@@ -30,6 +30,10 @@ import { hashToken } from '../src/auth.js'; // createPool/migrate 已随夹具�
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import { claimRun, setRunState, postEvents } from '../src/internal.js';
 import { partialOutputs } from '../src/run-partial-buffer.js';
+// issue #502 形态 M 绊线用例要拿 runner 的**真映射**造 `round_end` 载荷（不手抄字段名）。
+// `loopEventPayload` 是导出的纯函数（`runner/worker.js:232`，导出理由就写在它的注释里）；
+// import worker.js 在 runner/test/*.test.js 里已是常规做法（`usage-event.test.js:13` 等）。
+import { loopEventPayload } from '../../runner/worker.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATION = path.join(HERE, '../../deploy/migrations/0033-delta-events-not-persisted.sql');
@@ -252,6 +256,109 @@ test('#502 判据 3 真库：终态无锚点 ⇒ 半截正文并进那一行 run
 });
 
 // ---------------------------------------------------------------------------
+// 绊线（tripwire）：形态 M 判据 3 的两处 durable 源，**键名与类型**
+// ---------------------------------------------------------------------------
+
+/**
+ * 这条用例**不测行为，只测「那两个键还在不在」**——它是一根绊线，不是功能验证。
+ *
+ * 形态 M 判据 3（「停止后界面正文不比停止前少」）的 durable 源只有两处，都挂在 `run_events`
+ * **既有**的行上（本单零新事件类型、零新索引）：
+ *   ① `type='round_end'` 行的 `payload.final_text` —— **已完成轮次**的正文；
+ *   ② `type='run_end'`   行的 `payload.partial_text` —— **停止那半轮**的正文。
+ * 读侧 `portal/src/http.js#projectPartialOutputItems` 就只认这两个键（非字符串 ⇒ 当「没给正文」）。
+ *
+ * ⚠ **①上游契约没钉**（2026-11-14 现查 `node_modules/erix-agent@0.32.0`）：
+ *   * `docs/host-consumer-contract.md:6635` —— `round_end` 只在**档位表**里出现，钉的是档位
+ *     `fact`，**没有一个字**讲它的 payload 有哪些键；
+ *   * `finalText` 只出现在引擎源码 JSDoc（`src/loop/orchestrator.js:489`，而且写作**可选**
+ *     `@property {string} [finalText]`）与发出点（`src/loop/orchestrator.js:6459-6464`）
+ *     ——**是实现事实，不是契约承诺**。
+ *   ⇒ 上游哪天改名（`finalText`→`text`）或瘦身（空轮不写键 / payload 换成 `{ round }`），本站会
+ *     **静默退化**：引擎不报错、`postEvents` 照单全收（payload 是原样 `JSON.stringify` 落库的）、
+ *     库里那一行照样在，只是读侧 `typeof p.final_text === 'string'` 永远不成立 ⇒ 界面正文消失，
+ *     而**别的测试不会红**（`session-partial-output.test.js` 那族喂的是自己手造的载荷，不是库里的行）。
+ *     ②是本站自造的键（`internal.js#runEndPartialKeys`），它这里的风险是**本站自己**的读点/写点漂移。
+ *
+ * 断言口径刻意是**键存在 + 类型是 string**，不是「值非空」：引擎在空轮上写的就是 `''`
+ * （runner 的 `event.finalText ?? ''`，`runner/worker.js:293`），要求非空会把合法的空轮判成回归。
+ * 载荷也**不手抄**字段名，而是从 runner 的 `loopEventPayload` 真映射里拿 —— 否则这条只钉得住
+ * 「库里存了什么」，钉不住「runner 有没有把引擎的 `finalText` 映射成 `final_text`」这半条链。
+ * 正文**内容**对不对另有其人（上面那条判据 3 用例断 `partial_text === '说到一半'`），这里不重复。
+ *
+ * **红了怎么读**：先查上游 payload 是否改名/瘦身（上面两处坐标），再查本站 runner 的映射
+ * （`runner/worker.js:290` 的 `case 'round_end'`）与 `internal.js#runEndPartialKeys`；
+ * **它红了不是本单（#502）的回归**，是「上游动了形态 M 脚下的地基」的信号。
+ */
+test('#502 绊线：库里 round_end.payload.final_text 与 run_end.payload.partial_text 两个键必须在（形态 M 判据 3 的 durable 源）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    partialOutputs.clear();
+    const scene = ids('tripwire');
+    const live = await claimAndStart(pool, scene);
+    let n = 0;
+    // 一条 U3 事件（`client_event_id` 形状同 `runner/worker.js:191`）。
+    const ev = (type, payload) => ({ client_event_id: `${scene.runId}:1:${n++}`, type, payload });
+    await postEvents(pool, {
+      ...live, runId: scene.runId,
+      body: { batch_id: 'b1', events: [
+        ev('round_start', { round: 1 }),
+        ev('assistant_delta', { text: '第一段正文' }),
+        // 引擎事件是**驼峰**的，落库键是**蛇形**的：中间这笔账由 `loopEventPayload` 结（本绊线的重点）。
+        ev('round_end', loopEventPayload({
+          type: 'round_end', round: 1, finalText: '第一段正文', stopReason: 'end_turn',
+          usage: { input_tokens: 10, output_tokens: 3 },
+        })),
+        // 第 2 轮**故意不给 `finalText`**（引擎空轮的真实形态）⇒ 落库值 `''`：键**仍须在**，
+        // 这正是「空串也算存在」那条口径的用武之地（瘦身成「空轮不写键」就会在这里红）。
+        ev('round_start', { round: 2 }),
+        ev('round_end', loopEventPayload({ type: 'round_end', round: 2, stopReason: 'end_turn' })),
+        // 第 3 轮只有碎片、没有 `round_end` ⇒ 停止时它还是半轮（正文只可能来自 ② 那个键）。
+        ev('round_start', { round: 3 }),
+        ev('assistant_delta', { text: '说到一半' }),
+      ] },
+    });
+    // `final_text: ''` ⇒ 没有 assistant 锚点（与 `finishRun` 建锚点同一条判据）⇒ ② 的键该出现。
+    await setRunState(pool, {
+      ...live, runId: scene.runId,
+      body: { state: 'failed', termination: { reason: 'aborted' }, rounds: 3, final_text: '' },
+    });
+
+    const rows = await pool.query(
+      `SELECT seq, type, payload FROM run_events WHERE run_id = $1 ORDER BY seq`, [scene.runId],
+    );
+    // ---- ① 已完成轮次：每一行 round_end 都得带着 `final_text`（读侧只认它）----
+    const roundEnds = rows.rows.filter((r) => r.type === 'round_end');
+    assert.equal(roundEnds.length, 2, '本场景有 2 个已完成轮次（第 3 轮是停掉的半轮，不该有 round_end）');
+    // 逐轮钉一遍，并按**引擎给的 round**对上号（不靠行序碰运气）。
+    for (const [round, want] of [[1, '第一段正文'], [2, '']]) {
+      const row = roundEnds.find((r) => Number(r.payload?.round) === round);
+      assert.ok(row, `第 ${round} 轮的 round_end 行没落库`);
+      const p = row.payload;
+      assert.ok(p && typeof p === 'object', `round_end 的 payload 不是对象：${JSON.stringify(p)}`);
+      assert.ok(Object.hasOwn(p, 'final_text'),
+        `绊线断了：seq=${row.seq}（第 ${round} 轮）的 round_end 行没有 final_text 键 ⇒ 形态 M 判据 3 的已完成轮次正文没有 durable 源了（上游 payload 改名/瘦身，或 runner/worker.js:290 的映射断了；不是 #502 本单的回归）`);
+      // 与读侧 `projectPartialOutputItems` 的谓词**逐字同一句**：非 string 在它眼里就是「没给正文」。
+      assert.equal(typeof p.final_text, 'string',
+        `绊线断了：final_text 不是 string（拿到 ${typeof p.final_text}）⇒ 读侧会把它当没给正文，界面正文消失`);
+      // 这一句钉的是**本站 runner 那一半链**：引擎驼峰 → U3 蛇形这笔账不能被改扁
+      //（比如退成恒 `''`：键在、类型也对，但正文丢了，上面两条给不了信）。
+      assert.equal(p.final_text, want,
+        `第 ${round} 轮的 final_text 与引擎事件里的 finalText 不再对应（拿到 ${JSON.stringify(p.final_text)}）——空轮给空串是合法的，但丢正文不是`);
+    }
+
+    // ---- ② 停止那半轮：`run_end` 那一行得带着 `partial_text` ----
+    const ends = rows.rows.filter((r) => r.type === 'run_end');
+    assert.equal(ends.length, 1, '一个 run 恰一条 run_end（正文就并在它身上）');
+    const ep = ends[0].payload;
+    assert.ok(ep && typeof ep === 'object', `run_end 的 payload 不是对象：${JSON.stringify(ep)}`);
+    assert.ok(Object.hasOwn(ep, 'partial_text'),
+      '绊线断了：无 assistant 锚点且缓冲里有正文，run_end 的 payload 却没有 partial_text 键 ⇒ 停止那半轮的正文没有 durable 源了（本站 internal.js#runEndPartialKeys 断了）');
+    assert.equal(typeof ep.partial_text, 'string',
+      `绊线断了：partial_text 不是 string（拿到 ${typeof ep.partial_text}）⇒ 读侧会把它当没给正文`);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 迁移 ② + 体积闸：清存量可重放 / 分批 / 锁窗口有界；VACUUM 前后的体积下降差值
 // ---------------------------------------------------------------------------
 
@@ -392,15 +499,27 @@ test('#502 体积闸：清理后 `run_events` / `run_checkpoints` 各自的每�
   });
 });
 
-test('#502 环境门自证：没有 TEST_DATABASE_URL 时上面四条都是 skip 而不是假通过', () => {
+test('#502 环境门自证：没有 TEST_DATABASE_URL 时上面那些真库用例都是 skip 而不是假通过', () => {
   // 这条**不加 skip**：它在两种环境下都必须跑，且它断言的是「门是否存在」。
   const guarded = [
     '#502 判据 1 真库形状闸：喂 10 条与 1000 条 delta 的 run，落库行数**完全相同**',
-    '#502 判据 3 真库：终态无锚点 ⇒ 同事务恰一行 partial_output，seq 排在 run_end 之后，唯一索引挡住第二行',
+    '#502 判据 3 真库：终态无锚点 ⇒ 半截正文并进那一行 run_end 的 payload（无新行、无新索引）',
     '#502 迁移 0033：分批清存量可重放（第二遍 0 行 rc=0）、锁窗口有界、VACUUM 不能进迁移文件',
     '#502 体积闸：清理后 `run_events` / `run_checkpoints` 各自的每行字节上界 + 碎片占比 < 5 %',
+    // 绊线用例也在门后面 ⇒ 它也必须在名单里：无 PG 时它是 skip（**不是** pass），
+    // 根 `npm test`（不带 TEST_DATABASE_URL）里它计入 `# skipped`，不是 `# pass`。
+    '#502 绊线：库里 round_end.payload.final_text 与 run_end.payload.partial_text 两个键必须在（形态 M 判据 3 的 durable 源）',
   ];
-  assert.equal(guarded.length, 4);
+  assert.equal(guarded.length, 5);
+  // 名单不许只是装饰：每一条都必须在本文件里**真的存着一个同名的 `test(...)`**。
+  // 不这样钉的话，它只能自数长度 ⇒ 本单就踩过一次：上一版用例改名后这里没人发现，
+  // 名单里那行已经变成对着一件不存往事描述的文字（所以旧名字也顺手改对了）。
+  // ⚠ 判据必须是 `test('<名字>'` 而不是「名字在源码里出现过」：后者会被名单自己满足（恒真）。
+  const selfSrc = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  for (const name of guarded) {
+    assert.ok(selfSrc.includes(`test('${name}'`) || selfSrc.includes(`test(\`${name}\``),
+      `环境门名单与本文件用例名漂移（本文件里没有这个用例）：${name}`);
+  }
   if (!URL_VALUE) {
     assert.match(SKIP, /TEST_DATABASE_URL 未设置/, '没有 PG 时必须走 skip（消息里写清怎么起一次性实例）');
   } else {
