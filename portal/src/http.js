@@ -16,6 +16,7 @@ import * as queuedInputs from './queued-inputs.js'; // #370：对话输入队列
 import * as idempotency from './idempotency.js';
 import * as preview from './preview.js';
 import * as internal from './internal.js';
+import { partialOutputs } from './run-partial-buffer.js'; // issue #502 D-5：补发侧读的就是写入侧喂的那份缓冲
 import * as artifacts from './artifacts.js';
 import * as llm from './llm.js';
 import { createLlmGatewayClient, LlmGatewayError } from './llm-gateway.js';
@@ -2411,8 +2412,14 @@ async function handleSessionStream(req, res, ctx, sessionId) {
   let replayedSeq = null;
   if (lastEventId != null) {
     const replay = await ctx.pool.query(
+      // #502：**碎片（`assistant_delta`/`reasoning_delta`/`tool_call_delta`）不再从库里补发**（已不落库），
+      // `partial_output` 那一行也**不在这里发**：它改由下面的快照通路负责。
+      // ⚠ `type <> 'partial_output'` 在形态 M 之后是**防御性保留**：新代码不再写这种行
+      //（正文改读 `round_end.final_text` / `run_end.partial_text`），但**旧库里有存量**（迁移 0033
+      // 只清残留、不保证清完）⇒ 不排掉就会“一行真事件 + 一份快照”两套正文同屏（审计 B-7）。
       `SELECT seq, ts, run_id, type, payload FROM run_events
-        WHERE session_id = $1 AND seq > $2 ORDER BY seq ASC`,
+        WHERE session_id = $1 AND seq > $2 AND type <> 'partial_output'
+        ORDER BY seq ASC`,
       [sessionId, lastEventId],
     );
     for (const row of replay.rows) {
@@ -2427,8 +2434,20 @@ async function handleSessionStream(req, res, ctx, sessionId) {
       internal.writeSseEvent(res, row.type, data, seq);
       replayedSeq = seq;
     }
+    // issue #502 D-5（形态 M）：碎片不落库之后，「断线期间流式过的那段正文」只有一个来源：
+    // **本进程的缓冲**（已终态的那半截不在这里：它已进 `run_end.partial_text`，刷新时走历史投影）。
+    if (!rec.resync && !cleaned) {
+      const frames = buildPartialSnapshotFrames({ sessionId });
+      for (const f of frames) {
+        if (rec.resync) break;
+        if (cleaned) return;
+        // **不带 id**：快照帧不是库里的一行（内存帧根本没有 seq），让它污染浏览器 Last-Event-ID
+        // 就会把补发游标推进到一个不存在的 seq 上（下一轮重连反而丢事件）。
+        internal.writeSseEvent(res, PARTIAL_OUTPUT_TYPE, JSON.stringify(f), null);
+      }
+    }
   } else {
-    internal.writeSseComment(res, 'connected'); // 首连不补发历史
+    internal.writeSseComment(res, 'connected'); // 首连不补发历史（§5.2.3 红线不变 ⇒ 也不发快照）
   }
   if (cleaned) return; // 补发期间断开：连接已关，不再 goLive（rec 已摘除）/不再起心跳
   internal.sessionClientGoLive(sessionId, rec, replayedSeq);
@@ -2453,7 +2472,14 @@ async function handleSessionStream(req, res, ctx, sessionId) {
  * （tool_use.input / tool_call_delta.arguments_delta 可能很大），防超大响应。
  */
 const HISTORY_EVENT_TYPES = new Set([
-  'tool_use', 'tool_result', 'tool_call_delta', 'judge',
+  // issue #502 D-7：`tool_call_delta` 从本白名单**摘掉**（三类碎片里此前只有它在册）。
+  // 理由：① 它已不再落库（`internal.js` 写入侧按引擎 `eventTierOf` 拦住），存量也由迁移 0033 清掉
+  //   ⇒ 留在集合里是一个**永不命中**的谓词；② 它的**成型副本**在 `tool_use.input`，工具卡片的入参
+  //   就取自那里（#279：实时与刷新归并成同一张卡），不拿逐字碎片回放它；
+  //   ③ 另两类 `assistant_delta` / `reasoning_delta` 本来就不在册（#300 起就不下发，免得与正文
+  //   锚点重复），本单无需改动。前端 `useEventStream.ts` 的 `HISTORY_REPLAY_TYPES` **同步摘**
+  //   （`event-surface-contract.test.js` 的 S4 要求两个集合逐项相等，只摘一边就红）。
+  'tool_use', 'tool_result', 'judge',
   'round', 'round_start', 'round_end', 'attempt', 'recovering', 'recovered',
   'compaction', 'final_guard', 'forced_final',
   // issue #288（缺陷 B）：portal 在 release-requeue 分支合成的**宿主事件**（attempt 被杀并重排）。
@@ -2503,19 +2529,72 @@ const HISTORY_EVENT_MAX_LIMIT = 2000;
 const HISTORY_PAYLOAD_STRING_CAP = 2000;
 // issue #300：中止/失败 run 的**只读正文重建**。runner 的 catch 固定 `final_text: ''` ⇒ 该 run 在
 // `messages` 里**零助手锚点**，而正文区本来就只从锚点渲染 ⇒ 界面上这次 run 一片空白（实测标本
-// run 72e2577d / 会话 1ead0b1a）。`assistant_delta` 逐 chunk 落 run_events（全库 5.4 万条）⇒ 在
-// 本**只读**端点里按 seq 聚合回一条合成项 `partial_output`。
+// run 72e2577d / 会话 1ead0b1a）。
+// issue #502 形态 M 的取数：不再聚合碎片（那 877,155 行已停写），而是读**已有的两处 durable 正文**
+// ⇒ `round_end.payload.final_text`（已完成轮次）+ `run_end.payload.partial_text`（停止时那半轮）。
 // 硬口径：**不落库、不进 SSE、不进前端 EVENT_TYPES/HISTORY_REPLAY_TYPES**（它是响应期合成的，
-// 进集合就变成「实时一条 + 历史一条」重复），也**不进** HISTORY_EVENT_TYPES（`assistant_delta` 同理
-// 不能进白名单，否则同一段正文来两遍）。
+// 进集合就变成「实时一条 + 历史一条」重复），也**不进** HISTORY_EVENT_TYPES（三类碎片同理
+// 不能进白名单，否则同一段正文来两遍）。前端消费它时带 `placeholder` 支持（两处正文都没有 ⇒
+// 一行中性提示，#278 底线）。
 const PARTIAL_OUTPUT_TYPE = 'partial_output';
-// 上限沿用本端点既有 `HISTORY_PAYLOAD_STRING_CAP = 2000` 的先例；**差别是刻意的**：合成项不塞
-// `…（已截断）` 文本，只给 `truncated` 布尔，截断标记由前端出（前端要能判定，见 StreamPanel）。
-const PARTIAL_OUTPUT_TEXT_CAP = 2000;
+// issue #502 形态 M：**投影上限 65536 字符 + `truncated` 布尔**（取代旧的 `PARTIAL_OUTPUT_TEXT_CAP = 2000`）。
+// 为什么不是 2000：那道闸会咬「刷新后逐字完整」这条红线（#278/#300 的既有口径：停止前看到的
+// 不能比停止前少）——dev 真库现查 `round_end.final_text` **最长 31,707 字符**（均值 467），2000 会把
+// 中位以上的正文都砍掉。为什么不是「无限」：本端点的响应直接进浏览器 JSON，一条失控的长稿不能
+// 拖死整个会话视图；65536 ≈ 真库最长值的**两倍余量**且是 2 的幂（口径好记、算术可核对）。
+// 超上限 ⇒ `truncated: true`，标记由前端出（StreamPanel），本端点**不塞**「…（已截断）」那种文本
+// （那是 `truncateHistoryPayload` 给真实事件用的口径，合成项要能被前端判定，就得给布尔）。
+const PARTIAL_PROJECTION_TEXT_CAP = 65536;
 // issue #236：**终态分隔条**的合成类型。名字**故意不叫 `run_end`**：`run_end` 是实时 SSE 的运行态
 // 语义事件，绝不能进历史白名单（#217 / #236 的红线）——它是响应期投影出来的展示项，与
 // `partial_output` 同一类存在（不落库、不进 SSE、两个前端集合都不加）。
 const RUN_TERMINATION_TYPE = 'run_termination';
+
+/**
+ * issue #502 D-5（形态 M）：**断线补发的快照通路**（碎片不落库之后，那段未完稿正文的唯一取回路径）。
+ *
+ * **只有一个来源：本进程的缓冲**（`run-partial-buffer`）。旧版这里有三个来源（内存 → 库里
+ * `partial_output` 行 → 占位帧），形态 M 删掉后两个：
+ *   * **库里那一行不存在了**：正文的 durable 落点改成 `round_end.final_text`（已完成轮次）+
+ *     `run_end.partial_text`（停止时那半轮）。内存没东西时再去库里拼一份「看起来像流式」的正文，
+ *     就是拿**已完成轮次的终稿**冒充「还在流的那一轮」；而终稿本来就该由历史投影
+ *     （`buildPartialOutputItems`）给，两条通路各自完整、互不越界。
+ *   * **占位帧搬到了历史投影**（M-4）：占位说的是「刷新后这片区域不许空白」（#278），而 SSE 重连时
+ *     前端本来就会重拉 history ⇒ 两条通道各说一句就是同一件事说两遍（且两边 id 不同 ⇒ 渲染两行）。
+ *
+ * 硬口径：
+ *   * **只发还在写的 run**（`partialOutputs.sessionRuns` 已排除已标终态的 entry）：终态 run 的正文
+ *     已在库里，再发一帧就是重复正文（#300 头号坑）。
+ *   * **没有 `uptoSeq` 闸门，也没有 `PARTIAL_SNAPSHOT_ROW_LIMIT`**（形态 M 删掉的旧设计）：碎片不落库
+ *     就没有 seq 坐标系，拿缓冲里「已落库事件的最大 seq」与客户端 `Last-Event-ID` 比是**两套坐标硬比**
+ *     （审计 B-2/B-3：比赢漏发、比输重发，两种错都长得像「正文空洞 / 重复」）。现在靠**帧自带
+ *     `roundSeq`**、前端拿自己观测到的 `round_start.seq` 对账 ⇒ 判据从「服务端猜水位线」变成
+ *     「两端对同一个事实」（`round_start` 是事实档、自带 seq，两边看到的是同一个数）。
+ *   * 帧**不带 `seq`、也不带 SSE `id:`**：内存帧根本没有 seq，带 `id:` 会污染浏览器 Last-Event-ID。
+ *
+ * 成本：**零查询**（缓冲自带会话归属）——旧版的回落查询与占位用的 `loadWindowRuns` 查询一起消失。
+ * ⚠ **per-process**：多副本 portal 下这份缓冲只在一个进程里 ⇒ 见 `docs/api/portal.md` §4.4a 部署前提。
+ *
+ * @returns {Array<object>} 快照帧（`type = 'partial_output'`，无 `id:`）
+ */
+function buildPartialSnapshotFrames({ sessionId }) {
+  const frames = [];
+  for (const runId of partialOutputs.sessionRuns(sessionId)) {
+    const snap = partialOutputs.snapshot(runId);
+    if (!snap || snap.text === '') continue; // 空正文没什么可补的（也不发空帧去清气泡）
+    frames.push({
+      session_id: sessionId, run_id: runId, type: PARTIAL_OUTPUT_TYPE,
+      ts: new Date().toISOString(),
+      // `roundSeq` 是前端唯一的对账依据（判据 4）：对不上当前轮就整帧丢弃，不覆盖、不追加。
+      roundSeq: snap.roundSeq,
+      round: snap.round,
+      text: snap.text, reasoning: snap.reasoning,
+      chunks: snap.chunks, truncated: snap.truncated,
+      source: 'memory',
+    });
+  }
+  return frames;
+}
 
 // 展示 payload 截断：字符串叶值超cap → 截断 + 标记（JSON 形状保持合法，前端 String() 路径原样可用）。
 function truncateHistoryPayload(value, depth = 0) {
@@ -2580,52 +2659,94 @@ async function loadWindowRuns(pool, runIds) {
 }
 
 /**
- * issue #300 聚合（**只对候选发**，走 `run_events_run_idx (run_id, seq)`，零新索引）：
- * 整 run 的 `assistant_delta` 按 `seq` 升序拼接（`ORDER BY` 在 SQL 里 ⇒ 与插入顺序无关，测试钉这点）。
- * 脏载荷：`payload` 缺失/不是对象、`text` 缺键或不是字符串 ⇒ **跳过该片段**，绝不 `String()` 进来
+ * issue #300 的正文取数（**issue #502 形态 M 改口径：读两处已有的 durable 正文**）。
+ *
+ * 三个版本依次是：① 按 seq 拼整 run 的 `assistant_delta`（dev 实测 877,155 行 / 472 MB 拼出一个字符串）
+ * → ② 读 `partial_output` 那一行（上一版设计）→ ③ **本版：完全不引入新行**：
+ *   * **已完成轮次** = `type='round_end'` 行的 `payload.final_text`，**按 seq 升序拼接**
+ *     （引擎每轮收尾都写一条，runner `worker.js:290` 的 `final_text: event.finalText ?? ''` 就是它；
+ *     dev 真库现查 1,008 行里 437 行非空 ⇒ 这是现成的真相，不需要再造一份）；
+ *   * **停止时那半轮** = `type='run_end'` 行的 `payload.partial_text`（由 `internal.js#runEndPartialKeys`
+ *     在终态事务里写进**既有**那一行）。
+ *
+ * 两处的顺序不能反：`round_end` 在前、`run_end` 在后就是「已经说完的话 + 说到一半的话」；
+ * 拼接是**字符串级**的，中间不插分隔符（引擎写的轮次边界是模型自己的，不是我们的段落格式）。
+ * `run_end` 只认它自己的 `partial_text` 键，**不拿 `termination`/`error` 当正文**（那不是正文）。
+ *
+ * **成本红线不变**（`portal/test/session-partial-output.test.js` 用 `sqlLog` 钉）：
+ *   * 候选集合仍只来自 `loadWindowRuns` 那**一条**查询（终态 + `has_anchor=false`）；
+ *   * 本函数仍只打**一条** `run_id = ANY($1)` 的查询，走 `run_events_run_idx (run_id, seq)`，零新索引
+ *     （取的仍是「这些 run 的行」，只是 `type` 从 `partial_output` 换成 `round_end`/`run_end`）；
+ *   * 窗口里没有 run ⇒ 整段跳过，一条查询都不许多发（`buildHistorySynthItems` 里那道早退）。
+ *
+ * 两处都没有正文 ⇒ **给一个占位项**（`placeholder: true`，#278 底线：中止态不许留空白）。
+ * 占位原来在 SSE 补发通路里（`source:'none'` 帧），形态 M 搬到**这里**：刷新才是占位真正要解决的
+ * 时刻（重连时前端会重拉 history），SSE 那份与它重复。
+ *
+ * 脏载荷：`payload` 缺失/不是对象、`final_text`/`partial_text` 缺键或不是字符串 ⇒ **当没给正文**
  * （项目惯例：脏数据不得渲染成 `[object Object]` / `undefined`）。
- * 返回 Map<runId, 合成项>；聚合后正文为空 ⇒ 不给该项（被停在 `sleep` 上的 run 本来就无正文可给）。
+ * 截断由本端点统一拿笔（`PARTIAL_PROJECTION_TEXT_CAP = 65536`，真库最长值 31,707 的两倍余量）：
+ * `truncated` 只认**真字面量 true** 或本端点真的切了长度（脏值不谎报），只给布尔、不给「…（已截断）」
+ * 文本，截断标记由前端出（StreamPanel）。
+ *
+ * @param {Array<{run_id?: string, id?: string, last_seq?: number}>} candidates `loadWindowRuns` 的终态无锚点行
+ * @returns {Promise<Array<{seq:number,run_id:string,type:string,payload:object}>>} 合成项（按 run 一条）
  */
-async function aggregatePartialOutputs(pool, candidateRunIds) {
-  const out = new Map();
-  if (!candidateRunIds?.length) return out;
+async function projectPartialOutputItems(pool, candidates) {
+  const items = [];
+  const ids = (candidates ?? []).map((c) => c.run_id ?? c.id).filter((id) => id != null);
+  if (ids.length === 0) return items;
   const r = await pool.query(
-    `SELECT run_id, seq, payload FROM run_events
-      WHERE run_id = ANY($1) AND type = 'assistant_delta'
+    `SELECT run_id, seq, type, payload FROM run_events
+      WHERE run_id = ANY($1) AND type IN ('round_end', 'run_end')
       ORDER BY run_id, seq`,
-    [candidateRunIds],
+    [ids],
   );
-  const groups = new Map();
+  /** @type {Map<string, {rounds: string[], partial: string|null, seqSum: number}>} */
+  const acc = new Map();
   for (const row of r.rows ?? []) {
     const runId = row.run_id ?? null;
     if (runId == null) continue;
-    const g = groups.get(runId) ?? { parts: [], chunks: 0, seq: null };
-    const text = row.payload?.text; // 可选字段：非字符串就是「没给正文」，不是「正文是 [object Object]」
-    if (typeof text === 'string') {
-      g.parts.push(text);
-      g.chunks += 1;
+    if (!acc.has(runId)) acc.set(runId, { rounds: [], partial: null });
+    const slot = acc.get(runId);
+    const p = row.payload && typeof row.payload === 'object' ? row.payload : {};
+    if (row.type === 'round_end') {
+      // 可选字段：非字符串就是「没给终稿」（引擎在空轮上写 `''`），不是「正文是 [object Object]」。
+      if (typeof p.final_text === 'string' && p.final_text !== '') slot.rounds.push(p.final_text);
+    } else if (row.type === 'run_end' && typeof p.partial_text === 'string' && p.partial_text !== '') {
+      // 那一行受 `run_events_run_end_key` 部分唯一索引保护 ⇒ 至多一条，不需要「取最后一条」的合并。
+      slot.partial = p.partial_text;
     }
-    const seq = Number(row.seq);
-    g.seq = Number.isFinite(seq) ? seq : g.seq; // `seq` 语义 = 该 run 最后一条 delta 的 seq（不是新分配）
-    groups.set(runId, g);
   }
-  for (const [runId, g] of groups) {
-    if (g.seq == null) continue;
-    const joined = g.parts.join('');
-    if (joined === '') continue; // 空文本不合成
-    const truncated = joined.length > PARTIAL_OUTPUT_TEXT_CAP;
-    out.set(runId, {
-      seq: g.seq,
+  for (const c of candidates ?? []) {
+    const runId = c.run_id ?? c.id;
+    if (runId == null) continue;
+    const seq = Number(c.last_seq);
+    if (!Number.isFinite(seq)) continue; // 无任何事件行 ⇒ 合成项无处安放
+    const slot = acc.get(runId) ?? { rounds: [], partial: null };
+    const full = slot.rounds.join('') + (slot.partial ?? '');
+    if (full === '') {
+      // 占位（#278 底线）：这次 run 无锚点、两处正文都没有 ⇒ 界面仍要有一行话说「内容没留住」。
+      items.push({
+        seq, run_id: runId, type: PARTIAL_OUTPUT_TYPE,
+        payload: { text: '', chunks: 0, truncated: false, placeholder: true, source: 'none' },
+      });
+      continue;
+    }
+    items.push({
+      seq, // 该 run 的最大 seq（**不新分配**，也不推进 `chat_sessions.last_seq`）⇒ 排在本次 run 内容之后
       run_id: runId,
       type: PARTIAL_OUTPUT_TYPE,
       payload: {
-        text: truncated ? joined.slice(0, PARTIAL_OUTPUT_TEXT_CAP) : joined,
-        chunks: g.chunks, // 可观测性：让人能核对「聚合了多少片」
-        truncated,
+        text: full.length > PARTIAL_PROJECTION_TEXT_CAP ? full.slice(0, PARTIAL_PROJECTION_TEXT_CAP) : full,
+        chunks: slot.rounds.length, // 可观测性：能核对「拼了几轮的终稿」（碎片级计数已随 #502 消失）
+        truncated: full.length > PARTIAL_PROJECTION_TEXT_CAP,
+        // #502 additive 透传（前端今天不读，但人工排查看得到）：这一份是从哪里来的。
+        source: slot.partial ? (slot.rounds.length > 0 ? 'round_end+run_end' : 'run_end') : 'round_end',
       },
     });
   }
-  return out;
+  return items;
 }
 
 /** 合成项参与升序排序，但**不占 limit、不参与 next_cursor/hasOlder**（那两个仍只由真实事件决定）。 */
@@ -2747,7 +2868,8 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
   }));
   // issue #300 / #236：零候选 ⇒ 零额外查询（无 run ⇒ 连终态查询都不发）。
   // `next_cursor` / `hasOlder` 在上面已由**真实事件**算完，合成项不参与。
-  const synth = await buildHistorySynthItems(ctx.pool, rows);
+  // `before` 要传下去（#502 M-6④）：合成项只许出现在它自己 seq 所属的那一页。
+  const synth = await buildHistorySynthItems(ctx.pool, rows, { before });
   return sendJson(res, 200, {
     events: mergeSynthItemsBySeq(events, synth),
     next_cursor: hasOlder && rows.length > 0 ? Number(rows[0].seq) : null,
@@ -2772,17 +2894,24 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
  * `seq` = 该 run 在 `run_events` 里的**最大 seq**（不新分配）：`run_end` 行本来就在表里 ⇒ 分隔条天然落在
  * 本次 run 内容之后，且分页窗口外的行也拿得到（`MAX(seq)` 不受 `before` 限制）。
  */
-async function buildHistorySynthItems(pool, windowRows) {
+async function buildHistorySynthItems(pool, windowRows, { before = null } = {}) {
   const runIds = distinctWindowRunIds(windowRows);
   if (runIds.length === 0) return []; // 成本红线：窗口无 run ⇒ 整段跳过，一条查询都不许多发
   // 一条 runs 查询同时服务 partial_output 的候选判定与 run_termination 的终态投影（不许打第二条）。
   const runRows = await loadWindowRuns(pool, runIds);
-  const partialCandidates = runRows
-    .filter((row) => row.has_anchor !== true)
-    .map((row) => row.run_id ?? row.id)
-    .filter((id) => id != null);
-  const partials = await aggregatePartialOutputs(pool, partialCandidates);
-  return [...partials.values(), ...buildRunTerminationItems(runRows)];
+  // 候选 = 终态且**无 assistant 锚点**的 run（有锚点 ⇒ 正文已在 `messages`/transcript 那条路上，
+  // 再合成一份就是重复正文 —— #300 头号坑）。`last_seq` 一并带下去当合成项的 seq（不新分配）。
+  const partialCandidates = runRows.filter((row) => row.has_anchor !== true);
+  const partials = await projectPartialOutputItems(pool, partialCandidates);
+  // issue #502 M-6④（审计第 4 条）：合成项只许在**它自己 seq 所属的那一页**出现。
+  // 两类合成项的 `seq` 都是 `loadWindowRuns` 的 `MAX(e.seq)`，而 `MAX` **不受 `before` 约束**（它算的是
+  // 全 run 的最大值）⇒ 同一个 run 的事件跳好几页时，它的合成项会在**每一页都出现一份**
+  //（分页往上翻 = 同一段正文/同一条分隔线反复重演）。修法只在入口拦一道：
+  // `seq >= before` 的项属于**更新的那一页**，本页不得返。不拿 `windowRows` 的最小 seq 去卡下界：
+  // `seq` 永远 >= 本页最小行 seq（候选就是从本页行里来的），卡下界只会把刚好落在页首的项误删。
+  const items = [...partials, ...buildRunTerminationItems(runRows)];
+  if (before == null) return items;
+  return items.filter((it) => Number(it.seq) < before);
 }
 
 /**

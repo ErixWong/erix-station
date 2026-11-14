@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createPool } from '../src/db.js';
 import { migrate, computeExpectedVersions } from '../src/migrate.js';
+import { createPgFixture } from './pg-fixture.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SUPER_DATABASE_URL = (process.env.TEST_DATABASE_URL || '').trim();
@@ -39,32 +40,27 @@ function platformRoleFromBootstrap() {
 }
 
 const PLATFORM = platformRoleFromBootstrap();
-const SUPER_URL = SUPER_DATABASE_URL ? new URL(SUPER_DATABASE_URL) : null;
-const LOGIN_ROLE = SUPER_URL ? decodeURIComponent(SUPER_URL.username) : '';
-const LOGIN_PW = SUPER_URL ? decodeURIComponent(SUPER_URL.password || '') : '';
-const adminPool = SUPER_DATABASE_URL ? createPool(SUPER_DATABASE_URL, { max: 2 }) : null;
+// issue #502 F-1：建库/删库与**跨进程文件锁**一起搬进 `pg-fixture.js`（本文件与
+// `delta-not-persisted-db.test.js` 各带一份复制版时，两条腿会在两个新建库里同时改
+// `pg_authid` 同一行（bootstrap.sql:37-38 的 ALTER ROLE + 本文件自己的 ALTER/CREATE ROLE），
+// advisory lock 按 database OID 分域 ⇒ 互相看不见 ⇒ 偶发 `tuple concurrently updated`。
+const fixture = SUPER_DATABASE_URL ? createPgFixture(SUPER_DATABASE_URL, { prefix: 'w280' }) : null;
+const adminPool = fixture ? fixture.adminPool : null;
+const LOGIN_ROLE = fixture ? fixture.loginRole : '';
+const LOGIN_PW = fixture ? fixture.loginPw : '';
 
 const suffix = () => crypto.randomBytes(4).toString('hex');
 
 /** 在注入的实例上换库 / 换登录角色拼连接串（只碰注入的那台）。 */
-function dbUrl(database, user = LOGIN_ROLE, pw = LOGIN_PW) {
-  const u = new URL(SUPER_DATABASE_URL);
-  u.username = encodeURIComponent(user);
-  u.password = encodeURIComponent(pw);
-  u.pathname = `/${database}`;
-  return u.toString();
-}
+const dbUrl = (database, user, pw) => fixture.dbUrl(database, user, pw);
 
-/** 建一个全新空库并在结束时删掉（WITH (FORCE)：pg 池可能还占着连接）。 */
-async function withFreshDatabase(fn) {
-  const name = `w280_${suffix()}`;
-  await adminPool.query(`CREATE DATABASE ${name}`);
-  try {
-    return await fn(name);
-  } finally {
-    await adminPool.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`).catch(() => {});
-  }
-}
+/**
+ * 建一个全新空库并在结束时删掉（WITH (FORCE)：pg 池可能还占着连接）。
+ * `migrate: false` —— 本文件的每条用例**自己控制迁移身份**（超级用户跑 / 平台角色跑 /
+ * 非属主角色 fail fast），夹具不许替它先跑一遍。锁仍然整段持有，因为本文件在用例体里
+ * 就发集群级 `ALTER ROLE` / `CREATE ROLE`。
+ */
+const withFreshDatabase = (fn) => fixture.withFreshDatabase(({ database }) => fn(database), { migrate: false });
 
 async function ownersOf(database) {
   const pool = createPool(dbUrl(database), { max: 1 });
@@ -154,8 +150,10 @@ test('全新空库以超级用户跑全流程（issue #280 现场）：一路到
 });
 
 test('compose 形态（连接角色已是平台角色）再跑一遍：幂等 + 一条 SET/RESET ROLE 都不发（不回退 no-op）', { skip: SKIP }, async () => {
-  await adminPool.query(`ALTER ROLE ${PLATFORM} PASSWORD '${TEST_PW}' LOGIN`);
   await withFreshDatabase(async (database) => {
+    // 这条 `ALTER ROLE` 原本在 `withFreshDatabase` **外面** ⇒ 落在锁外，正是 F-1 那个
+    // 「两个进程同时改 pg_authid 同一行」的现场之一。搬进夹具体内 = 在锁内。
+    await adminPool.query(`ALTER ROLE ${PLATFORM} PASSWORD '${TEST_PW}' LOGIN`);
     const superPool = createPool(dbUrl(database), { max: 1 });
     try {
       await migrate(superPool, { env: {}, log: { log: () => {} } });

@@ -1219,18 +1219,142 @@ describe('#288 tool_replay_decision_required（挂起工具未重放）', () => 
 // 前端两个集合都**不许**加它：加了 `EVENT_TYPES` ⇒ 实时多挂一个监听（同一 run 变成「实时一条 +
 // 历史一条」的起点）；加了 `HISTORY_REPLAY_TYPES` ⇒ 它会流进展示层状态机（本单要的是中性 entry，
 // 由 store 自己分流，见 stores/workbench.ts 的 addPartialOutput）。
-describe('#300 partial_output 不进 EVENT_TYPES / HISTORY_REPLAY_TYPES', () => {
-  it('实时：EventSource 没有为 partial_output 挂监听（加进 EVENT_TYPES 就红）', () => {
+describe('#300/#502 partial_output：只订不回放的展示项', () => {
+  // 这条 describe 在 #300 时叫「partial_output 不进 EVENT_TYPES / HISTORY_REPLAY_TYPES」。
+  // **issue #502 D-6 把前半句反过来了**（不是删断言，是换判据）：那一行/那一帧现在是补发通路的一部分，
+  // EventSource **必须**订得到它 ⇒ 断言从 `false` 改成 `true`，标题也改成「只订不回放的展示项」。
+  // 后半句（不进 HISTORY_REPLAY_TYPES）原样保留，它仍是 #300 那条「刷新后别出两条正文」的红线。
+  it('#502：实时必须订得到 partial_output（漏进 EVENT_TYPES 就红：补发帧一条都收不到）', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);
     s.connect('sess-1');
-    expect(lastES().listeners.has('partial_output')).toBe(false);
-    // 顺手钉住它也不是 assistant_delta 的别名：正文增量仍只有 assistant_delta 一条通路
+    expect(lastES().listeners.has('partial_output')).toBe(true);
+    // 顺手钉住它不是 assistant_delta 的别名：碎片增量与快照覆盖是**两条**通路，都在册。
     expect(lastES().listeners.has('assistant_delta')).toBe(true);
     expect(s.lastSeq.value).toBe(0);
   });
 
-  it('回放：replayEvent 收到 partial_output 时零副作用（未进 HISTORY_REPLAY_TYPES）', () => {
+  it('#502 判据 4（不重复的方向）：快照帧**覆盖**已有半截正文，不是追加', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 4, round: 1, run_id: 'r1' }); // 形态 M：双闸的轮起点（帧要拿它对账）
+    lastES().emit('assistant_delta', { seq: 5, run_id: 'r1', text: '半' });
+    lastES().emit('assistant_delta', { seq: 6, run_id: 'r1', text: '截' });
+    expect(s.deltaText.value).toBe('半截');
+    // 重连补发的快照帧（无 `seq`、无 `id:`）：客户端已有「半截」，服务端给的是全量
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 4, text: '半截正文没说完', chunks: 42, source: 'memory' });
+    expect(s.deltaText.value).toBe('半截正文没说完');
+    expect(s.deltaText.value).not.toContain('半截半截');
+  });
+
+  it('#502 判据 4（不空洞的方向）：气泡被 run_end/round_start 清空后，快照帧把正文放回来', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('assistant_delta', { seq: 5, run_id: 'r1', text: '断线前的半句' });
+    lastES().emit('round_start', { seq: 6, round: 2, run_id: 'r1' }); // 界面上那段被清空
+    expect(s.deltaText.value).toBe(null);
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 6, text: '断线前的半句＋断线期间的那半句', chunks: 80, source: 'memory' });
+    expect(s.deltaText.value).toBe('断线前的半句＋断线期间的那半句');
+  });
+
+  // ---- issue #502 形态 M：`roundSeq` 双闸（旧版靠 `uptoSeq` 猜水位线，形态 M 换成两端对同一个事实）----
+  // 下面四条是本单的前端红线：「少一段」可接受（刷新即回），「盖错」不可接受（把别轮/别的 run
+  // 的正文扣到当前气泡上）⇒ 不中整帧丢弃。不用 `w.emitted()`：本 composable 不挂组件，
+  // 判据全部走导出面 `s.deltaText`（与同文件其余用例同一口径）。
+
+  it('#502 形态 M 闸②（不匹配 ⇒ 整帧丢弃）：roundSeq 不是本连接观测到的当前轮 ⇒ 不盖正文也不清气泡', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 6, round: 2, run_id: 'r1' });
+    lastES().emit('assistant_delta', { seq: 7, run_id: 'r1', text: '本地已有的半截' });
+    const sepBefore = hooks.onSep.mock.calls.length; // `round_start` 自己会发一行「round 2」，不能拿「零调用」当判据
+    // 服务端手里是**上一轮**的快照（roundSeq=2 ≠ 当前轮 6）：盖上去就是把已完成轮次的正文当未定稿。
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 2, text: '上一轮的正文', chunks: 9, source: 'memory' });
+    expect(s.deltaText.value, '轮对不上 ⇒ 连当前气泡都不许清（那可能是本轮自己的那段）').toBe('本地已有的半截');
+    expect(hooks.onSep.mock.calls.length, '整帧丢弃 = 不产生任何行（含分隔行）').toBe(sepBefore);
+  });
+
+  it('#502 形态 M 闸①（run 不匹配 ⇒ 丢弃）：不是当前活跃 run 的帧，roundSeq 再对也不盖', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    // 先让 r1 成为当前活跃 run 并观测它的轮起点（`round_start` 自己**不**置活跃 run，
+    // 那是 store 的责任：workbench.ts:788 / :1400 / :1471 三处）⇒ 这里直接摸导出面，与
+    // workbench.spec.ts:216 同一口径。
+    lastES().emit('round_start', { seq: 6, round: 2, run_id: 'r1' });
+    s.activeRunId.value = 'r2';
+    // r1 的旧轮快照（它的 roundSeq 在自己账上是对的）：活跃 run 已换成 r2 ⇒ 整帧丢弃
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 6, text: '上一个 run 的半截', chunks: 4, source: 'memory' });
+    expect(s.deltaText.value).toBe(null);
+  });
+
+  it('#502 形态 M 闸①反面：activeRunId 未知（刚 connect）⇒ 接受（否则首连补发帧会全量丢光）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    expect(s.activeRunId.value).toBe(null);
+    lastES().emit('round_start', { seq: 3, round: 1, run_id: 'r9' });
+    lastES().emit('partial_output', { run_id: 'r9', roundSeq: 3, text: '重连就该看到的那段', chunks: 2, source: 'memory' });
+    expect(s.deltaText.value).toBe('重连就该看到的那段');
+  });
+
+  it('#502 形态 M 闸②反面：帧的 roundSeq 为 null ⇒ 按不中处理（服务端不确定 ⇒ 谁都不许盖）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 6, round: 2, run_id: 'r1' });
+    lastES().emit('assistant_delta', { seq: 7, run_id: 'r1', text: '已有正文' });
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: null, text: '服务端也不知道是哪轮', chunks: 1, source: 'memory' });
+    expect(s.deltaText.value).toBe('已有正文');
+  });
+
+  it('#502 形态 M 闸②的依赖：round_start 没带可用 seq ⇒ 记 null ⇒ 后续帧全丢（宁缺不错盖）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('round_start', { round: 2, run_id: 'r1' }); // 脏帧：没有 seq
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 2, text: '拿上一轮的号来碰运气', chunks: 1, source: 'memory' });
+    expect(s.deltaText.value, '轮起点未知 ⇒ 拿别的号来硬对就是错盖').toBe(null);
+  });
+
+  it('#502 形态 M：SSE 通路不再出占位（占位已搬进历史投影）⇒ 空帧只清气泡，不发分隔行', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 3, round: 1, run_id: 'r1' });
+    lastES().emit('assistant_delta', { seq: 4, run_id: 'r1', text: '残留的半截' });
+    const sepBefore = hooks.onSep.mock.calls.length; // 同上：round_start 那一行不算在本判据里
+    // 旧版这一帧会发 `stream.event.partialOutputLost` 分隔行；形态 M 之后后端**根本不发空帧**，
+    // 真到了「一个字都没有」那一步是历史投影的 `placeholder` 条目在兑（workbench.spec 钉）。
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 3, text: '', chunks: 0, truncated: false, source: 'memory' });
+    expect(s.deltaText.value, '空气泡比清空更坑 ⇒ 仍旧清').toBe(null);
+    expect(hooks.onSep.mock.calls.length, '占位行已搬到历史投影，SSE 这条路不该再发').toBe(sepBefore);
+    expect(hooks.onSysErr, '中性提示不是红色错误行').not.toHaveBeenCalled();
+  });
+
+  it('#502：快照帧没有 seq ⇒ 不推进本地水位线（不污染重连游标）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 11, round: 1, run_id: 'r1' });
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 11, text: '正文', chunks: 3, source: 'memory' });
+    expect(s.deltaText.value).toBe('正文');
+    expect(s.lastSeq.value, '帧里没有 seq ⇒ 水位线一步都不许动（round_start 那条自己推过了）').toBe(11);
+  });
+
+  it('#502：脏快照（text 不是字符串）不当成正文，也不炸', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('partial_output', { run_id: 'r1', text: 42, source: 'db' });
+    expect(s.deltaText.value).toBe(null);
+    expect(hooks.onSep).not.toHaveBeenCalled();
+  });
+
+  it('#300 仍在：回放（replayEvent）收到 partial_output 时零副作用（未进 HISTORY_REPLAY_TYPES）', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);
     s.replayEvent({ seq: 41, run_id: 'r1', type: 'partial_output', payload: { text: '半截', chunks: 3, truncated: false } });
