@@ -3320,22 +3320,61 @@ describe('copilot 最终验收 ①：未知身份只有一个判据，`unknown` 
   //     `es.resetStreamState()`（内含 `deltaText = null`）⇒ 也造不出这个组合。
   // ⇒ **不为了测试去造一份产品路不存在的假状态**（那测的是测试自己），改成钉源码：
   //   谁要往这个早退里塞「顺手删 partial」，这条用例就红。运行时该分支不可达，所以只能这么钉。
-  it('源码钉｜`removeDeltaEntry()` 的无条目早退里不得藏任何删 `partial` 的逻辑（运行时分支不可达 ⇒ 只能钉源码）', () => {
+  it('源码钉｜`removeDeltaEntry()` 只认 `deltaEntry` 那根单指针（早退 → indexOf(deltaEntry) → splice(i, 1) → 置空，按序钉死；体内不得藏 `partial`）', () => {
     const src = workbenchSource;
     const def = src.match(/\n  function removeDeltaEntry\(\) \{[\s\S]*?\n  \}/);
     // 用 throw 而不是 expect(...).not.toBeNull()：既给类型收窄，也在函数改名/换写法时给出可读的红文案。
     if (!def) throw new Error('`removeDeltaEntry()` 的定义必须能在源码里定位到（改名/换写法时本条先红，提醒重新评估这条锁）');
-    // 只钉代码，不钉注释：把行注释剥掉后再断言（早退上方那段「不可达但承重」的注释里**提到过** partial）。
-    const body = def[0].replace(/\/\/[^\n]*/g, '');
+    // 只钉代码，不钉注释：两种注释都剥（早退上方那段「不可达但承重」的注释里**提到过** partial，
+    // 只剥 `//` 的话块注释里的 `partial` 会误红、块注释里的代码样文本又可能造成假绿）。
+    // 先块后行：块注释里常出现 `//`（URL、缩进示例），先剥行注释会把块注释的收尾 `*/` 一起吞掉。
+    const body = def[0]
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '');
+    // 剥不干净（未配对的块注释定界符、或残留的 `//`）⇒ 说明「只剥注释」的退化正则在这个函数上失灵了，
+    // 那就**不许静默放过**：当场报错要求人工看这条锁，而不是拿一份可能混了注释文本的 body 去比对。
+    if (/\/\*|\*\/|\/\//.test(body)) {
+      throw new Error('`removeDeltaEntry()` 体内有剥不干净的注释（未配对的块注释或残留 `//`）：'
+        + '本条钉靠纯文本比对，剥不干净就分不清钉的是代码还是注释 ⇒ 请人工复核这条锁（不要放宽断言）');
+    }
     // 反面先断（红文案要直指那个变异本身）：体内出现任何「partial」字样就是往早退里塞了顺手清理。
     expect(/partial/i.test(body),
       '`removeDeltaEntry()` 只认 `deltaEntry` 那根单指针：无条目时它什么都不删，'
       + '尤其不许删 `kind:\'partial\'`（partial 的归属与撤不撤 delta 气泡无关，删错了就是用户正看的正文消失）').toBe(false);
     expect(body, '不许在体内遍历 entries 找别的条目').not.toMatch(/findIndex|filter|forEach|for \(/);
-    // 早退本身必须在（它挡的是「`deltaEntry` 为空时 `indexOf(null)` 找不到、`splice` 无从下手」那一步）。
-    expect(body).toContain('if (!deltaEntry) return;');
-    // 全函数**只有一处** splice，且下标必须来自 `indexOf(deltaEntry)` —— 它只认那根单指针。
+    // **有序**子串断言：每一段都只在上一次命中之后继续找 ⇒ 命中位置天然单调递增，写法顺序就是语义顺序。
+    // 这修的是原来那对假闸断言：「只有一次 `splice(`」+「体内出现 `indexOf(deltaEntry)`」各自成立，
+    // 却拦不住 `entries.value.splice(0, 1)` 配一个孤立的 `indexOf(deltaEntry)` —— 下标必须真的来自那次 indexOf。
+    // 不按括号深度解析函数体（缩进切法遇到同缩进闭括号可能提前截断）：一旦提前截断，
+    // 下面的链就找不到 ⇒ 当场红，是**响的失败**，不会假绿。
+    let cursor = 0;
+    const expectOrdered = (step: string, needle: RegExp, hint: string) => {
+      const at = body.slice(cursor).search(needle);
+      if (at === -1) {
+        throw new Error(`源码钉｜「${step}」没在预期位置出现（顺序不对、写法不对，或函数体被提前截断）：${hint}`);
+      }
+      const pos = cursor + at;
+      cursor = pos + 1;
+      return pos;
+    };
+    // 1) 无条目早退必须在最前（它挡的是「`deltaEntry` 为空时 `indexOf(null)` 找不到、`splice` 无从下手」那一步）。
+    const pGuard = expectOrdered('无条目早退', /if \(!deltaEntry\) return;/,
+      '`deltaEntry` 为空时必须直接 return，不许改成「没条目就去删别的条目」');
+    // 2) 下标必须**绑定到** `entries.value.indexOf(deltaEntry)` 的结果。
+    const pIndex = expectOrdered('下标来源', /const\s+i\s*=\s*entries\.value\.indexOf\(\s*deltaEntry\s*\)/,
+      '下标只能来自 `entries.value.indexOf(deltaEntry)`');
+    // 3) splice 的下标参数必须是那个 `i`、删除条数必须是 1（不是 `0`、不是任何别的字面量）。
+    const pSplice = expectOrdered('splice(i, 1)', /\.splice\(\s*i\s*,\s*1\s*\)/,
+      '`splice` 删的必须是 `indexOf(deltaEntry)` 拿到的那一条');
+    // 4) 指针置空必须在删之后（顺序反了就是把还在体内的条目当没了）。
+    const pNull = expectOrdered('指针置空', /deltaEntry = null;/,
+      '`deltaEntry` 必须在删除之后置空');
+    // 位置单调递增：显式再写一遍，让「顺序」这件事在断言里可见（而不是只依赖游标实现）。
+    expect([pGuard, pIndex, pSplice, pNull], '早退 → indexOf → splice(i, 1) → 置空 必须按这个顺序出现')
+      .toEqual([pGuard, pIndex, pSplice, pNull].slice().sort((a, b) => a - b));
+    expect([pGuard, pIndex, pSplice, pNull].filter((v, i, a) => a.indexOf(v) === i),
+      '四段各只出现一次且互不重合').toHaveLength(4);
+    // 全函数**只有一处** splice（链之外再塞一次 splice 就是偷偷多删了一条）。
     expect(body.match(/splice\(/g) ?? [], '只许一次 splice，且删的必须是 `deltaEntry` 那一条').toHaveLength(1);
-    expect(body).toMatch(/indexOf\(\s*deltaEntry\s*\)/);
   });
 });
