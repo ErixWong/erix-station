@@ -1797,6 +1797,34 @@ describe('issue #300：partial_output 归并成 kind:partial', () => {
     expect(en.truncated).toBe(true);
   });
 
+  it('#502 形态 M：`placeholder:true` 且空文本 ⇒ **仍然建条目**（#278 不空白红线现在全担在这里）', async () => {
+    // 后端形态 M 的历史投影在「无 assistant 锚点 + `round_end.final_text` 与 `run_end.partial_text`
+    // 两处都空」时发 `{ text:'', placeholder:true, source:'none' }`（`http.js` 的投影段）。
+    // **这条用例钉的是那个真洞**：旧实现在函数第一行就 `if (text === '') return;` ⇒ 占位项被丢掉
+    // ⇒「停止时一个字都没输出」的 run 界面上仍旧空白（#278 只在后端成立）。
+    mockFetch(partialHandler([
+      partialEvent({ text: '', chunks: 0, truncated: false, placeholder: true, source: 'none' }),
+    ]));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const parts = store.entries.filter((e) => e.kind === 'partial');
+    expect(parts).toHaveLength(1);
+    const en = parts[0] as Extract<StreamEntry, { kind: 'partial' }>;
+    expect(en.id).toBe('partial:r-abort');
+    expect(en.text).toBe('');
+    expect(en.placeholder, '占位标记必须透到条目上（StreamPanel 拿它分「空气泡」与「提示行」）').toBe(true);
+    expect(en.truncated).toBe(false);
+  });
+
+  it('#502 形态 M 反面：空文本但**没有**占位标记 ⇒ 仍旧不建条目（脏载荷不配空气泡）', async () => {
+    // 与上面那条只差 `placeholder` 一个键 —— 这正是要钉住的区分：两种空文本不是一回事，
+    // 合并处理就会要么空气泡满屏、要么「一个字都没留住」静默消失。
+    mockFetch(partialHandler([partialEvent({ text: '', chunks: 0, truncated: false })]));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.entries.filter((e) => e.kind === 'partial')).toHaveLength(0);
+  });
+
   it('红线：partial_output 绝不喂 es.replayEvent（喂了就是「实时一条 + 历史一条」重复）', async () => {
     mockFetch(partialHandler([partialEvent({ text: '半截', chunks: 3, truncated: true })]));
     const store = useWorkbenchStore();

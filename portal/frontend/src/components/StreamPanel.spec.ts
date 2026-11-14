@@ -853,6 +853,32 @@ describe('issue #300：partial entry 渲染（中性助手气泡 + 双语标签�
     expect(plain.wrapper.find('.partial-truncated').exists()).toBe(false);
   });
 
+  // issue #502 形态 M：历史投影在「无锚点 + 两处正文源都空」时给的**占位条目**（#278 底线）。
+  // 旧版这条提示走 SSE 分隔行；形态 M 把占位收进历史投影 ⇒ **界面这一行是它唯一的存在方式**，
+  // 上面 workbench.spec 钉「条目建得出来」，这里钉「建出来的条目真的渲染成一行话，而不是空气泡」。
+  it('#502 形态 M 占位条目 ⇒ 一行中性提示（zh/en 成对），不出空 markdown 正文、不出 syserr', () => {
+    const store = useWorkbenchStore();
+    store.renderedIds = new Set();
+    store.entries.length = 0;
+    store.entries.push({ kind: 'partial', id: 'partial:r1', text: '', truncated: false, placeholder: true, sessionId: 's1' });
+    const wrapper = mountPanel();
+    const node = wrapper.get('.msg.assistant.partial');
+    expect(node.find('.partial-placeholder').text()).toBe('这段输出的正文没能留存（中止时未落库），下面按终态继续。');
+    // 「空气泡」是这单的病根：占位**不许**再走 markdown 正文那一路（那会渲染出一个空 div）
+    expect(node.findAll('div')).toHaveLength(2); // 只有标签 + 提示行
+    expect(wrapper.find('.syserr').exists()).toBe(false);
+    expect(node.find('.partial-truncated').exists()).toBe(false);
+    const label = node.find('.partial-label').text();
+    expect(label).not.toMatch(/完成|错误|失败/);
+    setLocale('en');
+    const enWrapper = mountPanel();
+    expect(enWrapper.find('.partial-placeholder').text()).toBe(
+      'The text of this output was not retained (not persisted when the run stopped); the terminal state follows below.',
+    );
+    expect(enWrapper.find('.partial-placeholder').text()).not.toMatch(/complete|error|fail/i);
+    setLocale('zh-CN');
+  });
+
   it('正文与标签分离：标签不得混进 markdown 正文', () => {
     const { wrapper } = seedPartial('第一行\n第二行');
     const body = wrapper.get('.msg.assistant.partial').html();

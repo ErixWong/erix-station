@@ -550,6 +550,17 @@ export function useEventStream(hooks: EventStreamHooks) {
   // EVENT_TYPES 也在历史下发白名单）。写点只有 round_start/attempt/recovering/recovered
   // （载荷带轮号且发生在轮内；round_end/usage 不记，因为工具调用总在它们之前）。
   const roundTokenByRun = new Map<string, string>();
+  /**
+   * issue #502 形态 M：**本连接观测到的「该 run 当前轮的 `round_start` 自己的 seq」**（实时与历史回放都走这里）。
+   *
+   * 为什么需要第二份轮面信息（`roundTokenByRun` 存的是轮号，不是 seq）：补发的快照帧**不落库 ⇒
+   * 它自己没有 seq**，而 #502 之前用来判「客户端是不是已经看过这段」的 `uptoSeq` 已整条删除
+   * （碎片不落库就没有 seq 坐标系，拿「已落库事件的最大 seq」与 `Last-Event-ID` 比 = 两套坐标硬比，
+   * 比赢漏发、比输重发）。现在服务端只带 `roundSeq`（= 它那一轮 `round_start` 的 seq），
+   * 能不能覆盖本地气泡由**两端对同一个事实**决定：`round_start` 是事实档、自带 seq，两边看到的是同一个数。
+   * 值只可能是有限整数或 `null`（事件没带可用 seq ⇒ 记 null，后续帧一律不覆盖，宁少盖不错盖）。
+   */
+  const roundSeqByRun = new Map<string, number | null>();
   // issue #279 关联索引：provider `callId` → **最新一张**卡片的身份键 + 它的 run + 它已知的最细轮号。
   // 只用于「结果/投影找到已有那张卡」，**不得当身份**（同一个 id 跨轮时身份是两张卡、索引只指向
   // 最新那张——具名用例钉住）。存结构体而不是只存 key：归并时要能判「跨 run 不许归并」「两侧轮号都
@@ -592,6 +603,18 @@ export function useEventStream(hooks: EventStreamHooks) {
   function observeRound(runId: unknown, round: unknown): void {
     if (typeof runId !== 'string' || runId === '') return;
     roundTokenByRun.set(runId, eventRoundToken(round));
+  }
+
+  /**
+   * issue #502 形态 M：记「这个 run 当前轮的轮起点 seq」（只从 `case 'round_start'` 来）。
+   * `seq` 不是有限数字 ⇒ 记 `null` 而不是删掉：删了会让下一条快照帧拿去比**上一轮**那个号
+   *（旧轮号还挂在 Map 里 ⇒ 盖错轮）；记 null ⇒ 「这一段轮起点未知 ⇒ 谁都不许盖」，宁缺不错。
+   */
+  function observeRoundSeq(runId: unknown, seq: unknown): void {
+    if (typeof runId !== 'string' || runId === '') return;
+    // 只认**数字**（不用 `Number(seq)` 把 null/'' 镀成 0：那会把「未知」当成「第 0 轮」，
+    // 而 seq 从 1 起 ⇒ 看起来永远对不上，但下面的帧侧一旦碰上 seq=0 的脏值就会错盖）。
+    roundSeqByRun.set(runId, typeof seq === 'number' && Number.isFinite(seq) ? seq : null);
   }
 
   function roundTokenFor(runId: unknown): string {
@@ -798,6 +821,9 @@ export function useEventStream(hooks: EventStreamHooks) {
         if (deltaText.value) { deltaText.value = null; }
         // issue #279：本 run 的轮号水位线（卡片身份的唯一轮号来源；实时与历史回放都走这里）。
         observeRound(d.run_id, d.round);
+        // issue #502 形态 M：同一处顺手记「本轮的轮起点 seq」⇒ `partial_output` 快照帧拿它对账
+        //（实时帧与历史回放行都带 `seq`，`replayEvent` 把 `raw.seq` 放进 `d` ⇒ 两路同一个号）。
+        observeRoundSeq(d.run_id, d.seq);
         hooks.onSep(`round ${d.round}`); return;
       case 'attempt':
         observeRound(d.run_id, d.round); // 重试仍在同一轮内（#279：round_start 漏收时的补点）
@@ -947,22 +973,29 @@ export function useEventStream(hooks: EventStreamHooks) {
         return;
       case 'recovered': hooks.onSep(t('stream.event.recovered')); return;
       case 'partial_output': {
-        // issue #502 D-6：**覆盖式**赋值（不是 `+=`）。这一帧的语义是「当前这段未完稿正文的全量」，
-        // 而碎片 `assistant_delta` 的语义是「一片」。两个方向都必须成立（判据 4）：
+        // issue #502 D-6（**形态 M 加了双闸**）：**覆盖式**赋值（不是 `+=`）。这一帧的语义是
+        // 「当前这段未完稿正文的全量」，而碎片 `assistant_delta` 的语义是「一片」。两个方向都得成立（判据 4）：
         //   · 重连后客户端已有半截 + 服务端快照更全 ⇒ 覆盖 ⇒ **不重复**；
         //   · 断线期间流式过、客户端气泡已被 round_start/run_end 清空 ⇒ 覆盖 ⇒ **不空洞**。
-        // 前端只有**一个**流式气泡（`deltaText`，`round_start` 置 null）⇒ 覆盖与界面形状是一致的。
-        // 脏快照（`text` 缺键/不是字符串）不当成正文：清掉气泡直接返回（项目惯例：
-        // 脏数据不许渲染成 `[object Object]` / `undefined`，也不许把气泡撑成一个空格）。
+        // 但「覆盖」只在**确实是同一段**时才对 ⇒ 形态 M 把旧版靠 `uptoSeq` 猜水位线换成两条硬守卫，
+        // **两条都中才赋值，任一不中就整帧丢弃**（丢弃的代价 = 界面上少一段还没写完的正文，
+        // 刷新即回；错盖的代价 = 把别的轮/别的 run 的正文扣到当前气泡上，那才是看得见的错）。
+        //   闸①（run）：只认当前活跃 run 的帧；`activeRunId` 还没定（首连/刚清）⇒ 接受，
+        //        否则补发帧会在「会话已打开、run 身份尚未观测到」这个正常窗口里全量丢光。
+        //   闸②（轮）：帧自带的 `roundSeq` 必须等于本连接观测到的该 run 当前轮起点 seq。
+        //        帧的 `roundSeq` 为 null（服务端那一轮没观测到 `round_start` 的 seq）⇒ **按不中处理**：
+        //        拿 null 去盖等于承认「我确定它是当前轮」，而服务端并不确定。
         const text = typeof d.text === 'string' ? d.text : null;
-        if (text === null) { deltaText.value = null; return; }
-        if (d.placeholder === true || text === '') {
-          // #278 底线：内存与库里都拿不到正文时不许留空白 ⇒ 清掉半截气泡，出一行**中性**提示
-          //（不是红色 `.syserr`：「正文没能恢复」不是错误；终态原因仍由 `run_end` 那条分隔行负责）。
-          deltaText.value = null;
-          hooks.onSep(t('stream.event.partialOutputLost'));
-          return;
-        }
+        if (text === null) { deltaText.value = null; return; } // 脏快照：不当正文，也不撑成空格/`[object Object]`
+        const runKnown = activeRunId.value == null || activeRunId.value === '' || d.run_id === activeRunId.value;
+        const frameRoundSeq = typeof d.roundSeq === 'number' && Number.isFinite(d.roundSeq) ? d.roundSeq : null;
+        const runOk = typeof d.run_id === 'string' && d.run_id !== '';
+        const roundOk = frameRoundSeq !== null && roundSeqByRun.get(d.run_id) === frameRoundSeq;
+        if (!runOk || !runKnown || !roundOk) return; // 整帧丢弃（不清气泡：那可能是别人的那段）
+        // 空正文 ⇒ 清气泡但**不拆占位行**：占位的家已搬进历史投影（`workbench#addPartialOutput`）。
+        // 旧分支在这里发 `stream.event.partialOutputLost` 分隔行，但后端形态 M 的快照帧**根本不发空帧**
+        //（`http.js` `buildPartialSnapshotFrames` 对空缓冲直接 `return`），那条行在这里再也响不响。
+        if (text === '') { deltaText.value = null; return; }
         deltaText.value = text;
         return;
       }
@@ -1098,6 +1131,9 @@ export function useEventStream(hooks: EventStreamHooks) {
     toolCards.clear();
     // issue #279：轮号观测面与关联索引同生命周期（都得跟着卡片清，不然跨会话串轮号/串卡）。
     roundTokenByRun.clear();
+    // issue #502 形态 M：轮起点 seq 同生命周期 —— 不清会让下一个会话的第一条快照帧拿去比
+    // **上一个会话某个 run** 的号（run_id 不同 ⇒ 实际是 miss，但语义上这里必须是空的）。
+    roundSeqByRun.clear();
     cardByCallId.clear();
     esSessionId.value = null;
   }

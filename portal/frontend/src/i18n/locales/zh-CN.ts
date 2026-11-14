@@ -305,6 +305,10 @@ export const zhCN = {
     partialOutput: {
       label: '已中止 · 部分输出',
       truncated: '输出在停止前未生成完全（已截断）',
+      // issue #502 形态 M（#278 底线）：这次 run **一个字都没留住**（无 assistant 锚点，
+      // `round_end.final_text` 与 `run_end.partial_text` 两处都空）⇒ 历史投影给一条占位合成项，
+      // 界面出一行**中性**提示而不是空气泡。措辞不许写成故障（不是红色 .syserr 行）。
+      placeholder: '这段输出的正文没能留存（中止时未落库），下面按终态继续。',
     },
     // mermaid 图块（参考 pi-web MermaidBlock）：预览/源码切换按钮文案与渲染失败提示
     mermaid: {
@@ -315,9 +319,10 @@ export const zhCN = {
     event: {
       resync: '事件流需重同步（{why}），正在重连补发…',
       resyncBufferOverflow: '服务端缓冲溢出',
-      // issue #502 D-6：断线补发拿不到那段未完稿正文时的占位行（后端帧 `source:'none'` +
-      // `placeholder:true`）。中性分隔行，不是错误行：终态原因仍由 `run_end` 那条分隔行负责。
-      partialOutputLost: '断线期间这段流式正文没能恢复（服务端已无副本），下面按终态继续。',
+      // issue #502 形态 M：这里原本的 `partialOutputLost` **是故意删掉的**：SSE 快照帧已不带占位
+      //（后端在缓冲为空时**根本不发帧**），那行分隔行再也响不响；「正文没留住」这行现在由历史投影
+      // 走 `stream.partialOutput.placeholder`。（旧文案尾巴「…后端帧 `source:'none'` + `placeholder:true`，
+      // 中性分隔行不是错误」一并删除；本次跑不依赖它。）
       attempt: 'round {round} · 尝试 {attempt}/{max}',
       // issue #288（缺陷 B）：worker 被宿主杀掉并重排（之前用户只看到同一个工具卡片亮 3 次，
       // 最后拿一句没原因的 attempts exhausted）。载荷是 portal 在 release-requeue 分支合成的：
