@@ -20,14 +20,109 @@ import { enqueueRouteChange } from './outbox.js';
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 const MAX_ATTEMPTS = 5;
 
+// issue #506（空闲退避）：**旧行为**是两条与「有没有活」无关的固定节拍——每 250ms 一拍跑
+// `recoverRouteOrphans()`（一条 UPDATE）+ `claimRouteRows()`（BEGIN / 2×UPDATE / COMMIT），
+// `BACKOFF_MS` 只服务异常分支。平台完全空闲时实测 **26.4 事务/秒、64.2 次表扫/秒**
+//（2026-11-14 主 agent 现测，30s 窗口，无浏览器无 run）——全是空转。
+//
+// 新行为：节拍由**认领结果**驱动。
+//   · 认领 0 行 ⇒ 250 → 500 → 1000 → `ROUTE_IDLE_BACKOFF_MAX_MS`（默认 2000）封顶；
+//   · 认领 >0 行 ⇒ 立刻回 250ms（有积压时吞吐一秒不让）；
+//   · 孤儿回收与「有没有活」无关，改**独立节拍**（`ROUTE_ORPHAN_RECOVERY_INTERVAL_MS`，默认 10s），
+//     否则那条 UPDATE 每拍照跑，退避收益直接被吃掉一半以上。
+// 没动的东西（红线）：认领 SQL 的语义、`lease_until` 租约逻辑、失败重试状态机（`BACKOFF_MS`）。
+const IDLE_TICK_MS = 250;
+const IDLE_BACKOFF_MAX_MS_DEFAULT = 2000;
+const ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT = 10000;
+
+// issue #506 评审（copilot 验收意见①）：**光校验「正整数」不够**——退避时长最终是交给 `setTimeout`
+// 的，而 Node 的 timer 只吃 **32 位有符号整数**：现查 Node v22.23.2 跑 `setTimeout(()=>{}, 3e9)`
+// 直接打印 `Timeout duration was set to 1.`，即 `ROUTE_IDLE_BACKOFF_MAX_MS=3000000000` 的后果不是
+// 「退避变长」，而是**退化成 1ms 空转**——比本单要修的 250ms 空转还严重 250 倍。所以旋钮必须带
+// **安全上限**，且越界时**回落默认 + warn**（不静默夹取：夹取会让运维以为那行配置真的生效了）。
+const NODE_TIMER_MAX_MS = 2147483647;
+// 业务上限：空闲退避超过 60s 对 outbox 消费已经没意义（人手工入队的一条变更要等一分钟才生效，
+// 不如直接重启）。取 `min(Node timer 上限, 60s)`；要放宽请连同这条理由一起改。
+export const MAX_BACKOFF_MS_SAFE = Math.min(NODE_TIMER_MAX_MS, 60_000);
+// 孤儿回收间隔不是退避而是「崩溃恢复的最长延迟」，放大到 10min 仍可接受，但同样不许越 Node timer 上限。
+const ORPHAN_RECOVERY_INTERVAL_MS_SAFE = Math.min(NODE_TIMER_MAX_MS, 600_000);
+
+// 严格正整数：**trim 后整串**必须全是十进制数字（copilot 第四轮复审③）。
+// 改前用 `parseInt(raw, 10)`（前缀匹配），它吃的是**前缀**⇒ `'1e4'` → **1**、`'10000abc'` → **10000**，两种都**静默**：
+//   · `*_ORPHAN_RECOVERY_INTERVAL_MS=1e4`（运维习惯把 10000 写成 `1e4`）的真实后果是回收间隔变成 **1ms**
+//     ⇒ 那条与有没有活无关的回收**每拍都跑**，把 #506 刚省下来的空闲开销原样吐回去；
+//   · `'10000abc'` 则是「配了一个垃圾值，却按 10000 生效」——比直接不认更难查。
+// 口径：**先 trim 再整串匹配**——前后空格算合法（compose / env-file 里带空格很常见，与既有 `.trim()` 一致），
+// 但 `+10000` / `1_0000` / `0x10` / `1e4` / `10000abc` 一律不认 ⇒ 回落默认 + warn（与越界同一口径）。
+const STRICT_POSITIVE_INT_RE = /^\d+$/;
+
+
 // F3'（Round B 评审）：route_revisions / route_outbox 的 aggregate_id 是 uuid NOT NULL
 //（schema.sql §9），非 UUID 字符串在真实 DB 上会报 invalid input syntax for type uuid。
 // full_rebuild 的 outbox 行只是「触发一次全量重建」的信号、不对应真实聚合行，用固定 nil UUID 哨兵：
 // 满足 uuid 类型约束，且多次重试复用同一聚合 → 复用既有 revision head / 租约 / 重试链路。
 export const FULL_REBUILD_AGGREGATE_ID = '00000000-0000-0000-0000-000000000000';
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+/**
+ * 正整数 env（issue #506 评审①）。三种情形一律**回落默认并 warn 一句**，绝不静默：
+ *   · 非法值（`abc` / `-1` / `0` / `1e4` / `10000abc`）——旧行为是静默回落，本单改成看得见；
+ *     「非法」的判定在第四轮复审③ 从「parseInt 能出个数」改成**整串严格匹配**（前缀匹配会静默误读）；
+ *   · 越界（> `max`）——`max` 的存在理由见上面 `NODE_TIMER_MAX_MS` 的实测注释；
+ *   · 没配（空串）——静默用默认（这不是错误，不该每次启动都刷一条噪声）。
+ * @param {string} name @param {number} fallback @param {{max?: number, log?: object}} [opts]
+ */
+function envInt(name, fallback, { max = MAX_BACKOFF_MS_SAFE, log = console } = {}) {
+  const raw = String(process.env[name] ?? '').trim();
+  if (raw === '') return fallback;
+  // 不认前缀匹配：整串不是纯数字就当 NaN，与「非法值」走同一条回落分支（copilot 第四轮复审③）。
+  const n = STRICT_POSITIVE_INT_RE.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(n) || n <= 0) {
+    log.warn?.(`[env] ${name}=${raw} 不是严格正整数（trim 后整串必须是十进制数字；'1e4' / '10000abc' 这类科数或带尾巴的值不认）`
+      + ` ⇒ 回落默认 ${fallback}ms（这行配置没生效）`);
+    return fallback;
+  }
+  if (n > max) {
+    log.warn?.(`[env] ${name}=${n} 超过安全上限 ${max}ms ⇒ 回落默认 ${fallback}ms`
+      + `（不夹取：夹取会让人以为这行配置生效了）`);
+    return fallback;
+  }
+  return n;
+}
+
+/**
+ * issue #506：第 `idleTicks` 个**连续空闲拍**该等多久。`idleTicks = 0` 表示上一拍认领到了活
+ * ⇒ 回基准 250ms；否则 250 起指数翻倍、夹在 `maxMs`（默认 2000）封顶。
+ * 导出的理由：判据是「退避真的发生」，阶梯必须能被直接读出而不是靠间接推。
+ *
+ * issue #506 评审①：这里**自己也夹一次**（不假定调用方已经过 `envInt`）——直接调用方传 3e9 就会
+ * 造出 1ms 空转。返回值恒在 `[IDLE_TICK_MS, MAX_BACKOFF_MS_SAFE]`。
+ */
+export function idleDelayMs(idleTicks, maxMs = IDLE_BACKOFF_MAX_MS_DEFAULT) {
+  if (!(idleTicks > 0)) return IDLE_TICK_MS;
+  const cap = Number.isFinite(maxMs) && maxMs > 0
+    ? Math.min(Math.max(IDLE_TICK_MS, maxMs), MAX_BACKOFF_MS_SAFE) // 下限：配置不许把基准节拍压低
+    : IDLE_BACKOFF_MAX_MS_DEFAULT;                                 // NaN / Infinity / 负数 ⇒ 生产默认
+  return Math.min(IDLE_TICK_MS * 2 ** (idleTicks - 1), cap);
+}
+
+/**
+ * issue #506：可中断 sleep —— `stop()` 不许再等满一个退避窗口（旧代码退避到 2s 时，优雅关闭
+ * 最多要白等 2s，测试里也会挂住）。resolve(true)=睡满了，resolve(false)=被 abort。
+ * @param {number} ms @param {AbortSignal} [signal]
+ */
+export function sleepCancellable(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve(false);
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 // DNS label：小写字母数字，不以 - 开头/结尾（hostname grammar，fde-platform §8.5）。
@@ -879,11 +974,13 @@ export async function rebuildRoutes(pool, config, { log = console, assertText = 
 /** 消费一轮 route_outbox：全量重生成一份 Traefik 动态配置并原子替换。 */
 export async function runRoutesOnce(pool, config, { log = console, workerId = 'routes-1' } = {}) {
   const rows = await claimRouteRows(pool, workerId);
-  if (rows.length === 0) return { processed: 0 };
+  // #506：`claimed` 是给消费循环看的**退避信号**（本次认领了几行）。与 `processed` 分开是有意的：
+  // 发布失败时 processed=0 而 claimed>0，那种情行由异常分支的 BACKOFF_MS 接管，不该走空闲退避。
+  if (rows.length === 0) return { processed: 0, claimed: 0 };
   try {
     const out = await rebuildRoutes(pool, config, { log });
     for (const row of rows) await markRoutePublished(pool, row.id);
-    return { processed: rows.length, target: out.target };
+    return { processed: rows.length, claimed: rows.length, target: out.target };
   } catch (err) {
     log.warn?.(`[routes] publish failed: ${err.message}`);
     for (const row of rows) await markRouteFailed(pool, row.id, err);
@@ -901,15 +998,28 @@ export async function recoverRouteOrphans(pool) {
 }
 
 /** 启动常驻消费循环（由 cli serve 调用）。 */
-export function startRoutesLoop(pool, config, { log = console, workerId = 'routes-1', onPause } = {}) {
-  let stopped = false;
+export function startRoutesLoop(pool, config, {
+  log = console,
+  workerId = 'routes-1',
+  onPause,
+  // issue #506 旋钮与可测缝：生产不传 ⇒ 真 setTimeout / Date.now / env 默认值；
+  // 单测注入假时钟与假 sleep（判据是「退避真的发生」，不是「代码里有 sleep」）。
+  sleep = sleepCancellable,
+  now = () => Date.now(),
+  // #506 评审①：旋钮带上安全上限；越界/非法 ⇒ 回落默认 + warn（`log` 在同一参数列表里已先绑定）。
+  idleBackoffMaxMs = envInt('ROUTE_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log }),
+  orphanRecoveryIntervalMs = envInt('ROUTE_ORPHAN_RECOVERY_INTERVAL_MS', ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT, { max: ORPHAN_RECOVERY_INTERVAL_MS_SAFE, log }),
+} = {}) {
   let consecutiveFailures = 0;
+  // #506：连续空闲拍数（认领到活就清 0）与孤儿回收上次跑的时刻。
+  let idleTicks = 0;
+  let lastOrphanRecoveryAt = Number.NEGATIVE_INFINITY; // 首拍必跑一次（保留原语义：启动就回收孤儿）
+  const abort = new AbortController();
   // N5（Round C 评审）：启动重建失败且 full_rebuild 入队**也**失败（如 DB 抖动）时，旧代码只 warn——
   // DB 恢复后不会再有任何全量重建触发。保留内存标记 needsFullRebuild：此后每次循环迭代
-  // （消费 outbox 之前）重试入队，成功即清位。复用既有 250ms 循环节奏（正常路径零成本空转），
-  // 不新增高频轮询/新时间轮；进程重启后由启动路径的 enqueueFullRebuild 重新尝试。
+  // （消费 outbox 之前）重试入队，成功即清位。退避只拉长**等待**，不改变这条重试与消费顺序。
   let needsFullRebuild = false;
-  (async () => {
+  const done = (async () => {
     // 启动全量重建（portal/Traefik 重启后从 DB 重建缺失状态，topology §8）。
     try {
       await rebuildRoutes(pool, config, { log });
@@ -925,7 +1035,7 @@ export function startRoutesLoop(pool, config, { log = console, workerId = 'route
         log.warn?.(`[routes] enqueue full_rebuild row failed: ${e2.message}；已置 needsFullRebuild 标记，循环内将持续重试入队`);
       }
     }
-    while (!stopped) {
+    while (!abort.signal.aborted) {
       try {
         // N5：标记为真 → 消费 outbox 之前先重试入队（成功清位；失败保持标记，下轮继续）。
         if (needsFullRebuild) {
@@ -937,18 +1047,48 @@ export function startRoutesLoop(pool, config, { log = console, workerId = 'route
             log.warn?.(`[routes] full_rebuild 入队重试仍失败: ${e2.message}（needsFullRebuild 保持，下轮继续）`);
           }
         }
-        await recoverRouteOrphans(pool);
-        await runRoutesOnce(pool, config, { log, workerId });
+        // #506：孤儿回收是一条 UPDATE，与「本轮有没有活」无关 ⇒ 独立节拍，不每拍跑。
+        const tickAt = now();
+        if (tickAt - lastOrphanRecoveryAt >= orphanRecoveryIntervalMs) {
+          await recoverRouteOrphans(pool);
+          lastOrphanRecoveryAt = tickAt;
+        }
+        const { claimed = 0 } = await runRoutesOnce(pool, config, { log, workerId });
         consecutiveFailures = 0;
-        await sleep(250);
+        idleTicks = claimed > 0 ? 0 : idleTicks + 1;
+        if (!(await sleep(idleDelayMs(idleTicks, idleBackoffMaxMs), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[routes] loop error: ${err.message}`);
         onPause?.('routes', err);
         const backoff = BACKOFF_MS[Math.min(consecutiveFailures - 1, BACKOFF_MS.length - 1)];
-        await sleep(backoff);
+        if (!(await sleep(backoff, abort.signal))) break;
       }
     }
   })();
-  return { stop() { stopped = true; } };
+  // issue #506 评审③：`done` 是裸 async IIFE 的 Promise，`cli.js` 过去不消费它 ⇒ 循环里
+  // `onPause` / `log.warn` / 注入的 `sleep` 在异常分支抛错时，`done` 变 rejected 且无人 catch
+  // = **未捕获拒绝**（本仓已知陷阱：测试摘要全绿，进程却 rc=1）。所以启动时**立刻**挂处理器。
+  // 语义没动：`done` 仍是同一个 promise（await 它照样看到 resolve/reject），`settled` 是
+  // 「永不拒绝」的那份，给只想等退出、不关心失败细节的调用方用。
+  let loopFailure = null;
+  const settled = done.catch((err) => {
+    loopFailure = err;
+    try {
+      log.warn?.(`[routes] 消费循环异常退出（已就地接住，未成为未捕获拒绝）：${err?.message ?? err}`);
+    } catch {
+      // 日志面自己坏了（注入的 log.warn 抛错）不许再制造第二条未捕获拒绝
+    }
+  });
+  return {
+    stop() {
+      abort.abort(); // 可中断：退避等待中的那一拍必须立刻断开，否则关闭最多白等 idleBackoffMaxMs
+    },
+    done, // 循环真正退出时 resolve（优雅关闭与单测可 await；拒绝也照原样冒给 await 它的人）
+    // #506 评审③：已挂拒绝处理器的版本（永不拒绝）。优雅关闭走 `stopLoopsAndWait` 用它也行，
+    // 单测想断言「没有未捕获拒绝」时 await 这一份，不会自己把拒绝吃掉又漏掉别的。
+    settled,
+    /** #506 评审③：循环异常退出时的那个错误（正常退出为 null）。 */
+    failure: () => loopFailure,
+  };
 }
