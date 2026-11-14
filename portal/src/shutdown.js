@@ -188,7 +188,7 @@ export const SHUTDOWN_TOTAL_MS_DEFAULT = 8000;
 
 /**
  * 编排一次优雅关闭：停接新连接 → 等循环收尾 → 等 server 关完 → **刷日志** → 退出。**始终在总上限内返回/退出**
- * （刷日志用的是留给 exit 的那部分余量，不延长总上限）。
+ * （刷日志**也在总预算之内**：它的超时取「剩余预算」与 `flushTimeoutMs` 取小，不是额外赠送的 250ms）。
  * @param {object} opts
  * @param {{ close: (cb: (err?: Error | null) => void) => unknown }} [opts.server] HTTP server（假对象可注入）
  * @param {Array} [opts.loops] 循环句柄，原样转交 `stopLoops`
@@ -198,12 +198,14 @@ export const SHUTDOWN_TOTAL_MS_DEFAULT = 8000;
  * @param {(code: number) => void} [opts.exit] 默认 `process.exit`（测试注入 spy，否则用例自己被杀掉）
  * @param {(loops: Array, o: object) => Promise<object>} [opts.stopLoops] 默认 `stopLoopsAndWait`
  * @param {(o: object) => Promise<object>} [opts.flush] 默认 `flushLogs`：exit 前把已排队的日志推到 fd（第三轮复审①）
- * @param {number} [opts.flushTimeoutMs] 刷日志的上限（默认 `FLUSH_LOGS_TIMEOUT_MS_DEFAULT`；超时也照样 exit）
+ * @param {number} [opts.flushTimeoutMs] 刷日志的上限**请求值**（默认 `FLUSH_LOGS_TIMEOUT_MS_DEFAULT`）；
+ *   实际生效值 = `min(该请求值, 总预算剩余)`（第四轮复审①：flush 不许突破总上限），落在返回账目 `flushTimeoutMs`
  * @param {Array} [opts.logStreams] 注入点：要刷的流（缺省交给 `flushLogs` 自己取 stdout/stderr）
  * @returns {Promise<{sequence: string[], elapsedMs: number, timedOut: boolean, exitCode: number,
  *                    loops: object | null, pendingLoops: string[], serverCloseStarted: boolean,
  *                    serverClosed: boolean, totalTimeoutMs: number, loopTimeoutMs: number,
- *                    flush: object | null}>}
+ *                    flush: object | null, flushTimeoutMs: number}>}
+ *   （`elapsedMs` **含**退出前刷日志那一段；`flushTimeoutMs` 是实际生效的刷日志上限）
  */
 export async function gracefulShutdown({
   server,
@@ -317,22 +319,39 @@ export async function gracefulShutdown({
       + ` → 循环等了 ${loopWaited} 个（跳过 ${loopSkipped} 个无 done 的）`
       + (loopsReport?.timedOut ? ` ⇒ 循环收尾超时 ${loopBudgetMs}ms` : '')
       + (loopsReport?.rejected ? `，${loopsReport.rejected} 个带错误退出` : '')
-      + ` ⇒ 用时 ${elapsedMs}ms / 总上限 ${totalBudgetMs}ms${timedOut ? '（到点强退）' : ''}`);
+      // 「刷日志前」三个字是**故意**的：汇总行必须**在 flush 之前**记（否则它自己就不会被刷），
+      // 所以这里的数字天然不含 flush；含 flush 的最终耗时看返回账目 `report.elapsedMs`。
+      + ` ⇒ 用时 ${elapsedMs}ms（刷日志前）/ 总上限 ${totalBudgetMs}ms${timedOut ? '（到点强退）' : ''}`);
   } catch { /* 日志坏了也要退 */ }
 
   // 第 4 步：**先刷日志，再 exit**（copilot 第三轮复审①）。
   // 为何必须：`process.exit()` 不等已经排队的 stdout/stderr 写入落盘，而生产里它们就是**管道**
   // ⇒ 上面那条 warn（以及汇总行）可能在到点强退那一次里被截断。deadline 路径与正常路径**都**走这里。
-  // 它用的是留给 exit 的那 ~2s 余量的一小段（默认 250ms），**不是**把总上限延长；刷不到也照样退。
+  //
+  // **预算口径（copilot 第四轮复审①）：flush 在总预算之内，不是额外赠送的 250ms。**
+  // 改前这里是「`flush({ timeoutMs: flushTimeoutMs })`」——总 deadline 的 race 已经结束、timer 也
+  // clearTimeout 了，才又**无条件**等最多 250ms ⇒ 两点都不成立：
+  //   · 「整个关闭流程 ≤ totalTimeoutMs」被突破（到点强退实际是 total + flushTimeoutMs）；
+  //   · `report.elapsedMs` 是 flush **之前**算的 ⇒ 账面上报的时间比真实耗时少一段，运维看日志对不上；
+  //   · 更糟的是 flushTimeoutMs 是**调用方传的**：传 `3e9` 就等约 24.9 天（夹取后的 timer 上限）——
+  //     「有上限的关闭」在这一步又变回没有上限。
+  // 修法：flush 的超时取 **min(flushTimeoutMs, 剩余预算)**；剩余为 0 时**照样调用**（write 本身仍会把
+  // 已排队的字节推下去），但不等回调 ⇒ 总上限是**硬**的，flush 只是「余量里能刷多少算多少」。
   sequence.push('flushLogs');
+  const flushRequestedMs = safeTimeoutMs(flushTimeoutMs);
+  const remainingMs = Math.max(0, totalBudgetMs - (Date.now() - startedAt));
+  const flushBudgetMs = Math.min(flushRequestedMs, remainingMs);
   let flushReport = null;
   try {
-    flushReport = await flush({ timeoutMs: flushTimeoutMs, ...(logStreams ? { streams: logStreams } : {}) });
+    flushReport = await flush({ timeoutMs: flushBudgetMs, ...(logStreams ? { streams: logStreams } : {}) });
   } catch (err) {
     // 刷日志自己炸了不许把 exit 挡掉（日志不是控制流）
     warn(`[shutdown] 退出前刷日志失败（忽略，照样 exit）：${err?.message ?? err}`);
   }
   report.flush = flushReport;
+  report.flushTimeoutMs = flushBudgetMs; // **实际生效**的那个数（= 请求值与剩余预算取小），不是请求值
+  // elapsedMs 必须**含** flush 那一段（第四轮复审①：改前它少算一段，账目与真实耗时不一致）
+  report.elapsedMs = Date.now() - startedAt;
 
   // 第 5 步：无论收没收完都退（`exit` 默认就是 `process.exit` ⇒ 后面那行 return 在生产里执行不到）
   exit(report.exitCode);
