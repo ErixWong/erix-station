@@ -657,12 +657,26 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // 现在两档分开：条目在 ⇒ 身份**只认它出生那一刻钉的值**（未知就是未知，永不覆盖）；条目不在 ⇒
     // 才退回读 `es.deltaRunId`（今天行为）。
     const deltaOwner = deltaEntry ? (deltaEntry.runId ?? null) : (es.deltaRunId.value ?? null);
-    // 「未知身份」的兼容口径（只比文本）也有一条**下界**：链路上后来**出现过**别的 run 身份时，
-    // 那个身份**不属于**这个气泡（身份在出生时就定了，见 `useEventStream` 的 `deltaRunId` 口径），
-    // 拿它去坐实「同 run」就是循环论证 ⇒ 宁可不撤（代价 = 界面上同一段正文可能两遍，刷新即回），
-    // 也不能撤错（代价 = 用户正在看的那段字凭空消失）。只有「整条链路一个 run 身份都没拿到」
-    //（真·旧后端，既有那条「身份未知 ⇒ 照旧撤」用例钉的就是这一档）才退回只比文本。
-    const claimedLater = deltaEntry !== null && deltaEntry.runId == null && (es.deltaRunId.value ?? null) !== null;
+    // 「未知身份」的兼容口径（只比文本）也有一条**下界**：链路上后来**出现过** run 身份时，
+    // 那个身份在**出生时**并不属于这个气泡（身份在出生那一刻就定了，见 `useEventStream` 的
+    // `deltaRunId` 口径），拿它去坐实「同 run」就是循环论证 ⇒ 宁可不撤，也不能撤错
+    //（撤错的代价 = 用户正在看的那段字凭空消失）。
+    //
+    // copilot 复审 261115-01 第三轮的 **①**（中·真实回归）：这条下界原来写的是「后来出现过**任何**
+    // run 身份 ⇒ 不撤」，**它没有比对「后来那个身份」与「这条 partial 自己的 `runId`」**。
+    // 于是这条本来**就属于 run-B** 的 delta 气泡 —— 它那几帧 `assistant_delta` 因竞态没带 `run_id`
+    // ⇒ 出生身份钉成 `null` —— 后来被 `partial_output` 帧把 `es.deltaRunId` 补成 `'run-B'` 之后，
+    // 来一条 `run_id='run-B'` 的同文本 partial 也照样**不撤** ⇒ **界面上同一段正文出现两遍**
+    //（#502 判据 4 的红线），而上面注释里「代价 = 可能两遍，刷新即回」这个代价**本来就消得掉**。
+    // 精确口径（只多加一个条件）：
+    //   · 后来出现的是**别的** run（`laterOwner !== runId`）⇒ **不撤**（未知不能当已知用，E 条）；
+    //   · 后来出现的**正是**这条 partial 的那个 run ⇒ 允许撤 —— 「补认领」与这条 partial 的归属
+    //     一致，撤掉的就是它自己那一份，不存在把别人的气泡抹掉的风险；
+    //   · 整条链路**一个 run 身份都没拿到**（真·旧后端，既有那条「身份未知 ⇒ 照旧撤」用例钉的
+    //     就是这一档）⇒ 退回只比文本。
+    const laterOwner = es.deltaRunId.value ?? null;
+    const claimedLater = deltaEntry !== null && deltaEntry.runId == null
+      && laterOwner !== null && laterOwner !== runId;
     const sameRun = !claimedLater
       && (deltaOwner === null || deltaOwner === 'unknown' || runId === 'unknown' || deltaOwner === runId);
     if (sameRun && es.deltaText.value === text) {

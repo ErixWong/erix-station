@@ -2944,23 +2944,27 @@ describe('copilot 验收 E：delta 气泡带来源 run，同文本跨 run 不得
 });
 
 // ---------------------------------------------------------------------------
-// copilot 复审 261115-01 的 **①**（中）：`deltaEntry.runId === null` 不得被**后续** run 身份「补认领」
+// copilot 复审 261115-01 的 **①**（中）：`deltaEntry.runId === null` 不得被**后来的别的 run** 顶掉
 //
 // 改前那句 `deltaEntry?.runId ?? es.deltaRunId.value ?? null` 用 `??` 把两档读成同一种：
 //   · 「没有 delta 条目」（`deltaEntry === null`）与
 //   · 「有条目、但出生时 `run_id` 未知 ⇒ 身份已被**钉成** `null`」。
 // `??` 见 `null` 就当「没有」⇒ 已钉成未知的出生身份会被**后来**的 `es.deltaRunId` 顶掉（
-// `case 'partial_output'` 每收一帧都无条件写 `deltaRunId`）⇒ `sameRun` 拿「后来的 run ==
-// 这条 partial 的 run」当「同 run」的证据 ⇒ E 条要修的**跨 run 误删**换个路径回来：
-// 那个气泡其实是「身份未知的旧段」的，被一个它从没认领过的 run 的 partial 抹掉。
+// `case 'partial_output'` 每收一帧都无条件写 `deltaRunId`）⇒ E 条要修的**跨 run 误删**换个路径回来。
+// 第一版修法把「后来出现过任何 run 身份」一律当「不是这个气泡」拦下（见下面的 run-C 用例），
+// **第三轮复审又报出它的代价**：那条本来**就属于 run-B** 的段因竞态以 `runId = null` 出生、
+// 后来 `es.deltaRunId` 补成 `'run-B'` ⇒ 来一条 `run_id='run-B'` 的同文本 partial 也不撤
+// ⇒ **同一段正文两遍**（#502 判据 4 的红线）。现在口径是「后来那个身份**确实不是**这条 partial
+// 的 run 才拦」（见 `run-C` 与 `run-B` 两条方向相反的用例）。
 //
-// 两条用例一起承重（方向相反，缺一边就写得过窄）：
-//   · 未知身份 + 链路上**出现过**别的 run ⇒ **不撤**（未知不能当已知用）；
+// 三条用例一起承重（方向互补，缺一边就写得过窄）：
+//   · 未知身份 + 后来出现的**正是**这条 partial 的 run ⇒ **撤**（否则同一段正文两遍）；
+//   · 未知身份 + 后来出现的是**别的** run ⇒ **不撤**（未知不能当已知用，E 条）；
 //   · 未知身份 + 整条链路一个 run 身份都没拿到 ⇒ **照旧撤**（旧后端的兼容口径，#502 判据 4）。
-// 两条都走**真实 watcher 路径**（`assistant_delta` → composable → `watch(es.deltaText)` 建条目），
+// 三条都走**真实 watcher 路径**（`assistant_delta` → composable → `watch(es.deltaText)` 建条目），
 // 并各自把前置断言写死（`bubble.runId === null` / `deltaRunId === null`），否则等于什么都没测。
 // ---------------------------------------------------------------------------
-describe('copilot 复审 ①：出生身份未知的 delta 条目不得被后来的 run 身份补认领', () => {
+describe('copilot 复审 ①：出生身份未知的 delta 条目只不得被「后来的**别的** run」顶掉', () => {
   beforeEach(() => {
     mockFetch((url) => {
       if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
@@ -2974,25 +2978,25 @@ describe('copilot 复审 ①：出生身份未知的 delta 条目不得被后来
   const deltas = (store: ReturnType<typeof useWorkbenchStore>) =>
     store.entries.filter((e) => e.kind === 'delta') as Array<{ kind: 'delta'; text: string; runId?: string | null }>;
 
-  it('气泡以 runId=null 诞生 + 之后 deltaRunId 变成 run-B ⇒ 同文本的 run-B partial **不得撤**它', async () => {
+  it('气泡以 runId=null 诞生 + 之后 deltaRunId 补成 run-C（**别的** run）⇒ 同文本的 run-B partial **不得撤**它', async () => {
     const store = useWorkbenchStore();
     await store.openSession('s1');
     const es = FakeEventSource.instances.at(-1)!;
     store.es.activeRunId = null; // 出生时两把尺都拿不到 ⇒ 身份钉成 null
-    es.emit('round_start', { seq: 7, round: 1, run_id: 'run-B' }); // 先立轮起点，后面那条快照帧才过得了轮闸
+    es.emit('round_start', { seq: 7, round: 1, run_id: 'run-C' }); // 先立 run-C 的轮起点，下面那帧才过得了轮闸
     es.emit('assistant_delta', { text: '同样的一段话' });           // 无 run_id ⇒ 身份未知
     const { nextTick } = await import('vue');
     await nextTick();
     expect(deltas(store).length, '前置：条目必须是 watcher 建出来的').toBe(1);
     expect(deltas(store)[0].runId, '前置：出生身份必须真的被钉成 null').toBe(null);
 
-    // **后来**的一帧快照把 `es.deltaRunId` 写成了 run-B（同文本 ⇒ `deltaText` 值不变 ⇒ watcher
+    // **后来**的一帧快照把 `es.deltaRunId` 写成了 **run-C**（同文本 ⇒ `deltaText` 值不变 ⇒ watcher
     // 不重跑 ⇒ 条目的 `runId` 仍是 `null`）。这就是「补认领」的发生现场。
     es.emit('partial_output', {
-      run_id: 'run-B', roundSeq: 7, text: '同样的一段话', chunks: 1, truncated: false, source: 'memory',
+      run_id: 'run-C', roundSeq: 7, text: '同样的一段话', chunks: 1, truncated: false, source: 'memory',
     });
     await nextTick();
-    expect(store.es.deltaRunId, '前置：composable 侧的身份已变成 run-B（补认领真的发生了）').toBe('run-B');
+    expect(store.es.deltaRunId, '前置：composable 侧的身份已变成 run-C（补认领真的发生了）').toBe('run-C');
     expect(deltas(store)[0].runId, '前置：条目自己的身份仍是未知（出生那一刻定的）').toBe(null);
 
     store.addPartialOutput({
@@ -3001,8 +3005,43 @@ describe('copilot 复审 ①：出生身份未知的 delta 条目不得被后来
     });
     await nextTick();
     expect(deltas(store).length,
-      '身份未知被当成「已知 = run-B」用了：那个后来才出现的 run 不是这段气泡的主人 ⇒ 不得撤').toBe(1);
+      '身份未知被当成「已知 = run-C」用了：那个后来才出现的 run **不是**这条 partial 的 run ⇒ 不得撤').toBe(1);
     expect(store.es.deltaText, '流式状态也不许被它清掉').toBe('同样的一段话');
+  });
+
+  // 第三轮复审的 ①（本次修的核心）：「后来出现过身份」不再等于「不是这个气泡」——
+  // 那个身份**正是**这条 partial 的 run 时，拦下来就是拿同一段正文渲染两遍。
+  // 改前会红的就是这一条（改前 `claimedLater` 不看 `laterOwner !== runId` ⇒ 不撤 ⇒ 下面断言 0 变 1）。
+  it('气泡以 runId=null 诞生 + 之后 deltaRunId 补成 run-B（**正是**这条 partial 的 run）⇒ 同文本 ⇒ **撤**（不得两遍）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = null; // 出生时拿不到身份（竞态那半：delta 帧没带 run_id）
+    es.emit('round_start', { seq: 7, round: 1, run_id: 'run-B' });
+    es.emit('assistant_delta', { text: '同样的一段话' });           // 无 run_id ⇒ 身份未知
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store).length, '前置：条目必须是 watcher 建出来的').toBe(1);
+    expect(deltas(store)[0].runId, '前置：出生身份必须真的被钉成 null').toBe(null);
+
+    // 这一帧本身就是 run-B 的快照 ⇒ 「后来出现的身份」与「下面那条 partial 的 run」是**同一个**。
+    es.emit('partial_output', {
+      run_id: 'run-B', roundSeq: 7, text: '同样的一段话', chunks: 1, truncated: false, source: 'memory',
+    });
+    await nextTick();
+    expect(store.es.deltaRunId, '前置：composable 侧的身份是 run-B').toBe('run-B');
+    expect(deltas(store)[0].runId, '前置：条目自己的身份仍是未知（出生那一刻定的）').toBe(null);
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(deltas(store).length,
+      '后来那个身份正是这条 partial 自己的 run ⇒ 拦下来就是把同一段正文渲染两遍（#502 判据 4）').toBe(0);
+    expect(store.entries.filter((e) => e.kind === 'partial').map((e) => (e as { id: string }).id))
+      .toEqual(['partial:run-B']);
+    expect(store.es.deltaText, '撤掉气泡就要连流式状态一起清（否则下一帧又把它建回来）').toBe(null);
   });
 
   it('同一条链路里一个 run 身份都没拿到 ⇒ 未知身份照旧按「只比文本」撤（兼容口径不许改坏）', async () => {
