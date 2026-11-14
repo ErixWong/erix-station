@@ -2712,7 +2712,12 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   > （`assistant_delta` / `reasoning_delta` / `tool_call_delta`）**不分配 `seq`**（只转发，见 §5.3 表里那三行），
   > ② U3 写循环去掉了「先 `SELECT` 查重」的预检，重复投递会先烧掉 `seq` 再由 `ON CONFLICT DO NOTHING` 丢掉。
   > 结论对客户端不变、但更强：**跳号不是丢事件**，`chat_sessions.last_seq` 仍单调、`UNIQUE(session_id, seq)` 仍兜底。
-  > 下面 #25 那段关于「空洞」的措辞保留在原文里（它讲的是 messages/run_events 共用分配器那半边，仍然成立）。
+  > 下面 #25 那段关于「空洞」的措辞保留在原文里，但**它那句「无空洞只对 `messages ∪ run_events`
+  > 联合序列成立」也自本单起作废**：D-8 去掉逐事件的 `SELECT 1` 预查后，重复投递会**先烧掉一个 `seq`**
+  > 再由 `ON CONFLICT DO NOTHING` 丢掉，而那一号 **`messages` 与 `run_events` 两张表都不落行**
+  > ⇒ **联合序列同样有洞**（依据：`portal/src/internal.js` 的 U3 写循环与
+  > `portal/test/internal-delta-not-persisted.test.js` 里「seq 允许跳号」那条用例）。
+  > 口径收敛成一句：**`seq` 只保证单调**（它是回放游标，不是无洞的序号），`UNIQUE(session_id, seq)` 仍兜底。
   > **补发不再只依赖 DB，但也只看内存（形态 M）**：断线重连时「已经流出去、但按定义不落库」的那段
   > **当前轮**正文由 portal **进程内累加器**（`portal/src/run-partial-buffer.js`）补出。
   > **没有 DB 回落**（#502 之前那层「退回库里那一行 `partial_output`」已随该种行一起删除）：
@@ -2746,6 +2751,10 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   > 假设 portal 单副本部署。多副本时「断在另一个副本上」必然看不到那段正文（表现 = 少一段未定稿，
   > 不是脏数据），要跨副本补发得先把累加器换成共享存储（登记在 §8.125 的后续里）。
   > **实现注记（issue #25 裁决）**：「无空洞」只对 **`messages ∪ run_events` 联合序列**成立（两表共用 `chat_sessions.last_seq` 分配器，schema.sql §3）；SSE 只推 `run_events`，故**事件流单独看存在合法空洞**（user 消息、assistant 回写各占一个 seq）。因此客户端**不得**以「seq 跳号」作为重连触发条件（会把合法空洞误判为丢事件，重放后仍跳号 → 无限重连风暴，实测复现）。丢失恢复路径：① 服务端 `resync` 控制帧（缓冲溢出，见下）；② 浏览器 `EventSource` 自动重连天然携带 `Last-Event-ID`（§5.2 补发 `seq > lastEventId`）。前端仅在收到 `resync` 时主动 `close()` + 以 `?last_event_id=<本地已知最大 seq>` 重连。
+  > ⚠ **时间边界（261114-04 审计补）**：上面那句「无空洞只对联合序列成立」**写于 #25，已被 #502 推翻**——
+  > 重复投递先烧 `seq` 再被 `ON CONFLICT DO NOTHING` 丢掉 ⇒ 那一号两张表都不落行，**联合序列也不保证无洞**
+  > （见上面那条 #502 注记与 `docs/data/model.md` §1.12）。原文留着是取证它当时的口径；本注记**仍然有效的部分**
+  > 是后半句：客户端不得拿跳号当重连判据，丢失恢复只走 `resync` 与 `Last-Event-ID` 两条路。
 - 响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
 - 每 15s 发送注释行心跳（`: ping\n\n`），防止中间层断连。心跳不是事件，不占 seq。
 - 响应建议携带 `retry: 3000`，指导浏览器断线重连间隔。

@@ -10,21 +10,33 @@
 // 怎么跑（**在 playwright 容器里跑**，不在宿主直接跑；容器是 host 网络，能直接打到 127.0.0.1:18080）：
 //   docker cp portal/integration/stream-typing-check.mjs \
 //     erix_station_playwright:/home/node/.playwright-mcp/stream-typing-check.mjs
-//   docker exec -e SESSION_ID=<会话 id> -e COOKIE=<会话 token> -e BASE_URL=<入口> \
-//     -e COOKIE_NAME=<cookie 名> erix_station_playwright \
+//   docker exec -e SESSION_ID=<会话 id> -e COOKIE=<会话 token> erix_station_playwright \
 //     node /home/node/.playwright-mcp/stream-typing-check.mjs
+//   （**只这两个变量就能跑**：`BASE_URL` 缺省即 compose 的 `127.0.0.1:18080`，`COOKIE_NAME` 缺省
+//   跟着入口协议联动；要换入口/换 cookie 名再显式加 `-e BASE_URL=… -e COOKIE_NAME=…`。）
 // 需要的环境变量：
 //   SESSION_ID   必填。要一个**可写**的会话 ⇒ 本用例会真的发一条消息、真的起一个 run、真的花 token。
 //   COOKIE       必填。会话 token 值（登录后那条 `Set-Cookie` 里的值）。cookie **名**由宿主的
 //                `COOKIE_PROFILE` 决定（`portal/src/config.js` `cookieSettings`）：
 //                `prod` → `__Host-fde_session`（Secure）、`dev-http` → `fde_session_dev`（非 Secure）。
-//                用 `COOKIE_NAME` 指名，**别猜**（名字不对 = 静默落回登录页，本脚本会显式判失败）。
+//                名字**跟入口协议是一对**（见下面 `COOKIE_NAME`：缺省已联动，不必猜）。
+//                名字不对 = 静默落回登录页 ⇒ `verdict=FAIL reason=not_authenticated`。
 //   BASE_URL     选填，缺省 `http://127.0.0.1:18080`（compose 的 `PORTAL_HOST_PORT`）。
 //                走边缘入口时形如 `https://station.fde.erix.vip:8443`（自签证书时本脚本会因 TLS 失败）。
-//   COOKIE_NAME  选填，缺省 `__Host-fde_session`。
+//   COOKIE_NAME  选填，**缺省值按 `BASE_URL` 的协议联动**（不是写死的一个串）：
+//                `https:` ⇒ `__Host-fde_session`（Secure）；`http:` ⇒ `fde_session_dev`（非 Secure）。
+//                为什么要联动：`__Host-` 前缀被浏览器**强制要求 Secure**，在 http 入口下 Chromium 会
+//                直接**拒收**这条 cookie ⇒ 表现成「落回登录页」，看着像会话问题其实是名字选错了。
+//                ⇒ **按默认值跑 http 缺省入口就是可用的**（以前缺省写死 `__Host-fde_session`，
+//                不传 `COOKIE_NAME` 必挂，只能靠调用方每次显式传参绕过）。
+//                显式传 `COOKIE_NAME` 时**尊重传的值**，但「`__Host-` 名字 + 非 https 入口」这个组合
+//                当场 `verdict=FAIL reason=cookie_name_needs_https` 退出（一句话修法），不进浏览器。
 //   MESSAGE      选填。默认是一句「多吐正文、且这一轮别调工具」的话——工具轮会把流式打断成工具卡片，
 //                量不到连续增长的正文。
 //   SHOTS        选填，缺省 3（连拍张数，判据要求 ≥2）；`SHOT_GAP_MS` 缺省 2000。
+//   FIRST_TEXT_TIMEOUT_MS 选填，缺省 **60000**（毫秒）。点发送到「量到第一段流式正文」的预算：
+//                到点还没有任何正文 ⇒ `verdict=FAIL reason=no_streaming_text_within_budget`
+//                （那是「打字机死了」的判据，不是「慢」——所以它必须给得比模型首 token 的正常延迟宽）。
 //   OUT_DIR      选填，缺省 `/home/node/.playwright-mcp` —— 就是 playwright 容器的 output-dir
 //                （宿主侧对应 `/docker/erix_station_playwright`，截图落那儿可以直接看/可以进 vision）。
 //   PLAYWRIGHT_CORE_PATH 选填。`playwright-core` 的解析路径：mcp 镜像里它在 `/app/node_modules/playwright-core`
@@ -38,6 +50,9 @@
 //   `TYPING_CHECK lengths=<a>,<b>,<c>`                                  三次量到的流式气泡正文字符数
 //   `TYPING_CHECK verdict=PASS reason=strictly_increasing`              **三次长度严格递增**才算过
 //   `TYPING_CHECK verdict=FAIL reason=<码>[ detail=<..>]`                其余一切（含环境不满足）
+//   环境类失败码（都在**不起浏览器**时就退，并带一行 `TYPING_CHECK fix=…` 修法）：
+//                `missing_SESSION_ID` / `missing_COOKIE` / `bad_SHOTS` / `bad_BASE_URL` /
+//                `cookie_name_needs_https`（`__Host-` 名字 @ 非 https 入口）
 //   递增 ⇒ 碎片仍在流；不递增 ⇒ 要么根本没在流（长度不动），要么气泡被整段覆盖/清空（长度倒退）。
 //
 // 为什么不进 CI（也不进 `npm test`）：`docs/ops/ci-release.md` 已定「e2e 不进 CI」——它要真起栈、真浏览器、
@@ -50,7 +65,19 @@
 const SESSION_ID = process.env.SESSION_ID;
 const COOKIE = process.env.COOKIE;
 const BASE_URL = (process.env.BASE_URL || 'http://127.0.0.1:18080').replace(/\/+$/, '');
-const COOKIE_NAME = process.env.COOKIE_NAME || '__Host-fde_session';
+// `BASE_URL` 的协议决定 cookie 名的缺省值（两者是同一件事的两半，见头注释 `COOKIE_NAME` 那段）。
+// URL 形态坏掉要在这里就报成机器可读的结论，而不是把裸堆栈留给调用方去猜。
+let baseIsHttps;
+try {
+  baseIsHttps = new URL(BASE_URL).protocol === 'https:';
+} catch {
+  console.log(`TYPING_CHECK verdict=FAIL reason=bad_BASE_URL detail=${BASE_URL}`);
+  console.log('TYPING_CHECK fix=给一个带协议的绝对 URL，例如 http://127.0.0.1:18080 或 https://station.fde.erix.vip:8443');
+  process.exit(1);
+}
+// 口径与 `portal/src/config.js#cookieSettings` 同源：`prod` → `__Host-fde_session`（Secure）、
+// `dev-http` → `fde_session_dev`（非 Secure）。显式传了就照办（下面的 fail-fast 只管浏览器真的会拒的那种组合）。
+const COOKIE_NAME = process.env.COOKIE_NAME || (baseIsHttps ? '__Host-fde_session' : 'fde_session_dev');
 const MESSAGE = process.env.MESSAGE
   || '请用大约 600 字讲讲这台工位平台的整体架构，纯文字回答，这一轮不要调用任何工具。';
 const SHOTS = Number(process.env.SHOTS || 3);
@@ -75,6 +102,16 @@ if (!SESSION_ID || !COOKIE || !(SHOTS >= 2)) {
   if (!SESSION_ID) console.log('TYPING_CHECK verdict=FAIL reason=missing_SESSION_ID');
   if (!COOKIE) console.log('TYPING_CHECK verdict=FAIL reason=missing_COOKIE');
   if (!(SHOTS >= 2)) console.log(`TYPING_CHECK verdict=FAIL reason=bad_SHOTS detail=${process.env.SHOTS}`);
+  if (!SESSION_ID || !COOKIE) console.log('TYPING_CHECK fix=两个都要给：SESSION_ID=一个可写的会话 id，COOKIE=登录后 Set-Cookie 里的 token 值');
+  process.exit(1);
+}
+// fail-fast：`__Host-` 前缀是**浏览器侧的硬约束**（必须 Secure），不是本脚本的偏好。名字带 `__Host-`
+// 而入口不是 https 时，Chromium 会**静默拒收**这条 cookie，症状是「落回登录页」——一个真环境问题
+// （名字选错）会被写成一条含糊的 `not_authenticated`。所以显式传了这个名字 + 非 https 入口就当场退。
+// （缺省值已经按协议联动，走到这里的一定是**显式传参**。）
+if (!baseIsHttps && COOKIE_NAME.startsWith('__Host-')) {
+  console.log(`TYPING_CHECK verdict=FAIL reason=cookie_name_needs_https detail=${COOKIE_NAME} @ ${BASE_URL}`);
+  console.log('TYPING_CHECK fix=非 https 入口用 dev-http 的名字：-e COOKIE_NAME=fde_session_dev（或直接不传，缺省已跟着协议走）；要用 `__Host-` 名字就把 BASE_URL 换成 https 入口');
   process.exit(1);
 }
 
@@ -128,14 +165,15 @@ try {
   // 会话 cookie 是 host-only 的（`__Host-` 前缀强制 Secure + Path=/ + 无 Domain），所以只给 `url`：
   // Playwright 从 url 取 host/path（**给了 `url` 就不能同时给 `path`**，否则它直接拒：
   // 「Cookie should have either url or path」，实测）。`secure` 跟着协议走：http 入口
-  // （dev-http profile）必须给 false；而名字带 `__Host-` 却是 http 入口时 Chromium 会自己拒这条
-  // cookie（前缀规则），那属于「名字选错了」，下面显式报出来而不是静默落登录页。
+  // （dev-http profile）必须给 false。名字与协议**在缺省路径上已经联动**（见上面 `COOKIE_NAME`），
+  // 显式传参传错组合的（`__Host-` + http）在上面就 fail-fast 退了；这里再兜一层 Chromium 自己的拒绝
+  // （Playwright 不会替前缀规则报错，它照收，被拒是浏览器行为 ⇒ 下面 `not_authenticated` 那条会抓）。
   try {
     await context.addCookies([{
       name: COOKIE_NAME,
       value: COOKIE,
       url: BASE_URL,
-      secure: new URL(BASE_URL).protocol === 'https:',
+      secure: baseIsHttps,
       httpOnly: true,
       sameSite: 'Lax',
     }]);
@@ -190,7 +228,7 @@ try {
     console.log(`TYPING_CHECK shot=${i + 1} bubble_count=${m.count} len=${m.len} shot_file=${file}`);
   }
   console.log(`TYPING_CHECK lengths=${lengths.join(',')}`);
-  console.log(`TYPING_CHECK session=${SESSION_ID} base=${BASE_URL} gap_ms=${SHOT_GAP_MS} shots=${SHOTS}`);
+  console.log(`TYPING_CHECK session=${SESSION_ID} base=${BASE_URL} cookie_name=${COOKIE_NAME} gap_ms=${SHOT_GAP_MS} shots=${SHOTS}`);
 
   for (let i = 1; i < lengths.length; i += 1) {
     if (!(lengths[i] > lengths[i - 1])) {

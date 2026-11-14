@@ -5262,3 +5262,44 @@ Node 没有 `flock(2)` 绑定 ⇒ `open 'wx'` 原子创建 + 锁内记 `{pid,tok
 **部署路径（记下来）**：`npm run db:migrate` 在**宿主上跑不通**（`password authentication failed for user "station"`
 ——CLI 读的是进程环境，不是 `deploy/.env`）。正解是**重建镜像后重启容器**，让 `MIGRATE_ON_START=1` 在监听前
 应用迁移；镜像必须重建，因为迁移文件是 `COPY deploy/migrations/` 打进镜像的（旧镜像里只有到 `0033`）。
+
+#### 8.126.3 #511 合并后的审计复核：修 6 条文档/脚本事实错误（261114-04，2026-11-14，worker 落地）
+
+**为什么单独一笔**：#511 那批补的是「文档说了什么」，这一批补的是「文档说的还成立吗」。copilot 复核把
+上一轮的补记判成阻塞性事实错误，主 agent 逐条现验属实后开本单。**六条全部是真错**，没有一条是误报。
+
+| # | 位置 | 错在哪（现验） | 修成什么 |
+|---|---|---|---|
+| 1 | `portal/integration/stream-typing-check.mjs` | `COOKIE_NAME` 缺省写死 `__Host-fde_session`、`BASE_URL` 缺省是 **http**，而 `__Host-` 前缀被浏览器强制要求 Secure ⇒ **按默认值跑必然认证失败**（脚本自己的注释就写了这条约束，默认值没跟上；此前每次跑都要显式传参绕过） | 缺省值**按入口协议联动**（`https:` ⇒ `__Host-fde_session`，`http:` ⇒ `fde_session_dev`，与 `portal/src/config.js#cookieSettings` 同源）；显式传 `__Host-` 名 + 非 https 入口 ⇒ **fail-fast** `verdict=FAIL reason=cookie_name_needs_https` + 一行 `fix=`；头注释补上代码一直读、注释一直漏的 `FIRST_TEXT_TIMEOUT_MS`（缺省 60000）；结论行加 `cookie_name=` 让联动后的取值可观测 |
+| 2 | `docs/api/portal.md` §5.1 | #502 那条新注记写着「#25 那句『无空洞只对 `messages ∪ run_events` 联合序列成立』**仍然成立**」——它给一条**已作废**的旧断言背书 | 两处口径统一：**自 #502 起联合序列也不保证无洞**（D-8 去掉逐事件 `SELECT 1` 预查 ⇒ 重复投递先烧 `seq` 再由 `ON CONFLICT DO NOTHING` 丢掉，那一号两张表都不落行；依据 `internal.js` 的 U3 写循环 + `internal-delta-not-persisted.test.js` 的「seq 允许跳号」用例）。`seq` 只保证**单调**，是回放游标；`UNIQUE(session_id, seq)` 仍兜底 |
+| 3 | `docs/ops/ci-release.md` §1「当前基线」 | 锚点写 `main@e006d45` 却把**本 PR 新增**的文件算进 264（那棵树里只有 263 个）；并且一边说「三处台账自本日起同值」、紧接下一句说「那三处如今只剩本节写数字」 | 数字**整组重跑**并把锚点写成本分支上读数真实所在的 commit（见下）；删掉「三处同值」那句，只留「现价以本节为单一来源」 |
+| 4 | `docs/testing.md` §2.2.1 | 「**两处**真库文件共用同一句话」——现在有三处 | 泛化成「**所有**真库文件」（不写个数，免得加第四个又漂），并写清接入形态两支：两支 `import { SKIP_WITHOUT_PG }`、`migrate-fresh-db.test.js` 那份是**字面重复的同文案** ⇒ 改文案要动两处 |
+| 5 | `docs/data/model.md` §4 | `run_checkpoints` 还写 85 行 / 4.6 MB（`0033` 前甚至 `0034` 前的快照） | 加**时间边界**：`0034` 前 87 行 / 4,644,864 B；`0034` + `VACUUM (FULL, ANALYZE)` 后 **17 行 / 565,248 B**（heap 8,192 + 索引 32,768 + TOAST 本体 507,904，算 TOAST 索引是 524,288）。旧读数**不覆盖**，只加边界；出处 §8.126.2 |
+| 6 | `deploy/migrations/README.md` | 清单只到 `0033`，缺已合并的 `0034` | 补 `0034` 一行（两条谓词 + 纯清理零 DDL）与**部署动作**：`0034` 之后要手工 `VACUUM (FULL, ANALYZE) run_checkpoints` 才回收磁盘（4.64 MB → 565 KB，出处 §8.126.2） |
+
+**#1 的真机验收（判据是脚本自己的结论行，不是「跑起来了」）**：按**默认值**跑——只传 `SESSION_ID` + `COOKIE`，
+**不传** `COOKIE_NAME` / `BASE_URL`，在 `erix_station_playwright` 里打 `http://127.0.0.1:18080`：
+
+```
+TYPING_CHECK lengths=20,558,1209
+TYPING_CHECK session=1fbba941-… base=http://127.0.0.1:18080 cookie_name=fde_session_dev gap_ms=2000 shots=3
+TYPING_CHECK verdict=PASS reason=strictly_increasing
+```
+
+`cookie_name=fde_session_dev` 就是「缺省跟着协议走」的证据（改之前这一档会 `not_authenticated`）。
+同一棵树上另跑 fail-fast：`COOKIE_NAME=__Host-fde_session` + 默认 http 入口 ⇒ `reason=cookie_name_needs_https` rc=1，
+**没起浏览器就退**。环境复原：`users.mail_otp_enabled` 跑前 `false` 跑后已恢复 `true`（现查为 `t`）、
+会话 `DELETE` ⇒ 204（`status=archived`，DELETE 的语义就是归档，库里那行本来就不硬删）、
+容器与宿主 output-dir 里的脚本与三张截图已删、`/tmp` 临时 cookie 文件已删。
+
+**门禁读数（本单亲手重跑，不抄上一笔）**：① `node --check` **265** 个文件 rc=0 ·
+② 根 `npm test` **2226 / 2212 pass / 0 fail / 14 skipped** rc=0（13 条真库 + 1 条 LiteLLM live；
+带 `TEST_DATABASE_URL` 单跑那三个真库文件 **15 / 15 pass / 0 skip**）· ③ runner **507 / 507** rc=0 ·
+④ 前端 `typecheck` 干净 + **63 文件 / 1336 通过** rc=0 · `npm run check:agents-hotlayer` **VERDICT ok** rc=0。
+
+**顺带量到的两件可记账的事**：
+- 「`node --check` 文件数」从 263 涨到 265 是**两笔各加一个**（`aa78c6b` 加 `prune-checkpoints-db.test.js`、
+  `5c7fc2c` 加手工 e2e 脚本），上一笔记账时把两笔当一笔 ⇒ 那个 264 从来没有对应的树。教训：**锚点必须写「读数
+  真实所在的那棵树」，不能写「我记账时看到的 HEAD」**。
+- 三个真库文件里有**两份**同样的 skip 文案（一份导出、一份字面量）。泛化成「所有真库文件」只是让文档不再漂，
+  **代码侧那份重复还在**（`pg-fixture.js:136` 与 `migrate-fresh-db.test.js:27-29`），本单不动测试文件，留给后续。
