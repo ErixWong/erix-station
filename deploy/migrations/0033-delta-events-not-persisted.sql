@@ -1,21 +1,26 @@
--- 0033-delta-events-not-persisted.sql —— stream 档碎片不落库之后的存量清理 + 那一行的唯一键（issue #502）
+-- 0033-delta-events-not-persisted.sql —— stream 档碎片的存量清理（issue #502，**形态 M：纯清理，零 DDL**）
 --
--- 干什么（两件，都必须可重放）：
---   ① 建部分唯一索引 `run_events_run_partial_key (run_id) WHERE type = 'partial_output'`：
---      把「一个 run 至多一行 `partial_output`」从代码约定（`internal.js#insertPartialOutputRow` 的
---      `client_event_id = <runId>:final:partial_output` + `ON CONFLICT DO NOTHING`）抬成**库面约束**。
---      形状照既有先例 `run_events_run_end_key`（`docs/data/schema.sql:371-372`，同一个 run 至多一条
---      终态事件），不新造第三种写法。为什么必须唯一：补发侧（`http.js#buildPartialSnapshotFrames`）与
---      历史合成项（`http.js#aggregatePartialOutputs`）都按「至多一行」取数，两行就会让**同一个 run
---      在界面上出两条正文**——正是 #300 从头就在防的那件事。
---   ② 分批清存量碎片：`assistant_delta` / `reasoning_delta` / `tool_call_delta` 三类共 877,155 行
---      （dev 实测：884,163 行里占 99.2 %，472 MB 表体的 99 % 在这里）。清完表体与五个索引一起缩。
+-- 干什么（只有一件，且必须可重放）：分批清掉 `assistant_delta` / `reasoning_delta` / `tool_call_delta`
+--   三类历史碎片（dev 实测：884,163 行里 877,155 行是这三类，占 99.2 %，472 MB 表体的 99 % 在这里）。
+--   写入侧已按引擎 `eventTierOf` 拦住它们（`portal/src/internal.js` 的 U3 写循环），本文件只负责历史存量。
+--   清完表体与五个既有索引一起缩——**本单不新增、也不删除任何索引**。
 --
 -- ⚠ 名单与写入侧同源，但**这里只能手抄**：迁移文件跑在 SQL 里，读不到 JS 的 `EVENT_TIERS`。
 --   所以这三串在本文件里出现两次（谓词 + 观测），而 `portal/test/migrations.test.js` 钉住
 --   「代码里的写入侧判据仍来自 `eventTierOf`」——漂移方向只有一个：引擎新增 stream 档类型时
 --   本站写入侧自动拦住（不落库），而这里少清一类**历史存量**（历史存量本来就只可能有这三类，
 --   新类型不会出现在旧数据里）⇒ 漏清不会发生，写错才会。
+--
+-- **形态 M 删掉了本文件原来那半截 DDL**（`CREATE UNIQUE INDEX run_events_run_partial_key
+--   ON run_events (run_id) WHERE type = 'partial_output'`），理由要留在这里，免得下一个人重新发明：
+--   * 那个索引保护的是「一个 run 至多一行 `partial_output`」，而**形态 M 根本不写这种行**了：
+--     终态那半截正文并进**既有的** `run_end` 行（`payload.partial_text` / `partial_round` 两个
+--     additive 键），已完成轮次直接读**既有的** `round_end` 行（`payload.final_text`）。
+--     一个 run 至多一条 `run_end` 这件事，由**既有**的 `run_events_run_end_key`
+--     （`docs/data/schema.sql:371-372`）兜着，不需要第二条部分索引说同一句话。
+--   * 新增索引不是零成本：它是写入路径上每次 INSERT 都要多维护的一棵树，而 #502 之后 `run_events`
+--     的写入量已经是「每轮几条」而不是「每轮几百条」⇒ 那棵树的收益本来就没拿过，代价却长期在。
+--   * ⇒ **本单零新索引、零新列、零新类型**：`deploy/migrations` 里这一支只有 DELETE 与观测。
 --
 -- 为什么 VACUUM **不在**本文件里（硬约束，不是风格）：迁移 runner 是**单事务**执行每个文件
 --   （`portal/src/migrate.js` BEGIN → 执行 → 落 schema_migrations → COMMIT），而 PG 的 `VACUUM`
@@ -28,7 +33,7 @@
 --   等下一个人重新发现一遍：
 --     * B（`run_events` 的 5 个索引）：删索引只在**写入路径**换收益，而 #502 之后写入量已经是每轮
 --       几条而不是每轮几百条 ⇒ 写入侧收益跟着消失，留下的是读侧真用得到的形状
---       （`(session_id, seq)` 补发、`(run_id, seq)` 历史与聚合、`session_id INCLUDE` 覆盖）。
+--       （`(session_id, seq)` 补发、`(run_id, seq)` 历史与正文取数、`session_id INCLUDE` 覆盖）。
 --       索引体量的问题由「行数 ×0.8%」解决，不需要动形状。
 --     * C（`client_event_id` 前缀里重复了 `run_id` 的文本）：换键要动 U3 协议与 runner 的编号生成
 --       （`runner/worker.js:193`），而 #502 的 D-12 明写「runner→portal 批量协议不在本单」。
@@ -47,12 +52,7 @@
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '20min';
 
--- ① 那一行的唯一键（先建索引再清碎片：清完之后任何时刻都不允许出现「同一 run 两行」的窗口）。
---    `IF NOT EXISTS` ⇒ 第二遍重放是零 DDL 空操作（README「单文件约定」）。
-CREATE UNIQUE INDEX IF NOT EXISTS run_events_run_partial_key
-  ON run_events (run_id) WHERE type = 'partial_output';
-
--- ② 分批清存量。可重放（第二遍 0 行、rc=0）、每批 ≤ 5000 行、只锁自己删的行。
+-- 分批清存量。可重放（第二遍 0 行、rc=0）、每批 ≤ 5000 行、只锁自己删的行。
 DO $$
 DECLARE
   v_batch constant int := 5000;
@@ -80,7 +80,7 @@ BEGIN
     v_rounds := v_rounds + 1;
     -- 每 20 批报一次进度：真库跑到一半时，运维要能看出它在动，而不是「迁移卡住了」
     IF v_rounds % 20 = 0 THEN
-      RAISE NOTICE '0032/0033 清碎片进行中：已删 % 行（% 批，% ms）',
+      RAISE NOTICE '0033 清碎片进行中：已删 % 行（% 批，% ms）',
         v_deleted, v_rounds,
         round(extract(epoch from (clock_timestamp() - v_t0)) * 1000)::bigint;
     END IF;
@@ -94,13 +94,16 @@ BEGIN
       round(extract(epoch from (clock_timestamp() - v_t0)) * 1000)::bigint;
   END IF;
 
-  -- 观测（纯读）：清完之后三类必须归零，且那一行的唯一键必须已经存在。
+  -- 观测（纯读）：清完之后三类必须归零。**必须是 EXCEPTION 而不是 WARNING**：
+  -- 带着残留记成功 = `schema_migrations` 里落下「已清完」这一行，而表里还躺着几十万行碎片，
+  -- 于是下一次谁来看体积数据都会以为 #502 已经落地（迁移的可观测面只有 rc 与 NOTICE，
+  -- WARNING 不会挡住 COMMIT，等于把「没清干净」这个事实吞掉）。
+  -- 量到残留的真实原因只有一个：**部署顺序倒了**——旧版 portal 仍在上报 stream 档
+  -- （写入侧拦住它的代码在同一个 commit 里 ⇒ 必须先上代码、再跑迁移）。
+  -- 失败是可重放的：代码上线后重跑本文件即可（第二遍 0 行）。
   PERFORM 1 FROM run_events WHERE type IN ('assistant_delta', 'reasoning_delta', 'tool_call_delta') LIMIT 1;
   IF FOUND THEN
-    RAISE WARNING '0033: 清完之后仍量到碎片行 —— 有并发写方仍在上报 stream 档（部署顺序：先上代码再跑迁移）';
-  END IF;
-  IF to_regclass('public.run_events_run_partial_key') IS NULL THEN
-    RAISE WARNING '0033: partial_output 唯一键没建成 —— 补发侧的「至多一行」前提不成立';
+    RAISE EXCEPTION '0033: 清完之后仍量到 stream 档碎片行 —— 有并发写方仍在上报（部署顺序：先上代码再跑迁移，然后重跑本文件）';
   END IF;
 END
 $$;

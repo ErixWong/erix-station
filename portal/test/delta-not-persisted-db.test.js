@@ -157,7 +157,9 @@ async function driveRun(pool, scene, live, { rounds, deltasPerRound }) {
 // ---------------------------------------------------------------------------
 
 const ROWS_PER_ROUND = 8; // 每轮事实档上界（本夹具每轮实际 4 行，留一倍余量给 usage/judge 这类合法行）
-const ROWS_BASELINE = 2;  // run 级常数：`run_end` + 那一行 `partial_output`
+// run 级常数：形态 M 之后**只剩 `run_end` 一行**（上一版还会多一行 `partial_output`；终态那半截
+// 正文现在是它的 payload 键 ⇒ 常数从 2 降到 1。这是本单在「行数」这条闸上的**净删**证据）。
+const ROWS_BASELINE = 1;
 
 test('#502 判据 1 真库形状闸：喂 10 条与 1000 条 delta 的 run，落库行数**完全相同**', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
@@ -174,7 +176,7 @@ test('#502 判据 1 真库形状闸：喂 10 条与 1000 条 delta 的 run，落
     // **等式**，不是「少了很多」：判据 1 的改写口径就是这个等式。
     assert.equal(ten.total, thousand.total,
       `行数必须与 delta 条数无关：10 条 = ${ten.total} 行 / 1000 条 = ${thousand.total} 行`);
-    // 常数上界：行数 ≤ 轮数 × 每轮上界 + run 级常数（2 = run_end + partial_output）
+    // 常数上界：行数 ≤ 轮数 × 每轮上界 + run 级常数（1 = 只有 run_end）
     for (const [label, got] of [['10 条', ten], ['1000 条', thousand]]) {
       assert.ok(got.total <= 3 * ROWS_PER_ROUND + ROWS_BASELINE,
         `${label}：${got.total} 行超出上界 ${3 * ROWS_PER_ROUND + ROWS_BASELINE}（轮数 × ${ROWS_PER_ROUND} + ${ROWS_BASELINE}）`);
@@ -183,9 +185,11 @@ test('#502 判据 1 真库形状闸：喂 10 条与 1000 条 delta 的 run，落
     for (const t of ['assistant_delta', 'reasoning_delta', 'tool_call_delta']) {
       assert.equal(thousand.per[t] ?? 0, 0, `${t} 在真库里仍被写入：${JSON.stringify(thousand.per)}`);
     }
+    // 形态 M：**一类新行都没有**。上一版这里会多一条 `partial_output: 1`（新的读侧合成来源），
+    // 现在终态正文并进既有的那一行 `run_end` ⇒ 类型集合里没有本站新增的东西（本单零新事件类型）。
     assert.deepEqual(thousand.per, {
-      round_start: 3, tool_use: 3, tool_result: 3, round_end: 3, run_end: 1, partial_output: 1,
-    });
+      round_start: 3, tool_use: 3, tool_result: 3, round_end: 3, run_end: 1,
+    }, '落库类型集合必须只含引擎既有的事实档类型（partial_output 这类本站自造行不得出现）');
     // 会话水位线与落库行数一致（碎片不 allocSeq）
     const s = await pool.query(`SELECT last_seq FROM chat_sessions WHERE id = $1`, [b.sessionId]);
     assert.ok(Number(s.rows[0].last_seq) <= 3 * ROWS_PER_ROUND + ROWS_BASELINE + 4,
@@ -194,10 +198,10 @@ test('#502 判据 1 真库形状闸：喂 10 条与 1000 条 delta 的 run，落
 });
 
 // ---------------------------------------------------------------------------
-// 判据 3 + 迁移 ①：那一行的 seq 位置与「一个 run 只有一行」的库面约束
+// 判据 3 + 迁移：终态正文落在既有 `run_end` 行的 payload 上（零新行、零新索引）
 // ---------------------------------------------------------------------------
 
-test('#502 判据 3 真库：终态无锚点 ⇒ 同事务恰一行 partial_output，seq 排在 run_end 之后，唯一索引挡住第二行', { skip: SKIP }, async () => {
+test('#502 判据 3 真库：终态无锚点 ⇒ 半截正文并进那一行 run_end 的 payload（无新行、无新索引）', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     partialOutputs.clear();
     const scene = ids('anchor');
@@ -214,29 +218,43 @@ test('#502 判据 3 真库：终态无锚点 ⇒ 同事务恰一行 partial_outp
       body: { state: 'failed', termination: { reason: 'aborted' }, rounds: 1, final_text: '' },
     });
 
+    // 形态 M 的落点：**既有**那一行 `run_end` 的 payload（同一次 INSERT ⇒ 不存在「run 已终态但
+    // 正文还没写」的窗口；上一版是紧接着再 INSERT 一行 `partial_output`，本用例改写后断的是键而不是行）。
     const rows = await pool.query(
-      `SELECT seq, type, client_event_id, payload FROM run_events WHERE run_id = $1 AND type IN ('run_end','partial_output') ORDER BY seq`,
+      `SELECT seq, type, client_event_id, payload FROM run_events WHERE run_id = $1 ORDER BY seq`,
       [scene.runId],
     );
-    assert.deepEqual(rows.rows.map((r) => r.type), ['run_end', 'partial_output'],
-      `那一行必须排在 run_end 之后：${JSON.stringify(rows.rows)}`);
-    const p = rows.rows[1].payload;
-    assert.equal(p.text, '说到一半');
-    assert.equal(p.source, 'terminal');
-    assert.equal(rows.rows[1].client_event_id, `${scene.runId}:final:partial_output`);
-    assert.ok(Number(p.uptoSeq) >= Number(rows.rows[0].seq),
-      `uptoSeq 至少盖住 run_end 的 seq（补发侧靠它判「客户端已看到」）：uptoSeq=${p.uptoSeq} run_end=${rows.rows[0].seq}`);
+    const types = rows.rows.map((r) => r.type);
+    assert.equal(types.filter((t) => t === 'run_end').length, 1, '一个 run 恰一条 run_end（既有 run_events_run_end_key 的口径不变）');
+    assert.equal(types.includes('partial_output'), false, `形态 M 不再写那种行：${types.join(',')}`);
+    assert.equal(types[types.length - 1], 'run_end', 'run_end 仍是该 run 的最后一条（历史里正文排在分隔条之前）');
+    const end = rows.rows.find((r) => r.type === 'run_end');
+    assert.equal(end.client_event_id, `${scene.runId}:final:run_end`, '幂等键不变（additive 只加 payload 键）');
+    assert.equal(end.payload.partial_text, '说到一半', '刷新后这段必须还在（#278/#300 的红线，现在由这个键承重）');
+    assert.equal(Number(end.payload.partial_round), 1);
+    assert.equal(end.payload.termination.reason, 'aborted', '既有键不受影响');
 
-    // 唯一索引 `(run_id) WHERE type='partial_output'` 必须真的挡住第二行 —— 换一个 client_event_id
-    // 绕开 `(run_id, client_event_id)`，剩下的判据就只能是这条部分唯一索引。
+    // 本单**不新增任何索引**（形态 M 删掉了 `run_events_run_partial_key`）：
+    // 「一个 run 至多一条 run_end」本来就有库面约束，不需要第二条部分索引说同一句话。
+    const idx = await pool.query(
+      `SELECT count(*)::int AS n FROM pg_indexes WHERE indexname = 'run_events_run_partial_key'`,
+    );
+    assert.equal(idx.rows[0].n, 0, 'partial_output 唯一索引不得存在（它保护的是一种已经不再写入的行）');
+    const runEndIdx = await pool.query(
+      `SELECT count(*)::int AS n FROM pg_indexes WHERE indexname = 'run_events_run_end_key'`,
+    );
+    assert.equal(runEndIdx.rows[0].n, 1, '既有的 run_end 唯一键仍在（这才是「至多一条」的兜底）');
+
+    // 反向证据：同 run 再插一条 run_end 会被**既有**唯一键顶回来（23505）—— 说明形态 M 把
+    // 「至多一行」这件事完全交给既有约束，而不是新造一条。
     await assert.rejects(
       pool.query(
         `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload)
-         VALUES ($1, $2, $3, $4, 'partial_output', '{}'::jsonb)`,
-        [scene.runId, scene.sessionId, 99999, `${scene.runId}:final:partial_output:dup`, ],
+         VALUES ($1, $2, $3, $4, 'run_end', '{}'::jsonb)`,
+        [scene.runId, scene.sessionId, 99999, `${scene.runId}:final:run_end:dup`],
       ),
-      (e) => e.code === '23505' && /run_events_run_partial_key/.test(String(e.message)),
-      '第二行必须被 run_events_run_partial_key 顶回来（23505）',
+      (e) => e.code === '23505' && /run_events_run_end_key/.test(String(e.message)),
+      '第二条 run_end 必须被既有唯一键顶回来（23505）',
     );
   });
 });
@@ -250,6 +268,19 @@ test('#502 迁移 0033：分批清存量可重放（第二遍 0 行 rc=0）、�
   assert.match(sql, /SET LOCAL lock_timeout/, '锁窗口必须有界（拿不到锁就放弃，可重放）');
   assert.match(sql, /FOR UPDATE SKIP LOCKED/, '每批只锁自己要删的行');
   assert.match(sql, /LIMIT v_batch|LIMIT 5000/, '必须是分批，不是一枪删 87 万行');
+  // 形态 M：观测段用 **EXCEPTION** 而不是 WARNING —— 带着残留记成功，等于把「没清干净」吞掉
+  // （`schema_migrations` 会落下已应用，而表里还躺着几十万行）。见迁移文件里那段的注释。
+  assert.match(sql, /RAISE EXCEPTION '0033: 清完之后仍量到/, '残留碎片的观测必须让迁移失败（不许 WARNING 蒙过）');
+  assert.equal(/RAISE WARNING/.test(sql), false, '本文件没有任何「报告但继续」的观测：有残留就该失败');
+  // 编号笔误（原文件写的是 '0032/0033'）：迁移应用后 NOTICE 文案不可再改，所以在落库前钉住
+  assert.equal(/0032\/0033/.test(sql), false, '进度/结论 NOTICE 的编号必须只写 0033');
+  // 零 DDL：本支迁移不得出现任何索引/列/表的 DDL（形态 M 的硬口径）。
+  // ⚠ 只看**去掉整行注释之后**的语句区：头注释里会解释「为什么删掉了那条 CREATE UNIQUE INDEX」，
+  //   整文件正则必先命中注释 ⇒ 断言恒红（这不是放宽：migrations.test.js 里同一条用同一套剥离）。
+  const executable = sql.split('\n').filter((l) => !l.trim().startsWith('--')).join('\n');
+  assert.equal(/\bCREATE\b/i.test(executable), false, '形态 M 的 0033 是纯清理，语句区不该有 CREATE');
+  assert.equal(/\bDROP\b/i.test(executable), false, '也不该有 DROP（B/C 两个索引议题本单表态保留）');
+  assert.equal(/\bALTER\b/i.test(executable), false, '也不该有 ALTER（零新列、零新类型）');
   assert.equal(/^\s*VACUUM/im.test(sql), false, 'VACUUM 不得出现在迁移文件里（迁移 runner 是单事务，VACUUM 不能在事务块里跑）');
 
   await withFreshDb(async (pool, dbName) => {
@@ -284,16 +315,26 @@ test('#502 迁移 0033：分批清存量可重放（第二遍 0 行 rc=0）、�
     };
     const before = await pool.query(`SELECT count(*)::int AS n FROM run_events`);
     assert.equal(before.rows[0].n, 50000);
+    const idxBefore = await pool.query(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'run_events' ORDER BY indexname`,
+    );
     await applyOnce();
     const after = await pool.query(
       `SELECT count(*)::int AS n FROM run_events WHERE type IN ('assistant_delta','reasoning_delta','tool_call_delta')`,
     );
     assert.equal(after.rows[0].n, 0, '第一遍必须清干净');
     assert.equal(await applyOnce(), 0, '第二遍重放 rc=0');
-    const reidx = await pool.query(
-      `SELECT count(*)::int AS n FROM pg_indexes WHERE indexname = 'run_events_run_partial_key'`,
+    // 形态 M：本文件是**纯清理**（零 DDL）⇒ 重放前后索引集合必须**逐字相同**（旧版这里断的是
+    // 「partial_output 唯一索引存在」，那一整段 DDL 已删；改成断「一支清理型迁移不该动索引」，
+    // 比原断言更强：任何偷偷加/删索引的改动都会红）。
+    const idxAfter = await pool.query(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'run_events' ORDER BY indexname`,
     );
-    assert.equal(reidx.rows[0].n, 1, '重放之后唯一索引仍在（IF NOT EXISTS 不是删了重建）');
+    assert.equal(idxAfter.rows.length, idxBefore.rows.length,
+      `清理型迁移不得增删索引：前 ${idxBefore.rows.length} 个 / 后 ${idxAfter.rows.length} 个`);
+    assert.deepEqual(idxAfter.rows.map((r) => r.indexname), idxBefore.rows.map((r) => r.indexname));
+    assert.equal(idxAfter.rows.some((r) => r.indexname === 'run_events_run_partial_key'), false,
+      '形态 M 不再建那条 partial_output 唯一索引');
 
     // VACUUM **不能跑在事务块里**：这就是它不进迁移文件的直接证据（迁移 runner 单事务）。
     const c2 = await pool.connect();
