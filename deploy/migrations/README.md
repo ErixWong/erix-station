@@ -104,7 +104,7 @@
 | `0034-prune-stale-run-checkpoints.sql` | 清 `run_checkpoints` 里**永不再被读**的两类快照（(a) run 作用域且那个 run 已终态、(b) session 作用域且会话已归档或 14 天没动；**纯清理、零 DDL**，分批 `ctid` + `FOR UPDATE SKIP LOCKED`，只留活跃会话每 key 一行） | #502 的遗留账（工单 261114-03，PR #509） |
 
 ⚠ `0033` 有**部署顺序**要求，见下一节——它不是「又是一条 DELETE」那么轻。
-⚠ `0034` 同病：**迁移默完磁盘不会自己缩**——它只清行（dev 实测清掉 70/87 行后
+⚠ `0034` 同病：**迁移清完磁盘也不会自己缩**——它只清行（dev 实测清掉 70/87 行后
 `pg_total_relation_size` 从 4,644,864 B 只动到 4,628,480 B，−0.35%），要回收磁盘必须在部署后手工跑
 **`VACUUM (FULL, ANALYZE) run_checkpoints;`**（不能写进迁移文件：`VACUUM` 不在事务块里跑，同下面 `0033` 那条），
 实测 **4.64 MB → 565 KB**（565,248 B，−87.8%，`VACUUM FULL` 耗时 0.179 s）；出处
