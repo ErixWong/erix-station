@@ -54,9 +54,17 @@ export const FLUSH_LOGS_TIMEOUT_MS_DEFAULT = 250;
 
 /**
  * 对每个流写一个**空 chunk**（不产生任何输出，只是把该流上已排队的写入推到 fd）并等回调；
- * 每个流各自带超时，**超时/抛错都算刷过**（日志是尽力而为，不是控制流）。
- * @param {{ timeoutMs?: number, streams?: Array<{ write: (chunk: string, cb: () => void) => unknown }> }} [opts]
- * @returns {Promise<{attempted: number, flushed: number, stuck: number, elapsedMs: number}>} 给日志与单测看的账
+ * 每个流各自带超时，**超时/抛错都算「不干了」**（日志是尽力而为，不是控制流）。
+ *
+ * 每条流恰好落入三种结局之一（`flushed + stuck + failed === attempted`）：
+ *   · `flushed` —— 回调**带空 err** 被调 ⇒ 真的推到 fd 了；
+ *   · `stuck`   —— 到超时回调还没来（对端拖住了管道）；
+ *   · `failed`  —— 回调**带 err**，或 `write` 当场抛（已 destroy / EPIPE ⇒ **并没刷到**）。
+ * 第四轮复审②：`failed` 以前是并入 `flushed` 的（回调不看参数）⇒ 一个已 destroy 的流会让
+ * `flushReport` 在日志里宣称「刷了」而其实一行都没落盘。`errors` 把带 err 的那几条按序号点名。
+ * @param {{ timeoutMs?: number, streams?: Array<{ write: (chunk: string, cb: (err?: Error | null) => void) => unknown }> }} [opts]
+ * @returns {Promise<{attempted: number, flushed: number, stuck: number, failed: number,
+ *                    errors: string[], elapsedMs: number}>} 给日志与单测看的账
  */
 export function flushLogs({
   timeoutMs = FLUSH_LOGS_TIMEOUT_MS_DEFAULT,
@@ -68,23 +76,37 @@ export function flushLogs({
   const one = (stream) => new Promise((resolve) => {
     let done = false;
     let timer = null;
-    const finish = (flushed) => {
+    const finish = (outcome, err = null) => {
       if (done) return;
       done = true;
       if (timer) clearTimeout(timer); // 刷日志的 timer 不许反过来拖住退出（与收尾 timer 同一口径，故意不 unref）
-      resolve(flushed);
+      resolve({ outcome, err });
     };
     // timer **先建**再 write：注入的假 stream 会**同步**回调，先 write 就会留下一个清不掉的悬空 timer。
-    timer = setTimeout(() => finish(false), limit);
+    timer = setTimeout(() => finish('stuck'), limit);
     try {
-      stream.write('', () => finish(true));
-    } catch {
-      finish(false); // 流自己坏了（EPIPE、已 destroy）⇒ 认了，不许挡住 exit
+      // 回调**必须收 err**（copilot 第四轮复审②）：`writable.write(chunk, cb)` 在流已 destroy /
+      // EPIPE 时是以**回调错误**返回的，不看参数就把任何回调计成 `flushed` ⇒ 账目假成功。
+      stream.write('', (err) => finish(err ? 'failed' : 'flushed', err ?? null));
+    } catch (err) {
+      finish('failed', err ?? new Error('write 抛出未知错误')); // 流自己坏了（EPIPE、已 destroy）⇒ 认了，不许挡住 exit
     }
   });
-  return Promise.all(list.map(one)).then((flags) => {
-    const flushed = flags.filter(Boolean).length;
-    return { attempted: list.length, flushed, stuck: flags.length - flushed, elapsedMs: Date.now() - startedAt };
+  return Promise.all(list.map(one)).then((results) => {
+    const flushed = results.filter((r) => r.outcome === 'flushed').length;
+    const failed = results.filter((r) => r.outcome === 'failed').length;
+    // 把带 err 的那几条按流序号点名（序号就是传入 streams 的下标）；err 取 message，拿不到就取原值
+    const errors = results
+      .map((r, i) => (r.err ? `stream#${i}: ${r.err?.message ?? String(r.err)}` : null))
+      .filter(Boolean);
+    return {
+      attempted: list.length,
+      flushed,
+      stuck: results.length - flushed - failed,
+      failed,
+      errors,
+      elapsedMs: Date.now() - startedAt,
+    };
   });
 }
 
@@ -349,6 +371,12 @@ export async function gracefulShutdown({
     warn(`[shutdown] 退出前刷日志失败（忽略，照样 exit）：${err?.message ?? err}`);
   }
   report.flush = flushReport;
+  // 刷失败（回调带 err / write 抛）要点名：否则运维只看到「关闭超时」，看不到「那条 warn 自己也没落盘」。
+  // （这条 warn 在 flush **之后**，它自己同样可能被截断——那是「日志尽力而为」的固有代价，不是新的等待。）
+  if (flushReport && (flushReport.failed > 0 || flushReport.errors?.length)) {
+    warn(`[shutdown] 退出前刷日志有 ${flushReport.failed ?? 0} 条流没刷成（${flushReport.errors?.join('; ') || '无 err 详情'}）`
+      + '——这些流上排队的日志（包括上面那条 warn）可能没落盘；尽力而为，不改变退出。');
+  }
   report.flushTimeoutMs = flushBudgetMs; // **实际生效**的那个数（= 请求值与剩余预算取小），不是请求值
   // elapsedMs 必须**含** flush 那一段（第四轮复审①：改前它少算一段，账目与真实耗时不一致）
   report.elapsedMs = Date.now() - startedAt;

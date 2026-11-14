@@ -1,5 +1,7 @@
-// 单测：issue #506 的 copilot **第四轮（最终验收）复审①**——flush 排在总预算**之外**，
-// 于是「整个关闭流程 ≤ totalTimeoutMs」这条承诺其实是假的。
+// 单测：issue #506 的 copilot **第四轮（最终验收）复审① + ②**（都在 `portal/src/shutdown.js` 的
+// 「退出前刷日志那一步」）：
+//   ① flush 排在总预算**之外**，于是「整个关闭流程 ≤ totalTimeoutMs」这条承诺其实是假的；
+//   ② `write(chunk, cb)` 的回调**不看 err**，于是已 destroy / EPIPE 的流会被记成「刷到了」。
 //
 // 缺陷形状（现查 `portal/src/shutdown.js`，改前的第 4 步）：
 //   const outcome = await Promise.race([everything, deadline]);
@@ -208,6 +210,82 @@ test('#506e③ flushLogs(timeoutMs=0) 对永不回调的流立刻返回 stuck（
 // ---------------------------------------------------------------------------
 // 源码钉：顺序 + 结算点
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ④ write 回调的 err 必须看（copilot 第四轮复审②）
+// ---------------------------------------------------------------------------
+
+/** 模拟「已 destroy / EPIPE 的流」：`write` 当场以**回调错误**返回（不抛）。 */
+function errCallbackStream(events, message = 'EPIPE: broken pipe') {
+  return {
+    chunks: 0,
+    write(chunk, cb) {
+      this.chunks += 1;
+      events.push('flush');
+      cb(new Error(message)); // Node 对已 destroy 的流就是这么返回的
+    },
+  };
+}
+
+test('#506e② write 回调带 err ⇒ 记 failed，不许记成 flushed（日志不许假称「刷了」）', async () => {
+  const bad = errCallbackStream([]);
+  const out = await flushLogs({ timeoutMs: 50, streams: [bad] });
+  assert.equal(out.attempted, 1);
+  assert.equal(out.flushed, 0,
+    `回调带 err 就不是「刷到了」（实测 ${JSON.stringify(out)}）——改前回调不看参数，这里会记 flushed=1`);
+  assert.equal(out.failed, 1, `要单独数得出失败数（实测 ${JSON.stringify(out)}）`);
+  assert.equal(out.stuck, 0, '失败不是「到点没回调」，两种坑不许挤在同一个字段里');
+  assert.equal(out.errors.length, 1, '账目里要能点名那条错误');
+  assert.match(out.errors.join('|'), /EPIPE/, `实测 ${JSON.stringify(out.errors)}`);
+  assert.match(out.errors.join('|'), /stream#0/, '要点名是哪一条流');
+
+  // `cb(null)` / `cb()` 仍是刷到了：严格不等于「一律不信回调」
+  const okish = await flushLogs({ timeoutMs: 50, streams: [{ write: (c, cb) => cb(null) }, { write: (c, cb) => cb() }] });
+  assert.equal(okish.flushed, 2, `无 err 的回调照常算 flushed（实测 ${JSON.stringify(okish)}）`);
+  assert.equal(okish.failed, 0);
+  assert.deepEqual(okish.errors, []);
+
+  // 三种结局同场：账必须加得起来
+  const ev = [];
+  const mixed = await flushLogs({
+    timeoutMs: 60,
+    streams: [fakeStream(ev), errCallbackStream(ev, 'ERR_STREAM_DESTROYED'), fakeStream(ev, { neverCallback: true })],
+  });
+  assert.deepEqual(
+    { attempted: mixed.attempted, flushed: mixed.flushed, failed: mixed.failed, stuck: mixed.stuck },
+    { attempted: 3, flushed: 1, failed: 1, stuck: 1 },
+    `一条刷到 / 一条失败 / 一条卡住要分得清（实测 ${JSON.stringify(mixed)}）`,
+  );
+  assert.equal(mixed.flushed + mixed.failed + mixed.stuck, mixed.attempted, '三种结局必须刚好覆盖 attempted');
+  assert.match(mixed.errors.join('|'), /ERR_STREAM_DESTROYED/);
+});
+
+test('#506e② gracefulShutdown：写失败的流不记成刷到，并在日志里点名，但仍照样 exit(0)', async () => {
+  const { report, exits, log } = await run((ev) => ({
+    server: fakeServer(ev),
+    loops: [{ name: 'routes', stop() {}, done: settled() }],
+    loopTimeoutMs: 200,
+    totalTimeoutMs: 3000,
+    logStreams: [errCallbackStream(ev), fakeStream(ev)], // stderr 坏了 + stdout 好的
+    flushTimeoutMs: 100,
+  }));
+  assert.deepEqual(exits, [0], '刷失败不许变成不退');
+  assert.equal(report.flush.attempted, 2);
+  assert.equal(report.flush.flushed, 1, '好的那条仍算刷到');
+  assert.equal(report.flush.failed, 1, `坏的那条必须记 failed（实测 ${JSON.stringify(report.flush)}）`);
+  const line = log.warns.join('\n');
+  assert.match(line, /没刷成/, '要在日志里看得见「有一条没刷到」，否则运维以为那条 warn 已落盘');
+  assert.match(line, /EPIPE/, `要点名是哪个错（实测 ${line}）`);
+  assert.equal(log.warns.filter((m) => /总上限/.test(m)).length, 0, '本条没走到总上限，不许误报');
+});
+
+test('#506e② 源码钉：刷日志的账目里有 failed / errors 两个口径', () => {
+  const s = fs.readFileSync(new URL('../src/shutdown.js', import.meta.url), 'utf8');
+  assert.match(s, /finish\(err \? 'failed' : 'flushed', err \?\? null\)/, '回调必须收 err 并分流到 failed');
+  assert.match(s, /catch \(err\) \{\s*\n\s*finish\('failed', err/, 'write 当场抛也算 failed（与回调带 err 同类）');
+  assert.match(s, /stuck: results\.length - flushed - failed/, 'stuck 必须是「剩下的」，不能把失败也算成卡住/刷到');
+  assert.match(s, /errors,/, '返回账目要带 errors（给日志点名用）');
+});
 
 test('#506e 源码钉：flush 的超时取剩余预算，elapsedMs 在 flush 之后结算', () => {
   const s = fs.readFileSync(new URL('../src/shutdown.js', import.meta.url), 'utf8');
