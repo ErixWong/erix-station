@@ -14,6 +14,7 @@ import { startOffboardingLoop } from './offboarding.js';
 import { startRoutesLoop } from './routes.js';
 import { startRouteDriftMonitor } from './routesdrift.js';
 import { startReaperLoop, notifySessionEvents } from './internal.js';
+import { stopLoopsAndWait } from './shutdown.js';
 import {
   createDockerClient,
   onboardFde,
@@ -36,6 +37,8 @@ function usage() {
       '  cli.js healthcheck',
   );
 }
+
+const SHUTDOWN_WAIT_MS = 5000; // 优雅关闭等循环收尾的上限（见下方 shutdown() 与 ./shutdown.js）
 
 async function serve() {
   const config = loadConfig();
@@ -84,18 +87,42 @@ async function serve() {
     console.log('[portal] offboarding loop started');
   });
   // 进程退出时停循环（优雅关闭）。
-  const shutdown = () => {
-    materializerLoop.stop();
-    onboardingLoop.stop();
-    offboardingLoop.stop();
-    routesLoop.stop();
-    driftMonitor.stop();
-    provisionerLoop.stop();
-    reaperLoop.stop();
+  //
+  // issue #506 评审②：旧代码只同步调 7 个 `stop()` 就 `server.close(() => process.exit(0))`，
+  // 而 `stop()` **不中断在途的 `claim*Rows()` 事务**，也没人 await `done` ⇒ 进程可能切在事务中间
+  // （回滚白干一轮，或已提交却没 mark*Published ⇒ processing 行带 60s 租约等孤儿回收）。
+  // 现在先让每个循环把手上那一拍收尾（上限 `SHUTDOWN_WAIT_MS`，超时就记一条 warn 继续退，
+  // 绝不无限等——库抖起来一条查询能挂几十秒，而停机只给几秒）。细节见 ./shutdown.js。
+  const loops = [
+    { name: 'materializer', ...materializerLoop },
+    { name: 'onboarding', ...onboardingLoop },
+    { name: 'offboarding', ...offboardingLoop },
+    { name: 'routes', ...routesLoop },
+    { name: 'routes-drift', ...driftMonitor },
+    { name: 'provisioner', ...provisionerLoop },
+    { name: 'reaper', ...reaperLoop },
+  ];
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return; // 重入保护：重复信号不许重复 stop / 重复 close
+    shuttingDown = true;
+    const out = await stopLoopsAndWait(loops, { timeoutMs: SHUTDOWN_WAIT_MS });
+    // eslint-disable-next-line no-console
+    console.log(`[portal] 循环收尾：等了 ${out.waited} 个（跳过 ${out.skipped} 个无 done 的循环）`
+      + (out.timedOut ? ` ⇒ 超时 ${SHUTDOWN_WAIT_MS}ms，${out.pending.length} 个没退` : '')
+      + (out.rejected ? `，${out.rejected} 个带错误退出` : ''));
     server.close(() => process.exit(0));
   };
-  process.once('SIGTERM', shutdown);
-  process.once('SIGINT', shutdown);
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.once(signal, () => {
+      // shutdown 是 async：拒绝必须在这里接住，否则就是一条未捕获拒绝（本仓已知「摘要全绿但 rc=1」陷阱）。
+      shutdown().catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[portal] 优雅关闭自身异常，直接退出：', err?.message ?? err);
+        process.exit(1);
+      });
+    });
+  }
 }
 
 async function runMigrate() {
