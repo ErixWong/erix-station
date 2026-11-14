@@ -170,6 +170,21 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 **单调性（revision CAS，issue #8）**：`revision bigint NOT NULL DEFAULT 0` 是每 transcript key 的**单调版本号**。worker 每实例从 0 起递增；portal 端 `DO UPDATE ... WHERE run_checkpoints.revision < EXCLUDED.revision`——**旧 revision 的覆盖写被拒（0 行更新 → `409 checkpoint_stale`）**，解决「延迟到达的旧快照覆盖新快照」。resume 时 worker 经 U9 读回当前 `revision`，继续从 `revision+1` 起计，避免新 worker从 0 起计被 CAS 误拒。`seq` 仍是**调用方本地元数据、不落库**（其值在数值上可等于 revision，但不具权威性；runner-integration §9.5）。
 
+**时间边界（自迁移 `0034`，PR #509）：终态 run 的 run-keyed 快照读不到了 ⇒ 它只能给「未完成的 run」用**。
+`getLatestCheckpoint`（`portal/src/internal.js`，端点 U9 `GET .../runs/:id/checkpoint/latest`）对**已终态的 run**
+会**返回空**（内部 `null` ⇒ HTTP `204`）——**它是返回空，不是报错**：鉴权层仍然允许终态 run 读（只有非终态 run 才校
+`X-Claim-Token`），只是**那一行已经不在表里了**——`0034` 的谓词 (a)（`transcript_key IS NULL` 且那个 run
+`status IN ('finished','failed')`）专清这一类（dev 实测命中 14 行 / 304,496 B）。**时间精度**：迁移只处理它执行
+那一刻的存量，而现网没有会自动重跑 `0034` 的 reaper ⇒ **那之后才终态**的 run，它的 run-keyed 行只是「下一支清理迁移
+来之前还躺着」——所以不能拿「这条今天还读得到」当契约：**终态 run 的 run-keyed 快照从此不是 durable 读面**，
+调用方必须只对**未完成 run**（`queued` / `running` / `cancelling`）读它。为什么可以这样：快照的唯一用途是
+**接力一个没跑完的 run**（上游契约把它钉成 latest-only autosave + optional 能力，缺席的语义就是「没得到崩溃接力」，
+下一次 run 照常从 `transcript_rounds` 账本重建上下文 ⇒ 不丢正文），run 已终态 ⇒ 不会再有 attempt 去读它 ⇒
+那一行是纯死重（取证在 `deploy/migrations/0034-prune-stale-run-checkpoints.sql` 头注释）。⚠ **session 作用域那一路
+不受影响**（`transcript_key IS NOT NULL`：谓词 (b) 只清「已归档 ∨ 14 天没动」的会话，**活跃会话每个 key 那一行照留**），
+而现役 runner 走的正是 session 端点（`runner/lib/store.js` 的 `saveRunSnapshot` / `loadLatestRunSnapshot`）
+⇒ 现役通路零变化，受影响的只是旧形态（U8/U9 run 作用域）那个兼容面。
+
 ### 1.12 `run_events` — 第③层：流式事件日志
 
 见 §3。只追加；`seq` 由 portal 落库时从 `chat_sessions.last_seq` 分配（session 内单调递增，portal.md §5.1）；**`client_event_id` 为客户端幂等键**（worker 生成 `run_id:attempt:单调计数`，attempt 为本次 start 次数、计数为该 attempt 内单调递增），`UNIQUE(run_id, client_event_id)` + `ON CONFLICT DO NOTHING` 支撑 agentd 批量上报的 at-least-once 去重（runner-integration §7.3）；`session_id` 为冗余列，支撑 SSE 按 session 补发（`Last-Event-ID`）；`UNIQUE(session_id, seq)`；`type` 清单见 portal.md §5.3，上游 additive 新类型原样透传（故 DB 层不对 `type` 做 CHECK 枚举）。
@@ -193,7 +208,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 > ① **进程内累加器**（`portal/src/run-partial-buffer.js`，per-process ⇒ 重启即失、多副本不共享）只服务
 >    断线补发，且**只存当前那一轮**（`round_start` 一到就换槽，正文按轮重置、`reasoning` 独立累加）；
 > ② 终态时若这次 run **没有 assistant 锚点**，那段未定稿正文**并进既有 `run_end` 的载荷**：
->    `payload.partial_text` + `payload.partial_round`（与合成 `run_end` 的**同一条 INSERT**，
+>    `payload.partial_text` + `payload.partial_round` + `payload.partial_truncated`（**第三个键是 #513 加的**，
+>    取缓冲**正文槽自己**的截断位，不是两路共用的那个观测位；与合成 `run_end` 的**同一条 INSERT**，
 >    `internal.js#runEndPartialKeys`，六个终态点共用一个 helper）。**没有新增事件行**，也没有
 >    「一个 run 至多一行部分正文」的库面约束——那条约束本来就由**既有**的
 >    `run_events_run_end_key (run_id) WHERE type='run_end'` 提供（一个 run 至多一条 `run_end`），
@@ -736,7 +752,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 | 表 | 策略 | 理由 / 依据 |
 |---|---|---|
-| `run_events` | **热保留，当前不删除**（针对**已落库的 durable 档**）。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记。**#502 的两条例外**：① stream 档碎片自迁移 `0033` 起**不再产生**（旧存量由同一支迁移分批清掉）；② 每个 run 的未完稿正文只占**既有 `run_end` 载荷里的两个键**（`partial_text` / `partial_round`，
+| `run_events` | **热保留，当前不删除**（针对**已落库的 durable 档**）。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记。**#502 的两条例外**：① stream 档碎片自迁移 `0033` 起**不再产生**（旧存量由同一支迁移分批清掉）；② 每个 run 的未完稿正文只占**既有 `run_end` 载荷里的三个键**（`partial_text` / `partial_round`，以及 #513 加的截断位 `partial_truncated`，
 >    形态 M ⇒ 不新增行、不新增索引）。 事件的唯一消费是实时推送与断线补发。补发窗口有限的契约语义（过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取，portal.md §5.2-4）**保留定义但因当前不删事件而不会触发**——两处口径已对齐（portal.md §5.2 注） |
 | `transcript_rounds` | **不删**（resume 源 + 审计），膨胀靠 jsonb 自动 TOAST 压缩吸收。~~session 归档后可整体导出冷存~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**；活跃 session 永不归档 | 规格 §9.2「fold 只影响视图，档案完整」；resume 只可能发生在活跃 session 上 |
 | `run_checkpoints` | **每 transcript key 单行**（覆盖写，见 §1.11），无历史 seq 概念；随 run/transcript 同生命周期保留 | 上游 `loadLatestRunSnapshot` 只读最新（唯一消费者），覆盖写天然无积累 |
