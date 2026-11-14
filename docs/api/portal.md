@@ -1361,9 +1361,26 @@ station-portal user enable  --login <login>
 | `type` | string | 固定 `partial_output`（**合成类型，`run_events` 表里查不到这一行**——表里只有 `round_end` / `run_end` 那些真实行） |
 | `payload.text` | string | 来源 1 按 `seq` 升序拼接 + 来源 2 追加；脏值（`final_text` / `partial_text` 不是字符串）整条跳过，不拼成 `[object Object]` |
 | `payload.chunks` | number | **拼进正文的已完成轮次数**（= 来源 1 的 `round_end` 条数，**不含**那半轮）。⚠ 口径在形态 M 变了：#502 之前是「拼进来的碎片行数」，碎片不落库之后那个数就没有来源了 |
-| `payload.truncated` | boolean | 正文超上限被截时为 `true`（**载荷里不塞 `…（已截断）` 文本**，截断标记由前端出——与 §4.4 的「大小防护」刻意不同：合成项要给前端一个可判定的布尔） |
+| `payload.truncated` | boolean | **两个来源取或，任一侧为真即真**（#513 第 3 条把它从「只有投影自己切长度」改成两路）：① 本端点聚合后超 `PARTIAL_PROJECTION_TEXT_CAP = 65,536`（一直就有）；② 库里那份 `run_end.partial_text` **本身就已经是被夹过的**（`run_end.payload.partial_truncated`，见下面那张 additive 键表）。不取 ② 就是把一段被缓冲夹到 16,384 的正文说成「完整」（**谎报**，不是少报）。**载荷里不塞 `…（已截断）` 文本**，截断标记由前端出——与 §4.4 的「大小防护」刻意不同：合成项要给前端一个可判定的布尔） |
 | `payload.placeholder` | boolean | 占位项才有（只认真字面量 `true`）；**这是 #278 不空白红线在形态 M 之后的唯一落点** |
 | `payload.source` | string | 人工排障用：`round_end` / `run_end` / `round_end+run_end` / `none`（占位）。前端不读 |
+
+**写入侧那三个 additive 键（`run_events` 里 `type='run_end'` 的 `payload`，`internal.js#runEndPartialKeys`）**
+—— 与合成 `run_end` 的**同一条 INSERT** 落库（六个终态点共用一个 helper），**不开新事件行、不加 DDL**：
+
+| 键 | 类型 | 口径 |
+|---|---|---|
+| `partial_text` | string | 被停住那半轮的正文，取自进程内缓冲**当前那一轮**的正文槽（`round_end` 落库成功后那一轮的槽已被 `closeRound` 关掉 ⇒ 这里**不会**重复已完成轮次，#502 审计第 2 条）。**只在零助手锚点时写**；缓冲里没有这个 run、或正文为空 ⇒ **三个键一个都不写**（也不写空键） |
+| `partial_round` | number | 那段正文所属的轮号（缓冲槽里的 `round`；拿不到数就是 `0`） |
+| `partial_truncated` | boolean | **#513 新增的键**：正文槽**自己**被缓冲上限 `textCap = 16,384` 夹过尾就是 `true`。取的是快照的 `textTruncated`（实现注记见下）。读侧**只认真字面量 `true`**：缺键（#513 之前落的 `run_end` 行本来就不可能有这个键）与脏值都当「没截」，不拿脏值谎报 |
+
+> **实现注记（#513 审计第 3 条：为什么不用 `snap.truncated`）**：缓冲快照里那个 `truncated`
+> （`run-partial-buffer.js` 的 `truncatedByCap`）是正文与**推理两路共用**的观测位——`reasoning` 累加超上限
+> 同样会置它，而 `reasoning` 既不落库也不进本节投影 ⇒ 拿它写终态就会把「**推理**被截」谎报成「**正文**被截」。
+> 所以缓冲另开了一个**只有正文那一路会置**的 `textTruncated`（`append()` 里两处 `field === 'text'` 分支），
+> `partial_truncated` 写的就是它。⚠ **两处 `truncated` 不是一把尺**：§5.1 那个 SSE 补发快照帧里的
+> `truncated` 仍是两路共用的观测位（它只是给人看「这一轮被夹过」，不落库、不进投影），**别拿它反推**
+> `partial_truncated`，也别把两者合并成一个字段。
 
 - **上限**：`PARTIAL_PROJECTION_TEXT_CAP = 65536`。#502 之前是 2000，**它咬掉了判据 3**：真库现查单轮
   `round_end.final_text` 最长 **31,707** 字符 ⇒ 一个输出正常长文的中止 run 会被截掉大半，
@@ -2750,6 +2767,20 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   > **单副本前提（形态 M 明确接受的限制）**：累加器与 SSE hub 都是 **per-process** 的 ⇒ 本节的补发能力
   > 假设 portal 单副本部署。多副本时「断在另一个副本上」必然看不到那段正文（表现 = 少一段未定稿，
   > 不是脏数据），要跨副本补发得先把累加器换成共享存储（登记在 §8.125 的后续里）。
+  > **已接受损失（缓冲 LRU 逐掉活跃 run，issue #515；台账指针见 §8.126.4）—— 潜伏项**：
+  > 缓冲的条目上限 `maxEntries = 32`（`run-partial-buffer.js` 的 `PARTIAL_MAX_ENTRIES_DEFAULT`，32 × 64 KB ≈ 2 MB），
+  > `evictOne()` **优先逐已终态的 entry**（`markTerminal` 标过的那些）。但当**同时 >32 个活跃 run 且一条终态
+  > 条目都没得逐**时，它必须逐一个**仍在流**的 run（该 run 从此在缓冲里没槽）。后果链：被逐的 run 若终态时
+  > **零助手锚点** ⇒ `runEndPartialKeys` 读到空快照 ⇒ `run_end` 里**写不出 `partial_text`** ⇒ **那半轮正文
+  > 永久丢**，已跑完的轮次仍在（`round_end.final_text`），两处都空则历史里只剩 §4.4a-1 判据 3 的**占位项**
+  > （表现 = 「那段没了」+ 一行中性提示，不是脏数据）。今天**踩不到**：单 portal 副本 + 实际并发远小于 32
+  > （认领 SQL 串行 + 会话租约 ⇒ 单进程同时跑的 run 是个位数）。可观测面只有一半：逐出活跃 run 会计
+  > `stats().evictedActive` 并打一条 `log.warn`（**不静默**），但 `stats()` **没被挂到任何对外端点上**
+  >（现查 `grep -rn metrics portal/src` = 0 命中，portal 今天没 `/metrics`）也没进事件流 ⇒ 只能翻日志对账。
+  > ⇒ **已在 issue #515 开单要求显式裁决**（三选一：① 把 `maxEntries` 与 portal 级
+  > active-run 硬上限绑定（结构上排除逐出）；② 逐出时发一条可观测信号（诊断事件 / 指标）；③ 显式接受并
+  > 把本段当成交付）。**本节不拿「单副本前提」这条兼任它的豁免**：那一条说的是「跨副本不可见」，
+  > 本条是「同副本内被自己的上限逐掉」，两个成因不同。
   > **实现注记（issue #25 裁决）**：「无空洞」只对 **`messages ∪ run_events` 联合序列**成立（两表共用 `chat_sessions.last_seq` 分配器，schema.sql §3）；SSE 只推 `run_events`，故**事件流单独看存在合法空洞**（user 消息、assistant 回写各占一个 seq）。因此客户端**不得**以「seq 跳号」作为重连触发条件（会把合法空洞误判为丢事件，重放后仍跳号 → 无限重连风暴，实测复现）。丢失恢复路径：① 服务端 `resync` 控制帧（缓冲溢出，见下）；② 浏览器 `EventSource` 自动重连天然携带 `Last-Event-ID`（§5.2 补发 `seq > lastEventId`）。前端仅在收到 `resync` 时主动 `close()` + 以 `?last_event_id=<本地已知最大 seq>` 重连。
   > ⚠ **时间边界（261114-04 审计补）**：上面那句「无空洞只对联合序列成立」**写于 #25，已被 #502 推翻**——
   > 重复投递先烧 `seq` 再被 `ON CONFLICT DO NOTHING` 丢掉 ⇒ 那一号两张表都不落行，**联合序列也不保证无洞**
@@ -3523,6 +3554,13 @@ ON CONFLICT (run_id) DO UPDATE
 无 checkpoint → `204`（adapter 返回 `undefined`；revision 供 resume 从 0 续计，runner §9.5）。只读。
 
 **404/无权限/lease/终态语义**：run 不存在 → `404 run_not_found`；不属本容器 → `403 run_ownership_mismatch`；`X-Claim-Token` 失配 → `409 lease_lost`；**终态 run 仍可读**（checkpoint 不可变、作为审计/resume 记录可查）→ `200`（有则返回）/`204`（无则空）。
+
+> ⚠ **时间边界（自迁移 `0034`，PR #509）：上面那句「终态 run 仍可读」现在只剩「不报错」这一半**——
+> `0034` 的谓词 (a) 专清「run 作用域（`transcript_key IS NULL`）且那个 run 已终态」的快照行，所以**终态 run
+> 的 run-keyed 快照读不到**：本端点对它们返 `204`（**是空，不是错**）。⇒ 调用方必须只对**未完成的 run**读它
+> （它的唯一用途是接力一个没跑完的 run，上游契约钉成 latest-only + optional），**不得**拿它当终态 run 的审计面；
+> 口径与取证见 `docs/data/model.md` §1.11。现役 runner 走的是下面 §9.8b 的 **session 作用域**端点（谓词 (b) 只清
+> 已归档 / 14 天没动的会话 ⇒ 活跃会话每 key 那一行照留），**现役通路零变化**；受影响的只是旧 runner 的 U8/U9 兼容面。
 
 错误：`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`429 rate_limited`；5xx 无限退避重试（§9.13）。
 
