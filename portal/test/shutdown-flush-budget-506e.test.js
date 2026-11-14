@@ -453,3 +453,72 @@ test('#506f 源码钉：race 的 deadline 用「总预算 - 预留」，且预�
     '预留不许被写成加在总预算**之外**（那会把 8s 变成 8.25s，突破第四轮的硬承诺）');
   assert.match(s, /从总预算里切出来/, '注释要写清预留的口径：切出来的，不是额外赠送');
 });
+
+// ---------------------------------------------------------------------------
+// ⑥ copilot 最后一轮复审（唯一 1 条，LOW）：账目把「配置的预留」当成「实际切出的那一块」报
+// ---------------------------------------------------------------------------
+// 缺陷：`report.flushReserveMs` 报的是**清洗后的配置值**，但实际从总预算里切给 flush 的那一块是
+//   `min(总预算, 配置值)`。`totalTimeoutMs=100 / flushReserveMs=250` 时总预算只有 100
+//   ⇒ 实际最多只能留 100ms，而 report 与超时日志仍写 250ms ⇒ 账目与实际不符（运维按 250 对账对不上）。
+// 修法：两个口径**并存**且自解释 —— `flushReserveConfiguredMs`（配置值）+ `flushReserveEffectiveMs`
+//   （= `min(总预算, 配置值)`，实际切出的那一块）；日志改用 **effective**（日志要反映实际）。
+// 红线：只改账目字段与日志用词，**行为语义一字未动**（deadline / flush 预算 / exit 路径都不碰）。
+
+test('#506g 预留的两个口径要分开报：T=100/R=250 ⇒ configured=250 但 effective=100，日志报 effective', async () => {
+  const TOTAL = 100;
+  const RESERVE = 250; // 比总上限还大 ⇒ 两个口径必然分离（这正是原缺陷露馅的那一组数）
+  const { report, log } = await run((ev) => ({
+    server: fakeServer(ev, { neverCallback: true }),
+    loops: [{ name: 'materializer', stop() {}, done: forever() }],
+    loopTimeoutMs: 4000,
+    totalTimeoutMs: TOTAL,
+    flushReserveMs: RESERVE,
+    logStreams: [fakeStream(ev, { neverCallback: true })],
+    flushTimeoutMs: 1500,
+  }));
+  assert.equal(report.flushReserveConfiguredMs, RESERVE,
+    `配置口径照实上报（实测 ${report.flushReserveConfiguredMs}）——运维要能看见自己配了多少`);
+  assert.equal(report.flushReserveEffectiveMs, TOTAL,
+    `实际切出的那一块只有 min(总预算, 配置值)=${TOTAL}（实测 ${report.flushReserveEffectiveMs}）`
+    + '——改前账目与超时日志都写 250，而实际最多留 100，账目对不上');
+  assert.equal(report.flushReserveMs, report.flushReserveConfiguredMs,
+    '旧字段 `flushReserveMs` 保留为**配置口径**的别名（既有账目读它，不许断）');
+  assert.ok(report.flushReserveEffectiveMs <= report.totalTimeoutMs,
+    `effective 永远不许超过总上限（实测 ${report.flushReserveEffectiveMs} / ${report.totalTimeoutMs}）`);
+  // 日志必须反映**实际**：出现 effective（100），且不再把 250 说成「切出去的那一块」
+  const allText = [...log.warns, ...log.logs].join('\n');
+  assert.match(allText, /预留 100ms/, `超时/汇总日志要报实际切出的那一块 100ms（实测：${allText}）`);
+  assert.doesNotMatch(allText, /预留 250ms|其中 250ms|内含刷日志预留 250ms/,
+    `日志不许再把配置值 250ms 说成切出去的那一块（实测：${allText}）`);
+});
+
+test('#506g 常规情形 T=5000/R=250 ⇒ 两个口径相等（都是 250），日志不受影响', async () => {
+  const TOTAL = 5000;
+  const RESERVE = 250;
+  const { report, log } = await run((ev) => ({
+    server: fakeServer(ev), // close 回调正常来
+    loops: [{ name: 'routes', stop() {}, done: settled() }], // 循环立即收尾
+    loopTimeoutMs: 200,
+    totalTimeoutMs: TOTAL,
+    flushReserveMs: RESERVE,
+    logStreams: [fakeStream(ev)],
+    flushTimeoutMs: FLUSH_LOGS_TIMEOUT_MS_DEFAULT,
+  }));
+  assert.equal(report.timedOut, false, '本条要的是正常路径（没到点强退）');
+  assert.equal(report.flushReserveConfiguredMs, RESERVE, `配置口径 ${RESERVE}（实测 ${report.flushReserveConfiguredMs}）`);
+  assert.equal(report.flushReserveEffectiveMs, RESERVE,
+    `预算充足时 effective == configured（实测 ${report.flushReserveEffectiveMs}）——修法不许把常规情形砍小`);
+  assert.equal(report.loopsBudgetMs, TOTAL - RESERVE,
+    `行为语义未变：race 预算仍是「总预算 - 预留」（实测 ${report.loopsBudgetMs}）`);
+  assert.match(log.logs.join('\n'), /内含实际刷日志预留 250ms/, '汇总行的数与账目一致');
+});
+
+test('#506g 源码钉：两个口径各自成字段，日志取 effective', () => {
+  const s = fs.readFileSync(new URL('../src/shutdown.js', import.meta.url), 'utf8');
+  assert.match(s, /flushReserveConfiguredMs: flushReserveMs/, '配置口径要单独成字段（自解释，不留含糊的单一字段）');
+  assert.match(s, /flushReserveEffectiveMs: Math\.min\(totalBudgetMs, flushReserveMs\)/,
+    'effective 必须是 min(总预算, 配置值) —— 实际切出的那一块');
+  assert.match(s, /预留 \$\{report\.flushReserveEffectiveMs\}ms/, '超时日志用 effective（日志要反映实际）');
+  assert.match(s, /内含实际刷日志预留 \$\{report\.flushReserveEffectiveMs\}ms/, '汇总行同理用 effective');
+  assert.match(s, /配置值 ≠ 实际切出去的那一块|配置值 ≠ 实际/, '注释要写清两个口径的差别');
+});
