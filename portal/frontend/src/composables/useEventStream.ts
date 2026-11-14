@@ -166,6 +166,20 @@ export interface RunHistoryEvent {
   payload: Record<string, unknown>;
 }
 
+/**
+ * 审计第 4 条（261114-05）：**历史回放的两种口径必须显式区分**（`replayEvent` 的参数）。
+ *
+ * · `'initial'`（缺省）= `openSession` 的**首屏历史重建**：`entries` 刚从空里建起来，没有「实时
+ *   气泡」要护 ⇒ 保持 #502 形态 M 的原口径（`round_start` 清气泡、轮水位照写）。
+ * · `'older-page'` = 用户往上滚拉的**更早一页**（`loadOlderMessages`）：同一会话里可能有 run
+ *   正在流 ⇒ 旧页**不得清实时气泡、不得回退轮水位**。
+ *
+ * 为什么是个显式模式而不是「自己猜」：两条路跑的是**同一条**回放链路（这是 #10 定的口径），
+ * 而「能不能动当前轮」这件事只有调用方知道（它手里有游标）；靠 `seq` 大小猜就得拿
+ * 「旧页的 seq 一定小于当前」这个未写的假设当判据。
+ */
+export type ReplayMode = 'initial' | 'older-page';
+
 export interface ToolCardState {
   name: string;
   dig: string;
@@ -609,12 +623,30 @@ export function useEventStream(hooks: EventStreamHooks) {
    * issue #502 形态 M：记「这个 run 当前轮的轮起点 seq」（只从 `case 'round_start'` 来）。
    * `seq` 不是有限数字 ⇒ 记 `null` 而不是删掉：删了会让下一条快照帧拿去比**上一轮**那个号
    *（旧轮号还挂在 Map 里 ⇒ 盖错轮）；记 null ⇒ 「这一段轮起点未知 ⇒ 谁都不许盖」，宁缺不错。
+   *
+   * 审计第 4 条（261114-05）加了 `olderPage`：**旧页回放与首屏历史重建分两种口径**。
+   * 真缺陷的形状：会话里有个 run 正在流（`deltaText` 非空、本轮 `roundSeq` 已定），用户往上滚
+   * 翻更早的一页 ⇒ 旧事件走同一条回放链路 ⇒ `round_start` 原来无条件清气泡 + 把轮水位写成旧页
+   * 那轮的更早 seq ⇒ 实时气泡被清、**当前轮**的快照帧因 `roundSeq` 对不上被双闸整帧丢弃
+   * ⇒ 正在流的正文「打死」（既不显示也补不回来）。口径（三条都是定下来的，不靠猜）：
+   *   · **旧页不得清实时气泡**（旧页那轮早说完了，与当前这一段无关）；
+   *   · **旧页不得回退轮水位**：seq 会话内单调 ⇒ **同一个 run 上**「更大的 seq」就是「更新的
+   *     `round_start`」（跨 run 比 seq 没意义，所以只在同 run 内部比）——已知水位是有限数而
+   *     旧页拿来的不大于它 ⇒ 那是更旧（或脏）的一轮，不写；
+   *   · **没观测过就照旧写**（含写 null）：那时它就是首屏历史重建面，轮水位只能靠它，
+   *     #502 形态 M 的原口径一个字没变。
    */
-  function observeRoundSeq(runId: unknown, seq: unknown): void {
+  function observeRoundSeq(runId: unknown, seq: unknown, olderPage = false): void {
     if (typeof runId !== 'string' || runId === '') return;
+    const finite = typeof seq === 'number' && Number.isFinite(seq) ? seq : null;
+    if (olderPage) {
+      const cur = roundSeqByRun.get(runId);
+      // 「该 run 已有更新的 round_start」⇒ 旧页那一行不得写（既不回退，也不拿脏值盖掉好值）。
+      if (cur !== null && cur !== undefined && (finite === null || finite <= cur)) return;
+    }
     // 只认**数字**（不用 `Number(seq)` 把 null/'' 镀成 0：那会把「未知」当成「第 0 轮」，
     // 而 seq 从 1 起 ⇒ 看起来永远对不上，但下面的帧侧一旦碰上 seq=0 的脏值就会错盖）。
-    roundSeqByRun.set(runId, typeof seq === 'number' && Number.isFinite(seq) ? seq : null);
+    roundSeqByRun.set(runId, finite);
   }
 
   function roundTokenFor(runId: unknown): string {
@@ -793,13 +825,20 @@ export function useEventStream(hooks: EventStreamHooks) {
    *     onToolCardCreated 占位 + StreamPanel）；
    *   * 不推进水位线（openSession 已按 detail.last_seq 初始化；回放事件 seq ≤ 该值）；
    *   * run_end 强制短路——绝不触发 onCurrentRunEnd / refreshSession / 停止按钮状态机。
+   *
+   * 审计第 4 条：**两种历史回放必须分口径**（`mode` 是**显式参数**，不靠猜）：
+   *   * `'initial'`（缺省）= openSession 的**首屏历史重建**：`entries` 刚从空里建起来，没有
+   *     「实时气泡」可护 ⇒ `round_start` 照旧清气泡、轮水位照旧写；
+   *   * `'older-page'` = 用户往上滚拉的**更早一页**（`loadOlderMessages`）：同一个会话里可能有
+   *     run 正在流 ⇒ 旧页**不得清实时气泡、不得回退轮水位**（否则正在流的正文被旧页打死，
+   *     且后续当前轮快照因 `roundSeq` 对不上被双闸误杀）。口径全文在 `observeRoundSeq` 旁。
    */
-  function replayEvent(raw: RunHistoryEvent) {
+  function replayEvent(raw: RunHistoryEvent, mode: ReplayMode = 'initial') {
     if (!HISTORY_REPLAY_TYPES.has(raw.type)) return;
-    dispatch(raw.type, { seq: raw.seq, run_id: raw.run_id, ...(raw.payload ?? {}) }, true);
+    dispatch(raw.type, { seq: raw.seq, run_id: raw.run_id, ...(raw.payload ?? {}) }, true, mode === 'older-page');
   }
 
-  function dispatch(type: string, d: Record<string, any>, history = false) {
+  function dispatch(type: string, d: Record<string, any>, history = false, olderPage = false) {
     // 实现注记（§5.1）：事件流 seq 有合法空洞（messages 占号），故**不做**跳号重连判定；
     // 这里只推进本地水位线（resync 重连时作为 ?last_event_id 回放游标）；历史回放不推进。
     if (typeof d.seq === 'number' && !history) lastSeq.value = Math.max(lastSeq.value, d.seq);
@@ -818,12 +857,15 @@ export function useEventStream(hooks: EventStreamHooks) {
         hooks.onQueueUpdate?.(d);
         return;
       case 'round_start':
-        if (deltaText.value) { deltaText.value = null; }
+        // 审计第 4 条：**旧页回放不得清实时气泡**（旧页那一轮早就说完了，与「当前正在流的这一
+        // 段」无关；清了就是用户滚一下滚动条把正在打字的气泡弄没了）。首屏历史重建照旧清。
+        if (!olderPage && deltaText.value) { deltaText.value = null; }
         // issue #279：本 run 的轮号水位线（卡片身份的唯一轮号来源；实时与历史回放都走这里）。
         observeRound(d.run_id, d.round);
         // issue #502 形态 M：同一处顺手记「本轮的轮起点 seq」⇒ `partial_output` 快照帧拿它对账
         //（实时帧与历史回放行都带 `seq`，`replayEvent` 把 `raw.seq` 放进 `d` ⇒ 两路同一个号）。
-        observeRoundSeq(d.run_id, d.seq);
+        // `olderPage` 转下去 ⇒ 旧页只进不退（审计第 4 条）。
+        observeRoundSeq(d.run_id, d.seq, olderPage);
         hooks.onSep(`round ${d.round}`); return;
       case 'attempt':
         observeRound(d.run_id, d.round); // 重试仍在同一轮内（#279：round_start 漏收时的补点）
@@ -986,7 +1028,11 @@ export function useEventStream(hooks: EventStreamHooks) {
         //        帧的 `roundSeq` 为 null（服务端那一轮没观测到 `round_start` 的 seq）⇒ **按不中处理**：
         //        拿 null 去盖等于承认「我确定它是当前轮」，而服务端并不确定。
         const text = typeof d.text === 'string' ? d.text : null;
-        if (text === null) { deltaText.value = null; return; } // 脏快照：不当正文，也不撑成空格/`[object Object]`
+        // 审计第 6 条：脏文本（不是字符串）**只忽略、不动任何状态**。
+        // 原来这里是 `deltaText.value = null; return;` 且它在 run/round **双闸之前** ⇒ 一帧坏数据
+        //（或别的 run 的帧、或根本不该动的帧）就能清掉当前那段合法正文——「脏输入宁可不理」
+        // 是本仓惯例，而这里它不仅不理还替用户做了决定。
+        if (text === null) return; // 不当正文，也不撑成空格/`[object Object]`，更不清气泡
         const runKnown = activeRunId.value == null || activeRunId.value === '' || d.run_id === activeRunId.value;
         const frameRoundSeq = typeof d.roundSeq === 'number' && Number.isFinite(d.roundSeq) ? d.roundSeq : null;
         const runOk = typeof d.run_id === 'string' && d.run_id !== '';
