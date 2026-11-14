@@ -19,7 +19,7 @@ import { hashToken } from './auth.js';
 import { enqueueRouteChange } from './outbox.js';
 import { provisionFdePreviewPorts } from './portalloc.js';
 import { allocSeq } from './seq.js';
-import { broadcastRevoke, drainQueueAfterRun } from './internal.js';
+import { broadcastRevoke, drainQueueAfterRun, runEndPartialKeys, retirePartialBuffer } from './internal.js';
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
 import { removeGitCredentialFile, setGitCredential, platformCredentialPresent, migrateLegacyCredential } from './git-credential.js';
 import { mintGitAccount } from './git-mint.js';
@@ -1016,11 +1016,19 @@ async function terminateActiveRuns(pool, { userId, log = console } = {}) {
       c2 = await pool.connect();
       await c2.query('BEGIN');
       const seq = await allocSeq(c2, e.session_id);
+      // issue #502 形态 M（M-2）：offboard 的 run 完全可能已经流式过一段正文（用户拔容器 /
+      // 管理员吊销时它正在回答），而这条路径**从不写 assistant 锚点** ⇒ 不把那半截落下来，
+      // 界面就只剩一条「已中止」分隔行（§8.34 那条不许空白的红线）。
+      // 落点 = **既有 `run_end` 行的 payload**（additive 两键 `partial_text`/`partial_round`），
+      // 不新增事件行；helper 与 `finishRun` 用的是**同一个** `runEndPartialKeys`（自己写一份
+      // 「什么时候该写、写什么」就是第二把尺，而五处终态点一旦漂了就只能靠真库发现）。
       const payload = {
         termination: { reason: 'aborted' },
         usage: { input_tokens: 0, output_tokens: 0 },
         rounds: 0,
         attempt: e.attempt,
+        // 本路径无锚点 ⇒ `hasAssistantAnchor` 取默认的 false；缓冲只读，**收尾在 COMMIT 之后**。
+        ...runEndPartialKeys(e.run_id),
       };
       await c2.query(
         `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
@@ -1029,6 +1037,8 @@ async function terminateActiveRuns(pool, { userId, log = console } = {}) {
         [e.run_id, e.session_id, seq, `${e.run_id}:final:run_end`, JSON.stringify(payload)],
       );
       await c2.query('COMMIT');
+      // 缓冲的变更（标终态 + 丢弃）只能在 COMMIT 之后（审计 B-4）：提交失败 ⇒ 一个字节都不改。
+      retirePartialBuffer(e.run_id);
       events.push({ session_id: e.session_id, run_id: e.run_id, seq, payload });
     } catch (err) {
       await c2?.query('ROLLBACK').catch(() => {});

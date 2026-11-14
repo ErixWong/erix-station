@@ -7,6 +7,7 @@
 // http.js 负责路由/鉴权头解析/响应序列化（SSE 头与事件写入的薄封装由本模块导出）。
 
 import crypto from 'node:crypto';
+import { EVENT_TIER_STREAM, eventTierOf } from 'erix-agent'; // issue #502：碎片档的**唯一**判据来自引擎分级表
 import { hashToken, audit } from './auth.js';
 import { purgeExpired } from './idempotency.js';
 import { allocSeq } from './seq.js';
@@ -15,6 +16,7 @@ import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle } from './session-title.js';
 import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
 import { samePayload, dedupConflictDetails } from './transcript-payload.js';
+import { partialOutputs } from './run-partial-buffer.js'; // issue #502 D-4：stream 档正文的进程内缓冲
 import { enqueueMaterializeChange } from './outbox.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
@@ -24,6 +26,16 @@ const HOLD_MS_MAX = 30000; // claim 长轮询 hold 上限
 
 const MAX_EVENTS_PER_BATCH = 200; // runner §7.2
 const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
+/**
+ * issue #502 M-6③（审计第 3 条）：**portal 自造的事件类型**，容器经 U3 上报一律 400。
+ * 名单与写它们的代码一一对得上：`run_end`（终态收敛事务，五处写入点）、`attempt_killed`
+ *（#288/#292 的租约被抢行）、`partial_output`（旧形态遗留的正文行，形态 M 已不再写，
+ * 但旧库里还有存量行 ⇒ 名字仍不得被第二把笔占用）。三个名字都不在引擎的 `EVENT_TIERS` 里
+ *（现查：`eventTierOf('run_end') === undefined`），所以本名单是**本站自造类型的清单**，
+ * 不是引擎名单的副本（那会被误读成「引擎加了就要改这里」）。
+ * @type {ReadonlySet<string>}
+ */
+const PORTAL_RESERVED_EVENT_TYPES = new Set(['run_end', 'partial_output', 'attempt_killed']);
 // portal.md §9.7：单轮 transcript 记录体积上限。**默认仍是契约值 1 MiB**，issue #371-B 起可由
 // env `MAX_ROUND_BYTES` 覆盖（真机复现「宿主拒 → 引擎剥归档重试一次」要把闸调小到几百 KB，
 // 不可能为此跑 160 轮）。⚠ 调之前先看下面那个算术——调小于它，正常折叠记录也会天天碰闸。
@@ -44,8 +56,7 @@ export function resolveMaxRoundBytes(raw = process.env.MAX_ROUND_BYTES) {
 }
 const MAX_ROUND_BYTES = resolveMaxRoundBytes();
 
-/** internal 通道统一错误（http.js 映射为标准错误信封，portal.md §9.13）。 */
-export class InternalError extends Error {
+/** internal 通道统一错误（http.js 映射为标准错误信封，portal.md §9.13）。 */export class InternalError extends Error {
   constructor(status, code, message, { retryable = false, details } = {}) {
     super(message);
     this.status = status;
@@ -480,14 +491,28 @@ export function registerSessionClient(sessionId, res) {
   return rec;
 }
 
+/**
+ * issue #502 D-2：seq-less 帧（stream 档碎片、`partial_output` 快照）的水位线口径。
+ *
+ * 两条都不显然，所以各自钉了具名用例（`portal/test/internal-delta-not-persisted.test.js`）：
+ *   ① **不得被 `ev.seq <= sinceSeq` 过滤掉**：碎片的 `seq` 是 `null`，而 JS 里 `null <= 7` 是 **true**
+ *      （null 被强制成 0）⇒ 不加守卫就是「补发期间到的碎片整批丢」；
+ *   ② **不得推进 `rec.lastSeq`**：把 `lastSeq` 写成 `null` 会让后面那些「只有碎片比得过来」的
+ *      durable 事件从「已补发」变成「未补发」（或反过来说，拿一个不存在的 seq 当水位线就是拿脏值兼平）。
+ */
+function advanceLastSeq(rec, ev) {
+  if (ev.seq != null) rec.lastSeq = ev.seq;
+}
+
 /** 补发完成后调用：把缓冲中的事件（seq > sinceSeq）写给该客户端，随后转 live。 */
 export function sessionClientGoLive(sessionId, rec, sinceSeq = null) {
   if (rec.resync) return; // 已判定需重同步（缓冲溢出）：连接已 end，不再 flush
   const events = rec.buffer.splice(0, rec.buffer.length);
   for (const ev of events) {
-    if (sinceSeq != null && ev.seq <= sinceSeq) continue; // 补发已含
+    // `ev.seq != null` 是前提（#502 D-2 ①）：seq-less 碎片不参与「补发已含」判定，它必须发出去。
+    if (sinceSeq != null && ev.seq != null && ev.seq <= sinceSeq) continue; // 补发已含
     writeSessionEvent(rec.res, ev, sessionId);
-    rec.lastSeq = ev.seq;
+    advanceLastSeq(rec, ev); // #502 D-2 ②：碎片不动水位线
   }
   rec.live = true;
 }
@@ -533,9 +558,11 @@ export function notifySessionEvents(sessionId, events) {
     for (const rec of [...set]) { // 复制：溢出路径会在迭代中从 set 移除 rec
       if (rec.resync) continue; // 已判定需重同步，等待连接关闭/清理
       if (!rec.live) {
+        // 缓冲溢出按**条数**判（#502 D-2：碎片不落库但仍进缓冲，上限仍就是 SESSION_CLIENT_BUFFER_MAX 条；
+        // 改成按字节或只数 durable 事件就是引入第二个阈值，本单不动它）。
         if (rec.buffer.length < SESSION_CLIENT_BUFFER_MAX) {
           rec.buffer.push(ev);
-          rec.lastSeq = ev.seq;
+          advanceLastSeq(rec, ev);
           continue;
         }
         // 缓冲已满：不再静默丢事件，改判重同步（§5.1：seq 无空洞 → 丢一条即需补发收敛）
@@ -543,7 +570,7 @@ export function notifySessionEvents(sessionId, events) {
         continue;
       }
       writeSessionEvent(rec.res, ev, sessionId);
-      rec.lastSeq = ev.seq;
+      advanceLastSeq(rec, ev); // #502 D-2 ②：碎片不动水位线
     }
   }
 }
@@ -743,6 +770,69 @@ async function terminalPayloadMatches(pool, run, body) {
   return canonicalHash(stored) === canonicalHash(incoming);
 }
 
+/**
+ * issue #502 D-3（形态 M）：**终态那半截正文的落点 = 既有 `run_end` 行的 payload**（零新类型、零新索引）。
+ *
+ * 为什么需要它：#300 的「中止后还能看到那段正文」此前靠**聚合上千行 `assistant_delta`** 做到，
+ * 而 issue #502 把碎片停在不落库之后，那个来源就没了 ⇒ 必须有一个 durable 落点，否则
+ * §8.34 那条红线（中止态界面不许空白）会直接退回去。
+ *
+ * 形态 M 的落点选择（主 agent 定稿，对齐上游 #827「减少通道 / 槽化 / 缓存不当真值」）：
+ *   * **已完成轮次**的正文**早就 durable** 了 —— `round_end` 行的 `payload.final_text`
+ *     （dev 真库现查：`type='round_end'` 1,008 行里 437 行 final_text 非空，均值 467、最长 31,707 字符）
+ *     ⇒ 读侧直接拼它，不需要任何新基础设施；
+ *   * **停止时正在流的半轮**只有内存里有 ⇒ 写进**既有的** `run_end` 行（每 run 本来至多一行，
+ *     本来就有 `run_events_run_end_key` 部分唯一索引）：`partial_text` + `partial_round` 两个 additive 键。
+ *   * ⇒ **不新增 `type='partial_output'` 行**（上一版设计，已删）：那是一条新通道 + 一条新部分唯一索引
+ *     + 一个新的 seq 消费者，而它能说的事 `run_end` 本来就能说。
+ *
+ * 硬口径（`portal/test/internal-delta-not-persisted.test.js` 逐条钉具名用例）：
+ *   * **只在该 run 没有 assistant 锚点时写**：判据与 `finishRun` 建锚点用的是**同一条**
+ *     （`typeof finalText === 'string' && finalText.length > 0`）。有锚点 ⇒ 正文的 durable 副本在
+ *     `transcript_rounds`/投影里，再落一份就是「两份正文」（#300 头号坑：重复正文）。
+ *   * 缓冲里没有正文（`text === ''`）⇒ **不加键** ⇒ `run_end` 的 payload 与今天**逐字相同**
+ *     （被停在 `sleep` 上的 run 本来就无正文可给，也不许凭空多两个键）。
+ *   * `reasoning` **不落库**：它没有「成型副本在别处」的那条对账（碎片档定义），且界面不展示它；
+ *     落库只会让 `run_end` 变成一个没人读的胖子。
+ *   * **同事务**（与 `run_end` 的 INSERT 同一份 payload、同一次 INSERT）：拆两个事务就出现
+ *     「run 已终态但正文还没写」的窗口，而补发与 `GET /events/history` 都拿「终态」当取数前提
+ *     （先例：#292「合成 run_end 不许挪到 COMMIT 之后」）。
+ *   * **缓冲本身**的变更（`drop`/`markTerminal`）必须留在 **COMMIT 之后**（审计 B-4，见
+ *     `run-partial-buffer.js` 口径④）：本函数**只读**缓冲，不改它。
+ *
+ * @returns {Record<string, string|number>} 要并进 `run_end` payload 的键（可能为空对象 = 逐字不变）
+ */
+export function runEndPartialKeys(runId, {
+  hasAssistantAnchor = false, buffer = partialOutputs,
+} = {}) {
+  if (hasAssistantAnchor) return {}; // 有锚点 ⇒ 一份正文就够，绝不再落第二份
+  const snap = buffer.snapshot(runId);
+  if (!snap || snap.text === '') return {}; // 空正文没什么可说的（也不写空键）
+  return {
+    partial_text: snap.text,
+    partial_round: Number.isFinite(Number(snap.round)) ? Number(snap.round) : 0,
+  };
+}
+
+/**
+ * run 进终态 ⇒ 缓冲里那段「已经不再会变了」。
+ * 写侧在 **COMMIT 之后**调（审计 B-4）：
+ *   * 已经写了 `run_end.partial_text`（或有锚点）⇒ durable 副本存在 ⇒ `drop`（内存立刻还给系统）；
+ *   * 缓冲里没有这个 run ⇒ 两个调用都是 no-op。
+ * `markTerminal` 不是装饰：LRU 满了要先逐已终态的 run（`run-partial-buffer.js#evictOne`），
+ * 而「已终态但还没被 drop」的 entry 确实会存在（`sessions.js` 的排队即取消分支只标不丢）。
+ */
+export function retirePartialBuffer(runId, { buffer = partialOutputs } = {}) {
+  buffer.markTerminal(runId);
+  return buffer.drop(runId);
+}
+
+/** 合成 `run_end` 时的统一入口：算键 + 返回新 payload（不改调用方手里的原对象）。 */
+function withPartialRunEnd(runId, payload, { hasAssistantAnchor = false } = {}) {
+  const extra = runEndPartialKeys(runId, { hasAssistantAnchor });
+  return Object.keys(extra).length === 0 ? payload : { ...payload, ...extra };
+}
+
 /** 终态收敛事务（runner §7.6 加锁顺序：锁 run → 校验租约 → 写终态 → queue 收敛 → messages/usage/run_end）。 */
 async function finishRun(pool, { user, runId, claimToken, state, body, config, log = console }) {
   const termination = body.termination;
@@ -853,18 +943,26 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
     }
 
     // 合成 run_end 事件（run 内最后一条，§7.6）。client_event_id 与 worker 事件命名空间不碰撞。
+    // issue #502 D-3（形态 M）：**终态那半截正文就并在本行的 payload 里**（`partial_text`/`partial_round`，
+    // 见 `runEndPartialKeys`）——不另开事件行，也**不在这里改缓冲**（缓冲变更一律留到 COMMIT 之后）。
+    // 锚点判据与上面建锚点用的是**同一条表达式**，抄成两份就会漂。
+    const hasAssistantAnchor = typeof finalText === 'string' && finalText.length > 0;
+    const runEndPayload = withPartialRunEnd(runId, payload, { hasAssistantAnchor });
     const runEndSeq = await allocSeq(client, r.session_id);
     await client.query(
       `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
        VALUES ($1, $2, $3, $4, 'run_end', $5, now())
        ON CONFLICT (run_id, client_event_id) DO NOTHING`,
-      [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(payload)],
+      [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(runEndPayload)],
     );
 
     await client.query('COMMIT');
+    // issue #502 D-4（审计 B-4）：缓冲的**收尾动作在 COMMIT 之后**（提交失败 ⇒ 一个字节都不改，
+    // 不会留下「内存已收尾、库里没正文」的假象）。SSE 推的仍是**落库的那一份** payload。
+    retirePartialBuffer(runId);
     // 浏览器侧 SSE 推送（终态 run_end 也必须实时可见）
     try {
-      notifySessionEvents(r.session_id, [{ seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload }]);
+      notifySessionEvents(r.session_id, [{ seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: runEndPayload }]);
     } catch { /* 尽力推送 */ }
     // issue #88/#322：run 终态后异步评估会话自动标题（fire-and-forget：不阻塞本响应，失败全降级，
     // 天然「每 run 至多评估一次」）。**生成者在 portal 自己**（输入 = 该 run 收尾的那段助手文本 +
@@ -910,6 +1008,18 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     if (!ev || typeof ev.type !== 'string' || !ev.type) {
       throw new InternalError(400, 'validation_failed', 'event.type 必填', { details: { field: 'events[].type' } });
     }
+    // issue #502 M-6③：**portal 自造的三类事件不许从 U3 上来**（审计第 3 条）。
+    // 为什么这是 400 而不是「照单全收」：它们都是 portal 在终态/回收事务里**自己合成**的行
+    //（`run_end` = 终态行本身，`attempt_killed` = 租约被抢，`partial_output` = 旧形态遗留的正文行），
+    // 写它们的代码同时持有 `chat_sessions` 行锁与 `allocSeq`。容器再递一条同名事件进来就是
+    // **第二把笔写同一个名字**：前端按 `type` 分派的分支（气泡/分隔线/历史合成项）会双份，
+    // 而 `run_events_run_end_key`（部分唯一索引）会让第二行直接撞库——错误面从「界面双份」
+    // 变成「整批 500」，后者更难查。闸在入口比事后兼容便宜（与 `sessions.js` 自造 seq 那一族教训同源）。
+    if (PORTAL_RESERVED_EVENT_TYPES.has(ev.type)) {
+      throw new InternalError(400, 'validation_failed', `${ev.type} 是 portal 自造的事件类型，容器不得上报`, {
+        details: { field: 'events[].type', type: ev.type },
+      });
+    }
     if (!validateEventPayload(ev.payload)) {
       throw new InternalError(400, 'validation_failed', 'event.payload 必须为对象', { details: { field: 'events[].payload' } });
     }
@@ -939,13 +1049,46 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     }
 
     let stored = 0;
+    // issue #502 D-1（形态 M 不变）：stream 档（逐字碎片）**不入库、不 allocSeq**，但仍然转浏览器 SSE。
+    // `stream_forwarded` 是 **additive** 计数（只数**真的被转发**的碎片），`stored` 的语义不变 = 真落库行数；
+    // runner 侧只把它当 debug 日志读数（`runner/agentd.js:725`），协议形状零改动。
+    let streamForwarded = 0;
     let seqFirst = null;
     let seqLast = null;
+    // issue #502 M-6②（审计第 2 条）：**缓冲的变更必须排在 COMMIT 之后**。
+    // 原来是在事务里直接 `partialOutputs.observe(...)`：一旦本事务后面「回滚」（租约没了 /
+    // 写入报错 / COMMIT 失败），内存里已经累了一轮正文，而库里一行没有 ⇒ 补发侧会拿那段
+    // 「内存有、库里无」的正文当真值发给浏览器，终态时还会把它写进 `run_end.partial_text`。
+    // 做法：事务内只写**事务视图**（`stage()` 的副本），COMMIT 成功才并进真相；回滚 ⇒ 视图直接丢弃。
+    const bufferTx = partialOutputs.stage();
     const committedEvents = []; // 提交后推浏览器侧 SSE（D7）
     for (const ev of events) {
-      // 先查重再分配 seq：重复事件不消耗 seq（§7.3 严格递增、无空洞）。
-      const dup = await client.query(`SELECT 1 FROM run_events WHERE run_id = $1 AND client_event_id = $2`, [runId, ev.client_event_id]);
-      if (dup.rows.length > 0) continue;
+      // issue #502 判据 2：**名单不在这张纸上**——哪些类型属于碎片档只问 `erix-agent` 的
+      // `eventTierOf`/`EVENT_TIER_STREAM`（写入侧不得再手抄三个串）。命中的事件不 INSERT、不 allocSeq
+      //（那 877,155 行就是这里没拦住），但**照旧转 SSE**：打字机是实时通路，
+      // 不落库不等于不显示（`seq = null` ⇒ 帧不带 `id:`，不污染浏览器 Last-Event-ID，
+      // 也不会把补发水位线推到一条不存在的行上）。
+      if (eventTierOf(ev.type) === EVENT_TIER_STREAM) {
+        // issue #502 M-6①（审计第 1 条）：**返回值要用起来**。
+        // U3 是 at-least-once（`runner/agentd.js` 整批失败会 `unshift` 回去重发），而碎片不落库 ⇒
+        // **库里没有判据可依**，唯一的判据就是缓冲里那份 `client_event_id` 计数。原来只调不用返回值
+        // ⇒ 重投的碎片会被**再转一次 SSE**：打字机上看到的就是重复正文（#300 的头号坑），
+        // 而它只出现在「提交失败但 portal 其实已收到」这类真实故障里，常规测试看不見。
+        // 不转发 ≠ 不累加：`observe` 仍然记着它见过这个编号（否则去重本身会失效）。
+        if (bufferTx.observe(runId, { ...ev, session_id: r.session_id })) {
+          streamForwarded += 1;
+          committedEvents.push({
+            seq: null, ts: (ev.ts ?? new Date().toISOString()),
+            run_id: runId, type: ev.type, payload: ev.payload ?? {},
+          });
+        }
+        continue;
+      }
+      // issue #502 D-8（排在「delta 不落库」之后做，口径见 docs/api/portal.md §7.3）：
+      // **只靠** `ON CONFLICT (run_id, client_event_id) DO NOTHING` 一条 SQL 幂等，不再先打一条
+      // `SELECT 1` 预查。代价是**重投会白耗一个 seq**（跳号），而 §7.3 原来的「无空洞」口径
+      // 本来就是「跳号合法、客户端不得拿它当重连判据」（#288/#292/#277 已三处先例），
+      // `chat_sessions.last_seq` 仍单调。收益：每事件少一次 DB 往返（预查是真库上每条事件都要打的一枪）。
       const seq = await allocSeq(client, r.session_id);
       const ins = await client.query(
         `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
@@ -956,6 +1099,10 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
       );
       if (ins.rows.length > 0) {
         stored += 1;
+        // issue #502 形态 M（口径②）：**`round_start` 是正文槽位的重置信号**，所以事实档里只有它
+        // 需要嗂给缓冲（带它自己的 `seq` ⇒ 补发帧才能自证「我是哪一轮的」）。
+        // 其余事实档与这个槽无关（碎片的累加不靠它们，旧 `uptoSeq` 语义已删）。
+        if (ev.type === 'round_start') bufferTx.observe(runId, { ...ev, seq, session_id: r.session_id });
         committedEvents.push({
           seq, ts: (ev.ts ?? new Date().toISOString()),
           run_id: runId, type: ev.type, payload: ev.payload ?? {},
@@ -1014,11 +1161,14 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     }
 
     await client.query('COMMIT');
+    // issue #502 M-6②：缓冲的变更在 COMMIT **之后**才生效（见上面 `bufferTx` 的注）。
+    // 它必须在推 SSE 之前：同一个事务的碎片帧发出去后，补发侧读到的必须就是那段正文。
+    bufferTx.commit();
     // D7：事件先落 DB，再推浏览器侧 SSE（§5.1）。通知失败不影响 200（客户端靠 Last-Event-ID 补发）。
     try {
       if (committedEvents.length > 0) notifySessionEvents(r.session_id, committedEvents);
     } catch { /* 尽力推送 */ }
-    return { stored, seq_first: seqFirst, seq_last: seqLast };
+    return { stored, seq_first: seqFirst, seq_last: seqLast, stream_forwarded: streamForwarded };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
@@ -1906,7 +2056,11 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
       runStatus = 'finished';
       queueStatus = 'cancelled';
       const runEndSeq = await allocSeq(client, r.session_id);
-      const runEndPayload = { termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) };
+      let runEndPayload = { termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) };
+      // issue #502 D-3（形态 M）：用户主动「停止」就是这条路径 ⇒ **半截正文全靠这里并进 `run_end`**。
+      // 本分支从不写 assistant 锚点（worker 没报过终态 ⇒ `messages` 里零助手行），
+      // 所 `hasAssistantAnchor` 取默认的 false；**缓冲本身到 COMMIT 之后才收尾**（审计 B-4）。
+      runEndPayload = withPartialRunEnd(runId, runEndPayload);
       await client.query(
         `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
          VALUES ($1, $2, $3, $4, 'run_end', $5, now())
@@ -1964,7 +2118,7 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
       runStatus = 'failed';
       queueStatus = 'done';
       const runEndSeq = await allocSeq(client, r.session_id);
-      const runEndPayload = { termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
+      let runEndPayload = { termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
         error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } };
       // issue #288：**additive 增补**——`error.code` 永远是 `max_attempts_exceeded`（既有契约不得改），
       // 额外把最后一次 kill 的原因附在旁边，免用户去猜「为什么没理由就失败了」。有则出现，没有不写键。
@@ -1973,6 +2127,8 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
         runEndPayload.last_reason = reason;
         if (lastKill.silentMs !== null) runEndPayload.last_silent_ms = lastKill.silentMs;
       }
+      // issue #502 D-3（形态 M）：重试耗尽也是终态 ⇒ 同样并上那半截正文（本分支同样无锚点）。
+      runEndPayload = withPartialRunEnd(runId, runEndPayload);
       await client.query(
         `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
          VALUES ($1, $2, $3, $4, 'run_end', $5, now())
@@ -1983,6 +2139,9 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
     }
 
     await client.query('COMMIT');
+    // issue #502 M-6②：只有真写了终态行的那两支才收尾缓冲（requeue 那一支 run 还活着，
+    // 正文要留给下一个 attempt），且一律在 COMMIT **之后**。
+    if (committedRunEnd) retirePartialBuffer(runId);
     try {
       if (committedRunEnd) notifySessionEvents(committedRunEnd.session_id, [{ seq: committedRunEnd.seq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: committedRunEnd.payload }]);
       // #370：这一支写了终态（cancelled / attempts 耗尽）⇒ 试着投一条输入队列。
@@ -2092,7 +2251,8 @@ export async function reapExpiredRuns(pool) {
         await client.query(`UPDATE run_queue SET status='cancelled', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
         await client.query(`UPDATE runs SET status='finished', termination='{"reason":"aborted"}'::jsonb, ended_at=now() WHERE id=$1`, [runId]);
         const runEndSeq = await allocSeq(client, r.session_id);
-        const runEndPayload = { termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) };
+        // issue #502 D-3（形态 M）：回收路径同样无锚点 ⇒ 半截正文并进既有的 `run_end` 行。
+        const runEndPayload = withPartialRunEnd(runId, { termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) });
         await client.query(
           `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
            VALUES ($1, $2, $3, $4, 'run_end', $5, now())
@@ -2108,12 +2268,14 @@ export async function reapExpiredRuns(pool) {
           [runId],
         );
         const runEndSeq = await allocSeq(client, r.session_id);
-        const runEndPayload = { termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
+        let runEndPayload = { termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
           error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } };
         // issue #292：**additive**——`error.code` 仍是 `max_attempts_exceeded`（既有契约不得改，§6.4），
         // 旁边说明「最后这一次是怎么没的」。与 release 路径（§9.11）对齐，但 reaper **不带 `last_silent_ms`**：
         // 没有 IPC 上报就没有那个数（同 attempt_killed 的 `silent_ms` 口径，绝不拿估算冒充）。
         runEndPayload.last_reason = REAPER_KILL_REASON;
+        // issue #502 D-3（形态 M）：同上，无锚点 ⇒ 并上半截正文。
+        runEndPayload = withPartialRunEnd(runId, runEndPayload);
         await client.query(
           `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
            VALUES ($1, $2, $3, $4, 'run_end', $5, now())
@@ -2155,6 +2317,9 @@ export async function reapExpiredRuns(pool) {
         results.push({ run_id: runId, outcome: 'requeued', run_status: r.status });
       }
       await client.query('COMMIT');
+      // issue #502 M-6②：缓冲收尾排在 COMMIT 之后，且只给真写了终态行的两支（requeue 那一支
+      // run 还活着，正文要留给下一个 attempt）。
+      if (committedRunEnd) retirePartialBuffer(runId);
       try {
         if (committedRunEnd) notifySessionEvents(committedRunEnd.session_id, [{ seq: committedRunEnd.seq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: committedRunEnd.payload }]);
       // #370：这一支写了终态（cancelled / attempts 耗尽）⇒ 试着投一条输入队列。

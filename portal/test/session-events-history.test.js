@@ -357,15 +357,17 @@ test('#371-A 白名单含 persistence_error：落盘失败事件刷新后必须�
 test('payload 大小防护：字符串叶值截 2000 字符 + 标记（JSON 形状保持合法）', async () => {
   const s = await startServer();
   try {
+    // issue #502 D-7：`tool_call_delta` 不再落库，也不再进白名单 ⇒ 它**不该出现在响应里**。
+    // 本条用例的载荷大小防护原意保留：截断断言搬到仍在册的 `tool_use` 上（一条同样长的叶值），
+    // `tool_call_delta` 这条种子留着，改成断言「它被白名单挡掉了」——这是 #502 新增的那半边事实。
     s.pool.seed(ev(1, 'tool_call_delta', { tool_call_id: 'c1', name: 'write', arguments_delta: 'x'.repeat(5000) }));
     s.pool.seed(ev(2, 'tool_use', { tool_call_id: 'c2', name: 'write', input: { content: 'y'.repeat(3000), meta: { note: '短' } } }));
 
     const body = await (await fetch(`${s.base}/api/sessions/${SESSION_ID}/events/history`, {
       headers: { Cookie: s.cookieHeader },
     })).json();
-    const d = body.events.find((e) => e.type === 'tool_call_delta').payload.arguments_delta;
-    assert.equal(d.length, 2000 + '…（已截断）'.length);
-    assert.ok(d.endsWith('…（已截断）'));
+    assert.equal(body.events.find((e) => e.type === 'tool_call_delta'), undefined,
+      '#502：`tool_call_delta` 不落库也不下发（白名单里已摘）');
     const input = body.events.find((e) => e.type === 'tool_use').payload.input;
     assert.equal(input.content.length, 2000 + '…（已截断）'.length);
     assert.equal(input.meta.note, '短', '短字符串不动');
@@ -405,11 +407,16 @@ test('#236 终态 run ⇒ 恰一条 run_termination：seq = 该 run 最后一条
       type: 'run_termination',
       payload: { status: 'finished', termination: { reason: 'aborted', detail: 'stopped by user' } },
     });
-    // 真实事件仍只有白名单那一条；run_end 仍不下发
+    // 真实事件仍只有白名单那一条；run_end 仍不下发。
+    // **形态 M 的连带改动**（本用例的数据是「终态 + 零锚点 + 两处都没有正文」，正是占位的判据面）：
+    // 现在同 seq 还会多出一条 `partial_output` 的**占位项**（#278 底线：中止态不许留空白，占位从
+    // SSE 补发通路搬进了历史投影）。它不影响本用例的意图（终态分隔条恰一条、payload 原样透传），
+    // 所以**加进期望而不是删断言**：分隔条那条逐项 deepEqual 一条没少，只是列表里多了一个邻居。
+    // 占位自己的逐项形状由 `session-partial-output.test.js` 的占位用例承重。
     assert.deepEqual(
       body.events.map((e) => [e.seq, e.type]),
-      [[1, 'round_start'], [3, 'run_termination']],
-      'run_end 不下发；终态分隔条改为从 runs 投影（#236 的红线）',
+      [[1, 'round_start'], [3, 'partial_output'], [3, 'run_termination']],
+      'run_end 不下发；终态分隔条改为从 runs 投影（#236 的红线）；同 seq 的占位项排在分隔条之前',
     );
     // 不落库：run_events 里不得出现 run_termination 行
     assert.equal(s.pool.runEvents.filter((e) => e.type === 'run_termination').length, 0);
@@ -556,7 +563,11 @@ test('#236 终态项不占 limit、不改 next_cursor（分页字段仍只由白
     s.pool.seedRun('r1', 'finished', { reason: 'judge_done' });
 
     const body = await historyOf(s, '?limit=2');
-    assert.deepEqual(body.events.filter((e) => e.type !== 'run_termination').map((e) => e.seq), [3, 4], 'limit 只数真实事件');
+    // **形态 M 的连带改动**：本夹具的 run 是「终态 + 零锚点 + 两处正文都没有」⇒ 除终态项外还会有一条
+    // **占位**合成项（seq 同为 5）。过滤集合必须把两类响应期合成项都排除，否则「limit 只数真实事件」
+    // 会被占位项污染成假红（这不是放宽断言：真实事件的集合仍是 [3, 4]）。
+    const SYNTH = new Set(['run_termination', 'partial_output']);
+    assert.deepEqual(body.events.filter((e) => !SYNTH.has(e.type)).map((e) => e.seq), [3, 4], 'limit 只数真实事件');
     assert.equal(body.next_cursor, 3, 'next_cursor 仍只由白名单真实事件决定');
     assert.equal(terminationsOf(body).length, 1, '终态项照常下发（seq=5 落在窗口外也照发：MAX(seq) 是整 run 口径）');
     assert.equal(terminationsOf(body)[0].seq, 5);

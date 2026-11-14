@@ -227,7 +227,7 @@ export type StreamEntry =
   // 本来就只从 messages 锚点渲染 ⇒ 界面上这次 run 一片空白。历史端点把它的 assistant_delta 按 seq
   // 聚合成一条合成项 partial_output（**不落库、不进 SSE**），本 kind 就是它在展示层的落点：
   // **中性助手气泡**（不是红色 .syserr：「只剩半截正文」不是错误），id=partial:<run_id> 幂等去重。
-  | { kind: 'partial'; id: string; text: string; truncated: boolean; sessionId: string | null };
+  | { kind: 'partial'; id: string; text: string; truncated: boolean; placeholder?: boolean; sessionId: string | null };
 
 interface SessionDetail {
   session: Session & { active_run_id?: string | null };
@@ -589,18 +589,36 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   /**
    * issue #300：历史合成项 `partial_output` → 中性 partial entry。
    * 幂等靠 id=`partial:<run_id>` 走 renderedIds（与 addMessage 同一去重集）：同一条在多次归并/
-   * 重进会话时只渲染一次。聚合文本为空（脏载荷只有脏片段）⇒ 不推 entry，界面不出现空气泡。
+   * 重进会话时只渲染一次。**两种空文本不是一回事**（issue #502 形态 M 的关键区分，别再合回一条）：
+   *   · `payload.placeholder === true` ⇒ 服务端**真的拿不到正文**（无锦点 + `round_end.final_text` 与
+   *     `run_end.partial_text` 两处都空）⇒ 条目**必须建**（空文本 + 占位标记），由 StreamPanel 渲染
+   *     一行中性提示——#278 「不许留空白」现在**全部担在这条入口上**（旧版还有一条 SSE 占位帧兑底，
+   *     形态 M 已把占位收进历史投影；前端上一句 `if (text === '') return;` 就是「停止时一个字都没输出
+   *     的 run 界面上仍旧空白」那个真洞）。
+   *   · 文本空且**没有**占位标记 ⇒ 脏载荷（只有脏片段）⇒ 不推 entry，界面不出现空气泡（既有口径）。
    */
   function addPartialOutput(ev: RunHistoryEvent) {
     const runId = typeof ev.run_id === 'string' && ev.run_id !== '' ? ev.run_id : 'unknown';
     const id = `partial:${runId}`;
-    if (renderedIds.value) {
-      if (renderedIds.value.has(id)) return;
-      renderedIds.value.add(id);
-    }
     const text = partialText(ev.payload);
-    if (text === '') return;
-    entries.value.push({ kind: 'partial', id, text, truncated: partialTruncated(ev.payload), sessionId: sessionId.value });
+    // 只认真字面量 `true`（与 `partialTruncated` 同一口径）：缺键/脏值一律不当占位。
+    const placeholder = (ev.payload as Record<string, unknown> | undefined)?.placeholder === true;
+    if (text === '' && !placeholder) return; // 脏载荷只有脏片段 ⇒ 界面不出现空气泡（既有口径）
+    const truncated = partialTruncated(ev.payload);
+    const at = entries.value.findIndex((e) => e.kind === 'partial' && e.id === id);
+    if (at >= 0) {
+      // **覆盖而非跳过**（#502 D-6）：同一 run 的 partial 现在可能先从 SSE 快照帧来（只有**当前这一轮**
+      // 那段未完稿正文），再从 `GET /events/history` 的合成项来（已完成轮次终稿 + 停止时那半轮）⇒
+      // 后者是更完整的那一份，必须盖掉它。（旧注释里的「截到 `uptoSeq` 为止」已随该键整条删除。）
+      entries.value[at] = { kind: 'partial', id, text, truncated, placeholder, sessionId: sessionId.value };
+    } else {
+      if (renderedIds.value) renderedIds.value.add(id);
+      entries.value.push({ kind: 'partial', id, text, truncated, placeholder, sessionId: sessionId.value });
+    }
+    // 实时流式气泡与这条中性气泡是**同一份文本的两种存在方式**：中性气泡已就位 ⇒ 撤掉那份，
+    // 否则界面上同一段正文出现两遍（实时气泡 + 中性气泡）。只在**文本相同**时撤，
+    // 不跨 run 误伤（别的 run 正在流式时 `deltaText` 是它自己的那段，文本不会等）。
+    if (es.deltaText.value === text) es.deltaText.value = null;
   }
 
   function addMessage(m: ChatMessage) {

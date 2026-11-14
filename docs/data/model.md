@@ -174,11 +174,45 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 见 §3。只追加；`seq` 由 portal 落库时从 `chat_sessions.last_seq` 分配（session 内单调递增，portal.md §5.1）；**`client_event_id` 为客户端幂等键**（worker 生成 `run_id:attempt:单调计数`，attempt 为本次 start 次数、计数为该 attempt 内单调递增），`UNIQUE(run_id, client_event_id)` + `ON CONFLICT DO NOTHING` 支撑 agentd 批量上报的 at-least-once 去重（runner-integration §7.3）；`session_id` 为冗余列，支撑 SSE 按 session 补发（`Last-Event-ID`）；`UNIQUE(session_id, seq)`；`type` 清单见 portal.md §5.3，上游 additive 新类型原样透传（故 DB 层不对 `type` 做 CHECK 枚举）。
 
+> **只有 durable 档落库（issue #502）**：引擎给每个事件类型标了档位（`erix-agent` 的
+> `eventTierOf` / `EVENT_TIER_STREAM`），stream 档三型 `assistant_delta` / `reasoning_delta` /
+> `tool_call_delta` 在 U3 写循环里**既不 INSERT 也不分配 `seq`**，只转发给浏览器。判据是引擎的表，
+> 本站不再手抄类型清单（上游 additive 新碎片类型自动继承同一命运）。dev 真库实测（2026-11-13 现查）：
+> `run_events` 884,163 行里 **877,155 行是这三型**（99.2 %），表体 472 MB；平均每行 ≈ 560 B、
+> `assistant_delta` 的 `payload.text` 平均 **2.09 个字符**（`SELECT avg(length(payload->>'text'))
+> WHERE type='assistant_delta'` 现查；工单 #502 正文里那个 3.82 是同一条 SQL 的旧读数，本次没复现出来，
+> 以现查为准）——即「一次事务 + 五次索引更新」换两个字符。
+> 碎片的**内容**去向只有两条（形态 M 的落点，**零新类型、零新索引**）：
+> ① **进程内累加器**（`portal/src/run-partial-buffer.js`，per-process ⇒ 重启即失、多副本不共享）只服务
+>    断线补发，且**只存当前那一轮**（`round_start` 一到就换槽，正文按轮重置、`reasoning` 独立累加）；
+> ② 终态时若这次 run **没有 assistant 锚点**，那段未定稿正文**并进既有 `run_end` 的载荷**：
+>    `payload.partial_text` + `payload.partial_round`（与合成 `run_end` 的**同一条 INSERT**，
+>    `internal.js#runEndPartialKeys`，六个终态点共用一个 helper）。**没有新增事件行**，也没有
+>    「一个 run 至多一行部分正文」的库面约束——那条约束本来就由**既有**的
+>    `run_events_run_end_key (run_id) WHERE type='run_end'` 提供（一个 run 至多一条 `run_end`），
+>    形态 M 因此**不新增也不删除任何索引**；曾经计划的部分唯一索引 `run_events_run_partial_key`
+>    随它服务的那个行类型一起放弃（成本与理由见 task-ledger §8.125）。
+> ⇒ 「这次 run 说过的话」的 durable 来源只有两处：已完成轮次的 `round_end.payload.final_text`
+>    + 被停住那半轮的 `run_end.payload.partial_text`；历史投影（portal.md §4.4a-1）只读这两处拼正文，
+>    两处都空则给一条**占位合成项**（`placeholder: true`，#278 不空白红线的唯一落点）。
+> **B/C 的索引与键都保留**：`(run_id, client_event_id)` 的幂等键对 durable 档仍然承重（at-least-once
+> 重投照旧顶回），五条索引服务的是仍在落库的那些行——碎片不落库不等于索引可以为碎片让路。
+> 存量清理由迁移 `0033` 分批完成（`FOR UPDATE SKIP LOCKED` + `SET LOCAL lock_timeout/statement_timeout`，
+> **纯清理：语句区零 CREATE/DROP/ALTER**）。
+> **部署顺序是硬约束**：`0033` 把「残留 stream 档碎片」的观测从 `RAISE WARNING` 改成了 **`RAISE EXCEPTION`**
+> ⇒ **必须先上代码、再跑迁移**；顺序反了（旧版 portal 还在往库里写碎片）迁移会失败而不是带病通过
+> ——失败可重放，不是死局，但会把起栈卡住。
+
 **`run_end` 唯一性与来源（A4 定稿）**：`type='run_end'` 是 portal 在 U2 终态事务内**合成**的 run 内最后一条事件（worker 不再经 U3 发 `run_end`，runner-integration §7.6），其 `client_event_id` 为确定性值 `run_id:final:run_end`。schema 额外有部分唯一索引 `UNIQUE (run_id) WHERE type='run_end'`（`run_events_run_end_key`），保证**即使 client_event_id 不同，每个 run 也至多一条 `run_end`**；U2 终态重试用 `ON CONFLICT (run_id, client_event_id) DO NOTHING` 去重（同载荷幂等）。
 
 > **展示类历史读取通路（issue #89）**：`GET /api/sessions/:id/events/history`（portal.md §4.4a）按 seq 升序返回白名单内的展示类事件（工具卡片 / judge / round / compaction 等），供前端刷新后走与 SSE 实时**同一渲染路径**重建展示层；运行态语义事件（`run_end`/`usage`/`checkpoint` 等）不下发——历史回放不驱动运行态状态机。
 
-> **事件排序与 attempt 语义（issue #8）**：`seq` 只是**回放游标**（session 全局、按到达顺序分配、严格递增、无空洞），**不是** run 内逻辑顺序；逻辑顺序由 `client_event_id` 的 `(attempt, 计数)` 编码。attempt 使 re-claim 后新 worker 的计数归零也不会与旧 attempt 的 `client_event_id` 碰撞。乱序**到达**不影响正确性（逐事件幂等 + 自包含）；严格递增只对 `seq` 游标成立。详见 runner-integration §7.3/§7.5。
+> **事件排序与 attempt 语义（issue #8）**：`seq` 只是**回放游标**（session 全局、按到达顺序分配、严格递增；**自 #502 起允许跳号**，见下），**不是** run 内逻辑顺序；逻辑顺序由 `client_event_id` 的 `(attempt, 计数)` 编码。attempt 使 re-claim 后新 worker 的计数归零也不会与旧 attempt 的 `client_event_id` 碰撞。乱序**到达**不影响正确性（逐事件幂等 + 自包含）；严格递增只对 `seq` 游标成立。详见 runner-integration §7.3/§7.5。
+>
+> **#502 之后「无空洞」不再成立，跳号是合法的**（两个来源：① stream 档不分配 `seq`；② 写循环去掉了
+> 「先 `SELECT` 查重再 INSERT」的预检，重复投递会烧掉几个 `seq` 再被 `ON CONFLICT DO NOTHING` 丢掉）。
+> `chat_sessions.last_seq` 照旧单调，`UNIQUE(session_id, seq)` 照旧兜底，**客户端不得拿跳号当重连触发条件**
+> （这条 #25 的裁决原来就在，如今更是硬事实）。
 
 ### 1.13 `tool_calls` / `judge_decisions` / `approvals` / `artifacts`
 
@@ -669,11 +703,17 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 ## 4. 归档与膨胀策略
 
-膨胀来源排序（payload 量级）：`transcript_rounds.messages`（全量 canonical 消息，单 run 可达 MB 级）> `run_events.payload`（事件流，含 delta 逐片）> 其余表（均为小行）。
+**膨胀来源排序（dev 真库 `station` 现查，2026-11-13，issue #502 修正）**：
+`run_events` **472 MB** ≫ `transcript_rounds` **12 MB** > `run_checkpoints` 4.6 MB > 其余表。
+本表原先写的是「`transcript_rounds.messages`（单 run 可达 MB 级）> `run_events.payload`」——**排序反了**：
+`transcript_rounds` 实测 12 MB / 2,231 行（单 run MB 级那一档远没出现），而 `run_events` 靠 stream 档碎片的
+**行数**堆到 472 MB / 884,163 行。膨胀机制不是「行大」而是「行多且每行都要走一次事务 + 索引」，这是当初写下
+「单 run 可达 MB 级」时没料到的方向。修法见 §1.12 的 stream 档那条（碎片不落库）。
 
 | 表 | 策略 | 理由 / 依据 |
 |---|---|---|
-| `run_events` | **热保留，当前不删除**。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记 | 事件的唯一消费是实时推送与断线补发。补发窗口有限的契约语义（过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取，portal.md §5.2-4）**保留定义但因当前不删事件而不会触发**——两处口径已对齐（portal.md §5.2 注） |
+| `run_events` | **热保留，当前不删除**（针对**已落库的 durable 档**）。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记。**#502 的两条例外**：① stream 档碎片自迁移 `0033` 起**不再产生**（旧存量由同一支迁移分批清掉）；② 每个 run 的未完稿正文只占**既有 `run_end` 载荷里的两个键**（`partial_text` / `partial_round`，
+>    形态 M ⇒ 不新增行、不新增索引）。 事件的唯一消费是实时推送与断线补发。补发窗口有限的契约语义（过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取，portal.md §5.2-4）**保留定义但因当前不删事件而不会触发**——两处口径已对齐（portal.md §5.2 注） |
 | `transcript_rounds` | **不删**（resume 源 + 审计），膨胀靠 jsonb 自动 TOAST 压缩吸收。~~session 归档后可整体导出冷存~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**；活跃 session 永不归档 | 规格 §9.2「fold 只影响视图，档案完整」；resume 只可能发生在活跃 session 上 |
 | `run_checkpoints` | **每 transcript key 单行**（覆盖写，见 §1.11），无历史 seq 概念；随 run/transcript 同生命周期保留 | 上游 `loadLatestRunSnapshot` 只读最新（唯一消费者），覆盖写天然无积累 |
 | `messages` | 永久保留 | 人读层，行小（content + 摘要），是 FDE「关掉明天再打开会话还在」期待的承载（原理三） |
@@ -685,6 +725,12 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 - 冷存导出 = 「可恢复但不在线」，属**将来可选项（当前不实施**，决策者 2026-09，issue #3 评论**）**：若启用，导出目标可用 `/docker/station-db/archive/`（env §6 目录约定）。需要在线可查的长期归档（P3 之后）再评估分区表（按 `day`/`created_at` RANGE 分区）或独立归档库，**v1 DDL 不上分区**（过早复杂化）。
 - 若将来启用 `run_events` 冷存删除，则 `DELETE` 密集，需关注 autovacuum；膨胀监控直接查 DB（原理三：状态在中心）。
+- `0033` 清完存量后**空间不会自己还给磁盘**（普通 `VACUUM` 只回收页、不缩文件）：需要在低峰期手工
+  `VACUUM (FULL, ANALYZE) run_events;`（`FULL` 持 `ACCESS EXCLUSIVE`，本站规模下秒级到十秒级）。
+  这一步**没有**放进迁移文件——迁移 runner 每个文件跑在单事务里，`VACUUM` 不能在事务块中执行
+  （`portal/test/delta-not-persisted-db.test.js` 里有用例钉着这条事实）。
+- 每行字节上界（清理后）：`run_events` 每行 < 4 KB（含 5 个索引的摊销）、`run_checkpoints` 每行 < 512 KB
+  （dev 实测 85 行 / 4,644,864 B ≈ 53 KB/行，本单不动它）。两条都在真库用例里断言，不是文档口头承诺。
 - 量级粗估：单 FDE 日 20 runs × 100 事件/run × 2 KB ≈ 4 MB/日/FDE → 个位数 FDE 规模下即使**不删除**、长期热保留，增长亦平缓（年量级 GB），对 275 G 可用磁盘（env §8.1）无压力；transcript 的在线积累是主要增长项，需纳入看板。
 
 ---
