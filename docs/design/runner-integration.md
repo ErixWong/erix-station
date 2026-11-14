@@ -1,7 +1,7 @@
 # FDE 容器内 runner 集成设计
 
 > 状态：**设计基线；runner 已实现**（部署/实现边界见 `runner/README.md`）。
-> 依据：[`fde-platform.md`](fde-platform.md)（主规格，下称「规格 §x」）、[`principles.md`](principles.md)（原理与硬约束）、[`../api/portal.md`](../api/portal.md)（API 契约，下称「portal.md §x」）、[`../data/model.md`](../data/model.md) + [`../data/schema.sql`](../data/schema.sql)（数据模型，下称「model.md §x」）、上游引擎源码 [erix-agent](https://github.com/ErixWong/erix-agent)（runner 当前 pin **v0.14.0**；本文保留的 v0.3.5/v0.9.0 行号和设计决策为历史锚点，store 现状以 §9 与 `runner/lib/store.js` 为准）。
+> 依据：[`fde-platform.md`](fde-platform.md)（主规格，下称「规格 §x」）、[`principles.md`](principles.md)（原理与硬约束）、[`../api/portal.md`](../api/portal.md)（API 契约，下称「portal.md §x」）、[`../data/model.md`](../data/model.md) + [`../data/schema.sql`](../data/schema.sql)（数据模型，下称「model.md §x」）、上游引擎源码 [erix-agent](https://github.com/ErixWong/erix-agent)（runner 的 pin **以 `runner/package.json` 的 `erix-agent` 字段现读为准**，2026-11-14 现查 = **0.32.0**（与根 `package.json` 同源）；本文保留的 v0.3.5 / v0.9.0 / v0.14.0 行号与设计决策均为**历史锚点**，store 现状以 §9 与 `runner/lib/store.js` 为准）。
 >
 > **本文是平台最核心的实现层设计**：FDE 容器内 `station-agentd` / `station-runner` 两个可执行的进程模型、与 portal 的出站协议、IPC、run 生命周期、事件路径、store adapter、审批中转、失败恢复。目标是「实现者可直接照做」。
 >
@@ -496,10 +496,16 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
   - **attempt 前缀（issue #8，重启不碰撞）**：`attempt` = 本次 start 次数（claim 后 `run_queue.attempts`，经 ticket `run.attempt` / IPC `run_start.attempt` 下发）；`计数` 为该 attempt 内从 0 递增。re-claim 后新 worker 计数归零也不与旧 attempt 碰撞——否则旧 attempt 的 `run_id:0`、`run_id:1` 会被新 attempt 当重复丢弃。
 - **只有 durable 档落库（issue #502）**：U3 的投递语义（at-least-once、`client_event_id` 幂等、批次 200 条、202/207 响应）**对全部档位不变**；变的是 portal 侧的落库面——`eventTierOf(type) === EVENT_TIER_STREAM` 的事件**不 INSERT、不分配 `seq`**，直接进 SSE（帧里**不带 `id:`**，免得浏览器把碎片记进 `Last-Event-ID`）。协议形状零变更：runner 仍然照发，`worker.js` 的 `client_event_id` 计数仍然逐事件递增，agentd 读的还是 `data.stored`。
 - **seq 分配**：portal 在**同一事务**内 `UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`（model.md §1.6），只对 durable 档逐事件分配；`seq` 因此**允许跳号**（碎片不占号 + 重复投递烧号），客户端不得拿跳号当丢事件；`UNIQUE(session_id, seq)` 兜底（schema.sql §5 run_events）。seq 只在 portal 产生——worker/agentd 永不自造 seq。
-- **缺口检测**：前端按 SSE `id` 检测跳号；跳号 → 断开并以最后收到的 `id` 作 `Last-Event-ID` 重连补发（portal.md §5.2）。portal 广播层同样按 seq 顺序推送（事务提交乱序时按 seq 重排后再发）。
+- **缺口检测（#502 后口径已改：跳号不是缺口）**：前端**不得**拿「`id` 跳号」当丢事件或重连触发条件——
+  `seq` 现在只对 **durable 档**逐事件分配，碎片不占号、重投会烧号 ⇒ 跳号是**常态**（见 §7.3 上面那条）。
+  真正的丢失信号只有两个：① portal 主动发的 `event: resync` 控制帧（补发前缓冲溢出，portal.md §5.1）；
+  ② 浏览器 `EventSource` 自己断线重连（天然携带 `Last-Event-ID`，补发 `seq > lastEventId` 的全部事件）。
+  重连游标用**本地已收到的最大 `seq`**（portal.md §5.1/#25 裁决）。portal 广播层仍按 seq 顺序推送（事务提交乱序时按 seq 重排后再发）。
 - **断线重放**：portal 端语义已在 portal.md §5.2 定义（补发大于 `Last-Event-ID` 的全部事件）；容器侧 portal↔agentd 通道**无重放概念**——agentd 未确认的事件本地持有，重连后续传。
 - **排序语义澄清（issue #8，解决「乱序不影响正确性」vs「严格递增」的矛盾）**：二者指不同的东西——
-  - `seq` 是 **session 全局回放游标**：按**到达顺序**分配、严格递增、无空洞（SSE `Last-Event-ID` 依据）；它不是 run 内逻辑顺序。
+  - `seq` 是 **session 全局回放游标**：按**到达顺序**分配、**单调递增**（SSE `Last-Event-ID` 依据）、
+    **自 #502 起允许跳号**（stream 档不分配 + 重投烧号，§7.3）——**「无空洞」已不是验收判据**；
+    它不是 run 内逻辑顺序。
   - run 内**逻辑顺序**由 `client_event_id` 的 `(attempt, 计数)` 编码。
   - 「乱序不影响正确性」成立，因为：① 逐事件 `client_event_id` 幂等去重，重复/乱序到达不产生副作用；② 事件自包含（无位置依赖）；③ 投递纪律保证 attempt N 的事件在 attempt N+1 之前全部 200 确认或丢弃（§7.5/§7.6），DB 内不存在跨 attempt 乱序混合。「严格递增」只对 `seq` 游标成立，二者不冲突。
 
@@ -544,7 +550,18 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 
 **U2 终态加锁顺序（A4）**：portal 在 U2 终态事务内按序执行——① `SELECT ... FROM runs WHERE id=$1 FOR UPDATE`（锁 run 行，串行化并发 U2 / reaper / release）；② 校验 `X-Claim-Token` 与当前 `run_queue.claim_token` 一致（或走 reaper 的 portal 收敛路径，见 §6.4 cancelling 例外）；③ 写 `runs` 终态（status/termination/usage/error/ended_at）；④ `run_queue → done`（或 `cancelled`）；⑤ 回写 `messages` + `usage_ledger`；⑥ 从 `chat_sessions.last_seq` 分配 seq 并 `INSERT run_events`（`type='run_end'`，`client_event_id='run_id:final:run_end'`，`ON CONFLICT (run_id, client_event_id) DO NOTHING`）。第 ⑥ 步的 seq 最大，使 `run_end` 恒为 run 内最后一条事件。
 
-**事件 batch ack（U3）**：U3 响应 `200 {stored, seq_first, seq_last}` 即「batch ack」= 该批事件已被 portal 受理。**#502 起「受理」不再等于「逐行落库」**：durable 档 = 已 INSERT 并分配 seq；stream 档 = 已转发给浏览器并进进程内累加器（不落库、不占 seq，因此不在此处获得持久性保证——它的持久性由**终态 `run_end` 载荷里的 `partial_text`**（形态 M：并进既有那一行，不新增事件行）或 `messages` 锚点兑现）。ack 语义（收到 `200` 才推进 spool 游标、`stored < 条数` 是幂等命中）不变。agentd 收到 `200` 才推进 spool ack 游标、从缓冲删除；`stored < 请求条数` 是幂等命中（非错误）。batch ack 是「已落库」确认，不是「已推送到浏览器」确认——SSE 推送是 portal 落库后的派生动作（portal.md §5）。
+**事件 batch ack（U3）**：U3 响应 `200 {stored, seq_first, seq_last, stream_forwarded}`（最后一个键是 **#502 起 additive** 的计数）即「batch ack」= 该批事件已被 portal 受理。**#502 起「受理」不再等于「逐行落库」**：durable 档 = 已 INSERT 并分配 seq；stream 档 = 已转发给浏览器并进进程内累加器（不落库、不占 seq，因此不在此处获得持久性保证——它的持久性由**终态 `run_end` 载荷里的 `partial_text`**（形态 M：并进既有那一行，不新增事件行）或 `messages` 锚点兑现）。ack 语义（收到 `200` 才推进 spool 游标）不变。agentd 收到 `200` 才推进 spool ack 游标、从缓冲删除。
+
+> **`stored < 请求条数` 有两种原因，别只解释成幂等命中（#502）**：
+> ① **幂等命中**（传统含义）：批次里部分 `client_event_id` 已存在，`ON CONFLICT DO NOTHING` 跳过 ⇒ 仍 `200`、非错误；
+> ② **stream 档成功转发也不计入 `stored`**：`stored` 的语义是**真落库行数**，而碎片根本不 INSERT ⇒
+>   一个全是碎片的批可以 `stored: 0` 且完全正常。看它单独「比请求条数小」得不出任何结论，
+>   **要区分两种原因就读 additive 的 `stream_forwarded`**（只数**真的被转发**的碎片；重复投递那批碎片会被
+>   累加器的首次观测去重挡掉 ⇒ 它是 0，这是 #502 之后**唯一**剩下的碎片级去重信号，portal.md §9.4a）。
+>   **runner 今天不读它**（`runner/agentd.js:725` 那条 debug 日志只报 `stored` 与 `count`），旧 agentd 不读它
+>   也照旧工作 ⇒ **协议形状零改动**；写它只为把「为什么 `stored` 比条数小」在排障时能直接看出来。
+>
+> batch ack 是「已受理」确认（对 durable 档 = 已落库），**不是「已推送到浏览器」确认**——SSE 推送是 portal 落库后的派生动作（portal.md §5）。
 
 **U2 终态提交 barrier**：agentd 在发送 U2 终态前必须满足：① 该 run 全部事件批已收到 `200`（batch ack 完成，含 spool 重传）；② 全部 store 调用（U5-U9）已完成。portal 端在 U2 终态事务内：置 runs 终态 + `run_queue → done` + 合成 `run_end` 事件（seq 最大）+ messages 回写 + usage_ledger。终态不可变；此后任何 U3/U5/U8/U10/state 写 → `409 run_terminal`（§4.5）——即终态是「不再接受事件/checkpoint」的硬屏障。`run_end` 事件 payload 带 `attempt`（供 UI 标注第几次尝试）。
 

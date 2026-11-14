@@ -22,11 +22,22 @@
 
 **门禁步骤（顺序执行，任一失败即红；`ci.yml` 步骤 ①、①′、②–④）**
 
-> **现价（2026-11-11 在 `main@ad68523` + 热层搬家那笔 docs-only 改动上实测，四步 rc 全 0）**：
+> **历史基线（2026-11-11 在 `main@ad68523` + 热层搬家那笔 docs-only 改动上实测，四步 rc 全 0）**：
 > ① `node --check` **255** 个文件（新增 1 个闸脚本 + 1 个闸测试） · ② 根 **2138 / 2134 通过 / 0 失败 /
 > 4 跳过**（含 runner 的 505） · ③ runner **505 / 505** · ④ 前端 `typecheck` 干净 +
 > **63 文件 / 1316 通过**（本笔未改前端，该读数沿用 `bd227e2` 实测，动前端时重测）。
-> ⚠ 下面每一步里那一大段括号是**历史沿革**（逐单净增记录），旧数字彼此矛盾——**查现价只看本行**。
+> ⚠ 上面四个数是**那个 commit 的历史基线**，不是现价；别拿它们对今天的报告。旧行留着是因为它带着日期与
+> 当时的口径（逐项净增的起点），**不要删**。
+>
+> **当前基线（2026-11-14 在 `main@e006d45`（#508）上实测；根测与步骤 ① 是本单在 worktree 里亲手跑的，
+> runner / 前端取自台账 §8.126 的门禁读数）四步 rc 全 0**：
+> ① `node --check` **264** 个文件（`git ls-files -- '*.js' '*.mjs'` 现数 263 + 本单新增的手工 e2e 脚本
+> `portal/integration/stream-typing-check.mjs` = **264**，本单已逐文件跑过 rc=0）· ② 根 `npm test`
+> **2220 tests / 2210 pass / 0 fail / 10 skipped**（无
+> `TEST_DATABASE_URL` ⇒ **9 条真库用例整体 skip**（剩下那一条 skip 是 LiteLLM live smoke，与 DB 无关），
+> 口径见 `docs/testing.md` §2.2）·
+> ③ runner **507 / 507** · ④ 前端 **63 文件 / 1336 通过** + `typecheck` 干净（本支净增 8 条）。
+> ⚠ 下面每一步里那一大段括号是**历史沿革**（逐单净增记录），旧数字彼此矛盾——**查现价只看上面「当前基线」那块**。
 > 三处台账（本节 / `.github/workflows/ci.yml` 步骤 ② 注释 / `AGENTS.md` §8.104）自本日起同值。
 > 261111 实况：那三处如今只剩**本节**写数字——ci.yml 步骤 ② 的注释已压成指向本节的指针
 > （261110-04），`§8.104` 随台账整体搬入 `docs/maintenance/task-ledger.md`（261111-02）。
@@ -160,14 +171,16 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
    STATION_DOCKER_PROXY_IMAGE=ghcr.io/erixwong/erix-station-fde-proxy@sha256:<digest>
    ```
 
-   ⚠️ **prod 模式（`FDE_DEV_MODE=0`）只接受两种形态**，否则 portal 拒启（`portal/src/config.js:121-123`）：
+   ⚠️ **prod 模式（`FDE_DEV_MODE=0`）只接受两种形态**，否则 portal 拒启（两形态门现 `portal/src/config.js:160-194`；
+   旧坐标 `:121-123` 已过期——2026-11-14 现查，`imageIdRef`/`repoDigestRef` 与那个 `throw` 现在都在这一段）：
    - 形态① `image@sha256:<64hex>`（manifest digest，`images-digest.json` 的 `digest`）；
    - 形态② `sha256:<imageId>`（config digest，= 部署机 `docker image inspect --format '{{.Id}}'`；清单里的 `imageId`）。
    清单里两种都给了，任选；混用会核对不上（§3）。
 4. **起栈**：`docker compose -f deploy/docker-compose.yml up -d`（compose 默认 tag 仍是 `:local`，
    **不设 env 就还是本地镜像**，CI/CD 不会自己改变部署形态；`FDE_IMAGE` 同时是 proxy 的 `IMAGE_ALLOWLIST`，
    `deploy/docker-compose.yml:93`，改 FDE pin 时两处同源，不用单独改 proxy 白名单）。
-5. **换 FDE 镜像必须显式重建容器**：`ensureFdeContainer`（`portal/src/provisioner.js:305-322`）
+5. **换 FDE 镜像必须显式重建容器**：`ensureFdeContainer`（`portal/src/provisioner.js`，函数体现从 `:353`
+   起、到 `:413` 止；旧坐标 `:305-322` 已过期——2026-11-14 现查 `grep -n 'function ensureFdeContainer'`）
    **只在容器不存在时创建**，不因镜像变化重建。
 
    ```bash
@@ -186,7 +199,7 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
 - 开启 attestations（`docker/build-push-action@v6` 的 **provenance 默认是开的**）时，推上去的 digest 指向
   **attestation index**（子清单里除镜像外还有 provenance/sbom），它**不等于**部署机
   `docker image inspect --format '{{.Id}}'`（那是 **config blob 的 digest**）⇒ 我们拿 `.Id` / `@sha256:` 当部署 pin
-  （`portal/src/config.js:119-123` 两形态门），人肉核对会永远对不上。
+  （`portal/src/config.js:160-194` 两形态门；旧坐标 `:119-123` 已过期），人肉核对会永远对不上。
 - 关掉后推的是**单张 image manifest**，其 `config.digest` 就是部署机看到的 `.Id`。本机实测等价性：
   `docker save` 出来的 `blobs/sha256/<Id>.json` **文件名就是 `.Id`**，且该文件内容的 sha256 又等于该文件名
   （内容寻址）⇒ `manifest.config.digest == docker image inspect .Id`。
@@ -240,8 +253,8 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
   即 §4 里那个 500MB。我们推的三类都是 **container image** ⇒ 落在免费侧。
 - **退路**：一旦开始计费，改推本机自托管 **`registry:2`**（数据目录按全局约定放 `/docker/registry`），
   compose 的 `FDE_IMAGE` / `STATION_PORTAL_IMAGE` / `STATION_DOCKER_PROXY_IMAGE` 换成
-  `127.0.0.1:<port>/...@sha256:<digest>`（或 `registry:5000/...`，`portal/src/config.js:104-114` 的
-  registry host 判定接受带端口的 host）。
+  `127.0.0.1:<port>/...@sha256:<digest>`（或 `registry:5000/...`，`portal/src/config.js:176-191` 的
+  registry host 判定接受带端口的 host；旧坐标 `:104-114` 已过期——那段现在全是 cookie 属性）。
   **代价**：GitHub Actions **推不进 NAT 后的本机**（没有到本机的入站通道）⇒ 届时**构建也回本机**，
   CI 退回「只跑门禁」，镜像构建/推送改成本机脚本 + 同一个 digest 清单口径。
 
