@@ -544,10 +544,34 @@ test('#440-K13c folding 旋钮被引擎**接受**的形态：省略 / undefined 
   const ctxBlock = read('worker.js').match(CTX_MARKERS);
   assert.ok(ctxBlock, 'worker.js 没有成对的 `/* #392:context-strategy:start|end */` 标记 ⇒ 同上');
   // context 区间里写着 `assertCompactContext(…)` ⇒ 注入**真**校验器再求值（与 K1 同一姿势）。
+  // ⚠ 先把解析结果落成具名变量：下面这几条形状断言要用它，不能只在对象字面量里内联一次就完事。
+  const workerContext = new Function('assertCompactContext', `return {${ctxBlock[1]}}`)(assertCompactContext).context;
   const workerFolding = {
     ...new Function(`return {${ttlBlock[1]}}`)(),
-    context: new Function('assertCompactContext', `return {${ctxBlock[1]}}`)(assertCompactContext).context,
+    context: workerContext,
   };
+  // **这条（context 内层形状）与下面那条（顶层键集合）是两张不同的嘴，都要留着**：
+  // 对象字面量里的 `context: workerContext` 是**无条件显式**加键的 ⇒ 区间一旦被清空、或写法从
+  // `context: assertCompactContext({…})` 改成别的形，求值出来就是 `undefined`，而
+  // `Object.keys({...{context: undefined}})` **照样含 `context`** ⇒ 只跑 K13c 时下面那条照绿（假绿）。
+  // 所以这里钉的是「区间里**真的**解析出了 worker 传的那两个子键」。
+  assert.ok(
+    workerContext !== null && typeof workerContext === 'object' && !Array.isArray(workerContext)
+      && Object.keys(workerContext).length > 0,
+    `从 \`#392:context-strategy\` 标记区间里解析出的 context 是空的（实得：${JSON.stringify(workerContext)}，`
+    + `键：${JSON.stringify(Object.keys(workerContext ?? {}))}）⇒ 这说明**标记区间解析空了 / 区间里的写法变了**`
+    + '（`context:` 那行被删、或不再是 `context: assertCompactContext({…})` 那形），**不是引擎问题**'
+    + '：本用例的输入是从源码解析的，区间一空就等于在测一份不存在的配置（顶层键那条挡不住这种空）');
+  // worker 真传的就是这两个子键（值本身另由 fold-strategy B4/B5 与 K1 钉，这里只钉**在场与类型**）。
+  assert.ok(Object.hasOwn(workerContext, 'strategy'),
+    `解析出的 context 没有 \`strategy\` 子键（实得键：${JSON.stringify(Object.keys(workerContext))}）`
+    + '⇒ 这说明标记区间解析空了 / 区间里的写法变了，不是引擎问题');
+  assert.ok(Object.hasOwn(workerContext, 'keepRounds'),
+    `解析出的 context 没有 \`keepRounds\` 子键（实得键：${JSON.stringify(Object.keys(workerContext))}）`
+    + '⇒ 这说明标记区间解析空了 / 区间里的写法变了，不是引擎问题');
+  assert.equal(typeof workerContext.keepRounds, 'number',
+    `解析出的 \`context.keepRounds\` 不是数字（实得：${JSON.stringify(workerContext.keepRounds)}`
+    + `，类型 ${typeof workerContext.keepRounds}）⇒ 这说明标记区间解析空了 / 区间里的写法变了，不是引擎问题`);
   assert.deepEqual(Object.keys(workerFolding).sort(), ['context', 'toolResultFoldMinTokens', 'toolResultTtl'],
     `从 worker 标记区间里解析出的 folding 形状不是预期那份（实得：${JSON.stringify(workerFolding)}）`);
 
