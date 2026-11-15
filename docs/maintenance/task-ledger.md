@@ -5405,3 +5405,80 @@ run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data
 
 **剩余**：空闲仍有 13.2 事务/秒来自**另外 5 个轮询器**（`run_queue` 1.5/秒、`chat_sessions` 0.9/秒、
 `port_observations` 0.7/秒、`fde_onboarding` 0.6/秒…）⇒ 开 **#520** 续作（判据：空闲 < 3 事务/秒）。
+
+### 8.132 「查看原文」里工具行说不出「返回了什么」：重建路把 tool_result 挂回 tool_use（issue #387 / 工单 fix-261115-03，2026-11-15）
+
+**编号由主 agent 统一分配（本批并行）**：我自己现查 `grep -n '^### 8\.' … | tail -3` 拿到的是 `8.126`、曾按 `8.127` 落笔，而 8.127 已被 #496 占、8.128/8.129 属另外两张单 ⇒ **按分配号 8.132 改写**（台账只用**追加**，不往中间插）。
+未撞号（`grep -rn "8\.127" docs AGENTS.md` 落地前先跑，零命中）。
+
+§8.62 收尾时留了一句「**已知不足另单跟**：重建路上 `resultPreview` 实测 **0/98**」——这一单就是那张单。
+
+**病根是形状，不是内容缺失。** 上游 `projectTranscriptForDisplay` **会**配对（`src/display/projection.js#toolResultsOf`），
+但它**只扫本条记录的 `messages`**。而 erix-agent 0.23+ 一轮落**多行**：`:msg:<n>:0` 是 assistant 的 `tool_use`、
+`:msg:<n>:1..k` 是**每个 `tool_result` 各一行**、`:engine:round:<n>` 载体的 `messages` 是空数组。
+`rebuildFoldedRange` 把**每行各自一条记录**喂投影 ⇒ 调用块与结果块永远分家 ⇒ 每个 `toolCalls[]` 只剩
+`name`/`argsSummary`。主消息流没这个病，因为 `session-view.js` 在投影前先过了读侧折叠（`transcript-fold.js`）
+——**同一件事（先让结果与调用同记录，再交给上游）的两个入口**。
+
+**为什么不用读侧折叠闸**（这是本片唯一真正的设计选择，别照抄工单措辞）：`foldTranscriptRows` 要 record 级形状
+（`kind`/`seq`/`partOf`/key），而重建 SQL 只取 `round, messages`；更要命的是它**必须**把 `messages='[]'` 的**载体行**
+也放进来才折得动，而放载体行进来 = 让投影走 `response.content` 回退分支 ⇒ **正文重复**。所以重建路走
+「**挂记录**」：按 `tool_use_id` 在本 range 内建结果索引，把缺的那些结果块**原样**（同一引用，站内不切长度）
+追加成一条 `{role:'user', content:[…tool_result…]}` 挂到带 `tool_use` 的记录末尾，**配对与预览截断全在上游**
+⇒ `resultPreview`/`isError`/`executionStatus`/`durationMs` 与主消息流同一把尺，零新契约面。
+纯读侧：零 DDL、账本零改写、不改上游。
+
+**四条不伪造边界**（判据 ② 的全集）：查不到 id ⇒ 上游**连键都不写**（不是空串、不是 null）；本记录内已结清 ⇒
+**就近取本记录那份**，不被别处同 `tool_use_id` 改写（崩溃恢复后 `:round:<n>` 与 `:round:<n>:resume` 双载体是真形状，
+§8.38 末登记的旧病灶在这里会露脸）；只有 `tool_use` 没有 `id`（旧记录形状）⇒ 跳过；
+**取行 WHERE 不因配对而放宽** —— 范围外的结果行不许搬进原文。
+
+**读数**（合成夹具，形状照真库 `:msg:` 行 + 一条真账本对拍）：
+
+| 面 | 修复前 | 修复后 |
+|---|---|---|
+| 真库 `e02d96cb…` round 25（range 22..22，14 行）带预览的 `toolCalls` | **0/10** | **10/10** |
+| 夹具里配得上结果的调用 | 0/3 | **3/3** |
+| 配不上结果的那条调用 | 缺键 ✔ | 缺键 ✔（`'resultPreview' in call === false`） |
+| turn 条数 / 角色分布 | 3 条 | **3 条**（挂回去的是 tool_result-only 消息，上游 `textOf()` 是空串 ⇒ 不多冒气泡） |
+
+**变异自证六条，各有牙**（一轮一还原，AGENTS 惯例）：① 摘掉 `attachToolResultsToRecords(...)` ⇒ **恰 3 格红**
+（判据① / 幂等 / 源码级哨兵；反向对照与「不多冒气泡」故意不红——它们断的是**缺席**，摘了照样绿）；
+② 配不上就塞占位预览 ⇒ **反向对照格红**（外加判据①计数红）；③ 撤 `own` 去重 ⇒ **恰 1 格红**（新加的
+「本记录内已结清」用例，先自证非空操作再定性：`toolResultsOf` 的 Map 是同值覆盖，所以**没有这条夹具时撤守卫是绿的**
+⇒ 是夹具缺，不是守卫多余）；④ **配对键错一位**（每条调用拿**下一条**结果，命中率照满但内容错位）⇒ **判据① + 幂等两格红**、反向对照与「不多冒气泡」绿 ⇒ 证明判据①**不是「有没有预览」的恒真断言**，它按 `tool_use_id` 逐条比**预览文本**；⑤ 前端 `v-if` 写死 false ⇒ 恰前端那格红；⑥ 折叠消费点护栏的谓词自己正反两条都钉
+（真 import 必须判真、纯注释必须判假）。
+
+**顺带修掉一条会咬人的护栏**：`transcript-fold-wiring.test.js` 的「只有三个消费点」判据是
+`src.includes('transcript-fold.js')` —— **注释里提一下模块名就被咬红**（本片实测）。它自己早就写明「注释不是消费点」
+（因此排除了模块自身），却只排除了自身 ⇒ 护栏退化成打字员。改成只认 `import/export from` 语句，
+并自带正反自证。**允许清单仍是三个**：重建路不折、不消费本模块，真加第四个消费点仍要改那里并写理由。
+
+**界面这半边一起接上**（`StreamPanel.vue`）：工具行下多一行 `↳ <结果>`，走 `getToolResultSummary()` 归一
+（#228 同一把尺：string / `{content, metadata}` / number 三套形态，`0` 不算「没结果」）；
+**归一后是空串就一行都不画** —— 上游对配不上的调用是缺键，宁可少一行也不许在原文里凭空造一句它没说过的话。
+`workbench.ts` 的 `FoldedOriginalTurn.toolCalls[]` 补 `resultPreview?`（主消息流 #188 早就在送，原文面从来没填）。
+
+**门禁**：根 `npm test` **rc=0**（本片树 2363 格 / **2349 pass / 0 fail / 14 skipped**；+7 格全部来自新增的
+`portal/test/session-folded-result-preview.test.js` ⇒ 基线套件是 2356 格。⚠ 基线的 pass 数**我没在
+origin/main 上单独跑过**，别把 2349 当基线读数）；
+前端 `npm run typecheck` **rc=0** + `npm test` **rc=0**（63 文件 / 1378 格，+1）。
+⚠ 前端跑测试要 `env -u NODE_ENV`（本机 shell 是 `production` ⇒ `emitted()` 假红，AGENTS §4），
+且 `npm ci` 要 `NODE_ENV=development`（否则 devDependencies 不装、`vitest: not found`，实测 rc=127）。
+`npm run check:agents-hotlayer` rc=0。零依赖改动、零 lockfile 提交、`AGENTS.md` 一字节未动。
+
+⚠ **一条同机并发假红（不是本片引入，另单 #531）**：第一次全量跑 `npm test` **rc=1**，两格里有一格是
+`portal/test/env-int-strict-506e.test.js#506e③「严格性不许把安全上限那一条挤掉」`——断言
+`循环必须停在某一拍的 sleep 上`（`clock.pending` 要在 300 个 `setImmediate` 内出现）。两个读数：
+**全量并发跑 = 红**（本机同时有别的 agent 在跑，定时器饥饿），**单独复跑
+`node --test portal/test/env-int-strict-506e.test.js` = 17/17 绿**，且**全量复跑 = rc=0（0 fail）**。
+另一格红是我自己的改动真抓到的（折叠消费点护栏被注释误咬，见上），已修。
+⇒ 口径照 AGENTS §4「判绿只看退出码」，但**红格必须先单独复跑再定性**，别把定时器饥饿当回归。
+
+**没碰的文件**：`ISSUES.md` 的 B 表里 #387 那行仍写「真待做」——那是 261111 对账表、本批还有并行单在同改文档，**留给主 agent 关单动作统一改**（判据在代码与台账，不在这行字）。
+
+**未尽项**：① 本片的真账面对拍只有本机 `station-db` 里那一条折叠会话（`e02d96cb…`）——现网其它会话的
+折叠范围没有逐条复跑（形状同源，但读数只在这一条上取过）；② `executionStatus` 的特殊态（`intercepted`/
+`interrupted`）在原文面**没有专属展示**，目前只会随 `resultPreview` 一起进 `getToolResultSummary` 那条通用归一
+（主消息流的特殊态判据在 `StreamPanel.vue` 的 `cardOut`，原文面没接它）；③ 前端那格判据是 DOM 文本断言，
+**没有跑过浏览器**（本片不动部署面）。

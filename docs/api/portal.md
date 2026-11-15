@@ -1505,6 +1505,20 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 | `truncated` | 布尔位（**不塞省略号文本**，截断标记由前端出，先例同 §4.4a-1）。重建行数超 `FOLDED_REBUILD_MAX_ROWS = 2000`（与 U7 recall 同尺）**或**归档被上游夹断 ⇒ `true` |
 | `dropped_messages` | 上游夹断丢掉的条数（取 `record.foldedPayloadMeta.droppedMessages`）；无则 `0` |
 
+**`turns[].toolCalls[].resultPreview` 的配对口径（#387）**：重建路（`source:'rebuilt'`）在喂上游投影**之前**，
+先把本 range 内各行的 `tool_result` 按 `tool_use_id` 挂回带 `tool_use` 的那条记录（`portal/src/sessions.js#attachToolResultsToRecords`，
+**纯读侧**：不改 `rows`、不动账本、不改上游 `projectTranscriptForDisplay`）。于是 `toolCalls[]` 上的
+`resultPreview` / `isError` / `executionStatus` / `durationMs` **与主消息流同一个来源**（预览长度与截断规则全在上游，
+宿主不复制第二把尺，#95 红线）。为什么必须挂：0.23+ 账本一轮是多行（`:msg:<n>:0` = assistant 的 `tool_use`、
+`:msg:<n>:1..k` = 每个 `tool_result` 各一行、载体行 `messages` 为空），而上游的配对**只扫本条记录的 `messages`**
+⇒ 不挂就是真机读到的 `resultPreview` **0/98**（§8.62）。
+
+**配不上不伪造**：`tool_use_id` 在本 range 内查不到结果（结果行在折叠范围之外 / 只有 `tool_use` 没有 `id`）
+⇒ 上游**连 `resultPreview` 这个键都不写**（不是空串、不是 `null`）；前端据此「归一后为空就一行不画」。
+同一条记录内已结清的调用**就近取本记录那份**结果，不被别处的同 `tool_use_id` 改写（崩溃恢复后
+`:round:<n>` 与 `:round:<n>:resume` 双载体是真形状，§8.38 末）。**取行范围不因配对而放宽**：
+WHERE 仍是 `round BETWEEN from AND to`，范围外的结果行不会被搬进原文。
+
 **口径为什么要改**（#375，背后可见上游 erix-agent#461）：erix-agent 0.25.0 之前 `record.foldedPayload` 是每次折叠从 `from:1` 重发的**全量副本**，所以“只读那一行归档”意外地等于“全部原文”；0.25.0 把它改成**本轮新增的有界差分**（会话级内容去重 + 默认 256 KiB 夹断）⇒ 只读归档只能给出残缺，去重全吸收时甚至是空，而旧口径一律 `404 folded_payload_not_found`、前端文案「原文已不可用（上游未保留折叠前载荷）」——那是假话，原文一直在各自的轮行里。上游契约也已写明：宿主不得把截断/缺失读成数据丢失，`foldedRoundRange` + `navigationRecord` 才是有界指针。
 
 **`404` 语义收窄**：`folded_payload_not_found` 现在只在「range 与归档**两条路**都拿不出任何正文」时才发（旧口径：那一行归档为空就发）。行顺序按 `round ASC, append_seq ASC`（与账本保序口径一致，#338 教训：不得只在页内取行）。
