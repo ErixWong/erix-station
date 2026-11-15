@@ -134,8 +134,8 @@
 
 ```
 ┌ 完成审查 ▾ ┐
-│ ☑ 完成审查 · 默认     未通过时回灌一次，再不过邮件通知 │
-│ ☐ 完成审查 · 严格     未通过时只通知，不回灌          │
+│ ☑ 完成审查 · 默认     整改时回灌一次，再不过邮件通知 │
+│ ☐ 完成审查 · 严格     整改时只通知，不回灌            │
 │ ☐ 失败恢复            只在代码/工具类失败时启动        │
 └──────────────────────────────────────────────────────┘
 ```
@@ -183,7 +183,9 @@
 
 ### 4.3 与容器并发的关系（`capacity=2`）
 
-回灌会起新 run，而容器只有 2 个槽 ⇒ 它排在人后面。这是**对的**：人优先于机器人。
+回灌会起新 run，而**同会话只允许一个活跃 run**（会话级约束）⇒ 它排在人后面。这是**对的**：人优先于机器人。
+⚠ **不是靠容器 `capacity` 保证的**：`capacity=2` 只说明容器能同时跑两个 run，
+不保证谁先谁后；人优先必须由会话级互斥 + 调度规则落实（见 [08](08-watch-and-review.md) §11.1）。
 但如果用户连续发消息，回灌会一直被挤 ⇒ 需要有「最多等多久就放弃并通知」的上限
 （否则就是 [11](06-execution-and-recovery.md) §11.4 那个 `deferred` 的无限变体）。
 
@@ -201,11 +203,13 @@
 ### 5.2 每次触发：消息流里一条分隔条
 
 ```
-──────── 宏：完成审查 · 未通过（3 条未竟事宜）→ 已回灌 ────────
+──────── 宏：完成审查 · 整改（3 条未竟事宜）→ 已回灌 ────────
 ```
 
 - 复用现有 `.roundsep` 分隔条（[#236]），不新增 UI 结构
-- 判决用词与 [03](02-event-model-and-verdict.md) 的枚举一致：`通过` / `未通过` / `未达成` / `需人工`
+- 判决用词以 [08](08-watch-and-review.md) §6.1 的映射表为**唯一来源**：
+  `通过` / `整改` / `未证实有改动` / `需人工` / `未判`（平台状态）。
+  旧稿里的「未通过」「未达成」已全部替换；若在别处见到，按本表纠正。
 - 点开能看到证据（审查报告、finding 列表）
 
 ### 5.3 「为什么没触发」
@@ -265,11 +269,21 @@ macro_runs          ← 每次触发的账（可见面靠它）
   id · assignment_id · anchor(object_key) · state · bucket
   verdict · skipped_reason · started_at · finished_at
   child_session_id(nullable) · child_run_id(nullable)
-  UNIQUE (assignment_id, anchor, state, bucket)     ← 幂等
+  UNIQUE (assignment_id, anchor, state, bucket)     ← 幂等（唯一执行点）
+
+state 取值：pending / running / done / skipped / failed / superseded
+skipped_reason：budget_exhausted / quiet_hours / human_present /
+                run_in_progress / deferred_timeout / active_run_in_cwd /
+                cancelled_by_user
 ```
 
 ⚠ `macro_runs` 的 `UNIQUE` 是**幂等的唯一执行点**。没有它，
 状态型模板会每分钟发一次，回灌型模板会无限循环。
+
+⚠ **幂等键只有这一套**（`assignment_id, anchor, state, bucket`）。
+[08](08-watch-and-review.md) §10 的 `(assignment_id, anchor, 判据)` 是**同一个键在 M9 上的特化**：
+M9 的 `state` = 判据名（`mechanical` / `semantic`）、`bucket` = 触发 run id。
+**不并存两套约束。**
 
 ---
 
@@ -365,7 +379,7 @@ DelegateChildDrawer.vue:225     class="absolute inset-y-0 right-0 w-full max-w-x
 │                            [配置 ▾]            │
 │ ───────────────────────────────────────────── │
 │ 12:03 · run 9f3a · judge_done          已完成  │
-│ 审查 run → 3 条未通过 → 已回灌                  │
+│ 审查 run → 整改（3 条）→ 已回灌                │
 │ ↑82k ↓3.1k · 4m12s                     [展开]  │
 │ ───────────────────────────────────────────── │
 │ 11:40 · run 7c21 · judge_done          已跳过  │
@@ -383,7 +397,7 @@ DelegateChildDrawer.vue:225     class="absolute inset-y-0 right-0 w-full max-w-x
 
 ```
 12:03 · run 9f3a · judge_done              已完成
-审查 run → 3 条未通过 → 已回灌
+审查 run → 整改（3 条）→ 已回灌
 ↑82k ↓3.1k · 4m12s · 深度 0
 ```
 
@@ -474,9 +488,9 @@ DelegateChildDrawer.vue:225     class="absolute inset-y-0 right-0 w-full max-w-x
 
 ```
 run 9f3a 结束（judge_done）
-  └─ 审查 run 4b02 → 未通过 3 条
+  └─ 审查 run 4b02 → 整改（3 条）
        └─ 回灌 → run c711 结束（judge_done）
-            └─ 审查 run e35d → 未通过 1 条
+            └─ 审查 run e35d → 整改（1 条）
                  └─ 转人工 → 邮件已发
 ```
 
@@ -488,7 +502,7 @@ run 9f3a 结束（judge_done）
 
 ```
 run 9f3a 结束
-  └─ 审查 run 4b02 → 未通过 3 条
+  └─ 审查 run 4b02 → 整改（3 条）
        └─ 回灌 → run c711 …              另有 2 步  [⌄]
              └─ 转人工 · 已发邮件给 eric
 ```
@@ -497,7 +511,7 @@ run 9f3a 结束
 
 1. **默认最多两层**，更深的收成「另有 N 步」
 2. **链的末端必须常显**（`转人工 · 已发邮件给 eric` / `发送失败`），
-   即使它在第三层 —— 否则用户看到「未通过」不知道接下来会发生什么
+   即使它在第三层 —— 否则用户看到「整改」不知道接下来会发生什么
 3. **竖线只在有子步骤时画**，单条记录不画连接线
 4. **run id 与报告全文进详情**，不复制进流水行
 
@@ -505,7 +519,7 @@ run 9f3a 结束
 缩进 + 竖线够用。
 
 ⚠ 链的**末端必须明确**：`转人工` 那一行要写清「已发邮件给 eric」。
-否则用户看到「未通过」却不知道接下来会发生什么。
+否则用户看到「整改」却不知道接下来会发生什么。
 
 ---
 
