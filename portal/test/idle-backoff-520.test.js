@@ -24,6 +24,7 @@ import { startOnboardingLoop } from '../src/onboarding.js';
 import { startOffboardingLoop } from '../src/offboarding.js';
 import { startProvisionerLoop, reconcileDidWork } from '../src/provisioner.js';
 import { startReaperLoop } from '../src/internal.js';
+import { hashToken } from '../src/auth.js';
 import { startRouteDriftMonitor, DRIFT_INTERVAL_MS } from '../src/routesdrift.js';
 import { stopLoopsAndWait } from '../src/shutdown.js';
 
@@ -83,10 +84,39 @@ async function waitUntil(cond, label, deadlineMs = 15_000) {
   }
 }
 
-/** 跑到「第 n 拍 sleep 已被记录」为止，然后返回 sleeps。 */
-async function parkedTick(fake, n) {
-  await waitUntil(() => fake.sleeps.length >= n, `循环应已走到第 ${n} 拍 sleep；实际 ${fake.sleeps.length} 拍`);
+/** 跑到「第 n 拍 sleep 已被记录」为止（`who` 只用于失败消息：红了要知道是哪个循环没跑起来）。 */
+async function parkedTick(fake, n, who = '循环') {
+  await waitUntil(() => fake.sleeps.length >= n,
+    `${who} 应已走到第 ${n} 拍 sleep；实际 ${fake.sleeps.length} 拍（${JSON.stringify(fake.sleeps)}）`);
   return fake.sleeps;
+}
+
+/**
+ * 把假时钟推到「第 n 拍并**停在**那一拍的 sleep 上」（前面的拍逐拍放行）。
+ * 必要性的理由：假睡眠**不会自己醒**（这是它的卖点：不等真时间），所以每一拍都得由测试
+ * `pass()` 放行——直接 `parkedTick(n)` 而不放行前 n-1 拍，永远也等不到第 n 拍。
+ */
+async function parkAt(fake, n, who = '循环') {
+  for (let i = 1; i < n; i += 1) {
+    await parkedTick(fake, i, who);
+    fake.pass();
+  }
+  await parkedTick(fake, n, who);
+}
+
+/**
+ * 给一个「正常情况立刻落定」的 promise 加** watchdog**（不是判据，只是防挂死）。
+ * 为什么这里允许墙钟：判据是「`stop()` 能打断睡」——假睡眠**永不自己醒**，所以
+ * `settled` 能落定就只可能是 abort 生效；20s 只是「万一没打断也别挂死整个文件」。
+ * 与 #531 里那族红线的区别：那里拿墙钟/轮次**当判据**，这里拿它当看门狗。
+ */
+async function awaitWatchdog(promise, label, ms = 20_000) {
+  let timer = null;
+  const watchdog = new Promise((resolve) => { timer = setTimeout(() => resolve('__watchdog__'), ms); });
+  const outcome = await Promise.race([promise.then(() => '__ok__', (err) => err), watchdog]);
+  if (timer) clearTimeout(timer);
+  if (outcome === '__watchdog__') assert.fail(`stop() 没能打断在睡的那一拍（${label}，${ms}ms watchdog）`);
+  if (outcome !== '__ok__') throw outcome;
 }
 
 const silentLog = { log() {}, warn() {}, error() {} };
@@ -202,22 +232,25 @@ test('#520 B1 onboarding：认领 0 行 ⇒ sleep 序列 5000/10000/20000/30000/
 });
 
 test('#520 B2 onboarding：认领到活立刻回基准 5000（退避不许粘住）', async () => {
+  // 拍与 sleep 的对应关系（弄错这个就会造出一条「看起来像测了但其实没测」的用例）：
+  //   循环是「干活 → 决定这一拍睡多久 → sleep」，所以 **sleeps[i] 是第 i+1 拍干完活后的决定**。
+  //   ⇒ 要让某一拍「有活」，必须在它**还没开始干**的时候把 `hasWork` 翻上去 = 在上一拍还停在
+  //     sleep 上时翻。先 pass 再翻就晚了（那一拍已经按空闲拍过睡了）。
   const fake = makeFakeSleep();
   let hasWork = false;
   const pool = makeOnboardingPool({ claimRows: () => hasWork });
   const loop = startOnboardingLoop(pool, {}, { docker: {}, log: silentLog, sleep: fake.sleep, idleBackoffMaxMs: 30000 });
-  await parkedTick(fake, 1); fake.pass(); // 空闲 1 拍 ⇒ 5000
-  await parkedTick(fake, 2); fake.pass(); // 空闲 2 拍 ⇒ 10000
+  await parkedTick(fake, 1); fake.pass();            // 拍 1 空闲 ⇒ 5000
+  await parkedTick(fake, 2);
+  assert.equal(fake.sleeps[1], 10000, '拍 2 仍空闲 ⇒ 阶梯继续爬');
+  hasWork = true; // 拍 2 停在 sleep 上时入队 ⇒ 拍 3 一开工就认领得到
+  fake.pass();
   await parkedTick(fake, 3);
-  assert.equal(fake.sleeps[2], 10000);
-  hasWork = true; // 下一拍认领到了活
-  fake.pass();
-  await parkedTick(fake, 4);
-  assert.equal(fake.sleeps[3], 5000, '认领到活的那一拍必须回基准（idleTicks 清 0）');
+  assert.equal(fake.sleeps[2], 5000, '认领到活的那一拍必须回基准（idleTicks 清 0）');
   hasWork = false;
-  fake.pass();
-  await parkedTick(fake, 5);
-  assert.equal(fake.sleeps[4], 5000, '活干完之后从基准重新开始爬，不是接着 20000');
+  fake.pass();                                       // 拍 4 又开始空闲
+  await parkedTick(fake, 4);
+  assert.equal(fake.sleeps[3], 5000, '活干完之后从基准重新爬，不是接着 20000 继续');
   loop.stop();
   await loop.settled;
 });
@@ -236,18 +269,20 @@ test('#520 B3 onboarding：旋钮把上限顶到越界也不会变成 1ms（夹�
   await loop.settled;
 });
 
-test('#520 B4 onboarding：stop() 打断正在睡的退避（真 timer + 真 AbortController），done 落定且无未捕获拒绝', async () => {
+test('#520 B4 onboarding：stop() 打断正在睡的那一拍（假睡眠永不自己醒 ⇒ 能落定就只可能来自 abort）', async () => {
+  // 口径（工单 (d) + #531）：本条**不拿墙钟当判据**。假睡眠不会自己醒，所以 `settled` 能落定
+  // 就是 abort 生效的直接证据；`sleepCancellable` 自己的真 timer 行为由 A4 守。
+  const fake = makeFakeSleep();
   const pool = makeOnboardingPool({ claimRows: () => false });
-  const loop = startOnboardingLoop(pool, {}, { docker: {}, log: silentLog }); // 真 sleepCancellable
-  await waitUntil(() => loop.stop, '循环已启动');
-  // 真节拍：第一拍睡 5000ms，不该等它睡完就能退（等满就是「优雅关闭白等一整拍」）
-  const startedAt = Date.now();
+  const loop = startOnboardingLoop(pool, {}, { docker: {}, log: silentLog, sleep: fake.sleep });
+  await parkAt(fake, 3, 'onboarding');
+  assert.equal(fake.sleeps[2], 20000, '已经爬到退避上（否则本条测不到「退避中也能退」）');
+  assert.ok(fake.parked, '这一拍必须还停在 sleep 上');
   loop.stop();
-  await loop.settled; // 这条 await 能返回 = 既落定了也没成为未捕获拒绝
-  assert.ok(Date.now() - startedAt < 2000, `stop() 后应立刻退出，实测 ${Date.now() - startedAt}ms`);
+  await awaitWatchdog(loop.settled, 'onboarding');
+  assert.equal(fake.parked, false, '睡过去的那一拍必须以 abort 收场');
   assert.equal(loop.failure(), null, '正常退出不该留下循环异常');
-  // `done` 与 `settled` 指同一次退出（`done` 仍是给 stopLoopsAndWait 的那一份）
-  await loop.done;
+  await loop.done; // `done` 与 `settled` 指同一次退出（done 仍是给 stopLoopsAndWait 的那一份）
 });
 
 test('#520 B5 onboarding：异常分支走 BACKOFF_MS（不是空闲阶梯），且 onPause 收到', async () => {
@@ -308,7 +343,9 @@ test('#520 C1 offboarding：认领 0 行 ⇒ 同样阶梯；且**空闲时 1h �
   const sweepCount = { n: 0 };
   let t = 1_700_000_000_000; // 生产里 `Date.now()` 远大于 0 ⇒ 启动那一拍必跑一次清理（保持原语义）
   const pool = makeOffboardingPool({ claimRows: () => false, sweepCount });
-  const loop = startOffboardingLoop(pool, { userSpaceRoot: tmpRoot }, {
+  // ⚠ `workspaceRetentionDays` 必须非 0：它是清理功能的**开关**（0 ⇒ `sweepOffboardedWorkspaces`
+  // 直接 return `{disabled:true}`，一条 SQL 都不跑，本条用例就变成「断言一个从未跑的查询」）。
+  const loop = startOffboardingLoop(pool, { userSpaceRoot: tmpRoot, workspaceRetentionDays: 7 }, {
     docker: {}, log: silentLog, sleep: fake.sleep, now: () => t, idleBackoffMaxMs: 30000,
   });
   for (let i = 1; i <= 5; i += 1) {
@@ -331,28 +368,31 @@ test('#520 C2 offboarding：认领到活立刻回基准', async () => {
   const fake = makeFakeSleep();
   let hasWork = false;
   const pool = makeOffboardingPool({ claimRows: () => hasWork });
-  const loop = startOffboardingLoop(pool, { userSpaceRoot: tmpRoot }, {
+  const loop = startOffboardingLoop(pool, { userSpaceRoot: tmpRoot, workspaceRetentionDays: 7 }, {
     docker: {}, log: silentLog, sleep: fake.sleep, now: () => 1_700_000_000_000, idleBackoffMaxMs: 30000,
   });
   await parkedTick(fake, 1); fake.pass();
-  await parkedTick(fake, 2); fake.pass();
-  assert.equal(fake.sleeps[1], 10000);
-  hasWork = true;
-  fake.pass(); // 上面 pass 的是第 2 拍；下面第 3 拍会认领到活
+  await parkedTick(fake, 2);
+  assert.equal(fake.sleeps[1], 10000, '两拍空闲 ⇒ 在爬阶梯');
+  hasWork = true; // 拍 2 还停在 sleep 上 ⇒ 拍 3 一开工就认领得到
+  fake.pass();
   await parkedTick(fake, 3);
   assert.equal(fake.sleeps[2], 5000, '有活 ⇒ 回基准');
   loop.stop();
   await loop.settled;
 });
 
-test('#520 C3 offboarding：stop() 打断正在睡的退避（真 timer）', async () => {
+test('#520 C3 offboarding：stop() 打断在睡的那一拍（同 B4 口径：不用墙钟）', async () => {
+  const fake = makeFakeSleep();
   const pool = makeOffboardingPool({ claimRows: () => false });
-  const loop = startOffboardingLoop(pool, { userSpaceRoot: tmpRoot }, { docker: {}, log: silentLog });
-  await waitUntil(() => Boolean(loop), '循环已启动');
-  const startedAt = Date.now();
+  const loop = startOffboardingLoop(pool, { userSpaceRoot: tmpRoot, workspaceRetentionDays: 7 },
+    { docker: {}, log: silentLog, sleep: fake.sleep });
+  await parkAt(fake, 2, 'offboarding');
+  assert.equal(fake.sleeps[1], 10000);
   loop.stop();
-  await loop.settled;
-  assert.ok(Date.now() - startedAt < 2000, `stop() 后应立刻退出，实测 ${Date.now() - startedAt}ms`);
+  await awaitWatchdog(loop.settled, 'offboarding');
+  assert.equal(fake.parked, false);
+  assert.equal(loop.failure(), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -374,9 +414,17 @@ const RECONCILE_CONFIG = {
 
 /**
  * 假 pool + 假 docker：`containerExists` 决定这一拍要不要动手重建。
- * 稳态（容器在跑）⇒ `reconcileOnce` 返回的 stats 只有 `ensured>0` ⇒ 判据是「没动手」。
+ * 稳态（容器在跑）⇒ `reconcileOnce` 返回的 stats 全 0 ⇒ 判据是「没动手」。
+ *
+ * 两个假必顶得住真实的契约校验（否则 `reconcileOnce` 会在 `assertNetworkContract` 那里
+ * 抱一条 warn 就跳过本 FDE，`stats` 永远全 0 ⇒ 用例在**假绿**）：
+ *   · 网络 inspect 必须带 `station.managed` / `fde.name` / IPAM 的 subnet+gateway；
+ *   · 容器 inspect 的 `ERIX_STATION_TOKEN` 必须与 `runner_token_hash` 对得上（#404 的 F6：
+ *     对不上会被当成漂移重建）⇒ 这里两边同源算（`hashToken(TOKEN)`）。
+ *   · `State.Status = 'running'`（不跑 ⇒ `started=true` ⇒ `statusUpdates++` ⇒ 本单判为「动手」）。
  */
 function makeReconcileFakes({ containerExists }) {
+  const TOKEN = 'tok-520';
   const state = { rebuilds: 0, queries: [] };
   const pool = {
     async query(sql, params = []) {
@@ -385,7 +433,7 @@ function makeReconcileFakes({ containerExists }) {
         return { rows: [{
           user_id: 'u1', fde_name: 'alice', subnet: '10.200.1.0/29', gateway: '10.200.1.1',
           network_name: 'fde-alice', container_id: 'c1', container_name: 'fde-alice',
-          container_status: 'running', runner_token_hash: 'hash',
+          container_status: 'running', runner_token_hash: hashToken(TOKEN),
         }] };
       }
       if (sql.includes('SELECT 1 FROM fde_networks')) return { rows: [{ '?column?': 1 }] };
@@ -394,14 +442,28 @@ function makeReconcileFakes({ containerExists }) {
     async connect() { return { query: (sql, p) => this.query(sql, p), release() {} }; },
   };
   const docker = {
-    async inspectNetwork() { return { status: 200, data: { Name: 'fde-alice', Id: 'nid' } }; },
+    async inspectNetwork() {
+      return {
+        status: 200,
+        data: {
+          Name: 'fde-alice', Id: 'nid',
+          Labels: { 'station.managed': 'true', 'fde.name': 'alice' },
+          IPAM: { Config: [{ Subnet: '10.200.1.0/29', Gateway: '10.200.1.1' }] },
+        },
+      };
+    },
     async createNetwork() { return { status: 201, data: { Id: 'nid' } }; },
     async inspectContainer(name) {
       if (containerExists()) {
         return {
           status: 200,
           data: {
-            Name: `/${name}`, State: { Running: true }, Config: { Image: 'sha256:img', Labels: {}, Env: ['ERIX_RUNNER_TOKEN=hash'] },
+            Name: `/${name}`, Id: 'cid',
+            State: { Status: 'running' },
+            Config: {
+              Image: 'sha256:img', Labels: { 'station.managed': 'true', 'fde.name': 'alice' },
+              Env: [`ERIX_STATION_TOKEN=${TOKEN}`],
+            },
             HostConfig: { Memory: 512 * 1024 * 1024, Binds: [] },
           },
         };
@@ -452,9 +514,10 @@ test('#520 D2 provisioner：本轮真的动手收敛了 ⇒ 回基准 5000（漂
     docker, log: silentLog, sleep: fake.sleep, idleBackoffMaxMs: 15000,
   });
   await parkedTick(fake, 1); fake.pass();
-  await parkedTick(fake, 2); fake.pass();
+  await parkedTick(fake, 2);
   assert.equal(fake.sleeps[1], 10000, '两拍无事可做 ⇒ 已经在爬阶梯');
-  exists = false; // 有人在外面 `docker rm` 了 ⇒ 下一拍必须重建（stats.rebuilt>0）
+  exists = false; // 拍 2 停在 sleep 上时被人 `docker rm` ⇒ 拍 3 的 reconcile 会看到容器没了
+  fake.pass();
   await parkedTick(fake, 3);
   assert.equal(fake.sleeps[2], 5000, '动手重建的那一拍必须回基准（漂移发现后连续收敛）');
   exists = true;
@@ -465,14 +528,16 @@ test('#520 D2 provisioner：本轮真的动手收敛了 ⇒ 回基准 5000（漂
   await loop.settled;
 });
 
-test('#520 D3 provisioner：stop() 打断正在睡的退避（真 timer）', async () => {
+test('#520 D3 provisioner：stop() 打断在睡的那一拍（同 B4 口径：不用墙钟）', async () => {
+  const fake = makeFakeSleep();
   const { pool, docker } = makeReconcileFakes({ containerExists: () => true });
-  const loop = startProvisionerLoop(pool, RECONCILE_CONFIG, { docker, log: silentLog });
-  await waitUntil(() => Boolean(loop), '循环已启动');
-  const startedAt = Date.now();
+  const loop = startProvisionerLoop(pool, RECONCILE_CONFIG, { docker, log: silentLog, sleep: fake.sleep });
+  await parkAt(fake, 3, 'provisioner');
+  assert.equal(fake.sleeps[2], 15000, '已经顶到本循环的上限（15s）');
   loop.stop();
-  await loop.settled;
-  assert.ok(Date.now() - startedAt < 3000, `stop() 后应立刻退出，实测 ${Date.now() - startedAt}ms`);
+  await awaitWatchdog(loop.settled, 'provisioner');
+  assert.equal(fake.parked, false);
+  assert.equal(loop.failure(), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -524,15 +589,15 @@ test('#520 E2 reaper：1h 幂等键清理只按时刻判，跨闸门那一拍必
   await loop.settled;
 });
 
-test('#520 E3 reaper：stop() 打断在睡的那一拍（真 timer + 真 AbortController）', async () => {
+test('#520 E3 reaper：stop() 打断在睡的那一拍（改前是裸 setTimeout(15s)，同样不用墙钟）', async () => {
+  const fake = makeFakeSleep();
   const pool = makeReaperPool();
-  const loop = startReaperLoop(pool, { log: silentLog }); // 真 sleepCancellable，节拍 15s
-  await waitUntil(() => pool.reaps >= 1, 'reaper 至少扫过一拍');
-  const startedAt = Date.now();
+  const loop = startReaperLoop(pool, { log: silentLog, sleep: fake.sleep }); // 节拍仍是默认 15s
+  await parkedTick(fake, 1, 'reaper');
+  assert.equal(fake.sleeps[0], 15000);
   loop.stop();
-  await loop.settled;
-  assert.ok(Date.now() - startedAt < 2000,
-    `改前这里是裸 setTimeout(15s)：stop() 要白等最多 15s。实测 ${Date.now() - startedAt}ms`);
+  await awaitWatchdog(loop.settled, 'reaper');
+  assert.equal(fake.parked, false, '改前这里不可中断：stop() 会白等到多 15s');
   assert.equal(loop.failure(), null);
 });
 
@@ -581,21 +646,25 @@ test('#520 F1 stopLoopsAndWait：四个循环现在都有 done（改前只能记
     { name: 'provisioner', ...startProvisionerLoop(rec.pool, RECONCILE_CONFIG, { docker: rec.docker, log: silentLog, sleep: fakes.provisioner.sleep }) },
     { name: 'reaper', ...startReaperLoop(reaperPool, { log: silentLog, sleep: fakes.reaper.sleep }) },
   ];
-  // 让四个循环都停在**退避中**的那一拍上（阶梯已爬到 > 基准）
-  for (const fake of Object.values(fakes)) {
-    await parkedTick(fake, 2);
+  // 让四个循环都停在**退避中**的那一拍上（阶梯已爬过基准）；label 带名字，否则红了不知道是谁没跑起来
+  const named = [
+    ['onboarding', fakes.onboarding],
+    ['offboarding', fakes.offboarding],
+    ['provisioner', fakes.provisioner],
+    ['reaper', fakes.reaper],
+  ];
+  for (const [name, fake] of named) {
+    await parkAt(fake, 2, name);
   }
-  assert.ok(fakes.onboarding.parkedMs > 5000 || fakes.onboarding.parkedMs === 10000,
+  assert.ok(fakes.onboarding.parkedMs > 5000,
     `onboarding 应停在退避上，实际 ${fakes.onboarding.parkedMs}`);
-  const startedAt = Date.now();
   const result = await stopLoopsAndWait(loops, { timeoutMs: 5000, log: silentLog });
-  const elapsed = Date.now() - startedAt;
   assert.deepEqual(
     { stopped: result.stopped, waited: result.waited, skipped: result.skipped, timedOut: result.timedOut, rejected: result.rejected, pending: result.pending },
     { stopped: 4, waited: 4, skipped: 0, timedOut: false, rejected: 0, pending: [] },
-    '四个循环都要被等到（改前 onboarding/offboarding/provisioner/reaper 全部是 skipped）',
+    '四个循环都要被等到（改前 onboarding/offboarding/provisioner/reaper 全部是 skipped）；'
+    + ' `timedOut:false` 就是「退避中也能收完」的判据本身（不靠量墙钟，#531）',
   );
-  assert.ok(elapsed < 2000, `退避中的四个循环要在 2s 内收完，实测 ${elapsed}ms（= sleep 不可中断的话会白等一整拍）`);
   for (const loop of loops) await loop.settled; // 都没留下未捕获拒绝
 });
 
