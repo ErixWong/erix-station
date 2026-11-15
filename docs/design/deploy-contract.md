@@ -83,6 +83,17 @@
 | `station-docker-proxy` | 无（`service_started` 依赖即可） | — | — | — | — |
 
 > portal healthcheck 语义：`/api/health` 返回 200 当且仅当「DB 可达 + 迁移已到 head（§3）+ 无致命初始化错误」——这使 `depends_on: station-db (service_healthy)` 传递的 readiness 链成立（§8）。
+>
+> **判据是状态码 / 进程退出码，不是响应体（#515 / 261115-11 实测钉住，不是推理）**：
+> `station-portal healthcheck` 的实际执行链 = `node portal/src/cli.js healthcheck` → `fetch http://127.0.0.1:<PORT>/healthz`
+> → **只看 `res.ok`**（`portal/src/cli.js#healthcheck` 不解析 body）⇒ 容器健康日志里的 `Output` 就是 CLI 自己打的
+> 那一行 `ok`（实测 `docker inspect -f '{{json .State.Health}}' station-portal` 的 `Log[].Output = "ok\n"`、
+> `ExitCode: 0`）。推论：**往 200 的响应体里 additive 地加键对健康检查结构性安全**——本条就是为 #515 加的
+> `partialBuffer` 观测块留的口径（改前 `GET /healthz` = `{"status":"ok"}`，改后 =
+> `{"status":"ok","partialBuffer":{"entries":0,"maxEntries":32,"evictedActive":0}}`，同一条 compose 命令两次
+> 都 `rc=0`；块内字段与红线见 `docs/api/portal.md` §5.1 的那条已接受损失注记 +
+> `portal/test/healthz-partial-buffer.test.js`）。**反过来不成立**：状态码语义（200=就绪 / 503=`migration_failed`）
+> 与 503 的错误信封**不许**为观测目的而动——§8 的 readiness 链吃的是它们，不是 body。
 
 ### 2.4 `env_file` 约定与凭据注入
 
