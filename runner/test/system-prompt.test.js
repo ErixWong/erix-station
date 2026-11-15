@@ -296,7 +296,7 @@ test('#259 反向防漂移：提示词不再声称「家目录用文件工具读
   for (const line of scoped) {
     for (const dead of HOME_READ_DENIED) {
       assert.doesNotMatch(line, dead,
-        `家目录读法的句子里出现了「读不了」一族（/${dead.source}/）——#259 之后它是谎，而且会教模型去绕一个不存在的缺：${line}`);
+        `家目录读法的句子里出现了「读不了」一族（/${dead.source}/）——#259 之后它是谎，而且会教模型去绕一个不存在的缺口：${line}`);
     }
   }
   // ③ 家目录的读取手段必须是文件工具，且与 shell 不再同句出现（否则等于又给模型留了一条绕路）

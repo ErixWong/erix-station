@@ -607,7 +607,7 @@ async function withReplacedExceptionRoot(fn, { entry = '.erix', kind = 'dir', ta
     fs.writeFileSync(path.join(target, 'secrets', 'token.txt'), 'needle target secret\n');
   } else {
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, '# 外枛的平台约定\nTARGET-RULES\n');
+    fs.writeFileSync(target, '# 家目录外的平台约定\nTARGET-RULES\n');
   }
   const declared = path.join(home, entry);
   fs.rmSync(declared, { recursive: true, force: true });
