@@ -5548,3 +5548,44 @@ issue 侧：**#527 拆成 #537（W4a 快照与隔离）+ #538（W4b 判决与生
 
 **待办**：W1 代码审计（copilot，在跑）；W2 评估循环（`erix_run` 在跑）；
 W3–W7 按 `#523` 的顺序派。
+
+### 8.129 发版 v0.1.68 并上真机：0.32 未执行的红线补做 + 5 台 FDE 换引擎到 0.33.0（issue #530 B 段，2026-11-16 凌晨，主 agent）
+
+**这一条接 §8.127**（升级代码合进 main）**与 §8.123 的遗留 1**（0.32 的红线没执行）。真机现况是：
+`v0.1.67` 的 `runner/package.json` 仍是 0.31.0、5 台 `fde-*` 的 `build-info.json` 是
+`station 0.1.57 / engine 0.31.0`（容器 11-09 创建）、`deploy/.env` 的 `FDE_IMAGE` digest 是 **0.1.57**
+的镜像 —— 即 FDE 舰队自 0.1.57 起 10 个 release 都没上过真机。
+
+**切版与产物**：`chore-261116-01-release-0.1.68` 三处 `version` 对齐（根 / `runner` / `portal/frontend`）
+→ PR #546 合并 `96b70d0` → tag `v0.1.68` → `release.yml` run `43744913627` **success**。
+digest（`images-digest.json` 现取）：FDE `sha256:d90b1c52…67ff`、proxy `sha256:feb00379…425a`、
+portal `sha256:42419ff2…24f7`（**portal 仍走本地构建**：`deploy/.env` 的 `STATION_PORTAL_IMAGE` 本就是注释态，
+本次按现有部署形态 `docker compose build station-portal` 重建，未切换部署模式）。
+
+**上真机（逐条现查）**：
+
+| 判据 | 实测 |
+|---|---|
+| 5 台 `fde-*` 全部重建 | `docker rm -f` + `provision-fde` 逐台；`eric` / `acc019` / `blind` / `todo` / `tetris` |
+| 容器内 `build-info.json` | 5 台全是 `station 0.1.68 / engine 0.33.0 / revision 96b70d0` |
+| proxy 白名单 | `IMAGE_ALLOWLIST` = 新 FDE digest（与 `FDE_IMAGE` 同源，未单独改） |
+| portal 内引擎 | `/app/node_modules/erix-agent` = **0.33.0** |
+| 容器内真跑一条（真引擎 + 真 `shell` 工具，桩 provider） | `echo engine-0.33.0-ok` 真执行、`exit_code 0`；事件 `round_start/attempt/tool_use/tool_result/round_end/run_outcome`；`persistence_capability_degraded` **恰好 2 条**（`clearRecoveryRows` + `appendRecoveryRow`，与 #500 未做一致） |
+
+**没拿到的那一格（诚实记账）**：**真 LLM 的 run 跑不成** —— 上游中转 `inteva` 的额度**全局耗尽**：
+`todo` 与 `eric` 两个账号的 run 都以 `litellm.AuthenticationError … 令牌额度已用尽` 失败
+（`deepseek-v4-pro` 与 `deepseek-flash` 各一次，`runs.error.code = auth`，非本单回归）。
+⇒ #530 验收判据 7「一条真 run 时间线可读」**只做到「事件管线 + 引擎在容器内真跑」**，
+LLM 那一段等额度恢复后补跑（不影响本次交付的引擎版本事实）。
+
+**临时改动与还原（都可核对）**：为拿到上面那条容器内实测，临时把 `eric.mail_otp_enabled` 置 `false`
+（邮件二次验证挡住 CLI 登录）→ 现查已还原 `true`；`todo` 的 `password_hash` 临时改过 → 已用原值还原；
+两条探测 session（`4efca886` / `6655cdb2`）已归档，`fde-todo` 里的 `probe-0330` 目录已删。
+`deploy/.env` 改前备份在 `/tmp/deploy-env.bak.*`。
+
+**顺带修掉一个今天撞了 5 次的 CI 假红**（并进 #530）：三个 506 系列假时钟桩的 `arm()` 把「等循环停到
+某一拍 sleep」写成**固定 300 次 `setImmediate`**，CI 负载下预算先耗尽 ⇒ 断言假红（本地同 commit 全绿）。
+改成**真实时间 5 s 预算**、超时仍红并打印已等毫秒数。复现与自证：`taskset -c 0` 单核争抢下改前 5/5 红、
+改后 5/5 绿；超时路径（预算改 0）仍红。
+
+**剩余**：#500（恢复行三件套，1 张新表）/ #501（`loadRawRows`，零 DDL）/ D1（快照死代码退役）不变。
