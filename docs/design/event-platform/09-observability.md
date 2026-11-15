@@ -246,6 +246,7 @@ macro_runs  已有：assignment_id · anchor · state · verdict · skipped_reas
 
 **一个查询、三表 JOIN**（不是「一个 JOIN」），不需要事件总线、不需要物化视图。
 ⚠ 模板用 `LEFT JOIN`：软删的模板也要能显示出名字（[07](07-surfaces-and-panel.md) §2.3 末）。
+⚠ 硬删只发生在「没有任何 `macro_runs` / `notifications` 指着它」时 —— 所以 `LEFT JOIN` 只为软删兜底，不会因为硬删丢历史。
 
 ⚠ **新增一列**：`macro_assignments.last_evaluated_at`（§1 的水位线）。
 这是本文唯一需要加到数据形状里的字段 —— 没有它，问题 ① 无法回答。
