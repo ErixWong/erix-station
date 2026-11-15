@@ -25,6 +25,9 @@ import { foldDegradeNotice } from '../worker.js';
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(RUNNER_DIR, rel), 'utf8');
 const CTX_MARKERS = /\/\* #392:context-strategy:start \*\/([\s\S]*?)\/\* #392:context-strategy:end \*\//;
+// 与 `runner/test/fold-strategy.test.js` 的 `workerTtlKnobs()` 同一对标记、同一套正则：
+// 从**源码**里解析 worker 真传的那两个旋钮，而不是在测试里手抄一遍值。
+const TTL_MARKERS = /\/\* #440:ttl-knobs:start \*\/([\s\S]*?)\/\* #440:ttl-knobs:end \*\//;
 
 // ── ① A4：校验器本体的口径 ────────────────────────────────────────────────────
 test('K1 本站现在真传的那份 context 必须过校验（否则 worker 起跑即崩）', () => {
@@ -360,6 +363,32 @@ const foldingIntakeMessage = async (folding) => {
   return error === null ? null : String(error?.message ?? error);
 };
 
+// ──「引擎**接受**了这条输入」的**正向**判据（K13c 的清单与 K13d 的 `keepRound` 那条共用）──
+// 实测（装着的 erix-agent 0.33.0）：只要这条输入**过了值校验**，桦具必然一路走到装配期，而那里
+// 报的错**恒**是下面这一条 —— `undefined` / `{}` / `context: null` / `Number.MAX_SAFE_INTEGER` /
+// worker 真传的那份 / `keepRound` 拼错，六种全是这一条，一字不差。
+// 为什么这条 assembly 错**等价于**「过了值校验」：装配校验站在值规则**之后**（值错在 `config-namespace.js`
+// 的 intake 层就抛，走不到装配），而桦具唯一缺的是 `executeTool` ⇒ 能报到装配期，说明值那一关已经放行。
+//
+// ⚠ 为什么必须写成**正向断言**（「等于这一条」），而不是原先那种排除式（「不等于某几条已知 folding 错」）：
+//   排除式问的是「不是**我们现在认识的**这几条文案」⇒ 上游换措辞、换一张嘴、甚至**收紧**了输入面，
+//   都落在排除集之外 ⇒ 非法/新被拒的输入被判「接受」，用例**照常绿**（假绿），而它其实什么都没钉住。
+//   正向断言把预期收窄成「只接受这一种结果」：任何新文案当场红。逐字相等、不写成「包含」——这条错里
+//   带着**缺的方法名**，哪天缺的是别的方法，说明桦具形状变了（本判据的前提没了），同样该红。
+const ASSEMBLY_PORT_ERROR = 'assembly port is missing methods: executeTool';
+
+/** 正向判定「引擎接受了这份 folding」：没抛错，**或**只抛了装配期那一条预期错。 */
+async function assertFoldingAccepted(label, folding, note = '') {
+  const error = await foldingIntakeError(folding);
+  const msg = error === null ? null : String(error?.message ?? error);
+  assert.ok(error === null || msg === ASSEMBLY_PORT_ERROR,
+    `${label}：引擎没有**正向**判它「接受」（实得：${msg}）。两种可能都得查：`
+    + '① 引擎收窄了输入面 ⇒ 这条输入现在真被拒了；② 装配期那条预期错的文案/类型变了 ⇒ 本桦具的前提没了。'
+    + '⚠ 别退回去写「只要不是某几条已知 folding 错就算接受」——那种排除式在任何新文案下都假绿。'
+    + (note ? `\n   引擎语义 / 若确属①该怎么办：${note}` : ''));
+  return msg;
+}
+
 // 引擎值规则的文案模板（`config-namespace.js` 的 `nonNegativeIntegerConfigValueProblem`）：
 // **完整路径** + `must be a non-negative integer` + `(received: <类型>)` 尾巴。
 const foldingNonNegRe = (leafPath, received) => new RegExp(
@@ -464,6 +493,14 @@ test('#440-K13b folding 三叶子的非法值形态：null / NaN / ±Infinity / 
     ['context.keepRounds=Infinity', { context: { keepRounds: Infinity } }, foldingNonNegRe('context.keepRounds', 'number')],
     ['context.keepRounds=MAX_SAFE_INTEGER+1',
       { context: { keepRounds: Number.MAX_SAFE_INTEGER + 1 } }, foldingNonNegRe('context.keepRounds', 'number')],
+    // `toolResultTtl` 上面已钉过 -Infinity / boolean / array：三个叶子共用同一张嘴
+    // （`nonNegativeIntegerConfigValueProblem`），但**逐叶都钉**：上游完全可以只改一个叶子的入口。
+    ['toolResultFoldMinTokens=-Infinity', { toolResultFoldMinTokens: -Infinity }, foldingNonNegRe('toolResultFoldMinTokens', 'number')],
+    ['toolResultFoldMinTokens=true', { toolResultFoldMinTokens: true }, foldingNonNegRe('toolResultFoldMinTokens', 'boolean')],
+    ['toolResultFoldMinTokens=[]', { toolResultFoldMinTokens: [] }, foldingNonNegRe('toolResultFoldMinTokens', 'array')],
+    ['context.keepRounds=-Infinity', { context: { keepRounds: -Infinity } }, foldingNonNegRe('context.keepRounds', 'number')],
+    ['context.keepRounds=true', { context: { keepRounds: true } }, foldingNonNegRe('context.keepRounds', 'boolean')],
+    ['context.keepRounds=[]', { context: { keepRounds: [] } }, foldingNonNegRe('context.keepRounds', 'array')],
   ];
   for (const [label, folding, re] of intakeRejections) {
     const error = await foldingIntakeError(folding);
@@ -494,9 +531,26 @@ test('#440-K13b folding 三叶子的非法值形态：null / NaN / ±Infinity / 
 //   · `folding.context = null` 也被接受：那条规则对**非对象** payload 直接早退（`:618`）
 //     ⇒ 引擎把 `context` 当不透明盒子，只挖 `keepRounds` 一个子键。
 //   · 正整数全接受，**上界是安全整数**（与 K13b 的 `+1` 抛配对）。
+// ⚠ 「接受」的口径已改成**正向断言**（`assertFoldingAccepted`：没报错，或只报装配期那一条预期错）。
+//   原先的排除式（「不带某几条已知 folding 文案就算接受」）在引擎**换文案**时会让非法输入被判接受（假绿）。
 test('#440-K13c folding 旋钮被引擎**接受**的形态：省略 / undefined / context=null / 正整数 / 安全整数上界', async () => {
-  // 「接受」的判据＝**没报 folding 相关的启动期错**（桦具缺 `executeTool`，走到装配错是预期的事）。
-  const foldingComplaint = /must be a non-negative integer|unknown config\.folding option|config\.folding must be an object|context must be an object/;
+  // 本站 worker 真传的那一份：从 `worker.js` 的两对标记区间里**解析**出来，**不手抄**。
+  // 手抄会漂移：worker 改了值（A/B 回退就是改那一处），这里旧值照旧绿 ⇒ 钉的是已经不存在的配置。
+  // 两个区间各管一层（`config.folding` 叶子 / `config.folding.context` 子键），合成一份才是真输入。
+  const ttlBlock = read('worker.js').match(TTL_MARKERS);
+  assert.ok(ttlBlock,
+    'worker.js 没有成对的 `/* #440:ttl-knobs:start|end */` 标记 ⇒ 解析不出真传的那份（与同目录 '
+    + 'fold-strategy.test.js 的 B4/B5 同步：标记丢了先补那里）');
+  const ctxBlock = read('worker.js').match(CTX_MARKERS);
+  assert.ok(ctxBlock, 'worker.js 没有成对的 `/* #392:context-strategy:start|end */` 标记 ⇒ 同上');
+  // context 区间里写着 `assertCompactContext(…)` ⇒ 注入**真**校验器再求值（与 K1 同一姿势）。
+  const workerFolding = {
+    ...new Function(`return {${ttlBlock[1]}}`)(),
+    context: new Function('assertCompactContext', `return {${ctxBlock[1]}}`)(assertCompactContext).context,
+  };
+  assert.deepEqual(Object.keys(workerFolding).sort(), ['context', 'toolResultFoldMinTokens', 'toolResultTtl'],
+    `从 worker 标记区间里解析出的 folding 形状不是预期那份（实得：${JSON.stringify(workerFolding)}）`);
+
   const intakeAcceptances = [
     ['整组省略（folding 都不给）', undefined, '一个叶子都没给 ⇒ 全用引擎默认（2 / 4000）'],
     ['整组空对象', {}, '同上：没有叶子就没有值规则要跑'],
@@ -505,16 +559,21 @@ test('#440-K13c folding 旋钮被引擎**接受**的形态：省略 / undefined 
     ['context.keepRounds 省略', { context: { keepRounds: undefined } }, '规则只在 `raw !== undefined` 时校子键'],
     ['context = null', { context: null }, '非对象 payload 直接早退 ⇒ 当它「未设置」（本站 worker 真传的是对象）'],
     ['context = {}', { context: {} }, '空对象合法 ⇒ 折叠策略自己兜默认'],
-    ['本站 worker 真传的那份',
-      { context: { strategy: 'fold-llm', keepRounds: 6 }, toolResultTtl: 6, toolResultFoldMinTokens: 8000 },
+    ['本站 worker 真传的那份（从源码标记区间解析）', workerFolding,
       '**这一条红了就是 worker 起跑即崩**（值本身的在场另由 fold-strategy B4/B5 钉）'],
-    ['安全整数上界', { toolResultTtl: Number.MAX_SAFE_INTEGER, context: { keepRounds: Number.MAX_SAFE_INTEGER } },
-      '与 K13b 的 `MAX_SAFE_INTEGER+1` 抛配对，才是「上界=安全整数」这条界的完整证据'],
+    // 上界逐叶单独顶满（而不是三叶写在一起）：红了直接知道是哪个叶子改了上界。
+    // `toolResultFoldMinTokens` 这一条是本轮补的：共用同一张嘴，但只钉两个叶子时第三个可以本身被收窄而没人看见。
+    // 这一族与 K13b 的 `MAX_SAFE_INTEGER+1` 抛配对，才定得出「上界是 `isSafeInteger` 而非 `isInteger`」
+    // （`Number.isInteger(2 ** 53)` 是 true）。
+    ['toolResultTtl=MAX_SAFE_INTEGER', { toolResultTtl: Number.MAX_SAFE_INTEGER },
+      '与 K13b 的 `toolResultTtl=MAX_SAFE_INTEGER+1` 抛配对'],
+    ['toolResultFoldMinTokens=MAX_SAFE_INTEGER', { toolResultFoldMinTokens: Number.MAX_SAFE_INTEGER },
+      '与 K13b 的同形溢出抛配对'],
+    ['context.keepRounds=MAX_SAFE_INTEGER', { context: { keepRounds: Number.MAX_SAFE_INTEGER } },
+      '与 K13b 的同形溢出抛配对（这条走的是 `folding.context` 那条规则，不是顶层叶子的入口）'],
   ];
   for (const [label, folding, why] of intakeAcceptances) {
-    const msg = await foldingIntakeMessage(folding);
-    assert.ok(msg === null || !foldingComplaint.test(msg),
-      `${label} 被引擎在启动期拒了 ⇒ 引擎**收窄**了输入面（实得：${msg}）；引擎语义：${why}`);
+    await assertFoldingAccepted(label, folding, why);
   }
 });
 
@@ -557,10 +616,10 @@ test('#440-K13d folding 拼错键名由 unknown config option 那层拦（文案
   //   （`#392:context-strategy` 区间）⇒ 这个错法**唯一**的防线是本站 `assertCompactContext`（K2）。
   //   本条钉「引擎放行」这个事实：上游哪天把 `keepRounds` 收进 context 合法名单，这里会红，
   //   **那时**才谈得上把 K2 那条降级成注释。
-  const innerTypoMsg = await foldingIntakeMessage({ context: { strategy: 'fold-llm', keepRound: 6 } });
-  assert.ok(innerTypoMsg === null || !/unknown (config\.folding option|assembly policy context option)/.test(innerTypoMsg),
-    `context 内层的 keepRound 被引擎拦了 ⇒ 上游把 keepRounds 收进了 context 合法名单，`
-    + `本站 K2 那条可以降级（先改 K2 再改这里）（实得：${innerTypoMsg}）`);
+  await assertFoldingAccepted(
+    'context 内层拼错的 keepRound 竞被拦',
+    { context: { strategy: 'fold-llm', keepRound: 6 } },
+    '上游把 keepRounds 收进了 context 合法名单 ⇒ 本站 K2 那条可以降级（先改 K2 再改这里）');
   // 另一张嘴：`folding.context` 给**非对象**时文案是 `context must be an object`——**不带**
   // `config.folding.` 前缀（与 K13/K13b 那条完整路径不同形，排查时看不出它是哪个组的）。
   // 钉住这个差异：上游哪天补上前缀这里会红（那是改进，按实测改正则即可）。
