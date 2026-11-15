@@ -208,10 +208,13 @@ test('SYSTEM_PROMPT 讲清「端口段由平台分配 + ports.json 是唯一真�
 // `head -50/60/80` 截断（「收工即提交」在 53–54 行，`head -50` 正好切掉）⇒ 指针再硬也挡不住。
 // 所以下面这条用例的判据**反转**：不再要求「必须写先读」，而要求「必须明确告知已注入」——不告知，
 // 模型会以为提示词末尾那段是它自己读到的，也可能再 `cat` 一遍白烧轮次。
-// 保留的两条口径不变：`~/.erix/ports.json` 的 `cat`（它是动态清单，不注入）、家目录用 shell 读。
+//
+// **#259（261116）又推了一步**：家目录开了**只读例外** ⇒ 「ports.json 只能 shell `cat`」这条口径也退场了
+// （文件工具直接读得到）。保留的只是「ports.json 不注入、要自己读」这一半；读的手段从 shell 改成 readFile。
+// 下面三条 shell 口径的断言已按 #259 换向，换向的理由与反向防漂移断言在「#259」那两条用例里。
 // ---------------------------------------------------------------------------
 
-test('SYSTEM_PROMPT 明确告知「平台约定已随本次 run 注入」，并保留 ports.json 的 shell 读法与复核手段（#451）', () => {
+test('SYSTEM_PROMPT 明确告知「平台约定已随本次 run 注入」，并保留 ports.json 的读法与复核手段（#451 + #259）', () => {
   const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
   const pointer = linesMentioning(prompt, '~/AGENTS.md');
   assert.ok(pointer.length > 0, 'SYSTEM_PROMPT 必须指向 ~/AGENTS.md（#258 定稿的强制指针）——缺了模型根本不知道有这份文件');
@@ -226,12 +229,55 @@ test('SYSTEM_PROMPT 明确告知「平台约定已随本次 run 注入」，并�
   assert.match(section, /~\/AGENTS\.md/, '强制指针必须落在「预览域名与端口」段内（与它的消费时机同段）');
   assert.match(section, /不复述|不重抄/, '指针必须说明本节有意不复述那些规则（否则下一句就会被人当成可以拄规则）');
   assert.match(section, /不会立刻生效/, '必须写明本 run 内改约定文件不立刻生效（否则模型会以为改完就生效）');
-  // ⚠ #259 未落地前 createJail({ root: cwd }) 的读边界只有项目根（无只读例外）⇒
-  //   指针必须自带 shell 手段，否则模型按自然习惯 readFile 会撞「被宿主边界拒绝」白烧一轮。
-  assert.match(section, /文件工具读不到[\s\S]{0,60}用 shell 读/, '家目录读不到的口径与 shell 手段必须同段给出');
-  assert.match(section, /cat ~\/\.erix\/ports\.json/, 'ports.json 的读取手段不得在改版时丢掉（它是动态清单，不注入）');
-  assert.match(section, /cat ~\/AGENTS\.md/, '复核手段不得丢：模型要确认注入的约定文件是否被改过，只能 shell cat');
+  // ⚠ **#259 已落地**：家目录是 jail 的只读例外 ⇒ 手段从 shell `cat` 换成 `readFile`（等强度换向，
+  //   不是放宽：仍然必须写明「怎么读到它」，只是不再教模型绕平台的缺口）。两个路径都要给到。
+  assert.match(section, /直接用文件工具读/, '家目录平台文件的读取手段必须写清是文件工具（#259）');
+  assert.ok(linesMentioning(section, '~/.erix/ports.json').some((line) => /readFile/.test(line)),
+    'ports.json 的读取手段不得在改版时丢掉（它是动态清单，不注入）——#259 起必须是 readFile');
+  assert.ok(linesMentioning(section, '~/AGENTS.md').some((line) => /readFile/.test(line)),
+    '复核手段不得丢：模型要确认注入的约定文件是否被改过，现在 readFile 就能读到');
 });
+
+// ---------------------------------------------------------------------------
+// issue #259（工单 fix-261116-05）：告知面不得再教一个**已经不存在的病**。
+// 旧提示词写着「`~/.erix/ports.json` 在家目录，文件工具读不到它（会回『被宿主边界拒绝』），用 shell 读」——
+// 那是一条「教模型绕过平台缺口」的条款。缺口填了之后它还留着，就是让模型去跑一条比 `readFile` 更贵、
+// 且把整文件灌进上下文的路径（issue 验收点名的反向防漂移，所以下面逐条钉住）。
+// 同时钉**接线**：例外必须真的传给了 jail（只改提示词不改 jail = 提示词在说谎，比旧文案更坏）。
+// ---------------------------------------------------------------------------
+
+test('#259 反向防漂移：提示词不再声称「家目录用文件工具读不到」，也不再给家目录开 shell 读法', () => {
+  const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
+  // ① 旧句式整族退场（不只禁那一句原文：换皮说法同样在教一个不存在的病）
+  for (const dead of [/文件工具读不到/, /读不到它/, /用 shell 读：`cat ~\/(\.erix\/ports\.json|AGENTS\.md)`/]) {
+    assert.doesNotMatch(prompt, dead, `提示词里还残留家目录读不到的旧口径（/${dead.source}/）——#259 之后它是谎`);
+  }
+  // ② 家目录的读取手段必须是文件工具，且与 shell 不再同句出现（否则等于又给模型留了一条绕路）
+  const homeLines = linesMentioning(prompt, '~/.erix/ports.json').filter((line) => /读/.test(line));
+  assert.ok(homeLines.length > 0, '提示词必须告诉模型 ports.json 怎么读');
+  assert.ok(homeLines.some((line) => /readFile/.test(line)), `必须给 readFile 这条路，实际：${homeLines.join(' / ')}`);
+  for (const line of homeLines) {
+    assert.doesNotMatch(line, /\bcat\b/, `家目录读法的句子里不该再出现 cat：${line}`);
+  }
+});
+
+test('#259 接线锁：worker 把平台只读例外传给了 createJail，而 **写边界仍是 [cwd]**', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  // 断言必须钉在**调用点**上（不是全文关键词）：上一版写的是全文正则，结果它命中了注释里的
+  // `readExceptions: platformReadExceptions()`——把接线撤掉仍然全绿（变异实验抓到的）。
+  const jailCalls = src.match(/createJail\(\{[^\n]*\}\)/g) ?? [];
+  assert.equal(jailCalls.length, 1, `worker 里 createJail 只能有一处装配（实际 ${jailCalls.length} 处）：两处 = 两份边界`);
+  assert.match(jailCalls[0], /readExceptions: platformReadExceptions\(\)/,
+    `装配点必须真的拿到例外清单（只改文案不改 jail = 告知面在说谎）：${jailCalls[0]}`);
+  assert.match(jailCalls[0], /writable: \[cwd\]/, '写边界必须仍是 `[cwd]`（家目录只放宽读）');
+  assert.doesNotMatch(jailCalls[0], /writable:[^\]]*(homedir|home\b)/i,
+    '家目录不得进 writable：能改平台文件 = 下一轮对账覆盖回去，用户以为改掉了');
+  // 清单本体不得在 worker 里再拄一份（两份清单必然漂移）
+  assert.equal((src.match(/AGENTS\.md'\s*,?\s*\/\.erix|join\([^)]*'\.erix'/g) ?? []).length, 0,
+    '例外清单的单一来源在 lib/file-tools.js，worker 里不许出现第二份');
+});
+
+// 清单内容本身（两项、不含运行期事实、fail-closed）在 runner/test/file-tools.test.js 的 #259 一节钉。
 
 /**
  * #451 评审 M3：取 `startRun` 的**函数体边界**。旧锁只比文本位置（`indexOf('collectAgentsMd(') > indexOf('async function startRun(')`）
@@ -314,8 +360,9 @@ test('SYSTEM_PROMPT 挡掉三种跑偏：自造域名/端口、找平台加端�
   assert.match(section, /必须从清单里选/, '必须把选择范围钉在平台给的那一段里');
   // ② 索要：没有 port_quota_exceeded 这回事，也别去提工单
   assert.match(section, /不要要求平台再加|不要要求平台/, '必须写明不要要求平台加端口（配额语义已删除）');
-  // ③ 可达性：jail 根是项目目录，~/.erix/ports.json 只能经 shell 读（说了等于没说会白烧轮次）
-  assert.match(section, /shell/, '必须给出读得到 ports.json 的实际手段（文件工具够不到家目录）');
+  // ③ 可达性（#259 换了口径）：家目录是只读例外 ⇒ 手段必须是 readFile，而不是「文件工具够不到所以用 shell」
+  assert.ok(linesMentioning(section, '~/.erix/ports.json').some((line) => /readFile/.test(line)),
+    '必须给出读得到 ports.json 的实际手段（#259 起是文件工具，不再是 shell 绕路）');
   assert.match(prompt, /0\.0\.0\.0/, 'dev server 绑 0.0.0.0 的硬约定不能丢（fde-platform §8.4）');
 });
 

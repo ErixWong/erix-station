@@ -34,7 +34,7 @@ import {
 import { createStationDelegation, mergeUsage } from './lib/delegation.js';
 import { resolveRunModel, resolveModelMetadata } from './lib/llm-models.js';
 import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
-import { createJail, createStationFileTools } from './lib/file-tools.js';
+import { createJail, createStationFileTools, platformReadExceptions } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
@@ -69,9 +69,11 @@ import { collectAgentsMd, renderAgentsMdSection } from './lib/agents-md.js';
 // `head -50/60/80` 截断（「收工即提交」在 53–54 行，`head -50` 正好切掉）⇒ 指针再硬也挡不住
 // 「下发了 ≠ 读了」。注入在 `startRun` 里做（`lib/agents-md.js`），本常量只负责**告知**这段内容从哪来
 // （不告知，模型会以为那是它自己读到的、也可能再 `cat` 一遍白烧轮次）。
-// ⚠ 前提单 **#259** 未落地前 `createJail({ root: cwd })` 的读边界只有项目根（无只读例外），
-//   所以指针必须保留「家目录用 shell 读」的口径（`~/.erix/ports.json` 仍要 `cat`；`~/AGENTS.md` 降级为
-//   「复核」手段——真机里模型用 `readFile` 读它会撞「被宿主边界拒绝」白烧一轮）。R-1 复测的 P0 判据
+// ⚠ 前提单 **#259 已落地**（261116）：`createJail` 现在带 `readExceptions: platformReadExceptions()`
+//   = 家目录只读例外（`~/AGENTS.md`、`~/.erix/`），**写边界不变**（仍 `writable: [cwd]`）。因此指针
+//   不再需要「家目录用 shell 读」的口径：`readFile ~/AGENTS.md` / `readFile ~/.erix/ports.json` 直接就读得到
+//   （issue 验收的另一半：提示词不得再教一个已经不存在的病，防漂移断言在 system-prompt.test.js）。
+//   R-1 复测的 P0 判据
 //   （transcript 里读 `~/AGENTS.md` 的调用数为 0 判失败）自 #451 起**反转**为「规则被遵守」
 //   （设计稿 §6.2 D1/D2）。防漂移断言：同文件里的「强制指针存在 / 八个具体规则词不得出现（allowedHosts
 //   · credentials · CORS · Set-Cookie · localStorage · Bearer，后三个是 #262 第 7 条带进来的；
@@ -87,14 +89,14 @@ const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，�
 - readFile：单次返回有 256KB 上限。被截断时尾部 marker 已经写好了下一步（offset=… 续读，或提高 max_bytes）——照 marker 给的参数继续即可，别自己猜行数，也别以为文件只有这么多。
 - tree：列目录结构，默认同样跳过 vendor 与点目录（要看得更全传 include_vendor=true / include_hidden=true）。根标签是 ./，它下面的条目都是相对名，可以直接当 path 传回去。
 - searchText / tree 的 name_pattern 之类名字过滤只匹配**文件名**，不跨越 / ，所以 "**/*.ts" 这种写法不生效，要写 "*.ts"。
-- 读文件回「错误：…被宿主边界拒绝：…」时，不要在原路径上反复重试：那是路径越出了项目目录，或是要读的文件被平台刻意遮蔽（密钥类）。真需要内容时用 shell 定点看那一个文件，别把整文件灌进回复。
+- 读文件回「错误：…被宿主边界拒绝：…」时，不要在原路径上反复重试：那条路径既不在项目目录之内、也不在平台开的只读例外清单（家目录的 \`~/AGENTS.md\` 与 \`~/.erix/\`）之内，或者它被平台刻意遮蔽（密钥类）。真需要内容时用 shell 定点看那一个文件，别把整文件灌进回复。
 
 预览域名与端口（段由平台分配，**清单是唯一真相**，不需要你自己发明）：
 - **平台约定已随本次 run 注入到本提示词末尾**（\`~/AGENTS.md\` 平台节 + 上级目录与项目根的 \`AGENTS.md\`，由宿主在 run 启动时读取）：工位约定与平台约束就在那里，本提示词**有意不复述**它的应用侧规则（抄一遍就是第二个会过期的真相源）。不必再 \`cat\` 它们；本 run 里改动这些文件**不会立刻生效**，下一次 run 启动时才重新读取。
 - 预览端口段由平台在本 FDE 开户时**分配**：从全局号池里发一整段连续端口（默认 10 个，管理员可改段）。这一段到底是哪几个号，**唯一真相是 \`~/.erix/ports.json\` 里的清单**（每条带对应的真实访问 \`url\`）——不要凭记忆、也不要假设是固定的某几个端口。
 - dev server 的端口**必须从清单里选**，并绑 \`0.0.0.0\`（绑 127.0.0.1 入口进不来）；对外访问直接用清单里那一条的 \`url\`。
 - 域名由平台按 \`<fde>-p-<端口>\` 生成（与入口路由同源）：**不要自造域名或端口**，也不要要求平台再加——清单里那段就是全部，不够用就在它们里复用。
-- \`~/.erix/ports.json\` 在家目录（项目目录之外），文件工具读不到它（会回「被宿主边界拒绝」），用 shell 读：\`cat ~/.erix/ports.json\`；要确认注入的约定文件是否被改过，也用 shell 复核：\`cat ~/AGENTS.md\`。
+- 家目录里那两个平台文件（\`~/.erix/ports.json\` 与 \`~/AGENTS.md\`）**直接用文件工具读**：\`readFile\` 传 \`~/.erix/ports.json\` 就是端口与预览 URL 的清单（它是动态清单，不随提示词注入）；要复核注入的约定文件是否被改过，同样 \`readFile\` 传 \`~/AGENTS.md\`。家目录是平台开的**只读例外**：读得到，但**写不进去**（只有项目目录之内可写，平台文件下一轮对账也会被覆盖回去）——不要试图去改它。
 
 交付规则：
 1. 交付物（代码/配置/文档）必须用 writeFile 写入工作目录的文件系统——磁盘上的文件才是交付物。
@@ -547,8 +549,11 @@ async function startRun(msg) {
   //    + note 工作流工具（0.8.0 recall 退役，档案取回归 note_list→note_read；issue #46 起走
   //    0.10.0 装配工厂，notesDir 为 agentd 下行的 run 数据目录，logical-run 作用域跨 attempt 保留）；
   //    approvals 钩子 P2 留空）。
+  // issue #259：读边界 = 项目根 ∪ **平台侧只读例外**（`~/AGENTS.md`、`~/.erix/`）；
+  //   **写边界仍是 `writable: [cwd]` 一个**（红线：agent 改平台文件 = 下一轮对账覆盖回去，
+  //   用户以为改掉了 ⇒ 新的困惑源）。例外清单只放平台自己生成的文档，不含运行期事实。
   ensureGitRepo(cwd);
-  const jail = createJail({ root: cwd, writable: [cwd] });
+  const jail = createJail({ root: cwd, writable: [cwd], readExceptions: platformReadExceptions() });
   const fileTools = createStationFileTools({ jail, cwd });
   // issue #46（选项 A）+ #392（B 片）：notesDir 由 agentd 下行。作用域已从 **logical-run**
   // 改为**会话**：下行的是 `<home>/sessions/<sessionId>/notes`，同一会话的每个 run 看到的是
