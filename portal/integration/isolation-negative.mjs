@@ -27,8 +27,8 @@ import { reconcilePortsJsonWithDb, PREVIEW_LIVE_STATES } from './lib/ports-recon
 // issue #495（#412 遗留 ①②）：起跑前预检与「等宿主侧物化文件」的三态分类——同样是「失败必须长得
 // 像它真正的原因」那一类护栏，所以反向测试也住这里（行为面夹具，不碰 docker）。
 import {
-  COMPOSE_ENV_FILE, formatLastSegmentLinkLine, observeHostPath, observeLastSegmentLink, assertComposeEnvFile,
-  materializeSnapshot, toContainerPath, waitForHostFile,
+  COMPOSE_ENV_FILE, formatAncestorLinkLines, formatLastSegmentLinkLine, observeHostPath, observeLastSegmentLink,
+  observeSegmentLink, assertComposeEnvFile, materializeSnapshot, toContainerPath, waitForHostFile,
 } from './lib/e2e-preflight.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -442,6 +442,31 @@ try {
     assert.equal(asDangling.link.targetExists, false);
     assert.match(formatLastSegmentLinkLine(asDangling.link), /缺的是\*\*链接目标\*\*/, '要说清缺的是目标，不是链接本身');
 
+    // 链上**更早**的段是链接（`/srv/erix -> /data/erix` 那种「bind 源本身就是链接」的真实摆法）：
+    // 末段根本不像链接 ⇒ 只看末段就等于完全看不见它，逐段事实必须在账上。
+    const realAlice = path.join(userspace, 'alice');
+    const mount = path.join(userspace, 'mount');
+    fs.symlinkSync(path.relative(userspace, realAlice), mount);
+    const viaMount = observeHostPath(path.join(mount, 'home', '.erix', 'config.json'));
+    assert.equal(viaMount.state, 'present', '祖先段是链接 ⇒ 三态归属一个字不改（仍 present）');
+    const ancestorLinks = viaMount.links.filter((e) => e.isSymlink === true && e.isLastSegment === false);
+    assert.equal(ancestorLinks.length, 1,
+      `links 里必须有 mount 那一段：${JSON.stringify(viaMount.links.map((e) => [e.segment, e.isSymlink, e.isLastSegment]))}`);
+    assert.equal(ancestorLinks[0].segment, mount, '点名的是那一段（不是叶子）');
+    assert.equal(ancestorLinks[0].targetExists, true);
+    const ancestorLine = formatAncestorLinkLines(viaMount.links);
+    assert.match(ancestorLine, /符号链接/, '链上的链接必须被点名');
+    assert.ok(ancestorLine.includes(realAlice), `要点名它指向哪里：${ancestorLine}`);
+    assert.match(ancestorLine, /不是同一个 inode/);
+    assert.match(ancestorLine, /要改的是宿主侧这条链接指向/, '要说清宿主侧改哪里才有效');
+
+    // 全链真目录 ⇒ 零输出（反向自证：把那行改成恒输出 ⇒ 本格红）
+    assert.equal(formatAncestorLinkLines(asPlain.links), '', '全真目录不许冒出链上链接那一行');
+    assert.equal(asPlain.links.filter((e) => e.isSymlink === true).length, 0, '全真目录 ⇒ 一条链接都不许报');
+    assert.equal(asPlain.links.at(-1).isLastSegment, true, '末段那条继续保留（已合并的形状不能碎）');
+    assert.equal(observeSegmentLink(mount, { fsImpl: {} }).isSymlink, null,
+      '逐段 API 也一样：没有 lstatSync ⇒ 无从判定，不许假装「不是链接」');
+
     // 叶子级不存在（链能进、read 时报 ENOENT）也不许沾到权限分支（与陷阱 13 同一条，两门各钉一份）
     const leafGone = { ...fs, readFileSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); } };
     const asLeafGone = observeHostPath(cfg, { fsImpl: leafGone });
@@ -662,6 +687,8 @@ const SINGLE_SOURCE_FILES = {
   inspectHostPathChain: 'e2e-preflight.mjs',
   observeHostPath: 'e2e-preflight.mjs',
   observeLastSegmentLink: 'e2e-preflight.mjs',
+  observeSegmentLink: 'e2e-preflight.mjs',
+  formatAncestorLinkLines: 'e2e-preflight.mjs',
   formatLastSegmentLinkLine: 'e2e-preflight.mjs',
   waitForHostFile: 'e2e-preflight.mjs',
   toContainerPath: 'e2e-preflight.mjs',

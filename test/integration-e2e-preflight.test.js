@@ -17,8 +17,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  COMPOSE_ENV_FILE, PORTAL_USERSPACE_CONTAINER_ROOT, assertComposeEnvFile, formatLastSegmentLinkLine, inspectHostPathChain,
-  materializeSnapshot, observeHostPath, observeLastSegmentLink, toContainerPath, waitForHostFile,
+  COMPOSE_ENV_FILE, PORTAL_USERSPACE_CONTAINER_ROOT, assertComposeEnvFile, formatAncestorLinkLines,
+  formatLastSegmentLinkLine, inspectHostPathChain, materializeSnapshot, observeHostPath, observeLastSegmentLink,
+  observeSegmentLink, toContainerPath, waitForHostFile,
 } from '../portal/integration/lib/e2e-preflight.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -362,6 +363,72 @@ test('#495② L4 叶子级不存在（stat 能进、叶子没物化）⇒ 与权
   const observed = observeHostPath(file, { fsImpl: leafGone });
   assert.equal(observed.state, 'missing', '叶子在 stat 与 read 之间消失 ⇒ 归 missing（归进 unreadable = 把没物化当成权限，#495 ② 反向坑）');
   assert.equal(observed.blocker, null, '不许进 unreadable 分支（进了就有 blocker，而这里根本没权限问题）');
+});
+
+// ---------------------------------------------------------------------------
+// 链上**更早**的段是链接（`mount -> real`，即「bind 源本身就是符号链接」的真实摆法）
+// ---------------------------------------------------------------------------
+
+test('#495② L5 ① ancestor 是链接（mount -> real）⇒ links 里有那一段、文案点名它与目标', async (t) => {
+  // 真实部署里这是 `/srv/erix -> /data/erix` 那种：bind 源自己是个链接，而**末段根本不像链接**
+  // ⇒ 只看末段等于完全看不见它（上一轮自报的边界，本轮就补这一条）。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-495-anc-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const real = path.join(base, 'real');
+  const home = path.join(real, 'alice', 'home', '.erix');
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, 'config.json'), '{"ok":1}');
+  const mount = path.join(base, 'mount');
+  fs.symlinkSync(path.relative(base, real), mount); // 相对链接：顺带验解析
+  const target = path.join(mount, 'alice', 'home', '.erix', 'config.json');
+
+  const observed = observeHostPath(target);
+  assert.equal(observed.state, 'present', '祖先段是链接 ⇒ 三态归属一个字不改（仍 present）');
+  const ancestorLinks = observed.links.filter((entry) => entry.isSymlink === true && entry.isLastSegment === false);
+  assert.equal(ancestorLinks.length, 1, `links 里必须有 mount 那一段：${JSON.stringify(observed.links.map((e) => [e.segment, e.isSymlink, e.isLastSegment]))}`);
+  assert.equal(ancestorLinks[0].segment, mount, '点名的是那一段的路径（不是叶子）');
+  assert.equal(ancestorLinks[0].resolvedTarget, real, '还要给出解析后的目标');
+  assert.equal(ancestorLinks[0].targetExists, true);
+  assert.equal(observed.links.at(-1).segment, target, '末段那条继续保留（不破坏已合并的形状）');
+  assert.equal(ancestorLinks[0].isLastSegment, false);
+  // 逐段 API 单独用也得诚实：没有 lstatSync ⇒ 无从判定，不许假装「不是链接」
+  assert.equal(observeSegmentLink(mount, { fsImpl: {} }).isSymlink, null);
+
+  const line = formatAncestorLinkLines(observed.links);
+  assert.match(line, /符号链接/, '① 文案必须点名链上的链接');
+  assert.ok(line.includes(mount), `要点名那一段：${line}`);
+  assert.ok(line.includes(real), `要点名它指向哪里：${line}`);
+  assert.match(line, /不是同一个 inode/);
+  assert.match(line, /要改的是宿主侧这条链接指向/, '要说清「宿主侧改哪里才有效」（不然会去改容器里那一侧）');
+
+  // 真到失败路径时这行必须在场（诊断行不是只给单测看的）
+  const err = await waitForHostFile(path.join(mount, 'alice', 'home', '.erix', 'ghost.json'), {
+    timeoutMs: 5, intervalMs: 1, sleepImpl: noSleep, label: 'ghost under mount config.json',
+  }).then(() => null, (error) => error);
+  assert.ok(err, '叶子没物化 ⇒ 仍按 missing 拒绝（归属没动）');
+  assert.match(err.message, /timeout waiting for ghost under mount config\.json/);
+  assert.match(err.message, /链上第一段符号链接（不是末段）：/, '失败文案要带上链上那一段');
+  assert.ok(err.message.includes(mount) && err.message.includes(real), `失败文案要点名链接与目标：${err.message}`);
+});
+
+test('#495② L6 ② 全链都是真目录 ⇒ links 里没有任何链接、诊断行零输出（反向自证）', async (t) => {
+  const { root, dir, file } = fixtureUserspace(t);
+  const observed = observeHostPath(file);
+  assert.equal(observed.state, 'present');
+  const mine = observed.links.filter((entry) => entry.segment === root || entry.segment.startsWith(root + path.sep));
+  assert.ok(mine.length >= 3, `夹具里至少该走查过三段（alice/home/.erix）：${JSON.stringify(observed.links.map((e) => e.segment))}`);
+  assert.deepEqual(mine.filter((entry) => entry.isSymlink === true), [], '全真目录 ⇒ 一条链接都不许报（把那行改成恒输出 ⇒ 本格红）');
+  assert.equal(mine.every((entry) => entry.isSymlink === false && entry.detectable === true), true,
+    '真 fs 有 lstatSync ⇒ 每段都要给出结论，不许拿「无从判定」糊过去');
+  assert.equal(formatAncestorLinkLines(observed.links), '', '零输出（不是来一句「链上没有链接」）');
+  assert.equal(formatAncestorLinkLines([]), '');
+  assert.equal(formatAncestorLinkLines(null), '');
+  // 失败文案里也不许出现链接（全真目录的没物化就是没物化）
+  const err = await waitForHostFile(path.join(dir, 'ghost.json'), {
+    timeoutMs: 5, intervalMs: 1, sleepImpl: noSleep, label: 'plain ghost config.json',
+  }).then(() => null, (error) => error);
+  assert.ok(err);
+  assert.doesNotMatch(err.message, /符号链接/, '真目录链上的没物化文案里不该冒出链接');
 });
 
 test('#495 接线静态自检：脚本必须在**任何 docker 之前**做预检（源码级）', () => {

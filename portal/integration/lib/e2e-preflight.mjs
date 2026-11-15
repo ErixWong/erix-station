@@ -14,12 +14,15 @@
 //    （#412 原工单自认「最费时间的一条」，当时靠手工把四个 uid/gid 指给自己才绕开）。
 //    ⚠ 反向红线：修法**不是**「忽略读错误继续等」——那会把真的没物化也拖成一句超时。状态必须三分：
 //    present / missing（链上第一段就不存在）/ unreadable（存在但进不去），三种状态给三种文案。
-//    另加一条**独立事实**（不改成第四态）：末段是符号链接时把链接与目标说出来（`observeLastSegmentLink`）——
-//    bind 源做成链接是合法配置，但「宿主上 `ls` 到的」与「portal 容器里读到的那一侧」不是同一个 inode，
-//    不说出来就是拿状态去猜挂载形态。
+//    另加一条**独立事实**（不改成第四态）：链上**每一段**是符号链接时把链接与目标说出来
+//    （逐段：`observeSegmentLink`；末段：`observeLastSegmentLink`）——bind 源做成链接是合法配置，但
+//    「宿主上 `ls` 到的」与「portal 容器里读到的那一侧」不是同一个 inode，不说出来就是拿状态去猜挂载形态。
+//    尤其要看**非末段**：`/srv/erix -> /data/erix` 这种「bind 源本身就是链接」的常见摆法里，末段根本不像链接，
+//    只看末段就等于完全看不见它。
 //
-// ⚠️ 本文件是 assertComposeEnvFile / inspectHostPathChain / observeHostPath / observeLastSegmentLink /
-// formatLastSegmentLinkLine / waitForHostFile / toContainerPath / materializeSnapshot 的**唯一定义处**，
+// ⚠️ 本文件是 assertComposeEnvFile / inspectHostPathChain / observeHostPath / observeSegmentLink /
+// observeLastSegmentLink / formatLastSegmentLinkLine / formatAncestorLinkLines / waitForHostFile /
+// toContainerPath / materializeSnapshot 的**唯一定义处**，
 // 新增 e2e 一律 import，禁止在脚本里复制第二份
 // （`portal/integration/isolation-negative.mjs` 的单一来源断言把定义处钉在这里）。
 import assert from 'node:assert/strict';
@@ -151,59 +154,66 @@ export function assertComposeEnvFile({
  *
  * @param {string} filePath 要观测的宿主路径（绝对或相对当前目录）
  * @param {{fsImpl?: typeof import('node:fs')}} [options]
- * @returns {{blocker: null | {path: string, reason: 'no-permission' | 'not-a-directory', mode: string, owner: string}, missingPrefix: string | null}}
+ * @returns {{blocker: null | {path: string, reason: 'no-permission' | 'not-a-directory', mode: string, owner: string}, missingPrefix: string | null, links: object[]}}
+ *   `links` = 走查过的每一段的**链接事实**（`lstatSync`，不跟随）——只是多一条可诊断的账，
+ *   不参与归属判断（为什么需要它：见 `observeSegmentLink`）。提前 return 时也把已走到的段带回去。
  */
 export function inspectHostPathChain(filePath, { fsImpl = fs } = {}) {
   const abs = path.resolve(filePath);
   const segments = abs.split(path.sep).filter(Boolean);
+  const links = [];
   let current = path.parse(abs).root;
   for (let i = 0; i < segments.length; i += 1) {
     current = path.join(current, segments[i]);
     const isLeaf = i === segments.length - 1;
+    // 先记事实（`lstatSync`，**不跟随**），再做存在性/类型/可达性判断：顺序不能反过来——
+    // `statSync` 对悬空链接报 ENOENT，先走它就永远看不到链接本体（那就是变异 M-A 的入口）。
+    links.push(observeSegmentLink(current, { fsImpl, isLastSegment: isLeaf }));
     const stat = statOrNull(current, fsImpl);
-    if (!stat) return { blocker: null, missingPrefix: current };
+    if (!stat) return { blocker: null, missingPrefix: current, links };
     if (!isLeaf && !stat.isDirectory()) {
       return {
         blocker: { path: current, reason: 'not-a-directory', mode: modeOf(stat), owner: ownerOf(stat) },
         missingPrefix: null,
+        links,
       };
     }
     try {
       fsImpl.accessSync(current, isLeaf ? R_OK : R_OK | X_OK);
     } catch (error) {
-      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { blocker: null, missingPrefix: current };
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { blocker: null, missingPrefix: current, links };
       return {
         blocker: { path: current, reason: 'no-permission', mode: modeOf(stat), owner: ownerOf(stat) },
         missingPrefix: null,
+        links,
       };
     }
   }
-  return { blocker: null, missingPrefix: null };
+  return { blocker: null, missingPrefix: null, links };
 }
 
 /**
- * 末段是不是**符号链接**、它指向哪（issue #495 判据差项 ① 的返修；主 agent 拍板：**只诊断，不改策略**）。
+ * 链上**某一段**是不是符号链接、它指向哪（本体只说事实，不参与任何归属判断）。
  *
- * 为什么要单独报一条事实：`statSync` / `readFileSync` 都**跟随**链接，于是「末段是指向可读文件的链接」与
- * 「末段是真文件」在状态上**完全同形**（都是 `present` + `blocker: null`）。排查宿主 bind 源时这恰恰是
- * 决定性的区别：bind 源做成符号链接时，portal 容器里看到的是**链接目标那一侧**——宿主上 `ls` 到的与
- * 容器里读到的不是同一个 inode。
+ * 为什么连**非末段**也要记（issue #495 本轮补的那一条）：真实部署里「bind 源本身是个链接」很常见
+ * （`/srv/erix -> /data/erix`、home 整棵挂在另一块盘上）。这种形态下链上**每个段**用 `statSync` 看都是
+ * 「正常的目录」，末段也不是链接 ⇒ 上一轮的末段事实完全看不见它，而容器里那一侧走的是链接目标，
+ * 宿主侧改的可能是链接本体——两者不是同一个 inode，排查时会改错地方。
  *
- * 为什么**不**新增第四态（也不把 present 改成失败）：bind 源是链接是**合法配置**（别的操作机的机器就这么摆），
- * 预检/等待是**诊断面**不是策略闸门；而且 `waitForHostFile` 的「提前放弃 / 等满超时」两种形状已被判据钉住，
- * 加第四态会把那条时间判据搞崩。悬空链接也**保持**归 `missing`（`statSync` 对悬空链接抛 ENOENT，本来就
- * 读不出内容），只是文案要顺带说清「它是个链接，缺的是目标」。
+ * ⚠ 必须 `lstatSync`（**不跟随**）+ `readlinkSync`：用 `statSync` 判链接永远判不出来（变异 M-A 的入口）。
  *
- * ⚠ 必须用 `lstatSync`（**不跟随**）+ `readlinkSync`：用 `statSync` 判链接永远判不出来（那就是变异 MT2 的入口）。
- *
- * @param {string} filePath 宿主路径
- * @param {{fsImpl?: typeof import('node:fs')}} [options]
- * @returns {{path: string, isSymlink: boolean | null, target: string | null, resolvedTarget: string | null, targetExists: boolean, detectable: boolean}}
- *   `isSymlink: null` + `detectable: false` = 注入的 `fsImpl` 没有 `lstatSync`，**无从判定**（不去假装「不是链接」）。
+ * @param {string} segmentPath 绝对路径的某一段（累计到这一段的完整路径）
+ * @param {{fsImpl?: typeof import('node:fs'), isLastSegment?: boolean}} [options]
+ * @returns {{segment: string, path: string, isLastSegment: boolean, isSymlink: boolean | null, target: string | null, resolvedTarget: string | null, targetExists: boolean, detectable: boolean}}
+ *   `path` 与 `segment` 同值（前者是已合并形状的兼容键）。`isSymlink: null` + `detectable: false`
+ *   = 注入的 `fsImpl` 没有 `lstatSync`（或这一段的 `lstat` 自己就被权限挡了）⇒ **无从判定**，不假装「不是链接」。
  */
-export function observeLastSegmentLink(filePath, { fsImpl = fs } = {}) {
-  const abs = path.resolve(filePath);
-  const base = { path: abs, isSymlink: false, target: null, resolvedTarget: null, targetExists: false, detectable: true };
+export function observeSegmentLink(segmentPath, { fsImpl = fs, isLastSegment = false } = {}) {
+  const abs = path.resolve(segmentPath);
+  const base = {
+    segment: abs, path: abs, isLastSegment, isSymlink: false,
+    target: null, resolvedTarget: null, targetExists: false, detectable: true,
+  };
   if (typeof fsImpl.lstatSync !== 'function') return { ...base, isSymlink: null, detectable: false };
   let stat;
   try {
@@ -226,7 +236,28 @@ export function observeLastSegmentLink(filePath, { fsImpl = fs } = {}) {
   }
   const resolvedTarget = target === null ? null : path.resolve(path.dirname(abs), target);
   const targetExists = resolvedTarget === null ? false : Boolean(statOrNull(resolvedTarget, fsImpl));
-  return { path: abs, isSymlink: true, target, resolvedTarget, targetExists, detectable: true };
+  return { ...base, isSymlink: true, target, resolvedTarget, targetExists, detectable: true };
+}
+
+/**
+ * 末段是不是符号链接、它指向哪（issue #495 判据差项 ① 的返修；主 agent 拍板：**只诊断，不改策略**）。
+ *
+ * 为什么要单独报一条事实：`statSync` / `readFileSync` 都**跟随**链接，于是「末段是指向可读文件的链接」与
+ * 「末段是真文件」在状态上**完全同形**（都是 `present` + `blocker: null`）。排查宿主 bind 源时这恰恰是
+ * 决定性的区别：bind 源做成符号链接时，portal 容器里看到的是**链接目标那一侧**——宿主上 `ls` 到的与
+ * 容器里读到的不是同一个 inode。
+ *
+ * 为什么**不**新增第四态（也不把 present 改成失败）：bind 源是链接是**合法配置**（别的操作机的机器就这么摆），
+ * 预检/等待是**诊断面**不是策略闸门；而且 `waitForHostFile` 的「提前放弃 / 等满超时」两种形状已被判据钉住，
+ * 加第四态会把那条时间判据搞崩。悬空链接也**保持**归 `missing`（`statSync` 对悬空链接抛 ENOENT，本来就
+ * 读不出内容），只是文案要顺带说清「它是个链接，缺的是目标」。
+ *
+ * @param {string} filePath 宿主路径
+ * @param {{fsImpl?: typeof import('node:fs')}} [options]
+ * @returns {{segment: string, path: string, isLastSegment: boolean, isSymlink: boolean | null, target: string | null, resolvedTarget: string | null, targetExists: boolean, detectable: boolean}}
+ */
+export function observeLastSegmentLink(filePath, { fsImpl = fs } = {}) {
+  return observeSegmentLink(filePath, { fsImpl, isLastSegment: true });
 }
 
 /**
@@ -253,6 +284,36 @@ export function formatLastSegmentLinkLine(link) {
 }
 
 /**
+ * 链上**非末段**有符号链接时的诊断行；全链都是真目录 ⇒ **空串**（反向自证就靠这条：把这行改成恒输出，
+ * 「全真目录」那格必须红）。只点名**第一个**这样的段——人真正要看的是「从哪一段开始两侧不再是同一个 inode」。
+ *
+ * @param {object[] | null | undefined} links `observeHostPath(...).links`（或 `inspectHostPathChain(...).links`）
+ * @returns {string}
+ */
+export function formatAncestorLinkLines(links) {
+  const ancestors = (Array.isArray(links) ? links : [])
+    .filter((entry) => entry && entry.isSymlink === true && entry.isLastSegment === false);
+  if (ancestors.length === 0) return '';
+  const first = ancestors[0];
+  const target = first.target === null
+    ? '目标读不出（readlink 失败？）'
+    : (first.resolvedTarget && first.resolvedTarget !== first.target ? `${first.target}（解析后 ${first.resolvedTarget}）` : first.target);
+  const lines = [
+    `  链上第一段符号链接（不是末段）：${first.segment ?? first.path ?? '?'} → ${target}`,
+    '    portal 容器里看到的**容器内路径与宿主路径不是同一个 inode**：容器那一侧走的是链接目标，而宿主侧',
+    '    `ls`/`stat` 看到的可能是链接本体。若这就是 bind 源：**要改的是宿主侧这条链接指向**（或整条 bind 源路径），',
+    '    去改容器里看到的那一侧不会生效。',
+  ];
+  if (first.targetExists === false) {
+    lines.push(`    缺的是**链接目标**（${first.resolvedTarget ?? first.target ?? '?'}），不是链接本身。`);
+  }
+  if (ancestors.length > 1) {
+    lines.push(`    （链上还有 ${ancestors.length - 1} 段也是链接，全量在 links 数组里）`);
+  }
+  return lines.join('\n');
+}
+
+/**
  * 观测一个宿主路径的**真实**状态：`present` / `missing` / `unreadable`（+ 罕见的 `unknown`）。
  *
  * ⚠ 红线（issue #495 的验收判据）：不许把「读不到」与「不存在」压成同一个布尔（#412 那条
@@ -260,32 +321,37 @@ export function formatLastSegmentLinkLine(link) {
  *
  * @param {string} filePath 宿主路径
  * @param {{fsImpl?: typeof import('node:fs')}} [options]
- * @returns {{state: 'present' | 'missing' | 'unreadable' | 'unknown', content?: string, blocker?: object | null, missingPrefix?: string | null, error?: object}}
+ * @returns {{state: 'present' | 'missing' | 'unreadable' | 'unknown', content?: string, blocker?: object | null, missingPrefix?: string | null, link: object, links: object[], error?: object}}
+ *   `link` = 末段那条事实（已合并的形状，保留）；`links` = 链上走查过的**每一段**的事实（含末段）。
  */
 export function observeHostPath(filePath, { fsImpl = fs } = {}) {
   const chain = inspectHostPathChain(filePath, { fsImpl });
-  // 独立事实：不改变三态归属，只是多一条可诊断的账（为什么必须单独说：见 observeLastSegmentLink 注释）
-  const link = observeLastSegmentLink(filePath, { fsImpl });
-  if (chain.blocker) return { state: 'unreadable', blocker: chain.blocker, missingPrefix: null, link };
-  if (chain.missingPrefix) return { state: 'missing', blocker: null, missingPrefix: chain.missingPrefix, link };
+  // 独立事实：不改变三态归属，只是多一条可诊断的账（为什么必须逐段说：见 observeSegmentLink 注释）
+  const links = Array.isArray(chain.links) ? chain.links : [];
+  // 链走到末段时直接复用走查里那条（同一次 lstat，不重复发 syscall）；提前 return（段不存在/进不去）时
+  // 末段根本没走查过 ⇒ 补一次，保证 `link` 永远在（已合并的 L1/L2/L3 三格形状不能碎）。
+  const link = links.find((entry) => entry && entry.isLastSegment) ?? observeLastSegmentLink(filePath, { fsImpl });
+  if (chain.blocker) return { state: 'unreadable', blocker: chain.blocker, missingPrefix: null, link, links };
+  if (chain.missingPrefix) return { state: 'missing', blocker: null, missingPrefix: chain.missingPrefix, link, links };
   try {
     const content = fsImpl.readFileSync(filePath, 'utf8');
-    return { state: 'present', content, blocker: null, missingPrefix: null, link };
+    return { state: 'present', content, blocker: null, missingPrefix: null, link, links };
   } catch (error) {
     const code = error?.code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return { state: 'missing', blocker: null, missingPrefix: path.resolve(filePath), link };
+    if (code === 'ENOENT' || code === 'ENOTDIR') return { state: 'missing', blocker: null, missingPrefix: path.resolve(filePath), link, links };
     if (code === 'EACCES' || code === 'EPERM') {
       return {
         state: 'unreadable',
         missingPrefix: null,
         link,
+        links,
         blocker: {
           path: path.resolve(filePath), reason: 'no-permission',
           mode: modeOf(statOrNull(filePath, fsImpl)), owner: ownerOf(statOrNull(filePath, fsImpl)),
         },
       };
     }
-    return { state: 'unknown', error, blocker: null, missingPrefix: null, link };
+    return { state: 'unknown', error, blocker: null, missingPrefix: null, link, links };
   }
 }
 
@@ -314,6 +380,7 @@ function unreadableMessage(name, observed, extra) {
     '  ⇒ 多半是 FDE_USER_UID / FDE_USER_GID（deploy/.env，portal/src/config.js 缺省 1000/1000）与你自己的 uid/gid',
     '    不一致：portal 以 root 把 FDE 目录建成 0770 node:node，组外用户根本进不去（issue #495 ②）。',
     '  ⚠ 旧写法 fs.existsSync 在这种路径上返回 false ⇒ 症状与「真的没物化」逐字相同，这条文案就是把两者分开。',
+    formatAncestorLinkLines(observed.links),
     formatLastSegmentLinkLine(observed.link),
     extra ?? '',
   ].filter((line) => line !== '').join('\n');
@@ -325,6 +392,7 @@ function missingMessage(name, observed, extra) {
     `timeout waiting for ${name}：等到超时，且**路径上第一段就不存在**（缺：${observed.missingPrefix ?? '?'}）`,
     '  ⇒ 物化确实没发生（不是权限问题：链上能进去的段全都进得去，缺的是目录/文件本身）。',
     '  对照：config.json 由 portal 的 materializer 在启动全量重建时写出（user-space §8.1，本仓 restartPortal 就是触发它）。',
+    formatAncestorLinkLines(observed.links),
     formatLastSegmentLinkLine(observed.link),
     extra ?? '',
   ].filter((line) => line !== '').join('\n');
