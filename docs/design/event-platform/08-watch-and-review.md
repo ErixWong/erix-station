@@ -11,8 +11,11 @@
 
 > **会话停下 → 平台把事实摆到审查 agent 眼前（不下判决）→ agent 判 → 不过就一句话要求整改 →
 > 灌回原会话 → 再判一次 → 再不过转人工。**
+>
+> ⚠ 只有 `red` 走「整改 → 回灌」。`needs-human` 直接转人工，**不回灌**（§6.2）。
 
-只有一个判决者。没有机械判据层 —— 平台只**采集事实**，不**下结论**。
+**M9 只有一个判决者。** 平台只**采集事实**、不替 agent 下结论；
+（范围仅限 M9：`02`/`05`/`06` 里其他宏的机械判据照旧，见 §1。）
 
 ## 1. 为什么 M9 不设「机械判据层」（范围：只限 M9）
 
@@ -26,19 +29,28 @@
 1. **Goodhart**：`git commit` 一下灯就绿，哪怕内容是垃圾（「一个空 commit 也能让灯绿」是站内既有结论）。
 2. **两个判决者，用户永远信便宜的那个**：机械层零 token 秒级、语义层一个 run 分钟级 ⇒
    机械层会**替代**语义层，不是漏斗。
-3. **它给的是确定性的假象**：**灯只有 4 种颜色**（`portal/src/gitlight.js:41`
-   `LIGHT_ORDER = ['red','yellow','grey','green']`），而工作树的状态空间远大于四种。
-   `reason` 更不是封闭枚举 —— 它是「这次采样为什么是这个色」，多仓库/部分扫描会不断产生新值
+3. **它给的是确定性的假象**：**界面只有 4 种灯色**（`portal/src/gitlight.js:41`
+   `LIGHT_ORDER = ['red','yellow','grey','green']` —— 注意它是**聚合排序键**，不是封闭 enum
+   **【实测：代码行】**），而工作树的状态空间远大于四种。
+   `reason` 也不是封闭枚举 —— 它是「这次采样为什么是这个色」，多仓库/部分扫描下取值会继续增加
    （`unreadable` / `busy` / `unchecked_partial` / `no_repo` / `covered_by_outer_repo` / …）
-   **【实测】**。
+   **【推断：按代码分支推断，未穷举】**。
    **藏起来的不确定性比显式的不确定性更危险** —— 看到"灯绿了"就不再追问，而问题还在。
 
 ⇒ **机械证据 ≠ 机械判据**。平台必须把事实采集得**完整且不可回避**（agent 只读，看不到就是不知道），
 但**不许替 agent 下结论**。
 
 ⚠ **反例要认**：有些机械检查确实比模型可靠（「某条测试退出码必须为 0」「某文件必须存在」）。
-它们的正确位置是**硬前置**：不过就直接判 `red`，不进模型。所以不是「不要机械检查」，
-是「**机械检查不许和模型并列发布同一个最终判决**」。
+它们的正确位置是**硬前置**，但**硬前置不是第二个判决者** —— 措辞要精确：
+
+| 说法 | 成立吗 |
+|---|---|
+| 硬前置失败 ⇒ 直接落 `verdict=red`、不进模型 | ✅ 成立，但它是**短路**（一个判决，不是两个） |
+| 硬前置与模型**并列**各自发布判决，再合并 | ❌ 不许，这才是「两个判决者」 |
+
+⇒ 判据：**硬前置失败时模型根本不跑**（短路），所以全程只有一个判决被产生。
+`§6.1` 的「产生者」列要相应写清：`red` 可能由**模型**产生，也可能由**硬前置短路**产生，
+但**同一行记录里只有一个**。
 
 ## 2. 概念图（五个东西的关系）
 
@@ -166,16 +178,44 @@ git -C <原目录> ls-files --others --exclude-standard -z \
 | `rsync` 失败 | 同上，记 `untracked_copy_failed` |
 | **一致性校验不过** | 见下 |
 
-**一致性校验**（补上 copilot 指出的原子性缺口）：搬运前后各取一次
-`HEAD` + `git status --porcelain -uall | sha256`，不一致 ⇒ 说明搬运期间原目录被改，
-**重试一次；仍不一致 ⇒ 记 `snapshot_unstable` 并放弃本次审查**（不许拿拼凑树去审）。
+**一致性校验**（补上 copilot 指出的原子性缺口）：
 
-**孤儿清理**：worktree 的路径登记进 `macro_runs.worktree_path`。portal 启动时扫一遍：
-`git worktree list` 里有、但对应 `macro_runs` 已终态超过 1 小时的 ⇒ `git worktree remove --force`。
+⚠ **只 hash `git status` 文本不够** —— 同一路径内容变了、status 文本可以完全不变
+（比如一个已修改文件的第二/第三次编辑）。所以取**内容级**指纹：
+
+```
+HEAD sha
++ git status --porcelain -uall（含路径与状态码）
++ 每个变更文件的 (path, size, mtime, sha256) 清单
++ 未跟踪文件同样取 sha256
+→ 整体 sha256 作为 snapshot_id
+```
+
+搬运前后各取一次，不一致 ⇒ **重试一次；仍不一致 ⇒ 记 `snapshot_unstable` 并放弃本次审查**
+（不许拿拼凑树去审）。`snapshot_id` 落 `macro_runs`，判决与它绑定。
+
+**孤儿清理**：worktree 路径登记进 `macro_runs.worktree_path`。portal 启动时扫一遍
+`git worktree list`，命中任一条件即 `git worktree remove --force`：
+
+| 条件 | 为什么 |
+|---|---|
+| 对应 `macro_runs` 已终态 > 1 小时 | 正常收尾没清掉 |
+| 对应 `macro_runs` 仍是 `running` 但 `started_at` > 1 小时 | **进程崩溃留下的**，永远等不到终态 |
+| `macro_runs` 行根本不存在 | 建 worktree 后、写库前就死了 |
+
+⚠ 第二条是审计指出的遗漏：只扫「已终态」会漏掉崩溃态。
 清理本身失败 ⇒ 记 warn + 留到下次启动（**不阻塞**，但必须可见）。
 
-**预算**：仓库大小 / `worktree add` 耗时 / 磁盘占用各设上限，超限 ⇒ 记 `snapshot_too_large`，
-不启动审查，通知用户（而不是默默跑半小时）。
+**预算**（可执行阈值，不是"各设上限"）：
+
+| 项 | 阈值 | 超限行为 |
+|---|---|---|
+| `worktree add` 耗时 | 60s | 中止 + `snapshot_timeout` |
+| 快照总字节（含未跟踪） | 500 MB | 中止 + `snapshot_too_large` |
+| 变更文件数 | 5000 | 中止 + `snapshot_too_large` |
+| 磁盘余量 | < 2 GB | 中止 + `disk_low` |
+
+超限一律**不启动审查**、通知用户，不静默跑半小时。
 
 ### 5.4 五种失败出口（每种都要有持久状态）
 
@@ -185,10 +225,14 @@ git -C <原目录> ls-files --others --exclude-standard -z \
 | LLM / API 失败 | `failed` | `unclassified` | 用户 | ❌ |
 | 工作包构建失败（§5.3 任一环） | `failed` | `unclassified` | 用户 | ❌ |
 | 首行格式非法 | `done` | `unclassified` | 用户 + 管理员 | ❌（存原文供人看） |
-| 回灌 409 `run_in_progress` | `skipped` | 保留原判决 | **不通知**（人在场） | ❌，记 `deferred` |
+| 回灌 409 `run_in_progress` | `skipped` | **保留原判决** | **不通知**（人在场） | ❌，记 `deferred` |
 
-⚠ **共同底线**：这五种都**不许伪装成 `red` 或 `needs-human`** —— 它们是"没判成"，不是"判成没过"。
-所以统一落 `unclassified`，界面显示「未判」。
+⚠ **前四种**（超时 / LLM 失败 / 构建失败 / 首行非法）都**不许伪装成 `red` 或 `needs-human`**
+—— 它们是「没判成」，不是「判成没过」，所以统一落 `unclassified`，界面显示「未判」。
+
+⚠ **第五种（409）不是失败**：审查**已经判出来了**，只是**送不进去**。
+所以 `verdict` 保留原值、`state=skipped`、`skipped_reason=deferred`。
+把它也归到 `unclassified` 会抹掉一次成功的审查 —— 这是两件事，不能合并。
 
 ### 5.5 `until` 到期时的在途审查
 
@@ -221,7 +265,7 @@ git -C <原目录> ls-files --others --exclude-standard -z \
 | `unclassified` | —— | 未判 | **平台**（未完成 / 超时 / 首行非法） |
 
 ⚠ **`未判` 是平台状态，不是第五种模型判决**，模型不许输出它。
-`07` 里的「未通过 / 未达成」只作正文用语，**不再作为独立存储或解析枚举**。
+旧稿里的「未通过 / 未达成」已按本表全部替换为 `整改`，**不再作为独立存储或解析枚举**。
 
 ### 6.2 首行契约与 fail closed
 
@@ -243,6 +287,7 @@ git -C <原目录> ls-files --others --exclude-standard -z \
 ## 7. 回灌（唯一的环）
 
 ```js
+// ⚠ 只在 verdict === 'red' 时执行；needs-human 走人工通知，不走这里
 postMessage({
   sessionId: 原会话,
   content: "[系统] <结论之后的正文>",
@@ -337,21 +382,26 @@ postMessage({
 ## 10. 数据形状（只写形状，不写 DDL）
 
 ⚠ **本节是 [07](07-surfaces-and-panel.md) §6 形状的增量**，不是另一份定义。
-两边合起来才是完整形状；`07` 已有的字段这里不重复列。
+`state` / `skipped_reason` 的**完整取值以 `07` 为唯一来源**（含 `superseded` / `cancelled_by_user`），
+本节不重复列。
 
 ```
 macro_templates      同 07
 macro_assignments    07 的字段 + until(timestamptz, UTC 存储)
-macro_runs           07 的字段（state / skipped_reason / started_at / finished_at）
-                       + verdict(enum, 见 §6.1) · remediation_text
-                       + child_session_id · depth · parent_macro_run_id
-                       UNIQUE (assignment_id, anchor, 判据)   ← 幂等的唯一执行点
+macro_runs           07 的字段 + 下列 M9 专用列：
+                       verdict        enum，见 §6.1（含 unclassified）
+                       verdict_raw    text，模型原文（首行非法时供人看）
+                       reason         text，失败原因（§5.4 前四行）
+                       remediation_text text，回灌正文
+                       child_session_id · child_run_id · depth · parent_macro_run_id
+                       worktree_path  text，建好的 worktree 路径（§5.3 孤儿清扫用）
 ```
 
+**幂等键只有一套**，见 `07` 的 `UNIQUE (assignment_id, anchor, state, bucket)`。
+M9 上的特化：`state` = 判据名（`mechanical` / `semantic`）、`bucket` = 触发 run id。
+**不并存两套约束。**
+
 - `until` 到期 ⇒ `enabled=false` + 一条通知。默认**次日 09:00**（存 UTC，显示本地）。
-- `state` 取值（与 `07` 对齐）：`pending` / `running` / `done` / `skipped` / `failed`。
-- `skipped_reason` 取值：`budget_exhausted` / `quiet_hours` / `human_present` /
-  `run_in_progress` / `deferred_timeout` / `active_run_in_cwd`。
 
 ## 11. 风险与防线
 
@@ -369,6 +419,12 @@ macro_runs           07 的字段（state / skipped_reason / started_at / finish
 
 ⇒ 判据落在**同一条 SQL 的条件插入/条件更新**里（或 `SELECT … FOR UPDATE` 锁住该 cwd 的登记行），
 不能写成"查一次、然后启动"。查失败/有活跃 run ⇒ 记 `skipped_reason=active_run_in_cwd` 并等下一个事件。
+
+⚠ **这把锁必须被所有会写同一 cwd 的 run 启动路径共用** —— 用户发消息、队列 drain、
+M7 定时任务、M9 审查，全部走同一个条件写入。只在 M9 这边加锁 = 没锁。
+
+⚠ **人优先不靠 `capacity`**：容器 `capacity=2` 只说明能并行两个，不保证先后。
+人优先必须由**会话级互斥**（同会话单活跃 run）+ 排队规则落实。
 
 **人优先**（`08` §11 那条）同理：用户发消息时若审查在排队 ⇒ 审查标 `superseded`，
 **不得回灌过期结论**，重新开始时针对新快照重审。
