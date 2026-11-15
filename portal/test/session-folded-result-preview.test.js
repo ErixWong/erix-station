@@ -92,7 +92,7 @@ class ResultPool extends FakePool {
   }
 }
 
-async function startServer() {
+async function startServer({ log } = {}) {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-folded-result-'));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const config = {
@@ -112,7 +112,7 @@ async function startServer() {
     staticDir,
   };
   const pool = new ResultPool();
-  const server = createServer({ pool, config });
+  const server = createServer({ pool, config, ...(log ? { log } : {}) });
   await new Promise((res) => server.listen(0, '127.0.0.1', res));
   const base = `http://127.0.0.1:${server.address().port}`;
   return {
@@ -366,4 +366,139 @@ test('#387 源码级哨兵：配对必须发生在喂投影**之前**，且不�
   const helper = src.slice(helperAt, start);
   assert.doesNotMatch(helper, /slice\(0,\s*\d+\)|substring\(0,\s*\d+\)|\bpadStart\b/,
     '挂回去的必须是**原样的结果块引用**：站内再切一刀就是第二把预览尺');
+});
+
+// ---------------------------------------------------------------------------
+// PR #541 第三方审计 MED：`tool_use_id` **跨轮复用**时挂错结果。
+//
+// 病根（审计原文 + 主 agent 裁决）：`attachToolResultsToRecords` 原来建的是 range 级 `Map`，
+// `set` 是 last-write-wins，而 `own` 只挡「同一条记录里已结清」的 id ⇒ 两个 round 都用 id `x`
+// （round A 得 A、round B 得 B）时，**第一个 round 会显示第二个 round 的结果**——错内容比缺内容
+// 更难发现。这不是理论：上游明写 provider id 不保证 run 内唯一
+// （`node_modules/erix-agent/src/tool-fact.js:209-210`「**跳轮不在这里继承**：provider id 不保证
+// run 内唯一（issue #284）」），真库里也确有 6 个跨轮复用的 id（§8.132 取证读数）。
+// 修法：配对按**位置**取「就近」——先取该调用**之后最近**的同 id 结果，之后一条都没有才回退
+// 取**之前最近**的那条。「取第一条」不算修好：那只是把错的方向反过来。
+// ---------------------------------------------------------------------------
+
+/** 同一 id `tu_reuse` 在两个 round 各用一次、各有一份自己的结果（结果行紧贴自己的调用行）。 */
+function seedReusedIdAcrossRounds(pool) {
+  seedFoldCarrier(pool);
+  pool.seed(KEY, 4, `${KEY}:msg:4:0`, [{
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'ROUND A BODY' },
+      { type: 'tool_use', id: 'tu_reuse', name: 'readFile', input: { path: 'a-in.txt' } },
+    ],
+  }]);
+  pool.seed(KEY, 4, `${KEY}:msg:4:1`, [{
+    role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_reuse', content: 'RESULT OF ROUND A' }],
+  }]);
+  pool.seed(KEY, 6, `${KEY}:msg:6:0`, [{
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'ROUND B BODY' },
+      { type: 'tool_use', id: 'tu_reuse', name: 'readFile', input: { path: 'b-in.txt' } },
+    ],
+  }]);
+  pool.seed(KEY, 6, `${KEY}:msg:6:1`, [{
+    role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_reuse', content: 'RESULT OF ROUND B' }],
+  }]);
+}
+
+const callsOfRound = (turns, round) => allCalls(turns.filter((turn) => turn.round === round));
+
+test('#541 MED 判据①：同一个 `tool_use_id` 跨轮复用 ⇒ 各轮拿**自己那一轮**的结果（不是都拿最后一条）', async () => {
+  const s = await startServer();
+  try {
+    seedReusedIdAcrossRounds(s.pool);
+    const turns = await fetchTurns(s);
+
+    const callA = callsOfRound(turns, 4).find((call) => call.id === 'tu_reuse');
+    const callB = callsOfRound(turns, 6).find((call) => call.id === 'tu_reuse');
+    assert.ok(callA && callB, '两轮各自的 `tool_use` 都要在（夹具自证）');
+    assert.equal(callA.argsSummary, 'path=a-in.txt', '两轮的入参不同 ⇒ 拿错轮一眼可见');
+    assert.equal(callB.argsSummary, 'path=b-in.txt');
+
+    assert.equal(callA.resultPreview, 'RESULT OF ROUND A',
+      `round 4 的调用要拿 round 4 那份（拿到 ${JSON.stringify(callA.resultPreview)} 就是 range 级 last-write-wins 复发）`);
+    assert.equal(callB.resultPreview, 'RESULT OF ROUND B',
+      `round 6 的调用要拿 round 6 那份；「取第一条」会把这条打成 round 4 那份 ⇒ 本断言照样红`);
+    assert.notEqual(callA.resultPreview, callB.resultPreview, '两份结果不许被并成一条');
+  } finally { await s.close(); }
+});
+
+test('#541 MED 判据②：调用之后没有同 id 结果 ⇒ 回退取**之前最近**的那条（resume 复放的形状）', async () => {
+  const s = await startServer();
+  try {
+    seedFoldCarrier(s.pool);
+    // round 3：正常的一轮（调用 + 紧随其后的结果行）
+    s.pool.seed(KEY, 3, `${KEY}:msg:3:0`, [{
+      role: 'assistant',
+      content: [{ type: 'text', text: 'ROUND 3 BODY' }, { type: 'tool_use', id: 'tu_replay', name: 'shell', input: { command: 'pwd' } }],
+    }]);
+    s.pool.seed(KEY, 3, `${KEY}:msg:3:1`, [{
+      role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_replay', content: 'RESULT FROM EARLIER ROUND' }],
+    }]);
+    // round 6：`:engine:round:6:resume` 载体**重发**旧调用，它后面没有任何结果行
+    // （真库形状：`3dcab38b…` 的 round 56 resume 行重发了 round 8/13/20/29/45 的 `tool_use`）
+    s.pool.seed(KEY, 6, `${KEY}:engine:round:6:resume`, [{
+      role: 'assistant',
+      content: [{ type: 'text', text: 'RESUMED' }, { type: 'tool_use', id: 'tu_replay', name: 'shell', input: { command: 'pwd' } }],
+    }]);
+
+    const turns = await fetchTurns(s);
+    const replayed = callsOfRound(turns, 6).find((call) => call.id === 'tu_replay');
+    assert.ok(replayed, '复放的 `tool_use` 要在');
+    assert.equal(replayed.resultPreview, 'RESULT FROM EARLIER ROUND',
+      '之后一条都没有 ⇒ 退到「之前最近」那条；只认「之后」的实现会把这条打成缺键 ⇒ 本断言红');
+    assert.equal(callsOfRound(turns, 3).find((call) => call.id === 'tu_replay').resultPreview,
+      'RESULT FROM EARLIER ROUND', '原来那一轮照样拿自己那份');
+  } finally { await s.close(); }
+});
+
+test('#541 MED 判据③：同 id 出现多份结果 ⇒ **计数走现成日志通道**（无重复时必须不打，否则断言恒真）', async () => {
+  const lines = [];
+  const log = { warn: (m) => lines.push(String(m)), info: () => {}, error: (m) => lines.push(String(m)) };
+  const s = await startServer({ log });
+  try {
+    seedReusedIdAcrossRounds(s.pool);
+    await fetchTurns(s);
+    const dup = lines.filter((line) => line.includes('tool_use_id'));
+    assert.equal(dup.length, 1, `有重复时要恰好打一条（实际 ${dup.length} 条：${JSON.stringify(dup)}）`);
+    assert.match(dup[0], /1 个 tool_use_id/, `那条要带条数读数：${dup[0]}`);
+    assert.match(dup[0], /tu_reuse/, '要能指出是哪个 id（运维定位用）');
+  } finally { await s.close(); }
+
+  // 反向对照：同一份 range 里没有重复 id ⇒ 一条都不许多打（否则上面的断言是恒真的）
+  const quiet = [];
+  const s2 = await startServer({ log: { warn: (m) => quiet.push(String(m)), info: () => {}, error: () => {} } });
+  try {
+    seedLedger(s2.pool);
+    await fetchTurns(s2);
+    assert.deepEqual(quiet.filter((line) => line.includes('tool_use_id')), [],
+      `没有重复就不许报（实际：${JSON.stringify(quiet)}）`);
+  } finally { await s2.close(); }
+});
+
+test('#541 MED 源码级哨兵：多份结果必须交回 `duplicateIds` 并走 `log.warn`（不是 console、不是响应字段）', () => {
+  const src = fs.readFileSync(new URL('../src/sessions.js', import.meta.url), 'utf8');
+  const start = src.indexOf('async function rebuildFoldedRange');
+  const body = src.slice(start, src.indexOf('/** PATCH /api/sessions/:id', start));
+  assert.match(body, /duplicateIds/, '重建路要接住「哪些 id 有多份结果」');
+  assert.match(body, /log\?\.warn\?\.\(/, '可观测走调用方传进来的 `log`（现成通道），不新造事件类型、不加响应字段');
+  assert.doesNotMatch(body, /console\.(warn|log|error)/, '不得绕过注入的 log 直接打 console');
+  // 配对尺必须**看位置**：两个方向（之后 / 之前）都要在，只剩一个方向就是「取第一条」或「取最后一条」
+  const helperAt = src.indexOf('function attachToolResultsToRecords');
+  const helper = src.slice(helperAt, start);
+  assert.match(helper, /seq > call\.seq/, '「取之后最近」那半边要在');
+  assert.match(helper, /seq < call\.seq/, '「回退取之前最近」那半边要在');
+  // 通道必须是通的：http 的 ctx.log → getFoldedPayload → rebuildFoldedRange（任何一环断了，上面那条
+  // 日志判据就会变成「永不打」的假绿）。
+  const httpSrc = fs.readFileSync(new URL('../src/http.js', import.meta.url), 'utf8');
+  assert.match(httpSrc, /getFoldedPayload\(ctx\.pool,\s*\{[^}]*log:\s*ctx\.log/,
+    '端点必须把 ctx.log 递给 getFoldedPayload（否则 warn 永远打不出来）');
+  const payloadBody = src.slice(src.indexOf('export async function getFoldedPayload'), src.indexOf('/** `foldedRoundRange` 形态校验'));
+  assert.match(payloadBody, /rebuildFoldedRange\(pool,\s*\{\s*key:\s*sessionId,\s*range,\s*log\s*\}\)/,
+    'getFoldedPayload 必须把 log 继续往重建路递');
 });
