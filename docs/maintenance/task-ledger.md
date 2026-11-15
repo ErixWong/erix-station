@@ -5435,7 +5435,8 @@ select payload->>'final_text' from run_events
 `<｜｜DSML｜｜` / `<tool_call` / `<｜Function`（≥3 条，不是「只钉 DSML」）。两条防误伤规则：
 整段围栏代码块与成对反引号**先剥掉再匹配**（正文里**引用**标记本身不是泄漏），大小写不敏感。
 可配置面 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS`：逗号分隔**整串替换**缺省；`off` 是**显式关闭**（要 warn）；
-非法条目（空 / 超长 / 含换行 / 非串）**点名是哪个值**并回退缺省 —— 配错不该把问题重新藏起来。
+非法条目**逐条**丢弃并**点名是哪个值**，**全部**非法才回退缺省 —— 配错不该把问题重新藏起来。
+（261116 返工更正：这一条先前写作「空 / 超长 / 含换行 / 非串…**并回退缺省**」，三处不准，见下面 §8.137 返工段 LOW-3；代码一直是对的，措辞是错的。）
 
 **第 2 步：链路怎么接（逐条照 #442 的 `final_text_fallback` 抄，三条口径一字未改）**
 - `runner/worker.js`：每 run 解析一次特征集（worker 进程会被复用给下一个 run），`warnings[]` 逐条落 `warn` LOG；
@@ -5531,3 +5532,74 @@ select payload->>'final_text' from run_events
 **64 files / 1388 tests 全绿 rc=0**（含 i18n 双语键集对账 `localeParity.spec.ts`）。
 root `timeout 1500 npm test` 按「先 commit 再跑长门禁」在本节提交之后单独跑一次，读数记在交付
 `/tmp/tickets/deliver-243-step3.md`。
+
+#### 8.137 返工（PR #555 第三方复审 2 MED + 2 LOW，2026-11-16，同一分支只追加提交）
+
+**取证边界（先把没证的说清楚）**：本轮对 `station-db` 只跑只读 `select`
+（`docker exec station-db psql -U station -d station -At -c '…'`），没进 `station-*` / `fde-*` 容器，没写库。
+新加的两族特征是**预防性覆盖，不是实证**——现查读数：
+
+| 取数语句（逐字） | 读数 |
+| --- | --- |
+| `select count(*) from run_events where payload::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from run_events where payload::text like '%<invoke name=%'` | **0** |
+| `select count(*) from messages where content::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from messages where content::text like '%<invoke name=%'` | **0** |
+| `select count(*) from transcript_rounds where record::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from transcript_rounds where record::text like '%<invoke name=%'` | **0** |
+| `select count(*) from transcript_rounds where messages::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from transcript_rounds where messages::text like '%<invoke name=%'` | **0** |
+| 阴性对照（同一批查法，证明不是查法失效）：`… like '%DSML%'` 分别打在 `run_events.payload` / `messages.content` / `transcript_rounds.record` / `transcript_rounds.messages` | **6 / 1 / 8 / 8** |
+| `select count(*) from run_events where payload::text like '%chatcmpl%'`（裸串） | **1**，`left(payload::text,220)` 取出来是 `{"name":"writeFile","input":{"path":"llm-smoke-test.js",…}}` —— 某 run 写下去的测试脚本正文，**不是终局正文** |
+| 那一行的身份：`select run_id::text||' / '||type from run_events where payload::text like '%chatcmpl%' limit 3` | `80c1686d-d205-4e01-846d-1ea4a23cb25e / tool_use` |
+
+⇒ `<invoke` 与 `chatcmpl-tool-` 都**没有真样本**（上面全部查过），夹具是**形状夹具**；
+`<｜Function` 那条同族特征也仍是**推断覆盖**（先前记录里已经这么标）。
+顺带一条有用的副产品：裸 `chatcmpl` 会出现在正常内容里（那一行就是），所以进缺省的是
+**带横杠的 13 字符前缀**，不是短词 `chatcmpl`。
+
+**MED-2（优先）：一个超长 marker 曾经能拒绝整条终态**。事实链核对成立：`portal/src/internal.js`
+的 marker 校验开在 `BEGIN` **之前** ⇒ 400 直接 return，终态不写、**不重试**（run 只能等租约过期 / reaper）。
+⇒ 丢弃挪到**源头**：`textualizedToolCallField()` 超长 ⇒ 只丢 `textualized_tool_call_marker`、**布尔照传**；
+`agentd.js` 透传时同一道闸（旧 worker 版本偏移的兜底）；portal 那侧保留 400 但**只是契约闸**，
+裸 `120` 换成两侧**同名**常量 `TEXTUALIZED_MARKER_MAX_CHARS`（grep 一把能齐）。
+对账不靠肉眼：`portal/test/textualized-toolcall.test.js` 的 **E3** 拿**真** `textualizedToolCallField`
+造的载荷过终态闸（超长 ⇒ 终态照写 + 事件照有 + payload 只剩 `{chars}`；runner 侧上界若比 portal 宽，
+这一格会以「终态写不进去」炸出来）；另有源码级一格钉「两侧常量数值相等 + portal 不许留裸 `> 120`
++ agentd 必须 import 同一个常量」。配置面附带一条：条目长过上界**不算非法**（照样判定），
+但给一条告警说明命中时会少一段片段 —— 不静默。
+
+**MED-1：两族认不出、而且配不进去**。缺省集合加 `<invoke`；`chatcmpl-tool-` **不含 `<`**，
+而「条目必须含 `<`」是防误伤的承重墙 ⇒ **没把门槛调低**，改成把「像 id 前缀」写成判据：
+**不含 `<` 的条目要求长度 ≥12 且含 `-`**（`chatcmpl-tool-`=13 过；`chatcmpl`=8、`off`、`offer`、
+`offset`、11 字符的 `abcdefghij-` 拒）。承重墙的理由也用行为钉了一次：绕开解析器硬把 `off` 当特征
+⇒ "offset" 会被咬。误伤判据两格按要求落了（正文只写 `chatcmpl`、正文含 `offset`/`offer` ⇒ 都判假）。
+
+**LOW-3 更正（是我先前记错，不是工单写错）**：本节先前写作「非法条目（空 / **超长** / **含换行** / 非串）
+点名是哪个值**并回退缺省**」—— 三处不准：① 长度上限从来不是拒绝理由（返工之后更是明确
+「超长照样判、只给告警」）；② 解析器从不看有没有换行；③ 真实行为是**逐条**丢弃、
+**全部**非法才回退缺省，「少于 3 条整份作废」这种门槛根本不存在。代码一直是对的，措辞是错的；
+现在判据 ⑪ 把口径钉在代码上（单条合法就留那一条）。**行为一个字没动。**
+
+**LOW-4：已知残余登记**：特征判据是逐字子串 ⇒ 正常交付若在代码块**外**裸写 `｜｜DSML｜｜` 这类标记会
+误报一条中性提示（写进行内代码/围栏不会 —— 剥代码那一步管着）。代价是**多一条中性提示**，
+不是把正常 run 判成失败；换来的是不再静默丢掉交付报告 ⇒ 净收益为正。已同时登记在
+`docs/api/portal.md` §5.3 第 29 类与判据 ⑩（那格里写明了「要改它得先证明不漏真样本 B 那种带空格变体」）。
+
+**四发变异（都实跑，收尾 `grep -rn MUTANT runner portal` = 0）**
+- **A 撤掉源头丢弃**（超长 marker 照带）⇒ `34 tests / 32 pass / 2 fail`：红的正是 **E3 跨面行为**
+  与 **⑨ 边界两侧**那格。
+- **B 把不含 `<` 的门槛降回 3、并去掉横杠要求** ⇒ `23 / 20 / 3`：红的正是 **⑧ 承重墙**、
+  **④ 配置**、**⑪ 口径**（"短词能溜进来"这件事在三处都留了钩子）。
+- **C 把 `<invoke` 从缺省里拿掉** ⇒ `23 / 21 / 2`：红 **③ 缺省集合**与 **⑧ XML 族**那格。
+- **D 撤掉 `agentd.js` 的长度闸** ⇒ `23 / 21 / 2`：红 **⑨ 跨面对账**（源码级）与 **⑨ agentd 兜底**（行为级）。
+
+**读数**：`runner/test/final-text-toolcall.test.js` **23/23**、`portal/test/textualized-toolcall.test.js` **11/11**、
+`node --test 'runner/test/*.test.js'` **530/530**、前端全量 **64 files / 1388 tests rc=0**
+（返工没动 `portal/frontend/**`，第 3 步那 11 格仍绿）、root `npm test` **2392 tests / 2378 pass / 0 fail / 14 skipped rc=0**、
+`npm run check:agents-hotlayer` **rc=0**。
+
+**剩余（本轮没做，别当成已做）**：① `ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 仍未接部署面三处
+（见上面「剩余」第 2 条），现在多了一层：现场要配 `chatcmpl-tool-` 那一族时，
+配置面**收得下**但**投递不到**；② `<invoke` / `chatcmpl-tool-` 是预防性覆盖，真样本仍待现场出现；
+③ LOW-4 的残余按上面的代价论证保留。
