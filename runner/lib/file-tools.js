@@ -54,6 +54,59 @@ export class JailError extends Error {
 }
 
 /**
+ * jail 缺省告警出口（261116 返工）：与 `lib/llm-timeouts.js:66-73` 同一先例——worker 的 stdout
+ * 由 agentd 逐行接管并加 `[worker <run>]` 前缀（`runner/agentd.js:1040`），所以库里一句
+ * `console.warn` 在现网是**运维看得见**的，不必把 logger 注入进来。
+ * 测试注入自己的 sink（见 `file-tools.test.js` 的 `warn: (m) => warnings.push(m)`）。
+ */
+function defaultJailWarn(message) {
+  console.warn(`[station-runner] ${message}`);
+}
+
+/**
+ * 只读例外条目的解析 + **归属检查**（issue #259 返工，第三方审计 LOW-1）。
+ *
+ * 为什么必须有这条检查：例外条目自己会被 realpath（`~/.erix` 是 symlink 时 realpath 给出的是
+ * **目标**目录），于是「agent 用 shell 把 `~/.erix` 换成指向 `/etc` 的链接」= 例外静默扩张成
+ * `/etc/**`。清单是平台给的，但**目录是 agent 能改的**，所以解析完必须回查归属。
+ *
+ * 归属锚 = **声明这条例外的目录**（`path.dirname(declared)` 的 realpath），对
+ * `platformReadExceptions()` 的两项（`$HOME/AGENTS.md`、`$HOME/.erix`）就是 `$HOME` 本身。
+ * 取父目录而不是在 jail 里硬取 `os.homedir()`：① jail 是纯参数驱动的库（测试与将来别的调用方
+ * 都用夹具家目录，环境里的 HOME 与它们无关）；② 父目录恒**不会比声明更宽**，所以「例外不得被
+ * symlink 放宽」这条不变式对任意条目都成立，而不是只对平台那两项成立。
+ * 锚自己也要 realpath：`$HOME` 本身是 symlink 的机器上，拿词法父目录比会把合法重排误判成越界。
+ *
+ * 不满足 ⇒ **丢弃该条形同不存在**（读边界退化成没这条例外的样子）+ `warn` 点名两个路径。
+ * ⚠ **绝不在这里抛**：那会让整个 jail 构造失败 = worker 起不来，而「agent 换掉 `~/.erix`」是它
+ * 自己做得到的动作，那种情况该有的形状是「这条例外没生效」，不是「工位起不来」。
+ *
+ * @returns {[string[], Readonly<Array<{declared:string, resolved:string, anchor:string}>>]}
+ *   [保留下来的例外根（realpath 后）, 被丢弃条目的事实（供 jail 复核/日志）]
+ */
+function resolveReadExceptionRoots(readExceptions, rootPath, warn) {
+  const kept = [];
+  const dropped = [];
+  for (const entry of (Array.isArray(readExceptions) ? readExceptions : [])) {
+    if (typeof entry !== 'string' || entry.length === 0) continue;
+    const declared = path.resolve(rootPath, entry);
+    // realpathWithMissing 对**还不存在**的路径不抛（只把缺失尾段拼回去），所以「平台文件尚未物化」
+    // 不会在装配期炸掉 jail，也不会被归属检查误杀（不存在 ⇒ 解析结果仍在声明它的目录之内）。
+    const resolved = realpathWithMissing(declared);
+    const anchor = realpathWithMissing(path.dirname(declared));
+    if (isWithin(anchor, resolved)) {
+      kept.push(resolved);
+      continue;
+    }
+    dropped.push(Object.freeze({ declared, resolved, anchor }));
+    warn(`read-only exception dropped: ${declared} resolves to ${resolved}, which is NOT inside the `
+      + `directory that declares it (${anchor}) — treating it as if absent (issue #259: a read exception `
+      + 'must not be widened into another tree by a symlink; the write boundary is unchanged either way)');
+  }
+  return [kept, Object.freeze(dropped)];
+}
+
+/**
  * 创建文件系统路径 jail（0.3.5 createJail 同名同语义移植）。
  *
  * **读边界与写边界是两条线**（issue #259 起）：
@@ -64,14 +117,19 @@ export class JailError extends Error {
  *   * 读边界 = `root` ∪ `readExceptions`（只放宽读）。例外**不经过模型**：它是装配方（worker）
  *     传进来的平台侧白名单，模型既不能传参放宽、也不能靠 `..` / symlink 走出例外清单
  *     （realpath 之后再做前缀判定，所以 `<例外>/../<别处>` 与指向清单外的 symlink 都仍然越界）。
+ *   * **例外根自己也不许借 symlink 搬走**（261116 返工 / 审计 LOW-1）：条目 realpath 之后必须仍在
+ *     「声明它的那个目录」之内（平台那两项 = `$HOME`），否则**丢弃该条形同不存在 + warn 点名**，
+ *     但**绝不因此让 jail 构造失败**（见 `resolveReadExceptionRoots` 的注释）。丢弃的事实挂在
+ *     `droppedReadExceptions` 上，供装配方与测试复核。
  *   * `maskedPaths` 在例外之内**继续生效**（遮蔽是收窄读，与例外正交）；因此遮蔽条目允许落在
  *     例外子树里（此前会被当成越界而在装配期抛 `JailError`）。
  *
- * @param {{root:string, writable?:string[], maskedPaths?:string[], readExceptions?:string[]}} options
- * @returns {{root:string, readExceptions:readonly string[], resolve:(p:string)=>string, resolveForWrite:(p:string)=>string, assertReadable:(p:string)=>string}}
- *   root 为已 realpath 的绝对根路径，供调用方做「解析结果 == 根」判定；readExceptions 为 realpath 后的例外清单（只读事实，供日志/测试复核）。
+ * @param {{root:string, writable?:string[], maskedPaths?:string[], readExceptions?:string[], warn?:(message:string)=>void}} options
+ * @returns {{root:string, readExceptions:readonly string[], droppedReadExceptions:readonly object[], resolve:(p:string)=>string, resolveForWrite:(p:string)=>string, assertReadable:(p:string)=>string}}
+ *   root 为已 realpath 的绝对根路径，供调用方做「解析结果 == 根」判定；readExceptions 为**通过归属检查**的
+ *   例外清单（realpath 后，只读事实，供日志/测试复核）；droppedReadExceptions 为被归属检查丢弃的条目。
  */
-export function createJail({ root, writable = [], maskedPaths = [], readExceptions = [] }) {
+export function createJail({ root, writable = [], maskedPaths = [], readExceptions = [], warn = defaultJailWarn }) {
   const rootPath = fs.realpathSync(path.resolve(root));
 
   // 严格解析：只认根之内（写侧与历史 `resolve` 语义的唯一实现，#259 一个字节都没动它）。
@@ -85,12 +143,9 @@ export function createJail({ root, writable = [], maskedPaths = [], readExceptio
   };
 
   // 只读例外（issue #259）：装配方的白名单，相对写法按根解析、能 realpath 就 realpath
-  // （例外自身是指向别处的目录时，前缀判定跟着 realpath 走，不给「指出去的第二道门」留缝）。
-  // realpathWithMissing 对**还不存在**的路径不抛（只把缺失尾段拼回去），所以「平台文件尚未物化」
-  // 不会在装配期炸掉 jail。
-  const exceptionRoots = (Array.isArray(readExceptions) ? readExceptions : [])
-    .filter((entry) => typeof entry === 'string' && entry.length > 0)
-    .map((entry) => realpathWithMissing(path.resolve(rootPath, entry)));
+  // （例外自身是指向别处的目录时，前缀判定跟着 realpath 走，不给「指出去的第二道门」留缝），
+  // 但 realpath 之后必须仍在声明它的目录之内——归属检查与丢弃见 `resolveReadExceptionRoots`。
+  const [exceptionRoots, droppedReadExceptions] = resolveReadExceptionRoots(readExceptions, rootPath, warn);
 
   const withinReadableRoots = (target) => isWithin(rootPath, target)
     || exceptionRoots.some((exceptionRoot) => isWithin(exceptionRoot, target));
@@ -110,8 +165,23 @@ export function createJail({ root, writable = [], maskedPaths = [], readExceptio
   // 遮蔽条目的解析走读侧口径（根之内 ∪ 例外之内）：#259 之后「在例外里遮蔽一个密钥子目录」
   // 是**有生产者的用法**（家目录开了只读例外，平台侧要能在里面继续挡东西）。
   // 落在两者之外的条目仍照旧在装配期抛 `JailError`（不静默吞掉一条写歪的遮蔽规则）。
-  const maskedRoots = (Array.isArray(maskedPaths) ? maskedPaths : [])
-    .map((entry) => resolveReadable(entry));
+  // ⚠ 例外**之内**是刻意留的口（见 §8.135），例外**之外**必须抛——生产侧 `maskedPaths` 今天还没有
+  //   生产者（`grep -n maskedPaths runner/worker.js` = 0 处），所以这条守卫现在只由测试按着。
+  // 例外根被归属检查丢弃时，落在那条形同不存在的例外之下的遮蔽条目**不得反过来把 jail 炸掉**
+  // （261116 返工红线：丢弃只能让「这条例外没生效」，不能让 worker 起不来）：那棵子树整个都读不到，
+  // 遮蔽本来就是空转，丢弃它 + warn 点名，比在装配期抛更符合「退化成没这条例外」的语义。
+  const maskedRoots = [];
+  for (const entry of (Array.isArray(maskedPaths) ? maskedPaths : [])) {
+    const declared = path.resolve(rootPath, entry);
+    try {
+      maskedRoots.push(resolveReadable(declared));
+    } catch (error) {
+      const owner = droppedReadExceptions.find((dropped) => isWithin(dropped.declared, declared));
+      if (!owner) throw error;
+      warn(`masked entry skipped: ${declared} sits under the dropped read-only exception `
+        + `${owner.declared} (that whole subtree is unreadable anyway, so masking it is a no-op)`);
+    }
+  }
 
   const resolveForWrite = (value) => {
     // 写侧用**严格解析**（与 `resolve` 同一口径），但拒因要分得开（issue #259 验收：「只读例外」与
@@ -144,6 +214,7 @@ export function createJail({ root, writable = [], maskedPaths = [], readExceptio
   return {
     root: rootPath,
     readExceptions: Object.freeze([...exceptionRoots]),
+    droppedReadExceptions,
     resolve,
     resolveForWrite,
     assertReadable,
