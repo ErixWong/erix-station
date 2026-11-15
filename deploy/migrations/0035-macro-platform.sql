@@ -7,7 +7,10 @@
 --   * `macro_assignments`：**谁在什么范围内订阅了哪个模板**（给谁做、做几次）。`until` 到期
 --     ⇒ `enabled = false`（到期判定一律 UTC；本单**不做定时器**，到点执行是 W2 的事）。
 --   * `macro_runs`：**每次执行一条账**（做没做、结果如何）。幂等键
---     `(assignment_id, anchor, state, bucket)` 唯一——同一个事件在同一状态同一桶里只该跑一次，
+--     `(assignment_id, anchor, criterion, bucket)` 唯一——同一个事件在同一条判据同一桶里只该跑
+--     一次。⚠ **键里不许出现 `status`**：`status` 是生命周期（pending → running → done），会随执行
+--     推进而变；把它放进幂等键，一条记录跑完之后键就换了，同一个触发能被再次 claim ⇒ 幂等直接失效
+--     （这就是「一列两义」的代价）。判据（`criterion`）与桶（`bucket`）都不随执行变，键才稳定。
 --     认领用 `INSERT … ON CONFLICT DO NOTHING RETURNING id`（`macros.js` `claimMacroRun`），
 --     **不是**「先 SELECT 再 INSERT」（那在并发下会把同一个事件跑两遍）。
 --
@@ -80,7 +83,7 @@ CREATE INDEX IF NOT EXISTS macro_assignments_template_idx
 CREATE INDEX IF NOT EXISTS macro_assignments_user_active_idx
     ON macro_assignments (user_id) WHERE enabled;
 
--- ③ 执行账：一次执行一行，只追加，不改写历史（state 的推进是唯一例外）。
+-- ③ 执行账：一次执行一行，只追加，不改写历史（`status` 的推进是唯一例外）。
 CREATE TABLE IF NOT EXISTS macro_runs (
   id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   -- ⚠ **不带 ON DELETE**（口径同 `chat_sessions.user_id`）：执行账是审计面，「取消订阅」不能顺手
@@ -93,10 +96,21 @@ CREATE TABLE IF NOT EXISTS macro_runs (
   -- `bucket` = 去重桶（同一 anchor 下的聚合窗口，例如静默告警的 10 分钟桶）。
   anchor              text NOT NULL,
   bucket              text NOT NULL,
-  -- 执行状态机：pending → running → done / failed；pending → skipped（被门禁挡下）；
+  -- **生命周期**（这一列会随执行推进而变 ⇒ 绝不进幂等键，见文件头）：
+  -- pending → running → done / failed；pending → skipped（被门禁挡下）；
   -- pending → superseded（被同桶的更新一次取代，不执行）。
-  state               text NOT NULL DEFAULT 'pending'
-                      CHECK (state IN ('pending', 'running', 'done', 'skipped', 'failed', 'superseded')),
+  status              text NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending', 'running', 'done', 'skipped', 'failed', 'superseded')),
+  -- **触发判据**（这一列写完就不变 ⇒ 是幂等键的一部分）。为什么必须与 `status` 分两列：
+  -- 判据回答「这次触发是谁叫起来的」，生命周期回答「这一次跑到哪了」——两个轴各自演进，
+  -- 合成一列就得让幂等键跟着状态跑（见上面的 ⚠）。取值：
+  --   `terminal`   run 进终态触发的宏（run-notify / run-review）
+  --   `silent`     静默告警（run-silence-alert，按 bucket 聚合窗口去重）
+  --   `tick`       定时/轮询（scheduled-task，W2 的定时器驱动）
+  --   `mechanical` M9 判据：机械可判定的那一路（不需要模型裁决）
+  --   `semantic`   M9 判据：要模型语义裁决的那一路
+  criterion           text NOT NULL
+                      CHECK (criterion IN ('terminal', 'silent', 'tick', 'mechanical', 'semantic')),
   -- 结果判定（`done` 才有）。`verdict` 是归一化后的口径，`verdict_raw` 存模型原话，
   -- 便于口径改了以后回溯重算——两者分开存是站内既有习惯（照 run 的 termination 透传 + 展示态推导）。
   verdict             text CHECK (verdict IN ('pass', 'red', 'no-op-claim', 'needs-human', 'unclassified')),
@@ -121,9 +135,9 @@ CREATE TABLE IF NOT EXISTS macro_runs (
   -- 仍然指得回「当时用的是哪个快照」，SET NULL 会把审计链切断。
   snapshot_id         uuid,
   worktree_path       text,
-  -- 幂等键：同订阅 × 同事件 × 同状态 × 同桶 只有一行。`claimMacroRun` 的
-  -- `ON CONFLICT DO NOTHING` 依赖的正是这条约束。
-  UNIQUE (assignment_id, anchor, state, bucket)
+  -- 幂等键：同订阅 × 同事件 × **同判据** × 同桶 只有一行。`claimMacroRun` 的
+  -- `ON CONFLICT DO NOTHING` 依赖的正是这条约束；四列全都写完不变（`status` 不在里面）。
+  UNIQUE (assignment_id, anchor, criterion, bucket)
 );
 
 -- 筛选全落索引列（09-observability.md §7）。**索引选型说明**（任务给的二选一）：
@@ -141,7 +155,11 @@ CREATE INDEX IF NOT EXISTS macro_runs_started_idx
     ON macro_runs (started_at DESC);
 -- 未收口的账（进程死在 running 上的残留、待跑的 pending）——调度器每次 tick 都要扫。
 CREATE INDEX IF NOT EXISTS macro_runs_open_idx
-    ON macro_runs (started_at) WHERE state IN ('pending', 'running');
+    ON macro_runs (started_at) WHERE status IN ('pending', 'running');
+-- 「这条判据跑过没有」/「这条订阅在这条判据下跑过没有」（W2 每次 tick 都要问；
+-- 幂等键那条索引的前缀是 assignment_id，服务不了这种按判据的筛法）。
+CREATE INDEX IF NOT EXISTS macro_runs_criterion_started_idx
+    ON macro_runs (criterion, started_at DESC);
 -- 「这个 run 是哪次宏跑出来的」反查（run 详情页要显示「由宏 X 触发」）。
 CREATE INDEX IF NOT EXISTS macro_runs_child_run_idx
     ON macro_runs (child_run_id) WHERE child_run_id IS NOT NULL;
@@ -152,9 +170,20 @@ DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_constraint
               WHERE conrelid = 'macro_runs'::regclass AND contype = 'c'
-                AND pg_get_constraintdef(oid) LIKE '%state%'
+                AND pg_get_constraintdef(oid) LIKE '%status%'
                 AND pg_get_constraintdef(oid) NOT LIKE '%superseded%') THEN
-    RAISE EXCEPTION '0035: macro_runs.state 的 CHECK 漂移（缺 superseded）';
+    RAISE EXCEPTION '0035: macro_runs.status 的 CHECK 漂移（缺 superseded）';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_constraint
+              WHERE conrelid = 'macro_runs'::regclass AND contype = 'c'
+                AND pg_get_constraintdef(oid) LIKE '%criterion%'
+                AND pg_get_constraintdef(oid) NOT LIKE '%mechanical%') THEN
+    RAISE EXCEPTION '0035: macro_runs.criterion 的 CHECK 漂移（M9 两路 mechanical/semantic 缺了）';
+  END IF;
+  -- 判据与状态**必须是两列**（一列两义的回归闸）：库里不许再有名为 `state` 的列。
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+              WHERE table_name = 'macro_runs' AND column_name = 'state') THEN
+    RAISE EXCEPTION '0035: macro_runs 还留着 state 列（生命周期与判据必须拆成 status / criterion 两列）';
   END IF;
   IF EXISTS (SELECT 1 FROM pg_constraint
               WHERE conrelid = 'macro_runs'::regclass AND contype = 'c'
@@ -171,8 +200,15 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint
                   WHERE conrelid = 'macro_runs'::regclass AND contype = 'u'
                     AND pg_get_constraintdef(oid) =
-                        'UNIQUE (assignment_id, anchor, state, bucket)') THEN
-    RAISE EXCEPTION '0035: macro_runs 幂等键 UNIQUE (assignment_id, anchor, state, bucket) 漂移';
+                        'UNIQUE (assignment_id, anchor, criterion, bucket)') THEN
+    RAISE EXCEPTION '0035: macro_runs 幂等键 UNIQUE (assignment_id, anchor, criterion, bucket) 漂移';
+  END IF;
+  -- ⚠ **幂等键里混进 status 就必须失败**（这条是本节存在的理由）：状态会随执行推进而变，
+  -- 键里带它 ⇒ 一条账 pending→running→done 之后键位空出来 ⇒ 同一个触发能被再次 claim，幂等失效。
+  IF EXISTS (SELECT 1 FROM pg_constraint
+              WHERE conrelid = 'macro_runs'::regclass AND contype = 'u'
+                AND pg_get_constraintdef(oid) LIKE '%status%') THEN
+    RAISE EXCEPTION '0035: macro_runs 幂等键里混进了 status（生命周期列进键 ⇒ 状态一迁移幂等就失效）';
   END IF;
   -- ⚠ 极性注意：这条是「**必须存在**一条带 NULLS NOT DISTINCT 的 UNIQUE」（与上面几条
   -- 「存在但不完整 ⇒ 漂」的写法相反），因为要防的是这半句被丢，而不是多写了什么。
