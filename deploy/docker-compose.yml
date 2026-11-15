@@ -201,6 +201,9 @@ services:
       # ⇒ 不写这一行，运维在 deploy/.env 里改 FILE_UPLOAD_MAX_BYTES 根本不生效（评审 major 8）。
       # 默认值与 `portal/src/config.js` 的 `fileUploadMaxBytes` 必须同值（32 * 1024 * 1024 = 33554432），
       # 两头一致性由 `portal/test/deploy-env-defaults.test.js` 机器判据钉住。
+      # ⚠ issue #485 片 A 之后它的角色变了：它是**兜底值**，不再是「改了就生效」的旋钮——真正生效的值
+      #   按 `upload_settings.max_file_bytes`（管理台，迁移 0035）> 本值 > 默认 取，**每次上传现读**。
+      #   改管理台不需要重建 portal 容器；改本值仍然需要（而且会被管理台里已保存的值盖住）。
       FILE_UPLOAD_MAX_BYTES: ${FILE_UPLOAD_MAX_BYTES:-33554432}
       ERIX_ARTIFACT_CAPTURE_BUDGET_MS: ${ERIX_ARTIFACT_CAPTURE_BUDGET_MS:-60000}
       ERIX_SHELL_TIMEOUT_MS: ${ERIX_SHELL_TIMEOUT_MS:-60000}

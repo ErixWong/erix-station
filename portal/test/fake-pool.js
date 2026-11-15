@@ -13,6 +13,10 @@ export class FakePool {
     this.emailCodes = [];
     // #449：邮件通道配置（单行表 `mail_settings`）。默认无行 = 未配置 = 第二因素不生效。
     this.mailSettings = null;
+    // #485 片 A：单文件上传上限（单行表 `upload_settings`）。默认无行 = 未配置 = 回落 env/默认。
+    // 存的是 `{ max_file_bytes, updated_at, updated_by }`（max_file_bytes 存 **number**，
+    // 出参时再按真驱动的形状转成字符串，见下面 `FROM upload_settings` 分支的长注）。
+    this.uploadSettings = null;
     // #456：证书台账（`tls_certificates`）。**不是真相源**（真相是盘上证书文件），只记「谁什么时候装了什么」。
     this.tlsCerts = [];
     // #456 M2：**语句流水**（`{sql, params}`，每条进来的语句）。只给「零副作用」这类判据用：
@@ -285,6 +289,37 @@ export class FakePool {
     if (sql.includes('FROM mail_settings')) {
       // 回副本：避免产品代码拿到 fake 的内部对象引用后就地改（那会让「没落库」的 bug 测不出来）。
       return { rows: this.mailSettings ? [{ ...this.mailSettings }] : [], rowCount: this.mailSettings ? 1 : 0 };
+    }
+
+    // ---- #485 片 A：单文件上传上限（upload_settings 单行表，迁移 0035） ----
+    // 写侧按 SQL 文本真模拟（AGENTS §8.14 “不把新 SQL 当未知放行”），并把迁移 0035 的两条
+    // 约束当 **DB 事实**执行：① 只能有一行（id = 1）；② `CHECK (max_file_bytes > 0)`。
+    // 产品侧漏了这两条时 fake 会炸 ⇒ 用例变红，而不是静默存下一个“半个值”。
+    if (sql.includes('INSERT INTO upload_settings')) {
+      if (!/ON CONFLICT \(id\) DO UPDATE/.test(sql)) {
+        throw new Error('fake：upload_settings 写入必须是单条 upsert（INSERT … ON CONFLICT (id) DO UPDATE）');
+      }
+      if (!/VALUES \(1,/.test(sql)) throw new Error('fake：upload_settings 是单行表，插入必须写死 id = 1');
+      if (params.length !== 2) throw new Error(`fake：upload_settings upsert 应带 2 个参数，实际 ${params.length}`);
+      const [maxFileBytes, updatedBy] = params;
+      const value = Number(maxFileBytes);
+      if (!Number.isFinite(value)) throw new Error('fake：max_file_bytes 是 bigint NOT NULL，不能是 undefined/null/NaN');
+      if (value <= 0) throw new Error('fake：CHECK (max_file_bytes > 0) 被违反');
+      this.uploadSettings = { max_file_bytes: value, updated_at: new Date(), updated_by: updatedBy };
+      return { rows: [{ ...this.uploadSettings, max_file_bytes: String(value) }], rowCount: 1 };
+    }
+
+    if (sql.includes('FROM upload_settings')) {
+      // ⚠ **`max_file_bytes` 回字符串**，这不是手误：它是 `bigint`（int8），node-pg 对 int8 **默认就回
+      // 字符串**（不自动转 number，怕超 2^53 丢精度）。fake 必须复制这个形状，否则产品侧一个
+      // `Number(row.max_file_bytes)` / `parseInt(row.max_file_bytes)` 的错误在单测里是绿的，到真库上才锈
+      // （`parseInt('1e4') === 1` 那族，台账 §8.126）。
+      return {
+        rows: this.uploadSettings
+          ? [{ ...this.uploadSettings, max_file_bytes: String(this.uploadSettings.max_file_bytes) }]
+          : [],
+        rowCount: this.uploadSettings ? 1 : 0,
+      };
     }
 
     // ---- #449：登录邮箱验证码（login_email_codes） ----
