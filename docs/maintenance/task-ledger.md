@@ -5558,3 +5558,21 @@ tracked-state 形式复查 promise 是否其实已落定（事件循环被停顿
    `station-portal.environment` 里（四条 `grep -c` 全 0）⇒ 标准部署上配了同样是空气。本单没顺手改（跨单，
    且会动 #506 的部署面）；修法同 §6，建议另开一单把四根加进同一条三腿判据。
 3. `chat_sessions` 0.86/秒 的精确拆分仍未收口（本机无语句级计数），已按「不是那 7 个循环 + 逐条 SQL 排除」交付。
+
+**补记：PR #552 返工的门禁原文（2026-11-16，只跑了一次根门禁）**
+- 门禁 1 `timeout 400 node --test portal/test/idle-backoff-520.test.js; echo rc=$?`
+  ⇒ `# tests 23 / # pass 23 / # fail 0`，**`rc=0`**
+- 门禁 2 `timeout 400 node --test portal/test/deploy-env-idle-backoff.test.js; echo rc=$?`
+  ⇒ `# tests 5 / # pass 5 / # fail 0`，**`rc=0`**（两文件合跑 28/28；关闭家族 + #506 退避家族 +
+  两个既有 `deploy-env-*` 一致性文件合跑 108/108）
+- 门禁 3 `timeout 1500 npm test; echo rc=$?` ⇒ `# tests 2384 / # pass 2369 / # fail 1 / # skipped 14`，
+  **`rc=1`**（`# duration_ms 15094`）。唯一红格：
+  `not ok 202 - #506e③ 严格性不许把安全上限那一条挤掉：越界仍回落 + warn（两个文件）`，
+  位置 `portal/test/env-int-strict-506e.test.js:276`，报错 `循环必须停在某一拍的 sleep 上`，
+  栈顶 `Object.arm (env-int-strict-506e.test.js:50)`，`duration_ms 16.27`。
+  **定性：#531 那族负载假红，不是本单引入** —— 失效形状正是「`arm()` 拿轮次预算等循环走到 sleep」，
+  而本单没动 `routes.js` / `materializer.js`（#506 那两份 `envInt` 拷贝）与该夹具任何一行。
+  两个读数：全量 `fail 1`（就是这一条）⇒ **单跑该文件两次**均 `# tests 17 / # pass 17 / # fail 0`，`rc=0`。
+  按工单口径**没有改那些夹具**（#531 的收口是独立单）。
+- 本轮**没有**新增 DB 读数：判据 1 仍是 `BLOCKED-on-deploy`（dev 栈 `station-portal` 跑旧代码，红线不许
+  重启/重建 `station-*`）；也没碰任何容器、没改依赖与 lockfile。
