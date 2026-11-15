@@ -171,6 +171,30 @@ test('引擎源码交叉核对（升级 erix-agent 时的 tripwire）', async ()
   // ⇒ 本文件引用的**文档锚全部无需改动**：`docs/data/model.md` §1.7 与 `docs/api/portal.md` §4.1/§5.3
   //   的 `<!-- DRIFT:termination-reason -->` 枚举（十值）、§6.4 的 `run-retryable-error-code` 枚举（五值）
   //   在 0.32.0 上逐项仍与常量一致（由上面两条文档断言当场跑绿，不是口头承诺）。
+  //
+  // 0.32.0 → **0.33.0**（issue #530 / 工单 feat-261115-08）抬号时的复核现场（261115 本 worktree 现跑，
+  // 对照面 = `npm pack` 解包的 `/tmp/ea32x/package` 与 `/tmp/ea33x/package`；先确认装着的包 == npm
+  // 发布包：`diff -rq <装着的>/src /tmp/ea33x/package/src` 过滤 `.d.ts` 后**无输出**）：
+  //   · `diff -u <0.32>/src/loop/termination.js <0.33>/src/loop/termination.js` 只有三处实体：
+  //     ① 一行**注释**把 `checkpoint_failed` 从错误码例子里拿掉并明写「已退役」；
+  //     ② 新增 `isFileWritesBlind()` 与 `payload.fileWritesBlind`（additive，不碰 reason）；
+  //     ③ `answerPendingTailToolUse` 多传一个 `executedToolIds` 参数（不碰 reason）
+  //     ⇒ **reason 值域零变化**。
+  //   · 两份包各自取 `src/loop/termination.js` 的 reason 字面值（同一 grep 口径）两侧**逐字相同**
+  //     （九个值：`aborted` / `continuation_exhausted` / `end_turn` / `failed` / `final_guard_unverified`
+  //     / `judge_done` / `max_rounds_cap` / `no_tool` / `stall`；`persistence_failed` 在 `orchestrator.js`）。
+  //   · 在**装着的 0.33.0** 上现跑本文件的 typedef 抽取正则：仍是同一组**九值**、同一声明顺序
+  //     （`end_turn,no_tool,stall,max_rounds_cap,judge_done,continuation_exhausted,final_guard_unverified,
+  //     aborted,failed`）；`?\s*"failed"\s*:\s*"persistence_failed"` 定值三元、`const reason = signal?.aborted`
+  //     与 `operation: persistenceFailure.operation` 透传三句断言**全部仍在**。
+  //   · 上游可重试码：`diff -q <0.32>/src/providers/errors.js <0.33>/src/providers/errors.js` **rc=0**
+  //     （逐字节相同，且本版 `src/providers/` **整目录零变更**）⇒ `RETRYABLE_CODES` 仍是 `timeout` /
+  //     `rate_limited` / `server` / `disconnect`，下面那条「剔掉 `checkpoint_failed` 后与上游相等」的断言
+  //     一字未改。⚠ `checkpoint_failed` 在 0.33 已**不再产出**（引擎注释已明写），但**旧档案的历史错误码
+  //     仍要判可重试** ⇒ 本站 `RETRYABLE_ERROR_CODES` 里那一项**保留不动**（只改注释，值域本单不动）。
+  // ⇒ 本文件引用的**文档锚全部无需改动**：`docs/data/model.md` §1.7 与 `docs/api/portal.md` §4.1/§5.3
+  //   的 `<!-- DRIFT:termination-reason -->` 枚举（十值）、§6.4 的 `run-retryable-error-code` 枚举（五值）
+  //   在 0.33.0 上逐项仍与常量一致（同样由上面两条文档断言当场跑绿，不是口头承诺）。
   const engineEntry = import.meta.resolve('erix-agent'); // …/erix-agent/src/index.js
   const engineRoot = path.resolve(fileURLToPath(engineEntry), '..', '..');
   const pkg = JSON.parse(fs.readFileSync(path.join(engineRoot, 'package.json'), 'utf8'));
@@ -198,8 +222,9 @@ test('引擎源码交叉核对（升级 erix-agent 时的 tripwire）', async ()
   assert.match(orchestrator, /const reason = signal\?\.aborted/, 'fail() 的 reason 判定形状变了？复核透传口径');
   assert.match(orchestrator, /operation:\s*persistenceFailure\.operation/, '引擎不再挂 operation/phase/sideEffect？复核透传');
 
-  // 上游可重试码集（provider 层）。⚠ 0.32.0 复核（#499 升级片，2026-11-13 现查两份 `npm pack` 解包）：
-  // `diff -q <0.31>/src/providers/errors.js <0.32>/src/providers/errors.js` **rc=0**（逐字节相同）
+  // 上游可重试码集（provider 层）。⚠ 0.33.0 复核（#530 升级片，261115 现查两份 `npm pack` 解包）：
+  // `diff -q <0.32>/src/providers/errors.js <0.33>/src/providers/errors.js` **rc=0**（逐字节相同，
+  // 本版 `src/providers/` 是**整目录零变更**）
   // ⇒ `RETRYABLE_CODES` 仍是 `timeout` / `rate_limited` / `server` / `disconnect`，本断言一字未改。
   const errors = fs.readFileSync(path.join(engineRoot, 'src/providers/errors.js'), 'utf8');
   const upstream = /RETRYABLE_CODES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(errors);

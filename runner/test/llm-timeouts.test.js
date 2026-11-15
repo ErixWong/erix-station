@@ -79,7 +79,16 @@ const REPO_ROOT = path.join(RUNNER_DIR, '..');
 // · `diff -q` 对 `timeout.js` / `errors.js` / `anthropic.js` **全部 rc=0**（逐字节相同）
 //   ⇒ 四相超时语义、legacy 120s 总闸、streamTotal 默认 300s、provider 可重试码面一字未变，
 //   仍然只追版本号（§8.27 先例），下面所有断言一字未改。
-const ENGINE_VERSION_PINNED = '0.32.0';
+// 0.32.0 → **0.33.0** 复核结果（issue #530 / 工单 feat-261115-08，261115 本 worktree 现跑，
+// 对照面 = `npm pack` 解包 `/tmp/ea32x/package`（0.32.0）与 `/tmp/ea33x/package`（0.33.0），
+// 且 `diff -rq <装着的 0.33.0>/src /tmp/ea33x/package/src` 过滤 `.d.ts` 后**无输出**
+// ⇒ 装着的包 == npm 上的 0.33.0 发布包，不是本地改过的东西）：
+// · `diff -rq <0.32>/src/providers <0.33>/src/providers` **整目录无输出**（rc=0，一个文件都没动）
+//   —— 比 0.32 那次更彻底：0.32 只做到 `timeout.js`/`errors.js`/`anthropic.js` 三文件逐字节相同，
+//   0.33 是 `payload.js` / `openai.js` 也一起不动，`src/providers/` 全目录零变更；
+// · 于是四相超时语义、legacy 120s 总闸、streamTotal 默认 300s、`RETRYABLE_CODES` 可重试码面
+//   **全部逐字节同一**，本文件下面所有断言一字未改，仍然只追版本号（§8.27 先例）。
+const ENGINE_VERSION_PINNED = '0.33.0';
 
 // 决策者定稿的四相默认值（工单 /tmp/TICKET-261.md）——本文件里**唯一**的期望值来源是 helper，
 // 数值本身在 ① 里逐键钉一次，改数值必须同时改 docs/env.md §10.4（⑤ 会盯）。
