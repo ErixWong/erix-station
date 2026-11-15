@@ -21,7 +21,7 @@
 |---|---|---|---|
 | ① | **平台有没有看过？** | 订阅卡片的**评估水位线** | `macro_assignments.last_evaluated_at` |
 | ② | **看过了，命中了吗？** | 流水列表（命中才有行） | `macro_runs` 是否存在 |
-| ③ | **命中了，做成了吗？** | 流水那一行的状态 + 判决 | `state` / `verdict` / `reason` |
+| ③ | **命中了，做成了吗？** | 流水那一行的状态 + 判决 | `status` / `verdict` / `reason` |
 
 ⚠ **关键：未命中不建记录。** 否则「每个 run × 每条模板」都有一行，纯噪音。
 所以「有没有看过」**不能靠记录证明，只能靠水位线**。这两件必须配对设计，少一个就答不了。
@@ -51,7 +51,7 @@
 
 拿到一条订阅，看三个数就能定位到唯一一格：
 
-| 水位线 | 流水有行？ | `state` | 结论 | 该查什么 |
+| 水位线 | 流水有行？ | `status` | 结论 | 该查什么 |
 |---|---|---|---|---|
 | 有，且新鲜 | ❌ | — | **没命中**（正常） | 判据是否太严 |
 | 有，且新鲜 | ✅ | `pending` | **已登记，等槽位** | 排队中，正常 |
@@ -236,7 +236,8 @@
 ## 6. 数据来源（不新建表）
 
 ```
-macro_runs  已有：assignment_id · anchor · state · verdict · skipped_reason
+macro_runs  已有：assignment_id · anchor · criterion · bucket · status
+                  · verdict · skipped_reason
                   · started_at · finished_at · child_run_id · depth
                   · verdict_raw · reason · worktree_path · snapshot_id
   JOIN macro_assignments  → user_id
@@ -258,7 +259,7 @@ macro_runs  已有：assignment_id · anchor · state · verdict · skipped_reas
 | 项 | 第一版做法 |
 |---|---|
 | 分页 | keyset（`WHERE (started_at, id) < (?, ?)`），照 `listSessions` 的现成形状 |
-| 筛选索引 | `(template_id, started_at)` / `(state, started_at)` / `(user_id, started_at)` |
+| 筛选索引 | `(template_id, started_at)` / `(status, started_at)` / `(user_id, started_at)` |
 | 导出 | ❌ 不做（会绕开权限面） |
 | 保留 | 同 `audit_log` 不删，但默认只查近 7 天 |
 

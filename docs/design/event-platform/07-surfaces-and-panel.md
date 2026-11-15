@@ -299,12 +299,20 @@ macro_assignments
   UNIQUE (template_id, user_id, session_id)
 
 macro_runs          ← 每次触发的账（可见面靠它）
-  id · assignment_id · anchor(object_key) · state · bucket
-  verdict · skipped_reason · started_at · finished_at
+  id · assignment_id · anchor(object_key)
+  criterion · bucket          ← 幂等键的两段（见下）
+  status                      ← 生命周期，**不进幂等键**
+  verdict · verdict_raw · reason · remediation_text
+  skipped_reason · started_at · finished_at
   child_session_id(nullable) · child_run_id(nullable)
-  UNIQUE (assignment_id, anchor, state, bucket)     ← 幂等（唯一执行点）
+  depth · parent_macro_run_id(nullable)
+  snapshot_id(nullable) · worktree_path(nullable)
+  UNIQUE (assignment_id, anchor, criterion, bucket)   ← 幂等（唯一执行点）
 
-state 取值：pending / running / done / skipped / failed / superseded
+status（生命周期）：pending / running / done / skipped / failed / superseded
+criterion（哪条判据产生的这次触发）：
+  terminal（E1 终态）/ silent（E1 静默）/ tick（E5 时钟）/
+  mechanical（M9 机械前置）/ semantic（M9 语义审查）
 skipped_reason：budget_exhausted / quiet_hours / human_present /
                 run_in_progress / deferred / deferred_timeout /
                 active_run_in_cwd / cancelled_by_user
@@ -316,10 +324,20 @@ macro_assignments   id · template_id · user_id · session_id(nullable) · cwd(
 ⚠ `macro_runs` 的 `UNIQUE` 是**幂等的唯一执行点**。没有它，
 状态型模板会每分钟发一次，回灌型模板会无限循环。
 
-⚠ **幂等键只有这一套**（`assignment_id, anchor, state, bucket`）。
-[08](08-watch-and-review.md) §10 的 `(assignment_id, anchor, 判据)` 是**同一个键在 M9 上的特化**：
-M9 的 `state` = 判据名（`mechanical` / `semantic`）、`bucket` = 触发 run id。
-**不并存两套约束。**
+### ⚠ `status` 与 `criterion` 必须是两列（2026-11-16 修，审计 blocker）
+
+初稿把两者合成一列 `state`，并用它做幂等键 —— **那是错的**：
+
+| | 用途 | 会变吗 |
+|---|---|---|
+| `status` | 生命周期（pending → running → done） | **会变** |
+| `criterion` | 哪条判据产生的这次触发 | 不变 |
+
+把 `status` 放进唯一键 ⇒ 一条记录从 `pending` 走到 `done` 之后唯一键就变了
+⇒ **同一触发可以被再次 claim，幂等直接失效**。
+
+⇒ 幂等键 = `(assignment_id, anchor, criterion, bucket)`，**不含 `status`**。
+`bucket` 的含义：状态型事件的分档/日期桶；M9 上是触发它的 run id。
 
 ---
 

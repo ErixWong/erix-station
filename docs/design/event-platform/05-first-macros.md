@@ -220,7 +220,7 @@ M7 是它的通用骨架。第一版先证骨架；日报降级成 M7 的一个*
     title       "[{{anchor}}] 已 {{evidence}} 没有反馈"
     body        "最后一条事件是 {{state}}；已静默 {{evidence}}\n\n{{url}}"
   criteria      （空）
-  budget        每个 (订阅, run, state) 只发一次
+  budget        每个 (订阅, run, criterion) 只发一次
   notify_on_failure true
 ```
 
@@ -236,7 +236,7 @@ M7 是它的通用骨架。第一版先证骨架；日报降级成 M7 的一个*
 判据：**改它会改变「世界是什么状态」⇒ 平台定；只改变「什么时候叫我」⇒ 宏参数。**
 ⚠ 两者都不进用户订阅（[11](06-execution-and-recovery.md) §9）：用户只能开/关。
 
-⚠ **幂等键必须含订阅**：`(订阅, anchor, state)`。若只写 `(macro, anchor, state)`，
+⚠ **幂等键必须含订阅**：`(订阅, anchor, criterion, bucket)`。若只写 `(macro, anchor, criterion, bucket)`，
 同一 run 上两个不同阈值的订阅会互相吞（先到的那个占住键，后到的永远不发）。
 这也是它与其他宏不同的一点：**状态型 + 参数化阈值的宏，幂等粒度是订阅，不是宏**。
 
@@ -440,7 +440,7 @@ run 必须挂在 session 上（`runs.session_id NOT NULL`），所以「文件 +
 | # | 要新写什么 | 量级 |
 |---|---|---|
 | 1 | **评估循环**：每 N 秒求值一次所有 `level` 谓词（静默 + 定时） | 小 |
-| 2 | **宏表 + 执行器 + 幂等**：键 = `(macro, anchor, state, bucket)` | 中 |
+| 2 | **宏表 + 执行器 + 幂等**：键 = `(macro, anchor, criterion, bucket)` | 中 |
 | 3 | **通知落地**：A5 需要一个 UI 落点；A4 需要一条「通知用」邮件模板路径 | 中 |
 | 4 | **可见面**：「今天为什么没触发」 | 小但**最容易被砍、最不能砍** |
 
