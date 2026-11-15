@@ -1348,7 +1348,7 @@ station-portal user enable  --login <login>
 
 | # | 条件 | 为什么 |
 |---|---|---|
-| 1 | 该 run 出现在**本次响应窗口**里（窗口行的 `run_id` 去重） | 窗口里没这个 run ⇒ 连候选判定查询都不发 |
+| 1 | 该 run 是**本页的候选**：窗口白名单行里出现过它的 `run_id`，**或**本页 seq 窗口内有它的 `run_end` 行（issue #514：「`queued` 从未开始就被取消」的 run 只写一行 `run_end`，在白名单行里零影子 ⇒ 旧判据下它既拿不到正文项也拿不到占位项） | 两路都没命中 ⇒ 连候选判定查询都不发（零候选零额外查询，成本红线不变） |
 | 2 | `runs.status IN ('finished','failed')` **且**该 run **零助手锚点**（`messages` 里 `role='assistant'` 的任意行，**含 `synthetic = true`**） | `queued`/`running`/`cancelling` 不是终态——「还在跑就标已中止」是新造的误导；**有锚点的 run 绝不能再渲染一遍**（重复正文就是这个坑，也正是 `partial_text` 只在**无锚点**时才写的原因，两处判据逐字同构） |
 | 3 | 两处来源拼出**非空**文本 ⇒ 正文项；**都空** ⇒ **占位项**（`text: ''` + `placeholder: true`） | 占位是 #278「不许留空白」的落点：这次 run 一个字都没留住时，界面仍要有一行中性提示，而不是空气泡。**注意占位只在这里发**，SSE 补发通路**不发**占位帧 |
 
@@ -1389,7 +1389,7 @@ station-portal user enable  --login <login>
   （走既有 `run_events_run_idx (run_id, seq)`）拿完两处来源。**零 DDL、零新索引**（形态 M 明确不新增
   也不删除任何索引，理由见 `docs/maintenance/task-ledger.md` §8.125）。
 - **分页（形态 M 修的第四条审计）**：合成项**只在它 `seq` 所属的那一页出现**——`before` 已经切过它的
-  `seq` 就不给（`buildHistorySynthItems(pool, rows, { before })`）。它 `seq = MAX(seq)` 不受窗口约束，
+  `seq` 就不给（`buildHistorySynthItems(pool, rows, { before, sessionId, pageLow, limit })`）。它 `seq = MAX(seq)` 不受窗口约束，
   不加这道闸就是「往上翻一页，同一段正文再重演一遍」。同一条闸同时管 `run_termination`（§4.4a-2），
   两类合成项共用。
 - **排序 / limit**：合成项参与升序排序（按 `seq`），但**不占 `limit`、不参与 `next_cursor` / `hasOlder` 判定**
@@ -1449,10 +1449,16 @@ station-portal user enable  --login <login>
 run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在本**只读**端点里从 `runs` 的终态字段
 （`status` + `termination`）**投影**一条展示项。
 
-**存在性判据（三条同时成立，一条 run 至多一条）**：① 该 run 出现在**本次响应窗口**里；
+**存在性判据（三条同时成立，一条 run 至多一条）**：① 该 run 是**本页的候选**——它出现在本次响应窗口的
+**白名单行**里，**或**本页 seq 窗口 `[本页最小 seq, before)` 内有它的 `run_end` 行（issue #514 补的：
+「`queued` 从未开始就被取消」的 run 只写一行 `run_end`，在白名单行里**零影子**）；
 ② `runs.status IN ('finished','failed')`（`queued`/`running`/`cancelling` 一律不合成——「还在跑就标已中止」
 是新造的误导）；③ `termination.reason` 是**非空字符串**（缺 `termination` / 脏载荷 ⇒ 不合成：**绝不拿
 `status` 编一个 reason**）。
+
+⚠ ① 的两路**都只用来发现 run id**：白名单行照旧下发，而 `run_end` 行照旧**永不下发**（红线）——
+把 `run_end` 塞进 `HISTORY_EVENT_TYPES` / 前端 `HISTORY_REPLAY_TYPES` 就是把一条运行态语义事件喂给
+回放（它会关停止按钮 / 驱动终态状态机，#217 / #236 定的红线）。
 
 | 字段 | 类型 | 口径 |
 |---|---|---|
@@ -1471,8 +1477,13 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 - **幂等**：前端用 `renderedIds` 的 `termination:<run_id>` 去重；实时 `run_end` 渲染后立即登记同一个
   id ⇒ 同一视图里「实时一条 + 历史一条」不会发生；硬刷新后 `renderedIds` 重建 ⇒ 历史项正常渲染。
 - **成本**：与 §4.4a-1 **共用同一条** `runs` 查询（`r.id = ANY(...)` + 终态过滤 + `MAX(seq)` 相关子查询，
-  走既有 `run_events_run_idx`）⇒ 本次窗口没有 run 时**一条查询都不发**，有 run 时**也只有那一条**（不重查）。
+  走既有 `run_events_run_idx`）⇒ 本次窗口没有 run **且页内没有 `run_end` 行**时一条 `runs` 查询都不发，
+  有候选时**也只有那一条**（不重查）。issue #514 新增一条**候选发现**查询（`SELECT run_id FROM run_events
+  WHERE session_id=$ AND type='run_end' AND seq >= <本页最小 seq> [AND seq < before] ORDER BY seq DESC
+  LIMIT <limit>`）：每次响应**至多一条**，走既有 `UNIQUE (session_id, seq)` 倒序扫，扫描区间被页边界
+  夹住（`run_events_run_end_key` 保证每 run 至多一行 ⇒ 候选数天然有界）。
 - **已接受边界**：① 只覆盖「该 run 真落在本次响应窗口里」的那一页（同 §4.4a-1 的窗口口径）；
+  候选发现的页数上界 = `limit`（极端会话「一整页都是被取消的 run」时，一页最多带出 `limit` 条分隔条）；
   ② 合成项**不带 `usage`**（实时 `run_end` 的 `· tokens a+b` 后缀在历史里不重建——与 #282「刷新后运行态数字
   拿不回来」同一口径，不拿历史值假装实时）。
 
