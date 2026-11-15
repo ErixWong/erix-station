@@ -2755,7 +2755,7 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
 |---|---|
 | `maxFileBytes` | **当前生效值**（= 下一次上传用的那个数），不是「上次保存回显的那个数」|
 | `source` | 来源：`db` / `env` / `default` —— 「现在到底听谁的」不许靠猜，UI 必须显示 |
-| `reason` | `source ≠ db` 的原因：`null`（DB 生效）/ `no_row`（未配置）/ `invalid_db_value`（有行但值不可用）/ `read_failed`（表缺失或 DB 抖动）|
+| `reason` | `source ≠ db` 的原因：`null`（DB 生效）/ `no_row`（未配置）/ `invalid_db_value`（有行但值不可用）/ `read_failed`（表缺失或 DB 抛错）/ `read_timeout`（查询发出去但 `UPLOAD_SETTINGS_READ_TIMEOUT_MS` 内没回；行为与 `read_failed` 同：回落、不 500、不挡上传）|
 | `dbMaxFileBytes` | DB 里那个**可用**值（不可用 / 无行 ⇒ `null`）|
 | `envMaxFileBytes` / `envIsExplicit` | env 那一档的值，以及「env 里是否真的显式写了 `FILE_UPLOAD_MAX_BYTES`」（给了但非法 ⇒ `false`）|
 | `limits` | 写侧允许的区间（UI 可拿它做前置提示，但**服务端才是闸**）|
@@ -2786,6 +2786,7 @@ Content-Type: application/json
 | DB（迁移 `0035`）| 物理荒谬 | `CHECK (max_file_bytes > 0)` + `CHECK (id = 1)`（单行是 DB 事实）+ `bigint`（`int` 只到 2 GiB）|
 | JS 写侧（§4.15-2）| 产品区间 1 MiB–1 GiB | 400 `validation_failed`，**当场红** |
 | JS 读侧（§4.14 的 `POST /api/files/upload`）| 任何不可用的行 | **回落 env → 默认** + 一条点名 `upload_settings.max_file_bytes` 与 `FILE_UPLOAD_MAX_BYTES` 的 warn；**永不 500** |
+| JS 读侧的**超时**（复 audit 活一）| 「查询发出去而**不返回**」 | `catch` 抓不到这种情况（不抛错就永远进不了 catch），所以读取外面套 `UPLOAD_SETTINGS_READ_TIMEOUT_MS`（默认 1500ms）：到点 = 读不到 ⇒ 同上回落、`reason=read_timeout`、**只留 debug 不刷 warn**、**上传照常**。没有这一层，「读侧永不抛」是假的——一次卡住的 DB 会把每次上传挂住 |
 
 两个细节值得单独记：
 - **产品区间故意没写进 DB CHECK**。否则「手工把 `max_file_bytes` 改成一个非法值 ⇒ 上传回落而不是 500」
@@ -2804,10 +2805,19 @@ Content-Type: application/json
   （portal 服务没有 `env_file`）。但它的角色变了：它设的是**兜底值**，不再是「改了就生效」的旋钮。
 - 审计：每次保存写一条 `admin.upload_settings_updated`（`target='upload_settings'`，
   `details={max_file_bytes, previous_max_bytes, previous_source}`）—— 只记新值看不出「谁把谁改下来的」。
+- ⚠ **审计与保存在同一条 SQL 语句里**（复 audit 活二，`upload-settings.js` 的 `SAVE_SQL`：一条带 CTE 的
+  `WITH prev … upd … aud …`）。旧实现是「`SELECT` 旧值 → `UPSERT` → `await auth.audit()`」三个 await：
+  并发保存时两条都先读到同一个旧值 ⇒ `previous_*` 记的是**自己进来之前**的数（审计就白记了）；
+  审计 `INSERT` 失败 ⇒ **设置已生效而审计一行没有**。一条语句把两个窗口一起收掉：语句级原子
+  （审计写不进去 ⇒ 设置也没改），旧值取的是本语句快照并带 `FOR UPDATE` 行锁。调用方**不得**再补一笔
+  `auth.audit`（会退回两个窗口并多写一条）。判据：`upload-settings.test.js` US-18/19/20/21。
+- 「DB 旧值是否可用」的判定在 SQL 里只做**区间比较**，两个边界由 JS 常量当**参数**送进去（`$5/$6`）⇒
+  区间常量仍然只有 `MIN/MAX_MAX_FILE_BYTES` 一处；SQL 那份 CASE 与 JS `parseDbMaxFileBytes` 的等价性
+  由 US-20 逐值钉住（不是靠注释声明）。
 - 上限仍是**单文件**，不是总量。**片 B（每 FDE 目录总量上限）不在本节**：那是 ext4 project quota，
   判据是「容器里 `dd` 也要失败」。上传前 `du` 一遍目录当闸门是**假闸门**（拦住人、放过 agent），本单明确没做。
 
-> 实现：`portal/src/upload-settings.js`（读侧 + 写侧 + 优先级）、`portal/src/http.js`（两个端点与审计、
+> 实现：`portal/src/upload-settings.js`（读侧 + 写侧 + 优先级 + 读超时 + 保存与审计的同一条 CTE）、`portal/src/http.js`（两个端点、
 > 上传端点的现读接入）、`portal/src/config.js`（`fileUploadMaxBytesSource`）、
 > `deploy/migrations/0035-upload-settings.sql`。
 > 单测：`portal/test/upload-settings.test.js`、`portal/test/migrations.test.js`（0035 那一段）。

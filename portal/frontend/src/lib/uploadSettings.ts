@@ -34,7 +34,9 @@ export interface UploadSettings {
   maxFileBytes: number | null;
   /** 生效值的来源；认不出来 ⇒ `null`（不是 `'default'`——那是在编一个来源）。 */
   source: UploadLimitSource | null;
-  /** `source ≠ db` 的原因（`no_row` / `invalid_db_value` / `read_failed`）；DB 生效时是 `null`。 */
+  /** `source ≠ db` 的原因（`no_row` / `invalid_db_value` / `read_failed` / `read_timeout`）；DB 生效时是 `null`。
+   *  ⚠ 这个联合是**后端加的**（复 audit 活一给读取加了超时）：视图必须为每个值给一句话，
+   *  新增 reason 若没有 case 就会掉进 default ⇒ 原因整条不显示。 */
   reason: string | null;
   dbMaxFileBytes: number | null;
   envMaxFileBytes: number | null;

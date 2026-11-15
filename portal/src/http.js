@@ -1559,18 +1559,10 @@ async function handleAdminApi(req, res, ctx, url) {
         actorId: session.user.id,
         fields: body,
       });
-      // 平台级操作 ⇒ 进审计（照 `admin.mail_settings_updated` 的形状）：旧值/旧来源一起记，
-      // 否则事后只能看到「现在是 1 MiB」而看不出「谁把它从 32 MiB 改下来的」。
-      await auth.audit(ctx.pool, {
-        actorId: session.user.id,
-        action: 'admin.upload_settings_updated',
-        target: 'upload_settings',
-        details: {
-          max_file_bytes: result.settings.maxFileBytes,
-          previous_max_bytes: result.previous.maxFileBytes,
-          previous_source: result.previous.source,
-        },
-      });
+      // 审计**不在这里**写（复 audit 活二）：`admin.upload_settings_updated` 已经和 upsert 挤进同一条 CTE 语句
+      //（`upload-settings.js` 的 `SAVE_SQL`）。原来这里是「upsert 已成 → 再 await 一笔 INSERT」：
+      // INSERT 失败就是「设置已生效而审计一行没有」，并发保存还会把 `previous_*` 记成自己进来之前的数。
+      // 再补一笔 `auth.audit` 会退回那两个窗口，并且多写一条审计行（`upload-settings.test.js` US-18 钉这一点）。
       return sendJson(res, 200, result.settings);
     }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');

@@ -2,6 +2,7 @@
 //
 // 两层：
 //   * **模块层**（优先级/解析/校验/回落）—— 纯函数与假 pool，判据是「哪个值生效、为什么」。
+//   * **复 audit 返修**（§4）—— 判据是「那次读取不返回时上传还过不过」+「设置与审计同生共死」，见本节头。
 //   * **HTTP 层**（`POST /api/files/upload` + `GET|PUT /api/admin/upload/settings`）—— 判据是工单原文：
 //     「管理台把上限改成 1 MiB ⇒ **不重启**，下一次上传 2 MiB 就 413」+「`413` 的 `details.max_bytes`
 //     必须等于**生效值**（不是 env 值）」。
@@ -21,6 +22,7 @@ import {
   DEFAULT_MAX_FILE_BYTES, MIN_MAX_FILE_BYTES, MAX_MAX_FILE_BYTES,
   parseDbMaxFileBytes, resolveFromRow, resolveEffectiveMaxFileBytes,
   getUploadSettings, updateUploadSettings, UploadSettingsError,
+  readTimeoutMs, DEFAULT_READ_TIMEOUT_MS, READ_TIMEOUT_ENV_VAR, AUDIT_ACTION, AUDIT_TARGET,
 } from '../src/upload-settings.js';
 
 const MIB = 1024 * 1024;
@@ -452,4 +454,197 @@ test('US-14 loadConfig：FILE_UPLOAD_MAX_BYTES 的来源标注（给了但非法
   }
   // 显式写了「恰好等于默认值」：来源是 env（运维确实设了它，管理台要如实显示）。
   assert.equal(loadConfig({ ...base, FILE_UPLOAD_MAX_BYTES: '33554432' }).fileUploadMaxBytesSource, 'env');
+});
+
+// ---------------------------------------------------------------------------
+// 4. 复 audit 返修（2026-11-17）：活一 = 那次读取必须有超时；活二 = 保存与审计必须同生共死
+// ---------------------------------------------------------------------------
+//
+// 两条都是「现在能工作，但故障形状没被挡住」：
+//   * 活一：`readRow()` 只 `catch` 抛错。查询**发出去而不返回**（连接挂住、服务端不答）永远进不了 catch，
+//     而这一次读取是**每次上传**都发的（无缓存是片 A 的取舍；前端逐文件上传 ⇒ N 文件 N 次读）。
+//     #520 刚为降 DB 负载做了一整单，这条路径挂住 = 上传挂住。
+//   * 活二：`SELECT 旧值 → UPSERT → await auth.audit()` 三个 await 之间谁都能插进来：并发保存把
+//     `previous_*` 记成自己进来之前的数；审计 INSERT 失败则**设置已生效而审计一行没有**。
+
+const READ_TIMEOUT_KNOB = READ_TIMEOUT_ENV_VAR;
+
+/** 只在**这些用例**里改全局旋钮（顶层用例默认串行 ⇒ 不会互相踩）。用完必删，别把 50ms 留给后面的用例。 */
+async function withKnob(raw, fn) {
+  if (raw === undefined) delete process.env[READ_TIMEOUT_KNOB];
+  else process.env[READ_TIMEOUT_KNOB] = String(raw);
+  try {
+    return await fn();
+  } finally {
+    delete process.env[READ_TIMEOUT_KNOB];
+  }
+}
+
+/** 一条**永不 settle**的读语句（不是抛错！抛错那条路径 US-5 已经钉过了）。 */
+const HANGING_READ_POOL = { query: () => new Promise(() => {}) };
+
+test('US-15【活一】查询不返回（永不 settle、不抛错）也必须按时给答案：read_timeout + 回落 env + 不刷 warn',
+  { timeout: 10_000 }, async () => {
+    const warns = [];
+    const debugs = [];
+    const log = { warn: (...a) => warns.push(a.join(' ')), debug: (...a) => debugs.push(a.join(' ')) };
+    const t0 = Date.now();
+    const resolved = await withKnob(50, () => resolveEffectiveMaxFileBytes({ pool: HANGING_READ_POOL, config: ENV32, log }));
+    const waited = Date.now() - t0;
+    assert.ok(waited < 3_000, `到点必须自己给答案（实测等 ${waited}ms ⇒ 变异「去掉超时」在这里就是整条用例挂死）`);
+    assert.deepEqual(
+      { v: resolved.maxBytes, s: resolved.source, r: resolved.reason },
+      { v: DEFAULT_MAX_FILE_BYTES, s: 'env', r: 'read_timeout' },
+      '超时 = 读不到：回落 env，reason 必须是 read_timeout（不是 read_failed，也不是 no_row）',
+    );
+    assert.deepEqual(warns, [], '超时是这条路径的常态兜底 ⇒ 不许 warn（一个慢 DB 会把日志刷满，#520 同族）');
+    assert.equal(debugs.length, 1, '留一条 debug（值班要能看出这是超时，不是没配）');
+    assert.match(debugs[0], /未返回/);
+    assert.match(debugs[0], /FILE_UPLOAD_MAX_BYTES/);
+
+    // 管理台那一页同理：超时也是 DTO，不许 500/白屏（与 `read_failed` 同口径）。
+    const dto = await withKnob(50, () => getUploadSettings({ pool: HANGING_READ_POOL, config: ENV32, log }));
+    assert.equal(dto.reason, 'read_timeout');
+    assert.equal(dto.maxFileBytes, DEFAULT_MAX_FILE_BYTES);
+    assert.equal(dto.source, 'env');
+  });
+
+test('US-16【活一】UPLOAD_SETTINGS_READ_TIMEOUT_MS 只认正整数；非法形状 ⇒ 默认 1500 并 warn 点名旋钮；旋钮必须已登记', () => {
+  const warns = [];
+  const log = { warn: (...a) => warns.push(a.join(' ')) };
+  assert.equal(readTimeoutMs({ env: {}, log }), DEFAULT_READ_TIMEOUT_MS, '未设 ⇒ 默认');
+  assert.equal(readTimeoutMs({ env: { [READ_TIMEOUT_KNOB]: '250' }, log }), 250, '正整数 ⇒ 采纳');
+  assert.equal(warns.length, 0, '合法值不该有 warn');
+  for (const raw of ['0', '-1', 'abc', '   ', '1.5', 'Infinity', 'NaN']) {
+    const w0 = warns.length;
+    assert.equal(readTimeoutMs({ env: { [READ_TIMEOUT_KNOB]: raw }, log }), DEFAULT_READ_TIMEOUT_MS,
+      `${raw}：不是正整数 ⇒ 必须用默认，不许把上传超时设成 0 或 NaN`);
+    assert.equal(warns.length, w0 + 1, `${raw}：静默换默认值不行，要 warn`);
+    assert.match(warns[warns.length - 1], new RegExp(READ_TIMEOUT_KNOB), 'warn 点名旋钮');
+  }
+  assert.equal(readTimeoutMs({ env: { [READ_TIMEOUT_KNOB]: '' }, log }), DEFAULT_READ_TIMEOUT_MS,
+    'compose 里 `K=${K:-}` 会给空串 ⇒ 当未设处理');
+  assert.ok(DEFAULT_READ_TIMEOUT_MS > 0 && DEFAULT_READ_TIMEOUT_MS <= 5_000,
+    '默认值必须「远大于一次单行主键查、远小于一次可接受的上传等待」');
+
+  // 两头说法：代码里有旋钮，env 文档与 .env.example 必须点名（只在代码里加的旋钮运维找不到）。
+  const envDoc = fs.readFileSync(new URL('../../docs/env.md', import.meta.url), 'utf8');
+  assert.match(envDoc, new RegExp(READ_TIMEOUT_KNOB), 'docs/env.md 必须登记这个旋钮');
+  assert.match(envDoc, /read_timeout/, 'env 文档要说清超时的表现（reason=read_timeout，不挡上传）');
+  const example = fs.readFileSync(new URL('../../deploy/.env.example', import.meta.url), 'utf8');
+  assert.match(example, new RegExp(READ_TIMEOUT_KNOB), 'deploy/.env.example 必须登记这个旋钮');
+});
+
+/** 把「读 `upload_settings` 的那条 SELECT」换成永不 settle（写语句与其余语句照常走 fake）。 */
+function hangUploadSettingsReads(pool) {
+  const orig = pool.query.bind(pool);
+  pool.query = (sql, params) => {
+    if (/FROM upload_settings/.test(sql) && !sql.includes('INSERT INTO upload_settings')) {
+      // 语句流水照记：不然「确实去读过、只是没回」与「压根没读」在判据里分不开。
+      pool.statements.push({ sql, params });
+      return new Promise(() => {});
+    }
+    return orig(sql, params);
+  };
+}
+
+test('US-17【活一·工单口径】DB 卡住（读取不返回）时上传**不许被挡住**：仍按 env 值 201，管理台 GET 也是 200',
+  { timeout: 20_000 }, async () => {
+    const s = await startStack();
+    try {
+      hangUploadSettingsReads(s.pool);
+      s.pool.uploadSettings = { max_file_bytes: MIN_MAX_FILE_BYTES, updated_at: new Date(), updated_by: null };
+      // DB 里其实是 1 MiB；读不到 ⇒ 回落 env 的 32 MiB ⇒ 2 MiB 该过（「读不到不许挡住上传」）。
+      const t0 = Date.now();
+      const res = await readResp(await upload({ s, name: 'hang.bin', bytes: 2 * MIB }));
+      const waited = Date.now() - t0;
+      assert.equal(res.status, 201, `DB 卡住时上传必须照常（回落 env 32 MiB）；实际 ${res.status} ${res.text}`);
+      assert.ok(waited < 5_000, `答复时间由超时决定（实测 ${waited}ms ⇒ 没有超时就是整条请求挂死）`);
+      assert.ok(uploadSettingsStatements(s.pool).length >= 1, '确实试过读 DB（不是压根没读）');
+
+      const got = await readResp(await adminFetch(s));
+      assert.equal(got.status, 200, `管理台 GET 不许 500；实际 ${got.status} ${got.text}`);
+      assert.equal(got.json.reason, 'read_timeout');
+      assert.equal(got.json.maxFileBytes, DEFAULT_MAX_FILE_BYTES);
+    } finally {
+      await s.close();
+    }
+  });
+
+test('US-18【活二】保存只发**一条**语句，且那条语句同时写 upload_settings 与 audit_log（旧值也在这条里取）', async () => {
+  const pool = new FakePool();
+  pool.uploadSettings = { max_file_bytes: 8 * MIB, updated_at: new Date(), updated_by: null };
+  await updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 2 * MIB } });
+  const touched = pool.statements.filter((r) => /upload_settings|audit_log/.test(r.sql));
+  assert.equal(touched.length, 1,
+    `保存必须是**一条**语句（读旧值 + upsert + 审计）；实际发了 ${touched.length} 条：`
+    + touched.map((r) => r.sql.replace(/\s+/g, ' ').slice(0, 60)).join(' | '));
+  const sql = touched[0].sql;
+  assert.match(sql, /INSERT INTO upload_settings/, '这条要写设置');
+  assert.match(sql, /INSERT INTO audit_log/, '同一条要写审计（分开两个 await 就是活二那个洞）');
+  assert.match(sql, /\bWITH\s+prev\b/i, '旧值必须在同一条语句里取（另发一条 SELECT 就是可插队的窗口）');
+  assert.equal(pool.audit.length, 1, '一次保存恰好一条审计（调用方再补一笔 auth.audit 就是重复记账）');
+});
+
+test('US-19【活二】并发两次保存：每条审计的 previous 是**紧邻的前一个值**，不是自己进来之前的那个数', async () => {
+  const pool = new FakePool();
+  pool.uploadSettings = { max_file_bytes: 8 * MIB, updated_at: new Date(), updated_by: null };
+  await Promise.all([
+    updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 2 * MIB } }),
+    updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 4 * MIB } }),
+  ]);
+  const auditPrev = pool.audit.map((a) => JSON.parse(a.details).previous_max_bytes).sort((x, y) => x - y);
+  // 一条语句 ⇒ 第二条看到的是第一条写完的值：{8 MiB, 2 MiB} 两个**不同**的旧值。
+  // 旧的「先 SELECT 再 UPSERT」⇒ 两条都先读到 8 MiB ⇒ {8 MiB, 8 MiB} ⇒ 本条红（变异读数见交付报告）。
+  assert.deepEqual(auditPrev, [2 * MIB, 8 * MIB],
+    '两条审计必须串成一条链（8→2→4）。两条都记 8 MiB 就是"看不出谁把谁改成谁"');
+  assert.equal(pool.uploadSettings.max_file_bytes, 4 * MIB, '最后写入的值必须是终值');
+});
+
+test('US-20【活二】审计里 previous_* 与接口返回的 previous **逐值等价**（SQL 那份 CASE 不许自成一套）', async () => {
+  const cases = [
+    ['DB 里是合法值（8 MiB）', { max_file_bytes: 8 * MIB, updated_at: new Date(), updated_by: null }, 'db', 8 * MIB],
+    ['DB 里没有行（回落 env）', null, 'env', DEFAULT_MAX_FILE_BYTES],
+    // 区间外的行（8 TiB）：SQL 的 `BETWEEN $5 AND $6` 与 JS 的 parseDbMaxFileBytes 必须判成同一件事。
+    ['DB 里是区间外的值', { max_file_bytes: 8 * 1024 * MIB, updated_at: new Date(), updated_by: null }, 'env', DEFAULT_MAX_FILE_BYTES],
+  ];
+  for (const [label, seed, wantSource, wantBytes] of cases) {
+    const pool = new FakePool();
+    pool.uploadSettings = seed;
+    const before = pool.audit.length;
+    const res = await updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 2 * MIB } });
+    const details = JSON.parse(pool.audit[before].details);
+    assert.deepEqual(
+      { prev: res.previous.maxFileBytes, src: res.previous.source },
+      { prev: details.previous_max_bytes, src: details.previous_source },
+      `${label}：接口说的 previous 与审计记的 previous 必须是同一个数/同一个来源`,
+    );
+    assert.deepEqual(
+      { prev: details.previous_max_bytes, src: details.previous_source },
+      { prev: wantBytes, src: wantSource },
+      `${label}：审计里的 previous 必须是当时真正在用的那个值`,
+    );
+    assert.equal(details.max_file_bytes, 2 * MIB, `${label}：新值就是落库值`);
+    assert.equal(pool.audit[before].action, AUDIT_ACTION);
+    assert.equal(pool.audit[before].target, AUDIT_TARGET);
+  }
+});
+
+test('US-21【活二】审计写不进去 ⇒ 整条保存失败且**设置一格没变**（设置生效而无审计是不可接受的形态）', async () => {
+  const pool = new FakePool();
+  pool.uploadSettings = { max_file_bytes: 8 * MIB, updated_at: new Date(), updated_by: null };
+  pool.failAudit = true;
+  const err = await updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 2 * MIB } })
+    .then(() => null, (e) => e);
+  assert.ok(err, '审计写失败必须把错误招出来，不许静默 200');
+  assert.equal(pool.uploadSettings.max_file_bytes, 8 * MIB,
+    '设置必须**没改**：改成「设置已生效而审计一行没有」就是活二（两步写法在这里会红）');
+  assert.equal(pool.audit.length, 0);
+
+  // 取消注入后同一份 pool 能正常保存（证明上面那次失败没把库改成半个状态）。
+  pool.failAudit = false;
+  const ok = await updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 2 * MIB } });
+  assert.equal(ok.settings.maxFileBytes, 2 * MIB);
+  assert.equal(ok.previous.maxFileBytes, 8 * MIB, '上一次失败的保存没有留下痕迹（previous 仍是 8 MiB）');
+  assert.equal(pool.audit.length, 1);
 });
