@@ -5405,3 +5405,146 @@ run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data
 
 **剩余**：空闲仍有 13.2 事务/秒来自**另外 5 个轮询器**（`run_queue` 1.5/秒、`chat_sessions` 0.9/秒、
 `port_observations` 0.7/秒、`fde_onboarding` 0.6/秒…）⇒ 开 **#520** 续作（判据：空闲 < 3 事务/秒）。
+
+### 8.127 引擎 0.32.0 → 0.33.0：四处版本线闸九度核 + replay-policy 现场从快照换成账本（issue #530 / 工单 feat-261115-08，2026-11-15，worker 落地）
+
+**本版上游只有四件事**（host 视角）：run snapshot 退役（#838 S2）、`run.replayPolicy` 默认值
+`always-replay` → `per-tool-declaration`、`folding.*` 三叶子启动期校验、其余全 additive
+（`fileWritesBlind` / `mid_sequence_request_view_stub.resumed` / `compaction.budgetUnreachable` /
+`round_end` 四键升契约）。导出面与事件面**未变**：`.` 96 / `./tools` 46 / `LoopEvent` 28 类
+（我在 0.32 与 0.33 两份 `npm pack` 解包上各取一次逐名对账：`added: []`、`removed: []`）。
+
+**前置事实**：装着的包 == npm 上的 0.33.0 发布包（`diff -rq <装着的>/src /tmp/ea33x/package/src`
+过滤 `.d.ts` 后**无输出**）⇒ 下面所有实测对发布包直接成立。
+
+**13 条稳定红，逐条归因（没有一条是生产行为回归）**：4 条 `llm-timeouts`、1 条导出面快照、
+1 条 termination tripwire、1 条 #440-K13、5 条 #288 replay-policy、1 条 store 能力申报。
+
+**复核（worker 自己独立跑，不是抄上一版的注释）**：
+
+| 判据 | 实测 |
+|---|---|
+| `diff -rq` 两份包 `src/providers` | **整目录无输出**（比 0.32 那次更强：0.32 只做到三文件相同）⇒ 四相超时、legacy 120s 总闸、streamTotal 300s、`RETRYABLE_CODES` 逐字节同一 |
+| `diff -u` 两份包 `src/loop/termination.js` | 只有三处实体：一行注释把 `checkpoint_failed` 标为已退役、`fileWritesBlind` 加法、`answerPendingTailToolUse` 多一个参数 ⇒ **reason 值域零变化** |
+| reason 字面值集合 | 两侧**逐字相同**（九值；`persistence_failed` 定在 `orchestrator.js` 的 `fail()`）|
+| 装着的 0.33.0 上跑 typedef 抽取正则 | 仍是同一组**九值**、同一顺序；三处形状断言全部仍命中 |
+| 导出面（装着的 0.33.0，两条途径互证） | 源码解析 `.` **96** / `./tools` **46**；真运行时 `Object.keys()` 同样 96 / 46；16 个零消费者名字两个入口**都是 `[]`**（第三次量到同一结果）|
+| 顺再导出表的可达闭包 | `.` 261→265（含 16 里的 9 个，两侧同一组）、`./tools` 66→66（含 4 个）⇒ 「删的是导出表那几行，不是实现」结论不变 |
+| `CONFIG_LEAF_VALUE_RULE_PATHS` | 0.32 三条 → 0.33 六条：新增 `folding.toolResultTtl` / `folding.toolResultFoldMinTokens` / `folding.context`（后者内部校 `keepRounds`，报错点是完整路径）|
+| `folding.*` 真引擎行为 | `'6'` / `-1` / `1.5` 三叶子各自**启动期 TypeError**；`0` 与正整数过 ⇒ 值域语义与本站原口径**逐字相同**（`0` = 关掉）|
+| 0.33 契约套件能力名单 | `runSnapshot` **0 命中**，只剩 `runState` / `runStateStatus` / `rawRows` / `fastPathProbes` ⇒ 再声明它撞「不在名单里（守卫写错了能力名）」|
+| 本站能力面上每 run 的降级行 | **恰好 2 条**：`clearRecoveryRows` + `appendRecoveryRow`（与 #500 / #530 正文口径一致，**不是** `saveRunSnapshot`）|
+
+**本单最实质的一项：replay-policy 现场必须重建，且顺带查出一条比用例更重要的事实。**
+
+0.33.0 退役快照后，旧夹具「靠快照造 tool_use 已入账、tool_result 未落」的现场失效（5 条红）。
+改成按**账本**造：第 1 轮 assistant 的 `tool_use` 随轮记录入账 + `executeTool` 里 `abort()`。
+重跑时发现：**本站能力面（5 方法 store）上 `always-replay` 也不再重放了**——两个策略逐字相同。
+
+根因（源码，不是猜测）：`resume-manager.js:837-853` 的 `resumePendingTools` 只纳入
+「同批前一条已被判定完成」之后的缺失项，而那个判定读的是账本 `tool-executed` **恢复行**；
+本站没有恢复行（#500 未做），0.33 起**不再回落快照** ⇒ `resumePendingTools` 恒空 ⇒
+`orchestrator.js:5208` 那个读 `replayPolicy` 的分支根本进不去。
+
+⇒ **在 0.33.0 + 本站能力面上，`run.replayPolicy` 已无可观测效果**。#288 的保护现在来自引擎
+自己那条「无证据就不重放」（`resume-manager.js:849-851`），**不是**来自我们传的那个 flag。
+三条别读错：① 不许据此说「本站不用传了」——**值仍要显式传**，默认值属于上游且已经改过一次；
+② 不许当成 #500 已做完，恰恰相反，接了恢复行 `replayPolicy` 才重新有牙；
+③ 「反面对照」必须在**夹具**里给恢复行，否则「重放」在这套 harness 里根本不可能发生。
+
+**变异口径跟着变了**（这条比用例本身承重）：0.33 默认值已是 `per-tool-declaration`
+⇒ 老变异「删掉 worker.js 那行」与不删**等价**，**结构性失效**（不是谁把闸弄松了）。
+替代两条，都已复验：① 源码钉 `workerReplayPolicy() === 'per-tool-declaration'`（删行 ⇒ 2 条红）；
+② 行为钉（改成 `always-replay`，在带恢复行的夹具上 ⇒ 4 条红）。复验后 `git diff runner/worker.js` 为空。
+
+**三条决策（已拍板）**：**D1** 快照死代码（`store.js` 两方法 + `ipc.js` 白名单 + agentd 路由 +
+portal internal 两端点 + `run_checkpoints` 表）本单一律不动，连同清存量留给另单一次性退役；
+**D2** replay-policy 按账本重建，不引入恢复行三件套（#500 不做）；**D3** 本站
+`assertFoldingToolResultKnobs` 退役成注释（引擎 0.33 起自己校，两套校验重叠时**会错的是不生效
+的那一半**），K13 方向翻面成「引擎已在校 ⇒ 本站不得重复造」，K14 随被删函数一起删（不留空壳）。
+
+**值域没动的地方**：`checkpoint_failed` 在 0.33 已**不再产出**，但 `RETRYABLE_ERROR_CODES` 里
+那一项**保留**——重试判定是**读旧账时做的**，摘了会把历史本该重试的 run 改判不可重试
+（实测值域仍是 5 值）。同理 `docs/api/portal.md` §6.2 与 §6 表格那行**不删**，只加退役状态横幅；
+两处把它当**例子**的地方（§4.1 `error`、§4.4 run 详情）换成仍会产出的 `rate_limited`。
+
+**没改的三处（有硬约束，已逐条现验）**：`portal/src/transcript-fold.js` 与
+`transcript-fold.test.js`（#341 读侧解链闸：0.33 `message-rows.js:316` 结论仍是「`partOf` 只认
+首片」、读侧单跳 `keyToIndex.get(partOf)` 无解链 ⇒ 闸不许拆）；`runner/worker.js` 的
+`tr.erix?.durationMs ?? tr.duration`（#303 回退：0.33 `tool-fact.js:16-17` 仍写着「读侧仍承认
+顶层旧名一代，共七处」⇒ 回退不许删，#303 继续挂账，触发条件 = 旧 transcript 行被归档）；
+发版部署面（本单不含，发版走 #530 B 段）。
+
+**门禁（只看退出码）**：见本单交付正文的四条原值。
+
+**遗留 / 承重**：
+
+1. **发版红线**（本版最容易再踩）：引擎 pin 变 ⇒ `runner/package-lock.json` 变 ⇒ **FDE 镜像变**
+   ⇒ 合并后重打 tag、改 `deploy/.env` 三 pin、`docker rm -f` 全部 `fde-*` 让 reconcile 重建，
+   并在容器内现查 `build-info.json` 的 `engine_version` == **0.33.0**。「`git diff -- runner/**/*.js`
+   为空」**不代表**镜像没变（§8.90 那条坑）。
+2. **本单不含发版/部署**（#530 B 段由主 agent 做）。
+3. `persistence_capability_degraded` 每 run 仍**恰好 2 条**——这是 #500 未做的可见记账，
+   **不是**本单的回归，不许因为本单把 #500/#501 顺带关掉。
+4. `replayPolicy` 无可观测效果这件事写进了 `runner/test/replay-policy.test.js` 头注与本条台账；
+   接 #500 那天要回来重估反面对照（届时主用例也该能钉住「有证据 + unsafe ⇒ 不重放」）。
+
+### 8.128 事件驱动平台第一版开工：设计定稿（10 份）+ 6→8 张工单 + W1 落地（issue #523/#524，2026-11-15→16，主 agent）
+
+**设计定稿**：`docs/design/event-platform/` 从 8 份长到 **10 份**（PR #522 合并 `c8613a3`，
+本批新增 `08-watch-and-review` / `09-observability` / `10-implementation-contract`）。
+状态从「可研、不排期」翻成「**第一版已批准开发**」，范围明确划死：
+M1 终态通知 / M8 静默告警 / M9 完成审查 / M7 定时任务 + 可观测性；
+其余（E3 端口对账 / E4 证书 / `run-recover` / 语义源 / 工作项账本 / 外部集成）仍在可研。
+
+**三轮开工前审计**（copilot，只读、独立 worktree，全部 `gpt-6-luna` / `context=default` / `effort=xhigh`）：
+
+| 轮 | 结论 | 抓到什么 |
+|---|---|---|
+| 1（审 9 份全文） | 不能作为无歧义规格 | 13 项，含 `capacity=1` 10 处错、判决映射散四处、`reason` 只有 8 个值是错前提 |
+| 2（审差异） | 不能合 | 4 条最小集：判决契约、单一幂等键、可验证快照、真实并发保证 |
+| 3（开工前闸） | 不可以开工 | 水位线漏评会误判、模板删除毁历史、前端五项未定、**README 仍写「不排期不开发」** |
+
+**过程账（派单教训，两次同一死法）**：第一次派 `subagent` worker 做 W1，**30 分钟零提交**
+—— 它一直在取证（跑了 `timeout 900 npm test` + `npm ci` + 挖 19 处迁移断言），一次都没开始写。
+第二次改派 `erix_run`（`maxRounds=100` / `timeoutMs=3600000` / `sessionDir` 必给），
+在工单里**预先喂了三个坑**（19 处 head 断言 + `model.md` 门禁 + 迁移写法参照）、
+**禁止跑全量 `npm test` 和 `npm ci`**、**写死「前 10 分钟必须落盘」+ 每里程碑 commit** ⇒
+98 轮完成，7 个提交。
+⇒ **口径：派实现类任务，必须把「已挖到的坑」写进工单、必须禁止吃掉预算的命令、
+必须写「先落盘再完善」。只写需求不写坑，执行体会把预算全花在重新挖坑上。**
+
+**设计 bug（审计抓到的，W1 已照抄后才被发现）**：`macro_runs.state` 一列两义 ——
+既是生命周期（`pending→running→done`）又当判据（`mechanical`/`semantic`），
+而唯一键是 `(assignment_id, anchor, state, bucket)` ⇒ **状态一迁移唯一键就变 ⇒ 同一触发可被再次
+claim ⇒ 幂等直接失效**。修法：拆成 `status`（生命周期，会变）+ `criterion`（判据，不变），
+幂等键改 `(assignment_id, anchor, criterion, bucket)`（PR #534 `dcb4994`）。
+⚠ 已用 `erix_run` 的 **steer** 通道投进正在跑的 W1（`steer=offered:98/injected:1`），
+它自己补了「推到 done 后再 claim 仍返回 null」的回归用例。
+
+**工单审计（copilot）判「六单按当前文本不足以交付」**，缺的全是**跨单接口**：
+W2→W3 意图对象没定义、五组 HTTP API 只有路径没有请求响应、枚举没有单一真源、
+三处无人认领（`notifications` 回补软删 / `until` 扫描 / `origin` 列）、
+**M7 只有「看见时间」没有「执行任务」**（整块遗漏）、W4 工作量明显超一次派单。
+⇒ 新增 `10-implementation-contract.md`（PR #535 `532068d`）把这三类钉死；
+issue 侧：**#527 拆成 #537（W4a 快照与隔离）+ #538（W4b 判决与生命周期）**，
+**新增 #536（W7 M7 执行器）**，#525/#526/#528/#529 正文尾部追加契约指针。
+
+**W1 落地（PR #542 `1dfda1d`）**：迁移 `0035`（三表 + 8 索引 + 8 条后置守卫）、
+`portal/src/macros.js`（690 行）、`portal/test/macros.test.js`（458 行）、
+`migrations.test.js` 的 19 处 head 断言 34→35、`model.md` 三表条目。
+主 agent 亲跑 41/41 + 21/21 全绿，并**自己跑两个变异**（`DO NOTHING`→`DO UPDATE` ⇒ `not ok 6` 红；
+幂等键混进 `status` ⇒ `not ok 31` 红），两个变异都已还原。
+执行体三处偏离均合理并写进提交信息：索引不冗余（执行账不复制可变的 `template_id`，
+已写成回归闸）、`assignment_id` 用 `RESTRICT`（取消订阅不许抹掉审计）、
+订阅键用 `UNIQUE NULLS NOT DISTINCT`（PG16，否则 `scope='user'` 会被重复订）。
+
+**自己踩的坑（记一笔）**：写本条目时先把内容 append 到了**主工作区**的
+`docs/maintenance/task-ledger.md`，而那棵树当时在并行 session 的分支
+`feat-261115-08-engine-0.33.0` 上 —— 等于改了别人的工作区。已 `git checkout --` 回退干净，
+改到自己的 worktree 再提交。
+⇒ **口径：写任何文件前先 `git branch --show-current`，不是自己的分支就换 worktree。**
+这和 §8.113 是同一族事故，只是这次改的是文档不是代码，且被及时发现。
+
+**待办**：W1 代码审计（copilot，在跑）；W2 评估循环（`erix_run` 在跑）；
+W3–W7 按 `#523` 的顺序派。
