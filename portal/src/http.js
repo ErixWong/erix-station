@@ -564,6 +564,46 @@ export async function checkReady(pool, migrationsDir = migrate.defaultMigrations
 }
 
 /**
+ * issue #515（工单 fix-261115-11）：**「缓冲逐出活跃 run」这条降级必须对外可见**。
+ *
+ * 为什么挂在这里（而不是新开端点、不是新增鉴权面、不是事件流）：
+ *   * `run-partial-buffer` 的 `evictOne()` 在「全表都是活跃 run」时会逐掉一个**仍在流**的 run，
+ *     后果 = 该 run 终态时 `partial_text` 写歪或写不出（两种情形见 `docs/api/portal.md` §5.1 的
+ *     已接受损失条目）。它本来已经有 `stats().evictedActive` 计数与一条 `log.warn`，但**没有
+ *     任何对外读面**（portal 今天没有 `/metrics`，`grep -rn metrics portal/src` = 0 命中）⇒
+ *     只能翻日志对账，界面上只表现为「那段没了」。本函数把那半个可观测面补成整只。
+ *   * 本仓已定裁决（#515 的三选一）= **「已有 `stats()` 挂到既有 `/healthz`」+「文档显式接受」**。
+ *     **不**新增宿主诊断事件（那要动 SSE 白名单 + 前端 + 事件面契约测，另单），**不**新增端点。
+ *     ⚠ 也**不**借用 `persistence_capability_degraded` 当信号名：那个类型是**引擎发射**的
+ *     （`orchestrator.js`，见 `docs/api/portal.md` §5.3 第 20 类），portal 拿它说自己的事 = 谎报发射方。
+ *
+ * 形状红线（`portal/test/healthz-partial-buffer.test.js` 逐条钉）：
+ *   * **三个整数，没有别的**：`entries`（当前占用的槽数）/ `maxEntries`（槽位上界，缺省 32）/
+ *     `evictedActive`（累计逐出活跃 run 的次数）。**不放 run id 列表、不放 sessionId、不放正文片段**
+ *     ——健康端点的响应会被人整段贴进工单与日志，放 run id 就是往里塞用户数据（PII）。
+ *   * **`status` 字段语义一字未动**（`{ status: 'ok' }` 仍是就绪判据），**503 分支的形状也没动**
+ *     （未就绪时返回 `errorBody('migration_failed', …)`，不带本块）：容器健康检查
+ *     （`deploy/docker-compose.yml` → `node portal/src/cli.js healthcheck`）只看 `res.ok`，
+ *     不解析 body（取证见 `cli.js#healthcheck`），所以加字段对它结构性安全。
+ *   * **观测块不得把健康端点打挂**：`stats()` 抛异常 ⇒ 整块缺席，`status: 'ok'` 照旧 200。
+ *     一个观测用的附加块不该让 readiness 链（`docs/design/deploy-contract.md` §8）翻成 500。
+ *
+ * @param {{stats?: () => object}} [buffer] 注入点（默认进程内单例；测试可塞自定义缓冲实例）
+ * @returns {{entries:number,maxEntries:number,evictedActive:number}|null} 取不到 ⇒ `null`（调用方省略该键）
+ */
+export function partialBufferHealth(buffer = partialOutputs) {
+  try {
+    const s = typeof buffer?.stats === 'function' ? buffer.stats() : null;
+    if (!s) return null;
+    // `stats()` 的键名是缓冲自己的口径（`size`），到对外契约这一层叫 `entries`：
+    // 映射写在这里=只有一处翻译，不把内部键名泄成对外契约的一部分。
+    return { entries: s.size, maxEntries: s.maxEntries, evictedActive: s.evictedActive };
+  } catch {
+    return null; // 观测面不承重（判据见上面的「观测块不得把健康端点打挂」）
+  }
+}
+
+/**
  * @param {{pool: object, config: object, log?: Console, docker?: object, llmGateway?: object,
  *          mailerProvider?: object, tlsConnect?: Function, tlsRoutePath?: string}} opts
  *   `tlsConnect` / `tlsRoutePath` 仅供测试注入（#456 的真机校验探针）：前者换掉 `tls.connect`，
@@ -818,7 +858,13 @@ async function route(req, res, ctx) {
       throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     }
     const ok = await checkReady(ctx.pool);
-    if (ok) return sendJson(res, 200, { status: 'ok' });
+    // #515：就绪响应多带一块 `partialBuffer` 观测数字（**additive**，`status` 语义不变、503 形状不变、
+    // 不新增端点与鉴权面）。为什么必须有：缓冲逐出活跃 run 只表现为「那段正文没了」，此前对外
+    // 零读数（无 `/metrics`）⇒ 只有 `log.warn` 可对账。形状与红线见 `partialBufferHealth` 的注释。
+    if (ok) {
+      const pb = partialBufferHealth();
+      return sendJson(res, 200, pb ? { status: 'ok', partialBuffer: pb } : { status: 'ok' });
+    }
     return sendJson(res, 503, errorBody('migration_failed', 'not ready'));
   }
 
