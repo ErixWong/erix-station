@@ -4,7 +4,10 @@
 //   ② 红是日常态 ⇒ 不用 ⚠、不给告警底色、文案不说"错误/失败"；
 //   ③ ⚪ 不得显绿（**包括旧后端把 partial 的绿漏过来时**）；
 //   ④ 平台零 git 写 ⇒ 动作只预填（emit prefill），组件既不发请求也不碰发送。
+//     事件契约的**观测方式**见下方 `mountBadgeHost`（issue #496：没有用 emitted()，它靠 devtools hook、
+//     `NODE_ENV=production` 下恒空 ⇒ 就是那条环境地板），产品代码的事件契约未动。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { defineComponent, h, reactive } from 'vue';
 import { mount } from '@vue/test-utils';
 import GitLightBadge from './GitLightBadge.vue';
 import { i18n, setLocale } from '../i18n';
@@ -26,6 +29,38 @@ function payloadOf(over: Partial<GitLightPayload> = {}): GitLightPayload {
 
 function mountBadge(props: Record<string, unknown> = {}) {
   return mount(GitLightBadge, { props, global: { plugins: [i18n] } });
+}
+
+/**
+ * **事件契约的观测方式**（issue #496）：不用 test-utils 的 `emitted()`，改用「父级回调 + DOM 复述」。
+ *
+ * 为什么：`@vue/test-utils@2.5.1` 的 `emitted()` 靠 **Vue devtools hook** 取事件，而 Vue 只在
+ * 非生产构建里发 devtools 事件 ⇒ 同一条未改的代码 `NODE_ENV=production` 下恒空（AGENTS.md §4
+ * 的环境地板，本机实测 3 红）。父级回调走的是 `emit()` 直接读 vnode props 上的 `onXxx`，与
+ * devtools 无关 ⇒ 两种 NODE_ENV 同一读数。
+ *
+ * 组件的**事件契约照旧**（`prefill` / `refresh` 原样 emit，产品代码零改动），改的只是判据读哪里：
+ * 回调把收到的东西**渲染进宿主 DOM**，断言读渲染出来的文本，不是 spy 的内部状态。
+ */
+function mountBadgeHost(props: Record<string, unknown> = {}) {
+  const seen = reactive({ prefill: [] as string[], refresh: 0 });
+  const Host = defineComponent({
+    setup() {
+      return () =>
+        h('div', [
+          h(GitLightBadge, {
+            ...props,
+            onPrefill: (text: string) => { seen.prefill.push(text); },
+            onRefresh: () => { seen.refresh += 1; },
+          }),
+          // 复述进 DOM：三条判据都读渲染结果（`0` 起步那条同时是「判据不空洞」的反向自证）
+          h('span', { 'data-test': 'host-prefill-count' }, String(seen.prefill.length)),
+          h('span', { 'data-test': 'host-prefill-text' }, seen.prefill.join('\n')),
+          h('span', { 'data-test': 'host-refresh-count' }, String(seen.refresh)),
+        ]);
+    },
+  });
+  return mount(Host, { global: { plugins: [i18n] } });
 }
 
 beforeEach(() => {
@@ -115,7 +150,7 @@ describe('动作：只预填，不发送（平台零 git 写）', () => {
   it('点「让 AI 收尾」⇒ emit prefill，文本点名脏仓库、不掺 undefined，**不发任何请求**', async () => {
     const fetchStub = vi.fn();
     vi.stubGlobal('fetch', fetchStub);
-    const w = mountBadge({
+    const w = mountBadgeHost({
       payload: payloadOf({
         light: 'red', reason: 'uncommitted',
         repos: [
@@ -125,32 +160,38 @@ describe('动作：只预填，不发送（平台零 git 写）', () => {
       }),
     });
     await w.get('[data-test="git-light-badge"]').trigger('click');
+    // 还没点收尾 ⇒ 父级一句预填也没收到（不先钉 0，「收到一句」就可能是挂载时自带的假绿）
+    expect(w.get('[data-test="host-prefill-count"]').text()).toBe('0');
     await w.get('[data-test="git-light-finish"]').trigger('click');
-    const emitted = w.emitted('prefill');
-    expect(emitted).toHaveLength(1);
-    const text = String(emitted![0][0]);
+    expect(w.get('[data-test="host-prefill-count"]').text()).toBe('1');
+    const text = w.get('[data-test="host-prefill-text"]').text();
     expect(text).toContain('svc');          // 点名脏的那个
-    expect(text).not.toContain('synced');   // 不点名已经收工的
+    // 不点名已经收工的。收工仓库的**名字**是 p1（不是状态词 synced），只钉 synced 的旧写法是假判据：
+    // 预填文案里根本不会出现状态词（`i18n/locales/zh-CN.ts` 的 `gitLight.prefill.finish` 只插
+    // `{repos}{more}`）⇒ 换成脏仓库名单也要靠 p1 才能红（变异 M2 实测）。
+    expect(text).not.toContain('p1');
     expect(text).not.toMatch(/undefined|\[object Object\]/);
+    expect(w.find('[data-test="git-light-panel"]').exists()).toBe(false); // 预填完就收面板（不纠缠）
     expect(fetchStub).not.toHaveBeenCalled(); // 组件自己一个请求都不发
     vi.unstubAllGlobals();
   });
 
   it('「问 AI」永远在（任何状态都能问），预填里带上状态与原因', async () => {
-    const w = mountBadge({ payload: payloadOf({ light: 'grey', reason: 'no_repo' }), cwd: '~/projects/p1' });
+    const w = mountBadgeHost({ payload: payloadOf({ light: 'grey', reason: 'no_repo' }), cwd: '~/projects/p1' });
     await w.get('[data-test="git-light-badge"]').trigger('click');
     await w.get('[data-test="git-light-ask"]').trigger('click');
-    const text = String(w.emitted('prefill')![0][0]);
+    const text = w.get('[data-test="host-prefill-text"]').text();
     expect(text).toContain('未检查');
     expect(text).toContain('p1');
     expect(text).not.toMatch(/undefined/);
   });
 
   it('「重新检查」⇒ emit refresh（刷新由调用方接 composable，组件不自己拉）', async () => {
-    const w = mountBadge({ payload: payloadOf() });
+    const w = mountBadgeHost({ payload: payloadOf() });
     await w.get('[data-test="git-light-badge"]').trigger('click');
+    expect(w.get('[data-test="host-refresh-count"]').text()).toBe('0'); // 先钉 0：否则「收到 1 次」可能是挂载自带的
     await w.get('[data-test="git-light-refresh"]').trigger('click');
-    expect(w.emitted('refresh')).toHaveLength(1);
+    expect(w.get('[data-test="host-refresh-count"]').text()).toBe('1');
   });
 
   it('预填不自动发送这条口径**写在界面上**（用户看得见"只是填进输入框"）', async () => {
