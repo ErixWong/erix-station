@@ -1267,6 +1267,31 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'forced_final':
         hooks.onSep(t('stream.event.forcedFinal', { round: d.round, reason: d.reason ?? '' }));
         return;
+      // issue #243（第 3 步）：终局正文是一段**被文本化的工具调用** ⇒ 一条**中性**分隔行。
+      // 语义是「模型把工具调用写进了正文，这次调用没有真的执行」——**不是故障**：正文里那段文字
+      // 就是模型给的答案的一部分，只是没被执行。所以走 `onSep`（`.roundsep` 中性灰），**不走 `onSysErr`**
+      // （`.syserr` 是 #dc3545 那个「错误」色，借它就是谎报严重程度；同 #300 给半截正文挑中性色、
+      // 同 D9「状态词、不是警报」那条口径）。
+      // payload 由 portal 在终态事务里合成（portal.md §5.3 第 29 项）：`{chars, marker?}`。
+      // `marker` 是**外来字符串**（现查真样本：`<｜｜DSML｜｜`、`<｜FunctionCallML｜｜ invoke`，
+      // 含全角竖线与 XML 尖括号）：
+      //   * **没给就没有那段片段**——第 2 步特意留了「缺 marker 也照发」，渲染不许依赖它；
+      //   * 非字符串 / 空串一律不带片段，绝不 `String(对象)` 把 `[object Object]` 渗进用户可见文案
+      //     （#261 / #288B 同口径）；
+      //   * 它最终落在 StreamPanel 的 `{{ en.text }}` **文本节点**上 ⇒ 尖括号原样可见。
+      //     ⚠ **不许**把那一处插值改成 `v-html`：`<invoke name="exec">` 会被当标签吃掉，
+      //     还可能连后半句一起吞掉（判据里有一格专门钉这件事）。
+      // 位置：portal 已把这条事件的 `seq` 排在 `run_end` **之前** ⇒ 前端**不重排**，到达顺序就是
+      // 「正文 → 这条提示 → 终态分隔条」；实时与刷新后回放走的是**同一条** `dispatch`（#89 口径）。
+      case 'textualized_tool_call': {
+        // 上界与 portal 的载荷校验同源（`internal.js`：marker 必须 ≤120 字符）；旧行/别的写者
+        // 给了更长的串也不该把一行提示撑成一段代码。
+        const marker = typeof d.marker === 'string' && d.marker !== '' ? d.marker.slice(0, 120) : '';
+        hooks.onSep(t('stream.event.toolCallTextualized', {
+          dash: marker === '' ? '' : t('stream.event.dash', { value: marker }),
+        }));
+        return;
+      }
       case 'usage': return;
       case 'run_end': {
         // issue #89 红线：历史回放的 run_end 一律短路——绝不驱动运行态状态机
