@@ -166,9 +166,11 @@ test('#524 幂等键 (assignment, anchor, criterion, bucket)：二次 claim 返�
   await withFreshDb(async (pool) => {
     const { userId, sessionId } = await seedScene(pool, 'a1');
     const tpl = await createTemplate(pool, {
-      kind: 'run-notify', name: '跑完告诉我', scope: 'session', params: { tone: 'brief' }, createdBy: userId,
+      kind: 'run-notify', name: '跑完告诉我', scope: 'session',
+      params: { states: ['completed'], channel: 'site' }, createdBy: userId,
     });
-    assert.deepEqual((await getTemplate(pool, { templateId: tpl.id })).params, { tone: 'brief' },
+    assert.deepEqual((await getTemplate(pool, { templateId: tpl.id })).params,
+      { states: ['completed'], channel: 'site' },
       'params 是 jsonb：进得去也原样出得来');
     const asg = await assignTemplate(pool, { templateId: tpl.id, userId, sessionId });
 
@@ -255,7 +257,7 @@ test('#524 软删三分支（07 §2.3）：零引用物理删 / 只有订阅级�
     const { userId, sessionId } = await seedScene(pool, 'a2');
 
     // ── 分支一：零引用 ⇒ 物理删（行真的没了）
-    const t1 = await createTemplate(pool, { kind: 'run-review', name: '零引用', scope: 'user' });
+    const t1 = await createTemplate(pool, { kind: 'run-review', name: '零引用', scope: 'session' });
     assert.equal((await deleteTemplate(pool, { templateId: t1.id })).mode, 'deleted');
     assert.equal((await pool.query('SELECT 1 FROM macro_templates WHERE id = $1', [t1.id])).rowCount, 0,
       '零引用必须物理删，不留 deleted_at 的僵尸行');
@@ -290,13 +292,13 @@ test('#524 软删三分支（07 §2.3）：零引用物理删 / 只有订阅级�
     );
 
     // ── 分支三的另一半：`notifications` **W3 才建** ⇒ 「表存在则检查、不存在则跳过」
-    const t4 = await createTemplate(pool, { kind: 'run-notify', name: '此刻无通知表', scope: 'user' });
-    await assignTemplate(pool, { templateId: t4.id, userId });
+    const t4 = await createTemplate(pool, { kind: 'run-notify', name: '此刻无通知表', scope: 'session' });
+    await assignTemplate(pool, { templateId: t4.id, userId, sessionId });
     assert.equal((await deleteTemplate(pool, { templateId: t4.id })).mode, 'deleted_with_assignments',
       'notifications 表不存在 ⇒ 这一支跳过（只有订阅 ⇒ 物理删 + 级联）');
 
-    const t5 = await createTemplate(pool, { kind: 'run-notify', name: '有通知', scope: 'user' });
-    await assignTemplate(pool, { templateId: t5.id, userId });
+    const t5 = await createTemplate(pool, { kind: 'run-notify', name: '有通知', scope: 'session' });
+    await assignTemplate(pool, { templateId: t5.id, userId, sessionId });
     // 现场建一张 W3 形状的表：验的是「探测 + 计数」这条通路真的接得上（列名用探测列表里的第一个）。
     await pool.query('CREATE TABLE notifications (id serial PRIMARY KEY, macro_template_id uuid, body text)');
     await pool.query('INSERT INTO notifications (macro_template_id, body) VALUES ($1, $2)', [t5.id, '已发出的通知']);
@@ -307,7 +309,7 @@ test('#524 软删三分支（07 §2.3）：零引用物理删 / 只有订阅级�
     // 表在但没有任何引用列 ⇒ 数不到 ⇒ 物理删（此时通知根本记不了模板，物理删是安全的）。
     await pool.query('DROP TABLE notifications');
     await pool.query('CREATE TABLE notifications (id serial PRIMARY KEY, body text)');
-    const t6 = await createTemplate(pool, { kind: 'run-notify', name: '无引用列', scope: 'user' });
+    const t6 = await createTemplate(pool, { kind: 'run-notify', name: '无引用列', scope: 'session' });
     assert.equal((await deleteTemplate(pool, { templateId: t6.id })).mode, 'deleted');
     await pool.query('DROP TABLE notifications');
   });
@@ -422,12 +424,12 @@ test('#524 订阅形状：NULLS NOT DISTINCT 挡重复订阅 / scope 决定 sess
     assert.equal(sAsg.session_id, sessionId);
 
     // audience=admin：非管理员看不见、也订不上
-    const adminOnly = await createTemplate(pool, { kind: 'run-review', name: '管理员专用', scope: 'user', audience: 'admin' });
+    const adminOnly = await createTemplate(pool, { kind: 'run-review', name: '管理员专用', scope: 'session', audience: 'admin' });
     assert.equal((await listTemplates(pool, {})).some((t) => t.id === adminOnly.id), false);
     assert.equal((await listTemplates(pool, { isAdmin: true })).some((t) => t.id === adminOnly.id), true);
     assert.equal((await listTemplates(pool, { kinds: ['run-review'], isAdmin: true })).some((t) => t.id === adminOnly.id), true);
-    await assertMacroError('forbidden', () => assignTemplate(pool, { templateId: adminOnly.id, userId }));
-    assert.ok((await assignTemplate(pool, { templateId: adminOnly.id, userId, isAdmin: true })).id);
+    await assertMacroError('forbidden', () => assignTemplate(pool, { templateId: adminOnly.id, userId, sessionId }));
+    assert.ok((await assignTemplate(pool, { templateId: adminOnly.id, userId, sessionId, isAdmin: true })).id);
 
     // 取消订阅两分支：无账物理删 / 有账只停用（= 迁移里 `macro_runs.assignment_id` 不带 ON DELETE 的后果）
     const clean = await assignTemplate(pool, { templateId: userScope.id, userId, cwd: '/clean' });
@@ -451,8 +453,118 @@ test('#524 订阅形状：NULLS NOT DISTINCT 挡重复订阅 / scope 决定 sess
     await assertMacroError('validation_failed', () => updateTemplate(pool, { templateId: userScope.id, patch: { scope: 'dept' } }));
     await assertMacroError('validation_failed', () => updateTemplate(pool, { templateId: userScope.id, patch: {} }));
     await assertMacroError('validation_failed',
-      () => createTemplate(pool, { kind: 'run-notify', name: '  ', scope: 'user' }), 'name 不许空白');
+      () => createTemplate(pool, { kind: 'run-notify', name: '  ', scope: 'session' }), 'name 不许空白');
     await assertMacroError('conflict', () => assignTemplate(pool, { templateId: userScope.id, userId, cwd: '/after-off' }));
     assert.equal((await getTemplate(pool, { templateId: userScope.id })).enabled, false);
   });
 });
+
+  // ── 审计回修（fix-261116-05）新增的四道闸 ────────────────────────────────
+  // 每条都**先造出旧行为能通过的状态**，再断言新闸拦住——不做「恒真」自证。
+
+  test('#524 模板停用/软删 ⇒ 既有订阅也 claim 不到（模板总开关是真门禁）', { skip: SKIP }, async () => {
+    await withFreshDb(async (pool) => {
+      const { userId } = await seedScene(pool, 'n1');
+      const t = await createTemplate(pool, {
+        kind: 'scheduled-task', name: '每天跑一次',
+        params: { at: '09:00', cwd: '/p', task: 't', maxRounds: 4 }, scope: 'user',
+      });
+      const asg = await assignTemplate(pool, { templateId: t.id, userId });
+      // 基线：模板启用时能认领
+      assert.ok(await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'clock:2026-11-16',
+        criterion: 'tick', bucket: '2026-11-16' }), '基线：模板启用时应能认领');
+
+      // ① 停用模板 ⇒ 订阅本身 enabled=true，但 claim 必须拿不到
+      await updateTemplate(pool, { templateId: t.id, patch: { enabled: false } });
+      assert.equal((await pool.query('SELECT enabled FROM macro_assignments WHERE id = $1',
+        [asg.id])).rows[0].enabled, true, '前置：订阅行自己仍是启用的（不是被顺手关掉才通过的）');
+      assert.equal(await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'clock:2026-11-17',
+        criterion: 'tick', bucket: '2026-11-17' }), null, '模板停用后不许再认领');
+
+      // ② 软删模板 ⇒ 同样不许认领
+      await updateTemplate(pool, { templateId: t.id, patch: { enabled: true } });
+      await deleteTemplate(pool, { templateId: t.id });
+      assert.equal(await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'clock:2026-11-18',
+        criterion: 'tick', bucket: '2026-11-18' }), null, '模板软删后不许再认领');
+    });
+  });
+
+  test('#524 until 到期在 claim 自己的资格子句里被拦（不靠上一次 listAssignments 顺手收敛）',
+    { skip: SKIP }, async () => {
+    await withFreshDb(async (pool) => {
+      const { userId } = await seedScene(pool, 'n2');
+      const t = await createTemplate(pool, {
+        kind: 'scheduled-task', name: '到期测试',
+        params: { at: '09:00', cwd: '/p', task: 't', maxRounds: 4 }, scope: 'user',
+      });
+      const asg = await assignTemplate(pool, { templateId: t.id, userId });
+      // ⚠ 这里**故意不调 listAssignments**（它内部会 applyExpiredAssignments）。
+      // 只把 until 用裸 SQL 推到过去 ⇒ 只有 claim 自己的 `until > $now` 能拦住。
+      await pool.query('UPDATE macro_assignments SET until = now() - interval \'1 hour\' WHERE id = $1',
+        [asg.id]);
+      assert.equal(await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'clock:2026-11-16',
+        criterion: 'tick', bucket: '2026-11-16' }), null, '过期订阅不许认领（claim 自己判，不靠旁路）');
+    });
+  });
+
+  test('#524 kind/scope 配对固定、params 按 kind schema 校验、name ≤ 40', { skip: SKIP }, async () => {
+    await withFreshDb(async (pool) => {
+      // kind 与 scope 不许自由组合
+      await assertMacroError('validation_failed', () => createTemplate(pool, {
+        kind: 'run-notify', name: 'x', scope: 'user', params: { states: ['completed'], channel: 'site' },
+      }), 'run-notify 只能 scope=session');
+      await assertMacroError('validation_failed', () => createTemplate(pool, {
+        kind: 'scheduled-task', name: 'x', scope: 'session',
+        params: { at: '09:00', cwd: '/p', task: 't', maxRounds: 4 },
+      }), 'scheduled-task 只能 scope=user');
+      // params 按 kind schema：缺字段不算错，但**多字段/错值**必须拦
+      await assertMacroError('validation_failed', () => createTemplate(pool, {
+        kind: 'run-notify', name: 'x', scope: 'session', params: { tone: 'brief' },
+      }), 'run-notify 不认识 tone');
+      await assertMacroError('validation_failed', () => createTemplate(pool, {
+        kind: 'scheduled-task', name: 'x', scope: 'user',
+        params: { at: '25:00', cwd: '/p', task: 't', maxRounds: 4 },
+      }), 'at 必须是 HH:MM');
+      // name ≤ 40（设计 07 §1.3；旧实现放到 200）
+      await assertMacroError('validation_failed', () => createTemplate(pool, {
+        kind: 'run-notify', name: 'a'.repeat(41), scope: 'session',
+        params: { states: ['completed'], channel: 'site' },
+      }), 'name 超过 40 字要拦');
+      // 改模板：kind / scope 不在白名单
+      const t = await createTemplate(pool, {
+        kind: 'run-notify', name: 'ok', scope: 'session', params: { states: ['completed'], channel: 'site' },
+      });
+      await assertMacroError('validation_failed',
+        () => updateTemplate(pool, { templateId: t.id, patch: { kind: 'run-review' } }), 'kind 不许改');
+      await assertMacroError('validation_failed',
+        () => updateTemplate(pool, { templateId: t.id, patch: { scope: 'user' } }), 'scope 不许改');
+    });
+  });
+
+  test('#524 finish 的两道闸：skipped 显式 null 也拦；终态不许回退', { skip: SKIP }, async () => {
+    await withFreshDb(async (pool) => {
+      const { userId, sessionId } = await seedScene(pool, 'n3');
+      const t = await createTemplate(pool, {
+        kind: 'run-notify', name: '终态闸', scope: 'session', params: { states: ['completed'], channel: 'site' },
+      });
+      const asg = await assignTemplate(pool, { templateId: t.id, userId, sessionId });
+      const run = await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'run:1',
+        criterion: 'terminal', bucket: 'b0' });
+
+      // ① 显式 null 也必须拦（旧写法 `&& skippedReason !== null` 会放过它）
+      await assertMacroError('validation_failed',
+        () => finishMacroRun(pool, { macroRunId: run.id, status: 'skipped', skippedReason: null }),
+        'skipped 显式 null 也不许');
+
+      // ② 推到终态后，不许再改回非终态
+      const done = await finishMacroRun(pool, { macroRunId: run.id, status: 'done', verdict: 'pass' });
+      assert.equal(done.status, 'done');
+      await assertMacroError('conflict',
+        () => finishMacroRun(pool, { macroRunId: run.id, status: 'running' }), 'done → running 必须 409');
+      // 前置证据：库里确实还是 done（不是被静默改掉了）
+      assert.equal((await pool.query('SELECT status FROM macro_runs WHERE id = $1', [run.id]))
+        .rows[0].status, 'done');
+      // ③ 重复写同一终态是幂等的（重试友好）
+      assert.equal((await finishMacroRun(pool, { macroRunId: run.id, status: 'done', verdict: 'pass' })).status, 'done');
+    });
+  });

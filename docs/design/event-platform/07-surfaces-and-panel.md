@@ -457,7 +457,7 @@ DelegateChildDrawer.vue:225     class="absolute inset-y-0 right-0 w-full max-w-x
 
 | 行 | 内容 | 从哪来 | 无值时 |
 |---|---|---|---|
-| trigger | 时间 + 锚 + state | `macro_runs.anchor` / `state` / `started_at` | 必填 |
+| trigger | 时间 + 锚 + 判据 | `macro_runs.anchor` / `criterion` / `started_at` | 必填 |
 | action | 做了什么（通知 / 起 run / 回灌 / 跳过） | 动作类型 + `skipped_reason` | 必填 |
 | result | 判决（`pass` / `red` / `no-op-claim` / `needs-human`） | `macro_runs.verdict` | 必填 |
 | 附注 | 成本 + 耗时 + 深度 | `child_run` 的 usage / `depth` | **整行隐藏，不填 0** |
@@ -665,7 +665,7 @@ run 9f3a 结束
 
 | 面板要的 | `macro_runs` 字段 |
 |---|---|
-| trigger | `anchor` / `state` / `started_at` |
+| trigger | `anchor` / `criterion` / `started_at` |
 | action | 动作类型 + `skipped_reason` |
 | result | `verdict` |
 | 链 | `parent_macro_run_id`（新增，指回上一条） |
