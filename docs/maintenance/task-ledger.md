@@ -5406,7 +5406,9 @@ run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data
 **剩余**：空闲仍有 13.2 事务/秒来自**另外 5 个轮询器**（`run_queue` 1.5/秒、`chat_sessions` 0.9/秒、
 `port_observations` 0.7/秒、`fde_onboarding` 0.6/秒…）⇒ 开 **#520** 续作（判据：空闲 < 3 事务/秒）。
 
-### 8.127 只写一行 `run_end` 的终态在界面上不存在：候选发现不能只认白名单行（issue #514 / 工单 fix-261115-04，2026-11-15，worker 落地）
+### 8.130 只写一行 `run_end` 的终态在界面上不存在：候选发现不能只认白名单行（issue #514 / 工单 fix-261115-04，2026-11-15，worker 落地）
+
+> 编号由主 agent 统一分配（本批并行）：本条原定 8.127，现查该号已被 #496 占用 ⇒ 按分配落 **8.130**。
 
 **缺陷形状**：`sessions.js#stopSession` 的 killedQueued 分支（`queued` 从未开始就被取消）在事件面上
 **只写一行** `run_end`；`run_end` 不在下发白名单 `HISTORY_EVENT_TYPES`（红线：它驱动前端运行态状态机，
@@ -5465,8 +5467,8 @@ AND seq >= $ [AND seq < $] ORDER BY seq DESC LIMIT $`），走既有 `UNIQUE (se
 基线 origin/main 同机同窗口现查是 2356 ⇒ **本单 +7 条**）。前端未改 ⇒ 未跑前端套件；`AGENTS.md` 未动
 ⇒ 热层字节闸不在本单账上（顺手跑了 `npm run check:agents-hotlayer` ⇒ `VERDICT ok`）。
 
-⚠ **同一台机器上的计时敏感用例在抖，且与本单无关（已做基线对照）**：本分支根套件连跑 **7 次 = 3 次
-`rc=0` / 4 次 `rc=1`**，红的**全部**是计时敏感用例（没有一条落在本单改的端点上）：`env-int-strict-506e.test.js` 的 `#routes③ …` 与
+⚠ **同一台机器上的计时敏感用例在抖，且与本单无关（已做基线对照）**：本分支根套件连跑 **10 次 = 4 次
+`rc=0` / 6 次 `rc=1`**，红的**全部**是计时敏感用例（没有一条落在本单改的端点上）：`env-int-strict-506e.test.js` 的 `#routes③ …` 与
 `#506e③ …`（`循环必须停在某一拍的 sleep 上`）、`idle-backoff-506.test.js:282` 的「孤儿回收按独立节拍
 ⇒ 60s 空转约 6 次」；单跑 `env-int-strict-506e.test.js` 永远 `rc=0`。**基线对照**：同一时间窗口把
 `origin/main` 另开 worktree（共用 node_modules）连跑 **3 次 = 2 次 `rc=0` / 1 次 `rc=1`**，红的就是
