@@ -5554,3 +5554,41 @@ uid ≠ 1000 时文件其实早就写出来了，测试却白等 120 s，报一�
 **判据差项现在只剩**：① 「链**逐段 lstat**、末段不许是符号链接」的 *fail-closed* 版本刻意不做（主 agent 裁决只诊断）；
 链检本身仍是 `statSync`+`accessSync`（跟随链接），但末段链接事实已由 `observeLastSegmentLink` 单独说出并写进文案；
 ② env 键值（值非法）校验不做（那条线在 `portal/test/deploy-env-defaults.test.js`）；③ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
+
+**返修补记二（同批 worker，第三轮；只放开自报的那一条边界）**
+
+把链上**更早**的段做成链接（`mount -> real`）⇒ 上一轮的结果是 `state=present`、`link.isSymlink=false`，
+也就是「bind 源本身就是符号链接」这个**现实里最常见的摆法**（`/srv/erix -> /data/erix`）今天完全隐形——
+而且它**末段根本不像链接**（末段是 `config.json` 真文件），所以只看末段永远看不见它。本轮就补这一条。
+
+- `inspectHostPathChain` 在**已有的逐段走查**里，对每一段先 `lstatSync`（不跟随）记一条事实
+  `{segment, path, isLastSegment, isSymlink, target, resolvedTarget, targetExists, detectable}` 再判归属，
+  返回 `links` 数组（提前 return 也把已走到的段带回去）。逐段 API 是 `observeSegmentLink`，
+  `observeLastSegmentLink` 变成它 `isLastSegment=true` 的薄包装（已合并的末段形状一个字没改）。
+  `observeHostPath` 的 `link` 直接**复用走查里末段那条**（同一次 `lstat`，不重复发 syscall；链提前 return 时
+  补一次，保证 L1/L2/L3 依赖的形状不碎）。
+- `formatAncestorLinkLines(links)`：只点名**第一个**非末段链接 + 它指向哪（相对链接给解析后的绝对目标）+
+  「portal 容器里看到的**容器内路径与宿主路径不是同一个 inode**：容器那一侧走的是链接目标，若这就是 bind 源，
+  **要改的是宿主侧这条链接指向**，去改容器里看到的那一侧不会生效」；悬空再加一句「缺的是**链接目标**」；
+  全链真目录 ⇒ **空串**（不是来一句「链上没有链接」）。接进 `unreadable` / `missing` 两种失败文案。
+- **三态归属一个字没改**：`present`/`missing`/`unreadable`、`missingPrefix`、`waitForHostFile` 的
+  「提前放弃 / 等满超时」两种形状、`unreadableConfirmations` 全部未动 ⇒ 本轮唯一产品效果是**多一条可诊断事实**。
+- 注入的 `fsImpl` 没有 `lstatSync` ⇒ 每一段都是 `isSymlink=null` + `detectable=false`（沿用末段口径，不假装「不是链接」）。
+
+**读数**：CI 门 `# tests 19 / # pass 19 / # fail 0`（上一轮 17 + 本轮 `L5`/`L6` 两格）；
+`isolation-negative --strict` rc=0（`verdict=TRAPS_FIRED（全部 13 条陷阱=均硬失败；单一来源=一份定义）`，
+缺省模式 rc=1 是刻意的负例证据口径）；单一来源钉新增 `observeSegmentLink` / `formatAncestorLinkLines`。
+
+**本轮变异（锚点命中数先校验=1 才动手；跑完 `git checkout` 还原、`grep -rn MUTANT portal test`=0、`git status` 干净）**
+
+| 发 | 改了什么 | CI 门 | `--strict` |
+|---|---|---|---|
+| M-A | 逐段走查用 `statSync`（跟随链接） | `# pass 16 / # fail 3`：`not ok 13 - L1` + `not ok 15 - L3` + **`not ok 17 - L5`** | rc=1 正例组「链接事实必须为真（statSync 跟随链接看不出来）」 |
+| M-B | 链上链接那一行改成**恒输出** | `# pass 17 / # fail 2`：`not ok 14 - L2` + **`not ok 18 - L6`**（`actual: '  链上第一段符号链接（不是末段）：MUTANT-MB 恒输出 → /'`） | rc=1 正例组「全真目录不许冒出链上链接那一行」 |
+| M-C | 走查里**只记末段**（把本轮新加那一半删掉） | `# pass 17 / # fail 2`：**`not ok 17 - L5`**（`expected: 1 / actual: 0`）+ `not ok 18 - L6`；**L1/L2/L3 保持绿** | rc=1 正例组「links 里必须有 mount 那一段：[["…/mount/home/.erix/config.json",false,true]]」 |
+
+M-C 是这轮最想要的一发：它证明 `L5` 那格**不是靠末段蹭红**（末段三格全绿时它单独红）。
+
+**判据差项现在只剩**：① 链检的存在性/类型/可达性判断仍走 `statSync`+`accessSync`（**只有链接事实**用 `lstat`）——
+「逐段 `lstat` 的 fail-closed 版本」按裁决不做；② env 键值（值非法）校验不做（那条线在
+`portal/test/deploy-env-defaults.test.js`）；③ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
