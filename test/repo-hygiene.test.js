@@ -97,9 +97,11 @@ const FRONTEND_DIR = 'portal/frontend';
 const EMITTED_SHAPES = [
   { name: '点号', re: /\.emitted\b/ },
   { name: '方括号', re: /\[\s*['"]emitted['"]\s*\]/ },
-  // 解构成员：`{` 或 `,` 后面紧跟 `emitted`（可带 `: 别名`）直到 `}` / `,`；
-  // 第二条支管跨行解构里单独占一行的成员（`emitted,` / `emitted: x,`）。
-  { name: '解构', re: /[{,]\s*emitted\s*(?::[^,}\n]+)?\s*[,}]|^[ \t]*emitted\s*[,:]/ },
+  // 解构成员：`{` 或 `,` 后面紧跟 `emitted`（可带 `: 别名`）直到 `}` / `,`；后两条支管跨行解构里
+  // 单独占一行的成员 —— 带尾逗号的（`emitted,`）与**最后一个成员没尾逗号**的（整行就一个 `emitted`，
+  // 实测漏了它 `const {⏎ find,⏎ emitted⏎} = wrapper` 会 rc=0 混过去）。
+  // 已知仍未覆盖：`const K = 'emitted'; wrapper[K]()`（字符串提到别的行再取，行级判据追不住）。
+  { name: '解构', re: /[{,]\s*emitted\s*(?::[^,}\n]+)?\s*[,}]|^[ \t]*emitted\s*[,:]|^[ \t]*emitted[ \t]*$/ },
 ];
 
 /** 扫描面：git 跟踪的、名字以 `.spec.ts` 结尾的前端文件（相对仓库根的路径）。 */
@@ -153,6 +155,7 @@ test('H3 前端 spec 里不许取走 emitted()（点号/方括号/解构三种�
     { shape: '解构', code: `const { emitted } = wrapper;` },
     { shape: '解构', code: `const { emitted: fired, find } = wrapper;` },
     { shape: '解构', code: `const {\n  emitted,\n} = wrapper;` }, // 跨行解构（审计没提，但同样是取走）
+    { shape: '解构', code: `const {\n  find,\n  emitted\n} = wrapper;` }, // 跨行 + 末位成员无尾逗号
   ];
   for (const { shape, code } of INJECTIONS) {
     const mutant = files.map((p) => {
