@@ -9,8 +9,11 @@
 // 三条硬语义（本单的验收重点，改动前先读）：
 //   ① **认领是 `INSERT … ON CONFLICT DO NOTHING RETURNING id`**（`claimMacroRun`）——
 //      不是「先 SELECT 再 INSERT」。后者在两个调度器并发时都会 SELECT 到「还没有」，
-//      然后各插一行、各跑一遍：幂等键 `(assignment_id, anchor, state, bucket)` 就成了装饰。
+//      然后各插一行、各跑一遍：幂等键 `(assignment_id, anchor, criterion, bucket)` 就成了装饰。
 //      返回 `null` 就是「这一枪别人已经开过了」，调用方必须当**正常情况**处理（不是异常）。
+//      ⚠ **幂等键里不许出现生命周期列（`status`）**：一条账 `pending → running → done` 之后
+//      键位就空出来，同一个触发能被再次 claim ⇒ 幂等失效。所以「哪条判据叫起来的」（`criterion`，
+//      写完不变）与「这一次跑到哪了」（`status`，会推进）必须是两列、各司其职。
 //   ② **模板删除是三分支**（`07-surfaces-and-panel.md` §2.3，实现见 `deleteTemplate`）：
 //      零引用 ⇒ 物理删；只有订阅、无执行记录 ⇒ 物理删 + 级联删订阅；
 //      有 `macro_runs` 或 `notifications` ⇒ **只能软删**（写 `deleted_at`）。
@@ -31,13 +34,24 @@ export const MACRO_AUDIENCES = Object.freeze(['all', 'admin']);
 /** 订阅范围：`session` 必须带 `session_id`，`user` 必须不带（口径见 `assignTemplate`）。 */
 export const MACRO_SCOPES = Object.freeze(['session', 'user']);
 /**
- * 执行账状态机（迁移 0035 CHECK 同一份）：
+ * 执行账的**生命周期**（迁移 0035 CHECK 同一份）：
  * `pending → running → done | failed`；`pending → skipped`（被门禁挡下）；
- * `pending → superseded`（同桶被更新的一次取代，不执行）。终态集合见 `MACRO_RUN_TERMINAL_STATES`。
+ * `pending → superseded`（同桶被更新的一次取代，不执行）。终态集合见 `MACRO_RUN_TERMINAL_STATUSES`。
+ * ⚠ 这一列**会随执行推进而变** ⇒ 绝不进幂等键（键里带它 = 状态一迁移幂等就失效）。
  */
-export const MACRO_RUN_STATES = Object.freeze(['pending', 'running', 'done', 'skipped', 'failed', 'superseded']);
+export const MACRO_RUN_STATUSES = Object.freeze(['pending', 'running', 'done', 'skipped', 'failed', 'superseded']);
 /** 终态：进了这五个就不再推进，`finishMacroRun` 会给它们补 `finished_at`。 */
-export const MACRO_RUN_TERMINAL_STATES = Object.freeze(['done', 'skipped', 'failed', 'superseded']);
+export const MACRO_RUN_TERMINAL_STATUSES = Object.freeze(['done', 'skipped', 'failed', 'superseded']);
+/**
+ * **触发判据**（迁移 0035 CHECK 同一份）：写完就不变 ⇒ 是幂等键的一部分。
+ * 与 `MACRO_RUN_STATUSES` 是**两个轴**，合成一列就得让幂等键跟着状态跑（见文件头红线 ①）。
+ *   `terminal`   run 进终态触发的宏（run-notify / run-review）
+ *   `silent`     静默告警（run-silence-alert，按 `bucket` 的聚合窗口去重）
+ *   `tick`       定时 / 轮询（scheduled-task，W2 的定时器驱动）
+ *   `mechanical` M9 判据：机械可判定的那一路（不需要模型裁决）
+ *   `semantic`   M9 判据：要模型语义裁决的那一路
+ */
+export const MACRO_RUN_CRITERIA = Object.freeze(['terminal', 'silent', 'tick', 'mechanical', 'semantic']);
 /** 八种门禁（09 篇 §7 的「为什么没跑」分组维度）——**穷举**成 CHECK，不留自由文本。 */
 export const MACRO_SKIPPED_REASONS = Object.freeze([
   'budget_exhausted', 'quiet_hours', 'human_present', 'run_in_progress',
@@ -78,7 +92,8 @@ export function validateMacroEnum(field, value, allowed, { nullable = false } = 
 }
 
 export const validateMacroKind = (kind) => validateMacroEnum('kind', kind, MACRO_KINDS);
-export const validateMacroRunState = (state) => validateMacroEnum('state', state, MACRO_RUN_STATES);
+export const validateMacroRunStatus = (status) => validateMacroEnum('status', status, MACRO_RUN_STATUSES);
+export const validateMacroCriterion = (criterion) => validateMacroEnum('criterion', criterion, MACRO_RUN_CRITERIA);
 
 /** 非空字符串（`name` / `anchor` / `bucket` 都用它：空串进幂等键会让整桶塌成一行）。 */
 function requireText(field, value, { max = 512 } = {}) {
@@ -159,7 +174,8 @@ export function toMacroRunSnapshot(row) {
     assignment_id: row.assignment_id,
     anchor: row.anchor,
     bucket: row.bucket,
-    state: row.state,
+    status: row.status,
+    criterion: row.criterion,
     verdict: row.verdict ?? null,
     verdict_raw: row.verdict_raw ?? null,
     reason: row.reason ?? null,
@@ -500,26 +516,31 @@ export async function unassignTemplate(pool, { assignmentId, userId = null, now 
 // ── 执行账 ────────────────────────────────────────────────────────────────────
 
 /**
- * **认领一次执行（红线 ①）**：`INSERT … ON CONFLICT (assignment_id, anchor, state, bucket) DO NOTHING
- * RETURNING id` —— 插到了返回 `{ id, …}`，**没插到返回 `null`**（幂等命中）。
+ * **认领一次执行（红线 ①）**：`INSERT … ON CONFLICT (assignment_id, anchor, criterion, bucket)
+ * DO NOTHING RETURNING id` —— 插到了返回 `{ id, …}`，**没插到返回 `null`**（幂等命中）。
  *
  * 为什么不能写成「先 SELECT 再 INSERT」：两条腿之间没有锁，两个调度器（或一次重试）
  * 会同时看到「还没有」，于是同一个事件跑两遍、通知发两条。`ON CONFLICT` 让唯一索引
  * 替我们做那个「只让一个人赢」的决定，这是**数据库层**的裁决，进程重启/多副本都成立。
  *
- * `state` 参与幂等键：同一个 anchor 允许留下 `pending`（认领）→ 之后由 `finishMacroRun` 推进，
- * 也允许同 anchor 的 `superseded` 与 `done` 各留一条——这正是「为什么这条没跑」能和「跑了的结果」
- * 并存一处的存法。认领重复跑在同一个 `(assignment, anchor, state, bucket)` 上才是真重复。
+ * **`criterion` 参与幂等键，`status` 不参与**（本单最容易写错的一处）：
+ *  - `criterion`（哪条判据叫起来的）与 `anchor`/`bucket` 都写完不变 ⇒ 键稳定；同一个
+ *    `(assignment, anchor, criterion, bucket)` 第二次认领必须拿到 `null`——**包括第一条已经
+ *    被 `finishMacroRun` 推到 `done` 之后**（键里没有状态列，所以状态迁移不动键位）。
+ *  - `status` 只是认领时写下的初始生命周期（默认 `pending`），之后由 `finishMacroRun` 推进；
+ *    同一个 anchor 在**不同判据**下可以各留一条账（例如 `terminal` 跑完、`silent` 又告警一次），
+ *    那是两次不同的触发，不是重复。
  *
  * ⚠ 订阅**不存在**或**已停用/已过期** ⇒ 也返回 `null`（上面那个 `WHERE EXISTS` 不成立）。
  *   这三种对调用方的处置动作完全一样——“这一枪不用开”——所以不拆成两种返回；
  *   要区分“订订阅在不在”去查 `macro_assignments`，不要拿认领当存在性探针。
  */
 export async function claimMacroRun(pool, {
-  assignmentId, anchor, bucket, state = 'pending', depth = 0, parentMacroRunId = null,
+  assignmentId, anchor, criterion, bucket, status = 'pending', depth = 0, parentMacroRunId = null,
   snapshotId = null, worktreePath = null, startedAt = null, now = new Date(),
 } = {}) {
-  const safeState = validateMacroRunState(state);
+  const safeCriterion = validateMacroCriterion(criterion);
+  const safeStatus = validateMacroRunStatus(status);
   const safeAnchor = requireText('anchor', anchor, { max: 512 });
   const safeBucket = requireText('bucket', bucket, { max: 256 });
   const safeDepth = Number.isInteger(depth) ? depth : 0;
@@ -537,12 +558,12 @@ export async function claimMacroRun(pool, {
     // `ON CONFLICT DO NOTHING` 是幂等那半，`WHERE EXISTS` 是资格那半，都不经过应用层。
     res = await runner(pool).query(
       `INSERT INTO macro_runs
-         (assignment_id, anchor, state, bucket, depth, parent_macro_run_id, snapshot_id, worktree_path, started_at)
-       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+         (assignment_id, anchor, criterion, status, bucket, depth, parent_macro_run_id, snapshot_id, worktree_path, started_at)
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
         WHERE EXISTS (SELECT 1 FROM macro_assignments a WHERE a.id = $1 AND a.enabled)
-       ON CONFLICT (assignment_id, anchor, state, bucket) DO NOTHING
+       ON CONFLICT (assignment_id, anchor, criterion, bucket) DO NOTHING
        RETURNING id`,
-      [assignmentId, safeAnchor, safeState, safeBucket, safeDepth,
+      [assignmentId, safeAnchor, safeCriterion, safeStatus, safeBucket, safeDepth,
         parentMacroRunId ?? null, snapshotId ?? null, safeWorktree, started],
     );
   } catch (e) {
@@ -556,38 +577,39 @@ export async function claimMacroRun(pool, {
   if (!id) return null;
   // 认领顺手记一次「评估过」——W2 的 tick 靠它做「这条订阅多久没被看过」的判据。
   await runner(pool).query('UPDATE macro_assignments SET last_evaluated_at = $2 WHERE id = $1', [assignmentId, at]);
-  return { id, assignmentId, anchor: safeAnchor, bucket: safeBucket, state: safeState };
+  return { id, assignmentId, anchor: safeAnchor, bucket: safeBucket, criterion: safeCriterion, status: safeStatus };
 }
 
 /**
- * 收口一次执行。只允许推进 `state` 与填结果列；**不改** `anchor`/`bucket`（幂等键的两半是历史）。
+ * 收口一次执行。**只推进 `status`**（生命周期）与填结果列；幂等键的三列
+ * （`anchor` / `criterion` / `bucket`）一律不动——推进之后同一个触发再认领仍然是 `null`。
  *
  * 语义闸（都在代码里，DB 只管形状）：
  *  - 进终态（`done`/`skipped`/`failed`/`superseded`）⇒ 必带 `finished_at`（没给就用 `now` 补）；
- *  - `state='skipped'` ⇒ 必带 `skipped_reason`（「为什么没跑」是必须可统计的维度，不许空）；
- *  - `state='done'` ⇒ `verdict` 缺省补 `'unclassified'`：宁可显式承认没分类，也不要留 NULL
+ *  - `status='skipped'` ⇒ 必带 `skipped_reason`（「为什么没跑」是必须可统计的维度，不许空）；
+ *  - `status='done'` ⇒ `verdict` 缺省补 `'unclassified'`：宁可显式承认没分类，也不要留 NULL
  *    让面板把「没判过」和「判不了」混成一个数。
  */
 export async function finishMacroRun(pool, {
-  macroRunId, state, verdict, verdictRaw = null, reason = null, remediationText = null,
+  macroRunId, status, verdict, verdictRaw = null, reason = null, remediationText = null,
   // ⚠ **不给 `= null` 默认值**：本函数里 `undefined`（没提这个字段）与 `null`（显式「不动/清空」）
-  // 是两件事，而 `state='skipped'` 必带 `skipped_reason` 这条闸靠的就是这个区分。
+  // 是两件事，而 `status='skipped'` 必带 `skipped_reason` 这条闸靠的就是这个区分。
   skippedReason, childSessionId = null, childRunId = null, finishedAt = null, now = new Date(),
 } = {}) {
-  const safeState = validateMacroRunState(state);
+  const safeStatus = validateMacroRunStatus(status);
   const safeVerdict = verdict === undefined ? null : validateMacroEnum('verdict', verdict, MACRO_VERDICTS, { nullable: true });
   const safeSkipped = skippedReason === undefined
     ? null : validateMacroEnum('skipped_reason', skippedReason, MACRO_SKIPPED_REASONS, { nullable: true });
   const at = toInstant('now', now) ?? new Date();
-  if (safeState === 'skipped' && !safeSkipped && skippedReason !== null) {
-    throw new MacroError('validation_failed', "state='skipped' 必须给 skipped_reason",
+  if (safeStatus === 'skipped' && !safeSkipped && skippedReason !== null) {
+    throw new MacroError('validation_failed', "status='skipped' 必须给 skipped_reason",
       { details: { field: 'skipped_reason', allowed: MACRO_SKIPPED_REASONS } });
   }
-  const terminal = MACRO_RUN_TERMINAL_STATES.includes(safeState);
-  const params = [macroRunId, safeState];
-  const sets = ['state = $2'];
+  const terminal = MACRO_RUN_TERMINAL_STATUSES.includes(safeStatus);
+  const params = [macroRunId, safeStatus];
+  const sets = ['status = $2'];
   const push = (column, value) => { params.push(value); sets.push(`${column} = $${params.length}`); };
-  const finalVerdict = safeState === 'done' && safeVerdict === null ? 'unclassified' : safeVerdict;
+  const finalVerdict = safeStatus === 'done' && safeVerdict === null ? 'unclassified' : safeVerdict;
   push('verdict', finalVerdict);
   if (verdictRaw !== undefined) push('verdict_raw', verdictRaw);
   if (reason !== undefined) push('reason', reason);
@@ -634,7 +656,7 @@ export function decodeMacroRunCursor(cursor) {
  * 可变的 `template_id`，见迁移 0035 的索引注释）。筛选列全部落在索引列上（09 篇 §7）。
  */
 export async function listMacroRuns(pool, {
-  assignmentId = null, templateId = null, state = null, userId = null,
+  assignmentId = null, templateId = null, status = null, criterion = null, userId = null,
   limit = MACRO_RUNS_DEFAULT_LIMIT, cursor = null,
 } = {}) {
   const where = [];
@@ -642,7 +664,10 @@ export async function listMacroRuns(pool, {
   if (assignmentId) { params.push(assignmentId); where.push(`r.assignment_id = $${params.length}`); }
   if (userId) { params.push(userId); where.push(`a.user_id = $${params.length}`); }
   if (templateId) { params.push(templateId); where.push(`a.template_id = $${params.length}`); }
-  if (state) { validateMacroRunState(state); params.push(state); where.push(`r.state = $${params.length}`); }
+  // 筛选走 `status`（生命周期，面板的默认筛法）与 `criterion`（判据）——两列各有索引/谓词可用；
+  // **幂等**用的是 `criterion` 那一支，与这里的筛选无关。
+  if (status) { validateMacroRunStatus(status); params.push(status); where.push(`r.status = $${params.length}`); }
+  if (criterion) { validateMacroCriterion(criterion); params.push(criterion); where.push(`r.criterion = $${params.length}`); }
   if (cursor) {
     const c = decodeMacroRunCursor(cursor);
     params.push(c.startedAt, c.id);
