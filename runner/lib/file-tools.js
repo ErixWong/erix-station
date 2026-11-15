@@ -252,31 +252,30 @@ function resolvesToRoot(root, value) {
   }
 }
 
-/** 能 realpath 就 realpath，不能（目录还不存在等）就原样返回。 */
-function realpathOrSelf(absolutePath) {
-  try {
-    return fs.realpathSync(absolutePath);
-  } catch {
-    return absolutePath;
-  }
-}
-
 /**
- * 装配层的遮蔽表（jail 之外的那一份，服务「没有 jail / jail 根与 cwd 不同」的调用方，见单测）。
- * 前缀条目：相对路径按 root 解析，能 realpath 就 realpath（防用 symlink 绕过遮蔽）。
+ * 装配层的遮蔽表（jail 之外的那一份，服务「没有 jail / jail 根与 cwd 不同」的调用方）。
+ * 前缀条目：相对路径按 root 解析，能 realpath 就 realpath（防用 symlink 绕过遮蔽）——**逐字沿用 #228 的
+ * `maskedPrefixes`**，只是拆成「先分类再编表」，前缀语义零改动。
  * 名字模式条目（issue #231）：只编译成 RegExp，判定发生在**每次谓词调用**上——所以 run 中途新建的
  * `.env.local` 一样被挡；换成「启动时扫目录把模式展成具体路径」就给遮蔽加了一条它本没有的失效条件。
+ *
+ * 已知边界（#228 既有，本单不扩）：本表按**调用方给的 root** 编，所以 root 是目录的符号链接写法时，
+ * 前缀条目会被 realpath 到真目录、与 target 的链接写法比不中 ⇒ 装配层这关对前缀条目 miss。
+ * 生产链路不因此漏：worker 同时传了 jail，`createJail` 的根是 realpath 过的（名字模式还额外比词法段），
+ * 两个方向都在那里兜住（用例已钉）。要消掉本边界就得同时编两张表（realpath 根 + 词法根），
+ * 而生产里它不改变任何结论 ⇒ #231 不做（已核）。
  */
-function compileMaskedTable(root, maskedPaths, { realpathEntries = true } = {}) {
+function compileMaskedTable(root, maskedPaths) {
   const { prefixes, patterns } = splitMaskedEntries(maskedPaths);
   return {
-    root,
     patterns,
-    // realpathEntries=false：条目只按调用方的拼写展开（不再 realpath）——配套下面那张「词法表」，
-    // 否则条目会被 realpath 到真目录、而 target 还是链接写法，前缀条目（`.git/config`）就比不中。
     prefixes: prefixes.map((entry) => {
       const lexical = path.resolve(root, entry);
-      return realpathEntries ? realpathOrSelf(lexical) : lexical;
+      try {
+        return fs.realpathSync(lexical);
+      } catch {
+        return lexical;
+      }
     }),
   };
 }
@@ -342,19 +341,9 @@ export function createStationFileTools({ jail, cwd, maskedPaths = [], allowRead,
   const root = path.resolve(cwd ?? jail?.root ?? process.cwd());
   const hostAllowRead = typeof allowRead === 'function' ? allowRead : () => true;
   const hostAllowWrite = typeof allowWrite === 'function' ? allowWrite : () => true;
-  // 遮蔽比的是路径段，而上游递进来的 target 是按**调用方 cwd** 解析的，createJail 那边却用 realpath
-  // 过的根：cwd 是目录的符号链接写法时（真机里 `~/projects` 本身可能是链接）两个拼写不是同一个字符串，
-  // 只按其中一个比 ⇒ 遮蔽**静默失效**（不报错，只表现为「这条没挡住」）。所以两种写法各编一张表，命中任一即遮。
-  const lexicalRoot = root;
-  const realRoot = realpathOrSelf(root);
-  const maskedTables = realRoot === lexicalRoot
-    ? [compileMaskedTable(realRoot, maskedPaths)]
-    : [
-      compileMaskedTable(realRoot, maskedPaths),
-      compileMaskedTable(lexicalRoot, maskedPaths, { realpathEntries: false }),
-    ];
+  const maskedTable = compileMaskedTable(root, maskedPaths);
 
-  const withinMasked = (target) => maskedTables.some((table) => maskedViolation(table, table.root, target, target));
+  const withinMasked = (target) => maskedViolation(maskedTable, root, target, target);
   // jail 的越界/非可写/遮蔽都是 JailError → 谓词返回 false（上游据此回「错误：…被宿主边界拒绝」文本，
   // 不再像 fork 那样抛）。非 JailError（例如 realpath 撞 EACCES）照旧上抛，不静默吞。
   const jailAllows = (resolver, target) => {
