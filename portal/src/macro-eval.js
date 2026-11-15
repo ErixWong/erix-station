@@ -80,9 +80,16 @@ export function parseDurationMs(str, fallbackMs) {
  */
 export function isWatermarkStale(lastEvaluatedAt, nowMs, intervalMs = EVAL_INTERVAL_MS) {
   if (lastEvaluatedAt == null) return true;
-  const ts = lastEvaluatedAt instanceof Date ? lastEvaluatedAt.getTime() : Date.parse(lastEvaluatedAt);
+  const ts = toMs(lastEvaluatedAt);
   if (!Number.isFinite(ts)) return true;
   return nowMs - ts > STALE_INTERVAL_MULTIPLE * intervalMs;
+}
+
+/** 归一 epoch ms（数字）、pg 返回的 timestamptz（JS Date）或 ISO 串为 epoch ms。 */
+function toMs(v) {
+  if (v instanceof Date) return v.getTime();
+  if (typeof v === 'number') return v;
+  return Date.parse(v);
 }
 
 /** 归一 `now()`（可注入 Date / 数字）为 epoch ms。 */
@@ -216,7 +223,7 @@ export async function advanceWatermark(pool, assignmentId) {
 export async function evalOneAssignment(pool, a, nowMs, { log } = {}) {
   const intents = [];
   let evaluated = false;
-  const expired = a.until != null && Date.parse(a.until) <= nowMs;
+  const expired = a.until != null && toMs(a.until) <= nowMs;
   if (expired) {
     // 到期扫描（`10` 篇 §4）：产一条到期意图（停用本身由 W1 的 applyExpiredAssignments 顺手做）。
     const it = await evalExpiry(pool, a, nowMs, { log });
@@ -254,15 +261,24 @@ export async function evalExpiry(pool, a, nowMs, { log } = {}) {
 
 /**
  * 到期意图专用的占位：与 `claimMacroRun` 同一条幂等键（`assignment_id,anchor,criterion,bucket`）、
- * 同一段 `last_evaluated_at` 推进，**但不带 `a.enabled` 资格谓词**——因为到期这一刻订阅正被
- * 置为停用，用启用谓词会把自己挡掉。命中冲突（已产过）⇒ 返回 null。
+ * 同一段 `last_evaluated_at` 推进、同样的**模板闸**（`t.enabled AND t.deleted_at IS NULL`，
+ * 与 #524 审计回修后的 `claimMacroRun` 一致），**但不带订阅自身的 `a.enabled` 谓词**。
+ *
+ * 取舍（写清楚）：
+ *   - 不查 `a.enabled` 是**刻意**的——到期这一刻订阅正要被置为停用，用启用谓词会把自己挡掉；
+ *   - 查模板闸也是**刻意**的——模板已软删/停用时，那条订阅本来就不该再产生任何东西（包括到期
+ *     通知），所以到期意图同样挡在模板闸之后。
+ * 命中冲突（已产过）⇒ 返回 null。
  */
 export async function claimExpiryRun(pool, { assignmentId, now }) {
   const at = now instanceof Date ? now : new Date(now);
   const res = await pool.query(
     `INSERT INTO macro_runs
          (assignment_id, anchor, criterion, status, bucket, started_at)
-     VALUES ($1, $2, 'tick', 'pending', 'expiry', $3)
+     SELECT $1, $2, 'tick', 'pending', 'expiry', $3
+       WHERE EXISTS (SELECT 1 FROM macro_assignments a
+                       JOIN macro_templates t ON t.id = a.template_id
+                      WHERE a.id = $1 AND t.enabled AND t.deleted_at IS NULL)
      ON CONFLICT (assignment_id, anchor, criterion, bucket) DO NOTHING
      RETURNING id`,
     [assignmentId, `assignment:${assignmentId}`, at],
@@ -321,7 +337,7 @@ export async function evalSilence(pool, a, nowMs, { log } = {}) {
     const threshold = silenceThresholdForPhase(phase, a.params);
     if (threshold == null) continue; // 该相位默认关（awaiting_llm）⇒ 不判
     // 静默起点：有事件用最后事件 ts；无事件退到 run 起跑时刻（started/queued）。
-    const sinceTs = lastEv ? Date.parse(lastEv.ts) : Date.parse(run.started_at ?? run.queued_at);
+    const sinceTs = lastEv ? toMs(lastEv.ts) : toMs(run.started_at ?? run.queued_at);
     const silentMs = nowMs - sinceTs;
     if (!(silentMs > threshold)) continue;
     const anchor = `run:${run.id}`;
