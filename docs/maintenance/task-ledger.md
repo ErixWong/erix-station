@@ -5461,10 +5461,19 @@ AND seq >= $ [AND seq < $] ORDER BY seq DESC LIMIT $`），走既有 `UNIQUE (se
 | M5 撤掉发现查询的上界 `before` | **恰 2 条红**（页界 + 上界承重） |
 
 **门禁读数**：`node --test 'portal/test/session-events-history.test.js'; echo rc=$?` ⇒ **`rc=0`**（27/27）；
-根 `npm test; echo rc=$?` ⇒ **`rc=0`**（`# tests 2363 / # pass 2349 / # fail 0 / # skipped 14`）。
-⚠ 第一次跑根套件曾红一条 `env-int-strict-506e.test.js` 的 `#routes③ … 回收仍按 10s 一拍`
-（`循环必须停在某一拍的 sleep 上`）——**与本单无关的计时敏感用例**，单跑该文件 `rc=0`、复跑根套件 `rc=0`。
-前端未改 ⇒ 未跑前端套件；`AGENTS.md` 未动 ⇒ 热层字节闸不在本单账上。
+根 `npm test; echo rc=$?` ⇒ **`rc=0`**（`# tests 2363 / # pass 2349 / # fail 0 / # skipped 14`；
+基线 origin/main 同机同窗口现查是 2356 ⇒ **本单 +7 条**）。前端未改 ⇒ 未跑前端套件；`AGENTS.md` 未动
+⇒ 热层字节闸不在本单账上（顺手跑了 `npm run check:agents-hotlayer` ⇒ `VERDICT ok`）。
+
+⚠ **同一台机器上的计时敏感用例在抖，且与本单无关（已做基线对照）**：本分支根套件连跑 **7 次 = 3 次
+`rc=0` / 4 次 `rc=1`**，红的**全部**是计时敏感用例（没有一条落在本单改的端点上）：`env-int-strict-506e.test.js` 的 `#routes③ …` 与
+`#506e③ …`（`循环必须停在某一拍的 sleep 上`）、`idle-backoff-506.test.js:282` 的「孤儿回收按独立节拍
+⇒ 60s 空转约 6 次」；单跑 `env-int-strict-506e.test.js` 永远 `rc=0`。**基线对照**：同一时间窗口把
+`origin/main` 另开 worktree（共用 node_modules）连跑 **3 次 = 2 次 `rc=0` / 1 次 `rc=1`**，红的就是
+同样那两条（两边红的集合完全同形；本单改的是 `portal/src/http.js` 的历史端点，不在这两条的调用链上）。
+当时 `load average 17.6`、`ollama` 吐 355% CPU。交回读数取机器空下来
+那一次：**`rc=0`**。（那批用例自身的计时敏感度是一块既有债，本单不动它们，也不拿「复跑至绿」冒充证据——
+基线同形状已写在上面。）
 
 **未尽项 / 已接受边界**：① 候选发现的条数上界 = `limit`（极端会话「一整页都是被取消的 run」时，
 一页最多带出 `limit` 条分隔条；`next_cursor` 在空页上为 null ⇒ 分页到此为止，不会漏掉更新的内容）；
