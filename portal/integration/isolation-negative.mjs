@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, removeDbDir, resolveDbDir, writeDynamicStub,
+  SHARED_STACK, assertIsolatedEnvironment, assertHostWritePathsIsolated, defaultFdeIpamPools, deriveFdeIpamPools, parseComposeEnvFile, removeDbDir, resolveDbDir, writeDynamicStub,
   deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
 // 工单 F（wp2a 重建）：`ports.json ↔ port_allocations` 对账件是 wp2a 最重的断言；提到纯函数后，
@@ -210,6 +210,35 @@ cases.push(await expectReject('waitForHostFile() 目录读不到 ⇒ 提前放�
   fs.rmSync(leafRoot, { recursive: true, force: true });
 }
 
+// 14) PR #554 复审 BLOCKER：`deploy/.env` 里**未加引号的行内注释**会把值变成
+//     `/docker/station-edge/dynamic # shared` ⇒ 与真路径**不相等** ⇒ 「与共享 `.env` 的值不相等」这条
+//     隔离判据在**危险方向上恒真**（隔离栈照旧往生产边缘写，预检却绿；#227① 当年就是这类「绿着写错」）。
+//     必须当场拒，并点名 文件:行号:键名 + 原文。只盯 HOST_WRITE_PATH_ENVS 那四个键：全文件一律拒会误杀
+//     真 `.env` 里 `POSTGRES_PASSWORD=xxxx # 说明` 这种合法行（实测本仓库 `deploy/.env` 就有三行）。
+//     变异入口：把 `findUnreproducibleEnvLines` 改成返回 []（= 撤掉那条拒绝）⇒ 本陷阱失灵（--strict rc=1）。
+{
+  const envDir = fs.mkdtempSync(path.join(os.tmpdir(), `erix-554-env-${process.pid}-`));
+  const isolatedFour = {
+    TRAEFIK_DYNAMIC_DIR_HOST: '/docker/station-edge/dynamic',
+    ERIX_USERSPACE_ROOT_HOST: '/erix-e2e/users',
+    ERIX_ARTIFACTS_ROOT_HOST: '/erix-e2e/artifacts',
+    STATION_DB_DIR: '/erix-e2e/db',
+  };
+  const inlineFile = path.join(envDir, 'shared-inline.env');
+  fs.writeFileSync(inlineFile, '# 共享栈\n\nTRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared\n');
+  cases.push(expectThrow('assertHostWritePathsIsolated() 共享路径带未加引号行内注释 ⇒ 当场拒并点名 文件:行号:键名',
+    () => assertHostWritePathsIsolated({ env: isolatedFour, envFile: inlineFile, label: 'wp3b-e2e' }),
+    { namesMustInclude: [':3 TRAEFIK_DYNAMIC_DIR_HOST', '未加引号', 'TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared'] }));
+  // 15) 同族第二形：比对键的值里有 `$` 插值（compose 会展开，我们看不到它的展开上下文）⇒ 无从证明
+  //     compose 拿到的就是这个字符串 ⇒ 也只能拒。变异入口：删掉 `interpolates` 那条分支 ⇒ 本陷阱失灵。
+  const interpFile = path.join(envDir, 'interp.env');
+  fs.writeFileSync(interpFile, 'STATION_DB_DIR=/docker/${STACK}/db\n');
+  cases.push(expectThrow('assertHostWritePathsIsolated() 比对键的值带 $ 插值 ⇒ 同族拒（无从复现 compose 真值）',
+    () => assertHostWritePathsIsolated({ env: isolatedFour, envFile: interpFile, label: 'wp3b-e2e' }),
+    { namesMustInclude: ['interp.env:1 STATION_DB_DIR', '$ 插值'] }));
+  fs.rmSync(envDir, { recursive: true, force: true });
+}
+
 // --- 正例（夹具 env 必须过护栏；否则上面的负例是「全都抛」的空洞通过）---------------------
 let positiveOk = true;
 let positiveError = '';
@@ -221,6 +250,33 @@ try {
   assert.ok(dockerCalls.length === callsBefore + 1, 'ERIX_E2E_ALLOW_DB_DIR=1 时 removeDbDir 应真的执行 docker');
   assert.ok(resolveDbDir({ STATION_DB_DIR: '/tmp/station-db-x/' }) === '/tmp/station-db-x',
     'resolveDbDir 应去掉尾斜杠');
+  // PR #554 BLOCKER 的反向自证（**不误杀**）：注释行 / 空行 / 缩进注释 / 引号内含 `#` / `#` 前无空格 /
+  // 非比对键带行内注释，都得照常过；且引号内的 `#` 必须是**正文**（compose 实测口径，误剥 = 把合法值改短）。
+  {
+    const okDir = fs.mkdtempSync(path.join(os.tmpdir(), `erix-554-ok-${process.pid}-`));
+    const okFile = path.join(okDir, 'ok.env');
+    fs.writeFileSync(okFile, [
+      '# 说明', '', '   # 缩进注释',
+      'TRAEFIK_DYNAMIC_DIR_HOST="/docker/station-edge/dynamic # odd"',
+      'ERIX_USERSPACE_ROOT_HOST=/erix/users#nospace',
+      'ERIX_ARTIFACTS_ROOT_HOST=/erix/artifacts',
+      'STATION_DB_DIR=/docker/station-db',
+      'POSTGRES_PASSWORD=Sup3r#cret # 生产库密码',
+    ].join('\n') + '\n');
+    assertHostWritePathsIsolated({
+      env: {
+        TRAEFIK_DYNAMIC_DIR_HOST: '/erix-e2e/dynamic', ERIX_USERSPACE_ROOT_HOST: '/erix-e2e/users',
+        ERIX_ARTIFACTS_ROOT_HOST: '/erix-e2e/artifacts', STATION_DB_DIR: '/erix-e2e/db',
+      },
+      envFile: okFile, label: 'wp3b-e2e',
+    });
+    const sharedValues = parseComposeEnvFile(okFile).values;
+    assert.equal(sharedValues.TRAEFIK_DYNAMIC_DIR_HOST, '/docker/station-edge/dynamic # odd',
+      '引号内的 `#` 是正文（误剥就是把合法路径改短 ⇒ 判据又在危险方向上漂）');
+    assert.equal(sharedValues.ERIX_USERSPACE_ROOT_HOST, '/erix/users#nospace', '`#` 前不是空格就不是注释（实测 compose 同口径）');
+    assert.equal(sharedValues.POSTGRES_PASSWORD, 'Sup3r#cret', '非比对键：注释照剥但不因此拒（真 `deploy/.env` 里三行密码就是这个写法）');
+    fs.rmSync(okDir, { recursive: true, force: true });
+  }
 } catch (error) {
   positiveOk = false;
   positiveError = String(error?.message ?? error);
@@ -676,7 +732,9 @@ try {
 // removeDbDir 副本：#227.1 已收编 wp2b/wp3b（wp2b 走 allowSharedReset 显式声明共享重置，
 // wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
 const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable',
-  'deriveFdeIpamPools', 'defaultFdeIpamPools', 'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce'];
+  'deriveFdeIpamPools', 'defaultFdeIpamPools', 'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce',
+  // PR #554 BLOCKER：env 行内注释的解析与「无从复现」判定也只允许一份定义（两份解析必然漂）。
+  'parseComposeEnvLine', 'parseComposeEnvFile', 'findUnreproducibleEnvLines'];
 // 工单 F：`ports.json ↔ port_allocations` 对账件的唯一定义处是 lib/ports-reconcile.mjs（不在
 // isolated-env.mjs 里），所以单一来源断言得按名字选归属文件，不能再默认「只有 isolated-env.mjs」。
 const SINGLE_SOURCE_FILES = {

@@ -21,6 +21,11 @@ import {
   formatLastSegmentLinkLine, inspectHostPathChain, materializeSnapshot, observeHostPath, observeLastSegmentLink,
   observeSegmentLink, toContainerPath, waitForHostFile,
 } from '../portal/integration/lib/e2e-preflight.mjs';
+// PR #554 复审 BLOCKER（E1–E5）：隔离预检读的就是这份 env，解析口径漂了判据就在危险方向上恒真。
+import { execFileSync } from 'node:child_process';
+import {
+  assertHostWritePathsIsolated, parseComposeEnvFile, parseComposeEnvLine,
+} from '../portal/integration/lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 /** 真实 EACCES 复现不了（属主就是自己）⇒ 用注入的 fsImpl 造 EACCES。 */
@@ -454,4 +459,174 @@ test('#495 接线静态自检：脚本必须在**任何 docker 之前**做预检
     assert.doesNotMatch(text, /fs\.existsSync\(config(?:Json)?Path\)/,
       `${script}: 又用 fs.existsSync(configPath) 等物化（EACCES 会被吞成「没物化」，#495 ②）`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// #227① E1–E5：`deploy/.env` 的值解析 ⇔「与共享路径不同」这条隔离判据（PR #554 复审 BLOCKER）
+//
+// 坑的形状：旧 `readEnvFile` 的正则在**未加引号**的值上把 ` # …` 整段留在值里 ⇒
+// `TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared` 解析成
+// `"/docker/station-edge/dynamic # shared"`，**不等于**真路径 `/docker/station-edge/dynamic`
+// ⇒ `assertHostWritePathsIsolated` 那条「与共享 `.env` 的值不相等」在**危险方向上恒真**：
+// 隔离栈照旧往生产边缘的目录写（#227① 现场：8090 全线 502 而容器全绿），预检却报绿。
+//
+// 取舍（主 agent 给的 A 案）：预检**拒**「我们无从复现 compose 真值」的键值行（点名 文件:行号:键名 + 原文），
+// 而不是让解析器去猜 compose 会怎么读。代价 = 真 `.env` 若在这四个比对键上写了未加引号注释，起跑前会红一次
+// （文案直接给改法），所以只盯那四个键 ⇒ E2 就是「不误杀」那一格。
+// E3/E4 是**外部基准**（不许同源自证）：E3 的表照抄真 compose 2.40.3 的输出（命令与原文读数见交付报告），
+// E4 在有 docker 的机器上现场再跑一次 compose 对账；没有 docker 就 skip 并说明退回 E3 的记录读数。
+// ---------------------------------------------------------------------------
+
+/** compose 2.40.3 对这些写法的实际读数（基准命令：`docker compose --env-file <env> -f <yml> config --format json`）。 */
+const COMPOSE_PARSE_CASES = [
+  ['V1=/a/b # shared', '/a/b'],                       // 本单 BLOCKER 那一形
+  ['V2="/c/d" # after quoted', '/c/d'],               // 引号闭合后的注释同样剥
+  ['V3=/g/h#nospace', '/g/h#nospace'],                // `#` 前不是空格 ⇒ 不是注释
+  ['V4="/i/j # inside"', '/i/j # inside'],            // 引号内的 `#` 是正文
+  ["V5='#k/l # single'", '#k/l # single'],
+  ['V6=a  b   #   deep', 'a  b'],
+  ['V7=/m/n\t#tab', '/m/n\t#tab'],                    // tab 不算注释起始（实测：只有空格算）
+  ['V8=  spaced value  # tail', 'spaced value'],
+  ['V9=#hash first', '#hash first'],                  // 值首的 `#` 是字面量
+  ['V10=/p/q   ', '/p/q'],
+  ['V11=/r/s "" # quoted empty after', '/r/s ""'],
+  ['V12=/t/u"q" # quoted inside', '/t/u"q"'],
+  ['V13="" # empty then comment', ''],
+];
+/** 一套「四个宿主写路径键都隔离干净」的 env 值。 */
+const ISOLATED_FOUR = Object.freeze({
+  TRAEFIK_DYNAMIC_DIR_HOST: '/erix-e2e/dynamic',
+  ERIX_USERSPACE_ROOT_HOST: '/erix-e2e/users',
+  ERIX_ARTIFACTS_ROOT_HOST: '/erix-e2e/artifacts',
+  STATION_DB_DIR: '/erix-e2e/db',
+});
+
+/** 写一份「共享 deploy/.env」夹具（根目录先 realpath 归一：`$TMPDIR` 本身是链接时也不受牵连）。 */
+function envFileFixture(t, sharedLines) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-554-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const envFile = path.join(root, 'shared.env');
+  fs.writeFileSync(envFile, sharedLines.join('\n') + '\n');
+  return { root, envFile };
+}
+
+test('#227① E1 共享路径带未加引号的行内注释 ⇒ 预检必须红并点名 文件:行号:键名（危险方向不再恒真）', (t) => {
+  const { root, envFile } = envFileFixture(t, [
+    '# 共享栈（生产边缘读的就是这一份）',
+    '',
+    'TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared',
+  ]);
+  const mine = { ...ISOLATED_FOUR, TRAEFIK_DYNAMIC_DIR_HOST: '/docker/station-edge/dynamic' };
+  assert.throws(() => assertHostWritePathsIsolated({ env: mine, envFile, label: 'wp3b-e2e' }), (error) => {
+    const text = String(error.message);
+    assert.match(text, /shared\.env:3 TRAEFIK_DYNAMIC_DIR_HOST/, `必须点名 文件:行号:键名，实际：${text}`);
+    assert.ok(text.includes('未加引号'), `要说清拒的是哪一形，实际：${text}`);
+    assert.ok(text.includes('TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared'),
+      `必须带上原文（不给人看原文，人就看不出这行为什么危险）：${text}`);
+    return true;
+  });
+  // 同一行去掉注释 ⇒ 碰撞判据照常工作。别让它变成「只有拒」活着、真碰撞反倒没人管。
+  const clean = path.join(root, 'clean.env');
+  fs.writeFileSync(clean, 'TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic\n');
+  assert.throws(() => assertHostWritePathsIsolated({ env: mine, envFile: clean, label: 'wp3b-e2e' }), /与共享栈共用同一份/);
+  // 机器事实：compose 对那一行读到的**就是**那条真路径（旧解析留下的字符串与真值不等 ⇒ E1 的红有依据，不是文案红）
+  assert.equal(parseComposeEnvFile(envFile).values.TRAEFIK_DYNAMIC_DIR_HOST, '/docker/station-edge/dynamic');
+});
+
+test('#227① E2 合法 env 不误杀：注释行 / 空行 / 缩进注释 / 引号内含 # / # 前无空格 / 非比对键带行内注释', (t) => {
+  const { envFile } = envFileFixture(t, [
+    '# 说明', '', '   # 缩进注释',
+    'TRAEFIK_DYNAMIC_DIR_HOST="/docker/station-edge/dynamic # odd"',
+    'ERIX_USERSPACE_ROOT_HOST=/erix/users#nospace',
+    'ERIX_ARTIFACTS_ROOT_HOST=/erix/artifacts',
+    'STATION_DB_DIR=/docker/station-db',
+    'POSTGRES_PASSWORD=Sup3r#cret # 生产库密码',
+    'PLATFORM_DB_PASSWORD=p1 # 平台库',
+  ]);
+  assert.doesNotThrow(() => assertHostWritePathsIsolated({ env: ISOLATED_FOUR, envFile, label: 'wp3b-e2e' }));
+  const values = parseComposeEnvFile(envFile).values;
+  assert.equal(values.TRAEFIK_DYNAMIC_DIR_HOST, '/docker/station-edge/dynamic # odd',
+    '引号内的 `#` 必须是正文（误剥就是把一条合法路径改短 ⇒ 又在危险方向上漂）');
+  assert.equal(values.ERIX_USERSPACE_ROOT_HOST, '/erix/users#nospace', '`#` 前不是空格就不是注释（compose 实测同口径）');
+  assert.equal(values.POSTGRES_PASSWORD, 'Sup3r#cret',
+    '非比对键：注释照剥（compose 口径）但不因此拒 —— 真 `deploy/.env` 里三行密码就是这个写法，一律拒就是把 e2e 关在门外');
+});
+
+test('#227① E3 外部基准（记录读数）：compose 2.40.3 对 13 种写法的读数，我们的解析必须逐字相等', () => {
+  const problems = [];
+  for (const [line, want] of COMPOSE_PARSE_CASES) {
+    const key = /^([A-Z0-9_]+)=/.exec(line)[1];
+    const parsed = parseComposeEnvLine(line);
+    if (parsed.kind !== 'pair') problems.push(`${key}: 我们解析成 ${parsed.kind}，compose 读到的是 ${JSON.stringify(want)}`);
+    else if (parsed.value !== want) {
+      problems.push(`${key}: 我们 ${JSON.stringify(parsed.value)} ≠ compose ${JSON.stringify(want)}（原文 ${JSON.stringify(line)}）`);
+    }
+  }
+  assert.deepEqual(problems, [],
+    `解析口径与 compose 漂了（隔离判据比的是字符串，往哪个方向漂就是哪个方向的错）：\n  ${problems.join('\n  ')}`);
+  // compose 自己会硬报错的两种写法：我们复现不了 ⇒ 必须标 unparsable（交给预检拒），不许默默给个值
+  assert.equal(parseComposeEnvLine('V14="/a/b # x').kind, 'unparsable', '未闭合引号');
+  assert.equal(parseComposeEnvLine('V15="/a/b"junk # c').kind, 'unparsable', '引号闭合后带垃圾');
+  // 纯注释行与空行不算键值行（误算就是把 `# 说明` 当成一个键）
+  assert.equal(parseComposeEnvLine('   # 说明').kind, 'blank', '缩进的注释行也是注释');
+  assert.equal(parseComposeEnvLine('   ').kind, 'blank', '空行');
+});
+
+test('#227① E4 外部基准（现场复核）：现场再跑一次真 compose 与我们的解析对账（无 docker ⇒ skip 并说明）', (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-554-oracle-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const envFile = path.join(root, '.env');
+  fs.writeFileSync(envFile, COMPOSE_PARSE_CASES.map(([line]) => line).join('\n') + '\n');
+  const composeFile = path.join(root, 'probe.yml');
+  fs.writeFileSync(composeFile, ['services:', '  probe:', '    image: alpine', '    environment:']
+    .concat(COMPOSE_PARSE_CASES.map(([line]) => {
+      const key = /^([A-Z0-9_]+)=/.exec(line)[1];
+      return `      ${key}: "\${${key}:-UNSET}"`;
+    }))
+    .join('\n') + '\n');
+  let json;
+  try {
+    json = execFileSync('docker', ['compose', '--env-file', envFile, '-f', composeFile, 'config', '--format', 'json'],
+      { encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    const why = String(error?.stderr ?? error?.message ?? error).split('\n')[0];
+    t.skip(`现场没有可用的 docker compose（${why.slice(0, 100)}）⇒ 外部基准退回 E3 的记录读数（那张表也是从真 compose 抄的）`);
+    return;
+  }
+  const got = JSON.parse(json).services.probe.environment ?? {};
+  const problems = [];
+  for (const [line, want] of COMPOSE_PARSE_CASES) {
+    const key = /^([A-Z0-9_]+)=/.exec(line)[1];
+    const expect = want === '' ? 'UNSET' : want;   // `${K:-UNSET}`：空值走默认分支（compose 实测）
+    // 三方对账：现场 compose ⇔ 记录表（E3）⇔ 我们的解析器。只比前两样只能发现「表过期」，
+    // 发现不了「解析器漂了」——而漂了的解析器正是本单 BLOCKER 的病根。
+    if (got[key] !== expect) problems.push(`${key}: compose 现场读 ${JSON.stringify(got[key])} ≠ 记录表 ${JSON.stringify(want)}（原文 ${JSON.stringify(line)}）⇒ 表过期了`);
+    const mine = parseComposeEnvLine(line);
+    if (mine.kind !== 'pair' || mine.value !== want) problems.push(`${key}: 我们的解析读 ${JSON.stringify(mine.value ?? mine.kind)} ≠ compose 现场 ${JSON.stringify(got[key])}（原文 ${JSON.stringify(line)}）⇒ 解析口径漂了`);
+  }
+  assert.deepEqual(problems, [], `现场 compose ⇔ 记录表 ⇔ 我们的解析三方对不上：\n  ${problems.join('\n  ')}`);
+});
+
+test('#227① E5 同族拒：比对键的值带 $ 插值 / 未闭合引号 / 引号后带垃圾 ⇒ 点名到行（非比对键不误杀）', (t) => {
+  for (const [line, key, wantName] of [
+    ['STATION_DB_DIR=/docker/${STACK}/db', 'STATION_DB_DIR', '$ 插值'],
+    ['ERIX_ARTIFACTS_ROOT_HOST="/a/b # x', 'ERIX_ARTIFACTS_ROOT_HOST', '未闭合'],
+    ['ERIX_USERSPACE_ROOT_HOST="/a/b"junk # c', 'ERIX_USERSPACE_ROOT_HOST', '垃圾'],
+  ]) {
+    const { envFile } = envFileFixture(t, [line]);
+    assert.throws(() => assertHostWritePathsIsolated({ env: ISOLATED_FOUR, envFile, label: 'wp3b-e2e' }), (error) => {
+      assert.ok(String(error.message).includes(`shared.env:1 ${key}`), `${key} 必须被点名到行，实际：${error.message}`);
+      assert.ok(String(error.message).includes(wantName), `文案要说清是哪一形（${wantName}），实际：${error.message}`);
+      return true;
+    });
+  }
+  // 反向自证：`$` 出现在**非比对键**上不误杀（密码里带 `$` 很常见，一律拒就是把 e2e 关在门外）
+  const { envFile } = envFileFixture(t, [
+    'TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic',
+    'ERIX_USERSPACE_ROOT_HOST=/docker/erix/users',
+    'ERIX_ARTIFACTS_ROOT_HOST=/docker/erix/artifacts',
+    'STATION_DB_DIR=/docker/station-db',
+    'POSTGRES_PASSWORD=p$a$sw0rd # 生产库密码',
+  ]);
+  assert.doesNotThrow(() => assertHostWritePathsIsolated({ env: ISOLATED_FOUR, envFile, label: 'wp3b-e2e' }));
 });
