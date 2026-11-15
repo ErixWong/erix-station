@@ -37,6 +37,16 @@ const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
  * 不是引擎名单的副本（那会被误读成「引擎加了就要改这里」）。
  * @type {ReadonlySet<string>}
  */
+/**
+ * `textualized_tool_call_marker` 的长度上界（PR #555 复审 MED-2）。
+ * ⚠ **三方同源**：`runner/lib/final-text-toolcall.js` 的同名常量（worker 侧生成）+ `runner/agentd.js`
+ * （透传时同样丢弃）+ 这里（契约闸）。**不许两处各写一个裸数字**——那是下一次漂移的源头；
+ * 对账判据：`portal/test/textualized-toolcall.test.js`（源码级读两侧常量数值相等 + 跨面行为格拿真
+ * `textualizedToolCallField` 造的载荷过这道闸）。
+ * 为什么 runner 侧必须先丢：本函数这道校验在**开事务之前**，400 会把整条终态打回
+ * （终态不写、不重试 ⇒ run 等租约过期 / reaper），一个纯观测性的片段不该有那种权力。
+ */
+const TEXTUALIZED_MARKER_MAX_CHARS = 120;
 const PORTAL_RESERVED_EVENT_TYPES = new Set(['run_end', 'partial_output', 'attempt_killed', 'textualized_tool_call']);
 // portal.md §9.7：单轮 transcript 记录体积上限。**默认仍是契约值 1 MiB**，issue #371-B 起可由
 // env `MAX_ROUND_BYTES` 覆盖（真机复现「宿主拒 → 引擎剥归档重试一次」要把闸调小到几百 KB，
@@ -877,9 +887,12 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
   }
   const textualizedToolCall = body.textualized_tool_call === true;
   const rawToolCallMarker = body.textualized_tool_call_marker;
+  // 契约闸（**不是**主要防线）：新链路的 runner/agentd 已经把超长 marker 丢在源头，走到这里的
+  // 只有旧容器或手写载荷。超长/脏值仍 400，但**别指望它**：400 会把整条终态打回（见上面常量注释）。
   if (rawToolCallMarker !== undefined && (typeof rawToolCallMarker !== 'string'
-    || rawToolCallMarker === '' || rawToolCallMarker.length > 120)) {
-    throw new InternalError(400, 'validation_failed', 'textualized_tool_call_marker 必须为非空字符串且 ≤120 字符', {
+    || rawToolCallMarker === '' || rawToolCallMarker.length > TEXTUALIZED_MARKER_MAX_CHARS)) {
+    throw new InternalError(400, 'validation_failed',
+      `textualized_tool_call_marker 必须为非空字符串且 ≤${TEXTUALIZED_MARKER_MAX_CHARS} 字符`, {
       details: { field: 'textualized_tool_call_marker' },
     });
   }

@@ -6,8 +6,9 @@
 // `termination.reason` 仍是正常值（静默发生）。本模块只回答一个问题：
 // **这段终局正文看起来像不像「被文本化的工具调用」**——不发事件、不改终态、不碰引擎。
 //
-// ── 缺省特征集为什么是这三条（**取证在下方注释里，不是拍的**）────────────────────────
-// 三条全部来自本机 dev 库 `station-db` 的**真实样本**（只读查询，2026-11-16 现查）：
+// ── 缺省特征集为什么是这四条（**取证在下方注释里，不是拍的**）────────────────────────
+// 前**三条**来自本机 dev 库 `station-db` 的**真实样本**（只读查询，2026-11-16 现查）；
+// **第四条是预防性覆盖**（下面逐条标了它是实证还是预防——别把预防写成实证）：
 //
 // 1. `<｜｜DSML｜｜`（U+FF5C ×2 + `DSML` + U+FF5C ×2）——DSML 那一族的**前缀**。
 //    样本 A（run `f4dfea1d-c439-…`，2026-10-11，`round_end.payload.final_text` seq 37223，
@@ -20,6 +21,23 @@
 //    取「到 `｜｜` 为止的前缀」才同时覆盖 `tool_calls` / `invoke` / `parameter` 与带空格变体。
 // 2. `<tool_call` —— 覆盖 `<tool_calls>` / `<tool_call>` / `<tool_call name=…>`。
 // 3. `<｜Function` —— 覆盖 `<｜Function_calls｜>` / `<｜Function=…｜>` 一族（同一个 U+FF5C 族）。
+// 4. `<invoke` —— XML 那一族（Anthropic/LiteLLM 把 tool call 编成 `<invoke name="exec">…</invoke>`）。
+//    ⚠ **预防性覆盖，不是实证**：261116 返工现查 dev 库，`<invoke name=` 在 `run_events.payload`、
+//    `messages.content`、`transcript_rounds(record/messages)` 三处**各 0 命中**（同一批查询里
+//    `DSML` 的阴性对照是 6 / 1 / 8 行 ⇒ 不是查法失效，是库里真没有）。加它的理由只有两条：
+//    形态确定（第三方复审在 PR #555 上复现了 `detect('<invoke name="exec">…') => hit:false`），
+//    且**含 `<`、长度 7**，正常交付在代码块**外**裸写它的概率极低（代码块已剥）。
+//
+// 5. `chatcmpl-tool-`（**不含 `<`** 的那一族）—— OpenAI/LiteLLM 把 tool call 的 **id** 直接写进 content
+//    时的前缀形态（第三方复审在 PR #555 上复现 `detect('…chatcmpl-tool-abc123def456') => hit:false`）。
+//    它进不了「条目必须含 `<`」这条规则，而那条规则是**防误伤的承重墙**（`off` 会命中 "offset"），
+//    所以不是把门槛调低，而是把「**像一个 id 前缀**」写成判据：
+//    **不含 `<` 的条目要求长度 ≥12 且含 `-`**（`chatcmpl-tool-` 长 13、含 `-` ⇒ 过；
+//    `chatcmpl` 长 8 ⇒ 拒；`offset` / `offer` ⇒ 拒）。
+//    ⚠ 同样是**预防性覆盖，不是实证**：`chatcmpl-tool-` 在 `run_events.payload`、`messages.content`、
+//    `transcript_rounds` 三处**各 0 命中**；`chatcmpl` 裸串全库只捞到 1 行，且那行是某个 run
+//    用 `writeFile` 写下去的测试脚本正文（`tool_use` 载荷，不是终局正文）⇒ 它同时说明
+//    「裸 `chatcmpl` 会出现在正常内容里」，这就是为什么进缺省的是**带 `-` 的 13 字符前缀**而不是短词。
 //
 // ⚠ **不许只钉 DSML 一条**：这类泄漏的成因是「上游/网关把 tool call 编进 content」，不同上游
 // 的编码不同（工单原文：「只要所用模型的 tool-call 编码落到 content…就会复现，不是偶发」）。
@@ -33,34 +51,77 @@
 // · 残余误伤面（诚实标注）：正文在代码块**之外**裸写 `<tool_call` 这类字面串的正常交付摘要
 //   会被判真。本模块的结论只是「值得提示」，不是「失败」——下游一律按**中性提示**渲染。
 // · 非法特征值**不许静默**：`invalid[]` 逐条带原值与理由，`warnings[]` 是人话（点名是哪个值）；
-//   全部条目都非法 ⇒ 回退缺省三条，**不是**关掉检测（静默关掉 = 又把问题吞回去）。
+//   全部条目都非法 ⇒ 回退缺省特征集，**不是**关掉检测（静默关掉 = 又把问题吞回去）。
 
 /** 特征集的环境变量名（下发光纤与其余 runner 旋钮同族：compose → provisioner → 容器 env）。 */
 export const TOOLCALL_MARKERS_ENV = 'ERIX_FINAL_TEXT_TOOLCALL_MARKERS';
 
 /**
- * 缺省特征集（三条，逐条理由见文件头；**顺序即匹配优先级**，命中就带回是哪一条）。
- * 值域说明：这三条都含 `<`，且长度 ≥3 —— 下面解析器拒绝的正是「不含 `<`」与「短于 3」两类，
- * 因为那种值会在自然语言里大面积误伤（`off` 会命中 "offset"，`<` 会命中一切正文）。
+ * 缺省特征集（五条，逐条理由见文件头；**顺序即匹配优先级**，命中就带回是哪一条）。
+ * 前三条是 dev 库真样本（**实证**），第四条 `<invoke` 与第五条 `chatcmpl-tool-` 是**预防性覆盖**
+ * （库里现查各 0 命中，取数语句与读数在交付里；措辞不许写成实证）。
+ * 值域说明：前四条**含 `<`** 且长度 ≥3 ⇒ 解析器对含 `<` 的条目拒的正是「短于 3」（`<` 会命中一切正文）；
+ * 第五条**不含 `<`** ⇒ 它靠的是「**长度 ≥12 且含 `-**`」这条形状闸（「像 id 前缀」写成判据），
+ * 同一个闸挡住 `off` / `chatcmpl` / `offset` 这类会咬自然语言的短词。
  */
-export const DEFAULT_TOOLCALL_MARKERS = Object.freeze(['<｜｜DSML｜｜', '<tool_call', '<｜Function']);
+export const DEFAULT_TOOLCALL_MARKERS = Object.freeze([
+  '<｜｜DSML｜｜', '<tool_call', '<｜Function',
+  '<invoke',            // XML 一族：**预防性覆盖**（dev 库现查 0 命中，理由见文件头）
+  'chatcmpl-tool-',     // OpenAI 的 tool-call id 前缀：**预防性覆盖**，也是唯一一条**不含 `<`** 的
+                        //（它进得来靠的是「长度 ≥12 且含 `-`」那条形状闸，不是靠把门槛调低）
+]);
 
 /** 显式关掉检测的哨兵值（整串就是它，大小写不敏感）。**必须显式写**，写错字不会静默关。 */
 export const TOOLCALL_MARKERS_OFF = 'off';
 
-/** 一条特征至少这么长（`<x` 这种两字符子串会在正文里乱咬）。 */
+/**
+ * marker 片段的**字符上界**——三方同源（PR #555 复审 MED-2）：
+ *   ① **runner**（本模块 `textualizedToolCallField`）与 `agentd` 的透传：超长的 marker
+ *      **只丢 marker，布尔照传**（`textualized_tool_call: true` 照发）；
+ *   ② **portal**（`internal.js` 的同名常量）：脏/超长 marker 仍 400，那是**契约闸**，
+ *      但**新链路的产物不该走到那儿**；
+ *   ③ 判据：`portal/test/textualized-toolcall.test.js` 的跨面行为格（拿真 `textualizedToolCallField`
+ *      造的载荷必须过得了 portal 校验）+ 本模块的源码级对账格（两侧同名常量的数值必须相等，
+ *      **不许两处各写一个裸数字**——那是下一次漂移的源头）。
+ *
+ * 为什么非要在源头丢：`internal.js` 的这道校验在**开事务之前**，400 会把**整条终态**打回
+ * （终态不写、不重试，run 只能等租约过期 / reaper 收敛）⇒ 一个**纯观测性**的显示片段
+ * 拿到了拒绝终态的能力，这是把可观测性变成可用性风险。marker 只是界面上的一段引用文本，
+ * 丢了它界面少一句片段，事件与终态一个字都不受影响。
+ */
+export const TEXTUALIZED_MARKER_MAX_CHARS = 120;
+
+/** 含 `<` 的条目至少这么长（`<x` 这种两字符子串会在正文里乱咬）。 */
 const MIN_MARKER_LENGTH = 3;
+
+/**
+ * **不含 `<`** 的条目的形状闸（PR #555 复审 MED-1）：长度 ≥12 **且含 `-`**。
+ *
+ * 为什么需要它：OpenAI 那一族的特征是 tool-call **id 前缀**（`chatcmpl-tool-`），天生不含 `<`，
+ * 而「条目必须含 `<`」是防误伤的承重墙（`off` 会命中 "offset"）。所以不是把门槛调低，
+ * 而是把「**像一个 id 前缀**」写成判据：够长 + 带分隔符。缺省集合**不含**它（库里取不到真样本），
+ * 但配置面收得下它 ⇒ FDE 现场遇到那一族时不必改代码。
+ */
+const MIN_BARE_MARKER_LENGTH = 12;
+const BARE_MARKER_REQUIRED_CHAR = '-';
+
+/** marker 能上界面的长度上界与 portal 同源 ⇒ 超长的条目**照样能判定**，只是命中时不带片段：这里先提示一句。 */
+const MAX_CONFIG_MARKER_HINT = TEXTUALIZED_MARKER_MAX_CHARS;
 
 /**
  * 解析特征集配置（纯函数：不读 `process.env`、不打日志、不抛错）。
  *
  * 口径（与 `runner/lib/config.js` 的 env 族同族，但这一族的「不静默」靠**返回值带账**）：
- * · `undefined` / `null` / 空串 / 全空白 ⇒ 缺省三条（`source: 'default'`，无告警）。
+ * · `undefined` / `null` / 空串 / 全空白 ⇒ 缺省特征集（`source: 'default'`，无告警）。
  * · `off`（整串，大小写不敏感）⇒ 显式关闭：`disabled: true`、`markers: []`，并给一条人话告警
  *   （关闭是个会影响可见面的决定，必须留痕）。
  * · 逗号分隔 ⇒ 逐条 `trim`；空段丢掉不告警（`a,,b` 是手滑，不是写错值）。
- * · 每条必须**长度 ≥3 且含 `<`**；否则**丢弃该条并点名**（进 `invalid[]` + `warnings[]`）。
- * · 全部条目都被丢 ⇒ 回退缺省三条并告警——**绝不因为配错就把检测关掉**。
+ * · 含 `<` 的条目要求**长度 ≥3**；**不含 `<`** 的条目要求**长度 ≥12 且含 `-`**（「像 id 前缀」，
+ *   收得下 `chatcmpl-tool-` 那一族，同时挡住 `off` / `chatcmpl` / `offset` 这类会咬自然语言的短词）；
+ *   不合格者**丢弃该条并点名**（进 `invalid[]` + `warnings[]`）。
+ * · 条目长过 `TEXTUALIZED_MARKER_MAX_CHARS` **不算非法**（照样判定），但会给一条告警：
+ *   命中时那个 marker 片段不会上界面（上界三方同源，见下方 MED-2 注释）。
+ * · 全部条目都被丢 ⇒ 回退缺省特征集并告警——**绝不因为配错就把检测关掉**。
  *
  * @param {unknown} raw 原始 env 值（字符串；其它类型按 `String()` 处理，不抛错）
  * @param {{ key?: string }} [opts] `key` 只影响告警里点名的变量名
@@ -91,9 +152,20 @@ export function parseToolCallMarkers(raw, { key = TOOLCALL_MARKERS_ENV } = {}) {
       continue;
     }
     if (!entry.includes('<')) {
-      invalid.push({ value: entry, reason: '不含 `<`，不是标记类字面串，会命中普通自然语言' });
-      warnings.push(`${key} 条目 ${JSON.stringify(entry)} 非法（不含 \`<\`，不是标记形态），已丢弃`);
-      continue;
+      // 不含 `<` ⇒ 必须是「id 前缀」形态（长度 ≥12 且含 `-`），否则**承重墙**不放过它：
+      // 一个不含 `<` 的短词会在正常交付里大面积命中（`off` 咬 "offset"、`offer` 咬 "offer"），
+      // 每个 run 都刷一条中性提示 = 信号贬值 = 下一次真泄漏没人看。
+      if (entry.length < MIN_BARE_MARKER_LENGTH || !entry.includes(BARE_MARKER_REQUIRED_CHAR)) {
+        invalid.push({ value: entry, reason: `不含 \`<\` 又不是 id 前缀形态（要求长度 ≥${MIN_BARE_MARKER_LENGTH} 且含 \`${BARE_MARKER_REQUIRED_CHAR}\`），会命中普通自然语言` });
+        warnings.push(`${key} 条目 ${JSON.stringify(entry)} 非法（不含 \`<\`，且长度 <${MIN_BARE_MARKER_LENGTH} 或不含 \`${BARE_MARKER_REQUIRED_CHAR}\`），已丢弃`);
+        continue;
+      }
+    }
+    if (entry.length > MAX_CONFIG_MARKER_HINT) {
+      // 不是错误：这么长的字面串**照样参与判定**，只是命中后那个 marker 片段上不了界面
+      // （上界与 portal 同源，见 `TEXTUALIZED_MARKER_MAX_CHARS`）。**提示一句而不是静默**——
+      // 配了它的人该知道自己看到的提示会少一段。
+      warnings.push(`${key} 条目 ${JSON.stringify(entry.slice(0, 24))}… 长 ${entry.length} > ${MAX_CONFIG_MARKER_HINT} ⇒ 命中时不再带 marker 片段（判定与事件不受影响，界面少一句引用）`);
     }
     const dedupKey = entry.toLowerCase();
     if (seen.has(dedupKey)) continue; // 重复条目不是错误，静默去重
@@ -103,7 +175,7 @@ export function parseToolCallMarkers(raw, { key = TOOLCALL_MARKERS_ENV } = {}) {
 
   if (!sawAnyEntry) return { markers: [...DEFAULT_TOOLCALL_MARKERS], invalid, disabled: false, source: 'default', warnings };
   if (markers.length === 0) {
-    warnings.push(`${key} 的全部条目都非法 ⇒ 回退缺省三条（**不是**关掉检测：配错不该把可见面也吞掉）`);
+    warnings.push(`${key} 的全部条目都非法 ⇒ 回退缺省特征集（**不是**关掉检测：配错不该把可见面也吞掉）`);
     return { markers: [...DEFAULT_TOOLCALL_MARKERS], invalid, disabled: false, source: 'default', warnings };
   }
   return { markers, invalid, disabled: false, source: 'env', warnings };
@@ -159,6 +231,7 @@ export function detectTextualizedToolCall(text, markers = DEFAULT_TOOLCALL_MARKE
 // 而这一族事件已经因为「同一件事在三处各说各话」修过四次（#288 / #371-A / #421 / #442）。
 // ---------------------------------------------------------------------------
 
+
 /**
  * 诊断事件类型名。三处集合必须同改（漏一边就是「实时收不到」或「刷新后消失」）：
  * `portal/src/http.js` 的 `HISTORY_EVENT_TYPES` + 前端 `useEventStream.ts` 的 `EVENT_TYPES`
@@ -178,5 +251,10 @@ export const TEXTUALIZED_TOOL_CALL_EVENT_TYPE = 'textualized_tool_call';
 export function textualizedToolCallField(finalText, markers = DEFAULT_TOOLCALL_MARKERS) {
   const hit = detectTextualizedToolCall(finalText, markers);
   if (!hit.hit) return {};
+  // MED-2：marker 超长 ⇒ **只丢这个显示片段，布尔照传**。命中与否由 `detect` 说了算，
+  // 上界只管「这段文字能不能安全地送到界面」，不许反过来取消命中。
+  if (typeof hit.marker === 'string' && hit.marker.length > TEXTUALIZED_MARKER_MAX_CHARS) {
+    return { textualized_tool_call: true };
+  }
   return { textualized_tool_call: true, textualized_tool_call_marker: hit.marker };
 }

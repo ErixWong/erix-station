@@ -28,6 +28,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { claimRun, postEvents, setRunState } from '../src/internal.js';
+// **跨面行为判据**用：拿 runner 真正的载荷生成函数造 U2 body，再喂给 portal 的终态收敛。
+// 先例：`portal/test/engine-error-code-contract.test.js` 直接 import `runner/lib/termination.js`。
+import { TEXTUALIZED_MARKER_MAX_CHARS, textualizedToolCallField } from '../../runner/lib/final-text-toolcall.js';
 import { seedClaimable } from './fake-internal-pool.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -199,6 +202,8 @@ test('#243 D 脏载荷一律 400：写 false、非布尔、marker 非字符串 /
     [{ textualized_tool_call: 'yes' }, '非布尔'],
     [{ textualized_tool_call: true, textualized_tool_call_marker: 42 }, 'marker 不是字符串'],
     [{ textualized_tool_call: true, textualized_tool_call_marker: '' }, '空串（界面上会是一条空提示）'],
+    // 超长：portal 这侧**仍然** 400（它是契约闸）。但新链路根本不该走到这里 ——
+    // runner/agentd 已把超长 marker 丢在源头（见下面 E3 那格跨面行为判据，PR #555 MED-2）。
     [{ textualized_tool_call: true, textualized_tool_call_marker: 'x'.repeat(121) }, '超长（外来字符串必须有上界）'],
   ];
   for (const [extra, why] of cases) {
@@ -258,6 +263,36 @@ test('#243 E 三处集合都含它（漏一边就是一种可见性不一致）'
     assert.match(src.slice(at, end), /'textualized_tool_call'/,
       `${rel} 必须含 textualized_tool_call（#288 老坑：三个集合独立存亡）`);
   }
+});
+
+test('#243 E3 跨面行为：runner 真函数造出来的载荷，超长 marker 也不许把终态打回（PR #555 MED-2）', async () => {
+  // 这条判据的关键是**不手抄载荷**：body 由 runner 真正的 `textualizedToolCallField` 生成，
+  // 所以「runner 的上界比 portal 的宽」这类漂移会以**终态写不进去**的形式炸出来，
+  // 而不是以「两个数字看起来都对」的形式蒙过去。
+  const overCapMarker = '<' + 'z'.repeat(TEXTUALIZED_MARKER_MAX_CHARS);   // 上界 + 1
+  const finalText = '交付说明见上。' + String.fromCharCode(10) + overCapMarker;
+  const extra = textualizedToolCallField(finalText, [overCapMarker]);
+  assert.deepEqual(extra, { textualized_tool_call: true },
+    '前置（runner 侧）：超长只丢片段、布尔照传 —— 本格要证的是 portal 收得下这个形状');
+
+  const ctx = await toRunning(harness());
+  const res = await setRunState(ctx.pool, {
+    container: ctx.container, user: ctx.user, runId: ctx.runId, claimToken: ctx.claimToken,
+    body: finishedBody(finalText, extra),
+  });
+  // ① 终态**照写**：一个观测性片段不许拿到拒绝终态的能力（400 是不写、不重试，run 只能等租约过期）
+  assert.equal(res.state, 'finished');
+  assert.equal(ctx.pool.runs[0].status, 'finished');
+  // ② 诊断事件**照有**
+  assert.equal(diagOf(ctx.pool).length, 1, '超长 marker 那次命中也必须留下事件行');
+  // ③ payload **没有** marker 键（键缺席，不是空串、不是 null）
+  assert.deepEqual(payloadOf(diagOf(ctx.pool)[0]), { chars: finalText.length },
+    'marker 丢在源头 ⇒ payload 只剩 chars；界面那句不许依赖它（前端第 3 步也有对应的一格）');
+  assert.equal(Object.hasOwn(payloadOf(diagOf(ctx.pool)[0]), 'marker'), false);
+  // ④ 对照：同一个函数在**上界之内**给的是两个键 ⇒ 上面那次「没 marker」是长度造成的，不是链路丢了字段
+  const okMarker = '<' + 'z'.repeat(TEXTUALIZED_MARKER_MAX_CHARS - 1);
+  assert.deepEqual(Object.keys(textualizedToolCallField('ok ' + okMarker, [okMarker])).sort(),
+    ['textualized_tool_call', 'textualized_tool_call_marker']);
 });
 
 test('#243 E2 docs/api/portal.md 登记了这条事件（§5.3 清单一行 + §4.4a 白名单一句）', () => {

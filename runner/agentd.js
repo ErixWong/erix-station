@@ -26,6 +26,10 @@ import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
 // delegation P1：开关的**唯一解析口径**与 worker 侧同源（两面各自 `=== '1'` 就会分叉）。
 import { isDelegateEnabled } from './lib/config.js';
+// issue #243 返工（PR #555 MED-2）：marker 片段的长度上界与 runner 侧同一个常量、与 portal 同名同值。
+// 这里**必须**用它：agentd 是 worker → U2 的最后一道宿主关口，超长 marker 若在 portal 侧被 400，
+// 被打回的是**整条终态**（终态不写、不重试），一个显示片段不该有那种权力。
+import { TEXTUALIZED_MARKER_MAX_CHARS } from './lib/final-text-toolcall.js';
 import { archiveRunData, prepareRunDataDir, prepareSessionNotesDir, prepareDelegationDirs, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
 import { captureAndUploadArtifact } from './lib/artifacts.js';
 // 端口呈现优化·观测层 MVP（迁移 0022）：/proc 采样当前真实监听，随 U4 heartbeat 捐带 `listeners`。
@@ -1161,7 +1165,10 @@ async function onWorkerFinished(ctx, msg) {
     ...(msg.textualized_tool_call === true
       ? {
         textualized_tool_call: true,
-        ...(typeof msg.textualized_tool_call_marker === 'string' && msg.textualized_tool_call_marker !== ''
+        // 只丢这个**显示片段**，布尔照传：非串 / 空串 / 超长（> 上界）都不许把整条终态拖下水。
+        ...(typeof msg.textualized_tool_call_marker === 'string'
+          && msg.textualized_tool_call_marker !== ''
+          && msg.textualized_tool_call_marker.length <= TEXTUALIZED_MARKER_MAX_CHARS
           ? { textualized_tool_call_marker: msg.textualized_tool_call_marker }
           : {}),
       }
