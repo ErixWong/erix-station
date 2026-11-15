@@ -5,6 +5,15 @@
 // #101 删除），**行为与导出逐字保留**：worker 无平台凭据、cwd（项目目录，D8 修订 2026-09-24 起）内
 // 可写；越界/遮蔽/非可写路径抛 JailError。
 //
+// ⚠ 唯一一处 station 扩展（issue #231）：`maskedPaths` 的条目从「只有前缀」扩成「前缀 ∪ 名字模式」
+// （含 `*` / `?` 的条目按相对根的**路径段**匹配，见 `splitMaskedEntries`）。**前缀条目的语义逐字未动**，
+// 0.3.5 移植面（越界 / 非可写 / 遮蔽都抛 JailError）也没动；扩的只是「一条遮蔽条目怎么写」。
+// 为什么必须扩：station 的遮蔽口径是 `.env*` / `*.pem` / `id_*` 这类**名字模式**，前缀机制表达不了
+// （前缀 `.env` 只会挡 `.env` 自己与 `.env/` 子树，挡不住 `.env.local`），而「启动时先扫一遍目录把
+// 模式展成具体路径」会给遮蔽集合加一条它本没有的失效条件（run 开始后新建的 `.env` 不在快照里）。
+// 语义与用途的不对称（只挡文件工具、不挡 shell ⇒ 它**不是安全加固**）见 `STATION_MASKED_PATHS` 的注记
+// 与 `docs/design/runner-integration.md` §17.1。
+//
 // 文件工具（本文件后半，issue #228）：曾经的 0.3.5 fork executor（readFile/rg/tree/writeFile）已于
 // issue #228 退役，改为装配上游 erix-agent 0.18.0 的 `createFileTools`（`createStationFileTools`）。
 // jail 不是 fork 的一部分，它是宿主边界；fork 演进的终点见 AGENTS.md §8.9 与 docs/design/runner-integration.md。
@@ -39,6 +48,66 @@ function realpathWithMissing(absolutePath) {
   }
 }
 
+/** 含 `*` / `?` 的遮蔽条目是**名字模式**；其余是**前缀**（一个目录或一个文件，含其子树）。 */
+function isMaskPattern(entry) {
+  return /[*?]/u.test(entry);
+}
+
+/** glob → RegExp：`*` / `?` 只在**一段内**匹配（不跨 `/`），其它字符逐字（`.env*` 不会把 `xenv` 算进来）。 */
+function maskPatternToRegExp(pattern) {
+  let source = '^';
+  for (const char of pattern) {
+    if (char === '*') source += '[^/]*';
+    else if (char === '?') source += '[^/]';
+    else source += char.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  }
+  return new RegExp(`${source}$`, 'u');
+}
+
+/**
+ * 把 maskedPaths 拆成前缀条目与名字模式两组。
+ * 非字符串 / 空串条目**丢掉而不是炸装配**：遮蔽是防御性的额外闸，一条脏条目不该让 run 起不来。
+ */
+function splitMaskedEntries(maskedPaths) {
+  const prefixes = [];
+  const patterns = [];
+  for (const entry of Array.isArray(maskedPaths) ? maskedPaths : []) {
+    if (typeof entry !== 'string' || entry.length === 0) continue;
+    if (isMaskPattern(entry)) patterns.push(maskPatternToRegExp(entry));
+    else prefixes.push(entry);
+  }
+  return { prefixes, patterns };
+}
+
+/** 目标相对 mask 根的路径段（根外 / 就是根本身 → 空数组，模式自然不命中）。 */
+function relativeSegments(root, target) {
+  const relative = path.relative(root, target);
+  if (relative === '' || path.isAbsolute(relative)) return [];
+  return relative.split(path.sep).filter((segment) => segment !== '');
+}
+
+/**
+ * 名字模式命中判定。`*` 不跨 `/` ⇒ 不带斜杠的模式按**每一段**匹配（`*.pem` 命中任意深度的 `server.pem`，
+ * 也命中名为 `certs.pem` 的目录整棵子树）；带斜杠的模式额外按**整条相对路径**匹配
+ * （`.github/workflows/*.yml` 这类）。
+ */
+function matchesMaskPattern(patterns, root, target) {
+  if (patterns.length === 0) return false;
+  const segments = relativeSegments(root, target);
+  if (segments.length === 0) return false;
+  return patterns.some((pattern) => segments.some((segment) => pattern.test(segment))
+    || pattern.test(segments.join('/')));
+}
+
+/** 遮蔽判定（前缀 ∪ 名字模式）；名字模式对**词法路径与 realpath 结果都查**，见下方两处调用点注记。 */
+function maskedViolation({ prefixes = [], patterns = [] }, root, lexicalPath, resolvedPath) {
+  if (patterns.length > 0
+    && (matchesMaskPattern(patterns, root, lexicalPath) || matchesMaskPattern(patterns, root, resolvedPath))) {
+    return true;
+  }
+  return prefixes.some((prefix) => isWithin(prefix, resolvedPath));
+}
+
 export class JailError extends Error {
   constructor(code = 'jail_violation', message = code) {
     super(message);
@@ -67,8 +136,10 @@ export function createJail({ root, writable = [], maskedPaths = [] }) {
 
   const writableRoots = (Array.isArray(writable) ? writable : [])
     .map((entry) => resolve(entry));
-  const maskedRoots = (Array.isArray(maskedPaths) ? maskedPaths : [])
-    .map((entry) => resolve(entry));
+  const maskedEntries = splitMaskedEntries(maskedPaths);
+  // 前缀条目照 0.3.5：走 jail 自己的 resolve（越界条目在**装配期**就抛，不静默失效）。
+  const maskedRoots = maskedEntries.prefixes.map((entry) => resolve(entry));
+  const maskedPatterns = maskedEntries.patterns;
 
   const resolveForWrite = (value) => {
     const resolvedPath = resolve(value);
@@ -80,7 +151,14 @@ export function createJail({ root, writable = [], maskedPaths = [] }) {
 
   const assertReadable = (value) => {
     const resolvedPath = resolve(value);
-    if (maskedRoots.some((maskedRoot) => isWithin(maskedRoot, resolvedPath))) {
+    // 名字模式额外拿**词法路径**比一次：`.env` 若是指向 `db-creds.txt` 的软链，realpath 之后段名里
+    // 再没有 `.env`，只查 realpath 会让「建个软链」就把遮蔽拆掉（前缀遮蔽本来就有这个洞，#231 不再扩大它）。
+    // 反方向（`link.txt -> .env`）由 resolvedPath 那一路命中 ⇒ 两个方向都是 fail-closed。
+    const masked = maskedViolation(
+      { prefixes: maskedRoots, patterns: maskedPatterns },
+      rootPath, path.resolve(rootPath, value), resolvedPath,
+    );
+    if (masked) {
       throw new JailError('path_masked', `Path is masked: ${value}`);
     }
     return resolvedPath;
@@ -174,19 +252,72 @@ function resolvesToRoot(root, value) {
   }
 }
 
-/** 遮蔽前缀表：相对路径按 root 解析，能 realpath 就 realpath（防用 symlink 绕过遮蔽）。 */
-function maskedPrefixes(root, maskedPaths) {
-  return (Array.isArray(maskedPaths) ? maskedPaths : [])
-    .filter((entry) => typeof entry === 'string' && entry.length > 0)
-    .map((entry) => {
-      const lexical = path.resolve(root, entry);
-      try {
-        return fs.realpathSync(lexical);
-      } catch {
-        return lexical;
-      }
-    });
+/** 能 realpath 就 realpath，不能（目录还不存在等）就原样返回。 */
+function realpathOrSelf(absolutePath) {
+  try {
+    return fs.realpathSync(absolutePath);
+  } catch {
+    return absolutePath;
+  }
 }
+
+/**
+ * 装配层的遮蔽表（jail 之外的那一份，服务「没有 jail / jail 根与 cwd 不同」的调用方，见单测）。
+ * 前缀条目：相对路径按 root 解析，能 realpath 就 realpath（防用 symlink 绕过遮蔽）。
+ * 名字模式条目（issue #231）：只编译成 RegExp，判定发生在**每次谓词调用**上——所以 run 中途新建的
+ * `.env.local` 一样被挡；换成「启动时扫目录把模式展成具体路径」就给遮蔽加了一条它本没有的失效条件。
+ */
+function compileMaskedTable(root, maskedPaths, { realpathEntries = true } = {}) {
+  const { prefixes, patterns } = splitMaskedEntries(maskedPaths);
+  return {
+    root,
+    patterns,
+    // realpathEntries=false：条目只按调用方的拼写展开（不再 realpath）——配套下面那张「词法表」，
+    // 否则条目会被 realpath 到真目录、而 target 还是链接写法，前缀条目（`.git/config`）就比不中。
+    prefixes: prefixes.map((entry) => {
+      const lexical = path.resolve(root, entry);
+      return realpathEntries ? realpathOrSelf(lexical) : lexical;
+    }),
+  };
+}
+
+/**
+ * station 生产链路的遮蔽集合（**单一真相**：`runner/worker.js` 直接 import 它，不另抄一份名单）。
+ *
+ * 口径（issue #231，工单 fix-261115-02）：**只针对项目目录以内**。FDE home 下的 `~/.ssh`、
+ * `~/.git-credentials`、`~/.erix/*` 本来就在 jail 根之外，文件工具一直读不到它们——那不是「漏了」，
+ * 不需要在这里再遮一遍。
+ *
+ * ⚠ **它不是安全加固，是防误读**（口径不对称，必须连理由一起读）：
+ *   - 遮蔽只作用于**文件工具**（readFile / searchText / tree 的读谓词）；`shell` 按设计越过文件牢笼
+ *     （`lib/shell-tools.js` 头注 + 不变式 1「容器是信任边界」），所以 `shell` 里 `cat .env` 依旧拿得到
+ *     全文，`runner/test/masked-paths.test.js` 把这条现状钉着（**不许当 bug 修**）。
+ *   - 因此本集合拦的是「模型**主动**用 readFile 把密钥拽进 transcript / 上下文」这条最常见路径，
+ *     而不是「容器里的人拿不到密钥」——后者归容器边界（不变式 1）与网络层，不归这里。
+ *   - 写侧不挡（与 `createJail.assertReadable` 逐字对齐的旧口径：**只挡读不挡写**），`writeFile` / `edit`
+ *     仍能写 `.env`。
+ *
+ * 误伤是已知代价（都是「多绕一步 shell」，不是死路）：`.env.example` / `.env.sample` 这类签入仓库的
+ * 模板同样被 `.env*` 命中，`id_mapping.csv`、`idea.txt` 这类名字会被 `id_*` 命中，测试用的 `*.pem`
+ * 夹具同理——SYSTEM_PROMPT 已给出口（「被宿主边界拒绝」时用 shell 定点看那一个文件）。
+ *
+ * **两种条目的深度语义不同（有用例各自钉住，别当同一个东西改）**：
+ *   - 名字模式（`.env*` / `*.pem` / `id_*`）按路径段匹配 ⇒ **任意深度**都挡（`deploy/tls/server.pem`、
+ *     `deploy/keys/id_ed25519` 都在集合内）；
+ *   - 前缀条目（`.git/config` / `.npmrc`）只挡那一个路径及其子树 ⇒ `sub/.npmrc`、`.git/HEAD` 不挡。
+ *     嵌套的 `.npmrc`（monorepo 包内）目前不在集合里，取内容走 shell。
+ *
+ * 两个方向的 symlink 都是 fail-closed（#231）：`.env` 是指向别处的软链仍被挡（比**词法段**），
+ * 普通名字指向 `.env` 也被挡（比 **realpath 结果**）。
+ * 口径登记：`docs/design/runner-integration.md` §6.3-3 与 §17.1。
+ */
+export const STATION_MASKED_PATHS = Object.freeze([
+  '.env*',        // .env / .env.local / .env.production …（含签入的 .env.example 模板，见上「误伤」）
+  '.git/config',  // remote url 里可能嵌 user:password（`.git` 其余条目不挡：HEAD / packed-refs 不是密钥）
+  '.npmrc',       // _authToken / //registry.npmjs.org/:_authToken（前缀条目 = 只挡**项目根**那一个，见上「两种条目」）
+  '*.pem',        // 证书 / 私钥；任意深度（`deploy/tls/server.pem` 这类）
+  'id_*',         // OpenSSH 私钥命名习惯（id_rsa / id_ed25519）；家目录 `~/.ssh` 在 jail 外，不在本集合职责内
+]);
 
 /**
  * 装配上游 `erix-agent/tools` 的 createFileTools，边界走本站 jail（issue #228）。
@@ -195,7 +326,8 @@ function maskedPrefixes(root, maskedPaths) {
  * @param {{root:string, assertReadable:Function, resolveForWrite:Function}} [options.jail]
  *   宿主边界（createJail 的返回值）。jail.root 是 realpath 过的根，未显式传 cwd 时用它做上游的解析根。
  * @param {string} [options.cwd] 上游相对路径解析根；缺省依次取 jail.root / process.cwd()
- * @param {string[]} [options.maskedPaths] 密钥遮蔽前缀（相对 cwd 或绝对）；只挡读，不挡写
+ * @param {string[]} [options.maskedPaths] 遮蔽条目：前缀（目录/文件，相对 cwd 或绝对）**或名字模式**
+ *   （含 `*` / `?`，按相对路径逐段匹配，issue #231）；只挡读，不挡写
  * @param {(absolutePath:string)=>boolean} [options.allowRead] 调用方读谓词（绝对路径），与 jail 谓词**相与**
  * @param {(absolutePath:string)=>boolean} [options.allowWrite] 调用方写谓词（绝对路径），与 jail 谓词**相与**
  * @returns {{
@@ -210,9 +342,19 @@ export function createStationFileTools({ jail, cwd, maskedPaths = [], allowRead,
   const root = path.resolve(cwd ?? jail?.root ?? process.cwd());
   const hostAllowRead = typeof allowRead === 'function' ? allowRead : () => true;
   const hostAllowWrite = typeof allowWrite === 'function' ? allowWrite : () => true;
-  const maskedRoots = maskedPrefixes(root, maskedPaths);
+  // 遮蔽比的是路径段，而上游递进来的 target 是按**调用方 cwd** 解析的，createJail 那边却用 realpath
+  // 过的根：cwd 是目录的符号链接写法时（真机里 `~/projects` 本身可能是链接）两个拼写不是同一个字符串，
+  // 只按其中一个比 ⇒ 遮蔽**静默失效**（不报错，只表现为「这条没挡住」）。所以两种写法各编一张表，命中任一即遮。
+  const lexicalRoot = root;
+  const realRoot = realpathOrSelf(root);
+  const maskedTables = realRoot === lexicalRoot
+    ? [compileMaskedTable(realRoot, maskedPaths)]
+    : [
+      compileMaskedTable(realRoot, maskedPaths),
+      compileMaskedTable(lexicalRoot, maskedPaths, { realpathEntries: false }),
+    ];
 
-  const withinMasked = (target) => maskedRoots.some((maskedRoot) => isWithin(maskedRoot, target));
+  const withinMasked = (target) => maskedTables.some((table) => maskedViolation(table, table.root, target, target));
   // jail 的越界/非可写/遮蔽都是 JailError → 谓词返回 false（上游据此回「错误：…被宿主边界拒绝」文本，
   // 不再像 fork 那样抛）。非 JailError（例如 realpath 撞 EACCES）照旧上抛，不静默吞。
   const jailAllows = (resolver, target) => {
