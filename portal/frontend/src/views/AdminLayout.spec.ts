@@ -27,9 +27,11 @@ function makeRouter() {
     routes: [
       { path: '/', component: AdminLayout },
       { path: '/login', component: { template: '<div>login</div>' } },
-      // 顶栏四个 tab 用的是 `{ name: ... }` 形式的 :to ⇒ 路由表里没有这些名字，挂载当场就
+      // 顶栏 tab 用的是 `{ name: ... }` 形式的 :to ⇒ 路由表里没有这些名字，挂载当场就
       // "No match for {name:'admin-users'}" 抛错（不是断言失败）。给桩即可，本单不测 tab。
-      ...['admin-users', 'admin-llm', 'admin-repos', 'admin-mail', 'admin-tls', 'admin-preview-pool']
+      // ⚠ **加一个 tab 必须同时在这里加一个名字**：漏了不是"那条 tab 断言红"，而是整个组件挂载就抛
+      //   ⇒ 本文件**所有**用例红（含与 tab 无关的登出、返回工作台）。#485 片 A 加 `admin-upload` 时踩过。
+      ...['admin-users', 'admin-llm', 'admin-repos', 'admin-mail', 'admin-tls', 'admin-upload', 'admin-preview-pool']
         .map((name) => ({ path: `/${name}`, name, component: { template: '<div />' } })),
     ],
   });
@@ -90,7 +92,7 @@ describe('AdminLayout tab 导航（#449 邮件通道）', () => {
 
     // 裸路由把 tab 桩成 `/<name>`，所以 href 是 `/admin-mail`（真实应用里是 `/admin/mail`，
     // 路由表那条由本用例末尾的 `routes` 断言钉住）。
-    const links = wrapper.findAll('nav a').slice(0, 6);
+    const links = wrapper.findAll('nav a').slice(0, 7);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-mail');
 
@@ -127,16 +129,18 @@ describe('AdminLayout tab 导航（#456 证书页）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 6);
+    const links = wrapper.findAll('nav a').slice(0, 7);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-tls');
 
     const tlsLink = links.find((link) => link.attributes('href') === '/admin-tls')!;
     expect(tlsLink.text()).toBe('证书');
 
-    // 顺序：users → llm → repos → mail → **certs** → pool
+    // 顺序：users → llm → repos → mail → **certs** → upload → pool
+    // ⚠ 第二条原本断言「号池占用紧挨证书」，#485 片 A 在两者之间插了「上传上限」⇒ 相邻关系改了。
+    //    这里改成钉「证书排在邮件之后 + 号池占用仍在最后」，精确相邻由下面 #485 那条钉。
     expect(hrefs.indexOf('/admin-tls')).toBe(hrefs.indexOf('/admin-mail') + 1);
-    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-tls') + 1);
+    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.length - 1);
 
     // 路由表本身：`/admin` 的 children 里有 `tls` → `admin-tls`，懒加载且要求 admin 角色
     const adminRoute = routes.find((route) => route.path === '/admin')!;
@@ -144,6 +148,39 @@ describe('AdminLayout tab 导航（#456 证书页）', () => {
     expect(tlsRoute.path).toBe('tls');
     expect(tlsRoute.meta).toEqual({ requiresRole: 'admin' });
     expect(typeof tlsRoute.component).toBe('function');
+  });
+});
+
+// issue #485 片 A：新 tab「上传上限」必须真在导航里且指向 `admin-upload`（同 #449/#456 的判据形状：
+// 只加路由不加 tab ⇒ 这一页在管理台里没有入口，等于没做）。
+describe('AdminLayout tab 导航（#485 片 A 上传上限）', () => {
+  it('导航里有「上传上限」，指向 admin-upload，且排在证书之后、号池占用之前', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
+    const auth = useAuthStore();
+    auth.user = ADMIN_WITH_SEAT as never;
+    auth.ready = true;
+    const router = makeRouter();
+    router.push('/');
+    await router.isReady();
+    const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
+
+    const links = wrapper.findAll('nav a').slice(0, 7);
+    const hrefs = links.map((link) => link.attributes('href'));
+    expect(hrefs).toContain('/admin-upload');
+    expect(links.find((link) => link.attributes('href') === '/admin-upload')!.text()).toBe('上传上限');
+
+    // 顺序：certs → **upload** → pool（平台配置挨在一起，只读的号池占用永远留最后）
+    expect(hrefs.indexOf('/admin-upload')).toBe(hrefs.indexOf('/admin-tls') + 1);
+    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-upload') + 1);
+    // tab 总数：这一格是「加 tab 必须同步改本文件桩路由」那条红线的正面（漏改 ⇒ 挂载就抛，不会走到这里）
+    expect(hrefs).toHaveLength(7);
+
+    // 路由表本身：`/admin` 的 children 里有 `upload` → `admin-upload`，懒加载且要求 admin 角色
+    const adminRoute = routes.find((route) => route.path === '/admin')!;
+    const uploadRoute = (adminRoute.children ?? []).find((child) => child.name === 'admin-upload')!;
+    expect(uploadRoute.path).toBe('upload');
+    expect(uploadRoute.meta).toEqual({ requiresRole: 'admin' });
+    expect(typeof uploadRoute.component).toBe('function');
   });
 });
 
