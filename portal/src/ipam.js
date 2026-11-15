@@ -1,7 +1,8 @@
 // IPAM：FDE 网络子网分配（H-B D-10，topology.md §3）。
-// 默认池 10.200.0.0/16（/29），大 FDE 段 10.201.0.0/16（/28）。
+// 缺省池 10.200.0.0/16（/29），大 FDE 段 10.201.0.0/16（/28）；两段取值可由 env 旋钮改段
+// （`IPAM_POOL_DEFAULT` / `IPAM_POOL_LARGE`，宿主侧 `FDE_IPAM_POOL_*`，issue #270），前缀长度不可配。
 // 纯函数子网算术（零依赖，uint32）+ DB 分配（写 fde_networks）。
-// 依据：docs/design/topology.md §3/§5.1、docs/data/schema.sql §9（fde_networks）、docs/env.md §5.2。
+// 依据：docs/design/topology.md §3/§5.1、docs/data/schema.sql §9（fde_networks）、docs/env.md §5.2/§10.1。
 
 import crypto from 'node:crypto';
 import { enqueueRouteChange } from './outbox.js';
@@ -9,10 +10,116 @@ import { enqueueRouteChange } from './outbox.js';
 // 全局 IPAM 锁：串行化「查空闲块 → 插行」，避免并发分配到同一 subnet（fde_networks.subnet UNIQUE 兜底）。
 const IPAM_LOCK_KEY = 74452312;
 
-export const POOLS = {
-  default: { cidr: '10.200.0.0/16', prefixLen: 29 },
-  large: { cidr: '10.201.0.0/16', prefixLen: 28 },
-};
+/**
+ * IPAM 池的**缺省**规格 —— 也就是 issue #270 之前 `POOLS` 里硬编码的那两个字面量。
+ * 单独导出的理由：它是「不设 env ⇒ 行为零变化」这条反向自证的唯一对照物（单测逐字比对它），
+ * 也是 `prefixLen` 的唯一真相源（见下：前缀长度**不是**旋钮）。
+ */
+export const DEFAULT_IPAM_POOLS = Object.freeze({
+  default: Object.freeze({ cidr: '10.200.0.0/16', prefixLen: 29 }),
+  large: Object.freeze({ cidr: '10.201.0.0/16', prefixLen: 28 }),
+});
+
+/**
+ * 池名 → portal 侧 env 旋钮（**唯一映射点**，issue #270）。
+ * 宿主/compose 侧是 `FDE_` 前缀版（`FDE_IPAM_POOL_DEFAULT` / `FDE_IPAM_POOL_LARGE`），
+ * 由 `deploy/docker-compose.yml` 的 station-portal.environment 去掉前缀下发（沿用仓内既有风格）。
+ *
+ * ⚠ 与 `FDE_IPAM_POOLS`（= fde-proxy 的 `IPAM_POOLS`，`network create` 的**白名单闸门**）是两个
+ * 不同语义：这一对是**分配器**从哪一段里切，那一条是**放行**哪些段。名字刻意不复用，
+ * 一个变量背两个语义 = 第二本账必然过期。
+ */
+export const IPAM_POOL_ENV_KEYS = Object.freeze({ default: 'IPAM_POOL_DEFAULT', large: 'IPAM_POOL_LARGE' });
+
+/**
+ * 每个池的分配前缀**钉在** `DEFAULT_IPAM_POOLS.prefixLen` 上，env 只开 CIDR，理由三条：
+ *  1. e2e 只需要换段（并行隔离栈各切一段），不需要改前缀；
+ *  2. baseline DDL 把「池名 ↔ 前缀」钉成死对（`docs/data/schema.sql` §9：`fde_networks` 的 CHECK
+ *     `pool='default' ⇒ prefix_len=29` / `pool='large' ⇒ prefix_len=28`，且 baseline 已冻结不可改），
+ *     把前缀也开成旋钮 = 开一个「一改就被 DB CHECK 炸成 23514」的假旋钮；
+ *  3. 别为将来预支结构复杂度（值形态 `<cidr>` 就够，`<cidr>:<前缀>` 只是多一个能写错的格子）。
+ *
+ * 段归属同理：baseline CHECK 还把「池名 ↔ 保留段」钉成 `default ⇒ << 10.200.0.0/16`、
+ * `large ⇒ << 10.201.0.0/16`，所以**合法取值只能是保留段内的一块子段**（典型用法：隔离栈取
+ * `10.201.<n>.0/24`，两套并行栈的 `fde-*` 网络不再从同一个池头撞车）。这个边界在**启动期**就判
+ * （见 resolveIpamPools），不让脏值活到 provision 才在 INSERT 上撞 23514；同时它也是
+ * topology §3 / deploy-contract §4.4 的口径（`10.200/16` 与 `10.201/16` 保留给 FDE 网络专用，
+ * 防火墙兜底 DROP 只覆盖这两段 ⇒ 分配段跑出这两段 = 脱离兜底防线）。
+ * 保留段的字面量就复用 `DEFAULT_IPAM_POOLS[*].cidr`（与缺省分配段同源，不抄第二份）。
+ */
+
+/** 整串严格形态：`d.d.d.d/<前缀>`，不许空白、不许端口式后缀、不许 CIDR 之外的任何写法。 */
+const POOL_CIDR_RE = /^([0-9]{1,3}(?:\.[0-9]{1,3}){3})\/(\d{1,2})$/;
+
+function poolEnvError(envKey, raw, reason) {
+  const err = new Error(`非法的 IPAM 池配置 ${envKey}=${JSON.stringify(raw)}：${reason}`);
+  err.code = 'ipam_pool_env_invalid';
+  err.envKey = envKey;
+  return err;
+}
+
+/**
+ * 由 env 解析 IPAM 池（issue #270：让分配段可配，缺省逐字等于 #270 之前的硬编码值）。
+ *
+ * 值形态：单个 CIDR（`IPAM_POOL_LARGE=10.201.37.0/24`）；前缀长度不进字符串，理由见
+ * `DEFAULT_IPAM_POOLS` 上方那段（前缀不是旋钮，恒为 29/28）。
+ *
+ * 判据口径：**整串严格校验 + 当场报错并点名旋钮**，不学 `parseInt('1e4')===1` 那族静默按半个值生效
+ * （台账 §8.126 附近的同型事故）。四条：
+ *   ① 形态：必须整串匹配 `<d.d.d.d>/<前缀>`；
+ *   ② 语义：八位组 ≤255、池前缀 ≤32（`parseCidr` 的既有判据）；
+ *   ③ 规范：主机位必须为 0（`10.201.0.7/16` 直接拒——`parseCidr` 会**静默 mask** 成 10.201.0.0/16，
+ *      那是最典型的「按半个值生效」）；
+ *   ④ DB 自洽：段必须整体落在该池的 DDL 保留段内（`schema.sql` §9 的 CHECK，baseline 冻结件），
+ *      且池自身的前缀不得比分配前缀更长（否则池里切不出一块，`enumerateSubnets` 会抛）。
+ *
+ * 空串 / 未设 ⇒ 该池回退缺省值（compose 的 `${VAR:-默认}` 也走这条路，两头都是同一个字面量）。
+ *
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {{default: {cidr: string, prefixLen: number}, large: {cidr: string, prefixLen: number}}}
+ */
+export function resolveIpamPools(env = process.env) {
+  const pools = {};
+  for (const [name, envKey] of Object.entries(IPAM_POOL_ENV_KEYS)) {
+    const fallback = DEFAULT_IPAM_POOLS[name];
+    const raw = env[envKey];
+    if (raw === undefined || String(raw).trim() === '') {
+      pools[name] = { ...fallback };
+      continue;
+    }
+    const value = String(raw).trim();
+    const m = POOL_CIDR_RE.exec(value);
+    if (!m) {
+      throw poolEnvError(envKey, raw, '必须是 `<网络地址>/<前缀>` 的整串形态（例：10.201.0.0/16），不接受空格、网段列表或前缀长度后缀');
+    }
+    let parsed;
+    try {
+      parsed = parseCidr(value);
+    } catch (err) {
+      throw poolEnvError(envKey, raw, err.message);
+    }
+    if (parsed.base !== parsed.ipInt) {
+      throw poolEnvError(envKey, raw, `必须是规范的网络地址（主机位全 0）；${value} 会被静默压成 ${parsed.cidr}，那种「半个值生效」不许出现`);
+    }
+    const dbSegment = DEFAULT_IPAM_POOLS[name].cidr;
+    const allowed = parseCidr(dbSegment);
+    if (!(allowed.base <= parsed.base && parsed.last <= allowed.last)) {
+      throw poolEnvError(envKey, raw, `必须整体落在 ${dbSegment} 之内（fde_networks 的 CHECK「pool='${name}' ⇒ subnet << ${dbSegment}」是 baseline DDL，见 schema.sql §9；脏值活到 provision 就是 INSERT 23514）`);
+    }
+    if (parsed.prefixLen > fallback.prefixLen) {
+      throw poolEnvError(envKey, raw, `池前缀 /${parsed.prefixLen} 比该池的分配前缀 /${fallback.prefixLen} 还长，池里切不出一块（前缀长度不是旋钮，恒为 /${fallback.prefixLen}）`);
+    }
+    pools[name] = { cidr: parsed.cidr, prefixLen: fallback.prefixLen };
+  }
+  return pools;
+}
+
+/**
+ * 运行期池表（模块加载时按 env 解析一次）。
+ * 消费方保持原样：`allocateNetworkInTx` 按池名取，`routebackends.js` 的 `FDE_IPAM_POOLS`
+ * 是它的**派生视图**（路由后端白名单随之跟着分配段走，不存在第二本账）。
+ */
+export const POOLS = resolveIpamPools();
 
 export function ipToInt(ip) {
   const parts = String(ip).trim().split('.');
