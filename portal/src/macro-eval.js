@@ -236,14 +236,40 @@ export async function evalOneAssignment(pool, a, nowMs, { log } = {}) {
 /**
  * ③ `until` 到期扫描（`10` 篇 §4）：enabled=true 且 until<=now ⇒ 产一条到期意图。
  * anchor=`assignment:<id>`、criterion=`tick`、bucket=`expiry`。靠幂等键，每订阅只产一次。
+ *
+ * ⚠ **为什么这里不能直接用 `claimMacroRun`**：`claimMacroRun` 一进来就先跑
+ *   `applyExpiredAssignments`（把 `until<=now` 的订阅置 `enabled=false`），而它那条
+ *   `INSERT … WHERE EXISTS (… a.enabled)` 要求订阅**仍启用** ⇒ 对「刚过期」的订阅，
+ *   资格谓词已被自己抹掉，claim 必返回 `null`，到期意图永远产不出。
+ *   所以到期意图走下面的 `claimExpiryRun`（同样的幂等键 `ON CONFLICT DO NOTHING`，
+ *   只是不带 `enabled` 谓词）。这是相对 §2.1「claim 一律走 `claimMacroRun`」的一处
+ *   必要偏离，原因就记在这段注释里。
  */
 export async function evalExpiry(pool, a, nowMs, { log } = {}) {
-  const claimed = await claimMacroRun(pool, {
-    assignmentId: a.id, anchor: `assignment:${a.id}`, criterion: 'tick', bucket: 'expiry', now: new Date(nowMs),
-  });
-  if (!claimed) return null; // 已产过 / 已被 W1 停用 ⇒ 不再产
+  const claimed = await claimExpiryRun(pool, { assignmentId: a.id, now: new Date(nowMs) });
+  if (!claimed) return null; // 已产过（幂等键命中）⇒ 不再产
   log.info?.(`[macro-eval] 到期意图 assignment=${a.id}`);
   return buildIntent(a, { anchor: `assignment:${a.id}`, criterion: 'tick', bucket: 'expiry', macroRunId: claimed.id, evidence: { until: a.until, now: new Date(nowMs).toISOString() } });
+}
+
+/**
+ * 到期意图专用的占位：与 `claimMacroRun` 同一条幂等键（`assignment_id,anchor,criterion,bucket`）、
+ * 同一段 `last_evaluated_at` 推进，**但不带 `a.enabled` 资格谓词**——因为到期这一刻订阅正被
+ * 置为停用，用启用谓词会把自己挡掉。命中冲突（已产过）⇒ 返回 null。
+ */
+export async function claimExpiryRun(pool, { assignmentId, now }) {
+  const at = now instanceof Date ? now : new Date(now);
+  const res = await pool.query(
+    `INSERT INTO macro_runs
+         (assignment_id, anchor, criterion, status, bucket, started_at)
+     VALUES ($1, $2, 'tick', 'pending', 'expiry', $3)
+     ON CONFLICT (assignment_id, anchor, criterion, bucket) DO NOTHING
+     RETURNING id`,
+    [assignmentId, `assignment:${assignmentId}`, at],
+  );
+  const id = res.rows[0]?.id ?? null;
+  if (id) await pool.query('UPDATE macro_assignments SET last_evaluated_at = $2 WHERE id = $1', [assignmentId, at]);
+  return id ? { id } : null;
 }
 
 /**
