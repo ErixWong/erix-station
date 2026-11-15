@@ -17,8 +17,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  COMPOSE_ENV_FILE, PORTAL_USERSPACE_CONTAINER_ROOT, assertComposeEnvFile, inspectHostPathChain,
-  materializeSnapshot, observeHostPath, toContainerPath, waitForHostFile,
+  COMPOSE_ENV_FILE, PORTAL_USERSPACE_CONTAINER_ROOT, assertComposeEnvFile, formatLastSegmentLinkLine, inspectHostPathChain,
+  materializeSnapshot, observeHostPath, observeLastSegmentLink, toContainerPath, waitForHostFile,
 } from '../portal/integration/lib/e2e-preflight.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -290,6 +290,78 @@ test('#495② P11 现场快照 = 一条不抛错的 ls（父目录 + 目标一�
     containerPath: '/srv/erix/users/alice/home/.erix/config.json',
   });
   assert.match(broken, /快照取不到/, '取不到时返回说明文本，不抛');
+});
+
+// ---------------------------------------------------------------------------
+// 末段是符号链接：要**可区分**，但不改三态归属（主 agent 裁决：只诊断，不改策略；bind 源做成链接是合法配置）
+// ---------------------------------------------------------------------------
+
+test('#495② L1 ① 末段是符号链接且目标可读 ⇒ 仍是 present，但链接事实为真、诊断行点名目标', (t) => {
+  const { dir, file } = fixtureUserspace(t);
+  const link = path.join(dir, 'config-link.json');
+  fs.symlinkSync(path.relative(dir, file), link); // 故意用**相对**链接：顺带验解析
+  const observed = observeHostPath(link);
+  assert.equal(observed.state, 'present', '链接指向可读文件 ⇒ 状态照旧 present（不新增第四态、不因此判失败）');
+  assert.equal(observed.content.includes('erix-placeholder'), true, 'present 照旧给正文');
+  assert.equal(observed.link.isSymlink, true, '链接事实必须为真（statSync 跟随链接看不出来 ⇒ 本格靠 lstatSync）');
+  assert.equal(observed.link.targetExists, true, '目标存在要说出来');
+  assert.equal(observed.link.resolvedTarget, file, `相对目标要解析成绝对：${JSON.stringify(observed.link)}`);
+  const line = formatLastSegmentLinkLine(observed.link);
+  assert.match(line, /符号链接/, '① 文案必须含「符号链接」');
+  assert.ok(line.includes(link), `诊断行要带是哪条路径：${line}`);
+  assert.ok(line.includes(path.relative(dir, file)), `诊断行要带链接目标（readlink 的原样）：${line}`);
+  assert.ok(line.includes(file), `相对链接还要给出解析后的绝对目标：${line}`);
+  assert.match(line, /portal 容器里看到的是\*\*链接目标那一侧\*\*/, 'bind 源是链接时的关键提示必须在（不写出来就是拿状态猜挂载）');
+  // 不注入也能直接拿事实（给调用方自己拼日志用）
+  assert.equal(observeLastSegmentLink(link, { fsImpl: {} }).isSymlink, null, '注入的 fsImpl 没有 lstatSync ⇒ 只能说「无从判定」，不许假装不是链接');
+});
+
+test('#495② L2 ② 末段是真文件 ⇒ 链接事实为假、文案里根本不出现「符号链接」（反向自证）', async (t) => {
+  const { root, file } = fixtureUserspace(t);
+  const observed = observeHostPath(file);
+  assert.equal(observed.state, 'present');
+  assert.equal(observed.link.isSymlink, false, '真文件不许被写成链接（把判定写死成恒真 ⇒ 本格红）');
+  assert.equal(observed.link.detectable, true, '真 fs 有 lstatSync ⇒ 必须给结论，不许拿「无从判定」糊过去');
+  assert.equal(formatLastSegmentLinkLine(observed.link), '', '非链接要渲染成空串（而不是来一句「不是链接」）');
+  // 失败文案里也不许出现：等一个不存在的叶子（链能进、叶子没物化）
+  const err = await waitForHostFile(path.join(root, 'alice', 'home', '.erix', 'ghost.json'), {
+    timeoutMs: 5, intervalMs: 1, sleepImpl: noSleep, label: 'ghost config.json',
+  }).then(() => null, (error) => error);
+  assert.ok(err, '不存在 ⇒ 最终必须拒绝');
+  assert.doesNotMatch(err.message, /符号链接/, '真没物化的文案里不该冒出链接（那会把人带去查挂载）');
+});
+
+test('#495② L3 悬空链接 ⇒ 状态仍归 missing（不改归属），但文案说清「是链接、缺的是目标」', async (t) => {
+  const { dir } = fixtureUserspace(t);
+  const dangling = path.join(dir, 'dangling.json');
+  const goneTarget = path.join(dir, 'never-written-by-materializer.json');
+  fs.symlinkSync(path.relative(dir, goneTarget), dangling);
+  const observed = observeHostPath(dangling);
+  assert.equal(observed.state, 'missing', '悬空链接**归属不变**（改成第四态会连锁打崩 P7/P8 的时间判据）');
+  assert.equal(observed.missingPrefix, dangling);
+  assert.equal(observed.link.isSymlink, true, 'lstat 看得见悬空链接本体（statSync 只会看到 ENOENT ⇒ 链接事实就丢了）');
+  assert.equal(observed.link.targetExists, false);
+  const err = await waitForHostFile(dangling, {
+    timeoutMs: 5, intervalMs: 1, sleepImpl: noSleep, label: 'dangling config.json',
+  }).then(() => null, (error) => error);
+  assert.ok(err);
+  assert.match(err.message, /timeout waiting for dangling config\.json/, '仍走 missing 那条形状（旧 grep 不坏）');
+  assert.match(err.message, /符号链接/, '要顺带说出它是链接');
+  assert.ok(err.message.includes(goneTarget), `要点名缺的是链接目标：${err.message}`);
+  assert.match(err.message, /缺的是\*\*链接目标\*\*/);
+  assert.doesNotMatch(err.message, /读不到|FDE_USER_UID/, '悬空链接不是权限问题');
+});
+
+test('#495② L4 叶子级不存在（stat 能进、叶子没物化）⇒ 与权限失败分得开（#227/§8.128 盲区补格）', (t) => {
+  const { dir, file } = fixtureUserspace(t);
+  const leaf = path.join(dir, 'late.json');
+  assert.equal(observeHostPath(leaf).state, 'missing', '链能进但叶子不存在 ⇒ 还是 missing');
+  // 真 fs 里单次调用造不出「stat 在、read 不在」（中间有竞态窗口），所以这一格用注入：
+  // statSync/accessSync 走真 fs（链确认可进），只把 readFileSync 换成 ENOENT ⇒ 这就是叶子级不存在。
+  const leafGone = { ...fs, readFileSync: () => { throw Object.assign(new Error('no such file'), { code: 'ENOENT' }); } };
+  const observed = observeHostPath(file, { fsImpl: leafGone });
+  assert.equal(observed.state, 'missing', '叶子在 stat 与 read 之间消失 ⇒ 归 missing（归进 unreadable = 把没物化当成权限，#495 ② 反向坑）');
+  assert.equal(observed.blocker, null, '不许进 unreadable 分支（进了就有 blocker，而这里根本没权限问题）');
 });
 
 test('#495 接线静态自检：脚本必须在**任何 docker 之前**做预检（源码级）', () => {
