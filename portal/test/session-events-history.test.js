@@ -87,14 +87,14 @@ class EventsHistoryPool extends FakePool {
         })),
       };
     }
-    // issue #514：**候选发现**的那条查询（页内的终态行只用来发现 run id，不作为回放事件下发）：
-    //   SELECT run_id FROM run_events
+    // issue #514：**候选发现**（页内的终态行只用来发现 run id 与分页游标，那一行本身不下发）：
+    //   SELECT run_id, seq FROM run_events
     //    WHERE session_id = $1 AND type = 'run_end' AND seq >= $2 [AND seq < $n]
-    //    ORDER BY seq DESC LIMIT $k
+    //    ORDER BY seq DESC LIMIT $k        // k = limit + 1（多取一行探针，探「窗口之下还有没有」）
     // ⚠ 必须排在下面的「主窗口」分支之前（主窗口也含 FROM run_events）。
     // 照 SQL 文本真算（AGENTS §8.14）：产品代码撤掉 `seq >= $2` 这道页界，fake 就不夹下界；撤掉
-    // ORDER BY 就拿插入序 —— 都不好心兼平，否则「分隔条在旧页重演」那格是假绿。
-    if (flat.includes('SELECT run_id FROM run_events')) {
+    // ORDER BY 就拿插入序；把 LIMIT 的 `+1` 探针改成 `limit`，fake 就多返一行 ⇒ 都别心平。
+    if (/FROM run_events/.test(flat) && flat.includes("type = 'run_end'")) {
       const sessionId = params[0];
       const lowMatch = flat.match(/seq >= \$(\d+)/);
       const low = lowMatch ? params[Number(lowMatch[1]) - 1] : null;
@@ -107,7 +107,7 @@ class EventsHistoryPool extends FakePool {
       if (upper != null) rows = rows.filter((e) => e.seq < upper);
       if (/ORDER BY seq DESC/.test(flat)) rows = rows.slice().sort((a, b) => b.seq - a.seq);
       if (cap != null) rows = rows.slice(0, cap);
-      return { rows: rows.map((e) => ({ run_id: e.run_id })) };
+      return { rows: rows.map((e) => ({ run_id: e.run_id, seq: e.seq })) };
     }
     if (sql.includes('FROM run_events')) {
       const sessionId = params[0];
@@ -610,8 +610,12 @@ test('#236 终态项不占 limit、不改 next_cursor（分页字段仍只由白
 const partialsOf = (body) => body.events.filter((e) => e.type === 'partial_output');
 const runEndsOf = (body) => body.events.filter((e) => e.type === 'run_end');
 const KILLED = { reason: 'aborted', detail: 'cancelled_before_start' };
-const discoveryQueries = (pool) => pool.sqlLog
-  .filter((sql) => /SELECT run_id FROM run_events/.test(sql.replace(/\s+/g, ' ')));
+// 发现查询的识别别拿 `SELECT run_id` 的列名单当锚（#514 返修后它多带了一列 `seq`）——
+// 按「只查 run_end 行」这条谓词认，才是它的身份。
+const discoveryQueries = (pool) => pool.sqlLog.filter((sql) => {
+  const flat = sql.replace(/\s+/g, ' ');
+  return /FROM run_events/.test(flat) && flat.includes("type = 'run_end'");
+});
 
 /** 种一次「从未开始就被取消」：库里只有那一行 `run_end`（载荷形状照 sessions.js 的 killedQueued）。 */
 function seedKilledQueuedRun(pool, runId, seq, termination = KILLED) {
@@ -768,6 +772,120 @@ test('#514 发现查询的上界（before）承重：不夹上界就会被更新
       [[205, 'r-killed', 'cancelled_before_start']]);
     assert.deepEqual(partialsOf(p2).map((p) => [p.seq, p.run_id, p.payload.placeholder]), [[205, 'r-killed', true]],
       '这一页同样不许空白');
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// issue #514 **返修**（copilot 二次审计第 1 条，主 agent 复核成立）：
+// 尾巴区（游标之下**零白名单行**、只有 `run_end` 行）的分隔条会**静默丢失，且没有游标可续**。
+// 旧口径 `next_cursor` 只由白名单行算 ⇒ 空页上恒 null，而「空页」恰恰意味着「游标之下还有内容，
+// 只是全不是白名单事件」⇒ 被发现的 `LIMIT` 截掉的那批 run **永远没有页可达**（不是晚点出现，
+// 是永远看不见）。触发条件：会话尾巴上有多过一页的「从未开始就被取消」的 run（连点取消、批量清队列）。
+// 修法：发现查询多带 `seq` 并按主窗口同一口径多取一行探针（`LIMIT limit + 1`）；**本页零白名单行**
+// 且探针证实窗口被截断时，`next_cursor` 取**已发现行里最小的 seq**（同向、与本页严格不重叠、
+// 不倒退）。非空页不动游标：那种页的游标属于白名单行，压到页下界之外会跳过**真实事件**。
+// ---------------------------------------------------------------------------
+
+/** 沿游标把整条翻页链拉完（客户端就是这条循环），返回每一页的 events / next_cursor。 */
+async function walkPages(s, limit, maxPages = 6) {
+  const pages = [];
+  let cursor = null;
+  for (let i = 0; i < maxPages; i += 1) {
+    const q = cursor == null ? `?limit=${limit}` : `?limit=${limit}&before=${cursor}`;
+    const body = await historyOf(s, q);
+    pages.push(body);
+    const next = body.next_cursor;
+    if (next == null) return pages;
+    assert.ok(Number.isSafeInteger(next) && next >= 1 && (cursor == null || next < cursor),
+      `游标必须为正整数且严格递减（否则客户端要么停住、要么无限循环）：第 ${i + 1} 页给的是 ${next}`);
+    cursor = next;
+  }
+  assert.fail(`翻页链在 ${maxPages} 页内没有收敛（游标不回 null = 客户端会一直拉）：${JSON.stringify(
+    pages.map((p) => [p.next_cursor, p.events.map((e) => e.seq)]))}`);
+  return pages;
+}
+
+test('#514 返修 判据：游标之下零白名单行、只有 limit+2 条 run_end ⇒ 第一页 limit 条且游标非 null、续页拿到剩下的', async () => {
+  const s = await startServer();
+  try {
+    // 会话尾巴：4 条从未开始就被取消的 run（每条库里只有那一行 run_end），页大小 2 ⇒ limit + 2。
+    const LIMIT = 2;
+    const tail = [1, 2, 3, 4]; // seq 递增 = 由老到新
+    tail.forEach((seq) => seedKilledQueuedRun(s.pool, `r-${seq}`, seq));
+
+    const p1 = await historyOf(s, `?limit=${LIMIT}`);
+    assert.deepEqual(terminationsOf(p1).map((t) => t.seq), [3, 4],
+      '第一页只许带出最新的 limit 条分隔条（升序返回）；探针那一行不算候选');
+    assert.ok(Number.isSafeInteger(p1.next_cursor) && p1.next_cursor >= 1,
+      '尾巴被截断时游标必须非 null（旧实现在这里给 null ⇒ 客户端不再翻页，剩下的永远看不见）');
+    assert.equal(p1.next_cursor, 3, '游标 = 已发现行里最小的 seq（3），不是最大的（4 = 会把已展示的那条重演）');
+
+    const p2 = await historyOf(s, `?limit=${LIMIT}&before=${p1.next_cursor}`);
+    assert.deepEqual(terminationsOf(p2).map((t) => t.seq), [1, 2],
+      '续页必须拿到剩下的 2 条（旧实现：这一页根本不会被请求）');
+    assert.equal(p2.next_cursor, null,
+      '窗口之下真的没有更老的了 ⇒ 游标必须回到 null（探针承重：拿「恰好返了 limit 条」当截断就会多跑一趟空页）');
+
+    const seen = [...terminationsOf(p1), ...terminationsOf(p2)].map((t) => t.seq).sort((a, b) => a - b);
+    assert.deepEqual(seen, tail, '两页合起来不多不少：每条 run_end 恰好露面一次');
+    assert.deepEqual(runEndsOf(p1).concat(runEndsOf(p2)), [], '红线同前：run_end 始终不下发');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#514 返修：尾巴长过两页 ⇒ 三页翻完，每条 run_end 恰好露面一次（游标驱动整条翻页链，不重不漏）', async () => {
+  const s = await startServer();
+  try {
+    const LIMIT = 2;
+    const tail = [1, 2, 3, 4, 5, 6]; // 2 * limit + 2 条：必须翻三页才翻得完
+    tail.forEach((seq) => seedKilledQueuedRun(s.pool, `r-${seq}`, seq));
+
+    const pages = await walkPages(s, LIMIT);
+    assert.equal(pages.length, 3, `应当恰好三页翻完，实际 ${pages.length} 页`);
+    // 每条被取消的 run 出**两项**（`partial_output` 占位 + `run_termination` 分隔条，#236/#300 同格）
+    assert.deepEqual(pages.map((p) => terminationsOf(p).length), [2, 2, 2],
+      '每页至多 limit 条候选（探针那一行不进响应）');
+    assert.deepEqual(pages.map((p) => p.events.length), [4, 4, 4],
+      '每页事件数 = 候选数 × 2（占位 + 分隔条），没有第三条、也没有少一条');
+    const seen = pages.flatMap((p) => terminationsOf(p).map((t) => t.seq));
+    assert.deepEqual(seen.slice().sort((a, b) => a - b), tail,
+      '三页合起来不多不少：六条 run_end 各露面一次（少了 = 静默丢失，多了 = 重叠重演）');
+    assert.equal(new Set(seen).size, tail.length, '三页合起来不重复（游标不重叠：下一页窗口是 [0, 游标) 严格小于）');
+    assert.deepEqual(pages.map((p) => p.next_cursor), [5, 3, null],
+      '游标逐页递减且最后一页归 null（客户端据此停手）');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#514 返修：非空页的游标所有权仍归白名单行——即使发现被截断也不许压到页界之外（那会跳过真实事件）', async () => {
+  const s = await startServer();
+  try {
+    // 白名单行只有 seq 10 这一条；尾巴上三条只写 run_end 的 run（20/21/22）。
+    s.pool.seed({ ...ev(10, 'round_start', { round: 1 }), run_id: 'r-a' });
+    s.pool.seedRun('r-a', 'finished', { reason: 'end_turn' });
+    seedKilledQueuedRun(s.pool, 'r-20', 20);
+    seedKilledQueuedRun(s.pool, 'r-21', 21);
+    seedKilledQueuedRun(s.pool, 'r-22', 22);
+
+    const p1 = await historyOf(s, '?limit=1');
+    assert.deepEqual(p1.events.filter((e) => e.type === 'round_start').map((e) => e.seq), [10],
+      '真实事件照常下发');
+    // r-a 自己也是「终态 + 零锚点」⇒ 它那条分隔条在 seq 10（来自白名单候选），尾巴那条来自**发现**候选
+    assert.deepEqual(terminationsOf(p1).map((t) => t.seq), [10, 22],
+      '本页窗口内的尾巴照样带出候选（候选上界 = limit，因此这页只带出一条尾巴行 22）');
+    assert.equal(p1.next_cursor, null,
+      '非空页 ⇒ 游标不许改成「已发现的最小 seq」（22）：那会让下一页 [0,22) 把 seq 10 那条真实事件'
+      + '再放一遍。尾巴上比 limit 更老的那几条是**非空页**的已接受边界（§4.4a-2 残余①），'
+      + '不是这一格该改的东西');
+
+    // 尾巴被截断掉的那两条（20/21）确实还在库里，但按现口径没有任何页能拿到它们——
+    // 这一句把「残余①」钉成**读数**而不是文档里的一句话（要修它得把发现并进主窗口查询）。
+    const p2 = await historyOf(s, '?limit=1&before=10');
+    assert.deepEqual(p2.events, [], '白名单游标之下确实没有页可达这些尾巴行了（残余①的形状）');
   } finally {
     await s.close();
   }

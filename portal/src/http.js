@@ -2902,15 +2902,35 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
   // `before` 要传下去（#502 M-6④）：合成项只许出现在它自己 seq 所属的那一页。
   // issue #514：`pageLow` = 本页最小的真实事件 seq（空页 ⇒ 0 = 不设下界），它是**候选发现的页界**；
   // `sessionId` 给发现查询用（那条查询按会话查 `run_end` 行，不像主窗口那样从行里带出 run_id）。
+  const pageLow = rows.length > 0 ? Number(rows[0].seq) : 0;
   const synth = await buildHistorySynthItems(ctx.pool, rows, {
     before,
     sessionId,
-    pageLow: rows.length > 0 ? Number(rows[0].seq) : 0,
+    pageLow,
     limit,
   });
+  // 白名单游标（既有口径，逐字未动）：本页有真实行且还有更早的 ⇒ 本页最老那一行的 seq。
+  const whitelistCursor = hasOlder && rows.length > 0 ? pageLow : null;
+  // issue #514 **返修**（二次审计第 1 条，主 agent 复核成立）：**空页的游标必须由候选发现行驱动**。
+  // 空页不是「到底了」，它恰恰意味着「`before` 之下还有内容，只是全不是白名单事件」——而那条尾巴
+  // （> `limit` 条「从未开始就被取消」的 run，每个只留一行 `run_end`）被发现的 `LIMIT` 截掉的部分，
+  // 在旧口径下 `next_cursor` 恒 null（游标只由白名单行算，空页上白名单行不存在）⇒ 客户端不会再拉
+  // 下一页 ⇒ 那些 run 的分隔条**永远没有页可达**（不是延迟出现，是永远看不见）。
+  // 取**已发现行里最小的 seq**：下一页窗口 `[0, minSeq)` 与本页 `[0, before)` 严格不重叠（发现查询
+  // 自己夹了 `seq < before` ⇒ minSeq 必然 < before，方向与白名单游标一致、不会倒退），
+  // 且下一页的窗口从这条之后继续 ⇒ 不重不漏。是否「还有更老的」取**事实**而非猜测：发现查询按
+  // 主窗口同一口径多取一行探针（`LIMIT limit + 1`），真拿到了第 `limit + 1` 行才算截断。
+  // 非空页**不动游标**：那种页的截断残差在 `[minSeq, pageLow)` 之间，而页游标属于白名单行——把它
+  // 压到 pageLow 之下会跳过**真实事件**（比丢一条分隔条更坑），所以那种页照旧、残余写进 §4.4a-2。
+  const minDiscoveredSeq = synth.discovery.minSeq;
+  const tailCursor = rows.length === 0 && synth.discovery.truncated
+    && Number.isSafeInteger(minDiscoveredSeq) && minDiscoveredSeq >= 1
+    && (before == null || minDiscoveredSeq < before)
+    ? minDiscoveredSeq
+    : null;
   return sendJson(res, 200, {
-    events: mergeSynthItemsBySeq(events, synth),
-    next_cursor: hasOlder && rows.length > 0 ? Number(rows[0].seq) : null,
+    events: mergeSynthItemsBySeq(events, synth.items),
+    next_cursor: whitelistCursor ?? tailCursor,
   });
 }
 
@@ -2943,11 +2963,12 @@ async function buildHistorySynthItems(pool, windowRows, { before = null, session
   // **一个影子都没有** ⇒ 旧代码把它整个漏掉：既没有 `run_termination` 分隔条，也没有占位项，
   // 刷新后正文区完全空白。这里用页内的 `run_end` 行**发现 run id**（只是多一个候选 id，
   // 那一行本身仍不作为回放事件下发），后面的投影完全复用既有通路。
-  const discoveredIds = sessionId == null
-    ? []
-    : await discoverTerminalRunIds(pool, sessionId, { pageLow, before, limit });
-  const runIds = [...new Set([...windowRunIds, ...discoveredIds])];
-  if (runIds.length === 0) return []; // 成本红线：窗口无 run 且页内无终态行 ⇒ 整段跳过，一条 runs 查询都不许多发
+  const discovery = sessionId == null
+    ? NO_TERMINAL_DISCOVERY
+    : await discoverTerminalRuns(pool, sessionId, { pageLow, before, limit });
+  const runIds = [...new Set([...windowRunIds, ...discovery.runIds])];
+  // 成本红线：窗口无 run 且页内无终态行 ⇒ 整段跳过，一条 runs 查询都不许多发。
+  if (runIds.length === 0) return { items: [], discovery };
   // 一条 runs 查询同时服务 partial_output 的候选判定与 run_termination 的终态投影（不许打第二条）。
   const runRows = await loadWindowRuns(pool, runIds);
   // 候选 = 终态且**无 assistant 锚点**的 run（有锚点 ⇒ 正文已在 `messages`/transcript 那条路上，
@@ -2961,12 +2982,20 @@ async function buildHistorySynthItems(pool, windowRows, { before = null, session
   // `seq >= before` 的项属于**更新的那一页**，本页不得返。不拿 `windowRows` 的最小 seq 去卡下界：
   // `seq` 永远 >= 本页最小行 seq（候选就是从本页行里来的），卡下界只会把刚好落在页首的项误删。
   const items = [...partials, ...buildRunTerminationItems(runRows)];
-  if (before == null) return items;
-  return items.filter((it) => Number(it.seq) < before);
+  // `discovery` 原样带出去（**不是**合成项的一部分）：分页游标要的是「发现行本身的最小 seq」与
+  // 「是否被 `LIMIT` 截断」这两个**窗口事实**，而不是存活下来的合成项的 seq（项会被 M-6④ 的
+  // `seq < before` 拦掉、会被「非终态 / 有锚点 / 无 reason」筛掉——拿它当游标会漏进可倒退的位置）。
+  if (before == null) return { items, discovery };
+  return { items: items.filter((it) => Number(it.seq) < before), discovery };
 }
 
+/** 会话未传（既有的调用口径：不跑发现查询）时的空发现结果。 */
+const NO_TERMINAL_DISCOVERY = Object.freeze({ runIds: Object.freeze([]), truncated: false, minSeq: null });
+
 /**
- * issue #514：**候选发现**——从本页 seq 窗口里的 `run_end` 行取 run id（只取 id，那一行不下发）。
+ * issue #514：**候选发现**——从本页 seq 窗口里的 `run_end` 行取 `run_id` 与 `seq`
+ * （那一行本身照旧不下发；取出来的 seq 只用于**分页游标**，不拿它当合成项的位置——
+ * 项的 `seq` 仍由 `loadWindowRuns` 的 `MAX(e.seq)` 定，#236/#300 口径未动）。
  *
  * 为什么需要它：合成项的候选集此前**只**来自「本页的白名单行里有哪个 run」，而一条从未开始就被
  * 取消的 run 只有一行 `run_end`（白名单外，红线不许加）⇒ 它永远进不了候选集 ⇒ 刷新后这条 run
@@ -2979,22 +3008,44 @@ async function buildHistorySynthItems(pool, windowRows, { before = null, session
  *     本页，同一根分隔条在每一页重演一次（#502 M-6④ 那个形状）。空页 ⇒ 下界 0：此时本页就是
  *     「白名单行的尾巴之下」那一段，本就没有更老的内容会被重复覆盖；
  *   * **seq 上界 `before`**：与主窗口同一口径（游标之下才属于本页）；
- *   * `LIMIT`：候选数不得超过页大小（`limit`），极端会话（整页都是被取消的 run）也只会多要一页的量。
+ *   * `LIMIT = limit + 1`（**多取一行探针**，与主窗口算 `hasOlder` 同一个手法，§1.3 keyset 口径）：
+ *     拿到的行数**超过** `limit` 才是「真的被截断了」（事实），而不是「恰好返了 `limit` 条」（猜）；
+ *     候选仍只取最新的 `limit` 条 ⇒「候选数不超过页大小」这条不变。
+ *     为何不能拿「返了 `limit` 条」当截断：那种页恰好只剩 `limit` 条时，游标会被归到一条**已经展示
+ *     过**的行上 ⇒ 客户端多跑一趟空页，而既有那条「空页 ⇒ 分页到头」的断言会变假（#514 页界用例）。
+ *
+ * **返的是窗口事实，不只是候选 id**（#514 返修，审计第 1 条）：`truncated` 与 `minSeq`（已保留行里
+ * 最小的 `seq`）是分页游标的唯一合法来源（见 `handleSessionEventsHistory`）——游标要回答的是
+ * 「这个窗口之下到底还有没有更老的行」，而不是「存活下来的合成项长什么样」（后者会被 M-6④ 的
+ * `seq < before` 拦掉、会被「非终态 / 有锚点 / 无 reason」筛掉 ⇒ 拿它当游标会造出倒退的页边界）。
  *
  * 成本：**每次响应最多一条**（不是每 run 一枪），走既有 `UNIQUE (session_id, seq)` 索引倒序扫，
  * 非空页的扫描范围被 `[pageLow, before)` 夹住；此前那条「同一次响应里只允许一条 `runs` 查询」的
  * 成本红线不变（发现的是 `run_events`，候选 id 仍并进 `loadWindowRuns` 那**一条** runs 查询）。
+ * ⚠ 二次审计 LOW-1 点名的两条算术（逐字同 §4.4a-2 成本段，别再被读成「扫过的行数为 1」）：
+ *   ① `LIMIT` 封的是**返回条数**，不是**扫过的索引条目数**——`type = 'run_end'` 是残余过滤；
+ *   ② `run_events_run_end_key`（部分唯一索引）建在 `run_id` 上，对这条**按会话扫**的查询
+ *      帮不上忙，它只保证「每 run 至多一行 ⇒ 候选数天然有界」这一件事。
  */
-async function discoverTerminalRunIds(pool, sessionId, { pageLow = 0, before = null, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
+async function discoverTerminalRuns(pool, sessionId, { pageLow = 0, before = null, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
   const params = [sessionId, pageLow];
   let where = `session_id = $1 AND type = 'run_end' AND seq >= $2`;
   if (before != null) { params.push(before); where += ` AND seq < $${params.length}`; }
-  params.push(Math.max(1, limit));
+  const cap = Math.max(1, limit);
+  params.push(cap + 1); // 探针行：只为判「窗口之下还有没有更老的」，不拿它当候选
   const r = await pool.query(
-    `SELECT run_id FROM run_events WHERE ${where} ORDER BY seq DESC LIMIT $${params.length}`,
+    `SELECT run_id, seq FROM run_events WHERE ${where} ORDER BY seq DESC LIMIT $${params.length}`,
     params,
   );
-  return (r.rows ?? []).map((row) => row.run_id).filter((id) => id != null);
+  const rows = (r.rows ?? []).filter((row) => row.run_id != null);
+  const kept = rows.slice(0, cap);
+  // `ORDER BY seq DESC` ⇒ 保留段的**最后一行**就是最小 seq（下一页游标要的正是它）。
+  const last = kept.length > 0 ? Number(kept[kept.length - 1].seq) : null;
+  return {
+    runIds: kept.map((row) => row.run_id),
+    truncated: rows.length > cap,
+    minSeq: Number.isSafeInteger(last) ? last : null,
+  };
 }
 
 /**
