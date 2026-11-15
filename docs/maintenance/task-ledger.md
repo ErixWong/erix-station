@@ -5405,3 +5405,39 @@ run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data
 
 **剩余**：空闲仍有 13.2 事务/秒来自**另外 5 个轮询器**（`run_queue` 1.5/秒、`chat_sessions` 0.9/秒、
 `port_observations` 0.7/秒、`fde_onboarding` 0.6/秒…）⇒ 开 **#520** 续作（判据：空闲 < 3 事务/秒）。
+
+### 8.127 前端 `emitted()` 环境地板拆掉，并加静态闸 H3（issue #496 / 工单 fix-261115-05，2026-11-15，worker 落地 + 主 agent 亲验）
+
+**为什么不是一次性修完就完事**：`@vue/test-utils@2.5.1` 的 `emitted()` 取事件靠 **Vue devtools
+hook**，Vue 只在非生产构建里发 devtools 事件 ⇒ 本机 shell 默认 `NODE_ENV=production` 时它**恒空**。
+`AGENTS.md` §4 那句「新用例别用 `w.emitted()`」写于 11-11，**11-14 的 `2e40214` 又带进来一处**
+（`useEventStream.spec.ts`）⇒ 文字纪律拦不住扩散，本单把它换成**能跑的判据**。
+
+**改了什么**
+- 观测方式：`wrapper.emitted(ev)` → 「父级回调收 + 渲染进宿主 DOM + 断言渲染文本」
+  （新增 `mountBadgeHost` / `mountPanelInHost`）。**产品代码零改动**，`prefill` / `refresh` /
+  `files-changed` 的事件契约照旧。
+- 顺带修一条**假判据**：`expect(text).not.toContain('synced')` 里 `synced` 是状态词，
+  预填文案（`gitLight.prefill.finish` 只插 `{repos}{more}`）根本不出现它 ⇒ 改成钉已收工仓库的
+  **名字** `p1`，脏名单漏进来才会红。
+- 静态闸 **H3** 进 `test/repo-hygiene.test.js`（与 H1/H2 同文件同形）：只扫 **git 跟踪的**
+  `portal/frontend` 下 `*.spec.ts`，匹配**带点调用形状** `\.emitted\b`（散文里写「别用 emitted()」
+  不拦、写成调用就拦）；四道防空转自证：清单 ≥ 40 个 spec、顶层 `src/router.spec.ts` 必须在清单里
+  （拿 `src/**/*.spec.ts` 当 git pathspec 会漏它）、注入一行调用必须恰好命中 1 处、注入散文零命中。
+
+**主 agent 亲验读数**（树 `wt-496-261115` @ `fix-261115-05-496-emitted-floor`）
+- 前端四个 spec：`NODE_ENV=production` 与 `env -u NODE_ENV` **两个方向都 212/212、rc=0**；
+  `npm run typecheck` rc=0。
+- 根 `npm test`：2357 项、唯一红是 `portal/test/env-int-strict-506e.test.js:197`
+  （`ROUTE_IDLE_BACKOFF_MAX_MS='10000abc'`，断言「循环必须停在某一拍的 sleep 上」），
+  **单独复跑两次 17/17 rc=0** ⇒ 本批四张并行造成负载假红，与本单无关。
+- 我自己补做的变异（不采信 worker 自报的 5/5）：往被跟踪的 `portal/frontend/src/router.spec.ts`
+  追加 `wrapper.emitted('files-changed')` ⇒ `not ok 3 - H3 …`、rc=1；还原 ⇒ rc=0（3/3）。
+
+**撞号提醒**：本批四张单都从 `c8613a3` 起跳，各棵树里台账最大号都是 8.126，8.127 很可能被同时
+取用 ⇒ **合并时先合者保留原号，后者 +1 并在节内注明原号**。
+
+**worker 侧过程记**：首轮在 30 分钟默认时间闸内做完了代码与变异、没来得及写台账
+（`2f4bab5` + 未提交的 `test/repo-hygiene.test.js`）；`resume` 续跑一次遇模型空响应
+（`produced no output`）⇒ 收尾（commit + 本节台账）由主 agent 完成，符合 §3.0
+（git 流程操作与文档维护本就属主 agent）。
