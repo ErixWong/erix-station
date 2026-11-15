@@ -1155,6 +1155,17 @@ async function onWorkerFinished(ctx, msg) {
     // 旧 worker 不知道这个键）。落点见 `portal/src/internal.js` 的 `finishRun`（写进
     // `runs.termination.finalTextFallback`，由 `run_termination` 合成项投影给界面）。
     ...(msg.final_text_fallback === true ? { final_text_fallback: true } : {}),
+    // issue #243：worker 只在**命中**「终局正文是一段被文本化的工具调用」时才带这两个键
+    //（缺席 = 没命中，绝不补 `false`）⇒ 这里同样**逐字透传**。落点见 `portal/src/internal.js` 的
+    // `finishRun`：在同一个终态事务里合成 `textualized_tool_call` 诊断事件（additive，不改终态语义）。
+    ...(msg.textualized_tool_call === true
+      ? {
+        textualized_tool_call: true,
+        ...(typeof msg.textualized_tool_call_marker === 'string' && msg.textualized_tool_call_marker !== ''
+          ? { textualized_tool_call_marker: msg.textualized_tool_call_marker }
+          : {}),
+      }
+      : {}),
     // issue #322：标题**归 portal 生成**（`session-title.js` → `title-llm.js` → `llm-chat.js`），worker
     // 侧不再起标题 ⇒ 这个字段现在恒是空串。本行只保留**透传**（契约形状一字未改：旧 portal + 新 agentd
     // 的组合下拿到空串即走降级链），`title` 在 U2 上的口径见 `docs/api/portal.md` §9.6。

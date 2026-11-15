@@ -101,6 +101,12 @@ export const EVENT_TYPES = [
   // ⇒ 只进本数组，**绝不进** HISTORY_REPLAY_TYPES（它没有 seq、也没有历史行可回放；刷新后由
   // `GET /api/sessions/:id` 的 `session.queued_messages` 快照补齐）。漏加本数组 = 实时永远收不到。
   'queue_update',
+  // issue #243：`textualized_tool_call`（**本站自造**，portal 在终态事务里合成）——「终局正文是一段
+  // 被文本化的工具调用，交付报告可能没生成」。本数组是 EventSource 逐类型 `addEventListener` 的
+  // **唯一来源**，漏加就是实时一条都收不到（#288/#371-A/#421 同一颗坑，已经踩过四次）。
+  // ⚠ 本次只加**订阅与回放两处集合**，渲染（中性分隔行 + 中英双语文案）在下一步落 —— 在那之前
+  // 这一类是「订得到、暂时不刷行」，与 `run_outcome` 今天的形态同类。
+  'textualized_tool_call',
 ] as const;
 
 // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）。
@@ -156,6 +162,10 @@ const HISTORY_REPLAY_TYPES = new Set([
   // 它是展示类、不驱动运行态状态机：红色面仍只由 `run_end` 负责（这条事件本身说的是「请求已原样发出」，
   // 不是「本轮失败」）。
   'user_turn_guard_unrecoverable',
+  // issue #243：与 `http.js` 的 `HISTORY_EVENT_TYPES`、上面 `EVENT_TYPES` **同步**加（三处只加一边
+  // 就分别得到「实时收不到」或「刷新后消失」；对账判据 `portal/test/event-surface-contract.test.js`
+  // 的 S4 要求两个集合逐项相等）。上游 erix-agent #182 的教训正是「实时看得见、刷新后消失」。
+  'textualized_tool_call',
 ]);
 
 /** issue #89：run_events 历史端点的事件项（REST 形状，与 SSE data 展开后同构）。 */
