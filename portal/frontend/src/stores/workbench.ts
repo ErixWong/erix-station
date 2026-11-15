@@ -193,7 +193,10 @@ export interface FoldedOriginalTurn {
   /** #384：渲染要用得上三类“不是正文”的内容（旧实现只看 `text`，把有工具调用的轮画成空行）。 */
   role?: string;
   reasoning?: string;
-  toolCalls?: Array<{ name?: string; argsSummary?: string; isError?: boolean }>;
+  toolCalls?: Array<{ name?: string; argsSummary?: string; isError?: boolean; resultPreview?: string }>;
+  // ↑ issue #387：`resultPreview`（上游 400 字预览）以前只在注释里，现在重建路会把它填上——
+  // **配不上结果时这个键缺席**（不是空串），所以渲染侧要按「缺键就不画」处理，不得拿它当「有结果」的判据。
+  // 主消息流（`messages[].toolCalls`）早就在送这个键（#188），只是原文面从来没填过。
   [key: string]: unknown;
 }
 
