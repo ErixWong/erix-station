@@ -5405,3 +5405,129 @@ run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data
 
 **剩余**：空闲仍有 13.2 事务/秒来自**另外 5 个轮询器**（`run_queue` 1.5/秒、`chat_sessions` 0.9/秒、
 `port_observations` 0.7/秒、`fde_onboarding` 0.6/秒…）⇒ 开 **#520** 续作（判据：空闲 < 3 事务/秒）。
+
+### 8.136 单文件上传上限进管理台：一条「改数字不该重建容器」的切片（issue #485 片 A / 工单 fix-261116-04，2026-11-16）
+
+> 编号由主 agent 统一分配（本批并行）。本片 = #485 的**片 A**；**片 B（每 FDE 目录总量配额）不在本单**，
+> 它的阻塞事实记在本节末尾（现查读数，不是抄工单）。
+
+**需求（一句话）**：`FILE_UPLOAD_MAX_BYTES` 是**启动期 env** —— 改一个数字要改 `deploy/.env` +
+`docker compose up -d station-portal`，管理台既看不见也改不了。把它搬进 DB 并让管理台可改，
+**改完立即生效**（判据不是「重启后正确」，而是「同一个进程内下一次上传就按新值走」）。
+
+**形状照 `mail_settings` 先例（迁移 0026 + `mail-settings.js` 写侧 + `mail-provider.js` 读侧），但两处刻意不同**：
+
+1. **没有 60s 缓存**。`mail-provider` 要缓存是因为登录是热路径；上传不是 —— 一次上传多一次单行主键
+   `SELECT`（<1 ms）换掉「改完要等一分钟」。**加缓存只是把「必须重启」换成「必须等 60s」，判据并没有被满足**
+   （因此写侧也不需要 `invalidate()`：没东西可失效）。这一条由变异自证，见下面 M2。
+2. **产品区间故意没写进 DB CHECK**。DB 只管物理荒谬（`CHECK (max_file_bytes > 0)` + `CHECK (id = 1)`），
+   1 MiB–1 GiB 只在 JS 写侧。理由不是懒：**写了 CHECK，「手工把 `max_file_bytes` 改成非法值 ⇒ 上传回落而不是
+   500」这条判据在真机上就根本进不去**（`UPDATE` 会被 CHECK 当场拒），只剩单测能测；而且日后改天花板
+   会从「改一个常量」变成「追加一次 DDL」。
+
+**三处优先级与回落是有意分层**（`portal/src/upload-settings.js`）：
+
+| 位置 | 管什么 | 形态 |
+|---|---|---|
+| DB（迁移 0035）| 物理荒谬 | `CHECK (max_file_bytes > 0)` |
+| JS 写侧（`PUT /api/admin/upload/settings`）| 产品区间 1 MiB–1 GiB | **当场 400** `validation_failed` + `details.field`，**不落库** |
+| JS 读侧（`POST /api/files/upload`）| 任何不可用的行 | **回落 env → 默认** + 一条点名 `upload_settings.max_file_bytes` 与 `FILE_UPLOAD_MAX_BYTES` 的 warn；**永不 500** |
+
+**`bigint` 的代价必须有人在读侧接住**：上限选 `bigint`（`int` 只到 2 GiB，提天花板不该再要一次 DDL），
+而 **node-pg 对 int8 默认回的是字符串**（不是 number）。所以读侧统一 `max_file_bytes::text` + 只认
+`/^[0-9]+$/` 且必须落在区间内，**不许** `Number()` / `parseInt()` 吞 —— 正是 §8.126 那条
+`parseInt('1e4') === 1`（半个值静默生效，比报错难查十倍）的同族。`fake-pool` 也**复制了这个形状**
+（`FROM upload_settings` 回字符串），否则「产品侧写成 `parseInt`」这种错在单测里是绿的、到真库才炸。
+于是：`'1e7'` / `' 100 '` / `'0'` / 超安全整数 / 区间外 ⇒ 全部回落并带 warn；而 JSON number `1e7`
+（= 10000000，精确可表示）在写侧**合法** —— 有意的**写侧严、读侧宽但从不猜**。
+
+**`413` 从此多一个 `details.limit_source`**（`db`/`env`/`default`），`details.max_bytes` 是**生效值**而不是
+env 值 ⇒ 值班看一眼就知道该去改哪一边。零新错误码（`validation_failed` / `forbidden` / `method_not_allowed`
+都是既有码），所以 §1.2 无新增。
+
+**工单原文有一条口径本身是错的**（照字面做会做出一个空区间）：片 A 第 3 条写「范围校验
+`1 MiB ≤ v ≤ MAX_BODY_BYTES 上限`」。但 `MAX_BODY_BYTES` 默认 **64 KiB** < 1 MiB 下限 ⇒ 区间为空集；
+根因不是笔误而是**口径错配** —— 上传**根本不走** `readJsonBody`（`http.js#handleFileUpload` 的注释：
+走它任何真实文件都会 413），两个旋钮量的是不同的东西。落地取明确产品天花板 **1 GiB**（= 32 × 默认值），
+理由写在 `upload-settings.js` 的常量注释与 §4.15，并把「它与 `MAX_BODY_BYTES` 无关」写进文档。
+
+**判据读数**（判绿只看退出码）：`portal/test/upload-settings.test.js` **14/14 通过**（US-1..US-14，含 HTTP 层
+真 tmp userspace + FakePool）；`portal/test/migrations.test.js` **31/31**（head 断言 34 → 35 全量进位：
+19 处 `slice(0,4)), 34` + 4 处 `Array.from({length: 34})` + 0033/0034 的「末位/倒数第二」两条改成
+倒数第三/倒数第二）；前端 `AdminUploadView.spec.ts` **20/20** + `lib/uploadSettings.spec.ts` 与
+`localeParity.spec.ts` 合跑 **47/47**，`npm run typecheck` rc=0。
+上传族回归面：`file-upload` / `http-upload` / `user-file-upload-flag` / `admin-mail-settings` /
+`mail-provider` / `config` / `deploy-env-defaults` 合跑 **101 + 26 全通过**。
+
+**三条变异（每条先 `git diff --numstat` 自证非空操作，跑完 `git checkout --` 复原，提交前
+`grep -rn MUTANT portal` = 0）**：
+
+| # | 变异 | 变红的格子（点名） |
+|---|---|---|
+| M1 | `http.js` 上传端点把 `maxBytes: limit.maxBytes` 改回 `ctx.config.fileUploadMaxBytes`（= 工单要求的「读侧只读 env」）| `✖ US-7【工单判据 1+3】`、`✖ US-8【工单判据 2 + 立即生效】` |
+| M2 | `resolveEffectiveMaxFileBytes` 加一个**模块级缓存**（= 「每次现读」退化）| `✖ US-8`（核心承诺那条，**只有它断言「改完之后的第二笔上传」**）、`✖ US-6`、`✖ US-7` |
+| M3 | `cleanMaxFileBytes` 把类型闸换成 `Number(value)` 吞一口 | `✖ US-3`（写侧只收区间内 JSON number）、`✖ US-10`（400 且不落库）|
+
+⚠ M2 的判据面要说清：US-7/US-6 也红是**粗变异跨用例漏染**（模块级 memo 会活到下一个 stack），
+真正区分「现读」与「缓存」的只有 **US-8** —— 它是唯一断言「同一进程内，PUT 之后第二笔上传的结果变了」
+的格子（413 → 保存 → 200 → 再传 200 → 改回 1 MiB → 再传 413）。**只断言「读过一次 DB」的格子在这里是假绿**，
+所以当初就没写成那样。
+
+**env 回落面逐字未动**（这是「两头说法」判据，别只看代码注释）：`portal/src/config.js` 的
+`fileUploadMaxBytes: intEnv(env, 'FILE_UPLOAD_MAX_BYTES', 32 * 1024 * 1024)` 与
+`deploy/docker-compose.yml` 的 `FILE_UPLOAD_MAX_BYTES: ${FILE_UPLOAD_MAX_BYTES:-33554432}`
+**两行与 `origin/main` 逐字相同**（`git diff origin/main...HEAD` 里它们不在 `+/-` 里；行号只因新增注释而位移
+286 → 302、204 → 207），compose 的 diff **非注释行为 0**。新增的只有 `fileUploadMaxBytesSource`
+（管理台要显示「这个值是从哪来的」，谓词与 `intEnv` 同口径：**给了但非法 ⇒ `default`**，不许谎报 env，
+US-14 钉住）。`portal/test/deploy-env-defaults.test.js` 26/26 仍绿 = compose 默认值与 config 默认值同源这条
+老闸没被动坏。
+
+**前端的一条纪律：不许抢服务端的闸**。解析得出整数就照发（**越界也发**，由 400 + `details.field` 回来标红），
+解析不出整数（空、`1.5`）才禁保存且**零请求** —— 发一个 `maxFileBytes: null` 只是把「用户还没填」伪装成
+「用户填了个非法值」。归一化守 #390-A：键缺席 ⇒ `null` ⇒ 页面显示「未知」，**不是 0**（`0 B` 会让人以为
+上限是 0，比「未知」更坏）。⚠ 实测一条 jsdom 与浏览器共同的行为，它决定了哪一层该测什么：
+**`<input type=number>` 会把 `1e7` 归一成 `10000000`**，所以「科学计数法字符串」这一族在视图层**永远到不了**
+lib —— 它由 `lib/uploadSettings.spec.ts` 直接测纯函数（视图层测它必然恒绿，是假绿）。
+
+**一条环境坑（会咬每一个 worker）**：本机 shell 里 **`NODE_ENV=production` 是设着的**，于是
+`npm ci` **跳过 devDependencies** ⇒ `npm run typecheck` 报 `vue-tsc: not found`（看起来像「worktree 没装依赖」，
+其实是 env 污染）。口径：**装依赖也要 `env -u NODE_ENV npm ci`**；跑前端测试同样必须 `env -u NODE_ENV`
+（AGENTS §4 那条 `emitted()` 恒红的根因就是它）。
+
+**真机面：`BLOCKED-on-deploy`**。本片没有动任何 `station-*` / `fde-*` 容器（派单红线），dev 库只读，
+所以「管理台改成 1 MiB ⇒ 不重启 ⇒ 下一笔 2 MiB 上传 413」这条**真机判据由主 agent 复验**。
+替代证据：US-7 / US-8 是 **HTTP 级**用例（真 `createServer` + 真 tmp 磁盘 + 真流式落盘 + 真 413 信封 +
+超限无 `.tmp` 残骸），唯一没覆盖的是「真 PG 里那一行的读写」与「真 compose 重启后 env 仍在」。
+
+**片 B（每 FDE 目录总量上限）不在本单 —— 它阻塞在宿主层，本单一片没碰**。现查读数（2026-11-16，本机，非抄工单）：
+
+```
+$ grep ERIX_USERSPACE_ROOT deploy/.env      → ERIX_USERSPACE_ROOT_HOST=/srv/erix/users
+$ findmnt -no TARGET,FSTYPE,OPTIONS --target /srv/erix/users
+/      ext4   rw,relatime                   ← 挂载选项里**没有** usrquota / grpquota / prjquota
+$ findmnt -no SOURCE /                      → /dev/nvme0n1p2        （userspace 与 station-db、
+$ df -h /                                   → 937G  677G  213G 77%    镜像层、日志**共用这块盘**）
+$ du -sx --block-size=1M /srv/erix/users    → 414 MiB（整棵 userspace）
+$ command -v setquota repquota quota edquota → 四个全部 MISSING（`quota` 包未装）
+$ command -v chattr dumpe2fs tune2fs         → 都在（/usr/bin/chattr、/usr/sbin/{dumpe2fs,tune2fs}）
+$ dumpe2fs -h /dev/nvme0n1p2                 → Permission denied（非 root 读不到 superblock）
+                                                ⇒ ext4 的 `project`/`quota` **feature bit 现状未知**
+```
+
+`BLOCKED: 挂载选项缺 prjquota` + **满足什么条件才许做**：① 拿到宿主 root；② `dumpe2fs -h` 读出 feature 里
+有 `project`+`quota` ⇒ 只需 `mount -o remount,prjquota /`（**活体 remount，生产要先演练**）；没有则
+`tune2fs -O project,quota` + 离线 `e2fsck` 窗口（**风险高，必须决策者排期**）；③ 装 `quota` 包
+（`setquota`/`repquota`）；④ 先在**一个测试 FDE** 上验「`chattr +P` 的目录位 + `-p` 默认 project id 能否让
+agent 在容器内 `mkdir` 的新目录继承 project id」——**这条验不过整个方案要重估**（ext4 的继承语义与 XFS 不同）。
+工单原判据留住：**容器里 `dd` 60 MiB 也要失败**才算闸门成立；「上传前 `du` 一遍目录」是**假闸门**
+（拦住人、放过 agent），本片明确**没有**顺手实现它。
+
+**残留风险**
+
+1. **`upload_settings` 与 env 是两套数**，管理台是唯一的合并点 —— 运维若只改 `deploy/.env` 而 DB 里有值，
+   改的其实是兜底位（不生效）。缓解：管理台显示 `source` + 三个来源的值 + `reason`；`docs/env.md` §10.1
+   与 compose 注释都改了角色描述。
+2. **区间常量三处一致**（`MIN/MAX_MAX_FILE_BYTES`、管理台 `limits`、迁移里**没有**区间）由
+   `migrations.test.js` 的 0035 段与 `US-12` 钉；日后放宽天花板要同处改 JS 常量，**不需要** DDL（这是设计意图）。
+3. 上传端点每次多一次单行 `SELECT`：QPS 极低，可接受；真库上没测过（`BLOCKED-on-deploy`）。
+4. 前端「越界提示」是提前给的一句话，**不是**校验闸（服务端的 400 仍是唯一真相）。
