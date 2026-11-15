@@ -5489,3 +5489,72 @@ reaper 周期 15s→30s → E1/E3 红；drift 周期 60s→120s → E4 红；**�
 4. `chat_sessions` 的精确拆分要 `pg_stat_statements`（scratch 库）或给 internal 请求加 `application_name`。
 5. 三个新循环的 `done`/`settled` 现在被 `stopLoopsAndWait` 等到了 ⇒ **若哪个循环卡在长事务里，关闭会等满预算**
    （仍是有界的，`gracefulShutdown` 的总预算没动）；真要观察这个，跑一次 SIGTERM 看 `[shutdown]` 那行读数。
+
+#### 8.134.1 PR #552 返工：第三方审计 4 条 LOW 的处置（issue #520 / 工单 fix-261116-01，2026-11-16）
+
+主 agent 验收并开了 PR #552（他亲验：新用例 23/23、变异「有活不 reset」恰红 1 格 B2、reaper 周期 15s→20s
+⇒ E1+E3 红、根 2379/2365/0 fail）。第三方对抗审计回来 **零 BLOCKER / 零 MED / 4 条 LOW**，其中两条推翻我
+原来的判断（下面逐条记「原判断 → 撤销后的结论」）。提交链（在 `972da21→3b826f7→41cf90c→cf7afea` 之上**只做新增**）：
+`693ee99`（LOW-2 代码）、`cb50832`（LOW-1 compose/.env.example + 三腿判据）、`6a64cfb`（LOW-3/LOW-4 文档与用例加固）。
+
+**LOW-1（撤销我的判断，改代码）：三根旋钮在标准部署里传不进去。**
+事实：`deploy/docker-compose.yml` 的 `station-portal` 是**显式 `environment` 列表、无 `env_file`**（该文件
+`FILE_UPLOAD_MAX_BYTES` 那条注释自己就写着），列表里没有 `ONBOARDING_/OFFBOARDING_/PROVISIONER_IDLE_BACKOFF_MAX_MS`
+⇒ 运维在 `deploy/.env` 写 `PROVISIONER_IDLE_BACKOFF_MAX_MS=5000` **完全不生效且不报错**。
+我原来写「不登记也行（这三根是可选调优，不是必须暴露的运维面）」——**撤销**：同一族病在 #472（评审 major 8）、
+#270（IPAM 三腿）、#450（管理台端口三处）都已立过先例，「可选调优」恰恰是最没人当场验证的那类。
+处置：compose 显式登记三条 `${…:-30000}/${…:-30000}/${…:-15000}`（缺省与代码常量**逐字相等**）+
+`deploy/.env.example` 同形登记 + `docs/env.md` §10.1 入表；新用例 `portal/test/deploy-env-idle-backoff.test.js`
+把**三腿**钉住：compose 插值缺省 == 代码缺省常量（从被测模块 import，不在测试里再抄一个）== **循环真正生效的封顶值**
+（真起循环读 sleep 毫秒序列；只比常量会漏「常量对但循环焊死在缺省上」）。
+变异自证（每次只跑 `node --test portal/test/deploy-env-idle-backoff.test.js`，红了立刻还原，提交前 `grep -rn MUTANT portal` = 0）：
+- M-1 只改 YAML 一个缺省值 `15000→16000` ⇒ **恰红 1 格** `not ok 2 - G2`，消息点名旋钮与两个数（`16000 !== 15000`）。
+- M-2 删掉 compose 里 `ONBOARDING_…` 那条登记 ⇒ `not ok 1 - G1` + `not ok 2 - G2`（登记腿与一致腿同红，符合预期）。
+- M-4 三个循环的旋钮焊死在缺省常量（接线断）⇒ `not ok 4 - G4` + `not ok 5 - G2b`；**`not ok 2 - G2` 仍绿**
+  —— 这正是 G2b 存在的理由。同一组变异下 `idle-backoff-520.test.js` 23/23 **全绿** ⇒ 旧文件看不见 env 接线断。
+
+**LOW-2（成立，改代码）：provisioner 的「15s 上限」不是硬上限。**
+事实：`PROVISIONER_IDLE_BACKOFF_MAX_MS=60000` 被接受并真产生 60s 延迟（解析器只守共享的
+`MAX_BACKOFF_MS_SAFE=60000`），而注释把 15s 叫「上限」。一个 env 能把「漂移即修」的发现延迟**静默放宽 4 倍**。
+主 agent 选「按循环钳制」而不是「改口径」，理由认同：漂移发现延迟是这个循环的业务承诺，不该由运维面单方面放宽。
+处置：`resolveIdleBackoffMaxMs({log,env})` ⇒ 先过严格正整数校验，再按 `IDLE_BACKOFF_MAX_MS_BUSINESS_CAP=15000` 钳，
+越界 ⇒ **钳到 15000 + warn 点名旋钮与钳后值**（不静默）。开户/销号**故意不钳**（它们的业务上限就是共享的 60s，
+注释里「要更激进就配 60000」必须能兑现 ⇒ G4 里放了对照组）。顺带给三个循环开 `env = process.env` 注入缝、
+`loop-timing.envInt` 支持 `env` 选项（注入口比「往 process.env 塞了再记得删」少一类交叉污染）。
+判据读数：`G4` 里 `env=60000` ⇒ 生效值 **15000**、warn 恰一条且文案含 `PROVISIONER_IDLE_BACKOFF_MAX_MS` 与 `15000`；
+端到端阶梯 `[5000,10000,15000,15000]`。变异 M-3（撤掉钳制，`if (false && …)`）⇒ **恰红 1 格** `not ok 4 - G4`。
+
+**LOW-3（成立，只改口径）：offboarding 的「1h 清理不跟着退」要说准。**
+事实：清理是销号循环里**每拍检查一次**的时间门（`offboarding.js` 的 `tickAt - lastSweepAt >= SWEEP_INTERVAL_MS`），
+不是独立定时器 ⇒ 空闲拍 30s 会让它**晚跑**（审计实测 59:59 判、60:29 跑）。不是饿死，但「keeps its schedule」是近似。
+准口径（已同时落到 `offboarding.js` 注释与 `docs/ops/db-idle-load.md` §7）：**阈值 1h 一个字节没改；节拍受空闲拍影响，
+典型晚 ~max/2、最坏晚一整个空闲拍 ≤ max（默认 30s）**。顺手修了原注释里「满了 1 天才清」的口径错
+（`SWEEP_INTERVAL_MS = 60 * 60 * 1000` 是 1 小时）。C1 用例仍是假时钟 —— 没为这条加任何墙钟断言（#531 教训）。
+
+**LOW-4（登记 + 顺手加固）：新用例仍有墙钟依赖。** 位置（返工后行号）：
+- `portal/test/idle-backoff-520.test.js:81` `waitUntil(cond,label,deadlineMs=15_000)` —— `Date.now()` 截止；
+- 同文件 `:126` `awaitWatchdog(promise,label,ms=20_000)` —— 真 `setTimeout` 看门狗；
+- 同文件 `:201-208` A4 用真 5ms abort / 真 1ms 睡 / 真 60s+abort。
+加固（不重排用例、不改判据）：两处看门狗到点后都先做 **5 轮宏任务的宽限复检**再判失败，`awaitWatchdog` 改成
+tracked-state 形式复查 promise 是否其实已落定（事件循环被停顿十几秒时，定时器回调可能排在已落定的 promise
+**之后**才被调度 ⇒ 老写法会把「已落定」误判成「stop 没打断」）。**没换成假时钟的部分与理由**：A4 测的就是
+`sleepCancellable` 对真 timer + 真 AbortSignal 的行为，换假时钟等于测夹具；它的判据是 resolve 的布尔值而非流逝
+毫秒 ⇒ 停顿只让它变慢。残余风险（如实登记）：极端事件循环停顿（>15s 且期间真无进展）下 `waitUntil` 仍可能红，
+红了按 #531 口径**先单跑该文件再定性**，别改 #506 的夹具。
+
+**门禁（各跑一次，原文）**：
+- `timeout 400 node --test portal/test/idle-backoff-520.test.js; echo rc=$?` ⇒ `# tests 23 / pass 23 / fail 0`，`rc=0`
+- 新增一致性用例 `timeout 400 node --test portal/test/deploy-env-idle-backoff.test.js` ⇒ `# tests 5 / pass 5 / fail 0`，`rc=0`
+  （两文件合跑 28/28；关闭家族 + #506 退避家族 + 两个既有 deploy-env 一致性文件合跑 108/108）
+- 根门禁 `timeout 1500 npm test; echo rc=$?` 见本节末的补记（只跑一次；`idle-backoff-506*` / `env-int-strict-506e` /
+  `idle-backoff-safe-range-506b` 是 #531 已知负载假红族，红格先单跑该文件再定性并附两个读数）
+
+**没做到的 / 遗留**：
+1. **判据 1（空闲 `xact_commit` < 3/秒）仍是 `BLOCKED-on-deploy`**：dev 共享栈的 `station-portal` 跑的是旧代码，
+   且红线不许重启/重建 `station-*`；本单交付的是**测量方法 + 现测基线**（§8.134 与 `docs/ops/db-idle-load.md`）。
+   算术期望值 ≈ 6–7/秒，不是 <3/秒 —— #506 的 outbox 2s 空闲地板本身就贡献约 4 语句/秒。
+2. **#506 的四根旋钮同族未登记**：`ROUTE_IDLE_BACKOFF_MAX_MS` / `ROUTE_ORPHAN_RECOVERY_INTERVAL_MS` /
+   `MATERIALIZE_IDLE_BACKOFF_MAX_MS` / `MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS` 至今不在 compose 的
+   `station-portal.environment` 里（四条 `grep -c` 全 0）⇒ 标准部署上配了同样是空气。本单没顺手改（跨单，
+   且会动 #506 的部署面）；修法同 §6，建议另开一单把四根加进同一条三腿判据。
+3. `chat_sessions` 0.86/秒 的精确拆分仍未收口（本机无语句级计数），已按「不是那 7 个循环 + 逐条 SQL 排除」交付。
