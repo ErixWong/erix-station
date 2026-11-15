@@ -5483,3 +5483,50 @@ select payload->>'final_text' from run_events
    升级顺序是「先 runner 后 portal」，与 #442 同）。
 4. dev 库里那条 run 的 `termination.reason` 是 `judge_done` 而非工单写的 `end_turn` ⇒ **真实现场的
    「9 轮 + `end_turn`」形态未在本库复现**，判据用的是「终局正文」这一层事实，不依赖轮数与 reason。
+
+**第 3 步追加（前端渲染，同日 261116，worker 落地；提交 `1f9a0cf` 渲染 + i18n / `5602c4e` 判据 / `15b0f26` 判据的 tsc 红）**
+
+上面「剩余」第 1 条（**界面还看不见**）到此结案。前端只加渲染，**后端一行没动**。
+
+**开工前的现场（先量再改，读数在 `/tmp/probe-243-readings.json`）**：`useEventStream.ts` 的 `dispatch` 里
+这个类型落进 `default: return`（第 1307 行「未知类型忽略（§5.3 向后兼容）」）。实测：一条历史回放帧 + 一条实时帧
++ 一条纯未知类型，`entries` 长度 **1 → 1 → 1 → 1**（一条都不多），DOM 里 `.roundsep` 只有夹具参照行、
+`.syserr` 0 个、**空节点 0 个** ⇒ 今天未知类型的真实现场是**整条事件被静默丢弃**，既不是空条目也不是破图。
+所以本步是**补渲染**，不是修一个已存在的破渲染。另两处工单事实更正：本仓**没有** `RunEventTimeline.vue`
+（时间线的分派表在 `composables/useEventStream.ts`，落点是 `components/StreamPanel.vue:599` 那条 `sep` 行），
+也**没有** `components/__tests__/` 目录（30 个前端 spec 一律与组件并排）⇒ 判据按本仓口径并排放。
+
+**渲染的三条口径**
+- **中性、不是警报**：`case 'textualized_tool_call'` → `hooks.onSep(...)` ⇒ 条目 `kind:'sep'` → 既有
+  `.roundsep` 中性灰行。**不走 `onSysErr`**（`.syserr` 是 #dc3545 那个「错误」色，借它就是谎报严重程度 ——
+  正文里那段文字**就是**模型答案的一部分，只是没执行；同 #300 给半截正文挑中性色、同 D9「状态词、不是警报」）。
+  文案里没有 `⚠`，judge 的黄色面板也不许借用。
+- **marker 有就显示、没有就不显示**：第 2 步特意留了「缺 marker 也照发」⇒ 整句必须独立成立；
+  非串 / 空串 / `null` 一律不带片段（绝不 `String(对象)` 渗进用户可见文案，#261/#288B 同口径），
+  片段上界 120 与 portal 的载荷校验同源；片段复用既有 `stream.event.dash`（不抄第二份）。
+- **必须走文本节点**：它最终落在 `StreamPanel.vue` 的 `{{ en.text }}` 上 ⇒ 全角竖线与 `<invoke name="exec">`
+  原样可见。**不许**改成 `v-html`（标签会被吃掉，可能连后半句一起吞）——这件事由判据钉死，不靠注释。
+- 位置：portal 已把 `seq` 排在 `run_end` **之前** ⇒ 前端**不重排**，到达顺序就是「正文 → 提示 → 终态条」；
+  实时与刷新回放共用同一条 `dispatch`（#89 口径），实测两路逐字同文案。
+
+**判据 11 格**（`StreamPanelTextualizedNotice.spec.ts`，全部 DOM 文本断言，**没有一处 `w.emitted()`**）：
+① 历史回放 / 实时各一格 + 「两路逐字同文案」一格；② 缺 marker ⇒ 整句照出且无 `undefined` / 悬空破折号；
+③ 两格（`<invoke name="exec">` 的 **ASCII** 形态 + `<｜｜DSML｜｜` 全角形态）；④ 反向自证（正常 `run_end` +
+普通正文不出现这句话，而终态分隔条照旧在）；另三格守红线：中性（`.syserr` 为 0、无 `⚠`、不借 judge 黄底）、
+位置（`compareDocumentPosition` 判**具体那一行**的文档序，不拿祖先 div 比、不看 `entries` 中间态）、
+双语与脏值。**夹具的一条硬知识**：v-html 的靶子必须是 **ASCII 开头**的标签 —— `<｜｜…` 全角开头在 HTML 里
+本来就不是标签，`v-html` 也吃不掉它，拿它当靶子会假绿（实测：变异 B 下全角那格照样绿）。
+
+**两发变异（都实跑，收尾 `grep -rn MUTANT portal` = 0）**
+- **A 渲染分支恒假** ⇒ `Tests 10 failed | 1 passed (11)`，红的正是 ①×3 / ② / ③×2 / 中性 / 位置 / 双语 / 脏值；
+  **只有 ④ 反向自证仍绿**（恒不渲染本就不该让「不该出现」那格变红 —— 它绿恰恰证明那格不是摆设）。
+- **B `{{ en.text }}` → `v-html`** ⇒ `Tests 2 failed | 9 passed (11)`，红的正是 ③ ASCII 那格
+  （`<invoke name="exec">` 被当标签吃掉）与 ① 实时那格（夹具 marker `<tool_call` 同为 ASCII 标签）。
+  两发都是**真改行为**，不是等价替换。
+
+**读数**：焦点 `env -u NODE_ENV npm test -- src/components/StreamPanelTextualizedNotice.spec.ts` **11/11 rc=0**；
+`npm run typecheck` **rc=0**（第一次是 rc=2：`expect(x).toBe(1,'消息')` 这一形 vitest 不支持，
+本仓口径是 `expect(值, 消息).toBe(…)`，见 `15b0f26`）；全量前端 `env -u NODE_ENV npm test`
+**64 files / 1388 tests 全绿 rc=0**（含 i18n 双语键集对账 `localeParity.spec.ts`）。
+root `timeout 1500 npm test` 按「先 commit 再跑长门禁」在本节提交之后单独跑一次，读数记在交付
+`/tmp/tickets/deliver-243-step3.md`。
