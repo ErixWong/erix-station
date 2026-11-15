@@ -1185,7 +1185,7 @@ export const IDLE_BACKOFF_MAX_MS_DEFAULT = 15000;
 // 点名旋钮（不静默）。与开户/销号两个循环的区别是故意的：那两个的业务上限就是 60s（共享上限），
 // 所以它们仍是「越界 ⇒ 回落缺省」；这里必须钳，因为缺省（15000）比共享上限（60000）小。
 // 判据：`portal/test/deploy-env-idle-backoff.test.js`（env=60000 ⇒ 生效 15000 且 warn 点名旋钮）。
-const IDLE_BACKOFF_MAX_MS_BUSINESS_CAP = 15000;
+export const IDLE_BACKOFF_MAX_MS_BUSINESS_CAP = 15000;
 
 /**
  * 本循环的空闲退避上限：**先过共享的严格正整数校验，再按本循环的业务上限钳**。
