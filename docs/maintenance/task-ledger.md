@@ -5576,3 +5576,11 @@ tracked-state 形式复查 promise 是否其实已落定（事件循环被停顿
   按工单口径**没有改那些夹具**（#531 的收口是独立单）。
 - 本轮**没有**新增 DB 读数：判据 1 仍是 `BLOCKED-on-deploy`（dev 栈 `station-portal` 跑旧代码，红线不许
   重启/重建 `station-*`）；也没碰任何容器、没改依赖与 lockfile。
+
+**补记 2（补记里那句「没有新增 DB 读数」之后的复核读数，同日晚些）**：交付前又跑了一次 §1 的只读采样，
+好让「现测基线」在 PR 上不是过期数据：`window 30.29s` ⇒ `xact_commit delta=357 rate=11.78/s`、
+`xact_rollback 0.00/s`、`total_scans/s = 25.13`（`containers` 4.82、`users` 4.42、`chat_sessions` 0.86、
+`fde_onboarding` 0.69、`fde_offboarding` 0.20）。与 §8.134 的基线（11.2–12.0/秒、5 分钟窗口 11.34/秒）同量级
+⇒ **dev 栈的 `station-portal` 仍在跑旧代码**（compose 里那三根旋钮是本次才登记的，容器还没带上新镜像），
+判据 1 的 <3/秒 依旧是 `BLOCKED-on-deploy`，不是「测出来不达标」。全程 `docker exec station-db psql -At` 只读，
+没重启/重建任何 `station-*`，`station-portal` 的 `Up 2 hours` 未被打断。
