@@ -92,11 +92,12 @@ describe('#243 ①②③④ 渲染四格', () => {
     const wrapper = mountPanel();
 
     const seps = sepTexts(wrapper);
-    expect(seps.length).toBe(1, '缺 marker 也必须出这一条（后端第 2 步特意留了「缺 marker 也照发」）');
+    // 消息写成 `expect(值, 消息)` 这一形（vitest 的 matcher 不吃第二参；本仓既有判据同此口径）
+    expect(seps.length, '缺 marker 也必须出这一条（后端第 2 步特意留了「缺 marker 也照发」）').toBe(1);
     expect(seps[0]).toBe(NOTICE_ZH);            // 整句独立成立
     expect(seps[0]).not.toContain('undefined');
     expect(seps[0]).not.toContain('null');
-    expect(seps[0]).not.toMatch(/—\s*$/,);      // 不许留一段没有内容的片段
+    expect(seps[0]).not.toMatch(/—\s*$/);      // 不许留一段没有内容的悬空片段
     expect(wrapper.text()).not.toContain('undefined');
   });
 
@@ -152,7 +153,7 @@ describe('#243 中性面 / 位置 / 双语 / 脏值', () => {
 
     const wrapper = mountPanel();
     expect(wrapper.findAll('.syserr').length).toBe(0);
-    expect(wrapper.findAll('.roundsep.judge-panel').length).toBe(0, 'judge 的黄色面板也不许借用');
+    expect(wrapper.findAll('.roundsep.judge-panel').length, 'judge 的黄色面板也不许借用').toBe(0);
     expect(wrapper.text()).not.toContain('⚠');
   });
 
@@ -204,8 +205,8 @@ describe('#243 中性面 / 位置 / 双语 / 脏值', () => {
     store.es.replayEvent(historyFrame({ chars: 7, marker: 'x'.repeat(500) }) as never);
     const text = sepTexts(mountPanel())[0];
     expect(text).toContain(NOTICE_ZH);
-    expect(text.length).toBeLessThanOrEqual(NOTICE_ZH.length + 3 + 120,
-      'marker 片段上界与 portal 的载荷校验同源（≤120），一行提示不许撑成一段代码');
+    expect(text.length, 'marker 片段上界与 portal 的载荷校验同源（≤120），一行提示不许撑成一段代码')
+      .toBeLessThanOrEqual(NOTICE_ZH.length + 3 + 120);
   });
 });
 
