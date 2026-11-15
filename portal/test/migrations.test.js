@@ -1203,3 +1203,69 @@ test('迁移 0034-prune-stale-run-checkpoints：纯清理（零 DDL）、cutoff 
   assert.match(sql, /14 天/, '保留窗口为什么是 14 天要写在文件里（本单选的值，要改就追加新迁移）');
   assert.match(sql, /每条语句取一个新快照/, 'cutoff 的理由要写在文件里：READ COMMITTED 块内每条语句取新快照 ⇒ 不钉 cutoff 就会被残留检查误炸');
 });
+
+// 0035（2026-11-15，issue #524 的事件平台 W1 数据层）：`macro_templates` / `macro_assignments` /
+// `macro_runs` 三张表，**只新增、不动既有表**（`docs/data/schema.sql` 一个字节都没改：baseline 冻结）。
+// 这条用例只管**静态形状**（真库语义在 `portal/test/macros.test.js`）。钉三件事：
+//   ① 两条唯一键必须在——`UNIQUE (assignment_id, anchor, state, bucket)` 是 `claimMacroRun` 的
+//      `ON CONFLICT DO NOTHING` 的依据，`UNIQUE NULLS NOT DISTINCT (…)` 是「重复订阅」的唯一防线
+//      （默认 UNIQUE 语义下 NULL 互不相等 ⇒ `scope='user'` 的订阅能被同一人订无数次）；
+//   ② `ON DELETE` 的**方向**是审计口径的一部分：`template_id → … ON DELETE CASCADE`（模板物理删
+//      ⇒ 订阅跟着没意义）与 `assignment_id → macro_assignments(id)` **不带 ON DELETE**（取消订阅
+//      不许抹掉执行账）故意不对称，抄成一致就红；
+//   ③ 索引选型钉死「不给账表冗余 `template_id`」——想加列的人必须重新论证（可变派生值塞进
+//      只追加的审计行 = 同一事实存两处），而不是顺手 ADD COLUMN。
+test('迁移 0035-macro-platform：三表齐全、两条唯一键在、FK 的 ON DELETE 方向与索引选型不许漂', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const file = '0035-macro-platform.sql';
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes(file), '0035 存在');
+  assert.equal(files[files.length - 1], file, '0035 是当前最后一支（新迁移只能追加，不回改已应用的编号）');
+
+  const sql = fs.readFileSync(path.join(dir, file), 'utf8');
+  // 去掉**整行注释**（保留 `$$ ... $$` 内部语句），否则「注释里提到 DROP TABLE」会被误判。
+  const executable = sql.split('\n').map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('--')).join('\n');
+  const count = (needle) => executable.split(needle).length - 1;
+
+  // ① 三张表 + 幂等/可重放：全部 `IF NOT EXISTS`，第二遍是零 DDL 空操作。
+  for (const t of ['macro_templates', 'macro_assignments', 'macro_runs']) {
+    assert.equal(count(`CREATE TABLE IF NOT EXISTS ${t}`), 1, `${t} 必须恰好建一次且带 IF NOT EXISTS`);
+  }
+  assert.equal(count('ON CONFLICT'), 0, '迁移本身不做 upsert（认领是 macros.js 的事，不在 DDL 里）');
+  for (const bad of ['DROP TABLE', 'DROP COLUMN', 'ALTER TABLE macro_']) {
+    assert.equal(count(bad), 0, `0035 不得有 ${bad}（只新增；删既有东西要另开一支迁移）`);
+  }
+
+  // ② 两条唯一键 + FK 的 ON DELETE 方向。
+  assert.equal(count('UNIQUE NULLS NOT DISTINCT (template_id, user_id, session_id, cwd)'), 1,
+    '订阅键必须是 NULLS NOT DISTINCT（PG15+；丢了它 ⇒ 同一人能重复订同一模板，调度器就重复跑）');
+  assert.equal(count('REFERENCES macro_templates (id) ON DELETE CASCADE'), 1,
+    'template_id 必须 CASCADE（模板物理删 ⇒ 订阅跟着没意义）');
+  assert.equal(count('REFERENCES macro_assignments (id),'), 1,
+    'macro_runs.assignment_id 必须是**不带 ON DELETE** 的裸 REFERENCES（=RESTRICT：有账的订阅只能停用，不能顺手抹历史）');
+  assert.equal(count('REFERENCES macro_runs (id) ON DELETE SET NULL'), 1, '自引用 parent_macro_run_id 必须 SET NULL');
+  assert.equal(count('ON DELETE CASCADE'), 2, 'CASCADE 只许两笔（template_id / session_id）；给 assignment_id 加上就是把审计级联删掉');
+  assert.equal(count('REFERENCES users (id)'), 2,
+    '两处 user 引用（templates.created_by / assignments.user_id）都必须 REFERENCES users (id) 且不带 ON DELETE（口径同 chat_sessions.user_id）');
+  assert.equal(count('REFERENCES chat_sessions (id)'), 2);
+  assert.equal(count('ON DELETE SET NULL'), 3, 'child_session_id / child_run_id / parent_macro_run_id 三笔 SET NULL：会话与 run 被清理时账要留着');
+  // `snapshot_id` / `worktree_path` **故意不建 FK**：快照是可回收物，SET NULL 会把审计链切断。
+  assert.match(executable, /snapshot_id\s+uuid,/, 'snapshot_id 必须是裸 uuid 列（不加 REFERENCES）');
+
+  // ③ 索引：七个（`09` §7 要筛选全落索引列），且**账表上没有冗余的 template_id**。
+  assert.equal(count('CREATE INDEX IF NOT EXISTS'), 7,
+    '0035 恰好七条索引（模板列表 / 订阅按模板 / 订阅按人启用中 / 账按订阅+时间 / 全局时间线 / 未收口 / child_run 反查）');
+  assert.ok(executable.includes('ON macro_runs (assignment_id, started_at DESC)'),
+    '按模板筛执行账走 JOIN，所以 (assignment_id, started_at) 这条复合索引必须在');
+  const runsBlock = executable.slice(executable.indexOf('CREATE TABLE IF NOT EXISTS macro_runs ('));
+  assert.equal(runsBlock.slice(0, runsBlock.indexOf('\n);')).includes('template'), false,
+    '索引选型口径：不给只追加的账表冗余 template_id（要按模板筛就 JOIN macro_assignments）');
+
+  // ④ 后置守卫（照 0021 / 0024 惯例）：CHECK 与两条 UNIQUE 漂了就拒绝启动，不静默记成功。
+  assert.equal(count("RAISE EXCEPTION '0035"), 5, '0035 的五条漂移守卫一条不能少');
+  assert.equal(count("RAISE NOTICE '0035"), 1, '结论 NOTICE 以 0035 开头（排障时能认出是谁在说话）');
+  assert.equal(count('RAISE WARNING'), 0, '不许 RAISE WARNING——CI 只 grep ERROR 会吞掉它');
+  assert.match(sql, /RAISE EXCEPTION '0035: macro_runs 幂等键 UNIQUE \(assignment_id, anchor, state, bucket\) 漂移/,
+    '幂等键漂移必须当场失败（否则 claimMacroRun 的 ON CONFLICT 会报「无此约束」）');
+});
