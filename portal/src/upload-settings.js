@@ -5,8 +5,10 @@
 //
 // 形状照 `mail_settings`（迁移 0026 + `portal/src/mail-settings.js`）这个先例，两点刻意不同：
 //   1. **没有 60s 缓存**。`mail-provider` 要缓存是因为登录是热路径；上传不是——一次上传多一次
-//      `SELECT` 单行主键查（<1ms）换「改完立即生效」这条判据，是划算的。加了缓存就等于把
-//      「必须重启」换成「必须等一分钟」，判据没被满足，只是换了个等待理由。
+//      `SELECT`（按 `id = 1` 取一行：无 JOIN、无扫描、命中主键）换「改完立即生效」这条判据，是划算的。
+//      加了缓存就等于把「必须重启」换成「必须等一分钟」，判据没被满足，只是换了个等待理由。
+//      ⚠ 这条论证**不带毫秒数**：本仓没量过这条查询的耗时，写死数字就是代码证明不了的声称（台账 §8.136）。
+//      取舍也不依赖它——要判断的是「一次额外的单行查询」换「改完立即生效」值不值，不是「几毫秒够不够快」。
 //   2. 因此写侧**不需要** `invalidate()`：没有缓存可失效。
 //
 // 六条硬口径（都有对应用例，别改回去；5/6 是 2026-11-17 复 audit 的返修，1–4 是原片）：
@@ -57,9 +59,10 @@ const SELECT_SQL = 'SELECT max_file_bytes::text AS max_file_bytes, updated_at, u
  * 不返回就永远进不了 catch。#520 刚为降 DB 负载做了一整单，这条路径的挂载面比看起来大得多
  * （前端逐文件上传 ⇒ N 个文件 N 次读取）。
  *
- * 默认 1500ms：比一次正常的单行主键查（<1ms）松三个数量级，比一次上传的可接受等待紧，
- * 且与 `mail-provider` 那几个 `*_TIMEOUT_MS` 同一量级。超时**不是错误**：按「读不到」回落 env/默认，
- * 上传照常（与既有 `read_failed` 完全同口径，见 `resolveFromRow`）。
+ * 默认 1500ms 是**定性**选的：远大于一次正常读取（按 `id = 1` 取一行）所需的往返，又小于一次可接受的
+ * 上传等待，量级对齐 `mail-provider` 那几个 `*_TIMEOUT_MS`。要改它就照这两条边界重估（别拿旧值凑倍数），
+ * 也**别顺手补一个「单次查询 <Xms」**——本仓没量过（台账 §8.136）。
+ * 超时**不是错误**：按「读不到」回落 env/默认，上传照常（与既有 `read_failed` 完全同口径，见 `resolveFromRow`）。
  */
 export const DEFAULT_READ_TIMEOUT_MS = 1500;
 
@@ -129,7 +132,7 @@ export const AUDIT_TARGET = 'upload_settings';
  *   2. 「DB 旧值可用不可用」的判定在 SQL 里只做**区间比较**（`BETWEEN $5 AND $6`，两个数字是参数，
  *      由 JS 常量传进来 ⇒ 常量仍然只有一处）。旧值取自 `bigint` 列 ⇒ 文本必是纯数字，所以这条比较与
  *      JS 侧 `parseDbMaxFileBytes` 在这条路径上等价；等价性由 `portal/test/upload-settings.test.js`
- *      的 US-19 钉住（SQL 派生的 previous_* 与 JS 派生的必须逐值相同），不是靠注释声明。
+ *      的 US-20 钉住（SQL 派生的 previous_* 与 JS 派生的必须逐值相同），不是靠注释声明。
  *   3. `details` 的键与旧实现（`http.js` 里手写的 `auth.audit`）逐字相同，事后审计查询不受影响。
  */
 const SAVE_SQL = `WITH prev AS (
@@ -363,7 +366,7 @@ export async function updateUploadSettings({ pool, config = {}, log = console, a
     throw new UploadSettingsError('internal', `保存成功但审计写了 ${row?.audit_rows ?? 0} 行`, { httpStatus: 500 });
   }
   // `previous` 走 JS 侧同一套解析（策略只一处）；SQL 里那份 CASE 只为审计的 `details` 服务，
-  // 两者的等价性由单测逐值钉住（US-19），不是靠注释声明。
+  // 两者的等价性由单测逐值钉住（US-20），不是靠注释声明。
   const previousRaw = row?.previous_raw ?? null;
   const previous = resolveFromRow(previousRaw == null ? null : { max_file_bytes: previousRaw }, { config });
   return {
