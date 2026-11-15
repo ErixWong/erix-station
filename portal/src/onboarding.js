@@ -19,8 +19,9 @@ const MATERIALIZE_TIMEOUT_MS = 120000;
 // llm-binding，单步超时 120s，见 `MATERIALIZE_TIMEOUT_MS`），30s 的排队等待相对它的总时长是
 // 噪声级；而 30s 上限换来的空闲收益是这条循环的表扫降到 1/6。要更激进就配 60000（上限
 // `MAX_BACKOFF_MS_SAFE`=60s，再大就越过 Node timer 的语义边界，理由见 `loop-timing.js`）。
-const LOOP_INTERVAL_MS = 5000;
-const IDLE_BACKOFF_MAX_MS_DEFAULT = 30000;
+export const LOOP_INTERVAL_MS = 5000;
+/** 代码缺省（运维面用例钉的就是它：`deploy/docker-compose.yml` 的插值缺省必须与此逐字相等）。 */
+export const IDLE_BACKOFF_MAX_MS_DEFAULT = 30000;
 
 function parseSteps(value) {
   const steps = typeof value === 'string' ? JSON.parse(value) : value;
@@ -338,7 +339,8 @@ export function startOnboardingLoop(pool, config, {
   log = console,
   onPause,
   sleep = sleepCancellable,
-  idleBackoffMaxMs = envInt('ONBOARDING_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log }),
+  env = process.env, // 单测注入旋钮用；生产不传 ⇒ process.env
+  idleBackoffMaxMs = envInt('ONBOARDING_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log, env }),
 } = {}) {
   if (!docker) docker = createDockerClient({ dockerHost: config.dockerHost });
   let consecutiveFailures = 0;

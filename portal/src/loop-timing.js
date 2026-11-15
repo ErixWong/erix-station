@@ -28,10 +28,13 @@ const STRICT_POSITIVE_INT_RE = /^\d+$/;
  *   · 非法值（`abc` / `-1` / `0` / `1e4` / `10000abc`）；
  *   · 越界（> `max`）；
  *   · 没配（空串）⇒ 静默用默认（这不是错误，不该每次启动刷噪声）。
- * @param {string} name @param {number} fallback @param {{max?: number, log?: object}} [opts]
+ * @param {string} name @param {number} fallback @param {{max?: number, log?: object, env?: Record<string,string|undefined>}} [opts]
+ *   `env` 只给单测注入用（不传 ⇒ `process.env`，生产行为逐字不变）。
+ *   为什么加这个口：往 `process.env` 里塞旋钮再删干净，在同文件多条用例之间会串（#531 那族「夹具相互
+ *   污染」的同型形状）；注入口把这件事变成局部参数，不靠记得清理。
  */
-export function envInt(name, fallback, { max = MAX_BACKOFF_MS_SAFE, log = console } = {}) {
-  const raw = String(process.env[name] ?? '').trim();
+export function envInt(name, fallback, { max = MAX_BACKOFF_MS_SAFE, log = console, env = process.env } = {}) {
+  const raw = String(env[name] ?? '').trim();
   if (raw === '') return fallback;
   const n = STRICT_POSITIVE_INT_RE.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isSafeInteger(n) || n <= 0) {
