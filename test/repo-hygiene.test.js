@@ -73,17 +73,34 @@ test('H2 `.gitignore` 必须挡住**符号链接**形态（带斜杠的 `node_mo
 });
 
 // ---------------------------------------------------------------------------
-// H3（issue #496）：前端 spec 里不许出现 `emitted()` 的**带点调用形状** `.emitted(`。
+// H3（issue #496）：前端 spec 里不许**取走** test-utils 的 `emitted()`（点号 / 方括号 / 解构三种形状）。
 // 机制与后果见文件头；这里只钉一句话：**判据不许依赖 Vue devtools 事件**。
 // 口径（都是有意选的，改动要连带改反向自证）：
 //   · 只扫 **git 跟踪的** spec（与 `npm run check:agents-hotlayer` 的引用面同口径：未入库的文件不是交付）；
 //   · 清单 = `portal/frontend` 下名字以 `.spec.ts` 结尾的跟踪文件 = vitest 的运行时表面（`vite.config.ts`
 //     的 `include: ['src/**/*.spec.ts']`）；注意**不能**拿 `src/**/*.spec.ts` 当 git pathspec，
 //     它匹配不到顶层的 `src/router.spec.ts`（实测少一个）⇒ 反向自证就钉在这个文件上；
-//   · 匹配 `\.emitted\b`（带点）而不是单词 `emitted` ⇒ 注释里写「不要用 emitted()」不会被误伤，
-//     但写成调用（哪怕在注释里）仍然拦得住 —— 宁可拦得难看，不可漏。
+//   · 匹配三种「取走 emitted」的形状（copilot 二次审计指出：**只拦点号可被绕过** ——
+//     `wrapper['emitted'](...)` 与 `const { emitted } = wrapper` 一样依赖 devtools，却躲得过点号）：
+//       ① 点号 `.emitted`（含属性读 `wrapper.emitted`）
+//       ② 方括号取属性 `['emitted']` / `["emitted"]`
+//       ③ 解构取走 `{ emitted }` / `{ emitted: 别名 }` / `{ a, emitted }`，以及跨行解构里
+//          独占一行的成员 `emitted,`。拦的是**取走这件事本身**：取走之后怎么调都追不住，
+//          所以不追调用点，直接把取走钉死。
+//     仍然**不拦**单词 `emitted` ⇒ 注释里写「不要用 emitted()」不会被误伤（现存 14 处这样的散文，
+//     分布在 8 个 spec 里，全是注释正文，一处调用都没有）；
+//     但写成上面三种形状（哪怕在注释里）仍然拦得住 —— 宁可拦得难看，不可漏。
+//   · 只管 devtools 这一族：不钉 `fire()` / `vm.$emit` 等其它读事件方式（issue #496 的范围）。
 const FRONTEND_DIR = 'portal/frontend';
-const EMITTED_CALL = /\.emitted\b/;
+
+/** 「取走 emitted」的形状。每条一支正则，反向自证按 `name` 逐形状注入并核对是**哪一支**认出来的。 */
+const EMITTED_SHAPES = [
+  { name: '点号', re: /\.emitted\b/ },
+  { name: '方括号', re: /\[\s*['"]emitted['"]\s*\]/ },
+  // 解构成员：`{` 或 `,` 后面紧跟 `emitted`（可带 `: 别名`）直到 `}` / `,`；
+  // 第二条支管跨行解构里单独占一行的成员（`emitted,` / `emitted: x,`）。
+  { name: '解构', re: /[{,]\s*emitted\s*(?::[^,}\n]+)?\s*[,}]|^[ \t]*emitted\s*[,:]/ },
+];
 
 /** 扫描面：git 跟踪的、名字以 `.spec.ts` 结尾的前端文件（相对仓库根的路径）。 */
 function trackedFrontendSpecs() {
@@ -91,18 +108,25 @@ function trackedFrontendSpecs() {
   return nul.split('\0').filter((p) => p.endsWith('.spec.ts')).sort();
 }
 
-/** 判据本体：给定 [{ path, text }]，返回每一处带点调用。生产调用与反向自证共用同一个函数。 */
+/**
+ * 判据本体：给定 [{ path, text }]，返回每一处「取走 emitted」的**行**（同行多支命中算一条，
+ * 标注是哪几支认出来的）。生产调用与反向自证共用同一个函数。
+ */
 function findEmittedCalls(files) {
   const hits = [];
   for (const f of files) {
     f.text.split('\n').forEach((line, i) => {
-      if (EMITTED_CALL.test(line)) hits.push(`${f.path}:${i + 1}: ${line.trim()}`);
+      const shapes = EMITTED_SHAPES.filter((s) => s.re.test(line)).map((s) => s.name);
+      if (shapes.length) hits.push(`${f.path}:${i + 1} [${shapes.join('+')}] ${line.trim()}`);
     });
   }
   return hits;
 }
 
-test('H3 前端 spec 里不许出现 `.emitted(`——那是 `NODE_ENV=production` 假红的地板（issue #496）', () => {
+/** 把路径当正则字面量用之前的转义。 */
+const reEscape = (s) => s.replace(/[/\\^$.*+?()[\]{}|]/g, '\\$&');
+
+test('H3 前端 spec 里不许取走 emitted()（点号/方括号/解构三种形状）——那是 `NODE_ENV=production` 假红的地板（issue #496）', () => {
   const files = trackedFrontendSpecs();
   // 不先钉「清单不空」，下面的「零命中」就可能是扫了个空集合（同 H2 的反向自证同理）。
   assert.ok(files.length >= 40, `只扫到 ${files.length} 个前端 spec ⇒ 清单本身漏了，本判据在空转`);
@@ -112,25 +136,49 @@ test('H3 前端 spec 里不许出现 `.emitted(`——那是 `NODE_ENV=productio
   const read = (p) => ({ path: p, text: fs.readFileSync(path.join(REPO_ROOT, p), 'utf8') });
   const hits = findEmittedCalls(files.map(read));
   assert.deepEqual(hits, [],
-    '前端 spec 里又出现了带点的 emitted(...) 调用：它在 NODE_ENV=production 下恒空（Vue 不发 devtools 事件）'
-    + '⇒ 要么假红、要么假绿。改成 DOM 断言或请求桩断言（先例：GitLightBadge.spec.ts 的 mountBadgeHost、'
+    '前端 spec 里又出现了「取走 emitted」的写法（点号 / 方括号 / 解构三种形状之一）：'
+    + '它在 NODE_ENV=production 下恒空（Vue 不发 devtools 事件）⇒ 要么假红、要么假绿。'
+    + '改成 DOM 断言或请求桩断言（先例：GitLightBadge.spec.ts 的 mountBadgeHost、'
     + 'SidebarPanel.spec.ts 的 mountPanelInHost）。命中：\n  ' + hits.join('\n  '));
 
-  // 反向自证 A：拿清单里**真的顶层那份**注入一行调用形状 ⇒ 同一次扫必须只多这一处可见。
-  // （它同时证明：① 匹配姿势对；② 清单真的盖到了顶层 spec。）
+  // 反向自证 A：**逐形状**注入。每种形状各注一次，每次必须 ①恰好命中 1 处 ②命中在被改的那份上
+  // ③命中要标注是**哪一支**认出来的 —— 只验点号就证明不了方括号那支（copilot 二次审计的正中）。
+  // 注在被跟踪的那份顶层 spec 上，它同时证明清单真的盖到了顶层。
   const probe = `${FRONTEND_DIR}/src/router.spec.ts`;
-  const mutant = files.map((p) => {
-    const f = read(p);
-    return p === probe ? { ...f, text: `${f.text}\nconst _mutant = wrapper.emitted('files-changed');\n` } : f;
-  });
-  const injected = findEmittedCalls(mutant);
-  assert.equal(injected.length, 1, `注入一处带点调用后只应命中 1 处，实际 ${injected.length} 处：${injected.join(' | ')}`);
-  assert.match(injected[0], new RegExp(probe.replace(/[/\\^$.*+?()[\]{}|]/g, '\\$&')), `命中的不是被改的那份：${injected[0]}`);
+  const INJECTIONS = [
+    { shape: '点号', code: `const _m = wrapper.emitted('files-changed');` },
+    { shape: '点号', code: `const _m = wrapper.emitted;` },
+    { shape: '方括号', code: `const _m = wrapper['emitted']('files-changed');` },
+    { shape: '方括号', code: `const _m = wrapper["emitted"]("refresh");` },
+    { shape: '解构', code: `const { emitted } = wrapper;` },
+    { shape: '解构', code: `const { emitted: fired, find } = wrapper;` },
+    { shape: '解构', code: `const {\n  emitted,\n} = wrapper;` }, // 跨行解构（审计没提，但同样是取走）
+  ];
+  for (const { shape, code } of INJECTIONS) {
+    const mutant = files.map((p) => {
+      const f = read(p);
+      return p === probe ? { ...f, text: `${f.text}\n${code}\n` } : f;
+    });
+    const injected = findEmittedCalls(mutant);
+    assert.equal(injected.length, 1,
+      `注入 ${shape} 形状 ${JSON.stringify(code)} 后只应命中 1 处，实际 ${injected.length} 处：${injected.join(' | ')}`);
+    assert.match(injected[0], new RegExp(reEscape(probe)), `命中的不是被改的那份：${injected[0]}`);
+    const hitShapes = (injected[0].match(/\[([^\]]+)\]/)?.[1] ?? '').split('+');
+    assert.ok(hitShapes.includes(shape), `命中不是 ${shape} 这一支认出来的（等于没验这个形状）：${injected[0]}`);
+  }
+  // 防新形状变成空支：每个声明的形状都必须有至少一条注入探针。
+  const covered = new Set(INJECTIONS.map((i) => i.shape));
+  assert.deepEqual(EMITTED_SHAPES.map((s) => s.name).filter((n) => !covered.has(n)), [],
+    '有形状没有对应的注入探针 ⇒ 那支正则坏了也不会红');
 
-  // 反向自证 B：只写不带点的散文 ⇒ 必须**看不见**（否则判据钉的是单词，不是调用形状）。
+  // 反向自证 B：不带点、不带方括号、不在解构成员位上的散文 ⇒ 必须**看不见**（否则判据钉的是
+  // 单词本身，会把仓库现存那 14 处「别用 emitted()」的说明注释全钉成红）。用全角标点写注释正文，
+  // 免得 ASCII 逗号把散文变成「解构成员位」。
   const prose = findEmittedCalls(files.map((p) => {
     const f = read(p);
-    return p === probe ? { ...f, text: `${f.text}\n// 别再写 emitted() 这种调用（#496）\n` } : f;
+    return p === probe
+      ? { ...f, text: `${f.text}\n// 别再写 emitted() 这种调用（#496）\n// 也不要在解构里取走 emitted（#496）\n` }
+      : f;
   }));
-  assert.deepEqual(prose, [], `不带点的散文不该被拦：${prose.join(' | ')}`);
+  assert.deepEqual(prose, [], `不带点/不括/不解构的散文不该被拦：${prose.join(' | ')}`);
 });
