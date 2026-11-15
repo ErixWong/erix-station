@@ -119,6 +119,7 @@ Traefik 访问日志与 portal 请求日志都不打，所以拿不到决定性�
 # 1) 部署带 #520 的镜像（别在 dev 共享栈上直接判：那里的 portal 跑的是旧代码）
 # 2) 静置 ≥ 90s（让三个循环爬到退避上限：30s/30s/15s 的最长的那个）
 # 3) 跑 §1 的 SQL，30s 窗口
+# 4) 想做对照（旧固定节拍 vs 退避）：先看 §6 —— 旋钮不登进 compose 就配不动
 ```
 
 期望值与本单的算术一致，**不要期望 <3/秒**：
@@ -128,3 +129,42 @@ Traefik 访问日志与 portal 请求日志都不打，所以拿不到决定性�
 | `containers` seq 扫 | 3.5/秒 | **≈ 0.2/秒**（15s 一拍 × 14 次/拍 ⇒ 每拍开销没变，拍少了） | — |
 | `fde_onboarding` / `fde_offboarding` 扫 | 0.59 / 0.20/秒 | **≈ 0.10 / 0.10/秒** | — |
 | `xact_commit` | 11.2–12.0/秒 | **≈ 6–7/秒** | **不达标**（地板见 §3 结论 2） |
+
+## 6. 三根旋钮「登记才生效」（PR #552 审计 LOW-1 / LOW-2 的返工）
+
+`deploy/docker-compose.yml` 里 `station-portal` 的 `environment` 是**显式列表、无 `env_file`**（该文件
+`FILE_UPLOAD_MAX_BYTES` 那条注释自己就写着这个行为）。⇒ 任何新旋钮只要没写进那张列表，运维在
+`deploy/.env` 里写它**完全不生效、也不报错**（症状长得像「配了没用」/「运维不会配」）。
+#520 的三根一开始就漏了这个形状（LOW-1），现已登记：
+
+| 旋钮 | 代码缺省 | compose 插值缺省 | 生效面 |
+|---|---|---|---|
+| `ONBOARDING_IDLE_BACKOFF_MAX_MS` | 30000 | `${ONBOARDING_IDLE_BACKOFF_MAX_MS:-30000}` | 可配到共享上限 `MAX_BACKOFF_MS_SAFE=60000` |
+| `OFFBOARDING_IDLE_BACKOFF_MAX_MS` | 30000 | `${OFFBOARDING_IDLE_BACKOFF_MAX_MS:-30000}` | 同上 |
+| `PROVISIONER_IDLE_BACKOFF_MAX_MS` | **15000（硬上限）** | `${PROVISIONER_IDLE_BACKOFF_MAX_MS:-15000}` | 写 >15000 ⇒ **钳到 15000** + warn 点名旋钮（LOW-2）|
+
+三腿一致性（compose 插值缺省 == 代码缺省常量 == **循环真正生效的封顶值**）由
+`portal/test/deploy-env-idle-backoff.test.js` 机器钉住（先例：#472 / #270 / #450）。值口径：只认严格正整数，
+`1e4` / `10000abc` / 负数 ⇒ warn 并回落缺省（不静默采用）。**逃生口**：三根都配 `5000` ⇒ 回到 #520 之前的
+固定 5s 节拍（现在配得动了）。
+
+⚠ **同一族病的已知遗留（#520 没动，跨单）**：#506 的
+`ROUTE_IDLE_BACKOFF_MAX_MS` / `ROUTE_ORPHAN_RECOVERY_INTERVAL_MS` /
+`MATERIALIZE_IDLE_BACKOFF_MAX_MS` / `MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS` **至今不在** compose 的
+`station-portal.environment` 里（四条 `grep -c` 全 0）⇒ 在任何标准部署上它们同样是空气。
+修法与本节同形：四行插值 + 把它们加进同一条三腿判据。
+
+## 7. offboarding 的 1h 工作区清理：阈值不变，**节拍会晚**（LOW-3 的准口径）
+
+它不是独立定时器，而是**销号循环里每拍检查一次**的时间门（`now() - lastSweepAt >= SWEEP_INTERVAL_MS`）。
+所以 #520 把空闲拍退到 30s 之后，三种说法只有一种对：
+
+| 说法 | 对不对 |
+|---|---|
+| 「1h 阈值变了」 | ❌ 阈值一个字节没改（`SWEEP_INTERVAL_MS = 60 * 60 * 1000`）|
+| 「会被空闲退避饿死」 | ❌ 闸门与「有没有活」解耦；改成「有活才扫」才会饿死（一个已全部处理完的平台永不扫）|
+| 「完全不影响日程」 | ❌ 检查频率就是它的节拍上限 ⇒ 典型晚 ~max/2（默认 ≈ 15s），**最坏晚一整个空闲拍 ≤ max（默认 30s）** |
+
+对 1h 粒度是噪声；但 `OFFBOARDING_IDLE_BACKOFF_MAX_MS=3600000` 那种配法会把清理拖到最坏晚 1h，
+那已经是拿旋钮改业务语义。判据：用例 C1（假时钟；不拿墙钟当判据 —— #531）。
+复测时要卡「清理是否按时」，请直看 portal 日志里 sweep 那一行的时间戳，别拿 30s 窗口反推。

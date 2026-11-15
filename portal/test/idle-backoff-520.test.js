@@ -72,13 +72,20 @@ function makeFakeSleep() {
 /**
  * 等到条件成立（**截止时刻**兜底，不是轮次预算 —— #531）。
  * 每一轮只 `setImmediate`，正常情况一两轮就满足；同机负载高时只是多转几轮，不会假红。
+ *
+ * PR #552 审计 LOW-4：墙钟在这条里仍是**看门狗**，不是判据；但一个被长 GC / 并发门禁压住十几秒的
+ * 事件循环仍可能让它误红（墙钟到期了，而循环只差一个宏任务）。所以到期后先给**几轮宏任务的宽限
+ * 复检**再判失败：真挂死仍然立刻红（只多几个宏任务，不多花一秒），而“只是被停顿了一下”不再假红。
+ * 没换成假时钟的理由：这里等的是“真事件循环把微任务链跑到了 sleep 上”，换成假时钟就变成在测夹具。
  */
 async function waitUntil(cond, label, deadlineMs = 15_000) {
   const deadline = Date.now() + deadlineMs;
   for (;;) {
     if (cond()) return;
     if (Date.now() > deadline) {
-      assert.fail(`等超时（${deadlineMs}ms，同机负载？）：${label}`);
+      for (let i = 0; i < 5 && !cond(); i += 1) await new Promise((r) => setImmediate(r)); // 宽限复检（防假红）
+      if (cond()) return;
+      assert.fail(`等超时（${deadlineMs}ms + 5 轮宽限，同机负载？）：${label}`);
     }
     await new Promise((r) => setImmediate(r));
   }
@@ -105,18 +112,30 @@ async function parkAt(fake, n, who = '循环') {
 }
 
 /**
- * 给一个「正常情况立刻落定」的 promise 加** watchdog**（不是判据，只是防挂死）。
+ * 给一个「正常情况立刻落定」的 promise 加**看门狗**（不是判据，只是防挂死）。
  * 为什么这里允许墙钟：判据是「`stop()` 能打断睡」——假睡眠**永不自己醒**，所以
  * `settled` 能落定就只可能是 abort 生效；20s 只是「万一没打断也别挂死整个文件」。
  * 与 #531 里那族红线的区别：那里拿墙钟/轮次**当判据**，这里拿它当看门狗。
+ *
+ * PR #552 审计 LOW-4：看门狗到点后先**复查 promise 是否其实已落定**（再给几轮宏任务）。
+ * 事件循环被停顿十几秒时，定时器回调可能排在那个已经落定的 promise **之后**才被调度
+ * ⇒ 老写法会把“其实已经落定”误判成“stop 没打断”（假红）。真没落定时仍然立刻红。
+ * 顺带修了 reject 不吞报：老写法 `promise.then(ok, err)` 把异常当返回值抛，新的 tracked 形式
+ * 保证 promise 自己被接住，不留 unhandled rejection。
  */
 async function awaitWatchdog(promise, label, ms = 20_000) {
+  let state = 'pending';
+  const tracked = Promise.resolve(promise).then(
+    () => { state = 'ok'; },
+    (err) => { state = { err }; },
+  );
   let timer = null;
-  const watchdog = new Promise((resolve) => { timer = setTimeout(() => resolve('__watchdog__'), ms); });
-  const outcome = await Promise.race([promise.then(() => '__ok__', (err) => err), watchdog]);
+  const watchdog = new Promise((resolve) => { timer = setTimeout(() => resolve(), ms); });
+  await Promise.race([tracked, watchdog]);
   if (timer) clearTimeout(timer);
-  if (outcome === '__watchdog__') assert.fail(`stop() 没能打断在睡的那一拍（${label}，${ms}ms watchdog）`);
-  if (outcome !== '__ok__') throw outcome;
+  for (let i = 0; i < 5 && state === 'pending'; i += 1) await new Promise((r) => setImmediate(r)); // 宽限复检（防假红）
+  if (state === 'pending') assert.fail(`stop() 没能打断在睡的那一拍（${label}，${ms}ms watchdog + 5 轮宽限）`);
+  if (state !== 'ok') throw state.err;
 }
 
 const silentLog = { log() {}, warn() {}, error() {} };
@@ -172,6 +191,11 @@ test('#520 A3 envInt：严格整串正整数；非法/越界 ⇒ 回落默认 + 
   assert.equal(warns.length, 0, '没配不算错误 ⇒ 不许每次启动刷噪声');
 });
 
+// PR #552 审计 LOW-4 登记：本格是全文件**唯一拿真 timer 当被测对象**的地方（真 5ms / 真 1ms）。
+// 不换成假时钟的理由：这里测的就是 `sleepCancellable` 对**真** timer + **真** AbortSignal 的行为，
+// 换成假时钟就变成在测夹具（与 #506 的 B4/C3/D3/E3 同口径）。
+// 墙钟依赖的实际风险：判据是 resolve 的**布尔值**，不是流逝毫秒数 ⇒ 事件循环被停顿时本格只会变慢，
+// 不会假红（唯一能红它的形状是 timer 回调根本不跑，那已经是运行时故障）。已登记的残留见台账 §8.134。
 test('#520 A4 sleepCancellable：abort 立刻 resolve(false)，睡满 resolve(true)', async () => {
   const ac = new AbortController();
   const p = sleepCancellable(60_000, ac.signal); // 真 timer，但下面立刻 abort
