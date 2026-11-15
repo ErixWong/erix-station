@@ -5405,3 +5405,79 @@ run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data
 
 **剩余**：空闲仍有 13.2 事务/秒来自**另外 5 个轮询器**（`run_queue` 1.5/秒、`chat_sessions` 0.9/秒、
 `port_observations` 0.7/秒、`fde_onboarding` 0.6/秒…）⇒ 开 **#520** 续作（判据：空闲 < 3 事务/秒）。
+
+### 8.128 `maskedPaths` 接进生产链路：能力与单测都在、装配点 0 引用（issue #231 / 工单 fix-261115-02，2026-11-15，worker 落地）
+
+> 编号说明：现查本树 `grep -n '^### 8\.' | tail -3` 最大是 8.126 ⇒ 应取 8.127；但同批并行工单
+> fix-261115-05（issue #496）已在它自己的 worktree 里用了 **8.127**（现查
+> `wt-496-261115/docs/maintenance/task-ledger.md:5409`）⇒ 按红线**再 +1 取 8.128**，合并时若仍与别的
+> 8.127/8.128 撞，由主 agent 按到达顺序改号。
+
+**现查起点（工单给的三条，逐条复核过）**：`runner/lib/file-tools.js` 的 `createJail({root, writable, maskedPaths})`
+确实支持遮蔽（该文件 9 处引用），而 `runner/worker.js` 里 `maskedPaths` **0 处**——不是「遮蔽做坏了」，
+是**装配层从来没传过**。这类缺口的坏处在静默：jail 越界/非可写都在挡，只有遮蔽这一格是空的，
+`file-tools-contract.test.js` 里两条遮蔽用例还一直**绿着**（它们自己传 `maskedPaths`）。
+真机代价就是 `readFile .env` 把数据库密码整块拽进 transcript（本文件 §8.9 #228 那条「待办 ③
+密钥遮蔽在真实项目上的实际效果」一直没做，就是这一格）。
+
+**改了什么（三处，`git diff --stat origin/main...HEAD` 为准）**：
+
+| 文件 | 内容 |
+|---|---|
+| `runner/worker.js` +21 | `createJail` 与 `createStationFileTools` 各传一份 `STATION_MASKED_PATHS`；补一条 `MSG.LOG` info 记账（走现成通道，**不新增事件类型**） |
+| `runner/lib/file-tools.js` +143（其中代码 65 / 注释 71 / 空行 7） | 遮蔽条目从「只有前缀」扩成「前缀 ∪ 名字模式」；新增名单单一真相 `STATION_MASKED_PATHS`；`createJail.assertReadable` 的名字模式**词法路径与 realpath 结果都比** |
+| `runner/test/masked-paths.test.js` +322（新增，14 条） | 工单三条判据 + 覆盖面/反面/误伤/只挡读不挡写/遍历排除账/条目语义/symlink 双向 + **worker 接线锁** |
+
+**为什么 65 行落在 `lib/file-tools.js` 而不是「只在 worker 传一个数组」**：口径点名的五项是
+`.env*` / `.git/config` / `.npmrc` / `*.pem` / `id_*`，其中三项是**名字模式**，而 jail 的 0.3.5 前缀机制
+只会做「这个路径及子树」——传字面量 `.env*` 进去，比较时会拿 `<root>/.env*` 去比 `<root>/.env.local`，
+**恰好不命中 ⇒ 三项是死的**，且死得和原来的 0 引用一样静默。备选方案「启动时扫一遍目录把模式展成
+具体路径」被否：它给遮蔽加了一条它本没有的失效条件（run 中途新建/改名的 `.env.local` 不在快照里），
+而 #451 那类真机教训正是「下发了 ≠ 读了」——不能自己再犯一条「扫过了 ≠ 挡得住」。
+所以扩的是「一条遮蔽条目怎么写」，**前缀条目语义与 0.3.5 移植面逐字未动**（`file-tools.test.js` /
+`file-tools-contract.test.js` 的 64 条零改动通过就是这条「没顺手改边界」的自证）。
+**中途收窄过一次**：装配层一度为「root 是符号链接写法」编了 realpath + 词法两张表，现查生产链路
+`createJail` 的根本来就是 realpath 过的、两种拼写都在 jail 那一层兜住 ⇒ 两张表不改变任何生产结论，
+已还原成一张（连带删掉只为它存在的 `realpathOrSelf`）。留下的已知边界写进了注释与用例
+（无 jail 且 root 是链接写法时，前缀条目比不中；名字模式不受影响，因为它比的是段名）。
+
+**判据与变异自证**（每条都是「先红给你看，再改回来」；命令 `node --test 'runner/test/masked-paths.test.js'`）：
+
+| # | 判据 | 怎么改坏它 | 红了哪一格 |
+|---|---|---|---|
+| ① | `.env` 用 `readFile` 拿不到，错误点名被拒路径（jail 层直接钉 `JailError path_masked`） | 名单里删掉 `'.env*'` | 判据① + 连带 8 格（9 红） |
+| ①' | 同上（另一条成因链） | `isMaskPattern` 恒 `false`（模式不编） | 判据① + 8 格（9 红，与上一条**红集合不同**：多红「条目语义」） |
+| ② | 反向：同目录 `notes.txt` / `README.md` / `src/main.js` 照读，且 `jail.assertReadable` 放行（防「挡住」其实来自越界） | `canWrite` 里加 `!withinMasked` | 「只挡读不挡写」红（写侧被顺手挡了 = 口径漂移） |
+| ③ | **shell `cat .env` 仍能读到全文**（钉现状，不许当 bug 修） | 给 `lib/shell-tools.js` 加一行「命令含 `.env` 就拒」 | 只有判据③红（1 红）⇒ 这条专防「有人去兼容 shell」 |
+| 接线 | `worker.js` 两处调用都传 `maskedPaths: STATION_MASKED_PATHS`，名单不在 worker 里重抄 | 任一处去掉 `maskedPaths` | 接线锁红（W1 / W2 各一次） |
+| 双向 fail-closed | `.env` 指向别处仍挡、普通名字指向 `.env` 也挡 | 去掉词法那一路 / 去掉 realpath 那一路 | 各红 1 格（symlink 那条） |
+
+**不对称是设计，已登记进文档**（工单口径）：`maskedPaths` **只挡文件工具，挡不住 shell**
+（`lib/shell-tools.js` 头注 + 不变式 1「容器是信任边界」），**只挡读不挡写**（与 `assertReadable` 逐字对齐的
+旧口径）⇒ 它的定位是**防止敏感内容被主动读进 transcript / 上下文**，**不是安全加固**。这条不对称此前
+只活在注释里，`docs/` 里 0 处（现查 `grep -rn 'maskedPaths' docs/` 只有 #228 的接线描述与 §17 风险表一行），
+本轮补两处：`docs/design/runner-integration.md` **§17.1**（不对称 + 三条理由 + 覆盖面表 + 误伤清单）、
+**§6.3-3** 新增一条接线事实（两处都得传、两类条目的深度语义不同）。
+**集合只针对项目目录以内**：FDE home 的 `~/.ssh` / `~/.git-credentials` / `~/.erix/*` 本来就在 jail 根外，
+不是「漏了家目录」。刻意误伤（出口都是「多绕一步 shell」）：`.env.example` / `.env.sample` 模板被 `.env*`
+命中、`id_mapping.csv` 被 `id_*` 命中、`*.pem` 测试夹具读不到——`SYSTEM_PROMPT` 已有出口句，不改提示词。
+
+**门禁（只看 rc）**：runner `node --test 'runner/test/*.test.js'` → `# tests 521 / pass 521 / fail 0`、
+**rc=0**（基线 507 + 本单 14）。根 `npm test` → 总数 `2356 → 2370`，**本单相关的那 14 条恒绿**，
+但整棵树在本机**时红时绿**：`fail 0/1/2/3` 都出现过，红的**全是 #506 那一族假时钟用例**
+（`portal/test/env-int-strict-506e.test.js:49` 等三处 `arm()` 靠「转满 300 个 `setImmediate`」等循环
+停在 sleep 上——那是**轮次预算不是时间预算**，机器负载 16→24 时循环还没走到第一拍 `sleep()` 预算就烧完）。
+**与 #231 无关的实测**（交错跑，同样负载窗口）：把本单新增的测试文件**拿掉**只跑基线树，
+3 轮里仍红 2 轮（红的同样是 `#routes③` / `#506e③`）；带本单文件 3 轮里红 2 轮 ⇒ 红绿与改动无关。
+单跑那两个文件×4 次全 rc=0。**不在本单顺手修**：那三个夹具正在另一张工单（fix-261114-07 / #506）的
+改动范围内，现在改它只会在合并时撞车；建议的修法已写在本节末尾「未尽项」。
+
+**未尽项**：① 真机 e2e 未做（本单只到单测 + 门禁；#228 遗留的「遮蔽在真实项目上的实际效果」这条
+待办现在才**具备被验的条件**，验的人应同时看 §17.1 的三条判据而不是只看「挡住没有」）；
+② `ISSUES.md:549` 那句「`maskedPaths` 已注入（§8.9）」是**错的**（现查 worker 0 处 ⇒ 本轮才是真注入），
+是否改口径/关单交主 agent，本单没动 ISSUES.md；③ 运维坑与本文件多条同型——改动全在 **worker 进程**里
+⇒ 必须重建 FDE 镜像并 `docker rm -f` 让 reconcile 重建才生效（`ensureFdeContainer` 不检镜像漂移）；
+④ 上面那三个 #506 假时钟夹具建议改法：`arm()` 的等待从「300 个 `setImmediate`」改成**带墙钟上限的
+spin**（例：上限 2s，每轮仍 `setImmediate`，到点仍 `assert.ok(clock.pending)`），假时钟语义不变
+（sleep 只能被 `release()` 放行），只是把「轮次预算」换成「时间预算」。不在本单做的原因：
+那三个文件属于 #506 的改动面，同时动它会在合并时撞车。

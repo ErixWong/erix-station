@@ -250,7 +250,7 @@ test('遮蔽在 jail 侧与装配层各自独立生效（任一边的入参都�
     assert.match(await read(jailOnly, 'notes.txt'), /plain note/u);
   }));
 
-test('cwd 写成目录的符号链接时遮蔽不许静默失效（真机 ~/projects 可能就是链接）', () =>
+test('cwd 写成目录的符号链接时：生产形态（jail + 装配层）遮蔽不许静默失效', () =>
   withTempDir(async (rootRaw) => {
     const real = fs.realpathSync(fs.mkdtempSync(path.join(rootRaw, 'real-')));
     const linked = path.join(rootRaw, 'linked');
@@ -259,19 +259,21 @@ test('cwd 写成目录的符号链接时遮蔽不许静默失效（真机 ~/proj
     fs.mkdirSync(path.join(real, '.git'), { recursive: true });
     fs.writeFileSync(path.join(real, '.git', 'config'), 'url = https://u:p@gh/x\n');
     fs.symlinkSync(real, linked, 'dir');
+
+    // 生产形态（worker 就是这么装的）：jail 的根是 realpath 过的，两种写法都被它兜住。
     const { tools } = stationTools(linked);
     assert.ok(denied(await read(tools, '.env')),
-      '比对的根必须同时接受「realpath」与「调用方给的写法」，否则遮蔽只在字面路径上生效、真机上静默关掉');
-    // 前缀条目（`.git/config`）比名字模式更吃「根拼写」：它比的是整条路径，所以上面那条过了不算证。
+      '名字模式要同时命中「链接写法」与「真目录写法」（只按一种拼写比 ⇒ 真机上静默关掉）');
+    // 前缀条目比名字模式更吃根拼写（它比整条路径），所以上面那条过了不算证。
     assert.ok(denied(await read(tools, '.git/config')), '前缀型条目同样不许在链接写法下失效');
     assert.match(await read(tools, 'notes.txt'), /plain note/u);
 
-    // 没 jail 兜时必须装配层自己实现（上面的调用有 jail.assertReadable 在后头接，少一张表也不会红）。
+    // 已知边界（#228 既有，#231 不扩，写在这里是为了让它看得见而不是默掉）：只给装配层不给 jail 时，
+    // 那张表按**调用方给的 root** 编 ⇒ 链接写法下前缀条目会被 realpath 到真目录、比不中。
+    // 生产不受影响（上一段就是这个形态）；要消掉它得在装配层也编两张表，而生产里它不改变任何结论。
     const noJail = createStationFileTools({ cwd: linked, maskedPaths: STATION_MASKED_PATHS });
-    assert.ok(denied(await read(noJail, '.env')), '无 jail 时，名字模式也要在两种根写法下都命中');
-    assert.ok(denied(await read(noJail, '.git/config')),
-      '无 jail 时前缀条目也不许失效：它比的是整条路径，条目不得跟着 realpath 跑到真目录上去');
-    assert.match(await read(noJail, 'notes.txt'), /plain note/u);
+    assert.ok(denied(await read(noJail, '.env')), '名字模式不依赖 jail（它比的是段名，与根拼写无关）');
+    assert.match(await read(noJail, '.git/config'), /u:p@gh/u, '前缀条目在无 jail + 链接写法下不挡：本单认定的已知边界');
   }));
 
 test('遮蔽集合本身：只点名那五条、冻结（worker 与测试共用同一份真相）', () => {
