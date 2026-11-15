@@ -12,7 +12,11 @@
 //   ② 软删三分支（07 篇 §2.3）：零引用物理删 / 只有订阅物理删 + 级联 / 有账或有通知只能软删。
 //      `notifications` 是 **W3 才建**的表 ⇒ 「表存在则检查」这一支用临时表现场接上验证。
 //   ③ `until` 到期 ⇒ `enabled = false`，且按**瞬时**判定（不受机器时区影响）。
-//   外加四条枚举 CHECK（`kind` / `state` / `skipped_reason` / `verdict`）。
+//   外加五条枚举 CHECK（`kind` / `status` / `criterion` / `skipped_reason` / `verdict`）。
+//
+// `state` 拆成两义的坑（设计变更）：`status` = 生命周期（会推进），`criterion` = 哪条判据叫起来的
+// （写完不变，是幂等键的一部分）。本文件专门有一条**状态迁移后仍 claim 不到**的用例——
+// 幂等键里一旦混进 `status`，一条账 pending→running→done 之后键位空出来，同一个触发会被再 claim。
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,9 +27,10 @@ import { fileURLToPath } from 'node:url';
 
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import {
-  MACRO_KINDS, MACRO_AUDIENCES, MACRO_SCOPES, MACRO_RUN_STATES, MACRO_RUN_TERMINAL_STATES,
+  MACRO_KINDS, MACRO_AUDIENCES, MACRO_SCOPES, MACRO_RUN_STATUSES, MACRO_RUN_TERMINAL_STATUSES,
+  MACRO_RUN_CRITERIA,
   MACRO_SKIPPED_REASONS, MACRO_VERDICTS,
-  MacroError, validateMacroEnum, validateMacroKind, validateMacroRunState,
+  MacroError, validateMacroEnum, validateMacroKind, validateMacroRunStatus, validateMacroCriterion,
   isAssignmentExpired, toInstant, toAssignmentSnapshot,
   encodeMacroRunCursor, decodeMacroRunCursor,
   listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate,
@@ -81,28 +86,40 @@ const CHECK_VIOLATION = '23514';
 
 // ── 纯逻辑（无 PG 也要跑）──────────────────────────────────────────────────────
 
-test('#524 JS 枚举与迁移 0035 的 CHECK 同源（八种 skipped_reason / 六种 state / 四种 kind 一个都不能少）', () => {
+test('#524 JS 枚举与迁移 0035 的 CHECK 同源（八种 skipped_reason / 六种 status / 五种 criterion / 四种 kind 一个都不能少）', () => {
   const sql = fs.readFileSync(MIGRATION_0035, 'utf8');
-  for (const values of [MACRO_KINDS, MACRO_AUDIENCES, MACRO_SCOPES, MACRO_RUN_STATES,
-    MACRO_SKIPPED_REASONS, MACRO_VERDICTS]) {
+  for (const values of [MACRO_KINDS, MACRO_AUDIENCES, MACRO_SCOPES, MACRO_RUN_STATUSES,
+    MACRO_RUN_CRITERIA, MACRO_SKIPPED_REASONS, MACRO_VERDICTS]) {
     for (const v of values) {
       assert.ok(sql.includes(`'${v}'`), `迁移 CHECK 里缺 '${v}'：JS 与 SQL 两份枚举漂了`);
     }
   }
   // 数量本身也是契约（09 篇 §7 要「为什么没跑」可分组 ⇒ 八种穷举，不许退化成自由文本）。
   assert.equal(MACRO_SKIPPED_REASONS.length, 8);
-  assert.equal(MACRO_RUN_STATES.length, 6);
+  assert.equal(MACRO_RUN_STATUSES.length, 6);
+  assert.deepEqual(MACRO_RUN_CRITERIA, ['terminal', 'silent', 'tick', 'mechanical', 'semantic']);
   assert.equal(MACRO_KINDS.length, 4);
-  assert.deepEqual(MACRO_RUN_TERMINAL_STATES, ['done', 'skipped', 'failed', 'superseded']);
-  // 终态必须是 state 的子集（`finishMacroRun` 补 finished_at 的判据靠这个包含关系）。
-  for (const s of MACRO_RUN_TERMINAL_STATES) assert.ok(MACRO_RUN_STATES.includes(s));
+  assert.deepEqual(MACRO_RUN_TERMINAL_STATUSES, ['done', 'skipped', 'failed', 'superseded']);
+  // 终态必须是 status 的子集（`finishMacroRun` 补 finished_at 的判据靠这个包含关系）。
+  for (const s of MACRO_RUN_TERMINAL_STATUSES) assert.ok(MACRO_RUN_STATUSES.includes(s));
+  // 两个轴必须是**两列**：迁移里 status 与 criterion 各有独立 CHECK，幂等键里不许有 status。
+  assert.ok(sql.includes('CHECK (status IN'), '生命周期列必须是 status + 独立 CHECK');
+  assert.ok(sql.includes('CHECK (criterion IN'), '判据列必须是 criterion + 独立 CHECK');
+  assert.ok(!/UNIQUE \(assignment_id, anchor, state/.test(sql), '幂等键不许回到含 state 的旧形状');
+  assert.ok(!/^\s+state\s+text/m.test(sql), '库里不许再留名为 state 的列（一列两义的回归）');
 });
 
-test('#524 枚举校验：非法 kind / state 当场 validation_failed（不是写进 DB 才发现）', () => {
+test('#524 枚举校验：非法 kind / status / criterion 当场 validation_failed（不是写进 DB 才发现）', () => {
   assert.equal(validateMacroKind('run-review'), 'run-review');
-  assert.equal(validateMacroRunState('superseded'), 'superseded');
+  assert.equal(validateMacroRunStatus('superseded'), 'superseded');
+  assert.equal(validateMacroCriterion('mechanical'), 'mechanical');
   assert.throws(() => validateMacroKind('run-partyy'), (e) => e instanceof MacroError && e.code === 'validation_failed');
-  assert.throws(() => validateMacroEnum('state', 'zombie', MACRO_RUN_STATES),
+  assert.throws(() => validateMacroEnum('status', 'zombie', MACRO_RUN_STATUSES),
+    (e) => e instanceof MacroError && e.code === 'validation_failed');
+  // 判据里混进生命周期值（`done`）必须是非法的——这正是「两列不许合回去」的形状。
+  assert.throws(() => validateMacroCriterion('done'),
+    (e) => e instanceof MacroError && e.code === 'validation_failed');
+  assert.throws(() => validateMacroRunStatus('terminal'),
     (e) => e instanceof MacroError && e.code === 'validation_failed');
   assert.throws(() => validateMacroEnum('verdict', undefined, MACRO_VERDICTS),
     (e) => e instanceof MacroError && e.code === 'validation_failed');
@@ -145,7 +162,7 @@ test('#524 环境门自证：没有 TEST_DATABASE_URL 时真库用例都是 skip
 
 // ── 真库用例──────────────────────────────────────────────────────────────────
 
-test('#524 幂等键：同 (assignment, anchor, state, bucket) 二次 claimMacroRun 返回 null（红线①）', { skip: SKIP }, async () => {
+test('#524 幂等键 (assignment, anchor, criterion, bucket)：二次 claim 返回 null，且状态迁移不改这个结论（红线①）', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     const { userId, sessionId } = await seedScene(pool, 'a1');
     const tpl = await createTemplate(pool, {
@@ -155,34 +172,60 @@ test('#524 幂等键：同 (assignment, anchor, state, bucket) 二次 claimMacro
       'params 是 jsonb：进得去也原样出得来');
     const asg = await assignTemplate(pool, { templateId: tpl.id, userId, sessionId });
 
-    // 显式给 started_at：翻页断言要的是确定序，不能靠「三条语句恰好落在不同微秒」。
+    // 显式给 startedAt：翻页断言要的是确定序，不能靠「三条语句恰好落在不同微秒」。
     const base = Date.parse('2026-03-01T00:00:00Z');
-    const c1 = await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'run-1', bucket: 'b0', startedAt: base + 1 });
+    const key = (over = {}) => ({ assignmentId: asg.id, anchor: 'run-1', criterion: 'terminal', bucket: 'b0', ...over });
+    const c1 = await claimMacroRun(pool, key({ startedAt: base + 1 }));
     assert.ok(c1?.id, '第一次必须拿到 id');
-    const c2 = await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'run-1', bucket: 'b0', startedAt: base + 2 });
-    assert.equal(c2, null, '同键第二次必须是 null（幂等命中）——改成先 SELECT 再 INSERT，这里会是一个新 id');
-    const c3 = await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'run-1', bucket: 'b1', startedAt: base + 3 });
+    assert.equal(c1.criterion, 'terminal');
+    assert.equal(c1.status, 'pending', '认领写下的生命周期默认 pending');
+    const c2 = await claimMacroRun(pool, key({ startedAt: base + 2 }));
+    assert.equal(c2, null, '同 (assignment, anchor, criterion, bucket) 第二次必须是 null（幂等命中）');
+
+    // ★★ 本单最容易写错的一处：**状态迁移不许影响幂等**。
+    // 把第一条从 pending 推到 done 之后再拿同一个键 claim —— 必须**仍然是 null**。
+    // 幂等键里若混进 `status`（旧形状 (assignment, anchor, state, bucket)），done 之后键位就
+    // 空出来了，这里会拿到一个**新 id** ⇒ 同一个触发被跑第二遍，幂等失效。
+    const FINISH_SQL = 'UPDATE macro_runs SET status = $2, finished_at = now() WHERE id = $1';
+    // 真库前置证据：用**裸 SQL** 把 status 从 pending 推到 done —— 若幂等键含 status，这一步
+    // 就会被唯一键拦住（23505）。能改成功本身就说明「生命周期不在键里」。
+    await finishMacroRun(pool, { macroRunId: c1.id, status: 'done', verdict: 'pass', verdictRaw: 'LGTM' });
+    const doneRow = (await pool.query('SELECT status, finished_at, verdict, verdict_raw FROM macro_runs WHERE id = $1',
+      [c1.id])).rows[0];
+    assert.equal(doneRow.status, 'done');
+    assert.equal(doneRow.verdict, 'pass');
+    await pool.query(FINISH_SQL, [c1.id, 'running']);
+    assert.equal((await pool.query('SELECT status FROM macro_runs WHERE id = $1', [c1.id])).rows[0].status,
+      'running', '状态可以随意推进而不动唯一键（这一步 23505 就是键里混进了 status）');
+    assert.ok(doneRow.finished_at, '进终态必须补 finished_at');
+    assert.equal(doneRow.verdict_raw, 'LGTM', '原话留在 verdict_raw（口径改了能回溯重算）');
+    assert.equal(await claimMacroRun(pool, key({ startedAt: base + 9 })), null,
+      '状态已 pending → done，同一个 (assignment, anchor, criterion, bucket) 再 claim 仍必须 null');
+    // 连推两级再试一次（running → done 的中途也一样不许漏）：直接写库造 running，再 claim。
+    await pool.query("UPDATE macro_runs SET status = 'running' WHERE id = $1", [c1.id]);
+    assert.equal(await claimMacroRun(pool, key({ startedAt: base + 10 })), null, 'running 中途同样幂等');
+    await pool.query("UPDATE macro_runs SET status = 'skipped', skipped_reason = 'quiet_hours' WHERE id = $1", [c1.id]);
+    assert.equal(await claimMacroRun(pool, key({ startedAt: base + 11 })), null, 'skipped 之后同样幂等');
+
+    // 同一 anchor 在**另一条判据**下是另一次触发 ⇒ 能认领（判据是键的一部分，status 不是）。
+    const c5 = await claimMacroRun(pool, key({ criterion: 'silent', startedAt: base + 3 }));
+    assert.ok(c5?.id, 'terminal 与 silent 是两条判据 ⇒ 两次不同的触发，不该互相挡');
+    const c3 = await claimMacroRun(pool, key({ bucket: 'b1', startedAt: base + 4 }));
     assert.ok(c3?.id, '换 bucket 不是同一次事件 ⇒ 应当能认领');
-    const c4 = await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'run-2', bucket: 'b0', startedAt: base + 4 });
+    const c4 = await claimMacroRun(pool, { assignmentId: asg.id, anchor: 'run-2', criterion: 'terminal', bucket: 'b0', startedAt: base + 5 });
     assert.ok(c4?.id);
-    assert.equal((await claimMacroRun(pool, { assignmentId: '00000000-0000-4000-8000-000000000000', anchor: 'x', bucket: 'b' })),
+    assert.equal(await claimMacroRun(pool, { assignmentId: '00000000-0000-4000-8000-000000000000', anchor: 'x', criterion: 'tick', bucket: 'b' }),
       null, '订阅不存在也是 null（不拿认领当存在性探针）');
+    await pool.query("UPDATE macro_runs SET status = 'done' WHERE id = $1", [c1.id]);
 
     // 认领顺手写了 last_evaluated_at（W2 的「这条订阅多久没被看过」判据）。
     const [rowAsg] = (await pool.query('SELECT last_evaluated_at FROM macro_assignments WHERE id = $1', [asg.id])).rows;
     assert.ok(rowAsg.last_evaluated_at, '认领必须留下评估时刻');
 
-    // 收口 + keyset 翻页：limit=1 逐页走，不重不漏。
-    await finishMacroRun(pool, { macroRunId: c1.id, state: 'done', verdict: 'pass', verdictRaw: 'LGTM' });
-    const done = (await pool.query('SELECT state, finished_at, verdict, verdict_raw FROM macro_runs WHERE id = $1',
-      [c1.id])).rows[0];
-    assert.equal(done.state, 'done');
-    assert.ok(done.finished_at, '进终态必须补 finished_at');
-    assert.equal(done.verdict_raw, 'LGTM', '原话留在 verdict_raw（口径改了能回溯重算）');
-
+    // keyset 翻页：limit=1 逐页走，不重不漏（账表只追加，OFFSET 在并发插入下会重/漏）。
     const p1 = await listMacroRuns(pool, { assignmentId: asg.id, limit: 1 });
     assert.equal(p1.runs.length, 1);
-    assert.equal(p1.runs[0].id, c4.id, '倒序：started_at 最新的那条在最前');
+    assert.equal(p1.runs[0].id, c4.id, '倒序：startedAt 最新的那条在最前');
     assert.ok(p1.nextCursor);
     const seen = [...p1.runs];
     let cur = p1.nextCursor;
@@ -191,14 +234,19 @@ test('#524 幂等键：同 (assignment, anchor, state, bucket) 二次 claimMacro
       seen.push(...next.runs);
       cur = next.nextCursor;
     }
-    assert.equal(seen.length, 3, '三条账一条不多一条不少（OFFSET 分页在并发插入下会重/漏，keyset 不会）');
-    assert.equal(new Set(seen.map((r) => r.id)).size, 3);
-    assert.deepEqual(seen.map((r) => r.id), [c4.id, c3.id, c1.id]);
+    assert.deepEqual(seen.map((r) => r.id), [c4.id, c3.id, c5.id, c1.id],
+      '四条账一条不多一条不少、按 startedAt 倒序（keyset 不重不漏）');
     assert.equal(seen.find((r) => r.id === c1.id).verdict, 'pass');
-    // 按模板筛（走 JOIN macro_assignments —— 索引选型的那一支）
-    const byTpl = await listMacroRuns(pool, { templateId: tpl.id, state: 'pending' });
-    assert.deepEqual(byTpl.runs.map((r) => r.id).sort(), [c3.id, c4.id].sort());
+    assert.equal(seen.find((r) => r.id === c1.id).status, 'done', '快照里 status 与 criterion 是两个字段');
+    assert.equal(seen.find((r) => r.id === c5.id).criterion, 'silent');
+    // 筛选：判据 / 生命周期各自能筛；按模板筛走 JOIN macro_assignments（索引选型那一支）。
+    const byTpl = await listMacroRuns(pool, { templateId: tpl.id, status: 'pending' });
+    assert.deepEqual(byTpl.runs.map((r) => r.id).sort(), [c3.id, c4.id, c5.id].sort());
     assert.equal(byTpl.nextCursor, null);
+    const byCriterion = await listMacroRuns(pool, { assignmentId: asg.id, criterion: 'silent' });
+    assert.deepEqual(byCriterion.runs.map((r) => r.id), [c5.id], 'criterion 能单独筛（W2 每 tick 要问「这条判据跑过没有」）');
+    assert.deepEqual((await listMacroRuns(pool, { assignmentId: asg.id, status: 'done' })).runs.map((r) => r.id),
+      [c1.id], 'status 能单独筛（面板默认视图的筛法）');
   });
 });
 
@@ -225,7 +273,7 @@ test('#524 软删三分支（07 §2.3）：零引用物理删 / 只有订阅级�
     // ── 分支三（有执行账）⇒ 只能软删
     const t3 = await createTemplate(pool, { kind: 'run-silence-alert', name: '有账', scope: 'session' });
     const a3 = await assignTemplate(pool, { templateId: t3.id, userId, sessionId });
-    assert.ok((await claimMacroRun(pool, { assignmentId: a3.id, anchor: 'run-x', bucket: 'b0' }))?.id);
+    assert.ok((await claimMacroRun(pool, { assignmentId: a3.id, anchor: 'run-x', criterion: 'terminal', bucket: 'b0' }))?.id);
     const r3 = await deleteTemplate(pool, { templateId: t3.id });
     assert.equal(r3.mode, 'soft', '有执行账 ⇒ 不许物理删（既成事实必须能被解释）');
     assert.equal(r3.macroRuns, 1);
@@ -296,27 +344,31 @@ test('#524 until 到期 ⇒ enabled=false（红线③的 DB 那一半；到期�
     assert.equal(listed.find((a) => a.id === a3.id).enabled, false,
       'listAssignments 读侧也收敛：读出来的 enabled 必须等于「真的还能跑」');
     assert.equal(listed.find((a) => a.id === a3.id).expired, true);
-    assert.equal(await claimMacroRun(pool, { assignmentId: a3.id, anchor: 'run-e', bucket: 'b0' }), null,
+    assert.equal(await claimMacroRun(pool, { assignmentId: a3.id, anchor: 'run-e', criterion: 'tick', bucket: 'b0' }), null,
       '到期的订阅没有认领资格：与「抢不到」同一个 null，调用方处置动作一致');
     assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM macro_runs WHERE assignment_id = $1',
       [a3.id])).rows[0].n, 0, '没资格就不该留下账');
     // 未到期那条照样能认领
-    assert.ok((await claimMacroRun(pool, { assignmentId: live.id, anchor: 'run-ok', bucket: 'b0' }))?.id);
+    assert.ok((await claimMacroRun(pool, { assignmentId: live.id, anchor: 'run-ok', criterion: 'terminal', bucket: 'b0' }))?.id);
   });
 });
 
-test('#524 枚举 CHECK 拒绝非法值：kind / state / skipped_reason / verdict（DB 是最后一道闸）', { skip: SKIP }, async () => {
+test('#524 枚举 CHECK 拒绝非法值：kind / status / criterion / skipped_reason / verdict（DB 是最后一道闸）', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     const { userId, sessionId } = await seedScene(pool, 'a4');
     const tpl = await createTemplate(pool, { kind: 'run-review', name: '闸', scope: 'session' });
     const asg = await assignTemplate(pool, { templateId: tpl.id, userId, sessionId });
     const bad = [
       ['kind', `INSERT INTO macro_templates (kind, name, scope) VALUES ('run-partyy', 'x', 'user')`, []],
-      ['state', `INSERT INTO macro_runs (assignment_id, anchor, state, bucket) VALUES ($1, 'z', 'half-done', 'b0')`, [asg.id]],
-      ['skipped_reason', `INSERT INTO macro_runs (assignment_id, anchor, state, bucket, skipped_reason)
-                           VALUES ($1, 'z', 'skipped', 'b0', 'i_was_sleeping')`, [asg.id]],
-      ['verdict', `INSERT INTO macro_runs (assignment_id, anchor, state, bucket, verdict)
-                    VALUES ($1, 'z', 'done', 'b0', 'green')`, [asg.id]],
+      ['status', `INSERT INTO macro_runs (assignment_id, anchor, criterion, bucket, status)
+                   VALUES ($1, 'z', 'terminal', 'b0', 'half-done')`, [asg.id]],
+      // 判据里塞生命周期的值（`pending`）必须被拒：这条拒的就是「两列合回去」的写法。
+      ['criterion', `INSERT INTO macro_runs (assignment_id, anchor, criterion, bucket)
+                      VALUES ($1, 'z', 'pending', 'b0')`, [asg.id]],
+      ['skipped_reason', `INSERT INTO macro_runs (assignment_id, anchor, criterion, bucket, status, skipped_reason)
+                           VALUES ($1, 'z', 'terminal', 'b0', 'skipped', 'i_was_sleeping')`, [asg.id]],
+      ['verdict', `INSERT INTO macro_runs (assignment_id, anchor, criterion, bucket, status, verdict)
+                    VALUES ($1, 'z', 'terminal', 'b0', 'done', 'green')`, [asg.id]],
     ];
     for (const [column, sql, params] of bad) {
       await assert.rejects(
@@ -329,14 +381,14 @@ test('#524 枚举 CHECK 拒绝非法值：kind / state / skipped_reason / verdic
       );
     }
     // 合法值必须能进（否则上面的红是假红：CHECK 写死成一个也不许）。
-    await pool.query(`INSERT INTO macro_runs (assignment_id, anchor, state, bucket, skipped_reason, verdict)
-                      VALUES ($1, 'z', 'superseded', 'b9', 'cancelled_by_user', 'unclassified')`, [asg.id]);
+    await pool.query(`INSERT INTO macro_runs (assignment_id, anchor, criterion, bucket, status, skipped_reason, verdict)
+                      VALUES ($1, 'z', 'mechanical', 'b9', 'superseded', 'cancelled_by_user', 'unclassified')`, [asg.id]);
     // 同一份枚举在 JS 侧也拦得住（两道闸都在，W2 才不会看到裸 pg 码）。
-    await assertMacroError('validation_failed', () => finishMacroRun(pool, { macroRunId: randomUUID(), state: 'half-done' }));
+    await assertMacroError('validation_failed', () => finishMacroRun(pool, { macroRunId: randomUUID(), status: 'half-done' }));
     await assertMacroError('validation_failed', () => createTemplate(pool, { kind: 'nope', name: 'x', scope: 'user' }));
     const onlyRunId = (await listMacroRuns(pool, { assignmentId: asg.id })).runs[0].id;
     await assertMacroError('validation_failed', () => finishMacroRun(pool, {
-      macroRunId: onlyRunId, state: 'skipped',
+      macroRunId: onlyRunId, status: 'skipped',
     }), 'skipped 必带 skipped_reason');
     assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM macro_runs WHERE anchor = $1', ['z'])).rows[0].n, 1,
       '被拒的三条非法行一条也没漏进去');
@@ -381,7 +433,7 @@ test('#524 订阅形状：NULLS NOT DISTINCT 挡重复订阅 / scope 决定 sess
     const clean = await assignTemplate(pool, { templateId: userScope.id, userId, cwd: '/clean' });
     assert.equal((await unassignTemplate(pool, { assignmentId: clean.id })).mode, 'deleted');
     assert.equal((await pool.query('SELECT 1 FROM macro_assignments WHERE id = $1', [clean.id])).rowCount, 0);
-    assert.ok(await claimMacroRun(pool, { assignmentId: sAsg.id, anchor: 'run-c', bucket: 'b0' }));
+    assert.ok(await claimMacroRun(pool, { assignmentId: sAsg.id, anchor: 'run-c', criterion: 'terminal', bucket: 'b0' }));
     const off = await unassignTemplate(pool, { assignmentId: sAsg.id });
     assert.equal(off.mode, 'disabled', '有执行账的订阅只能停用');
     assert.equal(off.macroRuns, 1);
