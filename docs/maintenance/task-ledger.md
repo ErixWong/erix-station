@@ -5539,3 +5539,20 @@ tab 顺序用例的 `findAll('nav a').slice(0, 6)` 窗口（6 个 tab ⇒ 7 个�
 相邻断言（现在中间隔着「上传上限」）。新增 tab 自己的判据照 #449/#456 先例补了一条（tab 存在 + 排在
 证书之后号池之前 + `routes` 里 `upload` 子路由 `requiresRole:'admin'` 且懒加载），并把这条连带红线
 写进了 `makeRouter()` 的注释里。
+
+**⚠ 合并时必须把我的迁移重编号 `0035` → `0036`（本单留的、唯一一处需要合并方动手的地方）**。
+现查（2026-11-16，`git ls-tree origin/main`）：main 上 `0035` 这个号**已经被占用** ——
+`deploy/migrations/0035-macro-platform.sql`（事件平台 W1 数据层，issue #524，`a22eb5f` → `cb82433`），
+且现网容器里已经是这一支（`docker exec station-portal ls /app/deploy/migrations` 末号 = `0035-macro-platform.sql`）。
+我这刀的 `0035-upload-settings.sql` 是在**它进 main 之前**的基点（`c8613a3`）上写的，两个文件同名不同内容。
+
+- **不改号会怎样**：runner 用「文件名去 `.sql`」当 `schema_migrations.version`，所以两支都叫 `0035-*` 但版本串不同
+  ⇒ 不会当场炸，而是**两支都应用**，把「0035 是宏平台」这条口头共识悄悄变成两回事；
+  真正会红的是 `portal/test/migrations.test.js` 那条**编号连续无空洞**（`nums.forEach(n === i + 1)`：
+  两个 35 ⇒ 第二格期望 36 而拿到 35）——**这是设计出来的闸**，别为了让它绿而改断言。
+- **为什么我在分支里不直接改成 0036**：我的基点还没有 `0035-macro-platform`，本树里改成 0036 会**自己造出一个空洞**
+  ⇒ 同样被上面那条闸拦下（这正是它该干的事）。所以只能在**合并方**（main 已含宏平台那一支）改号。
+- 合并后要一起进位的四处（漏一处就是一条红）：`migrations.test.js` 里 **19 处 head 断言 + 4 处
+  `Array.from({length: N})`**（35 → 36）、0035 那一段语义闸的文件名与 `RAISE NOTICE` 前缀、
+  `upload-settings.test.js` 的 US-13 路径、以及本节/`docs/api/portal.md` §4.15/`deploy/migrations/README.md`
+  清单里写的「迁移 0035」字样。**迁移文件内容本身不用改**（只改名；runner 记的是 sha，改名发生在应用之前 ⇒ 安全）。
