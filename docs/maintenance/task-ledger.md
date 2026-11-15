@@ -5405,3 +5405,81 @@ run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data
 
 **剩余**：空闲仍有 13.2 事务/秒来自**另外 5 个轮询器**（`run_queue` 1.5/秒、`chat_sessions` 0.9/秒、
 `port_observations` 0.7/秒、`fde_onboarding` 0.6/秒…）⇒ 开 **#520** 续作（判据：空闲 < 3 事务/秒）。
+
+### 8.137 终局正文是一段「被文本化的工具调用」：识别 + 中性提示，不许再静默丢交付（issue #243 / 工单 fix-261116-03，2026-11-16，worker 落地）
+
+> **编号说明**：本批多单并行，**编号由主 agent 统一分配**（工单原写 8.138，主 agent 改为 8.137）。
+> 本节一次记完两步：第 1 步（识别 + 特征集 + 判据，提交 `328525a`）与第 2 步（事件链路 + 白名单 + 判据，
+> 提交 `9fd7c3f` / `8721fb2`）。**界面渲染与中英双语文案是第 3 步**，本节末尾写明它的现存形态。
+
+**症状**：run 正常 `finished`，但用户在时间线顶端看到的「最终回复」是一堆标记
+（`<｜｜DSML｜｜tool_calls>…`）而不是交付报告 —— 模型把 tool call 吐进了 `content`，引擎当**最终文本**收下，
+于是既没有工具执行、也没有报告，而且**零信号**。`ISSUES.md` 与 `docs/ops/drill-2026-10-11.md` /
+`drill-2026-10-12.md` 都记过同一族形态（`｜FunctionCallML｜｜invoke`、`<tool_call…`）。
+
+**现查取证（本机 dev 库 `station-db`，只读，未碰 `station-*` / `fde-*` 容器）**
+```sql
+select payload->>'final_text' from run_events
+ where run_id='f4dfea1d-c439-4bba-ac34-4c86d7132bea' and type='round_end' order by seq desc limit 1;
+```
+- `runs` 表里这条 run 的实况是 `status=finished`、`rounds=32`、`termination.reason=judge_done`
+  ——**与工单正文写的「9 轮、`end_turn`」不符**（工单的形态描述对，读数不对）。真样本的正文不在
+  `run_end` 的 payload 里：那条 run 的 `run_events.type='run_end'` payload 只有 usage/rounds/termination，
+  **没有** `final_text` 键（本站终态正文的落点是 `round_end` 行 + transcript 投影，见 §8.126 形态 M）
+  ⇒ 判据一律用 `result.finalText`，**没有**新造正文落点。
+- 第二条同族真样本 `messages.id=0549e113-dc48-4ab3-9d87-f8b79a7557bf`：标记名里**带空格**
+  （`<｜FunctionCallML｜｜ invoke`）⇒ 任何「精确等于某个标签名」的判据都会漏。
+
+**特征集口径的一处事实修正（工单的缺省值要不得）**：工单建议钉 `<｜｜DSML｜｜invoke`，但真样本 A 是
+`<｜｜DSML｜｜tool_calls>`、样本 B 标记名内含空格 ⇒ 那条字面串**两条都命中不了**。缺省改为三条前缀形态：
+`<｜｜DSML｜｜` / `<tool_call` / `<｜Function`（≥3 条，不是「只钉 DSML」）。两条防误伤规则：
+整段围栏代码块与成对反引号**先剥掉再匹配**（正文里**引用**标记本身不是泄漏），大小写不敏感。
+可配置面 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS`：逗号分隔**整串替换**缺省；`off` 是**显式关闭**（要 warn）；
+非法条目（空 / 超长 / 含换行 / 非串）**点名是哪个值**并回退缺省 —— 配错不该把问题重新藏起来。
+
+**第 2 步：链路怎么接（逐条照 #442 的 `final_text_fallback` 抄，三条口径一字未改）**
+- `runner/worker.js`：每 run 解析一次特征集（worker 进程会被复用给下一个 run），`warnings[]` 逐条落 `warn` LOG；
+  RUN_FINISHED **成功**信封 additive 两键 `textualized_tool_call` / `textualized_tool_call_marker`，
+  **只在命中时给**（绝不写 `false`）。**`termination.reason`、`rounds`、`usage`、`final_text` 一个字节都不动** ——
+  它不是失败，红色面仍只由 `run_end` 负责（§2.5.1 第 3 条）。失败信封不带（那条路径正文恒空）。
+- `runner/agentd.js`：只在 `=== true` 时逐字透传；marker 脏（空串/非串）时只丢 marker，布尔照传 ——
+  否则 portal 的 400 会把**整条终态**打回去，为了一个片段丢终态是本末倒置。
+- `portal/src/internal.js#finishRun`：在**同一个终态事务内**合成 `textualized_tool_call` 事件行，
+  `seq` 排在 `run_end` **之前**（时间线：正文 → 中性提示 → 终态分隔条），
+  `client_event_id=<runId>:final:textualized_tool_call` + ON CONFLICT DO NOTHING（#277 先例）。
+  **为什么不叫容器经 U3 自己发**：U3 的写闸是「租约有效」，而收尾时 `finishRun` / `drainQueueAfterRun`
+  都会清 `claim_token`（#220 现查取证）⇒「活干完了、租约没了」是常态，容器自报会被 409 `lease_lost` 挡掉；
+  终态事务内由 portal 写才是必然成功那一侧（`attempt_killed` 的 reaper 分支同构）。
+  payload `{chars, marker}`：`chars` 由 portal 从收到的 `final_text` **自己算**，不取容器报的数（#261 口径）。
+- `portal/src/http.js` 的 `HISTORY_EVENT_TYPES` += 它（§5.3 第 **29** 项、§4.4a 同步补一句）——
+  上游 erix-agent **#182** 的教训就是「实时看得见、刷新后消失」，而这条事件讲的恰恰是
+  「用户刷新来看这次交付了什么」的那一刻。
+
+**前端这次只加了两处集合的类型名**（`EVENT_TYPES` / `HISTORY_REPLAY_TYPES`），**没写渲染**：
+`portal/test/event-surface-contract.test.js` 的 S4 要求「后端下发白名单」与「前端回放集合」**逐项相等**，
+只加后端一边会直接判红（#288 那颗坑的账面对账）。所以现在是「订得到、暂时不刷行」的中间态 ——
+与 `run_outcome` 今天的形态同类；中性分隔行与中英双语文案在第 3 步。
+
+**验证读数（全部实跑）**
+- `runner/test/final-text-toolcall.test.js` **15 格全绿**：① 两条 dev 库真样本 + 同族变体；② 不误伤
+  （提到工具名 / 正文含 `<` / HTML / 比较号 / 引用了标记本身）；③ 特征集可配置且生效（删掉一条 ⇒ 对应夹具
+  不再命中；缺省 ≥3 条；非法值点名 + 回退）；⑤ 反向自证（把判据放宽成「正文含 `<`」⇒ 正常交付摘要全被咬）；
+  ⑥ additive 字段本体 + worker 接线源码级判据；⑦ **真跑** `agentd.onWorkerFinished` 抓 U2 body（夹具同 #442 F3）。
+- `portal/test/textualized-toolcall.test.js` **10 格全绿**（新增）：事件恰好一条 / 排序在 `run_end` 前 /
+  payload 两键 / 终态语义不动 / 终态后再收 U2 不写第二条 / 正常终局零事件 / 脏载荷 400 且点名字段 /
+  U3 保留名 / 三处集合源码级对账 / 文档两处登记。
+- `portal/test/session-events-history.test.js` **+2 格**：**行为级**「刷新后历史端点仍返回它」，
+  payload 一字不改（`marker` 含全角竖线 `｜`，截断逻辑不许切坏它）。
+- **变异自证**（每次都还原，`grep -rn MUTANT runner portal` 收尾为 0）：
+  摘掉 worker 的识别 ⇒ ⑥ 红；识别恒判不命中 ⇒ ①③⑤⑥ 红；硬编码只认 DSML ⇒ ①③⑤⑥ 红；
+  从 `HISTORY_EVENT_TYPES` 删掉它 ⇒ 历史端点两条 + `event-surface-contract` 的 S4 + 三处集合对账全红。
+
+**剩余（不瞒）**
+1. **界面还看不见**：第 3 步（`StreamPanel` 中性分隔行 + zh/en 文案）落地前，这条事件只到「订得到、不渲染」。
+2. **`ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 目前只有 worker 进程读得到**，没接 `deploy/docker-compose.yml` /
+   `provisioner.js` / `fde-proxy` 的 env 允许名单（改那几处要动 `portal/src/http.js` 之外的并行热文件，
+   等主 agent 裁决再开一笔）。
+3. **旧 runner 镜像 ⇒ 无提示**（信号来自 worker，portal 不兜底重做识别：判据留在 runner 一处，
+   升级顺序是「先 runner 后 portal」，与 #442 同）。
+4. dev 库里那条 run 的 `termination.reason` 是 `judge_done` 而非工单写的 `end_turn` ⇒ **真实现场的
+   「9 轮 + `end_turn`」形态未在本库复现**，判据用的是「终局正文」这一层事实，不依赖轮数与 reason。
