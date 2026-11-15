@@ -276,6 +276,127 @@ test('cwd 写成目录的符号链接时：生产形态（jail + 装配层）遮
     assert.match(await read(noJail, '.git/config'), /u:p@gh/u, '前缀条目在无 jail + 链接写法下不挡：本单认定的已知边界');
   }));
 
+/**
+ * 遮蔽夹具表（与 `STATION_MASKED_PATHS` **同文件维护**：往名单里加一条，就得在这里给它添一条命得中的夹具）。
+ *
+ * 这张表**不是**「应当被遮的密钥清单」（那份口径在 `lib/file-tools.js` 的注记里），它只是**探针**：
+ * 下面那条自检判据拿它去问「这条名单条目真的能命中东西吗」。所以两个方向都不能空：
+ *   ① 表里每条都得真的落盘（否则「拿不到」可能来自 ENOENT 而不是遮蔽，红会红错地方）；
+ *   ② 整份名单装上后它们确实该被挡得住（否则判据的绿是空转出来的）——这两条都在下面的用例里钉着。
+ */
+const MASK_FIXTURE_PATHS = Object.freeze([
+  '.env',                      // `.env*` 与（假想的）`**/.env` 都该在这儿见分晓
+  '.env.local',
+  '.env.example',
+  '.git/config',               // 前缀条目：只有这一条命中，`sub/.npmrc` 型的不算
+  '.npmrc',
+  'deploy/tls/server.pem',     // `*.pem` 的任意深度面
+  'deploy/keys/id_ed25519',    // `id_*` 的任意深度面
+]);
+
+/** 落盘夹具（内容随便，判据只看「readFile 拿不拿得到」）；README.md 是「别把谁都挡了」的负面参照。 */
+function seedMaskFixtures(root) {
+  for (const rel of MASK_FIXTURE_PATHS) {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), `MASK-FIXTURE ${rel}\n`);
+  }
+  fs.writeFileSync(path.join(root, 'README.md'), 'MASK-FIXTURE-README\n');
+}
+
+/**
+ * 「每条名单条目都至少命中一个夹具」的**遍历式**检查；返回一个夹具都没命中的条目。
+ *
+ * 逐条**单独装配**（`maskedPaths: [entry]`）而不是整份名单一起装 ⇒ 命中必须归给这条条目本身，
+ * 不许被隔壁条目顺带兜住（否则 `.env* ` 打错字也能靠 `.env*` 那条假装绿）。
+ */
+async function entriesMatchingNoFixture(root, entries) {
+  const misses = [];
+  for (const entry of entries) {
+    const { tools } = stationTools(root, [entry]);
+    let hit = null;
+    for (const fixture of MASK_FIXTURE_PATHS) {
+      if (denied(await read(tools, fixture))) { hit = fixture; break; }
+    }
+    if (hit === null) misses.push(entry);
+  }
+  return misses;
+}
+
+/**
+ * 自检判据（issue #231 的 copilot 二次审计补）：名单里**任何一条**都必须在夹具表上真命中东西。
+ *
+ * 它防的不是「遮蔽语义写错」——那是上面那些具名用例的活——而是一种更阴的失效：**条目打错字，
+ * 编得出式子、静默不挡**。审计给的两个实例：`'.env* '`（多个尾空格 ⇒ 式子里多一个字面空格，
+ * 谁都匹配不上）与「两个星号 + `/.env`」那种写法（本表的 `*` 不跨 `/`、**没有 globstar** ⇒ 它只能命中
+ * `sub/.env`
+ * 这种带目录的写法，根目录那个 `.env` 照样漏）。两种都能安然通过「当前这几个条目各自的行为」
+ * 那几条具名用例，因为具名用例钉的是「已知条目 = 已知行为」，而**新增**条目的行为没人问过。
+ *
+ * ⚠ **这条是遍历式的，它防不住「从名单里删掉一个条目」**：名单少了谁，剩下的照样条条命中。
+ *   覆盖「删条目」的是那几条**具名**用例（`生产名单逐项命中` 逐条点名、`遮蔽集合本身` 冻结名单字面量、
+ *   以及 `.git/HEAD` / `sub/.npmrc` 那些反面钉子）——别把这条当「删了也红」的万能锁用。
+ *   下面「删条目不红」那条用例就是把这个限制钉住，免得后继误信它能防删。
+ *
+ * ⚠ 另一条限制（同样别误信）：它问的是「这条条目**到底挡不挡得住任何东西**」，不是「挡的是不是你
+ *   心里想那个」。新条目只要随便能命中夹具表上一个就算过 ⇒ **加条目的同时还要往
+ *   `生产名单逐项命中` 那张表里加一行具名断言**，那才是「命中了你想要的东西」的锁。
+ */
+test('自检判据：STATION_MASKED_PATHS 每一条都至少命中一个夹具（打错字 ⇒ 静默不挡，这里必须红）', () =>
+  withTempDir(async (root) => {
+    seedMaskFixtures(root);
+    for (const rel of MASK_FIXTURE_PATHS) {
+      assert.ok(fs.existsSync(path.join(root, rel)), `夹具没落盘：${rel}（红了会分不清是没命中还是没文件）`);
+    }
+
+    const misses = await entriesMatchingNoFixture(root, STATION_MASKED_PATHS);
+    assert.deepEqual(misses, [],
+      `这些名单条目在夹具表上一个路径都不命中 ⇒ 要么打错字（静默不挡），要么夹具表忘了同步：`
+      + `${JSON.stringify(misses)}；夹具表 = masked-paths.test.js 的 MASK_FIXTURE_PATHS`);
+
+    // 夹具表自己也得说得过去：它必须真的挡得住「名单此刻遮的那些」，否则上面的绿是空转出来的。
+    const { tools } = stationTools(root);
+    for (const rel of ['.env', '.git/config', '.npmrc', 'deploy/tls/server.pem', 'deploy/keys/id_ed25519']) {
+      assert.ok(denied(await read(tools, rel)), `夹具 ${rel} 在整份名单下竟能读 ⇒ 夹具选得没代表性，本判据在空转`);
+    }
+    assert.match(await read(tools, 'README.md'), /1: MASK-FIXTURE-README/u, '负面参照被挡了 ⇒ 夹具表选歪了');
+  }));
+
+test('反向自证：往名单里塞一条永不命中的条目，上面那条判据必须红并点名是哪条（审计给的两个实例）', () =>
+  withTempDir(async (root) => {
+    seedMaskFixtures(root);
+
+    // 这两条都是**编得过**的式子（`compileMaskedTable` 不会拒它们），也都**静默不挡**夹具表上的任何东西：
+    //   `'.env* '` —— 尾空格进了式子，段名里没有空格 ⇒ 谁都匹配不上；
+    //   `'**/.env'` —— 没有 globstar，`*` 不跨 `/` ⇒ 它命不中根目录那个 `.env`（夹具表里也没有 `sub/.env`）。
+    const auditTypo = '.env* ';
+    const noGlobstar = '**/.env';
+    assert.deepEqual(await entriesMatchingNoFixture(root, [...STATION_MASKED_PATHS, auditTypo]), [auditTypo],
+      '塞进带尾空格的条目却没人报红 ⇒ 本判据只会跟着名单点头，等于没加');
+    assert.deepEqual(await entriesMatchingNoFixture(root, [...STATION_MASKED_PATHS, noGlobstar]), [noGlobstar],
+      '把 `**` 当 globstar 用（本表不认）也必须报红');
+
+    // 而且必须**当场**红、红得准：真装上这两条时，夹具确实照读（证明它们不是「靠别处生效」的假条目）。
+    for (const typo of [auditTypo, noGlobstar]) {
+      const { tools } = stationTools(root, [typo]);
+      assert.match(await read(tools, '.env'), /1: MASK-FIXTURE \.env/u,
+        `打错字的条目 ${JSON.stringify(typo)} 竟然把 .env 挡了 ⇒ 上面那条反向自证的前提没了`);
+    }
+  }));
+
+test('这条判据的已知限制（钉住，别让后继误信它防删条目）：从名单里删一条，它不红', () =>
+  withTempDir(async (root) => {
+    seedMaskFixtures(root);
+    const minusOne = STATION_MASKED_PATHS.filter((entry) => entry !== '.npmrc');
+    assert.ok(minusOne.length === STATION_MASKED_PATHS.length - 1, '本用例假设名单可筛掉一条');
+    assert.deepEqual(await entriesMatchingNoFixture(root, minusOne), [],
+      '遍历式判据本该看不见「少了谁」；这里红了说明有人把它改成了双向比对（那要连注释一起改）');
+
+    // 而删条目真正会撞红的是具名钉子：整份名单下 `.npmrc` 读得到，`生产名单逐项命中` 那条就红。
+    const { tools } = stationTools(root, minusOne);
+    assert.match(await read(tools, '.npmrc'), /1: MASK-FIXTURE \.npmrc/u,
+      '删掉 `.npmrc` 条目后它居然还被挡 ⇒ 遮蔽另有来源，上面那条限制要重新写');
+  }));
+
 test('遮蔽集合本身：只点名那五条、冻结（worker 与测试共用同一份真相）', () => {
   assert.deepEqual([...STATION_MASKED_PATHS], ['.env*', '.git/config', '.npmrc', '*.pem', 'id_*']);
   assert.ok(Object.isFrozen(STATION_MASKED_PATHS), '名单不得被某个 import 方就地改写字面量');
