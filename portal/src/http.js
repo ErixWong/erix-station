@@ -3019,13 +3019,16 @@ const NO_TERMINAL_DISCOVERY = Object.freeze({ runIds: Object.freeze([]), truncat
  * 「这个窗口之下到底还有没有更老的行」，而不是「存活下来的合成项长什么样」（后者会被 M-6④ 的
  * `seq < before` 拦掉、会被「非终态 / 有锚点 / 无 reason」筛掉 ⇒ 拿它当游标会造出倒退的页边界）。
  *
- * 成本：**每次响应最多一条**（不是每 run 一枪），走既有 `UNIQUE (session_id, seq)` 索引倒序扫，
- * 非空页的扫描范围被 `[pageLow, before)` 夹住；此前那条「同一次响应里只允许一条 `runs` 查询」的
- * 成本红线不变（发现的是 `run_events`，候选 id 仍并进 `loadWindowRuns` 那**一条** runs 查询）。
- * ⚠ 二次审计 LOW-1 点名的两条算术（逐字同 §4.4a-2 成本段，别再被读成「扫过的行数为 1」）：
- *   ① `LIMIT` 封的是**返回条数**，不是**扫过的索引条目数**——`type = 'run_end'` 是残余过滤；
- *   ② `run_events_run_end_key`（部分唯一索引）建在 `run_id` 上，对这条**按会话扫**的查询
- *      帮不上忙，它只保证「每 run 至多一行 ⇒ 候选数天然有界」这一件事。
+ * 成本：**每次响应最多一条**（不是每 run 一枪）；非空页的扫描范围被 `[pageLow, before)` 夹住，
+ * 空页是 `[0, before)` 那一段（访问路径不止一条，见下面 LOW-1：planner 按统计选）。此前那条
+ * 「同一次响应里只允许一条 `runs` 查询」的成本红线不变（发现的是 `run_events`，候选 id 仍并进
+ * `loadWindowRuns` 那**一条** runs 查询）。
+ * ⚠ 成本的两条事实（二次审计 LOW-1 + 一次性真库自证，逐字同 §4.4a-2 成本段）：
+ *   ① `LIMIT` 封的是**返回条数**，不是**过滤 / 排序前的行数**——`type = 'run_end'` 是残余过滤；
+ *   ② planner 有**两条路**、按统计选：`UNIQUE (session_id, seq)` **反向扫**（扫页窗口内的事件行），
+ *      或 `run_events_run_end_key`（部分唯一 `WHERE type='run_end'`）**+ Top-N 排序**（扫这一形状
+ *      的 `run_end` 行，与 seq 窗口无关）。⇒ 「一定走倒序扫」与「`run_end_key` 帮不上忙」两句
+ *      **各说对一半**，两句都别当承诺（实测读数在 §4.4a-2 与台账 §8.130 的返修小节）。
  */
 async function discoverTerminalRuns(pool, sessionId, { pageLow = 0, before = null, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
   const params = [sessionId, pageLow];

@@ -1325,8 +1325,10 @@ station-portal user enable  --login <login>
 - **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑） / **`persistence_error`**（#371-A：引擎落盘失败告警，走 `diagnostics.error` 而**不是** `onEvent`——本站此前没传 `diagnostics`，真机全库该类型 **0 行**，非致命降级因此彻底隐形；前端只把 `fatal === false` 刷成中性分隔行，致命那条仍由 `run_end` 的 `persistence_failed` 负责）；**第 18~21 类（issue #421）**`compaction_strategy_fallback` / `persistence_capability_degraded` / `resume_journal_skipped`（`model_metadata_missing` 早在 #182 时就已列入）——引擎承诺、本站以前订不到那一族，不进则又是「实时没有、刷新后也没有」；而 **`run_outcome`（第 22 类）是写明了理由的显式不进**（与 `run_end` 重叠且无读者，对账测：`portal/test/event-surface-contract.test.js`）；**第 28 类 `host_steer_injected`（erix-agent 0.32.0 唯一新增的 LoopEvent，#499）同样显式不进**——本站不传 `capabilities.hooks.nextUserTurn` ⇒ 结构上不产生该事件，订得到（水位线推进）但不刷行、不回放、不下发（理由同 `run_outcome`，钉在同一份对账测的豁免表，只加前端 `EVENT_TYPES` 不写决定会被它的 S2 判红）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `tool_call_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。**#502 的补充**：三个碎片型自本单起**根本不落库**，「不下发」对它们是双重成立（表里没有 + 白名单不列）；`tool_call_delta` 是本单唯一**从白名单里摘掉**的类型（它以前在，摘它的理由是「行没了」，成形参数在 `tool_use.input`），摘除理由必须写——前端 `HISTORY_REPLAY_TYPES` 与它逐项对齐，由 `portal/test/event-surface-contract.test.js` 对账。**#425 的消费侧补充（零后端变更）**：白名单里的 `round_end` 载荷带 `usage`（本 run 累计真值），前端动量状态机**只**吃它的 `usage` 与 `context_window` 两个展示量（并把登记的 run 直接标成已结束），其余字段与所有其它历史帧仍一律不驱动运行态 ⇒ 硬刷新后「上次 run 用了多少 token / 窗口多大」仍在，而轮号、时长、速率、相位照旧不重建。
 - **分页**（§1.3 keyset）：默认取最新 `limit` 条（升序返回，`limit` 默认 500、上限 2000）；`before=<seq>` 取更早一批；`next_cursor` 非 null 表示还有更早批次。
   - **线上只有一个游标字段**：`next_cursor`。后端内部那个 `hasOlder`（主窗口多取一行算出来的）**不上线**；
-    `has_old_events` 这个名字在本仓**任何一处都不存在**（现查 `grep -rn "has_old_events" portal/ runner/ docs/`
-    为空）⇒ 客户端要续页只能靠 `next_cursor`，没有第三个字段可猜（issue #514 返修时现验过）。
+    `has_old_events` / `hasOldEvents` 这个名字在**代码里一处都没有**（现查 2026-11-16：
+    `grep -rn "has_old_events\|hasOldEvents" portal/src portal/frontend/src runner` ⇒ **0 处**；本节与台账
+    里出现该词只是**在说它不存在**）⇒ 客户端要续页只能靠 `next_cursor`，没有第三个字段可猜
+    （issue #514 返修时现验，别照着「大概有个 has_old_events」的记忆改客户端）。
   - **`next_cursor` 的三种来源**（issue #514 返修，二次审计第 1 条；实现在 `http.js#handleSessionEventsHistory`）：
 
     | 本页状态 | 游标取自 | 为什么 |
@@ -1512,16 +1514,29 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
    ORDER BY seq DESC LIMIT $4                                 -- $4 = limit + 1（多取一行探针）
   ```
 
-  每次响应**至多一条**，走既有 `UNIQUE (session_id, seq)` 倒序扫，非空页的窗口被 `[pageLow, before)` 夹住。
-  **准确的算术（二次审计 LOW-1，别再被读成「扫过的行数 = 1」）**：
+  每次响应**至多一条**；非空页的窗口被 `[pageLow, before)` 夹住，空页是 `[0, before)` 那一段。
+  **准确的算术（二次审计 LOW-1 + 一次性真库自证，别再被读成「扫过的行数 = 1」）**：
   - 未缓存时一次 history 响应最坏 **6 条查询** = handler 5 条（① 会话归属 `chat_sessions`、② 主窗口
     `run_events`、③ 本条候选发现、④ `runs` 批量投影、⑤ `partial_output` 的正文投影）+ 会话鉴权 1 条。
     #514 之前是 5 条，本单**多出的就是 ③ 这一条**；③ 的候选 id 并进 ④（不为它另打一条 `runs`）。
-  - `LIMIT` 封的是**返回条数**，不是**扫过的索引条目数**：`type = 'run_end'` 是残余过滤，索引只按
-    `(session_id, seq)` 排序 ⇒ 一个会话里 `run_end` 越稀，取满 `limit` 条要扫的行越多（页边界把非空页的
-    扫描区间夹住，空页是 `[0, before)` 那一段）。
-  - `run_events_run_end_key`（部分唯一索引）建在 `run_id` 上，对这条**按会话扫**的查询**帮不上忙**；
-    它只保证「每 run 至多一行 `run_end` ⇒ 候选数天然有界」这一件事。
+  - `LIMIT` 封的是**返回条数**，不是**排序 / 过滤前的行数**。③ 在执行计划里有**两条访问路径**，
+    planner 按统计选（现查读数见下），两条都带残余过滤 `type = 'run_end'`：
+    | 路径 | 什么时候被选中 | 扫的量 |
+    |---|---|---|
+    | `run_events_session_id_seq_key`（`UNIQUE (session_id, seq)`）**反向扫** | `run_end` 相对 `limit` 较密、或页窗口很窄 | 本页窗口内的**事件行数**（取满 `LIMIT` 即停 ⇒ 扫描量 ≥ 返回条数） |
+    | `run_events_run_end_key`（部分唯一 `WHERE type='run_end'`）+ **Top-N 排序** | `run_end` 稀疏（部分索引命中面远小于会话总行数） | 全库/该会话的 **`run_end` 行数**（与主窗口的 seq 窗口**无关**），随后 `Sort Method: top-N heapsort` 取前 `limit + 1` |
+  - ⇒ 两侧各说对一半：**既有文档**那句「走 `UNIQUE (session_id, seq)` 倒序扫」只是其中一条路；审计
+    LOW-1 那句「`run_events_run_end_key` 在 `run_id` 上帮不上这条查询」也只是另一条——**它在稀疏时
+    恰恰是 planner 选中的那条**（它同时保证「每 run 至多一行 ⇒ 候选数有界」）。别把任一句当承诺。
+  - **真库读数**（2026-11-16，一次性容器 `postgres:16` / 16.15，形状照 `docs/data/schema.sql:355-372`
+    现建，**不是** dev 库、**不是** migrations 全量 ⇒ 它证明的是「计划长这样、这两条路真的会出现」，
+    不是「dev 库此刻就走这条」）：全库 255,005 行、目标会话 55,005 行、目标会话 `run_end` 4 条时，
+    `… AND seq >= 0 ORDER BY seq DESC LIMIT 3` ⇒ `Bitmap Index Scan on run_events_run_end_key`
+    + `top-N`（`Execution Time: 0.03 ms`）；把该会话 `run_end` 灌到 5,004 条、`LIMIT 501` ⇒
+    `Sort Method: top-N heapsort Memory: 95kB`、`rows=5004 → 501`、`Execution Time: 2.6 ms`；
+    同一时刻再跑 `LIMIT 3` ⇒ 计划**改走** `Index Scan Backward using run_events_session_id_seq_key`
+    + `Filter: (type = 'run_end')`。**结论与代码无关、只与文档有关**：这条查询的成本上界是
+    「该会话的 `run_end` 行数」或「页窗口内的事件行数」取较小者，两者都不受 `LIMIT` 约束。
   - 把 ③ 并进 ② 的 `UNION ALL` 一条路（省掉这一条、并顺手消掉下面残余 ②）需要 fake 能解析 UNION，
     本单不做，登记为后续单。
 - **尾巴页（游标之下零白名单行）的窗口与重叠**（#514 返修，二次审计第 3 条）：那种页的候选发现窗口是

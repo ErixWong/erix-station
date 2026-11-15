@@ -5496,7 +5496,7 @@ AND seq >= $ [AND seq < $] ORDER BY seq DESC LIMIT $`），走既有 `UNIQUE (se
 
 | 面 | 现查坐标 | 语义 |
 |---|---|---|
-| 线上游标字段 | `http.js#handleSessionEventsHistory` 的响应只有 `{events, next_cursor}` | `hasOlder` 是**后端内部变量**，不上线；`has_old_events` 这个名字本仓**不存在**（`grep -rn has_old_events portal/ runner/ docs/` 为空）⇒ 客户端只能靠 `next_cursor` |
+| 线上游标字段 | `http.js#handleSessionEventsHistory` 的响应只有 `{events, next_cursor}` | `hasOlder` 是**后端内部变量**，不上线；`has_old_events` / `hasOldEvents` 在**代码里 0 处**（`grep -rn "has_old_events\|hasOldEvents" portal/src portal/frontend/src runner` ⇒ 空；文档里出现该词只是在说它不存在）⇒ 客户端只能靠 `next_cursor` |
 | 消息游标 | `workbench.ts:1106` → `olderMessagesCursor`（声明 `343`）；入口闸 `1129-1130`；按钮 `v-if` 在 `StreamPanel.vue:441` | 决定「**还要不要继续翻**」——翻页循环的**触发条件**是它，不是事件游标 |
 | 事件游标 | `workbench.ts:1107` → `olderEventsCursor`（声明 `344`）；消费在 `1137-1140` 拼 `?before=`，回写 `1145` | 决定「**更早的事件页从哪里开始**」⇒ **本单改的就是这一个** |
 | 续页条件是否落空 | `sessions.js:607-612`：每次 `POST /messages` 先写一行 `messages`（`role='user'`）再入队 run | 尾巴上每条被取消的 run 都**配一行 user 锚点** ⇒ 那一段消息游标仍非 null ⇒ 客户端会继续翻 ⇒ 事件游标真的会被消费（「只改游标让续页条件落空 = 没修」这条红线靠这一格落地） |
@@ -5557,6 +5557,25 @@ AND seq >= $ [AND seq < $] ORDER BY seq DESC LIMIT $`），走既有 `UNIQUE (se
 `termination:<run_id>` / `partial:<run_id>` 幂等键兜住（现读坐标见 §4.4a-2）；
 ④ 客户端续页的**触发闸是消息游标**（`workbench.ts:1129-1130`），不在本端点手里：若某段尾巴
 连 user 锚点都没有（纯宿主注入，本站现无此路径），事件游标再好也不会被消费——那是前端那一面，
-本单不动，写清楚为止；⑤ **真库证据**：本单仍只在 fake 上自证（fake 现按 SQL 文本真算那条发现
-查询，含探针行与 `LIMIT`），`seq` 边界与游标推进的读数是**行为级**（走真 HTTP 端点 + fake 池），
-但**真库执行计划**未测。
+本单不动，写清楚为止；⑤ 游标推进与 `seq` 边界的读数是**行为级**（走真 HTTP 端点 + fake 池，fake 现按 SQL 文本真算
+那条发现查询，含探针行与 `LIMIT`）；**真库**那一侧只做了下面的执行计划自证，**没有**真库端到端
+用例（本仓 history 端点从来没有真库集成用例，本单不开这个头，留给 `UNION ALL` 那个后续单）。
+
+**一次性真库自证（工单第 6 条，可选项，做了）**：为「`ORDER BY seq DESC LIMIT` 这条查询到底扫多少」
+起一个**一次性的** `postgres:16`（16.15）容器（`pg514-exec`，用完即删，**dev 库与 `station-*` 一个字节
+都没碰**），形状照 `docs/data/schema.sql:355-372` 现建 `run_events` 与它的三个索引/约束
+（**不是** migrations 全量、**不是** dev 库 ⇒ 它证明的是「计划真的会长成这样」，不是「dev 库此刻走哪条」）：
+
+| 格子 | 读数 |
+|---|---|
+| 全库 255,005 行 / 目标会话 55,005 行 / 该会话 `run_end` **4 条**；`… seq >= 0 ORDER BY seq DESC LIMIT 3` | `Bitmap Index Scan on run_events_run_end_key`（`Recheck Cond: type='run_end'`）+ `Limit rows=3`，`Execution Time: 0.03 ms` |
+| 同一会话 `run_end` 灌到 **5,004 条**；`LIMIT 501` | `Bitmap Index Scan on run_events_run_end_key` → `Sort Method: top-N heapsort Memory: 95kB`，`rows=5004 → 501`，`Execution Time: 2.6 ms` |
+| 同一时刻同一张表改回 `LIMIT 3` | 计划**换路**：`Index Scan Backward using run_events_session_id_seq_key`（`Index Cond: session_id=… AND seq >= 0`）+ `Filter: (type = 'run_end')` |
+| 非空页那一枪（`seq >= 150000 AND seq < 200000`） | 同一条部分唯一索引路径，`Rows Removed by Filter: 4` ⇒ 页边界夹的是**谓词**，不是「只碰本页的行」 |
+
+**这组读数推翻了两处各说对一半的说法**（都已在文档里改口）：① 上一版 §4.4a-2 与本文件里那句
+「走既有 `UNIQUE (session_id, seq)` 倒序扫」——只是**两条路里的一条**；② 审计 LOW-1 那句
+「`run_events_run_end_key` 在 `run_id` 上，对这条查询**帮不上忙**」——`run_end` 稀疏时它**恰恰是
+planner 选中的那条**（代价是它扫的是这一形状的 `run_end` 行、与 seq 窗口无关，所以还要配一次
+Top-N 排序）。两句都改成「planner 按统计二选一，两句都别当承诺」，并留了这张读数表做锚。
+**审计 LOW-1 成立的部分**：`LIMIT` 封的确实只是返回条数——两条路径的过滤 / 排序都在 `LIMIT` **之前**。
