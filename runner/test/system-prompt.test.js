@@ -48,6 +48,32 @@ function linesMentioning(prompt, needle) {
   return prompt.split('\n').filter((line) => line.includes(needle));
 }
 
+/**
+ * 讲「家目录里那两个平台文件怎么读」的那几句（#259 的作用域）。
+ * ⚠ 反向断言必须收窄到这里：全文查「看不见」一类会打到「用户看不见你的内部动作」（#425 的正常
+ * 句子），而「家目录」只在这几句里出现（现查：grep -c 家目录 于提示词 = 3 行）。
+ */
+function homeReadLines(prompt) {
+  return prompt.split('\n').filter((line) => /家目录|~\/AGENTS\.md|~\/\.erix/.test(line));
+}
+
+/** 切句（正向断言要锚**整句意**，只锚短语会被同位置的否定式骗过去）。 */
+function sentences(text) {
+  return text.split(/[\n。；;]/).map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * 「家目录用文件工具**读不了**」这一族语义相反的说法（261116 返工，审计 LOW-2 实测：旧反向断言
+ * 只禁了固定短语，把提示词改成「直接用文件工具读不了」 16/16 仍然 rc=0）。
+ */
+const HOME_READ_DENIED = Object.freeze([
+  /读不/, /看不见/, /无法[\s\S]{0,8}?读/, /不能[\s\S]{0,8}?读/, /读不进/, /用不上文件工具/,
+  /够不到/, /到不了/, /找不到/, /读不完/,
+]);
+
+/** 「能用文件工具读」的两种可接受写法（要么「(直接)用文件工具读」后面不许紧跟否定，要么明写「读得到」）。 */
+const HOME_READ_CAN = /(?:直接用|用)[*＊\s]*文件工具[*＊\s]*读(?!不)|(?:文件工具|readFile)[^。\n]{0,12}读得到/;
+
 async function withRegisteredFileTools(fn) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-prompt-test-')));
   try {
@@ -231,7 +257,17 @@ test('SYSTEM_PROMPT 明确告知「平台约定已随本次 run 注入」，并�
   assert.match(section, /不会立刻生效/, '必须写明本 run 内改约定文件不立刻生效（否则模型会以为改完就生效）');
   // ⚠ **#259 已落地**：家目录是 jail 的只读例外 ⇒ 手段从 shell `cat` 换成 `readFile`（等强度换向，
   //   不是放宽：仍然必须写明「怎么读到它」，只是不再教模型绕平台的缺口）。两个路径都要给到。
-  assert.match(section, /直接用文件工具读/, '家目录平台文件的读取手段必须写清是文件工具（#259）');
+  // ⚠ 261116 返工（审计 LOW-2）：旧断言只锚 `/直接用文件工具读/` 这个**短语**，把文案改成
+  //   「直接用文件工具**读不了**」（语义完全相反）它照样绿 ⇒ 正向必须锚**整句意**：
+  //   「家目录 + 文件工具/readFile + 能读」三要素同一句，且那句话自己不得是否定式。
+  const canReadSentence = sentences(section).find((s) => /家目录|~\/AGENTS\.md|~\/\.erix/.test(s)
+    && /(文件工具|readFile)/.test(s)
+    && HOME_READ_CAN.test(s));
+  assert.ok(canReadSentence,
+    '必须有一句同时说清「家目录 + 用文件工具/readFile + 读得到」三个要素（只出现工具名不算——'
+    + `261116 审计：反向措辞能骗过只锁短语的旧断言）。实际段内句子：${sentences(section).join(' / ')}`);
+  assert.ok(homeReadLines(prompt).some((line) => /(?:家目录|只读例外)[^\n]*读得到/.test(line)),
+    '「能读」这个断言必须与「家目录 / 只读例外」同句出现（正向锚整句意，不是只钉一个工具名）');
   assert.ok(linesMentioning(section, '~/.erix/ports.json').some((line) => /readFile/.test(line)),
     'ports.json 的读取手段不得在改版时丢掉（它是动态清单，不注入）——#259 起必须是 readFile');
   assert.ok(linesMentioning(section, '~/AGENTS.md').some((line) => /readFile/.test(line)),
@@ -252,7 +288,18 @@ test('#259 反向防漂移：提示词不再声称「家目录用文件工具读
   for (const dead of [/文件工具读不到/, /读不到它/, /用 shell 读：`cat ~\/(\.erix\/ports\.json|AGENTS\.md)`/]) {
     assert.doesNotMatch(prompt, dead, `提示词里还残留家目录读不到的旧口径（/${dead.source}/）——#259 之后它是谎`);
   }
-  // ② 家目录的读取手段必须是文件工具，且与 shell 不再同句出现（否则等于又给模型留了一条绕路）
+  // ② 261116 返工（审计 LOW-2）：只禁两个固定短语，**语义相反**的改写看不见（实测「直接用文件工具
+  //   读不了」全绿）。所以反向要扩到一族，并且**作用域收在讲家目录读法的那几句**（全文查「看不见」
+  //   会打到 #425「用户看不见你的内部动作」，那是止常句子）。
+  const scoped = homeReadLines(prompt);
+  assert.ok(scoped.length > 0, '提示词里必须还有讲家目录读法的句子（否则下面的反向断言是空转）');
+  for (const line of scoped) {
+    for (const dead of HOME_READ_DENIED) {
+      assert.doesNotMatch(line, dead,
+        `家目录读法的句子里出现了「读不了」一族（/${dead.source}/）——#259 之后它是谎，而且会教模型去绕一个不存在的缺：${line}`);
+    }
+  }
+  // ③ 家目录的读取手段必须是文件工具，且与 shell 不再同句出现（否则等于又给模型留了一条绕路）
   const homeLines = linesMentioning(prompt, '~/.erix/ports.json').filter((line) => /读/.test(line));
   assert.ok(homeLines.length > 0, '提示词必须告诉模型 ports.json 怎么读');
   assert.ok(homeLines.some((line) => /readFile/.test(line)), `必须给 readFile 这条路，实际：${homeLines.join(' / ')}`);
