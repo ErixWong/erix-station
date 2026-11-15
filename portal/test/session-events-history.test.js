@@ -87,6 +87,28 @@ class EventsHistoryPool extends FakePool {
         })),
       };
     }
+    // issue #514：**候选发现**的那条查询（页内的终态行只用来发现 run id，不作为回放事件下发）：
+    //   SELECT run_id FROM run_events
+    //    WHERE session_id = $1 AND type = 'run_end' AND seq >= $2 [AND seq < $n]
+    //    ORDER BY seq DESC LIMIT $k
+    // ⚠ 必须排在下面的「主窗口」分支之前（主窗口也含 FROM run_events）。
+    // 照 SQL 文本真算（AGENTS §8.14）：产品代码撤掉 `seq >= $2` 这道页界，fake 就不夹下界；撤掉
+    // ORDER BY 就拿插入序 —— 都不好心兼平，否则「分隔条在旧页重演」那格是假绿。
+    if (flat.includes('SELECT run_id FROM run_events')) {
+      const sessionId = params[0];
+      const lowMatch = flat.match(/seq >= \$(\d+)/);
+      const low = lowMatch ? params[Number(lowMatch[1]) - 1] : null;
+      const beforeMatch = flat.match(/seq < \$(\d+)/);
+      const upper = beforeMatch ? params[Number(beforeMatch[1]) - 1] : null;
+      const limitMatch = flat.match(/LIMIT \$(\d+)/);
+      const cap = limitMatch ? params[Number(limitMatch[1]) - 1] : null;
+      let rows = this.runEvents.filter((e) => e.session_id === sessionId && e.type === 'run_end');
+      if (low != null) rows = rows.filter((e) => e.seq >= low);
+      if (upper != null) rows = rows.filter((e) => e.seq < upper);
+      if (/ORDER BY seq DESC/.test(flat)) rows = rows.slice().sort((a, b) => b.seq - a.seq);
+      if (cap != null) rows = rows.slice(0, cap);
+      return { rows: rows.map((e) => ({ run_id: e.run_id })) };
+    }
     if (sql.includes('FROM run_events')) {
       const sessionId = params[0];
       const types = params[1]; // ANY($2) 数组
@@ -571,6 +593,181 @@ test('#236 终态项不占 limit、不改 next_cursor（分页字段仍只由白
     assert.equal(body.next_cursor, 3, 'next_cursor 仍只由白名单真实事件决定');
     assert.equal(terminationsOf(body).length, 1, '终态项照常下发（seq=5 落在窗口外也照发：MAX(seq) 是整 run 口径）');
     assert.equal(terminationsOf(body)[0].seq, 5);
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// issue #514：**「queued 从未开始就被取消」的 run 只写一行 `run_end`**（sessions.js 的 killedQueued
+// 分支），而 `run_end` 不在下发白名单（红线，它驱动前端运行态状态机）⇒ 这条 run 在白名单行里
+// **零影子**：旧实现的候选集只来自 `distinctWindowRunIds(白名单行)`，于是它永远进不了候选 ⇒
+// 既没有 `run_termination` 分隔条、也没有 `partial_output` 占位项 ⇒ 刷新后正文区**完全空白**
+// （连「它存在过、并且已经终态」都看不出来）。
+// 修法（工单候选 ①）：把**页内**的 `run_end` 行纳入**候选发现**——只发现 run id，那一行本身
+// 仍不作为回放事件下发；后面的终态投影与占位全部复用 #236/#300/#502 的既有通路。
+// ---------------------------------------------------------------------------
+const partialsOf = (body) => body.events.filter((e) => e.type === 'partial_output');
+const runEndsOf = (body) => body.events.filter((e) => e.type === 'run_end');
+const KILLED = { reason: 'aborted', detail: 'cancelled_before_start' };
+const discoveryQueries = (pool) => pool.sqlLog
+  .filter((sql) => /SELECT run_id FROM run_events/.test(sql.replace(/\s+/g, ' ')));
+
+/** 种一次「从未开始就被取消」：库里只有那一行 `run_end`（载荷形状照 sessions.js 的 killedQueued）。 */
+function seedKilledQueuedRun(pool, runId, seq, termination = KILLED) {
+  pool.seed({
+    ...ev(seq, 'run_end', { termination, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: 1 }),
+    run_id: runId,
+  });
+  pool.seedRun(runId, 'finished', termination);
+  return pool;
+}
+
+test('#514 判据①：本页零白名单行 + 页内只有 run_end ⇒ 恰一条 run_termination（aborted / cancelled_before_start）', async () => {
+  const s = await startServer();
+  try {
+    seedKilledQueuedRun(s.pool, 'r-killed', 7);
+    const body = await historyOf(s);
+    assert.deepEqual(terminationsOf(body), [{
+      seq: 7, // = 该 run 的唯一一行（run_end）的 seq ⇒ 分隔条落在它该在的位置
+      run_id: 'r-killed',
+      type: 'run_termination',
+      payload: { status: 'finished', termination: { reason: 'aborted', detail: 'cancelled_before_start' } },
+    }], '从未开始就被取消的 run，刷新后必须留一条终态分隔条（旧实现这里返回空 ⇒ 正文区全空白）');
+    assert.deepEqual(runEndsOf(body), [],
+      '红线：run_end 只参与候选发现，绝不下发（它会驱动前端运行态状态机，#217/#236）');
+    assert.equal(body.next_cursor, null);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#514 判据②：同一格 ⇒ 正文区不空白 —— 恰一条 partial_output 占位项（text 空 + placeholder:true）', async () => {
+  const s = await startServer();
+  try {
+    seedKilledQueuedRun(s.pool, 'r-killed', 7);
+    const body = await historyOf(s);
+    assert.deepEqual(partialsOf(body), [{
+      seq: 7,
+      run_id: 'r-killed',
+      type: 'partial_output',
+      payload: { text: '', chunks: 0, truncated: false, placeholder: true, source: 'none' },
+    }], '无锚点 + 两处 durable 正文都没有 ⇒ 一行中性提示（#278「不许留空白」，前端 StreamPanel 的 v-if="en.placeholder"）');
+    assert.deepEqual(body.events.map((e) => [e.seq, e.type]), [[7, 'partial_output'], [7, 'run_termination']],
+      '正文区一个字节都不许多于这两条：占位在终态分隔条之前（同 seq 的稳定序）');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#514 候选发现不止补空页：页里有别的 run 的白名单行时，只写 run_end 的那条同样要有分隔条', async () => {
+  const s = await startServer();
+  try {
+    // r-a：正常跑完并有白名单行；r-killed：从未开始就被取消（库里只有 run_end，seq 更大 = 更新）
+    s.pool.seed({ ...ev(1, 'round_start', { round: 1 }), run_id: 'r-a' });
+    s.pool.seed({ ...ev(2, 'round_start', { round: 2 }), run_id: 'r-a' });
+    s.pool.seed({ ...ev(3, 'run_end', { termination: { reason: 'end_turn' } }), run_id: 'r-a' });
+    s.pool.seedRun('r-a', 'finished', { reason: 'end_turn' });
+    seedKilledQueuedRun(s.pool, 'r-killed', 9);
+
+    const body = await historyOf(s);
+    assert.deepEqual(
+      terminationsOf(body).map((t) => [t.seq, t.run_id, t.payload.termination.reason]),
+      [[3, 'r-a', 'end_turn'], [9, 'r-killed', 'aborted']],
+      '「会话里有历史内容」不是把这次取消吞掉的理 —— 候选发现不能只在空页时兜底（工单候选 ② 的形状）',
+    );
+    assert.equal(terminationsOf(body)[1].payload.termination.detail, 'cancelled_before_start');
+    assert.deepEqual(runEndsOf(body), [], '红线同上一条');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#514 页界：发现查询被「本页最小 seq」与 before 夹住 ⇒ 同一根分隔条不在每一页重演一次（M-6④ 同形）', async () => {
+  const s = await startServer();
+  try {
+    s.pool.seed({ ...ev(10, 'round_start', { round: 1 }), run_id: 'r-old' });
+    s.pool.seed({ ...ev(11, 'round_start', { round: 2 }), run_id: 'r-old' });
+    s.pool.seed({ ...ev(12, 'run_end', { termination: { reason: 'end_turn' } }), run_id: 'r-old' });
+    s.pool.seedRun('r-old', 'finished', { reason: 'end_turn' });
+    seedKilledQueuedRun(s.pool, 'r-killed', 5); // 更老的、只写 run_end 的那条
+
+    const p1 = await historyOf(s, '?limit=1'); // 最新一条白名单行（seq 11）⇒ 本页下界 11
+    assert.deepEqual(terminationsOf(p1).map((t) => [t.seq, t.run_id]), [[12, 'r-old']]);
+    assert.equal(p1.next_cursor, 11);
+
+    const p2 = await historyOf(s, '?limit=1&before=11'); // 白名单行 seq 10 ⇒ 本页下界 10
+    assert.deepEqual(terminationsOf(p2).map((t) => [t.seq, t.run_id]), [],
+      'run_end 在 seq 5 < 本页下界 10 ⇒ 它属于更老的那一页，这页不许再放一次');
+
+    const p3 = await historyOf(s, '?limit=1&before=10'); // 白名单行空 ⇒ 尾巴页：下界 0、上界 10
+    assert.deepEqual(terminationsOf(p3).map((t) => [t.seq, t.run_id]), [[5, 'r-killed']],
+      '它最终仍要出现一次（不是被页界挤没了）');
+    assert.equal(p3.next_cursor, null, '空页 ⇒ 分页到头');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#514 成本：发现查询每次响应至多一条、被页边界与 LIMIT 夹住；runs 查询仍恰好一条', async () => {
+  const s = await startServer();
+  try {
+    s.pool.seed({ ...ev(1, 'round_start', { round: 1 }), run_id: 'r-a' });
+    s.pool.seedRun('r-a', 'finished', { reason: 'end_turn' });
+    seedKilledQueuedRun(s.pool, 'r-killed-1', 2);
+    seedKilledQueuedRun(s.pool, 'r-killed-2', 3);
+
+    s.pool.sqlLog.length = 0;
+    const body = await historyOf(s);
+    assert.equal(terminationsOf(body).length, 3, '三条终态 run 都要有分隔条（两条是只写 run_end 的）');
+    const disc = discoveryQueries(s.pool);
+    assert.equal(disc.length, 1, `一次响应至多一条发现查询：\n${disc.join('\n')}`);
+    assert.match(disc[0], /seq >= \$\d+/, '页下界必须写在 SQL 里（否则旧页的分隔条会在每一页重演）');
+    assert.match(disc[0], /LIMIT \$\d+/, '候选数必须被页大小夹住');
+    assert.equal(runsQueries(s.pool).length, 1,
+      `发现出来的 id 要并进既有那条批量 runs 查询，不许为它再打第二条：\n${runsQueries(s.pool).join('\n')}`);
+  } finally {
+    await s.close();
+  }
+});
+
+// 红线闸（源码钉）：把 run_end 塞进任一个集合，本文件的运行时用例**也会**红，但那条红说的是
+// 「这一格返回了什么」；这条钉的是「集合里到底有没有它」——两者不是同一件事（后者在
+// 有人「顺手加白名单图省事」时给出直白的名字与位置）。
+test('#514 红线：run_end 既不在后端下发白名单，也不在前端回放集合（它驱动运行态状态机，#217/#236）', () => {
+  const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+  const http = strip(fs.readFileSync(new URL('../src/http.js', import.meta.url), 'utf8'));
+  const backend = http.match(/const HISTORY_EVENT_TYPES = new Set\(\[([\s\S]*?)\]\);/);
+  assert.ok(backend, '锚点：后端下发白名单的字面量还在');
+  assert.ok(!backend[1].includes("'run_end'"), 'run_end 进后端白名单 = 刷新时把运行态事件回放给前端');
+  const fe = strip(fs.readFileSync(new URL('../frontend/src/composables/useEventStream.ts', import.meta.url), 'utf8'));
+  const replay = fe.match(/const HISTORY_REPLAY_TYPES = new Set\(\[([\s\S]*?)\]\);/);
+  assert.ok(replay, '锚点：前端回放集合的字面量还在');
+  assert.ok(!replay[1].includes("'run_end'"), '前端回放集合里出现 run_end = 拿历史帧驱动停止按钮 / 终态状态机');
+});
+
+test('#514 发现查询的上界（before）承重：不夹上界就会被更新的终态行挤掉 LIMIT ⇒ 这条 run 在每一页都露不了面', async () => {
+  const s = await startServer();
+  try {
+    // r-a 的白名单行在 200 / 210，它自己的 run_end 在 215；r-killed 只有 run_end 在 205。
+    s.pool.seed({ ...ev(200, 'round_start', { round: 1 }), run_id: 'r-a' });
+    s.pool.seed({ ...ev(210, 'round_start', { round: 2 }), run_id: 'r-a' });
+    s.pool.seed({ ...ev(215, 'run_end', { termination: { reason: 'end_turn' } }), run_id: 'r-a' });
+    s.pool.seedRun('r-a', 'finished', { reason: 'end_turn' });
+    seedKilledQueuedRun(s.pool, 'r-killed', 205);
+
+    const p1 = await historyOf(s, '?limit=1'); // 页 [210, ∞) ⇒ 下界 210
+    assert.deepEqual(terminationsOf(p1).map((t) => [t.seq, t.run_id]), [[215, 'r-a']]);
+    assert.equal(p1.next_cursor, 210);
+
+    // 页 [200, 210)：本页自己的终态行是 seq 205 那条。若发现查询不夹上界，`ORDER BY seq DESC LIMIT 1`
+    // 会先取到 215（属于更新的那一页），随后被 M-6④ 的 `seq < before` 拦掉 ⇒ 本页什么都不剩，
+    // 而 205 那条也在更新的那一页被页下界拦住 ⇒ **它在哪一页都不出现**（工单说的「看不见」）。
+    const p2 = await historyOf(s, '?limit=1&before=210');
+    assert.deepEqual(terminationsOf(p2).map((t) => [t.seq, t.run_id, t.payload.termination.detail]),
+      [[205, 'r-killed', 'cancelled_before_start']]);
+    assert.deepEqual(partialsOf(p2).map((p) => [p.seq, p.run_id, p.payload.placeholder]), [[205, 'r-killed', true]],
+      '这一页同样不许空白');
   } finally {
     await s.close();
   }

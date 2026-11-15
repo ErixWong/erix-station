@@ -2900,7 +2900,14 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
   // issue #300 / #236：零候选 ⇒ 零额外查询（无 run ⇒ 连终态查询都不发）。
   // `next_cursor` / `hasOlder` 在上面已由**真实事件**算完，合成项不参与。
   // `before` 要传下去（#502 M-6④）：合成项只许出现在它自己 seq 所属的那一页。
-  const synth = await buildHistorySynthItems(ctx.pool, rows, { before });
+  // issue #514：`pageLow` = 本页最小的真实事件 seq（空页 ⇒ 0 = 不设下界），它是**候选发现的页界**；
+  // `sessionId` 给发现查询用（那条查询按会话查 `run_end` 行，不像主窗口那样从行里带出 run_id）。
+  const synth = await buildHistorySynthItems(ctx.pool, rows, {
+    before,
+    sessionId,
+    pageLow: rows.length > 0 ? Number(rows[0].seq) : 0,
+    limit,
+  });
   return sendJson(res, 200, {
     events: mergeSynthItemsBySeq(events, synth),
     next_cursor: hasOlder && rows.length > 0 ? Number(rows[0].seq) : null,
@@ -2918,16 +2925,29 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
  * 与 #300 的 `partial_output` 同一种存在方式）。
  *
  * 判据（缺一不合成，**一条 run 至多一条**）：
- *   ① 该 run 出现在本次响应窗口里（`distinctWindowRunIds`）；
+ *   ① 该 run 是**本页的候选**：本页白名单行里出现过它（`distinctWindowRunIds`），**或**本页 seq 窗口内
+ *     有它的 `run_end` 行（issue #514 补的那半：只写一行 `run_end` 的 run 在白名单行里零影子）；
  *   ② `runs.status IN ('finished','failed')`（`queued`/`running`/`cancelling` 一律不合成）；
  *   ③ `termination.reason` 是**非空字符串**（缺 termination / 脏载荷 ⇒ 不合成：不拿 status 编一个 reason）。
+ *
+ * ⚠ ① 的两路**都只发现 run id**：白名单行照旧下发，`run_end` 行照旧**不下发**（红线，#217/#236）。
+ *
  *
  * `seq` = 该 run 在 `run_events` 里的**最大 seq**（不新分配）：`run_end` 行本来就在表里 ⇒ 分隔条天然落在
  * 本次 run 内容之后，且分页窗口外的行也拿得到（`MAX(seq)` 不受 `before` 限制）。
  */
-async function buildHistorySynthItems(pool, windowRows, { before = null } = {}) {
-  const runIds = distinctWindowRunIds(windowRows);
-  if (runIds.length === 0) return []; // 成本红线：窗口无 run ⇒ 整段跳过，一条查询都不许多发
+async function buildHistorySynthItems(pool, windowRows, { before = null, sessionId = null, pageLow = 0, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
+  const windowRunIds = distinctWindowRunIds(windowRows);
+  // issue #514：**候选发现不能只认白名单行**。`stopSession` 的 killedQueued 分支（queued 从未开始
+  // 就被取消）这次 run 只写**一行** `run_end`，而它不在下发白名单（红线）⇒ 这个 run 在白名单行里
+  // **一个影子都没有** ⇒ 旧代码把它整个漏掉：既没有 `run_termination` 分隔条，也没有占位项，
+  // 刷新后正文区完全空白。这里用页内的 `run_end` 行**发现 run id**（只是多一个候选 id，
+  // 那一行本身仍不作为回放事件下发），后面的投影完全复用既有通路。
+  const discoveredIds = sessionId == null
+    ? []
+    : await discoverTerminalRunIds(pool, sessionId, { pageLow, before, limit });
+  const runIds = [...new Set([...windowRunIds, ...discoveredIds])];
+  if (runIds.length === 0) return []; // 成本红线：窗口无 run 且页内无终态行 ⇒ 整段跳过，一条 runs 查询都不许多发
   // 一条 runs 查询同时服务 partial_output 的候选判定与 run_termination 的终态投影（不许打第二条）。
   const runRows = await loadWindowRuns(pool, runIds);
   // 候选 = 终态且**无 assistant 锚点**的 run（有锚点 ⇒ 正文已在 `messages`/transcript 那条路上，
@@ -2943,6 +2963,38 @@ async function buildHistorySynthItems(pool, windowRows, { before = null } = {}) 
   const items = [...partials, ...buildRunTerminationItems(runRows)];
   if (before == null) return items;
   return items.filter((it) => Number(it.seq) < before);
+}
+
+/**
+ * issue #514：**候选发现**——从本页 seq 窗口里的 `run_end` 行取 run id（只取 id，那一行不下发）。
+ *
+ * 为什么需要它：合成项的候选集此前**只**来自「本页的白名单行里有哪个 run」，而一条从未开始就被
+ * 取消的 run 只有一行 `run_end`（白名单外，红线不许加）⇒ 它永远进不了候选集 ⇒ 刷新后这条 run
+ * 在界面上**不存在**（正文区空白，连「已中止」那一行都没有）。
+ *
+ * 判据与边界：
+ *   * 只查 `type = 'run_end'`：`run_events_run_end_key`（部分唯一索引）保证每 run 至多一行 ⇒ 一次页
+ *     窗口里的候选数 = 该页里终态的 run 数，天然有界；
+ *   * **seq 下界 `pageLow`**（本页最小的白名单行 seq）：没有下界就会把**更老页**的终态 run 也拉进
+ *     本页，同一根分隔条在每一页重演一次（#502 M-6④ 那个形状）。空页 ⇒ 下界 0：此时本页就是
+ *     「白名单行的尾巴之下」那一段，本就没有更老的内容会被重复覆盖；
+ *   * **seq 上界 `before`**：与主窗口同一口径（游标之下才属于本页）；
+ *   * `LIMIT`：候选数不得超过页大小（`limit`），极端会话（整页都是被取消的 run）也只会多要一页的量。
+ *
+ * 成本：**每次响应最多一条**（不是每 run 一枪），走既有 `UNIQUE (session_id, seq)` 索引倒序扫，
+ * 非空页的扫描范围被 `[pageLow, before)` 夹住；此前那条「同一次响应里只允许一条 `runs` 查询」的
+ * 成本红线不变（发现的是 `run_events`，候选 id 仍并进 `loadWindowRuns` 那**一条** runs 查询）。
+ */
+async function discoverTerminalRunIds(pool, sessionId, { pageLow = 0, before = null, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
+  const params = [sessionId, pageLow];
+  let where = `session_id = $1 AND type = 'run_end' AND seq >= $2`;
+  if (before != null) { params.push(before); where += ` AND seq < $${params.length}`; }
+  params.push(Math.max(1, limit));
+  const r = await pool.query(
+    `SELECT run_id FROM run_events WHERE ${where} ORDER BY seq DESC LIMIT $${params.length}`,
+    params,
+  );
+  return (r.rows ?? []).map((row) => row.run_id).filter((id) => id != null);
 }
 
 /**
