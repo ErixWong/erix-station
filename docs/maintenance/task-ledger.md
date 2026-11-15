@@ -5488,3 +5488,63 @@ portal internal 两端点 + `run_checkpoints` 表）本单一律不动，连同�
    **不是**本单的回归，不许因为本单把 #500/#501 顺带关掉。
 4. `replayPolicy` 无可观测效果这件事写进了 `runner/test/replay-policy.test.js` 头注与本条台账；
    接 #500 那天要回来重估反面对照（届时主用例也该能钉住「有证据 + unsafe ⇒ 不重放」）。
+
+### 8.128 事件驱动平台第一版开工：设计定稿（10 份）+ 6→8 张工单 + W1 落地（issue #523/#524，2026-11-15→16，主 agent）
+
+**设计定稿**：`docs/design/event-platform/` 从 8 份长到 **10 份**（PR #522 合并 `c8613a3`，
+本批新增 `08-watch-and-review` / `09-observability` / `10-implementation-contract`）。
+状态从「可研、不排期」翻成「**第一版已批准开发**」，范围明确划死：
+M1 终态通知 / M8 静默告警 / M9 完成审查 / M7 定时任务 + 可观测性；
+其余（E3 端口对账 / E4 证书 / `run-recover` / 语义源 / 工作项账本 / 外部集成）仍在可研。
+
+**三轮开工前审计**（copilot，只读、独立 worktree，全部 `gpt-6-luna` / `context=default` / `effort=xhigh`）：
+
+| 轮 | 结论 | 抓到什么 |
+|---|---|---|
+| 1（审 9 份全文） | 不能作为无歧义规格 | 13 项，含 `capacity=1` 10 处错、判决映射散四处、`reason` 只有 8 个值是错前提 |
+| 2（审差异） | 不能合 | 4 条最小集：判决契约、单一幂等键、可验证快照、真实并发保证 |
+| 3（开工前闸） | 不可以开工 | 水位线漏评会误判、模板删除毁历史、前端五项未定、**README 仍写「不排期不开发」** |
+
+**过程账（派单教训，两次同一死法）**：第一次派 `subagent` worker 做 W1，**30 分钟零提交**
+—— 它一直在取证（跑了 `timeout 900 npm test` + `npm ci` + 挖 19 处迁移断言），一次都没开始写。
+第二次改派 `erix_run`（`maxRounds=100` / `timeoutMs=3600000` / `sessionDir` 必给），
+在工单里**预先喂了三个坑**（19 处 head 断言 + `model.md` 门禁 + 迁移写法参照）、
+**禁止跑全量 `npm test` 和 `npm ci`**、**写死「前 10 分钟必须落盘」+ 每里程碑 commit** ⇒
+98 轮完成，7 个提交。
+⇒ **口径：派实现类任务，必须把「已挖到的坑」写进工单、必须禁止吃掉预算的命令、
+必须写「先落盘再完善」。只写需求不写坑，执行体会把预算全花在重新挖坑上。**
+
+**设计 bug（审计抓到的，W1 已照抄后才被发现）**：`macro_runs.state` 一列两义 ——
+既是生命周期（`pending→running→done`）又当判据（`mechanical`/`semantic`），
+而唯一键是 `(assignment_id, anchor, state, bucket)` ⇒ **状态一迁移唯一键就变 ⇒ 同一触发可被再次
+claim ⇒ 幂等直接失效**。修法：拆成 `status`（生命周期，会变）+ `criterion`（判据，不变），
+幂等键改 `(assignment_id, anchor, criterion, bucket)`（PR #534 `dcb4994`）。
+⚠ 已用 `erix_run` 的 **steer** 通道投进正在跑的 W1（`steer=offered:98/injected:1`），
+它自己补了「推到 done 后再 claim 仍返回 null」的回归用例。
+
+**工单审计（copilot）判「六单按当前文本不足以交付」**，缺的全是**跨单接口**：
+W2→W3 意图对象没定义、五组 HTTP API 只有路径没有请求响应、枚举没有单一真源、
+三处无人认领（`notifications` 回补软删 / `until` 扫描 / `origin` 列）、
+**M7 只有「看见时间」没有「执行任务」**（整块遗漏）、W4 工作量明显超一次派单。
+⇒ 新增 `10-implementation-contract.md`（PR #535 `532068d`）把这三类钉死；
+issue 侧：**#527 拆成 #537（W4a 快照与隔离）+ #538（W4b 判决与生命周期）**，
+**新增 #536（W7 M7 执行器）**，#525/#526/#528/#529 正文尾部追加契约指针。
+
+**W1 落地（PR #542 `1dfda1d`）**：迁移 `0035`（三表 + 8 索引 + 8 条后置守卫）、
+`portal/src/macros.js`（690 行）、`portal/test/macros.test.js`（458 行）、
+`migrations.test.js` 的 19 处 head 断言 34→35、`model.md` 三表条目。
+主 agent 亲跑 41/41 + 21/21 全绿，并**自己跑两个变异**（`DO NOTHING`→`DO UPDATE` ⇒ `not ok 6` 红；
+幂等键混进 `status` ⇒ `not ok 31` 红），两个变异都已还原。
+执行体三处偏离均合理并写进提交信息：索引不冗余（执行账不复制可变的 `template_id`，
+已写成回归闸）、`assignment_id` 用 `RESTRICT`（取消订阅不许抹掉审计）、
+订阅键用 `UNIQUE NULLS NOT DISTINCT`（PG16，否则 `scope='user'` 会被重复订）。
+
+**自己踩的坑（记一笔）**：写本条目时先把内容 append 到了**主工作区**的
+`docs/maintenance/task-ledger.md`，而那棵树当时在并行 session 的分支
+`feat-261115-08-engine-0.33.0` 上 —— 等于改了别人的工作区。已 `git checkout --` 回退干净，
+改到自己的 worktree 再提交。
+⇒ **口径：写任何文件前先 `git branch --show-current`，不是自己的分支就换 worktree。**
+这和 §8.113 是同一族事故，只是这次改的是文档不是代码，且被及时发现。
+
+**待办**：W1 代码审计（copilot，在跑）；W2 评估循环（`erix_run` 在跑）；
+W3–W7 按 `#523` 的顺序派。
