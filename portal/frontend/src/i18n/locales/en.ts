@@ -728,6 +728,7 @@ export const en = {
       reasonNoRow: 'Nothing has been saved in the admin console yet, so the environment variable (or the default) is in force. Saving a value here overrides it.',
       reasonInvalid: 'The value stored in the database is unusable (out of range or the wrong shape), so we fell back to the environment/default — the number below is not what the admin console stored.',
       reasonReadFailed: 'upload_settings could not be read (missing table or database hiccup); we fell back to the environment/default. Uploads themselves are unaffected.',
+      reasonReadTimeout: 'Reading upload_settings timed out (the database did not answer within UPLOAD_SETTINGS_READ_TIMEOUT_MS); we fell back to the environment/default. Uploads themselves are unaffected.',
       srcDb: 'Database value (when usable)',
       srcEnv: 'Environment variable',
       srcDefault: 'Built-in default',

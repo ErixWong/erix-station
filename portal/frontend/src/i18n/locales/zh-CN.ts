@@ -760,6 +760,7 @@ export const zhCN = {
       reasonNoRow: '管理台还没存过值，现在用的是环境变量（没设则是默认）。在这里存一个数就会覆盖它。',
       reasonInvalid: 'DB 里那个值用不了（不在允许区间，或形状不对），已回落环境变量/默认值——所以下面那个数不是管理台里存的数。',
       reasonReadFailed: '读不到 upload_settings（表缺失或数据库抖动），已回落环境变量/默认值；上传本身不受影响。',
+      reasonReadTimeout: '读 upload_settings 超时（数据库没在 UPLOAD_SETTINGS_READ_TIMEOUT_MS 内回答），已回落环境变量/默认值；上传本身不受影响。',
       srcDb: 'DB 里的值（可用时）',
       srcEnv: '环境变量那一档',
       srcDefault: '内置默认',

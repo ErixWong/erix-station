@@ -17,6 +17,9 @@ export class FakePool {
     // 存的是 `{ max_file_bytes, updated_at, updated_by }`（max_file_bytes 存 **number**，
     // 出参时再按真驱动的形状转成字符串，见下面 `FROM upload_settings` 分支的长注）。
     this.uploadSettings = null;
+    // #485 复 audit（活二）：注入「审计 `INSERT` 失败」。保存是一条 CTE 语句 ⇒ 注入成立时整条语句
+    // 失败而设置**一格没变**（语句级原子）。默认 false = 不注入。
+    this.failAudit = false;
     // #456：证书台账（`tls_certificates`）。**不是真相源**（真相是盘上证书文件），只记「谁什么时候装了什么」。
     this.tlsCerts = [];
     // #456 M2：**语句流水**（`{sql, params}`，每条进来的语句）。只给「零副作用」这类判据用：
@@ -242,6 +245,66 @@ export class FakePool {
         }
       }
       return { rows: [] };
+    }
+
+    // ---- #485 片 A 复 audit（活二）：保存 = 读旧值 + upsert + 写审计，**一条** CTE 语句 ----
+    // ⚠ 必须排在下面那条 `INSERT INTO audit_log` 之前：这条 SQL 同时含两张表的 INSERT，
+    // 让通用审计分支先认到就会**吞掉 upsert**（设置没改、只多一条审计，用例却绿 = 假绿）。
+    // fake 真模拟三件事：① 旧值取的是**本语句开始时**的库状态（快照）；② `previous_*` 的区间判定
+    // **按 SQL 写的做**（`BETWEEN $5 AND $6` 没写就放宽 ⇒ 「区间判定被删」这种变异会红）；
+    //   ③ `failAudit` 注入时整条语句失败而 `uploadSettings` **一格没变**（语句级原子，对应 US-20）。
+    if (sql.includes('INSERT INTO upload_settings') && /\bWITH\s+prev\b/i.test(sql)) {
+      if (!/ON CONFLICT \(id\) DO UPDATE/.test(sql)) {
+        throw new Error('fake：upload_settings 写入必须是单条 upsert（INSERT … ON CONFLICT (id) DO UPDATE）');
+      }
+      if (!/VALUES \(1,/.test(sql)) throw new Error('fake：upload_settings 是单行表，插入必须写死 id = 1');
+      // 形状闸（复 audit 活二）：旧值不锁行，并发两条 PUT 就仍会各自读到「自己进来之前」的旧值。
+      if (!/FOR UPDATE/.test(sql)) {
+        throw new Error('fake：prev 必须 `FOR UPDATE`——否则 `previous_*` 仍可能是隔了一条写入的旧值');
+      }
+      if (params.length !== 8) throw new Error(`fake：upload_settings 保存语句应带 8 个参数，实际 ${params.length}`);
+      const [maxFileBytes, updatedBy, fallbackBytes, fallbackSource, minBytes, maxBytes, action, target] = params;
+      const value = Number(maxFileBytes);
+      if (!Number.isFinite(value)) throw new Error('fake：max_file_bytes 是 bigint NOT NULL，不能是 undefined/null/NaN');
+      if (value <= 0) throw new Error('fake：CHECK (max_file_bytes > 0) 被违反');
+      if (fallbackSource !== 'env' && fallbackSource !== 'default') {
+        throw new Error(`fake：previous_source 回落位只可能是 env/default，实际 ${fallbackSource}`);
+      }
+      // 旧值：与 `FROM upload_settings` 分支同形状（bigint ⇒ 字符串）。
+      const previousRaw = this.uploadSettings ? String(this.uploadSettings.max_file_bytes) : null;
+      const previousValue = previousRaw === null ? null : Number(previousRaw);
+      // SQL 里那句 CASE 的等价实现；`BETWEEN $5 AND $6` 被删 ⇒ 判定放宽（不兼平）。
+      const requireRange = /BETWEEN\s+\$5\s+AND\s+\$6/.test(sql);
+      const dbUsable = previousValue !== null && Number.isSafeInteger(previousValue)
+        && (!requireRange || (previousValue >= Number(minBytes) && previousValue <= Number(maxBytes)));
+      const previousMaxBytes = dbUsable ? previousValue : Number(fallbackBytes);
+      const previousSource = dbUsable ? 'db' : fallbackSource;
+      // 注入审计失败：真库里这是一条语句 ⇒ 设置与审计同生共死。fake 必须同样“要么全做要么全不做”，
+      // 不然它比产品更宽容，“审计写不进去也照样改成了”就测不出来（US-20）。
+      if (this.failAudit) throw new Error('fake：audit_log 写入失败（注入）');
+      this.uploadSettings = { max_file_bytes: value, updated_at: new Date(), updated_by: updatedBy };
+      this.audit.push({
+        actor_id: updatedBy,
+        action,
+        target,
+        // 真库把这列存成 jsonb；这里保持与旧实现（`auth.audit` 传 `JSON.stringify`）**同形状**，
+        // 免得“形状变了”与“内容变了”两个不同的红揉成一条。
+        details: JSON.stringify({
+          max_file_bytes: value,
+          previous_max_bytes: previousMaxBytes,
+          previous_source: previousSource,
+        }),
+      });
+      return {
+        rows: [{
+          max_file_bytes: String(value),
+          updated_at: this.uploadSettings.updated_at,
+          updated_by: updatedBy,
+          previous_raw: previousRaw,
+          audit_rows: 1,
+        }],
+        rowCount: 1,
+      };
     }
 
     // audit（best-effort）

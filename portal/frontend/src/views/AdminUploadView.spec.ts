@@ -10,7 +10,7 @@
 //   ④ `400 validation_failed` + `details.field='maxFileBytes'` ⇒ 那个框 aria-invalid + 文案可见
 //   ⑤ 解析不出整数（空、`1.5`）⇒ 禁保存且**零请求**（不发一个必然 400 的垃圾体）
 //   ⑥ 越界但仍是整数 ⇒ **照发**（前端不抢服务端的闸），同时给提前提示
-//   ⑦ `source ≠ db` 时把原因说清楚（`no_row` / `invalid_db_value` / `read_failed` 三种各一条）
+//   ⑦ `source ≠ db` 时把原因说清楚（`no_row` / `invalid_db_value` / `read_failed` / `read_timeout` 四种各一条）
 //   ⑧ 服务端给了缺键/不认识的形状 ⇒ 显示「未知」，**不是 0**（#390-A：键缺席不是 false/0）
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
@@ -256,6 +256,13 @@ describe('⑦ source ≠ db 时把原因说清楚', () => {
   it('read_failed：明说「读不到表，上传本身不受影响」', async () => {
     stubDefault({ ...ENV_SETTINGS, reason: 'read_failed' });
     const w = await mountView();
+    expect(text(w, 'upload-reason')).toContain('上传本身不受影响');
+  });
+
+  it('read_timeout：明说「数据库没在超时内回答，已回落，上传本身不受影响」（后端新增的 reason 不许掉进 default）', async () => {
+    stubDefault({ ...ENV_SETTINGS, reason: 'read_timeout' });
+    const w = await mountView();
+    expect(text(w, 'upload-reason')).toContain('UPLOAD_SETTINGS_READ_TIMEOUT_MS');
     expect(text(w, 'upload-reason')).toContain('上传本身不受影响');
   });
 

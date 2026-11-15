@@ -55,6 +55,9 @@ const reasonText = computed(() => {
     case 'no_row': return t('admin.upload.reasonNoRow');
     case 'invalid_db_value': return t('admin.upload.reasonInvalid');
     case 'read_failed': return t('admin.upload.reasonReadFailed');
+    // `read_timeout` 是新引入的第四种（复 audit 活一：那次读取有超时了）。缺这个 case 会掉进 default ⇒ 整条
+    // 原因不显示，运维看到的就是「不知道为啥生效值不是管理台那个数」。
+    case 'read_timeout': return t('admin.upload.reasonReadTimeout');
     default: return null;
   }
 });
