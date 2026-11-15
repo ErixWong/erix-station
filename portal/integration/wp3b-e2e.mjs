@@ -30,9 +30,10 @@
 //     **容器名**（deploy/docker-compose.yml:239/62/285），不派生会与共享栈撞名（container name already in use）。
 //   BACKEND_SUBNET：compose backend 网络子网（deploy/docker-compose.yml:13，缺省 172.32.0.0/24），
 //     不派生会 **Pool overlaps**。
-//   IPAM_RESERVED_SUBNETS：portal 的 IPAM 池**硬编码**（portal/src/ipam.js:12-15，10.200.0.0/16，**非 env 可配**），
-//     隔离栈 DB 是空的 → 会从池头分配 10.200.0.0/29，与共享栈已占段**重叠**（实测 403 Pool overlaps）；
-//     必须把**其他栈已用的 fde-* 子网**列进来。
+//   IPAM_RESERVED_SUBNETS：#270 之前 portal 的 IPAM 池**硬编码**（10.200.0.0/16，非 env 可配），
+//     隔离栈 DB 是空的 → 会从池头分配 10.200.0.0/29，与共享栈已占段**重叠**（实测 403 Pool overlaps），
+//     所以必须把**其他栈已用的 fde-* 子网**列进来。#270 之后分配段已可配（本栈走 FDE_IPAM_POOL_LARGE
+//     派生的保留段子段），不重叠不再靠它了；它仍是「共享栈也在同一段里」时的逃生口，留着。
 //   PORTAL_PUBLIC_BASE_URL：决定 FDE 容器内 ERIX_STATION_BASE_URL（portal/src/provisioner.js:183）；
 //     .env 里是共享栈值（http://100.100.0.3:8090），不派生 → agentd 会去连**共享栈的 Traefik**；
 //     本栈应为 http://station.<BASE_DOMAIN>:<TRAEFIK_WEB_PORT>（FDE 容器 /etc/hosts 已把该主机名
@@ -73,7 +74,7 @@ import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mj
 // issue #226：`writeTraefikStatic` 与隔离护栏本体一样收归公共模块（wp2a/wp3a/wp3b/wp5/wp6 共用一份）。
 // #227.1：wp3b 隔离跑法从此也过硬护栏（assertIsolatedEnvironment），removeDbDir 同样收编。
 import {
-  SHARED_STACK, assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  SHARED_STACK, assertHostPortsAvailable, applyStackIpamPoolEnv, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
   writeDynamicStub, deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
 
@@ -107,10 +108,11 @@ const ISOLATION_SIGNAL_KEYS = [
 ];
 const ISOLATED_MODE = ISOLATION_SIGNAL_KEYS.some((k) => process.env[k]);
 
-// #227.3：FDE_IPAM_POOLS 未显式传时按栈 id 派生本栈口径（派生段+portal large 池固定段；显式传入优先）。
-if (!process.env.FDE_IPAM_POOLS && process.env.STATION_STACK_ID) {
-  process.env.FDE_IPAM_POOLS = defaultFdeIpamPools(process.env.STATION_STACK_ID);
-}
+// #227.3 → #270：两腿**一次派生** —— 放行面 FDE_IPAM_POOLS（= proxy IPAM_POOLS）与 portal 的
+// 分配段 FDE_IPAM_POOL_LARGE（→ portal IPAM_POOL_LARGE）取同一个值，显式传入优先。旧口径
+// 「派生段 + 整个 large 保留段两段兜底」已删：那第二段就是「两套并行隔离栈都从同一池头分配」
+// 的撞车源头，而现在分配段本身可配（portal/src/ipam.js 的 IPAM_POOL_LARGE），不再需要额外放行一段。
+applyStackIpamPoolEnv(process.env);
 
 // #227.1：护栏参数按 wp3b 实际句柄传——栈含 LiteLLM；单 FDE 名（必须带栈 id、不得等于共享 alice）；
 // 镜像不得沿用共享 :local tag（同 wp6 口径）。
