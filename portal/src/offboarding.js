@@ -21,16 +21,22 @@ const STEPS = [
   'schedule-workspace-purge',
 ];
 const LOOP_BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
-const LOOP_INTERVAL_MS = 5000;
+export const LOOP_INTERVAL_MS = 5000;
 // issue #520：`LOOP_INTERVAL_MS` 现在是**有活时的基准节拍**；认领 0 行 ⇒ 5000 → 10000 → 20000 →
-// `OFFBOARDING_IDLE_BACKOFF_MAX_MS`（默认 30000）封顶，认领到活立刻回 5000（形状与 #506 一致）。
+// `OFFBOARDING_IDLE_BACKOFF_MAX_MS`（缺省 30000）封顶，认领到活立刻回 5000（形状与 #506 一致）。
 // 代价：空闲后新入队的销号**最坏 30s 才开始**（改前 5s）。销号是管理台显式动作后的多步长流程，
 // 且它的用户可见承诺是「已停用 + 已吊 token」（在那之前同步做完）而不是「几秒内开始」。
-const IDLE_BACKOFF_MAX_MS_DEFAULT = 30000;
-// 工作区目录清理是**定时语义**，不是退避对象（issue #520 判据 2 的“有明确定时语义”那一支）：
-// 它的节拍就是产品语义（“满了 1 天才清”），而且它已经与主节拍解耦（下面那个
-// `Date.now() - lastSweepAt >= SWEEP_INTERVAL_MS` 闸门）。主拍退避到 30s 只让它多等≤ 30s，
-// 对 1h 的粒度是噪声；反而若把它改成“没活就不跑”，一个全部 FDE 已处理完的平台就永远不会清盘。
+/** 代码缺省（运维面用例钉的就是它：`deploy/docker-compose.yml` 的插值缺省必须与此逐字相等）。 */
+export const IDLE_BACKOFF_MAX_MS_DEFAULT = 30000;
+// 工作区目录清理的**阈值**是定时语义，不是退避对象（issue #520 判据 2 的“有明确定时语义”那一支）：
+// 它的阈值就是产品语义（「离队满 1 小时才清」），而且它已经与主拍解耦（下面那个
+// `tickAt - lastSweepAt >= SWEEP_INTERVAL_MS` 闸门）；反而若把它改成“没活就不跑”，
+// 一个全部 FDE 已处理完的平台就永远不会清盘。
+// ⚠ 口径说准（PR #552 审计 LOW-3）：闸门本身是**在每一拍上检查**的，不是独立定时器
+// ⇒ 1h 这个**阈值**一个字没动，但**节拍**受空闲拍影响：典型比原定时刻晚 ~max/2（默认 ≈ 15s），
+// 最坏晚一整个空闲拍 ≤ max（默认 30s）。对 1h 粒度是噪声，但不是「完全不受影响」。
+// 量级对照：`OFFBOARDING_IDLE_BACKOFF_MAX_MS=3600000`（1h）那种配法会把清理拖到最坏晚 1h ——
+// 那已经是拿旋钮改业务语义，不是本注释放行的范围。
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const PURGE_BATCH_SIZE = 20;
 
@@ -542,10 +548,11 @@ export async function sweepOffboardedWorkspaces(pool, config, {
  * issue #520 的三件事，分开记：
  *  1. **主拍退避**（本单改的）：`runOffboardingOnce()` 认领 0 行 ⇒ 5000 → 10000 → 20000 →
  *     `OFFBOARDING_IDLE_BACKOFF_MAX_MS`（默认 30000）封顶；认领到活立刻回 5000。
- *  2. **1h 工作区清理不跟着退避**（判据 2 的「定时语义」那一支）：它的节拍就是它的语义（「到期
- *     1 天后才清盘」），而且它本来就不靠拍频驱动，靠的是 `now() - lastSweepAt >= SWEEP_INTERVAL_MS`
+ *  2. **1h 工作区清理的阈值不跟着退避**（判据 2 的「定时语义」那一支）：它的阈值就是它的语义
+ *     （「离队满 1 小时才清盘」），而且它不靠拍频驱动，靠的是 `now() - lastSweepAt >= SWEEP_INTERVAL_MS`
  *     这个闸门——把它挂到「有活才跑」上，一个已全部处理完的平台就永远不会清盘。
- *     主拍退避到 30s 只让它比原定时刻晚≤ 30s，对 1h 粒度是噪声。
+ *     ⚠ 但闸门是**每拍检查**的，不是独立定时器 ⇒ 空闲拍变长会把它**拖后**：典型 ~max/2，最坏 ≤ max
+ *     （默认 30s）。说「完全不影响日程」是错的，说「会被退避饿死」也是错的（判据：用例 C1）。
  *  3. 句柄补成 #506 同形（`stop`/`done`/`settled`/`failure`）：`stop()` 现在会 abort 正在睡的那一拍。
  * `now` 也是注入缝（生产仍是 `Date.now()`）——闸门必须能在假时钟下被测到，否则只能真等 1h。
  */
@@ -555,7 +562,8 @@ export function startOffboardingLoop(pool, config, {
   onPause,
   sleep = sleepCancellable,
   now = () => Date.now(),
-  idleBackoffMaxMs = envInt('OFFBOARDING_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log }),
+  env = process.env, // 单测注入旋钮用；生产不传 ⇒ process.env
+  idleBackoffMaxMs = envInt('OFFBOARDING_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log, env }),
 } = {}) {
   if (!docker) docker = createDockerClient({ dockerHost: config.dockerHost });
   let consecutiveFailures = 0;
@@ -573,6 +581,7 @@ export function startOffboardingLoop(pool, config, {
         }
         const { claimed = false } = (await runOffboardingOnce(pool, config, { docker, log })) ?? {};
         // 清理闸门与「有没有活」无关（语义见上面注释第 2 条）；`Date.now()` → `now()` 只是可测缝，不是行为改动。
+        // ⚠ 它是**每拍检查一次**的时间门：空闲拍退到 30s ⇒ 清理最坏比原定时刻晚一个拍（≤ max），不是按秒准时。
         const tickAt = now();
         if (tickAt - lastSweepAt >= SWEEP_INTERVAL_MS) {
           await sweepOffboardedWorkspaces(pool, config, { log });
