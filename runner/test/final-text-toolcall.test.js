@@ -488,6 +488,10 @@ test('#243 ⑧ `chatcmpl-tool-` 形态默认判真；只写 `chatcmpl` 或含 of
   ]) {
     assert.equal(detectTextualizedToolCall(text).hit, false, '不该判真：' + JSON.stringify(text));
   }
+  // 承重墙存在的**理由**也用行为钉一次（不是注释里空口说）：绕开解析器、硬把短词 `off` 当特征，
+  // "offset" 就会被咬 ⇒ 这就是「不含 `<` 的条目要求长度 ≥12 且含 `-`」防的东西。
+  assert.equal(detectTextualizedToolCall('我把滚动偏移 offset 修成了 0。', ['off']).hit, true,
+    '前置：短词当特征确实会咬 "offset"（否则上面那条形状闸就没有依据）');
   // 误伤判据二：`off` / `offer` / `offset` 这一族短词永远不许进特征（"offset" 里含 "off"）。
   for (const text of [
     '我把滚动偏移 offset 修成了 0，另把 offer 文案改了。',
