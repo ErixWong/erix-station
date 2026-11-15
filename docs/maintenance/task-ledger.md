@@ -5496,3 +5496,20 @@ uid ≠ 1000 时文件其实早就写出来了，测试却白等 120 s，报一�
   会被归成 `present`，**不点名"它是符号链接"**；「② env **值非法** fail-fast 点名变量」worker 只做了
   「缺失 / 不是普通文件 / 读不到」三种，**没做键值校验**（那条线在 `portal/test/deploy-env-defaults.test.js`）；
   「缺省值逐字 `ext4`」在本单文件里没出现——本单只新增 `/srv/erix/users` 一个常量，**零新增配置键**成立。
+
+**收尾补记（同批 worker，把上面「未验 ②」改成「已验」）**：② 的真机 EACCES 已补验，**不是注入的假
+`accessSync`**：`docker run --rm -u 1001:1001 -v <tmp>:/host:ro -v <repo>:/app:ro node:22-alpine` 里以
+`uid/gid=1001/1001` 读宿主上由 `uid=1000` 建的 `0770` 目录链（文件 `0644` 确实在盘上）：
+- `observeHostPath('/host/alice/home/.erix/config.json')` ⇒ `unreadable`，blocker=`/host/alice`，
+  `mode=0o770 owner=1000:1000`；同一时刻宿主侧 `cat` 拿得到正文 ⇒「文件已写出、只是测试看不见」第一次由文案自己说清；
+- `observeHostPath('/host/nobody/…')` ⇒ `missing` + `missingPrefix=/host/nobody` ⇒ **真权限下两态仍然分得开**；
+- `waitForHostFile(读不到那条)` ⇒ **503 ms** 放弃（上限 60 s），首行「已经存在，但当前用户读不到」并点名 `FDE_USER_UID`；
+- `waitForHostFile(没物化那条, timeoutMs=400)` ⇒ 等满后报 `timeout waiting for … 路径上第一段就不存在（缺：/host/nobody）`，
+  **没喊权限**（不许把人带去改 uid）；
+- 顺手量到的边界：把 bind 根本身也 `chmod 770` ⇒ 两条路径都报 `unreadable`、blocker 是根那一段——进不去就
+  无从 `stat`，这时「读不到 / 没物化」**原理上分不开**，文案给的是根路径而不是假装的区分。
+- 另两条原判「真机面」也补了：`docker compose -p station --profile litellm --env-file deploy/.env
+  -f deploy/docker-compose.yml config --quiet` ⇒ **rc=0**（原文命令跑通，只渲染不碰容器）；`mv deploy/.env`
+  之后 `node --test portal/integration/wp3b-e2e.mjs` ⇒ **rc=1 / 210 ms**，日志里一次 docker 都没发（唯一含
+  `docker` 的那行是文案本身）⇒ #495 ① 的「秒级失败 + 点名要复制哪个文件」成立。
+  **仍然未验**只剩：`wp3b`/`wp5`/`wp6` 的全量 e2e 复跑（要 docker + 整套隔离栈 env）。
