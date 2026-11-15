@@ -5405,3 +5405,94 @@ run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data
 
 **剩余**：空闲仍有 13.2 事务/秒来自**另外 5 个轮询器**（`run_queue` 1.5/秒、`chat_sessions` 0.9/秒、
 `port_observations` 0.7/秒、`fde_onboarding` 0.6/秒…）⇒ 开 **#520** 续作（判据：空闲 < 3 事务/秒）。
+
+### 8.128 e2e 起跑前预飞：缺 `deploy/.env` 不再烧完整轮镜像构建 + EACCES 不再伪装成「没物化」（issue #495 + #227①② / 工单 fix-261116-01，2026-11-16，worker 落地 + 变异自证）
+
+> **编号由主 agent 统一分配（本批并行）**：本仓末尾本节之前是 §8.126，§8.127/§8.128 的空号是主 agent
+> 留给并行 worker 的槽位。**本节用 `cat >>` 追加，不往文件中间插**（本批已实测并行 worker 往中间插会撞车），
+> 也**没动 `AGENTS.md`**（逐单账不进阶梯，见 AGENTS §6）。
+
+**治的是什么**：`#412` 拆出来的 ①② 两条（#495），共同点不是「测试红」而是**红得没有信息**——
+① 九支 e2e 的 compose 命令串固定带 `--env-file deploy/.env`，而它不入 git ⇒ git worktree / 新 clone
+里必然缺，`docker compose` 要到**整轮镜像构建之后**才报 `couldn't find env file`（#412 部署机实测白烧
+10.7 分钟）；② 等 portal 写进宿主 bind mount 的 `config.json` 时旧写法是
+`waitFor(() => (fs.existsSync(p) ? fs.readFileSync(p) : null))`，而 `existsSync` 对**没权限**的路径返回
+`false`（EACCES 被吞）—— portal 以 root 把 FDE 目录建成 `0770 node:node`（uid/gid 1000），跑测试的人
+uid ≠ 1000 时文件其实早就写出来了，测试却白等 120 s，报一句与「真的没物化」**逐字相同**的 timeout。
+
+**交付面**（一个提交 `test(e2e)[fix-261116-01]`，未 push）
+- 新增 `portal/integration/lib/e2e-preflight.mjs`（350 行，**唯一定义处**，`isolation-negative` 的单一来源
+  断言把六个导出全钉在这）：`assertComposeEnvFile`（①：不存在 / 不是普通文件 / 存在但读不到，三种文案各点名
+  「从主 checkout 复制一份」+ 模板路径，**成功时零输出**）、`inspectHostPathChain`（沿链从根往下走，给出
+  **第一个进不去的段** + 它的 `mode`/`owner`，或**第一个不存在的段**）、`observeHostPath`（三态
+  `present / missing / unreadable`）、`waitForHostFile`（unreadable 连续两次**立刻**放弃——权限不是时间问题；
+  missing 等满超时）、`toContainerPath` + `materializeSnapshot`（把 portal 容器侧 `ls -ld 父目录 + 目标`
+  的原文拼进失败文案，userspace 是**同路径** bind mount，一次 docker 排除两种可能之一）。
+- ① 接线 9 支：`wp2a/wp2b/wp3a/wp3b/wp4/wp5/wp6/wp5-ui-setup/wp5-ui-teardown` 在**模块加载时**（任何
+  `docker`/`compose` 之前）预检；wp3b 头部清单补上 `deploy/.env` 必传前置（#412 立项理由之一：清单不够用）。
+- ② 接线 3 支：`wp3b`/`wp5`/`wp6` 的 `config.json materialized` 等待改用 `waitForHostFile`（旧的
+  `fs.existsSync(configPath)` 形态由静态钉禁止回来）。
+- 判据两处：新增 `test/integration-e2e-preflight.test.js`（13 条，**进 CI 门**：根 `npm test`）；
+  `isolation-negative.mjs` +2 条陷阱（env 缺文件必须硬失败、读不到必须提前放弃）+ 一组 #495 正例
+  （三态互不相同、预检零输出、快照命令形状 `2>&1 || true`、路径换算越界必抛）。
+- 顺手修一处**误伤**：`#227.2` 的「`docker compose` 必须显式带 `-p`」是行级扫描，把注释与字符串里的
+  `docker compose` 当命令——本单的头部清单一次被误伤 **12 处**。修法不是改散文，是把判据收成
+  `lineMissingComposeProject()`（纯注释行不算命令）+ 双向夹具（真命令不带 `-p` 必红 / 带 `-p` 不红 / 注释不红）。
+
+**门禁读数**（判绿只看退出码）
+- `node --test test/integration-e2e-preflight.test.js` → `# pass 13 / # fail 0`
+- `node portal/integration/isolation-negative.mjs --strict` → **rc=0**（12 条陷阱均硬失败、单一来源一份定义）；
+  缺省模式仍 **rc=1**（这是刻意的「负例证据」口径，不是失败——文件头有写，别当回归）
+- 根 `npm test` 的终值贴在交付报告里（不拄进台账，免得仓里多一处手抄的当下数字）。**改动前**的基线是
+  `# tests 2368 / pass 2354 / fail 0 / skipped 14`（rc=0），本单净增 13 条用例。
+
+**变异自证 12 发**（每次只改一处源码，跑两道门；全部已还原。红条点名到 `not ok N`）
+
+| # | 变异 | 红在哪 |
+|---|---|---|
+| M1 | 删掉 wp3b 的 `assertComposeEnvFile(...)` 调用 | `not ok 13 - \#495 接线静态自检：脚本必须在**任何 docker 之前**做预检` |
+| M2 | 把预检插回 `safe(() => compose('down -v', {` 前一行 | **没红**——插的位置仍在第一次 compose **之前**，是合法形态 ⇒ 夹具缺陷，不是判据缺陷（红条入口是「晚于第一次 compose/docker」） |
+| M3 | 叶子级 EACCES 不再归 unreadable | `not ok 6 - \#495② P5b 文件本身不可读（链能进，但 readFileSync 抛 EACCES）` |
+| M3b | 目录级 blocker 不再归 unreadable | `not ok 5 - P5 三态分开`、`not ok 7 - P6`；neg 侧 `TRAP FAIL · waitForHostFile() 目录读不到 ⇒ 提前放弃并点名 uid 口径` + `正例夹具被抛错 … 链上某段 0770`（**双门红**） |
+| M4 | 叶子级 ENOENT 归进 unreadable（= 三态压成一态的原坑） | `not ok 9 - \#495② P8 等待：文件延迟出现 ⇒ 返回正文`；⚠ **neg --strict 仍绿**（盲区，见坑 3） |
+| M5 | 预检成功时多打一行 | `not ok 1 - \#495① P1 …**零输出**` + neg `正例夹具被抛错 … 预检成功不许打印任何东西`（双门红） |
+| M6 | `unreadableConfirmations` 2 → 1e9（不再提前放弃） | `not ok 7 - P6`（判据是 `elapsed < timeoutMs/2`，不是文案） |
+| M7 | 快照命令丢掉 `2>&1 \|\| true` | `not ok 11 - P11 现场快照 = 一条不抛错的 ls` + neg `… 远端 stderr 合并 + 不吃退出码` |
+| M8 | `toContainerPath` 不拒越界路径 | `not ok 10 - P10 宿主路径 → portal 容器内路径` + neg `… Missing expected exception` |
+| M9 | wp3b 等物化退回 `fs.existsSync` 一把梭 | `not ok 13 - 接线静态自检`（两条断言各抓一次：`waitForHostFile(` 消失 + `fs.existsSync(configJsonPath)` 回来） |
+| M10 | `#227.2` 判据去掉「注释行排除」 | neg `正例夹具被抛错 … 纯注释是散文不是命令` + `单一来源断言 FAIL：… e2e-preflight.mjs:7 docker compose 命令没显式带 -p` |
+| M11 | 在 wp3b 里复制一份 `waitForHostFile` 定义 | neg `单一来源断言 FAIL：waitForHostFile: 期望只在 lib/e2e-preflight.mjs 有 1 处定义，实际 2 处` |
+
+**四个坑（全是实测，不是设想）**
+
+1. **变异脚本的「备份还原」会自己藏毒**（本单真实踩到，且差点被提交）：上一轮变异跑到一半被时间闸掐了，
+   脚本末尾的 `restore()` 没执行，于是下一轮开头 `cp $LIB $D/lib.bak` 抓的是**带 M4 变异文本**的树，
+   之后每次 `restore()` 都把毒还原回去。表现：`M4 变异没打上（原文没搜到）` + `P8` 稳定红 + 怎么都解释不通。
+   ⇒ 两条红线：**提交前逐条 grep 变异指纹**（`if (false) {` / `console.log` / `1e9` / `2>/dev/null"` / `mode: '?'`），
+   以及**别信"脚本末尾有 restore"**——备份要么从 `git show HEAD:<path>` 取，要么每轮开头先校验备份自身干净。
+2. **`--strict` 与缺省模式是两套退出码**：缺省模式「陷阱全硬失败」= **rc=1**（刻意留证据），`--strict` 才是
+   回归口径（rc=0 才叫绿）。跑的人不知道这点就会把护栏改坏读成"本来就红"。
+3. **链级与叶子级要分开钉**：`missing`/`unreadable` 的判定有两条入口（祖先链走不动 / 叶子自己读不出）。
+   `P5`/`P7` 只覆盖链级，M4 那种「叶子级 ENOENT 被归成 unreadable」在 `isolation-negative` 里**完全没被抓住**
+   （正例组的夹具是"链上第一段不存在"），最后只有 `P8`（fake `readFileSync` 抛两次 ENOENT）抓到——
+   它就是"materializer 还没写出"那段窗口的哨兵。⇒ 文案级断言不够，**时间判据**（提前放弃 vs 等满）与
+   **状态值断言**才是可失败的证据。
+4. **`/srv/erix/users` 这类"宿主 ↔ 容器同路径"字面量要有归属**：新常量 `PORTAL_USERSPACE_CONTAINER_ROOT`
+   只活在 lib，`isolation-negative` 里加了一条「别的 integration 文件不许出现带引号的 `/srv/erix/users`」——
+   自己算映射 = 快照指到别处，看了白看（compose 里右值写死：`deploy/docker-compose.yml` portal 的
+   `${ERIX_USERSPACE_ROOT_HOST}:/srv/erix/users`）。
+
+**未尽项：静态判据 vs 真机面**（真机面 worker 本机跑不了，别当已验）
+- **已验（静态 / 夹具，进 CI 门）**：预检三种失败与「成功零输出」、三态互不相同、提前放弃与等满的时间判据、
+  宿主→容器路径换算与越界、快照命令形状、接线顺序（预检早于第一次 compose/docker）、单一来源、字面量归属。
+- **未验（真机面，主 agent 合并后亲手跑）**：① 在没有 `deploy/.env` 的 worktree 里跑 wp3b 的**秒级失败**
+  （worker 只验到「模块加载即抛 + 文案点名」的语义，没跑真 compose）；② **真 EACCES**（uid ≠ 目录属主）——
+  本机 eric 自己就是 `uid=1000` = FDE 目录属主，`chmod 0700` 对自己照样可读，所以「读不到」分支是
+  **注入的 `accessSync` 抛 EACCES** 复现的，不是真权限；建议按 #495 判据补一发
+  `docker run --rm -u 1001:1001 -v <tmp>:/host node:22-alpine node -e …`；③ `docker compose … --env-file deploy/.env config`
+  原文命令跑通；④ `wp3b`/`wp5`/`wp6` 全量 e2e **没复跑**（要 docker + 一整套隔离栈 env）。
+- **判据差项（明确没做，等主 agent 定）**：工单 follow-up 写的「① 宿主路径链逐段 `lstat`、**末段不许是符号链接**」
+  —— 现在链检是 `statSync` + `accessSync`（**跟随**符号链接）：悬空链接会被归成 `missing`，指向可读文件的链接
+  会被归成 `present`，**不点名"它是符号链接"**；「② env **值非法** fail-fast 点名变量」worker 只做了
+  「缺失 / 不是普通文件 / 读不到」三种，**没做键值校验**（那条线在 `portal/test/deploy-env-defaults.test.js`）；
+  「缺省值逐字 `ext4`」在本单文件里没出现——本单只新增 `/srv/erix/users` 一个常量，**零新增配置键**成立。
