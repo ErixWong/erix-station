@@ -254,6 +254,19 @@ services:
       SESSION_SIGNING_KEY: ${SESSION_SIGNING_KEY:-erix-station-dev-signing-key-change-me}
       PREVIEW_TICKET_TTL_SECONDS: ${PREVIEW_TICKET_TTL_SECONDS:-60}
       PREVIEW_SESSION_TTL_SECONDS: ${PREVIEW_SESSION_TTL_SECONDS:-900}
+      # issue #520：三个后台队列循环（开户/销号/对账）的**空闲退避上限**。⚠ portal 的 environment 同样
+      # 是**显式列表、无 env_file**（见上面 FILE_UPLOAD_MAX_BYTES 那条注释）⇒ 不登记这三行，运维在
+      # deploy/.env 里写 `PROVISIONER_IDLE_BACKOFF_MAX_MS=5000` **根本不生效**（PR #552 审计 LOW-1）。
+      # 语义：连续空闲拍按 5000→10000→20000→… 翻倍退避到这里的上限封顶；**认领到活立即回 5000**
+      # ⇒ 这三根旋钮只改「平台没事做时多久问一次 DB」，不改有活时的吞吐与延迟。
+      # 不设 = 用代码缺省（开户/销号 30000、对账 15000）。⚠ **对账那根是硬上限**：写超过 15000 会被
+      # 钳回 15000 并 warn（漂移发现延迟是它的业务承诺，见 `provisioner.js` 的 `resolveIdleBackoffMaxMs`，
+      # PR #552 审计 LOW-2）；开户/销号可以配到共享上限 60000。
+      # 三腿一致性（compose 插值缺省 == 代码缺省常量 == 循环真正生效值）由
+      # `portal/test/deploy-env-idle-backoff.test.js` 机器判据钉住（先例：#472 与 #270）。
+      ONBOARDING_IDLE_BACKOFF_MAX_MS: ${ONBOARDING_IDLE_BACKOFF_MAX_MS:-30000}
+      OFFBOARDING_IDLE_BACKOFF_MAX_MS: ${OFFBOARDING_IDLE_BACKOFF_MAX_MS:-30000}
+      PROVISIONER_IDLE_BACKOFF_MAX_MS: ${PROVISIONER_IDLE_BACKOFF_MAX_MS:-15000}
       # P1：baseline(schema.sql) + bootstrap.sql 由 station-db 首次初始化（db-init/00-init.sh，超级用户）
       # 完成；增量迁移（deploy/migrations/0001-idempotency-keys.sql 提供幂等台账 idempotency_keys，
       # portal.md §1.4）此前需人工补跑 → 本栈**显式启用启动迁移**：portal 在**监听端口前**以
