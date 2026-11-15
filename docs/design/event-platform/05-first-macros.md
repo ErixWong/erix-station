@@ -152,7 +152,7 @@ M9（审查）已升入第一版 ⇒ **判决层现在在第一版就有消费�
 
   action        A5 站内通知
     user        当前用户
-    title       "[{{anchor}}] 运行结束 · {{state}}"
+    title       "[{{anchor}}] 运行结束 · {{status}}"
     body        "{{evidence}}\n\n{{url}}"
   criteria      （空 —— 通知型不需要判据）
   budget        max_per_day 20 / quiet_hours 22:00-08:00（窗口内合并成一条）
@@ -218,7 +218,7 @@ M7 是它的通用骨架。第一版先证骨架；日报降级成 M7 的一个*
 
   action        A5 站内通知（带「停止这个 run」链接）
     title       "[{{anchor}}] 已 {{evidence}} 没有反馈"
-    body        "最后一条事件是 {{state}}；已静默 {{evidence}}\n\n{{url}}"
+    body        "最后一条事件是 {{status}}；已静默 {{evidence}}\n\n{{url}}"
   criteria      （空）
   budget        每个 (订阅, run, criterion) 只发一次
   notify_on_failure true
@@ -314,7 +314,7 @@ M8 补的是 B 类；A 类只需要 M1 的 `failed` 话术里带上「超时」�
   on_state      E1: run.completed（judge_done / end_turn）
                 ∧ E2: dir.{uncommitted|unpushed|never_fetched}
   action        A5 站内通知 + A1 回投到触发它的那个会话
-    text        "这次跑完了，但 {{anchor}} 还有未兜住的改动（{{state}}）。{{evidence}}"
+    text        "这次跑完了，但 {{anchor}} 还有未兜住的改动（{{status}}）。{{evidence}}"
   criteria      （空）
   budget        max_per_day 10 / 同一 (dir, run) 只发一次
   notify_on_failure true
@@ -337,7 +337,7 @@ M8 补的是 B 类；A 类只需要 M1 的 `failed` 话术里带上「超时」�
   action        A4 邮件 + A5 站内通知（一条汇总）
     to          当前用户（枚举）
     subject     "收工检查 · {{date}}：{{evidence}}"
-    text        逐目录一行：{{anchor}} — {{state}} — {{evidence}}
+    text        逐目录一行：{{anchor}} — {{status}} — {{evidence}}
   criteria      （空）
   budget        max_per_day 1 / quiet_hours 命中则顺延到 08:00 首条
   notify_on_failure true
@@ -354,7 +354,7 @@ M8 补的是 B 类；A 类只需要 M1 的 `failed` 话术里带上「超时」�
   anchor_type   用户
   on_state      E3: port.{assigned_not_listening|listening_not_assigned|duplicate_in_dir}
   action        A5 站内通知（同一 fde 的多条合并成一条）
-    body        "{{anchor}}：{{state}} —— {{evidence}}"
+    body        "{{anchor}}：{{status}} —— {{evidence}}"
   criteria      （空）
   budget        max_per_day 5 / 同一 (port, pid) 只发一次
 ```
