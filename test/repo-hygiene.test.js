@@ -13,6 +13,12 @@
 // `.gitignore` 第 1 行原本只有 `node_modules/`——**带斜杠的规则只匹配目录**，符号链接不是目录，
 // 所以 `git add -A` 照样把它扫进来。本文件钉两条：① 跟踪状态必须为空；② 规则必须真盖得住
 // **链接形态**（真造一个符号链接复现，不做文本匹配）。
+//
+// 第二条家族（H3，issue #496）同样是一次性修不掉的**环境地板**：`@vue/test-utils@2.5.1` 的
+// `emitted()` 靠 Vue devtools hook 取事件，而 Vue 只在非生产构建里发 devtools 事件 ⇒ 本机 shell
+// 默认 `NODE_ENV=production` 时它**恒空**，断言假红（且 `toBeUndefined()` 那一半会假绿）。
+// 光在 `AGENTS.md` §4 写「新用例别用」拦不住：那句话写于 11-11，11-14 的 `2e40214` 又带进来一处
+// ⇒ 现在改成静态判据（带反向自证，与 H2 同形）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -64,4 +70,67 @@ test('H2 `.gitignore` 必须挡住**符号链接**形态（带斜杠的 `node_mo
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// H3（issue #496）：前端 spec 里不许出现 `emitted()` 的**带点调用形状** `.emitted(`。
+// 机制与后果见文件头；这里只钉一句话：**判据不许依赖 Vue devtools 事件**。
+// 口径（都是有意选的，改动要连带改反向自证）：
+//   · 只扫 **git 跟踪的** spec（与 `npm run check:agents-hotlayer` 的引用面同口径：未入库的文件不是交付）；
+//   · 清单 = `portal/frontend` 下名字以 `.spec.ts` 结尾的跟踪文件 = vitest 的运行时表面（`vite.config.ts`
+//     的 `include: ['src/**/*.spec.ts']`）；注意**不能**拿 `src/**/*.spec.ts` 当 git pathspec，
+//     它匹配不到顶层的 `src/router.spec.ts`（实测少一个）⇒ 反向自证就钉在这个文件上；
+//   · 匹配 `\.emitted\b`（带点）而不是单词 `emitted` ⇒ 注释里写「不要用 emitted()」不会被误伤，
+//     但写成调用（哪怕在注释里）仍然拦得住 —— 宁可拦得难看，不可漏。
+const FRONTEND_DIR = 'portal/frontend';
+const EMITTED_CALL = /\.emitted\b/;
+
+/** 扫描面：git 跟踪的、名字以 `.spec.ts` 结尾的前端文件（相对仓库根的路径）。 */
+function trackedFrontendSpecs() {
+  const nul = git(['-c', 'core.quotePath=false', 'ls-files', '-z', '--', FRONTEND_DIR]);
+  return nul.split('\0').filter((p) => p.endsWith('.spec.ts')).sort();
+}
+
+/** 判据本体：给定 [{ path, text }]，返回每一处带点调用。生产调用与反向自证共用同一个函数。 */
+function findEmittedCalls(files) {
+  const hits = [];
+  for (const f of files) {
+    f.text.split('\n').forEach((line, i) => {
+      if (EMITTED_CALL.test(line)) hits.push(`${f.path}:${i + 1}: ${line.trim()}`);
+    });
+  }
+  return hits;
+}
+
+test('H3 前端 spec 里不许出现 `.emitted(`——那是 `NODE_ENV=production` 假红的地板（issue #496）', () => {
+  const files = trackedFrontendSpecs();
+  // 不先钉「清单不空」，下面的「零命中」就可能是扫了个空集合（同 H2 的反向自证同理）。
+  assert.ok(files.length >= 40, `只扫到 ${files.length} 个前端 spec ⇒ 清单本身漏了，本判据在空转`);
+  assert.ok(files.includes(`${FRONTEND_DIR}/src/router.spec.ts`),
+    '顶层 spec（src/router.spec.ts）必须在清单里：`src/**/*.spec.ts` 这种写法会漏它，判据会假绿');
+
+  const read = (p) => ({ path: p, text: fs.readFileSync(path.join(REPO_ROOT, p), 'utf8') });
+  const hits = findEmittedCalls(files.map(read));
+  assert.deepEqual(hits, [],
+    '前端 spec 里又出现了带点的 emitted(...) 调用：它在 NODE_ENV=production 下恒空（Vue 不发 devtools 事件）'
+    + '⇒ 要么假红、要么假绿。改成 DOM 断言或请求桩断言（先例：GitLightBadge.spec.ts 的 mountBadgeHost、'
+    + 'SidebarPanel.spec.ts 的 mountPanelInHost）。命中：\n  ' + hits.join('\n  '));
+
+  // 反向自证 A：拿清单里**真的顶层那份**注入一行调用形状 ⇒ 同一次扫必须只多这一处可见。
+  // （它同时证明：① 匹配姿势对；② 清单真的盖到了顶层 spec。）
+  const probe = `${FRONTEND_DIR}/src/router.spec.ts`;
+  const mutant = files.map((p) => {
+    const f = read(p);
+    return p === probe ? { ...f, text: `${f.text}\nconst _mutant = wrapper.emitted('files-changed');\n` } : f;
+  });
+  const injected = findEmittedCalls(mutant);
+  assert.equal(injected.length, 1, `注入一处带点调用后只应命中 1 处，实际 ${injected.length} 处：${injected.join(' | ')}`);
+  assert.match(injected[0], new RegExp(probe.replace(/[/\\^$.*+?()[\]{}|]/g, '\\$&')), `命中的不是被改的那份：${injected[0]}`);
+
+  // 反向自证 B：只写不带点的散文 ⇒ 必须**看不见**（否则判据钉的是单词，不是调用形状）。
+  const prose = findEmittedCalls(files.map((p) => {
+    const f = read(p);
+    return p === probe ? { ...f, text: `${f.text}\n// 别再写 emitted() 这种调用（#496）\n` } : f;
+  }));
+  assert.deepEqual(prose, [], `不带点的散文不该被拦：${prose.join(' | ')}`);
 });
