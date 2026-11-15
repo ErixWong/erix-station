@@ -520,9 +520,17 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 |---|---|---|
 | `macro_templates` | **做什么**：`kind`（四类：`run-notify` / `run-silence-alert` / `run-review` / `scheduled-task`）+ `name` + `params`（jsonb：四类参数集互不相交，散列成列会让每列只对一类有意义）+ `audience`（`all` / `admin`）+ `scope`（`session` / `user`）+ `enabled` + `created_by`（可空：内置模板没有创建人）+ `deleted_at`（软删） | `CHECK` 钉住 `kind` / `audience` / `scope`；`name` 不许空白 |
 | `macro_assignments` | **给谁做、在哪个范围、到什么时候**：`template_id` + `user_id` + `session_id`（`scope='session'` 才给）+ `cwd`（限定 worktree，NULL = 不限）+ `until`（到期时刻）+ `enabled` + `last_evaluated_at`（W2 的「多久没被看过」判据） | `UNIQUE NULLS NOT DISTINCT (template_id, user_id, session_id, cwd)`（PG15+）。**这一条是「重复订阅」的唯一防线**：默认 UNIQUE 语义下 NULL 互不相等 ⇒ `scope='user'`（两列都是 NULL）能被同一人订无数次。`template_id` → `ON DELETE CASCADE` |
-| `macro_runs` | **做没做、结果如何**（执行账，只追加）：`anchor`（触发它的事件标识）+ `bucket`（去重桶）+ `state` + `verdict`/`verdict_raw`（归一化口径 vs 模型原话，分开存才能改了口径后重算）+ `reason` / `remediation_text` + `skipped_reason`（八种门禁穷举，见 §2.4）+ `started_at`/`finished_at` + `child_session_id`/`child_run_id`（宏真跑起来时派生的会话与 run，`ON DELETE SET NULL`：会话被清理时账要留着）+ `depth`/`parent_macro_run_id`（挡无限自我派生）+ `snapshot_id`/`worktree_path`（现场引用，**故意不建 FK**：快照是可回收物，SET NULL 会把审计链切断） | `UNIQUE (assignment_id, anchor, state, bucket)` = 幂等键，`macros.js#claimMacroRun` 的 `ON CONFLICT DO NOTHING` 直接依赖它。`assignment_id` → `REFERENCES macro_assignments(id)` **不带 ON DELETE**：取消订阅不许抹掉历史（有账的订阅只能停用） |
+| `macro_runs` | **做没做、结果如何**（执行账，只追加）：`anchor`（触发它的事件标识）+ `bucket`（去重桶）+ **`criterion`（哪条判据叫起来的：`terminal` / `silent` / `tick` / `mechanical` / `semantic`，写完不变）** + **`status`（生命周期：`pending` → `running` → `done`/`failed`，或 `skipped` / `superseded`，会推进）** + `verdict`/`verdict_raw`（归一化口径 vs 模型原话，分开存才能改了口径后重算）+ `reason` / `remediation_text` + `skipped_reason`（八种门禁穷举，见 §2.4）+ `started_at`/`finished_at` + `child_session_id`/`child_run_id`（宏真跑起来时派生的会话与 run，`ON DELETE SET NULL`：会话被清理时账要留着）+ `depth`/`parent_macro_run_id`（挡无限自我派生）+ `snapshot_id`/`worktree_path`（现场引用，**故意不建 FK**：快照是可回收物，SET NULL 会把审计链切断） | `UNIQUE (assignment_id, anchor, criterion, bucket)` = 幂等键，`macros.js#claimMacroRun` 的 `ON CONFLICT DO NOTHING` 直接依赖它。**四列全部写完不变，`status` 不在键里**（见下面的「两轴必须分两列」）。`assignment_id` → `REFERENCES macro_assignments(id)` **不带 ON DELETE**：取消订阅不许抹掉历史（有账的订阅只能停用） |
 
 **三条口径（`portal/src/macros.js` 的三条硬语义，改代码前先读）**：
+
+**两轴必须分两列（issue #524 的设计变更，别合回去）**：`criterion` 回答「这次触发是谁叫起来的」，
+`status` 回答「这一次跑到哪了」。原先是一列 `state` 兼两义 ⇒ 幂等键里带着它，一条账
+`pending → running → done` 之后**键位就空出来**，同一个触发能被再次 claim ⇒ 幂等失效。
+现在：判据五值（`terminal` run 进终态 / `silent` 静默告警 / `tick` 定时轮询 /
+`mechanical` M9 机械可判 / `semantic` M9 需模型裁决）写完不变、进幂等键；
+生命周期六值会推进、不进键。迁移的守卫能抓三种回归：`criterion` 的 CHECK 少了 M9 的两路、
+库里还留着 `state` 列、幂等键里混进了 `status`——三者都在真库上验过「反例必炸」。
 
 1. **认领是 `INSERT … ON CONFLICT DO NOTHING RETURNING id`**，没插到返回 `null`（幂等命中）。
    写成「先 SELECT 再 INSERT」在并发下会让两个调度器各插一行、同一事件跑两遍——唯一索引就成了装饰。
@@ -543,9 +551,10 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 **不**给 `macro_runs` 冗余一份 `template_id`。理由：执行账是只追加的审计表，把可变的派生值
 复制进不可变的历史行等于把同一事实存两处，换绑/重建模板时旧值成假账，还得再写守卫去追平。
 代价是每次多一次等值 JOIN（`assignment_id` 已是 FK 且有索引），W1 量级足够。
-另有 `macro_runs(started_at DESC)`（全局时间线）、部分索引 `(started_at) WHERE state IN
-('pending','running')`（调度器每 tick 扫未收口的账）、`(child_run_id) WHERE NOT NULL`
-（run 详情页反查「由哪次宏触发」）——筛选全落索引列（09 篇 §7）。
+另有 `macro_runs(started_at DESC)`（全局时间线）、`(criterion, started_at DESC)`（「这条判据
+跑过没有」——幂等键那条索引的前缀是 `assignment_id`，服务不了这种筛法）、部分索引
+`(started_at) WHERE status IN ('pending','running')`（调度器每 tick 扫未收口的账）、
+`(child_run_id) WHERE NOT NULL`（run 详情页反查「由哪次宏触发」）——筛选全落索引列（09 篇 §7）。
 
 写入方 = 只有 `portal/src/macros.js`（W1）；读取方 = W2 调度器与 W3 面板（尚未接线）。
 用例：`portal/test/macros.test.js`（幂等键、软删三分支、`until` 到期、四条枚举 CHECK）。
@@ -646,7 +655,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制，attempts+1）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回收（A1/A2 定稿）：`runs.status='cancelling'` → `cancelled` + runs `finished`（aborted）；否则 `attempts < max_attempts` → 回 `pending`（**attempts 不变**），`attempts >= max_attempts` → `done` + runs `failed`（`max_attempts_exceeded`，§2.8） |
 | `queued_inputs.status` | `pending / delivering / delivered / recalled / discarded` | `pending` 由 `POST …/queued-inputs` 产生（会话行锁内，同事务判活跃 run）；`delivering` 由终态出队的 CAS 认领产生（0 行 = 被别人抢先，放弃本轮）；`delivered` 由投递成功后回写（带 `run_id`）；`recalled` 由 `DELETE …/queued-inputs` 整队取回产生；投递失败**退回 `pending`**（下一次终态再来），只有会话已 404 才 `discarded`。消费方：会话详情 `queued_messages` 快照、`queue_update` SSE、上限校验计数。**过期 `delivering` 算可认领**（判据见 §1.29 `claimed_at` 行）且**算在上限里** | 
 | `preview_grants.state` | `active / used / revoked / expired` | `active` 由 portal 签发（ticket）/ forwardAuth 换取（session）产生；`used` 由 forwardAuth 首次校验 ticket 同事务置位；`revoked` 由显式吊销 / allocation released / 用户 disabled 置位；`expired` 由 reaper 按 `expires_at` 懒打标 |
-| `macro_runs.state` | `pending / running / done / skipped / failed / superseded` | `pending` 由 `macros.js#claimMacroRun` 产生（`INSERT … ON CONFLICT DO NOTHING`，抢不到返回 `null`）；`running`/`done`/`failed` 由 W2 执行器经 `finishMacroRun` 推进（进终态补 `finished_at`）；`skipped` = 被门禁挡下，**必带 `skipped_reason`**（八种穷举：`budget_exhausted` / `quiet_hours` / `human_present` / `run_in_progress` / `deferred` / `deferred_timeout` / `active_run_in_cwd` / `cancelled_by_user`——「为什么没跑」是面板要分组的维度，不留自由文本）；`superseded` = 同桶被更新的一次取代。**W1 只有 `pending` 与手工收口，没有主动执行** |
+| `macro_runs.status` | `pending / running / done / skipped / failed / superseded` | **生命周期轴**（`criterion` 是另一轴：判据五值，写完不变、进幂等键，不是状态机 ⇒ 见 §1.33）。`pending` 由 `macros.js#claimMacroRun` 产生（`INSERT … ON CONFLICT DO NOTHING`，抢不到返回 `null`）；`running`/`done`/`failed` 由 W2 执行器经 `finishMacroRun` 推进（进终态补 `finished_at`）；`skipped` = 被门禁挡下，**必带 `skipped_reason`**（八种穷举：`budget_exhausted` / `quiet_hours` / `human_present` / `run_in_progress` / `deferred` / `deferred_timeout` / `active_run_in_cwd` / `cancelled_by_user`——「为什么没跑」是面板要分组的维度，不留自由文本）；`superseded` = 同桶被更新的一次取代。**W1 只有 `pending` 与手工收口，没有主动执行** |
 
 ### 2.5 `route_outbox.state`
 
