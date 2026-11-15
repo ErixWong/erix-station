@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createJail, createStationFileTools, JailError } from '../lib/file-tools.js';
+import { createJail, createStationFileTools, JailError, platformReadExceptions } from '../lib/file-tools.js';
 
 /** 用 tmp 目录做 jail root，工具面走 station 装配（issue #228 后的唯一实现）。 */
 async function withTools(fn, { writable } = {}) {
@@ -570,6 +570,188 @@ test('#259 越界：`..` / symlink / 兄弟路径 / 清单外的家目录文件�
 function agentsDotDot(home) {
   return `${path.join(home, 'AGENTS.md')}/..`;
 }
+
+// ---------------------------------------------------------------------------
+// issue #259 返工（261116，第三方审计 LOW-1）：**例外根自己**是符号链接时，例外会扩张到它的目标。
+// `createJail` 对例外条目也做 realpath（这是 #259 原单故意的：「例外自己是指向别处的目录时，前缀
+// 判定跟着 realpath 走」），于是 agent 用 shell 把 `~/.erix` 换成指向 `/etc` 的链接 ⇒ `/etc/*` 全部
+// 落进例外。上面那批用例只测了「例外**内部**指向外部的 symlink」，**没测例外根被替换**。
+// 修法：例外根 realpath 后必须仍在**声明它的那个目录**之内（对平台那两项就是 `$HOME`），否则
+// 丢弃该条形同不存在 + warn 点名——但不许因此让 jail 构造失败。
+// 夹具走的是 worker 真实装配形状：`platformReadExceptions({ home })` → `createJail`。
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {function} fn 拿到 { jail, tools, build, home, project, base, target, declared, warnings }
+ * @param {{entry?: string, kind?: 'dir'|'file', targetOf: (o:{home:string, base:string})=>string}} o
+ *   `entry` = 被换掉的那条例外（默认 `.erix`；传 `AGENTS.md` 验「两项走同一个归属判据」）；
+ *   `targetOf` 给链接目标的位置（家目录**内**还是**外**由调用方定）。
+ */
+async function withReplacedExceptionRoot(fn, { entry = '.erix', kind = 'dir', targetOf } = {}) {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-259-sym-')));
+  const home = path.join(base, 'home');
+  const project = path.join(home, 'projects', 'todo');
+  fs.mkdirSync(path.join(home, '.erix'), { recursive: true });
+  fs.mkdirSync(path.join(home, '.ssh'), { recursive: true });
+  fs.mkdirSync(project, { recursive: true });
+  fs.writeFileSync(path.join(home, 'AGENTS.md'), '# 平台约束\n收工即提交\n');
+  fs.writeFileSync(path.join(home, '.erix', 'keep.txt'), 'needle keep\n');
+  fs.writeFileSync(path.join(home, '.ssh', 'id_ed25519'), 'PRIVATE-KEY-OUTSIDE-EXCEPTION\n');
+  fs.writeFileSync(path.join(project, 'a.txt'), 'project file\n');
+  // 链接目标（被指向的那一棵）：位置由调用方给，内容这里铺好
+  const target = targetOf({ home, base });
+  if (kind === 'dir') {
+    fs.mkdirSync(path.join(target, 'secrets'), { recursive: true });
+    fs.writeFileSync(path.join(target, 'ports.json'), '{"allocations":[{"port":22000}]}\n');
+    fs.writeFileSync(path.join(target, 'secret.txt'), 'EXCEPTION-TARGET-CONTENT\n');
+    fs.writeFileSync(path.join(target, 'secrets', 'token.txt'), 'needle target secret\n');
+  } else {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, '# 外枛的平台约定\nTARGET-RULES\n');
+  }
+  const declared = path.join(home, entry);
+  fs.rmSync(declared, { recursive: true, force: true });
+  fs.symlinkSync(target, declared);
+  const warnings = [];
+  const build = (extra = {}) => createJail({
+    root: project,
+    writable: [project],
+    readExceptions: platformReadExceptions({ home }),
+    warn: (message) => warnings.push(message),
+    ...extra,
+  });
+  const jail = build();
+  const tools = createStationFileTools({ jail, cwd: project });
+  try {
+    return await fn({ jail, tools, build, home, project, base, target, declared, warnings });
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+}
+
+test('#259 归属检查①：例外根自己被换成指向**家目录之外**的 symlink ⇒ 该条形同不存在（目标目录整个读不到 + warn 点名两个路径）', () =>
+  withReplacedExceptionRoot(async ({ jail, tools, home, project, target, declared, warnings }) => {
+    // ① 目标目录下的文件读不到（旧行为：realpath 把整棵目标目录纳入例外，这里会直接读出内容）
+    const viaLink = path.join(home, '.erix', 'secret.txt');
+    const read = String(await tools.executors.readFile({ path: viaLink }));
+    assert.match(read, /^错误：读取被宿主边界拒绝/u, '例外根指向家目录外 ⇒ 不得把目标目录变成例外（审计 LOW-1 的复现格）');
+    assert.doesNotMatch(read, /EXCEPTION-TARGET-CONTENT/u, '被挡的同时一字节都不许漏');
+    assert.match(String(await tools.executors.tree({ path: path.join(home, '.erix') })),
+      /^错误：读取被宿主边界拒绝/u, 'tree 走同一个读侧解析，不得例外');
+    // ② 「丢弃该条形同不存在」是可观测的：清单里没它、丢弃事实挂上、写拒因退回越界
+    assert.deepEqual(jail.readExceptions, [path.join(home, 'AGENTS.md')], '被丢弃的条目不得残留在清单里');
+    assert.deepEqual(jail.droppedReadExceptions.map((d) => d.declared), [declared], '丢弃事实要挂给装配方复核');
+    assert.throws(() => jail.resolveForWrite(path.join(home, '.erix', 'new.txt')),
+      (e) => e instanceof JailError && e.code === 'path_escapes_root',
+      '丢弃之后这条不再是例外 ⇒ 写拒因退回「越界」，不得继续披「只读例外」的说法');
+    // ③ warn **点名两个路径**（哪个例外根、解析到了哪里）
+    assert.equal(warnings.length, 1, `应当正好一条 warn，实际：${JSON.stringify(warnings)}`);
+    assert.ok(warnings[0].includes(declared), `warn 要点名被丢弃的例外根 ${declared}：${warnings[0]}`);
+    assert.ok(warnings[0].includes(fs.realpathSync(target)), `warn 要点名它解析到了哪里：${warnings[0]}`);
+    assert.match(warnings[0], /drop|丢弃/iu, `warn 要说清为什么丢弃：${warnings[0]}`);
+    // ④ 丢弃不得连坐（这一格同时挡住「把例外全关了蒙过①」的假实现）
+    assert.match(await tools.executors.readFile({ path: path.join(home, 'AGENTS.md') }), /收工即提交/u,
+      '另一条例外（$HOME/AGENTS.md）必须照旧读得到');
+    assert.match(await tools.executors.readFile({ path: 'a.txt' }), /1: project file/u, '项目目录不受影响');
+    assert.equal(jail.root, project);
+  }, { targetOf: ({ base }) => path.join(base, 'outside', 'erix') }));
+
+test('#259 归属检查①红线：丢弃**不许**让 jail 构造失败——落在被丢弃例外之下的遮蔽条目只 warn不抛；两者之外的照旧抛', () =>
+  withReplacedExceptionRoot(async ({ build, home, warnings }) => {
+    // 生产侧今天没接 maskedPaths（`grep -n maskedPaths runner/worker.js` = 0），但「例外内遮蔽」是
+    // #259 开的口——将来接上之后，agent 一个 `ln -s` 不得变成「worker 起不来」。
+    assert.doesNotThrow(() => build({ maskedPaths: [path.join(home, '.erix', 'secrets')] }),
+      '遮蔽条目落在那条形同不存在的例外之下 ⇒ 丢弃 + warn，不得在装配期抛 JailError');
+    assert.ok(warnings.some((w) => /masked/iu.test(w)), `该点名被跳过的遮蔽条目：${JSON.stringify(warnings)}`);
+    // 旧守卫原样保留：根与例外**都之外**的遮蔽条目仍是装配期抛（不静默吞掉写歪的规则）
+    assert.throws(() => build({ maskedPaths: [path.join(home, '.ssh')] }),
+      (e) => e instanceof JailError && e.code === 'path_escapes_root');
+  }, { targetOf: ({ base }) => path.join(base, 'outside', 'erix') }));
+
+test('#259 归属检查②：例外根自己被换成指向**家目录之内**另一处的 symlink ⇒ 仍然读得到（合法重排不许打死）', () =>
+  withReplacedExceptionRoot(async ({ jail, tools, home, target, warnings }) => {
+    assert.deepEqual(warnings, [], '家目录内的重排是合法形状：不该有 warn');
+    assert.deepEqual(jail.droppedReadExceptions, [], '不该被丢弃');
+    assert.deepEqual(jail.readExceptions,
+      [path.join(home, 'AGENTS.md'), fs.realpathSync(target)], '清单存解析后的真身（跟随合法重排）');
+    const ports = path.join(home, '.erix', 'ports.json');
+    assert.match(await tools.executors.readFile({ path: ports }), /allocations/u,
+      '穿过 symlink 也必须读得到——这就是「不要把合法重排一起打死」的那一格');
+    assert.match(String(await tools.executors.tree({ path: path.join(home, '.erix') })), /ports\.json/u);
+    // 写边界一字未动：合法重排之后仍然是「能读不能写」
+    assert.throws(() => jail.resolveForWrite(ports),
+      (e) => e instanceof JailError && e.code === 'path_read_only');
+    // 但例外**不是家目录**：同一棵夹具里家目录的别处仍然读不到（重排没把判据松成家目录）
+    assert.match(String(await tools.executors.readFile({ path: path.join(home, '.ssh', 'id_ed25519') })),
+      /^错误：读取被宿主边界拒绝/u);
+  }, { targetOf: ({ home }) => path.join(home, 'relocated', 'erix') }));
+
+test('#259 归属判据只有一条：`$HOME/AGENTS.md` 被换成指向家目录外的 symlink 同样丢弃（不写两套逻辑）', () =>
+  withReplacedExceptionRoot(async ({ jail, tools, home, target, declared, warnings }) => {
+    assert.deepEqual(jail.droppedReadExceptions.map((d) => d.declared), [declared]);
+    const read = String(await tools.executors.readFile({ path: path.join(home, 'AGENTS.md') }));
+    assert.match(read, /^错误：读取被宿主边界拒绝/u, '指向家目录外的 ~/AGENTS.md 不得把外面那个文件接进来');
+    assert.doesNotMatch(read, /TARGET-RULES/u);
+    assert.ok(warnings.some((w) => w.includes(declared) && w.includes(fs.realpathSync(target))),
+      `warn 同样要点名两个路径：${JSON.stringify(warnings)}`);
+    // 另一条（`.erix` 真目录）不受影响——同一个判据不连坐
+    assert.match(await tools.executors.readFile({ path: path.join(home, '.erix', 'keep.txt') }), /needle keep/u);
+  }, { entry: 'AGENTS.md', kind: 'file', targetOf: ({ base }) => path.join(base, 'elsewhere', 'platform-rules.md') }));
+
+test('#259 归属判据的边界格（登记的残余风险）：例外根解析后**正好等于**家目录 ⇒ 保留（扩张上界是家目录，不是任意路径）', () =>
+  withReplacedExceptionRoot(async ({ jail, tools, home, warnings }) => {
+    assert.deepEqual(warnings, [], '「仍在声明它的目录之内」（这里就是恰等于家目录）不算越界');
+    assert.ok(jail.readExceptions.includes(fs.realpathSync(home)), '清单存的是家目录本身');
+    // 已知残余（写进 §8.135，不当缺陷遮）：`.erix -> $HOME` 会把例外放大到**整个家目录**，
+    // 但不会超出家目录——判据是「不得搬出声明它的目录」，不是安全边界（shell 本来就不受 file jail 约束）。
+    assert.match(String(await tools.executors.readFile({ path: path.join(home, '.erix', '.ssh', 'id_ed25519') })),
+      /PRIVATE-KEY-OUTSIDE-EXCEPTION/u, '本格钉的是「今天的真实行为」，将来收紧要同步改这里');
+  }, { targetOf: ({ home }) => home }));
+
+test('#259 `.erix` 尚未物化（新 FDE 第一次 run）：条目保留 + jail 放行，实际读报「路径不存在」而不是谎报权限', async () => {
+  // 审计事实：有效 HOME 但 `.erix` **不存在**时，例外仍保留该条、`assertReadable` 放行，实际 `readFile`
+  // 报「路径不存在」；而旧用例只覆盖了**无效 HOME 参数**那一支。这里钉住今天的形状（不是改它）：
+  // 「还没物化」不得被说成「权限/边界问题」（模型会以为平台挡了它，白绕一圈），
+  // 而物化之后同一条路径自然就读得到——那是「例外随物化生效」的本意，不是缺陷。
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-259-fresh-')));
+  const home = path.join(base, 'home');
+  const project = path.join(home, 'projects', 'todo');
+  fs.mkdirSync(project, { recursive: true });   // 家目录存在，但 `~/.erix` 一个字节都没物化过
+  const warnings = [];
+  const jail = createJail({
+    root: project, writable: [project],
+    readExceptions: platformReadExceptions({ home }),
+    warn: (message) => warnings.push(message),
+  });
+  const ports = path.join(home, '.erix', 'ports.json');
+  try {
+    // ① 条目**保留**（不是丢弃、不是静默关掉），而且归属检查不开火
+    assert.deepEqual(jail.readExceptions, [path.join(home, 'AGENTS.md'), path.join(home, '.erix')],
+      '「还没物化」不是「例外不成立」：条目必须保留，物化之后自动生效');
+    assert.deepEqual(jail.droppedReadExceptions, [], '不存在 ≠ 归属不对');
+    assert.deepEqual(warnings, [], '没丢弃就不该刷 warn（每个 run 都刷一遍会把真信号埋掉）');
+    // ② jail 层**放行**（谓词不拦它）
+    assert.equal(jail.assertReadable(ports), ports, '读侧必须放行，否则「物化之后自动生效」就成了谎');
+    // ③ 真读：报「不存在」，而且**不谎报权限/边界**
+    const tools = createStationFileTools({ jail, cwd: project });
+    let text = '';
+    try {
+      text = String(await tools.executors.readFile({ path: ports }));
+    } catch (error) {
+      text = String(error?.message ?? error);
+    }
+    assert.match(text, /不存在|ENOENT/u, `该报「路径不存在」，实际：${text}`);
+    assert.doesNotMatch(text, /被宿主边界拒绝|只读例外|权限/u,
+      `不许把「还没物化」谎报成边界/权限问题（那是另一个拒因，模型会走错分支）：${text}`);
+    // ④ 物化之后同一条路径就真读得到（同一 jail，不重建）
+    fs.mkdirSync(path.join(home, '.erix'), { recursive: true });
+    fs.writeFileSync(ports, '{"allocations":[{"port":22000}]}\n');
+    assert.match(await tools.executors.readFile({ path: ports }), /allocations/u,
+      '例外随物化自然生效——这才是「条目保留」而不是「条目丢弃」的理由');
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
 
 test('#259 遮蔽继续生效：例外内的遮蔽项读不到、计入排除账、tree 不列（前缀形态条目）', () =>
   withHomeFixture(async ({ tools, home }) => {
