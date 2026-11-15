@@ -343,6 +343,10 @@ export function createStationFileTools({ jail, cwd, maskedPaths = [], allowRead,
   const hostAllowWrite = typeof allowWrite === 'function' ? allowWrite : () => true;
   const maskedTable = compileMaskedTable(root, maskedPaths);
 
+  // ⚠ 无 jail 时这里是**单向**检查：同一个 `target` 既当词法路径、又当 realpath 结果交进去（上游给的
+  //   是词法解析后的绝对路径）⇒ 「普通名字指向被遮名」（`alias.txt -> .env`）这一面会漏；生产不受影响，
+  //   `worker.js:559-560` 供了 jail，两个方向由 `assertReadable` 那一路补齐（它拿的是两个不同的值）。
+  //   口径登记：`docs/design/runner-integration.md` §17.1——已知事实，**不**为此改装配语义或加参数。
   const withinMasked = (target) => maskedViolation(maskedTable, root, target, target);
   // jail 的越界/非可写/遮蔽都是 JailError → 谓词返回 false（上游据此回「错误：…被宿主边界拒绝」文本，
   // 不再像 fork 那样抛）。非 JailError（例如 realpath 撞 EACCES）照旧上抛，不静默吞。
