@@ -8,7 +8,7 @@
 //     必须等于**生效值**（不是 env 值）」。
 //
 // 隔离约定（docs/testing.md §2.1）：tmp userspace + FakePool + 手工 session，不碰真实 DB / 真实 dev 栈。
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -479,6 +479,12 @@ async function withKnob(raw, fn) {
     delete process.env[READ_TIMEOUT_KNOB];
   }
 }
+
+// 心跳：故意留一个**被引用**的定时器，让「永不 settle」的读取不会把事件循环抽干。
+// 没有它，变异「去掉超时」的表现是整轮 runner 被 `cancelledByParent` 带走（连带 6 条无辜的红，
+// 看不出哪条是信号）；有了它，表现就是**该红的用例各自超时**（US-15/17），其余照跑。
+const heartbeat = setInterval(() => {}, 1000);
+after(() => clearInterval(heartbeat));
 
 /** 一条**永不 settle**的读语句（不是抛错！抛错那条路径 US-5 已经钉过了）。 */
 const HANGING_READ_POOL = { query: () => new Promise(() => {}) };
