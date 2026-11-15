@@ -5513,3 +5513,44 @@ uid ≠ 1000 时文件其实早就写出来了，测试却白等 120 s，报一�
   之后 `node --test portal/integration/wp3b-e2e.mjs` ⇒ **rc=1 / 210 ms**，日志里一次 docker 都没发（唯一含
   `docker` 的那行是文案本身）⇒ #495 ① 的「秒级失败 + 点名要复制哪个文件」成立。
   **仍然未验**只剩：`wp3b`/`wp5`/`wp6` 的全量 e2e 复跑（要 docker + 整套隔离栈 env）。
+
+**返修补记（同批 worker，工单 fix-261116-01 的第二轮；只动两处，键值校验那条线按裁决不碰）**
+
+*活一：末段是符号链接 ⇒ 变成一条**独立可诊断事实**，三态归属一个字没改。*
+裁决记下来：预检是**诊断面**不是策略闸门——bind 源做成符号链接是合法配置（别的操作机的机器就这么摆），
+所以**不开第四态**（`waitForHostFile` 的「提前放弃 / 等满超时」两种形状已被判据钉住，加态会连锁打崩时间判据）。
+- `observeLastSegmentLink()`（`lstatSync` + `readlinkSync`）+ `formatLastSegmentLinkLine()`（**非链接 ⇒ 空串**，
+  不是来一句「不是链接」）；`observeHostPath` 每条返回都带 `link`；`unreadable` / `missing` 两种失败文案都带上这行
+  「`<路径> 是符号链接 → <目标>`；若这是宿主 bind 源，portal 容器里看到的是**链接目标那一侧**」。
+- 为什么必须单独说：`statSync` / `readFileSync` **跟随**链接 ⇒ 「链接指向可读文件」与「真文件」在状态上完全同形，
+  不说出来就是拿状态猜挂载形态。悬空链接**仍归 `missing`**（`statSync` 对它抛 ENOENT），但文案额外说一句
+  「缺的是**链接目标**，不是链接本身」。注入的 `fsImpl` 没有 `lstatSync` ⇒ `isSymlink=null` + `detectable=false`
+  （不许假装「不是链接」）。
+- 两格新判据（CI）：`L1` 链接+目标可读 ⇒ 仍 `present` 且链接事实为真、诊断行含 `符号链接` / 原样目标 / 解析后绝对目标；
+  `L2` 真文件 ⇒ 事实为假、`formatLastSegmentLinkLine()===''`、等待超时的文案里 `doesNotMatch(/符号链接/)`（反向自证）；
+  `L3` 悬空链接 ⇒ `missing` + `missingPrefix=链接路径`（归属不动）+ 文案点名缺的是目标 + `doesNotMatch(/读不到|FDE_USER_UID/)`。
+
+*活二：把上面登记的盲区（M4）补到负例门上*——`isolation-negative` 的 `expectThrow/expectReject` 加了
+`namesMustNotInclude`（「两种失败不许互串」的另一半判据以前表达不出来，只能靠人读输出），并加**陷阱 13**：
+链能进、叶子在 `stat` 与 `read` 之间消失 ⇒ 必须按没物化报（含快照那句 `No such file or directory`）
+且**不许**出现 `读不到` / `FDE_USER_UID`。夹具走注入：真 fs 单次调用造不出这个竞态窗口（`stat` 与 `read` 之间）。
+`#495` 正例组同时加链接四格 + 叶子级一格 ⇒ 「链级 / 叶子级」现在在**两个门**上都不可混。
+
+**本轮变异读数（每发都带 `MUTANT` 标记，跑完 `git checkout` 还原、`grep -rn MUTANT portal test`=0、`git status` 干净）**
+
+| 发 | 改了什么 | CI 门 | `--strict` |
+|---|---|---|---|
+| MT1 | 链接事实写死成恒真 | `# pass 16 / # fail 1`：**`not ok 14 - L2 ② 末段是真文件 ⇒ 链接事实为假…`** | rc=1 `正例夹具被抛错 … 真文件不许被写成链接` |
+| MT2 | 用 `statSync` 代替 `lstatSync`（不检末段） | `# pass 15 / # fail 2`：**`not ok 13 - L1`** + **`not ok 15 - L3`** | rc=1 `正例夹具被抛错 … 链接事实必须为真` |
+| MT3 | 叶子级 ENOENT 误归 `unreadable`（= 上一轮的 M4） | `# pass 15 / # fail 2`：`not ok 9 - P8` + **`not ok 16 - L4`** | rc=1 **`TRAP FAIL · waitForHostFile() 链能进但叶子不存在 ⇒ 按没物化报且不许喊权限`**（上一轮这里是全绿=盲区，现已堵） |
+
+干净树读数：CI 门 `# tests 17 / # pass 17 / # fail 0`（rc=0）；`isolation-negative --strict` rc=0
+（`verdict=TRAPS_FIRED（全部 13 条陷阱=均硬失败；单一来源=一份定义）`，缺省模式 rc=1 是刻意的负例证据口径）；
+`npm run check:agents-hotlayer` rc=0。里程碑 1 单独状态（旧 harness + 新 lib）也独立跑过：17/17 + `--strict` rc=0
+（12 条陷阱），所以两个提交各自都是绿的。
+`grep -rn "['\"](/srv/erix/users" portal/integration --include=wp*.mjs` 仍 0 处；单一来源钉新增
+`observeLastSegmentLink` / `formatLastSegmentLinkLine` 两个名字。
+
+**判据差项现在只剩**：① 「链**逐段 lstat**、末段不许是符号链接」的 *fail-closed* 版本刻意不做（主 agent 裁决只诊断）；
+链检本身仍是 `statSync`+`accessSync`（跟随链接），但末段链接事实已由 `observeLastSegmentLink` 单独说出并写进文案；
+② env 键值（值非法）校验不做（那条线在 `portal/test/deploy-env-defaults.test.js`）；③ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
