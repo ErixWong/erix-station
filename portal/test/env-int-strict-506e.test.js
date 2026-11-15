@@ -27,6 +27,14 @@ const LOOSE_LADDER = [250, 500, 1000, 2000, 4000, 8000];   // max=10000 生效�
 // 假时钟 + fake pool（与 idle-backoff-safe-range-506b.test.js 同一形状，自带一份避免跨文件耦合夹具）
 // ---------------------------------------------------------------------------
 
+// arm() 的等待预算（真实时间）。为什么**不能**用固定迭代次数（原写法 `for (let i = 0; i < 300 …)`）：
+// 一次 `setImmediate` 让出换算成多少真实时间**取决于机器负载**，两者不成比例——CI 上事件循环被同机
+// 别的进程压住时，300 次让出可能只走完几十毫秒，被测循环还没走到它那一拍的 sleep，断言就假红
+// （同一 commit 本地全绿、CI 约一半红，2026-11-16 一天撞了 5 次，日志实证见
+// `循环必须停在某一拍的 sleep 上`）。判据本身问的是「循环有没有停住」，那是**时间**问题，
+// 所以预算按真实时间给；超时仍然必须红（不许改成「等不到就算了」）。
+const ARM_BUDGET_MS = 5000;
+
 function makeFakeClock() {
   const clock = { nowMs: 0, sleeps: [], pending: null };
   const now = () => clock.nowMs;
@@ -46,8 +54,12 @@ function makeFakeClock() {
     clock.pending = entry;
   });
   async function arm() {
-    for (let i = 0; i < 300 && !clock.pending; i += 1) await new Promise((r) => setImmediate(r));
-    assert.ok(clock.pending, '循环必须停在某一拍的 sleep 上');
+    const startedAt = Date.now(); // 真实时间：假时钟的 now() 在这儿是不动的，量不出等了多久
+    while (!clock.pending && Date.now() - startedAt < ARM_BUDGET_MS) {
+      await new Promise((r) => setImmediate(r));
+    }
+    const waitedMs = Date.now() - startedAt;
+    assert.ok(clock.pending, `循环必须停在某一拍的 sleep 上（已等 ${waitedMs}ms / 预算 ${ARM_BUDGET_MS}ms）`);
   }
   async function release() {
     const entry = clock.pending;
