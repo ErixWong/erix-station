@@ -235,6 +235,12 @@ services:
       PORT_QUOTA: ${PORT_QUOTA:-40}
       FDE_POOL: ${FDE_POOL:-default}
       IPAM_RESERVED_SUBNETS: ${IPAM_RESERVED_SUBNETS:-}
+      # IPAM **分配器**从哪一段里切（issue #270）。缺省值逐字 = #270 之前 portal/src/ipam.js 硬编码的
+      # 那两段 ⇒ 不设 env 时行为零变化。前缀长度不是旋钮（恒 /29 与 /28，`fde_networks` 的 DDL CHECK 钉的）。
+      # ⚠ 与下面 proxy 的 IPAM_POOLS（**放行面**）是两个变量：分配段必须落在放行面之内，
+      # 否则 `network create` 会被 proxy 拒（reason 里会同时点名两侧变量名）。隔离 e2e 由栈 id 单一派生两头。
+      IPAM_POOL_DEFAULT: ${FDE_IPAM_POOL_DEFAULT:-10.200.0.0/16}
+      IPAM_POOL_LARGE: ${FDE_IPAM_POOL_LARGE:-10.201.0.0/16}
       FDE_USER_UID: ${FDE_USER_UID:-1000}
       FDE_USER_GID: ${FDE_USER_GID:-1000}
       # ---- WP2b：FDE provisioning + preview ticket ----
