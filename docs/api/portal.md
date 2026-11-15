@@ -2794,7 +2794,7 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   > 缓冲的条目上限 `maxEntries = 32`（`run-partial-buffer.js` 的 `PARTIAL_MAX_ENTRIES_DEFAULT`）。
   > ⚠ **N=32 的来源要说准：它是内存槽上限，不是并发上限，也不是任何「平台允许同时跑几个 run」的声明**——
   > 单 entry 两路（`text` / `reasoning`）**各自**夹到 `textCap` 16,384 字符 ≈ 64 KB ⇒ 全表 32 × 64 KB ≈ 2 MB；
-  > 取 32 而非 256 的理由是「单进程同时跑的 run 是个位数 ⇒ 十倍余量，多出来是常驻浪费」（算术在
+  > 取 32 而非 256 的理由是「**当前部署**下单 portal 进程同时跑的 run 是个位数 ⇒ 十倍余量，多出来是常驻浪费」（**不是**代码上限，见下一条）（算术在
   > `run-partial-buffer.js` 文件头）。它**不与 portal 级 active-run 上限绑定**——那种上限今天不存在（见下面裁决 ①）。
   > `evictOne()` **优先逐已终态的 entry**（`markTerminal` 标过的那些）；只有当**同时 >32 个活跃 run 且一条终态
   > 条目都没得逐**时，它才必须逐一个**仍在流**的 run。
@@ -2810,7 +2810,7 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   >     的补发判据（「run + `roundSeq` 两端都匹配才覆盖气泡」）**整帧丢弃** ⇒ 重连也补不回来。
   >     **这条尾巴是独立的正确性问题，#515 不修**（主 agent 另开单跟）；今天由
   >     `portal/test/healthz-partial-buffer.test.js` 里那条「钉**今天的真实行为**」的用例钉住 ⇒ 谁修它，谁就必须回来改本段口径。
-  > 今天**踩不到**：单 portal 副本 + 实际并发远小于 32（认领 SQL 串行 + 会话租约 ⇒ 单进程同时跑的 run 是个位数）。
+  > 今天**没踩到**，但要说准：**这是部署现状，不是代码保证**。逐出活跃 run 需要**同时 >32 个活跃 run**，而活跃并发 = Σ(每个 agentd 的 capacity)——缺省 **2/agentd**（`runner/agentd.js:15-17`，`ERIX_AGENTD_CAPACITY` 可调），portal 侧**没有**全局上限，认领是 `FOR UPDATE SKIP LOCKED` **逐行放行**（`portal/src/internal.js:257-280`，**不是全局串行**）。261116 现网读数：6 个 `fde-*` 容器 ⇒ 并发上界约 12；库里 `status in ('running','queued')` 的 run = **个位数**。**FDE 数 × 2 越过 32（约 17 台）就会开始逐活跃 run**，那时 `evictedActive` 会跳（见下面的可观测面）。
   > **可观测面（裁决的 ② 轻量版）**：逐出活跃 run 会计 `stats().evictedActive` 并打一条 `log.warn`（这两半
   > 本单之前就有），本单补的是第三半：**`GET /healthz` / `/api/health` 的 200 响应多带一块
   > `partialBuffer: { entries, maxEntries, evictedActive }`**（`portal/src/http.js#partialBufferHealth`）——
