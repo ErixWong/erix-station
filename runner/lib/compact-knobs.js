@@ -92,58 +92,35 @@ export function assertCompactContext(context) {
 }
 
 // ── issue #440：`config.folding` **层**的两个工具结果旋钮（`toolResultTtl` / `toolResultFoldMinTokens`）──
+// 校验已退役：见下方「本站不再自带校验」那段（erix-agent 0.33.0 / issue #530）。
+// 保留的历史事实（值域口径的出处，现在靠引擎兑现）：
+//   · 这两个叶子在 `CONFIG_NAMESPACE_SCHEMA.folding` 的**组层**，不在 `folding.context` 里
+//     ⇒ `assertCompactContext` 管不到它们（那是另一层，上面的白名单不包含它们）；
+//   · 值域按引擎语义定，不按「正整数」一刀切（`tool-result-ttl.js:244-245`）：`0` = **关掉 TTL 折叠**
+//     ⇒ 合法；负数 / 小数 / 字符串 / `null` 全拒（这条不直觉的口径现在由引擎逐字同语义地校着）。
+// ────────────────────────────────────────────────────────────────────────────────
+// `config.folding` 组层的两个工具结果旋钮（`toolResultTtl` / `toolResultFoldMinTokens`）：
+// **本站不再自带校验**（issue #440 曾加过一道，erix-agent 0.33.0 起退役成这段注释）。
 //
-// 为什么在这里另立一道（先核实过引擎**不校**这两个叶子，0.29.0）：
-//   · 它们是 `CONFIG_NAMESPACE_SCHEMA.folding` 里的合法叶子（`src/loop/config-namespace.js:222-223`），
-//     所以不会撞「unknown config.folding option」；
-//   · 但 `CONFIG_LEAF_VALUE_RULE_PATHS`（`config-namespace.js:569-587`）只登记了 `run.stream` 与
-//     `continuity.handoff` 两条值规则 ⇒ 这两个叶子**没有值规则**，任何值都收；
-//   · 读侧是 `resolvedToolResultTtl = toolResultTtl ?? TOOL_RESULT_TTL_DEFAULT`（`orchestrator.js:794`）
-//     与 `toolResultFoldMinTokens = TOOL_RESULT_FOLD_MIN_TOKENS_DEFAULT`（`:703`）——**裸 ?? 缺省**，
-//     不校验类型。真链路实测（真 `runToolLoop`，四个非法值各跑一发）：`'6'` / `-1` / `null` / `1.5`
-//     全部正常收尾，**不抛、不告警**，
-//     行为退化成「TTL 折叠静默失效」（`tool-result-ttl.js:245`：`ttl <= 0 || minTokens <= 0` ⇒ no-op；
-//     字符串走 `Number.isFinite` 守卫 `:241` ⇒ 直接原样返回）。
-//   ⇒ 与 #469 A4 同一个理由：本站走直连 `runToolLoop`，值是**代码写死的**（本片不给 env 旋钮），
-//     所以配错 = 编程错误，崩在起跑前比静默用默认值好。
+// 为什么曾有它（#440，当时引擎 0.29.0 / 0.30.0）：那两个叶子是 `CONFIG_NAMESPACE_SCHEMA.folding`
+// 的合法叶子，但**不在** `CONFIG_LEAF_VALUE_RULE_PATHS` 里 ⇒ 没有值规则，读侧是裸 `??` 缺省
+// （`orchestrator.js:794` / `:703`）⇒ `'6'` / `-1` / `1.5` / `null` 一路静默，行为退化成
+// 「TTL 折叠静默失效」（看起来配上了、其实是关的）。本站走直连 `runToolLoop`、值是代码写死的
+// ⇒ 配错 = 编程错误，所以当时自己加了 `assertFoldingToolResultKnobs` 在起跑前 fail-fast。
 //
-// 值域按引擎语义定，不按「正整数」一刀切（`tool-result-ttl.js:244-245`）：
-//   · `toolResultTtl: 0` = **关掉 TTL 折叠**（引擎自己 `cacheCapable === true` 时就是这么关的，
-//     `orchestrator.js:794-796`）⇒ 合法；负数/小数/字符串/`null` 全拒；
-//   · `toolResultFoldMinTokens: 0` = 同样关掉（`:245`）⇒ 合法；其余同上。
-// ⚠ 本站当前传的是 6 / 8000（见 `worker.js` 的 `#440:ttl-knobs` 段），`0` 合法只是**校验口径**，
-//   不代表本站现在用 0。
-export const FOLDING_TOOL_RESULT_KEYS = Object.freeze(['toolResultTtl', 'toolResultFoldMinTokens']);
+// 为什么现在退役（issue #530 / feat-261115-08，261115 在装着的 0.33.0 上现查）：上游开始校了。
+//   · `CONFIG_LEAF_VALUE_RULE_PATHS` 现在含 `folding.toolResultTtl` / `folding.toolResultFoldMinTokens`
+//     / `folding.context`（0.32.0 只有 `continuity.handoff` / `metadata.modelMetadata` / `run.stream`）；
+//   · 真 `runToolLoop` 实测（261115）：`toolResultTtl: '6'` / `-1` / `1.5` 全部**启动期抛**
+//     `TypeError: config.folding.toolResultTtl must be a non-negative integer (received: …)`；
+//     `0` 与正整数**过**（只在我那个最小桦具的 `executeTool` 上停）。
+// ⇒ 引擎的校验收与本站那道**逐字同语义**（含「`0` = 关掉 ⇒ 合法」这条不直觉的口径）。
+//   留着就是重复造闸：两套校验重叠时，真正会错的那一半是**不生效的那一半**（它会给出
+//   「已经校过了」的错觉）。所以删函数，不留空壳。
+//   ⚠ 退役的是**校验**，不是那两个旋钮：`worker.js` 的 `#440:ttl-knobs` 区间里那两行照旧在场
+//     （它们是待 A/B 验证的**裁定**，不是定论；A/B 回退 = 删那两行）。「键必须在场 + 值等于 N」
+//     的钉法由 `runner/test/fold-strategy.test.js` 的 #440-B4/B5 继续担，不依赖本站的校验器。
+//   ⚠ 值域现在由**引擎**定：上游哪天放宽或收紧，报错形状会变，而 #440-K13 钉的就是
+//     「`folding.*` 已在那张表里 + 本站不再自带校验」⇒ 上游改回去时 K13 会红，不会静默。
+// ────────────────────────────────────────────────────────────────────────────────
 
-/**
- * @param {Record<string, unknown>|undefined} knobs 要交给 `runToolLoop({ config: { folding } })` 的
- *   `folding` 层（**不是** `folding.context`——那两个叶子在组层，`assertCompactContext` 管不到）。
- * @returns {string[]} 问题列表（空 = 通过）
- */
-export function collectFoldingToolResultProblems(knobs) {
-  if (knobs === undefined || knobs === null) return [];
-  if (typeof knobs !== 'object' || Array.isArray(knobs)) return ['folding tool-result knobs must be a plain object'];
-  const problems = [];
-  for (const [key, value] of Object.entries(knobs)) {
-    if (!FOLDING_TOOL_RESULT_KEYS.includes(key)) {
-      problems.push(`unknown folding tool-result knob ${JSON.stringify(key)} (only ${FOLDING_TOOL_RESULT_KEYS.join(' / ')} are validated here)`);
-      continue;
-    }
-    if (value === undefined) continue; // 省略 = 用引擎默认（0.29.0：2 / 4000）
-    if (!Number.isSafeInteger(value) || value < 0) {
-      problems.push(`${key} must be a non-negative integer (0 = off), got ${JSON.stringify(value)}`);
-    }
-  }
-  return problems;
-}
-
-/**
- * 起跑前的 fail-fast（同 `assertCompactContext` 那一档：抛出去走 #212 失败信封）。
- * 返回入参本身，方便在 `worker.js` 里用 `...assertFoldingToolResultKnobs({...})` 展开。
- * @param {Record<string, unknown>|undefined} knobs
- */
-export function assertFoldingToolResultKnobs(knobs) {
-  const problems = collectFoldingToolResultProblems(knobs);
-  if (problems.length > 0) throw new TypeError(`invalid folding tool-result knobs: ${problems.join('; ')}`);
-  return knobs;
-}

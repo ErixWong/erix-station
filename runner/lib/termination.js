@@ -14,6 +14,16 @@
 //   `server` / `disconnect`，再加 `checkpoint_failed`（`src/loop/run-snapshot-executor.js` 抛的
 //   KitError，已对外文档化为可重试，见 docs/api/portal.md §6.2/§6.4）。
 //
+// ⚠ **`checkpoint_failed` 自 erix-agent 0.33.0（上游 #838 S2，本站 #530）已不再产出**：run snapshot
+//   退役 ⇒ 抛它的 `checkpoint_before_tool` / `checkpoint_after_tool` 两个 phase 一起退役（0.33.0
+//   `src/loop/termination.js` 的注释已自己写明「`checkpoint_failed` 已退役」；本站 261115 现查两份
+//   `npm pack` 解包的 diff 确认）。但下面集合里那一项**故意保留**，不是没打扫干净：
+//   旧档案（0.33 之前写的 run）的 `runs.error_code` / `termination.errorCode` 里已经写着这个码，
+//   而重试判定是**读旧账时做的** ⇒ 摘掉它会把历史上本该重试的失败run 改判成不可重试（语义变更，
+//   不是卫生问题）。⇒ **值域不动**，本单只改这段注释；前端 `RUN_RETRYABLE_ERROR_CODES` 同步不动
+//   （`portal/test/termination-contract.test.js` 钉两边逐项一致，改一处必改另一处）。
+//   旧 transcript 行被归档之后可以再评删除（与 #303 同一条触发条件），本单不动。
+//
 // ⚠️ 单一真相：可重试码集的权威常量在前端 `portal/frontend/src/lib/terminationReasons.ts`
 //   （`RUN_RETRYABLE_ERROR_CODES`，理由见该文件头注）。本文件是它的**运行时镜像**——FDE 镜像只
 //   `COPY runner/*`（runner/Dockerfile），运行时拿不到前端文件，所以必须自带一份；两者的逐项一致

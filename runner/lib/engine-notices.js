@@ -55,21 +55,35 @@ export function engineDiagnosticNotice(event) {
         msg: 'model metadata missing: compaction and aggregate output budget are disabled for this run',
       };
     // 宿主 store 缺某个持久化能力 ⇒ 那一步整个 run 跳过（= 中途崩溃不可恢复）。
-    // 发射点 `orchestrator.js:1011`，载荷 `{ runId, method, detail }`。
-    // 本站实现了 `saveRunSnapshot` ⇒ 今天不响；一响就是 portal 侧 store 面回退了。
+    // 发射点 `orchestrator.js:1346`/`:1355`（同一方法只报一次），载荷 `{ runId, method, detail }`。
+    // ⚠ **erix-agent 0.33.0（上游 #838 S2，本站 #530）之后这条在本站是常聘的，不是「今天不响」**：
+    //   run snapshot 已退役，引擎不再调 `saveRunSnapshot`，本站今天缺的是**恢复行通道**那组方法
+    //   （`appendRecoveryRow` / `clearRecoveryRows` = #500，本站决定不开）。
+    //   261115 在装着的 0.33.0 上实测（本站 5 方法能力面 + 一次工具调用的正常 run）：
+    //   **恰好 2 条**，`method` 分别是 `clearRecoveryRows` 与 `appendRecoveryRow`（与 #500 正文、
+    //   issue #530 「每 run 2 条」口径一致）。⇒ 一响不代表 portal 侧 store 面回退了，
+    //   要响的是「冒出第三条、或 `method` 变成这两个以外的名字」。（别把这条当噪声删：
+    //   它是 #500 未做的可见记账，也是「快照方法被重新调起」这类回退的唯一现扬。）
     case 'persistence_capability_degraded':
       return {
         level: 'warn',
         msg: `store capability degraded: store does not implement "${token(event.method)}"; `
           + 'that persistence is skipped for this run (mid-run crash resume unavailable)',
       };
-    // 崩溃那一轮的助手消息不在账上 ⇒ 那批工具结果本次没入账，下次恢复靠快照兜。
-    // 发射点 `orchestrator.js:2525`，载荷 `{ runId, round, reason, count }`。
+    // 崩溃那一轮的助手消息不在账上 ⇒ 那批工具结果本次没入账。
+    // 发射点 `orchestrator.js:3072`（`emitResumeJournalSkip`，#730 的四条放弃路径都从这里出口），
+    // 载荷 `{ runId, round, reason, count, detail?, toolUseIds?, resumed? }`。
+    // ⚠ 文案在 0.33.0 上重写过一次：旧句写「the next resume relies on the run snapshot」，而 run
+    //   snapshot 自 0.33.0（上游 #838 S2）已退役 ⇒ 那句话从「兜底承诺」变成了**假话**（引擎源码现查：
+    //   `orchestrator.js:3221` 「恢复只信账本，不再依赖 run snapshot 兜底」）。真实后果：这几条结果
+    //   **就是丢了**——本次恢复的上下文里有桩，但下一次恢复从账本重折时看不到它们，
+    //   那个 `tool_use` 会被当作「无证据的悬空调用」重新补桩（而不是拿回真输出）。
     case 'resume_journal_skipped':
       return {
         level: 'warn',
         msg: `resume journal skipped: ${num(event.count)} tool result(s) of crash round ${num(event.round)} `
-          + `were not written to the ledger (reason=${token(event.reason)}); the next resume relies on the run snapshot`,
+          + `were not written to the ledger (reason=${token(event.reason)}); `
+          + 'they are lost to later resumes: the ledger is the only recovery source (no run snapshot since 0.33.0)',
       };
     // run 级终局汇总，**每个 run 恰好一条**（`runOutcomeEmitted` 去重；正常终局走
     // `termination.js:700`，抛错终局走 `orchestrator.js:1197`）。载荷

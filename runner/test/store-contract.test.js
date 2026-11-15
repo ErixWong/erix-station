@@ -143,16 +143,23 @@ test('STORE_METHODS：0.14.0 必需/可选契约与 status 读接口在 IPC 白�
 
 // 上游契约套件（transcriptStoreContract 会注册多个 node:test 用例）。
 // 第三个参数是**诚实申报**（erix-agent 0.30.0 上游 #739 把「可选」做实，#499 升级片把本站的申报补齐）：
-//   · `runSnapshot`（`saveRunSnapshot` + `loadLatestRunSnapshot`）、`runState`（`saveRunState` +
-//     `loadRunState` + `markRunState`）、`runStateStatus`（`loadRunStateStatus`）——本站这三组**真实现**
-//     （`runner/lib/store.js` + peer 桩后的 portal internal 端点），所以申报出来：实现被删时套件当场红，
-//     而不是被成对守卫当「宿主本来就没选这个能力」静默跳过；
+//   · `runState`（`saveRunState` + `loadRunState` + `markRunState`）、`runStateStatus`（`loadRunStateStatus`）
+//     ——本站这两组**真实现**（`runner/lib/store.js` + peer 桩后的 portal internal 端点），所以申报出来：
+//     实现被删时套件当场红，而不是被成对守卫当「宿主本来就没选这个能力」静默跳过；
 //   · `rawRows`（`loadRawRows`）与 `fastPathProbes`（`loadByDedupKey` + `loadMaxRound`）**本站没有**
 //     ⇒ 一个都不报（报半组会被「声明了却没整组实现」当场判红，见 #501：补上 `loadRawRows` 那天再加）。
+//
+// ⚠ **erix-agent 0.33.0（issue #838 S2，本站 #530）：`runSnapshot` 这个能力名已从上游名单里删除**
+//   （现查 0.33.0：`test/contract/transcript-store.js` 里 `runSnapshot` **0 命中**；`OPTIONAL_CAPABILITIES`
+//   只剩 `runState` / `runStateStatus` / `rawRows` / `fastPathProbes` 四组）。本站再申报它就会撞上那句
+//   「${capability} 不在 OPTIONAL_CAPABILITIES 名单里（守卫写错了能力名）」⇒ 从申报里摘掉。
+//   ⚠ 摘的只是**申报**：本站 `runner/lib/store.js` 的 `saveRunSnapshot` / `loadLatestRunSnapshot` 方法
+//   **本体本单不动**（它们从 0.33 起是死代码，连同 `ipc.js` 白名单 / agentd 路由 / portal internal 两个
+//   端点 / `run_checkpoints` 表一起留给另单一次性退役——#530 决策 D1）。别把「摘申报」读成「能力已退役」。
 transcriptStoreContract('station-ipc-store', async () => {
   const peer = createFakeAgentdPeer();
   return makeStore('contract-run', { request: (method, args) => peer.handle(method, args) });
-}, { optionalCapabilities: ['runSnapshot', 'runState', 'runStateStatus'] });
+}, { optionalCapabilities: ['runState', 'runStateStatus'] });
 
 test('station-ipc-store：agentd 写入失败向上抛（IPC error 透传，fail-closed 语义）', async () => {
   const peer = createFakeAgentdPeer();

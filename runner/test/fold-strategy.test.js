@@ -35,7 +35,7 @@ import {
   BUILTIN_COMPACTION_STRATEGY_NAMES,
   createSlidingWindowStrategy,
 } from 'erix-agent';
-import { assertCompactContext, assertFoldingToolResultKnobs } from '../lib/compact-knobs.js';
+import { assertCompactContext } from '../lib/compact-knobs.js';
 
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(RUNNER_DIR, rel), 'utf8');
@@ -220,13 +220,24 @@ test('#438-B3 `config.continuity` / `capabilities.hooks.continuityProvider` 一�
 //   触发。**所以「调大更省」没有被验证**，也不许拿任何一次测量声称它被验证了。
 // 这两个值是**待 A/B 验证的裁定**（不是定论）：量出来更贵就删掉 `#440:ttl-knobs` 区间里那两行。
 
-/** 求值 worker 的 `#440:ttl-knobs` 段（注入真校验器，顺带证明那份真配置过得了本站校验）。 */
+/**
+ * 求值 worker 的 `#440:ttl-knobs` 段。
+ * ⚠ erix-agent 0.33.0（#530 / D3）起这一段是**裸字面量**了：以前它套着一层
+ * `...assertFoldingToolResultKnobs({...})`，求值时需注入那个校验器；现在本站那道重复校验已退役
+ * （引擎 0.33.0 起自己校 `folding.*`），区间里只剩两行赋值 ⇒ 直接求值即可。
+ * **判据强度未变**：下面 B4/B5 钉的仍是「两个键必须在场 + 值逐字等于 6 / 8000 + 只允许这两个键」，
+ * 不依赖本站的校验器（删任一行依旧当场红：键不在场 ⇒ B4 红；挪出区间 ⇒ B5 红）。
+ */
 function workerTtlKnobs() {
   const block = read('worker.js').match(TTL_MARKERS);
   assert.ok(block,
     'worker.js 必须有一对配对的 `/* #440:ttl-knobs:start|end */` 标记：'
     + '没了就是 A/B 回退点丢了（工单要求这两个值集中在一处、一行可删）');
-  return new Function('assertFoldingToolResultKnobs', `return {${block[1]}}`)(assertFoldingToolResultKnobs);
+  // 区间内不许再出现函数调用包装：出现就说明有人把本站校验器又塞回来了（引擎已经校了）。
+  assert.doesNotMatch(block[1], /assertFoldingToolResultKnobs/,
+    '0.33.0 起引擎自己校 `folding.*`，本站那道重复校验已退役（见 lib/compact-knobs.js 同段）：'
+    + '把包装塞回来 = 两套校验重叠，会错的是不生效的那一半');
+  return new Function(`return {${block[1]}}`)();
 }
 
 test('#440-B4 worker 显式传 toolResultTtl=6 / toolResultFoldMinTokens=8000（删掉任一就红）', () => {
@@ -274,6 +285,6 @@ test('#440-B5 源码级：这两个键只出现在 `#440:ttl-knobs` 标记区间
   // 值也必须写在区间里（不是从别处 import / 拼出来的）
   assert.match(block[1], /toolResultTtl:\s*6\b/, '标记区间里必须逐字写着 `toolResultTtl: 6`');
   assert.match(block[1], /toolResultFoldMinTokens:\s*8000\b/, '标记区间里必须逐字写着 `toolResultFoldMinTokens: 8000`');
-  // 区间里**只**有这两个叶子（`...assertFoldingToolResultKnobs({...})` 这一层包装除外）
+  // 区间里**只**有这两个叶子（0.33.0 起没有校验器包装了，所以区间内就是两行裸赋值）
   assert.doesNotMatch(block[1], /context\s*:/, '`folding.context` 不许搬进这个区间（两套标记各管各的）');
 });
