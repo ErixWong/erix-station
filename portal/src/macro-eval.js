@@ -306,7 +306,7 @@ export async function evalClock(pool, a, nowMs, { log } = {}) {
   return gateAndIntent(pool, a, {
     anchor, criterion: 'tick', bucket: date, macroRunId: claimed.id,
     evidence: { at, local_date: date, fired_at: new Date(nowMs).toISOString() },
-    gateFor: 'scheduled-task', log,
+    gateFor: 'scheduled-task', nowMs, log,
   });
 }
 
@@ -348,7 +348,7 @@ export async function evalSilence(pool, a, nowMs, { log } = {}) {
     const it = await gateAndIntent(pool, a, {
       anchor, criterion: 'silent', bucket: phase, macroRunId: claimed.id,
       evidence: { silent_ms: silentMs, phase, threshold_ms: threshold, last_event_type: lastEv?.type ?? null, last_event_ts: lastEv?.ts ?? null },
-      gateFor: 'run-silence-alert', log,
+      gateFor: 'run-silence-alert', nowMs, log,
     });
     if (it) intents.push(it);
   }
@@ -368,8 +368,8 @@ export async function evalSilence(pool, a, nowMs, { log } = {}) {
  * ⚠ `active_run_in_cwd` 在 W2 **只是意图层预检**（`10` 篇 §2.2）：结果可能过期，**最终裁决在
  *   W3/W4 创建 run 的那个事务里**（条件插入 / 行锁）。这里的判断不作为正确性保证。
  */
-export async function gateAndIntent(pool, a, { anchor, criterion, bucket, macroRunId, evidence, gateFor, log }) {
-  const reason = await evaluateSkipGates(pool, a, { nowMs: Date.parse(evidence.fired_at ?? '') || Date.now(), gateFor });
+export async function gateAndIntent(pool, a, { anchor, criterion, bucket, macroRunId, evidence, gateFor, nowMs, log }) {
+  const reason = await evaluateSkipGates(pool, a, { nowMs, gateFor });
   if (reason) {
     await finishMacroRun(pool, { macroRunId, status: 'skipped', skippedReason: reason });
     log.info?.(`[macro-eval] 跳过 anchor=${anchor} reason=${reason}`);
