@@ -8,6 +8,7 @@ import { removeGitCredentialFile } from './git-credential.js';
 import { assertSafePath } from './fsutil.js';
 import { validateFdeName } from './projects.js';
 import { disableGiteaAccount } from './git-mint.js';
+import { attachLoopWatch, envInt, idleDelayMs, MAX_BACKOFF_MS_SAFE, sleepCancellable } from './loop-timing.js';
 
 const STEPS = [
   'disable-user',
@@ -21,6 +22,15 @@ const STEPS = [
 ];
 const LOOP_BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 const LOOP_INTERVAL_MS = 5000;
+// issue #520：`LOOP_INTERVAL_MS` 现在是**有活时的基准节拍**；认领 0 行 ⇒ 5000 → 10000 → 20000 →
+// `OFFBOARDING_IDLE_BACKOFF_MAX_MS`（默认 30000）封顶，认领到活立刻回 5000（形状与 #506 一致）。
+// 代价：空闲后新入队的销号**最坏 30s 才开始**（改前 5s）。销号是管理台显式动作后的多步长流程，
+// 且它的用户可见承诺是「已停用 + 已吊 token」（在那之前同步做完）而不是「几秒内开始」。
+const IDLE_BACKOFF_MAX_MS_DEFAULT = 30000;
+// 工作区目录清理是**定时语义**，不是退避对象（issue #520 判据 2 的“有明确定时语义”那一支）：
+// 它的节拍就是产品语义（“满了 1 天才清”），而且它已经与主节拍解耦（下面那个
+// `Date.now() - lastSweepAt >= SWEEP_INTERVAL_MS` 闸门）。主拍退避到 30s 只让它多等≤ 30s，
+// 对 1h 的粒度是噪声；反而若把它改成“没活就不跑”，一个全部 FDE 已处理完的平台就永远不会清盘。
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const PURGE_BATCH_SIZE = 20;
 
@@ -526,43 +536,67 @@ export async function sweepOffboardedWorkspaces(pool, config, {
   return { disabled: false, purged, failed };
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export function startOffboardingLoop(pool, config, { docker, log = console, onPause } = {}) {
+/**
+ * 常驻销号循环。
+ *
+ * issue #520 的三件事，分开记：
+ *  1. **主拍退避**（本单改的）：`runOffboardingOnce()` 认领 0 行 ⇒ 5000 → 10000 → 20000 →
+ *     `OFFBOARDING_IDLE_BACKOFF_MAX_MS`（默认 30000）封顶；认领到活立刻回 5000。
+ *  2. **1h 工作区清理不跟着退避**（判据 2 的「定时语义」那一支）：它的节拍就是它的语义（「到期
+ *     1 天后才清盘」），而且它本来就不靠拍频驱动，靠的是 `now() - lastSweepAt >= SWEEP_INTERVAL_MS`
+ *     这个闸门——把它挂到「有活才跑」上，一个已全部处理完的平台就永远不会清盘。
+ *     主拍退避到 30s 只让它比原定时刻晚≤ 30s，对 1h 粒度是噪声。
+ *  3. 句柄补成 #506 同形（`stop`/`done`/`settled`/`failure`）：`stop()` 现在会 abort 正在睡的那一拍。
+ * `now` 也是注入缝（生产仍是 `Date.now()`）——闸门必须能在假时钟下被测到，否则只能真等 1h。
+ */
+export function startOffboardingLoop(pool, config, {
+  docker,
+  log = console,
+  onPause,
+  sleep = sleepCancellable,
+  now = () => Date.now(),
+  idleBackoffMaxMs = envInt('OFFBOARDING_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log }),
+} = {}) {
   if (!docker) docker = createDockerClient({ dockerHost: config.dockerHost });
-  let stopped = false;
   let consecutiveFailures = 0;
   let recoveredInterruptedWork = false;
   let lastSweepAt = 0;
-  (async () => {
-    while (!stopped) {
+  let idleTicks = 0; // 连续空闲拍数（认领到活就清 0）
+  const abort = new AbortController();
+  const done = (async () => {
+    while (!abort.signal.aborted) {
       try {
         if (!recoveredInterruptedWork) {
           const recovered = await recoverInterruptedOffboardings(pool);
           if (recovered > 0) log.warn?.(`[offboarding] recovered ${recovered} interrupted task(s)`);
           recoveredInterruptedWork = true;
         }
-        await runOffboardingOnce(pool, config, { docker, log });
-        if (Date.now() - lastSweepAt >= SWEEP_INTERVAL_MS) {
+        const { claimed = false } = (await runOffboardingOnce(pool, config, { docker, log })) ?? {};
+        // 清理闸门与「有没有活」无关（语义见上面注释第 2 条）；`Date.now()` → `now()` 只是可测缝，不是行为改动。
+        const tickAt = now();
+        if (tickAt - lastSweepAt >= SWEEP_INTERVAL_MS) {
           await sweepOffboardedWorkspaces(pool, config, { log });
-          lastSweepAt = Date.now();
+          lastSweepAt = tickAt;
         }
         consecutiveFailures = 0;
-        await sleep(LOOP_INTERVAL_MS);
+        idleTicks = claimed ? 0 : idleTicks + 1;
+        if (!(await sleep(idleDelayMs(idleTicks, { baseMs: LOOP_INTERVAL_MS, maxMs: idleBackoffMaxMs }), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[offboarding] loop error: ${err.message}`);
         onPause?.('offboarding', err);
         const backoff = LOOP_BACKOFF_MS[Math.min(consecutiveFailures - 1, LOOP_BACKOFF_MS.length - 1)];
-        await sleep(backoff);
+        if (!(await sleep(backoff, abort.signal))) break;
       }
     }
   })();
+  const { settled, failure } = attachLoopWatch(done, (msg) => log.warn?.(`[offboarding] ${msg}`));
   return {
     stop() {
-      stopped = true;
+      abort.abort();
     },
+    done,
+    settled,
+    failure,
   };
 }

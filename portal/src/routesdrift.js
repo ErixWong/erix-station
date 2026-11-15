@@ -41,7 +41,19 @@ import { readTlsAssets, renderTlsConfig, tlsPaths } from './tlsassets.js';
 import { generateTraefikConfig, generateLlmTraefikConfig, readRouteDesiredState } from './routes.js';
 import { assertRenderedRouteText } from './routebackends.js';
 
-/** 对账周期（工单 §2：60s；**不是** env 旋钮——一期口径写死，二期再谈旋钮）。 */
+/**
+ * 对账周期（工单 §2：60s；**不是** env 旋钮——一期口径写死，二期再谈旋钮）。
+ *
+ * issue #520 判据 2：本监控选的是「**有明确定时语义**」那一支，**不是**空闲退避。理由写在这里：
+ * 它看的是**盘上文件被人手改过**（`chmod` / `vim` / 备份恢复），那个变化源**不会给 portal 发任何
+ * 通知**——没有 outbox 行、没有租约、也没有可认领的东西，所根本不存在「本轮有没有活」这个信号；
+ * 它的周期就是**发现延迟本身**（“盘被动过最多 60s 后被看见”）。拿“没发现漂移”去退避，
+ * 只会把发现延迟推到分钟级而不会减少任何工作（它每拍的开销与盘上有无漂移无关：都是读三份文件
+ * + 一份期望态）。
+ * 成本口径：60s 一拍 = 0.017 拍/秒，是 7 个循环里**最便宜的一个**（现测：`port_observations`
+ * 20 次 seq 扫 / 30s 全部出自本循环的一拍，但一拍只跑一次 `readRouteDesiredState`）。
+ * 它也不是「裸 `setInterval`」：`stop()` 会 `clearInterval`，定时器也 `unref()`（下面）。
+ */
 export const DRIFT_INTERVAL_MS = 60_000;
 
 /** 三份被管文件与它们的**元数据期望**（mode 与 S2 发布面逐字同口径）。 */

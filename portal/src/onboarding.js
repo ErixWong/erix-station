@@ -3,10 +3,24 @@ import { enqueueMaterializeChange } from './outbox.js';
 import { runMaterializerOnce } from './materializer.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
 import { LlmError, LlmGatewayError, setFdeLlmConfig } from './llm.js';
+import { attachLoopWatch, envInt, idleDelayMs, MAX_BACKOFF_MS_SAFE, sleepCancellable } from './loop-timing.js';
 
 const STEPS = ['provision', 'materialize', 'llm-binding'];
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 const MATERIALIZE_TIMEOUT_MS = 120000;
+
+// issue #520：空闲退避（#506 同族，那是 outbox 两个循环，本单是其余轮询器）。
+// **改前**：`await sleep(5000)` 是固定节拍，与「本轮有没有认领到活」无关 —— 平台空闲时
+// `claimOne()`（BEGIN + SELECT ... FOR UPDATE SKIP LOCKED + COMMIT）每 5s 白跑一次。
+// **改后**：`runOnboardingOnce()` 返回 `claimed:false`（认领 0 行）⇒ 5000 → 10000 → 20000 →
+// `ONBOARDING_IDLE_BACKOFF_MAX_MS`（默认 30000）封顶；认领到活立刻回 5000。
+// 代价与理由（要改这个默认值请连这段一起改）：空闲后新入队的开户任务**最坏 30s 后才开始**
+// （改前最坏 5s）。开户本身是**人在管理台点出来的**多步长任务（provision → materialize →
+// llm-binding，单步超时 120s，见 `MATERIALIZE_TIMEOUT_MS`），30s 的排队等待相对它的总时长是
+// 噪声级；而 30s 上限换来的空闲收益是这条循环的表扫降到 1/6。要更激进就配 60000（上限
+// `MAX_BACKOFF_MS_SAFE`=60s，再大就越过 Node timer 的语义边界，理由见 `loop-timing.js`）。
+const LOOP_INTERVAL_MS = 5000;
+const IDLE_BACKOFF_MAX_MS_DEFAULT = 30000;
 
 function parseSteps(value) {
   const steps = typeof value === 'string' ? JSON.parse(value) : value;
@@ -310,34 +324,58 @@ function sleep(ms) {
 }
 
 /** Start the independent background loop that executes queued user onboarding. */
-export function startOnboardingLoop(pool, config, { docker, log = console, onPause } = {}) {
+/**
+ * 启动常驻后台循环，执行排队中的用户开户。
+ *
+ * issue #520：节拍由**认领结果**驱动（见上面 `LOOP_INTERVAL_MS` 的注释）。同时把句柄补成
+ * 与 #506 的 `startRoutesLoop` 同形（`stop` / `done` / `settled` / `failure`）：改前只有
+ * `stop()`，`stopLoopsAndWait` 对它只能记账跳过 ⇒ 优雅关闭既等不到它收尾、也等不到它从退避睡眠里
+ * 醒来（最多白等一个节拍）。现在 `stop()` 会 abort 掉正在睡的那一拍，`done` 立刻落定。
+ * 注入缝（`sleep` / 退避上限）照 #506：生产不传 ⇒ 真 `setTimeout` 与 env 默认值。
+ */
+export function startOnboardingLoop(pool, config, {
+  docker,
+  log = console,
+  onPause,
+  sleep = sleepCancellable,
+  idleBackoffMaxMs = envInt('ONBOARDING_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log }),
+} = {}) {
   if (!docker) docker = createDockerClient({ dockerHost: config.dockerHost });
-  let stopped = false;
   let consecutiveFailures = 0;
   let recoveredInterruptedWork = false;
-  (async () => {
-    while (!stopped) {
+  let idleTicks = 0; // 连续空闲拍数（认领到活就清 0）
+  const abort = new AbortController();
+  const done = (async () => {
+    while (!abort.signal.aborted) {
       try {
         if (!recoveredInterruptedWork) {
           const recovered = await recoverInterruptedOnboardings(pool);
           if (recovered > 0) log.warn?.(`[onboarding] recovered ${recovered} interrupted task(s)`);
           recoveredInterruptedWork = true;
         }
-        await runOnboardingOnce(pool, config, { docker, log });
+        const { claimed = false } = (await runOnboardingOnce(pool, config, { docker, log })) ?? {};
         consecutiveFailures = 0;
-        await sleep(5000);
+        idleTicks = claimed ? 0 : idleTicks + 1;
+        if (!(await sleep(idleDelayMs(idleTicks, { baseMs: LOOP_INTERVAL_MS, maxMs: idleBackoffMaxMs }), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[onboarding] loop error: ${err.message}`);
         onPause?.('onboarding', err);
         const backoff = BACKOFF_MS[Math.min(consecutiveFailures - 1, BACKOFF_MS.length - 1)];
-        await sleep(backoff);
+        // 异常分支不退避到 30s：那是**失败重试**节拍，与空闲退避两回事（#506 同口径：`BACKOFF_MS` 没动）。
+        // 空闲计数保持：失败说明 DB 在抖，退避阶梯不该被清零。
+        if (!(await sleep(backoff, abort.signal))) break;
       }
     }
   })();
+  // #506 评审③同款：`done` 是裸 IIFE 的 Promise，没人 catch 就是未捕获拒绝（本仓「摘要全绿但 rc=1」陷阱）。
+  const { settled, failure } = attachLoopWatch(done, (msg) => log.warn?.(`[onboarding] ${msg}`));
   return {
     stop() {
-      stopped = true;
+      abort.abort(); // 可中断：正在睡的那一拍必须立刻断开，否则关闭最多白等一个退避窗口
     },
+    done, // 循环真正退出时 resolve（优雅关闭与单测 await 它；拒绝照原样冒）
+    settled, // 已挂拒绝处理器的那份（`stopLoopsAndWait` 用它也不会制造未捕获拒绝）
+    failure, // 循环异常退出时的错误（正常退出为 null）
   };
 }
