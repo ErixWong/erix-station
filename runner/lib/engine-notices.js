@@ -56,14 +56,14 @@ export function engineDiagnosticNotice(event) {
       };
     // 宿主 store 缺某个持久化能力 ⇒ 那一步整个 run 跳过（= 中途崩溃不可恢复）。
     // 发射点 `orchestrator.js:1346`/`:1355`（同一方法只报一次），载荷 `{ runId, method, detail }`。
-    // ⚠ **erix-agent 0.33.0（上游 #838 S2，本站 #530）之后这条在本站是常聘的，不是「今天不响」**：
+    // ⚠ **erix-agent 0.33.0（上游 #838 S2，本站 #530）之后这条在本站是**会响**的，不是「今天不响」**：
     //   run snapshot 已退役，引擎不再调 `saveRunSnapshot`，本站今天缺的是**恢复行通道**那组方法
     //   （`appendRecoveryRow` / `clearRecoveryRows` = #500，本站决定不开）。
     //   261115 在装着的 0.33.0 上实测（本站 5 方法能力面 + 一次工具调用的正常 run）：
     //   **恰好 2 条**，`method` 分别是 `clearRecoveryRows` 与 `appendRecoveryRow`（与 #500 正文、
     //   issue #530 「每 run 2 条」口径一致）。⇒ 一响不代表 portal 侧 store 面回退了，
     //   要响的是「冒出第三条、或 `method` 变成这两个以外的名字」。（别把这条当噪声删：
-    //   它是 #500 未做的可见记账，也是「快照方法被重新调起」这类回退的唯一现扬。）
+    //   它是 #500 未做的可见记账，也是「快照方法被重新调起」这类回退的唯一现场。）
     case 'persistence_capability_degraded':
       return {
         level: 'warn',
