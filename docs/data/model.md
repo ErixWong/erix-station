@@ -42,6 +42,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | Git host 配置 | `git_hosts` / `fde_git_accounts`（migration 0011） | issue #118（多 Git host、按 host 能力选择代铸或逐 FDE 凭据） |
 | 用户下线 | `fde_offboarding`（migration 0013） | 规格 §7.3 / issue #110 |
 | 用户空间物化 | `materialize_outbox` / `materialize_revisions` | user-space.md §7.1（A7 定稿） |
+| 事件平台（宏） | `macro_templates` / `macro_assignments` / `macro_runs`（migration 0035） | issue #524（W1 数据层）/ 09-observability.md §7 / 07-surfaces-and-panel.md §2.3 |
 | 迁移台账 | `schema_migrations` | deploy-contract.md §3（A6 定稿） |
 
 ---
@@ -504,6 +505,54 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 ---
 
+### 1.33 `macro_templates` / `macro_assignments` / `macro_runs` — 事件平台的三张表（issue #524，migration 0035）
+
+> 同上：来自增量迁移 `0035-macro-platform.sql`；baseline 冻结、不回写 `schema.sql`。
+> **W1 只有数据层**（`portal/src/macros.js` 是唯一的写入口）：没有定时器、没有调度器、没有面板路由。
+> 「到点主动执行」是 W2，`notifications` 落地面是 W3。
+
+**为什么是三张而不是一张**：模板可被多人复用、订阅要能改人/改范围、执行记录要能永久审计——
+三者的生命周期与写入者完全不同（管理员改模板 / 用户改订阅 / 调度器只追加账）。
+落 DB 而不是进程内存的理由同不变式 3（DB 是状态真相）+ 不变式 4（容器是牲口）：
+调度器进程随时可死可换，只要这三张表在，重启后照样能接着认领、接着记账。
+
+| 表 | 语义 | 幂等键 / 关键约束 |
+|---|---|---|
+| `macro_templates` | **做什么**：`kind`（四类：`run-notify` / `run-silence-alert` / `run-review` / `scheduled-task`）+ `name` + `params`（jsonb：四类参数集互不相交，散列成列会让每列只对一类有意义）+ `audience`（`all` / `admin`）+ `scope`（`session` / `user`）+ `enabled` + `created_by`（可空：内置模板没有创建人）+ `deleted_at`（软删） | `CHECK` 钉住 `kind` / `audience` / `scope`；`name` 不许空白 |
+| `macro_assignments` | **给谁做、在哪个范围、到什么时候**：`template_id` + `user_id` + `session_id`（`scope='session'` 才给）+ `cwd`（限定 worktree，NULL = 不限）+ `until`（到期时刻）+ `enabled` + `last_evaluated_at`（W2 的「多久没被看过」判据） | `UNIQUE NULLS NOT DISTINCT (template_id, user_id, session_id, cwd)`（PG15+）。**这一条是「重复订阅」的唯一防线**：默认 UNIQUE 语义下 NULL 互不相等 ⇒ `scope='user'`（两列都是 NULL）能被同一人订无数次。`template_id` → `ON DELETE CASCADE` |
+| `macro_runs` | **做没做、结果如何**（执行账，只追加）：`anchor`（触发它的事件标识）+ `bucket`（去重桶）+ `state` + `verdict`/`verdict_raw`（归一化口径 vs 模型原话，分开存才能改了口径后重算）+ `reason` / `remediation_text` + `skipped_reason`（八种门禁穷举，见 §2.4）+ `started_at`/`finished_at` + `child_session_id`/`child_run_id`（宏真跑起来时派生的会话与 run，`ON DELETE SET NULL`：会话被清理时账要留着）+ `depth`/`parent_macro_run_id`（挡无限自我派生）+ `snapshot_id`/`worktree_path`（现场引用，**故意不建 FK**：快照是可回收物，SET NULL 会把审计链切断） | `UNIQUE (assignment_id, anchor, state, bucket)` = 幂等键，`macros.js#claimMacroRun` 的 `ON CONFLICT DO NOTHING` 直接依赖它。`assignment_id` → `REFERENCES macro_assignments(id)` **不带 ON DELETE**：取消订阅不许抹掉历史（有账的订阅只能停用） |
+
+**三条口径（`portal/src/macros.js` 的三条硬语义，改代码前先读）**：
+
+1. **认领是 `INSERT … ON CONFLICT DO NOTHING RETURNING id`**，没插到返回 `null`（幂等命中）。
+   写成「先 SELECT 再 INSERT」在并发下会让两个调度器各插一行、同一事件跑两遍——唯一索引就成了装饰。
+   「订阅不存在 / 已停用 / 已过期」同样返回 `null`（资格判定在同一条语句的 `WHERE EXISTS` 里），
+   别拿认领当存在性探针。
+2. **模板删除是三分支**（07 篇 §2.3，判定与删除**同事务** + 模板行 `FOR UPDATE`）：
+   零引用 ⇒ 物理删；只有订阅、无执行记录 ⇒ 物理删 + 级联删订阅；
+   有 `macro_runs` **或** `notifications` ⇒ 只能软删（写 `deleted_at`）。
+   「能不能物理删」由引用计数决定，不由请求方决定。`notifications` 表 **W3 才建** ⇒
+   判定是「表存在则检查、不存在则跳过」（探测 `information_schema`，列名不写死）。
+3. **`until` 到期 ⇒ `enabled = false`**，一律按**瞬时**比（`timestamptz` × JS `Date`，
+   不许按本地日截断）。W1 **不做定时器**：到期在读写两侧顺手收敛（`applyExpiredAssignments`
+   被 `assignTemplate` / `listAssignments` / `claimMacroRun` 调用），所以「读出来的 `enabled`」
+   与「真的还能跑」不会出现两种说法。W2 的 tick 只是把它变成主动。
+
+**索引选型（为什么账表上不存 `template_id`）**：按模板筛执行账走
+`macro_assignments(template_id)` + `macro_runs(assignment_id, started_at DESC)` 的 JOIN，
+**不**给 `macro_runs` 冗余一份 `template_id`。理由：执行账是只追加的审计表，把可变的派生值
+复制进不可变的历史行等于把同一事实存两处，换绑/重建模板时旧值成假账，还得再写守卫去追平。
+代价是每次多一次等值 JOIN（`assignment_id` 已是 FK 且有索引），W1 量级足够。
+另有 `macro_runs(started_at DESC)`（全局时间线）、部分索引 `(started_at) WHERE state IN
+('pending','running')`（调度器每 tick 扫未收口的账）、`(child_run_id) WHERE NOT NULL`
+（run 详情页反查「由哪次宏触发」）——筛选全落索引列（09 篇 §7）。
+
+写入方 = 只有 `portal/src/macros.js`（W1）；读取方 = W2 调度器与 W3 面板（尚未接线）。
+用例：`portal/test/macros.test.js`（幂等键、软删三分支、`until` 到期、四条枚举 CHECK）。
+
+
+---
+
 ## 2. 状态机
 
 > 验收锚点：**每个状态都列出产生方与消费方**。转换由应用层执行，DB 层用 CHECK 限定取值集合；「非法转换」的强制在应用层（portal / runner 各自只写自己负责的转换，见各表「写入方」）。
@@ -597,6 +646,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制，attempts+1）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回收（A1/A2 定稿）：`runs.status='cancelling'` → `cancelled` + runs `finished`（aborted）；否则 `attempts < max_attempts` → 回 `pending`（**attempts 不变**），`attempts >= max_attempts` → `done` + runs `failed`（`max_attempts_exceeded`，§2.8） |
 | `queued_inputs.status` | `pending / delivering / delivered / recalled / discarded` | `pending` 由 `POST …/queued-inputs` 产生（会话行锁内，同事务判活跃 run）；`delivering` 由终态出队的 CAS 认领产生（0 行 = 被别人抢先，放弃本轮）；`delivered` 由投递成功后回写（带 `run_id`）；`recalled` 由 `DELETE …/queued-inputs` 整队取回产生；投递失败**退回 `pending`**（下一次终态再来），只有会话已 404 才 `discarded`。消费方：会话详情 `queued_messages` 快照、`queue_update` SSE、上限校验计数。**过期 `delivering` 算可认领**（判据见 §1.29 `claimed_at` 行）且**算在上限里** | 
 | `preview_grants.state` | `active / used / revoked / expired` | `active` 由 portal 签发（ticket）/ forwardAuth 换取（session）产生；`used` 由 forwardAuth 首次校验 ticket 同事务置位；`revoked` 由显式吊销 / allocation released / 用户 disabled 置位；`expired` 由 reaper 按 `expires_at` 懒打标 |
+| `macro_runs.state` | `pending / running / done / skipped / failed / superseded` | `pending` 由 `macros.js#claimMacroRun` 产生（`INSERT … ON CONFLICT DO NOTHING`，抢不到返回 `null`）；`running`/`done`/`failed` 由 W2 执行器经 `finishMacroRun` 推进（进终态补 `finished_at`）；`skipped` = 被门禁挡下，**必带 `skipped_reason`**（八种穷举：`budget_exhausted` / `quiet_hours` / `human_present` / `run_in_progress` / `deferred` / `deferred_timeout` / `active_run_in_cwd` / `cancelled_by_user`——「为什么没跑」是面板要分组的维度，不留自由文本）；`superseded` = 同桶被更新的一次取代。**W1 只有 `pending` 与手工收口，没有主动执行** |
 
 ### 2.5 `route_outbox.state`
 
