@@ -1,7 +1,7 @@
 # 07 · 界面：管理台 / 用户面 / 后台执行 / 流水面板
 
-> 状态：可研（2026-11-08）。上游：[06](03-macro-model-and-catalog.md) 宏五格、[10](05-first-macros.md) 第一版三条、
-> [11](06-execution-and-recovery.md) 回灌。
+> 状态：可研（2026-11-08，2026-11-15 更新分期）。上游：[03](03-macro-model-and-catalog.md) 宏五格、
+> [05](05-first-macros.md) 第一版**四条**、[06](06-execution-and-recovery.md) 回灌。
 > 决策者口径（2026-11-08）：「admin console 里的模板定义」「用户界面只需要给个下拉菜单，
 > 选择一个然后 assign 到当前会话」「设置好了这个应该是在后台跑的」。
 
@@ -13,7 +13,7 @@
 
 | 层 | 是什么 | 谁定 | 能不能写逻辑 |
 |---|---|---|---|
-| **模板类型**（kind） | 代码里注册的几种行为骨架：`run-notify` / `run-silence-alert` / `scheduled-task`（第一版）· `run-review` / `run-recover`（**后续候选**） | **开发者** | 是（但只有开发者） |
+| **模板类型**（kind） | 代码里注册的几种行为骨架：`run-notify` / `run-silence-alert` / **`run-review`** / `scheduled-task`（第一版）· `run-recover`（**后续候选**） | **开发者** | 是（但只有开发者） |
 | **模板实例**（template） | 管理台建的一条：`kind` + 参数 + 名字 + 可见范围 | **管理员** | ❌ 只填参数 |
 | **订阅**（assignment） | 用户把某个模板实例挂到某个会话 | **用户** | ❌ 只有开/关 |
 
@@ -35,9 +35,10 @@
 │                                                                │
 │  终态通知 · 默认            run-notify    all     [已启用]  ⋯  │
 │  静默告警 · 15m             run-silence   all     [已启用]  ⋯  │
+│  完成审查 · 默认            run-review    all     [已启用]  ⋯  │
 │  每日 9 点 · eric 的项目    scheduled     admin   [停用]    ⋯  │
 │  ── 以下为后续候选 ───────────────────────────────────────────  │
-│  完成审查 · 默认            run-review    all     [未实现]  ⋯  │
+│  失败恢复                   run-recover   all     [未实现]  ⋯  │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,9 +69,42 @@
 | `enabled` | 全局开关（关掉 ⇒ 所有订阅一起失效） |
 | `scope` | `session` / `user`（见 §3.2） |
 | `created_by` / `created_at` | 审计 |
+| `deleted_at` | 软删时间戳（null = 未删） |
 
 ⚠ **`scope` 在建的时候就定死**：`scheduled-task` 只能是 `user`，其余只能是 `session`。
 不允许「一个模板既能挂会话又能挂用户」—— 那会让「它到底在盯什么」变成运行时才知道的事。
+
+#### 删除规则：**没有数据冲突就硬删，有就软删**（2026-11-15 定）
+
+判据一句话：**有没有别的行指着它。** 指着它的数据有三处：
+
+| # | 引用方 | 怎么指 |
+|---|---|---|
+| 1 | `macro_assignments` | `template_id`（FK） |
+| 2 | `macro_runs` | 经 `assignment_id` 间接指 |
+| 3 | `notifications` | 经 `macro_run_id` → `assignment_id` 间接指 |
+
+⇒ 规则：
+
+| 情形 | 动作 |
+|---|---|
+| 1、2、3 **都不存在** | **物理删**（干干净净，不留 `deleted_at`） |
+| 有 1 但 2、3 都没有 | **物理删**，订阅一起删（级联；先确认一次） |
+| **2 或 3 存在** | **只能软删**（`deleted_at`）：列表默认不显示，执行历史仍能 JOIN 到名字 |
+
+⚠ **为什么有 `macro_runs` 就不能硬删**：[09](09-observability.md) §6 是
+`macro_runs JOIN assignments JOIN templates`。物理删模板 ⇒ 历史行整批消失或丢失名字，
+**执行历史不可靠** —— 而那正是这套设计唯一的验证面。
+
+⚠ **查询口径**：执行历史用 `LEFT JOIN macro_templates`，软删模板显示成 `名称（已删除）`。
+
+⚠ **UI 上要说清**：两个按钮不是"删除/软删除"，是**一个按钮 + 两句话**：
+
+```
+[删除]
+  这个模板从没被用过 → 直接删掉。
+  这个模板有 12 次执行记录 → 删除后记录仍保留，但模板会标记为「已删除」。
+```
 
 ### 2.4 `audience` 只有两档，理由同 [10](05-first-macros.md) §4.3 的枚举纪律
 
@@ -108,12 +142,15 @@
 
 | scope | 例子 | 在哪 assign |
 |---|---|---|
-| `session` | 终态通知、静默告警（**第一版**）；完成审查、失败恢复（**后续候选**） | **会话头下拉** |
-| `user` | 每日 9 点定时任务（**第一版**，管理员代配） | **不在会话里** —— 它是用户级设置 |
+| `session` | 终态通知、静默告警、**完成审查**（第一版）；失败恢复（后续候选） | **会话右上角「值守」** |
+| `user` | 每日 9 点定时任务（第一版，管理员代配） | **不在会话里** —— 它是用户级设置 |
 
-⚠ **分期必须显式写出来**（评审 blocker）：[05](05-first-macros.md) 定了第一版只有
-M1 / M8 / M7 三条，**不含审查与恢复**。本节前面的模板类型与下拉示例把它们列在一起，
-容易被读成「第一版就有」——现按上表标为**后续候选**。
+⚠ **分期（2026-11-15 定）**：[05](05-first-macros.md) 第一版是 **M1 / M8 / M9 / M7 四条**，
+其中 **M9 = 完成审查**已从「后续候选」升入第一版（见 [08](08-watch-and-review.md) §9）；
+**只剩 `run-recover`（失败恢复）是后续候选**。
+
+⚠ **分期必须显式写出来**（评审 blocker）：本节前面的模板类型与下拉示例把多条 kind 列在一起，
+容易被读成「第一版都有」。现按上表分开标：**审查进第一版，恢复留后续**。
 
 「assign 到当前会话」这句话天然只对 `session` scope 成立。定时任务不属于任何会话
 （[08](06-execution-and-recovery.md)：它起自己的宏会话）。
@@ -130,8 +167,8 @@ M1 / M8 / M7 三条，**不含审查与恢复**。本节前面的模板类型与
 
 ```
 ┌ 完成审查 ▾ ┐
-│ ☑ 完成审查 · 默认     未通过时回灌一次，再不过邮件通知 │
-│ ☐ 完成审查 · 严格     未通过时只通知，不回灌          │
+│ ☑ 完成审查 · 默认     整改时回灌一次，再不过邮件通知 │
+│ ☐ 完成审查 · 严格     整改时只通知，不回灌            │
 │ ☐ 失败恢复            只在代码/工具类失败时启动        │
 └──────────────────────────────────────────────────────┘
 ```
@@ -177,9 +214,11 @@ M1 / M8 / M7 三条，**不含审查与恢复**。本节前面的模板类型与
 ⚠ **① 必须挂在「终态已 COMMIT」之后**：终态事务里做外部动作会把事务拉长，
 且失败会连带回滚终态（站内 `drainQueueAfterRun` 就是这个形状，照抄）。
 
-### 4.3 与 `capacity=1` 的关系
+### 4.3 与容器并发的关系（`capacity=2`）
 
-回灌会起新 run，而 `capacity=1` ⇒ 它排在人后面。这是**对的**：人优先于机器人。
+回灌会起新 run，而**同会话只允许一个活跃 run**（会话级约束）⇒ 它排在人后面。这是**对的**：人优先于机器人。
+⚠ **不是靠容器 `capacity` 保证的**：`capacity=2` 只说明容器能同时跑两个 run，
+不保证谁先谁后；人优先必须由会话级互斥 + 调度规则落实（见 [08](08-watch-and-review.md) §11.1）。
 但如果用户连续发消息，回灌会一直被挤 ⇒ 需要有「最多等多久就放弃并通知」的上限
 （否则就是 [11](06-execution-and-recovery.md) §11.4 那个 `deferred` 的无限变体）。
 
@@ -197,11 +236,13 @@ M1 / M8 / M7 三条，**不含审查与恢复**。本节前面的模板类型与
 ### 5.2 每次触发：消息流里一条分隔条
 
 ```
-──────── 宏：完成审查 · 未通过（3 条未竟事宜）→ 已回灌 ────────
+──────── 宏：完成审查 · 整改（3 条未竟事宜）→ 已回灌 ────────
 ```
 
 - 复用现有 `.roundsep` 分隔条（[#236]），不新增 UI 结构
-- 判决用词与 [03](02-event-model-and-verdict.md) 的枚举一致：`通过` / `未通过` / `未达成` / `需人工`
+- 判决用词以 [08](08-watch-and-review.md) §6.1 的映射表为**唯一来源**：
+  `通过` / `整改` / `未证实有改动` / `需人工` / `未判`（平台状态）。
+  旧稿里的「未通过」「未达成」已全部替换；若在别处见到，按本表纠正。
 - 点开能看到证据（审查报告、finding 列表）
 
 ### 5.3 「为什么没触发」
@@ -261,11 +302,24 @@ macro_runs          ← 每次触发的账（可见面靠它）
   id · assignment_id · anchor(object_key) · state · bucket
   verdict · skipped_reason · started_at · finished_at
   child_session_id(nullable) · child_run_id(nullable)
-  UNIQUE (assignment_id, anchor, state, bucket)     ← 幂等
+  UNIQUE (assignment_id, anchor, state, bucket)     ← 幂等（唯一执行点）
+
+state 取值：pending / running / done / skipped / failed / superseded
+skipped_reason：budget_exhausted / quiet_hours / human_present /
+                run_in_progress / deferred / deferred_timeout /
+                active_run_in_cwd / cancelled_by_user
+
+macro_assignments   id · template_id · user_id · session_id(nullable) · cwd(nullable)
+                    until(nullable) · enabled · last_evaluated_at
 ```
 
 ⚠ `macro_runs` 的 `UNIQUE` 是**幂等的唯一执行点**。没有它，
 状态型模板会每分钟发一次，回灌型模板会无限循环。
+
+⚠ **幂等键只有这一套**（`assignment_id, anchor, state, bucket`）。
+[08](08-watch-and-review.md) §10 的 `(assignment_id, anchor, 判据)` 是**同一个键在 M9 上的特化**：
+M9 的 `state` = 判据名（`mechanical` / `semantic`）、`bucket` = 触发 run id。
+**不并存两套约束。**
 
 ---
 
@@ -296,7 +350,7 @@ macro_runs          ← 每次触发的账（可见面靠它）
 1. **§8 的分叉**：A（代码常量）还是 B（可编辑）。
 2. 会话头下拉的位置与形态：chip + 下拉，还是塞进现有的某个菜单。
 3. `user` scope 的定时任务，第一版到底给不给用户自助 assign（本文建议不给，管理员代配）。
-4. 模板实例能不能被删除（有历史 `macro_runs` 时）：软删还是禁止。
+4. ~~模板实例能不能被删除~~ → **已定**（§2.3 末：有 `macro_runs` 只能软删）。
 5. 审查者起的会话在侧栏怎么显示（[11](06-execution-and-recovery.md) §15 同一问题）。
 
 
@@ -361,7 +415,7 @@ DelegateChildDrawer.vue:225     class="absolute inset-y-0 right-0 w-full max-w-x
 │                            [配置 ▾]            │
 │ ───────────────────────────────────────────── │
 │ 12:03 · run 9f3a · judge_done          已完成  │
-│ 审查 run → 3 条未通过 → 已回灌                  │
+│ 审查 run → 整改（3 条）→ 已回灌                │
 │ ↑82k ↓3.1k · 4m12s                     [展开]  │
 │ ───────────────────────────────────────────── │
 │ 11:40 · run 7c21 · judge_done          已跳过  │
@@ -379,7 +433,7 @@ DelegateChildDrawer.vue:225     class="absolute inset-y-0 right-0 w-full max-w-x
 
 ```
 12:03 · run 9f3a · judge_done              已完成
-审查 run → 3 条未通过 → 已回灌
+审查 run → 整改（3 条）→ 已回灌
 ↑82k ↓3.1k · 4m12s · 深度 0
 ```
 
@@ -449,6 +503,7 @@ DelegateChildDrawer.vue:225     class="absolute inset-y-0 right-0 w-full max-w-x
 | `quiet_hours` | 静默时段（22:00–08:00） | 灰 |
 | `human_present` | 你刚发了消息，不插话 | 灰 |
 | `run_in_progress` | 会话里有 run 在跑 | 灰 |
+| `deferred` | 会话里有 run 在跑，等它结束再说（等到了就送） | 灰 |
 | `deferred_timeout` | 等排位超过 10 分钟，放弃 | 灰 |
 
 ### 13.4 「它看过吗」单独一格
@@ -470,9 +525,9 @@ DelegateChildDrawer.vue:225     class="absolute inset-y-0 right-0 w-full max-w-x
 
 ```
 run 9f3a 结束（judge_done）
-  └─ 审查 run 4b02 → 未通过 3 条
+  └─ 审查 run 4b02 → 整改（3 条）
        └─ 回灌 → run c711 结束（judge_done）
-            └─ 审查 run e35d → 未通过 1 条
+            └─ 审查 run e35d → 整改（1 条）
                  └─ 转人工 → 邮件已发
 ```
 
@@ -484,7 +539,7 @@ run 9f3a 结束（judge_done）
 
 ```
 run 9f3a 结束
-  └─ 审查 run 4b02 → 未通过 3 条
+  └─ 审查 run 4b02 → 整改（3 条）
        └─ 回灌 → run c711 …              另有 2 步  [⌄]
              └─ 转人工 · 已发邮件给 eric
 ```
@@ -493,7 +548,7 @@ run 9f3a 结束
 
 1. **默认最多两层**，更深的收成「另有 N 步」
 2. **链的末端必须常显**（`转人工 · 已发邮件给 eric` / `发送失败`），
-   即使它在第三层 —— 否则用户看到「未通过」不知道接下来会发生什么
+   即使它在第三层 —— 否则用户看到「整改」不知道接下来会发生什么
 3. **竖线只在有子步骤时画**，单条记录不画连接线
 4. **run id 与报告全文进详情**，不复制进流水行
 
@@ -501,7 +556,7 @@ run 9f3a 结束
 缩进 + 竖线够用。
 
 ⚠ 链的**末端必须明确**：`转人工` 那一行要写清「已发邮件给 eric」。
-否则用户看到「未通过」却不知道接下来会发生什么。
+否则用户看到「整改」却不知道接下来会发生什么。
 
 ---
 
@@ -661,3 +716,110 @@ run 9f3a 结束
 —— 因为我把「每条结论必须指回行号」和「交付报告」串行化了。第二单在 prompt 开头加了
 「10 分钟内必须落盘、第 25 分钟不管写到哪立刻落盘」，45 分钟预算内正常完成。
 ⇒ **派只读评审类任务，必须把「先落盘骨架」写进纪律，否则取证会吃掉全部预算。**
+
+---
+
+## 21. 前端契约（开工前必须定，本文给默认值）
+
+> 2026-11-15 补。审计指出这五项未定会让不同实现者自行选语义 ⇒ 必然返工。
+> 以下**给默认值**，决策者不反对就按这个实现。
+
+### 21.1 i18n 键命名
+
+沿用站内 `admin.*` / `workbench.*` 的层级，**中英成对**（站内硬规矩，删一个零引用键也要成对删）。
+
+```
+macro.title / macro.empty / macro.loading / macro.loadFailed / macro.retry
+macro.kind.runNotify / .runSilence / .runReview / .scheduledTask
+macro.kind.desc.*                    ← 每个 kind 一句人话
+macro.field.name / .states / .channel / .threshold / .phases
+             .reviewDepth / .onFail / .maxRounds / .at / .cwd / .task
+macro.verdict.pass / .red / .noop / .human / .unclassified
+macro.skip.budget / .quietHours / .humanPresent / .runInProgress
+            .deferred / .deferredTimeout / .activeRunInCwd / .cancelledByUser
+macro.action.regenerate / .stopRun / .openSettings
+macro.cost.tokens / .estimate / .monthly
+admin.tabs.macros / admin.tabs.macroRuns
+admin.macros.title / .intro / .new / .subscribers / .disable / .softDelete
+admin.macroRuns.title / .filter.* / .summary.* / .timeline.*
+```
+
+**约 60 个键。** 键名一旦定就不再改（改名 = 双语同时改，容易漏一边）。
+
+### 21.2 窄屏规则
+
+站内验收视口是 **1280×768**，但侧栏可拖到很窄。规则：
+
+| 视口宽度 | 抽屉行为 |
+|---|---|
+| ≥ 1024px | 右侧覆盖 480–520px |
+| 768–1023px | 右侧覆盖 **`w-full max-w-md`**（约 448px） |
+| < 768px | **全屏覆盖**（`w-full`），带返回箭头 |
+
+⚠ 不做「并排」，任何宽度都不做（§11 已定）。
+
+### 21.3 通知落点（L1 回执）
+
+**已定：独立 `notifications` 表 + 顶栏铃铛。**
+
+```
+notifications
+  id · user_id · macro_run_id(nullable) · title · body · link
+  read_at(nullable) · created_at
+```
+
+理由：M1 默认只通知失败面，量小，值得给一个干净地方；复用会话流会让"对话"和"系统消息"
+混在一起（D9 的教训正是侧栏/流被机器人塞满）。
+
+⚠ **surface 由收件人推导，不由动作类型推导**（决策者 2026-11-15）：
+
+| 收件人 | 前台 |
+|---|---|
+| 含当前用户 | **可见**（`notifications` 一条） |
+| 只含管理员 | **静默**（只进执行历史，不打扰用户） |
+
+⚠ **失败按收件人分流**：发给当前用户的失败 ⇒ 升级成红色通知；发给管理员的失败 ⇒ 内置告警，用户看不到。
+
+### 21.4 宏会话在侧栏怎么显示
+
+**已定：单独分组「自动化」，默认折叠。**
+
+```
+▸ 自动化 (3)          ← 默认收起，点开才显示
+   完成审查 · erix-station
+   每日 9 点 · 报告
+   号池审计
+```
+
+理由：不折叠会淹掉用户自己的会话（D9 的教训）；完全不显示则用户找不到审查过程。
+
+⚠ 分组只在**有宏会话时**出现，没有就不占位。
+⚠ 分组内的会话**不允许用户发消息**（只读入口），避免把宏会话当普通对话用。
+
+### 21.5 前端测试判据
+
+每个新 `.vue` 配 `.spec.ts`，**只测这五类**（不做快照测试）：
+
+| 判据 | 断言什么 |
+|---|---|
+| 空态四选一 | 加载中 / 加载失败 / 无订阅 / 有订阅未触发，各自渲染对应文案 |
+| 跳过聚合 | 连续同因跳过渲染成**一条**汇总行，不同因不合并 |
+| 判决映射 | 五个 `verdict` 值各自渲染成 §6.1 的词，**不用 DOM 快照** |
+| 成本缺失 | 无 usage 时**不渲染** `↑0 ↓0`（不补 0） |
+| 健康告警位置 | 水位线陈旧时，告警渲染在**顶部状态条**，不在空态区 |
+
+⚠ 按站内口径**别用 `w.emitted()`**（`NODE_ENV=production` 下恒空），改用 DOM / 请求桩断言。
+⚠ 判绿只看退出码：`npm test; echo rc=$?`。
+
+### 21.6 首发参数默认值（05 §9 的收敛）
+
+| 项 | 默认值 | 可改吗 |
+|---|---|---|
+| M1 `states` | `failed/capped/aborted/persistence_failed/guard_unverified`（**不含 `completed`**） | 用户可显式勾 `completed` |
+| M8 `threshold` | **15m**，范围 1m–2h | 宏模板参数 |
+| M8 `phases` | 只开 `tool_running`；`awaiting_llm` 默认关 | 宏模板参数 |
+| M7 `at` | 订阅时必填，无默认 | 用户填 |
+| M7 `jitter` | **±10m**，范围 0–30m | 宏模板参数 |
+| M9 `review_depth` | **1**（整改一次） | 宏模板参数 |
+| M9 `max_rounds` | **8** | 宏模板参数 |
+| `until` | **次日 09:00**；允许「长期」但需显式勾选 | 用户选 |
