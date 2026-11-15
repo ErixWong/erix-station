@@ -2538,6 +2538,13 @@ const HISTORY_EVENT_TYPES = new Set([
   // 用户刷新来看「这次怎么失败了」时必须看得到。与前端 `EVENT_TYPES` + `HISTORY_REPLAY_TYPES` 是
   // **三处独立存亡的集合**（#288 教训），本单同改。
   'user_turn_guard_unrecoverable',
+  // issue #243：`textualized_tool_call`（**本站自造**，由 `internal.js#finishRun` 在终态事务里合成）
+  // ——「这次终局正文是一段被文本化的工具调用」= 交付报告可能没生成。它**必须进本白名单**：
+  // 上游 erix-agent #182 的教训就是「实时看得见、刷新后消失」，而这条事件说的恰恰是
+  // 「用户刷新来看这次交付了什么」的那一刻。三处集合独立存亡（#288 老坑）：本表 + 前端
+  // `EVENT_TYPES` + 前端 `HISTORY_REPLAY_TYPES`，只加一边就得到两种可见性不一致。
+  // 判据：`portal/test/textualized-toolcall.test.js`（源码级 + 行为级各一条，行为级就在本端点）。
+  'textualized_tool_call',
 ]);
 const HISTORY_EVENT_DEFAULT_LIMIT = 500;
 const HISTORY_EVENT_MAX_LIMIT = 2000;

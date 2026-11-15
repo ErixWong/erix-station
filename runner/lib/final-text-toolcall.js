@@ -140,3 +140,43 @@ export function detectTextualizedToolCall(text, markers = DEFAULT_TOOLCALL_MARKE
   }
   return { hit: false, marker: null, chars: text.length };
 }
+
+// ---------------------------------------------------------------------------
+// 事件面的两件事（工单第 2 步）：additive 字段怎么带、事件叫什么名字
+//
+// 载荷字段完全照 issue #442 的 `final_text_fallback` 那条链抄（`runner/lib/termination.js` 的
+// `finalTextFallbackField` → `worker.js` 的 RUN_FINISHED 信封 → `agentd.js` 的逐字透传 →
+// `portal/src/internal.js` 的 `finishRun`），三条口径一字不改：
+//   ① **只在命中时给这两个键**（缺席 = 没命中）。绝不写 `false`：那会把「旧 runner 根本不认识
+//      这个键」与「明确没命中」在 U2 载荷上分不开（#442 的同款理由）。
+//   ② 命名跟既有 `final_text` 走 snake_case（IPC / U2 载荷都是这个风格）。
+//   ③ **不改终态语义**：`termination.reason` / `usage` / `rounds` / `final_text` 一个字节都不动。
+//      命中与否只多带一个布尔 + 命中的那条特征；界面那一半是 portal 在**同一个终态事务里**合成的
+//      `textualized_tool_call` 事件（中性提示），红色面仍只由 `run_end` 负责（#212 口径）。
+//
+// 事件类型名要自解释：`textualized_tool_call` = 「终局正文是一段**被文本化的工具调用**」。
+// 不叫 `anomaly` / `degraded` 那种含糊名 —— 含糊名的代价是下一个人得先猜它指什么，
+// 而这一族事件已经因为「同一件事在三处各说各话」修过四次（#288 / #371-A / #421 / #442）。
+// ---------------------------------------------------------------------------
+
+/**
+ * 诊断事件类型名。三处集合必须同改（漏一边就是「实时收不到」或「刷新后消失」）：
+ * `portal/src/http.js` 的 `HISTORY_EVENT_TYPES` + 前端 `useEventStream.ts` 的 `EVENT_TYPES`
+ * 与 `HISTORY_REPLAY_TYPES`。名字在本文件与 portal 侧各写一份字符串，由
+ * `portal/test/textualized-toolcall.test.js` 的源码级断言对账（跨端不能 import）。
+ */
+export const TEXTUALIZED_TOOL_CALL_EVENT_TYPE = 'textualized_tool_call';
+
+/**
+ * 把识别结果换算成 RUN_FINISHED / U2 的 additive 字段。
+ *
+ * @param {unknown} finalText `result.finalText`
+ * @param {readonly string[]} [markers] 特征集（调用方从 env 解析后传进来；空数组 = 显式关闭）
+ * @returns {{ textualized_tool_call: true, textualized_tool_call_marker: string }|{}}
+ *   命中 ⇒ 两个键；没命中 / 空正文 / 显式关闭 ⇒ **空对象**（一个字节都不多带）。
+ */
+export function textualizedToolCallField(finalText, markers = DEFAULT_TOOLCALL_MARKERS) {
+  const hit = detectTextualizedToolCall(finalText, markers);
+  if (!hit.hit) return {};
+  return { textualized_tool_call: true, textualized_tool_call_marker: hit.marker };
+}
