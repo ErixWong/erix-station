@@ -24,6 +24,11 @@ import {
 // 工单 F（wp2a 重建）：`ports.json ↔ port_allocations` 对账件是 wp2a 最重的断言；提到纯函数后，
 // 本脚本可以用夹具**行为面**钉住它（无 docker 环境下也能验「不是恒真」）。
 import { reconcilePortsJsonWithDb, PREVIEW_LIVE_STATES } from './lib/ports-reconcile.mjs';
+// issue #495（#412 遗留 ①②）：起跑前预检与「等宿主侧物化文件」的三态分类——同样是「失败必须长得
+// 像它真正的原因」那一类护栏，所以反向测试也住这里（行为面夹具，不碰 docker）。
+import {
+  COMPOSE_ENV_FILE, observeHostPath, assertComposeEnvFile, materializeSnapshot, toContainerPath, waitForHostFile,
+} from './lib/e2e-preflight.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SELF = fileURLToPath(import.meta.url);
@@ -68,6 +73,20 @@ function expectThrow(label, fn, { namesMustInclude = [] } = {}) {
   }
   if (!thrown) return { label, fired: false, message: '（没抛错——护栏失效）', matched: false };
   const message = String(thrown.message ?? thrown);
+  const matched = namesMustInclude.every((needle) => message.includes(needle));
+  return { label, fired: true, message, matched };
+}
+
+/** 同上，但被测函数是 async（`waitForHostFile` 那一类）——rejection 也要能收到账上。 */
+async function expectReject(label, fn, { namesMustInclude = [] } = {}) {
+  let thrown = null;
+  try {
+    await fn();
+  } catch (error) {
+    thrown = error;
+  }
+  if (!thrown) return { label, fired: false, message: '（没抛错/没拒绝——护栏失效）', matched: false };
+  const message = String(thrown?.message ?? thrown);
   const matched = namesMustInclude.every((needle) => message.includes(needle));
   return { label, fired: true, message, matched };
 }
@@ -139,6 +158,26 @@ cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOLS=缺省两段�
 cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOLS=族外段 10.99.0.0/16',
   () => assertIsolatedEnvironment({ env: { ...validIsolationEnv(), FDE_IPAM_POOLS: '10.99.0.0/16' } }),
   { namesMustInclude: ['FDE_IPAM_POOLS', '10.99.0.0/16'] }));
+
+// 11) #495 ①：compose 的 `--env-file` 不存在 ⇒ 必须在预检就硬失败，并点名「从主 checkout 复制」。
+//     变异入口：删掉 assertComposeEnvFile 的 ENOENT 分支 ⇒ 本陷阱失灵（rc 会变 2 / --strict 下 rc=1）。
+cases.push(expectThrow('assertComposeEnvFile() --env-file 不存在（不得让 compose 去报）',
+  () => assertComposeEnvFile({ envFile: path.join(os.tmpdir(), `erix-495-absent-${process.pid}`, '.env'), cwd: HERE, label: 'wp3b-e2e' }),
+  { namesMustInclude: ['wp3b-e2e', '不存在', '复制', COMPOSE_ENV_FILE, '.env.example'] }));
+
+// 12) #495 ②：目录存在但读不到 ⇒ 必须**提前**放弃等待，并点名 FDE_USER_UID/GID 口径。
+//     变异入口：把 unreadable 归进 missing（或把 unreadableConfirmations 改成 ∞）⇒ 本陷阱失灵
+//     → 回到 #412 原症状：白等 120s，报一句与「真的没物化」逐字相同的 timeout。
+cases.push(await expectReject('waitForHostFile() 目录读不到 ⇒ 提前放弃并点名 uid 口径',
+  () => waitForHostFile('/srv/erix/users/alice/home/.erix/config.json', {
+    fsImpl: {
+      statSync: () => ({ mode: 0o40770, uid: 0, gid: 1000, isDirectory: () => true }),
+      accessSync: (p) => { if (String(p).endsWith('alice')) throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); },
+      readFileSync: () => '{}',
+    },
+    timeoutMs: 60_000, intervalMs: 1, sleepImpl: async () => {}, label: 'alice config.json materialized',
+  }),
+  { namesMustInclude: ['读不到', 'FDE_USER_UID', '0:1000', 'alice config.json materialized'] }));
 
 // --- 正例（夹具 env 必须过护栏；否则上面的负例是「全都抛」的空洞通过）---------------------
 let positiveOk = true;
@@ -309,6 +348,105 @@ try {
   positiveError = `${positiveError}${positiveError ? ' | ' : ''}ports.json↔DB 对账件正/负例被破坏：${String(error?.message ?? error)}`;
 }
 
+// issue #495 的正/负例组（同一棵树上的三态必须互不相同；全程夹具，不碰 docker）。
+// 变异自证入口：
+//   a) 把 observeHostPath 的 unreadable 归进 missing ⇒ 「真没物化」与「读不到」又被压成一态 ⇒ 本组红；
+//   b) 把 missing 归进 unreadable ⇒ 下面的「没物化不许喊权限」红（会把人带去改 uid 而不是查物化）；
+//   c) 让预检成功时也打一行字 ⇒ 「零输出」判据红（噪音会看起来像失败原因）；
+//   d) 把 toContainerPath 的越界分支删掉 ⇒ 拼错挂载根时快照指到别处，本组红。
+try {
+  const userspace = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-495-trap-'));
+  try {
+    const home = path.join(userspace, 'alice', 'home', '.erix');
+    fs.mkdirSync(home, { recursive: true });
+    const cfg = path.join(home, 'config.json');
+    fs.writeFileSync(cfg, '{"slots":{"default":{"apiKey":"erix-placeholder"}}}');
+    assert.equal(observeHostPath(cfg).state, 'present', '夹具里文件在 ⇒ present');
+
+    const missing = observeHostPath(path.join(userspace, 'bob', 'home', '.erix', 'config.json'));
+    assert.equal(missing.state, 'missing', '链上第一段不存在 ⇒ missing（不是 unreadable）');
+    assert.equal(missing.missingPrefix, path.join(userspace, 'bob'), '要点名「第一个不存在的段」（只报叶子看不出 materializer 走到哪）');
+
+    const blocked = observeHostPath(cfg, {
+      fsImpl: {
+        ...fs,
+        statSync: (p) => (p === path.join(userspace, 'alice')
+          ? { mode: 0o40770, uid: 0, gid: 1000, isDirectory: () => true } : fs.statSync(p)),
+        accessSync: (p, m) => { if (p === path.join(userspace, 'alice')) throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); fs.accessSync(p, m); },
+      },
+    });
+    assert.equal(blocked.state, 'unreadable', '链上某段 0770 root:node、当前用户不在组里 ⇒ unreadable');
+    assert.equal(blocked.blocker.path, path.join(userspace, 'alice'), 'blocker 要指向被挡住那一段（不是叶子）');
+    assert.equal(blocked.blocker.owner, '0:1000', '属主要写出来，才能一眼对上 FDE_USER_UID/GID=1000/1000');
+    assert.notEqual(missing.state, blocked.state, '「没物化」与「读不到」必须是两个状态（合成一个就是 #412 的坑）');
+
+    // 真没物化的文案不许喊权限（否则人会被带去改 uid，而真正缺的是 materializer）
+    const timeoutError = await waitForHostFile(path.join(userspace, 'nobody', 'home', '.erix', 'config.json'), {
+      timeoutMs: 5, intervalMs: 1, sleepImpl: async () => {}, label: 'nobody config.json materialized',
+      describe: () => 'ls: cannot access /srv/erix/users/nobody: No such file or directory',
+    }).then(() => null, (error) => error);
+    assert.ok(timeoutError, '没物化必须最终拒绝');
+    assert.match(timeoutError.message, /timeout waiting for nobody config\.json materialized/, '旧文案形状保留（历史 grep 仍有效）');
+    assert.match(timeoutError.message, /No such file or directory/, '容器侧现场快照要附在文案里（#495 ② 判据 2）');
+    assert.doesNotMatch(timeoutError.message, /读不到|FDE_USER_UID/, '真没物化时不许喊权限');
+
+    // 预检成功 ⇒ 零输出（#495 ① 验收判据的反向自证）
+    fs.mkdirSync(path.join(userspace, 'deploy'), { recursive: true });
+    fs.writeFileSync(path.join(userspace, 'deploy', '.env'), 'PORTAL_HOST_PORT=18080\n');
+    const writes = [];
+    const originalWrite = process.stdout.write;
+    process.stdout.write = (chunk) => { writes.push(String(chunk)); return true; };
+    try {
+      assertComposeEnvFile({ cwd: userspace, label: 'e2e226' });
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    assert.equal(writes.join(''), '', '预检成功不许打印任何东西：' + JSON.stringify(writes));
+
+    // 宿主路径 ↔ 容器路径与现场快照的形状（同路径 bind mount + 一条不抛错的 ls）
+    assert.equal(toContainerPath(cfg, { hostRoot: userspace }), '/srv/erix/users/alice/home/.erix/config.json');
+    assert.throws(() => toContainerPath('/totally/other/root/config.json', { hostRoot: userspace }), /不在宿主挂载根/);
+    const lsCalls = [];
+    materializeSnapshot({
+      docker: (args) => { lsCalls.push(args); return 'drwxrws--- 3 root node 4096 /srv/erix/users/alice/home/.erix'; },
+      container: 'station-portal-e2e226',
+      containerPath: '/srv/erix/users/alice/home/.erix/config.json',
+    });
+    assert.equal(lsCalls.length, 1, '现场快照只花一次 docker（成本敏感的判据不能查三次）');
+    assert.match(lsCalls[0], /2>&1 \|\| true/, '远端 stderr 合并 + 不吃退出码（ls 对缺失段返回 2，那句话正是要的）');
+    assert.ok(!/\n/.test(lsCalls[0]), '快照命令必须单行（工单 F-6：经 JSON.stringify 会变成字面 \\n）');
+
+    // #227.2 该钉的行级判据本体（#495 的文档注释被它误伤过 ⇒ 判据提出函数并钉住双向）：
+    // 变异入口：把注释排除那段删掉 ⇒ 散文又被当命令；把 `!/ -p /` 删掉 ⇒ 合规命令也被报。
+    assert.equal(lineMissingComposeProject('const COMPOSE = \'docker compose -f deploy/docker-compose.yml\';'), true,
+      '真命令不带 -p 必须报（#227.2 本体不能被放宽）');
+    assert.equal(lineMissingComposeProject('const COMPOSE = \'docker compose -p "${X:-station}" -f y\';'), false,
+      '带了 -p 的合规命令不许报');
+    assert.equal(lineMissingComposeProject('// 必然缺。docker compose 要到整轮镜像构建之后才报'), false,
+      '纯注释是散文不是命令（#495 的头部清单就是被这条误伤的）');
+    assert.equal(lineMissingComposeProject('   * docker compose down -v'), false, '块注释续行同样不算命令');
+    assert.equal(lineMissingComposeProject('// docker compose -f x'), false, '注释里就算带了 -p 也不该因「有 -p」才被放过（它根本不是命令）');
+  } finally {
+    fs.rmSync(userspace, { recursive: true, force: true });
+  }
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}#495 预检/三态分类正例被破坏：${String(error?.message ?? error)}`;
+}
+/**
+ * #227.2 的行级判据：这一行是不是「一条没显式带 -p 的 docker compose 命令」。
+ *
+ * ⚠ **纯注释行不算命令**（#495 的文档注释「… docker compose 要到整轮镜像构建之后才报」曾被该钉误伤）：
+ * 钉的是命令串，不是散文。真命令不会写在 `//` 行里（模板字面量的续行也不以 `//` 开头），所以只排除
+ * 注释形态 = 不放过任何真命令。夹具在上方 #495 正例组里（把判据改坏当场红）。
+ *
+ * @param {string} line 单行源码
+ * @returns {boolean} true = 该钉要报（是命令且不带 -p）
+ */
+function lineMissingComposeProject(line) {
+  return /docker compose\b/.test(line) && !/ -p /.test(line) && !/^\s*(?:\/\/|\*|\/\*)/.test(line);
+}
+
 // 工单 F-6：**经 `sg docker -c ${JSON.stringify(cmd)}` 两层的命令不得含裸换行**（源码级静态钉）。
 // 根因（真机 §⑤ 首失败）：JSON.stringify 把模板里的**真实换行**变成字面 `\n` 两个字符，而双引号内的
 // POSIX shell **不还原**它 ⇒ 下游 psql 实收 `run_id\n FROM` ⇒ `ERROR: syntax error at or near "\"`。
@@ -448,7 +586,17 @@ const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeT
   'deriveFdeIpamPools', 'defaultFdeIpamPools', 'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce'];
 // 工单 F：`ports.json ↔ port_allocations` 对账件的唯一定义处是 lib/ports-reconcile.mjs（不在
 // isolated-env.mjs 里），所以单一来源断言得按名字选归属文件，不能再默认「只有 isolated-env.mjs」。
-const SINGLE_SOURCE_FILES = { reconcilePortsJsonWithDb: 'ports-reconcile.mjs' };
+const SINGLE_SOURCE_FILES = {
+  reconcilePortsJsonWithDb: 'ports-reconcile.mjs',
+  // issue #495：起跑前预检与「等宿主侧物化文件」的三态分类（#412 遗留 ①②）。各 e2e 只 import，
+  // 不许在脚本里复制第二份——两份分类文案一定会漂，而漂了就是回到「两种失败长得一样」的原坑。
+  assertComposeEnvFile: 'e2e-preflight.mjs',
+  inspectHostPathChain: 'e2e-preflight.mjs',
+  observeHostPath: 'e2e-preflight.mjs',
+  waitForHostFile: 'e2e-preflight.mjs',
+  toContainerPath: 'e2e-preflight.mjs',
+  materializeSnapshot: 'e2e-preflight.mjs',
+};
 const ISOLATION_SCRIPTS = ['wp2a-e2e.mjs', 'wp3a-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
 const singleSourceProblems = [];
 {
@@ -573,7 +721,8 @@ const singleSourceProblems = [];
       singleSourceProblems.push("wp3a-e2e.mjs: ensureLlmBinding 没有显式传 modelName: 'mock-model'（必须与 fake-agentd llm 段请求的模型名对齐；缺省 e2e-mock-model 不在白名单 → 403，#268 M3）");
     }
   }
-  // 工单 F（wp2a 重建，#268 决策第 2 条）：wp2a 必须按 P5 + 迁移 0019 的现役语义跑，且最重的那条
+  
+// 工单 F（wp2a 重建，#268 决策第 2 条）：wp2a 必须按 P5 + 迁移 0019 的现役语义跑，且最重的那条
   // 断言（ports.json ↔ port_allocations 对账）不许在脚本里被写软。变异自证入口：
   //   a) 删 wp2a 的 writeDynamicStub 调用 → 上方 DYNAMIC_STUB_SCRIPTS 红；
   //   b) 把对账改成恒真 → 上面「ports.json↔DB 对账件正/负例」那组红（行为面，无需 docker）；
@@ -631,11 +780,12 @@ const singleSourceProblems = [];
   }
   // #227.2：脚本里的 compose 命令串必须显式带 `-p `（隔离系用 `${COMPOSE_PROJECT_NAME:?…}`、共享系用
   // `${COMPOSE_PROJECT_NAME:-station}`）——出现不带 -p 的 `docker compose ` 即红：回到「忘 export 就对
-  // 共享 dev 栈 down -v」的隐式兜底（deploy/docker-compose.yml 的 `name: station`）。
+  // 共享 dev 栈 down -v」的隐式兜底（deploy/docker-compose.yml 的 `name: station`）。判据本体在
+  // `lineMissingComposeProject()`（纯注释行不算命令，#495 误伤过一次；夹具在 #495 正例组）。
   for (const file of files) {
     const lines = fs.readFileSync(file, 'utf8').split('\n');
     lines.forEach((line, i) => {
-      if (/docker compose\b/.test(line) && !/ -p /.test(line)) {
+      if (lineMissingComposeProject(line)) {
         singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}:${i + 1} docker compose 命令没显式带 -p（#227.2：消灭 compose 文件 name: 的隐式兜底）：${line.trim()}`);
       }
     });
@@ -647,6 +797,15 @@ const singleSourceProblems = [];
     const text = fs.readFileSync(file, 'utf8');
     if (text.includes('10.201.0.0/16')) {
       singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 又出现等值段字面量 10.201.0.0/16（#227.3 应走 deriveFdeIpamPools/defaultFdeIpamPools 派生）`);
+    }
+  }
+  // #495 ②：portal 容器内的 userspace 路径（bind mount 右值，`deploy/docker-compose.yml` 里写死）只允许
+  // 活在 lib/e2e-preflight.mjs 的 PORTAL_USERSPACE_CONTAINER_ROOT。脚本里再拄一份带引号的字面量 = 有人在
+  // 自己算宿主→容器路径（拼错了就是快照指到别处，看了白看）。
+  for (const file of files) {
+    if (path.basename(file) === 'e2e-preflight.mjs') continue;
+    if (/['"]\/srv\/erix\/users['"]/.test(fs.readFileSync(file, 'utf8'))) {
+      singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 又硬编码了 portal 容器内的 userspace 路径 '/srv/erix/users'（#495 ② 应 import lib/e2e-preflight.mjs 的 PORTAL_USERSPACE_CONTAINER_ROOT + toContainerPath）`);
     }
   }
   // 工单 F-6：所有要过 `sg docker -c ${JSON.stringify(cmd)}` 那两层的命令串必须**单行**——真实换行会被
