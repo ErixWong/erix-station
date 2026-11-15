@@ -79,6 +79,16 @@ export const routes: RouteRecordRaw[] = [
       },
       // issue #350：预览号池占用总览（只读）。懒加载组件 + 照邻居写 requiresRole；
       // 请求只在本视图挂载时发（判据①：进管理台不请求，切到这一 tab 才恰好 1 次）。
+      // issue #485 片 A：上传上限（§4.15）。导航顺序：users → llm → repos → mail → certs → **upload** → pool。
+      // 请求只在本视图挂载时发（`AdminUploadView` 的 onMounted 是唯一触发点）。
+      {
+        path: 'upload',
+        name: 'admin-upload',
+        component: () => import('./views/AdminUploadView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
+      // issue #350：预览号池占用总览（只读）。懒加载组件 + 照邻居写 requiresRole；
+      // 请求只在本视图挂载时发（判据①：进管理台不请求，切到这一 tab 才恰好 1 次）。
       {
         path: 'preview-pool',
         name: 'admin-preview-pool',
