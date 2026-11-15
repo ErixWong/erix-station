@@ -5441,3 +5441,44 @@ hook**，Vue 只在非生产构建里发 devtools 事件 ⇒ 本机 shell 默认
 （`2f4bab5` + 未提交的 `test/repo-hygiene.test.js`）；`resume` 续跑一次遇模型空响应
 （`produced no output`）⇒ 收尾（commit + 本节台账）由主 agent 完成，符合 §3.0
 （git 流程操作与文档维护本就属主 agent）。
+
+**copilot 二次审计与 H3 加固**（同工单 fix-261115-05 的续作，2026-11-16，worker 落地）
+
+**审计那条 MED 属实**：加固前判据只有 `\.emitted\b` 一支（原 `test/repo-hygiene.test.js:86-99`），
+而 `wrapper['emitted'](...)` 与 `const { emitted } = wrapper` 一样吃 Vue devtools hook、在生产构建下
+同样恒空，只是躲得过点号；反向自证又**只注入点号那一种形状** ⇒ **H3 能在假绿状态下通过**
+（审计原话：*the canonical injected probe does not test those forms*；给出的绕过法就是 bracket
+access 与 destructure/alias）。**扫描面本身没问题**（`git ls-files -- portal/frontend` 递归 +
+`.spec.ts` 过滤是 vitest `include` 的超集），漏的是**匹配面与探针面**。
+
+**加固成了什么**（提交 `6c018d1`）
+
+- 一支 → 三支 `EMITTED_SHAPES`，各带名字：① 点号 `.emitted`（含属性读 `wrapper.emitted`）
+  ② 方括号 `['emitted']` / `["emitted"]` ③ 解构取走 `{ emitted }` / `{ emitted: 别名 }` /
+  `{ a, emitted }`，外加跨行解构里单独占一行的成员 `emitted,`。解构拦的是**取走这件事本身**——
+  取走之后怎么调都追不住，所以不追调用点，直接把取走钉死。
+- 命中行改成带 `[形状名]`；反向自证从「注入一次点号」改成**逐形状 7 条注入**（点号 2：调用 + 裸属性读；
+  方括号 2：单引号 + 双引号；解构 3：裸取 + 带别名 + 跨行），每条要求 ①恰好命中 1 处
+  ②命中在被改的那份上 ③**命中标注的是这一支**（只验「命中了」证明不了是哪种形状认出来的）。
+- 新增覆盖率闸：`EMITTED_SHAPES` 里每个名字都必须有注入探针 ⇒ 以后加形状忘了配探针 = 直接红。
+- 散文探针（反向自证 B）保留并加到两句，仍要求**零命中** ⇒ 仓库现存 14 处「别用 emitted()」的
+  注释正文（分布在 8 个 spec，一处真调用都没有）全没红。**拦的是形状，不是单词**。
+- 范围照原口径不动：不钉 `fire()` / `vm.$emit` 等其它读事件方式；产品代码零改动。
+
+**加固后的读数**（本树实测，`NODE_ENV=production`）
+
+- 判据自身：`node --test test/repo-hygiene.test.js` **3/3、rc=0**；根 `npm test` **2357 项 0 红 14 跳**。
+- 真盘变异（往被跟踪的 `portal/frontend/src/router.spec.ts` 追加一行，跑完还原）**六条全 rc=1**，
+  且各标自己那一支：`wrapper.emitted('files-changed')`→`[点号]`、`wrapper['emitted'](...)`→`[方括号]`、
+  `wrapper["emitted"](...)`→`[方括号]`、`const { emitted } = wrapper`→`[解构]`、
+  `const { emitted: fired, find } = wrapper`→`[解构]`、跨行 `const {⏎ emitted,⏎} = wrapper`→`[解构]`；
+  散文对照 `// 别再写 emitted() 这种调用（#496）` **rc=0**。
+- 「探针非空转」再自证一层：把三支正则逐个换成永不匹配的字面量 ⇒ 各自 rc=1 且报的是**对应注入探针**
+  （`注入 方括号 形状 … 实际 0 处`），三支**都不是空支**；再凭空加一条没有探针的形状 ⇒ rc=1
+  报「有形状没有对应的注入探针」。
+- **已知代价（有意接受，与点号那一支同口径）**：把形状**写进注释**会红——实测
+  `// 也别写 { emitted } 这种解构（#496）` rc=1。改措辞即可（散文写 `emitted()` 不拦）。
+
+**过程记**：这轮派单**正文是空的**（`Task:` 后无字），素材 `/tmp/h3-finding.md` 在派单那一刻还没落盘。
+worker 起手没干等：先查证仓库状态（分支已 3 提交、PR #532 已开、H3 基线 3/3 绿、前端 spec 里
+14 处 `emitted` 散文的现状），收到 steering 后补读素材直接接上。⇒ **派单前 `test -r` 一下素材文件**是便宜的保险。
