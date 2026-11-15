@@ -30,6 +30,14 @@ import {
 // 循环里两件事都靠它：退避时长（`idleDelayMs` 的结果）与孤儿回收的时间戳（`now()`）。
 // ---------------------------------------------------------------------------
 
+// arm() 的等待预算（真实时间）。为什么**不能**用固定迭代次数（原写法 `for (let i = 0; i < 300 …)`）：
+// 一次 `setImmediate` 让出换算成多少真实时间**取决于机器负载**，两者不成比例——CI 上事件循环被同机
+// 别的进程压住时，300 次让出可能只走完几十毫秒，被测循环还没走到它那一拍的 sleep，断言就假红
+// （同一 commit 本地全绿、CI 约一半红，2026-11-16 一天撞了 5 次）。判据本身问的是「循环有没有停住」，
+// 那是**时间**问题，所以预算按真实时间给；超时仍然必须红（不许改成「等不到就算了」）。
+// 本文件里那两条「退避途中关闭」的用例走的是**真 setTimeout**，它们不调 arm()，不受该预算约束。
+const ARM_BUDGET_MS = 5000;
+
 function makeFakeClock() {
   const clock = {
     nowMs: 0,
@@ -56,8 +64,12 @@ function makeFakeClock() {
 
   /** 让循环跑到「停在某一拍的等待上」（假时钟不动，只放行微任务/宏任务）。 */
   async function arm() {
-    for (let i = 0; i < 300 && !clock.pending; i += 1) await new Promise((r) => setImmediate(r));
-    assert.ok(clock.pending, '循环必须停在某一拍的 sleep 上（没停住 = 循环抛错或已经退了）');
+    const startedAt = Date.now(); // 真实时间：假时钟的 now() 在这儿是不动的，量不出等了多久
+    while (!clock.pending && Date.now() - startedAt < ARM_BUDGET_MS) {
+      await new Promise((r) => setImmediate(r));
+    }
+    const waitedMs = Date.now() - startedAt;
+    assert.ok(clock.pending, `循环必须停在某一拍的 sleep 上（没停住 = 循环抛错或已经退了；已等 ${waitedMs}ms / 预算 ${ARM_BUDGET_MS}ms）`);
   }
 
   /** 放行当前这一拍：假时钟按它请求的毫秒数前进，然后等下一拍挂起。返回这一拍的 sleep 毫秒。 */

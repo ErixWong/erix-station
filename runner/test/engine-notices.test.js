@@ -30,15 +30,23 @@ function engineRootOrNull() {
 
 test('E1 四类诊断事件各出一条 warn，且关键字段进文案（不许静默）', () => {
   const cases = [
-    // 载荷逐条对着引擎发射点写：orchestrator.js:3193 / :1040 / :1011 / :2525
+    // 载荷逐条对着**装着的 0.33.0** 发射点写：orchestrator.js:3193 / :1040 / :1346・:1355 / :3072
     { event: { type: 'compaction_strategy_fallback', round: 7, detail: 'engine compaction fallback in effect' },
       must: ['sliding-window', 'round 7'] },
     { event: { type: 'model_metadata_missing', detail: 'contextWindowTokens/maxOutputTokens unavailable' },
       must: ['model metadata missing', 'disabled for this run'] },
-    { event: { type: 'persistence_capability_degraded', method: 'saveRunSnapshot', detail: 'store does not implement' },
-      must: ['saveRunSnapshot', 'skipped for this run'] },
+    // ⚠ 0.33.0（#530）：样例 `method` 从 `saveRunSnapshot` 换成 `appendRecoveryRow`——
+    //   快照方法引擎已不再调，本站**真会收到**的是恢复行那两条（#500 未做）。
+    //   这里只验「载荷里的 method 要进文案 + 要说清那一步被跳过」，不验本站到底哪几条会响
+    //   （那是下面 E5・行为面的事）。
+    { event: { type: 'persistence_capability_degraded', method: 'appendRecoveryRow', detail: 'store does not implement' },
+      must: ['appendRecoveryRow', 'skipped for this run'] },
+    // ⚠ 0.33.0 文案重写（#530）：旧句「the next resume relies on the run snapshot」已成假话
+    //   （run snapshot 已退役，恢复只靠账本）。下面钉的是**新句的两个关键字**：
+    //   「后一次恢复看不到它们」与「账本是唯一恢复来源」。拆了任一个 = 把假话又装回来。
     { event: { type: 'resume_journal_skipped', round: 4, count: 3, reason: 'crash_round_assistant_not_in_ledger' },
-      must: ['3 tool result(s)', 'round 4', 'crash_round_assistant_not_in_ledger'] },
+      must: ['3 tool result(s)', 'round 4', 'crash_round_assistant_not_in_ledger',
+        'lost to later resumes', 'the ledger is the only recovery source'] },
   ];
   for (const { event, must } of cases) {
     const n = engineDiagnosticNotice(event);
@@ -179,6 +187,19 @@ test('E4 外来标识符过形状闸：不给字符串就退 ?，绝不 [object 
   // 合法形状（含下划线/点号）照原样保留——闸不能把真值也刷掉
   const ok = engineDiagnosticNotice({ type: 'persistence_capability_degraded', method: 'append_checkpoint' });
   assert.match(ok.msg, /"append_checkpoint"/);
+});
+
+// E5（issue #530 / erix-agent 0.33.0）：`resume_journal_skipped` 的文案**不许再拿快照当兜底承诺**。
+// 上面 E1 钉的是「关键字在」，这里钉的是「旧假话不在」：它一旦回来，运维就会继续信
+// 「丢了也没事，有快照兜」——而 0.33.0 起没有快照，这个信念会直接导成错判障。
+test('E5 resume_journal_skipped 不得再宣称「靠 run snapshot 兜底」（0.33.0 起快照已退役）', () => {
+  const n = engineDiagnosticNotice({
+    type: 'resume_journal_skipped', round: 4, count: 3, reason: 'crash_round_assistant_not_in_ledger',
+  });
+  assert.ok(n);
+  assert.doesNotMatch(n.msg, /relies on the run snapshot/,
+    '这句在 0.33.0 是假话：引擎不再读写 run snapshot，恢复只靠账本（orchestrator.js:3221）');
+  assert.match(n.msg, /no run snapshot since 0\.33\.0/, '要说清「没有快照兜底」这个事实及其版本边界');
 });
 
 // ── S1 issue #442（erix-agent 0.30.0 / 上游 #661）：**折叠失败 ⇒ run 失败**的运维嘴 ─────────

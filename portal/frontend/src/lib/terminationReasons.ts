@@ -98,10 +98,36 @@
 //        `RETRYABLE_CODES` 仍只有 `timeout` / `rate_limited` / `server` / `disconnect`（`diff -q` rc=0），
 //        `timeout.js` 与 `anthropic.js` 也逐字节相同 ⇒ provider 层可重试码面零差异。
 //     ⇒ **只追版本号，不放宽任何断言**（§8.27 / §8.65 先例）。
+//   * 0.32.0 → 0.33.0（issue #530 / 工单 feat-261115-08）**九度核**，按 0.33.0 现查（261115 本
+//     worktree，两份包都是 `npm pack` 解包：`/tmp/ea32x/package`（0.32.0）与 `/tmp/ea33x/package`
+//     （0.33.0）；先确认本站**装着的**那一份就是 registry 上那一页：
+//     `diff -rq <装着的>/src /tmp/ea33x/package/src` 过滤 `.d.ts` 后**无输出**）：
+//     ① `diff -u <0.32>/src/loop/termination.js <0.33>/src/loop/termination.js` 只有三处实体：
+//        一行**注释**把 `checkpoint_failed` 从错误码例子里拿掉并明写「已退役」、新增
+//        `isFileWritesBlind()` 与 `payload.fileWritesBlind`（additive，不碰 reason）、
+//        `answerPendingTailToolUse` 多传一个 `executedToolIds` 参数 ⇒ **三处都不碰 reason**，
+//        值域零变化；另用
+//        `grep -oE '"(aborted|end_turn|failed|…)"' | sort -u` 在两份包上各取一次，两侧**逐字相同**
+//        （九个值：`aborted` / `continuation_exhausted` / `end_turn` / `failed` /
+//        `final_guard_unverified` / `judge_done` / `max_rounds_cap` / `no_tool` / `stall`；
+//        `persistence_failed` 不在本文件，它定在 `orchestrator.js` 的 `fail()`）。
+//     ② `src/loop/orchestrator.js` 的 typedef 在**装着的 0.33.0** 上取到的仍是同一组九值、同一顺序
+//        （`end_turn,no_tool,stall,max_rounds_cap,judge_done,continuation_exhausted,final_guard_unverified,aborted,failed`）；
+//        `? "failed" : "persistence_failed"` / `const reason = signal?.aborted` /
+//        `operation: persistenceFailure.operation` 三处形状断言**仍然命中**（由
+//        `portal/test/termination-contract.test.js` 的「引擎源码交叉核对」在装着的 0.33.0 上跑绿）。
+//     ③ `diff -rq <0.32>/src/providers <0.33>/src/providers` **整目录无输出**（比 0.32 那次更强：
+//        0.32 只做到 `timeout.js`/`errors.js`/`anthropic.js` 三个文件逐字节相同，0.33 是整个
+//        providers 目录零变更）⇒ `errors.js` 的 `RETRYABLE_CODES` 仍是 `timeout` /
+//        `rate_limited` / `server` / `disconnect`，provider 层可重试码面零差异。
+//     ⚠ `checkpoint_failed` 从 0.33.0 起**不再产出**（引擎注释已明写），但它是**旧档案里已存在的
+//     历史错误码** ⇒ `RUN_RETRYABLE_ERROR_CODES` 里那一项**保留不动**（删了会把旧 run 的重试判定改
+//     语义）。本单只改注释，**值域一项不动**（`runner/lib/termination.js` 的镜像常量同步不动）。
+//     ⇒ **只追版本号，不放宽任何断言**（§8.27 / §8.65 先例）。
 //   * `reflection_stop` 已不是引擎取值（旧文档残留），只可能出现在历史数据行里，故**不在**本集合。
 
 /** 常量对齐的引擎版本（升级 erix-agent 时必须重跑防漂移测试并按需重开 issue）。 */
-export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.32.0';
+export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.33.0';
 
 /**
  * 引擎 `termination.reason` 全集（顺序 = 引擎 typedef 声明顺序，`persistence_failed` 追加在末尾）。
