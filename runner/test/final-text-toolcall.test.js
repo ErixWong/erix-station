@@ -18,6 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_TOOLCALL_MARKERS,
+  TEXTUALIZED_MARKER_MAX_CHARS,
   TEXTUALIZED_TOOL_CALL_EVENT_TYPE,
   TOOLCALL_MARKERS_ENV,
   detectTextualizedToolCall,
@@ -39,6 +40,11 @@ const LT = '<'; const GT = '>'; // 尖括号常量：同族变体夹具用它们
 const DSML_FEATURE = DEFAULT_TOOLCALL_MARKERS[0];
 const TOOL_CALL_FEATURE = '<tool_call';
 const FUNCTION_FEATURE = '<\uff5cFunction';
+// XML 那一族的特征（PR #555 复审 MED-1）：**预防性覆盖**，dev 库现查 0 命中 —— 不是第五条真样本。
+const INVOKE_FEATURE = LT + 'invoke';
+// OpenAI/LiteLLM 的 tool-call id 前缀（同 PR #555 复审 MED-1）：**同样是预防性覆盖**，
+// 也是缺省集合里唯一一条**不含 `<`** 的条目（它靠「长度 ≥12 且含 `-`」那条形状闸进得来）。
+const CHATCMPL_FEATURE = 'chatcmpl-tool-';
 
 /**
  * 真样本 A：run f4dfea1d-c439-4bba-ac34-4c86d7132bea（2026-10-11，runs.status=finished，32 轮，
@@ -163,13 +169,26 @@ test('#243 ③ 缺省特征集至少三条，且不许只钉 DSML 一条', () =>
   assert.ok(Array.isArray(DEFAULT_TOOLCALL_MARKERS) && DEFAULT_TOOLCALL_MARKERS.length >= 3,
     '缺省特征集必须 >= 3 条，实得 ' + JSON.stringify(DEFAULT_TOOLCALL_MARKERS));
   assert.equal(new Set(DEFAULT_TOOLCALL_MARKERS).size, DEFAULT_TOOLCALL_MARKERS.length, '缺省集合里有重复项');
+  // 缺省集合的**形状不变量**（= 解析器两条闸的同一条口径，别把它松成"是字符串就行"）：
+  //   含 `<` 的条目 ⇒ 长度 ≥3；**不含 `<`** 的条目 ⇒ 长度 ≥12 且含 `-`（「像 id 前缀」）。
+  //   这条断言就是防误伤的承重墙：松掉它，`off` 这种短词就能溜进缺省去咬 "offset"。
   for (const marker of DEFAULT_TOOLCALL_MARKERS) {
-    assert.ok(typeof marker === 'string' && marker.indexOf('<') >= 0,
-      '每条特征都必须是含尖括号的标记串，实得 ' + JSON.stringify(marker));
+    const isTag = typeof marker === 'string' && marker.indexOf('<') >= 0 && marker.length >= 3;
+    const isIdPrefix = typeof marker === 'string' && marker.indexOf('<') < 0
+      && marker.length >= 12 && marker.indexOf('-') >= 0;
+    assert.ok(isTag || isIdPrefix, '缺省条目形状不对，实得 ' + JSON.stringify(marker));
   }
-  assert.deepEqual([...DEFAULT_TOOLCALL_MARKERS], [DSML_OPEN, TOOL_CALL_FEATURE, FUNCTION_FEATURE],
-    '缺省三条 = DSML 前缀 / tool_call 一族 / Function 一族。DSML 取到竖线为止：真样本 B 写作带空格的'
-    + ' invoke、真样本 A 首行是 tool_calls，拿"到 invoke 为止"那种字面串当特征会两条都漏。');
+  const bareEntries = DEFAULT_TOOLCALL_MARKERS.filter((m) => m.indexOf('<') < 0);
+  assert.deepEqual(bareEntries, [CHATCMPL_FEATURE],
+    '不含 `<` 的条目必须只有 id 前缀那一条，且必须是 chatcmpl-tool-（多一条就得先补真样本，不是先补形状）');
+  assert.deepEqual([...DEFAULT_TOOLCALL_MARKERS],
+    [DSML_OPEN, TOOL_CALL_FEATURE, FUNCTION_FEATURE, INVOKE_FEATURE, CHATCMPL_FEATURE],
+    '缺省 = DSML 前缀 / tool_call 一族 / Function 一族 / XML 的 invoke 一族 / OpenAI 的 id 前缀一族。'
+    + 'DSML 取到竖线为止：真样本 B 写作带空格的 invoke、真样本 A 首行是 tool_calls，'
+    + '拿\"到 invoke 为止\"那种字面串当特征会两条都漏。'
+    + '\u26a0 **前三条是 dev 库实证；后两条（<invoke、chatcmpl-tool-）是预防性覆盖**——261116 返工现查'
+    + '库里各 0 命中（取数语句与读数见交付 /tmp/tickets/deliver-555-rework.md 的「取证边界」），'
+    + '别把它们读成第三、第四条真样本。');
 });
 
 test('#243 ③ 删掉某条特征 ⇒ 对应夹具不再命中（反向自证：判定真的跟着集合走）', () => {
@@ -204,10 +223,10 @@ test('#243 ③ 换一套集合 ⇒ 判定跟着变（自定义特征与缺省集
 // ④ 配置解析：缺省 / 显式关闭 / 非法值不许静默
 // ---------------------------------------------------------------------------
 
-test('#243 ④ 配置：未设 ⇒ 缺省三条；off ⇒ 显式关闭但必须响一声', () => {
+test('#243 ④ 配置：未设 ⇒ 缺省特征集；off ⇒ 显式关闭但必须响一声', () => {
   for (const raw of [undefined, null, '', '   ']) {
     const got = parseToolCallMarkers(raw);
-    assert.deepEqual(got.markers, [...DEFAULT_TOOLCALL_MARKERS], JSON.stringify(raw) + ' 应回退缺省三条');
+    assert.deepEqual(got.markers, [...DEFAULT_TOOLCALL_MARKERS], JSON.stringify(raw) + ' 应回退缺省特征集');
     assert.equal(got.disabled, false, '未设配置不是关闭');
     assert.deepEqual(got.warnings, [], '未设配置不该响');
   }
@@ -236,7 +255,7 @@ test('#243 ④ 配置：非法条目不许静默 —— 逐条点名丢弃；全
 
   const allBad = parseToolCallMarkers('off,tool,lt');
   assert.deepEqual(allBad.markers, [...DEFAULT_TOOLCALL_MARKERS],
-    '全部条目都非法 ⇒ 回退缺省三条，**不是**关掉检测（配错不该把可见面一起吞掉）');
+    '全部条目都非法 ⇒ 回退缺省特征集，**不是**关掉检测（配错不该把可见面一起吞掉）');
   assert.equal(allBad.disabled, false, '全部非法不得被当成显式关闭');
   assert.equal(allBad.warnings.length, 4, '三条非法 + 一条回退汇总都要响，实得 ' + JSON.stringify(allBad.warnings));
   assert.ok(allBad.warnings[allBad.warnings.length - 1].indexOf('回退缺省') >= 0, '回退这件事本身要响');
@@ -253,7 +272,7 @@ test('#243 ④ 从 env 读：只读那一个键，且把告警原样交回调用
   assert.equal(got.disabled, true, 'env 里写 off 就是关闭');
   assert.equal(got.warnings.length, 1, '从 env 读也要把告警交回去（本模块不打日志：纯函数）');
   assert.equal(toolCallMarkersFromEnv({}).markers.length, DEFAULT_TOOLCALL_MARKERS.length,
-    'env 里没有那个键 ⇒ 缺省三条');
+    'env 里没有那个键 ⇒ 缺省特征集');
 });
 // ---------------------------------------------------------------------------
 // ⑤ 「不误伤」那一格的反向自证：把判据放宽成「正文含 <」必须被这格逼红
@@ -272,7 +291,7 @@ test('#243 ⑤ 反向自证：判据若退化成"正文含 <"就算，正常交�
     + '的集合）。这格红 = 第 ② 格根本没在看这些夹具，那条判据可以写成恒绿断言');
   for (const text of NORMALS) {
     assert.equal(detectTextualizedToolCall(text).hit, false,
-      '同一批夹具在缺省三条下必须判假 —— 两向一起看，才说明"不误伤"是靠特征形状做到的，不是靠运气');
+      '同一批夹具在缺省特征集下必须判假 —— 两向一起看，才说明"不误伤"是靠特征形状做到的，不是靠运气');
   }
 });
 
@@ -417,4 +436,202 @@ test('#243 ⑦ agentd 逐字透传：worker 带了这两个键 ⇒ U2 body 里�
     assert.equal(Object.hasOwn(body, 'textualized_tool_call_marker'), false,
       `marker=${JSON.stringify(dirty)} 不该被透传（portal 会因它 400，整条终态都报不上去）`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// ⑧ PR #555 复审 MED-1：两族今天认不出、而且**配不进去**（XML 的 `<invoke` / OpenAI 的 id 前缀）
+//
+// ⚠ 这两族在 dev 库里**取不到真样本**（`run_events.payload` / `messages.content` /
+// `transcript_rounds(record|messages)` 三处各 0 命中，同一批查询里 DSML 的阴性对照是 6 / 1 / 8 行）
+// ⇒ 它们是**预防性覆盖**。下面的夹具是「形状夹具」，不是第五条、第六条真样本，别这么读。
+// ---------------------------------------------------------------------------
+
+// XML 那一族（Anthropic/LiteLLM 把 tool call 编进 content 的形状）。多行一律 join(NL)：
+// 单引号串跨行会把整个文件的解析打断（本文件踩过一次）。
+const SAMPLE_E_INVOKE = [
+  '任务已完成，下面是我打算执行的命令：',
+  LT + 'invoke name="exec"' + GT,
+  LT + 'parameter name="command"' + GT + 'npm test' + LT + '/parameter' + GT,
+  LT + '/invoke' + GT,
+].join(NL);
+
+// OpenAI/LiteLLM 的 tool-call **id 前缀**形态：正文里只剩一串 id，没有任何结构化 tool_calls。
+const SAMPLE_F_ID_PREFIX = ['交付说明见上。', 'chatcmpl-tool-abc123def456'].join(NL);
+
+test('#243 ⑧ `<invoke` 一族默认判真并带回是哪条特征；从缺省里删掉它 ⇒ 该夹具必须转假', () => {
+  const got = detectTextualizedToolCall(SAMPLE_E_INVOKE);
+  assert.equal(got.hit, true, 'XML 形态必须判真（复审复现过 hit:false）');
+  assert.equal(got.marker, INVOKE_FEATURE, '要能带回命中的是哪一条特征，实得 ' + JSON.stringify(got.marker));
+
+  // 反向自证：这条判定真的来自缺省集合里那条特征，不是别的条目顺手捞到的。
+  const withoutInvoke = DEFAULT_TOOLCALL_MARKERS.filter((m) => m !== INVOKE_FEATURE);
+  assert.equal(detectTextualizedToolCall(SAMPLE_A_FINAL_TEXT, withoutInvoke).hit, true,
+    '前置：删掉 <invoke 之后 DSML 真样本仍判真（否则下面那条判假是恒真断言）');
+  assert.equal(detectTextualizedToolCall(SAMPLE_E_INVOKE, withoutInvoke).hit, false,
+    '删掉 <invoke 这条后，XML 夹具必须转假');
+
+  // 剥代码的口径对新条目同样成立：文档/交付里**引用** `<invoke name="exec">` 不是泄漏。
+  const quoted = '本仓判据里出现过 ' + FENCE + NL + SAMPLE_E_INVOKE + NL + FENCE + '，那是夹具不是泄漏。';
+  assert.equal(detectTextualizedToolCall(quoted).hit, false, '代码块里引用的 XML 形态不许判真');
+});
+
+test('#243 ⑧ `chatcmpl-tool-` 形态默认判真；只写 `chatcmpl` 或含 offset/offer 的正常正文不许被咬', () => {
+  const got = detectTextualizedToolCall(SAMPLE_F_ID_PREFIX);
+  assert.equal(got.hit, true, 'id 前缀形态必须判真');
+  assert.equal(got.marker, CHATCMPL_FEATURE, '实得 ' + JSON.stringify(got.marker));
+
+  // 误伤判据一：**没有那条 `-`** 的短词不算（"chatcmpl" 会出现在普通内容里：dev 库里那一行
+  // 就是某个 run 用 writeFile 写下去的测试脚本正文）。
+  for (const text of [
+    '已生成响应 id chatcmpl-9fQ2xT，一切正常。',
+    '这次交付不涉及 chatcmpl 这个前缀，结论见上。',
+  ]) {
+    assert.equal(detectTextualizedToolCall(text).hit, false, '不该判真：' + JSON.stringify(text));
+  }
+  // 误伤判据二：`off` / `offer` / `offset` 这一族短词永远不许进特征（"offset" 里含 "off"）。
+  for (const text of [
+    '我把滚动偏移 offset 修成了 0，另把 offer 文案改了。',
+    '关掉开关（off）之后不再刷提示。',
+  ]) {
+    assert.equal(detectTextualizedToolCall(text).hit, false, '不该判真：' + JSON.stringify(text));
+  }
+});
+
+test('#243 ⑧ 承重墙：不含 `<` 的条目要求「长度 ≥12 且含 `-`」——收得下 id 前缀，挡得住短词', () => {
+  // 收得下：现场遇到那一族时不必改代码（这正是 MED-1 要的能力）。
+  const ok = parseToolCallMarkers(CHATCMPL_FEATURE, { key: 'X_MARKER' });
+  assert.deepEqual(ok.markers, [CHATCMPL_FEATURE], 'chatcmpl-tool- 必须收得下，实得 ' + JSON.stringify(ok.markers));
+  assert.deepEqual(ok.invalid, [], '它不是非法条目');
+  assert.deepEqual(ok.warnings, [], '合法的 id 前缀不该有告警');
+
+  // 挡得住：逐条点名丢弃，理由要点明"为什么这种值会咬自然语言"。
+  const bad = parseToolCallMarkers('chatcmpl,off,offer,offset,abcdefghij-', { key: 'X_MARKER' });
+  // 这批**全部**非法 ⇒ 走「回退缺省」那一条路（不是空集合、更不是关掉检测）；
+  // 「一条合法就留那条」的逐条口径在下面的 mixed 与 ⑪ 里各钉一次。
+  assert.deepEqual(bad.markers, [...DEFAULT_TOOLCALL_MARKERS],
+    '五条全非法 ⇒ 回退缺省（配错不该把可见面一起吞掉），实得 ' + JSON.stringify(bad.markers));
+  assert.equal(bad.disabled, false, '全部非法不得被当成显式关闭');
+  assert.deepEqual(bad.invalid.map((e) => e.value), ['chatcmpl', 'off', 'offer', 'offset', 'abcdefghij-'],
+    '按出现顺序逐条记账（abcdefghij- = 11 字符，差一个字符也不收）');
+  assert.equal(bad.warnings.length, 6, '5 条点名 + 1 条回退汇总都要响，实得 ' + JSON.stringify(bad.warnings));
+
+  // 混合：一条非法只丢那一条，别把整份判定带崩（口径以代码为准：**逐条**丢弃，全部非法才回退）。
+  const mixed = parseToolCallMarkers(TOOL_CALL_FEATURE + ',chatcmpl', { key: 'X_MARKER' });
+  assert.deepEqual(mixed.markers, [TOOL_CALL_FEATURE], '只丢那条短的');
+  assert.equal(mixed.invalid.length, 1);
+  assert.equal(mixed.warnings.length, 1, '一条非法只响一次');
+
+  // 形状闸的边界：12 字符 + 含 `-` 是最短可收形态；12 字符不含 `-` 仍拒。
+  assert.deepEqual(parseToolCallMarkers('abcdefghijkl-').markers, ['abcdefghijkl-'], '12 字符 + 横杠 = 收');
+  assert.deepEqual(parseToolCallMarkers('abcdefghijkl').markers, [...DEFAULT_TOOLCALL_MARKERS],
+    '12 字符但不含横杠 ⇒ 拒（并回退缺省：这是"全部条目都非法"那一条路，不是关掉检测）');
+});
+
+// ---------------------------------------------------------------------------
+// ⑨ PR #555 复审 MED-2：一个**超长 marker** 不许拿到拒绝整条终态的能力
+//
+// 事实链（返工单里的复现）：`internal.js` 的 marker 校验在**开事务之前** ⇒ 400 ⇒ 终态不写、不重试。
+// 所以丢弃必须发生在**源头**（runner 生成时 + agentd 透传时），portal 那道 400 只是契约闸。
+// ---------------------------------------------------------------------------
+
+test('#243 ⑨ 超长 marker ⇒ 只丢这个显示片段，布尔照传（120 边界两侧各钉一次）', () => {
+  const cap = TEXTUALIZED_MARKER_MAX_CHARS;
+  assert.equal(cap, 120, '上界是 120（与 portal 同名常量同源；跨面对账在下面那格）');
+
+  const atCap = LT + 'x'.repeat(cap - 1);            // 恰好 120 字符
+  const overCap = LT + 'x'.repeat(cap);              // 121 字符
+  assert.equal(atCap.length, cap); assert.equal(overCap.length, cap + 1);
+
+  // 用真正文驱动：正文里就是那条超长特征 ⇒ 命中成立，但片段不许上界面。
+  assert.deepEqual(textualizedToolCallField('结论如上。' + NL + atCap, [atCap]),
+    { textualized_tool_call: true, textualized_tool_call_marker: atCap },
+    '恰好等于上界 ⇒ 片段照带（别把边界误伤掉）');
+  assert.deepEqual(textualizedToolCallField('结论如上。' + NL + overCap, [overCap]),
+    { textualized_tool_call: true },
+    '超一个字符 ⇒ **只丢 marker**：布尔必须在，否则「命中」这件事整个消失');
+
+  // 上界只管显示，**不许反过来取消命中**（判定与事件都不受影响）。
+  assert.equal(detectTextualizedToolCall('结论如上。' + NL + overCap, [overCap]).hit, true,
+    'detect 不设长度闸：超长照样判真');
+
+  // 配置面：条目长过上限**不算非法**（照样参与判定），但必须提示一句会少一段片段——不许静默。
+  const cfg = parseToolCallMarkers(overCap, { key: 'X_MARKER' });
+  assert.deepEqual(cfg.invalid, [], '超长条目不是非法项：这么长的字面串照样能判定');
+  assert.deepEqual(cfg.markers, [overCap]);
+  assert.equal(cfg.warnings.length, 1, '但必须给一条告警，实得 ' + JSON.stringify(cfg.warnings));
+  assert.ok(cfg.warnings[0].indexOf('marker') >= 0, '告警要说清"命中时不再带 marker 片段"，实得 ' + cfg.warnings[0]);
+});
+
+test('#243 ⑨ 跨面对账：runner 的上界 == portal 的上界，且两侧都不许是裸数字', () => {
+  const root = path.join(RUNNER_DIR, '..');
+  const readSide = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
+  const grab = (src, name) => {
+    const m = src.match(new RegExp('const ' + name + '\\s*=\\s*(\\d+)\\s*;'));
+    assert.ok(m, name + ' 这个命名常量没找到（改成裸数字就等于两边各写一个数，那是下一次漂移的源头）');
+    return Number(m[1]);
+  };
+  const runnerCap = grab(readSide('runner/lib/final-text-toolcall.js'), 'TEXTUALIZED_MARKER_MAX_CHARS');
+  const portalCap = grab(readSide('portal/src/internal.js'), 'TEXTUALIZED_MARKER_MAX_CHARS');
+  assert.equal(runnerCap, portalCap,
+    '两侧上界必须相等（runner ' + runnerCap + ' vs portal ' + portalCap + '）');
+  assert.equal(runnerCap, TEXTUALIZED_MARKER_MAX_CHARS, 'runner 侧的常量必须真的被代码用到（不是另一份副本）');
+  // portal 侧不许再留裸 `> 120` 的比较（改成常量之后这条应当恒绿；漂回裸数字就红）
+  assert.doesNotMatch(readSide('portal/src/internal.js'), /rawToolCallMarker\.length\s*>\s*120\b/,
+    'portal 的校验必须走命名常量');
+  // agentd 也必须用同一个常量（它是 worker → U2 的最后一道宿主关口）
+  const agentdSrc = readSide('runner/agentd.js');
+  assert.match(agentdSrc, /import \{ TEXTUALIZED_MARKER_MAX_CHARS \} from '\.\/lib\/final-text-toolcall\.js'/,
+    'agentd 必须 import 同一个常量，而不是再抄一个数');
+  assert.match(agentdSrc, /msg\.textualized_tool_call_marker\.length <= TEXTUALIZED_MARKER_MAX_CHARS/,
+    'agentd 的透传必须带上长度闸');
+});
+
+test('#243 ⑨ agentd 兜底：worker 发来超长 marker（版本偏移）⇒ U2 只带布尔，终态不受影响', async () => {
+  const long = LT + 'y'.repeat(TEXTUALIZED_MARKER_MAX_CHARS);   // 121 字符
+  const body = await finishedBody({
+    textualized_tool_call: true, textualized_tool_call_marker: long,
+  });
+  assert.equal(body.textualized_tool_call, true, '布尔必须照传（丢的只是显示片段）');
+  assert.equal(Object.hasOwn(body, 'textualized_tool_call_marker'), false,
+    '超长 marker 不许送到 portal——那边 400 打回的是整条终态');
+  assert.equal(body.termination.reason, 'end_turn', '既有终态字段一个字没动');
+  assert.equal(body.rounds, 32);
+});
+
+// ---------------------------------------------------------------------------
+// ⑩ PR #555 复审 LOW-4：**代码块外**裸写标记 ⇒ 误报一条中性提示。这是**已知残余**，不是待修的 bug。
+//
+// 为什么接受：判据是「逐字子串」，一旦为了这种情况去加"位置/结构推断"，就会把真样本 B 那种
+// 带空格的变体一起放掉（那才是实证过的形状）。代价是**多一条中性提示**，不是把一个正常 run
+// 判成失败 ⇒ 净收益仍是正的。下一个人要改它，必须先拿出"改完不会漏真样本"的证据，别顺手改。
+// ---------------------------------------------------------------------------
+
+test('#243 ⑩ 钉现状：代码块**外**裸写标记会被判真（已知残余，代价是一条中性提示）', () => {
+  const mentionsBare = '说明：标记 ' + DSML_OPEN + ' 只是名称，并非调用。';
+  assert.equal(detectTextualizedToolCall(mentionsBare).hit, true,
+    '现状：裸写（不在代码块里）会判真 —— 把它当 bug 顺手改掉之前，先证明不会漏掉真样本 B 那种带空格变体');
+  // 同一段话只要把标记放进代码里就判假：这条残余的边界就是"有没有在代码里引用"。
+  const quotedSame = '说明：标记 `' + DSML_OPEN + '` 只是名称，并非调用。';
+  assert.equal(detectTextualizedToolCall(quotedSame).hit, false, '同一段话写进行内代码就判假');
+});
+
+// ---------------------------------------------------------------------------
+// ⑪ PR #555 复审 LOW-3：非法条目的真实行为是**逐条**丢弃，**全部**非法才回退
+//（"少于 3 条整份作废"那句话是工单/PR 正文写错，已用 REST 更正；这一格把口径钉在代码上）
+// ---------------------------------------------------------------------------
+
+test('#243 ⑪ 口径以代码为准：一条合法就留那条，全部非法才回退缺省（不是整份作废、更不是关掉）', () => {
+  const oneGood = parseToolCallMarkers('<tool_call', { key: 'X_MARKER' });
+  assert.deepEqual(oneGood.markers, [TOOL_CALL_FEATURE], '单条合法就是单条：不因为"少于三条"整份作废');
+  assert.deepEqual(oneGood.warnings, [], '合法条目不该有任何告警');
+  assert.equal(oneGood.disabled, false);
+
+  const twoGood = parseToolCallMarkers(TOOL_CALL_FEATURE + ',' + DSML_OPEN, { key: 'X_MARKER' });
+  assert.equal(twoGood.markers.length, 2, '两条合法就留两条（条数门槛根本不存在）');
+  assert.deepEqual(twoGood.invalid, []);
+
+  const allBad = parseToolCallMarkers('off,chatcmpl', { key: 'X_MARKER' });
+  assert.deepEqual(allBad.markers, [...DEFAULT_TOOLCALL_MARKERS], '全部非法 ⇒ 回退缺省');
+  assert.equal(allBad.disabled, false, '回退不是关闭：配错不许把可见面一起吞掉');
+  assert.ok(allBad.warnings.some((w) => w.indexOf('回退') >= 0), '回退这件事要响');
 });
