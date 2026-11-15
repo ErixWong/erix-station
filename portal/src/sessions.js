@@ -450,6 +450,80 @@ function normalizeFoldedRoundRange(raw) {
   return { from, to };
 }
 
+/** 消息的 content block 数组（字符串 content 与上游一样当「没有 block」；非对象块丢掉）。 */
+function contentBlocks(content) {
+  return Array.isArray(content) ? content.filter((block) => block !== null && typeof block === 'object') : [];
+}
+
+/** 一条消息里某种类型的块。 */
+function blocksOfMessage(message, type) {
+  return contentBlocks(message?.content).filter((block) => block.type === type);
+}
+
+/**
+ * issue #387：**纯读侧**把 `tool_result` 挂回带它那次 `tool_use` 的那条记录，再喂上游投影。
+ *
+ * 病根（实测 `resultPreview` **0/98**）：erix-agent 0.23+ 一轮是**多行**落盘的
+ * （`:msg:<n>:0` = assistant 的 `tool_use`，`:msg:<n>:1..k` = 每个 `tool_result` 各一行，
+ * `:engine:round:<n>` 载体的 `messages` 是空数组），而 `rebuildFoldedRange` 把**每行各自一条记录**
+ * 喂给 `projectTranscriptForDisplay`。上游的配对函数 `toolResultsOf`（`src/display/projection.js`）
+ * **只扫本条记录的 `messages`** ⇒ 结果块与调用块分家 ⇒ 每个 `toolCalls[]` 项只有 `name`/`argsSummary`，
+ * 「调了什么」看得见、「返回了什么」全丢（#384 之后渲染器已经会画工具行，缺的就是这一件）。
+ * 主消息流没这个病，是因为 `session-view.js` 在喂投影前先过了一遍读侧折叠
+ * （`transcript-fold.js`，把消息行折回轮行）——**同一条「先配对再投影」的口径**。
+ *
+ * 为什么是「挂记录」而不是「折行」：本端点的 SQL 只取 `round, messages`（不取 `record`/`dedup_key`），
+ * 折叠闸要的是 record 级形状；而重建面要的只有「让上游能配上对」这一件事。于是这里做**最小动作**：
+ * 按 `tool_use_id` 在本 range 内建结果索引，把**缺结果的那些块原样**（同一个块对象引用，不改写任何字段）
+ * 追加成一条 `{role:'user', content:[…tool_result 块…]}` 挂到带 `tool_use` 的那条记录末尾，
+ * **配对仍由上游做** ⇒ `resultPreview`/`isError`/`executionStatus`/`durationMs` 与主消息流**同一把尺**，
+ * 本站不复制第二套预览/截断规则（#95 红线：不向上游形状注入字段）。
+ *
+ * 三条不伪造的边界（判据 ②）：
+ *   · 本 range 内**查不到** `tool_use_id` ⇒ 不追加任何东西 ⇒ 上游连 `resultPreview` 这个**键都不写**
+ *     （上游对配不上的调用就是缺键，不是空串）；
+ *   · 结果**本来就在同一条记录里**（0.22 老账本、或同轮单行）⇒ 不重复追加（幂等，输出逐字节不变）；
+ *   · 只有 `tool_use` 没有 `id`（旧记录形状）⇒ 跳过，不猜。
+ * 追加的那条消息**只有 tool_result 块**，上游 `textOf()` 对它是空串 ⇒ 走的是「model plumbing」那条
+ * `continue`（`projection.js` 原注释）⇒ **不会多冒一个 user turn**（判据里用 turn 计数钉住）。
+ *
+ * 只读：不改 `rows`、不改 `record.messages`（新建数组/新对象），账本一字节不动。
+ */
+function attachToolResultsToRecords(records) {
+  const list = Array.isArray(records) ? records : [];
+  /** @type {Map<string, object>} range 内的 tool_use_id → 结果块（真库同一 id 只出现一次） */
+  const results = new Map();
+  for (const record of list) {
+    for (const message of Array.isArray(record?.messages) ? record.messages : []) {
+      for (const block of blocksOfMessage(message, 'tool_result')) {
+        if (typeof block.tool_use_id === 'string') results.set(block.tool_use_id, block);
+      }
+    }
+  }
+  if (results.size === 0) return list; // 一条结果都没有 ⇒ 原样交回（老账本零改写）
+
+  return list.map((record) => {
+    const messages = Array.isArray(record?.messages) ? record.messages : [];
+    const own = new Set(); // 本条记录里**已经**结清的 tool_use_id（不重复挂）
+    for (const message of messages) {
+      for (const block of blocksOfMessage(message, 'tool_result')) {
+        if (typeof block.tool_use_id === 'string') own.add(block.tool_use_id);
+      }
+    }
+    const missing = [];
+    for (const message of messages) {
+      for (const block of blocksOfMessage(message, 'tool_use')) {
+        const id = block.id;
+        if (typeof id !== 'string' || own.has(id)) continue;
+        const result = results.get(id);
+        if (result !== undefined) missing.push(result);
+      }
+    }
+    if (missing.length === 0) return record;
+    return { ...record, messages: [...messages, { role: 'user', content: missing }] };
+  });
+}
+
 /**
  * 按 `foldedRoundRange` 从同会话已有轮行重建原文（#375）。
  * 账本 append-only、全站 `DELETE FROM transcript_rounds` 零命中 ⇒ 可证无损；上限与截断口径同 U7 recall。
@@ -466,7 +540,10 @@ async function rebuildFoldedRange(pool, { key, range }) {
   const truncated = rows.length > FOLDED_REBUILD_MAX_ROWS;
   const kept = truncated ? rows.slice(0, FOLDED_REBUILD_MAX_ROWS) : rows;
   const records = kept.map((r) => ({ round: Number(r.round), messages: r.messages }));
-  return { turns: projectTranscriptForDisplay(records), truncated };
+  // issue #387：先把 `tool_result` 挂回带 `tool_use` 的记录（纯读侧，见 `attachToolResultsToRecords`），
+  // 再喂上游投影：配对与预览截断的尺全部留在上游。
+  const paired = attachToolResultsToRecords(records);
+  return { turns: projectTranscriptForDisplay(paired), truncated };
 }
 
 /** PATCH /api/sessions/:id —— 改标题（CAS 限定 active，防归档后仍改成功）。 */
