@@ -81,7 +81,18 @@ describe('termination reason 单一常量（issue #212）', () => {
     // 返回类型注记放宽），而 `timeout.js` / `errors.js` / `anthropic.js` `diff -q` **全部 rc=0**
     // ⇒ 本版 providers 面只有「实发参数观测」这一族加法，零 timeout / 零可重试码变更
     // ⇒ 下面九值断言一字未改（不放宽任何断言，§8.27 先例）。
-    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.32.0');
+    // 0.32.0 → 0.33.0（issue #530 / 工单 feat-261115-08）**九度核**，按 0.33.0 现查（261115 本
+    // worktree，`npm pack` 解包逐字对比：`/tmp/ea32x/package` vs `/tmp/ea33x/package`，且装着的包
+    // 与 0.33.0 发布包 `diff -rq src` 过滤 `.d.ts` 后无输出）：
+    // `diff -u` 对 `src/loop/termination.js` 只剩三处实体（一行注释把 `checkpoint_failed` 标为已退役
+    // + `fileWritesBlind` 加法 + `answerPendingTailToolUse` 多一个 `executedToolIds` 参数），**都不碰
+    // reason**；reason 字面值集合两侧逐字相同；`orchestrator.js` 的 typedef 取到的仍是同一组九值
+    // 同一顺序（`portal/test/termination-contract.test.js` 在装着的 0.33.0 上把它跑绿）；
+    // `src/providers/` **整目录零变更**（`diff -rq` 无输出，比 0.32 那次更强）
+    // ⇒ 下面九值断言一字未改（不放宽任何断言，§8.27 先例）。
+    // ⚠ `RUN_RETRYABLE_ERROR_CODES` 里的 `checkpoint_failed` 在 0.33.0 已**不再产出**，但旧档案里
+    // 已经写着这个码的 run 仍要判可重试 ⇒ 本单**值域不动**，只是注释说明了它为何留着。
+    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.33.0');
     for (const legacy of LEGACY_TERMINATION_REASONS) expect(TERMINATION_REASON_SET.has(legacy)).toBe(false);
   });
 

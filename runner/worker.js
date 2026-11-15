@@ -39,7 +39,7 @@ import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
 import { engineDiagnosticNotice, summarizerFailureNotice } from './lib/engine-notices.js';
-import { assertCompactContext, assertFoldingToolResultKnobs } from './lib/compact-knobs.js';
+import { assertCompactContext } from './lib/compact-knobs.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { buildFailureEnvelope, finalTextFallbackField } from './lib/termination.js';
@@ -966,15 +966,15 @@ async function startRun(msg) {
           //      **这是待验证的裁定，不是定论**：如果量出来更贵，回退 = 删掉标记区间里那两行
           //      （不要改成注释掉的死代码——注释掉的配置会被下一个人当成「曾经有用」）。
           //
-          // 校验归属（先核实过）：这两个叶子在 `config.folding` **组层**、不在 `folding.context` 里
-          // ⇒ `assertCompactContext` 管不到；引擎也**不校**它们的值（`CONFIG_LEAF_VALUE_RULE_PATHS`
-          // 只登记了 `run.stream` / `continuity.handoff`，见 `config-namespace.js:569-587`）⇒ 本站自己
-          // 加一道 `assertFoldingToolResultKnobs`（与 #469 A4 同一个理由：值是代码写死的，配错 = 编程错误）。
+          // 校验归属（261115 在装着的 0.33.0 上现查重定）：这两个叶子在 `config.folding` **组层**、
+          // 不在 `folding.context` 里 ⇒ `assertCompactContext` 管不到；而**引擎从 0.33.0 起自己校**
+          // （`folding.toolResultTtl` / `folding.toolResultFoldMinTokens` 已进 `CONFIG_LEAF_VALUE_RULE_PATHS`，
+          // 真 `runToolLoop` 实测 `'6'` / `-1` / `1.5` 启动期就 TypeError，`0` 与正整数过）
+          // ⇒ 本站那道重复的 `assertFoldingToolResultKnobs` 已退役成注释（#530 / D3，理由见
+          // `lib/compact-knobs.js` 的同名段）：两套校验重叠时，真正会错的是不生效的那一半。
           /* #440:ttl-knobs:start */
-          ...assertFoldingToolResultKnobs({
-            toolResultTtl: 6,
-            toolResultFoldMinTokens: 8000,
-          }),
+          toolResultTtl: 6,
+          toolResultFoldMinTokens: 8000,
           /* #440:ttl-knobs:end */
         },
         run: {
