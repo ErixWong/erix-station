@@ -935,6 +935,20 @@ FDE home 下的 `~/.ssh`、`~/.git-credentials`、`~/.erix/*` 本来就在 jail 
 夹具同样读不到。`SYSTEM_PROMPT` 已给出口（「被宿主边界拒绝」时不要原路径重试，用 shell 定点看那一个
 文件）。名单单一真相 = `STATION_MASKED_PATHS`（改口径只改那一处，`runner/worker.js` 不另拄一份）。
 
+**无 jail 的装配路径上，glob 遮蔽的 symlink 双向检查会退化成单向（生产不走这条路）**：遮蔽的双向 fail-closed
+只存在于 **jail 那一层**——`createJail.assertReadable` 拿的是**两个不同的值**（词法 `path.resolve(root, value)`
+与 `realpathWithMissing` 的结果）分别比一次。而**装配层自己那道**（`runner/lib/file-tools.js` 的 `withinMasked`，
+现 `:350`；二次审计当时记的是 `:346`，行号已因注记位移）把上游给的**同一个** `target` 同时当词法路径与
+realpath 结果交进去⇒ 只剩一种拼写在比。后果：**没有 jail 时**，「普通名字指向被遮名」这一面会漏（实测：
+`createStationFileTools({ cwd, maskedPaths: STATION_MASKED_PATHS })` 不供 jail，`alias.txt -> .env` 用 `readFile`
+直接拿到 `1: SECRET`；同一装配补上 jail 后回 `错误：…被宿主边界拒绝`）。反方向（`.env` 被改成了软链）
+不退化，段名还像密钥。**生产不走这条路**：`runner/worker.js:559-560` 同时给 `createJail` 与
+`createStationFileTools` 供了名单，两个方向都在 jail 里兜住（用例：`masked-paths.test.js` 的
+「symlink 两个方向都 fail-closed」与「cwd 写成目录的符号链接」两条）。另一面已登记的同型边界：
+无 jail + `cwd` 是目录软链时，**前缀**条目会因 realpath 根与 target 拼写不同而 miss（同一根源）。
+**处置：登记为事实，不为此改装配语义、不加参数**（装配层的 `maskedPaths` 本就是给「无 jail /
+jail 根 ≠ cwd」的调用方兜底的附加闸，不是安全边界；见 §6.3-3）。
+
 **不许当 bug 修的那三条**（`masked-paths.test.js` 里各带一条变异自证）：① 项目根的 `.env` 用 `readFile`
 拿不到，且错误点名被拒路径（jail 层直接抛 `JailError path_masked`）；② 同目录普通文件照读（防「把
 遮蔽改成默认拒绝」）；③ `shell` 里 `cat .env` **仍能读到全文**——红了就说明有人试图去「兼容」shell。
