@@ -415,6 +415,11 @@ export const zhCN = {
       // （`termination.finalTextFallback === true`）。**中性、不进红色面**：它不是故障，
       // 是引擎在如实交代「这次收尾没产出正文」。缺这条的用户体验：正文区那段话看起来像模型写的。
       finalTextFallback: '（本次收尾未产出正文：以上为引擎兜底文案，非模型输出）',
+      // issue #243（第 3 步）：终局正文是一段**被文本化的工具调用**（模型把 tool call 吐进 content，
+      // 引擎当最终文本收下 ⇒ run 正常 finished，但交付报告没生成）。措辞是**状态词、不是警报**：
+      // 不许出现「⚠ / 失败 / 错误」，也不许渲染成红色（它落在中性 `.roundsep` 分隔行上）。
+      // `{dash}` 是命中的那条特征片段（`stream.event.dash`），**没给就是空串**——整句必须独立成立。
+      toolCallTextualized: '模型把工具调用写进了正文，这次调用没有真的执行{dash}',
       runEnd: 'run 结束：{reason}{usage}',
       runEndNormal: '正常完成',
       missedRunEnd: '连接中断期间该 run 已结束（详情见运行记录）',
