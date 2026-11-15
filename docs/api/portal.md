@@ -58,6 +58,8 @@
 | 管理 | `GET /api/admin/mail/settings` | **邮件通道配置：读**（#449，§4.12）。**永不返回口令**：只给 `hasPassword` 布尔；无行（未配置）也回 `200` + 默认 DTO |
 | 管理 | `PUT /api/admin/mail/settings` | **邮件通道配置：写**（#449，§4.12）。口令**只写**：键缺席 = 不修改、`null`/`""` = 清除；落库后缓存**立刻**失效（不等 60s TTL） |
 | 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
+| 管理 | `GET /api/admin/upload/settings` | **单文件上传上限：读**（#485 片 A，§4.15）。回的是**当前生效值** + **来源**（`db`/`env`/`default`）+ 允许区间；表不存在/读失败也回 `200`（不是 500）|
+| 管理 | `PUT /api/admin/upload/settings` | **单文件上传上限：写**（#485 片 A，§4.15）。`{maxFileBytes}` 必须是 `1 MiB`–`1 GiB` 的 JSON 整数，否则 `400 validation_failed` 且**不落库**；**下一次上传就生效**（无缓存 ⇒ 不需重启，也不需失效任何东西）|
 | 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
 | 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
 | 管理 | `POST /api/admin/tls/inspect` | **解析但不落盘**（#456 M2，§4.13-3a）：`{certPem,keyPem?}` → 证书元数据 + `keyMatches` 三态 + 覆盖判定 + `warnings`。**零副作用**（不写盘/DB/审计、不动 `tlsLive`、不烧上传配额）；每管理员 120 次/小时 |
@@ -2654,6 +2656,7 @@ Cookie: <会话 cookie>
 ① requireSession                    → 401 unauthorized
 ② session.user.fde_name 为空        → 400 fde_name_required（没工位 ⇒ 没有落点）
 ③ file_upload_enabled !== true      → 403 upload_disabled      ← 必须在读 body 之前
+③b 现取生效上限（`upload_settings` → env → 默认，§4.15）      ← 在 ③ **之后**（未授权的账号不花这次查询）
 ④ receiveUpload(...)                → jail/名字/目标检查 → 流式落 temp → 提交
 ```
 
@@ -2665,7 +2668,8 @@ Cookie: <会话 cookie>
    （`portal/test/http-upload.test.js`；⚠ 答复**之后** Node 会用 `_dump` 把没人读的 body 排空，
    所以累计计数必然 >0 —— 判据必须取答复前的快照，否则这条变异不死）。
 2. **流式落盘，不把 body 读进内存**。逐 chunk 写 temp（`fsutil.writeTempFileFromStream`）+ `fsync` +
-   超限时**主动 destroy 流**并删 temp。默认上限 `FILE_UPLOAD_MAX_BYTES=33554432`（32 MiB，`docs/env.md`）。
+   超限时**主动 destroy 流**并删 temp。上限**每次请求现取**，优先级 `upload_settings.max_file_bytes`（DB，管理台）
+   `>` FILE_UPLOAD_MAX_BYTES `>` 默认 33554432（32 MiB）——取数与回落口径见 §4.15，env 旋钮见 `docs/env.md` §10.1。
    反过来说：门户共用的 `MAX_BODY_BYTES`（64 KiB）**不适用**在这里 —— 那是 JSON 请求体的口径，
    拿它卡上传会把所有真实文件判成 413。
 3. **no-clobber 用 `link`，不用 `rename`**。`rename(2)` **总是替换**目标，所以「先 `lstat` 看存在、
@@ -2694,7 +2698,7 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
 | `403` | `upload_disabled` | 能力位不为 `true`（**未收 body**）|
 | `404` | `not_found` | `cwd`/`path` 指向的目录不存在 |
 | `409` | `file_exists` | 目标已存在且没带 `overwrite=1`（快速路径或提交点竞态，同一个码）；**或** `overwrite=1` 而目标在传输期间变成了目录（`details.reason='target_is_dir'`）|
-| `413` | `file_too_large` | 超过 `FILE_UPLOAD_MAX_BYTES`，`details = {max_bytes, bytes}` |
+| `413` | `file_too_large` | 超过**当前生效上限**，`details = {max_bytes, bytes, limit_source}`。⚠ `max_bytes` 是**生效值**（管理台改完它就是 DB 值，不是 env 值）；`limit_source` ∈ `db`/`env`/`default`，让值班直接知道该去改哪一边（#485 片 A，§4.15）|
 
 `path` 是**相对牢笼根**的路径（与 `GET /api/files/tree`、预览端点同口径），不是绝对路径。
 **任何失败路径都不留 `.tmp` 残骸**（超限、断流、提交失败都先 unlink temp）。
@@ -2711,9 +2715,102 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   「红是进度不是警报」）。不重判 = 灯在骗人。
 
 > 实现：`portal/src/http.js`（handler 与闸门）、`portal/src/dirs.js`（`receiveUpload`）、
-> `portal/src/fsutil.js`（`writeTempFileFromStream` / `commitTempFileNoClobber`）。
+> `portal/src/fsutil.js`（`writeTempFileFromStream` / `commitTempFileNoClobber`）、
+> `portal/src/upload-settings.js`（上限的取数优先级，#485 片 A）。
 > 单测：`portal/test/file-upload.test.js`（单元：jail/名字/属主/no-clobber/残骸）、
-> `portal/test/http-upload.test.js`（HTTP 级：零读取判据、线上 DTO、上限、断流、受限会话门）。
+> `portal/test/http-upload.test.js`（HTTP 级：零读取判据、线上 DTO、上限、断流、受限会话门）、
+> `portal/test/upload-settings.test.js`（#485 片 A：来源优先级与「改完立即生效」）。
+
+---
+
+### 4.15 管理台上传上限（`/api/admin/upload/settings`，issue #485 片 A）
+
+**一句话**：单文件上限从「启动期 env + 重建容器」变成「管理台一个数字，**下一次上传就生效**」。
+真相在 `upload_settings`（迁移 `0035`，单行表）；`FILE_UPLOAD_MAX_BYTES` 降级成兜底值（`docs/env.md` §10.1）。
+
+**为何不缓存**（与 §4.12 的 `mail_settings` 刻意不同）：登录是热路径，所以 `mail-provider` 带 60s TTL；
+上传不是。一次上传多一次单行主键 `SELECT`（<1ms）换掉「改完要等一分钟」——加缓存只是把「必须重启」
+换成「必须等 60s」，判据并没有被满足（因此写侧也不需要 `invalidate()`：没东西可失效）。
+
+#### 4.15-1 `GET /api/admin/upload/settings`
+
+`200`（**表不存在 / DB 读失败也是 200** —— 配置面坏了不该让管理台这一页白屏）：
+
+```json
+{
+  "maxFileBytes": 33554432,
+  "source": "db",
+  "reason": null,
+  "dbMaxFileBytes": 33554432,
+  "envMaxFileBytes": 33554432,
+  "envIsExplicit": true,
+  "defaultMaxFileBytes": 33554432,
+  "limits": { "minBytes": 1048576, "maxBytes": 1073741824 },
+  "updatedAt": "2026-11-16T02:00:00.000Z",
+  "updatedBy": "<uuid 或 null>"
+}
+```
+
+| 字段 | 语义 |
+|---|---|
+| `maxFileBytes` | **当前生效值**（= 下一次上传用的那个数），不是「上次保存回显的那个数」|
+| `source` | 来源：`db` / `env` / `default` —— 「现在到底听谁的」不许靠猜，UI 必须显示 |
+| `reason` | `source ≠ db` 的原因：`null`（DB 生效）/ `no_row`（未配置）/ `invalid_db_value`（有行但值不可用）/ `read_failed`（表缺失或 DB 抖动）|
+| `dbMaxFileBytes` | DB 里那个**可用**值（不可用 / 无行 ⇒ `null`）|
+| `envMaxFileBytes` / `envIsExplicit` | env 那一档的值，以及「env 里是否真的显式写了 `FILE_UPLOAD_MAX_BYTES`」（给了但非法 ⇒ `false`）|
+| `limits` | 写侧允许的区间（UI 可拿它做前置提示，但**服务端才是闸**）|
+
+#### 4.15-2 `PUT /api/admin/upload/settings`
+
+```
+PUT /api/admin/upload/settings
+Content-Type: application/json
+
+{"maxFileBytes": 1048576}
+```
+
+| HTTP | 体 | 何时 |
+|---|---|---|
+| `200` | 同上 DTO（来自 `RETURNING` ⇒ `maxFileBytes` 就是落库后的生效值）| 保存成功 |
+| `400` | `validation_failed` + `details={field:'maxFileBytes', min_bytes, max_bytes}` | 不是 JSON number（`'1048576'`、`''`、`'1e7'` 全算）、非整数、越界、键缺席；`details.field='body'` = 体不是对象。**不落库** |
+| `403` | `forbidden` | 非管理员 |
+| `405` | `method_not_allowed` | `GET`/`PUT` 之外 |
+
+**只接受 JSON number**：HTML `number` input 清空给的是 `''`，而 `Number('') === 0` —— 不拦就是把「没填」
+存成一个 0 字节上限。区间内才落库，所「把上限设成一个根本用不到的数」会当场红，而不是静默落库。
+
+#### 4.15-3 优先级与回落（有意的分层，不是「漏了 CHECK」）
+
+| 位置 | 管什么 | 形态 |
+|---|---|---|
+| DB（迁移 `0035`）| 物理荒谬 | `CHECK (max_file_bytes > 0)` + `CHECK (id = 1)`（单行是 DB 事实）+ `bigint`（`int` 只到 2 GiB）|
+| JS 写侧（§4.15-2）| 产品区间 1 MiB–1 GiB | 400 `validation_failed`，**当场红** |
+| JS 读侧（§4.14 的 `POST /api/files/upload`）| 任何不可用的行 | **回落 env → 默认** + 一条点名 `upload_settings.max_file_bytes` 与 `FILE_UPLOAD_MAX_BYTES` 的 warn；**永不 500** |
+
+两个细节值得单独记：
+- **产品区间故意没写进 DB CHECK**。否则「手工把 `max_file_bytes` 改成一个非法值 ⇒ 上传回落而不是 500」
+  这条判据在真机上根本进不去（`UPDATE` 会被 CHECK 拒），只剩单测能测；而且日后改天花板就从
+  「改一个常量」变成「追加一次 DDL」。闸的静态锺点见 `portal/test/migrations.test.js` 的 0035 那一段。
+- **`bigint` 在 node-pg 里回的是字符串**（int8 不自动转 number），所以读侧统一 `::text` + 只认 `/^[0-9]+$/`
+  且必须落在区间内。这里**不许** `Number()` / `parseInt()` 吞下去：`parseInt('1e4') === 1`。
+  于是 `'1e7'` / `' 100 '` / `'0'` / 超安全整数 / 区间外 ⇒ 全部回落（带 warn）；而 JSON number `1e7`（= 10000000）
+  在写侧是合法的（它精确可表示）。这是有意的：**写侧严、读侧呧但从不猜**。
+
+#### 4.15-4 运维口径
+
+- 改完**不需要**重启 portal、不需要重建镜像、不需要动 `runner/` 与 FDE 容器。判据是「同一个进程内，
+  保存后下一次上传就按新值走」（`portal/test/upload-settings.test.js` 的 US-8），不是「重启后正确」。
+- `deploy/docker-compose.yml` 那行 `FILE_UPLOAD_MAX_BYTES: ${FILE_UPLOAD_MAX_BYTES:-33554432}` **仍然要留**
+  （portal 服务没有 `env_file`）。但它的角色变了：它设的是**兜底值**，不再是「改了就生效」的旋钮。
+- 审计：每次保存写一条 `admin.upload_settings_updated`（`target='upload_settings'`，
+  `details={max_file_bytes, previous_max_bytes, previous_source}`）—— 只记新值看不出「谁把谁改下来的」。
+- 上限仍是**单文件**，不是总量。**片 B（每 FDE 目录总量上限）不在本节**：那是 ext4 project quota，
+  判据是「容器里 `dd` 也要失败」。上传前 `du` 一遍目录当闸门是**假闸门**（拦住人、放过 agent），本单明确没做。
+
+> 实现：`portal/src/upload-settings.js`（读侧 + 写侧 + 优先级）、`portal/src/http.js`（两个端点与审计、
+> 上传端点的现读接入）、`portal/src/config.js`（`fileUploadMaxBytesSource`）、
+> `deploy/migrations/0035-upload-settings.sql`。
+> 单测：`portal/test/upload-settings.test.js`、`portal/test/migrations.test.js`（0035 那一段）。
 
 ---
 
