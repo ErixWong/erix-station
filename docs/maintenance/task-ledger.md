@@ -5405,3 +5405,96 @@ run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data
 
 **剩余**：空闲仍有 13.2 事务/秒来自**另外 5 个轮询器**（`run_queue` 1.5/秒、`chat_sessions` 0.9/秒、
 `port_observations` 0.7/秒、`fde_onboarding` 0.6/秒…）⇒ 开 **#520** 续作（判据：空闲 < 3 事务/秒）。
+
+### 8.129 IPAM 分配段参数化：#227③ 要的「并行不撞池」到 #270 才真能分——因为 baseline DDL 把「池名 ↔ 段」钉死了（issue #270 + #227③ / 工单 fix-261116-02，2026-11-16）
+
+> 编号由主 agent 统一分配（本批并行）。
+
+**一句话**：portal 的 FDE 网络池以前是 `portal/src/ipam.js` 里硬编码的两个字面量，e2e 想让两套隔离栈
+不撞池只能「派生段 + `10.201.0.0/16` 两段一起塞给放行面」——那第二段就是撞车本身。#270 把分配段开成
+env 旋钮、#227③ 把两腿收成一次派生；过程中挖出真正的硬约束：**baseline DDL 把 `pool='large'` 钉在
+`10.201.0.0/16` 里面**，所以「换一段新的 /16」这个看起来最自然的方案从来没生效过（也永远生效不了）。
+
+**三条病根**（前两条是工单写的，第三条是现查挖出来的，它改了做法）：
+
+1. 分配器硬编码：`POOLS = { default: 10.200.0.0/16 /29, large: 10.201.0.0/16 /28 }`，`FDE_POOL` 只能
+   选池名，段不可配。
+2. 两腿两处写：portal 的**分配段**与 fde-proxy 的**放行面**（`IPAM_POOLS` ← 宿主 `FDE_IPAM_POOLS`）是
+   两个模块各自的账，谁都不检查对方 ⇒ 「分配得到、`network create` 被拒」只能在 provision 期撞见。
+3. **baseline 的 CHECK 才是天花板**：`docs/data/schema.sql` §9 `fde_networks` 有
+   `CHECK ((pool='default' AND prefix_len=29 AND subnet::inet << inet '10.200.0.0/16') OR
+   (pool='large' AND prefix_len=28 AND subnet::inet << inet '10.201.0.0/16'))`，而 baseline 是**冻结件**
+   （改它 ⇒ `00-init.sh`/runner 记的 sha256 失配、拒绝启动），`deploy/migrations/` 里没有任何迁移碰过
+   `fde_networks`（现查：`grep -rln fde_networks deploy/migrations/` 空）。
+   ⇒ #227.3 派生出来的 `10.229.0.0/16` 那族**从来没被真的分配过**，它只在放行面里当装饰；
+   portal 始经从 `10.201.0.0/16` 池头分第一个 /28 ⇒ 两套并行隔离栈必撞。这就是当初只能「两段兜底」的
+   真实原因（当时的交付把它记成「portal 侧非 env 可配」，没写**为什么不能**可配）。
+
+**改法**（提交 `3958163` → `1d47dad` → `cb22eee`）：
+
+- **portal 侧**（`portal/src/ipam.js`）：`DEFAULT_IPAM_POOLS`（= 改前那两个硬编码字面量，逐字不动）+
+  `IPAM_POOL_ENV_KEYS`（`default ⇒ IPAM_POOL_DEFAULT`、`large ⇒ IPAM_POOL_LARGE`）+
+  `resolveIpamPools(env)`；`POOLS = resolveIpamPools()`。宿主侧走 `FDE_IPAM_POOL_DEFAULT` /
+  `FDE_IPAM_POOL_LARGE`（compose 去前缀下发，沿用仓内 `FDE_* → 服务 env` 风格）。
+  刻意**不叫** `FDE_POOL_POOLS`（issue 正文的示例名）、也刻意**不复用** `FDE_IPAM_POOLS`：后者是
+  `network create` 的放行闸门，一个名字背两个语义 = 第二本账必然过期。
+- **启动期四条硬判据**（不学 `parseInt('1e4')===1` 那族静默按半个值生效，见 §8.126.6 同型事故）：
+  ① 整串必须匹配 `<d.d.d.d>/<前缀>`；② 八位组 ≤255、前缀 ≤32；③ **规范网络地址**（`10.201.0.7/16`
+  直接拒——`parseCidr` 会静默 mask 成 `10.201.0.0/16`，最典型的「半个值生效」）；④ 段必须整体落在该池的
+  DDL 保留段内、且池前缀不得比分配前缀更长（否则池里切不出一块）。全部点名是哪个键，`err.code =
+  ipam_pool_env_invalid`。脏值不许活到 provision 才在 INSERT 上撞 23514。
+- **`prefixLen` 我判断**不**开成旋钮**（工单把这条交给我判断，理由记这儿）：① e2e 只需要换段；
+  ② 上面那条 CHECK 把 `default↔29`、`large↔28` 钉成死对，开前缀旋钮 = 开一个「一改就被 DB 炸」的假旋钮；
+  ③ 别为将来预支结构复杂度（`<cidr>:<前缀>` 只是多一个能写错的格子）。⇒ 值形态就是单个 CIDR。
+  同理「段归属」也做成硬判据，所以第 3 条天花板在代码里是**可见的**，不是口头约定。
+- **proxy 侧**（`deploy/fde-proxy/server.js`）：deny reason 从只报 subnet 改成同时点名两侧变量名
+  （`IPAM_POOLS`/`FDE_IPAM_POOLS` 与 `IPAM_POOL_DEFAULT`/`IPAM_POOL_LARGE` 及宿主侧 `FDE_` 版）——
+  本单最典型的失效形状就是「只改一头」，只报 subnet 会逼人去翻两份 env。
+- **e2e 侧**（`lib/isolated-env.mjs` + 五支 wp + `isolation-negative.mjs`）：
+  `deriveFdeIpamPools()` 改派**保留段内的子段** `10.201.(1 + n%99).0/24`（第三段 1–99，刻意跳过 0：
+  那是共享栈若用 large 池时第一批会分到的位置）；新增 `deriveStackIpamPoolEnv(栈 id)` /
+  `applyStackIpamPoolEnv(env)` **一次派生喂两腿**（`FDE_IPAM_POOLS` 与 `FDE_IPAM_POOL_LARGE` 同值，
+  显式传入优先），五支 wp 里旧的三行「只注入放行面」全删；`defaultFdeIpamPools()` 从「两段」收紧成
+  「只有派生段」；护栏 `assertIsolatedEnvironment()` 两腿都判（放行面仍是隔离族 + 拒共享段，另加
+  CIDR 合法性/规范地址；分配段必须被 portal 自己的解析器接受 = 落在 DDL 保留段内、必须是保留段的
+  **真子段**、必须被放行面覆盖），分配段进必需 env 清单；护栏拿的是 `portal/src/ipam.js` 的
+  `resolveIpamPools`（`lib` 直接 import portal 源码有先例：`lib/ports-reconcile.mjs` import
+  `src/previewpool.js`）⇒ 护栏红 = 容器也会同样红，不存在第二份 CIDR 判据。
+- 文档：`docs/env.md` §10.1 登记两个新旋钮并把 `FDE_IPAM_POOLS` 那行明写成「放行面 ≠ 分配器」；
+  `docs/ops/ci-release.md` §6 第 2 条按两腿同源重写（旧文那句「portal 侧分配钉死、非 env 可配」已过期）。
+  `deploy/.env.example` 同步（`deploy/.env` 是主 agent 复制进来的 600 权限件，未提交）。
+
+**判据与读数**（`node --test portal/test/ipam-pool-env.test.js` = 新文件 11 条，全绿；
+`node portal/integration/isolation-negative.mjs --strict` ⇒ `verdict=TRAPS_FIRED（全部 14 条陷阱=均硬失败；
+单一来源=一份定义）` rc=0，缺省负例模式 rc=1 是刻意口径）：
+
+| 判据 | 落点 | 读数 |
+|---|---|---|
+| ① 不设 env ⇒ 与 #270 之前**逐字**相同 | 同文件 3 条：`resolveIpamPools({})`、`DEFAULT_IPAM_POOLS`、**真子进程** import 拿到的 `POOLS` | 全对 `10.200.0.0/16 /29` 与 `10.201.0.0/16 /28`；含「三腿一致性」：compose 下发两键 + 插值默认喂进代码 == 代码默认（口径抄自 `deploy-env-defaults.test.js`） |
+| ② 注入 ⇒ 分配段随之变、且放行面认它 | `not ok`-候选：`#270 ② 注入 IPAM_POOL_LARGE…`、`#270 ② 分配的 subnet 在放行面内 ⇒ validateNetworkBody 放行` | `10.201.37.0/24` ⇒ 首个候选 `10.201.37.0/28`、`prefixLen` 仍 28；`validateNetworkBody(…, {ipamPools:[同段]})` 返回 `[]` |
+| ③ 非法值当场红 + 点名键 | 9 个脏值（`:28` 后缀 / 非规范 / 跑出保留段 / 池前缀过长 / 前缀 >32 / 八位组 >255 / `1e4` / 一格两段）+ 真子进程加载失败 | 每条 `err.code=ipam_pool_env_invalid` 且消息含 `IPAM_POOL_LARGE`；`default` 那一格同样点名自己 |
+| ④ 分配段不在放行面 ⇒ 明确失败且点名两个变量 | proxy reason 断言 + 反向对照（同源派生下同一 subnet 放行） | reason 同时含 `not in allowed pools`/subnet/`IPAM_POOLS`/`FDE_IPAM_POOLS`/`IPAM_POOL_LARGE`/`FDE_IPAM_POOL_LARGE`；反向对照绿 ⇒ 红在「两头分叉」而不是文案 |
+
+**变异自证**（每条先证明它真的改变了行为，再看红在哪个具名格子上）：
+`DEFAULT` 缺省漂一位 ⇒ ① 三格红（`not ok 1/2/3`）；`POOLS = resolveIpamPools({})`（不接线）⇒
+`not ok 4` + `not ok 8`；删「规范网络地址」判据 ⇒ `not ok 7`；删段归属判据 ⇒ `not ok 7/8/9`；
+compose 插值默认改歪 / compose 删掉那一行 ⇒ 均 `not ok 3`（**这就是「参数化是不是假的」的那格**）；
+proxy reason 退回只报 subnet ⇒ `not ok 10`；`isCidrInPools` 对 10.201 恒真 ⇒ `not ok 10`（反向对照仍绿）。
+隔离侧：`defaultFdeIpamPools` 退回两段 ⇒ TRAP_SILENT；两腿拆成两处（分配段用整段）⇒ TRAP_SILENT；
+删「放行面覆盖」判据 ⇒ `TRAP FAIL · …FDE_IPAM_POOL_LARGE 不在 FDE_IPAM_POOLS 放行面内`；删「整段=必撞
+口径」判据 ⇒ 两条 TRAP FAIL；派生口径退回旧 /16 族 ⇒ 正例夹具被抛错（TRAP_SILENT）；脚本自己
+`process.env.FDE_IPAM_POOL_LARGE = …` ⇒ `单一来源断言 FAIL：wp5-e2e.mjs: 自己给 FDE_IPAM_POOL_LARGE 赋值了`；
+某支不再调 `applyStackIpamPoolEnv()` ⇒ 同一组里 `没调用 applyStackIpamPoolEnv()` 红。
+
+**一处诚实的「不承重」**：把 `FDE_IPAM_POOL_LARGE` 从必需 env 清单里摘掉，护栏**照样红**（改抛「不是规范
+写法」那条），所以「必需 env」那一格最初是纸判据 ⇒ 把那条陷阱的文案锚点收紧到 `must be set` 之后它才
+承重（删清单条目 ⇒ 该陷阱 FAIL）。两条判据互为冗余是允许的，但**锚点必须钉在更早、更准的那条文案上**。
+
+**未尽项**：
+- e2e 整轮（`wp2a/wp3a/wp3b/wp5/wp6`）**没跑**：需要 docker + 泛域名 + Tailscale + 分钟成本，本机共享 dev
+  栈在跑（`station-*` 六容器，动前动后名单一致）。⇒ 「隔离栈真机开出来、`fde-*` 网络落在派生段、
+  两套并行不撞」这条是**静态判据 + 护栏夹具**，真机面留给主 agent 合并后跑。
+- wp5 / wp6 的手传 env 清单（`ci-release` §6 末尾那句「wp5 仍需手工三件套」）需要按两腿同源改一行
+  操作者说明——本轮只在 §6 第 2 条重写了两腿口径，没动那三条手工清单的其余部分。
+- `IPAM_RESERVED_SUBNETS` 保留不动（两腿分离后它不再是"不撞"的承重件，但仍是共享栈也在同一段里时
+  的逃生口；wp3b 头注已按此改口径）。
