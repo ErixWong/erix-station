@@ -27,7 +27,8 @@ import { reconcilePortsJsonWithDb, PREVIEW_LIVE_STATES } from './lib/ports-recon
 // issue #495（#412 遗留 ①②）：起跑前预检与「等宿主侧物化文件」的三态分类——同样是「失败必须长得
 // 像它真正的原因」那一类护栏，所以反向测试也住这里（行为面夹具，不碰 docker）。
 import {
-  COMPOSE_ENV_FILE, observeHostPath, assertComposeEnvFile, materializeSnapshot, toContainerPath, waitForHostFile,
+  COMPOSE_ENV_FILE, formatLastSegmentLinkLine, observeHostPath, observeLastSegmentLink, assertComposeEnvFile,
+  materializeSnapshot, toContainerPath, waitForHostFile,
 } from './lib/e2e-preflight.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -63,8 +64,8 @@ function validIsolationEnv() {
   };
 }
 
-/** 收集「护栏如期抛错」的证据。 */
-function expectThrow(label, fn, { namesMustInclude = [] } = {}) {
+/** 收集「护栏如期抛错」的证据。`namesMustNotInclude` = 文案里**不许**出现的词（两种失败不许互串的那一半）。 */
+function expectThrow(label, fn, { namesMustInclude = [], namesMustNotInclude = [] } = {}) {
   let thrown = null;
   try {
     fn();
@@ -73,12 +74,13 @@ function expectThrow(label, fn, { namesMustInclude = [] } = {}) {
   }
   if (!thrown) return { label, fired: false, message: '（没抛错——护栏失效）', matched: false };
   const message = String(thrown.message ?? thrown);
-  const matched = namesMustInclude.every((needle) => message.includes(needle));
+  const matched = namesMustInclude.every((needle) => message.includes(needle))
+    && namesMustNotInclude.every((needle) => !message.includes(needle));
   return { label, fired: true, message, matched };
 }
 
 /** 同上，但被测函数是 async（`waitForHostFile` 那一类）——rejection 也要能收到账上。 */
-async function expectReject(label, fn, { namesMustInclude = [] } = {}) {
+async function expectReject(label, fn, { namesMustInclude = [], namesMustNotInclude = [] } = {}) {
   let thrown = null;
   try {
     await fn();
@@ -87,7 +89,8 @@ async function expectReject(label, fn, { namesMustInclude = [] } = {}) {
   }
   if (!thrown) return { label, fired: false, message: '（没抛错/没拒绝——护栏失效）', matched: false };
   const message = String(thrown?.message ?? thrown);
-  const matched = namesMustInclude.every((needle) => message.includes(needle));
+  const matched = namesMustInclude.every((needle) => message.includes(needle))
+    && namesMustNotInclude.every((needle) => !message.includes(needle));
   return { label, fired: true, message, matched };
 }
 
@@ -178,6 +181,34 @@ cases.push(await expectReject('waitForHostFile() 目录读不到 ⇒ 提前放�
     timeoutMs: 60_000, intervalMs: 1, sleepImpl: async () => {}, label: 'alice config.json materialized',
   }),
   { namesMustInclude: ['读不到', 'FDE_USER_UID', '0:1000', 'alice config.json materialized'] }));
+
+// 13) #495 ② 的**叶子级**盲区（§8.128 变异 M4 登记的那一条）：**链能进、叶子没物化** ⇒ 必须按没物化报，
+//     而且**不许喊权限**。为什么上面 12) 不够：那条的 missing 夹具是**链级**（`<root>/bob` 整段不存在），
+//     而 M4（把叶子级 ENOENT 误归 unreadable）当时只把 CI 侧 `P8` 跑红、`--strict` 全绿 = 两个门各缺一半，
+//     「链级 / 叶子级」两种失败在负例门上仍可以互换。现在两门都不许混。
+//     夹具用注入：真 fs 单次调用造不出「stat 在、read 不在」（中间有竞态窗口），所以 statSync/accessSync
+//     走真夹具目录（链确认可进、叶子也在），只把 readFileSync 换成 ENOENT = 叶子在 stat 与 read 之间消失。
+//     变异入口：把叶子级 ENOENT 归进 unreadable ⇒ 文案变成「读不到」⇒ 本陷阱失灵（--strict rc=1）。
+{
+  const leafRoot = fs.mkdtempSync(path.join(os.tmpdir(), `erix-495-leaf-${process.pid}-`));
+  const leafDir = path.join(leafRoot, 'carol', 'home', '.erix');
+  fs.mkdirSync(leafDir, { recursive: true });
+  const leaf = path.join(leafDir, 'config.json');
+  fs.writeFileSync(leaf, '{}'); // stat 看得见它，但 read 时报 ENOENT（= 叶子级不存在）
+  cases.push(await expectReject('waitForHostFile() 链能进但叶子不存在 ⇒ 按没物化报且不许喊权限',
+    () => waitForHostFile(leaf, {
+      fsImpl: { ...fs, readFileSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); } },
+      timeoutMs: 60, intervalMs: 10,
+      sleepImpl: async (ms) => { await new Promise((resolve) => { setTimeout(resolve, ms); }); },
+      label: 'carol config.json materialized',
+      describe: () => `ls: cannot access '/srv/erix/users/carol/home/.erix/config.json': No such file or directory`,
+    }),
+    {
+      namesMustInclude: ['carol config.json materialized', '不存在', 'No such file or directory'],
+      namesMustNotInclude: ['读不到', 'FDE_USER_UID'],
+    }));
+  fs.rmSync(leafRoot, { recursive: true, force: true });
+}
 
 // --- 正例（夹具 env 必须过护栏；否则上面的负例是「全都抛」的空洞通过）---------------------
 let positiveOk = true;
@@ -353,7 +384,10 @@ try {
 //   a) 把 observeHostPath 的 unreadable 归进 missing ⇒ 「真没物化」与「读不到」又被压成一态 ⇒ 本组红；
 //   b) 把 missing 归进 unreadable ⇒ 下面的「没物化不许喊权限」红（会把人带去改 uid 而不是查物化）；
 //   c) 让预检成功时也打一行字 ⇒ 「零输出」判据红（噪音会看起来像失败原因）；
-//   d) 把 toContainerPath 的越界分支删掉 ⇒ 拼错挂载根时快照指到别处，本组红。
+//   d) 把 toContainerPath 的越界分支删掉 ⇒ 拼错挂载根时快照指到别处，本组红；
+//   e) 把「末段是链接」的判定写死成恒真 ⇒ 下面「真文件那格」红；用 statSync 代替 lstatSync ⇒
+//      「链接那格」红（statSync 跟随链接，永远判不出末段是链接）；
+//   f) 把叶子级 ENOENT 归进 unreadable ⇒ 下面「叶子级不许喊权限」那格红（与陷阱 13 同一条，两门各钉一份）。
 try {
   const userspace = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-495-trap-'));
   try {
@@ -379,6 +413,40 @@ try {
     assert.equal(blocked.blocker.path, path.join(userspace, 'alice'), 'blocker 要指向被挡住那一段（不是叶子）');
     assert.equal(blocked.blocker.owner, '0:1000', '属主要写出来，才能一眼对上 FDE_USER_UID/GID=1000/1000');
     assert.notEqual(missing.state, blocked.state, '「没物化」与「读不到」必须是两个状态（合成一个就是 #412 的坑）');
+
+    // 末段是**符号链接**：三态不许改（bind 源做成链接是合法配置），但链接这条事实必须可区分——
+    // 不说出来就是拿状态猜挂载形态（宿主上 `ls` 到的与 portal 容器里读到的是两侧）。
+    const linked = path.join(home, 'config-link.json');
+    fs.symlinkSync(path.relative(home, cfg), linked); // 相对链接：顺带验目标解析
+    const asLink = observeHostPath(linked);
+    assert.equal(asLink.state, 'present', '链接指向可读文件 ⇒ 状态照旧 present（不许开第四态把等待路径搞崩）');
+    assert.equal(asLink.link.isSymlink, true, '链接事实必须为真（statSync 跟随链接看不出来 ⇒ 本格靠 lstatSync）');
+    assert.equal(asLink.link.targetExists, true, '目标存在要单独说出来');
+    const linkLine = formatLastSegmentLinkLine(asLink.link);
+    assert.match(linkLine, /符号链接/, '文案要含「符号链接」');
+    assert.ok(linkLine.includes(cfg), `诊断行要点名解析后的链接目标：${linkLine}`);
+    assert.match(linkLine, /portal 容器里看到的是\*\*链接目标那一侧\*\*/, 'bind 源是链接时的关键提示必须在');
+
+    const asPlain = observeHostPath(cfg);
+    assert.equal(asPlain.link.isSymlink, false, '真文件不许被写成链接（把链接判定写死成恒真 ⇒ 本格红 = 反向自证）');
+    assert.equal(formatLastSegmentLinkLine(asPlain.link), '', '非链接要渲染成空串（真文件那条路径的文案里不该出现「符号链接」）');
+    assert.equal(observeLastSegmentLink(cfg, { fsImpl: {} }).isSymlink, null,
+      '注入的 fsImpl 没有 lstatSync ⇒ 只能说「无从判定」，不许假装「不是链接」');
+
+    const danglingTo = path.join(home, 'never-written-by-materializer.json');
+    const dangling = path.join(home, 'dangling.json');
+    fs.symlinkSync(path.relative(home, danglingTo), dangling);
+    const asDangling = observeHostPath(dangling);
+    assert.equal(asDangling.state, 'missing', '悬空链接**归属不变**（还是 missing；开第四态会连锁打崩等待的时间判据）');
+    assert.equal(asDangling.link.isSymlink, true, 'lstat 看得见悬空链接本体（statSync 只看到 ENOENT ⇒ 链接事实就丢了）');
+    assert.equal(asDangling.link.targetExists, false);
+    assert.match(formatLastSegmentLinkLine(asDangling.link), /缺的是\*\*链接目标\*\*/, '要说清缺的是目标，不是链接本身');
+
+    // 叶子级不存在（链能进、read 时报 ENOENT）也不许沾到权限分支（与陷阱 13 同一条，两门各钉一份）
+    const leafGone = { ...fs, readFileSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); } };
+    const asLeafGone = observeHostPath(cfg, { fsImpl: leafGone });
+    assert.equal(asLeafGone.state, 'missing', '叶子级 ENOENT ⇒ missing（归进 unreadable = 把没物化当成权限，#495 ② 反向坑）');
+    assert.equal(asLeafGone.blocker, null, '根本没权限问题 ⇒ 不许端出一个 blocker');
 
     // 真没物化的文案不许喊权限（否则人会被带去改 uid，而真正缺的是 materializer）
     const timeoutError = await waitForHostFile(path.join(userspace, 'nobody', 'home', '.erix', 'config.json'), {
@@ -593,6 +661,8 @@ const SINGLE_SOURCE_FILES = {
   assertComposeEnvFile: 'e2e-preflight.mjs',
   inspectHostPathChain: 'e2e-preflight.mjs',
   observeHostPath: 'e2e-preflight.mjs',
+  observeLastSegmentLink: 'e2e-preflight.mjs',
+  formatLastSegmentLinkLine: 'e2e-preflight.mjs',
   waitForHostFile: 'e2e-preflight.mjs',
   toContainerPath: 'e2e-preflight.mjs',
   materializeSnapshot: 'e2e-preflight.mjs',
