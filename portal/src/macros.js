@@ -33,6 +33,105 @@ export const MACRO_KINDS = Object.freeze(['run-notify', 'run-silence-alert', 'ru
 export const MACRO_AUDIENCES = Object.freeze(['all', 'admin']);
 /** 订阅范围：`session` 必须带 `session_id`，`user` 必须不带（口径见 `assignTemplate`）。 */
 export const MACRO_SCOPES = Object.freeze(['session', 'user']);
+
+/**
+ * **每个 kind 的 scope 是固定的**（`07` §1.3：`scheduled-task` 只能 `user`，其余只能 `session`）。
+ * 建模板与改模板都要按这张表校验——否则「一个模板既能挂会话又能挂用户」，
+ * 会让「它到底在盯什么」变成运行时才知道的事。
+ */
+export const KIND_SCOPE = Object.freeze({
+  'run-notify': 'session',
+  'run-silence-alert': 'session',
+  'run-review': 'session',
+  'scheduled-task': 'user',
+});
+
+/**
+ * **每个 kind 的参数 schema**（`10-implementation-contract.md` §1 的唯一真源）。
+ * `required` 缺了报错；`enum`/`enum[]` 校验取值；`int` 校验上下界；`duration` 只校验形态。
+ * ⚠ 只做**形状**校验，不做语义校验（语义在各宏的实现里）。
+ */
+export const KIND_SCHEMA = Object.freeze({
+  'run-notify': {
+    states: { type: 'enum[]', values: ['completed', 'failed', 'capped', 'aborted',
+      'persistence_failed', 'guard_unverified'] },
+    channel: { type: 'enum', values: ['site'] },
+  },
+  'run-silence-alert': {
+    threshold: { type: 'duration' },
+    phases: { type: 'enum[]', values: ['tool_running', 'awaiting_llm'] },
+  },
+  'run-review': {
+    review_depth: { type: 'int', values: [0, 1] },
+    on_fail: { type: 'enum', values: ['reflow', 'notify_only'] },
+    max_rounds: { type: 'int', min: 1, max: 100 },
+  },
+  'scheduled-task': {
+    at: { type: 'time' },
+    cwd: { type: 'path' },
+    task: { type: 'text', max: 8000 },
+    maxRounds: { type: 'int', min: 1, max: 100 },
+    jitter: { type: 'duration' },
+  },
+});
+
+const DURATION_RE = /^\d+(ms|s|m|h)$/;
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/** 按 kind 的 schema 校验 params 的形状。不合法一律 `MacroError`。 */
+export function validateKindParams(kind, params) {
+  const schema = KIND_SCHEMA[kind];
+  if (!schema) throw new MacroError('validation_failed', `未知 kind: ${kind}`, { details: { field: 'kind' } });
+  if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+    throw new MacroError('validation_failed', 'params 必须是对象', { details: { field: 'params' } });
+  }
+  for (const key of Object.keys(params)) {
+    if (!(key in schema)) {
+      throw new MacroError('validation_failed', `${kind} 不认识参数 ${key}`, { details: { field: `params.${key}` } });
+    }
+  }
+  for (const [key, rule] of Object.entries(schema)) {
+    const value = params[key];
+    if (value === undefined) continue;
+    const where = { field: `params.${key}` };
+    if (rule.type === 'enum') {
+      if (!rule.values.includes(value)) {
+        throw new MacroError('validation_failed', `${key} 取值必须是 ${rule.values.join('/')}`, { details: where });
+      }
+    } else if (rule.type === 'enum[]') {
+      if (!Array.isArray(value) || value.some((v) => !rule.values.includes(v))) {
+        throw new MacroError('validation_failed', `${key} 必须是 ${rule.values.join('/')} 的子集`, { details: where });
+      }
+    } else if (rule.type === 'int') {
+      if (!Number.isInteger(value)) throw new MacroError('validation_failed', `${key} 必须是整数`, { details: where });
+      if (rule.values && !rule.values.includes(value)) {
+        throw new MacroError('validation_failed', `${key} 只能是 ${rule.values.join('/')}`, { details: where });
+      }
+      if (rule.min !== undefined && value < rule.min) throw new MacroError('validation_failed', `${key} < ${rule.min}`, { details: where });
+      if (rule.max !== undefined && value > rule.max) throw new MacroError('validation_failed', `${key} > ${rule.max}`, { details: where });
+    } else if (rule.type === 'duration') {
+      if (typeof value !== 'string' || !DURATION_RE.test(value)) {
+        throw new MacroError('validation_failed', `${key} 必须是 Ns/Nm/Nh 形态`, { details: where });
+      }
+    } else if (rule.type === 'time') {
+      if (typeof value !== 'string' || !TIME_RE.test(value)) {
+        throw new MacroError('validation_failed', `${key} 必须是 HH:MM（UTC+8）`, { details: where });
+      }
+    } else if (rule.type === 'path') {
+      if (typeof value !== 'string' || value.length === 0 || value.includes('..')) {
+        throw new MacroError('validation_failed', `${key} 必须是非空路径且不许含 ..`, { details: where });
+      }
+    } else if (rule.type === 'text') {
+      if (typeof value !== 'string' || value.length === 0) {
+        throw new MacroError('validation_failed', `${key} 必须是非空字符串`, { details: where });
+      }
+      if (rule.max !== undefined && value.length > rule.max) {
+        throw new MacroError('validation_failed', `${key} 超过 ${rule.max} 字`, { details: where });
+      }
+    }
+  }
+  return true;
+}
 /**
  * 执行账的**生命周期**（迁移 0035 CHECK 同一份）：
  * `pending → running → done | failed`；`pending → skipped`（被门禁挡下）；
@@ -242,12 +341,16 @@ export async function createTemplate(pool, {
   kind, name, params = {}, audience = 'all', scope, enabled = true, createdBy = null,
 } = {}) {
   const safeKind = validateMacroKind(kind);
-  const safeName = requireText('name', name, { max: 200 });
+  // `07` §1.3：name ≤ 40（用户下拉里看到的字，不是标题）
+  const safeName = requireText('name', name, { max: 40 });
   const safeAudience = validateMacroEnum('audience', audience, MACRO_AUDIENCES, { nullable: true }) ?? 'all';
   const safeScope = validateMacroEnum('scope', scope, MACRO_SCOPES);
-  if (params === null || typeof params !== 'object' || Array.isArray(params)) {
-    throw new MacroError('validation_failed', 'params 必须是对象', { details: { field: 'params' } });
+  // `07` §1.3：scope 与 kind 的配对是固定的，不许自由组合
+  if (KIND_SCOPE[safeKind] !== safeScope) {
+    throw new MacroError('validation_failed',
+      `${safeKind} 的 scope 必须是 ${KIND_SCOPE[safeKind]}`, { details: { field: 'scope' } });
   }
+  validateKindParams(safeKind, params);
   const safeCreatedBy = createdBy ?? null;
   const res = await runner(pool).query(
     `INSERT INTO macro_templates (kind, name, params, audience, scope, enabled, created_by)
@@ -260,19 +363,24 @@ export async function createTemplate(pool, {
 
 /** 改模板（只允许这些列；软删过的模板不许改——要改就显式先「恢复」，W2 再说）。 */
 export async function updateTemplate(pool, { templateId, patch = {}, now = new Date() } = {}) {
-  const allowed = { kind: 'kind', name: 'name', params: 'params', audience: 'audience', scope: 'scope', enabled: 'enabled' };
+  // ⚠ `kind` / `scope` **不在白名单**（`07` §1.3：建完不可改）。
+  // 改 kind 等于换一种语义却留着旧 params；改 scope 会让「它盯什么」静默变掉。
+  const allowed = { name: 'name', params: 'params', audience: 'audience', enabled: 'enabled' };
+  // params 要按**现有 kind** 校验 ⇒ 先取一次 kind（同一事务里读，避免改到别的行）
+  const kindRow = await runner(pool).query(
+    `SELECT kind FROM macro_templates WHERE id = $1 AND deleted_at IS NULL`, [templateId]);
+  const existingKind = kindRow.rows[0]?.kind ?? null;
   const sets = [];
   const params = [templateId];
   for (const [key, column] of Object.entries(allowed)) {
     if (!(key in patch) || patch[key] === undefined) continue;
     let value = patch[key];
-    if (key === 'kind') value = validateMacroKind(value);
-    else if (key === 'name') value = requireText('name', value, { max: 200 });
+    if (key === 'name') value = requireText('name', value, { max: 40 });
     else if (key === 'audience') value = validateMacroEnum('audience', value, MACRO_AUDIENCES);
-    else if (key === 'scope') value = validateMacroEnum('scope', value, MACRO_SCOPES);
     else if (key === 'enabled') value = value === true;
     else if (key === 'params') {
-      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      if (existingKind) validateKindParams(existingKind, value);
+      else if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         throw new MacroError('validation_failed', 'params 必须是对象', { details: { field: 'params' } });
       }
       params.push(JSON.stringify(value));
@@ -560,11 +668,23 @@ export async function claimMacroRun(pool, {
       `INSERT INTO macro_runs
          (assignment_id, anchor, criterion, status, bucket, depth, parent_macro_run_id, snapshot_id, worktree_path, started_at)
        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-        WHERE EXISTS (SELECT 1 FROM macro_assignments a WHERE a.id = $1 AND a.enabled)
+        WHERE EXISTS (
+                SELECT 1
+                  FROM macro_assignments a
+                  JOIN macro_templates t ON t.id = a.template_id
+                 WHERE a.id = $1
+                   AND a.enabled
+                   -- 到期：until 未设 或 还没到。与 applyExpiredAssignments 双保险：
+                   -- 那个 UPDATE 与本 INSERT 是两条语句，并发下会有「扫完就被改成过期」的窗口。
+                   AND (a.until IS NULL OR a.until > $11)
+                   -- 模板总开关（07 §1.4：关掉 ⇒ 所有订阅一起失效）与软删
+                   AND t.enabled
+                   AND t.deleted_at IS NULL
+              )
        ON CONFLICT (assignment_id, anchor, criterion, bucket) DO NOTHING
        RETURNING id`,
       [assignmentId, safeAnchor, safeCriterion, safeStatus, safeBucket, safeDepth,
-        parentMacroRunId ?? null, snapshotId ?? null, safeWorktree, started],
+        parentMacroRunId ?? null, snapshotId ?? null, safeWorktree, started, at],
     );
   } catch (e) {
     // 23503 = 订阅不存在（FK）；23514 = CHECK 漂了。都翻成可读错误，别让 W2 看到裸 pg 码。
@@ -601,7 +721,9 @@ export async function finishMacroRun(pool, {
   const safeSkipped = skippedReason === undefined
     ? null : validateMacroEnum('skipped_reason', skippedReason, MACRO_SKIPPED_REASONS, { nullable: true });
   const at = toInstant('now', now) ?? new Date();
-  if (safeStatus === 'skipped' && !safeSkipped && skippedReason !== null) {
+  // ⚠ 判据是 `!safeSkipped`，**不额外放行 `null`** —— 早先写成 `&& skippedReason !== null`
+  // 会让「显式传 null」绕过这道闸，把空原因的 skipped 落库（DB CHECK 允许 NULL）。
+  if (safeStatus === 'skipped' && !safeSkipped) {
     throw new MacroError('validation_failed', "status='skipped' 必须给 skipped_reason",
       { details: { field: 'skipped_reason', allowed: MACRO_SKIPPED_REASONS } });
   }
@@ -619,11 +741,27 @@ export async function finishMacroRun(pool, {
   if (childRunId !== undefined) push('child_run_id', childRunId);
   if (terminal) push('finished_at', toInstant('finishedAt', finishedAt) ?? at);
 
+  // ⚠ **终态不许回退**：早先 `WHERE id = $1` 能把一条 `done` 改回 `running`，
+  // 于是「终态不再推进」只是注释。这里把闸写进 SQL：已是终态的行只接受终态写入
+  // （重试同一终态是幂等的，允许；terminal → 非 terminal 一律拒绝）。
   const res = await pool.query(
-    `UPDATE macro_runs SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params,
+    `UPDATE macro_runs SET ${sets.join(', ')}
+      WHERE id = $1
+        AND (status <> ALL($${params.length + 1}::text[]) OR $2 = ANY($${params.length + 1}::text[]))
+      RETURNING *`,
+    [...params, MACRO_RUN_TERMINAL_STATUSES],
   );
   const row = res.rows[0];
-  if (!row) throw new MacroError('not_found', '执行记录不存在', { httpStatus: 404, details: { macroRunId } });
+  if (!row) {
+    // 分清「没有这行」与「这行已是终态、不许回退」——两者对调用方的处置完全不同
+    const exists = await pool.query('SELECT status FROM macro_runs WHERE id = $1', [macroRunId]);
+    if (exists.rows[0]) {
+      throw new MacroError('conflict',
+        `执行记录已是终态 ${exists.rows[0].status}，不许回退成 ${safeStatus}`,
+        { httpStatus: 409, details: { macroRunId, current: exists.rows[0].status, attempted: safeStatus } });
+    }
+    throw new MacroError('not_found', '执行记录不存在', { httpStatus: 404, details: { macroRunId } });
+  }
   return toMacroRunSnapshot(row);
 }
 
