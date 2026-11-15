@@ -12,13 +12,24 @@
 //   多行样本一律用双引号串 + join(NL)；全是纯函数，零墙钟等待（不给 #531 那族假红添燃料）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_TOOLCALL_MARKERS,
+  TEXTUALIZED_TOOL_CALL_EVENT_TYPE,
   TOOLCALL_MARKERS_ENV,
   detectTextualizedToolCall,
   parseToolCallMarkers,
+  textualizedToolCallField,
   toolCallMarkersFromEnv,
 } from '../lib/final-text-toolcall.js';
+
+// agentd 的中转判据要**真跑一次** `onWorkerFinished`（夹具与 `final-text-fallback.test.js` 的 F3 同族）：
+// `agentd.js` 是可 import 的模块（起 daemon 的是 main 分支），但要读到 token 才不抱怨环境。
+process.env.ERIX_STATION_TOKEN = 'test-token';
+const agentd = await import('../agentd.js');
 
 const U = '\uff5c'; // \uff5c FULLWIDTH VERTICAL LINE —— DSML 标记的分隔符（U+FF5C），写成常量免得靠肉眼数竖线。
 const DSML_OPEN = '<' + U + U + 'DSML' + U + U; // <\uff5c\uff5cDSML\uff5c\uff5c
@@ -262,5 +273,148 @@ test('#243 ⑤ 反向自证：判据若退化成"正文含 <"就算，正常交�
   for (const text of NORMALS) {
     assert.equal(detectTextualizedToolCall(text).hit, false,
       '同一批夹具在缺省三条下必须判假 —— 两向一起看，才说明"不误伤"是靠特征形状做到的，不是靠运气');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑥ 事件面接线（工单第 2 步）：识别结果只多带 additive 字段，**不改终态**
+// ---------------------------------------------------------------------------
+
+const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const readRunner = (rel) => fs.readFileSync(path.join(RUNNER_DIR, rel), 'utf8');
+
+test('#243 ⑥ additive 字段：命中才给两个键，没命中/空正文/显式关闭 ⇒ 一个字节都不多', () => {
+  assert.deepEqual(textualizedToolCallField(SAMPLE_A_FINAL_TEXT),
+    { textualized_tool_call: true, textualized_tool_call_marker: DSML_FEATURE },
+    '命中 ⇒ 两个键：布尔 + 命中的那条特征（照 #442 的 final_text_fallback 同族口径）');
+  assert.deepEqual(textualizedToolCallField(NORMALS[0]), {}, '正常交付摘要不得多带任何键');
+  assert.deepEqual(textualizedToolCallField(''), {}, '空正文不得多带任何键（#442 才管那种情形）');
+  assert.deepEqual(textualizedToolCallField(SAMPLE_A_FINAL_TEXT, []), {},
+    '特征集为空（配置 off）⇒ 判定关闭，一个字节都不多');
+  // **绝不写 false**：那会让「旧 runner 不认识这个键」与「明确没命中」在 U2 载荷上分不开。
+  assert.equal('textualized_tool_call' in textualizedToolCallField(NORMALS[0]), false,
+    '未命中时这个键必须**缺席**，不是值为 false');
+});
+
+test('#243 ⑥ 事件名自解释且三处集合同名（跨端 import 不到，只能字符串对账）', () => {
+  assert.equal(TEXTUALIZED_TOOL_CALL_EVENT_TYPE, 'textualized_tool_call');
+  const root = path.join(RUNNER_DIR, '..');
+  const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
+  // ① 后端历史下发白名单（漏 = 刷新后后端根本不下发）
+  const http = read('portal/src/http.js');
+  const wlStart = http.indexOf('const HISTORY_EVENT_TYPES = new Set([');
+  assert.ok(wlStart >= 0, 'http.js 的 HISTORY_EVENT_TYPES 锚点还在');
+  const wl = http.slice(wlStart, http.indexOf('const HISTORY_EVENT_DEFAULT_LIMIT', wlStart));
+  assert.match(wl, /'textualized_tool_call'/, '后端白名单必须含它，否则刷新后消失（erix-agent #182 教训）');
+  // ②③ 前端两处集合（漏 EVENT_TYPES = 实时收不到；漏 HISTORY_REPLAY_TYPES = 刷新后消失）
+  const fe = read('portal/frontend/src/composables/useEventStream.ts');
+  for (const [label, marker] of [['EVENT_TYPES', 'export const EVENT_TYPES = ['], ['HISTORY_REPLAY_TYPES', 'const HISTORY_REPLAY_TYPES = new Set([']]) {
+    const at = fe.indexOf(marker);
+    assert.ok(at >= 0, `前端 ${label} 锚点还在`);
+    const end = fe.indexOf('] as const', at) > 0 && fe.indexOf('] as const', at) < 4000
+      ? fe.indexOf('] as const', at)
+      : fe.indexOf(']);', at);
+    assert.match(fe.slice(at, end), /'textualized_tool_call'/, `前端 ${label} 必须含它`);
+  }
+});
+
+test('#243 ⑥ worker / agentd 接线：成功信封带字段、失败信封不带、agentd 逐字透传', () => {
+  const worker = readRunner('worker.js');
+  const agentd = readRunner('agentd.js');
+  // 成功信封里确实展开了这个函数（不是只在文件里 import 了没用）
+  assert.match(worker, /\.\.\.textualizedToolCallField\(result\.finalText, finalTextShapeConfig\.markers\)/,
+    'worker 的 RUN_FINISHED 成功信封必须展开 textualizedToolCallField（漏了就是"检测在跑但没人上报"）');
+  // 每 run 重新解析配置 + 告警必须落到 LOG 面（非法值不许静默）
+  assert.match(worker, /finalTextShapeConfig = toolCallMarkersFromEnv\(process\.env\)/,
+    '特征集必须每 run 解析一次（worker 进程会被复用给下一个 run）');
+  assert.match(worker, /for \(const warning of finalTextShapeConfig\.warnings\)[\s\S]{0,200}level: 'warn'/,
+    '配置告警必须逐条落 warn LOG —— 静默回退等于没人知道自己配错了');
+  // 失败信封（final_text 恒空）**不该**带这个键：那一侧的正文由 #300 的重建路径负责
+  const failEnvelope = worker.slice(worker.indexOf("type: MSG.RUN_FINISHED,\n      run_id: runId,\n      ok: false"));
+  assert.ok(failEnvelope.length > 0, '失败信封锚点还在');
+  assert.equal(failEnvelope.slice(0, 900).indexOf('textualizedToolCallField'), -1,
+    '失败路径不该带这个键（那条路径 final_text 恒为空，谈不上降级交付）');
+  // agentd 逐字透传、绝不补 false
+  assert.match(agentd, /\.\.\.\(msg\.textualized_tool_call === true/,
+    'agentd 必须只在 true 时透传这两个键（补 false 就把"旧 worker 不认识"与"没命中"混成一件事）');
+});
+
+// ---------------------------------------------------------------------------
+// ⑦ agentd 中转：真跑一次 `onWorkerFinished` 抓 U2 的 body（夹具同 #442 的 F3）
+// ---------------------------------------------------------------------------
+
+function stubFetch() {
+  const bodies = [];
+  return {
+    bodies,
+    impl: async (url, opts = {}) => {
+      const method = opts.method ?? 'GET';
+      if (method === 'PUT' && String(url).endsWith('/state')) {
+        bodies.push(typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body);
+        return { ok: true, status: 200, text: async () => JSON.stringify({ state: 'finished', run_end_seq: 1 }) };
+      }
+      if (method === 'PUT' && String(url).endsWith('/artifact')) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ artifact_id: 'a1', size: 1 }) };
+      }
+      throw new Error(`unexpected fetch ${method} ${url}`);
+    },
+  };
+}
+
+function makeCtx(projectDir) {
+  return {
+    // 用真样本那条 runId：出错时读日志一眼就知道是哪次 run（fixture 也要长得像现场）。
+    runId: 'f4dfea1d-c439-4bba-ac34-4c86d7132bea', claimToken: 'ct-test', attempt: 1, resume: false,
+    worker: null, workerPid: null, exited: null, events: [], eventBytes: 0,
+    flushTimer: null, inflight: false, finishing: false, dropped: false, dropReason: null,
+    lastIpcAt: Date.now(), projectDir,
+  };
+}
+
+async function finishedBody(msg) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-toolcall-'));
+  const { bodies, impl } = stubFetch();
+  const saved = globalThis.fetch;
+  globalThis.fetch = impl;
+  try {
+    await agentd.onWorkerFinished(makeCtx(root), {
+      ok: true, termination: { reason: 'end_turn' },
+      usage: { input_tokens: 1, output_tokens: 2 }, rounds: 32, final_text: SAMPLE_A_FINAL_TEXT, ...msg,
+    });
+  } finally {
+    globalThis.fetch = saved;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  assert.equal(bodies.length, 1, 'U2 终态应当上报恰好一次');
+  return bodies[0];
+}
+
+test('#243 ⑦ agentd 逐字透传：worker 带了这两个键 ⇒ U2 body 里有；不带 ⇒ 一个字节都不多', async () => {
+  const hit = await finishedBody({ textualized_tool_call: true, textualized_tool_call_marker: DSML_FEATURE });
+  assert.equal(hit.textualized_tool_call, true, 'agentd 把标记吞了 ⇒ 界面永远不知道终局是一段工具调用');
+  assert.equal(hit.textualized_tool_call_marker, DSML_FEATURE, '命中的特征名必须原样到 portal（界面要用它）');
+  // **终态语义一个字没动**：additive 之外 body 的既有字段照旧。
+  assert.equal(hit.termination.reason, 'end_turn');
+  assert.equal(hit.rounds, 32);
+  assert.equal(hit.final_text, SAMPLE_A_FINAL_TEXT);
+
+  const miss = await finishedBody({});
+  assert.equal(Object.hasOwn(miss, 'textualized_tool_call'), false,
+    '没命中时 U2 body 里不许多出这个键（缺席才是「没命中」）');
+  assert.equal(Object.hasOwn(miss, 'textualized_tool_call_marker'), false);
+
+  for (const dirty of [1, 'true', {}, [], 0]) {
+    const body = await finishedBody({ textualized_tool_call: dirty, textualized_tool_call_marker: DSML_FEATURE });
+    assert.equal(Object.hasOwn(body, 'textualized_tool_call'), false,
+      `textualized_tool_call=${JSON.stringify(dirty)} 不该被当成 true 透传`);
+    assert.equal(Object.hasOwn(body, 'textualized_tool_call_marker'), false,
+      '脏布尔时连 marker 也不该单独漏过去（两个键说的是同一件事）');
+  }
+  // marker 脏（空串 / 非串）⇒ 只丢 marker，布尔照传：事件仍要写，界面少一句片段而已。
+  for (const dirty of ['', 42, null]) {
+    const body = await finishedBody({ textualized_tool_call: true, textualized_tool_call_marker: dirty });
+    assert.equal(body.textualized_tool_call, true);
+    assert.equal(Object.hasOwn(body, 'textualized_tool_call_marker'), false,
+      `marker=${JSON.stringify(dirty)} 不该被透传（portal 会因它 400，整条终态都报不上去）`);
   }
 });
