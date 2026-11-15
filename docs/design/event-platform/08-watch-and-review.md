@@ -382,8 +382,11 @@ postMessage({
 ## 10. 数据形状（只写形状，不写 DDL）
 
 ⚠ **本节是 [07](07-surfaces-and-panel.md) §6 形状的增量**，不是另一份定义。
-`state` / `skipped_reason` 的**完整取值以 `07` 为唯一来源**（含 `superseded` / `cancelled_by_user`），
-本节不重复列。
+`status`（生命周期）/ `criterion`（判据）/ `skipped_reason` 的**完整取值以 `07` 为唯一来源**
+（含 `superseded` / `cancelled_by_user`），本节不重复列。
+
+⚠ **2026-11-16 修正**：初稿把生命周期与判据合成一列 `state` 并放进幂等键 —— 那是错的
+（状态迁移会改变唯一键 ⇒ 幂等失效）。现已拆成 `status` + `criterion`，见 `07` §18。
 
 ```
 macro_templates      同 07
@@ -397,9 +400,9 @@ macro_runs           07 的字段 + 下列 M9 专用列：
                        worktree_path  text，建好的 worktree 路径（§5.3 孤儿清扫用）
 ```
 
-**幂等键只有一套**，见 `07` 的 `UNIQUE (assignment_id, anchor, state, bucket)`。
-M9 上的特化：`state` = 判据名（`mechanical` / `semantic`）、`bucket` = 触发 run id。
-**不并存两套约束。**
+**幂等键只有一套**，见 `07` 的 `UNIQUE (assignment_id, anchor, criterion, bucket)`。
+M9 上：`criterion` ∈ `{mechanical, semantic}`、`bucket` = 触发它的 run id。
+**`status` 不进幂等键**（它会变）。**不并存两套约束。**
 
 - `until` 到期 ⇒ `enabled=false` + 一条通知。默认**次日 09:00**（存 UTC，显示本地）。
 
