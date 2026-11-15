@@ -5592,3 +5592,55 @@ M-C 是这轮最想要的一发：它证明 `L5` 那格**不是靠末段蹭红**
 **判据差项现在只剩**：① 链检的存在性/类型/可达性判断仍走 `statSync`+`accessSync`（**只有链接事实**用 `lstat`）——
 「逐段 `lstat` 的 fail-closed 版本」按裁决不做；② env 键值（值非法）校验不做（那条线在
 `portal/test/deploy-env-defaults.test.js`）；③ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
+
+#### 返修补记三（2026-11-17，PR #554 第三方复审 BLOCKER 单独一轮：`deploy/.env` 的行内注释把隔离判据读成恒真）
+
+**病灶（一句话）**：`readEnvFile` 的旧正则在**未加引号**的值上把 ` # …` 整段留在值里 ⇒
+`TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared` 解析成
+`"/docker/station-edge/dynamic # shared"`，**不等于**真路径 `/docker/station-edge/dynamic`
+⇒ `assertHostWritePathsIsolated` 那条「与共享 `.env` 的值不相等」在**危险方向上恒真**：
+共享的正是生产边缘那份，预检却报绿（#227① 现场 = 隔离 portal 覆写边缘路由，8090 全线 502 而 `docker ps` 全 healthy）。
+主 agent 复现读数：`readEnvFile("<tmp>/env-probe")` → `"/docker/station-edge/dynamic # shared"`。
+
+**裁决（A 案，主 agent 定）**：预检**拒**「我们无从证明 compose 会拿到什么」的键值行，点名**文件 + 行号 + 键名 + 原文**，
+与既有 fail-fast（宁可起跑前红）同族；**没有**选「把解析改成与 compose 对齐并宣称等价」——那条路要求一条
+外部基准来证明「我们的解析 == compose 的解析」，而本单先要的是**别再绿着写错**。解析口径本身也照实测 compose 修了
+（`parseComposeEnvLine` / `parseComposeEnvFile`），但**判定权在拒不在猜**。两条边界按现场读数收窄：
+
+- 只盯 `HOST_WRITE_PATH_ENVS` 那四个键（`TRAEFIK_DYNAMIC_DIR_HOST` / `ERIX_USERSPACE_ROOT_HOST` /
+  `ERIX_ARTIFACTS_ROOT_HOST` / `STATION_DB_DIR`）：全文件一律拒会误杀真 `.env` 里
+  `POSTGRES_PASSWORD=xxxx # 说明` 这种合法行——**实测本仓库 `deploy/.env` 里就有三行**（32/38/40 行附近，全是密码键）。
+- 同族第二形一并拒：比对键的值里有 `$` 插值（compose 实测会把 `/a/${QQ}b` 读成 `/a/b`，我们看不到展开上下文）、
+  以及 compose 自己会硬报错的两形（未闭合引号、引号闭合后带垃圾）。非比对键带 `$` 不误杀（密码里 `$` 很常见）。
+
+**compose 口径实测**（`docker compose 2.40.3`，`docker compose --env-file <env> -f <yml> config --format json`，
+13 条读数已照抄成 `test/integration-e2e-preflight.test.js` 的 `COMPOSE_PARSE_CASES`）：
+`K=a b # c`→`a b`；`K="/c/d" # after`→`/c/d`；`K=/g/h#nospace`→原样；`K="/i/j # in"`→`/i/j # in`（引号内是正文）；
+`K=/a/b<TAB>#tab`→原样（**tab 不算注释起始**，只有空格算）；`K=  spaced value  # tail`→`spaced value`；
+`K=#hash first`→`#hash first`（值首 `#` 是字面）；`K="" # c`→空；未闭合引号与 `"v"junk` ⇒ compose 直接 `failed to read …`。
+
+**判据（两门，全夹具，不碰 docker）**：CI 新增 `#227① E1–E5`（E1 = 带注释的共享路径必须红且点名
+`shared.env:3 TRAEFIK_DYNAMIC_DIR_HOST`；E2 = 注释行/空行/缩进注释/引号内含 `#`/`#` 前无空格/非比对键带注释 ⇒ 不误杀；
+E3 = 记录读数表；E4 = **现场再跑一次真 compose 做三方对账**（现场 compose ⇔ 记录表 ⇔ 我们的解析），无 docker 才 skip；
+E5 = `$` 插值/未闭合/垃圾三形点名到行）；负例门新增**陷阱 14/15** + 正例组「不误杀」一格；
+`parseComposeEnvLine` / `parseComposeEnvFile` / `findUnreproducibleEnvLines` 进单一来源清单（两份解析必然漂）。
+
+**变异读数**（每发只打一处，锚点先 `grep -cF` 确认恰好 1 次，跑完立即复原，`grep -rn MUTANT portal | wc -l` = 0）：
+
+| 发 | 改了什么 | CI 门 | `--strict` |
+|---|---|---|---|
+| MT1 | **撤掉那条拒绝**（`findUnreproducibleEnvLines` 恒不命中） | rc=1：`not ok 20 - #227① E1 共享路径带未加引号的行内注释…` + `not ok 24 - #227① E5 同族拒…` | rc=1 `TRAP FAIL · assertHostWritePathsIsolated() 共享路径带未加引号行内注释 ⇒ 当场拒并点名 文件:行号:键名` + `… $ 插值 …`，`verdict=TRAP_SILENT` |
+| MT2 | 撤掉剥注释（值里「空格 + `#`」不再切开） | rc=1：`not ok 20/21/22/23`（E1–E4 全红） | rc=1 `TRAP FAIL · …行内注释…`，`verdict=TRAP_SILENT` |
+| MT3 | 反向：把**引号内**的 `#` 也当注释剥掉（误杀合法值） | rc=1：`not ok 21/22/23`（E2 不误杀红） | rc=1 `正例夹具被抛错（护栏过严/夹具过期）：引号内的 \`#\` 是正文…` |
+
+**门禁读数**：`node --test test/integration-e2e-preflight.test.js` ⇒ rc=0 `# tests 24 / # pass 24 / # fail 0 / # skipped 0`
+（E4 在本机真跑 compose，没 skip）；同一条命令在 `portal/` 目录里用 `../test/…` 跑 ⇒ rc=0 同样 24/24
+（**字面照抄 `test/…` 会 rc=1 `Could not find`** —— 该文件在仓库根的 `test/` 下，派单里那句路径写法记在此处）；
+`node portal/integration/isolation-negative.mjs --strict` ⇒ rc=0 `verdict=TRAPS_FIRED（全部 15 条陷阱=均硬失败；单一来源=一份定义）`，
+默认跑法仍 rc=1（语义如此）；`npm run check:agents-hotlayer` ⇒ rc=0（热层 18706 / 预算 19456，条目 127 无重复编号）。
+
+**本轮差项 / 遗留**：① A 案的代价说清：真机若在那四个比对键上写未加引号注释（本仓库这份没有），
+`wp3b-e2e` 会起跑前红一次，文案给改法（加引号或把注释挪到上一行）——这是有意的 fail-fast，不是误杀；
+② compose 版本相关：`COMPOSE_PARSE_CASES` 的读数表钉的是 **2.40.3**，别处版本若改了口径，E4 现场复核对不上会红
+（这正是它存在的理由，不要顺手改表）；③ 第三方复审另外四条（链接目标 EACCES 归 missing、`FDE_POOL=large` 白名单可缺
+large 段、`$TMPDIR` 是链接时的夹具前提、「三态」措辞）本轮按裁决**未做**，另起一轮；④ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
