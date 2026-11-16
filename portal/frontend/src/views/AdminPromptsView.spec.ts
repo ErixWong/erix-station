@@ -194,6 +194,10 @@ describe('F1 挂载只发 1 次 GET', () => {
     expect(text(w, 'bytes-addendum')).toContain('8 KiB');
     expect(text(w, 'bytes-titlePrompt')).toContain('1.95 KiB');
     expect(text(w, 'agents-md-render-budget')).toContain('16 KiB');
+    // 预算口径必须说清：DTO 那个数用示例名 `example` 渲染，而写侧闸按最长合法工位名算
+    // （契约 §4.16-3 评审 F2）⇒ 不写清就变成「页面没顶到上限就存得进去」的错承诺。
+    expect(text(w, 'agents-md-render-budget-note')).toContain('example');
+    expect(text(w, 'agents-md-render-budget-note')).toContain('最长合法工位名');
   });
 
   it('store 侧：loadPlatformPrompts 成功返回 null 且 loaded=true（区分「没请求」与「服务端回的是内置」）', async () => {
