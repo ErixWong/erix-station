@@ -13,6 +13,7 @@ import { startOnboardingLoop } from './onboarding.js';
 import { startOffboardingLoop } from './offboarding.js';
 import { startRoutesLoop } from './routes.js';
 import { startRouteDriftMonitor } from './routesdrift.js';
+import { startMacroEvalLoop } from './macro-eval.js';
 import { startReaperLoop, notifySessionEvents } from './internal.js';
 import { gracefulShutdown, SHUTDOWN_LOOPS_MS_DEFAULT } from './shutdown.js';
 import {
@@ -74,6 +75,8 @@ async function serve() {
   const routesLoop = startRoutesLoop(pool, config);
   // issue #474 S3 一期：动态文件漂移**只读**对账（60s + 启动一次；只 warn + 审计，绝不写盘）。
   const driftMonitor = startRouteDriftMonitor(pool, config);
+  // issue #525 W2：宏平台评估循环（只产触发意图，不执行；水位线逐条推进；60s + 启动一次）。
+  const macroEvalLoop = startMacroEvalLoop(pool, config);
   const provisionerLoop = startProvisionerLoop(pool, config);
   const reaperLoop = startReaperLoop(pool);
   server.listen(config.port, config.host, () => {
@@ -104,6 +107,7 @@ async function serve() {
     { name: 'offboarding', ...offboardingLoop },
     { name: 'routes', ...routesLoop },
     { name: 'routes-drift', ...driftMonitor },
+    { name: 'macro-eval', ...macroEvalLoop },
     { name: 'provisioner', ...provisionerLoop },
     { name: 'reaper', ...reaperLoop },
   ];
