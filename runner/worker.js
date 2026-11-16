@@ -714,12 +714,15 @@ async function startRun(msg) {
     if (delegation !== null && options?.name === 'delegate') {
       return delegation.execute(options.input, buildDelegateContext(options.context, runId));
     }
-    if (noteTools.executeTool && noteToolNames.has(options.name)) {
+    // issue #537：审查 run 不给 note（契约 ⑤）——baseToolSchemas 已不下发 note 名，但执行侧
+    // 也得挡；这层不该只靠「模型看不到」。
+    if (!reviewOnly && noteTools.executeTool && noteToolNames.has(options.name)) {
       return noteTools.executeTool(options);
     }
     // 技能工具：上游 executeTool(name, input) 位置参形态（契约见 loader 契约测试），与 notes 的
     // options 对象形态不同，故单独一段路由。
-    if (skillTools.executeTool && skillToolNames.has(options.name)) {
+    // issue #537：审查 run 不给技能（宁严勿宽：技能可自带写/执行能力，与只读承诺相逆）。
+    if (!reviewOnly && skillTools.executeTool && skillToolNames.has(options.name)) {
       return skillTools.executeTool(options.name, options.input);
     }
     // issue #211：abort signal 必须转交。引擎契约把 run 的 signal 放在 executeTool 的**顶层**
@@ -750,7 +753,13 @@ async function startRun(msg) {
   // `delegation_dir` 由 agentd 预建并 `runAsWorker` 改属主后下行（同 `notes_dir`）：agentd 跑 1001、
   // worker 跑 1002，1001 建的 755 目录 1002 写不进 ⇒ **不要**在这里自己拼 `process.env.HOME`。
   const delegateEnabled = isDelegateEnabled(process.env.ERIX_DELEGATE_ENABLED);
-  if (delegateEnabled) {
+  // issue #537：审查 run（reviewOnly）**不建 delegation**。子 run 的工具面是
+  // `[...fileTools.schemas, ...shellTools.schemas]`（见下 childTools），**不是从父 registry
+  // 过滤出来的** ⇒ 父的只读过滤（装配点①②）传不到子；而子 run 自带 shell（`bash -c` 无白名单）。
+  // ⇒ 审查 run 只要环境 `ERIX_DELEGATE_ENABLED=1`（FDE 全局开）就能
+  // `delegate("跑 shell 把 ~/projects/foo 读出来")` 让子 run 拿 shell 逃逸出 worktree。
+  // 关掉后 `delegation` 保持 null ⇒ executeTool 里 `delegation !== null` 那条 delegate 路由自然不通。
+  if (delegateEnabled && !reviewOnly) {
     const delegateMax = parseDelegateMax(process.env.ERIX_DELEGATE_MAX);
     const delegateRounds = parseDelegateChildRounds(process.env.ERIX_DELEGATE_CHILD_ROUNDS);
     const delegateTimeout = parseDelegateChildTimeoutMs(process.env.ERIX_DELEGATE_CHILD_TIMEOUT_MS);
