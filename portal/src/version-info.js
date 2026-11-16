@@ -64,14 +64,23 @@ function firstString(candidates, fallback) {
 export function readStationVersion({ env = process.env, buildInfoPath, packageDir = PACKAGE_DIR } = {}) {
   const fallback = { station: UNKNOWN, engine: UNKNOWN, revision: UNKNOWN, builtAt: UNKNOWN, source: UNKNOWN };
   try {
+    // **在入口就挡掉 `ERIX_AGENT_VERSION`**（评审阻断，#586）。`readBuildInfo()` ① 那条 override 是
+    // **FDE 容器侧**的正当需求：`provisioner.js:281` 往容器 env 里注它，声明「容器内跑的是哪个引擎」，
+    // 那里它跟容器自己的 build-info.json **同源**，盖了不谎报。portal 不是那个场合：它的权威载体是
+    // **自己镜像里的** `/app/build-info.json`，没有任何合法理由让一个环境变量冒充镜像里的构建产物。
+    // 不挡会谎报来源：`aboutPanel()` 的 `provenance.platformEngine` 写的是 `'build-info.json'`（写死的），
+    // 而 engine 那格会被 env 撑成另一个数 ⇒ 面板显示的值不来自它自称的那个来源，**正是本单要消灭的形状**。
+    // 口径选择：env 冒充就在入口挡掉，而不是「让它盖过去再把 provenance 改成 `'env'`」——后者只是把
+    // 谎话换成「来源=env」，而我们的口径是**镜像内 build-info 才是权威**。
+    const { ERIX_AGENT_VERSION: _engineOverrideIgnored, ...envSansOverride } = env ?? {};
     const info = readBuildInfo({
-      env,
+      env: envSansOverride,
       // 优先级：显式入参 > `STATION_BUILD_INFO_PATH`（portal 自己的注入旋钮，契约测试用）>
       // `ERIX_BUILD_INFO_PATH`（runner 那份链里已有的那个旋钮，保留兼容）> portal 镜像内的默认位置。
       // ⚠ 必须**显式**传：`readBuildInfo()` 自己的兜底是 runner 的 `/opt/erix/build-info.json`，
       //   那是**另一个镜像**里的另一份版本，portal 拿它当默认就会读到 FDE 的账。
       buildInfoPath: firstString(
-        [buildInfoPath, env?.STATION_BUILD_INFO_PATH, env?.ERIX_BUILD_INFO_PATH],
+        [buildInfoPath, envSansOverride.STATION_BUILD_INFO_PATH, envSansOverride.ERIX_BUILD_INFO_PATH],
         BUILD_INFO_PATH,
       ),
       packageDir,
@@ -172,6 +181,10 @@ export async function aboutPanel({ pool, readVersion = readStationVersion, log =
     fdes,
     fdesPresent,
     provenance: {
+      // server / platformEngine 两格**可以写死** `'build-info.json'`，不是偷懒：这两格从此只有 build-info
+      // 那一条来源（唯一能绕开它的旋钮 `ERIX_AGENT_VERSION` 已在 `readStationVersion()` 入口屏蔽），
+      // 而 dev 源码态的退路（`source: 'package'`）不伪装成镜像事实——它走 `server.source` 那格说清。
+      // ⇒ 这里写死的字符串与面板显示的值**构造上一致**（被 version-surface 的用例钉着：env 注入不进去）。
       server: 'build-info.json',
       platformEngine: 'build-info.json',
       fdes: 'containers.agent_version',

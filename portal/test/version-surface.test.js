@@ -309,3 +309,57 @@ test('#586：读法只有一条 —— portal/src 里除 version-info.js/build-i
   }
   assert.deepEqual(offenders, [], '自己 `require(.../package.json)` 就是第二个真相源（口径 #586 第 4 条）');
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 评审阻断（copilot review）：`ERIX_AGENT_VERSION` 不许在 portal 侧冒充镜像里的构建产物
+// ─────────────────────────────────────────────────────────────────────────────
+// `readBuildInfo()` ① 那条 override 是 **FDE 容器侧**的正当需求（`provisioner.js` 往容器 env 注入它，
+// 与容器自己的 build-info.json 同源）。portal 的权威载体是**自己镜像里**的 build-info.json —— 一旦让它
+// 盖过去，`aboutPanel()` 写死的 `provenance.platformEngine: 'build-info.json'` 就变成谎话：面板显示的值
+// 不来自它自称的那个来源。所以 portal 在**入口**屏蔽这个旋钮（不是把 provenance 改成 `'env'` 了事）。
+test('#586 评审阻断：portal 侧 ERIX_AGENT_VERSION 盖不掉平台侧引擎那格（provenance 不许说谎）', async () => {
+  const BOGUS = '9.9.9-bogus';
+  const { dir, file } = writeBuildInfo(INJECT);
+  await withEnv({ STATION_BUILD_INFO_PATH: file, ERIX_AGENT_VERSION: BOGUS }, async () => {
+    const panel = await aboutPanel({ pool: new SurfacePool() });
+    assert.equal(panel.platformEngine.version, INJECT.engine_version,
+      '引擎那格必须还是 build-info 里那一个（被 env 盖过 = 谎报来源）');
+    assert.equal(panel.server.source, 'build-info', '面板要能说真话：这一格确实从 build-info 读的');
+    assert.equal(panel.provenance.platformEngine, 'build-info.json');
+    assert.ok(!JSON.stringify(panel).includes(BOGUS),
+      `env 那个值根本不许出现在响应里，实得：${JSON.stringify(panel)}`);
+    // `/api/health` 同口径：形状不变（**不含** engine 字段），三格也不受这个旋钮影响。
+    const srv = await startServer(new SurfacePool());
+    try {
+      const res = await fetch(`${srv.base}/api/health`);
+      const body = await res.json();
+      assert.deepEqual(Object.keys(body.version).sort(), ['builtAt', 'revision', 'station'],
+        '健康端点的 version 块仍是三格，没多出 engine');
+      assert.deepEqual(body.version, {
+        station: INJECT.station_version, revision: INJECT.revision, builtAt: INJECT.built_at,
+      });
+      assert.ok(!JSON.stringify(body).includes(BOGUS), '健康端点同样不许漏出 env 覆盖值');
+    } finally {
+      await srv.close();
+    }
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('#586 评审阻断：屏蔽只发生在 portal 入口 —— runner 那份 override 语义原样保留（不许顺手改别人的口径）', () => {
+  const { dir, file } = writeBuildInfo(INJECT);
+  try {
+    const withOverride = readRunnerBuildInfo({
+      env: { ERIX_AGENT_VERSION: '9.9.9-bogus' }, buildInfoPath: file, packageDir: PACKAGE_DIR,
+    });
+    assert.equal(withOverride.agentVersion, '9.9.9-bogus', 'runner/FDE 侧仍能显式盖（那是它的正当需求）');
+    assert.equal(withOverride.source, 'env');
+    const portalView = readPortalBuildInfo({
+      env: { ERIX_AGENT_VERSION: '9.9.9-bogus' }, buildInfoPath: file, packageDir: PACKAGE_DIR,
+    });
+    assert.equal(portalView.agentVersion, '9.9.9-bogus',
+      '底层函数本身照旧：屏蔽是 version-info.js 的责任，不是把 readBuildInfo 改残');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
