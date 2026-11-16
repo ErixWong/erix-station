@@ -33,8 +33,8 @@
 //   且凡 import 这条链的文件全部连坐）。判据 `P11` 用两个子进程正反两序各加载一次钉住这件事。
 import {
   renderHomeAgentsMd,
-  agentsMdRenderBudget,
   agentsMdRenderedBytes,
+  agentsMdGateRenderBudget,
   AGENTS_MD_EXAMPLE_FDE_NAME,
 } from './materializer.js';
 import { enqueueMaterializeChange } from './outbox.js';
@@ -201,8 +201,11 @@ const ACTIVE_FDE_SQL = `SELECT id FROM users
  *
  * 参数：`$1` 列名 `$2` 新文本 `$3` actor `$4` 模板字节 `$5` 追加段开销 `$6` 标识行尾部
  * `$7` 渲染上限 `$8` 审计 action `$9` 审计 target。
+ *
+ * ⚠ `$4/$5/$6` 送的是**最坏情况预算**（`agentsMdGateRenderBudget()`，评审 F2）：标识行按最长合法
+ *   工位名算，不是按示例名。导出来是给真库集成脚本直接跑一遍那段算术（`P6b` 的 SQL 那半边）。
  */
-const SAVE_SQL = `WITH snap AS (
+export const SAVE_SQL = `WITH snap AS (
    SELECT agents_md_addendum, agents_md_override, title_prompt
      FROM platform_prompts
     WHERE id = 1
@@ -349,7 +352,10 @@ export async function resolveEffectiveTitlePrompt({ pool, log, timeoutMs } = {})
 
 /** 管理台 DTO（契约 §6 那个形状；键名 camelCase）。`reason` 是 additive 的排障位。 */
 export function toPlatformPromptsDto({ resolved, row = null }) {
-  const budget = agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME });
+  // ★ `__budget` 是**写侧闸要用那份**（标识行按最长合法工位名），不是下面预览那一份：
+  //   单测要钉的是「送进 SQL 的常量是哪一份」，拿预览那份当 `__budget` 就把这件事自证了。
+  const budget = agentsMdGateRenderBudget();
+  // 下面三份文本/字节是**给人看的预览** ⇒ 用示例名 `example`（契约 §6）；与写侧闸用哪份预算是两件事。
   const effectiveText = renderHomeAgentsMd({
     fdeName: AGENTS_MD_EXAMPLE_FDE_NAME, addendum: resolved.addendum, override: resolved.override,
   });
@@ -383,7 +389,7 @@ export function toPlatformPromptsDto({ resolved, row = null }) {
     updatedAt: isoOrNull(row?.updated_at ?? null),
     updatedBy: row?.updated_by ?? null,
     reason: resolved.reason ?? null,
-    __budget: budget, // 不参与响应（`buildDtoForResponse` 会剔掉），给单测与写侧复用同一份算术
+    __budget: budget, // 不参与响应（`buildDtoForResponse` 会剔掉）；就是写侧闸要送进 SQL 的那份算术
   };
 }
 
@@ -509,7 +515,11 @@ export async function updatePlatformPrompts({ pool, field, text, actorId = null,
   const spec = PROMPT_FIELDS[field];
   if (!spec) fail('field', `未知字段：${String(field)}（只支持 addendum / agentsMd / titlePrompt）`);
   const value = cleanTextField(field, { text });
-  const budget = agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME });
+  // ★ 写侧闸按**最坏情况**算（评审 F2）：标识行取最长合法工位名（长度从 `FDE_NAME_RE` 导出），
+  //   不是 DTO 预览那个 `example`——否则 8192 这个字段上限会放过「示例名装得下、真工位名装不下」
+  //   那一档输入，而超那一档的后果是注入侧静默截断（写侧闸存在的全部理由）。
+  //   DTO 的 `effectiveText`/`templateBytes` 仍然按 `example` 渲染（那是预览，契约 §6）。
+  const budget = agentsMdGateRenderBudget();
   // 闸一（JS 预闸，**写之前**）：只有参与渲染的两格需要（`title_prompt` 不进 `AGENTS.md` ⇒ 不多一次读）。
   if (spec.renders) {
     const preRendered = await renderedBytesIfSaved({ pool, spec, value, budget, log });

@@ -27,6 +27,40 @@ export const PROJECT_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 //   `CWD_RE` / `validateSessionCwd`（字符集与长度不限，允许下划线；`chat_sessions.cwd` 无 CHECK）。
 export const FDE_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
+/**
+ * 「最长合法工位名」的字符数，**从 `FDE_NAME_RE` 现算**（拿单字符重复去试，试到第一个不合法为止）。
+ *
+ * 为什么要它：渲染闸必须按**最坏情况**算标识行（`materializer.js#agentsMdGateRenderBudget`，
+ * 评审 F2）——写侧保存时不知道这份文件会渲染给哪些工位，拿示例名 `example` 卡预算 = 拿一个
+ * 比现实短 56 字段的样本做上限。而这个名字不能手抄：抄一个 `63` 就是长出第二份真相，
+ * 哪天 `FDE_NAME_RE` 改了长度，闸会默默错而没人知道（这里探一遍，漂了自动跟着漂）。
+ *
+ * ⚠ 字符数 ≡ 字节数：`FDE_NAME_RE` 的字符集只有 `[a-z0-9-]`（全 ASCII），所以这个数能直接当
+ *   字节预算用。将来若允许中文工位名，这条假设会在这里碎掉 ⇒ `hardCap` 那道闸与
+ *   `materializer.test.js` 里「字符数 == 字节数」那条断言会一起报信。
+ * @type {number}
+ */
+export const FDE_NAME_MAX_LEN = deriveFdeNameMaxLen(FDE_NAME_RE);
+
+/**
+ * 探针：`'a'.repeat(1)`、`'a'.repeat(2)`… 直到第一个被拒的长度。只依赖 `FDE_NAME_RE` 本身
+ * ⇒ 没有第二份正则、没有手抄的数。`hardCap` 不是「上限的估值」，是**防呆**：量词要是从 `{0,61}`
+ * 改成 `+`/`*`（无上界），这里会报信而不是算出一个骗人的大数（静默少算 = 闸默默变宽）。
+ */
+function deriveFdeNameMaxLen(re, { probeChar = 'a', hardCap = 512 } = {}) {
+  let len = 0;
+  while (re.test(probeChar.repeat(len + 1))) {
+    len += 1;
+    if (len >= hardCap) {
+      throw new Error(
+        `FDE_NAME_RE 允许的长度没有上界（${hardCap} 个字符仍合法）⇒ 渲染闸的「最坏情况标识行」算不出来`,
+      );
+    }
+  }
+  if (len < 1) throw new Error('FDE_NAME_RE 连一个字符都不接受 ⇒ 最长合法工位名算不出来（正则被改坏了？）');
+  return len;
+}
+
 export class ProjectError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
     super(message);
