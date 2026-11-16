@@ -1,0 +1,161 @@
+{
+  "$comment": [
+    "issue #557 活二：runner 侧 env 枚举的**例外清单**（判据 `portal/test/deploy-env-delegate.test.js` 的「活二①/④/⑤」读它）。",
+    "语义：`runner/` 里真的读了这个 env 名，但它**不在宿主 → 容器那条三腿链上**（compose station-portal → provisioner Env → fde-proxy ENV_KEY_ALLOW）。",
+    "规矩（判据钉的，不是习俗）：① 每条必须有非空 `reason`，**没有理由的例外不算例外**（去掉 `reason` 字段判据就红）；",
+    "② 同一个键只能一条（重复 = 停泊位）；③ 登记的键必须真的在枚举里（过期条目红）；④ 已经三腿齐的键不许留在这里（停泊红）；",
+    "⑤ 三腿齐的键一个都不许写在这里 —— 所以这张表**只增不减就是腐烂**的反向指标：接上一条腿，就该删掉一行。",
+    "⑥ `where` 是**可校验坐标**，不是说明文字（#557 返工活二）：每个 `路径.js[:行]` 引用都必须存在，带行的那一行必须**在代码里**（剥掉注释后）",
+    "   含该 key 的字面量、或含一个能解析到它的常量名；只给文件不给行时，扫描器必须在那个文件里发现对该 key 的**活读**。",
+    "   为什么升到硬判据：本仓实测有过**注释背书的登记** —— `ERIX_AGENT_VERSION` 的 where 原先指 `runner/agentd.js:52`，",
+    "   那一行是**注释正文**里引用的旧代码（真读取早在 `runner/lib/build-info.js:84`，另一形 `env.X`），扫描器不认那形、",
+    "   判据不核 for 在不在，于是「假坐标 + 真理由」静默活了三天；同一个 PR 还把 `provisioner.js:257` 挪到了",
+    "   `ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 那一行 ⇒ **行号看着合理**的坐标会随时间自己变成假的。",
+    "⑦ 读取形状**解析不出字面量名**的（运行期拼名那类）必须登记进 `unsupported` 段并写理由：读形认得、名字认不出 ⇒ 静默；",
+    "   登记要花钱，所以「扫不出来」这件事不再是免费的（fail closed）。坐标同样要现跑核对。"
+  ],
+  "exceptions": [
+    {
+      "key": "ERIX_SHELL_LIVENESS_MS",
+      "where": "runner/lib/shell-tools.js:34",
+      "reason": "与 #557 **同形的已知缺口**（三腿全无 ⇒ 宿主设了投不进，只能改代码/镜像）。#557 的范围只接 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 这一条，本键登记为**已知未接**，别读成已修。要接就一次补三腿并删掉本条。"
+    },
+    {
+      "key": "ERIX_AGENTD_WATCHDOG_MS",
+      "where": "runner/agentd.js:74",
+      "reason": "agentd 进程内的存活看门狗预算（F6：超时 SIGKILL + 重放整条命令，#288 的真机形状）。它的默认值与 `ERIX_SHELL_MAX_TIMEOUT_MS` / `ERIX_DELEGATE_CHILD_TIMEOUT_MS` 互相钳制（`deploy-env-delegate.test.js` 的腿③b 钉的是那两个），抬它等于改重放语义 ⇒ 不给「现场随手设一下」的入口，要改是改代码并同步那两条超时。"
+    },
+    {
+      "key": "ERIX_HEARTBEAT_MS",
+      "where": "runner/agentd.js:62",
+      "reason": "agentd ↔ portal 心跳节拍（IPC/事件面，不是任务面）。它同时是 `ERIX_AGENTD_HB_INIT_MAX_WAIT_MS` 的推导基数，改节拍要连 reaper/租约一起看 ⇒ 不进宿主下发面。"
+    },
+    {
+      "key": "ERIX_AGENTD_HB_INIT_MAX_WAIT_MS",
+      "where": "runner/agentd.js:67",
+      "reason": "启动期「等第一次心跳」的兜底，缺省直接从 `ERIX_HEARTBEAT_MS` 推导（`2 *`）。登记理由同上族：调它是在调启动时序容错，不是现场旋钮。"
+    },
+    {
+      "key": "ERIX_BATCH_WINDOW_MS",
+      "where": "runner/agentd.js:68",
+      "reason": "事件上行合批的时间窗（吞吐/延迟权衡，属进程内自适应参数）。宿主面能设它但没有对应的语义文档 ⇒ 先登记，别为了让闸门变绿顺手接腿。"
+    },
+    {
+      "key": "ERIX_BATCH_BYTES",
+      "where": "runner/agentd.js:69",
+      "reason": "同上：合批的字节窗，与 `ERIX_BATCH_WINDOW_MS` 成对，二者只下发一个反而制造新的分叉 ⇒ 一起登记、一起接。"
+    },
+    {
+      "key": "ERIX_MAX_PENDING_EVENTS",
+      "where": "runner/agentd.js:75",
+      "reason": "待发事件队列的**背压上限**（F7，防无界增长）。它调小会直接制造丢弃/断连行为，属容量参数而不是功能开关；现网容量决策走 portal 侧（reaper/租约），不给容器 env 一根单独的旋钮。"
+    },
+    {
+      "key": "ERIX_RUN_DATA_TTL_HOURS",
+      "where": "runner/agentd.js:79",
+      "reason": "容器内 `<home>/runs/` 活跃层的 mtime 保留期（崩溃后 resume re-claim 必须落在窗口内）。它是**容器生命周期**的参数（容器重建即空），生命周期策略的真值在 portal（workspace 保留走 `ERIX_WORKSPACE_RETENTION_DAYS`）⇒ 不在宿主下发面。"
+    },
+    {
+      "key": "ERIX_ARCHIVE_TTL_HOURS",
+      "where": "runner/agentd.js:83",
+      "reason": "`<home>/runs-archive/` 的归档 TTL（会话真相的归档层）。归档口径由 `docs/design/conversation-state.md` §5 定，属数据保留策略；要现场可配得连 portal 侧保留策略一起改 ⇒ 单下一根 env 反而是分叉源。"
+    },
+    {
+      "key": "ERIX_HB_OK_PATH",
+      "where": "runner/agentd.js:61",
+      "reason": "容器内文件路径（`/run/station/hb-ok`，健康检查用的落盘哨兵）。路径由镜像布局决定，宿主设了也要镜像里有那个目录 ⇒ 不是配置面，是安装面。"
+    },
+    {
+      "key": "ERIX_PROC_PATH",
+      "where": "runner/agentd.js:64",
+      "reason": "容器内 `/proc` 挂载点（watchdog 读进程存活用）。同上：装机路径，不是旋钮。"
+    },
+    {
+      "key": "FDE_CONTAINER_USER",
+      "where": "runner/agentd.js:56",
+      "reason": "容器内用户名，由 FDE 镜像的 user 布局写死（agentd 拿它拼 HOME）。改它要重建镜像（用户不存在时 drop 权限直接失败）⇒ 上宿主面只会制造「设了但镜像不认」。"
+    },
+    {
+      "key": "FDE_HOME",
+      "where": "runner/agentd.js:57",
+      "reason": "容器内 HOME 路径；bind mount 的**容器侧右值**在 compose 的 volumes 里写死（`<host>:/home/erix/…`，见 materializer/provisioner 的 binds），宿主 env 改这个不会改 bind ⇒ 单改它就是把 agentd 的视角和挂载面拆开。契约里这条路径不是旋钮。"
+    },
+    {
+      "key": "FDE_WORKER_GID",
+      "where": "runner/agentd.js:59",
+      "reason": "容器内 worker 的 GID 由镜像 entrypoint 决定；agentd 这里只是同名兜底。注意 **`FDE_WORKER_UID` 在 compose 里有同名键但消费者是 portal**（见下面那条），GID 侧 compose 没有对应键 ⇒ 登记为「已知不同源」，不是漏抄。"
+    },
+    {
+      "key": "FDE_WORKER_UID",
+      "where": "runner/agentd.js:58；compose 的那一行喂的是 portal/src/config.js:391",
+      "reason": "**同名不同源**：compose `station-portal` 的 `FDE_WORKER_UID` 是 portal 用来算 FDE 容器 `--user`/UID 的（config.js:391），容器内 agentd 的同名读不在 `ENV_KEY_ALLOW` 里 ⇒ 它「在 compose 里」不等于「有三腿」。登记而不是补两腿，因为把 UID 注进容器会改变镜像内既有 UID 契约（#27/#62 那一族）。"
+    },
+    {
+      "key": "ERIX_WORKER_UID",
+      "where": "runner/agentd.js:58",
+      "reason": "`FDE_WORKER_UID` 的**旧名兜底**（`FDE_WORKER_UID || ERIX_WORKER_UID || 1002`）。留它只为兼容旧镜像/旧部署，不是独立旋钮：给它接三腿等于给同一个旋钮开两个名字。"
+    },
+    {
+      "key": "ERIX_WORKER_GID",
+      "where": "runner/agentd.js:59",
+      "reason": "`FDE_WORKER_GID` 的旧名兜底，理由同 `ERIX_WORKER_UID`。"
+    },
+    {
+      "key": "STATION_SKILLS_DIR",
+      "where": "runner/worker.js:678",
+      "reason": "随镜像发布的内置 skills 目录兜底（`/opt/erix/skills`）。skills 是镜像内容不是部署配置（用户自己的 skills 走 userspace bind），上宿主面会让人以为能改镜像里的那棵树。"
+    },
+    {
+      "key": "ERIX_STATION_TOKEN",
+      "where": "runner/agentd.js:48；注入点 portal/src/provisioner.js:414；读侧 helper portal/src/provisioner.js:366",
+      "reason": "**每个 FDE 一份的凭据**，由 provisioner 在 create 时生成并注入（`env: [..., `ERIX_STATION_TOKEN=${token}`, ...]`，`provisioner.js:414`），proxy 已放行。compose 腿不适用：没有「一份共享默认值」可写，写进 compose 反而会把所有 FDE 变成同一个 token。坐标口径（返工核对）：`provisioner.js:366` 的 `readContainerEnv(inspectData, key = 'ERIX_STATION_TOKEN')` 是**读侧**（从 docker inspect 的 Config.Env 里读回来对账 hash），**不是注入点** —— 两者都含这个 key，只有前者能当腿的证据。"
+    },
+    {
+      "key": "ERIX_FDE_NAME",
+      "where": "runner/agentd.js:50；注入点 portal/src/provisioner.js:414（proxy 还额外校验它必须等于路径里的 fdeName）",
+      "reason": "**每个 FDE 一份的身份**，与 `fdeName` 绑死（`fde-proxy/server.js` 的 Env 校验会拒绝不等值的注入）。compose 腿不适用，理由同 token：它是实例属性，不是部署属性。"
+    },
+    {
+      "key": "ERIX_STATION_BASE_URL",
+      "where": "runner/agentd.js:49；注入点 portal/src/provisioner.js:229",
+      "reason": "值由 provisioner 从 `PORTAL_PUBLIC_BASE_URL` **推导**（拼 `/api/internal` + 按 dev/prod 定 scheme/host）。宿主侧的入口是那个键 ⇒ compose 腿的名字与它不同，同名插值不适用（接了就是两个键管一件事）。坐标返工：原登记 `provisioner.js:213` 那一行是 bind mount 的路径拼接，与本键无关（行号漂移，见 `$comment` ⑥）。"
+    },
+    {
+      "key": "ERIX_AGENT_VERSION",
+      "where": "runner/lib/build-info.js:84；注入点 portal/src/provisioner.js:281",
+      "reason": "宿主侧入口是 compose 的 `FDE_AGENT_VERSION`（版本 pin 的真值在 `deploy/.env` / 发版流程），portal 折算后按实例注入 ⇒ compose 腿**换了名字**，不是漏了。#416 那次「注入方加了键、放行方没加」的事故已由本文件的 `ENV_KEY_ALLOW` + 腿② 交叉核对钉住，这里不需要第三条腿。**本条的坐标在返工里被推翻过一次**（值得留着当反面教材）：原先写 `runner/agentd.js`（不带行）+ `provisioner.js:257`，而 `agentd.js:52` 里的 `process.env.ERIX_AGENT_VERSION` 是**注释正文**引用的旧代码（`:54` 的注释自己写了「现在读镜像里烘的 build-info.json」），真读取是 `lib/build-info.js:84` 的 `s(env.ERIX_AGENT_VERSION)`（**别名点号形**，旧扫描器只认 `process.env.` 前缀 ⇒ 扫不出来，注释因此背了书）；`provisioner.js:257` 如今是 #581 新加的 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 那一行 —— 行号合理但内容不对。"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_FIRST_BYTE_MS",
+      "where": "runner/lib/llm-timeouts.js:103；env 名来自数据表 runner/lib/llm-timeouts.js:58",
+      "reason": "issue #261 的四相超时之一（首字节预算）。**这条是返工才扫出来的**：读取点 `env?.[envName]`（`:103`）里**没有 env 名的字面量**，名字来自同文件的数据表 `LLM_TIMEOUT_ENV`（`:57`），旧扫描器只认字面量读形 ⇒ 静默漏扫。三腿全无 ⇒ 与 #557 **同形的已知缺口**，登记为**已知未接**，别读成已修。四项必须**一起接**（只接一项 = 一次 LLM call 的四个预算分叉），接完删掉这四条。"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_STREAM_IDLE_MS",
+      "where": "runner/lib/llm-timeouts.js:103；env 名来自数据表 runner/lib/llm-timeouts.js:59",
+      "reason": "四相超时的流空闲预算（#261）。扫出路径与登记理由同 `ERIX_LLM_TIMEOUT_FIRST_BYTE_MS`（同一次 `env?.[envName]` 读形 + 同一张表），**不许只接这一项**。登记为已知未接，别读成已修。"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_STREAM_TOTAL_MS",
+      "where": "runner/lib/llm-timeouts.js:103；env 名来自数据表 runner/lib/llm-timeouts.js:60",
+      "reason": "四相超时的流总时长预算（#261）。同族登记：见 `ERIX_LLM_TIMEOUT_FIRST_BYTE_MS` 那条的口径，四项一起接。"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_REQUEST_MS",
+      "where": "runner/lib/llm-timeouts.js:103；env 名来自数据表 runner/lib/llm-timeouts.js:61",
+      "reason": "四相超时的整请求预算（#261）；它正是「显式传相 ⇒ 引擎关掉 legacyTimeoutMs 绝对死线」那一条的关键项，改它改的是重放/死线语义 ⇒ 同族登记（见 `ERIX_LLM_TIMEOUT_FIRST_BYTE_MS`），四项一起接。"
+    },
+    {
+      "key": "ERIX_BUILD_INFO_PATH",
+      "where": "runner/lib/build-info.js:55",
+      "reason": "容器内 `build-info.json` 的**路径** override。路径由镜像布局写死（`runner/Dockerfile` 构建期写进 `/opt/erix/build-info.json`，代码默认值就是那个路径），宿主设了也要镜像里真有那个文件 ⇒ 装机面不是旋钮，与 `ERIX_HB_OK_PATH` / `ERIX_PROC_PATH` 同族。它同样是**返工才扫出来的**：读取形是 `readBuildInfo({ env = process.env })` 里的 `env.ERIX_BUILD_INFO_PATH`（别名点号），旧扫描器只认 `process.env.` 前缀 ⇒ 这个键以前根本不在枚举面上。"
+    }
+  ],
+  "unsupported": [
+    {
+      "at": "runner/worker.js:774",
+      "read": "process.env[name]",
+      "reason": "**读形认得、名字解析不出**的动态下标：`name` 来自同一个 `for (const [name, parsed] of [[...]])` 的字面量对数组（三个名字就是 `ERIX_DELEGATE_MAX` / `ERIX_DELEGATE_CHILD_ROUNDS` / `ERIX_DELEGATE_CHILD_TIMEOUT_MS`，见 `runner/worker.js:763-765`，那三行是字面量读形，已经被枚举覆盖，这里只是打日志时回读原值）。扫描器**故意**不解析 for-of 解构配对数组（再写一条形状规则去迎合现存代码 = 判据围着样本转），于是这一处必须留下这条登记 ⇒ 「扫不干净」是花钱的，不是静默的。坐标漂移时判据红，重跑一次更新即可。"
+    }
+  ]
+}
