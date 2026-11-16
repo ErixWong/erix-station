@@ -159,3 +159,62 @@ test('issue #211：装配层入口补一次中止检查（上游 readFile/writeF
     assert.equal(fs.existsSync(path.join(root, 'b.txt')), false, '已中止的 writeFile 不得落盘');
     assert.match(await tools.executeTool('readFile', { path: 'a.txt' }, {}), /1: x/u, '未中止时照常工作');
   }));
+
+// ---------------------------------------------------------------------------
+// issue #259 × #228：**只读例外只放宽 jail 那一项**。
+// #228 定下的接线口径是「喂给上游的 allowRead = 调用方谓词 ∧ ¬遮蔽 ∧ jail 谓词」，例外长在
+// jail 那一项上——它既不能替换调用方谓词，也不能让装配层的遮蔽失效。四种「放宽过头」的形状
+// 各钉一条（外加一条正向对照，否则前四条只是「全都挡」的假绿）。
+// ---------------------------------------------------------------------------
+test('#259 例外只放宽 jail 那一项：调用方谓词与装配层遮蔽照样挡得住例外路径', () =>
+  withTempDir(async (root) => {
+    const home = path.join(root, 'home');
+    const project = path.join(home, 'projects', 'todo');
+    fs.mkdirSync(path.join(home, '.erix'), { recursive: true });
+    fs.mkdirSync(project, { recursive: true });
+    fs.writeFileSync(path.join(home, 'AGENTS.md'), 'platform rules\n');
+    fs.writeFileSync(path.join(home, '.erix', 'ports.json'), '{"allocations":[]}\n');
+    fs.writeFileSync(path.join(project, 'a.txt'), 'project own\n');
+    const exceptions = (h) => [path.join(h, 'AGENTS.md'), path.join(h, '.erix')];
+    const agents = path.join(home, 'AGENTS.md');
+    const ports = path.join(home, '.erix', 'ports.json');
+    const jailFor = (h) => createJail({ root: project, writable: [project], readExceptions: exceptions(h) });
+
+    // ① 正向对照：例外确实放行（读得到，才谈得上后面三条在挡什么）
+    const open = createStationFileTools({ jail: jailFor(home), cwd: project });
+    assert.match(await open.executeTool('readFile', { path: agents }, {}), /1: platform rules/u);
+    assert.match(await open.executeTool('readFile', { path: ports }, {}), /allocations/u);
+
+    // ② 调用方谓词拒绝 ⇒ 例外不得翻它（jail 放宽 ≠ 替换宿主注入的谓词，#228 那条红线）
+    const hostDenies = createStationFileTools({
+      jail: jailFor(home),
+      cwd: project,
+      allowRead: (target) => target !== agents && !target.startsWith(path.join(home, '.erix')),
+    });
+    assert.match(String(await hostDenies.executeTool('readFile', { path: agents }, {})),
+      /^错误：读取被宿主边界拒绝/u, '调用方说不要读，例外不许替它做主');
+    assert.match(String(await hostDenies.executeTool('readFile', { path: ports }, {})),
+      /^错误：读取被宿主边界拒绝/u);
+    // 同一次装配里，调用方**没**拒的路径照旧读得到（证明上面两条拒的是谓词，不是整个工具面坏掉了）
+    assert.match(await hostDenies.executeTool('readFile', { path: path.join(project, 'a.txt') }, {}),
+      /1: project own/u);
+
+    // ③ 装配层遮蔽照样生效，**即使遮蔽项正落在例外目录里**（密钥不能因为开了例外就漏读）
+    const masked = createStationFileTools({
+      jail: jailFor(home),
+      cwd: project,
+      maskedPaths: [ports],
+    });
+    const maskedRead = String(await masked.executeTool('readFile', { path: ports }, {}));
+    assert.match(maskedRead, /^错误：读取被宿主边界拒绝/u);
+    assert.doesNotMatch(maskedRead, /allocations/u, '被遮蔽的内容一字节不许回传');
+    assert.match(await masked.executeTool('readFile', { path: agents }, {}), /platform rules/u,
+      '遮蔽只打那一个文件，不许把整条例外顺带带走');
+
+    // ④ 写侧：例外不参与——jail 写边界（不认例外）与调用方写谓词两道都还站着
+    assert.match(String(await open.executeTool('writeFile', { path: agents, content: 'x' }, {})),
+      /^错误：写入被宿主边界拒绝/u);
+    const writeDenied = createStationFileTools({ jail: jailFor(home), cwd: project, allowWrite: () => false });
+    assert.match(String(await writeDenied.executeTool('writeFile', { path: path.join(project, 'a.txt'), content: 'x' }, {})),
+      /^错误：写入被宿主边界拒绝/u, '调用方 allowWrite=false 不得被例外顺带放宽（例外只管读）');
+  }));

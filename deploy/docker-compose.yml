@@ -201,6 +201,9 @@ services:
       # ⇒ 不写这一行，运维在 deploy/.env 里改 FILE_UPLOAD_MAX_BYTES 根本不生效（评审 major 8）。
       # 默认值与 `portal/src/config.js` 的 `fileUploadMaxBytes` 必须同值（32 * 1024 * 1024 = 33554432），
       # 两头一致性由 `portal/test/deploy-env-defaults.test.js` 机器判据钉住。
+      # ⚠ issue #485 片 A 之后它的角色变了：它是**兜底值**，不再是「改了就生效」的旋钮——真正生效的值
+      #   按 `upload_settings.max_file_bytes`（管理台，迁移 0035）> 本值 > 默认 取，**每次上传现读**。
+      #   改管理台不需要重建 portal 容器；改本值仍然需要（而且会被管理台里已保存的值盖住）。
       FILE_UPLOAD_MAX_BYTES: ${FILE_UPLOAD_MAX_BYTES:-33554432}
       ERIX_ARTIFACT_CAPTURE_BUDGET_MS: ${ERIX_ARTIFACT_CAPTURE_BUDGET_MS:-60000}
       ERIX_SHELL_TIMEOUT_MS: ${ERIX_SHELL_TIMEOUT_MS:-60000}
@@ -235,6 +238,12 @@ services:
       PORT_QUOTA: ${PORT_QUOTA:-40}
       FDE_POOL: ${FDE_POOL:-default}
       IPAM_RESERVED_SUBNETS: ${IPAM_RESERVED_SUBNETS:-}
+      # IPAM **分配器**从哪一段里切（issue #270）。缺省值逐字 = #270 之前 portal/src/ipam.js 硬编码的
+      # 那两段 ⇒ 不设 env 时行为零变化。前缀长度不是旋钮（恒 /29 与 /28，`fde_networks` 的 DDL CHECK 钉的）。
+      # ⚠ 与下面 proxy 的 IPAM_POOLS（**放行面**）是两个变量：分配段必须落在放行面之内，
+      # 否则 `network create` 会被 proxy 拒（reason 里会同时点名两侧变量名）。隔离 e2e 由栈 id 单一派生两头。
+      IPAM_POOL_DEFAULT: ${FDE_IPAM_POOL_DEFAULT:-10.200.0.0/16}
+      IPAM_POOL_LARGE: ${FDE_IPAM_POOL_LARGE:-10.201.0.0/16}
       FDE_USER_UID: ${FDE_USER_UID:-1000}
       FDE_USER_GID: ${FDE_USER_GID:-1000}
       # ---- WP2b：FDE provisioning + preview ticket ----
@@ -254,6 +263,19 @@ services:
       SESSION_SIGNING_KEY: ${SESSION_SIGNING_KEY:-erix-station-dev-signing-key-change-me}
       PREVIEW_TICKET_TTL_SECONDS: ${PREVIEW_TICKET_TTL_SECONDS:-60}
       PREVIEW_SESSION_TTL_SECONDS: ${PREVIEW_SESSION_TTL_SECONDS:-900}
+      # issue #520：三个后台队列循环（开户/销号/对账）的**空闲退避上限**。⚠ portal 的 environment 同样
+      # 是**显式列表、无 env_file**（见上面 FILE_UPLOAD_MAX_BYTES 那条注释）⇒ 不登记这三行，运维在
+      # deploy/.env 里写 `PROVISIONER_IDLE_BACKOFF_MAX_MS=5000` **根本不生效**（PR #552 审计 LOW-1）。
+      # 语义：连续空闲拍按 5000→10000→20000→… 翻倍退避到这里的上限封顶；**认领到活立即回 5000**
+      # ⇒ 这三根旋钮只改「平台没事做时多久问一次 DB」，不改有活时的吞吐与延迟。
+      # 不设 = 用代码缺省（开户/销号 30000、对账 15000）。⚠ **对账那根是硬上限**：写超过 15000 会被
+      # 钳回 15000 并 warn（漂移发现延迟是它的业务承诺，见 `provisioner.js` 的 `resolveIdleBackoffMaxMs`，
+      # PR #552 审计 LOW-2）；开户/销号可以配到共享上限 60000。
+      # 三腿一致性（compose 插值缺省 == 代码缺省常量 == 循环真正生效值）由
+      # `portal/test/deploy-env-idle-backoff.test.js` 机器判据钉住（先例：#472 与 #270）。
+      ONBOARDING_IDLE_BACKOFF_MAX_MS: ${ONBOARDING_IDLE_BACKOFF_MAX_MS:-30000}
+      OFFBOARDING_IDLE_BACKOFF_MAX_MS: ${OFFBOARDING_IDLE_BACKOFF_MAX_MS:-30000}
+      PROVISIONER_IDLE_BACKOFF_MAX_MS: ${PROVISIONER_IDLE_BACKOFF_MAX_MS:-15000}
       # P1：baseline(schema.sql) + bootstrap.sql 由 station-db 首次初始化（db-init/00-init.sh，超级用户）
       # 完成；增量迁移（deploy/migrations/0001-idempotency-keys.sql 提供幂等台账 idempotency_keys，
       # portal.md §1.4）此前需人工补跑 → 本栈**显式启用启动迁移**：portal 在**监听端口前**以

@@ -16,11 +16,17 @@ import * as auth from '../src/auth.js';
 import { parseCidr, intToIp } from '../src/ipam.js';
 // #227.1：removeDbDir 收编进单一来源公共模块（wp2b 是共享栈跑法，用 allowSharedReset 显式声明）。
 import { createDbDirCleaner } from './lib/isolated-env.mjs';
+// issue #495 ①（#412 遗留）：compose 的 `--env-file` 与「等宿主侧物化文件」的失败分类（唯一定义处 lib/e2e-preflight.mjs）。
+import { COMPOSE_ENV_FILE, assertComposeEnvFile } from './lib/e2e-preflight.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 // #227.2：显式 -p 把「我就是要动共享栈 station」写进命令（不再靠 compose 文件 name: 的隐式兜底；
 // 设了 COMPOSE_PROJECT_NAME 则显式改用该 project）。
 const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:-station}" --env-file deploy/.env -f deploy/docker-compose.yml';
+// issue #495 ①：上面命令串固定带 --env-file deploy/.env，而它不入 git ⇒ git worktree / 新 clone 里
+// 必然缺。docker compose 要到**整轮镜像构建之后**才报 couldn't find env file（#412 部署机实测白烧 10.7 分钟），
+// 所以这条预检放在模块加载时——它先于本文件任何一次 docker/compose；文件在场时零输出。
+assertComposeEnvFile({ envFile: COMPOSE_ENV_FILE, cwd: REPO_ROOT, label: 'wp2b-e2e' });
 const PORTAL = 'http://127.0.0.1:18080';
 const TRAEFIK_WEB = 'http://127.0.0.1:8090';
 

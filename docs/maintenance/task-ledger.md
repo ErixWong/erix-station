@@ -5589,3 +5589,1811 @@ LLM 那一段等额度恢复后补跑（不影响本次交付的引擎版本事�
 改后 5/5 绿；超时路径（预算改 0）仍红。
 
 **剩余**：#500（恢复行三件套，1 张新表）/ #501（`loadRawRows`，零 DDL）/ D1（快照死代码退役）不变。
+
+### 8.130 事件平台 W1/W2 落地 + 审计回修：模板总开关、kind/scope 定死、UTC+8 日界（#524/#525，2026-11-16，主 agent + erix_run）
+
+接 §8.128。**W1（数据层）与 W2（评估循环）已合并进 main**，中间夹一次审计回修。
+
+| 单 | PR | 合并 | 执行体 | 轮数 |
+|---|---|---|---|---|
+| W1 数据层（#524） | #542 | `1dfda1d` | `erix_run` | 98（扩轮 1 次） |
+| W1 审计回修 | #547 | `7b6f762` | 主 agent | — |
+| W2 评估循环（#525） | #559 | `6a8958e` | `erix_run` | 65 + 续跑 73 |
+
+**W1 独立代码审计（copilot `gpt-6-luna`/`xhigh`，只读独立 worktree）判「必须修，不建议原样留 main」**，
+四条最小集全部成立，逐条核过代码：
+
+1. **模板总开关是假的**（最硬）：`claimMacroRun` 的资格子句只查 `macro_assignments.enabled`，
+   不查模板 ⇒ **模板 `enabled=false` 或软删后，既有订阅照样能认领、照样执行**。
+   而设计 `07` §2.3 明写「`enabled` 全局开关（关掉 ⇒ 所有订阅一起失效）」。修法：资格子句 JOIN
+   `macro_templates`，同一条 SQL 里同时要求 `t.enabled` 且 `t.deleted_at IS NULL`；
+   顺带把 `until` 也塞进同一条 SQL（`applyExpiredAssignments` 的 UPDATE 与本 INSERT 是两条语句，
+   并发下有「扫完就被改成过期」的窗口）。
+2. **`kind`/`scope` 能改**：`updateTemplate` 白名单里有 `kind` 和 `scope` ⇒ 能把 `run-notify`
+   改成 `run-review`（换语义留旧 params）、`session` 改 `user`。设计「建完不可改」。
+   新增 `KIND_SCOPE`（`scheduled-task`→`user`，其余→`session`）+ `KIND_SCHEMA`（契约 §1 要求的
+   参数单一真源）+ `validateKindParams()`；`name` 上限 200 → 设计写的 **40**。
+3. **`finishMacroRun` 两处可绕过**：`skippedReason !== null` 那句让**显式传 `null`** 绕过
+   「skipped 必带原因」；`UPDATE … WHERE id = $1` 无终态闸 ⇒ **能把 `done` 改回 `running`**，
+   「终态不再推进」只是注释。
+4. 文档残留：`07` §18 两处面板字段表还写 `state`（W1 已拆 `status`+`criterion`）；
+   `05` 的通知模板变量 `{{state}}` 5 处 → `{{status}}`（对齐 `macro_runs.status`，免得 W3 找不存在的列）。
+
+⚠ **旧用例里有 7 处用了设计禁止的形状**（`run-review`/`run-notify` + `scope=user`、
+`params: { tone: 'brief' }`）—— 一律**改成合法 fixture，不是把闸放宽去迁就用例**。
+
+**主 agent 复验口径（这轮定下来的，往后照用）**：不信执行体自报，逐条跑**变异**
+（把闸拆掉 ⇒ 对应用例必须变红 ⇒ 再还原）。本轮共跑 7 个变异：
+W1 的两个（`DO NOTHING`→`DO UPDATE`、幂等键混进 `status`）、W1 回修的五个
+（claim 去模板闸 / 去 `until` 闸、finish 恢复 null 放行 / 去终态闸、恢复 `kind`/`scope` 白名单），
+全部命中。**变异是最便宜的「测试是否真的钉住语义」的判据。**
+
+**W2 的测试缺口就是变异抓出来的**：把 `evalClock` 的 `inTz8(nowMs)` 换成
+`new Date(nowMs).toISOString().slice(0,10)`（UTC 日期）⇒ **原 9 条全绿，一条都没红**。
+原用例只覆盖了「UTC 日期 == UTC+8 日期」的时刻，跨日那一段从未被测。
+补两条（跨日 anchor、跨日「今天已 tick」），复验：变异时 `not ok 10/11` 红，还原后 11/11 绿。
+⇒ **口径：任何「按本地日期分档」的逻辑，用例必须至少有一个 UTC 日期 ≠ 本地日期的时刻。**
+
+**W2 撞到的一个真语义冲突（执行体自己发现并写进注释，判断正确）**：到期意图**不能**用
+`claimMacroRun` —— 它一进来先跑 `applyExpiredAssignments`（把 `until<=now` 的订阅置
+`enabled=false`），而资格谓词要求 `a.enabled` ⇒ 对「刚过期」的订阅**资格已被自己抹掉**，
+claim 必返回 `null`，到期意图永远产不出。⇒ 走 `claimExpiryRun`（同一幂等键、
+同样 `ON CONFLICT DO NOTHING`，不带 `enabled` 谓词）。这是对契约 §2.1「claim 只在 W2 调」的
+一处必要偏离，理由记在代码注释里。
+
+**执行体两次撞 `max_rounds_cap` 的教训**：W2 的续跑（只补两条测试）在 73 轮撞上限被强制收尾，
+**变异代码还留在工作树里没还原**（`git status` 能看到 `[MUTATION]` 标记）。
+⇒ 续跑时也**必须给 `maxRounds` 与 `maxExtensions`**（我漏了，用了默认 8 轮 + 0 扩轮）；
+⇒ 接手前先 `git status` / `git diff` 看有没有残留的变异或半成品。
+
+**待办**：W3（通知 + HTTP API，#526，在跑）、W4a（#537）、W4b（#538）、W7（#536）、W5/W6。
+
+
+### 8.131 前端 `emitted()` 环境地板拆掉，并加静态闸 H3（issue #496 / 工单 fix-261115-05，2026-11-15，worker 落地 + 主 agent 亲验）
+
+**为什么不是一次性修完就完事**：`@vue/test-utils@2.5.1` 的 `emitted()` 取事件靠 **Vue devtools
+hook**，Vue 只在非生产构建里发 devtools 事件 ⇒ 本机 shell 默认 `NODE_ENV=production` 时它**恒空**。
+`AGENTS.md` §4 那句「新用例别用 `w.emitted()`」写于 11-11，**11-14 的 `2e40214` 又带进来一处**
+（`useEventStream.spec.ts`）⇒ 文字纪律拦不住扩散，本单把它换成**能跑的判据**。
+
+**改了什么**
+- 观测方式：`wrapper.emitted(ev)` → 「父级回调收 + 渲染进宿主 DOM + 断言渲染文本」
+  （新增 `mountBadgeHost` / `mountPanelInHost`）。**产品代码零改动**，`prefill` / `refresh` /
+  `files-changed` 的事件契约照旧。
+- 顺带修一条**假判据**：`expect(text).not.toContain('synced')` 里 `synced` 是状态词，
+  预填文案（`gitLight.prefill.finish` 只插 `{repos}{more}`）根本不出现它 ⇒ 改成钉已收工仓库的
+  **名字** `p1`，脏名单漏进来才会红。
+- 静态闸 **H3** 进 `test/repo-hygiene.test.js`（与 H1/H2 同文件同形）：只扫 **git 跟踪的**
+  `portal/frontend` 下 `*.spec.ts`，匹配**带点调用形状** `\.emitted\b`（散文里写「别用 emitted()」
+  不拦、写成调用就拦）；四道防空转自证：清单 ≥ 40 个 spec、顶层 `src/router.spec.ts` 必须在清单里
+  （拿 `src/**/*.spec.ts` 当 git pathspec 会漏它）、注入一行调用必须恰好命中 1 处、注入散文零命中。
+
+**主 agent 亲验读数**（树 `wt-496-261115` @ `fix-261115-05-496-emitted-floor`）
+- 前端四个 spec：`NODE_ENV=production` 与 `env -u NODE_ENV` **两个方向都 212/212、rc=0**；
+  `npm run typecheck` rc=0。
+- 根 `npm test`：2357 项、唯一红是 `portal/test/env-int-strict-506e.test.js:197`
+  （`ROUTE_IDLE_BACKOFF_MAX_MS='10000abc'`，断言「循环必须停在某一拍的 sleep 上」），
+  **单独复跑两次 17/17 rc=0** ⇒ 本批四张并行造成负载假红，与本单无关。
+- 我自己补做的变异（不采信 worker 自报的 5/5）：往被跟踪的 `portal/frontend/src/router.spec.ts`
+  追加 `wrapper.emitted('files-changed')` ⇒ `not ok 3 - H3 …`、rc=1；还原 ⇒ rc=0（3/3）。
+
+**撞号提醒**：本批四张单都从 `c8613a3` 起跳，各棵树里台账最大号都是 8.126，8.127 很可能被同时
+取用 ⇒ **合并时先合者保留原号，后者 +1 并在节内注明原号**。
+
+**worker 侧过程记**：首轮在 30 分钟默认时间闸内做完了代码与变异、没来得及写台账
+（`2f4bab5` + 未提交的 `test/repo-hygiene.test.js`）；`resume` 续跑一次遇模型空响应
+（`produced no output`）⇒ 收尾（commit + 本节台账）由主 agent 完成，符合 §3.0
+（git 流程操作与文档维护本就属主 agent）。
+
+**copilot 二次审计与 H3 加固**（同工单 fix-261115-05 的续作，2026-11-16，worker 落地）
+
+**审计那条 MED 属实**：加固前判据只有 `\.emitted\b` 一支（原 `test/repo-hygiene.test.js:86-99`），
+而 `wrapper['emitted'](...)` 与 `const { emitted } = wrapper` 一样吃 Vue devtools hook、在生产构建下
+同样恒空，只是躲得过点号；反向自证又**只注入点号那一种形状** ⇒ **H3 能在假绿状态下通过**
+（审计原话：*the canonical injected probe does not test those forms*；给出的绕过法就是 bracket
+access 与 destructure/alias）。**扫描面本身没问题**（`git ls-files -- portal/frontend` 递归 +
+`.spec.ts` 过滤是 vitest `include` 的超集），漏的是**匹配面与探针面**。
+
+**加固成了什么**（提交 `6c018d1`）
+
+- 一支 → 三支 `EMITTED_SHAPES`，各带名字：① 点号 `.emitted`（含属性读 `wrapper.emitted`）
+  ② 方括号 `['emitted']` / `["emitted"]` ③ 解构取走 `{ emitted }` / `{ emitted: 别名 }` /
+  `{ a, emitted }`，外加跨行解构里单独占一行的成员 `emitted,`。解构拦的是**取走这件事本身**——
+  取走之后怎么调都追不住，所以不追调用点，直接把取走钉死。
+- 命中行改成带 `[形状名]`；反向自证从「注入一次点号」改成**逐形状 7 条注入**（点号 2：调用 + 裸属性读；
+  方括号 2：单引号 + 双引号；解构 3：裸取 + 带别名 + 跨行），每条要求 ①恰好命中 1 处
+  ②命中在被改的那份上 ③**命中标注的是这一支**（只验「命中了」证明不了是哪种形状认出来的）。
+- 新增覆盖率闸：`EMITTED_SHAPES` 里每个名字都必须有注入探针 ⇒ 以后加形状忘了配探针 = 直接红。
+- 散文探针（反向自证 B）保留并加到两句，仍要求**零命中** ⇒ 仓库现存 14 处「别用 emitted()」的
+  注释正文（分布在 8 个 spec，一处真调用都没有）全没红。**拦的是形状，不是单词**。
+- 范围照原口径不动：不钉 `fire()` / `vm.$emit` 等其它读事件方式；产品代码零改动。
+
+**加固后的读数**（本树实测，`NODE_ENV=production`）
+
+- 判据自身：`node --test test/repo-hygiene.test.js` **3/3、rc=0**；根 `npm test` **2357 项 0 红 14 跳**。
+- 真盘变异（往被跟踪的 `portal/frontend/src/router.spec.ts` 追加一行，跑完还原）**六条全 rc=1**，
+  且各标自己那一支：`wrapper.emitted('files-changed')`→`[点号]`、`wrapper['emitted'](...)`→`[方括号]`、
+  `wrapper["emitted"](...)`→`[方括号]`、`const { emitted } = wrapper`→`[解构]`、
+  `const { emitted: fired, find } = wrapper`→`[解构]`、跨行 `const {⏎ emitted,⏎} = wrapper`→`[解构]`；
+  散文对照 `// 别再写 emitted() 这种调用（#496）` **rc=0**。
+- 「探针非空转」再自证一层：把三支正则逐个换成永不匹配的字面量 ⇒ 各自 rc=1 且报的是**对应注入探针**
+  （`注入 方括号 形状 … 实际 0 处`），三支**都不是空支**；再凭空加一条没有探针的形状 ⇒ rc=1
+  报「有形状没有对应的注入探针」。
+- **已知代价（有意接受，与点号那一支同口径）**：把形状**写进注释**会红——实测
+  `// 也别写 { emitted } 这种解构（#496）` rc=1。改措辞即可（散文写 `emitted()` 不拦）。
+
+**过程记**：这轮派单**正文是空的**（`Task:` 后无字），素材 `/tmp/h3-finding.md` 在派单那一刻还没落盘。
+worker 起手没干等：先查证仓库状态（分支已 3 提交、PR #532 已开、H3 基线 3/3 绿、前端 spec 里
+14 处 `emitted` 散文的现状），收到 steering 后补读素材直接接上。⇒ **派单前 `test -r` 一下素材文件**是便宜的保险。
+
+**自证时又抓到一条同族绕过（已补，提交 `31d8387`）**
+
+加固第一版留着一个洞，是我按形状逐条做真盘变异时撞出来的（不是审计提的）：
+
+```js
+const {
+  find,
+  emitted        // 末位成员、行尾没逗号、`}` 在下一行 —— 加固第一版 rc=0 放过去了
+} = wrapper;
+```
+
+行级判据的前两条支都要求**同一行**里 `emitted` 后面跟得上 `,` `}` 或 `:`，而这一行整行就一个
+`emitted` ⇒ 看不见。补第三条支 `^[ \t]*emitted[ \t]*$`（整行只有这个标识符 = 跨行解构的成员位），
+并配一条注入探针钉住 ⇒ 注入探针共 **8 条**。补完该变形 **rc=0 → rc=1**（标 `[解构]`）。
+
+**订正上面那句「根 npm test 0 红」**：加固后再跑一次根 `npm test`，2357 项里出现 2 红，都在
+`portal/test/env-int-strict-506e.test.js` 的「循环必须停在某一拍的 sleep 上」（routes③）——
+**单跑两次各 17/17 rc=0**，当时机器 load 11.1（同机在跑一个 copilot 审计）。就是本节上面记过的
+**负载假红**，与本单无关（本单只改静态扫描，不碰时序）。⇒ 「0 红」是本树低负载时刻的读数，
+**别当恒真**；引用它的人请按「单跑绿 + 负载假红」理解。
+
+**仍未覆盖（有意留下的边界）**：`const K = 'emitted'; wrapper[K]()` —— 字符串提到别的行再取，
+行级判据追不住；要拦它得扫字符串字面量（会牵连一堆无关的 `'emitted'` 文本），超出本单口径。
+
+**返工：H3 把注释当成了代码（同单返工，261116，worker 落地 + 提交 `2fdac48`）**
+
+> 号数说明：本节在本分支是 **8.127**，按上面「撞号提醒」在十单合并树里落到 **8.131** ⇒ 这段是
+> 追加进**同一节**（没改号、没另起节）。它**订正**本节那句「已知代价：把形状写进注释会红」——
+> 那条代价今天被证明不是可接受的代价，见下。
+
+**现场（主 agent 在合并树跑出来的，不是负载假红）**：最终树根 `npm test` 只红一格
+`not ok 2527 - H3 …`，指向 `portal/frontend/src/components/StreamPanelTextualizedNotice.spec.ts:16`
+`[点号]`，而那一行是 #555 那份 spec 的**文件头注释**：
+`* ⚠ 口径：本文件**不用 \`w.emitted()\`**（本机 \`NODE_ENV=production\` 会让它恒空 ⇒ 假绿）…`。
+**那份 spec 写得完全正确**（只用 DOM 断言，还特意留了一句说明）⇒ 闸指着的是**一句真话**。
+
+**为什么修闸而不是改注释**：这条闸的语义是「**代码**里不许取走 `emitted()`」。改措辞绕过 ⇒ 下一个
+想在文件头写「本文件不用 emitted()」的人再被撞一次、拿到的仍是一条指着真话的红 ⇒ 学会「文件里别写
+这条口径」= **反向教育**。所以派单写死「不许改 `portal/frontend/**` 里任何 spec 的措辞」，本单
+只动 `test/repo-hygiene.test.js`（`git status --porcelain -- portal/frontend` 全程为空）。
+
+**改了什么**
+- `stripComments()`：扫描**前先剥块注释**（含 JSDoc，跨行）**再剥行注释**，然后才跑点号/方括号/解构
+  三个匹配器。剥法是**等长空格替换** ⇒ 行数与列位不变，命中报告里的 `path:16` 还能跳到位
+  （判据①顺手钉住「剥注释不许改行数」）。
+- **不是**「整行含 `//` 或 `*` 就放过」，也**不是**两条正则 pass：
+  一趟字符扫描一次定死三种优先级（块注释里不认行注释起点、行注释里不认块注释起点、字符串/模板字面量
+  里两者都不认）。pass 版的三个坑都在**吞真代码**（假绿方向）：行注释里写 glob 的「斜杠星」、块注释
+  正文里写 URL、以及注释正文里夹的**反引号**（真实误报那句就有）。另两处刻意保守：块注释到文件尾
+  没闭合 ⇒ 判它假的、原样退回不剥；普通单/双引号串撞见换行就地收尾 ⇒ 游离撇号不会把后半篇当字符串。
+- 判据**加两格**（`test/repo-hygiene.test.js`，两格必须成对读：只过① 可能只是规矩被废了）：
+  ① `H3-①` 同款形状的那句注释（JSDoc 内、行首 `*`、正文夹反引号、里面写着 `w.emitted()`）**不报**；
+  ② `H3-②` 同一份夹具把那一句换成真代码 `const e = w.emitted('x');` **必须报**且标签仍 `[点号]`，
+  四种写法各钉一次：原地替换 / 行尾还跟注释（专杀「整行放过」偷懒）/ URL 串在前（字符串里的两斜杠
+  不是注释起点）/ 注释位与代码位共存（注释一处都不许多算）。
+
+**读数**（树 `wt-496-261115` @ `fix-261115-05-496-emitted-floor`，本机 shell 默认 `NODE_ENV=production`）
+- 判据自身：`node --test test/repo-hygiene.test.js` → **5/5、rc=0**（原 3 格 + 新 2 格）。
+- 变异一：**撤掉剥注释**（`f.text` 直接扫）⇒ `not ok 4 - H3-① …`，报的就是今天那句原文
+  （`H3CommentFixture.spec.ts:3 [点号] * ⚠ 口径：… \`w.emitted()\`…`）⇒ 假阳性复发，rc=1；
+  （同一发里 `not ok 5 - H3-②` 也红，因为②的第四种写法让注释多算了一处 ⇒ 2 处 ≠ 1 处，属预期连带。）
+- 变异二：豁免做成「整行含 `//` 或 `*` 就放过」⇒ `not ok 5 - H3-② …`，
+  `真代码后面还跟着行尾注释 ⇒ 应恰好命中 1 处，实际 0 处`（`0 !== 1`），rc=1；`H3-①` 那发**仍绿**
+  ⇒ 两格合起来证明「豁免的是注释，不是这条规矩」。两发都跑完还原，`grep -rn MUTANT test portal` = **0**。
+- **真盘回放**（不是只测夹具）：把 #555 那份 spec 原文从 `wt-243-261115` 拷进来、`git add` 让它进
+  扫描面（H3 只扫 git 跟踪的文件）⇒ 闸 **5/5 rc=0**（今天的红没了）；再在同一份文件末尾追加一行
+  `const _probe = w.emitted('x'); // 行尾还有一句说明` ⇒ `not ok 3 - H3 …` 且报
+  `…StreamPanelTextualizedNotice.spec.ts:230 [点号] const _probe = w.emitted('x');`（行尾注释被剥、
+  代码没被放过、行号对得上）。回放完 `git rm --cached --force` + 删文件，`portal/frontend` 零改动。
+- 门禁一：`timeout 300 node --test test/repo-hygiene.test.js` → **5/5、rc=0**；根 `npm test` 里也钉住了
+  （`ok 2355`…`ok 2359`，含新的 ①② 两格）。
+- 门禁二（根 `timeout 1500 npm test`，**环内先踩到一个坑**）：第一发 **860 项 / 113 红**，红因是
+  `ERR_MODULE_NOT_FOUND: Cannot find package 'erix-agent'` —— 查 `node_modules` 发现**本 worktree 的
+  依赖树是空的**（`ls node_modules | wc -l` = **0**，而 `wt-495` / `wt-243` / `wt-514` 三棵树都是 17 项
+  含 `erix-agent`）⇒ 就是 H1 那段讲的共享树被刷干净。按 AGENTS.md 的口径 `npm ci --prefer-offline`
+  修环（**没改依赖、没改 lockfile**：前后 sha256 前缀都是 `67fcd574d3199b11`，`git status` 只见台账）。
+- 门禁二（修环后）：**2359 项 / 1 红 / 14 跳**，唯一红格是
+  `not ok 183 - #routes③ ROUTE_IDLE_BACKOFF_MAX_MS 其它前缀形状 …`（`portal/test/env-int-strict-506e.test.js:206`，
+  `循环必须停在某一拍的 sleep 上`）⇒ **正是派单点名的 #531 负载假红族**（`env-int-strict-506e`）。
+  定性读数：**单跑那个文件两次都是 17/17、rc=0**；**没动那些夹具**（本单只改静态扫描，不碰时序）。
+- `npm run check:agents-hotlayer` rc=**0**（热层 18706 / 预算 19456；台账条目 127 个、无重复编号）。
+- `deploy/.env` 本树**不存在**（只有 `deploy/.env.example`）⇒「保持未跟踪」天然满足；`git status` 全程
+  只出现本单改的两个文件。
+
+**仍然没覆盖（追加到本节那条残留边界旁边）**：正则字面量不进状态机 ⇒ `/a/*b/` 这类写法若后面还碰得上
+一个真块闭合，中间那段会被误剥（假绿方向）；加上原有那条 `const K = 'emitted'; wrapper[K]()`，
+两支都属「行级判据追不住」，要拦得扫整棵 AST，超出本单口径。
+
+
+### 8.133 缓冲逐出活跃 run：从「只有日志」到「`/healthz` 有读数 + 文档显式接受」，并实测出工单漏掉的第二种后果（issue #515 / 工单 fix-261115-11，2026-11-15，worker 落地）
+
+> 编号由主 agent 统一分配（本批并行）。
+
+**工单是怎么进来的**：派给 worker 的派单正文**丢了**（工具只收到 `Task:` 空串），唯一线索是 worktree 分支名
+`fix-261115-11-515-evict-active`。worker 没猜，而是从分支名 → `docs/api/portal.md` §5.1 那条 #515 注记 →
+GitHub issue #515 原文，把三选一的**代价各自现验了一遍**再来要裁决。三条选项的代价都是**查出来的**不是估的：
+①「把容量与 portal 级 active-run 硬上限绑定」= portal 今天**根本没有**那种硬上限（认领是
+`FOR UPDATE SKIP LOCKED` 一条条来，并发只受 runner 数量与会话租约约束），且 `maxEntries` **没接 config/env**
+⇒ 做 ① 等于在本单里顺手造一个调度级闸门；② 完整版（新增宿主诊断事件）要动 SSE 白名单 + 前端 +
+`event-surface-contract.test.js` 的豁免表；③ 纯文档。**裁决 = ② 轻量版（把已有的 `stats()` 挂到既有
+`/healthz`）+ ③ 同做**；① 与 ② 完整版都留后续单，不在本单预支。
+
+**worker 的一条实测纠正了工单正文**（这是本单最有价值的部分）：工单写「被逐的 run ⇒ `runEndPartialKeys`
+读到空槽 ⇒ 写不出 `partial_text`」，但**这只在逐出后该 run 不再吐字时成立**。槽位在后续碎片到达时会被
+**重建成 blank entry**，于是终态写出的是**一段从中间起笔的尾巴冒充整段**，并且：
+
+| 键 | 逐出前 | 逐出后重建（实测值） | 后果 |
+|---|---|---|---|
+| `text` / `partial_text` | `第1个run的前半段正文` | `后半段` | 前半段永久丢，**且没有任何标记说明它是尾巴** ⇒ 历史投影**不出**占位项 |
+| `round` / `partial_round` | `1` | `null` / `0` | 轮号谎报成第 0 轮 |
+| `roundSeq` | `101` | `null` | §4.4a 补发判据「run + `roundSeq` 两端都匹配才覆盖气泡」⇒ **整帧丢弃**，重连也补不回 |
+| `chunks` / `textSegment` | `1` / `1` | `1` / `0` | 代际号回落 ⇒ 前端按「过期一代」忽略（水位线不倒退，但也补不回来） |
+
+⇒ **尾巴比缺字段更坑**：缺字段会出中性占位项，尾巴是「看着完整、其实从半句开始」。这条被定为**独立的正确性
+问题**（主 agent 另开单跟，不在本单修），本单只把它**钉成现状测试**。
+
+**现验到的可观测面事实**（裁决成立的前提，全部现查）：
+
+| 事实 | 读数 / 出处 |
+|---|---|
+| 缓冲上界 | `PARTIAL_MAX_ENTRIES_DEFAULT = 32`（内存槽上限：单 entry 两路各 16,384 字符 ≈ 64 KB ⇒ 全表 ≈ 2 MB）；**不是并发上限** |
+| 逐出计数是否对外可读 | 改前**不可读**：`stats().evictedActive` 只在内存，`grep -rn metrics portal/src` = **0 命中**（portal 无 `/metrics`）⇒ 只能翻 `log.warn` |
+| 容器健康检查的真实判据 | `deploy/docker-compose.yml:267` = `["CMD","node","portal/src/cli.js","healthcheck"]` → `cli.js#healthcheck` `fetch /healthz` → **只看 `res.ok`，不解析 body** |
+| 容器健康日志里到底有什么 | `docker inspect -f '{{json .State.Health}}' station-portal` → `Status=healthy`、`FailingStreak=0`、`Log[].Output = "ok\n"`、`ExitCode=0`（**body 根本不进判据**） |
+| `/healthz` 的全部消费方 | `cli.js#healthcheck`（`res.ok`）、6 个 `portal/integration/*.mjs`（一律 `?.status === 200`）、`deploy/README.md:36`（`curl -o /dev/null -w '%{http_code}'`）⇒ **没有一个解析 body** |
+
+**改了什么**（`②` 的形状红线：只多一块，别的都不许多动）：
+
+| 文件 | 改动 |
+|---|---|
+| `portal/src/http.js` | 新增导出 `partialBufferHealth(buffer = partialOutputs)` → `{ entries, maxEntries, evictedActive }`；`/healthz` 与 `/api/health` 的 **200 分支** additive 带上这块。**`status` 语义不变、503 分支逐字不变、405 不变、不新增端点与鉴权面**；`stats()` 抛异常 ⇒ 省略该键（观测面不承重，不许把 readiness 端点打挂成 500） |
+| `portal/test/healthz-partial-buffer.test.js` | 新增 9 条（含主 agent 追加要求的那条「钉**今天的真实行为**」复现） |
+| `docs/api/portal.md` §5.1 | #515 那条注记**按实测重写**：裁决结果与理由（含 ① 不做的理由）、**两种形态**的后果、N=32 的来源（内存槽上限≠并发上限、且不接 env）、与 #502 已接受损失的边界（不许互相豁免） |
+| `docs/design/deploy-contract.md` §2.3 | 加一条口径：**健康检查判的是状态码/退出码，不是响应体** ⇒ additive 加键结构性安全；但状态码语义与 503 信封不许为观测目的改动 |
+
+**刻意不做的一件事**（worker 提出、主 agent 认了并写进文档）：**不**借用 `persistence_capability_degraded`
+当逐出信号 —— 那个事件类型是**引擎发射**的（`orchestrator.js`，`docs/api/portal.md` §5.3 第 20 类），
+portal 拿它说自己的事 = **谎报发射方**。工单原文把 ② 写成「`persistence_capability_degraded` 或专用诊断」，
+照抄就会踩。
+
+**判据与读数**（`portal/test/healthz-partial-buffer.test.js`，`timeout 240 node --test <文件>` ⇒ **rc=0，9 pass**）：
+逐出 ⇒ `/healthz` 的 `evictedActive` **严格 +1**（不是「大于 0」的钝断言）；`/healthz` 与 `/api/health`
+同一条 handler ⇒ body 逐字相等；块内**只有三个整数**（断言 JSON 里不含 run id、不含正文片段——健康端点的
+响应会被人整段贴进日志）；`stats()` 抛异常 ⇒ 省略键但仍 200；503 的 body **逐字**仍是
+`{error:{code:'migration_failed',message:'not ready',retryable:false}}`；非 GET 仍 405；
+`maxEntries` 缺省仍是 32 —— 这条连**字面量写法**一起钉（`assert.match(src, /export const PARTIAL_MAX_ENTRIES_DEFAULT = 32;/`）
+⇒ 改成 env 注入或改数都会红，逼改动者回来写理由。
+
+**四道变异自证**（每道都必须红，否则判据是空的）：
+
+| 变异 | 结果 |
+|---|---|
+| 撤掉 `/healthz` 的块（`pb = null`） | rc=1，3 fail |
+| `PARTIAL_MAX_ENTRIES_DEFAULT` 32 → 8 | rc=1，5 fail |
+| 逐出了但不计数（`evictedActive += 0`，回到「静默」） | rc=1，3 fail |
+| **不逐活跃 run**（`evictOne` 全活跃时直接 `return`，= 未来那个修复的形状） | **rc=124 挂死，不是变绿** |
+
+最后那道是白捡的事实：`observe()` 与 `stage().commit()` 里都是 `while (entries.size >= maxEntries) evictOne();`
+⇒ **一条都逐不掉时那是死循环**。所以后续做 ①（结构上排除逐出）时**不能只在 `evictOne()` 里 `return`**，
+得改那两处 `while`。已写进 §5.1 的注记给后续单当地基。
+
+**`/healthz` 前后对比**（同一台机、同一条命令）：
+
+```
+改前（现网容器 station-portal，经 127.0.0.1:18080 与经 Traefik 边缘都是这个）
+  {"status":"ok"}
+改后（本 worktree 起服务，新代码）
+  {"status":"ok","partialBuffer":{"entries":0,"maxEntries":32,"evictedActive":0}}
+compose 原文那条命令 `node portal/src/cli.js healthcheck`：改前 rc=0、改后 rc=0（两次都打印一行 `ok`）
+```
+
+**门禁**：仓库根 `npm test; echo rc=$?` ⇒ **rc=0**，`# tests 2365 / # pass 2351 / # fail 0 / # skipped 14`
+（基线同机同树：**2356 / 2342 / 0 / 14**，本单净增 9 条用例、零回归）。
+`npm run check:agents-hotlayer` ⇒ **VERDICT ok**（热层 18706 / 预算 19456；台账 126 个条目无重复编号）。
+
+**三条可复用的教训**：
+1. **派单正文丢了也能干活，但只许走「证据链」不许走「猜」**：分支名 → 文档注记 → issue 原文 → 现验代价 → 回来要裁决。
+   本单如果没有这一步，就会照抄工单把 ② 实现成借用引擎的事件名。
+2. **「钉今天的真实行为」比「钉期望行为」难写但值钱**：那条尾巴用例现在是后续单唯一的地基 —— 它会在
+   有人真去修「尾巴冒充整段」时**变红**，逼他回来改 §5.1 的口径，而不是让修复悄悄改掉契约。
+3. **`NODE_ENV=production` 会让 `cli.js healthcheck` 假红**（本机 shell 默认就是 production）：
+   `loadConfig` 会先因 `FDE_IMAGE 必须为 … 不可变引用` **抛异常**，跑不到 fetch 那一步，报的是 rc=1 ——
+   跟 `/healthz` 一点关系没有。口径：手工跑那条命令要带 `FDE_DEV_MODE=1`（AGENTS §4 那条前端假红是同一个坑的另一直态）。
+
+**未尽项**：① 与 ② 完整版都另单；「尾巴冒充整段 + `roundSeq=null` ⇒ 补发整帧丢弃」另单（主 agent 开）；
+`/healthz` 在 `docs/api/portal.md` §0.1 端点清单里**本来就没有一行**（清单只覆盖 `/api/*`），本单没补那行，
+形状口径写在 §5.1 注记与 deploy-contract §2.3 两处；issue #515 待本分支合并后关单。
+
+
+### 8.134 IPAM 分配段参数化：#227③ 要的「并行不撞池」到 #270 才真能分——因为 baseline DDL 把「池名 ↔ 段」钉死了（issue #270 + #227③ / 工单 fix-261116-02，2026-11-16）
+
+> 编号由主 agent 统一分配（本批并行）。
+
+**一句话**：portal 的 FDE 网络池以前是 `portal/src/ipam.js` 里硬编码的两个字面量，e2e 想让两套隔离栈
+不撞池只能「派生段 + `10.201.0.0/16` 两段一起塞给放行面」——那第二段就是撞车本身。#270 把分配段开成
+env 旋钮、#227③ 把两腿收成一次派生；过程中挖出真正的硬约束：**baseline DDL 把 `pool='large'` 钉在
+`10.201.0.0/16` 里面**，所以「换一段新的 /16」这个看起来最自然的方案从来没生效过（也永远生效不了）。
+
+**三条病根**（前两条是工单写的，第三条是现查挖出来的，它改了做法）：
+
+1. 分配器硬编码：`POOLS = { default: 10.200.0.0/16 /29, large: 10.201.0.0/16 /28 }`，`FDE_POOL` 只能
+   选池名，段不可配。
+2. 两腿两处写：portal 的**分配段**与 fde-proxy 的**放行面**（`IPAM_POOLS` ← 宿主 `FDE_IPAM_POOLS`）是
+   两个模块各自的账，谁都不检查对方 ⇒ 「分配得到、`network create` 被拒」只能在 provision 期撞见。
+3. **baseline 的 CHECK 才是天花板**：`docs/data/schema.sql` §9 `fde_networks` 有
+   `CHECK ((pool='default' AND prefix_len=29 AND subnet::inet << inet '10.200.0.0/16') OR
+   (pool='large' AND prefix_len=28 AND subnet::inet << inet '10.201.0.0/16'))`，而 baseline 是**冻结件**
+   （改它 ⇒ `00-init.sh`/runner 记的 sha256 失配、拒绝启动），`deploy/migrations/` 里没有任何迁移碰过
+   `fde_networks`（现查：`grep -rln fde_networks deploy/migrations/` 空）。
+   ⇒ #227.3 派生出来的 `10.229.0.0/16` 那族**从来没被真的分配过**，它只在放行面里当装饰；
+   portal 始经从 `10.201.0.0/16` 池头分第一个 /28 ⇒ 两套并行隔离栈必撞。这就是当初只能「两段兜底」的
+   真实原因（当时的交付把它记成「portal 侧非 env 可配」，没写**为什么不能**可配）。
+
+**改法**（提交 `3958163` → `1d47dad` → `cb22eee`）：
+
+- **portal 侧**（`portal/src/ipam.js`）：`DEFAULT_IPAM_POOLS`（= 改前那两个硬编码字面量，逐字不动）+
+  `IPAM_POOL_ENV_KEYS`（`default ⇒ IPAM_POOL_DEFAULT`、`large ⇒ IPAM_POOL_LARGE`）+
+  `resolveIpamPools(env)`；`POOLS = resolveIpamPools()`。宿主侧走 `FDE_IPAM_POOL_DEFAULT` /
+  `FDE_IPAM_POOL_LARGE`（compose 去前缀下发，沿用仓内 `FDE_* → 服务 env` 风格）。
+  刻意**不叫** `FDE_POOL_POOLS`（issue 正文的示例名）、也刻意**不复用** `FDE_IPAM_POOLS`：后者是
+  `network create` 的放行闸门，一个名字背两个语义 = 第二本账必然过期。
+- **启动期四条硬判据**（不学 `parseInt('1e4')===1` 那族静默按半个值生效，见 §8.126.6 同型事故）：
+  ① 整串必须匹配 `<d.d.d.d>/<前缀>`；② 八位组 ≤255、前缀 ≤32；③ **规范网络地址**（`10.201.0.7/16`
+  直接拒——`parseCidr` 会静默 mask 成 `10.201.0.0/16`，最典型的「半个值生效」）；④ 段必须整体落在该池的
+  DDL 保留段内、且池前缀不得比分配前缀更长（否则池里切不出一块）。全部点名是哪个键，`err.code =
+  ipam_pool_env_invalid`。脏值不许活到 provision 才在 INSERT 上撞 23514。
+- **`prefixLen` 我判断**不**开成旋钮**（工单把这条交给我判断，理由记这儿）：① e2e 只需要换段；
+  ② 上面那条 CHECK 把 `default↔29`、`large↔28` 钉成死对，开前缀旋钮 = 开一个「一改就被 DB 炸」的假旋钮；
+  ③ 别为将来预支结构复杂度（`<cidr>:<前缀>` 只是多一个能写错的格子）。⇒ 值形态就是单个 CIDR。
+  同理「段归属」也做成硬判据，所以第 3 条天花板在代码里是**可见的**，不是口头约定。
+- **proxy 侧**（`deploy/fde-proxy/server.js`）：deny reason 从只报 subnet 改成同时点名两侧变量名
+  （`IPAM_POOLS`/`FDE_IPAM_POOLS` 与 `IPAM_POOL_DEFAULT`/`IPAM_POOL_LARGE` 及宿主侧 `FDE_` 版）——
+  本单最典型的失效形状就是「只改一头」，只报 subnet 会逼人去翻两份 env。
+- **e2e 侧**（`lib/isolated-env.mjs` + 五支 wp + `isolation-negative.mjs`）：
+  `deriveFdeIpamPools()` 改派**保留段内的子段** `10.201.(1 + n%99).0/24`（第三段 1–99，刻意跳过 0：
+  那是共享栈若用 large 池时第一批会分到的位置）；新增 `deriveStackIpamPoolEnv(栈 id)` /
+  `applyStackIpamPoolEnv(env)` **一次派生喂两腿**（`FDE_IPAM_POOLS` 与 `FDE_IPAM_POOL_LARGE` 同值，
+  显式传入优先），五支 wp 里旧的三行「只注入放行面」全删；`defaultFdeIpamPools()` 从「两段」收紧成
+  「只有派生段」；护栏 `assertIsolatedEnvironment()` 两腿都判（放行面仍是隔离族 + 拒共享段，另加
+  CIDR 合法性/规范地址；分配段必须被 portal 自己的解析器接受 = 落在 DDL 保留段内、必须是保留段的
+  **真子段**、必须被放行面覆盖），分配段进必需 env 清单；护栏拿的是 `portal/src/ipam.js` 的
+  `resolveIpamPools`（`lib` 直接 import portal 源码有先例：`lib/ports-reconcile.mjs` import
+  `src/previewpool.js`）⇒ 护栏红 = 容器也会同样红，不存在第二份 CIDR 判据。
+- 文档：`docs/env.md` §10.1 登记两个新旋钮并把 `FDE_IPAM_POOLS` 那行明写成「放行面 ≠ 分配器」；
+  `docs/ops/ci-release.md` §6 第 2 条按两腿同源重写（旧文那句「portal 侧分配钉死、非 env 可配」已过期）。
+  `deploy/.env.example` 同步（`deploy/.env` 是主 agent 复制进来的 600 权限件，未提交）。
+
+**判据与读数**（`node --test portal/test/ipam-pool-env.test.js` = 新文件 11 条，全绿；
+`node portal/integration/isolation-negative.mjs --strict` ⇒ `verdict=TRAPS_FIRED（全部 14 条陷阱=均硬失败；
+单一来源=一份定义）` rc=0，缺省负例模式 rc=1 是刻意口径）：
+
+| 判据 | 落点 | 读数 |
+|---|---|---|
+| ① 不设 env ⇒ 与 #270 之前**逐字**相同 | 同文件 3 条：`resolveIpamPools({})`、`DEFAULT_IPAM_POOLS`、**真子进程** import 拿到的 `POOLS` | 全对 `10.200.0.0/16 /29` 与 `10.201.0.0/16 /28`；含「三腿一致性」：compose 下发两键 + 插值默认喂进代码 == 代码默认（口径抄自 `deploy-env-defaults.test.js`） |
+| ② 注入 ⇒ 分配段随之变、且放行面认它 | `not ok`-候选：`#270 ② 注入 IPAM_POOL_LARGE…`、`#270 ② 分配的 subnet 在放行面内 ⇒ validateNetworkBody 放行` | `10.201.37.0/24` ⇒ 首个候选 `10.201.37.0/28`、`prefixLen` 仍 28；`validateNetworkBody(…, {ipamPools:[同段]})` 返回 `[]` |
+| ③ 非法值当场红 + 点名键 | 9 个脏值（`:28` 后缀 / 非规范 / 跑出保留段 / 池前缀过长 / 前缀 >32 / 八位组 >255 / `1e4` / 一格两段）+ 真子进程加载失败 | 每条 `err.code=ipam_pool_env_invalid` 且消息含 `IPAM_POOL_LARGE`；`default` 那一格同样点名自己 |
+| ④ 分配段不在放行面 ⇒ 明确失败且点名两个变量 | proxy reason 断言 + 反向对照（同源派生下同一 subnet 放行） | reason 同时含 `not in allowed pools`/subnet/`IPAM_POOLS`/`FDE_IPAM_POOLS`/`IPAM_POOL_LARGE`/`FDE_IPAM_POOL_LARGE`；反向对照绿 ⇒ 红在「两头分叉」而不是文案 |
+
+**变异自证**（每条先证明它真的改变了行为，再看红在哪个具名格子上）：
+`DEFAULT` 缺省漂一位 ⇒ ① 三格红（`not ok 1/2/3`）；`POOLS = resolveIpamPools({})`（不接线）⇒
+`not ok 4` + `not ok 8`；删「规范网络地址」判据 ⇒ `not ok 7`；删段归属判据 ⇒ `not ok 7/8/9`；
+compose 插值默认改歪 / compose 删掉那一行 ⇒ 均 `not ok 3`（**这就是「参数化是不是假的」的那格**）；
+proxy reason 退回只报 subnet ⇒ `not ok 10`；`isCidrInPools` 对 10.201 恒真 ⇒ `not ok 10`（反向对照仍绿）。
+隔离侧：`defaultFdeIpamPools` 退回两段 ⇒ TRAP_SILENT；两腿拆成两处（分配段用整段）⇒ TRAP_SILENT；
+删「放行面覆盖」判据 ⇒ `TRAP FAIL · …FDE_IPAM_POOL_LARGE 不在 FDE_IPAM_POOLS 放行面内`；删「整段=必撞
+口径」判据 ⇒ 两条 TRAP FAIL；派生口径退回旧 /16 族 ⇒ 正例夹具被抛错（TRAP_SILENT）；脚本自己
+`process.env.FDE_IPAM_POOL_LARGE = …` ⇒ `单一来源断言 FAIL：wp5-e2e.mjs: 自己给 FDE_IPAM_POOL_LARGE 赋值了`；
+某支不再调 `applyStackIpamPoolEnv()` ⇒ 同一组里 `没调用 applyStackIpamPoolEnv()` 红。
+
+**一处诚实的「不承重」**：把 `FDE_IPAM_POOL_LARGE` 从必需 env 清单里摘掉，护栏**照样红**（改抛「不是规范
+写法」那条），所以「必需 env」那一格最初是纸判据 ⇒ 把那条陷阱的文案锚点收紧到 `must be set` 之后它才
+承重（删清单条目 ⇒ 该陷阱 FAIL）。两条判据互为冗余是允许的，但**锚点必须钉在更早、更准的那条文案上**。
+
+**未尽项**：
+- e2e 整轮（`wp2a/wp3a/wp3b/wp5/wp6`）**没跑**：需要 docker + 泛域名 + Tailscale + 分钟成本，本机共享 dev
+  栈在跑（`station-*` 六容器，动前动后名单一致）。⇒ 「隔离栈真机开出来、`fde-*` 网络落在派生段、
+  两套并行不撞」这条是**静态判据 + 护栏夹具**，真机面留给主 agent 合并后跑。
+- wp5 / wp6 的手传 env 清单（`ci-release` §6 末尾那句「wp5 仍需手工三件套」）需要按两腿同源改一行
+  操作者说明——本轮只在 §6 第 2 条重写了两腿口径，没动那三条手工清单的其余部分。
+- `IPAM_RESERVED_SUBNETS` 保留不动（两腿分离后它不再是"不撞"的承重件，但仍是共享栈也在同一段里时
+  的逃生口；wp3b 头注已按此改口径）。
+
+
+### 8.135 #520 收尾：另外 3 个队列循环改空闲退避，reaper/drift 钉成定时语义（issue #520 / 工单 fix-261116-01，2026-11-16）
+
+> **编号由主 agent 统一分配（本批并行）**——本节号不是我自己挑的：8.127–8.133 已被同批其它单占用，
+> 本文件当前最大可见号还是 8.126（worktree 基线 `c8613a3`）。按 §「规矩」不自己取号、不重排。
+
+**过程**：60 分钟时间闸掐了一次，现场靠「每完成一个里程碑就 commit」保住了（三个 commit：
+`972da21` 代码 / `3b826f7` 用例 WIP / `41cf90c` 用例改确定性 + 23/23 绿）。**没 push、没开 PR、没合 main**。
+
+**接线一共 5 处**（判据 2 的两支都用了，不是一律退避）：
+
+| 循环 | 处置 | 空闲拍频 | 有活时 |
+|---|---|---|---|
+| onboarding | 退避（`ONBOARDING_IDLE_BACKOFF_MAX_MS`=30000） | 5000→10000→20000→30000 | 立刻回 5000 |
+| offboarding | 退避（`OFFBOARDING_IDLE_BACKOFF_MAX_MS`=30000）；**1h 工作区清理不跟着退**（定时语义） | 同上 | 立刻回 5000 |
+| provisioner | 退避（`PROVISIONER_IDLE_BACKOFF_MAX_MS`=**15000**，比另两个小一档：漂移发现延迟是它的业务承诺） | 5000→10000→15000 | 本轮动了手就回 5000 |
+| reaper | **不退避**（15s = 租约 90s 的 1/6，退避会偷走崩溃后发现延迟）；只把 sleep 改可中断 + 交 `done` | 恒 15s | — |
+| drift monitor | **不退避**（盘上人手改动没有通知源，周期就是发现延迟） | 恒 60s | — |
+
+三个新退避循环的句柄顺带补成 #506 同形（`stop`/`done`/`settled`/`failure`）：**改前 `stopLoopsAndWait`
+对它们是「记账跳过」**（只有裸 `stopped` 标志 + 不可中断 sleep），改后 `waited` 从 0/4 变 4/4。
+另：`reconcileDidWork()` 单独导出——`stats.ensured` **不能**当「有活」信号（它对每个 desired 行都 +1，
+拿它判活退避永不生效）。
+
+**测量方法 + 基线落到了 `docs/ops/db-idle-load.md`**（判据 1 要「有据」，方法不可复现就等于没测）。
+现测读数（`docker exec station-db psql`，只读；**`station-portal` 里是旧代码 ⇒ 这些都是「改前」基线**）：
+30.29s / 30.29s / 32.28s 三个短窗口 = **11.23 / 12.02 / 11.74 事务/秒**，再补 300.28s 长窗口 = **11.34 /秒**。
+
+**判据 1（空闲 < 3 事务/秒）判为 `BLOCKED-on-deploy`**，理由不是「没测到」而是**测到了但测的是旧代码**：
+正在跑的容器里没有本单的代码，且**不许重启共享 dev 栈**（`station-*` 全栈给别人用）。单元级替代证据见
+`docs/ops/db-idle-load.md` §3 的算式（每拍语句数用假 pool 数出来 × 拍频）：provisioner **32 条/拍**（6 FDE 稳态、
+1 FDE 时 7 条）、routes/materializer 各 **4 条/拍**（实测）、onboarding/offboarding 各 **3 条/拍**、
+reaper **1 条/拍**（0 个到期租约）。⇒ 本单省掉约 5 条语句/秒，但 **#506 的 2s 上限自己就是 4 条/秒的地板**，
+所以 <3/秒**本单单独做不到**，期望值 ≈ 6–7/秒。要真达标得抬 `*_IDLE_BACKOFF_MAX_MS` 或改 `LISTEN/NOTIFY`
+（#506 的口径变更，需拍板）——**这是本单交付里最该被看的一条结论**。
+
+**`chat_sessions` 0.9/秒 现查结论：不是这 7 个循环里的任何一个**（逐条 SQL 排除：provisioner 那条在
+`deprovisionFde`、offboarding 那条在 `disable-user` 步骤、reaper 只在合成 `run_end` 时才碰会话，空闲路径
+全都不碰）。剩下最像的是 **agentd 长轮询 claim**（`holdMs=30000`，等待前后各一次 `tryClaim`，候选语句
+`FROM run_queue q2 JOIN runs r JOIN chat_sessions s`）与**心跳**（`ERIX_HEARTBEAT_MS`=15s，实测份额
+`fde_llm_bindings` 0.40/秒、`port_observations` 0.67/秒 与它对得上）。**没做到精确拆分**：语句级归因在本机
+拿不到——`pg_stat_statements` 没装（要改 `shared_preload_libraries` = 重启库），Traefik 访问日志与 portal
+请求日志都不打，而 `pg_stat_activity` 两种采样**全部 0 命中**（4ms×7500 与 0.5ms×40000；语句短于亚毫秒）。
+
+**用例（`portal/test/idle-backoff-520.test.js`，23 格全绿，整文件 0.36s 跑完）**——判据 3 的形状是
+「断言观察到的 sleep 毫秒序列」。第一版被自己的夹具骗了四次，都记在这儿（**都是能复用的坑**）：
+
+1. **假睡眠永不自己醒 ⇒ 每一拍都得测试放行**：直接 `parkedTick(3)` 而不放行前 2 拍 = 永远等不到（4 格假红）。
+   补了 `parkAt()`。
+2. **拍与 sleep 的对应关系**：循环是「干活 → 决定这拍睡多久 → 睡」，所以 `sleeps[i]` 是**第 i+1 拍干完活之后**
+   的决定 ⇒ 要让某一拍「有活」，必须在它**还没开始干**之前翻标志（= 上一拍还停在 sleep 上时翻）。
+   先 `pass()` 再翻标志，测的是「上一拍」，看着像测了其实没测。
+3. **假 docker 顶不住真实契约校验 ⇒ 假绿**：`inspectNetwork` 少了 `station.managed`/IPAM 时
+   `assertNetworkContract` 抛错被 per-FDE 的 catch 吞掉，`stats` 恒 0，「本轮动手 ⇒ 回基准」那格
+   实际在断言一个**从未发生**的重建。补：网络 Labels+IPAM、容器 `State.Status='running'`、
+   `ERIX_STATION_TOKEN` 与 `runner_token_hash` **同源**算（`hashToken(TOKEN)`，#404 F6 会核它）。
+4. **`workspaceRetentionDays` 是功能开关不是参数**：0 ⇒ `sweepOffboardedWorkspaces` 直接
+   `return {disabled:true}`，一条 SQL 都不跑 ⇒ 「空闲时 1h 清理照样跑」那格变成断言一个从未跑的查询。
+
+**红线遵守情况（工单 (d) 与 #531）**：**没有**拿真实墙钟或 `setImmediate` 轮次当判据——假时钟推进由测试
+负责；`stop()` 可中断性的判据改成「假睡眠不会自己醒 ⇒ `settled` 能落定就只可能来自 abort」，另留一个
+20s watchdog **只防挂死、不当判据**；优雅关闭那格用 `stopLoopsAndWait` 自己的 `timedOut/pending` 当判据。
+**没动** #506 那三个旧夹具（`env-int-strict-506e` / `idle-backoff-506*`，#531 在它们身上）。
+
+**变异自证（每条都跑过，点名红的格子；`not ok` 原文在交付报告里）**：撤 onboarding 退避接线 →
+B1/B2/B3/B4/F1 五格红；**只撤 reset**（有活也不清 `idleTicks`）→ **只有 B2 一格红**（B1 仍绿）；
+offboarding 同法 → 只有 C2 红；provisioner 用 `ensured` 当活信号 → D0/D1/D2/D3 四格红；
+reaper 周期 15s→30s → E1/E3 红；drift 周期 60s→120s → E4 红；**四个句柄各自撤掉 `done`** → F1 红
+（`waited` 4→3），这条是「接线锁」——最容易假装做完的一格，已锁死。
+
+**没动的东西（红线）**：`routes.js` / `materializer.js` 里 #506 那两份 `idleDelayMs`/`sleepCancellable`/
+`envInt` **没回改**（它们在 #506 改动面里，现在动必然合并撞车；本单新循环用
+`portal/src/loop-timing.js` 的共用那份）；认领 SQL / 租约时长 / `BACKOFF_MS` 失败重试节拍都没动；
+`reconcileOnce` 那条 adopt 分支的**无条件 `UPDATE containers SET image=...`** 是真正的写放大
+（300s 窗口里 `containers` 被写 1.32 次/秒），**没顺手改**——改它属于改业务语义，见下方遗留。
+
+**遗留 / 该开的下一单**：
+1. **判据 1 待部署后复测**（`docs/ops/db-idle-load.md` §5 给了复测口径与期望值 6–7/秒）。
+2. **<3/秒 需要动 #506 的 2s 上限**（或 outbox 改事件驱动）——口径变更，要拍板。
+3. **adopt 那条无条件 UPDATE**（每拍每 FDE 写一次 `containers`）可改成 `IS DISTINCT FROM` 再省一截，
+   与 #404 的 F6 同形；本单没动。
+4. `chat_sessions` 的精确拆分要 `pg_stat_statements`（scratch 库）或给 internal 请求加 `application_name`。
+5. 三个新循环的 `done`/`settled` 现在被 `stopLoopsAndWait` 等到了 ⇒ **若哪个循环卡在长事务里，关闭会等满预算**
+   （仍是有界的，`gracefulShutdown` 的总预算没动）；真要观察这个，跑一次 SIGTERM 看 `[shutdown]` 那行读数。
+
+#### 8.134.1 PR #552 返工：第三方审计 4 条 LOW 的处置（issue #520 / 工单 fix-261116-01，2026-11-16）
+
+主 agent 验收并开了 PR #552（他亲验：新用例 23/23、变异「有活不 reset」恰红 1 格 B2、reaper 周期 15s→20s
+⇒ E1+E3 红、根 2379/2365/0 fail）。第三方对抗审计回来 **零 BLOCKER / 零 MED / 4 条 LOW**，其中两条推翻我
+原来的判断（下面逐条记「原判断 → 撤销后的结论」）。提交链（在 `972da21→3b826f7→41cf90c→cf7afea` 之上**只做新增**）：
+`693ee99`（LOW-2 代码）、`cb50832`（LOW-1 compose/.env.example + 三腿判据）、`6a64cfb`（LOW-3/LOW-4 文档与用例加固）。
+
+**LOW-1（撤销我的判断，改代码）：三根旋钮在标准部署里传不进去。**
+事实：`deploy/docker-compose.yml` 的 `station-portal` 是**显式 `environment` 列表、无 `env_file`**（该文件
+`FILE_UPLOAD_MAX_BYTES` 那条注释自己就写着），列表里没有 `ONBOARDING_/OFFBOARDING_/PROVISIONER_IDLE_BACKOFF_MAX_MS`
+⇒ 运维在 `deploy/.env` 写 `PROVISIONER_IDLE_BACKOFF_MAX_MS=5000` **完全不生效且不报错**。
+我原来写「不登记也行（这三根是可选调优，不是必须暴露的运维面）」——**撤销**：同一族病在 #472（评审 major 8）、
+#270（IPAM 三腿）、#450（管理台端口三处）都已立过先例，「可选调优」恰恰是最没人当场验证的那类。
+处置：compose 显式登记三条 `${…:-30000}/${…:-30000}/${…:-15000}`（缺省与代码常量**逐字相等**）+
+`deploy/.env.example` 同形登记 + `docs/env.md` §10.1 入表；新用例 `portal/test/deploy-env-idle-backoff.test.js`
+把**三腿**钉住：compose 插值缺省 == 代码缺省常量（从被测模块 import，不在测试里再抄一个）== **循环真正生效的封顶值**
+（真起循环读 sleep 毫秒序列；只比常量会漏「常量对但循环焊死在缺省上」）。
+变异自证（每次只跑 `node --test portal/test/deploy-env-idle-backoff.test.js`，红了立刻还原，提交前 `grep -rn MUTANT portal` = 0）：
+- M-1 只改 YAML 一个缺省值 `15000→16000` ⇒ **恰红 1 格** `not ok 2 - G2`，消息点名旋钮与两个数（`16000 !== 15000`）。
+- M-2 删掉 compose 里 `ONBOARDING_…` 那条登记 ⇒ `not ok 1 - G1` + `not ok 2 - G2`（登记腿与一致腿同红，符合预期）。
+- M-4 三个循环的旋钮焊死在缺省常量（接线断）⇒ `not ok 4 - G4` + `not ok 5 - G2b`；**`not ok 2 - G2` 仍绿**
+  —— 这正是 G2b 存在的理由。同一组变异下 `idle-backoff-520.test.js` 23/23 **全绿** ⇒ 旧文件看不见 env 接线断。
+
+**LOW-2（成立，改代码）：provisioner 的「15s 上限」不是硬上限。**
+事实：`PROVISIONER_IDLE_BACKOFF_MAX_MS=60000` 被接受并真产生 60s 延迟（解析器只守共享的
+`MAX_BACKOFF_MS_SAFE=60000`），而注释把 15s 叫「上限」。一个 env 能把「漂移即修」的发现延迟**静默放宽 4 倍**。
+主 agent 选「按循环钳制」而不是「改口径」，理由认同：漂移发现延迟是这个循环的业务承诺，不该由运维面单方面放宽。
+处置：`resolveIdleBackoffMaxMs({log,env})` ⇒ 先过严格正整数校验，再按 `IDLE_BACKOFF_MAX_MS_BUSINESS_CAP=15000` 钳，
+越界 ⇒ **钳到 15000 + warn 点名旋钮与钳后值**（不静默）。开户/销号**故意不钳**（它们的业务上限就是共享的 60s，
+注释里「要更激进就配 60000」必须能兑现 ⇒ G4 里放了对照组）。顺带给三个循环开 `env = process.env` 注入缝、
+`loop-timing.envInt` 支持 `env` 选项（注入口比「往 process.env 塞了再记得删」少一类交叉污染）。
+判据读数：`G4` 里 `env=60000` ⇒ 生效值 **15000**、warn 恰一条且文案含 `PROVISIONER_IDLE_BACKOFF_MAX_MS` 与 `15000`；
+端到端阶梯 `[5000,10000,15000,15000]`。变异 M-3（撤掉钳制，`if (false && …)`）⇒ **恰红 1 格** `not ok 4 - G4`。
+
+**LOW-3（成立，只改口径）：offboarding 的「1h 清理不跟着退」要说准。**
+事实：清理是销号循环里**每拍检查一次**的时间门（`offboarding.js` 的 `tickAt - lastSweepAt >= SWEEP_INTERVAL_MS`），
+不是独立定时器 ⇒ 空闲拍 30s 会让它**晚跑**（审计实测 59:59 判、60:29 跑）。不是饿死，但「keeps its schedule」是近似。
+准口径（已同时落到 `offboarding.js` 注释与 `docs/ops/db-idle-load.md` §7）：**阈值 1h 一个字节没改；节拍受空闲拍影响，
+典型晚 ~max/2、最坏晚一整个空闲拍 ≤ max（默认 30s）**。顺手修了原注释里「满了 1 天才清」的口径错
+（`SWEEP_INTERVAL_MS = 60 * 60 * 1000` 是 1 小时）。C1 用例仍是假时钟 —— 没为这条加任何墙钟断言（#531 教训）。
+
+**LOW-4（登记 + 顺手加固）：新用例仍有墙钟依赖。** 位置（返工后行号）：
+- `portal/test/idle-backoff-520.test.js:81` `waitUntil(cond,label,deadlineMs=15_000)` —— `Date.now()` 截止；
+- 同文件 `:126` `awaitWatchdog(promise,label,ms=20_000)` —— 真 `setTimeout` 看门狗；
+- 同文件 `:201-208` A4 用真 5ms abort / 真 1ms 睡 / 真 60s+abort。
+加固（不重排用例、不改判据）：两处看门狗到点后都先做 **5 轮宏任务的宽限复检**再判失败，`awaitWatchdog` 改成
+tracked-state 形式复查 promise 是否其实已落定（事件循环被停顿十几秒时，定时器回调可能排在已落定的 promise
+**之后**才被调度 ⇒ 老写法会把「已落定」误判成「stop 没打断」）。**没换成假时钟的部分与理由**：A4 测的就是
+`sleepCancellable` 对真 timer + 真 AbortSignal 的行为，换假时钟等于测夹具；它的判据是 resolve 的布尔值而非流逝
+毫秒 ⇒ 停顿只让它变慢。残余风险（如实登记）：极端事件循环停顿（>15s 且期间真无进展）下 `waitUntil` 仍可能红，
+红了按 #531 口径**先单跑该文件再定性**，别改 #506 的夹具。
+
+**门禁（各跑一次，原文）**：
+- `timeout 400 node --test portal/test/idle-backoff-520.test.js; echo rc=$?` ⇒ `# tests 23 / pass 23 / fail 0`，`rc=0`
+- 新增一致性用例 `timeout 400 node --test portal/test/deploy-env-idle-backoff.test.js` ⇒ `# tests 5 / pass 5 / fail 0`，`rc=0`
+  （两文件合跑 28/28；关闭家族 + #506 退避家族 + 两个既有 deploy-env 一致性文件合跑 108/108）
+- 根门禁 `timeout 1500 npm test; echo rc=$?` 见本节末的补记（只跑一次；`idle-backoff-506*` / `env-int-strict-506e` /
+  `idle-backoff-safe-range-506b` 是 #531 已知负载假红族，红格先单跑该文件再定性并附两个读数）
+
+**没做到的 / 遗留**：
+1. **判据 1（空闲 `xact_commit` < 3/秒）仍是 `BLOCKED-on-deploy`**：dev 共享栈的 `station-portal` 跑的是旧代码，
+   且红线不许重启/重建 `station-*`；本单交付的是**测量方法 + 现测基线**（§8.134 与 `docs/ops/db-idle-load.md`）。
+   算术期望值 ≈ 6–7/秒，不是 <3/秒 —— #506 的 outbox 2s 空闲地板本身就贡献约 4 语句/秒。
+2. **#506 的四根旋钮同族未登记**：`ROUTE_IDLE_BACKOFF_MAX_MS` / `ROUTE_ORPHAN_RECOVERY_INTERVAL_MS` /
+   `MATERIALIZE_IDLE_BACKOFF_MAX_MS` / `MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS` 至今不在 compose 的
+   `station-portal.environment` 里（四条 `grep -c` 全 0）⇒ 标准部署上配了同样是空气。本单没顺手改（跨单，
+   且会动 #506 的部署面）；修法同 §6，建议另开一单把四根加进同一条三腿判据。
+3. `chat_sessions` 0.86/秒 的精确拆分仍未收口（本机无语句级计数），已按「不是那 7 个循环 + 逐条 SQL 排除」交付。
+
+**补记：PR #552 返工的门禁原文（2026-11-16，只跑了一次根门禁）**
+- 门禁 1 `timeout 400 node --test portal/test/idle-backoff-520.test.js; echo rc=$?`
+  ⇒ `# tests 23 / # pass 23 / # fail 0`，**`rc=0`**
+- 门禁 2 `timeout 400 node --test portal/test/deploy-env-idle-backoff.test.js; echo rc=$?`
+  ⇒ `# tests 5 / # pass 5 / # fail 0`，**`rc=0`**（两文件合跑 28/28；关闭家族 + #506 退避家族 +
+  两个既有 `deploy-env-*` 一致性文件合跑 108/108）
+- 门禁 3 `timeout 1500 npm test; echo rc=$?` ⇒ `# tests 2384 / # pass 2369 / # fail 1 / # skipped 14`，
+  **`rc=1`**（`# duration_ms 15094`）。唯一红格：
+  `not ok 202 - #506e③ 严格性不许把安全上限那一条挤掉：越界仍回落 + warn（两个文件）`，
+  位置 `portal/test/env-int-strict-506e.test.js:276`，报错 `循环必须停在某一拍的 sleep 上`，
+  栈顶 `Object.arm (env-int-strict-506e.test.js:50)`，`duration_ms 16.27`。
+  **定性：#531 那族负载假红，不是本单引入** —— 失效形状正是「`arm()` 拿轮次预算等循环走到 sleep」，
+  而本单没动 `routes.js` / `materializer.js`（#506 那两份 `envInt` 拷贝）与该夹具任何一行。
+  两个读数：全量 `fail 1`（就是这一条）⇒ **单跑该文件两次**均 `# tests 17 / # pass 17 / # fail 0`，`rc=0`。
+  按工单口径**没有改那些夹具**（#531 的收口是独立单）。
+- 本轮**没有**新增 DB 读数：判据 1 仍是 `BLOCKED-on-deploy`（dev 栈 `station-portal` 跑旧代码，红线不许
+  重启/重建 `station-*`）；也没碰任何容器、没改依赖与 lockfile。
+
+**补记 2（补记里那句「没有新增 DB 读数」之后的复核读数，同日晚些）**：交付前又跑了一次 §1 的只读采样，
+好让「现测基线」在 PR 上不是过期数据：`window 30.29s` ⇒ `xact_commit delta=357 rate=11.78/s`、
+`xact_rollback 0.00/s`、`total_scans/s = 25.13`（`containers` 4.82、`users` 4.42、`chat_sessions` 0.86、
+`fde_onboarding` 0.69、`fde_offboarding` 0.20）。与 §8.134 的基线（11.2–12.0/秒、5 分钟窗口 11.34/秒）同量级
+⇒ **dev 栈的 `station-portal` 仍在跑旧代码**（compose 里那三根旋钮是本次才登记的，容器还没带上新镜像），
+判据 1 的 <3/秒 依旧是 `BLOCKED-on-deploy`，不是「测出来不达标」。全程 `docker exec station-db psql -At` 只读，
+没重启/重建任何 `station-*`，`station-portal` 的 `Up 2 hours` 未被打断。
+
+
+### 8.136 单文件上传上限进管理台：一条「改数字不该重建容器」的切片（issue #485 片 A / 工单 fix-261116-04，2026-11-16）
+
+> 编号由主 agent 统一分配（本批并行）。本片 = #485 的**片 A**；**片 B（每 FDE 目录总量配额）不在本单**，
+> 它的阻塞事实记在本节末尾（现查读数，不是抄工单）。
+
+**需求（一句话）**：`FILE_UPLOAD_MAX_BYTES` 是**启动期 env** —— 改一个数字要改 `deploy/.env` +
+`docker compose up -d station-portal`，管理台既看不见也改不了。把它搬进 DB 并让管理台可改，
+**改完立即生效**（判据不是「重启后正确」，而是「同一个进程内下一次上传就按新值走」）。
+
+**形状照 `mail_settings` 先例（迁移 0026 + `mail-settings.js` 写侧 + `mail-provider.js` 读侧），但两处刻意不同**：
+
+1. **没有 60s 缓存**。`mail-provider` 要缓存是因为登录是热路径；上传不是 —— 一次上传多一次单行主键
+   `SELECT`（<1 ms）换掉「改完要等一分钟」。**加缓存只是把「必须重启」换成「必须等 60s」，判据并没有被满足**
+   （因此写侧也不需要 `invalidate()`：没东西可失效）。这一条由变异自证，见下面 M2。
+2. **产品区间故意没写进 DB CHECK**。DB 只管物理荒谬（`CHECK (max_file_bytes > 0)` + `CHECK (id = 1)`），
+   1 MiB–1 GiB 只在 JS 写侧。理由不是懒：**写了 CHECK，「手工把 `max_file_bytes` 改成非法值 ⇒ 上传回落而不是
+   500」这条判据在真机上就根本进不去**（`UPDATE` 会被 CHECK 当场拒），只剩单测能测；而且日后改天花板
+   会从「改一个常量」变成「追加一次 DDL」。
+
+**三处优先级与回落是有意分层**（`portal/src/upload-settings.js`）：
+
+| 位置 | 管什么 | 形态 |
+|---|---|---|
+| DB（迁移 0035）| 物理荒谬 | `CHECK (max_file_bytes > 0)` |
+| JS 写侧（`PUT /api/admin/upload/settings`）| 产品区间 1 MiB–1 GiB | **当场 400** `validation_failed` + `details.field`，**不落库** |
+| JS 读侧（`POST /api/files/upload`）| 任何不可用的行 | **回落 env → 默认** + 一条点名 `upload_settings.max_file_bytes` 与 `FILE_UPLOAD_MAX_BYTES` 的 warn；**永不 500** |
+
+**`bigint` 的代价必须有人在读侧接住**：上限选 `bigint`（`int` 只到 2 GiB，提天花板不该再要一次 DDL），
+而 **node-pg 对 int8 默认回的是字符串**（不是 number）。所以读侧统一 `max_file_bytes::text` + 只认
+`/^[0-9]+$/` 且必须落在区间内，**不许** `Number()` / `parseInt()` 吞 —— 正是 §8.126 那条
+`parseInt('1e4') === 1`（半个值静默生效，比报错难查十倍）的同族。`fake-pool` 也**复制了这个形状**
+（`FROM upload_settings` 回字符串），否则「产品侧写成 `parseInt`」这种错在单测里是绿的、到真库才炸。
+于是：`'1e7'` / `' 100 '` / `'0'` / 超安全整数 / 区间外 ⇒ 全部回落并带 warn；而 JSON number `1e7`
+（= 10000000，精确可表示）在写侧**合法** —— 有意的**写侧严、读侧宽但从不猜**。
+
+**`413` 从此多一个 `details.limit_source`**（`db`/`env`/`default`），`details.max_bytes` 是**生效值**而不是
+env 值 ⇒ 值班看一眼就知道该去改哪一边。零新错误码（`validation_failed` / `forbidden` / `method_not_allowed`
+都是既有码），所以 §1.2 无新增。
+
+**工单原文有一条口径本身是错的**（照字面做会做出一个空区间）：片 A 第 3 条写「范围校验
+`1 MiB ≤ v ≤ MAX_BODY_BYTES 上限`」。但 `MAX_BODY_BYTES` 默认 **64 KiB** < 1 MiB 下限 ⇒ 区间为空集；
+根因不是笔误而是**口径错配** —— 上传**根本不走** `readJsonBody`（`http.js#handleFileUpload` 的注释：
+走它任何真实文件都会 413），两个旋钮量的是不同的东西。落地取明确产品天花板 **1 GiB**（= 32 × 默认值），
+理由写在 `upload-settings.js` 的常量注释与 §4.15，并把「它与 `MAX_BODY_BYTES` 无关」写进文档。
+
+**判据读数**（判绿只看退出码）：`portal/test/upload-settings.test.js` **14/14 通过**（US-1..US-14，含 HTTP 层
+真 tmp userspace + FakePool）；`portal/test/migrations.test.js` **31/31**（head 断言 34 → 35 全量进位：
+19 处 `slice(0,4)), 34` + 4 处 `Array.from({length: 34})` + 0033/0034 的「末位/倒数第二」两条改成
+倒数第三/倒数第二）；前端 `AdminUploadView.spec.ts` **20/20** + `lib/uploadSettings.spec.ts` 与
+`localeParity.spec.ts` 合跑 **47/47**，`npm run typecheck` rc=0。
+上传族回归面：`file-upload` / `http-upload` / `user-file-upload-flag` / `admin-mail-settings` /
+`mail-provider` / `config` / `deploy-env-defaults` 合跑 **101 + 26 全通过**。
+
+**三条变异（每条先 `git diff --numstat` 自证非空操作，跑完 `git checkout --` 复原，提交前
+`grep -rn MUTANT portal` = 0）**：
+
+| # | 变异 | 变红的格子（点名） |
+|---|---|---|
+| M1 | `http.js` 上传端点把 `maxBytes: limit.maxBytes` 改回 `ctx.config.fileUploadMaxBytes`（= 工单要求的「读侧只读 env」）| `✖ US-7【工单判据 1+3】`、`✖ US-8【工单判据 2 + 立即生效】` |
+| M2 | `resolveEffectiveMaxFileBytes` 加一个**模块级缓存**（= 「每次现读」退化）| `✖ US-8`（核心承诺那条，**只有它断言「改完之后的第二笔上传」**）、`✖ US-6`、`✖ US-7` |
+| M3 | `cleanMaxFileBytes` 把类型闸换成 `Number(value)` 吞一口 | `✖ US-3`（写侧只收区间内 JSON number）、`✖ US-10`（400 且不落库）|
+
+⚠ M2 的判据面要说清：US-7/US-6 也红是**粗变异跨用例漏染**（模块级 memo 会活到下一个 stack），
+真正区分「现读」与「缓存」的只有 **US-8** —— 它是唯一断言「同一进程内，PUT 之后第二笔上传的结果变了」
+的格子（413 → 保存 → 200 → 再传 200 → 改回 1 MiB → 再传 413）。**只断言「读过一次 DB」的格子在这里是假绿**，
+所以当初就没写成那样。
+
+**env 回落面逐字未动**（这是「两头说法」判据，别只看代码注释）：`portal/src/config.js` 的
+`fileUploadMaxBytes: intEnv(env, 'FILE_UPLOAD_MAX_BYTES', 32 * 1024 * 1024)` 与
+`deploy/docker-compose.yml` 的 `FILE_UPLOAD_MAX_BYTES: ${FILE_UPLOAD_MAX_BYTES:-33554432}`
+**两行与 `origin/main` 逐字相同**（`git diff origin/main...HEAD` 里它们不在 `+/-` 里；行号只因新增注释而位移
+286 → 302、204 → 207），compose 的 diff **非注释行为 0**。新增的只有 `fileUploadMaxBytesSource`
+（管理台要显示「这个值是从哪来的」，谓词与 `intEnv` 同口径：**给了但非法 ⇒ `default`**，不许谎报 env，
+US-14 钉住）。`portal/test/deploy-env-defaults.test.js` 26/26 仍绿 = compose 默认值与 config 默认值同源这条
+老闸没被动坏。
+
+**前端的一条纪律：不许抢服务端的闸**。解析得出整数就照发（**越界也发**，由 400 + `details.field` 回来标红），
+解析不出整数（空、`1.5`）才禁保存且**零请求** —— 发一个 `maxFileBytes: null` 只是把「用户还没填」伪装成
+「用户填了个非法值」。归一化守 #390-A：键缺席 ⇒ `null` ⇒ 页面显示「未知」，**不是 0**（`0 B` 会让人以为
+上限是 0，比「未知」更坏）。⚠ 实测一条 jsdom 与浏览器共同的行为，它决定了哪一层该测什么：
+**`<input type=number>` 会把 `1e7` 归一成 `10000000`**，所以「科学计数法字符串」这一族在视图层**永远到不了**
+lib —— 它由 `lib/uploadSettings.spec.ts` 直接测纯函数（视图层测它必然恒绿，是假绿）。
+
+**一条环境坑（会咬每一个 worker）**：本机 shell 里 **`NODE_ENV=production` 是设着的**，于是
+`npm ci` **跳过 devDependencies** ⇒ `npm run typecheck` 报 `vue-tsc: not found`（看起来像「worktree 没装依赖」，
+其实是 env 污染）。口径：**装依赖也要 `env -u NODE_ENV npm ci`**；跑前端测试同样必须 `env -u NODE_ENV`
+（AGENTS §4 那条 `emitted()` 恒红的根因就是它）。
+
+**真机面：`BLOCKED-on-deploy`**。本片没有动任何 `station-*` / `fde-*` 容器（派单红线），dev 库只读，
+所以「管理台改成 1 MiB ⇒ 不重启 ⇒ 下一笔 2 MiB 上传 413」这条**真机判据由主 agent 复验**。
+替代证据：US-7 / US-8 是 **HTTP 级**用例（真 `createServer` + 真 tmp 磁盘 + 真流式落盘 + 真 413 信封 +
+超限无 `.tmp` 残骸），唯一没覆盖的是「真 PG 里那一行的读写」与「真 compose 重启后 env 仍在」。
+
+**片 B（每 FDE 目录总量上限）不在本单 —— 它阻塞在宿主层，本单一片没碰**。现查读数（2026-11-16，本机，非抄工单）：
+
+```
+$ grep ERIX_USERSPACE_ROOT deploy/.env      → ERIX_USERSPACE_ROOT_HOST=/srv/erix/users
+$ findmnt -no TARGET,FSTYPE,OPTIONS --target /srv/erix/users
+/      ext4   rw,relatime                   ← 挂载选项里**没有** usrquota / grpquota / prjquota
+$ findmnt -no SOURCE /                      → /dev/nvme0n1p2        （userspace 与 station-db、
+$ df -h /                                   → 937G  677G  213G 77%    镜像层、日志**共用这块盘**）
+$ du -sx --block-size=1M /srv/erix/users    → 414 MiB（整棵 userspace）
+$ command -v setquota repquota quota edquota → 四个全部 MISSING（`quota` 包未装）
+$ command -v chattr dumpe2fs tune2fs         → 都在（/usr/bin/chattr、/usr/sbin/{dumpe2fs,tune2fs}）
+$ dumpe2fs -h /dev/nvme0n1p2                 → Permission denied（非 root 读不到 superblock）
+                                                ⇒ ext4 的 `project`/`quota` **feature bit 现状未知**
+```
+
+`BLOCKED: 挂载选项缺 prjquota` + **满足什么条件才许做**：① 拿到宿主 root；② `dumpe2fs -h` 读出 feature 里
+有 `project`+`quota` ⇒ 只需 `mount -o remount,prjquota /`（**活体 remount，生产要先演练**）；没有则
+`tune2fs -O project,quota` + 离线 `e2fsck` 窗口（**风险高，必须决策者排期**）；③ 装 `quota` 包
+（`setquota`/`repquota`）；④ 先在**一个测试 FDE** 上验「`chattr +P` 的目录位 + `-p` 默认 project id 能否让
+agent 在容器内 `mkdir` 的新目录继承 project id」——**这条验不过整个方案要重估**（ext4 的继承语义与 XFS 不同）。
+工单原判据留住：**容器里 `dd` 60 MiB 也要失败**才算闸门成立；「上传前 `du` 一遍目录」是**假闸门**
+（拦住人、放过 agent），本片明确**没有**顺手实现它。
+
+**残留风险**
+
+1. **`upload_settings` 与 env 是两套数**，管理台是唯一的合并点 —— 运维若只改 `deploy/.env` 而 DB 里有值，
+   改的其实是兜底位（不生效）。缓解：管理台显示 `source` + 三个来源的值 + `reason`；`docs/env.md` §10.1
+   与 compose 注释都改了角色描述。
+2. **区间常量三处一致**（`MIN/MAX_MAX_FILE_BYTES`、管理台 `limits`、迁移里**没有**区间）由
+   `migrations.test.js` 的 0035 段与 `US-12` 钉；日后放宽天花板要同处改 JS 常量，**不需要** DDL（这是设计意图）。
+3. 上传端点每次多一次单行 `SELECT`：QPS 极低，可接受；真库上没测过（`BLOCKED-on-deploy`）。
+4. 前端「越界提示」是提前给的一句话，**不是**校验闸（服务端的 400 仍是唯一真相）。
+**加一个管理台 tab 的连带红线（本片自己踩的，症状会骗人）**：`AdminLayout.spec.ts` 的 `makeRouter()`
+把 tab 桩成裸路由名（`{name:'admin-*'}`），**漏加一个名字不是"那条 tab 断言红"，而是整个组件挂载就抛
+`No match for {name:'admin-upload'}`** ⇒ 该文件**所有**用例一起红，包括与 tab 毫无关系的「登出」与
+「← 返回工作台」。看到"整文件 6 红"要先去查桩路由的名字表，别去怀疑登出逻辑。同步要改的第二处：两个
+tab 顺序用例的 `findAll('nav a').slice(0, 6)` 窗口（6 个 tab ⇒ 7 个），以及「号池占用紧挨证书」这条
+相邻断言（现在中间隔着「上传上限」）。新增 tab 自己的判据照 #449/#456 先例补了一条（tab 存在 + 排在
+证书之后号池之前 + `routes` 里 `upload` 子路由 `requiresRole:'admin'` 且懒加载），并把这条连带红线
+写进了 `makeRouter()` 的注释里。
+
+**⚠ 合并时必须把我的迁移重编号 `0035` → `0036`（本单留的、唯一一处需要合并方动手的地方）**。
+现查（2026-11-16，`git ls-tree origin/main`）：main 上 `0035` 这个号**已经被占用** ——
+`deploy/migrations/0035-macro-platform.sql`（事件平台 W1 数据层，issue #524，`a22eb5f` → `cb82433`），
+且现网容器里已经是这一支（`docker exec station-portal ls /app/deploy/migrations` 末号 = `0035-macro-platform.sql`）。
+我这刀的 `0035-upload-settings.sql` 是在**它进 main 之前**的基点（`c8613a3`）上写的，两个文件同名不同内容。
+
+- **不改号会怎样**：runner 用「文件名去 `.sql`」当 `schema_migrations.version`，所以两支都叫 `0035-*` 但版本串不同
+  ⇒ 不会当场炸，而是**两支都应用**，把「0035 是宏平台」这条口头共识悄悄变成两回事；
+  真正会红的是 `portal/test/migrations.test.js` 那条**编号连续无空洞**（`nums.forEach(n === i + 1)`：
+  两个 35 ⇒ 第二格期望 36 而拿到 35）——**这是设计出来的闸**，别为了让它绿而改断言。
+- **为什么我在分支里不直接改成 0036**：我的基点还没有 `0035-macro-platform`，本树里改成 0036 会**自己造出一个空洞**
+  ⇒ 同样被上面那条闸拦下（这正是它该干的事）。所以只能在**合并方**（main 已含宏平台那一支）改号。
+- 合并后要一起进位的四处（漏一处就是一条红）：`migrations.test.js` 里 **19 处 head 断言 + 4 处
+  `Array.from({length: N})`**（35 → 36）、0035 那一段语义闸的文件名与 `RAISE NOTICE` 前缀、
+  `upload-settings.test.js` 的 US-13 路径、以及本节/`docs/api/portal.md` §4.15/`deploy/migrations/README.md`
+  清单里写的「迁移 0035」字样。**迁移文件内容本身不用改**（只改名；runner 记的是 sha，改名发生在应用之前 ⇒ 安全）。
+
+**⚠ 复 audit 返修（2026-11-17）：第三方审计零 BLOCKER / 零 MED / 3 条 LOW，两条改代码（`ee919b9`）、一条就是下面这三条登记。**
+
+先记两条实现（细节在代码注释与 `docs/api/portal.md` §4.15，这里只记"为什么必须这样"）：
+- **活一：那次读取必须有超时**（`UPLOAD_SETTINGS_READ_TIMEOUT_MS`，默认 1500ms，`DEFAULT_READ_TIMEOUT_MS`）。
+  片 A 选了「不缓存 ⇒ 每次上传现读」，于是「查询发出去而**不返回**」就是「每一次上传都挂住」——
+  `catch` 抓不到它（不抛错就永远进不了 catch），原来那句「读侧永不抛」在这种故障形状下是假的。
+  超时按**既有**的「读不到不许挡住上传」处理：回落 env/默认、不 500、只把 `reason` 分成 `read_timeout`
+  （三种回落理由必须分开：表坏了 / DB 卡住 / 真的没配），并且**只留 debug 不刷 warn**。
+- **活二：保存 = 一条 CTE 语句**（`SAVE_SQL`：`WITH prev … FOR UPDATE` → `upd` upsert → `aud` 写 `audit_log`）。
+  旧的三步（读旧值 / upsert / `await auth.audit()`）有两个洞：并发保存两条都先读到同一个旧值 ⇒
+  `previous_*` 记的是**自己进来之前**的数（审计白记）；审计 `INSERT` 失败 ⇒ 设置已生效而审计一行没有。
+  ⇒ 调用方（`http.js`）**不得**再补 `auth.audit`；SQL 里的区间判定只比 `BETWEEN $5 AND $6`（两个边界由
+  JS 常量当参数送进去），所以 `MIN/MAX_MAX_FILE_BYTES` 仍是唯一一处，与 JS `parseDbMaxFileBytes` 的等价性
+  由 US-20 逐值钉住而不是靠注释声明。心跳定时器单独一笔在 `9485dd2`（作用见下面变异读数那条）。
+
+下面三条是审计 LOW 的第 3 条要求的登记（代码里不该留"只跑过测试"的口头共识）：
+
+1. **「每上传一读」与 #520 的负载口径**：#520 的判据是**空闲**时 < 3 事务/秒（本节上面已记那条出处），
+   而这条读只在**真有上传时**发生 ⇒ 不在同一口径里，没有上传就没有这条读，两边不打架。
+   真实放大面要说清：前端是**逐文件**上传 ⇒ N 个文件 N 条读（不是 N 个请求共用一条）。这条读同时也是
+   **挂载面**——正因为每次上传都读，一次卡住就挂住全部上传，所以活一那个超时是这条取舍的**必要配套**，
+   不是可选的加固。**第 1 条 LOW（那句「<1ms」）最终怎么处理：删掉，没去测。**三处（本模块头注、
+   `DEFAULT_READ_TIMEOUT_MS` 的注、`docs/api/portal.md` §4.15「为何不缓存」）都改成不带数字的说法并注明
+   「本仓没量过」。为什么不补一次测量：那句是**论证**不是**测量**，而片 A 的判据（US-7 DB 值压过 env、
+   US-8 改完立即生效）与耗时无关；真要引入缓存或做容量测算，就在同一条上传路径上对真 PG 量并把现场条件
+   一起写进来，别拿一个来路不明的毫秒数当决策依据。连带结论：`1500ms` 是**定性**选的（远大于一次单行往返、
+   小于一次可接受的上传等待、量级对齐 `mail-provider` 那几个 `*_TIMEOUT_MS`），要改就照这两条边界重估。
+2. **DB 的 `CHECK (max_file_bytes > 0)` 与代码的 1 MiB–1 GiB 是两层标准，故意不合并**：DB 只管物理荒谬
+   （0 / 负数），产品区间是策略、由写侧 400（US-3 / US-10），改天花板 = 改常量而不是追加 DDL。
+   这条登记要回答的是"分层会不会存下一个静默不起效的值"——**不会**，两条路各自封住：手工 `UPDATE` 成
+   8 TiB ⇒ 读侧判不可用 ⇒ 回落 env 并 `reason=invalid_db_value`，管理台那一页明说「DB 那个值用不了」
+   （US-9 就是这个现场：同一次还断言上传照常用 env 值成功）；从管理台想存越界 ⇒ 当场 400，写不进去。
+   迁移头注释里那条理由（区间写进 CHECK 会让"手工写坏 ⇒ 回落而不是 500"这条判据在真机上根本进不去）
+   仍然成立，这里补的是另一问的答案。
+3. **`413` 把 `limit_source` 返给非管理员**：`portal/src/http.js` 给 413 的 `details` 塞了 `limit_source`，
+   而 413 走的是**普通上传用户**（fde）的路径 ⇒ `db`/`env`/`default` 三值对非管理员可见。结论是**不收敛**：
+   三值都不泄露拓扑（没有主机名、表名、路径），而它存在的意义正是让"传不进去的人"能一句话报清"现在哪一边在管"。
+   登记面：契约写在 `docs/api/portal.md` §4.14 的 413 那行；**前端目前不读它**
+   （`grep -rn limit_source portal/frontend/src` 无命中 ⇒ 界面文案不受它影响）。日后要让界面显示来源，
+   记住它只有这三值，别在 default 分支以外猜第四个。
+
+**变异读数（判据有没有牙只认这个，别只写"跑过测试"）**
+
+- **活一**（主 agent 复现）：摘掉 `readRow()` 里的 `withReadTimeout(…)`、只留 `catch` ⇒ **恰两格红**：
+  `not ok 15 - US-15【活一】查询不返回（永不 settle、不抛错）也必须按时给答案…`、
+  `not ok 17 - US-17【活一·工单口径】DB 卡住（读取不返回）时上传**不许被挡住**…`，其余 19 格照绿。
+  **真改了行为**（不返回时答案永远不来），不是等价替换。心跳定时器（`9485dd2`）为什么必要：没有它，
+  永不 settle 的读取把事件循环抽干 ⇒ 整轮 `cancelledByParent` ⇒ 连带 6 格无辜的红，看不出哪格是信号。
+- **活二·撤掉 `FOR UPDATE`**（主 agent 与我各跑一次，读数一致）⇒ **6 格红**：`not ok 4 - US-4 …`、
+  `not ok 8 - US-8 …`、`not ok 18 - US-18 …`、`not ok 19 - US-19 …`、`not ok 20 - US-20 …`、`not ok 21 - US-21 …`。
+  但要说清它**红在哪**：先炸的是 `fake-pool.js` 的形状闸
+  （`fake：prev 必须 \`FOR UPDATE\`——否则 \`previous_*\` 仍可能是隔了一条写入的旧值`）⇒ 所有写路径都进不去。
+  所以这条是**形状证据**（撤锁一定有人被叫醒），**不是**"锁真的修正了 `previous_*` 时序"的**行为证据**——
+  后者在假库里不可观察，只有真 PG 的 READ COMMITTED 下才有差别，本单没为它做真机验证，别写成已验证事实。
+  ⚠ 踩坑：这发变异第一次标记写成 `-- MUTANT-B 撤掉 FOR UPDATE`，注释里原样带着那几个字 ⇒ 假库的正则照样命中
+  ⇒ 21 格全绿，差点误判成"判据没牙"。**变异标记里别出现被撤关键词的原文。**
+- **活二·退回三步**（我跑）：只把 `updateUploadSettings` 改回「先 `readRow()` 读旧值 → plain upsert →
+  `INSERT INTO audit_log`」三条语句（超时那层不动）⇒ **恰三格红**：`not ok 18 - US-18 …`、
+  `not ok 19 - US-19 …`、`not ok 21 - US-21 …`。核心证据是 US-19 的读数本身：并发两次保存后审计里的
+  previous 是 `[8388608, 8388608]`（两条都记"自己进来之前的数"），期望 `[2097152, 8388608]`。**真改了行为**。
+  同一次变异里 `US-20` 照绿是**对的**：三步写法的审计 previous 本来就是 JS 算的，等价性自然成立 ⇒
+  US-20 盯的是"日后有人往 SQL 里加第二条策略并让它漂移"，不是"退回两步"。
+- 返修后的焦点门禁读数（同一棵树，`MUTANT` 清零）：`node --test portal/test/upload-settings.test.js
+  portal/test/migrations.test.js` ⇒ **52/52，rc=0**。
+
+
+### 8.137 只写一行 `run_end` 的终态在界面上不存在：候选发现不能只认白名单行（issue #514 / 工单 fix-261115-04，2026-11-15，worker 落地）
+
+> 编号由主 agent 统一分配（本批并行）：本条原定 8.127，现查该号已被 #496 占用 ⇒ 按分配落 **8.130**。
+
+**缺陷形状**：`sessions.js#stopSession` 的 killedQueued 分支（`queued` 从未开始就被取消）在事件面上
+**只写一行** `run_end`；`run_end` 不在下发白名单 `HISTORY_EVENT_TYPES`（红线：它驱动前端运行态状态机，
+#217/#236），而 #236/#300 那两类响应期合成项的**候选集只来自「本页白名单行里有哪个 run」**
+（`distinctWindowRunIds`）⇒ 这条 run 在白名单行里**零影子** ⇒ 它既拿不到 `run_termination` 分隔条、
+也拿不到 `partial_output` 占位项 ⇒ **刷新后正文区完全空白**，连「它存在过、并且已中止」都看不出来。
+它是 #502 显影的既有形状（§8.126.4 未尽项里点过名），不是新写坏的。
+
+**选哪条修法（工单给了两个候选，选 ①）**：
+
+| 候选 | 判据 | 为什么选/不选 |
+|---|---|---|
+| **① 把页内终态 `run_end` 纳入候选发现**（只发现 run id，不作为回放事件下发） | 「这一页里确实有这条 run 的终态行」 | **选它**。它修的是**根**：候选集此前把「本页没有这个 run 的白名单行」当成「这个 run 不在本页」，而这两件事**不等价**。且它一并覆盖更常见的格子——会话里本来就有历史内容、用户取消的是刚排队那条（页**非空**，被取消的 run 仍一根分隔条都没有）。位置也天然正确：分隔条的 seq 就是那行 `run_end` 的 seq |
+| ② 本页零白名单行时补查该会话最近一个终态 run | 「这一页空了，就说一句最近的事」 | **不选**。它是会话级的猜测而非页级事实：(a) 上面那格（页非空）它**根本不触发**，判据①照样不满足；(b)「最近一个」与本页的 seq 坐标系无关，要落地仍得自己补一套 `seq < before` 的页界闸（等于把 ① 的账再写一遍）；(c) 一页里两条被取消的 run 只会出现一条 |
+
+红线守住的方式：**`run_end` 一个集合都没进**——后端 `HISTORY_EVENT_TYPES` 不动、前端 `EVENT_TYPES` /
+`HISTORY_REPLAY_TYPES` 不动（新加了一条**源码钉**用例把它钉在两个集合之外）；它只在「候选发现」这一步
+被用来取 run id，投影完全复用 #236/#300/#502 的既有通路 ⇒ **零前端改动、零新形状、零新事件类型**。
+
+**页界是这道修改的承重墙，不是装饰**：发现查询的 seq 窗口 = `[本页最小白名单 seq, before)` + `LIMIT limit`。
+- 少**下界** ⇒ 更老页的终态行被拉进本页 ⇒ 同一根分隔条在每一页重演一次（#502 M-6④ 那个形状）；
+- 少**上界** ⇒ 更新页的终态行按 `ORDER BY seq DESC LIMIT n` **挤掉本页的名额**，而它随后又被 M-6④
+  的 `seq < before` 拦掉 ⇒ **那条 run 在任何一页都露不了面**（比原缺陷更隐蔽：原缺陷至少还空着）。
+空页 ⇒ 下界取 0：此时本页就是「白名单行尾巴之下」那一段，本没有更老的内容会被重复覆盖。
+
+**成本**：每次响应**至多一条**新查询（`SELECT run_id FROM run_events WHERE session_id=$ AND type='run_end'
+AND seq >= $ [AND seq < $] ORDER BY seq DESC LIMIT $`），走既有 `UNIQUE (session_id, seq)` 倒序扫，
+非空页的扫描区间被页边界夹住；`run_events_run_end_key`（部分唯一索引）保证每 run 至多一行 ⇒ 候选数天然
+有界。发现出来的 id **并进 `loadWindowRuns` 那一条**批量 runs 查询 ⇒「同一次响应只允许一条 runs 查询」
+那条被用例钉住的红线不变（新用例逐字钉 `runs` 查询恰一条 + 发现查询恰一条 + 页界/LIMIT 必须写在 SQL 里）。
+既有那两条「零候选 ⇒ 零额外查询」用例仍绿——它们的夹具没有 `run_end` 行，发现查询拿空 ⇒ 仍不发 runs 查询。
+
+**判据与读数**（`portal/test/session-events-history.test.js` **17 → 24 条 `test()`**，含 for-of 展开 3 条
+⇒ 文件内用例 **20 → 27**）：
+- 判据①（分隔条）：本页零白名单行 + 页内只有 `run_end` ⇒ 恰一条 `run_termination`，
+  `payload.termination = {reason:'aborted', detail:'cancelled_before_start'}`、`seq` = 那行的 seq；
+  **同一条响应里 `type='run_end'` 零条**（红线同框断言）。
+- 判据②（不空白）：同一格 ⇒ 恰一条 `partial_output`，`payload` 逐项
+  `{text:'', chunks:0, truncated:false, placeholder:true, source:'none'}`（前端 `StreamPanel.vue` 的
+  `v-if="en.placeholder"` 那一行中性提示就是它的落点），且升序里排在分隔条**之前**。
+- 另三条钉边界：混合页（页非空也要有）、页界（旧页的分隔条不在新页重演 + 最终仍要出现一次）、
+  上界承重。
+
+**变异自证 5 条，每条先自证变异真的落到了文件上**（`git diff --stat` 对 `portal/src/http.js`）：
+
+| 变异 | 结果 |
+|---|---|
+| M1 撤掉候选发现（退回只认白名单行） | **恰 5 条新用例红**（判据①② + 三格边界）⇒ 用例真的钉住修法 |
+| M2 把 `run_end` 塞进后端下发白名单（踩红线） | **10 条红**：首条白名单用例 + #236/#288 那几条 + 新的红线源码钉 + 本单用例 |
+| M3 撤掉页下界 `seq >= $2` | **恰 2 条红**（页界 + 成本里那条「页下界必须写在 SQL 里」）。⚠ **第一次是假变异**：python 锚点里写了 `\$` 转义没命中 ⇒ rc=0 全绿，加 `assert old in s` 重做才拿到红（§8.24 那句「先自证变异非空操作」又一次自己抓到东西） |
+| M4 撤掉占位项 | **恰 2 条红**（判据② + #236 那条依赖占位的旧用例） |
+| M5 撤掉发现查询的上界 `before` | **恰 2 条红**（页界 + 上界承重） |
+
+**门禁读数**：`node --test 'portal/test/session-events-history.test.js'; echo rc=$?` ⇒ **`rc=0`**（27/27）；
+根 `npm test; echo rc=$?` ⇒ **`rc=0`**（`# tests 2363 / # pass 2349 / # fail 0 / # skipped 14`；
+基线 origin/main 同机同窗口现查是 2356 ⇒ **本单 +7 条**）。前端未改 ⇒ 未跑前端套件；`AGENTS.md` 未动
+⇒ 热层字节闸不在本单账上（顺手跑了 `npm run check:agents-hotlayer` ⇒ `VERDICT ok`）。
+
+⚠ **同一台机器上的计时敏感用例在抖，且与本单无关（已做基线对照）**：本分支根套件连跑 **10 次 = 4 次
+`rc=0` / 6 次 `rc=1`**，红的**全部**是计时敏感用例（没有一条落在本单改的端点上）：`env-int-strict-506e.test.js` 的 `#routes③ …` 与
+`#506e③ …`（`循环必须停在某一拍的 sleep 上`）、`idle-backoff-506.test.js:282` 的「孤儿回收按独立节拍
+⇒ 60s 空转约 6 次」；单跑 `env-int-strict-506e.test.js` 永远 `rc=0`。**基线对照**：同一时间窗口把
+`origin/main` 另开 worktree（共用 node_modules）连跑 **3 次 = 2 次 `rc=0` / 1 次 `rc=1`**，红的就是
+同样那两条（两边红的集合完全同形；本单改的是 `portal/src/http.js` 的历史端点，不在这两条的调用链上）。
+当时 `load average 17.6`、`ollama` 吐 355% CPU。交回读数取机器空下来
+那一次：**`rc=0`**。（那批用例自身的计时敏感度是一块既有债，本单不动它们，也不拿「复跑至绿」冒充证据——
+基线同形状已写在上面。）
+
+**未尽项 / 已接受边界**：① 候选发现的条数上界 = `limit`（极端会话「一整页都是被取消的 run」时，
+一页最多带出 `limit` 条分隔条；`next_cursor` 在空页上为 null ⇒ 分页到此为止，不会漏掉更新的内容）；
+② 每次 history 响应多一条 `run_events` 查询（有界），换掉的是「一条 run 在界面上完全不存在」——
+若将来要把这条也省掉，做法是把发现并入主窗口查询（`UNION ALL` 一个只带 run_id 的分支），
+代价是 fake 的分派要能解析 UNION，本单不做；③ 本单只在 fake 上自证（fake 现按 SQL 文本真算那条
+发现查询），**没有真库用例**——`seq` 边界与 `LIMIT` 的读数是文本级的，真库执行计划未测。
+
+**返修（同日，261115-04 二次审计第 1 条，主 agent 复核后接受）**：上面那版**留了一个静默丢失**。
+候选发现的 `LIMIT` 截掉的 `run_end` 行**没有游标可续**——旧口径 `next_cursor` 只由白名单行算，
+而**空页上白名单行不存在** ⇒ 游标恒 `null` ⇒ 客户端不再发下一页。上面「未尽项 ②」那句
+「空页上 `next_cursor` 为 null ⇒ 分页到此为止，不会漏掉更新的内容」**只对非空页成立**：
+空页恰恰意味着「游标之下还有内容，只是全不是白名单事件」，被截掉的那批就是**永远看不到**
+（不是晚点出现）。触发条件：会话尾巴上有多过一页的「从未开始就被取消」的 run（连点取消、
+批量清队列）——不常见但不是零。
+
+**先现验客户端到底靠什么续页（工单要求 1，读数先于改动）**：
+
+| 面 | 现查坐标 | 语义 |
+|---|---|---|
+| 线上游标字段 | `http.js#handleSessionEventsHistory` 的响应只有 `{events, next_cursor}` | `hasOlder` 是**后端内部变量**，不上线；`has_old_events` / `hasOldEvents` 在**代码里 0 处**（`grep -rn "has_old_events\|hasOldEvents" portal/src portal/frontend/src runner` ⇒ 空；文档里出现该词只是在说它不存在）⇒ 客户端只能靠 `next_cursor` |
+| 消息游标 | `workbench.ts:1106` → `olderMessagesCursor`（声明 `343`）；入口闸 `1129-1130`；按钮 `v-if` 在 `StreamPanel.vue:441` | 决定「**还要不要继续翻**」——翻页循环的**触发条件**是它，不是事件游标 |
+| 事件游标 | `workbench.ts:1107` → `olderEventsCursor`（声明 `344`）；消费在 `1137-1140` 拼 `?before=`，回写 `1145` | 决定「**更早的事件页从哪里开始**」⇒ **本单改的就是这一个** |
+| 续页条件是否落空 | `sessions.js:607-612`：每次 `POST /messages` 先写一行 `messages`（`role='user'`）再入队 run | 尾巴上每条被取消的 run 都**配一行 user 锚点** ⇒ 那一段消息游标仍非 null ⇒ 客户端会继续翻 ⇒ 事件游标真的会被消费（「只改游标让续页条件落空 = 没修」这条红线靠这一格落地） |
+
+**改了什么**：① 发现查询多带 `seq`，并按主窗口同一口径**多取一行探针**（`LIMIT limit + 1`，
+`§1.3` keyset 手法），于是「窗口之下还有没有更老的」是**事实**而不是「恰好返了 `limit` 条」的猜测；
+候选仍只取最新 `limit` 条 ⇒「候选数不超过页大小」不变。② **本页零白名单行 + 探针证实被截断**
+⇒ `next_cursor` = 已发现行里**最小的 `seq`**（发现自己夹了 `seq < before` ⇒ 同向、不倒退；
+下一页窗口 `[0, 那个 seq)` ⇒ 与本页严格不重叠）。③ **非空页不动游标**：那种页的游标属于白名单行，
+压到 `pageLow` 之下会**跳过真实事件**，比丢一条分隔条更坑。
+`buildHistorySynthItems` 的返回从「数组」改成 `{items, discovery}`：游标要的是**窗口事实**
+（`truncated` / `minSeq`），不是存活下来的合成项的 seq（项会被 M-6④ 的 `seq < before` 拦掉、
+会被「非终态 / 有锚点 / 无 reason」筛掉 ⇒ 拿它当游标会造出倒退的页边界）。
+
+**为什么用探针，而不用工单写的「返回 `limit` 条即视为截断」**：那个启发式在「恰好只剩 `limit` 条」
+的页上会把游标归到一条**已经展示过**的行 ⇒ 客户端白跑一趟空页，并且**逼着**既有那条
+「空页 ⇒ 分页到头」（本文件页界用例的 `p3.next_cursor === null`）改口径。探针把这条不变式保住了，
+代价只是发现查询多取一行。变异 M4 就是这一格（见下表）。
+
+**判据与读数**（`portal/test/session-events-history.test.js` **27 → 30 条 `test()`**）：
+- 判据①（工单原样）：游标之下**零白名单行**、只有 `limit + 2` 条 `run_end` ⇒ 第一页**恰 `limit` 条**
+  分隔条 + `next_cursor` **非 null** 且逐字等于「已发现最小 seq」；续页拿到**剩下的 2 条**；
+  合起来不多不少；且续页那一页的游标**必须回到 null**（探针承重）。
+- 三页翻页链：`2 * limit + 2 = 6` 条 ⇒ **恰好三页**翻完，每页 2 条候选（4 个事件 = 占位 + 分隔条），
+  游标序列 `[5, 3, null]` 严格递减，六条 `run_end` **各露面一次**（少了 = 静默丢失，多了 = 重叠重演）。
+  `walkPages()` 是这条链的夹具化：它在「游标不回 null」时**主动 fail**，不给无限循环留活路。
+- 非空页游标所有权：非空页即使发现被截断，`next_cursor` 也**必须仍是 null**（不许改成 22），
+  并顺手把「非空页截断残差」钉成读数（`?before=10` 那一页拿不到 20/21 那两条）——它现在是
+  §4.4a-2 **残余 ②**，不再是文档里的一句口头话。
+
+**变异自证 5 条，每条先自证锚点存在（§8.24 那条纪律）**：
+
+| 变异 | 结果（焦点两文件 59 条） |
+|---|---|
+| M1 撤掉游标驱动（`next_cursor` 只认白名单） | **2 红**：判据①（「续页拿到剩下的」那格）+ 三页链 ⇒ 正是工单点名的那一格 |
+| M2 游标取已发现的**最大** seq | **2 红**：`4 !== 3`（游标值）+「应当恰好三页，实际 5 页」 |
+| M3 游标多算一条（`minSeq + 1` ⇒ 窗口重叠） | **2 红**：同上两条，红在页数（重叠 ⇒ 同一条露面两次） |
+| M4 撤掉探针（`LIMIT = limit`，`rows.length >= cap` 当截断） | **3 红**：新两条 **+ 既有那条「空页 ⇒ 分页到头」** ⇒ 启发式确实会踩坏既有不变式 |
+| M5 去掉 `rows.length === 0` 守卫（非空页也让发现行改写游标） | **恰 1 红**（游标所有权那一格） |
+
+**两条 LOW 登记（审计 LOW-1 / LOW-2，只登记不改代码）**：
+- **LOW-1 成本算准**：未缓存时一次 history 响应最坏 **6 条查询** = handler 5 条（归属、主窗口、
+  候选发现、`runs` 批量投影、`partial` 正文投影）+ 会话鉴权 1 条；#514 多出的就是候选发现那条。
+  `LIMIT` 封的是**返回条数**不是**扫过的索引条目数**（`type = 'run_end'` 是残余过滤）；
+  `run_events_run_end_key` 建在 `run_id` 上，对这条**按会话扫**的查询**帮不上忙**，它只保证
+  「每 run 至多一行 ⇒ 候选数有界」。算术已逐字写进 §4.4a-2 成本段。
+- **LOW-2 源码级红线不承担回归检测**：那条「`run_end` 不在后端白名单 / 不在前端回放集合」的
+  **源码钉**用例，在**本单修复被整条撤掉时仍然绿**（它钉的是集合的字面量，而本单从没动集合）。
+  ⇒ 它是**源码级红线**（防「顺手加白名单图省事」），**不是**行为判据；行为判据是主 agent 亲手
+  变异打掉的那 6 条，加上本单新增的 3 条（各自都有上表的定向红做背书）。别把它当回归网。
+
+**残余（更新版，替代上面那三条里被本单改写的那部分）**：① 候选上界 = `limit`（不变）；
+② **非空页**的截断残差：既有白名单行、又有多过 `limit` 条 `run_end` 的页，比 `minDiscoveredSeq`
+更老的那几条落在 `[pageLow, minDiscoveredSeq)`，而下一页窗口是 `[0, pageLow)` ⇒ 接不住。
+不为它挪游标（会跳过真实事件，用例钉着）；真要修走 `UNION ALL` 那条（发现并进主窗口查询，
+顺带把成本段的 ③ 也省掉），代价是 fake 的分派要能解析 UNION ⇒ **后续单**；
+③ 空页窗口 `[0, before)` 的重叠**不消除**（游标分页的本性），靠游标不重叠 + 前端
+`termination:<run_id>` / `partial:<run_id>` 幂等键兜住（现读坐标见 §4.4a-2）；
+④ 客户端续页的**触发闸是消息游标**（`workbench.ts:1129-1130`），不在本端点手里：若某段尾巴
+连 user 锚点都没有（纯宿主注入，本站现无此路径），事件游标再好也不会被消费——那是前端那一面，
+本单不动，写清楚为止；⑤ 游标推进与 `seq` 边界的读数是**行为级**（走真 HTTP 端点 + fake 池，fake 现按 SQL 文本真算
+那条发现查询，含探针行与 `LIMIT`）；**真库**那一侧只做了下面的执行计划自证，**没有**真库端到端
+用例（本仓 history 端点从来没有真库集成用例，本单不开这个头，留给 `UNION ALL` 那个后续单）。
+
+**一次性真库自证（工单第 6 条，可选项，做了）**：为「`ORDER BY seq DESC LIMIT` 这条查询到底扫多少」
+起一个**一次性的** `postgres:16`（16.15）容器（`pg514-exec`，用完即删，**dev 库与 `station-*` 一个字节
+都没碰**），形状照 `docs/data/schema.sql:355-372` 现建 `run_events` 与它的三个索引/约束
+（**不是** migrations 全量、**不是** dev 库 ⇒ 它证明的是「计划真的会长成这样」，不是「dev 库此刻走哪条」）：
+
+| 格子 | 读数 |
+|---|---|
+| 全库 255,005 行 / 目标会话 55,005 行 / 该会话 `run_end` **4 条**；`… seq >= 0 ORDER BY seq DESC LIMIT 3` | `Bitmap Index Scan on run_events_run_end_key`（`Recheck Cond: type='run_end'`）+ `Limit rows=3`，`Execution Time: 0.03 ms` |
+| 同一会话 `run_end` 灌到 **5,004 条**；`LIMIT 501` | `Bitmap Index Scan on run_events_run_end_key` → `Sort Method: top-N heapsort Memory: 95kB`，`rows=5004 → 501`，`Execution Time: 2.6 ms` |
+| 同一时刻同一张表改回 `LIMIT 3` | 计划**换路**：`Index Scan Backward using run_events_session_id_seq_key`（`Index Cond: session_id=… AND seq >= 0`）+ `Filter: (type = 'run_end')` |
+| 非空页那一枪（`seq >= 150000 AND seq < 200000`） | 同一条部分唯一索引路径，`Rows Removed by Filter: 4` ⇒ 页边界夹的是**谓词**，不是「只碰本页的行」 |
+
+**这组读数推翻了两处各说对一半的说法**（都已在文档里改口）：① 上一版 §4.4a-2 与本文件里那句
+「走既有 `UNIQUE (session_id, seq)` 倒序扫」——只是**两条路里的一条**；② 审计 LOW-1 那句
+「`run_events_run_end_key` 在 `run_id` 上，对这条查询**帮不上忙**」——`run_end` 稀疏时它**恰恰是
+planner 选中的那条**（代价是它扫的是这一形状的 `run_end` 行、与 seq 窗口无关，所以还要配一次
+Top-N 排序）。两句都改成「planner 按统计二选一，两句都别当承诺」，并留了这张读数表做锚。
+**审计 LOW-1 成立的部分**：`LIMIT` 封的确实只是返回条数——两条路径的过滤 / 排序都在 `LIMIT` **之前**。
+
+**主 agent 补记（261116 清晨，第三方复审后的残差登记 + 文档订正）**
+copilot 复审（`gpt-6-luna`、xhigh、一次性沙箱树 `/tmp/audit-pr539`）**零 BLOCKER、1 MED**，
+且那条是**行为红**。我独立复现（**没抄它的夹具**，改钉「客户端只跟着返回的 `next_cursor` 走，那个 run
+最终必须出场」）：库里 `r-new` 两条白名单行 `seq=10/11`、更早 `seq=5` 只有一行 `run_end`，`limit=1` 翻页记录
+= `[[11,[…3 项]], [null,[10:tool_use]]]`，**`r-old` 一次都没出现**；对照组（`run_end` 放 `seq=9`）绿
+⇒ 不是探针坏。焦点套件 `32 / 31 pass / 1 fail rc=1`（唯一那红就是我这条探针）。
+机制我逐条读了原文才对上：`http.js:2905` `pageLow` → `http.js:3035` 发现查询 `seq >= $2` 把它当**下界** →
+`http.js:2913` `whitelistCursor` 依赖 `hasOlder` → `http.js:2926` `tailCursor` 非空页恒 null →
+`http.js:2933` `next_cursor: whitelistCursor ?? tailCursor`。
+**为什么它不是已登记的 ②**：② 要求「发现行超过 `limit`」才漏，我这条只有 1 条发现行、`limit=1`、**无截断**，
+断点纯由游标提前置 null ⇒ 尾巴页压根没被走到。已在 §4.4a「已接受边界」补 **④** 并写明「② 盖不住它」。
+残差**本 PR 不修**（修要动主窗口查询 `UNION ALL`），判据与修法登记进 **issue #561**；
+其中一条硬约束抄在这里以免后来人走捷径：**不许**用「把游标压到 `pageLow` 之下」换绿——
+那会跳过真实事件，用例 `#514 返修：非空页的游标所有权…` 钉着。
+本轮只动 `docs/api/portal.md`（一段）与本台账，**产品代码零改动**。
+
+
+### 8.132 「查看原文」里工具行说不出「返回了什么」：重建路把 tool_result 挂回 tool_use（issue #387 / 工单 fix-261115-03，2026-11-15）
+
+**编号由主 agent 统一分配（本批并行）**：我自己现查 `grep -n '^### 8\.' … | tail -3` 拿到的是 `8.126`、曾按 `8.127` 落笔，而 8.127 已被 #496 占、8.128/8.129 属另外两张单 ⇒ **按分配号 8.132 改写**（台账只用**追加**，不往中间插）。
+未撞号（`grep -rn "8\.127" docs AGENTS.md` 落地前先跑，零命中）。
+
+§8.62 收尾时留了一句「**已知不足另单跟**：重建路上 `resultPreview` 实测 **0/98**」——这一单就是那张单。
+
+**病根是形状，不是内容缺失。** 上游 `projectTranscriptForDisplay` **会**配对（`src/display/projection.js#toolResultsOf`），
+但它**只扫本条记录的 `messages`**。而 erix-agent 0.23+ 一轮落**多行**：`:msg:<n>:0` 是 assistant 的 `tool_use`、
+`:msg:<n>:1..k` 是**每个 `tool_result` 各一行**、`:engine:round:<n>` 载体的 `messages` 是空数组。
+`rebuildFoldedRange` 把**每行各自一条记录**喂投影 ⇒ 调用块与结果块永远分家 ⇒ 每个 `toolCalls[]` 只剩
+`name`/`argsSummary`。主消息流没这个病，因为 `session-view.js` 在投影前先过了读侧折叠（`transcript-fold.js`）
+——**同一件事（先让结果与调用同记录，再交给上游）的两个入口**。
+
+**为什么不用读侧折叠闸**（这是本片唯一真正的设计选择，别照抄工单措辞）：`foldTranscriptRows` 要 record 级形状
+（`kind`/`seq`/`partOf`/key），而重建 SQL 只取 `round, messages`；更要命的是它**必须**把 `messages='[]'` 的**载体行**
+也放进来才折得动，而放载体行进来 = 让投影走 `response.content` 回退分支 ⇒ **正文重复**。所以重建路走
+「**挂记录**」：按 `tool_use_id` 在本 range 内建结果索引，把缺的那些结果块**原样**（同一引用，站内不切长度）
+追加成一条 `{role:'user', content:[…tool_result…]}` 挂到带 `tool_use` 的记录末尾，**配对与预览截断全在上游**
+⇒ `resultPreview`/`isError`/`executionStatus`/`durationMs` 与主消息流同一把尺，零新契约面。
+纯读侧：零 DDL、账本零改写、不改上游。
+
+**四条不伪造边界**（判据 ② 的全集）：查不到 id ⇒ 上游**连键都不写**（不是空串、不是 null）；本记录内已结清 ⇒
+**就近取本记录那份**，不被别处同 `tool_use_id` 改写（崩溃恢复后 `:round:<n>` 与 `:round:<n>:resume` 双载体是真形状，
+§8.38 末登记的旧病灶在这里会露脸）；只有 `tool_use` 没有 `id`（旧记录形状）⇒ 跳过；
+**取行 WHERE 不因配对而放宽** —— 范围外的结果行不许搬进原文。
+
+**读数**（合成夹具，形状照真库 `:msg:` 行 + 一条真账本对拍）：
+
+| 面 | 修复前 | 修复后 |
+|---|---|---|
+| 真库 `e02d96cb…` round 25（range 22..22，14 行）带预览的 `toolCalls` | **0/10** | **10/10** |
+| 夹具里配得上结果的调用 | 0/3 | **3/3** |
+| 配不上结果的那条调用 | 缺键 ✔ | 缺键 ✔（`'resultPreview' in call === false`） |
+| turn 条数 / 角色分布 | 3 条 | **3 条**（挂回去的是 tool_result-only 消息，上游 `textOf()` 是空串 ⇒ 不多冒气泡） |
+
+**变异自证六条，各有牙**（一轮一还原，AGENTS 惯例）：① 摘掉 `attachToolResultsToRecords(...)` ⇒ **恰 3 格红**
+（判据① / 幂等 / 源码级哨兵；反向对照与「不多冒气泡」故意不红——它们断的是**缺席**，摘了照样绿）；
+② 配不上就塞占位预览 ⇒ **反向对照格红**（外加判据①计数红）；③ 撤 `own` 去重 ⇒ **恰 1 格红**（新加的
+「本记录内已结清」用例，先自证非空操作再定性：`toolResultsOf` 的 Map 是同值覆盖，所以**没有这条夹具时撤守卫是绿的**
+⇒ 是夹具缺，不是守卫多余）；④ **配对键错一位**（每条调用拿**下一条**结果，命中率照满但内容错位）⇒ **判据① + 幂等两格红**、反向对照与「不多冒气泡」绿 ⇒ 证明判据①**不是「有没有预览」的恒真断言**，它按 `tool_use_id` 逐条比**预览文本**；⑤ 前端 `v-if` 写死 false ⇒ 恰前端那格红；⑥ 折叠消费点护栏的谓词自己正反两条都钉
+（真 import 必须判真、纯注释必须判假）。
+
+**顺带修掉一条会咬人的护栏**：`transcript-fold-wiring.test.js` 的「只有三个消费点」判据是
+`src.includes('transcript-fold.js')` —— **注释里提一下模块名就被咬红**（本片实测）。它自己早就写明「注释不是消费点」
+（因此排除了模块自身），却只排除了自身 ⇒ 护栏退化成打字员。改成只认 `import/export from` 语句，
+并自带正反自证。**允许清单仍是三个**：重建路不折、不消费本模块，真加第四个消费点仍要改那里并写理由。
+
+**界面这半边一起接上**（`StreamPanel.vue`）：工具行下多一行 `↳ <结果>`，走 `getToolResultSummary()` 归一
+（#228 同一把尺：string / `{content, metadata}` / number 三套形态，`0` 不算「没结果」）；
+**归一后是空串就一行都不画** —— 上游对配不上的调用是缺键，宁可少一行也不许在原文里凭空造一句它没说过的话。
+`workbench.ts` 的 `FoldedOriginalTurn.toolCalls[]` 补 `resultPreview?`（主消息流 #188 早就在送，原文面从来没填）。
+
+**门禁**：根 `npm test` **rc=0**（本片树 2363 格 / **2349 pass / 0 fail / 14 skipped**；+7 格全部来自新增的
+`portal/test/session-folded-result-preview.test.js` ⇒ 基线套件是 2356 格。⚠ 基线的 pass 数**我没在
+origin/main 上单独跑过**，别把 2349 当基线读数）；
+前端 `npm run typecheck` **rc=0** + `npm test` **rc=0**（63 文件 / 1378 格，+1）。
+⚠ 前端跑测试要 `env -u NODE_ENV`（本机 shell 是 `production` ⇒ `emitted()` 假红，AGENTS §4），
+且 `npm ci` 要 `NODE_ENV=development`（否则 devDependencies 不装、`vitest: not found`，实测 rc=127）。
+`npm run check:agents-hotlayer` rc=0。零依赖改动、零 lockfile 提交、`AGENTS.md` 一字节未动。
+
+⚠ **一条同机并发假红（不是本片引入，另单 #531）**：第一次全量跑 `npm test` **rc=1**，两格里有一格是
+`portal/test/env-int-strict-506e.test.js#506e③「严格性不许把安全上限那一条挤掉」`——断言
+`循环必须停在某一拍的 sleep 上`（`clock.pending` 要在 300 个 `setImmediate` 内出现）。两个读数：
+**全量并发跑 = 红**（本机同时有别的 agent 在跑，定时器饥饿），**单独复跑
+`node --test portal/test/env-int-strict-506e.test.js` = 17/17 绿**，且**全量复跑 = rc=0（0 fail）**。
+另一格红是我自己的改动真抓到的（折叠消费点护栏被注释误咬，见上），已修。
+⇒ 口径照 AGENTS §4「判绿只看退出码」，但**红格必须先单独复跑再定性**，别把定时器饥饿当回归。
+
+**没碰的文件**：`ISSUES.md` 的 B 表里 #387 那行仍写「真待做」——那是 261111 对账表、本批还有并行单在同改文档，**留给主 agent 关单动作统一改**（判据在代码与台账，不在这行字）。
+
+**未尽项**：① 本片的真账面对拍只有本机 `station-db` 里那一条折叠会话（`e02d96cb…`）——现网其它会话的
+折叠范围没有逐条复跑（形状同源，但读数只在这一条上取过）；② `executionStatus` 的特殊态（`intercepted`/
+`interrupted`）在原文面**没有专属展示**，目前只会随 `resultPreview` 一起进 `getToolResultSummary` 那条通用归一
+（主消息流的特殊态判据在 `StreamPanel.vue` 的 `cardOut`，原文面没接它）；③ 前端那格判据是 DOM 文本断言，
+**没有跑过浏览器**（本片不动部署面）。
+
+**主 agent 补记（261116 上午，第三方复审判读 + 文档口径订正）**
+copilot 复审（`gpt-6-luna`、xhigh、一次性沙箱树 `/tmp/audit-pr541`）交回 **1 MED + 3 LOW**
+（第一发被 25 分钟看门狗砍了，但它**砍前已把报告写盘**；我另起了收窄版重跑）。我的逐条处置：
+
+- **MED（张冠李戴）我独立复现了**，在**独立树** `/tmp/parent-pr541`（不跟审计同树——我自己定的「并发写者
+  不许共享同一目录」，第一版我踩了：审计树里同时有它的 `B: run-id isolation…` 与我的探针，读数混在一处）。
+  位置序 `call(OLD) < call(NEW) < res(NEW) < res(OLD)` ⇒ 两个调用的 `resultPreview` 都是新调用那份
+  （`["RESULT-FOR-NEW-CALL","RESULT-FOR-NEW-CALL"]`），焦点套件 **13 / 12 pass / 1 fail rc=1**。
+  修法方向与判据进 **issue #562**（不在本 PR 修）。
+- **我自己造了两个假红，都记在这里**：① 判可观测性时按英文词 `/duplicate/i` 判，而现读 warn 是中文
+  ⇒ 差点把「已有留痕」记成「无人知道」；改成对得上现读文案（`多份结果|就近优先`）后 **`#P541-B` 绿**。
+  ② 第一版把两条断言并成一条，第一条炸了就看不见第二条读数 ⇒ 拆成 A/B 两格。**判据必须对得上现读文案**。
+- **LOW（代理对）我确认是真的，但病灶在上游**：`node_modules/erix-agent/src/display/projection.js:31`
+  的 `MAX_RESULT_PREVIEW = 400` 配 `text.length` / `slice(0, maxChars)` ⇒ 单位是 **UTF-16 代码单元**。
+  我本机逐字跑：`'a'.repeat(399) + '💥tail'` ⇒ `length=405`、码点 `404`、`slice(0,400)` 末尾 `"a\ud83d"`（孤立高代理）。
+  ⇒ 上游单 **erix-agent#854**；宿主不在 portal 侧二次截断（复制引擎口径必然漂）。
+  **顺带订正我们自己的文档**：`docs/api/portal.md` 那条「400 码点」是**写错的**，已改成「UTF-16 代码单元」
+  并带上这条实测读数（算术量级不变，变的只是边界形状）。
+- **LOW（两路不一致）纠正的是我的派单简报，不是产品**：实时 `result_digest`（500、无省略号）与折叠
+  `resultPreview`（400 + 省略号 = 401）本来就是两种东西；我简报里「两路逐字一致」那句作废。
+  核过文档没有声称一致 ⇒ **文档不用改行为，只补一句口径说明**。
+- **LOW（顶层 `text` 重复气泡）审计自己标了 UNPROVEN**，与本节已有的「未造出生产者」现读一致（真库
+  1423 个 `tool_result` 块无一条带顶层 `text`），**维持现状不修**。
+- 我另外自己钉到的一条（审计没走通，因为**我的沙箱没装前端依赖**）：预览进界面是
+  `StreamPanel.vue` 的 **`{{ }}` 插值不是 `v-html`** ⇒ 注入面直接排除。补记于此，并把「审计树要跑前端
+  就得先 `cd portal/frontend && NODE_ENV=development npm ci`」记成派单前置（本次是我漏的，rc=127）。
+
+本轮**只动文档与本台账**，产品代码零改动。
+
+
+### 8.138 `maskedPaths` 接进生产链路：能力与单测都在、装配点 0 引用（issue #231 / 工单 fix-261115-02，2026-11-15）
+
+> **编号由主 agent 统一分配（本批并行）** ⇒ 本节取 **8.131**。（worker 当时的现查过程留给后继：
+> 本树 `grep -n '^### 8\.' | tail -3` 最大是 8.126 ⇒ 先取 8.127，现查同批 `wt-496-261115` 已占 8.127
+> ⇒ 自查改取过 8.128，最后按主 agent 的分配表改为本号。台账只**追加**不往中间插，本节的编号修正
+> 只动自己那一节的标题行。）
+
+**现查起点（工单给的三条，逐条复核过）**：`runner/lib/file-tools.js` 的 `createJail({root, writable, maskedPaths})`
+确实支持遮蔽（该文件 9 处引用），而 `runner/worker.js` 里 `maskedPaths` **0 处**——不是「遮蔽做坏了」，
+是**装配层从来没传过**。这类缺口的坏处在静默：jail 越界/非可写都在挡，只有遮蔽这一格是空的，
+`file-tools-contract.test.js` 里两条遮蔽用例还一直**绿着**（它们自己传 `maskedPaths`）。
+真机代价就是 `readFile .env` 把数据库密码整块拽进 transcript（本文件 §8.9 #228 那条「待办 ③
+密钥遮蔽在真实项目上的实际效果」一直没做，就是这一格）。
+
+**改了什么（三处，`git diff --stat origin/main...HEAD` 为准）**：
+
+| 文件 | 内容 |
+|---|---|
+| `runner/worker.js` +21 | `createJail` 与 `createStationFileTools` 各传一份 `STATION_MASKED_PATHS`；补一条 `MSG.LOG` info 记账（走现成通道，**不新增事件类型**） |
+| `runner/lib/file-tools.js` +143（其中代码 65 / 注释 71 / 空行 7） | 遮蔽条目从「只有前缀」扩成「前缀 ∪ 名字模式」；新增名单单一真相 `STATION_MASKED_PATHS`；`createJail.assertReadable` 的名字模式**词法路径与 realpath 结果都比** |
+| `runner/test/masked-paths.test.js` +322（新增，14 条） | 工单三条判据 + 覆盖面/反面/误伤/只挡读不挡写/遍历排除账/条目语义/symlink 双向 + **worker 接线锁** |
+
+**为什么 65 行落在 `lib/file-tools.js` 而不是「只在 worker 传一个数组」**：口径点名的五项是
+`.env*` / `.git/config` / `.npmrc` / `*.pem` / `id_*`，其中三项是**名字模式**，而 jail 的 0.3.5 前缀机制
+只会做「这个路径及子树」——传字面量 `.env*` 进去，比较时会拿 `<root>/.env*` 去比 `<root>/.env.local`，
+**恰好不命中 ⇒ 三项是死的**，且死得和原来的 0 引用一样静默。备选方案「启动时扫一遍目录把模式展成
+具体路径」被否：它给遮蔽加了一条它本没有的失效条件（run 中途新建/改名的 `.env.local` 不在快照里），
+而 #451 那类真机教训正是「下发了 ≠ 读了」——不能自己再犯一条「扫过了 ≠ 挡得住」。
+所以扩的是「一条遮蔽条目怎么写」，**前缀条目语义与 0.3.5 移植面逐字未动**（`file-tools.test.js` /
+`file-tools-contract.test.js` 的 64 条零改动通过就是这条「没顺手改边界」的自证）。
+**中途收窄过一次**：装配层一度为「root 是符号链接写法」编了 realpath + 词法两张表，现查生产链路
+`createJail` 的根本来就是 realpath 过的、两种拼写都在 jail 那一层兜住 ⇒ 两张表不改变任何生产结论，
+已还原成一张（连带删掉只为它存在的 `realpathOrSelf`）。留下的已知边界写进了注释与用例
+（无 jail 且 root 是链接写法时，前缀条目比不中；名字模式不受影响，因为它比的是段名）。
+
+**判据与变异自证**（每条都是「先红给你看，再改回来」；命令 `node --test 'runner/test/masked-paths.test.js'`）：
+
+| # | 判据 | 怎么改坏它 | 红了哪一格 |
+|---|---|---|---|
+| ① | `.env` 用 `readFile` 拿不到，错误点名被拒路径（jail 层直接钉 `JailError path_masked`） | 名单里删掉 `'.env*'` | 判据① + 连带 8 格（9 红） |
+| ①' | 同上（另一条成因链） | `isMaskPattern` 恒 `false`（模式不编） | 判据① + 8 格（9 红，与上一条**红集合不同**：多红「条目语义」） |
+| ② | 反向：同目录 `notes.txt` / `README.md` / `src/main.js` 照读，且 `jail.assertReadable` 放行（防「挡住」其实来自越界） | `canWrite` 里加 `!withinMasked` | 「只挡读不挡写」红（写侧被顺手挡了 = 口径漂移） |
+| ③ | **shell `cat .env` 仍能读到全文**（钉现状，不许当 bug 修） | 给 `lib/shell-tools.js` 加一行「命令含 `.env` 就拒」 | 只有判据③红（1 红）⇒ 这条专防「有人去兼容 shell」 |
+| 接线 | `worker.js` 两处调用都传 `maskedPaths: STATION_MASKED_PATHS`，名单不在 worker 里重抄 | 任一处去掉 `maskedPaths` | 接线锁红（W1 / W2 各一次） |
+| 双向 fail-closed | `.env` 指向别处仍挡、普通名字指向 `.env` 也挡 | 去掉词法那一路 / 去掉 realpath 那一路 | 各红 1 格（symlink 那条） |
+
+**不对称是设计，已登记进文档**（工单口径）：`maskedPaths` **只挡文件工具，挡不住 shell**
+（`lib/shell-tools.js` 头注 + 不变式 1「容器是信任边界」），**只挡读不挡写**（与 `assertReadable` 逐字对齐的
+旧口径）⇒ 它的定位是**防止敏感内容被主动读进 transcript / 上下文**，**不是安全加固**。这条不对称此前
+只活在注释里，`docs/` 里 0 处（现查 `grep -rn 'maskedPaths' docs/` 只有 #228 的接线描述与 §17 风险表一行），
+本轮补两处：`docs/design/runner-integration.md` **§17.1**（不对称 + 三条理由 + 覆盖面表 + 误伤清单）、
+**§6.3-3** 新增一条接线事实（两处都得传、两类条目的深度语义不同）。
+**集合只针对项目目录以内**：FDE home 的 `~/.ssh` / `~/.git-credentials` / `~/.erix/*` 本来就在 jail 根外，
+不是「漏了家目录」。刻意误伤（出口都是「多绕一步 shell」）：`.env.example` / `.env.sample` 模板被 `.env*`
+命中、`id_mapping.csv` 被 `id_*` 命中、`*.pem` 测试夹具读不到——`SYSTEM_PROMPT` 已有出口句，不改提示词。
+
+**门禁（只看 rc）**：runner `node --test 'runner/test/*.test.js'` → `# tests 521 / pass 521 / fail 0`、
+**rc=0**（基线 507 + 本单 14）。根 `npm test` → 总数 `2356 → 2370`，**本单相关的那 14 条恒绿**，
+但整棵树在本机**时红时绿**：`fail 0/1/2/3/4/5` 都出现过（负载 11→24），红的**全是 #506 那一族假时钟用例**
+（`portal/test/env-int-strict-506e.test.js:49` 等三处 `arm()` 靠「转满 300 个 `setImmediate`」等循环
+停在 sleep 上——那是**轮次预算不是时间预算**，机器负载 16→24 时循环还没走到第一拍 `sleep()` 预算就烧完）。
+**同机并发下会假红这件事已由主 agent 开 #531 跟踪**（本单不顺手修：那三个夹具在 #506 的改动面里，
+现在动只会在合并时撞车；修法建议见本节末尾「未尽项 ④」）。
+**与 #231 无关的实测**（交错跑，同样负载窗口）：把本单新增的测试文件**拿掉**只跑基线树，
+3 轮里仍红 2 轮（红的同样是 `#routes③` / `#506e③`）；带本单文件 3 轮里红 2 轮 ⇒ 红绿与改动无关。
+**硬证据（借临时 worktree 跑了一棵干净的 `origin/main`）**：同一时间窗内
+`c8613a3` 干净树 `npm test` 三轮 = **rc=0 / rc=1(2 fail) / rc=1(1 fail)**，红的就是同一族用例
+（`#routes③` / `#506e③`）⇒ 这条红是 **main 自带的负载敏感夹具**，不是 #231 带进来的；
+worktree 用完已拆（`git worktree list` 里没有 `/tmp/pristine-231`）。
+**定性用的两个读数**（`#531` 那一类的标准定法：红格先单跑再定性）：
+`node --test portal/test/env-int-strict-506e.test.js` **单跑 = rc=0（17/17 绿，连跑两遍都是）**；
+同一台机同一负载窗口内的**全量** `npm test` 则能到 **rc=1**（红的就是该文件的 `#routes③`，负载 13.4 那一轮）；
+负载降到 9.8 后全量又 **rc=0（2370 / 2356 pass / 0 fail）**⇒ 单跑恒绿、全量随负载飘 ⇒ 并发抢时，不是逻辑回归。
+
+**未尽项**：① 真机 e2e 未做（本单只到单测 + 门禁；#228 遗留的「遮蔽在真实项目上的实际效果」这条
+待办现在才**具备被验的条件**，验的人应同时看 §17.1 的三条判据而不是只看「挡住没有」）；
+② `ISSUES.md:549` 那句「`maskedPaths` 已注入（§8.9）」是**错的**（现查 worker 0 处 ⇒ 本轮才是真注入），
+是否改口径/关单交主 agent，本单没动 ISSUES.md；③ 运维坑与本文件多条同型——改动全在 **worker 进程**里
+⇒ 必须重建 FDE 镜像并 `docker rm -f` 让 reconcile 重建才生效（`ensureFdeContainer` 不检镜像漂移）；
+④ 上面那三个 #506 假时钟夹具（已开 **#531** 跟踪）建议改法：`arm()` 的等待从「300 个 `setImmediate`」改成**带墙钟上限的
+spin**（例：上限 2s，每轮仍 `setImmediate`，到点仍 `assert.ok(clock.pending)`），假时钟语义不变
+（sleep 只能被 `release()` 放行），只是把「轮次预算」换成「时间预算」。不在本单做的原因：
+那三个文件属于 #506 的改动面，同时动它会在合并时撞车。
+
+**追加（2026-11-16，同单收口第二轮）**：第三方二次审计（copilot / gpt-6-luna / xhigh / readonly，对象 PR #540
+的 diff）判**生产面没有漏洞**（glob 与前缀语义、symlink 双向、写侧不遮蔽都有据，接线锁撤任一处都红），
+留了两条尾巴，本轮都收了。**没有 amend/rebase 已有提交，全是新增**（`6321eec` 测试、`8da783c` 文档+注释）。
+
+① **加了一条「遍历式」自检判据**（`runner/test/masked-paths.test.js`，14 → 17 格）。病根：此前所有用例
+都是「已知条目 = 已知行为」的具名钉子，**没有任何一条**问过「往 `STATION_MASKED_PATHS` 新加一个条目时
+它真的会命中东西吗」——而 `compileMaskedTable` 对条目是「能编就收下」⇒ **打错字静默不挡**：审计给的两个
+实例 `'.env* '`（尾空格进了式子）与 `'**/.env'`（本表 `*` 不跨 `/`、**没有 globstar** ⇒ 命不中根目录那个
+`.env`，只能命中 `sub/.env` 那种带目录的写法）都能让门禁照绿。新判据三格：
+- **自检**：夹具表 `MASK_FIXTURE_PATHS`（与名单同文件维护，7 条路径）+ 逐条**单独装配**
+  （`maskedPaths: [entry]` ⇒ 命中不许被隔壁条目顺带兜住）遍历名单，断言每条至少命中一个夹具；
+  同一格里再钉夹具自身不空转（整份名单下这 5 个代表路径确实该被挡、`README.md` 参照不许被挡）。
+- **反向自证**（永久钉，不靠手工变异）：往名单里塞那两个审计实例 ⇒ 判据必须红且红文点名是哪一条。
+- **限制钉子**：**这条的遍历面防不住「从名单里删条目」**（剩下的照样条条命中）。删条目真正的红来自
+  具名钉子（`生产名单逐项命中` 逐条点名 + `遮蔽集合本身` 的 `deepEqual` 冻结字面量）。
+  这条限制写成了**用例**而不是只写注释，免得后继误信它防删。
+  ⚠ 别把它读成「删条目时这一格一定绿」：同一格还带一条「夹具不得空转」的断言，真源码上删条目会把
+  **那一面**触发红（读数见下表第三行）——**隐形的是遍历面，不是整格**。
+另一条限制也写进注释了：它问的是「到底挡不挡得住任何东西」，不是「挡的是不是你心里想那个」⇒
+**加条目时还要同时往 `生产名单逐项命中` 那张表里加一行具名断言**。
+
+**变异自证读数**（每条改完立刻还原，还原后 `masked-paths.test.js` 17/17 rc=0）：
+
+| 变异 | 结果 |
+|---|---|
+| 名单 `'.env*'` → `'.env* '`（审计实例①） | 12 格红，其中新判据红文点名 `[".env* "]`；具名钉子同轮一起红（符合预期） |
+| 只把夹具表里的 `deploy/keys/id_ed25519` 删掉（**名单一字未动**） | **具名用例 1–12 全绿，只有新判据红**并点名 `["id_*"]` ⇒ 这条判据独立有效，不是蹭具名用例的红 |
+| 名单去掉 `'.npmrc'`（真源码上删，注释掉那一行） | 红 4 格：`生产名单逐项命中`④、`遮蔽集合本身`⑯（冻结 `deepEqual`）——**这两条才是防删条目的锁**；新判据⑬也红，但红在**「夹具不得空转」那一面**（代表夹具 `.npmrc` 变得可读），**它的遍历部分照样不红**；⑮（限制钉子）红在「本用例假设名单可筛掉一条」⇒ 限制本身另有钉子 |
+| 同上，但**只在测试里筛**（⑮ 那格的 `minusOne`，名单不动） | 遍历式检查返回 `[]` ⇒ **删条目在遍历面隐形**，这条限制是实测出来的、不是推测的 |
+
+② **只登记不改代码的一条**：`docs/design/runner-integration.md` §17.1 补了一段事实——**无 jail 的装配路径**
+（`runner/lib/file-tools.js` 的 `withinMasked`，现 `:350`；审计记的 `:346` 已因新增注记位移）把上游给的
+**同一个** target 同时当词法路径与 realpath 结果交进去 ⇒ 对 glob 遮蔽的 symlink 双向检查**退化成单向**；
+实测：不供 jail 时 `alias.txt -> .env` 用 `readFile` 直接拿到 `1: SECRET`，同一装配补上 jail 后回
+「错误：…被宿主边界拒绝」。反方向（`.env` 被改成软链）不退化（段名还像密钥）。
+**生产不走这条路**：`runner/worker.js:559-560` 同时给 `createJail` 与装配层供了名单。
+按裁决**没**改装配语义、**没**加参数，只在调用点上方留三行注释指回 §17.1。
+
+**门禁（本轮实测，只看 rc）**：`node --test 'runner/test/masked-paths.test.js'` → **17/17 rc=0**；
+`node --test 'runner/test/*.test.js'` → **524/524 rc=0**（上轮 521 + 本追加 3）；
+根 `npm test` 跑 1 次 → `# tests 2373 / pass 2359 / fail 0 / skipped 14`、**rc=0**（load 1.53→2.79，
+低负载窗口 ⇒ #531 那族假时钟夹具这轮没飘；上一节已记清它在 load 13+ 时会让全量 rc=1 而单跑恒绿，
+**本轮没有出现需要定性的红格**）。`node --check` 全部改动文件过。
+
+
+### 8.139 issue #259 jail 只读例外：读边界从一条变两条（写判定一点没放宽）+ 提示词退掉一条教了半年的假病（issue #259 / 工单 fix-261116-05，2026-11-16，worker 落地 + 真机判据 BLOCKED-on-deploy）
+
+> **编号由主 agent 统一分配（本批并行）**：worker 侧按 `grep -n '^### 8\.' | tail -3` 先挑了号，最终以主 agent 的分配为准（§8.116 那条撞号老账）。
+
+**动的是什么**：`createJail({ root: cwd, writable: [cwd] })` 的读边界一直只有项目根，`~/AGENTS.md`（平台约束的单一真相，#258）与 `~/.erix/ports.json`（端口唯一真相，#246）在 `readFile` / `tree` 里**不存在**——真机证据是 transcript 里读 `~/AGENTS.md` 走的是 `shell cat`，模型的自然习惯 `readFile` 撞上 `错误：读取被宿主边界拒绝：…`，白烧一轮。**加的是只读例外，写判定一点没放宽**（红线：agent 能改平台文件 = 下一轮对账覆盖回去 = 用户以为改掉了，那是比「读不到」更坏的困惑源）。
+
+**实现形态**（`runner/lib/file-tools.js`）：读侧多一条解析，写侧沿用 0.3.5 那条。
+- `createJail({ root, writable, maskedPaths, readExceptions })`：`resolve` 逐字未动（严格根内，也是历史 `resolve` 的唯一实现）；新增内部 `resolveReadable` = 「根之内 ∪ 例外之内」，**只有 `assertReadable` 用它**。例外条目 `realpathWithMissing` 后再判前缀 ⇒ `<例外>/../<别处>`、指向清单外的 symlink、以及**名字前缀与例外相同的兄弟目录**（`~/.erix-backup`）都出不了清单；对**还不存在**的路径不抛，所以「平台文件尚未物化」不会在装配期炸掉 jail。
+- `maskedPaths` 的条目解析从「严格根内」改成同一口径：**这是本单一处刻意的语义变化**——家目录开了只读例外之后，「在例外里遮蔽一个密钥子目录」之前会被当成越界而在装配期抛，现在能用；落在根与例外**之外**的遮蔽条目仍照旧抛（旧守卫原样保留，不静默吞写歪的规则）。
+- `platformReadExceptions({ home })` = `[<home>/AGENTS.md, <home>/.erix]`，`worker.js` 里 `createJail({ root: cwd, writable: [cwd], readExceptions: platformReadExceptions() })` 只有一处装配。两条纪律：**不含运行期事实**（端口号 / 伞域 / FDE 名一个都不出现，#246/#257 同口径）；**fail-closed**（拿不到家目录 ⇒ 空清单，退化成 #259 之前的行为，不是「放宽成整个 `/`」；`home: undefined` 是「没传」的同义，不是「拿不到」）。
+- #228 的接线口径不变：喂给上游的 `allowRead` 仍是「调用方谓词 ∧ ¬遮蔽 ∧ jail 谓词」，例外只长在 jail 那一项上——`file-tools-contract.test.js` 新用例把四种「放宽过头」的形状各钉一条（正向对照 + 调用方谓词照挡 + 装配层遮蔽照挡（遮蔽项正落在例外里）+ 写侧不被顺带放宽）。
+
+**「被拒」与「为什么被拒」是两件事**（本单最容易做假的一条，主 agent 派单时点名）。上游把谓词的 `false` 排成一句固定文案 `错误：写入被宿主边界拒绝：<相对路径>`，**它看不见 jail 的错误码** ⇒ 只断言「被拒」的测试放什么实现进去都能绿。所以分两层钉：
+- jail 层三条拒因的**错误码分得很开**：落在例外清单里 ⇒ `path_read_only`；根内非可写 ⇒ `path_not_writable`（同 0.3.5）；根外 ⇒ `path_escapes_root`（同 0.3.5）。三条都是拒，**写判定一点没放宽**，只是把其中一条说准了。
+- 工具文案层在 `executeTool` 出口给那句拒绝**追加**一句原因（`错误：写入被宿主边界拒绝：…（这是平台开的**只读例外**…读得到、写不进去）`），只追加不改上游前缀（契约只钉前缀）。两条拒因的**用词互不重叠**（`只读例外` 四个字只出现在第一条），否则「分得开」只能靠 `doesNotMatch` 逆推、会被无关文案里的同一个词误兵。装配层为此记一次「最后一次 `allowWrite` 调用的拒因」：上游对一次写只调一次 `allowWrite`（`src/tools/file-tools.js` 里 `writeFile` / `edit` 各一处），所以它是确定量；将来上游改成多次调用，备注会变糊但不会变错（注释里写了这条前提）。
+
+**清单为什么不收窄成「只放 `ports.json`」（现查，不是省事）**：`~/.erix/` 里平台只物化四样（`portal/src/materializer.js#buildFilePlan`：`config.json` / `mcp.json` / `ports.json` + 落盘后的 `manifest.json`），`config.json` 里只有**占位 key**（`renderConfigJson` 的 `apiKey: 'erix-placeholder'`，H-B D-4 容器内零真实凭据），userspace 每 FDE 一棵（user-space §2.4）⇒ **既没有跨 FDE 数据也没有密钥**。目录里余下的 `skills/`、`todos/` 是本 FDE 自管内容（user-space §4.2），读到它们不是失守而是本意。⚠ **现查顺带挖出两条事实**：① `maskedPaths` 在**生产侧没有生产者**（`grep -n maskedPaths runner/worker.js` = 0 处，jail 与装配层都只在建工厂时收这个参数）⇒ 本单「例外内遮蔽仍生效」是**库层能力 + 测试锁定**，真要在家目录挡密钥还得先把 `maskedPaths` 接进 worker 装配（另单，别顺手塞进本单）；② `~/.erix/delegation/` 这条路径**不存在**——delegation 的名册/账本住 `<home>/delegation`（`runner/lib/delegation.js:172` 由 agentd 下行；`docs/api/portal.md` §4.4c 同口径），`docs/design/event-platform/06` §1 那句「名册目录 `~/.erix/delegation/`」与实现不一致，本单没照它开例外。
+
+**不与 PR #540 的 glob 语义耦合**（#540 还没合并，main 上遮蔽只有前缀语义）：本单用的例外条目与遮蔽条目都是**字面前缀**，并且反着钉了一条用例——把 `*` 写进 `readExceptions` / `maskedPaths`，它必须**不**当模式用（`<home>/*` 遮不住 / 放不了任何东西）。将来 #540 合并后这条变红，就是提醒重读口径，不是「修测试」了事。
+
+**提示词那一条假病退场**（issue 验收的反向防漂移）：`runner/worker.js` 原来写着「`~/.erix/ports.json` 在家目录（项目目录之外），**文件工具读不到它**（会回「被宿主边界拒绝」），用 shell 读：`cat ~/.erix/ports.json`」——一条存在的意义就是「教模型绕过平台的缺口」，缺口填了它就成了谎（教模型去跑一条比 `readFile` 更贵、还把整文件灌进上下文的路径）。改成 `readFile` 口径并写明「读得到但写不进去」。`system-prompt.test.js` 三条同步：① #451 那条用例的判据**等强度换向**（仍要求「说清怎么读到它」，手段从 `cat` 换成 `readFile`）；② 新增反向防漂移（旧句式**整族**退场，`~/…` 读法的句子里不得再出现 `cat`）；③ 新增**接线锁**——断言必须钉在 `createJail({…})` 这一个调用点上，`writable` 仍是 `[cwd]`。
+
+**变异实验**（每条都先红再复绿；后三发是在**最终代码形态**上跑的，前三发是在「还没有拒因分诊」的那一版上跑的，已标注）：
+| 变异 | 读数 | 备注 |
+|---|---|---|
+| `assertReadable` 退回严格 `resolve`（读侧例外整体失效） | **9 红 / 91**（正向、写红线、越界、遮蔽×3、严格语义、真机形状、契约谓词相与） | 最终形态复跑 |
+| 删掉 `path_read_only` 那条分支（拒因塌回越界） | **2 红 / 91**（「红线：写边界不变」+「jail 严格语义一字未动」） | 最终形态复跑——**只断言「被拒」的测试在这一发下会全绿**，这就是它存在的理由 |
+| 撤掉 worker 的接线（只改文案不改 jail） | **1 红 / 91**（「#259 接线锁」） | 最终形态复跑。第一版这条**全绿**：断言写成了全文关键词，命中了注释里的同一串字——是变异实验揭穿的唯一一条假锁，改成钉调用点后复红 |
+| `resolveReadable` 只按 lexical 前缀判定（不做 realpath） | 2 红（越界用例 + 既有 F7 symlink 用例） | 前一版形态，之后未复跑 |
+| 清单放宽成整个家目录 | 2 红（清单内容、真机形状） | 前一版形态，之后未复跑 |
+| 遮蔽条目退回严格解析 | 2 红（例外内遮蔽、遮蔽条目落点） | 前一版形态，之后未复跑 |
+| 提示词退回旧文案 / 写边界顺手加 `os.homedir()` | 3 红 / 1 红 | 前一版形态，之后未复跑 |
+
+**验证**：`node --test runner/test/file-tools.test.js runner/test/file-tools-contract.test.js runner/test/system-prompt.test.js` **91/91 绿**（基线 78 → 新增 13 条：jail 侧 10 + 契约侧 1 + 提示词侧 2）。新用例覆盖：正向三工具（含例外目录的子目录）、写被拒且**不落盘**（`writeFile` 与 `edit` 各一次）+ 两条拒因文案分得开、八条越界（lexical 在例外内而 realpath 在外 / symlink / 例外文件再 `..` / 清单外家目录文件 / `.erix-backup` 前缀兄弟 / 普通兄弟 / `$HOME/../etc/passwd` 两种爬法）、遮蔽在例外内（前缀形态条目 + 排除账 `metadata.searchSkipped.deniedPaths` + `tree` 不列）、遮蔽条目落点三格、glob 元字符按字面、缺省空清单 = 旧行为、`platformReadExceptions` 内容与 fail-closed、**真机形状**（把 `process.env.HOME` 换到夹具 ⇒ 上游 `expandHomePath` 与本模块缺省值同源，`readFile {path:"~/AGENTS.md"}` 读到内容而不是撞边界）。
+
+**⚠ BLOCKED-on-deploy：issue 验收的「真机：agent 用 `readFile` 读 `~/AGENTS.md`」本轮未跑**。改动全在 **worker 进程**里 ⇒ 必须**重建 FDE 镜像 + `docker rm -f` 掉 `fde-*` 容器**才生效（`ensureFdeContainer` 不检镜像漂移，同 `runner-integration` §6.3 的运维坑），而本机 5 个 `fde-*` 容器当时正被另一张引擎升级单占用（本轮红线：不碰任何 `station-*` / `fde-*` 容器）。复测方法（谁做都照这三步）：
+1. `docker ps --format '{{.Names}}' | grep '^fde-'` 挑一个**已用新镜像重建**的容器（镜像 tag 现读 `deploy/.env`，重建窗口由主 agent 定）；
+2. 在门户对该工位发一条最普通的消息「用 readFile 读一下 ~/AGENTS.md，把『收工即提交』那条原文贴给我」；
+3. **成功长这样**：工具卡片里出现 `readFile`（**不是** `shell`），入参 `{"path":"~/AGENTS.md"}`，返回正文；该 run 的 transcript 里 `错误：读取被宿主边界拒绝` **0 次**。反证（旧行为）：第一轮是 `shell` + `cat ~/AGENTS.md`，或 `readFile` 拿到那句拒绝。同一条 run 里顺手复核端口清单：让它 `readFile ~/.erix/ports.json` 报出 `block`，同样不该撞边界。单元级替代证据 = 上面「真机形状」那条用例（换 `HOME` 后走的就是「上游 `~` 展开 → jail 谓词」这条真链路）。
+
+**改了哪些文档**：`docs/design/user-space.md` §4.1.2「读取边界」行（旧行写的是「无只读例外」，整行改口径）、`docs/design/runner-integration.md` §6.3-3 与 §12 工具风险表（`readFile` 那行补「家目录有一张显式白名单，其余位置依旧挡」）、`docs/design/agents-md-layering-2026-11-05.md` §1 事实表与 §2.3（**保留历史原句 + 标注「当时如此，现已改」**，不把历史改脏）。`ISSUES.md` 的 #259 行没动——它属于某一次全量对账的快照，等部署面验过再随关单一起改。`AGENTS.md` 没碰（热层预算与台账搬家口径见 §8.117）。
+
+**返工（261116 同日，第三方审计 5 条 LOW 的处置）**：主 agent 已验收过上面那版（30/30、接线锁变异、520/520、根 2369/2355/0），本轮**只做新增提交**，处理审计的 5 条 LOW：**两条改代码、一条加测试、两条只登记**。
+
+**LOW-1（改代码）：例外根自己是 symlink ⇒ 例外会扩张到它的目标**。上面那句「例外自身是指向别处的目录时，前缀判定跟着 realpath 走」是**双刃**的：`~/.erix` 被换成指向 `/etc` 的链接，`/etc/*` 就整体落进只读例外。清单是平台给的，但**目录是 agent 自己能改的**（shell `rm -rf ~/.erix && ln -s /etc ~/.erix`），所以解析完必须回查归属。实现成 `resolveReadExceptionRoots()`：
+- **归属锚 = 声明这条例外的目录**（`path.dirname(declared)` 的 realpath），对 `platformReadExceptions()` 那两项（`$HOME/AGENTS.md`、`$HOME/.erix`）**就是 `$HOME` 本身**。不在 jail 里硬取 `os.homedir()` 的两个理由：① jail 是纯参数驱动的库，测试与将来的调用方都用夹具家目录，环境里的 HOME 与它们无关；② 父目录恒**不比声明更宽**，于是「例外不得被 symlink 放宽」对任意条目都成立，而不是只对平台那两项成立。锚自己**也要 realpath**——`$HOME` 本身是 symlink 的机器上拿词法父目录比会把合法重排误杀成越界（这是本轮唯一一处「先想到再验证」的边界，判据②就是它的锁）。
+- 不满足 ⇒ **丢弃该条形同不存在**（清单里没它、写拒因从 `path_read_only` 退回 `path_escapes_root`、读侧整个子树读不到）+ `warn` 点名两个路径（哪个例外根、解析到了哪里）+ 事实挂 `jail.droppedReadExceptions` 供装配方复核。⚠ **绝不因此抛**：抛 = jail 构造失败 = worker 起不来，而 agent 换个链接是它做得到的动作，该有的形状是「这条例外没生效」。连带把**落在被丢弃例外之下的 `maskedPaths` 条目**也改成「跳过 + warn」（生产侧 `maskedPaths` 今天还没有生产者，但 #259 已经开了「例外内遮蔽」这个口，不修就是将来某次接线把 worker 打挂）；根与例外**都之外**的遮蔽条目照旧在装配期抛（旧守卫原样保留）。
+- **两项走同一个函数、同一个判据**（`$HOME/AGENTS.md` 不写第二套逻辑），并单独钉一格证明这件事。
+- **登记的残余风险（不当缺陷遮）**：判据是「不得搬出声明它的目录」，所以 `~/.erix -> $HOME` 这种解析结果**恰等于家目录**的形状是**保留**的，此时例外放大到整个家目录（钉了一格写死今天的真实行为）。扩张上界是家目录，不是任意路径。
+
+**LOW-2（改代码，改的是测试码）：提示词防漂移看不见语义相反的改写**。旧正向断言只锚 `/直接用文件工具读/` 这个**短语**，把文案改成「直接用文件工具**读不了**」（意思整个反过来）16/16 仍然 rc=0——这不是断言写得严不严的问题，是**子串匹配在中文里天然挡不住否定式**。修法两条：正向改成**锚整句意**（切句后要求同一句里同时有「家目录 / 两个 `~/` 路径」+「文件工具 或 readFile」+「能读」，且 `读` 后面紧跟否定就不算）；反向从两条固定短语扩成一族（`读不X` / 看不见 / 无法…读 / 不能…读 / 用不上文件工具 / 够不到 / 到不了 / 找不到），**作用域收在讲家目录读法的那几行**——全文查「看不见」会打到 #425 的「用户看不见你的内部动作」，那是正常句子，扩错作用域就是自己造误兵。`worker.js` 的文案一字未动。
+
+**LOW-3（加测试，不改产品码）：`.erix` 尚未物化的形状钉住**。有效 HOME 但 `~/.erix` 不存在时：条目**保留**（不是丢弃也不是空清单）、归属检查**不开火**、不刷 warn、`assertReadable` **放行**，实际 `readFile` 报「路径不存在」而**不谎报边界/权限**（谎报会让模型以为平台挡了它，走错分支）；同一格顺手钉「物化之后同一条路径自然读得到」——这正是「条目保留」而不是「条目丢弃」的理由，是 #259 的本意而非缺陷。旧用例只覆盖了**无效 HOME 参数**那一支。
+
+**LOW-4 / LOW-5（只登记）**：① **没有通用秘密扫描闸**——今天物化进 `~/.erix` 的四样没有真 token（`config.json` 是 `erix-placeholder`、`mcp.json` 为空、`ports.json` / `manifest.json` 是本 FDE 自己的分配与元数据），但将来新增 `.erix/token.json` 之类，读例外会**静默放行**且现有测试未必失败 ⇒ 解禁条件已写进 `docs/design/user-space.md` §4.1.2 那行：**往 `~/.erix` 新增物化文件之前，先把它的形状钉进 `portal/test/materializer.test.js` 的秘密扫描用例**（本轮**没有**实现那道扫描，见下面的未尽项）。② **shell 不对称**：shell 确实注册给模型且不受 file jail 约束（`runner/lib/shell-tools.js:6-8,192`），提示词在文件工具拒绝时还会建议用 shell ⇒ **本轮加的归属检查定位是「防例外静默扩张」，不是安全边界**（同一句话也写进了 `docs/design/user-space.md` 与 `docs/design/runner-integration.md` §6.3-3 / §17，别让下一个人以为它挡住了 `cat`）。
+
+**变异自证（每条先红再复绿；改的都是产品码/文案，不是把测试改松）**：
+| 变异 | 读数 | 说明 |
+|---|---|---|
+| M1 撤掉归属检查（退回「条目直接 realpath」） | **3 红 / 36**：`not ok 24 - #259 归属检查①…`、`not ok 25 - #259 归属检查①红线…`、`not ok 27 - #259 归属判据只有一条：$HOME/AGENTS.md…`；**格②（家目录内重排）仍绿** | 真改行为：审计那条越界形状重新变成可读 |
+| M2 把检查写成「始终通过」（`\|\| true`） | **同样 3 红 / 36**（24 / 25 / 27），格② 仍绿 | 与 M1 同一决策点的两种形状（删判据 vs 恒真），读数一致正是期望：证明那三格锁的是判据本身 |
+| M3 一律丢弃（= 「把例外全关了蒙过①」） | **13 红 / 36**，其中含 **`not ok 26 - #259 归属检查②…仍然读得到`** | 这一发是**反作弊格**：格② 在 M1/M2 下绿、在 M3 下红 ⇒ 它真的在测「合法重排仍可读」，不是「例外都关」的假绿 |
+| M4 提示词注入反向措辞（「直接用文件工具读**不了**」） | **2 红 / 16**：`not ok 7 - SYSTEM_PROMPT 明确告知「平台约定已随本次 run 注入」…（#451 + #259）`、`not ok 8 - #259 反向防漂移…`，rc=1 | **这条就是 LOW-2 的验收**（旧断言在这一发下 16/16 全绿）。正向与反向各红一次 = 两条锁独立生效 |
+| 对照：等价正向改写（「用文件工具读得到」） | **16/16 绿，rc=0** | 证明新的正向断言不是新的固定短语锁——换措辞仍绿，只有**语义反过来**才红 |
+
+**本轮验证**：`node --test runner/test/file-tools.test.js runner/test/system-prompt.test.js` **52/52 绿**（36 + 16；上一版 30 + 16 ⇒ 新增 6 格全在 file-tools）；`runner/test/file-tools-contract.test.js runner/test/agents-md.test.js` **73/73 绿**（jail 改动没伤 #228 的谓词相与面与 #451 的注入面）；`node --test 'runner/test/*.test.js'` 全量与 `npm run check:agents-hotlayer` 见交付报告。**未跑根 `npm test`**：本轮没碰 portal 侧（`git diff --stat` 里 portal 为空），那张 15 分钟的账单不该在这里付。
+
+**未尽项**：① **LOW-4 那道秘密扫描用例没实现**（是审计的「可选加分」，且它会强制把 portal 侧拖进本轮门禁）——已登记成**解禁条件**而不是「已防住」；② 上面那条 **BLOCKED-on-deploy 的真机判据**本轮依旧没跑（红线：不碰 `station-*` / `fde-*` 容器），复测三步不变；③ `.erix -> $HOME` 的边界形状按今天的行为钉死（保留），要收紧成「必须严格在家目录之内、不等于家目录」得连那一格一起改。
+
+
+### 8.140 终局正文是一段「被文本化的工具调用」：识别 + 中性提示，不许再静默丢交付（issue #243 / 工单 fix-261116-03，2026-11-16，worker 落地）
+
+> **编号说明**：本批多单并行，**编号由主 agent 统一分配**（工单原写 8.138，主 agent 改为 8.137）。
+> 本节一次记完两步：第 1 步（识别 + 特征集 + 判据，提交 `328525a`）与第 2 步（事件链路 + 白名单 + 判据，
+> 提交 `9fd7c3f` / `8721fb2`）。**界面渲染与中英双语文案是第 3 步**，本节末尾写明它的现存形态。
+
+**症状**：run 正常 `finished`，但用户在时间线顶端看到的「最终回复」是一堆标记
+（`<｜｜DSML｜｜tool_calls>…`）而不是交付报告 —— 模型把 tool call 吐进了 `content`，引擎当**最终文本**收下，
+于是既没有工具执行、也没有报告，而且**零信号**。`ISSUES.md` 与 `docs/ops/drill-2026-10-11.md` /
+`drill-2026-10-12.md` 都记过同一族形态（`｜FunctionCallML｜｜invoke`、`<tool_call…`）。
+
+**现查取证（本机 dev 库 `station-db`，只读，未碰 `station-*` / `fde-*` 容器）**
+```sql
+select payload->>'final_text' from run_events
+ where run_id='f4dfea1d-c439-4bba-ac34-4c86d7132bea' and type='round_end' order by seq desc limit 1;
+```
+- `runs` 表里这条 run 的实况是 `status=finished`、`rounds=32`、`termination.reason=judge_done`
+  ——**与工单正文写的「9 轮、`end_turn`」不符**（工单的形态描述对，读数不对）。真样本的正文不在
+  `run_end` 的 payload 里：那条 run 的 `run_events.type='run_end'` payload 只有 usage/rounds/termination，
+  **没有** `final_text` 键（本站终态正文的落点是 `round_end` 行 + transcript 投影，见 §8.126 形态 M）
+  ⇒ 判据一律用 `result.finalText`，**没有**新造正文落点。
+- 第二条同族真样本 `messages.id=0549e113-dc48-4ab3-9d87-f8b79a7557bf`：标记名里**带空格**
+  （`<｜FunctionCallML｜｜ invoke`）⇒ 任何「精确等于某个标签名」的判据都会漏。
+
+**特征集口径的一处事实修正（工单的缺省值要不得）**：工单建议钉 `<｜｜DSML｜｜invoke`，但真样本 A 是
+`<｜｜DSML｜｜tool_calls>`、样本 B 标记名内含空格 ⇒ 那条字面串**两条都命中不了**。缺省改为三条前缀形态：
+`<｜｜DSML｜｜` / `<tool_call` / `<｜Function`（≥3 条，不是「只钉 DSML」）。两条防误伤规则：
+整段围栏代码块与成对反引号**先剥掉再匹配**（正文里**引用**标记本身不是泄漏），大小写不敏感。
+可配置面 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS`：逗号分隔**整串替换**缺省；`off` 是**显式关闭**（要 warn）；
+非法条目**逐条**丢弃并**点名是哪个值**，**全部**非法才回退缺省 —— 配错不该把问题重新藏起来。
+（261116 返工更正：这一条先前写作「空 / 超长 / 含换行 / 非串…**并回退缺省**」，三处不准，见下面 §8.137 返工段 LOW-3；代码一直是对的，措辞是错的。）
+
+**第 2 步：链路怎么接（逐条照 #442 的 `final_text_fallback` 抄，三条口径一字未改）**
+- `runner/worker.js`：每 run 解析一次特征集（worker 进程会被复用给下一个 run），`warnings[]` 逐条落 `warn` LOG；
+  RUN_FINISHED **成功**信封 additive 两键 `textualized_tool_call` / `textualized_tool_call_marker`，
+  **只在命中时给**（绝不写 `false`）。**`termination.reason`、`rounds`、`usage`、`final_text` 一个字节都不动** ——
+  它不是失败，红色面仍只由 `run_end` 负责（§2.5.1 第 3 条）。失败信封不带（那条路径正文恒空）。
+- `runner/agentd.js`：只在 `=== true` 时逐字透传；marker 脏（空串/非串）时只丢 marker，布尔照传 ——
+  否则 portal 的 400 会把**整条终态**打回去，为了一个片段丢终态是本末倒置。
+- `portal/src/internal.js#finishRun`：在**同一个终态事务内**合成 `textualized_tool_call` 事件行，
+  `seq` 排在 `run_end` **之前**（时间线：正文 → 中性提示 → 终态分隔条），
+  `client_event_id=<runId>:final:textualized_tool_call` + ON CONFLICT DO NOTHING（#277 先例）。
+  **为什么不叫容器经 U3 自己发**：U3 的写闸是「租约有效」，而收尾时 `finishRun` / `drainQueueAfterRun`
+  都会清 `claim_token`（#220 现查取证）⇒「活干完了、租约没了」是常态，容器自报会被 409 `lease_lost` 挡掉；
+  终态事务内由 portal 写才是必然成功那一侧（`attempt_killed` 的 reaper 分支同构）。
+  payload `{chars, marker}`：`chars` 由 portal 从收到的 `final_text` **自己算**，不取容器报的数（#261 口径）。
+- `portal/src/http.js` 的 `HISTORY_EVENT_TYPES` += 它（§5.3 第 **29** 项、§4.4a 同步补一句）——
+  上游 erix-agent **#182** 的教训就是「实时看得见、刷新后消失」，而这条事件讲的恰恰是
+  「用户刷新来看这次交付了什么」的那一刻。
+
+**前端这次只加了两处集合的类型名**（`EVENT_TYPES` / `HISTORY_REPLAY_TYPES`），**没写渲染**：
+`portal/test/event-surface-contract.test.js` 的 S4 要求「后端下发白名单」与「前端回放集合」**逐项相等**，
+只加后端一边会直接判红（#288 那颗坑的账面对账）。所以现在是「订得到、暂时不刷行」的中间态 ——
+与 `run_outcome` 今天的形态同类；中性分隔行与中英双语文案在第 3 步。
+
+**验证读数（全部实跑）**
+- `runner/test/final-text-toolcall.test.js` **15 格全绿**：① 两条 dev 库真样本 + 同族变体；② 不误伤
+  （提到工具名 / 正文含 `<` / HTML / 比较号 / 引用了标记本身）；③ 特征集可配置且生效（删掉一条 ⇒ 对应夹具
+  不再命中；缺省 ≥3 条；非法值点名 + 回退）；⑤ 反向自证（把判据放宽成「正文含 `<`」⇒ 正常交付摘要全被咬）；
+  ⑥ additive 字段本体 + worker 接线源码级判据；⑦ **真跑** `agentd.onWorkerFinished` 抓 U2 body（夹具同 #442 F3）。
+- `portal/test/textualized-toolcall.test.js` **10 格全绿**（新增）：事件恰好一条 / 排序在 `run_end` 前 /
+  payload 两键 / 终态语义不动 / 终态后再收 U2 不写第二条 / 正常终局零事件 / 脏载荷 400 且点名字段 /
+  U3 保留名 / 三处集合源码级对账 / 文档两处登记。
+- `portal/test/session-events-history.test.js` **+2 格**：**行为级**「刷新后历史端点仍返回它」，
+  payload 一字不改（`marker` 含全角竖线 `｜`，截断逻辑不许切坏它）。
+- **变异自证**（每次都还原，`grep -rn MUTANT runner portal` 收尾为 0）：
+  摘掉 worker 的识别 ⇒ ⑥ 红；识别恒判不命中 ⇒ ①③⑤⑥ 红；硬编码只认 DSML ⇒ ①③⑤⑥ 红；
+  从 `HISTORY_EVENT_TYPES` 删掉它 ⇒ 历史端点两条 + `event-surface-contract` 的 S4 + 三处集合对账全红。
+
+**剩余（不瞒）**
+1. **界面还看不见**：第 3 步（`StreamPanel` 中性分隔行 + zh/en 文案）落地前，这条事件只到「订得到、不渲染」。
+2. **`ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 目前只有 worker 进程读得到**，没接 `deploy/docker-compose.yml` /
+   `provisioner.js` / `fde-proxy` 的 env 允许名单（改那几处要动 `portal/src/http.js` 之外的并行热文件，
+   等主 agent 裁决再开一笔）。
+3. **旧 runner 镜像 ⇒ 无提示**（信号来自 worker，portal 不兜底重做识别：判据留在 runner 一处，
+   升级顺序是「先 runner 后 portal」，与 #442 同）。
+4. dev 库里那条 run 的 `termination.reason` 是 `judge_done` 而非工单写的 `end_turn` ⇒ **真实现场的
+   「9 轮 + `end_turn`」形态未在本库复现**，判据用的是「终局正文」这一层事实，不依赖轮数与 reason。
+
+**第 3 步追加（前端渲染，同日 261116，worker 落地；提交 `1f9a0cf` 渲染 + i18n / `5602c4e` 判据 / `15b0f26` 判据的 tsc 红）**
+
+上面「剩余」第 1 条（**界面还看不见**）到此结案。前端只加渲染，**后端一行没动**。
+
+**开工前的现场（先量再改，读数在 `/tmp/probe-243-readings.json`）**：`useEventStream.ts` 的 `dispatch` 里
+这个类型落进 `default: return`（「未知类型忽略（§5.3 向后兼容）」——**行号按改前那棵树是 1307**，
+本步插入 25 行之后它在 1332；按 §8.126.4 那条「锚点必须写它真实所在的那棵树」的教训，两棵都写）。实测：一条历史回放帧 + 一条实时帧
++ 一条纯未知类型，`entries` 长度 **1 → 1 → 1 → 1**（一条都不多），DOM 里 `.roundsep` 只有夹具参照行、
+`.syserr` 0 个、**空节点 0 个** ⇒ 今天未知类型的真实现场是**整条事件被静默丢弃**，既不是空条目也不是破图。
+所以本步是**补渲染**，不是修一个已存在的破渲染。另两处工单事实更正：本仓**没有** `RunEventTimeline.vue`
+（时间线的分派表在 `composables/useEventStream.ts`，落点是 `components/StreamPanel.vue:599` 那条 `sep` 行），
+也**没有** `components/__tests__/` 目录（30 个前端 spec 一律与组件并排）⇒ 判据按本仓口径并排放。
+
+**渲染的三条口径**
+- **中性、不是警报**：`case 'textualized_tool_call'` → `hooks.onSep(...)` ⇒ 条目 `kind:'sep'` → 既有
+  `.roundsep` 中性灰行。**不走 `onSysErr`**（`.syserr` 是 #dc3545 那个「错误」色，借它就是谎报严重程度 ——
+  正文里那段文字**就是**模型答案的一部分，只是没执行；同 #300 给半截正文挑中性色、同 D9「状态词、不是警报」）。
+  文案里没有 `⚠`，judge 的黄色面板也不许借用。
+- **marker 有就显示、没有就不显示**：第 2 步特意留了「缺 marker 也照发」⇒ 整句必须独立成立；
+  非串 / 空串 / `null` 一律不带片段（绝不 `String(对象)` 渗进用户可见文案，#261/#288B 同口径），
+  片段上界 120 与 portal 的载荷校验同源；片段复用既有 `stream.event.dash`（不抄第二份）。
+- **必须走文本节点**：它最终落在 `StreamPanel.vue` 的 `{{ en.text }}` 上 ⇒ 全角竖线与 `<invoke name="exec">`
+  原样可见。**不许**改成 `v-html`（标签会被吃掉，可能连后半句一起吞）——这件事由判据钉死，不靠注释。
+- 位置：portal 已把 `seq` 排在 `run_end` **之前** ⇒ 前端**不重排**，到达顺序就是「正文 → 提示 → 终态条」；
+  实时与刷新回放共用同一条 `dispatch`（#89 口径），实测两路逐字同文案。
+
+**判据 11 格**（`StreamPanelTextualizedNotice.spec.ts`，全部 DOM 文本断言，**没有一处 `w.emitted()`**）：
+① 历史回放 / 实时各一格 + 「两路逐字同文案」一格；② 缺 marker ⇒ 整句照出且无 `undefined` / 悬空破折号；
+③ 两格（`<invoke name="exec">` 的 **ASCII** 形态 + `<｜｜DSML｜｜` 全角形态）；④ 反向自证（正常 `run_end` +
+普通正文不出现这句话，而终态分隔条照旧在）；另三格守红线：中性（`.syserr` 为 0、无 `⚠`、不借 judge 黄底）、
+位置（`compareDocumentPosition` 判**具体那一行**的文档序，不拿祖先 div 比、不看 `entries` 中间态）、
+双语与脏值。**夹具的一条硬知识**：v-html 的靶子必须是 **ASCII 开头**的标签 —— `<｜｜…` 全角开头在 HTML 里
+本来就不是标签，`v-html` 也吃不掉它，拿它当靶子会假绿（实测：变异 B 下全角那格照样绿）。
+
+**两发变异（都实跑，收尾 `grep -rn MUTANT portal` = 0）**
+- **A 渲染分支恒假** ⇒ `Tests 10 failed | 1 passed (11)`，红的正是 ①×3 / ② / ③×2 / 中性 / 位置 / 双语 / 脏值；
+  **只有 ④ 反向自证仍绿**（恒不渲染本就不该让「不该出现」那格变红 —— 它绿恰恰证明那格不是摆设）。
+- **B `{{ en.text }}` → `v-html`** ⇒ `Tests 2 failed | 9 passed (11)`，红的正是 ③ ASCII 那格
+  （`<invoke name="exec">` 被当标签吃掉）与 ① 实时那格（夹具 marker `<tool_call` 同为 ASCII 标签）。
+  两发都是**真改行为**，不是等价替换。
+
+**读数**：焦点 `env -u NODE_ENV npm test -- src/components/StreamPanelTextualizedNotice.spec.ts` **11/11 rc=0**；
+`npm run typecheck` **rc=0**（第一次是 rc=2：`expect(x).toBe(1,'消息')` 这一形 vitest 不支持，
+本仓口径是 `expect(值, 消息).toBe(…)`，见 `15b0f26`）；全量前端 `env -u NODE_ENV npm test`
+**64 files / 1388 tests 全绿 rc=0**（含 i18n 双语键集对账 `localeParity.spec.ts`）。
+root `timeout 1500 npm test` 按「先 commit 再跑长门禁」在本节提交之后单独跑一次，读数记在交付
+`/tmp/tickets/deliver-243-step3.md`。
+
+#### 8.137 返工（PR #555 第三方复审 2 MED + 2 LOW，2026-11-16，同一分支只追加提交）
+
+**取证边界（先把没证的说清楚）**：本轮对 `station-db` 只跑只读 `select`
+（`docker exec station-db psql -U station -d station -At -c '…'`），没进 `station-*` / `fde-*` 容器，没写库。
+新加的两族特征是**预防性覆盖，不是实证**——现查读数：
+
+| 取数语句（逐字） | 读数 |
+| --- | --- |
+| `select count(*) from run_events where payload::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from run_events where payload::text like '%<invoke name=%'` | **0** |
+| `select count(*) from messages where content::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from messages where content::text like '%<invoke name=%'` | **0** |
+| `select count(*) from transcript_rounds where record::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from transcript_rounds where record::text like '%<invoke name=%'` | **0** |
+| `select count(*) from transcript_rounds where messages::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from transcript_rounds where messages::text like '%<invoke name=%'` | **0** |
+| 阴性对照（同一批查法，证明不是查法失效）：`… like '%DSML%'` 分别打在 `run_events.payload` / `messages.content` / `transcript_rounds.record` / `transcript_rounds.messages` | **6 / 1 / 8 / 8** |
+| `select count(*) from run_events where payload::text like '%chatcmpl%'`（裸串） | **1**，`left(payload::text,220)` 取出来是 `{"name":"writeFile","input":{"path":"llm-smoke-test.js",…}}` —— 某 run 写下去的测试脚本正文，**不是终局正文** |
+| 那一行的身份：`select run_id::text||' / '||type from run_events where payload::text like '%chatcmpl%' limit 3` | `80c1686d-d205-4e01-846d-1ea4a23cb25e / tool_use` |
+
+⇒ `<invoke` 与 `chatcmpl-tool-` 都**没有真样本**（上面全部查过），夹具是**形状夹具**；
+`<｜Function` 那条同族特征也仍是**推断覆盖**（先前记录里已经这么标）。
+顺带一条有用的副产品：裸 `chatcmpl` 会出现在正常内容里（那一行就是），所以进缺省的是
+**带横杠的 13 字符前缀**，不是短词 `chatcmpl`。
+
+**MED-2（优先）：一个超长 marker 曾经能拒绝整条终态**。事实链核对成立：`portal/src/internal.js`
+的 marker 校验开在 `BEGIN` **之前** ⇒ 400 直接 return，终态不写、**不重试**（run 只能等租约过期 / reaper）。
+⇒ 丢弃挪到**源头**：`textualizedToolCallField()` 超长 ⇒ 只丢 `textualized_tool_call_marker`、**布尔照传**；
+`agentd.js` 透传时同一道闸（旧 worker 版本偏移的兜底）；portal 那侧保留 400 但**只是契约闸**，
+裸 `120` 换成两侧**同名**常量 `TEXTUALIZED_MARKER_MAX_CHARS`（grep 一把能齐）。
+对账不靠肉眼：`portal/test/textualized-toolcall.test.js` 的 **E3** 拿**真** `textualizedToolCallField`
+造的载荷过终态闸（超长 ⇒ 终态照写 + 事件照有 + payload 只剩 `{chars}`；runner 侧上界若比 portal 宽，
+这一格会以「终态写不进去」炸出来）；另有源码级一格钉「两侧常量数值相等 + portal 不许留裸 `> 120`
++ agentd 必须 import 同一个常量」。配置面附带一条：条目长过上界**不算非法**（照样判定），
+但给一条告警说明命中时会少一段片段 —— 不静默。
+
+**MED-1：两族认不出、而且配不进去**。缺省集合加 `<invoke`；`chatcmpl-tool-` **不含 `<`**，
+而「条目必须含 `<`」是防误伤的承重墙 ⇒ **没把门槛调低**，改成把「像 id 前缀」写成判据：
+**不含 `<` 的条目要求长度 ≥12 且含 `-`**（`chatcmpl-tool-`=13 过；`chatcmpl`=8、`off`、`offer`、
+`offset`、11 字符的 `abcdefghij-` 拒）。承重墙的理由也用行为钉了一次：绕开解析器硬把 `off` 当特征
+⇒ "offset" 会被咬。误伤判据两格按要求落了（正文只写 `chatcmpl`、正文含 `offset`/`offer` ⇒ 都判假）。
+
+**LOW-3 更正（是我先前记错，不是工单写错）**：本节先前写作「非法条目（空 / **超长** / **含换行** / 非串）
+点名是哪个值**并回退缺省**」—— 三处不准：① 长度上限从来不是拒绝理由（返工之后更是明确
+「超长照样判、只给告警」）；② 解析器从不看有没有换行；③ 真实行为是**逐条**丢弃、
+**全部**非法才回退缺省，「少于 3 条整份作废」这种门槛根本不存在。代码一直是对的，措辞是错的；
+现在判据 ⑪ 把口径钉在代码上（单条合法就留那一条）。**行为一个字没动。**
+
+**LOW-4：已知残余登记**：特征判据是逐字子串 ⇒ 正常交付若在代码块**外**裸写 `｜｜DSML｜｜` 这类标记会
+误报一条中性提示（写进行内代码/围栏不会 —— 剥代码那一步管着）。代价是**多一条中性提示**，
+不是把正常 run 判成失败；换来的是不再静默丢掉交付报告 ⇒ 净收益为正。已同时登记在
+`docs/api/portal.md` §5.3 第 29 类与判据 ⑩（那格里写明了「要改它得先证明不漏真样本 B 那种带空格变体」）。
+
+**四发变异（都实跑，收尾 `grep -rn MUTANT runner portal` = 0）**
+- **A 撤掉源头丢弃**（超长 marker 照带）⇒ `34 tests / 32 pass / 2 fail`：红的正是 **E3 跨面行为**
+  与 **⑨ 边界两侧**那格。
+- **B 把不含 `<` 的门槛降回 3、并去掉横杠要求** ⇒ `23 / 20 / 3`：红的正是 **⑧ 承重墙**、
+  **④ 配置**、**⑪ 口径**（"短词能溜进来"这件事在三处都留了钩子）。
+- **C 把 `<invoke` 从缺省里拿掉** ⇒ `23 / 21 / 2`：红 **③ 缺省集合**与 **⑧ XML 族**那格。
+- **D 撤掉 `agentd.js` 的长度闸** ⇒ `23 / 21 / 2`：红 **⑨ 跨面对账**（源码级）与 **⑨ agentd 兜底**（行为级）。
+
+**读数**：`runner/test/final-text-toolcall.test.js` **23/23**、`portal/test/textualized-toolcall.test.js` **11/11**、
+`node --test 'runner/test/*.test.js'` **530/530**、前端全量 **64 files / 1388 tests rc=0**
+（返工没动 `portal/frontend/**`，第 3 步那 11 格仍绿）、root `npm test` **2392 tests / 2378 pass / 0 fail / 14 skipped rc=0**、
+`npm run check:agents-hotlayer` **rc=0**。
+
+**剩余（本轮没做，别当成已做）**：① `ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 仍未接部署面三处
+（见上面「剩余」第 2 条），现在多了一层：现场要配 `chatcmpl-tool-` 那一族时，
+配置面**收得下**但**投递不到**；② `<invoke` / `chatcmpl-tool-` 是预防性覆盖，真样本仍待现场出现；
+③ LOW-4 的残余按上面的代价论证保留。
+
+
+### 8.141 e2e 起跑前预飞：缺 `deploy/.env` 不再烧完整轮镜像构建 + EACCES 不再伪装成「没物化」（issue #495 + #227①② / 工单 fix-261116-01，2026-11-16，worker 落地 + 变异自证）
+
+> **编号由主 agent 统一分配（本批并行）**：本仓末尾本节之前是 §8.126，§8.127/§8.128 的空号是主 agent
+> 留给并行 worker 的槽位。**本节用 `cat >>` 追加，不往文件中间插**（本批已实测并行 worker 往中间插会撞车），
+> 也**没动 `AGENTS.md`**（逐单账不进阶梯，见 AGENTS §6）。
+
+**治的是什么**：`#412` 拆出来的 ①② 两条（#495），共同点不是「测试红」而是**红得没有信息**——
+① 九支 e2e 的 compose 命令串固定带 `--env-file deploy/.env`，而它不入 git ⇒ git worktree / 新 clone
+里必然缺，`docker compose` 要到**整轮镜像构建之后**才报 `couldn't find env file`（#412 部署机实测白烧
+10.7 分钟）；② 等 portal 写进宿主 bind mount 的 `config.json` 时旧写法是
+`waitFor(() => (fs.existsSync(p) ? fs.readFileSync(p) : null))`，而 `existsSync` 对**没权限**的路径返回
+`false`（EACCES 被吞）—— portal 以 root 把 FDE 目录建成 `0770 node:node`（uid/gid 1000），跑测试的人
+uid ≠ 1000 时文件其实早就写出来了，测试却白等 120 s，报一句与「真的没物化」**逐字相同**的 timeout。
+
+**交付面**（一个提交 `test(e2e)[fix-261116-01]`，未 push）
+- 新增 `portal/integration/lib/e2e-preflight.mjs`（350 行，**唯一定义处**，`isolation-negative` 的单一来源
+  断言把六个导出全钉在这）：`assertComposeEnvFile`（①：不存在 / 不是普通文件 / 存在但读不到，三种文案各点名
+  「从主 checkout 复制一份」+ 模板路径，**成功时零输出**）、`inspectHostPathChain`（沿链从根往下走，给出
+  **第一个进不去的段** + 它的 `mode`/`owner`，或**第一个不存在的段**）、`observeHostPath`（三态
+  `present / missing / unreadable`）、`waitForHostFile`（unreadable 连续两次**立刻**放弃——权限不是时间问题；
+  missing 等满超时）、`toContainerPath` + `materializeSnapshot`（把 portal 容器侧 `ls -ld 父目录 + 目标`
+  的原文拼进失败文案，userspace 是**同路径** bind mount，一次 docker 排除两种可能之一）。
+- ① 接线 9 支：`wp2a/wp2b/wp3a/wp3b/wp4/wp5/wp6/wp5-ui-setup/wp5-ui-teardown` 在**模块加载时**（任何
+  `docker`/`compose` 之前）预检；wp3b 头部清单补上 `deploy/.env` 必传前置（#412 立项理由之一：清单不够用）。
+- ② 接线 3 支：`wp3b`/`wp5`/`wp6` 的 `config.json materialized` 等待改用 `waitForHostFile`（旧的
+  `fs.existsSync(configPath)` 形态由静态钉禁止回来）。
+- 判据两处：新增 `test/integration-e2e-preflight.test.js`（13 条，**进 CI 门**：根 `npm test`）；
+  `isolation-negative.mjs` +2 条陷阱（env 缺文件必须硬失败、读不到必须提前放弃）+ 一组 #495 正例
+  （三态互不相同、预检零输出、快照命令形状 `2>&1 || true`、路径换算越界必抛）。
+- 顺手修一处**误伤**：`#227.2` 的「`docker compose` 必须显式带 `-p`」是行级扫描，把注释与字符串里的
+  `docker compose` 当命令——本单的头部清单一次被误伤 **12 处**。修法不是改散文，是把判据收成
+  `lineMissingComposeProject()`（纯注释行不算命令）+ 双向夹具（真命令不带 `-p` 必红 / 带 `-p` 不红 / 注释不红）。
+
+**门禁读数**（判绿只看退出码）
+- `node --test test/integration-e2e-preflight.test.js` → `# pass 13 / # fail 0`
+- `node portal/integration/isolation-negative.mjs --strict` → **rc=0**（12 条陷阱均硬失败、单一来源一份定义）；
+  缺省模式仍 **rc=1**（这是刻意的「负例证据」口径，不是失败——文件头有写，别当回归）
+- 根 `npm test` 的终值贴在交付报告里（不拄进台账，免得仓里多一处手抄的当下数字）。**改动前**的基线是
+  `# tests 2368 / pass 2354 / fail 0 / skipped 14`（rc=0），本单净增 13 条用例。
+
+**变异自证 12 发**（每次只改一处源码，跑两道门；全部已还原。红条点名到 `not ok N`）
+
+| # | 变异 | 红在哪 |
+|---|---|---|
+| M1 | 删掉 wp3b 的 `assertComposeEnvFile(...)` 调用 | `not ok 13 - \#495 接线静态自检：脚本必须在**任何 docker 之前**做预检` |
+| M2 | 把预检插回 `safe(() => compose('down -v', {` 前一行 | **没红**——插的位置仍在第一次 compose **之前**，是合法形态 ⇒ 夹具缺陷，不是判据缺陷（红条入口是「晚于第一次 compose/docker」） |
+| M3 | 叶子级 EACCES 不再归 unreadable | `not ok 6 - \#495② P5b 文件本身不可读（链能进，但 readFileSync 抛 EACCES）` |
+| M3b | 目录级 blocker 不再归 unreadable | `not ok 5 - P5 三态分开`、`not ok 7 - P6`；neg 侧 `TRAP FAIL · waitForHostFile() 目录读不到 ⇒ 提前放弃并点名 uid 口径` + `正例夹具被抛错 … 链上某段 0770`（**双门红**） |
+| M4 | 叶子级 ENOENT 归进 unreadable（= 三态压成一态的原坑） | `not ok 9 - \#495② P8 等待：文件延迟出现 ⇒ 返回正文`；⚠ **neg --strict 仍绿**（盲区，见坑 3） |
+| M5 | 预检成功时多打一行 | `not ok 1 - \#495① P1 …**零输出**` + neg `正例夹具被抛错 … 预检成功不许打印任何东西`（双门红） |
+| M6 | `unreadableConfirmations` 2 → 1e9（不再提前放弃） | `not ok 7 - P6`（判据是 `elapsed < timeoutMs/2`，不是文案） |
+| M7 | 快照命令丢掉 `2>&1 \|\| true` | `not ok 11 - P11 现场快照 = 一条不抛错的 ls` + neg `… 远端 stderr 合并 + 不吃退出码` |
+| M8 | `toContainerPath` 不拒越界路径 | `not ok 10 - P10 宿主路径 → portal 容器内路径` + neg `… Missing expected exception` |
+| M9 | wp3b 等物化退回 `fs.existsSync` 一把梭 | `not ok 13 - 接线静态自检`（两条断言各抓一次：`waitForHostFile(` 消失 + `fs.existsSync(configJsonPath)` 回来） |
+| M10 | `#227.2` 判据去掉「注释行排除」 | neg `正例夹具被抛错 … 纯注释是散文不是命令` + `单一来源断言 FAIL：… e2e-preflight.mjs:7 docker compose 命令没显式带 -p` |
+| M11 | 在 wp3b 里复制一份 `waitForHostFile` 定义 | neg `单一来源断言 FAIL：waitForHostFile: 期望只在 lib/e2e-preflight.mjs 有 1 处定义，实际 2 处` |
+
+**四个坑（全是实测，不是设想）**
+
+1. **变异脚本的「备份还原」会自己藏毒**（本单真实踩到，且差点被提交）：上一轮变异跑到一半被时间闸掐了，
+   脚本末尾的 `restore()` 没执行，于是下一轮开头 `cp $LIB $D/lib.bak` 抓的是**带 M4 变异文本**的树，
+   之后每次 `restore()` 都把毒还原回去。表现：`M4 变异没打上（原文没搜到）` + `P8` 稳定红 + 怎么都解释不通。
+   ⇒ 两条红线：**提交前逐条 grep 变异指纹**（`if (false) {` / `console.log` / `1e9` / `2>/dev/null"` / `mode: '?'`），
+   以及**别信"脚本末尾有 restore"**——备份要么从 `git show HEAD:<path>` 取，要么每轮开头先校验备份自身干净。
+2. **`--strict` 与缺省模式是两套退出码**：缺省模式「陷阱全硬失败」= **rc=1**（刻意留证据），`--strict` 才是
+   回归口径（rc=0 才叫绿）。跑的人不知道这点就会把护栏改坏读成"本来就红"。
+3. **链级与叶子级要分开钉**：`missing`/`unreadable` 的判定有两条入口（祖先链走不动 / 叶子自己读不出）。
+   `P5`/`P7` 只覆盖链级，M4 那种「叶子级 ENOENT 被归成 unreadable」在 `isolation-negative` 里**完全没被抓住**
+   （正例组的夹具是"链上第一段不存在"），最后只有 `P8`（fake `readFileSync` 抛两次 ENOENT）抓到——
+   它就是"materializer 还没写出"那段窗口的哨兵。⇒ 文案级断言不够，**时间判据**（提前放弃 vs 等满）与
+   **状态值断言**才是可失败的证据。
+4. **`/srv/erix/users` 这类"宿主 ↔ 容器同路径"字面量要有归属**：新常量 `PORTAL_USERSPACE_CONTAINER_ROOT`
+   只活在 lib，`isolation-negative` 里加了一条「别的 integration 文件不许出现带引号的 `/srv/erix/users`」——
+   自己算映射 = 快照指到别处，看了白看（compose 里右值写死：`deploy/docker-compose.yml` portal 的
+   `${ERIX_USERSPACE_ROOT_HOST}:/srv/erix/users`）。
+
+**未尽项：静态判据 vs 真机面**（真机面 worker 本机跑不了，别当已验）
+- **已验（静态 / 夹具，进 CI 门）**：预检三种失败与「成功零输出」、三态互不相同、提前放弃与等满的时间判据、
+  宿主→容器路径换算与越界、快照命令形状、接线顺序（预检早于第一次 compose/docker）、单一来源、字面量归属。
+- **未验（真机面，主 agent 合并后亲手跑）**：① 在没有 `deploy/.env` 的 worktree 里跑 wp3b 的**秒级失败**
+  （worker 只验到「模块加载即抛 + 文案点名」的语义，没跑真 compose）；② **真 EACCES**（uid ≠ 目录属主）——
+  本机 eric 自己就是 `uid=1000` = FDE 目录属主，`chmod 0700` 对自己照样可读，所以「读不到」分支是
+  **注入的 `accessSync` 抛 EACCES** 复现的，不是真权限；建议按 #495 判据补一发
+  `docker run --rm -u 1001:1001 -v <tmp>:/host node:22-alpine node -e …`；③ `docker compose … --env-file deploy/.env config`
+  原文命令跑通；④ `wp3b`/`wp5`/`wp6` 全量 e2e **没复跑**（要 docker + 一整套隔离栈 env）。
+- **判据差项（明确没做，等主 agent 定）**：工单 follow-up 写的「① 宿主路径链逐段 `lstat`、**末段不许是符号链接**」
+  —— 现在链检是 `statSync` + `accessSync`（**跟随**符号链接）：悬空链接会被归成 `missing`，指向可读文件的链接
+  会被归成 `present`，**不点名"它是符号链接"**；「② env **值非法** fail-fast 点名变量」worker 只做了
+  「缺失 / 不是普通文件 / 读不到」三种，**没做键值校验**（那条线在 `portal/test/deploy-env-defaults.test.js`）；
+  「缺省值逐字 `ext4`」在本单文件里没出现——本单只新增 `/srv/erix/users` 一个常量，**零新增配置键**成立。
+
+**收尾补记（同批 worker，把上面「未验 ②」改成「已验」）**：② 的真机 EACCES 已补验，**不是注入的假
+`accessSync`**：`docker run --rm -u 1001:1001 -v <tmp>:/host:ro -v <repo>:/app:ro node:22-alpine` 里以
+`uid/gid=1001/1001` 读宿主上由 `uid=1000` 建的 `0770` 目录链（文件 `0644` 确实在盘上）：
+- `observeHostPath('/host/alice/home/.erix/config.json')` ⇒ `unreadable`，blocker=`/host/alice`，
+  `mode=0o770 owner=1000:1000`；同一时刻宿主侧 `cat` 拿得到正文 ⇒「文件已写出、只是测试看不见」第一次由文案自己说清；
+- `observeHostPath('/host/nobody/…')` ⇒ `missing` + `missingPrefix=/host/nobody` ⇒ **真权限下两态仍然分得开**；
+- `waitForHostFile(读不到那条)` ⇒ **503 ms** 放弃（上限 60 s），首行「已经存在，但当前用户读不到」并点名 `FDE_USER_UID`；
+- `waitForHostFile(没物化那条, timeoutMs=400)` ⇒ 等满后报 `timeout waiting for … 路径上第一段就不存在（缺：/host/nobody）`，
+  **没喊权限**（不许把人带去改 uid）；
+- 顺手量到的边界：把 bind 根本身也 `chmod 770` ⇒ 两条路径都报 `unreadable`、blocker 是根那一段——进不去就
+  无从 `stat`，这时「读不到 / 没物化」**原理上分不开**，文案给的是根路径而不是假装的区分。
+- 另两条原判「真机面」也补了：`docker compose -p station --profile litellm --env-file deploy/.env
+  -f deploy/docker-compose.yml config --quiet` ⇒ **rc=0**（原文命令跑通，只渲染不碰容器）；`mv deploy/.env`
+  之后 `node --test portal/integration/wp3b-e2e.mjs` ⇒ **rc=1 / 210 ms**，日志里一次 docker 都没发（唯一含
+  `docker` 的那行是文案本身）⇒ #495 ① 的「秒级失败 + 点名要复制哪个文件」成立。
+  **仍然未验**只剩：`wp3b`/`wp5`/`wp6` 的全量 e2e 复跑（要 docker + 整套隔离栈 env）。
+
+**返修补记（同批 worker，工单 fix-261116-01 的第二轮；只动两处，键值校验那条线按裁决不碰）**
+
+*活一：末段是符号链接 ⇒ 变成一条**独立可诊断事实**，三态归属一个字没改。*
+裁决记下来：预检是**诊断面**不是策略闸门——bind 源做成符号链接是合法配置（别的操作机的机器就这么摆），
+所以**不开第四态**（`waitForHostFile` 的「提前放弃 / 等满超时」两种形状已被判据钉住，加态会连锁打崩时间判据）。
+- `observeLastSegmentLink()`（`lstatSync` + `readlinkSync`）+ `formatLastSegmentLinkLine()`（**非链接 ⇒ 空串**，
+  不是来一句「不是链接」）；`observeHostPath` 每条返回都带 `link`；`unreadable` / `missing` 两种失败文案都带上这行
+  「`<路径> 是符号链接 → <目标>`；若这是宿主 bind 源，portal 容器里看到的是**链接目标那一侧**」。
+- 为什么必须单独说：`statSync` / `readFileSync` **跟随**链接 ⇒ 「链接指向可读文件」与「真文件」在状态上完全同形，
+  不说出来就是拿状态猜挂载形态。悬空链接**仍归 `missing`**（`statSync` 对它抛 ENOENT），但文案额外说一句
+  「缺的是**链接目标**，不是链接本身」。注入的 `fsImpl` 没有 `lstatSync` ⇒ `isSymlink=null` + `detectable=false`
+  （不许假装「不是链接」）。
+- 两格新判据（CI）：`L1` 链接+目标可读 ⇒ 仍 `present` 且链接事实为真、诊断行含 `符号链接` / 原样目标 / 解析后绝对目标；
+  `L2` 真文件 ⇒ 事实为假、`formatLastSegmentLinkLine()===''`、等待超时的文案里 `doesNotMatch(/符号链接/)`（反向自证）；
+  `L3` 悬空链接 ⇒ `missing` + `missingPrefix=链接路径`（归属不动）+ 文案点名缺的是目标 + `doesNotMatch(/读不到|FDE_USER_UID/)`。
+
+*活二：把上面登记的盲区（M4）补到负例门上*——`isolation-negative` 的 `expectThrow/expectReject` 加了
+`namesMustNotInclude`（「两种失败不许互串」的另一半判据以前表达不出来，只能靠人读输出），并加**陷阱 13**：
+链能进、叶子在 `stat` 与 `read` 之间消失 ⇒ 必须按没物化报（含快照那句 `No such file or directory`）
+且**不许**出现 `读不到` / `FDE_USER_UID`。夹具走注入：真 fs 单次调用造不出这个竞态窗口（`stat` 与 `read` 之间）。
+`#495` 正例组同时加链接四格 + 叶子级一格 ⇒ 「链级 / 叶子级」现在在**两个门**上都不可混。
+
+**本轮变异读数（每发都带 `MUTANT` 标记，跑完 `git checkout` 还原、`grep -rn MUTANT portal test`=0、`git status` 干净）**
+
+| 发 | 改了什么 | CI 门 | `--strict` |
+|---|---|---|---|
+| MT1 | 链接事实写死成恒真 | `# pass 16 / # fail 1`：**`not ok 14 - L2 ② 末段是真文件 ⇒ 链接事实为假…`** | rc=1 `正例夹具被抛错 … 真文件不许被写成链接` |
+| MT2 | 用 `statSync` 代替 `lstatSync`（不检末段） | `# pass 15 / # fail 2`：**`not ok 13 - L1`** + **`not ok 15 - L3`** | rc=1 `正例夹具被抛错 … 链接事实必须为真` |
+| MT3 | 叶子级 ENOENT 误归 `unreadable`（= 上一轮的 M4） | `# pass 15 / # fail 2`：`not ok 9 - P8` + **`not ok 16 - L4`** | rc=1 **`TRAP FAIL · waitForHostFile() 链能进但叶子不存在 ⇒ 按没物化报且不许喊权限`**（上一轮这里是全绿=盲区，现已堵） |
+
+干净树读数：CI 门 `# tests 17 / # pass 17 / # fail 0`（rc=0）；`isolation-negative --strict` rc=0
+（`verdict=TRAPS_FIRED（全部 13 条陷阱=均硬失败；单一来源=一份定义）`，缺省模式 rc=1 是刻意的负例证据口径）；
+`npm run check:agents-hotlayer` rc=0。里程碑 1 单独状态（旧 harness + 新 lib）也独立跑过：17/17 + `--strict` rc=0
+（12 条陷阱），所以两个提交各自都是绿的。
+`grep -rn "['\"](/srv/erix/users" portal/integration --include=wp*.mjs` 仍 0 处；单一来源钉新增
+`observeLastSegmentLink` / `formatLastSegmentLinkLine` 两个名字。
+
+**判据差项现在只剩**：① 「链**逐段 lstat**、末段不许是符号链接」的 *fail-closed* 版本刻意不做（主 agent 裁决只诊断）；
+链检本身仍是 `statSync`+`accessSync`（跟随链接），但末段链接事实已由 `observeLastSegmentLink` 单独说出并写进文案；
+② env 键值（值非法）校验不做（那条线在 `portal/test/deploy-env-defaults.test.js`）；③ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
+
+**返修补记二（同批 worker，第三轮；只放开自报的那一条边界）**
+
+把链上**更早**的段做成链接（`mount -> real`）⇒ 上一轮的结果是 `state=present`、`link.isSymlink=false`，
+也就是「bind 源本身就是符号链接」这个**现实里最常见的摆法**（`/srv/erix -> /data/erix`）今天完全隐形——
+而且它**末段根本不像链接**（末段是 `config.json` 真文件），所以只看末段永远看不见它。本轮就补这一条。
+
+- `inspectHostPathChain` 在**已有的逐段走查**里，对每一段先 `lstatSync`（不跟随）记一条事实
+  `{segment, path, isLastSegment, isSymlink, target, resolvedTarget, targetExists, detectable}` 再判归属，
+  返回 `links` 数组（提前 return 也把已走到的段带回去）。逐段 API 是 `observeSegmentLink`，
+  `observeLastSegmentLink` 变成它 `isLastSegment=true` 的薄包装（已合并的末段形状一个字没改）。
+  `observeHostPath` 的 `link` 直接**复用走查里末段那条**（同一次 `lstat`，不重复发 syscall；链提前 return 时
+  补一次，保证 L1/L2/L3 依赖的形状不碎）。
+- `formatAncestorLinkLines(links)`：只点名**第一个**非末段链接 + 它指向哪（相对链接给解析后的绝对目标）+
+  「portal 容器里看到的**容器内路径与宿主路径不是同一个 inode**：容器那一侧走的是链接目标，若这就是 bind 源，
+  **要改的是宿主侧这条链接指向**，去改容器里看到的那一侧不会生效」；悬空再加一句「缺的是**链接目标**」；
+  全链真目录 ⇒ **空串**（不是来一句「链上没有链接」）。接进 `unreadable` / `missing` 两种失败文案。
+- **三态归属一个字没改**：`present`/`missing`/`unreadable`、`missingPrefix`、`waitForHostFile` 的
+  「提前放弃 / 等满超时」两种形状、`unreadableConfirmations` 全部未动 ⇒ 本轮唯一产品效果是**多一条可诊断事实**。
+- 注入的 `fsImpl` 没有 `lstatSync` ⇒ 每一段都是 `isSymlink=null` + `detectable=false`（沿用末段口径，不假装「不是链接」）。
+
+**读数**：CI 门 `# tests 19 / # pass 19 / # fail 0`（上一轮 17 + 本轮 `L5`/`L6` 两格）；
+`isolation-negative --strict` rc=0（`verdict=TRAPS_FIRED（全部 13 条陷阱=均硬失败；单一来源=一份定义）`，
+缺省模式 rc=1 是刻意的负例证据口径）；单一来源钉新增 `observeSegmentLink` / `formatAncestorLinkLines`。
+
+**本轮变异（锚点命中数先校验=1 才动手；跑完 `git checkout` 还原、`grep -rn MUTANT portal test`=0、`git status` 干净）**
+
+| 发 | 改了什么 | CI 门 | `--strict` |
+|---|---|---|---|
+| M-A | 逐段走查用 `statSync`（跟随链接） | `# pass 16 / # fail 3`：`not ok 13 - L1` + `not ok 15 - L3` + **`not ok 17 - L5`** | rc=1 正例组「链接事实必须为真（statSync 跟随链接看不出来）」 |
+| M-B | 链上链接那一行改成**恒输出** | `# pass 17 / # fail 2`：`not ok 14 - L2` + **`not ok 18 - L6`**（`actual: '  链上第一段符号链接（不是末段）：MUTANT-MB 恒输出 → /'`） | rc=1 正例组「全真目录不许冒出链上链接那一行」 |
+| M-C | 走查里**只记末段**（把本轮新加那一半删掉） | `# pass 17 / # fail 2`：**`not ok 17 - L5`**（`expected: 1 / actual: 0`）+ `not ok 18 - L6`；**L1/L2/L3 保持绿** | rc=1 正例组「links 里必须有 mount 那一段：[["…/mount/home/.erix/config.json",false,true]]」 |
+
+M-C 是这轮最想要的一发：它证明 `L5` 那格**不是靠末段蹭红**（末段三格全绿时它单独红）。
+
+**判据差项现在只剩**：① 链检的存在性/类型/可达性判断仍走 `statSync`+`accessSync`（**只有链接事实**用 `lstat`）——
+「逐段 `lstat` 的 fail-closed 版本」按裁决不做；② env 键值（值非法）校验不做（那条线在
+`portal/test/deploy-env-defaults.test.js`）；③ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
+
+#### 返修补记三（2026-11-17，PR #554 第三方复审 BLOCKER 单独一轮：`deploy/.env` 的行内注释把隔离判据读成恒真）
+
+**病灶（一句话）**：`readEnvFile` 的旧正则在**未加引号**的值上把 ` # …` 整段留在值里 ⇒
+`TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared` 解析成
+`"/docker/station-edge/dynamic # shared"`，**不等于**真路径 `/docker/station-edge/dynamic`
+⇒ `assertHostWritePathsIsolated` 那条「与共享 `.env` 的值不相等」在**危险方向上恒真**：
+共享的正是生产边缘那份，预检却报绿（#227① 现场 = 隔离 portal 覆写边缘路由，8090 全线 502 而 `docker ps` 全 healthy）。
+主 agent 复现读数：`readEnvFile("<tmp>/env-probe")` → `"/docker/station-edge/dynamic # shared"`。
+
+**裁决（A 案，主 agent 定）**：预检**拒**「我们无从证明 compose 会拿到什么」的键值行，点名**文件 + 行号 + 键名 + 原文**，
+与既有 fail-fast（宁可起跑前红）同族；**没有**选「把解析改成与 compose 对齐并宣称等价」——那条路要求一条
+外部基准来证明「我们的解析 == compose 的解析」，而本单先要的是**别再绿着写错**。解析口径本身也照实测 compose 修了
+（`parseComposeEnvLine` / `parseComposeEnvFile`），但**判定权在拒不在猜**。两条边界按现场读数收窄：
+
+- 只盯 `HOST_WRITE_PATH_ENVS` 那四个键（`TRAEFIK_DYNAMIC_DIR_HOST` / `ERIX_USERSPACE_ROOT_HOST` /
+  `ERIX_ARTIFACTS_ROOT_HOST` / `STATION_DB_DIR`）：全文件一律拒会误杀真 `.env` 里
+  `POSTGRES_PASSWORD=xxxx # 说明` 这种合法行——**实测本仓库 `deploy/.env` 里就有三行**（32/38/40 行附近，全是密码键）。
+- 同族第二形一并拒：比对键的值里有 `$` 插值（compose 实测会把 `/a/${QQ}b` 读成 `/a/b`，我们看不到展开上下文）、
+  以及 compose 自己会硬报错的两形（未闭合引号、引号闭合后带垃圾）。非比对键带 `$` 不误杀（密码里 `$` 很常见）。
+
+**compose 口径实测**（`docker compose 2.40.3`，`docker compose --env-file <env> -f <yml> config --format json`，
+13 条读数已照抄成 `test/integration-e2e-preflight.test.js` 的 `COMPOSE_PARSE_CASES`）：
+`K=a b # c`→`a b`；`K="/c/d" # after`→`/c/d`；`K=/g/h#nospace`→原样；`K="/i/j # in"`→`/i/j # in`（引号内是正文）；
+`K=/a/b<TAB>#tab`→原样（**tab 不算注释起始**，只有空格算）；`K=  spaced value  # tail`→`spaced value`；
+`K=#hash first`→`#hash first`（值首 `#` 是字面）；`K="" # c`→空；未闭合引号与 `"v"junk` ⇒ compose 直接 `failed to read …`。
+
+**判据（两门，全夹具，不碰 docker）**：CI 新增 `#227① E1–E5`（E1 = 带注释的共享路径必须红且点名
+`shared.env:3 TRAEFIK_DYNAMIC_DIR_HOST`；E2 = 注释行/空行/缩进注释/引号内含 `#`/`#` 前无空格/非比对键带注释 ⇒ 不误杀；
+E3 = 记录读数表；E4 = **现场再跑一次真 compose 做三方对账**（现场 compose ⇔ 记录表 ⇔ 我们的解析），无 docker 才 skip；
+E5 = `$` 插值/未闭合/垃圾三形点名到行）；负例门新增**陷阱 14/15** + 正例组「不误杀」一格；
+`parseComposeEnvLine` / `parseComposeEnvFile` / `findUnreproducibleEnvLines` 进单一来源清单（两份解析必然漂）。
+
+**变异读数**（每发只打一处，锚点先 `grep -cF` 确认恰好 1 次，跑完立即复原，`grep -rn MUTANT portal | wc -l` = 0）：
+
+| 发 | 改了什么 | CI 门 | `--strict` |
+|---|---|---|---|
+| MT1 | **撤掉那条拒绝**（`findUnreproducibleEnvLines` 恒不命中） | rc=1：`not ok 20 - #227① E1 共享路径带未加引号的行内注释…` + `not ok 24 - #227① E5 同族拒…` | rc=1 `TRAP FAIL · assertHostWritePathsIsolated() 共享路径带未加引号行内注释 ⇒ 当场拒并点名 文件:行号:键名` + `… $ 插值 …`，`verdict=TRAP_SILENT` |
+| MT2 | 撤掉剥注释（值里「空格 + `#`」不再切开） | rc=1：`not ok 20/21/22/23`（E1–E4 全红） | rc=1 `TRAP FAIL · …行内注释…`，`verdict=TRAP_SILENT` |
+| MT3 | 反向：把**引号内**的 `#` 也当注释剥掉（误杀合法值） | rc=1：`not ok 21/22/23`（E2 不误杀红） | rc=1 `正例夹具被抛错（护栏过严/夹具过期）：引号内的 \`#\` 是正文…` |
+
+**门禁读数**：`node --test test/integration-e2e-preflight.test.js` ⇒ rc=0 `# tests 24 / # pass 24 / # fail 0 / # skipped 0`
+（E4 在本机真跑 compose，没 skip）；同一条命令在 `portal/` 目录里用 `../test/…` 跑 ⇒ rc=0 同样 24/24
+（**字面照抄 `test/…` 会 rc=1 `Could not find`** —— 该文件在仓库根的 `test/` 下，派单里那句路径写法记在此处）；
+`node portal/integration/isolation-negative.mjs --strict` ⇒ rc=0 `verdict=TRAPS_FIRED（全部 15 条陷阱=均硬失败；单一来源=一份定义）`，
+默认跑法仍 rc=1（语义如此）；`npm run check:agents-hotlayer` ⇒ rc=0（热层 18706 / 预算 19456，条目 127 无重复编号）。
+
+**本轮差项 / 遗留**：① A 案的代价说清：真机若在那四个比对键上写未加引号注释（本仓库这份没有），
+`wp3b-e2e` 会起跑前红一次，文案给改法（加引号或把注释挪到上一行）——这是有意的 fail-fast，不是误杀；
+② compose 版本相关：`COMPOSE_PARSE_CASES` 的读数表钉的是 **2.40.3**，别处版本若改了口径，E4 现场复核对不上会红
+（这正是它存在的理由，不要顺手改表）；③ 第三方复审另外四条（链接目标 EACCES 归 missing、`FDE_POOL=large` 白名单可缺
+large 段、`$TMPDIR` 是链接时的夹具前提、「三态」措辞）本轮按裁决**未做**，另起一轮；④ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
+
+### 8.142 事件平台 W3 落地 + 迁移让号 0037 + 迁移编号撞车的处理口径（#526，2026-11-16，主 agent + erix_run）
+
+接 §8.130。**W3（通知 + HTTP API）已合并进 main**（PR #564，`f0a7af4`）。
+
+| 单 | PR | 合并 | 轮数 |
+|---|---|---|---|
+| W3 通知 + 14 端点（#526） | #564 | `f0a7af4` | 80 + 复验收紧 92 |
+
+**交付**：`0037-notifications-and-origin.sql`（`notifications` 表 + `chat_sessions.origin` 列）、
+`portal/src/notifications.js`（读写层 + `deliverIntent`）、`portal/src/macro-routes.js`（14 handler）、
+`http.js` 接线（业务逻辑不进那个 4741 行的文件）、接上 W1 的 `// TODO(W3)` 软删接点。
+
+**契约里三条最容易做错的，都按 `10` 篇钉住了**：
+① `summary` 的分母是 `done` 不是 `triggered`（`byVerdict` 各桶都是
+`COUNT(*) FILTER (WHERE verdict = '…')`，`skipped`/`failed` 的 `verdict` 是 NULL ⇒ 天然不并入；
+**别「顺手优化」成 `verdict IS NULL ⇒ unclassified`**，那会把 skipped/failed 吸进分母）；
+② 白名单映射不是黑名单删除（`toPublicTemplate` 只列六个键；admin 流水不含 `sessionId`/`childSessionId`）；
+③ `severity` 由「收件人 + 结果」推导。
+
+**主 agent 抓到的弱测试（已收紧）**：原「判据5」写的是
+`deliverIntent(pool, intent, { recipients: [] })` —— **恒真**（空数组是调用方给的，
+函数只是「空就不循环」）。它证明不了契约 §3.4 的真语义「收件人**只有管理员** ⇒ 不写行」。
+⇒ `deliverIntent` 加**写侧角色闸**（自己查 `users.role`，不信调用方），
+判据5 重写成真角色用例（admin / 混合 / 失败 / 全无效 id / 去重 / 空清单）。
+反向自证：去掉角色过滤 ⇒ `not ok 7` 红（admin 名下真写出了一行）；还原后 13/13 绿。
+⇒ **口径：凡是「某类调用方不许发生某事」的判据，用例必须让那个调用方真的出现一次，
+用「空集合恒真」来充当判据等于没测。**
+
+**六个变异全部命中**：`unclassified` 吸 NULL、`toPublicTemplate` 改黑名单、非属主改 403、
+admin 流水加 `sessionId`、`severity` 恒 `info`、软删不查 `notifications`。
+
+---
+
+#### 迁移编号撞车：处置口径（本批第一次真撞上）
+
+rebase 到 main 时发现**另一个 session 先合了 `0036-upload-settings.sql`**，而 W3 也建了
+`0036-notifications-and-origin.sql` ⇒ 同一编号两个文件、`migrations.test.js` 三方冲突
+（19 处 head 断言 + 4 处 `Array.from` + 0033/0034/0035 的相对位置断言）。
+
+处置：**后进入的让号**（W3 改 `0037`），并把 19 处 head 断言 36→37、4 处 `Array.from({length})`、
+三处相对位置断言（`-4`→`-5`、`-3`→`-4`、`-2`→`-3`）**一并顺移**。
+rebase 后 69/69 全绿（含 upload-settings 那支）。
+
+⇒ **口径：① 加迁移前先 `git fetch && git ls-tree --name-only origin/main deploy/migrations/ | tail -3`
+现查 head，别信自己记忆里的编号；② 撞了就后进入的让号，绝不回改已应用的编号；
+③ 相对位置断言（`files.length - N`）比 head 断言更容易漏 —— 让号时两个都要顺移。**
+
+#### 顺带记两个操作坑
+
+- `gh pr create` 报 `Head sha can't be blank` = **分支还没推**（不是 gh 的问题）。
+- `gh pr edit --body-file` 在本机 **rc=1 什么都不写**（§3.7 记的是 rc=0 空写，两种都有）。
+  改 PR body 一律走 REST：`gh api repos/<o>/<r>/pulls/<n> -X PATCH --input <json>`，**写完回读确认**。
+- 直连 GitHub 有一次 133s 超时 ⇒ 换显式代理
+  `git -c http.proxy=http://proxy.internal:19001 -c https.proxy=…` 立刻通（与 §4 记载一致）。
+
+**待办**：W4a（#537，在跑）、W4b（#538）、W7（#536）、W5/W6。

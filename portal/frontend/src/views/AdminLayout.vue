@@ -42,6 +42,8 @@ const tabs = [
   // issue #456 M2：证书页。顺序 users → llm → repos → mail → **certs** → pool：
   // 「发信 / 边缘证书」同属平台入口配置，号池占用仍留最后（只读运维快照）。
   { name: 'admin-tls', label: 'admin.tabs.tls' },
+  // issue #485 片 A：上传上限（§4.15）。紧随证书（两者都是平台配置）而在号池占用（只读快照）之前。
+  { name: 'admin-upload', label: 'admin.tabs.upload' },
   // issue #350：号池占用总览（只读）。放在最后：先看用户/配置，选段时才来这里。
   { name: 'admin-preview-pool', label: 'admin.tabs.previewPool' },
 ] as const;

@@ -35,7 +35,7 @@
 //   PORTAL_HOST_PORT=<非 18080> TRAEFIK_WEB_PORT=<非 8090> TRAEFIK_WEBSECURE_PORT=<非 8443>
 //   FDE_NAME=<含栈 id 的 FDE 名>（`fde-<name>` 是全局 docker 网络/容器名，不派生会与共享栈互删）
 //   BACKEND_SUBNET=<非 172.32.0.0/24> FDE_POOL=large（FDE_IPAM_POOLS 可不传：缺省由
-//     defaultFdeIpamPools(栈 id) 派生；显式传入优先，#227.3）
+//     applyStackIpamPoolEnv(栈 id) 派生；显式传入优先，#227.3）
 //   STATION_PORTAL_IMAGE/STATION_DOCKER_PROXY_IMAGE/FDE_IMAGE=…:<栈 id>
 //   FDE_DEV_MODE=1（#227.1 起必需：FDE_IMAGE 为 image:tag 形态时须显式声明 dev 模式；digest 形态豁免）
 //   BASE_DOMAIN=…（**必须 export**，如 fde.erix.vip 或自建域，#268 M2 警示：不 export 时
@@ -69,20 +69,27 @@ import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mj
 import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { reconcilePortsJsonWithDb } from './lib/ports-reconcile.mjs';
 import {
-  assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  assertHostPortsAvailable, applyStackIpamPoolEnv, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
   writeDynamicStub, deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
+// issue #495 ①（#412 遗留）：compose 的 `--env-file` 与「等宿主侧物化文件」的失败分类（唯一定义处 lib/e2e-preflight.mjs）。
+import { COMPOSE_ENV_FILE, assertComposeEnvFile } from './lib/e2e-preflight.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 // #227.2：compose 一律显式 -p，且用 bash 的 `${VAR:?msg}`——未 export 时展开即非零退出并点名，
 // 不再依赖「COMPOSE_PROJECT_NAME 环境变量压过 compose 文件 name: station」这条隐式优先级
 // （忘 export 曾经会让脚本自己对共享 dev 栈 down -v）。
 const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME required for isolated e2e}" --env-file deploy/.env -f deploy/docker-compose.yml';
+// issue #495 ①：上面命令串固定带 --env-file deploy/.env，而它不入 git ⇒ git worktree / 新 clone 里
+// 必然缺。docker compose 要到**整轮镜像构建之后**才报 couldn't find env file（#412 部署机实测白烧 10.7 分钟），
+// 所以这条预检放在模块加载时——它先于本文件任何一次 docker/compose；文件在场时零输出。
+assertComposeEnvFile({ envFile: COMPOSE_ENV_FILE, cwd: REPO_ROOT, label: 'wp2a-e2e' });
 
-// #227.3：FDE_IPAM_POOLS 未显式传时按栈 id 派生本栈口径（派生段+portal large 池固定段；显式传入优先）。
-if (!process.env.FDE_IPAM_POOLS && process.env.STATION_STACK_ID) {
-  process.env.FDE_IPAM_POOLS = defaultFdeIpamPools(process.env.STATION_STACK_ID);
-}
+// #227.3 → #270：两腿**一次派生** —— 放行面 FDE_IPAM_POOLS（= proxy IPAM_POOLS）与 portal 的
+// 分配段 FDE_IPAM_POOL_LARGE（→ portal IPAM_POOL_LARGE）取同一个值，显式传入优先。旧口径
+// 「派生段 + 整个 large 保留段两段兜底」已删：那第二段就是「两套并行隔离栈都从同一池头分配」
+// 的撞车源头，而现在分配段本身可配（portal/src/ipam.js 的 IPAM_POOL_LARGE），不再需要额外放行一段。
+applyStackIpamPoolEnv(process.env);
 
 // issue #226：入口句柄全部 env 派生（缺省值保留现状值只为可读，隔离跑法由护栏强制显式传）。
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';

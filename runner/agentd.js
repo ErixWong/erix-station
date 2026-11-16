@@ -26,6 +26,10 @@ import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
 // delegation P1：开关的**唯一解析口径**与 worker 侧同源（两面各自 `=== '1'` 就会分叉）。
 import { isDelegateEnabled } from './lib/config.js';
+// issue #243 返工（PR #555 MED-2）：marker 片段的长度上界与 runner 侧同一个常量、与 portal 同名同值。
+// 这里**必须**用它：agentd 是 worker → U2 的最后一道宿主关口，超长 marker 若在 portal 侧被 400，
+// 被打回的是**整条终态**（终态不写、不重试），一个显示片段不该有那种权力。
+import { TEXTUALIZED_MARKER_MAX_CHARS } from './lib/final-text-toolcall.js';
 import { archiveRunData, prepareRunDataDir, prepareSessionNotesDir, prepareDelegationDirs, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
 import { captureAndUploadArtifact } from './lib/artifacts.js';
 // 端口呈现优化·观测层 MVP（迁移 0022）：/proc 采样当前真实监听，随 U4 heartbeat 捐带 `listeners`。
@@ -1231,6 +1235,20 @@ async function onWorkerFinished(ctx, msg) {
     // 旧 worker 不知道这个键）。落点见 `portal/src/internal.js` 的 `finishRun`（写进
     // `runs.termination.finalTextFallback`，由 `run_termination` 合成项投影给界面）。
     ...(msg.final_text_fallback === true ? { final_text_fallback: true } : {}),
+    // issue #243：worker 只在**命中**「终局正文是一段被文本化的工具调用」时才带这两个键
+    //（缺席 = 没命中，绝不补 `false`）⇒ 这里同样**逐字透传**。落点见 `portal/src/internal.js` 的
+    // `finishRun`：在同一个终态事务里合成 `textualized_tool_call` 诊断事件（additive，不改终态语义）。
+    ...(msg.textualized_tool_call === true
+      ? {
+        textualized_tool_call: true,
+        // 只丢这个**显示片段**，布尔照传：非串 / 空串 / 超长（> 上界）都不许把整条终态拖下水。
+        ...(typeof msg.textualized_tool_call_marker === 'string'
+          && msg.textualized_tool_call_marker !== ''
+          && msg.textualized_tool_call_marker.length <= TEXTUALIZED_MARKER_MAX_CHARS
+          ? { textualized_tool_call_marker: msg.textualized_tool_call_marker }
+          : {}),
+      }
+      : {}),
     // issue #322：标题**归 portal 生成**（`session-title.js` → `title-llm.js` → `llm-chat.js`），worker
     // 侧不再起标题 ⇒ 这个字段现在恒是空串。本行只保留**透传**（契约形状一字未改：旧 portal + 新 agentd
     // 的组合下拿到空串即走降级链），`title` 在 U2 上的口径见 `docs/api/portal.md` §9.6。

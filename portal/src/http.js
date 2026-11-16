@@ -41,9 +41,12 @@ import { createRateLimiter, createSemaphore } from './ratelimit.js';
 import { maskEmail } from './mailer.js'; // #449：邮件通道端口（登录邮箱验证码）
 import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置的 DB 读取侧（60s 缓存）
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
+import * as uploadSettings from './upload-settings.js'; // #485 片 A：单文件上限进管理台（DB 优先 env，每次上传现读）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
 import * as delegation from './delegation.js'; // 子 run（delegation）读侧：名册 + 账本两个只读端点
+import * as macroRoutes from './macro-routes.js'; // #526：宏平台 HTTP 业务层（if 链只做「匹配+鉴权+转发」，不再撑大本文件）
+import { MacroError } from './macros.js'; // #526：宏域错误载体（httpStatus 自带在错误上，一处映射）
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -564,6 +567,46 @@ export async function checkReady(pool, migrationsDir = migrate.defaultMigrations
 }
 
 /**
+ * issue #515（工单 fix-261115-11）：**「缓冲逐出活跃 run」这条降级必须对外可见**。
+ *
+ * 为什么挂在这里（而不是新开端点、不是新增鉴权面、不是事件流）：
+ *   * `run-partial-buffer` 的 `evictOne()` 在「全表都是活跃 run」时会逐掉一个**仍在流**的 run，
+ *     后果 = 该 run 终态时 `partial_text` 写歪或写不出（两种情形见 `docs/api/portal.md` §5.1 的
+ *     已接受损失条目）。它本来已经有 `stats().evictedActive` 计数与一条 `log.warn`，但**没有
+ *     任何对外读面**（portal 今天没有 `/metrics`，`grep -rn metrics portal/src` = 0 命中）⇒
+ *     只能翻日志对账，界面上只表现为「那段没了」。本函数把那半个可观测面补成整只。
+ *   * 本仓已定裁决（#515 的三选一）= **「已有 `stats()` 挂到既有 `/healthz`」+「文档显式接受」**。
+ *     **不**新增宿主诊断事件（那要动 SSE 白名单 + 前端 + 事件面契约测，另单），**不**新增端点。
+ *     ⚠ 也**不**借用 `persistence_capability_degraded` 当信号名：那个类型是**引擎发射**的
+ *     （`orchestrator.js`，见 `docs/api/portal.md` §5.3 第 20 类），portal 拿它说自己的事 = 谎报发射方。
+ *
+ * 形状红线（`portal/test/healthz-partial-buffer.test.js` 逐条钉）：
+ *   * **三个整数，没有别的**：`entries`（当前占用的槽数）/ `maxEntries`（槽位上界，缺省 32）/
+ *     `evictedActive`（累计逐出活跃 run 的次数）。**不放 run id 列表、不放 sessionId、不放正文片段**
+ *     ——健康端点的响应会被人整段贴进工单与日志，放 run id 就是往里塞用户数据（PII）。
+ *   * **`status` 字段语义一字未动**（`{ status: 'ok' }` 仍是就绪判据），**503 分支的形状也没动**
+ *     （未就绪时返回 `errorBody('migration_failed', …)`，不带本块）：容器健康检查
+ *     （`deploy/docker-compose.yml` → `node portal/src/cli.js healthcheck`）只看 `res.ok`，
+ *     不解析 body（取证见 `cli.js#healthcheck`），所以加字段对它结构性安全。
+ *   * **观测块不得把健康端点打挂**：`stats()` 抛异常 ⇒ 整块缺席，`status: 'ok'` 照旧 200。
+ *     一个观测用的附加块不该让 readiness 链（`docs/design/deploy-contract.md` §8）翻成 500。
+ *
+ * @param {{stats?: () => object}} [buffer] 注入点（默认进程内单例；测试可塞自定义缓冲实例）
+ * @returns {{entries:number,maxEntries:number,evictedActive:number}|null} 取不到 ⇒ `null`（调用方省略该键）
+ */
+export function partialBufferHealth(buffer = partialOutputs) {
+  try {
+    const s = typeof buffer?.stats === 'function' ? buffer.stats() : null;
+    if (!s) return null;
+    // `stats()` 的键名是缓冲自己的口径（`size`），到对外契约这一层叫 `entries`：
+    // 映射写在这里=只有一处翻译，不把内部键名泄成对外契约的一部分。
+    return { entries: s.size, maxEntries: s.maxEntries, evictedActive: s.evictedActive };
+  } catch {
+    return null; // 观测面不承重（判据见上面的「观测块不得把健康端点打挂」）
+  }
+}
+
+/**
  * @param {{pool: object, config: object, log?: Console, docker?: object, llmGateway?: object,
  *          mailerProvider?: object, tlsConnect?: Function, tlsRoutePath?: string}} opts
  *   `tlsConnect` / `tlsRoutePath` 仅供测试注入（#456 的真机校验探针）：前者换掉 `tls.connect`，
@@ -741,6 +784,10 @@ export function createServer({
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof uploadSettings.UploadSettingsError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       if (err instanceof tlsCert.TlsCertError) {
         // #456：证书面的错误一律 `retryable:false`（`tls_cert_expired` 也是——换一张证书才是出路，
         // 重试一万次还是同一张）。`details` 里只有字段名/域名/指纹，**没有 PEM、没有私钥**。
@@ -754,6 +801,12 @@ export function createServer({
       if (err instanceof delegation.DelegationError) {
         // 子 run 读侧：只用既有错误码（not_found / validation_failed / payload_too_large / internal），
         // httpStatus 自带在错误上 ⇒ 零新码、零新映射规则。
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
+      if (err instanceof MacroError) {
+        // #526 宏域（macros.js / macro-routes.js / notifications.js 共用这一种错误载体）：
+        // httpStatus 自带 ⇒ 与 SessionError/DelegationError 同形映射，零新错误码。
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
@@ -818,7 +871,13 @@ async function route(req, res, ctx) {
       throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     }
     const ok = await checkReady(ctx.pool);
-    if (ok) return sendJson(res, 200, { status: 'ok' });
+    // #515：就绪响应多带一块 `partialBuffer` 观测数字（**additive**，`status` 语义不变、503 形状不变、
+    // 不新增端点与鉴权面）。为什么必须有：缓冲逐出活跃 run 只表现为「那段正文没了」，此前对外
+    // 零读数（无 `/metrics`）⇒ 只有 `log.warn` 可对账。形状与红线见 `partialBufferHealth` 的注释。
+    if (ok) {
+      const pb = partialBufferHealth();
+      return sendJson(res, 200, pb ? { status: 'ok', partialBuffer: pb } : { status: 'ok' });
+    }
     return sendJson(res, 503, errorBody('migration_failed', 'not ready'));
   }
 
@@ -1137,6 +1196,61 @@ async function routeApi(req, res, ctx, url) {
     if (req.method === 'GET') return handleGetRunArtifact(req, res, ctx, runId);
   }
 
+  // ---- #526 宏平台用户面（契约 10 篇 §3.2；⚠ 不能放 `/api/admin/*`——#450 白名单）。
+  // 本链只做「正则匹配 → requireSession → 调 macro-routes → sendJson」，业务全部在 macro-routes.js；
+  // 属主校验在其内部走 `fetchSession`（非属主/不存在都 404，不泄露存在性）。
+  if (req.method === 'GET' && pathname === '/api/macro-templates') {
+    await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.userTemplates({ pool: ctx.pool }));
+  }
+  // ⚠ `unread-count` 排在 `/notifications/:id/read` 之前：两段都是 `/api/notifications/xxx`，
+  // 后者的 `:id` 能吃掉 `unread-count`（同名空间里的静态段要先注册，口径同 macro-runs/summary）。
+  if (req.method === 'GET' && pathname === '/api/notifications/unread-count') {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.notificationsUnreadCount({ pool: ctx.pool, userId: s.user.id }));
+  }
+  const notifReadMatch = pathname.match(/^\/api\/notifications\/([^/]+)\/read$/);
+  if (req.method === 'POST' && notifReadMatch) {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.notificationMarkRead({
+      pool: ctx.pool, userId: s.user.id, notificationId: decodeURIComponent(notifReadMatch[1]).toLowerCase(),
+    }));
+  }
+  if (req.method === 'GET' && pathname === '/api/notifications') {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.notificationsList({ pool: ctx.pool, userId: s.user.id, query: url.searchParams }));
+  }
+  const sessMacroAssignMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/macro-assignments$/);
+  if (sessMacroAssignMatch) {
+    const s = await requireSession(req, ctx);
+    const sessionId = decodeUuid(sessMacroAssignMatch[1]);
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await macroRoutes.sessionAssignments({ pool: ctx.pool, sessionId, userId: s.user.id }));
+    }
+    if (req.method === 'PUT') {
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      return sendJson(res, 200, await macroRoutes.putAssignment({ pool: ctx.pool, sessionId, userId: s.user.id, body }));
+    }
+  }
+  const sessMacroAssignOneMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/macro-assignments\/([^/]+)$/);
+  if (req.method === 'DELETE' && sessMacroAssignOneMatch) {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.deleteAssignment({
+      pool: ctx.pool,
+      sessionId: decodeUuid(sessMacroAssignOneMatch[1]),
+      userId: s.user.id,
+      assignmentId: decodeUuid(sessMacroAssignOneMatch[2]),
+    }));
+  }
+  if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/macro-runs$/.test(pathname)) {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.sessionMacroRuns({
+      pool: ctx.pool, userId: s.user.id,
+      sessionId: decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/macro-runs$/)[1]),
+      query: url.searchParams,
+    }));
+  }
+
   // ---- admin LLM 配置（issue #38 Phase A；requireAdmin 鉴权） ----
   if (pathname.startsWith('/api/admin/')) {
     return handleAdminApi(req, res, ctx, url);
@@ -1159,6 +1273,39 @@ async function requireAdmin(req, ctx) {
 async function handleAdminApi(req, res, ctx, url) {
   const { pathname } = url;
   const session = await requireAdmin(req, ctx); // 所有 /api/admin/* 端点统一先鉴权
+
+  // ---- #526 宏平台管理台（契约 10 篇 §3.3；业务在 macro-routes.js，本处只转发）----
+  if (pathname === '/api/admin/macro-templates') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await macroRoutes.adminTemplates({ pool: ctx.pool, query: url.searchParams }));
+    }
+    if (req.method === 'POST') {
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      return sendJson(res, 200, await macroRoutes.adminCreateTemplate({ pool: ctx.pool, body, adminUserId: session.user.id }));
+    }
+  }
+  const adminMacroTemplateMatch = pathname.match(/^\/api\/admin\/macro-templates\/([^/]+)$/);
+  if (adminMacroTemplateMatch) {
+    const templateId = decodeUuid(adminMacroTemplateMatch[1]);
+    if (req.method === 'PATCH') {
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      return sendJson(res, 200, await macroRoutes.adminPatchTemplate({ pool: ctx.pool, templateId, body }));
+    }
+    if (req.method === 'DELETE') {
+      return sendJson(res, 200, await macroRoutes.adminDeleteTemplate({ pool: ctx.pool, templateId }));
+    }
+  }
+  // ⚠ `summary` 必须排在 `/macro-runs/:id` 之前：否则字面量 `summary` 会被当成 run id 吞掉。
+  if (req.method === 'GET' && pathname === '/api/admin/macro-runs/summary') {
+    return sendJson(res, 200, await macroRoutes.adminRunsSummary({ pool: ctx.pool, query: url.searchParams }));
+  }
+  const adminMacroRunMatch = pathname.match(/^\/api\/admin\/macro-runs\/([^/]+)$/);
+  if (req.method === 'GET' && adminMacroRunMatch) {
+    return sendJson(res, 200, await macroRoutes.adminMacroRunDetail({ pool: ctx.pool, runId: decodeUuid(adminMacroRunMatch[1]) }));
+  }
+  if (req.method === 'GET' && pathname === '/api/admin/macro-runs') {
+    return sendJson(res, 200, await macroRoutes.adminMacroRuns({ pool: ctx.pool, query: url.searchParams }));
+  }
 
   const adminGitCredentialMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/git-credential$/);
   if (adminGitCredentialMatch) {
@@ -1533,6 +1680,33 @@ async function handleAdminApi(req, res, ctx, url) {
   }
   if (pathname === '/api/admin/mail/test') {
     if (req.method === 'POST') return handleAdminMailTest(req, res, ctx, session);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
+  // 管理台「上传上限」（issue #485 片 A，契约 portal.md §4.15）：GET 读生效值 + 来源 / PUT 写。
+  // 与 mail/settings 不同：无需 `invalidate()` —— 上传端点本就每次现读 DB（无缓存），改完立即生效。
+  if (pathname === '/api/admin/upload/settings') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await uploadSettings.getUploadSettings({
+        pool: ctx.pool, config: ctx.config, log: ctx.log,
+      }));
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await uploadSettings.updateUploadSettings({
+        pool: ctx.pool,
+        config: ctx.config,
+        log: ctx.log,
+        actorId: session.user.id,
+        fields: body,
+      });
+      // 审计**不在这里**写（复 audit 活二）：`admin.upload_settings_updated` 已经和 upsert 挤进同一条 CTE 语句
+      //（`upload-settings.js` 的 `SAVE_SQL`）。原来这里是「upsert 已成 → 再 await 一笔 INSERT」：
+      // INSERT 失败就是「设置已生效而审计一行没有」，并发保存还会把 `previous_*` 记成自己进来之前的数。
+      // 再补一笔 `auth.audit` 会退回那两个窗口，并且多写一条审计行（`upload-settings.test.js` US-18 钉这一点）。
+      return sendJson(res, 200, result.settings);
+    }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
 
@@ -2538,6 +2712,13 @@ const HISTORY_EVENT_TYPES = new Set([
   // 用户刷新来看「这次怎么失败了」时必须看得到。与前端 `EVENT_TYPES` + `HISTORY_REPLAY_TYPES` 是
   // **三处独立存亡的集合**（#288 教训），本单同改。
   'user_turn_guard_unrecoverable',
+  // issue #243：`textualized_tool_call`（**本站自造**，由 `internal.js#finishRun` 在终态事务里合成）
+  // ——「这次终局正文是一段被文本化的工具调用」= 交付报告可能没生成。它**必须进本白名单**：
+  // 上游 erix-agent #182 的教训就是「实时看得见、刷新后消失」，而这条事件说的恰恰是
+  // 「用户刷新来看这次交付了什么」的那一刻。三处集合独立存亡（#288 老坑）：本表 + 前端
+  // `EVENT_TYPES` + 前端 `HISTORY_REPLAY_TYPES`，只加一边就得到两种可见性不一致。
+  // 判据：`portal/test/textualized-toolcall.test.js`（源码级 + 行为级各一条，行为级就在本端点）。
+  'textualized_tool_call',
 ]);
 const HISTORY_EVENT_DEFAULT_LIMIT = 500;
 const HISTORY_EVENT_MAX_LIMIT = 2000;
@@ -2804,7 +2985,7 @@ function mergeSynthItemsBySeq(realEvents, synthItems) {
  */
 async function handleSessionFoldedPayload(req, res, ctx, sessionId, round) {
   const session = await requireSession(req, ctx);
-  const result = await sessions.getFoldedPayload(ctx.pool, { userId: session.user.id, sessionId, round });
+  const result = await sessions.getFoldedPayload(ctx.pool, { userId: session.user.id, sessionId, round, log: ctx.log });
   return sendJson(res, 200, result);
 }
 
@@ -2900,10 +3081,37 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
   // issue #300 / #236：零候选 ⇒ 零额外查询（无 run ⇒ 连终态查询都不发）。
   // `next_cursor` / `hasOlder` 在上面已由**真实事件**算完，合成项不参与。
   // `before` 要传下去（#502 M-6④）：合成项只许出现在它自己 seq 所属的那一页。
-  const synth = await buildHistorySynthItems(ctx.pool, rows, { before });
+  // issue #514：`pageLow` = 本页最小的真实事件 seq（空页 ⇒ 0 = 不设下界），它是**候选发现的页界**；
+  // `sessionId` 给发现查询用（那条查询按会话查 `run_end` 行，不像主窗口那样从行里带出 run_id）。
+  const pageLow = rows.length > 0 ? Number(rows[0].seq) : 0;
+  const synth = await buildHistorySynthItems(ctx.pool, rows, {
+    before,
+    sessionId,
+    pageLow,
+    limit,
+  });
+  // 白名单游标（既有口径，逐字未动）：本页有真实行且还有更早的 ⇒ 本页最老那一行的 seq。
+  const whitelistCursor = hasOlder && rows.length > 0 ? pageLow : null;
+  // issue #514 **返修**（二次审计第 1 条，主 agent 复核成立）：**空页的游标必须由候选发现行驱动**。
+  // 空页不是「到底了」，它恰恰意味着「`before` 之下还有内容，只是全不是白名单事件」——而那条尾巴
+  // （> `limit` 条「从未开始就被取消」的 run，每个只留一行 `run_end`）被发现的 `LIMIT` 截掉的部分，
+  // 在旧口径下 `next_cursor` 恒 null（游标只由白名单行算，空页上白名单行不存在）⇒ 客户端不会再拉
+  // 下一页 ⇒ 那些 run 的分隔条**永远没有页可达**（不是延迟出现，是永远看不见）。
+  // 取**已发现行里最小的 seq**：下一页窗口 `[0, minSeq)` 与本页 `[0, before)` 严格不重叠（发现查询
+  // 自己夹了 `seq < before` ⇒ minSeq 必然 < before，方向与白名单游标一致、不会倒退），
+  // 且下一页的窗口从这条之后继续 ⇒ 不重不漏。是否「还有更老的」取**事实**而非猜测：发现查询按
+  // 主窗口同一口径多取一行探针（`LIMIT limit + 1`），真拿到了第 `limit + 1` 行才算截断。
+  // 非空页**不动游标**：那种页的截断残差在 `[minSeq, pageLow)` 之间，而页游标属于白名单行——把它
+  // 压到 pageLow 之下会跳过**真实事件**（比丢一条分隔条更坑），所以那种页照旧、残余写进 §4.4a-2。
+  const minDiscoveredSeq = synth.discovery.minSeq;
+  const tailCursor = rows.length === 0 && synth.discovery.truncated
+    && Number.isSafeInteger(minDiscoveredSeq) && minDiscoveredSeq >= 1
+    && (before == null || minDiscoveredSeq < before)
+    ? minDiscoveredSeq
+    : null;
   return sendJson(res, 200, {
-    events: mergeSynthItemsBySeq(events, synth),
-    next_cursor: hasOlder && rows.length > 0 ? Number(rows[0].seq) : null,
+    events: mergeSynthItemsBySeq(events, synth.items),
+    next_cursor: whitelistCursor ?? tailCursor,
   });
 }
 
@@ -2918,16 +3126,30 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
  * 与 #300 的 `partial_output` 同一种存在方式）。
  *
  * 判据（缺一不合成，**一条 run 至多一条**）：
- *   ① 该 run 出现在本次响应窗口里（`distinctWindowRunIds`）；
+ *   ① 该 run 是**本页的候选**：本页白名单行里出现过它（`distinctWindowRunIds`），**或**本页 seq 窗口内
+ *     有它的 `run_end` 行（issue #514 补的那半：只写一行 `run_end` 的 run 在白名单行里零影子）；
  *   ② `runs.status IN ('finished','failed')`（`queued`/`running`/`cancelling` 一律不合成）；
  *   ③ `termination.reason` 是**非空字符串**（缺 termination / 脏载荷 ⇒ 不合成：不拿 status 编一个 reason）。
+ *
+ * ⚠ ① 的两路**都只发现 run id**：白名单行照旧下发，`run_end` 行照旧**不下发**（红线，#217/#236）。
+ *
  *
  * `seq` = 该 run 在 `run_events` 里的**最大 seq**（不新分配）：`run_end` 行本来就在表里 ⇒ 分隔条天然落在
  * 本次 run 内容之后，且分页窗口外的行也拿得到（`MAX(seq)` 不受 `before` 限制）。
  */
-async function buildHistorySynthItems(pool, windowRows, { before = null } = {}) {
-  const runIds = distinctWindowRunIds(windowRows);
-  if (runIds.length === 0) return []; // 成本红线：窗口无 run ⇒ 整段跳过，一条查询都不许多发
+async function buildHistorySynthItems(pool, windowRows, { before = null, sessionId = null, pageLow = 0, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
+  const windowRunIds = distinctWindowRunIds(windowRows);
+  // issue #514：**候选发现不能只认白名单行**。`stopSession` 的 killedQueued 分支（queued 从未开始
+  // 就被取消）这次 run 只写**一行** `run_end`，而它不在下发白名单（红线）⇒ 这个 run 在白名单行里
+  // **一个影子都没有** ⇒ 旧代码把它整个漏掉：既没有 `run_termination` 分隔条，也没有占位项，
+  // 刷新后正文区完全空白。这里用页内的 `run_end` 行**发现 run id**（只是多一个候选 id，
+  // 那一行本身仍不作为回放事件下发），后面的投影完全复用既有通路。
+  const discovery = sessionId == null
+    ? NO_TERMINAL_DISCOVERY
+    : await discoverTerminalRuns(pool, sessionId, { pageLow, before, limit });
+  const runIds = [...new Set([...windowRunIds, ...discovery.runIds])];
+  // 成本红线：窗口无 run 且页内无终态行 ⇒ 整段跳过，一条 runs 查询都不许多发。
+  if (runIds.length === 0) return { items: [], discovery };
   // 一条 runs 查询同时服务 partial_output 的候选判定与 run_termination 的终态投影（不许打第二条）。
   const runRows = await loadWindowRuns(pool, runIds);
   // 候选 = 终态且**无 assistant 锚点**的 run（有锚点 ⇒ 正文已在 `messages`/transcript 那条路上，
@@ -2941,8 +3163,73 @@ async function buildHistorySynthItems(pool, windowRows, { before = null } = {}) 
   // `seq >= before` 的项属于**更新的那一页**，本页不得返。不拿 `windowRows` 的最小 seq 去卡下界：
   // `seq` 永远 >= 本页最小行 seq（候选就是从本页行里来的），卡下界只会把刚好落在页首的项误删。
   const items = [...partials, ...buildRunTerminationItems(runRows)];
-  if (before == null) return items;
-  return items.filter((it) => Number(it.seq) < before);
+  // `discovery` 原样带出去（**不是**合成项的一部分）：分页游标要的是「发现行本身的最小 seq」与
+  // 「是否被 `LIMIT` 截断」这两个**窗口事实**，而不是存活下来的合成项的 seq（项会被 M-6④ 的
+  // `seq < before` 拦掉、会被「非终态 / 有锚点 / 无 reason」筛掉——拿它当游标会漏进可倒退的位置）。
+  if (before == null) return { items, discovery };
+  return { items: items.filter((it) => Number(it.seq) < before), discovery };
+}
+
+/** 会话未传（既有的调用口径：不跑发现查询）时的空发现结果。 */
+const NO_TERMINAL_DISCOVERY = Object.freeze({ runIds: Object.freeze([]), truncated: false, minSeq: null });
+
+/**
+ * issue #514：**候选发现**——从本页 seq 窗口里的 `run_end` 行取 `run_id` 与 `seq`
+ * （那一行本身照旧不下发；取出来的 seq 只用于**分页游标**，不拿它当合成项的位置——
+ * 项的 `seq` 仍由 `loadWindowRuns` 的 `MAX(e.seq)` 定，#236/#300 口径未动）。
+ *
+ * 为什么需要它：合成项的候选集此前**只**来自「本页的白名单行里有哪个 run」，而一条从未开始就被
+ * 取消的 run 只有一行 `run_end`（白名单外，红线不许加）⇒ 它永远进不了候选集 ⇒ 刷新后这条 run
+ * 在界面上**不存在**（正文区空白，连「已中止」那一行都没有）。
+ *
+ * 判据与边界：
+ *   * 只查 `type = 'run_end'`：`run_events_run_end_key`（部分唯一索引）保证每 run 至多一行 ⇒ 一次页
+ *     窗口里的候选数 = 该页里终态的 run 数，天然有界；
+ *   * **seq 下界 `pageLow`**（本页最小的白名单行 seq）：没有下界就会把**更老页**的终态 run 也拉进
+ *     本页，同一根分隔条在每一页重演一次（#502 M-6④ 那个形状）。空页 ⇒ 下界 0：此时本页就是
+ *     「白名单行的尾巴之下」那一段，本就没有更老的内容会被重复覆盖；
+ *   * **seq 上界 `before`**：与主窗口同一口径（游标之下才属于本页）；
+ *   * `LIMIT = limit + 1`（**多取一行探针**，与主窗口算 `hasOlder` 同一个手法，§1.3 keyset 口径）：
+ *     拿到的行数**超过** `limit` 才是「真的被截断了」（事实），而不是「恰好返了 `limit` 条」（猜）；
+ *     候选仍只取最新的 `limit` 条 ⇒「候选数不超过页大小」这条不变。
+ *     为何不能拿「返了 `limit` 条」当截断：那种页恰好只剩 `limit` 条时，游标会被归到一条**已经展示
+ *     过**的行上 ⇒ 客户端多跑一趟空页，而既有那条「空页 ⇒ 分页到头」的断言会变假（#514 页界用例）。
+ *
+ * **返的是窗口事实，不只是候选 id**（#514 返修，审计第 1 条）：`truncated` 与 `minSeq`（已保留行里
+ * 最小的 `seq`）是分页游标的唯一合法来源（见 `handleSessionEventsHistory`）——游标要回答的是
+ * 「这个窗口之下到底还有没有更老的行」，而不是「存活下来的合成项长什么样」（后者会被 M-6④ 的
+ * `seq < before` 拦掉、会被「非终态 / 有锚点 / 无 reason」筛掉 ⇒ 拿它当游标会造出倒退的页边界）。
+ *
+ * 成本：**每次响应最多一条**（不是每 run 一枪）；非空页的扫描范围被 `[pageLow, before)` 夹住，
+ * 空页是 `[0, before)` 那一段（访问路径不止一条，见下面 LOW-1：planner 按统计选）。此前那条
+ * 「同一次响应里只允许一条 `runs` 查询」的成本红线不变（发现的是 `run_events`，候选 id 仍并进
+ * `loadWindowRuns` 那**一条** runs 查询）。
+ * ⚠ 成本的两条事实（二次审计 LOW-1 + 一次性真库自证，逐字同 §4.4a-2 成本段）：
+ *   ① `LIMIT` 封的是**返回条数**，不是**过滤 / 排序前的行数**——`type = 'run_end'` 是残余过滤；
+ *   ② planner 有**两条路**、按统计选：`UNIQUE (session_id, seq)` **反向扫**（扫页窗口内的事件行），
+ *      或 `run_events_run_end_key`（部分唯一 `WHERE type='run_end'`）**+ Top-N 排序**（扫这一形状
+ *      的 `run_end` 行，与 seq 窗口无关）。⇒ 「一定走倒序扫」与「`run_end_key` 帮不上忙」两句
+ *      **各说对一半**，两句都别当承诺（实测读数在 §4.4a-2 与台账 §8.130 的返修小节）。
+ */
+async function discoverTerminalRuns(pool, sessionId, { pageLow = 0, before = null, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
+  const params = [sessionId, pageLow];
+  let where = `session_id = $1 AND type = 'run_end' AND seq >= $2`;
+  if (before != null) { params.push(before); where += ` AND seq < $${params.length}`; }
+  const cap = Math.max(1, limit);
+  params.push(cap + 1); // 探针行：只为判「窗口之下还有没有更老的」，不拿它当候选
+  const r = await pool.query(
+    `SELECT run_id, seq FROM run_events WHERE ${where} ORDER BY seq DESC LIMIT $${params.length}`,
+    params,
+  );
+  const rows = (r.rows ?? []).filter((row) => row.run_id != null);
+  const kept = rows.slice(0, cap);
+  // `ORDER BY seq DESC` ⇒ 保留段的**最后一行**就是最小 seq（下一页游标要的正是它）。
+  const last = kept.length > 0 ? Number(kept[kept.length - 1].seq) : null;
+  return {
+    runIds: kept.map((row) => row.run_id),
+    truncated: rows.length > cap,
+    minSeq: Number.isSafeInteger(last) ? last : null,
+  };
 }
 
 /**
@@ -4149,7 +4436,8 @@ async function handleFileTree(req, res, ctx, url) {
  * ⚠ 能力位必须在**读 body 之前**：否则一个没开上传的账号可以用一个 32MiB 的 PUT 把 portal 的
  * 内存/带宽花掉才被拒（而 portal 与全站共用一个进程）。判据直接数请求体的 `data` 事件次数。
  * ⚠ **不走 `readJsonBody`/`readRawBody`**：`MAX_BODY_BYTES` 默认 64KiB，走它任何真实上传都会 413；
- *    上限由 `FILE_UPLOAD_MAX_BYTES` 在流式写入里逐 chunk 兜。
+ *    上限在流式写入里逐 chunk 兜，值由 `upload_settings` 单行表 → `FILE_UPLOAD_MAX_BYTES` → 默认 32MiB
+ *    依次回落（#485 片 A：管理台可改且改完立即生效，见 `portal/src/upload-settings.js`）。
  * 属主两个值都传（只传 uid 会留下 gid=0=root 组，agent 改不动），口径见 docs/design/user-space.md §6.2。
  */
 async function handleFileUpload(req, res, ctx, url) {
@@ -4165,18 +4453,37 @@ async function handleFileUpload(req, res, ctx, url) {
       details: { action: 'enable_in_admin_console' },
     });
   }
-  const result = await dirs.receiveUpload({
-    userSpaceRoot: ctx.config.userSpaceRoot,
-    fdeName,
-    cwd: url.searchParams.get('cwd'),
-    relPath: url.searchParams.get('path') ?? '.',
-    name: url.searchParams.get('name') ?? '',
-    stream: req,
-    maxBytes: ctx.config.fileUploadMaxBytes,
-    overwrite: url.searchParams.get('overwrite') === '1',
-    uid: ctx.config.fdeUid,
-    gid: ctx.config.fdeGid,
+  // #485 片 A：上限在**请求时**现取（`DB > env > 默认`，无缓存）⇒ 管理台改完下一次上传就生效，
+  // 不需要重启 portal。两个位置约束：
+  //   * 必须在能力位**之后**——#472 的判据是「没开上传的账号不能先把 body 抽干再被拒」，这里只多
+  //     一次单行主键 SELECT（不碰 `req` 流），所以不会破那条判据；
+  //   * 必须在开 temp **之前**——超限行不该先落盘再删。
+  // 读侧永不抛（表缺失 / DB 抖动 / 值非法 ⇒ 回落 env + warn），所以上传不会因为配置面而 500。
+  const limit = await uploadSettings.resolveEffectiveMaxFileBytes({
+    pool: ctx.pool, config: ctx.config, log: ctx.log,
   });
+  let result;
+  try {
+    result = await dirs.receiveUpload({
+      userSpaceRoot: ctx.config.userSpaceRoot,
+      fdeName,
+      cwd: url.searchParams.get('cwd'),
+      relPath: url.searchParams.get('path') ?? '.',
+      name: url.searchParams.get('name') ?? '',
+      stream: req,
+      maxBytes: limit.maxBytes,
+      overwrite: url.searchParams.get('overwrite') === '1',
+      uid: ctx.config.fdeUid,
+      gid: ctx.config.fdeGid,
+    });
+  } catch (err) {
+    // 把**来源**补进 413 的 `details`：`max_bytes` 已是生效值（`receiveUpload` 直接回弹它收到的 maxBytes），
+    // 再标一下它是 DB / env / 默认，值班就不用去猜该改哪一边。不改状态码与错误码（零新错误码）。
+    if (err instanceof dirs.DirError && err.code === 'file_too_large') {
+      err.details = { ...(err.details ?? {}), limit_source: limit.source };
+    }
+    throw err;
+  }
   // 201 = 新建；200 = 覆盖（`overwrite=1` 且真的提交掉了旧内容）。DTO 见 §4.14。
   return sendJson(res, result.overwritten ? 200 : 201, result);
 }

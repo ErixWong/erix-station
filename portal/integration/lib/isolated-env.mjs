@@ -16,6 +16,8 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// 分配段的判据直接用 portal 自己的解析器（护栏与容器启动期共用同一份代码，不会分叉）；纯函数，不连库。
+import { IPAM_POOL_ENV_KEYS, parseCidr, resolveIpamPools } from '../../src/ipam.js';
 
 const LIB_DIR = path.dirname(fileURLToPath(import.meta.url));
 /** 仓库根（本文件位于 portal/integration/lib/）。 */
@@ -44,24 +46,52 @@ export const SHARED_STACK = {
 };
 
 /**
- * portal 侧 IPAM「large 池」钉死的分配段（`portal/src/ipam.js:14`，**非 env 可配**，且 portal/src/**
- * 在护栏脚本的改动范围外）。fde-proxy 对 `network create` 的 subnet 做白名单校验
- * （deploy/fde-proxy/server.js:343-350/400），因此隔离栈的 FDE_IPAM_POOLS **必须包含这段**，
- * 否则 provision 建 fde-* 网络会被 proxy 拒（`IPAM.Subnet not in allowed pools`）——#227.3 落地时
- * 发现的口径冲突，详见交付报告「遗留问题」。
+ * 大 FDE 池的**保留段**（baseline DDL 钉的：`docs/data/schema.sql` §9 `fde_networks` 的 CHECK
+ * `pool='large' ⇒ prefix_len=28 AND subnet::inet << inet '10.201.0.0/16'`；default 同构钉 10.200.0.0/16）。
+ * 它同时是三件事的边界：① portal 分配段的合法取值域（`portal/src/ipam.js#resolveIpamPools` 已把它
+ * 做成启动期硬判据）；② topology §3「两段保留给 FDE 网络专用」；③ deploy-contract §4.4 的兜底 DROP
+ * 只覆盖 `10.200.0.0/16` 与 `10.201.0.0/16` ⇒ 分配段跑出这两段 = 脱离兜底防线。
+ *
+ * ⇒ #270 之后隔离栈的正确做法不是换一段全新的 /16（那会被 DB CHECK 炸成 23514，#227.3 当初的
+ * 「派生段 + 本段两段兜底」就是因为这个：派生段从来没法被真的分配），而是在这段**里面**切子段。
  */
 export const PORTAL_LARGE_POOL = '10.201.0.0/16';
 
 /**
- * 由栈 id 确定性派生本隔离栈专用的 FDE IPAM 段（#227.3：两套隔离栈并行时不共用同一段）。
+ * 隔离栈在保留段里切的片宽（/24）：分配前缀 /28 ⇒ 一片 16 块，够一条 e2e 链路开几个 FDE。
+ * 第三段取 1–99（**刻意跳过 0**：`10.201.0.0/24` 是共享栈如果也用 large 池时第一批会分到的位置）。
+ */
+export const FDE_STACK_SLICE_PREFIX = 24;
+
+/**
+ * 宿主/compose 侧的分配段变量名（去 `FDE_` 前缀就是 portal 侧的 `IPAM_POOL_*`；映射见
+ * `deploy/docker-compose.yml` 的 station-portal.environment 与 `portal/src/ipam.js#IPAM_POOL_ENV_KEYS`）。
+ */
+export const FDE_IPAM_POOL_HOST_KEYS = Object.freeze({
+  default: 'FDE_IPAM_POOL_DEFAULT',
+  large: 'FDE_IPAM_POOL_LARGE',
+});
+
+/** 宿主 env → portal 侧 env（护栏拿 portal 那份**同一个解析器**判，不另写一份 CIDR 校验）。 */
+export function portalIpamEnvFromHostEnv(env = {}) {
+  const out = {};
+  for (const [poolName, hostKey] of Object.entries(FDE_IPAM_POOL_HOST_KEYS)) {
+    if (env[hostKey] !== undefined) out[IPAM_POOL_ENV_KEYS[poolName]] = env[hostKey];
+  }
+  return out;
+}
+
+/**
+ * 由栈 id 确定性派生本隔离栈专用的 FDE IPAM 子段（#227.3 立题，#270 把它做成**真能分配的段**）。
  *
- * 规则：取栈 id 里全部数字拼接后 mod 99 ⇒ 段 = `10.(201 + n%99).0.0/16`（族 10.201–10.299，
- * **天然排除共享段 10.200.0.0/16**）；无数字则用 FNV-1a 短哈希。按段号可判定：段号 ≡ 数字 mod 99，
- * 不同余数必不同段；同 id 永远同段（幂等）。派生值相同≠一定撞（仅当两栈真的并行分配同一子网段才撞，
- * 那时用显式覆盖 FDE_IPAM_POOLS 拆开，护栏允许族内显式覆盖）。
+ * 规则：取栈 id 里全部数字拼接后 mod 99 ⇒ 段 = `10.201.(1 + n%99).0/24`（第三段 1–99）；无数字
+ * 则用 FNV-1a 短哈希走同一条映射。同 id 永远同段（幂等）；不同余数必不同段。为何不是新的 /16：
+ * 见 `PORTAL_LARGE_POOL` 定义处（baseline 的 CHECK 把 `pool='large'` 钉在 `10.201.0.0/16` 里面）。
+ *
+ * 派生值相同≠一定撞（只有两栈真的并行且同段才撞）；那时显式覆盖两腿即可，护栏允许保留段内的显式覆盖。
  *
  * @param {string} stackId STATION_STACK_ID
- * @returns {string} 形如 `10.229.0.0/16` 的单段 CIDR
+ * @returns {string} 形如 `10.201.49.0/24` 的单段 CIDR
  */
 export function deriveFdeIpamPools(stackId) {
   const id = String(stackId ?? '');
@@ -75,18 +105,54 @@ export function deriveFdeIpamPools(stackId) {
     for (let i = 0; i < id.length; i += 1) h = Math.imul(h ^ id.charCodeAt(i), 16777619);
     n = Math.abs(h) % 99;
   }
-  return `10.${201 + n}.0.0/16`;
+  // 保留段只活在上面那个常量里（不拆写第三/四段 ⇒ 改保留段不会漏改这里）。
+  const family = PORTAL_LARGE_POOL.split('.');
+  return `${family[0]}.${family[1]}.${1 + n}.0/${FDE_STACK_SLICE_PREFIX}`;
 }
 
 /**
- * 脚本默认注入的 FDE_IPAM_POOLS（未显式传时）：派生段 + portal large 池固定段（去重，逗号分隔）。
- * 包含 PORTAL_LARGE_POOL 的原因见其定义处注释（proxy 白名单必须覆盖 portal 实际分配的段）。
+ * 两腿一次派生（#270 的单一来源）：同一个段同时当
+ *   · `FDE_IPAM_POOLS`（→ proxy `IPAM_POOLS`，`network create` 的放行面），与
+ *   · `FDE_IPAM_POOL_LARGE`（→ portal `IPAM_POOL_LARGE`，分配器从哪切）。
+ * 两腿同值 ⇒ 「分配出来就被 proxy 拒」不再靠人记对齐。
+ *
+ * @param {string} stackId STATION_STACK_ID
+ * @returns {{ FDE_IPAM_POOLS: string, FDE_IPAM_POOL_LARGE: string }}
+ */
+export function deriveStackIpamPoolEnv(stackId) {
+  const segment = deriveFdeIpamPools(stackId);
+  return { FDE_IPAM_POOLS: segment, [FDE_IPAM_POOL_HOST_KEYS.large]: segment };
+}
+
+/**
+ * 脚本缺省注入的 `FDE_IPAM_POOLS`（#270 收紧：**只注入派生段**，不再多送一段）。
  *
  * @param {string} stackId STATION_STACK_ID
  * @returns {string}
  */
 export function defaultFdeIpamPools(stackId) {
-  return [...new Set([deriveFdeIpamPools(stackId), PORTAL_LARGE_POOL])].join(',');
+  return deriveFdeIpamPools(stackId);
+}
+
+/**
+ * 就地把两腿注入 env（显式传入优先；没栈 id 就不注入，共享栈跑法维持 compose 缺省）。
+ * 各 e2e 入口调一次，取代旧「只注入 `FDE_IPAM_POOLS`」那三行（两腿只注入一腿 = 分叉的根源）。
+ *
+ * @param {Record<string, string | undefined>} [env]
+ * @param {string} [stackId] 缺省取 env.STATION_STACK_ID
+ * @returns {Record<string, string>} 实际注入了哪些键（供日志/断言；没注入则空对象）
+ */
+export function applyStackIpamPoolEnv(env = process.env, stackId = env.STATION_STACK_ID) {
+  if (!stackId) return {};
+  const derived = deriveStackIpamPoolEnv(stackId);
+  const applied = {};
+  for (const [key, value] of Object.entries(derived)) {
+    if (env[key] === undefined || env[key] === '') {
+      env[key] = value;
+      applied[key] = value;
+    }
+  }
+  return applied;
 }
 
 /**
@@ -198,19 +264,127 @@ export const HOST_WRITE_PATH_ENVS = Object.freeze([
   'STATION_DB_DIR', // 库文件目录：写错 = 两个实例开同一份数据文件
 ]);
 
-/** 读 `deploy/.env`（只取 `KEY=VALUE`，忽略注释/空行）。缺文件返回 {}（CI 的 worktree 里就没有它）。 */
-export function readEnvFile(envFile) {
-  try {
-    const out = {};
-    for (const line of fs.readFileSync(envFile, 'utf8').split('\n')) {
-      if (!line.trim() || line.trim().startsWith('#')) continue;
-      const m = /^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
-      if (m) out[m[1]] = m[2].replace(/^["']|["']$/g, '');
-    }
-    return out;
-  } catch {
-    return {};
+/**
+ * 单行 env 的解析（口径对齐**真 compose**，不是自洽就行）。
+ *
+ * 下面的规则全部来自实测（Docker Compose 2.40.3，命令与输出拄在
+ * `test/integration-e2e-preflight.test.js` 的 `COMPOSE_PARSE_CASES` 里，那一格直接拿 compose 自己当基准）：
+ *
+ * | 写法                              | compose 看到的        | 为什么重要 |
+ * |-----------------------------------|-----------------------|------------|
+ * | `K=/a/b # shared`                 | `/a/b`                | **本单 BLOCKER**：不剥就与真路径不等 ⇒ 「与共享路径不同」在危险方向上恒真 |
+ * | `K="/c/d" # after quoted`         | `/c/d`                | 引号闭合后的注释也得剥 |
+ * | `K=/g/h#nospace`                  | `/g/h#nospace`        | `#` 前面不是空格就**不是**注释 |
+ * | `K=/a/b<TAB>#tab`                 | `/a/b<TAB>#tab`       | tab 也不算注释起始（只有空格算）|
+ * | `K="#q# inside"`                  | `#q# inside`          | 引号内的 `#` 是正文 ⇒ 不能误剥（反向自证那格）|
+ * | `K=  spaced value  # tail`        | `spaced value`        | 前导/尾随空白会去 |
+ * | `K=#hash first`                   | `#hash first`         | 值首的 `#` 是字面量 |
+ * | `K="` 未闭合 / `K="v"junk`      | **compose 直接报错**   | 我们复现不了 ⇒ 交给 `kind:'unparsable'` |
+ *
+ * 另外 compose 会展开 `$VAR` / `${VAR}`（实测 `/a/${QQ}b` ⇒ `/a/b`），我们**复现不了展开上下文**
+ * ⇒ 只把这一类标 `interpolates`，由调用方决定要不要拒（同文件里 `$` 很常见，一律拒会误杀）。
+ *
+ * @param {string} line 单行原文（可以带 \r）
+ * @returns {{kind: 'blank'|'pair'|'unparsable', key?: string, value?: string, inlineComment?: boolean,
+ *   interpolates?: boolean, why?: string}}
+ */
+export function parseComposeEnvLine(line) {
+  const raw = String(line ?? '').replace(/\r$/, '');
+  const stripped = raw.trim();
+  if (!stripped || stripped.startsWith('#')) return { kind: 'blank' };
+  const m = /^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/.exec(raw);
+  if (!m) return { kind: 'unparsable', raw, why: '不是 KEY=VALUE 形态' };
+  const [, key] = m;
+  const lead = m[2].replace(/^[ \t]+/, '');   // 前导空白会被 compose 去掉
+  const quote = lead[0] === '"' || lead[0] === "'" ? lead[0] : null;
+  if (quote) {
+    const end = lead.indexOf(quote, 1);
+    if (end === -1) return { kind: 'unparsable', key, raw, why: `未闭合的引号 ${quote}` };
+    const inner = lead.slice(1, end);
+    const tail = lead.slice(end + 1);
+    if (/^[ \t]*$/.test(tail)) return { kind: 'pair', key, value: inner, quoted: true, inlineComment: false, interpolates: inner.includes('$') };
+    if (/^[ \t]+(#|$)/.test(tail)) return { kind: 'pair', key, value: inner, quoted: true, inlineComment: true, interpolates: inner.includes('$') };
+    return { kind: 'unparsable', key, raw, why: `引号闭合后还有垃圾：${tail}` };
   }
+  // 未加引号：从**第一个「空格 + #」**处切开（tab 与值首的 # 都不是注释起始 —— 实测）
+  let cut = -1;
+  for (let i = 1; i < lead.length; i += 1) {
+    if (lead[i] === '#' && lead[i - 1] === ' ') { cut = i; break; }
+  }
+  const value = (cut === -1 ? lead : lead.slice(0, cut)).replace(/[ \t]+$/, '');
+  return { kind: 'pair', key, value, quoted: false, inlineComment: cut !== -1, interpolates: value.includes('$') };
+}
+
+/**
+ * 整份 env 文件：返回 compose 会看到的值 + 每一行的解析账（要拒哪一行得能点名行号）。
+ * 文件不存在 ⇒ `{ values: {}, lines: [], missing: true }`（CI 的 worktree 里就没有 `deploy/.env`）。
+ *
+ * @param {string} envFile
+ * @returns {{values: Record<string,string>, lines: object[], missing: boolean}}
+ */
+export function parseComposeEnvFile(envFile) {
+  let text;
+  try {
+    text = fs.readFileSync(envFile, 'utf8');
+  } catch {
+    return { values: {}, lines: [], missing: true };
+  }
+  const values = {};
+  const lines = [];
+  text.split('\n').forEach((raw, index) => {
+    const parsed = parseComposeEnvLine(raw);
+    if (parsed.kind === 'blank') return;
+    const entry = { no: index + 1, raw: raw.replace(/\r$/, ''), ...parsed };
+    lines.push(entry);
+    if (parsed.kind === 'pair') values[parsed.key] = parsed.value;   // 后写的赢（与 compose 一致）
+  });
+  return { values, lines, missing: false };
+}
+
+/** 读 `deploy/.env`（只取 `KEY=VALUE`，按 compose 的口径处理注释/引号）。缺文件返回 {}。 */
+export function readEnvFile(envFile) {
+  return parseComposeEnvFile(envFile).values;
+}
+
+/**
+ * 找出「我们**无从证明 compose 会拿到什么**」的键值行（PR #554 复审 BLOCKER，A 案）。
+ *
+ * 为什么要拒而不是猜：旧解析把未加引号值的行内注释**整段留在值里**，于是
+ * `TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared` 解析成
+ * `"/docker/station-edge/dynamic # shared"` ⇒ 与真路径 `/docker/station-edge/dynamic` **不相等**
+ * ⇒ 「与共享路径不同」这个隔离判据在**危险方向上恒真**（隔离栈照旧往生产目录写，而预检绿）。
+ * 剥注释也能修这一格，但那就变成「我们的解析器认为 compose 会怎么读」——需要一条外部基准才能站住。
+ * 预检的取向是宁可起跑前红，所以这里直接拒，并点名**文件 + 行号 + 键名 + 原文**。
+ *
+ * 只查隔离判据会用的那几个键（{@link HOST_WRITE_PATH_ENVS}）：全文件一律拒会误杀真 `.env` 里
+ * `POSTGRES_PASSWORD=xxxx # 说明` 这种合法行（实测本仓库 `deploy/.env` 里就有三行）。
+ *
+ * @param {{lines: object[]}} parsed {@link parseComposeEnvFile} 的返回
+ * @param {string[]} [keys] 要盯的键
+ * @returns {Array<object>} 带 `why` 的行（空数组 = 全部可复现）
+ */
+export function findUnreproducibleEnvLines(parsed, keys = HOST_WRITE_PATH_ENVS) {
+  const out = [];
+  for (const line of parsed?.lines ?? []) {
+    if (!keys.includes(line.key)) continue;
+    if (line.kind === 'unparsable') {
+      out.push({ ...line, why: `我们解析不了（${line.why}），compose 会看到什么无从证明` });
+      continue;
+    }
+    if (line.kind !== 'pair') continue;
+    if (!line.quoted && line.inlineComment) {
+      out.push({
+        ...line,
+        why: `值里带**未加引号**的行内注释：原文 ${JSON.stringify(line.raw.trim())} 而 compose 读到的是 ${JSON.stringify(line.value)}`
+          + ' ⇒ 两者不等，「与共享路径不同」会在危险方向上恒真',
+      });
+      continue;
+    }
+    if (line.interpolates) {
+      out.push({ ...line, why: `值里有 $ 插值（compose 会展开，我们看不到它的展开上下文）⇒ 无从证明 compose 拿到的就是这个字符串` });
+    }
+  }
+  return out;
 }
 
 /**
@@ -223,7 +397,18 @@ export function assertHostWritePathsIsolated({
   label = '隔离实例',
 } = {}) {
   if (!envFile) return { checked: [], shared: {} };
-  const shared = readEnvFile(envFile);
+  const parsed = parseComposeEnvFile(envFile);
+  const shared = parsed.values;
+  const risky = findUnreproducibleEnvLines(parsed);
+  if (risky.length > 0) {
+    const fixed = 'KEY="/docker/erix/users" # 想写注释就加引号，或直接挪到上一行';
+    throw new Error(
+      `${label} 的 env 文件 ${envFile} 里有 ${risky.length} 行我们无从证明 compose 会拿到什么（这些键是**宿主写路径**）：\n  `
+      + `- ${risky.map((l) => `${envFile}:${l.no} ${l.key}（原文 ${JSON.stringify(l.raw.trim())}）：${l.why}`).join('\n  - ')}`
+      + `\n⇒ 判错方向 = 隔离栈往**生产的目录**里写（现网实测过一次：边缘路由被覆写，8090 全线 502 而容器全绿）。`
+      + `改法：${fixed}`,
+    );
+  }
   const collisions = [];
   for (const key of HOST_WRITE_PATH_ENVS) {
     const mine = env[key];
@@ -274,7 +459,7 @@ export function assertIsolatedEnvironment(options = {}) {
     'STATION_DB_NAME', 'STATION_PORTAL_NAME', 'STATION_DOCKER_PROXY_NAME', 'STATION_EDGE_NAME',
     'PORTAL_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT',
     'STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE',
-    'BACKEND_SUBNET', 'FDE_POOL', 'FDE_IPAM_POOLS',
+    'BACKEND_SUBNET', 'FDE_POOL', 'FDE_IPAM_POOLS', FDE_IPAM_POOL_HOST_KEYS.large,
     ...(litellm ? ['STATION_LITELLM_NAME', 'LITELLM_HOST_PORT'] : []),
     ...fdeNames.map((fde) => fde.env),
     ...extraRequiredEnv,
@@ -306,17 +491,55 @@ export function assertIsolatedEnvironment(options = {}) {
   }
 
   assert.equal(env.FDE_POOL, 'large', 'isolated e2e must use the dedicated large FDE pool');
-  // #227.3：从「等值 10.201.0.0/16」改为按栈派生。fail-closed 口径：每一段都必须在隔离族
-  // 10.201.0.0/16–10.299.0.0/16 内；共享段 10.200.0.0/16（portal 缺省池/共享栈 FDE 网络所在地）一律拒。
-  // 正规值 = deriveFdeIpamPools(STATION_STACK_ID)；显式覆盖（仍在族内）同样放行——并行撞段时的逃生口。
+  // #227.3 → #270：从「等值 10.201.0.0/16」改成「按栈派生的保留段子段」，而且现在**两腿都要判**：
+  //   腿 A（放行面 FDE_IPAM_POOLS）：每段必须落在隔离族 10.201.0.0/16–10.299.0.0/16 里；共享段
+  //     10.200.0.0/16（portal 缺省池 / 共享栈 fde-* 网络所在地）一律拒 —— fail-closed。
+  //   腿 B（分配段 FDE_IPAM_POOL_LARGE → portal IPAM_POOL_LARGE）：必须被 portal 自己的启动期校验
+  //     接受（即落在 DDL 保留段 10.201.0.0/16 内）、必须是保留段的**真子段**（整段 = 并行必撞的
+  //     旧口径）、且必须被腿 A 的放行面覆盖（不覆盖 = provision 建 fde-* 网络被 proxy 拒）。
+  //     失败文案**同时点名两侧变量名**（工单判据④）。
   const fdeIpamPools = String(env.FDE_IPAM_POOLS).split(',').map((pool) => pool.trim()).filter(Boolean);
   assert.ok(fdeIpamPools.length > 0, `FDE_IPAM_POOLS=${env.FDE_IPAM_POOLS} 不含任何有效 CIDR`);
+  const parsedWhitelist = [];
   for (const pool of fdeIpamPools) {
     assert.notEqual(pool, SHARED_STACK.fdeIpamPool,
       `FDE_IPAM_POOLS 含共享栈在用的段 ${pool}（portal 缺省池/共享栈 fde-* 网络在此，并行必撞）；本栈应用派生段 deriveFdeIpamPools(STATION_STACK_ID)=${deriveFdeIpamPools(env.STATION_STACK_ID)}`);
-    assert.match(pool, /^10\.2(?:0[1-9]|[1-9][0-9])\.0\.0\/16$/,
+    let parsed;
+    try {
+      parsed = parseCidr(pool);
+    } catch {
+      assert.fail(`FDE_IPAM_POOLS=${pool} 不是合法 CIDR（正规值=派生段 ${deriveFdeIpamPools(env.STATION_STACK_ID)}）`);
+    }
+    if (parsed.base !== parsed.ipInt) {
+      assert.fail(`FDE_IPAM_POOLS=${pool} 不是规范网络地址（主机位必须全 0；否则护栏与 portal 的口径会对不上）`);
+    }
+    const octets = pool.split('.');
+    const secondOctet = Number(octets[1]);
+    assert.ok(octets[0] === '10' && secondOctet >= 201 && secondOctet <= 299,
       `FDE_IPAM_POOLS=${pool} 必须留在隔离族 10.201.0.0/16–10.299.0.0/16 内（正规值=派生段 ${deriveFdeIpamPools(env.STATION_STACK_ID)}）`);
+    parsedWhitelist.push(parsed);
   }
+  // 腿 B：分配段（#270 的旋钮）。拿 portal 自己的解析器判 —— 护栏红 = 容器也会同样红。
+  const allocHostKey = FDE_IPAM_POOL_HOST_KEYS[env.FDE_POOL];
+  let resolvedPools;
+  try {
+    resolvedPools = resolveIpamPools(portalIpamEnvFromHostEnv(env));
+  } catch (err) {
+    assert.fail(`${allocHostKey}=${env[allocHostKey]} 被 portal 自己的启动期校验拒了（容器会以同样的原因起不来）：${err.message}`);
+  }
+  const allocSegment = resolvedPools[env.FDE_POOL].cidr;
+  assert.equal(allocSegment, String(env[allocHostKey]).trim(),
+    `${allocHostKey}=${env[allocHostKey]} 不是规范写法（portal 会把它压成 ${allocSegment}）；正规值=派生段 ${deriveFdeIpamPools(env.STATION_STACK_ID)}`);
+  assert.notEqual(allocSegment, PORTAL_LARGE_POOL,
+    `${allocHostKey}=${allocSegment} 是**整个**保留段 = #270 之前「两套隔离栈都从 10.201.0.0/16 池头分配」的必撞口径；`
+    + `请切子段（正规值=派生段 ${deriveFdeIpamPools(env.STATION_STACK_ID)}）`);
+  const parsedAlloc = parseCidr(allocSegment);
+  assert.ok(
+    parsedWhitelist.some((w) => w.base <= parsedAlloc.base && parsedAlloc.last <= w.last),
+    `分配段 ${allocSegment}（portal 侧 ${IPAM_POOL_ENV_KEYS[env.FDE_POOL]} ← 宿主侧 ${allocHostKey}）没被本栈放行面 `
+    + `FDE_IPAM_POOLS=${env.FDE_IPAM_POOLS} 覆盖 ⇒ provision 建 fde-* 网络会被 proxy 拒（IPAM.Subnet not in allowed pools）；`
+    + '两头必须同源（正规跑法：deriveStackIpamPoolEnv(栈 id) 一次派生喂两腿）',
+  );
   assert.equal(env.COMPOSE_PROJECT_NAME, env.STATION_STACK_ID,
     'compose project and stack label must use the same unique ID');
   for (const name of containerNames) {

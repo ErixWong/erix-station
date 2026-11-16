@@ -98,12 +98,27 @@ test('#337 引擎取上下文与 run 作用域 legacy 端点**不折**（`intern
 });
 
 test('#337 折叠模块只有三个消费点（`session-view.js` / `transcript-store.js` / `delegation.js`），别处引用即红', () => {
-  const files = fs.readdirSync(SRC).filter((name) => name.endsWith('.js'));
-  // #351：模块自己的文件头现在要点名镜像 `runner/lib/transcript-fold.js`（两份尺的漂移说明），
-  // 那是**注释**不是消费点 ⇒ 排除自身；否则「改一句注释」就把这条护栏咬红，护栏就变成了打字员。
-  const importers = files
-    .filter((name) => name !== 'transcript-fold.js')
-    .filter((name) => read(name).includes('transcript-fold.js'));
+  // 判据是「**真的 import 了本模块**」，不是「文本里出现过模块名」。护栏自己说过：注释不是消费点
+  // （所以模块自己的文件早就是排除项）——但旧写法只排除了自身，别的文件在**注释里**提一下模块名
+  // 就被咬红（#387 实测：`sessions.js` 重建路的注释点了「读侧折叠」的名字 ⇒ 假红）。
+  // 那等于把护栏退化成打字员：想说不算消费，写了才算。因此改成只认 import/export from 语句。
+  // PR #541 LOW #4 补的三块盲区（旧谓词都能被合法写法绕过 ⇒ 开了第二家折叠而护栏全绿）：
+  //   · **动态 `import()`** 是合法 ESM：`await import('./transcript-fold.js')` 旧谓词全认不出；
+  //     `require()` 在本仓是 CJS 遗留，在 ESM 里拼它就是走偏，同样算消费点；
+  //   · **多行**具名 import（`import {\n a,\n} from '…'`）：旧谓词的 `[^\n]*` 卡在行尾，拼成多行就漏；
+  //   · **嵌套目录**：旧扫描只看 `portal/src` 顶层，子目录里的文件根本没人看（今天没有子目录，
+  //     但「没有」不等于「不许有」）⇒ 改成递归扫，允许清单口径不变。
+  // 剩下的已知代价（**未尽项**，见台账 §8.132）：剔注释是正则剔的，剔不掉「字符串里塞一整段
+  // 带 `//` 的文本」这种写法（假红方向，不是假绿方向）；非相对路径写法（别名 `@/x`、裸包名）不认。
+  const stripComments = (src) => src
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1'); // `http://` 里的 `//` 前面有冒号 ⇒ 不吞
+  const CONSUMES = /(?:^|\n)[ \t]*(?:import|export)\b[^;'"()]*?\bfrom\s*['"][^'"]*transcript-fold\.js['"]|(?:^|\n)[ \t]*import\s+['"][^'"]*transcript-fold\.js['"]|\b(?:import|require)\s*\(\s*['"][^'"]*transcript-fold\.js['"]\s*\)/;
+  const consumesFold = (src) => CONSUMES.test(stripComments(src));
+  const files = fs.readdirSync(SRC, { recursive: true })
+    .filter((name) => name.endsWith('.js'))
+    .filter((name) => path.basename(name) !== 'transcript-fold.js');
+  const importers = files.filter((name) => consumesFold(read(name)));
   // 允许清单在 0.25.0 从 1 个变 2 个：`transcript-store.js` 的 `load()` 现在也必须折
   //（上游 #458 的随包契约），口径必须与咽喉点**同一份** `planFold` —— 这正是「两处都用同一模块」
   // 的理由，不是「多一个消费点就违规」。名单外的新引用仍然红：折叠口径只许有一份。
@@ -111,8 +126,40 @@ test('#337 折叠模块只有三个消费点（`session-view.js` / `transcript-s
   // 入口不同、规则同一份：它调 `foldLedgerRecords(records)`（文件记录），而咽喉点调
   // `foldTranscriptRows(rows)`（DB 行），两者底下都是同一个 `planFold`。新增入口而不是另开一套
   // 折叠，正是本护栏要的方向：口径漂移只在 `transcript-fold.js` 一处可能发生。
+  // ⚠ **#387 没有把名单抬到 4 个**：重建路（`sessions.js`）走的是「把 `tool_result` 挂回记录、
+  //   配对交给上游投影」，**不折**（端点 SQL 只取 `round, messages`，拿不到 record 级形状，
+  //   而放载体行进来会让投影走 `response.content` 回退分支⇒ 正文重复）。它不消费本模块，
+  //   所以名单就该是三个——真加第四个消费点仍要改这里并写理由。
   assert.deepEqual(importers, ['delegation.js', 'session-view.js', 'transcript-store.js'],
-    `只允许这三个消费点引用 transcript-fold.js（口径只此一份），实际：${importers.join(', ')}`);
+    `只允许这三个消费点 import transcript-fold.js（口径只此一份），实际：${importers.join(', ') || '零个'}`);
+  // 反向自证：把「注释里提一下」和「真的 import 了」分开——自己拼一句 import 喂给谓词必须判为消费。
+  assert.ok(CONSUMES.test("\nimport { foldLedgerRecords } from './transcript-fold.js';\n"),
+    '谓词本身必须能认出真 import（空转的谓词会把「谁都能引用」读成绿灯）');
+  assert.ok(!CONSUMES.test(' * 口径与 `transcript-fold.js` 逐字同构。\n'),
+    '纯注释不得算消费点（否则护栏只能逼人不写注释）');
+  // LOW #4 的注入自证：绕过旧谓词的写法现在必须全部判为消费（只钉「真 import」等于没补盲区）。
+  const INJECTIONS = [
+    ["\nimport {\n  foldLedgerRecords,\n  foldTranscriptRows,\n} from './transcript-fold.js';\n", '多行具名 import'],
+    ["\nconst m = await import('./transcript-fold.js');\n", '动态 import()'],
+    ['\nconst m = await import("./transcript-fold.js");\n', '动态 import()（双引号）'],
+    ["\nconst { foldLedgerRecords } = require('./transcript-fold.js');\n", 'require()'],
+    ["\nexport { foldLedgerRecords } from './transcript-fold.js';\n", '具名再导出'],
+    ["\nexport * from './transcript-fold.js';\n", '星号再导出'],
+    ["\nimport './transcript-fold.js';\n", '无绑定的副作用 import'],
+  ];
+  for (const [snippet, label] of INJECTIONS) {
+    assert.ok(consumesFold(snippet), `${label} 必须被认成消费点（拼上去就开了第二家折叠）：${JSON.stringify(snippet)}`);
+  }
+  // 反向：注释里拼出这些形状仍然不算消费；与本模块无关的 import / require 也不许误咬。
+  for (const [snippet, label] of [
+    [" * \u53e3\u5f84\u4e0e `transcript-fold.js` \u9010\u5b57\u540c\u6784\u3002\n", '纯注释（旧形状）'],
+    ["\n// \u522b\u7528 await import('./transcript-fold.js') \u7ed5\u8fc7\u62a4\u680f\n", '注释里的动态 import()'],
+    ["\n// require('./transcript-fold.js') \u662f\u65e7\u5199\u6cd5\n", '注释里的 require()'],
+    ["\nimport { x } from './session-text.js';\n", '无关模块的 import'],
+    ["\nconst y = await import('./transcript-store.js');\n", '无关模块的动态 import'],
+  ]) {
+    assert.ok(!consumesFold(snippet), `${label} 不算消费点：${JSON.stringify(snippet)}`);
+  }
 });
 
 test('#351 引擎面的折叠在 runner 侧（`runner/lib/store.js`），portal 端点面**不得**再折一遍', () => {

@@ -21,6 +21,7 @@ import { samePayload, dedupConflictDetails, DEDUP_CONFLICT_CODE } from './transc
 import { createRecoveryRowStore } from './transcript-store.js';
 import { partialOutputs } from './run-partial-buffer.js'; // issue #502 D-4：stream 档正文的进程内缓冲
 import { enqueueMaterializeChange } from './outbox.js';
+import { attachLoopWatch, sleepCancellable } from './loop-timing.js'; // issue #520
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -33,12 +34,24 @@ const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
  * issue #502 M-6③（审计第 3 条）：**portal 自造的事件类型**，容器经 U3 上报一律 400。
  * 名单与写它们的代码一一对得上：`run_end`（终态收敛事务，五处写入点）、`attempt_killed`
  *（#288/#292 的租约被抢行）、`partial_output`（旧形态遗留的正文行，形态 M 已不再写，
- * 但旧库里还有存量行 ⇒ 名字仍不得被第二把笔占用）。三个名字都不在引擎的 `EVENT_TIERS` 里
+ * 但旧库里还有存量行 ⇒ 名字仍不得被第二把笔占用）、`textualized_tool_call`（issue #243：终局正文
+ * 是一段被文本化的工具调用，由本事务按 worker additive 上报的 `textualized_tool_call` 字段合成）。
+ * 四个名字都不在引擎的 `EVENT_TIERS` 里
  *（现查：`eventTierOf('run_end') === undefined`），所以本名单是**本站自造类型的清单**，
  * 不是引擎名单的副本（那会被误读成「引擎加了就要改这里」）。
  * @type {ReadonlySet<string>}
  */
-const PORTAL_RESERVED_EVENT_TYPES = new Set(['run_end', 'partial_output', 'attempt_killed']);
+/**
+ * `textualized_tool_call_marker` 的长度上界（PR #555 复审 MED-2）。
+ * ⚠ **三方同源**：`runner/lib/final-text-toolcall.js` 的同名常量（worker 侧生成）+ `runner/agentd.js`
+ * （透传时同样丢弃）+ 这里（契约闸）。**不许两处各写一个裸数字**——那是下一次漂移的源头；
+ * 对账判据：`portal/test/textualized-toolcall.test.js`（源码级读两侧常量数值相等 + 跨面行为格拿真
+ * `textualizedToolCallField` 造的载荷过这道闸）。
+ * 为什么 runner 侧必须先丢：本函数这道校验在**开事务之前**，400 会把整条终态打回
+ * （终态不写、不重试 ⇒ run 等租约过期 / reaper），一个纯观测性的片段不该有那种权力。
+ */
+const TEXTUALIZED_MARKER_MAX_CHARS = 120;
+const PORTAL_RESERVED_EVENT_TYPES = new Set(['run_end', 'partial_output', 'attempt_killed', 'textualized_tool_call']);
 // portal.md §9.7：单轮 transcript 记录体积上限。**默认仍是契约值 1 MiB**，issue #371-B 起可由
 // env `MAX_ROUND_BYTES` 覆盖（真机复现「宿主拒 → 引擎剥归档重试一次」要把闸调小到几百 KB，
 // 不可能为此跑 160 轮）。⚠ 调之前先看下面那个算术——调小于它，正常折叠记录也会天天碰闸。
@@ -866,6 +879,27 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
     });
   }
   const finalTextFallback = body.final_text_fallback === true;
+  // issue #243：`textualized_tool_call` = 「这次终局正文是一段**被文本化的工具调用**」（模型把
+  // tool call 吐进 content，引擎当最终文本收下 ⇒ run 正常 `finished`，但交付报告没生成）。
+  // 与 `final_text_fallback` 同口径：**只在 `=== true` 时合法**（缺席 = 没命中；写 `false` 就是有人
+  // 把契约读成了三态）；`_marker` 是命中的那条特征（外来字符串，只用来出文案片段）——给了就必须是
+  // 非空短字符串，脏值 400 而不是静默收下（静默收下 = 界面上出现一条没人能解释的提示）。
+  if (body.textualized_tool_call !== undefined && body.textualized_tool_call !== true) {
+    throw new InternalError(400, 'validation_failed', 'textualized_tool_call 只能为 true（缺席 = 没命中）', {
+      details: { field: 'textualized_tool_call' },
+    });
+  }
+  const textualizedToolCall = body.textualized_tool_call === true;
+  const rawToolCallMarker = body.textualized_tool_call_marker;
+  // 契约闸（**不是**主要防线）：新链路的 runner/agentd 已经把超长 marker 丢在源头，走到这里的
+  // 只有旧容器或手写载荷。超长/脏值仍 400，但**别指望它**：400 会把整条终态打回（见上面常量注释）。
+  if (rawToolCallMarker !== undefined && (typeof rawToolCallMarker !== 'string'
+    || rawToolCallMarker === '' || rawToolCallMarker.length > TEXTUALIZED_MARKER_MAX_CHARS)) {
+    throw new InternalError(400, 'validation_failed',
+      `textualized_tool_call_marker 必须为非空字符串且 ≤${TEXTUALIZED_MARKER_MAX_CHARS} 字符`, {
+      details: { field: 'textualized_tool_call_marker' },
+    });
+  }
 
   if (!termination || typeof termination !== 'object' || !termination.reason) {
     throw new InternalError(400, 'validation_failed', '终态载荷缺 termination.reason');
@@ -951,6 +985,28 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
       );
     }
 
+    // issue #243：命中的话，**同一个终态事务内**先合成一条 `textualized_tool_call` 诊断事件。
+    // 为什么排在这一刻（而不是 runner 经 U3 自己发）：
+    //   * U3 的写入闸是「**租约有效**」（`lease_until > now()`），而 run 收尾时租约随时被清
+    //     （`finishRun` / `drainQueueAfterRun` 都会清空 `claim_token`，#220 现查取证），
+    //     「run 已经跑完、租约已经没了」正是常态 ⇒ 容器自己发会被 409 `lease_lost` 挡掉；
+    //     终态事务里由 portal 写才是**必然成功**的那一侧（`attempt_killed` 的 reaper 分支同构）。
+    //   * 幂等：`client_event_id` + `ON CONFLICT DO NOTHING`（#277 先例）⇒ U2 重放不会写第二条。
+    // `chars` 由 portal 自己从收到的 `final_text` 算，不取容器报的数（外来数字不进 payload）。
+    let textualizedEvent = null;
+    if (textualizedToolCall) {
+      const seq = await allocSeq(client, r.session_id);
+      const payload = { chars: typeof finalText === 'string' ? finalText.length : 0 };
+      if (typeof rawToolCallMarker === 'string' && rawToolCallMarker !== '') payload.marker = rawToolCallMarker;
+      await client.query(
+        `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+         VALUES ($1, $2, $3, $4, 'textualized_tool_call', $5, now())
+         ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+        [runId, r.session_id, seq, `${runId}:final:textualized_tool_call`, JSON.stringify(payload)],
+      );
+      textualizedEvent = { seq, ts: new Date().toISOString(), run_id: runId, type: 'textualized_tool_call', payload };
+    }
+
     // 合成 run_end 事件（run 内最后一条，§7.6）。client_event_id 与 worker 事件命名空间不碰撞。
     // issue #502 D-3（形态 M）：**终态那半截正文就并在本行的 payload 里**（`partial_text`/`partial_round`，
     // 见 `runEndPartialKeys`）——不另开事件行，也**不在这里改缓冲**（缓冲变更一律留到 COMMIT 之后）。
@@ -971,7 +1027,11 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
     retirePartialBuffer(runId);
     // 浏览器侧 SSE 推送（终态 run_end 也必须实时可见）
     try {
-      notifySessionEvents(r.session_id, [{ seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: runEndPayload }]);
+      // issue #243：诊断事件与终态行**同一次**推送（顺序 = 落库顺序：先提示，再终态分隔条）。
+      notifySessionEvents(r.session_id, [
+        ...(textualizedEvent ? [textualizedEvent] : []),
+        { seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: runEndPayload },
+      ]);
     } catch { /* 尽力推送 */ }
     // issue #88/#322：run 终态后异步评估会话自动标题（fire-and-forget：不阻塞本响应，失败全降级，
     // 天然「每 run 至多评估一次」）。**生成者在 portal 自己**（输入 = 该 run 收尾的那段助手文本 +
@@ -2316,9 +2376,10 @@ function replayReleaseResult(queueStatus, runStatus, qrow) {
 // run 租约 reaper（runner §6.4/§12；schema.sql §8 注释）
 // ---------------------------------------------------------------------------
 
-function sleepReaper(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+// issue #520：reaper 的 sleep 从「模块内裸 `setTimeout`」改成了注入的 `sleepCancellable`
+// （默认值来自 `loop-timing.js`）。旧的 `sleepReaper(ms)` 因此删掉了：留着它就是一个
+// 「看代码就知道不可中断」的噪声，而不可中断正是 #506 评审③拦过的坑。
+// 节拍（`REAPER_INTERVAL_MS`）本身没动，理由见 `startReaperLoop` 上面的注释。
 
 // issue #292：reaper 形态的 `attempt_killed` 固定字段（口径 docs/api/portal.md §5.3 第 14 类）。
 // - `killed_by: 'crash'`：reaper 只看得见「租约没人续」，**无从区分** F6 看门狗判死与真崩（上报者已死，
@@ -2472,12 +2533,31 @@ export async function reapExpiredRuns(pool) {
   return results;
 }
 
-/** 启动 run 租约 reaper 常驻循环（由 cli serve 调用）。 */
-export function startReaperLoop(pool, { intervalMs = REAPER_INTERVAL_MS, log = console } = {}) {
-  let stopped = false;
+/**
+ * 启动 run 租约 reaper 常驻循环（由 cli serve 调用）。
+ *
+ * issue #520 判据 2：本循环选的是「**有明确定时语义**」那一支，**不是**空闲退避——
+ * `REAPER_INTERVAL_MS = 15s` 不是随便选的：它是租约时长 `LEASE_SECONDS = 90` 的 1/6（schema.sql §8
+ * 注释同口径）。一个崩溃的 worker 占着的 run，用户看到的「排队中」就靠这里推回队列；节拍一旦
+ * 随空闲退避到 30s/60s，**崩溃后发现延迟就从≤15s 变成≤60s**，而 reaper 本身完全看不出「这个租约
+ * 将到期」——它只能每隔固定时间看一眼。换句话说：本循环的「空闲」不是「无活可干」，而是
+ * 「本拍没扫到到期租约」，后者与下一拍有没有活无关 ⇒ 退避只会偷走延迟承诺，拿不到正确的信号。
+ * 空闲开销的真实代价因此是**每拍的语句数**而不是节拍：本循环改的是（a）sleep 可中断、
+ * （b）句柄补成 #506 同形（`done`/`settled`，让 `stopLoopsAndWait` 能真的等到在途事务收尾），
+ * （c）幂等键清理的闸门用注入的 `now`（与 #506 的孤儿回收同一口径）。
+ * `reapExpiredRuns` 的 SQL（一次循环 44 次 `run_queue` idx 扫，确实是每拍最贵的那个）**没动**：
+ * 改它就是改租约/出队语义，红线之外，已记台账遗留。
+ */
+export function startReaperLoop(pool, {
+  intervalMs = REAPER_INTERVAL_MS,
+  log = console,
+  sleep = sleepCancellable,
+  now = () => Date.now(),
+} = {}) {
   let lastPurgeAt = 0;
-  (async () => {
-    while (!stopped) {
+  const abort = new AbortController();
+  const done = (async () => {
+    while (!abort.signal.aborted) {
       try {
         await reapExpiredRuns(pool);
       } catch (err) {
@@ -2485,8 +2565,9 @@ export function startReaperLoop(pool, { intervalMs = REAPER_INTERVAL_MS, log = c
       }
       // 幂等键过期清理（portal.md §1.4，TTL 24h）：低频（默认 1h，与 15s 的 run 扫描解耦）跑一次。
       // 清理失败不影响 reaper 主循环——命中判定本身带 TTL 过滤，脏行只是占空间。
-      if (Date.now() - lastPurgeAt >= IDEMPOTENCY_PURGE_INTERVAL_MS) {
-        lastPurgeAt = Date.now();
+      const tickAt = now();
+      if (tickAt - lastPurgeAt >= IDEMPOTENCY_PURGE_INTERVAL_MS) {
+        lastPurgeAt = tickAt;
         try {
           const purged = await purgeExpired(pool);
           if (purged > 0) log.log?.(`[reaper] purged ${purged} expired idempotency_keys`);
@@ -2494,12 +2575,18 @@ export function startReaperLoop(pool, { intervalMs = REAPER_INTERVAL_MS, log = c
           log.warn?.(`[reaper] idempotency purge error: ${err.message}`);
         }
       }
-      await sleepReaper(intervalMs);
+      // 节拍不变（15s），但**可中断**：`stop()` 不必再等完这一拍（#506 评审③同口径）。
+      // 它返回 false 就立刻退出，不重跑一次 `reapExpiredRuns`。
+      if (!(await sleep(intervalMs, abort.signal))) break;
     }
   })();
+  const { settled, failure } = attachLoopWatch(done, (msg) => log.warn?.(`[reaper] ${msg}`));
   return {
     stop() {
-      stopped = true;
+      abort.abort();
     },
+    done,
+    settled,
+    failure,
   };
 }
