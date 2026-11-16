@@ -169,6 +169,23 @@ function delegateEnvValue() {
   return raw === '1' ? '1' : '0';
 }
 
+/**
+ * issue #557：把「终局正文其实是被文本化的工具调用」的**特征集**旋钮透传给 FDE 容器。
+ *
+ * 名字与默认值的真相在 **`runner/lib/final-text-toolcall.js`**（`TOOLCALL_MARKERS_ENV` /
+ * `DEFAULT_TOOLCALL_MARKERS`），这里只做「宿主设了就说一句，没设就一个字都不说」的透传。
+ *
+ * ⚠ **未设 / 空串 ⇒ 返回 `undefined` ⇒ 容器 env 里不带这个键**（不是下发空串、更不是下发一份默认清单）：
+ * 与 `ERIX_SESSION_AUTO_TITLE` 那行的区别在于那行的默认值 `'0'` 是 **portal 的决定**，而这行的默认值
+ * （五条特征）是 **runner 的决定**——在这里硬写一份就是**第二本账**，runner 改了默认、容器还压着旧值。
+ * 值**原样透传**（逗号分隔清单，`off` = 显式关闭），合法性判定在 runner 侧 `parseToolCallMarkers`
+ * （非法条目逐条点名并回退缺省，不静默）。
+ */
+function toolCallMarkersEnvValue() {
+  const raw = process.env.ERIX_FINAL_TEXT_TOOLCALL_MARKERS;
+  return raw === undefined || raw === '' ? undefined : raw;
+}
+
 export function buildContainerConfig({
   fdeName,
   containerName,
@@ -231,6 +248,13 @@ export function buildContainerConfig({
       `ERIX_DELEGATE_MAX=${Number(process.env.ERIX_DELEGATE_MAX) || 2}`,
       `ERIX_DELEGATE_CHILD_ROUNDS=${Number(process.env.ERIX_DELEGATE_CHILD_ROUNDS) || 8}`,
       `ERIX_DELEGATE_CHILD_TIMEOUT_MS=${Number(process.env.ERIX_DELEGATE_CHILD_TIMEOUT_MS) || 240000}`,
+      // issue #557：终局正文「文本化工具调用」特征集（runner 读 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS`）。
+      // ⚠ **宿主未设 ⇒ 这一项整个不出现**（连键都不带，见 `toolCallMarkersEnvValue` 的理由：默认清单的
+      //   唯一真值在 `runner/lib/final-text-toolcall.js`）——这一条与上面四行的「未设也下发默认」是有意的差别。
+      // ⚠ 同样是**三处同改**（compose → 这里 → `fde-proxy` 的 `ENV_KEY_ALLOW`）；判据：`portal/test/deploy-env-delegate.test.js`。
+      ...(toolCallMarkersEnvValue() === undefined
+        ? []
+        : [`ERIX_FINAL_TEXT_TOOLCALL_MARKERS=${toolCallMarkersEnvValue()}`]),
     ],
     Labels: { 'station.managed': 'true', 'fde.name': fdeName, 'station.stack': stackId, ...labels },
     HostConfig: {
