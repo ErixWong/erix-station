@@ -854,8 +854,10 @@ export const zhCN = {
       footnote: '这是**单文件**上限，不是磁盘总量上限（总量配额是 #485 片 B，未实现）。它与 MAX_BODY_BYTES（JSON 请求体口径，默认 64 KiB）是两个不同的旋钮：上传不走后者。',
     },
     // issue #596 片 B：管理台「提示词」面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.16）。
-    // 三条**生效时机各不相同** ⇒ 故意是三个键而不是一个共用句（判据 F7：三张卡不许共用一句）。
-    // `readonly.*` 四条只写「住在哪 + 改它要付什么代价」，**不写全文**：portal 镜像不含 runner/。
+    // 三条生效时机各不相同 ⇒ 故意是三个键而不是一个共用句（判据 F7：三张卡不许共用一句）。
+    // readonly 四条只写「住在哪 + 改它要付什么代价」，不写全文：portal 镜像不含 runner/。
+    // ⚠ 这一段的值是纯文本渲染的（本页没有 markdown 渲染器，也不打算加依赖）⇒ 值里不许写成对星号
+    //   当强调：它在界面上只是一串杂字符。要强调请用 class；机械闸见 localeParity.spec.ts。
     prompts: {
       title: '平台提示词',
       intro: '平台喂给模型的文本里，portal 侧可控的三条。改完不重启 portal、不重建镜像：物化与改名每次都现读数据库那一行。空串就是「跟随内置」。',
@@ -881,19 +883,19 @@ export const zhCN = {
       cardAddendum: '平台补充约定（追加成 ~/AGENTS.md 末尾一节）',
       addendumLabel: '追加段正文',
       addendumHint: '那一节的标题与引言由平台撰写；你写的正文逐字节照搬，不加工不改写。清空就是不要那一节。',
-      timingAddendum: '生效时机：保存 ⇒ 入队重物化 ⇒ 该工位**下一次 run** 吃到这一节（不是当场，也不是下一次 portal 重启）。',
+      timingAddendum: '生效时机：保存 ⇒ 入队重物化 ⇒ 该工位下一次 run 吃到这一节（不是当场，也不是下一次 portal 重启）。',
       cardAgentsMd: '平台约定整段覆写（替换 ~/AGENTS.md 的正文主体）',
       agentsMdLabel: '覆写正文',
       agentsMdHint: '内置模板的正文主体整段被你这份替掉；末尾的「FDE 标识」行仍由代码追加，永远是最后一行、改不掉。',
-      timingAgentsMd: '生效时机：与追加段共用同一次物化通知 ⇒ 该工位**下一次 run** 生效；入队没成功时，要等下一次 portal 重启的全量重建才收敛。',
+      timingAgentsMd: '生效时机：与追加段共用同一次物化通知 ⇒ 该工位下一次 run 生效；入队没成功时，要等下一次 portal 重启的全量重建才收敛。',
       cardTitlePrompt: '会话标题提示词（AI 改名时的 system）',
       titlePromptLabel: '标题提示词',
       titlePromptHint: '它只决定「给会话起什么名」：不进 ~/AGENTS.md，也不参与物化。提示词不是守卫——落库前照旧 sanitize 标题。',
-      timingTitlePrompt: '生效时机：**下一次改名**就生效（手工「AI 改名」与自动改名走同一条解析路径；每次现读、无缓存，不用等 run，也不通知物化）。',
+      timingTitlePrompt: '生效时机：下一次改名就生效（手工「AI 改名」与自动改名走同一条解析路径；每次现读、无缓存，不用等 run，也不通知物化）。',
       deviated: '已偏离内置模板：现在发出去的是你写的这份正文主体。',
       followsTemplate: '跟随内置模板：没有覆写，发出去的就是代码里那一份。',
       renderBudget: '整份 ~/AGENTS.md：生效 {effective} / 注入上限 {limit}（内置模板渲染出来是 {template}）',
-      renderBudgetNote: '这个数是按固定示例工位名 example 渲染的预览值（零时间戳 ⇒ 可对比），不是某个真工位的文件大小；而保存时的渲染闸按**最长合法工位名**算 ⇒ 真名字更长时，它可能比这里显示的略大。',
+      renderBudgetNote: '这个数是按固定示例工位名 example 渲染的预览值（零时间戳 ⇒ 可对比），不是某个真工位的文件大小；而保存时的渲染闸按最长合法工位名算 ⇒ 真名字更长时，它可能比这里显示的略大。',
       viewEffective: '查看当前生效全文',
       hideEffective: '收起生效全文',
       copy: '复制',
@@ -909,7 +911,7 @@ export const zhCN = {
       savedNoticeCountUnknown: '已保存，但服务端没回 materializeEnqueued ⇒ 本页按「未通知」处理，不说「已生效」。',
       readonlyTitle: '住在镜像里的四条（本页只读）',
       readonlyIntro: '这四条第一期不开放在线覆写。下面只写它们住在哪、改它要付什么代价。',
-      readonlyNoFullText: '本页**不显示它们的全文**：portal 镜像里没有 runner/（Dockerfile 只 COPY portal/），后端运行时读不到、也只把 key 发过来——在这里显示全文就是撑不起的承诺。要看全文请读仓库源码。',
+      readonlyNoFullText: '本页不显示它们的全文：portal 镜像里没有 runner/（Dockerfile 只 COPY portal/），后端运行时读不到、也只把 key 发过来——在这里显示全文就是撑不起的承诺。要看全文请读仓库源码。',
       readonlyUnknown: '服务端还列了本页没有说明文案的条目：{keys}（不猜它是什么）。',
       readonly: {
         runnerSystemPrompt: {

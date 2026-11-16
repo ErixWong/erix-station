@@ -825,10 +825,13 @@ export const en = {
       footnote: 'This is a **per-file** limit, not a disk quota (total size is #485 slice B, not implemented). It is a different knob from MAX_BODY_BYTES (the JSON request-body limit, 64 KiB by default): uploads never go through the latter.',
     },
     // issue #596 slice B: admin prompts panel (views/AdminPromptsView.vue, docs/api/portal.md §4.16).
-    // The three **effective moments differ**, so they are three separate keys on purpose — one
-    // shared sentence would make the page lie (acceptance criterion F7). The `readonly.*` entries
+    // The three effective moments differ, so they are three separate keys on purpose — one
+    // shared sentence would make the page lie (acceptance criterion F7). The readonly.* entries
     // say where each prompt lives and what changing it costs, never its text: the portal image
     // does not contain runner/, so showing the text here would be an unfounded promise.
+    // ⚠ Every string below is rendered as plain text (this page has no markdown renderer and is
+    //   not getting one): a pair of asterisks in a value shows up as junk characters, not as
+    //   emphasis. Use a CSS class for emphasis; the gate lives in localeParity.spec.ts.
     prompts: {
       title: 'Platform prompts',
       intro: 'The three prompts the platform feeds the model that portal controls. Saving needs no portal restart and no image rebuild: materialization and renaming read that database row every time. An empty string means "follow the built-in text".',
@@ -854,15 +857,15 @@ export const en = {
       cardAddendum: 'Platform addendum (appended as a section at the end of ~/AGENTS.md)',
       addendumLabel: 'Addendum body',
       addendumHint: 'The section heading and lead-in are written by the platform; your body is copied byte for byte, rewritten by nobody. Clearing it removes that section.',
-      timingAddendum: 'Effective when: save ⇒ re-materialization is queued ⇒ this seat picks the section up on its **next run** (not immediately, not on the next portal restart).',
+      timingAddendum: 'Effective when: save ⇒ re-materialization is queued ⇒ this seat picks the section up on its next run (not immediately, not on the next portal restart).',
       cardAgentsMd: 'Whole-section override (replaces the body of ~/AGENTS.md)',
       agentsMdLabel: 'Override body',
       agentsMdHint: 'Your text replaces the body of the built-in template; the trailing seat identity line is still appended by code, always last, never editable.',
-      timingAgentsMd: 'Effective when: it shares the materialization notification with the addendum ⇒ **next run** of that seat; if queueing failed, convergence waits for the full rebuild on the next portal restart.',
+      timingAgentsMd: 'Effective when: it shares the materialization notification with the addendum ⇒ next run of that seat; if queueing failed, convergence waits for the full rebuild on the next portal restart.',
       cardTitlePrompt: 'Session title prompt (the system message behind AI retitling)',
       titlePromptLabel: 'Title prompt',
       titlePromptHint: 'It only decides how a session gets named: it never enters ~/AGENTS.md and never participates in materialization. The prompt is not a guard — titles are still sanitized before being stored.',
-      timingTitlePrompt: 'Effective when: the **next rename** (manual "AI retitle" and automatic renaming share one resolution path; read fresh every time, no cache, no run and no materialization needed).',
+      timingTitlePrompt: 'Effective when: the next rename (manual "AI retitle" and automatic renaming share one resolution path; read fresh every time, no cache, no run and no materialization needed).',
       deviated: 'Deviated from the built-in template: the body that goes out is the one you wrote.',
       followsTemplate: 'Following the built-in template: no override, the text in the code is what goes out.',
       renderBudget: 'Whole ~/AGENTS.md: effective {effective} / injection limit {limit} (the built-in template renders to {template})',
@@ -882,7 +885,7 @@ export const en = {
       savedNoticeCountUnknown: 'Saved, but the server did not return materializeEnqueued ⇒ this page treats it as not notified and never claims "already in effect".',
       readonlyTitle: 'The four prompts that live in the image (read-only here)',
       readonlyIntro: 'These four are not editable online in the first phase. Below: where each one lives and what changing it costs.',
-      readonlyNoFullText: 'This page does **not** show their text: the portal image has no runner/ directory (the Dockerfile only copies portal/), so the backend cannot read those prompts at runtime and sends only the keys. Showing text here would be an unfounded promise — read the source for the full text.',
+      readonlyNoFullText: 'This page does not show their text: the portal image has no runner/ directory (the Dockerfile only copies portal/), so the backend cannot read those prompts at runtime and sends only the keys. Showing text here would be an unfounded promise — read the source for the full text.',
       readonlyUnknown: 'The server also listed entries this page has no copy for: {keys} (their meaning is not guessed).',
       readonly: {
         runnerSystemPrompt: {
