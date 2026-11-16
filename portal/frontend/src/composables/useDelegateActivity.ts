@@ -335,10 +335,18 @@ export function useDelegateActivity(options: UseDelegateActivityOptions) {
     if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibilityChange);
   });
 
-  /** 一行的已跑时长（`createdAt` + 客户端时钟；§2 的结论：名册没有 deadline，只能画「已跑多久」）。 */
+  /**
+   * 一行的已跑时长（§2 的结论：名册没有 deadline，只能画「已跑多久」）。
+   *
+   * ⚠ **终态行必须定格**：`endedAt` 是有限数且不早于 `createdAt` ⇒ 用 `endedAt - createdAt`。
+   * 只用共享的 1s 时钟减 `createdAt` 的话，一个子 completed、另一个还在跑时，终态那一行的
+   * 「已跑 Ns」会跟着时钟一路涨上去（跑得越久越假）。脏值（`endedAt < createdAt`）当没有，
+   * 回落到时钟（宁可走表，不拿不认识的值去冒充定论）。
+   */
   function elapsedMs(item: DelegateActivityItem): number | null {
     if (item.createdAt === null) return null;
-    const delta = nowMs.value - item.createdAt;
+    const ended = item.endedAt !== null && item.endedAt >= item.createdAt ? item.endedAt : null;
+    const delta = (ended ?? nowMs.value) - item.createdAt;
     return Number.isFinite(delta) && delta >= 0 ? delta : null;
   }
 

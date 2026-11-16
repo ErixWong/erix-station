@@ -333,6 +333,27 @@ describe('归一化与徽标计数', () => {
     expect(rows[0]).toMatchObject({ childRunId: 'c1', state: '', createdAt: null, cwd: null, hasTranscript: false });
   });
 
+  it('必修 2：**终态行的「已跑」定格在 endedAt**（同一时钟下活态行继续涨）', async () => {
+    vi.setSystemTime(1_700_000_042_000);
+    queueResponses(ok(rosterBody(
+      rosterItem({ childRunId: 'sub-done-1', state: 'completed', createdAt: 1_700_000_000_000, endedAt: 1_700_000_030_000 }),
+      rosterItem({ childRunId: 'sub-live-1', state: 'running', createdAt: 1_700_000_000_000, endedAt: null }),
+      // 脏值：endedAt 早于 createdAt ⇒ 当没有，回落到共享时钟（不拿不认识的值冒充定论）。
+      rosterItem({ childRunId: 'sub-bad-1', state: 'failed', createdAt: 1_700_000_000_000, endedAt: 999 }),
+    )));
+    const { handle } = setup({ cards: [delegateCard()] }); // pending 卡 ⇒ 时钟与轮询都继续
+    await tick(0);
+    const [done, live, dirty] = handle.items.value;
+    expect(handle.elapsedMs(done)).toBe(30_000); // 定格在 endedAt - createdAt
+    expect(handle.elapsedMs(live)).toBe(42_000);
+    expect(handle.elapsedMs(dirty)).toBe(42_000);
+
+    await tick(3_000); // 3 拍
+    expect(handle.elapsedMs(done), '终态行不许跟着共享时钟涨').toBe(30_000);
+    expect(handle.elapsedMs(live)).toBe(45_000);
+    expect(handle.elapsedMs(dirty)).toBe(45_000);
+  });
+
   it('已跑时长用 createdAt + 客户端时钟；createdAt 缺席 ⇒ null（不画 0s 假时长）', async () => {
     vi.setSystemTime(1_700_000_042_000);
     queueResponses(ok(rosterBody(
