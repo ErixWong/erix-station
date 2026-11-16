@@ -92,3 +92,12 @@ export const VERDICT = Object.freeze(['pass', 'red', 'no-op-claim', 'needs-human
 export const DURATION_RE = /^\d+(ms|s|m|h)$/;
 /** `time` 参数的形态（`HH:MM`，UTC+8）。 */
 export const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/**
+ * 评估间隔（`09` 篇 §1.1）。与枚举一样是**跨端面**的：执行器拿它当轮询周期，
+ * 用户面拿它算「上次评估多久没动了算陈旧」——两边各写一份数字就会漂。
+ * 权威位在本文件；`portal/src/macro-eval.js` re-export 它。
+ */
+export const EVAL_INTERVAL_MS = 60_000;
+/** 水位线陈旧余量倍数（`09` 篇 §1.1「留 3 倍余量」，因为单轮求值可能要查 git / 查 run 状态）。 */
+export const STALE_INTERVAL_MULTIPLE = 3;

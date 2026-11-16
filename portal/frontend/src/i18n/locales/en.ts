@@ -703,6 +703,9 @@ export const en = {
       // issue #485 slice A: upload limit (views/AdminUploadView.vue, contract docs/api/portal.md §4.15).
       // Sits after certs and before the read-only pool view: it is platform configuration.
       upload: 'Upload limit',
+      // issue #528 (event platform W5): admin tabs for macro templates / macro runs (`07` §21.1 key table).
+      macros: 'Macro templates',
+      macroRuns: 'Macro runs',
     },
     // issue #485 slice A: per-file upload limit (`upload_settings` single-row table, migration 0035).
     // The page exists for one reason: changing a number should not require rebuilding a container. That is
@@ -1297,5 +1300,141 @@ export const en = {
       finish: '[Wrap up] Please get these repositories committed and pushed: {repos}{more}. Include untracked files in git add (do not skip them); when a directory holds several repositories, commit each one separately (the parent repository does not contain the child ones); push wherever a remote exists, and ask me before inventing a remote or upstream.',
       ask: '[Wrap-up check] The git light for this directory reports "{state}: {reason}" (cwd: {cwd}). Please go repository by repository: what is not yet protected by git, what that costs, and the exact steps to wrap up (commit / push / set up a remote).',
     },
+  },
+  // issue #528 (event platform W5) user-facing copy. Key names follow the table fixed in `07` §21.1
+  // (once fixed they never change — renaming means changing both locales at once, and one side gets missed).
+  // ⚠ Raw enum values (`quiet_hours`, …) never reach the UI: the human mapping lives in
+  // `lib/macroView.ts` (`skipMessageKey` / `verdictMessageKey`).
+  macro: {
+    title: 'Watch log',
+    loading: 'Loading…',
+    loadFailed: 'Failed to load',
+    retry: 'Retry',
+    chip: {
+      enabled: 'Automation · {count} on',
+      none: 'Automation · none on',
+    },
+    config: {
+      title: 'Configure ▾',
+      intro: 'Checking a box applies immediately — no save button; runs already triggered are not rolled back.',
+      userScopeHint: 'Set up by an admin (user level, not subscribed per session)',
+    },
+    card: {
+      enabledCount: '{count} enabled',
+      lastEvaluated: 'last evaluated {at}',
+      notEvaluated: 'not evaluated yet',
+    },
+    health: {
+      stale: '⚠ last evaluation was {minutes} min ago, expected every {everySeconds}s (stale after {staleAfterSeconds}s) · macros may not be firing',
+      neverEvaluated: '⚠ these templates have never been evaluated · macros may not be firing',
+      nextStep: 'If it keeps not refreshing, ask an admin to check the executor.',
+    },
+    filter: {
+      template: 'Template',
+      verdict: 'Verdict',
+      allTemplates: 'All templates',
+      allVerdicts: 'All verdicts',
+      clear: 'Clear filters',
+    },
+    status: {
+      pending: 'Queued',
+      running: 'Running',
+      done: 'Done',
+      skipped: 'Skipped',
+      failed: 'Failed',
+      superseded: 'Superseded',
+      unknown: 'Unknown status',
+    },
+    // The single wording table from `07` §6.1 (old drafts said "not passed" / "not achieved").
+    verdict: {
+      pass: 'Pass',
+      red: 'Rework',
+      noop: 'Change unproven',
+      human: 'Needs a human',
+      unclassified: 'Unjudged',
+    },
+    // Human wording per `09` §3.3. `humanPresent` states a neutral fact and never blames the user.
+    skip: {
+      budget: 'Daily budget used up',
+      quietHours: 'Quiet hours (22:00–08:00)',
+      humanPresent: 'You just sent a message, so it stayed quiet',
+      runInProgress: 'A run is in progress in this session',
+      deferred: 'A run is in progress, it will be delivered once that ends',
+      deferredTimeout: 'Waited for the slot over 10 minutes, gave up',
+      activeRunInCwd: 'A run is active in the same directory',
+      cancelledByUser: 'You turned the watch off',
+      unknown: 'Blocked by a gate (reason unknown)',
+      aggregate: '{count} in a row for the same reason',
+    },
+    kind: {
+      runNotify: 'Terminal notification',
+      runSilence: 'Silence alert',
+      runReview: 'Completion review',
+      scheduledTask: 'Scheduled task',
+      unknown: 'Unknown kind',
+      desc: {
+        runNotify: 'Notifies you when a run reaches a terminal state',
+        runSilence: 'Alerts when a tool stalls past the threshold',
+        runReview: 'Reviews the session after a run ends and reworks once',
+        scheduledTask: 'Starts its own macro session at a fixed time each day',
+        unknown: 'No description for this kind yet',
+      },
+    },
+    field: {
+      name: 'Name',
+      states: 'Terminal states to watch',
+      channel: 'Notification channel',
+      threshold: 'Silence threshold',
+      phases: 'Phases to watch',
+      reviewDepth: 'Review depth',
+      onFail: 'What to do on failure',
+      maxRounds: 'Max rounds',
+      at: 'Time',
+      cwd: 'Directory',
+      task: 'Task description',
+    },
+    action: {
+      regenerate: 'Regenerate',
+      stopRun: 'Stop run',
+      openSettings: 'Open settings',
+      refresh: 'Refresh',
+      close: 'Close',
+      back: 'Back',
+    },
+    detail: {
+      depth: 'depth {depth}',
+      noAction: 'Executed',
+    },
+    // `07` §15: per-run numbers are measured, the summary is marked as an estimate and collapsed by
+    // default; with no confirmed unit price we show tokens only and never a currency amount.
+    cost: {
+      tokens: 'tokens',
+      monthly: 'This month',
+      triggers: '{count} triggers in this session',
+      unknown: 'usage unknown',
+      estimateToggle: 'Estimate details',
+      estimateHint: 'estimate (unit price comes from the pricing config and may be off)',
+    },
+    // Business empty states per `07` §17.2 (technical states use `loading` / `loadFailed`).
+    empty: {
+      noSubscription: 'No template is attached to this session',
+      neverTriggered: '{count} enabled, nothing triggered yet. Last evaluated {at}',
+      filtered: 'No matching records',
+      chooseTemplate: 'Choose a template',
+    },
+  },
+  // `07` §21.3: a dedicated `notifications` table plus a bell in the top bar (not the message stream).
+  notifications: {
+    title: 'Notifications',
+    aria: 'Notifications, {count} unread',
+    loading: 'Loading…',
+    failed: 'Failed to load notifications',
+    empty: 'No notifications',
+    markRead: 'Mark as read',
+  },
+  // `07` §21.4: a separate collapsed "Automation" group in the sidebar; sessions inside are read-only.
+  macroSidebar: {
+    group: 'Automation',
+    readOnlyHint: 'Macro sessions are read-only — you cannot send messages here',
   },
 } as const satisfies MessageSchema;
