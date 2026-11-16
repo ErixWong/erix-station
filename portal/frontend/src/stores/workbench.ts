@@ -17,6 +17,9 @@ import { i18n } from '../i18n';
 import { useEventStream, RUN_FAIL_REASONS, type CardAlias, type ReplayMode, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
 // issue #282：会话页动量状态条的状态机（SSE 逐帧喂；组件只读派生视图，见 components/RunStatusBar.vue）。
 import { createRunMomentumFeed } from '../composables/useRunMomentum';
+// issue #592：子 run 活动面板的数据层（名册端点轮询）。**宿主是 store 而不是组件**：徽标在
+// `RunStatusBar` 尾部、面板在 `WorkbenchView` 的状态条下方——两边必须读同一份账（两份实例 = 两份轮询）。
+import { useDelegateActivity, type DelegateActivityItem } from '../composables/useDelegateActivity';
 import { renderMarkdown } from '../lib/markdown';
 import { DIR_NAME_RE, SESSION_TITLE_MAX_LEN } from '../lib/constants';
 // issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
@@ -33,6 +36,21 @@ import { normalizeSessionCompaction, type SessionCompaction } from '../lib/compa
 // 响应式：t() 内部读取 locale 响应式 ref，故在 computed / 模板函数中取词会随切语言自动更新；
 // 错误行/通知正文属「事件发生时快照」，不回溯翻译（可接受）。
 const t = i18n.global.t;
+
+/**
+ * issue #592：**已打开的子 run 只读抽屉**（设计 §4.3 的实现约束）。
+ *
+ * 原来这份状态是 `StreamPanel.vue` 的组件内 `ref`，只有工具卡一个入口写得动。活动面板的「查看」
+ * 是第二个入口 ⇒ **必须上提成共享状态**：否则要么复制第二个抽屉实例（得到两份轮询、两套 abort、
+ * 两份 state ⇒ 设计 §8.3 点名的坑），要么第二个入口点了没反应。
+ * 抽屉的**挂载点仍然只有一处**（`StreamPanel.vue` 模板底部），变的只是「谁能写它」。
+ */
+export interface DelegateViewerState {
+  parentRunId: string;
+  childRunId: string;
+  label: string;
+  termination?: string;
+}
 
 /**
  * issue #236：历史端点响应期合成的**终态状态项**类型（`GET /api/sessions/:id/events/history`）。
@@ -450,6 +468,74 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (item) item.title = d.title;
     },
   });
+
+  // ---------------------------------------------------------------------------
+  // issue #592：子 run（delegation）活动面（设计 §4.1 阶段 0 + §4.3）。
+  //
+  // **为什么实例在 store 而不是组件里**：徽标挂在 `RunStatusBar`（设计 §4.3：状态条是唯一落点），
+  // 面板挂在 `WorkbenchView` 的状态条下方——两个宿主。composable 自己 new 一份就是**两份轮询、
+  // 两个 interval、两套 abort**（正是设计 §8.3 点名的坑，与「抽屉只能有一个实例」同源）。挂在
+  // store 上则天然全应用一份，且它的 `onScopeDispose` 会挂在 pinia 的作用域上（组件卸载与 store
+  // 复位两种收摊路径都盖到），不需要引入模块级可变单例。
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 子 run 活动面板（徽标数字 + 面板行）的唯一数据源。入参全部是 getter ⇒ 与 SSE 状态保持响应式：
+   * `activeRunId` 变 null（run 结束）当场停轮询，工具卡被历史回放重建后又能自己恢复（§4.4 ①）。
+   */
+  const delegateActivity = useDelegateActivity({
+    sessionId: () => sessionId.value,
+    activeRunId: () => es.activeRunId.value,
+    cards: () => es.toolCards.values(),
+  });
+
+  /** 当前打开的子 run 抽屉（null = 没开）。**全应用只有一份**，挂载点也只有 `StreamPanel` 一处。 */
+  const delegateViewer = ref<DelegateViewerState | null>(null);
+
+  // 面板的对外面：**逐顶导出 computed/函数，不把 composable 那个对象整个交给 pinia**。原因很实际：
+  // pinia 的 setup store 会把返回体包成 reactive，**嵌套对象里的 ref 会被 unwrap** ⇒ 运行时
+  // `store.delegateActivity.liveCount` 是个 number，而 TS 仍按 `Ref<number>` 提示 ⇒「不写 `.value`
+  // 才能跑、写了才不报错」这种反向形状就是下一个假红的伏子。顶层 computed 没有这道缝。
+  const delegateRows = computed(() => delegateActivity.items.value);
+  const delegateLiveCount = computed(() => delegateActivity.liveCount.value);
+  const delegateHasLive = computed(() => delegateActivity.hasLive.value);
+  /** 连续失败到阈值 ⇒ 面板出**一行灰字**（中性，不是红条）。 */
+  const delegateRowsUnavailable = computed(() => delegateActivity.error.value);
+  /** 这一行的「已跑多久」毫秒数（内部读 composable 的 1s 时钟 ref ⇒ 在渲染效应里自然响应式）。 */
+  function delegateElapsedMs(item: DelegateActivityItem): number | null {
+    return delegateActivity.elapsedMs(item);
+  }
+
+  /** 展开态（徽标点开的面板）。与抽屉同理：徽标在状态条、面板在它下方，两个组件读写同一份。 */
+  const delegatePanelOpen = ref(false);
+
+  /** 打开子 run 抽屉（工具卡的按钮与面板行的「查看」都写这里）。 */
+  function openDelegateViewer(view: DelegateViewerState): void {
+    delegateViewer.value = { ...view };
+  }
+
+  function closeDelegateViewer(): void {
+    delegateViewer.value = null;
+  }
+
+  /** 收起面板（徽标再点一次 / Esc / 换 run 都会走到这里；换 run 必须收，否则会把上个 run 的面板顶给新 run）。 */
+  function collapseDelegatePanel(): void {
+    delegatePanelOpen.value = false;
+  }
+
+  function toggleDelegatePanel(): void {
+    delegatePanelOpen.value = !delegatePanelOpen.value;
+  }
+
+  /**
+   * 离开会话 / 换账号时的子 run 视图面复位（与 `clearExpandedToolCalls()` 同一批调用点）。
+   * 轮询本身不需要这里停：`delegateActivity` 监听 `parentRunId`（会话或活跃 run 一变就清账并拆 timer），
+   * 但抽屉与展开态是**视图态**，不跟那个信号，必须显式收。
+   */
+  function resetDelegateSurface(): void {
+    delegateViewer.value = null;
+    delegatePanelOpen.value = false;
+  }
 
   // ---- 计算属性（旧 updateProjectMeta / updateWorkspaceAvailability / setRunning 的响应式等价）----
   /** 当前选中目录（顶栏 cwd 徽标 / 下拉高亮用）。 */
@@ -1031,6 +1117,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
+    resetDelegateSurface(); // issue #592：离开会话/换账号同样不得把上一个 run 的子 run 抽屉与面板留给下一个（会话级视图态）
     renderedIds.value = null;
     sessions.value = [];
     // 评审修复：与 resetSessionView 对齐的状态复位（旧版同时复位自动跟随/「↓ 最新」/抽屉——
@@ -1060,6 +1147,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
+    resetDelegateSurface(); // issue #592：离开会话/换账号同样不得把上一个 run 的子 run 抽屉与面板留给下一个（会话级视图态）
     renderedIds.value = new Set();
     entries.value = [];
     sessionMessageCount.value = null; // #197：先清旧会话的计数，加载失败/竞态丢弃时不得串会话残留
@@ -1244,6 +1332,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
+    resetDelegateSurface(); // issue #592：离开会话/换账号同样不得把上一个 run 的子 run 抽屉与面板留给下一个（会话级视图态）
     renderedIds.value = null;
     sessions.value = [];
     streamDefaultText();
@@ -1393,6 +1482,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
+    resetDelegateSurface(); // issue #592：离开会话/换账号同样不得把上一个 run 的子 run 抽屉与面板留给下一个（会话级视图态）
     renderedIds.value = null;
     inputValue.value = '';
     streamDefaultText();
@@ -1452,6 +1542,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // ⑦ 旁路观测面：动量数字（#282）与工具卡片展开记忆（#85，模块级 Set，跨 store 实例都共享）
     momentum.reset();
     clearExpandedToolCalls();
+    resetDelegateSurface(); // issue #592：离开会话/换账号同样不得把上一个 run 的子 run 抽屉与面板留给下一个（会话级视图态）
     // ⑧ #449：登录**第二步的待决凭证**（`pending_token` / `factor` / `sendFailed` / 冷却）属于「上一个人」。
     //    它是签发时那台服务端认可的待决令牌：留着就会被下一个人拿去撞 `/api/auth/login/email-code`
     //    （与 #428/#431 同一纪律：跨账号可见面一项不留）。唯一的持有者是 auth store ⇒ 由它自己清。
@@ -1797,5 +1888,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessionCompaction,
     // issue #282：动量状态机（RunStatusBar / StreamPanel 的 1s 时钟各自 useRunMomentum 读它）
     momentum,
+    // issue #592：子 run 活动面（徽标 + 面板）与**共享的**子 run 抽屉状态。
+    // 数据只有一份（两份实例 = 两份轮询）；抽屉的挂载点仍在 StreamPanel，这里导出的是「谁能写它」：
+    // 工具卡的按钮 + 面板行的「查看」。
+    delegateRows, delegateLiveCount, delegateHasLive, delegateRowsUnavailable, delegateElapsedMs,
+    delegateViewer, delegatePanelOpen,
+    openDelegateViewer, closeDelegateViewer, toggleDelegatePanel, collapseDelegatePanel, resetDelegateSurface,
   };
 });

@@ -19,6 +19,9 @@ import StreamPanel from '../components/StreamPanel.vue';
 import RunStatusBar from '../components/RunStatusBar.vue';
 import ComposerBar from '../components/ComposerBar.vue';
 import QueuedInputsBar from '../components/QueuedInputsBar.vue';
+// issue #592：子 run 活动面板（设计 §4.3 的落点：状态条**下方**、队列条**上方**，读序
+// 「现在在跑什么 → 还排队说什么 → 输入框」）。徒标在 `RunStatusBar` 尾部，两边读 store 里同一份账。
+import DelegateActivityBar from '../components/DelegateActivityBar.vue';
 import SessionPickerModal from '../components/SessionPickerModal.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
 // issue #359（决策 §7 D9）P0b：顶栏「收工灯」——只回答“你的活儿被 git 保护住了吗”，平台零 git 写。
@@ -369,6 +372,8 @@ function jumpToLatest() {
              滚动容器里——常驻可见）。原来在流上方，顶部一行容易被忽略；贴到 composer 上沿后视线自然落到它。
              无选中会话时不挂（没有 run 可报，也不白起一个 1s 时钟）。 -->
         <RunStatusBar v-if="store.sessionId" />
+        <!-- issue #592：展开态面板（徒标点开后才会挂；无内容时整段不渲染，不会顶出一条空栏）。 -->
+        <DelegateActivityBar v-if="store.sessionId" />
         <!-- issue #370：队列条夹在状态条与 composer 之间——它是「还没发出去的话」，
              读序必须是「现在在跑什么 → 还排队说什么 → 输入框」。 -->
         <QueuedInputsBar v-if="store.sessionId" />
