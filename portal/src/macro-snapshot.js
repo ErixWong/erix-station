@@ -32,6 +32,22 @@ export const MIN_FREE_DISK_BYTES = 2 * 1024 * 1024 * 1024; // 2GB
 /** 孤儿判定阈值：终态 > 1h 或 running > 1h ⇒ 视为可回收（含进程崩溃的残留）。 */
 export const ORPHAN_AGE_MS = 60 * 60 * 1000;
 
+/**
+ * ③ 失败门闸的全部 reason（任一失败都不启动审查）。契约常量：单测据此逐项锁定，
+ * 新增/漏一个 reason 会红。`snapshot_root_in_projects` 是本站额外闸（worktree 必须
+ * 在 `~/projects` 之外，否则污染收工灯），**不在任务的 7 个里**。
+ */
+export const SNAPSHOT_FAILURE_REASONS = Object.freeze([
+  'worktree_add_failed',
+  'patch_apply_failed',
+  'untracked_copy_failed',
+  'snapshot_unstable',
+  'snapshot_timeout',
+  'snapshot_too_large',
+  'disk_low',
+  'snapshot_root_in_projects',
+]);
+
 /** `macro_runs.status` 的终态集合（与 0035 的 CHECK 对齐；本模块**不 import macros.js**，
  *  以保持零第三方依赖——portal 测试只跑本文件，不能把 pg 拖进来）。 */
 export const TERMINAL_MACRO_RUN_STATUSES = Object.freeze(['done', 'skipped', 'failed', 'superseded']);
@@ -415,6 +431,24 @@ export function shouldRemoveOrphan(row, nowMs = Date.now()) {
   }
   // pending（还没真跑）⇒ 不回收
   return false;
+}
+
+/**
+ * 生产用的 `macro_runs` 查找器（按 `worktree_path` 取孤儿判据所需的三列）。
+ * 作为 `cleanOrphanWorktrees({ lookupMacroRun })` 的真实现注入；单测用 fake pool 验 SQL 形态，
+ * **不必起真 Postgres**（decision 逻辑另由注入假 lookup 的 `cleanOrphanWorktrees` 用例覆盖）。
+ * 查不到行 ⇒ 返回 null（对应孤儿判据 3：建完 worktree、写库前就死了）。
+ */
+export function makeMacroRunLookup(pool) {
+  return async (worktreePath) => {
+    const r = await pool.query(
+      'SELECT status, started_at, finished_at FROM macro_runs WHERE worktree_path = $1 LIMIT 1',
+      [worktreePath],
+    );
+    const row = r?.rows?.[0];
+    if (!row) return null;
+    return { status: row.status, startedAt: row.started_at, finishedAt: row.finished_at };
+  };
 }
 
 /** 解析 `git worktree list --porcelain`，返回绝对路径数组。 */

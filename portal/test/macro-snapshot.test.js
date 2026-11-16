@@ -20,6 +20,8 @@ import {
   shouldRemoveOrphan,
   parseWorktreeList,
   cleanOrphanWorktrees,
+  makeMacroRunLookup,
+  SNAPSHOT_FAILURE_REASONS,
   TERMINAL_MACRO_RUN_STATUSES,
   ORPHAN_AGE_MS,
 } from '../src/macro-snapshot.js';
@@ -255,4 +257,58 @@ test('copyUntracked：无未跟踪文件时按探测口径返回、不报错', (
   const out = copyUntracked(repo, root, { hasRsync: true });
   assert.equal(out.method, 'rsync');
   assert.equal(out.copied, 0);
+});
+
+// --- ③ 失败门闸 ------------------------------------------------------------
+test('失败 reason 契约：任务指定的 7 个一个不少', () => {
+  const TASK_REASONS = [
+    'worktree_add_failed', 'patch_apply_failed', 'untracked_copy_failed',
+    'snapshot_unstable', 'snapshot_timeout', 'snapshot_too_large', 'disk_low',
+  ];
+  for (const r of TASK_REASONS) {
+    assert.ok(SNAPSHOT_FAILURE_REASONS.includes(r), `缺 reason：${r}`);
+  }
+});
+
+test('门闸：snapshotRoot 在 ~/projects 下 ⇒ snapshot_root_in_projects（不起进程）', async () => {
+  const repo = tmpRepo();
+  seedCommitted(repo, 'a.txt', 'a\n');
+  const root = path.join(os.homedir(), 'projects', 'wt-w4a-261116', '.w4a-snap');
+  const res = await createSnapshot({ repoDir: repo, snapshotRoot: root, id: 'gate-in-proj' });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'snapshot_root_in_projects');
+});
+
+test('门闸：worktree 目标已存在且非空 ⇒ worktree_add_failed', async () => {
+  const repo = tmpRepo();
+  seedCommitted(repo, 'a.txt', 'a\n');
+  const root = tmpRoot();
+  const id = 'gate-wt-exists';
+  // 预建非空 worktree 目标目录 ⇒ `git worktree add` 必失败
+  fs.mkdirSync(path.join(root, id), { recursive: true });
+  fs.writeFileSync(path.join(root, id, 'occupant.txt'), 'x');
+  const res = await createSnapshot({ repoDir: repo, snapshotRoot: root, id, hasRsync: true });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'worktree_add_failed');
+});
+
+// 孤儿清扫的生产 DB seam：按 worktree_path 查 macro_runs（fake pool 验形态，不起真库）。
+test('makeMacroRunLookup：按 worktree_path 查 macro_runs，命中映射三列、未命中返回 null', async () => {
+  const seen = [];
+  const pool = {
+    async query(sql, params) {
+      seen.push({ sql, params });
+      if (params[0] === '/present') {
+        return { rows: [{ status: 'running', started_at: new Date(0), finished_at: null }] };
+      }
+      return { rows: [] };
+    },
+  };
+  const lookup = makeMacroRunLookup(pool);
+  const hit = await lookup('/present');
+  assert.deepEqual(hit, { status: 'running', startedAt: new Date(0), finishedAt: null });
+  const miss = await lookup('/absent');
+  assert.equal(miss, null, '无行 ⇒ null（孤儿判据 3）');
+  assert.match(seen[0].sql, /FROM macro_runs WHERE worktree_path = \$1/);
+  assert.deepEqual(seen[0].params, ['/present']);
 });
