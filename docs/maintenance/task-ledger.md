@@ -7397,3 +7397,33 @@ rebase 后 69/69 全绿（含 upload-settings 那支）。
   `git -c http.proxy=http://proxy.internal:19001 -c https.proxy=…` 立刻通（与 §4 记载一致）。
 
 **待办**：W4a（#537，在跑）、W4b（#538）、W7（#536）、W5/W6。
+### 8.143 issue #563 交付：折叠原文「返回了什么」补上**已提交的** DOM 纯文本护栏（工单 `test-261116-06-563`，**零生产代码改动**）
+
+> 编号说明：本节由父 agent 从 §8.141 末尾的追加块**提成独立节**；**原拟 §8.142 已让号给 main 上的事件平台 W3**（并行 session 撞号，见 §8.142 首段的「编号撞车口径」）（AGENTS §6「一单一账 `### 8.N`」），
+> 内容一字未改；#563 与 e2e 预飞无关，压在 §8.141 里会让下一次 `grep '#563'` 的人以为它属于那单。
+
+**症状与根因**：折叠原文里 `tool_result` 的预览进界面走 `StreamPanel.vue:598-601` 的
+`↳ {{ foldedToolResult(tc) }}` **插值**（不是 `v-html`）⇒ 今天**行为本来就是对的**，`<img src=x onerror=…>`
+落在界面上是字面文本。缺的是断言：第三方审计把那个节点改成 `v-html` 之后跑整套 `StreamPanel.spec.ts`，
+**只有它临时加的那格红、原有 69 格全绿** ⇒ 「把返回预览换成 HTML 渲染」这件能在真浏览器里执行 `onerror`
+的事，CI 拦不住。根因**不在 CI 配置**：`vite.config.ts` 的 `test.environment='jsdom'` +
+`environmentOptions.jsdom.url` 是全局的（66 个 spec 文件都吃得到，无需逐个加 `@vitest-environment` 头），
+根因在**断言形状**。
+
+**为什么 #387 那格断不出**（钉住这条已核实的事实，别重新发现一遍）：`StreamPanel.spec.ts:592-626` 喂的
+`resultPreview` 是 `'1: 24'` / 缺键 / `0`——**一个标签字符都没有**，「插值」与「当 HTML 渲染」两种实现下
+`textContent` 一模一样，`toContain('1: 24')` 两种语义都真 ⇒ 它只能证明「预览有没有画出来」，证明不了
+「以什么语义画」。同理 `querySelectorAll('*').length === 0` 也会**假红**（`.folded-original-tool-result`
+自己就带 `pl-3` 类，祖先里还有按钮与提示行）。
+
+**修法**：`StreamPanel.spec.ts` 紧邻 #387 加一格 `#563 护栏：原文里「返回了什么」必须逐字是纯文本…`，
+喂**四种上游真发过的形状**（`<img src=x onerror=…>` / `<script>alert(1)</script>` /
+第三方那条关键的 `<invoke name="exec"><parameter name="command">ls
+…`（嵌套标签，HTML 里是**未知标签**：被当 HTML 解析时既不报错也不红，只是悄悄变成一对 DOM 元素）/
+`{content, metadata}`），断言只钉 DOM：`textContent` **逐字** `toBe('↳ ' + 原文)`（不是 `toContain`）、
+整块只有一个文本节点且 `children` 为 0、`querySelector('img'|'script'|'invoke'|'parameter')` 全 null，
+并直接读 `outerHTML`（不用 `wrapper.html()`，VTU 会 pretty-print）钉「尖括号仍是 `&lt;` 实体」。
+**不钉 `wrapper.emitted()`**（本机 `NODE_ENV=production` 下它恒空 ⇒ 假绿，AGENTS §8.9 第 5 条同源）。
+
+**变异读数**（锚点先数过：`grep -c '↳ {{ foldedToolResult(tc) }}' StreamPanel.vue` = **1**；备份放
+`/tmp/StreamPanel.vue.bak-563`，还原用 `cp` 回来，**没用 `git checkout --`**——那文件上压着本格未提交的编辑）：
