@@ -43,7 +43,10 @@ const tabs = [
   // 「发信 / 边缘证书」同属平台入口配置，号池占用仍留最后（只读运维快照）。
   { name: 'admin-tls', label: 'admin.tabs.tls' },
   // issue #485 片 A：上传上限（§4.15）。紧随证书（两者都是平台配置）而在号池占用（只读快照）之前。
+  // issue #596 片 B：提示词面板。与 upload 同属「改一行而不必重建镜像」的平台配置 ⇒ 紧接其后、
+  // 号池占用（只读快照）之前。请求只在该视图挂载时发（`AdminPromptsView` 的 onMounted 是唯一触发点）。
   { name: 'admin-upload', label: 'admin.tabs.upload' },
+  { name: 'admin-prompts', label: 'admin.tabs.prompts' },
   // issue #350：号池占用总览（只读）。放在最后：先看用户/配置，选段时才来这里。
   { name: 'admin-preview-pool', label: 'admin.tabs.previewPool' },
   // issue #529（事件平台 W6）：宏模板配置 + 宏执行历史。追加在末尾（模板 → 执行历史）。
