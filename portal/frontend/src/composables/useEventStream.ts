@@ -101,6 +101,12 @@ export const EVENT_TYPES = [
   // ⇒ 只进本数组，**绝不进** HISTORY_REPLAY_TYPES（它没有 seq、也没有历史行可回放；刷新后由
   // `GET /api/sessions/:id` 的 `session.queued_messages` 快照补齐）。漏加本数组 = 实时永远收不到。
   'queue_update',
+  // issue #243：`textualized_tool_call`（**本站自造**，portal 在终态事务里合成）——「终局正文是一段
+  // 被文本化的工具调用，交付报告可能没生成」。本数组是 EventSource 逐类型 `addEventListener` 的
+  // **唯一来源**，漏加就是实时一条都收不到（#288/#371-A/#421 同一颗坑，已经踩过四次）。
+  // ⚠ 本次只加**订阅与回放两处集合**，渲染（中性分隔行 + 中英双语文案）在下一步落 —— 在那之前
+  // 这一类是「订得到、暂时不刷行」，与 `run_outcome` 今天的形态同类。
+  'textualized_tool_call',
 ] as const;
 
 // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）。
@@ -156,6 +162,10 @@ const HISTORY_REPLAY_TYPES = new Set([
   // 它是展示类、不驱动运行态状态机：红色面仍只由 `run_end` 负责（这条事件本身说的是「请求已原样发出」，
   // 不是「本轮失败」）。
   'user_turn_guard_unrecoverable',
+  // issue #243：与 `http.js` 的 `HISTORY_EVENT_TYPES`、上面 `EVENT_TYPES` **同步**加（三处只加一边
+  // 就分别得到「实时收不到」或「刷新后消失」；对账判据 `portal/test/event-surface-contract.test.js`
+  // 的 S4 要求两个集合逐项相等）。上游 erix-agent #182 的教训正是「实时看得见、刷新后消失」。
+  'textualized_tool_call',
 ]);
 
 /** issue #89：run_events 历史端点的事件项（REST 形状，与 SSE data 展开后同构）。 */
@@ -1257,6 +1267,31 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'forced_final':
         hooks.onSep(t('stream.event.forcedFinal', { round: d.round, reason: d.reason ?? '' }));
         return;
+      // issue #243（第 3 步）：终局正文是一段**被文本化的工具调用** ⇒ 一条**中性**分隔行。
+      // 语义是「模型把工具调用写进了正文，这次调用没有真的执行」——**不是故障**：正文里那段文字
+      // 就是模型给的答案的一部分，只是没被执行。所以走 `onSep`（`.roundsep` 中性灰），**不走 `onSysErr`**
+      // （`.syserr` 是 #dc3545 那个「错误」色，借它就是谎报严重程度；同 #300 给半截正文挑中性色、
+      // 同 D9「状态词、不是警报」那条口径）。
+      // payload 由 portal 在终态事务里合成（portal.md §5.3 第 29 项）：`{chars, marker?}`。
+      // `marker` 是**外来字符串**（现查真样本：`<｜｜DSML｜｜`、`<｜FunctionCallML｜｜ invoke`，
+      // 含全角竖线与 XML 尖括号）：
+      //   * **没给就没有那段片段**——第 2 步特意留了「缺 marker 也照发」，渲染不许依赖它；
+      //   * 非字符串 / 空串一律不带片段，绝不 `String(对象)` 把 `[object Object]` 渗进用户可见文案
+      //     （#261 / #288B 同口径）；
+      //   * 它最终落在 StreamPanel 的 `{{ en.text }}` **文本节点**上 ⇒ 尖括号原样可见。
+      //     ⚠ **不许**把那一处插值改成 `v-html`：`<invoke name="exec">` 会被当标签吃掉，
+      //     还可能连后半句一起吞掉（判据里有一格专门钉这件事）。
+      // 位置：portal 已把这条事件的 `seq` 排在 `run_end` **之前** ⇒ 前端**不重排**，到达顺序就是
+      // 「正文 → 这条提示 → 终态分隔条」；实时与刷新后回放走的是**同一条** `dispatch`（#89 口径）。
+      case 'textualized_tool_call': {
+        // 上界与 portal 的载荷校验同源（`internal.js`：marker 必须 ≤120 字符）；旧行/别的写者
+        // 给了更长的串也不该把一行提示撑成一段代码。
+        const marker = typeof d.marker === 'string' && d.marker !== '' ? d.marker.slice(0, 120) : '';
+        hooks.onSep(t('stream.event.toolCallTextualized', {
+          dash: marker === '' ? '' : t('stream.event.dash', { value: marker }),
+        }));
+        return;
+      }
       case 'usage': return;
       case 'run_end': {
         // issue #89 红线：历史回放的 run_end 一律短路——绝不驱动运行态状态机

@@ -58,6 +58,8 @@
 | 管理 | `GET /api/admin/mail/settings` | **邮件通道配置：读**（#449，§4.12）。**永不返回口令**：只给 `hasPassword` 布尔；无行（未配置）也回 `200` + 默认 DTO |
 | 管理 | `PUT /api/admin/mail/settings` | **邮件通道配置：写**（#449，§4.12）。口令**只写**：键缺席 = 不修改、`null`/`""` = 清除；落库后缓存**立刻**失效（不等 60s TTL） |
 | 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
+| 管理 | `GET /api/admin/upload/settings` | **单文件上传上限：读**（#485 片 A，§4.15）。回的是**当前生效值** + **来源**（`db`/`env`/`default`）+ 允许区间；表不存在/读失败也回 `200`（不是 500）|
+| 管理 | `PUT /api/admin/upload/settings` | **单文件上传上限：写**（#485 片 A，§4.15）。`{maxFileBytes}` 必须是 `1 MiB`–`1 GiB` 的 JSON 整数，否则 `400 validation_failed` 且**不落库**；**下一次上传就生效**（无缓存 ⇒ 不需重启，也不需失效任何东西）|
 | 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
 | 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
 | 管理 | `POST /api/admin/tls/inspect` | **解析但不落盘**（#456 M2，§4.13-3a）：`{certPem,keyPem?}` → 证书元数据 + `keyMatches` 三态 + 覆盖判定 + `warnings`。**零副作用**（不写盘/DB/审计、不动 `tlsLive`、不烧上传配额）；每管理员 120 次/小时 |
@@ -1322,8 +1324,34 @@ station-portal user enable  --login <login>
 刷新后前端重建工具卡片 / judge 面板的**只读历史通路**（对齐 pi-web「转录即真相」：历史与实时走同一渲染入口）。
 
 - **与 SSE 的关系**：独立 REST 通路，不影响 §5.2.3 首连不补发 / 断线重连补发语义。
-- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑） / **`persistence_error`**（#371-A：引擎落盘失败告警，走 `diagnostics.error` 而**不是** `onEvent`——本站此前没传 `diagnostics`，真机全库该类型 **0 行**，非致命降级因此彻底隐形；前端只把 `fatal === false` 刷成中性分隔行，致命那条仍由 `run_end` 的 `persistence_failed` 负责）；**第 18~21 类（issue #421）**`compaction_strategy_fallback` / `persistence_capability_degraded` / `resume_journal_skipped`（`model_metadata_missing` 早在 #182 时就已列入）——引擎承诺、本站以前订不到那一族，不进则又是「实时没有、刷新后也没有」；而 **`run_outcome`（第 22 类）是写明了理由的显式不进**（与 `run_end` 重叠且无读者，对账测：`portal/test/event-surface-contract.test.js`）；**第 28 类 `host_steer_injected`（erix-agent 0.32.0 唯一新增的 LoopEvent，#499）同样显式不进**——本站不传 `capabilities.hooks.nextUserTurn` ⇒ 结构上不产生该事件，订得到（水位线推进）但不刷行、不回放、不下发（理由同 `run_outcome`，钉在同一份对账测的豁免表，只加前端 `EVENT_TYPES` 不写决定会被它的 S2 判红）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `tool_call_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。**#502 的补充**：三个碎片型自本单起**根本不落库**，「不下发」对它们是双重成立（表里没有 + 白名单不列）；`tool_call_delta` 是本单唯一**从白名单里摘掉**的类型（它以前在，摘它的理由是「行没了」，成形参数在 `tool_use.input`），摘除理由必须写——前端 `HISTORY_REPLAY_TYPES` 与它逐项对齐，由 `portal/test/event-surface-contract.test.js` 对账。**#425 的消费侧补充（零后端变更）**：白名单里的 `round_end` 载荷带 `usage`（本 run 累计真值），前端动量状态机**只**吃它的 `usage` 与 `context_window` 两个展示量（并把登记的 run 直接标成已结束），其余字段与所有其它历史帧仍一律不驱动运行态 ⇒ 硬刷新后「上次 run 用了多少 token / 窗口多大」仍在，而轮号、时长、速率、相位照旧不重建。
+- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑） / **`persistence_error`**（#371-A：引擎落盘失败告警，走 `diagnostics.error` 而**不是** `onEvent`——本站此前没传 `diagnostics`，真机全库该类型 **0 行**，非致命降级因此彻底隐形；前端只把 `fatal === false` 刷成中性分隔行，致命那条仍由 `run_end` 的 `persistence_failed` 负责）；**第 18~21 类（issue #421）**`compaction_strategy_fallback` / `persistence_capability_degraded` / `resume_journal_skipped`（`model_metadata_missing` 早在 #182 时就已列入）——引擎承诺、本站以前订不到那一族，不进则又是「实时没有、刷新后也没有」；而 **`run_outcome`（第 22 类）是写明了理由的显式不进**（与 `run_end` 重叠且无读者，对账测：`portal/test/event-surface-contract.test.js`）；**第 28 类 `host_steer_injected`（erix-agent 0.32.0 唯一新增的 LoopEvent，#499）同样显式不进**——本站不传 `capabilities.hooks.nextUserTurn` ⇒ 结构上不产生该事件，订得到（水位线推进）但不刷行、不回放、不下发（理由同 `run_outcome`，钉在同一份对账测的豁免表，只加前端 `EVENT_TYPES` 不写决定会被它的 S2 判红）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `tool_call_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。**#502 的补充**：三个碎片型自本单起**根本不落库**，「不下发」对它们是双重成立（表里没有 + 白名单不列）；`tool_call_delta` 是本单唯一**从白名单里摘掉**的类型（它以前在，摘它的理由是「行没了」，成形参数在 `tool_use.input`），摘除理由必须写——前端 `HISTORY_REPLAY_TYPES` 与它逐项对齐，由 `portal/test/event-surface-contract.test.js` 对账。**#425 的消费侧补充（零后端变更）**：白名单里的 `round_end` 载荷带 `usage`（本 run 累计真值），前端动量状态机**只**吃它的 `usage` 与 `context_window` 两个展示量（并把登记的 run 直接标成已结束），其余字段与所有其它历史帧仍一律不驱动运行态 ⇒ 硬刷新后「上次 run 用了多少 token / 窗口多大」仍在，而轮号、时长、速率、相位照旧不重建。**#243 的补充**：**第 29 类 `textualized_tool_call` 进白名单**（本站自造，终态事务内合成）——它说的正是「刷新后来看这次交付了什么」，不进就是「实时有、刷新后没了」，正是本白名单要消灭的那种可见性不一致。
 - **分页**（§1.3 keyset）：默认取最新 `limit` 条（升序返回，`limit` 默认 500、上限 2000）；`before=<seq>` 取更早一批；`next_cursor` 非 null 表示还有更早批次。
+  - **线上只有一个游标字段**：`next_cursor`。后端内部那个 `hasOlder`（主窗口多取一行算出来的）**不上线**；
+    `has_old_events` / `hasOldEvents` 这个名字在**代码里一处都没有**（现查 2026-11-16：
+    `grep -rn "has_old_events\|hasOldEvents" portal/src portal/frontend/src runner` ⇒ **0 处**；本节与台账
+    里出现该词只是**在说它不存在**）⇒ 客户端要续页只能靠 `next_cursor`，没有第三个字段可猜
+    （issue #514 返修时现验，别照着「大概有个 has_old_events」的记忆改客户端）。
+  - **`next_cursor` 的三种来源**（issue #514 返修，二次审计第 1 条；实现在 `http.js#handleSessionEventsHistory`）：
+
+    | 本页状态 | 游标取自 | 为什么 |
+    |---|---|---|
+    | 有白名单真实行（常规页） | 本页**最老那条真实事件**的 `seq`（且 `hasOlder` 为真） | 页的所有权属于真实事件：把游标压到页界之外会**跳过真实事件**，比丢一条分隔条更坑 |
+    | **零白名单行**且候选发现被 `LIMIT` 截断（会话尾巴页） | 已发现的 `run_end` 行里**最小的 `seq`** | 「空页」不是到底，它意味着「游标之下还有内容，只是全不是白名单事件」；不给游标 ⇒ 被截掉的那批**永远没有页可达**。那种页的窗口是 **`[0, before)`**，不同 `before` 的两次请求在同一段尾巴上**重叠是游标分页的本性**，不消除——不重不漏由**游标严格递减 + 前端幂等键**保证（现读坐标与理由见 §4.4a-2） |
+    | 零白名单行且发现**没**被截断 | `null`（确实到底） | 发现查询按主窗口同一口径多取一行**探针**（`LIMIT limit + 1`）⇒ 「还有没有更老的」是事实而非「恰好返了 `limit` 条」的猜测，不许多跑一趟空页 |
+
+  - **客户端到底靠什么续页（2026-11-16 现读，别照记忆写）**：
+    | 字段 | 落在哪 | 语义 |
+    |---|---|---|
+    | `GET /api/sessions/:id` 的 `next_cursor` | `workbench.ts:1106` → `olderMessagesCursor`（声明在 `343`） | 决定「**还要不要继续翻页**」：`loadOlderMessages()` 的入口闸是它（`1129-1130` 的 `if (!sid \|\| cursor == null \|\| olderLoading) return false`），「加载更早消息」按钮的 `v-if` 也是它（`StreamPanel.vue:441`） |
+    | 本端点的 `next_cursor` | `workbench.ts:1107` → `olderEventsCursor`（声明在 `344`） | 决定「**更早的事件页从哪里开始**」：`1137-1140` 用它拼 `?before=`，`1145` 再被本次响应覆盖 |
+
+    ⇒ 两个游标**任一为 null 都会让事件翻页停住**，而本单改的是**后者**（服务端在尾巴页给出可续的 `next_cursor`）。
+    前者不由本端点决定，所以「只改游标而让续页条件落空 = 没修」这条审计红线要单独成立：现查 `sessions.js:607-612`
+    —— `POST /api/sessions/:id/messages` 每次输入都先写一行 `messages`（`role='user'` 锚点行）再入队 run ⇒
+    「连点取消 / 批量清队列」那段尾巴上**每条 run 都配一行 user 消息**，消息游标在那一段仍非 null ⇒
+    客户端会继续翻页 ⇒ 本单补的事件游标真的会被消费。**登记的边界**：若一段尾巴连 user 锚点都没有
+    （纯宿主注入之类，本站现无此路径），消息游标会先归 null，事件侧游标再好也不会被消费——那是前端
+    续页闸的面（要改就得让 `loadOlderMessages` 允许「只有事件游标」也继续），本单不动，写在这里。
 - **大小防护**：payload 字符串叶值统一截 2000 字符（`tool_use.input` / `tool_call_delta.arguments_delta` 可能很大），JSON 形状保持合法。
 - **鉴权**：同 `GET /api/sessions/:id`（session cookie；非属主 / 不存在 → `404 not_found`，不泄露存在性）。
 
@@ -1348,7 +1376,7 @@ station-portal user enable  --login <login>
 
 | # | 条件 | 为什么 |
 |---|---|---|
-| 1 | 该 run 出现在**本次响应窗口**里（窗口行的 `run_id` 去重） | 窗口里没这个 run ⇒ 连候选判定查询都不发 |
+| 1 | 该 run 是**本页的候选**：窗口白名单行里出现过它的 `run_id`，**或**本页 seq 窗口内有它的 `run_end` 行（issue #514：「`queued` 从未开始就被取消」的 run 只写一行 `run_end`，在白名单行里零影子 ⇒ 旧判据下它既拿不到正文项也拿不到占位项） | 两路都没命中 ⇒ 连候选判定查询都不发（零候选零额外查询，成本红线不变） |
 | 2 | `runs.status IN ('finished','failed')` **且**该 run **零助手锚点**（`messages` 里 `role='assistant'` 的任意行，**含 `synthetic = true`**） | `queued`/`running`/`cancelling` 不是终态——「还在跑就标已中止」是新造的误导；**有锚点的 run 绝不能再渲染一遍**（重复正文就是这个坑，也正是 `partial_text` 只在**无锚点**时才写的原因，两处判据逐字同构） |
 | 3 | 两处来源拼出**非空**文本 ⇒ 正文项；**都空** ⇒ **占位项**（`text: ''` + `placeholder: true`） | 占位是 #278「不许留空白」的落点：这次 run 一个字都没留住时，界面仍要有一行中性提示，而不是空气泡。**注意占位只在这里发**，SSE 补发通路**不发**占位帧 |
 
@@ -1389,7 +1417,7 @@ station-portal user enable  --login <login>
   （走既有 `run_events_run_idx (run_id, seq)`）拿完两处来源。**零 DDL、零新索引**（形态 M 明确不新增
   也不删除任何索引，理由见 `docs/maintenance/task-ledger.md` §8.125）。
 - **分页（形态 M 修的第四条审计）**：合成项**只在它 `seq` 所属的那一页出现**——`before` 已经切过它的
-  `seq` 就不给（`buildHistorySynthItems(pool, rows, { before })`）。它 `seq = MAX(seq)` 不受窗口约束，
+  `seq` 就不给（`buildHistorySynthItems(pool, rows, { before, sessionId, pageLow, limit })`）。它 `seq = MAX(seq)` 不受窗口约束，
   不加这道闸就是「往上翻一页，同一段正文再重演一遍」。同一条闸同时管 `run_termination`（§4.4a-2），
   两类合成项共用。
 - **排序 / limit**：合成项参与升序排序（按 `seq`），但**不占 `limit`、不参与 `next_cursor` / `hasOlder` 判定**
@@ -1449,10 +1477,16 @@ station-portal user enable  --login <login>
 run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在本**只读**端点里从 `runs` 的终态字段
 （`status` + `termination`）**投影**一条展示项。
 
-**存在性判据（三条同时成立，一条 run 至多一条）**：① 该 run 出现在**本次响应窗口**里；
+**存在性判据（三条同时成立，一条 run 至多一条）**：① 该 run 是**本页的候选**——它出现在本次响应窗口的
+**白名单行**里，**或**本页 seq 窗口 `[本页最小 seq, before)` 内有它的 `run_end` 行（issue #514 补的：
+「`queued` 从未开始就被取消」的 run 只写一行 `run_end`，在白名单行里**零影子**）；
 ② `runs.status IN ('finished','failed')`（`queued`/`running`/`cancelling` 一律不合成——「还在跑就标已中止」
 是新造的误导）；③ `termination.reason` 是**非空字符串**（缺 `termination` / 脏载荷 ⇒ 不合成：**绝不拿
 `status` 编一个 reason**）。
+
+⚠ ① 的两路**都只用来发现 run id**：白名单行照旧下发，而 `run_end` 行照旧**永不下发**（红线）——
+把 `run_end` 塞进 `HISTORY_EVENT_TYPES` / 前端 `HISTORY_REPLAY_TYPES` 就是把一条运行态语义事件喂给
+回放（它会关停止按钮 / 驱动终态状态机，#217 / #236 定的红线）。
 
 | 字段 | 类型 | 口径 |
 |---|---|---|
@@ -1471,10 +1505,73 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 - **幂等**：前端用 `renderedIds` 的 `termination:<run_id>` 去重；实时 `run_end` 渲染后立即登记同一个
   id ⇒ 同一视图里「实时一条 + 历史一条」不会发生；硬刷新后 `renderedIds` 重建 ⇒ 历史项正常渲染。
 - **成本**：与 §4.4a-1 **共用同一条** `runs` 查询（`r.id = ANY(...)` + 终态过滤 + `MAX(seq)` 相关子查询，
-  走既有 `run_events_run_idx`）⇒ 本次窗口没有 run 时**一条查询都不发**，有 run 时**也只有那一条**（不重查）。
+  走既有 `run_events_run_idx`）⇒ 本次窗口没有 run **且页内没有 `run_end` 行**时一条 `runs` 查询都不发，
+  有候选时**也只有那一条**（不重查）。issue #514 新增一条**候选发现**查询（返修后取两列，并按主窗口
+  同一口径多取一行探针）：
+
+  ```sql
+  SELECT run_id, seq FROM run_events
+   WHERE session_id = $1 AND type = 'run_end' AND seq >= $2   -- 本页最小白名单 seq（空页 ⇒ 0）
+     [AND seq < $3]                                           -- before（游标之下才属于本页）
+   ORDER BY seq DESC LIMIT $4                                 -- $4 = limit + 1（多取一行探针）
+  ```
+
+  每次响应**至多一条**；非空页的窗口被 `[pageLow, before)` 夹住，空页是 `[0, before)` 那一段。
+  **准确的算术（二次审计 LOW-1 + 一次性真库自证，别再被读成「扫过的行数 = 1」）**：
+  - 未缓存时一次 history 响应最坏 **6 条查询** = handler 5 条（① 会话归属 `chat_sessions`、② 主窗口
+    `run_events`、③ 本条候选发现、④ `runs` 批量投影、⑤ `partial_output` 的正文投影）+ 会话鉴权 1 条。
+    #514 之前是 5 条，本单**多出的就是 ③ 这一条**；③ 的候选 id 并进 ④（不为它另打一条 `runs`）。
+  - `LIMIT` 封的是**返回条数**，不是**排序 / 过滤前的行数**。③ 在执行计划里有**两条访问路径**，
+    planner 按统计选（现查读数见下），两条都带残余过滤 `type = 'run_end'`：
+    | 路径 | 什么时候被选中 | 扫的量 |
+    |---|---|---|
+    | `run_events_session_id_seq_key`（`UNIQUE (session_id, seq)`）**反向扫** | `run_end` 相对 `limit` 较密、或页窗口很窄 | 本页窗口内的**事件行数**（取满 `LIMIT` 即停 ⇒ 扫描量 ≥ 返回条数） |
+    | `run_events_run_end_key`（部分唯一 `WHERE type='run_end'`）+ **Top-N 排序** | `run_end` 稀疏（部分索引命中面远小于会话总行数） | 全库/该会话的 **`run_end` 行数**（与主窗口的 seq 窗口**无关**），随后 `Sort Method: top-N heapsort` 取前 `limit + 1` |
+  - ⇒ 两侧各说对一半：**既有文档**那句「走 `UNIQUE (session_id, seq)` 倒序扫」只是其中一条路；审计
+    LOW-1 那句「`run_events_run_end_key` 在 `run_id` 上帮不上这条查询」也只是另一条——**它在稀疏时
+    恰恰是 planner 选中的那条**（它同时保证「每 run 至多一行 ⇒ 候选数有界」）。别把任一句当承诺。
+  - **真库读数**（2026-11-16，一次性容器 `postgres:16` / 16.15，形状照 `docs/data/schema.sql:355-372`
+    现建，**不是** dev 库、**不是** migrations 全量 ⇒ 它证明的是「计划长这样、这两条路真的会出现」，
+    不是「dev 库此刻就走这条」）：全库 255,005 行、目标会话 55,005 行、目标会话 `run_end` 4 条时，
+    `… AND seq >= 0 ORDER BY seq DESC LIMIT 3` ⇒ `Bitmap Index Scan on run_events_run_end_key`
+    + `top-N`（`Execution Time: 0.03 ms`）；把该会话 `run_end` 灌到 5,004 条、`LIMIT 501` ⇒
+    `Sort Method: top-N heapsort Memory: 95kB`、`rows=5004 → 501`、`Execution Time: 2.6 ms`；
+    同一时刻再跑 `LIMIT 3` ⇒ 计划**改走** `Index Scan Backward using run_events_session_id_seq_key`
+    + `Filter: (type = 'run_end')`。**结论与代码无关、只与文档有关**：这条查询的成本上界是
+    「该会话的 `run_end` 行数」或「页窗口内的事件行数」取较小者，两者都不受 `LIMIT` 约束。
+  - 把 ③ 并进 ② 的 `UNION ALL` 一条路（省掉这一条、并顺手消掉下面残余 ②）需要 fake 能解析 UNION，
+    本单不做，登记为后续单。
+- **尾巴页（游标之下零白名单行）的窗口与重叠**（#514 返修，二次审计第 3 条）：那种页的候选发现窗口是
+  **`[0, before)`**——不是某个「有界尾巴」。于是两次独立请求（`before` 分别取两个不同的值）在同一段尾巴上
+  **重叠是游标分页的本性**，本单不消除它；消除重复渲染的是**游标 + 前端幂等键**：
+  - 游标取**已发现行里最小的 `seq`**，下一页窗口是 `[0, 那个 seq)` ⇒ 与本页窗口**严格不重叠**，
+    且逐页严格递减 ⇒ 整条翻页链**不重不漏**（用例：三页翻完 6 条 `run_end`，合起来不多不少不重复）。
+  - 即便重叠真发生（客户端重试 / 同一 `before` 重放），前端也只画一根条：`addRunTermination` 的
+    **幂等键 = `termination:<run_id>`**（现读坐标 `portal/frontend/src/stores/workbench.ts:574-598`，
+    `id` 在 `579`、去重在 `581-583`；同一个键还被实时 `run_end` 渲染后经 `markRunTerminationRendered`
+    登记，见 `#600`）⇒ 同一视图里重复到达的同一 run 分隔条**当场被丢**，不会画两根。
+    `partial_output` 同理，键是 `partial:<run_id>`（同文件 `#addPartialOutput`）。
 - **已接受边界**：① 只覆盖「该 run 真落在本次响应窗口里」的那一页（同 §4.4a-1 的窗口口径）；
-  ② 合成项**不带 `usage`**（实时 `run_end` 的 `· tokens a+b` 后缀在历史里不重建——与 #282「刷新后运行态数字
+  候选发现的候选数上界 = `limit`（极端会话「一整页都是被取消的 run」时，一页最多带出 `limit` 条分隔条）；
+  ② **非空页**的截断残差（本单**认下来不动**）：当一页里既有白名单行、又有超过 `limit` 条 `run_end` 行时，
+  发现查询按 `limit` 截断，而比它更老的那几条落在 `[pageLow, minDiscoveredSeq)` 之间——下一页窗口是
+  `[0, pageLow)`，**接不住**它们 ⇒ 这几条分隔条在这一串页里露面不了。不为它挪游标：非空页的游标属于
+  白名单行，压到 `pageLow` 之下会**跳过真实事件**（用例钉着：`#514 返修：非空页的游标所有权…`）。
+  真要修就把发现并进主窗口查询（`UNION ALL` 一个只带 `run_id` 的分支），与上面成本段那条同一个后续单；
+  ③ 合成项**不带 `usage`**（实时 `run_end` 的 `· tokens a+b` 后缀在历史里不重建——与 #282「刷新后运行态数字
   拿不回来」同一口径，不拿历史值假装实时）。
+- **已接受边界 ④：第三种形状 —— 非空页里「没有更老的白名单行」⇒ 翻页链提前收敛**（**② 盖不住它**）。
+  机制（现读坐标，逐条对得上）：`http.js:2905` 取 `pageLow` = 本页最小白名单 seq；
+  `http.js:3035` 发现查询带 `AND seq >= $2`（`$2 = pageLow`）⇒ 比 `pageLow` **更老**的 `run_end` 不参与发现；
+  `http.js:2913` `whitelistCursor` 要 `hasOlder` 才给，而这一页之下**已无更老的白名单行** ⇒ null；
+  `http.js:2926` `tailCursor` 只在 `rows.length === 0 && truncated` 才给 ⇒ 非空页恒 null；
+  `http.js:2933` `next_cursor: whitelistCursor ?? tailCursor` ⇒ **游标就地变 null，尾巴页根本没被走到**。
+  与 ② 的区别（这条决定它是不是已知项）：这里发现行**远少于 `limit`**（复现里只有 1 条、`limit=1`，
+  **没发生截断**），断点纯由游标提前置 null 造成。
+  **主 agent 与第三方审计各自独立复现，都是行为红（不是形状闸）**；对照组（把 `run_end` 放到白名单行
+  之后）同一条游标循环是绿的 ⇒ 不是探针坏。判据与修法见 **issue #561**；本 PR **不修**——
+  修它要把发现并进主窗口查询（同上那条 `UNION ALL` 方向），且不许用「把游标压到 `pageLow` 之下」换绿
+  （那会跳过真实事件，用例 `#514 返修：非空页的游标所有权…` 钉着）。
 
 ```jsonc
 {
@@ -1504,6 +1601,75 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 | `source` | `rebuilt` = 按 `foldedRoundRange` 从同会话已有轮行重建；`archive` = 只拿得到那一行的归档（无 range 的存量行 / range 内无正文） |
 | `truncated` | 布尔位（**不塞省略号文本**，截断标记由前端出，先例同 §4.4a-1）。重建行数超 `FOLDED_REBUILD_MAX_ROWS = 2000`（与 U7 recall 同尺）**或**归档被上游夹断 ⇒ `true` |
 | `dropped_messages` | 上游夹断丢掉的条数（取 `record.foldedPayloadMeta.droppedMessages`）；无则 `0` |
+
+**`turns[].toolCalls[].resultPreview` 的配对口径（#387）**：重建路（`source:'rebuilt'`）在喂上游投影**之前**，
+先把本 range 内各行的 `tool_result` 按 `tool_use_id` 挂回带 `tool_use` 的那条记录（`portal/src/sessions.js#attachToolResultsToRecords`，
+**纯读侧**：不改 `rows`、不动账本、不改上游 `projectTranscriptForDisplay`）。于是 `toolCalls[]` 上的
+`resultPreview` / `isError` / `executionStatus` / `durationMs` **与主消息流同一个来源**（预览长度与截断规则全在上游，
+宿主不复制第二把尺，#95 红线）。为什么必须挂：0.23+ 账本一轮是多行（`:msg:<n>:0` = assistant 的 `tool_use`、
+`:msg:<n>:1..k` = 每个 `tool_result` 各一行、载体行 `messages` 为空），而上游的配对**只扫本条记录的 `messages`**
+⇒ 不挂就是真机读到的 `resultPreview` **0/98**（§8.62）。
+
+**配不上不伪造**：`tool_use_id` 在本 range 内查不到结果（结果行在折叠范围之外 / 只有 `tool_use` 没有 `id`）
+⇒ 上游**连 `resultPreview` 这个键都不写**（不是空串、不是 `null`）；前端据此「归一后为空就一行不画」。
+同一条记录内已结清的调用**就近取本记录那份**结果，不被别处的同 `tool_use_id` 改写（崩溃恢复后
+`:round:<n>` 与 `:round:<n>:resume` 双载体是真形状，§8.38 末）。**取行范围不因配对而放宽**：
+WHERE 仍是 `round BETWEEN from AND to`，范围外的结果行不会被搬进原文。
+
+**同一个 `tool_use_id` 在 range 内有多份结果 ⇒ 取「就近」，不取最后一条也不取第一条**（PR #541
+第三方审计 MED，§8.132）。`tool_use_id` 是 **provider 给的 id**，上游明写它**不保证在一个 run 内唯一**
+（`erix-agent/src/tool-fact.js:209-210`：「**跳轮不在这里继承**：provider id 不保证 run 内唯一（issue #284）」），
+所以「round A 用 `x` 得 A、round B 用 `x` 得 B」是合法形状。配对尺（PR #541 后）：
+
+1. 取该 `tool_use` **之后最近**的一条同 id 结果（正常形状：结果行紧贴自己的调用行）；
+2. 之后一条都没有 ⇒ 回退取**之前最近**的一条（resume 复放：`:round:<n>:resume` 行重发旧调用，结果落在前面）；
+3. 一条都没有 ⇒ 回到上面的「缺键不伪造」。
+
+位置是账本真实先后（`seq` 按「记录 → 消息 → 块」单调发号，记录顺序就是 SQL 的 `ORDER BY round ASC, append_seq ASC`）。
+⚠ **不是「取第一条」**：那只是把错的方向反过来（round B 会显示 A）——正确性来自**位置**而不是插入顺序。
+同 id 出现多份时**可观测**：`rebuildFoldedRange` 走 `log.warn` 打一条（条数 + 一个示例 id），
+**零新事件类型、零 DDL、零响应字段**（响应形状是契约，本端点不为此加键）。
+
+**响应体积的上界是「每条预览」，不是「每次响应」**（PR #541 LOW #2，只登记算术，本单不做响应级封顶）：
+上游 `truncated()` 的预览上界是 `MAX_RESULT_PREVIEW = 400` **UTF-16 代码单元** + 一个省略号 = 401
+（**订正**：本段先前写的是「码点」，错的——`truncated()` 用 `text.length` 判长、`text.slice(0, maxChars)` 截断，
+单位是**代码单元**；`projection.js:31` 定义三个上界 120 / 400 / 1200 走同一个 `truncated()`），而那是**单条**
+`resultPreview` 的尺。本端点只封顶**行数**（`FOLDED_REBUILD_MAX_ROWS = 2000`）而**不封顶每行的块数**，
+所以最坏算术是：`2000 行 × 每行 1 个结果块 × 401 个代码单元 ≈ 802,000 个 UTF-16 代码单元 ≈ 0.8 MB` 普通文本
+（**JSON 转义前**；一个结果的 `content` 是数组时每个带 `text` 的子块都会拼进同一句预览，所以「每行块数」
+真的是唯一没被封顶的那一项）。前端要画加载态/上限提示请按这条算，不要把 400 当成整个响应的上限。
+
+**已接受边界（PR #541 第三方复审后的两条残差 + 一条口径订正；本 PR 均不修，代码零改动）**
+
+- **边界可以切开代理对**（上游，**erix-agent#854**）。因为单位是代码单元而不是码点，
+  切点落在 emoji 上会留下**孤立高/低代理**。实测（本机等价口径，逐字可跑）：
+  `'a'.repeat(399) + '💥tail'` ⇒ `length=405`（单元）/ `404`（码点），`slice(0, 400)` 后末尾是
+  `"a\ud83d"`，`/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/` 命中 ⇒ **乱码风险是真的**。
+  宿主**不在 portal 侧二次修复**（那是把引擎的口径复制一份，必然漂）；**量级结论不变**，变的只是边界形状。
+- **`provider id` 被复用时预览会张冠李戴**（本仓，**issue #562**）：配对（`sessions.js#attachToolResultsToRecords`）
+  只看 `tool_use_id` + 位置，**既不比 `run_id` 也不比块上已有的 `erix.toolCallKey`**。主 agent 独立树的实测位置序
+  `call(OLD) < call(NEW) < res(NEW) < res(OLD)` ⇒ 两个调用的 `resultPreview` **都是新调用那份**
+  （`["RESULT-FOR-NEW-CALL","RESULT-FOR-NEW-CALL"]`），旧调用那份真结果界面上哪儿都没有。
+  缓解项**真实存在**：同 id 多份会 `log.warn`（文案现读为「`N 个 tool_use_id 在 range … 内有多份结果，已按「就近优先」取一条`」），
+  所以是 **MED 不是 BLOCKER**：显示错但有人知道。上游 `tool-fact.js` 明写 provider id 不能当跨轮调用身份
+  ⇒ 「同 id 两条调用」是**允许的语义**，不是脏数据。修法方向（先按键配、键缺席才退回就近）与判据在 #562。
+- **两路口径本来就不同**（口径订正）：实时卡片走 `tool_result.result_digest`（worker 侧截 500 个代码单元、
+  **无省略号**），刷新后的折叠原文行走 `resultPreview`（引擎截 400 **加**省略号 = 401）。主 agent 派单简报里
+  「两路文本逐字一致」那句**是错的**（第三方审计纠正的是简报，不是产品），产品行为如上，无需改。
+
+**已知形状风险（未造出生产者，PR #541 LOW #3，不改代码只登记）**：上游 `textOf()`
+（`display/projection.js:84-89`，消费点 `:365-368`）选块的条件是「`type === 'text'` **或** 块上有字符串
+`.text` / `.thinking`」——它**不看 `type` 白名单**，而块的 `type` 是可扩展的。于是一条同时带 `type:'tool_result'`
+与顶层 `.text` 的「结果块」会**既出预览又出一个可见 user 轮**（而重建路还会把它同时留在自己的行与挂给调用的
+那条合成行里 ⇒ 同一句话出两个气泡）。现查结论：**没有真实生产者**——上游唯一的构造入口
+`buildToolResultFact`（`src/tool-fact.js:292-312`）只写 `type`/`tool_use_id`/`content`/`is_error`/`erix`/`metadata`，
+而真库 `transcript_rounds` 里 **1423 个 `tool_result` 块中没有一条带顶层 `text`/`thinking`**（§8.132 读数）。
+⇒ 不改代码、不钉用例（钉一个假想形状等于把它写成契约）；**上游一旦开始往结果块上写 `text`，就要回来钉形状约束**。
+
+**响应体积与刷新频率**（运维读数，不是新契约）：本端点是「点一下才拉」的懒加载，单次代价上界 =
+选中行上限 2000 行 × 每行若干结果块 × 每块预览 ≤ 401 码点 ⇒ **最坏 ≈ 0.8 MB 普通文本（JSON 转义前）**；
+典型折叠段（几十轮、每轮 1–3 次调用）在十 KB 量级。同一个折叠段反复展开会反复重跑取行 + 配对 + 投影
+（前端未缓存），所以它只适合“展开时拉一次”，不要拿它做轮询源。
 
 **口径为什么要改**（#375，背后可见上游 erix-agent#461）：erix-agent 0.25.0 之前 `record.foldedPayload` 是每次折叠从 `from:1` 重发的**全量副本**，所以“只读那一行归档”意外地等于“全部原文”；0.25.0 把它改成**本轮新增的有界差分**（会话级内容去重 + 默认 256 KiB 夹断）⇒ 只读归档只能给出残缺，去重全吸收时甚至是空，而旧口径一律 `404 folded_payload_not_found`、前端文案「原文已不可用（上游未保留折叠前载荷）」——那是假话，原文一直在各自的轮行里。上游契约也已写明：宿主不得把截断/缺失读成数据丢失，`foldedRoundRange` + `navigationRecord` 才是有界指针。
 
@@ -2654,6 +2820,7 @@ Cookie: <会话 cookie>
 ① requireSession                    → 401 unauthorized
 ② session.user.fde_name 为空        → 400 fde_name_required（没工位 ⇒ 没有落点）
 ③ file_upload_enabled !== true      → 403 upload_disabled      ← 必须在读 body 之前
+③b 现取生效上限（`upload_settings` → env → 默认，§4.15）      ← 在 ③ **之后**（未授权的账号不花这次查询）
 ④ receiveUpload(...)                → jail/名字/目标检查 → 流式落 temp → 提交
 ```
 
@@ -2665,7 +2832,8 @@ Cookie: <会话 cookie>
    （`portal/test/http-upload.test.js`；⚠ 答复**之后** Node 会用 `_dump` 把没人读的 body 排空，
    所以累计计数必然 >0 —— 判据必须取答复前的快照，否则这条变异不死）。
 2. **流式落盘，不把 body 读进内存**。逐 chunk 写 temp（`fsutil.writeTempFileFromStream`）+ `fsync` +
-   超限时**主动 destroy 流**并删 temp。默认上限 `FILE_UPLOAD_MAX_BYTES=33554432`（32 MiB，`docs/env.md`）。
+   超限时**主动 destroy 流**并删 temp。上限**每次请求现取**，优先级 `upload_settings.max_file_bytes`（DB，管理台）
+   `>` FILE_UPLOAD_MAX_BYTES `>` 默认 33554432（32 MiB）——取数与回落口径见 §4.15，env 旋钮见 `docs/env.md` §10.1。
    反过来说：门户共用的 `MAX_BODY_BYTES`（64 KiB）**不适用**在这里 —— 那是 JSON 请求体的口径，
    拿它卡上传会把所有真实文件判成 413。
 3. **no-clobber 用 `link`，不用 `rename`**。`rename(2)` **总是替换**目标，所以「先 `lstat` 看存在、
@@ -2694,7 +2862,7 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
 | `403` | `upload_disabled` | 能力位不为 `true`（**未收 body**）|
 | `404` | `not_found` | `cwd`/`path` 指向的目录不存在 |
 | `409` | `file_exists` | 目标已存在且没带 `overwrite=1`（快速路径或提交点竞态，同一个码）；**或** `overwrite=1` 而目标在传输期间变成了目录（`details.reason='target_is_dir'`）|
-| `413` | `file_too_large` | 超过 `FILE_UPLOAD_MAX_BYTES`，`details = {max_bytes, bytes}` |
+| `413` | `file_too_large` | 超过**当前生效上限**，`details = {max_bytes, bytes, limit_source}`。⚠ `max_bytes` 是**生效值**（管理台改完它就是 DB 值，不是 env 值）；`limit_source` ∈ `db`/`env`/`default`，让值班直接知道该去改哪一边（#485 片 A，§4.15）|
 
 `path` 是**相对牢笼根**的路径（与 `GET /api/files/tree`、预览端点同口径），不是绝对路径。
 **任何失败路径都不留 `.tmp` 残骸**（超限、断流、提交失败都先 unlink temp）。
@@ -2711,9 +2879,115 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   「红是进度不是警报」）。不重判 = 灯在骗人。
 
 > 实现：`portal/src/http.js`（handler 与闸门）、`portal/src/dirs.js`（`receiveUpload`）、
-> `portal/src/fsutil.js`（`writeTempFileFromStream` / `commitTempFileNoClobber`）。
+> `portal/src/fsutil.js`（`writeTempFileFromStream` / `commitTempFileNoClobber`）、
+> `portal/src/upload-settings.js`（上限的取数优先级，#485 片 A）。
 > 单测：`portal/test/file-upload.test.js`（单元：jail/名字/属主/no-clobber/残骸）、
-> `portal/test/http-upload.test.js`（HTTP 级：零读取判据、线上 DTO、上限、断流、受限会话门）。
+> `portal/test/http-upload.test.js`（HTTP 级：零读取判据、线上 DTO、上限、断流、受限会话门）、
+> `portal/test/upload-settings.test.js`（#485 片 A：来源优先级与「改完立即生效」）。
+
+---
+
+### 4.15 管理台上传上限（`/api/admin/upload/settings`，issue #485 片 A）
+
+**一句话**：单文件上限从「启动期 env + 重建容器」变成「管理台一个数字，**下一次上传就生效**」。
+真相在 `upload_settings`（迁移 `0036`，单行表）；`FILE_UPLOAD_MAX_BYTES` 降级成兜底值（`docs/env.md` §10.1）。
+
+**为何不缓存**（与 §4.12 的 `mail_settings` 刻意不同）：登录是热路径，所以 `mail-provider` 带 60s TTL；
+上传不是。一次上传多一次单行主键 `SELECT`（按 `id = 1` 取一行）换掉「改完要等一分钟」——加缓存只是把
+「必须重启」换成「必须等 60s」，判据并没有被满足（因此写侧也不需要 `invalidate()`：没东西可失效）。
+⚠ 这条论证**不带毫秒数**：本仓没量过这条查询的耗时，写死数字就是一句代码证明不了的声称（来龙去脉见台账
+`docs/maintenance/task-ledger.md` §8.136）。取舍也不依赖它——要判断的是「一次额外的单行查询」换「下一次上传就
+生效」值不值，不是「几毫秒够不够快」。日后真要为它做容量测算，先测（同一条上传路径、真 PG、报上现场条件）再谈缓存。
+
+#### 4.15-1 `GET /api/admin/upload/settings`
+
+`200`（**表不存在 / DB 读失败也是 200** —— 配置面坏了不该让管理台这一页白屏）：
+
+```json
+{
+  "maxFileBytes": 33554432,
+  "source": "db",
+  "reason": null,
+  "dbMaxFileBytes": 33554432,
+  "envMaxFileBytes": 33554432,
+  "envIsExplicit": true,
+  "defaultMaxFileBytes": 33554432,
+  "limits": { "minBytes": 1048576, "maxBytes": 1073741824 },
+  "updatedAt": "2026-11-16T02:00:00.000Z",
+  "updatedBy": "<uuid 或 null>"
+}
+```
+
+| 字段 | 语义 |
+|---|---|
+| `maxFileBytes` | **当前生效值**（= 下一次上传用的那个数），不是「上次保存回显的那个数」|
+| `source` | 来源：`db` / `env` / `default` —— 「现在到底听谁的」不许靠猜，UI 必须显示 |
+| `reason` | `source ≠ db` 的原因：`null`（DB 生效）/ `no_row`（未配置）/ `invalid_db_value`（有行但值不可用）/ `read_failed`（表缺失或 DB 抛错）/ `read_timeout`（查询发出去但 `UPLOAD_SETTINGS_READ_TIMEOUT_MS` 内没回；行为与 `read_failed` 同：回落、不 500、不挡上传）|
+| `dbMaxFileBytes` | DB 里那个**可用**值（不可用 / 无行 ⇒ `null`）|
+| `envMaxFileBytes` / `envIsExplicit` | env 那一档的值，以及「env 里是否真的显式写了 `FILE_UPLOAD_MAX_BYTES`」（给了但非法 ⇒ `false`）|
+| `limits` | 写侧允许的区间（UI 可拿它做前置提示，但**服务端才是闸**）|
+
+#### 4.15-2 `PUT /api/admin/upload/settings`
+
+```
+PUT /api/admin/upload/settings
+Content-Type: application/json
+
+{"maxFileBytes": 1048576}
+```
+
+| HTTP | 体 | 何时 |
+|---|---|---|
+| `200` | 同上 DTO（来自 `RETURNING` ⇒ `maxFileBytes` 就是落库后的生效值）| 保存成功 |
+| `400` | `validation_failed` + `details={field:'maxFileBytes', min_bytes, max_bytes}` | 不是 JSON number（`'1048576'`、`''`、`'1e7'` 全算）、非整数、越界、键缺席；`details.field='body'` = 体不是对象。**不落库** |
+| `403` | `forbidden` | 非管理员 |
+| `405` | `method_not_allowed` | `GET`/`PUT` 之外 |
+
+**只接受 JSON number**：HTML `number` input 清空给的是 `''`，而 `Number('') === 0` —— 不拦就是把「没填」
+存成一个 0 字节上限。区间内才落库，所「把上限设成一个根本用不到的数」会当场红，而不是静默落库。
+
+#### 4.15-3 优先级与回落（有意的分层，不是「漏了 CHECK」）
+
+| 位置 | 管什么 | 形态 |
+|---|---|---|
+| DB（迁移 `0036`）| 物理荒谬 | `CHECK (max_file_bytes > 0)` + `CHECK (id = 1)`（单行是 DB 事实）+ `bigint`（`int` 只到 2 GiB）|
+| JS 写侧（§4.15-2）| 产品区间 1 MiB–1 GiB | 400 `validation_failed`，**当场红** |
+| JS 读侧（§4.14 的 `POST /api/files/upload`）| 任何不可用的行 | **回落 env → 默认** + 一条点名 `upload_settings.max_file_bytes` 与 `FILE_UPLOAD_MAX_BYTES` 的 warn；**永不 500** |
+| JS 读侧的**超时**（复 audit 活一）| 「查询发出去而**不返回**」 | `catch` 抓不到这种情况（不抛错就永远进不了 catch），所以读取外面套 `UPLOAD_SETTINGS_READ_TIMEOUT_MS`（默认 1500ms）：到点 = 读不到 ⇒ 同上回落、`reason=read_timeout`、**只留 debug 不刷 warn**、**上传照常**。没有这一层，「读侧永不抛」是假的——一次卡住的 DB 会把每次上传挂住 |
+
+两个细节值得单独记：
+- **产品区间故意没写进 DB CHECK**。否则「手工把 `max_file_bytes` 改成一个非法值 ⇒ 上传回落而不是 500」
+  这条判据在真机上根本进不去（`UPDATE` 会被 CHECK 拒），只剩单测能测；而且日后改天花板就从
+  「改一个常量」变成「追加一次 DDL」。闸的静态锺点见 `portal/test/migrations.test.js` 的 0035 那一段。
+- **`bigint` 在 node-pg 里回的是字符串**（int8 不自动转 number），所以读侧统一 `::text` + 只认 `/^[0-9]+$/`
+  且必须落在区间内。这里**不许** `Number()` / `parseInt()` 吞下去：`parseInt('1e4') === 1`。
+  于是 `'1e7'` / `' 100 '` / `'0'` / 超安全整数 / 区间外 ⇒ 全部回落（带 warn）；而 JSON number `1e7`（= 10000000）
+  在写侧是合法的（它精确可表示）。这是有意的：**写侧严、读侧呧但从不猜**。
+
+#### 4.15-4 运维口径
+
+- 改完**不需要**重启 portal、不需要重建镜像、不需要动 `runner/` 与 FDE 容器。判据是「同一个进程内，
+  保存后下一次上传就按新值走」（`portal/test/upload-settings.test.js` 的 US-8），不是「重启后正确」。
+- `deploy/docker-compose.yml` 那行 `FILE_UPLOAD_MAX_BYTES: ${FILE_UPLOAD_MAX_BYTES:-33554432}` **仍然要留**
+  （portal 服务没有 `env_file`）。但它的角色变了：它设的是**兜底值**，不再是「改了就生效」的旋钮。
+- 审计：每次保存写一条 `admin.upload_settings_updated`（`target='upload_settings'`，
+  `details={max_file_bytes, previous_max_bytes, previous_source}`）—— 只记新值看不出「谁把谁改下来的」。
+- ⚠ **审计与保存在同一条 SQL 语句里**（复 audit 活二，`upload-settings.js` 的 `SAVE_SQL`：一条带 CTE 的
+  `WITH prev … upd … aud …`）。旧实现是「`SELECT` 旧值 → `UPSERT` → `await auth.audit()`」三个 await：
+  并发保存时两条都先读到同一个旧值 ⇒ `previous_*` 记的是**自己进来之前**的数（审计就白记了）；
+  审计 `INSERT` 失败 ⇒ **设置已生效而审计一行没有**。一条语句把两个窗口一起收掉：语句级原子
+  （审计写不进去 ⇒ 设置也没改），旧值取的是本语句快照并带 `FOR UPDATE` 行锁。调用方**不得**再补一笔
+  `auth.audit`（会退回两个窗口并多写一条）。判据：`upload-settings.test.js` US-18/19/20/21。
+- 「DB 旧值是否可用」的判定在 SQL 里只做**区间比较**，两个边界由 JS 常量当**参数**送进去（`$5/$6`）⇒
+  区间常量仍然只有 `MIN/MAX_MAX_FILE_BYTES` 一处；SQL 那份 CASE 与 JS `parseDbMaxFileBytes` 的等价性
+  由 US-20 逐值钉住（不是靠注释声明）。
+- 上限仍是**单文件**，不是总量。**片 B（每 FDE 目录总量上限）不在本节**：那是 ext4 project quota，
+  判据是「容器里 `dd` 也要失败」。上传前 `du` 一遍目录当闸门是**假闸门**（拦住人、放过 agent），本单明确没做。
+
+> 实现：`portal/src/upload-settings.js`（读侧 + 写侧 + 优先级 + 读超时 + 保存与审计的同一条 CTE）、`portal/src/http.js`（两个端点、
+> 上传端点的现读接入）、`portal/src/config.js`（`fileUploadMaxBytesSource`）、
+> `deploy/migrations/0036-upload-settings.sql`。
+> 单测：`portal/test/upload-settings.test.js`、`portal/test/migrations.test.js`（0036 那一段）。
 
 ---
 
@@ -2790,20 +3064,46 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   > **单副本前提（形态 M 明确接受的限制）**：累加器与 SSE hub 都是 **per-process** 的 ⇒ 本节的补发能力
   > 假设 portal 单副本部署。多副本时「断在另一个副本上」必然看不到那段正文（表现 = 少一段未定稿，
   > 不是脏数据），要跨副本补发得先把累加器换成共享存储（登记在 §8.125 的后续里）。
-  > **已接受损失（缓冲 LRU 逐掉活跃 run，issue #515；台账指针见 §8.126.4）—— 潜伏项**：
-  > 缓冲的条目上限 `maxEntries = 32`（`run-partial-buffer.js` 的 `PARTIAL_MAX_ENTRIES_DEFAULT`，32 × 64 KB ≈ 2 MB），
-  > `evictOne()` **优先逐已终态的 entry**（`markTerminal` 标过的那些）。但当**同时 >32 个活跃 run 且一条终态
-  > 条目都没得逐**时，它必须逐一个**仍在流**的 run（该 run 从此在缓冲里没槽）。后果链：被逐的 run 若终态时
-  > **零助手锚点** ⇒ `runEndPartialKeys` 读到空快照 ⇒ `run_end` 里**写不出 `partial_text`** ⇒ **那半轮正文
-  > 永久丢**，已跑完的轮次仍在（`round_end.final_text`），两处都空则历史里只剩 §4.4a-1 判据 3 的**占位项**
-  > （表现 = 「那段没了」+ 一行中性提示，不是脏数据）。今天**踩不到**：单 portal 副本 + 实际并发远小于 32
-  > （认领 SQL 串行 + 会话租约 ⇒ 单进程同时跑的 run 是个位数）。可观测面只有一半：逐出活跃 run 会计
-  > `stats().evictedActive` 并打一条 `log.warn`（**不静默**），但 `stats()` **没被挂到任何对外端点上**
-  >（现查 `grep -rn metrics portal/src` = 0 命中，portal 今天没 `/metrics`）也没进事件流 ⇒ 只能翻日志对账。
-  > ⇒ **已在 issue #515 开单要求显式裁决**（三选一：① 把 `maxEntries` 与 portal 级
-  > active-run 硬上限绑定（结构上排除逐出）；② 逐出时发一条可观测信号（诊断事件 / 指标）；③ 显式接受并
-  > 把本段当成交付）。**本节不拿「单副本前提」这条兼任它的豁免**：那一条说的是「跨副本不可见」，
-  > 本条是「同副本内被自己的上限逐掉」，两个成因不同。
+  > **已接受损失（缓冲 LRU 逐掉活跃 run，issue #515；裁决 = ② 轻量版 + ③ 同做，261115-11 / 工单 fix-261115-11；台账 §8.133，原始取证 §8.126.4）—— 潜伏项，现已显式接受**：
+  > 缓冲的条目上限 `maxEntries = 32`（`run-partial-buffer.js` 的 `PARTIAL_MAX_ENTRIES_DEFAULT`）。
+  > ⚠ **N=32 的来源要说准：它是内存槽上限，不是并发上限，也不是任何「平台允许同时跑几个 run」的声明**——
+  > 单 entry 两路（`text` / `reasoning`）**各自**夹到 `textCap` 16,384 字符 ≈ 64 KB ⇒ 全表 32 × 64 KB ≈ 2 MB；
+  > 取 32 而非 256 的理由是「**当前部署**下单 portal 进程同时跑的 run 是个位数 ⇒ 十倍余量，多出来是常驻浪费」（**不是**代码上限，见下一条）（算术在
+  > `run-partial-buffer.js` 文件头）。它**不与 portal 级 active-run 上限绑定**——那种上限今天不存在（见下面裁决 ①）。
+  > `evictOne()` **优先逐已终态的 entry**（`markTerminal` 标过的那些）；只有当**同时 >32 个活跃 run 且一条终态
+  > 条目都没得逐**时，它才必须逐一个**仍在流**的 run。
+  > **后果有两种形态（工单 #515 原文只写了第一种；第二种是 261115-11 复现时实测补的，比第一种更坑）**：
+  >   · **形态 ①：逐出后该 run 不再吐字** ⇒ 槽位不重建 ⇒ `runEndPartialKeys` 读到空快照 ⇒ `run_end` 里
+  >     **不加 `partial_text` 键** ⇒ 那半轮正文永久丢。已跑完的轮次仍在（`round_end.final_text`），两处都空
+  >     则历史里只剩 §4.4a-1 判据 3 的**占位项**（表现 = 「那段没了」+ 一行中性提示，不是脏数据）。
+  >   · **形态 ②：逐出后该 run 继续吐字** ⇒ 后续碎片把它**重建成一个 blank entry** ⇒ 终态写出的
+  >     `partial_text` 是**一段从中间起笔的尾巴**（逐出之前那段永久丢，内存与库里都没有它，也没有 DB 回落），
+  >     而且**没有任何标记说明它是尾巴**：`partial_round` 掉到 `0`（轮号随 blank 一起没了）、`chunks` 从 0
+  >     重开、`textSegment` 回落到 0、`roundSeq` 掉到 `null`。⚠ 这比缺字段更坑：有 `partial_text` ⇒ 历史投影
+  >     **不出**占位项 ⇒ 用户看到的是一段「看着完整、其实从半句开始」的正文；而 `roundSeq: null` 会让本节
+  >     的补发判据（「run + `roundSeq` 两端都匹配才覆盖气泡」）**整帧丢弃** ⇒ 重连也补不回来。
+  >     **这条尾巴是独立的正确性问题，#515 不修**（主 agent 另开单跟）；今天由
+  >     `portal/test/healthz-partial-buffer.test.js` 里那条「钉**今天的真实行为**」的用例钉住 ⇒ 谁修它，谁就必须回来改本段口径。
+  > 今天**没踩到**，但要说准：**这是部署现状，不是代码保证**。逐出活跃 run 需要**同时 >32 个活跃 run**，而活跃并发 = Σ(每个 agentd 的 capacity)——缺省 **2/agentd**（`runner/agentd.js:15-17`，`ERIX_AGENTD_CAPACITY` 可调），portal 侧**没有**全局上限，认领是 `FOR UPDATE SKIP LOCKED` **逐行放行**（`portal/src/internal.js:257-280`，**不是全局串行**）。261116 现网读数：6 个 `fde-*` 容器 ⇒ 并发上界约 12；此刻库里 `status in ('running','queued')` 的 run = **0**（另有 1 条 `cancelling`）——**这是某一刻的快照，会随负载变**，别当常量引用。**FDE 数 × 2 越过 32（约 17 台）就会开始逐活跃 run**，那时 `evictedActive` 会跳（见下面的可观测面）。
+  > **可观测面（裁决的 ② 轻量版）**：逐出活跃 run 会计 `stats().evictedActive` 并打一条 `log.warn`（这两半
+  > 本单之前就有），本单补的是第三半：**`GET /healthz` / `/api/health` 的 200 响应多带一块
+  > `partialBuffer: { entries, maxEntries, evictedActive }`**（`portal/src/http.js#partialBufferHealth`）——
+  > 三个整数，**不放 run id、不放 sessionId、不放正文片段**（健康端点的响应会被人整段贴进工单与日志）。
+  > `status` 语义一字未动、**503 分支形状不变**、不新增端点与鉴权面；容器健康检查判的是**进程退出码**
+  >（`cli.js#healthcheck` 只看 `res.ok`，实测容器健康日志里的 Output 就是一行 `ok`，body 根本不进判据）
+  > ⇒ 往 200 里加字段对它结构性安全。portal 至今**没有** `/metrics`（现查 `grep -rn metrics portal/src` = 0 命中）
+  > ⇒ 这块读数是它唯一的对外数字；**没有做成事件**也是裁决的一部分：不新增宿主诊断事件（那要动 SSE 白名单 +
+  > 前端 + `event-surface-contract.test.js`），也**不**借用 `persistence_capability_degraded` —— 那个类型是
+  > **引擎发射**的（§5.3 第 20 类，`orchestrator.js`），portal 拿它说自己的事 = **谎报发射方**。
+  > **与 #502「明确接受的损失」的边界（两条不许互相豁免）**：#502 那条覆盖的是「**portal 重启 ∧ 无终态正文**」
+  >（进程没了 ⇒ 内存全清）；本条是「**同副本内、被自己的上限逐掉**」。同理，上面那条**「单副本前提」也不兼任
+  > 本条的豁免**：那条说「跨副本不可见」，本条说「同副本内被逐」，两个成因不同。
+  > **裁决 ①（把缓冲容量与 portal 级 active-run 硬上限绑定 ⇒ 结构上排除逐出）本单不做**：portal 今天没有
+  > active-run 硬上限（认领是 `FOR UPDATE SKIP LOCKED` 一条条来，并发只受 runner 数量与会话租约约束），
+  > 现造一个的爆炸半径超出一个缓冲修复 ⇒ 留后续单，不在本单预支。⚠ 后续修它时注意两条实测：(a) `observe()`
+  > 与 `stage().commit()` 里的 `while (entries.size >= maxEntries) evictOne()` 在「一条都逐不掉」时是**死循环**
+  >（把 `evictOne` 改成「全是活跃就直接 return」的变异实测 `rc=124` 挂死，不是变绿）⇒ 不能只在那里 `return`；
+  > (b) `maxEntries` 目前**没接 config / env**，只活在构造参数的默认值里。
   > **实现注记（issue #25 裁决）**：「无空洞」只对 **`messages ∪ run_events` 联合序列**成立（两表共用 `chat_sessions.last_seq` 分配器，schema.sql §3）；SSE 只推 `run_events`，故**事件流单独看存在合法空洞**（user 消息、assistant 回写各占一个 seq）。因此客户端**不得**以「seq 跳号」作为重连触发条件（会把合法空洞误判为丢事件，重放后仍跳号 → 无限重连风暴，实测复现）。丢失恢复路径：① 服务端 `resync` 控制帧（缓冲溢出，见下）；② 浏览器 `EventSource` 自动重连天然携带 `Last-Event-ID`（§5.2 补发 `seq > lastEventId`）。前端仅在收到 `resync` 时主动 `close()` + 以 `?last_event_id=<本地已知最大 seq>` 重连。
   > ⚠ **时间边界（261114-04 审计补）**：上面那句「无空洞只对联合序列成立」**写于 #25，已被 #502 推翻**——
   > 重复投递先烧 `seq` 再被 `ON CONFLICT DO NOTHING` 丢掉 ⇒ 那一号两张表都不落行，**联合序列也不保证无洞**
@@ -2900,6 +3200,7 @@ data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id"
 | 26 | `continuity_injection_skipped` | **引擎 `onEvent`**（erix-agent 0.29.0 引入；发射点 `orchestrator.js:3419`）。⚠ 0.29.0 时它「经 `onEvent` 真发但不在 `LoopEvent` 联合类型里」（上游漏登记）；**0.30.0 起上游把 `continuity_injection_skipped` / `continuity_written` / `continuity_write_failed` 三条全补进了联合类型**，那条「联合外真发」的豁免理由**已失效** | `round: number`、`reason: string`（如 `pending_tool_use`）、`detail: string`。语义：本轮**没有注入**续接块。**本站显式豁免、不刷行也不回放**：本站在 `config.continuity` 与 `capabilities.hooks.continuityProvider` 上**都不传**（`handoff` 默认 `off`）⇒ 引擎连注入分支都进不去，本事件在本站结构上不可能出现。同一族里 `continuity_written` / `continuity_write_failed`（写者那一半）0.30.0 起**订得到**（联合类型要求），但同样**豁免**（handoff=off ⇒ 引擎不写不发；`write_failed` 另有一条 runner `warn` LOG）。 |
 | 27 | `user_turn_guard_unrecoverable` | **引擎 `onEvent`**（erix-agent 0.30.0 的 `LoopEvent` 联合类型新增 8 类之一；发射点 `orchestrator.js:2716`） | `round: number`、`channel: string`、`reason: string`、`detail: string`（首句是固定原文）、`runId?`、`parentRunId?`。语义：请求视图违反「必须有 user 轮」不变式、且**所有回补都失败** ⇒ 请求**原样发出**，上游多半以 400 拒掉它。它是在那次 400 **之前**发的，所以是唯一归因信号。界面：中性分隔行（`stream.event.userTurnGuardUnrecoverable`，`round`/`channel`/`reason` 缺 ⇒ `?`）；runner 另落一条 **`warn`** LOG。**0.30.0 的 8 个新类型里本站只把这一类放进时间线**：另外 5 个（`tool_output_aggregate` / `continuity_written` / `continuity_write_failed` / `final_guard_extend` / `context_unknown_option`）是**写明理由的豁免**（见 `portal/test/event-surface-contract.test.js` 的豁免表），`forced_final` 与 `continuity_injection_skipped` 早在册。 |
 | 28 | `host_steer_injected` | **引擎 `onEvent`**（erix-agent 0.32.0 的 `LoopEvent` 联合类型新增——0.32.0 **27 类 → 28 类，只多这一个、删 0**；发射点 `orchestrator.js:3300`，级别 `fact`） | `round: number`、`chars: number`（注入那条 user 轮的正文字符数，上游 #753 C1 钉了它）。语义：宿主经 `capabilities.hooks.nextUserTurn` 递进来的那句话**真的被注成了这条 user 轮**。**本站显式豁免、不刷行也不回放**：引擎只在钩子是个函数时才走到发射点（`orchestrator.js:3253` 早退），而本站**不传那个钩子**（现查 `grep -rn "hooks\s*:" portal runner | grep -v node_modules` = 0 命中）⇒ 结构上不产生该事件；即使开了，用户可见的反馈也已在 `queue_update`（§4.3a）与注入后的正文里，再加一行是同一件事说两遍。订得到（水位线推进、`hooks.onEvent` 观察面可见），但**不进 §4.4a 历史白名单也不进 `HISTORY_REPLAY_TYPES`**，同 `run_outcome` / `continuity_injection_skipped` 先例；决定与理由钉在 `portal/test/event-surface-contract.test.js` 的豁免表（只加前端 `EVENT_TYPES` 不写决定会被 S2 判红）。 |
+| 29 | `textualized_tool_call` | **本站自造**（issue #243：终局正文是一段**被文本化的工具调用** —— 模型把 tool call 吐进 content，引擎当最终文本收下 ⇒ run 正常 `finished`，但交付报告可能没生成）。来源不是容器：worker 只在命中时在 U2 载荷里 additive 带 `textualized_tool_call: true`（+ 命中的那条特征名），由 `internal.js` 的 `finishRun` 在**同一个终态事务内**合成事件行（U3 那条路走不通：它的写闸是「租约有效」，而收尾时租约随时被清 —— #220 现查取证；同 `attempt_killed` 的 reaper 分支） | `chars: number`（**本站从收到的 `final_text` 自己算**，不取容器报的数）、`marker?: string`（命中的那条特征，≤120 字符的外来串，只用来出文案片段；没给就没有这个键。**上界与 runner 侧同一个命名常量**（`TEXTUALIZED_MARKER_MAX_CHARS`，两侧不许各写一个裸数字）：超长的片段由 **runner/agentd 丢在源头**（布尔照传），本站这侧的 400 只是契约闸 —— 它开在**事务之前**，真 400 会把整条终态打回（终态不写、不重试），一个纯观测性的片段不该有那种权力） | **进 `HISTORY_EVENT_TYPES`（第 29 类）**：这条事件讲的恰恰是「用户刷新来看这次交付了什么」的那一刻，实时看得见、刷新后消失就是它自己的缺陷（上游 erix-agent #182 的教训原样搬过来）。界面是**中性提示**，不是失败面 —— 红色面仍只由 `run_end` 负责（§2.5.1 第 3 条）；**不改 `termination.reason`、不改终态载荷任何既有字段**。判据：`runner/test/final-text-toolcall.test.js`（识别 + 特征集可配置 + 真样本）、`portal/test/textualized-toolcall.test.js`（事件落库 / 排序 / 幂等 / 校验 / 三处集合对账）、`portal/test/session-events-history.test.js`（**刷新后历史端点仍返回它**）、`portal/test/textualized-toolcall.test.js` 的 E3（**跨面行为**：拿 runner 真函数造的超长 marker 载荷过这道闸 ⇒ 终态照写）。**已知残余**：特征判据是逐字子串，正常交付若在代码块**外**裸写 `｜｜DSML｜｜` 这类标记会误报一条中性提示（代价是一条提示，不是把 run 判成失败；写进行内代码/围栏里不会误报） |
 
 > 说明与边界：
 > - **第 18~27 类是 issue #421 / #438 / #442 补接的「引擎承诺、宿主订不到」那一族**（#421 = 2026-10-27，#438 切片 B = 2026-11-02，#442 = erix-agent 0.30.0 升级片）：erix-agent 对宿主承诺 **28 类事件**（`src/loop/orchestrator.js` 里 `LoopEvent` 的 `@property` 联合类型；0.29.0 是 19 类，0.30.0 涨到 27 类，**0.32.0（#499）涨到 28 类——只多第 28 类 `host_steer_injected`，删 0**；**0.33.0（#530）仍是 28 类，新增 0 / 删除 0**（261115 在 0.32 与 0.33 两份 `npm pack` 解包上各取一次 `LoopEvent` 联合类型逐名对账：两侧各 28 个、`added: []` / `removed: []` ⇒ 本版**无新增事件类**，本站三处白名单与豁免表零改动，对账测当场跑绿）；**这份清单由 `portal/test/event-surface-contract.test.js` 从已安装引擎源码解析，不再手抄**），而本站三处白名单（前端 `EVENT_TYPES` / 前端 `HISTORY_REPLAY_TYPES` / 本文件 §4.4a 与 `http.js` 的 `HISTORY_EVENT_TYPES`）此前只认 11 类。写入侧不过白名单（`internal.js` 直接 `INSERT`）⇒ 这 5 类**每轮都在往 `run_events` 里写，而浏览器一条都收不到**（#371-A 同形状：库里存着、读不出来）。对账测：`portal/test/event-surface-contract.test.js`（从**已安装引擎源码**解析联合类型，上游改联合类型、本站删监听、豁免没写理由、联合外真发的事件没决定都会红）+ `portal/frontend/src/composables/engineEventSurface.spec.ts`（行为面：订得到 / 能回放 / 文案不编数据）+ `runner/test/engine-notices.test.js`（LOG 那一半）。**新增一类时三处必须同步，且 `run_outcome` 那种「订到但不展示」的决定必须写进豁免表。**

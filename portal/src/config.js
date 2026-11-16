@@ -19,6 +19,19 @@ function nonNegativeIntEnv(env, key, fallback) {
   return Number.isSafeInteger(v) && v >= 0 ? v : fallback;
 }
 
+/**
+ * 「这个大小类 env 旋钮当前生效的值是从哪来的」（issue #485 片 A，只用于 `FILE_UPLOAD_MAX_BYTES`）。
+ * 返回 `'env'` 仅当：env 里**显式写了**这个键、非空串、且它能过 `intEnv` 的采纳条件（有限正数）。
+ * 否则 `'default'`。为什么不能只看「键在不在」：`intEnv` 对 `0` / `'abc'` 会回落 fallback，
+ * 那时告诉运维「现在是 env 的值」就是指着一个不生效的数。下面的谓词与 `intEnv` 逐字同形（两处必须同口径）。
+ */
+function envUploadSource(env, key) {
+  const raw = env[key];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return 'default';
+  const v = Number(raw);
+  return Number.isFinite(v) && v > 0 ? 'env' : 'default';
+}
+
 /** TCP 端口 env：正整且 ≤65535，否则回退 fallback 并 warn（一个错拼的端口不许把 portal 拦在启动外）。 */
 function portEnv(env, key, fallback) {
   const raw = env[key];
@@ -283,7 +296,14 @@ export function loadConfig(env = process.env) {
     // ⚠ 它是**单文件**上限、**不是并发上限**：32MiB × N 个并发上传不会进内存（流式），但会同时占磁盘写
     // 与带宽；真正的总量闸门是配额（#472 R6：本版不做，见 docs/env.md）。
     // ⚠ compose 的 portal service 用显式 environment 列表、**没有 env_file** ⇒ 运维改 .env 要这里也列一行才生效。
+    // issue #485 片 A：本值从「唯一真相」降级成**兜底值** —— 真相在 `upload_settings` 单行表（迁移 0035），
+    //   每次上传现读，优先级 `DB > env > 默认`（`portal/src/upload-settings.js`）。env 保留的意义是
+    //   「不碰数据库也能压住上限」的运维急停，以及 DB 读失败时不至于没有上限（不是没上限）。
     fileUploadMaxBytes: intEnv(env, 'FILE_UPLOAD_MAX_BYTES', 32 * 1024 * 1024),
+    // 上面那个值的**来源**（管理台要显示「当前生效值从哪来」）。判据是「env 里有没有显式写这个键」，
+    // 不是「它是否等于 fileUploadMaxBytes」：`FILE_UPLOAD_MAX_BYTES=0` 这种**给了但非法**的值会被
+    // `intEnv` 回落成默认值，此时来源必须报 `default`（报 `env` 就是在指着一个根本不生效的值）。
+    fileUploadMaxBytesSource: envUploadSource(env, 'FILE_UPLOAD_MAX_BYTES'),
     // issue #64 R1：run 终态产物（worktree bundle tar.gz）存储与上限。
     // 持久卷 bind mount（deploy-contract §2.2 ④）；上限默认 20MB，与 agentd 侧截断口径一致。
     artifactsRoot: env.ERIX_ARTIFACTS_ROOT || '/srv/erix/artifacts',

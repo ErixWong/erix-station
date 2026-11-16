@@ -64,11 +64,11 @@ function makeFakeClock() {
 
   /** 让循环跑到「停在某一拍的等待上」（假时钟不动，只放行微任务/宏任务）。 */
   async function arm() {
-    const startedAt = Date.now(); // 真实时间：假时钟的 now() 在这儿是不动的，量不出等了多久
-    while (!clock.pending && Date.now() - startedAt < ARM_BUDGET_MS) {
+    const startedAt = performance.now(); // 单调时钟（Date.now() 会被 NTP 回拨）；假时钟的 now() 在这儿不动，量不出等了多久
+    while (!clock.pending && performance.now() - startedAt < ARM_BUDGET_MS) {
       await new Promise((r) => setImmediate(r));
     }
-    const waitedMs = Date.now() - startedAt;
+    const waitedMs = Math.round(performance.now() - startedAt);
     assert.ok(clock.pending, `循环必须停在某一拍的 sleep 上（没停住 = 循环抛错或已经退了；已等 ${waitedMs}ms / 预算 ${ARM_BUDGET_MS}ms）`);
   }
 

@@ -587,6 +587,45 @@ describe('issue #189：折叠横幅渲染', () => {
     expect(tools[1].text(), 'isError 的工具行要标出失败').toContain('（失败）');
   });
 
+  // issue #387：#384 把「调了什么」画出来了，但「返回了什么」在重建路上从来没填过（真机 0/98）。
+  // 后端挂回 `tool_result` 后预览有值了 ⇒ 原文里要给出一行；**配不上时键缺席 ⇒ 一行也不许多画**。
+  it('#387 原文工具行带出「返回了什么」（resultPreview）；配不上的那条不造假行也不写 undefined', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? {
+        status: 200,
+        body: {
+          round: 8,
+          turns: [{
+            role: 'assistant',
+            text: '',
+            toolCalls: [
+              { name: 'readFile', argsSummary: 'path=total.txt', resultPreview: '1: 24' },
+              // 上游对配不上结果的调用是**缺键**（不是空串）：后端把这种形状原样透传
+              { name: 'searchText', argsSummary: 'pattern=needle' },
+              // #228 同一条形状红线：number 0 是「写了 0 字节」，不是「没结果」
+              { name: 'writeFile', argsSummary: 'path=a.txt', resultPreview: 0 as unknown as string },
+            ],
+          }],
+        },
+      }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+
+    const tools = wrapper.findAll('.folded-original-tool');
+    expect(tools).toHaveLength(3);
+    expect(tools[0].findAll('.folded-original-tool-result')).toHaveLength(1);
+    expect(tools[0].text(), '「返回了什么」要在原文里看得见（#387 的本体）').toContain('1: 24');
+    expect(tools[1].findAll('.folded-original-tool-result')).toHaveLength(0);
+    expect(tools[1].text(), '配不上就一行也不许多画（不得伪造空预览的行）').not.toContain('↳');
+    expect(tools[1].text(), '但「调了什么」那一半照旧要给').toContain('pattern=needle');
+    expect(tools[2].text(), 'number 0 不得被当「没结果」吞掉（#228 同尺）').toContain('0');
+    expect(wrapper.text()).not.toContain('undefined');
+  });
+
   it('原文 404 → 友好提示（非红错）', async () => {
     mockFoldedFetch(() => ({ status: 404, body: { error: { code: 'folded_payload_not_found', message: 'gone' } } }));
     const store = useWorkbenchStore();

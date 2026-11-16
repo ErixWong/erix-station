@@ -34,8 +34,11 @@ import {
 import { createStationDelegation, mergeUsage } from './lib/delegation.js';
 import { resolveRunModel, resolveModelMetadata } from './lib/llm-models.js';
 import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
-import { createJail, createStationFileTools } from './lib/file-tools.js';
+import { createJail, createStationFileTools, STATION_MASKED_PATHS, platformReadExceptions } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
+// issue #537（W4a 审查快照与隔离）：审查 run 只读工具装配（纯函数、只 import node: 内建，
+// 故 portal/test/macro-snapshot.test.js 能跨目录 import 同一份口径做反向自证二）。
+import { isReviewOnly, filterReviewExecutors, filterReviewSchemas } from './lib/review-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
 import { engineDiagnosticNotice, summarizerFailureNotice } from './lib/engine-notices.js';
@@ -43,6 +46,9 @@ import { assertCompactContext } from './lib/compact-knobs.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { buildFailureEnvelope, finalTextFallbackField } from './lib/termination.js';
+// issue #243：终局正文「被文本化的工具调用」识别（纯函数 + env 特征集，判据在
+// `runner/test/final-text-toolcall.test.js`）。**只加字段、不改终态语义**。
+import { textualizedToolCallField, toolCallMarkersFromEnv } from './lib/final-text-toolcall.js';
 // issue #451：AGENTS.md 链注入（采集器纯函数 + 可注入 fs，判据在 runner/test/agents-md.test.js）。
 import { collectAgentsMd, renderAgentsMdSection } from './lib/agents-md.js';
 
@@ -69,9 +75,11 @@ import { collectAgentsMd, renderAgentsMdSection } from './lib/agents-md.js';
 // `head -50/60/80` 截断（「收工即提交」在 53–54 行，`head -50` 正好切掉）⇒ 指针再硬也挡不住
 // 「下发了 ≠ 读了」。注入在 `startRun` 里做（`lib/agents-md.js`），本常量只负责**告知**这段内容从哪来
 // （不告知，模型会以为那是它自己读到的、也可能再 `cat` 一遍白烧轮次）。
-// ⚠ 前提单 **#259** 未落地前 `createJail({ root: cwd })` 的读边界只有项目根（无只读例外），
-//   所以指针必须保留「家目录用 shell 读」的口径（`~/.erix/ports.json` 仍要 `cat`；`~/AGENTS.md` 降级为
-//   「复核」手段——真机里模型用 `readFile` 读它会撞「被宿主边界拒绝」白烧一轮）。R-1 复测的 P0 判据
+// ⚠ 前提单 **#259 已落地**（261116）：`createJail` 现在带 `readExceptions: platformReadExceptions()`
+//   = 家目录只读例外（`~/AGENTS.md`、`~/.erix/`），**写边界不变**（仍 `writable: [cwd]`）。因此指针
+//   不再需要「家目录用 shell 读」的口径：`readFile ~/AGENTS.md` / `readFile ~/.erix/ports.json` 直接就读得到
+//   （issue 验收的另一半：提示词不得再教一个已经不存在的病，防漂移断言在 system-prompt.test.js）。
+//   R-1 复测的 P0 判据
 //   （transcript 里读 `~/AGENTS.md` 的调用数为 0 判失败）自 #451 起**反转**为「规则被遵守」
 //   （设计稿 §6.2 D1/D2）。防漂移断言：同文件里的「强制指针存在 / 八个具体规则词不得出现（allowedHosts
 //   · credentials · CORS · Set-Cookie · localStorage · Bearer，后三个是 #262 第 7 条带进来的；
@@ -87,14 +95,14 @@ const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，�
 - readFile：单次返回有 256KB 上限。被截断时尾部 marker 已经写好了下一步（offset=… 续读，或提高 max_bytes）——照 marker 给的参数继续即可，别自己猜行数，也别以为文件只有这么多。
 - tree：列目录结构，默认同样跳过 vendor 与点目录（要看得更全传 include_vendor=true / include_hidden=true）。根标签是 ./，它下面的条目都是相对名，可以直接当 path 传回去。
 - searchText / tree 的 name_pattern 之类名字过滤只匹配**文件名**，不跨越 / ，所以 "**/*.ts" 这种写法不生效，要写 "*.ts"。
-- 读文件回「错误：…被宿主边界拒绝：…」时，不要在原路径上反复重试：那是路径越出了项目目录，或是要读的文件被平台刻意遮蔽（密钥类）。真需要内容时用 shell 定点看那一个文件，别把整文件灌进回复。
+- 读文件回「错误：…被宿主边界拒绝：…」时，不要在原路径上反复重试：那条路径既不在项目目录之内、也不在平台开的只读例外清单（家目录的 \`~/AGENTS.md\` 与 \`~/.erix/\`）之内，或者它被平台刻意遮蔽（密钥类）。真需要内容时用 shell 定点看那一个文件，别把整文件灌进回复。
 
 预览域名与端口（段由平台分配，**清单是唯一真相**，不需要你自己发明）：
 - **平台约定已随本次 run 注入到本提示词末尾**（\`~/AGENTS.md\` 平台节 + 上级目录与项目根的 \`AGENTS.md\`，由宿主在 run 启动时读取）：工位约定与平台约束就在那里，本提示词**有意不复述**它的应用侧规则（抄一遍就是第二个会过期的真相源）。不必再 \`cat\` 它们；本 run 里改动这些文件**不会立刻生效**，下一次 run 启动时才重新读取。
 - 预览端口段由平台在本 FDE 开户时**分配**：从全局号池里发一整段连续端口（默认 10 个，管理员可改段）。这一段到底是哪几个号，**唯一真相是 \`~/.erix/ports.json\` 里的清单**（每条带对应的真实访问 \`url\`）——不要凭记忆、也不要假设是固定的某几个端口。
 - dev server 的端口**必须从清单里选**，并绑 \`0.0.0.0\`（绑 127.0.0.1 入口进不来）；对外访问直接用清单里那一条的 \`url\`。
 - 域名由平台按 \`<fde>-p-<端口>\` 生成（与入口路由同源）：**不要自造域名或端口**，也不要要求平台再加——清单里那段就是全部，不够用就在它们里复用。
-- \`~/.erix/ports.json\` 在家目录（项目目录之外），文件工具读不到它（会回「被宿主边界拒绝」），用 shell 读：\`cat ~/.erix/ports.json\`；要确认注入的约定文件是否被改过，也用 shell 复核：\`cat ~/AGENTS.md\`。
+- 家目录里那两个平台文件（\`~/.erix/ports.json\` 与 \`~/AGENTS.md\`）**直接用文件工具读**：\`readFile\` 传 \`~/.erix/ports.json\` 就是端口与预览 URL 的清单（它是动态清单，不随提示词注入）；要复核注入的约定文件是否被改过，同样 \`readFile\` 传 \`~/AGENTS.md\`。家目录是平台开的**只读例外**：读得到，但**写不进去**（只有项目目录之内可写，平台文件下一轮对账也会被覆盖回去）——不要试图去改它。
 
 交付规则：
 1. 交付物（代码/配置/文档）必须用 writeFile 写入工作目录的文件系统——磁盘上的文件才是交付物。
@@ -186,6 +194,11 @@ let abortController = null;
 let steerArmed = false;
 /** 本次 run 是否曾经装填过转向（`steerArmed` 会被消费清零，终态信封需要的是「曾经装过」这个事实）。 */
 let steeredThisRun = false;
+/**
+ * issue #243：本次 run 的终局形态识别配置（`{markers, invalid, disabled, warnings, source}`）。
+ * 与 `runId`/`attempt` 同族——**每 run 在 `startRun` 里重新解析**，不是模块级常量。
+ */
+let finalTextShapeConfig = { markers: [], invalid: [], disabled: false, warnings: [], source: 'default' };
 const pendingApproval = new Map();
 
 function makeEvent(type, payload) {
@@ -414,6 +427,13 @@ async function startRun(msg) {
   runStart = msg;
   runId = msg.run_id;
   attempt = Number(msg.attempt ?? 1);
+  // issue #243：终局形态识别的特征集，**每 run 解析一次**（同一个 worker 进程会被复用给下一个 run，
+  // 所以既不读全局缓存也不许在模块顶层解析一次就完事）。非法条目**不许静默**：`warnings[]` 里
+  // 每一条都点名「是哪个值 + 为什么」，这里逐条落 `warn` LOG（本模块自己不打日志：纯函数零 IO）。
+  finalTextShapeConfig = toolCallMarkersFromEnv(process.env);
+  for (const warning of finalTextShapeConfig.warnings) {
+    sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: warning });
+  }
   abortController = new AbortController();
   steeredThisRun = false;
   // #370：每个 run 自己一份标记。⚠ 必须在 `startRun` 里复位——同一个 worker 进程会被 agentd
@@ -547,9 +567,39 @@ async function startRun(msg) {
   //    + note 工作流工具（0.8.0 recall 退役，档案取回归 note_list→note_read；issue #46 起走
   //    0.10.0 装配工厂，notesDir 为 agentd 下行的 run 数据目录，logical-run 作用域跨 attempt 保留）；
   //    approvals 钩子 P2 留空）。
+  // issue #259：读边界 = 项目根 ∪ **平台侧只读例外**（`~/AGENTS.md`、`~/.erix/`）；
+  //   **写边界仍是 `writable: [cwd]` 一个**（红线：agent 改平台文件 = 下一轮对账覆盖回去，
+  //   用户以为改掉了 ⇒ 新的困惑源）。例外清单只放平台自己生成的文档，不含运行期事实。
   ensureGitRepo(cwd);
-  const jail = createJail({ root: cwd, writable: [cwd] });
-  const fileTools = createStationFileTools({ jail, cwd });
+  // issue #231：把 `maskedPaths` 首次接进生产链路。此前这两处调用**从未传过** maskedPaths（`grep -c maskedPaths
+  // runner/worker.js` = 0），而 `lib/file-tools.js` 里的遮蔽能力一直存在并有单测——能力在、装配没接，
+  // 于是「密钥遮蔽」在生产里等于没开（真机表现：模型 `readFile .env` 直接拿到数据库密码全文，进 transcript）。
+  // 名单单一真相 = `STATION_MASKED_PATHS`（只针对**项目目录以内**；家目录 `~/.ssh` 等在 jail 外，本就读不到）。
+  // ⚠ 不对称（不是漏了，是设计）：**只挡文件工具，不挡 shell**——`lib/shell-tools.js` 头注与不变式 1
+  //   把容器当信任边界，shell 有意越过文件牢笼 ⇒ `cat .env` 仍读得到。本遮蔽的定位是「防止敏感内容被
+  //   主动读进 transcript / 上下文」，**不是安全加固**。判据：runner/test/masked-paths.test.js（含那条
+  //   钉现状的 shell 用例，不许当 bug 修）；口径：docs/design/runner-integration.md §17.1。
+  // ⚠ **必须写成一行**（本文件唯一超过 100 字节的一行，理由是判据形状）：#259 的接线锁按
+  //   「整个 createJail 调用在同一行」的形状抓取（正则里带「不含换行」那一类），拆成多行会一个都抓不到
+  //   ⇒ 它会红（不是静默降级，但白费一次往返）。#231 与 #259 在**同一处**装配是硬要求：
+  //   少任何一个都是静默降级，两侧各有一把锁。锁的原文见 runner/test/system-prompt.test.js 的 #259 一节。
+  // issue #537（W4a 审查快照与隔离）：审查 run 开关（env RUN_REVIEW_ONLY=1）。worker 里**读一次**，
+  // 两处装配点（registry / baseToolSchemas）共用同一个常量。审查 run 只留只读三件套 ⇒ 隔离由
+  // 「无 shell / 无 write / 无 note」在**工具装配层**保证（见下 registry / baseToolSchemas）。
+  // ⚠ jail 的 `writable: [cwd]` **刻意不动**：#259 的锁（runner/test/system-prompt.test.js:315-319）
+  //   钉住「worker 只有一处 createJail 且该行字面含 `writable: [cwd]`」。审查 run 的 cwd 就是 worktree，
+  //   而只读装配不含 writeFile/edit/shell ⇒ 无任何工具能触发写 ⇒ `writable: [cwd]` 与 `[]` 对 agent
+  //   的**可观测写面相同（皆空）**。这是有意取舍（详见交付报告偏差说明）。
+  const reviewOnly = isReviewOnly();
+  const jail = createJail({ root: cwd, writable: [cwd], maskedPaths: STATION_MASKED_PATHS, readExceptions: platformReadExceptions() });
+  const fileTools = createStationFileTools({ jail, cwd, maskedPaths: STATION_MASKED_PATHS });
+  // 一次性 info 记账（与 #451 的 AGENTS.md 注入记账同形态，走现成 MSG.LOG、**不新增事件类型**）：
+  // 运维遇到「agent 说读不到 .env」时，这条能直接区分「遮蔽生效」与「jail 越界」。
+  sendIpc(process, {
+    type: MSG.LOG, run_id: runId, level: 'info',
+    msg: `maskedPaths active: ${STATION_MASKED_PATHS.length} entries [${STATION_MASKED_PATHS.join(', ')}]`
+      + ' (file tools only; shell bypasses the file jail by design — invariant 1)',
+  });
   // issue #46（选项 A）+ #392（B 片）：notesDir 由 agentd 下行。作用域已从 **logical-run**
   // 改为**会话**：下行的是 `<home>/sessions/<sessionId>/notes`，同一会话的每个 run 看到的是
   // **同一个** notes 目录 + 同一个 scopeRef ⇒ `note_list` 与引擎 run-state 小抄目录跨 run 可见。
@@ -610,9 +660,10 @@ async function startRun(msg) {
       }),
     },
   });
+  // issue #537 装配点①（registry）：审查 run 时只留只读三件套、**不给 shell**。
   const registry = createToolRegistry({
-    executors: { ...fileTools.executors, ...shellTools.executors },
-    schemas: [...fileTools.schemas, ...shellTools.schemas],
+    executors: reviewOnly ? filterReviewExecutors(fileTools.executors) : { ...fileTools.executors, ...shellTools.executors },
+    schemas: reviewOnly ? filterReviewSchemas(fileTools.schemas) : [...fileTools.schemas, ...shellTools.schemas],
   });
   // #363：平台技能 bundled 通道 = FDE 镜像内 /opt/erix/skills（COPY 进镜像，不可变随 digest pin）。
   // 不用 bind mount：fde-proxy 契约只放 rw + userSpace 内源，ro 平台目录要改安全面；而 loader
@@ -640,7 +691,10 @@ async function startRun(msg) {
     });
   }
   const skillToolNames = new Set(skillTools.tools.map((t) => t.name));
-  const baseToolSchemas = [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
+  // issue #537 装配点②（baseToolSchemas，送给模型的面）：**必须与装配点①同口径**——只改一处等于没改。
+  const baseToolSchemas = reviewOnly
+    ? filterReviewSchemas(fileTools.schemas)
+    : [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
   const noteToolNames = new Set(noteTools.schemas.map((s) => s.name));
   /** delegation 实例（开关关 ⇒ 恒 null；声明在 executeTool 之前，因为路由分支要读它）。 */
   let delegation = null;
@@ -660,12 +714,15 @@ async function startRun(msg) {
     if (delegation !== null && options?.name === 'delegate') {
       return delegation.execute(options.input, buildDelegateContext(options.context, runId));
     }
-    if (noteTools.executeTool && noteToolNames.has(options.name)) {
+    // issue #537：审查 run 不给 note（契约 ⑤）——baseToolSchemas 已不下发 note 名，但执行侧
+    // 也得挡；这层不该只靠「模型看不到」。
+    if (!reviewOnly && noteTools.executeTool && noteToolNames.has(options.name)) {
       return noteTools.executeTool(options);
     }
     // 技能工具：上游 executeTool(name, input) 位置参形态（契约见 loader 契约测试），与 notes 的
     // options 对象形态不同，故单独一段路由。
-    if (skillTools.executeTool && skillToolNames.has(options.name)) {
+    // issue #537：审查 run 不给技能（宁严勿宽：技能可自带写/执行能力，与只读承诺相逆）。
+    if (!reviewOnly && skillTools.executeTool && skillToolNames.has(options.name)) {
       return skillTools.executeTool(options.name, options.input);
     }
     // issue #211：abort signal 必须转交。引擎契约把 run 的 signal 放在 executeTool 的**顶层**
@@ -696,7 +753,13 @@ async function startRun(msg) {
   // `delegation_dir` 由 agentd 预建并 `runAsWorker` 改属主后下行（同 `notes_dir`）：agentd 跑 1001、
   // worker 跑 1002，1001 建的 755 目录 1002 写不进 ⇒ **不要**在这里自己拼 `process.env.HOME`。
   const delegateEnabled = isDelegateEnabled(process.env.ERIX_DELEGATE_ENABLED);
-  if (delegateEnabled) {
+  // issue #537：审查 run（reviewOnly）**不建 delegation**。子 run 的工具面是
+  // `[...fileTools.schemas, ...shellTools.schemas]`（见下 childTools），**不是从父 registry
+  // 过滤出来的** ⇒ 父的只读过滤（装配点①②）传不到子；而子 run 自带 shell（`bash -c` 无白名单）。
+  // ⇒ 审查 run 只要环境 `ERIX_DELEGATE_ENABLED=1`（FDE 全局开）就能
+  // `delegate("跑 shell 把 ~/projects/foo 读出来")` 让子 run 拿 shell 逃逸出 worktree。
+  // 关掉后 `delegation` 保持 null ⇒ executeTool 里 `delegation !== null` 那条 delegate 路由自然不通。
+  if (delegateEnabled && !reviewOnly) {
     const delegateMax = parseDelegateMax(process.env.ERIX_DELEGATE_MAX);
     const delegateRounds = parseDelegateChildRounds(process.env.ERIX_DELEGATE_CHILD_ROUNDS);
     const delegateTimeout = parseDelegateChildTimeoutMs(process.env.ERIX_DELEGATE_CHILD_TIMEOUT_MS);
@@ -1150,6 +1213,13 @@ async function startRun(msg) {
       // 是**引擎兜底文案**（「本次收尾未产出正文」），不是模型输出。**只在 true 时给这个键**
       // （缺席 = 不是兜底，绝不写 false）。`finalTextFallbackField` 是纯函数，判据在 termination.test.js。
       ...finalTextFallbackField(result),
+      // issue #243：终局正文看起来是**一段被文本化的工具调用**（模型把 tool call 吐进 content，
+      // 引擎当最终文本收下 ⇒ run 正常 finished，用户看到的「最终回复」是一堆标记）。additive 两键、
+      // **只在命中时给**（缺席 = 没命中，绝不写 false），且**不改 `termination` / `final_text` /
+      // `rounds` / `usage` 任何既有字段**：这不是失败，是「交付报告可能没生成」的提示。
+      // 落点：portal 在同一终态事务里合成 `textualized_tool_call` 事件（`internal.js#finishRun`），
+      // 进 `HISTORY_EVENT_TYPES` ⇒ 刷新后仍在（上游 erix-agent #182 的教训）。
+      ...textualizedToolCallField(result.finalText, finalTextShapeConfig.markers),
       title: '',   // 标题归 portal 生成，worker 恒发空串（#322）
     });
   } catch (err) {

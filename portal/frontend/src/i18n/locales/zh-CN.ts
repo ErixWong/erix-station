@@ -415,6 +415,11 @@ export const zhCN = {
       // （`termination.finalTextFallback === true`）。**中性、不进红色面**：它不是故障，
       // 是引擎在如实交代「这次收尾没产出正文」。缺这条的用户体验：正文区那段话看起来像模型写的。
       finalTextFallback: '（本次收尾未产出正文：以上为引擎兜底文案，非模型输出）',
+      // issue #243（第 3 步）：终局正文是一段**被文本化的工具调用**（模型把 tool call 吐进 content，
+      // 引擎当最终文本收下 ⇒ run 正常 finished，但交付报告没生成）。措辞是**状态词、不是警报**：
+      // 不许出现「⚠ / 失败 / 错误」，也不许渲染成红色（它落在中性 `.roundsep` 分隔行上）。
+      // `{dash}` 是命中的那条特征片段（`stream.event.dash`），**没给就是空串**——整句必须独立成立。
+      toolCallTextualized: '模型把工具调用写进了正文，这次调用没有真的执行{dash}',
       runEnd: 'run 结束：{reason}{usage}',
       runEndNormal: '正常完成',
       missedRunEnd: '连接中断期间该 run 已结束（详情见运行记录）',
@@ -726,6 +731,46 @@ export const zhCN = {
       mail: '邮件通道',
       tls: '证书',
       previewPool: '号池占用',
+      // issue #485 片 A：上传上限（views/AdminUploadView.vue，契约 docs/api/portal.md §4.15）。
+      // 放在证书之后、号池占用（只读运维快照）之前：它是一处**平台配置**。
+      upload: '上传上限',
+    },
+    // issue #485 片 A：单文件上传上限（`upload_settings` 单行表，迁移 0035）。
+    // 这一页的存在理由只有一条：改一个数字不该要重建容器。所以文案的重心在「当前生效值 + 来源」，
+    // 而不是「保存成功」——只报保存成功，运维仍然不知道现在到底听哪一边的。
+    upload: {
+      title: '单文件上传上限',
+      intro: '工作台「上传」能传进来的单个文件最大多少字节。这里改完**不需要重启 portal、不需要重建容器**：上限是每次上传现读的，所以下一次上传就按新值走。',
+      loading: '正在读取上传上限…',
+      notLoaded: '尚未加载上传上限（还没请求）。',
+      unknown: '未知',
+      statusEffective: '当前生效值',
+      statusSource: '来源',
+      statusUpdatedAt: '最后修改',
+      updatedAtNever: '从未修改（还没人在管理台存过这个值）',
+      updatedAtUnknown: '时间无法解析：{value}',
+      limits: '允许区间：{min} – {max}',
+      field: '新的上限（字节）',
+      fieldHint: '服务端才是闸：填了整数就照发（越界会报错并标红这个框），前端不提前拦。只接受整数，`1.5` / `1e7` 这种写法不算整数。',
+      draftIs: '你填的是：{value}',
+      draftNotInteger: '还不是一个整数（空、小数、科学计数法都算不是）——此时不会发请求。',
+      hintBelow: '这个值低于允许区间（{min} – {max}），保存会被服务端拒。',
+      hintAbove: '这个值高于允许区间（{min} – {max}），保存会被服务端拒。',
+      save: '保存',
+      reload: '重新读取',
+      saved: '已保存，**下一次上传起生效**（显示的数就是服务端落库后回读的那一个）。',
+      sourceDb: '管理台（DB 里的 upload_settings）',
+      sourceEnv: '环境变量 FILE_UPLOAD_MAX_BYTES',
+      sourceDefault: '内置默认（32 MiB）',
+      reasonNoRow: '管理台还没存过值，现在用的是环境变量（没设则是默认）。在这里存一个数就会覆盖它。',
+      reasonInvalid: 'DB 里那个值用不了（不在允许区间，或形状不对），已回落环境变量/默认值——所以下面那个数不是管理台里存的数。',
+      reasonReadFailed: '读不到 upload_settings（表缺失或数据库抖动），已回落环境变量/默认值；上传本身不受影响。',
+      reasonReadTimeout: '读 upload_settings 超时（数据库没在 UPLOAD_SETTINGS_READ_TIMEOUT_MS 内回答），已回落环境变量/默认值；上传本身不受影响。',
+      srcDb: 'DB 里的值（可用时）',
+      srcEnv: '环境变量那一档',
+      srcDefault: '内置默认',
+      envNotSet: '环境变量并未显式设置',
+      footnote: '这是**单文件**上限，不是磁盘总量上限（总量配额是 #485 片 B，未实现）。它与 MAX_BODY_BYTES（JSON 请求体口径，默认 64 KiB）是两个不同的旋钮：上传不走后者。',
     },
     // issue #449 管理台切片：邮件通道配置（views/AdminMailView.vue，契约 docs/api/portal.md §4.12）。
     // 本页是登录第二因素「邮箱验证码」的唯一开关；口令**只写不读**（服务端只回 hasPassword）。

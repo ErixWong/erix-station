@@ -382,12 +382,18 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `PORTAL_PUBLIC_BASE_URL` | portal 对外完整 URL（cookie 域 / 跳转生成用，portal 运行时） | 空 = 由 `PORTAL_HOST` 派生 |
 | `LLM_PUBLIC_BASE_URL` | LLM 网关对外完整 URL（`llm.<base>`，路由生成与占位 endpoint 用） | 空 = 由 `LLM_HOST` 派生 |
 | `SESSION_TTL_SECONDS` | portal 登录会话 TTL | `604800`（7 天） |
-| `FDE_IPAM_POOLS` | IPAM 池（逗号分隔 CIDR；proxy/portal 双侧校验；隔离 e2e 必须使用与宿主网络不重叠的专用池） | `10.200.0.0/16,10.201.0.0/16` |
+| `FDE_IPAM_POOLS` | **放行面**（不是分配器）：fde-proxy 允许的 `network create` subnet 池，逗号分隔 CIDR（compose 下发给 proxy 的 `IPAM_POOLS`）；隔离 e2e 必须使用与宿主网络不重叠的专用池。⚠ 与下面两个旋钮是**两个语义**：portal 实际从哪一段切 = `FDE_IPAM_POOL_*`，本变量只决定**哪些段被放行**；分配段必须整体落在本变量的放行面内，否则 `network create` 被 proxy 拒（reason 会同时点名两侧变量名）。 | `10.200.0.0/16,10.201.0.0/16` |
+| `FDE_IPAM_POOL_DEFAULT` / `FDE_IPAM_POOL_LARGE` | IPAM **分配段**（issue #270）：去 `FDE_` 前缀后下发给 portal 的 `IPAM_POOL_DEFAULT` / `IPAM_POOL_LARGE`（`portal/src/ipam.js#resolveIpamPools`），决定默认池 / 大 FDE 池从哪一段里切。取值：单个 CIDR，必须是规范网络地址（主机位全 0），且必须整体落在该池的 DDL 保留段内（`default ⇒ 10.200.0.0/16`、`large ⇒ 10.201.0.0/16`，`schema.sql` §9 的 CHECK）；非法值/脏段/切不出块的段 ⇒ **portal 启动即失败并点名是哪个键**（不等 provision 撞 23514）。**前缀长度不是旋钮**（恒 /29 与 /28，同一条 CHECK 钉的）。并行隔离栈：每栈取不同子段（例 `10.201.37.0/24`）并把它同时放进 `FDE_IPAM_POOLS`。 | `10.200.0.0/16` / `10.201.0.0/16`（逐字 = #270 之前的硬编码值，不设 ⇒ 行为零变化） |
 | `FDE_ALLOWED_USERS` | FDE 容器允许的 `uid:gid` 白名单（create 参数级校验，deploy-contract §5.1） | `1001:1000` |
 | `FDE_MEMORY_LIMIT_MAX` / `FDE_PIDS_LIMIT_MAX` | FDE 容器资源限额上限（`0` = 不限；透传 station-docker-proxy） | `0` / `0` |
 | `FDE_DEV_MODE` | 显式开发模式（F12/F14 松约束；生产必须 `0` 或 `NODE_ENV=production`） | 开发 `1` / 生产 `0` |
 | `FDE_DEV_USER` | 开发期容器 `--user`（whoami 镜像无双 UID 用户时兑底） | `1001:1000` |
-| `FILE_UPLOAD_MAX_BYTES` | **单个上传文件**的字节上限（#472 片 B，portal 侧 `config.fileUploadMaxBytes`，`deploy/docker-compose.yml` 的 portal env 注入）。⚠ 与 `MAX_BODY_BYTES`（64 KiB，JSON 请求体口径）**是两个不同的旋钮**：拿后者卡上传会把所有真实文件判成 413。超限 ⇒ `413 file_too_large` 且服务端主动断流、不留 `.tmp`（契约见 `docs/api/portal.md` §4.14） | `33554432`（32 MiB）|
+| `FILE_UPLOAD_MAX_BYTES` | **单个上传文件**的字节上限的**默认值 / 兜底值**（#472 片 B 引入，#485 片 A 降级）。⚠ **它不再是唯一真相**：真正生效的值按 **`upload_settings.max_file_bytes`（DB，管理台可改）> 本 env > 默认 32 MiB`** 取，且 `POST /api/files/upload` **每次请求现读**⇒ 管理台改完**立即生效，不重启容器**（`portal/src/upload-settings.js`，契约 `docs/api/portal.md` §4.15）。本 env 保留的意义是「不碰数据库也能压住上限」的运维急停，以及 DB 读失败/无行/值非法时的回落位（回落会留一条 warn，`413` 的 `details.limit_source` 会标 `env`/`default`）。⚠ 与 `MAX_BODY_BYTES`（64 KiB，JSON 请求体口径）**仍是两个不同的旋钮**：上传根本不走 `readJsonBody`，拿后者卡上传会把所有真实文件判成 413。超限 ⇒ `413 file_too_large` 且服务端主动断流、不留 `.tmp`（§4.14）| `33554432`（32 MiB）|
+| `UPLOAD_SETTINGS_READ_TIMEOUT_MS` | **读 `upload_settings` 那次查询的超时**（毫秒；#485 片 A 复 audit）。片 A 的取舍是「每次上传现读、不缓存」⇒ 一次「查询发出去而**不返回**」（连接挂住、服务端不答）就是把**每一次上传**挂住（前端逐文件上传 ⇒ N 个文件 N 次读取；#520 刚为降 DB 负载做了一整单）。到点按「读不到」处理：回落 `FILE_UPLOAD_MAX_BYTES`/默认、`413` 的 `details.limit_source` 标 `env`/`default`、DTO 的 `reason=read_timeout`、**上传照常不挡**（超时只留 debug，不刷 warn）。⚠ 它**不改**优先级 `DB > env > 默认`，只决定「等多久算读不到」；只接受正整数，非法形状 ⇒ 默认 + 一条 warn。判据 `portal/test/upload-settings.test.js` US-15/16/17 | `1500` |
+| `ONBOARDING_IDLE_BACKOFF_MAX_MS` / `OFFBOARDING_IDLE_BACKOFF_MAX_MS` | 开户/销号队列循环在**连续没活**时的退避上限（issue #520）：5000→10000→20000→… 到这里封顶，**一认领到活立即回 5000** ⇒ 只改空闲时的 DB 开销，不改有活时的节拍。只认严格正整数（`1e4`/负数 ⇒ warn + 回落缺省）。测量方法与基线见 `docs/ops/db-idle-load.md` | `30000` / `30000`（可配到共享上限 `60000`）|
+| `PROVISIONER_IDLE_BACKOFF_MAX_MS` | 对账循环的同类上限（#520，它是空闲写事务的头号来源）。⚠ **硬上限**：写超过 15000 会被**钳到 15000** 并 warn 点名旋钮（漂移发现延迟是业务承诺，实现：`portal/src/provisioner.js` 的 `resolveIdleBackoffMaxMs`，PR #552 审计 LOW-2）。配 `5000` = 回到 #520 之前的固定 5s 节拍 | `15000` |
+| ⚠ 上面三根能不能生效，取决于它们是否出现在 `deploy/docker-compose.yml` 的 `station-portal.environment` 里——portal 的 environment 是**显式列表、无 `env_file`**，只在本文件里写一行等于没写（#472 同型事故）。三腿一致性的机器判据：`portal/test/deploy-env-idle-backoff.test.js`。<br>⚠ **已知遗留**：#506 的 `ROUTE_IDLE_BACKOFF_MAX_MS` / `ROUTE_ORPHAN_RECOVERY_INTERVAL_MS` / `MATERIALIZE_IDLE_BACKOFF_MAX_MS` / `MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS` **至今未登记在 compose 里** ⇒ 在标准部署上同样配了无效（#520 没顺手改，跨单；见 §8.134） | — |
+
 
 ### 10.2 补登：agentd 容器侧环境变量（runner 运行时，2026-09-24 登记）
 

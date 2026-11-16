@@ -18,20 +18,27 @@ import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { LLM_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 // issue #226：护栏/DB 目录解析/端口探测/Traefik 静态配置生成的唯一一副本在 lib/isolated-env.mjs。
 import {
-  assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  assertHostPortsAvailable, applyStackIpamPoolEnv, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
   writeDynamicStub,
 } from './lib/isolated-env.mjs';
+// issue #495 ①（#412 遗留）：compose 的 `--env-file` 与「等宿主侧物化文件」的失败分类（唯一定义处 lib/e2e-preflight.mjs）。
+import { COMPOSE_ENV_FILE, assertComposeEnvFile, materializeSnapshot, toContainerPath, waitForHostFile } from './lib/e2e-preflight.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 // #227.2：compose 一律显式 -p，且用 bash 的 `${VAR:?msg}`——未 export 时展开即非零退出并点名，
 // 不再依赖「COMPOSE_PROJECT_NAME 环境变量压过 compose 文件 name: station」这条隐式优先级
 // （忘 export 曾经会让脚本自己对共享 dev 栈 down -v）。
 const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME required for isolated e2e}" --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
+// issue #495 ①：上面命令串固定带 --env-file deploy/.env，而它不入 git ⇒ git worktree / 新 clone 里
+// 必然缺。docker compose 要到**整轮镜像构建之后**才报 couldn't find env file（#412 部署机实测白烧 10.7 分钟），
+// 所以这条预检放在模块加载时——它先于本文件任何一次 docker/compose；文件在场时零输出。
+assertComposeEnvFile({ envFile: COMPOSE_ENV_FILE, cwd: REPO_ROOT, label: 'wp6-llm-e2e' });
 
-// #227.3：FDE_IPAM_POOLS 未显式传时按栈 id 派生本栈口径（派生段+portal large 池固定段；显式传入优先）。
-if (!process.env.FDE_IPAM_POOLS && process.env.STATION_STACK_ID) {
-  process.env.FDE_IPAM_POOLS = defaultFdeIpamPools(process.env.STATION_STACK_ID);
-}
+// #227.3 → #270：两腿**一次派生** —— 放行面 FDE_IPAM_POOLS（= proxy IPAM_POOLS）与 portal 的
+// 分配段 FDE_IPAM_POOL_LARGE（→ portal IPAM_POOL_LARGE）取同一个值，显式传入优先。旧口径
+// 「派生段 + 整个 large 保留段两段兜底」已删：那第二段就是「两套并行隔离栈都从同一池头分配」
+// 的撞车源头，而现在分配段本身可配（portal/src/ipam.js 的 IPAM_POOL_LARGE），不再需要额外放行一段。
+applyStackIpamPoolEnv(process.env);
 
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
@@ -127,8 +134,16 @@ async function restartPortalAndWaitForConfigs(fdeNames) {
     { label: 'portal healthz after materializer rebuild', timeoutMs: 120000, intervalMs: 500 });
   for (const fdeName of fdeNames) {
     const configPath = path.join(S.userspaceRoot, fdeName, 'home', '.erix', 'config.json');
-    await waitFor(() => (fs.existsSync(configPath) ? configPath : null),
-      { label: `${fdeName} config.json materialized`, timeoutMs: 60000, intervalMs: 250 });
+    // issue #495 ②：「读不到」与「没物化」分开报（旧写法 fs.existsSync 会把 EACCES 吞成「没物化」；
+    // 分类与文案见 lib/e2e-preflight.mjs，这里只要「在不在」，正文丢弃）。
+    await waitForHostFile(configPath, {
+      label: `${fdeName} config.json materialized`, timeoutMs: 60000, intervalMs: 250,
+      describe: () => materializeSnapshot({
+        docker,
+        container: STATION_PORTAL_NAME,
+        containerPath: toContainerPath(configPath, { hostRoot: S.userspaceRoot }),
+      }),
+    });
   }
 }
 

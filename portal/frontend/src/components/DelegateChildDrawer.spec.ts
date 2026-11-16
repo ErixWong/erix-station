@@ -285,8 +285,10 @@ describe('DelegateChildDrawer dialog 语义', () => {
     document.body.appendChild(trigger);
     trigger.focus();
 
-    // `close` 走父级回调而不是 `wrapper.emitted()`：本环境（vitest 5）对 script-setup 组件的
-    // emitted() 不记录，仓库先例（FilePreviewModal.spec / SessionPickerModal.spec）一律用回调。
+    // `close` 走父级回调而不是 test-utils 的 `emitted()`：后者靠 Vue 的 devtools hook 取事件，
+    // `NODE_ENV=production` 下不发 devtools 事件 ⇒ 恒空假红（AGENTS.md §4 / issue #496）。
+    // 仓库先例（FilePreviewModal.spec / SessionPickerModal.spec）一律用回调；
+    // 静态闸 H3（test/repo-hygiene.test.js）钉住了这条口径，别再写回带点的调用形状。
     const onClose = vi.fn();
     const wrapper = mountDrawer({ onClose }, true);
     await tick(0);
