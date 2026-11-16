@@ -579,7 +579,9 @@ export const en = {
       toggle: 'Show or hide the sub-task panel ({count} running)',
       hint: 'Refreshes every 2s; shows only sub-tasks dispatched by the current run',
       collapse: 'Collapse',
-      elapsed: 'running {dur}',
+      // 行里前面已经有一个状态词（`delegate.state.running` = "Running"），所以这里**不许**再说
+      // "running"（真机上渲染成 `Running running 20.0s`）；中文那份是 `已跑 {dur}`，无此问题。
+      elapsed: 'for {dur}',
       view: 'View',
       viewAria: 'View sub-task {id}',
       unreadable: 'Sub-task status is temporarily unavailable',
