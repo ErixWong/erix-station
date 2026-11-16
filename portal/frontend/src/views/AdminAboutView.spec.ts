@@ -46,6 +46,8 @@ const ABOUT = {
     builtAt: '2026-11-16T03:45:00Z', source: 'build-info',
   },
   platformEngine: { version: '0.900.1-platform-engine' },
+  // 服务端实际读的那条路径（复验要求可见；这里给的是镜像内的默认位置）。
+  buildInfoPath: '/app/build-info.json',
   fdes: [
     {
       name: 'eric', agentVersion: '0.910.7-fde-side', image: 'ghcr.io/erixwong/erix-station-fde@sha256:aaa',
@@ -227,6 +229,52 @@ describe('判据 C-5：不猜数 —— `unknown` 是「未知」，不是空串
     const { wrapper } = await openAbout((url) => (url.startsWith(VERSION_PATH) ? jsonResponse(200, noSnapshot) : undefined));
     const row = wrapper.get('[data-test="fde-item"]');
     expect(row.get('[data-test="fde-snapshot"]').text()).toContain(String(t('admin.about.snapshotUnknown')));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 复验阻断（第二轮）：来源标注**由服务端按实际来源推导**后下发，路径注入要可见。
+// 写死 `'build-info.json'` 的旧形状在「本 PR 之前构建的 portal 镜像」上就是说谎：那份镜像里
+// 根本没有 build-info.json，引擎号其实是从 node_modules/erix-agent/package.json 读的。
+describe('复验阻断：来源标注跟着实际来源走，build-info 路径可见', () => {
+  it('build-info 读不到（旧镜像形状）⇒ 引擎段说「不是镜像里的构建产物」，不许顶着 build-info 那句', async () => {
+    const oldImage = {
+      ...ABOUT,
+      server: { station: '0.666.0-old-station', revision: 'unknown', builtAt: 'unknown', source: 'package' },
+      platformEngine: { version: '0.777.0-old-engine' },
+      buildInfoPath: '/app/build-info.json',
+      provenance: { server: 'package.json', platformEngine: 'package.json', fdes: 'containers.agent_version', fdesSnapshot: 'provision' },
+    };
+    const { wrapper } = await openAbout((url) => (url.startsWith(VERSION_PATH) ? jsonResponse(200, oldImage) : undefined));
+    expect(wrapper.get('[data-test="engine-version"]').text()).toContain('0.777.0-old-engine');
+    const engineSource = wrapper.get('[data-test="engine-source"]').text();
+    expect(engineSource).toContain(String(t('admin.about.engineSourcePackage')));
+    // 来源标注必须点名真正的载体（光说「未知」等于没说）。
+    expect(engineSource).toContain('package.json');
+    // 不许把 package 兜底说成镜像里的构建产物（复验阻断的那句谎话）。
+    expect(engineSource).not.toContain(String(t('admin.about.engineSourceBuildInfo')));
+    expect(wrapper.get('[data-test="server-source"]').text()).toContain(String(t('admin.about.sourcePackage')));
+  });
+
+  it('build-info 读到时仍说 build-info.json（推导不是恒降级），且界面给出实际读取路径', async () => {
+    const { wrapper } = await openAbout((url) => (url.startsWith(VERSION_PATH) ? jsonResponse(200, ABOUT) : undefined));
+    expect(wrapper.get('[data-test="engine-source"]').text()).toContain(String(t('admin.about.engineSourceBuildInfo')));
+    // 路径被 STATION_BUILD_INFO_PATH / ERIX_BUILD_INFO_PATH 改过时，管理员要能看见是哪条。
+    expect(wrapper.get('[data-test="server-build-info-path"]').text()).toContain('/app/build-info.json');
+  });
+
+  it('服务端没说路径（老端点 / 桩）⇒ 路径格显示「未知」，不猜成 /app/build-info.json', async () => {
+    const noPath = { ...ABOUT };
+    delete (noPath as { buildInfoPath?: string }).buildInfoPath;
+    const { wrapper } = await openAbout((url) => (url.startsWith(VERSION_PATH) ? jsonResponse(200, noPath) : undefined));
+    expect(wrapper.get('[data-test="server-build-info-path"]').text().trim()).toBe(String(t('admin.about.unknown')));
+  });
+
+  it('归一化：`buildInfoPath` 的 `unknown` / 缺失收成 null（判据 2 同口径），snake_case 也认', () => {
+    expect(normalizeVersionInfo({ buildInfoPath: 'unknown' }).buildInfoPath).toBeNull();
+    expect(normalizeVersionInfo({ build_info_path: '/tmp/injected.json' }).buildInfoPath).toBe('/tmp/injected.json');
+    expect(normalizeVersionInfo({}).buildInfoPath).toBeNull();
+    expect(normalizeVersionInfo(ABOUT).provenance.platformEngine).toBe('build-info.json');
   });
 });
 

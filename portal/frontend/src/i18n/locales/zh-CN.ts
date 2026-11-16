@@ -1063,8 +1063,17 @@ export const zhCN = {
       sourcePackage: '来源：本地 package.json（源码态退路，不是镜像里的构建产物）',
       sourceUnknown: '来源：未知（build-info.json 与 package.json 都没读到）',
       sourceUnknownShape: '来源：服务端没给或给了不认识的形状（不猜）',
+      // 实际去读的 build-info 路径（`STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH` 能改它 ⇒ 必须可见）。
+      buildInfoPath: '读取路径：{path}',
       engineTitle: '平台侧引擎（portal 镜像内的 erix-agent）',
       engineHint: 'portal 进程自己用的那份引擎，不是每台 FDE 里跑的那份——那是下面第三格。',
+      // 引擎那格的来源标注：跟着服务端推导出的 provenance 走（前端不自己判）。
+      // `package.json` = 源码态退路 / 这份镜像里根本没烘 build-info.json（旧镜像）⇒ 不许顶着「构建产物」的标签。
+      engineSourceBuildInfo: '来源：镜像内 build-info.json 的 engine_version（构建产物，唯一权威）',
+      engineSourcePackage: '来源：本地 node_modules/erix-agent/package.json —— 源码态退路，或这份镜像里根本没有 build-info.json（旧镜像），不是镜像里的构建产物',
+      engineSourceEnv: '来源：环境变量覆盖（portal 侧本不该出现，出现就说明它不是镜像构建产物）',
+      engineSourceUnknown: '来源：未知（build-info.json 与 package.json 都没读到）',
+      engineSourceUnknownShape: '来源：服务端没给或给了不认识的形状（不猜）',
       fdesTitle: '每台 FDE 的引擎',
       fdesHint: '读的是 containers.agent_version —— 派生副本，不作准。',
       snapshotProvision: 'provision 时快照',

@@ -56,6 +56,26 @@ const sourceText = computed(() => {
   }
 });
 
+/**
+ * 平台侧引擎那格的来源（复验阻断）：文案跟着**服务端推导出的标注**走，前端一个字都不推。
+ * `package.json` = 源码态退路 / 旧镜像里根本没烘 build-info.json ⇒ 必须说出来，不许顶着「构建产物」的标签。
+ */
+const engineSourceText = computed(() => {
+  switch (info.value?.provenance.platformEngine) {
+    case 'build-info.json': return t('admin.about.engineSourceBuildInfo');
+    case 'package.json': return t('admin.about.engineSourcePackage');
+    case 'env': return t('admin.about.engineSourceEnv');
+    case 'unknown': return t('admin.about.engineSourceUnknown');
+    default: return t('admin.about.engineSourceUnknownShape');
+  }
+});
+
+/** 实际读取的 build-info 路径（路径被注入旋钮改过时，界面上要能看见是哪条）。 */
+const buildInfoPathText = computed(() => {
+  const at = info.value?.buildInfoPath ?? null;
+  return at === null ? t('admin.about.unknown') : t('admin.about.buildInfoPath', { path: at });
+});
+
 /** FDE 项的快照口径标注（判据 C：这一格必须带口径，缺标注也要显式说出来）。 */
 function snapshotText(fde: FdeCell): string {
   return fde.snapshot === 'provision' ? t('admin.about.snapshotProvision') : t('admin.about.snapshotUnknown');
@@ -104,6 +124,7 @@ onMounted(() => {
           </div>
         </dl>
         <p data-test="server-source" class="mt-2 text-xs text-black/55">{{ sourceText }}</p>
+        <p data-test="server-build-info-path" class="mt-1 font-mono text-xs text-black/45">{{ buildInfoPathText }}</p>
       </section>
 
       <!-- ② 平台侧引擎：portal 镜像里的 erix-agent。**不是**每台 FDE 的那个引擎 -->
@@ -111,6 +132,7 @@ onMounted(() => {
         <h3 class="text-sm font-semibold">{{ t('admin.about.engineTitle') }}</h3>
         <p class="mt-0.5 text-xs text-black/55">{{ t('admin.about.engineHint') }}</p>
         <p data-test="engine-version" class="mt-2 font-mono text-sm">{{ valueText(info?.platformEngineVersion ?? null) }}</p>
+        <p data-test="engine-source" class="mt-1 text-xs text-black/55">{{ engineSourceText }}</p>
       </section>
 
       <!-- ③ 每台 FDE：`containers.agent_version`，派生副本 ⇒ 必须带「provision 时快照」口径 -->
