@@ -38,6 +38,8 @@ import {
   isPreviewPortInPool,
 } from './previewpool.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
+// issue #586：版本三格的唯一读面（`/healthz` / `/api/health` 的 `version` 块走它）。
+import { healthVersionBlock } from './version-info.js';
 import { maskEmail } from './mailer.js'; // #449：邮件通道端口（登录邮箱验证码）
 import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置的 DB 读取侧（60s 缓存）
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
@@ -874,9 +876,15 @@ async function route(req, res, ctx) {
     // #515：就绪响应多带一块 `partialBuffer` 观测数字（**additive**，`status` 语义不变、503 形状不变、
     // 不新增端点与鉴权面）。为什么必须有：缓冲逐出活跃 run 只表现为「那段正文没了」，此前对外
     // 零读数（无 `/metrics`）⇒ 只有 `log.warn` 可对账。形状与红线见 `partialBufferHealth` 的注释。
+    // #586：再 additive 一块 `version`（**只有** station/revision/builtAt，不带引擎版本；
+    // 读不到就三格 `unknown`）。存在的理由：v0.1.69 发布时 portal 烘的是停在 0.1.68 的旧工作树，
+    // 两边分裂一小时而**对外零读数**——`curl /api/health` 现在能直接把「跑的是哪份构建」说出来。
+    // 对健康检查结构性安全（它只看 `res.ok`，不解析 body；口径见 deploy-contract.md §2.3）。
     if (ok) {
       const pb = partialBufferHealth();
-      return sendJson(res, 200, pb ? { status: 'ok', partialBuffer: pb } : { status: 'ok' });
+      return sendJson(res, 200, pb
+        ? { status: 'ok', version: healthVersionBlock(), partialBuffer: pb }
+        : { status: 'ok', version: healthVersionBlock() });
     }
     return sendJson(res, 503, errorBody('migration_failed', 'not ready'));
   }
