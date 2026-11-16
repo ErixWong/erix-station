@@ -81,8 +81,6 @@ export const AUDIT_TARGET = 'platform_prompts';
 // 函数体里直接引用 import 绑定（判据 `P11` 钉住「两种加载顺序都不许抛」）。
 
 /**
-
-/**
  * 三块的字段表（**唯一一处**登记「列名 ↔ 上限 ↔ 是否参与渲染/物化」）。
  * `key` 是 DTO / 路由用的 camelCase 名，`column` 是 DB 列名（也进审计的 `details.field`）。
  */
