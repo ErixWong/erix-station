@@ -8,7 +8,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import StreamPanel from './StreamPanel.vue';
 import DelegateChildDrawer from './DelegateChildDrawer.vue';
 import { useWorkbenchStore } from '../stores/workbench';
-import { parseDelegateResult, shortRunId } from '../lib/delegate';
+import { parseDelegateResult, shortRunId, DELEGATE_UNKNOWN_MARK } from '../lib/delegate';
 import { i18n, setLocale } from '../i18n';
 import { zhCN } from '../i18n/locales/zh-CN';
 
@@ -116,6 +116,8 @@ describe('delegate 工具卡（接线到 DelegateChildDrawer）', () => {
 
   it('点按钮 ⇒ 渲染 DelegateChildDrawer（props 带父/子 runId），close 后卸载', async () => {
     const store = useWorkbenchStore();
+    // 这张卡所属的 run 仍是当前活跃 run ⇒ spinner 照旧（#602 之后「在跑」不再免费：见下面那一组用例）。
+    store.es.activeRunId = 'run-1';
     driveDelegate(store, { ok: true, runId: 'sub-child-aaaa', state: 'running', action: 'dispatch' });
     const wrapper = mountPanel();
     expect(wrapper.findComponent(DelegateChildDrawer).exists()).toBe(false);
@@ -177,5 +179,123 @@ describe('delegate 工具卡（接线到 DelegateChildDrawer）', () => {
     // 解不出 ⇒ delegate 专属的两段都不渲染（摘要/状态位回到既有通用展示）。
     expect(wrapper.find('.delegate-summary').exists()).toBe(false);
     expect(wrapper.find('.delegate-state').exists()).toBe(false);
+  });
+});
+
+// issue #602：卡片上的 `state` 是**派发那一刻**的快照，之后没有任何东西会更新它。而 `background:true`
+// 的子 run 随父 worker 进程一起消失（引擎 `finishRun` 永不跑）⇒ 名册永久 `running` ⇒ 真机上卡片
+// **永久转圈**（读数：父 run finished、子名册 state:running / endedAt:null、`.delegate-state svg.animate-spin` 命中 1）。
+// 修法：spinner 只在「这张卡所属的 run 仍是当前活跃 run」时才允许；否则按 `unknown` 中性档收尾
+// ——**既不是成功也不是失败**，所以不许出 ✓/✗，也不许染红。
+describe('delegate 卡：spinner 只属于「仍是当前活跃 run」的 run（issue #602）', () => {
+  const LIVE = { ok: true, runId: 'sub-child-aaaa', state: 'running', action: 'dispatch' };
+
+  it('run 活跃（activeRunId = 卡片的 run）+ 快照 running ⇒ 照旧转圈（蓝）', () => {
+    const store = useWorkbenchStore();
+    store.es.activeRunId = 'run-1';
+    driveDelegate(store, LIVE);
+    const wrapper = mountPanel();
+    const state = wrapper.get('.delegate-state');
+    expect(state.attributes('data-badge-kind')).toBe('running');
+    expect(state.find('svg.animate-spin').exists()).toBe(true);
+    expect(state.classes()).toContain('text-brand');
+  });
+
+  it('run 已结束（activeRunId = null）⇒ spinner 消失 + 中性灰 unknown 档，整张卡不含 text-red-600', () => {
+    const store = useWorkbenchStore();
+    driveDelegate(store, LIVE); // 卡片 runId = 'run-1'；活跃 run 为 null ⇒ 这个 run 已经收了
+    const wrapper = mountPanel();
+
+    const state = wrapper.get('.delegate-state');
+    expect(state.find('svg.animate-spin').exists()).toBe(false);
+    expect(state.attributes('data-badge-kind')).toBe('unknown');
+    expect(state.classes()).toContain('text-black/50'); // = DELEGATE_BADGE_CLASS.unknown
+    expect(state.text()).toBe(DELEGATE_UNKNOWN_MARK); // 中性位：既不是 ✓ 也不是 ✗
+    expect(wrapper.html()).not.toContain('text-red-600'); // 不许把「run 已结束」渲染成失败
+    // 「查看子 run」按钮不受影响：账本还在，用户仍然可以进去看（抽屉会自己说明状态未知）。
+    expect(wrapper.find('.delegate-open-viewer').exists()).toBe(true);
+  });
+
+  it('run 换成了别的 run（activeRunId 是另一个 id）⇒ 同样中性收（不给上一个 run 的卡续命）', () => {
+    const store = useWorkbenchStore();
+    driveDelegate(store, LIVE);
+    store.es.activeRunId = 'run-9'; // 当前活跃 run 已经是别人
+    const wrapper = mountPanel();
+
+    const state = wrapper.get('.delegate-state');
+    expect(state.find('svg.animate-spin').exists()).toBe(false);
+    expect(state.attributes('data-badge-kind')).toBe('unknown');
+    expect(state.classes()).toContain('text-black/50');
+    expect(wrapper.html()).not.toContain('text-red-600');
+  });
+
+  it('run **跑到一半收尾** ⇒ 卡片当场停转（活跃性在渲染效应里 ⇒ 换 activeRunId 就重渲）', async () => {
+    const store = useWorkbenchStore();
+    store.es.activeRunId = 'run-1';
+    driveDelegate(store, LIVE);
+    const wrapper = mountPanel();
+    expect(wrapper.get('.delegate-state').find('svg.animate-spin').exists()).toBe(true);
+
+    store.es.activeRunId = null; // 等价于 run_end 到了
+    await flushPromises();
+
+    const state = wrapper.get('.delegate-state');
+    expect(state.find('svg.animate-spin').exists()).toBe(false);
+    expect(state.attributes('data-badge-kind')).toBe('unknown');
+    expect(state.text()).toBe(DELEGATE_UNKNOWN_MARK);
+  });
+
+  it('刷新/加载路径建的卡也一样：没有活跃 run ⇒ 不转圈（只认 store，不认建卡路径）', () => {
+    const store = useWorkbenchStore();
+    driveLoadedDelegate(store, JSON.stringify(LIVE), 'c1');
+    const wrapper = mountPanel();
+
+    const state = wrapper.get('.delegate-state');
+    expect(state.find('svg.animate-spin').exists()).toBe(false);
+    expect(state.attributes('data-badge-kind')).toBe('unknown');
+    // 摘要位仍是既有的 `action · 后 8 位`（#602 只动状态位，不动摘要）。
+    expect(wrapper.get('.delegate-summary').text()).toBe(`dispatch · ${shortRunId('sub-child-aaaa')}`);
+  });
+
+  // ── 不误伤：以下两种展示与「run 是否活跃」无关，一个字都不许变 ──
+  it('不误伤：前台子（快照 completed）在 run 结束后仍 ✓ 绿', () => {
+    const store = useWorkbenchStore();
+    driveDelegate(store, { ok: true, runId: 'sub-child-aaaa', state: 'completed', action: 'dispatch', termination: 'end_turn' });
+    const wrapper = mountPanel();
+
+    const state = wrapper.get('.delegate-state');
+    expect(state.text()).toBe('✓');
+    expect(state.classes()).toContain('text-green-600');
+    expect(state.attributes('data-badge-kind')).toBe('completed');
+  });
+
+  it('不误伤：completed + syserr termination 在 run 结束后仍是红（分级尺规未被活跃判定改写）', () => {
+    const store = useWorkbenchStore();
+    driveDelegate(store, { ok: true, runId: 'sub-child-bbbb', state: 'completed', action: 'dispatch', termination: 'persistence_failed' });
+    const wrapper = mountPanel();
+
+    const state = wrapper.get('.delegate-state');
+    expect(state.text()).toBe('✗');
+    expect(state.classes()).toContain('text-red-600');
+  });
+
+  it('不误伤：capacity_full 拒单（载荷 ok:false）的既有 ✗ 展示与「run 是否活跃」逐字无关', () => {
+    const stateHtml = (activeRunId: string | null): string => {
+      setActivePinia(createPinia());
+      const store = useWorkbenchStore();
+      store.sessionId = 'sess-1';
+      store.es.activeRunId = activeRunId;
+      // 工具调用**本身也失败**（toolResultOk=false）⇒ 既有展示是 ✗ + 红；载荷没有 `state` ⇒ kind 恒
+      // `unknown`，走的仍是「解不出 state 就沿用既有 ✓/✗」那条退路（#602 不许动它）。
+      driveDelegate(store, { ok: false, reason: 'capacity_full' }, false);
+      const wrapper = mountPanel();
+      expect(wrapper.find('.delegate-open-viewer').exists()).toBe(false); // 拒单永不出按钮
+      return wrapper.get('.delegate-state').html();
+    };
+
+    const ended = stateHtml(null);
+    expect(ended).toContain('✗');
+    expect(ended).toContain('text-red-600');
+    expect(ended).toBe(stateHtml('run-1')); // 两种世界逐字相同 ⇒ 拒单展示没被活跃判定改写到
   });
 });
