@@ -77,8 +77,7 @@ function clipUtf8(s, maxBytes) {
  * 任何带 `command`（或 `input.command`）且能找到退出码线索的对象都算一条。
  */
 export function extractVerificationCommands(transcriptRows) {
-  const found = [];
-  const seen = new Set();
+  const candidates = [];
   const exitCodeOf = (node) => {
     for (const key of ['exit_code', 'exitCode', 'code']) {
       if (Number.isInteger(node?.[key])) return node[key];
@@ -92,11 +91,7 @@ export function extractVerificationCommands(transcriptRows) {
       : typeof node.input?.command === 'string' ? node.input.command : null;
     if (command) {
       const exitCode = exitCodeOf(node) ?? exitCodeOf(node.result) ?? exitCodeOf(node.toolResult);
-      const key = `${command}\u0000${exitCode ?? ''}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        found.push({ command, exitCode });
-      }
+      candidates.push({ command, exitCode });
     }
     for (const value of Object.values(node)) walk(value);
   };
@@ -105,7 +100,14 @@ export function extractVerificationCommands(transcriptRows) {
     // run_events 形状（type=tool_result 的行若混进来）也接住，不假设来源只有轮记录
     if (row?.payload) walk(row.payload);
   }
-  return found;
+  // 同一个命令会被嵌套形状（toolCall 本体与它的 `input` 子节点）各命中一次：
+  // 按命令去重，**优先保留带退出码的那条**（退出码是这一节唯一要有事实价值的内容）。
+  const byCmd = new Map();
+  for (const c of candidates) {
+    const cur = byCmd.get(c.command);
+    if (!cur || (cur.exitCode === null && c.exitCode !== null)) byCmd.set(c.command, c);
+  }
+  return [...byCmd.values()];
 }
 
 /** `git` 默认执行器（execFile，不经 shell；失败也返回 stdout，porcelain 失败场景少）。 */
