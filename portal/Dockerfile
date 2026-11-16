@@ -52,4 +52,25 @@ USER root
 
 EXPOSE 8080
 
+# ---- 版本作为构建产物（issue #586：portal 此前**没有**这份载体）-------------------------
+# 口径与 `runner/Dockerfile:155-166` 逐字同源，那边已经定过：`build-info.json` 是运行时**唯一**版本真相，
+# `LABEL org.opencontainers.image.version` 只给人看。portal 侧缺它付出过真代价：发 v0.1.69 时宿主工作树
+# 停在 0.1.68，`docker compose build station-portal` 烘的就是那份树 ⇒ 真机上 FDE 报 0.1.69、portal 报 0.1.68
+# 分裂了一小时，而**没有任何机器判据能发现**（`ci.yml` 的 ⑤′ tripwire 当时只查 FDE 镜像）。
+# 两格版本从**镜像内的文件**取（`/app/package.json`、`/app/node_modules/erix-agent/package.json`），
+# 不从 ARG 传——少一条必须与构建同步的手工输入就少一次漂移；只有镜像内拿不到的 git revision /
+# 构建时间走 ARG（与 runner 同一取舍）。`station_version` 取不到就 **exit 1**：宁可构建红，
+# 也不要烘出一个看起来合法的假版本（`runner/lib/build-info.js` 顶部记的 `0.1.0` 事故就是这个形状）。
+# 故意放在**最末尾**：ARG 一变更就让它之后的层缓存失效，放最后把影响压到最小（前面所有层与版本无关）。
+# ⚠ 这三个 ARG 不传 ⇒ `revision`/`built_at` 恒 `unknown`（v0.1.53 的 FDE 镜像实测就是这样）：
+#   判据是 `ci.yml` 的 portal tripwire 步骤（四格逐条断言），不是这段注释。
+# ⚠ 运行侧读它的唯一入口 = `portal/src/build-info.js`（dev 源码态退到仓库根 `package.json`），
+#   业务代码**不许**自己 `require('package.json')` —— 那是第二个真相源。
+ARG STATION_VERSION=unknown
+ARG STATION_REVISION=unknown
+ARG STATION_BUILD_DATE=unknown
+RUN node -e 'const fs=require("fs");const v=p=>{try{const j=JSON.parse(fs.readFileSync(p,"utf8"));return (typeof j.version==="string"&&j.version)||"unknown"}catch{return "unknown"}};const sv=v("/app/package.json");if(sv==="unknown"){console.error("[build-info] /app/package.json 缺 version，版本没能烘进镜像");process.exit(1)}fs.writeFileSync("/app/build-info.json",JSON.stringify({station_version:sv,engine_version:v("/app/node_modules/erix-agent/package.json"),revision:process.env.STATION_REVISION||"unknown",built_at:process.env.STATION_BUILD_DATE||"unknown"})+"\n");console.log("[build-info] "+fs.readFileSync("/app/build-info.json","utf8").trim())'
+# label 给人看（`docker inspect` 一眼可读版本），不参与运行时真相；真值以 build-info.json 为准。
+LABEL org.opencontainers.image.version="${STATION_VERSION}"       org.opencontainers.image.revision="${STATION_REVISION}"
+
 CMD ["node", "portal/src/cli.js", "serve"]
