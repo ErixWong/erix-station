@@ -59,6 +59,7 @@
 | 管理 | `PUT /api/admin/mail/settings` | **邮件通道配置：写**（#449，§4.12）。口令**只写**：键缺席 = 不修改、`null`/`""` = 清除；落库后缓存**立刻**失效（不等 60s TTL） |
 | 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
 | 管理 | `GET /api/admin/upload/settings` | **单文件上传上限：读**（#485 片 A，§4.15）。回的是**当前生效值** + **来源**（`db`/`env`/`default`）+ 允许区间；表不存在/读失败也回 `200`（不是 500）|
+| 管理 | `GET /api/admin/version` | **版本三格（「关于」面板）**（#586，§4.16）。只读：服务端 / 平台侧引擎 / 每台 FDE，三段各自标来源；不新增错误码 |
 | 管理 | `PUT /api/admin/upload/settings` | **单文件上传上限：写**（#485 片 A，§4.15）。`{maxFileBytes}` 必须是 `1 MiB`–`1 GiB` 的 JSON 整数，否则 `400 validation_failed` 且**不落库**；**下一次上传就生效**（无缓存 ⇒ 不需重启，也不需失效任何东西）|
 | 管理 | `GET /api/admin/prompts` | **平台提示词：读**（#596 片 A，§4.16）。三块（`~/AGENTS.md` 追加段 / 整段覆写 / 会话标题 system）的当前值 + 生效全文 + 字节预算 + 只读清单；**表不存在 / 读失败也回 `200`**（回落内置提示词，不是 500）|
 | 管理 | `PUT /api/admin/prompts/addendum` | **平台补充约定：写**（#596 片 A，§4.16）。`{text}`（`""` = 清空那一节）≤ 8192 字节，且**渲染后的整份 `~/AGENTS.md`** 必须 ≤ 16384 字节，否则 `400 validation_failed` 且**一条写语句都不发**；成功回完整 GET DTO + `materializeEnqueued` ⇒ **该工位下一次 run 生效** |
@@ -1688,7 +1689,7 @@ WHERE 仍是 `round BETWEEN from AND to`，范围外的结果行不会被搬进�
 鉴权同 `GET /api/sessions/:id`（`fetchSession` 同一个 404，不泄露存在性），再叠两层：**`runId` 必须属于该会话**（查 `runs` 表）、**`childRunId` 必须出现在该 parent 的名册里**（形状合法不等于存在）。`runId` 是**必填** query 参数（名册按父 run 分片，没有父身份就不知道该读哪个目录）。
 
 ```
-GET /api/sessions/:id/delegates?runId=<parentRunId>
+GET /api/sessions/:id/delegates?runId=<parentRunId>[&activity=1]
   → { "items": [ <DelegateItem> … ], "skipped": 0 }          // createdAt 升序
 GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
   → { "childRunId": "sub-…", "state": "completed", "messages": [ … ], "truncated": false, "totalTurns": 3 }
@@ -1709,6 +1710,28 @@ GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
 
 `skipped` = 被跳过的坏名册件数（JSON 解析失败 / 非对象 / `runId` 与文件名不符 / `state` 非字符串）。**一个坏文件不打成 500**：名册是普通 JSON 文件，而抽屉每 2s 轮询一次。名册目录不存在 ⇒ `{ "items": [], "skipped": 0 }`（**不是 404**：「还没派过子 run」与「刚点下 delegate、文件还没落」都是正常态）。原子写的临时件 `<id>.json.tmp-<pid>-<n>` 不算候选，也不计进 `skipped`。
 
+**`activity=1`（#593，可选）**：给每条 item 追加一个 `activity` 对象，回答「这个子 run **现在**在干啥」。**不带（或带 `0` / `true` / 其它任何值）时响应与上表逐字段相同**——`activity` 键根本不出现，也不读任何账本（判据：形状不变）。
+
+| 字段 | 类型 | 口径 |
+|---|---|---|
+| `at` | number \| null | 账本文件 `mtimeMs`（**写盘证据**，不是消息自己的 `ts`）。非活态子 / 账本还没落 ⇒ **不写这个键** |
+| `turns` | number \| null | 投影后的逻辑消息数；账本超上限或没落盘 ⇒ `null` |
+| `kind` | `'tool' \| 'text' \| 'tool_result' \| 'none'` | 最近一个可定性的动作：投影后**从后往前**扫，第一条能定性为动作的消息 |
+| `tool` / `args` | string | 仅 `kind='tool'`：工具名 / 参数摘要（各 ≤120 **码点**，超长末位 `…`） |
+| `text` | string | 仅 `kind ∈ {'text','tool_result'}`：正文片段（≤120 码点） |
+| `stale` | boolean | 父 run 已终态**而**子仍是活态 ⇒ `true`（语义见下） |
+
+成本与降级（每条都有判据）：
+
+- **只对活态子读账本**（`queued` / `running`）：终态子的终稿在名册 `resultText` 里，抽屉已能看全文 ⇒ 零文件动作。
+- **缓存键 = `(账本绝对路径, size, mtimeMs)`**：`stat` 没变就复用上次摘要，**零 `readFile`**。子 run 是逐消息追加（0.23「一条消息一落盘」）⇒ 2s 一轮里绝大多数命中缓存，稳态成本 ≈ N 次 `stat`。进程内 LRU（256 条 / TTL 5 min），丢失只意味着多读一次盘。
+- 账本 **> 8 MiB ⇒ 不读、不 413**：`{kind:'none', turns:null}`（与账本端点故意的差异：面板不是正文读取面，降级优于报错）。
+- **一条 SQL**：`activity=1` 走 `chat_sessions` × `users` × `runs` 一条 join（顺带取父 run 的 `status` 算 `stale`），不叠加 `resolveScope` 的三条查询。错误顺序仍是 **会话 404 → `runId` 形状 400 → `fde_name` 400 → 父 run 404**（越权的人不该从错误码读出「这个 session 存在」）。
+
+**`stale` 不是「门户判死」**：门户在宿主、名册里的 `pid` 在容器（两个 PID namespace），所以门户**不判死活、不改写名册**。`stale:true` 的真实成因是**后台子**：父 run 终态后 worker 200 ms 就 `process.exit(0)`（`runner/worker.js:1287`），嵌套的子 `runLoop` 随进程消失 ⇒ 引擎的 `finishRun` 永不执行 ⇒ 名册**永久**停在 `running`。前端据此画 ⚪ 且**不计入**活态数（D9 的「⚪ 不得渲染成绿」）。
+
+> 为什么要有这个参数而不是让前端自己读账本：面板每 2 s 一轮，前端逐个拉账本端点 = N 个请求 × 每次全量折叠投影（`foldLedgerRecords` → `projectTranscriptForDisplay`）；服务端一次 join + `stat` 缓存能把稳态成本压到「N 次 `stat` + 每 2 s 一条 SQL」。
+
 `messages[]` 是**与主对话同形**的 turn：上游 `projectTranscriptForDisplay` 的输出（`role`/`text`/`blocks`/`toolCalls`/`reasoning`/`round`/`ts`/`key`/`meta` 逐字透传，#95 红线）上叠四个宿主字段 `id`（`<childRunId>:<全量下标>`）/ `seq`（全量下标，所以向前翻页时同一条消息的 id 不漂移）/ `run_id`（= `childRunId`）/ `created_at`。⚠ `created_at` 是**轮行落盘时刻**（投影的 `ts` 读的是载体行），不是消息成型时刻，只当轮级时间戳用。
 
 **折叠与切尾的顺序（不得改）**：读全量行 → `portal/src/transcript-fold.js#foldLedgerRecords` → `projectTranscriptForDisplay` → **才** `slice(-tail)`。在原始行上切会把一轮切成半轮（`:msg:<round>:<seq>` 分片行与它的载体行分散在切界两侧），折叠拿到缺片的一轮 ⇒ 工具结果配不上对（#337 的老病根）。⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 的导出面**（实测 `undefined`，深引被包 `exports` 挡），所以用的是本站镜像——它正是 `runner/lib/store.js#load` 用的同一份口径（两份 `SHARED-FOLD-CORE` 逐字节对拍，AGENTS §8.52），也是上游读侧的**超集**（多一道 `partOf` 解链闸）。本站两条入口共用同一份 `planFold`：`session-view.js` 走 `foldTranscriptRows`（DB 行）、这里走 `foldLedgerRecords`（文件记录），不是两套规则。
@@ -1727,7 +1750,7 @@ GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
 | 账本文件不存在 | `404 not_found`，`details.reason='no_transcript'`（名册在、账本没落 ⇒ 前端给 `starting` / `no_transcript` 空态） |
 | 账本 > 8 MiB | `413 payload_too_large`，`details={size,max_bytes}`（**先 `stat` 再读**，超限一个字节都不进内存） |
 
-成本红线：`hasTranscript` 不读内容；名册目录不存在 ⇒ 零账本读；账本读取先 `stat` 判 8 MiB 上限（与 `session-partial-output` 的成本口径同族：单文件有上限，超了就 413 并提示）；账本里的坏行/空行（崩溃截断的最后一行是常态）跳过而不是 500。
+成本红线：`hasTranscript` 不读内容；名册目录不存在 ⇒ 零账本读；`activity=1` 的额外成本与降级见上（只读活态子、`(路径,size,mtime)` 缓存、8 MiB 降级、一条 join）；账本读取先 `stat` 判 8 MiB 上限（与 `session-partial-output` 的成本口径同族：单文件有上限，超了就 413 并提示）；账本里的坏行/空行（崩溃截断的最后一行是常态）跳过而不是 500。
 
 > **红线：`state` 是名册词汇（7 值：`queued` / `running` / `completed` / `failed` / `aborted` / `timeout` / `interrupted`），`termination` 才是引擎 reason。**
 > 引擎的 `TERMINATION_TO_STATE` 把未列出的一切判成 `failed`，而 P1 已把本站当正常收尾的 `no_tool` / `continuation_exhausted` 归一成 `end_turn` ⇒ 这类子在名册里是 `completed`。所以 **UI 分级以 `termination` 为准、过 `portal/frontend/src/lib/terminationReasons.ts`（`RUN_TERMINATION_SYSERR_REASONS`），不要只看 `state`**——只看 `state` 会把 `persistence_failed` / `final_guard_unverified` 这些该红的终态染成绿色。本模块只透传不归一（写侧的词汇封闭性是引擎的不变量，读侧拿它当过滤器只会藏掉真子 run）。
@@ -3150,6 +3173,181 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P11b` + `T1`/`T1b`）、
 > `portal/test/materializer.test.js`（`M1`：默认渲染逐字节不变）、
 > `portal/test/migrations.test.js`（0039 之后 head 断言 = 0039）。
+
+### 4.16 管理台「关于」：版本三格（`GET /api/admin/version`，issue #586）
+
+**要治的是什么**：版本号在本仓存在于五处（`package.json` / 镜像内 `build-info.json` / 运行时读取 /
+`containers.agent_version` / tag+digest），而**界面上一个读面都没有**。代价已经在 2026-11-16 付过一次：
+发 v0.1.69 时宿主工作树停在 0.1.68，`docker compose build station-portal` 烘的就是那份树 ⇒ 真机上
+**FDE 报 0.1.69、portal 报 0.1.68 分裂一小时，没有任何机器判据发现它**（portal 镜像当时没有
+`build-info.json`，`ci.yml` 的 ⑤′ tripwire 只查 FDE 镜像）。
+
+**口径（不是「选一个信」，是只有一条读法）**：
+
+| 格 | 唯一来源 | 取不到 |
+|---|---|---|
+| 服务端（portal 镜像） | portal 镜像内 `/app/build-info.json` 的 `station_version`（`portal/Dockerfile` 末尾烘入） | `unknown` |
+| 平台侧引擎 | 同一份 `build-info.json` 的 `engine_version` | `unknown` |
+| 每台 FDE 的引擎 | `containers.agent_version`（**派生副本**：provision 写入 + 心跳回报，**不是**这个镜像现在的值） | `unknown` |
+
+三格**不许互抄**；`package.json` 是**构建输入**（dev 源码态的退路，`server.source` 会显式说它是 `package`），
+git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什么」。`ci.yml` 的 portal tripwire 与
+`release.yml` ④ 保证镜像里那四格真烘进去了（口径全文见 `docs/ops/ci-release.md` 与 `runner/Dockerfile:155`）。
+
+**请求**：`GET /api/admin/version`（无参数）。鉴权同其余 `/api/admin/*`（`requireAdmin`：无会话 `401 unauthorized`、
+非 admin `403 forbidden`）；只读 ⇒ 非 GET 不落在本端点（`404 not_found`，**不新增错误码**）。
+
+**响应** `200 application/json`：
+
+```json
+{
+  "server": { "station": "0.1.69", "revision": "02fd33ec…", "builtAt": "2026-11-16T03:45:00Z", "source": "build-info" },
+  "platformEngine": { "version": "0.33.0" },
+  "buildInfoPath": "/app/build-info.json",
+  "fdes": [
+    { "name": "eric", "agentVersion": "0.33.0", "image": "ghcr.io/…@sha256:…",
+      "provisionedAt": "2026-11-16T02:00:00.000Z", "lastHeartbeatAt": "2026-11-16T04:00:00.000Z",
+      "revoked": false, "versionSource": "containers.agent_version", "snapshot": "provision" }
+  ],
+  "fdesPresent": true,
+  "provenance": { "server": "build-info.json", "platformEngine": "build-info.json",
+                  "fdes": "containers.agent_version", "fdesSnapshot": "provision" }
+}
+```
+
+- **所有版本格都是字符串，缺就是字面量 `unknown`**（永不 `undefined` / 空串 / `0`）：一个看起来合法的
+  假值比空值毒（`runner/lib/build-info.js` 顶部记的 `0.1.0` 事故）。
+- `server.source` ∈ `build-info` | `env` | `package` | `unknown`：这一格到底从哪儿读的。镜像里应当是
+  `build-info`；本地源码态是 `package`（此时 `revision`/`builtAt` 必然是 `unknown`，**那是事实**）。
+  portal 侧在入口**屏蔽** `ERIX_AGENT_VERSION`（那是 provisioner 注入给 FDE 容器的旋钮，
+  `portal/src/provisioner.js:281`），所以这里的引擎号不可能来自环境变量冒充（评审阻断一）。
+- **`provenance.server` / `provenance.platformEngine` 是由 `source` 推导的，不是常量**（复验阻断）：
+  `build-info → "build-info.json"`、`package → "package.json"`、`env → "env"`、认不出 → `"unknown"`。
+  写死 `'build-info.json'` 在**本 PR 之前构建的旧 portal 镜像**上就是说谎——那份镜像里根本没有
+  `build-info.json`，读取退到 `node_modules/erix-agent/package.json`，面板上的引擎号确实是它。
+  ⚠ `source` 是**整次读取共用的**（`readBuildInfo()` 只出一个），所以这两格**必然同源**（同一个文件）；
+  `provenance` 里 `package.json` 那一支就是「这是源码态退路 / 旧镜像，不是镜像构建产物」的显式说法。
+  **有值才谈来源**（第三轮评审 nit）：`platformEngine.version` 是 `unknown` 时 `provenance.platformEngine`
+  也降成 `"unknown"` —— `source` 会因为根 `package.json` 可读而置 `package`，但那份
+  `node_modules/erix-agent/package.json` 可能根本不存在，此时给一个没值的格子标上来源就是冒充。
+  `server` 那格不需要这道闸门（它的值就出自根 `package.json`，`source` 是 `package` 时必然读到了）。
+- `buildInfoPath` = **实际去读的那条路径**（`STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH` /
+  代码入参三个旋钮都能改它，前两个是契约测试的注入点 ⇒ 「路径被改过」必须在界面上可见）。
+  它只证明「读了这条路径」，**证明不了「读到了」**——读到没有看 `provenance`。`/api/health` **不带**这一格
+  （公开端点不泄露部署路径，§5.1 的形状仍是 `station`/`revision`/`builtAt` 三格）。
+- `fdesPresent:false` ⇒ 这一段**读不到**（查 `containers` 抛错），与「服务端说没有 FDE」（`fdesPresent:true`
+  + 空数组）是两件事（#350 同口径）；本端点因此**始终 200**，不把面板打成 500。
+- `snapshot:"provision"` 是**机器可读的口径标注**，前端据此必须渲染「provision 时快照」字样；
+  标注缺失时页面说「口径未给出」，**不许默认当成快照**。
+
+**不做**：不做用户侧（工作台）版本展示——两个引擎数并排给 FDE 看需要解释文案，那会变成第二个会漂的账；
+不改 `containers.agent_version` 的写入链（只加读面），也不做「期望版本 vs 实际版本」的 canary 对账（需另开列）。
+
+> 实现：`portal/src/version-info.js`（三格的唯一读法 + 面板聚合）、`portal/src/build-info.js`
+> （`runner/lib/build-info.js#readBuildInfo()` 的镜像副本，由测试钉同步）、`portal/src/http.js`（端点转发）、
+> 前端 `portal/frontend/src/lib/versionSurface.ts` + `views/AdminAboutView.vue`（`#/admin/about`）。
+> 单测：`portal/test/admin-version-panel.test.js`（后端三段/鉴权/降级）、
+> `portal/test/version-surface.test.js`（**三格来源锁死** + provenance 推导/路径可见 + 镜像与工作流的判据自证）、
+> `portal/test/health-version.test.js`（§5.1 的 `version` 块）、
+> `portal/frontend/src/views/AdminAboutView.spec.ts`（渲染面与不猜数）。
+### 4.17 能力市场（`/api/market/*` 与 `/api/admin/market/*`，issue #595）
+
+**一句话**：平台把技能包（bundle）发进目录，用户在页面上装/卸/启停，runner 在每次 run 启动时把
+「有哪些技能」注入提示词并把停用的技能从工具面摘掉。契约全文在
+`docs/design/capability-market.md`（§3 校验、§4 安装面、§5 物化、§6 runner、§7 本节的端点清单）。
+
+真相分布（三处，各有唯一职责）：包内容与元数据在 `capability_items` / `capability_files`
+（迁移 `0039`），装没装/启没启在 `fde_capability_installs`，「磁盘上有」只是这两张表的**投影**
+——平台不做磁盘对账，用户手删了文件页面仍显示已装，出路是给「重新安装」（`force`，见 4.16-5）。
+
+**两条全局形状**（与 §4.2 `/api/admin/users` 同形，前端两种都收但以这套为准）：
+列表 = `{"items":[...]}`，详情 = `{"item":{...}}`；字段一律 `snake_case`。
+`installed` / `enabled` 是**真布尔**（不是 `'t'/'f'`、不是 0/1）。
+
+**鉴权**：`/api/admin/market/*` 走 `requireAdmin`（非 admin ⇒ 403）；`/api/market/*` 走 `requireSession`，
+并且只作用于**当前登录用户自己的** FDE —— `fde_id` 与 `fde_name` 取自 session，**请求体里的 `fde` 一律不认**
+（收了就等于任何人都能往别人家目录写文件）。账号没有 `fde_name` ⇒ `400 fde_name_required`。
+用户面只见 `state='published'` 的条目。
+
+**错误码**（`MarketError` 一处映射，`details` 里只有字段名/数字/路径，**不含包内容**）：
+
+| code | HTTP | 触发 |
+| --- | --- | --- |
+| `validation_failed` | 400 | §3 任一校验不过（`details.field` / `details.reason` 点名是哪一条） |
+| `capability_not_found` | 404 | slug/id 不存在；或启停时**尚未安装**（`details.reason="not_installed"`） |
+| `capability_not_published` | 409 | 装一个非 `published` 的条目；或发布时当前版本没有包 |
+| `capability_budget_exceeded` | 409 | 启用的技能数已达 12（`details.max_enabled` / `details.enabled_now`） |
+| `capability_kind_unsupported` | 409 | `kind='mcp'` 的发布/安装（本期没有消费者，§9） |
+| `capability_install_failed` | 500 | 落盘/删目录失败（`details.reason` 是 `E*` 或 `invalid_fde_name`） |
+
+#### 4.16-1 `GET /api/market/items`
+
+`200`：`{"items":[<用户面列表项>], "budget":{"max_enabled":12,"enabled_now":<int>}}`。
+列表项：`slug, kind, name, summary, version, tags[], tool_count, security_score,
+installed, installed_version(null|string), enabled, when_to_use, author, license, updated_at`。
+`version` 是**已发布版本**，`installed_version` 是这台 FDE 实装的版本（不相等 = 页面该给「升级」）。
+列表**不取包字节**（`capability_files.content`）：50 条 × 2 MiB 会先把进程吃掉。
+
+#### 4.16-2 `GET /api/market/items/:slug`
+
+`200`：`{"item":{...列表项..., "description_md":"", "readme_md":"", "tools":[{"name","description"}],
+"manifest":{...}, "security_warnings":[{"code","path","line","note"}], "files":[{"path","bytes"}]}}`。
+`readme_md` 是 `SKILL.md` 的**正文**；包里没有这个文件时是 `""`（**不是 `null`** —— 前端把它直接喂给
+markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不合法（不匹配 `^[a-z0-9][a-z0-9-]{0,63}$`）
+在路径层就 `400`，不入库查一轮再报 404。
+
+#### 4.16-3 `POST /api/market/items/:slug/install`
+
+体（可省略）：`{"enabled":true,"force":false}`。`enabled` 缺省 = 已装过就沿用现值，否则 `true`。
+`200`：`{"result":{"changed":bool,"slug","version","enabled","dir","files"|...,"idempotent":true?},
+"item":<4.16-2 形状>}`。回包带 `item` 是为了让前端装完立刻把卡片翻成「已装」，不必自己拼三个字段。
+
+判据顺序（顺序本身是契约，不是实现细节）：① 条目存在 / `kind` 可消费 / `state='published'`；
+② **幂等**：同版本且非 `force` ⇒ `changed:false`，**一个字节都不写盘**（否则「用户手改过文件」与
+「页面多点了一下安装」会互相打架）；③ 预算闸：只在「这次真的会让启用数 +1」时判，重复启停不受预算影响；
+④ 落盘（先 `<slug>.tmp-*` 再原子替换）；⑤ 事务里落账 + 排一次物化（`capabilities.json` 要跟着变）。
+
+审计：`user.capability_installed` / `user.capability_uninstalled` / `user.capability_enabled`，
+`target=capability:<slug>`，`details` 只有 `{changed, version, enabled}`。
+
+#### 4.16-4 `POST /api/market/items/:slug/uninstall`
+
+无体（不带 `Content-Type` 也收：`requireJson` 只卡带体的两个动作）。`200 {"result":{"changed","slug",
+"dir_removed"},"item":{...}}`。删 slug 目录 + 删一行安装账；**目录本来就不存在也是 200**
+（幂等的定义是结果状态一致，不是「一定做了动作」）。只删 `<slug>/` 这一层，同级技能与 `~/.erix`
+里别的东西一个字节都不碰。
+
+#### 4.16-5 `POST /api/market/items/:slug/enabled`
+
+体：`{"enabled":<bool>}`（必须是布尔，否则 400）。**只改 DB 一行，磁盘一律不动**——停用后目录仍在，
+重新启用不必重下；从停用回到启用要过预算闸。未安装 ⇒ `404 capability_not_found`
+（`details.reason="not_installed"`）。
+
+#### 4.16-6 管理面 `/api/admin/market/*`
+
+| 端点 | 方法 | 说明 |
+| --- | --- | --- |
+| `/api/admin/market/items` | `GET` | `?state=draft\|published\|retired`（缺省全部；非法值 400，不静默当「没筛」）。`{"items":[...]}` 每项额外带 `id, state, installs`（装机数）。**不返回 content** |
+| `/api/admin/market/items` | `POST` | 发布新条目（元数据 + `bundle`）⇒ `201 {"item":{...}}`。默认落 `draft`，显式 `state:"published"` 时一并写 `published_at` |
+| `/api/admin/market/items/:id` | `GET` | 详情：`{"item":{...,"tools":[...],"manifest":{...},"security_warnings":[...],"files":[{"path","bytes"}]}}` |
+| `/api/admin/market/items/:id` | `PUT` | 改元数据，或**带 `bundle` 出新版**（带 bundle 时 `version` 必填且必须与当前不同，否则 400） |
+| `/api/admin/market/items/:id/publish` | `POST` | → `published`；当前版本没有包 ⇒ `409 capability_not_published` |
+| `/api/admin/market/items/:id/retire` | `POST` | → `retired`（下架后用户面立即看不见，已装的目录不动） |
+
+审计：`admin.capability_created` / `_updated` / `_published` / `_retired`，`target=capability:<slug>`；
+`_updated` 的 `details.has_bundle` 用来区分「只改了文案」与「真出了新版」。
+
+**bundle 的形状与上限**（§3，判据实现只在 `portal/src/market.js` 一处）：
+`{"files":[{"path":"skill.mjs","content_base64":"..."}]}`；根必须有 `skill.mjs`，根只允许
+`skill.mjs` / `SKILL.md`，子目录只允许 `scripts/` `references/` `assets/`；路径相对、无 `\`、
+**任何** `..` 段（按段判，不是子串）、长度 ≤ 200；文件数 ≤ 50、单文件 ≤ 512 KiB、总 ≤ 2 MiB；
+内容必须是规范 base64 且解出来是合法 UTF-8；`skill.mjs` 里静态取得的 `id` 字面量必须等于 `slug`；
+`tools[]` 1..12、名字唯一且匹配 `^[a-z][a-z0-9_]{1,63}$`、`description` ≥ 20 字符。
+`security_score` = `max(0, 100 - 10 × 命中数)`（8 条模式），**只是提示与排序依据，不是安装闸门**。
+
+⚠ **发布路由的请求体上限是 `4 MiB`，不是 `config.maxBodyBytes`**：bundle 走 JSON + base64，
+2 MiB 原文编码后约 2.75 MiB，而 `maxBodyBytes` 默认只有 64 KiB —— 沿用默认值会让 413 先于任何校验发生，
+调用方拿到的是「体太大」而不是「你的包哪里不对」（§4.15 记的是同一个坑的另一半）。
 
 ---
 

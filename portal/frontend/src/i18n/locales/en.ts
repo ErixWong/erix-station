@@ -146,6 +146,8 @@ export const en = {
     whoNoFde: '{login} ({role})',
     cwdCopyTitle: '{cwd} (click to copy)',
     toLatest: '↓ Latest',
+    // issue #595: header entry to the capability market (views/MarketView.vue, route #/market).
+    marketEntry: 'Market',
     resizeSidebar: 'Resize sidebar',
     inputPlaceholder: 'Type a task, Enter to send (Shift+Enter for a newline)',
     systemInjection: '[system] {content}',
@@ -566,6 +568,29 @@ export const en = {
       interrupted: 'Interrupted',
       unknown: 'Unknown state',
     },
+    // issue #592: live sub-task badge (tail of RunStatusBar) + expanded panel (below it).
+    // State wording is **reused** from `state.*` above; `{count}` here is the number of **live**
+    // children (same ruler as `lib/delegate.ts#DELEGATE_LIVE_STATES`; terminal ones don't count).
+    activity: {
+      title: 'Sub-tasks {count}',
+      // "cannot read" and "there are none" need different wording (badge degraded state;
+      // design §4.2 last paragraph + the D9 rule).
+      titleUnknown: 'Sub-tasks ?',
+      toggleUnknown: 'Show or hide the sub-task panel (status temporarily unavailable)',
+      panelTitle: 'Sub-tasks {count}',
+      toggle: 'Show or hide the sub-task panel ({count} running)',
+      hint: 'Refreshes every 2s; shows only sub-tasks dispatched by the current run',
+      collapse: 'Collapse',
+      // 行里前面已经有一个状态词（`delegate.state.running` = "Running"），所以这里**不许**再说
+      // "running"（真机上渲染成 `Running running 20.0s`）；中文那份是 `已跑 {dur}`，无此问题。
+      elapsed: 'for {dur}',
+      view: 'View',
+      viewAria: 'View sub-task {id}',
+      unreadable: 'Sub-task status is temporarily unavailable',
+      // The roster still says live while the parent run already ended (a background child dies with the
+      // parent process, so `finishRun` never runs). It means "status unknown" — not failed, not running.
+      staleParentEnded: 'Parent run has ended; status unknown',
+    },
   },
   preview: {
     title: 'Preview {path}',
@@ -680,6 +705,79 @@ export const en = {
       occupancyUnknown: 'unknown whether this block is free: it is not in the latest snapshot’s free list (that list is truncated), so the server check decides.',
     },
   },
+  // Capability market, user side (views/MarketView.vue, issue #595;
+  // contract docs/design/capability-market.md §8). Copy rule (§8): no red/yellow/green --
+  // "installed but disabled" is neutral grey text, not a warning.
+  market: {
+    title: 'Capability market',
+    backToWorkbench: '← Back to workbench',
+    reload: 'Reload',
+    loading: 'Loading the market catalogue…',
+    empty: 'No published capability packages yet.',
+    intro: 'Published skill packages. Install one into your FDE workspace; only enabled ones' +
+      ' reach the model tool surface.',
+    budgetHint: 'Every enabled skill ships all of its tools into every single turn:' +
+      ' one FDE can enable at most {max} at a time.',
+    footnote: 'Uninstalling or disabling never re-downloads (disabling only flips a flag);' +
+      ' if you edited files in the package, "Reinstall" writes them back.',
+    version: 'version {version}',
+    tools: 'tools: {count}',
+    securityScore: 'security score: {score}',
+    scanHints: '{count} static scan hints',
+    kindMcp: 'MCP entry',
+    installBlockedMcp: 'P0 does not consume MCP, so this cannot be installed',
+    driftHint: 'Installed {installed}, market version {version}: reinstall to overwrite.',
+    installed: {
+      notInstalled: 'Not installed',
+      installedDisabled: 'Installed · disabled',
+      installedEnabled: 'Installed · enabled',
+    },
+    install: 'Install',
+    reinstall: 'Reinstall',
+    uninstall: 'Uninstall',
+    enable: 'Enable',
+    disable: 'Disable',
+    busy: 'Working…',
+    state: {
+      draft: 'Draft',
+      published: 'Published',
+      retired: 'Retired',
+      unknown: 'Unknown state',
+    },
+    result: {
+      installed: 'Installed {name}; it is usable from the next run once enabled.',
+      reinstalled: 'Reinstalled {name}.',
+      uninstalled: 'Uninstalled {name} (package directory removed).',
+      enabled: 'Enabled {name}; effective from the next run.',
+      disabled: 'Disabled {name}; files stay, re-enabling needs no download.',
+    },
+    detail: {
+      open: 'Details',
+      close: 'Close',
+      loading: 'Loading details…',
+      whenToUse: 'When to use',
+      tools: 'Tools',
+      toolsUnknown: 'No tool list supplied by the server.',
+      params: 'parameters: {params}',
+      readme: 'SKILL.md body',
+      readmeMissing: 'This package ships no SKILL.md.',
+      files: 'File list',
+    },
+    errors: {
+      notFound: 'This entry is no longer in the market (possibly retired): reload the list.',
+      notPublished: 'This entry is not published right now, so it cannot be installed' +
+        ' -- an admin has to publish it first.',
+      budgetExceeded: 'Enable limit reached: one FDE can enable at most {max} skills at a time.' +
+        ' Disable one before enabling this one.',
+      kindUnsupported: 'MCP entries are not supported in P0 (no MCP client on the runner side)' +
+        ' -- browse only, no install.',
+      installFailed: 'Install failed: {reason}',
+      reasonUnknown: 'no reason given',
+      validationFailed: 'Invalid input: the server named the field {field}.',
+      validationGeneric: 'Invalid input: the server did not name a field.',
+      generic: 'Request failed (HTTP {status}): {message}',
+    },
+  },
   admin: {
     title: 'FDE Station Admin Console',
     backToWorkbench: '← Back to workbench',
@@ -703,13 +801,90 @@ export const en = {
       // issue #485 slice A: upload limit (views/AdminUploadView.vue, contract docs/api/portal.md §4.15).
       // Sits after certs and before the read-only pool view: it is platform configuration.
       upload: 'Upload limit',
-      // issue #596 slice B: platform prompts page (views/AdminPromptsView.vue, contract
+      // issue #596 片 B: platform prompts page (views/AdminPromptsView.vue, contract
       // docs/api/portal.md §4.16). Order upload → prompts: both are platform settings that used
       // to require rebuilding station-portal.
       prompts: 'Prompts',
+      // issue #595 M2: capability market console (views/AdminMarketView.vue, contract §7 admin API).
+      // After the upload limit and before the read-only pool view: it is platform configuration.
+      market: 'Capability market',
+      // issue #586: About (the three version cells, read-only); views/AdminAboutView.vue.
+      about: 'About',
       // issue #528 (event platform W5): admin tabs for macro templates / macro runs (`07` §21.1 key table).
       macros: 'Macro templates',
       macroRuns: 'Macro runs',
+    },
+    // Capability market, admin console (views/AdminMarketView.vue, issue #595 M2;
+    // contract §7 admin API + §8 admin UI).
+    market: {
+      title: 'Capability market',
+      intro: 'Publish and maintain skill packages: metadata plus a multi-file bundle.' +
+        ' Whether the bundle is legal is decided by the server.',
+      footnote: 'The static scan is advisory, not a gate (§3): a low score blocks neither publishing' +
+        ' nor installing. Hard path/byte/count checks live in the server (validateBundle);' +
+        ' this page only blocks obviously wrong paths.',
+      loading: 'Loading entries…',
+      empty: 'No entries yet: use "Publish new entry".',
+      reload: 'Reload',
+      filterLabel: 'State',
+      filterAll: 'All',
+      colState: 'state',
+      colSlug: 'slug',
+      colVersion: 'version',
+      colInstalls: 'installs',
+      colScore: 'score',
+      colActions: 'actions',
+      publish: 'Publish',
+      retire: 'Retire',
+      edit: 'Edit',
+      detail: 'Details',
+      close: 'Close',
+      detailLoading: 'Loading details…',
+      files: 'File list',
+      filesUnknown: 'No file list supplied by the server.',
+      scanScore: 'static scan: {score}',
+      scanClean: 'The scan reported nothing.',
+      scanHintCount: '{count} hints',
+      createTitle: 'Publish new entry',
+      editTitle: 'Edit entry',
+      submitCreate: 'Publish',
+      submitSave: 'Save',
+      cancel: 'Cancel',
+      formIntro: 'Fields marked * are required by the server; this form does not enforce that itself.',
+      fSlug: 'slug *',
+      slugHint: 'Directory name: lowercase letters, digits, hyphens.' +
+        ' The server also requires the package\'s `skill.id` to equal it.',
+      fName: 'name *',
+      fSummary: 'one-line summary *',
+      fWhenToUse: 'when to use *',
+      whenToUseHint: 'This text is injected into the system prompt as the routing signal' +
+        ' (server limits it to 8..500 characters).',
+      fVersion: 'version *',
+      fAuthor: 'author',
+      fTags: 'tags',
+      tagsHint: 'Comma separated (e.g. pdf,docs).',
+      fLicense: 'license',
+      fDescription: 'detail body (markdown)',
+      filesLabel: 'Package files (multiple)',
+      bundleHint: 'The root must contain `skill.mjs`. Paths come from the relative directory' +
+        ' (file name only when no folder was picked); file count, byte limits, a missing entrypoint' +
+        ' and an id mismatch are all reported by the server.',
+      noFilesPicked: 'No files picked: required when creating, optional when editing' +
+        ' (nothing picked = metadata only).',
+      pickedSummary: '{count} files picked, {bytes} total',
+      detailMissingHint: 'Could not read this entry\u2019s details: the "when to use" field and' +
+        ' the body may be empty -- fill them in before submitting, or you may clear the originals.',
+      pathIssue: {
+        empty: 'the path is empty',
+        absolute: 'absolute path (not allowed)',
+        separator: 'the path contains a backslash',
+        parentRef: 'the path contains `..`',
+        tooLong: 'the path is too long (over 200 bytes)',
+      },
+      resultCreated: 'Published {slug}.',
+      resultUpdated: 'Updated {slug}.',
+      resultPublished: 'Published {slug} (state moved to published).',
+      resultRetired: 'Retired {slug} (existing installs keep working).',
     },
     macros: {
       title: 'Macro templates',
@@ -1097,6 +1272,48 @@ export const en = {
         freeList: 'the free block list is longer than the free count',
         hasMore: 'has_more=true but the free count is not greater than the number of listed items',
       },
+    },
+    // issue #586: the "About" panel (views/AdminAboutView.vue, contract docs/api/portal.md §4.16).
+    // The point is not "there is a version number" but **which of the three cells this is and where it
+    // was read from**: the v0.1.69 release baked a working tree stuck at 0.1.68 and the two sides
+    // disagreed for an hour with nothing in the UI to reveal it.
+    about: {
+      title: 'About this station',
+      intro: 'Read-only. Three version numbers, three sources, none replaces another: the server and the platform engine come from the build-info.json baked into the portal image; each FDE engine comes from a derived copy in the database.',
+      loading: 'Loading version info…',
+      notLoaded: 'Version info not loaded yet (no request has been made).',
+      fieldVersion: 'Version',
+      fieldRevision: 'Build revision (git)',
+      fieldBuiltAt: 'Built at',
+      unknown: 'unknown',
+      unparsable: 'Unparsable: {value}',
+      serverTitle: 'Server (portal image)',
+      serverHint: 'Which build the portal container itself is running.',
+      sourceBuildInfo: 'Source: build-info.json inside the image (build artifact, the only authority)',
+      sourceEnv: 'Source: an explicit environment override (tests / pinning), not what was baked into the image',
+      sourcePackage: 'Source: local package.json (dev fallback, not a build artifact)',
+      sourceUnknown: 'Source: unknown (neither build-info.json nor package.json could be read)',
+      sourceUnknownShape: 'Source: the server did not say, or said something unrecognized (not guessed)',
+      // The build-info path actually read (STATION_BUILD_INFO_PATH / ERIX_BUILD_INFO_PATH can move it => it must stay visible).
+      buildInfoPath: 'Read path: {path}',
+      engineTitle: 'Platform engine (erix-agent inside the portal image)',
+      engineHint: 'The engine the portal process itself uses. Not the one running in each FDE container - that is the third section.',
+      // Engine provenance wording follows the label the server derived (the frontend never infers);
+      // package.json = dev fallback, or this image never baked a build-info.json at all (old image).
+      engineSourceBuildInfo: 'Source: engine_version from build-info.json inside the image (build artifact, the only authority)',
+      engineSourcePackage: 'Source: local node_modules/erix-agent/package.json - a dev fallback, or this image has no build-info.json at all (old image); it is not a build artifact',
+      engineSourceEnv: 'Source: an environment override (it should not appear on the portal side; when it does, this is not a build artifact)',
+      engineSourceUnknown: 'Source: unknown (neither build-info.json nor package.json could be read)',
+      engineSourceUnknownShape: 'Source: the server did not say, or said something unrecognized (not guessed)',
+      fdesTitle: 'Engine per FDE',
+      fdesHint: 'Read from containers.agent_version - a derived copy, not authoritative.',
+      snapshotProvision: 'provision-time snapshot',
+      snapshotUnknown: 'no provenance given',
+      fdeProvisionedAt: 'provisioned {at}',
+      revoked: 'revoked',
+      fdesEmpty: 'The server says there are no FDE containers.',
+      fdesUnreadable: 'containers.agent_version could not be read (that is "unreadable", not "no FDEs").',
+      caveat: 'Provenance: the only authority is the build-info.json baked into the image; package.json is a build input, while git tags, image tags, digests and containers.agent_version are derived copies and must be labelled as such.',
     },
     llm: {
       sectionTitle: 'LLM providers',

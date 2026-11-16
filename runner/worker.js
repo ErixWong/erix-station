@@ -51,6 +51,9 @@ import { buildFailureEnvelope, finalTextFallbackField } from './lib/termination.
 import { textualizedToolCallField, toolCallMarkersFromEnv } from './lib/final-text-toolcall.js';
 // issue #451：AGENTS.md 链注入（采集器纯函数 + 可注入 fs，判据在 runner/test/agents-md.test.js）。
 import { collectAgentsMd, renderAgentsMdSection } from './lib/agents-md.js';
+// issue #595：能力市场的 L3 注入面——`~/.erix/capabilities.json` → 提示词末尾的「平台技能」段
+// + L2 的 `excludeSkillIds`（纯函数 + 可注入 fs，判据在 runner/test/capability-index.test.js）。
+import { buildCapabilityIndex } from './lib/capability-index.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
 // docs/host-consumer-contract.md §runToolLoop options 白名单含 system）——
@@ -87,7 +90,7 @@ import { collectAgentsMd, renderAgentsMdSection } from './lib/agents-md.js';
 //   伞域字面量」三条。
 const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，工作目录是项目目录 \`~/projects/<project>\`（本次 run 直接在此工作，交付物留在项目目录内）。
 
-工具面只有这些：文件工具 readFile / searchText / tree / edit / writeFile，外加 shell（在容器内执行命令）与 note_* 工作流工具。上游提供的 rg / grep 只是 searchText 的退役别名，本站没有注册它们——调不存在的工具只会拿到 Unknown tool。
+工具面 = 文件工具 readFile / searchText / tree / edit / writeFile，加 shell（在容器内执行命令）与 note_* 工作流工具；如果本提示词**末尾**出现了「平台技能」段，那里面列出的工具同样可以直接调（没这个段就是本容器没装启用的技能）。上游提供的 rg / grep 只是 searchText 的退役别名，本站没有注册它们——调不存在的工具只会拿到 Unknown tool。
 
 文件工具怎么用（照做可省掉大量返工）：
 - searchText：搜文件内容。mode **必填且没有默认值**——固定字符串传 mode="literal"，正则传 mode="regex"，漏传或写错直接是错误结果，没人替你猜。默认跳过 node_modules/dist/build/target/vendor 与所有点目录（含 .git），结果尾部的「已跳过 …」是**排除账**而不是错误：确实要把它们一起搜，就传 include_vendor=true / include_hidden=true。所以看到「（无命中）」先回看排除账，再决定要不要下「代码里没有」的结论。三件事含义不同，别混：「（无命中）」= 范围内没搜到；「错误：无效正则：…」= 你的正则写错了；「错误：…被宿主边界拒绝：…」= 路径越界或被遮蔽。全仓搜索请用 searchText 本身，别改用 shell 命令去代替它。
@@ -489,6 +492,45 @@ async function startRun(msg) {
     });
   }
 
+  // issue #595 §6：能力市场的两面注入。**一次采集、两处消费**：
+  //   L3 → `capabilitySection`（只列启用的，拼到提示词末尾）；
+  //   L2 → `capabilityExclude`（停用项的 id，送给 `buildSkillTools({excludeSkillIds})`）。
+  // 为什么两处必须同一次采集：分两次读就有两个时刻，文件在两刻之间被物化重写 ⇒ 提示词说有三条、
+  // 工具面只装了两条，模型会去调一个 Unknown tool（#451 定下的「采集点唯一」是同一个病）。
+  // 降级口径与 #451 逐字同构：抛不出去、不新增事件类型，只有失败时一条 warn + 成功时一条 info 记账。
+  let capabilitySection = '';
+  let capabilityExclude = [];
+  let caps = { status: 'ok', skills: [], note: null };
+  let capsOk = true;
+  try {
+    caps = buildCapabilityIndex({ home: process.env.HOME || '/home/erix' });
+    capabilitySection = caps.section;
+    capabilityExclude = caps.excludeSkillIds;
+  } catch (err) {
+    // `buildCapabilityIndex` 自己已经兜住了；这一层是**判据不同源**的冗余防线（采集器自己的
+    //  bug 也不允许把 run 打死：本段在 `runToolLoop` 之前，抛出去 = worker 死 = requeue）。
+    capsOk = false;
+    capabilitySection = '';
+    capabilityExclude = [];
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'warn',
+      msg: `capability index collection failed, run continues without it: ${String(err?.message ?? err)}`,
+    });
+  }
+  // 记账（与 #451 同形态的现成 IPC `MSG.LOG`，**不新增事件类型**）：status / 条数 / 段字节 / 是否截断。
+  // 为什么无论有没有技能都发：`status=missing` 也是有效信息（它区分「市场还是空的」与「读不到」）。
+  if (capsOk) {
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'info',
+      msg: `capabilities injected: status=${caps.status}`
+        + ` skills=${caps.skills.length}`
+        + ` excluded=${capabilityExclude.length}`
+        + ` section_bytes=${Buffer.byteLength(capabilitySection, 'utf8')}`
+        + ` truncated=${/还有 \d+ 项未列出/.test(capabilitySection) ? 1 : 0}`
+        + (caps.note ? ` note=${caps.note}` : ''),
+    });
+  }
+
   // issue #81 P2（conversation-state.md §4.1）：transcript key = sessionId（引擎 runToolLoop 的
   // store key），runId 退回纯运维身份（事件流/IPC）。store adapter 双身份：engine 面 key=sessionId，
   // U2 'running' 面真 runId（makeStore 第二参，见 store.js 头注释）。旧 ticket 无 session_id →
@@ -677,6 +719,9 @@ async function startRun(msg) {
       cwd,
       bundledDir: process.env.STATION_SKILLS_DIR || '/opt/erix/skills',
       builtinNames: [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas].map((s) => s.name),
+      // #595 §6 L2：市面停用的技能**目录仍在磁盘**（§4：启停只改库一行，磁盘不动），
+      // 不显式排除就会被 loader 照装——用户页面里关了，模型却还调得到。
+      excludeSkillIds: capabilityExclude,
     });
     for (const e of skillTools.errors) {
       sendIpc(process, {
@@ -932,8 +977,9 @@ async function startRun(msg) {
         // 上下文唯一来源 = transcript（conversation-state.md §6 契约③）。
         input: {
           // issue #451：AGENTS.md 链已由宿主注入（`agentsMdSection` 为空时**逐字节等于**原 SYSTEM_PROMPT）。
+          // issue #595：末尾再拼一段「平台技能」（`capabilitySection` 为空时同上，逐字节不变）。
           // 防漂移锁：runner/test/system-prompt.test.js 数本行的拼装形状（裸常量 = 注入整条死掉且不报错）。
-          system: SYSTEM_PROMPT + agentsMdSection,
+          system: SYSTEM_PROMPT + agentsMdSection + capabilitySection,
           wrapup: false,
           ...buildEngineSeedOptions({ resume: transcriptPlan.resume === true, task }),
         },

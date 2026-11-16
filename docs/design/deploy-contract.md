@@ -94,6 +94,12 @@
 > 都 `rc=0`；块内字段与红线见 `docs/api/portal.md` §5.1 的那条已接受损失注记 +
 > `portal/test/healthz-partial-buffer.test.js`）。**反过来不成立**：状态码语义（200=就绪 / 503=`migration_failed`）
 > 与 503 的错误信封**不许**为观测目的而动——§8 的 readiness 链吃的是它们，不是 body。
+>
+> **同一口径的第二例（#586 / 工单 261116-12）**：`version: {station, revision, builtAt}` 也是 additive
+> 进 200 的（改后 = `{"status":"ok","version":{…},"partialBuffer":{…}}`），因为发版事故里「跑的到底是
+> 哪份构建」对外零读数。它**不带引擎版本**（portal 侧引擎与每台 FDE 的引擎是两个数，混进一个公开零鉴权
+> 端点必被读错），读法只有一条：`portal/src/version-info.js` → `readBuildInfo()` → 镜像内 `build-info.json`，
+> 取不到就是 `unknown`。判据：`portal/test/health-version.test.js`；三格口径见 `docs/api/portal.md` §4.16。
 
 ### 2.4 `env_file` 约定与凭据注入
 

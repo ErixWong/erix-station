@@ -22,6 +22,11 @@ import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore } from '../stores/workbench';
 import { useRunMomentum } from '../composables/useRunMomentum';
+// issue #592：子 run 徒章挂在**本条尾部**（设计 §4.3：「RunStatusBar 尾部追加一段，不新开一条」——
+// 它已经是 run 级状态的唯一落点，#282 定的）。数据与轮询都在 store 里那一份
+// `useDelegateActivity`（两份实例 = 两份轮询），本组件只多画一个按钮；无活态子时它自己整段不出，
+// 所以本组件既不起定时器也不参与动量时钟（1s tick 与它的用例逐字不变）。
+import DelegateActivityBadge from './DelegateActivityBadge.vue';
 import {
   formatByteSize,
   formatElapsed,
@@ -208,5 +213,8 @@ const segments = computed<Array<{ text: string; title?: string }>>(() => {
     <span v-if="view.stalled && phaseSegment === null" class="run-status-frozen shrink-0 font-medium">
       · {{ t('runStatus.frozen', { sec: wholeSeconds(view.frozenMs) ?? 0 }) }}
     </span>
+    <!-- issue #592：尾部一段——子 run（delegation）活跃徒标（`子任务 N` + 转圈，点开面板）。
+         无活态子时组件自己整段不出 ⇒ 不破坏上面任何一段与既有用例。 -->
+    <DelegateActivityBadge />
   </div>
 </template>

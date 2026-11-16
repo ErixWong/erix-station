@@ -21,6 +21,9 @@ import { FDE_NAME_MAX_LEN } from './projects.js';
 // ⚠ 这是一对**双向引用**（`platform-prompts.js` 要从本文件拿渲染器与渲染预算）。两边都**只在函数体里**
 //   用对面导出的东西（模块求值期不读）⇒ ESM 循环引用安全；把它改成顶层常量就会碰到 TDZ。
 import { resolveEffectiveAgentsMd } from './platform-prompts.js';
+// issue #595 §5：市场索引的读库侧在 market.js（渲染在本文件，读在数据层——「谁该装什么」的判据
+// 只有一处，物化面与安装面不能各持一份）。只要 SQL/行映射，不要它的错误类，故指名 import。
+import { listCapabilitiesForFde } from './market.js';
 
 // 容器内用户名固定 erix（⚠️ 待决策者确认，user-space §2.4）。
 export const FDE_CONTAINER_USER = 'erix';
@@ -369,6 +372,35 @@ export function agentsMdRenderedBytes(
   return bodyBytes + addBytes + budget.identityTailBytes;
 }
 
+/**
+ * issue #595 §5：`~/.erix/capabilities.json` —— 市场与 runner 之间唯一的通道。
+ * 三条硬要求（缺一就整个方案不成立）：
+ *   ① **逐字节确定**：system 是引擎标记的 prompt 缓存稳定前缀，文件里出现时间戳就等于每次物化
+ *      都把整条前缀缓存打飞（所以这里**没有** generated_at 这一项）；
+ *   ② **不含密钥**：`~/.erix` 是 runner 文件面的只读例外（#259），agent `readFile` 直接读得到 ⇒
+ *      这个文件一旦带上 token 就等于把密钥贴给模型。判据在 test/materializer.test.js 的 secret 扫描；
+ *   ③ **空市场也是合法文件**：`{"version":1,"skills":[]}`，runner 读到它渲染出空段 = 提示词逐字节不变。
+ * 排序在渲染侧再做一次（SQL 里也排）：两侧各自都能兑现字节确定性，判据不同源。
+ * @param {Array<object>} capabilities §5 形状的条目（含 enabled=false 的，runner 要用它的 id）
+ */
+export function renderCapabilitiesJson(capabilities) {
+  const list = Array.isArray(capabilities) ? capabilities : [];
+  const skills = list
+    .filter((s) => s && typeof s.id === 'string' && s.id.length > 0)
+    .map((s) => ({
+      id: s.id,
+      name: typeof s.name === 'string' ? s.name : s.id,
+      summary: typeof s.summary === 'string' ? s.summary : '',
+      when_to_use: typeof s.when_to_use === 'string' ? s.when_to_use : '',
+      enabled: s.enabled !== false,
+      tools: (Array.isArray(s.tools) ? s.tools : []).filter((t) => typeof t === 'string'),
+      // null = 包里没带 SKILL.md：runner 侧据此决定要不要提示「需要时 readFile」
+      readme: typeof s.readme === 'string' ? s.readme : null,
+    }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return json({ version: 1, skills });
+}
+
 // P5 去项目化（directory-as-project §3/§5）：ports.json 升为 FDE 级单一文件 ~/.erix/ports.json——
 // allocations 不再按项目分组（port_allocations.project_id 已退役，迁移 0008）。
 export function renderPortsJson({ fdeName, allocations, generation, observedPorts = null }) {
@@ -431,7 +463,8 @@ export function hostPathFor(root, fdeName, containerPath) {
  * @returns { files: [{ containerPath, hostPath, content, mode }] }
  */
 export function buildFilePlan({
-  fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root, generation, platformPrompts = null,
+  fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root, generation,
+  platformPrompts = null, capabilities = [],
 }) {
   const files = [];
   const add = (containerPath, content, mode = FILE_MODE) => {
@@ -448,6 +481,9 @@ export function buildFilePlan({
   add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmBaseUrl }));
   add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson());
   add(`${CONTAINER_HOME}/.erix/ports.json`, renderPortsJson({ fdeName, allocations, observedPorts, generation }));
+  // #595：能力市场索引。缺省空数组 ⇒ 没装任何东西时它就是个空清单文件（不是「文件不存在」），
+  // runner 因此永远有一条确定的读路径，不必区分「没装」与「还没物化过」。
+  add(`${CONTAINER_HOME}/.erix/capabilities.json`, renderCapabilitiesJson(capabilities));
   return files;
 }
 
@@ -487,13 +523,14 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
    */
   async function materialize({
     fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, generation, prevManifest,
-    platformPrompts = null, materializedAt = new Date(),
+    platformPrompts = null, capabilities = [], materializedAt = new Date(),
   }) {
     const rootReal = path.resolve(root);
     const prevFiles = (prevManifest && prevManifest.files) || {};
 
     const files = buildFilePlan({
-      fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root: rootReal, generation, platformPrompts,
+      fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root: rootReal, generation,
+      platformPrompts, capabilities,
     });
 
     ensureWorkspaceDirs(files);
@@ -734,7 +771,7 @@ export function sleepCancellable(ms, signal) {
   });
 }
 
-async function readFdeDesiredState(pool, fdeId, config) {
+async function readFdeDesiredState(pool, fdeId, config, log = console) {
   // issue #183：awaiting_credential 也是「活」状态（容器/工作区已在，只是 Git 凭据待补），
   // 平台文件应照常物化——凭据待补不应阻塞 ~/.erix（否则 agent 每次 run 都 ENOENT config.json）。
   // 仅排除 disabled（offboarding 后不再物化）。
@@ -763,10 +800,22 @@ async function readFdeDesiredState(pool, fdeId, config) {
   } catch {
     // 观测表缺失/读失败：咨询位降级 null
   }
+  // #595 §5：市场索引按 fde 现查。读失败 ⇒ 空数组 + 一条 warn，**绝不让这轮对账停**：
+  // 市场读不到与 ports.json 读不到不是一个量级——前者只是「模型这次看不见技能」，
+  // 后者才是平台文件面的事故。让 0039 的读面问题把整条物化链打死是本末倒置。
+  // ⚠ 降级成**空清单**而不是「保留上一次的值」：P0 没有缓存层，读不到时写旧值会让
+  //   「库里已卸、文件里还写着」变成一份没人负责的幽灵账（§5 允许两种做法，这里选空）。
+  let capabilities = [];
+  try {
+    capabilities = await listCapabilitiesForFde(pool, fdeId);
+  } catch (err) {
+    log.warn?.(`[materializer] capabilities read failed fde=${fdeId}: ${err.message}`);
+  }
   return {
     fdeName,
     allocations: allocs.rows,
     observedPorts,
+    capabilities,
     llmBaseUrl: config.llmPublicBaseUrl,
     baseDomain: config.baseDomain,
   };
@@ -851,7 +900,7 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
   let processed = 0;
   for (const row of rows) {
     try {
-      const state = await readFdeDesiredState(pool, row.fde_id, config);
+      const state = await readFdeDesiredState(pool, row.fde_id, config, log);
       if (!state) {
         await markMaterializePublished(pool, row.id);
         continue;
@@ -866,6 +915,8 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
         llmBaseUrl: state.llmBaseUrl,
         allocations: state.allocations,
         observedPorts: state.observedPorts,
+        // #595：市场索引随 desired state 一起下来（读失败时是空数组，见 readFdeDesiredState）
+        capabilities: state.capabilities,
         generation: Number(row.revision),
         prevManifest,
         platformPrompts,
@@ -902,7 +953,7 @@ export async function rebuildAllFdes(pool, config, { log = console } = {}) {
     `SELECT id, fde_name FROM users WHERE fde_name IS NOT NULL AND status IN ('active', 'awaiting_credential')`,
   );
   for (const u of users.rows) {
-    const state = await readFdeDesiredState(pool, u.id, config);
+    const state = await readFdeDesiredState(pool, u.id, config, log);
     if (!state) continue;
     const rev = await pool.query(`SELECT revision FROM materialize_revisions WHERE fde_id = $1`, [u.id]);
     const generation = Number(rev.rows[0]?.revision ?? 1);

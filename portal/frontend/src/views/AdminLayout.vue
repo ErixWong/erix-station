@@ -47,11 +47,17 @@ const tabs = [
   // 号池占用（只读快照）之前。请求只在该视图挂载时发（`AdminPromptsView` 的 onMounted 是唯一触发点）。
   { name: 'admin-upload', label: 'admin.tabs.upload' },
   { name: 'admin-prompts', label: 'admin.tabs.prompts' },
+  // issue #595 M2：能力市场发布台（条目表 + 发布/下线 + 扇描结果）。与证书/上传同为平台配置，
+  // 因此排在号池占用（只读运维快照）之前。
+  { name: 'admin-market', label: 'admin.tabs.market' },
   // issue #350：号池占用总览（只读）。放在最后：先看用户/配置，选段时才来这里。
   { name: 'admin-preview-pool', label: 'admin.tabs.previewPool' },
   // issue #529（事件平台 W6）：宏模板配置 + 宏执行历史。追加在末尾（模板 → 执行历史）。
   { name: 'admin-macros', label: 'admin.tabs.macros' },
   { name: 'admin-macro-runs', label: 'admin.tabs.macroRuns' },
+  // issue #586：「关于」（版本三格，只读）。排在所有能操作的 tab 之后：它不帮人做决定，
+  // 只在「现在跑的到底是哪份构建」出问题时被点开（v0.1.69 那次分裂的那一小时）。
+  { name: 'admin-about', label: 'admin.tabs.about' },
 ] as const;
 
 async function onLogout() {

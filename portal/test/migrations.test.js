@@ -1092,8 +1092,8 @@ test('迁移 0033-delta-events-not-persisted：形态 M 是纯清理（零 DDL�
   // 0035（`macro-platform`，issue #524）追加之后本行退一支；0037（`notifications-and-origin`，
   // issue #526）再退一支 —— 口径不变：靠**绝对位置**钉住。
   // 而不是「0033 必须永远排末位」——后者已经被上面那 19 处 head 断言接管（它们现在钉 0037）。
-  assert.equal(files[files.length - 7], file,
-    '0033 是倒数第七支（0034 / 0035 / 0036 / 0037 / 0038 / 0039 追加在它后面，不许回头插队）');
+  assert.equal(files[files.length - 8], file,
+    '0033 是倒数第八支（0034 / 0035 / 0036 / 0037 / 0038 / 0039 / 0040 追加在它后面，不许回头插队）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里"索引""VACUUM"这些词都会出现，整文件 indexOf 会假绿）。
@@ -1153,9 +1153,9 @@ test('迁移 0034-prune-stale-run-checkpoints：纯清理（零 DDL）、cutoff 
   const file = '0034-prune-stale-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0034 存在');
-  assert.equal(files[files.length - 6], file,
-    '0034 是倒数第六支（新迁移只能追加，不回改已应用的编号）；'
-    + '0035 / 0036 / 0037 / 0038 / 0039 追加在它后面');
+  assert.equal(files[files.length - 7], file,
+    '0034 是倒数第七支（新迁移只能追加，不回改已应用的编号）；'
+    + '0035 / 0036 / 0037 / 0038 / 0039 / 0040 追加在它后面');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里 "VACUUM""索引""DELETE" 这些词都会出现，整文件判会假绿/假红）。
@@ -1229,8 +1229,8 @@ test('迁移 0035-macro-platform：三表齐全、两条唯一键在、FK 的 ON
   const file = '0035-macro-platform.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0035 存在');
-  assert.equal(files[files.length - 5], file,
-    '0035 是倒数第五支（0036 / 0037 / 0038 / 0039 追加在它后面；'
+  assert.equal(files[files.length - 6], file,
+    '0035 是倒数第六支（0036 / 0037 / 0038 / 0039 / 0040 追加在它后面；'
     + '新迁移只能追加，不回改已应用的编号）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
@@ -1307,14 +1307,14 @@ test('迁移 0038-transcript-recovery-rows：幂等键/append_seq 排序/只新�
   const file = '0038-transcript-recovery-rows.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0038 存在');
-  // 0039（`platform-prompts`，issue #596 片 A）追加在末位 ⇒ 本行从「末位」退成「倒数第二支」。
-  // 口径不变：靠**绝对位置**钉住（末位那条改由下面 0039 一节负责）。
-  assert.equal(files[files.length - 2], file,
-    '0038 是倒数第二支（0039 追加在它后面；新迁移只能追加，不回改已应用的编号）');
+  // 0039（`capability-market`，#595）与 0040（`platform-prompts`，issue #596 片 A）都追加在它后面
+  // ⇒ 本行从「末位」退成「倒数第三支」。口径不变：靠**绝对位置**钉住（末位那条由下面 0040 一节负责）。
+  assert.equal(files[files.length - 3], file,
+    '0038 是倒数第三支（0039 / 0040 追加在它后面；新迁移只能追加，不回改已应用的编号）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
-    Array.from({ length: 39 }, (_, i) => i + 1),
-    '迁移编号 = 1..39 连续无空洞（每加一支迁移都要同步这里）',
+    Array.from({ length: 40 }, (_, i) => i + 1),
+    '迁移编号 = 1..40 连续无空洞（每加一支迁移都要同步这里）',
   );
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
@@ -1381,6 +1381,123 @@ test('迁移 0038-transcript-recovery-rows：幂等键/append_seq 排序/只新�
   // 超时必须 SET LOCAL：runner 用池化连接，裸 `SET` 会漏给同一条连接的后续语句。
   assert.match(executable, /^SET LOCAL lock_timeout/m, 'lock_timeout 必须 SET LOCAL（随事务结束失效，不漏给后续语句）');
   assert.doesNotMatch(executable, /^SET lock_timeout/m, '不许裸 SET lock_timeout（同上）');
+});
+
+// issue #595（能力市场 P0）：三表形态 + 两条复合主键 + 枚举 CHECK + 幂等可重放。
+// 这里只钉「schema 事实」；校验规则（slug/路径/体积/id 一致性）的唯一真相在 portal/src/market.js，
+// 判据在 portal/test/market.test.js，DDL 不重复钉业务校验（否则两份真相）。
+test('迁移 0039-capability-market：三表齐全、包内容按 (item,version) 不可变、枚举 CHECK 在、零 UPDATE 回填', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const file = '0039-capability-market.sql';
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes(file), '0039 存在');
+  assert.equal(files[files.length - 1], file, '0039 是当前最后一支（新迁移只能追加，不回改已应用的编号）');
+  assert.deepEqual(
+    files.map((f) => Number(f.slice(0, 4))),
+    Array.from({ length: 39 }, (_, i) => i + 1),
+    '迁移编号 = 1..39 连续无空洞',
+  );
+
+  const sql = fs.readFileSync(path.join(dir, file), 'utf8');
+  // 去整行注释（同 0032 / 0035 / 0038 的口径）：头注释里会出现 UPDATE / DROP / INSERT 这些词。
+  const executable = sql.split('\n').map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('--')).join('\n');
+  for (const t of ['capability_items', 'capability_files', 'fde_capability_installs']) {
+    assert.match(executable, new RegExp(`CREATE TABLE IF NOT EXISTS ${t} \\(`), `${t} 必须存在且幂等`);
+  }
+  // 包内容按 (item, version) 复合主键：改版 = 新增行，就地 UPDATE 会让已装版本与账面脱钩
+  assert.match(executable, /PRIMARY KEY \(item_id, version, path\)/,
+    'capability_files 主键必须是 (item_id, version, path)（历史版本留得下，才谈得上以后开回滚）');
+  assert.match(executable, /PRIMARY KEY \(fde_id, item_id\)/,
+    'installs 主键必须是 (fde_id, item_id)（一人一条 = 幂等安装落库的那道天然闸门）');
+  // 枚举值写进 DB：state/kind 的取值集合是协议，被写侧校验与物化 SQL 同时引用
+  assert.match(executable, /CHECK \(state IN \('draft','published','retired'\)\)/, 'state 枚举不许漂');
+  assert.match(executable, /CHECK \(kind IN \('skill','mcp'\)\)/, 'kind 枚举不许漂（mcp 是 P1 的位子，今天只占位）');
+  // advisory 扫描分不得变成闸门：DDL 里不许出现「score 低于某值」这类约束
+  assert.doesNotMatch(executable, /security_score\s*(>=|>|<|<=)\s*\d/,
+    'security_score 是 advisory（只提示与排序），不是安装闸门 —— 闸门在 JS 侧，DDL 里不许出现第二份判据');
+  // 幂等可重放：零 UPDATE 回填、零 DROP、末尾 DO 块只读
+  assert.doesNotMatch(executable, /\bUPDATE\b/, '新表上线即空表，不许出现回填 UPDATE');
+  assert.doesNotMatch(executable, /\bDROP (TABLE|COLUMN|INDEX)\b/, '不许 DROP（改表形态是改形状，另开一支迁移）');
+  assert.doesNotMatch(executable, /INSERT INTO|DELETE FROM/, '末尾 DO 块只读：出现 INSERT/DELETE 就不计成本重放（README）');
+});
+
+// ---------------------------------------------------------------------------
+// 0039 之后补的**通用形状闸**（不是某支迁移的语义判据）：RAISE 的格式串
+// ---------------------------------------------------------------------------
+
+/** 剥掉 `--` 行注释与块注释（注释里写的 `RAISE … || …` 不该被抓）。 */
+function stripSqlComments(sql) {
+  return sql.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ');
+}
+
+/** 把单引号字面量折成一个占位符：这样「字面量文本里含 ||」不会被误判成拼接。 */
+function squashLiterals(sql) {
+  return sql.replace(/'(?:[^']|'')*'/g, " \u0000 ");
+}
+
+/**
+ * 找出「`RAISE <级别> 'a' || 'b', args`」这种写法。
+ * 为什么这是一条**必须存在**的闸（issue #595 真机实测）：PL/pgSQL 的 RAISE 第一个参数必须是
+ * **字面量格式串**，写 `'a' || 'b', n` 会在解析期就 `syntax error at or near "||"` ⇒ 整支迁移回滚 ⇒
+ * **镜像起不来**。0039 首跑正是这条（`0039: capability_items=% …' || '（全 0 = …）', n_items, …`）。
+ * 它是「没人真跑过」的典型形状：文件从没被 migrate runner 应用过，文本断言又全在讲 DDL ⇒ 全绿照过。
+ * 所以这条闸只管**形状**（RAISE 到第一个逗号之间不许有 `||`），不管语义，扫的是全部增量迁移。
+ * @returns {string[]} 每条命中给一段可定位的片段
+ */
+function raiseFormatConcat(sql) {
+  const scannable = squashLiterals(stripSqlComments(sql));
+  const hits = [];
+  const re = /\bRAISE\b(?:\s+(NOTICE|EXCEPTION|WARNING|INFO|DEBUG|LOG|SQLSTATE)\b)?([^;]*)/gi;
+  let m;
+  while ((m = re.exec(scannable)) !== null) {
+    const rest = m[2] ?? '';
+    const comma = rest.indexOf(',');
+    const formatPart = comma === -1 ? rest : rest.slice(0, comma);
+    if (formatPart.includes('||')) {
+      hits.push(`RAISE ${(m[1] ?? '<级别>')} ${formatPart.trim().slice(0, 80)}`);
+    }
+  }
+  return hits;
+}
+
+test('迁移形状闸：RAISE 的格式串必须是单个字面量（\'a\' || \'b\', args 在 PL/pgSQL 是语法错）', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.length >= 39, `迁移条数异常：${files.length}`);
+  const bad = [];
+  for (const f of files) {
+    for (const hit of raiseFormatConcat(fs.readFileSync(path.join(dir, f), 'utf8'))) bad.push(`${f}: ${hit}`);
+  }
+  assert.deepEqual(bad, [],
+    `RAISE 的格式串不许写成拼接（迁移会在解析期炸并整支回滚）：\n${bad.join('\n')}`);
+
+  // 反向自证：0039 首跑那条真机报错的形状必须被判不合格，否则这条闸就是恒真的。
+  // 首条 = 当时文件里的**逐字形状**（源：`git show 0888aec:deploy/migrations/0039-capability-market.sql`，
+  // 即主 agent 修之前的那一版）：本闸已拿那份原文跑过⇒命中 1 条；换成单字面量后⇒clean。
+  const offenders = [
+    `RAISE NOTICE '0039: capability_items=% / capability_files=% / fde_capability_installs=% 行'\n    || '（全 0 = 市场未发布，capabilities.json 将渲染成 {"version":1,"skills":[]}）',\n    n_items, n_files, n_installs;`,
+    `RAISE NOTICE 'a=% ' || 'b' || 'c', v;`,                                          // 多段拼接
+    `DO $$ BEGIN RAISE WARNING 'p=%' || 'q', v; END $$;`,                             // 藏在 DO 块里
+    `RAISE 'x' || 'y';`,                                                               // 省略级别（缺省 EXCEPTION）
+  ];
+  offenders.forEach((sql, i) => assert.equal(raiseFormatConcat(sql).length, 1,
+    `违规样本 ${i} 必须恰好被判一次不合格：${sql}`));
+
+  // 合法形状不许误伤：闸只管「格式串」那一段，参数里出现 `||` 是合法的。
+  [
+    `RAISE NOTICE 'a=%', n;`,
+    `RAISE NOTICE 'a=% / b=%', x || 'z', y;`,            // 拼接在**参数**里 ⇒ 合法
+    `RAISE NOTICE '文本里含 || 也只是普通字符';`,          // 字面量内部的 ||
+    `-- 注释里写 RAISE NOTICE 'a' || 'b', n; 不算\nRAISE LOG 'ok %', v;`,
+    `/* 块注释里同理 RAISE NOTICE 'a' || 'b'; */ RAISE INFO 'ok';`,
+    `EXCEPTION WHEN OTHERS THEN RAISE; END;`,            // 重抛（没有格式串）
+  ].forEach((sql, i) => assert.deepEqual(raiseFormatConcat(sql), [], `合法样本 ${i} 被误伤：${sql}`));
+
+  // 0039 那一条本身：必须保持「单字面量 + 三个参数」（别被下一个人"顺手美化"回拼接）
+  const m39 = fs.readFileSync(path.join(dir, '0039-capability-market.sql'), 'utf8');
+  assert.match(m39, /RAISE NOTICE '[^']*'\s*,\s*\n?\s*n_items, n_files, n_installs;/s,
+    '0039 收尾的 DO 块 NOTICE 必须是单字面量格式串 + 三个参数');
 });
 
 // ---------------------------------------------------------------------------
