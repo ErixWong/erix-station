@@ -595,6 +595,26 @@ export const zhCN = {
       interrupted: '已中断',
       unknown: '状态未知',
     },
+    // issue #592：活跃子 run 徽标（RunStatusBar 尾部）与展开面板（状态条下方）。
+    // 状态词汇**复用**上面的 `state.*`（不另造一份）；这里的 `{count}` 是**活态**子数
+    // （尺规 = `lib/delegate.ts#DELEGATE_LIVE_STATES`，终态子不计数）。
+    activity: {
+      title: '子任务 {count}',
+      // 「读不到」与「没有」必须两种说法（徒标的降级态；设计 §4.2 末段 + D9 口径）。
+      titleUnknown: '子任务 ?',
+      toggleUnknown: '展开或收起子任务面板（状态暂不可读）',
+      panelTitle: '子任务 {count}',
+      toggle: '展开或收起子任务面板（{count} 个在跑）',
+      hint: '每 2 秒刷新，只读当前 run 派出的子任务',
+      collapse: '收起',
+      elapsed: '已跑 {dur}',
+      view: '查看',
+      viewAria: '查看子任务 {id}',
+      unreadable: '子任务状态暂不可读',
+      // 名册还写着活态、但父 run 已终态（后台子随父进程消失 ⇒ `finishRun` 永远不会跑）。
+      // 它是「状态未知」，不是失败也不是在跑（D9 的 ⚪ 口径）。
+      staleParentEnded: '父 run 已结束，状态未知',
+    },
   },
   // 文件预览 modal（components/FilePreviewModal.vue）
   preview: {
