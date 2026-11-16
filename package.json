@@ -17,6 +17,7 @@
     "test:integration:wp5": "node --test portal/integration/wp5-e2e.mjs",
     "test:integration:wp6": "node --test portal/integration/wp6-llm-e2e.mjs",
     "test:integration:db": "node --test portal/integration/db-integration.mjs",
+    "test:integration:prompts": "node --test portal/integration/platform-prompts-db.mjs",
     "start": "node portal/src/cli.js serve",
     "db:migrate": "node portal/src/cli.js migrate",
     "healthcheck": "node portal/src/cli.js healthcheck",
