@@ -13,7 +13,7 @@
 // ⚠ 后端 admin 流水**不含 sessionId / childSessionId**（决策者 2026-11-15）⇒ 没有会话列、
 //   没有点进会话的链接。软删模板的「（已删除）」由前端从 `includeDeleted` 的模板表**派生**
 //   （后端流水是 INNER JOIN，模板行仍在，但没下发 deleted 标志）。
-import { onMounted, reactive, ref, watch } from 'vue';
+import { onMounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
 import { VERDICT } from '@shared/macro-kinds';
@@ -57,7 +57,7 @@ const emptyFilters = (): MacroRunFilters => ({
   templateId: '', status: '', verdict: '', from: '', to: '', userId: '',
 });
 
-const filters = reactive<MacroRunFilters>(emptyFilters());
+const filters = ref<MacroRunFilters>(emptyFilters());
 const items = ref<AdminRunItem[]>([]);
 const nextCursor = ref<string | null>(null);
 const summary = ref<AdminSummary | null>(null);
@@ -77,13 +77,14 @@ function toIso(local: string): string | null {
 
 function buildQuery(cursor: string | null): URLSearchParams {
   const q = new URLSearchParams();
-  if (filters.templateId) q.set('templateId', filters.templateId);
-  if (filters.status) q.set('status', filters.status);
-  if (filters.verdict) q.set('verdict', filters.verdict);
-  if (filters.userId) q.set('userId', filters.userId);
-  const from = toIso(filters.from);
+  const f = filters.value;
+  if (f.templateId) q.set('templateId', f.templateId);
+  if (f.status) q.set('status', f.status);
+  if (f.verdict) q.set('verdict', f.verdict);
+  if (f.userId) q.set('userId', f.userId);
+  const from = toIso(f.from);
   if (from) q.set('from', from);
-  const to = toIso(filters.to);
+  const to = toIso(f.to);
   if (to) q.set('to', to);
   if (cursor) q.set('cursor', cursor);
   q.set('limit', String(PAGE_LIMIT));
