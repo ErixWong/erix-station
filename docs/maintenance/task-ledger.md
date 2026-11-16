@@ -7930,7 +7930,34 @@ W6（#529 管理台 UI）。
 **未做**（仍在可研，不属本版范围）：E3 端口对账 / E4 证书 / `run-recover` / 语义源 /
 工作项账本 / 外部集成（Slack、GitHub PR 通知）。
 
-### 8.149 portal 镜像未拷 `portal/shared/` 止血：`@shared` 别名目标补进镜像 + 防回归判据（issue #589，2026-11-16，主 agent + worker + copilot 评审）
+### 8.149 子 run 活动可视化：可研 + 立项三单（#591 / #592 / #593，2026-11-16，主 agent）
+
+**问题**：delegation P1/P2/P3 落地后，界面上**看不见正在跑的子 run**。现场三条（都现查）：
+① 门户名册端点 `GET /api/sessions/:id/delegates?runId=` 是 P2 交付的，**前端零消费**
+（`grep -rn delegates portal/frontend/src` 只有抽屉用的账本 URL）；
+② 前台子要等引擎 `await child` 才回 `runId`（`erix-agent/src/tools/delegation/tool.js:433-449`）
+⇒ 跑着的时候前端连 `childRunId` 都没有 ⇒ 工具卡「查看子任务」按钮不存在（`StreamPanel.vue:208` 的 `openable`）；
+③ `RunStatusBar.vue` 里没有任何子 run 段（2026-11-08 设计 §6 那一格从未实现）。
+不可见窗口 = 单子 240s × 并发 2 ⇒ 最长约 4 分钟只有一张哑卡。
+
+**可研结论**（`docs/design/delegation-activity-2026-11-16.md`，PR #590）：
+- 「在干啥」的**唯一**来源是子 run 账本（0.23 起「一条消息一落盘」⇒ **工具粒度**，真机样本 21KB/38KB）；
+  名册只有状态词汇，`recovery.jsonl` 只有 `toolUseId` 没有工具名，且引擎**没有导出**任何尾读器
+  （实测 `erix-agent` 根与 `erix-agent/tools` 两处 `tailChildTranscript` / `readTranscriptTailLines` /
+  `listRecoveryRows` 全 `undefined`）⇒ 只能走门户自己的 `foldLedgerRecords` → `projectTranscriptForDisplay`。
+- 三条通路并列比过：**轮询读侧（A，决策者 2026-11-16 批准）** / 子事件冒泡 SSE（B，成本在事件面四处集合
+  + 断线补偿 + 子事件挂父 run_id 会污染父时间线）/ 宿主 sidecar（C，第二份真相 + 清理债）。
+  「放宽 DDL 让子 run 成会话」作为结构性方案**记录否决**（`runs_one_active_per_session` 同时是 notes
+  单写者不变量的依据）。
+- 三个真机坑写进文档：门户**不能**用名册的 `pid` 判活（容器内 PID vs 宿主，两个 namespace）；
+  后台子会留**永久 `running`**（父跑完 200ms 后 worker `process.exit(0)`，嵌套子随进程消失 ⇒
+  `finishRun` 永不执行）⇒ 只做 `stale` 标记、门户零写操作；`deadlineAt` 缺省不存在（只有模型显式传
+  `deadlineMs` 才写）⇒ 不画预算进度条；per-child token 不在名册里。
+
+**立项**：#591 父单 · #592 W1 前端（接已有端点，**零后端改动**）· #593 W2 端点 `?activity=1`（缓存 + `stale`）。
+串行（W2 的 DTO 会被 W1 的组件消费）。**未实现**，实现账等落地后另记。
+
+### 8.150 portal 镜像未拷 `portal/shared/` 止血：`@shared` 别名目标补进镜像 + 防回归判据（issue #589，2026-11-16，主 agent + worker + copilot 评审）
 
 接 §8.147 / §8.148。**main 于 `04c7d83` 常红**（CI run `43817003603` 的「构建校验：station-portal 镜像」），
 根因不是老问题，是 §8.147 那天**新长出来的形状**：
