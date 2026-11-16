@@ -24,6 +24,23 @@
 --
 -- 单行：`id int PRIMARY KEY DEFAULT 1 CHECK (id = 1)` —— 与 0026/0036 同一手法，把「只能有一行」写成
 --   **DB 事实**。两行配置 = 谁生效取决于 `ORDER BY`，那是不可调试的形态。
+--
+-- ⚠ **为什么还要种下 `id = 1` 这一行**（独立评审 F1，契约 §2）——不是「省一次 INSERT」的优化，是补一个锁洞：
+--   写侧那条语句（`portal/src/platform-prompts.js` 的 `SAVE_SQL`）靠
+--   `SELECT … FROM platform_prompts WHERE id = 1 FOR UPDATE` 拿旧值快照，而 **`FOR UPDATE` 只能锁已经存在的
+--   行**：空表里没有任何行可锁 ⇒ 两个并发首写各拿一份「无行」快照（三列全 `COALESCE(…, '')`）、各写自己那一格
+--   ⇒ 后写的那条 `ON CONFLICT DO UPDATE` 把**整行**覆盖 ⇒ 先写的值丢了、它的 `previous_*` 也无从谈起。
+--   可选的补法里为什么不选别的：
+--     * 「把 `snap` 换成对不存在的键加锁（advisory lock / 锁表）」——引入一把与数据无关的锁，而 0026/0036
+--       两张同形表都没这么做，长出来的第二套并发模型要后人记住；
+--     * 「只在 JS 侧加互斥」——portal 可以起多个副本，进程内互斥锁不住跨连接的 `FOR UPDATE` 窗口。
+--   种一行让 `FOR UPDATE` **有行可锁**：DB 里本来就有 `id = 1` 这一把锁，写侧一条语句都不用改。
+--   代价是这条迁移多一行 `INSERT`，而它是幂等的（`ON CONFLICT (id) DO NOTHING` ⇒ 重放零变化，
+--   也不会覆盖管理员已经改过的文本）。
+--   ⚠ 种行**不等于**读侧可以省掉「无行」那一档：手工 `DELETE`、部分恢复的 dump、`TRUNCATE` 都能让表重新变空
+--   ⇒ 读侧 `resolveFromRow` 的 `no_row` ⇒ 回落内置必须留着（判据 `P1`），写侧 `snap` 取不到行时的
+--   `LEFT JOIN + COALESCE` 也照旧成立。
+--
 -- ⚠ 长度上限**不在 DB**，但**必须在写侧**（`AGENTS_MD_INJECT_MAX_BYTES`）：注入侧
 --   （`runner/lib/agents-md.js`）超过 16 KiB 会**静默截断**只留 marker —— 不拦的后果是「管理员写完
 --   8 KiB 追加段什么也不会发生，直到某天发现约定被切了一半」。对账用例：
@@ -31,9 +48,12 @@
 --
 -- `updated_by` 是 uuid 但**不建 FK**（照 0026/0036）：管理员行被停用/删除后配置要留着。
 --
--- 幂等可重放（deploy/migrations/README.md 单文件约定）：只有 `CREATE TABLE IF NOT EXISTS`，
---   第二遍是零 DDL 空操作；末尾 DO 块**只读**，打印重放证据（无行也是正常态 ⇒ NOTICE，不是 EXCEPTION）。
+-- 幂等可重放（deploy/migrations/README.md 单文件约定）：只有 `CREATE TABLE IF NOT EXISTS` + 一条
+--   `INSERT … ON CONFLICT DO NOTHING`，第二遍是零 DDL、零数据变化（`DO NOTHING` ⇒ 永不覆盖已改过的文本）；
+--   末尾 DO 块**只读**，打印重放证据（无行也是正常态 ⇒ NOTICE，不是 EXCEPTION）。
 --   baseline `docs/data/schema.sql` 一个字节都不改（冻结）。
+--   ⚠ 本片（#596 片 A）**尚未进入任何已部署库** ⇒ 本文件在同一片里迭代（加上面那条种行）不碰
+--     deploy/migrations/README.md 那条「已应用的迁移不可再改」的红线；一旦上线就只能新增 0040。
 
 CREATE TABLE IF NOT EXISTS platform_prompts (
   id                 int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -47,7 +67,13 @@ CREATE TABLE IF NOT EXISTS platform_prompts (
   updated_by         uuid
 );
 
--- 重放证据（只读）：打印当前行数与三列是否仍在跟随内置。无行 = 从未配置 = 三块全跟随内置，是上线形态。
+-- 种首行（评审 F1）：让 `SAVE_SQL` 的 `FOR UPDATE` 从第一次保存起就**有行可锁**。
+-- 三列取库里的 DEFAULT（`''` = 跟随内置）⇒ 种行本身不改变任何生效值：读侧仍是「三块全跟随内置」。
+-- `ON CONFLICT (id) DO NOTHING` ⇒ 重放零变化，也绝不覆盖管理员已经改过的文本。
+INSERT INTO platform_prompts (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- 重放证据（只读）：打印当前行数与三列是否仍在跟随内置。上线形态 = 1 行且三列全空（上面那条种行）。
+-- 行数 0 仍然合法（手工 `DELETE` / 部分恢复的 dump）⇒ 那是 NOTICE 不是 EXCEPTION：读侧对无行照样回落内置。
 DO $$
 DECLARE
   row_count bigint;
