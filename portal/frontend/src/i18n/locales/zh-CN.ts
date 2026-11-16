@@ -861,6 +861,8 @@ export const zhCN = {
       bundleHint: '根目录必须有 `skill.mjs`。path 取目录相对路径（没选目录就是文件名）；' +
         '文件数/字节上限、缺入口、id 对不上都由服务端报错。',
       noFilesPicked: '没选文件：新建时必须选，编辑时不选就是只改元数据。',
+      detailMissingHint: '这个条目的详情没读到：「何时用」「正文」可能是空的，' +
+        '请补齐再提交（否则可能把原值清空）。',
       pickedSummary: '已选 {count} 个文件，共 {bytes}',
       pathIssue: {
         empty: '路径是空的',

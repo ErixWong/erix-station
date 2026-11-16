@@ -391,11 +391,21 @@ describe('⑦ 服务端 400 的字段点名（details.field）', () => {
   });
 });
 
+/** 编辑要读一次详情（§7-3 的列表不保证带 `when_to_use`，见视图里 `openEdit` 的注释）。 */
+const detailOfP1 = {
+  id: 'p1', slug: 'p1', name: '能力 p1', state: 'published', version: '1.0.0', installs: 0,
+  security_score: 90, when_to_use: '原有的何时用', description_md: '原有正文',
+  author: '平台', license: 'MIT',
+};
+
 describe('⑧ 编辑（PUT）', () => {
   it('不选新文件 ⇒ PUT 不带 bundle；带了才带', async () => {
     const { wrapper, calls } = await mountWith((call) => {
       const base = listHandler(call);
       if (base) return base;
+      if (call.method === 'GET' && call.url === adminMarketItemPath('p1')) {
+        return json(200, { item: detailOfP1 });
+      }
       if (call.method === 'PUT' && call.url === adminMarketItemPath('p1')) {
         return json(200, { item: item('p1', { version: '1.0.1' }) });
       }
@@ -404,6 +414,10 @@ describe('⑧ 编辑（PUT）', () => {
     await wrapper.get('[data-test="market-edit-p1"]').trigger('click');
     await flushPromises();
     expect(wrapper.get('[data-test="field-slug"]').element).toHaveProperty('value', 'p1');
+    // 编辑**先回填详情**：只改版本号时不能把必填的 `when_to_use` 发成空串
+    expect(wrapper.get('[data-test="field-when_to_use"]').element)
+      .toHaveProperty('value', '原有的何时用');
+    expect(wrapper.get('[data-test="field-license"]').element).toHaveProperty('value', 'MIT');
     await wrapper.get('[data-test="field-version"]').setValue('1.0.1');
     await wrapper.get('[data-test="market-submit"]').trigger('submit');
     await flushPromises();
@@ -411,6 +425,7 @@ describe('⑧ 编辑（PUT）', () => {
     const put = calls.find((c) => c.method === 'PUT');
     expect(put?.url).toBe(adminMarketItemPath('p1'));
     expect(put?.body?.version).toBe('1.0.1');
+    expect(put?.body?.when_to_use).toBe('原有的何时用');
     expect('bundle' in (put?.body as Record<string, unknown>)).toBe(false);
 
     await wrapper.get('[data-test="market-edit-p1"]').trigger('click');
@@ -420,6 +435,21 @@ describe('⑧ 编辑（PUT）', () => {
     await flushPromises();
     const secondPut = calls.filter((c) => c.method === 'PUT').at(-1);
     expect(secondPut?.body?.bundle).toBeDefined();
+  });
+
+  it('回填详情读失败 ⇒ 页面明说「那几格可能是空的」（不假装表单是全的）', async () => {
+    const { wrapper } = await mountWith((call) => {
+      const base = listHandler(call);
+      if (base) return base;
+      if (call.method === 'GET' && call.url === adminMarketItemPath('p1')) {
+        return fail(500, 'internal', 'db down');
+      }
+      return undefined;
+    });
+    await wrapper.get('[data-test="market-edit-p1"]').trigger('click');
+    await flushPromises();
+    expect(exists(wrapper, 'form-prefill-failed')).toBe(true);
+    expect(text(wrapper, 'form-prefill-failed')).toContain('详情');
   });
 });
 

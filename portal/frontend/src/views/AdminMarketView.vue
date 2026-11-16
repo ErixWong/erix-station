@@ -142,6 +142,8 @@ const formError = ref<string | null>(null);
 const fieldError = ref<AdminFieldKey | null>(null);
 /** 上一次提交的扫描结果（§3：advisory，发布后要在页面上看得见）。 */
 const scanResult = ref<AdminMarketDetail | null>(null);
+/** 编辑时「补全元数据的那次详情读失败了」——界面必须说清那几格可能是空的（不假装表单是全的）。 */
+const editPrefillFailed = ref(false);
 
 const formTitle = computed(() =>
   (editingId.value === null ? t('admin.market.createTitle') : t('admin.market.editTitle')));
@@ -159,26 +161,45 @@ function openCreate(): void {
   formOpen.value = true;
 }
 
-/** 编辑：把列表行里的已知字段填回去（`when_to_use` / `description_md` 列表可能不带 ⇒ 空着）。 */
-function openEdit(row: AdminMarketItem): void {
+/**
+ * 编辑：先用列表行填能填的，再取一次详情把 §7-3 列表**不保证带**的那几格补上。
+ *
+ * 为什么必须先取详情：`when_to_use` 是必填（§3），而列表 DTO 里它可能缺席。直接开表单 ⇒
+ * 管理员只改版本号，PUT 却把 `when_to_use` 发成空串 ⇒ 服务端 400 或**把原值清空**。
+ * 详情读失败（404 / 网络）⇒ 那几格留空，但**页面上说清楚**（`detailMissingHint`），
+ * 让管理员知道要重写而不是以为表单是全的。
+ */
+async function openEdit(row: AdminMarketItem): Promise<void> {
   form.value = {
     slug: row.slug,
     name: row.name,
     summary: row.summary,
-    when_to_use: detail.value?.slug === row.slug ? detail.value.whenToUse : '',
+    when_to_use: '',
     version: row.version,
     author: '',
     tags: row.tags.join(', '),
     license: '',
-    description_md: detail.value?.slug === row.slug ? detail.value.descriptionMd : '',
+    description_md: '',
   };
   editingId.value = row.id;
   picked.value = [];
   pathIssues.value = [];
   formError.value = null;
   fieldError.value = null;
+  editPrefillFailed.value = false;
   scanResult.value = null;
   formOpen.value = true;
+  try {
+    const full = normalizeAdminDetail(await api(adminMarketItemPath(row.id)));
+    if (full === null || editingId.value !== row.id) return;
+    // 只补**没填过**的格子：详情在路上时管理员可能已经敲了字，别覆盖他的输入。
+    form.value.when_to_use = form.value.when_to_use || full.whenToUse;
+    form.value.description_md = form.value.description_md || full.descriptionMd;
+    form.value.author = form.value.author || (full.author ?? '');
+    form.value.license = form.value.license || (full.license ?? '');
+  } catch {
+    if (editingId.value === row.id) editPrefillFailed.value = true;
+  }
 }
 
 function closeForm(): void {
@@ -446,6 +467,12 @@ function invalid(key: AdminFieldKey): boolean {
       <form data-test="market-form" class="grid max-h-[80vh] gap-2 overflow-y-auto p-3" @submit.prevent="submit">
         <h3 class="text-base font-medium">{{ formTitle }}</h3>
         <p class="text-xs text-black/55">{{ t('admin.market.formIntro') }}</p>
+        <p
+          v-if="editPrefillFailed"
+          data-test="form-prefill-failed"
+          class="syserr text-xs"
+          role="alert"
+        >{{ t('admin.market.detailMissingHint') }}</p>
 
         <label class="flex flex-col gap-1 text-xs text-black/55">
           {{ t('admin.market.fSlug') }}
