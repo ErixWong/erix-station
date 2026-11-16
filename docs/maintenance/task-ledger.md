@@ -7340,3 +7340,60 @@ E5 = `$` 插值/未闭合/垃圾三形点名到行）；负例门新增**陷阱 
 ② compose 版本相关：`COMPOSE_PARSE_CASES` 的读数表钉的是 **2.40.3**，别处版本若改了口径，E4 现场复核对不上会红
 （这正是它存在的理由，不要顺手改表）；③ 第三方复审另外四条（链接目标 EACCES 归 missing、`FDE_POOL=large` 白名单可缺
 large 段、`$TMPDIR` 是链接时的夹具前提、「三态」措辞）本轮按裁决**未做**，另起一轮；④ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
+
+### 8.142 事件平台 W3 落地 + 迁移让号 0037 + 迁移编号撞车的处理口径（#526，2026-11-16，主 agent + erix_run）
+
+接 §8.130。**W3（通知 + HTTP API）已合并进 main**（PR #564，`f0a7af4`）。
+
+| 单 | PR | 合并 | 轮数 |
+|---|---|---|---|
+| W3 通知 + 14 端点（#526） | #564 | `f0a7af4` | 80 + 复验收紧 92 |
+
+**交付**：`0037-notifications-and-origin.sql`（`notifications` 表 + `chat_sessions.origin` 列）、
+`portal/src/notifications.js`（读写层 + `deliverIntent`）、`portal/src/macro-routes.js`（14 handler）、
+`http.js` 接线（业务逻辑不进那个 4741 行的文件）、接上 W1 的 `// TODO(W3)` 软删接点。
+
+**契约里三条最容易做错的，都按 `10` 篇钉住了**：
+① `summary` 的分母是 `done` 不是 `triggered`（`byVerdict` 各桶都是
+`COUNT(*) FILTER (WHERE verdict = '…')`，`skipped`/`failed` 的 `verdict` 是 NULL ⇒ 天然不并入；
+**别「顺手优化」成 `verdict IS NULL ⇒ unclassified`**，那会把 skipped/failed 吸进分母）；
+② 白名单映射不是黑名单删除（`toPublicTemplate` 只列六个键；admin 流水不含 `sessionId`/`childSessionId`）；
+③ `severity` 由「收件人 + 结果」推导。
+
+**主 agent 抓到的弱测试（已收紧）**：原「判据5」写的是
+`deliverIntent(pool, intent, { recipients: [] })` —— **恒真**（空数组是调用方给的，
+函数只是「空就不循环」）。它证明不了契约 §3.4 的真语义「收件人**只有管理员** ⇒ 不写行」。
+⇒ `deliverIntent` 加**写侧角色闸**（自己查 `users.role`，不信调用方），
+判据5 重写成真角色用例（admin / 混合 / 失败 / 全无效 id / 去重 / 空清单）。
+反向自证：去掉角色过滤 ⇒ `not ok 7` 红（admin 名下真写出了一行）；还原后 13/13 绿。
+⇒ **口径：凡是「某类调用方不许发生某事」的判据，用例必须让那个调用方真的出现一次，
+用「空集合恒真」来充当判据等于没测。**
+
+**六个变异全部命中**：`unclassified` 吸 NULL、`toPublicTemplate` 改黑名单、非属主改 403、
+admin 流水加 `sessionId`、`severity` 恒 `info`、软删不查 `notifications`。
+
+---
+
+#### 迁移编号撞车：处置口径（本批第一次真撞上）
+
+rebase 到 main 时发现**另一个 session 先合了 `0036-upload-settings.sql`**，而 W3 也建了
+`0036-notifications-and-origin.sql` ⇒ 同一编号两个文件、`migrations.test.js` 三方冲突
+（19 处 head 断言 + 4 处 `Array.from` + 0033/0034/0035 的相对位置断言）。
+
+处置：**后进入的让号**（W3 改 `0037`），并把 19 处 head 断言 36→37、4 处 `Array.from({length})`、
+三处相对位置断言（`-4`→`-5`、`-3`→`-4`、`-2`→`-3`）**一并顺移**。
+rebase 后 69/69 全绿（含 upload-settings 那支）。
+
+⇒ **口径：① 加迁移前先 `git fetch && git ls-tree --name-only origin/main deploy/migrations/ | tail -3`
+现查 head，别信自己记忆里的编号；② 撞了就后进入的让号，绝不回改已应用的编号；
+③ 相对位置断言（`files.length - N`）比 head 断言更容易漏 —— 让号时两个都要顺移。**
+
+#### 顺带记两个操作坑
+
+- `gh pr create` 报 `Head sha can't be blank` = **分支还没推**（不是 gh 的问题）。
+- `gh pr edit --body-file` 在本机 **rc=1 什么都不写**（§3.7 记的是 rc=0 空写，两种都有）。
+  改 PR body 一律走 REST：`gh api repos/<o>/<r>/pulls/<n> -X PATCH --input <json>`，**写完回读确认**。
+- 直连 GitHub 有一次 133s 超时 ⇒ 换显式代理
+  `git -c http.proxy=http://proxy.internal:19001 -c https.proxy=…` 立刻通（与 §4 记载一致）。
+
+**待办**：W4a（#537，在跑）、W4b（#538）、W7（#536）、W5/W6。
