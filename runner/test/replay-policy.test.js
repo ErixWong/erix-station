@@ -22,24 +22,34 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // ⚠⚠ 本版最重要的一条结论（别让后来者读反）
 // ─────────────────────────────────────────────────────────────────────────────
-// **在 0.33.0 + 本站能力面（`runner/lib/store.js` 那 5 个方法）上，`run.replayPolicy`
-// 已经无可观测效果**——传 `per-tool-declaration` 与传 `always-replay`，resume 期 executor
-// 都是 0 次（261115 在装着的 0.33.0 上实测，两个变体逐字相同）。
+// **【#500 之前的历史结论，保留原文别删】在 0.33.0 + 当时本站能力面（`runner/lib/store.js`
+// 那 5 个方法）上，`run.replayPolicy` 已经无可观测效果**——传 `per-tool-declaration` 与传
+// `always-replay`，resume 期 executor 都是 0 次（261115 在装着的 0.33.0 上实测，两个变体逐字相同）。
+//
+// **本单（#500）把三件套接上之后这条前提已经不成立了**：`makeStore()` 现在带着
+// `appendRecoveryRow` / `listRecoveryRows` / `clearRecoveryRows`（生产代码，不是夹具），
+// `replayPolicy` 重新有牙。本文件里 `recoveryRows: false` 那一组现在读作
+// **「#500 之前的本站」**（历史形态对照），`recoveryRows: true` 那一组读作**现况**；
+// 两组断言都原样留着——留着不是为了怀旧，是因为「没有证据时不重放」这条保护
+// 在两种形态下都必须成立（只是**理由**不同，见下面 ①②③）。
 //
 // 根因（源码，不是猜测）：`resume-manager.js:837-853`
 //   `ctx.resumePendingTools = pendingTools.filter((t) => replayableToolUses.has(t))`，
 // 而 `replayableToolUses` 只有在**同批更早的一个 `tool_use` 被判定为已完成**时才纳入后面缺失的那些；
 // 那个判定读的是 `ctx.resumeExecutedToolIds`，它的唯一来源是账本的 `tool-executed` **恢复行**
-// （`readExecutedToolIdRecoveryRows`）。本站没有恢复行（#500 未做），而 0.33.0 起**不再回落快照**
+// （`readExecutedToolIdRecoveryRows`）。**#500 之前**本站没有恢复行，而 0.33.0 起**不再回落快照**
 // ⇒ `resumeExecutedToolIds` 恒空 ⇒ `resumePendingTools` 恒空 ⇒ `orchestrator.js:5208` 里那个读
-// `replayPolicy` 的分支根本进不去。
+// `replayPolicy` 的分支根本进不去。——**这一段现在是历史**（三件套已在 `runner/lib/store.js`），
+// 它解释的是「为什么当年那组断言恒绿」，不是今天的现场；今天的现场见
+// `runner/test/recovery-rows-adapter.test.js` 第 ④ 组（有证据 / 无证据两条文案必须不同）。
 //
 // 所以 #288 的保护现在来自**引擎自己那条「无证据就不重放」**（`resume-manager.js:849-851`：
 // 「Without positive progress evidence, an unpaired call is unknown rather than safe to replay」），
 // **不是**来自本站传的这个 flag。⇒ 三条不许读错：
 //   ① 不许据此说「本站已经不需要传这个值了」——**值仍要显式传**：默认值属于上游，上游已经改过一次
 //      （0.32 的 `always-replay` → 0.33 的 `per-tool-declaration`），它还会再改；
-//   ② 不许把这条当成 #500 已做完——恰恰相反，接了恢复行三件套之后 `replayPolicy` 才重新有牙；
+//   ② #500 已接完（三件套在 `runner/lib/store.js` 里），所以这条现在读作「**别把下面那组
+//      `recoveryRows: false` 的恒绿当成本单未做**」——它钉的是历史形态，不是今天的本站；
 //   ③ 下面「反面对照」那组之所以要在**夹具里**给恢复行，就是因为只有给了证据，「重放」这件事
 //      才在这套 harness 里重新可见，才能证明主用例不是恒绿的空断言。
 //
@@ -97,16 +107,15 @@ function workerReplayPolicy() {
 /**
  * 内存 store。两种形态，差别**只有一处**：是否带账本恢复行三件套。
  *
- * · 默认（`recoveryRows: false`）= **本站真实能力面**：只有 `appendRound` / `load` /
- *   `saveRunState` / `loadRunState` / `markRunState` 这 5 个（与 `runner/lib/store.js` 一致）。
+ * · `recoveryRows: false` = **#500 之前的本站**（历史形态对照）：只有 `appendRound` / `load` /
+ *   `saveRunState` / `loadRunState` / `markRunState` 这 5 个。
  *   0.33.0 起引擎不再调快照方法 ⇒ **这里不再实现 `saveRunSnapshot` / `loadLatestRunSnapshot`**
  *   （实现了也没人调，留着只会让人以为恢复还靠快照）。主用例全部跑在这个形态上。
  *
- * · `recoveryRows: true` = **反面对照专用夹具**。⚠ 恢复行三件套**只在这个夹具里存在**，
- *   理由是「给引擎它做重放判定所需要的证据」（`resume-manager.js` 读 `tool-executed` 行才认
- *   「同批前一条已完成」，否则缺失项一律按「无证据」不重放），
- *   **不是本站能力的申报**，与 #500 无关——生产 `runner/lib/store.js` 本单一行未动，#500 仍未接。
- *   没有这份证据，「重放」在这套 harness 里根本不可能发生，反面对照就会退化成恒绿空断言。
+ * · `recoveryRows: true` = **现况（#500 已接）+ 反面对照**。三件套在 `runner/lib/store.js`
+ *   里是真的（生产代码），这里给的是同一格的内存版，作用是「给引擎它做重放判定所需要的证据」
+ *   （`resume-manager.js` 读 `tool-executed` 行才认「同批前一条已完成」，缺失项一律按「无证据」
+ *   不重放）。没有这份证据，「重放」在这套 harness 里根本不可能发生，反面对照会退化成恒绿空断言。
  */
 function makeStore({ recoveryRows = false } = {}) {
   const records = new Map();
