@@ -22,7 +22,7 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as migrate from '../src/migrate.js';
 import { hashToken } from '../src/auth.js';
-import { aboutPanel, provenanceFor, PACKAGE_DIR, BUILD_INFO_PATH } from '../src/version-info.js';
+import { aboutPanel, provenanceFor, provenanceForValue, PACKAGE_DIR, BUILD_INFO_PATH } from '../src/version-info.js';
 import { readBuildInfo as readPortalBuildInfo } from '../src/build-info.js';
 import { readStationVersion } from '../src/version-info.js';
 import { readBuildInfo as readRunnerBuildInfo, UNKNOWN } from '../../runner/lib/build-info.js';
@@ -401,6 +401,36 @@ test('#586 复验阻断：build-info 读不到（旧镜像形状）⇒ 引擎格
   }
 });
 
+test('#586 三轮 nit：引擎值本身是 unknown 时，来源标注不许冒充 package.json（有值才谈来源）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-586-noengine-'));
+  // **只有根 package.json**、没有 `node_modules/erix-agent/package.json`，也没有 build-info.json。
+  // `readBuildInfo()` 只看根 package.json 可读就置 `source:'package'` ⇒ 引擎那格其实是 `unknown`。
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ version: '0.666.0-old-station' }));
+  const missing = path.join(dir, 'build-info.json');
+  try {
+    const panel = await aboutPanel({
+      pool: new SurfacePool(),
+      readVersion: () => readStationVersion({ env: {}, buildInfoPath: missing, packageDir: dir }),
+    });
+    assert.equal(panel.server.station, '0.666.0-old-station', '夹具前提：根 package.json 确实读到了');
+    assert.equal(panel.server.source, 'package');
+    assert.equal(panel.platformEngine.version, UNKNOWN, '引擎没有值（那份 package.json 不存在）');
+    assert.equal(panel.provenance.platformEngine, UNKNOWN,
+      '**nit 点**：没值就不能报「来自 package.json」——标注只在有值时才说来源');
+    assert.notEqual(panel.provenance.platformEngine, 'package.json',
+      '有值才谈来源：这一格值都缺，冒充来源就是本单一贯要消灭的形状');
+    // `server` 那格不受这道闸门影响：它的值就出自根 package.json，读到了就有值。
+    assert.equal(panel.provenance.server, 'package.json', '有值的那一格照报来源（闸门不是把标注一律抹成 unknown）');
+    // 同一道闸门在 build-info 形状下不该误伤：四格齐全时来源照报。
+    assert.equal(provenanceForValue('0.33.0', 'build-info'), 'build-info.json');
+    assert.equal(provenanceForValue(UNKNOWN, 'build-info'), UNKNOWN,
+      'build-info 里缺 engine_version 时同样不许冒充');
+    assert.equal(provenanceForValue('', 'package'), UNKNOWN, '空串也算没值');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('#586 复验阻断：STATION_BUILD_INFO_PATH 改过路径 ⇒ 面板透出 buildInfoPath，而 /api/health 形状一字不动', async () => {
   const { dir, file } = writeBuildInfo(INJECT);
   await withEnv({ STATION_BUILD_INFO_PATH: file }, async () => {
@@ -414,6 +444,15 @@ test('#586 复验阻断：STATION_BUILD_INFO_PATH 改过路径 ⇒ 面板透出 
       assert.equal(panel.provenance.server, 'build-info.json', '读到了 ⇒ 标注仍是 build-info.json（推导不是降级）');
       assert.equal(panel.provenance.platformEngine, 'build-info.json');
       assert.equal(panel.server.source, 'build-info');
+      // 第三轮 nit：光透出路径不够 —— 必须**逐字对上这次注入的值**，才算证明「界面上那条路径
+      // 就是实际读到这两个版本的那条」，而不是路径与版本各算一遍（两条路各自降级也会各自全绿）。
+      assert.equal(panel.server.station, INJECT.station_version,
+        'station 必须出自**这条被改过的路径**里的那份 build-info');
+      assert.equal(panel.platformEngine.version, INJECT.engine_version,
+        '平台侧引擎同理（值与路径必须同一次读取，不许一边读文件、一边读 package.json）');
+      assert.equal(panel.server.revision, INJECT.revision);
+      assert.equal(panel.server.builtAt, INJECT.built_at);
+      assert.notEqual(panel.server.station, REPO_VERSION, '反证：不是从仓库 package.json 现读的那一份');
 
       const health = await (await fetch(`${srv.base}/api/health`)).json();
       assert.deepEqual(Object.keys(health.version).sort(), ['builtAt', 'revision', 'station'],
