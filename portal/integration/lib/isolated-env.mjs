@@ -264,19 +264,127 @@ export const HOST_WRITE_PATH_ENVS = Object.freeze([
   'STATION_DB_DIR', // 库文件目录：写错 = 两个实例开同一份数据文件
 ]);
 
-/** 读 `deploy/.env`（只取 `KEY=VALUE`，忽略注释/空行）。缺文件返回 {}（CI 的 worktree 里就没有它）。 */
-export function readEnvFile(envFile) {
-  try {
-    const out = {};
-    for (const line of fs.readFileSync(envFile, 'utf8').split('\n')) {
-      if (!line.trim() || line.trim().startsWith('#')) continue;
-      const m = /^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
-      if (m) out[m[1]] = m[2].replace(/^["']|["']$/g, '');
-    }
-    return out;
-  } catch {
-    return {};
+/**
+ * 单行 env 的解析（口径对齐**真 compose**，不是自洽就行）。
+ *
+ * 下面的规则全部来自实测（Docker Compose 2.40.3，命令与输出拄在
+ * `test/integration-e2e-preflight.test.js` 的 `COMPOSE_PARSE_CASES` 里，那一格直接拿 compose 自己当基准）：
+ *
+ * | 写法                              | compose 看到的        | 为什么重要 |
+ * |-----------------------------------|-----------------------|------------|
+ * | `K=/a/b # shared`                 | `/a/b`                | **本单 BLOCKER**：不剥就与真路径不等 ⇒ 「与共享路径不同」在危险方向上恒真 |
+ * | `K="/c/d" # after quoted`         | `/c/d`                | 引号闭合后的注释也得剥 |
+ * | `K=/g/h#nospace`                  | `/g/h#nospace`        | `#` 前面不是空格就**不是**注释 |
+ * | `K=/a/b<TAB>#tab`                 | `/a/b<TAB>#tab`       | tab 也不算注释起始（只有空格算）|
+ * | `K="#q# inside"`                  | `#q# inside`          | 引号内的 `#` 是正文 ⇒ 不能误剥（反向自证那格）|
+ * | `K=  spaced value  # tail`        | `spaced value`        | 前导/尾随空白会去 |
+ * | `K=#hash first`                   | `#hash first`         | 值首的 `#` 是字面量 |
+ * | `K="` 未闭合 / `K="v"junk`      | **compose 直接报错**   | 我们复现不了 ⇒ 交给 `kind:'unparsable'` |
+ *
+ * 另外 compose 会展开 `$VAR` / `${VAR}`（实测 `/a/${QQ}b` ⇒ `/a/b`），我们**复现不了展开上下文**
+ * ⇒ 只把这一类标 `interpolates`，由调用方决定要不要拒（同文件里 `$` 很常见，一律拒会误杀）。
+ *
+ * @param {string} line 单行原文（可以带 \r）
+ * @returns {{kind: 'blank'|'pair'|'unparsable', key?: string, value?: string, inlineComment?: boolean,
+ *   interpolates?: boolean, why?: string}}
+ */
+export function parseComposeEnvLine(line) {
+  const raw = String(line ?? '').replace(/\r$/, '');
+  const stripped = raw.trim();
+  if (!stripped || stripped.startsWith('#')) return { kind: 'blank' };
+  const m = /^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/.exec(raw);
+  if (!m) return { kind: 'unparsable', raw, why: '不是 KEY=VALUE 形态' };
+  const [, key] = m;
+  const lead = m[2].replace(/^[ \t]+/, '');   // 前导空白会被 compose 去掉
+  const quote = lead[0] === '"' || lead[0] === "'" ? lead[0] : null;
+  if (quote) {
+    const end = lead.indexOf(quote, 1);
+    if (end === -1) return { kind: 'unparsable', key, raw, why: `未闭合的引号 ${quote}` };
+    const inner = lead.slice(1, end);
+    const tail = lead.slice(end + 1);
+    if (/^[ \t]*$/.test(tail)) return { kind: 'pair', key, value: inner, quoted: true, inlineComment: false, interpolates: inner.includes('$') };
+    if (/^[ \t]+(#|$)/.test(tail)) return { kind: 'pair', key, value: inner, quoted: true, inlineComment: true, interpolates: inner.includes('$') };
+    return { kind: 'unparsable', key, raw, why: `引号闭合后还有垃圾：${tail}` };
   }
+  // 未加引号：从**第一个「空格 + #」**处切开（tab 与值首的 # 都不是注释起始 —— 实测）
+  let cut = -1;
+  for (let i = 1; i < lead.length; i += 1) {
+    if (lead[i] === '#' && lead[i - 1] === ' ') { cut = i; break; }
+  }
+  const value = (cut === -1 ? lead : lead.slice(0, cut)).replace(/[ \t]+$/, '');
+  return { kind: 'pair', key, value, quoted: false, inlineComment: cut !== -1, interpolates: value.includes('$') };
+}
+
+/**
+ * 整份 env 文件：返回 compose 会看到的值 + 每一行的解析账（要拒哪一行得能点名行号）。
+ * 文件不存在 ⇒ `{ values: {}, lines: [], missing: true }`（CI 的 worktree 里就没有 `deploy/.env`）。
+ *
+ * @param {string} envFile
+ * @returns {{values: Record<string,string>, lines: object[], missing: boolean}}
+ */
+export function parseComposeEnvFile(envFile) {
+  let text;
+  try {
+    text = fs.readFileSync(envFile, 'utf8');
+  } catch {
+    return { values: {}, lines: [], missing: true };
+  }
+  const values = {};
+  const lines = [];
+  text.split('\n').forEach((raw, index) => {
+    const parsed = parseComposeEnvLine(raw);
+    if (parsed.kind === 'blank') return;
+    const entry = { no: index + 1, raw: raw.replace(/\r$/, ''), ...parsed };
+    lines.push(entry);
+    if (parsed.kind === 'pair') values[parsed.key] = parsed.value;   // 后写的赢（与 compose 一致）
+  });
+  return { values, lines, missing: false };
+}
+
+/** 读 `deploy/.env`（只取 `KEY=VALUE`，按 compose 的口径处理注释/引号）。缺文件返回 {}。 */
+export function readEnvFile(envFile) {
+  return parseComposeEnvFile(envFile).values;
+}
+
+/**
+ * 找出「我们**无从证明 compose 会拿到什么**」的键值行（PR #554 复审 BLOCKER，A 案）。
+ *
+ * 为什么要拒而不是猜：旧解析把未加引号值的行内注释**整段留在值里**，于是
+ * `TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared` 解析成
+ * `"/docker/station-edge/dynamic # shared"` ⇒ 与真路径 `/docker/station-edge/dynamic` **不相等**
+ * ⇒ 「与共享路径不同」这个隔离判据在**危险方向上恒真**（隔离栈照旧往生产目录写，而预检绿）。
+ * 剥注释也能修这一格，但那就变成「我们的解析器认为 compose 会怎么读」——需要一条外部基准才能站住。
+ * 预检的取向是宁可起跑前红，所以这里直接拒，并点名**文件 + 行号 + 键名 + 原文**。
+ *
+ * 只查隔离判据会用的那几个键（{@link HOST_WRITE_PATH_ENVS}）：全文件一律拒会误杀真 `.env` 里
+ * `POSTGRES_PASSWORD=xxxx # 说明` 这种合法行（实测本仓库 `deploy/.env` 里就有三行）。
+ *
+ * @param {{lines: object[]}} parsed {@link parseComposeEnvFile} 的返回
+ * @param {string[]} [keys] 要盯的键
+ * @returns {Array<object>} 带 `why` 的行（空数组 = 全部可复现）
+ */
+export function findUnreproducibleEnvLines(parsed, keys = HOST_WRITE_PATH_ENVS) {
+  const out = [];
+  for (const line of parsed?.lines ?? []) {
+    if (!keys.includes(line.key)) continue;
+    if (line.kind === 'unparsable') {
+      out.push({ ...line, why: `我们解析不了（${line.why}），compose 会看到什么无从证明` });
+      continue;
+    }
+    if (line.kind !== 'pair') continue;
+    if (!line.quoted && line.inlineComment) {
+      out.push({
+        ...line,
+        why: `值里带**未加引号**的行内注释：原文 ${JSON.stringify(line.raw.trim())} 而 compose 读到的是 ${JSON.stringify(line.value)}`
+          + ' ⇒ 两者不等，「与共享路径不同」会在危险方向上恒真',
+      });
+      continue;
+    }
+    if (line.interpolates) {
+      out.push({ ...line, why: `值里有 $ 插值（compose 会展开，我们看不到它的展开上下文）⇒ 无从证明 compose 拿到的就是这个字符串` });
+    }
+  }
+  return out;
 }
 
 /**
@@ -289,7 +397,18 @@ export function assertHostWritePathsIsolated({
   label = '隔离实例',
 } = {}) {
   if (!envFile) return { checked: [], shared: {} };
-  const shared = readEnvFile(envFile);
+  const parsed = parseComposeEnvFile(envFile);
+  const shared = parsed.values;
+  const risky = findUnreproducibleEnvLines(parsed);
+  if (risky.length > 0) {
+    const fixed = 'KEY="/docker/erix/users" # 想写注释就加引号，或直接挪到上一行';
+    throw new Error(
+      `${label} 的 env 文件 ${envFile} 里有 ${risky.length} 行我们无从证明 compose 会拿到什么（这些键是**宿主写路径**）：\n  `
+      + `- ${risky.map((l) => `${envFile}:${l.no} ${l.key}（原文 ${JSON.stringify(l.raw.trim())}）：${l.why}`).join('\n  - ')}`
+      + `\n⇒ 判错方向 = 隔离栈往**生产的目录**里写（现网实测过一次：边缘路由被覆写，8090 全线 502 而容器全绿）。`
+      + `改法：${fixed}`,
+    );
+  }
   const collisions = [];
   for (const key of HOST_WRITE_PATH_ENVS) {
     const mine = env[key];

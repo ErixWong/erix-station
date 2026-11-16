@@ -6,6 +6,10 @@
 //   → 崩溃恢复：run 进行中 docker kill FDE（SIGKILL，不给优雅 drain 机会）→ docker 依
 //     RestartPolicy=unless-stopped 自动拉起 → 新 agentd re-claim（attempt+1、resume=true）→ 终态。
 // 运行：npm run test:integration:wp3b
+// ⚠ 前置（issue #495 ①，#412 遗留）：仓库根必须有 `deploy/.env`（= compose 的 --env-file，**不入 git**）。
+//   git worktree / 新 clone 里它必然缺，而 docker compose 要到**整轮镜像构建之后**才报
+//   `couldn't find env file`（#412 部署机实测：白烧 10.7 分钟）——脚本现在在**模块加载时**（任何 docker
+//   之前）预检并点名「从主 checkout 复制一份 deploy/.env」；文件在场时零输出（判据 lib/e2e-preflight.mjs）。
 //
 // 并行隔离用法（F8；#227.1 起先过 assertIsolatedEnvironment 硬护栏，不合规直接拒跑）：
 // 不拆共享栈（station-*）的前提下跑隔离栈——所有固定名/端口经 env 派生，容器名/镜像 tag/FDE 名
@@ -26,6 +30,9 @@
 //   node portal/integration/wp3b-e2e.mjs
 //
 // —— 隔离栈必传 env 清单（每条一句为什么）——
+//   `deploy/.env`（严格说不是 env，但是**必传前置**，#495 ①）：compose 命令串固定带 `--env-file deploy/.env`，
+//     而它不入 git ⇒ 新 checkout / worktree 里没有，报错时机却在镜像构建之后（上面那条 ⚠）。
+//     反向自证：文件存在时本预检零输出，不往日志里插一句「预检通过」。
 //   STATION_LITELLM_NAME / STATION_DOCKER_PROXY_NAME / STATION_EDGE_NAME：compose 用它们做
 //     **容器名**（deploy/docker-compose.yml:239/62/285），不派生会与共享栈撞名（container name already in use）。
 //   BACKEND_SUBNET：compose backend 网络子网（deploy/docker-compose.yml:13，缺省 172.32.0.0/24），
@@ -77,11 +84,17 @@ import {
   SHARED_STACK, assertHostPortsAvailable, applyStackIpamPoolEnv, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
   writeDynamicStub, deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
+// issue #495 ①（#412 遗留）：compose 的 `--env-file` 与「等宿主侧物化文件」的失败分类（唯一定义处 lib/e2e-preflight.mjs）。
+import { COMPOSE_ENV_FILE, assertComposeEnvFile, materializeSnapshot, toContainerPath, waitForHostFile } from './lib/e2e-preflight.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 // #227.2：显式 -p（双模脚本）：隔离跑法必带 COMPOSE_PROJECT_NAME（=栈 id，护栏硬要求，#227.1 起）→
 // -p 显式指向本栈；共享跑法（无任何隔离信号）显式 station——两种模式都写死在命令里，不留 `name:` 隐式兜底。
 const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:-station}" --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
+// issue #495 ①：上面命令串固定带 --env-file deploy/.env，而它不入 git ⇒ git worktree / 新 clone 里
+// 必然缺。docker compose 要到**整轮镜像构建之后**才报 couldn't find env file（#412 部署机实测白烧 10.7 分钟），
+// 所以这条预检放在模块加载时——它先于本文件任何一次 docker/compose；文件在场时零输出。
+assertComposeEnvFile({ envFile: COMPOSE_ENV_FILE, cwd: REPO_ROOT, label: 'wp3b-e2e' });
 // F8 并行隔离：固定名/端口全部 env 派生（缺省 = 现状值，共享栈零影响）。
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
@@ -479,8 +492,19 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
 
     // 等 config.json 物化（materializer 250ms 循环；路径段 = fde_name）
     const configJsonPath = path.join(S.userspaceRoot, FDE_NAME, 'home', '.erix', 'config.json');
-    await waitFor(() => (fs.existsSync(configJsonPath) ? fs.readFileSync(configJsonPath, 'utf8') : null), { label: 'config.json materialized' });
-    const configJson = JSON.parse(fs.readFileSync(configJsonPath, 'utf8'));
+    // issue #495 ②（#412 遗留）：本行原来是 `waitFor(() => (fs.existsSync(p) ? readFileSync(p) : null))`。
+    // existsSync 对**没权限**的路径返回 false ⇒ portal 以 root 建的 0770 node:node 目录把 EACCES 吞成
+    // 「没物化」：跑测试的人 uid ≠ FDE_USER_UID(1000) 时文件其实早已写出，却白等 120s 并报一句与
+    // 「真的没物化」逐字相同的 timeout。现在状态三分（present / 读不到 / 不存在），文案各自点名；
+    // describe 顺手把 portal 容器侧的 ls -ld 拼进失败文案（userspace 是同路径 bind mount，一眼定案）。
+    const configJson = JSON.parse(await waitForHostFile(configJsonPath, {
+      label: `${FDE_NAME} config.json materialized`,
+      describe: () => materializeSnapshot({
+        docker,
+        container: STATION_PORTAL_NAME,
+        containerPath: toContainerPath(configJsonPath, { hostRoot: S.userspaceRoot }),
+      }),
+    }));
     assert.equal(configJson.slots.default.endpoint, `${LLM_PUBLIC_BASE_URL}/v1`,
       `config.json endpoint 指向派生的 LLM 公共地址（BASE_DOMAIN=${BASE_DOMAIN}）`);
     assert.equal(configJson.slots.default.apiKey, 'erix-placeholder', '占位 key（零真实 LLM 凭据）');
