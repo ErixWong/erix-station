@@ -3035,14 +3035,20 @@ async function handleSessionDelegateTranscript(req, res, ctx, sessionId, childRu
 /**
  * `runId` 是**必填** query 参数（名册按父 run 分片 ⇒ 没有父身份就不知道该读哪个目录）。
  * 缺席/空串 ⇒ 400；形状（uuid）交给 `delegation.js` 的单点校验（同一个 `details.field='runId'`）。
- * `decodeUuid` 只为归一化小写：名册目录名是引擎写的小写值，拿大写串去拼目录会恒 miss。
+ *
+ * ⚠ **只归一化小写，不再 `decodeURIComponent`**（#593 修的既有缺陷，与 `decodeUuid` 不是一回事）：
+ * `url.searchParams.get()` 返回的值**已经被 URL 解析器解码过一次**，再走 `decodeUuid` 就是**双重解码**：
+ *   `?runId=%25` → `get()` 得 `'%'` → `decodeURIComponent('%')` 抛 `URIError` → 落到本文件顶部的
+ *   兵底（`unhandled:` ⇒ `500 internal`），而契约要的是 400 `validation_failed`（`details.field='runId'`）。
+ *   同类：`%E0%A4%A`（坏转义序列）。路径参数才需要 `decodeUuid`（那一段确实没解码过），别顺手改它。
+ * 非法值不需要在这里「解得出」：下游 `PARENT_RUN_ID_RE` 会把任何非 uuid 串判成 400 ⇒ 形状语义不少。
  */
 function requireDelegateRunId(url) {
   const raw = url.searchParams.get('runId');
   if (raw == null || raw === '') {
     throw new HttpError(400, 'validation_failed', 'runId 必填（父 run id）', { details: { field: 'runId' } });
   }
-  return decodeUuid(raw);
+  return raw.toLowerCase();
 }
 
 async function handleSessionEventsHistory(req, res, ctx, sessionId) {

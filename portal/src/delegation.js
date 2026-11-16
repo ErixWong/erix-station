@@ -268,6 +268,28 @@ export const nodeFs = {
   readFile: (file) => fsp.readFile(file, 'utf8'),
   stat: (file) => fsp.stat(file),
   existsSync: (file) => fsSync.existsSync(file),
+  /**
+   * `#593`：**有界读** —— 至多取 `maxBytes + 1` 个字节，读满了就不继续。
+   * 返回 `{ text, tooLarge }`：`tooLarge === true` ⇒ 文件比 `maxBytes` 大（此时 `text` 无意义，丢弃）。
+   *
+   * 为什么不是 `stat` 判完再 `readFile`：子 run 的账本是**正在被引擎追加写**的文件，`stat` 与
+   * `readFile` 之间它可以涨过上限，而无上限 `readFile` 会把**实际字节数**全部拉进内存
+   * ⇒ 那个 8 MiB 闸在并发追加下只是建议（#593 独立验收 BLOCK 里那条竞态）。本方法把上限从
+   * 「事后断言语」变成「读取本身的约束」：无论文件多大，进内存的不超过 `maxBytes + 1`。
+   * ⚠ 有意的口径差异：`getDelegateTranscript`（抽屉）**不用**它 —— 那边契约是 413 带 `details.size`，
+   *   尺寸语义要给用户看，不属本单范围（一字未动）。
+   */
+  readBounded: async (file, maxBytes) => {
+    const handle = await fsp.open(file, 'r');
+    try {
+      const buf = Buffer.alloc(maxBytes + 1);
+      const { bytesRead } = await handle.read(buf, 0, maxBytes + 1, 0);
+      if (bytesRead > maxBytes) return { text: '', tooLarge: true };
+      return { text: buf.toString('utf8', 0, bytesRead), tooLarge: false };
+    } finally {
+      await handle.close();
+    }
+  },
 };
 
 /** 名册目录里一个候选文件（其它名字一律不算候选：引擎原子写的临时件叫 `<id>.json.tmp-<pid>-<n>`）。 */
@@ -399,9 +421,12 @@ async function resolveScopeWithRunStatus({ pool, sessionId, userId, parentRunId,
  * 三道成本闸（全部有判据）：
  *   1. **非活态 ⇒ 零文件动作**（连 `stat` 都不发）：终子的终稿在名册 `resultText` 里，抽屉已能看全文。
  *      所以它的 `activity` 只有 `{ kind:'none', turns:null, stale:false }`（**不写 `at`**：没 `stat` 就没写盘证据）。
- *   2. `stat` 说没变 ⇒ 用缓存，**零 `readFile`**（稳态成本 ≈ N 次 `stat`）。
+ *   2. `stat` 说没变 ⇒ 用缓存，**零内容读**（稳态成本 ≈ N 次 `stat`）。
  *   3. `size > 8 MiB` ⇒ 不读，`{ at, turns:null, kind:'none', stale }`——**不 413 也不 500**：
  *      面板不是正文读取面，降级比报错合理（与抽屉的 413 口径故意不同，那边用户主动要看正文）。
+ *      ⚠ 上限由**两道**闸兑现：`stat` 那条只是省一次读的便宜路径，**真闸是 `fsImpl.readBounded`**：
+ *      账本正被引擎追加写，stat-then-read 之间它可以涨过上限（#593 独立验收 BLOCK 的竞态），
+ *      所以进内存的字节数只能由「读」本身限制，不能由「之前那次 stat」保证。
  */
 async function buildActivity({ scope, childRunId, state, parentRunStatus, fsImpl }) {
   // 设计 §4.4 ③：父 run 已终态**而**子仍写着活态 ⇒ stale。后台子的真实形状：父跑完 ⇒ worker 200ms
@@ -428,8 +453,17 @@ async function buildActivity({ scope, childRunId, state, parentRunStatus, fsImpl
   const key = `${file}|${st.size}|${st.mtimeMs}`;
   let core = activityCacheGet(key);
   if (core === undefined) {
-    const raw = await fsImpl.readFile(file);
-    core = summarizeActivity(projectLedgerRecords(parseLedgerRecords(raw)));
+    // 有界读：进内存的字节数本身就被 `maxBytes` 锁住，不依赖 stat 那一瞬间的准确性。
+    // ENOENT（stat 后被人扫掉）与 tooLarge（stat 后长过了上限）走同一支降级。
+    let read;
+    try {
+      read = await fsImpl.readBounded(file, DELEGATE_TRANSCRIPT_MAX_BYTES);
+    } catch (err) {
+      if (err?.code === 'ENOENT') return { at, kind: 'none', turns: null, stale };
+      throw err;
+    }
+    if (read?.tooLarge === true) return { at, kind: 'none', turns: null, stale };
+    core = summarizeActivity(projectLedgerRecords(parseLedgerRecords(read?.text ?? '')));
     activityCacheSet(key, core);
   }
   // 键序 = 契约序；`stale` **必须**每次现算（它在 DB 里，不在缓存里）。
