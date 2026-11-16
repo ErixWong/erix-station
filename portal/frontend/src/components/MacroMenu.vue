@@ -60,7 +60,11 @@ function isSubscribed(templateId: string): boolean {
 /** 这个模板能不能在会话里订（`KIND_SCOPE` 是 kind 的定义，`scheduled-task` 只能 `user`）。 */
 function assignableHere(template: { kind: string; scope: string }): boolean {
   if (props.scope !== 'session' || !props.sessionId) return false;
-  return KIND_SCOPE[template.kind] === 'session' && template.scope === 'session';
+  // `KIND_SCOPE` 的键是枚举字面量（shared 真源的推导结果），而后端的 `kind` 是 `string`
+  // ⇒ 这里做一次显式收窄，不在 shared 里把类型放宽成 `Record<string, string>`（那会丢掉
+  // shared 自己的字面量类型，其他消费方就得不到穷尽检查）。
+  const scopeOfKind = (KIND_SCOPE as Record<string, string | undefined>)[template.kind];
+  return scopeOfKind === 'session' && template.scope === 'session';
 }
 
 /** 选中即生效（`07` §3.3：没有「保存」按钮，也不往消息流里插东西）。 */

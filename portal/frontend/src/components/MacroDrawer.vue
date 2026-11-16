@@ -16,7 +16,7 @@ import { computed, onScopeDispose, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import MacroMenu from './MacroMenu.vue';
 import { useMacroStore } from '../stores/macro';
-// 健口告警文案要说「预期每 60 秒一次」（`07` §17.3 要求给「最后时刻 + 预期频率 + 下一步」）
+// 健康告警文案要说「预期每 60 秒一次」（`07` §17.3 要求给「最后时刻 + 预期频率 + 下一步」）
 // ⇒ 频率从 shared 真源拿，不在文案里写死数字。
 import { EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE } from '@shared/macro-kinds';
 import {

@@ -113,6 +113,17 @@ export const useMacroStore = defineStore('macro', () => {
 
   const filterActive = computed(() => filterTemplateId.value !== null || filterVerdict.value !== null);
 
+  /**
+   * 注入时钟（判据⑤「水位线陈旧」要能用固定时刻测）。默认 `Date.now()`；
+   * 测试里 `setClock(() => FIXED)` 后再挂载组件即可。不用 `ref` 包住：时刻不是渲染数据，
+   * 响应性由 `assignments` / 手动 `refresh` 驱动（健康位只在重算时读一次）。
+   */
+  let clock: () => number = () => Date.now();
+  const now = (): number => clock();
+  const setClock = (next: () => number): void => {
+    clock = next;
+  };
+
   /** 判决下拉的选项（**列表本身来自 shared 枚举**，不在前端重抄一遍）。 */
   const verdictOptions = computed<string[]>(() => [...VERDICT]);
 
@@ -370,7 +381,7 @@ export const useMacroStore = defineStore('macro', () => {
     loadTemplates, loadAssignments, loadRuns, loadMoreRuns, assign, unassign,
     loadNotifications, refreshUnreadCount, markRead,
     openDrawer, closeDrawer, refresh, setVerdictFilter, setTemplateFilter, clearFilters,
-    stopPolling, schedulePoll, reset,
+    stopPolling, schedulePoll, reset, now, setClock,
     /** 健康告警（判据⑤）：陈旧 ⇒ 进顶部状态条，不进空态区。时刻由调用方注入（可测）。 */
     watermark: (nowMs: number): WatermarkState => watermarkState(assignments.value, nowMs),
   };
