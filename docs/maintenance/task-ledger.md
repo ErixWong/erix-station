@@ -7605,3 +7605,45 @@ rebase 后 69/69 全绿（含 upload-settings 那支）。
 本轮唯一没被变异抓住的是 W2 的 UTC+8 日界（已补两条用例），这说明变异还能反过来当**测试缺口探测器**用。
 
 **待办**：W7（#536，在跑）、W5/W6（前端面板与铃铛）。
+
+### 8.145 #500 账本恢复行三件套上真机：每 run 的 2 条降级行归零（issue #500，PR #571 + 发版 v0.1.69，2026-11-16，主 agent 验收）
+
+**做了什么**（PR #571，merge `f881bfe`）：接上引擎 0.33.0 的三个可选方法
+`appendRecoveryRow` / `listRecoveryRows` / `clearRecoveryRows`，用 append-only 的**独立表**
+`transcript_recovery_rows`（迁移 `0038`）承载「这个 `tool_use` 真的执行过了」这件事实——
+run snapshot 在 0.33 退役后它是唯一证据。
+
+**四条红线（评审逐条核过）**：① 读方法「在但 reject / 返回非数组」⇒ 错误原样上抛（引擎据此以
+`recovery_rows_unreadable` 终局）；② 恢复行不进 `load()`（独立表结构性成立 + 有用例）；③
+`clearRecoveryRows` 的 `DELETE` 只打新表（`transcript_rounds` 全站零 DELETE 的前提未破）；④ 读/清两方法
+用**有限**重试 `RECOVERY_ROWS_MAX_RETRIES=2` —— 若沿用无限退避，portal 持续 5xx 时 reject 永不到达引擎，
+那条终局根本不会发生（现场从「明确失败」变成「无声卡死」）。
+
+**编号冲突**：main 上 `0036`/`0037` 已被并行会话占用 ⇒ 本单迁移重编号 `0036 → 0038`；
+`migrations.test.js` 的「最后一支 / 连续」判据随之进两位，并补了 0038 自己的用例。
+
+**顺带修掉 main 当前红**（PR #569）：#537 把 `worker.js` 的门扩成 `if (delegateEnabled && !reviewOnly)`，
+而 `delegation.test.js` 的 D7 断言还钉着旧形状 ⇒ main CI `fail 1`。判据跟着走成合取式，意图不变。
+
+**发版 v0.1.69**（PR #572，tag `02fd33ec`，release run `43800434189` success）：
+FDE `sha256:a04147ca…` / proxy `sha256:19c62c83…`；5 台 `fde-*` 全部重建，容器内
+`build-info.json` = **`station 0.1.69 / engine 0.33.0 / revision 02fd33ec`**（5/5）；
+`station-portal` 本地重建（部署形态未切）；迁移 `0038` 在 portal 起栈时**自动应用**（`schema_migrations`
+现查 = `0038-transcript-recovery-rows`，表与索引都在）。
+
+**真机验收（这次 LLM 额度恢复了，跑成了一条真 run）**：`eric` 账号一条 run（session `9e744aed…`，
+提示词要求用 shell 跑 `echo`）⇒ `finished` / 2 轮 / `judge_done`：
+
+| 判据 | 实测 |
+|---|---|
+| 每 run `persistence_capability_degraded` | **0 条**（发版前是恰好 2 条，见 §8.129） |
+| 恢复行是否真落库 | `transcript_recovery_rows` 里有一条 `tool-executed`（`toolUseId=call_00_Nwkz…`、round 1、append_seq 1） |
+| 时间线 | `round_start×2 / attempt×2 / tool_use / tool_result / round_end×2 / judge / usage×2 / run_outcome / run_end`，`tool_result` 的 `exit_code: 0` |
+
+**现场已还原**：`eric.mail_otp_enabled` 临时置 `false`（CLI 登录用）→ 现查 `true`；探测 session 已归档；
+`fde-eric` 里的 `probe-500` 目录已删；`deploy/.env` 改前备份在 `/tmp/deploy-env.bak69.*`。
+
+**遗留**：`#500` 的「崩溃续跑文案变准」与「`tool_replay_decision_required` 出现」两条没在真机上造现场验
+（需要杀一个正在跑工具的 run）；它们由 `runner/test/recovery-rows-adapter.test.js` 与
+`replay-policy.test.js` 的夹具钉着，真机口径等下一次真崩溃自然出现时对账。
+
