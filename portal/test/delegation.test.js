@@ -845,6 +845,49 @@ function partOfActivityLedger(runId) {
   ];
 }
 
+/**
+ * `kind:'tool_result'` 那一格的夹具：末轮 assistant **只有工具调用**（`input:{}` ⇒ 上游不给 `argsSummary`），
+ * 结果走 partOf 链落盘，而轮行**还带着一份 `response.content` 正文副本**（#335 停写前的老形状）。
+ * 这个夹具的意义在于它**只有走折叠链才读对**：
+ *   · 折叠后 ⇒ 结果与调用配得上对 ⇒ `kind:'tool_result'` + 末片正文；`turns` = 2（seed + assistant）。
+ *   · 不走折叠（自己拿原始行喂投影）⇒ 结果在别的记录里配不上对，轮行那份正文副本又自成一条
+ *     assistant turn ⇒ `kind:'text'` + `turns` = 3 ⇒ 用例红（这就是判据 8 要的「自己拼原始行 ⇒ 红」）。
+ */
+function toolResultChainLedger(runId) {
+  const k = (n) => `${runId}:msg:1:${n}`;
+  return [
+    JSON.stringify({
+      round: 0, roundKey: `${runId}:round:0`, dedupKey: `${runId}:engine:round:0:seed`,
+      ts: '2026-11-16T10:00:00.000Z',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '跑测试' }] }],
+    }),
+    JSON.stringify({
+      round: 1, kind: 'message', seq: 0, dedupKey: k(0), roundKey: `${runId}:round:1`,
+      ts: '2026-11-16T10:00:01.000Z',
+      messages: [{ role: 'assistant', content: [
+        { type: 'tool_use', id: 't1', name: 'shell', input: {} },
+        { type: 'tool_use', id: 't2', name: 'shell', input: {} },
+      ] }],
+    }),
+    JSON.stringify({
+      round: 1, kind: 'message', seq: 1, dedupKey: k(1), roundKey: `${runId}:round:1`,
+      ts: '2026-11-16T10:00:02.000Z',
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: '编译中' }] }],
+    }),
+    JSON.stringify({
+      round: 1, kind: 'message', seq: 2, dedupKey: k(2), partOf: k(1), roundKey: `${runId}:round:1`,
+      ts: '2026-11-16T10:00:03.000Z',
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: '尾部：2678 tests passed' }] }],
+    }),
+    JSON.stringify({
+      round: 1, roundKey: `${runId}:round:1`, dedupKey: `${runId}:engine:round:1`,
+      ts: '2026-11-16T10:00:04.000Z',
+      // 正文副本：折叠后它被消息行那份**取代**（只出一份条目），不折叠就多出一条 assistant turn
+      response: { content: [{ type: 'text', text: '先看两个文件' }], stopReason: 'tool_use' }, toolUses: 2,
+    }),
+  ];
+}
+
 /** 只有一条 assistant 正文的账本（`kind:'text'` 那一格）。 */
 function textOnlyLedger(runId) {
   return [
@@ -1090,6 +1133,27 @@ test('I8 判据8 summarizeActivity：tool / text / none 三格 + 120 字上限 +
       at: res.items[0].activity.at, turns: 2, kind: 'text', text: '正在整理结论…', stale: false,
     });
   } finally { t.cleanup(); }
+
+  // 折叠链反证那一格：partOf 链 + 轮行正文副本 ⇒ 答案**只有**走 fold 才对
+  const c = await makeHarness({
+    roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'running' })]],
+    transcripts: { [CHILD_1]: toolResultChainLedger(CHILD_1) },
+  });
+  try {
+    const res = await callList(c, { activity: true });
+    assert.deepEqual(res.items[0].activity, {
+      at: res.items[0].activity.at, turns: 2, kind: 'tool_result', text: '尾部：2678 tests passed', stale: false,
+    });
+    assert.equal(res.items[0].activity.turns, (await callTranscript(c, CHILD_1)).totalTurns);
+    // 纯函数那一侧同形（证明上面那个结果来自折叠后的展示消息，不是原始行）
+    assert.deepEqual(
+      summarizeActivity([{ role: 'user', text: '跑测试' }, {
+        role: 'assistant', text: '',
+        toolCalls: [{ name: 'shell', resultPreview: '编译中' }, { name: 'shell', resultPreview: '尾部：2678 tests passed' }],
+      }]),
+      { turns: 2, kind: 'tool_result', text: '尾部：2678 tests passed' },
+    );
+  } finally { c.cleanup(); }
 
   // `kind:'none'` 那一格：账本在但空的（子刚起、还没落正文）
   const e = await makeHarness({
