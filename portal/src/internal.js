@@ -18,6 +18,7 @@ import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text
 import { samePayload, dedupConflictDetails } from './transcript-payload.js';
 import { partialOutputs } from './run-partial-buffer.js'; // issue #502 D-4：stream 档正文的进程内缓冲
 import { enqueueMaterializeChange } from './outbox.js';
+import { attachLoopWatch, sleepCancellable } from './loop-timing.js'; // issue #520
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -2200,9 +2201,10 @@ function replayReleaseResult(queueStatus, runStatus, qrow) {
 // run 租约 reaper（runner §6.4/§12；schema.sql §8 注释）
 // ---------------------------------------------------------------------------
 
-function sleepReaper(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+// issue #520：reaper 的 sleep 从「模块内裸 `setTimeout`」改成了注入的 `sleepCancellable`
+// （默认值来自 `loop-timing.js`）。旧的 `sleepReaper(ms)` 因此删掉了：留着它就是一个
+// 「看代码就知道不可中断」的噪声，而不可中断正是 #506 评审③拦过的坑。
+// 节拍（`REAPER_INTERVAL_MS`）本身没动，理由见 `startReaperLoop` 上面的注释。
 
 // issue #292：reaper 形态的 `attempt_killed` 固定字段（口径 docs/api/portal.md §5.3 第 14 类）。
 // - `killed_by: 'crash'`：reaper 只看得见「租约没人续」，**无从区分** F6 看门狗判死与真崩（上报者已死，
@@ -2356,12 +2358,31 @@ export async function reapExpiredRuns(pool) {
   return results;
 }
 
-/** 启动 run 租约 reaper 常驻循环（由 cli serve 调用）。 */
-export function startReaperLoop(pool, { intervalMs = REAPER_INTERVAL_MS, log = console } = {}) {
-  let stopped = false;
+/**
+ * 启动 run 租约 reaper 常驻循环（由 cli serve 调用）。
+ *
+ * issue #520 判据 2：本循环选的是「**有明确定时语义**」那一支，**不是**空闲退避——
+ * `REAPER_INTERVAL_MS = 15s` 不是随便选的：它是租约时长 `LEASE_SECONDS = 90` 的 1/6（schema.sql §8
+ * 注释同口径）。一个崩溃的 worker 占着的 run，用户看到的「排队中」就靠这里推回队列；节拍一旦
+ * 随空闲退避到 30s/60s，**崩溃后发现延迟就从≤15s 变成≤60s**，而 reaper 本身完全看不出「这个租约
+ * 将到期」——它只能每隔固定时间看一眼。换句话说：本循环的「空闲」不是「无活可干」，而是
+ * 「本拍没扫到到期租约」，后者与下一拍有没有活无关 ⇒ 退避只会偷走延迟承诺，拿不到正确的信号。
+ * 空闲开销的真实代价因此是**每拍的语句数**而不是节拍：本循环改的是（a）sleep 可中断、
+ * （b）句柄补成 #506 同形（`done`/`settled`，让 `stopLoopsAndWait` 能真的等到在途事务收尾），
+ * （c）幂等键清理的闸门用注入的 `now`（与 #506 的孤儿回收同一口径）。
+ * `reapExpiredRuns` 的 SQL（一次循环 44 次 `run_queue` idx 扫，确实是每拍最贵的那个）**没动**：
+ * 改它就是改租约/出队语义，红线之外，已记台账遗留。
+ */
+export function startReaperLoop(pool, {
+  intervalMs = REAPER_INTERVAL_MS,
+  log = console,
+  sleep = sleepCancellable,
+  now = () => Date.now(),
+} = {}) {
   let lastPurgeAt = 0;
-  (async () => {
-    while (!stopped) {
+  const abort = new AbortController();
+  const done = (async () => {
+    while (!abort.signal.aborted) {
       try {
         await reapExpiredRuns(pool);
       } catch (err) {
@@ -2369,8 +2390,9 @@ export function startReaperLoop(pool, { intervalMs = REAPER_INTERVAL_MS, log = c
       }
       // 幂等键过期清理（portal.md §1.4，TTL 24h）：低频（默认 1h，与 15s 的 run 扫描解耦）跑一次。
       // 清理失败不影响 reaper 主循环——命中判定本身带 TTL 过滤，脏行只是占空间。
-      if (Date.now() - lastPurgeAt >= IDEMPOTENCY_PURGE_INTERVAL_MS) {
-        lastPurgeAt = Date.now();
+      const tickAt = now();
+      if (tickAt - lastPurgeAt >= IDEMPOTENCY_PURGE_INTERVAL_MS) {
+        lastPurgeAt = tickAt;
         try {
           const purged = await purgeExpired(pool);
           if (purged > 0) log.log?.(`[reaper] purged ${purged} expired idempotency_keys`);
@@ -2378,12 +2400,18 @@ export function startReaperLoop(pool, { intervalMs = REAPER_INTERVAL_MS, log = c
           log.warn?.(`[reaper] idempotency purge error: ${err.message}`);
         }
       }
-      await sleepReaper(intervalMs);
+      // 节拍不变（15s），但**可中断**：`stop()` 不必再等完这一拍（#506 评审③同口径）。
+      // 它返回 false 就立刻退出，不重跑一次 `reapExpiredRuns`。
+      if (!(await sleep(intervalMs, abort.signal))) break;
     }
   })();
+  const { settled, failure } = attachLoopWatch(done, (msg) => log.warn?.(`[reaper] ${msg}`));
   return {
     stop() {
-      stopped = true;
+      abort.abort();
     },
+    done,
+    settled,
+    failure,
   };
 }

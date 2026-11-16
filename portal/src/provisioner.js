@@ -23,6 +23,7 @@ import { broadcastRevoke, drainQueueAfterRun, runEndPartialKeys, retirePartialBu
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
 import { removeGitCredentialFile, setGitCredential, platformCredentialPresent, migrateLegacyCredential } from './git-credential.js';
 import { mintGitAccount } from './git-mint.js';
+import { attachLoopWatch, envInt, idleDelayMs, MAX_BACKOFF_MS_SAFE, sleepCancellable } from './loop-timing.js';
 
 // ---------------------------------------------------------------------------
 // 代码层 Docker API 白名单（写死）
@@ -1160,33 +1161,99 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
 
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// issue #520：对账循环的空闲退避。
+// **这个循环是空闲开销的头号来源**（不是估的：dev 真库 30.29s 窗口现测 `containers` 被扫 107 次
+// 丩约 40 次写、`fde_networks` 63 次、`users` 133 次，见 `docs/ops/db-idle-load.md` §2 的逐表读数）。
+// 量对得上：对账周期 5s（拍/秒 0.2）× 当时 6 个 FDE × 每 FDE 约 4 条语句（advisory lock
+// + `SELECT 1 FROM fde_networks` + adopt 分支那条无条件 `UPDATE containers SET image=...`
+// + 兼底的 `UPDATE ... status IN (...)`）+ 每拍两次 `readFdeDesired()`。
+// **改后**：本轮没发生任何收敛动作 ⇒ 5000 → 10000 → 15000 封顶（`PROVISIONER_IDLE_BACKOFF_MAX_MS`，
+// 缺省 15000）；发生了一次收敛就退回 5000。
+// 代价（本单唯一一处真实的行为差，要改缺省值请连这段一起改）：**盘外漂移的发现延迟**从
+// 「≤5s」变成「≤ 当前退避值」。上限取 15s（不是另外两个循环的 30s）就是为这件事：本循环的职责是
+// 「漂移即修」（topology.md §8），延迟是它的**业务承诺**；而开户/销号两个循环退让的是「人刚点
+// 的任务多等一会儿」，量级不同。要回到旧行为直接配 `PROVISIONER_IDLE_BACKOFF_MAX_MS=5000`
+// （退避阶梯会被 `idleDelayMs` 夹成恒定 5s = 改前语义），这是运维上的逃生口。
+export const LOOP_INTERVAL_MS = 5000;
+/** 代码缺省（运维面用例钉的就是它：`deploy/docker-compose.yml` 的插值缺省必须与此逐字相等）。 */
+export const IDLE_BACKOFF_MAX_MS_DEFAULT = 15000;
+
+// PR #552 审计 LOW-2：**15000 不只是缺省，它是本循环的业务硬上限**。
+// 改前只拿共享的 `MAX_BACKOFF_MS_SAFE`（60s）校这个旋钮 ⇒ 运维写 `PROVISIONER_IDLE_BACKOFF_MAX_MS=60000`
+// 会**真的**拿到 60s（实测），而注释里却把它叫「上限」——那不是一个东西：一个 env 就能把
+// 「漂移即修」的发现延迟静悄悄放宽到 4 倍。现在按**本循环的业务上限**钳：越界 ⇒ 钳到 15000 + warn
+// 点名旋钮（不静默）。与开户/销号两个循环的区别是故意的：那两个的业务上限就是 60s（共享上限），
+// 所以它们仍是「越界 ⇒ 回落缺省」；这里必须钳，因为缺省（15000）比共享上限（60000）小。
+// 判据：`portal/test/deploy-env-idle-backoff.test.js`（env=60000 ⇒ 生效 15000 且 warn 点名旋钮）。
+export const IDLE_BACKOFF_MAX_MS_BUSINESS_CAP = 15000;
+
+/**
+ * 本循环的空闲退避上限：**先过共享的严格正整数校验，再按本循环的业务上限钳**。
+ * 导出的理由：运维面用例（compose 缺省 == 代码缺省）与钳位用例都要读它，不能自己抄一个 15000。
+ * @param {{log?: object, env?: Record<string,string|undefined>}} [opts] env 只给单测注入用（生产不传 ⇒ `process.env`）
+ */
+export function resolveIdleBackoffMaxMs({ log = console, env = process.env } = {}) {
+  const shared = envInt('PROVISIONER_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log, env });
+  if (shared > IDLE_BACKOFF_MAX_MS_BUSINESS_CAP) {
+    log.warn?.(`[env] PROVISIONER_IDLE_BACKOFF_MAX_MS=${shared} 超过本循环的业务上限 ${IDLE_BACKOFF_MAX_MS_BUSINESS_CAP}ms`
+      + ` ⇒ 已钳到 ${IDLE_BACKOFF_MAX_MS_BUSINESS_CAP}ms（对账的发现延迟是业务承诺，不许被一个 env 放宽到 4 倍；`
+      + '要更快发现漂移就调小，例如 5000 = #520 之前的固定节拍）');
+    return IDLE_BACKOFF_MAX_MS_BUSINESS_CAP;
+  }
+  return shared;
 }
 
-/** 启动常驻对账循环（由 cli serve 调用）。 */
-export function startProvisionerLoop(pool, config, { docker, log = console, onPause } = {}) {
+/**
+ * 「本轮对账到底有没有动手」——`reconcileOnce` 的 `stats.ensured` **不能**当这个信号：
+ * 它对每个 desired 行都 `+= 1`（包括完全没收敛动作的那一轮），拿它判活会让退避**永不生效**。
+ * 真正的动作是这四个计数器：重建了容器 / 扫掉了孤儿容器 / 扫掉了孤儿网络 / 改了容器状态。
+ * @param {{ensured?: number, rebuilt?: number, orphansRemoved?: number, orphanNetworksRemoved?: number, statusUpdates?: number}} stats
+ */
+export function reconcileDidWork(stats = {}) {
+  return (stats.rebuilt ?? 0) + (stats.orphansRemoved ?? 0)
+    + (stats.orphanNetworksRemoved ?? 0) + (stats.statusUpdates ?? 0) > 0;
+}
+
+/**
+ * 启动常驻对账循环（由 cli serve 调用）。
+ * issue #520：节拍由「本轮有没有动手」驱动（见上面 `LOOP_INTERVAL_MS` 附近的注释）；
+ * 句柄补成 #506 同形（`stop` / `done` / `settled` / `failure`）。
+ */
+export function startProvisionerLoop(pool, config, {
+  docker,
+  log = console,
+  onPause,
+  sleep = sleepCancellable,
+  env = process.env, // 单测注入旋钮用；生产不传 ⇒ process.env
+  idleBackoffMaxMs = resolveIdleBackoffMaxMs({ log, env }),
+} = {}) {
   if (!docker) docker = createDockerClient({ dockerHost: config.dockerHost });
-  let stopped = false;
   let consecutiveFailures = 0;
-  (async () => {
-    while (!stopped) {
+  let idleTicks = 0; // 连续「没动手」的拍数（动手了就清 0）
+  const abort = new AbortController();
+  const done = (async () => {
+    while (!abort.signal.aborted) {
       try {
-        await reconcileOnce(pool, config, { docker, log });
+        const stats = await reconcileOnce(pool, config, { docker, log });
         consecutiveFailures = 0;
-        await sleep(5000);
+        idleTicks = reconcileDidWork(stats) ? 0 : idleTicks + 1;
+        if (!(await sleep(idleDelayMs(idleTicks, { baseMs: LOOP_INTERVAL_MS, maxMs: idleBackoffMaxMs }), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[provisioner] loop error: ${err.message}`);
         onPause?.('provisioner', err);
         const backoff = BACKOFF_MS[Math.min(consecutiveFailures - 1, BACKOFF_MS.length - 1)];
-        await sleep(backoff);
+        if (!(await sleep(backoff, abort.signal))) break;
       }
     }
   })();
+  const { settled, failure } = attachLoopWatch(done, (msg) => log.warn?.(`[provisioner] ${msg}`));
   return {
     stop() {
-      stopped = true;
+      abort.abort();
     },
+    done,
+    settled,
+    failure,
   };
 }
