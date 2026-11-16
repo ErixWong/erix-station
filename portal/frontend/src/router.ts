@@ -35,6 +35,9 @@ export const routes: RouteRecordRaw[] = [
     meta: { public: true },
   },
   { path: '/', name: 'workbench', component: () => import('./views/WorkbenchView.vue') },
+  // issue #595 M1：能力市场用户面（`#/market`）。与 `/` 同属用户面（登录即可，无 requiresRole），
+  // 顶栏入口在 `WorkbenchView` 的 `<header>`；页面自带「← 返回工作台」。
+  { path: '/market', name: 'market', component: () => import('./views/MarketView.vue') },
   // issue #55 B1 深链迁入路由层：#/session/<id>（hash 模式下与旧版 URL 形态一致，刷新/分享安全）。
   { path: '/session/:id', name: 'session', component: () => import('./views/WorkbenchView.vue') },
   {
@@ -85,6 +88,14 @@ export const routes: RouteRecordRaw[] = [
         path: 'upload',
         name: 'admin-upload',
         component: () => import('./views/AdminUploadView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
+      // issue #595 M2：能力市场发布台（§7 管理面）。导航顺序：… → upload → **market** → pool。
+      // 请求只在本视图挂载时发（`AdminMarketView` 的 onMounted 是唯一触发点）。
+      {
+        path: 'market',
+        name: 'admin-market',
+        component: () => import('./views/AdminMarketView.vue'),
         meta: { requiresRole: 'admin' },
       },
       // issue #350：预览号池占用总览（只读）。懒加载组件 + 照邻居写 requiresRole；
