@@ -1390,6 +1390,12 @@ test('迁移 0038-transcript-recovery-rows：幂等键/append_seq 排序/只新�
 // （三列全 `COALESCE(…, '')`）、各写自己那一格 ⇒ 后写的 `ON CONFLICT DO UPDATE` 覆盖**整行**，
 // 先写的那个值就这么丢了。种下 `id = 1` 是这件事的机器判据：那把锁从此一直存在。
 // 判据判的是**可执行 SQL 里真有那句 INSERT**（不是头注释里说过），注释写一万字也拦不住漏种。
+// 反向自证（2026-11-16 复测）：把 0039 那句 `INSERT INTO platform_prompts (id) VALUES (1)`
+// 换成一行注释 ⇒ 本节必须红在**点名它的那条断言**上，实测 rc=1 且
+// `error: '缺种首行：空表时 `snap … FOR UPDATE` 锁不到任何行 ⇒ 并发首写各拿一份空快照
+// ⇒ 后写覆盖整行（丢更新）'`（不是红在编号、不是红在 baseline —— 那说明判据没打在种行上）。
+// 同一件事在**真库**上的对应判据：`portal/integration/platform-prompts-db.mjs` 的
+// `P12d-db`（不种行 ⇒ 并发保存真的丢更新）。
 // ---------------------------------------------------------------------------
 
 test('迁移 0039-platform-prompts：种首行（让 FOR UPDATE 有行可锁）+ 幂等 + 零 baseline 回写', () => {
