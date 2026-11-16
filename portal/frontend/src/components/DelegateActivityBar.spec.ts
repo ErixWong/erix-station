@@ -303,8 +303,13 @@ describe('必修 1：首次就失败 ⇒ 降级态必须可达（设计 §4.2「
   });
 });
 
-describe('判据 15/16：刷新路径与失败静默', () => {
-  it('刷新路径：历史回放建出 `ok:null` 且 runId===activeRunId 的卡 ⇒ 面板仍能拉到并渲染行', async () => {
+describe('判据 15/16：pending 卡触发与失败静默', () => {
+  // ⚠ **名字只声明它真正证明的东西**（独立验收复核指出旧名「刷新路径」名不副实）：这张卡是
+  // `es.handleEvent('tool_use', …)` 建的（实时链路），**没走** `openSession` 的历史回放入口。
+  // 本用例判的是**触发形状**（`ok:null` 且 `runId === activeRunId` 的 delegate 卡 ⇒ 轮询 + 出行），
+  // 而该形状与硬刷新后回放重建出的那张**逐字段同形**（回放也填 `card.runId`，`#delegate` 已有
+  // 专测钉住）；回放链路本身归 `StreamPanel.spec.ts` / `DelegateToolCard.spec.ts` 管，不在这里假装验过。
+  it('pending 卡（`ok:null` 且 `runId === activeRunId`，与回放重建的那张同形）⇒ 触发轮询并渲染行', async () => {
     stubRoster({ items: [rosterItem({ childRunId: 'sub-live-aaaa', state: 'running' })] });
     const store = useWorkbenchStore();
     // 只有 `tool_use`、没有 `tool_result` ⇒ 卡片 `ok === null`，与硬刷新后由历史白名单重建出来的形状一致。

@@ -172,7 +172,7 @@ describe('触发判据（本轮存在 delegate 卡才轮询，设计 §4.2）', 
     expect(handle.shouldPoll.value).toBe(false);
   });
 
-  it('判据 2/7：pending 卡（ok:null，含刷新回放重建的那条）⇒ 立刻一发，之后每 2s 一发', async () => {
+  it('判据 2：pending 卡（ok:null；形状与硬刷新回放重建的那张同形）⇒ 立刻一发，之后每 2s 一发', async () => {
     queueResponses(ok(rosterBody(rosterItem())), ok(rosterBody(rosterItem())), ok(rosterBody(rosterItem())));
     const { handle } = setup({ cards: [delegateCard()] });
     await tick(0);
