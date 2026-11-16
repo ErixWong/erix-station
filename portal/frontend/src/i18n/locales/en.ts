@@ -557,6 +557,10 @@ export const en = {
       starting: 'The sub-task is starting, no output yet',
       empty: 'This sub-task left no output',
       error: 'Failed to load the sub-task output',
+      // issue #602: the parent run has ended while the roster still says live (a background child dies
+      // with the parent process, so `finishRun` never runs). That means "status unknown" — it is **not**
+      // a failure (same rule as `activity.staleParentEnded`), so this line carries no ⚠ and no red.
+      parentEnded: 'The parent run has ended, so the sub-task status is no longer updated (actual state unknown)',
     },
     state: {
       queued: 'Queued',
