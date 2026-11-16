@@ -102,7 +102,7 @@
 | `0032-drop-retired-tables.sql` | 撤三张退役/备份表（`llm_models_retired`、`llm_providers_retired`、`transcript_rounds_shape4_bak_20261027`）；**撤前每个部署自己跑一遍访问账判据** | #503 |
 | `0033-delta-events-not-persisted.sql` | 清 `assistant_delta` / `reasoning_delta` / `tool_call_delta` 的历史存量（**形态 M：纯清理、零 DDL**，分批 `FOR UPDATE SKIP LOCKED`） | #502 |
 | `0034-prune-stale-run-checkpoints.sql` | 清 `run_checkpoints` 里**永不再被读**的两类快照（(a) run 作用域且那个 run 已终态、(b) session 作用域且会话已归档或 14 天没动；**纯清理、零 DDL**，分批 `ctid` + `FOR UPDATE SKIP LOCKED`，只留活跃会话每 key 一行） | #502 的遗留账（工单 261114-03，PR #509） |
-| `0035-upload-settings.sql` | 新建 `upload_settings` 单行表（`max_file_bytes bigint`）——把单文件上传上限从「启动期 env + 重建容器」搬进管理台，**每次上传现读**⇒ 改完立即生效。`FILE_UPLOAD_MAX_BYTES` 降级为兜底值。**产品区间 1 MiB–1 GiB 故意没写进 DB CHECK**（理由在文件头注释：写了 CHECK，“DB 值非法 ⇒ 回落 env”这条判据在真机上就进不去了）| #485 片 A（工单 fix-261116-04） |
+| `0036-upload-settings.sql` | 新建 `upload_settings` 单行表（`max_file_bytes bigint`）——把单文件上传上限从「启动期 env + 重建容器」搬进管理台，**每次上传现读**⇒ 改完立即生效。`FILE_UPLOAD_MAX_BYTES` 降级为兜底值。**产品区间 1 MiB–1 GiB 故意没写进 DB CHECK**（理由在文件头注释：写了 CHECK，“DB 值非法 ⇒ 回落 env”这条判据在真机上就进不去了）| #485 片 A（工单 fix-261116-04） |
 
 ⚠ `0033` 有**部署顺序**要求，见下一节——它不是「又是一条 DELETE」那么轻。
 ⚠ `0034` 同病：**迁移清完磁盘也不会自己缩**——它只清行（dev 实测清掉 70/87 行后
