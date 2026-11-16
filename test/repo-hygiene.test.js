@@ -26,6 +26,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+// 剥注释的状态机**提出来共用**了（issue #557 返工）：`portal/test/deploy-env-delegate.test.js` 的
+// runner env 枚举同样要求「先剥注释再匹配」，两处必须共用**一份**实现，否则同一个形状一边算注释、
+// 另一边算代码 = 两本账。完整口径与三条实测踩坑写在 `test/lib/js-source.mjs` 的头部。
+import { stripComments } from './lib/js-source.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -113,64 +117,9 @@ function trackedFrontendSpecs() {
   return nul.split('\0').filter((p) => p.endsWith('.spec.ts')).sort();
 }
 
-// 扫描前剥注释（#496 返工）：把**块注释**（含 JSDoc，可跨行）与**行注释**（`//` 到行尾）的内容换成
-// 等长空格，**换行与列位一概保留** ⇒ 匹配还是逐行的，命中报告里的 `path:16` 依然能在编辑器里跳到位。
-//
-// 为什么是一趟字符扫描，而不是「先正则剥块、再正则剥行」两条 pass（两条 pass 都会**吞掉真代码**，
-// 那是假绿的方向，比假阳性更贵）：
-//   · 行注释里写 glob（`// 见 portal/` + 星号 + `/x.spec.ts`）时，那个「斜杠星」会让「先剥块」一路吃到
-//     下一个块闭合才收口 ⇒ 中间那几行**真代码**被整段抹掉；
-//   · 块注释正文里写 URL（`https:` 加两斜杠）时，「后剥行」会把那一行剩下的部分砍掉；
-//   · 真实误报那句注释里夹着**反引号**（`w.emitted()`）⇒ 任何「先认字符串再认注释」的写法会被它带偏。
-// 一趟扫描一次定死三种优先级：块注释里不再认行注释起点，行注释里不再认块注释起点，
-// 字符串/模板字面量里两者都不认 ⇒ URL 串里的两斜杠不是注释，它后面紧跟的代码照扫
-// （这正是判据②的第三条探针）。
-//
-// 两处刻意保守（宁可拦得难看，不可悄悄放过）：
-//   · 块注释直到文件尾都没闭合 ⇒ 判它是假的（多半是正则字面量里的「斜杠星」），那一段**原样退回**不剥；
-//   · 普通单/双引号串不跨行：撞见换行就地收尾 ⇒ 一个游离的撇号不会把后半篇都当字符串而漏扫。
-// 已知边界：状态机只认「引号串」与「注释」，不认**正则字面量** ⇒ 形如 `/a/*b/` 后面又碰得上一个真
-// 块闭合时，中间那段代码会被误剥（假绿方向，与本文件其它行级判据同口径）；正则里写 `//` 必须是
-// `\/\/`（转义后两斜杠不相邻），实测不误伤。
-function stripComments(text) {
-  const out = [];
-  const n = text.length;
-  let i = 0;
-  let quote = '';    // 当前字符串定界符：' " ` ；空串 = 不在字符串里
-  let blockOut = -1; // 块注释起点在 out 里的下标；-1 = 不在块注释里
-  let blockSrc = -1; // 块注释起点在 text 里的下标（未闭合时要原样退回）
-  while (i < n) {
-    const c = text[i];
-    const d = i + 1 < n ? text[i + 1] : '';
-    if (blockOut >= 0) {                    // 块注释里：只找闭合，`//` 与引号都不认
-      if (c === '*' && d === '/') { blockOut = -1; out.push('  '); i += 2; continue; }
-      out.push(c === '\n' ? '\n' : ' ');
-      i += 1;
-      continue;
-    }
-    if (quote) {                            // 字符串里：`//` 与 `/*` 都不是注释
-      if (c === '\\') { out.push(c, d); i += 2; continue; }           // 转义掉的引号不算闭合
-      if (c === quote) { quote = ''; out.push(c); i += 1; continue; }
-      if (c === '\n' && quote !== '`') { quote = ''; out.push('\n'); i += 1; continue; }
-      out.push(c);
-      i += 1;
-      continue;
-    }
-    if (c === '/' && d === '*') { blockOut = out.length; blockSrc = i; out.push('  '); i += 2; continue; }
-    if (c === '/' && d === '/') {                                          // 行注释：只抹到行尾
-      while (i < n && text[i] !== '\n') { out.push(' '); i += 1; }
-      continue;
-    }
-    if (c === "'" || c === '"' || c === '`') { quote = c; out.push(c); i += 1; continue; }
-    out.push(c);
-    i += 1;
-  }
-  if (blockOut >= 0) {                      // 块注释没闭合 ⇒ 假的，原样退回（见上方「刻意保守」）
-    out.length = blockOut;
-    out.push(text.slice(blockSrc));
-  }
-  return out.join('');
-}
+// `stripComments()` 现在从 `./lib/js-source.mjs` import（定义处只有一份）。本文件的判据①② 钉着它的
+// 语义：块/行注释 → 等长空格、行列位不变、字符串里的 `//` 不算注释、未闭合块原样退回 ——
+// 判据②（下面那条「三种形状都要命中」的自证）就是它的行为测试，改动那个状态机必须先过这里。
 
 /**
  * 判据本体：给定 [{ path, text }]，返回每一处「取走 emitted」的**行**（同行多支命中算一条，
