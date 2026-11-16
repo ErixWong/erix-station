@@ -779,6 +779,31 @@ const kindUnsupported = (slug) => new MarketError('kind="mcp" 的条目本期待
   { code: 'capability_kind_unsupported', httpStatus: 409, details: { slug } });
 const notFound = (key) => new MarketError('条目不存在', { code: 'capability_not_found', httpStatus: 404, details: { item: key } });
 
+/**
+ * §7 的 URL 动词 → 状态机取值（`capability_items.state` 的域）。
+ *
+ * 为什么映射放在数据层导出而不是内联在 http.js：「动词」是 HTTP 契约面（§7 只开了 publish/retire
+ * 两个口），「状态」是库里的列域（draft/published/retired）——两者词表不同、生命周期也不同
+ * （加个 `/unretire` 只该动映射，不该动状态机）。把它做成可导出的单一真相，单测才能钉住它
+ * （http 层测试需要登录态 + 整套 FakePool，为两个字符串不值得）。
+ * 旧写法 `state: adminMarketStateMatch[2]` 把动词直接当状态使 ⇒ `state='publish'` 被下面
+ * `setItemState` 的域校验拒掉 ⇒ 真机 publish/retire 一律 400 `validation_failed`（发布卡死）。
+ * 回归锁：test/market.test.js MK-23。
+ */
+export const STATE_VERBS = Object.freeze({ publish: 'published', retire: 'retired' });
+
+/** 动词 → 状态；未知动词抛 405（路由正则本已只放 publish|retire 进来，这里是纵深防御）。 */
+export function stateForVerb(verb) {
+  const state = STATE_VERBS[String(verb ?? '')];
+  if (!state) {
+    throw new MarketError(`未知的状态动词：${verb}`, {
+      code: 'capability_state_verb_unknown', httpStatus: 405,
+      details: { verb, allowed: Object.keys(STATE_VERBS) },
+    });
+  }
+  return state;
+}
+
 /** §7 publish / retire：状态机只有 `draft → published → retired` 三个点，跳迁交给调用方决定语义。 */
 export async function setItemState({ pool, itemId, state }) {
   if (!['draft', 'published', 'retired'].includes(state)) throw bad("state 只允许 draft/published/retired", { field: 'state' });
