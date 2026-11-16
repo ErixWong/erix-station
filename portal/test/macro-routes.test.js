@@ -198,3 +198,74 @@ test('#526 用户面：模板过滤 + 订阅 PUT 幂等 + 会话流水 keyset', 
     assert.equal(created.template.created_by, userId, 'admin 建模板记 created_by');
   });
 });
+
+// ── #613 管理台「订阅数」列 ────────────────────────────────────────────────────────
+
+/**
+ * `07` §2 要这一列的理由是「停用前要知道影响谁」，所以本用例同时钉三件事：
+ *  1. 有在用订阅的模板 ⇒ 具体数字（不是 —）；一个都没有 ⇒ `0`（前端拿 `undefined` 显示 `—`，
+ *     那是「后端没下发」的意思，不能和「没人订」混为一个值）；
+ *  2. 口径只算 `enabled = true`：挂在**同一个模板**上的取消订阅不计入（挂在另一张表上就测不出口径）；
+ *  3. 软删模板（`includeDeleted=true`）也带数：软删不抹订阅行 ⇒ 这一行的影响面照样看得见。
+ * 外加一条反 N+1 自证：模板数从 3 涨到 8 ⇒ 计数 SQL 仍只发一条 `GROUP BY`。
+ */
+test('#613 adminTemplates 下发 subscriberCount：2/0、取消订阅不计入、软删也带数、无 N+1', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const u1 = await seedScene(pool, 's613a');
+    const u2 = await seedScene(pool, 's613b');
+    const u3 = await seedScene(pool, 's613c');
+
+    const tTwo = await createTemplate(pool, { kind: 'run-notify', name: 'subs-two', scope: 'session', params: {} });
+    const tZero = await createTemplate(pool, { kind: 'run-notify', name: 'subs-zero', scope: 'session', params: {} });
+
+    // 两条在用订阅：订阅键是 (template_id,user_id,session_id,cwd) ⇒ 必须换人才能真长出第二条
+    await assignTemplate(pool, { templateId: tTwo.id, userId: u1.userId, sessionId: u1.sessionId });
+    await assignTemplate(pool, { templateId: tTwo.id, userId: u2.userId, sessionId: u2.sessionId });
+
+    // 第三条挂在**同一个模板**上、随后取消：先有账 ⇒ unassign 走「停用支」（enabled=false 的行留在表里）
+    const aOff = await assignTemplate(pool, { templateId: tTwo.id, userId: u3.userId, sessionId: u3.sessionId });
+    const rOff = await claimMacroRun(pool, { assignmentId: aOff.id, anchor: 'c613', criterion: 'terminal', bucket: 'b' });
+    await finishMacroRun(pool, { macroRunId: rOff.id, status: 'done', verdict: 'pass' });
+    const cancelled = await deleteAssignment({ pool, sessionId: u3.sessionId, userId: u3.userId, assignmentId: aOff.id });
+    assert.equal(cancelled.mode, 'disabled', '必须是停用支：deleted 支会把行删掉 ⇒ 本用例退化成空断言');
+    const offRow = await pool.query('SELECT enabled FROM macro_assignments WHERE id = $1', [aOff.id]);
+    assert.equal(offRow.rows[0]?.enabled, false, '取消订阅后行仍在且 enabled=false');
+
+    // 软删模板（有账 ⇒ 软删支，订阅行保留）
+    const tDel = await createTemplate(pool, { kind: 'run-notify', name: 'subs-del', scope: 'session', params: {} });
+    const aDel = await assignTemplate(pool, { templateId: tDel.id, userId: u1.userId, sessionId: u1.sessionId });
+    const rDel = await claimMacroRun(pool, { assignmentId: aDel.id, anchor: 'c613d', criterion: 'terminal', bucket: 'b' });
+    await finishMacroRun(pool, { macroRunId: rDel.id, status: 'done', verdict: 'pass' });
+    await deleteTemplate(pool, { templateId: tDel.id });
+
+    const byId = new Map((await adminTemplates({ pool, query: new URLSearchParams() })).items.map((t) => [t.id, t]));
+    assert.ok(byId.has(tTwo.id) && byId.has(tZero.id), '两个模板都应在 admin 列表里');
+    const two = byId.get(tTwo.id);
+    const zero = byId.get(tZero.id);
+
+    // 字段必须下发且是 number（缺字段 ⇒ 前端只能显示 —，正是本 issue 的病根）
+    for (const it of [two, zero]) {
+      assert.ok('subscriberCount' in it, 'subscriberCount 必须在响应里');
+      assert.equal(typeof it.subscriberCount, 'number', `必须是 number，实际 ${typeof it.subscriberCount}`);
+      assert.ok(Number.isInteger(it.subscriberCount), '不能是 bigint 字符串（node-pg 会把 COUNT(*) 回传成 "2"）');
+    }
+    assert.equal(two.subscriberCount, 2, '两条在用订阅；第三条已取消不计入 ⇒ 2 而不是 3');
+    assert.equal(zero.subscriberCount, 0, '没人订必须是 0，不是 null/undefined');
+    assert.notEqual(zero.subscriberCount, null);
+
+    // 软删模板：includeDeleted=true 也带这个数
+    const admDel = (await adminTemplates({ pool, query: new URLSearchParams('includeDeleted=true') }))
+      .items.find((t) => t.id === tDel.id);
+    assert.ok(admDel && admDel.deleted_at, '软删行看得到');
+    assert.equal(admDel.subscriberCount, 1, '软删不抹订阅行 ⇒ 删除影响面照样要看得见');
+
+    // 反 N+1：模板数从 3 涨到 8 ⇒ 订阅数查询仍只发一条 GROUP BY
+    let groupByQueries = 0;
+    const spy = { query: (sql, params) => { if (/macro_assignments/i.test(sql) && /GROUP\s+BY/i.test(sql)) groupByQueries += 1; return pool.query(sql, params); } };
+    for (let i = 0; i < 5; i += 1) {
+      await createTemplate(pool, { kind: 'run-notify', name: `subs-extra-${i}`, scope: 'session', params: {} });
+    }
+    await adminTemplates({ pool: spy, query: new URLSearchParams() });
+    assert.equal(groupByQueries, 1, '一次 GROUP BY 拿全表；逐模板一条查询就是 N+1');
+  });
+});
