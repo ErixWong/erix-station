@@ -31,12 +31,24 @@ const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
  * issue #502 M-6③（审计第 3 条）：**portal 自造的事件类型**，容器经 U3 上报一律 400。
  * 名单与写它们的代码一一对得上：`run_end`（终态收敛事务，五处写入点）、`attempt_killed`
  *（#288/#292 的租约被抢行）、`partial_output`（旧形态遗留的正文行，形态 M 已不再写，
- * 但旧库里还有存量行 ⇒ 名字仍不得被第二把笔占用）。三个名字都不在引擎的 `EVENT_TIERS` 里
+ * 但旧库里还有存量行 ⇒ 名字仍不得被第二把笔占用）、`textualized_tool_call`（issue #243：终局正文
+ * 是一段被文本化的工具调用，由本事务按 worker additive 上报的 `textualized_tool_call` 字段合成）。
+ * 四个名字都不在引擎的 `EVENT_TIERS` 里
  *（现查：`eventTierOf('run_end') === undefined`），所以本名单是**本站自造类型的清单**，
  * 不是引擎名单的副本（那会被误读成「引擎加了就要改这里」）。
  * @type {ReadonlySet<string>}
  */
-const PORTAL_RESERVED_EVENT_TYPES = new Set(['run_end', 'partial_output', 'attempt_killed']);
+/**
+ * `textualized_tool_call_marker` 的长度上界（PR #555 复审 MED-2）。
+ * ⚠ **三方同源**：`runner/lib/final-text-toolcall.js` 的同名常量（worker 侧生成）+ `runner/agentd.js`
+ * （透传时同样丢弃）+ 这里（契约闸）。**不许两处各写一个裸数字**——那是下一次漂移的源头；
+ * 对账判据：`portal/test/textualized-toolcall.test.js`（源码级读两侧常量数值相等 + 跨面行为格拿真
+ * `textualizedToolCallField` 造的载荷过这道闸）。
+ * 为什么 runner 侧必须先丢：本函数这道校验在**开事务之前**，400 会把整条终态打回
+ * （终态不写、不重试 ⇒ run 等租约过期 / reaper），一个纯观测性的片段不该有那种权力。
+ */
+const TEXTUALIZED_MARKER_MAX_CHARS = 120;
+const PORTAL_RESERVED_EVENT_TYPES = new Set(['run_end', 'partial_output', 'attempt_killed', 'textualized_tool_call']);
 // portal.md §9.7：单轮 transcript 记录体积上限。**默认仍是契约值 1 MiB**，issue #371-B 起可由
 // env `MAX_ROUND_BYTES` 覆盖（真机复现「宿主拒 → 引擎剥归档重试一次」要把闸调小到几百 KB，
 // 不可能为此跑 160 轮）。⚠ 调之前先看下面那个算术——调小于它，正常折叠记录也会天天碰闸。
@@ -864,6 +876,27 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
     });
   }
   const finalTextFallback = body.final_text_fallback === true;
+  // issue #243：`textualized_tool_call` = 「这次终局正文是一段**被文本化的工具调用**」（模型把
+  // tool call 吐进 content，引擎当最终文本收下 ⇒ run 正常 `finished`，但交付报告没生成）。
+  // 与 `final_text_fallback` 同口径：**只在 `=== true` 时合法**（缺席 = 没命中；写 `false` 就是有人
+  // 把契约读成了三态）；`_marker` 是命中的那条特征（外来字符串，只用来出文案片段）——给了就必须是
+  // 非空短字符串，脏值 400 而不是静默收下（静默收下 = 界面上出现一条没人能解释的提示）。
+  if (body.textualized_tool_call !== undefined && body.textualized_tool_call !== true) {
+    throw new InternalError(400, 'validation_failed', 'textualized_tool_call 只能为 true（缺席 = 没命中）', {
+      details: { field: 'textualized_tool_call' },
+    });
+  }
+  const textualizedToolCall = body.textualized_tool_call === true;
+  const rawToolCallMarker = body.textualized_tool_call_marker;
+  // 契约闸（**不是**主要防线）：新链路的 runner/agentd 已经把超长 marker 丢在源头，走到这里的
+  // 只有旧容器或手写载荷。超长/脏值仍 400，但**别指望它**：400 会把整条终态打回（见上面常量注释）。
+  if (rawToolCallMarker !== undefined && (typeof rawToolCallMarker !== 'string'
+    || rawToolCallMarker === '' || rawToolCallMarker.length > TEXTUALIZED_MARKER_MAX_CHARS)) {
+    throw new InternalError(400, 'validation_failed',
+      `textualized_tool_call_marker 必须为非空字符串且 ≤${TEXTUALIZED_MARKER_MAX_CHARS} 字符`, {
+      details: { field: 'textualized_tool_call_marker' },
+    });
+  }
 
   if (!termination || typeof termination !== 'object' || !termination.reason) {
     throw new InternalError(400, 'validation_failed', '终态载荷缺 termination.reason');
@@ -949,6 +982,28 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
       );
     }
 
+    // issue #243：命中的话，**同一个终态事务内**先合成一条 `textualized_tool_call` 诊断事件。
+    // 为什么排在这一刻（而不是 runner 经 U3 自己发）：
+    //   * U3 的写入闸是「**租约有效**」（`lease_until > now()`），而 run 收尾时租约随时被清
+    //     （`finishRun` / `drainQueueAfterRun` 都会清空 `claim_token`，#220 现查取证），
+    //     「run 已经跑完、租约已经没了」正是常态 ⇒ 容器自己发会被 409 `lease_lost` 挡掉；
+    //     终态事务里由 portal 写才是**必然成功**的那一侧（`attempt_killed` 的 reaper 分支同构）。
+    //   * 幂等：`client_event_id` + `ON CONFLICT DO NOTHING`（#277 先例）⇒ U2 重放不会写第二条。
+    // `chars` 由 portal 自己从收到的 `final_text` 算，不取容器报的数（外来数字不进 payload）。
+    let textualizedEvent = null;
+    if (textualizedToolCall) {
+      const seq = await allocSeq(client, r.session_id);
+      const payload = { chars: typeof finalText === 'string' ? finalText.length : 0 };
+      if (typeof rawToolCallMarker === 'string' && rawToolCallMarker !== '') payload.marker = rawToolCallMarker;
+      await client.query(
+        `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+         VALUES ($1, $2, $3, $4, 'textualized_tool_call', $5, now())
+         ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+        [runId, r.session_id, seq, `${runId}:final:textualized_tool_call`, JSON.stringify(payload)],
+      );
+      textualizedEvent = { seq, ts: new Date().toISOString(), run_id: runId, type: 'textualized_tool_call', payload };
+    }
+
     // 合成 run_end 事件（run 内最后一条，§7.6）。client_event_id 与 worker 事件命名空间不碰撞。
     // issue #502 D-3（形态 M）：**终态那半截正文就并在本行的 payload 里**（`partial_text`/`partial_round`，
     // 见 `runEndPartialKeys`）——不另开事件行，也**不在这里改缓冲**（缓冲变更一律留到 COMMIT 之后）。
@@ -969,7 +1024,11 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
     retirePartialBuffer(runId);
     // 浏览器侧 SSE 推送（终态 run_end 也必须实时可见）
     try {
-      notifySessionEvents(r.session_id, [{ seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: runEndPayload }]);
+      // issue #243：诊断事件与终态行**同一次**推送（顺序 = 落库顺序：先提示，再终态分隔条）。
+      notifySessionEvents(r.session_id, [
+        ...(textualizedEvent ? [textualizedEvent] : []),
+        { seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: runEndPayload },
+      ]);
     } catch { /* 尽力推送 */ }
     // issue #88/#322：run 终态后异步评估会话自动标题（fire-and-forget：不阻塞本响应，失败全降级，
     // 天然「每 run 至多评估一次」）。**生成者在 portal 自己**（输入 = 该 run 收尾的那段助手文本 +

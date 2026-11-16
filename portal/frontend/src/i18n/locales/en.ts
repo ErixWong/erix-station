@@ -399,6 +399,13 @@ export const en = {
       // engine's own fallback, not model output" (`termination.finalTextFallback === true`).
       // Deliberately neutral (never the red `.syserr` face): it is not a failure.
       finalTextFallback: '(no final text was produced: the text above is the engine fallback, not model output)',
+      // issue #243 (step 3): the final text is a **textualized tool call** (the model emitted the
+      // tool call into `content`, the engine took it as the final answer ⇒ the run finished fine but
+      // the deliverable never landed). Wording is a **status word, not an alarm**: no "warning /
+      // failed / error", and it renders on the neutral `.roundsep` line, never in red.
+      // `{dash}` is the matched feature fragment (`stream.event.dash`) — **empty when absent**, so the
+      // sentence has to stand on its own.
+      toolCallTextualized: 'the model wrote the tool call into its answer text; that call never actually ran{dash}',
       runEnd: 'run ended: {reason}{usage}',
       runEndNormal: 'completed normally',
       missedRunEnd: 'This run ended while the connection was interrupted (see run history)',
