@@ -64,6 +64,29 @@ export const ROSTER_STATES = Object.freeze([
   'queued', 'running', 'completed', 'failed', 'aborted', 'timeout', 'interrupted',
 ]);
 
+/**
+ * `#593`：**活态**名册 state —— 只有这两个 state 的子才允许读它的账本（设计
+ * `delegation-activity-2026-11-16.md` §4.1 纪律 1）。与前端 `portal/frontend/src/lib/delegate.ts#DELEGATE_LIVE_STATES`
+ * 逐值同尺（那边是 TS，本模块是 Node 侧，两边各存一份由判据 `J2`/前端的对拍钉住）。
+ * ⚠ **在 7 值之外的 state 一律按非活态**（不读盘）：词汇表封闭性是写侧（引擎）的不变量，读侧只拿它
+ * 决定「要不要多花一次磁盘读」，不拿它过滤条目（`B11` 钉住「未知 state 照原样下发」）。代价：引擎
+ * 哪天新增一个*活态*，这边会先给一版 `activity.kind:'none'`（不是错数据，只是没有摘要）。
+ */
+export const LIVE_ROSTER_STATES = Object.freeze(new Set(['queued', 'running']));
+
+/**
+ * `#593`：`runs.status` 的**终态**集（`docs/data/schema.sql:206` 的 CHECK 六值减去
+ * `sessions.js#ACTIVE_RUN_STATES` 那三个活态值）。只用来算 `activity.stale`（§4.4 ③），
+ * **不**用来判子 run 死活（门户在宿主、名册 `pid` 在容器，两个 PID namespace）。
+ */
+export const TERMINAL_RUN_STATUSES = Object.freeze(new Set(['finished', 'failed']));
+
+/** `#593`：`activity.args` / `activity.text` 的字符上限（码点数；超长末位补 `…`）。 */
+export const ACTIVITY_SNIPPET_MAX_CHARS = 120;
+
+/** 会话 id 的形状（与 `sessions.js#UUID_RE` 同一条尺，那边没导出 ⇒ 这里第二份，由 `J5` 钉行为）。 */
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function assertShape(value, re, field, label) {
   if (typeof value !== 'string' || !re.test(value)) {
     throw new DelegationError('validation_failed', `${label} 形态非法`, { details: { field } });
