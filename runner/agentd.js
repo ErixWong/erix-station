@@ -501,6 +501,46 @@ function assertSessionKey(ctx, args) {
   return ctx.sessionId;
 }
 
+/**
+ * 恢复行三个方法的**有限**重试上限（只对可重试错误生效：5xx / 429 / 网络错误）。
+ *
+ * 为什么不能沿用其余 store 方法的**无限**退避（`withRetry` 缺省 `maxRetries = Infinity`）：
+ * 那条口径在恢复行这一族上是**语义错误**，不是保守。
+ *   · **读**（`listRecoveryRows`）：契约把「方法在而 reject」定成终局
+ *     `recovery_rows_unreadable`（`reason: persistence_failed` / `operation: listRecoveryRows` /
+ *     `phase: resume_recovery_rows` / `sideEffect: not_started`）——因为吞掉这一次读就等于
+ *     「把唯一的执行证据当成没证据」，而下一次重放付的是真副作用。portal 持续挂 ⇒ 5xx
+ *     ⇒ 无限重试 ⇒ **reject 永不到达引擎** ⇒ 那条终局根本不发生，现场从「run 以明确原因失败」
+ *     变成「resume 无声卡死 + agentd 每 30s 一条 retry 日志」。这是 issue #500 红线 2。
+ *   · **清盘**（`clearRecoveryRows`）：契约同样定成终局（`phase: recovery_rows_clear`），理由是一句
+ *     承诺而不是堆栈：缺席 = 宿主从未承诺这项能力（契约要求这种宿主自己换新 `runId`），
+ *     **在而失败** = 承诺过而这次的「已清理」是假话 ⇒ 下一次续跑会把**上一代**的 `tool-executed`
+ *     当本代证据 ⇒ 跳过本该发生的副作用。无限重试就是把这句假话撑下去。
+ *   · **写**（`appendRecoveryRow`）：本站不特殊（仍走 `withRetry` 缺省无限），与其余账本写
+ *     （`appendRound` / `saveRunState` / `saveRunSnapshot`）同口径 —— 引擎自己那一层
+ *     （`persistClassified` 的 `retryAttempts` + 退避）已给「写坏了的账本」定了终局 `phase: transcript`，
+ *     本站不在中间加第二层重试预算（两层各重试一轮 = 排障时看不出是谁在等）。
+ *
+ * 取 2：一次初始尝试 + 两次重试 ⇒ 能走完 portal 一次重启的窗口（本站 portal 重启实测几秒），
+ * 叠上 `runner/lib/store.js` 自己那三层重试 ⇒ 单次引擎调用的最坏墙钟在十几秒量级，之后把错误
+ * **原样抛出去**（不吞、不改写 code）。改这个数请同时看上面那段：调大 = 拿「明确失败」换「多试几次」。
+ */
+const RECOVERY_ROWS_MAX_RETRIES = 2;
+
+/**
+ * 恢复行只有 session 语义：引擎传来的 `runId` 在本站就是 transcript key（= sessionId）。
+ * 没有 run 作用域的旧端点可退——那张表只有一个键列（迁移 0036），所以旧 portal 回退面
+ * （`ctx.sessionId = null`，上面每个 case 都有）**不是**「换个端点」，而是「本站还没给这个 run 建过
+ * 恢复行通道」⇒ 当场抛错，让错误里有 session 键，而不是发一个注定 404 的请求。
+ */
+function assertRecoverySessionKey(ctx, args) {
+  if (!ctx.sessionId) {
+    throw new Error(`recovery rows require a session transcript key (run=${ctx.runId}, `
+      + `worker sent runId=${String(args?.runId)}): transcript_recovery_rows 只有 session 作用域`);
+  }
+  return assertSessionKey(ctx, args);
+}
+
 async function handleStoreRequest(ctx, method, args, deps = {}) {
   const request = deps.request ?? internalRequest;
   const runId = ctx.runId;
@@ -675,6 +715,42 @@ async function handleStoreRequest(ctx, method, args, deps = {}) {
         { what: `loadLatestRunSnapshot run=${runId}` },
       );
       return r.data; // {checkpoint:{snapshot,revision,updated_at}} 或 204 → null
+    }
+    // ── issue #500：账本恢复行三件套（引擎 0.33.0 可选能力；**只走 session 端点**）──
+    // 三个都只有一句转发 + 有限重试（为何有限见 `RECOVERY_ROWS_MAX_RETRIES` 那段）。
+    // 返回体**原样透传**（`{added}` / `{rows}` / `{cleared}`）：判据与「非数组 ⇒ 抛」都在
+    // `runner/lib/store.js` 那一层，本层不拆包也不兜底（这里改形状 = 两层对形状各有理解）。
+    case 'appendRecoveryRow': {
+      const key = assertRecoverySessionKey(ctx, args);
+      // 线上传输名与 `appendRound` 一致（`args.record`）：只有一个名字，不写 `?? args.row` 这种
+      // 「两个都试试」的兼容——那会让两层对形状的理解各走各的（真出问题时报错指不到人）。
+      const row = args?.record ?? null;
+      const r = await withRetry(
+        () => request('PUT', `/transcript/${encodeURIComponent(key)}/recovery-rows${writerQs}`, { body: row, claimToken: ctx.claimToken }),
+        { what: `appendRecoveryRow key=${key} dedup=${String(row?.dedupKey)}`, maxRetries: RECOVERY_ROWS_MAX_RETRIES },
+      );
+      return r.data; // {added:true|false}
+    }
+    case 'listRecoveryRows': {
+      const key = assertRecoverySessionKey(ctx, args);
+      const r = await withRetry(
+        () => request('GET', `/transcript/${encodeURIComponent(key)}/recovery-rows${writerQs}`, { claimToken: ctx.claimToken }),
+        { what: `listRecoveryRows key=${key}`, maxRetries: RECOVERY_ROWS_MAX_RETRIES },
+      );
+      // 只留一条观测：resume 读是「引擎到底拿到没拿到证据」的唯一现场，与 loadRunState 那条同口径。
+      log('info', 'store listRecoveryRows', {
+        session_key: key, rows: Array.isArray(r?.data?.rows) ? r.data.rows.length : null,
+      });
+      return r.data; // {rows:[…]}；空 = {rows:[]}（**不是** 204/null，本站端点永不返 204）
+    }
+    case 'clearRecoveryRows': {
+      const key = assertRecoverySessionKey(ctx, args);
+      const r = await withRetry(
+        () => request('DELETE', `/transcript/${encodeURIComponent(key)}/recovery-rows${writerQs}`, { claimToken: ctx.claimToken }),
+        { what: `clearRecoveryRows key=${key}`, maxRetries: RECOVERY_ROWS_MAX_RETRIES },
+      );
+      log('info', 'store clearRecoveryRows', { session_key: key, cleared: r?.data?.cleared === true });
+      return r.data; // {cleared:true|false}
     }
     default:
       throw new Error(`unknown store method: ${method}`);
@@ -1578,4 +1654,7 @@ export {
   resolveRunCwd, buildWorkerEnv, CFG as testConfig,
   // issue #288：watchdog 巡检 / shell 子进程组账本 / 启动不变式，均为**单测可见面**（非对外契约）。
   sweepWatchdog, killShellChildGroups, applyShellLiveness, warnIfWatchdogBelowShellMax, makeRunCtx,
+  // issue #500：`withRetry` 的重试判据是 `err instanceof InternalError && err.retryable`，
+  // 所以「有限重试」那条用例必须能造**真**实例（造一个只长得像的错误对象会被判成不可重试 ⇒ 假绿）。
+  InternalError,
 };
