@@ -693,7 +693,7 @@ export const en = {
     empty: 'No published capability packages yet.',
     intro: 'Published skill packages. Install one into your FDE workspace; only enabled ones' +
       ' reach the model tool surface.',
-    budgetHint: 'Every enabled skill ships all of its tools into **every** turn:' +
+    budgetHint: 'Every enabled skill ships all of its tools into every single turn:' +
       ' one FDE can enable at most {max} at a time.',
     footnote: 'Uninstalling or disabling never re-downloads (disabling only flips a flag);' +
       ' if you edited files in the package, "Reinstall" writes them back.',
@@ -792,7 +792,7 @@ export const en = {
       intro: 'Publish and maintain skill packages: metadata plus a multi-file bundle.' +
         ' Whether the bundle is legal is decided by the server.',
       footnote: 'The static scan is advisory, not a gate (§3): a low score blocks neither publishing' +
-        ' nor installing. Hard path/byte/count checks live in the server (`validateBundle`);' +
+        ' nor installing. Hard path/byte/count checks live in the server (validateBundle);' +
         ' this page only blocks obviously wrong paths.',
       loading: 'Loading entries…',
       empty: 'No entries yet: use "Publish new entry".',
