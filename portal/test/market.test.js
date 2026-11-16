@@ -11,14 +11,20 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   LIMITS, ENTRYPOINT, README_FILE, SKILL_SLUG_RE, BUNDLE_MAX_BODY_BYTES,
   MarketError, validateFilePath, validateLayout, extractSkillMeta, scanSecurity, validateBundle,
   publishItem, updateItem, setItemState, listAdminItems, getAdminItem,
   listUserItems, getUserItem, installCapability, uninstallCapability, setCapabilityEnabled,
-  listCapabilitiesForFde, toCapabilityIndexEntry, skillDirFor,
+  listCapabilitiesForFde, toCapabilityIndexEntry, skillDirFor, STATE_VERBS, stateForVerb,
 } from '../src/market.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+/** 读被测源文件本身（结构判据用）：这些判据问的是「代码里还有没有某个写法」，不是行为。 */
+const srcOf = (rel) => fs.readFileSync(path.join(HERE, rel), 'utf8');
+const HTTP_SRC = srcOf('../src/http.js');
 
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
 const KIB = 1024;
@@ -756,3 +762,49 @@ export const SKILL = { id: 'real-skill', tools: [{ name: 'noop_tool', descriptio
   assert.equal(extractSkillMeta('export function getSkillDefinition() { return null; }').skillId, null);
 });
 
+
+// ---------------------------------------------------------------------------
+// §7 状态动词（真机实测：POST .../publish 曾直接 400）
+// ---------------------------------------------------------------------------
+
+test('MK-23 publish/retire 动词必须映射成状态（真机 400 validation_failed 的回归锁）', async () => {
+  assert.deepEqual({ ...STATE_VERBS }, { publish: 'published', retire: 'retired' },
+    '§7 只开这两个动词；加动词改这张表，别把状态机的域放宽');
+  assert.equal(stateForVerb('publish'), 'published');
+  assert.equal(stateForVerb('retire'), 'retired');
+  let ve = null;
+  try { stateForVerb('unretire'); } catch (e) { ve = e; }
+  assert.ok(ve instanceof MarketError && ve.httpStatus === 405 && ve.code === 'capability_state_verb_unknown',
+    `未知动词 ⇒ 405：${ve?.code} / ${ve?.httpStatus}`);
+
+  // 端到端一层：动词映射喂进状态机 ⇒ 库里 state 与 published_at 都对
+  const h = await harness({ publish: true, state: 'draft' });
+  try {
+    const item = h.pool.items.find((i) => i.slug === h.slug);
+    assert.equal(item.state, 'draft');
+    const pub = await setItemState({ pool: h.pool, itemId: item.id, state: stateForVerb('publish') });
+    assert.equal(pub.state, 'published', 'publish 动词落库必须是 published');
+    assert.ok(pub.published_at, 'publish 必须写 published_at（§5 的用户面列表按它排序）');
+    const ret = await setItemState({ pool: h.pool, itemId: item.id, state: stateForVerb('retire') });
+    assert.equal(ret.state, 'retired');
+    assert.ok(ret.retired_at, 'retire 必须写 retired_at');
+    // 状态机的域**没有**因为这次修映射而放宽：动词本身仍不是合法状态（防止「把校验删了当修好了」）
+    const e = await expectErr(setItemState({ pool: h.pool, itemId: item.id, state: 'publish' }),
+      { code: 'validation_failed', httpStatus: 400 });
+    assert.equal(e.details.field, 'state');
+
+    // http.js 侧的接线：路由只放这两个动词（非法动词进不了路由 ⇒ 由末尾兜底 404），且调用处传的是映射结果
+    const line = HTTP_SRC.split('\n').find((l) => l.includes('adminMarketStateMatch = pathname.match('));
+    assert.ok(line, 'publish/retire 路由必须还在 http.js');
+    const lit = /pathname\.match\((.+)\);/.exec(line)[1];
+    const routeRe = new RegExp(lit.slice(1, -1));
+    assert.ok(routeRe.test('/api/admin/market/items/9a2f/publish') && routeRe.test('/api/admin/market/items/9a2f/retire'));
+    assert.equal(routeRe.test('/api/admin/market/items/9a2f/unretire'), false,
+      '非法动词根本进不了这条路由（落 http.js 末尾的 404 兜底）');
+    assert.equal(routeRe.test('/api/admin/market/items/9a2f/published'), false);
+    assert.match(HTTP_SRC, /state\.stateForVerb\(adminMarketStateMatch\[2\]\)|stateForVerb\(adminMarketStateMatch\[2\]\)/,
+      'http.js 必须把动词过 stateForVerb 再传');
+    assert.ok(!/state:\s*adminMarketStateMatch\[2\]/.test(HTTP_SRC),
+      '不许再把 URL 动词直接当 state 传（真机 400 validation_failed 的根因）');
+  } finally { h.after(); }
+});

@@ -1830,7 +1830,11 @@ async function handleAdminApi(req, res, ctx, url) {
   const adminMarketStateMatch = pathname.match(/^\/api\/admin\/market\/items\/([^/]+)\/(publish|retire)$/);
   if (adminMarketStateMatch && req.method === 'POST') {
     const itemId = decodeUuid(adminMarketStateMatch[1]);
-    const item = await market.setItemState({ pool: ctx.pool, itemId, state: adminMarketStateMatch[2] });
+    // ⚠ URL 里的**动词**不等于库里的**状态**：`capability_items.state` 只允许 draft/published/retired，
+    //   直接传 `publish` 会被 `setItemState` 的域校验拒成 400 `validation_failed`（真机发布过这条路）。
+    //   映射表在 `market.STATE_VERBS`（单一真相，单测 MK-23 钉住），未知动词 ⇒ 405。
+    const state = market.stateForVerb(adminMarketStateMatch[2]);
+    const item = await market.setItemState({ pool: ctx.pool, itemId, state });
     await auth.audit(ctx.pool, {
       actorId: session.user.id,
       action: `admin.capability_${adminMarketStateMatch[2]}`,
