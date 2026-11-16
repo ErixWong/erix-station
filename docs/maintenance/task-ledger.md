@@ -5579,3 +5579,19 @@ AND seq >= $ [AND seq < $] ORDER BY seq DESC LIMIT $`），走既有 `UNIQUE (se
 planner 选中的那条**（代价是它扫的是这一形状的 `run_end` 行、与 seq 窗口无关，所以还要配一次
 Top-N 排序）。两句都改成「planner 按统计二选一，两句都别当承诺」，并留了这张读数表做锚。
 **审计 LOW-1 成立的部分**：`LIMIT` 封的确实只是返回条数——两条路径的过滤 / 排序都在 `LIMIT` **之前**。
+
+**主 agent 补记（261116 清晨，第三方复审后的残差登记 + 文档订正）**
+copilot 复审（`gpt-6-luna`、xhigh、一次性沙箱树 `/tmp/audit-pr539`）**零 BLOCKER、1 MED**，
+且那条是**行为红**。我独立复现（**没抄它的夹具**，改钉「客户端只跟着返回的 `next_cursor` 走，那个 run
+最终必须出场」）：库里 `r-new` 两条白名单行 `seq=10/11`、更早 `seq=5` 只有一行 `run_end`，`limit=1` 翻页记录
+= `[[11,[…3 项]], [null,[10:tool_use]]]`，**`r-old` 一次都没出现**；对照组（`run_end` 放 `seq=9`）绿
+⇒ 不是探针坏。焦点套件 `32 / 31 pass / 1 fail rc=1`（唯一那红就是我这条探针）。
+机制我逐条读了原文才对上：`http.js:2905` `pageLow` → `http.js:3035` 发现查询 `seq >= $2` 把它当**下界** →
+`http.js:2913` `whitelistCursor` 依赖 `hasOlder` → `http.js:2926` `tailCursor` 非空页恒 null →
+`http.js:2933` `next_cursor: whitelistCursor ?? tailCursor`。
+**为什么它不是已登记的 ②**：② 要求「发现行超过 `limit`」才漏，我这条只有 1 条发现行、`limit=1`、**无截断**，
+断点纯由游标提前置 null ⇒ 尾巴页压根没被走到。已在 §4.4a「已接受边界」补 **④** 并写明「② 盖不住它」。
+残差**本 PR 不修**（修要动主窗口查询 `UNION ALL`），判据与修法登记进 **issue #561**；
+其中一条硬约束抄在这里以免后来人走捷径：**不许**用「把游标压到 `pageLow` 之下」换绿——
+那会跳过真实事件，用例 `#514 返修：非空页的游标所有权…` 钉着。
+本轮只动 `docs/api/portal.md`（一段）与本台账，**产品代码零改动**。
