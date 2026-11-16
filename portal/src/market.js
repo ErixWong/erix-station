@@ -16,6 +16,8 @@
 // 反过来的话「库里说装了、磁盘上没有」会长期存在（平台不做磁盘对账，§4 末段）。
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { assertSafePath, ensureDirSafe, randomHex } from './fsutil.js';
 import { validateFdeName } from './projects.js';
@@ -588,15 +590,117 @@ export function skillDirFor(config, fdeName, slug) {
   return path.join(skillsRootDir(config, fdeName), slug);
 }
 
+// ---------------------------------------------------------------------------
+// 降权子进程（评审 MEDIUM/8）：落盘/删除**全部**交给 `market-write.js`
+// ---------------------------------------------------------------------------
+
+/**
+ * ⚠ 安全边界在哪里（请把这句当真，别只当注释）：
+ * `assertSafePath` **不是**安全边界——它是 check-then-use，而真正的写/删发生在检查之后；
+ * `~/.erix/skills/` 的每一级祖先属主都是 FDE（uid 1000），所以 FDE 能在两者之间把某一级换成 symlink，
+ * 让 root 身份的 portal 写到/删到用户空间外（`skills/<slug>` → `/etc/cron.d/x` ⇒ 容器逃逸到宿主 root）。
+ * **安全来自降权**：所有会改盘的动作都在 `spawn(..., { uid: fdeUid, gid: fdeGid })` 的子进程里发生，
+ * 于是竞态被赢下也只是「写到 uid 1000 本来就写得进的地方」。`assertSafePath` 仍然保留（纵深防御：
+ * 它把「路径不合法」在父进程就拦住，不让子进程白跑一趟），但它只能让错误更早、更好看。
+ * 残留面（已记录，未关）：`writeSkillDir` 里的 `ensureDirSafe`（建目录 + chmod/chown）仍在 root 手里，
+ * 理由与后果写在那段注释里——它是「改属主/模式」面，不是「写内容/删内容」面。
+ */
+const DISK_HELPER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'market-write.js');
+const DISK_SPAWN_TIMEOUT_MS = 30_000;
+/** payload 上限（与 helper 同源）：超过它直接失败，不拿管道去试（§3 的包天花板是 2 MiB）。 */
+const DISK_PAYLOAD_MAX_BYTES = 16 * 1024 * 1024;
+
+/** 当前进程能不能 setuid 到别人（= 是不是 root）。非 root 传 uid/gid 会 EPERM，只能原样跑。 */
+function canDropPrivileges() {
+  return typeof process.getuid === 'function' && process.getuid() === 0;
+}
+
+/** 真件：与 `spawnSync` 同签名（单测的可注入假件必须看到同样的 argv/opts，否则钉不住 uid/gid）。 */
+const defaultDiskSpawn = (file, argv, opts) => spawnSync(file, argv, opts);
+
+/**
+ * 把一串磁盘指令交给降权子进程跑（一次 spawn 一串 = 一次安装的原子序列）。
+ * @param {{config: object, ops: Array<object>, log?: object, spawnImpl?: Function}} p
+ * @returns {{results: Array<object>}} helper 的逐条回执（`remove` 带 `existed`）
+ * @throws {MarketError} `capability_install_failed` 500，`details.reason` 带子进程的退出码/信号/spawn errno
+ */
+function diskOps({ config, ops, log = console, spawnImpl = null }) {
+  const payload = JSON.stringify({ ops });
+  const bytes = Buffer.byteLength(payload, 'utf8');
+  if (bytes > DISK_PAYLOAD_MAX_BYTES) {
+    throw new MarketError(`落盘指令体积超限：${bytes} > ${DISK_PAYLOAD_MAX_BYTES}`
+      + '（不把 payload 塑进管道之前先拦，免得子进程白跑）', {
+      code: 'capability_install_failed', httpStatus: 500,
+      details: { reason: 'payload_too_large', bytes, max_bytes: DISK_PAYLOAD_MAX_BYTES },
+    });
+  }
+  const spawn = spawnImpl ?? config?.spawnImpl ?? defaultDiskSpawn;
+  const opts = {
+    input: payload,            // payload 走 stdin：argv 单串超 128 KiB 就 E2BIG，而包上限是 2 MiB
+    // encoding 缺省 null ⇒ stdout/stderr 是 Buffer（写 'buffer' 会直接 ERR_UNKNOWN_ENCODING）。
+    maxBuffer: 1024 * 1024,    // 回执只有一行 JSON；stdout 肥大 = helper 写了不该写的东西，当场失败
+    timeout: DISK_SPAWN_TIMEOUT_MS,
+    env: {},                   // 子进程不需要环境（也不该拿到 DB 密码之类的）
+    cwd: '/',                  // 不继承 cwd（父进程 cwd 被删过就 ENOENT）
+  };
+  if (canDropPrivileges()) {
+    opts.uid = config?.fdeUid ?? 1000;
+    opts.gid = config?.fdeGid ?? 1000;
+  }
+  const r = spawn(process.execPath, [DISK_HELPER], opts);
+  const stderr = r?.stderr == null ? '' : String(r.stderr);
+  if (r?.error) {
+    throw new MarketError(`落盘子进程拉起失败：${r.error.message}`, {
+      code: 'capability_install_failed', httpStatus: 500,
+      details: { reason: `spawn_failed_${r.error.code || r.error.name || 'unknown'}`, dropped: Boolean(opts.uid) },
+    });
+  }
+  if (r?.status !== 0) {
+    // 非 0（或超时/信号）⇒ 就是失败，不强行「部分成功」。details.reason **带子进程的码**（要求）。
+    const code = r?.signal ? `helper_signal_${r.signal}` : `helper_exit_${r?.status}`;
+    const details = { reason: code, exit_code: r?.status ?? null, signal: r?.signal ?? null,
+      dropped: Boolean(opts.uid), stderr: stderr.slice(0, 500) };
+    try {
+      const parsed = JSON.parse(stderr);
+      if (parsed && parsed.ok === false) Object.assign(details, { child_error: parsed.error, child_code: parsed.code, child_op: parsed.op, child_path: parsed.path, child_index: parsed.index });
+    } catch { /* stderr 不是 JSON（helper 自己炸了/没跑起来）：原文已在 details.stderr */ }
+    throw new MarketError(`落盘子进程失败：${code}${stderr ? ` ${stderr.slice(0, 300)}` : ''}`, {
+      code: 'capability_install_failed', httpStatus: 500, details,
+    });
+  }
+  if (stderr) log.warn?.(`[market] 落盘子进程 stderr（退出 0，不阻断）：${stderr.slice(0, 300)}`);
+  let parsed;
+  try {
+    parsed = JSON.parse(String(r.stdout ?? ''));
+  } catch (e) {
+    throw new MarketError(`落盘子进程回执不是 JSON：${String(r.stdout ?? '').slice(0, 200)}`, {
+      code: 'capability_install_failed', httpStatus: 500, details: { reason: 'helper_reply_unparsable', child_error: e.message },
+    });
+  }
+  if (!parsed || parsed.ok !== true || !Array.isArray(parsed.results)) {
+    throw new MarketError('落盘子进程回执形状不对', {
+      code: 'capability_install_failed', httpStatus: 500, details: { reason: 'helper_reply_malformed' },
+    });
+  }
+  return parsed;
+}
+
 /**
  * 落盘（§4）：先写 `<slug>.tmp-<rand>`，再把旧目录挪开、rename 就位、最后清旧目录。
  * 为什么不是「直接 rm -rf 再写」：rm 与写完之间崩了，用户看到的是「装了一半」；
  * 而 rename 是原子的，中间任意时刻目录里都是**完整的一版**（旧版或新版）。
  * 直接 rename 覆盖非空目录在 POSIX 会 ENOTEMPTY，所以旧目录必须先挪开（不是先删）。
- * @param {{userSpaceRoot: string, fdeUid?: number, fdeGid?: number}} config
+ *
+ * 谁在写盘：**不是本进程**。下面只算路径、建目录、排指令，真正的 write/rename/remove 全部在
+ * `diskOps()` 的降权子进程里发生（评审 MEDIUM/8）——原因见上面那段「安全边界」注释。
+ * 父进程只留两类**不改盘**的动作：`existsSync`（决定要不要插一条 stash rename）与 `assertSafePath`。
+ * 一次 spawn 装整串指令（写完 + 两次 rename），所以「一次安装 = 一次子进程」；
+ * 旧目录的清理是 best-effort，单独一次 spawn（它失败不能拖垮刚成功的安装）。
+ * ⚠ 本函数里出现 `fs.writeFileSync` / `fs.rmSync` 就是回归（单测 MK-21 钉了这条结构判据）。
+ * @param {{userSpaceRoot: string, fdeUid?: number, fdeGid?: number, spawnImpl?: Function}} config
  * @param {Array<{path: string, content: Buffer}>} files
  */
-export function writeSkillDir({ config, fdeName, slug, files, log = console }) {
+export function writeSkillDir({ config, fdeName, slug, files, log = console, spawnImpl = null }) {
   const root = config.userSpaceRoot;
   const skillsRoot = skillsRootDir(config, fdeName);
   const target = skillDirFor(config, fdeName, slug);
@@ -605,48 +709,62 @@ export function writeSkillDir({ config, fdeName, slug, files, log = console }) {
 
   const tmp = path.join(skillsRoot, `${slug}.tmp-${randomHex(4)}`);
   assertSafePath(root, tmp);
-  const written = [];
+  const ops = [];
   try {
     for (const f of files) {
       const dest = path.join(tmp, f.path);
       assertSafePath(root, dest);
       // 包内路径已过 `..` / 绝对路径 / 空段校验，这里再走一次宿主边界：判据不同源，任一侧漏了都不越界。
+      // 目录仍由**父进程**建（本节唯一留在 root 手里的改盘动作）。为什么不搬进子进程：
+      // 「全新 FDE、`.erix` 还不存在」时子进程（uid 1000）建不出 `home/.erix` 这一串——那需要它的
+      // 祖先就可写，而平台侧（materializer/provisioner）的口径是 root 建目录 + chown 1000（§6.2）。
+      // ⚠ 于是这里残留一个**更窄的** check-then-use 面：`ensureDirSafe` 的 chmod/chown 会跟随 symlink，
+      //   若 FDE 在 `assertSafePath` 之后把某一级换成指向外部的 symlink，root 会去 chmod/chown 那个外部目录
+      //   （改属主/模式，不是写内容，也不是提权；真正的写入与删除已经全在子进程里）。
+      //   要关这扇门的条件是：先确认生产上 `home/.erix` 整串的属主允许 uid 1000 自己 mkdir。
       ensureDirSafe(root, path.dirname(dest), { mode: 0o755, uid: config.fdeUid ?? null, gid: config.fdeGid ?? null, log });
-      fs.writeFileSync(dest, f.content, { mode: 0o644 });
-      fs.chmodSync(dest, 0o644);   // writeFileSync 的 mode 受 umask 影响，显式 chmod 才是 §4 的 0644
-      if (Number.isInteger(config.fdeUid) || Number.isInteger(config.fdeGid)) {
-        try { fs.chownSync(dest, config.fdeUid ?? -1, config.fdeGid ?? -1); } catch { /* 非 root 测试环境：模式已对，属主留给生产 root */ }
-      }
-      written.push(dest);
+      // 内容走 payload（base64）而不是「先落临时文件再让子进程读」：后者会引入一条新的 check-then-use 路径。
+      ops.push({ op: 'write', path: dest, contentBase64: Buffer.from(f.content).toString('base64'), mode: 0o644 });
     }
     let stashed = null;
-    if (fs.existsSync(target)) {
+    if (fs.existsSync(target)) {   // 只 stat，不动盘
       stashed = path.join(skillsRoot, `${slug}.old-${randomHex(4)}`);
-      fs.renameSync(target, stashed);
+      ops.push({ op: 'rename', from: target, to: stashed });
     }
-    fs.renameSync(tmp, target);
+    ops.push({ op: 'rename', from: tmp, to: target });
+    diskOps({ config, ops, log, spawnImpl });
     if (stashed) {
-      try { fs.rmSync(stashed, { recursive: true, force: true }); } catch (e) { log.warn?.(`[market] 清理旧版本目录失败（不阻断）：${stashed}: ${e.message}`); }
+      try {
+        diskOps({ config, ops: [{ op: 'remove', path: stashed }], log, spawnImpl });
+      } catch (e) { log.warn?.(`[market] 清理旧版本目录失败（不阻断）：${stashed}: ${e.message}`); }
     }
   } catch (e) {
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* tmp 可能压根没建起来 */ }
+    // tmp 清理同样是 best-effort（而且也得走子进程：本进程不该再亲手删盘）。
+    try { diskOps({ config, ops: [{ op: 'remove', path: tmp }], log, spawnImpl }); } catch { /* tmp 可能压根没建起来 */ }
+    if (e instanceof MarketError) throw e;   // diskOps 已经把退出码/spawn errno 封好了，不再重包一层
     throw new MarketError(`技能落盘失败：${e.message}`, {
       code: 'capability_install_failed', httpStatus: 500,
       details: { reason: e.code || e.name || 'write_failed', slug, path: target },
     });
   }
-  return { dir: target, files: written.length };
+  return { dir: target, files: ops.filter((o) => o.op === 'write').length };
 }
 
-/** §4 卸载：只删 slug 目录本身。目录不存在 ⇒ 幂等成功（用户手删了也算已卸）。 */
-export function removeSkillDir({ config, fdeName, slug, log = console }) {
+/**
+ * §4 卸载：只删 slug 目录本身。目录不存在 ⇒ 幂等成功（用户手删了也算已卸）。
+ * 删也是降权子进程做的（同上）；「删之前存不存在」由 helper 的回执回答，父进程不再自己 stat
+ * （自己 stat 又是一次 check-then-use，虽然降权后已不是安全判据，但同源的事实更好用）。
+ * ⚠ 本函数里出现 `fs.rmSync` 就是回归（单测 MK-21）。
+ */
+export function removeSkillDir({ config, fdeName, slug, log = console, spawnImpl = null }) {
   const target = skillDirFor(config, fdeName, slug);
   assertSafePath(config.userSpaceRoot, target);
-  if (!fs.existsSync(target)) return { removed: false, dir: target };
   try {
-    fs.rmSync(target, { recursive: true, force: true });
-    return { removed: true, dir: target };
+    const { results } = diskOps({ config, ops: [{ op: 'remove', path: target }], log, spawnImpl });
+    const existed = results.some((r) => r.op === 'remove' && r.existed === true);
+    return { removed: existed, dir: target };
   } catch (e) {
+    if (e instanceof MarketError) throw e;
     throw new MarketError(`技能目录删除失败：${e.message}`, {
       code: 'capability_install_failed', httpStatus: 500,
       details: { reason: e.code || e.name || 'remove_failed', slug, path: target },

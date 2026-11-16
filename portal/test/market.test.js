@@ -18,12 +18,16 @@ import {
   MarketError, validateFilePath, validateLayout, extractSkillMeta, scanSecurity, validateBundle,
   publishItem, updateItem, setItemState, listAdminItems, getAdminItem,
   listUserItems, getUserItem, installCapability, uninstallCapability, setCapabilityEnabled,
-  listCapabilitiesForFde, toCapabilityIndexEntry, skillDirFor, STATE_VERBS, stateForVerb,
+  listCapabilitiesForFde, toCapabilityIndexEntry, skillDirFor, writeSkillDir, removeSkillDir,
+  STATE_VERBS, stateForVerb,
 } from '../src/market.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 /** 读被测源文件本身（结构判据用）：这些判据问的是「代码里还有没有某个写法」，不是行为。 */
 const srcOf = (rel) => fs.readFileSync(path.join(HERE, rel), 'utf8');
+const MARKET_SRC = srcOf('../src/market.js');
+const HELPER_SRC = srcOf('../src/market-write.js');
+const HELPER_PATH = path.join(HERE, '..', 'src', 'market-write.js');
 const HTTP_SRC = srcOf('../src/http.js');
 
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
@@ -762,6 +766,163 @@ export const SKILL = { id: 'real-skill', tools: [{ name: 'noop_tool', descriptio
   assert.equal(extractSkillMeta('export function getSkillDefinition() { return null; }').skillId, null);
 });
 
+// ---------------------------------------------------------------------------
+// §4 落盘面：降权子进程（评审 MEDIUM/8：检查与使用之间的 symlink 竞态）
+// ---------------------------------------------------------------------------
+
+/** 取顶层函数体（这些函数的收尾 `}` 在第 0 列）——结构判据只能读源码，行为判据看不到「还有没有 fs.rmSync」。 */
+function fnBody(src, decl) {
+  const at = src.indexOf(decl);
+  assert.notEqual(at, -1, `找不到函数声明：${decl}`);
+  const end = src.indexOf('\n}', at);
+  assert.ok(end > at, `${decl} 的函数体取不到结尾`);
+  return src.slice(at, end);
+}
+
+test('MK-21 结构判据：写入与删除都经过子进程，父进程里不再动盘（安全来自降权，不是 assertSafePath）', () => {
+  // ① 父进程不许再亲手写/删：这些名字一出现就说明有人把动作挪回了 root 进程。
+  //    ⚠ `ensureDirSafe`（建目录）故意**不在**禁止名单里：那是本节唯一留在 root 手里的改盘动作
+  //    （全新 FDE 时子进程建不出 `home/.erix` 整串），market.js 里写了为什么与它的残留风险。
+  for (const decl of ['export function writeSkillDir(', 'export function removeSkillDir(']) {
+    const body = fnBody(MARKET_SRC, decl);
+    for (const forbidden of ['fs.writeFileSync', 'fs.writeFile(', 'fs.appendFileSync', 'fs.rmSync',
+      'fs.unlinkSync', 'fs.rmdirSync', 'fs.renameSync', 'fs.mkdirSync', 'fs.chmodSync', 'fs.chownSync']) {
+      assert.ok(!body.includes(forbidden), `${decl} 里又出现了 ${forbidden}：改盘必须走 market-write.js 子进程`);
+    }
+    assert.match(body, /diskOps\(/, `${decl} 必须把动作交给 diskOps()（降权子进程）`);
+  }
+  // ② 子进程确实是 spawn 出去的，并且带着 uid/gid 与「非 root 就跳过」的判定
+  const diskBody = fnBody(MARKET_SRC, 'function diskOps({');
+  assert.match(MARKET_SRC, /import \{ spawnSync \} from 'node:child_process'/);
+  assert.match(diskBody, /spawn\(process\.execPath, \[DISK_HELPER\], opts\)/, 'helper 必须用当前 node 跑，路径由模块位置决定');
+  assert.match(diskBody, /opts\.uid = config\?\.fdeUid \?\? 1000/);
+  assert.match(diskBody, /opts\.gid = config\?\.fdeGid \?\? 1000/);
+  assert.match(diskBody, /canDropPrivileges\(\)/, 'uid/gid 只在能降权时传（非 root 单测环境传了就是 EPERM）');
+  assert.match(MARKET_SRC, /process\.getuid\(\) === 0/);
+  // payload 走 stdin，不走 argv（Linux 单串 argv 上限 128 KiB，而包上限是 2 MiB）
+  assert.match(diskBody, /input: payload/);
+  assert.doesNotMatch(diskBody, /\[\s*DISK_HELPER,\s*payload\s*\]/, 'payload 不许塞进 argv');
+  // ③ helper 的位置由模块位置决定（而不是 cwd / 相对路径），且它真的在盘上
+  assert.match(MARKET_SRC, /path\.dirname\(fileURLToPath\(import\.meta\.url\)\), 'market-write\.js'\)/);
+  assert.ok(fs.existsSync(HELPER_PATH), 'portal/src/market-write.js 必须存在');
+  // ④ helper 不许带业务判断：只准 import node 内置（不 import market.js，不引第三方）
+  const imports = (HELPER_SRC.match(/^import [^\n]*$/gm) ?? []).map((l) => /from '([^']+)'/.exec(l)?.[1]).filter(Boolean);
+  assert.deepEqual(imports.sort(), ['node:fs', 'node:path'],
+    `market-write.js 只许用 node 内置模块（有业务判断就意味着安全边界又搬回 check-then-use 那侧）：${imports}`);
+  // ⑤ 镜像面：portal/Dockerfile 是整目录 COPY，所以新增 src 文件会自动进镜像
+  //    （issue #589 刚被「只拷子目录」坑过一次：portal/shared 没进镜像 ⇒ 镜像构建不出来）
+  const docker = srcOf('../Dockerfile');
+  assert.match(docker, /^COPY portal\/ portal\/$/m,
+    'portal/Dockerfile 若改成逐文件 COPY，必须把 portal/src/market-write.js 一起带上');
+});
+
+test('MK-22 子进程契约：payload 走 stdin、removed 由回执决定、非 0 退出 ⇒ capability_install_failed（带子进程码）', () => {
+  // tmp 当 userSpaceRoot（docs/testing.md §2.1）：本用例里所有「改盘」都是假件，但
+  // `ensureDirSafe`（建目录）仍在真盘上跑 ⇒ root 参数必须是可写的 tmp，不能拿 /srv/erix 去 mkdir。
+  const userSpaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'market-spawn-'));
+  const h = { config: { userSpaceRoot, fdeUid: 1000, fdeGid: 1000 } };
+  const quiet = { warn() {} };
+  try {
+  const ok = (results) => ({ status: 0, signal: null, stdout: Buffer.from(JSON.stringify({ ok: true, results })), stderr: Buffer.from('') });
+  const calls = [];
+  const fakeOk = (file, argv, opts) => { calls.push({ file, argv, opts }); return ok([{ op: 'remove', path: 'x', existed: true }]); };
+
+  const r = removeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet, spawnImpl: fakeOk });
+  assert.equal(calls.length, 1, '删除必须且只走一次子进程');
+  assert.equal(calls[0].file, process.execPath, '用当前 node 跑 helper（不依赖 PATH 上的 node）');
+  assert.deepEqual(calls[0].argv, [HELPER_PATH],
+    'argv 只放 helper 路径（由模块位置决定，不靠 cwd）；包内容进 argv 会撑爆单串 128 KiB 上限');
+  assert.equal(calls[0].opts.input.includes('demo-skill'), true, '指令必须走 stdin（opts.input）');
+  assert.deepEqual(JSON.parse(calls[0].opts.input).ops.map((o) => o.op), ['remove']);
+  assert.deepEqual(calls[0].opts.env, {}, '不给子进程带环境（DB 密码之类不该出现在里面）');
+  assert.ok(Number.isInteger(calls[0].opts.timeout), '子进程必须有超时：卡死会挂住 HTTP 请求');
+  assert.equal(r.removed, true, 'removed 必须由 helper 回执的 existed 决定（父进程不再自己 existsSync）');
+
+  // 幂等：回执说「本来就不在」⇒ removed:false（卸载两次仍是 200）
+  calls.length = 0;
+  calls.push; // no-op, keeps the array obviously mutable for readers
+  const gone = removeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet,
+    spawnImpl: () => ok([{ op: 'remove', path: 'x', existed: false }]) });
+  assert.equal(gone.removed, false);
+
+  // 生产分支：root 才降权（这里伪造 getuid()=0 来验「传了 uid/gid」，真实 setuid 效果只能在真容器里验）
+  const realGetuid = process.getuid;
+  try {
+    process.getuid = () => 0;
+    calls.length = 0;
+    removeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet, spawnImpl: fakeOk });
+    assert.equal(calls[0].opts.uid, 1000, 'root 下必须降权到 fdeUid');
+    assert.equal(calls[0].opts.gid, 1000, 'root 下必须降权到 fdeGid');
+    calls.length = 0;
+    removeSkillDir({ config: { userSpaceRoot }, log: quiet, fdeName: 'alice', slug: 'demo-skill', spawnImpl: fakeOk });
+    assert.deepEqual([calls[0].opts.uid, calls[0].opts.gid], [1000, 1000], 'config 没写 fdeUid/fdeGid 时按 §4 的缺省 1000 降权');
+  } finally { process.getuid = realGetuid; }
+  // 非 root（单测/开发）⇒ 不传 uid/gid，否则 spawnSync 直接 EPERM
+  assert.equal(typeof process.getuid === 'function' && process.getuid() === 0, false,
+    '本用例假设单测以非 root 跑（若以 root 跑，MK-22 后半段的「不降权」判据要改）');
+  calls.length = 0;
+  removeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet, spawnImpl: fakeOk });
+  assert.equal(calls[0].opts.uid, undefined, '非 root 环境不许传 uid（EPERM）');
+
+  // 非 0 退出 ⇒ 500 capability_install_failed，details 带子进程的码
+  const failFake = () => ({ status: 1, signal: null, stdout: Buffer.from(''),
+    stderr: Buffer.from(JSON.stringify({ ok: false, error: "EACCES: permission denied, open '/etc/cron.d/x'",
+      code: 'EACCES', op: 'write', path: '/etc/cron.d/x', index: 1 })) });
+  for (const [what, run] of [
+    ['writeSkillDir', () => writeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet,
+      files: [{ path: ENTRYPOINT, content: Buffer.from('// x\n') }], spawnImpl: failFake })],
+    ['removeSkillDir', () => removeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet, spawnImpl: failFake })],
+  ]) {
+    let e = null;
+    try { run(); } catch (err) { e = err; }
+    assert.ok(e instanceof MarketError, `${what} 子进程非 0 退出必须抛 MarketError`);
+    assert.equal(e.code, 'capability_install_failed', `${what} 的错误码：${e.code}`);
+    assert.equal(e.httpStatus, 500);
+    assert.equal(e.details.reason, 'helper_exit_1', `details.reason 要带子进程的码：${JSON.stringify(e.details)}`);
+    assert.equal(e.details.exit_code, 1);
+    assert.equal(e.details.child_code, 'EACCES', 'helper 的 errno 必须原样带出来（运维要靠它区分「越界」与「盘满」）');
+    assert.equal(e.details.child_op, 'write');
+    assert.equal(e.details.child_index, 1, '一个 payload 里可以有 20 多条指令：不报「第几条挂了」等于没报');
+  }
+  // 信号（超时/被杀）同样是失败，不许当成「部分成功」
+  let sig = null;
+  try {
+    removeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet,
+      spawnImpl: () => ({ status: null, signal: 'SIGTERM', stdout: Buffer.from(''), stderr: Buffer.from('') }) });
+  } catch (e) { sig = e; }
+  assert.equal(sig?.details?.reason, 'helper_signal_SIGTERM');
+  // 回执不是 JSON / 形状不对 ⇒ 也是失败（不许「静默当成功」）
+  for (const [stdout, reason] of [['nope', 'helper_reply_unparsable'], [JSON.stringify({ ok: true }), 'helper_reply_malformed']]) {
+    let e = null;
+    try {
+      removeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet,
+        spawnImpl: () => ({ status: 0, signal: null, stdout: Buffer.from(stdout), stderr: Buffer.from('') }) });
+    } catch (err) { e = err; }
+    assert.equal(e?.details?.reason, reason, `stdout=${stdout} 应当判失败：${e?.details?.reason}`);
+  }
+  // spawn 本身失败（helper 文件被删/execPath 不可用）⇒ 同一条错误码
+  let se = null;
+  try {
+    removeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet,
+      spawnImpl: () => ({ error: Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) }) });
+  } catch (e) { se = e; }
+  assert.equal(se?.code, 'capability_install_failed');
+  assert.equal(se?.details?.reason, 'spawn_failed_ENOENT');
+
+  // payload 超限 ⇒ 在父进程就拦住（一次 spawn 都不该发生）
+  const bigCalls = [];
+  let pe = null;
+  try {
+    writeSkillDir({ config: h.config, fdeName: 'alice', slug: 'demo-skill', log: quiet,
+      files: [{ path: ENTRYPOINT, content: Buffer.alloc(13 * MIB, 0x61) }],   // base64 后 > 16 MiB
+      spawnImpl: (...a) => { bigCalls.push(a); return ok([]); } });
+  } catch (e) { pe = e; }
+  assert.equal(pe?.details?.reason, 'payload_too_large', `超大 payload 必须当场拒：${pe?.details?.reason}`);
+  // 大 payload 一次都没进管道（只剩 catch 里那次小清理，它不该带着 13 MB 内容）
+  assert.ok(!bigCalls.some(([, , opts]) => Buffer.byteLength(String(opts.input ?? '')) > MIB),
+    `超限就不该把大块内容塞进管道（spawn 次数=${bigCalls.length}）`);
+  } finally { fs.rmSync(userSpaceRoot, { recursive: true, force: true }); }
+});
 
 // ---------------------------------------------------------------------------
 // §7 状态动词（真机实测：POST .../publish 曾直接 400）
