@@ -13,6 +13,8 @@ import { i18n, setLocale } from '../i18n';
 import { zhCN } from '../i18n/locales/zh-CN';
 
 const VIEWER_LABEL = zhCN.delegate.openViewer;
+/** 状态未知那句（卡片那个中性 `·` 的 tooltip）——取 locale，不在测试里手抄文案。 */
+const UNKNOWN_LABEL = zhCN.delegate.state.unknown;
 
 function frame(data: unknown): MessageEvent {
   return { data: JSON.stringify(data) } as MessageEvent;
@@ -211,6 +213,8 @@ describe('delegate 卡：spinner 只属于「仍是当前活跃 run」的 run（
     expect(state.attributes('data-badge-kind')).toBe('unknown');
     expect(state.classes()).toContain('text-black/50'); // = DELEGATE_BADGE_CLASS.unknown
     expect(state.text()).toBe(DELEGATE_UNKNOWN_MARK); // 中性位：既不是 ✓ 也不是 ✗
+    // 那个 `·` 得说得出自己是什么（tooltip 走既有 `delegate.state.unknown`，不新造文案）。
+    expect(state.attributes('title')).toBe(UNKNOWN_LABEL);
     expect(wrapper.html()).not.toContain('text-red-600'); // 不许把「run 已结束」渲染成失败
     // 「查看子 run」按钮不受影响：账本还在，用户仍然可以进去看（抽屉会自己说明状态未知）。
     expect(wrapper.find('.delegate-open-viewer').exists()).toBe(true);
