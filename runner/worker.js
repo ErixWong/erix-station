@@ -36,6 +36,9 @@ import { resolveRunModel, resolveModelMetadata } from './lib/llm-models.js';
 import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
 import { createJail, createStationFileTools, STATION_MASKED_PATHS, platformReadExceptions } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
+// issue #537（W4a 审查快照与隔离）：审查 run 只读工具装配（纯函数、只 import node: 内建，
+// 故 portal/test/macro-snapshot.test.js 能跨目录 import 同一份口径做反向自证二）。
+import { isReviewOnly, filterReviewExecutors, filterReviewSchemas } from './lib/review-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
 import { engineDiagnosticNotice, summarizerFailureNotice } from './lib/engine-notices.js';
@@ -580,6 +583,14 @@ async function startRun(msg) {
   //   「整个 createJail 调用在同一行」的形状抓取（正则里带「不含换行」那一类），拆成多行会一个都抓不到
   //   ⇒ 它会红（不是静默降级，但白费一次往返）。#231 与 #259 在**同一处**装配是硬要求：
   //   少任何一个都是静默降级，两侧各有一把锁。锁的原文见 runner/test/system-prompt.test.js 的 #259 一节。
+  // issue #537（W4a 审查快照与隔离）：审查 run 开关（env RUN_REVIEW_ONLY=1）。worker 里**读一次**，
+  // 两处装配点（registry / baseToolSchemas）共用同一个常量。审查 run 只留只读三件套 ⇒ 隔离由
+  // 「无 shell / 无 write / 无 note」在**工具装配层**保证（见下 registry / baseToolSchemas）。
+  // ⚠ jail 的 `writable: [cwd]` **刻意不动**：#259 的锁（runner/test/system-prompt.test.js:315-319）
+  //   钉住「worker 只有一处 createJail 且该行字面含 `writable: [cwd]`」。审查 run 的 cwd 就是 worktree，
+  //   而只读装配不含 writeFile/edit/shell ⇒ 无任何工具能触发写 ⇒ `writable: [cwd]` 与 `[]` 对 agent
+  //   的**可观测写面相同（皆空）**。这是有意取舍（详见交付报告偏差说明）。
+  const reviewOnly = isReviewOnly();
   const jail = createJail({ root: cwd, writable: [cwd], maskedPaths: STATION_MASKED_PATHS, readExceptions: platformReadExceptions() });
   const fileTools = createStationFileTools({ jail, cwd, maskedPaths: STATION_MASKED_PATHS });
   // 一次性 info 记账（与 #451 的 AGENTS.md 注入记账同形态，走现成 MSG.LOG、**不新增事件类型**）：
@@ -649,9 +660,10 @@ async function startRun(msg) {
       }),
     },
   });
+  // issue #537 装配点①（registry）：审查 run 时只留只读三件套、**不给 shell**。
   const registry = createToolRegistry({
-    executors: { ...fileTools.executors, ...shellTools.executors },
-    schemas: [...fileTools.schemas, ...shellTools.schemas],
+    executors: reviewOnly ? filterReviewExecutors(fileTools.executors) : { ...fileTools.executors, ...shellTools.executors },
+    schemas: reviewOnly ? filterReviewSchemas(fileTools.schemas) : [...fileTools.schemas, ...shellTools.schemas],
   });
   // #363：平台技能 bundled 通道 = FDE 镜像内 /opt/erix/skills（COPY 进镜像，不可变随 digest pin）。
   // 不用 bind mount：fde-proxy 契约只放 rw + userSpace 内源，ro 平台目录要改安全面；而 loader
@@ -679,7 +691,10 @@ async function startRun(msg) {
     });
   }
   const skillToolNames = new Set(skillTools.tools.map((t) => t.name));
-  const baseToolSchemas = [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
+  // issue #537 装配点②（baseToolSchemas，送给模型的面）：**必须与装配点①同口径**——只改一处等于没改。
+  const baseToolSchemas = reviewOnly
+    ? filterReviewSchemas(fileTools.schemas)
+    : [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
   const noteToolNames = new Set(noteTools.schemas.map((s) => s.name));
   /** delegation 实例（开关关 ⇒ 恒 null；声明在 executeTool 之前，因为路由分支要读它）。 */
   let delegation = null;
@@ -699,12 +714,15 @@ async function startRun(msg) {
     if (delegation !== null && options?.name === 'delegate') {
       return delegation.execute(options.input, buildDelegateContext(options.context, runId));
     }
-    if (noteTools.executeTool && noteToolNames.has(options.name)) {
+    // issue #537：审查 run 不给 note（契约 ⑤）——baseToolSchemas 已不下发 note 名，但执行侧
+    // 也得挡；这层不该只靠「模型看不到」。
+    if (!reviewOnly && noteTools.executeTool && noteToolNames.has(options.name)) {
       return noteTools.executeTool(options);
     }
     // 技能工具：上游 executeTool(name, input) 位置参形态（契约见 loader 契约测试），与 notes 的
     // options 对象形态不同，故单独一段路由。
-    if (skillTools.executeTool && skillToolNames.has(options.name)) {
+    // issue #537：审查 run 不给技能（宁严勿宽：技能可自带写/执行能力，与只读承诺相逆）。
+    if (!reviewOnly && skillTools.executeTool && skillToolNames.has(options.name)) {
       return skillTools.executeTool(options.name, options.input);
     }
     // issue #211：abort signal 必须转交。引擎契约把 run 的 signal 放在 executeTool 的**顶层**
@@ -735,7 +753,13 @@ async function startRun(msg) {
   // `delegation_dir` 由 agentd 预建并 `runAsWorker` 改属主后下行（同 `notes_dir`）：agentd 跑 1001、
   // worker 跑 1002，1001 建的 755 目录 1002 写不进 ⇒ **不要**在这里自己拼 `process.env.HOME`。
   const delegateEnabled = isDelegateEnabled(process.env.ERIX_DELEGATE_ENABLED);
-  if (delegateEnabled) {
+  // issue #537：审查 run（reviewOnly）**不建 delegation**。子 run 的工具面是
+  // `[...fileTools.schemas, ...shellTools.schemas]`（见下 childTools），**不是从父 registry
+  // 过滤出来的** ⇒ 父的只读过滤（装配点①②）传不到子；而子 run 自带 shell（`bash -c` 无白名单）。
+  // ⇒ 审查 run 只要环境 `ERIX_DELEGATE_ENABLED=1`（FDE 全局开）就能
+  // `delegate("跑 shell 把 ~/projects/foo 读出来")` 让子 run 拿 shell 逃逸出 worktree。
+  // 关掉后 `delegation` 保持 null ⇒ executeTool 里 `delegation !== null` 那条 delegate 路由自然不通。
+  if (delegateEnabled && !reviewOnly) {
     const delegateMax = parseDelegateMax(process.env.ERIX_DELEGATE_MAX);
     const delegateRounds = parseDelegateChildRounds(process.env.ERIX_DELEGATE_CHILD_ROUNDS);
     const delegateTimeout = parseDelegateChildTimeoutMs(process.env.ERIX_DELEGATE_CHILD_TIMEOUT_MS);
