@@ -436,6 +436,156 @@ test('#495② L6 ② 全链都是真目录 ⇒ links 里没有任何链接、诊
   assert.doesNotMatch(err.message, /符号链接/, '真目录链上的没物化文案里不该冒出链接');
 });
 
+// ---------------------------------------------------------------------------
+// 第二轮 MED：链接**目标所在目录**进不去 ⇒ 归因必须是「进不去」，不是「还没物化」
+//
+// 为什么已合并的 L1/L3/L5 不够：它们都是「链上段本身可见」的形状（目标可读、或目标**不存在**），
+// 而本族是「`stat` 自己抛 `EACCES`」——它是唯一能让走查里 `statOrNull` 返回 null、而链上每一段
+// 字面又能进的形状。吞错误 ⇒ 它落进 `missing`，于是失败文案说「还没物化」而真相是「进不去」，
+// 等待器还干等到超时（与真没物化逐字同形）。而**同一个文件**里 `observeHostPath()` 对末段的
+// `EACCES` 却正确归 `unreadable` ⇒ 两处口径不一致就是这条 MED。
+// 口径红线：只修归因——三态 + `unknown` 不变，没有第五态，`present` 仍是成功。
+// ---------------------------------------------------------------------------
+
+/** root 有 `CAP_DAC_OVERRIDE` ⇒ `chmod 000` 拦不住它（拿它当证据就是假绿）。 */
+const isRootUid = () => typeof process.getuid === 'function' && process.getuid() === 0;
+
+/**
+ * 真夹具（审计的复现形状）：`<base>/secret/inner` 是真文件，`<base>/link -> secret/inner`，
+ * `chmod 000 <base>/secret`。⇒ `stat(link)` 要跟随链接穿过 `secret` ⇒ 真 `EACCES`（非 root 才成立）。
+ */
+function fixtureUnenterableTarget(t) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-495b-perm-'));
+  const secret = path.join(base, 'secret');
+  fs.mkdirSync(secret, { recursive: true });
+  const inner = path.join(secret, 'inner');
+  fs.writeFileSync(inner, '{"slots":{"default":{"apiKey":"erix-placeholder"}}}\n');
+  const link = path.join(base, 'link');
+  fs.symlinkSync(path.relative(base, inner), link); // 相对链接：与真机 bind 源同形态，顺带验目标解析
+  fs.chmodSync(secret, 0o000);
+  t.after(() => {
+    fs.chmodSync(secret, 0o755); // 不先放开就 rm 不掉（目录自己进不去）
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+  return { base, secret, inner, link };
+}
+
+test('#495② M1 链接目标目录 chmod 000（真夹具）⇒ unreadable、blocker 点名、missingPrefix=null', (t) => {
+  if (isRootUid()) {
+    // root 下 chmod 000 拦不住 ⇒ 真 chmod 那一路**不可达**，不许假绿；同一形状由注入版 M1b 承担
+    t.skip('id -u = 0：root 有 CAP_DAC_OVERRIDE ⇒ chmod 000 拦不住，判据① 改由 M1b（fsImpl 注入 EACCES）承担');
+    return;
+  }
+  const { secret, link } = fixtureUnenterableTarget(t);
+  // 先证夹具本身成立（否则整格是假绿）：secret 真是 0o000，而 stat 真的抛 EACCES
+  const secretMode = fs.lstatSync(secret).mode & 0o777;
+  assert.equal(secretMode, 0, `夹具的 secret 必须真是 0o000，否则本格无效：0o${secretMode.toString(8)}`);
+  assert.throws(() => fs.statSync(link), (error) => {
+    assert.equal(error.code, 'EACCES', `这台机器上「进不去」必须真的是 EACCES，否则取证无效：${error?.code}`);
+    return true;
+  });
+
+  const chain = inspectHostPathChain(link);
+  assert.equal(chain.blocker?.path, link, 'blocker 要点名走查里被挡住那一段');
+  assert.equal(chain.blocker.reason, 'no-permission', '权限被挡就是权限被挡（不许混成 not-a-directory）');
+  assert.equal(chain.missingPrefix, null, 'unreadable 下 missingPrefix 必须是 null——指向链接自己就是「还没物化」的说法');
+
+  const observed = observeHostPath(link);
+  assert.equal(observed.state, 'unreadable', '「进不去」不许归成 missing（那会被读成「materializer 没写」）');
+  assert.equal(observed.blocker.reason, 'no-permission');
+  assert.equal(observed.missingPrefix, null, 'blocker 与 missingPrefix 不许同时端出来');
+  assert.equal(observed.link.isSymlink, true, '链接事实必须继续带上（已合并的 L1/L2/L3/L5/L6 形状不许碎）');
+  assert.equal(observed.link.detectable, true, 'lstat 看得见链接本体 ⇒ 不许退成「无从判定」');
+  assert.ok(observed.links.length >= 2, `逐段事实要继续带上：${JSON.stringify(observed.links.map((e) => e.segment))}`);
+});
+
+test('#495② M1b 同一形状的注入版（root 机也可跑）⇒ 仍归 unreadable 而不是 missing', (t) => {
+  const { dir, file } = fixtureUserspace(t);
+  const link = path.join(dir, 'link-under-blocked-dir.json');
+  fs.symlinkSync(path.relative(dir, file), link);
+  // 只把「跟随链接的那次 stat」换成 EACCES（链上真目录全都能进）⇒ 与真 chmod 000 走同一条分支
+  const fake = { ...fs, statSync: (p) => { if (p === link) throw EACCES(); return fs.statSync(p); } };
+  const observed = observeHostPath(link, { fsImpl: fake });
+  assert.equal(observed.state, 'unreadable', '注入 EACCES 也要归 unreadable（这就是 root 机上判据① 的主判据）');
+  assert.equal(observed.missingPrefix, null, '不许把 blocker 那段路径当成「缺的段」');
+  assert.equal(observed.blocker.path, link);
+  assert.equal(observed.blocker.reason, 'no-permission');
+  assert.equal(observed.link.isSymlink, true, '链接事实不能因为是注入版就丢');
+  assert.equal(inspectHostPathChain(link, { fsImpl: fake }).missingPrefix, null);
+});
+
+test('#495② M2 ENOENT/ENOTDIR 仍归 missing：悬空链接与链上缺段都不许退成权限（第一轮那两格）', (t) => {
+  const { root, dir } = fixtureUserspace(t);
+  // 判据② 本体：悬空链接（目标不存在）⇒ 仍 missing，且 missingPrefix 指向链接自己
+  const goneTarget = path.join(dir, 'never-written-by-materializer.json');
+  const dangling = path.join(dir, 'dangling-m2.json');
+  fs.symlinkSync(path.relative(dir, goneTarget), dangling);
+  const chain = inspectHostPathChain(dangling);
+  assert.equal(chain.blocker, null, 'ENOENT 不许被归成权限（那会把人带去改 uid 而不是查物化）');
+  assert.equal(chain.missingPrefix, dangling);
+  const observed = observeHostPath(dangling);
+  assert.equal(observed.state, 'missing', '悬空链接**归属不变**（开第四态会连锁打崩 P7/P8 的时间判据）');
+  assert.equal(observed.blocker, null);
+  assert.equal(observed.link.targetExists, false, '目标不存在要说出来（但它不是权限）');
+  // 链上第一段就不存在 ⇒ 同样仍 missing（点名的是那一段，不是叶子）
+  const absent = observeHostPath(path.join(root, 'bob', 'home', '.erix', 'config.json'));
+  assert.equal(absent.state, 'missing');
+  assert.equal(absent.missingPrefix, path.join(root, 'bob'));
+  // 祖先段是普通文件 ⇒ 仍归 not-a-directory（本轮改动不许把它摊成 no-permission）
+  const aFile = path.join(root, 'afile-m2');
+  fs.writeFileSync(aFile, 'x');
+  assert.equal(inspectHostPathChain(path.join(aFile, 'sub', 'config.json')).blocker?.reason, 'not-a-directory');
+});
+
+test('#495② M3 等待器：链接目标进不去 ⇒ 提前放弃并喊「读不到」（不许走到超时）', async (t) => {
+  // 与陷阱 16（isolation-negative `#495 ②` 那族）同一件事，但钉的是**链接诱导**的那条分支：
+  // 归因一退回吞错误，这格就会变成「等满 60s + 一句 timeout waiting for」⇒ 时间差就是牙。
+  const useReal = !isRootUid();
+  let target = null;
+  let fsImpl = fs;
+  if (useReal) {
+    target = fixtureUnenterableTarget(t).link;
+  } else {
+    const { dir, file } = fixtureUserspace(t);
+    target = path.join(dir, 'link-m3.json');
+    fs.symlinkSync(path.relative(dir, file), target);
+    fsImpl = { ...fs, statSync: (p) => { if (p === target) throw EACCES(); return fs.statSync(p); } };
+  }
+  const timeoutMs = 60_000;
+  const started = Date.now();
+  const err = await waitForHostFile(target, {
+    fsImpl, timeoutMs, intervalMs: 5, sleepImpl: noSleep, label: 'linked config.json materialized',
+  }).then(() => null, (error) => error);
+  assert.ok(err, '进不去 ⇒ 最终必须拒绝（不能默默返回空）');
+  const m = String(err.message);
+  assert.match(m, /读不到/, '报的是「读不到」（不是「没物化」）');
+  assert.doesNotMatch(m, /timeout waiting for/, '不是超时——权限不是时间问题（干等到超时 = 归因又退回吞错误）');
+  assert.match(m, /linked config\.json materialized/);
+  assert.match(m, /FDE_USER_UID/, '文案要给最可能的原因');
+  assert.match(m, /符号链接/, '链接那条事实也要在失败文案里（不然人不知道该查链接目标那一侧）');
+  assert.ok(Date.now() - started < timeoutMs / 2,
+    `进不去必须**提前**放弃（实测等了 ${Date.now() - started}ms，而 timeoutMs=${timeoutMs}）`);
+});
+
+test('#495② M4 lstat 也探不到 ⇒ mode/owner 填 null 且文案说「这次探不到」（不许编事实）', async (t) => {
+  const { file } = fixtureUserspace(t);
+  const fake = {
+    ...fs,
+    statSync: (p) => { if (p === file) throw EACCES(); return fs.statSync(p); },
+    lstatSync: (p) => { if (p === file) throw EACCES(); return fs.lstatSync(p); },
+  };
+  const observed = observeHostPath(file, { fsImpl: fake });
+  assert.equal(observed.state, 'unreadable', 'stat 被挡 ⇒ 还是进不去，不是没物化');
+  assert.equal(observed.blocker.mode, null, 'lstat 也失败 ⇒ mode 必须是 null（不许填 0o? 或「未知」当成事实）');
+  assert.equal(observed.blocker.owner, null, '同上：owner 也要是 null');
+  assert.equal(observed.link.detectable, false, 'lstat 被挡 ⇒ 链接「无从判定」');
+  assert.equal(observed.link.isSymlink, null, '**不许**把探不到编成「不是链接」');
+  const err = await waitForHostFile(file, {
+    fsImpl: fake, timeoutMs: 60_000, intervalMs: 5, sleepImpl: noSleep, label: 'unreadable config.json',
+  }).then(() => null, (error) => error);
+  assert.match(String(err.message), /这次探不到/, '文案要诚实说这次探不到（而不是拿一个假 mode 误导人）');
+});
+
 test('#495 接线静态自检：脚本必须在**任何 docker 之前**做预检（源码级）', () => {
   const dir = path.join(REPO_ROOT, 'portal/integration');
   const scripts = fs.readdirSync(dir).filter((f) => f.endsWith('.mjs'));

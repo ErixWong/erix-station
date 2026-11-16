@@ -65,12 +65,44 @@ function ownerOf(stat) {
   return stat ? `${stat.uid}:${stat.gid}` : '未知';
 }
 
-/** 安全的 stat：不存在 / 进不去 ⇒ null（不抛，调用方按 null 分支走）。 */
+/** 安全的 stat：不存在 / 进不去 ⇒ null（不抛）。只用于「存在性」这类**不参与归因**的旁证。 */
 function statOrNull(target, fsImpl) {
   try {
     return fsImpl.statSync(target);
   } catch {
     return null;
+  }
+}
+
+/**
+ * 不吞错误的 stat：把 `{stat}` 或 `{error}` 一起交回调用方。
+ *
+ * 为什么需要它（issue #495 第二轮 MED）：`statOrNull` 把 `EACCES` 与 `ENOENT` 压成同一个 `null`，
+ * 于是走查里「进不去」被归成 `missing` —— 失败文案会说「还没物化」，而真相是「进不去」，
+ * 等待器还会干等到超时（与「真的没物化」逐字同形）。归因要用 errno，所以错误本身必须传出去。
+ * 「同一个文件里 `observeHostPath()` 对末段的 `EACCES` 正确归 `unreadable`、走查处却不」——两处口径
+ * 不一致就是这条 MED；本函数就是把口径收拢到一处。
+ */
+function statResult(target, fsImpl) {
+  try {
+    return { stat: fsImpl.statSync(target) };
+  } catch (error) {
+    return { error };
+  }
+}
+
+/**
+ * `stat` 失败时 blocker 的 `mode`/`owner`：只能退到 **`lstat`**（不跟随，对悬空链接与「目标进不去」
+ * 都还能看见本体）。拿不到就填 **`null`**（不是 `0o?` / 也不是「未知」这种当成事实的字面量）——
+ * 文案会诚实说「这次探不到」；**不许**把探不到编成结论。
+ */
+function lstatFacts(target, fsImpl) {
+  if (typeof fsImpl.lstatSync !== 'function') return { mode: null, owner: null };
+  try {
+    const stat = fsImpl.lstatSync(target);
+    return { mode: modeOf(stat), owner: ownerOf(stat) };
+  } catch {
+    return { mode: null, owner: null };
   }
 }
 
@@ -149,12 +181,19 @@ export function assertComposeEnvFile({
  *
  * 为什么走链而不是只看叶子：`existsSync` / `readFileSync` 在「祖先目录没权限」与「文件没生成」两种
  * 情况下都只是返回 false / 抛 ENOENT，光看叶子分不开。走链才能给出**具体是哪一段**：
- *  · `blocker` —— 这一段存在但进不去（缺 R_OK|X_OK，或它根本不是目录）⇒ 再等也不会变，权限不是时间问题；
+ *  · `blocker` —— 这一段存在但进不去（缺 R_OK|X_OK，或它根本不是目录，或它的 `stat` 被权限挡了）⇒
+ *    再等也不会变，权限不是时间问题；
  *  · `missingPrefix` —— 前面的段都能进，但这一段自己还不存在 ⇒ 物化真的没发生（或还没轮到它）。
+ *
+ * ⚠ 归因口径（第二轮 MED 修的正是这一条）：走查里的 `statSync` **失败**要按 **errno** 分流，**不能吞**——
+ *  `ENOENT`/`ENOTDIR` ⇒ `missingPrefix`（真没物化）；`EACCES`/`EPERM` ⇒ `blocker{reason:'no-permission'}`
+ *  且 `missingPrefix` 必为 `null`。典型形状 `link -> secret/inner` 且 `chmod 000 secret`：链上每一段
+ *  字面上都进得去，但 `stat(link)` 要跟随链接 ⇒ 被 `secret` 挡住 ⇒ 这是「进不去」而不是「没物化」。
+ *  状态面不变：仍是三态 + `unknown`，**没有第五态**（为什么不开第四态：见 `observeLastSegmentLink`）。
  *
  * @param {string} filePath 要观测的宿主路径（绝对或相对当前目录）
  * @param {{fsImpl?: typeof import('node:fs')}} [options]
- * @returns {{blocker: null | {path: string, reason: 'no-permission' | 'not-a-directory', mode: string, owner: string}, missingPrefix: string | null, links: object[]}}
+ * @returns {{blocker: null | {path: string, reason: 'no-permission' | 'not-a-directory', mode: string | null, owner: string | null}, missingPrefix: string | null, links: object[]}}
  *   `links` = 走查过的每一段的**链接事实**（`lstatSync`，不跟随）——只是多一条可诊断的账，
  *   不参与归属判断（为什么需要它：见 `observeSegmentLink`）。提前 return 时也把已走到的段带回去。
  */
@@ -169,8 +208,26 @@ export function inspectHostPathChain(filePath, { fsImpl = fs } = {}) {
     // 先记事实（`lstatSync`，**不跟随**），再做存在性/类型/可达性判断：顺序不能反过来——
     // `statSync` 对悬空链接报 ENOENT，先走它就永远看不到链接本体（那就是变异 M-A 的入口）。
     links.push(observeSegmentLink(current, { fsImpl, isLastSegment: isLeaf }));
-    const stat = statOrNull(current, fsImpl);
-    if (!stat) return { blocker: null, missingPrefix: current, links };
+    // ⚠ 不吞错误：errno 就是归因本身（吞掉 ⇒ EACCES 变 missing，本轮 MED 的病灶）。
+    const { stat, error: statError } = statResult(current, fsImpl);
+    if (!stat) {
+      const code = statError?.code;
+      if (code === 'EACCES' || code === 'EPERM') {
+        // stat 跟随了链接 / 要穿过目标目录 ⇒ 被权限挡住的是「这一段的可达性」，不是它存不存在。
+        // mode/owner 从 lstat 取（stat 这次本来就失败了），取不到就是 null（文案会说「这次探不到」）。
+        const facts = lstatFacts(current, fsImpl);
+        return {
+          // `factsFrom:'lstat'`：这组 mode/owner 说的是**这一段本体**（若它是链接，就是链接自己），
+          // 不是它指向的那一侧——文案会把这层区别说出来，不让人拿 `0o777` 反推「怎么会读不到」。
+          blocker: { path: current, reason: 'no-permission', mode: facts.mode, owner: facts.owner, factsFrom: 'lstat' },
+          missingPrefix: null,
+          links,
+        };
+      }
+      // ENOENT / ENOTDIR（以及历史上就落在这里的其它 errno）⇒ 仍按「没物化」报：
+      // 第一轮那两格（悬空链接、链上第一段不存在）不许退回去。
+      return { blocker: null, missingPrefix: current, links };
+    }
     if (!isLeaf && !stat.isDirectory()) {
       return {
         blocker: { path: current, reason: 'not-a-directory', mode: modeOf(stat), owner: ownerOf(stat) },
@@ -183,7 +240,7 @@ export function inspectHostPathChain(filePath, { fsImpl = fs } = {}) {
     } catch (error) {
       if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { blocker: null, missingPrefix: current, links };
       return {
-        blocker: { path: current, reason: 'no-permission', mode: modeOf(stat), owner: ownerOf(stat) },
+        blocker: { path: current, reason: 'no-permission', mode: modeOf(stat), owner: ownerOf(stat), factsFrom: 'stat' },
         missingPrefix: null,
         links,
       };
@@ -373,10 +430,14 @@ function unreadableMessage(name, observed, extra) {
   const { uid, gid } = selfIds();
   const blocker = observed.blocker ?? {};
   const why = blocker.reason === 'not-a-directory' ? '链上这一段不是目录' : '缺 R_OK|X_OK（读或穿越）';
+  // 走查里的 stat 被权限挡住时，mode/owner 是退到 lstat 取的——说的是这一段本体，必须说出来。
+  const factsFrom = blocker.factsFrom === 'lstat'
+    ? '，取自 **lstat**（`stat` 这次被挡住了 ⇒ 这组数字是这一段本体；若它是链接，说的是链接自己而不是目标那一侧）'
+    : '';
   return [
     `${name}：已经存在，但当前用户**读不到**（不是「没物化」——文件很可能早就写出来了）。`,
     `  被挡住的一段：${blocker.path ?? '?'}`,
-    `    原因：${why}；mode=${blocker.mode ?? '?'} owner=${blocker.owner ?? '?'} 当前 uid/gid=${uid}/${gid}`,
+    `    原因：${why}；mode=${blocker.mode ?? '这次探不到（lstat 也被挡）'} owner=${blocker.owner ?? '这次探不到（lstat 也被挡）'}${factsFrom} 当前 uid/gid=${uid}/${gid}`,
     '  ⇒ 多半是 FDE_USER_UID / FDE_USER_GID（deploy/.env，portal/src/config.js 缺省 1000/1000）与你自己的 uid/gid',
     '    不一致：portal 以 root 把 FDE 目录建成 0770 node:node，组外用户根本进不去（issue #495 ②）。',
     '  ⚠ 旧写法 fs.existsSync 在这种路径上返回 false ⇒ 症状与「真的没物化」逐字相同，这条文案就是把两者分开。',
