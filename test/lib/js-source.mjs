@@ -18,7 +18,13 @@
 //   · 已知边界：不认**正则字面量** ⇒ `/a/*b/` 后面碰得上真块闭合时中间代码会被误剥（假绿方向）；
 //     正则里写 `//` 必须 `\/\/`。
 //
-// `structuralMask()` 是**另一个**问题：注释 + 字符串**正文**一起抹成空格（定界符与换行留着）。
+// `structuralMask()` 是**另一个**问题：注释 + 字符串/模板**正文**一起抹成空格（定界符与换行留着）。
+// 两件要说清楚的：
+//   · **模板插值 `${…}` 里的代码原样保留** —— 那是真代码。`runner/worker.js:774` 的
+//     `msg: `${ + 'name' + `}=${process.env[name]}`` 就是活在模板里的读取，抹掉它 = 又一处静默；
+//   · 它服务两个问题：**括号配平**（找对象/数组字面量的配对括号），以及**「这个位置是不是字符串正文」**
+//     （扫描器据此放过「串里提到的形状」）。做**内容匹配**要当心：env 名的字面量就活在字符串里
+//     （`const FOO_ENV = 'ERIX_X'`、provisioner 的 `` `ERIX_X=${v}` ``），拿掩码文本去匹配字面量会什么都认不到。
 // 它只服务于**结构配平**（找对象/数组字面量的配对括号）。**不能**拿它做内容匹配 ——
 // env 名的字面量就活在字符串里（`const FOO_ENV = 'ERIX_X'`、provisioner 的 `` `ERIX_X=${v}` ``），
 // 抹掉正文就没东西可认了。
@@ -78,31 +84,46 @@ export function structuralMask(text) {
   const out = [];
   const n = text.length;
   let i = 0;
-  let quote = '';
-  let blockOut = -1;
+  let quote = '';      // ' " ` ；空串 = 在代码里
+  let inBlock = false;
+  const stack = [];    // 模板插值嵌套栈（每项 { depth } = 该层插值里的花括号深度）
   while (i < n) {
     const c = text[i];
     const d = i + 1 < n ? text[i + 1] : '';
-    if (blockOut >= 0) {
-      if (c === '*' && d === '/') { blockOut = -1; out.push('  '); i += 2; continue; }
+    const interp = stack.length ? stack[stack.length - 1] : null;
+    if (inBlock) {                                   // 块注释：整段抹平，只认闭合
+      if (c === '*' && d === '/') { inBlock = false; out.push('  '); i += 2; continue; }
       out.push(c === '\n' ? '\n' : ' ');
       i += 1;
       continue;
     }
-    if (quote) {
+    if (quote === '`') {                             // 模板正文：` 结束；`${` 开一段**真代码**
+      if (c === '\\') { out.push(' ', ' '); i += 2; continue; }
+      if (c === '`') { quote = ''; out.push(c); i += 1; continue; }
+      if (c === '$' && d === '{') { stack.push({ depth: 0 }); out.push('${'); i += 2; quote = ''; continue; }
+      out.push(c === '\n' ? '\n' : ' ');
+      i += 1;
+      continue;
+    }
+    if (quote) {                                     // 普通串：正文抹平（同 stripComments 的「不跨行」保守规则）
       if (c === '\\') { out.push(' ', ' '); i += 2; continue; }
       if (c === quote) { quote = ''; out.push(c); i += 1; continue; }
-      if (c === '\n' && quote !== '`') { quote = ''; out.push('\n'); i += 1; continue; }
-      out.push(c === '\n' ? '\n' : ' ');
+      if (c === '\n') { quote = ''; out.push('\n'); i += 1; continue; }
+      out.push(' ');
       i += 1;
       continue;
     }
-    if (c === '/' && d === '*') { blockOut = 1; out.push('  '); i += 2; continue; }
-    if (c === '/' && d === '/') {
+    if (c === '/' && d === '*') { inBlock = true; out.push('  '); i += 2; continue; }
+    if (c === '/' && d === '/') {                    // 行注释：抹到行尾
       while (i < n && text[i] !== '\n') { out.push(' '); i += 1; }
       continue;
     }
     if (c === "'" || c === '"' || c === '`') { quote = c; out.push(c); i += 1; continue; }
+    if (interp && c === '{') { interp.depth += 1; out.push(c); i += 1; continue; }
+    if (interp && c === '}') {                       // 深度 0 的那个 `}` 才是插值收尾
+      if (interp.depth === 0) { stack.pop(); quote = '`'; out.push(c); i += 1; continue; }
+      interp.depth -= 1; out.push(c); i += 1; continue;
+    }
     out.push(c);
     i += 1;
   }

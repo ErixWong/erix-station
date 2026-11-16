@@ -285,34 +285,57 @@ function scanEnvReadsFromFiles(files, root) {
   };
   for (const { file, text } of files) {
     const rel = path.relative(root, file);
-    const code = stripComments(text);
+    const code = stripComments(text);            // 注释 → 空格（行列位不变）⇒ 注释里的读形**不算读取**
+    const masked = structuralMask(code);         // 再把字符串正文抹平 ⇒ 用来判「这个位置是不是串里的文字」
     const ctx = analyzeEnvReads(code);
     const objs = ['process\\.env', ...[...ctx.envObjs].map(escRe)];
+    // 读形：`对象 . 名字` 或 `对象 [ 表达式 ]`（`?.` 两种位置都认）。前视 `(?<![\w$.])` 挡住 `childEnv.X`
+    // 这类「别的对象也叫 env 结尾」的假别名。
     const readRe = new RegExp(
       `(?<![\\w$.])(?:${objs.join('|')})(?:\\?\\.)?(?:\\.(${IDENT_RE})|\\[\\s*([^\\]\\n]*?)\\s*\\])`, 'g');
+    // 写形态整段抹成空格（`process.env.X = v` 是给子进程传值，不是「这个 env 名有配置面」）；
+    // 只抹「对象 + 成员 + 等号」这一段，赋值**右侧**照旧参与匹配。
     const writeRe = new RegExp(
       `(?<![\\w$.])(?:${objs.join('|')})(?:\\?\\.)?(?:\\.${IDENT_RE}|\\[[^\\]]*\\])\\s*=(?!=)`, 'g');
-    code.split('\n').forEach((rawLine, i) => {
-      // 写形态整段抹平（`process.env.X = v` 是给子进程传值，不是「这个 env 名有配置面」）；
-      // 只抹「对象 + 成员 + 等号」这段，赋值右侧照旧参与匹配。
-      const line = rawLine.replace(writeRe, (m) => ' '.repeat(m.length));
-      for (const m of line.matchAll(readRe)) {
-        if (m[1] !== undefined) { add(m[1], rel, i + 1, 'dot'); continue; }
-        const expr = m[2] ?? '';
-        const lit = resolveExpr(expr, ctx);
-        if (lit) { for (const n of lit) add(n, rel, i + 1, `index:${expr.trim()}`); continue; }
-        unsupported.push({ at: `${rel}:${i + 1}`, shape: m[0].trim(), expr: expr.trim() });
-      }
-    });
+    const writable = code.replace(writeRe, (m) => ' '.repeat(m.length));
+    let line = 1;
+    let scanFrom = 0;
+    const lineUpTo = (idx) => {                   // 行列位被两个状态机一路保留 ⇒ 数换行就是行号
+      for (let k = scanFrom; k < idx; k += 1) if (code[k] === '\n') line += 1;
+      scanFrom = idx;
+      return line;
+    };
+    for (const m of writable.matchAll(readRe)) {
+      lineUpTo(m.index);
+      // 位置落在字符串正文里（掩码那格是空格、原文不是）⇒ 那是**串里提到的形状**，不是读取。
+      // 模板插值 `${…}` 里的代码不算串正文（`structuralMask` 特意留着），所以
+      // `` msg: `${name}=${process.env[name]}` `` 这种活在模板里的读取不会被误杀。
+      if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;
+      if (m[1] !== undefined) { add(m[1], rel, line, 'dot'); continue; }
+      const expr = m[2] ?? '';
+      const lit = resolveExpr(expr, ctx);
+      if (lit) { for (const n of lit) add(n, rel, line, `index:${expr.trim()}`); continue; }
+      // 读形认得、名字解析不出（运行期拼名那类）⇒ **fail closed**：进 unsupported 清单，
+      // 必须逐条登记进 `deploy/env-legs-exceptions.json` 的 `unsupported` 段并写理由，否则判据红。
+      unsupported.push({ at: `${rel}:${line}`, shape: m[0].trim(), expr: expr.trim() });
+    }
   }
   return { keys, unsupported };
 }
 
-/** 目录/单文件版入口（`mutate` 是**变异入口**：判据用它改内存里的源码，不改盘 —— 见活二②③）。 */
-function scanEnvReads(root, { mutate } = {}) {
+/**
+ * 目录/单文件版入口。两个可选入口都是**判据自己要用的**：
+ *   · `mutate(rel, text)` 改**内存里**的源码（不改盘）⇒ 「把这行注释掉 / 把表里的名字改掉」这类变异
+ *     由判据自己带着跑，不依赖谁手工改过一次树；
+ *   · `rootLabel` 给 `unsupported` 的坐标加前缀 ⇒ 真树扫出来的坐标写成**仓库根相对**
+ *     （`runner/worker.js:774`），与例外清单里 `where` 同一个口径，判据不用维护两套路径。
+ */
+function scanEnvReads(root, { mutate, rootLabel = '' } = {}) {
   const files = scanTargets(root).map((f) => ({ file: f, text: fs.readFileSync(f, 'utf8') }));
   if (mutate) for (const f of files) f.text = mutate(path.relative(root, f.file), f.text);
-  return scanEnvReadsFromFiles(files, root);
+  const out = scanEnvReadsFromFiles(files, root);
+  if (rootLabel) for (const u of out.unsupported) u.at = `${rootLabel}/${u.at}`;
+  return out;
 }
 
 /** 兼容旧口径：`Map(env 名 → Set(相对出处文件))`（活二②③ 与墓碑都在用它）。 */
@@ -328,7 +351,7 @@ function assertScannerFoundKeys(n, where) {
     + '把「扫不到」当成「没有旋钮」就是让闸门静默失效（#557 的根因是覆盖不全，不能再叠一层）');
 }
 
-const RUNNER_SCAN = scanEnvReads(RUNNER_ROOT);
+const RUNNER_SCAN = scanEnvReads(RUNNER_ROOT, { rootLabel: 'runner' });
 const RUNNER_ENV_KEYS = scanEnvKeys(RUNNER_ROOT);
 assertScannerFoundKeys(RUNNER_ENV_KEYS.size, `扫描根 ${path.relative(process.cwd(), RUNNER_ROOT)}/`);
 
@@ -338,11 +361,16 @@ function loadEnvLegExceptions() {
   try {
     doc = JSON.parse(fs.readFileSync(ENV_LEGS_EXCEPTIONS, 'utf8'));
   } catch (e) {
-    return { entries: [], problems: [`deploy/env-legs-exceptions.json 读不到或不是合法 JSON：${e.message}`] };
+    return { entries: [], unsupported: [], problems: [`deploy/env-legs-exceptions.json 读不到或不是合法 JSON：${e.message}`] };
   }
   const entries = Array.isArray(doc?.exceptions) ? doc.exceptions : null;
-  if (!entries) return { entries: [], problems: ['deploy/env-legs-exceptions.json 缺 exceptions 数组'] };
-  return { entries, problems: validateEntries(entries) };
+  if (!entries) return { entries: [], unsupported: [], problems: ['deploy/env-legs-exceptions.json 缺 exceptions 数组'] };
+  const unsupported = Array.isArray(doc?.unsupported) ? doc.unsupported : [];
+  return {
+    entries,
+    unsupported,
+    problems: [...validateEntries(entries), ...validateUnsupported(unsupported)],
+  };
 }
 
 /** 与内存版夹具共用同一套规则（变异入口必须过同一把尺，否则「去掉理由就红」是假牙）。 */
@@ -639,3 +667,325 @@ function validateWith(entries, key, patch) {
 function dupProblems(entries) {
   return validateEntries(entries).filter((p) => p.includes('重复登记'));
 }
+
+// ===========================================================================
+// 活一返工（PR #581）：形状覆盖有牙 + `where` 是**可校验坐标**
+// ===========================================================================
+
+// 相超时四项的名字**从真模块现读**：本文件的源码里一次都不出现 `ERIX_LLM_TIMEOUT_…` 这个字面量
+// ⇒ 「名字是从数据表里读的，不是抄进判据的」有可执行证据（见活一⑤ 的自证格）。
+const { LLM_TIMEOUT_ENV } = await import(new URL('../../runner/lib/llm-timeouts.js', import.meta.url).href);
+const TIMEOUT_KEYS = [...new Set(Object.values(LLM_TIMEOUT_ENV))];
+/** 本文件自己的源码（判据拿它自证「没有把 env 名抄进来」）。 */
+const SELF_TEXT = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8');
+
+const WHERE_REF = /([A-Za-z0-9_./-]+\.(?:js|mjs|cjs))(?::(\d+))?/g;
+
+function splitCoord(at) {
+  const m = /^(.*):(\d+)$/.exec(String(at ?? '').trim());
+  return m ? { rel: m[1], line: Number(m[2]) } : { rel: String(at ?? '').trim(), line: null };
+}
+
+const normRead = (t) => String(t ?? '').replace(/\s+/g, '');
+
+/** 扫描器认得读形、但解析不出 env 名的那些（运行期拼名）—— 每一条都必须登记并带理由。 */
+/** `root` 默认仓库根（盘上那份）；夹具把 `root` 换成临时目录，共用同一把尺。 */
+function validateUnsupported(items, root = REPO_ROOT) {
+  const problems = [];
+  const seen = new Set();
+  items.forEach((u, i) => {
+    const at = `unsupported[${i}]`;
+    if (u === null || typeof u !== 'object' || Array.isArray(u)) { problems.push(`${at} 不是对象`); return; }
+    const { rel, line } = splitCoord(u.at);
+    if (!rel || line == null) problems.push(`${at} 的 \`at\` 必须是 \`路径.js:行\` 坐标（实际 ${JSON.stringify(u.at)}）`);
+    else if (!fs.existsSync(path.join(root, rel))) problems.push(`${at} 的 \`at\` 指向不存在的文件 ${rel}`);
+    if (typeof u.read !== 'string' || u.read.trim() === '') problems.push(`${at} 缺 \`read\`（要登记的是那个**读形**本身）`);
+    if (typeof u.reason !== 'string' || u.reason.trim() === '') {
+      problems.push(`${at}（read=${u.read}）**缺理由字段 reason**：没有理由的例外不算例外`);
+    }
+    const k = `${rel}::${normRead(u.read)}`;
+    if (seen.has(k)) problems.push(`${at}（read=${u.read}）重复登记：同一个读形只能有一条`);
+    seen.add(k);
+  });
+  return problems;
+}
+
+/**
+ * 扫描结果 ↔ `unsupported` 登记的咬合（**fail closed 的那半**）：
+ *   · 扫出来没登记 ⇒ 红（「解析不出名字」不能是免费的）；
+ *   · 登记了但扫描器现在认不出来 ⇒ 红（过期条目 = 第二本账）；
+ *   · 读形对得上但行号漂了 ⇒ 红（坐标必须现跑核对，不许靠记忆）。
+ */
+function unsupportedProblems(detected, registered) {
+  const problems = [];
+  const matched = new Set();
+  for (const r of registered) {
+    const { rel, line } = splitCoord(r.at);
+    const hit = detected.find((d) => splitCoord(d.at).rel === rel && normRead(d.shape) === normRead(r.read));
+    if (!hit) {
+      problems.push(`unsupported 登记的 ${r.at}（read=${r.read}）扫描器现在**认不出来** ⇒ 过期条目：那个读形已改形或已删，删掉这条登记`);
+      continue;
+    }
+    const hitLine = splitCoord(hit.at);
+    if (hitLine.line !== line) {
+      problems.push(`unsupported 登记的坐标 ${r.at} **行号漂了**：同一个读形现在在 ${hit.at} ⇒ 现跑一次更新坐标（别删条目了事）`);
+      continue;
+    }
+    matched.add(hit.at);
+  }
+  for (const d of detected) {
+    if (matched.has(d.at)) continue;
+    problems.push(`扫描器在 ${d.at} 发现一个**解析不出 env 名**的读取 ${d.shape}，但没登记在 deploy/env-legs-exceptions.json 的 \`unsupported\` 段`
+      + ' ⇒ 动态读形静默漏过 = #557 的根因形状；登记它并写明理由（或把它改成字面量读形）');
+  }
+  return problems;
+}
+
+/**
+ * `where` 是**可校验坐标**（活二）：每个 `路径.js[:行]` 引用都必须存在；带行的那一行（**剥掉注释后**）
+ * 必须含该 key 的字面量、或含一个能解析到它的常量名；只给文件不给行 ⇒ 扫描器必须在那个文件里
+ * 发现对该 key 的**活读**。`sources` 传 `RUNNER_ENV_KEYS`（key → Set(runner 相对出处)）。
+ */
+function whereProblems(entries, sources, root = REPO_ROOT) {
+  const problems = [];
+  const cache = new Map();
+  const analyze = (rel) => {
+    if (!cache.has(rel)) {
+      const code = stripComments(fs.readFileSync(path.join(root, rel), 'utf8'));
+      cache.set(rel, { code, ctx: analyzeEnvReads(code) });
+    }
+    return cache.get(rel);
+  };
+  entries.forEach((e, i) => {
+    const at = `exceptions[${i}]`;
+    const where = typeof e?.where === 'string' ? e.where.trim() : '';
+    if (where === '') { problems.push(`${at}（key=${e?.key}）**缺 where**：没有可校验坐标的例外等于没取证`); return; }
+    const refs = [...where.matchAll(WHERE_REF)].map((m) => ({ rel: m[1], line: m[2] ? Number(m[2]) : null }));
+    if (refs.length === 0) {
+      problems.push(`${at}（key=${e.key}）的 where 里没有任何 \`路径.js[:行]\` 引用 ⇒ 「${where}」是**说明文字**，`
+        + '不是坐标：判据扫不到它，它会随改动自己变成假的');
+      return;
+    }
+    refs.forEach((ref, j) => {
+      const tag = `${at}（key=${e.key}）where 的第 ${j + 1} 个引用 ${ref.rel}${ref.line ? `:${ref.line}` : ''}`;
+      const abs = path.join(root, ref.rel);
+      if (!fs.existsSync(abs)) {
+        problems.push(`${tag} **文件不存在** ⇒ 坐标指向不在树上的文件，等于没取证`);
+        return;
+      }
+      if (ref.line == null) {
+        const underRunner = path.resolve(abs).startsWith(RUNNER_ROOT + path.sep);
+        if (underRunner) {
+          const relToCheck = path.relative(RUNNER_ROOT, abs);
+          if (sources.get(e.key)?.has(relToCheck)) return;
+          problems.push(`${tag} 只给了文件没给行，而扫描器在 \`${relToCheck}\` 里**没发现对 ${e.key} 的活读**`
+            + ' —— 坐标是**注释背书**的（#557 那条 `ERIX_AGENT_VERSION` 就栽在这一点上，见它的 reason）');
+          return;
+        }
+        if (analyze(ref.rel).code.includes(e.key)) return;
+        problems.push(`${tag} 只给了文件，而整个文件的**代码**（剥掉注释后）里没有 ${e.key} ⇒ 坐标过期`);
+        return;
+      }
+      const { code, ctx } = analyze(ref.rel);
+      const target = code.split('\n')[ref.line - 1];
+      if (target === undefined) {
+        problems.push(`${tag} 指到第 ${ref.line} 行，但那个文件只有 ${code.split('\n').length} 行 ⇒ 坐标过期`);
+        return;
+      }
+      if (lineMentionsKey(target, ctx, e.key)) return;
+      problems.push(`${tag} 那一行**不含该 key**（也没有能解析到它的常量名）。实际内容：`
+        + `\`${target.trim().slice(0, 90)}\` ⇒ 坐标是编的或已漂移：**行号看着合理不等于它对**`
+        + '（注释里出现过也不算，剥完注释才算）');
+    });
+  });
+  return problems;
+}
+
+/** 那一行含该 key 的字面量，或含一个能解析到它的常量名（表驱动那种真坐标必须算通过）。 */
+function lineMentionsKey(lineText, ctx, key) {
+  if (lineText.includes(key)) return true;
+  for (const m of lineText.matchAll(new RegExp(IDENT_RE, 'g'))) {
+    const lits = resolveExpr(m[0], ctx);
+    if (lits && lits.has(key)) return true;
+  }
+  return false;
+}
+
+test('活二⑤ `where` 是坐标不是说明文字：五种假坐标都要红，盘上那份要全绿', () => {
+  const { entries } = loadEnvLegExceptions();
+  // (a) 常驻闸门：盘上每条 where 的每个坐标都必须现跑核对得上
+  assert.deepEqual(whereProblems(entries, RUNNER_ENV_KEYS), [], '例外清单里有对不上的坐标（见问题列表）');
+  // (b) 文件不存在
+  assert.match(whereProblems([{ key: 'ERIX_RUN_DATA_TTL_HOURS', reason: 'r', where: 'runner/nope.js:10' }], new Map()).join('\n'),
+    /文件不存在/);
+  // (c) 文件在、行在，但那行没有这个 key（「行号看着合理」正是假坐标能活下来的原因）
+  assert.match(whereProblems([{ key: 'ERIX_RUN_DATA_TTL_HOURS', reason: 'r', where: 'runner/agentd.js:1' }], new Map()).join('\n'),
+    /不含该 key/);
+  // (d) **注释背书**：`agentd.js:52` 那行的 `process.env.ERIX_AGENT_VERSION` 是注释正文里引用的旧代码
+  assert.match(whereProblems([{ key: 'ERIX_AGENT_VERSION', reason: 'r', where: 'runner/agentd.js:52' }], new Map()).join('\n'),
+    /不含该 key/);
+  // (e) 只给文件不给行，而那个文件里对这个 key 没有活读（扫描器剥完注释不认）⇒ 红
+  assert.match(whereProblems([{ key: 'ERIX_RUN_DATA_TTL_HOURS', reason: 'r', where: 'runner/lib/build-info.js' }], new Map()).join('\n'),
+    /没发现对 ERIX_RUN_DATA_TTL_HOURS 的活读/);
+  // (f) 只剩说明文字 / 缺 where
+  assert.match(whereProblems([{ key: 'ERIX_RUN_DATA_TTL_HOURS', reason: 'r', where: 'runner 里读，compose 没有' }], new Map()).join('\n'),
+    /是\*\*说明文字\*\*/);
+  assert.match(whereProblems([{ key: 'ERIX_RUN_DATA_TTL_HOURS', reason: 'r' }], new Map()).join('\n'), /缺 where/);
+  // (g) 反向自证：表驱动那种真坐标（那一行只有 `envName`，没有字面量）必须**算通过**，
+  //     否则这条判据是在误杀真坐标而不是在杀假坐标
+  const tableEntry = entries.find((x) => x.key === TIMEOUT_KEYS[0]);
+  assert.ok(tableEntry, '四相超时里至少这一条已登记（活一⑤）');
+  assert.deepEqual(whereProblems([tableEntry], RUNNER_ENV_KEYS), [],
+    `表驱动坐标（${tableEntry.where}）被误判 ⇒ 「可解析到它的常量名」这一支没接上`);
+});
+
+test('活二⑥ 那条被推翻的登记：现坐标 ⇒ 绿；退回登记时的旧坐标 ⇒ 必须红（证明这格真的在判坐标）', () => {
+  const { entries } = loadEnvLegExceptions();
+  const e = entries.find((x) => x.key === 'ERIX_AGENT_VERSION');
+  assert.ok(e, 'ERIX_AGENT_VERSION 仍在例外清单里（不许为了让判据变绿删条目）');
+  assert.deepEqual(whereProblems([e], RUNNER_ENV_KEYS), [], `现坐标应核对通过：${e.where}`);
+  assert.match(e.where, /runner\/lib\/build-info\.js:84/, `读取点坐标必须是真读取那一行，实际 ${e.where}`);
+  // 变异入口：退回**登记当时的坐标**（`runner/agentd.js` 不带行 + `provisioner.js:257`）。
+  // 前者只被注释提到过，后者如今是 #581 新加的 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 那一行。
+  const stale = { ...e, where: 'runner/agentd.js；注入点 portal/src/provisioner.js:257（`agentVersion !== \'dev\'` 才 push）' };
+  const problems = whereProblems([stale], RUNNER_ENV_KEYS).join('\n');
+  assert.match(problems, /没发现对 ERIX_AGENT_VERSION 的活读/, `旧的第一坐标必须红，实际：\n${problems}`);
+  assert.match(problems, /不含该 key/, `旧的第二个坐标必须红，实际：\n${problems}`);
+});
+
+test('活一⑤ 数据表驱动的 env 名必须进枚举；名字是从表里读的（本文件源码里不出现那几个字面量）', () => {
+  assert.ok(TIMEOUT_KEYS.length >= 4, `相超时数据表只读出 ${TIMEOUT_KEYS.length} 个名字 ⇒ 变异入口失效了`);
+  for (const key of TIMEOUT_KEYS) {
+    const where = RUNNER_ENV_KEYS.get(key);
+    assert.ok(where, `扫描器没把 ${key} 当读取（它活在 ${'`'}LLM_TIMEOUT_ENV${'`'} 数据表 + ${'`'}env?.[envName]${'`'} 那一形里）`
+      + ' ⇒ 复刻 #557 的根因：读形认得、名字在表里，旧扫描器只认字面量就静默漏掉');
+    assert.ok([...where.keys()].some((f) => f.includes('llm-timeouts.js')),
+      `${key} 的出处必须是 lib/llm-timeouts.js（实际 ${JSON.stringify([...where.keys()])}）`);
+  }
+  // 「不是硬编码」的可执行证据：本文件源码里一次都不出现这些 env 名
+  for (const key of TIMEOUT_KEYS) {
+    assert.ok(!SELF_TEXT.includes(key), `判据源码里出现了字面量 ${key} ⇒ 名字被抄进判据了（应当从真模块/数据表现读）`);
+  }
+  // 表是活的：改名 ⇒ 枚举跟着改名（旧名消失、新名出现）。判据读的永远是**表**，不是四个手写名字。
+  const renamed = scanEnvReads(RUNNER_ROOT, {
+    rootLabel: 'runner',
+    mutate: (rel, text) => (rel.includes('llm-timeouts.js')
+      ? text.replace(/'(ERIX_LLM_TIMEOUT_[A-Z_]+)'/g, "'$1_RENAMED'")
+      : text),
+  });
+  for (const key of TIMEOUT_KEYS) {
+    assert.ok(!renamed.keys.has(key), `改了数据表里的名字，枚举里还留着 ${key} ⇒ 它是从别处（手抄）来的`);
+    assert.ok(renamed.keys.has(`${key}_RENAMED`), `改名后的 ${key}_RENAMED 没进枚举 ⇒ 名字不是从表里读的`);
+  }
+  // 且这三条坐标（例外清单里的 where）指向的确实是那张表/那一行
+  const { entries } = loadEnvLegExceptions();
+  const regs = entries.filter((x) => TIMEOUT_KEYS.includes(x.key));
+  assert.equal(regs.length, TIMEOUT_KEYS.length, '四项相超时必须在例外清单里逐条登记（三腿全无，不是漏抄）');
+  assert.deepEqual(whereProblems(regs, RUNNER_ENV_KEYS), [], '相超时的 where 坐标对不上');
+  for (const r of regs) assert.match(r.where, /runner\/lib\/llm-timeouts\.js/, `${r.key} 的坐标必须指向 lib/llm-timeouts.js（实际 ${r.where}）`);
+});
+
+test('活一⑥ 别名点号形（`env.ERIX_X`）必须算读取；注释里那个同名读形**不许**再背书', () => {
+  const key = 'ERIX_AGENT_VERSION';
+  const where = RUNNER_ENV_KEYS.get(key);
+  assert.ok(where, `${key} 不在枚举里 ⇒ 别名点号形（readBuildInfo({ env = process.env }) 里的 env.ERIX_X）没接上`);
+  const files = [...where.keys()];
+  assert.ok(files.some((f) => f === 'lib/build-info.js'),
+    `${key} 的读取点必须是 lib/build-info.js（实际 ${JSON.stringify(files)}）`);
+  assert.ok(!files.some((f) => f === 'agentd.js'),
+    `${key} 的出处里还有 agentd.js（实际 ${JSON.stringify(files)}）⇒ 注释又在给登记背书`);
+  // 变异入口 A：把**注释里**那个名字改掉 ⇒ 枚举不动（证明它本来就没靠注释）
+  const mutComment = scanEnvReads(RUNNER_ROOT, {
+    mutate: (rel, text) => (rel === 'agentd.js'
+      ? text.replace(/process\.env\.ERIX_AGENT_VERSION/g, 'process.env.ERIX_RENAMED_ONLY_IN_COMMENT')
+      : text),
+  });
+  assert.deepEqual([...(mutComment.keys.get(key)?.keys() ?? [])], files,
+    '改掉注释里的名字后出处变了 ⇒ 注释其实还在被当读取点计入（前一条断言是假的）');
+  // 变异入口 B：把**真读取那一行**注释掉 ⇒ 该键必须从枚举里消失
+  const mutCode = scanEnvReads(RUNNER_ROOT, {
+    mutate: (rel, text) => (rel === 'lib/build-info.js'
+      ? text.replace(/^(\s*)(const override = s\(env\.ERIX_AGENT_VERSION\);)/m, '$1// $2')
+      : text),
+  });
+  assert.ok(!mutCode.keys.has(key),
+    '把真读取注释掉之后该键还在枚举里 ⇒ 剥注释这一步没生效，或者还有另一处读取没被这条判据看到');
+});
+
+test('活一⑦ 注释与字符串：注释掉必消失、串里提到的不算读取、模板插值里的算读取（三向都自证）', () => {
+  // 控制组（真树）：这些读取必须在
+  assert.ok(RUNNER_ENV_KEYS.has('ERIX_SHELL_LIVENESS_MS'), '真树上的 shell-tools 读取不见了 ⇒ 剥注释剥过头了');
+  for (const key of TIMEOUT_KEYS) assert.ok(RUNNER_ENV_KEYS.has(key), '控制组：真树的相超时读取不见了');
+  // ① 把数据表那一行读取注释掉 ⇒ 四项必须全部消失（**且**没把别的键一起吞掉）
+  const mutComment = scanEnvReads(RUNNER_ROOT, {
+    mutate: (rel, text) => (rel === 'lib/llm-timeouts.js'
+      ? text.replace(/^(\s*)(out\[field\] = parseTimeoutMs\()/m, '$1// $2')
+      : text),
+  });
+  for (const key of TIMEOUT_KEYS) {
+    assert.ok(!mutComment.keys.has(key), `${key} 被注释掉了却还在枚举里 ⇒ 排除逻辑是装饰`);
+  }
+  assert.ok(mutComment.keys.has('ERIX_SHELL_LIVENESS_MS'),
+    '只注释了一处，别的键也不见了 ⇒ 剥注释吞掉了代码（那是假绿方向）');
+  // ② 多出处键：只注释掉其中一处，另一处还在 ⇒ 不许误报消失
+  const mutOne = scanEnvReads(RUNNER_ROOT, {
+    mutate: (rel, text) => (rel === 'lib/shell-tools.js'
+      ? text.replace(/^(\s*)(const live = .*ERIX_SHELL_LIVENESS_MS.*;)/m, '$1// $2')
+      : text),
+  });
+  assert.ok(mutOne.keys.has('ERIX_SHELL_LIVENESS_MS'), '另一处读取还在却消失了 ⇒ 计数逻辑有问题');
+  // ③ 串里**提到**的形状不算读取；模板插值 `${…}` 里的算（那是真代码，见 runner/worker.js:774）
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-shape-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'shapes.js'), [
+      "export const note = 'process.env.ERIX_GHOST_MENTIONED 已废弃';",
+      'export const t = `x=${process.env.ERIX_GHOST_INTERP} y`;',
+      '// process.env.ERIX_GHOST_LINECOMMENT',
+      '/* process.env.ERIX_GHOST_BLOCKCOMMENT */',
+    ].join('\n'));
+    const got = scanEnvKeys(dir);
+    assert.deepEqual([...got.keys()].sort(), ['ERIX_GHOST_INTERP'],
+      `形状判定错了（实际 ${JSON.stringify([...got.keys()])}）：串里提到/注释里的应当放过，模板插值里的应当算读取`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('活一⑧ 解析不出 env 名的读形 ⇒ 进 unsupported 清单；不登记红、无理由红、坐标漂了红、过期了红', () => {
+  // ① 夹具：运行期拼名的读形必须被记成 unsupported（**不是**静默丢掉）
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-unsupported-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'dyn.js'), [
+      'export function pick(suffix, env = process.env) { return env[`ERIX_DYN_${suffix}_X`]; }',
+      'export const lit = process.env.ERIX_GHOST_STATIC;',
+    ].join('\n'));
+    const { keys, unsupported } = scanEnvReads(dir);
+    assert.ok(keys.has('ERIX_GHOST_STATIC'), '字面量那读形必须还在（否则下面的判据是在判一个空集合）');
+    assert.equal(unsupported.length, 1, `动态读形应当记 1 条，实际 ${JSON.stringify(unsupported)}`);
+    assert.match(unsupported[0].at, /^dyn\.js:1$/);
+    assert.match(unsupported[0].shape, /^env\[`ERIX_DYN_/);
+    // ② 没登记 ⇒ 红
+    assert.match(unsupportedProblems(unsupported, []).join('\n'), /没登记在 deploy\/env-legs-exceptions\.json/);
+    // ③ 登记带理由 ⇒ 绿（同一把尺，共用 validateUnsupported）
+    const reg = [{ at: 'dyn.js:1', read: unsupported[0].shape, reason: '拼名来自调用方，本站没有对应配置面' }];
+    assert.deepEqual(unsupportedProblems(unsupported, reg), []);
+    assert.deepEqual(validateUnsupported(reg, dir), []);
+    // ④ 去掉理由 ⇒ 红（复用「无理由 ⇒ 红」那套机制的同一句措辞）
+    assert.match(validateUnsupported([{ at: 'dyn.js:1', read: unsupported[0].shape }], dir).join('\n'), /缺理由字段 reason/);
+    assert.match(validateUnsupported([{ at: 'dyn.js:1', read: unsupported[0].shape, reason: '  ' }], dir).join('\n'), /缺理由字段 reason/);
+    // ⑤ 坐标漂移 / 过期条目 ⇒ 红
+    assert.match(unsupportedProblems(unsupported, [{ ...reg[0], at: 'dyn.js:9' }]).join('\n'), /行号漂了/);
+    assert.match(unsupportedProblems([], reg).join('\n'), /扫描器现在\*\*认不出来\*\*/);
+    // ⑥ 登记的 `at` 指向不存在的文件 ⇒ 红（与 where 同一条口径）
+    assert.match(validateUnsupported([{ ...reg[0], at: 'nope/dir/dyn.js:1' }]).join('\n'), /指向不存在的文件/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  // ⑦ 真树的咬合：扫出来的动态读形必须全部登记，理由非空，坐标现跑对得上
+  const { unsupported: registered, problems } = loadEnvLegExceptions();
+  assert.deepEqual(problems, [], '例外清单（含 unsupported 段）本身不合法');
+  assert.ok(RUNNER_SCAN.unsupported.length > 0,
+    '真树里一个动态读形都没有了？那这条判据就成了空转 —— 去把 unsupported 段删掉并同步这里');
+  assert.deepEqual(unsupportedProblems(RUNNER_SCAN.unsupported, registered), [],
+    'runner 里的动态 env 读形与登记没咬合（未登记 / 过期 / 坐标漂移）');
+});
