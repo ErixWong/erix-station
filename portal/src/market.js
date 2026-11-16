@@ -859,9 +859,8 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
   }
   const existing = await selectInstall(pool, fde.id, slug);
   const wantEnabled = enabled === undefined ? (existing ? existing.enabled : true) : Boolean(enabled);
-  if (existing && existing.version === item.version && !force) {
-    return { changed: false, slug, version: item.version, enabled: existing.enabled, idempotent: true };
-  }
+  // 预算闸必须排在幂等判定**之前**：同版本但这次要求「从停用变启用」的请求，走的是下面那条
+  // 只改账的分支——排在后面就会绕过预算（§4 的上限管的是 enabled 计数，与有没有写盘无关）。
   if (wantEnabled && !(existing && existing.enabled)) {
     const n = await countEnabled(pool, fde.id);
     if (n >= LIMITS.maxEnabledSkills) {
@@ -869,6 +868,20 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
         { code: 'capability_budget_exceeded', httpStatus: 409,
           details: { max_enabled: LIMITS.maxEnabledSkills, enabled_now: n } });
     }
+  }
+  if (existing && existing.version === item.version && !force) {
+    // 同版本 ⇒ **一个字节都不写盘**。但 `enabled` 是账本字段，请求里明确要变就得变：
+    // 页面上那个开关点下去是「装好了但先关着」→「打开」，不能被幂等吞掉。
+    if (wantEnabled !== existing.enabled) {
+      await withTransaction(pool, async (client) => {
+        await client.query(
+          `UPDATE fde_capability_installs SET enabled = $3, updated_at = now()
+            WHERE fde_id = $1 AND item_id = $2`, [fde.id, item.id, wantEnabled]);
+        await enqueueMaterializeChange(client, { fdeId: fde.id, op: 'upsert' });
+      });
+      return { changed: true, slug, version: item.version, enabled: wantEnabled, disk: 'untouched' };
+    }
+    return { changed: false, slug, version: item.version, enabled: existing.enabled, idempotent: true };
   }
   const files = (await pool.query(
     `SELECT path, content, bytes FROM capability_files WHERE item_id = $1 AND version = $2 ORDER BY path`,
