@@ -1045,7 +1045,15 @@ test('I5 判据5 越权先于形状：非属主 + 非法 runId ⇒ 404 session n
   } finally { h.cleanup(); }
 });
 
-test('I6 判据6 activity=1 只发一条 SQL（复用 resolveScope 的三连 ⇒ 红）', async () => {
+/**
+ * 判据 6 的**边界**（别读成「整条 HTTP 请求只有 1 条 SQL」）：这里数的是
+ * **`listDelegates()` 这个函数内部**发的语句数——`activity=1` 那条 join 要把
+ * 属主 / `fde_name` / 父 run 状态一次拿齐（复用 `resolveScope` 的三连 ⇒ 这里红）。
+ * 走完整端点时还有**既有** `requireSession()` 的认证查询（会话 cookie 那一条，#593 之前就在，
+ * 不属本单口径也不该被算进来）⇒ 后来人别拿这条断言去推「一次 `GET .../delegates?activity=1`
+ * 全链路只查库一次」。
+ */
+test('I6 判据6 listDelegates 内部只发一条 SQL（整请求另含既有 requireSession 认证查询）', async () => {
   const h = await makeHarness({ roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'running' })]] });
   try {
     await callList(h, { activity: true });
@@ -1104,9 +1112,12 @@ test('I8 判据8 summarizeActivity：tool / text / none 三格 + 120 字上限 +
     ]),
     { turns: 2, kind: 'tool', tool: 'a', args: 'x' },
   );
-  // 上限：120 码点 + 末位 `…`；按码点数（emoji 不会被切半）
+  // 截断口径（与 `clipSnippet` 的注释逐字同尺）：**正文** 120 码点 + 末位 `…` ⇒ **总长最多 121**；
+  // 按码点数（emoji 不会被切半）。没超限的一侧也必须照原样出（不多不少）。
+  const short = summarizeActivity([{ role: 'assistant', text: '短句' }]);
+  assert.equal(short.text, '短句', '没超限不许被动过');
   const long = summarizeActivity([{ role: 'assistant', text: '汉'.repeat(200) }]);
-  assert.equal(Array.from(long.text).length, ACTIVITY_SNIPPET_MAX_CHARS + 1);
+  assert.equal(Array.from(long.text).length, ACTIVITY_SNIPPET_MAX_CHARS + 1, '总长 = 120 正文 + 1 省略号');
   assert.ok(long.text.endsWith('…'));
   const emoji = summarizeActivity([{ role: 'assistant', text: '😀'.repeat(200) }]);
   assert.equal(Array.from(emoji.text).length, ACTIVITY_SNIPPET_MAX_CHARS + 1, '120 个 emoji + 省略号');
