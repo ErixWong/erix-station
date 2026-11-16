@@ -168,6 +168,212 @@ export function createSessionTranscriptStore(client) {
       const max = res.rows?.[0]?.max_round ?? null;
       return max == null ? null : Number(max);
     },
+    // ── issue #500：账本恢复行三件套（erix-agent 0.33.0 的**可选**能力面，本站全实现）──
+    //
+    // 名字是引擎契约钉死的三个（`store.appendRecoveryRow` / `store.listRecoveryRows` /
+    // `store.clearRecoveryRows`，`orchestrator.js` 按名字探测）。三个都**可选**，但「在而做错」比
+    // 「缺席」更坑：读方法在而 reject ⇒ `recovery_rows_unreadable` 终局；写方法在而什么都不存
+    // ⇒ 引擎以为「执行过了」这条证据已落账，实际没落 ⇒ 比彻底不做更容易把副作用重放一遍。
+    // ⇒ **整组做，或者整组不做**（本站全做，SQL 面见 `createRecoveryRowStore`）。
+    //
+    // 为什么这个适配器（`load`/`appendRound` 这一族）也要带恢复行三件套：它的键**两种作用域都有**——
+    // session 键（`appendUserInputTurn` 的真实路径）与真 runId（随包契约套件与旧 portal 回退面）都从
+    // 这里进来。恢复行只有 session 语义，但本站的**适配器能力面**必须成套，否则契约套件的
+    // 「实现了就必须真断言」守卫会在半个能力上静默跳过（issue #739 那条口径的本站版）。
+    // 与轮记录同一个 client（红线：判冲突与判幂等的那笔 SELECT 必须落在同一事务里）。
+    ...createRecoveryRowStore(client),
+  };
+}
+
+/**
+ * `kind: "recovery"` 的行类型判别键（引擎 `RECOVERY_ROW_KIND`）。这里写**字面量**不是偷懒：
+ * `erix-agent` 的 `package.json#exports`（现查 0.33.0）只开 `.` / `./tools` / `./contract-tests`，
+ * `src/store/recovery-rows.js` 在面之外 ⇒ 运行期深路径 import 直接 `ERR_PACKAGE_PATH_NOT_EXPORTED`。
+ * 本站对它的全部依赖只剩「这两个字符串」+「写侧不收畸形行」这一条闸，判据的**真相**由
+ * `portal/test/transcript-recovery-rows.test.js` 按文件路径深路径 import 上游模块做**行为对拍**钉住
+ * （与 `transcript-payload.js` ↔ 上游 `transcript-dedup.js` 完全同一手法，先例见
+ * `portal/test/transcript-payload.test.js`）：上游改了形状/判别键，那条对拍当场红。
+ */
+const RECOVERY_ROW_KIND = 'recovery';
+/** 写侧只拦这一种事件：它是「工具真的执行过了」的唯一证据（引擎 `RECOVERY_EVENT_TOOL_EXECUTED`）。 */
+const RECOVERY_EVENT_TOOL_EXECUTED = 'tool-executed';
+
+/**
+ * 恢复行 `dedup_key` 的列宽上限：与迁移 `0036-transcript-recovery-rows.sql` 里
+ * `CHECK (length(dedup_key) <= 255)` **同一个数**（两处不一致 = 报错由 PG 抛 23514，
+ * 到了排障的人手里就只剩「23514」，没有「谁的哪一行」可说）。
+ * 与轮记录端点那条「`dedupKey` ≤256」故意差一个：那张表的 `dedup_key` 列上没有 CHECK。
+ */
+const RECOVERY_DEDUP_KEY_MAX_LEN = 255;
+
+/**
+ * `tool-executed` 恢复行的形状判据 —— **上游同件的本仓副本**（`toolExecutedRecoveryRowShapeProblem`）：
+ * 返回**第一个不合的字段名**，全合返 `null`。三条判据照上游逐字（`toolUseId` 非空串 / `round` 安全整数 /
+ * `dedupKey` 非空串），**一格不加**——上游那句注释说得清楚：写侧根本不可能产出 `round: NaN` 或没有
+ * `dedupKey` 的行，那种行是宿主手写/半截修复/被截断的，把它的 `toolUseId` 并进「执行过了」集合
+ * 等于拿一行的**身份**去坐实它自己都说不出的一次执行。
+ *
+ * 位置说明（别读成「本站把守卫搬走了」）：契约把这条守卫放在**读侧**（引擎 `readExecutedToolIdRecoveryRows`
+ * 抛 `TypeError` ⇒ 包成 `recovery_rows_unreadable`）。本站**照旧不在读侧动手**（`listRecoveryRows`
+ * 原样回行，见下面那份实现）；在**写侧**多拦一道是**严格超集**：能存进来的行必然过读侧守卫，
+ * 于是「写成功、下一次续跑才炸」这个更差的排障时序被换成了当场 400。
+ */
+function toolExecutedRecoveryRowShapeProblem(row) {
+  if (typeof row?.toolUseId !== 'string' || row.toolUseId === '') return 'toolUseId';
+  if (!Number.isSafeInteger(row?.round)) return 'round';
+  if (typeof row?.dedupKey !== 'string' || row.dedupKey === '') return 'dedupKey';
+  return null;
+}
+
+/**
+ * 恢复行的**写侧形状闸**（红线：本站不是「收下行就写」的假实现，但也不越权重写）。
+ * 只校「这条行能不能进这张表」：判别键 + 主键列 + 轮号 + `tool-executed` 的形状。
+ *
+ * `tool-result-unledgered` / `partial-text` **故意不在写侧校**：上游对它们的守卫
+ * （`readUnledgeredToolResultRecoveryRows` 那一串 `notYetLedgered` / `toolResult.tool_use_id` 对齐…、
+ * `readPartialTextRecoveryRow` 的 `text` 非空）长在**读侧**并抛 `TypeError`，本站再校一遍就是
+ * 第二把尺（漂移风险 > 收益），交给引擎读侧去抛 —— 那才是契约指定的位置。
+ *
+ * @param {any} row
+ * @returns {string|null} 人可读的违规描述；合规则 `null`
+ */
+function recoveryRowWriteProblem(row) {
+  if (row === null || typeof row !== 'object' || Array.isArray(row) || row.kind !== RECOVERY_ROW_KIND) {
+    // `kind` 是唯一判别键（引擎 `isRecoveryRow` 只认它）；不认识的行本站**不收**，不污染这张表。
+    return `record.kind must be "${RECOVERY_ROW_KIND}"`;
+  }
+  const dedupKey = row.dedupKey;
+  if (typeof dedupKey !== 'string' || dedupKey === '') {
+    return 'record.dedupKey is required (engine recoveryEventKey, host must not recompute it)';
+  }
+  if (dedupKey.length > RECOVERY_DEDUP_KEY_MAX_LEN) {
+    return `record.dedupKey exceeds ${RECOVERY_DEDUP_KEY_MAX_LEN} characters (transcript_recovery_rows CHECK)`;
+  }
+  if (!Number.isSafeInteger(row.round) || row.round < 0) {
+    // 列上也有 CHECK (round >= 0)，这里先拦：报错要说得出是哪个字段，且 `round: NaN` 进 jsonb 会变成 null。
+    return `record.round must be a non-negative safe integer (received ${String(row.round)})`;
+  }
+  if (row.recoveryEvent === RECOVERY_EVENT_TOOL_EXECUTED) {
+    const problem = toolExecutedRecoveryRowShapeProblem(row);
+    if (problem !== null) {
+      return `tool-executed recovery row is malformed on field "${problem}"`
+        + ' (engine toolExecutedRecoveryRowShapeProblem): refusing to persist execution evidence'
+        + ' that the engine would refuse to read back';
+    }
+  }
+  return null;
+}
+
+/**
+ * 恢复行三件套的 SQL 面（迁移 0036 的新表；与轮记录表 `transcript_rounds` **无外键关系**）。
+ * 导出理由：`internal.js` 的三个 internal 端点要的是同一套 SQL —— 两处各写一份就会出现
+ * 「store 适配器幂等、端点不幂等」这种只在一侧可观测的行为（与 `transcript-payload.js`
+ * 「判据只此一份」同一条纪律）。测试也直接打这一层（`portal/test/transcript-recovery-rows.test.js`）。
+ *
+ * 参数位一律用 `engineKey` 而不是 `key`：这一层是**双作用域**的——`load` / `appendRound` 那两法的
+ * `key` 既可能是 sessionId（session 作用域）也可能是真 runId（run 作用域，agentd 的旧 portal 回退面），
+ * 而恢复行只有 session 语义。写清楚名字，省得后来人以为这里该做 run 作用域兼容。
+ */
+export function createRecoveryRowStore(client) {
+  return {
+    /**
+     * `appendRecoveryRow`：追加一条恢复行。返回 `true` = 真写进去一行；`false` = 同 `dedupKey` + 同 payload ⇒ 幂等跳过。
+     * 同 key + **异 payload** ⇒ 抛 `code === 'dedup_payload_conflict'`（**既不覆盖也不静默丢弃**）。
+     *
+     * 判据与轮记录**同一把尺**：`./transcript-payload.js` 的 payload 指纹（顶层只剔
+     * `dedupKey`/`roundKey`/`round`/`ts`）。为什么恢复行尤其需要「剔顶层」这一半：崩溃重跑同一个
+     * 工具调用时，引擎重新算出的行只有 `ts`（和极端情况下的 `round`）会漂，payload 一个字节都没变，
+     * 拿整条记录去哈希就会把重放判成冲突 ⇒ 写侧抛错 → 引擎 `persistence_failed`，证据反而丢了。
+     *
+     * ⚠ `ON CONFLICT DO NOTHING` 之后必须读回既有行：`DO NOTHING` 本身分不清「幂等」与「真冲突」，
+     * 而这两种在契约里是两个结局（幂等 = `false` 继续跑；冲突 = 抛错让引擎按持久化失败收场）。
+     * 并发同 key 已被 `PRIMARY KEY (transcript_key, dedup_key)` 序列化 ⇒ 本事务之外最多一条落地。
+     */
+    async appendRecoveryRow(engineKey, row) {
+      const problem = recoveryRowWriteProblem(row);
+      if (problem !== null) throw new Error(`transcript recovery row rejected: ${problem}`);
+      const inserted = await client.query(
+        `INSERT INTO transcript_recovery_rows (transcript_key, dedup_key, round, record)
+         VALUES ($1, $2, $3, $4::jsonb)
+         ON CONFLICT (transcript_key, dedup_key) DO NOTHING
+         RETURNING dedup_key`,
+        [engineKey, row.dedupKey, row.round, JSON.stringify(row)],
+      );
+      if ((inserted.rows?.length ?? 0) > 0) return true;
+
+      const existing = (await client.query(
+        `SELECT record FROM transcript_recovery_rows
+          WHERE transcript_key = $1 AND dedup_key = $2`,
+        [engineKey, row.dedupKey],
+      )).rows?.[0]?.record ?? null;
+      if (existing === null) {
+        // ON CONFLICT 已跳过、却又读不到行：唯一可能是并发事务插完后立刻回滚（DO NOTHING 会等它
+        // 落地才判跳过）。**不静默成功**：按最保守方向报冲突（同 `appendRound` 那一格）。
+        throw dedupPayloadConflict({
+          runId: engineKey,
+          key: transcriptRecordKey(engineKey, row),
+          existing: undefined,
+          incoming: row,
+          existingFingerprint: 'sha256:000000000000000000000000',
+          incomingFingerprint: payloadFingerprint(row),
+        });
+      }
+      // 幂等命中：顶层 `ts`（重放必然带来新时刻）漂了仍算重放 ⇒ `false`，不新增行、不动既有行。
+      if (samePayload(existing, row)) return false;
+      throw dedupPayloadConflict({
+        runId: engineKey,
+        key: transcriptRecordKey(engineKey, row),
+        existing,
+        incoming: row,
+        existingFingerprint: payloadFingerprint(existing),
+        incomingFingerprint: payloadFingerprint(row),
+      });
+    },
+    /**
+     * `listRecoveryRows`：读该 key 的全部恢复行，按**持久化追加序** `append_seq` 升序（**不是**时间）。
+     * 契约：返回数组，空数组 = 「这条 run 没有恢复行」（唯一可以静默兜底的回答）。
+     * 本站**不吞错误**：client 抛错就让它抛出去——引擎把「方法在而 reject」判成
+     * `recovery_rows_unreadable`（吞掉 = 把唯一的执行证据当没有，正是本切片存在的理由）。
+     *
+     * 返回的是 `record` 本体（列 `round` **不合成进去**，与 `loadByDedupKey` 的保真要求同口径）：
+     * 引擎读侧的形状守卫读的就是 record 里那些字段，套一层列值会把手写行的畸形「修好」再放行，
+     * 于是守卫永远不响。
+     *
+     * ⚠ 没有 `partial-text` 的「每轮只有一个槽位」这回事：引擎文件存储靠**整文件重写**保证槽位语义，
+     * 本站是 append-only ⇒ 同轮多条 `partial-text` 会都在（读侧 `readPartialTextRecoveryRow` 取
+     * **最后落盘**那条，与文件存储语义一致）。今天本站没开 `partialPersistence`（#301）⇒ 该事件不产生。
+     */
+    async listRecoveryRows(engineKey) {
+      const res = await client.query(
+        `SELECT record
+           FROM transcript_recovery_rows
+          WHERE transcript_key = $1
+          ORDER BY append_seq`,
+        [engineKey],
+      );
+      return (res.rows ?? []).map((r) => r.record);
+    },
+    /**
+     * `clearRecoveryRows`：清光该 key 的恢复行（引擎在 **fresh start**、第一轮写之前调）。返回 `true` = 至少删掉一行，
+     * `false` = 本来就没有（两者都是成功；**抛错才是**契约里那个终局 `recovery_rows_clear` 失败）。
+     *
+     * 为什么这条 DELETE 不破坏「折叠重建可证无损」：它**只打新表**。`transcript_rounds` 上
+     * 「全站 `DELETE FROM transcript_rounds` 零命中」是 `sessions.js` 那条论证的前提，本方法一个字节
+     * 都不碰那张表（`portal/test/transcript-recovery-rows.test.js` 里有用例钉住）。
+     *
+     * 顺序红线（引擎 `dedup_payload_conflict` 之外唯一一条）：清盘**不许**被折叠进「本轮末尾」——
+     * `tool-executed` 只在执行器返回那一刻写一次，中途没有任何再确认，清早了 = 那一轮的执行证据永久丢失。
+     * 时序由调用方保证（引擎在 `resume !== true` 的分支里第一件事就是它，`orchestrator.js:2191-2199`）。
+     */
+    async clearRecoveryRows(engineKey) {
+      const res = await client.query(
+        `DELETE FROM transcript_recovery_rows
+          WHERE transcript_key = $1
+          RETURNING 1`,
+        [engineKey],
+      );
+      return (res.rowCount ?? 0) > 0;
+    },
   };
 }
 
