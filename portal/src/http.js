@@ -2990,8 +2990,11 @@ async function handleSessionFoldedPayload(req, res, ctx, sessionId, round) {
 }
 
 /**
- * GET /api/sessions/:id/delegates?runId=<parentRunId> —— 某个父 run 的子 run 名册（只读，零审计）。
+ * GET /api/sessions/:id/delegates?runId=<parentRunId>[&activity=1] —— 某个父 run 的子 run 名册（只读，零审计）。
  * 属主校验 / 父 run 归属 / 路径解析全在 `delegation.js`，与 `GET /api/sessions/:id` 同一个 404 口径。
+ * `activity`（issue #593）：**只认字符串 `1`**，其它任何值（`0` / `true` / `yes` / 空串 / 缺席）
+ * 一律等价于不带 ⇒ 响应与今天逐字段相同。不在这里判形状：`delegation.js` 只接 `activity === true`，
+ * 重一遍「只认 1」就会得到两把尺（与上面 `tail` 同口径）。
  */
 async function handleSessionDelegates(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
@@ -3002,6 +3005,7 @@ async function handleSessionDelegates(req, res, ctx, sessionId) {
     userId: session.user.id,
     parentRunId: requireDelegateRunId(url),
     userSpaceRoot: ctx.config.userSpaceRoot,
+    activity: url.searchParams.get('activity') === '1',
   });
   return sendJson(res, 200, result);
 }
