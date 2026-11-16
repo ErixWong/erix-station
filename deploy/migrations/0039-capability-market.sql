@@ -82,7 +82,8 @@ BEGIN
   SELECT count(*) INTO n_items FROM capability_items;
   SELECT count(*) INTO n_files FROM capability_files;
   SELECT count(*) INTO n_installs FROM fde_capability_installs;
-  RAISE NOTICE '0039: capability_items=% / capability_files=% / fde_capability_installs=% 行'
-    || '（全 0 = 市场未发布，capabilities.json 将渲染成 {"version":1,"skills":[]}）',
+  -- ⚠ PL/pgSQL 的 RAISE 第一个参数必须是**字面量格式串**：写成 `'a' || 'b', args` 会直接
+  -- `syntax error at or near "||"`（0039 首跑就是这个错，迁移整支回滚 ⇒ 镜像起不来）。
+  RAISE NOTICE '0039: capability_items=% / capability_files=% / fde_capability_installs=% 行（全 0 = 市场未发布，capabilities.json 将渲染成空清单）',
     n_items, n_files, n_installs;
 END $$;
