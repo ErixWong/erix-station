@@ -8148,3 +8148,39 @@ rc=0**；`portal/test/market.test.js` 23 条、`materializer.test.js` 37 条（�
 digest 并 `docker rm -f fde-eric` + `provision-fde` 即可（`docs/ops/deployment-2026-10-10.md` §升级/回滚）。
 ⚠ 跑 compose 必须在**同一棵树**里：从别的树 `up -d` 会用它自己的 `context: ..` 把 `portal:local` 标签
 重新指到那棵树（本次踩过：main 的树把标签指回旧代码，镜像里查不到 `market.js`）。
+
+### 8.154 版本三格真机 e2e 固化 + 发版 v0.1.70 的真机验收（#603，2026-11-16/17，主 agent + worker）
+
+接 §8.150 / §8.151。**#586 的验收原本是我手搓在 `/tmp` 里的脚本**（跑完就没了）⇒ 本单把它固化成
+仓库里可复跑的判据，并用它验完 v0.1.70。
+
+**落地**：`portal/integration/version-surface-e2e.mjs`（607 行）+ `npm run test:integration:version`，
+三层腿 + 缺环境 `skip`（打印原因，不假绿不硬失败）：
+
+| 腿 | 断什么 | skip 条件 |
+|---|---|---|
+| A1 `/api/health` | 三格非空、`status=ok`、**不许有 engine 键** | portal 连不上 |
+| A2 登录 → `/api/admin/version` | 三格齐、`source` 合法、`provenance` **按 source 独立复算**相等、`buildInfoPath` 非空 | 缺口令 / 无 cookie |
+| A3 `fdes[]` | 每行 `versionSource=containers.agent_version` + `snapshot=provision` | `fdes=[]`（明说「不算验过」） |
+| C1 容器腿 | `docker exec cat /app/build-info.json` 与 A2 三格**逐格 equal** | docker 不通 / 无该文件 |
+| U1 UI 腿（`E2E_UI=1`） | 真浏览器进 `#/admin/about`：三区块 / 页值==API 值 / 快照标注数 / 无溢出 / 无控制台错误 + 截图 | 没点名 / 无 playwright 容器 |
+
+**主 agent 复跑**：三层腿 rc=0；跳过路径（`PORTAL_URL=http://127.0.0.1:1`）rc=0 且 5 条全 SKIP；
+两处变异（`provenance.fdes` 改错 ⇒ A3 红；health 期望 200→299 ⇒ A1 红）；根 `npm test` 2771 项不受影响
+（integration 文件不被 `node --test` 收进去）。
+
+**发版 v0.1.70**：`#604`（版本三处对齐 0.1.69→0.1.70，`a5deeb7`）→ tag `v0.1.70` → release run
+`43910657016` success → portal digest `sha256:9b9b5e91…`。发布镜像四格实测
+`0.1.70 / engine 0.33.0 / revision a5deeb7 / built_at 2026-11-16T16:43:52Z`（revision 与 tag 指向的
+commit **一致**）。dev 栈改 pin 该 digest（`deploy/.env:72`，备份 `/tmp/deploy-env.bak70.*`）后
+`E2E_UI=1 npm run test:integration:version` ⇒ **5/5 rc=0**，截图 157,301 字节、8 台 FDE 全带快照标注。
+
+**两件如实记账**：
+- **tag 不是我打的**：`v0.1.70` 在我执行 `git tag` 前已由并行 session 建好（`a5deeb7`，release run
+  `43910657016`，早我 8 分钟）。内容对（含 #586/#589），但**不含 #603 的 e2e 脚本**（#607 在其后合并）
+  ⇒ 「拉 tag 的人手里没有 e2e 脚本」，要跑得从 main 取。下次发版会自然带上。
+- **vision 看图这一腿没做成**：`analyze_image` 连续 3 次 `http_request_failed`（上游 API 挂）⇒ 用
+  DOM 断言替代（文本/数值/溢出/控制台错误都机器判），「好不好看」这层没有第三方视觉确认。
+- 另：跑 e2e 时发现真机 portal 被并行 session 重建过 ⇒ `revision/built_at` 变 `unknown`（本地
+  `docker compose build` 没传 `STATION_REVISION`/`STATION_BUILD_DATE`，compose 缺省即 `unknown`）。
+  这**恰好证明口径诚实**（本地乱建不会编合法版本号），也说明 CI 的 ④′ tripwire 才是这条的守门人。
