@@ -778,9 +778,82 @@ export const en = {
       // issue #485 slice A: upload limit (views/AdminUploadView.vue, contract docs/api/portal.md §4.15).
       // Sits after certs and before the read-only pool view: it is platform configuration.
       upload: 'Upload limit',
+      // issue #595 M2: capability market console (views/AdminMarketView.vue, contract §7 admin API).
+      // After the upload limit and before the read-only pool view: it is platform configuration.
+      market: 'Capability market',
       // issue #528 (event platform W5): admin tabs for macro templates / macro runs (`07` §21.1 key table).
       macros: 'Macro templates',
       macroRuns: 'Macro runs',
+    },
+    // Capability market, admin console (views/AdminMarketView.vue, issue #595 M2;
+    // contract §7 admin API + §8 admin UI).
+    market: {
+      title: 'Capability market',
+      intro: 'Publish and maintain skill packages: metadata plus a multi-file bundle.' +
+        ' Whether the bundle is legal is decided by the server.',
+      footnote: 'The static scan is advisory, not a gate (§3): a low score blocks neither publishing' +
+        ' nor installing. Hard path/byte/count checks live in the server (`validateBundle`);' +
+        ' this page only blocks obviously wrong paths.',
+      loading: 'Loading entries…',
+      empty: 'No entries yet: use "Publish new entry".',
+      reload: 'Reload',
+      filterLabel: 'State',
+      filterAll: 'All',
+      colState: 'state',
+      colSlug: 'slug',
+      colVersion: 'version',
+      colInstalls: 'installs',
+      colScore: 'score',
+      colActions: 'actions',
+      publish: 'Publish',
+      retire: 'Retire',
+      edit: 'Edit',
+      detail: 'Details',
+      close: 'Close',
+      detailLoading: 'Loading details…',
+      files: 'File list',
+      filesUnknown: 'No file list supplied by the server.',
+      scanScore: 'static scan: {score}',
+      scanClean: 'The scan reported nothing.',
+      scanHintCount: '{count} hints',
+      createTitle: 'Publish new entry',
+      editTitle: 'Edit entry',
+      submitCreate: 'Publish',
+      submitSave: 'Save',
+      cancel: 'Cancel',
+      formIntro: 'Fields marked * are required by the server; this form does not enforce that itself.',
+      fSlug: 'slug *',
+      slugHint: 'Directory name: lowercase letters, digits, hyphens.' +
+        ' The server also requires the package\'s `skill.id` to equal it.',
+      fName: 'name *',
+      fSummary: 'one-line summary *',
+      fWhenToUse: 'when to use *',
+      whenToUseHint: 'This text is injected into the system prompt as the routing signal' +
+        ' (server limits it to 8..500 characters).',
+      fVersion: 'version *',
+      fAuthor: 'author',
+      fTags: 'tags',
+      tagsHint: 'Comma separated (e.g. pdf,docs).',
+      fLicense: 'license',
+      fDescription: 'detail body (markdown)',
+      filesLabel: 'Package files (multiple)',
+      bundleHint: 'The root must contain `skill.mjs`. Paths come from the relative directory' +
+        ' (file name only when no folder was picked); file count, byte limits, a missing entrypoint' +
+        ' and an id mismatch are all reported by the server.',
+      noFilesPicked: 'No files picked: required when creating, optional when editing' +
+        ' (nothing picked = metadata only).',
+      pickedSummary: '{count} files picked, {bytes} total',
+      pathIssue: {
+        empty: 'the path is empty',
+        absolute: 'absolute path (not allowed)',
+        separator: 'the path contains a backslash',
+        parentRef: 'the path contains `..`',
+        tooLong: 'the path is too long (over 200 bytes)',
+      },
+      resultCreated: 'Published {slug}.',
+      resultUpdated: 'Updated {slug}.',
+      resultPublished: 'Published {slug} (state moved to published).',
+      resultRetired: 'Retired {slug} (existing installs keep working).',
     },
     macros: {
       title: 'Macro templates',

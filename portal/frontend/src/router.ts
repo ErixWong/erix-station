@@ -90,6 +90,14 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminUploadView.vue'),
         meta: { requiresRole: 'admin' },
       },
+      // issue #595 M2：能力市场发布台（§7 管理面）。导航顺序：… → upload → **market** → pool。
+      // 请求只在本视图挂载时发（`AdminMarketView` 的 onMounted 是唯一触发点）。
+      {
+        path: 'market',
+        name: 'admin-market',
+        component: () => import('./views/AdminMarketView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
       // issue #350：预览号池占用总览（只读）。懒加载组件 + 照邻居写 requiresRole；
       // 请求只在本视图挂载时发（判据①：进管理台不请求，切到这一 tab 才恰好 1 次）。
       {
