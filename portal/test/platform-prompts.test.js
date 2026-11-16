@@ -28,9 +28,13 @@ import {
   renderHomeAgentsMd,
   agentsMdRenderBudget,
   agentsMdRenderedBytes,
+  agentsMdGateRenderBudget,
+  agentsMdGateFdeName,
   AGENTS_MD_EXAMPLE_FDE_NAME,
   AGENTS_MD_ADDENDUM_HEADER,
 } from '../src/materializer.js';
+// `P13`：写侧闸的最坏情况标识行必须从 `FDE_NAME_RE` 这条单一真相导出（不是手抄的 63）。
+import { FDE_NAME_MAX_LEN, FDE_NAME_RE } from '../src/projects.js';
 // 判据 `P9` 的跨包对账：portal 的注入上限必须等于 runner 注入侧的那个常量。
 // ⚠ 只有**测试**跨包 import —— portal 镜像不含 `runner/`（`portal/Dockerfile` 只 `COPY portal/ portal/`），
 //   运行期引它 = portal 起不来（先例：`runner/test/system-prompt.test.js` import `portal/src/previewpool.js`）。
@@ -431,8 +435,9 @@ test('P6 渲染超限（8 KiB 追加段 + 内置模板 > 16 KiB）⇒ 400 且**�
     row: { agents_md_addendum: '旧约定', agents_md_override: '', title_prompt: '', updated_at: null, updated_by: null },
   });
   // 字段自身上限（8192）**装得下**这条文本 ⇒ 拦住它的只能是渲染闸。
+  // 闸按**最坏情况**算（评审 F2）⇒ 期望值也得拿同一份预算算，不然是拿预览在验闸。
+  const budget = agentsMdGateRenderBudget();
   assert.equal(bytes(FULL_ADDENDUM), ADDENDUM_MAX_BYTES, '靶子正好 8192 字节，字段闸不拦');
-  const budget = agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME });
   assert.ok(
     agentsMdRenderedBytes(budget, { addendum: FULL_ADDENDUM, override: '' }) > AGENTS_MD_INJECT_MAX_BYTES,
     '前提：这条追加段与内置模板合起来确实超过注入上限',
@@ -487,8 +492,12 @@ test('P6 渲染超限（8 KiB 追加段 + 内置模板 > 16 KiB）⇒ 400 且**�
 });
 
 test('P6b 等价性：SQL 侧那条渲染算术与 renderHomeAgentsMd 的真实字节逐组同数', () => {
-  // SQL 在 `gate` 那段里自己算「渲染后多大」；这里逐组钉它与真渲染一致（口径同 0036 的 US-20）。
-  const budget = agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME });
+  // 逐组钉「JS 算子 ≡ JS 真渲染」（口径同 0036 的 US-20）。两份预算各配**同名**的渲染：
+  // 写侧闸那份配最坏情况名，DTO 预览那份配示例名。
+  //
+  // ⚠ 这条**只**管 JS 这一侧：SQL 里 `gate` 那段算术（`octet_length` / `convert_to`）在单测里**没有**
+  //   执行过——在这里拄一遍 SQL 算式只是把一份算术誊成两份。那半边由真库腿
+  //   `portal/integration/platform-prompts-db.mjs` 真的跑一次 `SAVE_SQL` 钉住（评审 F4 第 3 项）。
   const cases = [
     ['', ''],
     ['短', ''],
@@ -499,15 +508,75 @@ test('P6b 等价性：SQL 侧那条渲染算术与 renderHomeAgentsMd 的真实�
     ['\n\n', '\n'],
     ['中文与 emoji 🚀 的字节数不是字符数', ''],
   ];
-  for (const [addendum, override] of cases) {
-    const formula = agentsMdRenderedBytes(budget, { addendum, override });
-    const real = bytes(renderHomeAgentsMd({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME, addendum, override }));
-    assert.equal(formula, real, `addendum=${bytes(addendum)}B override=${bytes(override)}B 时算子必须与真渲染同数`);
+  const legs = [
+    ['写侧闸那份（最坏情况名）', agentsMdGateRenderBudget(), agentsMdGateFdeName()],
+    ['DTO 预览那份（示例名）', agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME }), AGENTS_MD_EXAMPLE_FDE_NAME],
+  ];
+  for (const [label, budget, fdeName] of legs) {
+    for (const [addendum, override] of cases) {
+      const formula = agentsMdRenderedBytes(budget, { addendum, override });
+      const real = bytes(renderHomeAgentsMd({ fdeName, addendum, override }));
+      assert.equal(formula, real,
+        `${label}：addendum=${bytes(addendum)}B override=${bytes(override)}B 时算子必须与真渲染同数`);
+    }
+    // 默认态：预算常量本身就等于那一档名字下今天那份文件的字节数
+    assert.equal(
+      budget.templateBytes + budget.identityTailBytes,
+      bytes(renderHomeAgentsMd({ fdeName })),
+      `${label}：默认态的预算常量就是那份文件的字节数`,
+    );
   }
-  // 默认态：预算常量本身就等于今天那份文件的字节数
+});
+
+test('P13 闸按最坏情况标识行而非示例名（评审 F2）：示例名装得下、最坏名装不下 ⇒ 400 且一格不写', async () => {
+  const gate = agentsMdGateRenderBudget();
+  const example = agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME });
+  assert.ok(gate.identityTailBytes > example.identityTailBytes,
+    '前提：最坏情况那份标识行确实更长（否则本节是拿同一份预算自己对自己，恒真）');
+
+  // 靶子：一条「按示例名正好装得下、按最坏情况名装不下」的追加段（差值就是两条标识行的字节差）。
+  const fitsExample = AGENTS_MD_INJECT_MAX_BYTES - example.templateBytes
+    - example.addendumOverheadBytes - example.identityTailBytes;
+  const addendum = 'x'.repeat(fitsExample);
+  assert.equal(bytes(addendum), fitsExample);
+  assert.ok(bytes(addendum) <= ADDENDUM_MAX_BYTES, '它没超字段自身上限 ⇒ 拦住它的只能是渲染闸');
+  assert.equal(agentsMdRenderedBytes(example, { addendum, override: '' }), AGENTS_MD_INJECT_MAX_BYTES,
+    '示例名那一档：正好装得下（拿它当预算就是评审说的那个洞）');
+  const worst = agentsMdRenderedBytes(gate, { addendum, override: '' });
+  assert.ok(worst > AGENTS_MD_INJECT_MAX_BYTES, '最坏情况那一档：装不下 ⇒ 必须拒');
+
+  const pool = new PromptsFakePool({ row: { agents_md_addendum: '', agents_md_override: '', title_prompt: '' } });
+  await assert.rejects(
+    () => updatePlatformPrompts({ pool, field: 'addendum', text: addendum, actorId: ACTOR }),
+    (e) => e.code === 'validation_failed'
+      && e.details.field === 'text'
+      && e.details.rendered_bytes === worst
+      && e.details.render_limit_bytes === AGENTS_MD_INJECT_MAX_BYTES,
+    '按示例名会 200，按最坏情况必须 400（且 details 报的是最坏情况那个数）',
+  );
+  assert.equal(pool.row.agents_md_addendum, '', '**一格不写**（拒在写之前）');
+  assert.equal(pool.audit.length, 0, '被拒的保存不写审计');
+  assert.deepEqual(pool.statements.filter((r) => /INSERT INTO/.test(r.sql)), [], '一条写语句都没发');
+
+  // ★ SQL 送参里那份标识行字节 = 最坏情况那份（不是示例名那份）。取一次**成功**的保存看参数。
+  const ok = new PromptsFakePool({ row: { agents_md_addendum: '', agents_md_override: '', title_prompt: '' } });
+  await updatePlatformPrompts({ pool: ok, field: 'addendum', text: 'x'.repeat(1000), actorId: ACTOR });
+  const save = ok.statements.find((r) => /INSERT INTO platform_prompts/.test(r.sql));
+  assert.ok(save, '这条要真走到 SQL（否则下面三条参数断言都是恒真）');
+  assert.equal(save.params[5], gate.identityTailBytes, '$6 标识行尾部必须是**最坏情况**那一份');
+  assert.notEqual(save.params[5], example.identityTailBytes,
+    '不得是示例名那一份（差 = 最长合法工位名比 `example` 长出来的字节）');
+  assert.equal(save.params[3], gate.templateBytes, '$4 模板字节与 $6 来自同一份预算');
+  assert.equal(save.params[6], AGENTS_MD_INJECT_MAX_BYTES, '$7 渲染上限仍是注入上限');
+
+  // 标识行的长度来自 `FDE_NAME_RE` 这条单一真相，不是手拄的 63。
+  assert.equal(agentsMdGateFdeName().length, FDE_NAME_MAX_LEN, '最坏情况名 = 最长合法工位名');
+  assert.ok(FDE_NAME_RE.test(agentsMdGateFdeName()), '那个名字本身必须是合法工位名（否则是在拿非法输入当上界）');
+  assert.ok(!FDE_NAME_RE.test(`a`.repeat(FDE_NAME_MAX_LEN + 1)), '再长一个字符就不合法 ⇒ 这一档真的是上界');
   assert.equal(
-    budget.templateBytes + budget.identityTailBytes,
-    bytes(renderHomeAgentsMd({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME })),
+    gate.identityTailBytes - example.identityTailBytes,
+    bytes(agentsMdGateFdeName()) - bytes(AGENTS_MD_EXAMPLE_FDE_NAME),
+    '两份预算只差标识行里的工位名字节（其余常量逐字相同）',
   );
 });
 
