@@ -2790,20 +2790,46 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   > **单副本前提（形态 M 明确接受的限制）**：累加器与 SSE hub 都是 **per-process** 的 ⇒ 本节的补发能力
   > 假设 portal 单副本部署。多副本时「断在另一个副本上」必然看不到那段正文（表现 = 少一段未定稿，
   > 不是脏数据），要跨副本补发得先把累加器换成共享存储（登记在 §8.125 的后续里）。
-  > **已接受损失（缓冲 LRU 逐掉活跃 run，issue #515；台账指针见 §8.126.4）—— 潜伏项**：
-  > 缓冲的条目上限 `maxEntries = 32`（`run-partial-buffer.js` 的 `PARTIAL_MAX_ENTRIES_DEFAULT`，32 × 64 KB ≈ 2 MB），
-  > `evictOne()` **优先逐已终态的 entry**（`markTerminal` 标过的那些）。但当**同时 >32 个活跃 run 且一条终态
-  > 条目都没得逐**时，它必须逐一个**仍在流**的 run（该 run 从此在缓冲里没槽）。后果链：被逐的 run 若终态时
-  > **零助手锚点** ⇒ `runEndPartialKeys` 读到空快照 ⇒ `run_end` 里**写不出 `partial_text`** ⇒ **那半轮正文
-  > 永久丢**，已跑完的轮次仍在（`round_end.final_text`），两处都空则历史里只剩 §4.4a-1 判据 3 的**占位项**
-  > （表现 = 「那段没了」+ 一行中性提示，不是脏数据）。今天**踩不到**：单 portal 副本 + 实际并发远小于 32
-  > （认领 SQL 串行 + 会话租约 ⇒ 单进程同时跑的 run 是个位数）。可观测面只有一半：逐出活跃 run 会计
-  > `stats().evictedActive` 并打一条 `log.warn`（**不静默**），但 `stats()` **没被挂到任何对外端点上**
-  >（现查 `grep -rn metrics portal/src` = 0 命中，portal 今天没 `/metrics`）也没进事件流 ⇒ 只能翻日志对账。
-  > ⇒ **已在 issue #515 开单要求显式裁决**（三选一：① 把 `maxEntries` 与 portal 级
-  > active-run 硬上限绑定（结构上排除逐出）；② 逐出时发一条可观测信号（诊断事件 / 指标）；③ 显式接受并
-  > 把本段当成交付）。**本节不拿「单副本前提」这条兼任它的豁免**：那一条说的是「跨副本不可见」，
-  > 本条是「同副本内被自己的上限逐掉」，两个成因不同。
+  > **已接受损失（缓冲 LRU 逐掉活跃 run，issue #515；裁决 = ② 轻量版 + ③ 同做，261115-11 / 工单 fix-261115-11；台账 §8.133，原始取证 §8.126.4）—— 潜伏项，现已显式接受**：
+  > 缓冲的条目上限 `maxEntries = 32`（`run-partial-buffer.js` 的 `PARTIAL_MAX_ENTRIES_DEFAULT`）。
+  > ⚠ **N=32 的来源要说准：它是内存槽上限，不是并发上限，也不是任何「平台允许同时跑几个 run」的声明**——
+  > 单 entry 两路（`text` / `reasoning`）**各自**夹到 `textCap` 16,384 字符 ≈ 64 KB ⇒ 全表 32 × 64 KB ≈ 2 MB；
+  > 取 32 而非 256 的理由是「**当前部署**下单 portal 进程同时跑的 run 是个位数 ⇒ 十倍余量，多出来是常驻浪费」（**不是**代码上限，见下一条）（算术在
+  > `run-partial-buffer.js` 文件头）。它**不与 portal 级 active-run 上限绑定**——那种上限今天不存在（见下面裁决 ①）。
+  > `evictOne()` **优先逐已终态的 entry**（`markTerminal` 标过的那些）；只有当**同时 >32 个活跃 run 且一条终态
+  > 条目都没得逐**时，它才必须逐一个**仍在流**的 run。
+  > **后果有两种形态（工单 #515 原文只写了第一种；第二种是 261115-11 复现时实测补的，比第一种更坑）**：
+  >   · **形态 ①：逐出后该 run 不再吐字** ⇒ 槽位不重建 ⇒ `runEndPartialKeys` 读到空快照 ⇒ `run_end` 里
+  >     **不加 `partial_text` 键** ⇒ 那半轮正文永久丢。已跑完的轮次仍在（`round_end.final_text`），两处都空
+  >     则历史里只剩 §4.4a-1 判据 3 的**占位项**（表现 = 「那段没了」+ 一行中性提示，不是脏数据）。
+  >   · **形态 ②：逐出后该 run 继续吐字** ⇒ 后续碎片把它**重建成一个 blank entry** ⇒ 终态写出的
+  >     `partial_text` 是**一段从中间起笔的尾巴**（逐出之前那段永久丢，内存与库里都没有它，也没有 DB 回落），
+  >     而且**没有任何标记说明它是尾巴**：`partial_round` 掉到 `0`（轮号随 blank 一起没了）、`chunks` 从 0
+  >     重开、`textSegment` 回落到 0、`roundSeq` 掉到 `null`。⚠ 这比缺字段更坑：有 `partial_text` ⇒ 历史投影
+  >     **不出**占位项 ⇒ 用户看到的是一段「看着完整、其实从半句开始」的正文；而 `roundSeq: null` 会让本节
+  >     的补发判据（「run + `roundSeq` 两端都匹配才覆盖气泡」）**整帧丢弃** ⇒ 重连也补不回来。
+  >     **这条尾巴是独立的正确性问题，#515 不修**（主 agent 另开单跟）；今天由
+  >     `portal/test/healthz-partial-buffer.test.js` 里那条「钉**今天的真实行为**」的用例钉住 ⇒ 谁修它，谁就必须回来改本段口径。
+  > 今天**没踩到**，但要说准：**这是部署现状，不是代码保证**。逐出活跃 run 需要**同时 >32 个活跃 run**，而活跃并发 = Σ(每个 agentd 的 capacity)——缺省 **2/agentd**（`runner/agentd.js:15-17`，`ERIX_AGENTD_CAPACITY` 可调），portal 侧**没有**全局上限，认领是 `FOR UPDATE SKIP LOCKED` **逐行放行**（`portal/src/internal.js:257-280`，**不是全局串行**）。261116 现网读数：6 个 `fde-*` 容器 ⇒ 并发上界约 12；此刻库里 `status in ('running','queued')` 的 run = **0**（另有 1 条 `cancelling`）——**这是某一刻的快照，会随负载变**，别当常量引用。**FDE 数 × 2 越过 32（约 17 台）就会开始逐活跃 run**，那时 `evictedActive` 会跳（见下面的可观测面）。
+  > **可观测面（裁决的 ② 轻量版）**：逐出活跃 run 会计 `stats().evictedActive` 并打一条 `log.warn`（这两半
+  > 本单之前就有），本单补的是第三半：**`GET /healthz` / `/api/health` 的 200 响应多带一块
+  > `partialBuffer: { entries, maxEntries, evictedActive }`**（`portal/src/http.js#partialBufferHealth`）——
+  > 三个整数，**不放 run id、不放 sessionId、不放正文片段**（健康端点的响应会被人整段贴进工单与日志）。
+  > `status` 语义一字未动、**503 分支形状不变**、不新增端点与鉴权面；容器健康检查判的是**进程退出码**
+  >（`cli.js#healthcheck` 只看 `res.ok`，实测容器健康日志里的 Output 就是一行 `ok`，body 根本不进判据）
+  > ⇒ 往 200 里加字段对它结构性安全。portal 至今**没有** `/metrics`（现查 `grep -rn metrics portal/src` = 0 命中）
+  > ⇒ 这块读数是它唯一的对外数字；**没有做成事件**也是裁决的一部分：不新增宿主诊断事件（那要动 SSE 白名单 +
+  > 前端 + `event-surface-contract.test.js`），也**不**借用 `persistence_capability_degraded` —— 那个类型是
+  > **引擎发射**的（§5.3 第 20 类，`orchestrator.js`），portal 拿它说自己的事 = **谎报发射方**。
+  > **与 #502「明确接受的损失」的边界（两条不许互相豁免）**：#502 那条覆盖的是「**portal 重启 ∧ 无终态正文**」
+  >（进程没了 ⇒ 内存全清）；本条是「**同副本内、被自己的上限逐掉**」。同理，上面那条**「单副本前提」也不兼任
+  > 本条的豁免**：那条说「跨副本不可见」，本条说「同副本内被逐」，两个成因不同。
+  > **裁决 ①（把缓冲容量与 portal 级 active-run 硬上限绑定 ⇒ 结构上排除逐出）本单不做**：portal 今天没有
+  > active-run 硬上限（认领是 `FOR UPDATE SKIP LOCKED` 一条条来，并发只受 runner 数量与会话租约约束），
+  > 现造一个的爆炸半径超出一个缓冲修复 ⇒ 留后续单，不在本单预支。⚠ 后续修它时注意两条实测：(a) `observe()`
+  > 与 `stage().commit()` 里的 `while (entries.size >= maxEntries) evictOne()` 在「一条都逐不掉」时是**死循环**
+  >（把 `evictOne` 改成「全是活跃就直接 return」的变异实测 `rc=124` 挂死，不是变绿）⇒ 不能只在那里 `return`；
+  > (b) `maxEntries` 目前**没接 config / env**，只活在构造参数的默认值里。
   > **实现注记（issue #25 裁决）**：「无空洞」只对 **`messages ∪ run_events` 联合序列**成立（两表共用 `chat_sessions.last_seq` 分配器，schema.sql §3）；SSE 只推 `run_events`，故**事件流单独看存在合法空洞**（user 消息、assistant 回写各占一个 seq）。因此客户端**不得**以「seq 跳号」作为重连触发条件（会把合法空洞误判为丢事件，重放后仍跳号 → 无限重连风暴，实测复现）。丢失恢复路径：① 服务端 `resync` 控制帧（缓冲溢出，见下）；② 浏览器 `EventSource` 自动重连天然携带 `Last-Event-ID`（§5.2 补发 `seq > lastEventId`）。前端仅在收到 `resync` 时主动 `close()` + 以 `?last_event_id=<本地已知最大 seq>` 重连。
   > ⚠ **时间边界（261114-04 审计补）**：上面那句「无空洞只对联合序列成立」**写于 #25，已被 #502 推翻**——
   > 重复投递先烧 `seq` 再被 `ON CONFLICT DO NOTHING` 丢掉 ⇒ 那一号两张表都不落行，**联合序列也不保证无洞**
