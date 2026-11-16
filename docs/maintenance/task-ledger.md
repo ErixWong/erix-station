@@ -8036,3 +8036,62 @@ W6（#529 管理台 UI）。
 **没做**（交主 agent）：真机截图（验收判据 3，playwright + vision 核渲染）与发版后对账（判据 5）——本单不 push、
 不建 PR、不动部署面 ⇒ 现网 portal 仍是旧镜像，`/api/health` 的 `version` 要等下一次发版+部署才出现；
 「期望版本 vs 实际版本」的 canary 对账也没做（需另开列，见 §4.16 的「不做」）。
+
+### 8.152 子 run 活动可视化落地：#592 前端徽标/面板 + #593 端点 activity 摘要 + 真机 e2e（2026-11-16，主 agent 派工 + 亲验）
+
+**单与分支**：父单 #591；`feat-261116-19-delegation-activity-ui`（#592，11 文件 +1890/−11，10 commit）·
+`feat-261116-20-delegation-activity-endpoint`（#593，3 文件 +958/−26，9 commit）· 文档分支
+`docs-261116-22-delegation-activity-contract`（`docs/api/portal.md` §4.4c 的 `activity=1` 契约 + 本文）。
+设计依据 `docs/design/delegation-activity-2026-11-16.md`（可研见 §8.149）。
+
+**做了什么**：状态条尾部一个 `🤖 子任务 N` 徽标（`RunStatusBar` 内，N=0 且读到过 ⇒ 整段不出；**读不到** ⇒ 中性灰
+`子任务 ?`，同 D9 的 ⚪ 口径）+ 面板（短码/状态/已跑时长/**最近动作** `🔧 tool · args`）+ 「查看」复用既有只读抽屉
+（`delegateOpen` 从 `StreamPanel` 上提到 store，挂载点仍只有一处）。数据面零 DDL：阶段 0 直接吃 P2 就交付却
+**零消费**的名册端点，阶段 1 给同一端点加可选 `?activity=1`（活态子才读账本、`(绝对路径,size,mtime)` LRU 缓存、
+`readBounded` 有界读兜 8 MiB 竞态、一条 join 顺带算 `stale`）。轮询只在「本轮存在 delegate 卡」时开，2s、单飞
+（`setInterval`+`inFlight`，**不**照抄抽屉那条不可证伪的链式 `setTimeout`）、可见性门控、终态即停。
+
+**门禁（主 agent 亲跑，`NODE_ENV` 为空）**：前端 `npm run typecheck` **rc=0**；前端 `npm test` **rc=0**，
+75 文件 / **1552** 用例（基线 73/1508）；根 `npm test` **rc=0**，pass **2647** / fail 0 / skipped 50（基线 2632）；
+`portal/test/delegation.test.js` 单跑 **37/37 rc=0**；`node --test test/repo-hygiene.test.js` 5/5。
+
+**真机 e2e（主 agent 亲手，headless chromium 直连 `:8090`，`--host-resolver-rules` 绕开本机 DNS）**：
+派两个 `background:true` 子 run（各 `sleep 40`）⇒ 徽标 `🤖 Sub-tasks 2`；面板两行
+`● b8cb195a Running for 20.0s 🔧 shell · command=sleep 40; echo A, timeout_ms=60000 [View]`；
+点「查看」抽屉打开（`Running | Sub-task 728cdf74 | delegate · 3`）；20s 内 **11 发** `/delegates?…&activity=1`
+（2s 一拍）；run 终态后徽标消失；**刷新 → 重选目录 → 重开会话** ⇒ 徽标与两行自己回来（轮询 19→21 发）。
+截图 `~/…/e2e2-5-reload-ok.png`、`dbg-reload-panel.png`（vision MCP 上游当日报 `http_request_failed`，
+主 agent 改用直接读图确认渲染）。
+
+**独立验收（copilot `readonly` + `gpt-6-luna` + `xhigh`，共 3 轮）抓到的 6 条，全部处置**
+1. **降级提示不可达**（真缺陷）：`error=true` 但 `liveCount=0` 时徽标不出、面板唯一入口是徽标 ⇒ 那句
+   「子任务状态暂不可读」永远到不了用户眼前。修：`degraded = error && !loaded` 驱动徽标可见性（灰 `?`）。
+2. **终态行「已跑」还在涨**（真缺陷）：`elapsedMs` 忽略 `endedAt`。修：有 `endedAt` 用它定格；**终态但
+   `endedAt` 缺失 ⇒ 整段不出时长**（不回落时钟）。
+3. **两条假绿**：卸载用例没断言 `signal.aborted`；`activeRunId→null` 用例只断言「没有新请求」而 `poll()`
+   本身在 runId 为空时早退（interval 泄漏也绿）。修：分别断言 `signal.aborted === true` 与 `vi.getTimerCount()===0`。
+4. **`runId=%25` 打 500**（**main 上就有的既有缺陷**，落在本单端点上）：`requireDelegateRunId` 对已被
+   `URLSearchParams` 解码的 query 值再 `decodeURIComponent` ⇒ `URIError` ⇒ 500。修：query 只做
+   `raw.toLowerCase()`（`decodeUuid` 留给路径参数），J1 五形坏输入钉 400。
+5. **8 MiB 闸是 stat-then-read 的竞态**（子 run 正在追加写）：改 `readBounded(maxBytes+1)`，
+   进内存的字节数由**读**本身锁住；J2/J3 钉「stat 后涨过上限」「读时已被扫掉」两支降级。
+6. 边界口径澄清（120 码点 + `…` = 总长 121；I6 只证 `listDelegates()` 一条 SQL，整请求另含认证查询）。
+
+**三处只有真机才暴露的坑（都已修/已记）**
+1. **Docker 前端层假缓存**：`docker compose build` 报 rc=0，但镜像里的 `dist` 仍是旧包（缺
+   `delegate-activity-panel` / `activity=1`）⇒ 徽标永远不出，e2e 连吃两次 `ABSENT`。判据：**构建后先
+   `docker exec … grep` 新字符串再跑 e2e**；修法 `docker build --no-cache-filter frontend-builder`。
+2. **`NODE_ENV=production` 判绿**：worker 的 shell 继承了这个 env ⇒ Vue 编译器剔掉模板注释 ⇒ 一条
+   「面板不许出现 ⚠」的断言打不到它自己写在注释里的 `⚠`。**同一个 commit 在 development 下 rc=1**。
+   这是 AGENTS §4 那条红线的第二次现场；判据改成「断言先剥 HTML 注释再判可见面」。
+3. **工作台不持久化选中的目录/会话** ⇒ 硬刷新后落在 `#/`，设计 §4.4① 原来写「刷新后自己回来」是**错的**，
+   已按真机改写为「刷新 → 重选目录 → 重开会话 ⇒ 才回来」。
+
+**执行体过程账**：两个 worker **各撞一次 30 分钟硬顶**（`1800000ms`），靠「每里程碑 commit」保住了成果，
+用 `resume` 续同一份上下文接着跑（不是换 agent）；`resume` 前先核 `git status` 确认无第二个写者。
+镜像构建在开工时是坏的（#589 `@shared` 未拷进镜像，main 于 `04c7d83` 红）——已由 PR #594 修好，
+集成分支 merge `origin/main` 后才构建成功。
+
+**已知边界（未做，别当 bug）**：名册/账本仍无 TTL；`stale` 只做标记（门户不判死活、不改写名册，
+因为名册 `pid` 是容器内 PID）；`activity` 不覆盖「流式正文」（子 run 未开 `partialPersistence`）；
+跨会话/跨 FDE 的全局 agent 面板不做；子 run 的停止/steer 按钮不做（前台子 `cancel` 恒 `not_owned`）。

@@ -1685,7 +1685,7 @@ WHERE 仍是 `round BETWEEN from AND to`，范围外的结果行不会被搬进�
 鉴权同 `GET /api/sessions/:id`（`fetchSession` 同一个 404，不泄露存在性），再叠两层：**`runId` 必须属于该会话**（查 `runs` 表）、**`childRunId` 必须出现在该 parent 的名册里**（形状合法不等于存在）。`runId` 是**必填** query 参数（名册按父 run 分片，没有父身份就不知道该读哪个目录）。
 
 ```
-GET /api/sessions/:id/delegates?runId=<parentRunId>
+GET /api/sessions/:id/delegates?runId=<parentRunId>[&activity=1]
   → { "items": [ <DelegateItem> … ], "skipped": 0 }          // createdAt 升序
 GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
   → { "childRunId": "sub-…", "state": "completed", "messages": [ … ], "truncated": false, "totalTurns": 3 }
@@ -1706,6 +1706,28 @@ GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
 
 `skipped` = 被跳过的坏名册件数（JSON 解析失败 / 非对象 / `runId` 与文件名不符 / `state` 非字符串）。**一个坏文件不打成 500**：名册是普通 JSON 文件，而抽屉每 2s 轮询一次。名册目录不存在 ⇒ `{ "items": [], "skipped": 0 }`（**不是 404**：「还没派过子 run」与「刚点下 delegate、文件还没落」都是正常态）。原子写的临时件 `<id>.json.tmp-<pid>-<n>` 不算候选，也不计进 `skipped`。
 
+**`activity=1`（#593，可选）**：给每条 item 追加一个 `activity` 对象，回答「这个子 run **现在**在干啥」。**不带（或带 `0` / `true` / 其它任何值）时响应与上表逐字段相同**——`activity` 键根本不出现，也不读任何账本（判据：形状不变）。
+
+| 字段 | 类型 | 口径 |
+|---|---|---|
+| `at` | number \| null | 账本文件 `mtimeMs`（**写盘证据**，不是消息自己的 `ts`）。非活态子 / 账本还没落 ⇒ **不写这个键** |
+| `turns` | number \| null | 投影后的逻辑消息数；账本超上限或没落盘 ⇒ `null` |
+| `kind` | `'tool' \| 'text' \| 'tool_result' \| 'none'` | 最近一个可定性的动作：投影后**从后往前**扫，第一条能定性为动作的消息 |
+| `tool` / `args` | string | 仅 `kind='tool'`：工具名 / 参数摘要（各 ≤120 **码点**，超长末位 `…`） |
+| `text` | string | 仅 `kind ∈ {'text','tool_result'}`：正文片段（≤120 码点） |
+| `stale` | boolean | 父 run 已终态**而**子仍是活态 ⇒ `true`（语义见下） |
+
+成本与降级（每条都有判据）：
+
+- **只对活态子读账本**（`queued` / `running`）：终态子的终稿在名册 `resultText` 里，抽屉已能看全文 ⇒ 零文件动作。
+- **缓存键 = `(账本绝对路径, size, mtimeMs)`**：`stat` 没变就复用上次摘要，**零 `readFile`**。子 run 是逐消息追加（0.23「一条消息一落盘」）⇒ 2s 一轮里绝大多数命中缓存，稳态成本 ≈ N 次 `stat`。进程内 LRU（256 条 / TTL 5 min），丢失只意味着多读一次盘。
+- 账本 **> 8 MiB ⇒ 不读、不 413**：`{kind:'none', turns:null}`（与账本端点故意的差异：面板不是正文读取面，降级优于报错）。
+- **一条 SQL**：`activity=1` 走 `chat_sessions` × `users` × `runs` 一条 join（顺带取父 run 的 `status` 算 `stale`），不叠加 `resolveScope` 的三条查询。错误顺序仍是 **会话 404 → `runId` 形状 400 → `fde_name` 400 → 父 run 404**（越权的人不该从错误码读出「这个 session 存在」）。
+
+**`stale` 不是「门户判死」**：门户在宿主、名册里的 `pid` 在容器（两个 PID namespace），所以门户**不判死活、不改写名册**。`stale:true` 的真实成因是**后台子**：父 run 终态后 worker 200 ms 就 `process.exit(0)`（`runner/worker.js:1287`），嵌套的子 `runLoop` 随进程消失 ⇒ 引擎的 `finishRun` 永不执行 ⇒ 名册**永久**停在 `running`。前端据此画 ⚪ 且**不计入**活态数（D9 的「⚪ 不得渲染成绿」）。
+
+> 为什么要有这个参数而不是让前端自己读账本：面板每 2 s 一轮，前端逐个拉账本端点 = N 个请求 × 每次全量折叠投影（`foldLedgerRecords` → `projectTranscriptForDisplay`）；服务端一次 join + `stat` 缓存能把稳态成本压到「N 次 `stat` + 每 2 s 一条 SQL」。
+
 `messages[]` 是**与主对话同形**的 turn：上游 `projectTranscriptForDisplay` 的输出（`role`/`text`/`blocks`/`toolCalls`/`reasoning`/`round`/`ts`/`key`/`meta` 逐字透传，#95 红线）上叠四个宿主字段 `id`（`<childRunId>:<全量下标>`）/ `seq`（全量下标，所以向前翻页时同一条消息的 id 不漂移）/ `run_id`（= `childRunId`）/ `created_at`。⚠ `created_at` 是**轮行落盘时刻**（投影的 `ts` 读的是载体行），不是消息成型时刻，只当轮级时间戳用。
 
 **折叠与切尾的顺序（不得改）**：读全量行 → `portal/src/transcript-fold.js#foldLedgerRecords` → `projectTranscriptForDisplay` → **才** `slice(-tail)`。在原始行上切会把一轮切成半轮（`:msg:<round>:<seq>` 分片行与它的载体行分散在切界两侧），折叠拿到缺片的一轮 ⇒ 工具结果配不上对（#337 的老病根）。⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 的导出面**（实测 `undefined`，深引被包 `exports` 挡），所以用的是本站镜像——它正是 `runner/lib/store.js#load` 用的同一份口径（两份 `SHARED-FOLD-CORE` 逐字节对拍，AGENTS §8.52），也是上游读侧的**超集**（多一道 `partOf` 解链闸）。本站两条入口共用同一份 `planFold`：`session-view.js` 走 `foldTranscriptRows`（DB 行）、这里走 `foldLedgerRecords`（文件记录），不是两套规则。
@@ -1724,7 +1746,7 @@ GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
 | 账本文件不存在 | `404 not_found`，`details.reason='no_transcript'`（名册在、账本没落 ⇒ 前端给 `starting` / `no_transcript` 空态） |
 | 账本 > 8 MiB | `413 payload_too_large`，`details={size,max_bytes}`（**先 `stat` 再读**，超限一个字节都不进内存） |
 
-成本红线：`hasTranscript` 不读内容；名册目录不存在 ⇒ 零账本读；账本读取先 `stat` 判 8 MiB 上限（与 `session-partial-output` 的成本口径同族：单文件有上限，超了就 413 并提示）；账本里的坏行/空行（崩溃截断的最后一行是常态）跳过而不是 500。
+成本红线：`hasTranscript` 不读内容；名册目录不存在 ⇒ 零账本读；`activity=1` 的额外成本与降级见上（只读活态子、`(路径,size,mtime)` 缓存、8 MiB 降级、一条 join）；账本读取先 `stat` 判 8 MiB 上限（与 `session-partial-output` 的成本口径同族：单文件有上限，超了就 413 并提示）；账本里的坏行/空行（崩溃截断的最后一行是常态）跳过而不是 500。
 
 > **红线：`state` 是名册词汇（7 值：`queued` / `running` / `completed` / `failed` / `aborted` / `timeout` / `interrupted`），`termination` 才是引擎 reason。**
 > 引擎的 `TERMINATION_TO_STATE` 把未列出的一切判成 `failed`，而 P1 已把本站当正常收尾的 `no_tool` / `continuation_exhausted` 归一成 `end_turn` ⇒ 这类子在名册里是 `completed`。所以 **UI 分级以 `termination` 为准、过 `portal/frontend/src/lib/terminationReasons.ts`（`RUN_TERMINATION_SYSERR_REASONS`），不要只看 `state`**——只看 `state` 会把 `persistence_failed` / `final_guard_unverified` 这些该红的终态染成绿色。本模块只透传不归一（写侧的词汇封闭性是引擎的不变量，读侧拿它当过滤器只会藏掉真子 run）。
