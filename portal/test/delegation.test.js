@@ -12,7 +12,9 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';import {
   delegationRoot, rosterDir, transcriptPath, listDelegates, getDelegateTranscript,
-  DelegationError, DELEGATE_TRANSCRIPT_MAX_BYTES, ROSTER_STATES,
+  summarizeActivity, clearActivityCache, activityCacheSize,
+  DelegationError, DELEGATE_TRANSCRIPT_MAX_BYTES, DELEGATE_TAIL_DEFAULT, ROSTER_STATES,
+  ACTIVITY_SNIPPET_MAX_CHARS,
 } from '../src/delegation.js';
 import { foldLedgerRecords } from '../src/transcript-fold.js';
 import { projectTranscriptForDisplay } from 'erix-agent';
@@ -145,6 +147,9 @@ async function makeHarness({ roster = [], transcripts = {}, parentRunId = PARENT
   }
   const pool = new DelegationPool();
   const fsSpy = spyFs();
+  // activity 缓存是**进程级**模块状态（真实形态就应如此：2s 一轮的抽屉不会每个请求重建缓存）。
+  // 测试这边必须逐格清一遗：同一个 childRunId 在另一个临时目录里 size+mtime 碰巧相同就会跨用例命中。
+  clearActivityCache();
   const scope = { pool, userSpaceRoot, fsImpl: fsSpy, sessionId, parentRunId };
   return {
     ...scope,
@@ -165,14 +170,35 @@ class DelegationPool extends FakePool {
       { id: SESSION_B, user_id: USER_B.id, status: 'active' },
     ];
     this.runs = [
-      { id: PARENT_RUN, session_id: SESSION_A },
-      { id: PARENT_RUN_B, session_id: SESSION_B },
+      // `status` 只服务 `#593` 的 `activity.stale`（一条 join 顺带取父 run 状态）；既有格不读它。
+      { id: PARENT_RUN, session_id: SESSION_A, status: 'running' },
+      { id: PARENT_RUN_B, session_id: SESSION_B, status: 'running' },
     ];
     this.sqlLog = [];
   }
 
   async query(sql, params = []) {
     this.sqlLog.push(sql.replace(/\s+/g, ' ').trim());
+    // `#593` 的那一条 join（`chat_sessions × users × runs`）**必须抢在下面那条之前**：
+    // 它的文本里也带 `FROM chat_sessions s`，顺序写反就会被属主查询兼平成假绿。
+    if (sql.includes('AS run_status')) {
+      const s = this.chatSessions.find((x) => x.id === params[0]);
+      if (!s) return { rows: [] };
+      const u = this.users.find((x) => x.id === s.user_id && x.status === 'active');
+      const run = params[1] == null
+        ? null
+        : this.runs.find((r) => r.id === params[1] && r.session_id === s.id);
+      return {
+        rows: [{
+          id: s.id,
+          user_id: s.user_id,
+          status: s.status,
+          fde_name: u ? u.fde_name : null,
+          run_id: run ? run.id : null,
+          run_status: run ? run.status : null,
+        }],
+      };
+    }
     if (sql.includes('FROM chat_sessions s')) {
       const row = this.chatSessions.find((s) => s.id === params[0]);
       return { rows: row ? [{ ...row, project_id: null, cwd: '~/projects/p', title: '', title_source: 'auto', model: null, last_seq: 0 }] : [] };
@@ -767,4 +793,370 @@ test('H2 大写 id 归一化：路径参数与 query 参数经 decodeUuid 落小
       `/api/sessions/${SESSION_A}/delegates/${CHILD_1.toUpperCase()}?runId=${PARENT_RUN.toUpperCase()}`, h.cookie);
     assert.equal(res.status, 200, JSON.stringify(await res.json()));
   } finally { await h.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// I 组：`activity=1`（issue #593，设计 `delegation-activity-2026-11-16.md` §4.1 / §4.4 ③ / §5 判据 1-8）
+// 八格逐条对应设计里那八条；每格都写了「撤掉哪一行会红」。
+// ---------------------------------------------------------------------------
+
+/** 活态子的账本：末轮 = 一条 assistant（正文 + 3 个工具调用），3 个 tool_result 用**链式 partOf** 分片落盘。 */
+function partOfActivityLedger(runId) {
+  const k = (n) => `${runId}:msg:1:${n}`;
+  return [
+    JSON.stringify({
+      round: 0, roundKey: `${runId}:round:0`, dedupKey: `${runId}:engine:round:0:seed`,
+      ts: '2026-11-16T10:00:00.000Z',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '跑一遍测试并整理结论' }] }],
+    }),
+    JSON.stringify({
+      round: 1, kind: 'message', seq: 0, dedupKey: k(0), roundKey: `${runId}:round:1`,
+      ts: '2026-11-16T10:00:01.000Z',
+      messages: [{
+        role: 'assistant',
+        content: [
+          { type: 'text', text: '先看两个文件再跑测试' },
+          { type: 'tool_use', id: 't1', name: 'readFile', input: { path: 'a.md' } },
+          { type: 'tool_use', id: 't2', name: 'readFile', input: { path: 'b.md' } },
+          { type: 'tool_use', id: 't3', name: 'shell', input: { command: 'npm test' } },
+        ],
+      }],
+    }),
+    JSON.stringify({
+      round: 1, kind: 'message', seq: 1, dedupKey: k(1), roundKey: `${runId}:round:1`,
+      ts: '2026-11-16T10:00:02.000Z',
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'A 内容' }] }],
+    }),
+    // ⚠ 0.23 写侧的 partOf 是**链**（第 3 片指第 2 片）：不走折叠链就拿不到这条聚合结果
+    JSON.stringify({
+      round: 1, kind: 'message', seq: 2, dedupKey: k(2), partOf: k(1), roundKey: `${runId}:round:1`,
+      ts: '2026-11-16T10:00:03.000Z',
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'B 内容' }] }],
+    }),
+    JSON.stringify({
+      round: 1, kind: 'message', seq: 3, dedupKey: k(3), partOf: k(2), roundKey: `${runId}:round:1`,
+      ts: '2026-11-16T10:00:04.000Z',
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't3', content: '2678 tests passed' }] }],
+    }),
+    JSON.stringify({
+      round: 1, roundKey: `${runId}:round:1`, dedupKey: `${runId}:engine:round:1`,
+      ts: '2026-11-16T10:00:05.000Z', response: { content: [], stopReason: 'tool_use' }, toolUses: 3,
+    }),
+  ];
+}
+
+/** 只有一条 assistant 正文的账本（`kind:'text'` 那一格）。 */
+function textOnlyLedger(runId) {
+  return [
+    JSON.stringify({
+      round: 0, roundKey: `${runId}:round:0`, dedupKey: `${runId}:engine:round:0:seed`,
+      ts: '2026-11-16T10:00:00.000Z',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '说句话' }] }],
+    }),
+    JSON.stringify({
+      round: 1, kind: 'message', seq: 0, dedupKey: `${runId}:msg:1:0`, roundKey: `${runId}:round:1`,
+      ts: '2026-11-16T10:00:01.000Z',
+      messages: [{ role: 'assistant', content: [{ type: 'text', text: '正在整理结论…' }] }],
+    }),
+    JSON.stringify({
+      round: 1, roundKey: `${runId}:round:1`, dedupKey: `${runId}:engine:round:1`,
+      ts: '2026-11-16T10:00:02.000Z', response: { content: [], stopReason: 'end_turn' },
+    }),
+  ];
+}
+
+/** 账本 .jsonl 上的读面（`stat` / `readFile`），`existsSync` 不算（它是 `hasTranscript` 唯一允许的动作）。 */
+const ledgerOps = (calls) => calls.filter(([op, p]) => p.endsWith('.jsonl') && (op === 'stat' || op === 'readFile'));
+const ledgerReads = (calls) => calls.filter(([op, p]) => p.endsWith('.jsonl') && op === 'readFile');
+
+test('I1 判据1 不带 activity ⇒ items 逐字段与今天相同、`activity` 键不存在；带了才多这一个键', async () => {
+  const h = await makeHarness({
+    roster: [
+      [CHILD_1, rosterRecord({ childRunId: CHILD_1, createdAt: 1_000, state: 'running', endedAt: undefined })],
+      [CHILD_2, rosterRecord({ childRunId: CHILD_2, createdAt: 2_000, state: 'completed' })],
+    ],
+    transcripts: { [CHILD_1]: partOfActivityLedger(CHILD_1), [CHILD_2]: textOnlyLedger(CHILD_2) },
+  });
+  try {
+    const WHITE_LIST = [
+      'childRunId', 'createdAt', 'cwd', 'endedAt', 'errorMessage', 'hasTranscript', 'model',
+      'resultTruncated', 'state', 'termination', 'updatedAt',
+    ].sort();
+    // ① 不带：形状与今天逐字段相同，`activity` 一格都不许多（变异「无条件给每条加 activity」⇒ 这里红）
+    const plain = await callList(h);
+    assert.deepEqual(Object.keys(plain).sort(), ['items', 'skipped']);
+    for (const item of plain.items) {
+      assert.deepEqual(Object.keys(item).sort(), WHITE_LIST, `白名单外的键进了响应：${JSON.stringify(item)}`);
+      assert.ok(!('activity' in item), `不带 activity=1 却多了 activity 键：${JSON.stringify(item)}`);
+    }
+    assert.ok(!JSON.stringify(plain).includes('"activity"'));
+    assert.deepEqual(ledgerReads(h.fsSpy.calls), [], '不带 activity ⇒ 一个账本都不许读（成本口径与今天相同）');
+
+    // ② 带了：白名单**减去**原样 + 只多 `activity` 这一个键，其余一格不少（DTO 白名单不变）
+    clearActivityCache();
+    const withAct = await callList(h, { activity: true });
+    assert.deepEqual(Object.keys(withAct).sort(), ['items', 'skipped']);
+    for (const item of withAct.items) {
+      assert.deepEqual(Object.keys(item).sort(), [...WHITE_LIST, 'activity'].sort());
+    }
+    // 活态那一条拿到了摘要，终态那一条没读盘（I2 管计数，这里只管形状）
+    assert.equal(withAct.items[0].activity.kind, 'tool');
+    assert.equal(withAct.items[1].activity.kind, 'none');
+    // ③ 除 `activity` 外两条响应逐字段相同（「不改变现有响应形状」的可执行形式）
+    const stripped = withAct.items.map(({ activity, ...rest }) => rest); // eslint-disable-line no-unused-vars
+    assert.deepEqual(stripped, plain.items);
+  } finally { h.cleanup(); }
+});
+
+test('I2 判据2 只对活态子读账本：终态子 stat/readFile 全 0（撤掉 state 闸 ⇒ 红）', async () => {
+  const h = await makeHarness({
+    roster: [
+      [CHILD_1, rosterRecord({ childRunId: CHILD_1, createdAt: 1_000, state: 'running' })],
+      [CHILD_2, rosterRecord({ childRunId: CHILD_2, createdAt: 2_000, state: 'completed' })],
+    ],
+    transcripts: { [CHILD_1]: partOfActivityLedger(CHILD_1), [CHILD_2]: textOnlyLedger(CHILD_2) },
+  });
+  try {
+    const res = await callList(h, { activity: true });
+    const ops = ledgerOps(h.fsSpy.calls);
+    assert.ok(ops.every(([ , p]) => p.includes(CHILD_1)), `终态子的账本被碰了：${JSON.stringify(ops)}`);
+    assert.equal(new Set(ops.map(([, p]) => p)).size, 1, '只有活态那一个文件上过');
+    assert.equal(ledgerReads(h.fsSpy.calls).length, 1, '活态子读一次，终态子零读');
+    assert.equal(res.items[1].state, 'completed');
+    // 终态子的 activity：**没 stat 就没写盘证据** ⇒ `at` 不写（「不给的字段不写」），turns 也不能编
+    assert.deepEqual(res.items[1].activity, { kind: 'none', turns: null, stale: false });
+    assert.ok(!('at' in res.items[1].activity), '没读盘就不许给 at（写盘证据只能来自 stat）');
+  } finally { h.cleanup(); }
+});
+
+test('I3 判据3 缓存命中：同 (size,mtime) 第二次 readFile = 0 且 activity 相同；clearActivityCache 后又读（变异「去掉缓存」⇒ 红）', async () => {
+  const h = await makeHarness({
+    roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'running' })]],
+    transcripts: { [CHILD_1]: partOfActivityLedger(CHILD_1) },
+  });
+  try {
+    assert.equal(activityCacheSize(), 0, 'harness 必须把进程级缓存清干净（跨用例命中 = 假绿）');
+    const first = await callList(h, { activity: true });
+    const readsAfterFirst = ledgerReads(h.fsSpy.calls).length;
+    assert.equal(readsAfterFirst, 1, '第一发必须真读一次');
+    assert.ok(activityCacheSize() >= 1, '读完要落缓存');
+
+    const second = await callList(h, { activity: true });
+    assert.equal(ledgerReads(h.fsSpy.calls).length, readsAfterFirst, '第二发缓存命中 ⇒ 零 readFile');
+    assert.deepEqual(second.items[0].activity, first.items[0].activity);
+    // 命中仍要 stat（键就是 (size,mtime)，不 stat 就不知道变没变）：稳态成本 = N 次 stat
+    assert.ok(ledgerOps(h.fsSpy.calls).some(([op]) => op === 'stat'));
+
+    // 显式清理口存在且真的清了：否则「可注入清理」这条是空的
+    clearActivityCache();
+    assert.equal(activityCacheSize(), 0);
+    await callList(h, { activity: true });
+    assert.equal(ledgerReads(h.fsSpy.calls).length, readsAfterFirst + 1, '清完缓存要回落到真读');
+  } finally { h.cleanup(); }
+});
+
+test('I4 判据4 账本 > 8MiB ⇒ 不读、kind:none、不 413 也不 500（抽屉那条才 413）', async () => {
+  const h = await makeHarness({
+    roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'running' })]],
+    transcripts: { [CHILD_1]: [] },
+  });
+  try {
+    await fsp.truncate(path.join(h.root, 'transcripts', `${CHILD_1}.jsonl`),
+      DELEGATE_TRANSCRIPT_MAX_BYTES + 1024 * 1024);
+    const res = await callList(h, { activity: true }); // 不许抛：降级而不是打故障
+    assert.equal(res.items.length, 1);
+    assert.deepEqual(res.items[0].activity, {
+      at: res.items[0].activity.at, kind: 'none', turns: null, stale: false,
+    });
+    assert.ok(Number.isFinite(res.items[0].activity.at), 'at 来自 stat，超限也拿得到');
+    assert.equal(ledgerReads(h.fsSpy.calls).length, 0, '超限的文件一个字节都不许读进内存');
+    assert.equal(ledgerOps(h.fsSpy.calls).length, 1, '判大小只花一次 stat');
+  } finally { h.cleanup(); }
+});
+
+test('I5 判据5 越权先于形状：非属主 + 非法 runId ⇒ 404 session not found（先校验 runId 就红）', async () => {
+  const h = await makeHarness({ roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1 })]] });
+  try {
+    // 越权 + 形状非法同时成立 ⇒ 只能是 404（400 会把「这个 session 存在」泄露给外人）
+    await expectDelegationError(
+      listDelegates({ ...h, userId: USER_B.id, parentRunId: 'not-a-uuid', activity: true }),
+      { code: 'not_found', httpStatus: 404 },
+    );
+    // 反面对照：属主本人形状非法 ⇒ 仍然 400（不是被兼平成 404）
+    await expectDelegationError(
+      callList(h, { parentRunId: '../../etc', activity: true }),
+      { code: 'validation_failed', httpStatus: 400, details: { field: 'runId' } },
+    );
+    assert.deepEqual(h.fsSpy.calls, [], '两条路都不该读一个文件');
+  } finally { h.cleanup(); }
+});
+
+test('I6 判据6 activity=1 只发一条 SQL（复用 resolveScope 的三连 ⇒ 红）', async () => {
+  const h = await makeHarness({ roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'running' })]] });
+  try {
+    await callList(h, { activity: true });
+    assert.equal(h.pool.sqlLog.length, 1, `一条 join 必须够拿齐 属主+fde_name+父run状态：${JSON.stringify(h.pool.sqlLog)}`);
+    const sql = h.pool.sqlLog[0];
+    for (const table of ['chat_sessions', 'users', 'runs']) {
+      assert.ok(sql.includes(table), `那条 join 少了 ${table}：${sql}`);
+    }
+  } finally { h.cleanup(); }
+
+  // 对照：不带 activity 走原路（3 条）——这条断言只为「我没顺手改基端点」作证
+  const base = await makeHarness({ roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1 })]] });
+  try {
+    await callList(base);
+    assert.equal(base.pool.sqlLog.length, 3);
+  } finally { base.cleanup(); }
+});
+
+test('I7 判据7 stale：父 run 终态 + 子活态 ⇒ true；父活态 ⇒ false；且**不进缓存**（恒 false ⇒ 红）', async () => {
+  const h = await makeHarness({
+    roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'running' })]],
+    transcripts: { [CHILD_1]: partOfActivityLedger(CHILD_1) },
+  });
+  try {
+    h.pool.runs.find((r) => r.id === PARENT_RUN).status = 'running';
+    const live = await callList(h, { activity: true });
+    assert.equal(live.items[0].activity.stale, false, '父 run 还在跑 ⇒ 不许标 stale');
+
+    h.pool.runs.find((r) => r.id === PARENT_RUN).status = 'finished';
+    // 账本一个字节没变 ⇒ 这一发**必然**命中缓存；stale 若被缓存过，这里就会假绿成 false
+    const done = await callList(h, { activity: true });
+    assert.equal(done.items[0].activity.stale, true, '父终态 + 子还写着 running ⇒ stale（设计 §4.4 ③）');
+    assert.equal(ledgerReads(h.fsSpy.calls).length, 1, 'stale 翻转不该多花一次账本读');
+    assert.equal(done.items[0].activity.kind, live.items[0].activity.kind, '除 stale 外摘要不变');
+
+    h.pool.runs.find((r) => r.id === PARENT_RUN).status = 'failed';
+    const failed = await callList(h, { activity: true });
+    assert.equal(failed.items[0].activity.stale, true, 'failed 也是终态');
+  } finally { h.cleanup(); }
+});
+
+test('I8 判据8 summarizeActivity：tool / text / none 三格 + 120 字上限 + partOf 夹具钉住折叠链', async () => {
+  // 三格（纯函数，不碰盘）：**不给的字段不写**
+  assert.deepEqual(summarizeActivity([]), { turns: 0, kind: 'none' });
+  assert.deepEqual(
+    summarizeActivity([{ role: 'assistant', text: '', toolCalls: [{ name: 'shell', argsSummary: 'command=npm test' }] }]),
+    { turns: 1, kind: 'tool', tool: 'shell', args: 'command=npm test' },
+  );
+  assert.deepEqual(summarizeActivity([{ role: 'user', text: '任务' }, { role: 'assistant', text: '正在整理结论…' }]),
+    { turns: 2, kind: 'text', text: '正在整理结论…' });
+  // 一轮多工具 ⇒ 取**最后一个带 argsSummary 的**（那才是「刚在做的那一步」）；user 消息不算动作
+  assert.deepEqual(
+    summarizeActivity([
+      { role: 'user', text: '任务' },
+      { role: 'assistant', text: '先看', toolCalls: [{ name: 'a', argsSummary: 'x' }, { name: 'b' }] },
+    ]),
+    { turns: 2, kind: 'tool', tool: 'a', args: 'x' },
+  );
+  // 上限：120 码点 + 末位 `…`；按码点数（emoji 不会被切半）
+  const long = summarizeActivity([{ role: 'assistant', text: '汉'.repeat(200) }]);
+  assert.equal(Array.from(long.text).length, ACTIVITY_SNIPPET_MAX_CHARS + 1);
+  assert.ok(long.text.endsWith('…'));
+  const emoji = summarizeActivity([{ role: 'assistant', text: '😀'.repeat(200) }]);
+  assert.equal(Array.from(emoji.text).length, ACTIVITY_SNIPPET_MAX_CHARS + 1, '120 个 emoji + 省略号');
+  assert.ok(!/[\uD800-\uDBFF]$/.test(emoji.text), '末位是落单高位代理 = 代理对被切半 = 乱码');
+
+  // 端点那一格：**partOf 分片链夹具** ⇒ 必须走 foldLedgerRecords → projectTranscriptForDisplay
+  const h = await makeHarness({
+    roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'running' })]],
+    transcripts: { [CHILD_1]: partOfActivityLedger(CHILD_1) },
+  });
+  try {
+    const res = await callList(h, { activity: true });
+    assert.deepEqual(res.items[0].activity, {
+      at: res.items[0].activity.at,
+      turns: 2,                        // 折叠后的**逻辑消息**数（1 seed + 1 assistant），不是原始行数
+      kind: 'tool',
+      tool: 'shell',                   // 最后一个带 argsSummary 的调用
+      args: 'command=npm test',        // 来自折叠后的 argsSummary，不是原始 input 行
+      stale: false,
+    });
+    // 「与抽屉同源」不是嘴上说的：turns 必须等于抽屉的 totalTurns
+    const drawer = await callTranscript(h, CHILD_1);
+    assert.equal(res.items[0].activity.turns, drawer.totalTurns, 'activity 与抽屉的折叠口径必须同一份');
+    assert.deepEqual(drawer.messages[1].toolCalls.map((c) => c.resultPreview), ['A 内容', 'B 内容', '2678 tests passed']);
+  } finally { h.cleanup(); }
+
+  // `kind:'text'` 那一格走真账本（assistant 只有正文）
+  const t = await makeHarness({
+    roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'queued' })]],
+    transcripts: { [CHILD_1]: textOnlyLedger(CHILD_1) },
+  });
+  try {
+    const res = await callList(t, { activity: true });
+    assert.deepEqual(res.items[0].activity, {
+      at: res.items[0].activity.at, turns: 2, kind: 'text', text: '正在整理结论…', stale: false,
+    });
+  } finally { t.cleanup(); }
+
+  // `kind:'none'` 那一格：账本在但空的（子刚起、还没落正文）
+  const e = await makeHarness({
+    roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'queued' })]],
+    transcripts: { [CHILD_1]: [] },
+  });
+  try {
+    const res = await callList(e, { activity: true });
+    assert.equal(res.items[0].activity.kind, 'none');
+    assert.equal(res.items[0].activity.turns, 0);
+    assert.ok(!('tool' in res.items[0].activity) && !('text' in res.items[0].activity));
+  } finally { e.cleanup(); }
+});
+
+test('I9 判据1 端点面：query `activity` **只认字符串 1**（0/true/yes/空/缺席 ⇒ 与不带逐字相同）', async () => {
+  const h = await startHttp();
+  try {
+    await seedFiles(h.userSpaceRoot, 'alice', {
+      roster: { [CHILD_1]: rosterRecord({ childRunId: CHILD_1, state: 'running' }) },
+      transcripts: { [CHILD_1]: partOfActivityLedger(CHILD_1) },
+    });
+    const base = await (await h.get(`/api/sessions/${SESSION_A}/delegates?runId=${PARENT_RUN}`, h.cookie)).json();
+    assert.ok(!('activity' in base.items[0]), JSON.stringify(base.items[0]));
+    for (const q of ['', '&activity=0', '&activity=true', '&activity=yes', '&activity=']) {
+      const res = await h.get(`/api/sessions/${SESSION_A}/delegates?runId=${PARENT_RUN}${q}`, h.cookie);
+      assert.equal(res.status, 200, q);
+      assert.deepEqual(await res.json(), base, `activity=${JSON.stringify(q)} 被当成了开启`);
+    }
+    const on = await h.get(`/api/sessions/${SESSION_A}/delegates?runId=${PARENT_RUN}&activity=1`, h.cookie);
+    assert.equal(on.status, 200);
+    const onBody = await on.json();
+    assert.equal(onBody.items[0].activity.kind, 'tool');
+    assert.equal(onBody.items[0].activity.stale, false);
+  } finally { await h.close(); }
+});
+
+test('I10 判据5/6 端点面：activity=1 的越权仍是 404 不泄露存在性；runId 必填不变', async () => {
+  const h = await startHttp();
+  try {
+    await seedFiles(h.userSpaceRoot, 'alice', {
+      roster: { [CHILD_1]: rosterRecord({ childRunId: CHILD_1, state: 'running' }) },
+      transcripts: { [CHILD_1]: partOfActivityLedger(CHILD_1) },
+    });
+    const cross = await h.get(`/api/sessions/${SESSION_B}/delegates?runId=${PARENT_RUN}&activity=1`, h.cookie);
+    const missing = await h.get(`/api/sessions/${MISSING_SESSION}/delegates?runId=${PARENT_RUN}&activity=1`, h.cookie);
+    assert.equal(cross.status, 404);
+    assert.deepEqual(await cross.json(), await missing.json(), '越权与不存在的响应体必须逐字相同');
+
+    const badShape = await h.get(`/api/sessions/${SESSION_A}/delegates?runId=../../etc&activity=1`, h.cookie);
+    assert.equal(badShape.status, 400);
+    assert.deepEqual((await badShape.json()).error.details, { field: 'runId' });
+
+    const noRun = await h.get(`/api/sessions/${SESSION_A}/delegates?activity=1`, h.cookie);
+    assert.equal(noRun.status, 400);
+    assert.deepEqual((await noRun.json()).error.details, { field: 'runId' });
+  } finally { await h.close(); }
+});
+
+test('I11 activity 的读面只有 .jsonl 的 stat+readFile（不新增别的盘动作、不写盘）', async () => {
+  const h = await makeHarness({
+    roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'running' })]],
+    transcripts: { [CHILD_1]: partOfActivityLedger(CHILD_1) },
+  });
+  try {
+    await callList(h, { activity: true });
+    const ops = [...new Set(h.fsSpy.calls.filter(([ , p]) => p.endsWith('.jsonl')).map(([op]) => op))].sort();
+    assert.deepEqual(ops, ['existsSync', 'readFile', 'stat'],
+      `activity 只许在 .jsonl 上加 stat+readFile（existsSync 是 hasTranscript 的既有动作）：${JSON.stringify(ops)}`);
+  } finally { h.cleanup(); }
 });
