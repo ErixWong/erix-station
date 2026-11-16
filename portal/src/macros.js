@@ -417,7 +417,9 @@ async function countTemplateNotifications(client, templateId) {
     `SELECT column_name FROM information_schema.columns
       WHERE table_schema = 'public' AND table_name = 'notifications'
         AND column_name = ANY($1::text[])`,
-    [NOTIFICATION_REF_COLUMNS],
+    // ⚠ 探测集必须**含** `macro_run_id`：探测只拉直连列时，间接列判定永远拿不到候选
+    // ⇒ 软删计数永远是 0（本行就是那条 bug 的回归位）。
+    [[...NOTIFICATION_REF_COLUMNS, NOTIFICATION_RUN_REF_COLUMN]], // 外层是 pg params 位，内层是 SQL 里的 text[]
   );
   const column = cols.rows.map((r) => r.column_name)
     .find((c) => NOTIFICATION_REF_COLUMNS.includes(c));
