@@ -8196,6 +8196,13 @@ commit **一致**）。dev 栈改 pin 该 digest（`deploy/.env:72`，备份 `/t
   `v0.1.70` 保留为「产品代码与 0.1.71 相同、但树里缺 e2e 脚本」的历史点，`latest` 由 0.1.71 重新指向。
 - 从 main 切 `v0.1.71`（三处版本号对齐 + 本条台账）。
 
+**结果（实测，不是承诺）**：main `f50dd4b`（CI 双绿）→ tag `v0.1.71` → release run `43917810893` success
+→ portal digest `sha256:22644c7d…`。发布镜像四格实测
+`0.1.71 / engine 0.33.0 / revision f50dd4b / built_at 2026-11-16T17:23:26Z`（revision = tag 指向的 commit）；
+镜像里确实带上了 #603 的交付物（`/app/portal/integration/version-surface-e2e.mjs`，42,887 字节）。
+dev 栈 pin 换成该 digest（`deploy/.env:72`，备份 `/tmp/deploy-env.bak71.*`）后
+`E2E_UI=1 npm run test:integration:version` ⇒ **5/5 rc=0**（A1/A2/A3/C1/U1 全跑，截图 157,068 字节、8 台 FDE）。
+
 **两版之间没有产品代码差异**（`git diff --stat v0.1.70..main` 只有 `portal/integration/version-surface-e2e.mjs`
 + 一条 npm script + 两篇设计文档 + 台账）⇒ 这不是「修 bug 的版本」，是**让 tag 追上验过的树**。
 
