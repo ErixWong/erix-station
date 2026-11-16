@@ -7427,3 +7427,53 @@ rebase 后 69/69 全绿（含 upload-settings 那支）。
 
 **变异读数**（锚点先数过：`grep -c '↳ {{ foldedToolResult(tc) }}' StreamPanel.vue` = **1**；备份放
 `/tmp/StreamPanel.vue.bak-563`，还原用 `cp` 回来，**没用 `git checkout --`**——那文件上压着本格未提交的编辑）：
+
+### 8.144 事件平台 W4a/W4b 落地：审查快照与隔离 + 判决与生命周期（#537/#538，2026-11-16，主 agent + erix_run）
+
+接 §8.142。**W4a 与 W4b 已合并进 main**，事件平台的实现单只剩 W7（#536）。
+
+| 单 | PR | 合并 | 轮数 |
+|---|---|---|---|
+| W4a 快照与隔离（#537） | #568 | `15d2b2d` | 43 + 堵逃逸 54 |
+| W4b 判决与生命周期（#538） | #573 | `3ee580c` | 107 |
+
+**W4a**：`portal/src/macro-snapshot.js`（快照搬运 / 内容级一致性 / 7 个失败 reason / 孤儿清扫）、
+`runner/lib/review-tools.js`（只读三件套白名单）、`runner/worker.js` 两处装配点。
+无新迁移（`snapshot_id`/`worktree_path` 已在 0035）。
+
+两个设计上必须记住的点：
+① **`git worktree add` 只 checkout 已提交内容，看不到未提交改动** —— 而那正是本功能最主要的
+审查对象 ⇒ 必须 `git diff HEAD --binary` + `git apply` 补进去，未跟踪文件另走 `tar --null -T -`；
+② **`mtimeMs` 记录但不进 digest** —— 搬运前（原目录）与搬运后（worktree）mtime 永远不等，
+进 digest 会让每次都被判 `snapshot_unstable`。
+
+**主 agent 抓到的真逃逸（这是本批最硬的一条）**：`reviewOnly` 一开始只挡住了两处装配点
+（`worker.js:665-666` registry、`:695-697` `baseToolSchemas`），**没挡住 `executeTool` 的三条旁路**：
+
+| 旁路 | 后果 |
+|---|---|
+| `delegate` 创建分支 `if (delegateEnabled)` **不看 `reviewOnly`** | 子 run 的 `childTools: [...fileTools.schemas, ...shellTools.schemas]` **自带 shell** ⇒ 审查 run 只要环境有 `ERIX_DELEGATE=1`，就能 `delegate("跑 shell 把 ~/projects/foo 读出来")` 逃出 worktree |
+| `note_*` 路由 | 契约要求「不给 note」，但执行侧没挡（只靠「模型看不到」） |
+| `skillTools` 路由 | 技能可自带写/执行能力，不确定 ⇒ 宁严勿宽一并挡 |
+
+⇒ 口径：**「只读面」不是「把 schema 过滤掉」就够了**。凡是 `executeTool` 里按名字分流的旁路
+（delegate / note / skill / 未来新增的），**每一条都要单独过一遍只读闸** ——
+模型看不到 ≠ 调不到，而旁路往往会带出自己的工具面（子 run 的 `childTools` 就是明证）。
+
+**W4b**：`portal/src/macro-review.js`（工作包 ≤8KB / 首行判决 fail closed / 回灌 / 五个失败出口 /
+`until` 到期闸）。无新迁移（`verdict`/`verdict_raw`/`reason`/`remediation_text`/`depth` 已在 0035）。
+
+三个刻意的口径：
+① **首行判决锚定完整匹配且不 trim 左端**（` 结论：通过` 是非法首行）；`includes` 式匹配会把
+正文里偶然出现的「结论：通过」当判决 ⇒ 已写成变异靶子（去掉 `^…$` ⇒ `not ok 2/8` 红）；
+② **回灌 409 `run_in_progress` 是 `skipped`+`deferred`+保留原判决**，不是 `failed` ——
+审查已经判出来了，只是送不进去；而超时/LLM 失败/快照失败/首行非法才是 `failed` 或
+`done`+`unclassified`，它们是「**没判成**」不是「**判成没过**」；
+③ **判据不查 `messages.content`**，走 `getSession` 的投影正文（普通用户消息 `content` 写空串、
+正文在 `transcript_rounds`）—— 只查裸 `content` 会假绿。
+
+**本批变异总数 17 个**（W1 两个、W1 回修五个、W2 三个、W3 六个、W4a 三个、W4b 三个），全部命中。
+⇒ **口径固化：每个交付单收尾必须逐条拆闸跑变异并贴 `not ok N`；报「测试全绿」不构成验收。**
+本轮唯一没被变异抓住的是 W2 的 UTC+8 日界（已补两条用例），这说明变异还能反过来当**测试缺口探测器**用。
+
+**待办**：W7（#536，在跑）、W5/W6（前端面板与铃铛）。
