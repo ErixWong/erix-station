@@ -18,7 +18,7 @@
 提示词版本历史。只读那 4 条在页面上**只列位置与生效路径，不显示全文** —— portal 镜像不含 `runner/`
 （`portal/Dockerfile` 只有 `COPY portal/ portal/`），portal 运行时读不到，显示全文就是撒谎。
 
-## 2. 数据模型（迁移 `deploy/migrations/0039-platform-prompts.sql`）
+## 2. 数据模型（迁移 `deploy/migrations/0040-platform-prompts.sql`）
 
 单行表，形状与理由照 0036（`upload_settings`）：`id int PK DEFAULT 1 CHECK (id = 1)` 把「只能有一行」写成 DB 事实。
 
@@ -121,7 +121,7 @@ DTO 里 `effectiveText` 仍用示例名 `example` 渲染（那是给人看的预
   `portal/test/materializer.test.js` 对**默认渲染**的断言一条都不许改（那是防漂移，不是装饰）。
 - 覆写模式下那 8 条要求链是管理员自己写的 ⇒ 内置模板的 8 条断言只在默认模式生效（测试要覆盖两种模式）。
 
-## 6. API 契约（写进 `docs/api/portal.md` 新 §4.16）
+## 6. API 契约（写进 `docs/api/portal.md` 新 §4.18）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|

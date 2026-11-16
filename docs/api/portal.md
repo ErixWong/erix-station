@@ -61,10 +61,10 @@
 | 管理 | `GET /api/admin/upload/settings` | **单文件上传上限：读**（#485 片 A，§4.15）。回的是**当前生效值** + **来源**（`db`/`env`/`default`）+ 允许区间；表不存在/读失败也回 `200`（不是 500）|
 | 管理 | `GET /api/admin/version` | **版本三格（「关于」面板）**（#586，§4.16）。只读：服务端 / 平台侧引擎 / 每台 FDE，三段各自标来源；不新增错误码 |
 | 管理 | `PUT /api/admin/upload/settings` | **单文件上传上限：写**（#485 片 A，§4.15）。`{maxFileBytes}` 必须是 `1 MiB`–`1 GiB` 的 JSON 整数，否则 `400 validation_failed` 且**不落库**；**下一次上传就生效**（无缓存 ⇒ 不需重启，也不需失效任何东西）|
-| 管理 | `GET /api/admin/prompts` | **平台提示词：读**（#596 片 A，§4.16）。三块（`~/AGENTS.md` 追加段 / 整段覆写 / 会话标题 system）的当前值 + 生效全文 + 字节预算 + 只读清单；**表不存在 / 读失败也回 `200`**（回落内置提示词，不是 500）|
-| 管理 | `PUT /api/admin/prompts/addendum` | **平台补充约定：写**（#596 片 A，§4.16）。`{text}`（`""` = 清空那一节）≤ 8192 字节，且**渲染后的整份 `~/AGENTS.md`** 必须 ≤ 16384 字节，否则 `400 validation_failed` 且**一条写语句都不发**；成功回完整 GET DTO + `materializeEnqueued` ⇒ **该工位下一次 run 生效** |
-| 管理 | `PUT /api/admin/prompts/agents-md` | **平台约定整段覆写：写**（#596 片 A，§4.16）。`{text}`（`""` = 恢复内置模板）≤ 16384 字节 + 同一条渲染闸；生效时机同上 |
-| 管理 | `PUT /api/admin/prompts/title-prompt` | **会话标题提示词：写**（#596 片 A，§4.16）。`{text}`（`""` = 用内置默认）≤ 2000 字节；**不涉物化**（`materializeEnqueued` 恒 `0`）⇒ **下一次改名就生效** |
+| 管理 | `GET /api/admin/prompts` | **平台提示词：读**（#596 片 A，§4.18）。三块（`~/AGENTS.md` 追加段 / 整段覆写 / 会话标题 system）的当前值 + 生效全文 + 字节预算 + 只读清单；**表不存在 / 读失败也回 `200`**（回落内置提示词，不是 500）|
+| 管理 | `PUT /api/admin/prompts/addendum` | **平台补充约定：写**（#596 片 A，§4.18）。`{text}`（`""` = 清空那一节）≤ 8192 字节，且**渲染后的整份 `~/AGENTS.md`** 必须 ≤ 16384 字节，否则 `400 validation_failed` 且**一条写语句都不发**；成功回完整 GET DTO + `materializeEnqueued` ⇒ **该工位下一次 run 生效** |
+| 管理 | `PUT /api/admin/prompts/agents-md` | **平台约定整段覆写：写**（#596 片 A，§4.18）。`{text}`（`""` = 恢复内置模板）≤ 16384 字节 + 同一条渲染闸；生效时机同上 |
+| 管理 | `PUT /api/admin/prompts/title-prompt` | **会话标题提示词：写**（#596 片 A，§4.18）。`{text}`（`""` = 用内置默认）≤ 2000 字节；**不涉物化**（`materializeEnqueued` 恒 `0`）⇒ **下一次改名就生效** |
 | 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
 | 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
 | 管理 | `POST /api/admin/tls/inspect` | **解析但不落盘**（#456 M2，§4.13-3a）：`{certPem,keyPem?}` → 证书元数据 + `keyMatches` 三态 + 覆盖判定 + `warnings`。**零副作用**（不写盘/DB/审计、不动 `tlsLive`、不烧上传配额）；每管理员 120 次/小时 |
@@ -3018,11 +3018,11 @@ Content-Type: application/json
 
 ---
 
-### 4.16 管理台提示词面板（`/api/admin/prompts`，issue #596 片 A）
+### 4.18 管理台提示词面板（`/api/admin/prompts`，issue #596 片 A）
 
 **一句话**：平台对 agent 说的三句话（`~/AGENTS.md` 的**补充约定**、`~/AGENTS.md` 的**整段覆写**、
 **会话标题的 system**）从「改 `portal/src/materializer.js` + 重建 station-portal 镜像」变成
-「管理台改一行 ⇒ 下一次 run / 下一次改名生效」。真相在 `platform_prompts`（迁移 `0039`，单行表）。
+「管理台改一行 ⇒ 下一次 run / 下一次改名生效」。真相在 `platform_prompts`（迁移 `0040`，单行表）。
 契约（为什么这么设计）见 `docs/design/admin-prompts-panel-2026-11-16.md` §2–§8；本节是 API 口径。
 
 **`""` 就是「跟随内置」**（三列同语义，DB 里不出现 `NULL`）：读侧因此**不需要**区分「没配」与
@@ -3041,7 +3041,7 @@ Content-Type: application/json
 （没东西可失效）。表不存在 / 读失败 / 读超时 ⇒ **回落内置**（`reason` 见下），**永不 500**：
 配置面坏了不能让物化与改名挂掉。
 
-#### 4.16-1 `GET /api/admin/prompts`
+#### 4.18-1 `GET /api/admin/prompts`
 
 `200`（**表不存在 / DB 读失败 / 读超时也是 200**）：
 
@@ -3068,7 +3068,7 @@ Content-Type: application/json
 | `addendum.text` / `agentsMd.override` / `titlePrompt.text` | DB 里的当前值（`""` = 跟随内置）。读侧**不做长度校验**：手工 `UPDATE` 进来的超长值**照用**（换成内置会让管理台显示的和实际生效的对不上）|
 | `*.isDefault` | 该格是否在跟随内置（`= (text === '')`）—— 「来源」不许靠 UI 猜 |
 | `agentsMd.isOverridden` | `override !== ''`。页面要显式标「已偏离内置模板」并给「恢复内置」按钮 |
-| `agentsMd.templateBytes` / `effectiveBytes` | 都是**按固定示例工位名 `example` 渲染的整份文件字节数**：默认态下逐数相同，覆写/追加后的差值就是净变化。⚠ 这是**预览**口径；**写侧闸不是这个名**，见 §4.16-3 |
+| `agentsMd.templateBytes` / `effectiveBytes` | 都是**按固定示例工位名 `example` 渲染的整份文件字节数**：默认态下逐数相同，覆写/追加后的差值就是净变化。⚠ 这是**预览**口径；**写侧闸不是这个名**，见 §4.18-3 |
 | `agentsMd.effectiveText` | 同一份「现在生效的全文」，用固定示例名 `example` 渲染 ⇒ **零时间戳、零 run id**（页面要能对比文本、测试要能断言；这份文本会进模型请求的 system 位，动态量会让 prompt 缓存整条失效）|
 | `*.maxBytes` | 该格的**写侧**上限（8192 / 16384 / 2000）。DB 里没有 CHECK，这里才是闸 |
 | `agentsMd.renderedLimitBytes` | 注入侧对**整份** `~/AGENTS.md` 的上限（= `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES`，跨包对账由判据 `P9` 钉住，不许手抄）|
@@ -3080,7 +3080,7 @@ Content-Type: application/json
 `templateBytes` / `effectiveBytes` / `effectiveText` 都按**固定示例工位名**
 `example`（7 字符）渲染，而**写侧闸按最长合法工位名**算那份标识行的预算
 （从 `FDE_NAME_RE` 导出的 `FDE_NAME_MAX_LEN`，现算不抄数字；理由与
-字节级后果见 §4.16-3）。⇒ 同一份文本，页面完全可以显示「离
+字节级后果见 §4.18-3）。⇒ 同一份文本，页面完全可以显示「离
 `renderLimitBytes` 还有几百字节」而保存仍然吃 `400`
 （`details.rendered_bytes` 超过 `details.render_limit_bytes`）。
 **所以前端不许拿这两个预览数自己预判「到上限就禁用保存」**：以 `PUT`
@@ -3089,7 +3089,7 @@ Content-Type: application/json
 「页面数字没到啊」。
 | `reason` | `null`（DB 生效）/ `no_row`（未配置）/ `read_failed`（表缺失或 DB 抛错）/ `read_timeout`（查询发出去但 `PLATFORM_PROMPTS_READ_TIMEOUT_MS` 内没回）。三种回落**两两可区分**：把「DB 卡住」说成「管理台还没配过」会让值班去配一个值，而真故障在连接上 |
 
-#### 4.16-2 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`
+#### 4.18-2 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`
 
 ```
 PUT /api/admin/prompts/addendum
@@ -3111,7 +3111,7 @@ Content-Type: application/json
 ⚠ **不新增错误码**：这一节的全部失败都是既有的 `validation_failed` / `forbidden` /
 `method_not_allowed` / `internal`（`details.field` 负责说清是哪一格）。
 
-#### 4.16-3 渲染规则与那条硬闸（为什么「保存成功」还不够）
+#### 4.18-3 渲染规则与那条硬闸（为什么「保存成功」还不够）
 
 ```
 正文主体 = override !== '' ? override : 内置模板正文
@@ -3147,7 +3147,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 判据：`P13`（造一组「示例名装得下、最坏名装不下」的输入 ⇒ 必须 400 且一格不写，并钉 SQL 送参里
 那份标识行字节就是最坏情况那一份）。
 
-#### 4.16-4 `materializeEnqueued` 与生效时机
+#### 4.18-4 `materializeEnqueued` 与生效时机
 
 保存成功之后给**全部启用中的 FDE**（`status IN ('active','awaiting_credential')`，与全量重建同一条
 谓词）入队重物化（`outbox.js#enqueueMaterializeChange`，op `upsert`）。**不做「设置 + 入队」的原子性**：
@@ -3167,12 +3167,12 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > 入队通知）、`portal/src/materializer.js`（`renderHomeAgentsMd({fdeName, addendum, override})` +
 > 渲染预算 + 物化时现读）、`portal/src/http.js`（四个端点）、`portal/src/title-llm.js` +
 > `sessions.js` + `session-title.js`（改名链路吃 DB 生效值；**提示词不是守卫**，落库前照旧 `sanitizeTitle`）、
-> `deploy/migrations/0039-platform-prompts.sql`。
+> `deploy/migrations/0040-platform-prompts.sql`。
 > ⚠ `materializer.js` ⇄ `platform-prompts.js` 是**双向引用**：两边都只在**函数体里**用对面的导出，
 > 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
 > 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P11b` + `T1`/`T1b`）、
 > `portal/test/materializer.test.js`（`M1`：默认渲染逐字节不变）、
-> `portal/test/migrations.test.js`（0039 之后 head 断言 = 0039）。
+> `portal/test/migrations.test.js`（0040 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
 
 ### 4.16 管理台「关于」：版本三格（`GET /api/admin/version`，issue #586）
 

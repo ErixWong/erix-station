@@ -33,7 +33,7 @@ import {
   type UploadSettings,
   type UploadSettingsPayload,
 } from '../lib/uploadSettings';
-// issue #596 片 B：管理台「提示词」面板（§4.16）。DTO 归一化 / 请求体构造 / 400 字段映射 /
+// issue #596 片 B：管理台「提示词」面板（§4.18）。DTO 归一化 / 请求体构造 / 400 字段映射 /
 // 物化通知语义全在 lib（纯函数可单测）；这里只负责「一次调用 = 一次请求」+ 错误透传。
 import {
   PLATFORM_PROMPTS_PATH,
@@ -315,7 +315,7 @@ export const useAdminStore = defineStore('admin', {
     // 400 `validation_failed` 的 `details.field`（§4.15-2）→ 页面标红那个框；null = 整表错误。
     uploadSaveField: null as UploadFieldKey | null,
     uploadSaveOk: false,
-    // issue #596 片 B：管理台「提示词」面板（§4.16）。与 upload 同构：归一化在 lib，这里只管
+    // issue #596 片 B：管理台「提示词」面板（§4.18）。与 upload 同构：归一化在 lib，这里只管
     // 「一次调用 = 一次请求」。**不缓存**（后端每次物化/改名都现读那一行 ⇒ 这一页要看的就是新快照）。
     platformPrompts: null as PlatformPrompts | null,
     platformPromptsLoaded: false,
@@ -881,7 +881,7 @@ export const useAdminStore = defineStore('admin', {
     },
 
     /**
-     * issue #596 片 B：`GET /api/admin/prompts`（§4.16-1）。
+     * issue #596 片 B：`GET /api/admin/prompts`（§4.18-1）。
      *
      * 服务端在**表不存在 / 读失败 / 读超时**时也回 `200`（回落内置提示词），所以这一页不需要
      * 处理「配置面挂了」的错路；`reason` 会把「为什么现在用的是内置」说清（归一化在 lib）。
@@ -904,12 +904,12 @@ export const useAdminStore = defineStore('admin', {
     },
 
     /**
-     * issue #596 片 B：三个 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`（§4.16-2）。
+     * issue #596 片 B：三个 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`（§4.18-2）。
      *
      * 三个入口只决定 `field`（路径 slug 的映射在 lib，别处不抄字面量），其余同一套：
      *   · 成功 ⇒ **用响应 DTO 回填**（它出自 `RETURNING` ⇒ 是真落库的那一份，不是回显输入）；
      *   · 同时收下 `materializeEnqueued` 并折成语义结论 `promptNotice`（`0` / 缺键都是要显式
-     *     说出口的事：「已保存，但物化未通知」，不许静默，§4.16-4）；
+     *     说出口的事：「已保存，但物化未通知」，不许静默，§4.18-4）；
      *   · 失败 ⇒ `details.field` 落到 `promptSaveField`（页面据此标红那张卡的输入框）。
      *
      * 越界（字段上限 / **渲染后**整份 `~/AGENTS.md` 超注入上限）在前端**不拦**：服务端才是闸，

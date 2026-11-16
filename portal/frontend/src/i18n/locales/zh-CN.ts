@@ -824,7 +824,7 @@ export const zhCN = {
       // issue #485 片 A：上传上限（views/AdminUploadView.vue，契约 docs/api/portal.md §4.15）。
       // 放在证书之后、号池占用（只读运维快照）之前：它是一处**平台配置**。
       upload: '上传上限',
-      // issue #596 片 B：平台提示词面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.16）。
+      // issue #596 片 B：平台提示词面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.18）。
       // 顺序 upload → prompts：两者都是「改一行而不必重建 station-portal」的平台配置。
       prompts: '提示词',
       // issue #595 M2：能力市场发布台（views/AdminMarketView.vue，契约 §7 管理面）。
@@ -1013,7 +1013,7 @@ export const zhCN = {
       envNotSet: '环境变量并未显式设置',
       footnote: '这是**单文件**上限，不是磁盘总量上限（总量配额是 #485 片 B，未实现）。它与 MAX_BODY_BYTES（JSON 请求体口径，默认 64 KiB）是两个不同的旋钮：上传不走后者。',
     },
-    // issue #596 片 B：管理台「提示词」面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.16）。
+    // issue #596 片 B：管理台「提示词」面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.18）。
     // 三条生效时机各不相同 ⇒ 故意是三个键而不是一个共用句（判据 F7：三张卡不许共用一句）。
     // readonly 四条只写「住在哪 + 改它要付什么代价」，不写全文：portal 镜像不含 runner/。
     // ⚠ 这一段的值是纯文本渲染的（本页没有 markdown 渲染器，也不打算加依赖）⇒ 值里不许写成对星号

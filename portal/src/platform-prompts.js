@@ -1,6 +1,6 @@
 // 管理台「提示词」面板的**读侧 + 写侧**（issue #596 片 A）。
 // 契约：`docs/design/admin-prompts-panel-2026-11-16.md`（§3 读侧 / §4 写侧 / §5 渲染 / §6 API / §8 判据）；
-// API 文档：`docs/api/portal.md` §4.16。表：迁移 `0039-platform-prompts.sql`（单行表，`''` = 跟随内置）。
+// API 文档：`docs/api/portal.md` §4.18。表：迁移 `0040-platform-prompts.sql`（单行表，`''` = 跟随内置）。
 //
 // 一句话：平台对 agent 说的三句话（`~/AGENTS.md` 的补充约定、`~/AGENTS.md` 的整段覆写、会话标题的
 // system）从「改代码 + 重建镜像」变成「管理台改一行，下一次 run / 下一次改名生效」。
@@ -16,7 +16,7 @@
 //      审计与设置必须同生共死，旧值必须来自同一语句的快照 ⇒ 调用方（`http.js`）**不得**再补
 //      `auth.audit`（判据 `P8`：`pool.query` 恰好 1 次、`audit_log` 恰好 1 行）。
 //   4. **响应一律来自 `RETURNING`**（不信输入）：「保存成功」说的是库里现在那份文本。
-//   5. **产品上限不在 DB CHECK，在这里**（分层见 0039 头注释）。两条闸：字段自身上限 +
+//   5. **产品上限不在 DB CHECK，在这里**（分层见 0040 头注释）。两条闸：字段自身上限 +
 //      **渲染后**整份 `~/AGENTS.md` ≤ `AGENTS_MD_INJECT_MAX_BYTES`。第二条是必须的：注入侧
 //      （`runner/lib/agents-md.js`）超过 16 KiB 会**静默截断**只留 marker —— 不拦就是「管理员写完
 //      8 KiB 追加段什么也不会发生，直到某天发现约定被切了一半」。
@@ -70,7 +70,7 @@ export const READ_TIMEOUT_ENV_VAR = 'PLATFORM_PROMPTS_READ_TIMEOUT_MS';
 /** env 里「正整数」的唯一可接受写法：十进制数字串（`''` 先前已当「没配」处理）。 */
 const POSITIVE_INT_RE = /^[0-9]+$/;
 
-/** 审计：`action` / `target` 与 `docs/api/portal.md` §4.16-4 登记的必须一致（改这里就要改文档）。 */
+/** 审计：`action` / `target` 与 `docs/api/portal.md` §4.18-4 登记的必须一致（改这里就要改文档）。 */
 export const AUDIT_ACTION = 'admin.platform_prompts_updated';
 export const AUDIT_TARGET = 'platform_prompts';
 
