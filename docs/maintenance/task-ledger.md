@@ -7929,3 +7929,33 @@ W6（#529 管理台 UI）。
 
 **未做**（仍在可研，不属本版范围）：E3 端口对账 / E4 证书 / `run-recover` / 语义源 /
 工作项账本 / 外部集成（Slack、GitHub PR 通知）。
+
+### 8.149 portal 镜像未拷 `portal/shared/` 止血：`@shared` 别名目标补进镜像 + 防回归判据（issue #589，2026-11-16，主 agent + worker + copilot 评审）
+
+接 §8.147 / §8.148。**main 于 `04c7d83` 常红**（CI run `43817003603` 的「构建校验：station-portal 镜像」），
+根因不是老问题，是 §8.147 那天**新长出来的形状**：
+
+- `portal/shared/macro-kinds.js` 与 `@shared` 别名由 PR #582（`55da065`）**当天新建**——此前该目录不存在，
+  前端也从未引用 `portal/frontend/` 之外的文件，所以「只 `COPY portal/frontend/`」当时是成立的。
+- 同批 PR 起 7 个前端文件 `import … from '@shared/macro-kinds'`，别名（`portal/frontend/vite.config.ts:17`）
+  指向 `portal/frontend/` **外面的** `portal/shared/` ⇒ 镜像里没有该目录 ⇒ `vite build` 报
+  `UNLOADABLE_DEPENDENCY: Could not load ../shared/macro-kinds` ⇒ **镜像构建不出来**，`release.yml` 的
+  portal 构建会以同一方式失败（**挡住 v0.1.70**）。
+- **红灯晚了两单才露头**：PR #582（`96dd0dd`）与 PR #584（`9de8c75`）合入 main 的那两次 CI，
+  两个 job 都是 `skipped/cancelled`（连续推送被 concurrency 取消）⇒ 镜像校验**压根没跑完**；
+  直到 `04c7d83` 才第一次跑成 ⇒ 红。仓里 `macro-kinds-single-source.test.js` 管的是「枚举只许一份」，
+  **不管「Dockerfile 有没有把它拷进镜像」**，两件事各说各话。
+
+修法：`portal/Dockerfile` 的 `frontend-builder` 阶段在 `RUN npm run build` **之前**加
+`COPY portal/shared/ ../shared/`（WORKDIR = `/build/portal/frontend`，与别名的 `new URL('../shared/')` 同源）。
+
+**判据**：新增根 `test/portal-shared-copy.test.js`（5 条，`node --test` 随根 `npm test` 跑）：S1 扫前端全部
+`@shared/*` 引用并断言目标在盘上存在（+「引用数 > 0」防扫描器假绿）；S2 断言别名根**确实在
+`portal/frontend/` 外面**；S3 夹具自测解析/落地计算；S4 断言 Dockerfile 前端阶段有覆盖它的 COPY
+**且在 build 之前**；S5 反向自证（删/写歪/挪后都用**同一个判定函数**，必须报不合格）。
+主 agent 亲手复跑：5/5 绿；**删掉那行 ⇒ S4/S5 红**；**挪到 build 之后 ⇒ S4/S5 红**；真构建 portal 镜像
+`rc=0`（修复前同一命令 `rc=1`）；根 `npm test` rc=0。
+
+**范围声明**（copilot 评审认可、留作后续）：本判据只认 `@shared/*` 静态与字面量动态 import；
+相对路径 / 其它别名 / CSS 等「引用 `portal/frontend/` 外面文件」的形态不在本单，扩成通用构建依赖
+扫描是另一件事。
