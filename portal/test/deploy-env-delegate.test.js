@@ -29,6 +29,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
+// 剥注释的状态机从 `test/lib/js-source.mjs` import（issue #557 返工：它原先内联在
+// `test/repo-hygiene.test.js:135`，那边同样靠它剥注释）。此处**不**另写一份逐行 `startsWith('//')`
+// 的弱货：两份实现会分叉成两本账（同一个形状一边算注释、另一边算代码）。
+import { stripComments, structuralMask } from '../../test/lib/js-source.mjs';
 
 const COMPOSE = new URL('../../deploy/docker-compose.yml', import.meta.url);
 const PROVISIONER = new URL('../src/provisioner.js', import.meta.url);
@@ -146,6 +150,7 @@ function checkEnvLegs(keys, legs, exceptions = []) {
 const NAMESPACED_ENV_NAME = /^(?:ERIX|FDE|STATION)_[A-Z][A-Z0-9_]*$/;
 /** 扫描要跳过的目录：`test/` 里的 env 读取是测试自造的，不是产品配置面。 */
 const SCAN_SKIP_DIRS = new Set(['node_modules', '.git', 'test', 'probes', 'skills', 'fixtures', 'dist']);
+const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
 /** root 可以是目录（递归）或**单个文件**（活二判据② 的旧口径负例要拿单文件跑同一个扫描器）。 */
 function scanTargets(root) {
@@ -164,60 +169,157 @@ function scanTargets(root) {
   return out.sort();
 }
 
-/** 间接常量表：`const FOO_ENV = 'ERIX_BAR'` ⇒ `Map(常量名 → Map(env 名 → 出处文件))`。 */
-function indirectEnvConsts(src, file) {
-  const out = new Map();
-  for (const m of src.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*['"]([A-Za-z][A-Za-z0-9_]{2,})['"]/g)) {
-    if (!out.has(m[1])) out.set(m[1], new Map());
-    out.get(m[1]).set(m[2], file);
+const IDENT_RE = String.raw`[A-Za-z_$][\w$]*`;
+/** env 名的字面量形状（数据表里挑名字时用；`{ timeout: 30 }` 这种数字项、`'erix-worker'` 这种小写值都不算）。 */
+const ENV_LITERAL = /^[A-Z][A-Z0-9_]{2,}$/;
+const ENV_LITERAL_QUOTED = /['"]([A-Z][A-Z0-9_]{2,})['"]/g;
+
+function escRe(s) { return s.replace(/[$()*+.?[\\\]^{|}]/g, '\\$&'); }
+
+/** 从 `{` / `[` 起做**配对扫描**（在 structuralMask 上跑 ⇒ 字符串正文与注释已抹平，括号不会被内容骗到）。 */
+function matchBrackets(masked, from) {
+  const open = masked[from];
+  if (open !== '{' && open !== '[') return null;
+  const close = open === '{' ? '}' : ']';
+  let depth = 0;
+  for (let i = from; i < masked.length; i += 1) {
+    if (masked[i] === open) depth += 1;
+    else if (masked[i] === close) { depth -= 1; if (depth === 0) return i + 1; }
   }
-  return out;
+  return null;
 }
 
 /**
- * 扫描 `root` 下对 env 的**读取**，返回 `Map(env 名 → Set(相对出处文件))`。四形（缺一形就会漏一个键）：
- *   形① `process.env.ERIX_X`                     —— 直接点号（写赋值 `process.env.X = v` 不算读）
- *   形② `process.env['ERIX_X']`                  —— 字面量下标
- *   形③ `process.env[SOME_ENV]`                  —— 间接常量下标（`const SOME_ENV = 'ERIX_X'`）
- *   形④ `f(env = process.env, { key = SOME_ENV }) { env?.[key] }` —— **参数默认值 + 动态下标**
- *        （#557 那个 key 在 `final-text-toolcall.js:188` 就是这一形，漏了它 = 复刻根因）
- * 只保留 `NAMESPACED_ENV_NAME` 命中的名字。
+ * 建「这个名字能解析出哪些 env 名」的表。**必须按形状分优先级多趟建**，因为绑定会互相引用
+ * （`{ key = TOOLCALL_MARKERS_ENV }` 里的 `key` 依赖常量表，`const envName = LLM_TIMEOUT_ENV[field]`
+ * 里的 `envName` 依赖数据表）：先收字面量与数据表，再收「别名 = 已知名」与「别名 = 已知名[...]」，
+ * 最后迭代到不动点。解析不出的名字**不在表里**（调用方据此判 unsupported，不许静默放过）。
+ * @returns {{ envObjs: Set<string>, names: Map<string, Set<string>> }}
  */
-function scanEnvKeys(root) {
-  const files = scanTargets(root);
-  const consts = new Map();
-  const sources = new Map();
-  const add = (name, file) => {
-    if (!NAMESPACED_ENV_NAME.test(name)) return;
-    if (!sources.has(name)) sources.set(name, new Set());
-    sources.get(name).add(path.relative(root, file));
+function analyzeEnvReads(code) {
+  const masked = structuralMask(code);
+  const envObjs = new Set();
+  const names = new Map();
+  const addName = (id, lits) => {
+    if (!/^[A-Za-z_$]/.test(id)) return;
+    if (!names.has(id)) names.set(id, new Set());
+    for (const l of lits) names.get(id).add(l);
   };
-  for (const f of files) {
-    const src = fs.readFileSync(f, 'utf8');
-    for (const [name, lits] of indirectEnvConsts(src, f)) {
-      if (!consts.has(name)) consts.set(name, new Map());
-      for (const [lit, where] of lits) consts.get(name).set(lit, where);
-    }
+  // env 对象别名：`env = process.env`（参数默认值或 `const env = process.env`，两种写法同一条正则）
+  for (const m of code.matchAll(new RegExp(`(${IDENT_RE})\\s*=\\s*process\\.env(?!\\.)(?!\\s*=[^=])`, 'g'))) envObjs.add(m[1]);
+
+  // ① 字符串常量：`const FOO_ENV = 'ERIX_X'`
+  for (const m of code.matchAll(new RegExp(`\\b(?:const|let|var)?\\s*(${IDENT_RE})\\s*=\\s*['"]([^'"]+)['"]`, 'g'))) {
+    if (ENV_LITERAL.test(m[2])) addName(m[1], [m[2]]);
   }
-  for (const f of files) {
-    const raw = fs.readFileSync(f, 'utf8');
-    // 写形态先抹掉（`process.env.X = v` 是给子进程传值，不是「这个 env 名有配置面」）
-    const src = raw.replace(/process\.env\.[A-Za-z_$][\w$]*\s*=(?!=)/g, 'process.env.__WRITE__ ');
-    for (const m of src.matchAll(/process\.env\.([A-Za-z_$][\w$]*)/g)) add(m[1], f);
-    for (const m of src.matchAll(/process\.env\[\s*['"]([^'"]+)['"]\s*\]/g)) add(m[1], f);
-    for (const m of src.matchAll(/process\.env\[\s*([A-Za-z_$][\w$]*)\s*\]/g)) {
-      for (const lit of consts.get(m[1])?.keys() ?? []) add(lit, f);
-    }
-    for (const m of src.matchAll(/([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*(?:,\s*\}|\})/g)) {
-      const [, local, alias] = m;
-      const lits = consts.get(alias);
+  // ② 解构默认值：`function f(env = process.env, { key = TOOLCALL_MARKERS_ENV } = {})` ⇒ key 是候选名变量
+  for (const m of code.matchAll(new RegExp(`[({,]\\s*(${IDENT_RE})\\s*=\\s*(${IDENT_RE})\\s*[,})]`, 'g'))) {
+    if (!names.has(m[2])) continue;
+    addName(m[1], names.get(m[2]));
+    addName(m[2], names.get(m[2]));
+  }
+  // ③ 数据表：`const T = Object.freeze({ a: 'ERIX_A', ... })` / `= { ... }` / `= ['ERIX_A', ...]`
+  //    （#557 返工新增：`runner/lib/llm-timeouts.js` 的 `LLM_TIMEOUT_ENV` 就是这一形，
+  //     读它的那一行里**根本没有 env 名的字面量**，只认字面量的旧扫描器因此静默漏掉四个键）
+  for (const m of code.matchAll(new RegExp(`\\b(?:const|let|var)\\s+(${IDENT_RE})\\s*=\\s*(?:Object\\.freeze\\(\\s*)?([{[])`, 'g'))) {
+    const start = masked.indexOf(m[2], m.index);
+    const end = start < 0 ? null : matchBrackets(masked, start);
+    if (end == null) continue;
+    const lits = [...code.slice(start, end).matchAll(ENV_LITERAL_QUOTED)].map((x) => x[1]);
+    if (lits.length) addName(m[1], lits);
+  }
+  // ④ 「名字变量」绑定：`const envName = TABLE[field]` / `const alias = KNOWN` ⇒ 迭代到不动点
+  for (let pass = 0; pass < 4; pass += 1) {
+    let changed = false;
+    const before = [...names].map(([k, v]) => [k, v.size]);
+    for (const m of code.matchAll(new RegExp(`(?:const|let|var)\\s+(${IDENT_RE})\\s*=\\s*(${IDENT_RE})\\s*(?:\\[|;|\\n)`, 'g'))) {
+      const lits = names.get(m[2]);
       if (!lits || lits.size === 0) continue;
-      // 该局部名必须真的被当**下标**读过，否则只是「默认值恰好叫这个名」
-      if (!new RegExp(`\\[\\s*${local}\\s*\\]`).test(src)) continue;
-      for (const lit of lits.keys()) add(lit, f);
+      const sink = names.get(m[1]) ?? new Set();
+      for (const l of lits) sink.add(l);
+      names.set(m[1], sink);
     }
+    const after = [...names].map(([k, v]) => [k, v.size]);
+    changed = JSON.stringify(before) !== JSON.stringify(after);
+    if (!changed) break;
   }
-  return sources;
+  return { envObjs, names };
+}
+
+/** 下标表达式 → 名字集合；`null` = 解析不出字面量名（调用方必须进 unsupported 清单，不许静默放过）。 */
+function resolveExpr(expr, ctx) {
+  const lit = /^\s*['"]([^'"]+)['"]\s*$/.exec(expr);
+  if (lit) return new Set([lit[1]]);
+  const id = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(expr);
+  if (id && ctx.names.has(id[1])) return new Set(ctx.names.get(id[1]));
+  const tbl = /^\s*([A-Za-z_$][\w$]*)\s*\[[\s\S]*\]\s*$/.exec(expr); // `T[field]` 直接写在读形里
+  if (tbl && ctx.names.has(tbl[1]) && ctx.names.get(tbl[1]).size > 0) return new Set(ctx.names.get(tbl[1]));
+  return null;
+}
+
+/**
+ * 扫描**一批源码**对 env 的读取。返回 `{ keys, unsupported }`：
+ *   `keys`        `Map(env 名 → Map(相对出处文件 → [行号]))`
+ *   `unsupported` `[{ at, shape, expr }]` —— **读形认得、名字解析不出**的动态下标（运行期拼名那类），
+ *                 必须逐条登记进例外清单的 `unsupported` 段并写明理由，否则判据红（fail closed）。
+ * 认的形状（漏一形就漏一个键，#557 的根因就是漏形）：
+ *   形① `process.env.ERIX_X` / 形①b 别名点号 `env.ERIX_X`（`{ env = process.env }` 参数默认值那一路，
+ *        `runner/lib/build-info.js:84` 读 `ERIX_AGENT_VERSION` 就是它 —— 旧扫描器只认 `process.env.` 前缀，
+ *        于是这个键的**唯一**出处只剩 `runner/agentd.js:52` 的**注释**，注释里的旧代码给它背了三天书）
+ *   形② `process.env['ERIX_X']` / 别名字面量下标
+ *   形③ `process.env[SOME_ENV]`（`const SOME_ENV = 'ERIX_X'`）
+ *   形④ `f(env = process.env, { key = SOME_ENV }) { env?.[key] }`
+ *   形⑤ 数据表驱动：`const n = TABLE[f]; env?.[n]` —— 名字从表里来，**不许把表里的名字抄进判据**
+ * 前置：整篇先过 `stripComments()` ⇒ 注释里的 `process.env.X` **不算读取**（判据③ 反过来钉：
+ * 把真读取注释掉，该键必须从枚举里消失）。写形态（`env.X = v`）不算读。
+ */
+function scanEnvReadsFromFiles(files, root) {
+  const keys = new Map();
+  const unsupported = [];
+  const add = (name, rel, line, shape) => {
+    if (!NAMESPACED_ENV_NAME.test(name)) return;
+    if (!keys.has(name)) keys.set(name, new Map());
+    const perFile = keys.get(name);
+    if (!perFile.has(rel)) perFile.set(rel, []);
+    perFile.get(rel).push({ line, shape });
+  };
+  for (const { file, text } of files) {
+    const rel = path.relative(root, file);
+    const code = stripComments(text);
+    const ctx = analyzeEnvReads(code);
+    const objs = ['process\\.env', ...[...ctx.envObjs].map(escRe)];
+    const readRe = new RegExp(
+      `(?<![\\w$.])(?:${objs.join('|')})(?:\\?\\.)?(?:\\.(${IDENT_RE})|\\[\\s*([^\\]\\n]*?)\\s*\\])`, 'g');
+    const writeRe = new RegExp(
+      `(?<![\\w$.])(?:${objs.join('|')})(?:\\?\\.)?(?:\\.${IDENT_RE}|\\[[^\\]]*\\])\\s*=(?!=)`, 'g');
+    code.split('\n').forEach((rawLine, i) => {
+      // 写形态整段抹平（`process.env.X = v` 是给子进程传值，不是「这个 env 名有配置面」）；
+      // 只抹「对象 + 成员 + 等号」这段，赋值右侧照旧参与匹配。
+      const line = rawLine.replace(writeRe, (m) => ' '.repeat(m.length));
+      for (const m of line.matchAll(readRe)) {
+        if (m[1] !== undefined) { add(m[1], rel, i + 1, 'dot'); continue; }
+        const expr = m[2] ?? '';
+        const lit = resolveExpr(expr, ctx);
+        if (lit) { for (const n of lit) add(n, rel, i + 1, `index:${expr.trim()}`); continue; }
+        unsupported.push({ at: `${rel}:${i + 1}`, shape: m[0].trim(), expr: expr.trim() });
+      }
+    });
+  }
+  return { keys, unsupported };
+}
+
+/** 目录/单文件版入口（`mutate` 是**变异入口**：判据用它改内存里的源码，不改盘 —— 见活二②③）。 */
+function scanEnvReads(root, { mutate } = {}) {
+  const files = scanTargets(root).map((f) => ({ file: f, text: fs.readFileSync(f, 'utf8') }));
+  if (mutate) for (const f of files) f.text = mutate(path.relative(root, f.file), f.text);
+  return scanEnvReadsFromFiles(files, root);
+}
+
+/** 兼容旧口径：`Map(env 名 → Set(相对出处文件))`（活二②③ 与墓碑都在用它）。 */
+function scanEnvKeys(root, opts) {
+  const out = new Map();
+  for (const [name, perFile] of scanEnvReads(root, opts).keys.entries()) out.set(name, new Set(perFile.keys()));
+  return out;
 }
 
 /** 扫描器自证：扫到 0 个就是扫描器坏了（不是「runner 不再读 env」）—— 这一条必须红。 */
@@ -226,6 +328,7 @@ function assertScannerFoundKeys(n, where) {
     + '把「扫不到」当成「没有旋钮」就是让闸门静默失效（#557 的根因是覆盖不全，不能再叠一层）');
 }
 
+const RUNNER_SCAN = scanEnvReads(RUNNER_ROOT);
 const RUNNER_ENV_KEYS = scanEnvKeys(RUNNER_ROOT);
 assertScannerFoundKeys(RUNNER_ENV_KEYS.size, `扫描根 ${path.relative(process.cwd(), RUNNER_ROOT)}/`);
 
