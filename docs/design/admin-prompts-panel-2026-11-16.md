@@ -182,14 +182,27 @@ GET DTO（键名 camelCase，与本仓其它管理台 DTO 一致）：
 7. `P9` `portal` 常量与 `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES` 相等（跨包对账）。
 8. `P10` 入队条数 = 启用中的 FDE 数；入队抛错 ⇒ 保存仍然成功 + `materializeEnqueued=0` + warn。
    ⚠ 断言不许写成 `… || true`（恒真的断言等于没断言，评审 F4）：`op` 必须是字面量 `upsert`。
-9. `M1` `renderHomeAgentsMd({fdeName})` 不传新入参时**逐字节等于**今天（既有断言一条不改仍全绿）。
+9. `P1` `renderHomeAgentsMd({fdeName})` 不传新入参时**逐字节等于**今天（既有断言一条不改仍全绿）。
+   勘误：本条原写 `M1`，而 `M1` 在本仓已被三处占走且都与本题无关——
+   `materializer.test.js:750`（评审轮 `a4d2cae`：root 内用户自建 `.gitignore`/`AGENTS.md`
+   在 stale 清理后存活）、`docs/testing.md:330` 的「M1 原子写」并发场景、
+   `docs/design/event-platform/` 的宏号 M1。
+   承担本条的两处（都不改名）：① `platform-prompts.test.js` 的 `P1`——无行 ⇒
+   `resolveEffectiveAgentsMd()` 与 `renderHomeAgentsMd({fdeName})` 字节级相同
+   （`Buffer.from` 对比，不是「看起来一样」）；② `materializer.test.js` 那 8 条
+   `renderHomeAgentsMd：…` 既有断言一条没改仍全绿——默认渲染一改就红，
+   证据：#596 分支对该文件**零 diff**（`git diff origin/main...HEAD` 不含它）。
+   引用本条请写 `P1`，别再写 `M1`。
 10. `T1` 手工改名与自动改名两条路径都用 DB 生效值（`systemPrompt` 出现在请求 `messages[0]`）。
 11. `P8` 的口径（评审 F4，261116 定稿）：判据是「**设置写与审计在同一次 `pool.query`**」，
     不是「整个保存总共只有一次查询」——渲染字段另有一次预读（JS 预闸）与 N 条入队，那是两条**不同的**
     判据，混成一句就会出现「测试只在不涉物化的那一格上成立」。测试必须各自点名。
-12. `P12` 首写并发（评审 F1）：表里**没有行**时两个并发保存（同字段 / 跨字段各一例）不得互相丢更新，
+12. `P12a`/`P12b` 首写并发（评审 F1）：表里**没有行**时两个并发保存
+    （同字段 / 跨字段各一例）不得互相丢更新，
     且后一条审计的 `previous_*` 必须是紧邻的前一个值。单测用假池 + **真 PG 集成脚本**各跑一次
     （`portal/integration/platform-prompts-db.mjs`，真并发假池证不了）。
+    ⚠ 勘误：本仓**没有裸 `P12`**，承担者是 `platform-prompts.test.js` 的
+    `P12a`（同字段）与 `P12b`（跨字段），真库腿另名 `P12a-db`–`P12d-db`。
 13. `P13` 预算按最长合法工位名（评审 F2）：一组「用示例名装得下、用最坏情况名装不下」的输入必须被拒。
 
 ## 9. 真机 e2e（主 agent 执行，不在 worker 单测里）
