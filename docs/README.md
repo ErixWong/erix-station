@@ -27,6 +27,7 @@
 | [`design/deploy-contract.md`](design/deploy-contract.md) | **P1 部署契约**：服务清单与镜像 pin、compose 字段（网络/publish/volume/healthcheck/env_file）、DB 迁移机制、Traefik 静态/动态配置、防火墙应用方式（iptables-nft 幂等 + fail-closed）、socket-proxy 白名单策略、FDE 容器创建参数、P1 范围声明、readiness 语义 | ✅ |
 | [`design/llm-gateway/llm-gateway-selection.md`](design/llm-gateway/llm-gateway-selection.md) | **LLM 网关选型支撑（Q1/Q7 决策材料）**：本场景硬需求准绳、候选活跃度核查（one-api / one-hub 因停更淘汰）、LiteLLM vs new-api 源码级对比；**结论：LiteLLM 默认且唯一推荐（new-api 源码级验证出局），Q1（公司是否已有网关）待定**，剩 P3 实测项 | ✅（选型材料定稿；Q1 待公司确认） |
 | [`design/llm-gateway/new-api-api-analysis.md`](design/llm-gateway/new-api-api-analysis.md) | **new-api 源码分析（选型证据）**：new-api 的路由/凭据/转发实现与 LiteLLM 对比要点（出局原因佐证） | ✅ |
+| [`design/admin-prompts-panel-2026-11-16.md`](design/admin-prompts-panel-2026-11-16.md) | **管理台「提示词」面板（issue #596）**：平台喂给模型的 8 处文本各住在哪个包 / 改它付什么代价；第一期可编辑的 3 条（平台补充约定、平台约定整段覆写、会话标题提示词）的 `platform_prompts` 单行表、读侧回落口径、写侧一条语句 + 渲染后 ≤ 16 KiB 硬闸、`renderHomeAgentsMd()` 的追加段与标识行渲染规则、`/api/admin/prompts*` 契约、必测格子 P1–P10 / M1 / T1 与真机 e2e 步骤 | ✅ |
 | [`data/bootstrap.sql`](data/bootstrap.sql) | **生产附加初始化**：角色幂等声明 + 库/schema 级授权 + ownership 归正（schema.sql **之后**执行，可重复；自包含不建业务表，不含 admin/LLM 种子） | ✅ |
 | [`charts.zh.md`](charts.zh.md) / [`charts.en.md`](charts.en.md) | **架构总览图表（中/英，可直接外发评审）**：拓扑图、请求链路、信任边界与凭据红线一页图；另附**宿主收紧原理**（容器为何摸不到宿主服务：INPUT + DOCKER-USER 两层、fail-closed、不锁管理通道）与**网络与安全评审说明**（常见追问逐条作答；含两条提请评审拍板的开放项）。两份均为自包含文件，不含任何内部引用 | ✅ |
 | [`env.md`](env.md) | **部署参数清单**：参数定义 + 参考实例 A + 目标环境探测 checklist（非单机环境事实） | ✅ |
