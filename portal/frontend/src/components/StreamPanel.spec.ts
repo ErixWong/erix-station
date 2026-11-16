@@ -626,6 +626,87 @@ describe('issue #189：折叠横幅渲染', () => {
     expect(wrapper.text()).not.toContain('undefined');
   });
 
+  // issue #563（**纯测试面护栏，不改渲染实现**）：#387 那格喂的是 `'1: 24'`——没有标签字符，
+  // 「插值」与「当 HTML 渲染」两种语义下 textContent 一模一样 ⇒ 它断不出这两种实现（第三方审计实测：
+  // 把 StreamPanel.vue 这个节点改成 `v-html` 之后跑整套 spec，原有 69 格**全绿**）。于是
+  // 「把返回预览换成 HTML 渲染」这件能在真浏览器里执行 `onerror` 的事，CI 拦不住。
+  // 本格补的就是这条断言：行为今天本来就是对的，缺的是**已提交的**护栏。
+  //
+  // 两条写法红线（AGENTS §8.9 第 5 条，本文件上面已为此改过两格）：
+  //   ① 断言只钉 DOM，**不许钉 `wrapper.emitted()`**：本机 `NODE_ENV=production` 下它恒空 ⇒ 假绿；
+  //   ② 跑它必须 `cd portal/frontend && NODE_ENV=development npm test -- src/components/StreamPanel.spec.ts`
+  //      （`npx vitest run <文件>` 绕开 vite.config.ts 的 jsdom environmentOptions，在 node 环境里永久挂死）。
+  //
+  // ⚠ 变异自证（这格的全部价值在这里，四步跑完才算交付）：
+  //   ① 改前先确认锚点唯一命中：`grep -c '↳ {{ foldedToolResult(tc) }}' portal/frontend/src/components/StreamPanel.vue`
+  //      必须是 1（命中 0 就停——节点形状变了，要按当时的实际 DOM 重写这格，别硬改）；
+  //   ② 先**单副本备份到 /tmp**（别放仓库树里，免得脏工作区）：
+  //      `cp portal/frontend/src/components/StreamPanel.vue /tmp/StreamPanel.vue.bak-563`
+  //      再把那行改成 ` v-html="foldedToolResult(tc)">↳ </div>`（只改这一处、只改这一行）；
+  //   ③ 重跑上面那条聚焦命令 ⇒ **期望 rc≠0 且 FAIL 行里出现本格的名字**（只写「有一格红」不算证据）；
+  //   ④ `cp /tmp/StreamPanel.vue.bak-563 portal/frontend/src/components/StreamPanel.vue` 还原后再跑一次 ⇒ rc=0。
+  //      **不要用 `git checkout -- <文件>`**：那个文件上还压着本格未提交的编辑，checkout 会把它们一起抹掉。
+  it('#563 护栏：原文里「返回了什么」必须逐字是纯文本——喂第三方形状（<img onerror>/<script>/<invoke>）时不许长出任何元素节点', async () => {
+    // 四种上游真发过的形状，一条用例里全喂上（`getToolResultSummary` 的归一路径一并过一遍）。
+    // `invoke` 那条最要紧：第三方工具结果里真实长这样，而 `invoke`/`parameter` 在 HTML 里是**未知标签**，
+    // 被当 HTML 解析时既不报错也不红，只是悄悄变成一对 DOM 元素 ⇒ 只断 `toContain` 抓不住它。
+    const RAW = {
+      // ① 会真的执行脚本的标签（真浏览器里 onerror 直接跑起来 = XSS 面）
+      img: '<img src=x onerror=alert(document.domain)>',
+      // ② 最经典的那一种
+      script: 'done <script>alert(1)</script> tail',
+      // ③ 第三方审计点名、也是真机账本里第三方工具结果真实存在的形状（upstream #567 同款嵌套标签）
+      invoke: '<invoke name="exec">\n<parameter name="command">ls\n</parameter>\n</invoke>',
+      // ④ 结构化结果 `{content, metadata}`：上游第三套返回形态，归一后同样只许当文本画
+      obj: { content: '<system-reminder>hit <b>cache</b></system-reminder>', metadata: { n: 1 } },
+    };
+    const SHAPES: Array<[string, string]> = [
+      ['img', RAW.img], ['script', RAW.script], ['invoke', RAW.invoke], ['content', RAW.obj.content],
+    ];
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? {
+        status: 200,
+        body: { round: 8, turns: [{ role: 'assistant', text: '', toolCalls: [
+          { name: 'exec', argsSummary: 'command=ls', resultPreview: RAW.img },
+          { name: 'exec', argsSummary: 'command=make', resultPreview: RAW.script },
+          { name: 'readFile', argsSummary: 'path=a.txt', resultPreview: RAW.invoke },
+          { name: 'readFile', argsSummary: 'path=b.txt', resultPreview: RAW.obj },
+        ] }] },
+      }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+
+    const previews = wrapper.findAll('.folded-original-tool-result');
+    expect(previews).toHaveLength(SHAPES.length);
+    SHAPES.forEach(([shape, raw], i) => {
+      const el = previews[i].element as HTMLElement;
+      // ① 逐字（**不是 toContain**：`toContain` 在两种实现下都真，正是 #387 抓不住的原因）
+      expect(el.textContent, shape + ' 的可见文本必须逐字是「↳ 」+ 原文').toBe('↳ ' + raw);
+      // ② DOM 层事实：整块只有一个**文本节点**，零子元素（有子元素 = 浏览器被喂了第二次解析）
+      expect(el.children, shape + ' 不许长出任何子元素').toHaveLength(0);
+      expect(el.childNodes, shape + ' 只许有一个节点').toHaveLength(1);
+      expect(el.firstChild?.nodeType, shape + ' 那个节点必须是文本节点').toBe(Node.TEXT_NODE);
+      // ③ 四种形状各自最可能被解析成的标签，逐个查 null（未知标签不报错，只能这样抓）
+      expect(el.querySelector('img'), shape + ' 不许解析出 <img>（onerror 会在真浏览器里真跑）').toBeNull();
+      expect(el.querySelector('script'), shape + ' 不许解析出 <script>').toBeNull();
+      expect(el.querySelector('invoke'), shape + ' 不许解析出 <invoke>').toBeNull();
+      expect(el.querySelector('parameter'), shape + ' 不许解析出 <parameter>').toBeNull();
+    });
+    // ⑤ 序列化出来的源码里尖括号必须**仍是实体**（插值转义，v-html 不转义）。
+    //    直接读 outerHTML，不用 `wrapper.html()`——VTU 的 html() 会 pretty-print，断言不该依赖它。
+    const originalHtml = (wrapper.get('.folded-original').element as HTMLElement).outerHTML;
+    expect(originalHtml).toContain('&lt;img src=x onerror=alert(document.domain)&gt;');
+    expect(originalHtml).toContain('&lt;invoke name="exec"&gt;');
+    expect(originalHtml).not.toMatch(/<(?:img|script|invoke|parameter)[\s/>]/);
+    // ⑥ 整段原文里也不许凭空多出这些元素（防「只在预览外面包一层」式的假修法）
+    const orig = wrapper.get('.folded-original').element;
+    expect(orig.querySelector('img, script, invoke, parameter')).toBeNull();
+  });
+
   it('原文 404 → 友好提示（非红错）', async () => {
     mockFoldedFetch(() => ({ status: 404, body: { error: { code: 'folded_payload_not_found', message: 'gone' } } }));
     const store = useWorkbenchStore();
