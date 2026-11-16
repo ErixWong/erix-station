@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS platform_prompts (
   updated_at         timestamptz NOT NULL DEFAULT now(),
   updated_by         uuid
 );
+-- 种下一行（评审 F1）：`SAVE_SQL` 靠 `SELECT … FOR UPDATE` 锁单例行，**表里没有行时它锁不到任何东西** ⇒
+-- 首次并发保存两边都拿空快照派生「其余列」，后者把前者刚写的另一列刷回 `''`（丢更新），
+-- 且审计的 `previous_*` 会记成空串而不是紧邻的前一个值。把行**建出来**，`FOR UPDATE` 就永远有锁可拿。
+-- 读侧仍然要能面对「无行」（手工 `TRUNCATE`、从别的库搬来的库）⇒ 回落内置那条路径不得删。
+INSERT INTO platform_prompts (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 ```
 
 三条口径写死在这里：
@@ -51,6 +56,9 @@ CREATE TABLE IF NOT EXISTS platform_prompts (
   `reason ∈ no_row | read_failed | read_timeout`。
 - 那次读取**带超时**（`PLATFORM_PROMPTS_READ_TIMEOUT_MS`，默认 1500ms，登记进 `docs/env.md`）。
   理由与 0036 复 audit 活一相同：只 `catch` 不覆盖「发出去但不返回」。
+  ⚠ **超时不取消已发出的查询**（评审 F3，与 0036 同一决策，不是漏了）：node-pg 没有中断一条已发查询的 API，
+  `Promise.race` 只保证**调用方不挂**；那条查询仍占着池里一个 client ⇒ DB 持续挂住时会累积占用。
+  本单判据是「配置面不许把功能锁死」，不是「连接必须回收」；真要回收得上 `statement_timeout`，那是另一单。
 - 导出：`getPlatformPrompts()`（管理台 DTO）、`updatePlatformPrompts()`（写侧，见 §4）、
   `resolveEffectiveAgentsMd({fdeName})`（materializer 用）、
   `resolveEffectiveTitlePrompt()`（改名链路用）。
@@ -66,6 +74,11 @@ CREATE TABLE IF NOT EXISTS platform_prompts (
 `http.js` **不得**再补一笔 `auth.audit`。审计 `action='admin.platform_prompts_updated'`、
 `target='platform_prompts'`、`details={field, text_bytes, text_sha256, previous_bytes, previous_sha256}`
 —— 审计存摘要不存正文（正文在配置行里，审计只证「谁在什么时候把它换成哪一份」，16 KiB × 2 塞进 jsonb 不值）。
+
+**预算取「最坏情况」，不取示例名**（评审 F2）：闸卡的是**落盘那份文件**的字节数，而标识行随真实工位名变化
+⇒ 预算里的标识行按**最长合法工位名**算（长度从 `projects.js` 的 `FDE_NAME_RE` 单一真相导出，不许手抄 63）。
+DTO 里 `effectiveText` 仍用示例名 `example` 渲染（那是给人看的预览，不是闸的依据）。
+两者不同名是刻意的：**预览可以挑任何一个名字，闸不能挑一个偏短的**。
 
 写侧校验（一律 `400 validation_failed` + `details.field`，非字符串 / 缺字段 / 越界都**不落库**）：
 
@@ -167,8 +180,16 @@ GET DTO（键名 camelCase，与本仓其它管理台 DTO 一致）：
 6. `P8` 保存 = 一条语句：调用 `pool.query` 恰好 1 次、`audit_log` 恰好 1 行（fake pool 计数）。
 7. `P9` `portal` 常量与 `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES` 相等（跨包对账）。
 8. `P10` 入队条数 = 启用中的 FDE 数；入队抛错 ⇒ 保存仍然成功 + `materializeEnqueued=0` + warn。
+   ⚠ 断言不许写成 `… || true`（恒真的断言等于没断言，评审 F4）：`op` 必须是字面量 `upsert`。
 9. `M1` `renderHomeAgentsMd({fdeName})` 不传新入参时**逐字节等于**今天（既有断言一条不改仍全绿）。
 10. `T1` 手工改名与自动改名两条路径都用 DB 生效值（`systemPrompt` 出现在请求 `messages[0]`）。
+11. `P8` 的口径（评审 F4，261116 定稿）：判据是「**设置写与审计在同一次 `pool.query`**」，
+    不是「整个保存总共只有一次查询」——渲染字段另有一次预读（JS 预闸）与 N 条入队，那是两条**不同的**
+    判据，混成一句就会出现「测试只在不涉物化的那一格上成立」。测试必须各自点名。
+12. `P12` 首写并发（评审 F1）：表里**没有行**时两个并发保存（同字段 / 跨字段各一例）不得互相丢更新，
+    且后一条审计的 `previous_*` 必须是紧邻的前一个值。单测用假池 + **真 PG 集成脚本**各跑一次
+    （`portal/integration/platform-prompts-db.mjs`，真并发假池证不了）。
+13. `P13` 预算按最长合法工位名（评审 F2）：一组「用示例名装得下、用最坏情况名装不下」的输入必须被拒。
 
 ## 9. 真机 e2e（主 agent 执行，不在 worker 单测里）
 
