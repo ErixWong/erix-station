@@ -154,6 +154,8 @@ export const zhCN = {
     whoNoFde: '{login}（{role}）',
     cwdCopyTitle: '{cwd}（点击复制）',
     toLatest: '↓ 最新',
+    // issue #595：顶栏进能力市场的入口（views/MarketView.vue，路由 #/market）。
+    marketEntry: '市场',
     resizeSidebar: '调整侧栏宽度',
     // composer 占位符（store.inputPlaceholder 计算属性）
     inputPlaceholder: '输入任务，Enter 发送（Shift+Enter 换行）',
@@ -595,6 +597,26 @@ export const zhCN = {
       interrupted: '已中断',
       unknown: '状态未知',
     },
+    // issue #592：活跃子 run 徽标（RunStatusBar 尾部）与展开面板（状态条下方）。
+    // 状态词汇**复用**上面的 `state.*`（不另造一份）；这里的 `{count}` 是**活态**子数
+    // （尺规 = `lib/delegate.ts#DELEGATE_LIVE_STATES`，终态子不计数）。
+    activity: {
+      title: '子任务 {count}',
+      // 「读不到」与「没有」必须两种说法（徒标的降级态；设计 §4.2 末段 + D9 口径）。
+      titleUnknown: '子任务 ?',
+      toggleUnknown: '展开或收起子任务面板（状态暂不可读）',
+      panelTitle: '子任务 {count}',
+      toggle: '展开或收起子任务面板（{count} 个在跑）',
+      hint: '每 2 秒刷新，只读当前 run 派出的子任务',
+      collapse: '收起',
+      elapsed: '已跑 {dur}',
+      view: '查看',
+      viewAria: '查看子任务 {id}',
+      unreadable: '子任务状态暂不可读',
+      // 名册还写着活态、但父 run 已终态（后台子随父进程消失 ⇒ `finishRun` 永远不会跑）。
+      // 它是「状态未知」，不是失败也不是在跑（D9 的 ⚪ 口径）。
+      staleParentEnded: '父 run 已结束，状态未知',
+    },
   },
   // 文件预览 modal（components/FilePreviewModal.vue）
   preview: {
@@ -707,6 +729,74 @@ export const zhCN = {
       occupancyUnknown: '不知道这一段空不空：它不在最近一次总览的空闲列表里（那份列表是截断的），以服务端校验为准。',
     },
   },
+  // 能力市场·用户面（views/MarketView.vue，issue #595；契约 docs/design/capability-market.md §8）。
+  // 口径（§8）：红黄绿不引入——「已安装但未启用」是中性灰字，不是告警。
+  market: {
+    title: '能力市场',
+    backToWorkbench: '← 返回工作台',
+    reload: '刷新',
+    loading: '正在读取市场目录…',
+    empty: '还没有已发布的技能包。',
+    intro: '这里列的是平台已发布的技能包：安装到你的 FDE 工位，启用后才会进入模型的工具面。',
+    budgetHint: '一个启用的技能会把它的全部工具铺进每一轮请求：单个 FDE 最多同时启用 {max} 个。',
+    footnote: '停用只改开关，不删文件也不重新下载；手改过包里的文件可以用「重新安装」盖回去；' +
+      '卸载会真的删掉 <你的工位>/.erix/skills 下那个目录。',
+    version: '版本 {version}',
+    tools: '工具：{count}',
+    securityScore: '安全分：{score}',
+    scanHints: '{count} 条静态扫描提示',
+    kindMcp: 'MCP 条目',
+    installBlockedMcp: 'P0 不消费 MCP，装不了',
+    driftHint: '已装版本 {installed}，市场版本 {version}：可重新安装覆盖。',
+    installed: {
+      notInstalled: '未安装',
+      installedDisabled: '已安装 · 未启用',
+      installedEnabled: '已安装 · 已启用',
+    },
+    install: '安装',
+    reinstall: '重新安装',
+    uninstall: '卸载',
+    enable: '启用',
+    disable: '禁用',
+    busy: '处理中…',
+    state: {
+      draft: '草稿',
+      published: '已发布',
+      retired: '已下线',
+      unknown: '未知状态',
+    },
+    result: {
+      installed: '已安装 {name}；启用后下一次 run 就能用。',
+      reinstalled: '已重新安装 {name}。',
+      uninstalled: '已卸载 {name}（包目录已删除）。',
+      enabled: '已启用 {name}；下一次 run 生效。',
+      disabled: '已停用 {name}；文件保留，重新启用不需重新下载。',
+    },
+    detail: {
+      open: '详情',
+      close: '收起',
+      loading: '正在读取详情…',
+      whenToUse: '何时用',
+      tools: '工具清单',
+      toolsUnknown: '没拿到工具清单（服务端未下发）。',
+      params: '参数：{params}',
+      readme: 'SKILL.md 正文',
+      readmeMissing: '这个包没附带 SKILL.md。',
+      files: '文件清单',
+    },
+    errors: {
+      notFound: '这个条目已经不在市场里了（可能被下线了）：刷新一下看看。',
+      notPublished: '这个条目当前不是已发布态，装不了：需要管理员先发布。',
+      budgetExceeded: '启用数量已达上限：单个 FDE 最多同时启用 {max} 个技能。' +
+        '请先禁用一个再启用这一个。',
+      kindUnsupported: 'MCP 类型的条目 P0 还不支持（runner 侧没有 MCP 客户端），只能看不能装。',
+      installFailed: '安装没成功：{reason}',
+      reasonUnknown: '原因未给出',
+      validationFailed: '参数不合法：服务端点名了字段 {field}。',
+      validationGeneric: '参数不合法：服务端没点名具体字段。',
+      generic: '请求失败（HTTP {status}）：{message}',
+    },
+  },
   // 管理台（views/AdminLayout.vue / AdminUsersView.vue / AdminView.vue + components/UserLlmPane.vue）
   // 注：服务端透传的 error.message 一律不译，仅译前端自产文案（含「错误：」前缀与 409 拒绝前缀）。
   admin: {
@@ -737,9 +827,79 @@ export const zhCN = {
       // issue #596 片 B：平台提示词面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.16）。
       // 顺序 upload → prompts：两者都是「改一行而不必重建 station-portal」的平台配置。
       prompts: '提示词',
+      // issue #595 M2：能力市场发布台（views/AdminMarketView.vue，契约 §7 管理面）。
+      // 排在上传之后、号池占用（只读运维快照）之前：它是一处平台配置。
+      market: '能力市场',
+      // issue #586：「关于」（版本三格，只读）；views/AdminAboutView.vue。
+      about: '关于',
       // issue #528（事件平台 W5）：宏模板与宏流水的管理台栏目（按 `07` §21.1 的键名表）。
       macros: '宏模板',
       macroRuns: '宏流水',
+    },
+    // 能力市场·发布台（views/AdminMarketView.vue，issue #595 M2；契约 §7 管理面 + §8 管理台）。
+    market: {
+      title: '能力市场',
+      intro: '发布与维护技能包：元数据 + 多文件包体。包内容的合法与否由服务端判。',
+      footnote: '静态扫描是**提示不是闸门**（§3）：分数低不会拦住发布，也不会拦住安装。' +
+        '路径/字节/条数的硬校验在服务端（validateBundle），本页只挡绝对路径与 `..` 这类一眼假。',
+      loading: '正在读取条目…',
+      empty: '还没有条目：点「发布新条目」建一个。',
+      reload: '刷新',
+      filterLabel: '状态',
+      filterAll: '全部',
+      colState: '状态',
+      colSlug: '标识（slug）',
+      colVersion: '版本',
+      colInstalls: '安装数',
+      colScore: '安全分',
+      colActions: '操作',
+      publish: '发布',
+      retire: '下线',
+      edit: '编辑',
+      detail: '详情',
+      close: '关闭',
+      detailLoading: '正在读取详情…',
+      files: '文件清单',
+      filesUnknown: '没拿到文件清单（服务端未下发）。',
+      scanScore: '静态扫描：{score} 分',
+      scanClean: '扫描没有提示。',
+      scanHintCount: '{count} 条提示',
+      createTitle: '发布新条目',
+      editTitle: '编辑条目',
+      submitCreate: '发布',
+      submitSave: '保存',
+      cancel: '取消',
+      formIntro: '带 * 的字段由服务端必填校验；本表单不做前端必填拦截。',
+      fSlug: '标识（slug）*',
+      slugHint: '目录名，全小写字母/数字/连字符；服务端还要求包里的 `skill.id` 等于它。',
+      fName: '名称 *',
+      fSummary: '一句话简介 *',
+      fWhenToUse: '何时用 *',
+      whenToUseHint: '这段会被注入模型的系统提示做路由信号（服务端限 8..500 字）。',
+      fVersion: '版本 *',
+      fAuthor: '作者',
+      fTags: '标签',
+      tagsHint: '逗号分隔（例：pdf,docs）。',
+      fLicense: '许可证',
+      fDescription: '详情正文（markdown）',
+      filesLabel: '包内文件（可多选）',
+      bundleHint: '根目录必须有 `skill.mjs`。path 取目录相对路径（没选目录就是文件名）；' +
+        '文件数/字节上限、缺入口、id 对不上都由服务端报错。',
+      noFilesPicked: '没选文件：新建时必须选，编辑时不选就是只改元数据。',
+      detailMissingHint: '这个条目的详情没读到：「何时用」「正文」可能是空的，' +
+        '请补齐再提交（否则可能把原值清空）。',
+      pickedSummary: '已选 {count} 个文件，共 {bytes}',
+      pathIssue: {
+        empty: '路径是空的',
+        absolute: '绝对路径（不允许）',
+        separator: '路径里有反斜杠',
+        parentRef: '路径含 `..`',
+        tooLong: '路径太长（超 200 字节）',
+      },
+      resultCreated: '已发布条目 {slug}。',
+      resultUpdated: '已更新条目 {slug}。',
+      resultPublished: '已发布 {slug}（状态转成 published）。',
+      resultRetired: '已下线 {slug}（已装的人仍可继续用）。',
     },
     macros: {
       title: '宏模板',
@@ -1125,6 +1285,47 @@ export const zhCN = {
       },
     },
     // LLM 供应商/模型区（AdminView #llmSection + UserLlmPane）
+    // issue #586：「关于」面板（views/AdminAboutView.vue，契约 docs/api/portal.md §4.16）。
+    // 重心不在「有个版本号」，在**三格各自是谁、各自从哪儿读**：v0.1.69 那次 portal 烘了停在 0.1.68 的
+    // 旧工作树，两边分裂一小时而界面上一个读面都没有 ⇒ 文案必须让人一眼看出哪格不作准。
+    about: {
+      title: '关于本站',
+      intro: '只读。三个版本号各来自一处、互不代替：服务端与平台侧引擎读 portal 镜像里烘的 build-info.json；每台 FDE 的引擎读库里的派生副本。',
+      loading: '正在读取版本信息…',
+      notLoaded: '尚未加载版本信息（还没请求）。',
+      fieldVersion: '版本',
+      fieldRevision: '构建修订（git revision）',
+      fieldBuiltAt: '构建时刻',
+      unknown: '未知',
+      unparsable: '无法解析：{value}',
+      serverTitle: '服务端（portal 镜像）',
+      serverHint: '这一格说的是 portal 容器自己在跑哪份构建。',
+      sourceBuildInfo: '来源：镜像内 build-info.json（构建产物，唯一权威）',
+      sourceEnv: '来源：环境变量显式覆盖（测试 / 临时钉版本用的），不是镜像里烘的那份',
+      sourcePackage: '来源：本地 package.json（源码态退路，不是镜像里的构建产物）',
+      sourceUnknown: '来源：未知（build-info.json 与 package.json 都没读到）',
+      sourceUnknownShape: '来源：服务端没给或给了不认识的形状（不猜）',
+      // 实际去读的 build-info 路径（`STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH` 能改它 ⇒ 必须可见）。
+      buildInfoPath: '读取路径：{path}',
+      engineTitle: '平台侧引擎（portal 镜像内的 erix-agent）',
+      engineHint: 'portal 进程自己用的那份引擎，不是每台 FDE 里跑的那份——那是下面第三格。',
+      // 引擎那格的来源标注：跟着服务端推导出的 provenance 走（前端不自己判）。
+      // `package.json` = 源码态退路 / 这份镜像里根本没烘 build-info.json（旧镜像）⇒ 不许顶着「构建产物」的标签。
+      engineSourceBuildInfo: '来源：镜像内 build-info.json 的 engine_version（构建产物，唯一权威）',
+      engineSourcePackage: '来源：本地 node_modules/erix-agent/package.json —— 源码态退路，或这份镜像里根本没有 build-info.json（旧镜像），不是镜像里的构建产物',
+      engineSourceEnv: '来源：环境变量覆盖（portal 侧本不该出现，出现就说明它不是镜像构建产物）',
+      engineSourceUnknown: '来源：未知（build-info.json 与 package.json 都没读到）',
+      engineSourceUnknownShape: '来源：服务端没给或给了不认识的形状（不猜）',
+      fdesTitle: '每台 FDE 的引擎',
+      fdesHint: '读的是 containers.agent_version —— 派生副本，不作准。',
+      snapshotProvision: 'provision 时快照',
+      snapshotUnknown: '口径未给出',
+      fdeProvisionedAt: 'provision 于 {at}',
+      revoked: '已吊销',
+      fdesEmpty: '服务端说当前没有 FDE 容器。',
+      fdesUnreadable: '读不到 containers.agent_version（这是「读不到」，不是「没有 FDE」）。',
+      caveat: '口径：唯一权威是镜像内烘的 build-info.json；package.json 只是构建输入，而 git tag / 镜像 tag / digest / containers.agent_version 都是派生副本，展示时必须标口径。',
+    },
     llm: {
       sectionTitle: 'LLM 供应商',
       emptyProviders: '暂无供应商，先在下方新增。',

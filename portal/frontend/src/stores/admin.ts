@@ -46,6 +46,14 @@ import {
   type PlatformPrompts,
   type PromptFieldKey,
 } from '../lib/platformPrompts';
+// issue #586 管理台「关于」面板（§4.16）。DTO 归一化全在 `lib/versionSurface`（纯函数可单测），
+// 这里只负责「一次调用 = 一次请求」+ 错误透传。**前端一个字都不推算版本**：三格各自读自己的字段。
+import {
+  VERSION_PATH,
+  normalizeVersionInfo,
+  versionErrorText,
+  type VersionInfo,
+} from '../lib/versionSurface';
 // issue #456 M2 管理台证书页（§4.13）。DTO 白名单 / 到期判定 / 错误文案全在 lib（纯函数可单测），
 // 这里只负责「一次调用 = 一次请求」+ 错误透传。**请求体是不透明的 `TlsRequestBody`**：两个 PEM 的
 // 字段名只活在视图里，本文件（与 lib）连字面量都不出现——私钥不进 store 的红线由此**结构上**成立。
@@ -274,6 +282,12 @@ export const useAdminStore = defineStore('admin', {
     previewUsageLoaded: false,
     previewUsageLoading: false,
     previewUsageErr: null as string | null,
+    // issue #586：「关于」面板的版本三格（§4.16）。与号池占用同构：`…Loaded` 与 `…info` 分开
+    // （「还没请求」≠「服务端说没数据」），且不缓存——本页要的就是「现在跑的是哪份构建」。
+    versionInfo: null as VersionInfo | null,
+    versionInfoLoaded: false,
+    versionInfoLoading: false,
+    versionInfoErr: null as string | null,
     // issue #449：邮件通道配置（§4.12）。**口令永不进这里**：DTO 只有 `hasPassword`，
     // 归一化（lib/mailSettings.normalizeMailSettings）是显式白名单，连服务端误发的明文也会被丢掉。
     mailSettings: null as MailSettings | null,
@@ -374,6 +388,29 @@ export const useAdminStore = defineStore('admin', {
 
     dismissTotpOnce() {
       this.totpOnce = null;
+    },
+
+    /**
+     * issue #586：`GET /api/admin/version`（管理台「关于」，§4.16）。
+     *
+     * 一次调用 = 一次请求（与 `loadPreviewUsage` 同口径）：版本是**构建产物**，本页存在的意义就是
+     * 「看一眼现在跑的是哪份」，缓存它就等于把 v0.1.69/0.1.68 那种分裂重新藏起来。
+     * 归一化在 lib：脏值 / 缺字段 ⇒ `null` + `fdesPresent` 旗标，页面据此说「未知 / 读不到」而不是 0。
+     */
+    async loadVersionInfo(): Promise<string | null> {
+      this.versionInfoLoading = true;
+      this.versionInfoErr = null;
+      try {
+        const data = await api<unknown>(VERSION_PATH);
+        this.versionInfo = normalizeVersionInfo(data);
+        this.versionInfoLoaded = true;
+        return null;
+      } catch (e) {
+        this.versionInfoErr = t('admin.errorPrefix') + versionErrorText(e);
+        return this.versionInfoErr;
+      } finally {
+        this.versionInfoLoading = false;
+      }
     },
 
     toggleExpandedProvider(id: string) {
