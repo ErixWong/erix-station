@@ -1294,7 +1294,6 @@ test('J2 必修B stat 后账本又涨过上限 ⇒ 有界读兜住并降级（�
   });
   try {
     // 桩：stat 说「很小、没超限」（真实竞态里的那一瞬间），readBounded 说「读的时候已经超限了」
-    const statsSeen = [];
     h.fsSpy.stat = (p) => {
       h.fsSpy.calls.push(['stat', p]);
       return Promise.resolve({ size: 1024, mtimeMs: 1_794_198_479_703.4 });
@@ -1310,7 +1309,6 @@ test('J2 必修B stat 后账本又涨过上限 ⇒ 有界读兜住并降级（�
     }, '竞态命中时必须走与「超限」同一支降级');
     assert.ok(Number.isInteger(res.items[0].activity.at), 'at 要落回整数 epoch ms');
     // 上限真的传给了读侧（而不是只在 stat 上判一次就无上限 readFile）
-    assert.deepEqual(statsSeen, [], '桩没走真 stat');
     const bounded = h.fsSpy.calls.filter(([op]) => op === 'readBounded');
     assert.equal(bounded.length, 1);
     assert.equal(bounded[0][2], DELEGATE_TRANSCRIPT_MAX_BYTES, 'product 代码要把上限交给有界读');
