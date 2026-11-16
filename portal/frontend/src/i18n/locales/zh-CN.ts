@@ -586,6 +586,9 @@ export const zhCN = {
       starting: '子任务正在启动，暂无输出',
       empty: '这个子任务没有留下任何输出',
       error: '读取子任务输出失败',
+      // issue #602：父 run 已结束、名册却还写着活态（后台子随父 worker 进程消失 ⇒ `finishRun` 永不跑）。
+      // 它是「状态未知」，**不是**失败（与 `activity.staleParentEnded` 同一口径），所以这句不带 ⚠ 也不染红。
+      parentEnded: '父 run 已结束，子任务状态不再更新（实际状态未知）',
     },
     state: {
       queued: '排队中',

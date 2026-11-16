@@ -2,13 +2,21 @@
 // 四条纪律各一条反证用例（终态只拉一次 / 活态按拍 / 转终态即停 / 单飞 / 卸载即停），
 // 加上三态文案、分级颜色、dialog 语义与渲染形状。
 // 时间全部走 fake timers，`fetch` 全部走桩：这里测的是**客户端纪律**，不是后端契约。
+//
+// issue #602 加了**第五条前置**：轮询还要求「父 run 仍是当前活跃 run」（`store.es.activeRunId`）。
+// 于是本文件的装配多了一件事：抽屉现在要读 store ⇒ 每个用例都要 `setActivePinia`，而
+// 「父 run 活跃」是上面那些既有纪律的**前提**，所以 `mountDrawer` 默认把 `activeRunId` 置成
+// `parentRunId`（那些用例测的仍是「父 run 在跑时按 2s 拍」，一字未改），
+// 要测「父 run 已结束」那一面传 `{ parentActive: false }`。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { nextTick } from 'vue';
 import { mount } from '@vue/test-utils';
 import { createI18n } from 'vue-i18n';
+import { createPinia, setActivePinia } from 'pinia';
 import DelegateChildDrawer from './DelegateChildDrawer.vue';
+import { useWorkbenchStore } from '../stores/workbench';
 import { zhCN } from '../i18n/locales/zh-CN';
-import { DELEGATE_POLL_MS, shortRunId } from '../lib/delegate';
+import { DELEGATE_POLL_MS, DELEGATE_UNKNOWN_MARK, shortRunId } from '../lib/delegate';
 
 const i18n = createI18n({ legacy: false, locale: 'zh-CN', messages: { 'zh-CN': zhCN } });
 const COPY = zhCN.delegate;
@@ -47,9 +55,22 @@ function stubFetch(...responses: StubResponse[]) {
   return fn;
 }
 
-function mountDrawer(props: Record<string, unknown> = {}, attach = false) {
+/**
+ * 装配抽屉。**默认「父 run 就是当前活跃 run」**（#602 之前这就是唯一世界；#602 之后它成了一条
+ * 需要写出来的前提）——抽屉现在只读 `store.es.activeRunId` 来判这条，所以每个用例都得有 pinia。
+ *
+ * @param props 覆盖抽屉 props（`parentRunId` 缺省 `parent-run-aaaa`）
+ * @param attach 挂到 `document.body`（dialog 焦点类用例用）
+ * @param options.parentActive `false` ⇒ 把 `es.activeRunId` 置 null（父 run 已结束，#602）
+ */
+function mountDrawer(props: Record<string, unknown> = {}, attach = false, options: { parentActive?: boolean } = {}) {
+  const store = useWorkbenchStore();
+  const parentRunId = typeof props.parentRunId === 'string' ? props.parentRunId : 'parent-run-aaaa';
+  // 只动这一个 store 字段：`sessionId` 留给空串 ⇒ store 里那个名册面板（`useDelegateActivity`）
+  // 自己不会起轮询，不会往下面的 `fetch` 计数里混请求。
+  store.es.activeRunId = options.parentActive === false ? null : parentRunId;
   return mount(DelegateChildDrawer, {
-    props: { sessionId: 'sess-1', parentRunId: 'parent-run-aaaa', childRunId: 'child-run-bbbb', ...props },
+    props: { sessionId: 'sess-1', parentRunId, childRunId: 'child-run-bbbb', ...props },
     global: { plugins: [i18n] },
     attachTo: attach ? document.body : undefined,
   });
@@ -62,6 +83,7 @@ async function tick(ms = 0) {
 }
 
 beforeEach(() => {
+  setActivePinia(createPinia());
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
 });
 
@@ -320,6 +342,109 @@ describe('DelegateChildDrawer dialog 语义', () => {
     await wrapper.find('[data-testid="delegate-refresh"]').trigger('click');
     await tick(0);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    wrapper.unmount();
+  });
+});
+
+// issue #602：后台子 run 随父 worker 进程消失 ⇒ 引擎那句 `finishRun` 永不执行 ⇒ 名册**永久**停在
+// `running`，而旧代码的「终态即停」永不触发 ⇒ 抽屉开了就是永久 2s 一发（真机：10s 内 5 发）。
+// 修法的前置：轮询只服务于「父 run 仍是当前活跃 run」（`store.es.activeRunId`）。
+describe('DelegateChildDrawer 父 run 结束后停止轮询（issue #602）', () => {
+  it('父 run 已结束 ⇒ 首发之后零请求（推进 10 拍也不多发一发）', async () => {
+    const fetchMock = stubFetch(response()); // 名册 state 仍是 running（就是真机那个卡死形状）
+    const wrapper = mountDrawer({}, false, { parentActive: false });
+    await tick(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // 打开抽屉该读到的一次还是要有（只读账本仍然有价值）
+
+    await tick(DELEGATE_POLL_MS * 10);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // 之后一发都不发
+    wrapper.unmount();
+  });
+
+  it('父 run 已结束 ⇒ 出现那行中性说明，且不是告警（无 ⚠ / 无 text-red-600）', async () => {
+    stubFetch(response());
+    const wrapper = mountDrawer({}, false, { parentActive: false });
+    await tick(0);
+
+    const note = wrapper.get('[data-testid="delegate-parent-ended"]');
+    expect(note.text()).toBe(COPY.viewer.parentEnded);
+    expect(note.classes()).toContain('text-black/40'); // 与 `delegate.polling` 那行同一中性小字
+    expect(wrapper.text()).not.toContain('⚠');
+    expect(wrapper.html()).not.toContain('text-red-600');
+    // 「运行中，自动刷新」那句不再挂着（真机上它就是永久轮询的自供状）
+    expect(wrapper.text()).not.toContain(COPY.polling);
+    wrapper.unmount();
+  });
+
+  it('父 run 已结束 ⇒ 徒章不再转圈，按 `unknown` 中性档收（不拿旧 running 谎报「运行中」）', async () => {
+    stubFetch(response());
+    const wrapper = mountDrawer({}, false, { parentActive: false });
+    await tick(0);
+
+    const badge = wrapper.get('[data-testid="delegate-badge"]');
+    expect(badge.find('svg.animate-spin').exists()).toBe(false);
+    expect(badge.attributes('data-badge-kind')).toBe('unknown');
+    expect(badge.classes().join(' ')).toContain('text-black/50');
+    expect(badge.text()).toBe(`${DELEGATE_UNKNOWN_MARK}${COPY.state.unknown}`); // 中性点 + 「状态未知」
+    wrapper.unmount();
+  });
+
+  it('不误伤：父 run 已结束而名册**已终态** ⇒ 不出那句说明（那是已知答案，不是未知）', async () => {
+    stubFetch(response({ body: { ...OK_BODY, state: 'completed' } }));
+    const wrapper = mountDrawer({}, false, { parentActive: false });
+    await tick(0);
+
+    expect(wrapper.find('[data-testid="delegate-parent-ended"]').exists()).toBe(false);
+    const badge = wrapper.get('[data-testid="delegate-badge"]');
+    expect(badge.attributes('data-badge-kind')).toBe('completed');
+    expect(badge.classes().join(' ')).toContain('text-green-600'); // ✓ 绿照常（#602 只动「活态卡死」）
+    wrapper.unmount();
+  });
+
+  it('不误伤：手动「刷新」在父 run 结束后仍可用（停的是自动轮询，不是用户的出口）', async () => {
+    const fetchMock = stubFetch(response());
+    const wrapper = mountDrawer({}, false, { parentActive: false });
+    await tick(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await wrapper.find('[data-testid="delegate-refresh"]').trigger('click');
+    await tick(0);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await tick(DELEGATE_POLL_MS * 3); // 手动那一发之后也不得把自动链子救活
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    wrapper.unmount();
+  });
+
+  it('抽屉开着时父 run 收尾（`activeRunId` 变 null）⇒ 当场停：已排的那一发跑完就不再续', async () => {
+    const store = useWorkbenchStore();
+    const fetchMock = stubFetch(response());
+    const wrapper = mountDrawer(); // 默认父 run 活跃
+    await tick(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await tick(DELEGATE_POLL_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    store.es.activeRunId = null; // run_end 到了
+    await nextTick();
+    await tick(DELEGATE_POLL_MS * 5);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // 一条新请求都不许发
+    expect(wrapper.find('[data-testid="delegate-parent-ended"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('父 run 已结束 ⇒ 标签页重新可见也不补一发（自动刷新全停，不只是 timer）', async () => {
+    const fetchMock = stubFetch(response());
+    const wrapper = mountDrawer({}, false, { parentActive: false });
+    await tick(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const spy = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    await tick(0);
+    spy.mockReturnValue('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await tick(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     wrapper.unmount();
   });
 });
