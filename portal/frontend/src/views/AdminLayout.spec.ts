@@ -101,7 +101,7 @@ describe('AdminLayout tab 导航（#449 邮件通道）', () => {
 
     // 裸路由把 tab 桩成 `/<name>`，所以 href 是 `/admin-mail`（真实应用里是 `/admin/mail`，
     // 路由表那条由本用例末尾的 `routes` 断言钉住）。
-    const links = wrapper.findAll('nav a').slice(0, 7);
+    const links = wrapper.findAll('nav a').slice(0, 8);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-mail');
 
@@ -138,7 +138,7 @@ describe('AdminLayout tab 导航（#456 证书页）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 7);
+    const links = wrapper.findAll('nav a').slice(0, 8);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-tls');
 
@@ -173,16 +173,18 @@ describe('AdminLayout tab 导航（#485 片 A 上传上限）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 7);
+    const links = wrapper.findAll('nav a').slice(0, 8);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-upload');
     expect(links.find((link) => link.attributes('href') === '/admin-upload')!.text()).toBe('上传上限');
 
-    // 顺序：certs → **upload** → pool（平台配置挨在一起，只读的号池占用永远留最后）
+    // 顺序：certs → **upload** → market → pool（平台配置挨在一起，只读的号池占用永远留最后）
+    // ⚠ #595 在 upload 与 pool 之间插了「能力市场」⇒ 这里的相邻判据同步改（精确相邻由 #595 那条钉）。
     expect(hrefs.indexOf('/admin-upload')).toBe(hrefs.indexOf('/admin-tls') + 1);
-    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-upload') + 1);
+    expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-upload') + 1);
+    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-market') + 1);
     // tab 总数：这一格是「加 tab 必须同步改本文件桩路由」那条红线的正面（漏改 ⇒ 挂载就抛，不会走到这里）
-    expect(hrefs).toHaveLength(7);
+    expect(hrefs).toHaveLength(8);
 
     // 路由表本身：`/admin` 的 children 里有 `upload` → `admin-upload`，懒加载且要求 admin 角色
     const adminRoute = routes.find((route) => route.path === '/admin')!;
@@ -190,6 +192,37 @@ describe('AdminLayout tab 导航（#485 片 A 上传上限）', () => {
     expect(uploadRoute.path).toBe('upload');
     expect(uploadRoute.meta).toEqual({ requiresRole: 'admin' });
     expect(typeof uploadRoute.component).toBe('function');
+  });
+});
+
+// issue #595 M2：新 tab「能力市场」必须真在导航里且指向 `admin-market`（同 #449/#456/#485 的判据
+// 形状：只加路由不加 tab ⇒ 这一页在管理台里没有入口，等于没做）。
+describe('AdminLayout tab 导航（#595 能力市场）', () => {
+  it('导航里有「能力市场」，指向 admin-market，且排在上传上限之后、号池占用之前', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
+    const auth = useAuthStore();
+    auth.user = ADMIN_WITH_SEAT as never;
+    auth.ready = true;
+    const router = makeRouter();
+    router.push('/');
+    await router.isReady();
+    const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
+
+    const links = wrapper.findAll('nav a');
+    const hrefs = links.map((link) => link.attributes('href'));
+    expect(hrefs).toContain('/admin-market');
+    expect(links.find((link) => link.attributes('href') === '/admin-market')!.text()).toBe('能力市场');
+
+    // 精确相邻：upload → **market** → pool（market 只插在两者之间，pool 仍是平台配置段的末尾）
+    expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-upload') + 1);
+    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-market') + 1);
+
+    // 路由表本身：`/admin` 的 children 里有 `market` → `admin-market`，懒加载且要求 admin 角色
+    const adminRoute = routes.find((route) => route.path === '/admin')!;
+    const marketRoute = (adminRoute.children ?? []).find((child) => child.name === 'admin-market')!;
+    expect(marketRoute.path).toBe('market');
+    expect(marketRoute.meta).toEqual({ requiresRole: 'admin' });
+    expect(typeof marketRoute.component).toBe('function');
   });
 });
 

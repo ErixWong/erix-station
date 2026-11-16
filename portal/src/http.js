@@ -49,6 +49,7 @@ import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期�
 import * as delegation from './delegation.js'; // 子 run（delegation）读侧：名册 + 账本两个只读端点
 import * as macroRoutes from './macro-routes.js'; // #526：宏平台 HTTP 业务层（if 链只做「匹配+鉴权+转发」，不再撑大本文件）
 import { MacroError } from './macros.js'; // #526：宏域错误载体（httpStatus 自带在错误上，一处映射）
+import * as market from './market.js'; // #595：能力市场（校验/安装面），本文件只做「匹配+鉴权+转发+审计」
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -790,6 +791,14 @@ export function createServer({
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof market.MarketError) {
+        // #595：市场域自己的错误载体（`code` 集合是 §7 的契约：validation_failed /
+        // capability_not_found / capability_not_published / capability_budget_exceeded /
+        // capability_kind_unsupported / capability_install_failed）。`details` 里只有字段名/数字/路径，
+        // **不含包内容**（2 MiB 的源码不该进错误响应）。
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       if (err instanceof tlsCert.TlsCertError) {
         // #456：证书面的错误一律 `retryable:false`（`tls_cert_expired` 也是——换一张证书才是出路，
         // 重试一万次还是同一张）。`details` 里只有字段名/域名/指纹，**没有 PEM、没有私钥**。
@@ -1259,6 +1268,70 @@ async function routeApi(req, res, ctx, url) {
     }));
   }
 
+  // ---- issue #595 能力市场：用户面（§7）。三条红线：只读 published、只作用于**当前登录用户自己的**
+  // FDE、写操作一律审计。`fde_id` 与 `fde_name` 都取自 session，**不接受请求体里的 fde**
+  // （收了就等于任何人都能往别人的家目录写文件）。 ----
+  if (pathname === '/api/market/items') {
+    if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    const s = await requireSession(req, ctx);
+    const fde = marketFdeOf(s);
+    return sendJson(res, 200, await market.listUserItems({ pool: ctx.pool, fdeId: fde.id }));
+  }
+  const marketItemMatch = pathname.match(/^\/api\/market\/items\/([^/]+)$/);
+  if (marketItemMatch) {
+    const s = await requireSession(req, ctx);
+    const fde = marketFdeOf(s);
+    const slug = decodeURIComponent(marketItemMatch[1]);
+    if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    // slug 在**路径层**就卡形状：不合法根本不可能存条目，让它进库查一轮只会把 400 拖成 404。
+    if (!market.SKILL_SLUG_RE.test(slug)) {
+      throw new HttpError(400, 'validation_failed', 'slug 不合法', { details: { field: 'slug', slug } });
+    }
+    return sendJson(res, 200, { item: await market.getUserItem({ pool: ctx.pool, fdeId: fde.id, slug }) });
+  }
+  const marketActionMatch = pathname.match(/^\/api\/market\/items\/([^/]+)\/(install|uninstall|enabled)$/);
+  if (marketActionMatch) {
+    if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    const s = await requireSession(req, ctx);
+    const fde = marketFdeOf(s);
+    const slug = decodeURIComponent(marketActionMatch[1]);
+    const action = marketActionMatch[2];
+    if (!market.SKILL_SLUG_RE.test(slug)) {
+      throw new HttpError(400, 'validation_failed', 'slug 不合法', { details: { field: 'slug', slug } });
+    }
+    // install/enabled 带体（`enabled` / `force`）；uninstall 无体 ⇒ 不卡 Content-Type
+    // （`requireJson` 会把没带 JSON 头的卸载请求直接 415，而它的语义本来就不需要体）。
+    let body = {};
+    if (action !== 'uninstall') {
+      requireJson(req);
+      body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    }
+    let result;
+    if (action === 'install') {
+      result = await market.installCapability({
+        pool: ctx.pool, config: ctx.config, fde, slug,
+        enabled: body?.enabled === undefined ? undefined : Boolean(body.enabled),
+        force: body?.force === true,
+        log: ctx.log,
+      });
+    } else if (action === 'uninstall') {
+      result = await market.uninstallCapability({ pool: ctx.pool, config: ctx.config, fde, slug, log: ctx.log });
+    } else {
+      result = await market.setCapabilityEnabled({ pool: ctx.pool, fde, slug, enabled: body?.enabled });
+    }
+    await auth.audit(ctx.pool, {
+      actorId: s.user.id,
+      action: `user.capability_${action === 'enabled' ? 'enabled' : action}`,
+      target: `capability:${slug}`,
+      // 只记结果与版本：磁盘路径是平台内部事实，进了审计就会变成第二份真相。
+      details: { changed: result.changed, version: result.version ?? null, enabled: result.enabled ?? null },
+    });
+    // 回包里同时给 `result`（这次做了什么）与 `item`（市面应长什么样）：前端装完要立刻把卡片翻成
+    // 「已装/已启用」，拿刷新后的条目比让它自己拼三个字段便宜也不会不一致。
+    const item = await market.getUserItem({ pool: ctx.pool, fdeId: fde.id, slug });
+    return sendJson(res, 200, { result, item });
+  }
+
   // ---- admin LLM 配置（issue #38 Phase A；requireAdmin 鉴权） ----
   if (pathname.startsWith('/api/admin/')) {
     return handleAdminApi(req, res, ctx, url);
@@ -1272,6 +1345,20 @@ async function routeApi(req, res, ctx, url) {
 // ---------------------------------------------------------------------------
 
 /** admin 鉴权：session 用户 role 必须为 'admin'，否则 403 forbidden。 */
+/**
+ * #595：把 session 折成 `{id, name}` 的 FDE 坐标。
+ * `fde_name` 缺失 = 这个账号没有自己的家目录（平台里 FDE 账号一定有），所以 400 而不是 403：
+ * 这不是权限不够，是这个账号**没有可写的地方**。同 `git-credential` 那一条的口径。
+ */
+function marketFdeOf(session) {
+  const name = session.user.fde_name;
+  if (!name) {
+    throw new HttpError(400, 'fde_name_required', '当前用户未分配 fde_name，无法安装能力（技能）',
+      { details: { field: 'fde_name' } });
+  }
+  return { id: session.user.id, name };
+}
+
 async function requireAdmin(req, ctx) {
   const session = await requireSession(req, ctx);
   if (session.user.role !== 'admin') throw new HttpError(403, 'forbidden', 'forbidden');
@@ -1723,6 +1810,76 @@ async function handleAdminApi(req, res, ctx, url) {
       // INSERT 失败就是「设置已生效而审计一行没有」，并发保存还会把 `previous_*` 记成自己进来之前的数。
       // 再补一笔 `auth.audit` 会退回那两个窗口，并且多写一条审计行（`upload-settings.test.js` US-18 钉这一点）。
       return sendJson(res, 200, result.settings);
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
+  // ---- issue #595 能力市场：管理面（§7）。全部已在 handleAdminApi 入口过 `requireAdmin`。
+  // 这一层的职责只有四件：匹配、鉴权、把 body 递给 market.js、写审计。校验与落盘全在数据层
+  // （判据必须与 CLI/脚本调用同一条路径，不能只长在 HTTP 上）。 ----
+  if (pathname === '/api/admin/market/items') {
+    if (req.method === 'GET') {
+      const state = url.searchParams.get('state');
+      // 非法 `?state=` 当场 400：静默当成「没筛」返回全量，管理台会以为筛选生效了（数字对不上才发觉）。
+      if (state !== null && state !== '' && !['draft', 'published', 'retired'].includes(state)) {
+        throw new HttpError(400, 'validation_failed', 'state 只允许 draft/published/retired',
+          { details: { field: 'state', state } });
+      }
+      return sendJson(res, 200, await market.listAdminItems({ pool: ctx.pool, state: state || null }));
+    }
+    if (req.method === 'POST') {
+      requireJson(req);
+      // bundle 是 JSON 里的 base64：2 MiB 原文编码后约 2.75 MiB，而 `config.maxBodyBytes` 默认只有
+      // 64 KiB ⇒ 这一条路由必须显式抬高上限，否则 413 会先于任何校验发生（§4.15 记的同一条坑）。
+      const body = await readJsonBody(req, market.BUNDLE_MAX_BODY_BYTES);
+      const item = await market.publishItem({ pool: ctx.pool, actorId: session.user.id, fields: body });
+      await auth.audit(ctx.pool, {
+        actorId: session.user.id,
+        action: 'admin.capability_created',
+        target: `capability:${item.slug}`,
+        // 审计里只记账面事实（版本/状态/扫描分），**不含包内容与 base64**。
+        details: { id: item.id, version: item.version, state: item.state, security_score: item.security_score },
+      });
+      return sendJson(res, 201, { item });
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  const adminMarketStateMatch = pathname.match(/^\/api\/admin\/market\/items\/([^/]+)\/(publish|retire)$/);
+  if (adminMarketStateMatch && req.method === 'POST') {
+    const itemId = decodeUuid(adminMarketStateMatch[1]);
+    // ⚠ URL 里的**动词**不等于库里的**状态**：`capability_items.state` 只允许 draft/published/retired，
+    //   直接传 `publish` 会被 `setItemState` 的域校验拒成 400 `validation_failed`（真机发布过这条路）。
+    //   映射表在 `market.STATE_VERBS`（单一真相，单测 MK-23 钉住），未知动词 ⇒ 405。
+    const state = market.stateForVerb(adminMarketStateMatch[2]);
+    const item = await market.setItemState({ pool: ctx.pool, itemId, state });
+    await auth.audit(ctx.pool, {
+      actorId: session.user.id,
+      action: `admin.capability_${adminMarketStateMatch[2]}`,
+      target: `capability:${item.slug}`,
+      details: { id: item.id, state: item.state },
+    });
+    return sendJson(res, 200, { item });
+  }
+  const adminMarketItemMatch = pathname.match(/^\/api\/admin\/market\/items\/([^/]+)$/);
+  if (adminMarketItemMatch) {
+    const itemId = decodeUuid(adminMarketItemMatch[1]);
+    if (req.method === 'GET') {
+      // 详情才带 manifest / files / warnings；列表**不取 bytea**（50 条 × 2 MiB 会先把进程吃掉）。
+      return sendJson(res, 200, { item: await market.getAdminItem({ pool: ctx.pool, itemId }) });
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, market.BUNDLE_MAX_BODY_BYTES);
+      const item = await market.updateItem({ pool: ctx.pool, actorId: session.user.id, itemId, fields: body });
+      await auth.audit(ctx.pool, {
+        actorId: session.user.id,
+        action: 'admin.capability_updated',
+        target: `capability:${item.slug}`,
+        // `has_bundle` 区分「只改了文案」与「出了新版」——事后追查「这台 FDE 为什么版本不同」时只看得到版本
+        // 号，那是不够的，还得知道哪一次请求真正带了包。
+        details: { id: item.id, version: item.version, has_bundle: body?.bundle != null },
+      });
+      return sendJson(res, 200, { item });
     }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }

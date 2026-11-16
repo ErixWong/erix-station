@@ -363,14 +363,15 @@ test('#451 接线锁①：collectAgentsMd( 恰好 1 次，且采集/渲染/拼�
 
 test('#451 接线锁②：config.input.system 是 SYSTEM_PROMPT + agentsMdSection（不是裸 SYSTEM_PROMPT）', () => {
   const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
-  assert.match(src, /system: SYSTEM_PROMPT \+ agentsMdSection,/,
-    '注入点必须拼上采集结果；写成裸 SYSTEM_PROMPT 等于本功能整条死掉，而且不会有任何报错');
-  assert.equal((src.match(/system: SYSTEM_PROMPT(?! \+ agentsMdSection)/g) ?? []).length, 0,
+  // #595：拼装形状从两段变三段（`capabilitySection` 为空时逐字节等于两段版 ⇒ 空容器零影响）。
+  assert.match(src, /system: SYSTEM_PROMPT \+ agentsMdSection \+ capabilitySection,/,
+    '注入点必须同时拼上约定文件段与平台技能段；漏掉任一段等于那条功能整条死掉，而且不会有任何报错');
+  assert.equal((src.match(/system: SYSTEM_PROMPT(?! \+ agentsMdSection \+ capabilitySection)/g) ?? []).length, 0,
     '不得有任何「裸 SYSTEM_PROMPT」的 system 拼装点（设计稿 §6.2 W1）：第二处会让人以为注入生效了');
   assert.equal((src.match(/renderAgentsMdSection\(/g) ?? []).length, 1, '渲染调用点必须唯一（W1）');
   // M3：拼接口不得漂到函数外（`agentsMdSection` 是 startRun 的局部变量，搬出去直接 ReferenceError）。
   const { startRunAt, endAt } = startRunBodyRange(src);
-  const systemAt = src.indexOf('system: SYSTEM_PROMPT + agentsMdSection');
+  const systemAt = src.indexOf('system: SYSTEM_PROMPT + agentsMdSection + capabilitySection');
   assert.ok(systemAt > startRunAt && systemAt < endAt,
     `拼装点必须在 startRun 函数体内（实际 index=${systemAt}，体内区间=[${startRunAt}, ${endAt}]）`);
 });
@@ -475,3 +476,58 @@ function extractOnEventBlock(src) {
   assert.notEqual(end, -1, 'onEvent 与 onDelta 之间必须能划出一段（抠取器假设的形状变了要同步本文件）');
   return src.slice(start, end);
 }
+
+// ---------------------------------------------------------------------------
+// issue #595（能力市场 P0）：「平台技能」段的接线与措辞。
+// 这一段的成败形状与 #451 完全同构：**拼错不报错**，只是模型永远看不见技能，或看见了调不到的工具。
+// 所以三条都做成源码级锁（不看运行期输出：worker 起不来时它们同样必须能判）。
+// ---------------------------------------------------------------------------
+
+test('#595 接线锁①：能力采集点唯一、在 startRun 体内，且 excludeSkillIds 真的传给了 buildSkillTools', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const hits = src.match(/buildCapabilityIndex\(/g) ?? [];
+  assert.equal(hits.length, 1, `采集点必须唯一（实际 ${hits.length} 处）：两处采集 = 两个时刻读同一个文件，`
+    + '中间被物化重写就会出现「提示词说有三条、工具面只装两条」，模型去调一个 Unknown tool');
+  const { startRunAt, endAt } = startRunBodyRange(src);
+  const at = src.indexOf('buildCapabilityIndex(');
+  assert.ok(at > startRunAt && at < endAt,
+    `采集必须在 startRun **函数体内**（实际 index=${at}）：worker 进程被复用给下一个 run，提到模块顶层 = `
+    + '第二个 run 沿用第一个 run 的快照（与 #451 的 AGENTS.md 同一条老账）');
+  // L2 的落点：停用项必须真的进 `buildSkillTools`，否则「页面里关了」只关掉了提示词、没关掉工具面。
+  // 只认 `await buildSkillTools({`：本文件的注释里也写着 `buildSkillTools({excludeSkillIds})`，
+  // 裸正则会把注释当成第二个装配点（261116 审计同型：注释命中让锁看起来红/绿都不对）。
+  const calls = src.match(/await buildSkillTools\(\{[\s\S]*?\}\)/g) ?? [];
+  assert.equal(calls.length, 1, `技能装配点必须唯一（实际 ${calls.length} 处）`);
+  assert.match(calls[0], /excludeSkillIds: capabilityExclude/,
+    `buildSkillTools 必须收到 excludeSkillIds（只改提示词不改装配 = 模型看不见但工具仍在，用户以为关了）：${calls[0]}`);
+  assert.match(calls[0], /home: process\.env\.HOME \|\| '\/home\/erix'/,
+    '技能装配仍走 $HOME（~/.erix/skills 是市场写的那一侧）');
+});
+
+test('#595 接线锁②：提示词不再声称「工具面只有这些」，并说明末尾的平台技能段是什么', () => {
+  const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
+  // 旧句子在装了技能之后**必然是谎**（工具面不止那些），留着比删掉更坏：模型会据此判定
+  // 「末尾那段列出的工具不在工具面里」，从而不调它。
+  assert.doesNotMatch(prompt, /工具面只有这些/, `旧口径必须退场（技能装配进来之后它就不成立）：${prompt.slice(0, 200)}`);
+  assert.match(prompt, /工具面/, '工具面这一句必须仍在（工具名清单的单一来源，只是不再穷举）');
+  assert.match(prompt, /平台技能/, '必须告诉模型末尾可能出现「平台技能」段（不告知 = 它不知道那些工具能用）');
+  assert.match(prompt, /末尾/, '必须写明那段的位置在提示词末尾（否则模型会去找一个不存在的工具说明）');
+  // 反向防漂移：段不存在是默认形态（没装技能），提示词不得把它写成一定存在的事实。
+  assert.match(prompt, /若本提示词\*\*末尾\*\*出现|如果本提示词\*\*末尾\*\*出现/,
+    '必须写成条件式（没装技能时那段根本不存在，写成事实会让模型去找不存在的东西）');
+  // 内置工具名一个都不许掉（这条与本单无关，但改同一句话时最容易手滑）。
+  for (const n of ['readFile', 'searchText', 'tree', 'edit', 'writeFile', 'shell']) {
+    assert.ok(prompt.includes(n), `内置工具名 ${n} 不得在改版时丢掉`);
+  }
+});
+
+test('#595 接线锁③：降级走现成 MSG.LOG，不新增事件类型（采集失败不许把 run 打死）', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const { startRunAt, endAt } = startRunBodyRange(src);
+  const body = src.slice(startRunAt, endAt);
+  // 顺序是 `type: MSG.LOG` 在前、`msg:` 在后（本仓 sendIpc 的固定形状），反向匹配才会假绿。
+  assert.match(body, /type: MSG\.LOG[\s\S]{0,160}capability index collection failed/,
+    '采集失败必须落一条 warn（否则线上只看得到「模型不知道有技能」，看不到为什么）');
+  assert.equal((body.match(/type: 'CAPABILITY|MSG\.CAPABILITY/g) ?? []).length, 0,
+    '不得为能力市场新增 IPC 事件类型（#451 定下的口径：记账走现成 MSG.LOG）');
+});
