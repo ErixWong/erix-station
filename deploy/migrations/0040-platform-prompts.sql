@@ -1,4 +1,4 @@
--- 0039-platform-prompts.sql —— 管理台「提示词」面板的数据层（issue #596 片 A / 工单 feat-261116-20，
+-- 0040-platform-prompts.sql —— 管理台「提示词」面板的数据层（issue #596 片 A / 工单 feat-261116-20，
 -- 2026-11-16）。契约：docs/design/admin-prompts-panel-2026-11-16.md §2。
 --
 -- 背景：平台喂给模型的文本里，portal 侧可控的三条（`~/AGENTS.md` 的补充约定、`~/AGENTS.md` 的整段覆写、
@@ -53,7 +53,12 @@
 --   末尾 DO 块**只读**，打印重放证据（无行也是正常态 ⇒ NOTICE，不是 EXCEPTION）。
 --   baseline `docs/data/schema.sql` 一个字节都不改（冻结）。
 --   ⚠ 本片（#596 片 A）**尚未进入任何已部署库** ⇒ 本文件在同一片里迭代（加上面那条种行）不碰
---     deploy/migrations/README.md 那条「已应用的迁移不可再改」的红线；一旦上线就只能新增 0040。
+--     deploy/migrations/README.md 那条「已应用的迁移不可再改」的红线；一旦上线就只能新增新编号。
+--   ⚠ **编号本身换过一次**（2026-11-16）：本文件原为 `0039-platform-prompts.sql`，而 `origin/main` 已经
+--     有 `0039-capability-market.sql`（#595）⇒ `NNNN` 同号两个文件违反 README「四位递增序号」，且 dev 库里
+--     真的同时落了 `0039-capability-market` 与 `0039-platform-prompts` 两行台账而没有任何判据报警 ⇒
+--     本文件让号到 0040（未进任何已部署库，换号 + 重放安全：内容只有 IF NOT EXISTS / ON CONFLICT DO
+--     NOTHING / 只读 DO 块）。机械闸：`portal/test/migrations.test.js`「迁移编号 NNNN 全局唯一」。
 
 CREATE TABLE IF NOT EXISTS platform_prompts (
   id                 int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -86,9 +91,9 @@ BEGIN
     INTO a_default, o_default, t_default
     FROM platform_prompts WHERE id = 1;
   IF row_count = 0 OR a_default IS NULL THEN
-    RAISE NOTICE '0039: platform_prompts 行数=%（无行 = 三块全部跟随内置提示词）', row_count;
+    RAISE NOTICE '0040: platform_prompts 行数=%（无行 = 三块全部跟随内置提示词）', row_count;
   ELSE
-    RAISE NOTICE '0039: platform_prompts 行数=%，跟随内置：addendum=% override=% title=%（生效值以 portal 读侧为准）',
+    RAISE NOTICE '0040: platform_prompts 行数=%，跟随内置：addendum=% override=% title=%（生效值以 portal 读侧为准）',
       row_count, a_default, o_default, t_default;
   END IF;
 END $$;

@@ -1,4 +1,4 @@
-// issue #596 片 B：管理台「提示词」页的单测（`AdminPromptsView.vue`，契约 `docs/api/portal.md` §4.16）。
+// issue #596 片 B：管理台「提示词」页的单测（`AdminPromptsView.vue`，契约 `docs/api/portal.md` §4.18）。
 //
 // 装配照 `AdminUploadView.spec.ts`：直接挂视图（本页不依赖路由）+ 真实 i18n 单例 + pinia +
 // 按 URL/方法分派的 fetch 桩（判据要读**请求体**，所以桩必须把 body 记下来）。
@@ -195,7 +195,7 @@ describe('F1 挂载只发 1 次 GET', () => {
     expect(text(w, 'bytes-titlePrompt')).toContain('1.95 KiB');
     expect(text(w, 'agents-md-render-budget')).toContain('16 KiB');
     // 预算口径必须说清：DTO 那个数用示例名 `example` 渲染，而写侧闸按最长合法工位名算
-    // （契约 §4.16-3 评审 F2）⇒ 不写清就变成「页面没顶到上限就存得进去」的错承诺。
+    // （契约 §4.18-3 评审 F2）⇒ 不写清就变成「页面没顶到上限就存得进去」的错承诺。
     expect(text(w, 'agents-md-render-budget-note')).toContain('example');
     expect(text(w, 'agents-md-render-budget-note')).toContain('最长合法工位名');
   });

@@ -63,7 +63,7 @@ function captureLog() {
 
 /**
  * `platform_prompts` 的内存 fake：**按 SQL 说的做**（AGENTS §8.14，不把新语句当未知放行），
- * 并把迁移 0039 的 DB 事实当约束执行：只能有一行（`id = 1`）。
+ * 并把迁移 0040 的 DB 事实当约束执行：只能有一行（`id = 1`）。
  * 注入位：`failSelect`（读抛错 = 表不存在）、`hangSelect`（读不返回 = 超时）、`failAudit`
  * （审计写失败 ⇒ 整条语句失败而设置**一格没变** = 语句级原子）、`failEnqueue`（入队抛错）、
  * `concurrent: N`（判据 `P12` 用：把「N 条保存同时在飞」建模进来，口径见 `query()` 里那段注释）。
@@ -96,7 +96,7 @@ class PromptsFakePool {
     // ★ `P12` 把真库的两件事实建模出来（真并行与真锁在 `portal/integration/platform-prompts-db.mjs`）：
     //   ① **到达栅栏**：两条保存都进到这条语句里才放行 ⇒ 假池不会把「并发」默默跑成串行
     //      （串行 = 假绿，那才是这里最坑的错；等不齐会报错而不是挂死）。
-    //   ② **行锁只在有行时存在**：`this.row !== null`（= 迁移 0039 已种首行）才排队 ⇒ 后一条的快照
+    //   ② **行锁只在有行时存在**：`this.row !== null`（= 迁移 0040 已种首行）才排队 ⇒ 后一条的快照
     //      必然是前一条写完之后的；`this.row === null`（未种行的旧形态）时 `FOR UPDATE` 锁不到任何
     //      东西 ⇒ 两条各拿一份空快照（丢更新的成因，同一个假池同一对输入 ⇒ 病复现得出来）。
     await this.arrivals();
@@ -735,12 +735,12 @@ test('P8b 审计写不进去 ⇒ 整条语句失败而设置一格没变（语�
 });
 
 // ---------------------------------------------------------------------------
-// `P12`：首写并发（评审 F1）。假池里两种快照 = 「已种行」（迁移 0039 现在的形态）与「无行」
+// `P12`：首写并发（评审 F1）。假池里两种快照 = 「已种行」（迁移 0040 现在的形态）与「无行」
 // （加种行之前的形态）：同一个假池、同一对输入，一边绿一边病 ⇒ 钉住的才是「种行」这件事本身。
 // 真并行与真行锁在 `portal/integration/platform-prompts-db.mjs`（真库腿）钉；这里钉的是语义。
 // ---------------------------------------------------------------------------
 
-/** 迁移 0039 种下的那一行：三列都是 DEFAULT `''`（= 跟随内置）。 */
+/** 迁移 0040 种下的那一行：三列都是 DEFAULT `''`（= 跟随内置）。 */
 const SEEDED_ROW = () => ({
   agents_md_addendum: '', agents_md_override: '', title_prompt: '', updated_at: null, updated_by: null,
 });
@@ -1246,11 +1246,34 @@ test('P11b 这条锁不是装饰：合成一对同样互相 import 的模块，�
   }
 });
 
+/**
+ * 取 `docs/api/portal.md` 里某一节的正文：从 `### <num> ` 那一行起，到**下一个** `## ` / `### ` 标题为止。
+ *
+ * ⚠ 为什么不是 `apiDoc.indexOf('### 4.18 ')` 那种前缀匹配 + 「切到 `## 5.`」的粗切法（本格子原先
+ *   就是那么写的）：合并 `origin/main` 时 §4.16 一度存在**两个**标题（本单的提示词面板 + #586 的
+ *   管理台「关于」），粗切会把邻居那一节乃至再下一节（#595 能力市场）整段吃进来 ⇒ 下面③那条
+ *   「本节不许出现新错误码」判到的是**别人的**错误码（实测报红：`发明了：capability_budget_exceeded,
+ *   capability_install_failed`）。节界只认「下一个同级/上级标题」才与文档结构同构；
+ *   编号唯一性本身另有一条常驻闸：`portal/test/migrations.test.js`「文档编号唯一性闸」。
+ * @param {string} doc portal.md 全文
+ * @param {string} num 章节号（`'4.18'`；字母后缀写 `'4.4a'`）
+ */
+function apiSectionOf(doc, num) {
+  const lines = doc.split('\n');
+  const start = lines.findIndex((l) => l.startsWith(`### ${num} `));
+  assert.ok(start >= 0, `docs/api/portal.md 必须有 §${num} 这一节（标题原文要以 "### ${num} " 开头）`);
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^###?\s/.test(lines[i])) { end = i; break; }   // `####`（本节内部的小节）不算界
+  }
+  return lines.slice(start, end).join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // 7. `D1` 两头说法：代码里的旋钮 / 端点 / DTO 键，文档必须同步点名
 // ---------------------------------------------------------------------------
 
-test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 DTO 键登记进 portal.md §4.16', async () => {
+test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 DTO 键登记进 portal.md §4.18', async () => {
   // 只在代码里加的旋钮运维找不到；只在文档里写的端点等于没做。口径照
   // `portal/test/upload-settings.test.js` US-12/US-15（同一族「两头说法」判据）。
   const envDoc = fs.readFileSync(new URL('../../docs/env.md', import.meta.url), 'utf8');
@@ -1262,10 +1285,8 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
   assert.match(example, new RegExp(READ_TIMEOUT_ENV_VAR), 'deploy/.env.example 必须登记这个旋钮');
 
   const apiDoc = fs.readFileSync(new URL('../../docs/api/portal.md', import.meta.url), 'utf8');
-  const sec = apiDoc.slice(apiDoc.indexOf('### 4.16 '));
-  assert.ok(sec.length > 200, 'portal.md 必须有 §4.16 这一节');
-  const section = sec.slice(0, sec.indexOf('\n## 5. ') > 0 ? sec.indexOf('\n## 5. ') : sec.length);
-  // ① 端点表（文档开头那张清单）与 §4.16 都得写四条路径。
+  const section = apiSectionOf(apiDoc, '4.18');
+  // ① 端点表（文档开头那张清单）与 §4.18 都得写四条路径。
   for (const route of [
     'GET /api/admin/prompts', 'PUT /api/admin/prompts/addendum',
     'PUT /api/admin/prompts/agents-md', 'PUT /api/admin/prompts/title-prompt',
@@ -1283,13 +1304,13 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
     }
   }
   for (const key of keyNames) {
-    assert.ok(section.includes(key), `§4.16 缺 DTO 键 ${key} 的语义`);
+    assert.ok(section.includes(key), `§4.18 缺 DTO 键 ${key} 的语义`);
   }
   assert.ok(keyNames.has('materializeEnqueued') || section.includes('materializeEnqueued'),
     'materializeEnqueued 的语义（含 =0 的两种意思）必须写进文档');
 
   // ③ **不新增错误码**（契约 §6：一律 `validation_failed`）。两条一起测：
-  //    §4.16 里出现的「像错误码的反引号词」必须全是既有码或 `reason` 取值；
+  //    §4.18 里出现的「像错误码的反引号词」必须全是既有码或 `reason` 取值；
   //    而通用错误码那一节（§1.2）不许被塞进一个提示词专用的新码。
   const KNOWN_CODES = ['forbidden', 'internal', 'method_not_allowed', 'validation_failed'];
   const KNOWN_REASONS = ['no_row', 'read_failed', 'read_timeout'];   // `reason` 的取值，不是错误码
@@ -1299,7 +1320,7 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
     if (/_failed|_exceeded|_too_large|_not_allowed|_not_configured$/.test(t)) codes.add(t);
   }
   const invented = [...codes].filter((t) => !KNOWN_CODES.includes(t) && !KNOWN_REASONS.includes(t));
-  assert.deepEqual(invented.sort(), [], `§4.16 只许用既有错误码（发明了：${invented.join(', ')}）`);
+  assert.deepEqual(invented.sort(), [], `§4.18 只许用既有错误码（发明了：${invented.join(', ')}）`);
   const codeTable = apiDoc.slice(apiDoc.indexOf('### 1.2 通用错误码'), apiDoc.indexOf('### 1.3'));
   assert.ok(codeTable.length > 200, '通用错误码那一节必须还在（切片要用它当基线）');
   assert.doesNotMatch(codeTable, /prompt/i, '§1.2 不许出现提示词专用的新错误码（本单**零新码**）');

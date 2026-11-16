@@ -90,7 +90,7 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminUploadView.vue'),
         meta: { requiresRole: 'admin' },
       },
-      // issue #596 片 B：提示词面板（§4.16）。导航顺序：… → certs → upload → **prompts** → pool。
+      // issue #596 片 B：提示词面板（§4.18）。导航顺序：… → certs → upload → **prompts** → pool。
       // 与 upload 相邻的理由同一条：两者都是「改一行而不必重建 station-portal」的平台配置。
       // 请求只在本视图挂载时发（`AdminPromptsView` 的 onMounted 是唯一触发点 ⇒ 判据 F1）。
       {
