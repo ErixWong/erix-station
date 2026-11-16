@@ -58,6 +58,13 @@ export interface Session {
   updated_at?: string;
   active_run_id?: string | null;
   cwd?: string; // issue #84 P5：会话绑定目录（响应带 cwd）
+  /**
+   * issue #528（`07` §21.4）：会话来源。`human`（默认）/ `macro:<宏名>`。
+   * 以 `macro:` 开头的就是**宏自己起的会话** ⇒ 侧栏归入「自动化」分组（默认折叠），
+   * 且**不允许用户发消息**（只读入口）。后端写入侧已给值（`sessions.js` 的 `origin: r.origin ?? 'human'`），
+   * 旧后端缺键 ⇒ `undefined`，按普通会话处理（宁可归错到人这一边，也不把用户会话吞进折叠分组）。
+   */
+  origin?: string | null;
   /** issue #197：会话消息数（后端 listSessions COUNT 全量 messages 行、含 synthetic，
    * 与头部状态行 sessionStats 同源口径）；旧后端/其列表外来源（createSession 响应）可能缺失 → 不显示。 */
   message_count?: number;
