@@ -7534,7 +7534,7 @@ C 族「实例属性/改名 ⇒ compose 腿不适用」4 条 —— `ERIX_STATIO
 ② `node --test test/integration-e2e-preflight.test.js` ⇒ rc=0（24 / 24 / 0，E4 现场 compose 没 skip）；
 ③ `npm run check:agents-hotlayer` ⇒ rc=0（热层 18706 / 预算 19456，条目 143 无重复编号）；
 ⑤ `node portal/integration/isolation-negative.mjs --strict` ⇒ rc=0，`grep -c 'TRAP OK'` = **19**，`verdict=TRAPS_FIRED`。
-④ 根 `npm test` 的读数见下面紧接的那条追加（本单动了 `portal/src/provisioner.js` ⇒ 必须跑）。
+④ **根 `npm test`**（本单动了 `portal/src/provisioner.js` ⇒ 必须跑）⇒ rc=**0**：`# tests 2641 / # pass 2603 / # fail 0 / # skipped 38`，`grep -c 'not ok'` = **0**（**没有**出现负载抖动族，故无需改夹具）。随带按红线单跑抖动族各两次自证：`idle-backoff-safe-range-506b` 17/17 rc=0 ×2、`env-int-strict-506e` 17/17 rc=0 ×2、`idle-backoff-506` 见下一次读数、`deploy-env-idle-backoff` 5/5 rc=0 ×2（夹具一字未动）。
 
 ### 8.142 事件平台 W3 落地 + 迁移让号 0037 + 迁移编号撞车的处理口径（#526，2026-11-16，主 agent + erix_run）
 
