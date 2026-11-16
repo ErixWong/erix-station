@@ -309,6 +309,13 @@ function jumpToLatest() {
         @open-runs="openMacroDrawer"
       />
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
+      <!-- issue #595 M1：能力市场入口（`#/market`）。用 `<a>` 而不是 `<button>`：既有顶栏单测拿的是
+           `header > button` 序列（登出必须是最后一颗），多一颗 button 会把那些用例假红。 -->
+      <router-link
+        data-test="market-entry-link"
+        :to="{ name: 'market' }"
+        class="text-sm underline"
+      >{{ t('workbench.marketEntry') }}</router-link>
       <a
         v-if="auth.user?.role === 'admin'"
         data-test="admin-console-link"

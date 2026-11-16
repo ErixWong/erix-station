@@ -8095,3 +8095,56 @@ W6（#529 管理台 UI）。
 **已知边界（未做，别当 bug）**：名册/账本仍无 TTL；`stale` 只做标记（门户不判死活、不改写名册，
 因为名册 `pid` 是容器内 PID）；`activity` 不覆盖「流式正文」（子 run 未开 `partialPersistence`）；
 跨会话/跨 FDE 的全局 agent 面板不做；子 run 的停止/steer 按钮不做（前台子 `cancel` 恒 `not_owned`）。
+### 8.153 能力市场 P0：技能包发布/浏览/安装 + 宿主侧能力索引注入（#595，2026-11-16，主 agent + 两个 pi worker + copilot 评审）
+
+**为什么**：FDE 用户拿不到「平台提供的能力」——技能只能靠镜像 bundled（`/opt/erix/skills`，只有 1 个）
+或自己往 `~/.erix/skills/` 丢文件；更要紧的是**模型根本不知道有技能存在**：`SYSTEM_PROMPT` 里一个字没提，
+提示词还写着「工具面只有这些：文件/shell/note_*」（装了技能后这句是假的）。
+
+**契约**：[`docs/design/capability-market.md`](../design/capability-market.md)（数据模型 / 包规范 / 校验 /
+物化形状 / runner 接线 / API / UI / 不做清单）。三层分开：L1 落盘面、L2 工具面（每轮全额下发）、
+L3 上下文面（宿主注入）。**MCP 消费者不在本单**（`kind` 列留着，`kind='mcp'` 一律 409）。
+
+**落地**（16 文件 +3200/−40，两个 worker 并行、分支 `feat-261116-20/21`，合并成一支 PR）：
+迁移 `0039`（三表）· `portal/src/market.js`（校验/安装/启停/DTO）+ `market-write.js`（降权执行体）·
+`http.js` 十端点 + `portal.md` §4.17 · `materializer.js` 物化 `~/.erix/capabilities.json` ·
+`runner/lib/capability-index.js` + `worker.js` 接 `excludeSkillIds` 与提示词「平台技能」段 ·
+前端 `MarketView` / `AdminMarketView` + 路由 + 双语 + 两页单测。
+
+**真机 e2e（主 agent 亲手，全经 Traefik 入口）**：admin 发布探针技能（`echo_probe`）→ `/publish` 动词生效
+→ `eric` 安装 → 宿主 `users/eric/home/.erix/skills/echo-probe/` 落盘 **eric:eric 755/644** →
+`capabilities.json` 物化（`section_bytes=728`）→ 新建会话让 agent 调 `echo_probe` ⇒ transcript 里
+`tool_use` + `tool_result.result_digest = "ECHO_PROBE_OK:final-e2e"`（L1+L2+L3 同时成立）→ 禁用后同一会话
+再调 ⇒ `Unknown tool: echo_probe`（judge 原话亦如此）→ 卸载 ⇒ 目录与行都消失、`capabilities.json` 变 `[]`、
+二次卸载幂等 → 浏览器（容器内 playwright，resolver 规则钉宿主 ingress）两页截图正常、console 0 error。
+
+**这一单里被真机/评审揪出来的四条缺陷**（都已修 + 已加判据）：
+1. `extractSkillMeta` 的 `skipString` **差一位** ⇒ 字符串紧跟 `]`/`}` 时括号不计数 ⇒ `close=-1` ⇒
+   `tools: []` ⇒ **任何真实技能包都被「tools 条数必须 1..12」拒掉**（真机：把 `required: ['msg']` 改成
+   `required: ['msg',]` 才发得出去，这就是根因指纹）。修 `skipString` 返回闭合引号下标。
+2. `POST /admin/market/items/:id/publish|retire` 把 **URL 动词当状态**传给 `setItemState` ⇒ 一律 400
+   （管理台根本发不出去）。加 `stateForVerb()` 边界映射，状态机域不放宽。
+3. **symlink 竞态**（copilot 评审 MEDIUM/8）：`assertSafePath` 之后用路径式 `writeFileSync`/`rmSync`，
+   而 `~/.erix` 每一级属主都是 FDE ⇒ 可换 symlink 让 **root 的 portal** 写到用户空间之外（容器逃逸面）。
+   修法 = **降权子进程**：新增 `portal/src/market-write.js`（只翻译 fs 指令、零业务判断），
+   `spawn(process.execPath, [helper], { uid/gid: 1000 })`，payload 走 stdin（argv 有 128 KiB 上限）。
+   安全来自降权而不是路径检查；`assertSafePath` 降为纵深防御。
+4. 迁移 `0039` 的 `RAISE NOTICE 'a' || 'b', args` 在 PL/pgSQL 里是**语法错** ⇒ 真机首跑整支回滚、
+   portal 起不来（`syntax error at or near "||"`）。改单字面量格式串 + `migrations.test.js` 加形状闸。
+
+**顺带**：`deploy/env-legs-exceptions.json` 两条 #557 坐标随 `worker.js` 行号进位（678→720 / 774→819）；
+合并 #589 的 `portal/shared` 进镜像止血（main 的 portal 镜像自 #582 起构建不出来，e2e 需要它）。
+
+**判据**：根 `npm test` **rc=0**（2667 pass / 0 fail）；前端 `typecheck` rc=0、全量 **75 文件 / 1550 通过
+rc=0**；`portal/test/market.test.js` 23 条、`materializer.test.js` 37 条（含 #595 三条）、
+`migrations.test.js` 34 条、`runner/test/capability-index.test.js` + `skills-channel` / `system-prompt` / `agents-md` 60 条。
+
+**遗留（P1 起，写进 #595 的不做清单）**：MCP 消费者（runner 侧 MCP 客户端 + 单 `mcp` 网关工具 +
+`~/.erix/mcp.json` 生成）· zip/git 源 · 版本回滚 UI · 技能子进程隔离 · 按 FDE 可见性 ·
+`~/.erix/skills/` 的对账 reconciler · 工具预算的自动缩容（只做安装期拒绝）。
+
+**环境留痕**：dev 栈本次用**本地构建**镜像跑 e2e（`deploy/.env` 的 `FDE_IMAGE` 已改成
+`erix-station/fde:local` 的 image ID，portal 用 `erix-station/portal:local`）；回滚把 `FDE_IMAGE` 改回
+digest 并 `docker rm -f fde-eric` + `provision-fde` 即可（`docs/ops/deployment-2026-10-10.md` §升级/回滚）。
+⚠ 跑 compose 必须在**同一棵树**里：从别的树 `up -d` 会用它自己的 `context: ..` 把 `portal:local` 标签
+重新指到那棵树（本次踩过：main 的树把标签指回旧代码，镜像里查不到 `market.js`）。

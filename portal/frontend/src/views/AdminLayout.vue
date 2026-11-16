@@ -44,6 +44,9 @@ const tabs = [
   { name: 'admin-tls', label: 'admin.tabs.tls' },
   // issue #485 片 A：上传上限（§4.15）。紧随证书（两者都是平台配置）而在号池占用（只读快照）之前。
   { name: 'admin-upload', label: 'admin.tabs.upload' },
+  // issue #595 M2：能力市场发布台（条目表 + 发布/下线 + 扇描结果）。与证书/上传同为平台配置，
+  // 因此排在号池占用（只读运维快照）之前。
+  { name: 'admin-market', label: 'admin.tabs.market' },
   // issue #350：号池占用总览（只读）。放在最后：先看用户/配置，选段时才来这里。
   { name: 'admin-preview-pool', label: 'admin.tabs.previewPool' },
   // issue #529（事件平台 W6）：宏模板配置 + 宏执行历史。追加在末尾（模板 → 执行历史）。

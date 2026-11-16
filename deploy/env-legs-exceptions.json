@@ -102,7 +102,7 @@
     },
     {
       "key": "STATION_SKILLS_DIR",
-      "where": "runner/worker.js:678",
+      "where": "runner/worker.js:720",
       "reason": "随镜像发布的内置 skills 目录兜底（`/opt/erix/skills`）。skills 是镜像内容不是部署配置（用户自己的 skills 走 userspace bind），上宿主面会让人以为能改镜像里的那棵树。"
     },
     {
@@ -153,9 +153,9 @@
   ],
   "unsupported": [
     {
-      "at": "runner/worker.js:774",
+      "at": "runner/worker.js:819",
       "read": "process.env[name]",
-      "reason": "**读形认得、名字解析不出**的动态下标：`name` 来自同一个 `for (const [name, parsed] of [[...]])` 的字面量对数组（三个名字就是 `ERIX_DELEGATE_MAX` / `ERIX_DELEGATE_CHILD_ROUNDS` / `ERIX_DELEGATE_CHILD_TIMEOUT_MS`，见 `runner/worker.js:763-765`，那三行是字面量读形，已经被枚举覆盖，这里只是打日志时回读原值）。扫描器**故意**不解析 for-of 解构配对数组（再写一条形状规则去迎合现存代码 = 判据围着样本转），于是这一处必须留下这条登记 ⇒ 「扫不干净」是花钱的，不是静默的。坐标漂移时判据红，重跑一次更新即可。"
+      "reason": "**读形认得、名字解析不出**的动态下标：`name` 来自同一个 `for (const [name, parsed] of [[...]])` 的字面量对数组（三个名字就是 `ERIX_DELEGATE_MAX` / `ERIX_DELEGATE_CHILD_ROUNDS` / `ERIX_DELEGATE_CHILD_TIMEOUT_MS`，见 `runner/worker.js:812-814`，那三行是字面量读形，已经被枚举覆盖，这里只是打日志时回读原值）。扫描器**故意**不解析 for-of 解构配对数组（再写一条形状规则去迎合现存代码 = 判据围着样本转），于是这一处必须留下这条登记 ⇒ 「扫不干净」是花钱的，不是静默的。坐标漂移时判据红，重跑一次更新即可。"
     }
   ]
 }

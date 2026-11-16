@@ -54,3 +54,41 @@ test('同名技能：~/.erix/skills 覆盖 bundled（用户空间 = 免重建镜
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+// issue #595 §6 L2：市场「停用」只改库里一行，**磁盘目录仍在**（~/.erix/skills/<slug>/）。
+// 于是装配面必须显式排除，否则用户在页面里关了技能、模型照样调得到那个工具 ——
+// 症状是「关了还在」，而提示词段里又看不见它，排查会绕远路。这条就是那条判据的机器版本。
+test('excludeSkillIds：~/.erix/skills 里的技能可以被逐条排除（市场停用的落盘面判据）', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'skills-excl-'));
+  const writeSkill = (id, desc) => {
+    mkdirSync(path.join(home, '.erix', 'skills', id), { recursive: true });
+    writeFileSync(
+      path.join(home, '.erix', 'skills', id, 'skill.mjs'),
+      `export function getSkillDefinition() { return { schema_version: 1, skill: { id: "${id}",`
+      + ` entrypoint: "skill.mjs" }, tools: [{ name: "${id}_run", description: "${desc}",`
+      + ` inputSchema: { type: "object" } }] }; }\nexport async function ${id}_run() { return "${id}"; }\n`,
+    );
+  };
+  try {
+    writeSkill('market_on', 'MARKET-ON');
+    writeSkill('market_off', 'MARKET-OFF');
+    const base = await buildSkillTools({ home, cwd: runnerDir, bundledDir, builtinNames: [] });
+    assert.deepEqual(base.errors, [], `两个市场技能都要能装配: ${JSON.stringify(base.errors)}`);
+    const all = base.tools.map((t) => t.name);
+    assert.ok(all.includes('market_on_run') && all.includes('market_off_run'), `前置不成立: ${all.join(',')}`);
+
+    const excluded = await buildSkillTools({
+      home, cwd: runnerDir, bundledDir, builtinNames: [], excludeSkillIds: ['market_off'],
+    });
+    const names = excluded.tools.map((t) => t.name);
+    assert.ok(!names.includes('market_off_run'), '被排除的技能不得出现在工具面（关了就该调不到）');
+    assert.ok(names.includes('market_on_run'), '排除必须是逐条的，不得连坐别的技能');
+    // 排除不是错误：目录仍在磁盘、文件仍合法，只是平台这次不装它 ⇒ 不许进 errors（否则每条 warn 都是噪音）
+    assert.deepEqual(excluded.errors, [], `排除不得产生 error: ${JSON.stringify(excluded.errors)}`);
+    // 空数组必须等于不排除（worker 的默认形态：没装过任何市场技能）
+    const empty = await buildSkillTools({ home, cwd: runnerDir, bundledDir, builtinNames: [], excludeSkillIds: [] });
+    assert.deepEqual(empty.tools.map((t) => t.name).sort(), all.sort(), 'excludeSkillIds: [] 必须逐字等于不排除');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

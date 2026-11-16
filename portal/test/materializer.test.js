@@ -12,6 +12,7 @@ import path from 'node:path';
 import {
   renderConfigJson,
   renderPortsJson,
+  renderCapabilitiesJson,
   renderManifest,
   renderHomeAgentsMd,
   buildFilePlan,
@@ -839,5 +840,148 @@ test('L5：atomicWriteFile 目录 fsync 失败抛 materialize_fsync_failed（不
       restore();
     } catch {}
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// issue #595 §5：`~/.erix/capabilities.json`（能力市场索引）
+//
+// 为什么值得单独立两条：这个文件是市场与 runner 之间**唯一**的通道，而它同时踩在两条红线上——
+//   ① system 是 prompt 缓存的稳定前缀 ⇒ 文件里出现时间戳 = 每次物化都把整条前缀打飞；
+//   ② `~/.erix` 是 runner 文件面的只读例外（#259）⇒ agent `readFile` 直接读得到它，
+//      一旦里面混进 token 就等于把平台密钥贴进模型上下文。
+// 隔离约定同上：注入 tmp 目录，不碰真实 /srv/erix/users。
+// ---------------------------------------------------------------------------
+
+const CAP_ROWS = [
+  { id: 'pdf_tools', name: 'PDF 工具', summary: '从 PDF 抽文本与页码', when_to_use: '用户给的是 pdf 文件时',
+    enabled: true, tools: ['pdf_extract', 'pdf_pages'], readme: '~/.erix/skills/pdf_tools/SKILL.md' },
+  { id: 'github', name: 'GitHub', summary: '读 issue / PR', when_to_use: '需要看仓库里的讨论时',
+    enabled: false, tools: ['github_fetch'], readme: null },
+];
+
+test('#595 capabilities.json：§5 形状 + 逐字节确定 + 落盘模式；空市场也是合法文件', async () => {
+  const plan = buildFilePlan({
+    fdeName: 'alice', baseDomain: 'example.test', llmBaseUrl: 'http://llm.example.test:4000',
+    allocations: [], root: '/tmp/unused', generation: 1, capabilities: CAP_ROWS,
+  });
+  const entry = plan.find((f) => f.containerPath === `${CONTAINER_HOME}/.erix/capabilities.json`);
+  assert.ok(entry, 'buildFilePlan 必须下发 capabilities.json（runner 读的就是它）');
+  assert.equal(entry.hostPath, '/tmp/unused/alice/home/.erix/capabilities.json', '宿主路径必须落在 home 骨架下');
+  assert.equal(entry.mode, 0o644, '模式必须 0644（§4：平台文件同 ports.json）');
+  assert.ok(isPlatformManagedPath('/home/erix/.erix/capabilities.json'),
+    '必须归平台管理路径（否则 stale 清理会把用户自己放的同名文件当平台文件误删，反之也是）');
+
+  const doc = JSON.parse(entry.content);
+  assert.deepEqual(Object.keys(doc).sort(), ['skills', 'version'], '顶层只有 version 与 skills');
+  assert.equal(doc.version, 1);
+  // 停用项**也在**文件里（runner 要用它的 id 去填 excludeSkillIds，目录仍在磁盘）
+  assert.deepEqual(doc.skills.map((s) => s.id), ['github', 'pdf_tools'], '必须按 id 升序（渲染侧兜一次排序）');
+  assert.deepEqual(doc.skills[0], {
+    id: 'github', name: 'GitHub', summary: '读 issue / PR', when_to_use: '需要看仓库里的讨论时',
+    enabled: false, tools: ['github_fetch'], readme: null,
+  }, '字段集合必须逐字等于 §5 示例（多一个字段 = runner 侧多一份要同步的真相）');
+
+  // 字节确定性：乱序输入必须得到同一串，且两次调用完全一致（缓存前缀不许漂）
+  const shuffled = [CAP_ROWS[1], CAP_ROWS[0]];
+  assert.equal(renderCapabilitiesJson(shuffled), entry.content, '乱序输入必须渲染成同一串');
+  assert.equal(renderCapabilitiesJson(CAP_ROWS), renderCapabilitiesJson(CAP_ROWS));
+  // 时间戳/run id 是缓存杀手（ports.json 用 generation 承载代次，这里连代次都不需要）
+  assert.doesNotMatch(entry.content, /\d{4}-\d{2}-\d{2}|generated_at|updated_at/,
+    '文件里不许出现日期或时间戳字段（prompt 缓存稳定前缀）');
+  // 空市场也是合法文件：runner 读到它就是空段 = 提示词逐字节不变，不存在「文件还没生成」的分支
+  // 缩进形态与 config.json / ports.json 同源（同一个 `json()` 助手）：两个文件长得不一样
+  // 就会被当成「两套渲染器」，日后有人只改一套。
+  const EMPTY = `${JSON.stringify({ version: 1, skills: [] }, null, 2)}\n`;
+  assert.equal(renderCapabilitiesJson([]), EMPTY);
+  assert.equal(renderCapabilitiesJson(undefined), EMPTY);
+  assert.equal(renderCapabilitiesJson([null, { name: '没有 id' }]), EMPTY,
+    '缺 id 的条目只能被丢掉（id 是目录名与 excludeSkillIds 的值，没有它整条无意义）');
+
+  // 落盘一次：真 tmp 目录里 JSON 可读、模式对
+  const root = tmpdir();
+  const mat = createMaterializer({ root, uid: SELF_UID, gid: SELF_GID });
+  await mat.materialize({
+    fdeName: 'alice', baseDomain: 'example.test', llmBaseUrl: 'http://llm.example.test:4000',
+    allocations: [], generation: 1, capabilities: CAP_ROWS,
+  });
+  const onDisk = path.join(root, 'alice', 'home', '.erix', 'capabilities.json');
+  assert.equal(fs.readFileSync(onDisk, 'utf8'), entry.content, '落盘内容必须与 plan 逐字节相同');
+  assert.equal(fs.statSync(onDisk).mode & 0o777, 0o644, '落盘模式必须 0644');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('#595 capabilities.json 不含密钥形状（家目录是只读例外，写进去就等于贴给模型）', () => {
+  // 判据是**形状**而不是字段名黑名单：密钥长什么样比它叫什么更重要（`apikey` 改名成 `cred` 就逃过黑名单）。
+  const SECRET_SHAPES = [
+    [/sk-[A-Za-z0-9]{12,}/, 'sk- 前缀的 API key'],
+    [/ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}/, 'GitHub token'],
+    [/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/, 'JWT'],
+    [/xox[baprs]-[A-Za-z0-9-]{8,}/, 'Slack token'],
+    [/(api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]/i, '密钥类键名带值'],
+    [/\b[A-Za-z0-9+/]{40,}={0,2}\b/, '≥40 字符的 base64 块（包内容/证书/密文都是这个形状）'],
+  ];
+  // 输入故意带上真实会出现的字段：readme 路径、when_to_use 里的长句、包里的 base64 摘要
+  const rows = [
+    ...CAP_ROWS,
+    // 故意用**中文长句**：`'x'.repeat(60)` 会自己撞上下面那条 base64 形状规则（60 个 [A-Za-z0-9]），
+    // 那是测试数据在骗人，不是文件里有密钥。真实摘要是一句话，不是字母块。
+    { id: 'long_one', name: '长句技能', summary: '把很长的一段说明压缩成一句能用的话'.repeat(4),
+      when_to_use: '当用户要求把一堆散乱笔记整理成条目时使用这个技能'.repeat(4),
+      enabled: true, tools: ['long_run'], readme: '~/.erix/skills/long_one/SKILL.md' },
+  ];
+  const content = renderCapabilitiesJson(rows);
+  for (const [re, label] of SECRET_SHAPES) {
+    assert.equal(re.test(content), false, `${label} 的形状不得出现在 capabilities.json 里：${re.exec(content)?.[0]}`);
+  }
+  // 机制面（为什么它不该混进密钥）：字段集合是闭集，包内容/字节/base64 一律不进文件。
+  const doc = JSON.parse(content);
+  const keys = new Set();
+  for (const s of doc.skills) for (const k of Object.keys(s)) keys.add(k);
+  assert.deepEqual([...keys].sort(), ['enabled', 'id', 'name', 'readme', 'summary', 'tools', 'when_to_use'],
+    '字段闭集：出现 content/bytes/manifest 之类就意味着有人开始往只读例外里塞别的东西');
+  assert.ok(!content.includes('content'), '包内容（bytea）不得进这个文件');
+});
+
+test('#595 市场读失败 ⇒ capabilities.json 降级成空清单 + 一条 warn，对账不许停', async () => {
+  // 判据来自 §5：「查库失败 ⇒ 空数组 + warn，绝不让对账停」。为什么必须显式钉住：
+  // 这条 try/catch 一旦被人"顺手重构"掉，症状是 **0039 的读面问题把整条物化链打死**
+  // （所有 FDE 的 config.json/ports.json 都不再更新），而市场本身只是「看不见技能」这么轻的事。
+  const root = tmpdir();
+  const warns = [];
+  const log = { warn: (m) => warns.push(m), log: () => {}, error: () => {} };
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM users')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      if (sql.includes('FROM port_allocations')) return { rows: [] };
+      if (sql.includes('FROM fde_capability_installs')) throw new Error('42P01: relation "fde_capability_installs" does not exist');
+      if (sql.includes('FROM materialize_revisions')) return { rows: [{ revision: 3 }] };
+      if (sql.startsWith('UPDATE materialize_outbox')) return { rows: [] };
+      throw new Error(`unexpected pool query: ${sql}`);
+    },
+    async connect() {
+      return {
+        async query(sql) {
+          if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
+          if (sql.includes('RETURNING o.id')) return { rows: [{ id: 'o1', fde_id: 'u1', revision: 3 }] };
+          if (sql.startsWith('UPDATE materialize_outbox')) return { rows: [] };
+          throw new Error(`unexpected client query: ${sql}`);
+        },
+        release() {},
+      };
+    },
+  };
+  try {
+    const result = await runMaterializerOnce(pool, MATERIALIZER_CONFIG(root), { log });
+    assert.deepEqual(result, { processed: 1, claimed: 1 }, '市场读失败不得让这一轮对账失败');
+    const p = path.join(root, 'alice', 'home', '.erix', 'capabilities.json');
+    assert.ok(fs.existsSync(p), '读失败也必须落下这个文件（runner 需要一条确定的读路径）');
+    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), { version: 1, skills: [] },
+      '降级值必须是**空清单**，不是旧值、不是 null');
+    assert.ok(warns.some((w) => /capabilities read failed/.test(w)), `必须留一条 warn：${JSON.stringify(warns)}`);
+    // 同轮其余平台文件照常落盘（市场不是物化的前置条件）
+    assert.ok(fs.existsSync(configJsonPath(root)), 'config.json 不得被市场读失败连带拖死');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
