@@ -65,12 +65,94 @@ function ownerOf(stat) {
   return stat ? `${stat.uid}:${stat.gid}` : '未知';
 }
 
-/** 安全的 stat：不存在 / 进不去 ⇒ null（不抛，调用方按 null 分支走）。 */
+/** 安全的 stat：不存在 / 进不去 ⇒ `null`（不抛）。只用于「拿个 mode/owner 当现场信息」这类**不参与归因**的旁证。 */
 function statOrNull(target, fsImpl) {
   try {
     return fsImpl.statSync(target);
   } catch {
     return null;
+  }
+}
+
+/**
+ * 不吞错误的 stat：把 `{stat}` 或 `{error}` 一起交回调用方。
+ *
+ * 为什么需要它（issue #495 第二轮 MED）：`statOrNull` 把 `EACCES` 与 `ENOENT` 压成同一个 `null`，
+ * 于是走查里「进不去」被归成 `missing` —— 失败文案会说「还没物化」，而真相是「进不去」，
+ * 等待器还会干等到超时（与「真的没物化」逐字同形）。归因要用 errno，所以错误本身必须传出去。
+ * 「同一个文件里 `observeHostPath()` 对末段的 `EACCES` 正确归 `unreadable`、走查处却不」——两处口径
+ * 不一致就是这条 MED；本函数就是把口径收拢到一处。
+ */
+function statResult(target, fsImpl) {
+  try {
+    return { stat: fsImpl.statSync(target) };
+  } catch (error) {
+    return { error };
+  }
+}
+
+/**
+ * errno ⇒ 归因的**唯一一张表**（issue #495 第三轮 MED）。
+ *
+ * 为什么必须是一张表、而不是三个探测点各写一遍 if：各写一遍之后，「既不是权限也不是缺失」的 errno
+ * （`EIO`/`ELOOP`/`ENAMETOOLONG`…）被**就近**塞进两个桶：走查里的 `statSync → EIO` 落 `missing`
+ * （文案说「还没物化」），`accessSync → EIO` 落 `unreadable`+`no-permission`（文案说「读不到」）——
+ * 两种都是凭空编的归因（而等待器一边会干等到超时、一边会提前放弃）。
+ * 第三支走**已有的** `unknown` 出口：状态面仍是 `present`/`missing`/`unreadable` + `unknown`，**没有第五态**。
+ */
+const PROBE_ERRNO_CLASS = new Map([
+  ['ENOENT', 'missing'],
+  ['ENOTDIR', 'missing'],
+  ['EACCES', 'unreadable'],
+  ['EPERM', 'unreadable'],
+]);
+
+/** 一个 errno 落在哪个出口；**表里没有就是 `unknown`**（不许就近二选一）。 */
+function classifyProbeErrno(code) {
+  return PROBE_ERRNO_CLASS.get(code ?? null) ?? 'unknown';
+}
+
+/**
+ * `unknown` 出口的载荷：把「哪一次探测、哪条路径、什么 errno」原样交回，不硬塞进两个桶。
+ * `message` 里**不写**「读不到」/「没物化」——那两句只属于归因得了的两种状态。
+ */
+function probeUnknown(at, probe, error) {
+  const code = typeof error?.code === 'string' ? error.code : null;
+  return {
+    path: at,
+    probe,
+    code,
+    message: `${probe} ${at} 报 ${code ?? ''} ${error?.message ?? error ?? '未知错误'}`.replace(/\s+/g, ' ').trim()
+      + '（既不是「不存在」也不是「进不去」⇒ 不下结论）',
+    cause: error ?? null,
+  };
+}
+
+/**
+ * 链接目标的**旁证**三态：`true` 存在 / `false` **真** `ENOENT`、`ENOTDIR` / `null` **这次探不到**。
+ *
+ * 为什么不能是布尔（第三轮 MED）：旧写法 `Boolean(statOrNull(...))` 把 `EACCES` 与 `ENOENT` 压成同一个
+ * `false`，于是「目标目录只是没 `x`（`0o444`）」也会让文案端出「缺的是**链接目标**」——把「探不到」
+ * 说成「不存在」，人就去找一个根本没丢的文件。归因可以只拿 errno，但**旁证也不许把探不到编成结论**。
+ */
+function probeTargetExists(target, fsImpl) {
+  const { stat, error } = statResult(target, fsImpl);
+  if (stat) return true;
+  return classifyProbeErrno(error?.code) === 'missing' ? false : null;
+}
+
+/**
+ * `stat` 失败时 blocker 的 `mode`/`owner`：只能退到 **`lstat`**（不跟随，对悬空链接与「目标进不去」
+ * 都还能看见本体）。拿不到就填 **`null`**（不是 `0o?` / 也不是「未知」这种当成事实的字面量）——
+ * 文案会诚实说「这次探不到」；**不许**把探不到编成结论。
+ */
+function lstatFacts(target, fsImpl) {
+  if (typeof fsImpl.lstatSync !== 'function') return { mode: null, owner: null };
+  try {
+    const stat = fsImpl.lstatSync(target);
+    return { mode: modeOf(stat), owner: ownerOf(stat) };
+  } catch {
+    return { mode: null, owner: null };
   }
 }
 
@@ -114,7 +196,8 @@ export function assertComposeEnvFile({
   }
   if (!stat) {
     const code = statError?.code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') {
+    const statClass = classifyProbeErrno(code);
+    if (statClass === 'missing') {
       throw new Error(
         `${label} 起跑前预检失败：compose 的 --env-file ${file} 不存在。\n`
         + 'git worktree / 新 clone 里没有它是常态（.env 不入库），而 compose 要到**整轮镜像构建之后**\n'
@@ -122,13 +205,15 @@ export function assertComposeEnvFile({
         + `⇒ ${fix}`,
       );
     }
-    if (code === 'EACCES' || code === 'EPERM') {
+    if (statClass === 'unreadable') {
       throw new Error(
         `${label} 起跑前预检失败：--env-file ${file} 存在但读不到（${code}；当前 uid/gid=${uid}/${gid}，`
         + `多半是它本身或它的父目录属主不是你）。\n⇒ ${fix}`,
       );
     }
-    throw new Error(`${label} 起跑前预检失败：stat ${file} 报 ${code ?? statError?.message ?? '未知错误'}`);
+    // 表里查不到的 errno ⇒ 第三支（也是 `unknown` 的意思：不许拿「不存在」或「读不到」当默认值）。
+    throw new Error(`${label} 起跑前预检失败：stat ${file} 报 ${code ?? statError?.message ?? '未知错误'}`
+      + '（既不是「不存在」也不是「读不到」⇒ 不下结论）');
   }
   if (!stat.isFile()) {
     throw new Error(`${label} 起跑前预检失败：--env-file ${file} 不是普通文件（${modeOf(stat)}）。\n⇒ ${fix}`);
@@ -136,6 +221,12 @@ export function assertComposeEnvFile({
   try {
     fsImpl.accessSync(file, R_OK);
   } catch (error) {
+    // 同一张表（第三轮 MED）：`stat` 都成功了而 `access` 报的不是权限 ⇒ 别一律写成「读不到」。
+    const accessClass = classifyProbeErrno(error?.code);
+    if (accessClass !== 'unreadable') {
+      throw new Error(`${label} 起跑前预检失败：stat ${file} 成功但 access(R_OK) 报 ${error?.code ?? '未知错误'}`
+        + '（既不是「不存在」也不是「读不到」⇒ 不下结论）');
+    }
     throw new Error(
       `${label} 起跑前预检失败：--env-file ${file} 存在但当前用户读不到（${error?.code ?? 'EACCES'}；`
       + `mode=${modeOf(stat)} owner=${ownerOf(stat)} 当前 uid/gid=${uid}/${gid}）。\n⇒ ${fix}`,
@@ -149,14 +240,30 @@ export function assertComposeEnvFile({
  *
  * 为什么走链而不是只看叶子：`existsSync` / `readFileSync` 在「祖先目录没权限」与「文件没生成」两种
  * 情况下都只是返回 false / 抛 ENOENT，光看叶子分不开。走链才能给出**具体是哪一段**：
- *  · `blocker` —— 这一段存在但进不去（缺 R_OK|X_OK，或它根本不是目录）⇒ 再等也不会变，权限不是时间问题；
+ *  · `blocker` —— 这一段存在但**够不到**：非叶子段缺的是**穿越**（`X_OK`）、叶子段缺的是**读**（`R_OK`），
+ *    或它根本不是目录，或它的 `stat` 被权限挡了 ⇒ 再等也不会变，权限不是时间问题；
  *  · `missingPrefix` —— 前面的段都能进，但这一段自己还不存在 ⇒ 物化真的没发生（或还没轮到它）。
+ *  · `unknown` —— 探测报了**既不是缺失也不是权限**的 errno（`EIO`/`ELOOP`/`ENAMETOOLONG`…）⇒ **不许二选一**，
+ *    把 errno 原样交回已有的 `unknown` 出口（分流只过 `classifyProbeErrno` 那一张表，见它的注释）。
+ *
+ * ⚠ 可达性**掩码**口径（第三轮 BLOCKER，别再改回去）：走查里对**非叶子段**只要求 `X_OK`，**不要求** `R_OK`。
+ *   理由：拿到**已知文件名**去读子文件，内核只要求祖先链上每段有 `x`（穿越）；`r` 只对「列目录」必要。
+ *   一旦写成 `R_OK | X_OK`，`chmod 0o111` 的 bind 源（可穿越、不可枚举，真实摆法）就被判成「读不到」：
+ *   真 `readFileSync` 读得到，观测却报 `unreadable`，等待器 12–53 ms 就假红判死（一个 100 ms 后才物化的
+ *   正常场景直接被打死）——**假红比原缺陷贵**，所以这条是 BLOCKER。
+ *
+ * ⚠ 归因口径（第二轮 MED 修的正是这一条）：走查里的 `statSync` **失败**要按 **errno** 分流，**不能吞**——
+ *  `ENOENT`/`ENOTDIR` ⇒ `missingPrefix`（真没物化）；`EACCES`/`EPERM` ⇒ `blocker{reason:'no-permission'}`
+ *  且 `missingPrefix` 必为 `null`。典型形状 `link -> secret/inner` 且 `chmod 000 secret`：链上每一段
+ *  字面上都进得去，但 `stat(link)` 要跟随链接 ⇒ 被 `secret` 挡住 ⇒ 这是「进不去」而不是「没物化」。
+ *  状态面不变：仍是三态 + `unknown`，**没有第五态**（为什么不开第四态：见 `observeLastSegmentLink`）。
  *
  * @param {string} filePath 要观测的宿主路径（绝对或相对当前目录）
  * @param {{fsImpl?: typeof import('node:fs')}} [options]
- * @returns {{blocker: null | {path: string, reason: 'no-permission' | 'not-a-directory', mode: string, owner: string}, missingPrefix: string | null, links: object[]}}
+ * @returns {{blocker: null | {path: string, reason: 'no-permission' | 'not-a-directory', mode: string | null, owner: string | null, missingAccess?: 'X_OK' | 'R_OK' | null}, missingPrefix: string | null, unknown: null | {path: string, probe: string, code: string | null, message: string, cause: object | null}, links: object[]}}
  *   `links` = 走查过的每一段的**链接事实**（`lstatSync`，不跟随）——只是多一条可诊断的账，
  *   不参与归属判断（为什么需要它：见 `observeSegmentLink`）。提前 return 时也把已走到的段带回去。
+ *   `blocker.missingAccess` 说的是**这一次要而没拿到的那一位**（祖先 `X_OK` / 叶子 `R_OK`），文案据此出话。
  */
 export function inspectHostPathChain(filePath, { fsImpl = fs } = {}) {
   const abs = path.resolve(filePath);
@@ -169,27 +276,64 @@ export function inspectHostPathChain(filePath, { fsImpl = fs } = {}) {
     // 先记事实（`lstatSync`，**不跟随**），再做存在性/类型/可达性判断：顺序不能反过来——
     // `statSync` 对悬空链接报 ENOENT，先走它就永远看不到链接本体（那就是变异 M-A 的入口）。
     links.push(observeSegmentLink(current, { fsImpl, isLastSegment: isLeaf }));
-    const stat = statOrNull(current, fsImpl);
-    if (!stat) return { blocker: null, missingPrefix: current, links };
+    // ⚠ 不吞错误：errno 就是归因本身（吞掉 ⇒ EACCES 变 missing，第二轮 MED 的病灶）。
+    // 分流只允许过 `classifyProbeErrno` 那一张表（第三轮 MED：别再在调用点写 if）。与下面两处同表：
+    // 走查里的 `accessSync`、`observeHostPath` 的 `readFileSync`。
+    const { stat, error: statError } = statResult(current, fsImpl);
+    if (!stat) {
+      const statClass = classifyProbeErrno(statError?.code);
+      if (statClass === 'unreadable') {
+        // stat 跟随了链接 / 要穿过目标目录 ⇒ 被权限挡住的是「这一段的可达性」，不是它存不存在。
+        // mode/owner 从 lstat 取（stat 这次本来就失败了），取不到就是 null（文案会说「这次探不到」）。
+        const facts = lstatFacts(current, fsImpl);
+        return {
+          // `factsFrom:'lstat'`：这组 mode/owner 说的是**这一段本体**（若它是链接，就是链接自己），
+          // 不是它指向的那一侧——文案会把这层区别说出来，不让人拿 `0o777` 反推「怎么会读不到」。
+          blocker: { path: current, reason: 'no-permission', mode: facts.mode, owner: facts.owner, factsFrom: 'lstat' },
+          missingPrefix: null,
+          unknown: null,
+          links,
+        };
+      }
+      if (statClass === 'missing') {
+        // ENOENT / ENOTDIR ⇒ 仍按「没物化」报：第一轮那两格（悬空链接、链上第一段不存在）不许退回去。
+        return { blocker: null, missingPrefix: current, unknown: null, links };
+      }
+      // 其它 errno（`EIO`/`ELOOP`/`ENAMETOOLONG`…）⇒ **既不许说「没物化」也不许说「没权限」**，
+      // 把 errno 原样交回 `unknown` 出口（已有那一态，不是第五态）。
+      return { blocker: null, missingPrefix: null, unknown: probeUnknown(current, 'statSync', statError), links };
+    }
     if (!isLeaf && !stat.isDirectory()) {
       return {
         blocker: { path: current, reason: 'not-a-directory', mode: modeOf(stat), owner: ownerOf(stat) },
         missingPrefix: null,
+        unknown: null,
         links,
       };
     }
     try {
-      fsImpl.accessSync(current, isLeaf ? R_OK : R_OK | X_OK);
+      // ⚠ 掩码分两种（第三轮 BLOCKER）：祖先段只要**可穿越**（`X_OK`）就够得到已知文件名的子文件，
+      // `R_OK` 只对「列目录」必要（要求它 ⇒ `0o111` 的 bind 源被误判「读不到」）；叶子段要的是**读**。
+      fsImpl.accessSync(current, isLeaf ? R_OK : X_OK);
     } catch (error) {
-      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { blocker: null, missingPrefix: current, links };
+      const accessClass = classifyProbeErrno(error?.code);
+      if (accessClass === 'missing') return { blocker: null, missingPrefix: current, unknown: null, links };
+      if (accessClass !== 'unreadable') {
+        // 同一个道理：`accessSync` 报 `EIO` 不是权限问题，别拿「权限」当兼容默认值。
+        return { blocker: null, missingPrefix: null, unknown: probeUnknown(current, 'accessSync', error), links };
+      }
       return {
-        blocker: { path: current, reason: 'no-permission', mode: modeOf(stat), owner: ownerOf(stat) },
+        blocker: {
+          path: current, reason: 'no-permission', mode: modeOf(stat), owner: ownerOf(stat), factsFrom: 'stat',
+          missingAccess: isLeaf ? 'R_OK' : 'X_OK',
+        },
         missingPrefix: null,
+        unknown: null,
         links,
       };
     }
   }
-  return { blocker: null, missingPrefix: null, links };
+  return { blocker: null, missingPrefix: null, unknown: null, links };
 }
 
 /**
@@ -204,9 +348,11 @@ export function inspectHostPathChain(filePath, { fsImpl = fs } = {}) {
  *
  * @param {string} segmentPath 绝对路径的某一段（累计到这一段的完整路径）
  * @param {{fsImpl?: typeof import('node:fs'), isLastSegment?: boolean}} [options]
- * @returns {{segment: string, path: string, isLastSegment: boolean, isSymlink: boolean | null, target: string | null, resolvedTarget: string | null, targetExists: boolean, detectable: boolean}}
+ * @returns {{segment: string, path: string, isLastSegment: boolean, isSymlink: boolean | null, target: string | null, resolvedTarget: string | null, targetExists: boolean | null, detectable: boolean}}
  *   `path` 与 `segment` 同值（前者是已合并形状的兼容键）。`isSymlink: null` + `detectable: false`
  *   = 注入的 `fsImpl` 没有 `lstatSync`（或这一段的 `lstat` 自己就被权限挡了）⇒ **无从判定**，不假装「不是链接」。
+ *   `targetExists` 是**三态**（第三轮 MED）：`true` 存在 / `false` **真** `ENOENT`、`ENOTDIR` / `null` **探不到**
+ *   （被权限挡、或 `readlink` 根本没读出目标）——理由见 `probeTargetExists`；不是链接那一段固定 `false`（没目标这回事）。
  */
 export function observeSegmentLink(segmentPath, { fsImpl = fs, isLastSegment = false } = {}) {
   const abs = path.resolve(segmentPath);
@@ -220,9 +366,10 @@ export function observeSegmentLink(segmentPath, { fsImpl = fs, isLastSegment = f
     // lstat：悬空链接也能看到本体（statSync 会当成 ENOENT ⇒ 链接事实就丢了）
     stat = fsImpl.lstatSync(abs);
   } catch (error) {
-    const code = error?.code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return base; // 连 lstat 都报不存在 ⇒ 就不是链接（悬空链接 lstat 是成功的）
-    return { ...base, isSymlink: null, detectable: false }; // 链上没权限 ⇒ 无从判定，不编结论
+    // 同一张表：`lstat` 报「不存在」才等于「不是链接」（悬空链接的 `lstat` 是成功的）；
+    // 其它 errno（权限、`EIO`…）都只能说「无从判定」，**不许**编成「不是链接」。
+    if (classifyProbeErrno(error?.code) === 'missing') return base;
+    return { ...base, isSymlink: null, detectable: false }; // 链上没权限/探不到 ⇒ 无从判定，不编结论
   }
   const isLink = typeof stat.isSymbolicLink === 'function'
     ? stat.isSymbolicLink()
@@ -235,7 +382,8 @@ export function observeSegmentLink(segmentPath, { fsImpl = fs, isLastSegment = f
     target = null;
   }
   const resolvedTarget = target === null ? null : path.resolve(path.dirname(abs), target);
-  const targetExists = resolvedTarget === null ? false : Boolean(statOrNull(resolvedTarget, fsImpl));
+  // `null` = 探不到（第三轮 MED）：`readlink` 没读出目标 ⇒ 「存不存在」无从判定，**不是**「不存在」。
+  const targetExists = resolvedTarget === null ? null : probeTargetExists(resolvedTarget, fsImpl);
   return { ...base, isSymlink: true, target, resolvedTarget, targetExists, detectable: true };
 }
 
@@ -254,10 +402,27 @@ export function observeSegmentLink(segmentPath, { fsImpl = fs, isLastSegment = f
  *
  * @param {string} filePath 宿主路径
  * @param {{fsImpl?: typeof import('node:fs')}} [options]
- * @returns {{segment: string, path: string, isLastSegment: boolean, isSymlink: boolean | null, target: string | null, resolvedTarget: string | null, targetExists: boolean, detectable: boolean}}
+ * @returns {{segment: string, path: string, isLastSegment: boolean, isSymlink: boolean | null, target: string | null, resolvedTarget: string | null, targetExists: boolean | null, detectable: boolean}}
  */
 export function observeLastSegmentLink(filePath, { fsImpl = fs } = {}) {
   return observeSegmentLink(filePath, { fsImpl, isLastSegment: true });
+}
+
+/**
+ * 链接目标的出话那一句（末段与链上段共用，**一处定义**）。
+ *
+ * ⚠ 第三轮 MED 的那一刀：「缺的是**链接目标**」这句话**只许在真 `ENOENT`/`ENOTDIR`（`targetExists === false`）时
+ * 出现。`targetExists === null` 是「这次探不到」（目标目录没 `x`、`readlink` 读不出…），把探不到写成「缺目标」
+ * 会让人去找一个根本没丢的文件；而这句话自己不许沾「读不到」/「没物化」（那两句归另外两个文案，并且有判据钉着）。
+ */
+function targetExistenceLine(link) {
+  if (!link || link.isSymlink !== true) return '';
+  const shown = link.resolvedTarget ?? link.target ?? '?';
+  if (link.targetExists === false) return `    缺的是**链接目标**（${shown}），不是链接本身。`;
+  if (link.targetExists === null) {
+    return `    链接目标（${shown}）**这次探不到**（探一次就报错 ⇒ 无从判定它在不在）——**不许**据此说它缺失。`;
+  }
+  return '';
 }
 
 /**
@@ -277,9 +442,8 @@ export function formatLastSegmentLinkLine(link) {
     '    若这是宿主 bind 源：portal 容器里看到的是**链接目标那一侧**，宿主 `ls` 到的与容器里读到的不是同一个 inode——'
     + '排查挂载先确认这一条。',
   ];
-  if (link.targetExists === false) {
-    lines.push(`    缺的是**链接目标**（${link.resolvedTarget ?? link.target ?? '?'}），不是链接本身。`);
-  }
+  const existence = targetExistenceLine(link);
+  if (existence) lines.push(existence);
   return lines.join('\n');
 }
 
@@ -304,9 +468,8 @@ export function formatAncestorLinkLines(links) {
     '    `ls`/`stat` 看到的可能是链接本体。若这就是 bind 源：**要改的是宿主侧这条链接指向**（或整条 bind 源路径），',
     '    去改容器里看到的那一侧不会生效。',
   ];
-  if (first.targetExists === false) {
-    lines.push(`    缺的是**链接目标**（${first.resolvedTarget ?? first.target ?? '?'}），不是链接本身。`);
-  }
+  const existence = targetExistenceLine(first);
+  if (existence) lines.push(existence);
   if (ancestors.length > 1) {
     lines.push(`    （链上还有 ${ancestors.length - 1} 段也是链接，全量在 links 数组里）`);
   }
@@ -333,13 +496,20 @@ export function observeHostPath(filePath, { fsImpl = fs } = {}) {
   const link = links.find((entry) => entry && entry.isLastSegment) ?? observeLastSegmentLink(filePath, { fsImpl });
   if (chain.blocker) return { state: 'unreadable', blocker: chain.blocker, missingPrefix: null, link, links };
   if (chain.missingPrefix) return { state: 'missing', blocker: null, missingPrefix: chain.missingPrefix, link, links };
+  // 走查里报了「既不是缺失也不是权限」的 errno ⇒ 走**已有的** `unknown` 出口（不是第五态）。
+  // 顺序不能换：`blocker`/`missingPrefix` 与 `unknown` 理论上互斥，但就算注入端端出多个，也不能让
+  // 「探不到」把前两者遮成「present」。`links` 逐段事实继续带上。
+  if (chain.unknown) {
+    return { state: 'unknown', error: chain.unknown, blocker: null, missingPrefix: null, link, links };
+  }
   try {
     const content = fsImpl.readFileSync(filePath, 'utf8');
     return { state: 'present', content, blocker: null, missingPrefix: null, link, links };
   } catch (error) {
-    const code = error?.code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return { state: 'missing', blocker: null, missingPrefix: path.resolve(filePath), link, links };
-    if (code === 'EACCES' || code === 'EPERM') {
+    // 同一张表（第三轮 MED：三个探测点共用，别再在调用点写 if）。
+    const readClass = classifyProbeErrno(error?.code);
+    if (readClass === 'missing') return { state: 'missing', blocker: null, missingPrefix: path.resolve(filePath), link, links };
+    if (readClass === 'unreadable') {
       return {
         state: 'unreadable',
         missingPrefix: null,
@@ -348,6 +518,8 @@ export function observeHostPath(filePath, { fsImpl = fs } = {}) {
         blocker: {
           path: path.resolve(filePath), reason: 'no-permission',
           mode: modeOf(statOrNull(filePath, fsImpl)), owner: ownerOf(statOrNull(filePath, fsImpl)),
+          // 叶子级 EACCES：缺的就是**读**这一位（文案不许退成「缺 R_OK|X_OK」那种笼统口径）
+          missingAccess: 'R_OK',
         },
       };
     }
@@ -368,18 +540,57 @@ function diagnosticsTail(describe) {
   return trimmed ? `\n—— 容器侧现场快照 ——\n${trimmed}` : '';
 }
 
+/**
+ * `blocker` 的**人话归因**：要说清「缺的是哪一位」，不能一律写成「读不到」。
+ *
+ * 为什么不能笼统（第三轮 BLOCKER 的文案那一半）：祖先目录缺的是**穿越**（`X_OK`），叶子缺的是**读**（`R_OK`）。
+ * 对祖先高喊「读不到」会把人推向查 uid/组（而真正要看的其实是挂载源的 mode 里那一格 `x`）；
+ * 说清缺哪一位，才能一句定案该 `chmod +x` 还是该 `chown`。
+ */
+function blockerWhy(blocker) {
+  if (blocker.reason === 'not-a-directory') return '链上这一段不是目录';
+  if (blocker.missingAccess === 'X_OK') {
+    return '这一段**不可穿越**（缺 `X_OK`）——它是祖先目录：不可穿越就根本够不到下面的文件'
+      + '（列目录的 `R_OK` 不是必需的，不需要能 `ls` 它）';
+  }
+  if (blocker.missingAccess === 'R_OK') {
+    return '这一段**不可读**（缺 `R_OK`）——路径本身能定位到，是**内容**读不出来';
+  }
+  // stat 自己就被挡（典型：要跟随链接穿过一个没 `x` 的目录）⇒ 缺的到底是哪一位探不出来，只说被挡这件事。
+  return '缺可达性（`R_OK`/`X_OK` 这一类，但 `stat` 自己就被挡住 ⇒ 探不出具体是哪一位）';
+}
+
+/** 按「缺的是哪一位」给一句**可执行**的修法（笼统一句「查 uid/组」会把人带去改错东西）。 */
+function blockerFixHint(blocker) {
+  if (blocker.reason === 'not-a-directory') return '（链上这一段根本不是目录 ⇒ 把它换成目录，或把 bind 源指对）';
+  if (blocker.missingAccess === 'X_OK') {
+    return '    ⇒ 要修的是**穿越**：给这一段加 `x`（`chmod +x`）或把自己放进它的组；不需要能 `ls` 它'
+      + '（`0o111` 这类的 bind 源是合法摆法，`R_OK` 与此无关）。';
+  }
+  if (blocker.missingAccess === 'R_OK') {
+    return '    ⇒ 要修的是**读**：这一段自己的 mode/属主（上游目录的 `x` 已经过了，不必去改它）。';
+  }
+  return '    ⇒ `stat` 自己就被挡住 ⇒ 挡人的多半在**链接目标那一侧**的目录（先按下面那条 `resolvedTarget` 查）。';
+}
+
 /** 「存在但读不到」的文案：点名被挡的段 + 权限/属主 + 最可能的原因（FDE_USER_UID/GID）。 */
 function unreadableMessage(name, observed, extra) {
   const { uid, gid } = selfIds();
   const blocker = observed.blocker ?? {};
-  const why = blocker.reason === 'not-a-directory' ? '链上这一段不是目录' : '缺 R_OK|X_OK（读或穿越）';
+  const why = blockerWhy(blocker);
+  // 走查里的 stat 被权限挡住时，mode/owner 是退到 lstat 取的——说的是这一段本体，必须说出来。
+  const factsFrom = blocker.factsFrom === 'lstat'
+    ? '，取自 **lstat**（`stat` 这次被挡住了 ⇒ 这组数字是这一段本体；若它是链接，说的是链接自己而不是目标那一侧）'
+    : '';
   return [
-    `${name}：已经存在，但当前用户**读不到**（不是「没物化」——文件很可能早就写出来了）。`,
+    `${name}：已经存在，但当前用户**够不到**它（不是「没物化」——文件很可能早就写出来了）。`,
     `  被挡住的一段：${blocker.path ?? '?'}`,
-    `    原因：${why}；mode=${blocker.mode ?? '?'} owner=${blocker.owner ?? '?'} 当前 uid/gid=${uid}/${gid}`,
+    `    缺的是哪一位：${why}`,
+    `    mode=${blocker.mode ?? '这次探不到（lstat 也被挡）'} owner=${blocker.owner ?? '这次探不到（lstat 也被挡）'}${factsFrom} 当前 uid/gid=${uid}/${gid}`,
     '  ⇒ 多半是 FDE_USER_UID / FDE_USER_GID（deploy/.env，portal/src/config.js 缺省 1000/1000）与你自己的 uid/gid',
     '    不一致：portal 以 root 把 FDE 目录建成 0770 node:node，组外用户根本进不去（issue #495 ②）。',
-    '  ⚠ 旧写法 fs.existsSync 在这种路径上返回 false ⇒ 症状与「真的没物化」逐字相同，这条文案就是把两者分开。',
+    blockerFixHint(blocker),
+    '  ⚠ 旧写法 fs.existsSync 在这种路径上返回 false ⇒「读不到」与「真的没物化」症状逐字相同，这条文案就是把两者分开。',
     formatAncestorLinkLines(observed.links),
     formatLastSegmentLinkLine(observed.link),
     extra ?? '',
@@ -444,8 +655,11 @@ export async function waitForHostFile(filePath, {
     if (Date.now() - startedAt >= timeoutMs) {
       if (last.state === 'unreadable') throw new Error(unreadableMessage(name, last, diagnosticsTail(describe)));
       if (last.state === 'unknown') {
+        // 第三轮 MED：这一支现在是**真能走到**的（走查里的 `statSync`/`accessSync` 报 `EIO` 一类也到这里）。
+        // 只说「无法归类 + errno + 哪一次探测」，不许把它推成「没物化」或「没权限」。
+        const detail = [last.error?.code, last.error?.message].filter((s) => s).join(' ');
         throw new Error(`timeout waiting for ${name}：观测到无法归类的错误 `
-          + `${last.error?.code ?? last.error?.message ?? '未知'}${diagnosticsTail(describe)}`);
+          + `${detail || '未知'}${diagnosticsTail(describe)}`);
       }
       throw new Error(missingMessage(name, last, diagnosticsTail(describe)));
     }
