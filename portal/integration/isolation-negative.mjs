@@ -18,8 +18,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, removeDbDir, resolveDbDir, writeDynamicStub,
-  deriveIsolationComposeEnv, memoizeOnce,
+  SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, deriveStackIpamPoolEnv, removeDbDir, resolveDbDir, writeDynamicStub,
+  deriveIsolationComposeEnv, memoizeOnce, applyStackIpamPoolEnv, PORTAL_LARGE_POOL, FDE_IPAM_POOL_HOST_KEYS,
 } from './lib/isolated-env.mjs';
 // 工单 F（wp2a 重建）：`ports.json ↔ port_allocations` 对账件是 wp2a 最重的断言；提到纯函数后，
 // 本脚本可以用夹具**行为面**钉住它（无 docker 环境下也能验「不是恒真」）。
@@ -48,8 +48,9 @@ function validIsolationEnv() {
     LLM_GATEWAY_HOST: 'http://127.0.0.1:24400',
     BACKEND_SUBNET: '172.33.0.0/24',
     FDE_POOL: 'large',
-    // #227.3：缺省注入值 = 派生段 + portal large 池固定段（两函数都在 lib，这里不抄字面量）。
-    FDE_IPAM_POOLS: defaultFdeIpamPools(stackId),
+    // #227.3 → #270：**一次派生喂两腿** —— 放行面 FDE_IPAM_POOLS 与 portal 分配段 FDE_IPAM_POOL_LARGE
+    // 取同一个派生段（派生件在 lib，这里不拄字面量）。旧缺省的「派生段 + 整个 large 保留段」已删。
+    ...deriveStackIpamPoolEnv(stackId),
     FDE_DEV_MODE: '1',
     STATION_PORTAL_IMAGE: `erix-station/portal:${stackId}`,
     STATION_DOCKER_PROXY_IMAGE: `erix-station/fde-proxy:${stackId}`,
@@ -140,6 +141,39 @@ cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOLS=族外段 10.
   () => assertIsolatedEnvironment({ env: { ...validIsolationEnv(), FDE_IPAM_POOLS: '10.99.0.0/16' } }),
   { namesMustInclude: ['FDE_IPAM_POOLS', '10.99.0.0/16'] }));
 
+// 11) #270 判据④：分配段没被放行面覆盖（并行隔离栈只改了一腿的典型形状）⇒ 必须拒，且文案
+//     **同时点名两腿的变量名**（否则操作者只会去翻其中一份 env）。
+cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOL_LARGE 不在 FDE_IPAM_POOLS 放行面内',
+  () => assertIsolatedEnvironment({ env: { ...validIsolationEnv(), FDE_IPAM_POOL_LARGE: '10.201.77.0/24' } }),
+  { namesMustInclude: ['FDE_IPAM_POOL_LARGE', 'FDE_IPAM_POOLS', 'IPAM_POOL_LARGE', 'proxy'] }));
+
+// 12) #270：分配段缺了 ⇒ 必需 env 直接拒（不声明就会被 compose 缺省值抬成整个 10.201 保留段）。
+{
+  const missingAlloc = { ...validIsolationEnv() };
+  delete missingAlloc.FDE_IPAM_POOL_LARGE;
+  // 点名 **两条**文案锚点：`must be set`（必需 env 那条更早、更准）+ 变量名。
+  // 变异入口：把 FDE_IPAM_POOL_LARGE 从必需清单里摘掉 ⇒ 本陷阱改抛「不是规范写法」那条，
+  // `must be set` 消失 ⇒ 本项红（否则「必需 env」那一格是纸判据：删了也没人发现，只是文案变难懂）。
+  cases.push(expectThrow('assertIsolatedEnvironment() 缺 FDE_IPAM_POOL_LARGE（分配段未声明）',
+    () => assertIsolatedEnvironment({ env: missingAlloc }),
+    { namesMustInclude: ['FDE_IPAM_POOL_LARGE', 'must be set'] }));
+}
+
+// 13) #270：分配段写成**整个** large 保留段 = #270 之前「两套隔离栈都从同一池头分配」的必撞口径。
+cases.push(expectThrow(`assertIsolatedEnvironment() FDE_IPAM_POOL_LARGE=整个保留段 ${PORTAL_LARGE_POOL}`,
+  () => assertIsolatedEnvironment({
+    env: { ...validIsolationEnv(), FDE_IPAM_POOLS: PORTAL_LARGE_POOL, FDE_IPAM_POOL_LARGE: PORTAL_LARGE_POOL },
+  }),
+  { namesMustInclude: ['FDE_IPAM_POOL_LARGE', '子段'] }));
+
+// 14) #270：分配段跑出 DDL 保留段（10.229.0.0/24）⇒ 护栏拿 portal 自己的解析器拒（同一条脏值
+//      在 portal 启动期也会红；别让它在 provision 期撞 23514）。
+cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOL_LARGE 跑出 DDL 保留段 10.229.0.0/24',
+  () => assertIsolatedEnvironment({
+    env: { ...validIsolationEnv(), FDE_IPAM_POOLS: '10.229.0.0/24', FDE_IPAM_POOL_LARGE: '10.229.0.0/24' },
+  }),
+  { namesMustInclude: ['FDE_IPAM_POOL_LARGE', '10.201.0.0/16'] }));
+
 // --- 正例（夹具 env 必须过护栏；否则上面的负例是「全都抛」的空洞通过）---------------------
 let positiveOk = true;
 let positiveError = '';
@@ -168,20 +202,37 @@ try {
   assert.equal(sharedResolved, SHARED_STACK.dbDir, 'allowSharedReset 下缺省应解析到共享库目录（wp2b 语义）');
   removeDbDir(fakeDocker, {}, { allowSharedReset: true });
   assert.ok(dockerCalls.length === beforeReset + 1, 'allowSharedReset 下 removeDbDir 应真的执行 docker');
-  // #227.3：派生段的口径钉死（变异 c 的红条入口：把 deriveFdeIpamPools 改成恒返回固定段就红）。
-  // e2e226 的全部数字拼接是 '2226'（e2e 里也有个 2）→ 2226 % 99 = 48 → 201+48 = 249。
-  assert.equal(deriveFdeIpamPools('e2e226'), '10.249.0.0/16', '派生段口径：10.(201 + 全部数字拼接 mod 99).0.0/16');
+  // #227.3 → #270：派生段的口径钉死（变异入口：把 deriveFdeIpamPools 改成恒返回固定段/改回整段就红）。
+  // e2e226 的全部数字拼接是 '2226'（e2e 里也有个 2）→ 2226 % 99 = 48 → 第三段 = 1+48 = 49。
+  assert.equal(deriveFdeIpamPools('e2e226'), '10.201.49.0/24',
+    '派生段口径：10.201.(1 + 全部数字拼接 mod 99).0/24（保留段内的子段，第三段 1–99）');
   assert.equal(deriveFdeIpamPools('E2E-226-stack'), deriveFdeIpamPools('e2e226'), '同数字必同段（按段号可判定）');
   assert.notEqual(deriveFdeIpamPools('e2e226'), deriveFdeIpamPools('e2e227'), '不同数字（mod 99 不同余）必不同段');
   const hashed = deriveFdeIpamPools('solo-alpha');
-  assert.match(hashed, /^10\.2(?:0[1-9]|[1-9][0-9])\.0\.0\/16$/, '无数字 id 走短哈希，仍限隔离族内');
+  assert.match(hashed, /^10\.201\.(?:[1-9][0-9]?)\.0\/24$/, '无数字 id 走短哈希，仍限在 large 保留段的子段里');
   assert.equal(deriveFdeIpamPools('solo-alpha'), hashed, '哈希路径也幂等');
   for (let i = 1; i <= 300; i += 1) {
     const p = deriveFdeIpamPools(`stack${i}`);
-    assert.match(p, /^10\.2(?:0[1-9]|[1-9][0-9])\.0\.0\/16$/, `stack${i} 派生越族：${p}`);
-    assert.notEqual(p, `${SHARED_STACK.fdeIpamPool}`, `stack${i} 派生命中共享段：${p}`);
+    assert.match(p, /^10\.201\.(?:[1-9][0-9]?)\.0\/24$/, `stack${i} 派生越界（必须是大 FDE 保留段内第三段 1–99 的 /24）：${p}`);
+    assert.notEqual(p, PORTAL_LARGE_POOL, `stack${i} 派生命中整个保留段（并行必撞）：${p}`);
+    assert.notEqual(p, SHARED_STACK.fdeIpamPool, `stack${i} 派生命中共享段：${p}`);
   }
-  // #227.3：显式只传派生段（不含 large 池段）也是合法正规值。
+  // #270：两腿必须同源 —— 一次派生同时喂放行面与分配段，两者不等 = 有人把两腿拆成两处写。
+  const legs = deriveStackIpamPoolEnv('e2e226');
+  assert.equal(legs.FDE_IPAM_POOLS, legs[FDE_IPAM_POOL_HOST_KEYS.large],
+    '放行面与分配段必须是同一个派生值（拆成两处写 = 「分配出来就被 proxy 拒」的回潮）');
+  // #270 收紧：缺省只注入派生段，**不再多送一段**（旧「派生段 + 整个保留段」两段兜底就是撞车源头）。
+  assert.equal(defaultFdeIpamPools('e2e226'), deriveFdeIpamPools('e2e226'),
+    'defaultFdeIpamPools 必须等于派生段本身（多一段 = #270 之前的两段兜底口径回来了）');
+  assert.ok(!defaultFdeIpamPools('e2e226').includes(','), '缺省注入只能一段（逗号分隔两段 = 旧口径回来了）');
+  // applyStackIpamPoolEnv：显式传入优先，未传的才注入（操作者手传时不得被派生值盖掉）。
+  const explicit = { STATION_STACK_ID: 'e2e226', FDE_IPAM_POOLS: '10.201.60.0/24' };
+  const applied = applyStackIpamPoolEnv(explicit);
+  assert.equal(explicit.FDE_IPAM_POOLS, '10.201.60.0/24', '显式传入的放行面不得被派生值盖掉');
+  assert.deepEqual(applied, { [FDE_IPAM_POOL_HOST_KEYS.large]: deriveFdeIpamPools('e2e226') },
+    '只注入未传的那一腿（applied 要如实反映注入了什么）');
+  assert.deepEqual(applyStackIpamPoolEnv({}), {}, '没栈 id ⇒ 不注入（共享栈跑法维持 compose 缺省）');
+  // #270：显式只传派生段（不含整段保留段）也是合法正规值。
   assertIsolatedEnvironment({ env: { ...validIsolationEnv(), FDE_IPAM_POOLS: deriveFdeIpamPools('e2e226') } });
 } catch (error) {
   positiveOk = false;
@@ -445,7 +496,8 @@ try {
 // removeDbDir 副本：#227.1 已收编 wp2b/wp3b（wp2b 走 allowSharedReset 显式声明共享重置，
 // wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
 const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable',
-  'deriveFdeIpamPools', 'defaultFdeIpamPools', 'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce'];
+  'deriveFdeIpamPools', 'defaultFdeIpamPools', 'deriveStackIpamPoolEnv', 'applyStackIpamPoolEnv',
+  'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce'];
 // 工单 F：`ports.json ↔ port_allocations` 对账件的唯一定义处是 lib/ports-reconcile.mjs（不在
 // isolated-env.mjs 里），所以单一来源断言得按名字选归属文件，不能再默认「只有 isolated-env.mjs」。
 const SINGLE_SOURCE_FILES = { reconcilePortsJsonWithDb: 'ports-reconcile.mjs' };
@@ -640,13 +692,25 @@ const singleSourceProblems = [];
       }
     });
   }
-  // #227.3：等值段字面量「10.201.0.0/16」只允许活在 lib/isolated-env.mjs（PORTAL_LARGE_POOL 定义处）；
+  // #227.3 → #270：等值段字面量「10.201.0.0/16」只允许活在 lib/isolated-env.mjs（PORTAL_LARGE_POOL 定义处）；
   // 其它 integration 脚本/夹具再出现该字面量 = 有人把「等值 10.201」的旧口径请了回来（派生被绕过）。
   for (const file of files) {
     if (path.basename(file) === 'isolated-env.mjs') continue;
     const text = fs.readFileSync(file, 'utf8');
     if (text.includes('10.201.0.0/16')) {
-      singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 又出现等值段字面量 10.201.0.0/16（#227.3 应走 deriveFdeIpamPools/defaultFdeIpamPools 派生）`);
+      singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 又出现等值段字面量 10.201.0.0/16（#227.3/#270 应走 deriveFdeIpamPools/deriveStackIpamPoolEnv 派生）`);
+    }
+  }
+  // #270：两腿（放行面 + 分配段）必须由 lib 的 `applyStackIpamPoolEnv()` **一次注入**。
+  // 变异入口：在脚本里自己写 `process.env.FDE_IPAM_POOL_LARGE = ...`（只注入一腿）⇒ 本项红；
+  // 那正是「分配段换了、放行面没换」这种 provision 期才暴雷的形状在脚本层的根源。
+  for (const script of [...ISOLATION_SCRIPTS, 'wp3b-e2e.mjs']) {
+    const text = fs.readFileSync(path.join(HERE, script), 'utf8');
+    if (!/applyStackIpamPoolEnv\(/.test(text)) {
+      singleSourceProblems.push(`${script}: 没调用 applyStackIpamPoolEnv()（两腿必须一次派生，#270）`);
+    }
+    for (const hit of text.matchAll(/process\.env\.(FDE_IPAM_POOL_[A-Z]+)\s*=[^=]/g)) {
+      singleSourceProblems.push(`${script}: 自己给 ${hit[1]} 赋值了（两腿注入只允许走 lib/applyStackIpamPoolEnv，#270）`);
     }
   }
   // 工单 F-6：所有要过 `sg docker -c ${JSON.stringify(cmd)}` 那两层的命令串必须**单行**——真实换行会被

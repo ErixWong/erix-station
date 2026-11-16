@@ -16,6 +16,8 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// 分配段的判据直接用 portal 自己的解析器（护栏与容器启动期共用同一份代码，不会分叉）；纯函数，不连库。
+import { IPAM_POOL_ENV_KEYS, parseCidr, resolveIpamPools } from '../../src/ipam.js';
 
 const LIB_DIR = path.dirname(fileURLToPath(import.meta.url));
 /** 仓库根（本文件位于 portal/integration/lib/）。 */
@@ -44,24 +46,52 @@ export const SHARED_STACK = {
 };
 
 /**
- * portal 侧 IPAM「large 池」钉死的分配段（`portal/src/ipam.js:14`，**非 env 可配**，且 portal/src/**
- * 在护栏脚本的改动范围外）。fde-proxy 对 `network create` 的 subnet 做白名单校验
- * （deploy/fde-proxy/server.js:343-350/400），因此隔离栈的 FDE_IPAM_POOLS **必须包含这段**，
- * 否则 provision 建 fde-* 网络会被 proxy 拒（`IPAM.Subnet not in allowed pools`）——#227.3 落地时
- * 发现的口径冲突，详见交付报告「遗留问题」。
+ * 大 FDE 池的**保留段**（baseline DDL 钉的：`docs/data/schema.sql` §9 `fde_networks` 的 CHECK
+ * `pool='large' ⇒ prefix_len=28 AND subnet::inet << inet '10.201.0.0/16'`；default 同构钉 10.200.0.0/16）。
+ * 它同时是三件事的边界：① portal 分配段的合法取值域（`portal/src/ipam.js#resolveIpamPools` 已把它
+ * 做成启动期硬判据）；② topology §3「两段保留给 FDE 网络专用」；③ deploy-contract §4.4 的兜底 DROP
+ * 只覆盖 `10.200.0.0/16` 与 `10.201.0.0/16` ⇒ 分配段跑出这两段 = 脱离兜底防线。
+ *
+ * ⇒ #270 之后隔离栈的正确做法不是换一段全新的 /16（那会被 DB CHECK 炸成 23514，#227.3 当初的
+ * 「派生段 + 本段两段兜底」就是因为这个：派生段从来没法被真的分配），而是在这段**里面**切子段。
  */
 export const PORTAL_LARGE_POOL = '10.201.0.0/16';
 
 /**
- * 由栈 id 确定性派生本隔离栈专用的 FDE IPAM 段（#227.3：两套隔离栈并行时不共用同一段）。
+ * 隔离栈在保留段里切的片宽（/24）：分配前缀 /28 ⇒ 一片 16 块，够一条 e2e 链路开几个 FDE。
+ * 第三段取 1–99（**刻意跳过 0**：`10.201.0.0/24` 是共享栈如果也用 large 池时第一批会分到的位置）。
+ */
+export const FDE_STACK_SLICE_PREFIX = 24;
+
+/**
+ * 宿主/compose 侧的分配段变量名（去 `FDE_` 前缀就是 portal 侧的 `IPAM_POOL_*`；映射见
+ * `deploy/docker-compose.yml` 的 station-portal.environment 与 `portal/src/ipam.js#IPAM_POOL_ENV_KEYS`）。
+ */
+export const FDE_IPAM_POOL_HOST_KEYS = Object.freeze({
+  default: 'FDE_IPAM_POOL_DEFAULT',
+  large: 'FDE_IPAM_POOL_LARGE',
+});
+
+/** 宿主 env → portal 侧 env（护栏拿 portal 那份**同一个解析器**判，不另写一份 CIDR 校验）。 */
+export function portalIpamEnvFromHostEnv(env = {}) {
+  const out = {};
+  for (const [poolName, hostKey] of Object.entries(FDE_IPAM_POOL_HOST_KEYS)) {
+    if (env[hostKey] !== undefined) out[IPAM_POOL_ENV_KEYS[poolName]] = env[hostKey];
+  }
+  return out;
+}
+
+/**
+ * 由栈 id 确定性派生本隔离栈专用的 FDE IPAM 子段（#227.3 立题，#270 把它做成**真能分配的段**）。
  *
- * 规则：取栈 id 里全部数字拼接后 mod 99 ⇒ 段 = `10.(201 + n%99).0.0/16`（族 10.201–10.299，
- * **天然排除共享段 10.200.0.0/16**）；无数字则用 FNV-1a 短哈希。按段号可判定：段号 ≡ 数字 mod 99，
- * 不同余数必不同段；同 id 永远同段（幂等）。派生值相同≠一定撞（仅当两栈真的并行分配同一子网段才撞，
- * 那时用显式覆盖 FDE_IPAM_POOLS 拆开，护栏允许族内显式覆盖）。
+ * 规则：取栈 id 里全部数字拼接后 mod 99 ⇒ 段 = `10.201.(1 + n%99).0/24`（第三段 1–99）；无数字
+ * 则用 FNV-1a 短哈希走同一条映射。同 id 永远同段（幂等）；不同余数必不同段。为何不是新的 /16：
+ * 见 `PORTAL_LARGE_POOL` 定义处（baseline 的 CHECK 把 `pool='large'` 钉在 `10.201.0.0/16` 里面）。
+ *
+ * 派生值相同≠一定撞（只有两栈真的并行且同段才撞）；那时显式覆盖两腿即可，护栏允许保留段内的显式覆盖。
  *
  * @param {string} stackId STATION_STACK_ID
- * @returns {string} 形如 `10.229.0.0/16` 的单段 CIDR
+ * @returns {string} 形如 `10.201.49.0/24` 的单段 CIDR
  */
 export function deriveFdeIpamPools(stackId) {
   const id = String(stackId ?? '');
@@ -75,18 +105,54 @@ export function deriveFdeIpamPools(stackId) {
     for (let i = 0; i < id.length; i += 1) h = Math.imul(h ^ id.charCodeAt(i), 16777619);
     n = Math.abs(h) % 99;
   }
-  return `10.${201 + n}.0.0/16`;
+  // 保留段只活在上面那个常量里（不拆写第三/四段 ⇒ 改保留段不会漏改这里）。
+  const family = PORTAL_LARGE_POOL.split('.');
+  return `${family[0]}.${family[1]}.${1 + n}.0/${FDE_STACK_SLICE_PREFIX}`;
 }
 
 /**
- * 脚本默认注入的 FDE_IPAM_POOLS（未显式传时）：派生段 + portal large 池固定段（去重，逗号分隔）。
- * 包含 PORTAL_LARGE_POOL 的原因见其定义处注释（proxy 白名单必须覆盖 portal 实际分配的段）。
+ * 两腿一次派生（#270 的单一来源）：同一个段同时当
+ *   · `FDE_IPAM_POOLS`（→ proxy `IPAM_POOLS`，`network create` 的放行面），与
+ *   · `FDE_IPAM_POOL_LARGE`（→ portal `IPAM_POOL_LARGE`，分配器从哪切）。
+ * 两腿同值 ⇒ 「分配出来就被 proxy 拒」不再靠人记对齐。
+ *
+ * @param {string} stackId STATION_STACK_ID
+ * @returns {{ FDE_IPAM_POOLS: string, FDE_IPAM_POOL_LARGE: string }}
+ */
+export function deriveStackIpamPoolEnv(stackId) {
+  const segment = deriveFdeIpamPools(stackId);
+  return { FDE_IPAM_POOLS: segment, [FDE_IPAM_POOL_HOST_KEYS.large]: segment };
+}
+
+/**
+ * 脚本缺省注入的 `FDE_IPAM_POOLS`（#270 收紧：**只注入派生段**，不再多送一段）。
  *
  * @param {string} stackId STATION_STACK_ID
  * @returns {string}
  */
 export function defaultFdeIpamPools(stackId) {
-  return [...new Set([deriveFdeIpamPools(stackId), PORTAL_LARGE_POOL])].join(',');
+  return deriveFdeIpamPools(stackId);
+}
+
+/**
+ * 就地把两腿注入 env（显式传入优先；没栈 id 就不注入，共享栈跑法维持 compose 缺省）。
+ * 各 e2e 入口调一次，取代旧「只注入 `FDE_IPAM_POOLS`」那三行（两腿只注入一腿 = 分叉的根源）。
+ *
+ * @param {Record<string, string | undefined>} [env]
+ * @param {string} [stackId] 缺省取 env.STATION_STACK_ID
+ * @returns {Record<string, string>} 实际注入了哪些键（供日志/断言；没注入则空对象）
+ */
+export function applyStackIpamPoolEnv(env = process.env, stackId = env.STATION_STACK_ID) {
+  if (!stackId) return {};
+  const derived = deriveStackIpamPoolEnv(stackId);
+  const applied = {};
+  for (const [key, value] of Object.entries(derived)) {
+    if (env[key] === undefined || env[key] === '') {
+      env[key] = value;
+      applied[key] = value;
+    }
+  }
+  return applied;
 }
 
 /**
@@ -274,7 +340,7 @@ export function assertIsolatedEnvironment(options = {}) {
     'STATION_DB_NAME', 'STATION_PORTAL_NAME', 'STATION_DOCKER_PROXY_NAME', 'STATION_EDGE_NAME',
     'PORTAL_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT',
     'STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE',
-    'BACKEND_SUBNET', 'FDE_POOL', 'FDE_IPAM_POOLS',
+    'BACKEND_SUBNET', 'FDE_POOL', 'FDE_IPAM_POOLS', FDE_IPAM_POOL_HOST_KEYS.large,
     ...(litellm ? ['STATION_LITELLM_NAME', 'LITELLM_HOST_PORT'] : []),
     ...fdeNames.map((fde) => fde.env),
     ...extraRequiredEnv,
@@ -306,17 +372,55 @@ export function assertIsolatedEnvironment(options = {}) {
   }
 
   assert.equal(env.FDE_POOL, 'large', 'isolated e2e must use the dedicated large FDE pool');
-  // #227.3：从「等值 10.201.0.0/16」改为按栈派生。fail-closed 口径：每一段都必须在隔离族
-  // 10.201.0.0/16–10.299.0.0/16 内；共享段 10.200.0.0/16（portal 缺省池/共享栈 FDE 网络所在地）一律拒。
-  // 正规值 = deriveFdeIpamPools(STATION_STACK_ID)；显式覆盖（仍在族内）同样放行——并行撞段时的逃生口。
+  // #227.3 → #270：从「等值 10.201.0.0/16」改成「按栈派生的保留段子段」，而且现在**两腿都要判**：
+  //   腿 A（放行面 FDE_IPAM_POOLS）：每段必须落在隔离族 10.201.0.0/16–10.299.0.0/16 里；共享段
+  //     10.200.0.0/16（portal 缺省池 / 共享栈 fde-* 网络所在地）一律拒 —— fail-closed。
+  //   腿 B（分配段 FDE_IPAM_POOL_LARGE → portal IPAM_POOL_LARGE）：必须被 portal 自己的启动期校验
+  //     接受（即落在 DDL 保留段 10.201.0.0/16 内）、必须是保留段的**真子段**（整段 = 并行必撞的
+  //     旧口径）、且必须被腿 A 的放行面覆盖（不覆盖 = provision 建 fde-* 网络被 proxy 拒）。
+  //     失败文案**同时点名两侧变量名**（工单判据④）。
   const fdeIpamPools = String(env.FDE_IPAM_POOLS).split(',').map((pool) => pool.trim()).filter(Boolean);
   assert.ok(fdeIpamPools.length > 0, `FDE_IPAM_POOLS=${env.FDE_IPAM_POOLS} 不含任何有效 CIDR`);
+  const parsedWhitelist = [];
   for (const pool of fdeIpamPools) {
     assert.notEqual(pool, SHARED_STACK.fdeIpamPool,
       `FDE_IPAM_POOLS 含共享栈在用的段 ${pool}（portal 缺省池/共享栈 fde-* 网络在此，并行必撞）；本栈应用派生段 deriveFdeIpamPools(STATION_STACK_ID)=${deriveFdeIpamPools(env.STATION_STACK_ID)}`);
-    assert.match(pool, /^10\.2(?:0[1-9]|[1-9][0-9])\.0\.0\/16$/,
+    let parsed;
+    try {
+      parsed = parseCidr(pool);
+    } catch {
+      assert.fail(`FDE_IPAM_POOLS=${pool} 不是合法 CIDR（正规值=派生段 ${deriveFdeIpamPools(env.STATION_STACK_ID)}）`);
+    }
+    if (parsed.base !== parsed.ipInt) {
+      assert.fail(`FDE_IPAM_POOLS=${pool} 不是规范网络地址（主机位必须全 0；否则护栏与 portal 的口径会对不上）`);
+    }
+    const octets = pool.split('.');
+    const secondOctet = Number(octets[1]);
+    assert.ok(octets[0] === '10' && secondOctet >= 201 && secondOctet <= 299,
       `FDE_IPAM_POOLS=${pool} 必须留在隔离族 10.201.0.0/16–10.299.0.0/16 内（正规值=派生段 ${deriveFdeIpamPools(env.STATION_STACK_ID)}）`);
+    parsedWhitelist.push(parsed);
   }
+  // 腿 B：分配段（#270 的旋钮）。拿 portal 自己的解析器判 —— 护栏红 = 容器也会同样红。
+  const allocHostKey = FDE_IPAM_POOL_HOST_KEYS[env.FDE_POOL];
+  let resolvedPools;
+  try {
+    resolvedPools = resolveIpamPools(portalIpamEnvFromHostEnv(env));
+  } catch (err) {
+    assert.fail(`${allocHostKey}=${env[allocHostKey]} 被 portal 自己的启动期校验拒了（容器会以同样的原因起不来）：${err.message}`);
+  }
+  const allocSegment = resolvedPools[env.FDE_POOL].cidr;
+  assert.equal(allocSegment, String(env[allocHostKey]).trim(),
+    `${allocHostKey}=${env[allocHostKey]} 不是规范写法（portal 会把它压成 ${allocSegment}）；正规值=派生段 ${deriveFdeIpamPools(env.STATION_STACK_ID)}`);
+  assert.notEqual(allocSegment, PORTAL_LARGE_POOL,
+    `${allocHostKey}=${allocSegment} 是**整个**保留段 = #270 之前「两套隔离栈都从 10.201.0.0/16 池头分配」的必撞口径；`
+    + `请切子段（正规值=派生段 ${deriveFdeIpamPools(env.STATION_STACK_ID)}）`);
+  const parsedAlloc = parseCidr(allocSegment);
+  assert.ok(
+    parsedWhitelist.some((w) => w.base <= parsedAlloc.base && parsedAlloc.last <= w.last),
+    `分配段 ${allocSegment}（portal 侧 ${IPAM_POOL_ENV_KEYS[env.FDE_POOL]} ← 宿主侧 ${allocHostKey}）没被本栈放行面 `
+    + `FDE_IPAM_POOLS=${env.FDE_IPAM_POOLS} 覆盖 ⇒ provision 建 fde-* 网络会被 proxy 拒（IPAM.Subnet not in allowed pools）；`
+    + '两头必须同源（正规跑法：deriveStackIpamPoolEnv(栈 id) 一次派生喂两腿）',
+  );
   assert.equal(env.COMPOSE_PROJECT_NAME, env.STATION_STACK_ID,
     'compose project and stack label must use the same unique ID');
   for (const name of containerNames) {

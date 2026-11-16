@@ -12,7 +12,7 @@
 //     =station-*-<栈 id>（compose 用它们做 container_name，不派生与共享栈撞名）
 //   PORTAL_HOST_PORT=<非 18080> LITELLM_HOST_PORT=<非 4100> TRAEFIK_WEB_PORT=<非 8090> TRAEFIK_WEBSECURE_PORT=<非 8443>
 //   FDE_NAME=<含栈 id 的 FDE 名>（fde-<name> 是全局 docker 网络/容器名，不派生会与共享栈互删）
-//   BACKEND_SUBNET=<非 172.32.0.0/24> FDE_POOL=large（FDE_IPAM_POOLS 可不传：缺省由 defaultFdeIpamPools(栈 id) 派生；显式传入优先，#227.3）
+//   BACKEND_SUBNET=<非 172.32.0.0/24> FDE_POOL=large（FDE_IPAM_POOLS 可不传：缺省由 applyStackIpamPoolEnv(栈 id) 派生；显式传入优先，#227.3）
 //   LLM_GATEWAY_HOST=http://127.0.0.1:<LITELLM_HOST_PORT>
 //   BASE_DOMAIN=…（**必须 export**，如 fde.erix.vip 或自建域；composeDomainEnv 缺省 localhost ⇒
 //     不 export 时路由 host 物化成 station.localhost/llm.localhost，agentd 全 404）。
@@ -33,7 +33,7 @@ import { ensureLlmBinding } from './lib/llm-binding.mjs';
 import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { LLM_HOST, PORTAL_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 import {
-  assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  assertHostPortsAvailable, applyStackIpamPoolEnv, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
   writeDynamicStub, deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
 
@@ -43,10 +43,11 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 // （忘 export 曾经会让脚本自己对共享 dev 栈 down -v）。
 const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME required for isolated e2e}" --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
 
-// #227.3：FDE_IPAM_POOLS 未显式传时按栈 id 派生本栈口径（派生段+portal large 池固定段；显式传入优先）。
-if (!process.env.FDE_IPAM_POOLS && process.env.STATION_STACK_ID) {
-  process.env.FDE_IPAM_POOLS = defaultFdeIpamPools(process.env.STATION_STACK_ID);
-}
+// #227.3 → #270：两腿**一次派生** —— 放行面 FDE_IPAM_POOLS（= proxy IPAM_POOLS）与 portal 的
+// 分配段 FDE_IPAM_POOL_LARGE（→ portal IPAM_POOL_LARGE）取同一个值，显式传入优先。旧口径
+// 「派生段 + 整个 large 保留段两段兜底」已删：那第二段就是「两套并行隔离栈都从同一池头分配」
+// 的撞车源头，而现在分配段本身可配（portal/src/ipam.js 的 IPAM_POOL_LARGE），不再需要额外放行一段。
+applyStackIpamPoolEnv(process.env);
 
 // issue #226：入口句柄全部 env 派生（缺省值保留现状值只为可读，隔离跑法由护栏强制显式传）。
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';

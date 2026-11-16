@@ -382,7 +382,8 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `PORTAL_PUBLIC_BASE_URL` | portal 对外完整 URL（cookie 域 / 跳转生成用，portal 运行时） | 空 = 由 `PORTAL_HOST` 派生 |
 | `LLM_PUBLIC_BASE_URL` | LLM 网关对外完整 URL（`llm.<base>`，路由生成与占位 endpoint 用） | 空 = 由 `LLM_HOST` 派生 |
 | `SESSION_TTL_SECONDS` | portal 登录会话 TTL | `604800`（7 天） |
-| `FDE_IPAM_POOLS` | IPAM 池（逗号分隔 CIDR；proxy/portal 双侧校验；隔离 e2e 必须使用与宿主网络不重叠的专用池） | `10.200.0.0/16,10.201.0.0/16` |
+| `FDE_IPAM_POOLS` | **放行面**（不是分配器）：fde-proxy 允许的 `network create` subnet 池，逗号分隔 CIDR（compose 下发给 proxy 的 `IPAM_POOLS`）；隔离 e2e 必须使用与宿主网络不重叠的专用池。⚠ 与下面两个旋钮是**两个语义**：portal 实际从哪一段切 = `FDE_IPAM_POOL_*`，本变量只决定**哪些段被放行**；分配段必须整体落在本变量的放行面内，否则 `network create` 被 proxy 拒（reason 会同时点名两侧变量名）。 | `10.200.0.0/16,10.201.0.0/16` |
+| `FDE_IPAM_POOL_DEFAULT` / `FDE_IPAM_POOL_LARGE` | IPAM **分配段**（issue #270）：去 `FDE_` 前缀后下发给 portal 的 `IPAM_POOL_DEFAULT` / `IPAM_POOL_LARGE`（`portal/src/ipam.js#resolveIpamPools`），决定默认池 / 大 FDE 池从哪一段里切。取值：单个 CIDR，必须是规范网络地址（主机位全 0），且必须整体落在该池的 DDL 保留段内（`default ⇒ 10.200.0.0/16`、`large ⇒ 10.201.0.0/16`，`schema.sql` §9 的 CHECK）；非法值/脏段/切不出块的段 ⇒ **portal 启动即失败并点名是哪个键**（不等 provision 撞 23514）。**前缀长度不是旋钮**（恒 /29 与 /28，同一条 CHECK 钉的）。并行隔离栈：每栈取不同子段（例 `10.201.37.0/24`）并把它同时放进 `FDE_IPAM_POOLS`。 | `10.200.0.0/16` / `10.201.0.0/16`（逐字 = #270 之前的硬编码值，不设 ⇒ 行为零变化） |
 | `FDE_ALLOWED_USERS` | FDE 容器允许的 `uid:gid` 白名单（create 参数级校验，deploy-contract §5.1） | `1001:1000` |
 | `FDE_MEMORY_LIMIT_MAX` / `FDE_PIDS_LIMIT_MAX` | FDE 容器资源限额上限（`0` = 不限；透传 station-docker-proxy） | `0` / `0` |
 | `FDE_DEV_MODE` | 显式开发模式（F12/F14 松约束；生产必须 `0` 或 `NODE_ENV=production`） | 开发 `1` / 生产 `0` |
