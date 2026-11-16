@@ -111,6 +111,17 @@ services:
     build:
       context: ..
       dockerfile: portal/Dockerfile
+      # issue #586：版本是**构建产物**（`build-info.json` 是运行时唯一版本真相，见 portal/Dockerfile 末尾）。
+      # 这三格只影响镜像末尾那一层与 OCI label，**不**是 `station_version` 的来源（那格从镜像内
+      # `package.json` 读）⇒ 本地不传不会烘出一个假版本，只会让 `revision`/`built_at` 是 `unknown`。
+      # 口径：CI / 发布路径**不许** unknown（`ci.yml` 的 portal tripwire、`release.yml` ④ 会红）；
+      # 本地想留 revision 就显式带：
+      #   STATION_REVISION="$(git rev-parse HEAD)" STATION_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      #     docker compose build station-portal
+      args:
+        STATION_VERSION: ${STATION_VERSION:-unknown}
+        STATION_REVISION: ${STATION_REVISION:-unknown}
+        STATION_BUILD_DATE: ${STATION_BUILD_DATE:-unknown}
     image: ${STATION_PORTAL_IMAGE:-erix-station/portal:local}
     restart: unless-stopped
     networks:
