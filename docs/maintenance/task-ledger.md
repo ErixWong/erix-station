@@ -6831,3 +6831,73 @@ spin**（例：上限 2s，每轮仍 `setImmediate`，到点仍 `assert.ok(clock
 根 `npm test` 跑 1 次 → `# tests 2373 / pass 2359 / fail 0 / skipped 14`、**rc=0**（load 1.53→2.79，
 低负载窗口 ⇒ #531 那族假时钟夹具这轮没飘；上一节已记清它在 load 13+ 时会让全量 rc=1 而单跑恒绿，
 **本轮没有出现需要定性的红格**）。`node --check` 全部改动文件过。
+
+
+### 8.135 issue #259 jail 只读例外：读边界从一条变两条（写判定一点没放宽）+ 提示词退掉一条教了半年的假病（issue #259 / 工单 fix-261116-05，2026-11-16，worker 落地 + 真机判据 BLOCKED-on-deploy）
+
+> **编号由主 agent 统一分配（本批并行）**：worker 侧按 `grep -n '^### 8\.' | tail -3` 先挑了号，最终以主 agent 的分配为准（§8.116 那条撞号老账）。
+
+**动的是什么**：`createJail({ root: cwd, writable: [cwd] })` 的读边界一直只有项目根，`~/AGENTS.md`（平台约束的单一真相，#258）与 `~/.erix/ports.json`（端口唯一真相，#246）在 `readFile` / `tree` 里**不存在**——真机证据是 transcript 里读 `~/AGENTS.md` 走的是 `shell cat`，模型的自然习惯 `readFile` 撞上 `错误：读取被宿主边界拒绝：…`，白烧一轮。**加的是只读例外，写判定一点没放宽**（红线：agent 能改平台文件 = 下一轮对账覆盖回去 = 用户以为改掉了，那是比「读不到」更坏的困惑源）。
+
+**实现形态**（`runner/lib/file-tools.js`）：读侧多一条解析，写侧沿用 0.3.5 那条。
+- `createJail({ root, writable, maskedPaths, readExceptions })`：`resolve` 逐字未动（严格根内，也是历史 `resolve` 的唯一实现）；新增内部 `resolveReadable` = 「根之内 ∪ 例外之内」，**只有 `assertReadable` 用它**。例外条目 `realpathWithMissing` 后再判前缀 ⇒ `<例外>/../<别处>`、指向清单外的 symlink、以及**名字前缀与例外相同的兄弟目录**（`~/.erix-backup`）都出不了清单；对**还不存在**的路径不抛，所以「平台文件尚未物化」不会在装配期炸掉 jail。
+- `maskedPaths` 的条目解析从「严格根内」改成同一口径：**这是本单一处刻意的语义变化**——家目录开了只读例外之后，「在例外里遮蔽一个密钥子目录」之前会被当成越界而在装配期抛，现在能用；落在根与例外**之外**的遮蔽条目仍照旧抛（旧守卫原样保留，不静默吞写歪的规则）。
+- `platformReadExceptions({ home })` = `[<home>/AGENTS.md, <home>/.erix]`，`worker.js` 里 `createJail({ root: cwd, writable: [cwd], readExceptions: platformReadExceptions() })` 只有一处装配。两条纪律：**不含运行期事实**（端口号 / 伞域 / FDE 名一个都不出现，#246/#257 同口径）；**fail-closed**（拿不到家目录 ⇒ 空清单，退化成 #259 之前的行为，不是「放宽成整个 `/`」；`home: undefined` 是「没传」的同义，不是「拿不到」）。
+- #228 的接线口径不变：喂给上游的 `allowRead` 仍是「调用方谓词 ∧ ¬遮蔽 ∧ jail 谓词」，例外只长在 jail 那一项上——`file-tools-contract.test.js` 新用例把四种「放宽过头」的形状各钉一条（正向对照 + 调用方谓词照挡 + 装配层遮蔽照挡（遮蔽项正落在例外里）+ 写侧不被顺带放宽）。
+
+**「被拒」与「为什么被拒」是两件事**（本单最容易做假的一条，主 agent 派单时点名）。上游把谓词的 `false` 排成一句固定文案 `错误：写入被宿主边界拒绝：<相对路径>`，**它看不见 jail 的错误码** ⇒ 只断言「被拒」的测试放什么实现进去都能绿。所以分两层钉：
+- jail 层三条拒因的**错误码分得很开**：落在例外清单里 ⇒ `path_read_only`；根内非可写 ⇒ `path_not_writable`（同 0.3.5）；根外 ⇒ `path_escapes_root`（同 0.3.5）。三条都是拒，**写判定一点没放宽**，只是把其中一条说准了。
+- 工具文案层在 `executeTool` 出口给那句拒绝**追加**一句原因（`错误：写入被宿主边界拒绝：…（这是平台开的**只读例外**…读得到、写不进去）`），只追加不改上游前缀（契约只钉前缀）。两条拒因的**用词互不重叠**（`只读例外` 四个字只出现在第一条），否则「分得开」只能靠 `doesNotMatch` 逆推、会被无关文案里的同一个词误兵。装配层为此记一次「最后一次 `allowWrite` 调用的拒因」：上游对一次写只调一次 `allowWrite`（`src/tools/file-tools.js` 里 `writeFile` / `edit` 各一处），所以它是确定量；将来上游改成多次调用，备注会变糊但不会变错（注释里写了这条前提）。
+
+**清单为什么不收窄成「只放 `ports.json`」（现查，不是省事）**：`~/.erix/` 里平台只物化四样（`portal/src/materializer.js#buildFilePlan`：`config.json` / `mcp.json` / `ports.json` + 落盘后的 `manifest.json`），`config.json` 里只有**占位 key**（`renderConfigJson` 的 `apiKey: 'erix-placeholder'`，H-B D-4 容器内零真实凭据），userspace 每 FDE 一棵（user-space §2.4）⇒ **既没有跨 FDE 数据也没有密钥**。目录里余下的 `skills/`、`todos/` 是本 FDE 自管内容（user-space §4.2），读到它们不是失守而是本意。⚠ **现查顺带挖出两条事实**：① `maskedPaths` 在**生产侧没有生产者**（`grep -n maskedPaths runner/worker.js` = 0 处，jail 与装配层都只在建工厂时收这个参数）⇒ 本单「例外内遮蔽仍生效」是**库层能力 + 测试锁定**，真要在家目录挡密钥还得先把 `maskedPaths` 接进 worker 装配（另单，别顺手塞进本单）；② `~/.erix/delegation/` 这条路径**不存在**——delegation 的名册/账本住 `<home>/delegation`（`runner/lib/delegation.js:172` 由 agentd 下行；`docs/api/portal.md` §4.4c 同口径），`docs/design/event-platform/06` §1 那句「名册目录 `~/.erix/delegation/`」与实现不一致，本单没照它开例外。
+
+**不与 PR #540 的 glob 语义耦合**（#540 还没合并，main 上遮蔽只有前缀语义）：本单用的例外条目与遮蔽条目都是**字面前缀**，并且反着钉了一条用例——把 `*` 写进 `readExceptions` / `maskedPaths`，它必须**不**当模式用（`<home>/*` 遮不住 / 放不了任何东西）。将来 #540 合并后这条变红，就是提醒重读口径，不是「修测试」了事。
+
+**提示词那一条假病退场**（issue 验收的反向防漂移）：`runner/worker.js` 原来写着「`~/.erix/ports.json` 在家目录（项目目录之外），**文件工具读不到它**（会回「被宿主边界拒绝」），用 shell 读：`cat ~/.erix/ports.json`」——一条存在的意义就是「教模型绕过平台的缺口」，缺口填了它就成了谎（教模型去跑一条比 `readFile` 更贵、还把整文件灌进上下文的路径）。改成 `readFile` 口径并写明「读得到但写不进去」。`system-prompt.test.js` 三条同步：① #451 那条用例的判据**等强度换向**（仍要求「说清怎么读到它」，手段从 `cat` 换成 `readFile`）；② 新增反向防漂移（旧句式**整族**退场，`~/…` 读法的句子里不得再出现 `cat`）；③ 新增**接线锁**——断言必须钉在 `createJail({…})` 这一个调用点上，`writable` 仍是 `[cwd]`。
+
+**变异实验**（每条都先红再复绿；后三发是在**最终代码形态**上跑的，前三发是在「还没有拒因分诊」的那一版上跑的，已标注）：
+| 变异 | 读数 | 备注 |
+|---|---|---|
+| `assertReadable` 退回严格 `resolve`（读侧例外整体失效） | **9 红 / 91**（正向、写红线、越界、遮蔽×3、严格语义、真机形状、契约谓词相与） | 最终形态复跑 |
+| 删掉 `path_read_only` 那条分支（拒因塌回越界） | **2 红 / 91**（「红线：写边界不变」+「jail 严格语义一字未动」） | 最终形态复跑——**只断言「被拒」的测试在这一发下会全绿**，这就是它存在的理由 |
+| 撤掉 worker 的接线（只改文案不改 jail） | **1 红 / 91**（「#259 接线锁」） | 最终形态复跑。第一版这条**全绿**：断言写成了全文关键词，命中了注释里的同一串字——是变异实验揭穿的唯一一条假锁，改成钉调用点后复红 |
+| `resolveReadable` 只按 lexical 前缀判定（不做 realpath） | 2 红（越界用例 + 既有 F7 symlink 用例） | 前一版形态，之后未复跑 |
+| 清单放宽成整个家目录 | 2 红（清单内容、真机形状） | 前一版形态，之后未复跑 |
+| 遮蔽条目退回严格解析 | 2 红（例外内遮蔽、遮蔽条目落点） | 前一版形态，之后未复跑 |
+| 提示词退回旧文案 / 写边界顺手加 `os.homedir()` | 3 红 / 1 红 | 前一版形态，之后未复跑 |
+
+**验证**：`node --test runner/test/file-tools.test.js runner/test/file-tools-contract.test.js runner/test/system-prompt.test.js` **91/91 绿**（基线 78 → 新增 13 条：jail 侧 10 + 契约侧 1 + 提示词侧 2）。新用例覆盖：正向三工具（含例外目录的子目录）、写被拒且**不落盘**（`writeFile` 与 `edit` 各一次）+ 两条拒因文案分得开、八条越界（lexical 在例外内而 realpath 在外 / symlink / 例外文件再 `..` / 清单外家目录文件 / `.erix-backup` 前缀兄弟 / 普通兄弟 / `$HOME/../etc/passwd` 两种爬法）、遮蔽在例外内（前缀形态条目 + 排除账 `metadata.searchSkipped.deniedPaths` + `tree` 不列）、遮蔽条目落点三格、glob 元字符按字面、缺省空清单 = 旧行为、`platformReadExceptions` 内容与 fail-closed、**真机形状**（把 `process.env.HOME` 换到夹具 ⇒ 上游 `expandHomePath` 与本模块缺省值同源，`readFile {path:"~/AGENTS.md"}` 读到内容而不是撞边界）。
+
+**⚠ BLOCKED-on-deploy：issue 验收的「真机：agent 用 `readFile` 读 `~/AGENTS.md`」本轮未跑**。改动全在 **worker 进程**里 ⇒ 必须**重建 FDE 镜像 + `docker rm -f` 掉 `fde-*` 容器**才生效（`ensureFdeContainer` 不检镜像漂移，同 `runner-integration` §6.3 的运维坑），而本机 5 个 `fde-*` 容器当时正被另一张引擎升级单占用（本轮红线：不碰任何 `station-*` / `fde-*` 容器）。复测方法（谁做都照这三步）：
+1. `docker ps --format '{{.Names}}' | grep '^fde-'` 挑一个**已用新镜像重建**的容器（镜像 tag 现读 `deploy/.env`，重建窗口由主 agent 定）；
+2. 在门户对该工位发一条最普通的消息「用 readFile 读一下 ~/AGENTS.md，把『收工即提交』那条原文贴给我」；
+3. **成功长这样**：工具卡片里出现 `readFile`（**不是** `shell`），入参 `{"path":"~/AGENTS.md"}`，返回正文；该 run 的 transcript 里 `错误：读取被宿主边界拒绝` **0 次**。反证（旧行为）：第一轮是 `shell` + `cat ~/AGENTS.md`，或 `readFile` 拿到那句拒绝。同一条 run 里顺手复核端口清单：让它 `readFile ~/.erix/ports.json` 报出 `block`，同样不该撞边界。单元级替代证据 = 上面「真机形状」那条用例（换 `HOME` 后走的就是「上游 `~` 展开 → jail 谓词」这条真链路）。
+
+**改了哪些文档**：`docs/design/user-space.md` §4.1.2「读取边界」行（旧行写的是「无只读例外」，整行改口径）、`docs/design/runner-integration.md` §6.3-3 与 §12 工具风险表（`readFile` 那行补「家目录有一张显式白名单，其余位置依旧挡」）、`docs/design/agents-md-layering-2026-11-05.md` §1 事实表与 §2.3（**保留历史原句 + 标注「当时如此，现已改」**，不把历史改脏）。`ISSUES.md` 的 #259 行没动——它属于某一次全量对账的快照，等部署面验过再随关单一起改。`AGENTS.md` 没碰（热层预算与台账搬家口径见 §8.117）。
+
+**返工（261116 同日，第三方审计 5 条 LOW 的处置）**：主 agent 已验收过上面那版（30/30、接线锁变异、520/520、根 2369/2355/0），本轮**只做新增提交**，处理审计的 5 条 LOW：**两条改代码、一条加测试、两条只登记**。
+
+**LOW-1（改代码）：例外根自己是 symlink ⇒ 例外会扩张到它的目标**。上面那句「例外自身是指向别处的目录时，前缀判定跟着 realpath 走」是**双刃**的：`~/.erix` 被换成指向 `/etc` 的链接，`/etc/*` 就整体落进只读例外。清单是平台给的，但**目录是 agent 自己能改的**（shell `rm -rf ~/.erix && ln -s /etc ~/.erix`），所以解析完必须回查归属。实现成 `resolveReadExceptionRoots()`：
+- **归属锚 = 声明这条例外的目录**（`path.dirname(declared)` 的 realpath），对 `platformReadExceptions()` 那两项（`$HOME/AGENTS.md`、`$HOME/.erix`）**就是 `$HOME` 本身**。不在 jail 里硬取 `os.homedir()` 的两个理由：① jail 是纯参数驱动的库，测试与将来的调用方都用夹具家目录，环境里的 HOME 与它们无关；② 父目录恒**不比声明更宽**，于是「例外不得被 symlink 放宽」对任意条目都成立，而不是只对平台那两项成立。锚自己**也要 realpath**——`$HOME` 本身是 symlink 的机器上拿词法父目录比会把合法重排误杀成越界（这是本轮唯一一处「先想到再验证」的边界，判据②就是它的锁）。
+- 不满足 ⇒ **丢弃该条形同不存在**（清单里没它、写拒因从 `path_read_only` 退回 `path_escapes_root`、读侧整个子树读不到）+ `warn` 点名两个路径（哪个例外根、解析到了哪里）+ 事实挂 `jail.droppedReadExceptions` 供装配方复核。⚠ **绝不因此抛**：抛 = jail 构造失败 = worker 起不来，而 agent 换个链接是它做得到的动作，该有的形状是「这条例外没生效」。连带把**落在被丢弃例外之下的 `maskedPaths` 条目**也改成「跳过 + warn」（生产侧 `maskedPaths` 今天还没有生产者，但 #259 已经开了「例外内遮蔽」这个口，不修就是将来某次接线把 worker 打挂）；根与例外**都之外**的遮蔽条目照旧在装配期抛（旧守卫原样保留）。
+- **两项走同一个函数、同一个判据**（`$HOME/AGENTS.md` 不写第二套逻辑），并单独钉一格证明这件事。
+- **登记的残余风险（不当缺陷遮）**：判据是「不得搬出声明它的目录」，所以 `~/.erix -> $HOME` 这种解析结果**恰等于家目录**的形状是**保留**的，此时例外放大到整个家目录（钉了一格写死今天的真实行为）。扩张上界是家目录，不是任意路径。
+
+**LOW-2（改代码，改的是测试码）：提示词防漂移看不见语义相反的改写**。旧正向断言只锚 `/直接用文件工具读/` 这个**短语**，把文案改成「直接用文件工具**读不了**」（意思整个反过来）16/16 仍然 rc=0——这不是断言写得严不严的问题，是**子串匹配在中文里天然挡不住否定式**。修法两条：正向改成**锚整句意**（切句后要求同一句里同时有「家目录 / 两个 `~/` 路径」+「文件工具 或 readFile」+「能读」，且 `读` 后面紧跟否定就不算）；反向从两条固定短语扩成一族（`读不X` / 看不见 / 无法…读 / 不能…读 / 用不上文件工具 / 够不到 / 到不了 / 找不到），**作用域收在讲家目录读法的那几行**——全文查「看不见」会打到 #425 的「用户看不见你的内部动作」，那是正常句子，扩错作用域就是自己造误兵。`worker.js` 的文案一字未动。
+
+**LOW-3（加测试，不改产品码）：`.erix` 尚未物化的形状钉住**。有效 HOME 但 `~/.erix` 不存在时：条目**保留**（不是丢弃也不是空清单）、归属检查**不开火**、不刷 warn、`assertReadable` **放行**，实际 `readFile` 报「路径不存在」而**不谎报边界/权限**（谎报会让模型以为平台挡了它，走错分支）；同一格顺手钉「物化之后同一条路径自然读得到」——这正是「条目保留」而不是「条目丢弃」的理由，是 #259 的本意而非缺陷。旧用例只覆盖了**无效 HOME 参数**那一支。
+
+**LOW-4 / LOW-5（只登记）**：① **没有通用秘密扫描闸**——今天物化进 `~/.erix` 的四样没有真 token（`config.json` 是 `erix-placeholder`、`mcp.json` 为空、`ports.json` / `manifest.json` 是本 FDE 自己的分配与元数据），但将来新增 `.erix/token.json` 之类，读例外会**静默放行**且现有测试未必失败 ⇒ 解禁条件已写进 `docs/design/user-space.md` §4.1.2 那行：**往 `~/.erix` 新增物化文件之前，先把它的形状钉进 `portal/test/materializer.test.js` 的秘密扫描用例**（本轮**没有**实现那道扫描，见下面的未尽项）。② **shell 不对称**：shell 确实注册给模型且不受 file jail 约束（`runner/lib/shell-tools.js:6-8,192`），提示词在文件工具拒绝时还会建议用 shell ⇒ **本轮加的归属检查定位是「防例外静默扩张」，不是安全边界**（同一句话也写进了 `docs/design/user-space.md` 与 `docs/design/runner-integration.md` §6.3-3 / §17，别让下一个人以为它挡住了 `cat`）。
+
+**变异自证（每条先红再复绿；改的都是产品码/文案，不是把测试改松）**：
+| 变异 | 读数 | 说明 |
+|---|---|---|
+| M1 撤掉归属检查（退回「条目直接 realpath」） | **3 红 / 36**：`not ok 24 - #259 归属检查①…`、`not ok 25 - #259 归属检查①红线…`、`not ok 27 - #259 归属判据只有一条：$HOME/AGENTS.md…`；**格②（家目录内重排）仍绿** | 真改行为：审计那条越界形状重新变成可读 |
+| M2 把检查写成「始终通过」（`\|\| true`） | **同样 3 红 / 36**（24 / 25 / 27），格② 仍绿 | 与 M1 同一决策点的两种形状（删判据 vs 恒真），读数一致正是期望：证明那三格锁的是判据本身 |
+| M3 一律丢弃（= 「把例外全关了蒙过①」） | **13 红 / 36**，其中含 **`not ok 26 - #259 归属检查②…仍然读得到`** | 这一发是**反作弊格**：格② 在 M1/M2 下绿、在 M3 下红 ⇒ 它真的在测「合法重排仍可读」，不是「例外都关」的假绿 |
+| M4 提示词注入反向措辞（「直接用文件工具读**不了**」） | **2 红 / 16**：`not ok 7 - SYSTEM_PROMPT 明确告知「平台约定已随本次 run 注入」…（#451 + #259）`、`not ok 8 - #259 反向防漂移…`，rc=1 | **这条就是 LOW-2 的验收**（旧断言在这一发下 16/16 全绿）。正向与反向各红一次 = 两条锁独立生效 |
+| 对照：等价正向改写（「用文件工具读得到」） | **16/16 绿，rc=0** | 证明新的正向断言不是新的固定短语锁——换措辞仍绿，只有**语义反过来**才红 |
+
+**本轮验证**：`node --test runner/test/file-tools.test.js runner/test/system-prompt.test.js` **52/52 绿**（36 + 16；上一版 30 + 16 ⇒ 新增 6 格全在 file-tools）；`runner/test/file-tools-contract.test.js runner/test/agents-md.test.js` **73/73 绿**（jail 改动没伤 #228 的谓词相与面与 #451 的注入面）；`node --test 'runner/test/*.test.js'` 全量与 `npm run check:agents-hotlayer` 见交付报告。**未跑根 `npm test`**：本轮没碰 portal 侧（`git diff --stat` 里 portal 为空），那张 15 分钟的账单不该在这里付。
+
+**未尽项**：① **LOW-4 那道秘密扫描用例没实现**（是审计的「可选加分」，且它会强制把 portal 侧拖进本轮门禁）——已登记成**解禁条件**而不是「已防住」；② 上面那条 **BLOCKED-on-deploy 的真机判据**本轮依旧没跑（红线：不碰 `station-*` / `fde-*` 容器），复测三步不变；③ `.erix -> $HOME` 的边界形状按今天的行为钉死（保留），要收紧成「必须严格在家目录之内、不等于家目录」得连那一格一起改。
