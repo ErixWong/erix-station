@@ -1,4 +1,4 @@
--- 0036-transcript-recovery-rows.sql —— 账本恢复行（issue #500：erix-agent 0.33.0 恢复行三件套）
+-- 0038-transcript-recovery-rows.sql —— 账本恢复行（issue #500：erix-agent 0.33.0 恢复行三件套）
 --
 -- 要解决的问题：引擎 0.32（上游 issue #769）把「这个 `tool_use` 真的执行过了」「这段半截正文产生过」
 -- 做成**账本恢复行**（`kind: "recovery"`），要求宿主实现 `appendRecoveryRow` / `listRecoveryRows` /
@@ -83,7 +83,7 @@ BEGIN
    WHERE c.contype = 'p' AND t.relname = 'transcript_recovery_rows';
 
   IF pk_cols IS DISTINCT FROM 'transcript_key,dedup_key' THEN
-    RAISE EXCEPTION '0036: transcript_recovery_rows 幂等键 UNIQUE (transcript_key, dedup_key) 漂移（实得 %）',
+    RAISE EXCEPTION '0038: transcript_recovery_rows 幂等键 UNIQUE (transcript_key, dedup_key) 漂移（实得 %）',
       coalesce(pk_cols, '<无主键>');
   END IF;
 
@@ -97,7 +97,7 @@ BEGIN
      AND i.indexrelid = 'transcript_recovery_rows_key_seq_idx'::regclass;
 
   IF idx_cols IS DISTINCT FROM 'transcript_key,append_seq' THEN
-    RAISE EXCEPTION '0036: transcript_recovery_rows_key_seq_idx 的列漂移（实得 %）——'
+    RAISE EXCEPTION '0038: transcript_recovery_rows_key_seq_idx 的列漂移（实得 %）——'
       '恢复行必须按 append_seq（不是时间）返回，partial-text 取的是「该轮最后落盘」那条',
       coalesce(idx_cols, '<无索引>');
   END IF;
@@ -107,7 +107,7 @@ BEGIN
      WHERE attrelid = 'transcript_recovery_rows'::regclass
        AND attname = 'created_at' AND NOT attisdropped
   ) THEN
-    RAISE EXCEPTION '0036: transcript_recovery_rows 又出现了 created_at——排序真相是 append_seq，'
+    RAISE EXCEPTION '0038: transcript_recovery_rows 又出现了 created_at——排序真相是 append_seq，'
       '不是墙钟（本站规矩：新表不写 DEFAULT CURRENT_TIMESTAMP）';
   END IF;
 END
@@ -119,6 +119,6 @@ DECLARE
   n bigint;
 BEGIN
   SELECT count(*) INTO n FROM transcript_recovery_rows;
-  RAISE NOTICE '0036: transcript_recovery_rows 就绪，共 % 行（新建时必为 0；重放时不变）', n;
+  RAISE NOTICE '0038: transcript_recovery_rows 就绪，共 % 行（新建时必为 0；重放时不变）', n;
 END
 $$;
