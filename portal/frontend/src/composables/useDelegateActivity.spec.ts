@@ -178,7 +178,8 @@ describe('触发判据（本轮存在 delegate 卡才轮询，设计 §4.2）', 
     await tick(0);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const url = String(fetchMock.mock.calls[0][0]);
-    expect(url).toBe(`/api/sessions/${SESSION}/delegates?runId=${PARENT}`);
+    // `&activity=1`（#593）：面板要「最近动作」那一格 ⇒ 必须带这个可选参数（不带就永远拿不到）。
+    expect(url).toBe(`/api/sessions/${SESSION}/delegates?runId=${PARENT}&activity=1`);
     expect(handle.shouldPoll.value).toBe(true);
 
     await tick(DELEGATE_POLL_MS);
@@ -187,10 +188,10 @@ describe('触发判据（本轮存在 delegate 卡才轮询，设计 §4.2）', 
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it('两个 id 都被 encode（会话 id 里有 `/` 也不越界）', async () => {
+  it('两个 id 都被 encode，且 `activity=1` 仍在（会话 id 里有 `/` 也不越界）', async () => {
     const { handle } = setup({ sessionId: 'a/b', activeRunId: 'r 1' });
     await handle.poll();
-    expect(String(fetchMock.mock.calls[0][0])).toBe('/api/sessions/a%2Fb/delegates?runId=r%201');
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/api/sessions/a%2Fb/delegates?runId=r%201&activity=1');
   });
 
   it('后台子（结果已回但 state=running）⇒ 照样触发轮询', async () => {
@@ -409,6 +410,69 @@ describe('归一化与徽标计数', () => {
   });
 });
 
+describe('activity 归一化与 stale（#593 / 设计 §4.1 阶段 1 + §4.4 ③）', () => {
+  it('kind 只认四值（脏值 ⇒ none）；tool/args/text 只认字符串；at/turns 只认有限数；stale 只认 === true', () => {
+    const [ok1] = normalizeDelegateItems({ items: [{
+      childRunId: 'c1', state: 'running',
+      activity: { kind: 'tool', tool: 'bash', args: 'npm test', at: 1_700_000_000_001, turns: 7, stale: false },
+    }] });
+    expect(ok1.activity).toEqual({
+      kind: 'tool', tool: 'bash', args: 'npm test', at: 1_700_000_000_001, turns: 7, stale: false,
+    });
+
+    const [dirty] = normalizeDelegateItems({ items: [{
+      childRunId: 'c2',
+      // 每一项都是脏的：kind 不在集内 / tool 不是字符串 / args 是空串 / text 是对象 / at+turns 不是有限数 /
+      // stale 是字符串 'true'（**不是** true）。
+      activity: { kind: 'TOOL', tool: 7, args: '', text: { deep: true }, at: 'nope', turns: null, stale: 'true' },
+    }] });
+    expect(dirty.activity).toEqual({ kind: 'none', stale: false }); // 一个脏字段都不落键
+
+    // 终态子的形状（#593：只有 kind/turns/stale，turns 还是 null）。
+    const [terminal] = normalizeDelegateItems({ items: [{ childRunId: 'c3', state: 'completed', activity: { kind: 'none', turns: null, stale: false } }] });
+    expect(terminal.activity).toEqual({ kind: 'none', stale: false });
+
+    // stale 只认真布尔：`true` 就落下来。
+    const [stale] = normalizeDelegateItems({ items: [{ childRunId: 'c4', state: 'running', activity: { kind: 'none', stale: true } }] });
+    expect(stale.activity.stale).toBe(true);
+  });
+
+  it('activity 整块缺席（旧后端 / 没带 `activity=1`）⇒ `{ kind: none, stale: false }`，不 throw', () => {
+    const [row] = normalizeDelegateItems({ items: [{ childRunId: 'c5', state: 'running' }] });
+    expect(row.activity).toEqual({ kind: 'none', stale: false });
+    const [junk] = normalizeDelegateItems({ items: [{ childRunId: 'c6', activity: 'not an object' }] });
+    expect(junk.activity).toEqual({ kind: 'none', stale: false });
+  });
+
+  it('判据 ②：**`stale` 的活态行不计入徽标数**（⚪ 不是「在跑」，D9 口径）', async () => {
+    queueResponses(ok(rosterBody(
+      rosterItem({ childRunId: 'sub-real-live', state: 'running' }),
+      rosterItem({ childRunId: 'sub-zombie', state: 'running', activity: { kind: 'tool', tool: 'bash', args: 'npm test', stale: true } }),
+      rosterItem({ childRunId: 'sub-queued', state: 'queued', activity: { kind: 'none', stale: true } }),
+      rosterItem({ childRunId: 'sub-done', state: 'completed' }),
+    )));
+    const { handle } = setup({ cards: [delegateCard()] });
+    await tick(0);
+    expect(handle.items.value).toHaveLength(4);
+    // 名册字面上的活态有 3 条（两条 stale），**报出来只能是 1**。
+    expect(handle.liveCount.value).toBe(1);
+    expect(handle.hasLive.value).toBe(true);
+  });
+
+  it('全是 stale 的活态行 ⇒ liveCount=0（徽标不该拿一堆「不知道」报成「在跑」）', async () => {
+    queueResponses(ok(rosterBody(
+      rosterItem({ childRunId: 'sub-z1', state: 'running', activity: { kind: 'none', stale: true } }),
+      rosterItem({ childRunId: 'sub-z2', state: 'running', activity: { kind: 'none', stale: true } }),
+    )));
+    const { handle } = setup({ cards: [delegateCard()] });
+    await tick(0);
+    expect(handle.liveCount.value).toBe(0);
+    expect(handle.hasLive.value).toBe(false);
+    // 但行仍然拉到（面板要能列出这些行并逐行标「状态未知」），不只是计数为 0。
+    expect(handle.items.value.every((item) => item.activity.stale)).toBe(true);
+  });
+});
+
 describe('失败语义（判据 16：静默保留，不渲染红条）', () => {
   it('一发 500 ⇒ 保留上次的行、不置 error（面板连灰字都不出）', async () => {    queueResponses(ok(rosterBody(rosterItem())), fail(500));
     const { handle } = setup({ cards: [delegateCard()] });
@@ -464,7 +528,7 @@ describe('失败语义（判据 16：静默保留，不渲染红条）', () => {
     expect(handle.items.value).toHaveLength(1); // 上次数据仍在
   });
 
-  it('URL 构造器对两个 id 都编码（端点路径段不许裸拼）', () => {
-    expect(delegateRosterUrl('s/1', 'r 2')).toBe('/api/sessions/s%2F1/delegates?runId=r%202');
+  it('URL 构造器对两个 id 都编码，并总是带 `activity=1`（端点路径段不许裸拼）', () => {
+    expect(delegateRosterUrl('s/1', 'r 2')).toBe('/api/sessions/s%2F1/delegates?runId=r%202&activity=1');
   });
 });

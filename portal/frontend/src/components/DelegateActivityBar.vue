@@ -51,15 +51,39 @@ const panelTitle = computed(() =>
 );
 
 function dotClass(item: DelegateActivityItem): string {
+  // `stale`（父 run 已终态而名册还写着活态）⇒ **中性灰**（取 `DELEGATE_BADGE_CLASS.unknown`，
+  // 颜色仍只有一个来源）：它不是「在跑」也不是「失败」，而是「不知道」（D9 的 ⚪ 不得显绿）。
+  if (item.activity.stale === true) return DELEGATE_BADGE_CLASS.unknown;
   return DELEGATE_BADGE_CLASS[delegateBadgeKind(item.state, item.termination)];
 }
 
 function badgeKind(item: DelegateActivityItem) {
+  if (item.activity.stale === true) return 'unknown' as const;
   return delegateBadgeKind(item.state, item.termination);
 }
 
 function stateText(item: DelegateActivityItem): string {
+  // 状态未知时不拿名册那个旧 `running` 继续报「运行中」（那是谎报）：说「状态未知」。
+  if (item.activity.stale === true) return t(`delegate.state.${delegateStateKey('')}`);
   return t(`delegate.state.${delegateStateKey(item.state)}`);
+}
+
+/**
+ * 「最近动作」那一格的文本（#593 的 `activity`，设计 §4.3 行内容）。**两种情整格不渲染**：
+ * `kind:'none'`（终态子只有这个）与**该 kind 依赖的字段缺席**（比如 `kind:'tool'` 但 `tool` 没给）
+ * ——宁可不出这一格，也不出一个空框或一句「未知」（仓规：不拿假数据填空白）。
+ */
+function activityText(item: DelegateActivityItem): string | null {
+  const activity = item.activity;
+  if (activity.kind === 'tool') {
+    const tool = activity.tool ?? '';
+    if (tool === '') return null;
+    const args = activity.args ?? '';
+    return args === '' ? `🔧 ${tool}` : `🔧 ${tool} · ${args}`;
+  }
+  if (activity.kind === 'text') return activity.text ? `💬 ${activity.text}` : null;
+  if (activity.kind === 'tool_result') return activity.text ? `✓ ${activity.text}` : null;
+  return null;
 }
 
 /** 「已跑 42s」；`createdAt` 缺席 ⇒ 整段不出（不写 0s 假时长）。 */
@@ -145,9 +169,20 @@ onUnmounted(() => {
         <span class="shrink-0 font-mono">{{ shortRunId(item.childRunId) || item.childRunId }}</span>
         <span class="shrink-0 text-black/50 dark:text-white/50">{{ stateText(item) }}</span>
         <span v-if="elapsedText(item)" class="shrink-0 text-black/50 dark:text-white/50">{{ elapsedText(item) }}</span>
-        <!-- 「最近动作」这一格（🔧 bash · npm test / 💬 正文）**等阶段 1 的 `activity` 字段**；
-             本单后端不给 ⇒ 这里什么都不渲染（不写「—」也不写假摘要）。 -->
-        <span class="min-w-0 flex-1"></span>
+        <!-- 「最近动作」那一格（#593 的 `activity`）：kind 决定图标（🔧 工具 / 💬 正文 / ✓ 结果）；
+             `none` 或字段缺席 ⇒ **整格不渲染**（占位元素仍然撑住右侧布局，但不写任何文字）。 -->
+        <span
+          v-if="activityText(item) !== null"
+          class="delegate-activity-action min-w-0 flex-1 truncate font-mono text-black/60 dark:text-white/60"
+          :title="activityText(item) ?? undefined"
+        >{{ activityText(item) }}</span>
+        <span v-else class="min-w-0 flex-1"></span>
+        <!-- 状态未知（父 run 已结束而名册还写着活态）：小字说明，**不是**告警（中性灰，无 ⚠）。 -->
+        <span
+          v-if="item.activity.stale === true"
+          data-testid="delegate-activity-stale"
+          class="delegate-activity-stale shrink-0 text-black/50 dark:text-white/50"
+        >{{ t('delegate.activity.staleParentEnded') }}</span>
         <button
           type="button"
           class="delegate-activity-view shrink-0 rounded px-1.5 py-0.5 text-brand hover:bg-black/5 dark:hover:bg-white/10"

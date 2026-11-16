@@ -42,9 +42,15 @@ export const DELEGATE_ACTIVITY_TICK_MS = 1000;
 /**
  * 名册端点（**两个 id 都要编码**，路径段不许裸拼）。
  * 与抽屉那条 `delegateTranscriptUrl`（`lib/delegate.ts`）是**两个不同端点**：这条列名册，那条读账本。
+ *
+ * `&activity=1`（#593 / 设计 §4.1 阶段 1）：让端点顺手给每条 item 一个「最近动作」摘要。
+ * 它是**可选参数**：不带就与阶段 0 逐字段相同；带了也只是 additive 一个 `activity` 键
+ * （终态子只有 `{kind:'none', turns:null, stale}`，`at/tool/args/text` 都可能缺键
+ * ⇒ 消费端逐字段兜底，见 `normalizeActivity`）。它不读 DB、只 `stat` + 读活态子的账本，
+ * 缓存键 `(childRunId, size, mtimeMs)` 在服务端 ⇒ 我们这边不需要再加一层。
  */
 export function delegateRosterUrl(sessionId: string, parentRunId: string): string {
-  return `/api/sessions/${encodeURIComponent(sessionId)}/delegates?runId=${encodeURIComponent(parentRunId)}`;
+  return `/api/sessions/${encodeURIComponent(sessionId)}/delegates?runId=${encodeURIComponent(parentRunId)}&activity=1`;
 }
 
 /** 触发判据要读的卡片字段（`ToolCardState` 的结构子集 ⇒ 真实卡片直接可用，不必适配）。 */
@@ -71,6 +77,34 @@ export interface UseDelegateActivityOptions {
   now?: () => number;
 }
 
+/**
+ * 「最近动作」摘要（`?activity=1` 的 `items[i].activity`，#593）的四值封闭集。
+ * 拿不到/不在集内 ⇒ `'none'`（**不猜**成 tool）。
+ */
+export const DELEGATE_ACTIVITY_KINDS = ['tool', 'text', 'tool_result', 'none'] as const;
+export type DelegateActivityKind = (typeof DELEGATE_ACTIVITY_KINDS)[number];
+
+/**
+ * 一行的「在干啥」（服务端从**投影后**的账本倒着扫出来的，折叠口径唯一来源是
+ * `foldLedgerRecords` → `projectTranscriptForDisplay`，前端只读不算）。
+ * 缺位一律是「没有」：`kind:'none'` + `stale:false`，其余键**缺席**（不写空串、不写 0）。
+ */
+export interface DelegateActivitySummary {
+  kind: DelegateActivityKind;
+  tool?: string;
+  args?: string;
+  text?: string;
+  /** 账本 mtime（写盘证据）；脏值 ⇒ 键缺席。 */
+  at?: number;
+  /** 投影后的逻辑消息数；终态子不给 ⇒ 键缺席。 */
+  turns?: number;
+  /**
+   * 父 run 已终态而名册还写着活态（§4.4 ③：后台子随父进程消失，`finishRun` 永远不会跑）。
+   * 只认 `=== true`；它**不是**「失败」也不是「在跑」，而是「状态未知」（D9 的 ⚪ 口径）。
+   */
+  stale: boolean;
+}
+
 /** 面板一行（名册 DTO 的 UI 白名单视图；字段缺席一律兜底成「没有」，不 throw）。 */
 export interface DelegateActivityItem {
   childRunId: string;
@@ -85,6 +119,8 @@ export interface DelegateActivityItem {
   cwd: string | null;
   model: string | null;
   hasTranscript: boolean;
+  /** 「最近动作」（`?activity=1`）；没带参数/字段脏 ⇒ `{ kind: 'none', stale: false }`。 */
+  activity: DelegateActivitySummary;
 }
 
 function asString(value: unknown): string {
@@ -99,6 +135,33 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+/**
+ * `activity` 摘要的逐字段兜底（**网络来的东西一个都不信**，同 `lib/delegate.ts` 对 termination 的口径）：
+ *   * `kind` 只认那四个字符串，其余 ⇒ `'none'`（不拿「不认识」升成「在跑工具」）；
+ *   * `tool` / `args` / `text` 只认字符串，其余 ⇒ **键缺席**（不写空串，UI 才能「整格不渲染」而不是出一个空框）；
+ *   * `at` / `turns` 只认有限数（终态子 `turns: null` ⇒ 键缺席，**不许拿 0 冒充**）；
+ *   * `stale` 只认 `=== true`（`'true'` / `1` 都当没这个旗标）。
+ * 整个 `activity` 缺席（旧后端 / 没带 `activity=1`）⇒ `{ kind: 'none', stale: false }` ⇒ 那一格不渲染。
+ */
+function normalizeActivity(raw: unknown): DelegateActivitySummary {
+  const record = asRecord(raw);
+  const kindRaw = record?.kind;
+  const kind = (DELEGATE_ACTIVITY_KINDS as readonly unknown[]).includes(kindRaw)
+    ? kindRaw as DelegateActivityKind
+    : 'none';
+  const summary: DelegateActivitySummary = { kind, stale: record?.stale === true };
+  for (const key of ['tool', 'args', 'text'] as const) {
+    const value = record?.[key];
+    // 空串与脏值都不写键：UI 拿「键在不在」区分「有这句话」与「没这句话」。
+    if (typeof value === 'string' && value !== '') summary[key] = value;
+  }
+  for (const key of ['at', 'turns'] as const) {
+    const value = asMs(record?.[key]);
+    if (value !== null) summary[key] = value;
+  }
+  return summary;
 }
 
 /**
@@ -128,6 +191,8 @@ export function normalizeDelegateItems(raw: unknown): DelegateActivityItem[] {
       cwd: typeof record.cwd === 'string' && record.cwd !== '' ? record.cwd : null,
       model: typeof record.model === 'string' && record.model !== '' ? record.model : null,
       hasTranscript: record.hasTranscript === true,
+      // 「最近动作」：`?activity=1` 才有；没带参数、旧后端、或脏值 ⇒ kind:'none' ⇒ 那一格不渲染。
+      activity: normalizeActivity(record.activity),
     });
   }
   return rows;
@@ -212,8 +277,16 @@ export function useDelegateActivity(options: UseDelegateActivityOptions) {
       && !(allChildrenTerminal.value && !hasPendingCard.value),
   );
 
-  /** 徽标数字（判据 5 的唯一尺规：活态集合就是 `lib/delegate.ts#DELEGATE_LIVE_STATES`）。 */
-  const liveCount = computed(() => items.value.filter((item) => isDelegateLive(item.state)).length);
+  /**
+   * 徽标数字。**两个条件缺一不可**：
+   *   * 活态集合 = `lib/delegate.ts#DELEGATE_LIVE_STATES`（判据 5 的唯一尺规，本文件不另造）；
+   *   * **减去 `activity.stale`**（#593 / 设计 §4.4 ③）：父 run 已终态而名册还写着 `running` 的行，
+   *     它**不是**「在跑」而是「状态未知」——把它计进「几个在跑」就是谎报，与 D9 的「⚪ 不得渲染成绿」
+   *     同一条口径（门户不判子 run 死活：名册里的 `pid` 是容器内 PID，与门户不在同一个 namespace）。
+   */
+  const liveCount = computed(
+    () => items.value.filter((item) => isDelegateLive(item.state) && item.activity.stale !== true).length,
+  );
   const hasLive = computed(() => liveCount.value > 0);
   /**
    * **降级态**：连续失败到阈值且**一条都没拉到过** ⇒ 「读不到」不等于「没有」。

@@ -611,6 +611,9 @@ export const zhCN = {
       view: '查看',
       viewAria: '查看子任务 {id}',
       unreadable: '子任务状态暂不可读',
+      // 名册还写着活态、但父 run 已终态（后台子随父进程消失 ⇒ `finishRun` 永远不会跑）。
+      // 它是「状态未知」，不是失败也不是在跑（D9 的 ⚪ 口径）。
+      staleParentEnded: '父 run 已结束，状态未知',
     },
   },
   // 文件预览 modal（components/FilePreviewModal.vue）

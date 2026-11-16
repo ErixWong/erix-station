@@ -176,7 +176,7 @@ describe('展开/收起（共享状态：徽标与面板两个组件读写同一
     expect(wrapper.get('[data-testid="delegate-activity-badge"]').attributes('aria-expanded')).toBe('false');
   });
 
-  it('行内容：短码 + 状态文案 + 已跑时长；「最近动作」那一格本单**不渲染**（字段还没给）', async () => {
+  it('行内容：短码 + 状态文案 + 已跑时长；`activity` 缺席（旧后端 / 没带 `activity=1`）⇒ 那一格不渲染', async () => {
     stubRoster({ items: [rosterItem({ childRunId: 'sub-6eda7fa1', state: 'running', createdAt: 1_700_000_000_000 })] });
     driveDelegateCard(useWorkbenchStore());
     const wrapper = mountSurface();
@@ -190,7 +190,8 @@ describe('展开/收起（共享状态：徽标与面板两个组件读写同一
     expect(row.text()).toContain(COPY.elapsed.replace('{dur}', '42.0s')); // createdAt + 客户端时钟
     // 状态点颜色唯一来源 DELEGATE_BADGE_CLASS[delegateBadgeKind(...)]：running ⇒ text-brand
     expect(row.get('.delegate-activity-dot').classes()).toContain('text-brand');
-    // 「最近动作」位置：没有 activity 字段 ⇒ 这格不出（不许拿假摘要填空白）。
+    // `activity` 缺席（这一批 fixture 就没带）⇒ 那一格不渲染（不拿假摘要填空白）。
+    expect(row.find('.delegate-activity-action').exists()).toBe(false);
     expect(row.text()).not.toContain('🔧');
   });
 
@@ -300,6 +301,109 @@ describe('必修 1：首次就失败 ⇒ 降级态必须可达（设计 §4.2「
     expect(wrapper.get('[data-testid="delegate-activity-badge"]').attributes('data-degraded')).toBe('false');
     expect(store.delegateDegraded).toBe(false);
     expect(store.delegateRowsUnavailable).toBe(true);
+  });
+});
+
+describe('W3：「最近动作」那一格（#593 的 activity）与 stale 行', () => {
+  /** 把面板展开并返回行容器（按 childRunId 认行，不靠顺序）。 */
+  async function openPanel(store: ReturnType<typeof useWorkbenchStore>, wrapper: ReturnType<typeof mountSurface>) {
+    await tick(0);
+    store.toggleDelegatePanel();
+    await nextTick();
+    return { rows: wrapper.findAll('[data-testid="delegate-activity-panel"] li'), wrapper };
+  }
+
+  it('kind=tool ⇒ `🔧 {tool} · {args}`；args 缺席 ⇒ 只出 `🔧 {tool}`', async () => {
+    stubRoster({ items: [
+      rosterItem({ childRunId: 'sub-t1', activity: { kind: 'tool', tool: 'bash', args: 'npm test --silent', stale: false } }),
+      rosterItem({ childRunId: 'sub-t2', activity: { kind: 'tool', tool: 'readFile', stale: false } }),
+    ] });
+    const store = useWorkbenchStore();
+    driveDelegateCard(store);
+    const wrapper = mountSurface();
+    const { rows } = await openPanel(store, wrapper);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].find('.delegate-activity-action').text()).toBe('🔧 bash · npm test --silent');
+    expect(rows[1].find('.delegate-activity-action').text()).toBe('🔧 readFile');
+  });
+
+  it('kind=text ⇒ `💬 {text}`；kind=tool_result ⇒ `✓ {text}`', async () => {
+    stubRoster({ items: [
+      rosterItem({ childRunId: 'sub-x1', activity: { kind: 'text', text: '正在整理结论…', stale: false } }),
+      rosterItem({ childRunId: 'sub-x2', activity: { kind: 'tool_result', text: '3 files changed', stale: false } }),
+    ] });
+    const store = useWorkbenchStore();
+    driveDelegateCard(store);
+    const { rows } = await openPanel(store, mountSurface());
+    expect(rows).toHaveLength(2);
+    expect(rows[0].find('.delegate-activity-action').text()).toBe('💬 正在整理结论…');
+    expect(rows[1].find('.delegate-activity-action').text()).toBe('✓ 3 files changed');
+  });
+
+  it('kind=none（终态子的形状）与**字段缺席**⇒ 整格不渲染：不出空框、不写「未知」也不写破折号', async () => {
+    stubRoster({ items: [
+      rosterItem({ childRunId: 'sub-n1', state: 'completed', activity: { kind: 'none', turns: null, stale: false } }),
+      // kind 说自己是 tool，但 tool 没给（#593 允许缺键）⇒ 同样整格不出，不能出一个 `🔧 ?`。
+      rosterItem({ childRunId: 'sub-n2', activity: { kind: 'tool', stale: false } }),
+      // text 类但 text 缺席。
+      rosterItem({ childRunId: 'sub-n3', activity: { kind: 'text', stale: false } }),
+    ] });
+    const store = useWorkbenchStore();
+    driveDelegateCard(store);
+    const wrapper = mountSurface();
+    const { rows } = await openPanel(store, wrapper);
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      expect(row.find('.delegate-activity-action').exists()).toBe(false);
+    }
+    // 整个面板里不许出现图标占位、破折号或「未知」（没内容就是没内容，不拿假字符填空）。
+    const panelText = wrapper.get('[data-testid="delegate-activity-panel"]').text();
+    expect(panelText).not.toContain('🔧');
+    expect(panelText).not.toContain('💬');
+    expect(panelText).not.toContain('—');
+    expect(panelText).not.toContain(zhCN.delegate.state.unknown); // 这三行都没 stale
+  });
+
+  it('stale 行 ⇒ 状态点中性灰（不是红也不是绿）+ 一行说明 + **不计入徽标数**', async () => {
+    stubRoster({ items: [
+      rosterItem({ childRunId: 'sub-zombie', state: 'running', activity: { kind: 'tool', tool: 'bash', args: 'sleep 60', stale: true } }),
+      rosterItem({ childRunId: 'sub-real', state: 'running' }),
+    ] });
+    const store = useWorkbenchStore();
+    driveDelegateCard(store);
+    const wrapper = mountSurface();
+    await tick(0);
+    // 判据 ②：两条名册活态，只有 1 条算「在跑」。
+    expect(wrapper.get('[data-testid="delegate-activity-badge"]').text()).toContain(COPY.title.replace('{count}', '1'));
+
+    store.toggleDelegatePanel();
+    await nextTick();
+    const rows = wrapper.findAll('[data-testid="delegate-activity-panel"] li');
+    const staleRow = rows[0];
+    expect(staleRow.attributes('data-child-run-id')).toBe('sub-zombie');
+    const dot = staleRow.get('.delegate-activity-dot');
+    const dotClass = dot.classes().join(' ');
+    expect(dotClass).toContain('text-black/50'); // 中性灰（DELEGATE_BADGE_CLASS.unknown）
+    expect(dotClass).not.toContain('text-brand'); // 不拿蓝色冒充「在跑」
+    expect(dotClass).not.toContain('text-green-600');
+    expect(dotClass).not.toContain('text-red-600');
+    expect(dot.attributes('data-badge-kind')).toBe('unknown');
+    expect(staleRow.get('[data-testid="delegate-activity-stale"]').text()).toBe(COPY.staleParentEnded);
+    // 状态文字也不拿旧 `running` 继续报「运行中」（那是谎报）。
+    expect(staleRow.text()).toContain(zhCN.delegate.state.unknown);
+    expect(staleRow.text()).not.toContain(STATE.running);
+    // 另一行不受影响：仍蓝、仍计数。
+    const liveDot = rows[1].get('.delegate-activity-dot');
+    expect(liveDot.classes()).toContain('text-brand');
+    expect(liveDot.attributes('data-badge-kind')).toBe('running');
+  });
+
+  it('全部行都 stale ⇒ 徽标整段不出（一堆「不知道」不等于「在跑」）', async () => {
+    stubRoster({ items: [rosterItem({ childRunId: 'sub-z1', state: 'running', activity: { kind: 'none', stale: true } })] });
+    driveDelegateCard(useWorkbenchStore());
+    const wrapper = mountSurface();
+    await tick(0);
+    expect(wrapper.find('[data-testid="delegate-activity-badge"]').exists()).toBe(false);
   });
 });
 

@@ -583,6 +583,9 @@ export const en = {
       view: 'View',
       viewAria: 'View sub-task {id}',
       unreadable: 'Sub-task status is temporarily unavailable',
+      // The roster still says live while the parent run already ended (a background child dies with the
+      // parent process, so `finishRun` never runs). It means "status unknown" — not failed, not running.
+      staleParentEnded: 'Parent run has ended; status unknown',
     },
   },
   preview: {
