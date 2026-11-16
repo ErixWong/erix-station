@@ -3346,7 +3346,9 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > ⚠ `materializer.js` ⇄ `platform-prompts.js` 是**双向引用**：两边都只在**函数体里**用对面的导出，
 > 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
 > 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P11b` + `T1`/`T1b`）、
-> `portal/test/materializer.test.js`（`M1`：默认渲染逐字节不变）、
+> `portal/test/materializer.test.js`（「默认渲染逐字节不变」由该文件 8 条 `renderHomeAgentsMd：…`
+> 既有断言承担，本分支对它们零改动；**别写 `M1`** —— 那个号在本仓已被
+> `materializer.test.js:750`（用户自建 `AGENTS.md`/`.gitignore` 在 stale 清理后存活）占用）、
 > `portal/test/migrations.test.js`（0040 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
 
 ---
