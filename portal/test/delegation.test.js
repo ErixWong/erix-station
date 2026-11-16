@@ -1361,12 +1361,24 @@ test('J4 顺手1 缓存键真的按 size 变：size 变了 ⇒ 换键 ⇒ 重新
     transcripts: { [CHILD_1]: textOnlyLedger(CHILD_1) },
   });
   try {
+    // `at` = `Math.floor(stat.mtimeMs)`，而「两次写落在不同毫秒」**不是**机器能保证的事：
+    // GitHub runner 上追加就发生在同一毫秒里，`notEqual(第二次 at, 第一次 at)` 于是假红
+    // （CI 实测 `notStrictEqual expected: 1794846022708 actual: 1794846022708`，两个数相同）。
+    // ⇒ 写盘证据一律 `utimes` 钉成**固定值**（与真实时钟无关），断言「at == 钉进去的那个值」；
+    //   键按 size 变那一元则单独验：第三段把 mtime **钉回同一个值**，只剩 size 一元在动。
+    const LEDGER = path.join(h.root, 'transcripts', `${CHILD_1}.jsonl`);
+    const M_FIRST_S = 1_700_000_000; // 2023-11-14T22:13:20Z
+    const M_SECOND_S = 1_800_000_000; // 2027-01-15T08:00:00Z
+    const setMtime = (epochSec) => fsp.utimes(LEDGER, epochSec, epochSec);
+
+    await setMtime(M_FIRST_S);
     const first = await callList(h, { activity: true });
     assert.equal(first.items[0].activity.kind, 'text');
+    assert.equal(first.items[0].activity.at, M_FIRST_S * 1000, 'at 是写盘证据：要等于 stat 到的那个 mtime（钉进去的固定值）');
     const reads = ledgerReads(h.fsSpy.calls).length;
 
     // 追加一行 ⇒ size 与 mtime 都变 ⇒ 必须换键重读，摘要跟着变
-    await fsp.appendFile(path.join(h.root, 'transcripts', `${CHILD_1}.jsonl`),
+    await fsp.appendFile(LEDGER,
       `${JSON.stringify({
         round: 2, kind: 'message', seq: 0, dedupKey: `${CHILD_1}:msg:2:0`, roundKey: `${CHILD_1}:round:2`,
         ts: '2026-11-16T10:00:09.000Z',
@@ -1375,15 +1387,33 @@ test('J4 顺手1 缓存键真的按 size 变：size 变了 ⇒ 换键 ⇒ 重新
           { type: 'tool_use', id: 'z1', name: 'shell', input: { command: 'npm run lint' } },
         ] }],
       })}\n`);
+    await setMtime(M_SECOND_S);
     const second = await callList(h, { activity: true });
     assert.equal(ledgerReads(h.fsSpy.calls).length, reads + 1, 'size 变了却没重读 ⇒ 缓存键没带上 size');
     assert.equal(second.items[0].activity.kind, 'tool', '摘要要跟着新账本走，不能吃缓存');
     assert.equal(second.items[0].activity.args, 'command=npm run lint');
-    assert.notEqual(second.items[0].activity.at, first.items[0].activity.at, 'at 是写盘证据，要跟着 mtime 走');
+    assert.equal(second.items[0].activity.at, M_SECOND_S * 1000, 'at 必须是这次写盘的 mtime（不是上一次的）');
 
     // 同一份内容再拉一次 ⇒ 命中缓存，零新增读（键里那两元都稳定）
     const stableReads = ledgerReads(h.fsSpy.calls).length;
     await callList(h, { activity: true });
     assert.equal(ledgerReads(h.fsSpy.calls).length, stableReads);
+
+    // 键里 **size 那一元单独验**：mtime 钉回上一次那个固定值（真实时钟不参与），只剩 size 在动
+    // ⇒ 「缓存键没带 size」必然命中旧键（变异必红），不再靠「两次写碰巧差一毫秒」兜底。
+    await fsp.appendFile(LEDGER,
+      `${JSON.stringify({
+        round: 3, kind: 'message', seq: 0, dedupKey: `${CHILD_1}:msg:3:0`, roundKey: `${CHILD_1}:round:3`,
+        ts: '2026-11-16T10:00:10.000Z',
+        messages: [{ role: 'assistant', content: [
+          { type: 'tool_use', id: 'z2', name: 'shell', input: { command: 'git status' } },
+        ] }],
+      })}\n`);
+    await setMtime(M_SECOND_S);
+    const third = await callList(h, { activity: true });
+    assert.equal(ledgerReads(h.fsSpy.calls).length, stableReads + 1,
+      'mtime 没变而 size 变了 ⇒ 照样要换键重读（键里那元 size 才是本用例的正身）');
+    assert.equal(third.items[0].activity.at, M_SECOND_S * 1000, 'mtime 钉着不动 ⇒ 写盘证据 at 也钉着不动');
+    assert.equal(third.items[0].activity.args, 'command=git status', '摘要要跟着 size 变化走（拿旧键命中就还是 round:2 那条）');
   } finally { h.cleanup(); }
 });
