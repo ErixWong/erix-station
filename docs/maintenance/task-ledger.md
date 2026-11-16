@@ -6833,7 +6833,7 @@ spin**（例：上限 2s，每轮仍 `setImmediate`，到点仍 `assert.ok(clock
 **本轮没有出现需要定性的红格**）。`node --check` 全部改动文件过。
 
 
-### 8.135 issue #259 jail 只读例外：读边界从一条变两条（写判定一点没放宽）+ 提示词退掉一条教了半年的假病（issue #259 / 工单 fix-261116-05，2026-11-16，worker 落地 + 真机判据 BLOCKED-on-deploy）
+### 8.139 issue #259 jail 只读例外：读边界从一条变两条（写判定一点没放宽）+ 提示词退掉一条教了半年的假病（issue #259 / 工单 fix-261116-05，2026-11-16，worker 落地 + 真机判据 BLOCKED-on-deploy）
 
 > **编号由主 agent 统一分配（本批并行）**：worker 侧按 `grep -n '^### 8\.' | tail -3` 先挑了号，最终以主 agent 的分配为准（§8.116 那条撞号老账）。
 
