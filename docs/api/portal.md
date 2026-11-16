@@ -1602,6 +1602,75 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 | `truncated` | 布尔位（**不塞省略号文本**，截断标记由前端出，先例同 §4.4a-1）。重建行数超 `FOLDED_REBUILD_MAX_ROWS = 2000`（与 U7 recall 同尺）**或**归档被上游夹断 ⇒ `true` |
 | `dropped_messages` | 上游夹断丢掉的条数（取 `record.foldedPayloadMeta.droppedMessages`）；无则 `0` |
 
+**`turns[].toolCalls[].resultPreview` 的配对口径（#387）**：重建路（`source:'rebuilt'`）在喂上游投影**之前**，
+先把本 range 内各行的 `tool_result` 按 `tool_use_id` 挂回带 `tool_use` 的那条记录（`portal/src/sessions.js#attachToolResultsToRecords`，
+**纯读侧**：不改 `rows`、不动账本、不改上游 `projectTranscriptForDisplay`）。于是 `toolCalls[]` 上的
+`resultPreview` / `isError` / `executionStatus` / `durationMs` **与主消息流同一个来源**（预览长度与截断规则全在上游，
+宿主不复制第二把尺，#95 红线）。为什么必须挂：0.23+ 账本一轮是多行（`:msg:<n>:0` = assistant 的 `tool_use`、
+`:msg:<n>:1..k` = 每个 `tool_result` 各一行、载体行 `messages` 为空），而上游的配对**只扫本条记录的 `messages`**
+⇒ 不挂就是真机读到的 `resultPreview` **0/98**（§8.62）。
+
+**配不上不伪造**：`tool_use_id` 在本 range 内查不到结果（结果行在折叠范围之外 / 只有 `tool_use` 没有 `id`）
+⇒ 上游**连 `resultPreview` 这个键都不写**（不是空串、不是 `null`）；前端据此「归一后为空就一行不画」。
+同一条记录内已结清的调用**就近取本记录那份**结果，不被别处的同 `tool_use_id` 改写（崩溃恢复后
+`:round:<n>` 与 `:round:<n>:resume` 双载体是真形状，§8.38 末）。**取行范围不因配对而放宽**：
+WHERE 仍是 `round BETWEEN from AND to`，范围外的结果行不会被搬进原文。
+
+**同一个 `tool_use_id` 在 range 内有多份结果 ⇒ 取「就近」，不取最后一条也不取第一条**（PR #541
+第三方审计 MED，§8.132）。`tool_use_id` 是 **provider 给的 id**，上游明写它**不保证在一个 run 内唯一**
+（`erix-agent/src/tool-fact.js:209-210`：「**跳轮不在这里继承**：provider id 不保证 run 内唯一（issue #284）」），
+所以「round A 用 `x` 得 A、round B 用 `x` 得 B」是合法形状。配对尺（PR #541 后）：
+
+1. 取该 `tool_use` **之后最近**的一条同 id 结果（正常形状：结果行紧贴自己的调用行）；
+2. 之后一条都没有 ⇒ 回退取**之前最近**的一条（resume 复放：`:round:<n>:resume` 行重发旧调用，结果落在前面）；
+3. 一条都没有 ⇒ 回到上面的「缺键不伪造」。
+
+位置是账本真实先后（`seq` 按「记录 → 消息 → 块」单调发号，记录顺序就是 SQL 的 `ORDER BY round ASC, append_seq ASC`）。
+⚠ **不是「取第一条」**：那只是把错的方向反过来（round B 会显示 A）——正确性来自**位置**而不是插入顺序。
+同 id 出现多份时**可观测**：`rebuildFoldedRange` 走 `log.warn` 打一条（条数 + 一个示例 id），
+**零新事件类型、零 DDL、零响应字段**（响应形状是契约，本端点不为此加键）。
+
+**响应体积的上界是「每条预览」，不是「每次响应」**（PR #541 LOW #2，只登记算术，本单不做响应级封顶）：
+上游 `truncated()` 的预览上界是 `MAX_RESULT_PREVIEW = 400` **UTF-16 代码单元** + 一个省略号 = 401
+（**订正**：本段先前写的是「码点」，错的——`truncated()` 用 `text.length` 判长、`text.slice(0, maxChars)` 截断，
+单位是**代码单元**；`projection.js:31` 定义三个上界 120 / 400 / 1200 走同一个 `truncated()`），而那是**单条**
+`resultPreview` 的尺。本端点只封顶**行数**（`FOLDED_REBUILD_MAX_ROWS = 2000`）而**不封顶每行的块数**，
+所以最坏算术是：`2000 行 × 每行 1 个结果块 × 401 个代码单元 ≈ 802,000 个 UTF-16 代码单元 ≈ 0.8 MB` 普通文本
+（**JSON 转义前**；一个结果的 `content` 是数组时每个带 `text` 的子块都会拼进同一句预览，所以「每行块数」
+真的是唯一没被封顶的那一项）。前端要画加载态/上限提示请按这条算，不要把 400 当成整个响应的上限。
+
+**已接受边界（PR #541 第三方复审后的两条残差 + 一条口径订正；本 PR 均不修，代码零改动）**
+
+- **边界可以切开代理对**（上游，**erix-agent#854**）。因为单位是代码单元而不是码点，
+  切点落在 emoji 上会留下**孤立高/低代理**。实测（本机等价口径，逐字可跑）：
+  `'a'.repeat(399) + '💥tail'` ⇒ `length=405`（单元）/ `404`（码点），`slice(0, 400)` 后末尾是
+  `"a\ud83d"`，`/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/` 命中 ⇒ **乱码风险是真的**。
+  宿主**不在 portal 侧二次修复**（那是把引擎的口径复制一份，必然漂）；**量级结论不变**，变的只是边界形状。
+- **`provider id` 被复用时预览会张冠李戴**（本仓，**issue #562**）：配对（`sessions.js#attachToolResultsToRecords`）
+  只看 `tool_use_id` + 位置，**既不比 `run_id` 也不比块上已有的 `erix.toolCallKey`**。主 agent 独立树的实测位置序
+  `call(OLD) < call(NEW) < res(NEW) < res(OLD)` ⇒ 两个调用的 `resultPreview` **都是新调用那份**
+  （`["RESULT-FOR-NEW-CALL","RESULT-FOR-NEW-CALL"]`），旧调用那份真结果界面上哪儿都没有。
+  缓解项**真实存在**：同 id 多份会 `log.warn`（文案现读为「`N 个 tool_use_id 在 range … 内有多份结果，已按「就近优先」取一条`」），
+  所以是 **MED 不是 BLOCKER**：显示错但有人知道。上游 `tool-fact.js` 明写 provider id 不能当跨轮调用身份
+  ⇒ 「同 id 两条调用」是**允许的语义**，不是脏数据。修法方向（先按键配、键缺席才退回就近）与判据在 #562。
+- **两路口径本来就不同**（口径订正）：实时卡片走 `tool_result.result_digest`（worker 侧截 500 个代码单元、
+  **无省略号**），刷新后的折叠原文行走 `resultPreview`（引擎截 400 **加**省略号 = 401）。主 agent 派单简报里
+  「两路文本逐字一致」那句**是错的**（第三方审计纠正的是简报，不是产品），产品行为如上，无需改。
+
+**已知形状风险（未造出生产者，PR #541 LOW #3，不改代码只登记）**：上游 `textOf()`
+（`display/projection.js:84-89`，消费点 `:365-368`）选块的条件是「`type === 'text'` **或** 块上有字符串
+`.text` / `.thinking`」——它**不看 `type` 白名单**，而块的 `type` 是可扩展的。于是一条同时带 `type:'tool_result'`
+与顶层 `.text` 的「结果块」会**既出预览又出一个可见 user 轮**（而重建路还会把它同时留在自己的行与挂给调用的
+那条合成行里 ⇒ 同一句话出两个气泡）。现查结论：**没有真实生产者**——上游唯一的构造入口
+`buildToolResultFact`（`src/tool-fact.js:292-312`）只写 `type`/`tool_use_id`/`content`/`is_error`/`erix`/`metadata`，
+而真库 `transcript_rounds` 里 **1423 个 `tool_result` 块中没有一条带顶层 `text`/`thinking`**（§8.132 读数）。
+⇒ 不改代码、不钉用例（钉一个假想形状等于把它写成契约）；**上游一旦开始往结果块上写 `text`，就要回来钉形状约束**。
+
+**响应体积与刷新频率**（运维读数，不是新契约）：本端点是「点一下才拉」的懒加载，单次代价上界 =
+选中行上限 2000 行 × 每行若干结果块 × 每块预览 ≤ 401 码点 ⇒ **最坏 ≈ 0.8 MB 普通文本（JSON 转义前）**；
+典型折叠段（几十轮、每轮 1–3 次调用）在十 KB 量级。同一个折叠段反复展开会反复重跑取行 + 配对 + 投影
+（前端未缓存），所以它只适合“展开时拉一次”，不要拿它做轮询源。
+
 **口径为什么要改**（#375，背后可见上游 erix-agent#461）：erix-agent 0.25.0 之前 `record.foldedPayload` 是每次折叠从 `from:1` 重发的**全量副本**，所以“只读那一行归档”意外地等于“全部原文”；0.25.0 把它改成**本轮新增的有界差分**（会话级内容去重 + 默认 256 KiB 夹断）⇒ 只读归档只能给出残缺，去重全吸收时甚至是空，而旧口径一律 `404 folded_payload_not_found`、前端文案「原文已不可用（上游未保留折叠前载荷）」——那是假话，原文一直在各自的轮行里。上游契约也已写明：宿主不得把截断/缺失读成数据丢失，`foldedRoundRange` + `navigationRecord` 才是有界指针。
 
 **`404` 语义收窄**：`folded_payload_not_found` 现在只在「range 与归档**两条路**都拿不出任何正文」时才发（旧口径：那一行归档为空就发）。行顺序按 `round ASC, append_seq ASC`（与账本保序口径一致，#338 教训：不得只在页内取行）。

@@ -397,7 +397,7 @@ function pickFoldCarrierRow(rows) {
     ?? null;
 }
 
-export async function getFoldedPayload(pool, { userId, sessionId, round }) {
+export async function getFoldedPayload(pool, { userId, sessionId, round, log }) {
   await fetchSession(pool, sessionId, userId);
   const n = Number(round);
   if (!Number.isInteger(n) || n < 0) {
@@ -421,7 +421,7 @@ export async function getFoldedPayload(pool, { userId, sessionId, round }) {
 
   // ① 有范围 ⇒ 以账本为准重建（#375 主路）。归档只能给差分，而横幅说的是整个范围。
   if (range) {
-    const rebuilt = await rebuildFoldedRange(pool, { key: sessionId, range });
+    const rebuilt = await rebuildFoldedRange(pool, { key: sessionId, range, log });
     if (rebuilt.turns.length > 0) {
       return {
         round: n, turns: rebuilt.turns, source: 'rebuilt',
@@ -450,12 +450,125 @@ function normalizeFoldedRoundRange(raw) {
   return { from, to };
 }
 
+/** 消息的 content block 数组（字符串 content 与上游一样当「没有 block」；非对象块丢掉）。 */
+function contentBlocks(content) {
+  return Array.isArray(content) ? content.filter((block) => block !== null && typeof block === 'object') : [];
+}
+
+/**
+ * issue #387：**纯读侧**把 `tool_result` 挂回带它那次 `tool_use` 的那条记录，再喂上游投影。
+ *
+ * 病根（实测 `resultPreview` **0/98**）：erix-agent 0.23+ 一轮是**多行**落盘的
+ * （`:msg:<n>:0` = assistant 的 `tool_use`，`:msg:<n>:1..k` = 每个 `tool_result` 各一行，
+ * `:engine:round:<n>` 载体的 `messages` 是空数组），而 `rebuildFoldedRange` 把**每行各自一条记录**
+ * 喂给 `projectTranscriptForDisplay`。上游的配对函数 `toolResultsOf`（`src/display/projection.js`）
+ * **只扫本条记录的 `messages`** ⇒ 结果块与调用块分家 ⇒ 每个 `toolCalls[]` 项只有 `name`/`argsSummary`，
+ * 「调了什么」看得见、「返回了什么」全丢（#384 之后渲染器已经会画工具行，缺的就是这一件）。
+ * 主消息流没这个病，是因为 `session-view.js` 在喂投影前先过了一遍读侧折叠
+ * （`transcript-fold.js`，把消息行折回轮行）——**同一条「先配对再投影」的口径**。
+ *
+ * 为什么是「挂记录」而不是「折行」：本端点的 SQL 只取 `round, messages`（不取 `record`/`dedup_key`），
+ * 折叠闸要的是 record 级形状；而重建面要的只有「让上游能配上对」这一件事。于是这里做**最小动作**：
+ * 按 `tool_use_id` 在本 range 内建结果索引，把**缺结果的那些块原样**（同一个块对象引用，不改写任何字段）
+ * 追加成一条 `{role:'user', content:[…tool_result 块…]}` 挂到带 `tool_use` 的那条记录末尾，
+ * **配对仍由上游做** ⇒ `resultPreview`/`isError`/`executionStatus`/`durationMs` 与主消息流**同一把尺**，
+ * 本站不复制第二套预览/截断规则（#95 红线：不向上游形状注入字段）。
+ *
+ * 三条不伪造的边界（判据 ②）：
+ *   · 本 range 内**查不到** `tool_use_id` ⇒ 不追加任何东西 ⇒ 上游连 `resultPreview` 这个**键都不写**
+ *     （上游对配不上的调用就是缺键，不是空串）；
+ *   · 结果**本来就在同一条记录里**（0.22 老账本、或同轮单行）⇒ 不重复追加（幂等，输出逐字节不变）；
+ *   · 只有 `tool_use` 没有 `id`（旧记录形状）⇒ 跳过，不猜。
+ * 追加的那条消息**只有 tool_result 块**，上游 `textOf()` 对它是空串 ⇒ 走的是「model plumbing」那条
+ * `continue`（`projection.js` 原注释）⇒ **不会多冒一个 user turn**（判据里用 turn 计数钉住）。
+ *
+ * ⚠ **同一个 `tool_use_id` 在 range 内有多份结果时取「就近」，不取「最后一条」也不取「第一条」**
+ * （PR #541 第三方审计 MED，主 agent 裁决返工）。为什么不是 last-write-wins：上游明写 provider id
+ * **不保证在一个 run 内唯一**（`erix-agent/src/tool-fact.js:209-210`：「**跳轮不在这里继承**：provider id
+ * 不保证 run 内唯一（issue #284）」），于是「round A 用 `x` 得 A、round B 用 `x` 得 B」是合法形状 ——
+ * range 级 `Map.set` 会把 B 覆盖成唯一值，**第一个 round 也就显示 B**（错内容比缺内容更难发现）。
+ * 而「取第一条」只是把错的方向反过来（B 会显示 A）：正确性来自**位置**，不是插入顺序。
+ * 现在的尺（`seq` 是全局单调计数，按「记录顺序 → 消息顺序 → 块顺序」发放，记录顺序就是 SQL 的
+ * `ORDER BY round ASC, append_seq ASC` ⇒ `seq` 就是账本里的真实先后）：
+ *   ① 取该 `tool_use` **之后**最近的一条同 id 结果（正常形状：结果行紧跟在调用行后面）；
+ *   ② 之后一条都没有 ⇒ 回退取**之前**最近的一条（resume 复放：`:round:<n>:resume` 行重发旧调用，
+ *      它的结果落在前面；真库实测 6 个跨轮复用的 id 全是这一类，见 §8.132 的取证读数）；
+ *   ③ 一条都没有 ⇒ 不追加（回到判据 ② 的「缺键不伪造」）。
+ * 同 id 出现多份时**必须可观测**：`duplicateIds` 交回调用方，由 `rebuildFoldedRange` 走现成的
+ * `log.warn` 通道打一条（零新事件类型、零 DDL、零响应字段）。
+ *
+ * 只读：不改 `rows`、不改 `record.messages`（新建数组/新对象），账本一字节不动。
+ * @returns {{ records: object[], duplicateIds: string[] }}
+ */
+function attachToolResultsToRecords(records) {
+  const list = Array.isArray(records) ? records : [];
+  /** @type {Map<string, { seq: number, block: object }[]>} range 内的 tool_use_id → 该 id 的全部结果块（带位置） */
+  const results = new Map();
+  /** @type {{ seq: number, id: string, recordIndex: number }[]} 按位置排的调用块 */
+  const calls = [];
+  /** @type {Set<string>[]} 每条记录里**已经**自己结清的 id（`own`，不重复挂） */
+  const ownIds = [];
+  let seq = 0; // 全局位置：只在 pass 1 里单调发号，pass 2 只读比较
+  list.forEach((record, recordIndex) => {
+    const own = new Set();
+    ownIds[recordIndex] = own;
+    for (const message of Array.isArray(record?.messages) ? record.messages : []) {
+      for (const block of contentBlocks(message?.content)) {
+        const at = seq++;
+        if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+          const bucket = results.get(block.tool_use_id);
+          const entry = { seq: at, block };
+          if (bucket) bucket.push(entry);
+          else results.set(block.tool_use_id, [entry]);
+          own.add(block.tool_use_id);
+        } else if (block.type === 'tool_use' && typeof block.id === 'string') {
+          calls.push({ seq: at, id: block.id, recordIndex });
+        }
+      }
+    }
+  });
+  if (results.size === 0) return { records: list, duplicateIds: [] }; // 一条结果都没有 ⇒ 原样交回（老账本零改写）
+
+  /** @type {Map<number, object[]>} recordIndex → 要追加的结果块（同一条记录内按调用顺序，去重同一块引用） */
+  const picks = new Map();
+  for (const call of calls) {
+    if (ownIds[call.recordIndex]?.has(call.id)) continue; // 本记录已结清 ⇒ 用本记录那一份
+    const candidates = results.get(call.id);
+    if (candidates === undefined) continue; // range 内查不到 ⇒ 缺键，不伪造
+    // ①「之后最近」优先；② 否则退到「之前最近」。两者都不看插入顺序 ⇒ first-wins 与 last-write-wins 一样错。
+    let chosen;
+    for (const c of candidates) {
+      if (c.seq > call.seq && (chosen === undefined || c.seq < chosen.seq)) chosen = c;
+    }
+    if (chosen === undefined) {
+      for (const c of candidates) {
+        if (c.seq < call.seq && (chosen === undefined || c.seq > chosen.seq)) chosen = c;
+      }
+    }
+    if (chosen === undefined) continue; // 位置相同（不可能：seq 唯一）⇒ 宁可不挂
+    const bucket = picks.get(call.recordIndex) ?? [];
+    if (!bucket.includes(chosen.block)) bucket.push(chosen.block); // 同一条记录里同 id 复用两次 ⇒ 只挂一份
+    picks.set(call.recordIndex, bucket);
+  }
+
+  const duplicateIds = [...results.entries()]
+    .filter(([, bucket]) => bucket.length > 1)
+    .map(([id]) => id);
+  const out = list.map((record, recordIndex) => {
+    const missing = picks.get(recordIndex);
+    if (missing === undefined || missing.length === 0) return record;
+    const messages = Array.isArray(record?.messages) ? record.messages : [];
+    return { ...record, messages: [...messages, { role: 'user', content: missing }] };
+  });
+  return { records: out, duplicateIds };
+}
+
 /**
  * 按 `foldedRoundRange` 从同会话已有轮行重建原文（#375）。
  * 账本 append-only、全站 `DELETE FROM transcript_rounds` 零命中 ⇒ 可证无损；上限与截断口径同 U7 recall。
  * 取行不取折叠行本身（它的 `messages` 是空数组）；`messages <> '[]'::jsonb` 把无正文的事实行筛掉。
  */
-async function rebuildFoldedRange(pool, { key, range }) {
+async function rebuildFoldedRange(pool, { key, range, log }) {
   const res = await pool.query(
     `SELECT round, messages FROM transcript_rounds
       WHERE transcript_key = $1 AND round BETWEEN $2 AND $3 AND messages <> '[]'::jsonb
@@ -466,7 +579,17 @@ async function rebuildFoldedRange(pool, { key, range }) {
   const truncated = rows.length > FOLDED_REBUILD_MAX_ROWS;
   const kept = truncated ? rows.slice(0, FOLDED_REBUILD_MAX_ROWS) : rows;
   const records = kept.map((r) => ({ round: Number(r.round), messages: r.messages }));
-  return { turns: projectTranscriptForDisplay(records), truncated };
+  // issue #387：先把 `tool_result` 挂回带 `tool_use` 的记录（纯读侧，见 `attachToolResultsToRecords`），
+  // 再喂上游投影：配对与预览截断的尺全部留在上游。
+  const { records: paired, duplicateIds } = attachToolResultsToRecords(records);
+  // PR #541 MED：同一个 `tool_use_id` 在 range 内有多份结果 ⇒ 取「就近」必须**可观测**（否则挂错了
+  // 没人看得见）。走现成的 warn 日志通道：零新事件类型、零 DDL、零响应字段（响应形状是契约，
+  // 而「运维要看」不需要前端画它）。只报条数 + 一个示例 id，不拼完整 id 列表（日志不许刷屏）。
+  if (duplicateIds.length > 0) {
+    log?.warn?.(`[sessions] folded 重建：${duplicateIds.length} 个 tool_use_id 在 range ${range.from}-${range.to} 内`
+      + `有多份结果，已按「就近优先」取一条（session=${key}，例：${duplicateIds[0]}）`);
+  }
+  return { turns: projectTranscriptForDisplay(paired), truncated };
 }
 
 /** PATCH /api/sessions/:id —— 改标题（CAS 限定 active，防归档后仍改成功）。 */
