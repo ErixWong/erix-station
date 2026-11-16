@@ -22,7 +22,11 @@
 //   saveRunState         → PUT /transcript/:key/runstate {run_state} （session）
 //   loadRunState         → GET /transcript/:key/runstate              （session；无 → undefined）
 //   loadRunStateStatus   → GET /transcript/:key/runstate/status       （session；返回 status?.status）
-//   （旧 run 作用域 U5–U9/runstate 端点保留不动，供旧 runner/旧 agentd 兼容——本 adapter 自 P2 起只走 session 端点。）
+//   appendRecoveryRow    → PUT /transcript/:key/recovery-rows         （session，issue #500；true/false）
+//   listRecoveryRows     → GET /transcript/:key/recovery-rows          （session，#500；返回**数组**）
+//   clearRecoveryRows    → DELETE /transcript/:key/recovery-rows       （session，#500；true/false 原样透出）
+//   （旧 run 作用域 U5–U9/runstate 端点保留不动，供旧 runner/旧 agentd 兼容——本 adapter 自 P2 起只走 session 端点。
+//   恢复行**没有** run 作用域旧端点可回退：那张新表只有一个键列，agentd 侧 sessionKey 缺失就是抛错。）
 import { foldLedgerRecords } from './transcript-fold.js';
 
 const RETRY_DELAYS = [1000, 2000, 5000];
@@ -36,6 +40,26 @@ function sleep(ms) {
  * @param {{request:(method:string, args:object)=>Promise<any>, runId?:string}} options
  *   request：IPC transport（生产侧接 ipcRequest）；runId：真 runId（U2 'running' 上报用，缺省回退 key）
  */
+// ── issue #500：恢复行布尔判据的读法（模块级，`makeStore` 之外）──
+/**
+ * 从 `{added}` / `{cleared}` 应答里取那个布尔。**只对「完全没有应答」fail-closed**：
+ * `null` / 非对象 ⇒ 抛（传输层没给出可判定的答案；把它说成 `false` 就是替 portal 编一句
+ * 「本来就没有」，而那正是 #500 要防的「把唯一的执行证据说成没有证据」）。
+ * 应答是对象但缺这个布尔 ⇒ 读成 `false`：本站 portal 端点恒发 `{added}` / `{cleared}`，
+ * 真缺字段说明对端是老版本，此时偏保守的解释是「没写成 / 没删动」——**不会**把
+ * 「可能没落账」说成「已落账」。
+ * ⚠ 本族唯一被契约点名的 fail-closed 判据在**读**面（`listRecoveryRows` 的「非数组 ⇒ 抛」，
+ *   见下面那个方法），它比这里严格，是故意的（引擎要的是 `recovery_rows_unreadable`，不是空账本）。
+ */
+function readFlag(res, field, method, key) {
+  if (res === null || typeof res !== 'object') {
+    throw new Error(`malformed ${method} response for ${String(key)}`
+      + ` (expected object with {${field}:boolean}, got ${res === null ? 'null' : typeof res})`);
+  }
+  return res[field] === true;
+}
+
+
 export function makeStore(key, { request, runId }) {
   let revision = 0;
 
@@ -125,6 +149,47 @@ export function makeStore(key, { request, runId }) {
       }
       revision = Number(res.checkpoint.revision ?? 0);
       return res.checkpoint.snapshot;
+    },
+    // ── issue #500：账本恢复行三件套（erix-agent 0.32/0.33 的可选能力面，本站全实现）──
+    //
+    // 三个都**可选**，但本站不允许「在而做错」：引擎按方法名单独探测，名字就是契约。
+    //   · 读方法「在但 reject / 返回非数组」⇒ 引擎终局 `recovery_rows_unreadable`；
+    //   · 写方法「在而什么都不存」⇒ 引擎以为「执行过了」已落账，实际没落，比证据缺席更容易把
+    //     副作用重放一遍。
+    // ⇒ 本层的一条纪律：**不吞错、不把畸形应答翻译成「空」**。「空」在契约里只有一个形状
+    //（`{rows: []}`），把它与「读坏了」混成一谈就是 #500 要修的那个洞本身。
+    // 重试预算在 agentd 那一层已经是有限的（`RECOVERY_ROWS_MAX_RETRIES`），本站这层
+    // `requestWithRetry` 只重试 `err.retryable === true` 的错误，两层叠起来仍是**有限**。
+    /**
+     * 追加一条恢复行（引擎在**执行器返回那一刻**写 `tool-executed`，早于结果行与任何快照写）。
+     * @returns {Promise<boolean>} `true` = 写入；`false` = 同 dedupKey 同 payload 的幂等跳过。
+     */
+    async appendRecoveryRow(r, record) {
+      const res = await requestWithRetry('appendRecoveryRow', { runId: r, record });
+      return readFlag(res, 'added', 'appendRecoveryRow', r);
+    },
+    /**
+     * 读该 key 的全部恢复行（引擎 resume 时读，按落盘序）。
+     * @returns {Promise<object[]>} **数组**；空数组 = 这条 run 没有恢复行（唯一可以静默兜底的回答）。
+     * 应答形状不合（不是数组）⇒ **抛出去**：引擎要的是 `recovery_rows_unreadable`，不是空账本。
+     */
+    async listRecoveryRows(r) {
+      const res = await requestWithRetry('listRecoveryRows', { runId: r });
+      const rows = res?.rows;
+      if (!Array.isArray(rows)) {
+        throw new Error(`malformed listRecoveryRows response for ${String(r)}`
+          + ` (expected {rows:array}, got ${res === null ? 'null' : typeof rows})`);
+      }
+      return rows;
+    },
+    /**
+     * fresh start 清盘（引擎在 `resume !== true` 的第一件事）。`true`/`false` **原样透出**：
+     * `true` = 至少删了一行，`false` = 本来就没有。两者都是成功；只有**抛错**才是契约里那个
+     * `recovery_rows_clear` 终局 ⇒ 本站不许把「删不动」与「没删成」混成一谈。
+     */
+    async clearRecoveryRows(r) {
+      const res = await requestWithRetry('clearRecoveryRows', { runId: r });
+      return readFlag(res, 'cleared', 'clearRecoveryRows', r);
     },
   };
 }

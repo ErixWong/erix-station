@@ -205,6 +205,7 @@ test('#351 真 runToolLoop 贯通：崩溃→追问→resume→**再 resume**，
   // 真账本语义的行存储：同 dedupKey 不同正文 ⇒ 抛冲突（= portal 的 409 round_conflict）
   const rows = [];
   const seen = new Map();
+  const recoveryRows = [];   // issue #500：恢复行（数组序 = 真库的 append_seq）
   let conflicts = 0;
   const peer = {
     async handle(method, args = {}) {
@@ -223,6 +224,22 @@ test('#351 真 runToolLoop 贯通：崩溃→追问→resume→**再 resume**，
       if (method === 'load') return { records: structuredClone(rows) }; // **原始行**，折叠由 adapter 做
       if (method === 'saveRunSnapshot') { peer.snapshot = structuredClone(args.snapshot); return {}; }
       if (method === 'loadLatestRunSnapshot') return peer.snapshot ? { checkpoint: { snapshot: peer.snapshot, revision: 1 } } : {};
+      // issue #500：`makeStore()` 自本单起**带着**恢复行三方法 ⇒ 引擎每趟 fresh start 都会
+      // `clearRecoveryRows`、每次 resume 都会 `listRecoveryRows`。本 peer 的兜底是 `return {}`，
+      // 而 adapter 对**读**面是 fail-closed 的（非数组 ⇒ 抛 ⇒ 引擎终局 `recovery_rows_unreadable`），
+      // 所以这里必须给真语义的三条路由（一张真表，不是把 `{}` 当空表）：
+      // 本用例的崩溃现场里唯一的调用死在 `executeTool` 里面 ⇒ 引擎一条 `tool-executed` 都没写成
+      // ⇒ resume 读回来就是空表，这正是 #351 那条崩溃现场该有的账本形状。
+      if (method === 'appendRecoveryRow') {
+        recoveryRows.push(structuredClone(args.record));
+        return { added: true };
+      }
+      if (method === 'listRecoveryRows') return { rows: structuredClone(recoveryRows) };
+      if (method === 'clearRecoveryRows') {
+        const cleared = recoveryRows.length > 0;
+        recoveryRows.length = 0;
+        return { cleared };
+      }
       return {};
     },
   };
