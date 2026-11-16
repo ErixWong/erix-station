@@ -1581,3 +1581,116 @@ test('迁移 0040-platform-prompts：种首行（让 FOR UPDATE 有行可锁）+
   assert.ok(!fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8').includes('platform_prompts'),
     'baseline schema.sql 里不许出现 platform_prompts（它的 sha256 在迁移台账里，改一字节现存库全部拒启）');
 });
+
+// ---------------------------------------------------------------------------
+// 通用形状闸：**`NNNN-*.sql` 的四位号必须全局唯一**（不是某支迁移的语义判据）
+//
+// 为什么这条闸必须存在（2026-11-16 现场，不是假想敌）：`deploy/migrations/README.md`「命名与顺序」
+// 写明 `NNNN` 是**四位递增序号**，而 #595 与 #596 两张并行单各自取号，各自都从「40」往下排 ⇒
+// 同一号出现两个文件：`0039-capability-market.sql` 与 `0039-platform-prompts.sql`。两边各自都绿：
+// 迁移 runner 用**文件名**当 `schema_migrations.version`，两个文件是两个不同的 version，
+// 于是 dev 库里同时落了 `0039-capability-market` 与 `0039-platform-prompts` 两行台账，
+// **全仓没有任何一条判据抱怨过**（`migrations.test.js` 只判「末位是哪支 + 编号连续」，
+// 末位断言看的是 `files[length-1]`，连续断言看的是 `Number(f.slice(0,4))` 的升序——
+// 重复号在两条判据里都不产生异常：升序里出现两个 39 也不算「跳号」）。
+// 真实代价不是难看：`sort` 升序里同号的先后由 **slug 字典序**决定 ⇒ 应用顺序变成隐式，
+// 而「谁在前」这件事今后没人能从编号本身读出来（迁移一旦有依赖，这就是不可复现的部署）。
+//
+// 反向自证（常驻，不靠手工）：见本节末尾的 `dupOf` 自检——它把两个同号文件名喂进同一个函数，
+// 必须判出**且点名是哪两个文件**。手工实测记录：`touch deploy/migrations/0040-collision-proof.sql`
+// ⇒ 本格子红在点名那两个文件的那条断言上（rc=1），删掉临时文件即复绿。
+// ---------------------------------------------------------------------------
+
+/** 重复的迁移号 → 抢这个号的文件名列表（干净目录 ⇒ 空对象）。 */
+function duplicateMigrationNumbers(files) {
+  const byNum = new Map();
+  for (const f of files) {
+    const num = f.slice(0, 4);
+    if (!/^\d{4}$/.test(num)) continue;
+    if (!byNum.has(num)) byNum.set(num, []);
+    byNum.get(num).push(f);
+  }
+  return Object.fromEntries([...byNum.entries()].filter(([, list]) => list.length > 1).sort());
+}
+
+test('迁移编号唯一性闸：`NNNN-*.sql` 的四位号全局唯一（同号两个文件 = 应用顺序没人说得清）', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.length >= 40, `迁移条数异常：${files.length}`);
+
+  const dup = duplicateMigrationNumbers(files);
+  const bad = Object.entries(dup).map(([num, list]) => `${num} 被 ${list.length} 个文件抢用：${list.join(' / ')}`);
+  assert.deepEqual(bad, [],
+    `deploy/migrations/ 里 ` + `NNNN 必须全局唯一（README「命名与顺序」）——撞号时 runner 照样`
+    + `各记一行 version，台账看起来都对，但同号两支的先后只剩 slug 字典序可查：\n${bad.join('\n')}`);
+
+  // 反向自证：本闸不是恒真的 —— 把两个同号文件名喂进去必须恰好判出一条，且**点名是哪两个文件**。
+  const proof = duplicateMigrationNumbers([
+    '0001-a.sql', '0040-capability-market.sql', '0040-platform-prompts.sql', '0041-b.sql',
+  ]);
+  assert.deepEqual(Object.keys(proof), ['0040'], `反向自证失败：0040 撞号没被抓到（拿到 ${JSON.stringify(proof)}）`);
+  assert.deepEqual(proof['0040'], ['0040-capability-market.sql', '0040-platform-prompts.sql'],
+    '反向自证失败：抓到了撞号但没点名是哪两个文件（下一地点名式报错就失去意义）');
+  // 边界：末位/首位撞号也要抓（判据不是「只检查中间」），空目录不得抛。
+  assert.deepEqual(Object.keys(duplicateMigrationNumbers(['0001-a.sql', '0001-b.sql'])), ['0001'],
+    '反向自证失败：首位撞号没被抓到');
+  assert.deepEqual(Object.keys(duplicateMigrationNumbers(['0099-a.sql', '0099-z.sql'])), ['0099'],
+    '反向自证失败：末位撞号没被抓到');
+  assert.deepEqual(duplicateMigrationNumbers([]), {}, '空目录不许抛');
+});
+
+// ---------------------------------------------------------------------------
+// 通用形状闸：**`docs/api/portal.md` 的 `### N.N` 章节号必须全局唯一**（同一族的事故，写在这里是
+// 因为「编号唯一」这条纪律只该有一处落地）
+//
+// 为什么这条闸也必须在（同一天的第二处现场）：合并 `origin/main` 时两边各自新建了一节 **§4.16**
+// （本单的「管理台提示词面板」与 #586 的「管理台关于」）——两节都写得很认真，**判据却先塌了**：
+// 本单的 `D1`（`portal/test/platform-prompts.test.js`）按 `apiDoc.indexOf('### 4.16 ')` 取节，
+// 撞号之后它取到的节界一路串到邻居 #595 的能力市场那一节，于是把 `capability_budget_exceeded` /
+// `capability_install_failed` 当成「本单发明了错误码」报红（实测：`§4.16 只许用既有错误码（发明了：
+// capability_budget_exceeded, capability_install_failed）`）。也就是说重复编号让判据在
+// **假红与假绿之间随机摆**：谁排在前面，别人那一节的文本就被算成它的。这与 `0039` 两个文件
+// 在库里并存而无人报警是同一类事故，只是发生在文档里。
+//
+// 判据形状与上面那条同族：抓**全部** `### N.N`（不区分章节、不许只查某一节），违规时点名
+// 「哪两个标题抢了同一个号」。字母后缀的子号（`### 4.4a`）是**不同的号**，不算撞车。
+//
+// 反向自证（常驻）：见本节末尾 `duplicateSectionNumbers` 的自检；手工实测 = 往 portal.md 临时插一句
+// `### 4.16 collision-proof` ⇒ 本格子必须红在点名那两个标题的断言上，删掉即复绿。
+// ---------------------------------------------------------------------------
+
+/**
+ * 重复的章节号 → 抢这个号的标题行列表（干净文档 ⇒ 空对象）。
+ * 只认 `### N.N` 这一级（`## N.` 是大章、`#### N.N-x` 是某一节内部的小节，各有自己的命名空间）。
+ */
+function duplicateSectionNumbers(markdown) {
+  const byNum = new Map();
+  for (const line of markdown.split('\n')) {
+    const m = /^### (\d+\.\d+[a-z]*)\s/.exec(line);
+    if (!m) continue;
+    if (!byNum.has(m[1])) byNum.set(m[1], []);
+    byNum.get(m[1]).push(line.trim());
+  }
+  return Object.fromEntries([...byNum.entries()].filter(([, list]) => list.length > 1).sort());
+}
+
+test('文档编号唯一性闸：docs/api/portal.md 的三级标题号（H3 的 `N.N`）全局唯一（撞号会把别人的节算成你的）', () => {
+  const doc = fs.readFileSync(path.join(HERE, '../../docs/api/portal.md'), 'utf8');
+  const dup = duplicateSectionNumbers(doc);
+  const bad = Object.entries(dup)
+    .map(([num, list]) => `§${num} 被 ${list.length} 个标题抢用：\n${list.map((h) => `    ${h}`).join('\n')}`);
+  assert.deepEqual(bad, [],
+    `docs/api/portal.md 的章节号必须全局唯一——撞号之后「按 §号取节」的判据（如本单的 D1）`
+    + `会吃进邻居那一节的文本，判据开始随机红/随机绿：\n${bad.join('\n')}`);
+
+  // 反向自证：同一个号写两次必须被抓，并且**点名是哪两个标题**。
+  const proof = duplicateSectionNumbers([
+    '### 4.1 甲', '### 4.16 管理台提示词面板', '### 4.16 管理台「关于」', '### 4.17 能力市场',
+  ].join('\n'));
+  assert.deepEqual(Object.keys(proof), ['4.16'], `反向自证失败：4.16 撞号没被抓到（拿到 ${JSON.stringify(proof)}）`);
+  assert.deepEqual(proof['4.16'], ['### 4.16 管理台提示词面板', '### 4.16 管理台「关于」'],
+    '反向自证失败：抓到了撞号但没点名是哪两个标题');
+  // 边界：`4.4` 与 `4.4a` 是两个号（文档里大量使用字母后缀，误判就是假红）；小节 `#### 4.16-1` 不参与。
+  assert.deepEqual(duplicateSectionNumbers('### 4.4 乙\n### 4.4a 丙\n#### 4.4-1 丁\n#### 4.4-1 戊'), {},
+    '字母后缀子号与 `####` 小节不许被判成撞号');
+});
