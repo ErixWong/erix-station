@@ -186,6 +186,18 @@ export function provenanceFor(source) {
 }
 
 /**
+ * **有值才谈来源**（第三轮评审 nit）：值为 `unknown` 时，来源也只能是 `'unknown'`。
+ *
+ * 要挡的形状：`readBuildInfo()` 只要**根** `package.json` 可读就置 `source: 'package'`，哪怕
+ * `node_modules/erix-agent/package.json` 根本不存在、引擎那格其实是 `unknown` ⇒ 照 `source` 直推就会
+ * 写成「来自 package.json」，而那一格**根本没有值**（标注在冒充来源）。所以标注只在「确有其值」时
+ * 才说来源；值缺就不冒充。与上一轮同一取向：标注必须是**真话**，宁可说「未知」。
+ */
+export function provenanceForValue(value, source) {
+  return text(value) === UNKNOWN ? UNKNOWN : provenanceFor(source);
+}
+
+/**
  * 管理台「关于」面板的三段（判据 C）。
  * @param {{pool: object, readVersion?: () => object, log?: {warn?: (m: string) => void}}} opts
  */
@@ -223,8 +235,10 @@ export async function aboutPanel({ pool, readVersion = readStationVersion, log =
       // **由实际来源推导**（`readStationVersion()` 返回的 `source`），不是常量：写死 `'build-info.json'`
       // 在「build-info 读不到 ⇒ 退 `package.json`」的旧 portal 镜像上就是谎报（声称镜像构建产物，而那个
       // 文件根本没烘）。推导链见 `provenanceFor()`；`server` 与 `platformEngine` 同源（一次读取一个 source）。
+      // 但引擎那格多一道**有值才报来源**的闸门（见 `provenanceForValue`）：`source` 是整次读取共用的，
+      // 而引擎值可能根本没读到（`node_modules/erix-agent/package.json` 缺失），那时它只能说 `'unknown'`。
       server: provenanceFor(v.source),
-      platformEngine: provenanceFor(v.source),
+      platformEngine: provenanceForValue(v.engine, v.source),
       fdes: 'containers.agent_version',
       fdesSnapshot: 'provision',
     },

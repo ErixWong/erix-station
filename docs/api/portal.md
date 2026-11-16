@@ -3045,6 +3045,10 @@ git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什�
   `build-info.json`，读取退到 `node_modules/erix-agent/package.json`，面板上的引擎号确实是它。
   ⚠ `source` 是**整次读取共用的**（`readBuildInfo()` 只出一个），所以这两格**必然同源**（同一个文件）；
   `provenance` 里 `package.json` 那一支就是「这是源码态退路 / 旧镜像，不是镜像构建产物」的显式说法。
+  **有值才谈来源**（第三轮评审 nit）：`platformEngine.version` 是 `unknown` 时 `provenance.platformEngine`
+  也降成 `"unknown"` —— `source` 会因为根 `package.json` 可读而置 `package`，但那份
+  `node_modules/erix-agent/package.json` 可能根本不存在，此时给一个没值的格子标上来源就是冒充。
+  `server` 那格不需要这道闸门（它的值就出自根 `package.json`，`source` 是 `package` 时必然读到了）。
 - `buildInfoPath` = **实际去读的那条路径**（`STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH` /
   代码入参三个旋钮都能改它，前两个是契约测试的注入点 ⇒ 「路径被改过」必须在界面上可见）。
   它只证明「读了这条路径」，**证明不了「读到了」**——读到没有看 `provenance`。`/api/health` **不带**这一格
