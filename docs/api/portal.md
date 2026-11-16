@@ -2726,7 +2726,7 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
 ### 4.15 管理台上传上限（`/api/admin/upload/settings`，issue #485 片 A）
 
 **一句话**：单文件上限从「启动期 env + 重建容器」变成「管理台一个数字，**下一次上传就生效**」。
-真相在 `upload_settings`（迁移 `0035`，单行表）；`FILE_UPLOAD_MAX_BYTES` 降级成兜底值（`docs/env.md` §10.1）。
+真相在 `upload_settings`（迁移 `0036`，单行表）；`FILE_UPLOAD_MAX_BYTES` 降级成兜底值（`docs/env.md` §10.1）。
 
 **为何不缓存**（与 §4.12 的 `mail_settings` 刻意不同）：登录是热路径，所以 `mail-provider` 带 60s TTL；
 上传不是。一次上传多一次单行主键 `SELECT`（按 `id = 1` 取一行）换掉「改完要等一分钟」——加缓存只是把
@@ -2786,7 +2786,7 @@ Content-Type: application/json
 
 | 位置 | 管什么 | 形态 |
 |---|---|---|
-| DB（迁移 `0035`）| 物理荒谬 | `CHECK (max_file_bytes > 0)` + `CHECK (id = 1)`（单行是 DB 事实）+ `bigint`（`int` 只到 2 GiB）|
+| DB（迁移 `0036`）| 物理荒谬 | `CHECK (max_file_bytes > 0)` + `CHECK (id = 1)`（单行是 DB 事实）+ `bigint`（`int` 只到 2 GiB）|
 | JS 写侧（§4.15-2）| 产品区间 1 MiB–1 GiB | 400 `validation_failed`，**当场红** |
 | JS 读侧（§4.14 的 `POST /api/files/upload`）| 任何不可用的行 | **回落 env → 默认** + 一条点名 `upload_settings.max_file_bytes` 与 `FILE_UPLOAD_MAX_BYTES` 的 warn；**永不 500** |
 | JS 读侧的**超时**（复 audit 活一）| 「查询发出去而**不返回**」 | `catch` 抓不到这种情况（不抛错就永远进不了 catch），所以读取外面套 `UPLOAD_SETTINGS_READ_TIMEOUT_MS`（默认 1500ms）：到点 = 读不到 ⇒ 同上回落、`reason=read_timeout`、**只留 debug 不刷 warn**、**上传照常**。没有这一层，「读侧永不抛」是假的——一次卡住的 DB 会把每次上传挂住 |
@@ -2822,8 +2822,8 @@ Content-Type: application/json
 
 > 实现：`portal/src/upload-settings.js`（读侧 + 写侧 + 优先级 + 读超时 + 保存与审计的同一条 CTE）、`portal/src/http.js`（两个端点、
 > 上传端点的现读接入）、`portal/src/config.js`（`fileUploadMaxBytesSource`）、
-> `deploy/migrations/0035-upload-settings.sql`。
-> 单测：`portal/test/upload-settings.test.js`、`portal/test/migrations.test.js`（0035 那一段）。
+> `deploy/migrations/0036-upload-settings.sql`。
+> 单测：`portal/test/upload-settings.test.js`、`portal/test/migrations.test.js`（0036 那一段）。
 
 ---
 

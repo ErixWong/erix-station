@@ -424,7 +424,7 @@ test('US-12 默认值三处同源：config 默认 == 模块常量 == compose 注
 });
 
 test('US-13 迁移 0035：单行表 + bigint + CHECK > 0 + 幂等 + 末尾只读 DO（不许 UPDATE/DELETE）', () => {
-  const file = new URL('../../deploy/migrations/0035-upload-settings.sql', import.meta.url);
+  const file = new URL('../../deploy/migrations/0036-upload-settings.sql', import.meta.url);
   const sql = fs.readFileSync(file, 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS upload_settings/, '必须 IF NOT EXISTS（重放是零 DDL 空操作）');
   assert.match(sql, /id\s+int PRIMARY KEY DEFAULT 1 CHECK \(id = 1\)/, '单行写成 DB 事实（与 0026 同手法）');

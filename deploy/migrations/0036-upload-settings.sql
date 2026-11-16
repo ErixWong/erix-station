@@ -1,4 +1,4 @@
--- 0035-upload-settings.sql —— 单文件上传上限进管理台（issue #485 片 A / 工单 fix-261116-04，2026-11-16）
+-- 0036-upload-settings.sql —— 单文件上传上限进管理台（issue #485 片 A / 工单 fix-261116-04，2026-11-16）
 --
 -- 背景：#472 片 B 的上传只有**一条**限额 `FILE_UPLOAD_MAX_BYTES`（默认 32 MiB），而它是**启动期 env**：
 --   改一个数字要改 `deploy/.env` + 重建 station-portal 容器，管理台既看不见也改不了。
@@ -48,10 +48,10 @@ BEGIN
   SELECT count(*) INTO row_count FROM upload_settings;
   SELECT max_file_bytes INTO effective FROM upload_settings WHERE id = 1;
   IF effective IS NULL THEN
-    RAISE NOTICE '0035: upload_settings 行数=%（无行 = 未配置，单文件上限回落 FILE_UPLOAD_MAX_BYTES / 默认 33554432）',
+    RAISE NOTICE '0036: upload_settings 行数=%（无行 = 未配置，单文件上限回落 FILE_UPLOAD_MAX_BYTES / 默认 33554432）',
       row_count;
   ELSE
-    RAISE NOTICE '0035: upload_settings 行数=%，max_file_bytes=%（生效值以 portal 读侧为准）',
+    RAISE NOTICE '0036: upload_settings 行数=%，max_file_bytes=%（生效值以 portal 读侧为准）',
       row_count, effective;
   END IF;
 END $$;
