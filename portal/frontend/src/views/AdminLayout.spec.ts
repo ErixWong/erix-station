@@ -31,7 +31,7 @@ function makeRouter() {
       // "No match for {name:'admin-users'}" 抛错（不是断言失败）。给桩即可，本单不测 tab。
       // ⚠ **加一个 tab 必须同时在这里加一个名字**：漏了不是"那条 tab 断言红"，而是整个组件挂载就抛
       //   ⇒ 本文件**所有**用例红（含与 tab 无关的登出、返回工作台）。#485 片 A 加 `admin-upload` 时踩过。
-      ...['admin-users', 'admin-llm', 'admin-repos', 'admin-mail', 'admin-tls', 'admin-upload', 'admin-preview-pool']
+      ...['admin-users', 'admin-llm', 'admin-repos', 'admin-mail', 'admin-tls', 'admin-upload', 'admin-preview-pool', 'admin-macros', 'admin-macro-runs']
         .map((name) => ({ path: `/${name}`, name, component: { template: '<div />' } })),
     ],
   });
