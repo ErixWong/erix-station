@@ -1382,3 +1382,82 @@ test('迁移 0038-transcript-recovery-rows：幂等键/append_seq 排序/只新�
   assert.match(executable, /^SET LOCAL lock_timeout/m, 'lock_timeout 必须 SET LOCAL（随事务结束失效，不漏给后续语句）');
   assert.doesNotMatch(executable, /^SET lock_timeout/m, '不许裸 SET lock_timeout（同上）');
 });
+
+// ---------------------------------------------------------------------------
+// 迁移 0039（issue #596 片 A，`platform_prompts` 单行表）——本节的存在理由是一条评审结论（F1）：
+// 写侧那条语句靠 `SELECT … FROM platform_prompts WHERE id = 1 FOR UPDATE` 拿旧值快照，而
+// **`FOR UPDATE` 只能锁已经存在的行**。空表里没有任何行可锁 ⇒ 两个并发首写各拿一份「无行」快照
+// （三列全 `COALESCE(…, '')`）、各写自己那一格 ⇒ 后写的 `ON CONFLICT DO UPDATE` 覆盖**整行**，
+// 先写的那个值就这么丢了。种下 `id = 1` 是这件事的机器判据：那把锁从此一直存在。
+// 判据判的是**可执行 SQL 里真有那句 INSERT**（不是头注释里说过），注释写一万字也拦不住漏种。
+// 反向自证（2026-11-16 复测）：把 0039 那句 `INSERT INTO platform_prompts (id) VALUES (1)`
+// 换成一行注释 ⇒ 本节必须红在**点名它的那条断言**上，实测 rc=1 且
+// `error: '缺种首行：空表时 `snap … FOR UPDATE` 锁不到任何行 ⇒ 并发首写各拿一份空快照
+// ⇒ 后写覆盖整行（丢更新）'`（不是红在编号、不是红在 baseline —— 那说明判据没打在种行上）。
+// 同一件事在**真库**上的对应判据：`portal/integration/platform-prompts-db.mjs` 的
+// `P12d-db`（不种行 ⇒ 并发保存真的丢更新）。
+// ---------------------------------------------------------------------------
+
+test('迁移 0039-platform-prompts：种首行（让 FOR UPDATE 有行可锁）+ 幂等 + 零 baseline 回写', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const file = '0039-platform-prompts.sql';
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes(file), '0039 存在');
+  assert.equal(files[files.length - 1], file, '0039 是当前头号（新迁移只能追加，不回改已应用的编号）');
+  assert.deepEqual(
+    files.map((f) => Number(f.slice(0, 4))),
+    Array.from({ length: 39 }, (_, i) => i + 1),
+    '迁移编号 = 1..39 连续无空洞（每加一支迁移都要同步这里）',
+  );
+
+  const sql = fs.readFileSync(path.join(dir, file), 'utf8');
+  // 去掉整行注释后再判（头注释里满是 "UPDATE""DELETE""索引" 这些词，整文件判会假红，口径同 0038 那节）。
+  const executable = sql.split('\n').map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('--')).join('\n');
+  const count = (re) => (executable.match(re) || []).length;
+
+  // —— ① ★ 本节本体（评审 F1）：首行必须**种在迁移里** ——
+  const seed = /INSERT INTO platform_prompts \(\w+\)\s+VALUES \(1\)\s+ON CONFLICT \(id\) DO NOTHING/;
+  assert.match(executable, seed,
+    '缺种首行：空表时 `snap … FOR UPDATE` 锁不到任何行 ⇒ 并发首写各拿一份空快照 ⇒ 后写覆盖整行（丢更新）');
+  assert.equal(count(new RegExp(seed.source, 'g')), 1, '种行恰好一条（多条 = 有人开始往迁移里塞数据操作）');
+  // 只认 `DO NOTHING`：写成 `DO UPDATE` 的话，第二遍重放会把管理员已经改过的文本刷回空串
+  // ⇒ 迁移吃掉了用户的配置（这条迁移的「幂等」二字指的就是它）。
+  assert.doesNotMatch(executable, /INSERT INTO platform_prompts[\s\S]{0,200}?ON CONFLICT \(id\) DO UPDATE/,
+    '种行不许写成 ON CONFLICT DO UPDATE（重放会把已改过的文本刷成空 = 迁移覆盖用户配置）');
+  // 只种 id ⇒ 三列由列上的 DEFAULT 出 `''` ⇒ 种行本身不改变任何生效值（读侧「三块全跟随内置」照旧，判据 P1）。
+  const seedStmt = /INSERT INTO platform_prompts[^;]*;/.exec(executable)[0];
+  assert.doesNotMatch(seedStmt, /agents_md_|title_prompt/,
+    '种行只给 id：在这里写死文本 = 造出第二份「内置提示词」真相（内置只有 materializer.js / title-llm.js 一份）');
+
+  // —— ② 建表与「只能有一行」这条 DB 事实 ——
+  assert.match(executable, /CREATE TABLE IF NOT EXISTS platform_prompts\b/, '建表必须 IF NOT EXISTS（可重放）');
+  assert.match(executable, /id\s+int PRIMARY KEY DEFAULT 1 CHECK \(id = 1\)/,
+    '单行是 DB 事实（照 0026/0036）：两行配置 = 谁生效取决于 ORDER BY，那是不可调试的形态');
+  for (const col of ['agents_md_addendum', 'agents_md_override', 'title_prompt']) {
+    assert.match(executable, new RegExp(`${col} +text NOT NULL DEFAULT ''`),
+      `${col} 必须 NOT NULL DEFAULT ''（'' = 跟随内置，是读侧唯一的默认态判据，不许再引入 NULL 那个状态）`);
+  }
+  // 产品区间（8192 / 16384 / 2000）**不在这里**：写侧常量挡（改天花板不用重放迁移），读侧要能面对
+  // 手工 UPDATE 进来的超长值照常工作 ⇒ DB 里出现这三个数字就是分层漂了。
+  for (const n of ['8192', '16384', '2000']) {
+    assert.doesNotMatch(executable, new RegExp(`\\b${n}\\b`), `${n} 是产品上限，属写侧常量，不进 DB CHECK`);
+  }
+  assert.match(executable, /updated_by\s+uuid\b/, 'updated_by 存在（谁改的要留名）');
+  assert.doesNotMatch(executable, /\bREFERENCES\b/, 'updated_by 不建 FK（照 0026/0036：管理员行被删后配置要留着）');
+
+  // —— ③ 可重放：零 DDL 破坏、零数据回收 ——
+  for (const bad of ['DROP TABLE', 'DROP INDEX', 'ALTER TABLE', 'TRUNCATE', 'DELETE FROM', ' UPDATE ']) {
+    assert.equal(count(new RegExp(bad.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')), 0,
+      `0039 不得有 ${bad.trim()}（重放要零变化；要改形态请另开一支迁移）`);
+  }
+  // 这条迁移没有需要断言的既有形态（无行与 1 行都是正常态）⇒ 只许 NOTICE，不许拿 EXCEPTION 当嗓门。
+  assert.equal(count(/RAISE EXCEPTION/g), 0, '零 EXCEPTION：这里没有「漂了就别启动」的形态可守');
+  assert.equal(count(/RAISE WARNING/g), 0, '不许 RAISE WARNING——CI 只 grep ERROR 会吞掉它');
+  assert.equal(count(/RAISE NOTICE '0039/g), 2, '重放证据两个分支各一条 NOTICE（有行/无行都要说清是哪一种）');
+  assert.doesNotMatch(executable, /\bVACUUM\b/, 'VACUUM 不进迁移（不在事务块里跑，runner 是单事务）');
+
+  // —— ④ baseline 冻结：本表只走增量迁移，schema.sql 一个字节不改 ——
+  assert.ok(!fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8').includes('platform_prompts'),
+    'baseline schema.sql 里不许出现 platform_prompts（它的 sha256 在迁移台账里，改一字节现存库全部拒启）');
+});

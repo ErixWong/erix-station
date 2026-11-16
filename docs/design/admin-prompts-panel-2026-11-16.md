@@ -177,7 +177,8 @@ GET DTO（键名 camelCase，与本仓其它管理台 DTO 一致）：
    `P5` 覆写设 `''` ⇒ 回到内置（逐字节等于 `P1`）。
 4. `P6` 渲染超限（8 KiB 追加段 + 模板 > 16 KiB）⇒ `400` 且**不落库**（读回还是旧值）。
 5. `P7` 非字符串 / 缺字段 / 空 body ⇒ `400 validation_failed` + `details.field`。
-6. `P8` 保存 = 一条语句：调用 `pool.query` 恰好 1 次、`audit_log` 恰好 1 行（fake pool 计数）。
+6. `P8` 保存：「写 `platform_prompts`」的语句恰好 **1** 条、`audit_log` 恰好 **1** 行，且两者是**同一条**
+   SQL（fake pool 计数）——三条字段路径（追加段 / 覆写 / 标题）各自点名，口径见第 11 条。
 7. `P9` `portal` 常量与 `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES` 相等（跨包对账）。
 8. `P10` 入队条数 = 启用中的 FDE 数；入队抛错 ⇒ 保存仍然成功 + `materializeEnqueued=0` + warn。
    ⚠ 断言不许写成 `… || true`（恒真的断言等于没断言，评审 F4）：`op` 必须是字面量 `upsert`。

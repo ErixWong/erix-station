@@ -28,9 +28,13 @@ import {
   renderHomeAgentsMd,
   agentsMdRenderBudget,
   agentsMdRenderedBytes,
+  agentsMdGateRenderBudget,
+  agentsMdGateFdeName,
   AGENTS_MD_EXAMPLE_FDE_NAME,
   AGENTS_MD_ADDENDUM_HEADER,
 } from '../src/materializer.js';
+// `P13`：写侧闸的最坏情况标识行必须从 `FDE_NAME_RE` 这条单一真相导出（不是手抄的 63）。
+import { FDE_NAME_MAX_LEN, FDE_NAME_RE } from '../src/projects.js';
 // 判据 `P9` 的跨包对账：portal 的注入上限必须等于 runner 注入侧的那个常量。
 // ⚠ 只有**测试**跨包 import —— portal 镜像不含 `runner/`（`portal/Dockerfile` 只 `COPY portal/ portal/`），
 //   运行期引它 = portal 起不来（先例：`runner/test/system-prompt.test.js` import `portal/src/previewpool.js`）。
@@ -61,10 +65,14 @@ function captureLog() {
  * `platform_prompts` 的内存 fake：**按 SQL 说的做**（AGENTS §8.14，不把新语句当未知放行），
  * 并把迁移 0039 的 DB 事实当约束执行：只能有一行（`id = 1`）。
  * 注入位：`failSelect`（读抛错 = 表不存在）、`hangSelect`（读不返回 = 超时）、`failAudit`
- * （审计写失败 ⇒ 整条语句失败而设置**一格没变** = 语句级原子）、`failEnqueue`（入队抛错）。
+ * （审计写失败 ⇒ 整条语句失败而设置**一格没变** = 语句级原子）、`failEnqueue`（入队抛错）、
+ * `concurrent: N`（判据 `P12` 用：把「N 条保存同时在飞」建模进来，口径见 `query()` 里那段注释）。
  */
 class PromptsFakePool {
-  constructor({ row = null, fdes = [], failSelect = null, hangSelect = false, failAudit = false, failEnqueue = false } = {}) {
+  constructor({
+    row = null, fdes = [], failSelect = null, hangSelect = false, failAudit = false, failEnqueue = false,
+    concurrent = 0,
+  } = {}) {
     this.row = row;          // 单行表的当前行（null = 无行 = 三块全跟随内置）
     this.fdes = fdes;        // 启用中的 FDE id 列表（`enqueueMaterializeForAllFdes` 要列的就是这个集合）
     this.failSelect = failSelect;
@@ -75,80 +83,121 @@ class PromptsFakePool {
     this.audit = [];
     this.outbox = [];
     this.revisions = [];
+    // `P12` 的两件件：到达栅栏（N 条保存必须**同时在飞**）与行锁队列（只锁已存在的行）。
+    this.arrivals = concurrent > 0 ? makeArrivalBarrier(concurrent) : null;
+    this.lockTail = Promise.resolve();
   }
 
   async query(sql, params = []) {
     const s = sql.replace(/\s+/g, ' ').trim();
     this.statements.push({ sql: s, params });
-
-    // —— 写侧：一条 CTE（旧值快照 → 渲染闸 → upsert → 审计）——
-    if (s.includes('INSERT INTO platform_prompts')) {
-      // 形状闸：这四条是「保存 = 一条语句 + 并发下旧值是紧邻前值」的全部依靠，删一条就该红。
-      if (!/\bFOR UPDATE\b/.test(s)) throw new Error('fake：snap 必须 `FOR UPDATE`（否则 previous_* 仍是隔条旧值）');
-      if (!/ON CONFLICT \(id\) DO UPDATE/.test(s)) throw new Error('fake：写入必须是单条 upsert');
-      if (!/WHERE rendered_bytes <= \$7::bigint/.test(s)) {
-        throw new Error('fake：渲染闸必须挂在喂给 INSERT 的 WHERE 上（超限 ⇒ 一格不写，而不是写完再拒）');
-      }
-      if (!/INSERT INTO audit_log/.test(s)) throw new Error('fake：审计必须与 upsert 同一条语句');
-      if (params.length !== 9) throw new Error(`fake：保存语句应带 9 个参数，实际 ${params.length}`);
-      const [column, text, actorId, tplBytes, addOverhead, idTail, limit, action, target] = params;
-      if (!PROMPT_FIELDS_FOR_FAKE.includes(column)) throw new Error(`fake：未知列名 ${column}`);
-      if (typeof text !== 'string') throw new Error('fake：text 是 NOT NULL 列，不能是 undefined/null/数字');
-      if (Number(tplBytes) <= 0 || Number(addOverhead) <= 0 || Number(idTail) <= 0) {
-        throw new Error('fake：渲染预算三个常量必须是正整数（从 materializer 现算，不许抄）');
-      }
-      // prev 快照（无行 ⇒ `COALESCE(...,'')`，与 SQL 里的 LEFT JOIN + COALESCE 同形）。
-      const prev = {
-        agents_md_addendum: this.row?.agents_md_addendum ?? '',
-        agents_md_override: this.row?.agents_md_override ?? '',
-        title_prompt: this.row?.title_prompt ?? '',
-      };
-      const next = { ...prev, [column]: text };
-      // SQL 里 `gate` 那段算术的等价实现（`octet_length` ≡ UTF-8 字节数）。
-      const rendered = column === 'title_prompt' ? 0
-        : (next.agents_md_override !== '' ? bytes(next.agents_md_override) : Number(tplBytes))
-          + (next.agents_md_addendum !== '' ? Number(addOverhead) + bytes(next.agents_md_addendum) : 0)
-          + Number(idTail);
-      const allowed = rendered <= Number(limit);
-      if (allowed && this.failAudit) throw new Error('fake：audit_log 写入失败（注入）');
-      let written = 0;
-      if (allowed) {
-        written = 1;
-        this.row = {
-          ...next,
-          updated_at: new Date('2026-11-16T09:00:00.000Z'),
-          updated_by: actorId ?? null,
-        };
-        this.audit.push({
-          actor_id: actorId ?? null,
-          action,
-          target,
-          // 真库这列是 jsonb（`encode(sha256(convert_to(...)))`）；这里保持同形状的 JSON 文本，
-          // 免得「形状变了」与「内容变了」两件事混成一条红（口径同 fake-pool 的 upload_settings 分支）。
-          details: JSON.stringify({
-            field: column,
-            text_bytes: bytes(text),
-            text_sha256: sha(text),
-            previous_bytes: bytes(prev[column]),
-            previous_sha256: sha(prev[column]),
-          }),
-        });
-      }
-      // `FROM gate LEFT JOIN upd ON TRUE` ⇒ 永远一行；被拒时 `upd` 那一半是 NULL。
-      const upd = allowed
-        ? { ...next, updated_at: this.row.updated_at, updated_by: this.row.updated_by ?? null }
-        : { agents_md_addendum: null, agents_md_override: null, title_prompt: null, updated_at: null, updated_by: null };
-      return {
-        rows: [{
-          written,
-          rendered_bytes: rendered,
-          audit_rows: allowed ? 1 : 0,
-          prev_text: prev[column],
-          ...upd,
-        }],
-      };
+    if (!s.includes('INSERT INTO platform_prompts')) return this.dispatch(s, params);
+    if (!this.arrivals) return this.applySave(s, params);
+    // ★ `P12` 把真库的两件事实建模出来（真并行与真锁在 `portal/integration/platform-prompts-db.mjs`）：
+    //   ① **到达栅栏**：两条保存都进到这条语句里才放行 ⇒ 假池不会把「并发」默默跑成串行
+    //      （串行 = 假绿，那才是这里最坑的错；等不齐会报错而不是挂死）。
+    //   ② **行锁只在有行时存在**：`this.row !== null`（= 迁移 0039 已种首行）才排队 ⇒ 后一条的快照
+    //      必然是前一条写完之后的；`this.row === null`（未种行的旧形态）时 `FOR UPDATE` 锁不到任何
+    //      东西 ⇒ 两条各拿一份空快照（丢更新的成因，同一个假池同一对输入 ⇒ 病复现得出来）。
+    await this.arrivals();
+    const release = this.row !== null ? await this.takeRowLock() : null;
+    try {
+      // 旧值快照：`snap … FOR UPDATE` 的等价位置（**拿到锁之后**才读，与真库同序）。
+      const prev = this.snapshotForSave();
+      // 快照与写入之间的窗口：真库里这段时间就是另一条语句插进来的地方。
+      await new Promise((resolve) => setImmediate(resolve));
+      return this.applySave(s, params, prev);
+    } finally {
+      if (release) release();
     }
+  }
 
+  /** `snap … FOR UPDATE` 那一列的等价面：无行 ⇒ 三列全 `COALESCE(…, '')`（与 SQL 里同形）。 */
+  snapshotForSave() {
+    return {
+      agents_md_addendum: this.row?.agents_md_addendum ?? '',
+      agents_md_override: this.row?.agents_md_override ?? '',
+      title_prompt: this.row?.title_prompt ?? '',
+    };
+  }
+
+  /** 行锁队列：先到先得（与 PG 的 wait queue 同形）；拿到后返回释放函数。 */
+  async takeRowLock() {
+    const wait = this.lockTail;
+    let release;
+    this.lockTail = new Promise((resolve) => { release = resolve; });
+    await wait;
+    return release;
+  }
+
+  /** 保存那条 CTE 的语义：形状闸 → 旧值快照 → 渲染闸 → upsert + 审计 → `RETURNING` 那一行。 */
+  applySave(s, params, prevOverride) {
+    // 形状闸：这四条是「保存 = 一条语句 + 并发下旧值是紧邻前值」的全部依靠，删一条就该红。
+    if (!/\bFOR UPDATE\b/.test(s)) throw new Error('fake：snap 必须 `FOR UPDATE`（否则 previous_* 仍是隔条旧值）');
+    if (!/ON CONFLICT \(id\) DO UPDATE/.test(s)) throw new Error('fake：写入必须是单条 upsert');
+    if (!/WHERE rendered_bytes <= \$7::bigint/.test(s)) {
+      throw new Error('fake：渲染闸必须挂在喂给 INSERT 的 WHERE 上（超限 ⇒ 一格不写，而不是写完再拒）');
+    }
+    if (!/INSERT INTO audit_log/.test(s)) throw new Error('fake：审计必须与 upsert 同一条语句');
+    if (params.length !== 9) throw new Error(`fake：保存语句应带 9 个参数，实际 ${params.length}`);
+    const [column, text, actorId, tplBytes, addOverhead, idTail, limit, action, target] = params;
+    if (!PROMPT_FIELDS_FOR_FAKE.includes(column)) throw new Error(`fake：未知列名 ${column}`);
+    if (typeof text !== 'string') throw new Error('fake：text 是 NOT NULL 列，不能是 undefined/null/数字');
+    if (Number(tplBytes) <= 0 || Number(addOverhead) <= 0 || Number(idTail) <= 0) {
+      throw new Error('fake：渲染预算三个常量必须是正整数（从 materializer 现算，不许抄）');
+    }
+    // prev 快照（无行 ⇒ `COALESCE(...,'')`，与 SQL 里的 LEFT JOIN + COALESCE 同形）。
+    // ★ 读 `this.row` 这一刻**就是** SQL 里 `snap` 取快照那一刻 ⇒ `P12` 的并发建模就是把这一刻接出去
+    //   （`prevOverride`），剩下的算术逐字走同一段。
+    const prev = prevOverride ?? this.snapshotForSave();
+    const next = { ...prev, [column]: text };
+    // SQL 里 `gate` 那段算术的等价实现（`octet_length` ≡ UTF-8 字节数）。
+    const rendered = column === 'title_prompt' ? 0
+      : (next.agents_md_override !== '' ? bytes(next.agents_md_override) : Number(tplBytes))
+        + (next.agents_md_addendum !== '' ? Number(addOverhead) + bytes(next.agents_md_addendum) : 0)
+        + Number(idTail);
+    const allowed = rendered <= Number(limit);
+    if (allowed && this.failAudit) throw new Error('fake：audit_log 写入失败（注入）');
+    let written = 0;
+    if (allowed) {
+      written = 1;
+      this.row = {
+        ...next,
+        updated_at: new Date('2026-11-16T09:00:00.000Z'),
+        updated_by: actorId ?? null,
+      };
+      this.audit.push({
+        actor_id: actorId ?? null,
+        action,
+        target,
+        // 真库这列是 jsonb（`encode(sha256(convert_to(...)))`）；这里保持同形状的 JSON 文本，
+        // 免得「形状变了」与「内容变了」两件事混成一条红（口径同 fake-pool 的 upload_settings 分支）。
+        details: JSON.stringify({
+          field: column,
+          text_bytes: bytes(text),
+          text_sha256: sha(text),
+          previous_bytes: bytes(prev[column]),
+          previous_sha256: sha(prev[column]),
+        }),
+      });
+    }
+    // `FROM gate LEFT JOIN upd ON TRUE` ⇒ 永远一行；被拒时 `upd` 那一半是 NULL。
+    const upd = allowed
+      ? { ...next, updated_at: this.row.updated_at, updated_by: this.row.updated_by ?? null }
+      : { agents_md_addendum: null, agents_md_override: null, title_prompt: null, updated_at: null, updated_by: null };
+    return {
+      rows: [{
+        written,
+        rendered_bytes: rendered,
+        audit_rows: allowed ? 1 : 0,
+        prev_text: prev[column],
+        ...upd,
+      }],
+    };
+  }
+
+  /** 除了保存那条 CTE，其余语句按 SQL 文本分发（读侧 + 保存后的通知面）。 */
+  dispatch(s, params) {
     // —— 读侧：单行表按 id = 1 取一行 ——
     if (s.includes('FROM platform_prompts')) {
       if (this.hangSelect) return new Promise(() => {});          // 发出去而**不返回**（超时判据用）
@@ -179,6 +228,26 @@ class PromptsFakePool {
   }
 
   async end() {}
+}
+
+/**
+ * 「N 条语句**同时在飞**」的栅栏：凑齐才放行，凑不齐就报错（不挂死）。
+ * 它存在的意义是把「假池把并发默默跑成串行」这种假绿变成红：串行 ⇒ 栅栏永远等不齐 ⇒ 就是这条消息。
+ */
+function makeArrivalBarrier(n, { timeoutMs = 2_000 } = {}) {
+  let left = n;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  return async () => {
+    if (--left <= 0) release();
+    const tooSlow = await Promise.race([
+      gate.then(() => false),
+      new Promise((resolve) => setTimeout(() => resolve(true), timeoutMs)),
+    ]);
+    if (tooSlow) {
+      throw new Error(`fake：并发栅栏只等到 ${n - left}/${n} 条保存同时在飞 ⇒ 这条路径被串行了（P12 的窗口不存在了）`);
+    }
+  };
 }
 
 const PROMPT_FIELDS_FOR_FAKE = ['agents_md_addendum', 'agents_md_override', 'title_prompt'];
@@ -366,8 +435,9 @@ test('P6 渲染超限（8 KiB 追加段 + 内置模板 > 16 KiB）⇒ 400 且**�
     row: { agents_md_addendum: '旧约定', agents_md_override: '', title_prompt: '', updated_at: null, updated_by: null },
   });
   // 字段自身上限（8192）**装得下**这条文本 ⇒ 拦住它的只能是渲染闸。
+  // 闸按**最坏情况**算（评审 F2）⇒ 期望值也得拿同一份预算算，不然是拿预览在验闸。
+  const budget = agentsMdGateRenderBudget();
   assert.equal(bytes(FULL_ADDENDUM), ADDENDUM_MAX_BYTES, '靶子正好 8192 字节，字段闸不拦');
-  const budget = agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME });
   assert.ok(
     agentsMdRenderedBytes(budget, { addendum: FULL_ADDENDUM, override: '' }) > AGENTS_MD_INJECT_MAX_BYTES,
     '前提：这条追加段与内置模板合起来确实超过注入上限',
@@ -422,8 +492,12 @@ test('P6 渲染超限（8 KiB 追加段 + 内置模板 > 16 KiB）⇒ 400 且**�
 });
 
 test('P6b 等价性：SQL 侧那条渲染算术与 renderHomeAgentsMd 的真实字节逐组同数', () => {
-  // SQL 在 `gate` 那段里自己算「渲染后多大」；这里逐组钉它与真渲染一致（口径同 0036 的 US-20）。
-  const budget = agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME });
+  // 逐组钉「JS 算子 ≡ JS 真渲染」（口径同 0036 的 US-20）。两份预算各配**同名**的渲染：
+  // 写侧闸那份配最坏情况名，DTO 预览那份配示例名。
+  //
+  // ⚠ 这条**只**管 JS 这一侧：SQL 里 `gate` 那段算术（`octet_length` / `convert_to`）在单测里**没有**
+  //   执行过——在这里拄一遍 SQL 算式只是把一份算术誊成两份。那半边由真库腿
+  //   `portal/integration/platform-prompts-db.mjs` 真的跑一次 `SAVE_SQL` 钉住（评审 F4 第 3 项）。
   const cases = [
     ['', ''],
     ['短', ''],
@@ -434,15 +508,75 @@ test('P6b 等价性：SQL 侧那条渲染算术与 renderHomeAgentsMd 的真实�
     ['\n\n', '\n'],
     ['中文与 emoji 🚀 的字节数不是字符数', ''],
   ];
-  for (const [addendum, override] of cases) {
-    const formula = agentsMdRenderedBytes(budget, { addendum, override });
-    const real = bytes(renderHomeAgentsMd({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME, addendum, override }));
-    assert.equal(formula, real, `addendum=${bytes(addendum)}B override=${bytes(override)}B 时算子必须与真渲染同数`);
+  const legs = [
+    ['写侧闸那份（最坏情况名）', agentsMdGateRenderBudget(), agentsMdGateFdeName()],
+    ['DTO 预览那份（示例名）', agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME }), AGENTS_MD_EXAMPLE_FDE_NAME],
+  ];
+  for (const [label, budget, fdeName] of legs) {
+    for (const [addendum, override] of cases) {
+      const formula = agentsMdRenderedBytes(budget, { addendum, override });
+      const real = bytes(renderHomeAgentsMd({ fdeName, addendum, override }));
+      assert.equal(formula, real,
+        `${label}：addendum=${bytes(addendum)}B override=${bytes(override)}B 时算子必须与真渲染同数`);
+    }
+    // 默认态：预算常量本身就等于那一档名字下今天那份文件的字节数
+    assert.equal(
+      budget.templateBytes + budget.identityTailBytes,
+      bytes(renderHomeAgentsMd({ fdeName })),
+      `${label}：默认态的预算常量就是那份文件的字节数`,
+    );
   }
-  // 默认态：预算常量本身就等于今天那份文件的字节数
+});
+
+test('P13 闸按最坏情况标识行而非示例名（评审 F2）：示例名装得下、最坏名装不下 ⇒ 400 且一格不写', async () => {
+  const gate = agentsMdGateRenderBudget();
+  const example = agentsMdRenderBudget({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME });
+  assert.ok(gate.identityTailBytes > example.identityTailBytes,
+    '前提：最坏情况那份标识行确实更长（否则本节是拿同一份预算自己对自己，恒真）');
+
+  // 靶子：一条「按示例名正好装得下、按最坏情况名装不下」的追加段（差值就是两条标识行的字节差）。
+  const fitsExample = AGENTS_MD_INJECT_MAX_BYTES - example.templateBytes
+    - example.addendumOverheadBytes - example.identityTailBytes;
+  const addendum = 'x'.repeat(fitsExample);
+  assert.equal(bytes(addendum), fitsExample);
+  assert.ok(bytes(addendum) <= ADDENDUM_MAX_BYTES, '它没超字段自身上限 ⇒ 拦住它的只能是渲染闸');
+  assert.equal(agentsMdRenderedBytes(example, { addendum, override: '' }), AGENTS_MD_INJECT_MAX_BYTES,
+    '示例名那一档：正好装得下（拿它当预算就是评审说的那个洞）');
+  const worst = agentsMdRenderedBytes(gate, { addendum, override: '' });
+  assert.ok(worst > AGENTS_MD_INJECT_MAX_BYTES, '最坏情况那一档：装不下 ⇒ 必须拒');
+
+  const pool = new PromptsFakePool({ row: { agents_md_addendum: '', agents_md_override: '', title_prompt: '' } });
+  await assert.rejects(
+    () => updatePlatformPrompts({ pool, field: 'addendum', text: addendum, actorId: ACTOR }),
+    (e) => e.code === 'validation_failed'
+      && e.details.field === 'text'
+      && e.details.rendered_bytes === worst
+      && e.details.render_limit_bytes === AGENTS_MD_INJECT_MAX_BYTES,
+    '按示例名会 200，按最坏情况必须 400（且 details 报的是最坏情况那个数）',
+  );
+  assert.equal(pool.row.agents_md_addendum, '', '**一格不写**（拒在写之前）');
+  assert.equal(pool.audit.length, 0, '被拒的保存不写审计');
+  assert.deepEqual(pool.statements.filter((r) => /INSERT INTO/.test(r.sql)), [], '一条写语句都没发');
+
+  // ★ SQL 送参里那份标识行字节 = 最坏情况那份（不是示例名那份）。取一次**成功**的保存看参数。
+  const ok = new PromptsFakePool({ row: { agents_md_addendum: '', agents_md_override: '', title_prompt: '' } });
+  await updatePlatformPrompts({ pool: ok, field: 'addendum', text: 'x'.repeat(1000), actorId: ACTOR });
+  const save = ok.statements.find((r) => /INSERT INTO platform_prompts/.test(r.sql));
+  assert.ok(save, '这条要真走到 SQL（否则下面三条参数断言都是恒真）');
+  assert.equal(save.params[5], gate.identityTailBytes, '$6 标识行尾部必须是**最坏情况**那一份');
+  assert.notEqual(save.params[5], example.identityTailBytes,
+    '不得是示例名那一份（差 = 最长合法工位名比 `example` 长出来的字节）');
+  assert.equal(save.params[3], gate.templateBytes, '$4 模板字节与 $6 来自同一份预算');
+  assert.equal(save.params[6], AGENTS_MD_INJECT_MAX_BYTES, '$7 渲染上限仍是注入上限');
+
+  // 标识行的长度来自 `FDE_NAME_RE` 这条单一真相，不是手拄的 63。
+  assert.equal(agentsMdGateFdeName().length, FDE_NAME_MAX_LEN, '最坏情况名 = 最长合法工位名');
+  assert.ok(FDE_NAME_RE.test(agentsMdGateFdeName()), '那个名字本身必须是合法工位名（否则是在拿非法输入当上界）');
+  assert.ok(!FDE_NAME_RE.test(`a`.repeat(FDE_NAME_MAX_LEN + 1)), '再长一个字符就不合法 ⇒ 这一档真的是上界');
   assert.equal(
-    budget.templateBytes + budget.identityTailBytes,
-    bytes(renderHomeAgentsMd({ fdeName: AGENTS_MD_EXAMPLE_FDE_NAME })),
+    gate.identityTailBytes - example.identityTailBytes,
+    bytes(agentsMdGateFdeName()) - bytes(AGENTS_MD_EXAMPLE_FDE_NAME),
+    '两份预算只差标识行里的工位名字节（其余常量逐字相同）',
   );
 });
 
@@ -520,41 +654,72 @@ test('P9 跨包对账：portal 的注入上限 == runner/lib/agents-md.js 的 AG
 // 3. 写侧的原子性与通知面（`P8` / `P10`）
 // ---------------------------------------------------------------------------
 
-test('P8 保存 = 一条语句：写 platform_prompts、旧值快照、审计全在同一次 pool.query 里（审计恰好 1 行）', async () => {
-  // 标题提示词不涉物化 ⇒ 整次保存的 pool.query 应该**恰好 1 次**。
-  const pool = new PromptsFakePool();
-  const saved = await updatePlatformPrompts({ pool, field: 'titlePrompt', text: '只用一句中文标题。', actorId: ACTOR });
-  assert.equal(pool.statements.length, 1, `恰好一次 pool.query，实际 ${pool.statements.length}`);
-  const save = pool.statements[0].sql;
-  assert.match(save, /INSERT INTO platform_prompts/, '那一格写在这一条里');
-  assert.match(save, /INSERT INTO audit_log/, '审计也写在这一条里（⇒ 调用方不得再补 auth.audit）');
-  assert.match(save, /FOR UPDATE/, '旧值必须带行锁快照（并发保存才不会把 previous_* 记成自己进来之前）');
-  assert.equal(pool.audit.length, 1, 'audit_log 恰好 1 行');
-  assert.equal(pool.audit[0].action, AUDIT_ACTION);
-  assert.equal(pool.audit[0].target, AUDIT_TARGET);
-  const details = JSON.parse(pool.audit[0].details);
+test('P8 保存：写 platform_prompts 与审计在同一次 pool.query 里（三条字段路径逐条点名）', async () => {
+  // ★ 判据本体是「**设置写与审计在同一条语句里**」，不是「整次保存只有一条 query」（评审 F4 第 2 项）：
+  //   涉物化那两格本来就要 ① JS 预闸预读对面那一列的当前值 ② 列启用中的 FDE ③ 每台两条入队语句
+  //   （bump revision + 写 outbox）。把「恰好一次 pool.query」当判据会把这条路径写死成不可扩展。
+  //   ⇒ 这里数的是「**写 platform_prompts 的语句恰好 1 条**」，并把其余那几条**逐条点名**（多一条也红）。
+  const countOf = (pool) => ({
+    saves: pool.statements.filter((r) => /INSERT INTO platform_prompts/.test(r.sql)).length,
+    audits: pool.statements.filter((r) => /INSERT INTO audit_log/.test(r.sql)).length,
+    preReads: pool.statements.filter((r) => /^SELECT agents_md_addendum/.test(r.sql)).length,
+    fdeList: pool.statements.filter((r) => /FROM users/.test(r.sql)).length,
+    revisions: pool.statements.filter((r) => /INSERT INTO materialize_revisions/.test(r.sql)).length,
+    outbox: pool.statements.filter((r) => /INSERT INTO materialize_outbox/.test(r.sql)).length,
+    total: pool.statements.length,
+    auditRows: pool.audit.length,
+  });
+  const assertSameStatement = (pool) => {
+    const saves = pool.statements.filter((r) => /INSERT INTO platform_prompts/.test(r.sql));
+    const audits = pool.statements.filter((r) => /INSERT INTO audit_log/.test(r.sql));
+    assert.equal(saves.length, 1, '写 platform_prompts 的语句恰好 1 条');
+    assert.equal(audits.length, 1, '写 audit_log 的语句恰好 1 条');
+    assert.equal(audits[0].sql, saves[0].sql, '设置与审计是**同一条**语句（拆两条 = 退回旧的两个洞）');
+    assert.match(saves[0].sql, /FOR UPDATE/, '旧值必须带行锁快照（并发保存才不会把 previous_* 记成自己进来之前）');
+    assert.equal(pool.audit.length, 1, 'audit_log 恰好 1 行');
+  };
+
+  // —— 路径①：`title_prompt`（不进 `~/AGENTS.md` ⇒ 不预读、不入队）——
+  const titlePool = new PromptsFakePool();
+  const saved = await updatePlatformPrompts({ pool: titlePool, field: 'titlePrompt', text: '只用一句中文标题。', actorId: ACTOR });
+  assertSameStatement(titlePool);
+  assert.deepEqual(countOf(titlePool), {
+    saves: 1, audits: 1, preReads: 0, fdeList: 0, revisions: 0, outbox: 0, total: 1, auditRows: 1,
+  }, '这一格只可能有一条语句：预读与入队都只属于渲染那两格（多出来的每一条都要在这里点名）');
+  assert.equal(saved.materializeEnqueued, 0, 'title-prompt 不涉物化 ⇒ 不入队');
+  const details = JSON.parse(titlePool.audit[0].details);
+  assert.equal(titlePool.audit[0].action, AUDIT_ACTION);
+  assert.equal(titlePool.audit[0].target, AUDIT_TARGET);
   assert.deepEqual(Object.keys(details).sort(), ['field', 'previous_bytes', 'previous_sha256', 'text_bytes', 'text_sha256'],
     '审计只存摘要不存正文（契约 §4：16 KiB × 2 塞进 jsonb 不值）');
   assert.equal(details.field, 'title_prompt');
   assert.equal(details.text_sha256, sha('只用一句中文标题。'));
   assert.equal(details.previous_sha256, sha(''), '第一次保存的前一份就是空串');
-
-  // 第二次保存：previous_* 必须是**紧邻的前一个值**（审计存在的唯一理由）。
-  await updatePlatformPrompts({ pool, field: 'titlePrompt', text: '换一版。', actorId: ACTOR });
-  const details2 = JSON.parse(pool.audit[1].details);
+  // 第二次保存：previous_* 必须是**紧邻的前一个值**（审计存在的唯一理由），且仍然每次恰好一条。
+  await updatePlatformPrompts({ pool: titlePool, field: 'titlePrompt', text: '换一版。', actorId: ACTOR });
+  const details2 = JSON.parse(titlePool.audit[1].details);
   assert.equal(details2.previous_sha256, sha('只用一句中文标题。'));
   assert.equal(details2.previous_bytes, bytes('只用一句中文标题。'));
-  assert.equal(pool.audit.length, 2, '每次保存恰好一条审计，不多写');
+  assert.equal(titlePool.audit.length, 2, '每次保存恰好一条审计，不多写');
+  assert.equal(countOf(titlePool).saves, 2, '两次保存 = 两条写语句（一条都不能多）');
 
-  // 涉物化的那一格：写 + 审计仍然只有**一条**语句（后面才是入队的那几条）
-  const pool2 = new PromptsFakePool();
-  await updatePlatformPrompts({ pool: pool2, field: 'addendum', text: '新约定', actorId: ACTOR });
-  const writes = pool2.statements.filter((r) => /INSERT INTO platform_prompts/.test(r.sql));
-  const auditWrites = pool2.statements.filter((r) => /INSERT INTO audit_log/.test(r.sql));
-  assert.equal(writes.length, 1, '写语句一条');
-  assert.equal(auditWrites.length, 1, '审计一条，且');
-  assert.equal(auditWrites[0].sql, writes[0].sql, '审计与写入是**同一条**语句（分成两条 = 退回旧的两个洞）');
-  assert.equal(saved.materializeEnqueued, 0, 'title-prompt 不涉物化 ⇒ 不入队');
+  // —— 路径②：`agents_md_addendum`（预读 + 写 + 列 FDE + 每台两条入队）——
+  const addPool = new PromptsFakePool({ fdes: ['f1', 'f2'] });
+  const savedAdd = await updatePlatformPrompts({ pool: addPool, field: 'addendum', text: '新约定', actorId: ACTOR });
+  assertSameStatement(addPool);
+  assert.deepEqual(countOf(addPool), {
+    saves: 1, audits: 1, preReads: 1, fdeList: 1, revisions: 2, outbox: 2, total: 7, auditRows: 1,
+  }, '预读 1（拿覆写列的当前值）+ 写 1 + 列 FDE 1 + 每台 2×2 入队 ⇒ 总共 7 条（口径逐条定死）');
+  assert.equal(savedAdd.materializeEnqueued, 2);
+
+  // —— 路径③：`agents_md_override`（同一条路径，0 台启用中的工位 ⇒ 入队那四条不该存在）——
+  const ovrPool = new PromptsFakePool();
+  const savedOvr = await updatePlatformPrompts({ pool: ovrPool, field: 'agentsMd', text: '# 整段覆写', actorId: ACTOR });
+  assertSameStatement(ovrPool);
+  assert.deepEqual(countOf(ovrPool), {
+    saves: 1, audits: 1, preReads: 1, fdeList: 1, revisions: 0, outbox: 0, total: 3, auditRows: 1,
+  }, '没有启用中的工位时不得凭空多出几条入队语句（列 FDE 那一条仍要在：它是“为什么是 0”的证据）');
+  assert.equal(savedOvr.materializeEnqueued, 0);
 });
 
 test('P8b 审计写不进去 ⇒ 整条语句失败而设置一格没变（语句级原子）', async () => {
@@ -569,6 +734,74 @@ test('P8b 审计写不进去 ⇒ 整条语句失败而设置一格没变（语�
   assert.equal(pool.row.agents_md_addendum, '旧', '设置没被改（这正是"一条语句"存在的理由）');
 });
 
+// ---------------------------------------------------------------------------
+// `P12`：首写并发（评审 F1）。假池里两种快照 = 「已种行」（迁移 0039 现在的形态）与「无行」
+// （加种行之前的形态）：同一个假池、同一对输入，一边绿一边病 ⇒ 钉住的才是「种行」这件事本身。
+// 真并行与真行锁在 `portal/integration/platform-prompts-db.mjs`（真库腿）钉；这里钉的是语义。
+// ---------------------------------------------------------------------------
+
+/** 迁移 0039 种下的那一行：三列都是 DEFAULT `''`（= 跟随内置）。 */
+const SEEDED_ROW = () => ({
+  agents_md_addendum: '', agents_md_override: '', title_prompt: '', updated_at: null, updated_by: null,
+});
+
+const saveAudit = (pool) => pool.audit.map((r) => JSON.parse(r.details));
+
+test('P12a 同字段并发首写（已种行）⇒ 后落笔那条的 previous_* 是前一条的正文，不是空串', async () => {
+  const texts = ['第一版平台约定', '第二版平台约定'];
+  const run = (pool) => Promise.all(texts.map((text) => updatePlatformPrompts({ pool, field: 'addendum', text, actorId: ACTOR })));
+
+  const pool = new PromptsFakePool({ row: SEEDED_ROW(), concurrent: 2 });
+  const saved = await run(pool);
+  assert.equal(saved.length, 2, '两条保存都成功（一条也不该被拒）');
+  assert.equal(pool.statements.filter((r) => /INSERT INTO platform_prompts/.test(r.sql)).length, 2,
+    '两条保存语句都真到了库里（假池的到达栅栏会卡住“默默串行”的形状）');
+  assert.equal(pool.audit.length, 2, '每次保存恰好一条审计 ⇒ 两条就是两条');
+  const audits = saveAudit(pool);
+  const textOf = (digest) => texts.find((t) => sha(t) === digest) ?? null;
+  // 提交顺序 = 审计写入顺序（审计与写入是同一条语句），所以 audits[0] 就是先落笔那一条。
+  assert.equal(audits[0].previous_sha256, sha(''), '先落笔那条看到的本来就是「没人配过」（种下来的是空行）');
+  assert.notEqual(audits[1].previous_sha256, sha(''),
+    '★ 后落笔那条的 previous_* 是空串 = 前一条被丢了（评审 F1 的丢更新形状）');
+  assert.equal(audits[1].previous_sha256, audits[0].text_sha256,
+    '★ previous_* 必须是前一条的正文指纹（审计存在的唯一理由）');
+  assert.ok(textOf(audits[1].previous_sha256), 'previous_sha256 必须是本次两条正文里的那一条（不是任何第三份值）');
+  assert.equal(audits[1].previous_bytes, bytes(textOf(audits[1].previous_sha256)),
+    'previous_bytes 与 previous_sha256 得说同一件事');
+  // 不假设谁先谁后：只要求「库里那份 = 后落笔那一条写的」。
+  assert.equal(sha(pool.row.agents_md_addendum), audits[1].text_sha256, '最后一笔赢，但绝不赢在空串上');
+
+  // ★ 反向自证：同一个假池、同一对输入，把种子行拿掉（= 未种行的旧形态）⇒ 病必须复现得出来。
+  //   复现不出来才真正可怕：那意味着上面那条绿是假池太宽松给的，不是种行给的。
+  const old = new PromptsFakePool({ row: null, concurrent: 2 });
+  await run(old);
+  const oldAudits = saveAudit(old);
+  assert.equal(oldAudits.length, 2, '两条也各写一条审计（审计不会少，会错）');
+  assert.equal(oldAudits[1].previous_sha256, sha(''),
+    '无行 ⇒ `FOR UPDATE` 锁不到任何东西 ⇒ 两条各拿一份空快照 ⇒ 后一条把前一条记成「之前没人配过」');
+});
+
+test('P12b 跨字段并发首写（已种行）⇒ 两格都在，先写那一格没被后一条刷成空', async () => {
+  const run = (pool) => Promise.all([
+    updatePlatformPrompts({ pool, field: 'addendum', text: 'A：平台补充约定', actorId: ACTOR }),
+    updatePlatformPrompts({ pool, field: 'titlePrompt', text: 'B：只用一句中文标题。', actorId: ACTOR }),
+  ]);
+
+  const pool = new PromptsFakePool({ row: SEEDED_ROW(), concurrent: 2 });
+  await run(pool);
+  assert.equal(pool.row.agents_md_addendum, 'A：平台补充约定', '后写那条不得把别人那一格刷掉');
+  assert.equal(pool.row.title_prompt, 'B：只用一句中文标题。');
+  assert.equal(pool.audit.length, 2, '两格各一条审计');
+  assert.deepEqual(saveAudit(pool).map((d) => d.field).sort(), ['agents_md_addendum', 'title_prompt']);
+
+  // ★ 反向自证（未种行的旧形态）：后一条拿的是空快照 ⇒ 它把先写那一格当「本来就没值」刷掉了。
+  const old = new PromptsFakePool({ row: null, concurrent: 2 });
+  await run(old);
+  const wiped = ['agents_md_addendum', 'title_prompt'].filter((c) => old.row[c] === '');
+  assert.equal(wiped.length, 1, `丢更新：两格里必须恰好被刷掉一格（实际 ${JSON.stringify(old.row)}）`);
+  assert.equal(saveAudit(old)[1].previous_sha256, sha(''), '跨字段也一样：后一条的 previous_* 记的是空串');
+});
+
 test('P10 入队条数 = 启用中的 FDE 数；入队抛错 ⇒ 保存仍然成功 + materializeEnqueued=0 + warn', async () => {
   const pool = new PromptsFakePool({ fdes: ['f1', 'f2', 'f3'] });
   const saved = await updatePlatformPrompts({ pool, field: 'addendum', text: '约定', actorId: ACTOR });
@@ -576,7 +809,12 @@ test('P10 入队条数 = 启用中的 FDE 数；入队抛错 ⇒ 保存仍然成
   assert.equal(pool.outbox.length, 3);
   const outboxParams = pool.outbox.map((r) => r.params);
   assert.deepEqual(outboxParams.map((p) => p[0]).sort(), ['f1', 'f2', 'f3'], '每条都点名一台 FDE');
-  assert.ok(pool.outbox.every((r) => /'upsert'|"upsert"|upsert/.test(JSON.stringify(r.params)) || true), 'op = upsert');
+  // ★ `op` 必须是字面量 `upsert`（`outbox.js` 的 `enqueueMaterializeOp` 把 op 放在 `$2`）。
+  //   旧写法 `/upsert/.test(JSON.stringify(params)) || true` 里那个 `|| true` 把整句变成恒真 ⇒ 这条
+  //   什么都没断（op 漂成 `delete` 也照绿）。现在逐条比字面量。
+  assert.deepEqual(outboxParams.map((p) => p[1]), ['upsert', 'upsert', 'upsert'],
+    'op 逐条必须是 upsert（重物化不是销号：runner 侧按这个字面量决定要不要重建文件）');
+  assert.deepEqual(outboxParams.map((p) => p[3]), ['{}', '{}', '{}'], 'payload 空对象（latest-wins，不携带正文）');
   assert.equal(pool.revisions.length, 3, '每条都先 bump 该 FDE 的 revision head（latest-wins 语义）');
 
   // 入队抛错：保存**仍然成功**（设置本身就是真相，入队只是通知）
