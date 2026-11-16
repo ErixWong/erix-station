@@ -568,6 +568,29 @@ export const en = {
       interrupted: 'Interrupted',
       unknown: 'Unknown state',
     },
+    // issue #592: live sub-task badge (tail of RunStatusBar) + expanded panel (below it).
+    // State wording is **reused** from `state.*` above; `{count}` here is the number of **live**
+    // children (same ruler as `lib/delegate.ts#DELEGATE_LIVE_STATES`; terminal ones don't count).
+    activity: {
+      title: 'Sub-tasks {count}',
+      // "cannot read" and "there are none" need different wording (badge degraded state;
+      // design §4.2 last paragraph + the D9 rule).
+      titleUnknown: 'Sub-tasks ?',
+      toggleUnknown: 'Show or hide the sub-task panel (status temporarily unavailable)',
+      panelTitle: 'Sub-tasks {count}',
+      toggle: 'Show or hide the sub-task panel ({count} running)',
+      hint: 'Refreshes every 2s; shows only sub-tasks dispatched by the current run',
+      collapse: 'Collapse',
+      // 行里前面已经有一个状态词（`delegate.state.running` = "Running"），所以这里**不许**再说
+      // "running"（真机上渲染成 `Running running 20.0s`）；中文那份是 `已跑 {dur}`，无此问题。
+      elapsed: 'for {dur}',
+      view: 'View',
+      viewAria: 'View sub-task {id}',
+      unreadable: 'Sub-task status is temporarily unavailable',
+      // The roster still says live while the parent run already ended (a background child dies with the
+      // parent process, so `finishRun` never runs). It means "status unknown" — not failed, not running.
+      staleParentEnded: 'Parent run has ended; status unknown',
+    },
   },
   preview: {
     title: 'Preview {path}',
@@ -781,6 +804,8 @@ export const en = {
       // issue #595 M2: capability market console (views/AdminMarketView.vue, contract §7 admin API).
       // After the upload limit and before the read-only pool view: it is platform configuration.
       market: 'Capability market',
+      // issue #586: About (the three version cells, read-only); views/AdminAboutView.vue.
+      about: 'About',
       // issue #528 (event platform W5): admin tabs for macro templates / macro runs (`07` §21.1 key table).
       macros: 'Macro templates',
       macroRuns: 'Macro runs',
@@ -1159,6 +1184,48 @@ export const en = {
         freeList: 'the free block list is longer than the free count',
         hasMore: 'has_more=true but the free count is not greater than the number of listed items',
       },
+    },
+    // issue #586: the "About" panel (views/AdminAboutView.vue, contract docs/api/portal.md §4.16).
+    // The point is not "there is a version number" but **which of the three cells this is and where it
+    // was read from**: the v0.1.69 release baked a working tree stuck at 0.1.68 and the two sides
+    // disagreed for an hour with nothing in the UI to reveal it.
+    about: {
+      title: 'About this station',
+      intro: 'Read-only. Three version numbers, three sources, none replaces another: the server and the platform engine come from the build-info.json baked into the portal image; each FDE engine comes from a derived copy in the database.',
+      loading: 'Loading version info…',
+      notLoaded: 'Version info not loaded yet (no request has been made).',
+      fieldVersion: 'Version',
+      fieldRevision: 'Build revision (git)',
+      fieldBuiltAt: 'Built at',
+      unknown: 'unknown',
+      unparsable: 'Unparsable: {value}',
+      serverTitle: 'Server (portal image)',
+      serverHint: 'Which build the portal container itself is running.',
+      sourceBuildInfo: 'Source: build-info.json inside the image (build artifact, the only authority)',
+      sourceEnv: 'Source: an explicit environment override (tests / pinning), not what was baked into the image',
+      sourcePackage: 'Source: local package.json (dev fallback, not a build artifact)',
+      sourceUnknown: 'Source: unknown (neither build-info.json nor package.json could be read)',
+      sourceUnknownShape: 'Source: the server did not say, or said something unrecognized (not guessed)',
+      // The build-info path actually read (STATION_BUILD_INFO_PATH / ERIX_BUILD_INFO_PATH can move it => it must stay visible).
+      buildInfoPath: 'Read path: {path}',
+      engineTitle: 'Platform engine (erix-agent inside the portal image)',
+      engineHint: 'The engine the portal process itself uses. Not the one running in each FDE container - that is the third section.',
+      // Engine provenance wording follows the label the server derived (the frontend never infers);
+      // package.json = dev fallback, or this image never baked a build-info.json at all (old image).
+      engineSourceBuildInfo: 'Source: engine_version from build-info.json inside the image (build artifact, the only authority)',
+      engineSourcePackage: 'Source: local node_modules/erix-agent/package.json - a dev fallback, or this image has no build-info.json at all (old image); it is not a build artifact',
+      engineSourceEnv: 'Source: an environment override (it should not appear on the portal side; when it does, this is not a build artifact)',
+      engineSourceUnknown: 'Source: unknown (neither build-info.json nor package.json could be read)',
+      engineSourceUnknownShape: 'Source: the server did not say, or said something unrecognized (not guessed)',
+      fdesTitle: 'Engine per FDE',
+      fdesHint: 'Read from containers.agent_version - a derived copy, not authoritative.',
+      snapshotProvision: 'provision-time snapshot',
+      snapshotUnknown: 'no provenance given',
+      fdeProvisionedAt: 'provisioned {at}',
+      revoked: 'revoked',
+      fdesEmpty: 'The server says there are no FDE containers.',
+      fdesUnreadable: 'containers.agent_version could not be read (that is "unreadable", not "no FDEs").',
+      caveat: 'Provenance: the only authority is the build-info.json baked into the image; package.json is a build input, while git tags, image tags, digests and containers.agent_version are derived copies and must be labelled as such.',
     },
     llm: {
       sectionTitle: 'LLM providers',

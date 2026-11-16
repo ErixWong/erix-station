@@ -52,6 +52,9 @@ const tabs = [
   // issue #529（事件平台 W6）：宏模板配置 + 宏执行历史。追加在末尾（模板 → 执行历史）。
   { name: 'admin-macros', label: 'admin.tabs.macros' },
   { name: 'admin-macro-runs', label: 'admin.tabs.macroRuns' },
+  // issue #586：「关于」（版本三格，只读）。排在所有能操作的 tab 之后：它不帮人做决定，
+  // 只在「现在跑的到底是哪份构建」出问题时被点开（v0.1.69 那次分裂的那一小时）。
+  { name: 'admin-about', label: 'admin.tabs.about' },
 ] as const;
 
 async function onLogout() {
