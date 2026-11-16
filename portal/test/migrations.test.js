@@ -1089,9 +1089,10 @@ test('迁移 0033-delta-events-not-persisted：形态 M 是纯清理（零 DDL�
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0033 存在');
   // ⚠ 0034（`prune-stale-run-checkpoints`）追加之后，本行从「0033 是最后一支」改成「0033 是倒数第二支」；
-  // 0035（`macro-platform`，issue #524）追加之后，本行再退一支 —— 口径不变：靠**绝对位置**钉住。
-  // 而不是「0033 必须永远排末位」——后者已经被上面那 19 处 head 断言接管（它们现在钉 0035）。
-  assert.equal(files[files.length - 4], file, '0033 是倒数第四支（0034 / 0035 / 0036 追加在它后面，不许回头插队）');
+  // 0035（`macro-platform`，issue #524）追加之后本行退一支；0037（`notifications-and-origin`，
+  // issue #526）再退一支 —— 口径不变：靠**绝对位置**钉住。
+  // 而不是「0033 必须永远排末位」——后者已经被上面那 19 处 head 断言接管（它们现在钉 0037）。
+  assert.equal(files[files.length - 5], file, '0033 是倒数第五支（0034 / 0035 / 0036 / 0037 追加在它后面，不许回头插队）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里"索引""VACUUM"这些词都会出现，整文件 indexOf 会假绿）。
@@ -1151,7 +1152,7 @@ test('迁移 0034-prune-stale-run-checkpoints：纯清理（零 DDL）、cutoff 
   const file = '0034-prune-stale-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0034 存在');
-  assert.equal(files[files.length - 3], file, '0034 是倒数第三支（新迁移只能追加，不回改已应用的编号）；0035 / 0036 之后它离末位两格');
+  assert.equal(files[files.length - 4], file, '0034 是倒数第四支（新迁移只能追加，不回改已应用的编号）；0035 / 0036 / 0037 之后它不再是末位');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里 "VACUUM""索引""DELETE" 这些词都会出现，整文件判会假绿/假红）。
@@ -1225,7 +1226,7 @@ test('迁移 0035-macro-platform：三表齐全、两条唯一键在、FK 的 ON
   const file = '0035-macro-platform.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0035 存在');
-  assert.ok(files.includes(file), '0035-macro-platform 仍在编号序列里（「谁是最后一支」由 0036 那节钉，一节里两份承诺下一支迁移必然红两格）');
+  assert.equal(files[files.length - 3], file, '0035 是倒数第三支（0036 / 0037 追加在它后面；新迁移只能追加，不回改已应用的编号）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 去掉**整行注释**（保留 `$$ ... $$` 内部语句），否则「注释里提到 DROP TABLE」会被误判。
