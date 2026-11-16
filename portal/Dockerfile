@@ -6,6 +6,22 @@ WORKDIR /build/portal/frontend
 COPY portal/frontend/package.json portal/frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY portal/frontend/ ./
+# ---- issue #589 止血：`@shared` 别名的目标目录必须进得了镜像 ----
+# ① 为什么目标是 `../shared/`（而不是 `./shared/`）：本阶段的 WORKDIR 是上面的 `WORKDIR /build/portal/frontend`
+#    （= `COPY portal/frontend/ ./` 的落点），而前端 `vite.config.ts:17` 把别名定成
+#    `alias: { '@shared': new URL('../shared/', import.meta.url).pathname }` ⇒ 别名目标 = `portal/frontend/` 的
+#    **同级** `portal/shared/`，镜像里就是 WORKDIR 的上一层再进 `shared` = `/build/portal/shared`。
+#    所以本行的源与目标都**与 vite.config 同源**：改 WORKDIR、改别名、或把前端换一层目录，这行都要跟着动。
+# ② 这一行是 issue #589 的止血（main 于 `04c7d83` 红）：`portal/shared/` 是 PR #582（issue #528 枚举单源）
+#    才新建的目录，前端 7 个文件随之 `import … from '@shared/macro-kinds'`，但本阶段只
+#    `COPY portal/frontend/ ./`（`portal/shared/` 在它外面）⇒ 镜像里没那个目录 ⇒ `vite build` 报
+#    `UNLOADABLE_DEPENDENCY: Could not load ../shared/macro-kinds` ⇒ **镜像构建不出来**（CI run 43817003603
+#    的「构建校验：station-portal 镜像」步）。此前 `portal/shared/` 不存在，所以「只拷 frontend」曾经是成立的。
+# ③ 以后**新增 `@shared` 目标（或任何指向 `portal/frontend/` 外面的构建期依赖）必须同步这里**，而不靠人肉记
+#    忆：根 `test/portal-shared-copy.test.js` 扫 `portal/frontend/src/**` 的全部 `@shared` 引用，要求每个目标
+#    既在盘上存在、又被本阶段某条**排在 `RUN npm run build` 之前**的 COPY 送到别名解析得到的那个路径
+#    （它自带反向自证：删/歪/延后本行都必须判不合格）。
+COPY portal/shared/ ../shared/
 RUN npm run build
 
 # portal 镜像：node:22-slim。
