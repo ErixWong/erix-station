@@ -45,6 +45,18 @@ function rosterItem(overrides: Record<string, unknown> = {}) {
 
 const fetchMock = vi.fn();
 
+/**
+ * 取**可见面**再断言：`html()` 会把**模板注释**一起返回，而注释里的字符不是界面内容。
+ *
+ * ⚠ 为什么必须剥注释：`NODE_ENV=development` 下 Vue 编译器**保留**模板注释，`production` 下**剔掉**它们
+ * ——同一行断言会在两种 env 下一个绿一个红（实际踩过：模板注释里写了个「无 ⚠」，把「面板里不许出现 ⚠」
+ * 那条判据当场打红，而在 `NODE_ENV=production` 的 shell 里却看不出来）。判据要的是「可见内容里没有告警
+ * 图标」，所以先剔注释再比：以后谁在注释里写什么字符（⚠ / 🔧 / 颜色类）都不该误红。
+ */
+function visibleHtml(node: { html(): string }): string {
+  return node.html().replace(/<!--[\s\S]*?-->/g, '');
+}
+
 function jsonResponse(status: number, body: unknown) {
   return {
     ok: status >= 200 && status < 300,
@@ -277,8 +289,8 @@ describe('必修 1：首次就失败 ⇒ 降级态必须可达（设计 §4.2「
     await badge.trigger('click'); // 徒标是唯一入口：它必须还能点开面板
     const panel = wrapper.get('[data-testid="delegate-activity-panel"]');
     expect(panel.text()).toContain(COPY.unreadable);
-    expect(panel.html()).not.toContain('text-red-600');
-    expect(panel.html()).not.toContain('⚠');
+    expect(visibleHtml(panel)).not.toContain('text-red-600');
+    expect(visibleHtml(panel)).not.toContain('⚠');
     // 降级态下标题也不拿 0 冒充「没有」。
     expect(panel.text()).toContain(COPY.titleUnknown);
   });
@@ -457,8 +469,8 @@ describe('判据 15/16：pending 卡触发与失败静默', () => {
     expect(wrapper.findAll('li')).toHaveLength(1); // 行仍然保留（静默保留上次数据）
     // 灰字不是告警：整块面板里不许出现红色类（子 run 是加分项，读不到不该把父界面打成故障态）。
     const panel = wrapper.get('[data-testid="delegate-activity-panel"]');
-    expect(panel.html()).not.toContain('text-red-600');
-    expect(panel.html()).not.toContain('border-red');
-    expect(panel.html()).not.toContain('⚠');
+    expect(visibleHtml(panel)).not.toContain('text-red-600');
+    expect(visibleHtml(panel)).not.toContain('border-red');
+    expect(visibleHtml(panel)).not.toContain('⚠');
   });
 });
