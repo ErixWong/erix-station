@@ -1033,8 +1033,17 @@ export const en = {
       sourcePackage: 'Source: local package.json (dev fallback, not a build artifact)',
       sourceUnknown: 'Source: unknown (neither build-info.json nor package.json could be read)',
       sourceUnknownShape: 'Source: the server did not say, or said something unrecognized (not guessed)',
+      // The build-info path actually read (STATION_BUILD_INFO_PATH / ERIX_BUILD_INFO_PATH can move it => it must stay visible).
+      buildInfoPath: 'Read path: {path}',
       engineTitle: 'Platform engine (erix-agent inside the portal image)',
       engineHint: 'The engine the portal process itself uses. Not the one running in each FDE container - that is the third section.',
+      // Engine provenance wording follows the label the server derived (the frontend never infers);
+      // package.json = dev fallback, or this image never baked a build-info.json at all (old image).
+      engineSourceBuildInfo: 'Source: engine_version from build-info.json inside the image (build artifact, the only authority)',
+      engineSourcePackage: 'Source: local node_modules/erix-agent/package.json - a dev fallback, or this image has no build-info.json at all (old image); it is not a build artifact',
+      engineSourceEnv: 'Source: an environment override (it should not appear on the portal side; when it does, this is not a build artifact)',
+      engineSourceUnknown: 'Source: unknown (neither build-info.json nor package.json could be read)',
+      engineSourceUnknownShape: 'Source: the server did not say, or said something unrecognized (not guessed)',
       fdesTitle: 'Engine per FDE',
       fdesHint: 'Read from containers.agent_version - a derived copy, not authoritative.',
       snapshotProvision: 'provision-time snapshot',

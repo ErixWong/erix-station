@@ -3021,6 +3021,7 @@ git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什�
 {
   "server": { "station": "0.1.69", "revision": "02fd33ec…", "builtAt": "2026-11-16T03:45:00Z", "source": "build-info" },
   "platformEngine": { "version": "0.33.0" },
+  "buildInfoPath": "/app/build-info.json",
   "fdes": [
     { "name": "eric", "agentVersion": "0.33.0", "image": "ghcr.io/…@sha256:…",
       "provisionedAt": "2026-11-16T02:00:00.000Z", "lastHeartbeatAt": "2026-11-16T04:00:00.000Z",
@@ -3036,6 +3037,18 @@ git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什�
   假值比空值毒（`runner/lib/build-info.js` 顶部记的 `0.1.0` 事故）。
 - `server.source` ∈ `build-info` | `env` | `package` | `unknown`：这一格到底从哪儿读的。镜像里应当是
   `build-info`；本地源码态是 `package`（此时 `revision`/`builtAt` 必然是 `unknown`，**那是事实**）。
+  portal 侧在入口**屏蔽** `ERIX_AGENT_VERSION`（那是 provisioner 注入给 FDE 容器的旋钮，
+  `portal/src/provisioner.js:281`），所以这里的引擎号不可能来自环境变量冒充（评审阻断一）。
+- **`provenance.server` / `provenance.platformEngine` 是由 `source` 推导的，不是常量**（复验阻断）：
+  `build-info → "build-info.json"`、`package → "package.json"`、`env → "env"`、认不出 → `"unknown"`。
+  写死 `'build-info.json'` 在**本 PR 之前构建的旧 portal 镜像**上就是说谎——那份镜像里根本没有
+  `build-info.json`，读取退到 `node_modules/erix-agent/package.json`，面板上的引擎号确实是它。
+  ⚠ `source` 是**整次读取共用的**（`readBuildInfo()` 只出一个），所以这两格**必然同源**（同一个文件）；
+  `provenance` 里 `package.json` 那一支就是「这是源码态退路 / 旧镜像，不是镜像构建产物」的显式说法。
+- `buildInfoPath` = **实际去读的那条路径**（`STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH` /
+  代码入参三个旋钮都能改它，前两个是契约测试的注入点 ⇒ 「路径被改过」必须在界面上可见）。
+  它只证明「读了这条路径」，**证明不了「读到了」**——读到没有看 `provenance`。`/api/health` **不带**这一格
+  （公开端点不泄露部署路径，§5.1 的形状仍是 `station`/`revision`/`builtAt` 三格）。
 - `fdesPresent:false` ⇒ 这一段**读不到**（查 `containers` 抛错），与「服务端说没有 FDE」（`fdesPresent:true`
   + 空数组）是两件事（#350 同口径）；本端点因此**始终 200**，不把面板打成 500。
 - `snapshot:"provision"` 是**机器可读的口径标注**，前端据此必须渲染「provision 时快照」字样；
@@ -3048,7 +3061,7 @@ git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什�
 > （`runner/lib/build-info.js#readBuildInfo()` 的镜像副本，由测试钉同步）、`portal/src/http.js`（端点转发）、
 > 前端 `portal/frontend/src/lib/versionSurface.ts` + `views/AdminAboutView.vue`（`#/admin/about`）。
 > 单测：`portal/test/admin-version-panel.test.js`（后端三段/鉴权/降级）、
-> `portal/test/version-surface.test.js`（**三格来源锁死** + 镜像/工作流/ compose 的判据自证）、
+> `portal/test/version-surface.test.js`（**三格来源锁死** + provenance 推导/路径可见 + 镜像与工作流的判据自证）、
 > `portal/test/health-version.test.js`（§5.1 的 `version` 块）、
 > `portal/frontend/src/views/AdminAboutView.spec.ts`（渲染面与不猜数）。
 

@@ -22,8 +22,9 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as migrate from '../src/migrate.js';
 import { hashToken } from '../src/auth.js';
-import { aboutPanel, PACKAGE_DIR, BUILD_INFO_PATH } from '../src/version-info.js';
+import { aboutPanel, provenanceFor, PACKAGE_DIR, BUILD_INFO_PATH } from '../src/version-info.js';
 import { readBuildInfo as readPortalBuildInfo } from '../src/build-info.js';
+import { readStationVersion } from '../src/version-info.js';
 import { readBuildInfo as readRunnerBuildInfo, UNKNOWN } from '../../runner/lib/build-info.js';
 import { checkBuildInfo, checkBuildInfoText } from '../../scripts/check-build-info.mjs';
 import { FakePool } from './fake-pool.js';
@@ -362,4 +363,66 @@ test('#586 评审阻断：屏蔽只发生在 portal 入口 —— runner 那份 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 复验阻断（第二轮）：来源标注必须**由实际来源推导**，路径注入要可见
+// ─────────────────────────────────────────────────────────────────────────────
+// 写死 `'build-info.json'` 在**旧 portal 镜像**（本 PR 之前构建的、或烘失败的）上就是说谎：
+// `readBuildInfo()` 在那份镜像里读不到 build-info.json ⇒ 退到 `packageDir/node_modules/erix-agent/package.json`
+// （`source:'package'`），面板上那个引擎号确实是 package.json 里的，标签却写着「镜像里的构建产物」。
+test('#586 复验阻断：build-info 读不到（旧镜像形状）⇒ 引擎格取自 package.json，来源标注也必须是 package.json', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-586-oldimage-'));
+  // 造一份「旧镜像」的最小布局：只有 package.json 与 node_modules/erix-agent/package.json，**没有** build-info.json。
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ version: '0.666.0-old-station' }));
+  fs.mkdirSync(path.join(dir, 'node_modules/erix-agent'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'node_modules/erix-agent/package.json'), JSON.stringify({ version: '0.777.0-old-engine' }));
+  const missing = path.join(dir, 'build-info.json'); // 就是不存在 ⇒ 走降级链
+  try {
+    const panel = await aboutPanel({
+      pool: new SurfacePool(),
+      readVersion: () => readStationVersion({ env: {}, buildInfoPath: missing, packageDir: dir }),
+    });
+    assert.equal(panel.server.source, 'package', '夹具前提：这次读取走的是 dev/旧镜像退路');
+    assert.equal(panel.platformEngine.version, '0.777.0-old-engine',
+      '引擎那格确实来自那份 package.json（值本身没撒谎）');
+    assert.equal(panel.provenance.platformEngine, 'package.json',
+      '**阻断点**：来源标注必须跟着值走，写死 build-info.json 就是在旧镜像上谎报');
+    assert.equal(panel.provenance.server, 'package.json', '同一次读取 ⇒ 服务端段同源（两格不许一格真一格假）');
+    assert.notEqual(panel.provenance.platformEngine, 'build-info.json',
+      '「镜像里烘了 build-info.json」这句话在这份构建里是不成立的');
+    assert.equal(panel.buildInfoPath, missing, '没读到也要说清去哪条路径读过（否则退路是凭空冒出来的）');
+    // 认不出的 source 一律 `unknown`，不许默认成 build-info（`provenanceFor` 是面板唯一的推导口）。
+    assert.equal(provenanceFor('nonsense'), UNKNOWN);
+    assert.equal(provenanceFor(undefined), UNKNOWN);
+    assert.equal(provenanceFor('env'), 'env', 'env 真出现时就说 env（入口已屏蔽它，但不能静默说成 build-info）');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#586 复验阻断：STATION_BUILD_INFO_PATH 改过路径 ⇒ 面板透出 buildInfoPath，而 /api/health 形状一字不动', async () => {
+  const { dir, file } = writeBuildInfo(INJECT);
+  await withEnv({ STATION_BUILD_INFO_PATH: file }, async () => {
+    const srv = await startServer(new SurfacePool());
+    try {
+      const panel = await (await fetch(`${srv.base}/api/admin/version`, {
+        headers: { cookie: srv.adminCookie },
+      })).json();
+      assert.equal(panel.buildInfoPath, file,
+        '路径被 env 改过就必须看得见（否则一份指向别处的文件顶着「镜像内 build-info.json」的标签出现）');
+      assert.equal(panel.provenance.server, 'build-info.json', '读到了 ⇒ 标注仍是 build-info.json（推导不是降级）');
+      assert.equal(panel.provenance.platformEngine, 'build-info.json');
+      assert.equal(panel.server.source, 'build-info');
+
+      const health = await (await fetch(`${srv.base}/api/health`)).json();
+      assert.deepEqual(Object.keys(health.version).sort(), ['builtAt', 'revision', 'station'],
+        '红线：`/api/health` **不加** buildInfoPath（公开端点不泄露部署路径，形状仍是三格）');
+      assert.ok(!JSON.stringify(health).includes(file.replace(/\/[^/]+$/, '')),
+        '整份健康响应里也不许漏出那条路径');
+    } finally {
+      await srv.close();
+    }
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
 });

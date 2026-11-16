@@ -43,6 +43,12 @@ export interface FdeCell {
 
 export interface VersionInfo {
   server: ServerCell;
+  /**
+   * 服务端实际去读的那条 build-info 路径（复验阻断：`STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH`
+   * 这三个注入旋钮能把路径换掉 ⇒ 「读的是哪条路径」必须在界面上看得见）。`null` = 服务端没说。
+   * ⚠ 它只证明「读了这条路径」，证明不了「读到了」——有没有读到看 `provenance`。
+   */
+  buildInfoPath: string | null;
   /** 平台侧引擎 = **portal 镜像里的 erix-agent**，与 FDE 段那个数**不是**一回事。 */
   platformEngineVersion: string | null;
   fdes: FdeCell[];
@@ -117,7 +123,11 @@ export function normalizeVersionInfo(raw: unknown): VersionInfo {
     platformEngineVersion: versionOrNull(engineRaw?.version),
     fdes,
     fdesPresent,
+    // `unknown` 收成 null（判据 2 同口径）：服务端没说就是「未知」，不显示成字面量路径。
+    buildInfoPath: versionOrNull(root.buildInfoPath ?? root.build_info_path),
     provenance: {
+      // 来源标注**由服务端推导后给出**（`portal/src/version-info.js#provenanceFor`）：前端只搬运，
+      // 不自己判「看起来像不像 build-info」——判一次就是第二份口径，而本单的返工点正是口径有第二份。
       server: stringOrNull(provenanceRaw?.server),
       platformEngine: stringOrNull(provenanceRaw?.platformEngine),
       fdes: stringOrNull(provenanceRaw?.fdes),

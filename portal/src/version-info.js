@@ -59,10 +59,13 @@ function firstString(candidates, fallback) {
  * @param {{env?: Record<string,string|undefined>, buildInfoPath?: string, packageDir?: string}} [opts]
  *   注入点：`buildInfoPath`（也可用 env `STATION_BUILD_INFO_PATH`）——契约测试拿它注入一份与
  *   `package.json` 版本不同的 build-info，**不真改仓库文件**（判据 D-1）。
- * @returns {{station:string,engine:string,revision:string,builtAt:string,source:string}} 四格全是字符串
+ * @returns {{station:string,engine:string,revision:string,builtAt:string,source:string,buildInfoPath:string}} 六格全是字符串
  */
 export function readStationVersion({ env = process.env, buildInfoPath, packageDir = PACKAGE_DIR } = {}) {
-  const fallback = { station: UNKNOWN, engine: UNKNOWN, revision: UNKNOWN, builtAt: UNKNOWN, source: UNKNOWN };
+  const fallback = {
+    station: UNKNOWN, engine: UNKNOWN, revision: UNKNOWN, builtAt: UNKNOWN, source: UNKNOWN,
+    buildInfoPath: UNKNOWN,
+  };
   try {
     // **在入口就挡掉 `ERIX_AGENT_VERSION`**（评审阻断，#586）。`readBuildInfo()` ① 那条 override 是
     // **FDE 容器侧**的正当需求：`provisioner.js:281` 往容器 env 里注它，声明「容器内跑的是哪个引擎」，
@@ -73,16 +76,19 @@ export function readStationVersion({ env = process.env, buildInfoPath, packageDi
     // 口径选择：env 冒充就在入口挡掉，而不是「让它盖过去再把 provenance 改成 `'env'`」——后者只是把
     // 谎话换成「来源=env」，而我们的口径是**镜像内 build-info 才是权威**。
     const { ERIX_AGENT_VERSION: _engineOverrideIgnored, ...envSansOverride } = env ?? {};
+    // 解析完的路径要**带出去**（复验：面板新增 `buildInfoPath`）——下面三条旋钮都能把它换掉，
+    // 而「路径被改过」如果不透出，界面就没法区分「读的是镜像里那份」与「读的是某处注入的那份」。
+    const resolvedBuildInfoPath = firstString(
+      [buildInfoPath, envSansOverride.STATION_BUILD_INFO_PATH, envSansOverride.ERIX_BUILD_INFO_PATH],
+      BUILD_INFO_PATH,
+    );
     const info = readBuildInfo({
       env: envSansOverride,
       // 优先级：显式入参 > `STATION_BUILD_INFO_PATH`（portal 自己的注入旋钮，契约测试用）>
       // `ERIX_BUILD_INFO_PATH`（runner 那份链里已有的那个旋钮，保留兼容）> portal 镜像内的默认位置。
       // ⚠ 必须**显式**传：`readBuildInfo()` 自己的兜底是 runner 的 `/opt/erix/build-info.json`，
       //   那是**另一个镜像**里的另一份版本，portal 拿它当默认就会读到 FDE 的账。
-      buildInfoPath: firstString(
-        [buildInfoPath, envSansOverride.STATION_BUILD_INFO_PATH, envSansOverride.ERIX_BUILD_INFO_PATH],
-        BUILD_INFO_PATH,
-      ),
+      buildInfoPath: resolvedBuildInfoPath,
       packageDir,
     });
     return {
@@ -92,6 +98,8 @@ export function readStationVersion({ env = process.env, buildInfoPath, packageDi
       revision: text(info.revision),
       builtAt: text(info.builtAt),
       source: text(info.source),
+      // 「去哪条路径读了」与「读到了没有」是两件事：前者就是这一格，后者看 `source`。
+      buildInfoPath: text(resolvedBuildInfoPath),
     };
   } catch {
     // `readBuildInfo()` 自己不抛（它内部每级都 catch），这一层只兜「env 传了个脏东西」这类装配错。
@@ -152,6 +160,32 @@ export function normalizeFdeRow(row) {
 }
 
 /**
+ * `readBuildInfo()` 的 `source` → 面板上的**来源标注**（复验阻断：这里写死就会在旧镜像上谎报）。
+ *
+ * 为什么必须推导而不是常量：`readBuildInfo()` 的降级链里 `build-info.json` **读不到**时（本 PR 之前
+ * 构建的旧 portal 镜像、烘失败、路径指错）会退到 `packageDir/node_modules/erix-agent/package.json`，
+ * 此时 `source === 'package'`——而面板上那个引擎号**确实是**从那份 `package.json` 读的。写死
+ * `'build-info.json'` 就说的是谎话：声称「镜像里的构建产物」，而旧镜像里根本没烘那个文件。
+ * `'env'` 理论上已被入口屏蔽，但**出现就说 `'env'`**（不许静默说成 build-info）；认不出的取值
+ * 一律 `'unknown'`（不猜）。
+ *
+ * ⚠ `source` 是**整次读取的共用来源**（`readBuildInfo()` 只出一个 `source`，不分格），所以
+ * `server` 与 `platformEngine` 两格从此**必然同源**（同一个文件）。两格仍然各自输出，是为了
+ * 让面板不必自己推；若将来某一格真的换了来源，这里必须显式改成按格推导。
+ */
+const PROVENANCE_BY_SOURCE = {
+  'build-info': 'build-info.json',
+  package: 'package.json',
+  env: 'env',
+};
+
+/** 认不出的 `source` ⇒ `'unknown'`（不猜、也不默认成 build-info）。导出给面板与用例共用。 */
+export function provenanceFor(source) {
+  const key = typeof source === 'string' ? source.trim() : '';
+  return PROVENANCE_BY_SOURCE[key] ?? UNKNOWN;
+}
+
+/**
  * 管理台「关于」面板的三段（判据 C）。
  * @param {{pool: object, readVersion?: () => object, log?: {warn?: (m: string) => void}}} opts
  */
@@ -178,15 +212,19 @@ export async function aboutPanel({ pool, readVersion = readStationVersion, log =
       source: text(v.source),
     },
     platformEngine: { version: text(v.engine) },
+    // 实际去读的那条 build-info 路径（可被 `STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH` / 入参改过）。
+    // 复验要求的路径可见性：这三个旋钮本身是**测试注入点**（不删），但「路径被改过」在界面上必须看得出来
+    // ——否则一份指向别处的文件就会顶着「镜像内 build-info.json」这个标签出现。它只能证明「读了这条路径」，
+    // 证明不了「读到了」（`provenance.*` 非 `build-info.json` 时它就是没读到）。
+    buildInfoPath: text(v.buildInfoPath),
     fdes,
     fdesPresent,
     provenance: {
-      // server / platformEngine 两格**可以写死** `'build-info.json'`，不是偷懒：这两格从此只有 build-info
-      // 那一条来源（唯一能绕开它的旋钮 `ERIX_AGENT_VERSION` 已在 `readStationVersion()` 入口屏蔽），
-      // 而 dev 源码态的退路（`source: 'package'`）不伪装成镜像事实——它走 `server.source` 那格说清。
-      // ⇒ 这里写死的字符串与面板显示的值**构造上一致**（被 version-surface 的用例钉着：env 注入不进去）。
-      server: 'build-info.json',
-      platformEngine: 'build-info.json',
+      // **由实际来源推导**（`readStationVersion()` 返回的 `source`），不是常量：写死 `'build-info.json'`
+      // 在「build-info 读不到 ⇒ 退 `package.json`」的旧 portal 镜像上就是谎报（声称镜像构建产物，而那个
+      // 文件根本没烘）。推导链见 `provenanceFor()`；`server` 与 `platformEngine` 同源（一次读取一个 source）。
+      server: provenanceFor(v.source),
+      platformEngine: provenanceFor(v.source),
       fdes: 'containers.agent_version',
       fdesSnapshot: 'provision',
     },
