@@ -866,6 +866,7 @@ export const en = {
       deviated: 'Deviated from the built-in template: the body that goes out is the one you wrote.',
       followsTemplate: 'Following the built-in template: no override, the text in the code is what goes out.',
       renderBudget: 'Whole ~/AGENTS.md: effective {effective} / injection limit {limit} (the built-in template renders to {template})',
+      renderBudgetNote: 'This figure is a preview rendered with the fixed example seat name "example" (zero timestamps, so it is comparable), not the size of any real seat file. The save-time render gate budgets the LONGEST legal seat name, so with a longer real name the real file can be slightly bigger than what is shown here.',
       viewEffective: 'View the effective full text',
       hideEffective: 'Hide the effective full text',
       copy: 'Copy',

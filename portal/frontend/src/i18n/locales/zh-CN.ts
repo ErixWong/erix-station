@@ -893,6 +893,7 @@ export const zhCN = {
       deviated: '已偏离内置模板：现在发出去的是你写的这份正文主体。',
       followsTemplate: '跟随内置模板：没有覆写，发出去的就是代码里那一份。',
       renderBudget: '整份 ~/AGENTS.md：生效 {effective} / 注入上限 {limit}（内置模板渲染出来是 {template}）',
+      renderBudgetNote: '这个数是按固定示例工位名 example 渲染的预览值（零时间戳 ⇒ 可对比），不是某个真工位的文件大小；而保存时的渲染闸按**最长合法工位名**算 ⇒ 真名字更长时，它可能比这里显示的略大。',
       viewEffective: '查看当前生效全文',
       hideEffective: '收起生效全文',
       copy: '复制',

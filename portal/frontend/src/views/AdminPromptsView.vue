@@ -330,6 +330,12 @@ onMounted(async () => {
             template: formatBytes(prompts.agentsMd.templateBytes) ?? '?',
           }) }}
         </p>
+        <!-- 这一行是预算口径的免责声明：DTO 里那个数用示例名 `example` 渲染（为了可对比、零动态量），
+             而写侧的渲染闸按**最长合法工位名**算（契约 §4.16-3 评审 F2）⇒ 不写清就会让人以为
+             「页面没顶到上限就存得进去」。 -->
+        <p data-test="agents-md-render-budget-note" class="text-xs text-black/40">
+          {{ t('admin.prompts.renderBudgetNote') }}
+        </p>
 
         <div class="flex flex-wrap items-center gap-2">
           <button
