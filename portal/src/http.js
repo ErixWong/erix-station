@@ -41,6 +41,7 @@ import { createRateLimiter, createSemaphore } from './ratelimit.js';
 import { maskEmail } from './mailer.js'; // #449：邮件通道端口（登录邮箱验证码）
 import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置的 DB 读取侧（60s 缓存）
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
+import * as uploadSettings from './upload-settings.js'; // #485 片 A：单文件上限进管理台（DB 优先 env，每次上传现读）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
 import * as delegation from './delegation.js'; // 子 run（delegation）读侧：名册 + 账本两个只读端点
@@ -778,6 +779,10 @@ export function createServer({
         return;
       }
       if (err instanceof mailSettings.MailSettingsError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
+      if (err instanceof uploadSettings.UploadSettingsError) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
@@ -1579,6 +1584,33 @@ async function handleAdminApi(req, res, ctx, url) {
   }
   if (pathname === '/api/admin/mail/test') {
     if (req.method === 'POST') return handleAdminMailTest(req, res, ctx, session);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
+  // 管理台「上传上限」（issue #485 片 A，契约 portal.md §4.15）：GET 读生效值 + 来源 / PUT 写。
+  // 与 mail/settings 不同：无需 `invalidate()` —— 上传端点本就每次现读 DB（无缓存），改完立即生效。
+  if (pathname === '/api/admin/upload/settings') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await uploadSettings.getUploadSettings({
+        pool: ctx.pool, config: ctx.config, log: ctx.log,
+      }));
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await uploadSettings.updateUploadSettings({
+        pool: ctx.pool,
+        config: ctx.config,
+        log: ctx.log,
+        actorId: session.user.id,
+        fields: body,
+      });
+      // 审计**不在这里**写（复 audit 活二）：`admin.upload_settings_updated` 已经和 upsert 挤进同一条 CTE 语句
+      //（`upload-settings.js` 的 `SAVE_SQL`）。原来这里是「upsert 已成 → 再 await 一笔 INSERT」：
+      // INSERT 失败就是「设置已生效而审计一行没有」，并发保存还会把 `previous_*` 记成自己进来之前的数。
+      // 再补一笔 `auth.audit` 会退回那两个窗口，并且多写一条审计行（`upload-settings.test.js` US-18 钉这一点）。
+      return sendJson(res, 200, result.settings);
+    }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
 
@@ -4195,7 +4227,8 @@ async function handleFileTree(req, res, ctx, url) {
  * ⚠ 能力位必须在**读 body 之前**：否则一个没开上传的账号可以用一个 32MiB 的 PUT 把 portal 的
  * 内存/带宽花掉才被拒（而 portal 与全站共用一个进程）。判据直接数请求体的 `data` 事件次数。
  * ⚠ **不走 `readJsonBody`/`readRawBody`**：`MAX_BODY_BYTES` 默认 64KiB，走它任何真实上传都会 413；
- *    上限由 `FILE_UPLOAD_MAX_BYTES` 在流式写入里逐 chunk 兜。
+ *    上限在流式写入里逐 chunk 兜，值由 `upload_settings` 单行表 → `FILE_UPLOAD_MAX_BYTES` → 默认 32MiB
+ *    依次回落（#485 片 A：管理台可改且改完立即生效，见 `portal/src/upload-settings.js`）。
  * 属主两个值都传（只传 uid 会留下 gid=0=root 组，agent 改不动），口径见 docs/design/user-space.md §6.2。
  */
 async function handleFileUpload(req, res, ctx, url) {
@@ -4211,18 +4244,37 @@ async function handleFileUpload(req, res, ctx, url) {
       details: { action: 'enable_in_admin_console' },
     });
   }
-  const result = await dirs.receiveUpload({
-    userSpaceRoot: ctx.config.userSpaceRoot,
-    fdeName,
-    cwd: url.searchParams.get('cwd'),
-    relPath: url.searchParams.get('path') ?? '.',
-    name: url.searchParams.get('name') ?? '',
-    stream: req,
-    maxBytes: ctx.config.fileUploadMaxBytes,
-    overwrite: url.searchParams.get('overwrite') === '1',
-    uid: ctx.config.fdeUid,
-    gid: ctx.config.fdeGid,
+  // #485 片 A：上限在**请求时**现取（`DB > env > 默认`，无缓存）⇒ 管理台改完下一次上传就生效，
+  // 不需要重启 portal。两个位置约束：
+  //   * 必须在能力位**之后**——#472 的判据是「没开上传的账号不能先把 body 抽干再被拒」，这里只多
+  //     一次单行主键 SELECT（不碰 `req` 流），所以不会破那条判据；
+  //   * 必须在开 temp **之前**——超限行不该先落盘再删。
+  // 读侧永不抛（表缺失 / DB 抖动 / 值非法 ⇒ 回落 env + warn），所以上传不会因为配置面而 500。
+  const limit = await uploadSettings.resolveEffectiveMaxFileBytes({
+    pool: ctx.pool, config: ctx.config, log: ctx.log,
   });
+  let result;
+  try {
+    result = await dirs.receiveUpload({
+      userSpaceRoot: ctx.config.userSpaceRoot,
+      fdeName,
+      cwd: url.searchParams.get('cwd'),
+      relPath: url.searchParams.get('path') ?? '.',
+      name: url.searchParams.get('name') ?? '',
+      stream: req,
+      maxBytes: limit.maxBytes,
+      overwrite: url.searchParams.get('overwrite') === '1',
+      uid: ctx.config.fdeUid,
+      gid: ctx.config.fdeGid,
+    });
+  } catch (err) {
+    // 把**来源**补进 413 的 `details`：`max_bytes` 已是生效值（`receiveUpload` 直接回弹它收到的 maxBytes），
+    // 再标一下它是 DB / env / 默认，值班就不用去猜该改哪一边。不改状态码与错误码（零新错误码）。
+    if (err instanceof dirs.DirError && err.code === 'file_too_large') {
+      err.details = { ...(err.details ?? {}), limit_source: limit.source };
+    }
+    throw err;
+  }
   // 201 = 新建；200 = 覆盖（`overwrite=1` 且真的提交掉了旧内容）。DTO 见 §4.14。
   return sendJson(res, result.overwritten ? 200 : 201, result);
 }

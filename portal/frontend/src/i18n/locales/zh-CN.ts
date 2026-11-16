@@ -726,6 +726,46 @@ export const zhCN = {
       mail: '邮件通道',
       tls: '证书',
       previewPool: '号池占用',
+      // issue #485 片 A：上传上限（views/AdminUploadView.vue，契约 docs/api/portal.md §4.15）。
+      // 放在证书之后、号池占用（只读运维快照）之前：它是一处**平台配置**。
+      upload: '上传上限',
+    },
+    // issue #485 片 A：单文件上传上限（`upload_settings` 单行表，迁移 0035）。
+    // 这一页的存在理由只有一条：改一个数字不该要重建容器。所以文案的重心在「当前生效值 + 来源」，
+    // 而不是「保存成功」——只报保存成功，运维仍然不知道现在到底听哪一边的。
+    upload: {
+      title: '单文件上传上限',
+      intro: '工作台「上传」能传进来的单个文件最大多少字节。这里改完**不需要重启 portal、不需要重建容器**：上限是每次上传现读的，所以下一次上传就按新值走。',
+      loading: '正在读取上传上限…',
+      notLoaded: '尚未加载上传上限（还没请求）。',
+      unknown: '未知',
+      statusEffective: '当前生效值',
+      statusSource: '来源',
+      statusUpdatedAt: '最后修改',
+      updatedAtNever: '从未修改（还没人在管理台存过这个值）',
+      updatedAtUnknown: '时间无法解析：{value}',
+      limits: '允许区间：{min} – {max}',
+      field: '新的上限（字节）',
+      fieldHint: '服务端才是闸：填了整数就照发（越界会报错并标红这个框），前端不提前拦。只接受整数，`1.5` / `1e7` 这种写法不算整数。',
+      draftIs: '你填的是：{value}',
+      draftNotInteger: '还不是一个整数（空、小数、科学计数法都算不是）——此时不会发请求。',
+      hintBelow: '这个值低于允许区间（{min} – {max}），保存会被服务端拒。',
+      hintAbove: '这个值高于允许区间（{min} – {max}），保存会被服务端拒。',
+      save: '保存',
+      reload: '重新读取',
+      saved: '已保存，**下一次上传起生效**（显示的数就是服务端落库后回读的那一个）。',
+      sourceDb: '管理台（DB 里的 upload_settings）',
+      sourceEnv: '环境变量 FILE_UPLOAD_MAX_BYTES',
+      sourceDefault: '内置默认（32 MiB）',
+      reasonNoRow: '管理台还没存过值，现在用的是环境变量（没设则是默认）。在这里存一个数就会覆盖它。',
+      reasonInvalid: 'DB 里那个值用不了（不在允许区间，或形状不对），已回落环境变量/默认值——所以下面那个数不是管理台里存的数。',
+      reasonReadFailed: '读不到 upload_settings（表缺失或数据库抖动），已回落环境变量/默认值；上传本身不受影响。',
+      reasonReadTimeout: '读 upload_settings 超时（数据库没在 UPLOAD_SETTINGS_READ_TIMEOUT_MS 内回答），已回落环境变量/默认值；上传本身不受影响。',
+      srcDb: 'DB 里的值（可用时）',
+      srcEnv: '环境变量那一档',
+      srcDefault: '内置默认',
+      envNotSet: '环境变量并未显式设置',
+      footnote: '这是**单文件**上限，不是磁盘总量上限（总量配额是 #485 片 B，未实现）。它与 MAX_BODY_BYTES（JSON 请求体口径，默认 64 KiB）是两个不同的旋钮：上传不走后者。',
     },
     // issue #449 管理台切片：邮件通道配置（views/AdminMailView.vue，契约 docs/api/portal.md §4.12）。
     // 本页是登录第二因素「邮箱验证码」的唯一开关；口令**只写不读**（服务端只回 hasPassword）。
