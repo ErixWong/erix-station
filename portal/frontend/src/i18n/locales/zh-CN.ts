@@ -734,6 +734,9 @@ export const zhCN = {
       // issue #485 片 A：上传上限（views/AdminUploadView.vue，契约 docs/api/portal.md §4.15）。
       // 放在证书之后、号池占用（只读运维快照）之前：它是一处**平台配置**。
       upload: '上传上限',
+      // issue #528（事件平台 W5）：宏模板与宏流水的管理台栏目（按 `07` §21.1 的键名表）。
+      macros: '宏模板',
+      macroRuns: '宏流水',
     },
     // issue #485 片 A：单文件上传上限（`upload_settings` 单行表，迁移 0035）。
     // 这一页的存在理由只有一条：改一个数字不该要重建容器。所以文案的重心在「当前生效值 + 来源」，
@@ -1332,6 +1335,140 @@ export const zhCN = {
       finish: '【收工】请把这些仓库的改动收进 git：{repos}{more}。要求：未跟踪的文件也一并 git add（别漏）；一个目录里有多个仓库就逐个仓库分别提交（父目录的仓库不包含子目录的仓库）；有远端就 push，没远端或没配 upstream 的先问我，别替我猜远端。',
       ask: '【收工检查】这个目录的收工灯报「{state}：{reason}」（目录 {cwd}）。请逐个仓库讲清楚：哪些工作还没被 git 保护、后果是什么、收工要一步步做什么（提交 / 推送 / 配远端）。',
     },
+  },
+  // issue #528（事件平台 W5）用户面文案。键名按 `07` §21.1 定下的表（键名一旦定就不再改，
+  // 改名 = 双语同时改，容易漏一边）。⚠ 原文枚举（`quiet_hours` 等）**不进 UI**：
+  // 人话对照在 `lib/macroView.ts` 的 `skipMessageKey` / `verdictMessageKey` 里映射。
+  macro: {
+    title: '值守流水',
+    loading: '加载中…',
+    loadFailed: '加载失败',
+    retry: '重试',
+    chip: {
+      enabled: '自动化 · {count} 启用',
+      none: '自动化 · 未启用',
+    },
+    config: {
+      title: '配置 ▾',
+      intro: '勾选即生效，没有保存按钮；已触发的历史不回滚。',
+      userScopeHint: '由管理员代配（用户级，不在会话里订阅）',
+    },
+    card: {
+      enabledCount: '{count} 个启用',
+      lastEvaluated: '上次评估 {at}',
+      notEvaluated: '尚未评估',
+    },
+    health: {
+      stale: '⚠ 上次评估在 {minutes} 分钟前，预期每 {everySeconds} 秒一次（超过 {staleAfterSeconds} 秒算陈旧）· 宏可能不生效',
+      neverEvaluated: '⚠ 这些模板还没被评估过 · 宏可能不生效',
+      nextStep: '持续不刷新请让管理员看执行器状态。',
+    },
+    filter: {
+      template: '模板',
+      verdict: '判决',
+      allTemplates: '全部模板',
+      allVerdicts: '全部判决',
+      clear: '清除筛选',
+    },
+    status: {
+      pending: '排队中',
+      running: '进行中',
+      done: '已完成',
+      skipped: '已跳过',
+      failed: '失败',
+      superseded: '已被取代',
+      unknown: '状态未知',
+    },
+    // `07` §6.1 的唯一用词（旧稿的「未通过」「未达成」已全部替换）。
+    verdict: {
+      pass: '通过',
+      red: '整改',
+      noop: '未证实有改动',
+      human: '需人工',
+      unclassified: '未判',
+    },
+    // `09` §3.3 的人话对照。`humanPresent` **写中性事实不归责用户**（不写「因为你在说话」）。
+    skip: {
+      budget: '今日额度用完',
+      quietHours: '静默时段（22:00–08:00）',
+      humanPresent: '你刚发了消息，不插话',
+      runInProgress: '会话里有 run 在跑',
+      deferred: '会话里有 run 在跑，等它结束再送',
+      deferredTimeout: '等排位超过 10 分钟，放弃',
+      activeRunInCwd: '同一目录有 run 在跑',
+      cancelledByUser: '你取消了值守',
+      unknown: '被门禁挡下（原因未知）',
+      aggregate: '最近 {count} 次同原因',
+    },
+    kind: {
+      runNotify: '终态通知',
+      runSilence: '静默告警',
+      runReview: '完成审查',
+      scheduledTask: '定时任务',
+      unknown: '未知类型',
+      desc: {
+        runNotify: 'run 进终态时通知你',
+        runSilence: '工具卡住超过阈值时告警',
+        runReview: 'run 结束后审一遍，整改一次',
+        scheduledTask: '每天固定时刻自己起一个宏会话',
+        unknown: '这个类型还没有说明',
+      },
+    },
+    field: {
+      name: '名称',
+      states: '盯哪些终态',
+      channel: '通知渠道',
+      threshold: '静默阈值',
+      phases: '盯哪些相位',
+      reviewDepth: '审查深度',
+      onFail: '不过怎么办',
+      maxRounds: '最多几轮',
+      at: '时刻',
+      cwd: '目录',
+      task: '任务描述',
+    },
+    action: {
+      regenerate: '重新生成',
+      stopRun: '停止 run',
+      openSettings: '打开设置',
+      refresh: '刷新',
+      close: '关闭',
+      back: '返回',
+    },
+    detail: {
+      depth: '深度 {depth}',
+      noAction: '已执行',
+    },
+    // `07` §15：逐条实测、汇总标「估算」且默认折叠；单价未定 ⇒ 只给 token 不给钱。
+    cost: {
+      tokens: 'token',
+      monthly: '本月',
+      triggers: '本会话 {count} 次触发',
+      unknown: '用量未知',
+      estimateToggle: '估算详情',
+      estimateHint: '估算（单价来自定价配置，可能不准）',
+    },
+    // `07` §17.2 的业务空态（技术态另走 `loading` / `loadFailed`）。
+    empty: {
+      noSubscription: '这个会话没挂模板',
+      neverTriggered: '已启用 {count} 个，还没触发过。上次评估 {at}',
+      filtered: '没有匹配的记录',
+      chooseTemplate: '选择模板',
+    },
+  },
+  // `07` §21.3：独立 `notifications` 表 + 顶铃铛（不复用会话流）。
+  notifications: {
+    title: '通知',
+    aria: '通知，未读 {count} 条',
+    loading: '加载中…',
+    failed: '通知加载失败',
+    empty: '暂无通知',
+    markRead: '标记已读',
+  },
+  // `07` §21.4：侧栏单独分组「自动化」，默认折叠，组内会话**不允许发消息**。
+  macroSidebar: {
+    group: '自动化',
+    readOnlyHint: '宏会话只读，不能在这里发消息',
   },
 } as const;
 
