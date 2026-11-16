@@ -5649,7 +5649,7 @@ claim 必返回 `null`，到期意图永远产不出。⇒ 走 `claimExpiryRun`�
 **待办**：W3（通知 + HTTP API，#526，在跑）、W4a（#537）、W4b（#538）、W7（#536）、W5/W6。
 
 
-### 8.127 前端 `emitted()` 环境地板拆掉，并加静态闸 H3（issue #496 / 工单 fix-261115-05，2026-11-15，worker 落地 + 主 agent 亲验）
+### 8.131 前端 `emitted()` 环境地板拆掉，并加静态闸 H3（issue #496 / 工单 fix-261115-05，2026-11-15，worker 落地 + 主 agent 亲验）
 
 **为什么不是一次性修完就完事**：`@vue/test-utils@2.5.1` 的 `emitted()` 取事件靠 **Vue devtools
 hook**，Vue 只在非生产构建里发 devtools 事件 ⇒ 本机 shell 默认 `NODE_ENV=production` 时它**恒空**。
