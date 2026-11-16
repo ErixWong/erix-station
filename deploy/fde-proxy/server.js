@@ -12,6 +12,9 @@
 //   MAX_PIDS              允许的 PidsLimit 上限（0 = 不限）
 //   ALLOWED_USERS         允许的容器 User 值，逗号分隔（默认 1001:1000）
 //   IPAM_POOLS            允许的 network create subnet 池，逗号分隔 CIDR（默认 10.200.0.0/16,10.201.0.0/16）
+//                         ⚠ 这是**白名单闸门**，不是分配器：portal 实际从哪一段切由 portal 侧
+//                         IPAM_POOL_DEFAULT / IPAM_POOL_LARGE 决定（issue #270），两头必须同源，
+//                         否则分配出来就被本 proxy 拒（reason 会同时点名两侧变量名）。
 //   PORT                  监听端口（默认 2375）
 import http from 'node:http';
 import path from 'node:path';
@@ -407,7 +410,15 @@ export function validateNetworkBody(body, opts = {}) {
     } else {
       const cfg = configs[0];
       if (typeof cfg.Subnet !== 'string' || !isCidrInPools(cfg.Subnet, ipamPools)) {
-        reasons.push(`IPAM.Subnet not in allowed pools: ${cfg.Subnet}`);
+        // 文案同时点名**两个旋钮**（issue #270 的红线：分配段必须落在放行面之内）。
+        // 这一条 deny 的现场几乎总是「只改了一头」：portal 换了分配段（IPAM_POOL_LARGE /
+        // IPAM_POOL_DEFAULT，宿主侧 FDE_IPAM_POOL_*）却没把同一段加进本 proxy 的放行面
+        // （IPAM_POOLS，宿主侧 FDE_IPAM_POOLS），或者反过来。只报 subnet 会逼人去翻两边的 env。
+        reasons.push(
+          `IPAM.Subnet not in allowed pools: ${cfg.Subnet}`
+          + ` [放行面=本进程 IPAM_POOLS（宿主 compose 侧 FDE_IPAM_POOLS）=${ipamPools.join(',') || '(未配置)'}；`
+          + '若 portal 的分配段已改，请同步改 portal 侧 IPAM_POOL_DEFAULT/IPAM_POOL_LARGE（宿主 compose 侧 FDE_IPAM_POOL_DEFAULT/FDE_IPAM_POOL_LARGE）与本侧 IPAM_POOLS，两头必须同源]',
+        );
       }
       if (cfg.Gateway !== undefined) {
         const c = parseCidr(cfg.Subnet);
