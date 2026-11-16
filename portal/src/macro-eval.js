@@ -14,15 +14,16 @@
 //   ⇒ **先求值成功、再推进水位线**（顺序反了会把「求值抛异常」显示成健康），
 //     且**逐条写不批量**（批量会把失败的一起推进）。见 `tick()` 里 `advanceWatermark` 的位置。
 import { claimMacroRun, finishMacroRun } from './macros.js';
+// 评估间隔与陈旧余量是**跨端面**常量（执行器与用户面共用）⇒ 权威位在
+// `shared/macro-kinds.js`（issue #528 / 契约 `10` 篇 §1），本文件只 re-export。
+import { EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE } from '../shared/macro-kinds.js';
+
+export { EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE };
 
 /** 站内时区口径：UTC+8（`02` 篇 §1 / `03` 篇 §556 的 `{{date}}`）。日期/时刻一律按这个偏移算。 */
 export const TZ_OFFSET_MINUTES = 8 * 60;
 /** 免打扰时段（UTC+8，`03` 篇 §296 / `04` 篇 §201）：22:00–08:00。 */
 export const QUIET_HOURS = Object.freeze({ start: 22, end: 8 });
-/** 评估间隔默认值（`09` 篇 §1.1 新鲜阈值 = 3× 间隔 ⇒ 默认 180s）。 */
-export const EVAL_INTERVAL_MS = 60_000;
-/** 陈旧判定的余量倍数（`09` 篇 §1.1「留 3 倍余量」）。 */
-export const STALE_INTERVAL_MULTIPLE = 3;
 /** 静默阈值默认值与「按相位」口径（`10` 篇 §1 KIND_SCHEMA / `05` 篇）：
  *  tool_running 默认 15m；awaiting_llm **默认关**（null ⇒ 该相位不判）。 */
 export const SILENCE_DEFAULT_THRESHOLD_MS = 15 * 60_000;

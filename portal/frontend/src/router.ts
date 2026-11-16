@@ -103,6 +103,19 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminAboutView.vue'),
         meta: { requiresRole: 'admin' },
       },
+      // issue #529（事件平台 W6）：宏模板配置 + 宏执行历史。懒加载 + 照邻居 requiresRole:'admin'。
+      {
+        path: 'macros',
+        name: 'admin-macros',
+        component: () => import('./views/AdminMacrosView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
+      {
+        path: 'macro-runs',
+        name: 'admin-macro-runs',
+        component: () => import('./views/AdminMacroRunsView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
     ],
   },
 ];

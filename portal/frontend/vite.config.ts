@@ -8,6 +8,15 @@ export default defineConfig({
   // hash 路由（createWebHashHistory）：服务端无需 history 回退；旧 index.html 的
   // #/session/<id> 深链已有 hash 先例（issue #55 B1）。
   base: '/',
+  // issue #528 / 契约 `10` 篇 §1：宏枚举的单一真源在 `portal/shared/`（后端不能 import 前端，
+  // 所以不能放 `src/lib/`）。前端用 `@shared/*` 别名指过去，**不许抄一份枚举字面量**
+  // （防漂移：portal/test/macro-kinds-single-source.test.js）。
+  // 用 URL 而非 `node:path`：本文件的 tsconfig `types` 只有 `vite/client`，没有 @types/node。
+  resolve: {
+    alias: {
+      '@shared': new URL('../shared/', import.meta.url).pathname,
+    },
+  },
   plugins: [vue(), tailwindcss()],
   build: {
     outDir: 'dist',
