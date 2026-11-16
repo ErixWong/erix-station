@@ -7647,3 +7647,36 @@ FDE `sha256:a04147ca…` / proxy `sha256:19c62c83…`；5 台 `fde-*` 全部重�
 （需要杀一个正在跑工具的 run）；它们由 `runner/test/recovery-rows-adapter.test.js` 与
 `replay-policy.test.js` 的夹具钉着，真机口径等下一次真崩溃自然出现时对账。
 
+
+### 8.146 事件平台 W7 落地：M7 定时任务执行器（工单审计抓到的整块遗漏，#536，2026-11-16，主 agent + erix_run）
+
+接 §8.144。**W7 已合并进 main**（PR #577，`d7b69c5`）。至此**事件平台后端六单全部落地**：
+W1 数据层 / W2 评估循环 / W3 通知与 API / W4a 快照与隔离 / W4b 判决与生命周期 / W7 执行器。
+
+**这一单本身是工单审计的产物**：原 6 张单里**没有任何一张负责「真正起一个 run」**——
+W2 只产 `tick` 意图、W4 只管审查。审计那句「六单按当前文本不足以交付」最硬的一条就是这个整块遗漏。
+
+**交付**：`portal/src/macro-scheduled.js`（232 行）+ `portal/test/macro-scheduled.test.js`（215 行 e2e，
+pg-fixture + 桩 runner）。无新迁移（`chat_sessions.origin` 已在 0037）。
+
+四个设计点（都写进了代码注释）：
+
+1. **宏会话 = 每个 `(user, template)` 一条长期会话**（`origin='macro:<name>'`），**不是每次开新的**。
+   理由是 notes 是 `sessionId` 作用域（`<home>/sessions/<id>/notes`）：复用会话 ⇒ 昨天写的注
+   今天还在 ⇒「跨会话记忆不存在」这条对宏会话不成立。代价是会话变长（1 run/天 × 30 天 ≈ 150 轮），
+   靠读侧折叠兜。
+2. **复用判据必须同时看 `origin` 和 `user_id`** —— 两个用户订同一模板是两条会话，
+   只看 `origin` 会把 A 的会话给 B。
+3. **失败不补跑，但必须通知**。时间意图会过期，补跑只会重复烧钱；而任务型宏失败如果只落在
+   没人看的会话里就是**静默死**（用户根本不知道今天该跑的东西没跑）。
+4. **产物由平台写 `<reportsRoot>/<宏名>/<date>.md`，不是模型自己写文件** —— 模型被 jail 在项目
+   `cwd`，它写的文件会把用户的**收工灯弄红**（D9 语义）。`reportsRoot` 可注入，测试不真写 `~/reports`。
+
+**主 agent 三个变异全部命中**：复用判据加 `WHERE false` ⇒ `not ok 1/2` 红；
+失败分支 `if (false) await notifyImpl(…)` ⇒ `not ok 3` 红；
+产物路径改 `/tmp` ⇒ `not ok 4` 红**且连带 1/2 也红**（说明断言走的是真路径不是影子）。
+
+**本批累计变异 20 个**，全部命中。
+
+**待办**：W5（#528 用户面 UI，在跑，含把枚举抽成 `portal/shared/macro-kinds.js` 单一真源）、
+W6（#529 管理台 UI）。
