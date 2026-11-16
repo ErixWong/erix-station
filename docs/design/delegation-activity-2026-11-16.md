@@ -254,9 +254,13 @@ activeRunId != null
 
 ### 4.4 四种边界的处理（每条都是真实会发生的）
 
-① **刷新页面**：`activeRunId` 由 `reconcileActiveRun` 恢复（`stores/workbench.ts:951`），
-delegate 卡由历史回放重建（`tool_use` 在白名单里）⇒ 面板**会**自己回来。
-前提是刷新时那次 `GET /api/sessions/:id` 成功；失败就退化成「没有面板」，不报错。
+① **刷新页面**：⚠ **工作台不持久化「选中的目录 / 会话」**（`stores/workbench.ts` 无 localStorage
+恢复路径）⇒ 硬刷新后落在 `#/`、没有选中会话，面板当然也不在。**真机验证过的真实路径**是：
+刷新 → 重新选目录 → 点那条还在跑的会话 ⇒ `activeRunId` 由 `reconcileActiveRun` 从
+`GET /api/sessions/:id` 的 `active_run_id` 恢复（`stores/workbench.ts:951`）、delegate 卡由历史回放
+重建（`tool_use` 在白名单里）⇒ **徽标与面板自己回来**（2026-11-16 真机：刷新后重开会话，
+两行都在、`🔧 shell · …` 也在，轮询从 19 发续到 21 发）。
+前提是那次 `GET /api/sessions/:id` 成功；失败就退化成「没有面板」，不报错。
 
 ② **多标签页 / 后台页**：每个打开的工作台都会轮询（N × 0.5qps）。可见性门控挡住后台页；
 多标签页是接受的成本（与 `usePreviewPorts` 同族）。
