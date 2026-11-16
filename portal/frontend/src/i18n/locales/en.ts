@@ -566,6 +566,29 @@ export const en = {
       interrupted: 'Interrupted',
       unknown: 'Unknown state',
     },
+    // issue #592: live sub-task badge (tail of RunStatusBar) + expanded panel (below it).
+    // State wording is **reused** from `state.*` above; `{count}` here is the number of **live**
+    // children (same ruler as `lib/delegate.ts#DELEGATE_LIVE_STATES`; terminal ones don't count).
+    activity: {
+      title: 'Sub-tasks {count}',
+      // "cannot read" and "there are none" need different wording (badge degraded state;
+      // design §4.2 last paragraph + the D9 rule).
+      titleUnknown: 'Sub-tasks ?',
+      toggleUnknown: 'Show or hide the sub-task panel (status temporarily unavailable)',
+      panelTitle: 'Sub-tasks {count}',
+      toggle: 'Show or hide the sub-task panel ({count} running)',
+      hint: 'Refreshes every 2s; shows only sub-tasks dispatched by the current run',
+      collapse: 'Collapse',
+      // 行里前面已经有一个状态词（`delegate.state.running` = "Running"），所以这里**不许**再说
+      // "running"（真机上渲染成 `Running running 20.0s`）；中文那份是 `已跑 {dur}`，无此问题。
+      elapsed: 'for {dur}',
+      view: 'View',
+      viewAria: 'View sub-task {id}',
+      unreadable: 'Sub-task status is temporarily unavailable',
+      // The roster still says live while the parent run already ended (a background child dies with the
+      // parent process, so `finishRun` never runs). It means "status unknown" — not failed, not running.
+      staleParentEnded: 'Parent run has ended; status unknown',
+    },
   },
   preview: {
     title: 'Preview {path}',
