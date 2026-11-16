@@ -600,6 +600,9 @@ export const zhCN = {
     // （尺规 = `lib/delegate.ts#DELEGATE_LIVE_STATES`，终态子不计数）。
     activity: {
       title: '子任务 {count}',
+      // 「读不到」与「没有」必须两种说法（徒标的降级态；设计 §4.2 末段 + D9 口径）。
+      titleUnknown: '子任务 ?',
+      toggleUnknown: '展开或收起子任务面板（状态暂不可读）',
       panelTitle: '子任务 {count}',
       toggle: '展开或收起子任务面板（{count} 个在跑）',
       hint: '每 2 秒刷新，只读当前 run 派出的子任务',

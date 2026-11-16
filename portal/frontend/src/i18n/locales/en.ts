@@ -571,6 +571,10 @@ export const en = {
     // children (same ruler as `lib/delegate.ts#DELEGATE_LIVE_STATES`; terminal ones don't count).
     activity: {
       title: 'Sub-tasks {count}',
+      // "cannot read" and "there are none" need different wording (badge degraded state;
+      // design §4.2 last paragraph + the D9 rule).
+      titleUnknown: 'Sub-tasks ?',
+      toggleUnknown: 'Show or hide the sub-task panel (status temporarily unavailable)',
       panelTitle: 'Sub-tasks {count}',
       toggle: 'Show or hide the sub-task panel ({count} running)',
       hint: 'Refreshes every 2s; shows only sub-tasks dispatched by the current run',

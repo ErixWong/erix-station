@@ -251,6 +251,58 @@ describe('判据 14：点「查看」打开抽屉（DOM 断言，抽屉仍只有
   });
 });
 
+describe('必修 1：首次就失败 ⇒ 降级态必须可达（设计 §4.2「连续 N 次失败降级成一行中性提示」）', () => {
+  it(`从未成功拉到过：连 ${DELEGATE_ACTIVITY_FAIL_THRESHOLD} 次 500 ⇒ 徒标以中性灰出现，点开面板看到那行灰字`, async () => {
+    stubRoster(new Error('boom'));
+    driveDelegateCard(useWorkbenchStore());
+    const wrapper = mountSurface();
+
+    // 第一发在 setup 当场，之后每 2s 一发 ⇒ 共 3 发之后才降级。
+    await tick(0);
+    expect(wrapper.find('[data-testid="delegate-activity-badge"]').exists()).toBe(false); // 1 次失败：还静默
+    await tick(2_000);
+    await tick(2_000);
+
+    const badge = wrapper.get('[data-testid="delegate-activity-badge"]');
+    expect(badge.text()).toContain(COPY.titleUnknown); // 「子任务 ?」而不是「子任务 0」
+    expect(badge.attributes('data-degraded')).toBe('true');
+    const klass = badge.classes().join(' ');
+    expect(klass).toContain('text-black/50'); // 中性灰
+    expect(klass).not.toContain('text-brand'); // 不拿品牌色冒充「在跑」
+    expect(klass).not.toContain('text-red-600'); // 也不是故障红
+    expect(badge.find('svg.animate-spin').exists()).toBe(false); // 读不到就不装转圈
+    expect(badge.attributes('aria-label')).toBe(COPY.toggleUnknown);
+
+    await badge.trigger('click'); // 徒标是唯一入口：它必须还能点开面板
+    const panel = wrapper.get('[data-testid="delegate-activity-panel"]');
+    expect(panel.text()).toContain(COPY.unreadable);
+    expect(panel.html()).not.toContain('text-red-600');
+    expect(panel.html()).not.toContain('⚠');
+    // 降级态下标题也不拿 0 冒充「没有」。
+    expect(panel.text()).toContain(COPY.titleUnknown);
+  });
+
+  it('拉到过东西之后的失败 ⇒ 徒标不进降级态（行还在就照旧报数，灰字只在面板里）', async () => {
+    stubRoster({ items: [rosterItem({ childRunId: 'sub-live-aaaa' })] }, new Error('boom'));
+    const store = useWorkbenchStore();
+    driveDelegateCard(store);
+    const wrapper = mountSurface();
+    await tick(0);
+
+    const badge = wrapper.get('[data-testid="delegate-activity-badge"]');
+    expect(badge.attributes('data-degraded')).toBe('false');
+    expect(badge.classes().join(' ')).toContain('text-brand');
+
+    for (let i = 0; i < DELEGATE_ACTIVITY_FAIL_THRESHOLD; i += 1) {
+      await tick(2_000);
+    }
+    // 仍报数（不是 `?`）、仍是蓝的：上次拉到的行没被失败洗掉。
+    expect(wrapper.get('[data-testid="delegate-activity-badge"]').attributes('data-degraded')).toBe('false');
+    expect(store.delegateDegraded).toBe(false);
+    expect(store.delegateRowsUnavailable).toBe(true);
+  });
+});
+
 describe('判据 15/16：刷新路径与失败静默', () => {
   it('刷新路径：历史回放建出 `ok:null` 且 runId===activeRunId 的卡 ⇒ 面板仍能拉到并渲染行', async () => {
     stubRoster({ items: [rosterItem({ childRunId: 'sub-live-aaaa', state: 'running' })] });
