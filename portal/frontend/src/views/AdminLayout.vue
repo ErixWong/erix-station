@@ -46,6 +46,9 @@ const tabs = [
   { name: 'admin-upload', label: 'admin.tabs.upload' },
   // issue #350：号池占用总览（只读）。放在最后：先看用户/配置，选段时才来这里。
   { name: 'admin-preview-pool', label: 'admin.tabs.previewPool' },
+  // issue #586：「关于」（版本三格，只读）。排在所有能操作的 tab 之后：它不帮人做决定，
+  // 只在「现在跑的到底是哪份构建」出问题时被点开（v0.1.69 那次分裂的那一小时）。
+  { name: 'admin-about', label: 'admin.tabs.about' },
 ] as const;
 
 async function onLogout() {
