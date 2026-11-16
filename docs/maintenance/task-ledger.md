@@ -8198,3 +8198,57 @@ commit **一致**）。dev 栈改 pin 该 digest（`deploy/.env:72`，备份 `/t
 
 **两版之间没有产品代码差异**（`git diff --stat v0.1.70..main` 只有 `portal/integration/version-surface-e2e.mjs`
 + 一条 npm script + 两篇设计文档 + 台账）⇒ 这不是「修 bug 的版本」，是**让 tag 追上验过的树**。
+
+### 8.156 #602 子 run 收尾后的假「在跑」+ J4 假红止血 + v0.1.70 部署落 pin（2026-11-16/17，主 agent + pi worker）
+
+接 §8.152（子 run 活动可视化落地）。真机 e2e 全绿之后**仍有一处说谎**：父 run `finished` 之后，
+子名册里那条 `state: running` / `endedAt: null` 永远不会再变（后台子随父进程消失 ⇒ `finishRun`
+永不执行），界面照着名册渲染 ⇒ **卡片永久转圈、抽屉永久轮询**（实测 `.delegate-state svg.animate-spin` = 1，
+抽屉 10s 内 5 发）。
+
+**#602 修法（PR #605，纯前端 7 文件 +379/−19，零后端）**：判据不是「名册说它活着」，而是
+**「它还是当前这个 run 的活跃子」**——
+- 卡片：`kind === 'running' && !cardRunStillActive(card)`（后者只认 `card.runId === store.es.activeRunId`）
+  ⇒ 落 `unknown` 档**中性灰 `·`**（`DELEGATE_UNKNOWN_MARK`）。**不掉回 `✓`**：那是谎报成功。
+- 抽屉：`parentRunActive = store.es.activeRunId === props.parentRunId` 进 `schedule()` / `polling` /
+  `onVisibilityChange` 三处 + `watch` 当场拆 timer，头部给 `data-testid="delegate-parent-ended"` 中性小字
+  （「The parent run has ended, so the sub-task status is no longer updated (actual state unknown)」）。
+- 定点判据 `/tmp/e2e602-verify.log`：卡住子 `lastIsNeutralDot: true` / `spinners: 0` / `lastHasNoRed: true` /
+  `drawerPolls: 0` / `drawerHasParentEnded: true`；**前台**子 `d8eb83d1` 仍 `✓ Completed`（未误伤）。
+- 门禁（主 agent 亲跑，`NODE_ENV` 为空）：`typecheck` rc=0；`npm test` rc=0（78 文件 / **1629** 用例）。
+
+**J4 假红（PR #606，只改 `portal/test/delegation.test.js`）**：PR #605 的 CI 红**不是 #602 的回归**——
+`J4 顺手1 缓存键真的按 size 变` 断的是 `notStrictEqual(第二次 at, 第一次 at)`，而 `at = floor(mtimeMs)`；
+GitHub runner 上两次写落在**同一毫秒** ⇒ 两数相同 ⇒ 假红（CI 原文 `expected: 1794846022708 actual: 1794846022708`）。
+本机（慢一点）恰好跨毫秒 ⇒ 本地永远绿 ⇒ **判据依赖机器速度**。改法：两次写盘都用 `fsp.utimes` **钉固定值**
+（`1_700_000_000` / `1_800_000_000`）并断 `at === 钉进去的值`；另**追加第三相**把 mtime 钉回同一个值、
+只追加内容 ⇒ 此时**只有 `size` 一元在动**，断「必须换键重读 + 摘要换成新内容」。第三相不是锦上添花：
+只钉两个不同固定值时，「缓存键没带 `size`」这支变异会靠 mtime 差异**逃掉**。判据：单文件 **5 连跑 5×rc=0**
+（37/37）、变异 A（键去掉 `st.size`）**唯一红格 = J4**、根 `npm test` rc=0（**2721** pass / 0 fail / 50 skip）。
+
+**发版 v0.1.70（我这一半）**：`v0.1.70` 的 tag 由本 session 打（§8.154 记的「tag 不是我打的」= 这条），
+release run `43910657016` success；版本前置 `#604`（0.1.69→0.1.70 三处对齐）由并行 session 出、我在发版前合入。
+
+**部署落 pin（本单收尾，`deploy/.env`，600 不入库）**——进来时是**半套**状态：portal 已被并行 session
+pin 到 0.1.70（`…portal@sha256:9b9b5e91…`，容器 RepoDigests 已核），而
+- `FDE_IMAGE=sha256:b94c72fc…` 是**本地 build**（`erix-station/fde:local`，`RepoDigests` 为空），不是发布件；
+- `STATION_DOCKER_PROXY_IMAGE=sha256:19c62c83…` 指向的镜像**本机根本不存在**（`No such image`）。
+
+⇒ 三处统一成形态①（manifest digest，两形态门认的那一形）：
+`FDE_IMAGE=…/erix-station-fde@sha256:625780a0…`（`docker pull` 6m32s，落盘 `.Id = c929c1ea…`，与 registry
+`config.digest` 逐字相同）、`STATION_DOCKER_PROXY_IMAGE=…/erix-station-fde-proxy@sha256:fb82e65d…`
+（`.Id = 79dbb1f4…`）；portal 原 pin 未动。备份 `/tmp/deploy.env.bak-261117-01`。
+`docker compose -f deploy/docker-compose.yml up -d` ⇒ `station-docker-proxy` + `station-portal` **Recreated**、
+两容器 healthy，`Config.Image` 与 pin 逐字一致。读数：`/api/health` = `0.1.70 / revision a5deeb7 / built_at
+2026-11-16T16:43:52Z`，容器内 `/app/build-info.json` = `0.1.70 / engine 0.33.0 / a5deeb7 / 同一 built_at`
+（**revision 与 tag 指向的 commit 一致** ⇒ 跑的是 CI 烘的那份，不是本地乱建）。
+`E2E_UI=1 npm run test:integration:version`（#603 固化的真机判据）⇒ **5/5 rc=0**（含真浏览器 U1 腿）。
+
+**两件如实记**：
+- **FDE 容器没重建**：`fde-eric` 在 `sha256:b94c72fc…`（本地 build，6h）、其余四台在 `sha256:d4b7cde4…`（13h），
+  都**不是**新 pin 的 `c929c1ea…`。runbook §2 第 5 条要求换 FDE 镜像必须显式 `docker rm -f` + `provision-fde`
+  ⇒ 会**杀掉在飞的 run**，故留给用户拍板，不顺手做（`ensureFdeContainer` 只在容器不存在时创建，pin 变化
+  不会自己生效——这正是它不生效的原因）。
+- **`v0.1.71` 的 tag 还空着**：main 已是 `0.1.71`（`#612`，`f50dd4b`），但 `git tag -l 'v0.1.7*'` 只有
+  `v0.1.7` / `v0.1.70`。§8.155 计划的重切**只差打 tag 这一步**，属并行 session 的账，本单不代打
+  （同一版本两个 session 各打一次正是 §8.154 要记的那种混乱）。
