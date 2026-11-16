@@ -1261,7 +1261,8 @@ describe('#300/#502 partial_output：只订不回放的展示项', () => {
 
   // ---- issue #502 形态 M：`roundSeq` 双闸（旧版靠 `uptoSeq` 猜水位线，形态 M 换成两端对同一个事实）----
   // 下面四条是本单的前端红线：「少一段」可接受（刷新即回），「盖错」不可接受（把别轮/别的 run
-  // 的正文扣到当前气泡上）⇒ 不中整帧丢弃。不用 `w.emitted()`：本 composable 不挂组件，
+  // 的正文扣到当前气泡上）⇒ 不中整帧丢弃。不用 test-utils 的 `emitted()`（它靠 devtools hook，
+  // `NODE_ENV=production` 下恒空，见 AGENTS.md §4 / issue #496），且本 composable 也不挂组件，
   // 判据全部走导出面 `s.deltaText`（与同文件其余用例同一口径）。
 
   it('#502 形态 M 闸②（不匹配 ⇒ 整帧丢弃）：roundSeq 不是本连接观测到的当前轮 ⇒ 不盖正文也不清气泡', () => {

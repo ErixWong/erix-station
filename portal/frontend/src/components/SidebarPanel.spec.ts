@@ -10,6 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
+import { defineComponent, h, reactive } from 'vue';
 import { createMemoryHistory } from 'vue-router';
 import SidebarPanel from './SidebarPanel.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
@@ -37,6 +38,22 @@ async function mountPanel(
   opts: { dirs?: DirInfo[]; sessions?: Session[]; noDir?: boolean; adminUser?: boolean; attachTo?: boolean } = {},
   attrs: Record<string, unknown> = {},
 ) {
+  const router = await setupPanel(opts);
+  // issue #107：重命名用例需断言 document.activeElement（autofocus 全选）——挂到真实文档才成立；
+  // 这类用例自行 wrapper.unmount() 清理，避免残留在 body 里干扰后续用例。
+  const wrapper = mount(SidebarPanel, {
+    global: { plugins: [router, i18n] },
+    attrs,
+    attachTo: opts.attachTo ? document.body : undefined,
+  });
+  await flushPromises();
+  return wrapper;
+}
+
+/** 侧栏用例的 fixtures（目录/会话直填 store + auth 探测定死 + memory 路由）；挂载方式由调用方决定。 */
+async function setupPanel(
+  opts: { dirs?: DirInfo[]; sessions?: Session[]; noDir?: boolean; adminUser?: boolean } = {},
+) {
   const store = useWorkbenchStore();
   store.dirs = opts.dirs ?? [];
   store.dirCwd = opts.dirs?.[0]?.cwd ?? null;
@@ -53,13 +70,31 @@ async function mountPanel(
   const router = createAppRouter(createMemoryHistory());
   router.push('/');
   await router.isReady();
-  // issue #107：重命名用例需断言 document.activeElement（autofocus 全选）——挂到真实文档才成立；
-  // 这类用例自行 wrapper.unmount() 清理，避免残留在 body 里干扰后续用例。
-  const wrapper = mount(SidebarPanel, {
-    global: { plugins: [router, i18n] },
-    attrs,
-    attachTo: opts.attachTo ? document.body : undefined,
+  return router;
+}
+
+/**
+ * issue #496：「向上透传」类判据的**观测方式**——把侧栏包在一个宿主里，`files-changed` 走父级
+ * 回调（vnode props 上的 `onFilesChanged`）并**复述进 DOM**，断言读渲染文本。
+ * 为什么不用 emitted()：它靠 Vue devtools hook，`NODE_ENV=production` 下不发事件 ⇒ 恒空（AGENTS.md §4）；
+ * 而且旧那半句 `expect(emitted('files-changed')).toBeUndefined()` 在生产下**永远成立**（假绿）。
+ * 侧栏的事件契约（`SidebarPanel.vue:49` / `:578`）未动。
+ */
+async function mountPanelInHost(
+  opts: { dirs?: DirInfo[]; sessions?: Session[]; noDir?: boolean; adminUser?: boolean } = {},
+) {
+  const router = await setupPanel(opts);
+  const seen = reactive({ filesChanged: 0 });
+  const Host = defineComponent({
+    setup() {
+      return () =>
+        h('div', [
+          h(SidebarPanel, { onFilesChanged: () => { seen.filesChanged += 1; } }),
+          h('span', { 'data-test': 'host-files-changed-count' }, String(seen.filesChanged)),
+        ]);
+    },
   });
+  const wrapper = mount(Host, { global: { plugins: [router, i18n] } });
   await flushPromises();
   return wrapper;
 }
@@ -1235,19 +1270,20 @@ describe('SidebarPanel · 端口区块与底部堆叠区（issue #308 + #468 追
 //   组件侧（DirectoryTree.spec）钉「树 emit 了」，视图侧（WorkbenchView.spec）钉「灯被重判」，
 //   中间这一环（侧栏透传）没有自己的判据就会整条断掉而两侧全绿 —— 典型的「链上每环都有人以为
 //   别人钉过了」。顺带钉住「侧栏不自己拉灯」：git-light 的数据所有权在视图侧的 useGitLight。
+//   issue #496：这一环现在读宿主 DOM 复述（`mountPanelInHost`），不再读 emitted()。
 // ---------------------------------------------------------------------------
 describe('SidebarPanel · files-changed 透传（issue #472）', () => {
   const DIR_A: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
 
   it('目录树 emit files-changed ⇒ 侧栏原样向上 emit，且自己不发 /api/git-light', async () => {
-    const wrapper = await mountPanel({ dirs: DIR_A });
+    const wrapper = await mountPanelInHost({ dirs: DIR_A });
     await flushPromises();
-    expect(wrapper.emitted('files-changed')).toBeUndefined();
+    expect(wrapper.get('[data-test="host-files-changed-count"]').text()).toBe('0');
 
     wrapper.findComponent(DirectoryTree).vm.$emit('files-changed');
     await flushPromises();
 
-    expect(wrapper.emitted('files-changed')).toHaveLength(1);
+    expect(wrapper.get('[data-test="host-files-changed-count"]').text(), '侧栏必须原样透传一句').toBe('1');
     const urls = vi.mocked(fetch).mock.calls.map(([u]) => (typeof u === 'string' ? u : u instanceof URL ? u.href : u.url));
     expect(urls.some((u) => u.startsWith('/api/git-light')), '侧栏不该越过视图去拉收工灯').toBe(false);
   });
