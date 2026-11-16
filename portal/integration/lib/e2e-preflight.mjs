@@ -181,9 +181,15 @@ export function assertComposeEnvFile({
  *
  * 为什么走链而不是只看叶子：`existsSync` / `readFileSync` 在「祖先目录没权限」与「文件没生成」两种
  * 情况下都只是返回 false / 抛 ENOENT，光看叶子分不开。走链才能给出**具体是哪一段**：
- *  · `blocker` —— 这一段存在但进不去（缺 R_OK|X_OK，或它根本不是目录，或它的 `stat` 被权限挡了）⇒
- *    再等也不会变，权限不是时间问题；
+ *  · `blocker` —— 这一段存在但**够不到**：非叶子段缺的是**穿越**（`X_OK`）、叶子段缺的是**读**（`R_OK`），
+ *    或它根本不是目录，或它的 `stat` 被权限挡了 ⇒ 再等也不会变，权限不是时间问题；
  *  · `missingPrefix` —— 前面的段都能进，但这一段自己还不存在 ⇒ 物化真的没发生（或还没轮到它）。
+ *
+ * ⚠ 可达性**掩码**口径（第三轮 BLOCKER，别再改回去）：走查里对**非叶子段**只要求 `X_OK`，**不要求** `R_OK`。
+ *   理由：拿到**已知文件名**去读子文件，内核只要求祖先链上每段有 `x`（穿越）；`r` 只对「列目录」必要。
+ *   一旦写成 `R_OK | X_OK`，`chmod 0o111` 的 bind 源（可穿越、不可枚举，真实摆法）就被判成「读不到」：
+ *   真 `readFileSync` 读得到，观测却报 `unreadable`，等待器 12–53 ms 就假红判死（一个 100 ms 后才物化的
+ *   正常场景直接被打死）——**假红比原缺陷贵**，所以这条是 BLOCKER。
  *
  * ⚠ 归因口径（第二轮 MED 修的正是这一条）：走查里的 `statSync` **失败**要按 **errno** 分流，**不能吞**——
  *  `ENOENT`/`ENOTDIR` ⇒ `missingPrefix`（真没物化）；`EACCES`/`EPERM` ⇒ `blocker{reason:'no-permission'}`
@@ -193,9 +199,10 @@ export function assertComposeEnvFile({
  *
  * @param {string} filePath 要观测的宿主路径（绝对或相对当前目录）
  * @param {{fsImpl?: typeof import('node:fs')}} [options]
- * @returns {{blocker: null | {path: string, reason: 'no-permission' | 'not-a-directory', mode: string | null, owner: string | null}, missingPrefix: string | null, links: object[]}}
+ * @returns {{blocker: null | {path: string, reason: 'no-permission' | 'not-a-directory', mode: string | null, owner: string | null, missingAccess?: 'X_OK' | 'R_OK' | null}, missingPrefix: string | null, links: object[]}}
  *   `links` = 走查过的每一段的**链接事实**（`lstatSync`，不跟随）——只是多一条可诊断的账，
  *   不参与归属判断（为什么需要它：见 `observeSegmentLink`）。提前 return 时也把已走到的段带回去。
+ *   `blocker.missingAccess` 说的是**这一次要而没拿到的那一位**（祖先 `X_OK` / 叶子 `R_OK`），文案据此出话。
  */
 export function inspectHostPathChain(filePath, { fsImpl = fs } = {}) {
   const abs = path.resolve(filePath);
@@ -236,11 +243,16 @@ export function inspectHostPathChain(filePath, { fsImpl = fs } = {}) {
       };
     }
     try {
-      fsImpl.accessSync(current, isLeaf ? R_OK : R_OK | X_OK);
+      // ⚠ 掩码分两种（第三轮 BLOCKER）：祖先段只要**可穿越**（`X_OK`）就够得到已知文件名的子文件，
+      // `R_OK` 只对「列目录」必要（要求它 ⇒ `0o111` 的 bind 源被误判「读不到」）；叶子段要的是**读**。
+      fsImpl.accessSync(current, isLeaf ? R_OK : X_OK);
     } catch (error) {
       if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { blocker: null, missingPrefix: current, links };
       return {
-        blocker: { path: current, reason: 'no-permission', mode: modeOf(stat), owner: ownerOf(stat), factsFrom: 'stat' },
+        blocker: {
+          path: current, reason: 'no-permission', mode: modeOf(stat), owner: ownerOf(stat), factsFrom: 'stat',
+          missingAccess: isLeaf ? 'R_OK' : 'X_OK',
+        },
         missingPrefix: null,
         links,
       };
@@ -405,6 +417,8 @@ export function observeHostPath(filePath, { fsImpl = fs } = {}) {
         blocker: {
           path: path.resolve(filePath), reason: 'no-permission',
           mode: modeOf(statOrNull(filePath, fsImpl)), owner: ownerOf(statOrNull(filePath, fsImpl)),
+          // 叶子级 EACCES：缺的就是**读**这一位（文案不许退成「缺 R_OK|X_OK」那种笼统口径）
+          missingAccess: 'R_OK',
         },
       };
     }
@@ -425,22 +439,57 @@ function diagnosticsTail(describe) {
   return trimmed ? `\n—— 容器侧现场快照 ——\n${trimmed}` : '';
 }
 
+/**
+ * `blocker` 的**人话归因**：要说清「缺的是哪一位」，不能一律写成「读不到」。
+ *
+ * 为什么不能笼统（第三轮 BLOCKER 的文案那一半）：祖先目录缺的是**穿越**（`X_OK`），叶子缺的是**读**（`R_OK`）。
+ * 对祖先高喊「读不到」会把人推向查 uid/组（而真正要看的其实是挂载源的 mode 里那一格 `x`）；
+ * 说清缺哪一位，才能一句定案该 `chmod +x` 还是该 `chown`。
+ */
+function blockerWhy(blocker) {
+  if (blocker.reason === 'not-a-directory') return '链上这一段不是目录';
+  if (blocker.missingAccess === 'X_OK') {
+    return '这一段**不可穿越**（缺 `X_OK`）——它是祖先目录：不可穿越就根本够不到下面的文件'
+      + '（列目录的 `R_OK` 不是必需的，不需要能 `ls` 它）';
+  }
+  if (blocker.missingAccess === 'R_OK') {
+    return '这一段**不可读**（缺 `R_OK`）——路径本身能定位到，是**内容**读不出来';
+  }
+  // stat 自己就被挡（典型：要跟随链接穿过一个没 `x` 的目录）⇒ 缺的到底是哪一位探不出来，只说被挡这件事。
+  return '缺可达性（`R_OK`/`X_OK` 这一类，但 `stat` 自己就被挡住 ⇒ 探不出具体是哪一位）';
+}
+
+/** 按「缺的是哪一位」给一句**可执行**的修法（笼统一句「查 uid/组」会把人带去改错东西）。 */
+function blockerFixHint(blocker) {
+  if (blocker.reason === 'not-a-directory') return '（链上这一段根本不是目录 ⇒ 把它换成目录，或把 bind 源指对）';
+  if (blocker.missingAccess === 'X_OK') {
+    return '    ⇒ 要修的是**穿越**：给这一段加 `x`（`chmod +x`）或把自己放进它的组；不需要能 `ls` 它'
+      + '（`0o111` 这类的 bind 源是合法摆法，`R_OK` 与此无关）。';
+  }
+  if (blocker.missingAccess === 'R_OK') {
+    return '    ⇒ 要修的是**读**：这一段自己的 mode/属主（上游目录的 `x` 已经过了，不必去改它）。';
+  }
+  return '    ⇒ `stat` 自己就被挡住 ⇒ 挡人的多半在**链接目标那一侧**的目录（先按下面那条 `resolvedTarget` 查）。';
+}
+
 /** 「存在但读不到」的文案：点名被挡的段 + 权限/属主 + 最可能的原因（FDE_USER_UID/GID）。 */
 function unreadableMessage(name, observed, extra) {
   const { uid, gid } = selfIds();
   const blocker = observed.blocker ?? {};
-  const why = blocker.reason === 'not-a-directory' ? '链上这一段不是目录' : '缺 R_OK|X_OK（读或穿越）';
+  const why = blockerWhy(blocker);
   // 走查里的 stat 被权限挡住时，mode/owner 是退到 lstat 取的——说的是这一段本体，必须说出来。
   const factsFrom = blocker.factsFrom === 'lstat'
     ? '，取自 **lstat**（`stat` 这次被挡住了 ⇒ 这组数字是这一段本体；若它是链接，说的是链接自己而不是目标那一侧）'
     : '';
   return [
-    `${name}：已经存在，但当前用户**读不到**（不是「没物化」——文件很可能早就写出来了）。`,
+    `${name}：已经存在，但当前用户**够不到**它（不是「没物化」——文件很可能早就写出来了）。`,
     `  被挡住的一段：${blocker.path ?? '?'}`,
-    `    原因：${why}；mode=${blocker.mode ?? '这次探不到（lstat 也被挡）'} owner=${blocker.owner ?? '这次探不到（lstat 也被挡）'}${factsFrom} 当前 uid/gid=${uid}/${gid}`,
+    `    缺的是哪一位：${why}`,
+    `    mode=${blocker.mode ?? '这次探不到（lstat 也被挡）'} owner=${blocker.owner ?? '这次探不到（lstat 也被挡）'}${factsFrom} 当前 uid/gid=${uid}/${gid}`,
     '  ⇒ 多半是 FDE_USER_UID / FDE_USER_GID（deploy/.env，portal/src/config.js 缺省 1000/1000）与你自己的 uid/gid',
     '    不一致：portal 以 root 把 FDE 目录建成 0770 node:node，组外用户根本进不去（issue #495 ②）。',
-    '  ⚠ 旧写法 fs.existsSync 在这种路径上返回 false ⇒ 症状与「真的没物化」逐字相同，这条文案就是把两者分开。',
+    blockerFixHint(blocker),
+    '  ⚠ 旧写法 fs.existsSync 在这种路径上返回 false ⇒「读不到」与「真的没物化」症状逐字相同，这条文案就是把两者分开。',
     formatAncestorLinkLines(observed.links),
     formatLastSegmentLinkLine(observed.link),
     extra ?? '',
