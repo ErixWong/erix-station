@@ -45,6 +45,8 @@ import * as uploadSettings from './upload-settings.js'; // #485 片 A：单文�
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
 import * as delegation from './delegation.js'; // 子 run（delegation）读侧：名册 + 账本两个只读端点
+import * as macroRoutes from './macro-routes.js'; // #526：宏平台 HTTP 业务层（if 链只做「匹配+鉴权+转发」，不再撑大本文件）
+import { MacroError } from './macros.js'; // #526：宏域错误载体（httpStatus 自带在错误上，一处映射）
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -802,6 +804,12 @@ export function createServer({
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof MacroError) {
+        // #526 宏域（macros.js / macro-routes.js / notifications.js 共用这一种错误载体）：
+        // httpStatus 自带 ⇒ 与 SessionError/DelegationError 同形映射，零新错误码。
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       log.error?.('[portal] unhandled:', err);
       if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
       else res.destroy();
@@ -1188,6 +1196,61 @@ async function routeApi(req, res, ctx, url) {
     if (req.method === 'GET') return handleGetRunArtifact(req, res, ctx, runId);
   }
 
+  // ---- #526 宏平台用户面（契约 10 篇 §3.2；⚠ 不能放 `/api/admin/*`——#450 白名单）。
+  // 本链只做「正则匹配 → requireSession → 调 macro-routes → sendJson」，业务全部在 macro-routes.js；
+  // 属主校验在其内部走 `fetchSession`（非属主/不存在都 404，不泄露存在性）。
+  if (req.method === 'GET' && pathname === '/api/macro-templates') {
+    await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.userTemplates({ pool: ctx.pool }));
+  }
+  // ⚠ `unread-count` 排在 `/notifications/:id/read` 之前：两段都是 `/api/notifications/xxx`，
+  // 后者的 `:id` 能吃掉 `unread-count`（同名空间里的静态段要先注册，口径同 macro-runs/summary）。
+  if (req.method === 'GET' && pathname === '/api/notifications/unread-count') {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.notificationsUnreadCount({ pool: ctx.pool, userId: s.user.id }));
+  }
+  const notifReadMatch = pathname.match(/^\/api\/notifications\/([^/]+)\/read$/);
+  if (req.method === 'POST' && notifReadMatch) {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.notificationMarkRead({
+      pool: ctx.pool, userId: s.user.id, notificationId: decodeURIComponent(notifReadMatch[1]).toLowerCase(),
+    }));
+  }
+  if (req.method === 'GET' && pathname === '/api/notifications') {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.notificationsList({ pool: ctx.pool, userId: s.user.id, query: url.searchParams }));
+  }
+  const sessMacroAssignMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/macro-assignments$/);
+  if (sessMacroAssignMatch) {
+    const s = await requireSession(req, ctx);
+    const sessionId = decodeUuid(sessMacroAssignMatch[1]);
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await macroRoutes.sessionAssignments({ pool: ctx.pool, sessionId, userId: s.user.id }));
+    }
+    if (req.method === 'PUT') {
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      return sendJson(res, 200, await macroRoutes.putAssignment({ pool: ctx.pool, sessionId, userId: s.user.id, body }));
+    }
+  }
+  const sessMacroAssignOneMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/macro-assignments\/([^/]+)$/);
+  if (req.method === 'DELETE' && sessMacroAssignOneMatch) {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.deleteAssignment({
+      pool: ctx.pool,
+      sessionId: decodeUuid(sessMacroAssignOneMatch[1]),
+      userId: s.user.id,
+      assignmentId: decodeUuid(sessMacroAssignOneMatch[2]),
+    }));
+  }
+  if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/macro-runs$/.test(pathname)) {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.sessionMacroRuns({
+      pool: ctx.pool, userId: s.user.id,
+      sessionId: decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/macro-runs$/)[1]),
+      query: url.searchParams,
+    }));
+  }
+
   // ---- admin LLM 配置（issue #38 Phase A；requireAdmin 鉴权） ----
   if (pathname.startsWith('/api/admin/')) {
     return handleAdminApi(req, res, ctx, url);
@@ -1210,6 +1273,39 @@ async function requireAdmin(req, ctx) {
 async function handleAdminApi(req, res, ctx, url) {
   const { pathname } = url;
   const session = await requireAdmin(req, ctx); // 所有 /api/admin/* 端点统一先鉴权
+
+  // ---- #526 宏平台管理台（契约 10 篇 §3.3；业务在 macro-routes.js，本处只转发）----
+  if (pathname === '/api/admin/macro-templates') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await macroRoutes.adminTemplates({ pool: ctx.pool, query: url.searchParams }));
+    }
+    if (req.method === 'POST') {
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      return sendJson(res, 200, await macroRoutes.adminCreateTemplate({ pool: ctx.pool, body, adminUserId: session.user.id }));
+    }
+  }
+  const adminMacroTemplateMatch = pathname.match(/^\/api\/admin\/macro-templates\/([^/]+)$/);
+  if (adminMacroTemplateMatch) {
+    const templateId = decodeUuid(adminMacroTemplateMatch[1]);
+    if (req.method === 'PATCH') {
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      return sendJson(res, 200, await macroRoutes.adminPatchTemplate({ pool: ctx.pool, templateId, body }));
+    }
+    if (req.method === 'DELETE') {
+      return sendJson(res, 200, await macroRoutes.adminDeleteTemplate({ pool: ctx.pool, templateId }));
+    }
+  }
+  // ⚠ `summary` 必须排在 `/macro-runs/:id` 之前：否则字面量 `summary` 会被当成 run id 吞掉。
+  if (req.method === 'GET' && pathname === '/api/admin/macro-runs/summary') {
+    return sendJson(res, 200, await macroRoutes.adminRunsSummary({ pool: ctx.pool, query: url.searchParams }));
+  }
+  const adminMacroRunMatch = pathname.match(/^\/api\/admin\/macro-runs\/([^/]+)$/);
+  if (req.method === 'GET' && adminMacroRunMatch) {
+    return sendJson(res, 200, await macroRoutes.adminMacroRunDetail({ pool: ctx.pool, runId: decodeUuid(adminMacroRunMatch[1]) }));
+  }
+  if (req.method === 'GET' && pathname === '/api/admin/macro-runs') {
+    return sendJson(res, 200, await macroRoutes.adminMacroRuns({ pool: ctx.pool, query: url.searchParams }));
+  }
 
   const adminGitCredentialMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/git-credential$/);
   if (adminGitCredentialMatch) {
