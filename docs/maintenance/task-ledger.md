@@ -6007,3 +6007,183 @@ proxy reason 退回只报 subnet ⇒ `not ok 10`；`isCidrInPools` 对 10.201 �
   操作者说明——本轮只在 §6 第 2 条重写了两腿口径，没动那三条手工清单的其余部分。
 - `IPAM_RESERVED_SUBNETS` 保留不动（两腿分离后它不再是"不撞"的承重件，但仍是共享栈也在同一段里时
   的逃生口；wp3b 头注已按此改口径）。
+
+
+### 8.134 #520 收尾：另外 3 个队列循环改空闲退避，reaper/drift 钉成定时语义（issue #520 / 工单 fix-261116-01，2026-11-16）
+
+> **编号由主 agent 统一分配（本批并行）**——本节号不是我自己挑的：8.127–8.133 已被同批其它单占用，
+> 本文件当前最大可见号还是 8.126（worktree 基线 `c8613a3`）。按 §「规矩」不自己取号、不重排。
+
+**过程**：60 分钟时间闸掐了一次，现场靠「每完成一个里程碑就 commit」保住了（三个 commit：
+`972da21` 代码 / `3b826f7` 用例 WIP / `41cf90c` 用例改确定性 + 23/23 绿）。**没 push、没开 PR、没合 main**。
+
+**接线一共 5 处**（判据 2 的两支都用了，不是一律退避）：
+
+| 循环 | 处置 | 空闲拍频 | 有活时 |
+|---|---|---|---|
+| onboarding | 退避（`ONBOARDING_IDLE_BACKOFF_MAX_MS`=30000） | 5000→10000→20000→30000 | 立刻回 5000 |
+| offboarding | 退避（`OFFBOARDING_IDLE_BACKOFF_MAX_MS`=30000）；**1h 工作区清理不跟着退**（定时语义） | 同上 | 立刻回 5000 |
+| provisioner | 退避（`PROVISIONER_IDLE_BACKOFF_MAX_MS`=**15000**，比另两个小一档：漂移发现延迟是它的业务承诺） | 5000→10000→15000 | 本轮动了手就回 5000 |
+| reaper | **不退避**（15s = 租约 90s 的 1/6，退避会偷走崩溃后发现延迟）；只把 sleep 改可中断 + 交 `done` | 恒 15s | — |
+| drift monitor | **不退避**（盘上人手改动没有通知源，周期就是发现延迟） | 恒 60s | — |
+
+三个新退避循环的句柄顺带补成 #506 同形（`stop`/`done`/`settled`/`failure`）：**改前 `stopLoopsAndWait`
+对它们是「记账跳过」**（只有裸 `stopped` 标志 + 不可中断 sleep），改后 `waited` 从 0/4 变 4/4。
+另：`reconcileDidWork()` 单独导出——`stats.ensured` **不能**当「有活」信号（它对每个 desired 行都 +1，
+拿它判活退避永不生效）。
+
+**测量方法 + 基线落到了 `docs/ops/db-idle-load.md`**（判据 1 要「有据」，方法不可复现就等于没测）。
+现测读数（`docker exec station-db psql`，只读；**`station-portal` 里是旧代码 ⇒ 这些都是「改前」基线**）：
+30.29s / 30.29s / 32.28s 三个短窗口 = **11.23 / 12.02 / 11.74 事务/秒**，再补 300.28s 长窗口 = **11.34 /秒**。
+
+**判据 1（空闲 < 3 事务/秒）判为 `BLOCKED-on-deploy`**，理由不是「没测到」而是**测到了但测的是旧代码**：
+正在跑的容器里没有本单的代码，且**不许重启共享 dev 栈**（`station-*` 全栈给别人用）。单元级替代证据见
+`docs/ops/db-idle-load.md` §3 的算式（每拍语句数用假 pool 数出来 × 拍频）：provisioner **32 条/拍**（6 FDE 稳态、
+1 FDE 时 7 条）、routes/materializer 各 **4 条/拍**（实测）、onboarding/offboarding 各 **3 条/拍**、
+reaper **1 条/拍**（0 个到期租约）。⇒ 本单省掉约 5 条语句/秒，但 **#506 的 2s 上限自己就是 4 条/秒的地板**，
+所以 <3/秒**本单单独做不到**，期望值 ≈ 6–7/秒。要真达标得抬 `*_IDLE_BACKOFF_MAX_MS` 或改 `LISTEN/NOTIFY`
+（#506 的口径变更，需拍板）——**这是本单交付里最该被看的一条结论**。
+
+**`chat_sessions` 0.9/秒 现查结论：不是这 7 个循环里的任何一个**（逐条 SQL 排除：provisioner 那条在
+`deprovisionFde`、offboarding 那条在 `disable-user` 步骤、reaper 只在合成 `run_end` 时才碰会话，空闲路径
+全都不碰）。剩下最像的是 **agentd 长轮询 claim**（`holdMs=30000`，等待前后各一次 `tryClaim`，候选语句
+`FROM run_queue q2 JOIN runs r JOIN chat_sessions s`）与**心跳**（`ERIX_HEARTBEAT_MS`=15s，实测份额
+`fde_llm_bindings` 0.40/秒、`port_observations` 0.67/秒 与它对得上）。**没做到精确拆分**：语句级归因在本机
+拿不到——`pg_stat_statements` 没装（要改 `shared_preload_libraries` = 重启库），Traefik 访问日志与 portal
+请求日志都不打，而 `pg_stat_activity` 两种采样**全部 0 命中**（4ms×7500 与 0.5ms×40000；语句短于亚毫秒）。
+
+**用例（`portal/test/idle-backoff-520.test.js`，23 格全绿，整文件 0.36s 跑完）**——判据 3 的形状是
+「断言观察到的 sleep 毫秒序列」。第一版被自己的夹具骗了四次，都记在这儿（**都是能复用的坑**）：
+
+1. **假睡眠永不自己醒 ⇒ 每一拍都得测试放行**：直接 `parkedTick(3)` 而不放行前 2 拍 = 永远等不到（4 格假红）。
+   补了 `parkAt()`。
+2. **拍与 sleep 的对应关系**：循环是「干活 → 决定这拍睡多久 → 睡」，所以 `sleeps[i]` 是**第 i+1 拍干完活之后**
+   的决定 ⇒ 要让某一拍「有活」，必须在它**还没开始干**之前翻标志（= 上一拍还停在 sleep 上时翻）。
+   先 `pass()` 再翻标志，测的是「上一拍」，看着像测了其实没测。
+3. **假 docker 顶不住真实契约校验 ⇒ 假绿**：`inspectNetwork` 少了 `station.managed`/IPAM 时
+   `assertNetworkContract` 抛错被 per-FDE 的 catch 吞掉，`stats` 恒 0，「本轮动手 ⇒ 回基准」那格
+   实际在断言一个**从未发生**的重建。补：网络 Labels+IPAM、容器 `State.Status='running'`、
+   `ERIX_STATION_TOKEN` 与 `runner_token_hash` **同源**算（`hashToken(TOKEN)`，#404 F6 会核它）。
+4. **`workspaceRetentionDays` 是功能开关不是参数**：0 ⇒ `sweepOffboardedWorkspaces` 直接
+   `return {disabled:true}`，一条 SQL 都不跑 ⇒ 「空闲时 1h 清理照样跑」那格变成断言一个从未跑的查询。
+
+**红线遵守情况（工单 (d) 与 #531）**：**没有**拿真实墙钟或 `setImmediate` 轮次当判据——假时钟推进由测试
+负责；`stop()` 可中断性的判据改成「假睡眠不会自己醒 ⇒ `settled` 能落定就只可能来自 abort」，另留一个
+20s watchdog **只防挂死、不当判据**；优雅关闭那格用 `stopLoopsAndWait` 自己的 `timedOut/pending` 当判据。
+**没动** #506 那三个旧夹具（`env-int-strict-506e` / `idle-backoff-506*`，#531 在它们身上）。
+
+**变异自证（每条都跑过，点名红的格子；`not ok` 原文在交付报告里）**：撤 onboarding 退避接线 →
+B1/B2/B3/B4/F1 五格红；**只撤 reset**（有活也不清 `idleTicks`）→ **只有 B2 一格红**（B1 仍绿）；
+offboarding 同法 → 只有 C2 红；provisioner 用 `ensured` 当活信号 → D0/D1/D2/D3 四格红；
+reaper 周期 15s→30s → E1/E3 红；drift 周期 60s→120s → E4 红；**四个句柄各自撤掉 `done`** → F1 红
+（`waited` 4→3），这条是「接线锁」——最容易假装做完的一格，已锁死。
+
+**没动的东西（红线）**：`routes.js` / `materializer.js` 里 #506 那两份 `idleDelayMs`/`sleepCancellable`/
+`envInt` **没回改**（它们在 #506 改动面里，现在动必然合并撞车；本单新循环用
+`portal/src/loop-timing.js` 的共用那份）；认领 SQL / 租约时长 / `BACKOFF_MS` 失败重试节拍都没动；
+`reconcileOnce` 那条 adopt 分支的**无条件 `UPDATE containers SET image=...`** 是真正的写放大
+（300s 窗口里 `containers` 被写 1.32 次/秒），**没顺手改**——改它属于改业务语义，见下方遗留。
+
+**遗留 / 该开的下一单**：
+1. **判据 1 待部署后复测**（`docs/ops/db-idle-load.md` §5 给了复测口径与期望值 6–7/秒）。
+2. **<3/秒 需要动 #506 的 2s 上限**（或 outbox 改事件驱动）——口径变更，要拍板。
+3. **adopt 那条无条件 UPDATE**（每拍每 FDE 写一次 `containers`）可改成 `IS DISTINCT FROM` 再省一截，
+   与 #404 的 F6 同形；本单没动。
+4. `chat_sessions` 的精确拆分要 `pg_stat_statements`（scratch 库）或给 internal 请求加 `application_name`。
+5. 三个新循环的 `done`/`settled` 现在被 `stopLoopsAndWait` 等到了 ⇒ **若哪个循环卡在长事务里，关闭会等满预算**
+   （仍是有界的，`gracefulShutdown` 的总预算没动）；真要观察这个，跑一次 SIGTERM 看 `[shutdown]` 那行读数。
+
+#### 8.134.1 PR #552 返工：第三方审计 4 条 LOW 的处置（issue #520 / 工单 fix-261116-01，2026-11-16）
+
+主 agent 验收并开了 PR #552（他亲验：新用例 23/23、变异「有活不 reset」恰红 1 格 B2、reaper 周期 15s→20s
+⇒ E1+E3 红、根 2379/2365/0 fail）。第三方对抗审计回来 **零 BLOCKER / 零 MED / 4 条 LOW**，其中两条推翻我
+原来的判断（下面逐条记「原判断 → 撤销后的结论」）。提交链（在 `972da21→3b826f7→41cf90c→cf7afea` 之上**只做新增**）：
+`693ee99`（LOW-2 代码）、`cb50832`（LOW-1 compose/.env.example + 三腿判据）、`6a64cfb`（LOW-3/LOW-4 文档与用例加固）。
+
+**LOW-1（撤销我的判断，改代码）：三根旋钮在标准部署里传不进去。**
+事实：`deploy/docker-compose.yml` 的 `station-portal` 是**显式 `environment` 列表、无 `env_file`**（该文件
+`FILE_UPLOAD_MAX_BYTES` 那条注释自己就写着），列表里没有 `ONBOARDING_/OFFBOARDING_/PROVISIONER_IDLE_BACKOFF_MAX_MS`
+⇒ 运维在 `deploy/.env` 写 `PROVISIONER_IDLE_BACKOFF_MAX_MS=5000` **完全不生效且不报错**。
+我原来写「不登记也行（这三根是可选调优，不是必须暴露的运维面）」——**撤销**：同一族病在 #472（评审 major 8）、
+#270（IPAM 三腿）、#450（管理台端口三处）都已立过先例，「可选调优」恰恰是最没人当场验证的那类。
+处置：compose 显式登记三条 `${…:-30000}/${…:-30000}/${…:-15000}`（缺省与代码常量**逐字相等**）+
+`deploy/.env.example` 同形登记 + `docs/env.md` §10.1 入表；新用例 `portal/test/deploy-env-idle-backoff.test.js`
+把**三腿**钉住：compose 插值缺省 == 代码缺省常量（从被测模块 import，不在测试里再抄一个）== **循环真正生效的封顶值**
+（真起循环读 sleep 毫秒序列；只比常量会漏「常量对但循环焊死在缺省上」）。
+变异自证（每次只跑 `node --test portal/test/deploy-env-idle-backoff.test.js`，红了立刻还原，提交前 `grep -rn MUTANT portal` = 0）：
+- M-1 只改 YAML 一个缺省值 `15000→16000` ⇒ **恰红 1 格** `not ok 2 - G2`，消息点名旋钮与两个数（`16000 !== 15000`）。
+- M-2 删掉 compose 里 `ONBOARDING_…` 那条登记 ⇒ `not ok 1 - G1` + `not ok 2 - G2`（登记腿与一致腿同红，符合预期）。
+- M-4 三个循环的旋钮焊死在缺省常量（接线断）⇒ `not ok 4 - G4` + `not ok 5 - G2b`；**`not ok 2 - G2` 仍绿**
+  —— 这正是 G2b 存在的理由。同一组变异下 `idle-backoff-520.test.js` 23/23 **全绿** ⇒ 旧文件看不见 env 接线断。
+
+**LOW-2（成立，改代码）：provisioner 的「15s 上限」不是硬上限。**
+事实：`PROVISIONER_IDLE_BACKOFF_MAX_MS=60000` 被接受并真产生 60s 延迟（解析器只守共享的
+`MAX_BACKOFF_MS_SAFE=60000`），而注释把 15s 叫「上限」。一个 env 能把「漂移即修」的发现延迟**静默放宽 4 倍**。
+主 agent 选「按循环钳制」而不是「改口径」，理由认同：漂移发现延迟是这个循环的业务承诺，不该由运维面单方面放宽。
+处置：`resolveIdleBackoffMaxMs({log,env})` ⇒ 先过严格正整数校验，再按 `IDLE_BACKOFF_MAX_MS_BUSINESS_CAP=15000` 钳，
+越界 ⇒ **钳到 15000 + warn 点名旋钮与钳后值**（不静默）。开户/销号**故意不钳**（它们的业务上限就是共享的 60s，
+注释里「要更激进就配 60000」必须能兑现 ⇒ G4 里放了对照组）。顺带给三个循环开 `env = process.env` 注入缝、
+`loop-timing.envInt` 支持 `env` 选项（注入口比「往 process.env 塞了再记得删」少一类交叉污染）。
+判据读数：`G4` 里 `env=60000` ⇒ 生效值 **15000**、warn 恰一条且文案含 `PROVISIONER_IDLE_BACKOFF_MAX_MS` 与 `15000`；
+端到端阶梯 `[5000,10000,15000,15000]`。变异 M-3（撤掉钳制，`if (false && …)`）⇒ **恰红 1 格** `not ok 4 - G4`。
+
+**LOW-3（成立，只改口径）：offboarding 的「1h 清理不跟着退」要说准。**
+事实：清理是销号循环里**每拍检查一次**的时间门（`offboarding.js` 的 `tickAt - lastSweepAt >= SWEEP_INTERVAL_MS`），
+不是独立定时器 ⇒ 空闲拍 30s 会让它**晚跑**（审计实测 59:59 判、60:29 跑）。不是饿死，但「keeps its schedule」是近似。
+准口径（已同时落到 `offboarding.js` 注释与 `docs/ops/db-idle-load.md` §7）：**阈值 1h 一个字节没改；节拍受空闲拍影响，
+典型晚 ~max/2、最坏晚一整个空闲拍 ≤ max（默认 30s）**。顺手修了原注释里「满了 1 天才清」的口径错
+（`SWEEP_INTERVAL_MS = 60 * 60 * 1000` 是 1 小时）。C1 用例仍是假时钟 —— 没为这条加任何墙钟断言（#531 教训）。
+
+**LOW-4（登记 + 顺手加固）：新用例仍有墙钟依赖。** 位置（返工后行号）：
+- `portal/test/idle-backoff-520.test.js:81` `waitUntil(cond,label,deadlineMs=15_000)` —— `Date.now()` 截止；
+- 同文件 `:126` `awaitWatchdog(promise,label,ms=20_000)` —— 真 `setTimeout` 看门狗；
+- 同文件 `:201-208` A4 用真 5ms abort / 真 1ms 睡 / 真 60s+abort。
+加固（不重排用例、不改判据）：两处看门狗到点后都先做 **5 轮宏任务的宽限复检**再判失败，`awaitWatchdog` 改成
+tracked-state 形式复查 promise 是否其实已落定（事件循环被停顿十几秒时，定时器回调可能排在已落定的 promise
+**之后**才被调度 ⇒ 老写法会把「已落定」误判成「stop 没打断」）。**没换成假时钟的部分与理由**：A4 测的就是
+`sleepCancellable` 对真 timer + 真 AbortSignal 的行为，换假时钟等于测夹具；它的判据是 resolve 的布尔值而非流逝
+毫秒 ⇒ 停顿只让它变慢。残余风险（如实登记）：极端事件循环停顿（>15s 且期间真无进展）下 `waitUntil` 仍可能红，
+红了按 #531 口径**先单跑该文件再定性**，别改 #506 的夹具。
+
+**门禁（各跑一次，原文）**：
+- `timeout 400 node --test portal/test/idle-backoff-520.test.js; echo rc=$?` ⇒ `# tests 23 / pass 23 / fail 0`，`rc=0`
+- 新增一致性用例 `timeout 400 node --test portal/test/deploy-env-idle-backoff.test.js` ⇒ `# tests 5 / pass 5 / fail 0`，`rc=0`
+  （两文件合跑 28/28；关闭家族 + #506 退避家族 + 两个既有 deploy-env 一致性文件合跑 108/108）
+- 根门禁 `timeout 1500 npm test; echo rc=$?` 见本节末的补记（只跑一次；`idle-backoff-506*` / `env-int-strict-506e` /
+  `idle-backoff-safe-range-506b` 是 #531 已知负载假红族，红格先单跑该文件再定性并附两个读数）
+
+**没做到的 / 遗留**：
+1. **判据 1（空闲 `xact_commit` < 3/秒）仍是 `BLOCKED-on-deploy`**：dev 共享栈的 `station-portal` 跑的是旧代码，
+   且红线不许重启/重建 `station-*`；本单交付的是**测量方法 + 现测基线**（§8.134 与 `docs/ops/db-idle-load.md`）。
+   算术期望值 ≈ 6–7/秒，不是 <3/秒 —— #506 的 outbox 2s 空闲地板本身就贡献约 4 语句/秒。
+2. **#506 的四根旋钮同族未登记**：`ROUTE_IDLE_BACKOFF_MAX_MS` / `ROUTE_ORPHAN_RECOVERY_INTERVAL_MS` /
+   `MATERIALIZE_IDLE_BACKOFF_MAX_MS` / `MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS` 至今不在 compose 的
+   `station-portal.environment` 里（四条 `grep -c` 全 0）⇒ 标准部署上配了同样是空气。本单没顺手改（跨单，
+   且会动 #506 的部署面）；修法同 §6，建议另开一单把四根加进同一条三腿判据。
+3. `chat_sessions` 0.86/秒 的精确拆分仍未收口（本机无语句级计数），已按「不是那 7 个循环 + 逐条 SQL 排除」交付。
+
+**补记：PR #552 返工的门禁原文（2026-11-16，只跑了一次根门禁）**
+- 门禁 1 `timeout 400 node --test portal/test/idle-backoff-520.test.js; echo rc=$?`
+  ⇒ `# tests 23 / # pass 23 / # fail 0`，**`rc=0`**
+- 门禁 2 `timeout 400 node --test portal/test/deploy-env-idle-backoff.test.js; echo rc=$?`
+  ⇒ `# tests 5 / # pass 5 / # fail 0`，**`rc=0`**（两文件合跑 28/28；关闭家族 + #506 退避家族 +
+  两个既有 `deploy-env-*` 一致性文件合跑 108/108）
+- 门禁 3 `timeout 1500 npm test; echo rc=$?` ⇒ `# tests 2384 / # pass 2369 / # fail 1 / # skipped 14`，
+  **`rc=1`**（`# duration_ms 15094`）。唯一红格：
+  `not ok 202 - #506e③ 严格性不许把安全上限那一条挤掉：越界仍回落 + warn（两个文件）`，
+  位置 `portal/test/env-int-strict-506e.test.js:276`，报错 `循环必须停在某一拍的 sleep 上`，
+  栈顶 `Object.arm (env-int-strict-506e.test.js:50)`，`duration_ms 16.27`。
+  **定性：#531 那族负载假红，不是本单引入** —— 失效形状正是「`arm()` 拿轮次预算等循环走到 sleep」，
+  而本单没动 `routes.js` / `materializer.js`（#506 那两份 `envInt` 拷贝）与该夹具任何一行。
+  两个读数：全量 `fail 1`（就是这一条）⇒ **单跑该文件两次**均 `# tests 17 / # pass 17 / # fail 0`，`rc=0`。
+  按工单口径**没有改那些夹具**（#531 的收口是独立单）。
+- 本轮**没有**新增 DB 读数：判据 1 仍是 `BLOCKED-on-deploy`（dev 栈 `station-portal` 跑旧代码，红线不许
+  重启/重建 `station-*`）；也没碰任何容器、没改依赖与 lockfile。
+
+**补记 2（补记里那句「没有新增 DB 读数」之后的复核读数，同日晚些）**：交付前又跑了一次 §1 的只读采样，
+好让「现测基线」在 PR 上不是过期数据：`window 30.29s` ⇒ `xact_commit delta=357 rate=11.78/s`、
+`xact_rollback 0.00/s`、`total_scans/s = 25.13`（`containers` 4.82、`users` 4.42、`chat_sessions` 0.86、
+`fde_onboarding` 0.69、`fde_offboarding` 0.20）。与 §8.134 的基线（11.2–12.0/秒、5 分钟窗口 11.34/秒）同量级
+⇒ **dev 栈的 `station-portal` 仍在跑旧代码**（compose 里那三根旋钮是本次才登记的，容器还没带上新镜像），
+判据 1 的 <3/秒 依旧是 `BLOCKED-on-deploy`，不是「测出来不达标」。全程 `docker exec station-db psql -At` 只读，
+没重启/重建任何 `station-*`，`station-portal` 的 `Up 2 hours` 未被打断。

@@ -389,6 +389,9 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_DEV_MODE` | 显式开发模式（F12/F14 松约束；生产必须 `0` 或 `NODE_ENV=production`） | 开发 `1` / 生产 `0` |
 | `FDE_DEV_USER` | 开发期容器 `--user`（whoami 镜像无双 UID 用户时兑底） | `1001:1000` |
 | `FILE_UPLOAD_MAX_BYTES` | **单个上传文件**的字节上限（#472 片 B，portal 侧 `config.fileUploadMaxBytes`，`deploy/docker-compose.yml` 的 portal env 注入）。⚠ 与 `MAX_BODY_BYTES`（64 KiB，JSON 请求体口径）**是两个不同的旋钮**：拿后者卡上传会把所有真实文件判成 413。超限 ⇒ `413 file_too_large` 且服务端主动断流、不留 `.tmp`（契约见 `docs/api/portal.md` §4.14） | `33554432`（32 MiB）|
+| `ONBOARDING_IDLE_BACKOFF_MAX_MS` / `OFFBOARDING_IDLE_BACKOFF_MAX_MS` | 开户/销号队列循环在**连续没活**时的退避上限（issue #520）：5000→10000→20000→… 到这里封顶，**一认领到活立即回 5000** ⇒ 只改空闲时的 DB 开销，不改有活时的节拍。只认严格正整数（`1e4`/负数 ⇒ warn + 回落缺省）。测量方法与基线见 `docs/ops/db-idle-load.md` | `30000` / `30000`（可配到共享上限 `60000`）|
+| `PROVISIONER_IDLE_BACKOFF_MAX_MS` | 对账循环的同类上限（#520，它是空闲写事务的头号来源）。⚠ **硬上限**：写超过 15000 会被**钳到 15000** 并 warn 点名旋钮（漂移发现延迟是业务承诺，实现：`portal/src/provisioner.js` 的 `resolveIdleBackoffMaxMs`，PR #552 审计 LOW-2）。配 `5000` = 回到 #520 之前的固定 5s 节拍 | `15000` |
+| ⚠ 上面三根能不能生效，取决于它们是否出现在 `deploy/docker-compose.yml` 的 `station-portal.environment` 里——portal 的 environment 是**显式列表、无 `env_file`**，只在本文件里写一行等于没写（#472 同型事故）。三腿一致性的机器判据：`portal/test/deploy-env-idle-backoff.test.js`。<br>⚠ **已知遗留**：#506 的 `ROUTE_IDLE_BACKOFF_MAX_MS` / `ROUTE_ORPHAN_RECOVERY_INTERVAL_MS` / `MATERIALIZE_IDLE_BACKOFF_MAX_MS` / `MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS` **至今未登记在 compose 里** ⇒ 在标准部署上同样配了无效（#520 没顺手改，跨单；见 §8.134） | — |
 
 ### 10.2 补登：agentd 容器侧环境变量（runner 运行时，2026-09-24 登记）
 
