@@ -7341,6 +7341,72 @@ E5 = `$` 插值/未闭合/垃圾三形点名到行）；负例门新增**陷阱 
 （这正是它存在的理由，不要顺手改表）；③ 第三方复审另外四条（链接目标 EACCES 归 missing、`FDE_POOL=large` 白名单可缺
 large 段、`$TMPDIR` 是链接时的夹具前提、「三态」措辞）本轮按裁决**未做**，另起一轮；④ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
 
+**复审第二轮补记（同批 worker，工单 `fix-261116-07-495-link-attribution-pool`；只做第三方复审剩下的**两条 MED**，2026-11-16）**
+
+第一轮（PR #554）已合并的是 BLOCKER（`readEnvFile` 行内注释）与「链接事实逐段记录」；本轮**只做剩下两条 MED**，
+`TMPDIR` 统一 `realpathSync` 与「三态」措辞这两条 LOW 由主 agent 排第三轮（本轮未做）。
+
+**MED-1 已修（归因，不是状态机）**：`lib/e2e-preflight.mjs` 走查处用 `statOrNull()` 判在不在 ⇒ 它把
+`EACCES` 与 `ENOENT` 压成同一个 `null`。审计的复现形状 `link -> secret/inner` + `chmod 000 secret`：链上每一段
+字面都进得去，但 `stat(link)` 要**跟随**链接穿过 `secret` ⇒ 真抛 `EACCES`，于是结果给的是
+`{state:'missing', blocker:null, missingPrefix:'<链接自己>'}` ⇒ 失败文案说「还没物化」而真相是「进不去」，
+等待器**干等到超时**才报一句与「真的没物化」逐字相同的 timeout（本机真夹具实测 elapsed **4042ms** ≈ `timeoutMs`）。
+而**同一个文件**里 `observeHostPath()` 对末段的 `EACCES` 却正确归 `unreadable` ⇒ 两处口径不一致就是这条 MED。
+
+改法：新增**不吞错误**的 `statResult()`（errno 就是归因本身）+ `lstatFacts()`；`ENOENT`/`ENOTDIR`（以及历史上
+本就落在这儿的其他 errno）仍归 `missing`（第一轮悬空链接那两格不退），`EACCES`/`EPERM` 归 `unreadable` 且
+`missingPrefix` **必为 `null`**，`mode`/`owner` 退到 **`lstat`** 取（`stat` 这次本来就失败）、取不到填 **`null`**
+并由 `blocker.factsFrom:'lstat'` 驱动文案明说「这组数字是这一段本体，不是它指向的那侧」/「这次探不到」。
+**状态面一个字没改**：`present`/`missing`/`unreadable`（+ `unknown`），**没有第五态**，`present` 仍是成功，
+`links` 逐段事实继续带上（提前 return 也带）；等待器无改动即受益（`unreadable` 连续两次 ⇒ 提前放弃，实测 **52ms**）。
+
+取证分岔按 `id -u` 选：本机 **`id -u` = 1000（非 root）** ⇒ 走**真 `chmod 000`**（不是注入夹具糊过去）；
+判据同时留一条 `fsImpl` 注入版（`M1b`），因为 **root 有 `CAP_DAC_OVERRIDE`，`chmod 000` 拦不住 root**，
+真 chmod 那一路在 root 机上不可达（`M1` 在 uid 0 下 `t.skip` 并说明理由，不假绿）。
+
+新增 5 格（`test/integration-e2e-preflight.test.js`，24 → 29）：`M1`（真 `chmod 000` 的判据①）、
+`M1b`（注入版判据①，root 机主判据）、`M2`（判据②：悬空链接 / 链上缺段 / 祖先是文件 三格都不许退成权限）、
+`M3`（判据③：等待器**时间牙** —— 不许走到超时）、`M4`（`lstat` 也探不到 ⇒ `mode/owner` 必须是 `null`
+且文案写「这次探不到」，`link.isSymlink:null`+`detectable:false` **不许**被编成「不是链接」）。
+**变异**（走查处退回吞错误 ⇒ 所有 stat 失败落 `missingPrefix`）：rc=1，
+`not ok 19 - #495② M1 …`、`not ok 20 - #495② M1b …`、`not ok 22 - #495② M3 …`、`not ok 23 - #495② M4 …`，
+而 `M2` 仍绿（它钉的是「不许退回去」）；`M3` 变异下 `duration_ms: 60002` 且文案退回
+`timeout waiting for … 且**路径上第一段就不存在**（缺：…/link）` —— 正是 MED 描述的症状本体。
+还原用 `cp /tmp/…bak`，**不是** `git checkout -- <文件>`（那文件上有未提交编辑）。
+
+**MED-2 现证后判定：现状已有牙，代码一行都没改**。担心的形状是「放行面（`FDE_IPAM_POOLS`）根本不含 large 段
+⇒『large 被放行』恒真」。`lib/isolated-env.mjs:523-542` 腿 B 拿的正是 `FDE_IPAM_POOL_HOST_KEYS[env.FDE_POOL]`
+= `FDE_IPAM_POOL_LARGE`，先过 **portal 自己的** `resolveIpamPools()`，再要求它**被放行面覆盖**。最小探针读数：
+
+| 送进 `assertIsolatedEnvironment` 的形状 | 裁决 | 点名 |
+|---|---|---|
+| A 两腿同源（`FDE_IPAM_POOLS` = `FDE_IPAM_POOL_LARGE` = 派生段 `10.201.21.0/24`） | **ACCEPTED** | — |
+| B `FDE_IPAM_POOL_LARGE` = 整个 DDL 保留段 `10.201.0.0/16` | REJECTED | `FDE_IPAM_POOL_LARGE`、`IPAM_POOL_LARGE`（「请切子段」） |
+| C **只把 large 段从放行面挪走**（`FDE_IPAM_POOLS=10.201.88.0/24`，分配段不动） | REJECTED | `FDE_IPAM_POOL_LARGE`、`FDE_IPAM_POOLS`、`IPAM_POOL_LARGE`、`proxy` |
+| D large 段跑出 DDL 保留段（两腿同值 `10.229.0.0/24`） | REJECTED | 由 portal 启动期校验点名 `IPAM_POOL_LARGE` 必须整体落在 `10.201.0.0/16` 内 |
+| E 放行面混进共享段 `10.200.0.0/16` | REJECTED | `FDE_IPAM_POOLS`（#227.3 fail-closed 未放宽） |
+
+**只改放行面就能翻转 A↔C** ⇒ 放行面确实含 large 段，「large 被放行」不是恒真。行为判据早已在门里：
+`isolation-negative.mjs` 陷阱 **11**（`FDE_IPAM_POOL_LARGE 不在 FDE_IPAM_POOLS 放行面内`，点名两腿变量名 + `proxy`）
+加 12/13/14（缺 env / 整个保留段 / 跑出保留段）。**变异**：把覆盖判据 `parsedWhitelist.some(...)` 改成恒真
+⇒ `--strict` **rc=1**、`TRAP FAIL · assertIsolatedEnvironment() FDE_IPAM_POOL_LARGE 不在 FDE_IPAM_POOLS 放行面内`、
+`verdict=TRAP_SILENT`、`TRAP OK` 19 → 18 —— 那格是真有牙的。
+
+**门禁读数（本轮，按顺序）**：`timeout 500 node --test test/integration-e2e-preflight.test.js` ⇒ **rc=0**
+`# tests 29 / # pass 29 / # fail 0 / # skipped 0`；`timeout 900 node portal/integration/isolation-negative.mjs --strict`
+⇒ **rc=0**、`verdict=TRAPS_FIRED（全部 19 条陷阱=均硬失败）`、`TRAP OK` = **19**（合并树里两边特性共存，不再是 15）；
+`npm run check:agents-hotlayer` ⇒ **rc=0**（热层 18706 / 预算 19456，条目 141 无重复编号）。
+根 `npm test` 本轮**未跑**（没碰 `portal/src/**`，按工单不要求）。`id -u` = **1000**；`npm ci --prefer-offline` 后
+无 lockfile 差异（未提交任何依赖变动）。
+
+**本轮差项 / 遗留**：① `M1` 在 **root 机上会 skip**（`CAP_DAC_OVERRIDE` ⇒ 真 `chmod 000` 拦不住 root），
+那条机器上判据① 由 `M1b` 承担 —— 这是取证边界，不是漏网；② 走查处**其它 errno**（`ELOOP`/`ENAMETOOLONG` 等）
+仍按历史上的 `missing` 报（本轮按裁决只修 `EACCES`/`EPERM` 两条，未扩状态；若哪天真要区分 `unknown`，
+开口在 `observeHostPath` 已有的第四态，不是新增第五态）；③ `blocker.mode` 在链接情形给的是**链接自己**的
+`0o777`（已由 `factsFrom:'lstat'` 在文案里说明），真机要定位「到底是哪一侧挡的」仍需看一眼 `link.resolvedTarget`；
+④ `$TMPDIR` 统一 `realpathSync`、`observeHostPath` 的「三态」措辞这两条 LOW **本轮未做**（主 agent 排第三轮）；
+⑤ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑（本轮判据全是纯夹具，不碰 docker）。
+
 ### 8.142 事件平台 W3 落地 + 迁移让号 0037 + 迁移编号撞车的处理口径（#526，2026-11-16，主 agent + erix_run）
 
 接 §8.130。**W3（通知 + HTTP API）已合并进 main**（PR #564，`f0a7af4`）。
