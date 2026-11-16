@@ -30,7 +30,7 @@
    折叠摘要进的是 **user** 消息不是 system：`summaryRole` 默认 `"user"`，`src/compact/budget-fit.js:134`。）
 
 顺带解决两件既有欠账：**父目录层今天根本不存在**（提示词只提 `~/AGENTS.md`，`~/projects/AGENTS.md`
-与项目根 `AGENTS.md` 从未被提到）；**`readFile` 读不到它们**（jail root = cwd，#259 未落地）。
+与项目根 `AGENTS.md` 从未被提到）；**`readFile` 读不到它们**（jail root = cwd，#259 当时未落地——261116 已落地，注入仍是主路径）。
 
 代价也诚实写在 §4.4：约 +4.5k token/轮（引擎口径，含平台 9 KB + 项目文件），对中位 15.6k 输入的小 run 是显著比例，
 但**大部分是今天本来就要花的**（模型合规时那次 `cat` 同样进上下文），真正的净增出现在"今天压根没读"的 run 上
@@ -48,7 +48,7 @@
 | 落点是决策者 2026-10-12 定的：**规则只住 `~/AGENTS.md`，提示词只留强制指针** | `portal/src/materializer.js:177-183`、`docs/design/user-space.md` §4.1.2 |
 | 提示词里的强制指针 + 读法（`cat ~/AGENTS.md`） | `runner/worker.js:81`、`:85` |
 | 提示词注入点（`config.input.system`） | `runner/worker.js:703` |
-| 文件工具读边界 = 项目根，无只读例外 ⇒ `readFile ~/AGENTS.md` 撞「被宿主边界拒绝」 | `runner/worker.js:480`（`createJail({ root: cwd, writable: [cwd] })`）、`runner/lib/file-tools.js:56-90`、`docs/design/user-space.md:184` |
+| 文件工具读边界 = 项目根，无只读例外 ⇒ `readFile ~/AGENTS.md` 撞「被宿主边界拒绝」（**本行描述的是 2026-11-05 当时的事实；#259 已于 261116 落地，读边界现在是「项目根 ∪ `$HOME/AGENTS.md` ∪ `$HOME/.erix`」，写边界不变**） | 当时：`runner/worker.js:480`（`createJail({ root: cwd, writable: [cwd] })`）、`runner/lib/file-tools.js:56-90`、`docs/design/user-space.md:184`。现在：`runner/lib/file-tools.js`（`createJail` / `platformReadExceptions`）+ 台账 §8.135 |
 | 防漂移锁：指针必须存在 + 8 个规则词不得进提示词 | `runner/test/system-prompt.test.js:207-247` |
 | 家目录解析已有先例（skills loader） | `runner/worker.js:554`（`home: process.env.HOME \|\| '/home/erix'`） |
 | 层级优先的仓内先例：skills 是 `project > ~/.erix/skills > bundled`（内层优先） | `runner/worker.js:546-553` 注释 |
@@ -131,6 +131,8 @@ select count(distinct e.run_id) from run_events e join runs r on r.id=e.run_id
 
 - **只读 `$HOME` 及其子孙**：不读 `/AGENTS.md`、不读 `/etc/**`、不越过 `realpath(HOME)`。
 - **不改 jail 写边界**（`writable: [cwd]` 一字不动）；本方案连读边界都不改（宿主读文件不经过文件工具）。
+  ⚠ **#259（261116）之后读边界确实加了只读例外**，但那不是本方案的注入路径——注入仍是主路径，
+  例外只是让 `readFile` 不再对平台文档报「被宿主边界拒绝」（口径见 `docs/design/user-space.md` §4.1.2 表「读取边界」行）。
 - **不物化任何用户内容**：`~/projects/AGENTS.md` 属用户空间，平台不创建、不覆盖、不进入 manifest。
 
 ---

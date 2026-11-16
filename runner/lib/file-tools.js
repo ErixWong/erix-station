@@ -5,19 +5,24 @@
 // #101 删除），**行为与导出逐字保留**：worker 无平台凭据、cwd（项目目录，D8 修订 2026-09-24 起）内
 // 可写；越界/遮蔽/非可写路径抛 JailError。
 //
-// ⚠ 唯一一处 station 扩展（issue #231）：`maskedPaths` 的条目从「只有前缀」扩成「前缀 ∪ 名字模式」
-// （含 `*` / `?` 的条目按相对根的**路径段**匹配，见 `splitMaskedEntries`）。**前缀条目的语义逐字未动**，
-// 0.3.5 移植面（越界 / 非可写 / 遮蔽都抛 JailError）也没动；扩的只是「一条遮蔽条目怎么写」。
-// 为什么必须扩：station 的遮蔽口径是 `.env*` / `*.pem` / `id_*` 这类**名字模式**，前缀机制表达不了
-// （前缀 `.env` 只会挡 `.env` 自己与 `.env/` 子树，挡不住 `.env.local`），而「启动时先扫一遍目录把
-// 模式展成具体路径」会给遮蔽集合加一条它本没有的失效条件（run 开始后新建的 `.env` 不在快照里）。
-// 语义与用途的不对称（只挡文件工具、不挡 shell ⇒ 它**不是安全加固**）见 `STATION_MASKED_PATHS` 的注记
-// 与 `docs/design/runner-integration.md` §17.1。
+// ⚠ station 的两处扩展（issue #231 与 #259，**互不相干、都在本文件**）：
+// 【#231】`maskedPaths` 的条目从「只有前缀」扩成「前缀 ∪ 名字模式」（含 `*`/`?` 的条目按相对根的
+//   **路径段**匹配，见 `splitMaskedEntries`）。**前缀条目语义逐字未动**，0.3.5 移植面也没动。
+//   为什么必须扩：station 的遮蔽口径是 `.env*` / `*.pem` / `id_*` 这类**名字模式**，前缀表达不了。
+//   不对称（只挡文件工具、不挡 shell ⇒ **不是安全加固**）见 `STATION_MASKED_PATHS` 注记与
+//   `docs/design/runner-integration.md` §17.1。
+// 【#259】**只读例外**（`readExceptions`）：家目录里平台自己生成的文档（`~/AGENTS.md`、`~/.erix/*`）
+//   在文件工具里从「二等公民」变成一等公民。**写边界与 0.3.5 逐字相同**（仍只认项目根），例外也不由
+//   模型传参决定，而是装配方的平台侧白名单。带测试：`runner/test/file-tools.test.js` 的 #259 一节
+//   + `file-tools-contract.test.js` 的谓词相与面。
+// 【两处相交的地方】**遮蔽条目的解析走读侧口径**（见下方 `maskedRoots`）：#259 之后「在例外里遮蔽一个
+//   密钥子目录」成为**有生产者的用法**；名字模式那一路仍是词法 + realpath **双向**比（建个软链拆不掉遮蔽）。
 //
 // 文件工具（本文件后半，issue #228）：曾经的 0.3.5 fork executor（readFile/rg/tree/writeFile）已于
 // issue #228 退役，改为装配上游 erix-agent 0.18.0 的 `createFileTools`（`createStationFileTools`）。
 // jail 不是 fork 的一部分，它是宿主边界；fork 演进的终点见 AGENTS.md §8.9 与 docs/design/runner-integration.md。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createFileTools as createUpstreamFileTools, classifyFileToolResult } from 'erix-agent/tools';
 import { throwIfAborted } from './abort.js';
@@ -117,14 +122,85 @@ export class JailError extends Error {
 }
 
 /**
- * 创建文件系统路径 jail（0.3.5 createJail 同名同语义移植）。
- * @param {{root:string, writable?:string[], maskedPaths?:string[]}} options
- * @returns {{root:string, resolve:(p:string)=>string, resolveForWrite:(p:string)=>string, assertReadable:(p:string)=>string}}
- *   root 为已 realpath 的绝对根路径，供调用方做「解析结果 == 根」判定。
+ * jail 缺省告警出口（261116 返工）：与 `lib/llm-timeouts.js:66-73` 同一先例——worker 的 stdout
+ * 由 agentd 逐行接管并加 `[worker <run>]` 前缀（`runner/agentd.js:1040`），所以库里一句
+ * `console.warn` 在现网是**运维看得见**的，不必把 logger 注入进来。
+ * 测试注入自己的 sink（见 `file-tools.test.js` 的 `warn: (m) => warnings.push(m)`）。
  */
-export function createJail({ root, writable = [], maskedPaths = [] }) {
+function defaultJailWarn(message) {
+  console.warn(`[station-runner] ${message}`);
+}
+
+/**
+ * 只读例外条目的解析 + **归属检查**（issue #259 返工，第三方审计 LOW-1）。
+ *
+ * 为什么必须有这条检查：例外条目自己会被 realpath（`~/.erix` 是 symlink 时 realpath 给出的是
+ * **目标**目录），于是「agent 用 shell 把 `~/.erix` 换成指向 `/etc` 的链接」= 例外静默扩张成
+ * `/etc/**`。清单是平台给的，但**目录是 agent 能改的**，所以解析完必须回查归属。
+ *
+ * 归属锚 = **声明这条例外的目录**（`path.dirname(declared)` 的 realpath），对
+ * `platformReadExceptions()` 的两项（`$HOME/AGENTS.md`、`$HOME/.erix`）就是 `$HOME` 本身。
+ * 取父目录而不是在 jail 里硬取 `os.homedir()`：① jail 是纯参数驱动的库（测试与将来别的调用方
+ * 都用夹具家目录，环境里的 HOME 与它们无关）；② 父目录恒**不会比声明更宽**，所以「例外不得被
+ * symlink 放宽」这条不变式对任意条目都成立，而不是只对平台那两项成立。
+ * 锚自己也要 realpath：`$HOME` 本身是 symlink 的机器上，拿词法父目录比会把合法重排误判成越界。
+ *
+ * 不满足 ⇒ **丢弃该条形同不存在**（读边界退化成没这条例外的样子）+ `warn` 点名两个路径。
+ * ⚠ **绝不在这里抛**：那会让整个 jail 构造失败 = worker 起不来，而「agent 换掉 `~/.erix`」是它
+ * 自己做得到的动作，那种情况该有的形状是「这条例外没生效」，不是「工位起不来」。
+ *
+ * @returns {[string[], Readonly<Array<{declared:string, resolved:string, anchor:string}>>]}
+ *   [保留下来的例外根（realpath 后）, 被丢弃条目的事实（供 jail 复核/日志）]
+ */
+function resolveReadExceptionRoots(readExceptions, rootPath, warn) {
+  const kept = [];
+  const dropped = [];
+  for (const entry of (Array.isArray(readExceptions) ? readExceptions : [])) {
+    if (typeof entry !== 'string' || entry.length === 0) continue;
+    const declared = path.resolve(rootPath, entry);
+    // realpathWithMissing 对**还不存在**的路径不抛（只把缺失尾段拼回去），所以「平台文件尚未物化」
+    // 不会在装配期炸掉 jail，也不会被归属检查误杀（不存在 ⇒ 解析结果仍在声明它的目录之内）。
+    const resolved = realpathWithMissing(declared);
+    const anchor = realpathWithMissing(path.dirname(declared));
+    if (isWithin(anchor, resolved)) {
+      kept.push(resolved);
+      continue;
+    }
+    dropped.push(Object.freeze({ declared, resolved, anchor }));
+    warn(`read-only exception dropped: ${declared} resolves to ${resolved}, which is NOT inside the `
+      + `directory that declares it (${anchor}) — treating it as if absent (issue #259: a read exception `
+      + 'must not be widened into another tree by a symlink; the write boundary is unchanged either way)');
+  }
+  return [kept, Object.freeze(dropped)];
+}
+
+/**
+ * 创建文件系统路径 jail（0.3.5 createJail 同名同语义移植）。
+ *
+ * **读边界与写边界是两条线**（issue #259 起）：
+ *   * 写边界 = `root`（+ `writable` 子集），**没有例外**——`resolve` 的语义与 0.3.5 逐字一致；
+ *     `resolveForWrite` 的**三条拒因分得很开**（issue #259 验收：不许把「只读例外」与「越界」糊成
+ *     一句）：`path_read_only`（落在例外清单里）/ `path_not_writable`（根内非可写，同 0.3.5）/
+ *     `path_escapes_root`（根外，同 0.3.5）。三条都是拒，**写判定一点没放宽**。
+ *   * 读边界 = `root` ∪ `readExceptions`（只放宽读）。例外**不经过模型**：它是装配方（worker）
+ *     传进来的平台侧白名单，模型既不能传参放宽、也不能靠 `..` / symlink 走出例外清单
+ *     （realpath 之后再做前缀判定，所以 `<例外>/../<别处>` 与指向清单外的 symlink 都仍然越界）。
+ *   * **例外根自己也不许借 symlink 搬走**（261116 返工 / 审计 LOW-1）：条目 realpath 之后必须仍在
+ *     「声明它的那个目录」之内（平台那两项 = `$HOME`），否则**丢弃该条形同不存在 + warn 点名**，
+ *     但**绝不因此让 jail 构造失败**（见 `resolveReadExceptionRoots` 的注释）。丢弃的事实挂在
+ *     `droppedReadExceptions` 上，供装配方与测试复核。
+ *   * `maskedPaths` 在例外之内**继续生效**（遮蔽是收窄读，与例外正交）；因此遮蔽条目允许落在
+ *     例外子树里（此前会被当成越界而在装配期抛 `JailError`）。
+ *
+ * @param {{root:string, writable?:string[], maskedPaths?:string[], readExceptions?:string[], warn?:(message:string)=>void}} options
+ * @returns {{root:string, readExceptions:readonly string[], droppedReadExceptions:readonly object[], resolve:(p:string)=>string, resolveForWrite:(p:string)=>string, assertReadable:(p:string)=>string}}
+ *   root 为已 realpath 的绝对根路径，供调用方做「解析结果 == 根」判定；readExceptions 为**通过归属检查**的
+ *   例外清单（realpath 后，只读事实，供日志/测试复核）；droppedReadExceptions 为被归属检查丢弃的条目。
+ */
+export function createJail({ root, writable = [], maskedPaths = [], readExceptions = [], warn = defaultJailWarn }) {
   const rootPath = fs.realpathSync(path.resolve(root));
 
+  // 严格解析：只认根之内（写侧与历史 `resolve` 语义的唯一实现，#259 一个字节都没动它）。
   const resolve = (value) => {
     const lexicalPath = path.resolve(rootPath, value);
     const resolvedPath = realpathWithMissing(lexicalPath);
@@ -134,15 +210,58 @@ export function createJail({ root, writable = [], maskedPaths = [] }) {
     return resolvedPath;
   };
 
+  // 只读例外（issue #259）：装配方的白名单，相对写法按根解析、能 realpath 就 realpath
+  // （例外自身是指向别处的目录时，前缀判定跟着 realpath 走，不给「指出去的第二道门」留缝），
+  // 但 realpath 之后必须仍在声明它的目录之内——归属检查与丢弃见 `resolveReadExceptionRoots`。
+  const [exceptionRoots, droppedReadExceptions] = resolveReadExceptionRoots(readExceptions, rootPath, warn);
+
+  const withinReadableRoots = (target) => isWithin(rootPath, target)
+    || exceptionRoots.some((exceptionRoot) => isWithin(exceptionRoot, target));
+
+  // 读侧解析：根之内 ∪ 例外之内。越界错误码/文案与严格解析逐字相同（工具面拿到的是同一句
+  // 「错误：读取被宿主边界拒绝」，模型看不出「越界」与「不在例外清单」的差别）。
+  const resolveReadable = (value) => {
+    const resolvedPath = realpathWithMissing(path.resolve(rootPath, value));
+    if (!withinReadableRoots(resolvedPath)) {
+      throw new JailError('path_escapes_root', `Path escapes jail root: ${value}`);
+    }
+    return resolvedPath;
+  };
+
   const writableRoots = (Array.isArray(writable) ? writable : [])
     .map((entry) => resolve(entry));
   const maskedEntries = splitMaskedEntries(maskedPaths);
-  // 前缀条目照 0.3.5：走 jail 自己的 resolve（越界条目在**装配期**就抛，不静默失效）。
-  const maskedRoots = maskedEntries.prefixes.map((entry) => resolve(entry));
+  // 前缀条目走**读侧口径**（根之内 ∪ 例外之内，见 `resolveReadable`）：#259 开了家目录只读例外之后，
+  // 「在例外子树里继续挡某个密钥路径」是有生产者的用法。落在两者之外的条目仍照旧在装配期抛
+  // `JailError`（不静默吞掉一条写歪的遮蔽规则）。
+  const maskedRoots = [];
+  for (const entry of maskedEntries.prefixes) {
+    const declared = path.resolve(rootPath, entry);
+    try {
+      maskedRoots.push(resolveReadable(declared));
+    } catch (error) {
+      const owner = droppedReadExceptions.find((dropped) => isWithin(dropped.declared, declared));
+      if (!owner) throw error; // 根与例外都之外 ⇒ 照旧装配期抛，不静默吞掉一条写歪的遮蔽规则
+      warn(`masked entry skipped: ${declared} sits under the dropped read-only exception `
+        + `${owner.declared} (that whole subtree is unreadable anyway, so masking it is a no-op)`);
+    }
+  }
   const maskedPatterns = maskedEntries.patterns;
 
   const resolveForWrite = (value) => {
-    const resolvedPath = resolve(value);
+    // 写侧用**严格解析**（与 `resolve` 同一口径），但拒因要分得开（issue #259 验收：「只读例外」与
+    // 「越界」不得糊成同一个说法）：
+    //   * 落在例外清单里 → `path_read_only`（能读不能写，这是 #259 故意留的口子）
+    //   * 根之内但不在 writable 子树 → `path_not_writable`（逐字同 0.3.5）
+    //   * 其余根外 → `path_escapes_root`（逐字同 0.3.5）
+    // **写判定本身一点没放宽**：三条都是拒，例外只是把其中一条说得准一点。
+    const resolvedPath = realpathWithMissing(path.resolve(rootPath, value));
+    if (!isWithin(rootPath, resolvedPath)) {
+      if (exceptionRoots.some((exceptionRoot) => isWithin(exceptionRoot, resolvedPath))) {
+        throw new JailError('path_read_only', `Path is a read-only exception (readable, never writable): ${value}`);
+      }
+      throw new JailError('path_escapes_root', `Path escapes jail root: ${value}`);
+    }
     if (!writableRoots.some((writableRoot) => isWithin(writableRoot, resolvedPath))) {
       throw new JailError('path_not_writable', `Path is not writable: ${value}`);
     }
@@ -150,10 +269,10 @@ export function createJail({ root, writable = [], maskedPaths = [] }) {
   };
 
   const assertReadable = (value) => {
-    const resolvedPath = resolve(value);
+    const resolvedPath = resolveReadable(value);
     // 名字模式额外拿**词法路径**比一次：`.env` 若是指向 `db-creds.txt` 的软链，realpath 之后段名里
-    // 再没有 `.env`，只查 realpath 会让「建个软链」就把遮蔽拆掉（前缀遮蔽本来就有这个洞，#231 不再扩大它）。
-    // 反方向（`link.txt -> .env`）由 resolvedPath 那一路命中 ⇒ 两个方向都是 fail-closed。
+    // 再没有 `.env`，只查 realpath 会让「建个软链」就把遮蔽拆掉。反方向（`link.txt -> .env`）由
+    // resolvedPath 那一路命中 ⇒ 两个方向都是 fail-closed。
     const masked = maskedViolation(
       { prefixes: maskedRoots, patterns: maskedPatterns },
       rootPath, path.resolve(rootPath, value), resolvedPath,
@@ -164,7 +283,34 @@ export function createJail({ root, writable = [], maskedPaths = [] }) {
     return resolvedPath;
   };
 
-  return { root: rootPath, resolve, resolveForWrite, assertReadable };
+  return {
+    root: rootPath,
+    readExceptions: Object.freeze([...exceptionRoots]),
+    droppedReadExceptions,
+    resolve,
+    resolveForWrite,
+    assertReadable,
+  };
+}
+
+/**
+ * 平台侧的**只读例外清单**（issue #259；jail 的 `readExceptions` 入参）。
+ *
+ * 只放**平台自己生成、且模型本该像读普通文档一样读它**的东西：
+ *   * `~/AGENTS.md` —— 平台约束的单一真相（#258 定稿：提示词只做指针，规则住在这个文件里）；
+ *   * `~/.erix/`    —— 平台下发的派生视图（`ports.json` 端口清单、`config.json` provider 配置等）。
+ *     家目录是**本 FDE 自己的**家目录（userspace 每 FDE 一棵，user-space §2.4），清单里没有
+ *     跨 FDE 的数据；`config.json` 里只有占位 key（H-B D-4 容器内零真实凭据，runner-integration §11）。
+ *
+ * 两条纪律：① **不含运行期事实**（端口号、伞域、FDE 名一个都不出现——同 #246/#257 口径）；
+ * ② **fail-closed**：拿不到家目录就返回空清单 ⇒ 退化成 #259 之前的行为，绝不是「放宽成整个 /」。
+ *
+ * @param {{home?:string}} [options] 注入家目录（测试用）；缺省 `os.homedir()`
+ * @returns {readonly string[]}
+ */
+export function platformReadExceptions({ home = os.homedir() } = {}) {
+  if (typeof home !== 'string' || home === '') return Object.freeze([]);
+  return Object.freeze([path.join(home, 'AGENTS.md'), path.join(home, '.erix')]);
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +373,9 @@ function isStructuredCall(value) {
 // 两者都只动首行根标签；不认的写法（真实子目录名、子树里的文件）一字不动，不过度归一。
 /** `tree` 根标签的归一目标（与上游 `path === "."` 分支的输出逐字一致）。 */
 const TREE_ROOT_LABEL = './';
+
+/** 上游写拒结果的固定前缀（本站只在这之后追加拒因，不改它）。 */
+const WRITE_DENIED_PREFIX = '错误：写入被宿主边界拒绝：';
 
 /** 「根写法」的入参：缺省 / null / `''` / `'.'` / `'./'`（含 `.//`、`./.`、`././` 等尾斜杠变体）。 */
 function isRootFormPath(value) {
@@ -324,6 +473,10 @@ export const STATION_MASKED_PATHS = Object.freeze([
  * @param {object} [options]
  * @param {{root:string, assertReadable:Function, resolveForWrite:Function}} [options.jail]
  *   宿主边界（createJail 的返回值）。jail.root 是 realpath 过的根，未显式传 cwd 时用它做上游的解析根。
+ *   ⚠ **只读例外不在本层加**（issue #259）：例外住在 jail 里（`readExceptions` → `assertReadable`），
+ *   本层只负责把它折成布尔喂给上游。写侧照旧只认 jail 的 `resolveForWrite`（根之内）。
+ *   上游 `createFileTools` 自己不做任何包含判定（ADR-009，它只把 `path.resolve` 后的绝对路径喂谓词，
+ *   并展开 `~/x`），所以 `readFile {path:"~/.erix/ports.json"}` 能否读全看 jail 谓词——本单要的正是这里。
  * @param {string} [options.cwd] 上游相对路径解析根；缺省依次取 jail.root / process.cwd()
  * @param {string[]} [options.maskedPaths] 遮蔽条目：前缀（目录/文件，相对 cwd 或绝对）**或名字模式**
  *   （含 `*` / `?`，按相对路径逐段匹配，issue #231）；只挡读，不挡写
@@ -361,11 +514,41 @@ export function createStationFileTools({ jail, cwd, maskedPaths = [], allowRead,
     }
   };
 
+  // 写拒因的分诊（issue #259 验收：「只读例外」与「越界」不得糊成一句）。上游把谓词的 false 排成
+  // 一句固定文案（`错误：写入被宿主边界拒绝：<相对路径>`），它看不到 jail 的错误码 ⇒ 本站在谓词里
+  // 把拒因记下来，出口给那句文案**追一句原因**。只追加、不改上游前缀（契约只钉前缀，不钉全文）。
+  // ⚠ 上游对一次写**只调一次** `allowWrite`（`src/tools/file-tools.js` 里 writeFile / edit 各一处），
+  // 所以这个「最后一次调用」的备注是确定量；将来上游改成多次调用，备注会变糊但不会变错。
+  const WRITE_DENY_NOTES = Object.freeze({
+    // ⚠ 两条拒因的**用词必须不重叠**（`只读例外` 这四个字只能出现在第一条）：否则「拒因分得开」
+    // 这类断言只能靠 `doesNotMatch` 逆推，而逆推会被无关文案里的同一个词误兵。见 file-tools.test.js
+    // 的「红线」用例（它钉的是：例外写拒含 `只读例外`、越界写拒含 `越出` 且不含 `只读例外`）。
+    path_read_only: '这是平台开的**只读例外**（家目录的 `~/AGENTS.md` 与 `~/.erix/`）：读得到、写不进去，平台文件下一轮对账也会覆盖回去',
+    path_not_writable: '这在项目目录之内，但不在本次 run 的可写范围内',
+    path_escapes_root: '这条路径越出了项目目录（家目录里只有清单内的那几个路径能读，其余一概不碰）',
+    host_predicate: '宿主（worker）的写谓词拒了它',
+  });
+  let lastWriteDenyNote = '';
+
   const canRead = (target) => Boolean(hostAllowRead(target))
     && !withinMasked(target)
     && jailAllows(jail?.assertReadable, target);
-  const canWrite = (target) => Boolean(hostAllowWrite(target))
-    && jailAllows(jail?.resolveForWrite, target);
+  const canWrite = (target) => {
+    lastWriteDenyNote = '';
+    if (!hostAllowWrite(target)) {
+      lastWriteDenyNote = WRITE_DENY_NOTES.host_predicate;
+      return false;
+    }
+    if (typeof jail?.resolveForWrite !== 'function') return true;
+    try {
+      jail.resolveForWrite(target);
+      return true;
+    } catch (error) {
+      if (!(error instanceof JailError)) throw error;
+      lastWriteDenyNote = WRITE_DENY_NOTES[error.code] ?? '';
+      return false;
+    }
+  };
 
   const upstream = createUpstreamFileTools({ cwd: root, allowRead: canRead, allowWrite: canWrite });
 
@@ -396,6 +579,10 @@ export function createStationFileTools({ jail, cwd, maskedPaths = [], allowRead,
       else input = { ...(input ?? {}), path: '.' };
     }
     const treeTargetIsRoot = isTreeCall && (rootForm || resolvesToRoot(root, treePath));
+    // 写拒因备注上一次调用重置（见上面 `canWrite` 的注记），并且只给写工具用。
+    const toolName = structured ? firstArg.name : firstArg;
+    const isWriteCall = toolName === 'writeFile' || toolName === 'edit';
+    if (isWriteCall) lastWriteDenyNote = '';
 
     const result = structured
       ? await upstream.executeTool(firstArg)
@@ -407,6 +594,12 @@ export function createStationFileTools({ jail, cwd, maskedPaths = [], allowRead,
     // ⚠ 两个旧坑：`if (!result)` 把「写了 0 字节」当成失败；`typeof result === 'string'` 也不是成败
     // 判据（**错误结果也是字符串**，顶层形态与 readFile 一致）。根标签收口只对文本生效，故取 kind。
     const fact = classifyFileToolResult(result);
+    // 写被拒时追一句**拒因**（issue #259：「只读例外」与「越界」必须分得开——只说「被拒」会让模型
+    // 去重试一条根本改不动的路径）。只**追加**，不改上游那句前缀。
+    if (isWriteCall && lastWriteDenyNote
+      && fact.kind === 'text' && fact.text.startsWith(WRITE_DENIED_PREFIX)) {
+      return `${fact.text}（${lastWriteDenyNote}）`;
+    }
     if (!treeTargetIsRoot || fact.kind !== 'text' || fact.text === '') return result;
     const treeText = fact.text;
 
