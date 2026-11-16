@@ -7341,6 +7341,134 @@ E5 = `$` 插值/未闭合/垃圾三形点名到行）；负例门新增**陷阱 
 （这正是它存在的理由，不要顺手改表）；③ 第三方复审另外四条（链接目标 EACCES 归 missing、`FDE_POOL=large` 白名单可缺
 large 段、`$TMPDIR` 是链接时的夹具前提、「三态」措辞）本轮按裁决**未做**，另起一轮；④ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
 
+**复审第二轮补记（同批 worker，工单 `fix-261116-07-495-link-attribution-pool`；只做第三方复审剩下的**两条 MED**，2026-11-16）**
+
+第一轮（PR #554）已合并的是 BLOCKER（`readEnvFile` 行内注释）与「链接事实逐段记录」；本轮**只做剩下两条 MED**，
+`TMPDIR` 统一 `realpathSync` 与「三态」措辞这两条 LOW 由主 agent 排第三轮（本轮未做）。
+
+**MED-1 已修（归因，不是状态机）**：`lib/e2e-preflight.mjs` 走查处用 `statOrNull()` 判在不在 ⇒ 它把
+`EACCES` 与 `ENOENT` 压成同一个 `null`。审计的复现形状 `link -> secret/inner` + `chmod 000 secret`：链上每一段
+字面都进得去，但 `stat(link)` 要**跟随**链接穿过 `secret` ⇒ 真抛 `EACCES`，于是结果给的是
+`{state:'missing', blocker:null, missingPrefix:'<链接自己>'}` ⇒ 失败文案说「还没物化」而真相是「进不去」，
+等待器**干等到超时**才报一句与「真的没物化」逐字相同的 timeout（本机真夹具实测 elapsed **4042ms** ≈ `timeoutMs`）。
+而**同一个文件**里 `observeHostPath()` 对末段的 `EACCES` 却正确归 `unreadable` ⇒ 两处口径不一致就是这条 MED。
+
+改法：新增**不吞错误**的 `statResult()`（errno 就是归因本身）+ `lstatFacts()`；`ENOENT`/`ENOTDIR`（以及历史上
+本就落在这儿的其他 errno）仍归 `missing`（第一轮悬空链接那两格不退），`EACCES`/`EPERM` 归 `unreadable` 且
+`missingPrefix` **必为 `null`**，`mode`/`owner` 退到 **`lstat`** 取（`stat` 这次本来就失败）、取不到填 **`null`**
+并由 `blocker.factsFrom:'lstat'` 驱动文案明说「这组数字是这一段本体，不是它指向的那侧」/「这次探不到」。
+**状态面一个字没改**：`present`/`missing`/`unreadable`（+ `unknown`），**没有第五态**，`present` 仍是成功，
+`links` 逐段事实继续带上（提前 return 也带）；等待器无改动即受益（`unreadable` 连续两次 ⇒ 提前放弃，实测 **52ms**）。
+
+取证分岔按 `id -u` 选：本机 **`id -u` = 1000（非 root）** ⇒ 走**真 `chmod 000`**（不是注入夹具糊过去）；
+判据同时留一条 `fsImpl` 注入版（`M1b`），因为 **root 有 `CAP_DAC_OVERRIDE`，`chmod 000` 拦不住 root**，
+真 chmod 那一路在 root 机上不可达（`M1` 在 uid 0 下 `t.skip` 并说明理由，不假绿）。
+
+新增 5 格（`test/integration-e2e-preflight.test.js`，24 → 29）：`M1`（真 `chmod 000` 的判据①）、
+`M1b`（注入版判据①，root 机主判据）、`M2`（判据②：悬空链接 / 链上缺段 / 祖先是文件 三格都不许退成权限）、
+`M3`（判据③：等待器**时间牙** —— 不许走到超时）、`M4`（`lstat` 也探不到 ⇒ `mode/owner` 必须是 `null`
+且文案写「这次探不到」，`link.isSymlink:null`+`detectable:false` **不许**被编成「不是链接」）。
+**变异**（走查处退回吞错误 ⇒ 所有 stat 失败落 `missingPrefix`）：rc=1，
+`not ok 19 - #495② M1 …`、`not ok 20 - #495② M1b …`、`not ok 22 - #495② M3 …`、`not ok 23 - #495② M4 …`，
+而 `M2` 仍绿（它钉的是「不许退回去」）；`M3` 变异下 `duration_ms: 60002` 且文案退回
+`timeout waiting for … 且**路径上第一段就不存在**（缺：…/link）` —— 正是 MED 描述的症状本体。
+还原用 `cp /tmp/…bak`，**不是** `git checkout -- <文件>`（那文件上有未提交编辑）。
+
+**MED-2 现证后判定：现状已有牙，代码一行都没改**。担心的形状是「放行面（`FDE_IPAM_POOLS`）根本不含 large 段
+⇒『large 被放行』恒真」。`lib/isolated-env.mjs:523-542` 腿 B 拿的正是 `FDE_IPAM_POOL_HOST_KEYS[env.FDE_POOL]`
+= `FDE_IPAM_POOL_LARGE`，先过 **portal 自己的** `resolveIpamPools()`，再要求它**被放行面覆盖**。最小探针读数：
+
+| 送进 `assertIsolatedEnvironment` 的形状 | 裁决 | 点名 |
+|---|---|---|
+| A 两腿同源（`FDE_IPAM_POOLS` = `FDE_IPAM_POOL_LARGE` = 派生段 `10.201.21.0/24`） | **ACCEPTED** | — |
+| B `FDE_IPAM_POOL_LARGE` = 整个 DDL 保留段 `10.201.0.0/16` | REJECTED | `FDE_IPAM_POOL_LARGE`、`IPAM_POOL_LARGE`（「请切子段」） |
+| C **只把 large 段从放行面挪走**（`FDE_IPAM_POOLS=10.201.88.0/24`，分配段不动） | REJECTED | `FDE_IPAM_POOL_LARGE`、`FDE_IPAM_POOLS`、`IPAM_POOL_LARGE`、`proxy` |
+| D large 段跑出 DDL 保留段（两腿同值 `10.229.0.0/24`） | REJECTED | 由 portal 启动期校验点名 `IPAM_POOL_LARGE` 必须整体落在 `10.201.0.0/16` 内 |
+| E 放行面混进共享段 `10.200.0.0/16` | REJECTED | `FDE_IPAM_POOLS`（#227.3 fail-closed 未放宽） |
+
+**只改放行面就能翻转 A↔C** ⇒ 放行面确实含 large 段，「large 被放行」不是恒真。行为判据早已在门里：
+`isolation-negative.mjs` 陷阱 **11**（`FDE_IPAM_POOL_LARGE 不在 FDE_IPAM_POOLS 放行面内`，点名两腿变量名 + `proxy`）
+加 12/13/14（缺 env / 整个保留段 / 跑出保留段）。**变异**：把覆盖判据 `parsedWhitelist.some(...)` 改成恒真
+⇒ `--strict` **rc=1**、`TRAP FAIL · assertIsolatedEnvironment() FDE_IPAM_POOL_LARGE 不在 FDE_IPAM_POOLS 放行面内`、
+`verdict=TRAP_SILENT`、`TRAP OK` 19 → 18 —— 那格是真有牙的。
+
+**门禁读数（本轮，按顺序）**：`timeout 500 node --test test/integration-e2e-preflight.test.js` ⇒ **rc=0**
+`# tests 29 / # pass 29 / # fail 0 / # skipped 0`；`timeout 900 node portal/integration/isolation-negative.mjs --strict`
+⇒ **rc=0**、`verdict=TRAPS_FIRED（全部 19 条陷阱=均硬失败）`、`TRAP OK` = **19**（合并树里两边特性共存，不再是 15）；
+`npm run check:agents-hotlayer` ⇒ **rc=0**（热层 18706 / 预算 19456，条目 141 无重复编号）。
+根 `npm test` 本轮**未跑**（没碰 `portal/src/**`，按工单不要求）。`id -u` = **1000**；`npm ci --prefer-offline` 后
+无 lockfile 差异（未提交任何依赖变动）。
+
+**本轮差项 / 遗留**：① `M1` 在 **root 机上会 skip**（`CAP_DAC_OVERRIDE` ⇒ 真 `chmod 000` 拦不住 root），
+那条机器上判据① 由 `M1b` 承担 —— 这是取证边界，不是漏网；② 走查处**其它 errno**（`ELOOP`/`ENAMETOOLONG` 等）
+仍按历史上的 `missing` 报（本轮按裁决只修 `EACCES`/`EPERM` 两条，未扩状态；若哪天真要区分 `unknown`，
+开口在 `observeHostPath` 已有的第四态，不是新增第五态）；③ `blocker.mode` 在链接情形给的是**链接自己**的
+`0o777`（已由 `factsFrom:'lstat'` 在文案里说明），真机要定位「到底是哪一侧挡的」仍需看一眼 `link.resolvedTarget`；
+④ `$TMPDIR` 统一 `realpathSync`、`observeHostPath` 的「三态」措辞这两条 LOW **本轮未做**（主 agent 排第三轮）；
+⑤ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑（本轮判据全是纯夹具，不碰 docker）。
+
+**复审第三轮补记（同批 worker，工单 `fix-261116-08-495-mask-errno`；第三方对抗审计报的 1 BLOCKER + 1 MED，其中 BLOCKER 是本节第一轮 `2cd3e73` 自己带进去的，2026-11-16）**
+
+**BLOCKER 已修（可达性掩码，不是状态机）**：本文件上面第一轮写的走查把可达性判成
+`accessSync(current, isLeaf ? R_OK : R_OK | X_OK)` —— **非叶子段多要了一个 `R_OK`**。拿**已知文件名**去读子文件，
+内核只要求祖先链每段有 `x`（穿越），`r` 只对「列目录」必要。真夹具（`id -u` = 1000，`os.tmpdir()`=`/tmp` 是 ext4、
+权限位真被内核执行，`umask` 0002）读数：祖先 `0o111` 时真 `readFileSync` 读到 `{"ok":1}`，`observeHostPath` 却给
+`unreadable` + `blocker{no-permission,mode:0o111}`，`waitForHostFile` **12 ms** 就 REJECTED（`timeoutMs=3000`；
+主 agent 那边同一形状的 `mount -> real` 是 53 ms）⇒ 一个「100 ms 后才物化」的正常场景被假红当场判死，
+文案还喊「读不到」把人推向查 uid/组。**假红比原缺陷贵**，这就是它当 BLOCKER 的理由。
+改法：非叶子段 `X_OK`、叶子 `R_OK`；`blocker.missingAccess` 记下「缺的是哪一位」（祖先 `X_OK` / 叶子 `R_OK` /
+`stat` 自己就被挡 ⇒ `null`），`unreadableMessage` 的 `why` 与新加的 `blockerWhy`/`blockerFixHint` 按这一位出话
+（祖先 ⇒「**不可穿越**…列目录的 `R_OK` 不是必需的」+ `chmod +x`/进组；叶子 ⇒「**不可读**」+ 查这一段 mode/属主；
+`stat` 被挡 ⇒ 「探不出是哪一位」+ 去查 `link.resolvedTarget` 那一侧）。**状态面一个字没改**：`present`/`missing`/
+`unreadable`（+ `unknown`），**没有第五态**，`present` 仍是成功，`links`/`mode`/`owner`/`factsFrom`/`missingPrefix`
+的形状只多了一个键。新增 6 格（29 → 35）：`X1`/`X1b`（判据①：祖先真 `chmod 0o111` / 注入版 ⇒ `present` 且
+`waitForHostFile` **成功返回**）、`X2`/`X2b`（判据②：祖先 `0o333` + 文件 **100 ms 后**才物化（`rename` 原子发布）
+⇒ 等待器**等到并成功**，`elapsed >= 100`）、`X3`（判据③：祖先**不可穿越**仍 `unreadable`）、`X4`（判据④：叶子无 `R`
+仍 `unreadable`）。注入是**掩码感知**的（只在「要的正是那一位」时抛）⇒ 掩码改回去必红；`X1`/`X2`/`X3`/`X4` 的
+真 `chmod` 那半格在 root 机 `t.skip` 并由注入版承担（不假绿）。⚠ 工单写的 `0o300` 在 uid=1000（属主）下是 `--wx`
+= **可穿越**（实测 `readFileSync` 成功、`access(X_OK)` 通过），表达不了「不可穿越」⇒ `X3` 用 `0o600`（真没 `x`），
+读数与理由写在交付报告里。
+**变异**（掩码改回 `R_OK | X_OK`）⇒ rc=1 `# pass 31 / # fail 4`，点名 `not ok 24 - X1`、`not ok 25 - X1b`、
+`not ok 26 - X2`、`not ok 27 - X2b`（①② 红，③④ 仍绿——它们钉的就是「不许放宽」）；`X1` 的失败正文就是病灶本体：
+`祖先可穿越就不许端出 blocker（要求 R_OK 就是把 0o111 判死）：{… mode:"0o111" …}`。现有 29 格（含
+`isolation-negative` 的 #495 正例组）**一行未改**，改完掩码当场复跑 rc=0/29 —— 它们按**路径**抛 EACCES、不按 mask
+判断，所以没被带翻（工单那条告警条件成立）。
+
+**MED 已修（errno 分类收成一张表）**：三个探测点各写一遍 if ⇒ 「既不是权限也不是缺失」的 errno 被**就近**塞进
+两个桶：走查里 `statSync → EIO` 落 `missing`（文案喊「还没物化」，等待器干等到超时），`accessSync → EIO` 落
+`unreadable`+`no-permission`（文案喊「读不到」，等待器提前放弃）。上面第二轮遗留② 说的就是这一条，本轮真的接了。
+新增**唯一一张表** `PROBE_ERRNO_CLASS` + `classifyProbeErrno()`（`ENOENT`/`ENOTDIR` ⇒ `missing`；`EACCES`/`EPERM` ⇒
+`unreadable`；**表里没有 ⇒ 已有的 `unknown` 出口**，不是第五态），**五个调用点**全部改走它：走查里的 `statSync`、
+走查里的 `accessSync`、`observeHostPath` 的 `readFileSync`、`observeSegmentLink` 的 `lstatSync`（「不存在」才等于
+「不是链接」，其它 ⇒「无从判定」）、`assertComposeEnvFile` 的 `statSync`/`accessSync`（同一张表决定用哪条文案）。
+走查新增 `unknown` 载荷 `{path, probe, code, message, cause}`（`probeUnknown()`），`observeHostPath` 映射成
+`state:'unknown'`，等待器「无法归类」那一支顺带把 message 也印出来（这一支以前基本走不到）。旁证同口径：
+`targetExists` 旧写法 `Boolean(statOrNull(...))` 把 `EACCES` 与 `ENOENT` 压成同一个 `false` ⇒ 目标目录只是没 `x`
+（`0o444`）时文案敢说「缺的是**链接目标**」；改成三态 `probeTargetExists()`（`false` **只**给真 `ENOENT`/`ENOTDIR`，
+探不到 ⇒ `null`），出话收进一处 `targetExistenceLine()`（末段与链上段共用）——「缺的是链接目标」**只许在真
+`ENOENT` 时出现**，探不到只能说「这次探不到…**不许**据此说它缺失」。新增 4 格（35 → 39）：`T1`/`T2`（注入
+`statSync→EIO` / `accessSync→EIO` ⇒ `unknown`，等待器文案含「无法归类」+ errno 而**不含**「没物化」/「没权限」措辞）、
+`T3`（真夹具目标目录 `0o444` ⇒ `unreadable`、`link.targetExists === null`、文案**不含**「缺的是链接目标」而**含**
+「这次探不到」；注入版让 root 机同判据）、`T4`（注入 `readlinkSync→EACCES` ⇒ 末段与链上段两形都不许声称目标缺失）。
+**两次变异各自点名**：`MUT-2B`（两个探测点退回原 if，`EIO` 落回 missing / 权限桶）⇒ rc=1 `# pass 37 / # fail 2`：
+`not ok 30 - T1`、`not ok 31 - T2`；`MUT-2C`（`targetExists` 写回 `Boolean(statOrNull)`）⇒ rc=1 `# pass 37 / # fail 2`：
+`not ok 32 - T3`、`not ok 33 - T4`（两格都断在 `false !== null`）⇒ 旁证那条**自己有牙**，不是靠 T1/T2 顺带。
+还原一律 `cp` 备份（**不是** `git checkout --`），复跑 rc=0/39。
+
+**门禁读数（本轮，按顺序；跑之前两个代码提交都已落：`18c828d` 活一、`1177ea0` 活二）**：
+`timeout 500 node --test test/integration-e2e-preflight.test.js` ⇒ **rc=0** `# tests 39 / # pass 39 / # fail 0 /
+# skipped 0`（自数 `grep -c '^ok '` = 39）；`timeout 900 node portal/integration/isolation-negative.mjs --strict`
+⇒ **rc=0**、`verdict=TRAPS_FIRED（全部 19 条陷阱=均硬失败；单一来源=一份定义）`、`TRAP OK` 自数 = **19**、
+`TRAP FAIL` = 0（本轮没给它加新陷阱，牙的数量不变）；`npm run check:agents-hotlayer` ⇒ **rc=0**（热层 18706 /
+预算 19456，条目 142 无重复编号）。`id -u` = **1000**；未提交任何依赖/lockfile；未 push（推送与合并归主 agent）。
+根 `npm test` 未跑（没碰 `portal/src/**`）。
+
+**本轮差项 / 遗留**：① 真 `chmod` 那半格在 **root 机上 skip**（`CAP_DAC_OVERRIDE`），由注入版承担 —— 取证边界；
+② 等待器对 `unknown` 的处理**一字未动**（仍等满超时再报「无法归类」）：`EIO` 一类该不该像 `unreadable` 那样提前
+放弃，本轮按裁决不扩，等真有现场再说；③ `blocker.mode` 在链接情形仍给链接自己的 `0o777`（靠 `factsFrom:'lstat'`
+说明）；④ `$TMPDIR` 是链接时的夹具前提、「三态」措辞这两条 LOW 仍归主 agent（本轮新增夹具自己先 `realpathSync`，
+不受牵连）；⑤ 上面第二轮遗留② 的「其它 errno 仍按 `missing` 报」本轮**已闭合**（就是这张表），别再当遗留抄下去。
+
 ### 8.142 事件平台 W3 落地 + 迁移让号 0037 + 迁移编号撞车的处理口径（#526，2026-11-16，主 agent + erix_run）
 
 接 §8.130。**W3（通知 + HTTP API）已合并进 main**（PR #564，`f0a7af4`）。
