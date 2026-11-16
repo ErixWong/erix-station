@@ -406,6 +406,13 @@ function foldedOriginalState(en: FoldedEntry): FoldedOriginalState | undefined {
   return store.getFoldedOriginal(en.sessionId, round);
 }
 
+// issue #387：原文里工具行的「返回了什么」。走 `getToolResultSummary` 而不是直接拼字符串：
+// 上游结果有三套形态（string / `{content, metadata}` / number），#228 已把这条归一收进那个函数
+// （`0` 不能被当「没结果」吞掉、对象不能渲成 `[object Object]`）；**缺键就是空串 ⇒ 一行都不许多画**。
+function foldedToolResult(tc: { resultPreview?: unknown }): string {
+  return getToolResultSummary(tc.resultPreview);
+}
+
 // issue #300：部分正文走**助手正文的既有渲染路径**（renderMarkdown 先转义后格式化，XSS 安全），
 // 与助手终稿/流式增量一致。text 在 store 里已保证是字符串（脏载荷退化成 '' 后根本不推 entry），
 // 这里再兜一层是为了组件对 entry 形状独立可推：不依赖调用方洁净，也不渲染 undefined。
@@ -569,9 +576,13 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
             于是**真的干了活的那几轮**（只有 reasoning + 工具调用、没有正文）整片渲染成「（无文本内容）」——
             真机 round 100 的 112 条里有 40 条是这样，用户看到的是满屏空行，而原文其实全在。
             现在：四类都画；只有四类**都空**才给占位（占位的语义收窄成「这一条真的什么都没有」）。
+            #387：工具行下半句——「返回了什么」。后端重建路（`sessions.js#attachToolResultsToRecords`）
+            现在会把 `tool_result` 挂回 `tool_use` 再喂上游投影，于是 `toolCalls[].resultPreview` 有值了。
+            **配不上时那个键缺席**（不是空串），所以这里用 `foldedToolResult()` 归一后**空串就不画**：
+            宁可少一行，也不能在原文里凭空造出一个「↳ （空）」——那是原文里从来没说过的话。
           -->
           <div
-            v-for="(turn, ti) in (foldedOriginalState(en) as { status: 'loaded'; turns: Array<{ role?: string; text?: string; reasoning?: string; toolCalls?: Array<{ name?: string; argsSummary?: string; isError?: boolean }> }> }).turns"
+            v-for="(turn, ti) in (foldedOriginalState(en) as { status: 'loaded'; turns: Array<{ role?: string; text?: string; reasoning?: string; toolCalls?: Array<{ name?: string; argsSummary?: string; isError?: boolean; resultPreview?: string }> }> }).turns"
             :key="ti"
             class="folded-original-turn"
           >
@@ -584,7 +595,10 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
               v-for="(tc, ci) in (turn.toolCalls ?? [])"
               :key="ci"
               class="folded-original-tool overflow-auto whitespace-pre-wrap break-all text-xs text-black/45"
-            >{{ t('stream.folded.originalTool', { name: tc.name ?? '?', args: tc.argsSummary ?? '' }) }}{{ tc.isError ? t('stream.folded.originalToolFailed') : '' }}</div>
+            >{{ t('stream.folded.originalTool', { name: tc.name ?? '?', args: tc.argsSummary ?? '' }) }}{{ tc.isError ? t('stream.folded.originalToolFailed') : '' }}<div
+                v-if="foldedToolResult(tc)"
+                class="folded-original-tool-result pl-3"
+              >↳ {{ foldedToolResult(tc) }}</div></div>
             <div v-if="!turn.text && !turn.reasoning && !(turn.toolCalls && turn.toolCalls.length)" class="text-xs text-black/40">{{ t('stream.folded.originalEmpty') }}</div>
           </div>
           <div v-if="(foldedOriginalState(en) as { status: 'loaded'; turns: unknown[] }).turns.length === 0" class="text-xs text-black/40">{{ t('stream.folded.originalEmpty') }}</div>

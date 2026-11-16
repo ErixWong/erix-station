@@ -2882,7 +2882,7 @@ function mergeSynthItemsBySeq(realEvents, synthItems) {
  */
 async function handleSessionFoldedPayload(req, res, ctx, sessionId, round) {
   const session = await requireSession(req, ctx);
-  const result = await sessions.getFoldedPayload(ctx.pool, { userId: session.user.id, sessionId, round });
+  const result = await sessions.getFoldedPayload(ctx.pool, { userId: session.user.id, sessionId, round, log: ctx.log });
   return sendJson(res, 200, result);
 }
 
