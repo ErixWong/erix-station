@@ -146,6 +146,8 @@ export const en = {
     whoNoFde: '{login} ({role})',
     cwdCopyTitle: '{cwd} (click to copy)',
     toLatest: '↓ Latest',
+    // issue #595: header entry to the capability market (views/MarketView.vue, route #/market).
+    marketEntry: 'Market',
     resizeSidebar: 'Resize sidebar',
     inputPlaceholder: 'Type a task, Enter to send (Shift+Enter for a newline)',
     systemInjection: '[system] {content}',
@@ -678,6 +680,79 @@ export const en = {
       occupancyOccupiedBare: 'in use (holder and live port count not given) — the server rejects the move (409), pick another block.',
       occupancyFree: 'completely free (it is in the latest snapshot’s free list).',
       occupancyUnknown: 'unknown whether this block is free: it is not in the latest snapshot’s free list (that list is truncated), so the server check decides.',
+    },
+  },
+  // Capability market, user side (views/MarketView.vue, issue #595;
+  // contract docs/design/capability-market.md §8). Copy rule (§8): no red/yellow/green --
+  // "installed but disabled" is neutral grey text, not a warning.
+  market: {
+    title: 'Capability market',
+    backToWorkbench: '← Back to workbench',
+    reload: 'Reload',
+    loading: 'Loading the market catalogue…',
+    empty: 'No published capability packages yet.',
+    intro: 'Published skill packages. Install one into your FDE workspace; only enabled ones' +
+      ' reach the model tool surface.',
+    budgetHint: 'Every enabled skill ships all of its tools into **every** turn:' +
+      ' one FDE can enable at most {max} at a time.',
+    footnote: 'Uninstalling or disabling never re-downloads (disabling only flips a flag);' +
+      ' if you edited files in the package, "Reinstall" writes them back.',
+    version: 'version {version}',
+    tools: 'tools: {count}',
+    securityScore: 'security score: {score}',
+    scanHints: '{count} static scan hints',
+    kindMcp: 'MCP entry',
+    installBlockedMcp: 'P0 does not consume MCP, so this cannot be installed',
+    driftHint: 'Installed {installed}, market version {version}: reinstall to overwrite.',
+    installed: {
+      notInstalled: 'Not installed',
+      installedDisabled: 'Installed · disabled',
+      installedEnabled: 'Installed · enabled',
+    },
+    install: 'Install',
+    reinstall: 'Reinstall',
+    uninstall: 'Uninstall',
+    enable: 'Enable',
+    disable: 'Disable',
+    busy: 'Working…',
+    state: {
+      draft: 'Draft',
+      published: 'Published',
+      retired: 'Retired',
+      unknown: 'Unknown state',
+    },
+    result: {
+      installed: 'Installed {name}; it is usable from the next run once enabled.',
+      reinstalled: 'Reinstalled {name}.',
+      uninstalled: 'Uninstalled {name} (package directory removed).',
+      enabled: 'Enabled {name}; effective from the next run.',
+      disabled: 'Disabled {name}; files stay, re-enabling needs no download.',
+    },
+    detail: {
+      open: 'Details',
+      close: 'Close',
+      loading: 'Loading details…',
+      whenToUse: 'When to use',
+      tools: 'Tools',
+      toolsUnknown: 'No tool list supplied by the server.',
+      params: 'parameters: {params}',
+      readme: 'SKILL.md body',
+      readmeMissing: 'This package ships no SKILL.md.',
+      files: 'File list',
+    },
+    errors: {
+      notFound: 'This entry is no longer in the market (possibly retired): reload the list.',
+      notPublished: 'This entry is not published right now, so it cannot be installed' +
+        ' -- an admin has to publish it first.',
+      budgetExceeded: 'Enable limit reached: one FDE can enable at most {max} skills at a time.' +
+        ' Disable one before enabling this one.',
+      kindUnsupported: 'MCP entries are not supported in P0 (no MCP client on the runner side)' +
+        ' -- browse only, no install.',
+      installFailed: 'Install failed: {reason}',
+      reasonUnknown: 'no reason given',
+      validationFailed: 'Invalid input: the server named the field {field}.',
+      validationGeneric: 'Invalid input: the server did not name a field.',
+      generic: 'Request failed (HTTP {status}): {message}',
     },
   },
   admin: {
