@@ -3007,8 +3007,11 @@ async function handleSessionFoldedPayload(req, res, ctx, sessionId, round) {
 }
 
 /**
- * GET /api/sessions/:id/delegates?runId=<parentRunId> —— 某个父 run 的子 run 名册（只读，零审计）。
+ * GET /api/sessions/:id/delegates?runId=<parentRunId>[&activity=1] —— 某个父 run 的子 run 名册（只读，零审计）。
  * 属主校验 / 父 run 归属 / 路径解析全在 `delegation.js`，与 `GET /api/sessions/:id` 同一个 404 口径。
+ * `activity`（issue #593）：**只认字符串 `1`**，其它任何值（`0` / `true` / `yes` / 空串 / 缺席）
+ * 一律等价于不带 ⇒ 响应与今天逐字段相同。不在这里判形状：`delegation.js` 只接 `activity === true`，
+ * 重一遍「只认 1」就会得到两把尺（与上面 `tail` 同口径）。
  */
 async function handleSessionDelegates(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
@@ -3019,6 +3022,7 @@ async function handleSessionDelegates(req, res, ctx, sessionId) {
     userId: session.user.id,
     parentRunId: requireDelegateRunId(url),
     userSpaceRoot: ctx.config.userSpaceRoot,
+    activity: url.searchParams.get('activity') === '1',
   });
   return sendJson(res, 200, result);
 }
@@ -3048,14 +3052,21 @@ async function handleSessionDelegateTranscript(req, res, ctx, sessionId, childRu
 /**
  * `runId` 是**必填** query 参数（名册按父 run 分片 ⇒ 没有父身份就不知道该读哪个目录）。
  * 缺席/空串 ⇒ 400；形状（uuid）交给 `delegation.js` 的单点校验（同一个 `details.field='runId'`）。
- * `decodeUuid` 只为归一化小写：名册目录名是引擎写的小写值，拿大写串去拼目录会恒 miss。
+ *
+ * ⚠ **只归一化小写，不再 `decodeURIComponent`**（#593 修的既有缺陷，与 `decodeUuid` 不是一回事）：
+ * `url.searchParams.get()` 返回的值**已经被 URL 解析器解码过一次**，再走 `decodeUuid` 就是**双重解码**：
+ *   `?runId=%25` → `get()` 得 `'%'` → `decodeURIComponent('%')` 抛 `URIError` → 它不是 SessionError/
+ *   DelegationError/MacroError ⇒ 落到请求处理的未捕获兜底（`log 'unhandled:'` + `500 internal`），
+ *   而契约要的是 400 `validation_failed`（`details.field='runId'`）。
+ *   同类：`%E0%A4%A`（坏转义序列）。路径参数才需要 `decodeUuid`（那一段确实没解码过），别顺手改它。
+ * 非法值不需要在这里「解得出」：下游 `PARENT_RUN_ID_RE` 会把任何非 uuid 串判成 400 ⇒ 形状语义不少。
  */
 function requireDelegateRunId(url) {
   const raw = url.searchParams.get('runId');
   if (raw == null || raw === '') {
     throw new HttpError(400, 'validation_failed', 'runId 必填（父 run id）', { details: { field: 'runId' } });
   }
-  return decodeUuid(raw);
+  return raw.toLowerCase();
 }
 
 async function handleSessionEventsHistory(req, res, ctx, sessionId) {
