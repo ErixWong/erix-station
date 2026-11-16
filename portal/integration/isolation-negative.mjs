@@ -18,12 +18,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, deriveStackIpamPoolEnv, removeDbDir, resolveDbDir, writeDynamicStub,
-  deriveIsolationComposeEnv, memoizeOnce, applyStackIpamPoolEnv, PORTAL_LARGE_POOL, FDE_IPAM_POOL_HOST_KEYS,
+  SHARED_STACK, assertIsolatedEnvironment, assertHostWritePathsIsolated, defaultFdeIpamPools, deriveFdeIpamPools, deriveStackIpamPoolEnv, parseComposeEnvFile, removeDbDir, resolveDbDir, writeDynamicStub, deriveIsolationComposeEnv, memoizeOnce, applyStackIpamPoolEnv, PORTAL_LARGE_POOL, FDE_IPAM_POOL_HOST_KEYS,
 } from './lib/isolated-env.mjs';
 // 工单 F（wp2a 重建）：`ports.json ↔ port_allocations` 对账件是 wp2a 最重的断言；提到纯函数后，
 // 本脚本可以用夹具**行为面**钉住它（无 docker 环境下也能验「不是恒真」）。
 import { reconcilePortsJsonWithDb, PREVIEW_LIVE_STATES } from './lib/ports-reconcile.mjs';
+// issue #495（#412 遗留 ①②）：起跑前预检与「等宿主侧物化文件」的三态分类——同样是「失败必须长得
+// 像它真正的原因」那一类护栏，所以反向测试也住这里（行为面夹具，不碰 docker）。
+import {
+  COMPOSE_ENV_FILE, formatAncestorLinkLines, formatLastSegmentLinkLine, observeHostPath, observeLastSegmentLink,
+  observeSegmentLink, assertComposeEnvFile, materializeSnapshot, toContainerPath, waitForHostFile,
+} from './lib/e2e-preflight.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SELF = fileURLToPath(import.meta.url);
@@ -59,8 +64,8 @@ function validIsolationEnv() {
   };
 }
 
-/** 收集「护栏如期抛错」的证据。 */
-function expectThrow(label, fn, { namesMustInclude = [] } = {}) {
+/** 收集「护栏如期抛错」的证据。`namesMustNotInclude` = 文案里**不许**出现的词（两种失败不许互串的那一半）。 */
+function expectThrow(label, fn, { namesMustInclude = [], namesMustNotInclude = [] } = {}) {
   let thrown = null;
   try {
     fn();
@@ -69,7 +74,23 @@ function expectThrow(label, fn, { namesMustInclude = [] } = {}) {
   }
   if (!thrown) return { label, fired: false, message: '（没抛错——护栏失效）', matched: false };
   const message = String(thrown.message ?? thrown);
-  const matched = namesMustInclude.every((needle) => message.includes(needle));
+  const matched = namesMustInclude.every((needle) => message.includes(needle))
+    && namesMustNotInclude.every((needle) => !message.includes(needle));
+  return { label, fired: true, message, matched };
+}
+
+/** 同上，但被测函数是 async（`waitForHostFile` 那一类）——rejection 也要能收到账上。 */
+async function expectReject(label, fn, { namesMustInclude = [], namesMustNotInclude = [] } = {}) {
+  let thrown = null;
+  try {
+    await fn();
+  } catch (error) {
+    thrown = error;
+  }
+  if (!thrown) return { label, fired: false, message: '（没抛错/没拒绝——护栏失效）', matched: false };
+  const message = String(thrown?.message ?? thrown);
+  const matched = namesMustInclude.every((needle) => message.includes(needle))
+    && namesMustNotInclude.every((needle) => !message.includes(needle));
   return { label, fired: true, message, matched };
 }
 
@@ -173,6 +194,82 @@ cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOL_LARGE 跑出 D
     env: { ...validIsolationEnv(), FDE_IPAM_POOLS: '10.229.0.0/24', FDE_IPAM_POOL_LARGE: '10.229.0.0/24' },
   }),
   { namesMustInclude: ['FDE_IPAM_POOL_LARGE', '10.201.0.0/16'] }));
+// 15) #495 ①：compose 的 `--env-file` 不存在 ⇒ 必须在预检就硬失败，并点名「从主 checkout 复制」。
+//     变异入口：删掉 assertComposeEnvFile 的 ENOENT 分支 ⇒ 本陷阱失灵（rc 会变 2 / --strict 下 rc=1）。
+cases.push(expectThrow('assertComposeEnvFile() --env-file 不存在（不得让 compose 去报）',
+  () => assertComposeEnvFile({ envFile: path.join(os.tmpdir(), `erix-495-absent-${process.pid}`, '.env'), cwd: HERE, label: 'wp3b-e2e' }),
+  { namesMustInclude: ['wp3b-e2e', '不存在', '复制', COMPOSE_ENV_FILE, '.env.example'] }));
+
+// 16) #495 ②：目录存在但读不到 ⇒ 必须**提前**放弃等待，并点名 FDE_USER_UID/GID 口径。
+//     变异入口：把 unreadable 归进 missing（或把 unreadableConfirmations 改成 ∞）⇒ 本陷阱失灵
+//     → 回到 #412 原症状：白等 120s，报一句与「真的没物化」逐字相同的 timeout。
+cases.push(await expectReject('waitForHostFile() 目录读不到 ⇒ 提前放弃并点名 uid 口径',
+  () => waitForHostFile('/srv/erix/users/alice/home/.erix/config.json', {
+    fsImpl: {
+      statSync: () => ({ mode: 0o40770, uid: 0, gid: 1000, isDirectory: () => true }),
+      accessSync: (p) => { if (String(p).endsWith('alice')) throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); },
+      readFileSync: () => '{}',
+    },
+    timeoutMs: 60_000, intervalMs: 1, sleepImpl: async () => {}, label: 'alice config.json materialized',
+  }),
+  { namesMustInclude: ['读不到', 'FDE_USER_UID', '0:1000', 'alice config.json materialized'] }));
+
+// 17) #495 ② 的**叶子级**盲区（§8.128 变异 M4 登记的那一条）：**链能进、叶子没物化** ⇒ 必须按没物化报，
+//     而且**不许喊权限**。为什么上面 12) 不够：那条的 missing 夹具是**链级**（`<root>/bob` 整段不存在），
+//     而 M4（把叶子级 ENOENT 误归 unreadable）当时只把 CI 侧 `P8` 跑红、`--strict` 全绿 = 两个门各缺一半，
+//     「链级 / 叶子级」两种失败在负例门上仍可以互换。现在两门都不许混。
+//     夹具用注入：真 fs 单次调用造不出「stat 在、read 不在」（中间有竞态窗口），所以 statSync/accessSync
+//     走真夹具目录（链确认可进、叶子也在），只把 readFileSync 换成 ENOENT = 叶子在 stat 与 read 之间消失。
+//     变异入口：把叶子级 ENOENT 归进 unreadable ⇒ 文案变成「读不到」⇒ 本陷阱失灵（--strict rc=1）。
+{
+  const leafRoot = fs.mkdtempSync(path.join(os.tmpdir(), `erix-495-leaf-${process.pid}-`));
+  const leafDir = path.join(leafRoot, 'carol', 'home', '.erix');
+  fs.mkdirSync(leafDir, { recursive: true });
+  const leaf = path.join(leafDir, 'config.json');
+  fs.writeFileSync(leaf, '{}'); // stat 看得见它，但 read 时报 ENOENT（= 叶子级不存在）
+  cases.push(await expectReject('waitForHostFile() 链能进但叶子不存在 ⇒ 按没物化报且不许喊权限',
+    () => waitForHostFile(leaf, {
+      fsImpl: { ...fs, readFileSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); } },
+      timeoutMs: 60, intervalMs: 10,
+      sleepImpl: async (ms) => { await new Promise((resolve) => { setTimeout(resolve, ms); }); },
+      label: 'carol config.json materialized',
+      describe: () => `ls: cannot access '/srv/erix/users/carol/home/.erix/config.json': No such file or directory`,
+    }),
+    {
+      namesMustInclude: ['carol config.json materialized', '不存在', 'No such file or directory'],
+      namesMustNotInclude: ['读不到', 'FDE_USER_UID'],
+    }));
+  fs.rmSync(leafRoot, { recursive: true, force: true });
+}
+
+// 18) PR #554 复审 BLOCKER：`deploy/.env` 里**未加引号的行内注释**会把值变成
+//     `/docker/station-edge/dynamic # shared` ⇒ 与真路径**不相等** ⇒ 「与共享 `.env` 的值不相等」这条
+//     隔离判据在**危险方向上恒真**（隔离栈照旧往生产边缘写，预检却绿；#227① 当年就是这类「绿着写错」）。
+//     必须当场拒，并点名 文件:行号:键名 + 原文。只盯 HOST_WRITE_PATH_ENVS 那四个键：全文件一律拒会误杀
+//     真 `.env` 里 `POSTGRES_PASSWORD=xxxx # 说明` 这种合法行（实测本仓库 `deploy/.env` 就有三行）。
+//     变异入口：把 `findUnreproducibleEnvLines` 改成返回 []（= 撤掉那条拒绝）⇒ 本陷阱失灵（--strict rc=1）。
+{
+  const envDir = fs.mkdtempSync(path.join(os.tmpdir(), `erix-554-env-${process.pid}-`));
+  const isolatedFour = {
+    TRAEFIK_DYNAMIC_DIR_HOST: '/docker/station-edge/dynamic',
+    ERIX_USERSPACE_ROOT_HOST: '/erix-e2e/users',
+    ERIX_ARTIFACTS_ROOT_HOST: '/erix-e2e/artifacts',
+    STATION_DB_DIR: '/erix-e2e/db',
+  };
+  const inlineFile = path.join(envDir, 'shared-inline.env');
+  fs.writeFileSync(inlineFile, '# 共享栈\n\nTRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared\n');
+  cases.push(expectThrow('assertHostWritePathsIsolated() 共享路径带未加引号行内注释 ⇒ 当场拒并点名 文件:行号:键名',
+    () => assertHostWritePathsIsolated({ env: isolatedFour, envFile: inlineFile, label: 'wp3b-e2e' }),
+    { namesMustInclude: [':3 TRAEFIK_DYNAMIC_DIR_HOST', '未加引号', 'TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared'] }));
+  // 19) 同族第二形：比对键的值里有 `$` 插值（compose 会展开，我们看不到它的展开上下文）⇒ 无从证明
+  //     compose 拿到的就是这个字符串 ⇒ 也只能拒。变异入口：删掉 `interpolates` 那条分支 ⇒ 本陷阱失灵。
+  const interpFile = path.join(envDir, 'interp.env');
+  fs.writeFileSync(interpFile, 'STATION_DB_DIR=/docker/${STACK}/db\n');
+  cases.push(expectThrow('assertHostWritePathsIsolated() 比对键的值带 $ 插值 ⇒ 同族拒（无从复现 compose 真值）',
+    () => assertHostWritePathsIsolated({ env: isolatedFour, envFile: interpFile, label: 'wp3b-e2e' }),
+    { namesMustInclude: ['interp.env:1 STATION_DB_DIR', '$ 插值'] }));
+  fs.rmSync(envDir, { recursive: true, force: true });
+}
 
 // --- 正例（夹具 env 必须过护栏；否则上面的负例是「全都抛」的空洞通过）---------------------
 let positiveOk = true;
@@ -185,6 +282,33 @@ try {
   assert.ok(dockerCalls.length === callsBefore + 1, 'ERIX_E2E_ALLOW_DB_DIR=1 时 removeDbDir 应真的执行 docker');
   assert.ok(resolveDbDir({ STATION_DB_DIR: '/tmp/station-db-x/' }) === '/tmp/station-db-x',
     'resolveDbDir 应去掉尾斜杠');
+  // PR #554 BLOCKER 的反向自证（**不误杀**）：注释行 / 空行 / 缩进注释 / 引号内含 `#` / `#` 前无空格 /
+  // 非比对键带行内注释，都得照常过；且引号内的 `#` 必须是**正文**（compose 实测口径，误剥 = 把合法值改短）。
+  {
+    const okDir = fs.mkdtempSync(path.join(os.tmpdir(), `erix-554-ok-${process.pid}-`));
+    const okFile = path.join(okDir, 'ok.env');
+    fs.writeFileSync(okFile, [
+      '# 说明', '', '   # 缩进注释',
+      'TRAEFIK_DYNAMIC_DIR_HOST="/docker/station-edge/dynamic # odd"',
+      'ERIX_USERSPACE_ROOT_HOST=/erix/users#nospace',
+      'ERIX_ARTIFACTS_ROOT_HOST=/erix/artifacts',
+      'STATION_DB_DIR=/docker/station-db',
+      'POSTGRES_PASSWORD=Sup3r#cret # 生产库密码',
+    ].join('\n') + '\n');
+    assertHostWritePathsIsolated({
+      env: {
+        TRAEFIK_DYNAMIC_DIR_HOST: '/erix-e2e/dynamic', ERIX_USERSPACE_ROOT_HOST: '/erix-e2e/users',
+        ERIX_ARTIFACTS_ROOT_HOST: '/erix-e2e/artifacts', STATION_DB_DIR: '/erix-e2e/db',
+      },
+      envFile: okFile, label: 'wp3b-e2e',
+    });
+    const sharedValues = parseComposeEnvFile(okFile).values;
+    assert.equal(sharedValues.TRAEFIK_DYNAMIC_DIR_HOST, '/docker/station-edge/dynamic # odd',
+      '引号内的 `#` 是正文（误剥就是把合法路径改短 ⇒ 判据又在危险方向上漂）');
+    assert.equal(sharedValues.ERIX_USERSPACE_ROOT_HOST, '/erix/users#nospace', '`#` 前不是空格就不是注释（实测 compose 同口径）');
+    assert.equal(sharedValues.POSTGRES_PASSWORD, 'Sup3r#cret', '非比对键：注释照剥但不因此拒（真 `deploy/.env` 里三行密码就是这个写法）');
+    fs.rmSync(okDir, { recursive: true, force: true });
+  }
 } catch (error) {
   positiveOk = false;
   positiveError = String(error?.message ?? error);
@@ -360,6 +484,167 @@ try {
   positiveError = `${positiveError}${positiveError ? ' | ' : ''}ports.json↔DB 对账件正/负例被破坏：${String(error?.message ?? error)}`;
 }
 
+// issue #495 的正/负例组（同一棵树上的三态必须互不相同；全程夹具，不碰 docker）。
+// 变异自证入口：
+//   a) 把 observeHostPath 的 unreadable 归进 missing ⇒ 「真没物化」与「读不到」又被压成一态 ⇒ 本组红；
+//   b) 把 missing 归进 unreadable ⇒ 下面的「没物化不许喊权限」红（会把人带去改 uid 而不是查物化）；
+//   c) 让预检成功时也打一行字 ⇒ 「零输出」判据红（噪音会看起来像失败原因）；
+//   d) 把 toContainerPath 的越界分支删掉 ⇒ 拼错挂载根时快照指到别处，本组红；
+//   e) 把「末段是链接」的判定写死成恒真 ⇒ 下面「真文件那格」红；用 statSync 代替 lstatSync ⇒
+//      「链接那格」红（statSync 跟随链接，永远判不出末段是链接）；
+//   f) 把叶子级 ENOENT 归进 unreadable ⇒ 下面「叶子级不许喊权限」那格红（与陷阱 13 同一条，两门各钉一份）。
+try {
+  const userspace = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-495-trap-'));
+  try {
+    const home = path.join(userspace, 'alice', 'home', '.erix');
+    fs.mkdirSync(home, { recursive: true });
+    const cfg = path.join(home, 'config.json');
+    fs.writeFileSync(cfg, '{"slots":{"default":{"apiKey":"erix-placeholder"}}}');
+    assert.equal(observeHostPath(cfg).state, 'present', '夹具里文件在 ⇒ present');
+
+    const missing = observeHostPath(path.join(userspace, 'bob', 'home', '.erix', 'config.json'));
+    assert.equal(missing.state, 'missing', '链上第一段不存在 ⇒ missing（不是 unreadable）');
+    assert.equal(missing.missingPrefix, path.join(userspace, 'bob'), '要点名「第一个不存在的段」（只报叶子看不出 materializer 走到哪）');
+
+    const blocked = observeHostPath(cfg, {
+      fsImpl: {
+        ...fs,
+        statSync: (p) => (p === path.join(userspace, 'alice')
+          ? { mode: 0o40770, uid: 0, gid: 1000, isDirectory: () => true } : fs.statSync(p)),
+        accessSync: (p, m) => { if (p === path.join(userspace, 'alice')) throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); fs.accessSync(p, m); },
+      },
+    });
+    assert.equal(blocked.state, 'unreadable', '链上某段 0770 root:node、当前用户不在组里 ⇒ unreadable');
+    assert.equal(blocked.blocker.path, path.join(userspace, 'alice'), 'blocker 要指向被挡住那一段（不是叶子）');
+    assert.equal(blocked.blocker.owner, '0:1000', '属主要写出来，才能一眼对上 FDE_USER_UID/GID=1000/1000');
+    assert.notEqual(missing.state, blocked.state, '「没物化」与「读不到」必须是两个状态（合成一个就是 #412 的坑）');
+
+    // 末段是**符号链接**：三态不许改（bind 源做成链接是合法配置），但链接这条事实必须可区分——
+    // 不说出来就是拿状态猜挂载形态（宿主上 `ls` 到的与 portal 容器里读到的是两侧）。
+    const linked = path.join(home, 'config-link.json');
+    fs.symlinkSync(path.relative(home, cfg), linked); // 相对链接：顺带验目标解析
+    const asLink = observeHostPath(linked);
+    assert.equal(asLink.state, 'present', '链接指向可读文件 ⇒ 状态照旧 present（不许开第四态把等待路径搞崩）');
+    assert.equal(asLink.link.isSymlink, true, '链接事实必须为真（statSync 跟随链接看不出来 ⇒ 本格靠 lstatSync）');
+    assert.equal(asLink.link.targetExists, true, '目标存在要单独说出来');
+    const linkLine = formatLastSegmentLinkLine(asLink.link);
+    assert.match(linkLine, /符号链接/, '文案要含「符号链接」');
+    assert.ok(linkLine.includes(cfg), `诊断行要点名解析后的链接目标：${linkLine}`);
+    assert.match(linkLine, /portal 容器里看到的是\*\*链接目标那一侧\*\*/, 'bind 源是链接时的关键提示必须在');
+
+    const asPlain = observeHostPath(cfg);
+    assert.equal(asPlain.link.isSymlink, false, '真文件不许被写成链接（把链接判定写死成恒真 ⇒ 本格红 = 反向自证）');
+    assert.equal(formatLastSegmentLinkLine(asPlain.link), '', '非链接要渲染成空串（真文件那条路径的文案里不该出现「符号链接」）');
+    assert.equal(observeLastSegmentLink(cfg, { fsImpl: {} }).isSymlink, null,
+      '注入的 fsImpl 没有 lstatSync ⇒ 只能说「无从判定」，不许假装「不是链接」');
+
+    const danglingTo = path.join(home, 'never-written-by-materializer.json');
+    const dangling = path.join(home, 'dangling.json');
+    fs.symlinkSync(path.relative(home, danglingTo), dangling);
+    const asDangling = observeHostPath(dangling);
+    assert.equal(asDangling.state, 'missing', '悬空链接**归属不变**（还是 missing；开第四态会连锁打崩等待的时间判据）');
+    assert.equal(asDangling.link.isSymlink, true, 'lstat 看得见悬空链接本体（statSync 只看到 ENOENT ⇒ 链接事实就丢了）');
+    assert.equal(asDangling.link.targetExists, false);
+    assert.match(formatLastSegmentLinkLine(asDangling.link), /缺的是\*\*链接目标\*\*/, '要说清缺的是目标，不是链接本身');
+
+    // 链上**更早**的段是链接（`/srv/erix -> /data/erix` 那种「bind 源本身就是链接」的真实摆法）：
+    // 末段根本不像链接 ⇒ 只看末段就等于完全看不见它，逐段事实必须在账上。
+    const realAlice = path.join(userspace, 'alice');
+    const mount = path.join(userspace, 'mount');
+    fs.symlinkSync(path.relative(userspace, realAlice), mount);
+    const viaMount = observeHostPath(path.join(mount, 'home', '.erix', 'config.json'));
+    assert.equal(viaMount.state, 'present', '祖先段是链接 ⇒ 三态归属一个字不改（仍 present）');
+    const ancestorLinks = viaMount.links.filter((e) => e.isSymlink === true && e.isLastSegment === false);
+    assert.equal(ancestorLinks.length, 1,
+      `links 里必须有 mount 那一段：${JSON.stringify(viaMount.links.map((e) => [e.segment, e.isSymlink, e.isLastSegment]))}`);
+    assert.equal(ancestorLinks[0].segment, mount, '点名的是那一段（不是叶子）');
+    assert.equal(ancestorLinks[0].targetExists, true);
+    const ancestorLine = formatAncestorLinkLines(viaMount.links);
+    assert.match(ancestorLine, /符号链接/, '链上的链接必须被点名');
+    assert.ok(ancestorLine.includes(realAlice), `要点名它指向哪里：${ancestorLine}`);
+    assert.match(ancestorLine, /不是同一个 inode/);
+    assert.match(ancestorLine, /要改的是宿主侧这条链接指向/, '要说清宿主侧改哪里才有效');
+
+    // 全链真目录 ⇒ 零输出（反向自证：把那行改成恒输出 ⇒ 本格红）
+    assert.equal(formatAncestorLinkLines(asPlain.links), '', '全真目录不许冒出链上链接那一行');
+    assert.equal(asPlain.links.filter((e) => e.isSymlink === true).length, 0, '全真目录 ⇒ 一条链接都不许报');
+    assert.equal(asPlain.links.at(-1).isLastSegment, true, '末段那条继续保留（已合并的形状不能碎）');
+    assert.equal(observeSegmentLink(mount, { fsImpl: {} }).isSymlink, null,
+      '逐段 API 也一样：没有 lstatSync ⇒ 无从判定，不许假装「不是链接」');
+
+    // 叶子级不存在（链能进、read 时报 ENOENT）也不许沾到权限分支（与陷阱 13 同一条，两门各钉一份）
+    const leafGone = { ...fs, readFileSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); } };
+    const asLeafGone = observeHostPath(cfg, { fsImpl: leafGone });
+    assert.equal(asLeafGone.state, 'missing', '叶子级 ENOENT ⇒ missing（归进 unreadable = 把没物化当成权限，#495 ② 反向坑）');
+    assert.equal(asLeafGone.blocker, null, '根本没权限问题 ⇒ 不许端出一个 blocker');
+
+    // 真没物化的文案不许喊权限（否则人会被带去改 uid，而真正缺的是 materializer）
+    const timeoutError = await waitForHostFile(path.join(userspace, 'nobody', 'home', '.erix', 'config.json'), {
+      timeoutMs: 5, intervalMs: 1, sleepImpl: async () => {}, label: 'nobody config.json materialized',
+      describe: () => 'ls: cannot access /srv/erix/users/nobody: No such file or directory',
+    }).then(() => null, (error) => error);
+    assert.ok(timeoutError, '没物化必须最终拒绝');
+    assert.match(timeoutError.message, /timeout waiting for nobody config\.json materialized/, '旧文案形状保留（历史 grep 仍有效）');
+    assert.match(timeoutError.message, /No such file or directory/, '容器侧现场快照要附在文案里（#495 ② 判据 2）');
+    assert.doesNotMatch(timeoutError.message, /读不到|FDE_USER_UID/, '真没物化时不许喊权限');
+
+    // 预检成功 ⇒ 零输出（#495 ① 验收判据的反向自证）
+    fs.mkdirSync(path.join(userspace, 'deploy'), { recursive: true });
+    fs.writeFileSync(path.join(userspace, 'deploy', '.env'), 'PORTAL_HOST_PORT=18080\n');
+    const writes = [];
+    const originalWrite = process.stdout.write;
+    process.stdout.write = (chunk) => { writes.push(String(chunk)); return true; };
+    try {
+      assertComposeEnvFile({ cwd: userspace, label: 'e2e226' });
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    assert.equal(writes.join(''), '', '预检成功不许打印任何东西：' + JSON.stringify(writes));
+
+    // 宿主路径 ↔ 容器路径与现场快照的形状（同路径 bind mount + 一条不抛错的 ls）
+    assert.equal(toContainerPath(cfg, { hostRoot: userspace }), '/srv/erix/users/alice/home/.erix/config.json');
+    assert.throws(() => toContainerPath('/totally/other/root/config.json', { hostRoot: userspace }), /不在宿主挂载根/);
+    const lsCalls = [];
+    materializeSnapshot({
+      docker: (args) => { lsCalls.push(args); return 'drwxrws--- 3 root node 4096 /srv/erix/users/alice/home/.erix'; },
+      container: 'station-portal-e2e226',
+      containerPath: '/srv/erix/users/alice/home/.erix/config.json',
+    });
+    assert.equal(lsCalls.length, 1, '现场快照只花一次 docker（成本敏感的判据不能查三次）');
+    assert.match(lsCalls[0], /2>&1 \|\| true/, '远端 stderr 合并 + 不吃退出码（ls 对缺失段返回 2，那句话正是要的）');
+    assert.ok(!/\n/.test(lsCalls[0]), '快照命令必须单行（工单 F-6：经 JSON.stringify 会变成字面 \\n）');
+
+    // #227.2 该钉的行级判据本体（#495 的文档注释被它误伤过 ⇒ 判据提出函数并钉住双向）：
+    // 变异入口：把注释排除那段删掉 ⇒ 散文又被当命令；把 `!/ -p /` 删掉 ⇒ 合规命令也被报。
+    assert.equal(lineMissingComposeProject('const COMPOSE = \'docker compose -f deploy/docker-compose.yml\';'), true,
+      '真命令不带 -p 必须报（#227.2 本体不能被放宽）');
+    assert.equal(lineMissingComposeProject('const COMPOSE = \'docker compose -p "${X:-station}" -f y\';'), false,
+      '带了 -p 的合规命令不许报');
+    assert.equal(lineMissingComposeProject('// 必然缺。docker compose 要到整轮镜像构建之后才报'), false,
+      '纯注释是散文不是命令（#495 的头部清单就是被这条误伤的）');
+    assert.equal(lineMissingComposeProject('   * docker compose down -v'), false, '块注释续行同样不算命令');
+    assert.equal(lineMissingComposeProject('// docker compose -f x'), false, '注释里就算带了 -p 也不该因「有 -p」才被放过（它根本不是命令）');
+  } finally {
+    fs.rmSync(userspace, { recursive: true, force: true });
+  }
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}#495 预检/三态分类正例被破坏：${String(error?.message ?? error)}`;
+}
+/**
+ * #227.2 的行级判据：这一行是不是「一条没显式带 -p 的 docker compose 命令」。
+ *
+ * ⚠ **纯注释行不算命令**（#495 的文档注释「… docker compose 要到整轮镜像构建之后才报」曾被该钉误伤）：
+ * 钉的是命令串，不是散文。真命令不会写在 `//` 行里（模板字面量的续行也不以 `//` 开头），所以只排除
+ * 注释形态 = 不放过任何真命令。夹具在上方 #495 正例组里（把判据改坏当场红）。
+ *
+ * @param {string} line 单行源码
+ * @returns {boolean} true = 该钉要报（是命令且不带 -p）
+ */
+function lineMissingComposeProject(line) {
+  return /docker compose\b/.test(line) && !/ -p /.test(line) && !/^\s*(?:\/\/|\*|\/\*)/.test(line);
+}
+
 // 工单 F-6：**经 `sg docker -c ${JSON.stringify(cmd)}` 两层的命令不得含裸换行**（源码级静态钉）。
 // 根因（真机 §⑤ 首失败）：JSON.stringify 把模板里的**真实换行**变成字面 `\n` 两个字符，而双引号内的
 // POSIX shell **不还原**它 ⇒ 下游 psql 实收 `run_id\n FROM` ⇒ `ERROR: syntax error at or near "\"`。
@@ -497,10 +782,26 @@ try {
 // wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
 const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable',
   'deriveFdeIpamPools', 'defaultFdeIpamPools', 'deriveStackIpamPoolEnv', 'applyStackIpamPoolEnv',
-  'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce'];
+  'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce',
+  // PR #554 BLOCKER：env 行内注释的解析与「无从复现」判定也只允许一份定义（两份解析必然漂）。
+  'parseComposeEnvLine', 'parseComposeEnvFile', 'findUnreproducibleEnvLines'];
 // 工单 F：`ports.json ↔ port_allocations` 对账件的唯一定义处是 lib/ports-reconcile.mjs（不在
 // isolated-env.mjs 里），所以单一来源断言得按名字选归属文件，不能再默认「只有 isolated-env.mjs」。
-const SINGLE_SOURCE_FILES = { reconcilePortsJsonWithDb: 'ports-reconcile.mjs' };
+const SINGLE_SOURCE_FILES = {
+  reconcilePortsJsonWithDb: 'ports-reconcile.mjs',
+  // issue #495：起跑前预检与「等宿主侧物化文件」的三态分类（#412 遗留 ①②）。各 e2e 只 import，
+  // 不许在脚本里复制第二份——两份分类文案一定会漂，而漂了就是回到「两种失败长得一样」的原坑。
+  assertComposeEnvFile: 'e2e-preflight.mjs',
+  inspectHostPathChain: 'e2e-preflight.mjs',
+  observeHostPath: 'e2e-preflight.mjs',
+  observeLastSegmentLink: 'e2e-preflight.mjs',
+  observeSegmentLink: 'e2e-preflight.mjs',
+  formatAncestorLinkLines: 'e2e-preflight.mjs',
+  formatLastSegmentLinkLine: 'e2e-preflight.mjs',
+  waitForHostFile: 'e2e-preflight.mjs',
+  toContainerPath: 'e2e-preflight.mjs',
+  materializeSnapshot: 'e2e-preflight.mjs',
+};
 const ISOLATION_SCRIPTS = ['wp2a-e2e.mjs', 'wp3a-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
 const singleSourceProblems = [];
 {
@@ -625,7 +926,8 @@ const singleSourceProblems = [];
       singleSourceProblems.push("wp3a-e2e.mjs: ensureLlmBinding 没有显式传 modelName: 'mock-model'（必须与 fake-agentd llm 段请求的模型名对齐；缺省 e2e-mock-model 不在白名单 → 403，#268 M3）");
     }
   }
-  // 工单 F（wp2a 重建，#268 决策第 2 条）：wp2a 必须按 P5 + 迁移 0019 的现役语义跑，且最重的那条
+  
+// 工单 F（wp2a 重建，#268 决策第 2 条）：wp2a 必须按 P5 + 迁移 0019 的现役语义跑，且最重的那条
   // 断言（ports.json ↔ port_allocations 对账）不许在脚本里被写软。变异自证入口：
   //   a) 删 wp2a 的 writeDynamicStub 调用 → 上方 DYNAMIC_STUB_SCRIPTS 红；
   //   b) 把对账改成恒真 → 上面「ports.json↔DB 对账件正/负例」那组红（行为面，无需 docker）；
@@ -683,11 +985,12 @@ const singleSourceProblems = [];
   }
   // #227.2：脚本里的 compose 命令串必须显式带 `-p `（隔离系用 `${COMPOSE_PROJECT_NAME:?…}`、共享系用
   // `${COMPOSE_PROJECT_NAME:-station}`）——出现不带 -p 的 `docker compose ` 即红：回到「忘 export 就对
-  // 共享 dev 栈 down -v」的隐式兜底（deploy/docker-compose.yml 的 `name: station`）。
+  // 共享 dev 栈 down -v」的隐式兜底（deploy/docker-compose.yml 的 `name: station`）。判据本体在
+  // `lineMissingComposeProject()`（纯注释行不算命令，#495 误伤过一次；夹具在 #495 正例组）。
   for (const file of files) {
     const lines = fs.readFileSync(file, 'utf8').split('\n');
     lines.forEach((line, i) => {
-      if (/docker compose\b/.test(line) && !/ -p /.test(line)) {
+      if (lineMissingComposeProject(line)) {
         singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}:${i + 1} docker compose 命令没显式带 -p（#227.2：消灭 compose 文件 name: 的隐式兜底）：${line.trim()}`);
       }
     });
@@ -711,6 +1014,15 @@ const singleSourceProblems = [];
     }
     for (const hit of text.matchAll(/process\.env\.(FDE_IPAM_POOL_[A-Z]+)\s*=[^=]/g)) {
       singleSourceProblems.push(`${script}: 自己给 ${hit[1]} 赋值了（两腿注入只允许走 lib/applyStackIpamPoolEnv，#270）`);
+    }
+  }
+  // #495 ②：portal 容器内的 userspace 路径（bind mount 右值，`deploy/docker-compose.yml` 里写死）只允许
+  // 活在 lib/e2e-preflight.mjs 的 PORTAL_USERSPACE_CONTAINER_ROOT。脚本里再拄一份带引号的字面量 = 有人在
+  // 自己算宿主→容器路径（拼错了就是快照指到别处，看了白看）。
+  for (const file of files) {
+    if (path.basename(file) === 'e2e-preflight.mjs') continue;
+    if (/['"]\/srv\/erix\/users['"]/.test(fs.readFileSync(file, 'utf8'))) {
+      singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 又硬编码了 portal 容器内的 userspace 路径 '/srv/erix/users'（#495 ② 应 import lib/e2e-preflight.mjs 的 PORTAL_USERSPACE_CONTAINER_ROOT + toContainerPath）`);
     }
   }
   // 工单 F-6：所有要过 `sg docker -c ${JSON.stringify(cmd)}` 那两层的命令串必须**单行**——真实换行会被

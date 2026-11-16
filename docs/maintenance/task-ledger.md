@@ -7100,3 +7100,243 @@ root `timeout 1500 npm test` 按「先 commit 再跑长门禁」在本节提交�
 （见上面「剩余」第 2 条），现在多了一层：现场要配 `chatcmpl-tool-` 那一族时，
 配置面**收得下**但**投递不到**；② `<invoke` / `chatcmpl-tool-` 是预防性覆盖，真样本仍待现场出现；
 ③ LOW-4 的残余按上面的代价论证保留。
+
+
+### 8.128 e2e 起跑前预飞：缺 `deploy/.env` 不再烧完整轮镜像构建 + EACCES 不再伪装成「没物化」（issue #495 + #227①② / 工单 fix-261116-01，2026-11-16，worker 落地 + 变异自证）
+
+> **编号由主 agent 统一分配（本批并行）**：本仓末尾本节之前是 §8.126，§8.127/§8.128 的空号是主 agent
+> 留给并行 worker 的槽位。**本节用 `cat >>` 追加，不往文件中间插**（本批已实测并行 worker 往中间插会撞车），
+> 也**没动 `AGENTS.md`**（逐单账不进阶梯，见 AGENTS §6）。
+
+**治的是什么**：`#412` 拆出来的 ①② 两条（#495），共同点不是「测试红」而是**红得没有信息**——
+① 九支 e2e 的 compose 命令串固定带 `--env-file deploy/.env`，而它不入 git ⇒ git worktree / 新 clone
+里必然缺，`docker compose` 要到**整轮镜像构建之后**才报 `couldn't find env file`（#412 部署机实测白烧
+10.7 分钟）；② 等 portal 写进宿主 bind mount 的 `config.json` 时旧写法是
+`waitFor(() => (fs.existsSync(p) ? fs.readFileSync(p) : null))`，而 `existsSync` 对**没权限**的路径返回
+`false`（EACCES 被吞）—— portal 以 root 把 FDE 目录建成 `0770 node:node`（uid/gid 1000），跑测试的人
+uid ≠ 1000 时文件其实早就写出来了，测试却白等 120 s，报一句与「真的没物化」**逐字相同**的 timeout。
+
+**交付面**（一个提交 `test(e2e)[fix-261116-01]`，未 push）
+- 新增 `portal/integration/lib/e2e-preflight.mjs`（350 行，**唯一定义处**，`isolation-negative` 的单一来源
+  断言把六个导出全钉在这）：`assertComposeEnvFile`（①：不存在 / 不是普通文件 / 存在但读不到，三种文案各点名
+  「从主 checkout 复制一份」+ 模板路径，**成功时零输出**）、`inspectHostPathChain`（沿链从根往下走，给出
+  **第一个进不去的段** + 它的 `mode`/`owner`，或**第一个不存在的段**）、`observeHostPath`（三态
+  `present / missing / unreadable`）、`waitForHostFile`（unreadable 连续两次**立刻**放弃——权限不是时间问题；
+  missing 等满超时）、`toContainerPath` + `materializeSnapshot`（把 portal 容器侧 `ls -ld 父目录 + 目标`
+  的原文拼进失败文案，userspace 是**同路径** bind mount，一次 docker 排除两种可能之一）。
+- ① 接线 9 支：`wp2a/wp2b/wp3a/wp3b/wp4/wp5/wp6/wp5-ui-setup/wp5-ui-teardown` 在**模块加载时**（任何
+  `docker`/`compose` 之前）预检；wp3b 头部清单补上 `deploy/.env` 必传前置（#412 立项理由之一：清单不够用）。
+- ② 接线 3 支：`wp3b`/`wp5`/`wp6` 的 `config.json materialized` 等待改用 `waitForHostFile`（旧的
+  `fs.existsSync(configPath)` 形态由静态钉禁止回来）。
+- 判据两处：新增 `test/integration-e2e-preflight.test.js`（13 条，**进 CI 门**：根 `npm test`）；
+  `isolation-negative.mjs` +2 条陷阱（env 缺文件必须硬失败、读不到必须提前放弃）+ 一组 #495 正例
+  （三态互不相同、预检零输出、快照命令形状 `2>&1 || true`、路径换算越界必抛）。
+- 顺手修一处**误伤**：`#227.2` 的「`docker compose` 必须显式带 `-p`」是行级扫描，把注释与字符串里的
+  `docker compose` 当命令——本单的头部清单一次被误伤 **12 处**。修法不是改散文，是把判据收成
+  `lineMissingComposeProject()`（纯注释行不算命令）+ 双向夹具（真命令不带 `-p` 必红 / 带 `-p` 不红 / 注释不红）。
+
+**门禁读数**（判绿只看退出码）
+- `node --test test/integration-e2e-preflight.test.js` → `# pass 13 / # fail 0`
+- `node portal/integration/isolation-negative.mjs --strict` → **rc=0**（12 条陷阱均硬失败、单一来源一份定义）；
+  缺省模式仍 **rc=1**（这是刻意的「负例证据」口径，不是失败——文件头有写，别当回归）
+- 根 `npm test` 的终值贴在交付报告里（不拄进台账，免得仓里多一处手抄的当下数字）。**改动前**的基线是
+  `# tests 2368 / pass 2354 / fail 0 / skipped 14`（rc=0），本单净增 13 条用例。
+
+**变异自证 12 发**（每次只改一处源码，跑两道门；全部已还原。红条点名到 `not ok N`）
+
+| # | 变异 | 红在哪 |
+|---|---|---|
+| M1 | 删掉 wp3b 的 `assertComposeEnvFile(...)` 调用 | `not ok 13 - \#495 接线静态自检：脚本必须在**任何 docker 之前**做预检` |
+| M2 | 把预检插回 `safe(() => compose('down -v', {` 前一行 | **没红**——插的位置仍在第一次 compose **之前**，是合法形态 ⇒ 夹具缺陷，不是判据缺陷（红条入口是「晚于第一次 compose/docker」） |
+| M3 | 叶子级 EACCES 不再归 unreadable | `not ok 6 - \#495② P5b 文件本身不可读（链能进，但 readFileSync 抛 EACCES）` |
+| M3b | 目录级 blocker 不再归 unreadable | `not ok 5 - P5 三态分开`、`not ok 7 - P6`；neg 侧 `TRAP FAIL · waitForHostFile() 目录读不到 ⇒ 提前放弃并点名 uid 口径` + `正例夹具被抛错 … 链上某段 0770`（**双门红**） |
+| M4 | 叶子级 ENOENT 归进 unreadable（= 三态压成一态的原坑） | `not ok 9 - \#495② P8 等待：文件延迟出现 ⇒ 返回正文`；⚠ **neg --strict 仍绿**（盲区，见坑 3） |
+| M5 | 预检成功时多打一行 | `not ok 1 - \#495① P1 …**零输出**` + neg `正例夹具被抛错 … 预检成功不许打印任何东西`（双门红） |
+| M6 | `unreadableConfirmations` 2 → 1e9（不再提前放弃） | `not ok 7 - P6`（判据是 `elapsed < timeoutMs/2`，不是文案） |
+| M7 | 快照命令丢掉 `2>&1 \|\| true` | `not ok 11 - P11 现场快照 = 一条不抛错的 ls` + neg `… 远端 stderr 合并 + 不吃退出码` |
+| M8 | `toContainerPath` 不拒越界路径 | `not ok 10 - P10 宿主路径 → portal 容器内路径` + neg `… Missing expected exception` |
+| M9 | wp3b 等物化退回 `fs.existsSync` 一把梭 | `not ok 13 - 接线静态自检`（两条断言各抓一次：`waitForHostFile(` 消失 + `fs.existsSync(configJsonPath)` 回来） |
+| M10 | `#227.2` 判据去掉「注释行排除」 | neg `正例夹具被抛错 … 纯注释是散文不是命令` + `单一来源断言 FAIL：… e2e-preflight.mjs:7 docker compose 命令没显式带 -p` |
+| M11 | 在 wp3b 里复制一份 `waitForHostFile` 定义 | neg `单一来源断言 FAIL：waitForHostFile: 期望只在 lib/e2e-preflight.mjs 有 1 处定义，实际 2 处` |
+
+**四个坑（全是实测，不是设想）**
+
+1. **变异脚本的「备份还原」会自己藏毒**（本单真实踩到，且差点被提交）：上一轮变异跑到一半被时间闸掐了，
+   脚本末尾的 `restore()` 没执行，于是下一轮开头 `cp $LIB $D/lib.bak` 抓的是**带 M4 变异文本**的树，
+   之后每次 `restore()` 都把毒还原回去。表现：`M4 变异没打上（原文没搜到）` + `P8` 稳定红 + 怎么都解释不通。
+   ⇒ 两条红线：**提交前逐条 grep 变异指纹**（`if (false) {` / `console.log` / `1e9` / `2>/dev/null"` / `mode: '?'`），
+   以及**别信"脚本末尾有 restore"**——备份要么从 `git show HEAD:<path>` 取，要么每轮开头先校验备份自身干净。
+2. **`--strict` 与缺省模式是两套退出码**：缺省模式「陷阱全硬失败」= **rc=1**（刻意留证据），`--strict` 才是
+   回归口径（rc=0 才叫绿）。跑的人不知道这点就会把护栏改坏读成"本来就红"。
+3. **链级与叶子级要分开钉**：`missing`/`unreadable` 的判定有两条入口（祖先链走不动 / 叶子自己读不出）。
+   `P5`/`P7` 只覆盖链级，M4 那种「叶子级 ENOENT 被归成 unreadable」在 `isolation-negative` 里**完全没被抓住**
+   （正例组的夹具是"链上第一段不存在"），最后只有 `P8`（fake `readFileSync` 抛两次 ENOENT）抓到——
+   它就是"materializer 还没写出"那段窗口的哨兵。⇒ 文案级断言不够，**时间判据**（提前放弃 vs 等满）与
+   **状态值断言**才是可失败的证据。
+4. **`/srv/erix/users` 这类"宿主 ↔ 容器同路径"字面量要有归属**：新常量 `PORTAL_USERSPACE_CONTAINER_ROOT`
+   只活在 lib，`isolation-negative` 里加了一条「别的 integration 文件不许出现带引号的 `/srv/erix/users`」——
+   自己算映射 = 快照指到别处，看了白看（compose 里右值写死：`deploy/docker-compose.yml` portal 的
+   `${ERIX_USERSPACE_ROOT_HOST}:/srv/erix/users`）。
+
+**未尽项：静态判据 vs 真机面**（真机面 worker 本机跑不了，别当已验）
+- **已验（静态 / 夹具，进 CI 门）**：预检三种失败与「成功零输出」、三态互不相同、提前放弃与等满的时间判据、
+  宿主→容器路径换算与越界、快照命令形状、接线顺序（预检早于第一次 compose/docker）、单一来源、字面量归属。
+- **未验（真机面，主 agent 合并后亲手跑）**：① 在没有 `deploy/.env` 的 worktree 里跑 wp3b 的**秒级失败**
+  （worker 只验到「模块加载即抛 + 文案点名」的语义，没跑真 compose）；② **真 EACCES**（uid ≠ 目录属主）——
+  本机 eric 自己就是 `uid=1000` = FDE 目录属主，`chmod 0700` 对自己照样可读，所以「读不到」分支是
+  **注入的 `accessSync` 抛 EACCES** 复现的，不是真权限；建议按 #495 判据补一发
+  `docker run --rm -u 1001:1001 -v <tmp>:/host node:22-alpine node -e …`；③ `docker compose … --env-file deploy/.env config`
+  原文命令跑通；④ `wp3b`/`wp5`/`wp6` 全量 e2e **没复跑**（要 docker + 一整套隔离栈 env）。
+- **判据差项（明确没做，等主 agent 定）**：工单 follow-up 写的「① 宿主路径链逐段 `lstat`、**末段不许是符号链接**」
+  —— 现在链检是 `statSync` + `accessSync`（**跟随**符号链接）：悬空链接会被归成 `missing`，指向可读文件的链接
+  会被归成 `present`，**不点名"它是符号链接"**；「② env **值非法** fail-fast 点名变量」worker 只做了
+  「缺失 / 不是普通文件 / 读不到」三种，**没做键值校验**（那条线在 `portal/test/deploy-env-defaults.test.js`）；
+  「缺省值逐字 `ext4`」在本单文件里没出现——本单只新增 `/srv/erix/users` 一个常量，**零新增配置键**成立。
+
+**收尾补记（同批 worker，把上面「未验 ②」改成「已验」）**：② 的真机 EACCES 已补验，**不是注入的假
+`accessSync`**：`docker run --rm -u 1001:1001 -v <tmp>:/host:ro -v <repo>:/app:ro node:22-alpine` 里以
+`uid/gid=1001/1001` 读宿主上由 `uid=1000` 建的 `0770` 目录链（文件 `0644` 确实在盘上）：
+- `observeHostPath('/host/alice/home/.erix/config.json')` ⇒ `unreadable`，blocker=`/host/alice`，
+  `mode=0o770 owner=1000:1000`；同一时刻宿主侧 `cat` 拿得到正文 ⇒「文件已写出、只是测试看不见」第一次由文案自己说清；
+- `observeHostPath('/host/nobody/…')` ⇒ `missing` + `missingPrefix=/host/nobody` ⇒ **真权限下两态仍然分得开**；
+- `waitForHostFile(读不到那条)` ⇒ **503 ms** 放弃（上限 60 s），首行「已经存在，但当前用户读不到」并点名 `FDE_USER_UID`；
+- `waitForHostFile(没物化那条, timeoutMs=400)` ⇒ 等满后报 `timeout waiting for … 路径上第一段就不存在（缺：/host/nobody）`，
+  **没喊权限**（不许把人带去改 uid）；
+- 顺手量到的边界：把 bind 根本身也 `chmod 770` ⇒ 两条路径都报 `unreadable`、blocker 是根那一段——进不去就
+  无从 `stat`，这时「读不到 / 没物化」**原理上分不开**，文案给的是根路径而不是假装的区分。
+- 另两条原判「真机面」也补了：`docker compose -p station --profile litellm --env-file deploy/.env
+  -f deploy/docker-compose.yml config --quiet` ⇒ **rc=0**（原文命令跑通，只渲染不碰容器）；`mv deploy/.env`
+  之后 `node --test portal/integration/wp3b-e2e.mjs` ⇒ **rc=1 / 210 ms**，日志里一次 docker 都没发（唯一含
+  `docker` 的那行是文案本身）⇒ #495 ① 的「秒级失败 + 点名要复制哪个文件」成立。
+  **仍然未验**只剩：`wp3b`/`wp5`/`wp6` 的全量 e2e 复跑（要 docker + 整套隔离栈 env）。
+
+**返修补记（同批 worker，工单 fix-261116-01 的第二轮；只动两处，键值校验那条线按裁决不碰）**
+
+*活一：末段是符号链接 ⇒ 变成一条**独立可诊断事实**，三态归属一个字没改。*
+裁决记下来：预检是**诊断面**不是策略闸门——bind 源做成符号链接是合法配置（别的操作机的机器就这么摆），
+所以**不开第四态**（`waitForHostFile` 的「提前放弃 / 等满超时」两种形状已被判据钉住，加态会连锁打崩时间判据）。
+- `observeLastSegmentLink()`（`lstatSync` + `readlinkSync`）+ `formatLastSegmentLinkLine()`（**非链接 ⇒ 空串**，
+  不是来一句「不是链接」）；`observeHostPath` 每条返回都带 `link`；`unreadable` / `missing` 两种失败文案都带上这行
+  「`<路径> 是符号链接 → <目标>`；若这是宿主 bind 源，portal 容器里看到的是**链接目标那一侧**」。
+- 为什么必须单独说：`statSync` / `readFileSync` **跟随**链接 ⇒ 「链接指向可读文件」与「真文件」在状态上完全同形，
+  不说出来就是拿状态猜挂载形态。悬空链接**仍归 `missing`**（`statSync` 对它抛 ENOENT），但文案额外说一句
+  「缺的是**链接目标**，不是链接本身」。注入的 `fsImpl` 没有 `lstatSync` ⇒ `isSymlink=null` + `detectable=false`
+  （不许假装「不是链接」）。
+- 两格新判据（CI）：`L1` 链接+目标可读 ⇒ 仍 `present` 且链接事实为真、诊断行含 `符号链接` / 原样目标 / 解析后绝对目标；
+  `L2` 真文件 ⇒ 事实为假、`formatLastSegmentLinkLine()===''`、等待超时的文案里 `doesNotMatch(/符号链接/)`（反向自证）；
+  `L3` 悬空链接 ⇒ `missing` + `missingPrefix=链接路径`（归属不动）+ 文案点名缺的是目标 + `doesNotMatch(/读不到|FDE_USER_UID/)`。
+
+*活二：把上面登记的盲区（M4）补到负例门上*——`isolation-negative` 的 `expectThrow/expectReject` 加了
+`namesMustNotInclude`（「两种失败不许互串」的另一半判据以前表达不出来，只能靠人读输出），并加**陷阱 13**：
+链能进、叶子在 `stat` 与 `read` 之间消失 ⇒ 必须按没物化报（含快照那句 `No such file or directory`）
+且**不许**出现 `读不到` / `FDE_USER_UID`。夹具走注入：真 fs 单次调用造不出这个竞态窗口（`stat` 与 `read` 之间）。
+`#495` 正例组同时加链接四格 + 叶子级一格 ⇒ 「链级 / 叶子级」现在在**两个门**上都不可混。
+
+**本轮变异读数（每发都带 `MUTANT` 标记，跑完 `git checkout` 还原、`grep -rn MUTANT portal test`=0、`git status` 干净）**
+
+| 发 | 改了什么 | CI 门 | `--strict` |
+|---|---|---|---|
+| MT1 | 链接事实写死成恒真 | `# pass 16 / # fail 1`：**`not ok 14 - L2 ② 末段是真文件 ⇒ 链接事实为假…`** | rc=1 `正例夹具被抛错 … 真文件不许被写成链接` |
+| MT2 | 用 `statSync` 代替 `lstatSync`（不检末段） | `# pass 15 / # fail 2`：**`not ok 13 - L1`** + **`not ok 15 - L3`** | rc=1 `正例夹具被抛错 … 链接事实必须为真` |
+| MT3 | 叶子级 ENOENT 误归 `unreadable`（= 上一轮的 M4） | `# pass 15 / # fail 2`：`not ok 9 - P8` + **`not ok 16 - L4`** | rc=1 **`TRAP FAIL · waitForHostFile() 链能进但叶子不存在 ⇒ 按没物化报且不许喊权限`**（上一轮这里是全绿=盲区，现已堵） |
+
+干净树读数：CI 门 `# tests 17 / # pass 17 / # fail 0`（rc=0）；`isolation-negative --strict` rc=0
+（`verdict=TRAPS_FIRED（全部 13 条陷阱=均硬失败；单一来源=一份定义）`，缺省模式 rc=1 是刻意的负例证据口径）；
+`npm run check:agents-hotlayer` rc=0。里程碑 1 单独状态（旧 harness + 新 lib）也独立跑过：17/17 + `--strict` rc=0
+（12 条陷阱），所以两个提交各自都是绿的。
+`grep -rn "['\"](/srv/erix/users" portal/integration --include=wp*.mjs` 仍 0 处；单一来源钉新增
+`observeLastSegmentLink` / `formatLastSegmentLinkLine` 两个名字。
+
+**判据差项现在只剩**：① 「链**逐段 lstat**、末段不许是符号链接」的 *fail-closed* 版本刻意不做（主 agent 裁决只诊断）；
+链检本身仍是 `statSync`+`accessSync`（跟随链接），但末段链接事实已由 `observeLastSegmentLink` 单独说出并写进文案；
+② env 键值（值非法）校验不做（那条线在 `portal/test/deploy-env-defaults.test.js`）；③ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
+
+**返修补记二（同批 worker，第三轮；只放开自报的那一条边界）**
+
+把链上**更早**的段做成链接（`mount -> real`）⇒ 上一轮的结果是 `state=present`、`link.isSymlink=false`，
+也就是「bind 源本身就是符号链接」这个**现实里最常见的摆法**（`/srv/erix -> /data/erix`）今天完全隐形——
+而且它**末段根本不像链接**（末段是 `config.json` 真文件），所以只看末段永远看不见它。本轮就补这一条。
+
+- `inspectHostPathChain` 在**已有的逐段走查**里，对每一段先 `lstatSync`（不跟随）记一条事实
+  `{segment, path, isLastSegment, isSymlink, target, resolvedTarget, targetExists, detectable}` 再判归属，
+  返回 `links` 数组（提前 return 也把已走到的段带回去）。逐段 API 是 `observeSegmentLink`，
+  `observeLastSegmentLink` 变成它 `isLastSegment=true` 的薄包装（已合并的末段形状一个字没改）。
+  `observeHostPath` 的 `link` 直接**复用走查里末段那条**（同一次 `lstat`，不重复发 syscall；链提前 return 时
+  补一次，保证 L1/L2/L3 依赖的形状不碎）。
+- `formatAncestorLinkLines(links)`：只点名**第一个**非末段链接 + 它指向哪（相对链接给解析后的绝对目标）+
+  「portal 容器里看到的**容器内路径与宿主路径不是同一个 inode**：容器那一侧走的是链接目标，若这就是 bind 源，
+  **要改的是宿主侧这条链接指向**，去改容器里看到的那一侧不会生效」；悬空再加一句「缺的是**链接目标**」；
+  全链真目录 ⇒ **空串**（不是来一句「链上没有链接」）。接进 `unreadable` / `missing` 两种失败文案。
+- **三态归属一个字没改**：`present`/`missing`/`unreadable`、`missingPrefix`、`waitForHostFile` 的
+  「提前放弃 / 等满超时」两种形状、`unreadableConfirmations` 全部未动 ⇒ 本轮唯一产品效果是**多一条可诊断事实**。
+- 注入的 `fsImpl` 没有 `lstatSync` ⇒ 每一段都是 `isSymlink=null` + `detectable=false`（沿用末段口径，不假装「不是链接」）。
+
+**读数**：CI 门 `# tests 19 / # pass 19 / # fail 0`（上一轮 17 + 本轮 `L5`/`L6` 两格）；
+`isolation-negative --strict` rc=0（`verdict=TRAPS_FIRED（全部 13 条陷阱=均硬失败；单一来源=一份定义）`，
+缺省模式 rc=1 是刻意的负例证据口径）；单一来源钉新增 `observeSegmentLink` / `formatAncestorLinkLines`。
+
+**本轮变异（锚点命中数先校验=1 才动手；跑完 `git checkout` 还原、`grep -rn MUTANT portal test`=0、`git status` 干净）**
+
+| 发 | 改了什么 | CI 门 | `--strict` |
+|---|---|---|---|
+| M-A | 逐段走查用 `statSync`（跟随链接） | `# pass 16 / # fail 3`：`not ok 13 - L1` + `not ok 15 - L3` + **`not ok 17 - L5`** | rc=1 正例组「链接事实必须为真（statSync 跟随链接看不出来）」 |
+| M-B | 链上链接那一行改成**恒输出** | `# pass 17 / # fail 2`：`not ok 14 - L2` + **`not ok 18 - L6`**（`actual: '  链上第一段符号链接（不是末段）：MUTANT-MB 恒输出 → /'`） | rc=1 正例组「全真目录不许冒出链上链接那一行」 |
+| M-C | 走查里**只记末段**（把本轮新加那一半删掉） | `# pass 17 / # fail 2`：**`not ok 17 - L5`**（`expected: 1 / actual: 0`）+ `not ok 18 - L6`；**L1/L2/L3 保持绿** | rc=1 正例组「links 里必须有 mount 那一段：[["…/mount/home/.erix/config.json",false,true]]」 |
+
+M-C 是这轮最想要的一发：它证明 `L5` 那格**不是靠末段蹭红**（末段三格全绿时它单独红）。
+
+**判据差项现在只剩**：① 链检的存在性/类型/可达性判断仍走 `statSync`+`accessSync`（**只有链接事实**用 `lstat`）——
+「逐段 `lstat` 的 fail-closed 版本」按裁决不做；② env 键值（值非法）校验不做（那条线在
+`portal/test/deploy-env-defaults.test.js`）；③ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。
+
+#### 返修补记三（2026-11-17，PR #554 第三方复审 BLOCKER 单独一轮：`deploy/.env` 的行内注释把隔离判据读成恒真）
+
+**病灶（一句话）**：`readEnvFile` 的旧正则在**未加引号**的值上把 ` # …` 整段留在值里 ⇒
+`TRAEFIK_DYNAMIC_DIR_HOST=/docker/station-edge/dynamic # shared` 解析成
+`"/docker/station-edge/dynamic # shared"`，**不等于**真路径 `/docker/station-edge/dynamic`
+⇒ `assertHostWritePathsIsolated` 那条「与共享 `.env` 的值不相等」在**危险方向上恒真**：
+共享的正是生产边缘那份，预检却报绿（#227① 现场 = 隔离 portal 覆写边缘路由，8090 全线 502 而 `docker ps` 全 healthy）。
+主 agent 复现读数：`readEnvFile("<tmp>/env-probe")` → `"/docker/station-edge/dynamic # shared"`。
+
+**裁决（A 案，主 agent 定）**：预检**拒**「我们无从证明 compose 会拿到什么」的键值行，点名**文件 + 行号 + 键名 + 原文**，
+与既有 fail-fast（宁可起跑前红）同族；**没有**选「把解析改成与 compose 对齐并宣称等价」——那条路要求一条
+外部基准来证明「我们的解析 == compose 的解析」，而本单先要的是**别再绿着写错**。解析口径本身也照实测 compose 修了
+（`parseComposeEnvLine` / `parseComposeEnvFile`），但**判定权在拒不在猜**。两条边界按现场读数收窄：
+
+- 只盯 `HOST_WRITE_PATH_ENVS` 那四个键（`TRAEFIK_DYNAMIC_DIR_HOST` / `ERIX_USERSPACE_ROOT_HOST` /
+  `ERIX_ARTIFACTS_ROOT_HOST` / `STATION_DB_DIR`）：全文件一律拒会误杀真 `.env` 里
+  `POSTGRES_PASSWORD=xxxx # 说明` 这种合法行——**实测本仓库 `deploy/.env` 里就有三行**（32/38/40 行附近，全是密码键）。
+- 同族第二形一并拒：比对键的值里有 `$` 插值（compose 实测会把 `/a/${QQ}b` 读成 `/a/b`，我们看不到展开上下文）、
+  以及 compose 自己会硬报错的两形（未闭合引号、引号闭合后带垃圾）。非比对键带 `$` 不误杀（密码里 `$` 很常见）。
+
+**compose 口径实测**（`docker compose 2.40.3`，`docker compose --env-file <env> -f <yml> config --format json`，
+13 条读数已照抄成 `test/integration-e2e-preflight.test.js` 的 `COMPOSE_PARSE_CASES`）：
+`K=a b # c`→`a b`；`K="/c/d" # after`→`/c/d`；`K=/g/h#nospace`→原样；`K="/i/j # in"`→`/i/j # in`（引号内是正文）；
+`K=/a/b<TAB>#tab`→原样（**tab 不算注释起始**，只有空格算）；`K=  spaced value  # tail`→`spaced value`；
+`K=#hash first`→`#hash first`（值首 `#` 是字面）；`K="" # c`→空；未闭合引号与 `"v"junk` ⇒ compose 直接 `failed to read …`。
+
+**判据（两门，全夹具，不碰 docker）**：CI 新增 `#227① E1–E5`（E1 = 带注释的共享路径必须红且点名
+`shared.env:3 TRAEFIK_DYNAMIC_DIR_HOST`；E2 = 注释行/空行/缩进注释/引号内含 `#`/`#` 前无空格/非比对键带注释 ⇒ 不误杀；
+E3 = 记录读数表；E4 = **现场再跑一次真 compose 做三方对账**（现场 compose ⇔ 记录表 ⇔ 我们的解析），无 docker 才 skip；
+E5 = `$` 插值/未闭合/垃圾三形点名到行）；负例门新增**陷阱 14/15** + 正例组「不误杀」一格；
+`parseComposeEnvLine` / `parseComposeEnvFile` / `findUnreproducibleEnvLines` 进单一来源清单（两份解析必然漂）。
+
+**变异读数**（每发只打一处，锚点先 `grep -cF` 确认恰好 1 次，跑完立即复原，`grep -rn MUTANT portal | wc -l` = 0）：
+
+| 发 | 改了什么 | CI 门 | `--strict` |
+|---|---|---|---|
+| MT1 | **撤掉那条拒绝**（`findUnreproducibleEnvLines` 恒不命中） | rc=1：`not ok 20 - #227① E1 共享路径带未加引号的行内注释…` + `not ok 24 - #227① E5 同族拒…` | rc=1 `TRAP FAIL · assertHostWritePathsIsolated() 共享路径带未加引号行内注释 ⇒ 当场拒并点名 文件:行号:键名` + `… $ 插值 …`，`verdict=TRAP_SILENT` |
+| MT2 | 撤掉剥注释（值里「空格 + `#`」不再切开） | rc=1：`not ok 20/21/22/23`（E1–E4 全红） | rc=1 `TRAP FAIL · …行内注释…`，`verdict=TRAP_SILENT` |
+| MT3 | 反向：把**引号内**的 `#` 也当注释剥掉（误杀合法值） | rc=1：`not ok 21/22/23`（E2 不误杀红） | rc=1 `正例夹具被抛错（护栏过严/夹具过期）：引号内的 \`#\` 是正文…` |
+
+**门禁读数**：`node --test test/integration-e2e-preflight.test.js` ⇒ rc=0 `# tests 24 / # pass 24 / # fail 0 / # skipped 0`
+（E4 在本机真跑 compose，没 skip）；同一条命令在 `portal/` 目录里用 `../test/…` 跑 ⇒ rc=0 同样 24/24
+（**字面照抄 `test/…` 会 rc=1 `Could not find`** —— 该文件在仓库根的 `test/` 下，派单里那句路径写法记在此处）；
+`node portal/integration/isolation-negative.mjs --strict` ⇒ rc=0 `verdict=TRAPS_FIRED（全部 15 条陷阱=均硬失败；单一来源=一份定义）`，
+默认跑法仍 rc=1（语义如此）；`npm run check:agents-hotlayer` ⇒ rc=0（热层 18706 / 预算 19456，条目 127 无重复编号）。
+
+**本轮差项 / 遗留**：① A 案的代价说清：真机若在那四个比对键上写未加引号注释（本仓库这份没有），
+`wp3b-e2e` 会起跑前红一次，文案给改法（加引号或把注释挪到上一行）——这是有意的 fail-fast，不是误杀；
+② compose 版本相关：`COMPOSE_PARSE_CASES` 的读数表钉的是 **2.40.3**，别处版本若改了口径，E4 现场复核对不上会红
+（这正是它存在的理由，不要顺手改表）；③ 第三方复审另外四条（链接目标 EACCES 归 missing、`FDE_POOL=large` 白名单可缺
+large 段、`$TMPDIR` 是链接时的夹具前提、「三态」措辞）本轮按裁决**未做**，另起一轮；④ `wp3b`/`wp5`/`wp6` 全量 e2e 仍未复跑。

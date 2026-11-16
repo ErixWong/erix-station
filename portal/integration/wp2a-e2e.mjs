@@ -72,12 +72,18 @@ import {
   assertHostPortsAvailable, applyStackIpamPoolEnv, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
   writeDynamicStub, deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
+// issue #495 ①（#412 遗留）：compose 的 `--env-file` 与「等宿主侧物化文件」的失败分类（唯一定义处 lib/e2e-preflight.mjs）。
+import { COMPOSE_ENV_FILE, assertComposeEnvFile } from './lib/e2e-preflight.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 // #227.2：compose 一律显式 -p，且用 bash 的 `${VAR:?msg}`——未 export 时展开即非零退出并点名，
 // 不再依赖「COMPOSE_PROJECT_NAME 环境变量压过 compose 文件 name: station」这条隐式优先级
 // （忘 export 曾经会让脚本自己对共享 dev 栈 down -v）。
 const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME required for isolated e2e}" --env-file deploy/.env -f deploy/docker-compose.yml';
+// issue #495 ①：上面命令串固定带 --env-file deploy/.env，而它不入 git ⇒ git worktree / 新 clone 里
+// 必然缺。docker compose 要到**整轮镜像构建之后**才报 couldn't find env file（#412 部署机实测白烧 10.7 分钟），
+// 所以这条预检放在模块加载时——它先于本文件任何一次 docker/compose；文件在场时零输出。
+assertComposeEnvFile({ envFile: COMPOSE_ENV_FILE, cwd: REPO_ROOT, label: 'wp2a-e2e' });
 
 // #227.3 → #270：两腿**一次派生** —— 放行面 FDE_IPAM_POOLS（= proxy IPAM_POOLS）与 portal 的
 // 分配段 FDE_IPAM_POOL_LARGE（→ portal IPAM_POOL_LARGE）取同一个值，显式传入优先。旧口径
