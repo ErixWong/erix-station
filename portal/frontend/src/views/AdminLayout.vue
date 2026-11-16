@@ -46,6 +46,9 @@ const tabs = [
   { name: 'admin-upload', label: 'admin.tabs.upload' },
   // issue #350：号池占用总览（只读）。放在最后：先看用户/配置，选段时才来这里。
   { name: 'admin-preview-pool', label: 'admin.tabs.previewPool' },
+  // issue #529（事件平台 W6）：宏模板配置 + 宏执行历史。追加在末尾（模板 → 执行历史）。
+  { name: 'admin-macros', label: 'admin.tabs.macros' },
+  { name: 'admin-macro-runs', label: 'admin.tabs.macroRuns' },
 ] as const;
 
 async function onLogout() {
