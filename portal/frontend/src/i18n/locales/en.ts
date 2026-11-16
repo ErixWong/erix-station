@@ -693,6 +693,47 @@ export const en = {
       mail: 'Mail channel',
       tls: 'Certificates',
       previewPool: 'Pool usage',
+      // issue #485 slice A: upload limit (views/AdminUploadView.vue, contract docs/api/portal.md §4.15).
+      // Sits after certs and before the read-only pool view: it is platform configuration.
+      upload: 'Upload limit',
+    },
+    // issue #485 slice A: per-file upload limit (`upload_settings` single-row table, migration 0035).
+    // The page exists for one reason: changing a number should not require rebuilding a container. That is
+    // why the copy centres on “current effective value + its source” rather than “saved” — after a save an
+    // operator still needs to know which knob the platform is actually listening to.
+    upload: {
+      title: 'Per-file upload limit',
+      intro: 'How large a single file may be when uploaded from the workbench. Changing it here needs **no portal restart and no container rebuild**: the limit is read per request, so the very next upload uses the new value.',
+      loading: 'Loading the upload limit…',
+      notLoaded: 'The upload limit has not been loaded yet (no request made).',
+      unknown: 'unknown',
+      statusEffective: 'Current effective value',
+      statusSource: 'Source',
+      statusUpdatedAt: 'Last changed',
+      updatedAtNever: 'Never changed (nobody has saved this value in the admin console)',
+      updatedAtUnknown: 'Unparseable timestamp: {value}',
+      limits: 'Allowed range: {min} – {max}',
+      field: 'New limit (bytes)',
+      fieldHint: 'The server is the gate: any integer you enter is sent as-is (out of range ⇒ an error and this box turns red); the UI does not pre-empt it. Only integers are accepted, so `1.5` / `1e7` do not count.',
+      draftIs: 'You entered: {value}',
+      draftNotInteger: 'Not an integer yet (empty, a decimal or scientific notation all count as not) — no request is sent while so.',
+      hintBelow: 'Below the allowed range ({min} – {max}); the server will reject the save.',
+      hintAbove: 'Above the allowed range ({min} – {max}); the server will reject the save.',
+      save: 'Save',
+      reload: 'Reload',
+      saved: 'Saved — **effective from the next upload** (the number shown is the one the server read back after writing).',
+      sourceDb: 'Admin console (upload_settings in the database)',
+      sourceEnv: 'Environment variable FILE_UPLOAD_MAX_BYTES',
+      sourceDefault: 'Built-in default (32 MiB)',
+      reasonNoRow: 'Nothing has been saved in the admin console yet, so the environment variable (or the default) is in force. Saving a value here overrides it.',
+      reasonInvalid: 'The value stored in the database is unusable (out of range or the wrong shape), so we fell back to the environment/default — the number below is not what the admin console stored.',
+      reasonReadFailed: 'upload_settings could not be read (missing table or database hiccup); we fell back to the environment/default. Uploads themselves are unaffected.',
+      reasonReadTimeout: 'Reading upload_settings timed out (the database did not answer within UPLOAD_SETTINGS_READ_TIMEOUT_MS); we fell back to the environment/default. Uploads themselves are unaffected.',
+      srcDb: 'Database value (when usable)',
+      srcEnv: 'Environment variable',
+      srcDefault: 'Built-in default',
+      envNotSet: 'the environment variable is not explicitly set',
+      footnote: 'This is a **per-file** limit, not a disk quota (total size is #485 slice B, not implemented). It is a different knob from MAX_BODY_BYTES (the JSON request-body limit, 64 KiB by default): uploads never go through the latter.',
     },
     // issue #449 admin slice: mail channel settings (views/AdminMailView.vue, contract docs/api/portal.md §4.12).
     // This page is the only switch for the email-code second factor; the password is write-only

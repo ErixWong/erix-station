@@ -24,6 +24,15 @@ import {
   type MailSettings,
   type MailSettingsPayload,
 } from '../lib/mailSettings';
+// issue #485 片 A：管理台上传上限（§4.15）。DTO 归一化 / 请求体构造 / 字段映射都在 lib（纯函数可单测）。
+import {
+  UPLOAD_SETTINGS_PATH,
+  normalizeUploadSettings,
+  uploadValidationFieldOf,
+  type UploadFieldKey,
+  type UploadSettings,
+  type UploadSettingsPayload,
+} from '../lib/uploadSettings';
 // issue #456 M2 管理台证书页（§4.13）。DTO 白名单 / 到期判定 / 错误文案全在 lib（纯函数可单测），
 // 这里只负责「一次调用 = 一次请求」+ 错误透传。**请求体是不透明的 `TlsRequestBody`**：两个 PEM 的
 // 字段名只活在视图里，本文件（与 lib）连字面量都不出现——私钥不进 store 的红线由此**结构上**成立。
@@ -268,6 +277,17 @@ export const useAdminStore = defineStore('admin', {
     // 502 的 `details.reason`（§4.12-4：只有摘要，不含口令/正文）；单独放，便于页面加一行「原因：」。
     mailTestReason: null as string | null,
     mailTestOk: null as { to: string; at: string | null } | null,
+    // issue #485 片 A：单文件上传上限（§4.15）。与邮件通道同构：DTO 归一化在 `lib/uploadSettings`，
+    // 这里只管「一次调用 = 一次请求」+ 错误透传。**不缓存**（与后端同口径：这一页就是要看当前生效值）。
+    uploadSettings: null as UploadSettings | null,
+    uploadSettingsLoaded: false,
+    uploadSettingsLoading: false,
+    uploadSettingsErr: null as string | null,
+    uploadSaving: false,
+    uploadSaveErr: null as string | null,
+    // 400 `validation_failed` 的 `details.field`（§4.15-2）→ 页面标红那个框；null = 整表错误。
+    uploadSaveField: null as UploadFieldKey | null,
+    uploadSaveOk: false,
     // issue #456 M2：管理台证书页（§4.13）。**私钥永不进这里**：状态只有 DTO 白名单
     // （`lib/tlsSettings.normalizeTlsStatus` / `normalizeTlsInspect`），连字段名字面量都不在本文件里。
     tlsStatus: null as TlsStatus | null,
@@ -741,6 +761,58 @@ export const useAdminStore = defineStore('admin', {
         return this.mailSaveErr;
       } finally {
         this.mailSaving = false;
+      }
+    },
+
+    /**
+     * issue #485 片 A：`GET /api/admin/upload/settings`（§4.15-1）。
+     *
+     * 服务端在**表不存在 / 读失败**时也回 `200` + 兜底 DTO（`source` = `env`/`default`），所以这一页
+     * 不需要处理「配置面挂了」的错路。一次调用 = 一次请求：生效值会被另一个管理员改，重进本页就该看到新快照。
+     */
+    async loadUploadSettings(): Promise<string | null> {
+      this.uploadSettingsLoading = true;
+      this.uploadSettingsErr = null;
+      try {
+        const data = await api<unknown>(UPLOAD_SETTINGS_PATH);
+        this.uploadSettings = normalizeUploadSettings(data);
+        this.uploadSettingsLoaded = true;
+        return null;
+      } catch (e) {
+        this.uploadSettingsErr = t('admin.errorPrefix') + this.errText(e);
+        return this.uploadSettingsErr;
+      } finally {
+        this.uploadSettingsLoading = false;
+      }
+    },
+
+    /**
+     * issue #485 片 A：`PUT /api/admin/upload/settings`（§4.15-2）。
+     *
+     * 成功 ⇒ 直接用响应 DTO 刷新状态：它出自 `RETURNING`，所以是**真落库的生效值**，不是回显输入
+     * （本页要的就是“我以为的值 vs 实际生效的值”不分离）。后端无缓存 ⇒ 不需要重取，下一次上传就是新值。
+     * 400 时把 `details.field` 落到 `uploadSaveField`（页面据此标红那个框）。
+     */
+    async saveUploadSettings(payload: UploadSettingsPayload): Promise<string | null> {
+      this.uploadSaving = true;
+      this.uploadSaveErr = null;
+      this.uploadSaveField = null;
+      this.uploadSaveOk = false;
+      try {
+        const data = await api<unknown>(UPLOAD_SETTINGS_PATH, {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        });
+        this.uploadSettings = normalizeUploadSettings(data);
+        this.uploadSettingsLoaded = true;
+        this.uploadSaveOk = true;
+        return null;
+      } catch (e) {
+        this.uploadSaveField = uploadValidationFieldOf(e);
+        this.uploadSaveErr = t('admin.errorPrefix') + this.errText(e);
+        return this.uploadSaveErr;
+      } finally {
+        this.uploadSaving = false;
       }
     },
 

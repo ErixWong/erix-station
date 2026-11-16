@@ -13,6 +13,13 @@ export class FakePool {
     this.emailCodes = [];
     // #449：邮件通道配置（单行表 `mail_settings`）。默认无行 = 未配置 = 第二因素不生效。
     this.mailSettings = null;
+    // #485 片 A：单文件上传上限（单行表 `upload_settings`）。默认无行 = 未配置 = 回落 env/默认。
+    // 存的是 `{ max_file_bytes, updated_at, updated_by }`（max_file_bytes 存 **number**，
+    // 出参时再按真驱动的形状转成字符串，见下面 `FROM upload_settings` 分支的长注）。
+    this.uploadSettings = null;
+    // #485 复 audit（活二）：注入「审计 `INSERT` 失败」。保存是一条 CTE 语句 ⇒ 注入成立时整条语句
+    // 失败而设置**一格没变**（语句级原子）。默认 false = 不注入。
+    this.failAudit = false;
     // #456：证书台账（`tls_certificates`）。**不是真相源**（真相是盘上证书文件），只记「谁什么时候装了什么」。
     this.tlsCerts = [];
     // #456 M2：**语句流水**（`{sql, params}`，每条进来的语句）。只给「零副作用」这类判据用：
@@ -240,6 +247,66 @@ export class FakePool {
       return { rows: [] };
     }
 
+    // ---- #485 片 A 复 audit（活二）：保存 = 读旧值 + upsert + 写审计，**一条** CTE 语句 ----
+    // ⚠ 必须排在下面那条 `INSERT INTO audit_log` 之前：这条 SQL 同时含两张表的 INSERT，
+    // 让通用审计分支先认到就会**吞掉 upsert**（设置没改、只多一条审计，用例却绿 = 假绿）。
+    // fake 真模拟三件事：① 旧值取的是**本语句开始时**的库状态（快照）；② `previous_*` 的区间判定
+    // **按 SQL 写的做**（`BETWEEN $5 AND $6` 没写就放宽 ⇒ 「区间判定被删」这种变异会红）；
+    //   ③ `failAudit` 注入时整条语句失败而 `uploadSettings` **一格没变**（语句级原子，对应 US-20）。
+    if (sql.includes('INSERT INTO upload_settings') && /\bWITH\s+prev\b/i.test(sql)) {
+      if (!/ON CONFLICT \(id\) DO UPDATE/.test(sql)) {
+        throw new Error('fake：upload_settings 写入必须是单条 upsert（INSERT … ON CONFLICT (id) DO UPDATE）');
+      }
+      if (!/VALUES \(1,/.test(sql)) throw new Error('fake：upload_settings 是单行表，插入必须写死 id = 1');
+      // 形状闸（复 audit 活二）：旧值不锁行，并发两条 PUT 就仍会各自读到「自己进来之前」的旧值。
+      if (!/FOR UPDATE/.test(sql)) {
+        throw new Error('fake：prev 必须 `FOR UPDATE`——否则 `previous_*` 仍可能是隔了一条写入的旧值');
+      }
+      if (params.length !== 8) throw new Error(`fake：upload_settings 保存语句应带 8 个参数，实际 ${params.length}`);
+      const [maxFileBytes, updatedBy, fallbackBytes, fallbackSource, minBytes, maxBytes, action, target] = params;
+      const value = Number(maxFileBytes);
+      if (!Number.isFinite(value)) throw new Error('fake：max_file_bytes 是 bigint NOT NULL，不能是 undefined/null/NaN');
+      if (value <= 0) throw new Error('fake：CHECK (max_file_bytes > 0) 被违反');
+      if (fallbackSource !== 'env' && fallbackSource !== 'default') {
+        throw new Error(`fake：previous_source 回落位只可能是 env/default，实际 ${fallbackSource}`);
+      }
+      // 旧值：与 `FROM upload_settings` 分支同形状（bigint ⇒ 字符串）。
+      const previousRaw = this.uploadSettings ? String(this.uploadSettings.max_file_bytes) : null;
+      const previousValue = previousRaw === null ? null : Number(previousRaw);
+      // SQL 里那句 CASE 的等价实现；`BETWEEN $5 AND $6` 被删 ⇒ 判定放宽（不兼平）。
+      const requireRange = /BETWEEN\s+\$5\s+AND\s+\$6/.test(sql);
+      const dbUsable = previousValue !== null && Number.isSafeInteger(previousValue)
+        && (!requireRange || (previousValue >= Number(minBytes) && previousValue <= Number(maxBytes)));
+      const previousMaxBytes = dbUsable ? previousValue : Number(fallbackBytes);
+      const previousSource = dbUsable ? 'db' : fallbackSource;
+      // 注入审计失败：真库里这是一条语句 ⇒ 设置与审计同生共死。fake 必须同样“要么全做要么全不做”，
+      // 不然它比产品更宽容，“审计写不进去也照样改成了”就测不出来（US-20）。
+      if (this.failAudit) throw new Error('fake：audit_log 写入失败（注入）');
+      this.uploadSettings = { max_file_bytes: value, updated_at: new Date(), updated_by: updatedBy };
+      this.audit.push({
+        actor_id: updatedBy,
+        action,
+        target,
+        // 真库把这列存成 jsonb；这里保持与旧实现（`auth.audit` 传 `JSON.stringify`）**同形状**，
+        // 免得“形状变了”与“内容变了”两个不同的红揉成一条。
+        details: JSON.stringify({
+          max_file_bytes: value,
+          previous_max_bytes: previousMaxBytes,
+          previous_source: previousSource,
+        }),
+      });
+      return {
+        rows: [{
+          max_file_bytes: String(value),
+          updated_at: this.uploadSettings.updated_at,
+          updated_by: updatedBy,
+          previous_raw: previousRaw,
+          audit_rows: 1,
+        }],
+        rowCount: 1,
+      };
+    }
+
     // audit（best-effort）
     if (sql.includes('INSERT INTO audit_log')) {
       const [actorId, action, target, details] = params;
@@ -285,6 +352,37 @@ export class FakePool {
     if (sql.includes('FROM mail_settings')) {
       // 回副本：避免产品代码拿到 fake 的内部对象引用后就地改（那会让「没落库」的 bug 测不出来）。
       return { rows: this.mailSettings ? [{ ...this.mailSettings }] : [], rowCount: this.mailSettings ? 1 : 0 };
+    }
+
+    // ---- #485 片 A：单文件上传上限（upload_settings 单行表，迁移 0035） ----
+    // 写侧按 SQL 文本真模拟（AGENTS §8.14 “不把新 SQL 当未知放行”），并把迁移 0035 的两条
+    // 约束当 **DB 事实**执行：① 只能有一行（id = 1）；② `CHECK (max_file_bytes > 0)`。
+    // 产品侧漏了这两条时 fake 会炸 ⇒ 用例变红，而不是静默存下一个“半个值”。
+    if (sql.includes('INSERT INTO upload_settings')) {
+      if (!/ON CONFLICT \(id\) DO UPDATE/.test(sql)) {
+        throw new Error('fake：upload_settings 写入必须是单条 upsert（INSERT … ON CONFLICT (id) DO UPDATE）');
+      }
+      if (!/VALUES \(1,/.test(sql)) throw new Error('fake：upload_settings 是单行表，插入必须写死 id = 1');
+      if (params.length !== 2) throw new Error(`fake：upload_settings upsert 应带 2 个参数，实际 ${params.length}`);
+      const [maxFileBytes, updatedBy] = params;
+      const value = Number(maxFileBytes);
+      if (!Number.isFinite(value)) throw new Error('fake：max_file_bytes 是 bigint NOT NULL，不能是 undefined/null/NaN');
+      if (value <= 0) throw new Error('fake：CHECK (max_file_bytes > 0) 被违反');
+      this.uploadSettings = { max_file_bytes: value, updated_at: new Date(), updated_by: updatedBy };
+      return { rows: [{ ...this.uploadSettings, max_file_bytes: String(value) }], rowCount: 1 };
+    }
+
+    if (sql.includes('FROM upload_settings')) {
+      // ⚠ **`max_file_bytes` 回字符串**，这不是手误：它是 `bigint`（int8），node-pg 对 int8 **默认就回
+      // 字符串**（不自动转 number，怕超 2^53 丢精度）。fake 必须复制这个形状，否则产品侧一个
+      // `Number(row.max_file_bytes)` / `parseInt(row.max_file_bytes)` 的错误在单测里是绿的，到真库上才锈
+      // （`parseInt('1e4') === 1` 那族，台账 §8.126）。
+      return {
+        rows: this.uploadSettings
+          ? [{ ...this.uploadSettings, max_file_bytes: String(this.uploadSettings.max_file_bytes) }]
+          : [],
+        rowCount: this.uploadSettings ? 1 : 0,
+      };
     }
 
     // ---- #449：登录邮箱验证码（login_email_codes） ----

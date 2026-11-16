@@ -15,10 +15,11 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // **每追加一支新迁移，这 19 处 + 那几处 `Array.from({ length: N })` 必须一起进一位**（本单：0034 → 0035，
 // `0035-macro-platform.sql`，issue #524 的事件平台 W1 数据层：`macro_templates` /
 // `macro_assignments` / `macro_runs` 三张表）。
+// `0036-upload-settings.sql`，issue #485 片 A 的 `upload_settings` 单行表（原 `0035-upload-settings.sql`，因 main 上 0035 已被 macro-platform 占位而进位）。
 // 为什么不改成「现算最大值」：那会把闸变成恒真（`max(files) === max(files)`）——
 // 这里的语义是「头号必须是**我期望的那一支**」，所以它只能写死；漏改一处的代价是一条红，
 // 而不是默默接受一支插错位置的迁移（插中间另有 `Array.from` 那条「连续无空洞」兜着）。
-// 每支迁移自己的语义闸在文件末尾按编号开一段（0034 那段就在最后）。
+// 每支迁移自己的语义闸在文件末尾按编号开一段（0035 那段就在最后）。
 
 test('迁移 0006-session-transcript：文件存在、编号连续、语句全部幂等（可重放）', () => {
   const dir = path.join(HERE, '../../deploy/migrations');
@@ -838,7 +839,7 @@ test('迁移 0029-user-file-upload：布尔列幂等、NOT NULL DEFAULT false、
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     Array.from({ length: 35 }, (_, i) => i + 1),
-    '迁移编号 = 1..35 连续无空洞',
+    '迁移编号 = 1..36 连续无空洞',
   );
 
   const sql = fs.readFileSync(path.join(dir, '0029-user-file-upload.sql'), 'utf8');
@@ -870,7 +871,7 @@ test('迁移 0030-user-totp-login-enabled：布尔列幂等、NOT NULL DEFAULT t
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     Array.from({ length: 35 }, (_, i) => i + 1),
-    '迁移编号 = 1..35 连续无空洞（新迁移只能追加在末尾）',
+    '迁移编号 = 1..36 连续无空洞（新迁移只能追加在末尾）',
   );
 
   const sql = fs.readFileSync(path.join(dir, '0030-user-totp-login-enabled.sql'), 'utf8');
@@ -909,7 +910,7 @@ test('迁移 0031-user-last-activity-at：可空无默认列幂等、回填只�
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     Array.from({ length: 35 }, (_, i) => i + 1),
-    '迁移编号 = 1..35 连续无空洞（新迁移只能追加在末尾）',
+    '迁移编号 = 1..36 连续无空洞（新迁移只能追加在末尾）',
   );
 
   const sql = fs.readFileSync(path.join(dir, '0031-user-last-activity-at.sql'), 'utf8');
@@ -981,7 +982,7 @@ test('迁移 0032-drop-retired-tables：三句 IF EXISTS、子表先撤（外键
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     Array.from({ length: 35 }, (_, i) => i + 1),
-    '迁移编号 = 1..35 连续无空洞（新迁移只能追加在末尾）',
+    '迁移编号 = 1..36 连续无空洞（新迁移只能追加在末尾）',
   );
 
   const sql = fs.readFileSync(path.join(dir, '0032-drop-retired-tables.sql'), 'utf8');
