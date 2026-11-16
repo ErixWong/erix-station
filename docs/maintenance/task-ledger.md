@@ -5482,3 +5482,32 @@ origin/main 上单独跑过**，别把 2349 当基线读数）；
 `interrupted`）在原文面**没有专属展示**，目前只会随 `resultPreview` 一起进 `getToolResultSummary` 那条通用归一
 （主消息流的特殊态判据在 `StreamPanel.vue` 的 `cardOut`，原文面没接它）；③ 前端那格判据是 DOM 文本断言，
 **没有跑过浏览器**（本片不动部署面）。
+
+**主 agent 补记（261116 上午，第三方复审判读 + 文档口径订正）**
+copilot 复审（`gpt-6-luna`、xhigh、一次性沙箱树 `/tmp/audit-pr541`）交回 **1 MED + 3 LOW**
+（第一发被 25 分钟看门狗砍了，但它**砍前已把报告写盘**；我另起了收窄版重跑）。我的逐条处置：
+
+- **MED（张冠李戴）我独立复现了**，在**独立树** `/tmp/parent-pr541`（不跟审计同树——我自己定的「并发写者
+  不许共享同一目录」，第一版我踩了：审计树里同时有它的 `B: run-id isolation…` 与我的探针，读数混在一处）。
+  位置序 `call(OLD) < call(NEW) < res(NEW) < res(OLD)` ⇒ 两个调用的 `resultPreview` 都是新调用那份
+  （`["RESULT-FOR-NEW-CALL","RESULT-FOR-NEW-CALL"]`），焦点套件 **13 / 12 pass / 1 fail rc=1**。
+  修法方向与判据进 **issue #562**（不在本 PR 修）。
+- **我自己造了两个假红，都记在这里**：① 判可观测性时按英文词 `/duplicate/i` 判，而现读 warn 是中文
+  ⇒ 差点把「已有留痕」记成「无人知道」；改成对得上现读文案（`多份结果|就近优先`）后 **`#P541-B` 绿**。
+  ② 第一版把两条断言并成一条，第一条炸了就看不见第二条读数 ⇒ 拆成 A/B 两格。**判据必须对得上现读文案**。
+- **LOW（代理对）我确认是真的，但病灶在上游**：`node_modules/erix-agent/src/display/projection.js:31`
+  的 `MAX_RESULT_PREVIEW = 400` 配 `text.length` / `slice(0, maxChars)` ⇒ 单位是 **UTF-16 代码单元**。
+  我本机逐字跑：`'a'.repeat(399) + '💥tail'` ⇒ `length=405`、码点 `404`、`slice(0,400)` 末尾 `"a\ud83d"`（孤立高代理）。
+  ⇒ 上游单 **erix-agent#854**；宿主不在 portal 侧二次截断（复制引擎口径必然漂）。
+  **顺带订正我们自己的文档**：`docs/api/portal.md` 那条「400 码点」是**写错的**，已改成「UTF-16 代码单元」
+  并带上这条实测读数（算术量级不变，变的只是边界形状）。
+- **LOW（两路不一致）纠正的是我的派单简报，不是产品**：实时 `result_digest`（500、无省略号）与折叠
+  `resultPreview`（400 + 省略号 = 401）本来就是两种东西；我简报里「两路逐字一致」那句作废。
+  核过文档没有声称一致 ⇒ **文档不用改行为，只补一句口径说明**。
+- **LOW（顶层 `text` 重复气泡）审计自己标了 UNPROVEN**，与本节已有的「未造出生产者」现读一致（真库
+  1423 个 `tool_result` 块无一条带顶层 `text`），**维持现状不修**。
+- 我另外自己钉到的一条（审计没走通，因为**我的沙箱没装前端依赖**）：预览进界面是
+  `StreamPanel.vue` 的 **`{{ }}` 插值不是 `v-html`** ⇒ 注入面直接排除。补记于此，并把「审计树要跑前端
+  就得先 `cd portal/frontend && NODE_ENV=development npm ci`」记成派单前置（本次是我漏的，rc=127）。
+
+本轮**只动文档与本台账**，产品代码零改动。
