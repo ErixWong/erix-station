@@ -158,21 +158,44 @@ export async function unreadCount(pool, { userId } = {}) {
  * 账 W2 已 claim，这里只补「人」这一侧，不再碰 `macro_runs`）。
  *
  * severity 推导（红线，§3.4）：**收件人 + 结果**，与动作类型无关——
- *   - `recipients` 为空（收件人只有管理员）⇒ **一行都不写**，返回 `{ wrote: 0 }`；
- *   - 否则每个收件人一行，`success ? 'info' : 'error'`。
+ *   - **收件人只有管理员 ⇒ 一行都不写**（只进执行历史），返回
+ *     `{ wrote: 0, severity: null, notifications: [], skippedReason: 'admin_only' }`；
+ *   - 否则**每个非管理员收件人**一行（管理员那份也只进执行历史），
+ *     `success ? 'info' : 'error'`。
  * 为什么不由 kind 推导：同一个 kind 对管理员是运维噪音、对当事用户可能是事故；
  * 类型说不清「谁该紧张」，收件人 × 成败才说清。
+ *
+ * ⚠ 角色**不信任调用方传入，在写侧查库**：W2/W4/W7 只知道「该发给谁」，
+ * 「这个人是不是 admin」是平台事实；信任调用方过滤，漏一处就把运维噪音发进用户铃铛。
+ * 无效 id（拼错）直接忽略（先过形状闸再进 `= ANY($1::uuid[])`，否则一个坏 id 让整批 22P02）；
+ * 「全是无效 id」与「空清单」一样 ⇒ `wrote: 0`，但不带 `skippedReason`（没见过任何 admin，
+ * 报 `admin_only` 是谎）。`skippedReason` 只在真因「只剩管理员」跳过时出现；
+ * 既有三键 `{wrote, severity, notifications}` 语义不变（只增键）。
  */
 export async function deliverIntent(pool, intent, {
   recipients = [], success = true, title = null, body = null, now = new Date(),
 } = {}) {
-  const list = [...new Set(recipients.filter(Boolean))];
+  const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const list = [...new Set(recipients.filter(Boolean))].filter(
+    (id) => typeof id === 'string' && UUID_SHAPE.test(id),
+  );
   if (list.length === 0) return { wrote: 0, severity: null, notifications: [] };
+  const roleRes = await pool.query(
+    'SELECT id, role FROM users WHERE id = ANY($1::uuid[])', [list],
+  );
+  const nonAdmins = roleRes.rows.filter((r) => r.role !== 'admin').map((r) => r.id);
+  if (nonAdmins.length === 0) {
+    if (roleRes.rows.length > 0) {
+      // 收件人存在但全是管理员 ⇒ 契约 §3.4：不写 notifications，只进执行历史。
+      return { wrote: 0, severity: null, notifications: [], skippedReason: 'admin_only' };
+    }
+    return { wrote: 0, severity: null, notifications: [] }; // 全是查无此人 ⇒ 忽略（不谎称 admin_only）
+  }
   const severity = success ? 'info' : 'error';
   const safeTitle = title ?? `宏「${intent?.templateName ?? '?'}」${success ? '已完成' : '执行失败'}`;
   const safeBody = body ?? '';
   const rows = [];
-  for (const userId of list) {
+  for (const userId of nonAdmins) {
     rows.push(await createNotification(pool, {
       userId,
       macroRunId: intent?.macroRunId ?? null,
