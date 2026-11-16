@@ -50,6 +50,10 @@ DELETE FROM judge_decisions WHERE run_id IN (SELECT id FROM tgt_run);
 DELETE FROM run_checkpoints WHERE run_id IN (SELECT id FROM tgt_run);
 DELETE FROM transcript_rounds WHERE run_id IN (SELECT id FROM tgt_run)
    OR transcript_key IN (SELECT id::text FROM tgt_sess);
+-- issue #500：恢复行（`transcript_recovery_rows`）是**独立表**、键只有 session transcript key
+-- ⇒ 必须在这里单独清一遍，否则删完 session 会留下孤儿恢复行（本脚本声称删「全部依赖」）。
+-- 只按 transcript_key 清：这张表没有 run_id 列（run 作用域在这张表上不存在）。
+DELETE FROM transcript_recovery_rows WHERE transcript_key IN (SELECT id::text FROM tgt_sess);
 DELETE FROM tool_calls WHERE run_id IN (SELECT id FROM tgt_run);
 DELETE FROM run_events WHERE run_id IN (SELECT id FROM tgt_run)
    OR session_id IN (SELECT id FROM tgt_sess);
