@@ -35,6 +35,9 @@ export const routes: RouteRecordRaw[] = [
     meta: { public: true },
   },
   { path: '/', name: 'workbench', component: () => import('./views/WorkbenchView.vue') },
+  // issue #595 M1：能力市场用户面（`#/market`）。与 `/` 同属用户面（登录即可，无 requiresRole），
+  // 顶栏入口在 `WorkbenchView` 的 `<header>`；页面自带「← 返回工作台」。
+  { path: '/market', name: 'market', component: () => import('./views/MarketView.vue') },
   // issue #55 B1 深链迁入路由层：#/session/<id>（hash 模式下与旧版 URL 形态一致，刷新/分享安全）。
   { path: '/session/:id', name: 'session', component: () => import('./views/WorkbenchView.vue') },
   {
