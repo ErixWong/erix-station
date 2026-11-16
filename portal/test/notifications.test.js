@@ -29,11 +29,11 @@ const SKIP = URL_VALUE ? false : SKIP_WITHOUT_PG;
 const fixture = URL_VALUE ? createPgFixture(URL_VALUE, { prefix: 'w526n' }) : null;
 const withFreshDb = (fn) => fixture.withFreshDatabase(({ pool }) => fn(pool), { log: () => {} });
 
-async function seedUser(pool, tag) {
+async function seedUser(pool, tag, role = 'fde') {
   const userId = randomUUID();
   await pool.query(
-    `INSERT INTO users (id, login, password_hash, status) VALUES ($1, $2, 'x', 'active')`,
-    [userId, `n526${tag}`],
+    `INSERT INTO users (id, login, password_hash, status, role) VALUES ($1, $2, 'x', 'active', $3)`,
+    [userId, `n526${tag}`, role],
   );
   return userId;
 }
@@ -169,26 +169,48 @@ test('#526 判据7：unreadCount 与 markRead 一致；判据4：markRead 非属
   });
 });
 
-test('#526 判据5：deliverIntent 的 severity 由收件人+结果推导；只有管理员⇒不写行', { skip: SKIP }, async () => {
+test('#526 判据5（收紧版）：角色闸在写侧——收件人只有管理员⇒不写行；混合⇒只写普通用户', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
-    const u = await seedUser(pool, 'd1');
+    const normal = await seedUser(pool, 'd1', 'fde');
+    const admin = await seedUser(pool, 'd2', 'admin');
     const intent = { templateName: '完成审查 · 默认', macroRunId: null };
-    // 收件人只有管理员（对用户面而言 = 空清单）⇒ 一行都不写
-    const none = await deliverIntent(pool, intent, { recipients: [] });
-    assert.deepEqual(none, { wrote: 0, severity: null, notifications: [] });
-    assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM notifications')).rows[0].n, 0);
-    // 成功 + 收件人含用户 ⇒ info
-    const ok = await deliverIntent(pool, intent, { recipients: [u], success: true });
-    assert.equal(ok.wrote, 1);
-    assert.equal(ok.severity, 'info');
-    // 失败 + 收件人含用户 ⇒ error（同一动作类型、不同结果 ⇒ severity 不同 —— 这就是「不由类型推导」）
-    const bad = await deliverIntent(pool, intent, { recipients: [u], success: false });
+    const countAll = async () => (await pool.query('SELECT COUNT(*)::int AS n FROM notifications')).rows[0].n;
+
+    // ① 收件人清单里**只有一个真 admin** ⇒ 一行都不写（§3.4：只进执行历史），带 admin_only 标。
+    //    ⚠ 这条不是「空数组不循环」的恒真：角色是 deliverIntent 自己查库判的，
+    //    把写侧角色过滤拆掉，这里就会写出 1 行 ⇒ 用例红。
+    const admOnly = await deliverIntent(pool, intent, { recipients: [admin] });
+    assert.deepEqual(admOnly, { wrote: 0, severity: null, notifications: [], skippedReason: 'admin_only' });
+    assert.equal(await countAll(), 0, '收件人只有管理员 ⇒ notifications 表一行都没有');
+
+    // ② 混合收件人 ⇒ 只给普通用户写，且那一行的 user_id 必须是普通用户（不是 admin）
+    const mixed = await deliverIntent(pool, intent, { recipients: [normal, admin], success: true });
+    assert.equal(mixed.wrote, 1);
+    assert.equal(mixed.severity, 'info');
+    assert.ok(!('skippedReason' in mixed), '没跳过就不许带 skippedReason（调用方拿它判「只进历史」）');
+    const rows = await pool.query('SELECT user_id, severity FROM notifications');
+    assert.equal(rows.rowCount, 1);
+    assert.equal(rows.rows[0].user_id, normal, '那一行必须挂在普通用户名下，不是 admin');
+
+    // ③ 同一动作类型（同 kind/同 title）+ 失败 ⇒ error：severity 由**结果**推导不由类型
+    const bad = await deliverIntent(pool, intent, { recipients: [normal], success: false });
     assert.equal(bad.severity, 'error');
-    const items = (await listNotifications(pool, { userId: u })).items;
-    assert.deepEqual(items.map((n) => n.severity).sort(), ['error', 'info']);
-    // 收件人去重：同一人重复出现只写一条
-    const dup = await deliverIntent(pool, intent, { recipients: [u, u], success: true });
+    assert.equal(rows.rows[0].severity, 'info', '同一动作成功那条仍是 info：两行差异只来自结果');
+    const sev = await pool.query('SELECT severity FROM notifications WHERE user_id = $1 ORDER BY severity', [normal]);
+    assert.deepEqual(sev.rows.map((r) => r.severity), ['error', 'info']);
+
+    // ④ 全是无效 id（拼错）⇒ 忽略该 id，wrote:0；不谎称 admin_only
+    const bogus = await deliverIntent(pool, intent, { recipients: ['deadbeef', randomUUID()] });
+    assert.deepEqual(bogus, { wrote: 0, severity: null, notifications: [] });
+    assert.ok(!('skippedReason' in bogus), '查无此人不是 admin_only');
+    assert.equal(await countAll(), 2, '无效 id 没写出任何行');
+
+    // ⑤ 收件人去重：同一普通用户重复出现只写一条
+    const dup = await deliverIntent(pool, intent, { recipients: [normal, normal], success: true });
     assert.equal(dup.wrote, 1);
+    // 空清单（既有行为形状不变，三键语义保留）
+    assert.deepEqual(await deliverIntent(pool, intent, { recipients: [] }),
+      { wrote: 0, severity: null, notifications: [] });
   });
 });
 
