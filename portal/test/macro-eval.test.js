@@ -263,3 +263,56 @@ test('#525⑥ until 到期 ⇒ 产一条到期意图（bucket=expiry），且只
     assert.equal(r2.intents.length, 0, '同一订阅的到期意图只产一次（幂等键）');
   });
 });
+
+// —— UTC+8 日界（跨日）——这是时钟口径最容易退化成 UTC 的一格。
+// ⚠ 跨日窗口（UTC+8 的 00:00–08:00）整段落免打扰 22:00–08:00 ⇒ clock 意图会被 `quiet_hours`
+//   跳过、返回的 intents 为空；但 `claimMacroRun` 在门禁**之前**就把 `anchor` 落了账。所以这里
+//   钉的是 **账行的 anchor**（也正是变异会改的那个值），而不是返回的 intents 数组。
+
+/** 取某订阅已落的 `clock:<date>` 锚（排序后返回）。 */
+async function clockAnchors(pool, assignmentId) {
+  const { rows } = await pool.query(
+    `SELECT anchor FROM macro_runs WHERE assignment_id = $1 AND criterion = 'tick' AND anchor LIKE 'clock:%'`,
+    [assignmentId],
+  );
+  return rows.map((r) => r.anchor).sort();
+}
+
+// —— ⑧ 跨日 anchor 用 UTC+8 日期，不是 UTC 日期 ——
+test('#525⑧ 跨日时刻的 clock anchor 必须是 UTC+8 那一天（不是 UTC 那天）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId } = await seedScene(pool, 'tz1');
+    const tpl = await addTemplate(pool, 'scheduled-task', 'user', { at: '00:00' });
+    const asg = await addAssignment(pool, { templateId: tpl, userId, cwd: '/no/such/cwd-tz1', until: null });
+    // 2026-11-15T17:30:00Z：UTC 日期是 11-15，UTC+8 已是 2026-11-16 01:30。
+    const t = Date.parse('2026-11-15T17:30:00.000Z');
+    const loop = startMacroEvalLoop(pool, {}, { intervalMs: 10_000_000, now: () => new Date(t), log: SILENT });
+    await loop.tick(); // 到点（00:00 已过）⇒ claim clock:<date>；date 必须走 inTz8
+    loop.stop();
+    assert.deepEqual(await clockAnchors(pool, asg), ['clock:2026-11-16'],
+      'anchor 必须用 UTC+8 那一天（用 UTC 日期会得到 clock:2026-11-15 ⇒ 这条红）');
+  });
+});
+
+// —— ⑨ 跨日「今天已 tick」按 UTC+8 日界判 ——
+test('#525⑨ 今天已 tick 按 UTC+8 日界：同日(UTC+8)不重复产，跨到 UTC+8 新一天才再产', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId } = await seedScene(pool, 'tz2');
+    const tpl = await addTemplate(pool, 'scheduled-task', 'user', { at: '00:00' }); // ≤01:00 ⇒ 跨午夜那次 at 也已过
+    const asg = await addAssignment(pool, { templateId: tpl, userId, cwd: '/no/such/cwd-tz2', until: null });
+    let t = Date.parse('2026-11-15T17:30:00.000Z'); // UTC+8 11-16 01:30
+    const loop = startMacroEvalLoop(pool, {}, { intervalMs: 10_000_000, now: () => new Date(t), log: SILENT });
+    await loop.tick(); // 占 clock:2026-11-16
+    assert.deepEqual(await clockAnchors(pool, asg), ['clock:2026-11-16'], '第一次按 UTC+8 占位');
+    // 拨到 UTC+8 11-16 18:00（同一 UTC+8 日）⇒ 不许再占一个新锚。
+    t = Date.parse('2026-11-16T10:00:00.000Z');
+    await loop.tick();
+    assert.deepEqual(await clockAnchors(pool, asg), ['clock:2026-11-16'], '同一 UTC+8 日 ⇒ 幂等挡下，不再产');
+    // 拨到 UTC+8 11-17 01:00（换了一天，at=00:00 已过）⇒ 要再占一条新锚。
+    t = Date.parse('2026-11-16T17:00:00.000Z');
+    await loop.tick();
+    assert.deepEqual(await clockAnchors(pool, asg), ['clock:2026-11-16', 'clock:2026-11-17'],
+      '跨到 UTC+8 新一天 ⇒ 再产一条（若 anchor 用 UTC 日期，这一步会拿到 clock:2026-11-16/16 同值而漏产 ⇒ 红）');
+    loop.stop();
+  });
+});
