@@ -41,8 +41,7 @@ CREATE TABLE IF NOT EXISTS platform_prompts (
   写侧上限见 §4；读侧必须能面对「手工 `UPDATE` 进来的超长值」并照常工作。
 - `updated_by` 是 uuid 但**不建 FK**（照 0026/0036）：管理员行停用后配置要留着。
 - 末尾一段只读 DO 块打印重放证据（照 0036）。
-- ⚠ 加迁移必须同时把 `portal/test/migrations.test.js` 里两处
-  `=== 38`（「当前最后迁移」断言）改成 `=== 39`；baseline `docs/data/schema.sql` **一个字节都不改**（冻结）。
+- ⚠ 加迁移必须同时把 `portal/test/migrations.test.js` 里**所有**「最后迁移 = 0038」断言（261116 现查 19 处 `, 38,`）改成 39，改完 `grep -n ', 38,'` 必须为空；baseline `docs/data/schema.sql` **一个字节都不改**（冻结）。
 
 ## 3. 读侧（`portal/src/platform-prompts.js`，新模块）
 
