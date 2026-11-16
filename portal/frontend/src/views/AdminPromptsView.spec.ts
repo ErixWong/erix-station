@@ -590,7 +590,39 @@ describe('英文 locale 的同一页（双语都真的写了）', () => {
     await click(w, 'save-addendum');
 
     expect(text(w, 'materialize-addendum')).toContain('materialization was not notified');
-    expect(text(w, 'readonly-no-fulltext')).toContain('does **not** show their text');
+    expect(text(w, 'readonly-no-fulltext')).toContain('does not show their text');
     expect(text(w, 'source-addendum')).not.toMatch(/[一-鿿]/);
   });
+});
+
+// 界面缺陷回归（issue #596 片 B）：这一页把 markdown 星号**原样显示**出来了 —— 宿主截图
+// `/docker/erix_station_playwright/596-after-save.png` 里肉眼可见 `**next run**`、`**not**`。
+// 成因：整个前端**没有 markdown 渲染器**（也不打算为一句文案加依赖），i18n 文案在模板里是
+// `{{ t('…') }}` 纯文本插值 ⇒ 文案里的记号就是界面上的杂字符。要强调请用 class（那些
+// `text-emerald-800` / `text-amber-700` 已经在做）。
+// 断言走 DOM（**不用 `w.emitted()`**：本机 NODE_ENV=production 下恒空 ⇒ 假红）。
+// ⚠ 只钉被点名的那几行：`readonly-*` 条目里的 `fde-*` 是真 glob 写法，不是 markdown。
+describe('markdown 星号不许进界面：三张卡的 timing-* 与 readonly-no-fulltext（#596）', () => {
+  const MARKER_TARGETS = [
+    'timing-addendum', 'timing-agentsMd', 'timing-titlePrompt',
+    // 后两条是工单里一并点名的残留：整段覆写卡的预算免责那句（zh 侧原本写着 `**最长合法工位名**`）
+    'readonly-no-fulltext', 'agents-md-render-budget-note',
+  ];
+
+  for (const locale of ['zh-CN', 'en'] as const) {
+    it(`${locale}：三张卡的 timing-* 与 readonly-no-fulltext 渲染出来的文本不含 *`, async () => {
+      setLocale(locale);
+      stubDefault(dto());
+      const w = await mountView();
+
+      for (const testId of MARKER_TARGETS) {
+        const rendered = text(w, testId); // w.get() ⇒ 元素缺失当场红，不会空跑假绿
+        expect(rendered.trim(), `${locale} ${testId} 不许是空文本`).not.toBe('');
+        expect(rendered, `${locale} ${testId} 渲染出了 markdown 星号`).not.toContain('*');
+      }
+      // 兼带一道全屏闸：任何一张卡新写进文案的成对星号都会在这里现形（单星号只在上面那五个
+      // 被点名的位置上当杂字符处理 —— readonly 条目里的 `fde-*` 是真 glob，不是 markdown）。
+      expect(w.text(), `${locale} 整页还带着 markdown 强调记号`).not.toContain('**');
+    });
+  }
 });

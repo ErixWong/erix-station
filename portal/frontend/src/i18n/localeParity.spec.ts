@@ -284,3 +284,39 @@ describe('收工灯 gitLight.* 的语义红线（#359 / D9）', () => {
     expect(enLight.label.grey.toLowerCase()).toContain('unchecked');
   });
 });
+
+// issue #596 片 B 交付后的**界面缺陷**（管理台「提示词」页把 markdown 星号原样显示出来了）：
+// 真浏览器截图（宿主 `/docker/erix_station_playwright/596-after-save.png`）里肉眼可见
+// `**next run**`、`**not**`、`**下一次改名**`。成因：i18n 字符串在模板里走 `{{ t('…') }}` 的
+// **纯文本插值** ⇒ 整个前端没有 markdown 渲染器，也不打算为一句文案加依赖。
+// 所以 `**…**` 写进界面文案不是强调，是一串杂字符；要视觉强调请回视图加 class（那些
+// `text-emerald-800` / `text-amber-700` 已经在做强调）。只钉 `admin.prompts.*` 这一棵：
+// 别处的历史 `**`（例如 `admin.upload.*`）属另一单的历史问题，不在本单的战线里。
+describe('markdown 星号不许进界面：admin.prompts.*（issue #596 提示词页）', () => {
+  const BOTH = [['zh-CN', zhCN.admin.prompts], ['en', en.admin.prompts]] as const;
+
+  it('zh-CN 与 en 两边整棵 admin.prompts.* 子树都不含 **（违规点名 locale + 键路径）', () => {
+    const offenders: string[] = [];
+    for (const [locale, subtree] of BOTH) {
+      const leaves = leafValues(subtree, 'admin.prompts');
+      // 防空跑：这一棵被改名或整块被删时叶子数会塌到 0 ⇒ 「一条都没违规」的假绿。
+      expect(leaves.length, `${locale} 的 admin.prompts.* 叶子数`).toBeGreaterThan(60);
+      for (const [path, value] of leaves) {
+        if (typeof value === 'string' && value.includes('**')) offenders.push(`${locale} ${path}`);
+      }
+    }
+    expect(offenders.join(' | '), '这些界面文案里还有 markdown 星号').toBe('');
+  });
+
+  it('三张卡的生效时机与「不显示全文」那句连单个 * 都不许出现（单星号同样是杂字符）', () => {
+    // 这四句就是截图里被点名的位置（页面上的 data-test 是 timing-* / readonly-no-fulltext）。
+    const STRICT = ['timingAddendum', 'timingAgentsMd', 'timingTitlePrompt', 'readonlyNoFullText'];
+    for (const [locale, subtree] of BOTH) {
+      const bag = subtree as unknown as Record<string, string>;
+      for (const key of STRICT) {
+        expect(typeof bag[key], `${locale} admin.prompts.${key} 必须存在`).toBe('string');
+        expect(bag[key], `${locale} admin.prompts.${key}`).not.toContain('*');
+      }
+    }
+  });
+});
