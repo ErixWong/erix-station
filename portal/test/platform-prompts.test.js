@@ -1007,3 +1007,62 @@ test('P11b 这条锁不是装饰：合成一对同样互相 import 的模块，�
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// 7. `D1` 两头说法：代码里的旋钮 / 端点 / DTO 键，文档必须同步点名
+// ---------------------------------------------------------------------------
+
+test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 DTO 键登记进 portal.md §4.16', async () => {
+  // 只在代码里加的旋钮运维找不到；只在文档里写的端点等于没做。口径照
+  // `portal/test/upload-settings.test.js` US-12/US-15（同一族「两头说法」判据）。
+  const envDoc = fs.readFileSync(new URL('../../docs/env.md', import.meta.url), 'utf8');
+  assert.match(envDoc, new RegExp(READ_TIMEOUT_ENV_VAR), `docs/env.md 必须登记 ${READ_TIMEOUT_ENV_VAR}`);
+  assert.match(envDoc, /read_timeout/, 'env 文档要说清超时的表现（reason=read_timeout，不挡物化与改名）');
+  assert.match(envDoc, /platform_prompts/, 'env 文档必须点名 DB 侧那张表（否则运维只看得见 env）');
+
+  const example = fs.readFileSync(new URL('../../deploy/.env.example', import.meta.url), 'utf8');
+  assert.match(example, new RegExp(READ_TIMEOUT_ENV_VAR), 'deploy/.env.example 必须登记这个旋钮');
+
+  const apiDoc = fs.readFileSync(new URL('../../docs/api/portal.md', import.meta.url), 'utf8');
+  const sec = apiDoc.slice(apiDoc.indexOf('### 4.16 '));
+  assert.ok(sec.length > 200, 'portal.md 必须有 §4.16 这一节');
+  const section = sec.slice(0, sec.indexOf('\n## 5. ') > 0 ? sec.indexOf('\n## 5. ') : sec.length);
+  // ① 端点表（文档开头那张清单）与 §4.16 都得写四条路径。
+  for (const route of [
+    'GET /api/admin/prompts', 'PUT /api/admin/prompts/addendum',
+    'PUT /api/admin/prompts/agents-md', 'PUT /api/admin/prompts/title-prompt',
+  ]) {
+    assert.ok(apiDoc.includes(route), `端点清单缺 ${route}`);
+  }
+  // ② 契约 §6 的 DTO 键**逐个**必须在文档里出现（少一个键 = 前端切片 B 按文档写就会漏字段）。
+  const keyNames = new Set();
+  const probe = await getPlatformPrompts({ pool: new PromptsFakePool() });
+  for (const [group, value] of Object.entries(probe)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      for (const k of Object.keys(value)) keyNames.add(k);
+    } else {
+      keyNames.add(group);
+    }
+  }
+  for (const key of keyNames) {
+    assert.ok(section.includes(key), `§4.16 缺 DTO 键 ${key} 的语义`);
+  }
+  assert.ok(keyNames.has('materializeEnqueued') || section.includes('materializeEnqueued'),
+    'materializeEnqueued 的语义（含 =0 的两种意思）必须写进文档');
+
+  // ③ **不新增错误码**（契约 §6：一律 `validation_failed`）。两条一起测：
+  //    §4.16 里出现的「像错误码的反引号词」必须全是既有码或 `reason` 取值；
+  //    而通用错误码那一节（§1.2）不许被塞进一个提示词专用的新码。
+  const KNOWN_CODES = ['forbidden', 'internal', 'method_not_allowed', 'validation_failed'];
+  const KNOWN_REASONS = ['no_row', 'read_failed', 'read_timeout'];   // `reason` 的取值，不是错误码
+  const codes = new Set();
+  for (const m of section.matchAll(/`([a-z][a-z0-9_]{3,})`/g)) {
+    const t = m[1];
+    if (/_failed|_exceeded|_too_large|_not_allowed|_not_configured$/.test(t)) codes.add(t);
+  }
+  const invented = [...codes].filter((t) => !KNOWN_CODES.includes(t) && !KNOWN_REASONS.includes(t));
+  assert.deepEqual(invented.sort(), [], `§4.16 只许用既有错误码（发明了：${invented.join(', ')}）`);
+  const codeTable = apiDoc.slice(apiDoc.indexOf('### 1.2 通用错误码'), apiDoc.indexOf('### 1.3'));
+  assert.ok(codeTable.length > 200, '通用错误码那一节必须还在（切片要用它当基线）');
+  assert.doesNotMatch(codeTable, /prompt/i, '§1.2 不许出现提示词专用的新错误码（本单**零新码**）');
+});
