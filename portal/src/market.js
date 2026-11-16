@@ -459,6 +459,12 @@ const asJson = (v, fallback) => {
   return v;
 };
 
+/** manifest.tools 的条数（列表 DTO 用）：取不到就算 0，绝不让列表里出现 undefined。 */
+const toolCountOf = (manifest) => {
+  const m = asJson(manifest, {});
+  return Array.isArray(m?.tools) ? m.tools.length : 0;
+};
+
 /** 管理端面的一条（列表与详情同源；详情多带 manifest / files / warnings）。 */
 export function toAdminItemDto(row, extra = {}) {
   return {
@@ -474,6 +480,9 @@ export function toAdminItemDto(row, extra = {}) {
     author: row.author ?? null,
     license: row.license ?? null,
     security_score: row.security_score,
+    // `tool_count` 从 manifest 现算：它是列表上唯一能解释「这个技能会带来几个工具」的数字，
+    // 而 manifest 已是它的唯一来源（不让调用方自己数 files[]，那是另一份真相）。
+    tool_count: toolCountOf(row.manifest),
     installs: row.installs === undefined ? undefined : Number(row.installs),
     created_at: row.created_at,
     published_at: row.published_at ?? null,
@@ -496,6 +505,8 @@ export function toUserItemDto(row) {
     author: row.author ?? null,
     license: row.license ?? null,
     security_score: row.security_score,
+    tool_count: toolCountOf(row.manifest),
+    // 真布尔（不是 't'/'f' 也不是 0/1）：前端按 `installed === true` 判，字符串会被判成未安装。
     installed: row.installed_version !== null && row.installed_version !== undefined,
     installed_version: row.installed_version ?? null,
     enabled: row.enabled === true,
@@ -774,9 +785,13 @@ export async function getAdminItem({ pool, itemId }) {
   const fs_ = (await pool.query(
     `SELECT path, bytes FROM capability_files WHERE item_id = $1 AND version = $2 ORDER BY path`,
     [itemId, row.version])).rows;
+  const manifest = asJson(row.manifest, {});
   return toAdminItemDto(row, {
     description_md: row.description_md ?? '',
-    manifest: asJson(row.manifest, {}),
+    when_to_use: row.when_to_use,
+    // `tools` 从 manifest 提到顶层：前端详情页直接渲这张表，不该去摸 manifest 的内部形状。
+    tools: Array.isArray(manifest.tools) ? manifest.tools : [],
+    manifest,
     security_warnings: asJson(row.security_warnings, []),
     files: fs_,
   });
@@ -811,7 +826,9 @@ export async function getUserItem({ pool, fdeId, slug }) {
   return {
     ...toUserItemDto(row),
     description_md: row.description_md ?? '',
-    readme_md: readme ? Buffer.from(readme.content).toString('utf8') : null,
+    // 缺 SKILL.md ⇒ 空串（**不是 null**）：前端把它直接塞进 markdown 渲染器，null 会渲染成 "null"。
+    readme_md: readme ? Buffer.from(readme.content).toString('utf8') : '',
+    tools: Array.isArray(asJson(row.manifest, {}).tools) ? asJson(row.manifest, {}).tools : [],
     manifest: asJson(row.manifest, {}),
     security_warnings: asJson(row.security_warnings, []),
     files: rows.map((f) => ({ path: f.path, bytes: f.bytes })),
