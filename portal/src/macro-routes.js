@@ -20,6 +20,7 @@
 import {
   MacroError, MACRO_VERDICTS, validateMacroEnum, validateMacroCriterion, validateMacroRunStatus,
   listTemplates, createTemplate, updateTemplate, deleteTemplate,
+  subscriberCountsByTemplate,
   listAssignments, assignTemplate, unassignTemplate,
   toMacroRunSnapshot, encodeMacroRunCursor, decodeMacroRunCursor,
 } from './macros.js';
@@ -159,11 +160,15 @@ export async function notificationsUnreadCount({ pool, userId }) {
 // ── 管理台 ────────────────────────────────────────────────────────────────────
 
 export async function adminTemplates({ pool, query = new URLSearchParams() }) {
-  const items = await listTemplates(pool, {
-    isAdmin: true,
-    includeDeleted: toBool(query.get('includeDeleted')),
-  });
-  return { items };
+  const includeDeleted = toBool(query.get('includeDeleted'));
+  const items = await listTemplates(pool, { isAdmin: true, includeDeleted });
+  // issue #613：补「订阅数」列（`07` §2：停用前要知道影响谁）。口径见 `subscriberCountsByTemplate`：
+  // **只算 `enabled = true`** 的订阅。一次全表 `GROUP BY`，不在循环里查 ⇒ 无 N+1。
+  // `includeDeleted=true` 走的是同一份计数 ⇒ 软删模板也带这个数（软删不抹订阅行，见 `deleteTemplate` 分支一）。
+  // 没任何启用订阅 ⇒ `0`（**不是** `null`/`undefined`：前端拿 `undefined` 显示 `—`，
+  // 那是「后端没下发」的意思，不能拿它冒充「没人订」）。
+  const counts = await subscriberCountsByTemplate(pool);
+  return { items: items.map((t) => ({ ...t, subscriberCount: counts.get(t.id) ?? 0 })) };
 }
 
 export async function adminCreateTemplate({ pool, body = {}, adminUserId }) {
