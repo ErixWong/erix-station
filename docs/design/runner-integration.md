@@ -370,6 +370,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 2b. **system prompt 与 AGENTS.md 链注入**（issue #451，设计稿 `docs/design/agents-md-layering-2026-11-05.md`）：`config.input.system = SYSTEM_PROMPT + agentsMdSection`。`agentsMdSection` 由 `runner/lib/agents-md.js` 在 **`startRun` 内部**（cwd 已知之后）采集一次：祖先链 `$HOME` → `$HOME/projects` → `cwd` 的 `AGENTS.md`（由外到内，平台节 `scope=platform` 不可被下层覆盖）+ `cwd` 下一层子目录的**索引**（只列路径，≤5 条）。边界：只读 `$HOME` 及其子孙（`realpath` 越界 = symlink 逃逸 ⇒ 跳过）；只注入**文件原文**（不解析/不改写）；单文件 16 KiB / 全链 48 KiB，超限从**内层**开始截（平台节完整）；任何读取失败降级为跳过 + note，**绝不让 run 失败**；渲染禁时间戳/run id/generation（system 是 prompt 缓存的稳定前缀），无约定文件时注入段为空串（`system` 逐字节等于原值）。记账走现成 IPC `MSG.LOG`（info，文件数/字节/截断），**不新增事件类型**；**不改 jail 读写边界**（#259 仍独立）。判据：`runner/test/agents-md.test.js` + `runner/test/system-prompt.test.js` 的两条接线锁。⚠ 运维坑与 5b 同型：逻辑全在 worker 进程里 ⇒ 改动要重建 FDE 镜像并 `docker rm -f` 让 reconcile 重建。
 3. **tools / executeTool**：`createJail`（jail 根 = `run_start.cwd`，即项目目录；本站自己的宿主边界，ADR-009）+ `createStationFileTools`（**issue #228 起**：对上游 `erix-agent/tools` 的 `createFileTools` 做薄装配，工具面 = **`readFile` / `searchText` / `tree` / `edit` / `writeFile` 五个**，不暴露弃用别名 `rg` / `grep`；边界谓词 = 调用方谓词 ∧ ¬遮蔽（`maskedPaths`，只挡读）∧ jail 谓词，**相与不是替换**）+ `createShellTools` + `createNotesTools` + `createToolRegistry`（file + shell + note 三组工具，PR #74 / issue #72）；`executeTool` 外包一层审批钩子（§10）与工具事件上报。code-server 清退（issue #71）后，容器内「跑命令」职能由 **shell 工具**承接（issue #72，PR #74）。
    - **文件工具语义口径**（issue #228，详见 AGENTS.md §8.9）：`readFile` **有界读**（单次默认 ≤ 262144 字节，行窗口流式；`ERIX_FILE_READ_MAX_BYTES` 可覆盖，本站**不注入**）、`searchText` 的 `mode` **必填**（`literal` / `regex`，无默认不猜）且默认跳过 `node_modules` / `dist` / `build` / `target` / `vendor` 与点目录（排除账在结果尾部 marker + `metadata.searchSkipped`）、`edit` 只做逐字节精确匹配（第二个写工具，写边界与 `writeFile` 同一个 jail `allowWrite`）；**`tree` 的根标签由本站在装配层归一成 `./`**（`''` / `'.'` / `'./'` 含尾斜杠变体 / 缺省 / `null`，以及解析后就是根的写法；上游只给 `path === "."` 这一种 `./`，其余给工作目录 basename，而真机上模型会把该标签拷回去当下一次 `path` 并 ENOENT——#228 真机验收踩到，#64 语义靠本收口保住；只改根标签，条目与 marker 不动；**上游侧已提单（erix-agent #215），修好后本收口可撤**）；越界 / 非可写 / 遮蔽路径返回 `错误：…被宿主边界拒绝：…` **文本结果**而非抛异常。`judge.writeToolNames` **不显式传**（0.18.0 默认 `["writeFile","edit"]` 已与本站工具面一致）。
+   - **`maskedPaths` 到底遮什么、遮不到什么**（issue #231，工单 fix-261115-02；完整口径与理由在 **§17.1**，本处只放接线事实）：名单的**单一真相** = `runner/lib/file-tools.js` 导出的 `STATION_MASKED_PATHS`（`.env*` / `.git/config` / `.npmrc` / `*.pem` / `id_*`），`worker.js` 把它**同时**传给 `createJail({…, maskedPaths})` 与 `createStationFileTools({…, maskedPaths})`——**两处都得传**：jail 是宿主边界（它的根是 realpath 过的），装配层那份是它的入参谓词（契约用例 `file-tools-contract.test.js` 钉的就是装配层这道）；只传一处 = 另一处的单测照样绿，而生产链路里那道闸是死的（#231 的病根正是「能力与单测都在，装配点 0 引用」）。条目分两类，**深度语义不同**：含 `*` / `?` 的**名字模式**按路径段匹配 ⇒ 任意深度命中；**前缀条目**只挡那一个路径（`sub/.npmrc` 不挡）。遮蔽**只作用于读谓词**（`writeFile` / `edit` 照旧能写），且不挡 `shell`。判据：`runner/test/masked-paths.test.js`。
 4. **store**：IPC 版 HTTP adapter（§9），`runId` = `run_start.run_id`（portal 生成的 UUID，规格 §9.3-3）。
 5. **resume**：`run_start.resume === true`（即 `attempt > 1` 的 re-claim）时传 `resume: true`（引擎从 checkpoint 恢复，跳过已执行工具——`executedToolIds` 去重，erix-agent 0.18.0 `loop/orchestrator.js:1770-1782` / `resume-manager.js:260-264`）。resume 时 adapter 先经 U9 读回当前 checkpoint 的 `revision`，本地计数从 `revision+1` 续起（§9.5），避免新 worker 从 0 起计被 CAS 误拒。
 5b. **恢复语义：挂起工具不再自动重放**（issue #288 缺陷 C，口径详见 AGENTS §8.22）。此前本站从未传 `replayPolicy` ⇒ 吃的是引擎默认 `"always-replay"`（`orchestrator.js:558`）：**「有 `tool_use`、无 `tool_result`」的挂起工具会在 resume 时从头再执行一遍**。真机：一条 `sleep 360` 的 shell 被杀后同 `call_id` 在 `run_events` 里出现 3 条 `tool_use`。⚠ 旧文档那句「副作用工具按 tool id 幂等」**只解决了记账不重复，没解决外部副作用**——`kill` 旧进程 / 重启 backend / 重跑测试这类非幂等命令每轮真的再掠一次桌。现改为传 `replayPolicy: 'per-tool-declaration'`（取值校验 `:634-635`，写错字面量直接 TypeError，不会静默退化）：
@@ -901,12 +902,67 @@ FDE 浏览器        portal                agentd               worker（execute
 
 | 工具 | 能砸什么 | 靠什么兜着 | 审计落点 |
 |---|---|---|---|
-| `readFile` / `searchText` / `tree` | 读到不该看的字节（密钥、`.env`） | jail `assertReadable` + `maskedPaths`（内容一字节不回传，只进排除账）；单次 ≤ 262144 字节 | `tool_calls` / `tool_outputs` |
+| `readFile` / `searchText` / `tree` | 读到不该看的字节（密钥、`.env`） | jail `assertReadable` + `maskedPaths`（内容一字节不回传，只进排除账）；单次 ≤ 262144 字节。⚠ 这道遮蔽**只在这一行**，`shell` 一行没有 ⇒ 见 §17.1 | `tool_calls` / `tool_outputs` |
 | `writeFile` / `edit` | 覆盖项目内文件、批量改动 | jail **可写边界**＝项目目录；越界**直接失败且不落盘**；`edit` 只吃逐字节精确匹配，0 命中/多处命中整次不落盘 | 同上（成功回显短 diff） |
 | **`shell`** | **最大爆破半径**：`rm -rf`、`git push --force`、`curl \| sh`、往 `$HOME` 别处写、外呼网络 | **只有**：容器隔离（不 publish 端口、单 FDE 网络、LLM 唯一出口）+ 超时（默认 60s／上限 600s）+ 输出 32KB 上限 + cwd 词法 `..` 拒绝（**注释明写不做 symlink/realpath 防御**，`runner/lib/shell-tools.js:7`）+ env 无平台凭据（agentd 剔除 `ERIX_STATION_TOKEN`） | `tool_calls.command` + 退出码；网络侧靠 Traefik/防火墙（**#233 未实现＝已知缺口**） |
 | `note_write` / `note_complete` / `note_revoke` | 污染档案 | 落 run 数据目录（宿主自管，终态清理 + 启动 sweep TTL） | 同上 + run 数据目录 |
 
 **为什么这张表比一个「批准」按钮有用**：出事时的排查路径是「先看 `tool_calls` 里那条记录 → 再看它归哪一列『靠什么兜着』」——若归 `shell`，就去查容器网络与磁盘，而不是去找一个并不存在的审批入口。
+
+### 17.1 `maskedPaths` 只挡文件工具，挡不住 `shell`（不对称是设计，不是漏洞）
+
+> 来源：issue #231（工单 fix-261115-02，2026-11-15）。本单把 `maskedPaths` 接进生产链路之前，先发现
+> 它**从来就只有一半覆盖**，而这件事只在代码注释里（`runner/lib/shell-tools.js` 头注），文档里没登记过。
+> 不登记就会反复被当成「遮蔽漏了 shell」的 bug 提回来，下一次改动顺手「把它兼容上」——那才是真回归。
+
+**事实**（判据：`runner/test/masked-paths.test.js`，三条主判据各带变异自证）：
+
+| 入口 | 项目目录内的 `.env` | 说明 |
+|---|---|---|
+| `readFile` / `searchText` / `tree` | **挡**（`错误：读取被宿主边界拒绝：.env`，内容零字节回传，`tree`/`searchText` 只留下排除账） | 走 jail 的 `assertReadable` + 装配层读谓词 |
+| `writeFile` / `edit` | **不挡** | 旧口径逐字对齐 `assertReadable`：**只挡读不挡写** |
+| `shell`（`cat .env`） | **不挡** | `lib/shell-tools.js` 头注：「shell 有意越过 worktree 文件牢笼——容器是信任边界（不变式 1）」 |
+
+**为什么不把 `shell` 也挡上**：
+
+1. **不对称的根源是不变式 1**（「容器是信任边界」，AGENTS.md §2）。FDE 容器里能跑 `cat` 的东西，本来就能跑
+   `grep` / `python -c` / `xxd`；要在 `shell` 里堵住一个文件名，得去解析命令行（`cat .env`、`cat <.env`、
+   `less .env`、`tar cf - . | …`），那是一个命令语义解释器，不是一个边界。#249 当年拒的正是这类
+   「按命令内容启发式上闸」。
+2. **它的定位是「防止敏感内容被主动读进 transcript / 上下文」**，不是安全加固：模型拿 `readFile` 读一个
+   200KB 的 `.env` / `*.pem` 会整块进上下文（白烧轮次 + 密钥进对话记录），这条路径**又长又静默**，
+   所以值得用一行名单挡掉。而 `shell` 的输出本来就有 32KB 上限 + 退出码 + 命令文本落 `tool_calls`，
+   是**短且可审计**的路径。两者不对称不是因为漏了一半，是因为它们防的是两件不同的事。
+3. **真正的安全加固不在这里**：容器隔离 / 不 publish 端口 / 单 FDE 网络 / LLM 唯一出口 / env 无平台凭据
+   （`ERIX_STATION_TOKEN` 由 agentd 剔除）。问「FDE 能不能拿到自己的 `.env`」——能，而且应当能；
+   问「平台的密钥会不会从这儿泄」——不从这里泄（worker 不持平台凭据）。
+
+**口径范围**：遮蔽集合只针对**项目目录以内**（`.env*` / `.git/config` / `.npmrc` / `*.pem` / `id_*`）。
+FDE home 下的 `~/.ssh`、`~/.git-credentials`、`~/.erix/*` 本来就在 jail 根之外（文件工具一直读不到，
+只有 shell 能读，见 §6.3-3 与 #259）——那是**已有的边界**，不是「遮蔽漏了家目录」。
+
+**已知代价（刻意的误伤，出口都是「多绕一步 shell」而不是死路）**：签入仓库的 `.env.example` /
+`.env.sample` 模板同样被 `.env*` 命中；`id_mapping.csv` 这类普通名字被 `id_*` 命中；测试用的 `*.pem`
+夹具同样读不到。`SYSTEM_PROMPT` 已给出口（「被宿主边界拒绝」时不要原路径重试，用 shell 定点看那一个
+文件）。名单单一真相 = `STATION_MASKED_PATHS`（改口径只改那一处，`runner/worker.js` 不另拄一份）。
+
+**无 jail 的装配路径上，glob 遮蔽的 symlink 双向检查会退化成单向（生产不走这条路）**：遮蔽的双向 fail-closed
+只存在于 **jail 那一层**——`createJail.assertReadable` 拿的是**两个不同的值**（词法 `path.resolve(root, value)`
+与 `realpathWithMissing` 的结果）分别比一次。而**装配层自己那道**（`runner/lib/file-tools.js` 的 `withinMasked`，
+现 `:350`；二次审计当时记的是 `:346`，行号已因注记位移）把上游给的**同一个** `target` 同时当词法路径与
+realpath 结果交进去⇒ 只剩一种拼写在比。后果：**没有 jail 时**，「普通名字指向被遮名」这一面会漏（实测：
+`createStationFileTools({ cwd, maskedPaths: STATION_MASKED_PATHS })` 不供 jail，`alias.txt -> .env` 用 `readFile`
+直接拿到 `1: SECRET`；同一装配补上 jail 后回 `错误：…被宿主边界拒绝`）。反方向（`.env` 被改成了软链）
+不退化，段名还像密钥。**生产不走这条路**：`runner/worker.js:559-560` 同时给 `createJail` 与
+`createStationFileTools` 供了名单，两个方向都在 jail 里兜住（用例：`masked-paths.test.js` 的
+「symlink 两个方向都 fail-closed」与「cwd 写成目录的符号链接」两条）。另一面已登记的同型边界：
+无 jail + `cwd` 是目录软链时，**前缀**条目会因 realpath 根与 target 拼写不同而 miss（同一根源）。
+**处置：登记为事实，不为此改装配语义、不加参数**（装配层的 `maskedPaths` 本就是给「无 jail /
+jail 根 ≠ cwd」的调用方兜底的附加闸，不是安全边界；见 §6.3-3）。
+
+**不许当 bug 修的那三条**（`masked-paths.test.js` 里各带一条变异自证）：① 项目根的 `.env` 用 `readFile`
+拿不到，且错误点名被拒路径（jail 层直接抛 `JailError path_masked`）；② 同目录普通文件照读（防「把
+遮蔽改成默认拒绝」）；③ `shell` 里 `cat .env` **仍能读到全文**——红了就说明有人试图去「兼容」shell。
 
 ---
 

@@ -34,7 +34,7 @@ import {
 import { createStationDelegation, mergeUsage } from './lib/delegation.js';
 import { resolveRunModel, resolveModelMetadata } from './lib/llm-models.js';
 import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
-import { createJail, createStationFileTools } from './lib/file-tools.js';
+import { createJail, createStationFileTools, STATION_MASKED_PATHS } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
@@ -548,8 +548,23 @@ async function startRun(msg) {
   //    0.10.0 装配工厂，notesDir 为 agentd 下行的 run 数据目录，logical-run 作用域跨 attempt 保留）；
   //    approvals 钩子 P2 留空）。
   ensureGitRepo(cwd);
-  const jail = createJail({ root: cwd, writable: [cwd] });
-  const fileTools = createStationFileTools({ jail, cwd });
+  // issue #231：把 `maskedPaths` 首次接进生产链路。此前这两处调用**从未传过** maskedPaths（`grep -c maskedPaths
+  // runner/worker.js` = 0），而 `lib/file-tools.js` 里的遮蔽能力一直存在并有单测——能力在、装配没接，
+  // 于是「密钥遮蔽」在生产里等于没开（真机表现：模型 `readFile .env` 直接拿到数据库密码全文，进 transcript）。
+  // 名单单一真相 = `STATION_MASKED_PATHS`（只针对**项目目录以内**；家目录 `~/.ssh` 等在 jail 外，本就读不到）。
+  // ⚠ 不对称（不是漏了，是设计）：**只挡文件工具，不挡 shell**——`lib/shell-tools.js` 头注与不变式 1
+  //   把容器当信任边界，shell 有意越过文件牢笼 ⇒ `cat .env` 仍读得到。本遮蔽的定位是「防止敏感内容被
+  //   主动读进 transcript / 上下文」，**不是安全加固**。判据：runner/test/masked-paths.test.js（含那条
+  //   钉现状的 shell 用例，不许当 bug 修）；口径：docs/design/runner-integration.md §17.1。
+  const jail = createJail({ root: cwd, writable: [cwd], maskedPaths: STATION_MASKED_PATHS });
+  const fileTools = createStationFileTools({ jail, cwd, maskedPaths: STATION_MASKED_PATHS });
+  // 一次性 info 记账（与 #451 的 AGENTS.md 注入记账同形态，走现成 MSG.LOG、**不新增事件类型**）：
+  // 运维遇到「agent 说读不到 .env」时，这条能直接区分「遮蔽生效」与「jail 越界」。
+  sendIpc(process, {
+    type: MSG.LOG, run_id: runId, level: 'info',
+    msg: `maskedPaths active: ${STATION_MASKED_PATHS.length} entries [${STATION_MASKED_PATHS.join(', ')}]`
+      + ' (file tools only; shell bypasses the file jail by design — invariant 1)',
+  });
   // issue #46（选项 A）+ #392（B 片）：notesDir 由 agentd 下行。作用域已从 **logical-run**
   // 改为**会话**：下行的是 `<home>/sessions/<sessionId>/notes`，同一会话的每个 run 看到的是
   // **同一个** notes 目录 + 同一个 scopeRef ⇒ `note_list` 与引擎 run-state 小抄目录跨 run 可见。
