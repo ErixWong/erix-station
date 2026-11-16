@@ -2,7 +2,7 @@
 // 消息流（旧 #stream 的渲染语义平移）：addMessage 三分（user/assistant/synthetic）、
 // 助手终稿 markdown（v-html，渲染器本身先转义后格式化，XSS 安全）、工具卡片、
 // roundsep/syserr 分隔行、流式增量气泡。自动跟随/「↓ 最新」由父级持有（scroll 容器也在父级）。
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, reactive, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore, type StreamEntry, type FoldedInfo, type FoldedOriginalState } from '../stores/workbench';
 import type { ToolCardState } from '../composables/useEventStream';
@@ -209,19 +209,20 @@ function delegateView(callId: string): DelegateView | null {
   };
 }
 
-// 打开的子 run（整个组件一处，抽屉挂在模板底部单一位置）。
-const delegateOpen = ref<{ parentRunId: string; childRunId: string; label: string; termination?: string } | null>(null);
+// 打开的子 run：**状态上提到 store（issue #592）**。原来是本组件的局部 `ref`，只有工具卡一个入口；
+// 子 run 活动面板的「查看」是第二个入口 ⇒ 两处写同一份（`store.openDelegateViewer`）。
+// ⚠ **挂载点仍然只有本文件模板底部那一处**（设计 §4.3 / §8.3：复制第二个抽屉 = 两份轮询 + 两套 abort）。
 
 function openDelegateDrawer(callId: string): void {
   const card = store.es.toolCards.get(callId);
   const p = card ? delegatePayload(card) : null;
   if (!card || !p || p.runId === '') return;
-  delegateOpen.value = {
+  store.openDelegateViewer({
     parentRunId: card.runId ?? '',
     childRunId: p.runId,
     label: card.name,
     termination: p.termination === '' ? undefined : p.termination,
-  };
+  });
 }
 
 // issue #188：推理块展开态（组件内，默认收起）——与工具卡片同一按钮+chevron 交互风格，不新造一套。
@@ -719,12 +720,12 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
        parentRunId = 卡片所属 run（实时与刷新两条建卡路径都填了）、childRunId = 结果里的 runId、
        termination 一并递下去（抽屉自己的端点不带它，而「completed + syserr 仍红」这条红线在抽屉里也得成立）。 -->
   <DelegateChildDrawer
-    v-if="delegateOpen"
+    v-if="store.delegateViewer"
     :session-id="store.sessionId ?? ''"
-    :parent-run-id="delegateOpen.parentRunId"
-    :child-run-id="delegateOpen.childRunId"
-    :label="delegateOpen.label"
-    :termination="delegateOpen.termination"
-    @close="delegateOpen = null"
+    :parent-run-id="store.delegateViewer.parentRunId"
+    :child-run-id="store.delegateViewer.childRunId"
+    :label="store.delegateViewer.label"
+    :termination="store.delegateViewer.termination"
+    @close="store.closeDelegateViewer()"
   />
 </template>
