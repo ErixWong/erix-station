@@ -120,6 +120,13 @@ jobs:
           platforms: linux/amd64
           provenance: false
           sbom: false
+          # issue #586：portal 镜像与 FDE 镜像同口径——三个版本 ARG 不传 ⇒ 镜像内 `build-info.json` 的
+          # `revision`/`built_at` 恒 `unknown`，而 portal 侧此前**根本没有这份文件**（真机分裂一小时无人发现）。
+          # 与下面 ⑤ 同一取舍：ARG 只影响 Dockerfile **末尾**那一层与 OCI label，前面的层缓存不动。
+          build-args: |
+            STATION_VERSION=${{ steps.version.outputs.version }}
+            STATION_REVISION=${{ github.sha }}
+            STATION_BUILD_DATE=${{ steps.stamp.outputs.iso }}
           tags: |
             ${{ env.IMG_PORTAL }}:${{ steps.version.outputs.version }}
             ${{ env.IMG_PORTAL }}:latest
