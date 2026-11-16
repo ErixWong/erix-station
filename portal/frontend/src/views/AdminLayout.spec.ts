@@ -20,6 +20,14 @@ const ADMIN_WITH_SEAT = {
   id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'root', auth_source: 'local',
 };
 
+/** 真路由表里 `/admin` 的子路由名字（= AdminLayout 的 tab 名字集合）。 */
+function adminChildNames(): string[] {
+  const adminRoute = routes.find((route) => route.path === '/admin');
+  return (adminRoute?.children ?? [])
+    .map((child) => (typeof child.name === 'string' ? child.name : null))
+    .filter((name): name is string => name !== null);
+}
+
 /** 不带应用守卫的裸路由：本组件只用 useRoute/useRouter，守卫的 /api/me 与本单无关。 */
 function makeRouter() {
   return createRouter({
@@ -29,10 +37,11 @@ function makeRouter() {
       { path: '/login', component: { template: '<div>login</div>' } },
       // 顶栏 tab 用的是 `{ name: ... }` 形式的 :to ⇒ 路由表里没有这些名字，挂载当场就
       // "No match for {name:'admin-users'}" 抛错（不是断言失败）。给桩即可，本单不测 tab。
-      // ⚠ **加一个 tab 必须同时在这里加一个名字**：漏了不是"那条 tab 断言红"，而是整个组件挂载就抛
-      //   ⇒ 本文件**所有**用例红（含与 tab 无关的登出、返回工作台）。#485 片 A 加 `admin-upload` 时踩过。
-      ...['admin-users', 'admin-llm', 'admin-repos', 'admin-mail', 'admin-tls', 'admin-upload', 'admin-preview-pool', 'admin-macros', 'admin-macro-runs']
-        .map((name) => ({ path: `/${name}`, name, component: { template: '<div />' } })),
+      // ⚠ **历史上每加一个 tab 都要回来这里加一个名字**，漏了不是「那条 tab 断言红」而是整个组件
+      //   挂载就抛 ⇒ 本文件**所有**用例红（含与 tab 无关的登出、返回工作台）。#485 片 A 加
+      //   `admin-upload` 时踩过。#586（加 `admin-about`）起改成从**真路由表**推导名字，
+      //   这个坑从此结构性消失（名字集合只能来自 `router.ts`，不会与它漂移）。
+      ...adminChildNames().map((name) => ({ path: `/${name}`, name, component: { template: '<div />' } })),
     ],
   });
 }

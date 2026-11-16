@@ -734,6 +734,8 @@ export const zhCN = {
       // issue #485 片 A：上传上限（views/AdminUploadView.vue，契约 docs/api/portal.md §4.15）。
       // 放在证书之后、号池占用（只读运维快照）之前：它是一处**平台配置**。
       upload: '上传上限',
+      // issue #586：「关于」（版本三格，只读）；views/AdminAboutView.vue。
+      about: '关于',
       // issue #528（事件平台 W5）：宏模板与宏流水的管理台栏目（按 `07` §21.1 的键名表）。
       macros: '宏模板',
       macroRuns: '宏流水',
@@ -1041,6 +1043,47 @@ export const zhCN = {
       },
     },
     // LLM 供应商/模型区（AdminView #llmSection + UserLlmPane）
+    // issue #586：「关于」面板（views/AdminAboutView.vue，契约 docs/api/portal.md §4.16）。
+    // 重心不在「有个版本号」，在**三格各自是谁、各自从哪儿读**：v0.1.69 那次 portal 烘了停在 0.1.68 的
+    // 旧工作树，两边分裂一小时而界面上一个读面都没有 ⇒ 文案必须让人一眼看出哪格不作准。
+    about: {
+      title: '关于本站',
+      intro: '只读。三个版本号各来自一处、互不代替：服务端与平台侧引擎读 portal 镜像里烘的 build-info.json；每台 FDE 的引擎读库里的派生副本。',
+      loading: '正在读取版本信息…',
+      notLoaded: '尚未加载版本信息（还没请求）。',
+      fieldVersion: '版本',
+      fieldRevision: '构建修订（git revision）',
+      fieldBuiltAt: '构建时刻',
+      unknown: '未知',
+      unparsable: '无法解析：{value}',
+      serverTitle: '服务端（portal 镜像）',
+      serverHint: '这一格说的是 portal 容器自己在跑哪份构建。',
+      sourceBuildInfo: '来源：镜像内 build-info.json（构建产物，唯一权威）',
+      sourceEnv: '来源：环境变量显式覆盖（测试 / 临时钉版本用的），不是镜像里烘的那份',
+      sourcePackage: '来源：本地 package.json（源码态退路，不是镜像里的构建产物）',
+      sourceUnknown: '来源：未知（build-info.json 与 package.json 都没读到）',
+      sourceUnknownShape: '来源：服务端没给或给了不认识的形状（不猜）',
+      // 实际去读的 build-info 路径（`STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH` 能改它 ⇒ 必须可见）。
+      buildInfoPath: '读取路径：{path}',
+      engineTitle: '平台侧引擎（portal 镜像内的 erix-agent）',
+      engineHint: 'portal 进程自己用的那份引擎，不是每台 FDE 里跑的那份——那是下面第三格。',
+      // 引擎那格的来源标注：跟着服务端推导出的 provenance 走（前端不自己判）。
+      // `package.json` = 源码态退路 / 这份镜像里根本没烘 build-info.json（旧镜像）⇒ 不许顶着「构建产物」的标签。
+      engineSourceBuildInfo: '来源：镜像内 build-info.json 的 engine_version（构建产物，唯一权威）',
+      engineSourcePackage: '来源：本地 node_modules/erix-agent/package.json —— 源码态退路，或这份镜像里根本没有 build-info.json（旧镜像），不是镜像里的构建产物',
+      engineSourceEnv: '来源：环境变量覆盖（portal 侧本不该出现，出现就说明它不是镜像构建产物）',
+      engineSourceUnknown: '来源：未知（build-info.json 与 package.json 都没读到）',
+      engineSourceUnknownShape: '来源：服务端没给或给了不认识的形状（不猜）',
+      fdesTitle: '每台 FDE 的引擎',
+      fdesHint: '读的是 containers.agent_version —— 派生副本，不作准。',
+      snapshotProvision: 'provision 时快照',
+      snapshotUnknown: '口径未给出',
+      fdeProvisionedAt: 'provision 于 {at}',
+      revoked: '已吊销',
+      fdesEmpty: '服务端说当前没有 FDE 容器。',
+      fdesUnreadable: '读不到 containers.agent_version（这是「读不到」，不是「没有 FDE」）。',
+      caveat: '口径：唯一权威是镜像内烘的 build-info.json；package.json 只是构建输入，而 git tag / 镜像 tag / digest / containers.agent_version 都是派生副本，展示时必须标口径。',
+    },
     llm: {
       sectionTitle: 'LLM 供应商',
       emptyProviders: '暂无供应商，先在下方新增。',

@@ -95,6 +95,14 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/PreviewPoolUsageView.vue'),
         meta: { requiresRole: 'admin' },
       },
+      // issue #586：「关于」（版本三格，只读）。放在**最后**：它不帮人做任何决定，只在「现在跑的到底是
+      // 哪份构建」出问题时被人点开。懒加载 + `requiresRole`，请求只在 `AdminAboutView` 的 onMounted 发。
+      {
+        path: 'about',
+        name: 'admin-about',
+        component: () => import('./views/AdminAboutView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
       // issue #529（事件平台 W6）：宏模板配置 + 宏执行历史。懒加载 + 照邻居 requiresRole:'admin'。
       {
         path: 'macros',

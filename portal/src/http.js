@@ -38,6 +38,8 @@ import {
   isPreviewPortInPool,
 } from './previewpool.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
+// issue #586：版本三格的唯一读面（`/healthz` / `/api/health` 的 `version` 块与管理台「关于」面板都走它）。
+import { aboutPanel, healthVersionBlock } from './version-info.js';
 import { maskEmail } from './mailer.js'; // #449：邮件通道端口（登录邮箱验证码）
 import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置的 DB 读取侧（60s 缓存）
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
@@ -874,9 +876,15 @@ async function route(req, res, ctx) {
     // #515：就绪响应多带一块 `partialBuffer` 观测数字（**additive**，`status` 语义不变、503 形状不变、
     // 不新增端点与鉴权面）。为什么必须有：缓冲逐出活跃 run 只表现为「那段正文没了」，此前对外
     // 零读数（无 `/metrics`）⇒ 只有 `log.warn` 可对账。形状与红线见 `partialBufferHealth` 的注释。
+    // #586：再 additive 一块 `version`（**只有** station/revision/builtAt，不带引擎版本；
+    // 读不到就三格 `unknown`）。存在的理由：v0.1.69 发布时 portal 烘的是停在 0.1.68 的旧工作树，
+    // 两边分裂一小时而**对外零读数**——`curl /api/health` 现在能直接把「跑的是哪份构建」说出来。
+    // 对健康检查结构性安全（它只看 `res.ok`，不解析 body；口径见 deploy-contract.md §2.3）。
     if (ok) {
       const pb = partialBufferHealth();
-      return sendJson(res, 200, pb ? { status: 'ok', partialBuffer: pb } : { status: 'ok' });
+      return sendJson(res, 200, pb
+        ? { status: 'ok', version: healthVersionBlock(), partialBuffer: pb }
+        : { status: 'ok', version: healthVersionBlock() });
     }
     return sendJson(res, 503, errorBody('migration_failed', 'not ready'));
   }
@@ -1273,6 +1281,15 @@ async function requireAdmin(req, ctx) {
 async function handleAdminApi(req, res, ctx, url) {
   const { pathname } = url;
   const session = await requireAdmin(req, ctx); // 所有 /api/admin/* 端点统一先鉴权
+
+  // ---- issue #586：「关于」面板（平台自述的版本三格）------------------------------------
+  // **只读、零副作用、零新错误码**：读镜像里烘的 build-info.json（前两格）+ `containers.agent_version`
+  // （第三格，派生副本）。存在的理由就是本单的事故：三个版本号此前**只在人脑里分开**，
+  // 界面上一个读面都没有 ⇒ 「FDE 报 0.1.69、portal 报 0.1.68」分裂一小时无人发现。
+  // 为什么放管理台而不做用户侧工作台：两个引擎数并排给 FDE 看需要解释文案，那会变成第二个会漂的账（判据 C）。
+  if (pathname === '/api/admin/version' && req.method === 'GET') {
+    return sendJson(res, 200, await aboutPanel({ pool: ctx.pool, log: ctx.log }));
+  }
 
   // ---- #526 宏平台管理台（契约 10 篇 §3.3；业务在 macro-routes.js，本处只转发）----
   if (pathname === '/api/admin/macro-templates') {

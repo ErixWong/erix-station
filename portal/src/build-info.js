@@ -1,0 +1,108 @@
+// portal/src/build-info.js —— `runner/lib/build-info.js#readBuildInfo()` 的**逐字镜像副本**（issue #586）。
+//
+// 为什么是副本而不是 `import '../../runner/lib/build-info.js'`：portal 镜像的构建上下文把整个 `runner/`
+// 排除在镜像外（`.dockerignore` 的 `runner` 那行）⇒ 跨边界 import 在**本地绿、容器里 ENOENT**，而版本读取
+// 恰好是唯一一个「崩了就没人知道跑的到底是谁」的路径。仓内同一先例：`portal/src/transcript-fold.js`
+// （镜像 `runner/lib/transcript-fold.js`）与 `gitlight.js` 的排除名单哨兵——口径都是「跳包不 import，测试钉同步」。
+// 副本只有一个合法差异：下面的默认路径（portal 镜像里 build-info 烘在 `/app/build-info.json`，
+// runner 烘在 `/opt/erix/build-info.json`）——但**不靠默认值**：`version-info.js` 永远显式传路径与 packageDir。
+// ⚠ 除本段抬头顶下逐字等于 `runner/lib/build-info.js`，由 `portal/test/version-surface.test.js` 钉住；
+//   上游改了没同步过来就红 ⇒ 把 runner 那份重新 `cp` 过来，**不要**在两份里各改一遍。
+//
+// 口径（issue #586，三格不许互抄）：
+//   • 服务端版本 = portal 镜像内 `build-info.json` 的 `station_version`（本函数返回在 `runnerVersion` 格里）
+//   • 平台侧引擎 = 同一份的 `engine_version`（在 `agentVersion` 格里）
+//   • 每台 FDE 的引擎 = `containers.agent_version`（**派生副本**，不本函数管，见 `version-info.js`）
+
+// --- 以下为 runner/lib/build-info.js 的原文逐字副本（`portal/test/version-surface.test.js` 逐字比对）---
+
+// issue #404 结案：容器里跑的「版本」必须是**构建产物**，不是运维旋钮。
+//
+// 为什么在这儿：`containers.agent_version` 曾长期写着一个 10-25 之后没人再动的 `.env` 静态值
+// （`FDE_AGENT_VERSION=0.1.32-088e41e`），而容器实际早已换过两个版本；同时 agentd 上报的
+// `ERIX_AGENT_VERSION` **从来没被任何地方设过**，于是落到 `'0.1.0'` 这个兜底常量——账上、上报、
+// 真相三方各说各话。根因不是"忘了同步"，是**版本有两个来源**（构建 + 一个手工 env），而手工那个
+// 没人负责、也没人检查。
+//
+// 现在的唯一真相：镜像构建期写进 `/opt/erix/build-info.json`（见 Dockerfile），运行时只读不猜。
+// 优先级三级，且**绝不抛错**——这在 agentd 的心跳热路径上，读不到版本不能让心跳死：
+//   ① `ERIX_AGENT_VERSION`：显式 override，默认不设。设了就是"我知道我在盖什么"（测试/临时钉版本）。
+//   ② `build-info.json`：镜像里的构建产物（station_version / engine_version / revision）。
+//   ③ 本地 `package.json`：仓库里直接跑 agentd（dev）时的退路；拿不到就 `unknown`。
+//
+// ⚠ 没有 `'0.1.0'` 这种兜底版本号了：**未知就写 unknown**。一个看起来合法的假值比空值毒——
+// 它这两周就是靠 `0.1.0` / `0.1.32-088e41e` 两个"合法样子"骗过了所有看的人。
+//
+// 契约口径：心跳 body 里 `agent_version` = **erix-agent（引擎）版本**（`docs/api/portal.md` U4 就这么
+// 定义的），runner 自己的版本另放 `runner_version`，构建 revision 放 `build_revision`。
+
+// ⚠ revision / built_at 的来源：**构建期 ARG**（`STATION_REVISION` / `STATION_BUILD_DATE`），
+// 由 `.github/workflows/release.yml` 步骤⑤ 传入；CI 的 `ci.yml` 步骤⑤ 也传（值不同、形状相同）。
+// 2026-11-09 之前这两个 ARG **谁都没传** ⇒ 镜像里 `revision`/`built_at` 恒 `unknown`，
+// 两个 OCI label 也是空的（v0.1.53 实测）——「版本作为构建产物」当时只做到 station/engine 两格。
+// 检查点是 `ci.yml` 步骤 ⑤′：`docker run --entrypoint cat` 读回 build-info.json 后逐格断言
+// （station_version == 仓库 pin、revision == 本次 commit、engine_version 非 unknown、built_at 非 unknown）。
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+export const UNKNOWN = 'unknown';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+function readVersion(file) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return typeof raw?.version === 'string' && raw.version.trim() !== '' ? raw.version.trim() : null;
+  } catch {
+    return null; // 缺文件 / 坏 JSON / 没 version 字段，一律走下一级
+  }
+}
+
+/**
+ * 读构建期烘进去的版本信息。任何一步失败都只降级，不抛错。
+ * @param {{env?: Record<string,string|undefined>, buildInfoPath?: string, packageDir?: string}} [opts]
+ * @returns {{agentVersion: string, runnerVersion: string, revision: string, builtAt: string, source: 'env'|'build-info'|'package'|'unknown'}}
+ */
+export function readBuildInfo({ env = process.env, buildInfoPath, packageDir } = {}) {
+  const out = { agentVersion: UNKNOWN, runnerVersion: UNKNOWN, revision: UNKNOWN, builtAt: UNKNOWN, source: 'unknown' };
+  const s = (v) => (typeof v === 'string' && v.trim() !== '' ? v.trim() : null);
+
+  // ② build-info.json（镜像里的构建产物）
+  const infoPath = s(buildInfoPath) ?? s(env.ERIX_BUILD_INFO_PATH) ?? '/opt/erix/build-info.json';
+  try {
+    const j = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
+    const engine = s(j.engine_version);
+    const station = s(j.station_version);
+    if (engine || station) {
+      out.agentVersion = engine ?? UNKNOWN;
+      out.runnerVersion = station ?? UNKNOWN;
+      out.revision = s(j.revision) ?? UNKNOWN;
+      out.builtAt = s(j.built_at) ?? UNKNOWN;
+      out.source = 'build-info';
+    }
+  } catch { /* 落下一级 */ }
+
+  // ③ dev 退路：仓库里直接跑（没有 /opt/erix），runner 版本取本地 package.json；
+  // 引擎版本从 node_modules 里的文件**直接读**——不能用 `require('erix-agent/package.json')`，
+  // 它的 exports 只开了 `.` / `./tools` / `./contract-tests`，裸 spec 那条路会 ERR_PACKAGE_PATH_NOT_EXPORTED。
+  if (out.source === 'unknown') {
+    const root = packageDir ?? path.resolve(HERE, '..');
+    const runnerVersion = readVersion(path.join(root, 'package.json'));
+    if (runnerVersion) {
+      out.runnerVersion = runnerVersion;
+      const engineVersion = readVersion(path.join(root, 'node_modules', 'erix-agent', 'package.json'));
+      if (engineVersion) out.agentVersion = engineVersion;
+      out.source = 'package';
+    }
+  }
+
+  // ① 显式 override 最高
+  const override = s(env.ERIX_AGENT_VERSION);
+  if (override) {
+    out.agentVersion = override;
+    out.source = 'env';
+  }
+  return out;
+}
