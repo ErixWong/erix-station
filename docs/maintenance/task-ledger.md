@@ -7597,6 +7597,11 @@ C 族「实例属性/改名 ⇒ compose 腿不适用」4 条 —— `ERIX_STATIO
 ③ `node --test test/integration-e2e-preflight.test.js` ⇒ rc=0（39 / 39 / 0）；
 ⑤ `node portal/integration/isolation-negative.mjs --strict` ⇒ rc=0，`grep -c 'TRAP OK'` = **19**，`verdict=TRAPS_FIRED`；
 ⑥ `npm run check:agents-hotlayer` ⇒ rc=0（热层 18706 / 预算 19456，条目 146 无重复编号）。
+④ **根 `npm test`**（本单动了 `test/**` ⇒ 不在「只动 `portal/test/**` + `deploy/*.json`」的免跑口径里）⇒ rc=**0**：
+`# tests 2678 / # pass 2628 / # fail 0 / # skipped 50`，`grep -c '^not ok'` = **0**。skipped 全是
+`TEST_DATABASE_URL 未设置` 的真库用例（无 PG 整体跳过，不是本单带来的）。
+随带记一条边界：新增的 `test/lib/js-source.mjs` 会被 `node --test` 当成一个**零测试的测试文件**计入
+（`ok 192 - test/lib/js-source.mjs`），与 `portal/test/fake-pool.js` 那批 helper 同形 —— 既有口径，不是新洞。
 
 ### 8.142 事件平台 W3 落地 + 迁移让号 0037 + 迁移编号撞车的处理口径（#526，2026-11-16，主 agent + erix_run）
 
