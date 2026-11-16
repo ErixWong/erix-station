@@ -1234,7 +1234,7 @@ test('I10 判据5/6 端点面：activity=1 的越权仍是 404 不泄露存在�
   } finally { await h.close(); }
 });
 
-test('I11 activity 的读面只有 .jsonl 的 stat+readFile（不新增别的盘动作、不写盘）', async () => {
+test('I11 activity 的读面只有 .jsonl 的 stat + 有界读（无上限 readFile 出局；不写盘）', async () => {
   const h = await makeHarness({
     roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1, state: 'running' })]],
     transcripts: { [CHILD_1]: partOfActivityLedger(CHILD_1) },
