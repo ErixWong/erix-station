@@ -14,7 +14,7 @@
 //   • 平台侧引擎 = 同一份的 `engine_version`（在 `agentVersion` 格里）
 //   • 每台 FDE 的引擎 = `containers.agent_version`（**派生副本**，不本函数管，见 `version-info.js`）
 
-/* --- 以下为 runner/lib/build-info.js 的原文逐字副本（`portal/test/version-surface.test.js` 比对锈）--- */
+// --- 以下为 runner/lib/build-info.js 的原文逐字副本（`portal/test/version-surface.test.js` 逐字比对）---
 
 // issue #404 结案：容器里跑的「版本」必须是**构建产物**，不是运维旋钮。
 //
