@@ -346,7 +346,10 @@ test('D7 默认开：ERIX_DELEGATE_ENABLED 未设 ⇒ 照常装配；显式非 1
     '开关必须走 lib/config.js 的唯一口径（agentd 读的是同一个函数）');
   assert.match(src, /const tools = \[\.\.\.baseToolSchemas, \.\.\.\(delegation !== null \? \[delegation\.definition\] : \[\]\)\];/,
     '关掉时工具面必须逐字等于 baseToolSchemas（2065 字节的 schema 一个字节都不许多带）');
-  assert.match(src, /if \(delegateEnabled\) \{/, '装配必须整段被开关圈住（显式关 ⇒ 连目录都不碰）');
+  // issue #537（审查 run 只读装配）把这道门扩成 `delegateEnabled && !reviewOnly`：开关仍然是**唯一**
+  // 决定 delegate 装配的变量之一，审查 run 只是额外关掉它。判据跟着走成合取式，意图不变
+  // （显式关 ⇒ 连目录都不碰）；写死成旧形状会让 D7 在 #537 之后恒红（2026-11-16 main 实际就是红的）。
+  assert.match(src, /if \(delegateEnabled && !reviewOnly\) \{/, '装配必须整段被开关圈住（显式关 ⇒ 连目录都不碰）');
 });
 
 test('D7c 显式关：ERIX_DELEGATE_ENABLED=0 ⇒ 工具面逐字等于今天（2065 字节 schema 一个字节都不多带）', () => {
