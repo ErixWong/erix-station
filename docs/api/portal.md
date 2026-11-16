@@ -3045,7 +3045,7 @@ Content-Type: application/json
 | `addendum.text` / `agentsMd.override` / `titlePrompt.text` | DB 里的当前值（`""` = 跟随内置）。读侧**不做长度校验**：手工 `UPDATE` 进来的超长值**照用**（换成内置会让管理台显示的和实际生效的对不上）|
 | `*.isDefault` | 该格是否在跟随内置（`= (text === '')`）—— 「来源」不许靠 UI 猜 |
 | `agentsMd.isOverridden` | `override !== ''`。页面要显式标「已偏离内置模板」并给「恢复内置」按钮 |
-| `agentsMd.templateBytes` / `effectiveBytes` | 都是**按固定示例工位名 `example` 渲染的整份文件字节数**：默认态下逐数相同，覆写/追加后的差值就是净变化 |
+| `agentsMd.templateBytes` / `effectiveBytes` | 都是**按固定示例工位名 `example` 渲染的整份文件字节数**：默认态下逐数相同，覆写/追加后的差值就是净变化。⚠ 这是**预览**口径；**写侧闸不是这个名**，见 §4.16-3 |
 | `agentsMd.effectiveText` | 同一份「现在生效的全文」，用固定示例名 `example` 渲染 ⇒ **零时间戳、零 run id**（页面要能对比文本、测试要能断言；这份文本会进模型请求的 system 位，动态量会让 prompt 缓存整条失效）|
 | `*.maxBytes` | 该格的**写侧**上限（8192 / 16384 / 2000）。DB 里没有 CHECK，这里才是闸 |
 | `agentsMd.renderedLimitBytes` | 注入侧对**整份** `~/AGENTS.md` 的上限（= `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES`，跨包对账由判据 `P9` 钉住，不许手抄）|
@@ -3100,6 +3100,17 @@ Content-Type: application/json
 
 两条闸报出的 `details` 逐字同形；SQL 里那段算术与真渲染的等价性由判据 `P6b` 逐组钉住（常量由 JS
 当参数送进 SQL，SQL 里不抄数字，口径同 §4.15-4 的 `$5/$6`）。
+
+⚠ **闸里的标识行按最坏情况算，不按示例名算**（评审 F2）：标识行是 `（FDE 标识：<fdeName>）`，而保存时
+不知道这份文件会渲染给哪些工位（全部启用中的都要重物化），所以预算取**最长合法工位名**：
+长度从 `projects.js` 的 `FDE_NAME_RE` 单一真相导出（`FDE_NAME_MAX_LEN`，现算不抄 `63`；那个字符集
+只有 ASCII `[a-z0-9-]` ⇒ 字符数 ≡ 字节数）。拿 `example`（7 字符）卡 16 KiB 会放进一批「今天没超、
+下一个长名工位一渲染就超」的输入，而超那一档的后果正是上面那句**静默截断** —— 写侧闸存在的理由
+就是它，不能自己留一个 56 字节的洞。
+**两份名字各自服务一件事**：写侧闸用最长合法名（`materializer.js#agentsMdGateRenderBudget`），
+DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的预览，要短要好看）。
+判据：`P13`（造一组「示例名装得下、最坏名装不下」的输入 ⇒ 必须 400 且一格不写，并钉 SQL 送参里
+那份标识行字节就是最坏情况那一份）。
 
 #### 4.16-4 `materializeEnqueued` 与生效时机
 

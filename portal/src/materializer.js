@@ -14,6 +14,9 @@ import {
   commitTempFile,
 } from './fsutil.js';
 import { OBSERVATION_FRESHNESS_SECONDS } from './portalloc.js';
+// 写侧渲染闸要按「最长合法工位名」算标识行（评审 F2）：长度只有 `FDE_NAME_RE` 一份真相，
+// 它在 `projects.js`（与本文件无循环引用：那边只 import `previewpool.js`）⇒ 这里只拿长度，不拿正则。
+import { FDE_NAME_MAX_LEN } from './projects.js';
 // issue #596 片 A：`~/AGENTS.md` 的追加段 / 覆写段来自 `platform_prompts`。
 // ⚠ 这是一对**双向引用**（`platform-prompts.js` 要从本文件拿渲染器与渲染预算）。两边都**只在函数体里**
 //   用对面导出的东西（模块求值期不读）⇒ ESM 循环引用安全；把它改成顶层常量就会碰到 TDZ。
@@ -317,10 +320,14 @@ export function renderHomeAgentsMd({ fdeName, addendum = '', override = '' } = {
  * 算术（`agentsMdRenderedBytes`）与真渲染（`renderHomeAgentsMd`）的等价性由
  * `portal/test/platform-prompts.test.js` 的 P6b 逐组钉住，不是靠注释声明。
  *
- * ⚠ `fdeName` 用**固定示例名**（默认 `example`）：标识行的长度随工位名变化，而写侧在保存时**不知道**
- * 会渲染给哪些工位（全部启用中的 FDE 都要重物化）。取固定名 ⇒ 闸是确定的、可测的、与 DTO 里
- * `effectiveText` 同一名（口径：契约 §6）。真实工位名的差异只有标识行的几个字节，
- * 而闸留的是「8 KiB 追加段 + 9 KiB 模板」这一档余量，不靠这几个字节兜底。
+ * ⚠ **两种名字，两种用途**（评审 F2，口径：契约 §4）：
+ *   * **预览**（DTO 的 `effectiveText` / `templateBytes`）用示例名 `AGENTS_MD_EXAMPLE_FDE_NAME`：
+ *     那是给人看的一份样例，要短要好看。
+ *   * **写侧闸**用**最长合法工位名**（`agentsMdGateRenderBudget()`）：保存时不知道这份文件会渲染给
+ *     哪些工位，而标识行长度随工位名变（`example` 7 字符 vs 合法上限 63 字符 ⇒ 56 字节的洞）；
+ *     拿示例名卡 16 KiB 会放进一些「今天没超、下一个 63 字符的工位一渲染就超」的输入，
+ *     而超那一档的后果是注入侧**静默截断**（写侧闸存在的全部理由）。长度从
+ *     `projects.js` 的 `FDE_NAME_RE` 单一真相导出（`FDE_NAME_MAX_LEN`），这里不抄 `63`。
  */
 export function agentsMdRenderBudget({ fdeName = AGENTS_MD_EXAMPLE_FDE_NAME } = {}) {
   const sepBytes = Buffer.byteLength(AGENTS_MD_SECTION_SEPARATOR);
@@ -333,6 +340,22 @@ export function agentsMdRenderBudget({ fdeName = AGENTS_MD_EXAMPLE_FDE_NAME } = 
     // 尾部：分隔 + 标识行 + 文件末尾那个换行。
     identityTailBytes: sepBytes + Buffer.byteLength(agentsMdIdentityLine(fdeName)) + 1,
   };
+}
+
+/**
+ * 写侧渲染闸用的那份预算：标识行按**最长合法工位名**算（评审 F2）。
+ *
+ * 名字现算不存常量：`FDE_NAME_MAX_LEN` 是跨模块绑定，而本模块与 `platform-prompts.js` 互相 import
+ * ⇒ 顶层读对面的名字就是 TDZ 风险（口径见 `platform-prompts.js` 头注释与本仓 `P11`）。
+ * `FDE_NAME_RE` 只允许 ASCII `[a-z0-9-]` ⇒ 字符数 ≡ 字节数，重复那么多个 `a` 就是字节上的最坏情况。
+ */
+export function agentsMdGateFdeName() {
+  return 'a'.repeat(FDE_NAME_MAX_LEN);
+}
+
+/** 写侧渲染闸的预算（与 `agentsMdRenderBudget` 同形状，只有标识行那一档不同）。 */
+export function agentsMdGateRenderBudget() {
+  return agentsMdRenderBudget({ fdeName: agentsMdGateFdeName() });
 }
 
 /** 按预算常量算「渲染后的整份文件字节数」（与 `renderHomeAgentsMd` 同口径，P6b 钉等价性）。 */
