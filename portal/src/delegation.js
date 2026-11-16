@@ -81,7 +81,7 @@ export const LIVE_ROSTER_STATES = Object.freeze(new Set(['queued', 'running']));
  */
 export const TERMINAL_RUN_STATUSES = Object.freeze(new Set(['finished', 'failed']));
 
-/** `#593`：`activity.args` / `activity.text` 的字符上限（码点数；超长末位补 `…`）。 */
+/** `#593`：`activity.args` / `activity.text` 的**正文**上限（码点数；被截断时另加末位 `…` ⇒ 总长最多 121）。 */
 export const ACTIVITY_SNIPPET_MAX_CHARS = 120;
 
 /** 会话 id 的形状（与 `sessions.js#UUID_RE` 同一条尺，那边没导出 ⇒ 这里第二份，由 `J5` 钉行为）。 */
@@ -95,9 +95,13 @@ function assertShape(value, re, field, label) {
 }
 
 /**
- * `#593`：文本片段上限（与上游 `projection.js#MAX_ARGS_PREVIEW` 同值 120）。
+ * `#593`：`activity.args` / `activity.text` 的截断口径（**说清楚，别让人猜**）：
+ *   · **正文**最多 `ACTIVITY_SNIPPET_MAX_CHARS` = **120 个码点**（与上游 `projection.js#MAX_ARGS_PREVIEW` 同值）；
+ *   · 被截断时**末尾补一个 `…`** ⇒ 返回串的**总长最多 121 个码点**（120 正文 + 1 省略号），
+ *     与上游 `truncated()` 完全同形；没超限 ⇒ 原样返回（不 trim 掉用户自己的空白之外的东西，只去首尾空白）。
+ *   · 上游给的 `argsSummary` 本身已是「≤120 + `…`」的形状 ⇒ 这里再过一道是幂等的。
  * ⚠ 按**码点**数截（`Array.from`）而不是 `.length`：`.length` 数 UTF-16 单元，一个 emoji / 生僻字
- * 算两个 ⇒ 同样标称 120 的上游 `argsSummary` 会被我们再切短一截。
+ * 算两个 ⇒ 同样标称 120 的上游 `argsSummary` 会被我们再切短一截，还可能把代理对切成半个（乱码）。
  */
 function clipSnippet(value, max = ACTIVITY_SNIPPET_MAX_CHARS) {
   const text = typeof value === 'string' ? value : String(value ?? '');
