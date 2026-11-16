@@ -1413,3 +1413,81 @@ test('迁移 0039-capability-market：三表齐全、包内容按 (item,version)
   assert.doesNotMatch(executable, /\bDROP (TABLE|COLUMN|INDEX)\b/, '不许 DROP（改表形态是改形状，另开一支迁移）');
   assert.doesNotMatch(executable, /INSERT INTO|DELETE FROM/, '末尾 DO 块只读：出现 INSERT/DELETE 就不计成本重放（README）');
 });
+
+// ---------------------------------------------------------------------------
+// 0039 之后补的**通用形状闸**（不是某支迁移的语义判据）：RAISE 的格式串
+// ---------------------------------------------------------------------------
+
+/** 剥掉 `--` 行注释与块注释（注释里写的 `RAISE … || …` 不该被抓）。 */
+function stripSqlComments(sql) {
+  return sql.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ');
+}
+
+/** 把单引号字面量折成一个占位符：这样「字面量文本里含 ||」不会被误判成拼接。 */
+function squashLiterals(sql) {
+  return sql.replace(/'(?:[^']|'')*'/g, " \u0000 ");
+}
+
+/**
+ * 找出「`RAISE <级别> 'a' || 'b', args`」这种写法。
+ * 为什么这是一条**必须存在**的闸（issue #595 真机实测）：PL/pgSQL 的 RAISE 第一个参数必须是
+ * **字面量格式串**，写 `'a' || 'b', n` 会在解析期就 `syntax error at or near "||"` ⇒ 整支迁移回滚 ⇒
+ * **镜像起不来**。0039 首跑正是这条（`0039: capability_items=% …' || '（全 0 = …）', n_items, …`）。
+ * 它是「没人真跑过」的典型形状：文件从没被 migrate runner 应用过，文本断言又全在讲 DDL ⇒ 全绿照过。
+ * 所以这条闸只管**形状**（RAISE 到第一个逗号之间不许有 `||`），不管语义，扫的是全部增量迁移。
+ * @returns {string[]} 每条命中给一段可定位的片段
+ */
+function raiseFormatConcat(sql) {
+  const scannable = squashLiterals(stripSqlComments(sql));
+  const hits = [];
+  const re = /\bRAISE\b(?:\s+(NOTICE|EXCEPTION|WARNING|INFO|DEBUG|LOG|SQLSTATE)\b)?([^;]*)/gi;
+  let m;
+  while ((m = re.exec(scannable)) !== null) {
+    const rest = m[2] ?? '';
+    const comma = rest.indexOf(',');
+    const formatPart = comma === -1 ? rest : rest.slice(0, comma);
+    if (formatPart.includes('||')) {
+      hits.push(`RAISE ${(m[1] ?? '<级别>')} ${formatPart.trim().slice(0, 80)}`);
+    }
+  }
+  return hits;
+}
+
+test('迁移形状闸：RAISE 的格式串必须是单个字面量（\'a\' || \'b\', args 在 PL/pgSQL 是语法错）', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.length >= 39, `迁移条数异常：${files.length}`);
+  const bad = [];
+  for (const f of files) {
+    for (const hit of raiseFormatConcat(fs.readFileSync(path.join(dir, f), 'utf8'))) bad.push(`${f}: ${hit}`);
+  }
+  assert.deepEqual(bad, [],
+    `RAISE 的格式串不许写成拼接（迁移会在解析期炸并整支回滚）：\n${bad.join('\n')}`);
+
+  // 反向自证：0039 首跑那条真机报错的形状必须被判不合格，否则这条闸就是恒真的。
+  // 首条 = 当时文件里的**逐字形状**（源：`git show 0888aec:deploy/migrations/0039-capability-market.sql`，
+  // 即主 agent 修之前的那一版）：本闸已拿那份原文跑过⇒命中 1 条；换成单字面量后⇒clean。
+  const offenders = [
+    `RAISE NOTICE '0039: capability_items=% / capability_files=% / fde_capability_installs=% 行'\n    || '（全 0 = 市场未发布，capabilities.json 将渲染成 {"version":1,"skills":[]}）',\n    n_items, n_files, n_installs;`,
+    `RAISE NOTICE 'a=% ' || 'b' || 'c', v;`,                                          // 多段拼接
+    `DO $$ BEGIN RAISE WARNING 'p=%' || 'q', v; END $$;`,                             // 藏在 DO 块里
+    `RAISE 'x' || 'y';`,                                                               // 省略级别（缺省 EXCEPTION）
+  ];
+  offenders.forEach((sql, i) => assert.equal(raiseFormatConcat(sql).length, 1,
+    `违规样本 ${i} 必须恰好被判一次不合格：${sql}`));
+
+  // 合法形状不许误伤：闸只管「格式串」那一段，参数里出现 `||` 是合法的。
+  [
+    `RAISE NOTICE 'a=%', n;`,
+    `RAISE NOTICE 'a=% / b=%', x || 'z', y;`,            // 拼接在**参数**里 ⇒ 合法
+    `RAISE NOTICE '文本里含 || 也只是普通字符';`,          // 字面量内部的 ||
+    `-- 注释里写 RAISE NOTICE 'a' || 'b', n; 不算\nRAISE LOG 'ok %', v;`,
+    `/* 块注释里同理 RAISE NOTICE 'a' || 'b'; */ RAISE INFO 'ok';`,
+    `EXCEPTION WHEN OTHERS THEN RAISE; END;`,            // 重抛（没有格式串）
+  ].forEach((sql, i) => assert.deepEqual(raiseFormatConcat(sql), [], `合法样本 ${i} 被误伤：${sql}`));
+
+  // 0039 那一条本身：必须保持「单字面量 + 三个参数」（别被下一个人"顺手美化"回拼接）
+  const m39 = fs.readFileSync(path.join(dir, '0039-capability-market.sql'), 'utf8');
+  assert.match(m39, /RAISE NOTICE '[^']*'\s*,\s*\n?\s*n_items, n_files, n_installs;/s,
+    '0039 收尾的 DO 块 NOTICE 必须是单字面量格式串 + 三个参数');
+});
