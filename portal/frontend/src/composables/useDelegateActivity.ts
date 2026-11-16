@@ -226,6 +226,10 @@ export function useDelegateActivity(options: UseDelegateActivityOptions) {
    * 「⚪ 不得渲染成绿」同一条口径（没证据就没资格下那个结论）。
    */
   const degraded = computed(() => error.value && !loaded.value);
+  // ⚠ **取舍（裁定口径）**：`!loaded` 是故意的——**读到过终态、零活态 ⇒ 静默**，不再拿灰字打扰。
+  // 那时候界面上本来就没有要报的东西（终态子 run 归工具卡），而「读得到、且真的没儿子」已是
+  // 一个完整答案；只有**一次都没读到过**才存着「我不知道」这笔账。所以「已读到过东西后连续失败」
+  // 不降级是设计而非缺陷（面板靠 `error` 在**已有行**上补一行灰字，入口仍然存在）。
   /** 面板要不要挂：拉到过东西，或已经降级到「暂不可读」那句。 */
   const hasRows = computed(() => items.value.length > 0 || error.value);
 
@@ -340,13 +344,18 @@ export function useDelegateActivity(options: UseDelegateActivityOptions) {
    *
    * ⚠ **终态行必须定格**：`endedAt` 是有限数且不早于 `createdAt` ⇒ 用 `endedAt - createdAt`。
    * 只用共享的 1s 时钟减 `createdAt` 的话，一个子 completed、另一个还在跑时，终态那一行的
-   * 「已跑 Ns」会跟着时钟一路涨上去（跑得越久越假）。脏值（`endedAt < createdAt`）当没有，
-   * 回落到时钟（宁可走表，不拿不认识的值去冒充定论）。
+   * 「已跑 Ns」会跟着时钟一路涨上去（跑得越久越假）。
+   *
+   * ⚠ **终态但拿不到 `endedAt` ⇒ 整段不出**（裁定：不回落时钟）。引擎 `finishRun` / `reconcile` 都会写
+   * `endedAt`，所以这只在脏记录/引擎变更时可达；而「已结束却还在涨」是拿假数据填空白——宁可不说。
+   * 活态行（含脏 state 的中性态）仍用客户端时钟；脏 `endedAt`（早于 `createdAt`）当没有。
    */
   function elapsedMs(item: DelegateActivityItem): number | null {
     if (item.createdAt === null) return null;
-    const ended = item.endedAt !== null && item.endedAt >= item.createdAt ? item.endedAt : null;
-    const delta = (ended ?? nowMs.value) - item.createdAt;
+    const endedAt = item.endedAt !== null && item.endedAt >= item.createdAt ? item.endedAt : null;
+    // 终态行没有可用的结束时刻 ⇒ 整段不出（**不回落时钟**）；宁可不说，不说一个在涨的假时长。
+    if (endedAt === null && isDelegateTerminal(item.state)) return null;
+    const delta = (endedAt ?? nowMs.value) - item.createdAt;
     return Number.isFinite(delta) && delta >= 0 ? delta : null;
   }
 

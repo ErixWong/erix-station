@@ -352,7 +352,7 @@ describe('归一化与徽标计数', () => {
     queueResponses(ok(rosterBody(
       rosterItem({ childRunId: 'sub-done-1', state: 'completed', createdAt: 1_700_000_000_000, endedAt: 1_700_000_030_000 }),
       rosterItem({ childRunId: 'sub-live-1', state: 'running', createdAt: 1_700_000_000_000, endedAt: null }),
-      // 脏值：endedAt 早于 createdAt ⇒ 当没有，回落到共享时钟（不拿不认识的值冒充定论）。
+      // 脏值：endedAt 早于 createdAt ⇒ 不可用；而这一行是**终态**（failed）⇒ 整段不出（裁定 2）。
       rosterItem({ childRunId: 'sub-bad-1', state: 'failed', createdAt: 1_700_000_000_000, endedAt: 999 }),
     )));
     const { handle } = setup({ cards: [delegateCard()] }); // pending 卡 ⇒ 时钟与轮询都继续
@@ -360,12 +360,37 @@ describe('归一化与徽标计数', () => {
     const [done, live, dirty] = handle.items.value;
     expect(handle.elapsedMs(done)).toBe(30_000); // 定格在 endedAt - createdAt
     expect(handle.elapsedMs(live)).toBe(42_000);
-    expect(handle.elapsedMs(dirty)).toBe(42_000);
+    expect(handle.elapsedMs(dirty)).toBeNull();
 
     await tick(3_000); // 3 拍
     expect(handle.elapsedMs(done), '终态行不许跟着共享时钟涨').toBe(30_000);
     expect(handle.elapsedMs(live)).toBe(45_000);
-    expect(handle.elapsedMs(dirty)).toBe(45_000);
+    expect(handle.elapsedMs(dirty)).toBeNull();
+  });
+
+  it('裁定 2：**终态但 `endedAt` 缺失 ⇒ 整段不出时长**（不回落时钟；活态行仍用时钟）', async () => {
+    vi.setSystemTime(1_700_000_042_000);
+    queueResponses(ok(rosterBody(
+      rosterItem({ childRunId: 'sub-noend', state: 'completed', createdAt: 1_700_000_000_000, endedAt: null }),
+      rosterItem({ childRunId: 'sub-live-2', state: 'running', createdAt: 1_700_000_000_000, endedAt: null }),
+    )));
+    const { handle } = setup({ cards: [delegateCard()] });
+    await tick(0);
+    const [terminal, live] = handle.items.value;
+    expect(handle.elapsedMs(terminal), '拿不到结束时刻就不说，而不是给一个在涨的假时长').toBeNull();
+    expect(handle.elapsedMs(live)).toBe(42_000);
+
+    await tick(4_000);
+    expect(handle.elapsedMs(terminal)).toBeNull(); // 连拍也不复活
+    expect(handle.elapsedMs(live)).toBe(46_000);
+  });
+
+  it('裁定 2 反面：**脏 state（既非活态也非终态）不拿终态口径处理**⇒ 仍按时钟（中性态不是「已结束」）', async () => {
+    vi.setSystemTime(1_700_000_042_000);
+    queueResponses(ok(rosterBody(rosterItem({ childRunId: 'sub-weird', state: 'waiting_for_ghosts', endedAt: null }))));
+    const { handle } = setup({ cards: [delegateCard()] });
+    await tick(0);
+    expect(handle.elapsedMs(handle.items.value[0])).toBe(42_000);
   });
 
   it('已跑时长用 createdAt + 客户端时钟；createdAt 缺席 ⇒ null（不画 0s 假时长）', async () => {
