@@ -30,6 +30,8 @@ import {
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 /** 真实 EACCES 复现不了（属主就是自己）⇒ 用注入的 fsImpl 造 EACCES。 */
 const EACCES = () => Object.assign(new Error('permission denied'), { code: 'EACCES' });
+/** 造一个「既不是缺失也不是权限」的 errno（第三轮 MED 的注入面：`EIO` 不许被塞进那两个桶）。 */
+const errnoOf = (code) => Object.assign(new Error(`${code}: probe failed`), { code });
 const noSleep = async () => {};
 
 /** 一个临时的「userspace 子树」夹具：`<root>/<fde>/home/.erix/config.json`（权限照抄真机 0770/0644）。 */
@@ -785,6 +787,154 @@ test('#495② X4 叶子无 `R_OK` ⇒ 仍 unreadable（现有语义不退），�
   assert.equal(real.state, 'unreadable', '真 chmod 000 的叶子 ⇒ 仍 unreadable（第一轮 P5b 的语义不退）');
   assert.equal(real.blocker.path, leaf);
   assert.equal(real.blocker.missingAccess, 'R_OK');
+});
+
+// ---------------------------------------------------------------------------
+// 第三轮 MED：errno 分类——「既不是缺失也不是权限」的错别再被二选一
+//
+// 三个探测点（走查里的 `statSync`、走查里的 `accessSync`、末段 `readFileSync`）以前各写一遍 if，于是
+// `EIO`/`ELOOP`/`ENAMETOOLONG` 被**就近**塞进两个桶：`statSync→EIO` 落 `missing`（文案喊「还没物化」并干等到
+// 超时），`accessSync→EIO` 落 `unreadable`+`no-permission`（文案喊「读不到」并提前放弃）。现在五处调用点
+// （再加 `lstatSync` 与 ① 的预检）只过 `classifyProbeErrno` 那一张表：`ENOENT`/`ENOTDIR` ⇒ `missing`；
+// `EACCES`/`EPERM` ⇒ `unreadable`；**其它 ⇒ 已有的 `unknown` 出口**（不是第五态）。
+// 旁证同口径：`targetExists` 以前是 `Boolean(statOrNull(...))`，把 `EACCES` 与 `ENOENT` 压成同一个 `false`
+// ⇒ 目标目录只是没 `x`（`0o444`）时文案敢说「缺的是链接目标」。现在 `false` 只给真 `ENOENT`/`ENOTDIR`。
+// ---------------------------------------------------------------------------
+
+/** 真夹具：`<base>/link -> target/inner`，而 `target` 目录**有 `r` 没 `x`**（`0o444`）。 */
+function fixtureUntraversableTargetDir(t) {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-495c-t3-')));
+  const target = path.join(base, 'target');
+  fs.mkdirSync(target, { recursive: true });
+  const inner = path.join(target, 'inner');
+  fs.writeFileSync(inner, '{"ok":1}');
+  const link = path.join(base, 'link');
+  fs.symlinkSync(path.relative(base, inner), link);
+  fs.chmodSync(target, 0o444);
+  t.after(() => {
+    fs.chmodSync(target, 0o755);
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+  return { base, target, inner, link };
+}
+
+/** 「缺的是**链接目标**」那一句（文案里带粗体星号，正则要逐字 esc）。 */
+const MISSING_TARGET_CLAIM = /缺的是\*\*链接目标\*\*/;
+
+test('#495③ T1 statSync 报 EIO ⇒ unknown（既不许说「没物化」也不许说「没权限」）', async (t) => {
+  const { file } = fixtureUserspace(t);
+  const fake = { ...fs, statSync: (p) => { if (p === file) throw errnoOf('EIO'); return fs.statSync(p); } };
+  const chain = inspectHostPathChain(file, { fsImpl: fake });
+  assert.equal(chain.blocker, null, 'EIO 不是权限 ⇒ 不许端出 blocker{no-permission}');
+  assert.equal(chain.missingPrefix, null, 'EIO 不是缺失 ⇒ 不许把探不到写成「还没物化」');
+  assert.equal(chain.unknown?.code, 'EIO', `errno 必须原样交回：${JSON.stringify(chain.unknown)}`);
+  assert.equal(chain.unknown?.probe, 'statSync', '要点名是哪一次探测探不到');
+  assert.equal(chain.unknown?.path, file);
+
+  const observed = observeHostPath(file, { fsImpl: fake });
+  assert.equal(observed.state, 'unknown', '第三支走**已有的** unknown 出口（不是新增第五态）');
+  assert.equal(observed.error?.code, 'EIO');
+  assert.equal(observed.blocker, null);
+  assert.ok(observed.links.length >= 3, `unknown 也要把逐段事实带上：${JSON.stringify(observed.links.map((e) => e.segment))}`);
+
+  const err = await waitForHostFile(file, {
+    fsImpl: fake, timeoutMs: 5, intervalMs: 1, sleepImpl: noSleep, label: 'eio config.json',
+  }).then(() => null, (error) => error);
+  assert.ok(err, '探不到 ⇒ 最终也要拒绝（不能默默返回空）');
+  const m = String(err.message);
+  assert.match(m, /无法归类/);
+  assert.match(m, /EIO/, '要把 errno 写在脸上（而不是替它选一个归因）');
+  assert.doesNotMatch(m, /读不到|FDE_USER_UID|第一段就不存在/, '不许替 EIO 编出「没物化」或「没权限」');
+});
+
+test('#495③ T2 accessSync 报 EIO ⇒ unknown（以前被一律归成「权限」）', (t) => {
+  const { file } = fixtureUserspace(t);
+  const fake = {
+    ...fs,
+    accessSync: (p, mode) => { if (p === file) throw errnoOf('EIO'); return fs.accessSync(p, mode); },
+  };
+  const chain = inspectHostPathChain(file, { fsImpl: fake });
+  assert.equal(chain.blocker, null, 'accessSync 报 EIO 不许落进 no-permission');
+  assert.equal(chain.missingPrefix, null);
+  assert.equal(chain.unknown?.probe, 'accessSync', `要点名是哪一次探测：${JSON.stringify(chain.unknown)}`);
+  assert.equal(chain.unknown?.code, 'EIO');
+  const observed = observeHostPath(file, { fsImpl: fake });
+  assert.equal(observed.state, 'unknown', '同一个 errno 在两个探测点必须同口径（这正是「一张表」要拦的事）');
+  assert.equal(observed.error?.code, 'EIO');
+});
+
+test('#495③ T3 真夹具：链接目标目录有 r 没 x（0o444）⇒ unreadable 且文案不许说「缺的是链接目标」', async (t) => {
+  const { target, inner, link } = fixtureUntraversableTargetDir(t);
+  // 注入版先行（root 机也可跑）：`stat` 跟随链接穿过没 `x` 的目标目录 ⇒ 与真机同形
+  const injected = { ...fs, statSync: (p) => { if (p === inner || p === link) throw EACCES(); return fs.statSync(p); } };
+  const injObserved = observeHostPath(link, { fsImpl: injected });
+  assert.equal(injObserved.state, 'unreadable', '注入版：目标目录不可穿越 ⇒ unreadable');
+  assert.equal(injObserved.link.isSymlink, true);
+  assert.equal(injObserved.link.targetExists, null, '探不到必须是 null，不是 false（false 只能是真的 ENOENT/ENOTDIR）');
+  assert.doesNotMatch(formatLastSegmentLinkLine(injObserved.link), MISSING_TARGET_CLAIM,
+    `探不到不许说成缺目标：${formatLastSegmentLinkLine(injObserved.link)}`);
+  assert.match(formatLastSegmentLinkLine(injObserved.link), /探不到/);
+  const injErr = await waitForHostFile(link, {
+    fsImpl: injected, timeoutMs: 60_000, intervalMs: 5, sleepImpl: noSleep, label: 'injected 0444 config.json',
+  }).then(() => null, (error) => error);
+  assert.ok(injErr);
+  assert.doesNotMatch(String(injErr.message), MISSING_TARGET_CLAIM, '失败文案也不许声称目标缺失');
+
+  if (isRootUid()) {
+    t.skip('注入版已过；真 chmod 0444 那半格在 root 机上不可达（CAP_DAC_OVERRIDE ⇒ root 照样能穿）');
+    return;
+  }
+  // 夹具自证：目录**能列**（有 r）但**穿不过**（没 x）⇒ 本格的形状真的成立
+  assert.equal(fs.lstatSync(target).mode & 0o777, 0o444, '夹具自证：target 必须真是 0o444');
+  assert.deepEqual(fs.readdirSync(target), ['inner'], '夹具自证：r 还在 ⇒ 能列目录');
+  assert.throws(() => fs.statSync(link), (error) => {
+    assert.equal(error.code, 'EACCES', `这台机器上「穿不过去」必须真是 EACCES：${error?.code}`);
+    return true;
+  });
+
+  const observed = observeHostPath(link);
+  assert.equal(observed.state, 'unreadable', '目标目录不可穿越 ⇒ unreadable（不是 missing）');
+  assert.equal(observed.link.isSymlink, true, '链接事实继续带上');
+  assert.equal(observed.link.resolvedTarget, inner, '仍要点名目标');
+  assert.equal(observed.link.targetExists, null, '判据：只是探不到 ⇒ null（旧写法 Boolean(statOrNull) 会给它 false）');
+  const err = await waitForHostFile(link, {
+    timeoutMs: 60_000, intervalMs: 5, sleepImpl: noSleep, label: 'unreadable target config.json',
+  }).then(() => null, (error) => error);
+  assert.ok(err);
+  const m = String(err.message);
+  assert.match(m, /够不到|读不到/);
+  assert.doesNotMatch(m, MISSING_TARGET_CLAIM, '判据：目标目录只是没 x ⇒ 文案不许说「缺的是链接目标」');
+  assert.match(m, /探不到/, '要诚实说这次探不到');
+  assert.ok(m.includes(inner), `仍要点名目标路径：${m}`);
+});
+
+test('#495③ T4 readlinkSync 报 EACCES ⇒ 不许声称目标缺失（末段与链上段两形）', (t) => {
+  const { root, dir, file } = fixtureUserspace(t);
+  // 末段是链接：readlink 读不出 ⇒ 「目标存不存在」只能是从无判定
+  const link = path.join(dir, 'link-readlink-eacces.json');
+  fs.symlinkSync(path.relative(dir, file), link);
+  const fakeLeaf = { ...fs, readlinkSync: (p) => { if (p === link) throw EACCES(); return fs.readlinkSync(p); } };
+  const observed = observeHostPath(link, { fsImpl: fakeLeaf });
+  assert.equal(observed.state, 'present', 'stat 能跟随到真文件 ⇒ 状态不退（本格钉的是旁证，不是三态）');
+  assert.equal(observed.link.isSymlink, true, 'lstat 看得见 ⇒ 「是链接」这件事还在');
+  assert.equal(observed.link.target, null, 'readlink 失败 ⇒ 目标只能是 null（不许编）');
+  assert.equal(observed.link.targetExists, null, '判据：目标读不出 ⇒ 「在不在」是从无判定，不是 false');
+  const line = formatLastSegmentLinkLine(observed.link);
+  assert.match(line, /符号链接/);
+  assert.match(line, /目标读不出/);
+  assert.doesNotMatch(line, MISSING_TARGET_CLAIM, `不许把「读不出目标」说成「目标缺失」：${line}`);
+
+  // 链上段是链接：同一件事必须在祖先那一行也成立
+  const mount = path.join(root, 'mount-readlink-eacces');
+  fs.symlinkSync(path.relative(root, dir), mount);
+  const viaMount = path.join(mount, 'config.json');
+  const fakeAnc = { ...fs, readlinkSync: (p) => { if (p === mount) throw EACCES(); return fs.readlinkSync(p); } };
+  const ancObserved = observeHostPath(viaMount, { fsImpl: fakeAnc });
+  assert.equal(ancObserved.state, 'present', '祖先段是链接 ⇒ 三态归属一个字不改');
+  const ancLine = formatAncestorLinkLines(ancObserved.links);
+  assert.match(ancLine, /链上第一段符号链接（不是末段）：/, '祖先那一段的链接事实仍要点名');
+  assert.match(ancLine, /目标读不出/);
+  assert.doesNotMatch(ancLine, MISSING_TARGET_CLAIM, `链上段也不许声称缺目标：${ancLine}`);
 });
 
 test('#495 接线静态自检：脚本必须在**任何 docker 之前**做预检（源码级）', () => {
