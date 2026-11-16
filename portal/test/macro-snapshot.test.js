@@ -227,6 +227,26 @@ test('反向自证二：审查 run 只装配 readFile/searchText/tree，shell �
   assert.equal(isReviewOnly({}), false);
 });
 
+// 反向自证二的接线锁：worker.js 的**两处**装配点（registry + baseToolSchemas）都必须按 reviewOnly
+// 走只读过滤。「只改一处等于没改」——删掉任一处接线，本用例即红。
+test('worker.js 两处装配点都接了审查只读过滤（接线锁）', () => {
+  const src = fs.readFileSync(
+    new URL('../../runner/worker.js', import.meta.url), 'utf8');
+  // 开关只读一次 + 两处共用同一 helper
+  assert.match(src, /const reviewOnly = isReviewOnly\(\);/, '必须读一次 RUN_REVIEW_ONLY 开关');
+  // 装配点①：registry 的 executors 与 schemas 都按 reviewOnly 过滤
+  assert.match(src, /executors: reviewOnly \? filterReviewExecutors\(fileTools\.executors\)/,
+    'registry.executors 未接只读过滤');
+  assert.match(src, /schemas: reviewOnly \? filterReviewSchemas\(fileTools\.schemas\)/,
+    'registry.schemas 未接只读过滤');
+  // 装配点②：baseToolSchemas 按 reviewOnly 过滤
+  assert.match(src, /const baseToolSchemas = reviewOnly\b[\s\S]{0,120}filterReviewSchemas\(fileTools\.schemas\)/,
+    'baseToolSchemas 未接只读过滤（只改一处 = 没改）');
+  // 两处都用了 filter helper，总数 >= 2（一处 registry schemas + 一处 baseToolSchemas）
+  const n = (src.match(/filterReviewSchemas\(fileTools\.schemas\)/g) || []).length;
+  assert.ok(n >= 2, `filterReviewSchemas(fileTools.schemas) 出现 ${n} 次，应 >= 2（两处装配点）`);
+});
+
 // 让 copyUntracked 的直接错误分支可被触及（未跟踪为空时不报错，method 仍标出）
 test('copyUntracked：无未跟踪文件时按探测口径返回、不报错', () => {
   const repo = tmpRepo();

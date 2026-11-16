@@ -36,6 +36,9 @@ import { resolveRunModel, resolveModelMetadata } from './lib/llm-models.js';
 import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
 import { createJail, createStationFileTools, STATION_MASKED_PATHS, platformReadExceptions } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
+// issue #537（W4a 审查快照与隔离）：审查 run 只读工具装配（纯函数、只 import node: 内建，
+// 故 portal/test/macro-snapshot.test.js 能跨目录 import 同一份口径做反向自证二）。
+import { isReviewOnly, filterReviewExecutors, filterReviewSchemas } from './lib/review-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
 import { engineDiagnosticNotice, summarizerFailureNotice } from './lib/engine-notices.js';
@@ -580,6 +583,14 @@ async function startRun(msg) {
   //   「整个 createJail 调用在同一行」的形状抓取（正则里带「不含换行」那一类），拆成多行会一个都抓不到
   //   ⇒ 它会红（不是静默降级，但白费一次往返）。#231 与 #259 在**同一处**装配是硬要求：
   //   少任何一个都是静默降级，两侧各有一把锁。锁的原文见 runner/test/system-prompt.test.js 的 #259 一节。
+  // issue #537（W4a 审查快照与隔离）：审查 run 开关（env RUN_REVIEW_ONLY=1）。worker 里**读一次**，
+  // 两处装配点（registry / baseToolSchemas）共用同一个常量。审查 run 只留只读三件套 ⇒ 隔离由
+  // 「无 shell / 无 write / 无 note」在**工具装配层**保证（见下 registry / baseToolSchemas）。
+  // ⚠ jail 的 `writable: [cwd]` **刻意不动**：#259 的锁（runner/test/system-prompt.test.js:315-319）
+  //   钉住「worker 只有一处 createJail 且该行字面含 `writable: [cwd]`」。审查 run 的 cwd 就是 worktree，
+  //   而只读装配不含 writeFile/edit/shell ⇒ 无任何工具能触发写 ⇒ `writable: [cwd]` 与 `[]` 对 agent
+  //   的**可观测写面相同（皆空）**。这是有意取舍（详见交付报告偏差说明）。
+  const reviewOnly = isReviewOnly();
   const jail = createJail({ root: cwd, writable: [cwd], maskedPaths: STATION_MASKED_PATHS, readExceptions: platformReadExceptions() });
   const fileTools = createStationFileTools({ jail, cwd, maskedPaths: STATION_MASKED_PATHS });
   // 一次性 info 记账（与 #451 的 AGENTS.md 注入记账同形态，走现成 MSG.LOG、**不新增事件类型**）：
@@ -649,9 +660,10 @@ async function startRun(msg) {
       }),
     },
   });
+  // issue #537 装配点①（registry）：审查 run 时只留只读三件套、**不给 shell**。
   const registry = createToolRegistry({
-    executors: { ...fileTools.executors, ...shellTools.executors },
-    schemas: [...fileTools.schemas, ...shellTools.schemas],
+    executors: reviewOnly ? filterReviewExecutors(fileTools.executors) : { ...fileTools.executors, ...shellTools.executors },
+    schemas: reviewOnly ? filterReviewSchemas(fileTools.schemas) : [...fileTools.schemas, ...shellTools.schemas],
   });
   // #363：平台技能 bundled 通道 = FDE 镜像内 /opt/erix/skills（COPY 进镜像，不可变随 digest pin）。
   // 不用 bind mount：fde-proxy 契约只放 rw + userSpace 内源，ro 平台目录要改安全面；而 loader
@@ -679,7 +691,10 @@ async function startRun(msg) {
     });
   }
   const skillToolNames = new Set(skillTools.tools.map((t) => t.name));
-  const baseToolSchemas = [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
+  // issue #537 装配点②（baseToolSchemas，送给模型的面）：**必须与装配点①同口径**——只改一处等于没改。
+  const baseToolSchemas = reviewOnly
+    ? filterReviewSchemas(fileTools.schemas)
+    : [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
   const noteToolNames = new Set(noteTools.schemas.map((s) => s.name));
   /** delegation 实例（开关关 ⇒ 恒 null；声明在 executeTool 之前，因为路由分支要读它）。 */
   let delegation = null;
