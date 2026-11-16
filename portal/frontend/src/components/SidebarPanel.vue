@@ -323,11 +323,38 @@ function messageCountSuffix(s: Session): string {
       </div>
       <div v-else>
         <p v-if="store.sessions.length === 0" class="px-2.5 py-2 text-[11px] leading-[1.5] text-black/50">{{ t('sidebar.noSessions') }}</p>
+        <!-- issue #528（`07` §21.4）：宏会话单独分组「自动化」，**默认折叠**（不折叠会淹掉用户自己的会话）。
+             用原生 `<details>` 且不带 `open` ⇒ 默认收起是声明而非 JS 状态（刷新/重挂载也不会记住）。
+             分组只在**有宏会话时**出现（没宏会话就不占位）；数据源 `chat_sessions.origin LIKE 'macro:%'`。
+             ⚠ 组内会话**不允许用户发消息**（只读入口）：这里给文案提示，发送闸在 `ComposerBar`（本单只做可见面）。 -->
+        <details
+          v-if="store.sessions.some((x) => String(x.origin ?? '').startsWith('macro:'))"
+          data-test="sidebar-automation-group"
+          class="mt-1"
+        >
+          <summary
+            data-test="sidebar-automation-summary"
+            class="cursor-pointer select-none px-2.5 py-1 text-[11px] leading-[1.5] text-black/55"
+          >{{ t('macroSidebar.group') }} ({{ store.sessions.filter((x) => String(x.origin ?? '').startsWith('macro:')).length }})</summary>
+          <p class="px-2.5 pb-1 text-[11px] leading-[1.5] text-black/45">{{ t('macroSidebar.readOnlyHint') }}</p>
+          <div
+            v-for="s in store.sessions.filter((x) => String(x.origin ?? '').startsWith('macro:'))"
+            :key="`macro:${String(s.id)}`"
+            data-test="sidebar-automation-item"
+            :data-session-id="String(s.id)"
+            class="flex min-h-[30px] cursor-pointer items-center gap-1.5 border-l-2 pl-6 pr-2 text-[12px]"
+            :class="isActive(s) ? 'border-l-brand bg-green-50' : 'border-l-transparent hover:bg-black/5'"
+            :title="t('macroSidebar.readOnlyHint')"
+            @click="emit('select-session', String(s.id))"
+          >
+            <span class="min-w-0 truncate">{{ s.title || t('common.unnamedSession') }}</span>
+          </div>
+        </details>
         <!-- issue #112：会话卡片 → 扁平行（对齐 pi-web SessionItem）：无边框卡片、左 14 右 8 内边距、
              选中 = 左 2px brand 竖条 + 浅绿底（border-l-2 常驻以免布局跳动）、hover = 浅灰底。
              用 min-h-[54px]（而非固定 height）保留行内错误提示行增高能力，正常两行内容下恰为 54px。 -->
         <div
-          v-for="s in store.sessions"
+          v-for="s in store.sessions.filter((x) => !String(x.origin ?? '').startsWith('macro:'))"
           :key="String(s.id)"
           data-session-row
           class="group flex min-h-[54px] cursor-pointer items-center gap-1.5 border-l-2 pl-3.5 pr-2"
