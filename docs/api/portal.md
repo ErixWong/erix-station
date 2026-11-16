@@ -59,6 +59,7 @@
 | 管理 | `PUT /api/admin/mail/settings` | **邮件通道配置：写**（#449，§4.12）。口令**只写**：键缺席 = 不修改、`null`/`""` = 清除；落库后缓存**立刻**失效（不等 60s TTL） |
 | 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
 | 管理 | `GET /api/admin/upload/settings` | **单文件上传上限：读**（#485 片 A，§4.15）。回的是**当前生效值** + **来源**（`db`/`env`/`default`）+ 允许区间；表不存在/读失败也回 `200`（不是 500）|
+| 管理 | `GET /api/admin/version` | **版本三格（「关于」面板）**（#586，§4.16）。只读：服务端 / 平台侧引擎 / 每台 FDE，三段各自标来源；不新增错误码 |
 | 管理 | `PUT /api/admin/upload/settings` | **单文件上传上限：写**（#485 片 A，§4.15）。`{maxFileBytes}` 必须是 `1 MiB`–`1 GiB` 的 JSON 整数，否则 `400 validation_failed` 且**不落库**；**下一次上传就生效**（无缓存 ⇒ 不需重启，也不需失效任何东西）|
 | 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
 | 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
@@ -3010,6 +3011,85 @@ Content-Type: application/json
 > 上传端点的现读接入）、`portal/src/config.js`（`fileUploadMaxBytesSource`）、
 > `deploy/migrations/0036-upload-settings.sql`。
 > 单测：`portal/test/upload-settings.test.js`、`portal/test/migrations.test.js`（0036 那一段）。
+
+---
+
+### 4.16 管理台「关于」：版本三格（`GET /api/admin/version`，issue #586）
+
+**要治的是什么**：版本号在本仓存在于五处（`package.json` / 镜像内 `build-info.json` / 运行时读取 /
+`containers.agent_version` / tag+digest），而**界面上一个读面都没有**。代价已经在 2026-11-16 付过一次：
+发 v0.1.69 时宿主工作树停在 0.1.68，`docker compose build station-portal` 烘的就是那份树 ⇒ 真机上
+**FDE 报 0.1.69、portal 报 0.1.68 分裂一小时，没有任何机器判据发现它**（portal 镜像当时没有
+`build-info.json`，`ci.yml` 的 ⑤′ tripwire 只查 FDE 镜像）。
+
+**口径（不是「选一个信」，是只有一条读法）**：
+
+| 格 | 唯一来源 | 取不到 |
+|---|---|---|
+| 服务端（portal 镜像） | portal 镜像内 `/app/build-info.json` 的 `station_version`（`portal/Dockerfile` 末尾烘入） | `unknown` |
+| 平台侧引擎 | 同一份 `build-info.json` 的 `engine_version` | `unknown` |
+| 每台 FDE 的引擎 | `containers.agent_version`（**派生副本**：provision 写入 + 心跳回报，**不是**这个镜像现在的值） | `unknown` |
+
+三格**不许互抄**；`package.json` 是**构建输入**（dev 源码态的退路，`server.source` 会显式说它是 `package`），
+git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什么」。`ci.yml` 的 portal tripwire 与
+`release.yml` ④ 保证镜像里那四格真烘进去了（口径全文见 `docs/ops/ci-release.md` 与 `runner/Dockerfile:155`）。
+
+**请求**：`GET /api/admin/version`（无参数）。鉴权同其余 `/api/admin/*`（`requireAdmin`：无会话 `401 unauthorized`、
+非 admin `403 forbidden`）；只读 ⇒ 非 GET 不落在本端点（`404 not_found`，**不新增错误码**）。
+
+**响应** `200 application/json`：
+
+```json
+{
+  "server": { "station": "0.1.69", "revision": "02fd33ec…", "builtAt": "2026-11-16T03:45:00Z", "source": "build-info" },
+  "platformEngine": { "version": "0.33.0" },
+  "buildInfoPath": "/app/build-info.json",
+  "fdes": [
+    { "name": "eric", "agentVersion": "0.33.0", "image": "ghcr.io/…@sha256:…",
+      "provisionedAt": "2026-11-16T02:00:00.000Z", "lastHeartbeatAt": "2026-11-16T04:00:00.000Z",
+      "revoked": false, "versionSource": "containers.agent_version", "snapshot": "provision" }
+  ],
+  "fdesPresent": true,
+  "provenance": { "server": "build-info.json", "platformEngine": "build-info.json",
+                  "fdes": "containers.agent_version", "fdesSnapshot": "provision" }
+}
+```
+
+- **所有版本格都是字符串，缺就是字面量 `unknown`**（永不 `undefined` / 空串 / `0`）：一个看起来合法的
+  假值比空值毒（`runner/lib/build-info.js` 顶部记的 `0.1.0` 事故）。
+- `server.source` ∈ `build-info` | `env` | `package` | `unknown`：这一格到底从哪儿读的。镜像里应当是
+  `build-info`；本地源码态是 `package`（此时 `revision`/`builtAt` 必然是 `unknown`，**那是事实**）。
+  portal 侧在入口**屏蔽** `ERIX_AGENT_VERSION`（那是 provisioner 注入给 FDE 容器的旋钮，
+  `portal/src/provisioner.js:281`），所以这里的引擎号不可能来自环境变量冒充（评审阻断一）。
+- **`provenance.server` / `provenance.platformEngine` 是由 `source` 推导的，不是常量**（复验阻断）：
+  `build-info → "build-info.json"`、`package → "package.json"`、`env → "env"`、认不出 → `"unknown"`。
+  写死 `'build-info.json'` 在**本 PR 之前构建的旧 portal 镜像**上就是说谎——那份镜像里根本没有
+  `build-info.json`，读取退到 `node_modules/erix-agent/package.json`，面板上的引擎号确实是它。
+  ⚠ `source` 是**整次读取共用的**（`readBuildInfo()` 只出一个），所以这两格**必然同源**（同一个文件）；
+  `provenance` 里 `package.json` 那一支就是「这是源码态退路 / 旧镜像，不是镜像构建产物」的显式说法。
+  **有值才谈来源**（第三轮评审 nit）：`platformEngine.version` 是 `unknown` 时 `provenance.platformEngine`
+  也降成 `"unknown"` —— `source` 会因为根 `package.json` 可读而置 `package`，但那份
+  `node_modules/erix-agent/package.json` 可能根本不存在，此时给一个没值的格子标上来源就是冒充。
+  `server` 那格不需要这道闸门（它的值就出自根 `package.json`，`source` 是 `package` 时必然读到了）。
+- `buildInfoPath` = **实际去读的那条路径**（`STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH` /
+  代码入参三个旋钮都能改它，前两个是契约测试的注入点 ⇒ 「路径被改过」必须在界面上可见）。
+  它只证明「读了这条路径」，**证明不了「读到了」**——读到没有看 `provenance`。`/api/health` **不带**这一格
+  （公开端点不泄露部署路径，§5.1 的形状仍是 `station`/`revision`/`builtAt` 三格）。
+- `fdesPresent:false` ⇒ 这一段**读不到**（查 `containers` 抛错），与「服务端说没有 FDE」（`fdesPresent:true`
+  + 空数组）是两件事（#350 同口径）；本端点因此**始终 200**，不把面板打成 500。
+- `snapshot:"provision"` 是**机器可读的口径标注**，前端据此必须渲染「provision 时快照」字样；
+  标注缺失时页面说「口径未给出」，**不许默认当成快照**。
+
+**不做**：不做用户侧（工作台）版本展示——两个引擎数并排给 FDE 看需要解释文案，那会变成第二个会漂的账；
+不改 `containers.agent_version` 的写入链（只加读面），也不做「期望版本 vs 实际版本」的 canary 对账（需另开列）。
+
+> 实现：`portal/src/version-info.js`（三格的唯一读法 + 面板聚合）、`portal/src/build-info.js`
+> （`runner/lib/build-info.js#readBuildInfo()` 的镜像副本，由测试钉同步）、`portal/src/http.js`（端点转发）、
+> 前端 `portal/frontend/src/lib/versionSurface.ts` + `views/AdminAboutView.vue`（`#/admin/about`）。
+> 单测：`portal/test/admin-version-panel.test.js`（后端三段/鉴权/降级）、
+> `portal/test/version-surface.test.js`（**三格来源锁死** + provenance 推导/路径可见 + 镜像与工作流的判据自证）、
+> `portal/test/health-version.test.js`（§5.1 的 `version` 块）、
+> `portal/frontend/src/views/AdminAboutView.spec.ts`（渲染面与不猜数）。
 
 ---
 
