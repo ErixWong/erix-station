@@ -163,8 +163,10 @@ export const MACRO_VERDICTS = Object.freeze(['pass', 'red', 'no-op-claim', 'need
 export const MACRO_RUNS_DEFAULT_LIMIT = 50;
 export const MACRO_RUNS_MAX_LIMIT = 200;
 
-/** `notifications` 里可能引用模板的列名（W3 才建表）。列名不确定 ⇒ 探测而不是猜死一种。 */
+/** `notifications` 里可能引用模板的列名（W3 已建表，0036 用的是间接引用，见下）。列名不确定 ⇒ 探测而不是猜死一种。 */
 const NOTIFICATION_REF_COLUMNS = Object.freeze(['macro_template_id', 'template_id', 'macro_id']);
+/** W3（0036）落地列：`notifications.macro_run_id` —— 没有直连模板列时经执行账间接数。 */
+const NOTIFICATION_RUN_REF_COLUMN = 'macro_run_id';
 
 /** 与 `SessionError` / `DelegationError` 同形的错误载体（`http.js` 顶层统一映射到标准错误信封）。 */
 export class MacroError extends Error {
@@ -419,7 +421,22 @@ async function countTemplateNotifications(client, templateId) {
   );
   const column = cols.rows.map((r) => r.column_name)
     .find((c) => NOTIFICATION_REF_COLUMNS.includes(c));
-  if (!column) return { present: cols.rowCount > 0 || cols.rows.length > 0, count: 0, column: null };
+  if (!column) {
+    // **W3 接点（10 篇 §4 第 1 条）**：0036 建的 `notifications` 没有直连模板列，
+    // 引用经执行账间接成立：notifications.macro_run_id → macro_runs.assignment_id
+    // → macro_assignments.template_id。有 `macro_run_id` 列就走这条 JOIN 数；
+    // 两条腿都没有 ⇒ 表里根本不记模板 ⇒ 视为 0（物理删安全，旧语义不变）。
+    const hasRunRef = cols.rows.some((r) => r.column_name === NOTIFICATION_RUN_REF_COLUMN);
+    if (!hasRunRef) return { present: cols.rowCount > 0 || cols.rows.length > 0, count: 0, column: null };
+    const viaRun = await client.query(
+      `SELECT COUNT(*)::bigint AS n
+         FROM notifications n
+         JOIN macro_runs r ON r.id = n.macro_run_id
+         JOIN macro_assignments a ON a.id = r.assignment_id
+        WHERE a.template_id = $1`, [templateId],
+    );
+    return { present: true, count: Number(viaRun.rows[0]?.n ?? 0), column: NOTIFICATION_RUN_REF_COLUMN };
+  }
   const cnt = await client.query(
     `SELECT COUNT(*)::bigint AS n FROM notifications WHERE ${column} = $1`, [templateId],
   );
