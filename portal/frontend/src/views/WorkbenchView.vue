@@ -23,6 +23,12 @@ import SessionPickerModal from '../components/SessionPickerModal.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
 // issue #359（决策 §7 D9）P0b：顶栏「收工灯」——只回答“你的活儿被 git 保护住了吗”，平台零 git 写。
 import GitLightBadge from '../components/GitLightBadge.vue';
+// issue #528（事件平台 W5）：宏用户面三件——会话头的「自动化」chip、顶栏铃铛、覆盖式流水抽屉。
+// 入口职责分开（`07` §3.1）：chip 只开抽屉，抽屉里的 [配置 ▾] 只开模板下拉。
+import MacroMenu from '../components/MacroMenu.vue';
+import MacroDrawer from '../components/MacroDrawer.vue';
+import MacroBell from '../components/MacroBell.vue';
+import { useMacroStore } from '../stores/macro';
 import { useGitLight } from '../composables/useGitLight';
 import { toDisplayText } from '../api'; // issue #281：失败详情进文案前过一道收口（不渗 [object Object]/undefined）
 // #450 A2：管理台入口是**跨 host** 链接（用户面 → 管理台），落点由 `site` store 的两个 base 决定。
@@ -53,6 +59,28 @@ const who = computed(() => {
   return u.fde_name
     ? t('workbench.who', { login: u.login, role: u.role, fde: u.fde_name })
     : t('workbench.whoNoFde', { login: u.login, role: u.role });
+});
+
+// ---- issue #528：宏用户面的接线 ----
+const macro = useMacroStore();
+const macroDrawerOpen = ref(false);
+
+/** chip 的唯一动作：开流水抽屉（`07` §3.1——不在这里开模板下拉）。 */
+function openMacroDrawer(): void {
+  if (!store.sessionId) return;
+  macroDrawerOpen.value = true;
+  void macro.openDrawer(store.sessionId);
+}
+
+function closeMacroDrawer(): void {
+  macroDrawerOpen.value = false;
+  macro.closeDrawer();
+}
+
+/** 切会话 ⇒ 抽屉与面板数据一起收（不要把上一个会话的订阅/流水留在屏上）。 */
+watch(() => store.sessionId, () => {
+  if (macroDrawerOpen.value) closeMacroDrawer();
+  macro.reset();
 });
 
 // ---- 路由钩子注入（store 保持 router 无关，便于单测）----
@@ -270,6 +298,13 @@ function jumpToLatest() {
         @refresh="gitLight.load()"
         @prefill="onGitLightPrefill"
       />
+      <!-- issue #528：会话级宏入口（与收工灯同族的「会话级设置」）。只列 `scope='session'` 的模板。 -->
+      <MacroMenu
+        v-if="store.sessionId"
+        scope="session"
+        :session-id="store.sessionId"
+        @open-runs="openMacroDrawer"
+      />
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
       <a
         v-if="auth.user?.role === 'admin'"
@@ -277,6 +312,9 @@ function jumpToLatest() {
         :href="adminConsoleHref"
         class="text-sm underline"
       >{{ t('common.adminConsole') }}</a>
+      <!-- issue #528：顶栏那份是**用户级**模板（只读，管理员代配）+ 通知铃铛（未读角标）。 -->
+      <MacroMenu scope="user" />
+      <MacroBell />
       <LocaleSwitch />
       <button
         class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5"
@@ -352,5 +390,12 @@ function jumpToLatest() {
         >{{ t('workbench.toLatest') }}</button>
       </section>
     </main>
+
+    <!-- issue #528：覆盖式右抽屉（不是并排）。挂在根层：遮罩要盖整个视口，包含侧栏与顶栏。 -->
+    <MacroDrawer
+      v-if="macroDrawerOpen && store.sessionId"
+      :session-id="store.sessionId!"
+      @close="closeMacroDrawer"
+    />
   </div>
 </template>
