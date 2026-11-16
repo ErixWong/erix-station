@@ -7536,6 +7536,68 @@ C 族「实例属性/改名 ⇒ compose 腿不适用」4 条 —— `ERIX_STATIO
 ⑤ `node portal/integration/isolation-negative.mjs --strict` ⇒ rc=0，`grep -c 'TRAP OK'` = **19**，`verdict=TRAPS_FIRED`。
 ④ **根 `npm test`**（本单动了 `portal/src/provisioner.js` ⇒ 必须跑）⇒ rc=**0**：`# tests 2641 / # pass 2603 / # fail 0 / # skipped 38`，`grep -c 'not ok'` = **0**（**没有**出现负载抖动族，故无需改夹具）。随带按红线单跑抖动族各两次自证：`idle-backoff-safe-range-506b` 17/17 rc=0 ×2、`env-int-strict-506e` 17/17 rc=0 ×2、`idle-backoff-506` 见下一次读数、`deploy-env-idle-backoff` 5/5 rc=0 ×2（夹具一字未动）。
 
+#### 8.141 追加（2026-11-16，工单 `fix-261116-10-557-scanner-teeth` / PR #581 的**返工轮**，worker 落地 + 变异自证）：
+**对抗审计在上一段那条新闸门自己身上找到 2 MED + 1 LOW** —— 「枚举源改成扫整棵 `runner/`」是对的，
+但它只认 `process.env.` 前缀那一形，于是**同一个根因在闸门里复发**：形状覆盖不全 = 静默。
+
+**MED-1 表驱动的 env 名根本不在枚举面上。** `runner/lib/llm-timeouts.js:99` 的
+`resolveLlmTimeouts(env = process.env)` 在 `:103` 读 `env?.[envName]`，而 `envName` 来自**数据表**
+`LLM_TIMEOUT_ENV`（`:57-61`）。那一行里**没有 env 名的字面量**，只认字面量的扫描器扫不到 ⇒
+`ERIX_LLM_TIMEOUT_FIRST_BYTE_MS` / `_STREAM_IDLE_MS` / `_STREAM_TOTAL_MS` / `_REQUEST_MS`
+四个键**静默漏过**，而这四个是**和 #557 一模一样**的「runner 真读了、宿主投不进」（`runner/worker.js:562`
+用 `resolveLlmTimeouts(process.env)` ⇒ 读的就是容器自己的 env，而三腿全无）。
+判据里**不许出现这四个名字**：现在它们由 `Object.values(LLM_TIMEOUT_ENV)` 现读，`SELF_TEXT` 自证本文件源码里
+一次都不含这些字面量，并且「改表里的名字 ⇒ 枚举跟着改名」是可执行的（旧名消失、新名出现）。
+
+**MED-2 `where` 没有任何 `assert` 在核。** 上一段登记的坐标里就有假的：`ERIX_AGENT_VERSION` 写
+`runner/agentd.js`（不带行），而 `agentd.js:52` 那个 `process.env.ERIX_AGENT_VERSION` 是**注释正文**引用的旧代码
+（`:54` 的注释自己写了「现在读镜像里烘的 build-info.json」），真读取在 `runner/lib/build-info.js:84` 的
+`s(env.ERIX_AGENT_VERSION)` —— 一个**别名点号形**，旧扫描器同样扫不到 ⇒ 「假坐标 + 真理由」静默活了三天。
+同一批里 `ERIX_STATION_BASE_URL` 指 `provisioner.js:213`（实际是 bind mount 的路径拼接行，真注入在 `:229`）、
+`ERIX_STATION_TOKEN` 指 `:390`（真注入在 `:414`，`:366` 那个是**读侧** helper `readContainerEnv`）、
+`ERIX_FDE_NAME` 同指 `:390`。⚠ **行号合理性会骗人**：`provisioner.js:257` 如今是 #581 自己新加的
+`ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 那一行 ⇒ 同一个行号会随改动**自己变成假的**。
+
+**修法（一件事实只在一处）**
+- `test/lib/js-source.mjs` 新文件：把 `stripComments()` 从 `test/repo-hygiene.test.js:135` **逐字搬出来**共用
+  （那边改成 import；H3 的判据①② 仍是它的行为测试）。**不**复制「逐行 `startsWith('//')`」的弱货 ——
+  两份实现会分叉成两本账。另加 `structuralMask()`（注释 + 串正文抹平，**但保留模板插值 `${…}`**：
+  `runner/worker.js:774` 的 `` msg: `${name}=${process.env[name]}` `` 就是活在模板里的真读取）。
+- 扫描器加两形：别名点号 `env.X`（`X = process.env` 的参数默认值/常量都算别名）、数据表下标 `env?.[name]`
+  （名字从 `TABLE` 来）。解析不出字面量名的读形 ⇒ **fail closed** 进 `unsupported` 清单，不登记 / 无理由 /
+  坐标漂了 / 条目过期 ⇒ 红。真树里现在恰好一处：`runner/worker.js:774` 的 `process.env[name]`
+  （`name` 来自同函数 `:763-765` 的字面量对数组，三个名字已被枚举覆盖）——**故意**不为它写一条
+  「for-of 解构配对数组」的形状规则（判据围着样本转 = 第二本账），改成留一条要花钱的登记。
+- `where` 升成硬判据：每个 `路径.js[:行]` 引用必须存在；那一行**剥掉注释后**必须含该 key 的字面量、
+  或含一个能解析到它的常量名（表驱动那种真坐标必须算通过，否则是在误杀真坐标）；只给文件不给行 ⇒
+  扫描器必须在那个文件里发现对该 key 的**活读**。写形态（`env.X = v`）不算读，注释里的读形不算读，
+  串里**提到**的形状不算读，模板插值里的算读。
+- 新扫出来的五个键（四相超时 + `ERIX_BUILD_INFO_PATH`，读取形 `env.ERIX_BUILD_INFO_PATH` 在
+  `runner/lib/build-info.js:55`）逐条进 `deploy/env-legs-exceptions.json` 并写理由，
+  **没有为了变绿删掉任何条目或任何判据**；`$comment` 里补上⑥（坐标口径 + 为什么它必须是硬判据）与
+  ⑦（动态读形必须登记）。四相超时**必须一起接**（只接一项 = 一次 LLM call 的四个预算分叉）。
+
+**变异自证（每条判据带着自己的变异；还原一律 `cp` + `diff -q`，此时工作区已有未提交改动 ⇒ 不用 `git checkout`）**
+
+| 变异 | 判据应当 | 实测 |
+| --- | --- | --- |
+| M1 `perl` 改 `LLM_TIMEOUT_ENV` 里四个名字（加 `_OLDNAME`） | 名字不是抄的 ⇒ 必须红 | `not ok 19 - 活一⑤`（随带 `not ok 11 - 活二①`、`not ok 17 - 活二⑤`：登记随之过期） |
+| M2 注释掉 `build-info.js:84` 的 `env.ERIX_AGENT_VERSION` | 别名点号形是唯一出处 ⇒ 必须红 | `not ok 20 - 活一⑥`（随带 `not ok 11`、`not ok 17`、`not ok 18`） |
+| M3 注释掉 `llm-timeouts.js` 的 `out[field] = parseTimeoutMs(…)` | 注释掉必消失 ⇒ 必须红 | `not ok 21 - 活一⑦`（随带 `not ok 11 / 17 / 19`） |
+| M4a 真树里加 `env[\`ERIX_MUTANT_${suffix}_X\`]` 且**不登记** | 静默要花钱 ⇒ 必须红 | 恰 1 红：`not ok 22 - 活一⑧`（消息点名 `runner/lib/build-info.js:92`） |
+| M4b 同一处变异 + `unsupported` 段登记带理由 | 付了账就该过 ⇒ 必须绿 | rc=0（22 / 22 / 0） |
+| M4c 同一处变异 + 登记但**删掉 `reason`** | 无理由不算例外 ⇒ 必须红 | `not ok 22 - 活一⑧` + `not ok 11` + `not ok 16` |
+| M5 某条 `where` 指到不存在的文件 | 坐标必须是真文件 ⇒ 必须红 | 恰 1 红：`not ok 17 - 活二⑤` |
+| M6 某条 `where` 漂到存在但没该 key 的一行（`agentd.js:1`） | 行号合理不算对 ⇒ 必须红 | 恰 1 红：`not ok 17 - 活二⑤` |
+| M7 `ERIX_AGENT_VERSION` 的 `where` 退回登记当时那两条 | 注释背书 + 漂移行号都要红 | `not ok 17 / 18`，消息逐条点名「`agentd.js` 里没发现活读」与「`:257` 那一行不含该 key（实际内容是 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS=…`）」 |
+| 判据自带的内存变异（不动盘） | 注释改名 ⇒ 枚举不动；注释掉真读取 ⇒ 键消失；串里提到 ⇒ 不算读；模板插值 ⇒ 算读；拼名读形 ⇒ 记一条 unsupported | 全绿（`scanEnvReads(root, { mutate })` 是判据的入口，不依赖谁手工改过一次树） |
+
+**门禁读数**（顺序跑，只看退出码）：① `node --test portal/test/deploy-env-delegate.test.js` ⇒ rc=0（**22 / 22 / 0**，
+上一段是 16 格）；② `node --test test/repo-hygiene.test.js` ⇒ rc=0（5 / 5 / 0，`stripComments` 搬出来后复跑）；
+③ `node --test test/integration-e2e-preflight.test.js` ⇒ rc=0（39 / 39 / 0）；
+⑤ `node portal/integration/isolation-negative.mjs --strict` ⇒ rc=0，`grep -c 'TRAP OK'` = **19**，`verdict=TRAPS_FIRED`；
+⑥ `npm run check:agents-hotlayer` ⇒ rc=0（热层 18706 / 预算 19456，条目 146 无重复编号）。
+
 ### 8.142 事件平台 W3 落地 + 迁移让号 0037 + 迁移编号撞车的处理口径（#526，2026-11-16，主 agent + erix_run）
 
 接 §8.130。**W3（通知 + HTTP API）已合并进 main**（PR #564，`f0a7af4`）。
