@@ -5813,3 +5813,103 @@ const {
 **仍然没覆盖（追加到本节那条残留边界旁边）**：正则字面量不进状态机 ⇒ `/a/*b/` 这类写法若后面还碰得上
 一个真块闭合，中间那段会被误剥（假绿方向）；加上原有那条 `const K = 'emitted'; wrapper[K]()`，
 两支都属「行级判据追不住」，要拦得扫整棵 AST，超出本单口径。
+
+
+### 8.133 缓冲逐出活跃 run：从「只有日志」到「`/healthz` 有读数 + 文档显式接受」，并实测出工单漏掉的第二种后果（issue #515 / 工单 fix-261115-11，2026-11-15，worker 落地）
+
+> 编号由主 agent 统一分配（本批并行）。
+
+**工单是怎么进来的**：派给 worker 的派单正文**丢了**（工具只收到 `Task:` 空串），唯一线索是 worktree 分支名
+`fix-261115-11-515-evict-active`。worker 没猜，而是从分支名 → `docs/api/portal.md` §5.1 那条 #515 注记 →
+GitHub issue #515 原文，把三选一的**代价各自现验了一遍**再来要裁决。三条选项的代价都是**查出来的**不是估的：
+①「把容量与 portal 级 active-run 硬上限绑定」= portal 今天**根本没有**那种硬上限（认领是
+`FOR UPDATE SKIP LOCKED` 一条条来，并发只受 runner 数量与会话租约约束），且 `maxEntries` **没接 config/env**
+⇒ 做 ① 等于在本单里顺手造一个调度级闸门；② 完整版（新增宿主诊断事件）要动 SSE 白名单 + 前端 +
+`event-surface-contract.test.js` 的豁免表；③ 纯文档。**裁决 = ② 轻量版（把已有的 `stats()` 挂到既有
+`/healthz`）+ ③ 同做**；① 与 ② 完整版都留后续单，不在本单预支。
+
+**worker 的一条实测纠正了工单正文**（这是本单最有价值的部分）：工单写「被逐的 run ⇒ `runEndPartialKeys`
+读到空槽 ⇒ 写不出 `partial_text`」，但**这只在逐出后该 run 不再吐字时成立**。槽位在后续碎片到达时会被
+**重建成 blank entry**，于是终态写出的是**一段从中间起笔的尾巴冒充整段**，并且：
+
+| 键 | 逐出前 | 逐出后重建（实测值） | 后果 |
+|---|---|---|---|
+| `text` / `partial_text` | `第1个run的前半段正文` | `后半段` | 前半段永久丢，**且没有任何标记说明它是尾巴** ⇒ 历史投影**不出**占位项 |
+| `round` / `partial_round` | `1` | `null` / `0` | 轮号谎报成第 0 轮 |
+| `roundSeq` | `101` | `null` | §4.4a 补发判据「run + `roundSeq` 两端都匹配才覆盖气泡」⇒ **整帧丢弃**，重连也补不回 |
+| `chunks` / `textSegment` | `1` / `1` | `1` / `0` | 代际号回落 ⇒ 前端按「过期一代」忽略（水位线不倒退，但也补不回来） |
+
+⇒ **尾巴比缺字段更坑**：缺字段会出中性占位项，尾巴是「看着完整、其实从半句开始」。这条被定为**独立的正确性
+问题**（主 agent 另开单跟，不在本单修），本单只把它**钉成现状测试**。
+
+**现验到的可观测面事实**（裁决成立的前提，全部现查）：
+
+| 事实 | 读数 / 出处 |
+|---|---|
+| 缓冲上界 | `PARTIAL_MAX_ENTRIES_DEFAULT = 32`（内存槽上限：单 entry 两路各 16,384 字符 ≈ 64 KB ⇒ 全表 ≈ 2 MB）；**不是并发上限** |
+| 逐出计数是否对外可读 | 改前**不可读**：`stats().evictedActive` 只在内存，`grep -rn metrics portal/src` = **0 命中**（portal 无 `/metrics`）⇒ 只能翻 `log.warn` |
+| 容器健康检查的真实判据 | `deploy/docker-compose.yml:267` = `["CMD","node","portal/src/cli.js","healthcheck"]` → `cli.js#healthcheck` `fetch /healthz` → **只看 `res.ok`，不解析 body** |
+| 容器健康日志里到底有什么 | `docker inspect -f '{{json .State.Health}}' station-portal` → `Status=healthy`、`FailingStreak=0`、`Log[].Output = "ok\n"`、`ExitCode=0`（**body 根本不进判据**） |
+| `/healthz` 的全部消费方 | `cli.js#healthcheck`（`res.ok`）、6 个 `portal/integration/*.mjs`（一律 `?.status === 200`）、`deploy/README.md:36`（`curl -o /dev/null -w '%{http_code}'`）⇒ **没有一个解析 body** |
+
+**改了什么**（`②` 的形状红线：只多一块，别的都不许多动）：
+
+| 文件 | 改动 |
+|---|---|
+| `portal/src/http.js` | 新增导出 `partialBufferHealth(buffer = partialOutputs)` → `{ entries, maxEntries, evictedActive }`；`/healthz` 与 `/api/health` 的 **200 分支** additive 带上这块。**`status` 语义不变、503 分支逐字不变、405 不变、不新增端点与鉴权面**；`stats()` 抛异常 ⇒ 省略该键（观测面不承重，不许把 readiness 端点打挂成 500） |
+| `portal/test/healthz-partial-buffer.test.js` | 新增 9 条（含主 agent 追加要求的那条「钉**今天的真实行为**」复现） |
+| `docs/api/portal.md` §5.1 | #515 那条注记**按实测重写**：裁决结果与理由（含 ① 不做的理由）、**两种形态**的后果、N=32 的来源（内存槽上限≠并发上限、且不接 env）、与 #502 已接受损失的边界（不许互相豁免） |
+| `docs/design/deploy-contract.md` §2.3 | 加一条口径：**健康检查判的是状态码/退出码，不是响应体** ⇒ additive 加键结构性安全；但状态码语义与 503 信封不许为观测目的改动 |
+
+**刻意不做的一件事**（worker 提出、主 agent 认了并写进文档）：**不**借用 `persistence_capability_degraded`
+当逐出信号 —— 那个事件类型是**引擎发射**的（`orchestrator.js`，`docs/api/portal.md` §5.3 第 20 类），
+portal 拿它说自己的事 = **谎报发射方**。工单原文把 ② 写成「`persistence_capability_degraded` 或专用诊断」，
+照抄就会踩。
+
+**判据与读数**（`portal/test/healthz-partial-buffer.test.js`，`timeout 240 node --test <文件>` ⇒ **rc=0，9 pass**）：
+逐出 ⇒ `/healthz` 的 `evictedActive` **严格 +1**（不是「大于 0」的钝断言）；`/healthz` 与 `/api/health`
+同一条 handler ⇒ body 逐字相等；块内**只有三个整数**（断言 JSON 里不含 run id、不含正文片段——健康端点的
+响应会被人整段贴进日志）；`stats()` 抛异常 ⇒ 省略键但仍 200；503 的 body **逐字**仍是
+`{error:{code:'migration_failed',message:'not ready',retryable:false}}`；非 GET 仍 405；
+`maxEntries` 缺省仍是 32 —— 这条连**字面量写法**一起钉（`assert.match(src, /export const PARTIAL_MAX_ENTRIES_DEFAULT = 32;/`）
+⇒ 改成 env 注入或改数都会红，逼改动者回来写理由。
+
+**四道变异自证**（每道都必须红，否则判据是空的）：
+
+| 变异 | 结果 |
+|---|---|
+| 撤掉 `/healthz` 的块（`pb = null`） | rc=1，3 fail |
+| `PARTIAL_MAX_ENTRIES_DEFAULT` 32 → 8 | rc=1，5 fail |
+| 逐出了但不计数（`evictedActive += 0`，回到「静默」） | rc=1，3 fail |
+| **不逐活跃 run**（`evictOne` 全活跃时直接 `return`，= 未来那个修复的形状） | **rc=124 挂死，不是变绿** |
+
+最后那道是白捡的事实：`observe()` 与 `stage().commit()` 里都是 `while (entries.size >= maxEntries) evictOne();`
+⇒ **一条都逐不掉时那是死循环**。所以后续做 ①（结构上排除逐出）时**不能只在 `evictOne()` 里 `return`**，
+得改那两处 `while`。已写进 §5.1 的注记给后续单当地基。
+
+**`/healthz` 前后对比**（同一台机、同一条命令）：
+
+```
+改前（现网容器 station-portal，经 127.0.0.1:18080 与经 Traefik 边缘都是这个）
+  {"status":"ok"}
+改后（本 worktree 起服务，新代码）
+  {"status":"ok","partialBuffer":{"entries":0,"maxEntries":32,"evictedActive":0}}
+compose 原文那条命令 `node portal/src/cli.js healthcheck`：改前 rc=0、改后 rc=0（两次都打印一行 `ok`）
+```
+
+**门禁**：仓库根 `npm test; echo rc=$?` ⇒ **rc=0**，`# tests 2365 / # pass 2351 / # fail 0 / # skipped 14`
+（基线同机同树：**2356 / 2342 / 0 / 14**，本单净增 9 条用例、零回归）。
+`npm run check:agents-hotlayer` ⇒ **VERDICT ok**（热层 18706 / 预算 19456；台账 126 个条目无重复编号）。
+
+**三条可复用的教训**：
+1. **派单正文丢了也能干活，但只许走「证据链」不许走「猜」**：分支名 → 文档注记 → issue 原文 → 现验代价 → 回来要裁决。
+   本单如果没有这一步，就会照抄工单把 ② 实现成借用引擎的事件名。
+2. **「钉今天的真实行为」比「钉期望行为」难写但值钱**：那条尾巴用例现在是后续单唯一的地基 —— 它会在
+   有人真去修「尾巴冒充整段」时**变红**，逼他回来改 §5.1 的口径，而不是让修复悄悄改掉契约。
+3. **`NODE_ENV=production` 会让 `cli.js healthcheck` 假红**（本机 shell 默认就是 production）：
+   `loadConfig` 会先因 `FDE_IMAGE 必须为 … 不可变引用` **抛异常**，跑不到 fetch 那一步，报的是 rc=1 ——
+   跟 `/healthz` 一点关系没有。口径：手工跑那条命令要带 `FDE_DEV_MODE=1`（AGENTS §4 那条前端假红是同一个坑的另一直态）。
+
+**未尽项**：① 与 ② 完整版都另单；「尾巴冒充整段 + `roundSeq=null` ⇒ 补发整帧丢弃」另单（主 agent 开）；
+`/healthz` 在 `docs/api/portal.md` §0.1 端点清单里**本来就没有一行**（清单只覆盖 `/api/*`），本单没补那行，
+形状口径写在 §5.1 注记与 deploy-contract §2.3 两处；issue #515 待本分支合并后关单。
