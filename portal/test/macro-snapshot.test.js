@@ -112,12 +112,14 @@ test('反向自证一：同路径内容变但 status 文本不变时，内容级
   seedCommitted(repo, 'f.txt', 'v0\n');
   // 第一次编辑：已跟踪文件被改（status = "M f.txt"）
   fs.writeFileSync(path.join(repo, 'f.txt'), 'v1\n');
-  const fp1 = computeContentFingerprint(repo, { contentLevel: true });
+  // 走**生产默认**（createSnapshot 调的就是这个默认值，不显式传 flag），
+  // 这样「把 computeContentFingerprint 的默认改成只 hash status」时，下面的断言会真的红。
+  const fp1 = computeContentFingerprint(repo);
   const fp1weak = computeContentFingerprint(repo, { contentLevel: false });
 
   // 第二次编辑**同一路径**：status 文本一字不变（仍是 "M f.txt"），但内容变了
   fs.writeFileSync(path.join(repo, 'f.txt'), 'v2-different\n');
-  const fp2 = computeContentFingerprint(repo, { contentLevel: true });
+  const fp2 = computeContentFingerprint(repo);
   const fp2weak = computeContentFingerprint(repo, { contentLevel: false });
 
   // 前提：status 文本确实没变（否则这个用例没抓到要害）
