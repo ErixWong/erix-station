@@ -4376,6 +4376,12 @@ async function handleGetProject(req, res, ctx, projectId) {
 
 const INTERNAL_EVENTS_LIMIT = 320 * 1024; // 事件批 256KB 载荷 + 信封冗余
 const INTERNAL_ROUND_LIMIT = 1.5 * 1024 * 1024; // transcript round 1MB + 信封冗余
+// issue #500：恢复行比轮记录小得多（`tool-executed` 实测百字节量级），但 `partial-text` 带**整段
+// 未收敛正文**（契约会跟着文本长，不截断不封顶），闸得给它留地方。
+// ⚠ 这一层是**传输级 413**，必须比 internal.js 的**业务级 400**（`MAX_RECOVERY_ROW_BYTES` = 512 KiB）
+// **宽**：反过来了 oversized 的 body 会先被这里 413 掉，报信里就只剩「太大」，没有 internal 那条
+// `details.bytes/limit` 可指认。今天本站不开 `partialPersistence`（#301）⇒ 真走到这个量级就是上游开了开关。
+const INTERNAL_RECOVERY_ROW_LIMIT = 640 * 1024;
 const INTERNAL_CHECKPOINT_LIMIT = 2 * 1024 * 1024; // checkpoint snapshot 可较大
 
 function bearerToken(req) {
@@ -4522,6 +4528,30 @@ async function handleInternal(req, res, ctx, url) {
         return;
       }
       return sendJson(res, 200, result);
+    }
+    // issue #500：账本恢复行三件套（引擎 0.33.0 的可选能力面）。writer fencing 与上面每一个 S 端点
+    // **完全一致**（`?run_id=` 已在进入本分支前强制校验 + `X-Claim-Token`）：恢复行只有 session 语义，
+    // 本站**没有**为它编 run 作用域兼容面。
+    //
+    // ⚠ 三个响应形状都是**对象包着一个字段**，不是裸数组/裸布尔：agentd 原样透传 `r.data`，
+    // 204 会被解析成 `null` ⇒ 「空」与「读坏了」在 runner 侧就分不开。契约里这两者是两个结局
+    //（空数组 = 合法降级；非数组 = `recovery_rows_unreadable` 终局），所以本端点**永不**返回 204。
+    if (sub === '/recovery-rows') {
+      if (req.method === 'GET') {
+        const result = await internal.listSessionRecoveryRows(ctx.pool, base);
+        return sendJson(res, 200, result); // {rows:[…]}，空 = {rows:[]}，不是 204
+      }
+      if (req.method === 'PUT') {
+        requireJson(req);
+        const body = await readJsonBody(req, INTERNAL_RECOVERY_ROW_LIMIT);
+        const result = await internal.appendSessionRecoveryRow(ctx.pool, { ...base, body });
+        return sendJson(res, 200, result); // {added:true|false}
+      }
+      if (req.method === 'DELETE') {
+        const result = await internal.clearSessionRecoveryRows(ctx.pool, base);
+        return sendJson(res, 200, result); // {cleared:true|false}
+      }
+      throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     }
     if (sub === '/runstate') {
       if (req.method === 'PUT') {

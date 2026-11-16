@@ -15,7 +15,10 @@ import { snapshotQueuedInputs, drainAfterRunTerminal } from './queued-inputs.js'
 import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle } from './session-title.js';
 import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
-import { samePayload, dedupConflictDetails } from './transcript-payload.js';
+import { samePayload, dedupConflictDetails, DEDUP_CONFLICT_CODE } from './transcript-payload.js';
+// issue #500：恢复行三个端点复用 store 层的同一套 SQL + 幂等判据（**不在这里重写一份**）：
+// 写路径 / 读路径 / 清盘各只有一处实现，否则会出现「store 适配器幂等、端点不幂等」这种单侧可观测的行为。
+import { createRecoveryRowStore } from './transcript-store.js';
 import { partialOutputs } from './run-partial-buffer.js'; // issue #502 D-4：stream 档正文的进程内缓冲
 import { enqueueMaterializeChange } from './outbox.js';
 
@@ -1846,6 +1849,119 @@ export async function loadSessionRunStateStatus(pool, { container, user, key, cl
     row?.engine_run_state_status, row?.has_engine_run_state_status === true, row?.engine_run_state, key,
   );
   return status === null ? null : { status };
+}
+
+// ---------------------------------------------------------------------------
+// session 账本恢复行（issue #500，erix-agent 0.33.0 可选能力面；迁移 0036）
+// ---------------------------------------------------------------------------
+//
+// 三个端点 = 引擎那三个可选方法的 portal 面（GET 列表 / PUT 追加 / DELETE 清空）。**鉴权三层与其余
+// S 系列端点逐字一致**（`fetchSession` 属主 + `fetchWriterRun` 归属 + `assertClaimToken` 租约），
+// 因为恢复行**只有 session 语义**：引擎的 `runId` 在本站就是 transcript key = sessionId，
+// writer fencing 走 `?run_id=` + `X-Claim-Token`，终态后 queue 释放 claim_token ⇒ 写自动 409 `lease_lost`。
+//
+// 幂等/冲突判据**不另造一把尺**：SQL 与判据全部走 `./transcript-store.js` 的 `createRecoveryRowStore`
+// （与轮记录同一个 `transcript-payload.js` 指纹）。这里只把它抛的 `dedup_payload_conflict` 翻成 HTTP 面。
+//
+// ⚠ 错误分类红线（本站与引擎之间最重要的一条）：**只有「同 dedupKey 异 payload」才是真冲突**（
+// `409 recovery_row_conflict`，不可重试 ⇒ 引擎按持久化失败收场，语义正确）；**其他任何失败都不许
+// 扮成 409**，必须让未捕获的 5xx 原样上招 ⇒ agentd 把 5xx 标可重试、**而读方法不进展无限重试**
+// （见 `runner/agentd.js` 的 `RECOVERY_READ_MAX_RETRIES`），否则「读坏了」会被重试成永久卡死，
+// 引擎那个 `recovery_rows_unreadable` 终局根本不会发生。
+
+/**
+ * 恢复行写入端点的体积闸。契约钉的是「恢复行**永不载正文**」（`messages: []` 恒空），但
+ * `tool-result-unledgered` 带一份 `toolResult`、`partial-text` 带**整段己未收敛的正文**
+（不截断、不封顶，契约会跟着文本长）⇒ 闸要给得下那两者，但**不许拿轮记录的 1 MiB 当默认值**：
+ * 恢复行的正文上限与轮记录不同源。取 512 KiB（今天本站不开 `partialPersistence` ⇒ 实际只走
+ * `tool-executed`，一两条百字节）：真撞上就是上游开了开关，比预期早一个量级报信，而不是静默丢证据。
+ */
+const MAX_RECOVERY_ROW_BYTES = 512 * 1024;
+
+/**
+ * 列宽与轮记录同口径：`dedup_key` 必填且 ≤255（迁移 0036 的 CHECK）。
+ * 与 `putSessionRound` 那个「≤256」不同——那边列上没 CHECK，本站新表把上限写进了 DB，
+ * 就得上这里当场 400（而不是让 PG 抛 23514 然被当成 5xx 无限重试）。
+ */
+const RECOVERY_DEDUP_KEY_MAX_LEN = 255;
+
+/** 恢复行 record 的入参校验（只校「能不能进这张表」，形状守卫归引擎读侧）。 */
+function assertRecoveryRowBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new InternalError(400, 'validation_failed', '恢复行 record 必须为对象', { details: { field: 'record' } });
+  }
+  if (body.kind !== 'recovery') {
+    // `kind` 是唯一判别键（引擎 `isRecoveryRow`）；不认识的行本站**不收**，而不是收了污染这张表。
+    throw new InternalError(400, 'validation_failed', 'record.kind 必须为 "recovery"', {
+      details: { field: 'kind', received: typeof body.kind === 'string' ? body.kind : typeof body.kind },
+    });
+  }
+  const dedupKey = body.dedupKey;
+  if (typeof dedupKey !== 'string' || dedupKey.length === 0 || dedupKey.length > RECOVERY_DEDUP_KEY_MAX_LEN) {
+    throw new InternalError(400, 'validation_failed',
+      `record.dedupKey 必填且 ≤${RECOVERY_DEDUP_KEY_MAX_LEN} 字符（引擎算好，宿主不重算）`,
+      { details: { field: 'dedupKey' } });
+  }
+  if (!Number.isSafeInteger(body.round) || body.round < 0) {
+    throw new InternalError(400, 'validation_failed', 'record.round 必须为非负安全整数', {
+      details: { field: 'round', received: String(body.round) },
+    });
+  }
+  const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
+  if (bytes > MAX_RECOVERY_ROW_BYTES) {
+    throw new InternalError(400, 'validation_failed',
+      `恢复行请求体超过 ${MAX_RECOVERY_ROW_BYTES} 字节上限`, { details: { bytes, limit: MAX_RECOVERY_ROW_BYTES } });
+  }
+}
+
+/** `GET /transcript/:key/recovery-rows` = 引擎 `listRecoveryRows`。空 = `[]`（**不是** 204）。 */
+export async function listSessionRecoveryRows(pool, { container, user, key, claimToken, writerRunId }) {
+  await fetchSession(pool, key, user.id);
+  await fetchWriterRun(pool, writerRunId, user.id, key);
+  await assertClaimToken(pool, writerRunId, claimToken);
+
+  const rows = await createRecoveryRowStore(pool).listRecoveryRows(key);
+  return { rows };
+}
+
+/** `PUT /transcript/:key/recovery-rows` = 引擎 `appendRecoveryRow`。`{added:true}` 写入 / `{added:false}` 幂等跳过。 */
+export async function appendSessionRecoveryRow(pool, { container, user, key, claimToken, writerRunId, body }) {
+  assertRecoveryRowBody(body);
+
+  await fetchSession(pool, key, user.id);
+  await fetchWriterRun(pool, writerRunId, user.id, key);
+  await assertClaimToken(pool, writerRunId, claimToken);
+
+  try {
+    const added = await createRecoveryRowStore(pool).appendRecoveryRow(key, body);
+    return { added };
+  } catch (err) {
+    // 同 key 异 payload = 真冲突 ⇒ 409（agentd 一律不重试 409，引擎按持久化失败收场，**不覆盖**既有行）。
+    // 其他错误（包括形状不合的 `transcript recovery row rejected`）**原样上招**：它们不是冲突，
+    // 扮成 409 就是把「宿主 bug」伪装成「幂等竞争」，排障时会追错方向。
+    if (err?.code === DEDUP_CONFLICT_CODE) {
+      throw new InternalError(409, 'recovery_row_conflict',
+        `同 dedupKey 已存在且 payload 不同（${err.key ?? ''}）`, {
+          details: {
+            dedupKey: err.key ?? null,
+            existingFingerprint: err.existingFingerprint ?? null,
+            incomingFingerprint: err.incomingFingerprint ?? null,
+            differingFields: err.differingFields ?? [],
+          },
+        });
+    }
+    throw err;
+  }
+}
+
+/** `DELETE /transcript/:key/recovery-rows` = 引擎 `clearRecoveryRows`。`{cleared:true}` 删了至少一行 / `false` 本来就没有。 */
+export async function clearSessionRecoveryRows(pool, { container, user, key, claimToken, writerRunId }) {
+  await fetchSession(pool, key, user.id);
+  await fetchWriterRun(pool, writerRunId, user.id, key);
+  await assertClaimToken(pool, writerRunId, claimToken);
+
+  const cleared = await createRecoveryRowStore(pool).clearRecoveryRows(key);
+  return { cleared };
 }
 
 // ---------------------------------------------------------------------------

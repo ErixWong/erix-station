@@ -42,6 +42,11 @@ export const MSG = {
  * `loadRunStateStatus` 是 station 的宿主读接口，不属于引擎能力校验。
  * `recall` 为 **legacy 兼容项**（0.8.0 recall 退役：引擎不再调用、worker 不注册 recall 工具；
  * U7 端点保留只读兼容，见 issue #43 拍板）——不属于 TranscriptStore 契约。
+ *
+ * issue #500（erix-agent 0.32/0.33 的**账本恢复行**三件套）：`appendRecoveryRow` / `listRecoveryRows` /
+ * `clearRecoveryRows` 都是引擎侧**可选**方法，本站全实现。**三个必须同进同出**：引擎按方法名单独探测，
+ * 只做一半就是「写了但读不回」（引擎以为证据已落账 ⇒ 比证据缺席更容易把副作用重放一遍）或
+ * 「读方法在但永远读不到」。**没有**旧 run 作用域兼容面：恢复行只有 session（transcript key）语义。
  */
 export const STORE_METHODS = new Set([
   'appendRound',
@@ -52,6 +57,10 @@ export const STORE_METHODS = new Set([
   'loadRunStateStatus',
   'saveRunSnapshot',
   'loadLatestRunSnapshot',
+  // issue #500：账本恢复行（引擎 0.32+/0.33.0 的可选能力，#530 之后没有快照兜底）。
+  'appendRecoveryRow',
+  'listRecoveryRows',
+  'clearRecoveryRows',
   // legacy（0.8.0 recall 退役，非 0.9.0 契约方法）：
   'recall',
 ]);
