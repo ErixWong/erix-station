@@ -27,6 +27,9 @@ import path from 'node:path';
 import { loadConfig } from './config.js';
 import { fetchUserTextTurns, fetchRunAssistantText } from './session-text.js';
 import { buildAutoTitlePrompt, generateTitle, resolveTitleLlmProvider } from './title-llm.js';
+// issue #596 片 A：自动改名的 system 也从 `platform_prompts` 取（与手工改名同一份生效值）。
+// `resolveEffectiveTitlePrompt` **永不抛**（读失败/无行/超时 ⇒ 回落内置），不破坏本文件的静默契约。
+import { resolveEffectiveTitlePrompt } from './platform-prompts.js';
 
 /** 自动标题长度上限（issue #88：≤30 字符左右；agent 侧生成时已按同口径清洗，此处再过一遍幂等）。 */
 export const AUTO_TITLE_MAX_LEN = 30;
@@ -141,6 +144,9 @@ export async function generateAutoTitle(pool, {
 
     const text = await generateTitle({
       provider,
+      // #596：DB 生效值（`''` ⇒ 内置 `TITLE_SYSTEM_PROMPT`）。与手工改名吃的是**同一条解析路径**，
+      // 两条链路不可能再长开（#322 收口的就是这件事）。仍不是守卫：外面照旧 `sanitizeTitle`。
+      systemPrompt: (await resolveEffectiveTitlePrompt({ pool, log })).text,
       userPrompt: buildAutoTitlePrompt(snippet),
       // 默认吃 `title-llm.js` 的现值（= `llm-chat.js` 的 15s）；显式传只服务于单测（假 fetch 超时要快）。
       ...(timeoutMs ? { timeoutMs } : {}),

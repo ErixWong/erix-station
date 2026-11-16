@@ -14,6 +14,10 @@ import {
   commitTempFile,
 } from './fsutil.js';
 import { OBSERVATION_FRESHNESS_SECONDS } from './portalloc.js';
+// issue #596 片 A：`~/AGENTS.md` 的追加段 / 覆写段来自 `platform_prompts`。
+// ⚠ 这是一对**双向引用**（`platform-prompts.js` 要从本文件拿渲染器与渲染预算）。两边都**只在函数体里**
+//   用对面导出的东西（模块求值期不读）⇒ ESM 循环引用安全；把它改成顶层常量就会碰到 TDZ。
+import { resolveEffectiveAgentsMd } from './platform-prompts.js';
 
 // 容器内用户名固定 erix（⚠️ 待决策者确认，user-space §2.4）。
 export const FDE_CONTAINER_USER = 'erix';
@@ -150,8 +154,30 @@ export function renderMcpJson() {
   return json({ mcpServers: {} });
 }
 
-export function renderHomeAgentsMd({ fdeName }) {
-  return [
+// ---------------------------------------------------------------------------
+// `~/AGENTS.md` 的渲染（issue #596 片 A：正文主体可被管理员整段覆写、末尾可追加一节）
+//
+// 三段式（契约 docs/design/admin-prompts-panel-2026-11-16.md §5）：
+//   正文主体 = override ≠ '' ? override : 内置模板正文        ← 覆写模式换掉的就是这一段
+//   追加段   = addendum ≠ '' ? 节标题与引言（平台写）+ 管理员正文（逐字节照搬） : ''
+//   标识行   = `（FDE 标识：<fdeName>）`                      ← 两种模式下都由**代码**追加，永远最后一行
+//
+// ⚠ **不传新入参时输出逐字节等于今天**（判据 `M1`）：`AGENTS_MD_TEMPLATE_BODY` 就是原来那个数组的
+//   `join('\n')`，标识行仍是 `'\n\n' + 标识行 + '\n'` 收尾 ⇒ 既有断言与物化幂等（sha 不变 ⇒ 不重写）
+//   全部不受影响。
+//
+// 追加段的**节标题与引言是平台写的**（措辞由契约定稿：与上面 8 条硬约束冲突时以**上面**为准），
+// 管理员正文**逐字节照搬、不加工不改写**（含首尾空白也照搬，代码只在它前后各留一个空行）。
+// ---------------------------------------------------------------------------
+
+/** 各段之间的分隔（一个空行）。字节数进 SQL 侧的渲染预算（见 `agentsMdRenderBudget`）。 */
+export const AGENTS_MD_SECTION_SEPARATOR = '\n\n';
+
+/** 管理台展示与写侧渲染闸共用的固定示例工位名（零动态量：口径见契约 §6）。 */
+export const AGENTS_MD_EXAMPLE_FDE_NAME = 'example';
+
+/** 内置模板的**正文主体**（不含标识行、不含末尾换行）。`renderHomeAgentsMd()` 缺省就渲染它。 */
+export const AGENTS_MD_TEMPLATE_BODY = [
     '# FDE 工位约定',
     '',
     '> 本文件由平台（materializer）生成，属平台所有（root:root 0644）；改动会被对账重物化覆盖。',
@@ -246,10 +272,78 @@ export function renderHomeAgentsMd({ fdeName }) {
     '- 可用期间的正确做法：直接起平台已下发的钉位代理 `python3 ~/bin/github-pinproxy.py`（只监听回环、监听端口见脚本首行用法注释，平台管理别改；端口被占可传参换），再 `git -c http.proxy=http://127.0.0.1:<端口> fetch origin`——**保完整历史**（git 无 `https.proxy` 配置键，`http.proxy` 对 https 远端同样生效）。自己另写代理时脚本放 `~/bin` 不放 `/tmp`（`/tmp` 不持久）。',
     '- 兑底（拿不到代理时）：`codeload.github.com/<owner>/<repo>/tar.gz/HEAD` 拉默认分支快照——**没有历史**，拿到后记得用上面的方法 `git fetch` 补回。',
     '- 容器内**没有 ssh 客户端**，不要规划 SSH 备选路径；`codeload.github.com` 通常不受该解析问题影响。',
-    '',
-    `（FDE 标识：${fdeName}）`,
-    '',
-  ].join('\n');
+].join('\n');
+
+/**
+ * 追加段的节标题与引言（**由平台撰写**，管理员正文由代码逐字节接在后面）。
+ * 措辞是契约定稿的（§5），要改先改契约。末尾自带一个空行，与正文之间不留第二个空行。
+ */
+export const AGENTS_MD_ADDENDUM_HEADER = [
+  '## 平台补充约定（由平台管理员撰写）',
+  '',
+  '> 本节是对上面平台约定的**补充**。与上面的硬约束（预览链路那 8 条）冲突时，**以上面为准**；',
+  '> 除非本节明确写出「覆盖上面第 N 条」。',
+  '',
+].join('\n');
+
+/** 标识行：两种模式下都由代码追加，永远是文件最后一行（不可被管理员编辑）。 */
+export function agentsMdIdentityLine(fdeName) {
+  return `（FDE 标识：${fdeName}）`;
+}
+
+/**
+ * 渲染整份 `~/AGENTS.md`。
+ *
+ * @param {object} [opts] `{ fdeName, addendum = '', override = '' }`
+ *   `addendum` / `override` 来自 `platform_prompts`（`portal/src/platform-prompts.js` 的读侧）；
+ *   **缺省 `''` ⇒ 逐字节等于本单之前的输出**（判据 `M1`）。
+ */
+export function renderHomeAgentsMd({ fdeName, addendum = '', override = '' } = {}) {
+  const body = override === '' ? AGENTS_MD_TEMPLATE_BODY : String(override);
+  const addBlock = addendum === ''
+    ? ''
+    : `${AGENTS_MD_SECTION_SEPARATOR}${AGENTS_MD_ADDENDUM_HEADER}${String(addendum)}`;
+  return `${body}${addBlock}${AGENTS_MD_SECTION_SEPARATOR}${agentsMdIdentityLine(fdeName)}\n`;
+}
+
+/**
+ * 渲染字节预算的**常量部分**（写侧那条 SQL 要拿它当参数，见 `platform-prompts.js` 的 `SAVE_SQL`）。
+ *
+ * 为什么要有这张表：注入侧（`runner/lib/agents-md.js`）对**整份文件**有 16 KiB 上限，超了**静默截断**
+ * 只留 marker ⇒ 写侧必须在保存前算出「渲染后的整份文件多大」。而那条 SQL 是一体的（旧值 + upsert +
+ * 审计同一条语句，并发下 `previous_*` 才取得到紧邻的旧值），渲染算术只能在 SQL 里做，
+ * 于是**常量由 JS 算好当参数送进去**（SQL 里不抄数字，口径同 0036 的 `$5/$6`）。
+ *
+ * 算术（`agentsMdRenderedBytes`）与真渲染（`renderHomeAgentsMd`）的等价性由
+ * `portal/test/platform-prompts.test.js` 的 P6b 逐组钉住，不是靠注释声明。
+ *
+ * ⚠ `fdeName` 用**固定示例名**（默认 `example`）：标识行的长度随工位名变化，而写侧在保存时**不知道**
+ * 会渲染给哪些工位（全部启用中的 FDE 都要重物化）。取固定名 ⇒ 闸是确定的、可测的、与 DTO 里
+ * `effectiveText` 同一名（口径：契约 §6）。真实工位名的差异只有标识行的几个字节，
+ * 而闸留的是「8 KiB 追加段 + 9 KiB 模板」这一档余量，不靠这几个字节兜底。
+ */
+export function agentsMdRenderBudget({ fdeName = AGENTS_MD_EXAMPLE_FDE_NAME } = {}) {
+  const sepBytes = Buffer.byteLength(AGENTS_MD_SECTION_SEPARATOR);
+  return {
+    fdeName,
+    separatorBytes: sepBytes,
+    templateBytes: Buffer.byteLength(AGENTS_MD_TEMPLATE_BODY),
+    // 追加段里除管理员正文本身之外的一切：前面的分隔 + 节标题与引言。
+    addendumOverheadBytes: sepBytes + Buffer.byteLength(AGENTS_MD_ADDENDUM_HEADER),
+    // 尾部：分隔 + 标识行 + 文件末尾那个换行。
+    identityTailBytes: sepBytes + Buffer.byteLength(agentsMdIdentityLine(fdeName)) + 1,
+  };
+}
+
+/** 按预算常量算「渲染后的整份文件字节数」（与 `renderHomeAgentsMd` 同口径，P6b 钉等价性）。 */
+export function agentsMdRenderedBytes(
+  budget, { addendum = '', override = '' } = {},
+) {
+  const bodyBytes = override === '' ? budget.templateBytes : Buffer.byteLength(String(override));
+  const addBytes = addendum === ''
+    ? 0
+    : budget.addendumOverheadBytes + Buffer.byteLength(String(addendum));
+  return bodyBytes + addBytes + budget.identityTailBytes;
 }
 
 // P5 去项目化（directory-as-project §3/§5）：ports.json 升为 FDE 级单一文件 ~/.erix/ports.json——
@@ -313,13 +407,20 @@ export function hostPathFor(root, fdeName, containerPath) {
  * 骨架 + FDE 级 ports.json；旧项目脚手架靠 stale 清理（manifest 机制）自然移除。
  * @returns { files: [{ containerPath, hostPath, content, mode }] }
  */
-export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root, generation }) {
+export function buildFilePlan({
+  fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root, generation, platformPrompts = null,
+}) {
   const files = [];
   const add = (containerPath, content, mode = FILE_MODE) => {
     files.push({ containerPath, hostPath: hostPathFor(root, fdeName, containerPath), content, mode });
   };
 
-  add(`${CONTAINER_HOME}/AGENTS.md`, renderHomeAgentsMd({ fdeName }));
+  // #596 片 A：`AGENTS.md` 的追加段 / 覆写段来自 `platform_prompts`（由调用方从 DB 取好传进来 ⇒
+  // 本函数**仍是纯函数**：同 DB 快照 → 字节级相同输出，物化幂等判据不受影响）。不传 = 内置模板。
+  const prompts = platformPrompts ?? {};
+  add(`${CONTAINER_HOME}/AGENTS.md`, renderHomeAgentsMd({
+    fdeName, addendum: prompts.addendum ?? '', override: prompts.override ?? '',
+  }));
   add(`${CONTAINER_HOME}/bin/github-pinproxy.py`, GITHUB_PINPROXY_SCRIPT);
   add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmBaseUrl }));
   add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson());
@@ -361,11 +462,16 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
    * 渲染 + 落盘该 FDE 全部平台文件 + manifest（提交点）。
    * 返回 manifest 内容与最终 generation（供测试断言）。
    */
-  async function materialize({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, generation, prevManifest, materializedAt = new Date() }) {
+  async function materialize({
+    fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, generation, prevManifest,
+    platformPrompts = null, materializedAt = new Date(),
+  }) {
     const rootReal = path.resolve(root);
     const prevFiles = (prevManifest && prevManifest.files) || {};
 
-    const files = buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root: rootReal, generation });
+    const files = buildFilePlan({
+      fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root: rootReal, generation, platformPrompts,
+    });
 
     ensureWorkspaceDirs(files);
 
@@ -728,6 +834,9 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
         continue;
       }
       const prevManifest = await readPrevManifest(config.userSpaceRoot, state.fdeName);
+      // #596：每次物化现读一次提示词（无缓存 ⇒ 管理台保存后下一次物化就按新值渲染）。
+      // 读失败/无行/超时 ⇒ 回落内置（`resolveEffectiveAgentsMd` 永不抛），物化照常跑。
+      const platformPrompts = await resolveEffectiveAgentsMd({ pool, fdeName: state.fdeName, log });
       await mat.materialize({
         fdeName: state.fdeName,
         baseDomain: state.baseDomain,
@@ -736,6 +845,7 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
         observedPorts: state.observedPorts,
         generation: Number(row.revision),
         prevManifest,
+        platformPrompts,
       });
       await markMaterializePublished(pool, row.id);
       processed += 1;
@@ -774,7 +884,9 @@ export async function rebuildAllFdes(pool, config, { log = console } = {}) {
     const rev = await pool.query(`SELECT revision FROM materialize_revisions WHERE fde_id = $1`, [u.id]);
     const generation = Number(rev.rows[0]?.revision ?? 1);
     const prevManifest = await readPrevManifest(config.userSpaceRoot, state.fdeName);
-    await mat.materialize({ ...state, generation, prevManifest });
+    // 同 `runMaterializerOnce`：启动全量重建也要把管理员写的提示词渲进去（否则重建会把它们抹掉）。
+    const platformPrompts = await resolveEffectiveAgentsMd({ pool, fdeName: state.fdeName, log });
+    await mat.materialize({ ...state, generation, prevManifest, platformPrompts });
   }
   return users.rows.length;
 }
