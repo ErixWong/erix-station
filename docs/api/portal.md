@@ -3026,7 +3026,7 @@ Content-Type: application/json
 {
   "addendum":    { "text": "", "isDefault": true, "maxBytes": 8192, "bytes": 0 },
   "agentsMd":    { "override": "", "isOverridden": false, "isDefault": true,
-                   "templateBytes": 9231, "effectiveBytes": 9231, "effectiveText": "# FDE 工位约定\n…",
+                   "templateBytes": 9021, "effectiveBytes": 9021, "effectiveText": "# FDE 工位约定\n…",
                    "maxBytes": 16384, "renderedLimitBytes": 16384 },
   "titlePrompt": { "text": "", "isDefault": true, "defaultText": "<内置 TITLE_SYSTEM_PROMPT>",
                    "maxBytes": 2000, "bytes": 0 },
@@ -3035,6 +3035,10 @@ Content-Type: application/json
   "updatedAt": null, "updatedBy": null, "reason": "no_row"
 }
 ```
+
+⚠ 例子里的 `9021` 只是「今天这一份内置模板按 `example` 渲染出来的字节数」，**不是契约值** ——
+模板一改它就变（内置模板的真相在 `materializer.js`，红线是它全文零端口数字、零伞域字面量）。
+
 
 | 键 | 语义 |
 |---|---|
