@@ -529,3 +529,64 @@ describe('F7 三条生效时机各不相同', () => {
     expect(text(w, 'source-addendum')).toContain('built-in');
   });
 });
+
+describe('store 层：三个 save action 与「连长度都算不出」那道闸', () => {
+  it('addendum / agentsMd / titlePrompt 各打自己的 URL（slug 只在 lib 一处）', async () => {
+    const calls = stubDefault(dto());
+    await mountView();
+    const store = useAdminStore();
+
+    await store.saveAddendumPrompt('a');
+    await store.saveAgentsMdPrompt('b');
+    await store.saveTitlePrompt('c');
+    expect(puts(calls).map((call) => call.url)).toEqual([
+      PUT_PATHS.addendum, PUT_PATHS.agentsMd, PUT_PATHS.titlePrompt,
+    ]);
+  });
+
+  it('草稿不是字符串 ⇒ 零请求 + 指到那张卡（不发一个必然 400 的垃圾体）', async () => {
+    const calls = stubDefault(dto());
+    await mountView();
+    const store = useAdminStore();
+
+    const err = await store.saveAddendumPrompt(undefined);
+    expect(err).toContain('连长度都算不出');
+    expect(puts(calls)).toHaveLength(0);
+    expect(gets(calls)).toHaveLength(1);
+    expect(store.promptSaveField).toBe('addendum');
+    expect(store.promptSavedField).toBeNull();
+  });
+
+  it('成功后状态里是响应 DTO（含 materializeEnqueued），`promptNotice` 是语义结论', async () => {
+    stubDefault(dto(), () => jsonResponse(200, dto({
+      addendum: { text: '落库的', isDefault: false, maxBytes: 8192, bytes: 9 },
+      materializeEnqueued: 0,
+    })));
+    await mountView();
+    const store = useAdminStore();
+
+    await store.saveAgentsMdPrompt('x');
+    expect(store.platformPrompts?.addendum.text).toBe('落库的');
+    expect(store.platformPrompts?.materializeEnqueued).toBe(0);
+    expect(store.promptNotice).toBe('not_enqueued');
+    expect(store.promptSavedField).toBe('agentsMd');
+    expect(store.promptSaving).toBe(false);
+  });
+});
+
+describe('英文 locale 的同一页（双语都真的写了）', () => {
+  it('物化未通知那句、只读卡那句都是英文', async () => {
+    setLocale('en');
+    stubDefault(dto(), () => jsonResponse(200, dto({
+      addendum: { text: 'x', isDefault: false, maxBytes: 8192, bytes: 1 },
+      materializeEnqueued: 0,
+    })));
+    const w = await mountView();
+    await setDraft(w, 'addendum', 'x');
+    await click(w, 'save-addendum');
+
+    expect(text(w, 'materialize-addendum')).toContain('materialization was not notified');
+    expect(text(w, 'readonly-no-fulltext')).toContain('does **not** show their text');
+    expect(text(w, 'source-addendum')).not.toMatch(/[一-鿿]/);
+  });
+});

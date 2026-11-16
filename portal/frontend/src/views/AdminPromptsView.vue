@@ -18,7 +18,6 @@ import { useI18n } from 'vue-i18n';
 import { useAdminStore } from '../stores/admin';
 import {
   formatBytes,
-  materializeNoticeOf,
   shortUuid,
   utf8ByteLength,
   type PlatformPrompts,
@@ -164,13 +163,14 @@ function fieldErrorOf(field: PromptFieldKey): string | null {
 
 /**
  * 保存后的物化通知那一行（§4.16-4）。只在**刚保存成功那张卡**下面出现。
- * `titlePrompt` 不涉物化（响应里那个 0 是恒 0）⇒ 这一行**不出现**，否则就是说假话。
+ * 语义结论不在这里算（那是 lib 的 `materializeNoticeOf`，store 已折成 `promptNotice`）：
+ * 两处各算一遍就是两本账。`titlePrompt` 不涉物化（响应里那个 0 是恒 0）⇒ 这一行**不出现**，
+ * 否则就是说假话。
  */
 function materializeText(field: PromptFieldKey): string | null {
   if (admin.promptSavedField !== field) return null;
-  const notice = materializeNoticeOf(field, prompts.value?.materializeEnqueued ?? null);
   const count = prompts.value?.materializeEnqueued ?? null;
-  switch (notice) {
+  switch (admin.promptNotice) {
     case 'enqueued': return t('admin.prompts.savedEnqueued', { count });
     case 'not_enqueued': return t('admin.prompts.savedButNotNotified');
     case 'enqueued_unknown': return t('admin.prompts.savedNoticeCountUnknown');
@@ -397,7 +397,7 @@ onMounted(async () => {
         v-if="materializeText(card.field) !== null"
         :data-test="`materialize-${card.field}`"
         class="text-xs"
-        :class="materializeText(card.field) === t('admin.prompts.savedButNotNotified')
+        :class="admin.promptNotice === 'not_enqueued' || admin.promptNotice === 'enqueued_unknown'
           ? 'text-amber-700' : 'text-black/55'"
       >{{ materializeText(card.field) }}</p>
     </div>
