@@ -843,6 +843,8 @@ export const en = {
       noFilesPicked: 'No files picked: required when creating, optional when editing' +
         ' (nothing picked = metadata only).',
       pickedSummary: '{count} files picked, {bytes} total',
+      detailMissingHint: 'Could not read this entry\u2019s details: the "when to use" field and' +
+        ' the body may be empty -- fill them in before submitting, or you may clear the originals.',
       pathIssue: {
         empty: 'the path is empty',
         absolute: 'absolute path (not allowed)',

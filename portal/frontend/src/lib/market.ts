@@ -130,6 +130,9 @@ export interface AdminMarketItem extends MarketListItem {
 export interface AdminMarketDetail extends AdminMarketItem {
   whenToUse: string;
   descriptionMd: string;
+  /** 编辑表单回填用（§7-3 的列表不保证带这些元数据 ⇒ 编辑前先取一次详情）。 */
+  author: string | null;
+  license: string | null;
   tools: MarketTool[];
   files: MarketFileEntry[];
   warnings: SecurityWarning[];
@@ -375,6 +378,8 @@ export function normalizeAdminDetail(raw: unknown): AdminMarketDetail | null {
     ...adminExtras(row),
     whenToUse: strOrEmpty(row.when_to_use ?? row.whenToUse),
     descriptionMd: strOrEmpty(row.description_md ?? row.descriptionMd),
+    author: str(row.author),
+    license: str(row.license),
     tools: toolsOf(row),
     files: filesOf(row),
     warnings: warnings ?? [],
