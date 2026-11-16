@@ -1326,6 +1326,32 @@ station-portal user enable  --login <login>
 - **与 SSE 的关系**：独立 REST 通路，不影响 §5.2.3 首连不补发 / 断线重连补发语义。
 - **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑） / **`persistence_error`**（#371-A：引擎落盘失败告警，走 `diagnostics.error` 而**不是** `onEvent`——本站此前没传 `diagnostics`，真机全库该类型 **0 行**，非致命降级因此彻底隐形；前端只把 `fatal === false` 刷成中性分隔行，致命那条仍由 `run_end` 的 `persistence_failed` 负责）；**第 18~21 类（issue #421）**`compaction_strategy_fallback` / `persistence_capability_degraded` / `resume_journal_skipped`（`model_metadata_missing` 早在 #182 时就已列入）——引擎承诺、本站以前订不到那一族，不进则又是「实时没有、刷新后也没有」；而 **`run_outcome`（第 22 类）是写明了理由的显式不进**（与 `run_end` 重叠且无读者，对账测：`portal/test/event-surface-contract.test.js`）；**第 28 类 `host_steer_injected`（erix-agent 0.32.0 唯一新增的 LoopEvent，#499）同样显式不进**——本站不传 `capabilities.hooks.nextUserTurn` ⇒ 结构上不产生该事件，订得到（水位线推进）但不刷行、不回放、不下发（理由同 `run_outcome`，钉在同一份对账测的豁免表，只加前端 `EVENT_TYPES` 不写决定会被它的 S2 判红）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `tool_call_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。**#502 的补充**：三个碎片型自本单起**根本不落库**，「不下发」对它们是双重成立（表里没有 + 白名单不列）；`tool_call_delta` 是本单唯一**从白名单里摘掉**的类型（它以前在，摘它的理由是「行没了」，成形参数在 `tool_use.input`），摘除理由必须写——前端 `HISTORY_REPLAY_TYPES` 与它逐项对齐，由 `portal/test/event-surface-contract.test.js` 对账。**#425 的消费侧补充（零后端变更）**：白名单里的 `round_end` 载荷带 `usage`（本 run 累计真值），前端动量状态机**只**吃它的 `usage` 与 `context_window` 两个展示量（并把登记的 run 直接标成已结束），其余字段与所有其它历史帧仍一律不驱动运行态 ⇒ 硬刷新后「上次 run 用了多少 token / 窗口多大」仍在，而轮号、时长、速率、相位照旧不重建。
 - **分页**（§1.3 keyset）：默认取最新 `limit` 条（升序返回，`limit` 默认 500、上限 2000）；`before=<seq>` 取更早一批；`next_cursor` 非 null 表示还有更早批次。
+  - **线上只有一个游标字段**：`next_cursor`。后端内部那个 `hasOlder`（主窗口多取一行算出来的）**不上线**；
+    `has_old_events` / `hasOldEvents` 这个名字在**代码里一处都没有**（现查 2026-11-16：
+    `grep -rn "has_old_events\|hasOldEvents" portal/src portal/frontend/src runner` ⇒ **0 处**；本节与台账
+    里出现该词只是**在说它不存在**）⇒ 客户端要续页只能靠 `next_cursor`，没有第三个字段可猜
+    （issue #514 返修时现验，别照着「大概有个 has_old_events」的记忆改客户端）。
+  - **`next_cursor` 的三种来源**（issue #514 返修，二次审计第 1 条；实现在 `http.js#handleSessionEventsHistory`）：
+
+    | 本页状态 | 游标取自 | 为什么 |
+    |---|---|---|
+    | 有白名单真实行（常规页） | 本页**最老那条真实事件**的 `seq`（且 `hasOlder` 为真） | 页的所有权属于真实事件：把游标压到页界之外会**跳过真实事件**，比丢一条分隔条更坑 |
+    | **零白名单行**且候选发现被 `LIMIT` 截断（会话尾巴页） | 已发现的 `run_end` 行里**最小的 `seq`** | 「空页」不是到底，它意味着「游标之下还有内容，只是全不是白名单事件」；不给游标 ⇒ 被截掉的那批**永远没有页可达**。那种页的窗口是 **`[0, before)`**，不同 `before` 的两次请求在同一段尾巴上**重叠是游标分页的本性**，不消除——不重不漏由**游标严格递减 + 前端幂等键**保证（现读坐标与理由见 §4.4a-2） |
+    | 零白名单行且发现**没**被截断 | `null`（确实到底） | 发现查询按主窗口同一口径多取一行**探针**（`LIMIT limit + 1`）⇒ 「还有没有更老的」是事实而非「恰好返了 `limit` 条」的猜测，不许多跑一趟空页 |
+
+  - **客户端到底靠什么续页（2026-11-16 现读，别照记忆写）**：
+    | 字段 | 落在哪 | 语义 |
+    |---|---|---|
+    | `GET /api/sessions/:id` 的 `next_cursor` | `workbench.ts:1106` → `olderMessagesCursor`（声明在 `343`） | 决定「**还要不要继续翻页**」：`loadOlderMessages()` 的入口闸是它（`1129-1130` 的 `if (!sid \|\| cursor == null \|\| olderLoading) return false`），「加载更早消息」按钮的 `v-if` 也是它（`StreamPanel.vue:441`） |
+    | 本端点的 `next_cursor` | `workbench.ts:1107` → `olderEventsCursor`（声明在 `344`） | 决定「**更早的事件页从哪里开始**」：`1137-1140` 用它拼 `?before=`，`1145` 再被本次响应覆盖 |
+
+    ⇒ 两个游标**任一为 null 都会让事件翻页停住**，而本单改的是**后者**（服务端在尾巴页给出可续的 `next_cursor`）。
+    前者不由本端点决定，所以「只改游标而让续页条件落空 = 没修」这条审计红线要单独成立：现查 `sessions.js:607-612`
+    —— `POST /api/sessions/:id/messages` 每次输入都先写一行 `messages`（`role='user'` 锚点行）再入队 run ⇒
+    「连点取消 / 批量清队列」那段尾巴上**每条 run 都配一行 user 消息**，消息游标在那一段仍非 null ⇒
+    客户端会继续翻页 ⇒ 本单补的事件游标真的会被消费。**登记的边界**：若一段尾巴连 user 锚点都没有
+    （纯宿主注入之类，本站现无此路径），消息游标会先归 null，事件侧游标再好也不会被消费——那是前端
+    续页闸的面（要改就得让 `loadOlderMessages` 允许「只有事件游标」也继续），本单不动，写在这里。
 - **大小防护**：payload 字符串叶值统一截 2000 字符（`tool_use.input` / `tool_call_delta.arguments_delta` 可能很大），JSON 形状保持合法。
 - **鉴权**：同 `GET /api/sessions/:id`（session cookie；非属主 / 不存在 → `404 not_found`，不泄露存在性）。
 
@@ -1350,7 +1376,7 @@ station-portal user enable  --login <login>
 
 | # | 条件 | 为什么 |
 |---|---|---|
-| 1 | 该 run 出现在**本次响应窗口**里（窗口行的 `run_id` 去重） | 窗口里没这个 run ⇒ 连候选判定查询都不发 |
+| 1 | 该 run 是**本页的候选**：窗口白名单行里出现过它的 `run_id`，**或**本页 seq 窗口内有它的 `run_end` 行（issue #514：「`queued` 从未开始就被取消」的 run 只写一行 `run_end`，在白名单行里零影子 ⇒ 旧判据下它既拿不到正文项也拿不到占位项） | 两路都没命中 ⇒ 连候选判定查询都不发（零候选零额外查询，成本红线不变） |
 | 2 | `runs.status IN ('finished','failed')` **且**该 run **零助手锚点**（`messages` 里 `role='assistant'` 的任意行，**含 `synthetic = true`**） | `queued`/`running`/`cancelling` 不是终态——「还在跑就标已中止」是新造的误导；**有锚点的 run 绝不能再渲染一遍**（重复正文就是这个坑，也正是 `partial_text` 只在**无锚点**时才写的原因，两处判据逐字同构） |
 | 3 | 两处来源拼出**非空**文本 ⇒ 正文项；**都空** ⇒ **占位项**（`text: ''` + `placeholder: true`） | 占位是 #278「不许留空白」的落点：这次 run 一个字都没留住时，界面仍要有一行中性提示，而不是空气泡。**注意占位只在这里发**，SSE 补发通路**不发**占位帧 |
 
@@ -1391,7 +1417,7 @@ station-portal user enable  --login <login>
   （走既有 `run_events_run_idx (run_id, seq)`）拿完两处来源。**零 DDL、零新索引**（形态 M 明确不新增
   也不删除任何索引，理由见 `docs/maintenance/task-ledger.md` §8.125）。
 - **分页（形态 M 修的第四条审计）**：合成项**只在它 `seq` 所属的那一页出现**——`before` 已经切过它的
-  `seq` 就不给（`buildHistorySynthItems(pool, rows, { before })`）。它 `seq = MAX(seq)` 不受窗口约束，
+  `seq` 就不给（`buildHistorySynthItems(pool, rows, { before, sessionId, pageLow, limit })`）。它 `seq = MAX(seq)` 不受窗口约束，
   不加这道闸就是「往上翻一页，同一段正文再重演一遍」。同一条闸同时管 `run_termination`（§4.4a-2），
   两类合成项共用。
 - **排序 / limit**：合成项参与升序排序（按 `seq`），但**不占 `limit`、不参与 `next_cursor` / `hasOlder` 判定**
@@ -1451,10 +1477,16 @@ station-portal user enable  --login <login>
 run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在本**只读**端点里从 `runs` 的终态字段
 （`status` + `termination`）**投影**一条展示项。
 
-**存在性判据（三条同时成立，一条 run 至多一条）**：① 该 run 出现在**本次响应窗口**里；
+**存在性判据（三条同时成立，一条 run 至多一条）**：① 该 run 是**本页的候选**——它出现在本次响应窗口的
+**白名单行**里，**或**本页 seq 窗口 `[本页最小 seq, before)` 内有它的 `run_end` 行（issue #514 补的：
+「`queued` 从未开始就被取消」的 run 只写一行 `run_end`，在白名单行里**零影子**）；
 ② `runs.status IN ('finished','failed')`（`queued`/`running`/`cancelling` 一律不合成——「还在跑就标已中止」
 是新造的误导）；③ `termination.reason` 是**非空字符串**（缺 `termination` / 脏载荷 ⇒ 不合成：**绝不拿
 `status` 编一个 reason**）。
+
+⚠ ① 的两路**都只用来发现 run id**：白名单行照旧下发，而 `run_end` 行照旧**永不下发**（红线）——
+把 `run_end` 塞进 `HISTORY_EVENT_TYPES` / 前端 `HISTORY_REPLAY_TYPES` 就是把一条运行态语义事件喂给
+回放（它会关停止按钮 / 驱动终态状态机，#217 / #236 定的红线）。
 
 | 字段 | 类型 | 口径 |
 |---|---|---|
@@ -1473,10 +1505,73 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 - **幂等**：前端用 `renderedIds` 的 `termination:<run_id>` 去重；实时 `run_end` 渲染后立即登记同一个
   id ⇒ 同一视图里「实时一条 + 历史一条」不会发生；硬刷新后 `renderedIds` 重建 ⇒ 历史项正常渲染。
 - **成本**：与 §4.4a-1 **共用同一条** `runs` 查询（`r.id = ANY(...)` + 终态过滤 + `MAX(seq)` 相关子查询，
-  走既有 `run_events_run_idx`）⇒ 本次窗口没有 run 时**一条查询都不发**，有 run 时**也只有那一条**（不重查）。
+  走既有 `run_events_run_idx`）⇒ 本次窗口没有 run **且页内没有 `run_end` 行**时一条 `runs` 查询都不发，
+  有候选时**也只有那一条**（不重查）。issue #514 新增一条**候选发现**查询（返修后取两列，并按主窗口
+  同一口径多取一行探针）：
+
+  ```sql
+  SELECT run_id, seq FROM run_events
+   WHERE session_id = $1 AND type = 'run_end' AND seq >= $2   -- 本页最小白名单 seq（空页 ⇒ 0）
+     [AND seq < $3]                                           -- before（游标之下才属于本页）
+   ORDER BY seq DESC LIMIT $4                                 -- $4 = limit + 1（多取一行探针）
+  ```
+
+  每次响应**至多一条**；非空页的窗口被 `[pageLow, before)` 夹住，空页是 `[0, before)` 那一段。
+  **准确的算术（二次审计 LOW-1 + 一次性真库自证，别再被读成「扫过的行数 = 1」）**：
+  - 未缓存时一次 history 响应最坏 **6 条查询** = handler 5 条（① 会话归属 `chat_sessions`、② 主窗口
+    `run_events`、③ 本条候选发现、④ `runs` 批量投影、⑤ `partial_output` 的正文投影）+ 会话鉴权 1 条。
+    #514 之前是 5 条，本单**多出的就是 ③ 这一条**；③ 的候选 id 并进 ④（不为它另打一条 `runs`）。
+  - `LIMIT` 封的是**返回条数**，不是**排序 / 过滤前的行数**。③ 在执行计划里有**两条访问路径**，
+    planner 按统计选（现查读数见下），两条都带残余过滤 `type = 'run_end'`：
+    | 路径 | 什么时候被选中 | 扫的量 |
+    |---|---|---|
+    | `run_events_session_id_seq_key`（`UNIQUE (session_id, seq)`）**反向扫** | `run_end` 相对 `limit` 较密、或页窗口很窄 | 本页窗口内的**事件行数**（取满 `LIMIT` 即停 ⇒ 扫描量 ≥ 返回条数） |
+    | `run_events_run_end_key`（部分唯一 `WHERE type='run_end'`）+ **Top-N 排序** | `run_end` 稀疏（部分索引命中面远小于会话总行数） | 全库/该会话的 **`run_end` 行数**（与主窗口的 seq 窗口**无关**），随后 `Sort Method: top-N heapsort` 取前 `limit + 1` |
+  - ⇒ 两侧各说对一半：**既有文档**那句「走 `UNIQUE (session_id, seq)` 倒序扫」只是其中一条路；审计
+    LOW-1 那句「`run_events_run_end_key` 在 `run_id` 上帮不上这条查询」也只是另一条——**它在稀疏时
+    恰恰是 planner 选中的那条**（它同时保证「每 run 至多一行 ⇒ 候选数有界」）。别把任一句当承诺。
+  - **真库读数**（2026-11-16，一次性容器 `postgres:16` / 16.15，形状照 `docs/data/schema.sql:355-372`
+    现建，**不是** dev 库、**不是** migrations 全量 ⇒ 它证明的是「计划长这样、这两条路真的会出现」，
+    不是「dev 库此刻就走这条」）：全库 255,005 行、目标会话 55,005 行、目标会话 `run_end` 4 条时，
+    `… AND seq >= 0 ORDER BY seq DESC LIMIT 3` ⇒ `Bitmap Index Scan on run_events_run_end_key`
+    + `top-N`（`Execution Time: 0.03 ms`）；把该会话 `run_end` 灌到 5,004 条、`LIMIT 501` ⇒
+    `Sort Method: top-N heapsort Memory: 95kB`、`rows=5004 → 501`、`Execution Time: 2.6 ms`；
+    同一时刻再跑 `LIMIT 3` ⇒ 计划**改走** `Index Scan Backward using run_events_session_id_seq_key`
+    + `Filter: (type = 'run_end')`。**结论与代码无关、只与文档有关**：这条查询的成本上界是
+    「该会话的 `run_end` 行数」或「页窗口内的事件行数」取较小者，两者都不受 `LIMIT` 约束。
+  - 把 ③ 并进 ② 的 `UNION ALL` 一条路（省掉这一条、并顺手消掉下面残余 ②）需要 fake 能解析 UNION，
+    本单不做，登记为后续单。
+- **尾巴页（游标之下零白名单行）的窗口与重叠**（#514 返修，二次审计第 3 条）：那种页的候选发现窗口是
+  **`[0, before)`**——不是某个「有界尾巴」。于是两次独立请求（`before` 分别取两个不同的值）在同一段尾巴上
+  **重叠是游标分页的本性**，本单不消除它；消除重复渲染的是**游标 + 前端幂等键**：
+  - 游标取**已发现行里最小的 `seq`**，下一页窗口是 `[0, 那个 seq)` ⇒ 与本页窗口**严格不重叠**，
+    且逐页严格递减 ⇒ 整条翻页链**不重不漏**（用例：三页翻完 6 条 `run_end`，合起来不多不少不重复）。
+  - 即便重叠真发生（客户端重试 / 同一 `before` 重放），前端也只画一根条：`addRunTermination` 的
+    **幂等键 = `termination:<run_id>`**（现读坐标 `portal/frontend/src/stores/workbench.ts:574-598`，
+    `id` 在 `579`、去重在 `581-583`；同一个键还被实时 `run_end` 渲染后经 `markRunTerminationRendered`
+    登记，见 `#600`）⇒ 同一视图里重复到达的同一 run 分隔条**当场被丢**，不会画两根。
+    `partial_output` 同理，键是 `partial:<run_id>`（同文件 `#addPartialOutput`）。
 - **已接受边界**：① 只覆盖「该 run 真落在本次响应窗口里」的那一页（同 §4.4a-1 的窗口口径）；
-  ② 合成项**不带 `usage`**（实时 `run_end` 的 `· tokens a+b` 后缀在历史里不重建——与 #282「刷新后运行态数字
+  候选发现的候选数上界 = `limit`（极端会话「一整页都是被取消的 run」时，一页最多带出 `limit` 条分隔条）；
+  ② **非空页**的截断残差（本单**认下来不动**）：当一页里既有白名单行、又有超过 `limit` 条 `run_end` 行时，
+  发现查询按 `limit` 截断，而比它更老的那几条落在 `[pageLow, minDiscoveredSeq)` 之间——下一页窗口是
+  `[0, pageLow)`，**接不住**它们 ⇒ 这几条分隔条在这一串页里露面不了。不为它挪游标：非空页的游标属于
+  白名单行，压到 `pageLow` 之下会**跳过真实事件**（用例钉着：`#514 返修：非空页的游标所有权…`）。
+  真要修就把发现并进主窗口查询（`UNION ALL` 一个只带 `run_id` 的分支），与上面成本段那条同一个后续单；
+  ③ 合成项**不带 `usage`**（实时 `run_end` 的 `· tokens a+b` 后缀在历史里不重建——与 #282「刷新后运行态数字
   拿不回来」同一口径，不拿历史值假装实时）。
+- **已接受边界 ④：第三种形状 —— 非空页里「没有更老的白名单行」⇒ 翻页链提前收敛**（**② 盖不住它**）。
+  机制（现读坐标，逐条对得上）：`http.js:2905` 取 `pageLow` = 本页最小白名单 seq；
+  `http.js:3035` 发现查询带 `AND seq >= $2`（`$2 = pageLow`）⇒ 比 `pageLow` **更老**的 `run_end` 不参与发现；
+  `http.js:2913` `whitelistCursor` 要 `hasOlder` 才给，而这一页之下**已无更老的白名单行** ⇒ null；
+  `http.js:2926` `tailCursor` 只在 `rows.length === 0 && truncated` 才给 ⇒ 非空页恒 null；
+  `http.js:2933` `next_cursor: whitelistCursor ?? tailCursor` ⇒ **游标就地变 null，尾巴页根本没被走到**。
+  与 ② 的区别（这条决定它是不是已知项）：这里发现行**远少于 `limit`**（复现里只有 1 条、`limit=1`，
+  **没发生截断**），断点纯由游标提前置 null 造成。
+  **主 agent 与第三方审计各自独立复现，都是行为红（不是形状闸）**；对照组（把 `run_end` 放到白名单行
+  之后）同一条游标循环是绿的 ⇒ 不是探针坏。判据与修法见 **issue #561**；本 PR **不修**——
+  修它要把发现并进主窗口查询（同上那条 `UNION ALL` 方向），且不许用「把游标压到 `pageLow` 之下」换绿
+  （那会跳过真实事件，用例 `#514 返修：非空页的游标所有权…` 钉着）。
 
 ```jsonc
 {

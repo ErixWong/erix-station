@@ -151,6 +151,29 @@ class PartialOutputPool extends FakePool {
       return { rows: this.runEvents.filter((e) => ids.includes(e.run_id) && e.type === 'assistant_delta') };
     }
 
+    // issue #514：**候选发现**（页内的终态行只用来发现 run id，那一行本身不下发）：
+    //   SELECT run_id, seq FROM run_events
+    //    WHERE session_id = $1 AND type = 'run_end' AND seq >= $2 [AND seq < $n]
+    //    ORDER BY seq DESC LIMIT $k          // k = limit + 1（#514 返修：多取一行探针判「是否被截断」）
+    // ⚠ 必须排在下面的「主窗口」之前（主窗口也含 FROM run_events，而它的 params[1] 在这里是
+    // **页下界那个数** ⇒ `types.includes` 直接 TypeError ⇒ 整个端点 500、本文件全红）。
+    // 照 SQL 文本真算（AGENTS §8.14）：代码撤了 `seq >= $2` 这道页界，fake 就不夹下界。
+    if (/FROM run_events/.test(flat) && flat.includes("type = 'run_end'")) {
+      const sessionId = params[0];
+      const lowMatch = flat.match(/seq >= \$(\d+)/);
+      const low = lowMatch ? params[Number(lowMatch[1]) - 1] : null;
+      const upperMatch = flat.match(/seq < \$(\d+)/);
+      const upper = upperMatch ? params[Number(upperMatch[1]) - 1] : null;
+      const limitMatch = flat.match(/LIMIT \$(\d+)/);
+      const cap = limitMatch ? params[Number(limitMatch[1]) - 1] : null;
+      let rows = this.runEvents.filter((e) => e.session_id === sessionId && e.type === 'run_end');
+      if (low != null) rows = rows.filter((e) => e.seq >= low);
+      if (upper != null) rows = rows.filter((e) => e.seq < upper);
+      if (/ORDER BY seq DESC/.test(flat)) rows = rows.slice().sort((a, b) => b.seq - a.seq);
+      if (cap != null) rows = rows.slice(0, cap);
+      return { rows: rows.map((e) => ({ run_id: e.run_id, seq: e.seq })) };
+    }
+
     // 主窗口（白名单 + keyset 分页）
     if (flat.includes('FROM run_events')) {
       const sessionId = params[0];
