@@ -3052,6 +3052,18 @@ Content-Type: application/json
 | `titlePrompt.defaultText` | 内置 `TITLE_SYSTEM_PROMPT` 全文（`""` 时实际发出去的就是它）|
 | `readonly[]` | 第一期**不开放在线覆写**的那 4 条，**只给 `key`**：portal 镜像不含 `runner/`（`portal/Dockerfile` 只 `COPY portal/ portal/`），运行时读不到 ⇒ 显示全文就是撒谎。中文说明在前端 i18n（zh + en）|
 | `updatedAt` / `updatedBy` | 最后一次保存的时间与操作人（从未保存过 ⇒ `null`/`null`）|
+
+⚠ **上面那两个字节数不是「存得进去」的承诺**（评审 F2，判据 `P13`）：
+`templateBytes` / `effectiveBytes` / `effectiveText` 都按**固定示例工位名**
+`example`（7 字符）渲染，而**写侧闸按最长合法工位名**算那份标识行的预算
+（从 `FDE_NAME_RE` 导出的 `FDE_NAME_MAX_LEN`，现算不抄数字；理由与
+字节级后果见 §4.16-3）。⇒ 同一份文本，页面完全可以显示「离
+`renderLimitBytes` 还有几百字节」而保存仍然吃 `400`
+（`details.rendered_bytes` 超过 `details.render_limit_bytes`）。
+**所以前端不许拿这两个预览数自己预判「到上限就禁用保存」**：以 `PUT`
+返回的 `details` 为准（那才是最坏情况那一份），并把这条 400 当成
+「工位名里有长名」的正常结果解释给人看，而不是一句
+「页面数字没到啊」。
 | `reason` | `null`（DB 生效）/ `no_row`（未配置）/ `read_failed`（表缺失或 DB 抛错）/ `read_timeout`（查询发出去但 `PLATFORM_PROMPTS_READ_TIMEOUT_MS` 内没回）。三种回落**两两可区分**：把「DB 卡住」说成「管理台还没配过」会让值班去配一个值，而真故障在连接上 |
 
 #### 4.16-2 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`
