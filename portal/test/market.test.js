@@ -667,3 +667,92 @@ test('MK-18 请求体上限常量存在且高于 bundle 上限（§4.15 那条�
     (e) => e instanceof MarketError && e.code === 'capability_not_found',
       'slug 形状不对时不许拼出逃逸路径');
 });
+
+// ---------------------------------------------------------------------------
+// §3 之二：静态取 meta 的回归锁（真机 e2e 实测的两条缺陷，issue #595）
+// ---------------------------------------------------------------------------
+
+/**
+ * 真实形状的 skill.mjs（**别把它改成「最小夹具」**——它的作用就是那些不起眼的边角）：
+ *   · `required: ['msg']` / `enum: ['clone', 'update']` → 闭合 `]` **紧跟字符串**（差一位的引爆点）；
+ *   · description 含中文与「」；`execute` 用模板字符串（里面既有 `}` 又有 `(`）；注释里出现 `]` 与 `}`；
+ *   · 排在 `SKILL` 前面还有一个无关对象 `{ id: 'other' }`（钉住「id 只在技能对象体里找」）。
+ * 实测（修复前）：`{ skillId: 'echo-probe', tools: [] }` ⇒ 发布被「tools[] 条数必须 1..12」拒掉；
+ * 把 `required: ['msg']` 改成 `required: ['msg',]`（让 `]` 不紧跟字符串）同一份包立刻发布成功 ⇒ 根因是差一位。
+ */
+const REAL_SKILL_SRC = `// skill.mjs —— echo-probe（e2e 探针，docs/design/capability-market.md §10）
+// 注释里出现 ] 与 } 也必须活着穿过静态解析。
+const CFG = { id: 'other', nested: { id: 'nested' } };
+export const SKILL = {
+  id: 'echo-probe',
+  name: 'Echo 探针',
+  description: '回显一段文本，用来验证「装配真的发生了」这条链路。',
+  tools: [
+    {
+      name: 'echo_probe',
+      description: 'Echo the marker back so the transcript proves L1+L2+L3 wiring.',
+      parameters: {
+        type: 'object',
+        properties: {
+          msg: { type: 'string', description: 'text to echo back' },
+          mode: { type: 'string', enum: ['clone', 'update'], description: 'which echo to run' },
+        },
+        required: ['msg'],
+      },
+    },
+    {
+      name: 'echo_probe_v2',
+      description: 'Second tool, description long enough to clear the 20 char floor.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  ],
+  execute: async ({ msg }) => \`echo: \${msg}\`,
+};
+export function getSkillDefinition() { return SKILL; }
+`;
+
+test('MK-19 真实形状的包必须解出 tools（差一位缺陷的回归锁：字符串紧跟 ] / } 也算数）', () => {
+  const { skillId, tools } = extractSkillMeta(REAL_SKILL_SRC);
+  assert.equal(skillId, 'echo-probe', 'id 取错会让「id 必须等于 slug」的闸误伤合法包');
+  assert.equal(tools.length, 2, `tools 条数必须是 2（修复前实得 0：闭合 ] 被多跳一格吞掉）：${JSON.stringify(tools)}`);
+  assert.deepEqual(tools.map((t) => t.name), ['echo_probe', 'echo_probe_v2']);
+  // 描述不许是空串/被截到别的字段（§3 的 toolDescMin=20 靠它，取错位置会误判「描述过短」）
+  for (const t of tools) {
+    assert.ok(t.description.length >= LIMITS.toolDescMin, `描述取错：${JSON.stringify(t)}`);
+    assert.ok(!t.description.includes('[') && !t.description.includes('enum'), `描述越界吃到 schema：${t.description}`);
+  }
+  // 同一份夹具必须过发布闸（端到端一层：静态取到的 tools 直接喂 validateBundle）
+  const v = validateBundle({ slug: 'echo-probe', whenToUse: 'prove the skill wiring end to end', bundle: {
+    files: [{ path: ENTRYPOINT, content_base64: b64(REAL_SKILL_SRC) }, { path: README_FILE, content_base64: b64('# p\n') }],
+  } });
+  assert.equal(v.manifest.tools.length, 2, 'manifest 里的 tools 必须与静态解析同数（§5 的 capabilities.json 用它）');
+
+  // 反向：`name` 后面不是字符串字面量 ⇒ 那一条**被忽略**（跳过，不抛、也不许把整包判死）
+  const mixed = extractSkillMeta(`export const SKILL = {
+  id: 'mixed-skill',
+  tools: [
+    { name: TOOL_REF, description: 'a bare identifier is not a tool name', required: ['x'] },
+    { name: 42, description: 'a number is not a tool name either', required: ['y'] },
+    { name: 'ok_tool', description: 'this one is a literal and must survive' },
+  ],
+};
+`);
+  assert.deepEqual(mixed.tools, [{ name: 'ok_tool', description: 'this one is a literal and must survive' }],
+    '不可解析的条目只能被丢掉：抛异常会让一整包发布不出去');
+});
+
+test('MK-20 skill.id 只在技能对象体里找（源里先出现无关 { id: \'other\' } 也不许抓错）', () => {
+  // 夹具：无关对象与注释都排在前面（旧写法直接对全文抓第一个 /\bid\s*:/，两者都会命中）
+  assert.equal(extractSkillMeta(REAL_SKILL_SRC).skillId, 'echo-probe',
+    '前置的 { id: \'other\' } 不得抢先（否则 id≠slug ⇒ 合法包 400）');
+  assert.equal(extractSkillMeta(`// 老包写作 id: 'legacy' ，那只是注释
+const CFG = { id: 'other' };
+export const SKILL = { id: 'real-skill', tools: [{ name: 'noop_tool', description: 'does nothing at all, honestly' }] };
+`).skillId, 'real-skill');
+  // 认不出锚点时退回全文扫描：至少不比旧行为差（历史包形状各异）
+  assert.equal(extractSkillMeta(`const S = { id: 'legacy-shape', tools: [] };`).skillId, 'legacy-shape',
+    '没有 SKILL 锚点也要能取到 id（退回全文扫描）');
+  // 什么都没有 ⇒ null（发布侧据此报「取不到 id」，不是猜一个）
+  assert.equal(extractSkillMeta('export function getSkillDefinition() { return null; }').skillId, null);
+});
+

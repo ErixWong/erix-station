@@ -177,6 +177,10 @@ function findMatchingBracket(src, from) {
   for (let i = from; i < src.length; i += 1) {
     const c = src[i];
     if (c === '"' || c === "'" || c === '`') {
+      // ⚠ 契约：`skipString` 返回**闭合引号的下标**，跨过闭合引号由这里的 `continue` + for 的 `i += 1` 负责。
+      // 曾经 `skipString` 返回的是「闭合引号后一位」，两者叠加 = **多跳一个字符** ⇒ 紧跟字符串的 `]` / `}`
+      // 不被计数（`required: ['msg']`、`enum: ['a','b']` 这种形状到处都有）⇒ 闭合点算错 ⇒ `tools: []`。
+      // 回归锁：test/market.test.js MK-19（真机 e2e 实测：同一份包把 `['msg']` 改成 `['msg',]` 就发布成功）。
       i = skipString(src, i);
       continue;
     }
@@ -187,13 +191,20 @@ function findMatchingBracket(src, from) {
   return -1;
 }
 
-/** 从引号下标走到引号结束的**下一个**下标（处理反斜杠转义）。 */
+/**
+ * 从**开引号下标**走到 `src[i]` 处引号的**闭合引号下标**（处理反斜杠转义）；未闭合返回 `src.length`。
+ *
+ * ⚠ 返回的是闭合引号**本身**的下标，不是它后面那个字符的下标——调用方 `findMatchingBracket` 写的是
+ * `i = skipString(src, i); continue;`，「跨过闭合引号」这件事交给 for 的 `i += 1` 兑现。
+ * 两边必须同源：任何一侧「+1」都会变成多跳一个字符，而差一位的后果是**吞掉紧跟字符串的 `]` / `}`**
+ * （见 `findMatchingBracket` 里的 ⚠ 与 MK-19）。未闭合返回 `src.length`（越界 ⇒ 主循环自然结束）。
+ */
 function skipString(src, i) {
   const q = src[i];
   for (let j = i + 1; j < src.length; j += 1) {
     const c = src[j];
     if (c === '\\') { j += 1; continue; }
-    if (c === q) return j + 1;
+    if (c === q) return j;
   }
   return src.length;
 }
@@ -228,14 +239,38 @@ function readStringLiteral(src, i) {
 }
 
 /**
+ * 取 `skill.id` 的锚点：§3 的导出形状是 `export const SKILL = { id, name, tools }`，
+ * 兼容 `const skill = {` 与对象字面量里的 `skill: {`。
+ * 只拿**第一个**锚点（一个 `skill.mjs` 只导出一个技能定义；多于一个是写错了）。
+ */
+const SKILL_OBJECT_RE = /\b(?:SKILL|skill)\s*[:=]\s*\{/;
+
+/** 技能对象体的文本（`{` 与 `}` 之间）；认不出锚点返回 null（调用方退回全文扫描）。 */
+function skillObjectSpan(source) {
+  const m = SKILL_OBJECT_RE.exec(source);
+  if (!m) return null;
+  const open = source.indexOf('{', m.index);
+  const close = findMatchingBracket(source, open);
+  return close > open ? source.slice(open + 1, close) : source.slice(open + 1);
+}
+
+/**
  * 静态取 `{skillId, tools}`。
  * 为什么必须静态：§7 的发布体**没有** tools 字段，而 `capability_items.manifest` 与
  * `capabilities.json` 的 `tools[]` 都要用到它——平台不能为了拿清单就去 `import` 外部件（§1.1）。
  * 取不到就算发布失败：宁缺毋滥（工具面为空 = 装了也调不到任何东西）。
+ *
+ * `id` 的取值范围：**先限定到技能对象体内**再抓第一个 `id:`。旧写法直接对全文抓
+ * `/\bid\s*:\s*(['"])…\1/`，会先命中排在 `SKILL` 前面的无关对象（`const CFG = { id: 'other' }`）、
+ * 甚至注释里的 `id: xxx`，拿到错id 后 validateBundle 的「id 必须等于 slug」闸会把**合法包**拒掉。
+ * 认不出锚点时退回全文扫描（兼容不守 §3 导出形状的源，至少不比旧行为差）。
+ * 回归锁：test/market.test.js MK-20。
  * @returns {{skillId: string|null, tools: Array<{name: string, description: string}>}}
  */
 export function extractSkillMeta(source) {
-  const idMatch = /\bid\s*:\s*(['"])([^'"]+)\1/.exec(source);
+  const ID_RE = /\bid\s*:\s*(['"])([^'"]+)\1/;
+  const span = skillObjectSpan(source);
+  const idMatch = (span ? ID_RE.exec(span) : null) ?? ID_RE.exec(source);
   const skillId = idMatch ? idMatch[2] : null;
 
   const tools = [];
