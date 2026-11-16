@@ -7930,7 +7930,64 @@ W6（#529 管理台 UI）。
 **未做**（仍在可研，不属本版范围）：E3 端口对账 / E4 证书 / `run-recover` / 语义源 /
 工作项账本 / 外部集成（Slack、GitHub PR 通知）。
 
-### 8.149 issue #586 落地：版本号口径收口到镜像内 build-info.json（portal 补烘 + `/api/health.version` + 管理台「关于」）
+### 8.149 子 run 活动可视化：可研 + 立项三单（#591 / #592 / #593，2026-11-16，主 agent）
+
+**问题**：delegation P1/P2/P3 落地后，界面上**看不见正在跑的子 run**。现场三条（都现查）：
+① 门户名册端点 `GET /api/sessions/:id/delegates?runId=` 是 P2 交付的，**前端零消费**
+（`grep -rn delegates portal/frontend/src` 只有抽屉用的账本 URL）；
+② 前台子要等引擎 `await child` 才回 `runId`（`erix-agent/src/tools/delegation/tool.js:433-449`）
+⇒ 跑着的时候前端连 `childRunId` 都没有 ⇒ 工具卡「查看子任务」按钮不存在（`StreamPanel.vue:208` 的 `openable`）；
+③ `RunStatusBar.vue` 里没有任何子 run 段（2026-11-08 设计 §6 那一格从未实现）。
+不可见窗口 = 单子 240s × 并发 2 ⇒ 最长约 4 分钟只有一张哑卡。
+
+**可研结论**（`docs/design/delegation-activity-2026-11-16.md`，PR #590）：
+- 「在干啥」的**唯一**来源是子 run 账本（0.23 起「一条消息一落盘」⇒ **工具粒度**，真机样本 21KB/38KB）；
+  名册只有状态词汇，`recovery.jsonl` 只有 `toolUseId` 没有工具名，且引擎**没有导出**任何尾读器
+  （实测 `erix-agent` 根与 `erix-agent/tools` 两处 `tailChildTranscript` / `readTranscriptTailLines` /
+  `listRecoveryRows` 全 `undefined`）⇒ 只能走门户自己的 `foldLedgerRecords` → `projectTranscriptForDisplay`。
+- 三条通路并列比过：**轮询读侧（A，决策者 2026-11-16 批准）** / 子事件冒泡 SSE（B，成本在事件面四处集合
+  + 断线补偿 + 子事件挂父 run_id 会污染父时间线）/ 宿主 sidecar（C，第二份真相 + 清理债）。
+  「放宽 DDL 让子 run 成会话」作为结构性方案**记录否决**（`runs_one_active_per_session` 同时是 notes
+  单写者不变量的依据）。
+- 三个真机坑写进文档：门户**不能**用名册的 `pid` 判活（容器内 PID vs 宿主，两个 namespace）；
+  后台子会留**永久 `running`**（父跑完 200ms 后 worker `process.exit(0)`，嵌套子随进程消失 ⇒
+  `finishRun` 永不执行）⇒ 只做 `stale` 标记、门户零写操作；`deadlineAt` 缺省不存在（只有模型显式传
+  `deadlineMs` 才写）⇒ 不画预算进度条；per-child token 不在名册里。
+
+**立项**：#591 父单 · #592 W1 前端（接已有端点，**零后端改动**）· #593 W2 端点 `?activity=1`（缓存 + `stale`）。
+串行（W2 的 DTO 会被 W1 的组件消费）。**未实现**，实现账等落地后另记。
+
+### 8.150 portal 镜像未拷 `portal/shared/` 止血：`@shared` 别名目标补进镜像 + 防回归判据（issue #589，2026-11-16，主 agent + worker + copilot 评审）
+
+接 §8.147 / §8.148。**main 于 `04c7d83` 常红**（CI run `43817003603` 的「构建校验：station-portal 镜像」），
+根因不是老问题，是 §8.147 那天**新长出来的形状**：
+
+- `portal/shared/macro-kinds.js` 与 `@shared` 别名由 PR #582（`55da065`）**当天新建**——此前该目录不存在，
+  前端也从未引用 `portal/frontend/` 之外的文件，所以「只 `COPY portal/frontend/`」当时是成立的。
+- 同批 PR 起 7 个前端文件 `import … from '@shared/macro-kinds'`，别名（`portal/frontend/vite.config.ts:17`）
+  指向 `portal/frontend/` **外面的** `portal/shared/` ⇒ 镜像里没有该目录 ⇒ `vite build` 报
+  `UNLOADABLE_DEPENDENCY: Could not load ../shared/macro-kinds` ⇒ **镜像构建不出来**，`release.yml` 的
+  portal 构建会以同一方式失败（**挡住 v0.1.70**）。
+- **红灯晚了两单才露头**：PR #582（`96dd0dd`）与 PR #584（`9de8c75`）合入 main 的那两次 CI，
+  两个 job 都是 `skipped/cancelled`（连续推送被 concurrency 取消）⇒ 镜像校验**压根没跑完**；
+  直到 `04c7d83` 才第一次跑成 ⇒ 红。仓里 `macro-kinds-single-source.test.js` 管的是「枚举只许一份」，
+  **不管「Dockerfile 有没有把它拷进镜像」**，两件事各说各话。
+
+修法：`portal/Dockerfile` 的 `frontend-builder` 阶段在 `RUN npm run build` **之前**加
+`COPY portal/shared/ ../shared/`（WORKDIR = `/build/portal/frontend`，与别名的 `new URL('../shared/')` 同源）。
+
+**判据**：新增根 `test/portal-shared-copy.test.js`（5 条，`node --test` 随根 `npm test` 跑）：S1 扫前端全部
+`@shared/*` 引用并断言目标在盘上存在（+「引用数 > 0」防扫描器假绿）；S2 断言别名根**确实在
+`portal/frontend/` 外面**；S3 夹具自测解析/落地计算；S4 断言 Dockerfile 前端阶段有覆盖它的 COPY
+**且在 build 之前**；S5 反向自证（删/写歪/挪后都用**同一个判定函数**，必须报不合格）。
+主 agent 亲手复跑：5/5 绿；**删掉那行 ⇒ S4/S5 红**；**挪到 build 之后 ⇒ S4/S5 红**；真构建 portal 镜像
+`rc=0`（修复前同一命令 `rc=1`）；根 `npm test` rc=0。
+
+**范围声明**（copilot 评审认可、留作后续）：本判据只认 `@shared/*` 静态与字面量动态 import；
+相对路径 / 其它别名 / CSS 等「引用 `portal/frontend/` 外面文件」的形态不在本单，扩成通用构建依赖
+扫描是另一件事。
+
+### 8.151 issue #586 落地：版本号口径收口到镜像内 build-info.json（portal 补烘 + `/api/health.version` + 管理台「关于」）
 
 **要治的**（真事故，非假想敌）：发 v0.1.69 时 `git pull --ff-only` 网络抖动只 fetch 没重试 pull ⇒
 `docker compose build station-portal` 烘的是停在 **0.1.68** 的工作树 ⇒ 真机 FDE 报 0.1.69、portal 报 0.1.68
