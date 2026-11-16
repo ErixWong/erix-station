@@ -8184,3 +8184,17 @@ commit **一致**）。dev 栈改 pin 该 digest（`deploy/.env:72`，备份 `/t
 - 另：跑 e2e 时发现真机 portal 被并行 session 重建过 ⇒ `revision/built_at` 变 `unknown`（本地
   `docker compose build` 没传 `STATION_REVISION`/`STATION_BUILD_DATE`，compose 缺省即 `unknown`）。
   这**恰好证明口径诚实**（本地乱建不会编合法版本号），也说明 CI 的 ④′ tripwire 才是这条的守门人。
+
+### 8.155 v0.1.70 重切为 v0.1.71：tag 的树必须就是「我们验过的那份」（#603 后续，2026-11-17，主 agent）
+
+接 §8.154。**为什么重切**：`v0.1.70` 指向 `a5deeb7`（#604 合并），而 #603 的交付物 `bcee26d`（e2e 脚本）
+与 #607 合并在它**之后** ⇒ **tag 的树 ≠ main**，且差的正是本单的交付物本身。这正是 #586 要消灭的形状
+（版本号必须能指认到确切的那份树），不能靠「下次发版自然带上」了事。
+
+**处置**：
+- **不动 `v0.1.70` 的 tag**（已发布镜像不可变；移动 tag = 造假，且 GHCR 上那两个 digest 已存在）。
+  `v0.1.70` 保留为「产品代码与 0.1.71 相同、但树里缺 e2e 脚本」的历史点，`latest` 由 0.1.71 重新指向。
+- 从 main 切 `v0.1.71`（三处版本号对齐 + 本条台账）。
+
+**两版之间没有产品代码差异**（`git diff --stat v0.1.70..main` 只有 `portal/integration/version-surface-e2e.mjs`
++ 一条 npm script + 两篇设计文档 + 台账）⇒ 这不是「修 bug 的版本」，是**让 tag 追上验过的树**。
