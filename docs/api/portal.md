@@ -2991,6 +2991,107 @@ Content-Type: application/json
 
 ---
 
+### 4.16 能力市场（`/api/market/*` 与 `/api/admin/market/*`，issue #595）
+
+**一句话**：平台把技能包（bundle）发进目录，用户在页面上装/卸/启停，runner 在每次 run 启动时把
+「有哪些技能」注入提示词并把停用的技能从工具面摘掉。契约全文在
+`docs/design/capability-market.md`（§3 校验、§4 安装面、§5 物化、§6 runner、§7 本节的端点清单）。
+
+真相分布（三处，各有唯一职责）：包内容与元数据在 `capability_items` / `capability_files`
+（迁移 `0039`），装没装/启没启在 `fde_capability_installs`，「磁盘上有」只是这两张表的**投影**
+——平台不做磁盘对账，用户手删了文件页面仍显示已装，出路是给「重新安装」（`force`，见 4.16-5）。
+
+**两条全局形状**（与 §4.2 `/api/admin/users` 同形，前端两种都收但以这套为准）：
+列表 = `{"items":[...]}`，详情 = `{"item":{...}}`；字段一律 `snake_case`。
+`installed` / `enabled` 是**真布尔**（不是 `'t'/'f'`、不是 0/1）。
+
+**鉴权**：`/api/admin/market/*` 走 `requireAdmin`（非 admin ⇒ 403）；`/api/market/*` 走 `requireSession`，
+并且只作用于**当前登录用户自己的** FDE —— `fde_id` 与 `fde_name` 取自 session，**请求体里的 `fde` 一律不认**
+（收了就等于任何人都能往别人家目录写文件）。账号没有 `fde_name` ⇒ `400 fde_name_required`。
+用户面只见 `state='published'` 的条目。
+
+**错误码**（`MarketError` 一处映射，`details` 里只有字段名/数字/路径，**不含包内容**）：
+
+| code | HTTP | 触发 |
+| --- | --- | --- |
+| `validation_failed` | 400 | §3 任一校验不过（`details.field` / `details.reason` 点名是哪一条） |
+| `capability_not_found` | 404 | slug/id 不存在；或启停时**尚未安装**（`details.reason="not_installed"`） |
+| `capability_not_published` | 409 | 装一个非 `published` 的条目；或发布时当前版本没有包 |
+| `capability_budget_exceeded` | 409 | 启用的技能数已达 12（`details.max_enabled` / `details.enabled_now`） |
+| `capability_kind_unsupported` | 409 | `kind='mcp'` 的发布/安装（本期没有消费者，§9） |
+| `capability_install_failed` | 500 | 落盘/删目录失败（`details.reason` 是 `E*` 或 `invalid_fde_name`） |
+
+#### 4.16-1 `GET /api/market/items`
+
+`200`：`{"items":[<用户面列表项>], "budget":{"max_enabled":12,"enabled_now":<int>}}`。
+列表项：`slug, kind, name, summary, version, tags[], tool_count, security_score,
+installed, installed_version(null|string), enabled, when_to_use, author, license, updated_at`。
+`version` 是**已发布版本**，`installed_version` 是这台 FDE 实装的版本（不相等 = 页面该给「升级」）。
+列表**不取包字节**（`capability_files.content`）：50 条 × 2 MiB 会先把进程吃掉。
+
+#### 4.16-2 `GET /api/market/items/:slug`
+
+`200`：`{"item":{...列表项..., "description_md":"", "readme_md":"", "tools":[{"name","description"}],
+"manifest":{...}, "security_warnings":[{"code","path","line","note"}], "files":[{"path","bytes"}]}}`。
+`readme_md` 是 `SKILL.md` 的**正文**；包里没有这个文件时是 `""`（**不是 `null`** —— 前端把它直接喂给
+markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不合法（不匹配 `^[a-z0-9][a-z0-9-]{0,63}$`）
+在路径层就 `400`，不入库查一轮再报 404。
+
+#### 4.16-3 `POST /api/market/items/:slug/install`
+
+体（可省略）：`{"enabled":true,"force":false}`。`enabled` 缺省 = 已装过就沿用现值，否则 `true`。
+`200`：`{"result":{"changed":bool,"slug","version","enabled","dir","files"|...,"idempotent":true?},
+"item":<4.16-2 形状>}`。回包带 `item` 是为了让前端装完立刻把卡片翻成「已装」，不必自己拼三个字段。
+
+判据顺序（顺序本身是契约，不是实现细节）：① 条目存在 / `kind` 可消费 / `state='published'`；
+② **幂等**：同版本且非 `force` ⇒ `changed:false`，**一个字节都不写盘**（否则「用户手改过文件」与
+「页面多点了一下安装」会互相打架）；③ 预算闸：只在「这次真的会让启用数 +1」时判，重复启停不受预算影响；
+④ 落盘（先 `<slug>.tmp-*` 再原子替换）；⑤ 事务里落账 + 排一次物化（`capabilities.json` 要跟着变）。
+
+审计：`user.capability_installed` / `user.capability_uninstalled` / `user.capability_enabled`，
+`target=capability:<slug>`，`details` 只有 `{changed, version, enabled}`。
+
+#### 4.16-4 `POST /api/market/items/:slug/uninstall`
+
+无体（不带 `Content-Type` 也收：`requireJson` 只卡带体的两个动作）。`200 {"result":{"changed","slug",
+"dir_removed"},"item":{...}}`。删 slug 目录 + 删一行安装账；**目录本来就不存在也是 200**
+（幂等的定义是结果状态一致，不是「一定做了动作」）。只删 `<slug>/` 这一层，同级技能与 `~/.erix`
+里别的东西一个字节都不碰。
+
+#### 4.16-5 `POST /api/market/items/:slug/enabled`
+
+体：`{"enabled":<bool>}`（必须是布尔，否则 400）。**只改 DB 一行，磁盘一律不动**——停用后目录仍在，
+重新启用不必重下；从停用回到启用要过预算闸。未安装 ⇒ `404 capability_not_found`
+（`details.reason="not_installed"`）。
+
+#### 4.16-6 管理面 `/api/admin/market/*`
+
+| 端点 | 方法 | 说明 |
+| --- | --- | --- |
+| `/api/admin/market/items` | `GET` | `?state=draft\|published\|retired`（缺省全部；非法值 400，不静默当「没筛」）。`{"items":[...]}` 每项额外带 `id, state, installs`（装机数）。**不返回 content** |
+| `/api/admin/market/items` | `POST` | 发布新条目（元数据 + `bundle`）⇒ `201 {"item":{...}}`。默认落 `draft`，显式 `state:"published"` 时一并写 `published_at` |
+| `/api/admin/market/items/:id` | `GET` | 详情：`{"item":{...,"tools":[...],"manifest":{...},"security_warnings":[...],"files":[{"path","bytes"}]}}` |
+| `/api/admin/market/items/:id` | `PUT` | 改元数据，或**带 `bundle` 出新版**（带 bundle 时 `version` 必填且必须与当前不同，否则 400） |
+| `/api/admin/market/items/:id/publish` | `POST` | → `published`；当前版本没有包 ⇒ `409 capability_not_published` |
+| `/api/admin/market/items/:id/retire` | `POST` | → `retired`（下架后用户面立即看不见，已装的目录不动） |
+
+审计：`admin.capability_created` / `_updated` / `_published` / `_retired`，`target=capability:<slug>`；
+`_updated` 的 `details.has_bundle` 用来区分「只改了文案」与「真出了新版」。
+
+**bundle 的形状与上限**（§3，判据实现只在 `portal/src/market.js` 一处）：
+`{"files":[{"path":"skill.mjs","content_base64":"..."}]}`；根必须有 `skill.mjs`，根只允许
+`skill.mjs` / `SKILL.md`，子目录只允许 `scripts/` `references/` `assets/`；路径相对、无 `\`、
+**任何** `..` 段（按段判，不是子串）、长度 ≤ 200；文件数 ≤ 50、单文件 ≤ 512 KiB、总 ≤ 2 MiB；
+内容必须是规范 base64 且解出来是合法 UTF-8；`skill.mjs` 里静态取得的 `id` 字面量必须等于 `slug`；
+`tools[]` 1..12、名字唯一且匹配 `^[a-z][a-z0-9_]{1,63}$`、`description` ≥ 20 字符。
+`security_score` = `max(0, 100 - 10 × 命中数)`（8 条模式），**只是提示与排序依据，不是安装闸门**。
+
+⚠ **发布路由的请求体上限是 `4 MiB`，不是 `config.maxBodyBytes`**：bundle 走 JSON + base64，
+2 MiB 原文编码后约 2.75 MiB，而 `maxBodyBytes` 默认只有 64 KiB —— 沿用默认值会让 413 先于任何校验发生，
+调用方拿到的是「体太大」而不是「你的包哪里不对」（§4.15 记的是同一个坑的另一半）。
+
+---
+
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
 
 ### 5.1 传输语义
