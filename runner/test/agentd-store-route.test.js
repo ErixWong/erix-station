@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 process.env.ERIX_STATION_TOKEN = 'test-token';
-const { handleStoreRequest } = await import('../agentd.js');
+const { handleStoreRequest, InternalError } = await import('../agentd.js');
 
 function makeCtx({ sessionId = 'sess-1', runId = 'run-1', claimToken = 'ct-1' } = {}) {
   return { runId, sessionId, claimToken, attempt: 1 };
@@ -179,4 +179,108 @@ test('#338 P3b：单页即到底时不发多余请求（pages=1 不触发分页�
   const out = await handleStoreRequest(makeCtx(), 'load', { runId: 'sess-1' }, { request });
   assert.equal(calls.length, 1, '单页到底 ⇒ 一次请求');
   assert.deepEqual(out.records.map((r) => r.dedupKey), ['k:input:m1']);
+});
+
+// ---------------------------------------------------------------------------
+// issue #500：账本恢复行三条路由（只走 session 端点，writer fencing 与其余 S 端点逐字一致）
+// ---------------------------------------------------------------------------
+
+const EXECUTED_ROW = {
+  round: 3,
+  roundKey: 'sess-1:round:3',
+  dedupKey: 'sess-1:engine:round:3:recovery:tool-executed:call-7f',
+  kind: 'recovery',
+  recoveryEvent: 'tool-executed',
+  toolUseId: 'call-7f',
+  messages: [],
+  ts: '2026-11-16T00:00:00.000Z',
+};
+
+test('#500 恢复行三方法走 session 端点（PUT/GET/DELETE + ?run_id= + X-Claim-Token）', async () => {
+  const { calls, request } = makeStub();
+  const ctx = makeCtx();
+
+  await handleStoreRequest(ctx, 'appendRecoveryRow', { runId: 'sess-1', record: EXECUTED_ROW }, { request });
+  assert.equal(calls.at(-1).method, 'PUT');
+  assert.equal(calls.at(-1).p, '/transcript/sess-1/recovery-rows?run_id=run-1');
+  assert.equal(calls.at(-1).opts.claimToken, 'ct-1', 'writer fencing 与其余 session 端点同一套');
+  assert.deepEqual(calls.at(-1).opts.body, EXECUTED_ROW, 'record 原样转发（本站不重算 dedupKey、不剥字段）');
+
+  await handleStoreRequest(ctx, 'listRecoveryRows', { runId: 'sess-1' }, { request });
+  assert.equal(calls.at(-1).method, 'GET');
+  assert.equal(calls.at(-1).p, '/transcript/sess-1/recovery-rows?run_id=run-1');
+
+  await handleStoreRequest(ctx, 'clearRecoveryRows', { runId: 'sess-1' }, { request });
+  assert.equal(calls.at(-1).method, 'DELETE');
+  assert.equal(calls.at(-1).p, '/transcript/sess-1/recovery-rows?run_id=run-1');
+
+  assert.equal(calls.length, 3);
+});
+
+test('#500 恢复行的键一致性自检：引擎传来的 key ≠ RUN_START sessionId ⇒ 抛错且零请求', async () => {
+  const { calls, request } = makeStub();
+  const ctx = makeCtx();
+  for (const [method, args] of [
+    ['appendRecoveryRow', { runId: 'sess-OTHER', record: EXECUTED_ROW }],
+    ['listRecoveryRows', { runId: 'sess-OTHER' }],
+    ['clearRecoveryRows', { runId: 'sess-OTHER' }],
+  ]) {
+    await assert.rejects(() => handleStoreRequest(ctx, method, args, { request }),
+      /transcript key mismatch/, method);
+  }
+  assert.equal(calls.length, 0, '自检失败不得发出任何请求（防串会话）');
+});
+
+test('#500 没有 run 作用域回退面：旧 portal（ctx.sessionId=null）下三方法一律抛错', async () => {
+  const { calls, request } = makeStub();
+  const ctx = makeCtx({ sessionId: null });
+  // 与其余方法的「旧 portal 回退 run 端点」**故意不同**：transcript_recovery_rows 只有一个键列，
+  // 没有 run 作用域这一格 ⇒ 编一个 `/runs/:id/recovery-rows` 就是发一个注定 404 的请求。
+  for (const [method, args] of [
+    ['appendRecoveryRow', { runId: 'run-1', record: EXECUTED_ROW }],
+    ['listRecoveryRows', { runId: 'run-1' }],
+    ['clearRecoveryRows', { runId: 'run-1' }],
+  ]) {
+    await assert.rejects(() => handleStoreRequest(ctx, method, args, { request }),
+      /require a session transcript key/, method);
+  }
+  assert.equal(calls.length, 0, '没发请求（抛错在发请求之前）');
+});
+
+test('#500 红线：读/清两个方法不许无限重试（portal 持续 5xx ⇒ 有限次后把错误原样抛给引擎）', async () => {
+  // 缺陷形状（issue #500 红线 2）：`withRetry` 缺省 `maxRetries = Infinity`，而 5xx 在 agentd 里
+  // 被标 `retryable` ⇒ portal 一直挂时这条请求**永远重试**，引擎收不到 reject ⇒
+  // `recovery_rows_unreadable` / `recovery_rows_clear` 那两个终局根本不会发生
+  //（现场从「run 以明确原因失败」变成「resume 无声卡死 + 每 30s 一条 retry 日志」）。
+  // 错误必须是**真的** `InternalError`：判据是 `instanceof && retryable`，长得像不算（否则假绿）。
+  for (const method of ['listRecoveryRows', 'clearRecoveryRows']) {
+    const seen = [];
+    const request = async (m, p, opts = {}) => {
+      seen.push({ m, p, opts });
+      throw new InternalError(503, 'http_503', 'portal down', true);
+    };
+    await assert.rejects(
+      () => handleStoreRequest(makeCtx(), method, { runId: 'sess-1' }, { request }),
+      /portal down/, `${method}：portal 持续不可用时必须把错误抛出去（不许吞成空结果）`,
+    );
+    assert.ok(seen.length >= 2, `${method}：至少重试一次（一次抖一下就放弃太脆）`);
+    assert.ok(seen.length <= 6, `${method}：重试必须**有限**（实得 ${seen.length} 次 = 又在走无限退避）`);
+    assert.ok(seen.every((c) => c.p === '/transcript/sess-1/recovery-rows?run_id=run-1'),
+      `${method}：重试打的是同一个端点，没有偷偷换路径`);
+  }
+});
+
+test('#500 写方法（appendRecoveryRow）仍与其余账本写同口径：可重试错误交给上层退避', async () => {
+  // 本站**不给**写侧单独设有限重试：引擎 `persistClassified` 那一层已经有 retryAttempts + 退避，
+  // 并在耗尽时给出 `phase: transcript` 的终局。中间再加一层就是两层各重试一轮 ⇒ 排障时看不出谁在等。
+  let calls = 0;
+  const request = async (m, p, opts = {}) => {
+    calls += 1;
+    if (calls === 1) throw new InternalError(502, 'http_502', 'flaky', true);
+    return { data: { added: true } };
+  };
+  const out = await handleStoreRequest(makeCtx(), 'appendRecoveryRow',
+    { runId: 'sess-1', record: EXECUTED_ROW }, { request });
+  assert.deepEqual(out, { added: true }, '一次抖动后重试成功，调用方无感');
+  assert.equal(calls, 2);
 });

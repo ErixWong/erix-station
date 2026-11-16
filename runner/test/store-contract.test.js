@@ -24,6 +24,7 @@ function createFakeAgentdPeer() {
   const snapshots = new Map(); // runId -> {snapshot, revision}
   const runStates = new Map();   // runId -> object
   const runStateStatuses = new Map(); // runId -> {status}
+  const recoveryRows = new Map(); // runId -> 恢复行 [{dedupKey, record}]（数组序 = append_seq）
 
   const peer = {
     calls: [],
@@ -110,6 +111,52 @@ function createFakeAgentdPeer() {
           const cp = snapshots.get(runId);
           if (!cp) return null;
           return { checkpoint: { snapshot: structuredClone(cp.snapshot), revision: cp.revision } };
+        }
+        // ── issue #500：账本恢复行三条路由 ──
+        //
+        // 为什么必须在这里补：`makeStore()` 自本单起**带着**这三个方法，本 peer 站的是 agentd 的位置
+        // —— 不补这三条就是 `unknown method`（任何碰到恢复行的用例当场红，与恢复行本身的对错无关）。
+        // ⚠ **随包契约套件并不覆盖恢复行**：现查 0.33.0 的 `OPTIONAL_CAPABILITIES` 只有
+        //   `runState` / `runStateStatus` / `rawRows` / `fastPathProbes` 四组，没有恢复行那一组
+        //   ⇒ 本站**不往 `optionalCapabilities` 申报里加东西**（申报一个名单里没有的能力名会被
+        //   「守卫写错了能力名」当场判红），恢复行的判据由 `recovery-rows-adapter.test.js` 自己写。
+        //
+        // 语义 = portal `appendSessionRecoveryRow` / `listSessionRecoveryRows` / `clearSessionRecoveryRows`
+        // 四个判据（幂等 / 冲突 / 清空 true|false / 按落盘序返回），幂等判据**与 portal 同一把尺**
+        // （本文件头那句「peer 桩模拟的是 portal 端点语义，不得另抄一份」在本族同样成立）。
+        case 'appendRecoveryRow': {
+          const list = recoveryRows.get(runId) ?? [];
+          const record = structuredClone(args.record);
+          const dedupKey = record?.dedupKey;
+          if (typeof dedupKey !== 'string' || dedupKey === '') {
+            const err = new Error('transcript recovery row rejected: record.dedupKey is required');
+            err.retryable = false;
+            throw err;
+          }
+          const existing = list.find((entry) => entry.dedupKey === dedupKey);
+          if (existing) {
+            if (samePayload(existing.record, record)) return { added: false };   // 幂等跳过（顶层 ts/round 漂了仍算重放）
+            throw dedupPayloadConflict({
+              runId,
+              key: transcriptRecordKey(runId, record),
+              existing: existing.record,
+              incoming: record,
+              existingFingerprint: payloadFingerprint(existing.record),
+              incomingFingerprint: payloadFingerprint(record),
+            });
+          }
+          list.push({ dedupKey, record });   // 数组序 = 持久化追加序（= 真库的 append_seq）
+          recoveryRows.set(runId, list);
+          return { added: true };
+        }
+        case 'listRecoveryRows': {
+          const list = recoveryRows.get(runId) ?? [];
+          return { rows: list.map((entry) => structuredClone(entry.record)) };
+        }
+        case 'clearRecoveryRows': {
+          const had = (recoveryRows.get(runId) ?? []).length > 0;
+          recoveryRows.set(runId, []);
+          return { cleared: had };   // true = 至少删了一行；false = 本来就没有
         }
         default:
           throw new Error(`unknown method: ${method}`);
