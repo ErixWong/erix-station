@@ -249,6 +249,28 @@ test('worker.js 两处装配点都接了审查只读过滤（接线锁）', () =
   assert.ok(n >= 2, `filterReviewSchemas(fileTools.schemas) 出现 ${n} 次，应 >= 2（两处装配点）`);
 });
 
+// 反向自证二的旁路接线锁：executeTool 的三条旁路（delegate / note / skill）都得被 reviewOnly 挡住。
+// 「只改装配点①②不够」——去掉任一个闸，本用例即红。
+test('worker.js executeTool 三条旁路都被 reviewOnly 闸住（接线锁）', () => {
+  const src = fs.readFileSync(
+    new URL('../../runner/worker.js', import.meta.url), 'utf8');
+  // 旁路① delegation：创建闸门（子 run 自带 shell，只读过滤传不下去）
+  assert.match(src, /if \(delegateEnabled && !reviewOnly\) \{/,
+    'delegate 创建未按 reviewOnly 闸住 ⇒ 审查 run 可经 delegate 子 run 拿 shell 逃逸');
+  // 根因记录：子工具面显式包含 shell（这正是闸的必要性）
+  assert.match(src, /childTools: \[\.\.\.fileTools\.schemas, \.\.\.shellTools\.schemas\]/,
+    '子 run 工具面含 shell（闸的根因；若这行变了要重评闸的必要性）');
+  // delegation=null 时 delegate 路由自然不通（依赖 delegation !== null）
+  assert.match(src, /if \(delegation !== null && options\?\.name === 'delegate'\)/,
+    'delegate 路由应依赖 delegation !== null（闸门置 null 即断）');
+  // 旁路② note 路由
+  assert.match(src, /if \(!reviewOnly && noteTools\.executeTool && noteToolNames\.has\(options\.name\)\)/,
+    'note 路由未按 reviewOnly 闸住');
+  // 旁路③ skill 路由
+  assert.match(src, /if \(!reviewOnly && skillTools\.executeTool && skillToolNames\.has\(options\.name\)\)/,
+    'skill 路由未按 reviewOnly 闸住');
+});
+
 // 让 copyUntracked 的直接错误分支可被触及（未跟踪为空时不报错，method 仍标出）
 test('copyUntracked：无未跟踪文件时按探测口径返回、不报错', () => {
   const repo = tmpRepo();
