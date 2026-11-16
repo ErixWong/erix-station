@@ -7680,3 +7680,49 @@ pg-fixture + 桩 runner）。无新迁移（`chat_sessions.origin` 已在 0037�
 
 **待办**：W5（#528 用户面 UI，在跑，含把枚举抽成 `portal/shared/macro-kinds.js` 单一真源）、
 W6（#529 管理台 UI）。
+
+### 8.147 事件平台 W5 落地：用户面 UI + 枚举单一真源（#528，2026-11-16，主 agent + erix_run）
+
+接 §8.146。**W5 已合并进 main**（PR #582，`96dd0dd`，+3154/-79 / 20 文件，CI 门禁 pass 1m43s）。
+
+**第 0 步先把契约 §1 欠的账还了**：枚举单一真源 `portal/shared/macro-kinds.js`
+（W1 当时把枚举放在 `portal/src/macros.js:31,155,160`，前端要用同一份 ⇒ 抽出来、
+`macros.js` 改成 re-export、**导出名不变**（W2/W3/W4b/W7 都不受影响）、前端走 `@shared` 别名）。
+
+**三个件**：`MacroMenu.vue`（chip + 下拉，同一组件两实例：会话头 session scope / 顶栏 user scope）、
+`MacroDrawer.vue`（覆盖式右抽屉，照 `DelegateChildDrawer.vue:217-225`，**不是并排**）、
+`MacroBell.vue`（顶栏铃铛）。入口职责分开：chip ⇒ 流水抽屉、抽屉内 `[配置 ▾]` ⇒ 模板下拉，
+**一次点击只做一件事**。
+
+---
+
+#### 主 agent 抓到的两处「判据真空」（这是本轮最值得记的形态）
+
+**① 防漂移测试是手写白名单 ⇒ 新文件必逃。**
+原 `FRONTEND_MACRO_FILES` 只手写了 3 个文件。实测：往 `lib/macroView.ts` 塞一行
+`['run-notify', 'run-silence-alert', …]` 枚举数组字面量 ⇒ **4 条全绿，一条没红**；
+往 `MacroBell.vue` 塞同样一行 ⇒ 也全绿。
+⇒ 改成**扫 `frontend/src` 全目录**（文件名/路径带 `macro` 的 `.ts`/`.vue`，排除 `.spec.`）。
+改完**立刻抓到两个真漏**：`MacroBell.vue`、`lib/macroView.ts` 都没引 `@shared/macro-kinds`。
+同时把「必须 import」收窄成**用到枚举成员字面量时才要求** —— 无条件要求会把只用
+`notifications.severity`（`info`/`error`，不是宏枚举）的组件误伤成红。
+
+⇒ **口径：凡是「禁止某类文件出现某种写法」的闸，扫描面必须由目录/模式推导，不许手写白名单。
+白名单天然落后于新增文件，而「新增文件忘了守规矩」正是这条闸要抓的东西。**
+
+**② 「跳过聚合」判据完全没有用例（函数存在、spec 零引用）。**
+`aggregateSkippedRuns` 在 `macroView.ts` 里，但**没有任何 spec 引用它**。实测：把
+「连续同因合并」那行改成 `if (false)` ⇒ **15 条全绿**。
+⇒ 补 `src/lib/macroFeed.spec.ts` 四条（连续同因合并 / 不同因不合并 / 中间夹非跳过记录要断组 /
+`skipped` 但无 reason 不并组）。
+
+⇒ **口径：设计文档里点名的每一条判据，都要能指到一条具体用例的 ID；指不到就是真空。
+「有实现 + 有测试文件 + 全绿」不等于「那条判据被测了」——要按判据名逐条对账。**
+
+**四个反向自证全部命中**：两处塞枚举字面量（白名单形态下**都不会红**）、
+跳过聚合改 `if (false)`（`× 连续同因跳过合成一条汇总行` / `× 不同因不合并`）、
+成本缺失仍渲染（`× 没有 usage ⇒ 不出现 ↑0 ↓0`）。
+
+**本批累计变异 24 个**。
+
+**待办**：W6（#529 管理台 UI，在跑，最后一单）。
