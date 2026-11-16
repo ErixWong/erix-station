@@ -5589,3 +5589,61 @@ LLM 那一段等额度恢复后补跑（不影响本次交付的引擎版本事�
 改后 5/5 绿；超时路径（预算改 0）仍红。
 
 **剩余**：#500（恢复行三件套，1 张新表）/ #501（`loadRawRows`，零 DDL）/ D1（快照死代码退役）不变。
+
+### 8.130 事件平台 W1/W2 落地 + 审计回修：模板总开关、kind/scope 定死、UTC+8 日界（#524/#525，2026-11-16，主 agent + erix_run）
+
+接 §8.128。**W1（数据层）与 W2（评估循环）已合并进 main**，中间夹一次审计回修。
+
+| 单 | PR | 合并 | 执行体 | 轮数 |
+|---|---|---|---|---|
+| W1 数据层（#524） | #542 | `1dfda1d` | `erix_run` | 98（扩轮 1 次） |
+| W1 审计回修 | #547 | `7b6f762` | 主 agent | — |
+| W2 评估循环（#525） | #559 | `6a8958e` | `erix_run` | 65 + 续跑 73 |
+
+**W1 独立代码审计（copilot `gpt-6-luna`/`xhigh`，只读独立 worktree）判「必须修，不建议原样留 main」**，
+四条最小集全部成立，逐条核过代码：
+
+1. **模板总开关是假的**（最硬）：`claimMacroRun` 的资格子句只查 `macro_assignments.enabled`，
+   不查模板 ⇒ **模板 `enabled=false` 或软删后，既有订阅照样能认领、照样执行**。
+   而设计 `07` §2.3 明写「`enabled` 全局开关（关掉 ⇒ 所有订阅一起失效）」。修法：资格子句 JOIN
+   `macro_templates`，同一条 SQL 里同时要求 `t.enabled` 且 `t.deleted_at IS NULL`；
+   顺带把 `until` 也塞进同一条 SQL（`applyExpiredAssignments` 的 UPDATE 与本 INSERT 是两条语句，
+   并发下有「扫完就被改成过期」的窗口）。
+2. **`kind`/`scope` 能改**：`updateTemplate` 白名单里有 `kind` 和 `scope` ⇒ 能把 `run-notify`
+   改成 `run-review`（换语义留旧 params）、`session` 改 `user`。设计「建完不可改」。
+   新增 `KIND_SCOPE`（`scheduled-task`→`user`，其余→`session`）+ `KIND_SCHEMA`（契约 §1 要求的
+   参数单一真源）+ `validateKindParams()`；`name` 上限 200 → 设计写的 **40**。
+3. **`finishMacroRun` 两处可绕过**：`skippedReason !== null` 那句让**显式传 `null`** 绕过
+   「skipped 必带原因」；`UPDATE … WHERE id = $1` 无终态闸 ⇒ **能把 `done` 改回 `running`**，
+   「终态不再推进」只是注释。
+4. 文档残留：`07` §18 两处面板字段表还写 `state`（W1 已拆 `status`+`criterion`）；
+   `05` 的通知模板变量 `{{state}}` 5 处 → `{{status}}`（对齐 `macro_runs.status`，免得 W3 找不存在的列）。
+
+⚠ **旧用例里有 7 处用了设计禁止的形状**（`run-review`/`run-notify` + `scope=user`、
+`params: { tone: 'brief' }`）—— 一律**改成合法 fixture，不是把闸放宽去迁就用例**。
+
+**主 agent 复验口径（这轮定下来的，往后照用）**：不信执行体自报，逐条跑**变异**
+（把闸拆掉 ⇒ 对应用例必须变红 ⇒ 再还原）。本轮共跑 7 个变异：
+W1 的两个（`DO NOTHING`→`DO UPDATE`、幂等键混进 `status`）、W1 回修的五个
+（claim 去模板闸 / 去 `until` 闸、finish 恢复 null 放行 / 去终态闸、恢复 `kind`/`scope` 白名单），
+全部命中。**变异是最便宜的「测试是否真的钉住语义」的判据。**
+
+**W2 的测试缺口就是变异抓出来的**：把 `evalClock` 的 `inTz8(nowMs)` 换成
+`new Date(nowMs).toISOString().slice(0,10)`（UTC 日期）⇒ **原 9 条全绿，一条都没红**。
+原用例只覆盖了「UTC 日期 == UTC+8 日期」的时刻，跨日那一段从未被测。
+补两条（跨日 anchor、跨日「今天已 tick」），复验：变异时 `not ok 10/11` 红，还原后 11/11 绿。
+⇒ **口径：任何「按本地日期分档」的逻辑，用例必须至少有一个 UTC 日期 ≠ 本地日期的时刻。**
+
+**W2 撞到的一个真语义冲突（执行体自己发现并写进注释，判断正确）**：到期意图**不能**用
+`claimMacroRun` —— 它一进来先跑 `applyExpiredAssignments`（把 `until<=now` 的订阅置
+`enabled=false`），而资格谓词要求 `a.enabled` ⇒ 对「刚过期」的订阅**资格已被自己抹掉**，
+claim 必返回 `null`，到期意图永远产不出。⇒ 走 `claimExpiryRun`（同一幂等键、
+同样 `ON CONFLICT DO NOTHING`，不带 `enabled` 谓词）。这是对契约 §2.1「claim 只在 W2 调」的
+一处必要偏离，理由记在代码注释里。
+
+**执行体两次撞 `max_rounds_cap` 的教训**：W2 的续跑（只补两条测试）在 73 轮撞上限被强制收尾，
+**变异代码还留在工作树里没还原**（`git status` 能看到 `[MUTATION]` 标记）。
+⇒ 续跑时也**必须给 `maxRounds` 与 `maxExtensions`**（我漏了，用了默认 8 轮 + 0 扩轮）；
+⇒ 接手前先 `git status` / `git diff` 看有没有残留的变异或半成品。
+
+**待办**：W3（通知 + HTTP API，#526，在跑）、W4a（#537）、W4b（#538）、W7（#536）、W5/W6。
