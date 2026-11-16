@@ -3018,162 +3018,6 @@ Content-Type: application/json
 
 ---
 
-### 4.18 管理台提示词面板（`/api/admin/prompts`，issue #596 片 A）
-
-**一句话**：平台对 agent 说的三句话（`~/AGENTS.md` 的**补充约定**、`~/AGENTS.md` 的**整段覆写**、
-**会话标题的 system**）从「改 `portal/src/materializer.js` + 重建 station-portal 镜像」变成
-「管理台改一行 ⇒ 下一次 run / 下一次改名生效」。真相在 `platform_prompts`（迁移 `0040`，单行表）。
-契约（为什么这么设计）见 `docs/design/admin-prompts-panel-2026-11-16.md` §2–§8；本节是 API 口径。
-
-**`""` 就是「跟随内置」**（三列同语义，DB 里不出现 `NULL`）：读侧因此**不需要**区分「没配」与
-「配了空」，`isDefault` 判据只有一条（`text === ''`）。整段覆写取空串 = **不要覆写** —— 没有
-「覆写成一份空文档」这种配置（标识行由代码追加，文件永远不为空）。
-
-**生效时机是这块的全部价值**，三条各不相同，页面必须逐条显示：
-
-| 块 | DB 列 | 落点 | 生效时机 |
-|---|---|---|---|
-| 平台补充约定 | `agents_md_addendum` | `~/AGENTS.md` 末尾「平台补充约定」那一节 | 保存 ⇒ 入队重物化 ⇒ **该工位下一次 run** |
-| 平台约定整段覆写 | `agents_md_override` | 替换 `renderHomeAgentsMd()` 的正文主体（标识行仍由代码追加）| 同上 |
-| 会话标题提示词 | `title_prompt` | `title-llm.js` 发请求时的 system | 保存 ⇒ **下一次改名**（手工「AI 改名」与自动改名同一条解析路径）|
-
-与 §4.15 同口径**不缓存**：物化与改名每次现读那一行 ⇒ 保存即生效，写侧也不需要 `invalidate()`
-（没东西可失效）。表不存在 / 读失败 / 读超时 ⇒ **回落内置**（`reason` 见下），**永不 500**：
-配置面坏了不能让物化与改名挂掉。
-
-#### 4.18-1 `GET /api/admin/prompts`
-
-`200`（**表不存在 / DB 读失败 / 读超时也是 200**）：
-
-```jsonc
-{
-  "addendum":    { "text": "", "isDefault": true, "maxBytes": 8192, "bytes": 0 },
-  "agentsMd":    { "override": "", "isOverridden": false, "isDefault": true,
-                   "templateBytes": 9021, "effectiveBytes": 9021, "effectiveText": "# FDE 工位约定\n…",
-                   "maxBytes": 16384, "renderedLimitBytes": 16384 },
-  "titlePrompt": { "text": "", "isDefault": true, "defaultText": "<内置 TITLE_SYSTEM_PROMPT>",
-                   "maxBytes": 2000, "bytes": 0 },
-  "readonly":    [ { "key": "runnerSystemPrompt" }, { "key": "childSystemPrompt" },
-                   { "key": "toolDescriptions" }, { "key": "engineNotices" } ],
-  "updatedAt": null, "updatedBy": null, "reason": "no_row"
-}
-```
-
-⚠ 例子里的 `9021` 只是「今天这一份内置模板按 `example` 渲染出来的字节数」，**不是契约值** ——
-模板一改它就变（内置模板的真相在 `materializer.js`，红线是它全文零端口数字、零伞域字面量）。
-
-
-| 键 | 语义 |
-|---|---|
-| `addendum.text` / `agentsMd.override` / `titlePrompt.text` | DB 里的当前值（`""` = 跟随内置）。读侧**不做长度校验**：手工 `UPDATE` 进来的超长值**照用**（换成内置会让管理台显示的和实际生效的对不上）|
-| `*.isDefault` | 该格是否在跟随内置（`= (text === '')`）—— 「来源」不许靠 UI 猜 |
-| `agentsMd.isOverridden` | `override !== ''`。页面要显式标「已偏离内置模板」并给「恢复内置」按钮 |
-| `agentsMd.templateBytes` / `effectiveBytes` | 都是**按固定示例工位名 `example` 渲染的整份文件字节数**：默认态下逐数相同，覆写/追加后的差值就是净变化。⚠ 这是**预览**口径；**写侧闸不是这个名**，见 §4.18-3 |
-| `agentsMd.effectiveText` | 同一份「现在生效的全文」，用固定示例名 `example` 渲染 ⇒ **零时间戳、零 run id**（页面要能对比文本、测试要能断言；这份文本会进模型请求的 system 位，动态量会让 prompt 缓存整条失效）|
-| `*.maxBytes` | 该格的**写侧**上限（8192 / 16384 / 2000）。DB 里没有 CHECK，这里才是闸 |
-| `agentsMd.renderedLimitBytes` | 注入侧对**整份** `~/AGENTS.md` 的上限（= `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES`，跨包对账由判据 `P9` 钉住，不许手抄）|
-| `titlePrompt.defaultText` | 内置 `TITLE_SYSTEM_PROMPT` 全文（`""` 时实际发出去的就是它）|
-| `readonly[]` | 第一期**不开放在线覆写**的那 4 条，**只给 `key`**：portal 镜像不含 `runner/`（`portal/Dockerfile` 只 `COPY portal/ portal/`），运行时读不到 ⇒ 显示全文就是撒谎。中文说明在前端 i18n（zh + en）|
-| `updatedAt` / `updatedBy` | 最后一次保存的时间与操作人（从未保存过 ⇒ `null`/`null`）|
-
-⚠ **上面那两个字节数不是「存得进去」的承诺**（评审 F2，判据 `P13`）：
-`templateBytes` / `effectiveBytes` / `effectiveText` 都按**固定示例工位名**
-`example`（7 字符）渲染，而**写侧闸按最长合法工位名**算那份标识行的预算
-（从 `FDE_NAME_RE` 导出的 `FDE_NAME_MAX_LEN`，现算不抄数字；理由与
-字节级后果见 §4.18-3）。⇒ 同一份文本，页面完全可以显示「离
-`renderLimitBytes` 还有几百字节」而保存仍然吃 `400`
-（`details.rendered_bytes` 超过 `details.render_limit_bytes`）。
-**所以前端不许拿这两个预览数自己预判「到上限就禁用保存」**：以 `PUT`
-返回的 `details` 为准（那才是最坏情况那一份），并把这条 400 当成
-「工位名里有长名」的正常结果解释给人看，而不是一句
-「页面数字没到啊」。
-| `reason` | `null`（DB 生效）/ `no_row`（未配置）/ `read_failed`（表缺失或 DB 抛错）/ `read_timeout`（查询发出去但 `PLATFORM_PROMPTS_READ_TIMEOUT_MS` 内没回）。三种回落**两两可区分**：把「DB 卡住」说成「管理台还没配过」会让值班去配一个值，而真故障在连接上 |
-
-#### 4.18-2 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`
-
-```
-PUT /api/admin/prompts/addendum
-Content-Type: application/json
-
-{"text": "- 收工前必须跑 npm run smoke。"}
-```
-
-| HTTP | 体 | 何时 |
-|---|---|---|
-| `200` | **完整 GET DTO**（出自 `RETURNING` ⇒ 回的是落库那份，不回显输入）+ `materializeEnqueued: <条数>` | 保存成功 |
-| `400` | `validation_failed` + `details={field:'text', max_bytes}` | `text` 不是字符串 / 键缺席 / `null` / 越界 ⇒ **不落库** |
-| `400` | `validation_failed` + `details={field:'body'}` | 请求体不是 JSON 对象（`"just a string"`、`42`、`[]`）|
-| `400` | `validation_failed` + `details={field:'text', max_bytes, rendered_bytes, render_limit_bytes}` | **渲染超限**：写下去之后整份 `~/AGENTS.md` > `render_limit_bytes` ⇒ **一条写语句都不发** |
-| `403` | `forbidden` | 非管理员 |
-| `405` | `method_not_allowed` | `PUT` 之外的方法 |
-| `500` | `internal` | 写了却没审计（有人把审计从那条语句里拆出去了）|
-
-⚠ **不新增错误码**：这一节的全部失败都是既有的 `validation_failed` / `forbidden` /
-`method_not_allowed` / `internal`（`details.field` 负责说清是哪一格）。
-
-#### 4.18-3 渲染规则与那条硬闸（为什么「保存成功」还不够）
-
-```
-正文主体 = override !== '' ? override : 内置模板正文
-追加段   = addendum !== '' ? 节标题与引言（平台写）+ 管理员正文（逐字节照搬） : ''
-标识行   = （FDE 标识：<fdeName>）      ← 两种模式下都由**代码**追加，永远是最后一行、不可编辑
-```
-
-追加段的**节标题与引言由平台撰写**（措辞是契约 §5 定稿的：与上面那 8 条硬约束冲突时**以上面为准**）；
-管理员正文**逐字节照搬，不加工不改写**。内置模板本身受既有红线约束（零端口数字、零伞域字面量），
-`portal/test/materializer.test.js` 对**默认渲染**的断言一条都没改（判据 `M1`：不传新入参时输出
-逐字节等于本单之前 ⇒ 物化幂等，sha 不变 ⇒ 不重写文件）。
-
-**渲染闸是必须的，不是锦上添花**：注入侧（`runner/lib/agents-md.js`）对整份文件有 16 KiB 上限，
-超了**静默截断**只留 marker。没有这道闸，管理员写完 8 KiB 追加段会看到「保存成功」而什么都不发生，
-直到某天发现约定被切了一半。闸在**两处**（不是冗余）：
-
-| 位置 | 拦什么 | 形态 |
-|---|---|---|
-| JS 预闸（写**之前**）| 常态超限 | 现读那一行拿到对面那一列的当前值 ⇒ 算出渲染后字节数 ⇒ 超了直接 400，**一条写语句都不发**（判据 `P6`）|
-| SQL 闸（同一条语句里）| 并发窗口（预闸读完之后别人改了对面那一列）| `INSERT … SELECT … WHERE rendered_bytes <= $7` ⇒ 超限就喂给 INSERT 0 行，**一格没写、审计零行**，JS 侧据 `written = 0` 报同一个 400 |
-
-两条闸报出的 `details` 逐字同形；SQL 里那段算术与真渲染的等价性由判据 `P6b` 逐组钉住（常量由 JS
-当参数送进 SQL，SQL 里不抄数字，口径同 §4.15-4 的 `$5/$6`）。
-
-⚠ **闸里的标识行按最坏情况算，不按示例名算**（评审 F2）：标识行是 `（FDE 标识：<fdeName>）`，而保存时
-不知道这份文件会渲染给哪些工位（全部启用中的都要重物化），所以预算取**最长合法工位名**：
-长度从 `projects.js` 的 `FDE_NAME_RE` 单一真相导出（`FDE_NAME_MAX_LEN`，现算不抄 `63`；那个字符集
-只有 ASCII `[a-z0-9-]` ⇒ 字符数 ≡ 字节数）。拿 `example`（7 字符）卡 16 KiB 会放进一批「今天没超、
-下一个长名工位一渲染就超」的输入，而超那一档的后果正是上面那句**静默截断** —— 写侧闸存在的理由
-就是它，不能自己留一个 56 字节的洞。
-**两份名字各自服务一件事**：写侧闸用最长合法名（`materializer.js#agentsMdGateRenderBudget`），
-DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的预览，要短要好看）。
-判据：`P13`（造一组「示例名装得下、最坏名装不下」的输入 ⇒ 必须 400 且一格不写，并钉 SQL 送参里
-那份标识行字节就是最坏情况那一份）。
-
-#### 4.18-4 `materializeEnqueued` 与生效时机
-
-保存成功之后给**全部启用中的 FDE**（`status IN ('active','awaiting_credential')`，与全量重建同一条
-谓词）入队重物化（`outbox.js#enqueueMaterializeChange`，op `upsert`）。**不做「设置 + 入队」的原子性**：
-设置本身就是真相，入队失败只意味着「下一次 portal 重启的全量重建才收敛」⇒ 必须 catch + warn，并把条数
-回给前端。**语义**：`materializeEnqueued` 是**实际入队条数**，`0` 有两种意思 —— 「一台启用中的工位都没有」
-或「通知没发出去（已保存）」，页面在 `0` 时必须说**「已保存，但物化未通知」**，不许说「已生效」。
-`title-prompt` 不涉物化 ⇒ 恒 `0`（键仍在：前端只有一套形状）。
-
-⚠ **审计与保存在同一条 SQL 语句里**（照 §4.15-4 的手法，`platform-prompts.js` 的 `SAVE_SQL`：
-`WITH snap(FOR UPDATE) → nxt → gate → upd → aud`）：`action='admin.platform_prompts_updated'`、
-`target='platform_prompts'`、`details={field, text_bytes, text_sha256, previous_bytes, previous_sha256}`
-—— 审计**只存摘要不存正文**（正文在配置行里，审计只证「谁在什么时候把它换成哪一份」，
-16 KiB × 2 塞进 jsonb 不值）。调用方（`http.js`）**不得**再补一笔 `auth.audit`：那会同时退回
-「设置已生效而审计一行没有」与「并发保存把 `previous_*` 记成自己进来之前」两个窗口，并多写一条审计行。
-
-> 实现：`portal/src/platform-prompts.js`（读侧 + 写侧 + 两道渲染闸 + 读超时 + 保存与审计的同一条 CTE +
-> 入队通知）、`portal/src/materializer.js`（`renderHomeAgentsMd({fdeName, addendum, override})` +
-> 渲染预算 + 物化时现读）、`portal/src/http.js`（四个端点）、`portal/src/title-llm.js` +
-> `sessions.js` + `session-title.js`（改名链路吃 DB 生效值；**提示词不是守卫**，落库前照旧 `sanitizeTitle`）、
-> `deploy/migrations/0040-platform-prompts.sql`。
-> ⚠ `materializer.js` ⇄ `platform-prompts.js` 是**双向引用**：两边都只在**函数体里**用对面的导出，
-> 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
-> 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P11b` + `T1`/`T1b`）、
-> `portal/test/materializer.test.js`（`M1`：默认渲染逐字节不变）、
-> `portal/test/migrations.test.js`（0040 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
-
 ### 4.16 管理台「关于」：版本三格（`GET /api/admin/version`，issue #586）
 
 **要治的是什么**：版本号在本仓存在于五处（`package.json` / 镜像内 `build-info.json` / 运行时读取 /
@@ -3348,6 +3192,162 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 ⚠ **发布路由的请求体上限是 `4 MiB`，不是 `config.maxBodyBytes`**：bundle 走 JSON + base64，
 2 MiB 原文编码后约 2.75 MiB，而 `maxBodyBytes` 默认只有 64 KiB —— 沿用默认值会让 413 先于任何校验发生，
 调用方拿到的是「体太大」而不是「你的包哪里不对」（§4.15 记的是同一个坑的另一半）。
+
+### 4.18 管理台提示词面板（`/api/admin/prompts`，issue #596 片 A）
+
+**一句话**：平台对 agent 说的三句话（`~/AGENTS.md` 的**补充约定**、`~/AGENTS.md` 的**整段覆写**、
+**会话标题的 system**）从「改 `portal/src/materializer.js` + 重建 station-portal 镜像」变成
+「管理台改一行 ⇒ 下一次 run / 下一次改名生效」。真相在 `platform_prompts`（迁移 `0040`，单行表）。
+契约（为什么这么设计）见 `docs/design/admin-prompts-panel-2026-11-16.md` §2–§8；本节是 API 口径。
+
+**`""` 就是「跟随内置」**（三列同语义，DB 里不出现 `NULL`）：读侧因此**不需要**区分「没配」与
+「配了空」，`isDefault` 判据只有一条（`text === ''`）。整段覆写取空串 = **不要覆写** —— 没有
+「覆写成一份空文档」这种配置（标识行由代码追加，文件永远不为空）。
+
+**生效时机是这块的全部价值**，三条各不相同，页面必须逐条显示：
+
+| 块 | DB 列 | 落点 | 生效时机 |
+|---|---|---|---|
+| 平台补充约定 | `agents_md_addendum` | `~/AGENTS.md` 末尾「平台补充约定」那一节 | 保存 ⇒ 入队重物化 ⇒ **该工位下一次 run** |
+| 平台约定整段覆写 | `agents_md_override` | 替换 `renderHomeAgentsMd()` 的正文主体（标识行仍由代码追加）| 同上 |
+| 会话标题提示词 | `title_prompt` | `title-llm.js` 发请求时的 system | 保存 ⇒ **下一次改名**（手工「AI 改名」与自动改名同一条解析路径）|
+
+与 §4.15 同口径**不缓存**：物化与改名每次现读那一行 ⇒ 保存即生效，写侧也不需要 `invalidate()`
+（没东西可失效）。表不存在 / 读失败 / 读超时 ⇒ **回落内置**（`reason` 见下），**永不 500**：
+配置面坏了不能让物化与改名挂掉。
+
+#### 4.18-1 `GET /api/admin/prompts`
+
+`200`（**表不存在 / DB 读失败 / 读超时也是 200**）：
+
+```jsonc
+{
+  "addendum":    { "text": "", "isDefault": true, "maxBytes": 8192, "bytes": 0 },
+  "agentsMd":    { "override": "", "isOverridden": false, "isDefault": true,
+                   "templateBytes": 9021, "effectiveBytes": 9021, "effectiveText": "# FDE 工位约定\n…",
+                   "maxBytes": 16384, "renderedLimitBytes": 16384 },
+  "titlePrompt": { "text": "", "isDefault": true, "defaultText": "<内置 TITLE_SYSTEM_PROMPT>",
+                   "maxBytes": 2000, "bytes": 0 },
+  "readonly":    [ { "key": "runnerSystemPrompt" }, { "key": "childSystemPrompt" },
+                   { "key": "toolDescriptions" }, { "key": "engineNotices" } ],
+  "updatedAt": null, "updatedBy": null, "reason": "no_row"
+}
+```
+
+⚠ 例子里的 `9021` 只是「今天这一份内置模板按 `example` 渲染出来的字节数」，**不是契约值** ——
+模板一改它就变（内置模板的真相在 `materializer.js`，红线是它全文零端口数字、零伞域字面量）。
+
+
+| 键 | 语义 |
+|---|---|
+| `addendum.text` / `agentsMd.override` / `titlePrompt.text` | DB 里的当前值（`""` = 跟随内置）。读侧**不做长度校验**：手工 `UPDATE` 进来的超长值**照用**（换成内置会让管理台显示的和实际生效的对不上）|
+| `*.isDefault` | 该格是否在跟随内置（`= (text === '')`）—— 「来源」不许靠 UI 猜 |
+| `agentsMd.isOverridden` | `override !== ''`。页面要显式标「已偏离内置模板」并给「恢复内置」按钮 |
+| `agentsMd.templateBytes` / `effectiveBytes` | 都是**按固定示例工位名 `example` 渲染的整份文件字节数**：默认态下逐数相同，覆写/追加后的差值就是净变化。⚠ 这是**预览**口径；**写侧闸不是这个名**，见 §4.18-3 |
+| `agentsMd.effectiveText` | 同一份「现在生效的全文」，用固定示例名 `example` 渲染 ⇒ **零时间戳、零 run id**（页面要能对比文本、测试要能断言；这份文本会进模型请求的 system 位，动态量会让 prompt 缓存整条失效）|
+| `*.maxBytes` | 该格的**写侧**上限（8192 / 16384 / 2000）。DB 里没有 CHECK，这里才是闸 |
+| `agentsMd.renderedLimitBytes` | 注入侧对**整份** `~/AGENTS.md` 的上限（= `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES`，跨包对账由判据 `P9` 钉住，不许手抄）|
+| `titlePrompt.defaultText` | 内置 `TITLE_SYSTEM_PROMPT` 全文（`""` 时实际发出去的就是它）|
+| `readonly[]` | 第一期**不开放在线覆写**的那 4 条，**只给 `key`**：portal 镜像不含 `runner/`（`portal/Dockerfile` 只 `COPY portal/ portal/`），运行时读不到 ⇒ 显示全文就是撒谎。中文说明在前端 i18n（zh + en）|
+| `updatedAt` / `updatedBy` | 最后一次保存的时间与操作人（从未保存过 ⇒ `null`/`null`）|
+
+⚠ **上面那两个字节数不是「存得进去」的承诺**（评审 F2，判据 `P13`）：
+`templateBytes` / `effectiveBytes` / `effectiveText` 都按**固定示例工位名**
+`example`（7 字符）渲染，而**写侧闸按最长合法工位名**算那份标识行的预算
+（从 `FDE_NAME_RE` 导出的 `FDE_NAME_MAX_LEN`，现算不抄数字；理由与
+字节级后果见 §4.18-3）。⇒ 同一份文本，页面完全可以显示「离
+`renderLimitBytes` 还有几百字节」而保存仍然吃 `400`
+（`details.rendered_bytes` 超过 `details.render_limit_bytes`）。
+**所以前端不许拿这两个预览数自己预判「到上限就禁用保存」**：以 `PUT`
+返回的 `details` 为准（那才是最坏情况那一份），并把这条 400 当成
+「工位名里有长名」的正常结果解释给人看，而不是一句
+「页面数字没到啊」。
+| `reason` | `null`（DB 生效）/ `no_row`（未配置）/ `read_failed`（表缺失或 DB 抛错）/ `read_timeout`（查询发出去但 `PLATFORM_PROMPTS_READ_TIMEOUT_MS` 内没回）。三种回落**两两可区分**：把「DB 卡住」说成「管理台还没配过」会让值班去配一个值，而真故障在连接上 |
+
+#### 4.18-2 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`
+
+```
+PUT /api/admin/prompts/addendum
+Content-Type: application/json
+
+{"text": "- 收工前必须跑 npm run smoke。"}
+```
+
+| HTTP | 体 | 何时 |
+|---|---|---|
+| `200` | **完整 GET DTO**（出自 `RETURNING` ⇒ 回的是落库那份，不回显输入）+ `materializeEnqueued: <条数>` | 保存成功 |
+| `400` | `validation_failed` + `details={field:'text', max_bytes}` | `text` 不是字符串 / 键缺席 / `null` / 越界 ⇒ **不落库** |
+| `400` | `validation_failed` + `details={field:'body'}` | 请求体不是 JSON 对象（`"just a string"`、`42`、`[]`）|
+| `400` | `validation_failed` + `details={field:'text', max_bytes, rendered_bytes, render_limit_bytes}` | **渲染超限**：写下去之后整份 `~/AGENTS.md` > `render_limit_bytes` ⇒ **一条写语句都不发** |
+| `403` | `forbidden` | 非管理员 |
+| `405` | `method_not_allowed` | `PUT` 之外的方法 |
+| `500` | `internal` | 写了却没审计（有人把审计从那条语句里拆出去了）|
+
+⚠ **不新增错误码**：这一节的全部失败都是既有的 `validation_failed` / `forbidden` /
+`method_not_allowed` / `internal`（`details.field` 负责说清是哪一格）。
+
+#### 4.18-3 渲染规则与那条硬闸（为什么「保存成功」还不够）
+
+```
+正文主体 = override !== '' ? override : 内置模板正文
+追加段   = addendum !== '' ? 节标题与引言（平台写）+ 管理员正文（逐字节照搬） : ''
+标识行   = （FDE 标识：<fdeName>）      ← 两种模式下都由**代码**追加，永远是最后一行、不可编辑
+```
+
+追加段的**节标题与引言由平台撰写**（措辞是契约 §5 定稿的：与上面那 8 条硬约束冲突时**以上面为准**）；
+管理员正文**逐字节照搬，不加工不改写**。内置模板本身受既有红线约束（零端口数字、零伞域字面量），
+`portal/test/materializer.test.js` 对**默认渲染**的断言一条都没改（判据 `M1`：不传新入参时输出
+逐字节等于本单之前 ⇒ 物化幂等，sha 不变 ⇒ 不重写文件）。
+
+**渲染闸是必须的，不是锦上添花**：注入侧（`runner/lib/agents-md.js`）对整份文件有 16 KiB 上限，
+超了**静默截断**只留 marker。没有这道闸，管理员写完 8 KiB 追加段会看到「保存成功」而什么都不发生，
+直到某天发现约定被切了一半。闸在**两处**（不是冗余）：
+
+| 位置 | 拦什么 | 形态 |
+|---|---|---|
+| JS 预闸（写**之前**）| 常态超限 | 现读那一行拿到对面那一列的当前值 ⇒ 算出渲染后字节数 ⇒ 超了直接 400，**一条写语句都不发**（判据 `P6`）|
+| SQL 闸（同一条语句里）| 并发窗口（预闸读完之后别人改了对面那一列）| `INSERT … SELECT … WHERE rendered_bytes <= $7` ⇒ 超限就喂给 INSERT 0 行，**一格没写、审计零行**，JS 侧据 `written = 0` 报同一个 400 |
+
+两条闸报出的 `details` 逐字同形；SQL 里那段算术与真渲染的等价性由判据 `P6b` 逐组钉住（常量由 JS
+当参数送进 SQL，SQL 里不抄数字，口径同 §4.15-4 的 `$5/$6`）。
+
+⚠ **闸里的标识行按最坏情况算，不按示例名算**（评审 F2）：标识行是 `（FDE 标识：<fdeName>）`，而保存时
+不知道这份文件会渲染给哪些工位（全部启用中的都要重物化），所以预算取**最长合法工位名**：
+长度从 `projects.js` 的 `FDE_NAME_RE` 单一真相导出（`FDE_NAME_MAX_LEN`，现算不抄 `63`；那个字符集
+只有 ASCII `[a-z0-9-]` ⇒ 字符数 ≡ 字节数）。拿 `example`（7 字符）卡 16 KiB 会放进一批「今天没超、
+下一个长名工位一渲染就超」的输入，而超那一档的后果正是上面那句**静默截断** —— 写侧闸存在的理由
+就是它，不能自己留一个 56 字节的洞。
+**两份名字各自服务一件事**：写侧闸用最长合法名（`materializer.js#agentsMdGateRenderBudget`），
+DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的预览，要短要好看）。
+判据：`P13`（造一组「示例名装得下、最坏名装不下」的输入 ⇒ 必须 400 且一格不写，并钉 SQL 送参里
+那份标识行字节就是最坏情况那一份）。
+
+#### 4.18-4 `materializeEnqueued` 与生效时机
+
+保存成功之后给**全部启用中的 FDE**（`status IN ('active','awaiting_credential')`，与全量重建同一条
+谓词）入队重物化（`outbox.js#enqueueMaterializeChange`，op `upsert`）。**不做「设置 + 入队」的原子性**：
+设置本身就是真相，入队失败只意味着「下一次 portal 重启的全量重建才收敛」⇒ 必须 catch + warn，并把条数
+回给前端。**语义**：`materializeEnqueued` 是**实际入队条数**，`0` 有两种意思 —— 「一台启用中的工位都没有」
+或「通知没发出去（已保存）」，页面在 `0` 时必须说**「已保存，但物化未通知」**，不许说「已生效」。
+`title-prompt` 不涉物化 ⇒ 恒 `0`（键仍在：前端只有一套形状）。
+
+⚠ **审计与保存在同一条 SQL 语句里**（照 §4.15-4 的手法，`platform-prompts.js` 的 `SAVE_SQL`：
+`WITH snap(FOR UPDATE) → nxt → gate → upd → aud`）：`action='admin.platform_prompts_updated'`、
+`target='platform_prompts'`、`details={field, text_bytes, text_sha256, previous_bytes, previous_sha256}`
+—— 审计**只存摘要不存正文**（正文在配置行里，审计只证「谁在什么时候把它换成哪一份」，
+16 KiB × 2 塞进 jsonb 不值）。调用方（`http.js`）**不得**再补一笔 `auth.audit`：那会同时退回
+「设置已生效而审计一行没有」与「并发保存把 `previous_*` 记成自己进来之前」两个窗口，并多写一条审计行。
+
+> 实现：`portal/src/platform-prompts.js`（读侧 + 写侧 + 两道渲染闸 + 读超时 + 保存与审计的同一条 CTE +
+> 入队通知）、`portal/src/materializer.js`（`renderHomeAgentsMd({fdeName, addendum, override})` +
+> 渲染预算 + 物化时现读）、`portal/src/http.js`（四个端点）、`portal/src/title-llm.js` +
+> `sessions.js` + `session-title.js`（改名链路吃 DB 生效值；**提示词不是守卫**，落库前照旧 `sanitizeTitle`）、
+> `deploy/migrations/0040-platform-prompts.sql`。
+> ⚠ `materializer.js` ⇄ `platform-prompts.js` 是**双向引用**：两边都只在**函数体里**用对面的导出，
+> 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
+> 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P11b` + `T1`/`T1b`）、
+> `portal/test/materializer.test.js`（`M1`：默认渲染逐字节不变）、
+> `portal/test/migrations.test.js`（0040 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
 
 ---
 
