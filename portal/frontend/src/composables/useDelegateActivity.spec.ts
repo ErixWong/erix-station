@@ -276,9 +276,14 @@ describe('轮询四条纪律', () => {
     const { activeRunId, handle } = setup({ cards: [delegateCard()] });
     await tick(0);
     expect(handle.items.value).toHaveLength(1);
+    // 轮询期间确实挂着两个 interval（名册 2s + 时长 1s）——没有这个前置，下面的 0 可以假绿。
+    expect(vi.getTimerCount()).toBeGreaterThanOrEqual(2);
 
     activeRunId.value = null;
     await nextTick();
+    // 判据本体：**timer 真的被清了**。只断言「没有新请求」证不了这件事——`poll()` 自己在 runId
+    // 为空时就早退，interval 泄漏也照样绿（验收复核指出的假绿）。
+    expect(vi.getTimerCount()).toBe(0);
     const at = fetchMock.mock.calls.length;
     await tick(DELEGATE_POLL_MS * 4);
     expect(fetchMock.mock.calls.length).toBe(at);
@@ -286,10 +291,14 @@ describe('轮询四条纪律', () => {
     expect(handle.hasLive.value).toBe(false);
   });
 
-  it('纪律 4：作用域销毁 ⇒ 清 timer + abort 在途，abort 之后的 reject 不当故障', async () => {
+  it('纪律 4：作用域销毁 ⇒ 清 timer + **abort 在途**，abort 之后的 reject 不当故障', async () => {
     let rejectRequest: (e: unknown) => void = () => {};
+    // 把传给 fetch 的 `init.signal` **拿在手上**（验收复核指出的假绿：不抓 signal 的话，
+    // 「去掉 abortInFlight()」这条用例照样绿 —— 手动 reject 只计一次失败，低于阈值 3）。
+    const signals: AbortSignal[] = [];
     fetchMock.mockImplementation(
       (_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+        if (init?.signal) signals.push(init.signal);
         init?.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
         rejectRequest = reject;
       }),
@@ -297,8 +306,13 @@ describe('轮询四条纪律', () => {
     const { scope, handle } = setup({ cards: [delegateCard()] });
     await tick(0);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(signals).toHaveLength(1);
+    expect(signals[0].aborted).toBe(false);
 
     scope.stop();
+    // 判据本体：**在途请求当场被 abort**（不是「等它自己落定」）。
+    expect(signals[0].aborted).toBe(true);
+
     rejectRequest(new Error('should never surface as a fault'));
     await tick(DELEGATE_POLL_MS * 3);
     expect(fetchMock).toHaveBeenCalledTimes(1);
