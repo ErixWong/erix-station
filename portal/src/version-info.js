@@ -1,0 +1,181 @@
+// issue #586：版本号的**唯一读面**（三格各自从哪儿取、取不到怎么表现）。
+//
+// 本单要治的真事故（发 v0.1.69）：`git pull` 抖动只 fetch 没 pull ⇒ `docker compose build station-portal`
+// 用的是停在 0.1.68 的宿主工作树 ⇒ 真机上 **FDE 报 0.1.69、portal 报 0.1.68 分裂一小时**，而
+// **没有任何机器判据能发现**（portal 镜像当时没有 `build-info.json`，`ci.yml` 的 ⑤′ tripwire 只查 FDE 镜像）。
+// 根因不是「忘了同步」，是**版本有两个来源而其中一个没人负责**（`runner/lib/build-info.js` 顶部记的
+// `0.1.0` / `0.1.32-088e41e` 是同一形状的事故）。所以本文件的职责不是「算一个版本号」，是**只有一条读法**：
+//
+// | 格 | 来源（唯一） | 取不到 |
+// |---|---|---|
+// | 服务端版本（portal 镜像） | portal 镜像内 `/app/build-info.json` 的 `station_version`（`portal/Dockerfile` 末尾烘进去） | `unknown` |
+// | 平台侧引擎（portal 镜像里的 erix-agent） | 同一份的 `engine_version` | `unknown` |
+// | 每台 FDE 的引擎 | `containers.agent_version`（**派生副本**，不是权威载体） | `unknown` |
+//
+// 三条红线（`portal/test/version-surface.test.js` 逐条钉）：
+//   1. **不许互抄**：三格各有自己的来源。把 FDE 那格写成平台侧引擎版本、或把服务端那格从
+//      `package.json` 现读，都是本单要消灭的形状（`package.json` 是**构建输入**，不是运行事实）。
+//   2. **读版本只走 `readBuildInfo()`**（`./build-info.js`）：业务代码里出现 `require('../package.json')`
+//      就是第二个真相源。dev 源码态由它自己退到仓库根 `package.json`（镜像里 `/app` 就是仓库根的对应物）。
+//   3. **缺字段给 `unknown`，永不 `undefined`、永不抛**：一个看起来合法的假值比空值毒（同一份注释），
+//      而这条读法挂在 `/api/health` 上——一个观测字段不许把 readiness 端点打挂（#515 同口径）。
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { readBuildInfo, UNKNOWN } from './build-info.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * portal 镜像里 build-info.json 的位置（`portal/Dockerfile` 末尾那一层写的）。
+ * ⚠ 与 runner 的 `/opt/erix/build-info.json` **不是同一个文件**：一个镜像一份，各说各的版本。
+ * 本地源码态没有这个文件 ⇒ `readBuildInfo()` 退到 `package.json`（`source: 'package'`）。
+ */
+export const BUILD_INFO_PATH = '/app/build-info.json';
+
+/**
+ * dev 退路读 `package.json` 的落点：`portal/src/` 的上两级。
+ * 镜像内 = `/app`（`package.json` 与 `node_modules/erix-agent/package.json` 都在那儿），
+ * 源码态 = 仓库根（同一形状）⇒ 两份布局同源，不需要按环境分支。
+ */
+export const PACKAGE_DIR = path.resolve(HERE, '..', '..');
+
+/** 只认非空字符串，其余（`undefined` / 数字 / 空串 / 脏形状）一律 `unknown`。 */
+function text(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : UNKNOWN;
+}
+
+/** 按优先级取第一个非空字符串；一个都没有 ⇒ 兜底值。 */
+function firstString(candidates, fallback) {
+  for (const item of candidates) {
+    const v = text(item);
+    if (v !== UNKNOWN) return v;
+  }
+  return fallback;
+}
+
+/**
+ * 读 portal 这一侧的三格中前两格（服务端 + 平台侧引擎）。
+ * @param {{env?: Record<string,string|undefined>, buildInfoPath?: string, packageDir?: string}} [opts]
+ *   注入点：`buildInfoPath`（也可用 env `STATION_BUILD_INFO_PATH`）——契约测试拿它注入一份与
+ *   `package.json` 版本不同的 build-info，**不真改仓库文件**（判据 D-1）。
+ * @returns {{station:string,engine:string,revision:string,builtAt:string,source:string}} 四格全是字符串
+ */
+export function readStationVersion({ env = process.env, buildInfoPath, packageDir = PACKAGE_DIR } = {}) {
+  const fallback = { station: UNKNOWN, engine: UNKNOWN, revision: UNKNOWN, builtAt: UNKNOWN, source: UNKNOWN };
+  try {
+    const info = readBuildInfo({
+      env,
+      // 优先级：显式入参 > `STATION_BUILD_INFO_PATH`（portal 自己的注入旋钮，契约测试用）>
+      // `ERIX_BUILD_INFO_PATH`（runner 那份链里已有的那个旋钮，保留兼容）> portal 镜像内的默认位置。
+      // ⚠ 必须**显式**传：`readBuildInfo()` 自己的兜底是 runner 的 `/opt/erix/build-info.json`，
+      //   那是**另一个镜像**里的另一份版本，portal 拿它当默认就会读到 FDE 的账。
+      buildInfoPath: firstString(
+        [buildInfoPath, env?.STATION_BUILD_INFO_PATH, env?.ERIX_BUILD_INFO_PATH],
+        BUILD_INFO_PATH,
+      ),
+      packageDir,
+    });
+    return {
+      // `runnerVersion` 就是 build-info 里的 `station_version`（字段名是 runner 时代的历史包袱）。
+      station: text(info.runnerVersion),
+      engine: text(info.agentVersion),
+      revision: text(info.revision),
+      builtAt: text(info.builtAt),
+      source: text(info.source),
+    };
+  } catch {
+    // `readBuildInfo()` 自己不抛（它内部每级都 catch），这一层只兜「env 传了个脏东西」这类装配错。
+    return fallback;
+  }
+}
+
+/**
+ * `/healthz` 与 `/api/health` 的 `version` 块（判据 B）。
+ *
+ * **只有三格**：`station` / `revision` / `builtAt`。刻意**不带引擎版本**：portal 侧引擎与每台 FDE 的
+ * 引擎是两个不同的数，并排塞进一个**公开、零鉴权**的端点里就会被读错（「`version.engine` 是哪个引擎？」
+ * 没有上下文可答）。引擎那格只在管理台「关于」面板里出现（那里有标签说明它是谁）。
+ *
+ * 观测面不承重：任何异常 ⇒ 三格 `unknown`，`status` 与 200/503 语义一字不动（#515 同口径）。
+ * @param {() => {station?: unknown, revision?: unknown, builtAt?: unknown}} [read] 注入点（测试用）
+ * @returns {{station:string,revision:string,builtAt:string}}
+ */
+export function healthVersionBlock(read = readStationVersion) {
+  try {
+    const v = read() ?? {};
+    return { station: text(v.station), revision: text(v.revision), builtAt: text(v.builtAt) };
+  } catch {
+    return { station: UNKNOWN, revision: UNKNOWN, builtAt: UNKNOWN };
+  }
+}
+
+/**
+ * 第三格：每台 FDE 的引擎版本。⚠ 读的是 `containers.agent_version` —— **派生副本**，不是权威载体。
+ * 写它的是 provision（`provisioner.js#upsertContainerRow`，那一刻从镜像/env 取）与容器心跳
+ * （`internal.js#heartbeat`，agentd 从**自己镜像里**的 build-info.json 读出来上报）。
+ * 所以它的口径是「这台机器上次被报告时跑的是什么」，**不是**「这个镜像现在是什么」；
+ * 面板必须把它标成快照（判据 C），否则管理员会拿它当实时事实与 portal 那一格对比。
+ */
+export const FDE_VERSION_SQL = `
+  SELECT fde_name, agent_version, image, created_at, rotated_at, last_heartbeat, revoked_at
+    FROM containers
+   ORDER BY fde_name`;
+
+/** 一行 containers → 面板项。脏形状（缺列 / 非字符串版本）不猜：**整行不丢，版本落 `unknown`**。 */
+export function normalizeFdeRow(row) {
+  const name = typeof row?.fde_name === 'string' ? row.fde_name.trim() : '';
+  return {
+    name: name !== '' ? name : UNKNOWN,
+    agentVersion: text(row?.agent_version),
+    image: text(row?.image),
+    provisionedAt: typeof row?.created_at === 'string' || row?.created_at instanceof Date
+      ? (row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at)
+      : null,
+    lastHeartbeatAt: row?.last_heartbeat instanceof Date
+      ? row.last_heartbeat.toISOString()
+      : text(row?.last_heartbeat) === UNKNOWN ? null : text(row?.last_heartbeat),
+    revoked: row?.revoked_at !== null && row?.revoked_at !== undefined,
+    // 机器可读的来源标注（前端据此渲染本地化文案；**不许**前端自己再算一份版本）。
+    versionSource: 'containers.agent_version',
+    snapshot: 'provision',
+  };
+}
+
+/**
+ * 管理台「关于」面板的三段（判据 C）。
+ * @param {{pool: object, readVersion?: () => object, log?: {warn?: (m: string) => void}}} opts
+ */
+export async function aboutPanel({ pool, readVersion = readStationVersion, log = console }) {
+  const v = readVersion();
+  let fdes = [];
+  let fdesPresent = false;
+  try {
+    const res = await pool.query(FDE_VERSION_SQL);
+    fdesPresent = Array.isArray(res?.rows);
+    fdes = (fdesPresent ? res.rows : []).map((row) => normalizeFdeRow(row));
+  } catch (err) {
+    // 读不到 ≠ 「一台 FDE 都没有」（#350 同口径）：`fdesPresent:false` 让页面说「读不到」而不是「空」。
+    fdesPresent = false;
+    log?.warn?.(`[version] containers.agent_version 读取失败：${err?.message ?? err}`);
+  }
+  return {
+    server: {
+      station: text(v.station),
+      revision: text(v.revision),
+      builtAt: text(v.builtAt),
+      // 这一格到底从哪儿读的（`build-info` = 镜像里的构建产物；`package` = dev 源码态退路；
+      // `env`/`unknown` 同理）。管理员据此知道「这个数是烘进来的还是现读的」，不许页面自己猜。
+      source: text(v.source),
+    },
+    platformEngine: { version: text(v.engine) },
+    fdes,
+    fdesPresent,
+    provenance: {
+      server: 'build-info.json',
+      platformEngine: 'build-info.json',
+      fdes: 'containers.agent_version',
+      fdesSnapshot: 'provision',
+    },
+  };
+}
