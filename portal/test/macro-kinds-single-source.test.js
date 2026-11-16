@@ -14,7 +14,7 @@
  * 纯静态 + 纯 import，不需要 DB（`TEST_DATABASE_URL` 不设也能跑）。
  */
 import { strict as assert } from 'node:assert';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
@@ -94,29 +94,55 @@ test('portal/src/macros.js 里不再出现枚举字面量数组', () => {
 
 // ── 前端：不许抄第二份 ────────────────────────────────────────────────────────
 
-const FRONTEND_MACRO_FILES = [
-  'frontend/src/stores/macro.ts',
-  'frontend/src/components/MacroMenu.vue',
-  'frontend/src/components/MacroDrawer.vue',
-];
+/**
+ * **扫全目录，不维护白名单**（早先写成手写三条，结果 `MacroBell.vue` 和 `lib/macroView.ts`
+ * 一加进来就逃了 —— 白名单天然落后于新增文件，而「新增文件忘引 shared」正是要抓的东西）。
+ *
+ * 收录判据：`frontend/src` 下**文件名或路径**带 `macro` 的 `.ts` / `.vue`（大小写不敏感），
+ * 且不是 `.spec.`。这样新加的宏组件/工具函数自动进入检查面。
+ */
+function collectFrontendMacroFiles() {
+  const roots = [resolve(PORTAL, 'frontend/src')];
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const abs = resolve(dir, e.name);
+      if (e.isDirectory()) { walk(abs); continue; }
+      if (!/\.(ts|vue)$/.test(e.name)) continue;
+      if (/\.spec\./.test(e.name)) continue; // 用例里造枚举字面量是正当的
+      if (!/macro/i.test(abs.slice(resolve(PORTAL, 'frontend/src').length))) continue;
+      out.push('frontend/src/' + abs.slice(resolve(PORTAL, 'frontend/src').length + 1));
+    }
+  };
+  for (const r of roots) walk(r);
+  return out.sort();
+}
 
 test('前端宏相关源文件从 shared 引枚举，不自己抄字面量', () => {
-  const exists = FRONTEND_MACRO_FILES.filter((rel) => {
-    try {
-      readFileSync(resolve(PORTAL, rel), 'utf8');
-      return true;
-    } catch {
-      return false;
-    }
-  });
-  // 文件还不存在（W5 分步交付）时不报错；一旦存在就必须走 shared。
+  // ⚠ 反向自证：往 `frontend/src/lib/` 或任意 `Macro*.vue` 里塞一行
+  // `['run-notify', …]` 字面量 ⇒ 本条必须红。白名单形态下它不会红（已实测）。
+  const exists = collectFrontendMacroFiles();
+  assert.ok(exists.length >= 3, `扫描面异常小（${exists.length} 个），检查 collectFrontendMacroFiles`);
   for (const rel of exists) {
     const source = read(rel);
-    assert.match(source, /@shared\/macro-kinds/, `${rel} 必须 import @shared/macro-kinds`);
-    assertNoEnumArrayLiteral(source, `portal/${rel}`, shared.KINDS);
-    assertNoEnumArrayLiteral(source, `portal/${rel}`, shared.STATUS);
-    assertNoEnumArrayLiteral(source, `portal/${rel}`, shared.CRITERION);
-    assertNoEnumArrayLiteral(source, `portal/${rel}`, shared.SKIPPED_REASON);
-    assertNoEnumArrayLiteral(source, `portal/${rel}`, shared.VERDICT);
+    const label = `portal/${rel}`;
+    // ① 硬规则：不许出现枚举**数组字面量**（「抄一份」在语法上必然是数组）
+    for (const values of [shared.KINDS, shared.STATUS, shared.CRITERION,
+      shared.SKIPPED_REASON, shared.VERDICT]) {
+      assertNoEnumArrayLiteral(source, label, values);
+    }
+    // ② 用到枚举成员字面量（单值也算，例如 `verdict === 'red'`）就必须走 shared。
+    //    只对**真用到**的文件要求 import —— 无条件要求会把只用 `notifications.severity`
+    //    这类别的枚举的组件（如 MacroBell）误伤成红。
+    const usesEnumMember = [shared.KINDS, shared.STATUS, shared.CRITERION,
+      shared.SKIPPED_REASON, shared.VERDICT].some((values) => {
+      const re = new RegExp(`['\"\`](${values.map(esc).join('|')})['\"\`]`);
+      return re.test(source);
+    });
+    if (usesEnumMember) {
+      assert.match(source, /@shared\/macro-kinds/, `${label} 用到了枚举成员字面量，必须 import @shared/macro-kinds`);
+    }
   }
 });
