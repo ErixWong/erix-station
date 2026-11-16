@@ -155,7 +155,6 @@
     {
       "at": "runner/worker.js:774",
       "read": "process.env[name]",
-      "where": "runner/worker.js:763",
       "reason": "**读形认得、名字解析不出**的动态下标：`name` 来自同一个 `for (const [name, parsed] of [[...]])` 的字面量对数组（三个名字就是 `ERIX_DELEGATE_MAX` / `ERIX_DELEGATE_CHILD_ROUNDS` / `ERIX_DELEGATE_CHILD_TIMEOUT_MS`，见 `runner/worker.js:763-765`，那三行是字面量读形，已经被枚举覆盖，这里只是打日志时回读原值）。扫描器**故意**不解析 for-of 解构配对数组（再写一条形状规则去迎合现存代码 = 判据围着样本转），于是这一处必须留下这条登记 ⇒ 「扫不干净」是花钱的，不是静默的。坐标漂移时判据红，重跑一次更新即可。"
     }
   ]
