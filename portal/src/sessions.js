@@ -108,7 +108,7 @@ export async function fetchSession(pool, sessionId, userId, { forUpdate = false,
     ? `,\n            (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count`
     : '';
   const res = await pool.query(
-    `SELECT s.id, s.user_id, s.project_id, s.cwd, s.title, s.title_source, s.model, s.status, s.last_seq${countCol}
+    `SELECT s.id, s.user_id, s.project_id, s.cwd, s.title, s.title_source, s.model, s.status, s.last_seq, s.origin${countCol}
        FROM chat_sessions s
       WHERE s.id = $1${lock}`,
     [sessionId],
@@ -171,7 +171,7 @@ export async function listSessions(pool, { userId, projectId, cwd, cursor, limit
   }
   params.push(n + 1);
   const res = await pool.query(
-    `SELECT s.id, s.project_id, s.cwd, s.title, s.title_source, s.model, s.last_seq, s.created_at, s.updated_at,
+    `SELECT s.id, s.project_id, s.cwd, s.title, s.title_source, s.model, s.last_seq, s.origin, s.created_at, s.updated_at,
             (SELECT r.id FROM runs r WHERE r.session_id = s.id AND r.status IN ${ACTIVE_RUN_STATES} ORDER BY r.queued_at DESC LIMIT 1) AS active_run_id,
             -- issue #197：每会话消息数（侧栏列表展示）。口径与头部状态行同源（StreamPanel sessionStats ←
             -- getSession DTO 的 messages 长度）：= 该会话在 messages 表的全部行数，含 synthetic、
@@ -1135,6 +1135,9 @@ function rowToSession(r) {
     cwd: r.cwd ?? null,
     title: r.title,
     title_source: r.title_source ?? 'auto', // issue #88：旧部署行由迁移 0009 回填；缺省兜底 'auto'
+    // #526（10 篇 §4 第 4 条）：会话来源。`human`（默认）/ `macro:<宏名>`；侧栏「自动化」分组按
+    // `origin LIKE 'macro:%'` 过滤（写入侧归 W7）。旧行/未带列的查询兔底 'human'。
+    origin: r.origin ?? 'human',
     model: r.model,
     status: r.status,
     last_seq: Number(r.last_seq),
