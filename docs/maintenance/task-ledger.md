@@ -7647,3 +7647,53 @@ FDE `sha256:a04147ca…` / proxy `sha256:19c62c83…`；5 台 `fde-*` 全部重�
 （需要杀一个正在跑工具的 run）；它们由 `runner/test/recovery-rows-adapter.test.js` 与
 `replay-policy.test.js` 的夹具钉着，真机口径等下一次真崩溃自然出现时对账。
 
+
+### 8.146 issue #586 落地：版本号口径收口到镜像内 build-info.json（portal 补烘 + `/api/health.version` + 管理台「关于」）
+
+**要治的**（真事故，非假想敌）：发 v0.1.69 时 `git pull --ff-only` 网络抖动只 fetch 没重试 pull ⇒
+`docker compose build station-portal` 烘的是停在 **0.1.68** 的工作树 ⇒ 真机 FDE 报 0.1.69、portal 报 0.1.68
+分裂一小时，**没有任何机器判据发现它**（portal 镜像当时没有 `build-info.json`，`ci.yml` 的 ⑤′ 只查 FDE 镜像）。
+
+**四段落地**（分支 `feat-261116-12-version-surface`，基点 `2a01a11`；不 push、不建 PR，交主 agent 评审）：
+
+- **A** `6fd5d6a`：`portal/Dockerfile` 末尾烘 `/app/build-info.json`（四格：`station_version` 取镜像内
+  `/app/package.json`，取不到**直接 exit 1**；`engine_version` 取镜像内 `node_modules/erix-agent/package.json`；
+  `revision`/`built_at` 走 ARG），ARG 声明放**所有 COPY 之后**（缓存代价只有一层，与 `runner/Dockerfile:155-166`
+  同一取舍）+ OCI `LABEL`（只给人看）；`release.yml` ④ 与 `ci.yml` 的 portal 构建都补三个 `--build-arg`；
+  `deploy/docker-compose.yml` 的 `station-portal.build.args`（本地允许 `unknown`，CI/发布不许）。
+- **B** `bd89fad`：`/healthz` 与 `/api/health` 的 200 additive 一块 `version{station,revision,builtAt}`——
+  **不带引擎版本**（portal 侧引擎与每台 FDE 的引擎是两个数，塞进公开零鉴权端点必被读错）；
+  `status`/`partialBuffer`/503 信封**一字未动**（`deploy-contract.md` §2.3 的「只看 `res.ok` ⇒ additive 结构性安全」第二例）。
+  新增 `portal/src/version-info.js` = 三格的**唯一读法**；`portal/src/build-info.js` 是
+  `runner/lib/build-info.js#readBuildInfo()` 的**逐字镜像副本**（`.dockerignore` 把 `runner` 排除在 portal 构建
+  上下文外 ⇒ 跨镜像 import 是「本地绿、容器 ENOENT」；同 `transcript-fold.js` 先例），同步由测试在**文本面 + 行为面**
+  两面钉住。业务代码里除这两个文件外没人再读 `package.json`（源码级锁）。
+- **C** `9da5e2d`：`GET /api/admin/version`（`requireAdmin`，只读，不新增错误码）+ 管理台 `#/admin/about`
+  三段分开的只读面板；FDE 段每项带机器可读的 `snapshot:"provision"`，前端据此**必须**渲染「provision 时快照」；
+  `fdesPresent:false` 与「服务端说没有 FDE」是两种画面（#350 同口径）。契约：`docs/api/portal.md` §4.16。
+- **D** `08449c5`：`ci.yml` 加 portal 镜像的 ④′ tripwire（`docker run --entrypoint cat … /app/build-info.json`）；
+  四格断言的唯一实现抽到 **`scripts/check-build-info.mjs`**，CI 与 `portal/test/version-surface.test.js` 共用
+  ⇒ 「判据本身会不会红」在单测里就能自证（四种坏形状各红一条、且**只有该红的那条红**）；
+  FDE 那条 ⑤′ 保持原样内联（不重构别人的判据）。
+
+**判据自证（本地两种真构建）**：带 ARG ⇒ 镜像内 `{"station_version":"0.1.69","engine_version":"0.33.0",
+"revision":"08449c54…","built_at":"2026-11-16T06:50:23Z"}` ⇒ tripwire `rc=0`；**不传 ARG** ⇒ 同一路径读出
+`revision`/`built_at` 恒 `unknown` ⇒ 同一判据 `rc=1`（并点名是这两格）。两次构建的镜像已 `docker rmi`。
+
+**门禁现价**（本机，全部只看退出码）：根 `npm test` 跑两遍 **rc=0 / rc=0**（2679 项、2633 通过、46 跳过、0 失败；
+比基线 +23 = 三个新测试文件 8+7+8）· `node --test 'runner/test/*.test.js'` **rc=0**（583/583）·
+前端 `timeout 240 npm test` **rc=0**（67 文件 / 1458 项，比基线 +16）+ `npm run typecheck` **rc=0** ·
+`npm run check:agents-hotlayer` **rc=0**（热层 18706 / 预算 19456）。
+
+**顺手修掉一个会反复咬人的测试装配坑**：`AdminLayout.spec.ts` 的桩路由表原本手写 tab 名字列表，
+加一个 tab 漏加一个名字 ⇒ **整个文件所有用例**挂载即抛（#485 片 A 踩过）。改成从真路由表
+（`routes` 的 `/admin` 子路由名字）推导，名字集合从此不可能与 `router.ts` 漂移。
+
+**一处事实修正（与工单措辞不同，按现读代码写）**：`containers.agent_version` **不只**在 provision 时写——
+`internal.js#heartbeat` 会用 agentd 上报的值刷新它（`IS DISTINCT FROM` ⇒ 同值不写）。所以它是
+「这台机器上次被报告时跑的是什么」，比工单说的「provision 那一刻的快照」略新一点。面板措辞仍按工单要求
+显示「provision 时快照」（口径没错，只是不完备），并额外透出 `lastHeartbeatAt` / `revoked` 让人能自己判。
+
+**没做**（交主 agent）：真机截图（验收判据 3，playwright + vision 核渲染）与发版后对账（判据 5）——本单不 push、
+不建 PR、不动部署面 ⇒ 现网 portal 仍是旧镜像，`/api/health` 的 `version` 要等下一次发版+部署才出现；
+「期望版本 vs 实际版本」的 canary 对账也没做（需另开列，见 §4.16 的「不做」）。
