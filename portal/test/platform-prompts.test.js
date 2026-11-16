@@ -654,41 +654,72 @@ test('P9 跨包对账：portal 的注入上限 == runner/lib/agents-md.js 的 AG
 // 3. 写侧的原子性与通知面（`P8` / `P10`）
 // ---------------------------------------------------------------------------
 
-test('P8 保存 = 一条语句：写 platform_prompts、旧值快照、审计全在同一次 pool.query 里（审计恰好 1 行）', async () => {
-  // 标题提示词不涉物化 ⇒ 整次保存的 pool.query 应该**恰好 1 次**。
-  const pool = new PromptsFakePool();
-  const saved = await updatePlatformPrompts({ pool, field: 'titlePrompt', text: '只用一句中文标题。', actorId: ACTOR });
-  assert.equal(pool.statements.length, 1, `恰好一次 pool.query，实际 ${pool.statements.length}`);
-  const save = pool.statements[0].sql;
-  assert.match(save, /INSERT INTO platform_prompts/, '那一格写在这一条里');
-  assert.match(save, /INSERT INTO audit_log/, '审计也写在这一条里（⇒ 调用方不得再补 auth.audit）');
-  assert.match(save, /FOR UPDATE/, '旧值必须带行锁快照（并发保存才不会把 previous_* 记成自己进来之前）');
-  assert.equal(pool.audit.length, 1, 'audit_log 恰好 1 行');
-  assert.equal(pool.audit[0].action, AUDIT_ACTION);
-  assert.equal(pool.audit[0].target, AUDIT_TARGET);
-  const details = JSON.parse(pool.audit[0].details);
+test('P8 保存：写 platform_prompts 与审计在同一次 pool.query 里（三条字段路径逐条点名）', async () => {
+  // ★ 判据本体是「**设置写与审计在同一条语句里**」，不是「整次保存只有一条 query」（评审 F4 第 2 项）：
+  //   涉物化那两格本来就要 ① JS 预闸预读对面那一列的当前值 ② 列启用中的 FDE ③ 每台两条入队语句
+  //   （bump revision + 写 outbox）。把「恰好一次 pool.query」当判据会把这条路径写死成不可扩展。
+  //   ⇒ 这里数的是「**写 platform_prompts 的语句恰好 1 条**」，并把其余那几条**逐条点名**（多一条也红）。
+  const countOf = (pool) => ({
+    saves: pool.statements.filter((r) => /INSERT INTO platform_prompts/.test(r.sql)).length,
+    audits: pool.statements.filter((r) => /INSERT INTO audit_log/.test(r.sql)).length,
+    preReads: pool.statements.filter((r) => /^SELECT agents_md_addendum/.test(r.sql)).length,
+    fdeList: pool.statements.filter((r) => /FROM users/.test(r.sql)).length,
+    revisions: pool.statements.filter((r) => /INSERT INTO materialize_revisions/.test(r.sql)).length,
+    outbox: pool.statements.filter((r) => /INSERT INTO materialize_outbox/.test(r.sql)).length,
+    total: pool.statements.length,
+    auditRows: pool.audit.length,
+  });
+  const assertSameStatement = (pool) => {
+    const saves = pool.statements.filter((r) => /INSERT INTO platform_prompts/.test(r.sql));
+    const audits = pool.statements.filter((r) => /INSERT INTO audit_log/.test(r.sql));
+    assert.equal(saves.length, 1, '写 platform_prompts 的语句恰好 1 条');
+    assert.equal(audits.length, 1, '写 audit_log 的语句恰好 1 条');
+    assert.equal(audits[0].sql, saves[0].sql, '设置与审计是**同一条**语句（拆两条 = 退回旧的两个洞）');
+    assert.match(saves[0].sql, /FOR UPDATE/, '旧值必须带行锁快照（并发保存才不会把 previous_* 记成自己进来之前）');
+    assert.equal(pool.audit.length, 1, 'audit_log 恰好 1 行');
+  };
+
+  // —— 路径①：`title_prompt`（不进 `~/AGENTS.md` ⇒ 不预读、不入队）——
+  const titlePool = new PromptsFakePool();
+  const saved = await updatePlatformPrompts({ pool: titlePool, field: 'titlePrompt', text: '只用一句中文标题。', actorId: ACTOR });
+  assertSameStatement(titlePool);
+  assert.deepEqual(countOf(titlePool), {
+    saves: 1, audits: 1, preReads: 0, fdeList: 0, revisions: 0, outbox: 0, total: 1, auditRows: 1,
+  }, '这一格只可能有一条语句：预读与入队都只属于渲染那两格（多出来的每一条都要在这里点名）');
+  assert.equal(saved.materializeEnqueued, 0, 'title-prompt 不涉物化 ⇒ 不入队');
+  const details = JSON.parse(titlePool.audit[0].details);
+  assert.equal(titlePool.audit[0].action, AUDIT_ACTION);
+  assert.equal(titlePool.audit[0].target, AUDIT_TARGET);
   assert.deepEqual(Object.keys(details).sort(), ['field', 'previous_bytes', 'previous_sha256', 'text_bytes', 'text_sha256'],
     '审计只存摘要不存正文（契约 §4：16 KiB × 2 塞进 jsonb 不值）');
   assert.equal(details.field, 'title_prompt');
   assert.equal(details.text_sha256, sha('只用一句中文标题。'));
   assert.equal(details.previous_sha256, sha(''), '第一次保存的前一份就是空串');
-
-  // 第二次保存：previous_* 必须是**紧邻的前一个值**（审计存在的唯一理由）。
-  await updatePlatformPrompts({ pool, field: 'titlePrompt', text: '换一版。', actorId: ACTOR });
-  const details2 = JSON.parse(pool.audit[1].details);
+  // 第二次保存：previous_* 必须是**紧邻的前一个值**（审计存在的唯一理由），且仍然每次恰好一条。
+  await updatePlatformPrompts({ pool: titlePool, field: 'titlePrompt', text: '换一版。', actorId: ACTOR });
+  const details2 = JSON.parse(titlePool.audit[1].details);
   assert.equal(details2.previous_sha256, sha('只用一句中文标题。'));
   assert.equal(details2.previous_bytes, bytes('只用一句中文标题。'));
-  assert.equal(pool.audit.length, 2, '每次保存恰好一条审计，不多写');
+  assert.equal(titlePool.audit.length, 2, '每次保存恰好一条审计，不多写');
+  assert.equal(countOf(titlePool).saves, 2, '两次保存 = 两条写语句（一条都不能多）');
 
-  // 涉物化的那一格：写 + 审计仍然只有**一条**语句（后面才是入队的那几条）
-  const pool2 = new PromptsFakePool();
-  await updatePlatformPrompts({ pool: pool2, field: 'addendum', text: '新约定', actorId: ACTOR });
-  const writes = pool2.statements.filter((r) => /INSERT INTO platform_prompts/.test(r.sql));
-  const auditWrites = pool2.statements.filter((r) => /INSERT INTO audit_log/.test(r.sql));
-  assert.equal(writes.length, 1, '写语句一条');
-  assert.equal(auditWrites.length, 1, '审计一条，且');
-  assert.equal(auditWrites[0].sql, writes[0].sql, '审计与写入是**同一条**语句（分成两条 = 退回旧的两个洞）');
-  assert.equal(saved.materializeEnqueued, 0, 'title-prompt 不涉物化 ⇒ 不入队');
+  // —— 路径②：`agents_md_addendum`（预读 + 写 + 列 FDE + 每台两条入队）——
+  const addPool = new PromptsFakePool({ fdes: ['f1', 'f2'] });
+  const savedAdd = await updatePlatformPrompts({ pool: addPool, field: 'addendum', text: '新约定', actorId: ACTOR });
+  assertSameStatement(addPool);
+  assert.deepEqual(countOf(addPool), {
+    saves: 1, audits: 1, preReads: 1, fdeList: 1, revisions: 2, outbox: 2, total: 7, auditRows: 1,
+  }, '预读 1（拿覆写列的当前值）+ 写 1 + 列 FDE 1 + 每台 2×2 入队 ⇒ 总共 7 条（口径逐条定死）');
+  assert.equal(savedAdd.materializeEnqueued, 2);
+
+  // —— 路径③：`agents_md_override`（同一条路径，0 台启用中的工位 ⇒ 入队那四条不该存在）——
+  const ovrPool = new PromptsFakePool();
+  const savedOvr = await updatePlatformPrompts({ pool: ovrPool, field: 'agentsMd', text: '# 整段覆写', actorId: ACTOR });
+  assertSameStatement(ovrPool);
+  assert.deepEqual(countOf(ovrPool), {
+    saves: 1, audits: 1, preReads: 1, fdeList: 1, revisions: 0, outbox: 0, total: 3, auditRows: 1,
+  }, '没有启用中的工位时不得凭空多出几条入队语句（列 FDE 那一条仍要在：它是“为什么是 0”的证据）');
+  assert.equal(savedOvr.materializeEnqueued, 0);
 });
 
 test('P8b 审计写不进去 ⇒ 整条语句失败而设置一格没变（语句级原子）', async () => {
