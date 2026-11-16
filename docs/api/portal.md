@@ -3090,6 +3090,35 @@ git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什�
 > `portal/test/version-surface.test.js`（**三格来源锁死** + provenance 推导/路径可见 + 镜像与工作流的判据自证）、
 > `portal/test/health-version.test.js`（§5.1 的 `version` 块）、
 > `portal/frontend/src/views/AdminAboutView.spec.ts`（渲染面与不猜数）。
+
+**真机 e2e（issue #603）——发版部署后跑一次，它才是「镜像里烘的是哪份」的机器判据**：
+单测钉的是「读法只有一条」，证不了**真机上那份镜像里到底烘了什么**。v0.1.69 那起事故（portal 烘了停在
+0.1.68 的旧工作树，分裂一小时无人发现）只能由「容器内 `/app/build-info.json` ⇄ `/api/health` ⇄
+`/api/admin/version` ⇄「关于」面板」四处**逐格对账**拦住 —— 就是这支脚本。
+
+```bash
+npm run test:integration:version          # API 腿（A1/A2/A3）+ 容器腿（C1 逐格对账）
+E2E_UI=1 npm run test:integration:version # 再加 UI 腿：playwright 真浏览器进 #/admin/about + 截图
+```
+
+脚本：`portal/integration/version-surface-e2e.mjs`。**验的就是这台机器上活着的那套栈**（与 wp2a/wp3b/
+wp5/wp6 的「起一套隔离栈」相反：新栈必然自洽，拿它验版本没有意义），所以它**不**碰 compose、
+**不**进 CI（同一个理由，见 `docs/ops/ci-release.md` §6）、也**不**被根 `npm test` 收进去。
+三种情况**整腿 skip 并打印原因**（`rc` 仍是 0 —— 既不静默 pass，也不把「没环境」报成产品坏了）：
+
+| 腿 | 需要什么 | 缺了会 skip 的场合 |
+|---|---|---|
+| API（默认跑） | `PORTAL_URL`（缺省 `http://127.0.0.1:${PORTAL_HOST_PORT:-18080}`）连得上；`ADMIN_PASSWORD_FILE`（缺省 `~/.config/mcp/creds/station-dev.password`，AGENTS.md §4.1）里的 `ADMIN_LOGIN`（缺省 `admin`）能**口令直通** | 栈没起 / 口令已轮换 / 这个账号开了 TOTP 或邮箱码（本脚本只会第一步） |
+| 容器 | `docker` 可用（直连或 `sg docker -c`）、`PORTAL_CONTAINER`（缺省 `station-portal`）在跑、镜像里有 `/app/build-info.json` | 没 docker；或镜像是 #586 **之前**烘的（里面根本没那个文件 —— 那正是本节说的 `source=package` 场合） |
+| UI（点名才跑） | `E2E_UI=1` + `PLAYWRIGHT_CONTAINER`（缺省 `erix_station_playwright`）在跑且容器内有 `/app/node_modules/playwright` | 没点名（真浏览器要几十秒），或那个容器不在跑/没装 playwright。UI 腿用**容器里的** playwright，仓库**不**加这个依赖 |
+
+可改的坐标（同一台机器上验别的栈）：`PORTAL_URL` / `PORTAL_HOST_PORT` / `PORTAL_CONTAINER` /
+`ADMIN_LOGIN` / `ADMIN_PASSWORD_FILE` / `E2E_UI` / `E2E_UI_BASE`（缺省 `https://admin.fde.erix.vip:9443`）/
+`PLAYWRIGHT_CONTAINER` / `E2E_SHOT_HOST`（截图落点，缺省 `/tmp/version-surface-e2e.png`）。
+⚠ 本地 `docker compose build station-portal` 不带 `STATION_REVISION`/`STATION_BUILD_DATE` 时，
+`revision`/`built_at` 就是 `unknown`（上面 compose 注释那条）—— 脚本对此**只提示不报红**（红的是
+`station` 那格，以及四处**逐格不相等**）；发布路径的 unknown 由 `ci.yml` 的 portal tripwire 拦。
+
 ### 4.17 能力市场（`/api/market/*` 与 `/api/admin/market/*`，issue #595）
 
 **一句话**：平台把技能包（bundle）发进目录，用户在页面上装/卸/启停，runner 在每次 run 启动时把
