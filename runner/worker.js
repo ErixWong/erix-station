@@ -43,6 +43,9 @@ import { assertCompactContext } from './lib/compact-knobs.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { buildFailureEnvelope, finalTextFallbackField } from './lib/termination.js';
+// issue #243：终局正文「被文本化的工具调用」识别（纯函数 + env 特征集，判据在
+// `runner/test/final-text-toolcall.test.js`）。**只加字段、不改终态语义**。
+import { textualizedToolCallField, toolCallMarkersFromEnv } from './lib/final-text-toolcall.js';
 // issue #451：AGENTS.md 链注入（采集器纯函数 + 可注入 fs，判据在 runner/test/agents-md.test.js）。
 import { collectAgentsMd, renderAgentsMdSection } from './lib/agents-md.js';
 
@@ -188,6 +191,11 @@ let abortController = null;
 let steerArmed = false;
 /** 本次 run 是否曾经装填过转向（`steerArmed` 会被消费清零，终态信封需要的是「曾经装过」这个事实）。 */
 let steeredThisRun = false;
+/**
+ * issue #243：本次 run 的终局形态识别配置（`{markers, invalid, disabled, warnings, source}`）。
+ * 与 `runId`/`attempt` 同族——**每 run 在 `startRun` 里重新解析**，不是模块级常量。
+ */
+let finalTextShapeConfig = { markers: [], invalid: [], disabled: false, warnings: [], source: 'default' };
 const pendingApproval = new Map();
 
 function makeEvent(type, payload) {
@@ -416,6 +424,13 @@ async function startRun(msg) {
   runStart = msg;
   runId = msg.run_id;
   attempt = Number(msg.attempt ?? 1);
+  // issue #243：终局形态识别的特征集，**每 run 解析一次**（同一个 worker 进程会被复用给下一个 run，
+  // 所以既不读全局缓存也不许在模块顶层解析一次就完事）。非法条目**不许静默**：`warnings[]` 里
+  // 每一条都点名「是哪个值 + 为什么」，这里逐条落 `warn` LOG（本模块自己不打日志：纯函数零 IO）。
+  finalTextShapeConfig = toolCallMarkersFromEnv(process.env);
+  for (const warning of finalTextShapeConfig.warnings) {
+    sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: warning });
+  }
   abortController = new AbortController();
   steeredThisRun = false;
   // #370：每个 run 自己一份标记。⚠ 必须在 `startRun` 里复位——同一个 worker 进程会被 agentd
@@ -1174,6 +1189,13 @@ async function startRun(msg) {
       // 是**引擎兜底文案**（「本次收尾未产出正文」），不是模型输出。**只在 true 时给这个键**
       // （缺席 = 不是兜底，绝不写 false）。`finalTextFallbackField` 是纯函数，判据在 termination.test.js。
       ...finalTextFallbackField(result),
+      // issue #243：终局正文看起来是**一段被文本化的工具调用**（模型把 tool call 吐进 content，
+      // 引擎当最终文本收下 ⇒ run 正常 finished，用户看到的「最终回复」是一堆标记）。additive 两键、
+      // **只在命中时给**（缺席 = 没命中，绝不写 false），且**不改 `termination` / `final_text` /
+      // `rounds` / `usage` 任何既有字段**：这不是失败，是「交付报告可能没生成」的提示。
+      // 落点：portal 在同一终态事务里合成 `textualized_tool_call` 事件（`internal.js#finishRun`），
+      // 进 `HISTORY_EVENT_TYPES` ⇒ 刷新后仍在（上游 erix-agent #182 的教训）。
+      ...textualizedToolCallField(result.finalText, finalTextShapeConfig.markers),
       title: '',   // 标题归 portal 生成，worker 恒发空串（#322）
     });
   } catch (err) {

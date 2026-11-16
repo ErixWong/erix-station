@@ -6901,3 +6901,202 @@ spin**（例：上限 2s，每轮仍 `setImmediate`，到点仍 `assert.ok(clock
 **本轮验证**：`node --test runner/test/file-tools.test.js runner/test/system-prompt.test.js` **52/52 绿**（36 + 16；上一版 30 + 16 ⇒ 新增 6 格全在 file-tools）；`runner/test/file-tools-contract.test.js runner/test/agents-md.test.js` **73/73 绿**（jail 改动没伤 #228 的谓词相与面与 #451 的注入面）；`node --test 'runner/test/*.test.js'` 全量与 `npm run check:agents-hotlayer` 见交付报告。**未跑根 `npm test`**：本轮没碰 portal 侧（`git diff --stat` 里 portal 为空），那张 15 分钟的账单不该在这里付。
 
 **未尽项**：① **LOW-4 那道秘密扫描用例没实现**（是审计的「可选加分」，且它会强制把 portal 侧拖进本轮门禁）——已登记成**解禁条件**而不是「已防住」；② 上面那条 **BLOCKED-on-deploy 的真机判据**本轮依旧没跑（红线：不碰 `station-*` / `fde-*` 容器），复测三步不变；③ `.erix -> $HOME` 的边界形状按今天的行为钉死（保留），要收紧成「必须严格在家目录之内、不等于家目录」得连那一格一起改。
+
+
+### 8.137 终局正文是一段「被文本化的工具调用」：识别 + 中性提示，不许再静默丢交付（issue #243 / 工单 fix-261116-03，2026-11-16，worker 落地）
+
+> **编号说明**：本批多单并行，**编号由主 agent 统一分配**（工单原写 8.138，主 agent 改为 8.137）。
+> 本节一次记完两步：第 1 步（识别 + 特征集 + 判据，提交 `328525a`）与第 2 步（事件链路 + 白名单 + 判据，
+> 提交 `9fd7c3f` / `8721fb2`）。**界面渲染与中英双语文案是第 3 步**，本节末尾写明它的现存形态。
+
+**症状**：run 正常 `finished`，但用户在时间线顶端看到的「最终回复」是一堆标记
+（`<｜｜DSML｜｜tool_calls>…`）而不是交付报告 —— 模型把 tool call 吐进了 `content`，引擎当**最终文本**收下，
+于是既没有工具执行、也没有报告，而且**零信号**。`ISSUES.md` 与 `docs/ops/drill-2026-10-11.md` /
+`drill-2026-10-12.md` 都记过同一族形态（`｜FunctionCallML｜｜invoke`、`<tool_call…`）。
+
+**现查取证（本机 dev 库 `station-db`，只读，未碰 `station-*` / `fde-*` 容器）**
+```sql
+select payload->>'final_text' from run_events
+ where run_id='f4dfea1d-c439-4bba-ac34-4c86d7132bea' and type='round_end' order by seq desc limit 1;
+```
+- `runs` 表里这条 run 的实况是 `status=finished`、`rounds=32`、`termination.reason=judge_done`
+  ——**与工单正文写的「9 轮、`end_turn`」不符**（工单的形态描述对，读数不对）。真样本的正文不在
+  `run_end` 的 payload 里：那条 run 的 `run_events.type='run_end'` payload 只有 usage/rounds/termination，
+  **没有** `final_text` 键（本站终态正文的落点是 `round_end` 行 + transcript 投影，见 §8.126 形态 M）
+  ⇒ 判据一律用 `result.finalText`，**没有**新造正文落点。
+- 第二条同族真样本 `messages.id=0549e113-dc48-4ab3-9d87-f8b79a7557bf`：标记名里**带空格**
+  （`<｜FunctionCallML｜｜ invoke`）⇒ 任何「精确等于某个标签名」的判据都会漏。
+
+**特征集口径的一处事实修正（工单的缺省值要不得）**：工单建议钉 `<｜｜DSML｜｜invoke`，但真样本 A 是
+`<｜｜DSML｜｜tool_calls>`、样本 B 标记名内含空格 ⇒ 那条字面串**两条都命中不了**。缺省改为三条前缀形态：
+`<｜｜DSML｜｜` / `<tool_call` / `<｜Function`（≥3 条，不是「只钉 DSML」）。两条防误伤规则：
+整段围栏代码块与成对反引号**先剥掉再匹配**（正文里**引用**标记本身不是泄漏），大小写不敏感。
+可配置面 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS`：逗号分隔**整串替换**缺省；`off` 是**显式关闭**（要 warn）；
+非法条目**逐条**丢弃并**点名是哪个值**，**全部**非法才回退缺省 —— 配错不该把问题重新藏起来。
+（261116 返工更正：这一条先前写作「空 / 超长 / 含换行 / 非串…**并回退缺省**」，三处不准，见下面 §8.137 返工段 LOW-3；代码一直是对的，措辞是错的。）
+
+**第 2 步：链路怎么接（逐条照 #442 的 `final_text_fallback` 抄，三条口径一字未改）**
+- `runner/worker.js`：每 run 解析一次特征集（worker 进程会被复用给下一个 run），`warnings[]` 逐条落 `warn` LOG；
+  RUN_FINISHED **成功**信封 additive 两键 `textualized_tool_call` / `textualized_tool_call_marker`，
+  **只在命中时给**（绝不写 `false`）。**`termination.reason`、`rounds`、`usage`、`final_text` 一个字节都不动** ——
+  它不是失败，红色面仍只由 `run_end` 负责（§2.5.1 第 3 条）。失败信封不带（那条路径正文恒空）。
+- `runner/agentd.js`：只在 `=== true` 时逐字透传；marker 脏（空串/非串）时只丢 marker，布尔照传 ——
+  否则 portal 的 400 会把**整条终态**打回去，为了一个片段丢终态是本末倒置。
+- `portal/src/internal.js#finishRun`：在**同一个终态事务内**合成 `textualized_tool_call` 事件行，
+  `seq` 排在 `run_end` **之前**（时间线：正文 → 中性提示 → 终态分隔条），
+  `client_event_id=<runId>:final:textualized_tool_call` + ON CONFLICT DO NOTHING（#277 先例）。
+  **为什么不叫容器经 U3 自己发**：U3 的写闸是「租约有效」，而收尾时 `finishRun` / `drainQueueAfterRun`
+  都会清 `claim_token`（#220 现查取证）⇒「活干完了、租约没了」是常态，容器自报会被 409 `lease_lost` 挡掉；
+  终态事务内由 portal 写才是必然成功那一侧（`attempt_killed` 的 reaper 分支同构）。
+  payload `{chars, marker}`：`chars` 由 portal 从收到的 `final_text` **自己算**，不取容器报的数（#261 口径）。
+- `portal/src/http.js` 的 `HISTORY_EVENT_TYPES` += 它（§5.3 第 **29** 项、§4.4a 同步补一句）——
+  上游 erix-agent **#182** 的教训就是「实时看得见、刷新后消失」，而这条事件讲的恰恰是
+  「用户刷新来看这次交付了什么」的那一刻。
+
+**前端这次只加了两处集合的类型名**（`EVENT_TYPES` / `HISTORY_REPLAY_TYPES`），**没写渲染**：
+`portal/test/event-surface-contract.test.js` 的 S4 要求「后端下发白名单」与「前端回放集合」**逐项相等**，
+只加后端一边会直接判红（#288 那颗坑的账面对账）。所以现在是「订得到、暂时不刷行」的中间态 ——
+与 `run_outcome` 今天的形态同类；中性分隔行与中英双语文案在第 3 步。
+
+**验证读数（全部实跑）**
+- `runner/test/final-text-toolcall.test.js` **15 格全绿**：① 两条 dev 库真样本 + 同族变体；② 不误伤
+  （提到工具名 / 正文含 `<` / HTML / 比较号 / 引用了标记本身）；③ 特征集可配置且生效（删掉一条 ⇒ 对应夹具
+  不再命中；缺省 ≥3 条；非法值点名 + 回退）；⑤ 反向自证（把判据放宽成「正文含 `<`」⇒ 正常交付摘要全被咬）；
+  ⑥ additive 字段本体 + worker 接线源码级判据；⑦ **真跑** `agentd.onWorkerFinished` 抓 U2 body（夹具同 #442 F3）。
+- `portal/test/textualized-toolcall.test.js` **10 格全绿**（新增）：事件恰好一条 / 排序在 `run_end` 前 /
+  payload 两键 / 终态语义不动 / 终态后再收 U2 不写第二条 / 正常终局零事件 / 脏载荷 400 且点名字段 /
+  U3 保留名 / 三处集合源码级对账 / 文档两处登记。
+- `portal/test/session-events-history.test.js` **+2 格**：**行为级**「刷新后历史端点仍返回它」，
+  payload 一字不改（`marker` 含全角竖线 `｜`，截断逻辑不许切坏它）。
+- **变异自证**（每次都还原，`grep -rn MUTANT runner portal` 收尾为 0）：
+  摘掉 worker 的识别 ⇒ ⑥ 红；识别恒判不命中 ⇒ ①③⑤⑥ 红；硬编码只认 DSML ⇒ ①③⑤⑥ 红；
+  从 `HISTORY_EVENT_TYPES` 删掉它 ⇒ 历史端点两条 + `event-surface-contract` 的 S4 + 三处集合对账全红。
+
+**剩余（不瞒）**
+1. **界面还看不见**：第 3 步（`StreamPanel` 中性分隔行 + zh/en 文案）落地前，这条事件只到「订得到、不渲染」。
+2. **`ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 目前只有 worker 进程读得到**，没接 `deploy/docker-compose.yml` /
+   `provisioner.js` / `fde-proxy` 的 env 允许名单（改那几处要动 `portal/src/http.js` 之外的并行热文件，
+   等主 agent 裁决再开一笔）。
+3. **旧 runner 镜像 ⇒ 无提示**（信号来自 worker，portal 不兜底重做识别：判据留在 runner 一处，
+   升级顺序是「先 runner 后 portal」，与 #442 同）。
+4. dev 库里那条 run 的 `termination.reason` 是 `judge_done` 而非工单写的 `end_turn` ⇒ **真实现场的
+   「9 轮 + `end_turn`」形态未在本库复现**，判据用的是「终局正文」这一层事实，不依赖轮数与 reason。
+
+**第 3 步追加（前端渲染，同日 261116，worker 落地；提交 `1f9a0cf` 渲染 + i18n / `5602c4e` 判据 / `15b0f26` 判据的 tsc 红）**
+
+上面「剩余」第 1 条（**界面还看不见**）到此结案。前端只加渲染，**后端一行没动**。
+
+**开工前的现场（先量再改，读数在 `/tmp/probe-243-readings.json`）**：`useEventStream.ts` 的 `dispatch` 里
+这个类型落进 `default: return`（「未知类型忽略（§5.3 向后兼容）」——**行号按改前那棵树是 1307**，
+本步插入 25 行之后它在 1332；按 §8.126.4 那条「锚点必须写它真实所在的那棵树」的教训，两棵都写）。实测：一条历史回放帧 + 一条实时帧
++ 一条纯未知类型，`entries` 长度 **1 → 1 → 1 → 1**（一条都不多），DOM 里 `.roundsep` 只有夹具参照行、
+`.syserr` 0 个、**空节点 0 个** ⇒ 今天未知类型的真实现场是**整条事件被静默丢弃**，既不是空条目也不是破图。
+所以本步是**补渲染**，不是修一个已存在的破渲染。另两处工单事实更正：本仓**没有** `RunEventTimeline.vue`
+（时间线的分派表在 `composables/useEventStream.ts`，落点是 `components/StreamPanel.vue:599` 那条 `sep` 行），
+也**没有** `components/__tests__/` 目录（30 个前端 spec 一律与组件并排）⇒ 判据按本仓口径并排放。
+
+**渲染的三条口径**
+- **中性、不是警报**：`case 'textualized_tool_call'` → `hooks.onSep(...)` ⇒ 条目 `kind:'sep'` → 既有
+  `.roundsep` 中性灰行。**不走 `onSysErr`**（`.syserr` 是 #dc3545 那个「错误」色，借它就是谎报严重程度 ——
+  正文里那段文字**就是**模型答案的一部分，只是没执行；同 #300 给半截正文挑中性色、同 D9「状态词、不是警报」）。
+  文案里没有 `⚠`，judge 的黄色面板也不许借用。
+- **marker 有就显示、没有就不显示**：第 2 步特意留了「缺 marker 也照发」⇒ 整句必须独立成立；
+  非串 / 空串 / `null` 一律不带片段（绝不 `String(对象)` 渗进用户可见文案，#261/#288B 同口径），
+  片段上界 120 与 portal 的载荷校验同源；片段复用既有 `stream.event.dash`（不抄第二份）。
+- **必须走文本节点**：它最终落在 `StreamPanel.vue` 的 `{{ en.text }}` 上 ⇒ 全角竖线与 `<invoke name="exec">`
+  原样可见。**不许**改成 `v-html`（标签会被吃掉，可能连后半句一起吞）——这件事由判据钉死，不靠注释。
+- 位置：portal 已把 `seq` 排在 `run_end` **之前** ⇒ 前端**不重排**，到达顺序就是「正文 → 提示 → 终态条」；
+  实时与刷新回放共用同一条 `dispatch`（#89 口径），实测两路逐字同文案。
+
+**判据 11 格**（`StreamPanelTextualizedNotice.spec.ts`，全部 DOM 文本断言，**没有一处 `w.emitted()`**）：
+① 历史回放 / 实时各一格 + 「两路逐字同文案」一格；② 缺 marker ⇒ 整句照出且无 `undefined` / 悬空破折号；
+③ 两格（`<invoke name="exec">` 的 **ASCII** 形态 + `<｜｜DSML｜｜` 全角形态）；④ 反向自证（正常 `run_end` +
+普通正文不出现这句话，而终态分隔条照旧在）；另三格守红线：中性（`.syserr` 为 0、无 `⚠`、不借 judge 黄底）、
+位置（`compareDocumentPosition` 判**具体那一行**的文档序，不拿祖先 div 比、不看 `entries` 中间态）、
+双语与脏值。**夹具的一条硬知识**：v-html 的靶子必须是 **ASCII 开头**的标签 —— `<｜｜…` 全角开头在 HTML 里
+本来就不是标签，`v-html` 也吃不掉它，拿它当靶子会假绿（实测：变异 B 下全角那格照样绿）。
+
+**两发变异（都实跑，收尾 `grep -rn MUTANT portal` = 0）**
+- **A 渲染分支恒假** ⇒ `Tests 10 failed | 1 passed (11)`，红的正是 ①×3 / ② / ③×2 / 中性 / 位置 / 双语 / 脏值；
+  **只有 ④ 反向自证仍绿**（恒不渲染本就不该让「不该出现」那格变红 —— 它绿恰恰证明那格不是摆设）。
+- **B `{{ en.text }}` → `v-html`** ⇒ `Tests 2 failed | 9 passed (11)`，红的正是 ③ ASCII 那格
+  （`<invoke name="exec">` 被当标签吃掉）与 ① 实时那格（夹具 marker `<tool_call` 同为 ASCII 标签）。
+  两发都是**真改行为**，不是等价替换。
+
+**读数**：焦点 `env -u NODE_ENV npm test -- src/components/StreamPanelTextualizedNotice.spec.ts` **11/11 rc=0**；
+`npm run typecheck` **rc=0**（第一次是 rc=2：`expect(x).toBe(1,'消息')` 这一形 vitest 不支持，
+本仓口径是 `expect(值, 消息).toBe(…)`，见 `15b0f26`）；全量前端 `env -u NODE_ENV npm test`
+**64 files / 1388 tests 全绿 rc=0**（含 i18n 双语键集对账 `localeParity.spec.ts`）。
+root `timeout 1500 npm test` 按「先 commit 再跑长门禁」在本节提交之后单独跑一次，读数记在交付
+`/tmp/tickets/deliver-243-step3.md`。
+
+#### 8.137 返工（PR #555 第三方复审 2 MED + 2 LOW，2026-11-16，同一分支只追加提交）
+
+**取证边界（先把没证的说清楚）**：本轮对 `station-db` 只跑只读 `select`
+（`docker exec station-db psql -U station -d station -At -c '…'`），没进 `station-*` / `fde-*` 容器，没写库。
+新加的两族特征是**预防性覆盖，不是实证**——现查读数：
+
+| 取数语句（逐字） | 读数 |
+| --- | --- |
+| `select count(*) from run_events where payload::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from run_events where payload::text like '%<invoke name=%'` | **0** |
+| `select count(*) from messages where content::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from messages where content::text like '%<invoke name=%'` | **0** |
+| `select count(*) from transcript_rounds where record::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from transcript_rounds where record::text like '%<invoke name=%'` | **0** |
+| `select count(*) from transcript_rounds where messages::text like '%chatcmpl-tool-%'` | **0** |
+| `select count(*) from transcript_rounds where messages::text like '%<invoke name=%'` | **0** |
+| 阴性对照（同一批查法，证明不是查法失效）：`… like '%DSML%'` 分别打在 `run_events.payload` / `messages.content` / `transcript_rounds.record` / `transcript_rounds.messages` | **6 / 1 / 8 / 8** |
+| `select count(*) from run_events where payload::text like '%chatcmpl%'`（裸串） | **1**，`left(payload::text,220)` 取出来是 `{"name":"writeFile","input":{"path":"llm-smoke-test.js",…}}` —— 某 run 写下去的测试脚本正文，**不是终局正文** |
+| 那一行的身份：`select run_id::text||' / '||type from run_events where payload::text like '%chatcmpl%' limit 3` | `80c1686d-d205-4e01-846d-1ea4a23cb25e / tool_use` |
+
+⇒ `<invoke` 与 `chatcmpl-tool-` 都**没有真样本**（上面全部查过），夹具是**形状夹具**；
+`<｜Function` 那条同族特征也仍是**推断覆盖**（先前记录里已经这么标）。
+顺带一条有用的副产品：裸 `chatcmpl` 会出现在正常内容里（那一行就是），所以进缺省的是
+**带横杠的 13 字符前缀**，不是短词 `chatcmpl`。
+
+**MED-2（优先）：一个超长 marker 曾经能拒绝整条终态**。事实链核对成立：`portal/src/internal.js`
+的 marker 校验开在 `BEGIN` **之前** ⇒ 400 直接 return，终态不写、**不重试**（run 只能等租约过期 / reaper）。
+⇒ 丢弃挪到**源头**：`textualizedToolCallField()` 超长 ⇒ 只丢 `textualized_tool_call_marker`、**布尔照传**；
+`agentd.js` 透传时同一道闸（旧 worker 版本偏移的兜底）；portal 那侧保留 400 但**只是契约闸**，
+裸 `120` 换成两侧**同名**常量 `TEXTUALIZED_MARKER_MAX_CHARS`（grep 一把能齐）。
+对账不靠肉眼：`portal/test/textualized-toolcall.test.js` 的 **E3** 拿**真** `textualizedToolCallField`
+造的载荷过终态闸（超长 ⇒ 终态照写 + 事件照有 + payload 只剩 `{chars}`；runner 侧上界若比 portal 宽，
+这一格会以「终态写不进去」炸出来）；另有源码级一格钉「两侧常量数值相等 + portal 不许留裸 `> 120`
++ agentd 必须 import 同一个常量」。配置面附带一条：条目长过上界**不算非法**（照样判定），
+但给一条告警说明命中时会少一段片段 —— 不静默。
+
+**MED-1：两族认不出、而且配不进去**。缺省集合加 `<invoke`；`chatcmpl-tool-` **不含 `<`**，
+而「条目必须含 `<`」是防误伤的承重墙 ⇒ **没把门槛调低**，改成把「像 id 前缀」写成判据：
+**不含 `<` 的条目要求长度 ≥12 且含 `-`**（`chatcmpl-tool-`=13 过；`chatcmpl`=8、`off`、`offer`、
+`offset`、11 字符的 `abcdefghij-` 拒）。承重墙的理由也用行为钉了一次：绕开解析器硬把 `off` 当特征
+⇒ "offset" 会被咬。误伤判据两格按要求落了（正文只写 `chatcmpl`、正文含 `offset`/`offer` ⇒ 都判假）。
+
+**LOW-3 更正（是我先前记错，不是工单写错）**：本节先前写作「非法条目（空 / **超长** / **含换行** / 非串）
+点名是哪个值**并回退缺省**」—— 三处不准：① 长度上限从来不是拒绝理由（返工之后更是明确
+「超长照样判、只给告警」）；② 解析器从不看有没有换行；③ 真实行为是**逐条**丢弃、
+**全部**非法才回退缺省，「少于 3 条整份作废」这种门槛根本不存在。代码一直是对的，措辞是错的；
+现在判据 ⑪ 把口径钉在代码上（单条合法就留那一条）。**行为一个字没动。**
+
+**LOW-4：已知残余登记**：特征判据是逐字子串 ⇒ 正常交付若在代码块**外**裸写 `｜｜DSML｜｜` 这类标记会
+误报一条中性提示（写进行内代码/围栏不会 —— 剥代码那一步管着）。代价是**多一条中性提示**，
+不是把正常 run 判成失败；换来的是不再静默丢掉交付报告 ⇒ 净收益为正。已同时登记在
+`docs/api/portal.md` §5.3 第 29 类与判据 ⑩（那格里写明了「要改它得先证明不漏真样本 B 那种带空格变体」）。
+
+**四发变异（都实跑，收尾 `grep -rn MUTANT runner portal` = 0）**
+- **A 撤掉源头丢弃**（超长 marker 照带）⇒ `34 tests / 32 pass / 2 fail`：红的正是 **E3 跨面行为**
+  与 **⑨ 边界两侧**那格。
+- **B 把不含 `<` 的门槛降回 3、并去掉横杠要求** ⇒ `23 / 20 / 3`：红的正是 **⑧ 承重墙**、
+  **④ 配置**、**⑪ 口径**（"短词能溜进来"这件事在三处都留了钩子）。
+- **C 把 `<invoke` 从缺省里拿掉** ⇒ `23 / 21 / 2`：红 **③ 缺省集合**与 **⑧ XML 族**那格。
+- **D 撤掉 `agentd.js` 的长度闸** ⇒ `23 / 21 / 2`：红 **⑨ 跨面对账**（源码级）与 **⑨ agentd 兜底**（行为级）。
+
+**读数**：`runner/test/final-text-toolcall.test.js` **23/23**、`portal/test/textualized-toolcall.test.js` **11/11**、
+`node --test 'runner/test/*.test.js'` **530/530**、前端全量 **64 files / 1388 tests rc=0**
+（返工没动 `portal/frontend/**`，第 3 步那 11 格仍绿）、root `npm test` **2392 tests / 2378 pass / 0 fail / 14 skipped rc=0**、
+`npm run check:agents-hotlayer` **rc=0**。
+
+**剩余（本轮没做，别当成已做）**：① `ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 仍未接部署面三处
+（见上面「剩余」第 2 条），现在多了一层：现场要配 `chatcmpl-tool-` 那一族时，
+配置面**收得下**但**投递不到**；② `<invoke` / `chatcmpl-tool-` 是预防性覆盖，真样本仍待现场出现；
+③ LOW-4 的残余按上面的代价论证保留。

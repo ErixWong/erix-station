@@ -890,3 +890,46 @@ test('#514 返修：非空页的游标所有权仍归白名单行——即使发
     await s.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// issue #243（工单 fix-261116-03）：`textualized_tool_call` 刷新后必须仍在
+//
+// 这条事件说的是「这次终局正文是一段被文本化的工具调用 —— 交付报告可能没生成」，
+// 而它**出现的时机恰恰就是用户刷新页面来看这次交付了什么**的那一刻。
+// 上游 erix-agent #182 的教训（诊断事件实时可见、刷新后消失）正是本白名单要消灭的
+// 那种可见性不一致；#288 的 `attempt_killed` 是本站第一次踩，判据写法照它。
+// 写入侧（`internal.js#finishRun` 在终态事务里合成这一行）的判据在
+// `portal/test/textualized-toolcall.test.js`；这里只钉「下发」这一半。
+// ---------------------------------------------------------------------------
+
+test('#243 白名单含 textualized_tool_call：刷新后仍返回它，payload 原样，且不把 run_end 带进来', async () => {
+  const s = await startServer();
+  try {
+    // 载荷形状与写入侧严格一致：{chars, marker}（marker 是命中的特征，含全角竖线，多字节）。
+    s.pool.seed(ev(4, 'textualized_tool_call', { chars: 1830, marker: '<｜｜DSML｜｜' }));
+    s.pool.seed(ev(5, 'run_end', { termination: { reason: 'end_turn' }, final_text: '<｜｜DSML｜｜…' })); // 仍白名单外
+    const body = await historyOf(s);
+    assert.deepEqual(
+      body.events.map((e) => [e.seq, e.type, e.payload]),
+      [[4, 'textualized_tool_call', { chars: 1830, marker: '<｜｜DSML｜｜' }]],
+      '刷新后必须还返回这条事件，且 payload 一字不改（`marker` 含全角字符，截断逻辑不许切坏它）；'
+      + '白名单外的 run_end 照常不下发（本改动是 additive，没有将终态行提升为下发项）',
+    );
+    assert.equal(body.events.some((e) => e.type === 'run_end'), false);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#243 缺 marker 的历史行也照发（前端要能对「没有 marker」也出同一句话）', async () => {
+  const s = await startServer();
+  try {
+    s.pool.seed(ev(9, 'textualized_tool_call', { chars: 44 }));
+    const body = await historyOf(s);
+    assert.deepEqual(body.events.map((e) => [e.seq, e.type, e.payload]),
+      [[9, 'textualized_tool_call', { chars: 44 }]],
+      '没给 marker 就不是 null/空串——形状与写入侧一致（键缺席）');
+  } finally {
+    await s.close();
+  }
+});
