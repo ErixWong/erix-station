@@ -37,6 +37,7 @@ import {
   listAssignments, assignTemplate, unassignTemplate, applyExpiredAssignments,
   claimMacroRun, finishMacroRun, listMacroRuns,
 } from '../src/macros.js';
+import { createNotification } from '../src/notifications.js'; // #526：软删判定接真表后，本文件要能写通知行
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATION_0035 = path.join(HERE, '../../deploy/migrations/0035-macro-platform.sql');
@@ -291,22 +292,23 @@ test('#524 软删三分支（07 §2.3）：零引用物理删 / 只有订阅级�
     await assertMacroError('not_found', () => updateTemplate(pool, { templateId: t3.id, patch: { name: '复活' } }),
     );
 
-    // ── 分支三的另一半：`notifications` **W3 才建** ⇒ 「表存在则检查、不存在则跳过」
-    const t4 = await createTemplate(pool, { kind: 'run-notify', name: '此刻无通知表', scope: 'session' });
+    // ── 分支三的另一半：`notifications` 已由 W3（0036）建成真表 ⇒ 判定必须经真表数
+    //（issue #526，10 篇 §4 第 1 条：W1 留的「表不存在则跳过」时代结束）。
+    const t4 = await createTemplate(pool, { kind: 'run-notify', name: '表在但无引用', scope: 'session' });
     await assignTemplate(pool, { templateId: t4.id, userId, sessionId });
     assert.equal((await deleteTemplate(pool, { templateId: t4.id })).mode, 'deleted_with_assignments',
-      'notifications 表不存在 ⇒ 这一支跳过（只有订阅 ⇒ 物理删 + 级联）');
+      '真表存在但一行都没指向本模板 ⇒ 数不到 ⇒ 物理删 + 级联（空表不许误伤成软删）');
 
     const t5 = await createTemplate(pool, { kind: 'run-notify', name: '有通知', scope: 'session' });
-    await assignTemplate(pool, { templateId: t5.id, userId, sessionId });
-    // 现场建一张 W3 形状的表：验的是「探测 + 计数」这条通路真的接得上（列名用探测列表里的第一个）。
-    await pool.query('CREATE TABLE notifications (id serial PRIMARY KEY, macro_template_id uuid, body text)');
-    await pool.query('INSERT INTO notifications (macro_template_id, body) VALUES ($1, $2)', [t5.id, '已发出的通知']);
+    const a5 = await assignTemplate(pool, { templateId: t5.id, userId, sessionId });
+    // 真表口径：引用经执行账间接成立（notifications.macro_run_id → assignments.template_id）。
+    const r5run = await claimMacroRun(pool, { assignmentId: a5.id, anchor: 'run-n', criterion: 'terminal', bucket: 'b0' });
+    await createNotification(pool, { userId, macroRunId: r5run.id, title: '已发出的通知' });
     const r5 = await deleteTemplate(pool, { templateId: t5.id });
-    assert.equal(r5.mode, 'soft', 'notifications 里有引用 ⇒ 只能软删（表存在就必须被算进来）');
+    assert.equal(r5.mode, 'soft', 'notifications 里有引用（间接） ⇒ 只能软删（表存在就必须被算进来）');
     assert.equal(r5.notifications, 1);
     assert.ok((await pool.query('SELECT deleted_at FROM macro_templates WHERE id = $1', [t5.id])).rows[0].deleted_at);
-    // 表在但没有任何引用列 ⇒ 数不到 ⇒ 物理删（此时通知根本记不了模板，物理删是安全的）。
+    // 表在但既无直连列也无 `macro_run_id` ⇒ 数不到 ⇒ 物理删（此时通知根本记不了模板，删是安全的）。
     await pool.query('DROP TABLE notifications');
     await pool.query('CREATE TABLE notifications (id serial PRIMARY KEY, body text)');
     const t6 = await createTemplate(pool, { kind: 'run-notify', name: '无引用列', scope: 'session' });
