@@ -5647,3 +5647,169 @@ claim 必返回 `null`，到期意图永远产不出。⇒ 走 `claimExpiryRun`�
 ⇒ 接手前先 `git status` / `git diff` 看有没有残留的变异或半成品。
 
 **待办**：W3（通知 + HTTP API，#526，在跑）、W4a（#537）、W4b（#538）、W7（#536）、W5/W6。
+
+
+### 8.127 前端 `emitted()` 环境地板拆掉，并加静态闸 H3（issue #496 / 工单 fix-261115-05，2026-11-15，worker 落地 + 主 agent 亲验）
+
+**为什么不是一次性修完就完事**：`@vue/test-utils@2.5.1` 的 `emitted()` 取事件靠 **Vue devtools
+hook**，Vue 只在非生产构建里发 devtools 事件 ⇒ 本机 shell 默认 `NODE_ENV=production` 时它**恒空**。
+`AGENTS.md` §4 那句「新用例别用 `w.emitted()`」写于 11-11，**11-14 的 `2e40214` 又带进来一处**
+（`useEventStream.spec.ts`）⇒ 文字纪律拦不住扩散，本单把它换成**能跑的判据**。
+
+**改了什么**
+- 观测方式：`wrapper.emitted(ev)` → 「父级回调收 + 渲染进宿主 DOM + 断言渲染文本」
+  （新增 `mountBadgeHost` / `mountPanelInHost`）。**产品代码零改动**，`prefill` / `refresh` /
+  `files-changed` 的事件契约照旧。
+- 顺带修一条**假判据**：`expect(text).not.toContain('synced')` 里 `synced` 是状态词，
+  预填文案（`gitLight.prefill.finish` 只插 `{repos}{more}`）根本不出现它 ⇒ 改成钉已收工仓库的
+  **名字** `p1`，脏名单漏进来才会红。
+- 静态闸 **H3** 进 `test/repo-hygiene.test.js`（与 H1/H2 同文件同形）：只扫 **git 跟踪的**
+  `portal/frontend` 下 `*.spec.ts`，匹配**带点调用形状** `\.emitted\b`（散文里写「别用 emitted()」
+  不拦、写成调用就拦）；四道防空转自证：清单 ≥ 40 个 spec、顶层 `src/router.spec.ts` 必须在清单里
+  （拿 `src/**/*.spec.ts` 当 git pathspec 会漏它）、注入一行调用必须恰好命中 1 处、注入散文零命中。
+
+**主 agent 亲验读数**（树 `wt-496-261115` @ `fix-261115-05-496-emitted-floor`）
+- 前端四个 spec：`NODE_ENV=production` 与 `env -u NODE_ENV` **两个方向都 212/212、rc=0**；
+  `npm run typecheck` rc=0。
+- 根 `npm test`：2357 项、唯一红是 `portal/test/env-int-strict-506e.test.js:197`
+  （`ROUTE_IDLE_BACKOFF_MAX_MS='10000abc'`，断言「循环必须停在某一拍的 sleep 上」），
+  **单独复跑两次 17/17 rc=0** ⇒ 本批四张并行造成负载假红，与本单无关。
+- 我自己补做的变异（不采信 worker 自报的 5/5）：往被跟踪的 `portal/frontend/src/router.spec.ts`
+  追加 `wrapper.emitted('files-changed')` ⇒ `not ok 3 - H3 …`、rc=1；还原 ⇒ rc=0（3/3）。
+
+**撞号提醒**：本批四张单都从 `c8613a3` 起跳，各棵树里台账最大号都是 8.126，8.127 很可能被同时
+取用 ⇒ **合并时先合者保留原号，后者 +1 并在节内注明原号**。
+
+**worker 侧过程记**：首轮在 30 分钟默认时间闸内做完了代码与变异、没来得及写台账
+（`2f4bab5` + 未提交的 `test/repo-hygiene.test.js`）；`resume` 续跑一次遇模型空响应
+（`produced no output`）⇒ 收尾（commit + 本节台账）由主 agent 完成，符合 §3.0
+（git 流程操作与文档维护本就属主 agent）。
+
+**copilot 二次审计与 H3 加固**（同工单 fix-261115-05 的续作，2026-11-16，worker 落地）
+
+**审计那条 MED 属实**：加固前判据只有 `\.emitted\b` 一支（原 `test/repo-hygiene.test.js:86-99`），
+而 `wrapper['emitted'](...)` 与 `const { emitted } = wrapper` 一样吃 Vue devtools hook、在生产构建下
+同样恒空，只是躲得过点号；反向自证又**只注入点号那一种形状** ⇒ **H3 能在假绿状态下通过**
+（审计原话：*the canonical injected probe does not test those forms*；给出的绕过法就是 bracket
+access 与 destructure/alias）。**扫描面本身没问题**（`git ls-files -- portal/frontend` 递归 +
+`.spec.ts` 过滤是 vitest `include` 的超集），漏的是**匹配面与探针面**。
+
+**加固成了什么**（提交 `6c018d1`）
+
+- 一支 → 三支 `EMITTED_SHAPES`，各带名字：① 点号 `.emitted`（含属性读 `wrapper.emitted`）
+  ② 方括号 `['emitted']` / `["emitted"]` ③ 解构取走 `{ emitted }` / `{ emitted: 别名 }` /
+  `{ a, emitted }`，外加跨行解构里单独占一行的成员 `emitted,`。解构拦的是**取走这件事本身**——
+  取走之后怎么调都追不住，所以不追调用点，直接把取走钉死。
+- 命中行改成带 `[形状名]`；反向自证从「注入一次点号」改成**逐形状 7 条注入**（点号 2：调用 + 裸属性读；
+  方括号 2：单引号 + 双引号；解构 3：裸取 + 带别名 + 跨行），每条要求 ①恰好命中 1 处
+  ②命中在被改的那份上 ③**命中标注的是这一支**（只验「命中了」证明不了是哪种形状认出来的）。
+- 新增覆盖率闸：`EMITTED_SHAPES` 里每个名字都必须有注入探针 ⇒ 以后加形状忘了配探针 = 直接红。
+- 散文探针（反向自证 B）保留并加到两句，仍要求**零命中** ⇒ 仓库现存 14 处「别用 emitted()」的
+  注释正文（分布在 8 个 spec，一处真调用都没有）全没红。**拦的是形状，不是单词**。
+- 范围照原口径不动：不钉 `fire()` / `vm.$emit` 等其它读事件方式；产品代码零改动。
+
+**加固后的读数**（本树实测，`NODE_ENV=production`）
+
+- 判据自身：`node --test test/repo-hygiene.test.js` **3/3、rc=0**；根 `npm test` **2357 项 0 红 14 跳**。
+- 真盘变异（往被跟踪的 `portal/frontend/src/router.spec.ts` 追加一行，跑完还原）**六条全 rc=1**，
+  且各标自己那一支：`wrapper.emitted('files-changed')`→`[点号]`、`wrapper['emitted'](...)`→`[方括号]`、
+  `wrapper["emitted"](...)`→`[方括号]`、`const { emitted } = wrapper`→`[解构]`、
+  `const { emitted: fired, find } = wrapper`→`[解构]`、跨行 `const {⏎ emitted,⏎} = wrapper`→`[解构]`；
+  散文对照 `// 别再写 emitted() 这种调用（#496）` **rc=0**。
+- 「探针非空转」再自证一层：把三支正则逐个换成永不匹配的字面量 ⇒ 各自 rc=1 且报的是**对应注入探针**
+  （`注入 方括号 形状 … 实际 0 处`），三支**都不是空支**；再凭空加一条没有探针的形状 ⇒ rc=1
+  报「有形状没有对应的注入探针」。
+- **已知代价（有意接受，与点号那一支同口径）**：把形状**写进注释**会红——实测
+  `// 也别写 { emitted } 这种解构（#496）` rc=1。改措辞即可（散文写 `emitted()` 不拦）。
+
+**过程记**：这轮派单**正文是空的**（`Task:` 后无字），素材 `/tmp/h3-finding.md` 在派单那一刻还没落盘。
+worker 起手没干等：先查证仓库状态（分支已 3 提交、PR #532 已开、H3 基线 3/3 绿、前端 spec 里
+14 处 `emitted` 散文的现状），收到 steering 后补读素材直接接上。⇒ **派单前 `test -r` 一下素材文件**是便宜的保险。
+
+**自证时又抓到一条同族绕过（已补，提交 `31d8387`）**
+
+加固第一版留着一个洞，是我按形状逐条做真盘变异时撞出来的（不是审计提的）：
+
+```js
+const {
+  find,
+  emitted        // 末位成员、行尾没逗号、`}` 在下一行 —— 加固第一版 rc=0 放过去了
+} = wrapper;
+```
+
+行级判据的前两条支都要求**同一行**里 `emitted` 后面跟得上 `,` `}` 或 `:`，而这一行整行就一个
+`emitted` ⇒ 看不见。补第三条支 `^[ \t]*emitted[ \t]*$`（整行只有这个标识符 = 跨行解构的成员位），
+并配一条注入探针钉住 ⇒ 注入探针共 **8 条**。补完该变形 **rc=0 → rc=1**（标 `[解构]`）。
+
+**订正上面那句「根 npm test 0 红」**：加固后再跑一次根 `npm test`，2357 项里出现 2 红，都在
+`portal/test/env-int-strict-506e.test.js` 的「循环必须停在某一拍的 sleep 上」（routes③）——
+**单跑两次各 17/17 rc=0**，当时机器 load 11.1（同机在跑一个 copilot 审计）。就是本节上面记过的
+**负载假红**，与本单无关（本单只改静态扫描，不碰时序）。⇒ 「0 红」是本树低负载时刻的读数，
+**别当恒真**；引用它的人请按「单跑绿 + 负载假红」理解。
+
+**仍未覆盖（有意留下的边界）**：`const K = 'emitted'; wrapper[K]()` —— 字符串提到别的行再取，
+行级判据追不住；要拦它得扫字符串字面量（会牵连一堆无关的 `'emitted'` 文本），超出本单口径。
+
+**返工：H3 把注释当成了代码（同单返工，261116，worker 落地 + 提交 `2fdac48`）**
+
+> 号数说明：本节在本分支是 **8.127**，按上面「撞号提醒」在十单合并树里落到 **8.131** ⇒ 这段是
+> 追加进**同一节**（没改号、没另起节）。它**订正**本节那句「已知代价：把形状写进注释会红」——
+> 那条代价今天被证明不是可接受的代价，见下。
+
+**现场（主 agent 在合并树跑出来的，不是负载假红）**：最终树根 `npm test` 只红一格
+`not ok 2527 - H3 …`，指向 `portal/frontend/src/components/StreamPanelTextualizedNotice.spec.ts:16`
+`[点号]`，而那一行是 #555 那份 spec 的**文件头注释**：
+`* ⚠ 口径：本文件**不用 \`w.emitted()\`**（本机 \`NODE_ENV=production\` 会让它恒空 ⇒ 假绿）…`。
+**那份 spec 写得完全正确**（只用 DOM 断言，还特意留了一句说明）⇒ 闸指着的是**一句真话**。
+
+**为什么修闸而不是改注释**：这条闸的语义是「**代码**里不许取走 `emitted()`」。改措辞绕过 ⇒ 下一个
+想在文件头写「本文件不用 emitted()」的人再被撞一次、拿到的仍是一条指着真话的红 ⇒ 学会「文件里别写
+这条口径」= **反向教育**。所以派单写死「不许改 `portal/frontend/**` 里任何 spec 的措辞」，本单
+只动 `test/repo-hygiene.test.js`（`git status --porcelain -- portal/frontend` 全程为空）。
+
+**改了什么**
+- `stripComments()`：扫描**前先剥块注释**（含 JSDoc，跨行）**再剥行注释**，然后才跑点号/方括号/解构
+  三个匹配器。剥法是**等长空格替换** ⇒ 行数与列位不变，命中报告里的 `path:16` 还能跳到位
+  （判据①顺手钉住「剥注释不许改行数」）。
+- **不是**「整行含 `//` 或 `*` 就放过」，也**不是**两条正则 pass：
+  一趟字符扫描一次定死三种优先级（块注释里不认行注释起点、行注释里不认块注释起点、字符串/模板字面量
+  里两者都不认）。pass 版的三个坑都在**吞真代码**（假绿方向）：行注释里写 glob 的「斜杠星」、块注释
+  正文里写 URL、以及注释正文里夹的**反引号**（真实误报那句就有）。另两处刻意保守：块注释到文件尾
+  没闭合 ⇒ 判它假的、原样退回不剥；普通单/双引号串撞见换行就地收尾 ⇒ 游离撇号不会把后半篇当字符串。
+- 判据**加两格**（`test/repo-hygiene.test.js`，两格必须成对读：只过① 可能只是规矩被废了）：
+  ① `H3-①` 同款形状的那句注释（JSDoc 内、行首 `*`、正文夹反引号、里面写着 `w.emitted()`）**不报**；
+  ② `H3-②` 同一份夹具把那一句换成真代码 `const e = w.emitted('x');` **必须报**且标签仍 `[点号]`，
+  四种写法各钉一次：原地替换 / 行尾还跟注释（专杀「整行放过」偷懒）/ URL 串在前（字符串里的两斜杠
+  不是注释起点）/ 注释位与代码位共存（注释一处都不许多算）。
+
+**读数**（树 `wt-496-261115` @ `fix-261115-05-496-emitted-floor`，本机 shell 默认 `NODE_ENV=production`）
+- 判据自身：`node --test test/repo-hygiene.test.js` → **5/5、rc=0**（原 3 格 + 新 2 格）。
+- 变异一：**撤掉剥注释**（`f.text` 直接扫）⇒ `not ok 4 - H3-① …`，报的就是今天那句原文
+  （`H3CommentFixture.spec.ts:3 [点号] * ⚠ 口径：… \`w.emitted()\`…`）⇒ 假阳性复发，rc=1；
+  （同一发里 `not ok 5 - H3-②` 也红，因为②的第四种写法让注释多算了一处 ⇒ 2 处 ≠ 1 处，属预期连带。）
+- 变异二：豁免做成「整行含 `//` 或 `*` 就放过」⇒ `not ok 5 - H3-② …`，
+  `真代码后面还跟着行尾注释 ⇒ 应恰好命中 1 处，实际 0 处`（`0 !== 1`），rc=1；`H3-①` 那发**仍绿**
+  ⇒ 两格合起来证明「豁免的是注释，不是这条规矩」。两发都跑完还原，`grep -rn MUTANT test portal` = **0**。
+- **真盘回放**（不是只测夹具）：把 #555 那份 spec 原文从 `wt-243-261115` 拷进来、`git add` 让它进
+  扫描面（H3 只扫 git 跟踪的文件）⇒ 闸 **5/5 rc=0**（今天的红没了）；再在同一份文件末尾追加一行
+  `const _probe = w.emitted('x'); // 行尾还有一句说明` ⇒ `not ok 3 - H3 …` 且报
+  `…StreamPanelTextualizedNotice.spec.ts:230 [点号] const _probe = w.emitted('x');`（行尾注释被剥、
+  代码没被放过、行号对得上）。回放完 `git rm --cached --force` + 删文件，`portal/frontend` 零改动。
+- 门禁一：`timeout 300 node --test test/repo-hygiene.test.js` → **5/5、rc=0**；根 `npm test` 里也钉住了
+  （`ok 2355`…`ok 2359`，含新的 ①② 两格）。
+- 门禁二（根 `timeout 1500 npm test`，**环内先踩到一个坑**）：第一发 **860 项 / 113 红**，红因是
+  `ERR_MODULE_NOT_FOUND: Cannot find package 'erix-agent'` —— 查 `node_modules` 发现**本 worktree 的
+  依赖树是空的**（`ls node_modules | wc -l` = **0**，而 `wt-495` / `wt-243` / `wt-514` 三棵树都是 17 项
+  含 `erix-agent`）⇒ 就是 H1 那段讲的共享树被刷干净。按 AGENTS.md 的口径 `npm ci --prefer-offline`
+  修环（**没改依赖、没改 lockfile**：前后 sha256 前缀都是 `67fcd574d3199b11`，`git status` 只见台账）。
+- 门禁二（修环后）：**2359 项 / 1 红 / 14 跳**，唯一红格是
+  `not ok 183 - #routes③ ROUTE_IDLE_BACKOFF_MAX_MS 其它前缀形状 …`（`portal/test/env-int-strict-506e.test.js:206`，
+  `循环必须停在某一拍的 sleep 上`）⇒ **正是派单点名的 #531 负载假红族**（`env-int-strict-506e`）。
+  定性读数：**单跑那个文件两次都是 17/17、rc=0**；**没动那些夹具**（本单只改静态扫描，不碰时序）。
+- `npm run check:agents-hotlayer` rc=**0**（热层 18706 / 预算 19456；台账条目 127 个、无重复编号）。
+- `deploy/.env` 本树**不存在**（只有 `deploy/.env.example`）⇒「保持未跟踪」天然满足；`git status` 全程
+  只出现本单改的两个文件。
+
+**仍然没覆盖（追加到本节那条残留边界旁边）**：正则字面量不进状态机 ⇒ `/a/*b/` 这类写法若后面还碰得上
+一个真块闭合，中间那段会被误剥（假绿方向）；加上原有那条 `const K = 'emitted'; wrapper[K]()`，
+两支都属「行级判据追不住」，要拦得扫整棵 AST，超出本单口径。
