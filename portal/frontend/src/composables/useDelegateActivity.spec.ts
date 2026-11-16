@@ -350,8 +350,7 @@ describe('归一化与徽标计数', () => {
 });
 
 describe('失败语义（判据 16：静默保留，不渲染红条）', () => {
-  it('一发 500 ⇒ 保留上次的行、不置 error（面板连灰字都不出）', async () => {
-    queueResponses(ok(rosterBody(rosterItem())), fail(500));
+  it('一发 500 ⇒ 保留上次的行、不置 error（面板连灰字都不出）', async () => {    queueResponses(ok(rosterBody(rosterItem())), fail(500));
     const { handle } = setup({ cards: [delegateCard()] });
     await tick(0);
     expect(handle.items.value).toHaveLength(1);
@@ -376,6 +375,33 @@ describe('失败语义（判据 16：静默保留，不渲染红条）', () => {
     await tick(DELEGATE_POLL_MS);
     expect(handle.error.value).toBe(false);
     expect(handle.items.value).toHaveLength(1);
+  });
+
+  it('degraded（必修 1）：一次都没拉到 ⇒ degraded=true；拉到过之后的失败只 error、**不** degraded', async () => {
+    // 「读不到」与「没有」必须分家：徒标的可见性靠 degraded，只看 `liveCount` 会把首次就失败的
+    // 情形说成「没有子任务」（那句「暂不可读」就永远不可达）。
+    queueResponses(fail(500));
+    const { handle } = setup({ cards: [delegateCard()] });
+    for (let i = 0; i < DELEGATE_ACTIVITY_FAIL_THRESHOLD; i += 1) {
+      await tick(i === 0 ? 0 : DELEGATE_POLL_MS);
+    }
+    expect(handle.error.value).toBe(true);
+    expect(handle.loaded.value).toBe(false);
+    expect(handle.degraded.value).toBe(true);
+
+    // 一旦拉到过，就退回「保留上次数据 + 一行灰字」，徒标不再进降级态。
+    queueResponses(ok(rosterBody(rosterItem())));
+    await tick(DELEGATE_POLL_MS);
+    expect(handle.loaded.value).toBe(true);
+    expect(handle.degraded.value).toBe(false);
+
+    queueResponses(fail(500));
+    for (let i = 0; i < DELEGATE_ACTIVITY_FAIL_THRESHOLD; i += 1) {
+      await tick(DELEGATE_POLL_MS);
+    }
+    expect(handle.error.value).toBe(true);
+    expect(handle.degraded.value).toBe(false);
+    expect(handle.items.value).toHaveLength(1); // 上次数据仍在
   });
 
   it('URL 构造器对两个 id 都编码（端点路径段不许裸拼）', () => {

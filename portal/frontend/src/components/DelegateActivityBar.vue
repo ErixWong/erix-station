@@ -44,7 +44,11 @@ const liveCount = computed(() => store.delegateLiveCount);
 watch(liveCount, (n) => {
   if (n === 0) store.collapseDelegatePanel();
 });
-const panelTitle = computed(() => t('delegate.activity.panelTitle', { count: liveCount.value }));
+/** 读不到且一行都没有 ⇒ 标题也说「子任务 ?」（与徒标同一说法，不拿 0 冒充「没有」）。 */
+const unknown = computed(() => store.delegateDegraded && rows.value.length === 0);
+const panelTitle = computed(() =>
+  unknown.value ? t('delegate.activity.titleUnknown') : t('delegate.activity.panelTitle', { count: liveCount.value }),
+);
 
 function dotClass(item: DelegateActivityItem): string {
   return DELEGATE_BADGE_CLASS[delegateBadgeKind(item.state, item.termination)];

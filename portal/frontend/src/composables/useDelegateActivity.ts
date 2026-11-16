@@ -215,6 +215,17 @@ export function useDelegateActivity(options: UseDelegateActivityOptions) {
   /** 徽标数字（判据 5 的唯一尺规：活态集合就是 `lib/delegate.ts#DELEGATE_LIVE_STATES`）。 */
   const liveCount = computed(() => items.value.filter((item) => isDelegateLive(item.state)).length);
   const hasLive = computed(() => liveCount.value > 0);
+  /**
+   * **降级态**：连续失败到阈值且**一条都没拉到过** ⇒ 「读不到」不等于「没有」。
+   *
+   * 为什么不直接把 `error` 拿去驱动徒标可见性：面板要在拉到过东西之后用 `error` 保留上次数据继续
+   * 画行（那一发挂了不改事实），而徒标的可见性必须区分两种 0：**读到过且真的没儿子**（整段不出）
+   * 与**从没读到过**（必须说话）。少了这个量就是验收抓到的真缺陷：首次请求就连着 500
+   * ⇒ `liveCount === 0` ⇒ 徒标不渲染 ⇒ 面板开不了 ⇒ 设计 §4.2 要的那句「子任务状态暂不可读」
+   * **永远不可达**，用户看到的是「没有子任务」——把「我不知道」说成「没有」，与 D9 的
+   * 「⚪ 不得渲染成绿」同一条口径（没证据就没资格下那个结论）。
+   */
+  const degraded = computed(() => error.value && !loaded.value);
   /** 面板要不要挂：拉到过东西，或已经降级到「暂不可读」那句。 */
   const hasRows = computed(() => items.value.length > 0 || error.value);
 
@@ -335,6 +346,7 @@ export function useDelegateActivity(options: UseDelegateActivityOptions) {
     items,
     error,
     loaded,
+    degraded,
     liveCount,
     hasLive,
     hasRows,

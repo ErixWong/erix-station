@@ -501,6 +501,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const delegateHasLive = computed(() => delegateActivity.hasLive.value);
   /** 连续失败到阈值 ⇒ 面板出**一行灰字**（中性，不是红条）。 */
   const delegateRowsUnavailable = computed(() => delegateActivity.error.value);
+  /**
+   * 「读不到」而不是「没有」（连续失败且一次都没拉到）。徒标靠它决定**可见性**：
+   * 没有这个量时首次请求就失败 ⇒ `liveCount` 恒 0 ⇒ 徒标不出 ⇒ 那句「暂不可读」永远不可达。
+   */
+  const delegateDegraded = computed(() => delegateActivity.degraded.value);
   /** 这一行的「已跑多久」毫秒数（内部读 composable 的 1s 时钟 ref ⇒ 在渲染效应里自然响应式）。 */
   function delegateElapsedMs(item: DelegateActivityItem): number | null {
     return delegateActivity.elapsedMs(item);
@@ -1891,7 +1896,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // issue #592：子 run 活动面（徽标 + 面板）与**共享的**子 run 抽屉状态。
     // 数据只有一份（两份实例 = 两份轮询）；抽屉的挂载点仍在 StreamPanel，这里导出的是「谁能写它」：
     // 工具卡的按钮 + 面板行的「查看」。
-    delegateRows, delegateLiveCount, delegateHasLive, delegateRowsUnavailable, delegateElapsedMs,
+    delegateRows, delegateLiveCount, delegateHasLive, delegateRowsUnavailable, delegateDegraded, delegateElapsedMs,
     delegateViewer, delegatePanelOpen,
     openDelegateViewer, closeDelegateViewer, toggleDelegatePanel, collapseDelegatePanel, resetDelegateSurface,
   };
