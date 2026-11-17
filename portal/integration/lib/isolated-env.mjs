@@ -162,7 +162,7 @@ export function applyStackIpamPoolEnv(env = process.env, stackId = env.STATION_S
  *  1. 未设置 ⇒ 抛错，并点名「缺省会 rm -rf 共享 dev 库数据目录」；
  *  2. 设了但不在 OS 临时目录内 ⇒ 也抛（`ERIX_E2E_ALLOW_DB_DIR=1` 是显式豁免，用于真机有意复用某路径）。
  *
- * `allowSharedReset`（#227.1，**只允许 wp2b 用**）：调用方**显式声明「我就是要重置共享 dev 库」**——
+ * `allowSharedReset`（#227.1；#661 起 **wp2b 已退役 ⇒ 没有任何调用方**，仅作隔离护栏的夹具语义保留）：调用方**显式声明「我就是要重置共享 dev 库」**——
  * 未设置时不抛、直接解析为共享栈的 `/docker/station-db`；解析结果恰等于该路径时豁免临时目录检查，
  * 其余路径照旧严格（不把豁免面扩大成「任意非临时路径」）。确认这个重置语义前不要复制到别的脚本
  * （`isolation-negative.mjs` 的单一来源断言把出现处钉在 lib + wp2b）。
@@ -221,7 +221,7 @@ export function removeDbDir(docker, env = process.env, options = {}) {
  * 生成该脚本专用的 `removeDbDir()` 闭包（各 e2e 的 docker 执行器是本地函数，这样调用点保持零参数）。
  *
  * @param {{ docker: (args: string) => unknown, env?: Record<string, string | undefined>, allowSharedReset?: boolean }} opts
- *   allowSharedReset 只允许 wp2b（共享栈重置）传，见 resolveDbDir 与单一来源断言。
+ *   allowSharedReset 原先只允许 wp2b（共享栈重置）传；wp2b 退役后无调用方，见 resolveDbDir 与单一来源断言。
  * @returns {{ removeDbDir: () => void, dbDir: () => string }}
  */
 export function createDbDirCleaner({ docker, env = process.env, allowSharedReset = false }) {

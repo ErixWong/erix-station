@@ -697,6 +697,10 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       assert.equal(issued.status, 201, `签发预览票据：${JSON.stringify(ticket)}`);
       assert.match(ticket.ticket, /^pt_/, 'ticket 形态 pt_<base64url>');
       assert.ok(Number.isInteger(ticket.expires_in) && ticket.expires_in > 0, `expires_in 是正整数（缺省 60s ⇒ 签完立刻兑换）：${ticket.expires_in}`);
+      // 从 wp2b 折入（issue #661）：**精确** TTL 也要钉住。只断言「正整数」会把
+      // `PREVIEW_TICKET_TTL_SECONDS` 的默认值漂移（60 → 3600）放过去。
+      assert.equal(ticket.expires_in, 60,
+        `票据 TTL 默认必须是 60s（PREVIEW_TICKET_TTL_SECONDS 默认值；实际 ${ticket.expires_in}）`);
       assert.equal(ticket.url, `http://${S.hostname}:${TRAEFIK_WEB_PORT}?preview_ticket=${ticket.ticket}`,
         '签票返回的 url = 该 host 的公开入口（scheme/端口从 PORTAL_PUBLIC_BASE_URL 派生，#57 阶段2）');
 
