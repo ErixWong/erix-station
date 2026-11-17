@@ -3503,7 +3503,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 - run `status → failed`，`run.error = { "code": "checkpoint_failed", "retryable": true, ... }`；`run_end` 事件带同样 `error`。
 - **宿主 store adapter 必须把 `checkpoint_failed` 识别为可重试并包 retry**（规格 §9.3-2，erix ≤0.3.5 无内建重试，3 次退避见 runner-integration §9.2）；重试耗尽后透传 → run 终态 `failed`。
 - **`checkpoint_failed` 是终态、不自动 re-claim**（A3 定稿，model.md §2.9 / runner-integration R20）：它是引擎在工具执行前/后 checkpoint 写失败时的 fail-closed 判定（**不是**进程崩溃），存储故障持续时 re-claim 只会原地重演，故直接终态 `failed`；终态后不可 resume。
-- **恢复口径（前端提示）**：「任务因平台存储故障中止，已持久化的进度（checkpoint/transcript）未丢失，请稍后重新发送」——**重发消息 = 新 run**（`POST /messages` 产生新 run，本期无跨 run resume）；**同 run 的恢复 = re-claim**（仅进程崩溃场景：租约到期后 re-claim 领同一 run，`resume:true`、`attempt > 1`，从最新 checkpoint 续跑，runner-integration §6.4）。
+- **恢复口径（前端提示）**：「任务因平台存储故障中止，已持久化的进度（**账本** transcript/rounds）未丢失，请稍后重新发送」——**重发消息 = 新 run**（`POST /messages` 产生新 run，本期无跨 run resume）；**同 run 的恢复 = re-claim**（仅进程崩溃场景：租约到期后 re-claim 领同一 run，`resume:true`、`attempt > 1`，从最新 checkpoint 续跑，runner-integration §6.4）。
 - ~~⚠️ 待决策者确认~~ **已定稿（D2'）**：存储为纯 DB（Postgres），不采纳「本地 file 优先 + DB 异步复制」装饰器；中心 DB 抖动风险由 adapter 重试包装补偿（runner-integration §9.2），抖动超过重试窗口会使在跑任务 `checkpoint_failed` 失败（§6.2 恢复口径）。
 
 ### 6.3 容器不可达 → `container_unreachable`（503）
@@ -3577,7 +3577,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 > 本节的唯一事实来源是 [`../design/runner-integration.md`](../design/runner-integration.md)（下称「runner §x」）§4（portal ↔ agentd 协议）、§7（事件批量与 seq）、§9（store adapter 契约）、§11（凭据模型）；配套数据表见 [`../data/schema.sql`](../data/schema.sql)（`run_events.client_event_id`、`run_queue` 租约字段、`transcript_rounds.record`）与[规格](../design/fde-platform.md) §10.3。端点编号 U1–U12 与 runner §4.2 一一对应。
 >
 > ⚠ **编号空洞是有原因的（issue #640）**：run snapshot 那一族（U8/U9 与 session 侧对应端点）自
-> erix-agent 0.33.0 起引擎不再调用 ⇒ 四个端点已删、表由迁移 `0041` 撤掉，**编号不回收**（U8/U9/S3/S5
+> erix-agent 0.33.0 起引擎不再调用 ⇒ 四个端点已删、表由迁移 `0041` 撤掉，**编号不回收**（U8/U9/S3/S4
 > 这些号在历史 PR 与旧 runner 日志里还要被引用）。旧 agentd 若仍打这些路径，拿到的是 `404 not_found`。
 
 三条要点：
@@ -3594,7 +3594,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 |---|---|
 | Base URL | `https://station.<base>/api/internal`（容器内 `--add-host station.<base>:<本 FDE 网关 IP>`，经 Traefik host:443，H-B D-5） |
 | 认证头 | `Authorization: Bearer <per-container token>`（每请求） |
-| 租约凭证头 | `X-Claim-Token: <claim_token>`——claim 之后的 run 级端点（U2/U3/U5–U12，含读端点 U6/U7/U9）携带；portal 校验「该 run 当前有效租约 = 此 token」，不匹配 → `409 lease_lost`（防 re-claim 后旧 agentd 双写，runner §4.2/§6.4） |
+| 租约凭证头 | `X-Claim-Token: <claim_token>`——claim 之后的 run 级端点（U2/U3/U5–U12，含读端点 U6/U7；**U9 已退役，#640**）携带；portal 校验「该 run 当前有效租约 = 此 token」，不匹配 → `409 lease_lost`（防 re-claim 后旧 agentd 双写，runner §4.2/§6.4） |
 | 长驻连接 | `GET .../stream`（SSE 下行，§9.12）+ 循环 `POST .../claim`（长轮询，§9.3）；其余为短请求 |
 | 语义基调 | **at-least-once + 幂等**：所有写端点携带客户端幂等键，portal 端 DB 唯一约束兜底；agentd 对所有 5xx/网络错误无限指数退避重试（§9.13） |
 
@@ -4072,7 +4072,7 @@ agentd 的四条转发、portal 侧四个路由与四个存储函数、以及承
 `0041-retire-run-checkpoints.sql` `DROP TABLE`）。真库现查：17 行 / 565,248 B、
 `max(updated_at)` = 2026-11-11（0.33 上线后零写入）、FK 是 child 端且零视图/触发器依赖。
 
-**编号与历史口径**：U8/U9/S3/S5 的号**不回收**；本节以下旧内容（revision CAS、`checkpoint_stale`、
+**编号与历史口径**：U8/U9/S3/S4 的号**不回收**；本节以下旧内容（revision CAS、`checkpoint_stale`、
 `204` 语义、0034 的终态读空注记）作为历史保留在 `docs/maintenance/task-ledger.md`
 （§8.126.2 等）与 git 历史里，**不再是活契约**。
 
@@ -4323,9 +4323,9 @@ worker 被杀后重排的上报形态（**issue #288 additive**；没有 kill �
 | 401 | `token_invalid` / `token_revoked` | token 错 / 吊销 | 停领新任务；`token_revoked` 时按 `revoke` 流程退出 |
 | 403 | `run_ownership_mismatch` | run 不属本容器 | 记日志告警（视为 bug/攻击），**不重试** |
 | 404 | `run_not_found` | run 不存在（已清理） | 停止相关上报，收敛本地状态 |
-| 409 | `run_terminal` | 向终态 run 写事件 / checkpoint / state / 审批；或不同载荷重复终态 | 幂等命中：**视为成功**（`stored` 语义），不再重试；不同载荷重复终态**不重试**（首次结果为准） |
+| 409 | `run_terminal` | 向终态 run 写事件 / state / 审批（**checkpoint 已退役，#640**）；或不同载荷重复终态 | 幂等命中：**视为成功**（`stored` 语义），不再重试；不同载荷重复终态**不重试**（首次结果为准） |
 | 409 | `lease_lost` | `X-Claim-Token` 失效（run 已被 re-claim）；心跳 U4 则以 run 级 `lease: lease_lost` 表达（非 HTTP 错误，§9.5） | 本地 abort 该 run 的 worker（若还在跑），丢弃缓冲与 spool |
-| 409 | `checkpoint_stale` | checkpoint 的 `revision` 不大于当前（旧/乱序/同值重试被 CAS 拒绝，§9.8） | 视为「本快照已过期」，**不重试**（以最新为准） |
+| ~~409~~ | ~~`checkpoint_stale`~~ | **已退役（#640）**：checkpoint 的 `revision` CAS 随 run snapshot 一起删除，现役代码不再返回它 | 仅历史客户端可能见到，视为「本快照已过期」，**不重试**（以最新为准） |
 | 409 | `invalid_transition` | 非法状态转换（§9.6 转换表之外） | 视为 bug，**不重试** |
 | 409 | `round_conflict` | transcript 同 round 不同 body / 不同 dedupKey（§9.7 U5） | 视为 bug，**不重试** |
 | 429 | `rate_limited` | portal 自我保护 | 遵循 `Retry-After` 退避 |

@@ -563,7 +563,7 @@ hostname := <fde> "-p-" <portLabel> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> �
 
 ### 9.3 store 适配器（接 erix-agent）
 
-实现 erix-agent 0.14.0 的 `TranscriptStore`：必需 `appendRound / load`；配对的 `saveRunSnapshot / loadLatestRunSnapshot`、`saveRunState / loadRunState`、`markRunState` 是可选能力。Station adapter 通过 `erix-agent/contract-tests` 校验；详见 runner-integration §9。
+实现 erix-agent 0.14.0 的 `TranscriptStore`：必需 `appendRound / load`；配对的 `saveRunState / loadRunState`、`markRunState` 是可选能力。Station adapter 通过 `erix-agent/contract-tests` 校验；详见 runner-integration §9。
 
 四条注意：
 

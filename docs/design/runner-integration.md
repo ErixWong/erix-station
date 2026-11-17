@@ -42,7 +42,7 @@
 | `createSession` | portal `POST /api/sessions`（portal.md §4.2），纯 DB 操作 |
 | `submit` | portal `POST /api/sessions/:id/messages`（建 run + 入队）→ agentd claim → worker 组装 `runToolLoop` 参数（§6） |
 | `stop` | portal `POST /api/sessions/:id/stop`（写 `cancel_requested_at`）→ SSE `stop_request` → agentd abort worker（§4.3/§10） |
-| `history` | portal `GET /api/sessions/:id`（`messages` 层）；resume 源 = `transcript_rounds` + 最新 checkpoint（§9） |
+| `history` | portal `GET /api/sessions/:id`（`messages` 层）；resume 源 = `transcript_rounds` 账本（**`checkpoint` 已于 #640 退役，不再是 resume 源**） |
 
 worker 侧对上游的**全部**依赖面（D4'，再没有别的）：
 
@@ -261,9 +261,9 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | 401 | `token_invalid` / `token_revoked` | token 错/吊销 | 停领新任务；`token_revoked` 时按 `revoke` 流程退出 |
 | 403 | `run_ownership_mismatch` | run 不属本容器 | 记日志告警（视为 bug/攻击），不重试 |
 | 404 | `run_not_found` | run 不存在（已清理） | 停止相关上报，收敛本地状态 |
-| 409 | `run_terminal` | 向终态 run 写事件/checkpoint/state | 幂等命中：视为成功（`stored` 语义），不再重试 |
+| 409 | `run_terminal` | 向终态 run 写事件/state（checkpoint 已退役 #640） | 幂等命中：视为成功（`stored` 语义），不再重试 |
 | 409 | `lease_lost` | `X-Claim-Token` 失效（run 已被 re-claim）；心跳 U4 则以 run 级 `lease: lease_lost` 表达（非 HTTP 错误，§4.2） | 本地 abort 该 run 的 worker（若还在跑），丢弃缓冲与 spool |
-| 409 | `checkpoint_stale` | checkpoint 的 `revision` 不大于当前（旧/乱序快照被 CAS 拒绝） | 视为「本快照已过期」，**不重试**（以最新为准，§9.5） |
+| ~~409~~ | ~~`checkpoint_stale`~~ | **已退役（#640）**：run snapshot 删除后不再产生 | 视为「本快照已过期」，**不重试**（以最新为准，§9.5） |
 | 400 | `validation_failed` | 载荷不合法（与公开端点统一 400，portal.md §9.13） | 不重试，记错误日志（视为 bug） |
 | 429 | `rate_limited` | portal 自我保护 | 遵循 `Retry-After` 退避 |
 | 5xx / 网络错误 | — | portal/DB 抖动 | **无限指数退避重试**（1s→2s→5s→10s→30s 封顶，抖动 ±20%）；事件缓冲走 §7.4 背压与 spool |
@@ -675,7 +675,7 @@ D2' 纯 DB 意味着 portal/DB 抖动会直接传导到引擎的 fail-closed（�
 
 - 中心 DB 抖动超过 ~8s（重试窗口）将**杀掉正在跑的任务**（`checkpoint_failed`）。接受该代价的理由：DB 与 portal 同宿主机（规格 §14），抖动窗口小；**失败后为终态，需存储恢复 + 用户重发（新 run）——不自动 re-claim**（A3 定稿，§9.5/§15-16；抖动持续时 re-claim 只会原地重演）。
 - **spool 文件（§7.5）不是 transcript 副本**：它只缓冲 SSE 事件流（第③层），第②层 transcript 无本地副本，D2' 语义完整。
-- resume 的全部前提（checkpoint 成对、最新 checkpoint 可读）都在 DB，容器重建后由新 worker 经 portal 读回——原理三成立。
+- resume 的全部前提（**账本**可读；~~checkpoint 成对~~ 已于 #640 退役）都在 DB，容器重建后由新 worker 经 portal 读回——原理三成立。
 
 ### 9.5 checkpoint 单调性（revision CAS，issue #8）
 

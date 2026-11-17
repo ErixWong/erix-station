@@ -596,7 +596,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
                  ┌────▼─────┐   POST /stop（cancel_requested）
                  │ running  │ ─────────────────────────────▶ cancelling  ──┐
                  └────┬─────┘   （已执行过，等 worker 报终态；A2：不回 running）│
-        run_end 正常  │  异常（checkpoint_failed 重试耗尽 / rate_limited / max_attempts_exceeded）
+        run_end 正常  │  异常（persistence_failed 重试耗尽 / rate_limited / max_attempts_exceeded；`checkpoint_failed` 已于 #640 退役）
                  ┌────▼────┐   ┌────────┐                        worker abort 后 U2 收敛 ─┤
                  │ finished│   │ failed │                             → finished / failed
                  └─────────┘   └────────┘
