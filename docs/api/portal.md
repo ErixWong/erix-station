@@ -3355,13 +3355,20 @@ Content-Type: application/json
 - **SQL 侧**那段字节算术由 `P6b-db`（`portal/integration/platform-prompts-db.mjs`）钉：它在真
   PostgreSQL 上把 `SAVE_SQL` 真跑一遍，逐组对账 `gate.rendered_bytes` 与 JS 的算子，并钉超限那档
   `written = 0`、审计零行、一格没写。
+- **SQL 侧的「形状」**（常驻，在 `npm test` 里）由 `P6c`（`portal/test/platform-prompts.test.js`）钉：
+  它不执行 SQL，只对 `SAVE_SQL` 的文本做**片段级**断言 —— `rendered_bytes` 必须显式含**两份列字节项**
+  （`agents_md_addendum` 与 `agents_md_override` 各自的 `octet_length(…)`）加同一份常量预算
+  （`$4`/`$5`/`$6`），且 SQL 里不许出现硬编码的字节常量；失败信息逐条点名（少了哪一列 / 哪一份常量）。
+  常驻反向自证：把「只算一列」与「一列都不算」两种退化式喂进同一个检查函数，各自判红并点名缺的那一列。
+  **它挡的是退化式，不是值**：写法对而算错（比如把某列按字符数而非字节数算）仍然只有 `P6b-db` 会红。
 
 ⚠ **限制（必须知道）**：`P6b-db` **不在 `npm test` 里** —— `npm test` 是裸 `node --test`，而
 `portal/integration/` 下的文件叫 `*.mjs`，不匹配它的测试文件名规则；CI 也没有 PostgreSQL 步骤。
 跑它得自己起一个专用临时库：`TEST_DATABASE_URL=… npm run test:integration:prompts`。
 后果：SQL 侧那段算术被改坏（比如 `$5::bigint + octet_length(nxt.addendum)` 退化成只算一列）在
 默认流水线上**测不出来** —— 拦下超限的是 JS 预闸（判据 `P6` / `P13` 都只跑假池，假池不执行 SQL），
-`npm test` 照样全绿，只有 `P6b-db` 会红而它不在这条流水线上。
+`npm test` 照样全绿，只有 `P6b-db` 会红而它不在这条流水线上。（评审 R8 之后补一句：这一类
+「**退化式**」现在由常驻的 `P6c` 在 `npm test` 里拦住；上面那句限制对「形状对而值不对」仍然成立。）
 
 ⚠ **闸里的标识行按最坏情况算，不按示例名算**（评审 F2）：标识行是 `（FDE 标识：<fdeName>）`，而保存时
 不知道这份文件会渲染给哪些工位（全部启用中的都要重物化），所以预算取**最长合法工位名**：
