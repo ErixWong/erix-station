@@ -193,10 +193,14 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 调用方必须只对**未完成 run**（`queued` / `running` / `cancelling`）读它。为什么可以这样：快照的唯一用途是
 **接力一个没跑完的 run**（上游契约把它钉成 latest-only autosave + optional 能力，缺席的语义就是「没得到崩溃接力」，
 下一次 run 照常从 `transcript_rounds` 账本重建上下文 ⇒ 不丢正文），run 已终态 ⇒ 不会再有 attempt 去读它 ⇒
-那一行是纯死重（取证在 `deploy/migrations/0034-prune-stale-run-checkpoints.sql` 头注释）。⚠ **session 作用域那一路
-不受影响**（`transcript_key IS NOT NULL`：谓词 (b) 只清「已归档 ∨ 14 天没动」的会话，**活跃会话每个 key 那一行照留**），
-而现役 runner 走的正是 session 端点（`runner/lib/store.js` 的 `saveRunSnapshot` / `loadLatestRunSnapshot`）
-⇒ 现役通路零变化，受影响的只是旧形态（U8/U9 run 作用域）那个兼容面。
+那一行是纯死重（取证在 `deploy/migrations/0034-prune-stale-run-checkpoints.sql` 头注释）。
+
+> **⚠ 这一整条已于 2026-11-17 作废（issue #640，迁移 `0041`）**：erix-agent **0.33.0** 让 run snapshot
+> 彻底退役（引擎零调用 `saveRunSnapshot` / `loadLatestRunSnapshot` / `loadLatestCheckpoint`），所以
+> **`run_checkpoints` 整张表已撤** —— 上面关于「run-keyed 行 / session 作用域那一路」的区分、
+> 以及「现役 runner 走 session 端点」这些口径**都不再成立**：两条作用域一起没了。
+> 现在的唯一 durable 读面是**账本**（`transcript_rounds` / `run_events` / `transcript_recovery_rows`），
+> 快照不再参与持久化与恢复。上游口径见 `erix-agent` 的 `docs/host-upgrade-guide-0.33.0.md` §2。
 
 ### 1.12 `run_events` — 第③层：流式事件日志
 
