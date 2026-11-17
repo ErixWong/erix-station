@@ -8497,7 +8497,7 @@ M7 管道在真机上**确实通了**（`clock:2026-11-17` → `done`、宏会�
 `UPDATE users SET mail_otp_enabled=false WHERE login='eric'`（**原值 `t`**）。
 
 **待办**：#646（M1/M9 触发源，在跑）、#637（M7 产物三缺陷，在跑）。
-### 8.164 能力市场 P1：MCP 通道 portal 切片（#608，2026-11-17，主 agent 自己写 + 两个 erix_run 并行跑 runner/前端）
+### 8.166 能力市场 P1：MCP 通道 portal 切片（#608，2026-11-17，主 agent 自己写 + 两个 erix_run 并行跑 runner/前端）
 
 - **为什么主 agent 自己写**：这一片的两个 pi worker 后台 run 连续被外部终止（`Async runner process … exited
   before writing a result`，6h 内两次），第三次改用 `erix_run`（带 sessionDir，可续跑）跑 runner 与前端，
@@ -8528,7 +8528,7 @@ M7 管道在真机上**确实通了**（`clock:2026-11-17` → `done`、宏会�
   缺槽必须 409、`detached:true` 必须被红色形状拒）。
 - **文档**：`docs/api/portal.md` §4.18（发布体 / 配置槽只写不读 / 内部下发 / 用户面差异 + 错误码）。
 
-### 8.165 MCP 通道 P1 收尾：三切片合并 + 真机 e2e + copilot 独立审计（#608，2026-11-17，主 agent + 两个 erix_run）
+### 8.167 MCP 通道 P1 收尾：三切片合并 + 真机 e2e + copilot 独立审计（#608，2026-11-17，主 agent + 两个 erix_run）
 
 **合并**：三个 worktree 分支（`-02` portal / `-03` runner / `-04` 前端）合进 `feat-261117-01-mcp-channel`
 再追平 main（`5ae41ce`），冲突只有台账一处（main 已占 8.156..8.159 ⇒ 本单让到 8.160/8.161）。
