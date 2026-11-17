@@ -4,7 +4,8 @@
 //   （`erix-agent/src/loop/orchestrator.js:950-1008` 定 reason + 挂落盘细节，
 //     `erix-agent/src/loop/termination.js:74-91` `annotateTermination` 把对象塞进 `error.termination`）。
 //   于是：
-//     * `reason` 可能是 `persistence_failed`（run snapshot / markRunState 没落盘），**不是** `failed`；
+//     * `reason` 可能是 `persistence_failed`（**transcript 账本 / run-state 写失败**；run snapshot 已于
+//       2026-11-17 随 #640 退役、不再是它的成因），**不是** `failed`；
 //     * 该 reason 还额外携带 `operation` / `phase` / `sideEffect`（哪一步没写、副作用是否可能已发生）。
 //   station 此前在 worker 里把它拍平成 `{reason:'failed'}`，前端既看不见「快照没落盘」也看不见 phase，
 //   崩溃恢复可能重复副作用这一最重的语义被降级成一条普通失败。

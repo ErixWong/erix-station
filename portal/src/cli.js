@@ -90,6 +90,12 @@ async function serve() {
   // issue #616：评估器产出的意图由 dispatcher **消费**（onIntents 接线），否则三条主功能全断且留永久 pending 行。
   const intentDispatcher = createIntentDispatcher({ pool, config });
   const macroEvalLoop = startMacroEvalLoop(pool, config, { onIntents: (intents) => intentDispatcher.dispatch(intents) });
+  // issue #646：M1 终态通知 / M9 完成审查是**终态触发**型，产生端在 `internal.finishRun`（不在评估循环里）。
+  // 用**同一个** dispatcher 消费：把 `dispatch` 经 `config.onMacroIntents` 注入——`createServer`/`finishRun`
+  // 拿到的 `config` 是同一个对象引用（`cli.serve` 同步跑完这三行才 `listen`，无请求早于此），
+  // 所以 finishRun 经 `setRunState(…, { config: ctx.config })` 就能拿到。⚠ **不在 internal.js 里新建 dispatcher**
+  //（那会绕过本处接线、还可能重复起 sweep loop）。
+  config.onMacroIntents = (intents) => intentDispatcher.dispatch(intents);
   // issue #616 要求④：超时回收清扫单独起 loop（职责与评估不同，不合并）；pending 超阈→failed。
   const macroSweepLoop = startPendingSweepLoop(pool, config);
   const provisionerLoop = startProvisionerLoop(pool, config);

@@ -21,7 +21,8 @@
 //   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:655-656`（runToolLoop 返回值 typedef；**按 0.29.0 现查**。
 //     0.18.0 时这块写在一行、位于 :511，0.19.0 起改成多行块，0.26.0 在 :490-491 ⇒ 防漂移测试的取值正则已同步）；
 //   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:1077-1081`，fail() 里
-//     「快照/markRunState 没落盘」时定值，并把 operation/phase/sideEffect 挂在 termination 上，
+//     「**transcript 账本 / run-state 写失败**」时定值 —— run snapshot 已于 2026-11-17 随 #640 退役、
+//     不再是成因；并把 operation/phase/sideEffect 挂在 termination 上，
 //     `orchestrator.js:1091` + `src/loop/termination.js:74` annotateTermination）；
 //   * 0.20.0 另有一处**只影响可达性**的变更（guide §4，上游 #282）：终局裁决处 `aborted` 压过
 //     `judge_done` / `final_guard_*` ⇒ 集合不变，但这三值在「用户点过停止」的 run 上不再可达。
@@ -153,7 +154,8 @@ export const TERMINATION_REASON_SET: ReadonlySet<string> = new Set<string>(TERMI
 
 /**
  * issue #212 的红色告警子集（issue #42 的三值 + #212 补的两值）：
- *   * `persistence_failed` = **快照没落盘**——崩溃恢复可能重复副作用，语义最重，必须红色；
+ *   * `persistence_failed` = **账本没落盘**（transcript 轮记录 / run-state 写失败；#640 起本站没有
+ *     run snapshot，但错误类型与这条分级一字未动）——崩溃恢复可能重复副作用，语义最重，必须红色；
  *   * `final_guard_unverified` = **终稿未经核验**（finalGuard 修订重试耗尽 fail-closed），用户必须看见。
  * 注：`stall` / `continuation_exhausted` 属「截断但非故障」，按现状保持灰色（不在 #212 范围）。
  *
@@ -185,7 +187,7 @@ export const USER_STOP_TERMINATION_REASON: TerminationReason = 'aborted';
  * 终态分隔条**刷红**（`.syserr`）的 reason 集合（issue #236 呈现分级，实时 `run_end` 与历史合成项
  * `run_termination` **共用这一条规则**——两路同文案同分级，不然刷新一次颜色就变）：
  *   * 红 = `failed`（真失败）/ `max_rounds_cap`（撞轮数上限，异常截断）/ `persistence_failed`
- *     （快照没落盘，崩溃恢复可能重复副作用，语义最重）/ `final_guard_unverified`（终稿未核验）；
+ *     （账本没落盘，崩溃恢复可能重复副作用，语义最重）/ `final_guard_unverified`（终稿未核验）；
  *   * 中性 = 其余（含 `end_turn` / `no_tool` / `judge_done` / `stall` / `continuation_exhausted`
  *     这些正常或「截断但非故障」的收尾，以及 **`aborted`**：用户按了停止）。
  * **由 `RUN_FAIL_REASONS` 派生**（减掉 `USER_STOP_TERMINATION_REASON`）而不是手抄第二份枚举：

@@ -201,3 +201,50 @@ test('U2 /state：cancelling 期间的 running 写入 → 200 幂等 ack（不�
     fs.rmSync(s.staticDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// issue #640：`/checkpoint*` 四个端点已退役（erix-agent 0.33.0 起引擎不再读写 run snapshot）。
+//
+// 这条断言的是**退役的形状**，不是「功能还在」：带**有效**内部认证（容器 token + 有效 claim token +
+// writer fencing）打过去必须 **404 `not_found`**，不能是 500（路由分支被删但 handler 里还留着半截
+// ⇒ `internal.putCheckpoint is not a function` 那种 500），也不能是 405（方法对了路径还在 = 端点没删干净）。
+// 两个作用域（U8/U9 run 作用域、S3/S4 session 作用域）各钉一次，`/latest` 与裸路径各钉一次。
+// 反向自证：同时打一条**仍活着**的 `/runstate` ⇒ 必须不是 404（否则 404 是路由前缀坏了，不是端点没了）。
+// ---------------------------------------------------------------------------
+test('#640 退役回归：四个 /checkpoint* 端点带有效内部认证打过去 ⇒ 404 not_found（不是 500/405）', async () => {
+  const { pool, runId, sessionId, token } = seedClaimable();
+  const s = await startServer(pool);
+  try {
+    const auth = { Authorization: `Bearer ${token}` };
+    const claim = await fetch(`${s.base}/api/internal/claim`, {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ capacity: 1, hold_ms: 10 }),
+    });
+    assert.equal(claim.status, 200);
+    const ticket = await claim.json();
+    const headers = { ...auth, 'X-Claim-Token': ticket.claim_token, 'Content-Type': 'application/json' };
+
+    const shots = [
+      ['U8 run 作用域 PUT', 'PUT', `/api/internal/runs/${runId}/checkpoint`, { revision: 1, snapshot: { round: 1 } }],
+      ['U9 run 作用域 GET', 'GET', `/api/internal/runs/${runId}/checkpoint/latest`, null],
+      ['S4 session 作用域 PUT', 'PUT', `/api/internal/transcript/${sessionId}/checkpoint?run_id=${runId}`, { revision: 1, snapshot: { round: 1 } }],
+      ['S5 session 作用域 GET', 'GET', `/api/internal/transcript/${sessionId}/checkpoint/latest?run_id=${runId}`, null],
+    ];
+    for (const [label, method, p, body] of shots) {
+      const res = await fetch(`${s.base}${p}`, { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) });
+      assert.equal(res.status, 404, `${label} 必须 404（端点已删），得 ${res.status}：${JSON.stringify(await res.clone().json().catch(() => null))}`);
+      const payload = await res.json().catch(() => null);
+      assert.equal(payload?.error?.code, 'not_found', `${label} 的 404 必须是通用 not_found，不是发明新错误码`);
+    }
+
+    // 反向自证：同一作用域里仍活着的端点不得跟着 404（否则上面四条是「路由前缀坏了」的假绿）。
+    const aliveRun = await fetch(`${s.base}/api/internal/runs/${runId}/runstate`, { headers });
+    assert.notEqual(aliveRun.status, 404, 'run 作用域 /runstate 还活着 ⇒ 不得 404');
+    const aliveSession = await fetch(`${s.base}/api/internal/transcript/${sessionId}?run_id=${runId}`, { headers });
+    assert.notEqual(aliveSession.status, 404, 'session 作用域 /transcript/:key 还活着 ⇒ 不得 404');
+  } finally {
+    await s.close();
+    fs.rmSync(s.staticDir, { recursive: true, force: true });
+  }
+});

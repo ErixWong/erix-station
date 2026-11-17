@@ -339,7 +339,7 @@ export const en = {
       strategyFallback: 'compaction is not using the configured strategy: the engine fallback "sliding-window" drops whole head rounds without summarising (from round {round})',
       metadataMissing: 'model context metadata missing: compaction and the aggregate output budget are disabled for this run',
       capabilityDegraded: 'store lacks the {method} capability: that persistence is skipped for this run (no mid-run crash resume)',
-      resumeJournalSkipped: '{count} tool result(s) from the crash round (round {round}) were not written to the ledger; the next resume relies on the snapshot',
+      resumeJournalSkipped: '{count} tool result(s) from the crash round (round {round}) were not written to the ledger; the next resume relies on the ledger (run snapshots were retired in #640)',
       resumeJournalSome: 'some',
       // issue #438 slice B (erix-agent 0.29.0): the two display-class diagnostics the LoopEvent union
       // grew. Missing numbers are already normalised to "?" by the caller (#283); foreign identifiers
@@ -426,8 +426,10 @@ export const en = {
       // language, and the termination separator is now projected into history for every reason).
       // Unknown/future engine reasons stay out of this table ⇒ the raw reason is shown (§5.3).
       runEndReason: {
-        // the run snapshot never reached the store → crash recovery may replay tool side effects
-        persistence_failed: 'run snapshot not persisted (side effects may repeat on resume)',
+        // the ledger never reached the store (transcript round / run-state write failed) ⇒ crash
+        // recovery may replay tool side effects. Wording updated with issue #640 (there is no run
+        // snapshot since erix-agent 0.33.0); the reason enum and its red severity are unchanged.
+        persistence_failed: 'run ledger not persisted (side effects may repeat on resume)',
         // the final answer never passed the final guard → the user must review it
         final_guard_unverified: 'final answer not verified',
         // issue #236: user pressed stop (previously rendered as the bare English `aborted`)
