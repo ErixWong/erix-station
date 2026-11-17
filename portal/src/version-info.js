@@ -108,6 +108,78 @@ export function readStationVersion({ env = process.env, buildInfoPath, packageDi
 }
 
 /**
+ * 这份构建是不是「本地 scratch 构建」（issue #643 B）。值来自 `readStationVersion()` 那一格。
+ *
+ * 要治的形状：`revision` 只有**构建期 ARG** 拿得到（`portal/Dockerfile` 末尾烘 `/app/build-info.json`，
+ * 发布路径由 `.github/workflows/release.yml` 的「④ 构建并推送 portal 镜像」传 `STATION_REVISION`，
+ * 质量门禁侧由 `.github/workflows/ci.yml` 的「④′ portal 镜像的 build-info.json tripwire」保证它非
+ * `unknown`）。本地 `docker compose build station-portal`
+ * 不传那个 ARG ⇒ 它是 `unknown`，而这份镜像**与发布件长得一模一样**（版本号照样是 `0.1.72`、页面照样
+ * 起得来），区别只在「有没有身份」⇒ 有人拿本地构建当发布件对账（261117 现场：共享 dev 栈里跑的正是
+ * 一份 `erix-station/portal:p596-v3`，`/api/health` 报 `revision:unknown / builtAt:unknown`）。
+ *
+ * **判据只看 `revision`，不看 `builtAt`** —— 这是本函数唯一的口径，改之前先读完这段：
+ *   · `revision` 是「那份 build-info 到底烘没烘进去」的**判别位**：镜像里没那份文件、或烘的时候没传
+ *     ARG，它才是 `unknown`；发布路径必须传（`ci.yml` 的 portal tripwire 逐格断言它非 `unknown`）。
+ *   · `builtAt` 单独缺**不说明这份构建没有身份**：它只说明没传构建时刻（那是另一个 ARG），
+ *     revision 照样能对上账。拿它当判据会把「传了 revision、忘了传日期」的**真发布件**报成本地构建
+ *     ⇒ 假红 ⇒ 下一次没人再信这条告警（告警喊错一次，抵过它省下的十次）。
+ *
+ * 脏形状（非字符串 / 空串 / 整个对象没给）经 `text()` 落 `unknown` ⇒ 一律按本地构建处理：
+ * 「读不出身份」与「没有身份」对管理员是同一句话，宁可多喊一声，不许静默。
+ *
+ * @param {{revision?: unknown} | null | undefined} [v] `readStationVersion()` 的返回（或注入的脏东西）
+ * @returns {boolean} 恒有真布尔，绝不抛（观测面不承重，#515 同口径）
+ */
+export function isLocalBuild(v) {
+  return text(v?.revision) === UNKNOWN;
+}
+
+/**
+ * 启动时把「我是本地构建」喊进日志一次（issue #643 B 的**日志腿**）。
+ *
+ * 为什么日志也要有一条：界面上 revision 显示「未知」是**静音**的 —— 本地构建与发布件在页面上只差两个
+ * 字，而 `docker compose up -d` 的人根本不会去开「关于」面板。日志里那一声才是可 grep 的读数：
+ * `docker logs station-portal | grep local-build`。
+ *
+ * 形状与 `healthVersionBlock()` 同一条红线：**观测面不承重**（#515）—— 读版本失败、注入的 `log` 是
+ * `undefined` / 没有 `warn` 方法 / `warn` 自己抛（告警 sink 挂了），全都**不许**把调用方的启动路径
+ * 带倒，也**不许**抛出去。发布件**一条都不打**：天天喊的告警等于没有告警。
+ *
+ * @param {{readVersion?: () => object, log?: {warn?: (m: string) => void}}} [opts] 两个注入点（测试用）
+ * @returns {{local: boolean, message: string}} 恒有值，绝不抛
+ */
+export function warnIfLocalBuild({ readVersion = readStationVersion, log = console } = {}) {
+  let v = {};
+  try {
+    v = readVersion() ?? {};
+  } catch {
+    // 读版本这条路自己炸了 ⇒ 当成「读不出身份」（与本地构建同一句话），仍然只喊一条、不往上抛。
+    v = {};
+  }
+  const local = isLocalBuild(v);
+  // `local` 成立时 `revision` 必然是字面量 `unknown`（上面那条判据就是它），所以这一格直接插值，
+  // 不必再硬编码一次 —— 但它**必须出现在文案里**：`revision=unknown` 是这条告警的机器读数。
+  // 同理 `local-build` 这个标记**只在本地构建那一条文案里出现**：发布件不写日志，也不顶着这个标记，
+  // 否则 `grep local-build` 不再是「这一份不能当发布件对账」的同义句。
+  const revision = text(v.revision);
+  const message = local
+    ? `[version] local-build revision=${revision} builtAt=${text(v.builtAt)}`
+      + ` station=${text(v.station)}`
+      + ' —— 这份构建没烘 /app/build-info.json，**不能当发布件对账**；'
+      + '版本面读数见 GET /api/admin/version 的 `localBuild`（#586 / #643）'
+    : `[version] release-build revision=${revision} —— 构建身份已烘入，不往日志里喊`;
+  if (local) {
+    try {
+      log?.warn?.(message);
+    } catch {
+      // 告警出口自己挂了：这条喊不出去，也不许把 `serve()` 的启动路径带倒（#515 同口径）。
+    }
+  }
+  return { local, message };
+}
+
+/**
  * `/healthz` 与 `/api/health` 的 `version` 块（判据 B）。
  *
  * **只有三格**：`station` / `revision` / `builtAt`。刻意**不带引擎版本**：portal 侧引擎与每台 FDE 的
@@ -229,6 +301,13 @@ export async function aboutPanel({ pool, readVersion = readStationVersion, log =
     // ——否则一份指向别处的文件就会顶着「镜像内 build-info.json」这个标签出现。它只能证明「读了这条路径」，
     // 证明不了「读到了」（`provenance.*` 非 `build-info.json` 时它就是没读到）。
     buildInfoPath: text(v.buildInfoPath),
+    // issue #643 B：**本地 scratch 构建自曝**（`revision=unknown` ⇒ 没烘 build-info ⇒ 不能当发布件对账）。
+    // 为什么在**顶层**而不是塞进 `server`：`server` 那条「每一格都是字符串」的不变式正被
+    // `portal/test/admin-version-panel.test.js:274` 钉着（`deepEqual` 在 `:164`），塞一个布尔进去就得
+    // 连带放宽那条红线——而那条红线的价值恰恰是「版本格全是字符串，缺就是 `unknown`」。
+    // 顶层布尔的先例就在同一层：`fdesPresent`。值**只由 `isLocalBuild(v)` 推**：不读 env、
+    // 也不许前端自己猜（前端猜版本号是本单一贯要消灭的形状）。
+    localBuild: isLocalBuild(v),
     fdes,
     fdesPresent,
     provenance: {

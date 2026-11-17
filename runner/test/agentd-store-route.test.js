@@ -45,17 +45,26 @@ test('appendRound/load/run-state/snapshot 方法走 session 端点（键 + write
   await handleStoreRequest(ctx, 'loadRunState', { runId: 'sess-1' }, { request });
   assert.equal(calls.at(-1).p, '/transcript/sess-1/runstate?run_id=run-1');
 
-  await handleStoreRequest(ctx, 'saveRunSnapshot', { runId: 'sess-1', revision: 2, snapshot: { round: 1 } }, { request });
-  assert.equal(calls.at(-1).p, '/transcript/sess-1/checkpoint?run_id=run-1');
-  assert.deepEqual(calls.at(-1).opts.body, { revision: 2, snapshot: { round: 1 } });
-
-  await handleStoreRequest(ctx, 'loadLatestRunSnapshot', { runId: 'sess-1' }, { request });
-  assert.equal(calls.at(-1).p, '/transcript/sess-1/checkpoint/latest?run_id=run-1');
+  // ⚠ 旧 `saveRunSnapshot` / `loadLatestRunSnapshot`（session 端点 `/transcript/:key/checkpoint{,/latest}`）
+  //   已随 issue #640 整条删除 ⇒ 反向断言在末尾那条用例里（方法不存在 ⇒ 不发请求 + 报 unknown）。
 
   await handleStoreRequest(ctx, 'loadRunStateStatus', { runId: 'sess-1' }, { request });
   assert.equal(calls.at(-1).p, '/transcript/sess-1/runstate/status?run_id=run-1');
 
-  assert.equal(calls.length, 7);
+  assert.equal(calls.length, 5);
+});
+
+test('快照两面已退役（#640）：saveRunSnapshot / loadLatestRunSnapshot 不得再被转发（0.33.0 引擎不再调）', async () => {
+  const { calls, request } = makeStub();
+  const ctx = makeCtx();
+  for (const method of ['saveRunSnapshot', 'loadLatestRunSnapshot']) {
+    await assert.rejects(
+      () => handleStoreRequest(ctx, method, { runId: 'sess-1', revision: 1, snapshot: {} }, { request }),
+      new RegExp(`unknown store method: ${method}`),
+      `${method} 必须当场报 unknown（旧 portal 404 不如 here fail fast）`,
+    );
+  }
+  assert.equal(calls.length, 0, '退役方法不得发出任何 HTTP 请求');
 });
 
 test("markRunState 双路拆分：'running' → U2 真 runId；终态标记 → session status 通道", async () => {
@@ -105,12 +114,6 @@ test('旧 portal 回退（ctx.sessionId = null）：全部走 run 作用域旧�
 
   await handleStoreRequest(ctx, 'markRunState', { runId: 'run-1', state: 'succeeded' }, { request });
   assert.equal(calls.at(-1).p, '/runs/run-1/runstate');
-
-  await handleStoreRequest(ctx, 'saveRunSnapshot', { runId: 'run-1', revision: 1, snapshot: {} }, { request });
-  assert.equal(calls.at(-1).p, '/runs/run-1/checkpoint');
-
-  await handleStoreRequest(ctx, 'loadLatestRunSnapshot', { runId: 'run-1' }, { request });
-  assert.equal(calls.at(-1).p, '/runs/run-1/checkpoint/latest');
 
   await handleStoreRequest(ctx, 'loadRunStateStatus', { runId: 'run-1' }, { request });
   assert.equal(calls.at(-1).p, '/runs/run-1/runstate/status');

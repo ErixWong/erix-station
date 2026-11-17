@@ -26,6 +26,8 @@ import {
   startProvisionerLoop,
 } from './provisioner.js';
 import { migrateLegacyCredential } from './git-credential.js';
+// issue #643 B：本地构建自曝（`revision=unknown` ⇒ 启动日志里一条 `local-build`）。
+import { warnIfLocalBuild } from './version-info.js';
 
 function usage() {
   // eslint-disable-next-line no-console
@@ -48,6 +50,13 @@ const SHUTDOWN_TOTAL_MS = 8000;
 
 async function serve() {
   const config = loadConfig();
+  // issue #643 B：**本地 scratch 构建自曝**，位置在 `loadConfig()` 之后、`migrate()` 之前。
+  // 为什么要在 migrate 之前：读版本不碰 DB（它只读镜像里的 `/app/build-info.json`），而 `migrate()`
+  // 失败会直接 `process.exit(1)`、DB 起不来时还要看 compose 的 `service_healthy` 门槛——自曝挂在它后面
+  // 就等于「只有 DB 好了才有机会说自己是本地构建」，而一个 crash-loop 的容器恰恰最需要这一句。
+  // 它自己也不抛（观测面不承重，#515 同口径），放这儿不会把启动路径弄挂。
+  // eslint-disable-next-line no-console
+  warnIfLocalBuild({ log: console });
   const pool = createPool(config.databaseUrl);
   if (config.migrateOnStart) {
     const migratePool = createPool(config.migrateDatabaseUrl);
@@ -81,6 +90,12 @@ async function serve() {
   // issue #616：评估器产出的意图由 dispatcher **消费**（onIntents 接线），否则三条主功能全断且留永久 pending 行。
   const intentDispatcher = createIntentDispatcher({ pool, config });
   const macroEvalLoop = startMacroEvalLoop(pool, config, { onIntents: (intents) => intentDispatcher.dispatch(intents) });
+  // issue #646：M1 终态通知 / M9 完成审查是**终态触发**型，产生端在 `internal.finishRun`（不在评估循环里）。
+  // 用**同一个** dispatcher 消费：把 `dispatch` 经 `config.onMacroIntents` 注入——`createServer`/`finishRun`
+  // 拿到的 `config` 是同一个对象引用（`cli.serve` 同步跑完这三行才 `listen`，无请求早于此），
+  // 所以 finishRun 经 `setRunState(…, { config: ctx.config })` 就能拿到。⚠ **不在 internal.js 里新建 dispatcher**
+  //（那会绕过本处接线、还可能重复起 sweep loop）。
+  config.onMacroIntents = (intents) => intentDispatcher.dispatch(intents);
   // issue #616 要求④：超时回收清扫单独起 loop（职责与评估不同，不合并）；pending 超阈→failed。
   const macroSweepLoop = startPendingSweepLoop(pool, config);
   const provisionerLoop = startProvisionerLoop(pool, config);

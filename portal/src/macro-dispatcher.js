@@ -20,14 +20,114 @@
 //     由 dispatcher **自己** finish：投递成功⇒done，抛异常⇒failed。
 import os from 'node:os';
 import { finishMacroRun, MacroError } from './macros.js';
-import { executeScheduledIntent, defaultReportsRoot } from './macro-scheduled.js';
+import { executeScheduledIntent } from './macro-scheduled.js';
 import { runMacroReview } from './macro-review.js';
 import { deliverIntent } from './notifications.js';
+import { fetchRunAssistantText } from './session-text.js';
 
 /** 超时回收阈值（要求④）：`pending` 且 `started_at` 早于 now-此值 ⇒ 判为「派发途中进程崩了」，落 failed。 */
 export const DISPATCH_TIMEOUT_MS = 10 * 60_000;
 /** 超时清扫循环的间隔（与评估循环**分开**起：职责不同，见 issue 要求④「别和评估循环合并」）。 */
 export const SWEEP_INTERVAL_MS = 5 * 60_000;
+
+/** runTask 真实实现等 run 到终态的**上限**（#637 ①）：超时 ⇒ `run_timeout`（不重试，`06` §8：时间意图会过期，补跑重复烧钱）。 */
+export const RUN_TASK_TIMEOUT_MS = 30 * 60_000;
+/** runTask 轮询 `runs.status` 的间隔。 */
+export const RUN_TASK_POLL_MS = 2_000;
+
+/**
+ * 取该 run 的**最后一条 assistant 正文**（#637 ①；**#652 修正取数口径**）。
+ *
+ * ⚠ **#652 的根因**：本函数过去自己写 `SELECT … FROM transcript_rounds WHERE run_id = $1`，
+ * 而那张表的 `run_id` **真机 97% 是 NULL**（实测 96/3219）——引擎 sidecar 走的是 session 维度
+ * 写入（`transcript-store.js#appendRound`：`run_id = NULL` + `transcript_key = sessionId`），
+ * 于是按 run_id 查恒返回 0 行 ⇒ 正文 `''` ⇒ **M7 产物 0 字节**。
+ * 也不能读 `messages.content`：P3 PR②b 起 assistant **停双写**（该列对 assistant 恒为空串）。
+ *
+ * ⇒ 唯一正确口径 = **站内既有读侧投影**：`session-text.fetchRunAssistantText`（内部
+ * `projectAnchors` + `loadTextContext`，按 `transcript_key = sessionId` 整会话读轮次、用官方
+ * `projectTranscriptForDisplay` 展正文、再按 run 归属配回 assistant 锚点）——与
+ * `GET /api/sessions/:id` 对话流（`session-view.assistantTurnText`）**同一口径**，不再自写 SQL。
+ *
+ * @param {object} pool
+ * @param {{runId: string, sessionId?: string|null}} [arg] `sessionId` 缺省时回查**一次**
+ *   `runs.session_id`（投影是 session 作用域的，没有 sessionId 无从下手；一次查询，不在轮询里循环）
+ * @returns {Promise<string>} 取不到 ⇒ `''`（空产物的处置见 `macro-scheduled.js` 的产物口径注释）
+ */
+async function collectRunFinalText(pool, { runId, sessionId } = {}) {
+  if (!runId) return '';
+  try {
+    let sid = typeof sessionId === 'string' && sessionId !== '' ? sessionId : null;
+    if (sid === null) {
+      const res = await pool.query(`SELECT session_id FROM runs WHERE id = $1`, [runId]);
+      const found = res.rows?.[0]?.session_id;
+      sid = typeof found === 'string' && found !== '' ? found : null;
+    }
+    if (sid === null) return '';
+    const hit = await fetchRunAssistantText(pool, { sessionId: sid, runId });
+    return typeof hit?.text === 'string' ? hit.text : '';
+  } catch {
+    // 读正文失败不许改判 run 的终态（终态已经由 runs.status 定了）。
+    return '';
+  }
+}
+
+/**
+ * runTask 的**生产真实实现**（#637 ①）：轮询 `runs.status` 直到终态（`finished` / `failed`，
+ * `cancelling` 属非终态继续等它落到终态），把 `status` / `error` / 最后一条 assistant 正文收集起来。
+ *
+ * 返回 `{ ok: status === 'finished', text, termination: { reason, error }, error }`（额外带一个顶层
+ * `error` 字符串，供 `executeScheduledIntent.failRun` 的 reason 可读）。超时 ⇒ `{ ok:false,
+ * termination:{reason:'run_timeout'} }`。**不重试**（`06` §8）。超时/轮询/时钟/睡眠都可注入（测试用短超时）。
+ *
+ * @param {{pool:object, childRunId?:string, sessionId?:string|null, log?:object}} ctx 执行器传入的执行上下文
+ *   （`sessionId` = 该 run 的会话；`executeScheduledIntent` 本来就传，缺省时 `collectRunFinalText`
+ *   回查一次 `runs.session_id`——读侧投影是 **session 作用域**的，#652）
+ * @param {{timeoutMs?:number, pollMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>}} [opts]
+ */
+export async function pollRunTask({ pool, childRunId, sessionId } = {}, {
+  timeoutMs = RUN_TASK_TIMEOUT_MS,
+  pollMs = RUN_TASK_POLL_MS,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  const fail = (reason, error) => ({
+    ok: false, text: '',
+    termination: { reason, error: error ?? null },
+    error: error?.message ? `${reason}: ${error.message}` : String(reason),
+  });
+  if (!childRunId) return fail('no_child_run', null);
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    let row;
+    try {
+      ({ rows: [row] } = await pool.query(
+        `SELECT status, termination, error FROM runs WHERE id = $1`, [childRunId]));
+    } catch (err) {
+      return fail('run_query_failed', { message: err?.message ?? String(err) });
+    }
+    if (!row) return fail('run_not_found', null);
+    const { status } = row;
+    if (status === 'finished' || status === 'failed') {
+      const runError = row.error ?? null;
+      const tReason = row.termination?.reason ?? runError?.code ?? null;
+      const text = await collectRunFinalText(pool, { runId: childRunId, sessionId });
+      if (status === 'finished') {
+        return { ok: true, text, termination: { reason: tReason ?? 'finished', error: null }, error: null };
+      }
+      // failed（含 cancelling 落到的终态失败）：不记 done，交执行器 failRun。
+      return {
+        ok: false, text,
+        termination: { reason: tReason ?? 'run_failed', error: runError },
+        error: runError?.message ? `${tReason ?? 'run_failed'}: ${runError.message}`
+          : String(tReason ?? 'run_failed'),
+      };
+    }
+    // 非终态（queued / running / cancelling）：超时则放弃（不重试），否则再等一拍。
+    if (now() >= deadline) return fail('run_timeout', null);
+    await sleep(pollMs);
+  }
+}
 
 /**
  * 从 `run-review` 意图里取「该被审查的原 run id」。
@@ -96,7 +196,7 @@ export function createIntentDispatcher({
   pool,
   config = {},
   log = console,
-  reportsRoot = defaultReportsRoot(),
+  reportsRoot, // 缺省 undefined ⇒ 由 executeScheduledIntent 按 config.userSpaceRoot + fde_name 现算（#637 ②）
   sessionsHome = os.homedir(),
   runTask,
   reviewRunner,
@@ -107,9 +207,9 @@ export function createIntentDispatcher({
 } = {}) {
   const nowVal = () => (typeof now === 'function' ? now() : now);
 
-  // 生产缺省 runTask：没有进程内模型适配器时，W7 已经通过 postMessage 把 run 入队（真起了 run），
-  // 这里只做「已入队」的诚实收口（不谎报产物）。真实模型驱动由调用方注入 runTask 覆盖。
-  const defaultRunTask = async ({ childRunId }) => ({ ok: true, text: '', childRunId });
+  // 生产缺省 runTask（#637 ①）：**真实实现** = 轮询 run 到终态、收集判决与正文（过去是空壳桩 ⇒
+  // 立刻返回空文本 + done，把失败伪装成完成、产物为空）。超时不重试（`06` §8）。
+  const defaultRunTask = async (ctx) => pollRunTask(ctx);
   // 生产缺省 reviewRunner：没有模型适配器 ⇒ 明确抛错（dispatcher 会补 finish(failed)，不留 pending）。
   const defaultReviewRunner = async () => {
     throw new Error('未配置 reviewRunner（W4b 需要模型适配器；当前会落 failed 而非留 pending）');
@@ -135,7 +235,7 @@ export function createIntentDispatcher({
       case 'scheduled-task':
         // 执行器自收尾（done/failed 都它自己 finish）⇒ dispatcher 不再 finish。
         await execScheduled(pool, intent, {
-          reportsRoot, sessionsHome, runTask: runTask ?? defaultRunTask, now: nowVal(), log,
+          reportsRoot, sessionsHome, runTask: runTask ?? defaultRunTask, now: nowVal(), log, config,
         });
         return;
       case 'run-review':

@@ -22,6 +22,11 @@ import { createRecoveryRowStore } from './transcript-store.js';
 import { partialOutputs } from './run-partial-buffer.js'; // issue #502 D-4：stream 档正文的进程内缓冲
 import { enqueueMaterializeChange } from './outbox.js';
 import { attachLoopWatch, sleepCancellable } from './loop-timing.js'; // issue #520
+// issue #646：终态宏意图产生端（M1 终态通知 / M9 完成审查）用宏平台的**唯一认领口**做幂等占位。
+// ⚠ 只 import 产生端的 `claimMacroRun`（W2 边界内的唯一 ledger owner），**不** import dispatcher
+//   （消费端在 cli.js 组装、经 `config.onMacroIntents` 注入回来），否则 internal 侧会绕过 cli 接线、
+//   还可能重复起 sweep loop。
+import { claimMacroRun } from './macros.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -862,7 +867,147 @@ function withPartialRunEnd(runId, payload, { hasAssistantAnchor = false } = {}) 
 }
 
 /** 终态收敛事务（runner §7.6 加锁顺序：锁 run → 校验租约 → 写终态 → queue 收敛 → messages/usage/run_end）。 */
-async function finishRun(pool, { user, runId, claimToken, state, body, config, log = console }) {
+// ---------------------------------------------------------------------------
+// issue #646：终态宏意图产生端（M1 终态通知 / M9 完成审查）
+// ---------------------------------------------------------------------------
+//
+// 背景：`run-notify`（M1）与 `run-review`（M9）是**终态触发**型——它们的意图**不由评估循环
+// `tick()` 产出**（见 `macro-eval.js` 里那句「run-notify/run-review 由 W1 的终态触发驱动」），
+// 而「W1 的终态触发」此前**根本不存在**：`finishRun`（终态收敛路径）一行都没碰宏平台。
+// ⇒ M1/M9 零发生。本函数就是那个缺失的产生端：run 提交终态后，查该会话上启用的
+// run-notify/run-review 订阅，命中后 `claimMacroRun` 占位（幂等），把意图交给注入的消费者。
+
+/**
+ * 引擎 `termination.reason` → 宏的封闭终态枚举（`run-notify.states`：
+ * `completed / failed / capped / aborted / persistence_failed / guard_unverified`，
+ * 权威定义在 `portal/shared/macro-kinds.js:56`、契约 `10` §1）。
+ *
+ * ⚠ 引擎 reason 全集的**权威来源**是 `portal/frontend/src/lib/terminationReasons.ts` 的
+ *   `TERMINATION_REASONS`（`end_turn/no_tool/stall/max_rounds_cap/judge_done/continuation_exhausted/
+ *   final_guard_unverified/aborted/failed/persistence_failed`）；runner 只透传、不枚举
+ *   （`runner/lib/termination.js:31`），故映射在本处按「reason 语义 → 平台 state」定，不自造 reason：
+ *     - 五个非 `completed` 状态与引擎 reason 一一对应：
+ *         `failed`→failed、`max_rounds_cap`→capped（撞轮数上限）、`aborted`→aborted、
+ *         `persistence_failed`→persistence_failed、`final_guard_unverified`→guard_unverified（终稿未核验）；
+ *     - 其余收尾（`end_turn`/`judge_done`/`no_tool`/`stall`/`continuation_exhausted`）与未知 reason
+ *       ⇒ `completed`：正常或「截断但非故障」的收尾，界面显示「已完成」（`07` §435 `judge_done → 已完成`）。
+ */
+export const TERMINATION_REASON_TO_MACRO_STATE = Object.freeze({
+  failed: 'failed',
+  max_rounds_cap: 'capped',
+  aborted: 'aborted',
+  persistence_failed: 'persistence_failed',
+  final_guard_unverified: 'guard_unverified',
+});
+
+/** 把一个引擎 `termination.reason` 归到宏的封闭终态枚举之一（未列出的 ⇒ `completed`）。 */
+export function macroStateOfTermination(reason) {
+  return TERMINATION_REASON_TO_MACRO_STATE[reason] ?? 'completed';
+}
+
+/**
+ * M9「有改动可审」的保守触发集（`08` §0/§4：审查 = 会话停下后把工作树事实摆给审查 agent）。
+ *
+ * 只有以下两类**不审**（其余终态都审）：
+ *   - `aborted`：用户主动停止、人就在现场（`08` §2「人在场」不回灌），审查是噪音；
+ *   - `persistence_failed`：快照没落盘、状态不可靠、崩溃恢复可能重复副作用，「有改动可审」前提不成立。
+ * 正常收尾（`completed`）与异常收尾（`failed`/`capped`/`guard_unverified`）都可能留下待审改动 ⇒ 审。
+ */
+export const REVIEWABLE_MACRO_STATES = Object.freeze(['completed', 'failed', 'capped', 'guard_unverified']);
+
+/**
+ * run 到终态后，为该会话上启用的 `run-notify` / `run-review` 订阅产生宏意图并交给注入的消费者。
+ *
+ * 幂等：认领走 `claimMacroRun`，唯一键 `(assignment_id, anchor='run:<runId>', criterion='terminal', bucket='b0')`
+ *   ⇒ 同一条 run 的终态被重放收敛两次，第二次 `claimMacroRun` 返回 `null` ⇒ **只产一条账**。
+ *
+ * ⚠ 本函数是**尽力而为**：`onMacroIntents` 抛异常由调用方（`finishRun` 的 fire-and-forget）接住，
+ *   绝不冒泡到 run 自己的收尾。`onMacroIntents` 非函数 / 无会话 / 无 reason ⇒ 直接静默跳过。
+ *
+ * @returns {Promise<{intents:number}>} 产生并交给消费者的意图条数
+ */
+export async function emitTerminalMacroIntents(pool, {
+  runId, sessionId, termination, onMacroIntents, log = console, now = () => new Date(),
+} = {}) {
+  if (!sessionId || typeof onMacroIntents !== 'function') return { intents: 0 };
+  const reason = termination && typeof termination === 'object' ? termination.reason : null;
+  if (typeof reason !== 'string' || reason === '') return { intents: 0 };
+  const macroState = macroStateOfTermination(reason);
+  const at = typeof now === 'function' ? now() : now;
+
+  // 取该会话上「启用 + 未过期 + 模板开着且未软删」的 run-notify/run-review 订阅。
+  // 资格谓词与 `claimMacroRun` 内部的 `WHERE EXISTS` 同口径（双保险；即便这里查漏，claim 也会再挡）。
+  let rows;
+  try {
+    ({ rows } = await pool.query(
+      `SELECT a.id AS assignment_id, a.user_id, a.session_id, a.cwd,
+              t.id AS template_id, t.kind, t.name AS template_name, t.params
+         FROM macro_assignments a
+         JOIN macro_templates t ON t.id = a.template_id
+        WHERE a.session_id = $1
+          AND a.enabled
+          AND (a.until IS NULL OR a.until > $2)
+          AND t.enabled AND t.deleted_at IS NULL
+          AND t.kind IN ('run-notify', 'run-review')`,
+      [sessionId, at],
+    ));
+  } catch (err) {
+    log.warn?.(`[internal] 终态宏：取订阅失败（跳过本次，不影响 run 收尾）：${err?.message ?? err}`);
+    return { intents: 0, queryError: true };
+  }
+
+  const anchor = `run:${runId}`;
+  const intents = [];
+  for (const a of rows) {
+    const params = a.params ?? {};
+    if (a.kind === 'run-notify') {
+      // states 未给（老订阅）⇒ 回落 KIND_SCHEMA 默认（`shared/macro-kinds.js:57`，不含 completed）。
+      const wanted = Array.isArray(params.states) && params.states.length > 0
+        ? params.states
+        : ['failed', 'capped', 'aborted', 'persistence_failed', 'guard_unverified'];
+      if (!wanted.includes(macroState)) continue;
+    } else if (a.kind === 'run-review') {
+      if (!REVIEWABLE_MACRO_STATES.includes(macroState)) continue;
+    } else {
+      continue;
+    }
+    // ⚠ 幂等全压在这一行：重放收敛 ⇒ claimed=null ⇒ continue（不产第二条账、不重复通知）。
+    let claimed;
+    try {
+      claimed = await claimMacroRun(pool, {
+        assignmentId: a.assignment_id, anchor, criterion: 'terminal', bucket: 'b0', now: at,
+      });
+    } catch (err) {
+      log.warn?.(`[internal] 终态宏：认领失败 assignment=${a.assignment_id}（跳过这条）：${err?.message ?? err}`);
+      continue;
+    }
+    if (!claimed) continue;
+    intents.push({
+      assignmentId: a.assignment_id,
+      templateId: a.template_id,
+      templateKind: a.kind,
+      templateName: a.template_name, // 快照：模板改名后历史仍显示当时名字
+      params,                        // 快照：执行时不再回查模板
+      userId: a.user_id,
+      sessionId: a.session_id ?? null,
+      cwd: a.cwd ?? null,
+      anchor,
+      criterion: 'terminal',
+      bucket: 'b0',
+      // evidence.runId 供 dispatcher 的 extractReviewRunId 优先取用（否则退回解析 anchor 'run:<id>'）；
+      // run-review 靠它定位原 run（`08` §5）。
+      evidence: { macro_state: macroState, termination_reason: reason, runId },
+      macroRunId: claimed.id,
+    });
+  }
+
+  if (intents.length === 0) return { intents: 0 };
+  // 交给注入的消费者（dispatcher.dispatch）。抛异常由调用方接住，这里不吞、让它冒到 fire-and-forget 的 catch。
+  await onMacroIntents(intents);
+  return { intents: intents.length };
+}
+
+async function finishRun(pool, { user, runId, claimToken, state, body, config, log = console, onMacroIntents }) {
   const termination = body.termination;
   const usage = body.usage;
   const rounds = body.rounds;
@@ -1054,7 +1199,23 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
     // 锁 chat_sessions，同事务内调它就是自锁）；判定表在 queued-inputs.js 一处，五处终态共用。
     await drainQueueAfterRun(pool, runId, log);
     await audit(pool, { actorId: user.id, action: 'run.finish', target: runId, details: { state, queue_status: queueStatus } }).catch(() => {});
-    return { state, queue_status: queueStatus, run_end_seq: runEndSeq };
+    // issue #646：M1 终态通知 / M9 完成审查——**提交终态之后**（不在事务里）尽力产生宏意图。
+    // ⚠ **绝不阻塞终态收敛**：fire-and-forget（不 await）+ 全量 try/catch，通知/审查失败只 warn，
+    //   绝不影响 run 自己的收尾（判据 4：派发抛异常 ⇒ 终态收敛照常完成）。未注入 hook ⇒ 静默跳过（判据 5）。
+    // ⚠ hook 从**注入参数**优先、退回 `config.onMacroIntents`（同一 config 引用由 cli.js 经 setRunState 流到这里）。
+    const macroHook = typeof onMacroIntents === 'function' ? onMacroIntents
+      : (config && typeof config.onMacroIntents === 'function' ? config.onMacroIntents : null);
+    let macroIntents = null;
+    if (macroHook) {
+      macroIntents = Promise.resolve()
+        .then(() => emitTerminalMacroIntents(pool, {
+          runId, sessionId: r.session_id, termination, onMacroIntents: macroHook, log,
+        }))
+        .catch((err) => log.warn?.(`[internal] 终态宏意图产生/派发异常（不影响 run 收尾）：${err?.message ?? err}`));
+      // 不 await：U2 终态响应不等通知/审查（run-review 会起真 run，可能很慢）。
+      // 内部已 catch ⇒ 绝不产生未处理拒绝；测试若需断言宏账/通知，await 这个返回的 promise 即可（确定性）。
+    }
+    return { state, queue_status: queueStatus, run_end_seq: runEndSeq, macroIntents };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
@@ -1580,45 +1741,13 @@ function collectRoundText(row) {
 }
 
 // ---------------------------------------------------------------------------
-// U8/U9 checkpoint
+// U8/U9 checkpoint（已退役，issue #640）
+//
+// erix-agent 0.33.0（上游 #838 S2，本站 #530）不再读写 run snapshot ⇒ `putCheckpoint` /
+// `getLatestCheckpoint` / `putSessionCheckpoint` / `getSessionLatestCheckpoint` 四个函数、
+// 四个 `/checkpoint*` 端点、agentd 的四条转发与那张快照表（迁移 `0041` DROP）同批删除。
+// 旧 agentd 若还在打这些路径，拿到的是 **404 `not_found`**（见 http.js 的分支注释）。
 // ---------------------------------------------------------------------------
-
-export async function putCheckpoint(pool, { container, user, runId, claimToken, body }) {
-  const revision = body?.revision;
-  if (!Number.isInteger(revision) || revision < 0) {
-    throw new InternalError(400, 'validation_failed', 'revision 必须为非负整数');
-  }
-  if (!body?.snapshot || typeof body.snapshot !== 'object' || Array.isArray(body.snapshot)) {
-    throw new InternalError(400, 'validation_failed', 'snapshot 必须为对象');
-  }
-  const run = await fetchRun(pool, runId, user.id);
-  if (isTerminal(run.status)) throw new InternalError(409, 'run_terminal', 'run already terminal');
-  await assertClaimToken(pool, runId, claimToken);
-
-  const res = await pool.query(
-    `INSERT INTO run_checkpoints (run_id, snapshot, revision, updated_at)
-     VALUES ($1, $2, $3, now())
-     ON CONFLICT (run_id) DO UPDATE
-       SET snapshot = EXCLUDED.snapshot, revision = EXCLUDED.revision, updated_at = now()
-       WHERE run_checkpoints.revision < EXCLUDED.revision
-     RETURNING revision`,
-    [runId, JSON.stringify(body.snapshot), revision],
-  );
-  if (res.rows.length === 0) {
-    throw new InternalError(409, 'checkpoint_stale', 'checkpoint revision 不大于当前（CAS 拒绝）');
-  }
-  return { revision: Number(res.rows[0].revision) };
-}
-
-export async function getLatestCheckpoint(pool, { container, user, runId, claimToken }) {
-  const run = await fetchRun(pool, runId, user.id);
-  if (!isTerminal(run.status)) await assertClaimToken(pool, runId, claimToken);
-
-  const res = await pool.query(`SELECT snapshot, revision, updated_at FROM run_checkpoints WHERE run_id = $1`, [runId]);
-  const row = res.rows?.[0];
-  if (!row) return null;
-  return { checkpoint: { snapshot: row.snapshot, revision: Number(row.revision), updated_at: row.updated_at } };
-}
 
 // ---------------------------------------------------------------------------
 // session-scoped transcript（issue #81 P2，docs/design/conversation-state.md §4.1）
@@ -1780,49 +1909,6 @@ export async function getSessionTranscript(pool, { container, user, key, claimTo
   const nextCursor = last ? `${Number(last.round)}:${String(last.append_seq)}` : null;
   const records = res.rows.map((r) => ({ round: Number(r.round), ...r.record }));
   return { records, next_cursor: nextCursor };
-}
-
-/** session checkpoint 覆盖写 + revision CAS（同 U8 语义，键 = transcript key）。 */
-export async function putSessionCheckpoint(pool, { container, user, key, claimToken, writerRunId, body }) {
-  const revision = body?.revision;
-  if (!Number.isInteger(revision) || revision < 0) {
-    throw new InternalError(400, 'validation_failed', 'revision 必须为非负整数');
-  }
-  if (!body?.snapshot || typeof body.snapshot !== 'object' || Array.isArray(body.snapshot)) {
-    throw new InternalError(400, 'validation_failed', 'snapshot 必须为对象');
-  }
-  await fetchSession(pool, key, user.id);
-  await fetchWriterRun(pool, writerRunId, user.id, key);
-  await assertClaimToken(pool, writerRunId, claimToken);
-
-  const res = await pool.query(
-    `INSERT INTO run_checkpoints (run_id, transcript_key, snapshot, revision, updated_at)
-     VALUES ($1, $2, $3, $4, now())
-     ON CONFLICT (transcript_key) WHERE transcript_key IS NOT NULL DO UPDATE
-       SET snapshot = EXCLUDED.snapshot, revision = EXCLUDED.revision, updated_at = now()
-       WHERE run_checkpoints.revision < EXCLUDED.revision
-     RETURNING revision`,
-    [writerRunId, key, JSON.stringify(body.snapshot), revision],
-  );
-  if (res.rows.length === 0) {
-    throw new InternalError(409, 'checkpoint_stale', 'checkpoint revision 不大于当前（CAS 拒绝）');
-  }
-  return { revision: Number(res.rows[0].revision) };
-}
-
-/** session checkpoint 读取；无 → null（HTTP 204）。 */
-export async function getSessionLatestCheckpoint(pool, { container, user, key, claimToken, writerRunId }) {
-  await fetchSession(pool, key, user.id);
-  await fetchWriterRun(pool, writerRunId, user.id, key);
-  await assertClaimToken(pool, writerRunId, claimToken);
-
-  const res = await pool.query(
-    `SELECT snapshot, revision, updated_at FROM run_checkpoints WHERE transcript_key = $1`,
-    [key],
-  );
-  const row = res.rows?.[0];
-  if (!row) return null;
-  return { checkpoint: { snapshot: row.snapshot, revision: Number(row.revision), updated_at: row.updated_at } };
 }
 
 function runStateStatusRecord(statusRecord, hasStatusRecord, runState, key) {

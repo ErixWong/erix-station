@@ -21,6 +21,10 @@ P1 walking skeleton 的本地开发栈：`station-db`（Postgres）+ `station-po
 ```bash
 # 1) 生成本地 .env（不入库）
 cp deploy/.env.example deploy/.env
+#   ⚠ 三根自构建镜像引用（STATION_PORTAL_IMAGE / STATION_DOCKER_PROXY_IMAGE / FDE_IMAGE）在
+#   模板里**留空**，compose 对它们是 `${VAR:?}` 缺值即拒（#643）：填了才起得来。
+#   本地构建就填 tag 形态：portal/proxy 写 `…:local`，FDE 写 `traefik/whoami`（或自建 `…fde:local`）。
+#   部署/发布按 `docs/ops/ci-release.md` §4 pin digest。
 # 2) 起栈（构建 portal 镜像 + 拉起三容器）
 sg docker -c 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build'
 # 2a) （可选，Office/压缩包预览）先自建 kkFileView 镜像再带 profile 起（#366，见「说明」节）

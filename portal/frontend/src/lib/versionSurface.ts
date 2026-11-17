@@ -54,6 +54,16 @@ export interface VersionInfo {
   fdes: FdeCell[];
   /** 服务端真的给了 FDE 列表（false ⇒ 页面说「读不到」，不说「没有 FDE」，#350 同口径）。 */
   fdesPresent: boolean;
+  /**
+   * 服务端说「这是**本地构建**、镜像里没烘 build-info」（issue #643 B）。
+   * 算法在服务端（`revision` 为 `unknown` ⇒ true），前端一个字都不推 ——
+   * 再推一次就是第二份口径，而本文件的红线是「口径只许有一份」。
+   * 三态：`true` / `false` 是服务端说了；**`null` = 它没说**
+   * （老端点、桩给半截、脏值都算没说）。
+   * `null` 不等于「不是本地构建」，也不许渲染成「已烘 build-info」——
+   * 把「没说」读成「说了不是」就是假账，所页面在 `null` 时一个字都不加。
+   */
+  localBuild: boolean | null;
   provenance: { server: string | null; platformEngine: string | null; fdes: string | null };
 }
 
@@ -80,6 +90,17 @@ function stringOrNull(value: unknown): string | null {
 
 function booleanish(value: unknown): boolean {
   return value === true || value === 1 || value === 'true';
+}
+
+/**
+ * 三态布尔（#643 B）：只认**真布尔**。
+ * `'true'` / `'no'` / `1` / 缺失 ⇒ `null`，意思是「服务端没说」，不是「说了不是」。
+ * ⚠ 别复用上面的 `booleanish()`：那是宽松真值，给 `revoked` 用，误判最坏只是
+ * 多显示一句「已吊销」；这一格误判会把「没说」冒充成「是本地构建」，
+ * 而它说的是**能不能当发布件对账** —— 宁可什么都没说。
+ */
+function booleanOrNull(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
 }
 
 export function versionSourceOf(value: unknown): VersionSource {
@@ -123,6 +144,9 @@ export function normalizeVersionInfo(raw: unknown): VersionInfo {
     platformEngineVersion: versionOrNull(engineRaw?.version),
     fdes,
     fdesPresent,
+    // 两种键名都认（先例见上面 `buildInfoPath`）：契约换形不至于退化成「没说」。
+    // **不在这里推**：推一次就是两份口径（红线 #643B-R）。
+    localBuild: booleanOrNull(root.localBuild ?? root.local_build),
     // `unknown` 收成 null（判据 2 同口径）：服务端没说就是「未知」，不显示成字面量路径。
     buildInfoPath: versionOrNull(root.buildInfoPath ?? root.build_info_path),
     provenance: {

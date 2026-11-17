@@ -21,7 +21,7 @@ import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import { claimMacroRun } from '../src/macros.js';
 import { claimRun } from '../src/internal.js';
 import {
-  executeScheduledIntent, artifactPath, macroOrigin, macroSessionTitle,
+  executeScheduledIntent, artifactPath, macroOrigin, macroSessionTitle, defaultReportsRoot,
 } from '../src/macro-scheduled.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
@@ -315,6 +315,63 @@ test('#627③ maxRounds=3 ⇒ 起出来的 run 带的是 3，并随 claim ticket
     const row2 = (await pool.query(`SELECT run_state FROM runs WHERE id=$1`, [out2.childRunId])).rows[0];
     assert.equal(row2.run_state?.host_max_rounds ?? null, null,
       '没声明 ⇒ 不写键（不得把「未填」翻译成一个具体的轮数）');
+    await fs.rm(home, { recursive: true, force: true });
+  });
+});
+
+// ── #637③ artifactPath：保留中文名 / 不同中文名不同目录 / 路径穿越安全（纯函数，无需 DB）──
+// ⚠ 反向自证锚点：把 macro-scheduled.js 的 safePathSegment 正则改回 /[^\w.\-]+/g ⇒ 判据 1/2 变红
+//   （这就是线上当前行为：`每日巡检` 被压成一个 `_`，两个中文宏挤同一目录互相覆盖）。
+test('#637③-1 artifactPath 保留中文宏名（不被压成 _）', () => {
+  const p = artifactPath('/r', '每日巡检', '2026-11-17');
+  assert.ok(p.includes('每日巡检'), `路径必须含中文宏名：${p}`);
+  assert.equal(p, path.join('/r', '每日巡检', '2026-11-17.md'));
+});
+
+test('#637③-2 两个不同中文宏名 ⇒ 不同目录（不得互相覆盖）', () => {
+  const a = artifactPath('/r', '每日巡检', '2026-11-17');
+  const b = artifactPath('/r', '每周总结', '2026-11-17');
+  assert.notEqual(a, b, '同一天两个不同中文宏不得写进同一文件');
+  assert.ok(a.includes('每日巡检') && b.includes('每周总结'), `各自保留自己的名：${a} / ${b}`);
+});
+
+test('#637③-3 路径安全：模板名含 ../ 或 / 或 .. 不得逃出 reportsRoot', () => {
+  const root = '/srv/erix/users/u1/reports';
+  for (const name of ['../../etc/passwd', 'foo/bar', '..', '.', '../x', 'a\\b\\c', '.././../escape']) {
+    const p = artifactPath(root, name, '2026-11-17');
+    assert.ok(p.startsWith(root + path.sep), `产物必须仍在 root 之下（name=${name}）：${p}`);
+    assert.ok(!p.includes('/projects/'), `不得落到 ~/projects 触发收工灯：${p}`);
+  }
+});
+
+// ── #637② 产物根缺省落点来自 config.userSpaceRoot + users.fde_name（不是 os.homedir）──
+test('#637②-7 产物根缺省 = config.userSpaceRoot + users.fde_name（不是 os.homedir）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T9'));
+    // 给这个用户配上 fde_name（users.fde_name，产物路径口径要的正是它；containers.fde_name 是另一张表）。
+    await pool.query(`UPDATE users SET fde_name = $2 WHERE id = $1`, [scene.userId, scene.login]);
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'w7home-'));
+    // 不注入 reportsRoot ⇒ 走缺省；用 config.userSpaceRoot 顶掉真实 /srv/erix（测试别真写挂载）。
+    const it = await tickIntent(pool, scene, { date: '2026-11-16' });
+    const out = await executeScheduledIntent(pool, it, {
+      sessionsHome: home, runTask: okRunner('day1.md'),
+      config: { userSpaceRoot: home },
+    });
+    assert.equal(out.status, 'done');
+    const expectedRoot = path.join(home, scene.login, 'reports');
+    assert.ok(out.artifactPath.startsWith(expectedRoot),
+      `产物必须在 <userSpaceRoot>/<fde_name>/reports 下：期望 ${expectedRoot}，实际 ${out.artifactPath}`);
+    assert.ok(out.artifactPath.includes(scene.login), '路径必须带 fde_name 段');
+    // ⚠ 反向自证锚点：把缺省改回 os.homedir()（旧 defaultReportsRoot）⇒ 这里 startsWith 失败、下面命中 ~/reports。
+    assert.ok(!out.artifactPath.startsWith(path.join(os.homedir(), 'reports')),
+      `缺省不得回落 os.homedir()/reports：${out.artifactPath}`);
+    // ⚠ 上面那条走的是**注入** userSpaceRoot 的路径，钉不到「缺省值」本身。
+    //   生产走的是缺省（没人给 config.userSpaceRoot 时就靠它）⇒ 缺省必须单独钉一次。
+    //   主 agent 复验时把缺省改成 os.homedir() 跑测试：**全绿**（因为注入把它遮住了）⇒ 补这条。
+    assert.ok(defaultReportsRoot('eric').startsWith('/srv/erix/users/'),
+      `缺省产物根必须是用户可见的 RW 挂载 /srv/erix/users/<fde>：${defaultReportsRoot('eric')}`);
+    assert.equal(defaultReportsRoot('eric'), '/srv/erix/users/eric/reports');
+    assert.equal(await fs.readFile(out.artifactPath, 'utf8'), '产物正文', '产物仍由平台落盘、非空');
     await fs.rm(home, { recursive: true, force: true });
   });
 });
