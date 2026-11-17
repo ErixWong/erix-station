@@ -8833,3 +8833,16 @@ clock:2026-11-17 | done
 
 **没做的**：C（advisory lock，#635 写侧已落、缺读侧对账 + 存量回填）本轮按用户指令**未动**，
 issue #643 保持 OPEN 并在单下留了口径。
+
+### 8.168 切版 0.1.72 → 0.1.73（MCP 通道 P1 首发版）（2026-11-17，主 agent）
+
+- **改哪三处**：`package.json` / `runner/package.json` / `portal/frontend/package.json` 的 `version`。
+  三份 **lockfile 的顶层两行**（`version` + `packages[""].version`）一并改——261117-05 那单就是
+  「lockfile 上两次切版漏了、还在 0.1.69」，别让它第三次发生。
+- **打 tag 前现验三件**（§7 的口径，不抄旧数）：① `git ls-remote --tags origin | grep v0.1.73` 无命中；
+  ② tag 指向的 commit 就是「交付物全部合进 main 之后」的那笔；③ `package.json` 的 `version` 与 tag 去 `v` 后逐字相等
+  （release.yml 步骤 ① 的硬门）。
+- **本版内容**：#653（能力市场 MCP 通道 P1，§8.166/§8.167）+ 此前已合入 main 的若干单。
+  ⚠ 切版时 main 上仍有 3 个在飞 PR（#660 ports.json schema2 e2e / #655 坐标可核对性 / #641 提示词面板）——
+  它们**不属于**本版，合进来会进下一版；这不违反「tag 必须指向我们验过的那份树」：本单的交付物已全部在 main。
+- **验证**（切版树上亲跑）：根 `npm test` **2858 pass / 0 fail**；前端 `typecheck` rc=0 + **79 files / 1671 tests**。
