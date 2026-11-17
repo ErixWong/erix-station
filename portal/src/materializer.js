@@ -170,7 +170,9 @@ export const MCP_MAX_SCHEMA_BYTES = 64 * 1024;
 export function renderMcpJson(servers) {
   const list = Array.isArray(servers) ? servers : [];
   const out = list
-    .filter((s) => s && typeof s.name === 'string' && s.name !== '')
+    // `hidden` 是**不物化**档（§4.1）：查询层已经滤过一遍，这里再滤一次是纵深防御——
+    // mcp.json 是 runner 唯一读得到配置的地方，让它出现就等于「可达」。
+    .filter((s) => s && typeof s.name === 'string' && s.name !== '' && s.exposure !== 'hidden')
     .map((s) => {
       const exposure = ['direct', 'deferred', 'hidden'].includes(s.exposure) ? s.exposure : 'deferred';
       const tools = (Array.isArray(s.tools) ? s.tools : [])
@@ -346,7 +348,8 @@ export function renderCapabilitiesJson(capabilities, mcpServers = []) {
   // §5.2：MCP 段**只放路由信号**（name/description/exposure/tool_count），**不放工具名**——
   // 工具名进提示词就是几百 token，而工具清单已经在 `mcp.json` 里（runner 读得到）。
   const mcp = (Array.isArray(mcpServers) ? mcpServers : [])
-    .filter((s) => s && typeof s.name === 'string' && s.name !== '')
+    // hidden 不进清单：它在提示词里出现就等于告诉模型「有个用不了的东西」，纯噪音。
+    .filter((s) => s && typeof s.name === 'string' && s.name !== '' && s.exposure !== 'hidden')
     .map((s) => ({
       name: s.name,
       description: typeof s.description === 'string' ? s.description : '',
