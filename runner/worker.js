@@ -883,7 +883,16 @@ async function startRun(msg) {
   // 写注由 `noteTools.executors('note_take', …)` 完成（作用域 = B 片的 scopeRef=sessionId，此处不传
   // scopeRef/runId——工厂绑定，传了就是伪造 __erix）。写注失败只 warn（`fatal:false`），绝不打死 run。
   // notes 不可用时（lib/notes-tools.js 降级路径：executors 非函数）⇒ 整体不接线，行为退回 A 片。
-  const foldNoteSink = typeof noteTools.executors === 'function'
+  //
+  // issue #626：这是只读闸的**第四条旁路**。前三条（delegate / note / skill，PR #568）都在
+  // `executeTool` 这条路上，而本钩子**直调 `noteTools.executors('note_take', …)`**
+  // （见 lib/fold-notes.js:43），根本不经 `executeTool` ⇒ worker.js:764 那条
+  // `if (!reviewOnly && noteTools.executeTool && …)` 管不到它。
+  // 「只读面」= 模型能调的工具 ∪ **宿主回调里会写东西的钩子**；前几轮只审了前者。
+  // 口径：新增任何 `executors(...)` 直调点时都要问一句「review run 会走到吗」。
+  // 修法与 note 路由同口径：reviewOnly 时**不构建 sink**（onFoldSummary 不接线 ⇒ 折叠仍产出
+  // 替代物、仍进上下文，只是不往会话 notes 写行——审查 run 本来也没有 note 可翻）。
+  const foldNoteSink = !reviewOnly && typeof noteTools.executors === 'function'
     ? createFoldNoteSink({
       noteTools,
       runId,

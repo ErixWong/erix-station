@@ -52,6 +52,9 @@ export function artifactPath(reportsRoot, templateName, date) {
  * origin 值形如 `macro:<模板名快照>`，已把「模板维度」编进 origin，故 `origin + user_id`
  * 就是 (user, template) 的唯一判据。
  *
+ * ⚠ #627 ② 修正：上面的「唯一判据」并不完整——还必须比 `cwd`（否则改模板 cwd 不生效）。
+ * 口径与理由写在下面查询旁的注释里。
+ *
  * ⚠ **为什么复用而不是每次开新会话**：notes 是 `sessionId` 作用域
  *   （`runner/lib/run-data.js:70` 的 `<home>/sessions/<id>/notes`）。复用会话 ⇒
  *   昨天写的注今天还在 ⇒ 「跨会话记忆不存在」这条对宏会话**不成立**。
@@ -59,13 +62,23 @@ export function artifactPath(reportsRoot, templateName, date) {
  */
 export async function getOrCreateMacroSession(pool, { userId, templateName, cwd = null, now = new Date() }) {
   const origin = macroOrigin(templateName);
-  // 先按 (user, origin) 找最早的活跃宏会话；命中即复用（这是 notes 跨 tick 累积的来源）。
+  // 先按 (user, origin, cwd) 找最早的活跃宏会话；命中即复用（这是 notes 跨 tick 累积的来源）。
+  // issue #627 ②：cwd 进复用判据。run 的 cwd 是 claim 时从 `chat_sessions.cwd` 取的
+  // （`internal.js` tryClaim 的 `SELECT … s.cwd`），所以**复用了旧会话 = 旧 cwd 又跑了一天**：
+  // 用户把模板 cwd 从 `~/projects/a` 改到 `b`，任务仍在 `a` 跑，页面不报错——静默失效。
+  // 拍板：cwd 变了就**新建一条宏会话**（origin 相同、cwd 不同），旧会话保留历史。
+  //   为什么不就地改旧会话 cwd：宏会话是长期会话，它的 notes/历史全部是在旧目录下产生的，
+  //   就地改会让旧账与新 run 指向不同目录（翻旧账时路径全错）；新建则旧账留在旧目录的会话里。
+  //   代价：换 cwd 后 notes 不连续——本来也不该让两个目录的注串味。
+  // 比较用 `IS NOT DISTINCT FROM`：cwd 允许 NULL（未指定目录），普通 `=` 对 NULL 恒不命中
+  //   ⇒ 会把「两边都没 cwd」也当成变化，每拍新建一条会话（比原来的 bug 更糟）。
   const found = await pool.query(
     `SELECT id FROM chat_sessions
       WHERE user_id = $1 AND origin = $2 AND status = 'active'
+        AND cwd IS NOT DISTINCT FROM $3
       ORDER BY created_at ASC
       LIMIT 1`,
-    [userId, origin],
+    [userId, origin, cwd ?? null],
   );
   if (found.rows[0]?.id) return { sessionId: found.rows[0].id, created: false };
 
@@ -128,6 +141,11 @@ export async function executeScheduledIntent(pool, intent, {
   try {
     const posted = await postMessageImpl(pool, {
       userId, sessionId, content: task, triggerKind: 'synthetic',
+      // issue #627 ②③：两个过去被读出来却没人用的参数现在真的下行。
+      //  · `cwd`：会话已按 cwd 取/建，但「复用旧会话 + 模板改了 cwd」这一格靠 postMessage 自己
+      //    刷会话 cwd 兑住：run 的 cwd = claim 时读的 `chat_sessions.cwd`，刷了会话行 = 新目录。
+      //  · `maxRounds`：写进 run 行，再由 claim 下行给 runner（路线与理由见 sessions.js postMessage）。
+      cwd, maxRounds,
     });
     childRunId = posted?.run?.id ?? null;
   } catch (err) {
