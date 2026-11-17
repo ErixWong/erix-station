@@ -1,7 +1,7 @@
 // 管理台「提示词」页（issue #596 片 B）的纯逻辑：DTO 归一化 + 请求体构造 + 400 字段映射
 // + 「保存后物化到底通知了没有」的判据 + 只读清单。
 //
-// 契约：`docs/api/portal.md` §4.18（端点与 DTO）、`docs/design/admin-prompts-panel-2026-11-16.md`
+// 契约：`docs/api/portal.md` §4.19（端点与 DTO）、`docs/design/admin-prompts-panel-2026-11-16.md`
 // §1（哪些可改）/ §6（DTO）/ §7（前端要求）。
 // ⚠ **DTO 的真相在后端实现里**（`portal/src/platform-prompts.js` 的 `toPlatformPromptsDto`），
 //   键集由后端判据 `portal/test/platform-prompts.test.js` 的 `P8c` 逐键钉住。本文照那份写，
@@ -15,12 +15,12 @@
 //
 // 三条硬口径：
 //   1. **归一化是显式白名单且永不抛**：`GET` 在「表不存在 / 读失败 / 读超时」时也回 `200`
-//      （§4.18-1），所以任何形状都不许让这一页白屏。逐键取值，漏一个键只会让那一格显示「未知」。
-//   2. **服务端才是闸**（§4.18-2）：文本框里是什么就发什么，**越界照发**，由
+//      （§4.19-1），所以任何形状都不许让这一页白屏。逐键取值，漏一个键只会让那一格显示「未知」。
+//   2. **服务端才是闸**（§4.19-2）：文本框里是什么就发什么，**越界照发**，由
 //      `400 validation_failed` + `details` 回来标红；前端只在「连长度都算不出」
 //      （进来的根本不是字符串）时不发请求 —— 发一个 `{text: null}` 只是把「用户还没填」
 //      伪装成「用户填了个非法值」。
-//   3. **「跟随内置」只有一条判据**：`text === ''`（§4.18 开头）。前端**从文本自己派生**，
+//   3. **「跟随内置」只有一条判据**：`text === ''`（§4.19 开头）。前端**从文本自己派生**，
 //      不去读服务端的 `isDefault`：读侧的判据本来就是它，读两份真相迟早分叉。
 import type { ApiError } from '../api';
 
@@ -38,7 +38,7 @@ const PROMPT_SLUGS: Record<PromptFieldKey, string> = {
   titlePrompt: 'title-prompt',
 };
 
-/** `addendum` / `agentsMd` 参与物化，`titlePrompt` 不涉（§4.18-4）。 */
+/** `addendum` / `agentsMd` 参与物化，`titlePrompt` 不涉（§4.19-4）。 */
 const MATERIALIZING_FIELDS: readonly PromptFieldKey[] = ['addendum', 'agentsMd'];
 
 /** 只读清单（第一期不开放在线覆写的那 4 条，§1/§6）。后端只给 `key`，说明文案在前端 i18n。 */
@@ -109,7 +109,7 @@ export interface PlatformPrompts {
   materializeEnqueued: number | null;
 }
 
-/** 写侧请求体（§4.18-2）：只有一个 `text`，且必须是 JSON 字符串（`''` 合法）。 */
+/** 写侧请求体（§4.19-2）：只有一个 `text`，且必须是 JSON 字符串（`''` 合法）。 */
 export interface PromptPayload {
   text: string;
 }
@@ -153,7 +153,7 @@ function reasonOrNull(value: unknown): PromptFallbackReason | null {
 }
 
 /**
- * `readonly[]` 的形状是**对象数组** `[{ key: 'runnerSystemPrompt' }, …]`（§4.18-1，
+ * `readonly[]` 的形状是**对象数组** `[{ key: 'runnerSystemPrompt' }, …]`（§4.19-1，
  * 后端 `P8c` 逐字钉住），**不是**字符串数组。只取 `key` 且只认字符串：
  * `text` / `where` 这类多余键一律丢掉 —— portal 镜像不含 `runner/`，后端自己就读不到全文，
  * 它哪天误发一份文本进来也不许被当成真相渲染（那才是撑不起的承诺）。
@@ -227,7 +227,7 @@ export function normalizePlatformPrompts(raw: unknown): PlatformPrompts {
 }
 
 /**
- * 文本框的一手值 → 请求体（§4.18-2 只有 `text` 一个字段）。
+ * 文本框的一手值 → 请求体（§4.19-2 只有 `text` 一个字段）。
  *
  * **只有「进来的不是字符串」才返回 `null`（= 不发请求）**：文本框没有「解析不出数值」那种形态，
  * 越界是服务端的判断（它会回 `400` + `details`，页面据此标红），前端不许抢这道闸。
@@ -263,7 +263,7 @@ export function promptValidationFieldOf(
 }
 
 /**
- * `materializeEnqueued` 的语义（§4.18-4）—— 页面在 `0` 时**必须**说「已保存，但物化未通知」。
+ * `materializeEnqueued` 的语义（§4.19-4）—— 页面在 `0` 时**必须**说「已保存，但物化未通知」。
  *
  * | 值 | 含义 | 页面 |
  * |---|---|---|
@@ -284,7 +284,7 @@ export function materializeNoticeOf(
 }
 
 /**
- * `updatedBy` 只有 uuid、**没有显示名**（§4.18-1）。页面必须显示成「短 uuid」或「—」：
+ * `updatedBy` 只有 uuid、**没有显示名**（§4.19-1）。页面必须显示成「短 uuid」或「—」：
  * 留空会让人以为「没人改过」，而那恰恰是没改过的样子。取前 8 位当短形式（认不出的形状原样给）。
  */
 export function shortUuid(value: string | null): string | null {
