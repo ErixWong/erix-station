@@ -22,9 +22,37 @@ export const MACRO_SESSION_ORIGIN_PREFIX = 'macro:';
 /** 平台写死的宏会话标题后缀（用户可改标题，但 `origin` 不变，侧栏「自动化」分组靠 origin 过滤）。 */
 export const MACRO_SESSION_TITLE_SUFFIX = '· 长期';
 
-/** 产物根默认 `~/reports`（⚠ 不是 `~/projects`：模型被 jail 在项目 cwd，它自己写文件会把用户的收工灯弄红）。 */
-export function defaultReportsRoot(home = os.homedir()) {
-  return path.join(home, 'reports');
+/**
+ * 路径段清洗（issue #637 ③）：把「名字」压成一个**安全路径段**，并**保留 Unicode 字母/数字**
+ * （汉字原样留下）。过去的 `[^\w.\-]+` 里 `\w` 只认 `[A-Za-z0-9_]` ⇒ 中文名整段被压成一个 `_`，
+ * 所有中文宏挤进同一个 `_/` 目录、`<date>.md` 互相覆盖（真机实测目录就是 `_`）。
+ *
+ * 用 `/[^\p{L}\p{N}._-]+/gu`（`\p{L}` 含汉字、`\p{N}` 含各文种数字）后：
+ *  - 控制字符（含 NUL）→ `_`（`\p{L}`/`\p{N}` 本就不含，但显式挡一遍更稳）；
+ *  - 其余非「字母 / 数字 / `.` / `_` / `-`」（`/`、`\`、空格、emoji…）→ `_` ⇒ 挡掉 `/` 造成的目录穿越；
+ *  - **前导点**（`.` / `..` / `.hidden`）→ `_` ⇒ 挡 `..` 这个「无斜杠也能逃一层」的特例
+ *    （`path.join(root, '..')` 会逃到 root 之外）；
+ *  - 截断 120，全被清空 ⇒ 兜底 `fallback`（保持过去 `'macro'` 的行为）。
+ */
+function safePathSegment(value, fallback = 'macro') {
+  const out = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, '_')
+    .replace(/[^\p{L}\p{N}._-]+/gu, '_')
+    .replace(/^\.+/, '_')
+    .slice(0, 120);
+  return out || fallback;
+}
+
+/**
+ * 产物根默认落点（issue #637 ②）：**用户可见的 RW 挂载** `/srv/erix/users/<fde_name>/reports`。
+ * 过去是 `os.homedir() + '/reports'` = 容器内 `/root/reports`，**没挂载** ⇒ 用户看不到、换镜像即丢。
+ * 口径：`userSpaceRoot`（默认对齐 `config.userSpaceRoot` = `/srv/erix/users`，portal 对它是 RW 挂载）
+ *   + `<fde_name>`（过 `safePathSegment` 挡穿越，空 ⇒ `'user'`）+ `reports`；`artifactPath` 再拼
+ *   `<宏名>/<date>.md` ⇒ 最终 `/srv/erix/users/<fde_name>/reports/<宏名>/<date>.md`。
+ * ⚠ 绝不落 `~/projects`（模型 jail 在项目 cwd，平台写到那儿会把用户收工灯弄红，W7 原本就避开）。
+ */
+export function defaultReportsRoot(fdeName, userSpaceRoot = '/srv/erix/users') {
+  return path.join(userSpaceRoot, safePathSegment(fdeName, 'user'), 'reports');
 }
 
 /** 宏会话标题：`<宏名> · 长期`。 */
@@ -39,8 +67,7 @@ export function macroOrigin(templateName) {
 
 /** 产物落点：`<reportsRoot>/<宏名>/<date>.md`（date 用意图 bucket = UTC+8 日期，不回查模板）。 */
 export function artifactPath(reportsRoot, templateName, date) {
-  const safe = (s) => String(s ?? '').replace(/[^\w.\-]+/g, '_').slice(0, 120) || 'macro';
-  return path.join(reportsRoot, safe(templateName), `${safe(date)}.md`);
+  return path.join(reportsRoot, safePathSegment(templateName, 'macro'), `${safePathSegment(date, 'macro')}.md`);
 }
 
 /**
