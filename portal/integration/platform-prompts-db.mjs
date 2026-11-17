@@ -17,7 +17,7 @@
 //
 // 反向自证（评审要求，两种口径都有）：
 //   · 常驻一腿 `P12d-db`：把种行 `DELETE` 掉 ⇒ 同样的交错必须**真的**丢更新（不需要人工配合）。
-//   · 一次性开关 `P596_SKIP_SEED_ROW=1`：临时库回到 0040 **没种首行**的那个形态（等价于把迁移里
+//   · 一次性开关 `P596_SKIP_SEED_ROW=1`：临时库回到 0041 **没种首行**的那个形态（等价于把迁移里
 //     那句 INSERT 去掉），此时 `P12a-db` / `P12b-db` 必须自己变红 —— 用来自证那两格的绿是种行给的。
 //
 // ⚠ **凡「故意开着事务模拟竞态」的腿都自带硬超时**（`LOCK_WAIT_MS` / `LEG_GUARD_MS`）：到点自己
@@ -46,7 +46,7 @@ if (!DATABASE_URL) {
   throw new Error('TEST_DATABASE_URL 未设置。先起一个临时 postgres:16 并导出该变量（口径同 db-integration.mjs）。');
 }
 
-/** 反向自证开关：不种首行 ⇒ 回到 0040 加种行**之前**的形态（`P12a-db`/`P12b-db` 必须红）。 */
+/** 反向自证开关：不种首行 ⇒ 回到 0041 加种行**之前**的形态（`P12a-db`/`P12b-db` 必须红）。 */
 const SKIP_SEED_ROW = process.env.P596_SKIP_SEED_ROW === '1';
 
 const SCHEMA = 'p596_prompts_itest';
@@ -122,7 +122,7 @@ async function withLegGuard(label, bag, body) {
 }
 
 /**
- * 建一张最小的 `platform_prompts` + `audit_log`（+ 入队面那三张）：形状照迁移 0040 与 0026/0036，
+ * 建一张最小的 `platform_prompts` + `audit_log`（+ 入队面那三张）：形状照迁移 0041 与 0026/0036，
  * 只留这条语句用得上的东西（整库迁移不是这一腿的职责，那是 `db-integration.mjs`）。
  * ⚠ 种首行必须在这里也有：它正是被验那件事的前提（没有它，①的结论只能解释成"锁不住才正常"）。
  */
@@ -486,7 +486,7 @@ test('P12c-db：两条 Promise.all 直接赛跑（同一格 / 两格各一组）
 
 test('P12d-db：删掉种行后同样的交错真的丢更新 ⇒ 上面那些绿是种行给的，不是运气', async () => {
   await freshSchema();
-  await pool.query(`DELETE FROM ${SCHEMA}.platform_prompts`);   // 回到 0040 加种行之前的形态
+  await pool.query(`DELETE FROM ${SCHEMA}.platform_prompts`);   // 回到 0041 加种行之前的形态
   // 与 `P12b-db` **逐字同参**（同一套持法、同一个交错），差别只在「表里没有那一行」。
   const { rowB, sawWait } = await interleavedSave({
     label: 'P12d-db（无种行的交错）',
