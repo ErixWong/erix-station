@@ -8198,3 +8198,34 @@ commit **一致**）。dev 栈改 pin 该 digest（`deploy/.env:72`，备份 `/t
 
 **两版之间没有产品代码差异**（`git diff --stat v0.1.70..main` 只有 `portal/integration/version-surface-e2e.mjs`
 + 一条 npm script + 两篇设计文档 + 台账）⇒ 这不是「修 bug 的版本」，是**让 tag 追上验过的树**。
+
+### 8.156 能力市场 P1：MCP 通道 portal 切片（#608，2026-11-17，主 agent 自己写 + 两个 erix_run 并行跑 runner/前端）
+
+- **为什么主 agent 自己写**：这一片的两个 pi worker 后台 run 连续被外部终止（`Async runner process … exited
+  before writing a result`，6h 内两次），第三次改用 `erix_run`（带 sessionDir，可续跑）跑 runner 与前端，
+  portal 侧由主 agent 直接收口——不然整片一直停在「读文件」阶段。
+- **落点**：迁移 `0040-mcp-channel.sql`（`capability_params` + `capability_param_values`，密文
+  `iv(12)||tag(16)||ct`，两条部分唯一索引因为 PG 的 NULL 互不相等）、`portal/src/secrets.js`
+  （`parseKey` 无默认值 / `aadFor` 含 fde_id / `resolveSlots` fde 覆盖 global）、`market.js` MCP 面
+  （`validateMcpFields`/`validateSlots`/`replaceParams`/`listSlots`/`setSlotValues`/
+  `listMcpServersForFde`/`resolveMcpServersForFde`/`mcpSecretsReadyMap`/`recordToolsCache` + 发布/安装/
+  启用的 kind 分支）、`materializer.js`（`renderMcpJson` 自定义 `{version,servers[]}` 形状、不含值、
+  direct 超 64 KiB 降级 deferred）、`http.js`（secrets 只写不读两端口 + 内部 `mcp/servers`、
+  `mcp/tools-cache`）、`config.js` + compose 接 `MCP_SECRET_KEY`（**无默认值**，缺 key ⇒ 503
+  `secret_key_missing`）。
+- **写实现时抓到的三个真缺陷**（都不是「测试写错了」）：
+  1. `validateMcpFields` 把 `transport` 只放进返回值、**没放进 manifest** ⇒ 物化出来的 `mcp.json`
+     没有传输方式，runner 侧无从选择（MC-3 判据钉住「manifest 必须带 transport」）。
+  2. 发布闸门对 MCP 也要求「当前版本有包」⇒ MCP 条目**永远发不出去**（它本来就没有包）。改成按
+     `kind` 分流：MCP 的闸门是「配置完整」（`command` 或 `url`），错误码仍是 `capability_not_published`
+     但 `details.reason='mcp_config_incomplete'`。
+  3. 「启用前校验必填槽」写在了**状态迁移**分支里 ⇒ `enabled:true → true`（已经是启用态）直接绕过，
+     而槽值恰恰最可能在启用后被删掉/key 轮换后解不开。改成「只要请求 enabled=true 就查」。
+- **门禁连带**：新增迁移会让 `portal/test/migrations.test.js` 里 19 处 `head=0039`、6 处
+  `Array.from({length:39})`、4 处「倒数第 N 支」全部漂移（这是该文件的既有设计：每加一支迁移都要跟着改）；
+  `config.js` 插了 5 行让 `deploy/env-legs-exceptions.json` 里 `FDE_WORKER_UID` 的 `config.js:391`
+  坐标失效（`deploy-env-delegate` 的「where 是坐标不是说明文字」那条会红）——两处都跟着改了。
+- **验证**：`node --test 'portal/test/*.test.js'` ⇒ **2125 pass / rc=0**（含新增 `secrets.test.js` 7 条、
+  `market-mcp.test.js` 6 条；后者是**反向判据**：跨 FDE 搬密文必须解不开、`hidden` 必须整条不物化、
+  缺槽必须 409、`detached:true` 必须被红色形状拒）。
+- **文档**：`docs/api/portal.md` §4.18（发布体 / 配置槽只写不读 / 内部下发 / 用户面差异 + 错误码）。
