@@ -42,7 +42,7 @@ import { AGENTS_MD_MAX_FILE_BYTES } from '../../runner/lib/agents-md.js';
 import {
   ADDENDUM_MAX_BYTES, OVERRIDE_MAX_BYTES, TITLE_PROMPT_MAX_BYTES, AGENTS_MD_INJECT_MAX_BYTES,
   AUDIT_ACTION, AUDIT_TARGET, DEFAULT_READ_TIMEOUT_MS, PROMPT_FIELDS,
-  READONLY_PROMPT_KEYS, READ_TIMEOUT_ENV_VAR,
+  READONLY_PROMPT_KEYS, READ_TIMEOUT_ENV_VAR, SAVE_SQL,
   getPlatformPrompts, readTimeoutMs, resolveEffectiveAgentsMd, resolveEffectiveTitlePrompt,
   resolveFromRow, updatePlatformPrompts,
 } from '../src/platform-prompts.js';
@@ -609,6 +609,105 @@ test('P6b 等价性：SQL 侧那条渲染算术与 renderHomeAgentsMd 的真实�
       `${label}：默认态的预算常量就是那份文件的字节数`,
     );
   }
+});
+
+/**
+ * 评审 R8：SQL 侧那段渲染算术的**形状**闸（不是对账）。
+ *
+ * 为什么要常驻一条：`npm test` 是裸 `node --test`，`portal/integration/` 下的 `*.mjs` 不匹配它的
+ * 测试文件名规则 ⇒ **假池从不执行 `SAVE_SQL`** 里那段 `octet_length(...)`。实测：把
+ * `$5::bigint + octet_length(nxt.addendum)` 改回 `$5::bigint`（= 追加段那一列自己的字节不再进闸），
+ * `npm test` 照样全绿 —— 拦住超限的是 JS 预闸（`P6`/`P13` 只跑假池）；只有真库腿 `P6b-db` 会红，
+ * 而它不在 `npm test`/CI（R1 已把这句写进契约 §4.18-3）。
+ *
+ * 本格子挡的是「**SQL 那半边漂移**」：只钉算式的**片段形状**（两列各自的字节项 + 同一份常量预算），
+ * 算式真值对账仍然归 `P6b-db`（它在真 PG 上逐组比 `gate.rendered_bytes` ≡ `agentsMdRenderedBytes`）。
+ * 两边分工：这里挡住「改坏而默认流水线上没人报警」，那边挡住「写法对但值不对」。
+ */
+
+/** `SAVE_SQL` 里 `gate` 那段 `rendered_bytes` 的算式文本（取不到 ⇒ 所有片段全算缺）。 */
+function renderedBytesArithmeticOf(sql) {
+  const gateAt = sql.search(/\bgate\s+AS\s*\(/i);
+  const aliasAt = sql.search(/\bAS\s+rendered_bytes\b/i);
+  if (gateAt < 0 || aliasAt < 0 || aliasAt < gateAt) return '';
+  return sql.slice(gateAt, aliasAt);
+}
+
+/**
+ * 算式里必须看得见的片段（**逐条点名**：失败信息里就是「少了哪一列 / 哪一份常量」）。
+ * `column` 非空 = 该片段代表那一列自己的字节项（退化式必须被点到名）。
+ */
+const RENDERED_BYTES_FRAGMENTS = [
+  {
+    name: 'agents_md_addendum 那一列自己的字节项（octet_length(… agents_md_addendum …)）',
+    column: 'agents_md_addendum',
+    re: /octet_length\(\s*(?:convert_to\(\s*)?(?:nxt\.)?addendum\b/i,
+  },
+  {
+    name: 'agents_md_override 那一列自己的字节项（octet_length(… agents_md_override …)）',
+    column: 'agents_md_override',
+    re: /octet_length\(\s*(?:convert_to\(\s*)?(?:nxt\.)?override\b/i,
+  },
+  { name: '常量 $4::bigint = 内置模板字节（agentsMdRenderBudget().templateBytes）', re: /\$4::bigint/ },
+  { name: '常量 $5::bigint = 追加段开销（addendumOverheadBytes：节标题+引言+分隔）', re: /\$5::bigint/ },
+  { name: '常量 $6::bigint = 标识行尾部（identityTailBytes，最坏情况名那一份）', re: /\$6::bigint/ },
+];
+
+/** 算式里缺的片段名（干净 ⇒ 空数组）；算式本身找不到时返回一条「找不到」加上全部片段名。 */
+function renderedBytesShapeGaps(sql) {
+  const expr = renderedBytesArithmeticOf(sql);
+  if (expr === '') {
+    return ['找不到 `gate` CTE 里那段 `AS rendered_bytes` 算式 ⇒ 逐条无法判定，当作全缺：'
+      + RENDERED_BYTES_FRAGMENTS.map((f) => f.name).join('；')];
+  }
+  const missing = RENDERED_BYTES_FRAGMENTS.filter((f) => !f.re.test(expr)).map((f) => f.name);
+  if (!/rendered_bytes\s*<=\s*\$7::bigint/i.test(sql)) {
+    missing.push('比较式 `WHERE rendered_bytes <= $7::bigint`（闸得真的拦得住 INSERT）');
+  }
+  return missing;
+}
+
+test('P6c SQL 侧渲染闸的形状闸：rendered_bytes 必须显式算**两列各自的字节** + 同一份常量预算（评审 R8）', () => {
+  // 事实链（验收员实证）：假池不执行 SQL ⇒ SQL 那半边漂移在默认流水线上「改坏了照样绿」。
+  // 所以这里不跑 SQL，只钉文本形状；真算式对账归 `P6b-db`（不在 `npm test`/CI，见本节上面的注释）。
+  const gaps = renderedBytesShapeGaps(SAVE_SQL);
+  assert.deepEqual(gaps, [], `SAVE_SQL 里那段渲染算术缺了这些东西（逐条点名）：\n${gaps.join('\n')}`);
+
+  // 常驻反向自证·①「只算一列」：拿验收员实测的那个退化式（就是上面那段历史现场）喂同一个函数
+  // ⇒ 必须判红，且**点名缺的是追加段那一列**（不是泛泛的「少了 octet_length」）。
+  const onlyOverride = SAVE_SQL.replace('$5::bigint + octet_length(nxt.addendum)', '$5::bigint');
+  assert.notEqual(onlyOverride, SAVE_SQL, '反向自证失效：退化式没换上（字符串对不上了，先修这里）');
+  const gapsOne = renderedBytesShapeGaps(onlyOverride);
+  assert.deepEqual(gapsOne, [RENDERED_BYTES_FRAGMENTS[0].name],
+    `只算 override 一列时必须恰好点名「少了 agents_md_addendum 那一列」，实得：${JSON.stringify(gapsOne)}`);
+
+  // 常驻反向自证·②「一列都不算」：两列的字节项全拿掉 ⇒ 两条点名都在（不许只报一条）。
+  const noColumns = onlyOverride
+    .replace('octet_length(nxt.override)', '0::bigint')
+    .replace('octet_length(nxt.addendum)', '0::bigint');
+  assert.notEqual(noColumns, onlyOverride, '反向自证失效：override 那一列没拆掉');
+  assert.ok(!/octet_length\(\s*nxt\.(addendum|override)/.test(noColumns), '退化式里确实一列都没算了');
+  const gapsNone = renderedBytesShapeGaps(noColumns);
+  assert.ok(gapsNone.includes(RENDERED_BYTES_FRAGMENTS[0].name)
+    && gapsNone.includes(RENDERED_BYTES_FRAGMENTS[1].name),
+    `一列都不算时两列都要被点名，实得：${JSON.stringify(gapsNone)}`);
+
+  // 常驻反向自证·③常量预算不能被拄成硬数字：拿掉 $5 ⇒ 必须点名「追加段开销」那一份常量。
+  const noOverhead = SAVE_SQL.replace('THEN $5::bigint +', 'THEN');
+  assert.notEqual(noOverhead, SAVE_SQL, '反向自证失效：$5 没拆掉');
+  assert.ok(renderedBytesShapeGaps(noOverhead).includes(RENDERED_BYTES_FRAGMENTS[3].name),
+    '少了 $5（追加段开销）时必须点名那一份常量');
+
+  // 送参那一腿也要钉住：SQL 里**不拄字节数字**（常量只有 JS 一处 ⇒ 改了预算，SQL 自动跟着走）。
+  // 口径同 §4.15-4 的 `$5/$6`；退化式（把 `$5::bigint` 拄成 `244::bigint`）必红。
+  const literals = [...SAVE_SQL.matchAll(/\b\d{3,}\b/g)].map((m) => m[0]);
+  assert.deepEqual(literals, [],
+    `SAVE_SQL 里不许出现硬编码的字节常量（实得 ${JSON.stringify(literals)}）`);
+  // 反向自证：把 `$5::bigint` 拄成今天那个数（244）⇒ 必须点名「少了常量 $5」那一份。
+  const hardcoded = SAVE_SQL.replace('$5::bigint', '244::bigint');
+  assert.notEqual(hardcoded, SAVE_SQL, '反向自证失效：$5 没换上（字符串对不上了，先修这里）');
+  assert.ok(renderedBytesShapeGaps(hardcoded).includes(RENDERED_BYTES_FRAGMENTS[3].name),
+    '把常量拄成硬数字时必须点名「少了 $5 追加段开销」那一份');
 });
 
 test('P13 闸按最坏情况标识行而非示例名（评审 F2）：示例名装得下、最坏名装不下 ⇒ 400 且一格不写', async () => {
