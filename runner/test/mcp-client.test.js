@@ -82,7 +82,6 @@ function fakeStdioSpawn(behaviour = {}) {
     child.stdout = stdout;
     child.stderr = stderr;
     const send = (msg) => {
-      frames.push(msg);
       stdout.write(`${JSON.stringify(msg)}\n`);
     };
     let buf = '';
@@ -95,6 +94,8 @@ function fakeStdioSpawn(behaviour = {}) {
         buf = buf.slice(i + 1);
         if (line !== '') {
           const msg = JSON.parse(line);
+          // 账上记的是**收到的帧**（请求与通知）：重试次数、握手顺序、取消通知全靠它数。
+          frames.push(msg);
           const handled = behaviour.onRequest ? behaviour.onRequest(msg, send) : false;
           if (!handled) defaultReply(msg, send);
         }
@@ -194,7 +195,7 @@ test('MC-3 env 白名单（§10.9）：只给 PATH/HOME/LANG/TZ/TMPDIR + 槽位�
   await client.listTools();
   const options = srv.spawnCalls[0].options;
   const env = options.env;
-  assert.deepEqual(Object.keys(env).sort(), ['ECHO_PREFIX', 'HOME', 'LANG', 'PATH', 'TZ', 'TMPDIR'],
+  assert.deepEqual(Object.keys(env).sort(), ['ECHO_PREFIX', 'HOME', 'LANG', 'PATH', 'TMPDIR', 'TZ'],
     `多传一个键就是多送一份平台身份：${JSON.stringify(Object.keys(env))}`);
   assert.equal(env.ECHO_PREFIX, 'CANARY_v', '槽位值必须真的注入（e2e 的 PREFIX:hello 全靠它）');
   assert.equal(options.detached, true, 'detached:true 是进程组回收的前提（§6.8）');
