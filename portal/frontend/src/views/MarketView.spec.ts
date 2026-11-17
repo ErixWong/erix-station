@@ -11,7 +11,8 @@
 //   ⑤ 启停：POST `…/enabled` 的请求体是 `{enabled:false}`（布尔，不是字符串）
 //   ⑥ 卸载：POST `…/uninstall` + 卡片退回未安装
 //   ⑦ 详情：GET `…/items/<slug>` ⇒ when_to_use / SKILL.md 正文 / 工具与参数
-//   ⑧ `kind='mcp'`（§9）：没有安装按钮，只有「P0 不消费 MCP」
+//   ⑧ `kind='mcp'`（#608 §8.2）：kind 徽标 / reason 走 i18n / exposure + 工具数 /
+//      `secrets_ready=false` ⇒ 启用禁用且**零请求** / **整页没有填值输入框**
 //   ⑨ 返回工作台的链接存在（`#/`）
 //   ⑩ 双语成对：`market.*` 的叶子键两边一致（zh 真中文、en 真英文）
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -362,13 +363,124 @@ describe('⑦ 详情', () => {
   });
 });
 
-describe('⑧ MCP 条目（§9：P0 不做消费者）', () => {
-  it('kind=mcp ⇒ 标出「MCP 条目」，没有安装按钮', async () => {
-    const { wrapper } = await mountWith((c) => (c.url === MARKET_ITEMS_PATH
-      ? listResponse([freshItem({ slug: 'mcp-thing', kind: 'mcp' })])
-      : undefined));
-    expect(exists(wrapper, 'market-kind-mcp')).toBe(true);
-    expect(exists(wrapper, 'market-install-mcp-thing')).toBe(false);
+describe('⑧ MCP 条目（#608 §8.2）', () => {
+  /** 一条已装但缺凭据的 MCP 条目（§7.2：缺凭据**允许安装**，不可启用）。 */
+  function mcpItem(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      slug: 'srch', kind: 'mcp', name: '检索服务', summary: '外部检索',
+      version: '1.0.0', tags: ['search'], exposure: 'deferred', reason: 'stateful',
+      secrets_ready: false, installed: true, enabled: false,
+      ...over,
+    };
+  }
+
+  /** 列表 + 动作的复合桩：列表照回，动作交给 `onAction`。 */
+  function withMcp(items: unknown[], onAction?: (call: Recorded) => Response | undefined): Handler {
+    return (call) => {
+      if (call.method === 'GET' && call.url === MARKET_ITEMS_PATH) return listResponse(items);
+      return onAction === undefined ? undefined : onAction(call);
+    };
+  }
+
+  it('kind 徽标：mcp 与 skill 各说一句人话，不把英文枚举喷给人看', async () => {
+    const { wrapper } = await mountWith(withMcp([mcpItem(), freshItem()]));
+    expect(text(wrapper, 'market-kind-srch')).toContain('MCP 服务');
+    expect(text(wrapper, 'market-kind-srch')).not.toContain('mcp');
+    expect(text(wrapper, 'market-kind-github')).toContain('技能包');
+    expect(text(wrapper, 'market-kind-github')).not.toContain('skill');
+  });
+
+  it('准入理由走 i18n（§4.4）；skill 带了理由 ⇒ 忽略（整段不出）', async () => {
+    const { wrapper } = await mountWith(withMcp([
+      mcpItem({ reason: 'credential_boundary' }),
+      freshItem({ reason: 'stateful' }),
+    ]));
+    expect(text(wrapper, 'market-reason-srch')).toContain('凭据边界');
+    expect(text(wrapper, 'market-reason-srch')).not.toContain('credential_boundary');
+    expect(exists(wrapper, 'market-reason-github')).toBe(false);
+  });
+
+  it('skill 卡不出理由/暴露档那两行；MCP 卡出 exposure，工具数缺 ⇒ 「未知」而不是 0', async () => {
+    const { wrapper } = await mountWith(withMcp([mcpItem({ exposure: 'hidden' }), freshItem()]));
+    expect(exists(wrapper, 'market-exposure-srch')).toBe(true);
+    expect(text(wrapper, 'market-exposure-srch')).toContain('隐藏');
+    expect(exists(wrapper, 'market-exposure-github')).toBe(false);
+    // 没有 `tool_count`（还没 FDE 连过）⇒ 不拿 0 冒充「没工具」
+    expect(text(wrapper, 'market-tools-srch')).toContain('工具数未知');
+    expect(text(wrapper, 'market-tools-srch')).not.toContain('0');
+  });
+
+  it('工具数真下发了 ⇒ 就报那个数（不因为种类是 mcp 就改成「未知」）', async () => {
+    const { wrapper } = await mountWith(withMcp([mcpItem({ tool_count: 7 })]));
+    expect(text(wrapper, 'market-tools-srch')).toContain('7');
+    expect(text(wrapper, 'market-tools-srch')).not.toContain('未知');
+  });
+
+  it('secrets_ready=false ⇒ 启用 disabled + 「等待管理员配置凭据」，点了也**零请求**', async () => {
+    const { wrapper, calls } = await mountWith(withMcp([mcpItem({ secrets_ready: false })]));
+    const toggle = wrapper.get('[data-test="market-toggle-srch"]');
+    expect((toggle.element as HTMLButtonElement).disabled).toBe(true);
+    expect(text(wrapper, 'market-secrets-pending-srch')).toContain('等待管理员配置凭据');
+    await toggle.trigger('click');
+    await flushPromises();
+    expect(posts(calls, '/enabled')).toHaveLength(0);
+  });
+
+  it('凭据齐了（secrets_ready=true）⇒ 启用可点，POST `…/enabled` 带 {enabled:true}', async () => {
+    const { wrapper, calls } = await mountWith(withMcp([mcpItem({ secrets_ready: true })], (call) =>
+      (call.method === 'POST' && call.url === `${marketUserItemPath('srch')}/enabled`
+        ? json(200, { item: mcpItem({ secrets_ready: true, installed: true, enabled: true }) })
+        : undefined)));
+    const toggle = wrapper.get('[data-test="market-toggle-srch"]');
+    expect((toggle.element as HTMLButtonElement).disabled).toBe(false);
+    expect(exists(wrapper, 'market-secrets-pending-srch')).toBe(false);
+    await toggle.trigger('click');
+    await flushPromises();
+    const hit = posts(calls, '/enabled');
+    expect(hit).toHaveLength(1);
+    expect(hit[0].body).toEqual({ enabled: true });
+  });
+
+  it('服务端没说 secrets_ready ⇒ 不拦（以服务端 409 为准），也不摆「等待配置」那句', async () => {
+    const { wrapper, calls } = await mountWith(withMcp([mcpItem({ secrets_ready: undefined })], (call) =>
+      (call.method === 'POST' && call.url === `${marketUserItemPath('srch')}/enabled`
+        ? fail(409, 'capability_secret_missing', 'missing slots', { missing: ['SRCH_TOKEN'] })
+        : undefined)));
+    expect((wrapper.get('[data-test="market-toggle-srch"]').element as HTMLButtonElement).disabled).toBe(false);
+    expect(exists(wrapper, 'market-secrets-pending-srch')).toBe(false);
+    await wrapper.get('[data-test="market-toggle-srch"]').trigger('click');
+    await flushPromises();
+    expect(posts(calls, '/enabled')).toHaveLength(1);
+    // 409 的文案要点名缺哪几个槽（§7.3 details.missing）
+    expect(text(wrapper, 'market-error')).toContain('SRCH_TOKEN');
+  });
+
+  it('缺凭据也允许安装（§7.2：install 只写绑定）；装了才能看到那颗禁用的启用按钮', async () => {
+    const { wrapper, calls } = await mountWith(withMcp(
+      [mcpItem({ installed: false, enabled: false, secrets_ready: false })],
+      (call) => (call.method === 'POST' && call.url === `${marketUserItemPath('srch')}/install`
+        ? json(200, { item: mcpItem({ installed: true }) })
+        : undefined),
+    ));
+    expect(exists(wrapper, 'market-install-srch')).toBe(true);
+    await wrapper.get('[data-test="market-install-srch"]').trigger('click');
+    await flushPromises();
+    expect(posts(calls, '/install')).toHaveLength(1);
+  });
+
+  it('用户面没有填值入口：列表与详情里 **一个 input/textarea 都没有**（DOM 断言）', async () => {
+    const { wrapper } = await mountWith((call) => {
+      if (call.method === 'GET' && call.url === MARKET_ITEMS_PATH) return listResponse([mcpItem()]);
+      if (call.method === 'GET' && call.url === marketUserItemPath('srch')) {
+        return json(200, { slug: 'srch', name: '检索服务', when_to_use: '要查资料时', exposure: 'deferred' });
+      }
+      return undefined;
+    });
+    expect(wrapper.findAll('input, textarea')).toHaveLength(0);
+    await wrapper.get('[data-test="market-detail-srch"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.findAll('input, textarea')).toHaveLength(0);
+    expect(exists(wrapper, 'market-detail')).toBe(true);
   });
 });
 
