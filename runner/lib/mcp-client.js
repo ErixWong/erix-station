@@ -144,7 +144,7 @@ export function redactValues(text, values = {}) {
  * 单独抽出且按字节裁：按 `String.length` 裁会在中文上裁出越界的尾巴，而这个上限存在的
  * 目的就是给一个话痨 server 定住内存。越界的半个多字节字符会变成替代符（显示层代价，不是错）。
  */
-export function appendStderrTail(tail, chunk, maxBytes = STDERR_KEEP_BYTES) {
+export function appendStderrTail(tail, chunk, maxBytes = Number.POSITIVE_INFINITY) {
   const merged = `${String(tail ?? '')}${String(chunk ?? '')}`;
   const bytes = Buffer.byteLength(merged, 'utf8');
   if (bytes <= maxBytes) return merged;
@@ -217,6 +217,8 @@ function createStdioTransport({
   log = null,
   spawnImpl = nodeSpawn,
   onProcess = () => {},
+  // 子进程自己死了（不是我们关的）时把死因上报给上层状态机；上层用它填 `status().error`。
+  onExited = () => {},
   killImpl = (pid, sig) => process.kill(pid, sig),
   killGraceMs = CLOSE_GRACE_MS,
   baseEnv = process.env,
@@ -307,20 +309,27 @@ function createStdioTransport({
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (chunk) => {
       // 只留末 4 KiB（§1）：留全文等于让一个话痨 server 决定我们的内存上限。
-      stderrTail = appendStderrTail(stderrTail, chunk);
+      // 上限在**调用处**写明（而不是当默认参数）：这个函数同时给测试用来自证「按字节裁」。
+      stderrTail = appendStderrTail(stderrTail, chunk, STDERR_KEEP_BYTES);
     });
     child.on('exit', (code, signal) => {
       gone = { code, signal };
       notifyProcess('exit', child?.pid ?? 0);
-      settleAll(mcpError(
+      const why = mcpError(
         MCP_ERRORS.UNREACHABLE,
         `MCP server 进程退出（code=${String(code)} signal=${String(signal)}）`
         + ` stderr_tail=${redactValues(stderrTail, values).slice(-200)}`,
-      ));
+      );
+      // 没在途请求时也要把死因报给上层：否则 `status()` 只能回 `ready`，而进程早没了
+      // ——运维看 `mcp({action:"status"})` 会得到一个与事实相反的答案。
+      onExited(why);
+      settleAll(why);
     });
     child.on('error', (err) => {
       gone = { code: null, signal: null };
-      settleAll(mcpError(MCP_ERRORS.UNREACHABLE, `MCP 子进程错误：${String(err?.message ?? err)}`));
+      const why = mcpError(MCP_ERRORS.UNREACHABLE, `MCP 子进程错误：${String(err?.message ?? err)}`);
+      onExited(why);
+      settleAll(why);
     });
     return child;
   }
@@ -351,22 +360,18 @@ function createStdioTransport({
     },
     request(method, params, { signal, timeoutMs: perCall } = {}) {
       const limit = resolveTimeoutMs(perCall ?? timeoutMs);
-      let entry;
+      const id = nextId++;
       const promise = new Promise((resolve, reject) => {
-        let id;
-        try {
-          id = nextId++;
-          writeMessage({ jsonrpc: '2.0', id, method, params: params ?? {} });
-        } catch (err) {
-          reject(err);
-          return;
-        }
+        const finish = (fn, arg) => {
+          if (signal) signal.removeEventListener('abort', onAbort);
+          fn(arg);
+        };
         // 超时后**不重试**（§1）：直接 abort 这一条请求并把它从账上摘掉，
         // 否则迟到的响应会去 resolve 一个模型早就忘了的调用。
         const timer = setTimeout(() => {
           if (!pending.has(id)) return;
           pending.delete(id);
-          reject(mcpError(MCP_ERRORS.TIMEOUT, `MCP 请求超时（${method}，${limit} ms）`));
+          finish(reject, mcpError(MCP_ERRORS.TIMEOUT, `MCP 请求超时（${method}，${limit} ms）`));
         }, limit);
         const onAbort = () => {
           if (!pending.has(id)) return;
@@ -382,33 +387,42 @@ function createStdioTransport({
               })}\n`);
             } catch { /* 通道已死：没得通知 */ }
           }
-          reject(mcpError(MCP_ERRORS.ABORTED, `MCP 请求被宿主中止（${method}）`));
+          finish(reject, mcpError(MCP_ERRORS.ABORTED, `MCP 请求被宿主中止（${method}）`));
         };
+        // 账必须**先登记再写帧**：响应可能在 `write()` 的同一个调用栈里就回来（测试里的假
+        // server 就是同进程 PassThrough），晚一步登记就等于把响应认成 notification 扔掉，
+        // 然后干等到超时——这条不是理论风险，是实测到的。
+        const entry = {
+          timer,
+          resolve: (v) => finish(resolve, v),
+          reject: (e) => finish(reject, e),
+        };
+        pending.set(id, entry);
         if (signal) {
           if (signal.aborted) {
             clearTimeout(timer);
-            onAbort();
+            pending.delete(id);
+            reject(mcpError(MCP_ERRORS.ABORTED, `MCP 请求被宿主中止（${method}）`));
             return;
           }
           signal.addEventListener('abort', onAbort, { once: true });
         }
-        entry = {
-          resolve: (v) => {
-            if (signal) signal.removeEventListener('abort', onAbort);
-            resolve(v);
-          },
-          reject: (e) => {
-            if (signal) signal.removeEventListener('abort', onAbort);
-            reject(e);
-          },
-          timer,
-        };
-        pending.set(id, entry);
+        try {
+          writeMessage({ jsonrpc: '2.0', id, method, params: params ?? {} });
+        } catch (err) {
+          pending.delete(id);
+          clearTimeout(timer);
+          if (signal) signal.removeEventListener('abort', onAbort);
+          reject(err);
+        }
       });
       return promise;
     },
     notify(method, params) {
       try {
+        // 通知**不携带** id（JSON-RPC 定义），但**要占号**：与请求共用一个计数器，
+        // 这样同一条会话上永远不会出现「响应 id 撞车」这种无法归因的歧义。
+        nextId += 1;
         writeMessage({ jsonrpc: '2.0', method, params: params ?? {} });
       } catch (err) {
         emitLog(log, 'debug', 'mcp notify dropped', { method, err: String(err?.message ?? err) });
@@ -664,6 +678,7 @@ function createHttpTransport({
       return msg.result;
     },
     async notify(method, params, { signal, timeoutMs: perCall } = {}) {
+      nextId += 1;   // 同 stdio：通知不带 id，但占号，保证 id 在整条会话上唯一
       try {
         await post({ jsonrpc: '2.0', method, params: params ?? {} }, { signal, timeoutMs: perCall });
       } catch (err) {
@@ -725,6 +740,9 @@ export function createMcpClient({
   }
   const values = resolved?.values && typeof resolved.values === 'object' ? resolved.values : {};
   const timeoutMs = resolveTimeoutMs(server.timeout_ms);
+  // URL 在**装配时**就判（§1：只允许 http/https）：拖到第一次调用才报错，模型看到的是
+  // 「server 挂了」，而事实是配置根本不可用；`direct` 档的工具已经上了工具面，必须当场拒。
+  if ((server.transport || (server.url ? 'http' : 'stdio')) === 'http') assertHttpUrl(server.url);
   /** §6.4 状态机：idle → starting → ready → error（连续 3 次 ⇒ fused，直到 run 结束）。 */
   let state = 'idle';
   let lastError = null;
@@ -736,6 +754,12 @@ export function createMcpClient({
 
   const transportDeps = {
     values, log, spawnImpl, fetchImpl, onProcess, killImpl, baseEnv, delay, timeoutMs,
+    // 子进程自己死了（OOM / 自己退出）：把死因留在 `status()` 上，并把状态从 `ready`
+    // 拉下来。我们主动 `close()` 引发的那个 exit **不算故障**（否则正常收尾也会报 error）。
+    onExited: (err) => {
+      lastError = err?.message ?? String(err);
+      if (!closing && state !== 'fused' && state !== 'closed') state = 'error';
+    },
   };
 
   async function destroyTransport(t) {
@@ -938,7 +962,14 @@ export function createMcpPool({
       for (const c of clients.values()) {
         if (c.exposure !== 'direct') continue;
         for (const tool of c.tools) {
-          out.push({ server: c.name, tool: tool?.name, description: tool?.description ?? '', tool });
+          // ⚠ 同一个字面量里不能两次写 `tool:`（后者会盖掉前者）：`tool` 是**工具名**，
+          // 原始声明另存 `definition`（direct 展开时要用它的 inputSchema）。
+          out.push({
+            server: c.name,
+            tool: tool?.name,
+            description: tool?.description ?? '',
+            definition: tool,
+          });
         }
       }
       return out.filter((row) => typeof row.tool === 'string' && row.tool !== '');
