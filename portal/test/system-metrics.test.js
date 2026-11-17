@@ -961,6 +961,38 @@ test('#650 metricsApiPayload：DB 挂了 ⇒ seriesError 给原因，latest 照�
   clearSeriesCache();
 });
 
+// `enabled`（前端「采样已关闭」文案的唯一依据，issue #650 前端单）。
+// 为什么不能只靠 `latest === null`：那个形状同时包含「采样已关闭」与「刚重启还没第一拍」
+// 两个完全不同结论（前者要去改 env 重启，后者只要等 30s），前端自己分不出来。
+test('#650 metricsApiPayload：采样器在跑且启用 ⇒ enabled:true（additive，不改其余字段）', async () => {
+  clearSeriesCache();
+  const clock = makeClock();
+  const payload = await metricsApiPayload({
+    pool: new MetricsPool(), sampler: { latest: () => makeSample(), enabled: true }, now: clock.now,
+  });
+  assert.equal(payload.enabled, true, '采样器句柄自己的 enabled 直接搬过去（前端不许反推）');
+  assert.notEqual(payload.latest, null, '其余字段形状不变');
+  assert.equal(payload.seriesError, null);
+  clearSeriesCache();
+});
+
+test('#650 metricsApiPayload：没有采样器 / 采样器被关 ⇒ enabled:false（不是 null、不是缺键）', async () => {
+  clearSeriesCache();
+  const clock = makeClock();
+  // `ENABLED=0` 时 `cli.js serve` 根本不建采样器 ⇒ `http.js` 递进来的是 `null`。
+  const noSampler = await metricsApiPayload({ pool: new MetricsPool(), now: clock.now });
+  assert.equal(noSampler.enabled, false, '没有采样器 ⇒ false，页面才能说「采样已关闭」');
+  assert.equal(noSampler.latest, null, '两个读数各自独立：这一格是 false 不改变 latest 的 null');
+  // 句柄存在但 `enabled:false`（建了没跑）与脏值（`'true'` / 缺键）⇒ 只认真布尔，其余都是 false。
+  for (const enabled of [false, 'true', 1, null, undefined]) {
+    const payload = await metricsApiPayload({
+      pool: new MetricsPool(), sampler: { latest: () => null, enabled }, now: clock.now,
+    });
+    assert.equal(payload.enabled, false, `enabled=${JSON.stringify(enabled)} ⇒ false（只认真布尔）`);
+  }
+  clearSeriesCache();
+});
+
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // 9) 读面（HTTP 层）：admin 200 / 非 admin 403 / 降级不报错
 // ─────────────────────────────────────────────────────────────────────────────────────────
