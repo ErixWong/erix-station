@@ -5028,7 +5028,9 @@ async function handleInternal(req, res, ctx, url) {
     }
     let out;
     try {
-      out = await market.resolveMcpServersForFde({ pool: ctx.pool, fde, key: ctx.config.mcpSecretKey });
+      out = await market.resolveMcpServersForFde({
+        pool: ctx.pool, fde, key: ctx.config.mcpSecretKey, log: ctx.log,
+      });
     } catch (err) {
       // 缺 key / 解密全失败 ⇒ 降级成「一台都没有」，让 run 正常继续（不把 run 打死）。
       ctx.log?.warn?.(`[internal/mcp] resolve failed fde=${fde.name}: ${err.message}`);

@@ -1627,7 +1627,7 @@ export async function listMcpServersForFde(pool, fdeId) {
  * §6.1 内部通道的读面：给 agentd 的「已解析」清单（**含明文值**）。
  * 只给 `published && enabled && 非 hidden`；缺必填槽 ⇒ 进 `missing` 且**不进 servers**（fail-closed）。
  */
-export async function resolveMcpServersForFde({ pool, fde, key }) {
+export async function resolveMcpServersForFde({ pool, fde, key, log = null }) {
   const servers = await listMcpServersForFde(pool, fde.id);
   const ids = new Map((await pool.query(
     `SELECT id, slug FROM capability_items WHERE slug = ANY($1::text[])`, [servers.map((s) => s.name)])).rows
@@ -1636,7 +1636,7 @@ export async function resolveMcpServersForFde({ pool, fde, key }) {
   const missing = [];
   for (const s of servers) {
     const itemId = ids.get(s.name);
-    const { values, missing: miss } = await resolveSlots({ pool, itemId, fdeId: fde.id, key });
+    const { values, missing: miss } = await resolveSlots({ pool, itemId, fdeId: fde.id, key, log });
     if (miss.length > 0) { missing.push({ name: s.name, slots: miss }); continue; }
     resolved.push({ ...s, values });
   }
