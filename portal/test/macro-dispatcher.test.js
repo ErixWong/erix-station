@@ -195,3 +195,58 @@ test('附. extractReviewRunId：evidence.runId 优先，否则从 anchor run:<id
   assert.equal(extractReviewRunId({ anchor: 'run:a-id' }), 'a-id');
   assert.equal(extractReviewRunId({ anchor: 'clock:2026-11-16' }), null);
 });
+
+// —— #624 判据 6：到期意图（criterion=tick + bucket=expiry）要有**正确**的消费者 ——
+// 到期是**正常生命周期结束**：只说一声 + 落 `done`。以前 dispatcher 只按 `templateKind`
+// 分派 ⇒ `scheduled-task` 的到期会**真的再起一个 run**（把「不想再跑了」执行成「再跑一次」）。
+test('6. 到期意图：不起 run、deliverIntent 说一声、账落 done（不是 failed）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T6'));
+    const intent = await claimedIntent(pool, scene, {
+      anchor: `assignment:${scene.assignmentId}`, bucket: 'expiry', criterion: 'tick',
+    });
+    let scheduledCalls = 0;
+    const delivered = [];
+    const dispatcher = createIntentDispatcher({
+      pool,
+      executeScheduledIntent: async () => { scheduledCalls += 1; return { status: 'done' }; },
+      deliverIntent: async (_pool, it, opts) => { delivered.push({ it, opts }); },
+      log: { warn() {}, info() {} },
+    });
+    const out = await dispatcher.dispatch([intent]);
+    assert.equal(out.dispatched, 1);
+    assert.equal(out.failed, 0);
+    // ⚠ 反向自证（语义那一半）：删掉 dispatchOne 里的 `isExpiryIntent` 前置支 ⇒ 这里
+    //   `scheduledCalls` 变 1（到期把任务又跑了一遍）、且账不是 done。
+    assert.equal(scheduledCalls, 0, '到期不是「再跑一次」，不许叫执行器');
+    assert.equal(delivered.length, 1, '到期要说一声（#624 的「到期通知无消费者」）');
+    assert.deepEqual(delivered[0].opts.recipients, [scene.userId], '收件人是订阅者本人');
+    assert.match(delivered[0].opts.title, /到期/);
+    assert.match(delivered[0].opts.body, /停用/);
+    const row = await rowOf(pool, intent.macroRunId);
+    // ⚠ 到期是正常结束 ⇒ **done**；写成 failed 会把每次到期显示成一次故障。
+    assert.equal(row.status, 'done', `到期账必须 done（实际 ${row.status}）`);
+    assert.equal(row.reason ?? null, null, 'done 不该带失败 reason');
+  });
+});
+
+// —— 判据 7：普通（非到期）通知意图仍走原路，不被到期支误吞 ——
+test('7. 非到期的 run-notify 意图仍按 kind 分派（到期支不是万能支）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T7'));
+    const intent = await claimedIntent(pool, scene, {
+      kind: 'run-notify', anchor: 'run:r-1', bucket: 'b0', criterion: 'terminal',
+    });
+    const delivered = [];
+    const dispatcher = createIntentDispatcher({
+      pool,
+      deliverIntent: async (_pool, it, opts) => { delivered.push({ it, opts }); },
+      log: { warn() {}, info() {} },
+    });
+    const out = await dispatcher.dispatch([intent]);
+    assert.equal(out.dispatched, 1);
+    assert.equal(delivered.length, 1, 'terminal/run-notify 仍要被投递');
+    assert.match(delivered[0].opts.title, /daily-/, '标题仍是宏名（不是到期文案）');
+    assert.equal((await rowOf(pool, intent.macroRunId)).status, 'done');
+  });
+});

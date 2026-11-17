@@ -47,7 +47,17 @@ export const MACRO_SCOPES = SCOPES;
 
 export { KIND_SCOPE, KIND_SCHEMA };
 
-/** 按 kind 的 schema 校验 params 的形状。不合法一律 `MacroError`。 */
+/**
+ * 按 kind 的 schema 校验 params 的形状。不合法一律 `MacroError`。
+ *
+ * ⚠ **返回值是「补完默认值后的 params」**（issue #625），不是 `true`：
+ *   - `required` 且缺 ⇒ `MacroError('validation_failed')`（以前是 `continue` ⇒
+ *     能建出没有 `at` 的 `scheduled-task`：永不触发、静默死）；
+ *   - `default` 且缺 ⇒ **在这里补上**（服务端补，不只前端补 ⇒ API 直连也拿到默认值），
+ *     补完的值**一并校验**（防契约里的默认值自己越界）。
+ *   ⇒ **调用点必须把返回值写库**（`createTemplate` / `updateTemplate`），否则补了也丢。
+ * @returns {Record<string, unknown>} 原字段 + 补齐的默认值（不原地改传入对象）
+ */
 export function validateKindParams(kind, params) {
   const schema = KIND_SCHEMA[kind];
   if (!schema) throw new MacroError('validation_failed', `未知 kind: ${kind}`, { details: { field: 'kind' } });
@@ -59,9 +69,18 @@ export function validateKindParams(kind, params) {
       throw new MacroError('validation_failed', `${kind} 不认识参数 ${key}`, { details: { field: `params.${key}` } });
     }
   }
+  const filled = { ...params };
   for (const [key, rule] of Object.entries(schema)) {
-    const value = params[key];
-    if (value === undefined) continue;
+    let value = filled[key];
+    if (value === undefined) {
+      if (rule.required) {
+        throw new MacroError('validation_failed', `${kind} 缺少必填参数 ${key}`, { details: { field: `params.${key}` } });
+      }
+      if (!('default' in rule)) continue;
+      // 数组默认值必须**拷一份**：否则调用方一 `push`/`sort` 就改到了共享的 schema 常量上。
+      value = Array.isArray(rule.default) ? [...rule.default] : rule.default;
+      filled[key] = value;
+    }
     const where = { field: `params.${key}` };
     if (rule.type === 'enum') {
       if (!rule.values.includes(value)) {
@@ -104,7 +123,7 @@ export function validateKindParams(kind, params) {
       }
     }
   }
-  return true;
+  return filled;
 }
 // 执行账枚举同样来自 shared 真源（生命周期/终态/判据/门禁/判决的注释在 `shared/macro-kinds.js`）。
 /** 执行账的生命周期（单一真源：`shared/macro-kinds.js` 的 `STATUS`）。 */
@@ -311,13 +330,15 @@ export async function createTemplate(pool, {
     throw new MacroError('validation_failed',
       `${safeKind} 的 scope 必须是 ${KIND_SCOPE[safeKind]}`, { details: { field: 'scope' } });
   }
-  validateKindParams(safeKind, params);
+  // ⚠ 必须用**返回值**入库（#625）：`validateKindParams` 会把 schema 的 `default` 补进来，
+  //   只调用不接返回值 = 默认值补了又丢，库里仍是 `{}`。
+  const safeParams = validateKindParams(safeKind, params);
   const safeCreatedBy = createdBy ?? null;
   const res = await runner(pool).query(
     `INSERT INTO macro_templates (kind, name, params, audience, scope, enabled, created_by)
      VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)
      RETURNING *`,
-    [safeKind, safeName, JSON.stringify(params), safeAudience, safeScope, enabled === true, safeCreatedBy],
+    [safeKind, safeName, JSON.stringify(safeParams), safeAudience, safeScope, enabled === true, safeCreatedBy],
   );
   return toTemplateSnapshot(res.rows[0]);
 }
@@ -340,7 +361,9 @@ export async function updateTemplate(pool, { templateId, patch = {}, now = new D
     else if (key === 'audience') value = validateMacroEnum('audience', value, MACRO_AUDIENCES);
     else if (key === 'enabled') value = value === true;
     else if (key === 'params') {
-      if (existingKind) validateKindParams(existingKind, value);
+      // 同上：补完的默认值要写库 ⇒ 接返回值。旧模板的 params 本来就带齐了默认值，
+      // 所以下面补齐的只是「本次 patch 没写的可缺字段」，不会静默改掉用户显式写的值。
+      if (existingKind) value = validateKindParams(existingKind, value);
       else if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         throw new MacroError('validation_failed', 'params 必须是对象', { details: { field: 'params' } });
       }
