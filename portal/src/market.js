@@ -1076,7 +1076,9 @@ export async function getUserItem({ pool, fdeId, slug }) {
     // 缺 SKILL.md ⇒ 空串（**不是 null**）：前端把它直接塞进 markdown 渲染器，null 会渲染成 "null"。
     readme_md: readme ? Buffer.from(readme.content).toString('utf8') : '',
     tools: Array.isArray(asJson(row.manifest, {}).tools) ? asJson(row.manifest, {}).tools : [],
-    manifest: asJson(row.manifest, {}),
+    // ⚠ 用户面**不给 manifest**（审计必修）：`manifest` 里有 `command` / `args` / `url`，
+    // 而 `args` 与 `url` 是最容易被塞进凭据的两格（`--token=…`、`?key=…`）。用户不需要它们
+    // （界面只显示 exposure 与工具数），管理面（`getAdminItem`）照旧给全。
     security_warnings: asJson(row.security_warnings, []),
     files: rows.map((f) => ({ path: f.path, bytes: f.bytes })),
     // §8.1/§8.2：MCP 条目把槽位**声明**给用户看（「需要管理员配置凭据」的说明），但**没有值**。
@@ -1110,7 +1112,12 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
       { code: 'capability_not_published', httpStatus: 409, details: { slug, state: item.state } });
   }
   const existing = await selectInstall(pool, fde.id, slug);
-  const wantEnabled = enabled === undefined ? (existing ? existing.enabled : true) : Boolean(enabled);
+  // ⚠ MCP 的「安装即启用」默认值必须是 **false**（审计必修）：启用要过「必填槽齐」那道闸，
+  // 而安装面没有那道闸——默认 true 等于让「装上就生效」绕过凭据校验（症状：库里 enabled=true、
+  // 运行时缺槽、工具静默不存在）。skill 保持原语义（装上即启用）。
+  const wantEnabled = enabled === undefined
+    ? (existing ? existing.enabled : item.kind !== 'mcp')
+    : Boolean(enabled);
   // 预算闸必须排在幂等判定**之前**：同版本但这次要求「从停用变启用」的请求，走的是下面那条
   // 只改账的分支——排在后面就会绕过预算（§4 的上限管的是 enabled 计数，与有没有写盘无关）。
   const isMcp = item.kind === 'mcp';
@@ -1123,6 +1130,14 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
       throw new MarketError(`启用的${isMcp ? ' MCP server' : '技能'}已达上限 ${budget.limit} 个`,
         { code: 'capability_budget_exceeded', httpStatus: 409,
           details: { max_enabled: budget.limit, enabled_now: n, kind: budget.kind } });
+    }
+  }
+  // 显式 `enabled:true` 的安装也要过同一道槽位闸（否则 install 就是 setCapabilityEnabled 的旁路）。
+  if (isMcp && wantEnabled) {
+    const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id, key: config?.mcpSecretKey });
+    if (missing.length > 0) {
+      throw new MarketError('还有必填凭据没配置，无法启用（等管理员配置）', {
+        code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing } });
     }
   }
   // §4 MCP：**不落盘**（没有包内容），只落账 + 排物化。
@@ -1408,10 +1423,16 @@ export function validateMcpFields(fields, { requireAll = false } = {}) {
   if (transport !== undefined && !MCP_TRANSPORTS.includes(transport)) {
     throw bad("transport 只允许 'stdio' | 'http'", { field: 'transport', transport });
   }
-  const exposure = pick('exposure') ?? 'deferred';
-  if (!MCP_EXPOSURES.includes(exposure)) throw bad(`exposure 只允许 ${MCP_EXPOSURES.join('|')}`, { field: 'exposure', exposure });
-  const lifecycle = pick('lifecycle') ?? 'run';
-  if (!MCP_LIFECYCLES.includes(lifecycle)) throw bad(`lifecycle 只允许 ${MCP_LIFECYCLES.join('|')}`, { field: 'lifecycle', lifecycle });
+  // ⚠ `requireAll:false`（PUT 部分更新）时**不许**填缺省值：填了就等于「没提 exposure 就把它改回
+  // deferred」——一次只改 timeout 的 PUT 会把 `hidden` 静默放出来（审计必修，2026-11-17）。
+  const exposure = pick('exposure') ?? (requireAll ? 'deferred' : undefined);
+  if (exposure !== undefined && !MCP_EXPOSURES.includes(exposure)) {
+    throw bad(`exposure 只允许 ${MCP_EXPOSURES.join('|')}`, { field: 'exposure', exposure });
+  }
+  const lifecycle = pick('lifecycle') ?? (requireAll ? 'run' : undefined);
+  if (lifecycle !== undefined && !MCP_LIFECYCLES.includes(lifecycle)) {
+    throw bad(`lifecycle 只允许 ${MCP_LIFECYCLES.join('|')}`, { field: 'lifecycle', lifecycle });
+  }
   if (pick('resident') !== undefined && pick('resident') !== false) {
     throw new MarketError('resident 在 P1 只支持 false（形态②/③ 未实现）', {
       code: 'capability_kind_unsupported', httpStatus: 409, details: { field: 'resident', resident: pick('resident') },
@@ -1440,7 +1461,12 @@ export function validateMcpFields(fields, { requireAll = false } = {}) {
   }
 
   // transport 必须进 manifest（它是 runner 侧选传输的唯一依据；只放 meta 会让物化出来没有传输方式）
-  const manifest = { transport, exposure, lifecycle, resident: false, timeout_ms: timeoutMs };
+  // 只把**真的给了**的字段放进 manifest：`undefined` 进对象后 `JSON.stringify` 会把它丢掉，
+  // 但 `{...old, ...new}` 合并那一步已经先把旧值盖成 undefined 了 ⇒ 字段凭空消失（审计必修）。
+  const manifest = { resident: false };
+  for (const [k, v] of Object.entries({ transport, exposure, lifecycle, timeout_ms: timeoutMs })) {
+    if (v !== undefined) manifest[k] = v;
+  }
   if (reason !== undefined) manifest.reason = reason;
   if (transport === 'stdio') {
     const command = need('command', 'stdio 必须给 command');

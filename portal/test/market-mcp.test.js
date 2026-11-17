@@ -339,6 +339,13 @@ test('MC-5/MC-6/MC-7 安装不落盘；启用缺槽 409；写值后 has_value=tr
     const inst = await installCapability({ pool, config, fde, slug: 'hub' });
     assert.equal(inst.disk, 'none', 'MCP 安装不落盘');
     assert.equal(fs.existsSync(path.join(root, 'alice', 'home', '.erix', 'skills')), false, '不该创建 skills 目录');
+    // 安装**不自动启用**：启用要过「必填槽齐」那道闸，安装面没有闸 ⇒ 默认启用就是绕闸（审计必修）。
+    assert.equal(inst.enabled, false, 'MCP 安装默认必须 enabled=false');
+    // 显式 enabled:true 的安装也要过同一道闸（install 不是 setCapabilityEnabled 的旁路）
+    const instBlocked = await expectErr(
+      installCapability({ pool, config, fde, slug: 'hub', enabled: true }));
+    assert.equal(instBlocked.code, 'capability_secret_missing');
+    assert.deepEqual(instBlocked.details.missing, ['ECHO_PREFIX']);
 
     // 缺槽 ⇒ 启用被 409 拦住（fail-closed）
     const e = await expectErr(setCapabilityEnabled({ pool, fde, slug: 'hub', enabled: true, config }));
@@ -384,12 +391,14 @@ test('MC-8 解析：只取 published && enabled && 非 hidden；fde 覆盖 globa
   await setItemState({ pool, itemId: a.id, state: 'published' });
   await installCapability({ pool, config: tmpConfig().config, fde, slug: 'alpha' });
   await setSlotValues({ pool, itemId: a.id, scope: 'global', values: { ECHO_PREFIX: 'G' }, key: KEY });
+  await setCapabilityEnabled({ pool, fde, slug: 'alpha', enabled: true, config: { mcpSecretKey: KEY } });
 
   // hidden 条目：即使装了也不该出现在物化/解析面
   const h = await publishItem({ pool, fields: MCP_FIELDS('ghost', { exposure: 'hidden' }) });
   await setItemState({ pool, itemId: h.id, state: 'published' });
   await installCapability({ pool, config: tmpConfig().config, fde, slug: 'ghost' });
   await setSlotValues({ pool, itemId: h.id, scope: 'global', values: { ECHO_PREFIX: 'G' }, key: KEY });
+  await setCapabilityEnabled({ pool, fde, slug: 'ghost', enabled: true, config: { mcpSecretKey: KEY } });
 
   const listed = await listMcpServersForFde(pool, fde.id);
   assert.deepEqual(listed.map((s) => s.name), ['alpha'], 'hidden 整条不物化');
@@ -418,8 +427,10 @@ test('MC-10【反向】MCP 条目不许出现在 skills 清单里（kind 过滤�
   const mcp = await publishItem({ pool, fields: MCP_FIELDS('hub') });
   await setItemState({ pool, itemId: mcp.id, state: 'published' });
   await installCapability({ pool, config: tmpConfig().config, fde, slug: 'hub' });
+  await setSlotValues({ pool, itemId: mcp.id, scope: 'global', values: { ECHO_PREFIX: 'G' }, key: KEY });
+  await setCapabilityEnabled({ pool, fde, slug: 'hub', enabled: true, config: { mcpSecretKey: KEY } });
 
-  // MCP 装了 ⇒ mcp 清单有它、skills 清单**一条都没有**
+  // MCP 装了并启用 ⇒ mcp 清单有它、skills 清单**一条都没有**
   assert.equal((await listMcpServersForFde(pool, fde.id)).length, 1);
   assert.deepEqual(await listCapabilitiesForFde(pool, fde.id), [],
     'MCP 条目混进 skills 清单 ⇒ capabilities.json 会宣称一个不存在的技能包');

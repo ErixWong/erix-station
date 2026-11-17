@@ -421,8 +421,26 @@ export function hostPathFor(root, fdeName, containerPath) {
  * 骨架 + FDE 级 ports.json；旧项目脚手架靠 stale 清理（manifest 机制）自然移除。
  * @returns { files: [{ containerPath, hostPath, content, mode }] }
  */
+/**
+ * 有效 MCP server 清单：**降级判定只做一次**，`mcp.json` 与 `capabilities.json` 共享同一份结果。
+ * 为什么必须共享（审计必修）：两边各算一次时，超 64 KiB 的 `direct` server 在 mcp.json 里已降级成
+ * `deferred`，而索引里仍写 `direct` ⇒ runner 按 direct 期待独立工具、实际一个都没有（静默不一致）。
+ * @returns {Array<object>} 每项是 server 的浅拷贝，`exposure` 已是**生效值**
+ */
+export function effectiveMcpServers(servers, { log = null } = {}) {
+  const list = Array.isArray(servers) ? servers : [];
+  return list.map((s) => {
+    if (!s || s.exposure !== 'direct') return s;
+    const tools = Array.isArray(s.tools) ? s.tools : [];
+    const bytes = Buffer.byteLength(JSON.stringify(tools.map((t) => ({ ...t }))), 'utf8');
+    if (bytes <= MCP_MAX_SCHEMA_BYTES) return s;
+    log?.warn?.(`[materializer] mcp direct 降级 deferred：server=${s.name} schema=${bytes}B > ${MCP_MAX_SCHEMA_BYTES}B`);
+    return { ...s, exposure: 'deferred', tools: tools.map((t) => ({ name: t.name, description: t.description })) };
+  });
+}
+
 export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root, generation,
-  capabilities = [], mcpServers = [] }) {
+  capabilities = [], mcpServers = [], log = null }) {
   const files = [];
   const add = (containerPath, content, mode = FILE_MODE) => {
     files.push({ containerPath, hostPath: hostPathFor(root, fdeName, containerPath), content, mode });
@@ -431,11 +449,12 @@ export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, ob
   add(`${CONTAINER_HOME}/AGENTS.md`, renderHomeAgentsMd({ fdeName }));
   add(`${CONTAINER_HOME}/bin/github-pinproxy.py`, GITHUB_PINPROXY_SCRIPT);
   add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmBaseUrl }));
-  add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson(mcpServers));
+  const effectiveMcp = effectiveMcpServers(mcpServers, { log });
+  add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson(effectiveMcp));
   add(`${CONTAINER_HOME}/.erix/ports.json`, renderPortsJson({ fdeName, allocations, observedPorts, generation }));
   // #595：能力市场索引。缺省空数组 ⇒ 没装任何东西时它就是个空清单文件（不是「文件不存在」），
   // runner 因此永远有一条确定的读路径，不必区分「没装」与「还没物化过」。
-  add(`${CONTAINER_HOME}/.erix/capabilities.json`, renderCapabilitiesJson(capabilities, mcpServers));
+  add(`${CONTAINER_HOME}/.erix/capabilities.json`, renderCapabilitiesJson(capabilities, effectiveMcp));
   return files;
 }
 
@@ -479,7 +498,7 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
     const prevFiles = (prevManifest && prevManifest.files) || {};
 
     const files = buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root: rootReal, generation,
-      capabilities, mcpServers });
+      capabilities, mcpServers, log });
 
     ensureWorkspaceDirs(files);
 
