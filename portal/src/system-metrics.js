@@ -477,8 +477,10 @@ export function containerDrift(dbNames, dockerNames) {
  *     卡片读的是进程内那一拍，DB 挂了它依旧有数（决定 2）——这是本端点存在的理由，不是降级补丁。
  *     此时 `series.points` 给空数组（页面画「该区间无数据」，不画一条贴底的假线）。
  *   · 采样器没跑（`SYSTEM_METRICS_ENABLED=0`）或还没有第一拍 ⇒ `latest: null`，**不是 500**。
+ *     但「没跑」与「还没第一拍」在前端必须是**两句不同文案** ⇒ 额外下发 `enabled`（additive，
+ *     取自采样器句柄自己的 `enabled`，前端不许从 `latest === null` 反推）。
  *
- * @param {{pool: object, sampler?: {latest?: () => object|null}, retentionDays?: number|null,
+ * @param {{pool: object, sampler?: {latest?: () => object|null, enabled?: boolean}, retentionDays?: number|null,
  *          range?: string, now?: () => number}} input
  */
 export async function metricsApiPayload({
@@ -496,7 +498,13 @@ export async function metricsApiPayload({
     // 只给原因字符串（`code` 优先，没 code 才给 message）：堆栈与 SQL 片段不该出现在管理台响应里。
     seriesError = String(err?.code ?? err?.message ?? err);
   }
-  return { latest, series, range: key, retentionDays: retentionDays ?? null, seriesError };
+  // 采样器到底开没开（issue #650 前端「采样已关闭」文案的唯一依据）。
+  // `sampler` 为 `null`（`ENABLED=0` 时 `cli.js serve` 根本不建它）⇒ `false`；
+  // 这一格与 `latest: null` 是**两件事**：前者说「没人采」，后者只说「还没采到」。
+  return {
+    latest, series, range: key, retentionDays: retentionDays ?? null, seriesError,
+    enabled: sampler?.enabled === true,
+  };
 }
 
 /**

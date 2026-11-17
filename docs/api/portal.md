@@ -3589,7 +3589,8 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
                             "memUsed": 40900000000, "containersRunning": 33, "samples": 2 } ] },
   "range": "1h",                                // **生效的** range（非法入参已被回落成 `1h`）
   "retentionDays": 30,                          // 来自 `config.systemMetrics.retentionDays`；拿不到 ⇒ null
-  "seriesError": null                           // 历史查询失败时是原因字符串，成功时是 null
+  "seriesError": null,                          // 历史查询失败时是原因字符串，成功时是 null
+  "enabled": true                               // 采样器到底开没开（`sampler?.enabled === true`；没有采样器 ⇒ false）
 }
 ```
 
@@ -3607,6 +3608,10 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   `t` 是桶起点（ISO 字符串），`samples` 是这个桶里聚合了几行原始点（只有 1 个点时页面要说清粒度）。
   分桶结果按 `range` 缓存 5s（`SERIES_CACHE_TTL_MS`），与前端 5s 轮询对齐 ⇒ 10 个人同开这页的 DB 查询量与 1 个人相同。
 - `retentionDays` 只是**回显配置**，让页面能写「保留 30 天」而不必硬编码；清理动作不在这个端点上（挂 reaper 小时槽）。
+- `enabled`（**additive**，#650 前端单补）：采样器到底开没开。只看 `sampler?.enabled === true`——
+  `sampler` 为 `null`（`SYSTEM_METRICS_ENABLED=0` 时 `cli.js serve` 根本不建它）⇒ `false`。
+  为什么需要它而不是让前端从 `latest === null` 反推：那个形状同时兼容「采样已关闭」与「刚重启还没第一拍」
+  两个相反结论（前者要去改 env + 重启，后者只要等 30s），前端分不出来 ⇒ 这句话必须由说得出它的一方说。
 
 **错误语义（本端点零新错误码，三个降级分支都是 200）**：
 
