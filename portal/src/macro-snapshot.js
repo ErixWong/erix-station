@@ -74,9 +74,28 @@ export function isUnderProjects(candidate, home = os.homedir()) {
 // git / 进程执行原语
 // ---------------------------------------------------------------------------
 
+/**
+ * git 的**全局选项**（放在子命令之前）。抽成纯函数是为了可测（见 `gitGlobalArgs()` 的用例）。
+ *
+ * `-c safe.directory=*`（issue #669）：portal 以 **root** 跑，而 FDE 项目目录属主是
+ * 1000/1001 —— git ≥2.35 对「仓库属主 ≠ 当前用户」一律拒绝（CVE-2022-24765 的缓解），
+ * 报 `detected dubious ownership in repository`。**这是部署常态，不是边角**：
+ * 不加这一项，`createSnapshot` 里所有 git 调用（`rev-parse` / `status` / `diff` /
+ * `worktree add`）在真机上全部失败 ⇒ M9 审查 100% 起不来。
+ *
+ * ⚠ 用 `-c` 而**不是** `git config --global --add safe.directory <path>`：
+ * 后者往容器 `~/.gitconfig` 里**逐目录**累积，容器重建即丢、新目录永远漏；`-c` 每次显式带上，无状态。
+ * 口径与 `gitlight.js:152`（D9 收工灯，同样跨 uid 读用户目录）一致。
+ *
+ * `--no-optional-locks`：只读探测不该去抢 index 锁（同 gitlight 的理由）。
+ */
+export function gitGlobalArgs() {
+  return ['-c', 'safe.directory=*', '--no-optional-locks'];
+}
+
 /** 跑 git，返回 stdout（utf8）。失败（非 0 退出）抛错，错误里带上 stderr 便于分类。 */
 function git(args, { timeout, maxBuffer = 64 * 1024 * 1024 } = {}) {
-  return execFileSync('git', args, { encoding: 'utf8', timeout, maxBuffer }).toString();
+  return execFileSync('git', [...gitGlobalArgs(), ...args], { encoding: 'utf8', timeout, maxBuffer }).toString();
 }
 
 function sha256Text(s) {
