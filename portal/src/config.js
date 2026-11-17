@@ -324,6 +324,10 @@ export function loadConfig(env = process.env) {
     userSpaceRoot: env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
     // F3：bind source 用的**宿主**路径（Docker API bind source 必须是宿主路径，与容器内 userSpaceRoot 解耦）。
     userSpaceRootHost: env.ERIX_USERSPACE_ROOT_HOST || env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
+    // issue #676（丙=止血）：M9「完成审查」总开关。**缺省 'disabled'** ⇒ 只出事实、不下判决
+    //（run-review 分派落 skipped/review_unavailable、不建快照、verdict NULL）。
+    // 甲/乙 见 #673，拍板后改 `'snapshot'`（修快照）/ `'live-fingerprint'`（读活目录+前后指纹）。
+    reviewMode: env.ERIX_REVIEW_MODE || 'disabled',
     // Workspace 自动清理默认关闭；显式正数才会设置 purge deadline 并启用目录 sweep。
     workspaceRetentionDays: nonNegativeIntEnv(env, 'ERIX_WORKSPACE_RETENTION_DAYS', 0),
     // FDE 工作区属主 UID/GID（user-space §6.1：1000/1000）。

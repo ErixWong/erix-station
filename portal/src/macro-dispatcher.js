@@ -26,7 +26,9 @@ import { runMacroReview } from './macro-review.js';
 import { deliverIntent } from './notifications.js';
 import { fetchRunAssistantText } from './session-text.js';
 // issue #662：审查 run 的真实实现需要——起只读审查会话（postMessage）+ 建快照（createSnapshot）。
-import { postMessage as postMessageSession } from './sessions.js';
+import { postMessage as postMessageSession, validateRunCwd } from './sessions.js';
+// #676：jail 宿主子目录的单一真值表（`resolveOriginalRepoDir` 的 projects 段从它取）。
+import { jailHostDir } from '../shared/jail-mounts.js';
 import { createSnapshot as createSnapshotDefault } from './macro-snapshot.js';
 
 /** 超时回收阈值（要求④）：`pending` 且 `started_at` 早于 now-此值 ⇒ 判为「派发途中进程崩了」，落 failed。 */
@@ -221,7 +223,8 @@ export async function resolveOriginalRepoDir(pool, { originalRunId, config } = {
   const m = /^~\/projects\/([^/]+)\/?$/.exec(cwd);
   if (!m) return cwd;
   const userSpaceRoot = config?.userSpaceRoot ?? '/srv/erix/users';
-  return path.join(userSpaceRoot, row.fde_name ?? '', 'projects', m[1]);
+  // #676：projects 宿主目录取自 jail 单一真值表（与 provisioner / 校验器同一源，不三拄）。
+  return path.join(jailHostDir(userSpaceRoot, row.fde_name ?? '', 'projects'), m[1]);
 }
 
 /**
@@ -229,8 +232,14 @@ export async function resolveOriginalRepoDir(pool, { originalRunId, config } = {
  * origin = `review:<macroRunId>`（可追溯）；title = `审查 · <原 run 短 id>`。会话用完不删
  *（历史留档），worktree 由 W4a 孤儿清扫回收（worktree_path 已落 macro_runs）。
  */
-export async function createReviewSession(pool, { userId, cwd, originalRunId, macroRunId } = {}) {
+export async function createReviewSession(pool, { userId, cwd, originalRunId, macroRunId, config = {} } = {}) {
   const shortId = String(originalRunId ?? macroRunId ?? '').slice(0, 8);
+  // #676 ①：审查会话的 cwd 也不能任意字符串——裸 INSERT 同样走越界校验器。
+  // 绝对路径需要 fde_name + userSpaceRoot 才能判 jail 归属（从 userId 查 fde_name）。
+  if (typeof cwd === 'string' && cwd.trim() !== '') {
+    const fdeRes = await pool.query(`SELECT fde_name FROM users WHERE id = $1`, [userId]);
+    validateRunCwd(cwd, { userSpaceRoot: config?.userSpaceRoot, fdeName: fdeRes.rows?.[0]?.fde_name ?? null });
+  }
   const res = await pool.query(
     `INSERT INTO chat_sessions (user_id, cwd, title, title_source, origin)
      VALUES ($1, $2, $3, 'manual', $4)
@@ -253,7 +262,7 @@ export async function createReviewSession(pool, { userId, cwd, originalRunId, ma
 export async function runReviewTaskDefault({
   pool, brief, macroRunId, originalRunId = null, snapshot,
   postMessage = postMessageSession, reviewTask = (ctx, opts) => pollRunTask(ctx, opts),
-  pollOpts, log = console, maxRounds = DEFAULT_REVIEW_MAX_ROUNDS,
+  pollOpts, log = console, maxRounds = DEFAULT_REVIEW_MAX_ROUNDS, config = {},
 } = {}) {
   const acct = await pool.query(
     `SELECT a.user_id FROM macro_runs r JOIN macro_assignments a ON a.id = r.assignment_id WHERE r.id = $1`,
@@ -264,9 +273,9 @@ export async function runReviewTaskDefault({
   if (!userId) throw new Error('审查会话缺 userId（无法起只读审查 run）');
   if (!cwd) throw new Error('审查快照缺 worktreePath（cwd 无法指向隔离现场）');
 
-  const sessionId = await createReviewSession(pool, { userId, cwd, originalRunId, macroRunId });
+  const sessionId = await createReviewSession(pool, { userId, cwd, originalRunId, macroRunId, config });
   const posted = await postMessage(pool, {
-    userId, sessionId, content: brief, triggerKind: 'synthetic', cwd, reviewOnly: true, maxRounds,
+    userId, sessionId, content: brief, triggerKind: 'synthetic', cwd, reviewOnly: true, maxRounds, config,
   });
   const childRunId = posted?.run?.id ?? null;
   const res = await reviewTask({ pool, childRunId, sessionId }, pollOpts);
@@ -340,6 +349,22 @@ export function createIntentDispatcher({
         // D：只在 run-review 分支建快照（run-notify 不建，快照有成本 ≤60s/≤500MB）。
         // 原 run 的项目目录 = runs.session_id → chat_sessions.cwd（一次查询）。
         const originalRunId = extractReviewRunId(intent);
+        // issue #676 ②（丙 = 止血）：`reviewMode='disabled'`（缺省）⇒ **只出事实、不下判决**：
+        //   不调 reviewRunner、不建快照、不解析判决；runMacroReview 落 skipped/review_unavailable、
+        //   verdict NULL，并给用户发一条「审查暂未启用」通知。甲/乙（快照 / 活目录指纹）见 #673，
+        //   定下来后把 reviewMode 改成 `'snapshot'` / `'live-fingerprint'` 走下面的真审查。
+        const reviewMode = config?.reviewMode ?? 'disabled';
+        if (reviewMode === 'disabled') {
+          await execReview(pool, {
+            macroRunId,
+            originalRunId,
+            userId: intent?.userId ?? null,
+            reviewUnavailable: true,
+            now: nowVal(),
+          });
+          return;
+        }
+        // —— 真审查路径（甲 = 快照；乙 = 活目录指纹待接）——
         const repoDir = await resolveOriginalRepoDir(pool, { originalRunId, config });
         const snapshot = repoDir
           ? await createSnapshot({ repoDir })
@@ -358,7 +383,7 @@ export function createIntentDispatcher({
           ?? ((ctx) => runReviewTaskDefault({
             pool, brief: ctx.brief, macroRunId: ctx.macroRunId, originalRunId, snapshot,
             maxRounds: normalizeReviewMaxRounds(intent?.params?.max_rounds),
-            postMessage, reviewTask, pollOpts: reviewPollOpts, log,
+            postMessage, reviewTask, pollOpts: reviewPollOpts, log, config,
           }));
         await execReview(pool, {
           macroRunId,
