@@ -71,7 +71,7 @@ function captureLog() {
 class PromptsFakePool {
   constructor({
     row = null, fdes = [], failSelect = null, hangSelect = false, failAudit = false, failEnqueue = false,
-    concurrent = 0,
+    concurrent = 0, failSaveWith = null,
   } = {}) {
     this.row = row;          // 单行表的当前行（null = 无行 = 三块全跟随内置）
     this.fdes = fdes;        // 启用中的 FDE id 列表（`enqueueMaterializeForAllFdes` 要列的就是这个集合）
@@ -79,6 +79,7 @@ class PromptsFakePool {
     this.hangSelect = hangSelect;
     this.failAudit = failAudit;
     this.failEnqueue = failEnqueue;
+    this.failSaveWith = failSaveWith;   // 判据 `P15`：保存那条语句炸在**驱动**手里（约束/表名）
     this.statements = [];
     this.audit = [];
     this.outbox = [];
@@ -158,6 +159,7 @@ class PromptsFakePool {
         + Number(idTail);
     const allowed = rendered <= Number(limit);
     if (allowed && this.failAudit) throw new Error('fake：audit_log 写入失败（注入）');
+    if (this.failSaveWith) throw this.failSaveWith;   // 驱动层报错（relation/constraint 字样在原文里）
     let written = 0;
     if (allowed) {
       written = 1;
@@ -760,6 +762,40 @@ test('P8b 审计写不进去 ⇒ 整条语句失败而设置一格没变（语�
     '审计失败要报 500，不许静默回 200',
   );
   assert.equal(pool.row.agents_md_addendum, '旧', '设置没被改（这正是"一条语句"存在的理由）');
+});
+
+test('P15 保存炸在驱动手里 ⇒ 500 的 message 是静态串（表名/约束名不外泄），细节只进服务端日志', async () => {
+  // 真库的报错原文长这样（PG 的措辞）：relation / column / constraint 名全在里面。`http.js` 是
+  // 把 `err.message` 原样 `sendJson` 出去的 ⇒ 拼进响应就等于把 schema 形状送给浏览器（评审 R6）。
+  // 先例：`upload-settings.js` 那两条 `internal` 用的都是静态串。
+  const driverMsg = 'insert or update on table "platform_prompts" violates '
+    + 'check constraint "platform_prompts_agents_md_addendum_len"';
+  const { log, warns } = captureLog();
+  const pool = new PromptsFakePool({ row: SEEDED_ROW(), failSaveWith: new Error(driverMsg) });
+  const err = await updatePlatformPrompts({ pool, field: 'addendum', text: '新约定', actorId: ACTOR, log })
+    .then(() => null, (e) => e);
+  assert.ok(err instanceof Error && err.code === 'internal' && err.httpStatus === 500,
+    `必须仍是 500 internal，实际 ${err?.code}/${err?.httpStatus}`);
+  assert.doesNotMatch(err.message, /platform_prompts|relation|constraint|violates check/i,
+    `500 的 message 里不许出现驱动字样（原文：${err.message}）`);
+  const logged = warns.join('\n');
+  assert.match(logged, /platform_prompts|constraint/i, '细节必须进服务端日志，否则值班无从下手');
+  assert.doesNotMatch(logged, /WITH snap|octet_length/, '日志不许把整条 SQL 抄进去');
+  assert.doesNotMatch(logged, /新约定/, '日志不许把参数值（提示词正文，可能含用户内容）抄进去');
+
+  // HTTP 面：同一件事走真 `createServer`，响应体里也不许出现这些字样。
+  const s = await startAdmin({ poolOpts: { failSaveWith: new Error(driverMsg) } });
+  try {
+    const got = await readResp(await call(s, {
+      path: '/api/admin/prompts/addendum', method: 'PUT', body: { text: '新约定' },
+    }));
+    assert.equal(got.status, 500, `驱动失败必须 500；实际 ${got.status} ${got.text}`);
+    assert.equal(got.json.error.code, 'internal', '不新增错误码（契约 §6）');
+    assert.doesNotMatch(got.text, /platform_prompts|relation|constraint|violates check/i,
+      `响应体泄露了驱动字样：${got.text}`);
+  } finally {
+    await s.close();
+  }
 });
 
 // ---------------------------------------------------------------------------
