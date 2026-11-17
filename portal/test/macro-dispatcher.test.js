@@ -597,7 +597,7 @@ test('#662-1 run-review 分派建快照，快照 worktreePath 传给 runMacroRev
     let snapCalls = 0;
     let snapArg = null;
     let snapshotPassed = null;
-    const fake = { ok: true, snapshotId: 'snap-1', worktreePath: WT, contentDigest: 'd' };
+    const fake = { ok: true, snapshotId: crypto.randomUUID(), worktreePath: WT, contentDigest: 'd' };
     const d = createIntentDispatcher({
       pool, log: QUIET,
       createSnapshot: async (a) => { snapCalls += 1; snapArg = a; return fake; },
@@ -646,7 +646,7 @@ test('#662-3 缺省审查 runner：postMessage 收到 reviewOnly===true + trigge
     let pmOpts = null;
     const d = createIntentDispatcher({
       pool, log: QUIET,
-      createSnapshot: async () => ({ ok: true, snapshotId: 's', worktreePath: WT, contentDigest: 'd' }),
+      createSnapshot: async () => ({ ok: true, snapshotId: crypto.randomUUID(), worktreePath: WT, contentDigest: 'd' }),
       postMessage: async (_p, o) => { pmOpts = o; return { run: { id: crypto.randomUUID() } }; },
       reviewTask: async () => ({ ok: true, text: '结论：通过', termination: { reason: 'finished', error: null }, error: null }),
       // reviewRunner 不注入 ⇒ 走缺省 runReviewTaskDefault
@@ -668,7 +668,7 @@ test('#662-4 缺省审查 runner：postMessage 的 cwd === snapshot.worktreePath
     let pmOpts = null;
     const d = createIntentDispatcher({
       pool, log: QUIET,
-      createSnapshot: async () => ({ ok: true, snapshotId: 's', worktreePath: WT, contentDigest: 'd' }),
+      createSnapshot: async () => ({ ok: true, snapshotId: crypto.randomUUID(), worktreePath: WT, contentDigest: 'd' }),
       postMessage: async (_p, o) => { pmOpts = o; return { run: { id: crypto.randomUUID() } }; },
       reviewTask: async () => ({ ok: true, text: '结论：通过', termination: { reason: 'finished', error: null }, error: null }),
     });
@@ -687,7 +687,7 @@ test('#662-5 桩 runner 返回「结论：整改」⇒ verdict=red + 回灌（re
     let runnerCalled = 0;
     const d = createIntentDispatcher({
       pool, log: QUIET,
-      createSnapshot: async () => ({ ok: true, snapshotId: 's', worktreePath: '/tmp/wt-662-r5', contentDigest: 'd' }),
+      createSnapshot: async () => ({ ok: true, snapshotId: crypto.randomUUID(), worktreePath: '/tmp/wt-662-r5', contentDigest: 'd' }),
       reviewRunner: ({ brief }) => { runnerCalled += 1; assert.ok(brief.includes('原任务'), '工作包应含原任务段'); return '结论：整改\n有 3 个未跟踪文件'; },
       // runMacroReview 用真实缺省实现 + 真实回灌 postMessage
     });
