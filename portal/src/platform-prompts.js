@@ -14,7 +14,14 @@
 //      超时按「读不到」处理：回落内置、照常物化/改名，只留 debug 不刷 warn。
 //   3. **保存 = 一条 SQL 语句**（`SAVE_SQL`：prev `FOR UPDATE` → 渲染闸 → upsert → 写审计）。
 //      审计与设置必须同生共死，旧值必须来自同一语句的快照 ⇒ 调用方（`http.js`）**不得**再补
-//      `auth.audit`（判据 `P8`：`pool.query` 恰好 1 次、`audit_log` 恰好 1 行）。
+//      `auth.audit`。判据 `P8` 钉的是「**写 `platform_prompts` 的语句恰好 1 条，且它与写
+//      `audit_log` 那条是同一条**」（评审 F4 第 2 项的定稿口径，**不是**「整次保存只有一条
+//      `pool.query`」）：涉物化那两格实测共 **7 条** query（JS 预闸预读 1 + 保存（设置与审计）1 +
+//      列启用中的 FDE 1 + 每台 2 条入队），逐条点名见 `portal/test/platform-prompts.test.js` 的
+//      `P8` 与设计稿 §8 第 11 条。
+//      ⚠ 谁拿旧口径（「恰好一次 `pool.query`」）去「修回一次查询」，删的就是下面
+//      `updatePlatformPrompts` 里那段 **JS 预闸**（那一段 `闸一（写之前）`）：预读多付的只是
+//      1 条 SELECT，而删掉它就是拿「超限也先把正文写进库里」换的。
 //   4. **响应一律来自 `RETURNING`**（不信输入）：「保存成功」说的是库里现在那份文本。
 //   5. **产品上限不在 DB CHECK，在这里**（分层见 0040 头注释）。两条闸：字段自身上限 +
 //      **渲染后**整份 `~/AGENTS.md` ≤ `AGENTS_MD_INJECT_MAX_BYTES`。第二条是必须的：注入侧
