@@ -118,9 +118,15 @@ function silenceThresholdForPhase(phase, params) {
 
 /**
  * 启动评估循环：启动即跑一次，此后每 `intervalMs` 一次。
+ *
+ * `onIntents`（issue #616）：**可注入**的意图消费者回调（默认 no-op）。本模块**只产意图不执行动作**
+ * （契约 `10` §2 的 W2 边界）——它不 import 任何执行器，只把 `tick()` 攒下的意图交给注入方。
+ * 真正的执行器与收尾在 `./macro-dispatcher.js`，由 `cli.js` 接线（`onIntents: dispatcher.dispatch`）。
+ * ⚠ `onIntents` **抛异常不许打断评估循环**（故包 try/catch，只 warn）：消费者挂了，评估器仍要继续
+ * 产意图/推进水位线，否则一处执行故障会把整条评估链显示成「循环没跑」。
  * @returns {{stop: () => void, tick: () => Promise<{intents: object[], evaluated: number, failed: number}>}}
  */
-export function startMacroEvalLoop(pool, _config = {}, { log = console, intervalMs = EVAL_INTERVAL_MS, now = () => new Date() } = {}) {
+export function startMacroEvalLoop(pool, _config = {}, { log = console, intervalMs = EVAL_INTERVAL_MS, now = () => new Date(), onIntents = async () => {} } = {}) {
   let stopped = false;
   /** @type {Promise<object>|null} 正在进行的一轮（去重靠它，重入等同一轮，不静默跳过）。 */
   let inflight = null;
@@ -156,6 +162,15 @@ export function startMacroEvalLoop(pool, _config = {}, { log = console, interval
           intents.push(...res.intents);
           // ⚠ **先求值成功、再推进水位线**；逐条写、不批量（`09` 篇 §1.1）。
           await advanceWatermark(pool, a.id);
+        }
+      }
+      // issue #616：把本轮产出的意图交给**注入的消费者**（默认 no-op）。评估器只产不执行，
+      // 且消费者抛异常**不许**打断评估——故 try/catch，失败只 warn，本轮结果照常返回。
+      if (intents.length > 0) {
+        try {
+          await onIntents(intents);
+        } catch (err) {
+          log.warn?.(`[macro-eval] 意图消费者异常（已产 ${intents.length} 条，不影响本轮评估）：${err?.message ?? err}`);
         }
       }
       return { intents, evaluated, failed };
