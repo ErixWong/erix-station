@@ -1629,22 +1629,45 @@ test('活二⑱ 表达式体箭头的遮蔽区间只覆盖体本身：箭头**�
     + '）：多出一条就是箭头后面那条静态读被误判了（区间过宽 = 假红，与幻影 key 相反的静默方向）');
 });
 
-test('活二⑲ 解析得出的参数默认值不许白丢：末位默认值 / 解构别名默认值都要解析成那个常量', () => {
+test('活二⑲ 解析得出的参数默认值不许白丢：默认值必须被**解析成那个常量**（外层同名常量不许顶上来）', () => {
   // 与⑰同一块地基、方向相反的两面：默认值文本里多一个 `)` 就解析不出 ⇒ 能解析的被丢进 `unsupported`
   // （假红）；而 `{ k: NAME = 'ERIX_X' }` 这一支旧代码写死 `def: null` ⇒ 同样把解析得出的默认值白丢。
-  // 两形各钉一条，**必须**从默认值里解析出那个 env 名（进枚举）、**不许**出现在 unsupported 里：
-  // 白丢一个可解析的名字，就等于那个旋钮从三腿判据里消失（它不再要求 compose / Env / 白名单齐）。
+  //
+  // **三轮审计点名的盲区**（判据质量问题，不是机件问题）：本格原先只断言「枚举里有那两个名字 +
+  // `unsupported` 为空」，而 `analyzeEnvReads()` 的**文件级字面量收集器**（那一趟 `const|let|var` 写成
+  // 可选的正则）也会把参数默认值文本里的 `DEF_PLAIN = 'ERIX_…'` 当成文件级常量收下 ⇒ 把「参数默认值
+  // 绑定解析」整块拆掉，那两个名字仍然在枚举里、`unsupported` 仍然为空 ⇒ 本格照样绿 = 没牙。
+  // 现在夹具里放**同名但值不同**的外层常量，并且**直接断言遮蔽表本身**：
+  //   · 枚举里必须是**默认值**那两个名字：外层同名值一旦出现 = 默认值绑定没进遮蔽表（幻影 key）
+  //   · `unsupported` 必须为空：可解析的名字不许被丢进 fail-closed 清单（丢一个 = 那个旋钮消失）
+  //   · 遮蔽表里必须有「那个名字 → 那个字面量」的绑定：钉的是**解析结果**，不是下游侥幸
   const src = [
+    "const DEF_PLAIN = 'ERIX_A5_DEF_OUTER_PLAIN';",        // 同名外层常量：默认值解析没接上就会被它顶替
+    "const DEF_ALIAS = 'ERIX_A5_DEF_OUTER_ALIAS';",
     "export function plainDefault(DEF_PLAIN = 'ERIX_A5_DEF_PLAIN_OK') { return process.env[DEF_PLAIN]; }",
     "export function aliasedDefault({ k: DEF_ALIAS = 'ERIX_A5_DEF_ALIAS_OK' } = {}) { return process.env[DEF_ALIAS]; }",
   ].join('\n');
   const { keys, unsupported } = scanFixture('param-default-resolvable', src);
   assert.deepEqual(keys, ['ERIX_A5_DEF_ALIAS_OK', 'ERIX_A5_DEF_PLAIN_OK'],
-    `两个可解析的参数默认值没全进枚举（实际 ${JSON.stringify(keys)}）：默认值解析不出就被当成动态名，`
-    + '那个旋钮从三腿判据里消失（不是报错，是静默降级）');
+    `两个可解析的参数默认值没全**按默认值**进枚举（实际 ${JSON.stringify(keys)}）：默认值解析不出就被当成`
+    + '动态名（那个旋钮从三腿判据里消失），或被外层同名常量顶替（枚举里是个没人读的幻影 key）');
+  for (const phantom of ['ERIX_A5_DEF_OUTER_PLAIN', 'ERIX_A5_DEF_OUTER_ALIAS']) {
+    assert.ok(!keys.includes(phantom),
+      `${phantom} 进了枚举：那是**外层同名常量**的值，读取点坐在参数默认值的遮蔽区间里，读的是默认值。`
+      + '它出现就说明默认值绑定没进遮蔽表（默认值解析被拆掉）');
+  }
   assert.deepEqual(unsupported, [],
     `可解析的默认值被丢进 unsupported 了（实际 ${JSON.stringify(unsupported.map((u) => u.shape))}）：`
     + '两形（末位 `X = \'ERIX_X\'` / 解构别名 `{ k: NAME = \'ERIX_X\' }`）少解析一形 = 那一形白丢');
+  // 直接钉遮蔽表：默认值必须成为那个名字的区间绑定（不看下游收集器的侥幸）
+  const shadows = analyzeEnvReads(stripComments(src)).shadows;
+  for (const [name, lit] of [['DEF_PLAIN', 'ERIX_A5_DEF_PLAIN_OK'], ['DEF_ALIAS', 'ERIX_A5_DEF_ALIAS_OK']]) {
+    const got = (shadows.get(name) ?? []).map((s) => (s.lits ? [...s.lits] : null));
+    assert.ok(got.some((l) => l != null && l.length === 1 && l[0] === lit),
+      `参数默认值没被解析成遮蔽绑定（要求 ${name} → [${JSON.stringify(lit)}]，实际 ${JSON.stringify(got)}）：`
+      + '默认值解析被移除时，文件级字面量收集器仍会把那个名字**顺带**收进静态表 ⇒ 只看枚举与 unsupported '
+      + '两本账看不出机件被拆（审计点名的假绿形状），所以这里钉的是解析结果本身');
+  }
 });
 
 test('活二⑳ 「不许猜」的边界仍在：rest 参数 / 无默认值的解构成员 / 解析不出的默认值都得进 unsupported', () => {
@@ -1672,6 +1695,108 @@ test('活二⑳ 「不许猜」的边界仍在：rest 参数 / 无默认值的�
   ],
     `三形逐条登记的动态读不对（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}）：`
     + '少一条就是那一形被猜成了某个名字（rest / 解构成员 / 不可解析默认值）');
+});
+
+test('活二㉑ 嵌套解构要**逐层**进遮蔽表：`{ a: { b: X } }` 漏一层 = 幻影 key 进枚举而 unsupported 为空', () => {
+  // 三轮审计的假绿：`function f({ a: { b: KEY } }) { return process.env[KEY] }` 里 `KEY` **没进遮蔽表**
+  // ⇒ 外层同名常量把那条动态读错记成静态 key（实测 keys=["ERIX_AUDIT_PHANTOM"]、unsupported=[]）。
+  // 旧 `paramBindingsIn()` 只把「冒号右边是个简单标识符」当绑定；冒号右边还是解构时，递归进去的那个片段
+  // 以 `a:` 开头 ⇒ 既不是名字也不是 `{`/`[` ⇒ **静默返回空**（= 这里没遮蔽），于是闸门全绿。
+  // 每一层都要有名字进来：对象套对象 / 对象套数组 / 数组套对象 / 数组套数组（带洞）/ rest 的目标是解构 /
+  // 箭头参数的嵌套解构。带默认值的那一形方向相反（**必须解析成那个常量**，见⑲同一口径）。
+  const src = [
+    "const NEST_ENV = 'ERIX_A5_NESTED_PHANTOM';",
+    "const CTRL_ENV = 'ERIX_A5_NESTED_CTRL_OK';",
+    'export function objInObj({ a: { b: NEST_ENV } }) { return process.env[NEST_ENV]; }',       // 审计原形
+    'export function objInArr({ a: [NEST_ENV] }) { return process.env[NEST_ENV]; }',
+    'export function arrInObj([{ x: NEST_ENV }]) { return process.env[NEST_ENV]; }',
+    'export function arrInArr([, { x: [NEST_ENV] }]) { return process.env[NEST_ENV]; }',         // 洞 + 嵌套
+    'export function arrRest([first, ...[NEST_ENV]]) { return process.env[NEST_ENV]; }',         // rest 的目标
+    "export function nestedDefault({ a: { b: DEF_NEST = 'ERIX_A5_NESTED_DEF_OK' } }) { return process.env[DEF_NEST]; }",
+    'export const arrowNested = ({ a: { b: NEST_ENV } }) => process.env[NEST_ENV];',             // 箭头那一形
+    'export const ctrl = process.env[CTRL_ENV];',                                                 // 对照组
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('nested-destructuring', src);
+  assert.ok(!keys.includes('ERIX_A5_NESTED_PHANTOM'),
+    'ERIX_A5_NESTED_PHANTOM 只出现在**被参数遮蔽**的读形里却进了枚举（实际 ' + JSON.stringify(keys) + '）：'
+    + '那一层的解构成员没进遮蔽表 ⇒ 动态读沿用了文件级同名常量 = 幻影 key，而真的动态读在 unsupported 里隐形');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`),
+    [3, 4, 5, 6, 7, 9].map((n) => `fx.js:${n} process.env[NEST_ENV]`),
+    `六形嵌套解构的动态读没**逐条**进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}）：`
+    + '少一条就是那一形（对象套对象 / 对象套数组 / 数组套对象 / 数组套数组带洞 / rest 目标 / 箭头参数）没被递归到');
+  assert.deepEqual(keys, ['ERIX_A5_NESTED_CTRL_OK', 'ERIX_A5_NESTED_DEF_OK'],
+    `枚举不对（实际 ${JSON.stringify(keys)}）：嵌套里**解析得出的默认值**（ERIX_A5_NESTED_DEF_OK）必须在，`
+    + '没被遮蔽的静态对照（ERIX_A5_NESTED_CTRL_OK）也必须在 —— 少任何一个都是把「遮蔽」与「解析」算错方向');
+});
+
+test('活二㉒ ASI 箭头（省略分号）：表达式体必须在行尾结束，但**续行形状**不许跟着一起算窄', () => {
+  // 三轮审计的假红：`const f = (KEY) => process.env[KEY]` 换行后接 `process.env[KEY];` ⇒ **两条**读取都进
+  // `unsupported`、`keys=[]`。`expressionBodyEnd()` 原先只列「哪些开头算边界」（关键词清单），下一行以普通
+  // 标识符 `process` 开头不算边界 ⇒ 遮蔽拉到文件尾，箭头**之后**那条读外层常量的静态读被误判成动态。
+  // 反向判据（只有「能接在上一行」的开头才算续行）有两个方向，两个都要钉：
+  //   · 过宽（旧口径）：ASI 之后那条静态读从枚举里消失、unsupported 多一条
+  //   · 过窄（矫枉过正）：`.concat()` / `??` / 跨行三元那些**还在体内**的读形被当成体外 ⇒ 它们会错记成
+  //     外层同名常量（幻影 key）并少几条 unsupported
+  const src = [
+    "const ASI_ENV = 'ERIX_A5_ASI_AFTER_OK';",
+    'export const asi = (ASI_ENV) => process.env[ASI_ENV]',   // 省略分号：体只能到本行为止
+    'process.env[ASI_ENV];',                                   // 外层作用域的静态读 ⇒ 必须进枚举
+    "const CHAIN_ENV = 'ERIX_A5_CHAIN_PHANTOM';",
+    'export const chain = (CHAIN_ENV) => process.env[CHAIN_ENV]',
+    '  ?? process.env[CHAIN_ENV];',                            // 续行：仍在体内
+    'export const dot = (CHAIN_ENV) => process.env[CHAIN_ENV]',
+    '  .concat(process.env[CHAIN_ENV]);',                      // 续行：`(K) => a\n  .b(K)` 同一形
+    "const TERN_ENV = 'ERIX_A5_TERN_PHANTOM';",
+    'export const tern = (TERN_ENV) => flag',
+    '  ? process.env[TERN_ENV]',
+    '  : process.env[TERN_ENV];',                              // 跨行三元：两支都在体内
+    "const SEMI_ENV = 'ERIX_A5_SEMI_AFTER_OK';",
+    'export const semi = (SEMI_ENV) => process.env[SEMI_ENV];',  // 分号收尾：体到此为止
+    'process.env[SEMI_ENV];',
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('asi-arrow-body-end', src);
+  assert.deepEqual(keys, ['ERIX_A5_ASI_AFTER_OK', 'ERIX_A5_SEMI_AFTER_OK'],
+    `箭头**之后**那两条外层静态读没进枚举（实际 ${JSON.stringify(keys)}）：表达式体的边界算宽了 —— `
+    + '省略分号时体必须在行尾（ASI）结束，不许把下一行吞进遮蔽区间（吞了就是一条静态 key 从三腿判据里隐形）');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), [
+    'fx.js:2 process.env[ASI_ENV]',
+    'fx.js:5 process.env[CHAIN_ENV]',
+    'fx.js:6 process.env[CHAIN_ENV]',
+    'fx.js:7 process.env[CHAIN_ENV]',
+    'fx.js:8 process.env[CHAIN_ENV]',
+    'fx.js:11 process.env[TERN_ENV]',
+    'fx.js:12 process.env[TERN_ENV]',
+    'fx.js:14 process.env[SEMI_ENV]',
+  ],
+    `体内动态读该逐条登记的清单不对（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}）：`
+    + '少一条就是体被算窄了（`??` / `.concat()` / 跨行三元那些续行还在体内，把它们当体外就会错记成外层同名常量）；'
+    + '多一条就是体被算宽了（把 ASI 之后的外层读也圈了进来）');
+  for (const phantom of ['ERIX_A5_CHAIN_PHANTOM', 'ERIX_A5_TERN_PHANTOM']) {
+    assert.ok(!keys.includes(phantom),
+      `${phantom} 进了枚举：体内（含续行那几行）的读形被算到了体**外面**，于是沿用文件级同名常量 = 幻影 key`);
+  }
+});
+
+test('活二㉓ 解构形状解析不出 ⇒ fail loudly 进 unsupported，不许静默当成「这里没遮蔽」', () => {
+  // ㉑把能认的形状收全了；这一格钉**认不出**的那些：不许静默返回「没绑定」（那等于外层同名常量继续生效，
+  // 与㉑那个假绿同形），必须把名字按「遮蔽但解析不出」记账 ⇒ 读形逐条进 `unsupported`。
+  // 三形都不是合法解构（`键: 成员表达式` / `键: 调用` / 括号不配对），共同点是**静态上认不出绑定目标**。
+  const shapes = {
+    'member-expression-target': 'export function weird({ a: LEAK_ENV.c }) { return process.env[LEAK_ENV]; }',
+    'call-target': 'export function callish({ a: LEAK_ENV() }) { return process.env[LEAK_ENV]; }',
+    'unbalanced-brackets': 'export function broken({ a: [LEAK_ENV } }) { return process.env[LEAK_ENV]; }',
+  };
+  for (const [name, line] of Object.entries(shapes)) {
+    const src = ["const LEAK_ENV = 'ERIX_A5_OPAQUE_PHANTOM';", line].join('\n');
+    const { keys, unsupported } = scanFixture(`opaque-${name}`, src);
+    assert.deepEqual(keys, [],
+      `形状「${name}」的扫描结果里有具体 env 名（实际 ${JSON.stringify(keys)}）：认不出的解构被当成`
+      + '「这里没绑定」⇒ 外层同名常量被错记成静态 key。错记比漏记更坏：枚举里那个 key 看起来是对的，'
+      + '而真的动态读在 unsupported 里隐形（fail-closed 被绕过）');
+    assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), ['fx.js:2 process.env[LEAK_ENV]'],
+      `形状「${name}」那条动态读没进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => u.shape))}）：`
+      + '解析不出就必须点名，不许静默放行（不设「记为已知边界」）');
+  }
 });
 
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
