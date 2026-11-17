@@ -3263,6 +3263,13 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 }
 ```
 
+⚠ 例子里的 `no_row` 是「表不存在 / 一行都没有」那一档。已部署库上更常见的形态是「行在、但没人
+存过」（迁移 0040 种的那一行）：那一档 `reason` 是 `null`，而 `updatedAt` / `updatedBy` **仍按
+「从未保存过」报 `null`/`null`**。理由：种行走 `INSERT … ON CONFLICT DO NOTHING`，而
+`updated_at` 是 `timestamptz NOT NULL DEFAULT now()` ⇒ 全新库上那一列**有值**（迁移跑过的那一刻），
+`updated_by` 才是 NULL。只看 `updated_at` 就等于让界面宣称一个管理员从没做过的「最后保存」，
+所以「从未保存」的定义定在**没有写者**上（判据 `P14`；不在迁移里动 `updated_at`，那会牵动已部署库）。
+
 ⚠ 例子里的 `9021` 只是「今天这一份内置模板按 `example` 渲染出来的字节数」，**不是契约值** ——
 模板一改它就变（内置模板的真相在 `materializer.js`，红线是它全文零端口数字、零伞域字面量）。
 
@@ -3278,7 +3285,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 | `agentsMd.renderedLimitBytes` | 注入侧对**整份** `~/AGENTS.md` 的上限（= `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES`，跨包对账由判据 `P9` 钉住，不许手抄）|
 | `titlePrompt.defaultText` | 内置 `TITLE_SYSTEM_PROMPT` 全文（`""` 时实际发出去的就是它）|
 | `readonly[]` | 第一期**不开放在线覆写**的那 4 条，**只给 `key`**：portal 镜像不含 `runner/`（`portal/Dockerfile` 只 `COPY portal/ portal/`），运行时读不到 ⇒ 显示全文就是撒谎。中文说明在前端 i18n（zh + en）|
-| `updatedAt` / `updatedBy` | 最后一次保存的时间与操作人（从未保存过 ⇒ `null`/`null`）|
+| `updatedAt` / `updatedBy` | 最后一次保存的时间与操作人；「从未保存过」（= `updated_by IS NULL`，即**没有写者**，而不是「没有那一行」）⇒ 两个字段一起 `null`；见上面那条注记与判据 `P14` |
 
 ⚠ **上面那两个字节数不是「存得进去」的承诺**（评审 F2，判据 `P13`）：
 `templateBytes` / `effectiveBytes` / `effectiveText` 都按**固定示例工位名**
@@ -3390,7 +3397,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > `deploy/migrations/0040-platform-prompts.sql`。
 > ⚠ `materializer.js` ⇄ `platform-prompts.js` 是**双向引用**：两边都只在**函数体里**用对面的导出，
 > 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
-> 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P11b` + `T1`/`T1b`）、
+> 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P14` 及其变体 + `T1`/`T1b` + `D1`）、
 > `portal/test/materializer.test.js`（「默认渲染逐字节不变」由该文件 8 条 `renderHomeAgentsMd：…`
 > 既有断言承担，本分支对它们零改动；**这里不用 `M` 字头的判据号** —— 它在本仓已被
 > `materializer.test.js:750`（用户自建 `AGENTS.md`/`.gitignore` 在 stale 清理后存活）占用）、

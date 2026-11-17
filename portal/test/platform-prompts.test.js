@@ -363,6 +363,34 @@ test('P2c 读侧不做长度校验：手工 UPDATE 进来的超长值照常工�
   assert.equal(title.isDefault, false);
 });
 
+test('P14 「从未保存过」的定义是没有写者：迁移种的那一行（`updated_by` 为 NULL）⇒ `updatedAt` 与 '
+  + '`updatedBy` 一起回 null（新库上不许报一个没人做过的「最后保存」）', async () => {
+  // 事实链：`0040-platform-prompts.sql` 会 `INSERT INTO platform_prompts (id) VALUES (1)` 种下首行，
+  // 而那一列是 `updated_at timestamptz NOT NULL DEFAULT now()` ⇒ 全新库上那一行**存在**且
+  // `updated_at` **非 null**（那个值是「迁移跑过的时刻」），`updated_by` 才是 NULL。
+  // DTO 若只看 `updated_at` 非空，界面就会宣称一个管理员从没做过的「最后保存」（评审 R3）。
+  // 裁决：**不在迁移里动 `updated_at`**（那会牵动已部署库），口径在 DTO 这一侧。
+  const seededAt = new Date('2026-11-16T00:00:00.000Z');
+  const seededRow = {
+    agents_md_addendum: '', agents_md_override: '', title_prompt: '',
+    updated_at: seededAt, updated_by: null,
+  };
+  const seedPool = new PromptsFakePool({ row: seededRow });
+  const dto = await getPlatformPrompts({ pool: seedPool, log: console });
+  assert.equal(dto.reason, null, '行确实在 ⇒ `reason` 仍是 null（这条只管「谁写的」，不管「有没有行」）');
+  assert.equal(dto.updatedAt, null, '有行但没有写者 ⇒ 不许把迁移那一刻当「最后保存」报出去');
+  assert.equal(dto.updatedBy, null, '写者本来就是 null（与上面同一口径，不许只抹一个）');
+
+  // 常驻反例：`updated_by` 非空 ⇒ 两个字段**都出真值**（这条绿不许是靠把 `updatedAt` 一律拍成
+  // null 糊出来的）。
+  const byWriter = { ...seededRow, updated_by: ACTOR, agents_md_addendum: '已存的约定' };
+  const savePool = new PromptsFakePool({ row: byWriter });
+  const saved = await getPlatformPrompts({ pool: savePool, log: console });
+  assert.equal(saved.updatedAt, seededAt.toISOString(), '有写者 ⇒ 时间必须照出（不许连坐成 null）');
+  assert.equal(saved.updatedBy, ACTOR, '有写者 ⇒ 操作人必须照出');
+  assert.equal(saved.addendum.isDefault, false, '反例那一行确实不是默认态（不然两个绿都是空跑）');
+});
+
 // ---------------------------------------------------------------------------
 // 2. 写侧：渲染规则与两条闸（`P3`–`P6`）
 // ---------------------------------------------------------------------------

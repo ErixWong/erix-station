@@ -1020,7 +1020,7 @@ export const en = {
       never: '—',
       updatedAt: 'Last saved',
       updatedBy: 'Saved by',
-      updatedAtNever: 'Never saved (the row does not exist yet)',
+      updatedAtNever: 'Never saved (nobody has saved a value in the admin console yet)',
       updatedAtUnparsable: 'Unparsable timestamp: {value}',
       reasonNoRow: 'Nothing has ever been saved here, so the built-in prompts are what goes out; saving a value in this page overrides it.',
       reasonReadFailed: 'platform_prompts could not be read (missing table or database hiccup), so the built-in prompts are in force; materialization and renaming keep working (this is never a 500).',
