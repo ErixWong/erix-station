@@ -3434,7 +3434,7 @@ data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id"
 | 17 | `queue_update` | **portal 合成（issue #370）**：入队 / 整队取回 / 终态出队（含被闸门挡下）三处推 |`steering: [{id, content}]`、`follow_up: [{id, content}]`（**恒为全量快照，不是增量**）、`blocked: string \| null`（暂停投递原因，当前值域 `container_not_running` / `deliver_failed` / `not_deliverable_at_terminal`；界面按它出本地化文案，**服务端只发码不发话**，#294）、`delivered_run_id: string \| null`（**本帧存在的原因是一条队列输入被投出去了** ⇒ 这个 run 刚被建起来；前端只有在「本机没有活跃 run」时接管它，见下）。**信封 `seq` 与 `run_id` 均为 `null`**：它不是历史事件而是**状态**，真相在 `queued_inputs`，可由会话详情全量重建 ⇒ **不落 `run_events`、不进历史白名单、不参与回放**（同第 16 类之外的 `session_updated` 那一支）。 |
 | 18 | `compaction_strategy_fallback` | **引擎 `onEvent`**（additive `LoopEvent`，erix-agent 0.25.0 上游 #464-A；发射点 `orchestrator.js:3193`） | `round: number`、`detail: string`（首句是**固定原文**，宿主可直接断言）、`runId`（= 引擎 store key = transcriptKey = sessionId，**不是** station run id，#81 老坑）。语义：**你配在 `context.strategy` 上的折叠策略没生效，实跑的是引擎库层默认的 `sliding-window`**（整轮丢头、不摘要）。条件：仅当 `context.strategy` **未配置**时发，每 run 恰好一条 ⇒ 本站恒配 `fold-llm`（#438 切片 B 起），**这条一响就意味着本站的配置没送到引擎**（#392 那个回归的机读信号）。界面：中性分隔行（`stream.event.strategyFallback`）；runner 另落一条 `warn` LOG（`runner/lib/engine-notices.js`）。 |
 | 19 | `model_metadata_missing` | **引擎 `onEvent`**（erix-agent 0.18.0 上游 #182；发射点 `orchestrator.js:1040`） | `runId`（同上口径）、`detail: string`。**注意：本事件没有 `round`**（引擎不给，文案也不许编）。语义：模型上下文元数据取不到 ⇒ **本 run 的压缩闸门与聚合输出预算整条关闭**。本站 #309/#316 的行为级测早拿它当判据（「压缩关掉必须是可观测的」），但今天只有测试看得见——#421 之后实时 / 刷新 / LOG 三条路都看得到。界面：中性分隔行（`stream.event.metadataMissing`）。 |
-| 20 | `persistence_capability_degraded` | **引擎 `onEvent`**（erix-agent 0.20.0 上游 #173 PR-B；发射点 `orchestrator.js:1011`） | `runId`、`method: string`（缺的那个 store 能力名）、`detail: string`。语义：宿主 store 没实现某个持久化能力 ⇒ **那一步整个 run 跳过（中途崩溃不可恢复）**，每 run 每个方法最多一条。本站实现了 `saveRunSnapshot`（旧名 `saveCheckpoint`/`appendCheckpoint` 只是引擎兼容别名）⇒ 今天不响，一响就是 portal 侧 store 面回退了。界面：中性分隔行（`stream.event.capabilityDegraded`）。 |
+| 20 | `persistence_capability_degraded` | **引擎 `onEvent`**（erix-agent 0.20.0 上游 #173 PR-B；发射点 `orchestrator.js:1011`） | `runId`、`method: string`（缺的那个 store 能力名）、`detail: string`。语义：宿主 store 没实现某个持久化能力 ⇒ **那一步整个 run 跳过（中途崩溃不可恢复）**，每 run 每个方法最多一条。本站**曾经**实现 `saveRunSnapshot`（旧名 `saveCheckpoint`/`appendCheckpoint` 只是引擎兼容别名），**2026-11-17 起已随 run snapshot 退役删除（issue #640）**：erix-agent 0.33.0 不再调用它（上游 `host-upgrade-guide-0.33.0.md` §2.2 已把它从能力面摘掉）⇒ 这个码对本仓**已不可能再因它而响**；一响就说明是别的 store 能力缺失（如 `saveRunState` / `appendRound`）。界面：中性分隔行（`stream.event.capabilityDegraded`）。 |
 | 21 | `resume_journal_skipped` | **引擎 `onEvent`**（erix-agent 0.24.0 上游 #420/#421；发射点 `orchestrator.js:2525`） | `runId`、`round: number`、`reason: string`（当前实测值 `crash_round_assistant_not_in_ledger`）、`count: number`。语义：**崩溃那一轮的助手消息不在账上 ⇒ 那批工具结果本次没入账**，下一次恢复仍靠快照兜住。本站天天在恢复会话 ⇒ 可达。界面：中性分隔行（`stream.event.resumeJournalSkipped`，`count` 缺 ⇒ 「若干」，`round` 缺 ⇒ `?`，绝不拿 0 冒充，#283）。 |
 | 22 | `run_outcome` | **引擎 `onEvent`**（erix-agent 0.21.0 上游 #165；记录体 `judge-record.js:105`，正常终局走 `termination.js:700`、抛错终局走 `orchestrator.js:1197`） | `runId?`、`model?`、`judgeModel?`、`rounds?`、`judgeRecordCount?`、`termination?`、`verification?`（全是条件写入，没给就**没这个键**）。语义：**每 run 恰好一条**的 run 级终局汇总（`runOutcomeEmitted` 去重）。**本站今天不展示它**：它与第 10 类 `run_end` 语义重叠（rounds / 终局）且无读者，故**不进 §4.4a 历史白名单也不进 `HISTORY_REPLAY_TYPES`**（订得到：水位线与 `hooks.onEvent` 观察面拿得到；runner 落一条 `info` LOG）。豁免理由钉在 `portal/test/event-surface-contract.test.js`——等 §12 台账 / 结算面板真用它时再接。 |
 | 23 | `compaction_deferred` | **引擎 `onEvent`**（erix-agent 0.29.0 的 `LoopEvent` 联合类型新增；发射点 `orchestrator.js:4884`） | `round: number`、`reason: string`（当前实测值 `pending_tool_use`）、`detail: string`。语义：**本轮没折**——请求尾部是「有 `tool_use`、没 `tool_result`」的未结清回合（`max_tokens` 续写还在飞），折了就会把半截工具调用写成摘要或破坏 `tool_use`/`tool_result` 配对；下一轮对完整回合再折。界面：中性分隔行（`stream.event.compactionDeferred`，`round`/`reason` 缺 ⇒ `?`，绝不拿 0 冒充）；runner 另落一条 **`info`** LOG（每轮最多一条的正常推迟，不占 warn 面）。 |
@@ -3517,7 +3517,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 - run `status → failed`，`run.error = { "code": "checkpoint_failed", "retryable": true, ... }`；`run_end` 事件带同样 `error`。
 - **宿主 store adapter 必须把 `checkpoint_failed` 识别为可重试并包 retry**（规格 §9.3-2，erix ≤0.3.5 无内建重试，3 次退避见 runner-integration §9.2）；重试耗尽后透传 → run 终态 `failed`。
 - **`checkpoint_failed` 是终态、不自动 re-claim**（A3 定稿，model.md §2.9 / runner-integration R20）：它是引擎在工具执行前/后 checkpoint 写失败时的 fail-closed 判定（**不是**进程崩溃），存储故障持续时 re-claim 只会原地重演，故直接终态 `failed`；终态后不可 resume。
-- **恢复口径（前端提示）**：「任务因平台存储故障中止，已持久化的进度（checkpoint/transcript）未丢失，请稍后重新发送」——**重发消息 = 新 run**（`POST /messages` 产生新 run，本期无跨 run resume）；**同 run 的恢复 = re-claim**（仅进程崩溃场景：租约到期后 re-claim 领同一 run，`resume:true`、`attempt > 1`，从最新 checkpoint 续跑，runner-integration §6.4）。
+- **恢复口径（前端提示）**：「任务因平台存储故障中止，已持久化的进度（**账本** transcript/rounds）未丢失，请稍后重新发送」——**重发消息 = 新 run**（`POST /messages` 产生新 run，本期无跨 run resume）；**同 run 的恢复 = re-claim**（仅进程崩溃场景：租约到期后 re-claim 领同一 run，`resume:true`、`attempt > 1`，从最新 checkpoint 续跑，runner-integration §6.4）。
 - ~~⚠️ 待决策者确认~~ **已定稿（D2'）**：存储为纯 DB（Postgres），不采纳「本地 file 优先 + DB 异步复制」装饰器；中心 DB 抖动风险由 adapter 重试包装补偿（runner-integration §9.2），抖动超过重试窗口会使在跑任务 `checkpoint_failed` 失败（§6.2 恢复口径）。
 
 ### 6.3 容器不可达 → `container_unreachable`（503）
@@ -3586,9 +3586,13 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 ## 9. 内部端点（internal）：容器 → portal
 
-> **实现状态（WP3a，2026-09）**：本节 U1–U12 + `GET /stream` 已由 `portal/src/internal.js` 实现（纯 DB 逻辑）+ `portal/src/http.js` 路由（Bearer token 鉴权 + `X-Claim-Token` 租约校验），并经 `portal/integration/wp3a-e2e.mjs` 真机实测（claim/状态机/事件 seq/re-claim/并发 claim/SSE 下行/mock 网关注入链）。**U13（run 终态产物上传，issue #64 R1）已随 `portal/src/artifacts.js` 实现**：body = tar.gz 字节流 + `X-Sha-256`，终态后租约已释放故**不校验 X-Claim-Token**（鉴权 = per-container token + run 属主校验），大小上限 `ERIX_ARTIFACT_MAX_BYTES`（默认 20MB），落盘 `ERIX_ARTIFACTS_ROOT/<runId>.tar.gz` + 写 `artifacts` 表（`manifest` jsonb，迁移 0005）。与契约的两处实现口径：① U7 recall 已实现为最小子串扫描（不返回 501）；② 读端点（U6/U7/U9/U11）在 **run 终态后放宽租约校验**（终态仍可读，与 §9.7/§9.8「终态 run 仍可读」一致）——非终态 run 仍严格校验 `X-Claim-Token`。U5 的 fold 更新（同 dedupKey、`folded` false→true）视为合法 UPDATE（runner §9.3）。
+> **实现状态（WP3a，2026-09）**：本节 U1–U12 + `GET /stream` 已由 `portal/src/internal.js` 实现（纯 DB 逻辑）+ `portal/src/http.js` 路由（Bearer token 鉴权 + `X-Claim-Token` 租约校验），并经 `portal/integration/wp3a-e2e.mjs` 真机实测（claim/状态机/事件 seq/re-claim/并发 claim/SSE 下行/mock 网关注入链）。**U13（run 终态产物上传，issue #64 R1）已随 `portal/src/artifacts.js` 实现**：body = tar.gz 字节流 + `X-Sha-256`，终态后租约已释放故**不校验 X-Claim-Token**（鉴权 = per-container token + run 属主校验），大小上限 `ERIX_ARTIFACT_MAX_BYTES`（默认 20MB），落盘 `ERIX_ARTIFACTS_ROOT/<runId>.tar.gz` + 写 `artifacts` 表（`manifest` jsonb，迁移 0005）。与契约的两处实现口径：① U7 recall 已实现为最小子串扫描（不返回 501）；② 读端点（U6/U7/U11；~~U9~~ 已随 #640 退役）在 **run 终态后放宽租约校验**（终态仍可读，与 §9.7/§9.8「终态 run 仍可读」一致）——非终态 run 仍严格校验 `X-Claim-Token`。U5 的 fold 更新（同 dedupKey、`folded` false→true）视为合法 UPDATE（runner §9.3）。
 
-> 本节的唯一事实来源是 [`../design/runner-integration.md`](../design/runner-integration.md)（下称「runner §x」）§4（portal ↔ agentd 协议）、§7（事件批量与 seq）、§9（store adapter 契约）、§11（凭据模型）；配套数据表见 [`../data/schema.sql`](../data/schema.sql)（`run_events.client_event_id`、`run_queue` 租约字段、`run_checkpoints` 单行、`transcript_rounds.record`）与[规格](../design/fde-platform.md) §10.3。端点编号 U1–U12 与 runner §4.2 一一对应。
+> 本节的唯一事实来源是 [`../design/runner-integration.md`](../design/runner-integration.md)（下称「runner §x」）§4（portal ↔ agentd 协议）、§7（事件批量与 seq）、§9（store adapter 契约）、§11（凭据模型）；配套数据表见 [`../data/schema.sql`](../data/schema.sql)（`run_events.client_event_id`、`run_queue` 租约字段、`transcript_rounds.record`）与[规格](../design/fde-platform.md) §10.3。端点编号 U1–U12 与 runner §4.2 一一对应。
+>
+> ⚠ **编号空洞是有原因的（issue #640）**：run snapshot 那一族（U8/U9 与 session 侧对应端点）自
+> erix-agent 0.33.0 起引擎不再调用 ⇒ 四个端点已删、表由迁移 `0041` 撤掉，**编号不回收**（U8/U9/S3/S4
+> 这些号在历史 PR 与旧 runner 日志里还要被引用）。旧 agentd 若仍打这些路径，拿到的是 `404 not_found`。
 
 三条要点：
 
@@ -3604,7 +3608,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 |---|---|
 | Base URL | `https://station.<base>/api/internal`（容器内 `--add-host station.<base>:<本 FDE 网关 IP>`，经 Traefik host:443，H-B D-5） |
 | 认证头 | `Authorization: Bearer <per-container token>`（每请求） |
-| 租约凭证头 | `X-Claim-Token: <claim_token>`——claim 之后的 run 级端点（U2/U3/U5–U12，含读端点 U6/U7/U9）携带；portal 校验「该 run 当前有效租约 = 此 token」，不匹配 → `409 lease_lost`（防 re-claim 后旧 agentd 双写，runner §4.2/§6.4） |
+| 租约凭证头 | `X-Claim-Token: <claim_token>`——claim 之后的 run 级端点（U2/U3/U5–U12，含读端点 U6/U7；**U9 已退役，#640**）携带；portal 校验「该 run 当前有效租约 = 此 token」，不匹配 → `409 lease_lost`（防 re-claim 后旧 agentd 双写，runner §4.2/§6.4） |
 | 长驻连接 | `GET .../stream`（SSE 下行，§9.12）+ 循环 `POST .../claim`（长轮询，§9.3）；其余为短请求 |
 | 语义基调 | **at-least-once + 幂等**：所有写端点携带客户端幂等键，portal 端 DB 唯一约束兜底；agentd 对所有 5xx/网络错误无限指数退避重试（§9.13） |
 
@@ -3619,8 +3623,8 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | U5 | `PUT /api/internal/runs/:id/transcript/rounds/:round` | store：`appendRound`（§9.7） | `UNIQUE(run_id, round)` + `dedupKey` |
 | U6 | `GET /api/internal/runs/:id/transcript` | store：`load`（§9.7） | 只读 |
 | U7 | `GET /api/internal/runs/:id/transcript/recall` | store：`recall`（§9.7；P1 可 501） | 只读 |
-| U8 | `PUT /api/internal/runs/:id/checkpoint` | store：`saveCheckpoint` / `appendCheckpoint`（§9.8） | 单行覆盖写 + revision CAS |
-| U9 | `GET /api/internal/runs/:id/checkpoint/latest` | store：`loadLatestCheckpoint`（§9.8） | 只读 |
+| ~~U8~~ | ~~`PUT /api/internal/runs/:id/checkpoint`~~ | **已退役（#640）** | 任何方法都 `404 not_found`（见 §9.8） |
+| ~~U9~~ | ~~`GET /api/internal/runs/:id/checkpoint/latest`~~ | **已退役（#640）** | 同上 |
 | — | `PUT /api/internal/runs/:id/runstate` | store：`saveRunState` / markRunState 终态标记（§9.8a，0.9.0 八方法契约，issue #43） | `runs.run_state` jsonb 合并写 |
 | — | `GET /api/internal/runs/:id/runstate` | store：`loadRunState`（§9.8a） | 只读；无 → 204 |
 | U10 | `POST /api/internal/runs/:id/approvals` | 创建审批单（§9.10） | 一个工具调用至多一单 |
@@ -3629,8 +3633,8 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | U13 | `PUT /api/internal/runs/:id/artifact` | **run 终态产物 bundle 上传**（issue #64 R1，runner §6.6） | `UNIQUE(run_id, kind)`；重复上传 409 `artifact_exists`（不覆盖） |
 | S1 | `GET /api/internal/transcript/:key` | store：`load`（session 维度，§9.8b，issue #81 P2） | 只读 |
 | S2 | `PUT /api/internal/transcript/:key/rounds/:round` | store：`appendRound`（§9.8b） | `(transcript_key, dedup_key)` 部分唯一索引 |
-| S3 | `PUT /api/internal/transcript/:key/checkpoint` | store：`saveCheckpoint` / `appendCheckpoint`（§9.8b） | 单行覆盖写 + revision CAS |
-| S4 | `GET /api/internal/transcript/:key/checkpoint/latest` | store：`loadLatestCheckpoint`（§9.8b） | 只读；无 → 204 |
+| ~~S3~~ | ~~`PUT /api/internal/transcript/:key/checkpoint`~~ | **已退役（#640）** | 任何方法都 `404 not_found`（见 §9.8b） |
+| ~~S4~~ | ~~`GET /api/internal/transcript/:key/checkpoint/latest`~~ | **已退役（#640）** | 同上 |
 | S5 | `PUT /api/internal/transcript/:key/runstate` | store：`saveRunState` / markRunState 终态标记（§9.8b） | `chat_sessions.engine_run_state` jsonb 合并写 |
 | S6 | `GET /api/internal/transcript/:key/runstate` | store：`loadRunState`（§9.8b） | 只读；无 → 204 |
 | — | `GET /api/internal/stream` | SSE 下行通道（§9.12） | — |
@@ -4068,78 +4072,28 @@ query：`from_round`（含，默认 0）/ `to_round`（含，默认最大）/ `p
 
 > ⚠️ **P1 可暂未实现本端点**：此时返回 `501`，错误码 `not_implemented`（`retryable: false`）。**worker 降级行为**：adapter 把 `501 not_implemented` 映射为 recall 工具「不可用」，引擎本轮**不带 recall 能力继续**（judge 可能记 `degraded`，§5.3 类型 12）——**不因 recall 缺失中断 run**；契约形状保留，后续分期补齐。
 
-### 9.8 checkpoint（U8/U9）
+### 9.8 checkpoint（U8/U9）——**已退役**（issue #640）
 
-#### `PUT /api/internal/runs/:id/checkpoint`（U8：saveCheckpoint / appendCheckpoint）
+> **这四个端点不存在了**：`PUT/GET /api/internal/runs/:id/checkpoint{,/latest}`（U8/U9）与
+> `PUT/GET /api/internal/transcript/:key/checkpoint{,/latest}`（S3/S5 编号见 §9.8b 的表）。
+> 带**有效**内部认证打过去得到的是 `404 not_found`（不是 405、不是 500）——判据：
+> `portal/test/http-runstate.test.js` 的「#640 退役回归」那条用例。
 
-请求：
+**为什么删**：erix-agent 0.33.0（上游 #838 S2，本站 #530）把 run snapshot 整个退役，引擎不再调
+`saveRunSnapshot` / `loadLatestRunSnapshot`（0.33.0 源码现查零命中），恢复只靠账本
+（`transcript_rounds` + `transcript_recovery_rows`）。本站随即拆掉整条竖切：runner 侧两个 store 方法与
+agentd 的四条转发、portal 侧四个路由与四个存储函数、以及承载它的快照表（迁移
+`0041-retire-run-checkpoints.sql` `DROP TABLE`）。真库现查：17 行 / 565,248 B、
+`max(updated_at)` = 2026-11-11（0.33 上线后零写入）、FK 是 child 端且零视图/触发器依赖。
 
-```json
-{
-  "revision": 7,
-  "snapshot": { "round": 3, "executedToolIds": [ "..." ], "...": "上游 checkpoint 快照原样" }
-}
-```
+**编号与历史口径**：U8/U9/S3/S4 的号**不回收**；本节以下旧内容（revision CAS、`checkpoint_stale`、
+`204` 语义、0034 的终态读空注记）作为历史保留在 `docs/maintenance/task-ledger.md`
+（§8.126.2 等）与 git 历史里，**不再是活契约**。
 
-| 字段 | 说明 |
-|---|---|
-| `revision` | **每 run 单调版本号**（worker 每 run 从 0 递增），CAS 依据（runner §9.5） |
-| `snapshot` | 上游 checkpoint 快照，原样落 `run_checkpoints.snapshot` |
-
-> **`seq` 已作废为本地元数据**：`seq` 仅为 worker 本地计数（其值在实现上可等于 `revision`），**不进请求、不落库**（`run_checkpoints` 无 `seq` 列）；权威单调性由 DB 的 `revision` 列保证（runner §9.5）。
-
-响应 `200`（写入成功，或同一 `revision` 的幂等重放）。
-
-**幂等与 revision CAS**（对齐 runner §9.5，与 schema.sql `run_checkpoints` 一致）：
-
-```sql
-INSERT INTO run_checkpoints (run_id, snapshot, revision, updated_at)
-VALUES ($1, $2, $3, now())
-ON CONFLICT (run_id) DO UPDATE
-  SET snapshot = EXCLUDED.snapshot, revision = EXCLUDED.revision, updated_at = now()
-  WHERE run_checkpoints.revision < EXCLUDED.revision;
-```
-
-| 情形 | 响应 | 语义 |
-|---|---|---|
-| 无现存行（首次） | `200` | 插入 |
-| `revision > 现存 revision` | `200` | 覆盖写（前进） |
-| `revision <= 现存 revision`（旧/乱序/同值重试） | `409 checkpoint_stale` | CAS 拒绝；worker 侧视为「本快照已过期」，**不重试**（继续以最新为准）。**同 `revision` 重试语义等价于幂等命中**——agentd 对 `checkpoint_stale` 不重试（runner §9.5 / §4.5） |
-
-**resume 续计**：re-claim 后新 worker 先经 U9 读回当前 `revision`，本地计数从 `revision+1` 续起（§6.3-5 / runner §9.5）；无 checkpoint（U9 `204`）→ 从 0 起计。`revision` 是**跨 attempt 连续单调版本**，不因 attempt 重置而回落。
-
-**重试要求**（runner §9.2，fail-closed 语义下的补偿，adapter 必须包 retry）：
-
-| 项 | 策略（⚠️ 参数待确认） |
-|---|---|
-| 重试次数 | 3 次（不含首次） |
-| 退避 | 1s → 2s → 5s（指数，±20% 抖动） |
-| 可重试错误 | 网络错误、5xx、429 |
-| 不可重试 | 4xx → 直接抛（`checkpoint_stale` 除外：视为已过期、不重试） |
-| 耗尽 | 错误透传引擎 → `checkpoint_failed` → run 终态 `failed`（用户口径见 §6.2：重发产生新 run，不自动 re-claim） |
-
-错误：`400 validation_failed`（缺 `revision`/`snapshot` 或 `revision` 非非负整数）；`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`409 run_terminal`（终态 run 不再接受 checkpoint——终态 barrier）；`409 checkpoint_stale`；`429 rate_limited`；5xx 无限退避重试（§9.13）。
-
-#### `GET /api/internal/runs/:id/checkpoint/latest`（U9：loadLatestCheckpoint）
-
-响应 `200`：
-
-```json
-{ "checkpoint": { "snapshot": { "...": "..." }, "revision": 7, "updated_at": "2026-09-12T09:00:10.000Z" } }
-```
-
-无 checkpoint → `204`（adapter 返回 `undefined`；revision 供 resume 从 0 续计，runner §9.5）。只读。
-
-**404/无权限/lease/终态语义**：run 不存在 → `404 run_not_found`；不属本容器 → `403 run_ownership_mismatch`；`X-Claim-Token` 失配 → `409 lease_lost`；**终态 run 仍可读**（checkpoint 不可变、作为审计/resume 记录可查）→ `200`（有则返回）/`204`（无则空）。
-
-> ⚠ **时间边界（自迁移 `0034`，PR #509）：上面那句「终态 run 仍可读」现在只剩「不报错」这一半**——
-> `0034` 的谓词 (a) 专清「run 作用域（`transcript_key IS NULL`）且那个 run 已终态」的快照行，所以**终态 run
-> 的 run-keyed 快照读不到**：本端点对它们返 `204`（**是空，不是错**）。⇒ 调用方必须只对**未完成的 run**读它
-> （它的唯一用途是接力一个没跑完的 run，上游契约钉成 latest-only + optional），**不得**拿它当终态 run 的审计面；
-> 口径与取证见 `docs/data/model.md` §1.11。现役 runner 走的是下面 §9.8b 的 **session 作用域**端点（谓词 (b) 只清
-> 已归档 / 14 天没动的会话 ⇒ 活跃会话每 key 那一行照留），**现役通路零变化**；受影响的只是旧 runner 的 U8/U9 兼容面。
-
-错误：`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`429 rate_limited`；5xx 无限退避重试（§9.13）。
+**仍成立的同名物**（别一起删掉）：错误码 `checkpoint_failed` 仍是**可重试码值域**里的历史值
+（旧档案的重试判定要读它，`runner/lib/termination.js` 写明理由）；`persistence_error.phase` 的
+`checkpoint_before_tool` / `checkpoint_after_tool` 仍要能在旧事件/旧终态里显示；
+事件流里的 `checkpoint` 事件类型、run-state 里恒为 0 的 `deterministic.errors.checkpoint` 与这张表无关。
 
 ### 9.8a runstate（saveRunState / loadRunState，0.9.0 八方法契约，issue #43）
 
@@ -4157,11 +4111,11 @@ ON CONFLICT (run_id) DO UPDATE
 - `{run_state}`：引擎 saveRunState 全量合并（deterministic + semantic）。
 - `{state}`：**引擎终态标记**（succeeded / unverified_error / guard_error / failed / aborted，0.9.0 `termination.js finish()`）——只合并 `state` 字段，**不触碰 `runs.status`**（宿主终态唯一权威仍是 §9.6 U2，runner §6.3-9）。
 
-响应 `200 {ok:true}`。错误：`400 validation_failed`（run_state 非对象 / 两种形态都缺）；`401/403/404` 同 U8；`409 lease_lost`；`409 run_terminal`（终态 barrier，写不再接受）；`429`；5xx 退避重试（§9.13）。
+响应 `200 {ok:true}`。错误：`400 validation_failed`（run_state 非对象 / 两种形态都缺）；`401/403/404` 同其余 run 作用域写端点；`409 lease_lost`；`409 run_terminal`（终态 barrier，写不再接受）；`429`；5xx 退避重试（§9.13）。
 
 #### `GET /api/internal/runs/:id/runstate`（loadRunState）
 
-响应 `200 { "run_state": { ... } }`；从未写入 → `204`（adapter 返回 `undefined`，resume 按「无状态」正常继续）。**终态 run 仍可读**（读语义同 U9）。错误：`401/403/404`；非终态时 `409 lease_lost`；`429`；5xx 退避重试（§9.13）。
+响应 `200 { "run_state": { ... } }`；从未写入 → `204`（adapter 返回 `undefined`，resume 按「无状态」正常继续）。**终态 run 仍可读**（~~读语义同 U9~~；U9 已随 #640 退役）。错误：`401/403/404`；非终态时 `409 lease_lost`；`429`；5xx 退避重试（§9.13）。
 
 ### 9.8b session transcript（S1–S6，issue #81 P2）
 
@@ -4169,10 +4123,11 @@ ON CONFLICT (run_id) DO UPDATE
 > 依据 `docs/design/conversation-state.md` §4.1：transcript key 从 runId 切到 **sessionId**（= `:key`），
 > 照抄 erix-agent CLI「预写入 + resume」模式（引擎零改动）。`runId` 退回纯运维身份。
 
-**与 run 作用域端点（U5–U9/runstate）并存**：U 系列端点不动，旧 runner 继续可用（向后兼容）；
+**与 run 作用域端点（U5–U7/runstate）并存**：这些端点不动，旧 runner 继续可用（向后兼容）；**U8/U9（run snapshot）已于 2026-11-17 退役（#640）**，不在这些端点之列；
 S 系列端点是 P2 起 runner 的默认路径。存储 = 既有表加列 + 部分唯一索引（评估记录见迁移文件头注释）：
 `transcript_rounds.transcript_key/dedup_key`（生成列，`record->>'dedupKey'`）、
-`run_checkpoints.transcript_key`、`chat_sessions.engine_run_state`。
+`chat_sessions.engine_run_state`。（0006 还给快照表加过 `transcript_key` + 部分唯一索引 —— 那张表已随
+#640 被 `0041` 撤掉，但 **0006 的字节是冻结的**，不改写历史。）
 
 **鉴权三层**（对齐 §9.1 per-container token）：① `Authorization: Bearer`；② session 属主校验
 （`:key` = `chat_sessions.id`，须属于该容器用户，否则 404 `session_not_found` / 403
@@ -4192,8 +4147,8 @@ query 参数 + `X-Claim-Token` 头——writer run 必须属于该 session（否
 |---|---|
 | `GET /api/internal/transcript/:key` | load 全量（`limit`/`cursor` 分页；**cursor 是不透明串** `<round>:<append_seq>`，见下「S1 分页」） |
 | `PUT /api/internal/transcript/:key/rounds/:round` | appendRound（body = RoundRecord 全量，dedupKey 必填 ≤256 字符，body ≤1MB） |
-| `PUT /api/internal/transcript/:key/checkpoint` | saveCheckpoint / appendCheckpoint（revision CAS，旧 revision 409 `checkpoint_stale`） |
-| `GET /api/internal/transcript/:key/checkpoint/latest` | loadLatestCheckpoint；无 → 204 |
+| ~~`PUT /api/internal/transcript/:key/checkpoint`~~ | **已退役（#640）**：⇒ `404 not_found`，见 §9.8 |
+| ~~`GET /api/internal/transcript/:key/checkpoint/latest`~~ | **已退役（#640）**：同上 |
 | `PUT /api/internal/transcript/:key/runstate` | saveRunState `{run_state}` / markRunState 终态标记 `{state}`（合并写，blob 并入 `runId = :key`，引擎契约 `loadRunState(key).runId === key`）；不动 `runs.status` |
 | `GET /api/internal/transcript/:key/runstate` | loadRunState；无 → 204 |
 
@@ -4382,9 +4337,9 @@ worker 被杀后重排的上报形态（**issue #288 additive**；没有 kill �
 | 401 | `token_invalid` / `token_revoked` | token 错 / 吊销 | 停领新任务；`token_revoked` 时按 `revoke` 流程退出 |
 | 403 | `run_ownership_mismatch` | run 不属本容器 | 记日志告警（视为 bug/攻击），**不重试** |
 | 404 | `run_not_found` | run 不存在（已清理） | 停止相关上报，收敛本地状态 |
-| 409 | `run_terminal` | 向终态 run 写事件 / checkpoint / state / 审批；或不同载荷重复终态 | 幂等命中：**视为成功**（`stored` 语义），不再重试；不同载荷重复终态**不重试**（首次结果为准） |
+| 409 | `run_terminal` | 向终态 run 写事件 / state / 审批（**checkpoint 已退役，#640**）；或不同载荷重复终态 | 幂等命中：**视为成功**（`stored` 语义），不再重试；不同载荷重复终态**不重试**（首次结果为准） |
 | 409 | `lease_lost` | `X-Claim-Token` 失效（run 已被 re-claim）；心跳 U4 则以 run 级 `lease: lease_lost` 表达（非 HTTP 错误，§9.5） | 本地 abort 该 run 的 worker（若还在跑），丢弃缓冲与 spool |
-| 409 | `checkpoint_stale` | checkpoint 的 `revision` 不大于当前（旧/乱序/同值重试被 CAS 拒绝，§9.8） | 视为「本快照已过期」，**不重试**（以最新为准） |
+| ~~409~~ | ~~`checkpoint_stale`~~ | **已退役（#640）**：checkpoint 的 `revision` CAS 随 run snapshot 一起删除，现役代码不再返回它 | 仅历史客户端可能见到，视为「本快照已过期」，**不重试**（以最新为准） |
 | 409 | `invalid_transition` | 非法状态转换（§9.6 转换表之外） | 视为 bug，**不重试** |
 | 409 | `round_conflict` | transcript 同 round 不同 body / 不同 dedupKey（§9.7 U5） | 视为 bug，**不重试** |
 | 429 | `rate_limited` | portal 自我保护 | 遵循 `Retry-After` 退避 |

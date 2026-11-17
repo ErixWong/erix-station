@@ -17,8 +17,6 @@ import {
   releaseRun,
   heartbeat,
   reapExpiredRuns,
-  putCheckpoint,
-  getLatestCheckpoint,
   putRound,
   putSessionRound,
   recallTranscript,
@@ -581,28 +579,12 @@ test('#204 B 安全性证据：崩溃后 runs.status=running + run_queue=pending
   assert.equal(ticket2.run.attempt, 2);
 });
 
-test('putCheckpoint：revision CAS（前进 200 / 旧 revision 409 checkpoint_stale）', async () => {
-  const { pool, userId, containerId, runId } = seedClaimable();
-  const container = { id: containerId, user_id: userId };
-  const user = { id: userId, login: 'alice' };
-  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
-  const claimToken = ticket.claim_token;
-  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
-
-  const r1 = await putCheckpoint(pool, { container, user, runId, claimToken, body: { revision: 1, snapshot: { round: 1 } } });
-  assert.equal(r1.revision, 1);
-
-  const r2 = await putCheckpoint(pool, { container, user, runId, claimToken, body: { revision: 2, snapshot: { round: 2 } } });
-  assert.equal(r2.revision, 2);
-
-  await assert.rejects(
-    () => putCheckpoint(pool, { container, user, runId, claimToken, body: { revision: 1, snapshot: { round: 0 } } }),
-    (e) => e.code === 'checkpoint_stale',
-  );
-
-  const latest = await getLatestCheckpoint(pool, { container, user, runId, claimToken });
-  assert.equal(latest.checkpoint.revision, 2);
-});
+// ⚠ 旧用例「putCheckpoint：revision CAS（前进 200 / 旧 revision 409 checkpoint_stale）」已随
+//   issue #640 删除：`putCheckpoint` / `getLatestCheckpoint` 两个函数、四个 `/checkpoint*` 端点与
+//   快照表（迁移 `0041`）同批退役 ⇒ 没有 CAS 可测了。
+//   `checkpoint_stale` 这个 code 也不再由本站任何路径产出（旧档案里的 `checkpoint_failed` 是**另一件事**，
+//   它的值域与可重试分类保留，见 runner/lib/termination.js）。
+//   端点层面的退役判据在 `portal/test/http-runstate.test.js`（有效认证打过去 ⇒ 404 not_found）。
 
 test('saveRunState/loadRunStateStatus：快照与终态 status 分离，legacy state 可读', async () => {
   const { pool, userId, containerId, runId } = seedClaimable();

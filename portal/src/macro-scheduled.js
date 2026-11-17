@@ -22,9 +22,37 @@ export const MACRO_SESSION_ORIGIN_PREFIX = 'macro:';
 /** 平台写死的宏会话标题后缀（用户可改标题，但 `origin` 不变，侧栏「自动化」分组靠 origin 过滤）。 */
 export const MACRO_SESSION_TITLE_SUFFIX = '· 长期';
 
-/** 产物根默认 `~/reports`（⚠ 不是 `~/projects`：模型被 jail 在项目 cwd，它自己写文件会把用户的收工灯弄红）。 */
-export function defaultReportsRoot(home = os.homedir()) {
-  return path.join(home, 'reports');
+/**
+ * 路径段清洗（issue #637 ③）：把「名字」压成一个**安全路径段**，并**保留 Unicode 字母/数字**
+ * （汉字原样留下）。过去的 `[^\w.\-]+` 里 `\w` 只认 `[A-Za-z0-9_]` ⇒ 中文名整段被压成一个 `_`，
+ * 所有中文宏挤进同一个 `_/` 目录、`<date>.md` 互相覆盖（真机实测目录就是 `_`）。
+ *
+ * 用 `/[^\p{L}\p{N}._-]+/gu`（`\p{L}` 含汉字、`\p{N}` 含各文种数字）后：
+ *  - 控制字符（含 NUL）→ `_`（`\p{L}`/`\p{N}` 本就不含，但显式挡一遍更稳）；
+ *  - 其余非「字母 / 数字 / `.` / `_` / `-`」（`/`、`\`、空格、emoji…）→ `_` ⇒ 挡掉 `/` 造成的目录穿越；
+ *  - **前导点**（`.` / `..` / `.hidden`）→ `_` ⇒ 挡 `..` 这个「无斜杠也能逃一层」的特例
+ *    （`path.join(root, '..')` 会逃到 root 之外）；
+ *  - 截断 120，全被清空 ⇒ 兜底 `fallback`（保持过去 `'macro'` 的行为）。
+ */
+function safePathSegment(value, fallback = 'macro') {
+  const out = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, '_')
+    .replace(/[^\p{L}\p{N}._-]+/gu, '_')
+    .replace(/^\.+/, '_')
+    .slice(0, 120);
+  return out || fallback;
+}
+
+/**
+ * 产物根默认落点（issue #637 ②）：**用户可见的 RW 挂载** `/srv/erix/users/<fde_name>/reports`。
+ * 过去是 `os.homedir() + '/reports'` = 容器内 `/root/reports`，**没挂载** ⇒ 用户看不到、换镜像即丢。
+ * 口径：`userSpaceRoot`（默认对齐 `config.userSpaceRoot` = `/srv/erix/users`，portal 对它是 RW 挂载）
+ *   + `<fde_name>`（过 `safePathSegment` 挡穿越，空 ⇒ `'user'`）+ `reports`；`artifactPath` 再拼
+ *   `<宏名>/<date>.md` ⇒ 最终 `/srv/erix/users/<fde_name>/reports/<宏名>/<date>.md`。
+ * ⚠ 绝不落 `~/projects`（模型 jail 在项目 cwd，平台写到那儿会把用户收工灯弄红，W7 原本就避开）。
+ */
+export function defaultReportsRoot(fdeName, userSpaceRoot = '/srv/erix/users') {
+  return path.join(userSpaceRoot, safePathSegment(fdeName, 'user'), 'reports');
 }
 
 /** 宏会话标题：`<宏名> · 长期`。 */
@@ -39,8 +67,22 @@ export function macroOrigin(templateName) {
 
 /** 产物落点：`<reportsRoot>/<宏名>/<date>.md`（date 用意图 bucket = UTC+8 日期，不回查模板）。 */
 export function artifactPath(reportsRoot, templateName, date) {
-  const safe = (s) => String(s ?? '').replace(/[^\w.\-]+/g, '_').slice(0, 120) || 'macro';
-  return path.join(reportsRoot, safe(templateName), `${safe(date)}.md`);
+  return path.join(reportsRoot, safePathSegment(templateName, 'macro'), `${safePathSegment(date, 'macro')}.md`);
+}
+
+/**
+ * 查 `users.fde_name`（产物根缺省口径用，#637 ②）。`intent.userId` = users.id。
+ * 查不到（无 userId / 行不存在 / 列 NULL / 查询报错）⇒ 返回 null，交 `defaultReportsRoot` 兜底 'user'：
+ * 产物仍落在挂载里，**不**能因取不到名字而退回不可见的容器内路径。
+ */
+async function lookupFdeName(pool, userId) {
+  if (!userId) return null;
+  try {
+    const { rows } = await pool.query('SELECT fde_name FROM users WHERE id = $1', [userId]);
+    return rows[0]?.fde_name ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -99,7 +141,9 @@ export async function getOrCreateMacroSession(pool, { userId, templateName, cwd 
  *
  * @param {object} intent  W2 产出的意图（含已占位的 `macroRunId` 与参数快照 params.cwd/task/maxRounds）
  * @param {object} [opts]
- *   - `reportsRoot` 产物根（默认 `~/reports`；测试注入临时目录，别真写用户 `~/reports`）
+ *   - `reportsRoot` 产物根（**注入优先**；缺省 ⇒ 现算 = `config.userSpaceRoot` + `users.fde_name`，#637 ②；
+ *                   测试注入临时目录，别真写 `/srv/erix`）
+ *   - `config`      仅用于读 `userSpaceRoot`（缺省产物根口径），其余字段忽略。
  *   - `runTask`     执行体（生产=真跑一次 run；测试注入桩 runner）。
  *                   `(ctx) => Promise<{ ok, text?, error? } | void>`；抛异常或 `ok===false` ⇒ 失败。
  *   - `sessionsHome` notes 根（`<home>/sessions/<id>/notes` 的 `<home>`），透传给 runTask。
@@ -108,13 +152,14 @@ export async function getOrCreateMacroSession(pool, { userId, templateName, cwd 
  * @returns {{ status, verdict, sessionId, childRunId, artifactPath? , ... }}
  */
 export async function executeScheduledIntent(pool, intent, {
-  reportsRoot = defaultReportsRoot(),
+  reportsRoot = null,
   runTask,
   sessionsHome = os.homedir(),
   postMessageImpl = postMessage,
   notifyImpl = deliverIntent,
   now = new Date(),
   log = console,
+  config = {},
 } = {}) {
   const macroRunId = intent?.macroRunId;
   if (!macroRunId) {
@@ -181,33 +226,53 @@ export async function executeScheduledIntent(pool, intent, {
   }
 
   // —— 产物由**平台**落盘（模型被 jail 在项目 cwd，它写的文件会把用户收工灯弄红）——
-  const artifact = artifactPath(reportsRoot, templateName, date);
-  try {
-    await fs.mkdir(path.dirname(artifact), { recursive: true });
-    const text = (result && typeof result.text === 'string') ? result.text : String(result ?? '');
-    await fs.writeFile(artifact, text, 'utf8');
-  } catch (err) {
-    log.warn?.(`[macro-scheduled] 产物落盘失败（不影响 run 判定）：${err?.message ?? String(err)}`);
+  // 产物根：注入优先；缺省 ⇒ 按 `config.userSpaceRoot` + `users.fde_name` 现算（#637 ②）。
+  // intent.userId 是 users.id，产物要落到用户可见的 RW 挂载 ⇒ 查 users.fde_name；查不到 ⇒ fde_name=null
+  // ⇒ defaultReportsRoot 兜底 'user'（仍在挂载里，**不**退回 os.homedir()，否则又回到不可见的容器内路径）。
+  let root = reportsRoot;
+  if (root == null) {
+    root = defaultReportsRoot(await lookupFdeName(pool, userId), config?.userSpaceRoot);
+  }
+  const artifact = artifactPath(root, templateName, date);
+  const text = (result && typeof result.text === 'string') ? result.text : String(result ?? '');
+  // —— **空正文的产物形态（issue #652 ② 拍板：选 (a) 不落盘）** ——
+  // 理由（写死在此，免得后人又改回 0 字节文件）：
+  //  · 设计 `05` §4.2 给 M7 的第一版判据是**机械的**「**产出非空** / 落盘文件存在 / 退出码 0」——
+  //    它要的是「有输出 ⇒ 有产物」，**没有**「每次必有一份产物」这一条，所以不落盘不违约。
+  //  · 0 字节文件是**假账**：用户打开是空白，分不出「本次真的无输出」还是「取数管道坏了」；
+  //    #652 的现物正是后者（投影口径错 ⇒ 正文空）被 0 字节文件伪装成了前者。
+  //  · 不落盘 + 账上 `macro_runs.reason='no_output'` ⇒ 界面能直接说出「本次无输出」，两态可分。
+  const hasOutput = text.trim() !== '';
+  if (hasOutput) {
+    try {
+      await fs.mkdir(path.dirname(artifact), { recursive: true });
+      await fs.writeFile(artifact, text, 'utf8');
+    } catch (err) {
+      log.warn?.(`[macro-scheduled] 产物落盘失败（不影响 run 判定）：${err?.message ?? String(err)}`);
+    }
+  } else {
+    log.info?.('[macro-scheduled] 本次无文本产出 ⇒ 不落盘（#652 ②：0 字节文件是假账），账上记 no_output');
   }
 
   // —— 收口：done。verdict 交给 finishMacroRun 缺省补 'unclassified'。——
   // 已是终态（重放）⇒ finishMacroRun 抛 409 conflict：幂等吞掉，不谎报失败。
+  // `reason`：正常 done 仍为 null；只有「run 成功但没产出文本」记 `no_output`（上面选 (a) 的落点）。
   let snap;
   try {
     snap = await finishMacroRun(pool, {
       macroRunId, status: 'done',
-      childSessionId: sessionId, childRunId, reason: null,
+      childSessionId: sessionId, childRunId, reason: hasOutput ? null : 'no_output',
     });
   } catch (err) {
     if (err instanceof MacroError && err.httpStatus === 409) {
       log.info?.(`[macro-scheduled] 账已终态（重放），跳过收口：${err.message}`);
-      return { status: 'done', replayed: true, sessionId, childRunId, artifactPath: artifact };
+      return { status: 'done', replayed: true, sessionId, childRunId, artifactPath: hasOutput ? artifact : null };
     }
     throw err;
   }
   return {
     status: 'done', verdict: snap?.verdict ?? 'unclassified',
-    sessionId, childRunId, artifactPath: artifact,
+    sessionId, childRunId, artifactPath: hasOutput ? artifact : null,
   };
 }
 

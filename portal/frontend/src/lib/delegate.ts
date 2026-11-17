@@ -8,7 +8,8 @@
 //   ① **分级不许只看名册 `state`**：`state === 'completed'` 但 `termination` 属于
 //      `RUN_TERMINATION_SYSERR_REASONS`（`persistence_failed` / `final_guard_unverified` /
 //      `failed` / `max_rounds_cap`）⇒ **仍判红**。名册 state 只回答「引擎认为它怎么收的尾」，
-//      而「快照没落盘」这类收尾在用户面就是故障（`terminationReasons.ts` 头注 + issue #212）。
+//      而「账本没落盘」这类收尾在用户面就是故障（`terminationReasons.ts` 头注 + issue #212；
+//      旧称「快照没落盘」，issue #640 起本站没有 run snapshot，**分级与错误类型一字未动**）。
 //      红色集合**唯一来源**是 `lib/terminationReasons.ts`，本文件**不许**另造第二份枚举
 //      （由 `lib/delegate.spec.ts` 钉住：直接对 `RUN_TERMINATION_SYSERR_REASONS` 逐项断言）。
 //   ② `aborted` 是**琥珀不是红**（用户主动停止不是故障，#236 同一口径），且它**不在**
