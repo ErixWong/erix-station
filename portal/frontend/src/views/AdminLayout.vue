@@ -43,7 +43,10 @@ const tabs = [
   // 「发信 / 边缘证书」同属平台入口配置，号池占用仍留最后（只读运维快照）。
   { name: 'admin-tls', label: 'admin.tabs.tls' },
   // issue #485 片 A：上传上限（§4.15）。紧随证书（两者都是平台配置）而在号池占用（只读快照）之前。
+  // issue #596 片 B：提示词面板。与 upload 同属「改一行而不必重建镜像」的平台配置 ⇒ 紧接其后、
+  // 号池占用（只读快照）之前。请求只在该视图挂载时发（`AdminPromptsView` 的 onMounted 是唯一触发点）。
   { name: 'admin-upload', label: 'admin.tabs.upload' },
+  { name: 'admin-prompts', label: 'admin.tabs.prompts' },
   // issue #595 M2：能力市场发布台（条目表 + 发布/下线 + 扇描结果）。与证书/上传同为平台配置，
   // 因此排在号池占用（只读运维快照）之前。
   { name: 'admin-market', label: 'admin.tabs.market' },

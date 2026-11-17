@@ -21,7 +21,11 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 合并 `0040-platform-prompts.sql` 之后**必须**把下面那个集合清空（留空 = 恢复严格连续）。
 // 0040 这个洞已被 `0040-mcp-channel.sql`（#608）填上 ⇒ 保留集合清空，恢复严格连续。
 const RESERVED_MIGRATION_NUMS = new Set([]);
-const MIGRATION_HEAD = 42;
+// 现势（issue #596 第四次让号，2026-11-17）：本单 platform-prompts 迁到 0043。
+// 判据：migrations.test.js「NNNN 全局唯一」闸 + migrate.js 台账反向对账。
+// 0042 已被 #670 那条线 `0042-mcp-plaintext-values` 取走 ⇒ 第四次让号到 0043
+//（撞号会撞真库 checksum / 容器反复重启）。
+const MIGRATION_HEAD = 43;
 const MIGRATION_NUMS = Array.from({ length: MIGRATION_HEAD }, (_, i) => i + 1)
   .filter((n) => !RESERVED_MIGRATION_NUMS.has(n));
 
@@ -78,7 +82,7 @@ test('迁移 0008-deprojectize：编号连续、语句幂等（可重放）、�
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0008-deprojectize.sql'), '0008 存在');
   // 新迁移追加在序列末尾（README：编号连续无空洞）。
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0008-deprojectize.sql'), 'utf8');
   // 语句全部幂等（IF NOT EXISTS / 条件 UPDATE / IF EXISTS）。
@@ -110,7 +114,7 @@ test('迁移 0009-session-auto-title：编号连续、语句幂等、关键语�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0009-session-auto-title.sql'), '0009 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0009-session-auto-title.sql'), 'utf8');
   assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS title_source'), 'chat_sessions 加 title_source 列（幂等）');
@@ -167,7 +171,7 @@ test('迁移 0011-git-hosts：Git host registry、token ref 与 awaiting_credent
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0011-git-hosts.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "迁移编号连续（head=0042）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "迁移编号连续（head=0043）");
 
   const sql = fs.readFileSync(path.join(dir, '0011-git-hosts.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS git_hosts/);
@@ -188,7 +192,7 @@ test('迁移 0012-onboarding：开户队列状态、步骤和索引全在增量 
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0012-onboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "迁移编号连续（head=0042）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "迁移编号连续（head=0043）");
 
   const sql = fs.readFileSync(path.join(dir, '0012-onboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS fde_onboarding/);
@@ -204,7 +208,7 @@ test('迁移 0013-offboarding：增量队列可保留已停用用户并吊销 ru
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0013-offboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "迁移编号连续（head=0042）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "迁移编号连续（head=0043）");
 
   const sql = fs.readFileSync(path.join(dir, '0013-offboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE fde_offboarding/);
@@ -223,7 +227,7 @@ test('迁移 0014-run-state-status：终态 status 独立列，旧快照由读�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0014-run-state-status.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移");
 
   const sql = fs.readFileSync(path.join(dir, '0014-run-state-status.sql'), 'utf8');
   assert.match(sql, /runs ADD COLUMN IF NOT EXISTS run_state_status jsonb/);
@@ -238,7 +242,7 @@ test('迁移 0015-backfill-user-input-transcript：只增不改、文本判断�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0015-backfill-user-input-transcript.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移");
 
   const sql = fs.readFileSync(path.join(dir, '0015-backfill-user-input-transcript.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -263,7 +267,7 @@ test('迁移 0016-transcript-append-seq：append 序列、确定性回填、索�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0016-transcript-append-seq.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移");
 
   const sql = fs.readFileSync(path.join(dir, '0016-transcript-append-seq.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -292,7 +296,7 @@ test('迁移 0017-port-allocations-hostname-check：整域名 CHECK、NOT VALID�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0017-port-allocations-hostname-check.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0017-port-allocations-hostname-check.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -318,7 +322,7 @@ test('迁移 0018-port-allocations-scope-fde：scope CHECK 放开含 fde、保�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0018-port-allocations-scope-fde.sql'), '0018 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0018-port-allocations-scope-fde.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -360,7 +364,7 @@ test('迁移 0019-preview-port-pool：⓪→①→②→③ 顺序不可换、CH
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0019-preview-port-pool.sql'), '0019 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0019-preview-port-pool.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -447,7 +451,7 @@ test('迁移 0020-preview-grant-revoke-repair：只撤 active、不碰 used、�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0020-preview-grant-revoke-repair.sql'), '0020 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0020-preview-grant-revoke-repair.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -500,7 +504,7 @@ test('迁移 0021-user-must-change-password：ADD COLUMN IF NOT EXISTS 可重放
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0021-user-must-change-password.sql'), '0021 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0042 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, "0043 为当前最后迁移（连续无空洞）");
   // 编号连续无空洞（README 约定：顺序 = 文件名升序）。
   // 同 0006 那条：逐号核对，只让开顶部显式登记的预留号（0040-platform-prompts 已落真库台账）。
   assert.deepEqual(files.map((f) => Number(f.slice(0, 4))), MIGRATION_NUMS, `迁移编号空洞/多余：${files.join(', ')}`);
@@ -713,7 +717,7 @@ test('迁移 0026-login-email-codes：两表幂等、码只存 hash、单行配�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0026-login-email-codes.sql'), '0026 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0041 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0043 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0026-login-email-codes.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -782,7 +786,7 @@ test('迁移 0027-tls-certificates：审计表幂等、无 PEM 列、kind 两态
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0027-tls-certificates.sql'), '0027 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0041 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0043 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0027-tls-certificates.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -835,7 +839,7 @@ test('迁移 0028-user-mail-otp：布尔列幂等、NOT NULL DEFAULT false、零
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0028-user-mail-otp.sql'), '0028 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0041 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0043 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0028-user-mail-otp.sql'), 'utf8');
   assert.match(sql, /ALTER TABLE users\s+ADD COLUMN IF NOT EXISTS mail_otp_enabled boolean NOT NULL DEFAULT false/,
@@ -851,7 +855,7 @@ test('迁移 0029-user-file-upload：布尔列幂等、NOT NULL DEFAULT false、
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0029-user-file-upload.sql'), '0029 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0041 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0043 为当前最后迁移（连续无空洞）');
   // 编号连续无空洞（0001..0029 一个不少）——新迁移**只能追加在末尾**，插中间这里就红。
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
@@ -923,7 +927,7 @@ test('迁移 0031-user-last-activity-at：可空无默认列幂等、回填只�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0031-user-last-activity-at.sql'), '0031 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0041 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0043 为当前最后迁移（连续无空洞）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -995,7 +999,7 @@ test('迁移 0032-drop-retired-tables：三句 IF EXISTS、子表先撤（外键
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0032-drop-retired-tables.sql'), '0032 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0041 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, '0043 为当前最后迁移（连续无空洞）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -1109,7 +1113,7 @@ test('迁移 0033-delta-events-not-persisted：形态 M 是纯清理（零 DDL�
   // 0035（`macro-platform`，issue #524）追加之后本行退一支；0037（`notifications-and-origin`，
   // issue #526）再退一支 —— 口径不变：靠**绝对位置**钉住。
   // 而不是「0033 必须永远排末位」——后者已经被上面那 19 处 head 断言接管（它们现在钉 0037）。
-  assert.equal(files[files.length - 10], file, '0033 是倒数第九支（0034..0039 + 0040-mcp-channel + 0041 追加在它后面，不许回头插队）');
+  assert.equal(files[files.length - 11], file, '0033 是倒数第十一支（0034..0042 + 0043-platform-prompts 追加在它后面，不许回头插队）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里"索引""VACUUM"这些词都会出现，整文件 indexOf 会假绿）。
@@ -1169,7 +1173,7 @@ test('迁移 0034-prune-stale-run-checkpoints：纯清理（零 DDL）、cutoff 
   const file = '0034-prune-stale-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0034 存在');
-  assert.equal(files[files.length - 9], file, '0034 是倒数第八支（新迁移只能追加，不回改已应用的编号）；0035..0041 之后它不再是末位');
+  assert.equal(files[files.length - 10], file, '0034 是倒数第十支（新迁移只能追加，不回改已应用的编号）；0035..0043 之后它不再是末位');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里 "VACUUM""索引""DELETE" 这些词都会出现，整文件判会假绿/假红）。
@@ -1243,7 +1247,7 @@ test('迁移 0035-macro-platform：三表齐全、两条唯一键在、FK 的 ON
   const file = '0035-macro-platform.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0035 存在');
-  assert.equal(files[files.length - 8], file, '0035 是倒数第七支（0036..0041 追加在它后面；新迁移只能追加，不回改已应用的编号）');
+  assert.equal(files[files.length - 9], file, '0035 是倒数第九支（0036..0043 追加在它后面；新迁移只能追加，不回改已应用的编号）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 去掉**整行注释**（保留 `$$ ... $$` 内部语句），否则「注释里提到 DROP TABLE」会被误判。
@@ -1319,7 +1323,7 @@ test('迁移 0038-transcript-recovery-rows：幂等键/append_seq 排序/只新�
   const file = '0038-transcript-recovery-rows.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0038 存在');
-  assert.equal(files[files.length - 5], file, '0038 不再是倒数第三支（0039-capability-market / 0040-mcp-channel / 0041 追加在它后面）');
+  assert.equal(files[files.length - 6], file, '0038 不再是倒数第三支（0039-capability-market / 0040-mcp-channel / 0041 / 0042 / 0043 追加在它后面）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -1400,7 +1404,7 @@ test('迁移 0039-capability-market：三表齐全、包内容按 (item,version)
   const file = '0039-capability-market.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0039 存在');
-  assert.equal(files[files.length - 4], file, '0039 是倒数第三支（0040-mcp-channel 与 0041 追加在它后面；新迁移只能追加）');
+  assert.equal(files[files.length - 5], file, '0039 是倒数第五支（0040-mcp-channel / 0041-retire / 0042-mcp-plaintext-values / 0043-platform-prompts 追加在它后面；新迁移只能追加）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -1525,7 +1529,7 @@ test('迁移 0041-retire-run-checkpoints：DROP 形状四 constraint（IF EXISTS
   const file = '0041-retire-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0041 存在');
-  assert.equal(files[files.length - 2], file, '0041 不再是末位（0042-mcp-plaintext-values 追加在它后面）');
+  assert.equal(files[files.length - 3], file, '0041 不再是末位（0042-mcp-plaintext-values 与 0043-platform-prompts 追加在它后面）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**语句区**（整行注释剥掉）：头注释里 DROP / VACUUM / BEGIN / CASCADE 这些词都要出现，
@@ -1595,4 +1599,264 @@ test('0041 形状闸反向自证：裸 DROP / 带 CASCADE / 带 VACUUM / 手写 
   const real = fs.readFileSync(path.join(HERE, '../../deploy/migrations/0041-retire-run-checkpoints.sql'), 'utf8')
     .split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('--')).join('\n');
   assert.equal(shapeOk(real), true, '0041 真文件必须通过同一把尺');
+});
+
+// 迁移 0043（issue #596 片 A，`platform_prompts` 单行表）——本节的存在理由是一条评审结论（F1）：
+// 写侧那条语句靠 `SELECT … FROM platform_prompts WHERE id = 1 FOR UPDATE` 拿旧值快照，而
+// **`FOR UPDATE` 只能锁已经存在的行**。空表里没有任何行可锁 ⇒ 两个并发首写各拿一份「无行」快照
+// （三列全 `COALESCE(…, '')`）、各写自己那一格 ⇒ 后写的 `ON CONFLICT DO UPDATE` 覆盖**整行**，
+// 先写的那个值就这么丢了。种下 `id = 1` 是这件事的机器判据：那把锁从此一直存在。
+// 判据判的是**可执行 SQL 里真有那句 INSERT**（不是头注释里说过），注释写一万字也拦不住漏种。
+// 反向自证（2026-11-16 复测）：把 0043 那句 `INSERT INTO platform_prompts (id) VALUES (1)`
+// 换成一行注释 ⇒ 本节必须红在**点名它的那条断言**上，实测 rc=1 且
+// `error: '缺种首行：空表时 `snap … FOR UPDATE` 锁不到任何行 ⇒ 并发首写各拿一份空快照
+// ⇒ 后写覆盖整行（丢更新）'`（不是红在编号、不是红在 baseline —— 那说明判据没打在种行上）。
+// 同一件事在**真库**上的对应判据：`portal/integration/platform-prompts-db.mjs` 的
+// `P12d-db`（不种行 ⇒ 并发保存真的丢更新）。
+// ---------------------------------------------------------------------------
+
+test('迁移 0043-platform-prompts：种首行（让 FOR UPDATE 有行可锁）+ 幂等 + 零 baseline 回写', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const file = '0043-platform-prompts.sql';
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes(file), '0043 存在');
+  // 本单让号到 0043 后它就是当前末位（0040→#608 mcp-channel、0041→#640 retire、0042→#670 mcp-plaintext 都排在它之前）。
+  assert.equal(files[files.length - 1], file,
+    '0043 是当前末位（0040-mcp-channel、0041-retire-run-checkpoints、0042-mcp-plaintext-values 都在它之前；新迁移只能追加）');
+  assert.deepEqual(
+    files.map((f) => Number(f.slice(0, 4))),
+    MIGRATION_NUMS,
+    '迁移编号 = 1..head 连续（0043 已由本单填上 ⇒ 恢复严格连续）',
+  );
+
+  const sql = fs.readFileSync(path.join(dir, file), 'utf8');
+  // 去掉整行注释后再判（头注释里满是 "UPDATE""DELETE""索引" 这些词，整文件判会假红，口径同 0038 那节）。
+  const executable = sql.split('\n').map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('--')).join('\n');
+  const count = (re) => (executable.match(re) || []).length;
+
+  // —— ① ★ 本节本体（评审 F1）：首行必须**种在迁移里** ——
+  const seed = /INSERT INTO platform_prompts \(\w+\)\s+VALUES \(1\)\s+ON CONFLICT \(id\) DO NOTHING/;
+  assert.match(executable, seed,
+    '缺种首行：空表时 `snap … FOR UPDATE` 锁不到任何行 ⇒ 并发首写各拿一份空快照 ⇒ 后写覆盖整行（丢更新）');
+  assert.equal(count(new RegExp(seed.source, 'g')), 1, '种行恰好一条（多条 = 有人开始往迁移里塞数据操作）');
+  // 只认 `DO NOTHING`：写成 `DO UPDATE` 的话，第二遍重放会把管理员已经改过的文本刷回空串
+  // ⇒ 迁移吃掉了用户的配置（这条迁移的「幂等」二字指的就是它）。
+  assert.doesNotMatch(executable, /INSERT INTO platform_prompts[\s\S]{0,200}?ON CONFLICT \(id\) DO UPDATE/,
+    '种行不许写成 ON CONFLICT DO UPDATE（重放会把已改过的文本刷成空 = 迁移覆盖用户配置）');
+  // 只种 id ⇒ 三列由列上的 DEFAULT 出 `''` ⇒ 种行本身不改变任何生效值（读侧「三块全跟随内置」照旧，判据 P1）。
+  const seedStmt = /INSERT INTO platform_prompts[^;]*;/.exec(executable)[0];
+  assert.doesNotMatch(seedStmt, /agents_md_|title_prompt/,
+    '种行只给 id：在这里写死文本 = 造出第二份「内置提示词」真相（内置只有 materializer.js / title-llm.js 一份）');
+
+  // —— ② 建表与「只能有一行」这条 DB 事实 ——
+  assert.match(executable, /CREATE TABLE IF NOT EXISTS platform_prompts\b/, '建表必须 IF NOT EXISTS（可重放）');
+  assert.match(executable, /id\s+int PRIMARY KEY DEFAULT 1 CHECK \(id = 1\)/,
+    '单行是 DB 事实（照 0026/0036）：两行配置 = 谁生效取决于 ORDER BY，那是不可调试的形态');
+  for (const col of ['agents_md_addendum', 'agents_md_override', 'title_prompt']) {
+    assert.match(executable, new RegExp(`${col} +text NOT NULL DEFAULT ''`),
+      `${col} 必须 NOT NULL DEFAULT ''（'' = 跟随内置，是读侧唯一的默认态判据，不许再引入 NULL 那个状态）`);
+  }
+  // 产品区间（8192 / 16384 / 2000）**不在这里**：写侧常量挡（改天花板不用重放迁移），读侧要能面对
+  // 手工 UPDATE 进来的超长值照常工作 ⇒ DB 里出现这三个数字就是分层漂了。
+  for (const n of ['8192', '16384', '2000']) {
+    assert.doesNotMatch(executable, new RegExp(`\\b${n}\\b`), `${n} 是产品上限，属写侧常量，不进 DB CHECK`);
+  }
+  assert.match(executable, /updated_by\s+uuid\b/, 'updated_by 存在（谁改的要留名）');
+  assert.doesNotMatch(executable, /\bREFERENCES\b/, 'updated_by 不建 FK（照 0026/0036：管理员行被删后配置要留着）');
+
+  // —— ③ 可重放：零 DDL 破坏、零数据回收 ——
+  for (const bad of ['DROP TABLE', 'DROP INDEX', 'ALTER TABLE', 'TRUNCATE', 'DELETE FROM', ' UPDATE ']) {
+    assert.equal(count(new RegExp(bad.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')), 0,
+      `0043 不得有 ${bad.trim()}（重放要零变化；要改形态请另开一支迁移）`);
+  }
+  // 这条迁移没有需要断言的既有形态（无行与 1 行都是正常态）⇒ 只许 NOTICE，不许拿 EXCEPTION 当嗓门。
+  assert.equal(count(/RAISE EXCEPTION/g), 0, '零 EXCEPTION：这里没有「漂了就别启动」的形态可守');
+  assert.equal(count(/RAISE WARNING/g), 0, '不许 RAISE WARNING——CI 只 grep ERROR 会吞掉它');
+  assert.equal(count(/RAISE NOTICE '0040/g), 2, '重放证据两个分支各一条 NOTICE（有行/无行都要说清是哪一种）');
+  assert.doesNotMatch(executable, /\bVACUUM\b/, 'VACUUM 不进迁移（不在事务块里跑，runner 是单事务）');
+
+  // —— ④ baseline 冻结：本表只走增量迁移，schema.sql 一个字节不改 ——
+  assert.ok(!fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8').includes('platform_prompts'),
+    'baseline schema.sql 里不许出现 platform_prompts（它的 sha256 在迁移台账里，改一字节现存库全部拒启）');
+});
+
+// ---------------------------------------------------------------------------
+// 通用形状闸：**`NNNN-*.sql` 的四位号必须全局唯一**（不是某支迁移的语义判据）
+//
+// 为什么这条闸必须存在（2026-11-16 现场，不是假想敌）：`deploy/migrations/README.md`「命名与顺序」
+// 写明 `NNNN` 是**四位递增序号**，而 #595 与 #596 两张并行单各自取号，各自都从「40」往下排 ⇒
+// 同一号出现两个文件：`0039-capability-market.sql` 与 `0039-platform-prompts.sql`。两边各自都绿：
+// 迁移 runner 用**文件名**当 `schema_migrations.version`，两个文件是两个不同的 version，
+// 于是 dev 库里同时落了 `0039-capability-market` 与 `0039-platform-prompts` 两行台账，
+// **全仓没有任何一条判据抱怨过**（`migrations.test.js` 只判「末位是哪支 + 编号连续」，
+// 末位断言看的是 `files[length-1]`，连续断言看的是 `Number(f.slice(0,4))` 的升序——
+// 重复号在两条判据里都不产生异常：升序里出现两个 39 也不算「跳号」）。
+// 真实代价不是难看：`sort` 升序里同号的先后由 **slug 字典序**决定 ⇒ 应用顺序变成隐式，
+// 而「谁在前」这件事今后没人能从编号本身读出来（迁移一旦有依赖，这就是不可复现的部署）。
+//
+// 反向自证（常驻，不靠手工）：见本节末尾的 `dupOf` 自检——它把两个同号文件名喂进同一个函数，
+// 必须判出**且点名是哪两个文件**。手工实测记录：`touch deploy/migrations/0040-collision-proof.sql`
+// ⇒ 本格子红在点名那两个文件的那条断言上（rc=1），删掉临时文件即复绿。
+// ---------------------------------------------------------------------------
+
+/** 重复的迁移号 → 抢这个号的文件名列表（干净目录 ⇒ 空对象）。 */
+function duplicateMigrationNumbers(files) {
+  const byNum = new Map();
+  for (const f of files) {
+    const num = f.slice(0, 4);
+    if (!/^\d{4}$/.test(num)) continue;
+    if (!byNum.has(num)) byNum.set(num, []);
+    byNum.get(num).push(f);
+  }
+  return Object.fromEntries([...byNum.entries()].filter(([, list]) => list.length > 1).sort());
+}
+
+test('迁移编号唯一性闸：`NNNN-*.sql` 的四位号全局唯一（同号两个文件 = 应用顺序没人说得清）', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.length >= 40, `迁移条数异常：${files.length}`);
+
+  const dup = duplicateMigrationNumbers(files);
+  const bad = Object.entries(dup).map(([num, list]) => `${num} 被 ${list.length} 个文件抢用：${list.join(' / ')}`);
+  assert.deepEqual(bad, [],
+    `deploy/migrations/ 里 ` + `NNNN 必须全局唯一（README「命名与顺序」）——撞号时 runner 照样`
+    + `各记一行 version，台账看起来都对，但同号两支的先后只剩 slug 字典序可查：\n${bad.join('\n')}`);
+
+  // 反向自证：本闸不是恒真的 —— 把两个同号文件名喂进去必须恰好判出一条，且**点名是哪两个文件**。
+  const proof = duplicateMigrationNumbers([
+    '0001-a.sql', '0040-capability-market.sql', '0040-platform-prompts.sql', '0041-b.sql',
+  ]);
+  assert.deepEqual(Object.keys(proof), ['0040'], `反向自证失败：0040 撞号没被抓到（拿到 ${JSON.stringify(proof)}）`);
+  assert.deepEqual(proof['0040'], ['0040-capability-market.sql', '0040-platform-prompts.sql'],
+    '反向自证失败：抓到了撞号但没点名是哪两个文件（下一地点名式报错就失去意义）');
+  // 边界：末位/首位撞号也要抓（判据不是「只检查中间」），空目录不得抛。
+  assert.deepEqual(Object.keys(duplicateMigrationNumbers(['0001-a.sql', '0001-b.sql'])), ['0001'],
+    '反向自证失败：首位撞号没被抓到');
+  assert.deepEqual(Object.keys(duplicateMigrationNumbers(['0099-a.sql', '0099-z.sql'])), ['0099'],
+    '反向自证失败：末位撞号没被抓到');
+  assert.deepEqual(duplicateMigrationNumbers([]), {}, '空目录不许抛');
+});
+
+// ---------------------------------------------------------------------------
+// 通用形状闸：**`docs/api/portal.md` 的 `### N.N` 章节号必须全局唯一**（同一族的事故，写在这里是
+// 因为「编号唯一」这条纪律只该有一处落地）
+//
+// 为什么这条闸也必须在（同一天的第二处现场）：合并 `origin/main` 时两边各自新建了一节 **§4.16**
+// （本单的「管理台提示词面板」与 #586 的「管理台关于」）——两节都写得很认真，**判据却先塌了**：
+// 本单的 `D1`（`portal/test/platform-prompts.test.js`）按 `apiDoc.indexOf('### 4.16 ')` 取节，
+// 撞号之后它取到的节界一路串到邻居 #595 的能力市场那一节，于是把 `capability_budget_exceeded` /
+// `capability_install_failed` 当成「本单发明了错误码」报红（实测：`§4.16 只许用既有错误码（发明了：
+// capability_budget_exceeded, capability_install_failed）`）。也就是说重复编号让判据在
+// **假红与假绿之间随机摆**：谁排在前面，别人那一节的文本就被算成它的。这与 `0039` 两个文件
+// 在库里并存而无人报警是同一类事故，只是发生在文档里。
+//
+// 判据形状与上面那条同族：抓**全部** `### N.N`（不区分章节、不许只查某一节），违规时点名
+// 「哪两个标题抢了同一个号」。字母后缀的子号（`### 4.4a`）是**不同的号**，不算撞车。
+//
+// 反向自证（常驻）：见本节末尾 `duplicateSectionNumbers` 的自检；手工实测 = 往 portal.md 临时插一句
+// `### 4.16 collision-proof` ⇒ 本格子必须红在点名那两个标题的断言上，删掉即复绿。
+// ---------------------------------------------------------------------------
+
+/**
+ * 重复的章节号 → 抢这个号的标题行列表（干净文档 ⇒ 空对象）。
+ * 只认 `### N.N` 这一级（`## N.` 是大章、`#### N.N-x` 是某一节内部的小节，各有自己的命名空间）。
+ */
+function duplicateSectionNumbers(markdown) {
+  const byNum = new Map();
+  for (const line of markdown.split('\n')) {
+    const m = /^### (\d+\.\d+[a-z]*)\s/.exec(line);
+    if (!m) continue;
+    if (!byNum.has(m[1])) byNum.set(m[1], []);
+    byNum.get(m[1]).push(line.trim());
+  }
+  return Object.fromEntries([...byNum.entries()].filter(([, list]) => list.length > 1).sort());
+}
+
+test('文档编号唯一性闸：docs/api/portal.md 的三级标题号（H3 的 `N.N`）全局唯一（撞号会把别人的节算成你的）', () => {
+  const doc = fs.readFileSync(path.join(HERE, '../../docs/api/portal.md'), 'utf8');
+  const dup = duplicateSectionNumbers(doc);
+  const bad = Object.entries(dup)
+    .map(([num, list]) => `§${num} 被 ${list.length} 个标题抢用：\n${list.map((h) => `    ${h}`).join('\n')}`);
+  assert.deepEqual(bad, [],
+    `docs/api/portal.md 的章节号必须全局唯一——撞号之后「按 §号取节」的判据（如本单的 D1）`
+    + `会吃进邻居那一节的文本，判据开始随机红/随机绿：\n${bad.join('\n')}`);
+
+  // 反向自证：同一个号写两次必须被抓，并且**点名是哪两个标题**。
+  const proof = duplicateSectionNumbers([
+    '### 4.1 甲', '### 4.16 管理台提示词面板', '### 4.16 管理台「关于」', '### 4.17 能力市场',
+  ].join('\n'));
+  assert.deepEqual(Object.keys(proof), ['4.16'], `反向自证失败：4.16 撞号没被抓到（拿到 ${JSON.stringify(proof)}）`);
+  assert.deepEqual(proof['4.16'], ['### 4.16 管理台提示词面板', '### 4.16 管理台「关于」'],
+    '反向自证失败：抓到了撞号但没点名是哪两个标题');
+  // 边界：`4.4` 与 `4.4a` 是两个号（文档里大量使用字母后缀，误判就是假红）；小节 `#### 4.16-1` 不参与。
+  assert.deepEqual(duplicateSectionNumbers('### 4.4 乙\n### 4.4a 丙\n#### 4.4-1 丁\n#### 4.4-1 戊'), {},
+    '字母后缀子号与 `####` 小节不许被判成撞号');
+  // ↑ 这里说「`####` 不参与」**只针对本闸**（撞号命名空间）：小节号自己另有归属闸 ——
+  //   下面那条「小节号必须挂在同名 H3 下」。两道闸各管一件事，不是这里写漏了。
+});
+
+// ---------------------------------------------------------------------------
+// 上一节那条闸的**盲区**（评审 R9）：`duplicateSectionNumbers` 只读 H3，而小节写的是
+// `#### N.N-x`——那个 `N.N` 本意就是「我挂在哪个 H3 下面」，却从来没人对账过。
+// 现场：合并 `origin/main` 后能力市场那一节是 `### 4.17`，而它下面**六个**小节仍叫
+// `#### 4.16-1 … 4.16-6`（§4.16 早已是 #586 的管理台「关于」）⇒ 按小节号去找节会找到邻居家。
+// 裁决：闸扩成「小节号 ≡ 它上面那个 H3 的号」，违规点名（哪个小节、挂在哪个 H3 下、应该叫什么）。
+// 口径：比较的是**数字本体**（`### 4.4a` 下面的 `#### 4.4-1` 算对，字母后缀不参与比较）；
+// 不带号的 `####` 小标题不参与；文档里代码块内没有 `#### N.N-x` 形状的行（实测），
+// 所以本闸不跟踪围栏。
+//
+// 反向自证（常驻）：把 `#### 4.16-1` 挂在 `### 4.17` 下面必须判红且点名两个标题。
+// ---------------------------------------------------------------------------
+
+/**
+ * 「小节号与主人不一致」的清单（干净文档 ⇒ 空数组）。
+ * 每条都带：那一行原文、它挂在哪个 H3 下、以及它**应该**叫什么。
+ */
+function subsectionNumbersOutOfParent(markdown) {
+  const bad = [];
+  let h3 = null;   // 当前那个 H3（`### N.N[a-z]*`）
+  for (const line of markdown.split('\n')) {
+    const m3 = /^### (\d+\.\d+)([a-z]*)\s/.exec(line);
+    if (m3) { h3 = { num: m3[1], title: line.trim() }; continue; }
+    const m4 = /^#### (\d+\.\d+)-/.exec(line);
+    if (!m4) continue;
+    if (!h3) {
+      bad.push(`${line.trim()} ⇒ 上面没有任何「### N.N」可挂（它得先有个主人）`);
+      continue;
+    }
+    if (m4[1] === h3.num) continue;
+    bad.push(`${line.trim()} ⇒ 挂在 ${h3.title} 下面，小节号必须与主人同号（应为 #### ${h3.num}-…）`);
+  }
+  return bad;
+}
+
+test('文档小节归属闸：`#### N.N-x` 的小节号必须等于它上面那个 H3 的号（评审 R9 的盲区）', () => {
+  const doc = fs.readFileSync(path.join(HERE, '../../docs/api/portal.md'), 'utf8');
+  const out = subsectionNumbersOutOfParent(doc);
+  assert.deepEqual(out, [],
+    'docs/api/portal.md 里每个「#### N.N-x」的小节号必须与它所属那一节同号：\n' + out.join('\n'));
+
+  // 常驻反向自证·①：真实现场那个形状（`#### 4.16-1` 挂在 `### 4.17` 下面）必须判红。
+  const misplaced = subsectionNumbersOutOfParent([
+    '### 4.17 能力市场（`/api/market/*`，issue #595）',
+    '#### 4.16-1 `GET /api/market/items`',
+    '#### 4.17-2 `GET /api/market/items/:slug`',
+  ].join('\n'));
+  assert.equal(misplaced.length, 1, `只许抓到那一条违规（实得 ${JSON.stringify(misplaced)}）`);
+  assert.match(misplaced[0], /#### 4\.16-1/, '要点名**哪个小节**');
+  assert.match(misplaced[0], /### 4\.17 能力市场/, '要点名它**挂在哪个 H3 下**');
+  assert.match(misplaced[0], /#### 4\.17-/, '要给出它应该叫什么（否则修的人还得自己推）');
+
+  // 常驻反向自证·②：同号但挂错节（两道闸都不拦的形状，只有这条拦得住）。
+  assert.equal(subsectionNumbersOutOfParent('### 4.16 关于\n### 4.17 市场\n#### 4.16-1 装').length, 1,
+    '小节号在自己的节里、但人已换到下一节 ⇒ 必须报（这正是 H3 唯一性闸的盲区）');
+
+  // 常驻反向自证·③：干净形状不许误伤（同号、字母后缀主人、不带号的小标题、主人之前没有小节）。
+  const CLEAN = ['### 4.17 市场', '#### 4.17-1 甲', '#### 4.17-2 乙', '#### 形状约定',
+    '### 4.4a 边（字母后缀的主人）', '#### 4.4-1 丙'].join('\n');
+  assert.deepEqual(subsectionNumbersOutOfParent(CLEAN), [],
+    '合法形状不许假红（字母后缀的主人名下用数字本体比较）');
+  // 边界：小节出现在任何 H3 之前 ⇒ 也要点名（不能默默放过）。
+  assert.match(subsectionNumbersOutOfParent('#### 4.2-1 孤儿').join('\n'), /没有任何/, '无主小节也要点名');
 });

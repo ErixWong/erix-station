@@ -33,6 +33,19 @@ import {
   type UploadSettings,
   type UploadSettingsPayload,
 } from '../lib/uploadSettings';
+// issue #596 片 B：管理台「提示词」面板（§4.19）。DTO 归一化 / 请求体构造 / 400 字段映射 /
+// 物化通知语义全在 lib（纯函数可单测）；这里只负责「一次调用 = 一次请求」+ 错误透传。
+import {
+  PLATFORM_PROMPTS_PATH,
+  buildPromptPayload,
+  materializeNoticeOf,
+  normalizePlatformPrompts,
+  platformPromptPath,
+  promptValidationFieldOf,
+  type MaterializeNotice,
+  type PlatformPrompts,
+  type PromptFieldKey,
+} from '../lib/platformPrompts';
 // issue #586 管理台「关于」面板（§4.16）。DTO 归一化全在 `lib/versionSurface`（纯函数可单测），
 // 这里只负责「一次调用 = 一次请求」+ 错误透传。**前端一个字都不推算版本**：三格各自读自己的字段。
 import {
@@ -302,6 +315,20 @@ export const useAdminStore = defineStore('admin', {
     // 400 `validation_failed` 的 `details.field`（§4.15-2）→ 页面标红那个框；null = 整表错误。
     uploadSaveField: null as UploadFieldKey | null,
     uploadSaveOk: false,
+    // issue #596 片 B：管理台「提示词」面板（§4.19）。与 upload 同构：归一化在 lib，这里只管
+    // 「一次调用 = 一次请求」。**不缓存**（后端每次物化/改名都现读那一行 ⇒ 这一页要看的就是新快照）。
+    platformPrompts: null as PlatformPrompts | null,
+    platformPromptsLoaded: false,
+    platformPromptsLoading: false,
+    platformPromptsErr: null as string | null,
+    promptSaving: false,
+    promptSaveErr: null as string | null,
+    // 400 的 `details.field`（`text`/`body`/`field`）映射出来的**要标红那张卡**；null = 整页错误。
+    promptSaveField: null as PromptFieldKey | null,
+    // 最近一次**成功**保存的卡（页面据此只在那一张卡上显示「已保存」+ 生效时机 + 物化通知状态）。
+    promptSavedField: null as PromptFieldKey | null,
+    // `materializeEnqueued` 的语义结论（`0` 与「没给」都是要显式说出口的事，不许静默）。
+    promptNotice: null as MaterializeNotice | null,
     // issue #456 M2：管理台证书页（§4.13）。**私钥永不进这里**：状态只有 DTO 白名单
     // （`lib/tlsSettings.normalizeTlsStatus` / `normalizeTlsInspect`），连字段名字面量都不在本文件里。
     tlsStatus: null as TlsStatus | null,
@@ -851,6 +878,91 @@ export const useAdminStore = defineStore('admin', {
       } finally {
         this.uploadSaving = false;
       }
+    },
+
+    /**
+     * issue #596 片 B：`GET /api/admin/prompts`（§4.19-1）。
+     *
+     * 服务端在**表不存在 / 读失败 / 读超时**时也回 `200`（回落内置提示词），所以这一页不需要
+     * 处理「配置面挂了」的错路；`reason` 会把「为什么现在用的是内置」说清（归一化在 lib）。
+     * 一次调用 = 一次请求：另一个管理员随时可能改，重进本页就该看到新快照（与后端同口径：不缓存）。
+     */
+    async loadPlatformPrompts(): Promise<string | null> {
+      this.platformPromptsLoading = true;
+      this.platformPromptsErr = null;
+      try {
+        const data = await api<unknown>(PLATFORM_PROMPTS_PATH);
+        this.platformPrompts = normalizePlatformPrompts(data);
+        this.platformPromptsLoaded = true;
+        return null;
+      } catch (e) {
+        this.platformPromptsErr = t('admin.errorPrefix') + this.errText(e);
+        return this.platformPromptsErr;
+      } finally {
+        this.platformPromptsLoading = false;
+      }
+    },
+
+    /**
+     * issue #596 片 B：三个 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`（§4.19-2）。
+     *
+     * 三个入口只决定 `field`（路径 slug 的映射在 lib，别处不抄字面量），其余同一套：
+     *   · 成功 ⇒ **用响应 DTO 回填**（它出自 `RETURNING` ⇒ 是真落库的那一份，不是回显输入）；
+     *   · 同时收下 `materializeEnqueued` 并折成语义结论 `promptNotice`（`0` / 缺键都是要显式
+     *     说出口的事：「已保存，但物化未通知」，不许静默，§4.19-4）；
+     *   · 失败 ⇒ `details.field` 落到 `promptSaveField`（页面据此标红那张卡的输入框）。
+     *
+     * 越界（字段上限 / **渲染后**整份 `~/AGENTS.md` 超注入上限）在前端**不拦**：服务端才是闸，
+     * 它回 `400 validation_failed` 且**不落库**，前端只负责把那句话与那个框指出来。
+     */
+    async savePromptText(field: PromptFieldKey, text: unknown): Promise<string | null> {
+      const payload = buildPromptPayload(text);
+      if (payload === null) {
+        // 连长度都算不出（不是字符串）⇒ 不发一个必然 400 的垃圾体。
+        this.promptSaveField = field;
+        this.promptSaveErr = t('admin.prompts.errNotText');
+        this.promptSavedField = null;
+        this.promptNotice = null;
+        return this.promptSaveErr;
+      }
+      this.promptSaving = true;
+      this.promptSaveErr = null;
+      this.promptSaveField = null;
+      this.promptSavedField = null;
+      this.promptNotice = null;
+      try {
+        const data = await api<unknown>(platformPromptPath(field), {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        });
+        const next = normalizePlatformPrompts(data);
+        this.platformPrompts = next;
+        this.platformPromptsLoaded = true;
+        this.promptSavedField = field;
+        this.promptNotice = materializeNoticeOf(field, next.materializeEnqueued);
+        return null;
+      } catch (e) {
+        this.promptSaveField = promptValidationFieldOf(e, field);
+        this.promptSaveErr = t('admin.errorPrefix') + this.errText(e);
+        return this.promptSaveErr;
+      } finally {
+        this.promptSaving = false;
+      }
+    },
+
+    /** `PUT /api/admin/prompts/addendum`：`''` = 清空「平台补充约定」那一节。 */
+    saveAddendumPrompt(text: unknown): Promise<string | null> {
+      return this.savePromptText('addendum', text);
+    },
+
+    /** `PUT /api/admin/prompts/agents-md`：`''` = **恢复内置模板**（「恢复内置」按钮就是它）。 */
+    saveAgentsMdPrompt(text: unknown): Promise<string | null> {
+      return this.savePromptText('agentsMd', text);
+    },
+
+    /** `PUT /api/admin/prompts/title-prompt`：`''` = 用内置 `TITLE_SYSTEM_PROMPT`（不涉物化）。 */
+    saveTitlePrompt(text: unknown): Promise<string | null> {
+      return this.savePromptText('titlePrompt', text);
     },
 
     /**

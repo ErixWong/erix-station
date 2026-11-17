@@ -836,6 +836,10 @@ export const en = {
       // issue #485 slice A: upload limit (views/AdminUploadView.vue, contract docs/api/portal.md §4.15).
       // Sits after certs and before the read-only pool view: it is platform configuration.
       upload: 'Upload limit',
+      // issue #596 片 B: platform prompts page (views/AdminPromptsView.vue, contract
+      // docs/api/portal.md §4.19). Order upload → prompts: both are platform settings that used
+      // to require rebuilding station-portal.
+      prompts: 'Prompts',
       // issue #595 M2: capability market console (views/AdminMarketView.vue, contract §7 admin API).
       // After the upload limit and before the read-only pool view: it is platform configuration.
       market: 'Capability market',
@@ -1100,6 +1104,90 @@ export const en = {
       srcDefault: 'Built-in default',
       envNotSet: 'the environment variable is not explicitly set',
       footnote: 'This is a **per-file** limit, not a disk quota (total size is #485 slice B, not implemented). It is a different knob from MAX_BODY_BYTES (the JSON request-body limit, 64 KiB by default): uploads never go through the latter.',
+    },
+    // issue #596 slice B: admin prompts panel (views/AdminPromptsView.vue, docs/api/portal.md §4.19).
+    // The three effective moments differ, so they are three separate keys on purpose — one
+    // shared sentence would make the page lie (acceptance criterion F7). The readonly.* entries
+    // say where each prompt lives and what changing it costs, never its text: the portal image
+    // does not contain runner/, so showing the text here would be an unfounded promise.
+    // ⚠ Every string below is rendered as plain text (this page has no markdown renderer and is
+    //   not getting one): a pair of asterisks in a value shows up as junk characters, not as
+    //   emphasis. Use a CSS class for emphasis; the gate lives in localeParity.spec.ts.
+    prompts: {
+      title: 'Platform prompts',
+      intro: 'The three prompts the platform feeds the model that portal controls. Saving needs no portal restart and no image rebuild: materialization and renaming read that database row every time. An empty string means "follow the built-in text".',
+      loading: 'Loading prompts…',
+      notLoaded: 'Prompts not loaded yet (no request sent).',
+      unknown: 'unknown',
+      never: '—',
+      updatedAt: 'Last saved',
+      updatedBy: 'Saved by',
+      updatedAtNever: 'Never saved (nobody has saved a value in the admin console yet)',
+      updatedAtUnparsable: 'Unparsable timestamp: {value}',
+      reasonNoRow: 'Nothing has ever been saved here, so the built-in prompts are what goes out; saving a value in this page overrides it.',
+      reasonReadFailed: 'platform_prompts could not be read (missing table or database hiccup), so the built-in prompts are in force; materialization and renaming keep working (this is never a 500).',
+      reasonReadTimeout: 'Reading platform_prompts timed out (the database did not answer within PLATFORM_PROMPTS_READ_TIMEOUT_MS), so the built-in prompts are in force. This does not mean "nobody configured it" — the real fault is the connection.',
+      reasonUnknown: 'The server reported a fallback reason this page does not know (a new backend reason?), so the built-in prompts are in force; check the server log for the actual cause.',
+      source: 'Current source',
+      sourceDb: 'database override',
+      sourceBuiltin: 'built-in',
+      sourceDbNote: '(this field is the value saved in the admin console, not the one in the code)',
+      bytesOf: 'currently {bytes} / limit {max}',
+      draftBytes: 'draft: {bytes}',
+      overLimit: 'The draft is {bytes}, above the {max} limit: the server will reject the save with 400. Nothing is blocked here on purpose — the server is the gate.',
+      cardAddendum: 'Platform addendum (appended as a section at the end of ~/AGENTS.md)',
+      addendumLabel: 'Addendum body',
+      addendumHint: 'The section heading and lead-in are written by the platform; your body is copied byte for byte, rewritten by nobody. Clearing it removes that section.',
+      timingAddendum: 'Effective when: save ⇒ re-materialization is queued ⇒ this seat picks the section up on its next run (not immediately, not on the next portal restart).',
+      cardAgentsMd: 'Whole-section override (replaces the body of ~/AGENTS.md)',
+      agentsMdLabel: 'Override body',
+      agentsMdHint: 'Your text replaces the body of the built-in template; the trailing seat identity line is still appended by code, always last, never editable.',
+      timingAgentsMd: 'Effective when: it shares the materialization notification with the addendum ⇒ next run of that seat; if queueing failed, convergence waits for the full rebuild on the next portal restart.',
+      cardTitlePrompt: 'Session title prompt (the system message behind AI retitling)',
+      titlePromptLabel: 'Title prompt',
+      titlePromptHint: 'It only decides how a session gets named: it never enters ~/AGENTS.md and never participates in materialization. The prompt is not a guard — titles are still sanitized before being stored.',
+      timingTitlePrompt: 'Effective when: the next rename (manual "AI retitle" and automatic renaming share one resolution path; read fresh every time, no cache, no run and no materialization needed).',
+      deviated: 'Deviated from the built-in template: the body that goes out is the one you wrote.',
+      followsTemplate: 'Following the built-in template: no override, the text in the code is what goes out.',
+      renderBudget: 'Whole ~/AGENTS.md: effective {effective} / injection limit {limit} (the built-in template renders to {template})',
+      renderBudgetNote: 'This figure is a preview rendered with the fixed example seat name "example" (zero timestamps, so it is comparable), not the size of any real seat file. The save-time render gate budgets the LONGEST legal seat name, so with a longer real name the real file can be slightly bigger than what is shown here.',
+      viewEffective: 'View the effective full text',
+      hideEffective: 'Hide the effective full text',
+      copy: 'Copy',
+      copied: 'Copied.',
+      copyFailed: 'Copy failed (the browser gave no clipboard), select the text manually.',
+      restoreBuiltin: 'Restore built-in',
+      titlePromptDefaultBytes: 'Built-in default (what actually goes out while following the default): {bytes}',
+      save: 'Save',
+      reload: 'Reload',
+      saved: 'Saved (what this page now shows is the value the server read back after writing, not what you typed).',
+      savedEnqueued: 'Re-materialization was queued for {count} active seat(s) ⇒ each takes it on its next run.',
+      savedButNotNotified: 'Saved, but materialization was not notified (the full rebuild after a portal restart will converge).',
+      savedNoticeCountUnknown: 'Saved, but the server did not return materializeEnqueued ⇒ this page treats it as not notified and never claims "already in effect".',
+      readonlyTitle: 'The four prompts that live in the image (read-only here)',
+      readonlyIntro: 'These four are not editable online in the first phase. Below: where each one lives and what changing it costs.',
+      readonlyNoFullText: 'This page does not show their text: the portal image has no runner/ directory (the Dockerfile only copies portal/), so the backend cannot read those prompts at runtime and sends only the keys. Showing text here would be an unfounded promise — read the source for the full text.',
+      readonlyUnknown: 'The server also listed entries this page has no copy for: {keys} (their meaning is not guessed).',
+      readonly: {
+        runnerSystemPrompt: {
+          where: 'Lives in runner/worker.js as SYSTEM_PROMPT: the system message of every main run, prepended before the ~/AGENTS.md injection.',
+          cost: 'Changing it means: edit code + rebuild and push the FDE image + recreate every fde-* container (not station-portal), i.e. a platform-wide release; the database has no column for it.',
+        },
+        childSystemPrompt: {
+          where: 'Lives in runner/lib/delegation.js as CHILD_SYSTEM_PROMPT: the system message of a delegated child run (it states that the child has no delegate tool).',
+          cost: 'Same as above: edit code, rebuild the FDE image, recreate containers. Slice 1 does not open online editing (issue #596 ranks it after the three portal-side prompts).',
+        },
+        toolDescriptions: {
+          where: 'Lives in the description field of every tool schema in runner/lib/file-tools.js, shell-tools.js, notes-tools.js and friends.',
+          cost: 'One sentence still costs an FDE image rebuild. Tool descriptions decide how the model calls them, so the regression surface is every run on every seat — far dearer than rewording a prompt.',
+        },
+        engineNotices: {
+          where: 'Lives in runner/lib/engine-notices.js: the layer that turns engine diagnostics into human-readable LOG (the half the UI never shows).',
+          cost: 'Edit code + rebuild the FDE image, and it is reconciled key by key against run_events (runner/test/engine-notices.test.js) — you cannot change the wording without the criteria.',
+        },
+      },
+      errNotText: 'This draft is not text, so not even its length can be computed — no request was sent.',
+      footnote: 'Beyond these three, the platform has four more prompts living in the runner image (see the read-only card above). Slice 1 has no per-FDE override and no version history: to see who changed what, read the audit action admin.platform_prompts_updated (the audit stores digests only; the text lives in that configuration row).',
     },
     // issue #449 admin slice: mail channel settings (views/AdminMailView.vue, contract docs/api/portal.md §4.12).
     // This page is the only switch for the email-code second factor; the password is write-only

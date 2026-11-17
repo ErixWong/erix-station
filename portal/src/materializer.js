@@ -14,6 +14,13 @@ import {
   commitTempFile,
 } from './fsutil.js';
 import { OBSERVATION_FRESHNESS_SECONDS } from './portalloc.js';
+// 写侧渲染闸要按「最长合法工位名」算标识行（评审 F2）：长度只有 `FDE_NAME_RE` 一份真相，
+// 它在 `projects.js`（与本文件无循环引用：那边只 import `previewpool.js`）⇒ 这里只拿长度，不拿正则。
+import { FDE_NAME_MAX_LEN } from './projects.js';
+// issue #596 片 A：`~/AGENTS.md` 的追加段 / 覆写段来自 `platform_prompts`。
+// ⚠ 这是一对**双向引用**（`platform-prompts.js` 要从本文件拿渲染器与渲染预算）。两边都**只在函数体里**
+//   用对面导出的东西（模块求值期不读）⇒ ESM 循环引用安全；把它改成顶层常量就会碰到 TDZ。
+import { resolveEffectiveAgentsMd } from './platform-prompts.js';
 // issue #595 §5：市场索引的读库侧在 market.js（渲染在本文件，读在数据层——「谁该装什么」的判据
 // 只有一处，物化面与安装面不能各持一份）。只要 SQL/行映射，不要它的错误类，故指名 import。
 import { listCapabilitiesForFde, listMcpServersForFde } from './market.js';
@@ -217,8 +224,30 @@ export function renderMcpJson(servers) {
   return json({ version: 1, servers: out });
 }
 
-export function renderHomeAgentsMd({ fdeName }) {
-  return [
+// ---------------------------------------------------------------------------
+// `~/AGENTS.md` 的渲染（issue #596 片 A：正文主体可被管理员整段覆写、末尾可追加一节）
+//
+// 三段式（契约 docs/design/admin-prompts-panel-2026-11-16.md §5）：
+//   正文主体 = override ≠ '' ? override : 内置模板正文        ← 覆写模式换掉的就是这一段
+//   追加段   = addendum ≠ '' ? 节标题与引言（平台写）+ 管理员正文（逐字节照搬） : ''
+//   标识行   = `（FDE 标识：<fdeName>）`                      ← 两种模式下都由**代码**追加，永远最后一行
+//
+// ⚠ **不传新入参时输出逐字节等于今天**（判据 `M1`）：`AGENTS_MD_TEMPLATE_BODY` 就是原来那个数组的
+//   `join('\n')`，标识行仍是 `'\n\n' + 标识行 + '\n'` 收尾 ⇒ 既有断言与物化幂等（sha 不变 ⇒ 不重写）
+//   全部不受影响。
+//
+// 追加段的**节标题与引言是平台写的**（措辞由契约定稿：与上面 8 条硬约束冲突时以**上面**为准），
+// 管理员正文**逐字节照搬、不加工不改写**（含首尾空白也照搬，代码只在它前后各留一个空行）。
+// ---------------------------------------------------------------------------
+
+/** 各段之间的分隔（一个空行）。字节数进 SQL 侧的渲染预算（见 `agentsMdRenderBudget`）。 */
+export const AGENTS_MD_SECTION_SEPARATOR = '\n\n';
+
+/** 管理台展示与写侧渲染闸共用的固定示例工位名（零动态量：口径见契约 §6）。 */
+export const AGENTS_MD_EXAMPLE_FDE_NAME = 'example';
+
+/** 内置模板的**正文主体**（不含标识行、不含末尾换行）。`renderHomeAgentsMd()` 缺省就渲染它。 */
+export const AGENTS_MD_TEMPLATE_BODY = [
     '# FDE 工位约定',
     '',
     '> 本文件由平台（materializer）生成，属平台所有（root:root 0644）；改动会被对账重物化覆盖。',
@@ -313,10 +342,104 @@ export function renderHomeAgentsMd({ fdeName }) {
     '- 可用期间的正确做法：直接起平台已下发的钉位代理 `python3 ~/bin/github-pinproxy.py`（只监听回环、监听端口见脚本首行用法注释，平台管理别改；端口被占可传参换），再 `git -c http.proxy=http://127.0.0.1:<端口> fetch origin`——**保完整历史**（git 无 `https.proxy` 配置键，`http.proxy` 对 https 远端同样生效）。自己另写代理时脚本放 `~/bin` 不放 `/tmp`（`/tmp` 不持久）。',
     '- 兑底（拿不到代理时）：`codeload.github.com/<owner>/<repo>/tar.gz/HEAD` 拉默认分支快照——**没有历史**，拿到后记得用上面的方法 `git fetch` 补回。',
     '- 容器内**没有 ssh 客户端**，不要规划 SSH 备选路径；`codeload.github.com` 通常不受该解析问题影响。',
-    '',
-    `（FDE 标识：${fdeName}）`,
-    '',
-  ].join('\n');
+].join('\n');
+
+/**
+ * 追加段的节标题与引言（**由平台撰写**，管理员正文由代码逐字节接在后面）。
+ * 措辞是契约定稿的（§5），要改先改契约。
+ *
+ * 末尾那**两个**空数组项就是「引言与正文之间恰好一个空行」这件事本身：`join('\n')` 之后
+ * 串以 `…第 N 条」。\n\n` 收尾（`docs/design/admin-prompts-panel-2026-11-16.md` §5 的样例在引言
+ * 与 `<逐字照搬的管理员正文>` 之间画的就是一个空行）。少一项就紧贴（评审 R5 抓的现场：真机宿主
+ * 文件里正文直接贴在引言下面），多一项就成两个空行 ⇒ 判据 `P3` 两头都钉：恰好一个，多一个也红。
+ */
+export const AGENTS_MD_ADDENDUM_HEADER = [
+  '## 平台补充约定（由平台管理员撰写）',
+  '',
+  '> 本节是对上面平台约定的**补充**。与上面的硬约束（预览链路那 8 条）冲突时，**以上面为准**；',
+  '> 除非本节明确写出「覆盖上面第 N 条」。',
+  '',
+  '',
+].join('\n');
+
+/** 标识行：两种模式下都由代码追加，永远是文件最后一行（不可被管理员编辑）。 */
+export function agentsMdIdentityLine(fdeName) {
+  return `（FDE 标识：${fdeName}）`;
+}
+
+/**
+ * 渲染整份 `~/AGENTS.md`。
+ *
+ * @param {object} [opts] `{ fdeName, addendum = '', override = '' }`
+ *   `addendum` / `override` 来自 `platform_prompts`（`portal/src/platform-prompts.js` 的读侧）；
+ *   **缺省 `''` ⇒ 逐字节等于本单之前的输出**（判据 `M1`）。
+ */
+export function renderHomeAgentsMd({ fdeName, addendum = '', override = '' } = {}) {
+  const body = override === '' ? AGENTS_MD_TEMPLATE_BODY : String(override);
+  const addBlock = addendum === ''
+    ? ''
+    : `${AGENTS_MD_SECTION_SEPARATOR}${AGENTS_MD_ADDENDUM_HEADER}${String(addendum)}`;
+  return `${body}${addBlock}${AGENTS_MD_SECTION_SEPARATOR}${agentsMdIdentityLine(fdeName)}\n`;
+}
+
+/**
+ * 渲染字节预算的**常量部分**（写侧那条 SQL 要拿它当参数，见 `platform-prompts.js` 的 `SAVE_SQL`）。
+ *
+ * 为什么要有这张表：注入侧（`runner/lib/agents-md.js`）对**整份文件**有 16 KiB 上限，超了**静默截断**
+ * 只留 marker ⇒ 写侧必须在保存前算出「渲染后的整份文件多大」。而那条 SQL 是一体的（旧值 + upsert +
+ * 审计同一条语句，并发下 `previous_*` 才取得到紧邻的旧值），渲染算术只能在 SQL 里做，
+ * 于是**常量由 JS 算好当参数送进去**（SQL 里不抄数字，口径同 0036 的 `$5/$6`）。
+ *
+ * 算术（`agentsMdRenderedBytes`）与真渲染（`renderHomeAgentsMd`）的等价性由
+ * `portal/test/platform-prompts.test.js` 的 P6b 逐组钉住，不是靠注释声明。
+ *
+ * ⚠ **两种名字，两种用途**（评审 F2，口径：契约 §4）：
+ *   * **预览**（DTO 的 `effectiveText` / `templateBytes`）用示例名 `AGENTS_MD_EXAMPLE_FDE_NAME`：
+ *     那是给人看的一份样例，要短要好看。
+ *   * **写侧闸**用**最长合法工位名**（`agentsMdGateRenderBudget()`）：保存时不知道这份文件会渲染给
+ *     哪些工位，而标识行长度随工位名变（`example` 7 字符 vs 合法上限 63 字符 ⇒ 56 字节的洞）；
+ *     拿示例名卡 16 KiB 会放进一些「今天没超、下一个 63 字符的工位一渲染就超」的输入，
+ *     而超那一档的后果是注入侧**静默截断**（写侧闸存在的全部理由）。长度从
+ *     `projects.js` 的 `FDE_NAME_RE` 单一真相导出（`FDE_NAME_MAX_LEN`），这里不抄 `63`。
+ */
+export function agentsMdRenderBudget({ fdeName = AGENTS_MD_EXAMPLE_FDE_NAME } = {}) {
+  const sepBytes = Buffer.byteLength(AGENTS_MD_SECTION_SEPARATOR);
+  return {
+    fdeName,
+    separatorBytes: sepBytes,
+    templateBytes: Buffer.byteLength(AGENTS_MD_TEMPLATE_BODY),
+    // 追加段里除管理员正文本身之外的一切：前面的分隔 + 节标题与引言。
+    addendumOverheadBytes: sepBytes + Buffer.byteLength(AGENTS_MD_ADDENDUM_HEADER),
+    // 尾部：分隔 + 标识行 + 文件末尾那个换行。
+    identityTailBytes: sepBytes + Buffer.byteLength(agentsMdIdentityLine(fdeName)) + 1,
+  };
+}
+
+/**
+ * 写侧渲染闸用的那份预算：标识行按**最长合法工位名**算（评审 F2）。
+ *
+ * 名字现算不存常量：`FDE_NAME_MAX_LEN` 是跨模块绑定，而本模块与 `platform-prompts.js` 互相 import
+ * ⇒ 顶层读对面的名字就是 TDZ 风险（口径见 `platform-prompts.js` 头注释与本仓 `P11`）。
+ * `FDE_NAME_RE` 只允许 ASCII `[a-z0-9-]` ⇒ 字符数 ≡ 字节数，重复那么多个 `a` 就是字节上的最坏情况。
+ */
+export function agentsMdGateFdeName() {
+  return 'a'.repeat(FDE_NAME_MAX_LEN);
+}
+
+/** 写侧渲染闸的预算（与 `agentsMdRenderBudget` 同形状，只有标识行那一档不同）。 */
+export function agentsMdGateRenderBudget() {
+  return agentsMdRenderBudget({ fdeName: agentsMdGateFdeName() });
+}
+
+/** 按预算常量算「渲染后的整份文件字节数」（与 `renderHomeAgentsMd` 同口径，P6b 钉等价性）。 */
+export function agentsMdRenderedBytes(
+  budget, { addendum = '', override = '' } = {},
+) {
+  const bodyBytes = override === '' ? budget.templateBytes : Buffer.byteLength(String(override));
+  const addBytes = addendum === ''
+    ? 0
+    : budget.addendumOverheadBytes + Buffer.byteLength(String(addendum));
+  return bodyBytes + addBytes + budget.identityTailBytes;
 }
 
 /**
@@ -440,13 +563,18 @@ export function effectiveMcpServers(servers, { log = null } = {}) {
 }
 
 export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root, generation,
-  capabilities = [], mcpServers = [], log = null }) {
+  capabilities = [], mcpServers = [], platformPrompts = null, log = null }) {
   const files = [];
   const add = (containerPath, content, mode = FILE_MODE) => {
     files.push({ containerPath, hostPath: hostPathFor(root, fdeName, containerPath), content, mode });
   };
 
-  add(`${CONTAINER_HOME}/AGENTS.md`, renderHomeAgentsMd({ fdeName }));
+  // #596 片 A：`AGENTS.md` 的追加段 / 覆写段来自 `platform_prompts`（由调用方从 DB 取好传进来 ⇒
+  // 本函数**仍是纯函数**：同 DB 快照 → 字节级相同输出，物化幂等判据不受影响）。不传 = 内置模板。
+  const prompts = platformPrompts ?? {};
+  add(`${CONTAINER_HOME}/AGENTS.md`, renderHomeAgentsMd({
+    fdeName, addendum: prompts.addendum ?? '', override: prompts.override ?? '',
+  }));
   add(`${CONTAINER_HOME}/bin/github-pinproxy.py`, GITHUB_PINPROXY_SCRIPT);
   add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmBaseUrl }));
   const effectiveMcp = effectiveMcpServers(mcpServers, { log });
@@ -493,12 +621,12 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
    * 返回 manifest 内容与最终 generation（供测试断言）。
    */
   async function materialize({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, generation, prevManifest,
-    capabilities = [], mcpServers = [], materializedAt = new Date() }) {
+    capabilities = [], mcpServers = [], platformPrompts = null, materializedAt = new Date() }) {
     const rootReal = path.resolve(root);
     const prevFiles = (prevManifest && prevManifest.files) || {};
 
     const files = buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root: rootReal, generation,
-      capabilities, mcpServers, log });
+      capabilities, mcpServers, platformPrompts, log });
 
     ensureWorkspaceDirs(files);
 
@@ -882,6 +1010,9 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
         continue;
       }
       const prevManifest = await readPrevManifest(config.userSpaceRoot, state.fdeName);
+      // #596：每次物化现读一次提示词（无缓存 ⇒ 管理台保存后下一次物化就按新值渲染）。
+      // 读失败/无行/超时 ⇒ 回落内置（`resolveEffectiveAgentsMd` 永不抛），物化照常跑。
+      const platformPrompts = await resolveEffectiveAgentsMd({ pool, fdeName: state.fdeName, log });
       await mat.materialize({
         fdeName: state.fdeName,
         baseDomain: state.baseDomain,
@@ -894,6 +1025,7 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
         mcpServers: state.mcpServers ?? [],
         generation: Number(row.revision),
         prevManifest,
+        platformPrompts,
       });
       await markMaterializePublished(pool, row.id);
       processed += 1;
@@ -932,7 +1064,9 @@ export async function rebuildAllFdes(pool, config, { log = console } = {}) {
     const rev = await pool.query(`SELECT revision FROM materialize_revisions WHERE fde_id = $1`, [u.id]);
     const generation = Number(rev.rows[0]?.revision ?? 1);
     const prevManifest = await readPrevManifest(config.userSpaceRoot, state.fdeName);
-    await mat.materialize({ ...state, generation, prevManifest });
+    // 同 `runMaterializerOnce`：启动全量重建也要把管理员写的提示词渲进去（否则重建会把它们抹掉）。
+    const platformPrompts = await resolveEffectiveAgentsMd({ pool, fdeName: state.fdeName, log });
+    await mat.materialize({ ...state, generation, prevManifest, platformPrompts });
   }
   return users.rows.length;
 }

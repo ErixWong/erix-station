@@ -726,7 +726,7 @@ test('MK-18 请求体上限常量存在且高于 bundle 上限（§4.15 那条�
     '发布路由的上限必须 > bundle 天花板：base64 编码后还会再涨 4/3');
   assert.equal(BUNDLE_MAX_BODY_BYTES, 4 * MIB);
   assert.deepEqual([LIMITS.maxFiles, LIMITS.maxFileBytes, LIMITS.maxTotalBytes, LIMITS.maxEnabledSkills],
-    [50, 512 * KIB, 2 * MIB, 12], '天花板数字改了必须同步 docs/api/portal.md §4.16 与设计文档 §3');
+    [50, 512 * KIB, 2 * MIB, 12], '天花板数字改了必须同步 docs/api/portal.md §4.17 与设计文档 §3');
   assert.equal(skillDirFor({ userSpaceRoot: '/srv/erix/users' }, 'alice', 'pdf-tools'),
     '/srv/erix/users/alice/home/.erix/skills/pdf-tools');
   assert.throws(() => skillDirFor({ userSpaceRoot: '/srv/erix/users' }, 'alice', '../escape'),

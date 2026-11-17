@@ -142,6 +142,11 @@
 - 每个迁移在 Postgres **单事务**内执行（DDL 在 PG 中事务性）→ 失败整体回滚该迁移，`schema_migrations` 不写该行，**不产生半套 schema**。
 - 迁移失败 → portal **拒绝启动**（不进入 unhealthy 的假就绪），`/api/health` 返回 503 + 明确错误码 `migration_failed`（§8 readiness）。
 - 迁移文件带 `checksum`：已应用迁移的文件内容被改动 → checksum 失配 → 拒绝启动 + 告警（防「改历史」）。
+- **反向对账（台账 → 本地文件）只 warn、不拒启**：`schema_migrations` 里有而 `deploy/migrations/`
+  没有的 version（典型成因：迁移**换号**，如 `0039-platform-prompts` → `0040-platform-prompts`）
+  ⇒ 启动时**点名那些 version**。已部署库不能回改（迁移历史是事实），所以这是运维线索而不是
+  正确性闸；代价是那条孤儿的 checksum 从此不再被校验。判据：`portal/test/migrate.test.js`（R10，
+  无 PG 也能跑）；台账与本地一致时**不许发 warn**（否则报警会被默成噪声）。
 - **数据迁移**（有损/大表 rewrite）必须显式 `SET lock_timeout` + 幂等（`IF NOT EXISTS` 等），遵循 env §11.2 的 `statement_timeout`/`lock_timeout` 基线；超时则回滚重试，不硬等锁。
 
 ### 3.3 `docs/data/schema.sql` 的应用方式

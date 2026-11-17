@@ -100,18 +100,25 @@ export async function resolveTitleLlmProvider(pool, userId, { gatewayUrl = 'http
  * 它自己只把 `messages` 交给 `llm-chat.js`。`max_tokens` 的「必发」由 `llm-chat.js` 结构性保证
  * （这里传 `TITLE_LLM_MAX_TOKENS`，那个文件在发出前还会断言一次）。
  *
+ * `systemPrompt`（issue #596 片 A）：管理台可改的那份 system（`platform_prompts.title_prompt`）由
+ * **调用点**解析后传进来（`resolveEffectiveTitlePrompt`，每次现读、无缓存 ⇒ 下一次改名就生效）；
+ * **缺省仍是 `TITLE_SYSTEM_PROMPT`** ⇒ 不传 = 行为逐字节等于今天。它只是「说什么」，
+ * **不是守卫**：落库前仍然 `sanitizeTitle`（口径不变）。
+ *
  * @throws 透传 `llm-chat.js` 的错误（`llm_not_configured` / `llm_upstream_failed` / `validation_failed`）；
  *         错误类型由 `ErrorCtor` 决定（手工路径传 `SessionError` ⇒ `http.js` 的映射一行都不用改，
  *         错误面与收口前逐字一致）。
  *         **本函数不吞错**：要不要静默降级由调用方按自己的业务判（自动路径外面包 try/catch）。
  */
 export async function generateTitle({
-  provider, userPrompt, maxTokens = TITLE_LLM_MAX_TOKENS, timeoutMs = TITLE_LLM_TIMEOUT_MS,
+  provider, userPrompt, systemPrompt = TITLE_SYSTEM_PROMPT,
+  maxTokens = TITLE_LLM_MAX_TOKENS, timeoutMs = TITLE_LLM_TIMEOUT_MS,
   fetchImpl = fetch, ErrorCtor, log = console, logTag = 'title', logContext = '',
-} = {}) {  const { text } = await chatCompletion({
+} = {}) {
+  const { text } = await chatCompletion({
     provider,
     messages: [
-      { role: 'system', content: TITLE_SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ],
     temperature: 0.2,

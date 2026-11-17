@@ -227,6 +227,19 @@ services:
       #   按 `upload_settings.max_file_bytes`（管理台，迁移 0035）> 本值 > 默认 取，**每次上传现读**。
       #   改管理台不需要重建 portal 容器；改本值仍然需要（而且会被管理台里已保存的值盖住）。
       FILE_UPLOAD_MAX_BYTES: ${FILE_UPLOAD_MAX_BYTES:-33554432}
+      # issue #485 片 A / #596 片 A 返修 F5：两根**读侧超时**旋钮登记进部署面。
+      # ⚠ 同一个坑（#472 / #520 LOW-1 同型）：portal 的 environment 是
+      #   **显式列表、无 `env_file`** ⇒ 没在这里写一行，运维在 `deploy/.env`
+      #   里改它就**根本不生效**（容器里仍是代码缺省 1500），而且
+      #   **没有任何报错**：看现象像「运维不会配」，真凶是这一行没写。
+      #   上一单只在 `docs/env.md` 与 `.env.example` 登记了这两根，compose 里没写，
+      #   并把「配了不生效」当**已知遗留**写进注释 ⇒ 本条把它消掉
+      #   （假账由判据 F5-G3 销：注释里再留那句就红）。
+      # 三腿一致性（compose 插值缺省 == 代码 `DEFAULT_READ_TIMEOUT_MS`
+      # == 读取路径真正交给定时器的那一串毫秒）由
+      # `portal/test/deploy-env-read-timeout.test.js` 机器钉住（先例 #520 / #472 / #270）。
+      UPLOAD_SETTINGS_READ_TIMEOUT_MS: ${UPLOAD_SETTINGS_READ_TIMEOUT_MS:-1500}
+      PLATFORM_PROMPTS_READ_TIMEOUT_MS: ${PLATFORM_PROMPTS_READ_TIMEOUT_MS:-1500}
       ERIX_ARTIFACT_CAPTURE_BUDGET_MS: ${ERIX_ARTIFACT_CAPTURE_BUDGET_MS:-60000}
       ERIX_SHELL_TIMEOUT_MS: ${ERIX_SHELL_TIMEOUT_MS:-60000}
       ERIX_SHELL_MAX_TIMEOUT_MS: ${ERIX_SHELL_MAX_TIMEOUT_MS:-600000}
