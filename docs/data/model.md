@@ -120,7 +120,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 **termination 口径注（issue #212，2026-10-09）**
 
 * **真值链**：引擎实际取值 → 代码单一常量 `portal/frontend/src/lib/terminationReasons.ts`（`TERMINATION_REASONS`）→ 本文 §1.7 与 `docs/api/portal.md` §4.1/§5.3 的枚举表。三者逐项一致由 `portal/test/termination-contract.test.js` 断言（含直接读 `erix-agent` 包源码交叉核对 typedef 与 `persistence_failed` 字面量）。
-* **`persistence_failed` 为什么语义最重**：它表示 run snapshot / `markRunState` **没落盘**（`orchestrator.js:973-977` 定值，`:986-990` 把 `operation`/`phase`/`sideEffect` 挂在 termination 上）——DB 不是这次 run 的完整真相，**崩溃恢复可能重复执行工具副作用**，因此必须与 `failed` 区分并在工作台以红色告警显示（前端红色集合 `RUN_FAIL_REASONS`）。`final_guard_unverified` = 终稿未经 final guard 核验，用户必须看见，同列红色。⚠ issue #236 起「界面刷红」另有**派生集合** `RUN_TERMINATION_SYSERR_REASONS` = `RUN_FAIL_REASONS` **减掉 `aborted`**（用户按「停止」不是故障 ⇒ 中性分隔条）；`RUN_FAIL_REASONS` 本体不变（它仍决定「重试上一条」与「终态后补拉 history」）。
+* **`persistence_failed` 为什么语义最重**：它表示 **transcript 账本 / run-state 写失败**（`markRunState` 等）；**run snapshot 已于 2026-11-17 随 #640 退役，不再是它的成因**（`orchestrator.js:973-977` 定值，`:986-990` 把 `operation`/`phase`/`sideEffect` 挂在 termination 上）——DB 不是这次 run 的完整真相，**崩溃恢复可能重复执行工具副作用**，因此必须与 `failed` 区分并在工作台以红色告警显示（前端红色集合 `RUN_FAIL_REASONS`）。`final_guard_unverified` = 终稿未经 final guard 核验，用户必须看见，同列红色。⚠ issue #236 起「界面刷红」另有**派生集合** `RUN_TERMINATION_SYSERR_REASONS` = `RUN_FAIL_REASONS` **减掉 `aborted`**（用户按「停止」不是故障 ⇒ 中性分隔条）；`RUN_FAIL_REASONS` 本体不变（它仍决定「重试上一条」与「终态后补拉 history」）。
 * **`termination.errorCode`（erix-agent 0.18.0 新增，上游 #176）**：仅 `reason === 'failed'` 的终局额外带 additive 字段 `errorCode`——引擎把错误上已有的分类码（`KitError.code`：`timeout` / `rate_limited` / `auth` / `server` / `checkpoint_failed` / …）原样透出，错误上没有分类码时引擎回落 `unknown`；**值域由引擎定义**，宿主不解释语义、不维护第二份枚举。station 是「原样透传引擎 termination」（`runner/lib/termination.js`），运行时零改动即已下发，因此本列的 jsonb 可能含 `errorCode` 键；其余 reason 的终局形状不变。依据：`erix-agent/src/loop/termination.js:43-49` `terminationErrorCodeForError` + `:52-57` `withErrorCode`（只认 `failed`），在 `src/loop/orchestrator.js:981-984` 的 `fail()` 里调用。
 * **`docs/data/schema.sql` 内该列的注释不作为真值来源**：那段注释是 baseline 冻结时留下的历史快照（还写着 v0.3.5 与已不存在的 `reflection_stop`）。原因见 `portal/src/migrate.js`：`:138` 对**整个 `schema.sql` 文件文本（含注释）**算 sha256，`:154-172` 与库中 `schema_migrations` 里 baseline 的 checksum 不符就 `refusing to start`，而这段校验发生在增量迁移循环（`:185`）**之前**——「加一条迁移去 UPDATE checksum」救不了它。故本仓一律不改 `schema.sql`（含注释），口径变更只写本文与 `docs/api/portal.md`，DDL 只走 `deploy/migrations/*.sql`。
 
@@ -182,6 +182,10 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 **每 transcript key 一行**（run 模式以 run 为 key，session 模式以 session 为 key）：erix-agent 0.14.0 的 `saveRunSnapshot` / `loadLatestRunSnapshot` 是**latest-only 覆盖读写**。写入语义 = `INSERT ... ON CONFLICT ... WHERE <表>.revision < EXCLUDED.revision`（单行覆盖 + **revision CAS**，重试同一 revision 安全；portal.md §9.8 已标退役）。这组 optional snapshot 能力成对实现时提供 crash-resume；写失败经 HTTP adapter retry 后仍抛 `checkpoint_failed`（runner-integration §9.2）。原「本地 file 优先 + DB 异步复制」装饰器建议已按决策者裁定**不采纳**（D2' 纯 DB；代价见 runner-integration §9.4）。
 
 **单调性（revision CAS，issue #8）**：`revision bigint NOT NULL DEFAULT 0` 是每 transcript key 的**单调版本号**。worker 每实例从 0 起递增；portal 端 `DO UPDATE ... WHERE <表>.revision < EXCLUDED.revision`——**旧 revision 的覆盖写被拒（0 行更新 → `409 checkpoint_stale`）**，解决「延迟到达的旧快照覆盖新快照」。resume 时 worker 经 U9 读回当前 `revision`，继续从 `revision+1` 起计，避免新 worker从 0 起计被 CAS 误拒。`seq` 仍是**调用方本地元数据、不落库**（其值在数值上可等于 revision，但不具权威性；runner-integration §9.5）。
+
+> **⚠ 整段已于 2026-11-17 作废（#640 / 迁移 `0041`）**：`run_checkpoints` 表**已删**、U8/U9 端点**已删**，
+> 所以下面关于「终态 run 读不到 / 只能给未完成 run 用」的口径只对**历史库**有意义，现役代码里没有这条读面。
+> 恢复只靠账本。保留原文是为了解释 `0034` 当年的取舍。
 
 **时间边界（自迁移 `0034`，PR #509）：终态 run 的 run-keyed 快照读不到了 ⇒ 它只能给「未完成的 run」用**。
 `getLatestCheckpoint`（`portal/src/internal.js`，端点 U9 `GET .../runs/:id/checkpoint/latest`）对**已终态的 run**

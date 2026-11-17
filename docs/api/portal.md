@@ -4109,7 +4109,7 @@ agentd 的四条转发、portal 侧四个路由与四个存储函数、以及承
 > 依据 `docs/design/conversation-state.md` §4.1：transcript key 从 runId 切到 **sessionId**（= `:key`），
 > 照抄 erix-agent CLI「预写入 + resume」模式（引擎零改动）。`runId` 退回纯运维身份。
 
-**与 run 作用域端点（U5–U9/runstate）并存**：U 系列端点不动，旧 runner 继续可用（向后兼容）；
+**与 run 作用域端点（U5–U7/runstate）并存**：这些端点不动，旧 runner 继续可用（向后兼容）；**U8/U9（run snapshot）已于 2026-11-17 退役（#640）**，不在这些端点之列；
 S 系列端点是 P2 起 runner 的默认路径。存储 = 既有表加列 + 部分唯一索引（评估记录见迁移文件头注释）：
 `transcript_rounds.transcript_key/dedup_key`（生成列，`record->>'dedupKey'`）、
 `chat_sessions.engine_run_state`。（0006 还给快照表加过 `transcript_key` + 部分唯一索引 —— 那张表已随
