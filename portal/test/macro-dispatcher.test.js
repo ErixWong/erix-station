@@ -16,13 +16,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs/promises';
 
 import { hashToken } from '../src/auth.js';
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import { claimMacroRun, finishMacroRun } from '../src/macros.js';
 import { startMacroEvalLoop } from '../src/macro-eval.js';
+import { executeScheduledIntent } from '../src/macro-scheduled.js';
 import {
-  createIntentDispatcher, reclaimTimedOutPendingRuns, extractReviewRunId,
+  createIntentDispatcher, reclaimTimedOutPendingRuns, extractReviewRunId, pollRunTask,
 } from '../src/macro-dispatcher.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
@@ -248,5 +252,129 @@ test('7. 非到期的 run-notify 意图仍按 kind 分派（到期支不是万�
     assert.equal(delivered.length, 1, 'terminal/run-notify 仍要被投递');
     assert.match(delivered[0].opts.title, /daily-/, '标题仍是宏名（不是到期文案）');
     assert.equal((await rowOf(pool, intent.macroRunId)).status, 'done');
+  });
+});
+
+// ── #637① 真实 runTask（pollRunTask）：等 run 到终态、收集判决与正文 ──────────────────
+// 种一条会话 + run + transcript。⚠ 正文种在 transcript_rounds.messages（不是 messages.content：
+// P3 PR②b 起 assistant 的 messages.content 是空串），pollRunTask 必须从这里取到正文。
+async function seedRun(pool, scene, { status = 'running', assistantText = '这是巡检结果：一切正常' } = {}) {
+  const sessionId = crypto.randomUUID();
+  const runId = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO chat_sessions (id, user_id, project_id, title, title_source, status, last_seq)
+     VALUES ($1,$2,NULL,'s','manual','active',0)`, [sessionId, scene.userId]);
+  await pool.query(`INSERT INTO runs (id, session_id, status) VALUES ($1,$2,$3)`, [runId, sessionId, status]);
+  await pool.query(
+    `INSERT INTO transcript_rounds (run_id, round, record, messages)
+     VALUES ($1,0,'{}'::jsonb,$2::jsonb)`,
+    [runId, JSON.stringify([
+      { role: 'user', content: '整理今日变更' },
+      { role: 'assistant', content: assistantText },
+    ])]);
+  return { sessionId, runId };
+}
+
+// —— #637①-4：finished ⇒ ok:true 且 text 非空；failed ⇒ ok:false ——
+test('#637①-4 pollRunTask：run finished ⇒ ok:true 且 text 非空；failed ⇒ ok:false', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T8'));
+    const { runId } = await seedRun(pool, scene, { status: 'running' });
+    await pool.query(`UPDATE runs SET status='finished', ended_at=now() WHERE id=$1`, [runId]); // queued/running → finished
+    const ok = await pollRunTask({ pool, childRunId: runId }, { timeoutMs: 1000, pollMs: 5 });
+    assert.equal(ok.ok, true, 'finished ⇒ ok:true');
+    assert.ok(ok.text && ok.text.includes('这是巡检结果'), `text 必须取到 transcript 里的 assistant 正文（非空）：${ok.text}`);
+    assert.equal(ok.termination.error, null);
+
+    await pool.query(
+      `UPDATE runs SET status='failed', error='{"code":"network","message":"fetch failed"}'::jsonb WHERE id=$1`, [runId]);
+    const bad = await pollRunTask({ pool, childRunId: runId }, { timeoutMs: 1000, pollMs: 5 });
+    assert.equal(bad.ok, false, 'failed ⇒ ok:false（不许记 done）');
+    assert.equal(bad.termination.error?.code, 'network', 'termination 带上 run 的 error');
+  });
+});
+
+// —— #637①-4b【接线锁】：dispatcher **缺省** runTask 必须就是 pollRunTask ——
+// 上面 ①-4 直接测 `pollRunTask`、①-5 **注入** `runTask` ⇒ 两条都绕过 `defaultRunTask`。
+// 主 agent 复验时把 `defaultRunTask` 改回空壳桩 `({ok:true,text:''})` 跑测试：**全绿**
+// （①-5 的注释声称「改回空壳桩 ⇒ 本条红」，实测是假的 —— 它注入 runTask，压根不走缺省）。
+// 本条钉的是「接线」：**不注入** runTask，走 createIntentDispatcher 的缺省，
+// 断言产物正文来自 transcript（空壳桩会给空串 ⇒ 红）。
+test('#637①-4b【接线锁】dispatcher 缺省 runTask = pollRunTask（不注入也等终态）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T8b'));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'w616home-b-'));
+    const intent = await claimedIntent(pool, scene);
+    // 入队后 **100ms 才失败**（复刻「run 起来了一会儿才被网络错误打死」）。
+    // 判别器：空壳桩立刻返回 ok:true ⇒ 账 done（错）；缺省 pollRunTask 会等到 failed ⇒ 账 failed（对）。
+    // ⚠ 这就是真机 bug 的形状：`status=failed` 的 run 被记成 `done`。
+    const dispatcher = createIntentDispatcher({
+      pool,
+      config: { userSpaceRoot: home },
+      reportsRoot: home, sessionsHome: home,
+      log: { warn() {}, info() {} },
+      executeScheduledIntent: async (p, it, opts) => {
+        const { executeScheduledIntent: real } = await import('../src/macro-scheduled.js');
+        return real(p, it, {
+          ...opts,
+          postMessageImpl: async (...args) => {
+            const posted = await (await import('../src/sessions.js')).postMessage(...args);
+            const rid = posted?.run?.id;
+            if (rid) {
+              setTimeout(() => {
+                p.query(`UPDATE runs SET status='failed', error='{"code":"network","message":"fetch failed"}'::jsonb, ended_at=now() WHERE id=$1`, [rid])
+                  .catch(() => {});
+              }, 100);
+            }
+            return posted;
+          },
+        });
+      },
+    });
+    const out = await dispatcher.dispatch([intent]);
+    assert.equal(out.dispatched, 1);
+    const row = await rowOf(pool, intent.macroRunId);
+    // ⚠ 反向自证锚点：把 defaultRunTask 改回空壳桩 ⇒ 立刻 ok:true ⇒ 账 done ⇒ 本条红。
+    assert.equal(row.status, 'failed',
+      `run 后来 failed ⇒ 账必须 failed（空壳桩会立刻记 done）。实际 ${row.status}`);
+    await fs.rm(home, { recursive: true, force: true });
+  });
+});
+
+// —— #637①-5：run failed ⇒ macro_runs 落 failed 而非 done（真机 network 场景端到端）——
+test('#637①-5 run failed ⇒ macro_runs 落 failed 而非 done（真机 network 场景）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T9'));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'w616home-'));
+    const intent = await claimedIntent(pool, scene);
+    // 真实 executeScheduledIntent + 真实 pollRunTask：runTask 把入队的 run 翻成 failed 再轮询（复刻 LLM 网关挂了）。
+    const out = await executeScheduledIntent(pool, intent, {
+      reportsRoot: home, sessionsHome: home, log: { warn() {}, info() {} },
+      runTask: async (ctx) => {
+        await pool.query(
+          `UPDATE runs SET status='failed', error='{"code":"network","message":"fetch failed"}'::jsonb, ended_at=now()
+             WHERE id=$1`, [ctx.childRunId]);
+        return pollRunTask(ctx, { timeoutMs: 1000, pollMs: 5 });
+      },
+    });
+    assert.equal(out.status, 'failed');
+    // ⚠ 反向自证锚点：把 defaultRunTask 改回空壳桩 ({ok:true,text:''}) ⇒ runTask 立刻返回 ok:true ⇒ 账是 done ⇒ 本条红。
+    const row = await rowOf(pool, intent.macroRunId);
+    assert.equal(row.status, 'failed', `run 真失败 ⇒ 账必须 failed，不是 done（实际 ${row.status}）`);
+    await fs.rm(home, { recursive: true, force: true });
+  });
+});
+
+// —— #637①-6：run 一直 queued ⇒ pollRunTask 到超时返回 ok:false + reason=run_timeout（短超时，别真等 30 分钟）——
+test('#637①-6 run 一直 queued ⇒ pollRunTask 超时返回 ok:false + run_timeout', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T10'));
+    const { runId } = await seedRun(pool, scene, { status: 'queued' });
+    const t0 = Date.now();
+    const res = await pollRunTask({ pool, childRunId: runId }, { timeoutMs: 40, pollMs: 5 });
+    assert.equal(res.ok, false, '超时 ⇒ ok:false');
+    assert.equal(res.termination.reason, 'run_timeout', `超时 reason 必须是 run_timeout：${JSON.stringify(res.termination)}`);
+    assert.ok(Date.now() - t0 < 3000, `短超时必须快速返回（实际 ${Date.now() - t0}ms，别真等 30 分钟）`);
   });
 });
