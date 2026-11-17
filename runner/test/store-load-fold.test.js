@@ -222,8 +222,8 @@ test('#351 真 runToolLoop 贯通：崩溃→追问→resume→**再 resume**，
         return { inserted: true };
       }
       if (method === 'load') return { records: structuredClone(rows) }; // **原始行**，折叠由 adapter 做
-      if (method === 'saveRunSnapshot') { peer.snapshot = structuredClone(args.snapshot); return {}; }
-      if (method === 'loadLatestRunSnapshot') return peer.snapshot ? { checkpoint: { snapshot: peer.snapshot, revision: 1 } } : {};
+      // ⚠ 旧 `saveRunSnapshot` / `loadLatestRunSnapshot` 两条桩已随 issue #640 删（引擎 0.33.0 不再调，
+      //   adapter 也没这两个方法了）——本 peer 对未知 method 直接报 `unknown method`，不会静默兑错。
       // issue #500：`makeStore()` 自本单起**带着**恢复行三方法 ⇒ 引擎每趟 fresh start 都会
       // `clearRecoveryRows`、每次 resume 都会 `listRecoveryRows`。本 peer 的兜底是 `return {}`，
       // 而 adapter 对**读**面是 fail-closed 的（非数组 ⇒ 抛 ⇒ 引擎终局 `recovery_rows_unreadable`），
