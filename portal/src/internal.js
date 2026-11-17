@@ -184,6 +184,9 @@ export function assembleTicket({
       // null = 没声明 ⇒ runner 继续用容器级 ERIX_MAX_ROUNDS 默认。agentd 拿到非空值时
       // 以 per-run 环境量覆盖（见 runner/agentd.js buildWorkerEnv）。
       max_rounds: run.max_rounds ?? null,
+      // issue #662：本次 run 是否为只读审查 run（宿主写在 `runs.run_state.host_review_only`）。
+      // 严格布尔：`true` ⇒ agentd 置 `RUN_REVIEW_ONLY='1'`；`false`/null（没声明）⇒ 不设（回落容器默认）。
+      review_only: run.review_only === true ? true : null,
       resume: attempts > 1,
       attachments: Array.isArray(message?.attachments) ? message.attachments : [],
       ...(gitName || gitEmail ? { git_identity: { name: gitName, email: gitEmail } } : {}),
@@ -312,7 +315,8 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), bas
 
   const run = await pool.query(
     `SELECT r.id, r.session_id, s.model, s.cwd,
-            (r.run_state ->> 'host_max_rounds')::int AS max_rounds
+            (r.run_state ->> 'host_max_rounds')::int AS max_rounds,
+            (r.run_state ->> 'host_review_only')::boolean AS review_only
        FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE r.id = $1`,
     [row.run_id],
   );
@@ -362,7 +366,7 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), bas
     claimToken: row.claim_token,
     leaseUntil: row.lease_until,
     run: { id: runRow.id, session_id: runRow.session_id, model: runRow.model, cwd: runRow.cwd ?? null,
-      max_rounds: runRow.max_rounds ?? null },
+      max_rounds: runRow.max_rounds ?? null, review_only: runRow.review_only === true ? true : null },
     project,
     message: { ...currentMessage, content: taskText },
     attempts: Number(row.attempts),
