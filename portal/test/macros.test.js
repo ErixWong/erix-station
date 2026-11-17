@@ -43,6 +43,8 @@ import { createNotification } from '../src/notifications.js'; // #526：软删�
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATION_0035 = path.join(HERE, '../../deploy/migrations/0035-macro-platform.sql');
+// #676：`review_unavailable` 不在 0035 里，而在拓宽 CHECK 的 0044——同源闸要读两支的并集。
+const MIGRATION_0044 = path.join(HERE, '../../deploy/migrations/0044-macro-skipped-reason-review-unavailable.sql');
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
 const SKIP = URL_VALUE ? false : SKIP_WITHOUT_PG;
@@ -98,15 +100,16 @@ const CHECK_VIOLATION = '23514';
 // ── 纯逻辑（无 PG 也要跑）──────────────────────────────────────────────────────
 
 test('#524 JS 枚举与迁移 0035 的 CHECK 同源（八种 skipped_reason / 六种 status / 五种 criterion / 四种 kind 一个都不能少）', () => {
-  const sql = fs.readFileSync(MIGRATION_0035, 'utf8');
+  const sql = fs.readFileSync(MIGRATION_0035, 'utf8') + '\n' + fs.readFileSync(MIGRATION_0044, 'utf8');
   for (const values of [MACRO_KINDS, MACRO_AUDIENCES, MACRO_SCOPES, MACRO_RUN_STATUSES,
     MACRO_RUN_CRITERIA, MACRO_SKIPPED_REASONS, MACRO_VERDICTS]) {
     for (const v of values) {
       assert.ok(sql.includes(`'${v}'`), `迁移 CHECK 里缺 '${v}'：JS 与 SQL 两份枚举漂了`);
     }
   }
-  // 数量本身也是契约（09 篇 §7 要「为什么没跑」可分组 ⇒ 八种穷举，不许退化成自由文本）。
-  assert.equal(MACRO_SKIPPED_REASONS.length, 8);
+  // 数量本身也是契约（09 篇 §7 要「为什么没跑」可分组 ⇒ 穷举，不许退化成自由文本）。
+  // #676 加了第九种 `review_unavailable`（M9 facts-only，见迁移 0044）⇒ 8 → 9。
+  assert.equal(MACRO_SKIPPED_REASONS.length, 9);
   assert.equal(MACRO_RUN_STATUSES.length, 6);
   assert.deepEqual(MACRO_RUN_CRITERIA, ['terminal', 'silent', 'tick', 'mechanical', 'semantic']);
   assert.equal(MACRO_KINDS.length, 4);
