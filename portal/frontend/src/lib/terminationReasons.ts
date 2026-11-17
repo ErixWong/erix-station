@@ -153,7 +153,8 @@ export const TERMINATION_REASON_SET: ReadonlySet<string> = new Set<string>(TERMI
 
 /**
  * issue #212 的红色告警子集（issue #42 的三值 + #212 补的两值）：
- *   * `persistence_failed` = **快照没落盘**——崩溃恢复可能重复副作用，语义最重，必须红色；
+ *   * `persistence_failed` = **账本没落盘**（transcript 轮记录 / run-state 写失败；#640 起本站没有
+ *     run snapshot，但错误类型与这条分级一字未动）——崩溃恢复可能重复副作用，语义最重，必须红色；
  *   * `final_guard_unverified` = **终稿未经核验**（finalGuard 修订重试耗尽 fail-closed），用户必须看见。
  * 注：`stall` / `continuation_exhausted` 属「截断但非故障」，按现状保持灰色（不在 #212 范围）。
  *
@@ -185,7 +186,7 @@ export const USER_STOP_TERMINATION_REASON: TerminationReason = 'aborted';
  * 终态分隔条**刷红**（`.syserr`）的 reason 集合（issue #236 呈现分级，实时 `run_end` 与历史合成项
  * `run_termination` **共用这一条规则**——两路同文案同分级，不然刷新一次颜色就变）：
  *   * 红 = `failed`（真失败）/ `max_rounds_cap`（撞轮数上限，异常截断）/ `persistence_failed`
- *     （快照没落盘，崩溃恢复可能重复副作用，语义最重）/ `final_guard_unverified`（终稿未核验）；
+ *     （账本没落盘，崩溃恢复可能重复副作用，语义最重）/ `final_guard_unverified`（终稿未核验）；
  *   * 中性 = 其余（含 `end_turn` / `no_tool` / `judge_done` / `stall` / `continuation_exhausted`
  *     这些正常或「截断但非故障」的收尾，以及 **`aborted`**：用户按了停止）。
  * **由 `RUN_FAIL_REASONS` 派生**（减掉 `USER_STOP_TERMINATION_REASON`）而不是手抄第二份枚举：
