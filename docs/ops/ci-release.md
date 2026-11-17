@@ -307,6 +307,16 @@ userspace/端口下发对账 → 预览签票链路 → 去置备 + offboarding 
   2. `runner/package.json`（FDE 镜像与宿主引擎同源，`release.yml` 只警告不阻断）；
   3. `portal/frontend/package.json`（纯展示，建议一并对齐）。
   然后 `git commit` → `git tag vX.Y.Z` → 推 tag。
+- **打 tag 前必须现查这个 tag 是否已经存在**：`git ls-remote --tags origin | grep "vX.Y.Z"`。
+  261117 实测的现场：并行 session 在我执行 `git tag` 之前 8 分钟就打了 `v0.1.70` 并跑完 release
+  （`43910657016` success），我的 `git tag -a` 直接 `fatal: tag already exists`——**这是运气好**；
+  若对方打的号与我打算的号不同（例如他打 0.1.70、我打 0.1.71），我会在**别人的发布之上**再叠一版，
+  两边的 tag 指向两棵不同的树，谁都不知道 0.1.70 里到底有什么。
+  现查两件：① 目标 tag 是否已存在；② 它指向的 commit 是不是我准备打的那个（`git rev-parse --short vX.Y.Z^{commit}`）。
+- **tag 必须指向「我们验过的那份树」**：261117 实测的第二个坑——`v0.1.70` 指向 `a5deeb7`（版本号那单的合并），
+  而该单的**交付物（e2e 脚本）合并在它之后** ⇒ tag 的树 ≠ main，差的正是交付物本身。处置口径：
+  **不动已发布的 tag**（镜像不可变，移动 tag = 造假），从 main 重切下一版（0.1.70 → 0.1.71）并记账。
+  ⇒ 顺序永远是「**要交付的东西全部合进 main** → 版本号 PR 合并 → 打 tag」，别在还有 PR 在飞时打 tag。
 - 依赖 `erix-agent` 是公开包（三份 lockfile 的 `resolved` 全指 `registry.npmjs.org`）⇒ **CI 不需要 NPM_TOKEN**，
   也不需要任何新 secret（GHCR 登录用内置 `GITHUB_TOKEN`）。
 
