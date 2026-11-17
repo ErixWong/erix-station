@@ -434,5 +434,14 @@ test('#288 M1 接线：agentd 启动路径真的调了不变式检查，且心�
   assert.match(agentdSrc, /warnIfWatchdogBelowShellMax\(\);/, 'main() 里必须挂上启动不变式检查');
   assert.match(agentdSrc, /sweepWatchdog\(\{ now: Date\.now\(\) \}\);/, 'heartbeatLoop 必须走抽出来的巡检（行为与内联版等价）');
   assert.match(agentdSrc, /MSG\.SHELL_LIVENESS:[\s\S]*applyShellLiveness\(ctx, msg\)/, '心跳消息必须落到 applyShellLiveness');
-  assert.match(agentdSrc, /killShellChildGroups\(ctx\)/, '终止路径必须补杀 shell 子进程组');
+  // #608 起终止路径**收敛成一个入口** `killChildGroups(ctx)`（内部同时补杀 shell 与 MCP 两组
+  // detached 进程）。这里钉两件事，缺一条就是「新增了终止路径却忘了补杀」：
+  //   ① 所有终止路径都走那个统一入口（不再各写一遍 killShellChildGroups）；
+  //   ② 入口内部真的两支都调（只调一支 ⇒ 另一类子进程跨 attempt 无限累加）。
+  const entryCalls = agentdSrc.match(/killChildGroups\(/g) ?? [];
+  assert.ok(entryCalls.length >= 2, `终止路径必须走统一入口 killChildGroups（当前 ${entryCalls.length} 处）`);
+  assert.match(agentdSrc, /function killChildGroups\(ctx[\s\S]{0,200}killShellChildGroups\(ctx/,
+    'killChildGroups 内部必须补杀 shell 子进程组');
+  assert.match(agentdSrc, /function killChildGroups\(ctx[\s\S]{0,300}killMcpChildGroups\(ctx/,
+    'killChildGroups 内部必须补杀 MCP server 子进程组（#608 §6.8）');
 });
