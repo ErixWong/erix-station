@@ -3131,7 +3131,7 @@ wp5/wp6 的「起一套隔离栈」相反：新栈必然自洽，拿它验版本
 
 真相分布（三处，各有唯一职责）：包内容与元数据在 `capability_items` / `capability_files`
 （迁移 `0039`），装没装/启没启在 `fde_capability_installs`，「磁盘上有」只是这两张表的**投影**
-——平台不做磁盘对账，用户手删了文件页面仍显示已装，出路是给「重新安装」（`force`，见 4.16-5）。
+——平台不做磁盘对账，用户手删了文件页面仍显示已装，出路是给「重新安装」（`force`，见 4.17-5）。
 
 **两条全局形状**（与 §4.2 `/api/admin/users` 同形，前端两种都收但以这套为准）：
 列表 = `{"items":[...]}`，详情 = `{"item":{...}}`；字段一律 `snake_case`。
@@ -3153,7 +3153,7 @@ wp5/wp6 的「起一套隔离栈」相反：新栈必然自洽，拿它验版本
 | `capability_kind_unsupported` | 409 | `kind='mcp'` 的发布/安装（本期没有消费者，§9） |
 | `capability_install_failed` | 500 | 落盘/删目录失败（`details.reason` 是 `E*` 或 `invalid_fde_name`） |
 
-#### 4.16-1 `GET /api/market/items`
+#### 4.17-1 `GET /api/market/items`
 
 `200`：`{"items":[<用户面列表项>], "budget":{"max_enabled":12,"enabled_now":<int>}}`。
 列表项：`slug, kind, name, summary, version, tags[], tool_count, security_score,
@@ -3161,7 +3161,7 @@ installed, installed_version(null|string), enabled, when_to_use, author, license
 `version` 是**已发布版本**，`installed_version` 是这台 FDE 实装的版本（不相等 = 页面该给「升级」）。
 列表**不取包字节**（`capability_files.content`）：50 条 × 2 MiB 会先把进程吃掉。
 
-#### 4.16-2 `GET /api/market/items/:slug`
+#### 4.17-2 `GET /api/market/items/:slug`
 
 `200`：`{"item":{...列表项..., "description_md":"", "readme_md":"", "tools":[{"name","description"}],
 "manifest":{...}, "security_warnings":[{"code","path","line","note"}], "files":[{"path","bytes"}]}}`。
@@ -3169,11 +3169,11 @@ installed, installed_version(null|string), enabled, when_to_use, author, license
 markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不合法（不匹配 `^[a-z0-9][a-z0-9-]{0,63}$`）
 在路径层就 `400`，不入库查一轮再报 404。
 
-#### 4.16-3 `POST /api/market/items/:slug/install`
+#### 4.17-3 `POST /api/market/items/:slug/install`
 
 体（可省略）：`{"enabled":true,"force":false}`。`enabled` 缺省 = 已装过就沿用现值，否则 `true`。
 `200`：`{"result":{"changed":bool,"slug","version","enabled","dir","files"|...,"idempotent":true?},
-"item":<4.16-2 形状>}`。回包带 `item` 是为了让前端装完立刻把卡片翻成「已装」，不必自己拼三个字段。
+"item":<4.17-2 形状>}`。回包带 `item` 是为了让前端装完立刻把卡片翻成「已装」，不必自己拼三个字段。
 
 判据顺序（顺序本身是契约，不是实现细节）：① 条目存在 / `kind` 可消费 / `state='published'`；
 ② **幂等**：同版本且非 `force` ⇒ `changed:false`，**一个字节都不写盘**（否则「用户手改过文件」与
@@ -3183,20 +3183,20 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 审计：`user.capability_installed` / `user.capability_uninstalled` / `user.capability_enabled`，
 `target=capability:<slug>`，`details` 只有 `{changed, version, enabled}`。
 
-#### 4.16-4 `POST /api/market/items/:slug/uninstall`
+#### 4.17-4 `POST /api/market/items/:slug/uninstall`
 
 无体（不带 `Content-Type` 也收：`requireJson` 只卡带体的两个动作）。`200 {"result":{"changed","slug",
 "dir_removed"},"item":{...}}`。删 slug 目录 + 删一行安装账；**目录本来就不存在也是 200**
 （幂等的定义是结果状态一致，不是「一定做了动作」）。只删 `<slug>/` 这一层，同级技能与 `~/.erix`
 里别的东西一个字节都不碰。
 
-#### 4.16-5 `POST /api/market/items/:slug/enabled`
+#### 4.17-5 `POST /api/market/items/:slug/enabled`
 
 体：`{"enabled":<bool>}`（必须是布尔，否则 400）。**只改 DB 一行，磁盘一律不动**——停用后目录仍在，
 重新启用不必重下；从停用回到启用要过预算闸。未安装 ⇒ `404 capability_not_found`
 （`details.reason="not_installed"`）。
 
-#### 4.16-6 管理面 `/api/admin/market/*`
+#### 4.17-6 管理面 `/api/admin/market/*`
 
 | 端点 | 方法 | 说明 |
 | --- | --- | --- |
