@@ -315,22 +315,38 @@ function opaqueBindingNames(masked, from, to) {
   return [...names];
 }
 
+
 /** 能**结束**一个表达式的字符（ASI 判定用：`x\n const y` 才断，`(\n x` / `x +\n y` 那种没成形的不断）。 */
 const EXPRESSION_ENDS_RE = /[\w$)\]}'"`]/;
 
 /**
- * 换行之后**只能另起一句**的开头词（ASI 边界）：这些词不可能接着上一个表达式继续。
- * 反过来那些**能**接着表达式继续的词（`in` / `of` / `instanceof` / `new` 之外…）一律不列：
- * `a\n in obj` 是同一个表达式，ASI 不插分号 ⇒ 把它当边界会把遮蔽算窄（= 错记，静默）。
+ * 换行之后**能**接着上一行表达式的开头（⇒ ASI **不**插分号 ⇒ 表达式体还要往下延伸）：
+ * 运算符 / 成员访问 `.` `?.` / 调用 `(` / 下标 `[` / 模板续写（反引号），以及 `in` / `of` /
+ * `instanceof` 这三个「看着像新语句、其实接在上一行」的词（把它们当边界会把遮蔽算窄 = 错记，静默）。
+ *
+ * **反过来才是主方向**（#587 族 A 三轮②）：下一行以普通标识符 / 数字 / 声明关键字开头 ⇒ 那个换行
+ * 必然插分号 ⇒ 体到此为止。旧口径**只列了「哪些词算边界」**（`STATEMENT_HEAD_RE`），于是
+ * `const f = (KEY) => env[KEY]\nprocess.env[KEY];` 里下一行以 `process` 开头不算边界 ⇒ 遮蔽拉到文件尾
+ * ⇒ 箭头**之后**那条读外层常量的静态读形被误判成动态 = **假红**（那个 key 从三腿判据里隐形）。
+ * 两头都要成立：只把「不可能续行」的开头当边界，`a\n .b(K)` / 跨行三元 / 跨行 `??` 必须仍全覆盖
+ * （区间算窄过头 = 体后半段那些动态读又会被错记成外层静态名 = 回到假绿）。
  */
-const STATEMENT_HEAD_RE = /^(?:const|let|var|function|class|export|import|return|if|for|while|do|switch|try|catch|finally|else|throw|break|continue|debugger|await|yield|typeof|void|delete)\b/;
-
+const EXPRESSION_CONTINUATION_RE = /^(?:[.?([+*/%<>=!&|^,;:~`-]|\*\*|=>|\?\?|in\b|of\b|instanceof\b)/;
 
 /**
  * **无花括号箭头**（表达式体）的区间结尾，从 `=>` 之后第一个下标起算：扫到第一个「深度 0 的结束符」
  * （`;` `,` `)` `]` `}`）或 ASI 语句边界为止。
+ *
+ * 旧口径取「最内层**外围块**的结尾」（`{` 都没写，没配对 ⇒ 保守拉宽），后果是实测的**假红**：
+ * `const g = (KEY) => env[KEY]; … process.env[KEY]` —— 箭头**之后**那次读的是外层常量，却被算进
+ * 箭头参数的遮蔽区间 ⇒ 静态读形被判成动态 ⇒ 进 `unsupported`（三腿判据看不见这个 key，另一种静默）。
+ * 拉窄的边界必须**仍覆盖整个表达式体**：体内不可能出现深度 0 的 `;` `,` `)` `]` `}`（那些符号一出现
+ * 就说明表达式已经结束），所以这一趟扫描只会停在真正的体尾。
+ *
+ * ASI 那一跳要看**原文**（`code`）而不是掩码：串正文被抹成空格后，`a\n 'x'` 那种「下一行以串开头」
+ * 会被 `nextNonSpace(masked, …)` 跳到串后面去，误认成续行。`code` 与 `masked` 等长、坐标同一套。
  */
-function expressionBodyEnd(masked, from) {
+function expressionBodyEnd(code, masked, from) {
   let depth = 0;
   let last = '';
   for (let i = from; i < masked.length; i += 1) {
@@ -339,8 +355,9 @@ function expressionBodyEnd(masked, from) {
     if (c === ')' || c === ']' || c === '}') { if (depth === 0) return i; depth -= 1; last = c; continue; }
     if (depth === 0 && (c === ';' || c === ',')) return i;
     if (depth === 0 && c === '\n' && EXPRESSION_ENDS_RE.test(last)) {
-      const nx = nextNonSpace(masked, i + 1);
-      if (nx != null && STATEMENT_HEAD_RE.test(masked.slice(nx))) return i;
+      const nx = nextNonSpace(code, i + 1);
+      // 下一行没东西了（文件尾）也算边界；否则只有「能续行」的开头才让体继续下去。
+      if (nx == null || !EXPRESSION_CONTINUATION_RE.test(code.slice(nx))) return i;
     }
     if (!/\s/.test(c)) last = c;
   }
@@ -425,7 +442,7 @@ function collectParamBindings(code, masked, pairs, scopes, litsOf) {
     const b = nextNonSpace(masked, from);
     const raw = b != null && masked[b] === '{'
       ? (pairs.get(b) ?? scopes(b).end)
-      : expressionBodyEnd(masked, from);
+      : expressionBodyEnd(code, masked, from);
     return Math.min(raw, ceiling);
   };
   const sites = [];
