@@ -1228,6 +1228,11 @@ export const zhCN = {
       sourceUnknownShape: '来源：服务端没给或给了不认识的形状（不猜）',
       // 实际去读的 build-info 路径（`STATION_BUILD_INFO_PATH` / `ERIX_BUILD_INFO_PATH` 能改它 ⇒ 必须可见）。
       buildInfoPath: '读取路径：{path}',
+      // #643 B：只在服务端自己说「这是本地构建」时才出现的标注。
+      // 算法在服务端，前端不推（见 lib/versionSurface.ts）。
+      // 中性状态词：要说清没烘 build-info、不能当发布件对账。
+      localBuild: '本地构建：这份 portal 镜像里没烘 build-info，'
+        + '不能当发布件对账（镜像 tag / digest 都对不上）',
       engineTitle: '平台侧引擎（portal 镜像内的 erix-agent）',
       engineHint: 'portal 进程自己用的那份引擎，不是每台 FDE 里跑的那份——那是下面第三格。',
       // 引擎那格的来源标注：跟着服务端推导出的 provenance 走（前端不自己判）。

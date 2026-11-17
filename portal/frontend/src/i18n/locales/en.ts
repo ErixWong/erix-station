@@ -1214,6 +1214,11 @@ export const en = {
       sourceUnknownShape: 'Source: the server did not say, or said something unrecognized (not guessed)',
       // The build-info path actually read (STATION_BUILD_INFO_PATH / ERIX_BUILD_INFO_PATH can move it => it must stay visible).
       buildInfoPath: 'Read path: {path}',
+      // #643 B: shown only when the server itself says this is a local build;
+      // the frontend never infers it (see lib/versionSurface.ts).
+      // Neutral wording, but it must name "no build-info" / "not a release artifact".
+      localBuild: 'Local build: no build-info was baked into this portal image, so it is not a '
+        + 'release artifact to reconcile against (image tag / digest will not match)',
       engineTitle: 'Platform engine (erix-agent inside the portal image)',
       engineHint: 'The engine the portal process itself uses. Not the one running in each FDE container - that is the third section.',
       // Engine provenance wording follows the label the server derived (the frontend never infers);

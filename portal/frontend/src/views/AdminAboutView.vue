@@ -125,6 +125,18 @@ onMounted(() => {
         </dl>
         <p data-test="server-source" class="mt-2 text-xs text-black/55">{{ sourceText }}</p>
         <p data-test="server-build-info-path" class="mt-1 font-mono text-xs text-black/45">{{ buildInfoPathText }}</p>
+        <!-- #643 B：「本地构建」标注。条件只有 `=== true` 一个，因为这是**三态**：
+             `false` = 服务端说这不是本地构建（发布件，界面必须是干净的），`null` = 服务端没说
+             （老端点 / 桩给半截）—— 后者不许冒充前者的反面结论（不许写成「已烘 build-info」）。
+             判定在服务端（`revision === 'unknown'` ⇒ true），前端一个字都不推（红线 #643B-R）。
+             样式是中性标注、不给告警底色与 `⚠`：它是状态不是警报（D9 同口径）。 -->
+        <p
+          v-if="info?.localBuild === true"
+          data-test="server-local-build"
+          class="mt-1 inline-block rounded border border-black/15 px-1 text-xs text-black/60"
+        >
+          {{ t('admin.about.localBuild') }}
+        </p>
       </section>
 
       <!-- ② 平台侧引擎：portal 镜像里的 erix-agent。**不是**每台 FDE 的那个引擎 -->
