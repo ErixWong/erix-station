@@ -1628,12 +1628,22 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
     assert.deepEqual(got, want, `反向自证「${name}」的抓取结果不对：${JSON.stringify(got)}`);
   }
 
-  // ⑤（C 件补强）悬空引用扫描：同一行 提示词语境 + 引用旧号 ⇒ 违规
+  // ⑤（补强+收尾扩邻域）悬空引用：提示词语境 + 引用旧号 ⇒ 违规。
   //    旧号 = §4.16（现 #586「关于」）或 §4.18（现 #608「MCP」）。
   //    语境标记：platform_prompts / PLATFORM_PROMPTS / /api/admin/prompts / 提示词面板
-  //    只认引用形态（portal.md 或 契约/口径/见 紧邻 §N）；白话/主人行不计
+  //    只认引用形态（portal.md/见/契约/口径/contract 紧邻 §N）。
+  //    ① 同行：标记与引用同处一行（原有判据，一条不松）。
+  //    ② 邻域：真文件里标记与引用常不同行，只看引用行上方 N 行内有无
+  //    标记，且只在标记在前、引用在后时成立（反向不算）。
   const PROMPT_LINE = /platform_prompts|PLATFORM_PROMPTS|\/api\/admin\/prompts|提示词面板/;
   const OWNER_LINE = /#586|关于|about|version|版本|#608|MCP|能力市场|marketplace/i;
+  // 邻域窗口：真文件里旋钮说明与文档指引常不同行——.env.example 把
+  // platform_prompts 写在首行，# 详见 … §4.19 落在下方第 4 行；只判
+  // 同行 ⇒ 翻回旧号也不响（夹具比现实友好）。故再看上方 N 行。
+  // N=5：旋钮说明块从标记行到指引行实测跨 4 行，N=5 覆盖整块并留 1 行
+  // 余量；块间以空行/# 标题分隔，不会上溯到无关旋钮；全仓实测 N=5 仍
+  // 0 误伤（含 task-ledger 的 §4.16/§4.18 历史行：上方 5 行内无标记）。
+  const NEIGH_N = 5;
   const danglingRefs = (files, num) => {
     const esc = num.replace('.', '\\.');
     const ref = new RegExp('(?:portal\\.md[^\\n]{0,40}|(?:见|契约|口径|contract)'
@@ -1643,9 +1653,12 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
       const lines = f.text.split(/\r?\n/);
       for (let i = 0; i < lines.length; i++) {
         const ln = lines[i];
-        if (PROMPT_LINE.test(ln) && ref.test(ln) && !OWNER_LINE.test(ln)) {
-          hits.push(`${f.path || f.name}:${i + 1}: ${ln.trim().slice(0, 160)}`);
+        if (!ref.test(ln) || OWNER_LINE.test(ln)) continue;
+        let mark = PROMPT_LINE.test(ln);   // ① 同行标记
+        for (let k = Math.max(0, i - NEIGH_N); k < i && !mark; k++) {
+          if (PROMPT_LINE.test(lines[k])) mark = true;   // ② 上方邻域（标记在前）
         }
+        if (mark) hits.push(`${f.path || f.name}:${i + 1}: ${ln.trim().slice(0, 160)}`);
       }
     }
     return hits;
@@ -1659,11 +1672,49 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
   assert.match(apiDoc, /^### 4\.19 管理台提示词面板/m,
     'docs/api/portal.md 必须有 `### 4.19 管理台提示词面板` 标题');
 
-  // 常驻反向自证：把一行写成 §4.18 的 .env.example 喂进同一函数 ⇒ 判红
+  // 常驻反向自证·①：取 .env.example 的实际内容，只在内存里把一处
+  // §4.19 换成 §4.18（标记在上、引用在下），喂同一函数 ⇒ 判红。
+  // 不改磁盘那个文件（红线）；这条就是主 agent 那次翻旧号不响的变异。
+  const envReal = fs.readFileSync(
+    fileURLToPath(new URL('../../deploy/.env.example', import.meta.url)), 'utf8');
+  const envLines = envReal.split(/\r?\n/);
+  const envIdx = envLines.findIndex((l) => l.includes('§4.19'));
+  assert.ok(envIdx >= 0, '前置：deploy/.env.example 必须真有 §4.19 可供变异');
+  const envMut = envLines
+    .map((l, i) => (i === envIdx ? l.replace('§4.19', '§4.18') : l)).join('\n');
+  const gotReal = danglingRefs([{ path: 'deploy/.env.example', text: envMut }], '4.18');
+  assert.ok(gotReal.length >= 1,
+    '反向自证失效：真文件把 §4.19 换成 §4.18 却判绿（邻域口径没生效）');
+  assert.ok(gotReal.some((h) => h.startsWith(`deploy/.env.example:${envIdx + 1}:`)),
+    `须点名被改行 deploy/.env.example:${envIdx + 1}：${JSON.stringify(gotReal)}`);
+
+  // 常驻反向自证·②（保留，不许被①顶替）：
+  // 标记与引用同行的内存夹具也必须被同一函数抓到。
   const REF_418 = '§' + '4.18';   // 拆着写：这一行本身不许被⑤扫到
   const envProbe = [{ path: 'deploy/.env.example',
     text: 'PLATFORM_PROMPTS_READ_TIMEOUT_MS=8000  # 详见 docs/api/portal.md ' + REF_418 }];
   const got418 = danglingRefs(envProbe, '4.18').map((h) => h.replace(/: .*$/, ''));
   assert.deepEqual(got418, ['deploy/.env.example:1'],
-    '反向自证：写成 §4.18 的 .env.example 必须被判红并点名那一行');
+    '反向自证：写成 §4.18 的 .env.example（同行）必须判红并点名那一行');
+
+  // 常驻不许误伤（各一条，喂同一 danglingRefs ⇒ 必须判绿 []）。
+  const NEG = [
+    // 主人（#586 关于）那节的 §4.16 合法：引用行点名主人 ⇒ 豁免。
+    ['#586 own 4.16', '# platform_prompts 的超时见别处。\n'
+      + '# 关于面板契约 docs/api/portal.md §' + '4.16' + '。\n'],
+    // 别家台账历史合法：§4.18 引用行旋钮标记在 5 行之外（邻域有界）。
+    ['ledger 4.18 history', 'PLATFORM_PROMPTS_READ_TIMEOUT_MS=8000\n'
+      + 'a\nb\nc\nd\ne\n契约 docs/api/portal.md §' + '4.18' + '。\n'],
+    // 白话提及（不带 portal.md / 见/契约/口径/contract）不算引用形态。
+    ['prose mention', 'platform_prompts 面板。\n'
+      + '当年 §' + '4.16' + ' 一度有两个标题（合并 main 时）。\n'],
+    // 方向闸：标记在引用下方不算（主人行历史上方偶有旋钮）。
+    ['marker after ref', '详见 docs/api/portal.md §' + '4.18' + '。\n'
+      + 'PLATFORM_PROMPTS_READ_TIMEOUT_MS=8000\n'],
+  ];
+  for (const [label, text] of NEG) {
+    const one = [{ path: label, text }];
+    const bad = [...danglingRefs(one, '4.16'), ...danglingRefs(one, '4.18')];
+    assert.deepEqual(bad, [], `不许误伤「${label}」：${JSON.stringify(bad)}`);
+  }
 });
