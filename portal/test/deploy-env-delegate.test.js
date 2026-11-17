@@ -1187,11 +1187,16 @@ test('活一⑧ 解析不出 env 名的读形 ⇒ 进 unsupported 清单；不�
 // 每格都带一个**方向相反的对照组**，所以「把机件拆掉」与「把机件做得过宽」都会红。
 // ===========================================================================
 
-/** 写一个临时夹具（单文件 `fx.js`）并扫它：`{ keys: 排序后的数组, unsupported }`。 */
+/**
+ * 写一个临时夹具并扫它：`src` 给字符串 = 单文件 `fx.js`；给对象 = 多个文件（**别名表是按文件建的**，
+ * 想让某个形状「只有它自己」时必须单独放一个文件，否则隔壁文件的别名会替它背书）。
+ * @returns {{ keys: string[], unsupported: Array }}
+ */
 function scanFixture(name, src) {
+  const files = typeof src === 'string' ? { 'fx.js': src } : src;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `env-lang-${name}-`));
   try {
-    fs.writeFileSync(path.join(dir, 'fx.js'), src);
+    for (const [f, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, f), text);
     const { keys, unsupported } = scanEnvReads(dir);
     return { keys: [...keys.keys()].sort(), unsupported };
   } finally {
@@ -1214,6 +1219,7 @@ test('活二⑨ 正则字面量不是注释：字符类里的「斜杠星」之�
     'export const c = process.env.ERIX_A2_AFTER_ESCAPED;',
     'const x = a / b; const re = /[/*]/; const y = c / d; // 正则夹在两次除法中间',
     'export const d = process.env.ERIX_A2_BETWEEN_DIV;',
+    'const cls2 = /[/]*/; const e2 = process.env.ERIX_A2_AFTER_CLASS_SLASH; const w = 1 / 2;',
     'export function f(e) { return /[*?]/u.test(e); }',
     'export const g = process.env.ERIX_A2_AFTER_RETURN;',
     '/* 真块注释里提到 process.env.ERIX_A2_GHOST_BLOCK */',
@@ -1222,7 +1228,7 @@ test('活二⑨ 正则字面量不是注释：字符类里的「斜杠星」之�
   ].join('\n');
   const { keys } = scanFixture('regex', src);
   assert.deepEqual(keys, [
-    'ERIX_A2_AFTER_BLOCK', 'ERIX_A2_AFTER_CLASS', 'ERIX_A2_AFTER_CLASS_U',
+    'ERIX_A2_AFTER_BLOCK', 'ERIX_A2_AFTER_CLASS', 'ERIX_A2_AFTER_CLASS_SLASH', 'ERIX_A2_AFTER_CLASS_U',
     'ERIX_A2_AFTER_ESCAPED', 'ERIX_A2_AFTER_RETURN', 'ERIX_A2_BETWEEN_DIV',
   ].sort(), `正则识别漏了形状 ⇒ 它后面的真读取被整段吞掉（实际只扫到 ${JSON.stringify(keys)}）。`
     + '缺哪几个名字 = 哪一段代码被当成注释/串正文抹平了');
@@ -1248,38 +1254,43 @@ test('活二⑩ 正则**正文里提到的**读形不算读取（掩码那把尺
 
 test('活二⑪ 可选链读形五种都要进枚举（`process.env?.X` / `env?.X` / `process?.env?.X` / `process.env?.[\'X\']` / `env?.[表名]`）', () => {
   // 旧 `readRe` 只有 `(?:\?\.)?(?:\. NAME | \[…\])`：`process.env?.X` 里 `?.` 之后**没有**第二个点，
-  // 两支都不匹配 ⇒ 整形扫不到 0 次；`process?.env` 更是连对象别名都匹配不上。
-  // 成员那一跳必须写成 `(?:\?\.|\.)`，对象那一跳要允许 `process?.env`。
-  const src = [
-    "const T = Object.freeze({ a: 'ERIX_A3_TABLE_KEY' });",
-    'export function pick(which, env = process.env) {',
-    '  const name = T[which];',
-    '  return [',
-    '    process.env.ERIX_A3_DOT,',
-    '    env.ERIX_A3_ALIAS_DOT,',
-    '    process.env["ERIX_A3_BRACKET"],',
-    '    process.env?.ERIX_A3_OPTCHAIN,',
-    '    env?.ERIX_A3_ALIAS_OPT,',
-    '    process?.env?.ERIX_A3_OPTPROC,',
-    "    process.env?.['ERIX_A3_OPT_BRACKET'],",
-    '    env?.[name],',
-    '    env?.[which],',
-    '  ];',
-    '}',
-    'export function viaAlias(env = process?.env) { return env.ERIX_A3_ALIAS_FROM_OPTCHAIN; }',
-    'export const notEnv = (foo) => foo?.ERIX_A3_NOT_ENV_OBJECT;',
-  ].join('\n');
-  const { keys, unsupported } = scanFixture('optchain', src);
+  // 两支都不匹配 ⇒ 整形扫不到 0 次；`process?.env` 更是连**对象别名**都匹配不上（别名表与读形两处都要改）。
+  // 别名那一支必须单独放一个文件：别名是**按文件**建的，隔壁文件的 `env = process.env` 会替它背书。
+  const { keys, unsupported } = scanFixture('optchain', {
+    'shapes.js': [
+      "const T = Object.freeze({ a: 'ERIX_A3_TABLE_KEY' });",
+      'export function pick(which, env = process.env) {',
+      '  const name = T[which];',
+      '  return [',
+      '    process.env.ERIX_A3_DOT,',
+      '    env.ERIX_A3_ALIAS_DOT,',
+      '    process.env["ERIX_A3_BRACKET"],',
+      '    process.env?.ERIX_A3_OPTCHAIN,',
+      '    env?.ERIX_A3_ALIAS_OPT,',
+      '    process?.env?.ERIX_A3_OPTPROC,',
+      "    process.env?.['ERIX_A3_OPT_BRACKET'],",
+      '    env?.[name],',
+      '    env?.[which],',
+      '  ];',
+      '}',
+      'export const falseAlias = (childEnv) => childEnv.ERIX_A3_FALSE_ALIAS;',
+      'export const nestedEnv = (spec) => spec.env.ERIX_A3_NESTED_ALIAS;',
+      'export const notEnv = (foo) => foo?.ERIX_A3_NOT_ENV_OBJECT;',
+    ].join('\n'),
+    'alias-only.js': 'export function viaAlias(env = process?.env) { return env.ERIX_A3_ALIAS_FROM_OPTCHAIN; }\n',
+  });
   assert.deepEqual(keys, [
     'ERIX_A3_ALIAS_DOT', 'ERIX_A3_ALIAS_FROM_OPTCHAIN', 'ERIX_A3_ALIAS_OPT', 'ERIX_A3_BRACKET',
     'ERIX_A3_DOT', 'ERIX_A3_OPTPROC', 'ERIX_A3_OPT_BRACKET', 'ERIX_A3_OPTCHAIN', 'ERIX_A3_TABLE_KEY',
   ].sort(), `可选链那一支没进枚举（实际 ${JSON.stringify(keys)}）⇒ 读形扫不到 = 那个旋钮在闸门里不存在`);
   // 读形认得、名字来自调用方 ⇒ 不许静默放过，必须进 `unsupported`（fail loudly）
-  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), ['fx.js:13 env?.[which]'],
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), ['shapes.js:13 env?.[which]'],
     `解析不出名字的动态读形没进 unsupported（实际 ${JSON.stringify(unsupported)}）`);
-  // 前缀那条前视不许被放宽：`foo?.X` 不是 env 对象，不许因为「加了可选链支持」就把它当读取
-  assert.ok(!keys.includes('ERIX_A3_NOT_ENV_OBJECT'),
-    '非 env 对象的 `foo?.NAME` 被当成读取 ⇒ 可选链支持顺带放宽了对象前缀，假 key 又来了');
+  // 对象前缀那条前视不许被放宽：`childEnv.X` / `foo?.X` 都不是 env 对象
+  for (const phantom of ['ERIX_A3_FALSE_ALIAS', 'ERIX_A3_NESTED_ALIAS', 'ERIX_A3_NOT_ENV_OBJECT']) {
+    assert.ok(!keys.includes(phantom),
+      `${phantom} 来自**别的对象**（名字以 env 结尾 / 只是碰巧写了可选链）却进了枚举 ⇒ 前缀被放宽了`);
+  }
 });
 
 test('活二⑫ 参数遮蔽：`function f(OUTER_ENV, env)` 里 `env[OUTER_ENV]` 是动态读，不许错记成外层常量的名字', () => {
