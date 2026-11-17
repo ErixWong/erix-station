@@ -52,6 +52,7 @@ import * as delegation from './delegation.js'; // 子 run（delegation）读侧�
 import * as macroRoutes from './macro-routes.js'; // #526：宏平台 HTTP 业务层（if 链只做「匹配+鉴权+转发」，不再撑大本文件）
 import { MacroError } from './macros.js'; // #526：宏域错误载体（httpStatus 自带在错误上，一处映射）
 import * as market from './market.js'; // #595：能力市场（校验/安装面），本文件只做「匹配+鉴权+转发+审计」
+import { metricsApiPayload } from './system-metrics.js'; // #650：管理台系统监控（响应本体在那个模块，本文件只做匹配+递旋钮）
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -1419,6 +1420,20 @@ async function handleAdminApi(req, res, ctx, url) {
   // 为什么放管理台而不做用户侧工作台：两个引擎数并排给 FDE 看需要解释文案，那会变成第二个会漂的账（判据 C）。
   if (pathname === '/api/admin/version' && req.method === 'GET') {
     return sendJson(res, 200, await aboutPanel({ pool: ctx.pool, log: ctx.log }));
+  }
+
+  // ---- issue #650：管理台「系统」tab 的后端面（宿主 CPU / 内存 / 磁盘 / 容器数）----------------
+  // **只读、零副作用、零新错误码**（入口已统一过 `requireAdmin` ⇒ 非 admin 在上面就 403 了，不重复加）。
+  // 存在理由与 #586 的版本三格同形：真相一直在（`htop` / `free` / `df`），但界面上一个读面都没有。
+  // `latest` 与 `series` 来自**同一个**采样器（`cli.js serve` 经 `config.metricsSampler` 递进来），
+  // 不是两份真相；采样器没跑时 `latest: null`，DB 读失败时只带 `seriesError`——**两者都是 200**（降级不报错）。
+  if (pathname === '/api/admin/system/metrics' && req.method === 'GET') {
+    return sendJson(res, 200, await metricsApiPayload({
+      pool: ctx.pool,
+      sampler: ctx.config?.metricsSampler ?? null,
+      retentionDays: ctx.config?.systemMetrics?.retentionDays ?? null,
+      range: url.searchParams.get('range') ?? undefined,
+    }));
   }
 
   // ---- #526 宏平台管理台（契约 10 篇 §3.3；业务在 macro-routes.js，本处只转发）----
