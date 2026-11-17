@@ -85,8 +85,7 @@ function makeStore() {
       records.get(key).push(record);
     },
     async load(key) { return [...(records.get(key) ?? [])]; },
-    async saveRunSnapshot() {},
-    async loadLatestRunSnapshot() { return undefined; },
+    // ⚠ 旧 `saveRunSnapshot` / `loadLatestRunSnapshot` 桩已随 issue #640 删（0.33.0 引擎不再调）。
     async saveRunState() {},
     async loadRunState() { return undefined; },
     async markRunState() {},
