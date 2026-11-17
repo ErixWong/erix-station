@@ -1,4 +1,4 @@
--- 0042-system-metrics.sql —— 宿主资源指标（CPU / 内存 / 磁盘 / 容器数）的时序落库（issue #650，工单 feat-261117-15）
+-- 0044-system-metrics.sql —— 宿主资源指标（CPU / 内存 / 磁盘 / 容器数）的时序落库（issue #650，工单 feat-261117-15）
 --
 -- 要治的是什么：管理台今天没有任何宿主资源读面——CPU / 内存 / 磁盘 / 容器数只能靠人 SSH 上机
 --   `htop` + `docker ps`。出问题的症状是「FDE 变慢」，而**平台自己不知道宿主是不是快满了**。
@@ -68,7 +68,7 @@ DECLARE
 BEGIN
   SELECT count(*) INTO n_metrics FROM system_metrics;
   SELECT count(*) INTO n_disks FROM system_metrics_disks;
-  RAISE NOTICE '0042: system_metrics=% 行 / system_metrics_disks=% 行（新建即空表，全 0 是正常态）',
+  RAISE NOTICE '0044: system_metrics=% 行 / system_metrics_disks=% 行（新建即空表，全 0 是正常态）',
     n_metrics, n_disks;
 END
 $$;

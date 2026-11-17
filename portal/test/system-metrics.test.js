@@ -1126,5 +1126,5 @@ test('#650 端点只读：非 GET 不许命中它；baseline schema.sql 没被�
     clearSeriesCache();
   }
   const schema = fs.readFileSync(new URL('../../docs/data/schema.sql', import.meta.url), 'utf8');
-  assert.ok(!/system_metrics/.test(schema), 'baseline schema.sql 冻结：0042 的东西不许回写进 baseline');
+  assert.ok(!/system_metrics/.test(schema), 'baseline schema.sql 冻结：0044 的东西不许回写进 baseline');
 });
