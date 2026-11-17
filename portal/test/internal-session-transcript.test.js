@@ -274,72 +274,11 @@ test('session transcript：fencing——writer run 属主/租约校验、缺 run
   }
 });
 
-test('session checkpoint：CAS 前进 / 旧 revision 409 / 跨 run 同 key revision 续增', async () => {
-  const { pool, token, runId, sessionId, userId } = seedClaimable();
-  const s = await startServer(pool);
-  try {
-    const ticket = await claimTicket(s, token);
-    const h = {
-      Authorization: `Bearer ${token}`,
-      'X-Claim-Token': ticket.claim_token,
-      'Content-Type': 'application/json',
-    };
-    const qs = `?run_id=${runId}`;
-
-    // 无 checkpoint → 204
-    const none = await fetch(`${s.base}/api/internal/transcript/${sessionId}/checkpoint/latest${qs}`, { headers: h });
-    assert.equal(none.status, 204);
-
-    const cp1 = { round: 1, status: 'pending', messages: [] };
-    const cp2 = { round: 2, status: 'executed', messages: [] };
-    const put1 = await fetch(`${s.base}/api/internal/transcript/${sessionId}/checkpoint${qs}`, {
-      method: 'PUT', headers: h, body: JSON.stringify({ revision: 1, snapshot: cp1 }),
-    });
-    assert.equal(put1.status, 200);
-    const put2 = await fetch(`${s.base}/api/internal/transcript/${sessionId}/checkpoint${qs}`, {
-      method: 'PUT', headers: h, body: JSON.stringify({ revision: 2, snapshot: cp2 }),
-    });
-    assert.equal(put2.status, 200);
-
-    // 旧 revision → 409 checkpoint_stale
-    const stale = await fetch(`${s.base}/api/internal/transcript/${sessionId}/checkpoint${qs}`, {
-      method: 'PUT', headers: h, body: JSON.stringify({ revision: 1, snapshot: cp1 }),
-    });
-    assert.equal(stale.status, 409);
-    assert.equal((await stale.json()).error.code, 'checkpoint_stale');
-
-    // 读回最新
-    const got = await fetch(`${s.base}/api/internal/transcript/${sessionId}/checkpoint/latest${qs}`, { headers: h });
-    assert.equal(got.status, 200);
-    const body = await got.json();
-    assert.equal(body.checkpoint.revision, 2);
-    assert.deepEqual(body.checkpoint.snapshot, cp2);
-
-    // 同 session 换 run（re-claim 场景）：revision 从读回值续增，不重置
-    pool.runs.push({ id: 'run2', session_id: sessionId, status: 'queued' });
-    pool.queue.push({ id: 'q2', run_id: 'run2', status: 'pending', attempts: 0, max_attempts: 3, created_at: 2 });
-    // 先让 run1 终态释放（直接改 fake 现场）
-    pool._run(runId).status = 'finished';
-    pool._queue(runId).status = 'done';
-    pool._queue(runId).claim_token = null;
-    const claim2 = await fetch(`${s.base}/api/internal/claim`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ capacity: 1, hold_ms: 10 }),
-    });
-    const ticket2 = await claim2.json();
-    assert.equal(ticket2.run.id, 'run2');
-    const h2 = { Authorization: `Bearer ${token}`, 'X-Claim-Token': ticket2.claim_token, 'Content-Type': 'application/json' };
-    const put3 = await fetch(`${s.base}/api/internal/transcript/${sessionId}/checkpoint?run_id=run2`, {
-      method: 'PUT', headers: h2, body: JSON.stringify({ revision: 3, snapshot: { round: 3 } }),
-    });
-    assert.equal(put3.status, 200);
-    const got2 = await fetch(`${s.base}/api/internal/transcript/${sessionId}/checkpoint/latest?run_id=run2`, { headers: h2 });
-    assert.equal((await got2.json()).checkpoint.revision, 3);
-  } finally {
-    await s.close();
-  }
-});
+// ⚠ 旧用例「session checkpoint：CAS 前进 / 旧 revision 409 / 跨 run 同 key revision 续增」已随
+//   issue #640 删除（S4/S5 = `PUT /transcript/:key/checkpoint` 与 `GET .../checkpoint/latest`）。
+//   0006 给 `run_checkpoints` 加的 session 侧键（`transcript_key` + 部分唯一索引）也一起没了，
+//   但 **0006 的字节不许改**（已应用的迁移，sha256 冻结）⇒ `migrations.test.js:49` 那条历史断言保留。
+//   退役形状本身（有效认证 ⇒ 404，不是 500/405）由 `portal/test/http-runstate.test.js` 的 #640 用例钉。
 
 test('session runstate：快照与终态 status 分离，status API 回退 legacy state', async () => {
   const { pool, token, runId, sessionId } = seedClaimable();

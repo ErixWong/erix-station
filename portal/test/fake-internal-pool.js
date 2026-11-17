@@ -16,7 +16,8 @@ export class FakeInternalPool {
     this.messages = seed.messages ?? [];
     this.events = seed.events ?? [];
     this.rounds = seed.rounds ?? [];
-    this.checkpoints = seed.checkpoints ?? [];
+    // ⚠ `run_checkpoints` 相关的桩（`checkpoints` 数组 + 四条 SQL 分支）已随 issue #640 删除；
+    //   表由迁移 `0041` DROP，四个 /checkpoint* 端点也不再路由 ⇒ 这里没有可留的语义。
     this.approvals = seed.approvals ?? [];
     // tool_calls 行补齐两列缺省值（NULL 就是 NULL，不是「没这个键」），与真库列默认值同口径。
     this.toolCalls = (seed.toolCalls ?? []).map((row) => Object.assign({ duration_ms: null, result_digest: null }, row, {
@@ -557,27 +558,6 @@ export class FakeInternalPool {
       return { rows };
     }
 
-    // ---- session checkpoint（issue #81 P2：ON CONFLICT (transcript_key) + revision CAS）----
-    if (sql.includes('INSERT INTO run_checkpoints') && sql.includes('transcript_key')) {
-      const [runId, key, snapshot, revision] = params;
-      const existing = this.checkpoints.find((c) => c.transcript_key === key);
-      if (!existing) {
-        this.checkpoints.push({ run_id: runId, transcript_key: key, snapshot: JSON.parse(snapshot), revision });
-        return { rows: [{ revision }] };
-      }
-      if (revision > existing.revision) {
-        existing.snapshot = JSON.parse(snapshot);
-        existing.revision = revision;
-        return { rows: [{ revision }] };
-      }
-      return { rows: [] }; // stale
-    }
-    if (sql.includes('FROM run_checkpoints WHERE transcript_key')) {
-      const [key] = params;
-      const c = this.checkpoints.find((x) => x.transcript_key === key);
-      return { rows: c ? [{ snapshot: c.snapshot, revision: c.revision, updated_at: new Date() }] : [] };
-    }
-
     // ---- session 属主校验（fetchSession）----
     if (sql.includes('SELECT id, user_id FROM chat_sessions WHERE id')) {
       const key = params[0];
@@ -624,27 +604,6 @@ export class FakeInternalPool {
       const [runId, round] = params;
       const r = this.rounds.find((x) => x.run_id === runId && x.round === round);
       return { rows: r ? [{ record: r.record, folded: r.folded }] : [] };
-    }
-
-    // ---- checkpoint ----
-    if (sql.includes('INSERT INTO run_checkpoints')) {
-      const [runId, snapshot, revision] = params;
-      const existing = this.checkpoints.find((c) => c.run_id === runId);
-      if (!existing) {
-        this.checkpoints.push({ run_id: runId, snapshot: JSON.parse(snapshot), revision });
-        return { rows: [{ revision }] };
-      }
-      if (revision > existing.revision) {
-        existing.snapshot = JSON.parse(snapshot);
-        existing.revision = revision;
-        return { rows: [{ revision }] };
-      }
-      return { rows: [] }; // stale
-    }
-    if (sql.includes('FROM run_checkpoints WHERE run_id')) {
-      const runId = params[0];
-      const c = this.checkpoints.find((x) => x.run_id === runId);
-      return { rows: c ? [{ snapshot: c.snapshot, revision: c.revision, updated_at: new Date() }] : [] };
     }
 
     // ---- runstate snapshot/status（F2：条件 UPDATE 包含非终态+属主+有效租约）----

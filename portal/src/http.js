@@ -4902,7 +4902,12 @@ const INTERNAL_ROUND_LIMIT = 1.5 * 1024 * 1024; // transcript round 1MB + 信封
 // **宽**：反过来了 oversized 的 body 会先被这里 413 掉，报信里就只剩「太大」，没有 internal 那条
 // `details.bytes/limit` 可指认。今天本站不开 `partialPersistence`（#301）⇒ 真走到这个量级就是上游开了开关。
 const INTERNAL_RECOVERY_ROW_LIMIT = 640 * 1024;
-const INTERNAL_CHECKPOINT_LIMIT = 2 * 1024 * 1024; // checkpoint snapshot 可较大
+// **内部大 body 上限**（不是哪个端点专属）：今天只有两个 `/runstate` PUT 用它——
+// run-state 快照随会话长度增长（上下文压缩摘要 / 折叠事实 / 工具清单都能撑进去），量级远超轮记录。
+// 名字由来：它原本叫 `INTERNAL_CHECKPOINT_LIMIT`（给 `run_checkpoints` 的快照 body 用，
+// issue #640 已连同四个 `/checkpoint*` 端点一起删），**常量本身活了下来** ⇒ 改名成按语义自解释。
+// 新加大 body 的内部端点若量级相当，复用它是故意的（不是历史残留）。
+const INTERNAL_LARGE_BODY_LIMIT = 2 * 1024 * 1024;
 
 function bearerToken(req) {
   const header = req.headers.authorization || '';
@@ -5022,23 +5027,9 @@ async function handleInternal(req, res, ctx, url) {
       const result = await internal.putSessionRound(ctx.pool, { ...base, round: Number(sessionRoundMatch[1]), body });
       return sendJson(res, 200, result);
     }
-    if (sub === '/checkpoint') {
-      if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
-      requireJson(req);
-      const body = await readJsonBody(req, INTERNAL_CHECKPOINT_LIMIT);
-      const result = await internal.putSessionCheckpoint(ctx.pool, { ...base, body });
-      return sendJson(res, 200, result);
-    }
-    if (sub === '/checkpoint/latest') {
-      if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
-      const result = await internal.getSessionLatestCheckpoint(ctx.pool, base);
-      if (result === null) {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-      return sendJson(res, 200, result);
-    }
+    // ⚠ 旧 S4/S5（`PUT /transcript/:key/checkpoint` 与 `GET /transcript/:key/checkpoint/latest`）已随
+    //   issue #640 删除：erix-agent 0.33.0 不再读写 run snapshot ⇒ 落到本分支末尾的 **404 `not_found`**
+    //   （不是 405：路径本身已不存在，旧 agentd 打过来要当「端点没了」而非「方法不对」）。
     if (sub === '/runstate/status') {
       if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
       const result = await internal.loadSessionRunStateStatus(ctx.pool, base);
@@ -5076,7 +5067,7 @@ async function handleInternal(req, res, ctx, url) {
     if (sub === '/runstate') {
       if (req.method === 'PUT') {
         requireJson(req);
-        const body = await readJsonBody(req, INTERNAL_CHECKPOINT_LIMIT);
+        const body = await readJsonBody(req, INTERNAL_LARGE_BODY_LIMIT);
         const result = await internal.saveSessionRunState(ctx.pool, { ...base, body });
         return sendJson(res, 200, result);
       }
@@ -5124,23 +5115,8 @@ async function handleInternal(req, res, ctx, url) {
       const result = await internal.releaseRun(ctx.pool, { container, user, runId, claimToken, body });
       return sendJson(res, 200, result);
     }
-    if (sub === '/checkpoint') {
-      if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
-      requireJson(req);
-      const body = await readJsonBody(req, INTERNAL_CHECKPOINT_LIMIT);
-      const result = await internal.putCheckpoint(ctx.pool, { container, user, runId, claimToken, body });
-      return sendJson(res, 200, result);
-    }
-    if (sub === '/checkpoint/latest') {
-      if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
-      const result = await internal.getLatestCheckpoint(ctx.pool, { container, user, runId, claimToken });
-      if (result === null) {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-      return sendJson(res, 200, result);
-    }
+    // ⚠ 旧 U8/U9（`PUT /runs/:id/checkpoint` 与 `GET /runs/:id/checkpoint/latest`）已随 issue #640 删除
+    //   （run snapshot 整条竖切退役）⇒ 两个路径现在落到本函数末尾的 **404 `not_found`**，不是 405/500。
     if (sub === '/runstate/status') {
       if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
       const result = await internal.loadRunStateStatus(ctx.pool, { container, user, runId, claimToken });
@@ -5154,7 +5130,7 @@ async function handleInternal(req, res, ctx, url) {
     if (sub === '/runstate') {
       if (req.method === 'PUT') {
         requireJson(req);
-        const body = await readJsonBody(req, INTERNAL_CHECKPOINT_LIMIT);
+        const body = await readJsonBody(req, INTERNAL_LARGE_BODY_LIMIT);
         const result = await internal.saveRunState(ctx.pool, { container, user, runId, claimToken, body });
         return sendJson(res, 200, result);
       }
