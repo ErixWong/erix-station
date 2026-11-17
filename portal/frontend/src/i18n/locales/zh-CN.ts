@@ -441,8 +441,10 @@ export const zhCN = {
       // 文案」）下作废；且终态分隔条现在会从历史投影出来，任何 reason 都会上屏。引擎新增的未知值
       // 不进本表 ⇒ 文案回落 reason 原文（§5.3 向后兼容）。
       runEndReason: {
-        // 快照没落盘 → 崩溃恢复可能重复工具副作用，语义最重（裁决理由见 docs/data/model.md §1.7）
-        persistence_failed: '快照未落盘（崩溃恢复可能重复副作用）',
+        // 账本没落盘（transcript 轮记录 / run-state 写失败）→ 崩溃恢复可能重复工具副作用，语义最重。
+        // ⚠ 措辞随 issue #640 改过：0.33 起本站没有 run snapshot，但 `persistence_failed` 这个
+        //   **错误类型与红色分级一字未动**（裁决理由见 docs/data/model.md §1.7）——改的只是「落盘的是什么」。
+        persistence_failed: '账本未落盘（崩溃恢复可能重复副作用）',
         // 终稿未经 final guard 核验 → 用户必须自己复核
         final_guard_unverified: '终稿未经核验',
         // issue #236：用户主动停止（最常看到的那一条，此前上屏是裸英文 `aborted`）
