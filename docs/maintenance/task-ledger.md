@@ -8846,3 +8846,35 @@ issue #643 保持 OPEN 并在单下留了口径。
   ⚠ 切版时 main 上仍有 3 个在飞 PR（#660 ports.json schema2 e2e / #655 坐标可核对性 / #641 提示词面板）——
   它们**不属于**本版，合进来会进下一版；这不违反「tag 必须指向我们验过的那份树」：本单的交付物已全部在 main。
 - **验证**（切版树上亲跑）：根 `npm test` **2858 pass / 0 fail**；前端 `typecheck` rc=0 + **79 files / 1671 tests**。
+
+### 8.169 配置槽的值改明文存（撤销 v2 的加密方案）（#608 后续，2026-11-17，主 agent）
+
+**决策**（用户当场定的，不是技术偏好）：MCP 服务要的凭据由 IT 在管理台填、平台注入 ⇒ 必须存在平台侧。
+v2 设计把它做成 AES-256-GCM + `MCP_SECRET_KEY`（`deploy/.env`）。复盘时判定这笔加密**收益不抵成本**：
+
+- 它挡的是「DB 单点泄漏」（`pg_dump` 落 /tmp、备份出内网、只读账号）；
+- 它挡不住「主机沦陷」——portal 与 DB 同机、`.env` 与 DB 同盘，两样一起丢；
+- 成本却是每天都会碰到的：多一个必须保管的部署变量 + 换 key 要全员重填。
+
+⇒ 先明文。**加回来的判据**（不是版本号）：真出现「DB 要给第三方只读」或「备份要出内网」时再上，
+那时是加一列 + 懒迁移，**不动对外接口**。理由与判据写在 `deploy/migrations/0042-mcp-plaintext-values.sql`
+头部（下一个想改回去的人先读那里）。
+
+**落点**：迁移 `0042`（`value_plain text NOT NULL`，旧密文列整列丢弃——P1 从未在生产存过真实凭据，
+dev 那条是 e2e 密文，明文世界里无法解释）；`secrets.js` 从「加解密模块」缩成「形态校验 + 运行期解析」
+（`normalizeValue` 拒空串/超 1024 字符、`resolveSlots` 读 `value_plain`）；`market.setSlotValues` 直接写明文；
+`config.js` / compose 删 `MCP_SECRET_KEY`；前端删掉两条「没配密钥」的文案与映射。
+
+**保住的三条边界**（与加不加密无关，别一起删）：
+① 接口层**只写不读**（GET 只回 `has_value`，值不进响应/DOM/日志/审计，连长度都不记）；
+② 值**不进文件**（`mcp.json` 只有槽位声明）；
+③ 明文只在 run 内存里活一次（agentd 代取 → 注入子进程 env/header）。
+新增判据 `secrets.test.js` S-4【反向】：库里手工塞的**未声明**槽名不会进注入面
+（等于堵住「往 DB 塞一行 = 往子进程环境塞任意变量」这条路）。
+
+**门禁连带**：新增迁移 ⇒ `migrations.test.js` 的 head/倒数第 N 支整体进一位（这次 0041 从「末位」变「倒数第二」）；
+`config.js` 删 5 行 ⇒ `deploy/env-legs-exceptions.json` 的坐标漂移（重钉脚本跑一次）。
+`MCP_SECRET_KEY` 从 `deploy-env-delegate` 的三腿面里彻底消失（它不再是 env 读取项）。
+
+**验证**：根 `npm test` **2855 pass / 0 fail**；`node --test 'portal/test/*.test.js'` rc=0（2215 项）；
+前端 `typecheck` rc=0 + **79 files / 1671 tests**。

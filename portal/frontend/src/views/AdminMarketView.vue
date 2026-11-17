@@ -226,10 +226,7 @@ async function saveSecret(): Promise<void> {
     closeSecretForm();
     await loadSecrets(id);
   } catch (e) {
-    // 503 `secret_key_missing` 走凭据区自己的文案（§3.1：没 key 时写入失败且解密路径不可用）。
-    secretFormError.value = (e as { code?: string }).code === 'secret_key_missing'
-      ? t('admin.market.secrets.keyMissing')
-      : marketErrorText(e);
+    secretFormError.value = marketErrorText(e);
   } finally {
     secretSaving.value = false;
   }

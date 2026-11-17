@@ -3288,11 +3288,11 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
   "values": { "ERIX_SEARCH_TOKEN": "明文", "OTHER": null } }
 ```
 
-- 加密：AES-256-GCM，key 来自 `MCP_SECRET_KEY`（base64 的 32 字节，`deploy/.env`），
-  AAD = `<item_id>:<name>:<scope>:<fde_id|空串>` ⇒ **密文不可跨条目/跨槽/跨 FDE 搬移**
-  （搬过去解不开，判据 `portal/test/secrets.test.js` S-2/S-3）。
-- **缺 key 不是「用默认 key」**：`MCP_SECRET_KEY` 为空 ⇒ 加解密一律 `503 secret_key_missing`
-  （读元数据仍可用，`has_value` 恒 false）。轮换口径：换 key ⇒ 旧密文解不开 ⇒ 槽位显示未设置 ⇒ 重填。
+- **存储是明文**（`capability_param_values.value_plain`，迁移 `0042`）：v2 的 AES-256-GCM 方案已撤销，
+  理由见 `docs/design/mcp-integration.md` §3.1——简言之「portal 与 DB 同机 ⇒ 加密只挡 DB 单点泄漏，
+  不挡主机沦陷，而代价是多一个必须保管的变量 + 换 key 要重填」。
+- 空串**不允许**（与「未设置」语义分不开）⇒ `400 capability_slot_invalid`；删除请传 `null`。
+  单值上限 1024 字符（凭据不该更长，超了几乎必然是贴错东西）。
 - 解析优先级：**fde 覆盖 global**；解不开的值按「没设置」处理（fail-closed 进 `missing`）。
 - 审计：`admin.capability_secrets_updated`，`details` 只有 `{scope, fde_id, names[], changed}`，**无值**。
 
