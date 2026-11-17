@@ -26,9 +26,7 @@ import {
   resolveMcpServersForFde, setCapabilityEnabled, setItemState, setSlotValues, validateBundle,
   validateMcpFields,
 } from '../src/market.js';
-import { decryptValue, encryptValue } from '../src/secrets.js';
 
-const KEY = Buffer.alloc(32, 9);
 
 // ---------------------------------------------------------------------------
 // 最小 fake：只认本文件用到的 SQL 形状
@@ -127,7 +125,7 @@ class McpFake {
     if (s.includes('INSERT INTO capability_param_values')) {
       const [itemId, name, scope, fdeId, blob, actorId] = params;
       this.values.set(`${itemId}|${name}|${scope}|${fdeId ?? ''}`, {
-        item_id: itemId, name, scope, fde_id: fdeId ?? null, value_encrypted: blob,
+        item_id: itemId, name, scope, fde_id: fdeId ?? null, value_plain: blob,
         updated_by: actorId ?? null, updated_at: new Date(),
       });
       return { rows: [] };
@@ -138,7 +136,7 @@ class McpFake {
       this.values.delete(`${itemId}|${name}|${scope}|${fdeId ?? ''}`);
       return { rows: [] };
     }
-    if (s.includes('SELECT name, scope, fde_id, value_encrypted FROM capability_param_values')) {
+    if (s.includes('SELECT name, scope, fde_id, value_plain FROM capability_param_values')) {
       const [itemId, fdeId] = params;
       return { rows: [...this.values.values()].filter((v) => v.item_id === itemId && (v.scope === 'global' || v.fde_id === fdeId)) };
     }
@@ -241,7 +239,7 @@ const MCP_FIELDS = (slug, extra = {}) => ({
 
 function tmpConfig() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-market-'));
-  return { config: { userSpaceRoot: root, fdeUid: null, fdeGid: null, mcpSecretKey: KEY }, root };
+  return { config: { userSpaceRoot: root, fdeUid: null, fdeGid: null }, root };
 }
 
 const expectErr = async (p) => {
@@ -352,27 +350,23 @@ test('MC-5/MC-6/MC-7 安装不落盘；启用缺槽 409；写值后 has_value=tr
     assert.equal(e.code, 'capability_secret_missing');
     assert.deepEqual(e.details.missing, ['ECHO_PREFIX']);
 
-    // 写值（global）⇒ 密文入库；listSlots 只回元数据
-    await setSlotValues({ pool, itemId: item.id, actorId: null, scope: 'global', values: { ECHO_PREFIX: 'PFX' }, key: KEY });
+    // 写值（global）⇒ 明文入库；listSlots 只回元数据
+    await setSlotValues({ pool, itemId: item.id, actorId: null, scope: 'global', values: { ECHO_PREFIX: 'PFX' } });
     const stored = [...pool.values.values()][0];
-    assert.ok(Buffer.isBuffer(stored.value_encrypted), '库里必须是密文 Buffer');
-    assert.equal(stored.value_encrypted.toString('utf8').includes('PFX'), false, '明文不许出现在密文列里');
+    // 明文存库（决策见 0042 迁移）：这里断言的是「存进去的就是原值」，
+    // **不是**「存的是密文」——后者是已撤销的设计。
+    assert.equal(stored.value_plain, 'PFX');
 
     const slots = await listSlots({ pool, itemId: item.id });
     assert.equal(slots[0].has_value, true);
     assert.equal(JSON.stringify(slots).includes('PFX'), false, 'listSlots 的响应里不许出现值');
-
-    // 解密（内部通道用）能拿回原文
-    assert.equal(decryptValue({
-      itemId: item.id, name: 'ECHO_PREFIX', scope: 'global', blob: stored.value_encrypted, key: KEY,
-    }), 'PFX');
 
     // 补齐后可以启用
     const ok = await setCapabilityEnabled({ pool, fde, slug: 'hub', enabled: true, config });
     assert.equal(ok.enabled, true);
 
     // 删除值（null）⇒ 又变成缺槽
-    await setSlotValues({ pool, itemId: item.id, scope: 'global', values: { ECHO_PREFIX: null }, key: KEY });
+    await setSlotValues({ pool, itemId: item.id, scope: 'global', values: { ECHO_PREFIX: null } });
     assert.equal((await listSlots({ pool, itemId: item.id }))[0].has_value, false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -390,31 +384,31 @@ test('MC-8 解析：只取 published && enabled && 非 hidden；fde 覆盖 globa
   const a = await publishItem({ pool, fields: MCP_FIELDS('alpha') });
   await setItemState({ pool, itemId: a.id, state: 'published' });
   await installCapability({ pool, config: tmpConfig().config, fde, slug: 'alpha' });
-  await setSlotValues({ pool, itemId: a.id, scope: 'global', values: { ECHO_PREFIX: 'G' }, key: KEY });
-  await setCapabilityEnabled({ pool, fde, slug: 'alpha', enabled: true, config: { mcpSecretKey: KEY } });
+  await setSlotValues({ pool, itemId: a.id, scope: 'global', values: { ECHO_PREFIX: 'G' } });
+  await setCapabilityEnabled({ pool, fde, slug: 'alpha', enabled: true });
 
   // hidden 条目：即使装了也不该出现在物化/解析面
   const h = await publishItem({ pool, fields: MCP_FIELDS('ghost', { exposure: 'hidden' }) });
   await setItemState({ pool, itemId: h.id, state: 'published' });
   await installCapability({ pool, config: tmpConfig().config, fde, slug: 'ghost' });
-  await setSlotValues({ pool, itemId: h.id, scope: 'global', values: { ECHO_PREFIX: 'G' }, key: KEY });
-  await setCapabilityEnabled({ pool, fde, slug: 'ghost', enabled: true, config: { mcpSecretKey: KEY } });
+  await setSlotValues({ pool, itemId: h.id, scope: 'global', values: { ECHO_PREFIX: 'G' } });
+  await setCapabilityEnabled({ pool, fde, slug: 'ghost', enabled: true });
 
   const listed = await listMcpServersForFde(pool, fde.id);
   assert.deepEqual(listed.map((s) => s.name), ['alpha'], 'hidden 整条不物化');
 
-  const resolved = await resolveMcpServersForFde({ pool, fde, key: KEY });
+  const resolved = await resolveMcpServersForFde({ pool, fde });
   assert.deepEqual(resolved.servers.map((s) => s.name), ['alpha']);
   assert.deepEqual(resolved.servers[0].values, { ECHO_PREFIX: 'G' });
 
   // fde 覆盖 global
-  await setSlotValues({ pool, itemId: a.id, scope: 'fde', fdeId: fde.id, values: { ECHO_PREFIX: 'F' }, key: KEY });
-  assert.deepEqual((await resolveMcpServersForFde({ pool, fde, key: KEY })).servers[0].values, { ECHO_PREFIX: 'F' });
+  await setSlotValues({ pool, itemId: a.id, scope: 'fde', fdeId: fde.id, values: { ECHO_PREFIX: 'F' } });
+  assert.deepEqual((await resolveMcpServersForFde({ pool, fde })).servers[0].values, { ECHO_PREFIX: 'F' });
 
   // 停用 ⇒ 两个面都不再出现
-  await setCapabilityEnabled({ pool, fde, slug: 'alpha', enabled: false, config: { mcpSecretKey: KEY } });
+  await setCapabilityEnabled({ pool, fde, slug: 'alpha', enabled: false });
   assert.deepEqual(await listMcpServersForFde(pool, fde.id), []);
-  assert.deepEqual((await resolveMcpServersForFde({ pool, fde, key: KEY })).servers, []);
+  assert.deepEqual((await resolveMcpServersForFde({ pool, fde })).servers, []);
 });
 
 // ---------------------------------------------------------------------------
@@ -427,8 +421,8 @@ test('MC-10【反向】MCP 条目不许出现在 skills 清单里（kind 过滤�
   const mcp = await publishItem({ pool, fields: MCP_FIELDS('hub') });
   await setItemState({ pool, itemId: mcp.id, state: 'published' });
   await installCapability({ pool, config: tmpConfig().config, fde, slug: 'hub' });
-  await setSlotValues({ pool, itemId: mcp.id, scope: 'global', values: { ECHO_PREFIX: 'G' }, key: KEY });
-  await setCapabilityEnabled({ pool, fde, slug: 'hub', enabled: true, config: { mcpSecretKey: KEY } });
+  await setSlotValues({ pool, itemId: mcp.id, scope: 'global', values: { ECHO_PREFIX: 'G' } });
+  await setCapabilityEnabled({ pool, fde, slug: 'hub', enabled: true });
 
   // MCP 装了并启用 ⇒ mcp 清单有它、skills 清单**一条都没有**
   assert.equal((await listMcpServersForFde(pool, fde.id)).length, 1);

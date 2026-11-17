@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS capability_param_values (
   name            text NOT NULL,
   scope           text NOT NULL CHECK (scope IN ('global','fde')),
   fde_id          uuid REFERENCES users (id) ON DELETE CASCADE,
-  value_encrypted bytea NOT NULL,               -- iv(12) || tag(16) || ciphertext
+  value_plain     text NOT NULL,                -- 明文（0042：加密方案已撤销，理由见 §3.1）
   updated_by      uuid REFERENCES users (id) ON DELETE SET NULL,
   updated_at      timestamptz NOT NULL DEFAULT now(),
   FOREIGN KEY (item_id, name) REFERENCES capability_params (item_id, name) ON DELETE CASCADE,
@@ -136,15 +136,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS capability_param_values_fde_uq
 **没有 `default_value` 列**（v1 的设计漏洞：声明了却无处落地）。`config` 槽的值同样由管理员填，
 「本地兜底」写在技能/客户端代码里（`context?.secrets?.X ?? 'http://localhost:8080'`）。
 
-### 3.1 加密口径（`portal/src/secrets.js`）
+### 3.1 存储口径：**明文**（`portal/src/secrets.js`）
 
-- `aes-256-gcm`；key = `MCP_SECRET_KEY`（`deploy/.env`，base64 的 32 字节，**无默认值**）。
-- 存储 `iv(12) || tag(16) || ciphertext`；**AAD = `${item_id}:${name}:${scope}:${fde_id ?? ''}`**
-  （v1 漏了 `fde_id` ⇒ 跨 FDE 搬移密文仍能解开；v2 必须包含）。
-- **只写不读**：API 只回 `{name, kind, inject, required, has_value, updated_at, updated_by}`。
-- **没有 key 时**：`has_value` 仍可读（那是元数据）；**任何解密/注入一律失败** ⇒ 该 server 视为
-  `missing slots`（不注册、不可启用），并记一条 `secret_key_missing` 的运维日志（不含值）。
-- 换 key ⇒ 旧密文不可解 ⇒ 槽位显示「未设置」，管理员重填。**不静默失败**。
+> **v2 的加密方案已撤销**（2026-11-17 决策，迁移 `0042-mcp-plaintext-values.sql`）。
+> 原设计是 AES-256-GCM + `MCP_SECRET_KEY`（`deploy/.env`）；评估后判定：portal 与 DB 同机、
+> `.env` 与 DB 同盘 ⇒ 主机沦陷时两样一起丢，加密只挡得住「DB 单点泄漏」（dump / 备份 / 只读账号）
+> 那三条，代价却是「多一个必须保管的部署变量 + 换 key 要全员重填」。内部平台、单个 IT 角色、
+> token 个位数 ⇒ **先明文，等真出现「DB 要给第三方只读」或「备份要出内网」再加回来**
+> （那时是加一列 + 懒迁移，**不动对外接口**）。判据与完整理由写在那个迁移文件的头部注释里。
+
+- 存储：`capability_param_values.value_plain text NOT NULL`。空串**不允许**（与「未设置」语义分不开，
+  代码在写入前就拒；删除用 `null`）。
+- **只写不读**（这条是真正挡住「值泄漏到界面」的闸，与加不加密无关）：API 只回
+  `{name, kind, inject, required, has_value, updated_at, updated_by}`；任何响应/DOM/日志/审计里
+  都不出现值，连长度都不记。
+- **值不进文件**：`~/.erix/mcp.json` 只带槽位声明（name/inject/required）。
+- **明文只在 run 内存里活一次**：agentd 代取 → 注入子进程 env（stdio）或请求头（http），run 结束随进程消失。
+- 缺必填槽 ⇒ 该 server 视为 `missing slots`（不注册、不可启用，fail-closed）。
+- 注入面**只认声明过的槽**：库里手工塞的野行不会进子进程环境（判据 `secrets.test.js` S-4）。
 
 ---
 
@@ -429,7 +438,7 @@ idle ──list/call 需要元数据或调用──▶ starting ──握手成�
 | `capability_slot_invalid` | 400 | 槽位名/kind/inject/组合矩阵不合法 |
 | `capability_secret_missing` | 409 | 启用时缺必填槽（`details.missing`） |
 | `capability_package_shape` | 400 | skill 包命中 §4.5 |
-| `secret_key_missing` | 503 | 写值但 `MCP_SECRET_KEY` 未配置 |
+| `capability_slot_invalid` | 400 | 槽值空串 / 超过 1024 字符 / 槽未声明 |
 | `mcp_unreachable` / `mcp_call_timeout` | 502 / 504 | 运行期（不进市场 API） |
 | `mcp_tool_unknown` / `mcp_tool_ambiguous` / `mcp_tool_hidden` | 运行期工具错误 | 见 §6.3 |
 
