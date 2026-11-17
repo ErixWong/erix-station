@@ -21,6 +21,7 @@ import {
   toPublicTemplate, toAdminRunItem, userTemplates, sessionAssignments, putAssignment,
   deleteAssignment, sessionMacroRuns, userMacroRuns, adminTemplates, adminCreateTemplate, adminPatchTemplate,
   adminMacroRuns, adminMacroRunDetail, adminRunsSummary,
+  userAssignments, putUserAssignment, deleteUserAssignment,
 } from '../src/macro-routes.js';
 import { MacroError, createTemplate, assignTemplate, claimMacroRun, finishMacroRun, deleteTemplate, updateTemplate } from '../src/macros.js';
 import { SessionError } from '../src/sessions.js';
@@ -314,5 +315,100 @@ test('#614 userMacroRuns：响应不含 snapshot_id / worktree_path / verdict_ra
     assert.ok('assignment_id' in list.items[0] && 'status' in list.items[0] && 'started_at' in list.items[0]);
     assert.ok('items' in list && 'nextCursor' in list, '响应形状与会话级一致');
     assert.equal(list.nextCursor, null);
+  });
+});
+
+// ── issue #623：用户级订阅写入口（scheduled-task 是 scope='user'，用户需自己的开户路径）──
+
+// 建一个 user-scope 模板（scheduled-task）；用户面可订。
+async function seedUserScopeTemplate(pool, tag) {
+  return createTemplate(pool, { kind: 'scheduled-task', name: `sched-${tag}`, scope: 'user', params: { at: '09:00' } });
+}
+
+test('#623 PUT 建 user-scope 订阅 ⇒ 库里一行、session_id 为 NULL、cwd 有值', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId } = await seedScene(pool, 'ua1');
+    const tpl = await seedUserScopeTemplate(pool, 'ua1');
+    const { assignment } = await putUserAssignment({ pool, userId, body: { templateId: tpl.id, cwd: '~/projects/acme' } });
+    assert.equal(assignment.session_id, null, 'user-scope 订阅 session_id 必须 NULL');
+    assert.equal(assignment.cwd, '~/projects/acme', 'cwd 落库');
+    assert.equal(assignment.user_id, userId);
+    assert.ok(assignment.effective_enabled, '新建即生效');
+    // 直查库：恰一行，且 session_id IS NULL、cwd 非空
+    const rows = await pool.query('SELECT id, session_id, cwd FROM macro_assignments WHERE user_id = $1', [userId]);
+    assert.equal(rows.rowCount, 1, '库里恰一行');
+    assert.equal(rows.rows[0].session_id, null);
+    assert.equal(rows.rows[0].cwd, '~/projects/acme');
+    // 响应形状复用 toAssignmentSnapshot：不含 worktree_path 之类运维字段
+    assert.ok(!('worktree_path' in assignment), '用户面订阅不下发 worktree_path');
+  });
+});
+
+test('#623 同 templateId 再 PUT ⇒ 幂等（UNIQUE NULLS NOT DISTINCT，不新增行）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId } = await seedScene(pool, 'ua2');
+    const tpl = await seedUserScopeTemplate(pool, 'ua2');
+    const first = await putUserAssignment({ pool, userId, body: { templateId: tpl.id, cwd: '~/projects/acme' } });
+    const second = await putUserAssignment({ pool, userId, body: { templateId: tpl.id, cwd: '~/projects/acme' } });
+    assert.equal(first.assignment.id, second.assignment.id, '命中幂等键 ⇒ 同一行');
+    const cnt = await pool.query('SELECT COUNT(*)::int AS n FROM macro_assignments WHERE user_id = $1', [userId]);
+    assert.equal(cnt.rows[0].n, 1, '重复 PUT 不新增行');
+  });
+});
+
+test('#623 cwd 不是 ~/projects/<name> 形式 ⇒ 400（拒绝 .. / 绝对路径 / 多级目录 / 缺失）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId } = await seedScene(pool, 'ua3');
+    const tpl = await seedUserScopeTemplate(pool, 'ua3');
+    for (const bad of ['../etc', '/home/x/y', '~/projects/a/b', '~/other/x', '~/projects', '']) {
+      await assert.rejects(
+        () => putUserAssignment({ pool, userId, body: { templateId: tpl.id, cwd: bad } }),
+        (e) => e.httpStatus === 400,
+        `非法 cwd 应 400: ${JSON.stringify(bad)}`,
+      );
+    }
+    // 合法值应通过
+    const ok = await putUserAssignment({ pool, userId, body: { templateId: tpl.id, cwd: '~/projects/acme' } });
+    assert.equal(ok.assignment.cwd, '~/projects/acme');
+  });
+});
+
+test('#623 GET 只返回当前用户、且只含 scope=user 的订阅', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const u1 = await seedScene(pool, 'ua4a');
+    const u2 = await seedScene(pool, 'ua4b');
+    const tpl = await seedUserScopeTemplate(pool, 'ua4');
+    await putUserAssignment({ pool, userId: u1.userId, body: { templateId: tpl.id, cwd: '~/projects/p1' } });
+    await putUserAssignment({ pool, userId: u2.userId, body: { templateId: tpl.id, cwd: '~/projects/p2' } });
+    const g1 = await userAssignments({ pool, userId: u1.userId });
+    assert.equal(g1.items.length, 1, 'u1 只看自己一条');
+    assert.equal(g1.items[0].user_id, u1.userId);
+    assert.equal(g1.items[0].cwd, '~/projects/p1');
+    // user 订阅不会混进会话级模板的订阅：造一个 session-scope 模板的会话订阅，不应出现在 userAssignments
+    const sTpl = await createTemplate(pool, { kind: 'run-review', name: 'rev', scope: 'session', params: {} });
+    await assignTemplate(pool, { templateId: sTpl.id, userId: u1.userId, sessionId: u1.sessionId });
+    const g1b = await userAssignments({ pool, userId: u1.userId });
+    assert.equal(g1b.items.length, 1, '会话级订阅不进 user 列表（只看 scope=user）');
+  });
+});
+
+test('#623 DELETE 取消自己的订阅成功；取消别人的 ⇒ 404（不泄露存在性）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const u1 = await seedScene(pool, 'ua5a');
+    const u2 = await seedScene(pool, 'ua5b');
+    const tpl = await seedUserScopeTemplate(pool, 'ua5');
+    const own = await putUserAssignment({ pool, userId: u1.userId, body: { templateId: tpl.id, cwd: '~/projects/p1' } });
+    // 别人先删 ⇒ 404
+    await assert.rejects(
+      () => deleteUserAssignment({ pool, userId: u2.userId, assignmentId: own.assignment.id }),
+      (e) => e instanceof MacroError && e.httpStatus === 404,
+      '取消别人的订阅应 404（不泄露存在性）',
+    );
+    // 自己删 ⇒ 成功
+    const res = await deleteUserAssignment({ pool, userId: u1.userId, assignmentId: own.assignment.id });
+    assert.ok(res && (res.mode === 'deleted' || res.mode === 'disabled'), '自己的订阅取消成功');
+    // 再 GET ⇒ 空
+    const g = await userAssignments({ pool, userId: u1.userId });
+    assert.equal(g.items.filter((a) => a.effective_enabled).length, 0, '取消后无生效订阅');
   });
 });
