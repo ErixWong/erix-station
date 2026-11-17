@@ -61,6 +61,9 @@ const ABOUT = {
     },
   ],
   fdesPresent: true,
+  // #643 B：服务端顶层真布尔。夹具给 `false`（发布件形状）⇒ 既有断言不受影响；
+  // 新用例自己造变体（true / 缺键），不去改既有预期值。
+  localBuild: false,
   provenance: {
     server: 'build-info.json', platformEngine: 'build-info.json', fdes: 'containers.agent_version', fdesSnapshot: 'provision',
   },
@@ -352,3 +355,152 @@ describe('lib/versionSurface：归一化与两条源码级红线', () => {
     }
   });
 });
+
+// ──────────────────────────────────────────────────────────────────────
+// issue #643 B 前端腿。服务端现在下发**顶层真布尔** `localBuild`（算法在服务端：
+// `revision === 'unknown'` ⇒ true），界面只在它**真的是 true** 时加一句中性标注。三态：
+//   * `true` ⇒ 必须有那句（否则本地构建被当成发布件，就是 #643 本体的形状）。
+//   * `false` ⇒ 服务端说「不是」⇒ 发布件，那一节必须干净（多一句就是噪声）。
+//   * 缺键 / 脏值 ⇒ 收成 `null` = **服务端没说**：同样不渲染，而且**不许**写成
+//     「已烘 build-info / 不是本地构建」这类反面结论 ——「没说」不是「说了不是」。
+// 另钉两条红线：归一化只认真布尔（`'true'` 不算）；前端不许从 `revision` 自己推。
+const withLocalBuild = (patch: Record<string, unknown>) => (url: string) =>
+  url.startsWith(VERSION_PATH) ? jsonResponse(200, { ...ABOUT, ...patch }) : undefined;
+
+/** 把顶层 `localBuild` 从响应里抹掉 = 「服务端没说」（老端点 / 桩给半截）。 */
+function withoutKey<T extends object>(payload: T): T {
+  const copy = { ...payload } as T & { localBuild?: unknown };
+  delete copy.localBuild;
+  return copy;
+}
+
+describe('判据 #643B-1：只在 `localBuild === true` 时标注；`false` 与「没说」都不出现', () => {
+  it('#643B-1a：`localBuild:true` ⇒ 服务端那一节出 `server-local-build`，文案说「本地构建」', async () => {
+    const { wrapper } = await openAbout(withLocalBuild({ localBuild: true }));
+    const badge = wrapper.find('[data-test="server-local-build"]');
+    expect(badge.exists(), 'localBuild:true 却没标注 ⇒ 本地构建被当成发布件').toBe(true);
+    const text = badge.text();
+    // 语义三要素（工单口径）：本地构建 / 没烘 build-info / 不能当发布件对账。
+    expect(text).toContain('本地构建');
+    expect(text).toContain('build-info');
+    expect(text).toMatch(/发布件/);
+    expect(text).toMatch(/对账/);
+    // 它属于**服务端那一节**（说的是什么东西是本地构建，不是引擎也不是 FDE）。
+    expect(wrapper.get('[data-test="about-server"]').text()).toContain('本地构建');
+    // 中性标注：它是状态不是警报（D9 同口径）⇒ 不给 `⚠`、不给告警底色。
+    expect(text).not.toContain('⚠');
+    expect(badge.attributes('class') ?? '').not.toMatch(/amber|red|syserr/);
+  });
+
+  it('#643B-1b：`localBuild:false` ⇒ 不渲染（发布件那一节必须是干净的）', async () => {
+    const { wrapper } = await openAbout(withLocalBuild({ localBuild: false }));
+    expect(wrapper.find('[data-test="server-local-build"]').exists()).toBe(false);
+    expect(wrapper.get('[data-test="about-server"]').text()).not.toContain('本地构建');
+  });
+
+  it('#643B-1c：**缺键**（服务端没说）⇒ 不渲染，也不许冒充「已烘」的反面结论', async () => {
+    // 响应里**没有** `localBuild` 这个键（ABOUT 本身带 false，所以这里必须真删）。
+    const { wrapper } = await openAbout((url) => (url.startsWith(VERSION_PATH)
+      ? jsonResponse(200, withoutKey(ABOUT)) : undefined));
+    expect(wrapper.find('[data-test="server-local-build"]').exists(),
+      '服务端没说却渲染了标注 ⇒ 把「没说」当成「是本地构建」').toBe(false);
+    const serverText = wrapper.get('[data-test="about-server"]').text();
+    expect(serverText).not.toContain('本地构建');
+    // 「没说」不许被写成反面结论（钉住 null ≠ false）：不许出现「已烘 / 不是本地构建」这类断言。
+    expect(serverText).not.toMatch(/已烘|不是本地构建|非本地构建/);
+  });
+
+  it('#643B-1d：`revision:unknown` 但服务端没说 ⇒ 仍然不渲染（前端不许自已完成构建判定）', async () => {
+    const blank = withoutKey({
+      ...ABOUT,
+      server: { station: 'unknown', revision: 'unknown', builtAt: 'unknown', source: 'package' },
+    });
+    const { wrapper } = await openAbout((url) => (url.startsWith(VERSION_PATH)
+      ? jsonResponse(200, blank) : undefined));
+    expect(wrapper.get('[data-test="server-revision"]').text()).toBe(String(t('admin.about.unknown')));
+    expect(wrapper.find('[data-test="server-local-build"]').exists()).toBe(false);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// 归一化真值表：逐格写死。**口径**：只有 `true` / `false` 两个真布尔才算「服务端说了话」。
+// `'true'` 这类字符串**不当真**（M-3 要红的就是这里）：把脏值读成 true 就是「前端替服务端
+// 做主」，而这一格要说的是能不能当发布件对账 —— 说错方向就是假账，宁可什么都没说。
+describe('判据 #643B-2：`normalizeVersionInfo` 把 `localBuild` 收成三态（只认真布尔）', () => {
+  it('#643B-2a：真值表逐格（true/false 是真话；`\'true\'` / `\'no\'` / `1` / 缺失 ⇒ null）', () => {
+    expect(normalizeVersionInfo({ localBuild: true }).localBuild).toBe(true);
+    expect(normalizeVersionInfo({ localBuild: false }).localBuild).toBe(false);
+    // 脏值一律落到「服务端没说」，**不许**被宽松当真。
+    expect(normalizeVersionInfo({ localBuild: 'true' }).localBuild).toBeNull();
+    expect(normalizeVersionInfo({ localBuild: 'false' }).localBuild).toBeNull();
+    expect(normalizeVersionInfo({ localBuild: 'no' }).localBuild).toBeNull();
+    expect(normalizeVersionInfo({ localBuild: 1 }).localBuild).toBeNull();
+    expect(normalizeVersionInfo({ localBuild: 0 }).localBuild).toBeNull();
+    expect(normalizeVersionInfo({ localBuild: null }).localBuild).toBeNull();
+    expect(normalizeVersionInfo({}).localBuild).toBeNull();
+    expect(normalizeVersionInfo(null).localBuild).toBeNull();
+    // snake_case 也认（照 `buildInfoPath` 的先例），但脏值同样不算真。
+    expect(normalizeVersionInfo({ local_build: true }).localBuild).toBe(true);
+    expect(normalizeVersionInfo({ local_build: false }).localBuild).toBe(false);
+    expect(normalizeVersionInfo({ local_build: 'true' }).localBuild).toBeNull();
+    // camelCase 在场时以它为准（与 `buildInfoPath ?? build_info_path` 同一条取法）。
+    expect(normalizeVersionInfo({ localBuild: false, local_build: true }).localBuild).toBe(false);
+    // 它是**顶层**字段，不嵌在 `server` 里（契约写的是顶层真布尔）。
+    expect(normalizeVersionInfo({ server: { localBuild: true } }).localBuild).toBeNull();
+  });
+
+  it('#643B-2b：`revision` 不参与判定 —— 服务端没说时，`revision` 是 `unknown` 也不许推出 true', () => {
+    // 这是反向红线的**行为面**：算法在服务端，前端只搬值，不替服务端做主。
+    expect(normalizeVersionInfo({ server: { revision: 'unknown' } }).localBuild).toBeNull();
+    expect(normalizeVersionInfo({ server: { revision: 'b'.repeat(40) } }).localBuild).toBeNull();
+    // 服务端说了就照它 —— 即使 `revision` 看上去相反（两个方向都不许被 revision 翻）。
+    expect(normalizeVersionInfo({ server: { revision: 'unknown' }, localBuild: true }).localBuild).toBe(true);
+    expect(normalizeVersionInfo({ server: { revision: 'b'.repeat(40) }, localBuild: false }).localBuild).toBe(false);
+    expect(normalizeVersionInfo({ server: { revision: 'b'.repeat(40) }, localBuild: true }).localBuild).toBe(true);
+    expect(normalizeVersionInfo({ server: { revision: 'unknown' }, localBuild: false }).localBuild).toBe(false);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// 红线 #643B-R：前端不许出现**由 `revision` 推出的**本地构建判定（第二份口径）。
+// 做法：剥掉注释（注释里写 `revision` 是**解释**，代码里写才是**判定**），再从每一处
+// 「本地构建」出现点取出**它所在的判定表达式**：到最近的语句边界（`, ; } >`）为止。
+// 边界是**语句级而不是行尾**，所以跨行写法（多行 `computed`）也跑不掉。
+describe('红线 #643B-R：`localBuild` 那一侧的推导不许引用 `revision`', () => {
+  it('#643B-R1：两份源文件中，每一处本地构建判定表达式都不含 revision', () => {
+    for (const [name, source] of [['AdminAboutView.vue', viewSource], ['versionSurface.ts', libSource]] as const) {
+      for (const clause of localBuildClauses(stripComments(source))) {
+        expect(clause, `${name} 的本地构建判定里出现了 revision：${clause}`).not.toMatch(/revision/i);
+      }
+    }
+  });
+
+  it('#643B-R2：地板——R1 不得因「根本找不到 localBuild」而空转（防判据是死的）', () => {
+    expect(localBuildClauses(stripComments(libSource)).length).toBeGreaterThan(0);
+    expect(localBuildClauses(stripComments(viewSource)).length).toBeGreaterThan(0);
+    // 渲染条件就是那一个 `=== true`（多一个条件就是有人在前端加了自己的口径）。
+    expect(stripComments(viewSource)).toContain('localBuild === true');
+    expect(stripComments(libSource)).toMatch(/localBuild:\s*booleanOrNull\(/);
+  });
+});
+
+/** 「本地构建」的出现点（camel / snake / kebab 都算，渲染与归一化两侧都要被盖到）。 */
+const LOCAL_BUILD_MENTION = /localBuild|local_build|local-build/gi;
+
+/** 剥注释：`// …`、`/* … *\/`、模板里的 `<!-- … -->`。 */
+function stripComments(source: string): string {
+  return source
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/^[ \t]*\/\/.*$/gm, ' ');
+}
+
+/** 每一处出现点所在的判定表达式片段（到最近的语句边界 `, ; } >` 为止，上限 300 字）。 */
+function localBuildClauses(source: string): string[] {
+  return [...source.matchAll(LOCAL_BUILD_MENTION)].map((match) => {
+    const from = (match.index ?? 0) + match[0].length;
+    const rest = source.slice(from, from + 300);
+    const stop = rest.search(/[,;}>]/);
+    return stop < 0 ? rest : rest.slice(0, stop);
+  });
+}

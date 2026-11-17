@@ -181,8 +181,10 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
    - 形态① `image@sha256:<64hex>`（manifest digest，`images-digest.json` 的 `digest`）；
    - 形态② `sha256:<imageId>`（config digest，= 部署机 `docker image inspect --format '{{.Id}}'`；清单里的 `imageId`）。
    清单里两种都给了，任选；混用会核对不上（§3）。
-4. **起栈**：`docker compose -f deploy/docker-compose.yml up -d`（compose 默认 tag 仍是 `:local`，
-   **不设 env 就还是本地镜像**，CI/CD 不会自己改变部署形态；`FDE_IMAGE` 同时是 proxy 的 `IMAGE_ALLOWLIST`，
+4. **起栈**：`docker compose -f deploy/docker-compose.yml up -d`（这三根镜像引用在 compose 里是
+   `${VAR:?}` **无缺省值**：没填（含空值）就**直接报错并点名变量**，不会静默回落成 `:local`
+   本地镜像（#643）——所以 digest pin 没写进 `deploy/.env` 就是起不来，而不是悄悄跑错对象；
+   CI/CD 不会自己改变部署形态；`FDE_IMAGE` 同时是 proxy 的 `IMAGE_ALLOWLIST`，
    `deploy/docker-compose.yml:93`，改 FDE pin 时两处同源，不用单独改 proxy 白名单）。
 5. **换 FDE 镜像必须显式重建容器**：`ensureFdeContainer`（`portal/src/provisioner.js`，函数体现从 `:353`
    起、到 `:413` 止；旧坐标 `:305-322` 已过期——2026-11-14 现查 `grep -n 'function ensureFdeContainer'`）
