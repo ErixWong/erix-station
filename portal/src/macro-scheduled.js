@@ -234,32 +234,45 @@ export async function executeScheduledIntent(pool, intent, {
     root = defaultReportsRoot(await lookupFdeName(pool, userId), config?.userSpaceRoot);
   }
   const artifact = artifactPath(root, templateName, date);
-  try {
-    await fs.mkdir(path.dirname(artifact), { recursive: true });
-    const text = (result && typeof result.text === 'string') ? result.text : String(result ?? '');
-    await fs.writeFile(artifact, text, 'utf8');
-  } catch (err) {
-    log.warn?.(`[macro-scheduled] 产物落盘失败（不影响 run 判定）：${err?.message ?? String(err)}`);
+  const text = (result && typeof result.text === 'string') ? result.text : String(result ?? '');
+  // —— **空正文的产物形态（issue #652 ② 拍板：选 (a) 不落盘）** ——
+  // 理由（写死在此，免得后人又改回 0 字节文件）：
+  //  · 设计 `05` §4.2 给 M7 的第一版判据是**机械的**「**产出非空** / 落盘文件存在 / 退出码 0」——
+  //    它要的是「有输出 ⇒ 有产物」，**没有**「每次必有一份产物」这一条，所以不落盘不违约。
+  //  · 0 字节文件是**假账**：用户打开是空白，分不出「本次真的无输出」还是「取数管道坏了」；
+  //    #652 的现物正是后者（投影口径错 ⇒ 正文空）被 0 字节文件伪装成了前者。
+  //  · 不落盘 + 账上 `macro_runs.reason='no_output'` ⇒ 界面能直接说出「本次无输出」，两态可分。
+  const hasOutput = text.trim() !== '';
+  if (hasOutput) {
+    try {
+      await fs.mkdir(path.dirname(artifact), { recursive: true });
+      await fs.writeFile(artifact, text, 'utf8');
+    } catch (err) {
+      log.warn?.(`[macro-scheduled] 产物落盘失败（不影响 run 判定）：${err?.message ?? String(err)}`);
+    }
+  } else {
+    log.info?.('[macro-scheduled] 本次无文本产出 ⇒ 不落盘（#652 ②：0 字节文件是假账），账上记 no_output');
   }
 
   // —— 收口：done。verdict 交给 finishMacroRun 缺省补 'unclassified'。——
   // 已是终态（重放）⇒ finishMacroRun 抛 409 conflict：幂等吞掉，不谎报失败。
+  // `reason`：正常 done 仍为 null；只有「run 成功但没产出文本」记 `no_output`（上面选 (a) 的落点）。
   let snap;
   try {
     snap = await finishMacroRun(pool, {
       macroRunId, status: 'done',
-      childSessionId: sessionId, childRunId, reason: null,
+      childSessionId: sessionId, childRunId, reason: hasOutput ? null : 'no_output',
     });
   } catch (err) {
     if (err instanceof MacroError && err.httpStatus === 409) {
       log.info?.(`[macro-scheduled] 账已终态（重放），跳过收口：${err.message}`);
-      return { status: 'done', replayed: true, sessionId, childRunId, artifactPath: artifact };
+      return { status: 'done', replayed: true, sessionId, childRunId, artifactPath: hasOutput ? artifact : null };
     }
     throw err;
   }
   return {
     status: 'done', verdict: snap?.verdict ?? 'unclassified',
-    sessionId, childRunId, artifactPath: artifact,
+    sessionId, childRunId, artifactPath: hasOutput ? artifact : null,
   };
 }
 

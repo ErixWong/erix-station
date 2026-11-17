@@ -23,6 +23,7 @@ import { finishMacroRun, MacroError } from './macros.js';
 import { executeScheduledIntent } from './macro-scheduled.js';
 import { runMacroReview } from './macro-review.js';
 import { deliverIntent } from './notifications.js';
+import { fetchRunAssistantText } from './session-text.js';
 
 /** 超时回收阈值（要求④）：`pending` 且 `started_at` 早于 now-此值 ⇒ 判为「派发途中进程崩了」，落 failed。 */
 export const DISPATCH_TIMEOUT_MS = 10 * 60_000;
@@ -35,43 +36,40 @@ export const RUN_TASK_TIMEOUT_MS = 30 * 60_000;
 export const RUN_TASK_POLL_MS = 2_000;
 
 /**
- * 从 `transcript_rounds` 取该 run 的**最后一条 assistant 正文**（#637 ①）。
+ * 取该 run 的**最后一条 assistant 正文**（#637 ①；**#652 修正取数口径**）。
  *
- * ⚠ 不能读 `messages.content`：P3 PR②b 起 `messages` 对 assistant **停双写**（`content` 恒为空串，
- * 真相在 `transcript_rounds.messages` = 引擎 canonical 消息数组），口径同读侧
- * `session-view.assistantTurnText` / `session-text.fetchRunAssistantText`。
- * 逐轮（新→旧）倒序扫 `messages` 数组，取第一条 `role==='assistant'` 且正文非空的文本；
- * `content` 可为 string 或 block 数组（取 block 的 `text` 拼接）。取不到 ⇒ ''（空产物，不影响终态判定）。
+ * ⚠ **#652 的根因**：本函数过去自己写 `SELECT … FROM transcript_rounds WHERE run_id = $1`，
+ * 而那张表的 `run_id` **真机 97% 是 NULL**（实测 96/3219）——引擎 sidecar 走的是 session 维度
+ * 写入（`transcript-store.js#appendRound`：`run_id = NULL` + `transcript_key = sessionId`），
+ * 于是按 run_id 查恒返回 0 行 ⇒ 正文 `''` ⇒ **M7 产物 0 字节**。
+ * 也不能读 `messages.content`：P3 PR②b 起 assistant **停双写**（该列对 assistant 恒为空串）。
+ *
+ * ⇒ 唯一正确口径 = **站内既有读侧投影**：`session-text.fetchRunAssistantText`（内部
+ * `projectAnchors` + `loadTextContext`，按 `transcript_key = sessionId` 整会话读轮次、用官方
+ * `projectTranscriptForDisplay` 展正文、再按 run 归属配回 assistant 锚点）——与
+ * `GET /api/sessions/:id` 对话流（`session-view.assistantTurnText`）**同一口径**，不再自写 SQL。
+ *
+ * @param {object} pool
+ * @param {{runId: string, sessionId?: string|null}} [arg] `sessionId` 缺省时回查**一次**
+ *   `runs.session_id`（投影是 session 作用域的，没有 sessionId 无从下手；一次查询，不在轮询里循环）
+ * @returns {Promise<string>} 取不到 ⇒ `''`（空产物的处置见 `macro-scheduled.js` 的产物口径注释）
  */
-async function collectRunFinalText(pool, runId) {
+async function collectRunFinalText(pool, { runId, sessionId } = {}) {
   if (!runId) return '';
-  let rows;
   try {
-    ({ rows } = await pool.query(
-      `SELECT round, messages FROM transcript_rounds WHERE run_id = $1 ORDER BY round DESC LIMIT 40`,
-      [runId],
-    ));
+    let sid = typeof sessionId === 'string' && sessionId !== '' ? sessionId : null;
+    if (sid === null) {
+      const res = await pool.query(`SELECT session_id FROM runs WHERE id = $1`, [runId]);
+      const found = res.rows?.[0]?.session_id;
+      sid = typeof found === 'string' && found !== '' ? found : null;
+    }
+    if (sid === null) return '';
+    const hit = await fetchRunAssistantText(pool, { sessionId: sid, runId });
+    return typeof hit?.text === 'string' ? hit.text : '';
   } catch {
+    // 读正文失败不许改判 run 的终态（终态已经由 runs.status 定了）。
     return '';
   }
-  const extract = (msg) => {
-    if (!msg || typeof msg !== 'object' || msg.role !== 'assistant') return null;
-    const c = msg.content ?? msg.text;
-    if (typeof c === 'string') return c === '' ? null : c;
-    if (Array.isArray(c)) {
-      const t = c.map((b) => (typeof b === 'string' ? b : b?.text ?? '')).filter(Boolean).join('\n').trim();
-      return t === '' ? null : t;
-    }
-    return null;
-  };
-  for (const row of rows) {
-    const msgs = Array.isArray(row.messages) ? row.messages : [];
-    for (let i = msgs.length - 1; i >= 0; i -= 1) {
-      const t = extract(msgs[i]);
-      if (t) return t;
-    }
-  }
-  return '';
 }
 
 /**
@@ -82,10 +80,12 @@ async function collectRunFinalText(pool, runId) {
  * `error` 字符串，供 `executeScheduledIntent.failRun` 的 reason 可读）。超时 ⇒ `{ ok:false,
  * termination:{reason:'run_timeout'} }`。**不重试**（`06` §8）。超时/轮询/时钟/睡眠都可注入（测试用短超时）。
  *
- * @param {{pool:object, childRunId?:string, log?:object}} ctx 执行器传入的执行上下文
+ * @param {{pool:object, childRunId?:string, sessionId?:string|null, log?:object}} ctx 执行器传入的执行上下文
+ *   （`sessionId` = 该 run 的会话；`executeScheduledIntent` 本来就传，缺省时 `collectRunFinalText`
+ *   回查一次 `runs.session_id`——读侧投影是 **session 作用域**的，#652）
  * @param {{timeoutMs?:number, pollMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>}} [opts]
  */
-export async function pollRunTask({ pool, childRunId } = {}, {
+export async function pollRunTask({ pool, childRunId, sessionId } = {}, {
   timeoutMs = RUN_TASK_TIMEOUT_MS,
   pollMs = RUN_TASK_POLL_MS,
   now = () => Date.now(),
@@ -111,7 +111,7 @@ export async function pollRunTask({ pool, childRunId } = {}, {
     if (status === 'finished' || status === 'failed') {
       const runError = row.error ?? null;
       const tReason = row.termination?.reason ?? runError?.code ?? null;
-      const text = await collectRunFinalText(pool, childRunId);
+      const text = await collectRunFinalText(pool, { runId: childRunId, sessionId });
       if (status === 'finished') {
         return { ok: true, text, termination: { reason: tReason ?? 'finished', error: null }, error: null };
       }
