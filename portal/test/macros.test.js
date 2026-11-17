@@ -49,6 +49,14 @@ const fixture = URL_VALUE ? createPgFixture(URL_VALUE, { prefix: 'w524' }) : nul
 /** 夹具包一层：用例体只拿 pool（`withFreshDatabase` 跑完整链：baseline → bootstrap → 全部增量含 0035）。 */
 const withFreshDb = (fn) => fixture.withFreshDatabase(({ pool }) => fn(pool), { log: () => {} });
 
+/**
+ * #625：`scheduled-task` 的必填参数（契约 §1：`at`/`cwd`/`task` 都是 `required: true`）。
+ * 以前 `validateKindParams` 对缺字段 `continue` ⇒ 夹具给 `params: {}` 也建得成；
+ * 现在缺任一个就 400 ⇒ 所有 `scheduled-task` 夹具必须带齐（可缺的 `maxRounds`/`jitter`
+ * 故意不带，用来验「服务端会补契约默认值」）。
+ */
+const SCHEDULED_PARAMS = Object.freeze({ at: '09:00', cwd: '/p', task: 't' });
+
 /** 建一个能过 FK 的最小场景：user → project → session。id 由 UUIDv4 给（不 cwd 派生，同 runs.id 红线）。 */
 async function seedScene(pool, tag) {
   const userId = randomUUID();
@@ -264,7 +272,9 @@ test('#524 软删三分支（07 §2.3）：零引用物理删 / 只有订阅级�
       '零引用必须物理删，不留 deleted_at 的僵尸行');
 
     // ── 分支二：只有订阅、无执行记录 ⇒ 物理删 + 级联删订阅
-    const t2 = await createTemplate(pool, { kind: 'scheduled-task', name: '只有订阅', scope: 'user' });
+    const t2 = await createTemplate(pool, {
+      kind: 'scheduled-task', name: '只有订阅', scope: 'user', params: SCHEDULED_PARAMS,
+    });
     const a2 = await assignTemplate(pool, { templateId: t2.id, userId });
     const r2 = await deleteTemplate(pool, { templateId: t2.id });
     assert.equal(r2.mode, 'deleted_with_assignments');
@@ -321,7 +331,9 @@ test('#524 until 到期 ⇒ enabled=false（红线③的 DB 那一半；到期�
   await withFreshDb(async (pool) => {
     const { userId, sessionId } = await seedScene(pool, 'a3');
     const sessionTpl = await createTemplate(pool, { kind: 'run-notify', name: '临时开一小时', scope: 'session' });
-    const userTpl = await createTemplate(pool, { kind: 'scheduled-task', name: '临时开一小时（全局）', scope: 'user' });
+    const userTpl = await createTemplate(pool, {
+      kind: 'scheduled-task', name: '临时开一小时（全局）', scope: 'user', params: SCHEDULED_PARAMS,
+    });
 
     const live = await assignTemplate(pool, {
       templateId: sessionTpl.id, userId, sessionId, until: new Date(Date.now() + 3600_000),
@@ -402,7 +414,9 @@ test('#524 枚举 CHECK 拒绝非法值：kind / status / criterion / skipped_re
 test('#524 订阅形状：NULLS NOT DISTINCT 挡重复订阅 / scope 决定 session_id / admin 受众 / 取消订阅两分支', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     const { userId, sessionId } = await seedScene(pool, 'a5');
-    const userScope = await createTemplate(pool, { kind: 'scheduled-task', name: '每天早上', scope: 'user' });
+    const userScope = await createTemplate(pool, {
+      kind: 'scheduled-task', name: '每天早上', scope: 'user', params: SCHEDULED_PARAMS,
+    });
     const first = await assignTemplate(pool, { templateId: userScope.id, userId });
     const again = await assignTemplate(pool, { templateId: userScope.id, userId });
     assert.equal(again.id, first.id,
@@ -519,7 +533,8 @@ test('#524 订阅形状：NULLS NOT DISTINCT 挡重复订阅 / scope 决定 sess
         kind: 'scheduled-task', name: 'x', scope: 'session',
         params: { at: '09:00', cwd: '/p', task: 't', maxRounds: 4 },
       }), 'scheduled-task 只能 scope=user');
-      // params 按 kind schema：缺字段不算错，但**多字段/错值**必须拦
+      // params 按 kind schema：**缺必填**（#625，如 `scheduled-task` 缺 `at`）、
+      // **多字段/错值**都要拦；可缺字段缺了 ⇒ 服务端补契约默认值（不报错，见 #625 那组用例）。
       await assertMacroError('validation_failed', () => createTemplate(pool, {
         kind: 'run-notify', name: 'x', scope: 'session', params: { tone: 'brief' },
       }), 'run-notify 不认识 tone');

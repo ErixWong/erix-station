@@ -36,10 +36,18 @@ const SILENT = { log() {}, info() {}, warn() {}, error() {} };
 const NOW_MS = Date.parse('2026-11-16T02:00:00.000Z');
 
 // —— 假 pool：按 SQL 片段路由，够走「列表 → 求值(抛) → 水位线」这条链，不触达 macros.js。 —
+// ⚠ issue #624：`listEvaluableAssignments` 现在**先**跑 `applyExpiredAssignments`
+// （`UPDATE macro_assignments SET enabled = false …`），它属于「取订阅」这一步，
+// ⇒ 每条假 pool 都得有这条路由。缺省时自动补一条「本轮没有到期」，不削弱
+// 「未预期 SQL 就抛」的严格性（那是假 pool 的核心价值）。
+const EXPIRY_SWEEP_PROBE = 'UPDATE macro_assignments SET enabled = false WHERE enabled AND until IS NOT NULL AND until <= $1 RETURNING id';
+const isExpirySweep = (s) => s.includes('UPDATE macro_assignments SET enabled = false');
+const NO_EXPIRY = { test: isExpirySweep, fn: () => ({ rows: [], rowCount: 0 }) };
 function makeFakePool(routes) {
+  const all = routes.some((r) => r.test(EXPIRY_SWEEP_PROBE)) ? routes : [NO_EXPIRY, ...routes];
   return {
     async query(sql, params) {
-      for (const r of routes) if (r.test(sql)) return r.fn(sql, params);
+      for (const r of all) if (r.test(sql)) return r.fn(sql, params);
       throw new Error(`fake pool: 未预期的 SQL: ${String(sql).slice(0, 80)}`);
     },
   };
@@ -474,9 +482,12 @@ test('#611⚑7 ERIX_MACRO_QUIET_HOURS=off ⇒ 通知型 23:00 也不被挡', { s
 
 // ── ⚑8 建 run-notify 模板能传 max_per_day / quiet_hours（schema 认）───────────────
 test('#617⚑8 run-notify/run-silence-alert 的 params 认 max_per_day/quiet_hours', () => {
-  assert.equal(validateKindParams('run-notify', { max_per_day: 5, quiet_hours: '01:00-02:00' }), true);
-  assert.equal(validateKindParams('run-notify', { quiet_hours: 'off' }), true, 'quiet_hours 允许 off');
-  assert.equal(validateKindParams('run-silence-alert', { max_per_day: 200 }), true);
+  // ⚠ #625：返回值从 `true` 改成「补完默认值的 params」⇒ 这里断言「传的在、缺的补上」。
+  assert.deepEqual(validateKindParams('run-notify', { max_per_day: 5, quiet_hours: '01:00-02:00' }),
+    { max_per_day: 5, quiet_hours: '01:00-02:00', channel: 'site',
+      states: ['failed', 'capped', 'aborted', 'persistence_failed', 'guard_unverified'] });
+  assert.equal(validateKindParams('run-notify', { quiet_hours: 'off' }).quiet_hours, 'off', 'quiet_hours 允许 off');
+  assert.equal(validateKindParams('run-silence-alert', { max_per_day: 200 }).max_per_day, 200);
   // 反向自证：把 max_per_day 从 KIND_SCHEMA 摘掉 ⇒ validateKindParams 抛 '不认识参数' ⇒ 红。
 });
 
