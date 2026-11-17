@@ -181,7 +181,7 @@ sequenceDiagram
         G->>U: forward upstream
         U-->>R: streaming completion back
         R->>R: run tools: edit code / run tests / start dev server :4000<br/>(binds 0.0.0.0, port taken from ports.json)
-        AG->>T: POST /api/internal/* (transcript / events / checkpoint)
+        AG->>T: POST /api/internal/* (transcript / events / runstate)
         T->>P: ipAllowList source filter (FDE subnets) → loopback to portal
         P->>DB: persist events + seq allocation + usage_ledger accounting
     end

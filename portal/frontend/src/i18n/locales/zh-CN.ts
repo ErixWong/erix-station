@@ -356,7 +356,7 @@ export const zhCN = {
       strategyFallback: '压缩未使用配置的策略：引擎兜底 sliding-window（整轮丢弃、不摘要，第 {round} 轮起）',
       metadataMissing: '模型上下文元数据缺失：本次 run 的压缩与聚合输出预算已关闭',
       capabilityDegraded: '存储端缺少 {method} 能力：本次 run 对应的持久化被跳过（中途崩溃不可恢复）',
-      resumeJournalSkipped: '崩溃轮的 {count} 条工具结果未入账（第 {round} 轮），下次恢复将依赖快照',
+      resumeJournalSkipped: '崩溃轮的 {count} 条工具结果未入账（第 {round} 轮），下次恢复将依赖账本（run snapshot 已于 #640 退役）',
       resumeJournalSome: '若干',
       // issue #438 切片 B（erix-agent 0.29.0）：`LoopEvent` 新增的两类**展示类**诊断事件。
       // 数字没给就 `?`（#283）、外来标识符过形状闸（#261）——调用方已归一，文案不得再编数。
@@ -441,8 +441,10 @@ export const zhCN = {
       // 文案」）下作废；且终态分隔条现在会从历史投影出来，任何 reason 都会上屏。引擎新增的未知值
       // 不进本表 ⇒ 文案回落 reason 原文（§5.3 向后兼容）。
       runEndReason: {
-        // 快照没落盘 → 崩溃恢复可能重复工具副作用，语义最重（裁决理由见 docs/data/model.md §1.7）
-        persistence_failed: '快照未落盘（崩溃恢复可能重复副作用）',
+        // 账本没落盘（transcript 轮记录 / run-state 写失败）→ 崩溃恢复可能重复工具副作用，语义最重。
+        // ⚠ 措辞随 issue #640 改过：0.33 起本站没有 run snapshot，但 `persistence_failed` 这个
+        //   **错误类型与红色分级一字未动**（裁决理由见 docs/data/model.md §1.7）——改的只是「落盘的是什么」。
+        persistence_failed: '账本未落盘（崩溃恢复可能重复副作用）',
         // 终稿未经 final guard 核验 → 用户必须自己复核
         final_guard_unverified: '终稿未经核验',
         // issue #236：用户主动停止（最常看到的那一条，此前上屏是裸英文 `aborted`）
