@@ -8419,7 +8419,85 @@ portal/proxy → **先验在飞 run = 0** 再逐台 `docker rm -f fde-<name>` + 
 **一处遗留，如实记**：3 个 revoked 测试账号（`portsprobe` / `pw173jscw` / `ui17kbwg`）**没有容器**，
 About 面板上仍显示它们停用时的旧快照摘要（`941a157c…` / `4c1e7068…`）——那是**历史快照不是当前运行**，
 面板本来就把第三格标成 `derived copy, not authoritative`，不修（重建一个 revoked 账号的容器没有意义）。
-### 8.160 能力市场 P1：MCP 通道 portal 切片（#608，2026-11-17，主 agent 自己写 + 两个 erix_run 并行跑 runner/前端）
+
+### 8.160 事件平台 e2e 首轮的 11 个缺陷修复：从「零件齐了」到「管道真通」（2026-11-17，主 agent + erix_run × 5 + copilot 验收）
+
+接 §8.158。首轮 e2e 抓到 11 个缺陷，本轮修掉 9 个（#613/#616/#611+#617/#614+#615/#623/#624+#625/#626+#627），
+另开 2 个（#637 M7 产物、#646 M1/M9 触发源）正在跑。
+
+| 单 | PR | 合并 | 内容 |
+|---|---|---|---|
+| #613 | #622 | `c019825` | 管理台订阅数列（后端 `subscriberCount`） |
+| #616 | #632 | `d5a9e46` | **意图消费者 dispatcher**（M1/M9/M7 的接线） |
+| #611+#617 | #633 | `36ecea6` | `quiet_hours` 只对通知型 + 读 params + 窗内不丢弃；`max_per_day` 进 schema |
+| #614+#615 | #634 | `80a994b` | 顶栏死入口 + 假警报；新增 `GET /api/macro-runs` |
+| #623 | #638 | `dbe27e3` | **用户级订阅端点**（M7 开户路径） |
+| #626+#627 | #642 | `2ad6888` | 只读闸第四条旁路；M7 三处静默失效 |
+| #624+#625 | #645 | `5ae41ce` | 契约 `default`/`required` 进 schema；`until` 到期收敛 |
+
+**每个 PR 主 agent 都亲跑判据 + 跑 2–3 个变异**（本轮累计 17 个变异，全部命中）。
+
+---
+
+#### 最重要的两条：**管道的两端都曾经是空的**
+
+1. **#616：意图没有消费者。** `executeScheduledIntent` / `runMacroReview` **全仓只被自己的测试引用**。
+   `cli.js` 只启动评估循环，`void tick()` 把返回值丢掉。
+2. **#646（待修）：终态意图没有生产者。** `run-notify` / `run-review` 是**终态触发**型，
+   而 `finishRun`（`internal.js`）**没有任何一行碰宏平台**。代码自己在 `macro-eval.js:306` 写着
+   「由 W1 的终态触发驱动」—— 那个「W1 的终态触发」不存在。
+
+⇒ **同一类错误第三次换位置出现**：
+§8.146「没人起 run」→ §8.158 #616「没人消费意图」→ 本条「没人产生终态意图」。
+三次都是「接口/函数交付了，但**调用它的那一方**不属于任何一张单」。
+**口径升级：拆单时对每个「产出一份数据」和「消费一份数据」的模块，都要显式指派对端；
+只写「它做什么」不够，必须写「谁调它」。**
+
+#### 真机验证才暴露的那一层（#637，待修）
+
+M7 管道在真机上**确实通了**（`clock:2026-11-17` → `done`、宏会话建出来、run 入队），
+但顺着往下看产出是**零**：
+- `defaultRunTask` 是**空壳桩** ⇒ 不等待、产物空、**失败记成 `done`**
+- 产物写 `/root/reports`（容器内、未挂载）⇒ 用户看不到、重建即丢
+- `safe()` 用 `[^\w.\-]` ⇒ **中文宏名整段压成一个 `_`** ⇒ 所有中文宏挤同一目录互相覆盖
+
+⇒ **「链路通了」与「产出可用」是两件事**。判据必须是
+「用户能看到的最终产物对不对」，不能停在「账上写了 done」。
+
+#### 派单与协作的账
+
+- **5 条 worker 全部 `erix_run`**，无一换执行体；轮数 72–120。
+- **两次后台 run 被 pi 进程重启杀掉**（w-611 死 2 次），靠 `resume` / 重派救回。
+  ⇒ 长跑单要盯，或接受「死后 resume 是常态」。
+- **rebase 到快速前进的 main 是主要成本**：本轮 5 个 PR 全部要 rebase 1–3 次，
+  其中 #645 一次 rebase 把冲突文件里的 fixture 修复**冲掉了**（`Unexpected end of input` +
+  5 条用例红），手工补回。
+  ⇒ 口径：**rebase 解冲突后必须重跑全量判据**，不能只看冲突标记消失。
+- **跨单语义交互要主动核对**：#625 让 `scheduled-task` 的 `at`/`cwd`/`task` 成必填，
+  而 #623 的 fixture 建于其前 ⇒ rebase 后 5 条红。这是**正确的交互**（不是谁的 bug），
+  改 fixture 即恢复。⇒ 一张单改了校验，要 grep 别的单有没有造违反新校验的 fixture。
+
+#### 环境操作坑（记一笔）
+
+- **worktree 没有 `deploy/.env`**（gitignore + worktree 不带未跟踪文件）⇒
+  `docker compose build` 会落到默认 `erix-station/portal:local`，
+  而**运行中的容器用的是 GHCR digest pin**（`STATION_PORTAL_IMAGE` 在 `.env` 里）
+  ⇒ 以为重建了、其实没换。查法：`docker inspect <c> --format '{{.Config.Image}}'`。
+- **`.env` 里是 digest 引用 ⇒ `docker compose build` 直接失败**
+  （`refusing to create a tag with a digest reference`）。本地构建必须显式
+  `STATION_PORTAL_IMAGE=erix-station/portal:local`。
+- **验证完必须还原 digest pin**（否则部署记录与实况分裂）。本轮已还原。
+- **`gh pr merge` 冲突失败后紧接着删远端分支 ⇒ PR 变 CLOSED**（不是留 OPEN）。
+  §8.157 的台账 PR 就这么没了。⇒ 合并失败先别删分支。
+- **vision MCP 上游间歇失败**，但模型能直接读图 —— `read` 一张 png 即可。
+
+#### 环境副作用（待还原）
+
+为让 `eric` 能密码登录做 UI e2e，临时改了 dev 库：
+`UPDATE users SET mail_otp_enabled=false WHERE login='eric'`（**原值 `t`**）。
+
+**待办**：#646（M1/M9 触发源，在跑）、#637（M7 产物三缺陷，在跑）。
+### 8.162 能力市场 P1：MCP 通道 portal 切片（#608，2026-11-17，主 agent 自己写 + 两个 erix_run 并行跑 runner/前端）
 
 - **为什么主 agent 自己写**：这一片的两个 pi worker 后台 run 连续被外部终止（`Async runner process … exited
   before writing a result`，6h 内两次），第三次改用 `erix_run`（带 sessionDir，可续跑）跑 runner 与前端，
@@ -8450,7 +8528,7 @@ About 面板上仍显示它们停用时的旧快照摘要（`941a157c…` / `4c1
   缺槽必须 409、`detached:true` 必须被红色形状拒）。
 - **文档**：`docs/api/portal.md` §4.18（发布体 / 配置槽只写不读 / 内部下发 / 用户面差异 + 错误码）。
 
-### 8.161 MCP 通道 P1 收尾：三切片合并 + 真机 e2e + copilot 独立审计（#608，2026-11-17，主 agent + 两个 erix_run）
+### 8.163 MCP 通道 P1 收尾：三切片合并 + 真机 e2e + copilot 独立审计（#608，2026-11-17，主 agent + 两个 erix_run）
 
 **合并**：三个 worktree 分支（`-02` portal / `-03` runner / `-04` 前端）合进 `feat-261117-01-mcp-channel`
 再追平 main（`5ae41ce`），冲突只有台账一处（main 已占 8.156..8.159 ⇒ 本单让到 8.160/8.161）。
