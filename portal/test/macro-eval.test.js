@@ -18,9 +18,11 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
+import { validateKindParams, claimMacroRun, MacroError } from '../src/macros.js';
 import {
   startMacroEvalLoop, isWatermarkStale, isQuietHours, inTz8, atToEpochMs, parseDurationMs,
-  EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE, SILENCE_DEFAULT_THRESHOLD_MS,
+  EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE, SILENCE_DEFAULT_THRESHOLD_MS, evaluateSkipGates,
+  parseQuietSpec, quietSpecFor, DEFAULT_MAX_PER_DAY, DEFAULT_QUIET_SPEC, NOTIFY_KINDS,
 } from '../src/macro-eval.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
@@ -315,4 +317,177 @@ test('#525⑨ 今天已 tick 按 UTC+8 日界：同日(UTC+8)不重复产，跨�
       '跨到 UTC+8 新一天 ⇒ 再产一条（若 anchor 用 UTC 日期，这一步会拿到 clock:2026-11-16/16 同值而漏产 ⇒ 红）');
     loop.stop();
   });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// #611 quiet_hours 只对通知型生效 + 从 params 读 + 窗内不丢弃合并 digest；
+// #617 max_per_day/quiet_hours 进 KIND_SCHEMA（拍平），两闸读 params 缺省回落。
+//
+// 「通知型」= `NOTIFY_KINDS` = ['run-notify','run-silence-alert']。评估循环实际会求值的
+// 通知型只有 `run-silence-alert`（run-notify 由 W1 终态触发驱动，不进 W2 循环），所以闸的
+// DB 用例都用 run-silence-alert 走 `evaluateSkipGates`；`gateFor` 就是门禁认的那个 kind。
+// 固定时刻（UTC+8，用 atToEpochMs）：23:00 落默认窗 22–08 内；01:30 落 01:00–02:00 内；03:00 在外。
+const T23 = atToEpochMs('2026-11-16', '23:00');
+const T0130 = atToEpochMs('2026-11-16', '01:30');
+const T0300 = atToEpochMs('2026-11-16', '03:00');
+
+// ── ⚑1 scheduled-task 在 23:00 仍要跑（不被 quiet_hours 挡）──────────────────────
+test('#611⚑1 scheduled-task 在 23:00（默认窗内）不被 quiet_hours 挡', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId } = await seedScene(pool, 'q1');
+    const tpl = await addTemplate(pool, 'scheduled-task', 'user', { at: '00:00' });
+    const asg = await addAssignment(pool, { templateId: tpl, userId, cwd: '/no/such/cwd-q1', until: null });
+    const a = { id: asg, params: {}, sessionId: null, cwd: '/no/such/cwd-q1' };
+    // 反向自证：若去掉「quiet 只对通知型生效」的 `NOTIFY_KINDS.includes(gateFor)` 前缀
+    // （改成对所有 kind 判 quiet），23:00 会返回 'quiet_hours' ⇒ 这条红。
+    assert.equal(
+      await evaluateSkipGates(pool, a, { nowMs: T23, gateFor: 'scheduled-task', log: SILENT }),
+      null, 'scheduled-task 不受 quiet_hours 约束 ⇒ 23:00 也放行');
+  });
+});
+
+// ── ⚑2 通知型在 23:00 被挡（基线：闸还在）─────────────────────────────────────────
+test('#611⚑2 通知型 run-silence-alert 在 23:00（默认窗内）被 quiet_hours 挡', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'q2');
+    const tpl = await addTemplate(pool, 'run-silence-alert', 'session', { phases: ['tool_running'], threshold: '15m' });
+    const asg = await addAssignment(pool, { templateId: tpl, userId, sessionId });
+    const a = { id: asg, params: {}, sessionId, cwd: null };
+    assert.equal(
+      await evaluateSkipGates(pool, a, { nowMs: T23, gateFor: 'run-silence-alert', log: SILENT }),
+      'quiet_hours', '通知型在默认免打扰窗内 ⇒ 闸仍命中 quiet_hours');
+  });
+});
+
+// ── ⚑3 params.quiet_hours='01:00-02:00' ⇒ 01:30 挡、03:00 不挡 ───────────────────
+test('#611⚑3 params.quiet_hours 覆盖缺省窗：01:30 挡、03:00 不挡', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'q3');
+    const params = { quiet_hours: '01:00-02:00' };
+    const tpl = await addTemplate(pool, 'run-silence-alert', 'session', params);
+    const asg = await addAssignment(pool, { templateId: tpl, userId, sessionId });
+    const a = { id: asg, params, sessionId, cwd: null };
+    assert.equal(
+      await evaluateSkipGates(pool, a, { nowMs: T0130, gateFor: 'run-silence-alert', log: SILENT }),
+      'quiet_hours', '01:30 落在 params 指定的 01:00–02:00 内 ⇒ 挡');
+    assert.equal(
+      await evaluateSkipGates(pool, a, { nowMs: T0300, gateFor: 'run-silence-alert', log: SILENT }),
+      null, '03:00 不在 params 窗内（缺省 22–08 被 params 覆盖掉）⇒ 不挡');
+  });
+});
+
+// ── ⚑4 params.max_per_day=1 ⇒ 当日第 2 次 budget_exhausted ───────────────────────
+test('#617⚑4 params.max_per_day=1 ⇒ 当日第 2 次命中 budget_exhausted', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'b4');
+    const params = { max_per_day: 1 };
+    // 反向自证：schema 认 max_per_day 才建得成模板；若把 max_per_day 从 KIND_SCHEMA 摘掉，
+    // 这行 validateKindParams 抛 '不认识参数 max_per_day' ⇒ 本条红。
+    validateKindParams('run-silence-alert', params);
+    const tpl = await addTemplate(pool, 'run-silence-alert', 'session', params);
+    const asg = await addAssignment(pool, { templateId: tpl, userId, sessionId });
+    const a = { id: asg, params, sessionId, cwd: null };
+    // NOW_MS=10:00（UTC+8，窗外）：先判 budget，count 含本轮已 claim 的那条（用 >）。
+    await claimMacroRun(pool, { assignmentId: asg, anchor: 'b1', criterion: 'silent', bucket: 'tool_running', now: new Date(NOW_MS) });
+    assert.equal(
+      await evaluateSkipGates(pool, a, { nowMs: NOW_MS, gateFor: 'run-silence-alert', log: SILENT }),
+      null, '当日第 1 次（count=1，1>1 false）⇒ 放行');
+    await claimMacroRun(pool, { assignmentId: asg, anchor: 'b2', criterion: 'silent', bucket: 'tool_running', now: new Date(NOW_MS) });
+    assert.equal(
+      await evaluateSkipGates(pool, a, { nowMs: NOW_MS, gateFor: 'run-silence-alert', log: SILENT }),
+      'budget_exhausted', '当日第 2 次（count=2>1）⇒ budget_exhausted');
+  });
+});
+
+// ── ⚑5 不传 max_per_day ⇒ 默认 20 生效 ───────────────────────────────────────────
+test('#617⚑5 不传 max_per_day ⇒ 回落 DEFAULT_MAX_PER_DAY=20（第 20 放行、第 21 挡）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    assert.equal(DEFAULT_MAX_PER_DAY, 20, '缺省上限必须是 20');
+    const { userId, sessionId } = await seedScene(pool, 'b5');
+    const tpl = await addTemplate(pool, 'run-silence-alert', 'session', {});
+    const asg = await addAssignment(pool, { templateId: tpl, userId, sessionId });
+    const a = { id: asg, params: {}, sessionId, cwd: null };
+    for (let i = 1; i <= 20; i += 1) {
+      await claimMacroRun(pool, { assignmentId: asg, anchor: `k${i}`, criterion: 'silent', bucket: 'tool_running', now: new Date(NOW_MS) });
+    }
+    assert.equal(
+      await evaluateSkipGates(pool, a, { nowMs: NOW_MS, gateFor: 'run-silence-alert', log: SILENT }),
+      null, '第 20 次（count=20，20>20 false）⇒ 放行');
+    await claimMacroRun(pool, { assignmentId: asg, anchor: 'k21', criterion: 'silent', bucket: 'tool_running', now: new Date(NOW_MS) });
+    assert.equal(
+      await evaluateSkipGates(pool, a, { nowMs: NOW_MS, gateFor: 'run-silence-alert', log: SILENT }),
+      'budget_exhausted', '第 21 次（count=21>20）⇒ budget_exhausted');
+  });
+});
+
+// ── ⚑6 窗内不丢弃 ⇒ 窗外合并成一封 digest ─────────────────────────────────────────
+test('#611⚑6 静默在窗内不丢弃（不 claim/不落 skipped），出窗合并成一封 digest', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'd6');
+    const tpl = await addTemplate(pool, 'run-silence-alert', 'session', { phases: ['tool_running'], threshold: '15m' });
+    const asg = await addAssignment(pool, { templateId: tpl, userId, sessionId });
+    const t2230 = atToEpochMs('2026-11-16', '22:30'); // 最后一条 run_event：窗内
+    const runId = await addRun(pool, { sessionId, status: 'running', startedAt: t2230 - 5 * 60_000 });
+    await addRunEvent(pool, { runId, sessionId, type: 'tool_use', ts: t2230, seq: 1 });
+
+    let t = atToEpochMs('2026-11-16', '23:00'); // 窗内那一拍
+    const loop = startMacroEvalLoop(pool, {}, { intervalMs: 10_000_000, now: () => new Date(t), log: SILENT });
+    const r1 = await loop.tick();
+    assert.equal(r1.intents.length, 0, '窗内不发即时静默');
+    const { rows } = await pool.query(`SELECT count(*)::int AS n FROM macro_runs WHERE assignment_id = $1`, [asg]);
+    assert.equal(rows[0].n, 0, '窗内既不 claim 也不落 skipped ⇒ 积压被保留，没被丢弃');
+
+    t = atToEpochMs('2026-11-17', '09:00'); // 出窗那一拍：积压合并
+    const r2 = await loop.tick();
+    loop.stop();
+    assert.equal(r2.intents.length, 1, '出窗 ⇒ 窗内积压合并成 1 封 digest');
+    const d = r2.intents[0];
+    assert.match(d.anchor, /^digest:/, '合并意图用 digest:<窗日> 锚');
+    assert.equal(d.criterion, 'tick');
+    assert.equal(d.evidence.digest, true, 'evidence 必须标 digest');
+    assert.ok(d.evidence.merged >= 1, 'digest 至少要合并 1 条积压');
+    // 反向自证：若把「积压到窗外」改回「丢弃」（窗外直接 continue 而非进 digestBacklog），
+    // r2.intents 会是空 ⇒ 上面 `r2.intents.length === 1` 红。
+  });
+});
+
+// ── ⚑7 ERIX_MACRO_QUIET_HOURS=off ⇒ 通知型 23:00 也不挡 ──────────────────────────
+test('#611⚑7 ERIX_MACRO_QUIET_HOURS=off ⇒ 通知型 23:00 也不被挡', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'q7');
+    const tpl = await addTemplate(pool, 'run-silence-alert', 'session', { phases: ['tool_running'], threshold: '15m' });
+    const asg = await addAssignment(pool, { templateId: tpl, userId, sessionId });
+    const a = { id: asg, params: {}, sessionId, cwd: null };
+    const prev = process.env.ERIX_MACRO_QUIET_HOURS;
+    process.env.ERIX_MACRO_QUIET_HOURS = 'off';
+    try {
+      // 反向自证：若 quietSpecFor 忽略 env，则回落缺省 22–08 ⇒ 23:00 返回 'quiet_hours' ⇒ 红。
+      assert.equal(
+        await evaluateSkipGates(pool, a, { nowMs: T23, gateFor: 'run-silence-alert', log: SILENT }),
+        null, 'env=off ⇒ 通知型在 23:00 也放行');
+    } finally {
+      if (prev === undefined) delete process.env.ERIX_MACRO_QUIET_HOURS; else process.env.ERIX_MACRO_QUIET_HOURS = prev;
+    }
+  });
+});
+
+// ── ⚑8 建 run-notify 模板能传 max_per_day / quiet_hours（schema 认）───────────────
+test('#617⚑8 run-notify/run-silence-alert 的 params 认 max_per_day/quiet_hours', () => {
+  assert.equal(validateKindParams('run-notify', { max_per_day: 5, quiet_hours: '01:00-02:00' }), true);
+  assert.equal(validateKindParams('run-notify', { quiet_hours: 'off' }), true, 'quiet_hours 允许 off');
+  assert.equal(validateKindParams('run-silence-alert', { max_per_day: 200 }), true);
+  // 反向自证：把 max_per_day 从 KIND_SCHEMA 摘掉 ⇒ validateKindParams 抛 '不认识参数' ⇒ 红。
+});
+
+// ── ⚑9 建 scheduled-task 传 quiet_hours / max_per_day ⇒ 400（只给通知型）──────────
+test('#617⚑9 scheduled-task 传 quiet_hours/max_per_day ⇒ MacroError 400', () => {
+  for (const field of ['quiet_hours', 'max_per_day']) {
+    let err;
+    try {
+      validateKindParams('scheduled-task', { at: '09:00', cwd: '/srv/x', [field]: field === 'quiet_hours' ? '22:00-08:00' : 5 });
+    } catch (e) { err = e; }
+    assert.ok(err instanceof MacroError, `scheduled-task + ${field} 必须抛 MacroError`);
+    assert.equal(err.code, 'validation_failed');
+    assert.equal(err.httpStatus, 400, `scheduled-task 不收 ${field} ⇒ 400`);
+  }
 });

@@ -16,14 +16,23 @@
 import { claimMacroRun, finishMacroRun } from './macros.js';
 // 评估间隔与陈旧余量是**跨端面**常量（执行器与用户面共用）⇒ 权威位在
 // `shared/macro-kinds.js`（issue #528 / 契约 `10` 篇 §1），本文件只 re-export。
-import { EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE } from '../shared/macro-kinds.js';
+import { EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE, QUIET_WINDOW_RE } from '../shared/macro-kinds.js';
 
 export { EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE };
 
 /** 站内时区口径：UTC+8（`02` 篇 §1 / `03` 篇 §556 的 `{{date}}`）。日期/时刻一律按这个偏移算。 */
 export const TZ_OFFSET_MINUTES = 8 * 60;
-/** 免打扰时段（UTC+8，`03` 篇 §296 / `04` 篇 §201）：22:00–08:00。 */
+/** 免打扰时段缺省（UTC+8，`03` 篇 §296 / `04` 篇 §201）：22:00–08:00。形状保留作回落用。 */
 export const QUIET_HOURS = Object.freeze({ start: 22, end: 8 });
+/** quiet_hours 缺省形态（`04` §201）；params 未给且 env 未设时用它。 */
+export const DEFAULT_QUIET_SPEC = '22:00-08:00';
+/** max_per_day 缺省（#617：之前 extractMaxPerDay 不传就恒 null ⇒ 闸永不命中）。 */
+export const DEFAULT_MAX_PER_DAY = 20;
+/**
+ * quiet_hours / max_per_day 只对**通知型** kind 生效（#611）：它们的语义是「什么时候值得叫我 /
+ * 别把我淹了」。`scheduled-task` 是用户显式指定时刻要跑的任务，01:00 就是 01:00。
+ */
+export const NOTIFY_KINDS = Object.freeze(['run-notify', 'run-silence-alert']);
 /** 静默阈值默认值与「按相位」口径（`10` 篇 §1 KIND_SCHEMA / `05` 篇）：
  *  tool_running 默认 15m；awaiting_llm **默认关**（null ⇒ 该相位不判）。 */
 export const SILENCE_DEFAULT_THRESHOLD_MS = 15 * 60_000;
@@ -60,10 +69,55 @@ export function atToEpochMs(dateStr, atHHMM) {
   return dayStartUtc8 + (h * 60 + m) * 60_000;
 }
 
-/** 当前是否落在免打扰时段（UTC+8）：[22:00,24:00) ∪ [00:00,08:00)。 */
-export function isQuietHours(epochMs) {
-  const { hour } = inTz8(epochMs);
-  return hour >= QUIET_HOURS.start || hour < QUIET_HOURS.end;
+/** `HH:MM` → 当日分钟数（UTC+8）。 */
+function minutesOfHHMM(hhmm) {
+  const [h, m] = String(hhmm).split(':').map((x) => Number(x));
+  return h * 60 + m;
+}
+
+/**
+ * 解析 quiet_hours 形态为窗对象（#611/#617）：
+ *   `'off'` ⇒ `{off:true}`（永不静默）；`'HH:MM-HH:MM'` ⇒ `{off:false,startMin,endMin}`（UTC+8）；
+ *   空/未给 ⇒ 缺省 `22:00-08:00`；**解析失败 ⇒ 回落缺省并 `log.warn`**。
+ */
+export function parseQuietSpec(raw, { log } = {}) {
+  const fallback = () => ({ off: false, startMin: QUIET_HOURS.start * 60, endMin: QUIET_HOURS.end * 60 });
+  const s = String(raw ?? '').trim();
+  if (s === '') return fallback();
+  if (!QUIET_WINDOW_RE.test(s)) {
+    log?.warn?.(`[macro-eval] quiet_hours 形态非法（${JSON.stringify(raw)}），回落缺省 ${DEFAULT_QUIET_SPEC}`);
+    return fallback();
+  }
+  if (s === 'off') return { off: true };
+  const [a, b] = s.split('-');
+  return { off: false, startMin: minutesOfHHMM(a), endMin: minutesOfHHMM(b) };
+}
+
+/**
+ * 解析一条订阅生效的安静窗（优先级）：`params.quiet_hours`（模板显式）> `ERIX_MACRO_QUIET_HOURS`（env，e2e 逃生阀）> 缺省。
+ * env 只覆盖**缺省值**（#611 §5：否则 22:00–08:00 期间只能改代码做 e2e）；模板显式指定时以模板为准。
+ */
+export function quietSpecFor(params, { log } = {}) {
+  const raw = params?.quiet_hours ?? process.env.ERIX_MACRO_QUIET_HOURS;
+  return parseQuietSpec(raw, { log });
+}
+
+/** 给定时刻是否落在安静窗内（跨午夜窗：start>end，如 22:00-08:00）。 */
+function windowActive(spec, epochMs) {
+  if (!spec || spec.off) return false;
+  const { minutesOfDay } = inTz8(epochMs);
+  const { startMin, endMin } = spec;
+  if (startMin === endMin) return false; // start==end ⇒ 空窗
+  if (startMin < endMin) return minutesOfDay >= startMin && minutesOfDay < endMin;
+  return minutesOfDay >= startMin || minutesOfDay < endMin; // 跨午夜
+}
+
+/**
+ * 当前是否落在免打扰时段（UTC+8）。默认窗 22:00–08:00（不读 env，保证纯时钟口径用例稳定）；
+ * 调用方传 `quietSpecFor(params)` 则按模板/env 解析后的窗判。#611 之前用冻结常量不看窗 ⇒ 不可配。
+ */
+export function isQuietHours(epochMs, spec) {
+  return windowActive(spec ?? { off: false, startMin: QUIET_HOURS.start * 60, endMin: QUIET_HOURS.end * 60 }, epochMs);
 }
 
 /** 解析 `'15m' / '2h' / '30s' / '900'`（无单位按分钟）为 ms；解析失败给 fallback。 */
@@ -99,11 +153,11 @@ function nowMsOf(now) {
   return v instanceof Date ? v.getTime() : Number(v);
 }
 
-/** 从模板 params 取 `max_per_day`（budget 在 params.budget 或 params 顶层，见 `03` 篇 §610/§622）。 */
+/** 从模板 params 取 `max_per_day`（#617：拍平后在 params 顶层，兼容旧的 params.budget.max_per_day）；缺省 20。 */
 function extractMaxPerDay(params) {
-  const v = params?.budget?.max_per_day ?? params?.max_per_day;
+  const v = params?.max_per_day ?? params?.budget?.max_per_day;
   const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? n : null;
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_MAX_PER_DAY;
 }
 
 /** 求一个相位的静默阈值（ms）；null ⇒ 该相位不判（默认 awaiting_llm 关）。 */
@@ -336,6 +390,12 @@ export async function evalClock(pool, a, nowMs, { log } = {}) {
 export async function evalSilence(pool, a, nowMs, { log } = {}) {
   const intents = [];
   if (!a.sessionId) return intents; // session scope 才有会话可判
+  // #611 ③：安静窗内不丢弃。对通知型：窗内命中⇒**不 claim、不落 skipped 行**（挂起），
+  // 窗外的下一次求值把「静默起点落在窗内」的那些**合并成一颗 digest**（不是逐条补发）。
+  const isNotify = NOTIFY_KINDS.includes(a.kind);
+  const spec = isNotify ? quietSpecFor(a.params, { log }) : null;
+  const inQuietNow = isNotify && windowActive(spec, nowMs);
+  const digestBacklog = []; // 静默起点落在安静窗内、而现在已经出窗的 run（待合并）
   const runsRes = await pool.query(
     `SELECT id, started_at, queued_at FROM runs
       WHERE session_id = $1 AND status = ANY($2::text[])`,
@@ -356,6 +416,12 @@ export async function evalSilence(pool, a, nowMs, { log } = {}) {
     const sinceTs = lastEv ? toMs(lastEv.ts) : toMs(run.started_at ?? run.queued_at);
     const silentMs = nowMs - sinceTs;
     if (!(silentMs > threshold)) continue;
+    if (inQuietNow) continue; // 窗内：不丢弃但不即时发（不 claim、不落 skipped），等窗外合并
+    // 出窗：若静默起点落在安静窗内 ⇒ 这是被压住的积压，归入 digest（不单独发）。
+    if (isNotify && windowActive(spec, sinceTs)) {
+      digestBacklog.push({ runId: run.id, phase, silentMs });
+      continue;
+    }
     const anchor = `run:${run.id}`;
     const claimed = await claimMacroRun(pool, {
       assignmentId: a.id, anchor, criterion: 'silent', bucket: phase, now: new Date(nowMs),
@@ -367,6 +433,23 @@ export async function evalSilence(pool, a, nowMs, { log } = {}) {
       gateFor: 'run-silence-alert', nowMs, log,
     });
     if (it) intents.push(it);
+  }
+  // 积压合并：多条挂起的静默→**一封 digest**（幂等键 `digest:<window-date>`、criterion=tick、bucket=<日期>）。
+  // 同一窗日只发一次（claim 幂等）；后续同日的求值 claim 拿 null ⇒ 不重复补发。
+  if (digestBacklog.length) {
+    const { date } = inTz8(nowMs);
+    const anchor = `digest:${date}`;
+    const claimed = await claimMacroRun(pool, {
+      assignmentId: a.id, anchor, criterion: 'tick', bucket: date, now: new Date(nowMs),
+    });
+    if (claimed) {
+      const it = await gateAndIntent(pool, a, {
+        anchor, criterion: 'tick', bucket: date, macroRunId: claimed.id,
+        evidence: { digest: true, merged: digestBacklog.length, runs: digestBacklog.map((d) => d.runId) },
+        gateFor: a.kind, nowMs, log,
+      });
+      if (it) intents.push(it);
+    }
   }
   return intents;
 }
@@ -385,7 +468,7 @@ export async function evalSilence(pool, a, nowMs, { log } = {}) {
  *   W3/W4 创建 run 的那个事务里**（条件插入 / 行锁）。这里的判断不作为正确性保证。
  */
 export async function gateAndIntent(pool, a, { anchor, criterion, bucket, macroRunId, evidence, gateFor, nowMs, log }) {
-  const reason = await evaluateSkipGates(pool, a, { nowMs, gateFor });
+  const reason = await evaluateSkipGates(pool, a, { nowMs, gateFor, log });
   if (reason) {
     await finishMacroRun(pool, { macroRunId, status: 'skipped', skippedReason: reason });
     log.info?.(`[macro-eval] 跳过 anchor=${anchor} reason=${reason}`);
@@ -395,7 +478,7 @@ export async function gateAndIntent(pool, a, { anchor, criterion, bucket, macroR
 }
 
 /** 逐条门禁，返回第一个命中的 skipped_reason（无则 null）。 */
-export async function evaluateSkipGates(pool, a, { nowMs, gateFor }) {
+export async function evaluateSkipGates(pool, a, { nowMs, gateFor, log } = {}) {
   // budget_exhausted：当日（UTC+8）已产 > max_per_day（本轮 claim 已计入 ⇒ 用 `>`）。
   const maxPerDay = extractMaxPerDay(a.params);
   if (maxPerDay != null) {
@@ -408,7 +491,10 @@ export async function evaluateSkipGates(pool, a, { nowMs, gateFor }) {
     );
     if ((rows[0]?.n ?? 0) > maxPerDay) return 'budget_exhausted';
   }
-  if (isQuietHours(nowMs)) return 'quiet_hours';
+  // quiet_hours：**只对通知型生效**（#611）；scheduled-task/run-review 不受约束。
+  // 命中 ⇒ 返回 'quiet_hours'；但通知型的「不丢弃」在 evalSilence 层面处理（窗内不 claim、窗外合并发 digest），
+  // 不会走到这里落 skipped；此返回值留给非窗内场景（已出窗 ⇒ windowActive=false ⇒ 不命中）。
+  if (NOTIFY_KINDS.includes(gateFor) && isQuietHours(nowMs, quietSpecFor(a.params, { log }))) return 'quiet_hours';
   if (gateFor === 'scheduled-task') {
     // run_in_progress：同会话（若订阅绑了 session）有活跃 run。
     if (a.sessionId) {
