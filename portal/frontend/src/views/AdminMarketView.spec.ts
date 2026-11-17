@@ -14,13 +14,16 @@
 //   ⑦ 400 `validation_failed` + `details.field` ⇒ 那一格 aria-invalid + 错误行点名字段
 //   ⑧ 编辑不选文件 ⇒ PUT 不带 `bundle`（只改元数据）
 //   ⑨ 双语成对：`admin.market.*` 与 `admin.tabs.market`
+//   ⑩ MCP 发布面（#608 §8.1）：kind 切换与字段组、`reason` 缺失**不发请求**、slots 增删、
+//      `inject` 随 transport 锁定、凭据面板只显示「已设置 / 未设置」+ 源码级「没有读值入口」
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import AdminMarketView from './AdminMarketView.vue';
 import { i18n, setLocale } from '../i18n';
 import { zhCN } from '../i18n/locales/zh-CN';
 import { en } from '../i18n/locales/en';
-import { ADMIN_MARKET_ITEMS_PATH, adminMarketItemPath } from '../lib/market';
+import { ADMIN_MARKET_ITEMS_PATH, adminMarketItemPath, adminMarketSecretsPath, normalizeMcpSecrets } from '../lib/market';
 
 interface Recorded { url: string; method: string; body: Record<string, unknown> | null }
 type Handler = (call: Recorded) => Response | undefined;
