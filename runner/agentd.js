@@ -1099,6 +1099,15 @@ function buildWorkerEnv(runStart, baseEnv = process.env) {
     childEnv.GIT_COMMITTER_NAME = identity.name;
     childEnv.GIT_COMMITTER_EMAIL = identity.email;
   }
+  // issue #627 ③：per-run 轮数上限。ticket 带了 `max_rounds`（宏 / 自动化起的 run）就覆盖
+  // 容器级默认——worker 本来就读 `ERIX_MAX_ROUNDS`（worker.js:1105 parseMaxRounds），
+  // 所以只需在这里把环境量换成本次的值，runner 侧零改动、且与容器默认同一解析口径。
+  // 区间 1..200 与 `lib/config.js` parseMaxRounds 一致；越界/非整数不覆盖（宁可回到容器默认，
+  // 也不要把一个脏值当预算传给引擎——引擎拿到 `maxRounds: 0` 会启动期 TypeError）。
+  const perRunMaxRounds = Number(runStart?.max_rounds);
+  if (Number.isInteger(perRunMaxRounds) && perRunMaxRounds >= 1 && perRunMaxRounds <= 200) {
+    childEnv.ERIX_MAX_ROUNDS = String(perRunMaxRounds);
+  }
   return childEnv;
 }
 
