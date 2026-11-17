@@ -20,7 +20,7 @@
 现状的病根：**runId 同时是运维单元和 transcript key**，导致会话真相分裂成两半——
 
 - `messages` 表：纯文本（UI 渲染用），丢失 tool_use/tool_result 块；
-- 引擎 transcript（`run_checkpoints`/轮记录）：字节级但**按 run 分片**，且终态清场时被 purge。
+- 引擎 transcript（轮记录 `transcript_rounds`；~~快照表~~ 已随 issue #640 撤，恢复只靠账本）：字节级但**按 run 分片**，且终态清场时被 purge。
 
 模型每轮需要的是字节级上文（「我上一轮写过哪个文件」藏在 write 工具调用里），两半都不是完整答案。#70 的文本注入是过渡方案：方向对（宿主显式供给），数据源错（纯文本 + 手动截断）。
 

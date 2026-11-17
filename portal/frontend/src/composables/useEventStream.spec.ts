@@ -226,7 +226,7 @@ describe('useEventStream（mock EventSource）', () => {
     // 与既有标签/落盘细节片段共存：errorCode 缺失时 persistence_failed 的老文案一字不动
     s.activeRunId.value = 'run-5';
     lastES().emit('run_end', { seq: 5, run_id: 'run-5', termination: { reason: 'persistence_failed' } });
-    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：persistence_failed — 快照未落盘（崩溃恢复可能重复副作用）');
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：persistence_failed — 账本未落盘（崩溃恢复可能重复副作用）');
     // 红色与中性两路都不得带 code 片段
     const allLines = [...hooks.onSysErr.mock.calls, ...hooks.onSep.mock.calls].map((c) => String(c[0]));
     expect(allLines.every((line) => !line.includes('code='))).toBe(true);
@@ -351,7 +351,9 @@ describe('useEventStream（mock EventSource）', () => {
   });
 
   // issue #212：worker 透传引擎 termination 后，这两个 reason 必须到工作台前台（红色 syserr），
-  // 绝不能落到灰色中性分隔条分支——尤其 persistence_failed（快照没落盘 = 崩溃恢复可能重复副作用）。
+  // 绝不能落到灰色中性分隔条分支——尤其 persistence_failed（账本没落盘 = 崩溃恢复可能重复副作用；
+  // ⚠ #640 起本站没有 run snapshot，但**红色分级一字未动**，`checkpoint_before_tool` /
+  // `checkpoint_after_tool` 这两个 phase 仍是旧档案里要能显示的历史值）。
   it('run_end 分级（#212）：persistence_failed 红色 syserr，并显示 operation/phase/sideEffect', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);
@@ -370,7 +372,7 @@ describe('useEventStream（mock EventSource）', () => {
       usage: { input_tokens: 3, output_tokens: 5 },
     });
     expect(hooks.onSysErr).toHaveBeenCalledWith(
-      'run 结束：persistence_failed — 快照未落盘（崩溃恢复可能重复副作用） · 落盘细节 saveRunState/checkpoint_before_tool/not_started · tokens 3+5',
+      'run 结束：persistence_failed — 账本未落盘（崩溃恢复可能重复副作用） · 落盘细节 saveRunState/checkpoint_before_tool/not_started · tokens 3+5',
     );
     expect(hooks.onSep).not.toHaveBeenCalled(); // 关键：不是灰色分隔条
     expect(hooks.onCurrentRunEnd).toHaveBeenCalledTimes(1);
@@ -383,7 +385,7 @@ describe('useEventStream（mock EventSource）', () => {
     // 无 operation/phase/sideEffect（例如 final guard 分支）：只有标签，不出现「落盘细节」
     s.activeRunId.value = 'run-1';
     lastES().emit('run_end', { seq: 3, run_id: 'run-1', termination: { reason: 'persistence_failed' } });
-    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：persistence_failed — 快照未落盘（崩溃恢复可能重复副作用）');
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：persistence_failed — 账本未落盘（崩溃恢复可能重复副作用）');
     s.activeRunId.value = 'run-2';
     lastES().emit('run_end', { seq: 4, run_id: 'run-2', termination: { reason: 'final_guard_unverified', detail: 'guard retries exhausted' } });
     expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：final_guard_unverified — 终稿未经核验');
@@ -445,7 +447,7 @@ describe('useEventStream（mock EventSource）', () => {
       termination: { reason: 'persistence_failed', operation: 'markRunState', phase: 'checkpoint_after_tool', sideEffect: 'maybe_started' },
     });
     expect(hooks.onSysErr).toHaveBeenLastCalledWith(
-      'run ended: persistence_failed — run snapshot not persisted (side effects may repeat on resume) · persistence detail markRunState/checkpoint_after_tool/maybe_started',
+      'run ended: persistence_failed — run ledger not persisted (side effects may repeat on resume) · persistence detail markRunState/checkpoint_after_tool/maybe_started',
     );
     s.activeRunId.value = 'run-2';
     lastES().emit('run_end', { seq: 7, run_id: 'run-2', termination: { reason: 'final_guard_unverified' } });

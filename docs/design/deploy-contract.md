@@ -26,6 +26,11 @@
 > 镜像取值见 env §10；**生产部署对每个镜像最终以不可变引用锁定（issue #27 双轨两形态：① repo digest `image@sha256:…`；② image ID `sha256:<imageId>`，目标机本地 build 时 RepoDigests 为空），禁止浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。P1 开发期可暂用 `<major>.<minor>` 类 tag 并记录 resolved digest。
 >
 > **运行时强制范围（审计 #34 F-E）**：portal 启动时 fail-closed 校验的**只有 `FDE_IMAGE`**（`portal/src/config.js` F12，双轨两形态）。`PORTAL_IMAGE` / `POSTGRES_IMAGE` / `TRAEFIK_IMAGE` / `STATION_DOCKER_PROXY_IMAGE` 经 compose 变量注入，portal 进程内看不到其实际引用 → **不属运行时校验范围，由部署流程保证**；F12 本身是**形态门**（三类前缀 + 严格 `@sha256:<64hex>` 后缀），不做 docker reference 语法完备校验——引用合法性最终由 Docker 裁决（审计 #34 F-D）（部署记录留存 `docker inspect` 解析出的 digest，见 env 附录 B / runbook）。
+>
+> **compose 层的缺值闸门（#643）**：`STATION_PORTAL_IMAGE` / `STATION_DOCKER_PROXY_IMAGE` / `FDE_IMAGE`（后者同时填 proxy 的 `IMAGE_ALLOWLIST`）在 compose 里写 `${VAR:?}`，
+> **无缺省值**：没给值或给空值 ⇒ `up -d` 直接非零退出并点名变量。分层不重叠：compose 拦「没给」（因为 `deploy/.env` 不入库，带缺省值会静默换掉共享 dev 栈），
+> F12 拦「给的形态不对」（浮 tag / 伪 sha256 尾）。钉它们的判据：`portal/test/deploy-env-defaults.test.js`（文本形态）与
+> `test/deploy-compose-failclosed.test.js`（真 compose 行为）。
 
 | 服务 | 镜像 | tag pin 要求 | command（ENTRYPOINT/CMD） | 运行用户 | restart | 部署期 |
 |---|---|---|---|---|---|---|

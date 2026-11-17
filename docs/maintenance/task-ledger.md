@@ -8636,3 +8636,200 @@ M1: run:05beae2d-… → done + notifications「宏「跑完告诉我」」   �
   导致后续命令链静默失败）⇒ 清理与后续操作要分开两条命令。
 
 **待办**：#652（M7 产物正文，在跑）。修完后需再跑一次真机确认产物非空。
+
+### 8.162 事件平台收官：M1/M7 真机产出可用（产物 568 字节真实正文），以及「假自证」四连（2026-11-17，主 agent + erix_run × 3）
+
+接 §8.160 / §8.161。**#652 合并（`eec03f6`）后真机复验，M7 产出终于可用。**
+
+#### 真机终局证据（这是整轮的验收结论）
+
+```
+clock:2026-11-17 | done
+/srv/erix/users/eric/reports/每日巡检/2026-11-17.md   → 568 字节（之前 0）
+内容 = 该 run 的 assistant 正文：
+  「当前目录 ~/projects/hello-station 下有 14 个文件——4 个脚本 … 另有两个隐藏项 .git …
+    本轮为只读勘验，未做任何写入或修改。」
+```
+
+**M7 全链路首次产出可用**：评估循环 → clock tick → claim → 意图 → dispatcher →
+`executeScheduledIntent` → 宏会话复用 → `postMessage` 入队 → worker 真跑 →
+`pollRunTask` 等到终态 → 走读侧投影取正文 → 落用户可见挂载（中文名保留）。
+**M1 也已真机发出**（`run:<id>` 账 + `notifications` 一行）。
+
+环境已完全还原：容器回 GHCR digest pin（`sha256:3de136f0…`）、
+`eric` 的 `mail_otp_enabled` 回 `true`。
+
+---
+
+#### 本轮最值钱的东西：「假自证」四连
+
+四张单都写了「反向自证锚点」注释，**四条实测全是假的** —— 用例绿，但抓不到它们声称要抓的东西：
+
+| # | 声称 | 实测 | 病根 |
+|---|---|---|---|
+| 1 | 「把 `defaultRunTask` 改回空壳桩 ⇒ 本条红」 | **全绿** | 用例**注入** `runTask`，压根不走缺省 |
+| 2 | 「把缺省产物根改回 `os.homedir()` ⇒ 本条红」 | **全绿** | 用例**注入** `config.userSpaceRoot` |
+| 3 | #637 的 transcript 用例 | 绿 | 自己造 `run_id` 填好的行，线上 **97% 是 NULL** |
+| 4 | #652 修完后 HEAD 的 `#637①-4` | **红** | fixture 还是旧的不真实形状（这条是反过来暴露的） |
+
+⇒ **四条可复用口径（比这一批代码更值得带走）**：
+
+1. **凡 `x = default` 的参数，必须有一条「不传 x」的用例钉住缺省本身。**
+   注入式用例只能证明「注入的东西生效」，证明不了缺省。
+2. **凡「从表里读一行」的用例，fixture 必须复刻线上真实的列分布**（哪些列基本为 NULL）。
+   自己编一个「各列都填好」的行 = 给自己发绿卡。
+3. **判据要落在「用户最终看到的东西」上。** M7 的判据原本是「账上 `done`」，
+   而真该验的是「产物文件非空且内容正确」——**账上 done 与产出可用是两件事**。
+4. **执行体的「反向自证」声明必须被主 agent 亲手复跑一遍。**
+   四张单都声明做过，四次都抓不到。**声明不是证据。**
+
+#### 过程账
+
+- **#652 的工作树里留着未提交的变异**（`===== TEMP #652 反向自证 =====` 整段旧实现嵌在新函数里），
+  HEAD 干净但工作树脏。这是 §8.146 记的坑第二次出现。
+  ⇒ **口径不变：接手执行体产物前先 `git status` / `git diff`。**
+- **`transcript_rounds` 的形状知识是硬资产**：`run_id` 97% 为 NULL、
+  正文在 `record` 里、`messages.content` 对 assistant 恒空串、按 `transcript_key = sessionId` 存。
+  权威 fixture 形状在 `portal/test/fake-session-text.js:31` 的 `engineTranscriptRow`。
+  **以后任何读 transcript 的代码都先看那个文件**，别再自写 SQL。
+- **测试库被 worker 与我抢用导致多次假红**（`terminating connection`、跨文件污染）。
+  ⇒ 复验时用**自己起的库 + 自己端口**，别复用执行体的容器。
+
+#### 这一版事件平台的真实状态（诚实版）
+
+| 功能 | 状态 |
+|---|---|
+| M7 定时任务 | ✅ **真机产出可用**（产物 568 字节真实正文） |
+| M1 终态通知 | ✅ 真机发出（`run:<id>` 账 + notifications 行） |
+| M8 静默告警 | 代码通（tick 型 + digest 合并），**未真机验** |
+| M9 完成审查 | 触发源已接（#646），但 `defaultReviewRunner` **缺模型适配器** ⇒ 会落 `failed`（明确报错不留 pending），**未真机验** |
+| 管理台/用户面 UI | 真机验过渲染与交互（§8.158），订阅数已补（#613） |
+| 发版部署 | **未发版**；本轮验证用的是本地构建镜像，验完已还原 digest pin |
+
+**待办**：M9 的 reviewRunner 适配器、M8 真机验、发版（v0.1.73）。
+---
+
+### 8.163 `run_checkpoints` 整条竖切退役（#640，2026-11-17，worker 落地 + 变异自证；表由 `0041` 撤）
+
+**缘起**：#530（erix-agent 0.33.0，上游 #838 S2 删 run snapshot）拍的是 **D1 一律不动** —— 只摘能力申报，
+方法本体 / IPC 白名单 / agentd 路由 / portal 端点 / 那张表整条留给「另单」收尾。**本单就是那支另单。**
+0.33.0 源码现查：`saveRunSnapshot` / `loadLatestRunSnapshot` / `loadLatestCheckpoint` **零命中**，
+恢复只剩「账本 + `tool-executed` 恢复行」一条路（上游 `run-with-store.js` 里 `loadRunState()` 是唯一恢复读）。
+
+**撤表判据（真库 `station` 只读现查，2026-11-17 09:37）**：17 行 / `pg_total_relation_size` **565,248 B**
+（与 §8.126.2 记的 `0034` + `VACUUM FULL` 后那个读数**逐字相同**，⇒ 0.33 上线后零写入、体积也没漂）；
+`max(updated_at)` = **2026-11-11 01:32:41+00**（= 09:32:41 CST，早于 0.33 上线）；**零视图 / 零触发器 / 零外键入边**
+（`run_checkpoints_run_id_fkey` 里本站是 **child 端**，`confdeltype = a`）⇒ `DROP` 不会级联掉任何东西。
+撤前整表备份：`~/backups/run_checkpoints-pre-0041-261117-0937.sql.gz`（17 行，成本可忽略）。
+部署面：FDE 容器与 dev portal **已全部 0.33.0** ⇒ 现场不再有任何 writer，「旧 runner 还在写」这一条不成立。
+
+**编号更正（照例不覆盖旧读数）**：工单原文写「真库当前 head 是 0039 ⇒ 新迁移用 `0040`」——**真查 head =
+`0040-platform-prompts`**（`schema_migrations` 现查），本单落的是 **`0041`**。`0040` 那个号已被占，
+`portal/test/migrations.test.js` 里因此有一条**显式保留空洞**的断言（`RESERVED_MIGRATION_NUMS = {40}`）：
+不是漏号，是「已经用掉的号」；将来 `0040` 位置被历史件填上时，那条豁免必须删掉。
+
+**五刀**（每刀一个 commit，各自可回滚）：
+1. **runner**：删 `saveRunSnapshot` / `loadLatestRunSnapshot` 两个方法 + 每 run 的 `revision` 计数器 +
+   `checkpoint_stale` 那条「409 不重试」特例（它问的正是「快照账本有没有被更新的 revision 抢先落库」——
+   表没了问题就不成立）；IPC 白名单两个名字**换成反向断言**（`unknown store method` 且不发 HTTP）；
+   agentd 两条转发整段删除。`requestWithRetry` 的账本写重试不动（0.33.0 还在调的 append / load /
+   runstate / 恢复行照旧）。
+2. **portal**：四个 `/checkpoint*` 路由（run 侧 U8/U9 + session 侧两个）与 `internal.js` 四个函数
+   （`putCheckpoint` / `getLatestCheckpoint` / `putSessionCheckpoint` / `getSessionLatestCheckpoint`）全删。
+   ⚠ 常量 `INTERNAL_CHECKPOINT_LIMIT` **改名** `INTERNAL_LARGE_BODY_LIMIT` —— 不是顺手清理：`/runstate`
+   那两条 PUT 的 body 上限（2 MiB）复用它，「checkpoint」这个名字对还活着的路由是错的。
+   **新代码形状判据**：带**有效**内部认证打已删路径必须 `404 not_found`（**不是 500、不是 405**）——
+   500 意味着路由还在只是背后存储没了，正是 #579/#628 那种「半条路」的形状；判据在
+   `portal/test/http-runstate.test.js`，并带**反向**断言（同一请求打还活着的 `/runstate` / `/:key` 仍 200）。
+   `runState` / `runStateStatus` 落的是**另一张表**（`runs.run_state` / `chat_sessions.engine_run_state`），照旧。
+3. **`0041-retire-run-checkpoints.sql`**：`SET LOCAL lock_timeout = '5s';` + 一条
+   `DROP TABLE IF EXISTS public.run_checkpoints;` + 只读观测块。**无 `CASCADE`**（级联会静默带走没算到的依赖，
+   而「没有依赖」是撤前现查出来的事实，事实变了就该炸）、**无 `VACUUM`**（§8.126.1 那条：迁移 runner 每个文件
+   跑在单事务里，`VACUUM` 进事务块报 25001；此处也不需要 —— 磁盘要还给OS是部署侧的事，565 KB 量级）、
+   **无手写 `BEGIN/COMMIT`**（`portal/src/migrate.js` 自己 `BEGIN … COMMIT`）。四种写歪的形状（漏 `IF EXISTS` /
+   加 `CASCADE` / 夹 `VACUUM` / 手写事务边界）各有一条自测试（同一份守卫逻辑作用在变异文本上，理由见 §8.153 那条纪律）。
+   `docs/data/schema.sql` **冻结件照旧**（sha256 落库、旧库按它重放，改字 = 重放面漂移）；0006 / 0034 同冻结。
+   ⚠ `DROP` 顺带带走 `run_checkpoints_session_uidx`（0034 当年不敢撤它，因为它是 session 快照 `ON CONFLICT`
+   的目标 —— 写侧没了，索引跟着表走是对的）。
+4. **测试**：退役 `portal/test/prune-checkpoints-db.test.js`（它判的表没了；0034 的**文件形状**判据留在
+   `migrations.test.js`，冻结件仍被钉着）。`delta-not-persisted-db.test.js` 摘掉 `run_checkpoints` 那一半闸，
+   **但没有退化成空样本**：`run_events` 那条闸新加两道 —— ① 样本行数必须恰好等于种下去的行数
+   （`SEED_ROWS = 5000`，「查了个空」直接红），② **总字节下界**（实测 `n=5000 total=3,858,432 per_row=772`
+   ⇒ 取 `1,900,000`，约为实测一半的余量；只有每行均值闸的话，「空表 + 索引残留」也能满足「每行 < 4 KB」）。
+   `hardCompressible` 夹具与 `putCheckpoint` 播种一起删（它唯一的用途是给快照表种「压不动的样本」）。
+5. **口径**：`persistence_failed` 的**语义与红色 UI 不动**，只改措辞 —— 它问的是「这一轮的账本到底落盘没有」，
+   0.33.0 之后落的是 `transcript_rounds`（+ `transcript_recovery_rows`），快照表没了 ⇒ 英文
+   `run snapshot not persisted` → `run ledger not persisted`、中文 `快照未落盘` → `账本未落盘`，
+   崩溃恢复语义原样保留在下一格。**留着的同名物**（都不是这张表）：错误码 `checkpoint_failed`（仍在可重试
+   值域，旧档案的 `runs.error_code` / `termination.errorCode` 要按它读）、`persistence_error.phase` 的
+   `checkpoint_before_tool` / `checkpoint_after_tool`（旧事件仍带）、事件流的 `checkpoint` 事件类型、
+   run-state 里恒为 0 的 `deterministic.errors.checkpoint`、`/runstate` 的 2 MiB body 上限。
+
+**真机判据（临时 `postgres:16`，宿主 127.0.0.1:15511，用完 `docker rm -f`）**：全新空库跑完整条迁移链
+⇒ head = **41**（含 0041）、`to_regclass('public.run_checkpoints')` = **null**、`pg_indexes` 里那张表的
+0 条索引、裸 `DROP TABLE public.run_checkpoints` ⇒ **`42P01`**（证明「DROP 是真撤」，不是改名/不是留下空壳）；
+第二遍重放 rc=0（`IF EXISTS` 生效）。全新库的「表曾经存在」这一半是**现场重建**的：冻结 baseline 的建表语句
++ 0006 那两处改动在同一个 schema 里重放出来，量到 1 条主键索引 + 1 条 session 唯一索引 + 1 条 FK 入边
+（`run_checkpoints_run_id_fkey`）—— **全新库本来没有这张表**，不现场重建就证不出「0041 真的撤了它」。
+
+**门禁**：见本单 PR 描述里的 rc 表（全量含真库、前端、`check:agents-hotlayer`），0 红才算完。
+
+**一处口径提醒（给下一个读这段的人）**：别拿本单当「D1 可以随便推翻」的先例 —— D1 的「不动」是为了让
+#530 那批里**还活着**的 transcript / 账本改动不被顺手改到；本单做的前提是「**只剩死代码，没有任何活语义**」，
+判据是 0.33.0 源码零命中 + 真库零写入 + 零依赖，三样缺一样就该继续留着。
+
+### 8.164 #643 A+B：compose 三处镜像引用缺值即报错 + 本地构建自曝（2026-11-17，主 agent 设计 + pi worker ×3 + 主 agent 收尾）
+
+现场：共享 dev 栈的 `station-portal` 从 GHCR digest pin 掉回 `revision=unknown` 的本地构建
+（12:19 另一 session 又把它 `docker compose build` 成 `erix-station-portal:local`，实况仍在），
+`/api/health` 只报「未知」、界面只显示「未知」、日志一声不响。根因链在 issue #643：
+`deploy/.env` 是 gitignore 的、**worktree 里根本没有它**，而 compose 写的是 `${VAR:-fallback}`
+⇒ 谁在 worktree 里跑一次 `up -d`（**不带 `--build`**）就把共享栈换成 scratch 镜像。
+
+**A（`30920fd`）** 三处一起改 `${VAR:?…}`（`station-portal.image:130` /
+`station-docker-proxy.image:72` / `IMAGE_ALLOWLIST:98`+`FDE_IMAGE:281`，**同一条不变式拆两处**，
+只改 image 行的话「本地构建悄悄进 allowlist」这条根因还留着）：
+- **`.env.example` 的值刻意留空**：空串照样被 `:?` 拒（compose 把空值当没设）⇒ 复制模板不等于
+  拿到改共享栈的许可；文案写明「填了 = 你有意换镜像」+ 本地 scratch 的写法（`:local`，且必须 `--build`）。
+- 判据两条：`portal/test/deploy-env-defaults.test.js`（静态锁 5 条，无 docker 也能跑）+
+  `test/deploy-compose-failclosed.test.js`（**真调 compose 的行为锁** 6 条，缺 docker 才 skip）。
+- 变异 4 个（恢复 portal 回落 / 恢复 allowlist 回落 / 摘掉 `.env.example` 的登记 / 文案里去掉变量名）
+  ⇒ 分别红 4 / 2 / 1 / 1 条，全在具名用例上。
+
+**B（`bc1fa9a` + `47f5943`）** 本地构建自曝两条腿：
+- 启动 `warnIfLocalBuild()`（`cli.js` 在 `loadConfig()` 之后、`migrate()` 之前；migrate 失败会
+  `exit(1)`，喊晚了这份日志就没人看到）；`GET /api/admin/version` 加**顶层真布尔** `localBuild`
+  （不塞进 `server`：「每格都是字符串」那条不变式正被 `admin-version-panel.test.js` 钉着）。
+- **判别位只认 `revision`**：`builtAt` 是另一个 ARG，它单独缺不说明这份构建没身份
+  —— 拿它当判据会把真发布件报成本地构建（变异 M-b 就是这条，红 6 条）。
+- 前端**只搬不推**：三态（`true`/`false` 是真话，缺键 ⇒ `null` ⇒ 不渲染），
+  并带一条源码级红线「`localBuild` 那侧的判定表达式不许出现 `revision`」+ 一条地板防红线空转。
+- 判据：后端 `portal/test/local-build-surface.test.js` 9 条（含 `cli.js` 接线锁）、前端 8 条。
+  变异 7 个（恒 false / 判据换 builtAt / 摘掉调用 / 面板不输出 / 去掉 v-if / 前端自推 / `'true'` 当真）
+  ⇒ 全部红在具名用例，摘掉调用那条**恰红在接线锁**。
+
+**真机验证**（不打断共享栈：全程只跑一次性容器，`docker ps` 前后对比 `station-*` 一字未动）
+- A：worktree 里 `docker compose -f deploy/docker-compose.yml up -d` ⇒ **rc=1**，stderr 点名
+  `STATION_PORTAL_IMAGE` 与服务路径；拿运维真 `.env` 现跑 ⇒ rc=0（正常部署没被拦）。
+- B：同一棵工作树构两份镜像 —— 不传 `STATION_REVISION` ⇒ 启动日志恰 1 条
+  `[version] local-build revision=unknown …`，端点 `localBuild=true`；传了 ⇒ **0 条**、`localBuild=false`。
+  `/api/health` 三格形状两次都没变（#586 的形状没动）。一次性容器/网络/镜像已全部清掉。
+
+**口径与坑（下次照抄）**
+- `--env-file <空文件>` 才能压掉 compose 的**自动装载**（`--project-directory` 不改装载点）；
+  行为锁必须显式给，否则本机有 `.env` 就测不出缺失、CI 又没 docker ⇒ 静态锁兜底。
+- `docker compose config` 在 `DOCKER_HOST` 是死的 tcp 端点时**照样 rc=0**（config 不连 daemon），
+  所以读 ops `.env` 做正向验不需要活的 docker 上下文，也不会误建容器。
+- compose 一次只报**第一个**插值错误，而 `FDE_IMAGE` 有两处、求值顺序未定义 ⇒
+  行为锁对「两处都点名」只采样取证（首轮只看到 `services.station-portal.environment.FDE_IMAGE`），
+  不把顺序写成断言。
+- 工单写「测试放 `test/`」时注意仓库**实际有 `test/` 与 `portal/test/` 两处**（#586 的先例在后者）：
+  A 那条按工单落 `test/`（它测的是 compose 本身，不碰 portal 源码），B 落 `portal/test/`。
+- **`ui` 腿留给下次发布件部署**：本单的面板标注只到 spec 层（真机面板要看的是带 `localBuild`
+  的端点 + 真镜像，共享栈现在是别人的本地构建，不该为验证去换它）。
+  复验命令：`PORTAL_URL=… E2E_UI_BASE=… node portal/integration/version-surface-e2e.mjs`。
+- 基线：主套件 2811 →（A）2820 →（B）2829，skipped 恒 83，rc=0；
+  前端 1644 → 1652（`NODE_ENV=` 跑，rc=0），`npm run typecheck` rc=0。
+
+**没做的**：C（advisory lock，#635 写侧已落、缺读侧对账 + 存量回填）本轮按用户指令**未动**，
+issue #643 保持 OPEN 并在单下留了口径。
