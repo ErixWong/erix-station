@@ -144,7 +144,7 @@ materializer 在 `buildFilePlan` 里新增一条（root:root 0644，与 `config.
    `runner/test/system-prompt.test.js` 的防漂移断言。
 4. **审查 run 继续不给技能**（#537）；delegation 子 run 继续不含技能。
 
-## 7. API 契约（`docs/api/portal.md` 新增 §4.16）
+## 7. API 契约（`docs/api/portal.md` 新增 §4.17）
 
 管理面（`/api/admin/market/*`，管理台入口专属）：
 
