@@ -1745,7 +1745,7 @@ function collectRoundText(row) {
 //
 // erix-agent 0.33.0（上游 #838 S2，本站 #530）不再读写 run snapshot ⇒ `putCheckpoint` /
 // `getLatestCheckpoint` / `putSessionCheckpoint` / `getSessionLatestCheckpoint` 四个函数、
-// 四个 `/checkpoint*` 端点、agentd 的四条转发与 `run_checkpoints` 表（迁移 `0041` DROP）同批删除。
+// 四个 `/checkpoint*` 端点、agentd 的四条转发与那张快照表（迁移 `0041` DROP）同批删除。
 // 旧 agentd 若还在打这些路径，拿到的是 **404 `not_found`**（见 http.js 的分支注释）。
 // ---------------------------------------------------------------------------
 

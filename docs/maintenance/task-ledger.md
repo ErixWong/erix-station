@@ -8553,3 +8553,73 @@ M1: run:05beae2d-… → done + notifications「宏「跑完告诉我」」   �
   导致后续命令链静默失败）⇒ 清理与后续操作要分开两条命令。
 
 **待办**：#652（M7 产物正文，在跑）。修完后需再跑一次真机确认产物非空。
+---
+
+### 8.162 `run_checkpoints` 整条竖切退役（#640，2026-11-17，worker 落地 + 变异自证；表由 `0041` 撤）
+
+**缘起**：#530（erix-agent 0.33.0，上游 #838 S2 删 run snapshot）拍的是 **D1 一律不动** —— 只摘能力申报，
+方法本体 / IPC 白名单 / agentd 路由 / portal 端点 / 那张表整条留给「另单」收尾。**本单就是那支另单。**
+0.33.0 源码现查：`saveRunSnapshot` / `loadLatestRunSnapshot` / `loadLatestCheckpoint` **零命中**，
+恢复只剩「账本 + `tool-executed` 恢复行」一条路（上游 `run-with-store.js` 里 `loadRunState()` 是唯一恢复读）。
+
+**撤表判据（真库 `station` 只读现查，2026-11-17 09:37）**：17 行 / `pg_total_relation_size` **565,248 B**
+（与 §8.126.2 记的 `0034` + `VACUUM FULL` 后那个读数**逐字相同**，⇒ 0.33 上线后零写入、体积也没漂）；
+`max(updated_at)` = **2026-11-11 03:30:15**（早于 0.33 上线）；**零视图 / 零触发器 / 零外键入边**
+（`run_checkpoints_run_id_fkey` 里本站是 **child 端**，`confdeltype = a`）⇒ `DROP` 不会级联掉任何东西。
+撤前整表备份：`~/backups/run_checkpoints-pre-0041-261117-0937.sql.gz`（17 行，成本可忽略）。
+部署面：FDE 容器与 dev portal **已全部 0.33.0** ⇒ 现场不再有任何 writer，「旧 runner 还在写」这一条不成立。
+
+**编号更正（照例不覆盖旧读数）**：工单原文写「真库当前 head 是 0039 ⇒ 新迁移用 `0040`」——**真查 head =
+`0040-platform-prompts`**（`schema_migrations` 现查），本单落的是 **`0041`**。`0040` 那个号已被占，
+`portal/test/migrations.test.js` 里因此有一条**显式保留空洞**的断言（`RESERVED_MIGRATION_NUMS = {40}`）：
+不是漏号，是「已经用掉的号」；将来 `0040` 位置被历史件填上时，那条豁免必须删掉。
+
+**五刀**（每刀一个 commit，各自可回滚）：
+1. **runner**：删 `saveRunSnapshot` / `loadLatestRunSnapshot` 两个方法 + 每 run 的 `revision` 计数器 +
+   `checkpoint_stale` 那条「409 不重试」特例（它问的正是「快照账本有没有被更新的 revision 抢先落库」——
+   表没了问题就不成立）；IPC 白名单两个名字**换成反向断言**（`unknown store method` 且不发 HTTP）；
+   agentd 两条转发整段删除。`requestWithRetry` 的账本写重试不动（0.33.0 还在调的 append / load /
+   runstate / 恢复行照旧）。
+2. **portal**：四个 `/checkpoint*` 路由（run 侧 U8/U9 + session 侧两个）与 `internal.js` 四个函数
+   （`putCheckpoint` / `getLatestCheckpoint` / `putSessionCheckpoint` / `getSessionLatestCheckpoint`）全删。
+   ⚠ 常量 `INTERNAL_CHECKPOINT_LIMIT` **改名** `INTERNAL_LARGE_BODY_LIMIT` —— 不是顺手清理：`/runstate`
+   那两条 PUT 的 body 上限（2 MiB）复用它，「checkpoint」这个名字对还活着的路由是错的。
+   **新代码形状判据**：带**有效**内部认证打已删路径必须 `404 not_found`（**不是 500、不是 405**）——
+   500 意味着路由还在只是背后存储没了，正是 #579/#628 那种「半条路」的形状；判据在
+   `portal/test/http-runstate.test.js`，并带**反向**断言（同一请求打还活着的 `/runstate` / `/:key` 仍 200）。
+   `runState` / `runStateStatus` 落的是**另一张表**（`runs.run_state` / `chat_sessions.engine_run_state`），照旧。
+3. **`0041-retire-run-checkpoints.sql`**：`SET LOCAL lock_timeout = '5s';` + 一条
+   `DROP TABLE IF EXISTS public.run_checkpoints;` + 只读观测块。**无 `CASCADE`**（级联会静默带走没算到的依赖，
+   而「没有依赖」是撤前现查出来的事实，事实变了就该炸）、**无 `VACUUM`**（§8.126.1 那条：迁移 runner 每个文件
+   跑在单事务里，`VACUUM` 进事务块报 25001；此处也不需要 —— 磁盘要还给OS是部署侧的事，565 KB 量级）、
+   **无手写 `BEGIN/COMMIT`**（`portal/src/migrate.js` 自己 `BEGIN … COMMIT`）。四种写歪的形状（漏 `IF EXISTS` /
+   加 `CASCADE` / 夹 `VACUUM` / 手写事务边界）各有一条自测试（同一份守卫逻辑作用在变异文本上，理由见 §8.153 那条纪律）。
+   `docs/data/schema.sql` **冻结件照旧**（sha256 落库、旧库按它重放，改字 = 重放面漂移）；0006 / 0034 同冻结。
+   ⚠ `DROP` 顺带带走 `run_checkpoints_session_uidx`（0034 当年不敢撤它，因为它是 session 快照 `ON CONFLICT`
+   的目标 —— 写侧没了，索引跟着表走是对的）。
+4. **测试**：退役 `portal/test/prune-checkpoints-db.test.js`（它判的表没了；0034 的**文件形状**判据留在
+   `migrations.test.js`，冻结件仍被钉着）。`delta-not-persisted-db.test.js` 摘掉 `run_checkpoints` 那一半闸，
+   **但没有退化成空样本**：`run_events` 那条闸新加两道 —— ① 样本行数必须恰好等于种下去的行数
+   （`SEED_ROWS = 5000`，「查了个空」直接红），② **总字节下界**（实测 `n=5000 total=3,858,432 per_row=772`
+   ⇒ 取 `1,900,000`，约为实测一半的余量；只有每行均值闸的话，「空表 + 索引残留」也能满足「每行 < 4 KB」）。
+   `hardCompressible` 夹具与 `putCheckpoint` 播种一起删（它唯一的用途是给快照表种「压不动的样本」）。
+5. **口径**：`persistence_failed` 的**语义与红色 UI 不动**，只改措辞 —— 它问的是「这一轮的账本到底落盘没有」，
+   0.33.0 之后落的是 `transcript_rounds`（+ `transcript_recovery_rows`），快照表没了 ⇒ 英文
+   `run snapshot not persisted` → `run ledger not persisted`、中文 `快照未落盘` → `账本未落盘`，
+   崩溃恢复语义原样保留在下一格。**留着的同名物**（都不是这张表）：错误码 `checkpoint_failed`（仍在可重试
+   值域，旧档案的 `runs.error_code` / `termination.errorCode` 要按它读）、`persistence_error.phase` 的
+   `checkpoint_before_tool` / `checkpoint_after_tool`（旧事件仍带）、事件流的 `checkpoint` 事件类型、
+   run-state 里恒为 0 的 `deterministic.errors.checkpoint`、`/runstate` 的 2 MiB body 上限。
+
+**真机判据（临时 `postgres:16`，宿主 127.0.0.1:15511，用完 `docker rm -f`）**：全新空库跑完整条迁移链
+⇒ head = **41**（含 0041）、`to_regclass('public.run_checkpoints')` = **null**、`pg_indexes` 里那张表的
+0 条索引、裸 `DROP TABLE public.run_checkpoints` ⇒ **`42P01`**（证明「DROP 是真撤」，不是改名/不是留下空壳）；
+第二遍重放 rc=0（`IF EXISTS` 生效）。全新库的「表曾经存在」这一半是**现场重建**的：冻结 baseline 的建表语句
++ 0006 那两处改动在同一个 schema 里重放出来，量到 1 条主键索引 + 1 条 session 唯一索引 + 1 条 FK 入边
+（`run_checkpoints_run_id_fkey`）—— **全新库本来没有这张表**，不现场重建就证不出「0041 真的撤了它」。
+
+**门禁**：见本单 PR 描述里的 rc 表（全量含真库、前端、`check:agents-hotlayer`），0 红才算完。
+
+**一处口径提醒（给下一个读这段的人）**：别拿本单当「D1 可以随便推翻」的先例 —— D1 的「不动」是为了让
+#530 那批里**还活着**的 transcript / 账本改动不被顺手改到；本单做的前提是「**只剩死代码，没有任何活语义**」，
+判据是 0.33.0 源码零命中 + 真库零写入 + 零依赖，三样缺一样就该继续留着。

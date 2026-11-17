@@ -45,7 +45,7 @@ export const MSG = {
  *
  * ⚠ **`saveRunSnapshot` / `loadLatestRunSnapshot` 已随 issue #640 整条删除**（erix-agent 0.33.0 起引擎
  * 不再调它们，上游 `OPTIONAL_CAPABILITIES` 也已删掉 `runSnapshot` 这个能力名）——不是「暂时摘申报」，
- * 是 IPC 白名单 / agentd 路由 / portal 端点 / `run_checkpoints` 表一起退役。
+ * 是 IPC 白名单 / agentd 路由 / portal 端点 / 快照表一起退役。
  *
  * issue #500（erix-agent 0.32/0.33 的**账本恢复行**三件套）：`appendRecoveryRow` / `listRecoveryRows` /
  * `clearRecoveryRows` 都是引擎侧**可选**方法，本站全实现。**三个必须同进同出**：引擎按方法名单独探测，

@@ -123,7 +123,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | **DB** | 不直连（无凭据） | 不直连 | **唯一业务写方**（D1'） |
 | **任务** | claim 长轮询领任务；lease 续期（随心跳）；准备工作（项目目录）；认领失败 release；**run 终态产物捕获上传（U13，issue #64，§6.6）** | 跑 `runToolLoop`；组装引擎参数（provider/tools/store/task） | 入队（`run_queue`）；租约判定与 re-claim；状态收敛 |
 | **事件** | 批量（250ms/2KB）、重试、顺序保证、spool 兜底 | 引擎回调 → IPC 即发（不批量） | 分配 seq、写 `run_events`、SSE 广播 |
-| **transcript/checkpoint** | store_request 的无状态转发（加 Authorization） | `TranscriptStore` HTTP adapter（IPC 版）的调用方 | 端点落 `transcript_rounds` / `run_checkpoints` |
+| **transcript**（~~/checkpoint~~ 已退役，#640） | store_request 的无状态转发（加 Authorization） | `TranscriptStore` HTTP adapter（IPC 版）的调用方 | 端点落 `transcript_rounds`（快照表随 #640 撤，见 §9.1 注与 §9.2） |
 | **审批** | 中转：worker await ↔ portal 审批单；SSE 快通道 + 轮询兜底；10min 超时拒绝 | 在 `executeTool` 包装层发起并 await；收到拒绝则返回 tool_result「被拒绝」 | 审批单 CRUD、决定写库、SSE 下发 |
 | **停止** | SSE `stop_request` / 心跳兜底 → IPC `abort` | `AbortController.abort()` → 引擎收敛 `aborted`（`src/loop.js:712-717`） | 写 `cancel_requested_at`；发 SSE；心跳响应兜底 |
 | **进程** | fork/kill worker；孤儿清理 | 单 run 生命周期 | Docker API 管容器 |
@@ -605,8 +605,10 @@ worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → ag
 > ⚠ **erix-agent 0.33.0（issue #530 / 上游 #838）对本表的两处事实变更（表体暂不动，理由见下）**：
 > ① **`saveRunSnapshot` / `loadLatestRunSnapshot` 两行自 0.33.0 起引擎不再调用**（run snapshot 退役，
 >    恢复只靠账本）⇒ 这两行、`ipc.js` 白名单、agentd 路由、portal internal 两个端点与
->    `run_checkpoints` 表现在是**死代码**（不报错，但无人调）。本单按已拍板的 **D1 一律不动**，
->    连同清存量一起留给另单一次性退役；在那之前本表仍是本站 store 的真实方法面。
+>    快照表当时是**死代码**（不报错，但无人调）。#530 拍的是 **D1 一律不动**（先摘申报、
+>    本体另单收尾）⇒ **那条「另单」已经落地：issue #640 把两行、`ipc.js` 白名单、agentd 路由、
+>    portal 四个 internal 端点与那张表（迁移 `0041` DROP）整条删掉了**。下面表体里那两行快照方法
+>    因此**只剩历史**（保留是为了让旧日志/旧档案里的名字还能对上），不再是方法面。
 > ② **上游契约套件里的能力名 `runSnapshot` 已删除**（现查 0.33.0 `test/contract/transcript-store.js`：
 >    `OPTIONAL_CAPABILITIES` 只剩 `runState` / `runStateStatus` / `rawRows` / `fastPathProbes`）
 >    ⇒ `runner/test/store-contract.test.js` 的 `optionalCapabilities` 已摘掉 `runSnapshot`
@@ -619,8 +621,8 @@ worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → ag
 | `load(runId)` | `load` | U6 `GET .../transcript` | 读 `transcript_rounds` 按 `(round, append_seq)` 升序（#338 的真 keyset 游标 + agentd 翻页拉齐全量） | 只读；**返回前必须做读侧折叠**（`runner/lib/transcript-fold.js`，#351：上游 0.23 把消息行折回轮行是 **store 的 `load()` 职责**，引擎只 `foldLedgerMessages` 不做载体折叠） |
 | `recall(runId, from?, to?, pattern?)` | `recall` | U7 `GET .../transcript/recall` | 读 `transcript_rounds`（含 `folded_payload`，对齐上游「折叠原文同属档案」`src/store/file.js:252-261`） | 只读 |
 | `markRunState(runId, state)` | `markRunState` | `running` → U2 `PUT .../state`；其他状态 → `PUT .../runstate {state}` | 终态仍走既有写路径，portal 写入独立 `runs.run_state_status` / `chat_sessions.engine_run_state_status`；只读另走 `GET .../runstate/status` | 覆盖写；不合并进 run-state JSONB |
-| `saveRunSnapshot(runId, snapshot)` | `saveRunSnapshot` | U8 `PUT .../checkpoint` | `run_checkpoints` | **单行 latest-only 覆盖写 + revision CAS**；旧 revision 被拒（§9.5）；`seq` 仅调用方本地元数据、不落库 |
-| `loadLatestRunSnapshot(runId)` | `loadLatestRunSnapshot` | U9 `GET .../checkpoint/latest` | 直接取最新行；返回 `{snapshot, revision, updated_at}`；无 → `204` → adapter 返回 `undefined`（revision 供 resume 续计，§9.5） | 只读 |
+| ~~`saveRunSnapshot(runId, snapshot)`~~ | ~~`saveRunSnapshot`~~ | ~~U8 `PUT .../checkpoint`~~ | ~~快照表~~ | **已随 #640 整条删除**（0.33.0 引擎不再调）。历史语义备查：单行 latest-only 覆盖写 + revision CAS，`seq` 仅本地元数据 |
+| ~~`loadLatestRunSnapshot(runId)`~~ | ~~`loadLatestRunSnapshot`~~ | ~~U9 `GET .../checkpoint/latest`~~ | 同上 | **已随 #640 删除**；恢复只靠账本（`transcript_rounds` + `transcript_recovery_rows`） |
 | `saveRunState(runId, runState)` | `saveRunState` | `PUT .../runstate {run_state}` | `runs.run_state` / `chat_sessions.engine_run_state` JSONB 合并写；过滤顶层 `state`，并入 `runId`（reference 语义 = 上游 file store） | 合并写 |
 | `loadRunState(runId)` | `loadRunState` | `GET .../runstate` | 读快照 JSONB；无 → `204` → adapter 返回 `undefined` | 只读；legacy 快照内的 `state` 保留可读 |
 | `loadRunStateStatus(runId)` | `loadRunStateStatus` | `GET .../runstate/status` | 读 `run_state_status` / `engine_run_state_status`；缺失时回退 legacy 快照 `state`，损坏记录抛错 | 只读；portal 响应含 `status.status`，adapter 返回状态字符串 |
@@ -653,9 +655,13 @@ D2' 纯 DB 意味着 portal/DB 抖动会直接传导到引擎的 fail-closed（�
 | 退避 | 1s → 2s → 5s（指数，±20% 抖动） |
 | 可重试错误 | 网络错误、5xx、429；`checkpoint_failed` 语义上可重试（规格 §9.3-2） |
 | 不可重试 | 4xx（`validation_failed` / `lease_lost` / `run_terminal` 之外的）→ 直接抛 |
-| 耗尽 | 错误透传引擎 → `checkpoint_failed` → run 失败，用户口径见 portal.md §6.2（「进度未丢失，可重新发送继续」） |
+| 耗尽 | 错误透传引擎 → ~~`checkpoint_failed`~~ → run 失败，用户口径见 portal.md §6.2（「进度未丢失，可重新发送继续」）。⚠ **时间边界（erix-agent 0.33.0 + 本站 #640）**：这套重试现在服务的是**账本写**（`appendRound` / `saveRunState` / 恢复行），`checkpoint_failed` 只作为**旧档案的错误码**留在可重试值域里（`runner/lib/termination.js` 写明理由），新 run 不再产出它 |
 
-> **A3 定稿：`checkpoint_failed` 是终态、不自动 re-claim**。它产生于 worker（`runToolLoop` fail-closed 抛错，adapter 3 次重试耗尽后透传），经 agentd U2 终态上报 `failed`（`error.code='checkpoint_failed', retryable=true`）；**不是**进程崩溃，因此不走 §6.4 的 release/re-claim——存储故障持续时 re-claim 只会原地重演。恢复时 checkpoint 取**最新已持久化那一份**（U9 返回的 `snapshot+revision`），失败的那次 save 未落库、不改变 `run_checkpoints.revision`；需「存储恢复 + 用户重发」（本期无跨 run resume，方案 A 不做）。完整口径见 model.md §2.9。
+> ⚠ **下面这段 A3 是历史口径**（erix-agent 0.33.0 起 run snapshot 退役、本站 #640 撤表）：
+> 句子本身留着，因为**旧档案的 `runs.error_code` / `termination.errorCode` 里写着它**，重试判定要按它读；
+> 但新 run 的同类失败现在叫 `persistence_failed`（落的是账本写失败）。
+>
+> **A3 定稿：`checkpoint_failed` 是终态、不自动 re-claim**。它产生于 worker（`runToolLoop` fail-closed 抛错，adapter 3 次重试耗尽后透传），经 agentd U2 终态上报 `failed`（`error.code='checkpoint_failed', retryable=true`）；**不是**进程崩溃，因此不走 §6.4 的 release/re-claim——存储故障持续时 re-claim 只会原地重演。恢复时 checkpoint 取**最新已持久化那一份**（U9 返回的 `snapshot+revision`），失败的那次 save 未落库、不改变快照表的 `revision`；需「存储恢复 + 用户重发」（本期无跨 run resume，方案 A 不做）。完整口径见 model.md §2.9。
 
 ### 9.3 transcript round 幂等
 
@@ -674,14 +680,19 @@ D2' 纯 DB 意味着 portal/DB 抖动会直接传导到引擎的 fail-closed（�
 
 **问题**：U8 曾接收 `seq` 但不落库，单行覆盖写无版本约束 → **延迟到达的旧快照会覆盖新快照**（分区/重试乱序时）。
 
-**规则**：`run_checkpoints` 加 `revision bigint NOT NULL DEFAULT 0`（单调 CAS 版本）；U8 请求带 `revision`（worker 每 run 从 0 递增），portal 落库用：
+> ⚠ **本节整条随 issue #640 退役**（快照表已由迁移 `0041` DROP，U8/U9 端点已删）。留着是因为
+> 「revision CAS」这套说法还在旧 ledger、旧事件载荷与旧 runner 日志里被引用 —— **历史读法**，不是现状。
+> 现在的单调性真相在账本侧：`transcript_rounds.append_seq`（迁移 0016）与 `run_events.seq`。
+
+**规则（历史）**：快照表当年加 `revision bigint NOT NULL DEFAULT 0`（单调 CAS 版本）；U8 请求带 `revision`（worker 每 run 从 0 递增），portal 落库用的形状：
 
 ```sql
-INSERT INTO run_checkpoints (run_id, snapshot, revision, updated_at)
+-- 历史形状；表已由 0041 撤，DDL 原文见 deploy/migrations/0006-session-transcript.sql
+INSERT INTO <快照表> (run_id, snapshot, revision, updated_at)
 VALUES ($1, $2, $3, now())
 ON CONFLICT (run_id) DO UPDATE
   SET snapshot = EXCLUDED.snapshot, revision = EXCLUDED.revision, updated_at = now()
-  WHERE run_checkpoints.revision < EXCLUDED.revision;  -- 旧 revision 0 行更新 → 409 checkpoint_stale
+  WHERE <快照表>.revision < EXCLUDED.revision;  -- 旧 revision 0 行更新 → 409 checkpoint_stale
 ```
 
 - **旧快照被拒**：`revision <= 当前值` 时 `DO UPDATE ... WHERE` 不命中（0 行更新）→ portal 返回 `409 checkpoint_stale`；worker 侧视为「本快照已过期」，**不重试**（继续以最新为准）。
@@ -860,7 +871,7 @@ FDE 浏览器        portal                agentd               worker（execute
 |---|---|
 | 组件职责 / 网络 / 容器模板 | [规格](fde-platform.md) §4 / §5 / §12 |
 | 事件流与 SSE 语义（事件信封 13 类、Last-Event-ID） | [portal.md](../api/portal.md) §5；规格 §10 |
-| 数据表（runs / run_queue / run_events / transcript_rounds / run_checkpoints / approvals / containers） | [model.md](../data/model.md) §1；[schema.sql](../data/schema.sql) |
+| 数据表（runs / run_queue / run_events / transcript_rounds / transcript_recovery_rows / approvals / containers；~~快照表~~ 已由 `0041` 撤） | [model.md](../data/model.md) §1；[schema.sql](../data/schema.sql) |
 | 状态机基线（runs / queue / approvals） | [model.md](../data/model.md) §2 |
 | 三份数据边界（messages / transcript / events 不混） | 规格 §9.2；[model.md](../data/model.md) §3 |
 | 错误语义（`checkpoint_failed` / `rate_limited` / `container_exited`） | [portal.md](../api/portal.md) §6 |
@@ -880,7 +891,7 @@ FDE 浏览器        portal                agentd               worker（execute
 | R8 | model.md §3「谁写」表 | 「runner 回写 assistant 回复」在 D1' 下实为 runner 上报、**portal 落库** | 措辞对齐 |
 | R9 | 上游行号引用 | 各文档原混用 v0.3.4 / v0.3.5 行号 | ✅ 已统一：全部按 v0.3.5（本地 HEAD 1a511eb）实测标注 |
 | R10 | 本文 §1.3/§5/§6.3/§11/§13 及 fde-platform.md §11 / env.md §6 | 「LLM 虚拟 key 文件注入容器（`apiKeyFile`）」已按 H-B D-4 作废：容器内零 LLM 凭据（占位 key + `endpoint=https://llm.<base>/v1`），真实虚拟 key 只存在于宿主 Traefik 动态配置（600） | 已对齐（本文 + fde-platform.md + env.md 均已注明作废；schema.sql 无 LLM 凭据列，无需改动） |
-| R11 | schema.sql `run_checkpoints`（每 run 单行，无 `seq` 列） | 本文 §4.2 U8/§9.1 曾写 `UPSERT (run_id, seq)` / `ORDER BY seq`，与 schema 单行覆盖写矛盾 | ✅ 已改：统一为 `ON CONFLICT (run_id) DO UPDATE`；并新增 `revision` 列 + CAS（`WHERE revision < EXCLUDED.revision`，§9.5）；`seq` 仅调用方本地元数据、不落库（portal.md §9.8 已同步 revision） |
+| R11 | schema.sql 快照表（每 run 单行，无 `seq` 列；原名见冻结 baseline） | 本文 §4.2 U8/§9.1 曾写 `UPSERT (run_id, seq)` / `ORDER BY seq`，与 schema 单行覆盖写矛盾 | ✅ 已改：统一为 `ON CONFLICT (run_id) DO UPDATE`；并新增 `revision` 列 + CAS（`WHERE revision < EXCLUDED.revision`，§9.5）；`seq` 仅调用方本地元数据、不落库（portal.md §9.8 已同步 revision） |
 | R12 | portal.md §9.5（U4 heartbeat） | 请求 `runs[]` 缺 `claim_token`；响应无 run 级部分失败 | 本文 §4.2 已写清应改成什么样：请求 `runs[].claim_token`；响应加 `runs[]`（`lease: renewed / lease_lost`）+ `revoked` 字段保留（恒 false）。**修订（审计 #34 F-C）**：`lease_lost` 为 run 级、仍在 `200` 内表达（非 HTTP 错误）；`revoked`（容器级吊销）**不在 `200` 内表达**——由鉴权阶段 `401 token_revoked` 给出（SSE/claim/heartbeat 三径同源）。✅ 已转派：portal.md §9.5 已同步 |
 | R13 | portal.md §9.8（U8/U9 checkpoint） | 请求/响应无 `revision`；`seq` 口径过时 | U8 请求 `{revision, snapshot}`、响应 `200`/`409 checkpoint_stale`；U9 响应 `{checkpoint: {snapshot, revision, updated_at}}`；`seq` 仅本地元数据。✅ 已转派：portal.md §9.8 已同步 |
 | R14 | portal.md §9.4（U3 事件） | `client_event_id` 格式 `run_id:计数` 无 attempt 前缀 | 改为 `run_id:attempt:计数`（attempt 从 claim ticket `run.attempt` 下发）；事件排序/attempt 语义见本文 §7.3。✅ 已转派：portal.md §9.4 已同步 |
