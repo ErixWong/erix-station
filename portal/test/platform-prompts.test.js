@@ -1333,6 +1333,58 @@ function apiSectionOf(doc, num) {
   return lines.slice(start, end).join('\n');
 }
 
+// —— 判据 `D1` 第④项用的两件小工具：全仓文本文件清单 + 「指向某一节的引用」扫描 ——
+
+const SCAN_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'coverage']);
+const SCAN_EXTS = new Set(['.md', '.js', '.mjs', '.cjs', '.ts', '.vue', '.sql', '.yml', '.yaml',
+  '.example', '.sh', '.txt']);
+const SCAN_SKIP_NAMES = new Set(['package-lock.json']);
+
+/** 仓库里的文本文件（`{name: 相对路径, text: 全文}`）；跳过依赖目录、lockfile 与二进制。 */
+function repoTextFiles(rootUrl) {
+  const root = fileURLToPath(rootUrl);
+  const out = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (SCAN_SKIP_DIRS.has(e.name) || SCAN_SKIP_NAMES.has(e.name)) continue;
+      const abs = path.join(dir, e.name);
+      if (e.isDirectory()) { walk(abs); continue; }
+      if (!SCAN_EXTS.has(path.extname(e.name)) && e.name !== 'Dockerfile') continue;
+      let text = null;
+      try { text = fs.readFileSync(abs, 'utf8'); } catch { continue; }
+      out.push({ name: path.relative(root, abs).split(path.sep).join('/'), text });
+    }
+  };
+  walk(root);
+  return out;
+}
+
+/**
+ * 扫「指向 `docs/api/portal.md §<number>` 的**引用**」。
+ * 只认引用形态（同一行出现 `portal.md … §N.N` 或「见/详见/契约/口径/contract … §N.N」），
+ * 白话提及（「当年 §4.16 一度有两个标题」）不算；`ownerRe` 命中的行豁免（那一节真正的主人）。
+ * 只扫正文里提到 `subjectRe` 的文件。返回 `['path:line: 原文', …]`。
+ */
+function stalePortalSectionRefs({ files, number, subjectRe, ownerRe }) {
+  const num = number.replace(/\./g, '\\.');
+  const forms = [
+    new RegExp(`portal\\.md[^\\n]*§\\s*${num}\\b`),
+    new RegExp(`(?:见|詳见|详见|契约|口径|contract)[^\\n]*§\\s*${num}\\b`),
+  ];
+  const bare = new RegExp(`§\\s*${num}\\b`);
+  const hits = [];
+  for (const f of files) {
+    if (!subjectRe.test(f.text)) continue;
+    f.text.split('\n').forEach((line, i) => {
+      if (!bare.test(line)) return;
+      if (!forms.some((re) => re.test(line))) return;
+      if (ownerRe && ownerRe.test(line)) return;
+      hits.push(`${f.name}:${i + 1}: ${line.trim().slice(0, 100)}`);
+    });
+  }
+  return hits;
+}
+
 // ---------------------------------------------------------------------------
 // 7. `D1` 两头说法：代码里的旋钮 / 端点 / DTO 键，文档必须同步点名
 // ---------------------------------------------------------------------------
@@ -1388,4 +1440,39 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
   const codeTable = apiDoc.slice(apiDoc.indexOf('### 1.2 通用错误码'), apiDoc.indexOf('### 1.3'));
   assert.ok(codeTable.length > 200, '通用错误码那一节必须还在（切片要用它当基线）');
   assert.doesNotMatch(codeTable, /prompt/i, '§1.2 不许出现提示词专用的新错误码（本单**零新码**）');
+
+  // ④ **§号口径**：提示词面板是 §4.18。凡提到 `platform_prompts` 的文件，正文里都不许留下
+  //    指向 `§4.16` 的**引用**（§4.16 现在是 #586 的管理台「关于」面板）。漏改的现场就在
+  //    `deploy/.env.example`：`PLATFORM_PROMPTS_READ_TIMEOUT_MS` 那行的文档指引，在本单把它换
+  //    成 4.18 之前指的就是邻居那一节（评审 R4）。本格子自己的注释也**不写成引用形态**，
+  //    否则这条闸会扫到自己 —— `ownerRe` 只豁免 4.16 那一节现在真正的主人（#586）。
+  //    白话提及（不带 `portal.md`、不带「见/契约/口径」那种）不算引用，不受这条约束。
+  const stale = stalePortalSectionRefs({
+    files: repoTextFiles(new URL('../..', import.meta.url)),
+    number: '4.16',
+    subjectRe: /platform_prompts|PLATFORM_PROMPTS/,
+    ownerRe: /#586|关于|about|version|版本/i,
+  });
+  assert.deepEqual(stale, [], '提示词相关文件的正文里不许残留指向 §4.16 的引用（应当指向 §4.18）：\n'
+    + stale.join('\n'));
+
+  // 常驻反向自证：同一个检查函数必须既能抓住退化式、也不误伤 §4.16 真正主人的合法引用，
+  // 否则上面那条绿只是「什么都没扫到」。
+  const REF_416 = '§' + '4.16';   // 拆着写：这一行本身不许被这条闸扫到
+  const SELF = [
+    // ① 退化式（env 示例那种形状）：必须被抓到，且点名文件与行号。
+    ['deploy/.env.example', '# 读 platform_prompts 的超时。\n# 详见 docs/env.md §10.1 与 '
+      + 'docs/api/portal.md ' + REF_416 + '\n', ['deploy/.env.example:2']],
+    // ② #586 的合法引用（同一行点名了主人）：必须**不**被抓到。
+    ['x.ts', '// issue #586：「关于」面板（契约 docs/api/portal.md ' + REF_416 + '）。\n', []],
+    // ③ 本节自己的正确引用：必须不被抓到。
+    ['y.md', 'platform_prompts 的契约见 docs/api/portal.md §4.18。\n', []],
+  ];
+  for (const [name, text, want] of SELF) {
+    const got = stalePortalSectionRefs({
+      files: [{ name, text }], number: '4.16',
+      subjectRe: /platform_prompts|PLATFORM_PROMPTS/, ownerRe: /#586|关于|about|version|版本/i,
+    }).map((h) => h.replace(/: .*$/, ''));
+    assert.deepEqual(got, want, `反向自证「${name}」的抓取结果不对：${JSON.stringify(got)}`);
+  }
 });
