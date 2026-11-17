@@ -20,7 +20,7 @@
 //     由 dispatcher **自己** finish：投递成功⇒done，抛异常⇒failed。
 import os from 'node:os';
 import { finishMacroRun, MacroError } from './macros.js';
-import { executeScheduledIntent, defaultReportsRoot } from './macro-scheduled.js';
+import { executeScheduledIntent } from './macro-scheduled.js';
 import { runMacroReview } from './macro-review.js';
 import { deliverIntent } from './notifications.js';
 
@@ -96,7 +96,7 @@ export function createIntentDispatcher({
   pool,
   config = {},
   log = console,
-  reportsRoot = defaultReportsRoot(),
+  reportsRoot, // 缺省 undefined ⇒ 由 executeScheduledIntent 按 config.userSpaceRoot + fde_name 现算（#637 ②）
   sessionsHome = os.homedir(),
   runTask,
   reviewRunner,
@@ -135,7 +135,7 @@ export function createIntentDispatcher({
       case 'scheduled-task':
         // 执行器自收尾（done/failed 都它自己 finish）⇒ dispatcher 不再 finish。
         await execScheduled(pool, intent, {
-          reportsRoot, sessionsHome, runTask: runTask ?? defaultRunTask, now: nowVal(), log,
+          reportsRoot, sessionsHome, runTask: runTask ?? defaultRunTask, now: nowVal(), log, config,
         });
         return;
       case 'run-review':
