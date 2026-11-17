@@ -1179,9 +1179,27 @@ function mentionsKeyIn(code, masked, start, end, key, opts = {}) {
           while (re2 < masked.length && code[re2] !== '\n' && masked[re2] === ' ') re2 += 1;
           // 跳过**闭引号**（掩码把引号留下了，但它在串正文之外 ⇒ 停在引号上会看不见后面的 `:`）
           if (code[re2] === "'" || code[re2] === '"' || code[re2] === '`') re2 += 1;
+          // #587 族 B 四轮：**计算键** `{ ['ERIX_X']: 1 }` —— 闭引号之后先跟 `]`，再才是 `:`
+          while (code[re2] === ' ' || code[re2] === '\t') re2 += 1;
+          if (code[re2] === ']') { re2 += 1; }
           let k = re2;
           while (k < code.length && (code[k] === ' ' || code[k] === '\t')) k += 1;
-          if (code[k] !== ':') return true;
+          if (code[k] !== ':') {
+            // #587 族 B 四轮：**裸标量声明不算数据证据**（`const MSG = 'ERIX_X'` 只是文案）。
+            // 真坐标的裸串都在**容器内**：对象值 `a: 'ERIX_X'`、数组元素 `['ERIX_X', v]`、
+            // 调用实参 `intEnv(env, 'ERIX_X', 1002)` ⇒ 该行必须出现 `(`/`{`/`[`。
+            // 判据看**串前面那个符号**：`:`/`(`/`[`/`,` ⇒ 容器内的值（对象值、数组元素、调用实参）；
+            // `=` ⇒ 标量声明（`const MSG = 'ERIX_X'` 只是文案，不算数据证据）。
+            let pv = rs - 2;   // `rs-1` 是**开引号**，要看它前面那个符号
+            while (pv >= 0 && (code[pv] === ' ' || code[pv] === '\t')) pv -= 1;
+            if ([':', '(', '[', ','].includes(code[pv])) return true;
+            // `=` 也有一类合法：**形参默认值**（`key = 'ERIX_X'` 在参数表里）⇒ 该行前面出现过 `(`
+            if (code[pv] === '=') {
+              const ls2 = code.lastIndexOf('\n', pv - 1) + 1;
+              return code.slice(ls2, pv).includes('(');
+            }
+            return false;
+          }
         }
       }
     }
@@ -1430,6 +1448,9 @@ function validateUnsupported(items, root = REPO_ROOT, detected = null) {
       const b = to == null || to === from ? a : (lineRange(code, clampLn(to)) ?? a);
       const seg = code.slice(a[0], b[1]);
       if (/\bprocess\s*\.\s*env\b|\benv\s*[.[]/.test(seg)) return false;   // 自己就是 env 读行
+      // #587 族 B 四轮：**裸标量声明不算数据表**（`const MSG = 'ERIX_X'` 只是文案，审计实测能背书动态读）。
+      // 数据表的形状是「容器内的值」⇒ 该行必须出现 `{` 或 `[`。
+      if (!/[\[{]/.test(seg)) return false;
       return lineHasEnvEvidence(code, masked, a[0], b[1]);
     };
     const existingUsable = usable.filter((r) => { try { readSrc(r.rel); return true; } catch { return false; } });
@@ -2453,6 +2474,16 @@ test('活二㉞ B-①②④ 三轮返工：对象键位不算坐标 / 文件级�
     // ① 对象**键位**串不算坐标（审计：`{'ERIX_X': 1}` 曾被接受）
     assert.match(prob('lib/objkey.js:1'), /不含该 key/,
       '对象键位（属性名）不是数据证据，必须红');
+    // ①b **计算键** `{ ['ERIX_X']: 1 }`：闭引号后跟 `]` 再跟 `:`（审计四轮实测可绕过）
+    fs.writeFileSync(path.join(tmp, 'lib/computed.js'), "const item = { ['ERIX_STATION_TOKEN']: 1 };\n");
+    assert.match(prob('lib/computed.js:1'), /不含该 key/, '计算键位也不是数据证据，必须红');
+    // ①c **裸标量声明**不算数据表：`const MSG = 'ERIX_X'` 只是文案（审计四轮实测能背书动态读）
+    fs.writeFileSync(path.join(tmp, 'lib/scalar.js'), "const MSG = 'ERIX_STATION_TOKEN';\n");
+    assert.match(prob('lib/scalar.js:1'), /不含该 key/, '裸标量声明不是数据表，必须红');
+    // ①d 反向自证：**容器内**的值位裸串仍算（真数据 `config.js:391` 那种）
+    fs.writeFileSync(path.join(tmp, 'lib/table.js'), "export const T = { a: 'ERIX_STATION_TOKEN' };\n");
+    assert.deepEqual(whereProblems([{ ...token, where: 'lib/table.js:1' }], RUNNER_ENV_KEYS, tmp), [],
+      '容器内的值位裸串必须仍算坐标（否则真数据里的数据表登记会被误杀）');
     // ② 文件级引用（不带行号）在**豁免**下也不许吃裸串（旧代码在这里漏传豁免选项）
     const waived = prob('test/waive.js', { whereTest: '这是真站点' });
     assert.match(waived, /只给了文件|不含该 key|注释背书|没发现对/,
