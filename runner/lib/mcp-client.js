@@ -868,7 +868,12 @@ export function createMcpClient({
           ...(tool.inputSchema && typeof tool.inputSchema === 'object' ? { inputSchema: tool.inputSchema } : {}),
         }));
       // 发现到的清单立刻进本地视图：`search` 与 `call` 的门禁读的就是它（§6.3）。
-      tools = list;
+      // ⚠ **原地改，不要重新赋值**：`createMcpClient` 返回的 `tools` 属性指向这个数组，
+      // 而 `pool.list()` / `registerTools()` 读的也是它——`tools = list` 会让外部视图永远停在
+      // 创建时那份（真机症状：`mcp({action:"list"})` 报「工具 0 个 [已发现 0 个工具]」，
+      // 随后 `call` 报 `mcp_tool_unknown`，而客户端自己明明拿到 2 个工具）。
+      tools.length = 0;
+      tools.push(...list);
       toolsCached = list.length > 0;
       return list;
     },
