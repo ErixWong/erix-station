@@ -838,7 +838,7 @@ export const en = {
       // Sits after certs and before the read-only pool view: it is platform configuration.
       upload: 'Upload limit',
       // issue #596 片 B: platform prompts page (views/AdminPromptsView.vue, contract
-      // docs/api/portal.md §4.18). Order upload → prompts: both are platform settings that used
+      // docs/api/portal.md §4.19). Order upload → prompts: both are platform settings that used
       // to require rebuilding station-portal.
       prompts: 'Prompts',
       // issue #595 M2: capability market console (views/AdminMarketView.vue, contract §7 admin API).
@@ -1107,7 +1107,7 @@ export const en = {
       envNotSet: 'the environment variable is not explicitly set',
       footnote: 'This is a **per-file** limit, not a disk quota (total size is #485 slice B, not implemented). It is a different knob from MAX_BODY_BYTES (the JSON request-body limit, 64 KiB by default): uploads never go through the latter.',
     },
-    // issue #596 slice B: admin prompts panel (views/AdminPromptsView.vue, docs/api/portal.md §4.18).
+    // issue #596 slice B: admin prompts panel (views/AdminPromptsView.vue, docs/api/portal.md §4.19).
     // The three effective moments differ, so they are three separate keys on purpose — one
     // shared sentence would make the page lie (acceptance criterion F7). The readonly.* entries
     // say where each prompt lives and what changing it costs, never its text: the portal image

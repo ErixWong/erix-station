@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 管理台 · 提示词（issue #596 片 B，契约 `docs/api/portal.md` §4.18 / 设计稿 §7）。
+// 管理台 · 提示词（issue #596 片 B，契约 `docs/api/portal.md` §4.19 / 设计稿 §7）。
 //
 // 这一页存在的理由只有一条：**平台对 agent 说的话不该要重建容器**。所以判据不在"能不能编辑"，而在：
 //   ① 每卡显示**当前来源**（DB 覆写 / 跟随内置）、**字节数与上限**、**生效时机** —— 少了任何一条，
@@ -8,8 +8,8 @@
 //      所以这里刻意写三句不同的话，不共用一句"保存后生效"。
 //   ③ 保存后**用响应 DTO 回填**（它出自 `RETURNING` ⇒ 是真落库的那一份，不是回显输入）。
 //   ④ `materializeEnqueued === 0` 必须**显式**出现「已保存，但物化未通知」——静默就是把
-//      "改了但工位还没吃到"藏起来（§4.18-4）。
-//   ⑤ 前端**不抢服务端的闸**（§4.18-2）：文本照发，越界由 `400 validation_failed` 回来标红；
+//      "改了但工位还没吃到"藏起来（§4.19-4）。
+//   ⑤ 前端**不抢服务端的闸**（§4.19-2）：文本照发，越界由 `400 validation_failed` 回来标红；
 //      只有"连长度都算不出"（进来的不是字符串）才不发请求。
 //   ⑥ 只读那张卡**只列位置与代价，不显示全文**：portal 镜像不含 `runner/`
 //      （`portal/Dockerfile` 只 `COPY portal/ portal/`），后端也只给 `key` —— 显示全文就是撒谎。
@@ -98,7 +98,7 @@ const reasonText = computed(() => {
     case 'no_row': return t('admin.prompts.reasonNoRow');
     case 'read_failed': return t('admin.prompts.reasonReadFailed');
     // `read_timeout`：查询发出去但没在 `PLATFORM_PROMPTS_READ_TIMEOUT_MS` 内回 —— 把这事说成
-    // "管理台还没配过"会让值班去配一个值，而真故障在连接上（§4.18-1 的 `reason` 三条互不合并）。
+    // "管理台还没配过"会让值班去配一个值，而真故障在连接上（§4.19-1 的 `reason` 三条互不合并）。
     case 'read_timeout': return t('admin.prompts.reasonReadTimeout');
     // 后端新增的第四种 reason：不许塌成 `no_row`，也不许整行不显示。
     case 'unknown': return t('admin.prompts.reasonUnknown');
@@ -162,7 +162,7 @@ function fieldErrorOf(field: PromptFieldKey): string | null {
 }
 
 /**
- * 保存后的物化通知那一行（§4.18-4）。只在**刚保存成功那张卡**下面出现。
+ * 保存后的物化通知那一行（§4.19-4）。只在**刚保存成功那张卡**下面出现。
  * 语义结论不在这里算（那是 lib 的 `materializeNoticeOf`，store 已折成 `promptNotice`）：
  * 两处各算一遍就是两本账。`titlePrompt` 不涉物化（响应里那个 0 是恒 0）⇒ 这一行**不出现**，
  * 否则就是说假话。
@@ -331,7 +331,7 @@ onMounted(async () => {
           }) }}
         </p>
         <!-- 这一行是预算口径的免责声明：DTO 里那个数用示例名 `example` 渲染（为了可对比、零动态量），
-             而写侧的渲染闸按**最长合法工位名**算（契约 §4.18-3 评审 F2）⇒ 不写清就会让人以为
+             而写侧的渲染闸按**最长合法工位名**算（契约 §4.19-3 评审 F2）⇒ 不写清就会让人以为
              「页面没顶到上限就存得进去」。 -->
         <p data-test="agents-md-render-budget-note" class="text-xs text-black/40">
           {{ t('admin.prompts.renderBudgetNote') }}
@@ -397,7 +397,7 @@ onMounted(async () => {
           class="text-xs text-emerald-700"
         >{{ t('admin.prompts.saved') }}</p>
       </div>
-      <!-- §4.18-4：`materializeEnqueued === 0` 不许静默 ⇒ 这一行必须出现（标题提示词不涉物化，
+      <!-- §4.19-4：`materializeEnqueued === 0` 不许静默 ⇒ 这一行必须出现（标题提示词不涉物化，
            所以那一卡压根不渲染这一行 —— 对它说"物化未通知"是撒谎）。 -->
       <p
         v-if="materializeText(card.field) !== null"

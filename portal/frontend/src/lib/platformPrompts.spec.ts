@@ -1,3 +1,4 @@
+// @vitest-environment node
 // issue #596 片 B：`lib/platformPrompts.ts` 的纯函数单测。
 //
 // 为什么这一层必须单独有文件（照 `lib/uploadSettings.spec.ts` 的分工）：
@@ -19,6 +20,8 @@ import {
   shortUuid,
   utf8ByteLength,
 } from './platformPrompts';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 /** 后端 `P8c` 钉住的那份 GET DTO（默认态，三块全跟随内置）。 */
 const DTO = {
@@ -211,5 +214,76 @@ describe('shortUuid：只有 uuid、没有显示名 ⇒ 短形式或原样，绝
     expect(shortUuid('3f2c0000-0000-4000-8000-0000000000a1')).toBe('3f2c0000…');
     expect(shortUuid('not-a-uuid')).toBe('not-a-uuid');
     expect(shortUuid(null)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 契约节号机械闸（#596）：提示词面板那批源码只许引用 portal.md §4.19。
+// 为什么常驻：本节号连撞三次，肉眼发现漂移太脆，改成机器判。
+// §4.16 现是「关于」(#586)、§4.18 现是「MCP」(#608)，§4.20 是预留位——
+// 专属文件整文件判；共享文件只判提示词语境行，不误伤别人的 §4.16
+// 不扫本 spec：反向自证的 §4.18 样本是内存字符串，不该把文件判红。
+// ---------------------------------------------------------------------------
+
+/** 只认 §4.16 / §4.18 / §4.20 三号违规，§4.19 不在其列。 */
+const FORBIDDEN_SECTION = /§4\.16|§4\.18|§4\.20/;
+
+/** 提示词上下文标记，用于把别人合法的 §4.16 从共享文件里排除。 */
+const PROMPT_CONTEXT = /提示词|[Pp]rompts/;
+
+/** 提示词面板专属文件：整文件都是本页 ⇒ 任何旧/预留节号算漂移。 */
+const PROMPT_OWNED = [
+  './platformPrompts.ts',
+  '../views/AdminPromptsView.vue',
+  '../views/AdminPromptsView.spec.ts',
+];
+
+/** 共享文件：他面板同处一文件 ⇒ 只判提示词语境行上的旧号。 */
+const SHARED_FILES = [
+  '../stores/admin.ts',
+  '../router.ts',
+  '../i18n/locales/zh-CN.ts',
+  '../i18n/locales/en.ts',
+];
+
+/**
+ * 命中 §4.16 / §4.18 / §4.20 的行，返回 label:行号: 那一行。
+ * requireContext=true（共享文件）时，只算同一行还带提示词上下文的那些。
+ */
+function findSectionDrift(text: string, label: string, requireContext: boolean): string[] {
+  const bad: string[] = [];
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!FORBIDDEN_SECTION.test(line)) continue;
+    if (requireContext && !PROMPT_CONTEXT.test(line)) continue;
+    bad.push(`${label}:${i + 1}: ${line.trim()}`);
+  }
+  return bad;
+}
+
+describe('契约节号机械闸：面板只许 §4.19（第三次撞号后的常驻闸）', () => {
+  it('扫面板那批源码，不得出现 §4.16 / §4.18 / §4.20', () => {
+    const here = fileURLToPath(new URL('./', import.meta.url));
+    const drift: string[] = [];
+    for (const rel of PROMPT_OWNED) {
+      drift.push(...findSectionDrift(readFileSync(here + rel, 'utf8'), rel, false));
+    }
+    for (const rel of SHARED_FILES) {
+      drift.push(...findSectionDrift(readFileSync(here + rel, 'utf8'), rel, true));
+    }
+    expect(drift, `发现漂移的旧契约节号：\n${drift.join('\n')}`).toEqual([]);
+  });
+
+  it('反向自证：写着 §4.18 的样本喂进函数必须判红并点名', () => {
+    // 提示词语境行 + §4.18 ⇒ 必须红（共享文件 requireContext=true）。
+    const sample = 'NODE=x\n// 提示词面板引用 docs/api/portal.md §4.18-2\n';
+    const hits = findSectionDrift(sample, '.env.example', true);
+    expect(hits, '提示词语境的旧号 §4.18 必须被判红').toHaveLength(1);
+    expect(hits[0]).toContain('.env.example:2');
+    expect(hits[0]).toContain('§4.18-2');
+    // 反向自证另半边：同行没有提示词上下文（他人 §4.16）不该红。
+    const notMine = findSectionDrift('// 关于面板 §4.16', 'other.ts', true);
+    expect(notMine, '非提示词语境的 §4.16 不该判红').toEqual([]);
   });
 });
