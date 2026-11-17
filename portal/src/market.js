@@ -969,13 +969,27 @@ export function stateForVerb(verb) {
 export async function setItemState({ pool, itemId, state }) {
   if (!['draft', 'published', 'retired'].includes(state)) throw bad("state 只允许 draft/published/retired", { field: 'state' });
   if (state === 'published') {
-    // 发布闸门：当前版本必须真的**有包**。否则装上去是个空目录，而 capabilities.json 会告诉模型「有」。
-    const n = (await pool.query(
-      `SELECT count(*)::int AS n FROM capability_files
-        WHERE item_id = $1 AND version = (SELECT version FROM capability_items WHERE id = $1)`, [itemId])).rows[0]?.n ?? 0;
-    if (Number(n) === 0) {
-      throw new MarketError('当前版本没有包内容，不能发布',
-        { code: 'capability_not_published', httpStatus: 409, details: { reason: 'no_files_for_current_version' } });
+    const cur = (await pool.query('SELECT kind, manifest FROM capability_items WHERE id = $1', [itemId])).rows[0];
+    if (!cur) throw notFound(itemId);
+    if (cur.kind === 'mcp') {
+      // §4 MCP 的发布闸门不是「有包」而是「配置完整」：transport 必须有 command 或 url，
+      // 否则 runner 拿到一条什么都起不来的配置（症状是「装了但 list 里什么都没有」）。
+      const m = asJson(cur.manifest, {});
+      const ok = (m.transport === 'stdio' && typeof m.command === 'string' && m.command !== '')
+        || (m.transport === 'http' && typeof m.url === 'string' && m.url !== '');
+      if (!ok) {
+        throw new MarketError('MCP 条目缺 transport/command/url，不能发布',
+          { code: 'capability_not_published', httpStatus: 409, details: { reason: 'mcp_config_incomplete' } });
+      }
+    } else {
+      // 发布闸门：当前版本必须真的**有包**。否则装上去是个空目录，而 capabilities.json 会告诉模型「有」。
+      const n = (await pool.query(
+        `SELECT count(*)::int AS n FROM capability_files
+          WHERE item_id = $1 AND version = (SELECT version FROM capability_items WHERE id = $1)`, [itemId])).rows[0]?.n ?? 0;
+      if (Number(n) === 0) {
+        throw new MarketError('当前版本没有包内容，不能发布',
+          { code: 'capability_not_published', httpStatus: 409, details: { reason: 'no_files_for_current_version' } });
+      }
     }
   }
   const r = await pool.query(
@@ -1409,7 +1423,8 @@ export function validateMcpFields(fields, { requireAll = false } = {}) {
     timeoutMs = timeoutRaw;
   }
 
-  const manifest = { exposure, lifecycle, resident: false, timeout_ms: timeoutMs };
+  // transport 必须进 manifest（它是 runner 侧选传输的唯一依据；只放 meta 会让物化出来没有传输方式）
+  const manifest = { transport, exposure, lifecycle, resident: false, timeout_ms: timeoutMs };
   if (reason !== undefined) manifest.reason = reason;
   if (transport === 'stdio') {
     const command = need('command', 'stdio 必须给 command');
@@ -1636,15 +1651,18 @@ async function publishMcpItem({ pool, actorId, meta, fields }) {
   const manifest = { ...mcpManifest };
   const state = meta.state ?? 'draft';
   return withTransaction(pool, async (client) => {
+    // 参数顺序与 skill 那条**逐字相同**（kind 也走 $1）：测试里的 FakePool 是按位置认列的，
+    // 两条 INSERT 用不同布局会让 fake 分叉成两套（fake 越像真 SQL，判据才越可信）。
     const r = await client.query(
       `INSERT INTO capability_items
          (kind, slug, name, summary, when_to_use, description_md, version, author, tags, license,
           state, manifest, security_score, security_warnings, created_by, published_at)
-       VALUES ('mcp',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,100,'[]'::jsonb,$12,
-               CASE WHEN $10 = 'published' THEN now() ELSE NULL END)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb,$15,
+               CASE WHEN $11 = 'published' THEN now() ELSE NULL END)
        RETURNING ${ITEM_COLUMNS}`,
-      [meta.slug, meta.name, meta.summary, meta.when_to_use, meta.description_md ?? '', meta.version,
-        meta.author ?? null, meta.tags ?? [], meta.license ?? null, state, JSON.stringify(manifest), actorId]);
+      ['mcp', meta.slug, meta.name, meta.summary, meta.when_to_use, meta.description_md ?? '', meta.version,
+        meta.author ?? null, meta.tags ?? [], meta.license ?? null, state, JSON.stringify(manifest),
+        100, '[]', actorId]);
     const item = r.rows[0];
     await replaceParams(client, { itemId: item.id, slots });
     return toAdminItemDto(item);
