@@ -1511,11 +1511,36 @@ function repoTextFiles(rootUrl) {
   return out;
 }
 
+// ④ 判「哪个文件算提示词文件」用的是**文件级**口径（见下面
+// `subjectRe.test(f.text)`：出现过一次标记就整本受管）。所以本闸
+// 的扫描范围排除了**只追加的历史文件**，理由在这两本的规矩上：
+//   - `docs/maintenance/task-ledger.md`：新单在末尾追加、号不重排；
+//   - `ISSUES.md`：原始反馈「保留历史原文，不改写」。
+// 两本都是条目按时间往后长、旧条目不回头改。于是任何一条提到
+// 提示词的新条目都会把**整本**历史拉进受管范围，而历史行的旧号
+// 在写它的那一年是对的（`§4.16` 曾是 #586「关于」面板的号）。
+// 本闸管的是**现势**契约与配置还指不指得对，不是历史叙述有没有
+// 被后来的改号追着改；后者在只追加的文件里做不到——回头改历史
+// 行就违反这两本的规矩。闸若不管这层，必然在未来某天变红，而且
+// 红的永远是别人的历史行（2026-12-01：#350 时代那行被点名）。
+//
+// 两类文件**不进**名单，各给理由：
+//   1. 不再被追加的冻结件（已应用迁移：runner 逐文件记 `sha256`，
+//      改一字节即失配拒启）：不会被新条目拉进受管范围，无需豁免；
+//   2. 现势文件（`deploy/.env.example`、`docs/env.md`、`portal.md`、
+//      源码）：写旧号就是真漏改，照旧全量受管。「排除有没有把闸
+//      掏空」由下面的常驻反向自证 ④-② 钉住（现势必须判红）。
+const APPEND_ONLY_HISTORY_FILES = new Set([
+  'docs/maintenance/task-ledger.md',  // 一单一账、末尾追加、编号不重排不复用
+  'ISSUES.md',                        // 原始反馈记录，历史原文不改写
+]);
+
 /**
  * 扫「指向 `docs/api/portal.md §<number>` 的**引用**」。
  * 只认引用形态（同一行出现 `portal.md … §N.N` 或「见/详见/契约/口径/contract … §N.N」），
  * 白话提及（「当年 §4.16 一度有两个标题」）不算；`ownerRe` 命中的行豁免（那一节真正的主人）。
- * 只扫正文里提到 `subjectRe` 的文件。返回 `['path:line: 原文', …]`。
+ * 只扫提到 `subjectRe` 的文件；只追加历史（上面那份名单）除外。
+ * 返回 `['path:line: 原文', …]`。
  */
 function stalePortalSectionRefs({ files, number, subjectRe, ownerRe }) {
   const num = number.replace(/\./g, '\\.');
@@ -1526,6 +1551,8 @@ function stalePortalSectionRefs({ files, number, subjectRe, ownerRe }) {
   const bare = new RegExp(`§\\s*${num}\\b`);
   const hits = [];
   for (const f of files) {
+    // 只追加的历史不归本闸管（见 APPEND_ONLY_HISTORY_FILES）
+    if (APPEND_ONLY_HISTORY_FILES.has(f.name)) continue;
     if (!subjectRe.test(f.text)) continue;
     f.text.split('\n').forEach((line, i) => {
       if (!bare.test(line)) return;
@@ -1599,6 +1626,9 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
   //    成 4.19 之前指的就是邻居那一节（评审 R4）。本格子自己的注释也**不写成引用形态**，
   //    否则这条闸会扫到自己 —— `ownerRe` 只豁免 4.16 那一节现在真正的主人（#586）。
   //    白话提及（不带 `portal.md`、不带「见/契约/口径」那种）不算引用，不受这条约束。
+  //    **扫描范围**：只追加的历史（台账与 `ISSUES.md`）不归 ④ 管：
+  //    历史条目不许回头改，号是当年对的；完整理由见上面那份名单。
+  //    ⑤（邻域口径）**不**跟着排除：它按行判，本来咬不到历史行。
   const stale = stalePortalSectionRefs({
     files: repoTextFiles(new URL('../..', import.meta.url)),
     number: '4.16',
@@ -1626,6 +1656,41 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
       subjectRe: /platform_prompts|PLATFORM_PROMPTS/, ownerRe: /#586|关于|about|version|版本/i,
     }).map((h) => h.replace(/: .*$/, ''));
     assert.deepEqual(got, want, `反向自证「${name}」的抓取结果不对：${JSON.stringify(got)}`);
+  }
+
+  // —— 常驻反向自证（范围排除的两面）：不咬历史，也没掏空本闸 ——
+  // ① **台账形状**合成输入 ⇒ ④ 不许判红：新条目里有提示词标记，
+  //    文件级口径因此把整本受管；另有一条历史行写着当年对的旧号。
+  //    这正是 2026-12-01 咬到人的现场；缺了它，排除就是样子货。
+  const LEDGER_SHAPED = '### 8.100 某旧单（过程账）\n'
+    + '  号：`docs/api/portal.md` ' + REF_416 + '。\n'
+    + '### 8.172 提示词面板（新写的那条）\n'
+    + '  `platform_prompts` 的号是 `docs/api/portal.md` §4.19。\n';
+  // ② 现势形状的合成输入：必须判红并点名（现势配置写旧号 = 漏改）
+  const CURRENT_SHAPED = '# 读 `platform_prompts` 的超时。\n'
+    + '# 号：docs/env.md §10.1 与 docs/api/portal.md ' + REF_416 + '\n';
+  const SCOPE_SELF = [
+    // ① 的对照组：同一份内容换个非历史名必须还是红 ⇒ 救它的就是
+    // 「排除只追加历史」这一条，不是别种豁免（主人行 / 非引用形态）。
+    { label: '④-① 台账形状（新条目带标记 + 历史行是旧号）必须放过',
+      name: 'docs/maintenance/task-ledger.md', text: LEDGER_SHAPED, want: 0 },
+    { label: '④-① 对照组：同一内容换个非历史名必须照判红',
+      name: 'docs/maintenance/other-notes.md', text: LEDGER_SHAPED, want: 1 },
+    { label: '④-② 现势形状（运维配置写旧号）必须照判红并点名',
+      name: 'deploy/.env.example', text: CURRENT_SHAPED, want: 1 },
+  ];
+  for (const c of SCOPE_SELF) {
+    const got = stalePortalSectionRefs({
+      files: [{ name: c.name, text: c.text }], number: '4.16',
+      subjectRe: /platform_prompts|PLATFORM_PROMPTS/, ownerRe: /#586|关于|about|version|版本/i,
+    });
+    assert.equal(got.length, c.want,
+      `常驻反向自证·${c.label}：抓到 ${got.length} 条（期望 ${c.want}）：`
+      + `\n${got.join('\n')}`);
+    if (c.want === 1) {
+      assert.ok(got[0].startsWith(`${c.name}:`),
+        `常驻反向自证·${c.label} 必须点名 ${c.name}，实际：${got.join('\n')}`);
+    }
   }
 
   // ⑤（补强+收尾扩邻域）悬空引用：提示词语境 + 引用旧号 ⇒ 违规。
