@@ -87,8 +87,8 @@
     },
     {
       "key": "FDE_WORKER_UID",
-      "where": "runner/agentd.js:58；compose 的那一行喂的是 portal/src/config.js:391",
-      "reason": "**同名不同源**：compose `station-portal` 的 `FDE_WORKER_UID` 是 portal 用来算 FDE 容器 `--user`/UID 的（config.js:391），容器内 agentd 的同名读不在 `ENV_KEY_ALLOW` 里 ⇒ 它「在 compose 里」不等于「有三腿」。登记而不是补两腿，因为把 UID 注进容器会改变镜像内既有 UID 契约（#27/#62 那一族）。"
+      "where": "runner/agentd.js:58；compose 的那一行喂的是 portal/src/config.js:396",
+      "reason": "**同名不同源**：compose `station-portal` 的 `FDE_WORKER_UID` 是 portal 用来算 FDE 容器 `--user`/UID 的（config.js:396），容器内 agentd 的同名读不在 `ENV_KEY_ALLOW` 里 ⇒ 它「在 compose 里」不等于「有三腿」。登记而不是补两腿，因为把 UID 注进容器会改变镜像内既有 UID 契约（#27/#62 那一族）。"
     },
     {
       "key": "ERIX_WORKER_UID",
