@@ -1,10 +1,14 @@
 // station store adapter（runner/lib/store.js，IPC 版 TranscriptStore）契约测试 harness。
 // 对 adapter 跑上游 transcriptStoreContract（erix-agent/contract-tests，0.16.0：
-// latest-only run snapshot、独立状态通道、多 runId 隔离、写失败向上抛、RoundRecord/message 保真往返、
+// 独立状态通道、多 runId 隔离、写失败向上抛、RoundRecord/message 保真往返、
 // 同 round 按持久化追加序）。
-// agentd + portal 用内存 IPC peer 桩掉（语义 = portal internal session 端点：snapshot revision CAS、
+// agentd + portal 用内存 IPC peer 桩掉（语义 = portal internal session 端点：
 // run-state 快照/状态分列、多 runId 隔离、同 round 不同 dedupKey 共存 + dedupKey 幂等），
 // transport 注入 adapter——不 fork 进程、不碰网络/DB。
+//
+// ⚠ **run snapshot 已退役（issue #640）**：0.33.0 的上游套件里 `runSnapshot` 能力名与方法名都是 0 命中，
+//   本文件的 peer 桩也不再实现 `saveRunSnapshot` / `loadLatestRunSnapshot`（末尾那条反向自证钉住它）。
+//   本仓历史注释里提到的 0.14–0.32 时代语义（latest-only snapshot / revision CAS）只是来历，不是现状。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { transcriptStoreContract } from 'erix-agent/contract-tests';
@@ -21,7 +25,6 @@ import { STORE_METHODS } from '../lib/ipc.js';
 /** 内存 IPC peer 桩：模拟 agentd → portal internal 端点的 store 语义。 */
 function createFakeAgentdPeer() {
   const transcripts = new Map(); // runId -> round records[]
-  const snapshots = new Map(); // runId -> {snapshot, revision}
   const runStates = new Map();   // runId -> object
   const runStateStatuses = new Map(); // runId -> {status}
   const recoveryRows = new Map(); // runId -> 恢复行 [{dedupKey, record}]（数组序 = append_seq）
@@ -95,23 +98,9 @@ function createFakeAgentdPeer() {
           const legacy = runStates.get(runId)?.state;
           return typeof legacy === 'string' ? { status: { status: legacy } } : null;
         }
-        case 'saveRunSnapshot': {
-          const current = snapshots.get(runId);
-          const revision = Number(args.revision ?? 0);
-          if (current && revision <= current.revision) {
-            const err = new Error('checkpoint revision 不大于当前');
-            err.code = 'checkpoint_stale';
-            err.retryable = false;
-            throw err;
-          }
-          snapshots.set(runId, { snapshot: structuredClone(args.snapshot), revision });
-          return { revision };
-        }
-        case 'loadLatestRunSnapshot': {
-          const cp = snapshots.get(runId);
-          if (!cp) return null;
-          return { checkpoint: { snapshot: structuredClone(cp.snapshot), revision: cp.revision } };
-        }
+        // ⚠ 旧 `saveRunSnapshot` / `loadLatestRunSnapshot` 两条路由已随 issue #640 删除（表也 DROP 了）。
+        // 本 peer **不实现它们**：任何代码或上游套件重新调这两个名字，就会得到下面 `default` 的
+        // `unknown method` ⇒ 当场红，而不是静默「看起来能用」（末尾有显式反向自证）。
         // ── issue #500：账本恢复行三条路由 ──
         //
         // 为什么必须在这里补：`makeStore()` 自本单起**带着**这三个方法，本 peer 站的是 agentd 的位置
@@ -166,9 +155,9 @@ function createFakeAgentdPeer() {
   return peer;
 }
 
-test('STORE_METHODS：0.14.0 必需/可选契约与 status 读接口在 IPC 白名单内；recall 为 legacy 兼容项', async () => {
+test('STORE_METHODS：必需/可选契约与 status 读接口在 IPC 白名单内；recall 为 legacy 兼容项；快照两面已退役', async () => {
   const upstreamContract = [
-    'appendRound', 'load', 'saveRunSnapshot', 'loadLatestRunSnapshot',
+    'appendRound', 'load',
     'saveRunState', 'loadRunState', 'markRunState',
     'loadRunStateStatus',
   ];
@@ -183,6 +172,13 @@ test('STORE_METHODS：0.14.0 必需/可选契约与 status 读接口在 IPC 白�
   }
   assert.equal(typeof store.saveCheckpoint, 'undefined', '旧快照方法名不得暴露给引擎');
   assert.equal(typeof store.loadLatestCheckpoint, 'undefined', '旧快照方法名不得暴露给引擎');
+  // **反向自证（issue #640）**：快照本体也已退役——不是「换了个名字」，而是整条竖切（IPC 白名单 /
+  // agentd 路由 / portal 端点 / `run_checkpoints` 表）都没了。名字一旦回来（引擎回退或有人
+  // 「顺手补上」），本用例会红，而不是默默多一个没人调的方法。
+  for (const retired of ['saveRunSnapshot', 'loadLatestRunSnapshot']) {
+    assert.equal(typeof store[retired], 'undefined', `快照方法 ${retired} 已随 #640 退役，不得再现`);
+    assert.equal(STORE_METHODS.has(retired), false, `IPC 白名单不得再包 ${retired}`);
+  }
   // recall：legacy（0.8.0 退役），保留但标注为非契约方法。
   assert.ok(STORE_METHODS.has('recall'), 'recall 保留（legacy 只读兼容）');
   assert.ok(!upstreamContract.includes('recall'), 'recall 不属于 0.14.0 TranscriptStore 能力');
@@ -198,11 +194,10 @@ test('STORE_METHODS：0.14.0 必需/可选契约与 status 读接口在 IPC 白�
 //
 // ⚠ **erix-agent 0.33.0（issue #838 S2，本站 #530）：`runSnapshot` 这个能力名已从上游名单里删除**
 //   （现查 0.33.0：`test/contract/transcript-store.js` 里 `runSnapshot` **0 命中**；`OPTIONAL_CAPABILITIES`
-//   只剩 `runState` / `runStateStatus` / `rawRows` / `fastPathProbes` 四组）。本站再申报它就会撞上那句
-//   「${capability} 不在 OPTIONAL_CAPABILITIES 名单里（守卫写错了能力名）」⇒ 从申报里摘掉。
-//   ⚠ 摘的只是**申报**：本站 `runner/lib/store.js` 的 `saveRunSnapshot` / `loadLatestRunSnapshot` 方法
-//   **本体本单不动**（它们从 0.33 起是死代码，连同 `ipc.js` 白名单 / agentd 路由 / portal internal 两个
-//   端点 / `run_checkpoints` 表一起留给另单一次性退役——#530 决策 D1）。别把「摘申报」读成「能力已退役」。
+//   只剩 `runState` / `runStateStatus` / `rawRows` / `fastPathProbes` 四组）。本站当时只是**从申报里摘掉**，
+//   方法本体连同 IPC 白名单 / agentd 路由 / portal 端点 / `run_checkpoints` 表一起留给了另单——
+//   **那个另单已落地：issue #640 把整条竖切删干净了**（表由迁移 `0041` DROP）。
+//   ⇒ 本文件的 peer 桩不再实现快照方法，上面的反向自证钉住「不得再加回来」。
 transcriptStoreContract('station-ipc-store', async () => {
   const peer = createFakeAgentdPeer();
   return makeStore('contract-run', { request: (method, args) => peer.handle(method, args) });

@@ -17,8 +17,6 @@
 //   recall               → GET /runs/:id/transcript/recall          （U7 legacy，保持 run 作用域不动）
 //   markRunState         → PUT /runs/:id/state（'running'，真 runId） （U2）
 //                          → PUT /transcript/:key/runstate {state}（状态通道，session）
-//   saveRunSnapshot      → PUT /transcript/:key/checkpoint           （session，revision CAS）
-//   loadLatestRunSnapshot→ GET /transcript/:key/checkpoint/latest    （session）
 //   saveRunState         → PUT /transcript/:key/runstate {run_state} （session）
 //   loadRunState         → GET /transcript/:key/runstate              （session；无 → undefined）
 //   loadRunStateStatus   → GET /transcript/:key/runstate/status       （session；返回 status?.status）
@@ -27,6 +25,13 @@
 //   clearRecoveryRows    → DELETE /transcript/:key/recovery-rows       （session，#500；true/false 原样透出）
 //   （旧 run 作用域 U5–U9/runstate 端点保留不动，供旧 runner/旧 agentd 兼容——本 adapter 自 P2 起只走 session 端点。
 //   恢复行**没有** run 作用域旧端点可回退：那张新表只有一个键列，agentd 侧 sessionKey 缺失就是抛错。）
+//
+// ⚠ **run snapshot 已整条退役（issue #640）**：erix-agent 0.33.0（上游 #838 S2，本站 #530）起引擎不再调
+//   `saveRunSnapshot` / `loadLatestRunSnapshot`，本 adapter 的同名方法、agentd 的四条转发、portal 的四个
+//   `/checkpoint*` 端点与 `run_checkpoints` 表（迁移 `0041` DROP）一并删——恢复只靠账本（轮记录 + 恢复行）。
+//   **不在删列**、故意留下的同名物：错误码 `checkpoint_failed`（理由见 `lib/termination.js` 头注）、
+//   `persistence_error.phase` 的 `checkpoint_before_tool` / `checkpoint_after_tool`（旧档案读侧）、
+//   事件流里的 `checkpoint` 事件类型、run-state 里恒为 0 的 `deterministic.errors.checkpoint`。
 import { foldLedgerRecords } from './transcript-fold.js';
 
 const RETRY_DELAYS = [1000, 2000, 5000];
@@ -61,8 +66,6 @@ function readFlag(res, field, method, key) {
 
 
 export function makeStore(key, { request, runId }) {
-  let revision = 0;
-
   async function requestWithRetry(method, args) {
     let lastErr;
     for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
@@ -70,7 +73,9 @@ export function makeStore(key, { request, runId }) {
         return await request(method, args);
       } catch (err) {
         lastErr = err;
-        const retryable = err?.retryable === true && err?.code !== 'checkpoint_stale';
+        // 只有 transport 明确标了可重试才重试（409 一族的 lease_lost / run_terminal 在 agentd
+        // 侧已被标成不可重试；旧 `checkpoint_stale` 的同款特判随 snapshot 一起退役，issue #640）。
+        const retryable = err?.retryable === true;
         if (!retryable || attempt >= RETRY_DELAYS.length) throw err;
         const delay = RETRY_DELAYS[attempt] * (0.8 + Math.random() * 0.4);
         await sleep(delay);
@@ -130,25 +135,6 @@ export function makeStore(key, { request, runId }) {
         throw new Error(`malformed run-state status response for ${String(r)}`);
       }
       return res.status.status;
-    },
-    async saveRunSnapshot(r, snapshot) {
-      revision += 1;
-      try {
-        await requestWithRetry('saveRunSnapshot', { runId: r, revision, snapshot });
-      } catch (err) {
-        // §9.5：revision <= 当前 → checkpoint_stale 视为「本快照已过期」，不重试、不抛（继续以最新为准）。
-        if (err?.code === 'checkpoint_stale') return;
-        throw err;
-      }
-    },
-    async loadLatestRunSnapshot(r) {
-      const res = await requestWithRetry('loadLatestRunSnapshot', { runId: r });
-      if (!res || !res.checkpoint) {
-        revision = 0;
-        return undefined;
-      }
-      revision = Number(res.checkpoint.revision ?? 0);
-      return res.checkpoint.snapshot;
     },
     // ── issue #500：账本恢复行三件套（erix-agent 0.32/0.33 的可选能力面，本站全实现）──
     //

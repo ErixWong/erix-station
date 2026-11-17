@@ -29,8 +29,7 @@ function brokenStore() {
   return {
     async appendRound() { throw new Error('fake: host rejected the round (1MB cap)'); },
     async load() { return null; },
-    async saveRunSnapshot() { return undefined; },
-    async loadLatestRunSnapshot() { return null; },
+    // ⚠ 旧 `saveRunSnapshot` / `loadLatestRunSnapshot` 桩已随 issue #640 删（0.33.0 引擎不再调）。
   };
 }
 
