@@ -3,7 +3,7 @@
 // 外加 §11 的形态红线（覆盖式遮罩 + 右侧面板，**任何宽度都不并排**）与 §12 的
 // 「附注行按数据有无显示」。断言一律读 DOM，不用 `w.emitted()`。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia, type Pinia } from 'pinia';
 import MacroDrawer from './MacroDrawer.vue';
 import { i18n, setLocale } from '../i18n';
@@ -301,10 +301,24 @@ describe('判据⑤：健康告警位置（顶部状态条，不在空态区）'
     expect(wrapper.find('[data-test="macro-empty"]').exists()).toBe(true);
   });
 
-  it('首次订阅（水位线为 null）⇒ 说「还没被评估过」而不是「0 分钟前」', async () => {
+  it('刚建的首次订阅（null 且在宽限窗内）⇒ 顶部不出现 ⚠，卡片写「尚未评估」（#615 不再狼来了）', async () => {
     const macro = useMacroStore();
     macro.setClock(() => NOW);
-    macro.assignments = [assignment({ lastEvaluatedAt: null })];
+    macro.assignments = [assignment({ lastEvaluatedAt: null, createdAt: new Date(NOW).toISOString() })];
+    macro.runs = [];
+    const wrapper = mountDrawer();
+    await wrapper.vm.$nextTick();
+    // 不再占据顶部告警位（这是旧代码的 bug：每个新订阅都闪一次 ⚠）
+    expect(wrapper.find('[data-test="macro-health"]').exists()).toBe(false);
+    // 唯一的中性信号：订阅卡片上写「尚未评估」而不是一个具体时刻
+    expect(wrapper.find('[data-test="macro-last-evaluated"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="macro-last-evaluated"]').text()).not.toContain('0 分钟前');
+  });
+
+  it('首次订阅且过了宽限窗（null 仍没推进）⇒ 顶部 ⚠ 说「还没被评估过」而不是「0 分钟前」', async () => {
+    const macro = useMacroStore();
+    macro.setClock(() => NOW);
+    macro.assignments = [assignment({ lastEvaluatedAt: null, createdAt: new Date(NOW - 10 * 60_000).toISOString() })];
     const wrapper = mountDrawer();
     await wrapper.vm.$nextTick();
     const health = wrapper.find('[data-test="macro-health"]');
@@ -372,5 +386,25 @@ describe('形态红线（`07` §11 / §21.2：覆盖式右抽屉，任何宽度�
 
     await wrapper.find('[data-test="macro-close"]').trigger('click');
     expect(macro.drawerOpen).toBe(false);
+  });
+});
+
+// #614：顶栏用户级 chip 开的是「无会话」形态抽屉——卡片必须显示用户级模板而不是会话模板。
+describe('用户级形态（sessionId=null，issue #614）', () => {
+  it('卡片列用户级模板（scope=user）而不是会话模板', async () => {
+    const wrapper = mountDrawer({ sessionId: null });
+    await flushPromises();   // 等 MacroMenu onMounted 的 loadTemplates 落地（fetch 桩）
+    await wrapper.vm.$nextTick();
+    // stubTemplates 里的用户级模板名：'每日 9 点'（scope='user'）
+    const cards = wrapper.findAll('[data-test="macro-subscription-card"]').map((w) => w.text());
+    expect(cards.some((tx) => tx.includes('每日 9 点'))).toBe(true);
+    // 会话级模板名 '完成审查 · 默认'（scope='session'）不该出现在用户级卡片里
+    expect(cards.some((tx) => tx.includes('完成审查'))).toBe(false);
+  });
+
+  it('sessionId=null 时仍渲染抽屉根节点（无会话也要能开）', async () => {
+    const wrapper = mountDrawer({ sessionId: null });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="macro-drawer"]').exists()).toBe(true);
   });
 });

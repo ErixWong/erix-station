@@ -14,16 +14,27 @@
 //   ③ 终态即停：state ∈ 终态集（`lib/delegate.ts` 由 7 值封闭集减活态导出）⇒ 不再排程；
 //      **打开时就已是终态 ⇒ 只拉一次**；
 //   ④ `onUnmounted` 清 timer + abort 在途请求（abort 之后的 reject 不当故障，也不复活 timer）。
-import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef } from 'vue';
+//
+// issue #602 加了**第五条前置**（上面四条一条不许退化）：**父 run 必须仍是当前活跃 run**。
+// 名册里的 `state` 是引擎 `finishRun` 写的，而 `background:true` 的子 run 随父 worker 进程一起消失
+// ⇒ 那句 `finishRun` 永远不会执行 ⇒ 名册永久 `running` ⇒ 上面纪律 ③「终态即停」在真机上**永不触发**
+//（实测：父 run finished、子名册 state:running / endedAt:null ⇒ 抽屉 10s 内 5 发，永不停）。
+// 所以上面四条之外再加一条：父 run 结束（`store.es.activeRunId` 不再是它）⇒ 当场停 timer，
+// 并在头部出一行**中性**说明（「状态未知」，不是告警）。父 run 是否活跃**只能从 store 读**：
+// 抽屉是只读的，不许为它新增任何取数逻辑。
+import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { renderMarkdown } from '../lib/markdown';
+import { useWorkbenchStore } from '../stores/workbench';
 import {
   DELEGATE_BADGE_CLASS,
   DELEGATE_POLL_MS,
+  DELEGATE_UNKNOWN_MARK,
   delegateBadgeKind,
   delegateStateKey,
   delegateToolCallText,
   delegateTranscriptUrl,
+  isDelegateLive,
   isDelegateTerminal,
   shortRunId,
   type DelegateMessage,
@@ -45,6 +56,8 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: 'close'): void }>();
 
 const { t } = useI18n();
+// 只为读「当前活跃 run 是谁」（#602）。不写、不拉：抽屉的取数面仍然只有 `delegateTranscriptUrl` 那一条。
+const store = useWorkbenchStore();
 
 /** P2 读侧响应体（每个字段都按脏值兜底：UI 不许假设后端一定给全）。 */
 interface DelegateTranscriptDto {
@@ -64,12 +77,36 @@ const totalTurns = ref(0);
 const errorMessage = ref('');
 const inFlight = ref(false);
 
+// ── #602 的第五条前置：父 run 是不是**当前活跃 run**（与卡片同源：只读 `es.activeRunId`）────
+/**
+ * 父 run 已结束（`activeRunId` 变 null 或已换成别的 run）时，名册里那个 `state` 再也不会更新了：
+ * `background:true` 的子 run 随父 worker 进程消失 ⇒ 引擎那句 `finishRun` 永不执行。
+ *
+ * 它**不是取数**：`store.es.activeRunId` 是 store 里已有的量（`running` 这个 computed 同源），
+ * 抽屉只是读——抽屉的取数面仍然只有 `delegateTranscriptUrl` 那一条（它仍是只读的）。
+ */
+const parentRunActive = computed(() => {
+  const active: unknown = store.es.activeRunId;
+  return typeof active === 'string' && active !== '' && active === props.parentRunId;
+});
+/**
+ * 名册还写着**活态**而父 run 已经结束 ⇒ 「在跑」是假信号，它是「状态未知」：
+ * 不转圈、不绿不红（与 `DelegateActivityBar` 对 `activity.stale` 的处理逐字同口径，
+ * 也与工具卡 `delegateView` 的 `orphaned` 分支同源——三处必须画得一样）。
+ *
+ * 只看名册那个 `state`：已经拿到终态 ⇒ 抽屉本来就有已知答案，不该多这一行。
+ */
+const parentEndedUnknown = computed(() => !parentRunActive.value && isDelegateLive(state.value));
+
 // ── 分级（唯一入口 delegateBadgeKind：syserr 判红 + aborted 琥珀都在它里面）────────────
 const badgeKind = computed(() =>
-  delegateBadgeKind(state.value, termination.value || props.termination || ''),
+  // #602：父 run 已结束时不拿名册那个旧 `running` 继续报「运行中」（那是谎报）：画 `unknown` 档。
+  parentEndedUnknown.value ? ('unknown' as const) : delegateBadgeKind(state.value, termination.value || props.termination || ''),
 );
 const badgeClass = computed(() => DELEGATE_BADGE_CLASS[badgeKind.value]);
-const stateText = computed(() => t(`delegate.state.${delegateStateKey(state.value)}`));
+const stateText = computed(() =>
+  t(`delegate.state.${parentEndedUnknown.value ? 'unknown' : delegateStateKey(state.value)}`),
+);
 const spinning = computed(() => badgeKind.value === 'running');
 
 // ── 三态（error > 空活态 starting > 空终态 empty > 有内容）───────────────────────────
@@ -82,7 +119,10 @@ const showStarting = computed(
 const showEmpty = computed(
   () => !showFatalError.value && messages.value.length === 0 && isDelegateTerminal(state.value),
 );
-const polling = computed(() => !showFatalError.value && !isDelegateTerminal(state.value));
+
+const polling = computed(() =>
+  !showFatalError.value && !isDelegateTerminal(state.value) && parentRunActive.value,
+);
 
 const title = computed(() =>
   t('delegate.viewerTitle', { id: shortRunId(props.childRunId) || props.childRunId }),
@@ -120,11 +160,17 @@ function clearTimer(): void {
   }
 }
 
-/** 终态即停（纪律 ③）：终态 / 已卸载 ⇒ 不再排程；否则固定 `DELEGATE_POLL_MS` 后补一发。 */
+/**
+ * 终态即停（纪律 ③）+ 父 run 结束即停（#602）：二者任一 ⇒ 不再排程；否则固定 `DELEGATE_POLL_MS` 后补一发。
+ *
+ * ⚠ 这一条必须挡在**排程**上，而不是只挡在 `polling` 那个文案位上：名册停在 `running` 时，
+ * 只改文案会让 timer 照样一拍一发，轮询依旧永久不停（那才是真机上的症状）。
+ */
 function schedule(): void {
   clearTimer();
   if (unmounted) return;
   if (isDelegateTerminal(state.value)) return;
+  if (!parentRunActive.value) return; // #602：父 run 已结束 ⇒ 这个 state 再也不会变了
   timer = setTimeout(() => {
     timer = null;
     void poll();
@@ -173,8 +219,17 @@ function refresh(): void {
 }
 
 function onVisibilityChange(): void {
-  if (document.visibilityState === 'visible' && !inFlight.value) refresh();
+  // #602：「重新可见立刻补一发」也只服务于**还在跑的父 run**；父 run 已结束时这一发同样不该发。
+  if (document.visibilityState === 'visible' && !inFlight.value && parentRunActive.value) refresh();
 }
+
+// #602：父 run 结束（`activeRunId` 不再是它）当场拆 timer，**不等下一拍**——与
+// `useDelegateActivity` 里 `watch(shouldPoll)` 那句「判据假 ⇒ 当场拆 timer + abort」同一口径。
+// 在途那一发不必 abort：响应落在抽屉上是 benign 信息，而它的 `finally` 会走 `schedule()`，
+// 那里已经拦住 ⇒ 链子到它为止，不会复活。
+watch(parentRunActive, (active) => {
+  if (!active) clearTimer();
+});
 
 // ── dialog 语义（对齐 FilePreviewModal）─────────────────────────────────────────────
 const dialogEl = useTemplateRef<HTMLElement>('dialogEl');
@@ -244,7 +299,7 @@ defineExpose({ refresh, poll });
             <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" opacity="0.25" />
             <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
-          <span v-else aria-hidden="true">{{ badgeKind === 'completed' ? '✓' : badgeKind === 'aborted' ? '■' : badgeKind === 'failed' ? '✗' : '·' }}</span>
+          <span v-else aria-hidden="true">{{ badgeKind === 'completed' ? '✓' : badgeKind === 'aborted' ? '■' : badgeKind === 'failed' ? '✗' : DELEGATE_UNKNOWN_MARK }}</span>
           <span>{{ stateText }}</span>
         </span>
         <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ title }}</span>
@@ -267,6 +322,15 @@ defineExpose({ refresh, poll });
 
       <p v-if="polling" class="px-4 py-1 text-xs text-black/40 dark:text-white/40">
         {{ t('delegate.polling') }}
+      </p>
+      <!-- issue #602：父 run 已结束而名册还写着活态 ⇒ 停轮询后**得说清楚为什么不再刷**。
+           中性灰小字，与上面那句 `delegate.polling` 同一形状：**不许** ⚠、**不许**红、不许告警底色。 -->
+      <p
+        v-if="parentEndedUnknown"
+        data-testid="delegate-parent-ended"
+        class="px-4 py-1 text-xs text-black/40 dark:text-white/40"
+      >
+        {{ t('delegate.viewer.parentEnded') }}
       </p>
       <!-- 只在上游明说「切过尾」（`truncated`）时才说，数字是**屏上条数**（不是切尾前的全量） -->
       <p v-if="truncated" class="px-4 py-1 text-xs text-amber-600">

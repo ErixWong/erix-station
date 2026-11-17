@@ -61,7 +61,12 @@ beforeEach(() => {
 });
 
 /** 挂载工作台（目录列表经 fetch 桩注入；会话列表恒为空）。 */
-async function mountWorkbench(user: AuthUser = FDE_USER, dirs = DIRS, gitLightBody: unknown = GIT_LIGHT_GREEN) {
+async function mountWorkbench(
+  user: AuthUser = FDE_USER,
+  dirs = DIRS,
+  gitLightBody: unknown = GIT_LIGHT_GREEN,
+  macroTemplatesBody: unknown = { items: [] },
+) {
   const pinia = createPinia();
   setActivePinia(pinia);
   // 按 URL 分派的 fetch 桩（先于 router.push：导航守卫会打 /api/me）。
@@ -72,6 +77,9 @@ async function mountWorkbench(user: AuthUser = FDE_USER, dirs = DIRS, gitLightBo
     if (url.startsWith('/api/sessions')) return jsonResponse({ items: [] });
     // issue #359 P0b：收工灯（默认给"已收工"，个别用例自己换成脏载荷）
     if (url.startsWith('/api/git-light')) return jsonResponse(gitLightBody);
+    // issue #614：用户级抽屉要能拉到模板与全局流水
+    if (url.startsWith('/api/macro-templates')) return jsonResponse(macroTemplatesBody);
+    if (url.startsWith('/api/macro-runs')) return jsonResponse({ items: [], nextCursor: null });
     return jsonResponse({});
   }));
   const auth = useAuthStore();
@@ -589,5 +597,44 @@ describe('WorkbenchView · 上传后重判收工灯（issue #472）', () => {
     const before = gitLightCalls();
     await tick();
     expect(gitLightCalls()).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #614：顶栏用户级 MacroMenu 的 chip 以前没人接 `@open-runs` ⇒ 点了静默丢弃。
+//   这里钉：点了顶栏 chip ⇒ 用户级流水抽屉真打开，且拉的是 `/api/macro-runs`（不是会话级）。
+//   DOM 断言（不用 w.emitted()，NODE_ENV=production 下恒空）。
+// ---------------------------------------------------------------------------
+describe('WorkbenchView · 顶栏用户级 chip 开抽屉（issue #614）', () => {
+  const USER_TPL = {
+    id: 't-daily', kind: 'scheduled-task', name: '每日 9 点 · 用户级', params: {}, scope: 'user', audience: 'all',
+  };
+
+  const fetchUrls = () => vi.mocked(fetch).mock.calls
+    .map(([u]) => (typeof u === 'string' ? u : u instanceof URL ? u.href : u.url));
+
+  it('没选会话时点顶栏 chip ⇒ 抽屉仍打开，卡片出现用户级模板名，且请求 /api/macro-runs', async () => {
+    const wrapper = await mountWorkbench(FDE_USER, DIRS, GIT_LIGHT_GREEN, { items: [USER_TPL] });
+    // 默认挂载未选会话（会话列表空）——旧代码此时 openMacroDrawer 直接 return，点了没反应
+    expect(useWorkbenchStore().sessionId).toBeFalsy();
+
+    const topChip = wrapper.find('[data-test="macro-menu"][data-scope="user"] [data-test="macro-chip"]');
+    expect(topChip.exists()).toBe(true);
+    await topChip.trigger('click');
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="macro-drawer"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain('每日 9 点 · 用户级');
+    // 走的是用户级全局端点，不是会话级（没会话也没有 /api/sessions/.../macro-runs）
+    expect(fetchUrls().some((u) => u.startsWith('/api/macro-runs'))).toBe(true);
+    expect(fetchUrls().some((u) => /\/macro-runs$/.test(u.split('?')[0]) && u.includes('/sessions/'))).toBe(false);
+  });
+
+  it('反向：会话级 chip 不存在时（无会话）顶栏那颗仍是用户级、仍接了 open-runs', async () => {
+    // 无会话 ⇒ 会话头那份 MacroMenu 不渲染（v-if store.sessionId），只剩顶栏用户级那颗
+    const wrapper = await mountWorkbench(FDE_USER, DIRS, GIT_LIGHT_GREEN, { items: [USER_TPL] });
+    const chips = wrapper.findAll('[data-test="macro-menu"]');
+    expect(chips).toHaveLength(1);
+    expect(chips[0].attributes('data-scope')).toBe('user');
   });
 });

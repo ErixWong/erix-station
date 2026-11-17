@@ -112,6 +112,13 @@ export const DELEGATE_BADGE_CLASS: Readonly<Record<DelegateBadgeKind, string>> =
   unknown: 'text-black/50',
 };
 
+/**
+ * 「状态未知」那一位的图形（抽屉徒章与工具卡**同一个字符**，与 `DELEGATE_BADGE_CLASS` 同理：
+ * 卡片与抽屉必须画得一样，否则「卡片一个形状、抽屉另一个形状」就是下一个 #236）。
+ * 它是中性点，**不是** ✓/✗/⚠（issue #602：「状态未知」既不是成功也不是失败）。
+ */
+export const DELEGATE_UNKNOWN_MARK = '·';
+
 /** 状态文案的 i18n 键后缀（`delegate.state.<kind>`）。7 值 + unknown 共 8 个，双语成对。 */
 export function delegateStateKey(state: unknown): string {
   return typeof state === 'string' && (DELEGATE_ROSTER_STATES as readonly string[]).includes(state)

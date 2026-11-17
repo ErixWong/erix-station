@@ -8148,3 +8148,265 @@ rc=0**；`portal/test/market.test.js` 23 条、`materializer.test.js` 37 条（�
 digest 并 `docker rm -f fde-eric` + `provision-fde` 即可（`docs/ops/deployment-2026-10-10.md` §升级/回滚）。
 ⚠ 跑 compose 必须在**同一棵树**里：从别的树 `up -d` 会用它自己的 `context: ..` 把 `portal:local` 标签
 重新指到那棵树（本次踩过：main 的树把标签指回旧代码，镜像里查不到 `market.js`）。
+
+### 8.154 版本三格真机 e2e 固化 + 发版 v0.1.70 的真机验收（#603，2026-11-16/17，主 agent + worker）
+
+接 §8.150 / §8.151。**#586 的验收原本是我手搓在 `/tmp` 里的脚本**（跑完就没了）⇒ 本单把它固化成
+仓库里可复跑的判据，并用它验完 v0.1.70。
+
+**落地**：`portal/integration/version-surface-e2e.mjs`（607 行）+ `npm run test:integration:version`，
+三层腿 + 缺环境 `skip`（打印原因，不假绿不硬失败）：
+
+| 腿 | 断什么 | skip 条件 |
+|---|---|---|
+| A1 `/api/health` | 三格非空、`status=ok`、**不许有 engine 键** | portal 连不上 |
+| A2 登录 → `/api/admin/version` | 三格齐、`source` 合法、`provenance` **按 source 独立复算**相等、`buildInfoPath` 非空 | 缺口令 / 无 cookie |
+| A3 `fdes[]` | 每行 `versionSource=containers.agent_version` + `snapshot=provision` | `fdes=[]`（明说「不算验过」） |
+| C1 容器腿 | `docker exec cat /app/build-info.json` 与 A2 三格**逐格 equal** | docker 不通 / 无该文件 |
+| U1 UI 腿（`E2E_UI=1`） | 真浏览器进 `#/admin/about`：三区块 / 页值==API 值 / 快照标注数 / 无溢出 / 无控制台错误 + 截图 | 没点名 / 无 playwright 容器 |
+
+**主 agent 复跑**：三层腿 rc=0；跳过路径（`PORTAL_URL=http://127.0.0.1:1`）rc=0 且 5 条全 SKIP；
+两处变异（`provenance.fdes` 改错 ⇒ A3 红；health 期望 200→299 ⇒ A1 红）；根 `npm test` 2771 项不受影响
+（integration 文件不被 `node --test` 收进去）。
+
+**发版 v0.1.70**：`#604`（版本三处对齐 0.1.69→0.1.70，`a5deeb7`）→ tag `v0.1.70` → release run
+`43910657016` success → portal digest `sha256:9b9b5e91…`。发布镜像四格实测
+`0.1.70 / engine 0.33.0 / revision a5deeb7 / built_at 2026-11-16T16:43:52Z`（revision 与 tag 指向的
+commit **一致**）。dev 栈改 pin 该 digest（`deploy/.env:72`，备份 `/tmp/deploy-env.bak70.*`）后
+`E2E_UI=1 npm run test:integration:version` ⇒ **5/5 rc=0**，截图 157,301 字节、8 台 FDE 全带快照标注。
+
+**两件如实记账**：
+- **tag 不是我打的**：`v0.1.70` 在我执行 `git tag` 前已由并行 session 建好（`a5deeb7`，release run
+  `43910657016`，早我 8 分钟）。内容对（含 #586/#589），但**不含 #603 的 e2e 脚本**（#607 在其后合并）
+  ⇒ 「拉 tag 的人手里没有 e2e 脚本」，要跑得从 main 取。下次发版会自然带上。
+- **vision 看图这一腿：先判错、后补上（口径纠正）**。当时 `analyze_image` 连 4 次 `http_request_failed`，
+  我先记成「上游 API 挂」——**错**。真因是**本机 `llama.cpp` 容器已 `Exited` 3 周**（`:8008` 无响应），
+  而 vision 的默认模型 `Qwen3.5-4B` 就由它提供（经 relay `llm-gateway.internal` 映射）⇒ relay 报
+  `http_request_failed` 是**后端死了**，不是外网抽风。`docker start llama.cpp` 后 1s 出 OK。
+  **但 `analyze_image` 仍超时**：视觉推理 + 大图实测 **51s**，超过 pi 的 MCP 调用超时 ⇒ 改走 CLI
+  通道（`~/.local/bin/vision-mcp --file <png> "<问题>"`）拿到确认：三区块标题、Server 三格
+  `0.1.71 / f50dd4fb664… / 11/16 5:23 PM`、无红色报错/无空白/无重叠、每台 FDE 都带
+  `provision-time snapshot`。⚠ 它把 revision 读成 `f50dd4fb664…`（实际 `f50dd4bfb646…`）——
+  **易混字符误读**是 `vision-mcp` 文件头写明的已知短板 ⇒ **逐字判据（版本号/commit/revision）一律靠
+  DOM 或接口断言，看图只用来判「有没有渲染错乱/空白/重叠」**。
+- 另：跑 e2e 时发现真机 portal 被并行 session 重建过 ⇒ `revision/built_at` 变 `unknown`（本地
+  `docker compose build` 没传 `STATION_REVISION`/`STATION_BUILD_DATE`，compose 缺省即 `unknown`）。
+  这**恰好证明口径诚实**（本地乱建不会编合法版本号），也说明 CI 的 ④′ tripwire 才是这条的守门人。
+
+### 8.155 v0.1.70 重切为 v0.1.71：tag 的树必须就是「我们验过的那份」（#603 后续，2026-11-17，主 agent）
+
+接 §8.154。**为什么重切**：`v0.1.70` 指向 `a5deeb7`（#604 合并），而 #603 的交付物 `bcee26d`（e2e 脚本）
+与 #607 合并在它**之后** ⇒ **tag 的树 ≠ main**，且差的正是本单的交付物本身。这正是 #586 要消灭的形状
+（版本号必须能指认到确切的那份树），不能靠「下次发版自然带上」了事。
+
+**处置**：
+- **不动 `v0.1.70` 的 tag**（已发布镜像不可变；移动 tag = 造假，且 GHCR 上那两个 digest 已存在）。
+  `v0.1.70` 保留为「产品代码与 0.1.71 相同、但树里缺 e2e 脚本」的历史点，`latest` 由 0.1.71 重新指向。
+- 从 main 切 `v0.1.71`（三处版本号对齐 + 本条台账）。
+
+**结果（实测，不是承诺）**：main `f50dd4b`（CI 双绿）→ tag `v0.1.71` → release run `43917810893` success
+→ portal digest `sha256:22644c7d…`。发布镜像四格实测
+`0.1.71 / engine 0.33.0 / revision f50dd4b / built_at 2026-11-16T17:23:26Z`（revision = tag 指向的 commit）；
+镜像里确实带上了 #603 的交付物（`/app/portal/integration/version-surface-e2e.mjs`，42,887 字节）。
+dev 栈 pin 换成该 digest（`deploy/.env:72`，备份 `/tmp/deploy-env.bak71.*`）后
+`E2E_UI=1 npm run test:integration:version` ⇒ **5/5 rc=0**（A1/A2/A3/C1/U1 全跑，截图 157,068 字节、8 台 FDE）。
+
+**两版之间没有产品代码差异**（`git diff --stat v0.1.70..main` 只有 `portal/integration/version-surface-e2e.mjs`
++ 一条 npm script + 两篇设计文档 + 台账）⇒ 这不是「修 bug 的版本」，是**让 tag 追上验过的树**。
+
+### 8.156 #602 子 run 收尾后的假「在跑」+ J4 假红止血 + v0.1.70 部署落 pin（2026-11-16/17，主 agent + pi worker）
+
+接 §8.152（子 run 活动可视化落地）。真机 e2e 全绿之后**仍有一处说谎**：父 run `finished` 之后，
+子名册里那条 `state: running` / `endedAt: null` 永远不会再变（后台子随父进程消失 ⇒ `finishRun`
+永不执行），界面照着名册渲染 ⇒ **卡片永久转圈、抽屉永久轮询**（实测 `.delegate-state svg.animate-spin` = 1，
+抽屉 10s 内 5 发）。
+
+**#602 修法（PR #605，纯前端 7 文件 +379/−19，零后端）**：判据不是「名册说它活着」，而是
+**「它还是当前这个 run 的活跃子」**——
+- 卡片：`kind === 'running' && !cardRunStillActive(card)`（后者只认 `card.runId === store.es.activeRunId`）
+  ⇒ 落 `unknown` 档**中性灰 `·`**（`DELEGATE_UNKNOWN_MARK`）。**不掉回 `✓`**：那是谎报成功。
+- 抽屉：`parentRunActive = store.es.activeRunId === props.parentRunId` 进 `schedule()` / `polling` /
+  `onVisibilityChange` 三处 + `watch` 当场拆 timer，头部给 `data-testid="delegate-parent-ended"` 中性小字
+  （「The parent run has ended, so the sub-task status is no longer updated (actual state unknown)」）。
+- 定点判据 `/tmp/e2e602-verify.log`：卡住子 `lastIsNeutralDot: true` / `spinners: 0` / `lastHasNoRed: true` /
+  `drawerPolls: 0` / `drawerHasParentEnded: true`；**前台**子 `d8eb83d1` 仍 `✓ Completed`（未误伤）。
+- 门禁（主 agent 亲跑，`NODE_ENV` 为空）：`typecheck` rc=0；`npm test` rc=0（78 文件 / **1629** 用例）。
+
+**J4 假红（PR #606，只改 `portal/test/delegation.test.js`）**：PR #605 的 CI 红**不是 #602 的回归**——
+`J4 顺手1 缓存键真的按 size 变` 断的是 `notStrictEqual(第二次 at, 第一次 at)`，而 `at = floor(mtimeMs)`；
+GitHub runner 上两次写落在**同一毫秒** ⇒ 两数相同 ⇒ 假红（CI 原文 `expected: 1794846022708 actual: 1794846022708`）。
+本机（慢一点）恰好跨毫秒 ⇒ 本地永远绿 ⇒ **判据依赖机器速度**。改法：两次写盘都用 `fsp.utimes` **钉固定值**
+（`1_700_000_000` / `1_800_000_000`）并断 `at === 钉进去的值`；另**追加第三相**把 mtime 钉回同一个值、
+只追加内容 ⇒ 此时**只有 `size` 一元在动**，断「必须换键重读 + 摘要换成新内容」。第三相不是锦上添花：
+只钉两个不同固定值时，「缓存键没带 `size`」这支变异会靠 mtime 差异**逃掉**。判据：单文件 **5 连跑 5×rc=0**
+（37/37）、变异 A（键去掉 `st.size`）**唯一红格 = J4**、根 `npm test` rc=0（**2721** pass / 0 fail / 50 skip）。
+
+**发版 v0.1.70（我这一半）**：`v0.1.70` 的 tag 由本 session 打（§8.154 记的「tag 不是我打的」= 这条），
+release run `43910657016` success；版本前置 `#604`（0.1.69→0.1.70 三处对齐）由并行 session 出、我在发版前合入。
+
+**部署落 pin（本单收尾，`deploy/.env`，600 不入库）**——进来时是**半套**状态：portal 已被并行 session
+pin 到 0.1.70（`…portal@sha256:9b9b5e91…`，容器 RepoDigests 已核），而
+- `FDE_IMAGE=sha256:b94c72fc…` 是**本地 build**（`erix-station/fde:local`，`RepoDigests` 为空），不是发布件；
+- `STATION_DOCKER_PROXY_IMAGE=sha256:19c62c83…` 指向的镜像**本机根本不存在**（`No such image`）。
+
+⇒ 三处统一成形态①（manifest digest，两形态门认的那一形）：
+`FDE_IMAGE=…/erix-station-fde@sha256:625780a0…`（`docker pull` 6m32s，落盘 `.Id = c929c1ea…`，与 registry
+`config.digest` 逐字相同）、`STATION_DOCKER_PROXY_IMAGE=…/erix-station-fde-proxy@sha256:fb82e65d…`
+（`.Id = 79dbb1f4…`）；portal 原 pin 未动。备份 `/tmp/deploy.env.bak-261117-01`。
+`docker compose -f deploy/docker-compose.yml up -d` ⇒ `station-docker-proxy` + `station-portal` **Recreated**、
+两容器 healthy，`Config.Image` 与 pin 逐字一致。读数：`/api/health` = `0.1.70 / revision a5deeb7 / built_at
+2026-11-16T16:43:52Z`，容器内 `/app/build-info.json` = `0.1.70 / engine 0.33.0 / a5deeb7 / 同一 built_at`
+（**revision 与 tag 指向的 commit 一致** ⇒ 跑的是 CI 烘的那份，不是本地乱建）。
+`E2E_UI=1 npm run test:integration:version`（#603 固化的真机判据）⇒ **5/5 rc=0**（含真浏览器 U1 腿）。
+
+**两件如实记**：
+- **FDE 容器没重建**：`fde-eric` 在 `sha256:b94c72fc…`（本地 build，6h）、其余四台在 `sha256:d4b7cde4…`（13h），
+  都**不是**新 pin 的 `c929c1ea…`。runbook §2 第 5 条要求换 FDE 镜像必须显式 `docker rm -f` + `provision-fde`
+  ⇒ 会**杀掉在飞的 run**，故留给用户拍板，不顺手做（`ensureFdeContainer` 只在容器不存在时创建，pin 变化
+  不会自己生效——这正是它不生效的原因）。
+- **`v0.1.71` 的 tag 还空着**：main 已是 `0.1.71`（`#612`，`f50dd4b`），但 `git tag -l 'v0.1.7*'` 只有
+  `v0.1.7` / `v0.1.70`。§8.155 计划的重切**只差打 tag 这一步**，属并行 session 的账，本单不代打
+  （同一版本两个 session 各打一次正是 §8.154 要记的那种混乱）。
+
+### 8.157 部署移到 v0.1.71 + 5 台 FDE 容器重建（版本分裂消除）（2026-11-17，主 agent）
+
+接 §8.156。§8.156 落 pin 的是 `v0.1.70`，而**同一晚 `v0.1.71` 已被并行 session 切出来并发布成功**
+（tag `v0.1.71` → release run `43917810893` success，三镜像 `latest` 已重新指向：portal `22644c7d…` /
+fde `84007d94…` / proxy `3c3f6eb6…`）⇒ 部署再走一步，把栈整体挪到 0.1.71，顺手消掉 §8.156 记的那处
+**版本分裂**（portal 0.1.70 vs FDE 容器 0.1.69，其中 `fde-eric` 还是 `revision unknown` 的本地 build）。
+
+**做法与读数**：
+- `deploy/.env` 三处换成 0.1.71 的**形态①** manifest digest（备份 `/tmp/deploy.env.bak-261117-71`）：
+  `FDE_IMAGE=…erix-station-fde@sha256:84007d94…`（拉取 1m20s，落盘 `.Id = a83b1f0b…`）、
+  `STATION_PORTAL_IMAGE=…portal@sha256:22644c7d…`（`.Id = e6536f76…`）、
+  `STATION_DOCKER_PROXY_IMAGE=…fde-proxy@sha256:3c3f6eb6…`（`.Id = ca85d467…`）。
+- `docker compose up -d` ⇒ `station-portal` / `station-docker-proxy` Recreated + healthy。
+- **FDE 容器重建**（runbook §2 第 5 条：`ensureFdeContainer` 只在容器不存在时创建，pin 变了不会自己生效）：
+  **先验在飞 run = 0**（`select count(*) from runs where status in ('running','queued')` ⇒ `0`，只余一条历史
+  `cancelling`），再逐台 `docker rm -f fde-<name>` + `provision-fde --fde-name <name>`，
+  5 台（`tetris` / `todo` / `blind` / `acc019` / `eric`）全部 `provision rc=0`、`image = a83b1f0b…`（= 新 pin 的 `.Id`）。
+  数据不丢的依据：工作区是宿主 bind mount（`/srv/erix/users/<name>/{home,projects,cache}`），容器是牲口。
+- **分裂消除**：portal `/api/health` = `0.1.71 / revision f50dd4b / built_at 2026-11-16T17:23:26Z`；
+  5 台 FDE 容器内 `/opt/erix/build-info.json` **逐格相同**（`0.1.71 / engine 0.33.0 / f50dd4b / 同一 built_at`）。
+  ⚠ FDE 镜像里那份文件在 **`/opt/erix/build-info.json`**（不是 portal 的 `/app/build-info.json`）——
+  拿 portal 的路径去 `docker exec fde-*` 会得到 `No such file`，别据此判「镜像里没烘」。
+
+**验收**：`E2E_UI=1 npm run test:integration:version` ⇒ **5/5 rc=0**，截图 `/tmp/version-surface-e2e.png`
+（160,348 字节）：About 面板 Server `0.1.71 / f50dd4bfb646… / 11/16/2026 5:23:26 PM`、平台引擎 `0.33.0`、
+每台 FDE 行带 `provision-time snapshot` 且镜像摘要 = `…fde@sha256:84007d94…`（与 pin 同源）。
+
+**一处环境兜底，如实记**：第一次跑 UI 腿被 skip，原因是 **`admin.fde.erix.vip` 解析不出**
+（`net::ERR_NAME_NOT_RESOLVED`）——**宿主自己 `getent hosts` 也解析不出**（伞域泛解析依赖的内网 DNS
+间歇性抽风，与 AGENTS §4 记的那条同族）。兜底：给 `erix_station_playwright` 容器 `/etc/hosts` 加
+`172.17.0.1 admin.fde.erix.vip station.fde.erix.vip`（Traefik `network_mode: host`，管理台入口在宿主 9443），
+重跑即 5/5。**这是测试环境兜底，不是产品修复**；容器重启后该行会消失，下次 skip 先查这一条。
+
+### 8.158 事件平台真机 e2e 首轮：主链路可用，但**三条主功能根本没接通**（2026-11-17 凌晨，主 agent + copilot 独立验收）
+
+接 §8.148。八单合并后主 agent 判断只到「代码交付」档，`0 模板 / 0 订阅 / 0 执行账 / 0 通知`
+说明整条链路一次都没端到端跑过。本单做首轮真机 e2e，**结论推翻了自己此前的乐观判断**。
+
+**方法**：curl 打 API + playwright 实点 + 截图（逐张读过）+ DOM 文本断言。
+环境：dev 栈（portal up 3h healthy / db up 7d / Traefik 8090 用户面 + 9443 管理台）。
+报告：`~/worker-reports-261108/e2e-event-platform-261117.md`。
+
+#### 验通的（逐条实测）
+
+管理台：两个新 tab 都在；建模板成功；5 筛选齐全；汇总口径**正确**
+（`triggered=6/done=4`，`byVerdict` 各 25% —— **分母是 done 不是 triggered**）；「跳过」单列；
+无 session 列；Cost 缺数据显示 `—` 不是 `↑0 ↓0`。
+用户面：三个件都在（chip / 铃铛 / 侧栏 Automation 分组）；会话级 chip 点开 "Watch log" 抽屉
+（宽 510px ✓、只有 Template/Verdict 两个筛选 ✓、空态 ✓）；挂订阅后顶部状态条 + 5 个判决映射 ✓；
+模板列表不含运维字段 ✓；通知全链路（角标 1 → 列表 → 标记已读 → 0，`read_at` 落库）✓。
+后端：评估循环真在跑，`[macro-eval] 跳过 anchor=clock:2026-11-17 reason=quiet_hours`，
+**UTC+8 日期正确**（01:0x 本地 ⇒ 11-17，不是 UTC 的 11-16）。
+
+#### 抓到的 8 个缺陷（主 agent 4 + 独立验收者 4，全部现验过）
+
+| # | issue | 严重度 | 一句话 |
+|---|---|---|---|
+| 1 | **#616** | **致命** | **评估器产出的意图没有任何消费者**：`executeScheduledIntent` / `runMacroReview` **只被自己的测试引用**，`cli.js` 只启动循环，`void tick()` 把返回值丢掉 ⇒ M1/M9/M7 三条主功能全断，且通过门禁的意图留下**永久 `pending` 行** |
+| 2 | **#623** | **高** | `scheduled-task` 是 `scope='user'`，但**用户没有任何订阅写入口**（user 模板只读 + 唯一订阅接口是会话级 + `assignTemplate` 拒绝 user+sessionId）⇒ M7 **开户路径不存在**，e2e 那条订阅是 `psql INSERT` 进去的 |
+| 3 | #611 | 高 | `quiet_hours` 对所有 kind 无条件生效 ⇒ 用户设 01:00 的任务每天被静默跳过；冻结常量不可配；窗口内**直接丢弃**（设计要求「积压到窗口外合并发一封」） |
+| 4 | #614 | 高 | 顶栏用户级 `MacroMenu` 的 chip **点了没反应**（`<MacroMenu scope="user" />` 无 `@open-runs` 监听）+ `openMacroDrawer()` 硬依赖 `sessionId`（语义错配） |
+| 5 | #624 | 中 | `until` 到期后**订阅永不停用**（`listEvaluableAssignments` 不看 `until`，只有 `claimMacroRun` 顺手收敛 ⇒ 不走 claim 的 kind 永远 enabled）+ 到期通知无消费者 |
+| 6 | #625 | 中 | `KIND_SCHEMA` 缺 `default`/`required` ⇒ UI 建 `run-notify` 时 `states: []`（**永远不会通知**，界面却显示 Enabled）；`at`/`cwd`/`task` 非严格必填 |
+| 7 | #626 | 中 | W4a 只读闸**第四条旁路**：`fold-notes.js` 直调 `executors('note_take')`，绕过 `executeTool` 的 reviewOnly 闸 ⇒ 审查 run 折叠上下文时仍会写 notes |
+| 8 | #627 | 中 | M7 三处静默失效：`jitter` 存了不用、复用宏会话不刷 `cwd`、`maxRounds` 没进 run |
+
+另：**#617**（`max_per_day`/`quiet_hours` 不在 `KIND_SCHEMA` ⇒ 预算闸是死代码）—— 与 #611 同源，合并做。
+已修合并：#613（订阅数，PR #622）。
+
+#### 这一轮最值钱的三条口径
+
+1. **「八单全绿 + CI pass + 单测全绿」不等于「功能可用」。**
+   #616 那种「零件全交付了、没人接线」的缺陷，**任何单测都抓不到** ——
+   每个零件的单测都在测「这个零件对不对」，没人测「它们连起来了吗」。
+   ⇒ **每批多单合并后，必须有一次「从用户动作到系统结果」的端到端走查**，
+   而且要走**产品路径**（e2e 里那条订阅是 `psql INSERT` 的，这本身就是信号：走不通才需要绕）。
+
+2. **派单边界要问「谁调用它」，不只问「它做什么」。**
+   W2 的单写明「不执行动作，只产意图」，W7 的单写明「交付执行器」——
+   两张单都完成了，**但「谁把意图交给执行器」不属于任何一张单**。
+   这与 §8.146 记的「没人起 run」是**同一类错误换了位置**。
+   ⇒ 拆单时对每个「产出一份数据」的模块，必须显式指派一个「消费它的单」；
+   否则就是两个半成品拼不成产品。
+
+3. **独立验收（copilot 只读）必须给「找漏」的指令，不是「复核」的指令。**
+   这轮 prompt 是「不要复述主 agent 的结论，去找他漏掉的东西」，结果它抓到
+   #623/#624/#625/#626/#627 五条我漏的（#623 直接决定 M7 是否可用）。
+   反例：若 prompt 写「请复核这份 e2e 报告」，它大概率只会确认我的结论。
+
+#### 操作坑（记一笔）
+
+- **`erix_run` 的后台 run 会被 pi 进程重启杀掉**（status.json 停在 `running`/0 轮、树里零提交）。
+  本轮 w-611 就这么死了一次，用 `resume: <status.json 路径>` 救回来。
+- **`gh pr merge` 冲突失败后，紧接着删远端分支会把 PR 变成 CLOSED**（不是留在 OPEN）。
+  本轮 §8.157 的台账 PR 就这么没了，只能重开。⇒ 合并失败时**先别删分支**。
+- **台账编号会被并行 session 抢先**：本单原本写 8.157，被另一个 session 占了 ⇒ 让号到 8.158。
+- **vision MCP 上游间歇失败**，但模型能直接读图 —— `read` 一张 png 即可，不必依赖 vision 服务。
+
+#### 环境副作用（待还原）
+
+为让 `eric` 能密码登录做 UI e2e，临时改了 dev 库：
+`UPDATE users SET mail_otp_enabled=false WHERE login='eric'`（**原值 `t`**）。
+验完须还原（或按 §4.1 口径保持 dev 密码直通，由用户定）。
+
+**待办**：#611+#617、#614+#615、#616（均在跑）、#623、#624、#625、#626、#627。
+
+### 8.159 发版 v0.1.72 并部署到位（切版 + 三份 lockfile 补齐 + 5 台 FDE 重建 + 5/5 真机验收）（2026-11-17，主 agent）
+
+接 §8.157。`v0.1.71` 之后 main 上又有**产品代码**（`#622` 的 `fix(#613)`：`portal/src/macros.js` /
+`macro-routes.js` 下发 `adminTemplates.subscriberCount`，+106 行含测试）⇒ 需要一个能指认到那份树的版本号。
+
+**切版（`#629`，`1c4b74a`）**：三处 `package.json` + **三份 lockfile** 一起对齐到 `0.1.72`。
+⚠ **lockfile 的上两次切版（#604 / #612）只改了 `package.json`**，三份 lockfile 的 root 版本还停在
+`0.1.69`（`sed -n 1,10p` 现查：三份都在第 3、9 行）⇒ 本单补齐，不留「package.json 说 0.1.72、lockfile 说
+0.1.69」的第二本账。⚠ 另记：`node -p require('./package.json').version` 在本仓**不能当唯一判据**——
+它只读 package.json；判「三处 + 三份 lockfile 都对齐」得逐个 `node -p`（本单这么做的）。
+
+**发版前置两条铁律（`#620` 新增）逐条落地**：
+1. **tag 现查是否已存在**：`git tag -l 'v0.1.7*'` = `v0.1.7` / `v0.1.70` / `v0.1.71` ⇒ `v0.1.72` 未被占
+   （并 `git ls-remote --tags origin refs/tags/v0.1.72` 复核远端 0 条）。
+2. **tag 必须指向验过的树**：`#629` 合并后先等 **main 上该 commit 自己的 CI 跑绿**（run 的 `headSha =
+   1c4b74a`，`completed/success`），再在 `1c4b74a` 上打 annotated tag ⇒ tag 的树 = main 的树 = CI 验过的那份。
+   ⚠ 过程中撞到一次「**merge commit 的树 ≠ PR 分支的树**」：`#629` 合并时 main 上多插了一条 `#630`（台账
+   docs），`git rev-parse 1c4b74a^{tree}` 与 `3608695^{tree}` 不同 ⇒ 若照 PR 那次 CI 的结论去打 tag，
+   就是 §8.154/§8.155 记的那个形状。判据不是「PR 绿了」，是「**要打 tag 的那个 commit 自己绿了**」。
+
+**发布读数**：release run `43989025198` **completed/success**；三镜像 digest（`latest` 同步重新指向）：
+portal `sha256:3de136f0…`（`.Id effbf282…`）· fde `sha256:e953727a…`（`.Id 68bef8d0…`）·
+proxy `sha256:b9d93cdd…`（`.Id b2dbc1ee…`）。FDE 镜像拉取 **8m24s**。
+
+**部署**：`deploy/.env` 三 pin 换 0.1.72 形态①（备份 `/tmp/deploy.env.bak-261117-72`）→ `up -d` 重建
+portal/proxy → **先验在飞 run = 0** 再逐台 `docker rm -f fde-<name>` + `provision-fde`，5 台
+（`tetris`/`todo`/`blind`/`acc019`/`eric`）全部 `rc=0` 且 `image = 68bef8d0…`（= 新 pin 的 `.Id`）。
+
+**验收**：`/api/health` = `0.1.72 / revision 1c4b74a / built_at 2026-11-17T00:37:01Z`；5 台 FDE 容器内
+`/opt/erix/build-info.json` **逐格相同**；`E2E_UI=1 npm run test:integration:version` ⇒ **5/5 rc=0**
+（截图 `/tmp/version-surface-e2e.png`，158,412 字节：Server `0.1.72 / 1c4b74aec364… / 11/17/2026 12:37:01 AM`、
+平台引擎 `0.33.0`、每台 FDE 行镜像摘要 = `…fde@sha256:e953727a…` 与 pin 同源）。
+
+**一处遗留，如实记**：3 个 revoked 测试账号（`portsprobe` / `pw173jscw` / `ui17kbwg`）**没有容器**，
+About 面板上仍显示它们停用时的旧快照摘要（`941a157c…` / `4c1e7068…`）——那是**历史快照不是当前运行**，
+面板本来就把第三格标成 `derived copy, not authoritative`，不修（重建一个 revoked 账号的容器没有意义）。

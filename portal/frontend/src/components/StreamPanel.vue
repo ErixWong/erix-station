@@ -27,6 +27,7 @@ import { compactionLayerSegments, formatSavedTokens, type SessionCompaction } fr
 import DelegateChildDrawer from './DelegateChildDrawer.vue';
 import {
   DELEGATE_BADGE_CLASS,
+  DELEGATE_UNKNOWN_MARK,
   delegateBadgeKind,
   parseDelegateResult,
   shortRunId,
@@ -166,14 +167,33 @@ function cardOut(card: ToolCardState): string {
 /** 头行渲染所需的全部派生量（一次算完，模板里只插值不写业务）。 */
 interface DelegateView {
   summary: string;
+  /** **要画出来的**分级（活态快照但所属 run 已结束时已被换成 `unknown`，见 `delegateView`）。 */
   kind: DelegateBadgeKind;
   spinner: boolean;
   mark: string;
   color: string;
   openable: boolean;
+  /** #602：`true` = 活态快照但所属 run 已收尾 ⇒ 状态未知（模板给一句 tooltip，别让人猜那个 `·`）。 */
+  stale: boolean;
 }
 
 const delegateCache = new WeakMap<ToolCardState, DelegateResult | null>();
+
+/**
+ * 这张卡所属的 run **还是当前活跃 run** 吗（issue #602）。
+ *
+ * 卡片上的 `state` 是**派发那一刻**的工具结果快照，之后没有任何东西会更新它；而 `background:true`
+ * 的子 run 会随父 worker 进程一起消失（引擎那句 `finishRun` 永远不会执行）⇒ 名册**永久**停在
+ * `running`。于是父 run 一结束（`activeRunId` 变 null，或用户切去了别的 run），「还在跑」就永远是
+ * 假话 —— 真机读数（2026-11-16）：父 run `finished`、子名册 `state: running`、卡片 spinner 命中 1。
+ *
+ * 只认 `store.es.activeRunId`（当前 run 的唯一来源）；`card.runId` 两条建卡路径都填，缺席就当认不出
+ * （不为一个认不出父 run 的老卡谎报「在跑」，与 `useDelegateActivity` 的触发判据同一取舍）。
+ */
+function cardRunStillActive(card: ToolCardState): boolean {
+  const active: unknown = store.es.activeRunId;
+  return typeof active === 'string' && active !== '' && card.runId === active;
+}
 
 /** delegate 卡的结果载荷；非 delegate 卡 / 解不出 ⇒ null（整段退回既有摘要与 ✓/✗）。 */
 function delegatePayload(card: ToolCardState): DelegateResult | null {
@@ -194,18 +214,28 @@ function delegateView(callId: string): DelegateView | null {
   // 分级单一入口（state + termination）；syserr 检查在 `completed` 之前，所以「completed + 落盘失败」仍红。
   const kind = delegateBadgeKind(p.state, p.termination || undefined);
   const summary = [p.action, shortRunId(p.runId)].filter((part) => part !== '').join(' · ');
+  // issue #602：活态快照 + 所属 run 已不是当前活跃 run ⇒ 「在跑」是假信号，按 `unknown` 那一档收尾。
+  // ⚠ 这是**状态未知**，不是失败也不是成功：中性灰（`DELEGATE_BADGE_CLASS.unknown`）、不转圈、
+  // 也不许掉回 `statusMark(card)`（那种子工具结果本身 ok:true，掉回去就谎报成 ✓）。
+  const orphaned = kind === 'running' && !cardRunStillActive(card);
+  const shown: DelegateBadgeKind = orphaned ? 'unknown' : kind;
   // state 拿不到（脏值 / 只有 `{ok:false,reason}` 这种拒单）⇒ 不猜成红色，沿用既有 ✓/✗/…。
-  const known = kind !== 'unknown';
+  const known = shown !== 'unknown';
   return {
     summary: summary !== '' ? summary : summaryText(card),
-    kind,
-    spinner: kind === 'running',
-    mark: known
-      ? kind === 'completed' ? '✓' : kind === 'aborted' ? '■' : kind === 'failed' ? '✗' : ''
-      : statusMark(card),
-    color: known ? DELEGATE_BADGE_CLASS[kind] : (card.ok === false ? 'text-red-600' : 'text-black/50'),
+    kind: shown,
+    spinner: shown === 'running',
+    mark: orphaned
+      ? DELEGATE_UNKNOWN_MARK
+      : known
+        ? shown === 'completed' ? '✓' : shown === 'aborted' ? '■' : shown === 'failed' ? '✗' : ''
+        : statusMark(card),
+    color: orphaned
+      ? DELEGATE_BADGE_CLASS.unknown
+      : known ? DELEGATE_BADGE_CLASS[shown] : (card.ok === false ? 'text-red-600' : 'text-black/50'),
     // 抽屉要两个 id 才拉得到数据：子 runId 来自结果，父 runId 来自卡片（两条建卡路径都填了）。
     openable: p.ok === true && p.runId !== '',
+    stale: orphaned,
   };
 }
 
@@ -643,11 +673,14 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
           >
             {{ summaryText(store.es.toolCards.get(en.callId)!) }}
           </span>
-          <!-- 状态位：spinner+蓝 / ✓ 绿 / ■ 琥珀 / ✗ 红（红色集含「completed + syserr termination」） -->
+          <!-- 状态位：spinner+蓝 / ✓ 绿 / ■ 琥珀 / ✗ 红（红色集含「completed + syserr termination」）；
+               run 已结束而快照仍是活态 ⇒ 中性灰 `·`（issue #602，**不是**红也不是绿） -->
           <span
             v-if="delegateView(en.callId)"
             class="delegate-state flex shrink-0 items-center font-normal"
             :class="delegateView(en.callId)!.color"
+            :data-badge-kind="delegateView(en.callId)!.kind"
+            :title="delegateView(en.callId)!.stale ? t('delegate.state.unknown') : undefined"
           >
             <svg
               v-if="delegateView(en.callId)!.spinner"
