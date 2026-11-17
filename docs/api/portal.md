@@ -3050,6 +3050,7 @@ git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什�
       "revoked": false, "versionSource": "containers.agent_version", "snapshot": "provision" }
   ],
   "fdesPresent": true,
+  "localBuild": false,
   "provenance": { "server": "build-info.json", "platformEngine": "build-info.json",
                   "fdes": "containers.agent_version", "fdesSnapshot": "provision" }
 }
@@ -3075,6 +3076,16 @@ git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什�
   代码入参三个旋钮都能改它，前两个是契约测试的注入点 ⇒ 「路径被改过」必须在界面上可见）。
   它只证明「读了这条路径」，**证明不了「读到了」**——读到没有看 `provenance`。`/api/health` **不带**这一格
   （公开端点不泄露部署路径，§5.1 的形状仍是 `station`/`revision`/`builtAt` 三格）。
+- `localBuild` 是**顶层真布尔**（issue #643 B）：`true` = 这份 portal 构建**没身份**（`revision`
+  是 `unknown` ⇒ 镜像里 `build-info.json` 没烘那一格，典型成因是本地 `docker compose build` 没传
+  `STATION_REVISION`），**不能当发布件对账**（拿镜像 tag / digest 去对也对不上）。
+  算法**只在服务端**（`portal/src/version-info.js#isLocalBuild`），判据是 `revision` 而**不是** `builtAt`
+  （后者是另一个 ARG，它单独缺不说明这份构建没身份——拿它当判据会把真发布件报成本地构建）。
+  为什么放顶层而不是塞进 `server`：`server` 那条「每一格都是字符串、缺就是 `unknown`」的不变式
+  止于版本格，布尔旗标不属它（同一层的旗标先例是 `fdesPresent`）。同一句话也进了启动日志
+  （`serve()` 里 `loadConfig()` 之后、`migrate()` 之前喊一条）：`docker logs station-portal
+  | grep local-build`。**发布件两者都静默**——天天喊的告警等于没有告警。
+  `/api/health` **不带**这一格（§5.1 的三格形状是 #586 定稿）。
 - `fdesPresent:false` ⇒ 这一段**读不到**（查 `containers` 抛错），与「服务端说没有 FDE」（`fdesPresent:true`
   + 空数组）是两件事（#350 同口径）；本端点因此**始终 200**，不把面板打成 500。
 - `snapshot:"provision"` 是**机器可读的口径标注**，前端据此必须渲染「provision 时快照」字样；
@@ -3088,8 +3099,11 @@ git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什�
 > 前端 `portal/frontend/src/lib/versionSurface.ts` + `views/AdminAboutView.vue`（`#/admin/about`）。
 > 单测：`portal/test/admin-version-panel.test.js`（后端三段/鉴权/降级）、
 > `portal/test/version-surface.test.js`（**三格来源锁死** + provenance 推导/路径可见 + 镜像与工作流的判据自证）、
+> `portal/test/local-build-surface.test.js`（#643 B：**本地构建自曝**——判别位只认 revision、日志腿、
+> 面板/端点的顶层 `localBuild`、以及 `cli.js` 的接线锁）、
 > `portal/test/health-version.test.js`（§5.1 的 `version` 块）、
-> `portal/frontend/src/views/AdminAboutView.spec.ts`（渲染面与不猜数）。
+> `portal/frontend/src/views/AdminAboutView.spec.ts`（渲染面与不猜数；含 #643B 的三态渲染与
+> 「前端不许从 revision 自己推」那条反向红线）。
 
 **真机 e2e（issue #603）——发版部署后跑一次，它才是「镜像里烘的是哪份」的机器判据**：
 单测钉的是「读法只有一条」，证不了**真机上那份镜像里到底烘了什么**。v0.1.69 那起事故（portal 烘了停在
