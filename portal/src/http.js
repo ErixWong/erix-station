@@ -4904,7 +4904,7 @@ const INTERNAL_ROUND_LIMIT = 1.5 * 1024 * 1024; // transcript round 1MB + 信封
 const INTERNAL_RECOVERY_ROW_LIMIT = 640 * 1024;
 // **内部大 body 上限**（不是哪个端点专属）：今天只有两个 `/runstate` PUT 用它——
 // run-state 快照随会话长度增长（上下文压缩摘要 / 折叠事实 / 工具清单都能撑进去），量级远超轮记录。
-// 名字由来：它原本叫 `INTERNAL_CHECKPOINT_LIMIT`（给 `run_checkpoints` 的快照 body 用，
+// 名字由来：它原本叫 `INTERNAL_CHECKPOINT_LIMIT`（给快照表的 body 用，
 // issue #640 已连同四个 `/checkpoint*` 端点一起删），**常量本身活了下来** ⇒ 改名成按语义自解释。
 // 新加大 body 的内部端点若量级相当，复用它是故意的（不是历史残留）。
 const INTERNAL_LARGE_BODY_LIMIT = 2 * 1024 * 1024;

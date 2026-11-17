@@ -47,9 +47,9 @@ DELETE FROM approvals WHERE run_id IN (SELECT id FROM tgt_run)
    OR tool_call_id IN (SELECT id::text FROM tool_calls WHERE run_id IN (SELECT id FROM tgt_run));
 DELETE FROM artifacts       WHERE run_id IN (SELECT id FROM tgt_run);
 DELETE FROM judge_decisions WHERE run_id IN (SELECT id FROM tgt_run);
--- ⚠ `run_checkpoints` 那一句已随 issue #640 删除：erix-agent 0.33.0 起 run snapshot 退役，
+-- ⚠ 快照表那句 `DELETE` 已随 issue #640 删除：erix-agent 0.33.0 起 run snapshot 退役，
 --   表由迁移 `0041-retire-run-checkpoints.sql` DROP ⇒ 留着这句会让本脚本在 0041 之后的库里
---   直接 `relation "run_checkpoints" does not exist`（集成清理脚本没有 IF EXISTS 的余地）。
+--   直接 `relation ... does not exist`（集成清理脚本没有 IF EXISTS 的余地）。
 DELETE FROM transcript_rounds WHERE run_id IN (SELECT id FROM tgt_run)
    OR transcript_key IN (SELECT id::text FROM tgt_sess);
 -- issue #500：恢复行（`transcript_recovery_rows`）是**独立表**、键只有 session transcript key

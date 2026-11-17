@@ -543,7 +543,8 @@ hostname := <fde> "-p-" <portLabel> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> �
 > - 容器与项目：`containers` / `projects`
 > - 会话与对话：`chat_sessions` / `runs` / `messages`
 > - 端口分配与路由：`port_allocations` / `route_outbox` / `route_revisions`
-> - 引擎持久化：`transcript_rounds` / `run_checkpoints`（每 run 单行）/ `run_events`（含 `client_event_id`）
+> - 引擎持久化：`transcript_rounds` / `transcript_recovery_rows` / `run_events`（含 `client_event_id`）
+>   （~~每 run 单行那张快照表~~ 已随 issue #640 由迁移 `0041` 撤：erix-agent 0.33.0 起没有 run snapshot）
 > - 工具与审批：`tool_calls` / `tool_outputs` / `judge_decisions` / `approvals` / `artifacts`
 > - 用量与审计：`usage_ledger` / `audit_log`
 > - 任务队列：`run_queue`（含租约字段）
@@ -566,8 +567,8 @@ hostname := <fde> "-p-" <portLabel> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> �
 
 四条注意：
 
-1. **run snapshot 能力须成对**（`saveRunSnapshot` + `loadLatestRunSnapshot`）。adapter 成对暴露时引擎启用 crash-resume 持久化；写入失败经 adapter retry 后仍抛 `checkpoint_failed`，不会静默降级。
-2. **store adapter 必须包 retry**，并把 `checkpoint_failed` 识别为**可重试**。adapter = 调 portal internal 端点的 HTTP adapter（不直连 DB，D1'/D2'），重试参数见 [runner-integration.md](runner-integration.md) §9.2。
+1. ~~**run snapshot 能力须成对**（`saveRunSnapshot` + `loadLatestRunSnapshot`）……~~ **已作废（issue #640）**：erix-agent 0.33.0 把 run snapshot 整个退役，本站已删这两个方法、agentd 转发、四个 internal 端点与承载表（迁移 `0041`）。恢复只靠账本（轮记录 + `transcript_recovery_rows`）。`checkpoint_failed` 作为**旧档案错误码**仍留在可重试值域里（理由见 `runner/lib/termination.js`），但新 run 不再产出它。
+2. **store adapter 必须包 retry**（这条不变，只是对象换成**账本写**：`appendRound` / `saveRunState` / 恢复行）。adapter = 调 portal internal 端点的 HTTP adapter（不直连 DB，D1'/D2'），重试参数见 [runner-integration.md](runner-integration.md) §9.2。
 3. **runId 用 UUID**，不要用 cwd 派生（多用户下会撞）。
 4. `run_events` / 用量 / session 状态**不属于** `TranscriptStore` 契约 → 由 portal 在 internal 端点侧补齐（事件落库与 seq 分配、`last_seq` 推进、`usage_ledger` 记账；agentd 只负责上报，runner-integration §4.2/§7）。
 
@@ -780,7 +781,7 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 2. `LoopEvent` 无 seq/ts/持久化 → 宿主 store decorator 补
 3. `onEvent` 是同步 void，事件分散在 6 个回调 → 建议 additive 增补 `assistant_delta` / `reasoning_delta` / `tool_call_delta` / `judge` 类型（可选增强）
 4. **多轮必须显式传 `task`**（host-upgrade-guide §2），否则 judge 拿旧种子当基准
-5. `checkpoint_failed` fail-closed 语义 → 见 §9.3
+5. ~~`checkpoint_failed` fail-closed 语义~~ → 见 §9.3（**历史**：0.33.0 起同类失败是 `persistence_failed`，`checkpoint_failed` 只作旧档案读法）
 6. `erix-agent/contract-tests` 应接入 CI（长期运行的宿主必需）
 
 ---

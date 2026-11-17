@@ -28,7 +28,7 @@
 //
 // ⚠ **run snapshot 已整条退役（issue #640）**：erix-agent 0.33.0（上游 #838 S2，本站 #530）起引擎不再调
 //   `saveRunSnapshot` / `loadLatestRunSnapshot`，本 adapter 的同名方法、agentd 的四条转发、portal 的四个
-//   `/checkpoint*` 端点与 `run_checkpoints` 表（迁移 `0041` DROP）一并删——恢复只靠账本（轮记录 + 恢复行）。
+//   `/checkpoint*` 端点与快照表（迁移 `0041` DROP）一并删——恢复只靠账本（轮记录 + 恢复行）。
 //   **不在删列**、故意留下的同名物：错误码 `checkpoint_failed`（理由见 `lib/termination.js` 头注）、
 //   `persistence_error.phase` 的 `checkpoint_before_tool` / `checkpoint_after_tool`（旧档案读侧）、
 //   事件流里的 `checkpoint` 事件类型、run-state 里恒为 0 的 `deterministic.errors.checkpoint`。

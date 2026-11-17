@@ -16,7 +16,7 @@ export class FakeInternalPool {
     this.messages = seed.messages ?? [];
     this.events = seed.events ?? [];
     this.rounds = seed.rounds ?? [];
-    // ⚠ `run_checkpoints` 相关的桩（`checkpoints` 数组 + 四条 SQL 分支）已随 issue #640 删除；
+    // ⚠ 快照表相关的桩（`checkpoints` 数组 + 四条 SQL 分支）已随 issue #640 删除；
     //   表由迁移 `0041` DROP，四个 /checkpoint* 端点也不再路由 ⇒ 这里没有可留的语义。
     this.approvals = seed.approvals ?? [];
     // tool_calls 行补齐两列缺省值（NULL 就是 NULL，不是「没这个键」），与真库列默认值同口径。

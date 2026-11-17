@@ -33,7 +33,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 会话与对话 | `chat_sessions` / `runs` / `messages` / `queued_inputs`（migration 0024） | 规格 §9.1 / issue #370 |
 | 写操作幂等 | `idempotency_keys` | portal.md §1.4（本轮实现；**仅**由增量迁移 0001 提供，baseline 不含本表） |
 | 端口分配与路由 | `port_allocations` / `route_outbox` / `route_revisions` | 规格 §8 / topology.md §5/§8 |
-| 引擎持久化 | `transcript_rounds` / `run_checkpoints` / `run_events` | 规格 §9.2/§9.3 |
+| 引擎持久化 | `transcript_rounds` / `transcript_recovery_rows` / `run_events`（~~快照表~~ 已随 #640 由迁移 `0041` 撤） | 规格 §9.2/§9.3 |
 | 工具与审批 | `tool_calls` / `tool_outputs` / `judge_decisions` / `approvals` / `artifacts` | 规格 §9.1 / topology.md §9 |
 | 用量与审计 | `usage_ledger` / `audit_log` | 规格 §11.4 / §14 |
 | 任务队列 | `run_queue`（含租约字段） | runner-integration §4.2/§6（拉模型，claim 长轮询） |
@@ -165,11 +165,23 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 **`append_seq` 与同 round 保序（迁移 0016，erix-agent 0.16.0）**：同一 `(transcript_key, round)` 可有多行（CLI 行号复用 + 引擎 `:resume` 补跑重落盘；session 行 `run_id IS NULL` 不受 `UNIQUE(run_id, round)` 限制）。`append_seq bigint`（默认 `nextval`）是**持久化追加序列**，新行由序列保证严格追加序；存量行按 `created_at, id` 确定性回填（历史行近似还原）。`load()` 契约要求按追加序返回同 round 记录（引擎不再二次排序），故 `getSessionTranscript` / legacy `getTranscript` 用 `ORDER BY round ASC, append_seq ASC`——不得依赖 `created_at`、执行计划或主键扫描顺序（真机已存在 `created_at` 完全相同的同轮行）。
 
-### 1.11 `run_checkpoints` — run snapshot（crash-resume 的落点）
+### 1.11 快照表（run snapshot，crash-resume 的落点）**【已退役：迁移 `0041`，issue #640】**
 
-**每 transcript key 一行**（run 模式以 run 为 key，session 模式以 session 为 key）：erix-agent 0.14.0 的 `saveRunSnapshot` / `loadLatestRunSnapshot` 是**latest-only 覆盖读写**。写入语义 = `INSERT ... ON CONFLICT ... WHERE run_checkpoints.revision < EXCLUDED.revision`（单行覆盖 + **revision CAS**，重试同一 revision 安全；portal.md §9）。这组 optional snapshot 能力成对实现时提供 crash-resume；写失败经 HTTP adapter retry 后仍抛 `checkpoint_failed`（runner-integration §9.2）。原「本地 file 优先 + DB 异步复制」装饰器建议已按决策者裁定**不采纳**（D2' 纯 DB；代价见 runner-integration §9.4）。
+> 表原名在下面这几段历史文字里**不再重复写出**（判据：活文档里不留这个名字）——建表 DDL 见
+> `deploy/migrations/0006-session-transcript.sql`，清存量见 `0034-prune-stale-run-checkpoints.sql`，
+> 撤表见 `0041-retire-run-checkpoints.sql`；它从 0001 baseline 就在，所以冻结件里那句建表语句照旧。
 
-**单调性（revision CAS，issue #8）**：`revision bigint NOT NULL DEFAULT 0` 是每 transcript key 的**单调版本号**。worker 每实例从 0 起递增；portal 端 `DO UPDATE ... WHERE run_checkpoints.revision < EXCLUDED.revision`——**旧 revision 的覆盖写被拒（0 行更新 → `409 checkpoint_stale`）**，解决「延迟到达的旧快照覆盖新快照」。resume 时 worker 经 U9 读回当前 `revision`，继续从 `revision+1` 起计，避免新 worker从 0 起计被 CAS 误拒。`seq` 仍是**调用方本地元数据、不落库**（其值在数值上可等于 revision，但不具权威性；runner-integration §9.5）。
+> ⚠ **这张表已经不存在了**（2026-11-17，issue #640）。erix-agent 0.33.0（上游 #838 S2，本站 #530）
+> 把 run snapshot 整个退役 ⇒ 引擎不再调 `saveRunSnapshot` / `loadLatestRunSnapshot`，恢复只靠账本
+> （`transcript_rounds` 的轮记录 + `transcript_recovery_rows` 的 `tool-executed` 证据）。本站随之删掉
+> store 方法、agentd 转发、四个 internal 端点，并用 `0041-retire-run-checkpoints.sql` 撤表
+> （撤前真库 17 行 / 565,248 B、`max(updated_at)` = 2026-11-11，零写入；FK 是 child 端、零视图/触发器依赖）。
+> **下面整节留着是历史读法**：旧 ledger、旧事件载荷、旧 runner 日志里的 revision CAS / `checkpoint_stale`
+> / `checkpoint_failed` 都要能对上号。**新代码不要照本节写**（照 §1.9/§1.10 的账本写）。
+
+**每 transcript key 一行**（run 模式以 run 为 key，session 模式以 session 为 key）：erix-agent 0.14.0 的 `saveRunSnapshot` / `loadLatestRunSnapshot` 是**latest-only 覆盖读写**。写入语义 = `INSERT ... ON CONFLICT ... WHERE <表>.revision < EXCLUDED.revision`（单行覆盖 + **revision CAS**，重试同一 revision 安全；portal.md §9.8 已标退役）。这组 optional snapshot 能力成对实现时提供 crash-resume；写失败经 HTTP adapter retry 后仍抛 `checkpoint_failed`（runner-integration §9.2）。原「本地 file 优先 + DB 异步复制」装饰器建议已按决策者裁定**不采纳**（D2' 纯 DB；代价见 runner-integration §9.4）。
+
+**单调性（revision CAS，issue #8）**：`revision bigint NOT NULL DEFAULT 0` 是每 transcript key 的**单调版本号**。worker 每实例从 0 起递增；portal 端 `DO UPDATE ... WHERE <表>.revision < EXCLUDED.revision`——**旧 revision 的覆盖写被拒（0 行更新 → `409 checkpoint_stale`）**，解决「延迟到达的旧快照覆盖新快照」。resume 时 worker 经 U9 读回当前 `revision`，继续从 `revision+1` 起计，避免新 worker从 0 起计被 CAS 误拒。`seq` 仍是**调用方本地元数据、不落库**（其值在数值上可等于 revision，但不具权威性；runner-integration §9.5）。
 
 **时间边界（自迁移 `0034`，PR #509）：终态 run 的 run-keyed 快照读不到了 ⇒ 它只能给「未完成的 run」用**。
 `getLatestCheckpoint`（`portal/src/internal.js`，端点 U9 `GET .../runs/:id/checkpoint/latest`）对**已终态的 run**
@@ -744,20 +756,25 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | 回收 | portal（reaper） | **A2 分支**：`runs.status='cancelling'` → queue `cancelled` + runs `finished`（`termination.reason='aborted'`），不回 pending；**A1 分支**：`attempts < max_attempts` → 回 `pending`（清 claim_token/owner_container_id/lease/claimed_at，**attempts 不变**）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)` |
 | 重新认领 | 新 agentd（重建后）或原 agentd（分区恢复后） | 按 **user_id 路由**领取且 `runs.status IN ('queued','running')`（非 container_id，§1.16）；新 claim_token 使旧 token 失效 |
 | 双写防护 | portal | 旧 worker 任何写（事件/checkpoint/终态）→ `lease_lost` → 旧 agentd 本地 abort、丢缓冲（§4.5） |
-| resume | 新 worker | `resume = attempt > 1`；引擎从 `run_checkpoints`（本 run_id 单行）+ `transcript_rounds`（本 run_id）恢复，checkpoint revision 从 U9 读回继续 +1 |
+| resume | 新 worker | `resume = attempt > 1`；~~引擎从快照表（本 run_id 单行）+ `transcript_rounds`（本 run_id）恢复，checkpoint revision 从 U9 读回继续 +1~~ ⇒ **自 erix-agent 0.33.0 / 本站 #640：只从 `transcript_rounds`（+ `transcript_recovery_rows`）恢复**，没有快照可读 |
 | 副作用隔离 | 平台 | **DB 状态写被 fencing 拒绝**；外部副作用（shell/网络/LLM）平台无法物理终止（原理四），由 attempt 边界 + 审计标记隔离（runner-integration §6.5） |
 | 终态 barrier | agentd | 全部事件批（U3）200 确认 + 全部 store 调用完成后，才提交 U2 终态；portal 合成 `run_end` 事件（runner-integration §7.6） |
 
 **方案 B 的代价与 A5 口径（定稿）**：`runs.status` **不**在终态前多次 `running ↔ failed`——attempt 级失败（崩溃/re-claim）**不写 `runs.status`**，只记入 `run_queue.attempts`（claim 时递增）与 `audit_log`（`run.claim` / `run.lease_superseded` / `run.released` / `run.attempt_exhausted`）；`runs.status` 在崩溃恢复期间保持 `queued`/`running`，**只有**耗尽（`max_attempts_exceeded`）或非重试性错误（`checkpoint_failed` 重试耗尽 / `rate_limited`，§2.9）才置终态 `failed`。终态 `failed` 后无自动 resume（如需跨 run 续跑，那是方案 A 的 `resume_from_run_id`，本期不做）。UI 的「第 N 次尝试」由 `run_end.payload.attempt` 与 `audit_log` 展示，而非 `runs.status` 回跳。
 
-### 2.9 `checkpoint_failed` 恢复口径（A3 定稿）
+### 2.9 `checkpoint_failed` 恢复口径（A3 定稿）**【历史口径：0.33.0 起不再产出该错误码】**
+
+> ⚠ 本节整条是**旧档案读法**（表已由 `0041` 撤，见 §1.11）。留着的原因：`checkpoint_failed` 仍在
+> 可重试码值域里（旧 run 的 `runs.error_code` / `termination.errorCode` 写着它，重试判定读旧账时要用，
+> 理由见 `runner/lib/termination.js`）。**新 run 的同类失败叫 `persistence_failed`**（落的是账本写失败，
+> phase 可能是 `transcript` / `run_state`，也可能是旧档案里的 `checkpoint_before_tool` / `checkpoint_after_tool`）。
 
 | 项 | 结论 |
 |---|---|
 | 谁置 `checkpoint_failed` | **worker**：`runToolLoop` 在工具执行前/后 checkpoint 写失败时 fail-closed 抛错（adapter 已按 runner-integration §9.2 做 3 次重试，耗尽后透传）→ agentd 经 U2 终态上报 `failed`，`error={code:'checkpoint_failed', retryable:true}`；portal 落库 |
 | 是否可重试 | **adapter 层可重试**（3 次，1s/2s/5s）；**run 层不自动 re-claim**——它是引擎 fail-closed 判定而非进程崩溃，存储故障持续时 re-claim 只会原地重演；因此直接终态 `failed`（与 A1 的崩溃耗尽、A2 的 cancelling 并列的终态来源，不冲突） |
-| 恢复时 checkpoint 取哪一份 | **最新已持久化那一份**：`run_checkpoints` 单行，U9 返回的 `snapshot + revision`。失败的那次 save 没有落库（revision CAS 拒旧/失败不写），不存在「半份 checkpoint」；`runs.status='failed'` 终态后不可 resume（终态 barrier） |
-| 与 revision CAS 的关系 | 失败写不改变 `run_checkpoints.revision`（要么 0 行更新被拒、要么网络失败未达库）；U9 读回的是上一个成功 revision；若将来启用同 run resume，从 `revision+1` 续计，不冲突 |
+| 恢复时 checkpoint 取哪一份 | **最新已持久化那一份**：快照表单行，U9 返回的 `snapshot + revision`。失败的那次 save 没有落库（revision CAS 拒旧/失败不写），不存在「半份 checkpoint」；`runs.status='failed'` 终态后不可 resume（终态 barrier） |
+| 与 revision CAS 的关系 | 失败写不改变快照表的 `revision`（要么 0 行更新被拒、要么网络失败未达库）；U9 读回的是上一个成功 revision；若将来启用同 run resume，从 `revision+1` 续计，不冲突 |
 | 是否需人工介入 | **是**：存储恢复 + 用户重发（`POST /messages` 产生新 run）。本期无跨 run resume（方案 A 不做），「进度未丢失」仅指 checkpoint/transcript 数据仍完整保留在 DB、可供未来 resume 或人工检查，**不**自动续跑 |
 
 ---
@@ -786,8 +803,9 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 ## 4. 归档与膨胀策略
 
 **膨胀来源排序（dev 真库 `station` 现查，2026-11-13，issue #502 修正；⚠ 那一列是 **`0033` 迁移前**的历史读数）**：
-`run_events` **472 MB** ≫ `transcript_rounds` **12 MB** > `run_checkpoints` 4.6 MB > 其余表。
-（⚠ 行尾那个 `run_checkpoints` 4.6 MB 是 **`0034` 迁移前**的读数；`0034` + `VACUUM FULL` 后它是
+`run_events` **472 MB** ≫ `transcript_rounds` **12 MB** > 快照表 4.6 MB > 其余表。
+（⚠ 这条排序里「快照表」那一档是**历史项**：它已由迁移 `0041` 撤掉，issue #640；原名见冻结 baseline。）
+（⚠ 行尾那一档 4.6 MB 是 **`0034` 迁移前**的读数；`0034` + `VACUUM FULL` 后它是
 17 行 / 565,248 B，见下面「迁移后的当前量级」那条与台账 §8.126.2。）
 本表原先写的是「`transcript_rounds.messages`（单 run 可达 MB 级）> `run_events.payload`」——**排序反了**：
 `transcript_rounds` 实测 12 MB / 2,231 行（单 run MB 级那一档远没出现），而 `run_events` 靠 stream 档碎片的
@@ -798,7 +816,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 > `docs/maintenance/task-ledger.md` §8.126.1）**：`run_events` **7,008 行 / 5,578,752 B（5.3 MB）/
 > 每行 802 B**，全库 **48,389,143 B（46.1 MB）** ⇒ 上面那条排序里 `run_events` 已从「472 MB」降到全库零头，
 > 现下的榜首是 `transcript_rounds`（那个排序只在迁移前成立）。
-> ⚠ 另一处没动的膨胀源：`run_checkpoints`（85 行 / 4.6 MB）本单未动——**但自迁移 `0034`（PR #509）起它也不成立了**，
+> ⚠ 另一处没动的膨胀源：快照表（85 行 / 4.6 MB）本单未动——**但自迁移 `0034`（PR #509）起它也不成立了**，
 > 时间边界（真库 `station` 实测，出处 `docs/maintenance/task-ledger.md` §8.126.2）：
 > **`0034` 之前 87 行 / 4,644,864 B**（台账记的拆分：heap 81,920 / 索引 32,768 / TOAST 4,227,072，
 > 那一组不逐字相加——它没含 TOAST 自己的索引与 FSM/VM 那几块），
@@ -807,14 +825,14 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 > ——回收 4,079,616 B = −87.8%，全库 −3.88 MB（−8.4%）。
 > 上面那句 85 行 / 4.6 MB 与本节那个排序同属**旧时点读数**（那是 `0033` 前甚至 `0034` 前的一次现查），
 > 留着是取证当时的排序，不是现价；现价的量法（行数 / `pg_total_relation_size` / heap·idx·TOAST 拆开）见 §8.126.2。
-> 另：`0034` 只清行，**磁盘要部署侧手工 `VACUUM (FULL, ANALYZE) run_checkpoints` 才回收**（同下面 `0033` 那条运维注记的理由）。
+> 另：`0034` 只清行，**磁盘要部署侧手工 `VACUUM (FULL, ANALYZE) <快照表>` 才回收**（表已由 `0041` 撤，这条运维动作自此是历史）（同下面 `0033` 那条运维注记的理由）。
 
 | 表 | 策略 | 理由 / 依据 |
 |---|---|---|
 | `run_events` | **热保留，当前不删除**（针对**已落库的 durable 档**）。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记。**#502 的两条例外**：① stream 档碎片自迁移 `0033` 起**不再产生**（旧存量由同一支迁移分批清掉）；② 每个 run 的未完稿正文只占**既有 `run_end` 载荷里的三个键**（`partial_text` / `partial_round`，以及 #513 加的截断位 `partial_truncated`，
 >    形态 M ⇒ 不新增行、不新增索引）。 事件的唯一消费是实时推送与断线补发。补发窗口有限的契约语义（过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取，portal.md §5.2-4）**保留定义但因当前不删事件而不会触发**——两处口径已对齐（portal.md §5.2 注） |
 | `transcript_rounds` | **不删**（resume 源 + 审计），膨胀靠 jsonb 自动 TOAST 压缩吸收。~~session 归档后可整体导出冷存~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**；活跃 session 永不归档 | 规格 §9.2「fold 只影响视图，档案完整」；resume 只可能发生在活跃 session 上 |
-| `run_checkpoints` | **每 transcript key 单行**（覆盖写，见 §1.11），无历史 seq 概念；随 run/transcript 同生命周期保留 | 上游 `loadLatestRunSnapshot` 只读最新（唯一消费者），覆盖写天然无积累 |
+| ~~快照表~~ | **表已撤**（迁移 `0041`，issue #640）——不再是归档对象 | 曾经：每 transcript key 单行覆盖写，无积累；0.33.0 起引擎不再读写，恢复改由 `transcript_rounds` + `transcript_recovery_rows` 承担 |
 | `messages` | 永久保留 | 人读层，行小（content + 摘要），是 FDE「关掉明天再打开会话还在」期待的承载（原理三） |
 | `usage_ledger` / `audit_log` | 永久保留，只追加 | 记账与审计语义（规格 §14 看板/对账）；量小（每 run 数行 / 每请求一行） |
 | `port_allocations`（released） | reaper 定期硬删 `released_at` 过期的记录（规格 §8.2） | 历史归属信息已由 `audit_log`（`port.allocate` / `port.release` 动作）承载 |
@@ -828,7 +846,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
   `VACUUM (FULL, ANALYZE) run_events;`（`FULL` 持 `ACCESS EXCLUSIVE`，本站规模下秒级到十秒级）。
   这一步**没有**放进迁移文件——迁移 runner 每个文件跑在单事务里，`VACUUM` 不能在事务块中执行
   （`portal/test/delta-not-persisted-db.test.js` 里有用例钉着这条事实）。
-- 每行字节上界（清理后）：`run_events` 每行 < 4 KB（含 5 个索引的摊销）、`run_checkpoints` 每行 < 512 KB
+- 每行字节上界（清理后）：`run_events` 每行 < 4 KB（含 5 个索引的摊销）；~~快照表每行 < 512 KB~~（**该表已随 #640 撤**，体积闸现在只断 `run_events`，并新增了「样本必须恰好是种下去的行数」+ **总字节下界**两道，防退化成空样本）
   （**时间边界**：`0034` 前 dev 实测 85 行 / 4,644,864 B ≈ 53 KB/行；`0034` + `VACUUM (FULL, ANALYZE)` 后
   **17 行 / 565,248 B ≈ 33 KB/行**；2026-11-14 真库现查，出处台账 §8.126.2）。
   两条上界都在真库用例里断言（`portal/test/delta-not-persisted-db.test.js` 的「体积闸」那条），不是文档口头承诺；
@@ -873,7 +891,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | 10 | 崩溃恢复方案：**方案 A（新 run + `resume_from_run_id`，不自动 resume）** vs **方案 B（同 run_id re-claim，倾向）** | 倾向 B（principles §3 + 现有 claim/lease/resume 机制；checkpoint/transcript 单行-per-run 天然同 run_id） | §2.8；影响 checkpoint 查询契约、审计/UI（runner-integration §6.5） |
 | 11 | `client_event_id` 是否含 attempt 前缀（`run_id:attempt:计数`） | 含（re-claim 后计数归零不碰撞） | §1.12；portal.md §9.4 已同步 |
 | 12 | `run_end` 事件唯一产生方：worker 经 U3 vs portal 由 U2 合成 | portal 由 U2 合成（单事务，无事件/终态排序间隙） | §1.12/§2.1；portal.md §5.3 已同步 |
-| 13 | checkpoint 单调性：`revision` CAS（旧快照拒绝） | 采用（`run_checkpoints.revision` 已落 DDL） | §1.11；portal.md §9.8 U8/U9 已同步 |
+| 13 | checkpoint 单调性：`revision` CAS（旧快照拒绝） | ~~采用（快照表 `revision` 已落 DDL）~~ ⇒ **已撤销**：表随 #640 由 `0041` DROP，单调性改由 `transcript_rounds.append_seq`（0016）承担 | §1.11（历史）；portal.md §9.8（已标退役） |
 | 14 | 心跳 U4 逐 run 携带 `claim_token` + 部分失败响应 | 采用 | §1.16；portal.md §9.5 已同步 |
 | 15 | spool 契约（路径/配额/写满/删除） | 见 runner-integration §7.5（参数 ⚠️） | 不入库（非真相）；§1.12 |
 | 16 | `max_attempts` 默认值与耗尽终态 | 默认 3；耗尽 → `failed(max_attempts_exceeded)` | §1.16/§2.8（已落 DDL） |

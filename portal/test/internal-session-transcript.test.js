@@ -276,7 +276,7 @@ test('session transcript：fencing——writer run 属主/租约校验、缺 run
 
 // ⚠ 旧用例「session checkpoint：CAS 前进 / 旧 revision 409 / 跨 run 同 key revision 续增」已随
 //   issue #640 删除（S4/S5 = `PUT /transcript/:key/checkpoint` 与 `GET .../checkpoint/latest`）。
-//   0006 给 `run_checkpoints` 加的 session 侧键（`transcript_key` + 部分唯一索引）也一起没了，
+//   0006 给快照表加的 session 侧键（`transcript_key` + 部分唯一索引）也一起没了，
 //   但 **0006 的字节不许改**（已应用的迁移，sha256 冻结）⇒ `migrations.test.js:49` 那条历史断言保留。
 //   退役形状本身（有效认证 ⇒ 404，不是 500/405）由 `portal/test/http-runstate.test.js` 的 #640 用例钉。
 

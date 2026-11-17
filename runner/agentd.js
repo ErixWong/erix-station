@@ -236,7 +236,7 @@ async function internalRequest(method, p, { body, claimToken, retries = 0, timeo
   const err = new InternalError(res.status, code, message, retryable);
 
   // lease_lost / run_terminal / 其余 4xx → 不重试（由调用方按语义处理）。
-  // （旧 `checkpoint_stale` 同批退役：那是 `run_checkpoints` 的 revision CAS 专有的 409，issue #640。）
+  // （旧 `checkpoint_stale` 同批退役：那是快照表的 revision CAS 专有的 409，issue #640。）
   if (res.status === 409) err.retryable = false;
   throw err;
 }
@@ -691,7 +691,7 @@ async function handleStoreRequest(ctx, method, args, deps = {}) {
     }
     // ⚠ `saveRunSnapshot` / `loadLatestRunSnapshot` 两个 case（各两条转发：session 与 run 作用域）已随
     //   issue #640 删除：erix-agent 0.33.0 起引擎不再调它们 ⇒ agentd 的转发、portal 的四个
-    //   `/checkpoint*` 端点与 `run_checkpoints` 表（迁移 `0041`）同批退役。未知 method 会由下面的
+    //   `/checkpoint*` 端点与快照表（迁移 `0041`）同批退役。未知 method 会由下面的
     //   `default` 抛 `unknown store method: …`（引擎已不会发出该 method ⇒ 真抛出来就是回退，该红）。
     // ── issue #500：账本恢复行三件套（引擎 0.33.0 可选能力；**只走 session 端点**）──
     // 三个都只有一句转发 + 有限重试（为何有限见 `RECOVERY_ROWS_MAX_RETRIES` 那段）。

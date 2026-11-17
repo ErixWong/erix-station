@@ -581,7 +581,7 @@ test('#204 B 安全性证据：崩溃后 runs.status=running + run_queue=pending
 
 // ⚠ 旧用例「putCheckpoint：revision CAS（前进 200 / 旧 revision 409 checkpoint_stale）」已随
 //   issue #640 删除：`putCheckpoint` / `getLatestCheckpoint` 两个函数、四个 `/checkpoint*` 端点与
-//   `run_checkpoints` 表（迁移 `0041`）同批退役 ⇒ 没有 CAS 可测了。
+//   快照表（迁移 `0041`）同批退役 ⇒ 没有 CAS 可测了。
 //   `checkpoint_stale` 这个 code 也不再由本站任何路径产出（旧档案里的 `checkpoint_failed` 是**另一件事**，
 //   它的值域与可重试分类保留，见 runner/lib/termination.js）。
 //   端点层面的退役判据在 `portal/test/http-runstate.test.js`（有效认证打过去 ⇒ 404 not_found）。

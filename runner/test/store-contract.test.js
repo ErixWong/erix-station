@@ -173,7 +173,7 @@ test('STORE_METHODS：必需/可选契约与 status 读接口在 IPC 白名单�
   assert.equal(typeof store.saveCheckpoint, 'undefined', '旧快照方法名不得暴露给引擎');
   assert.equal(typeof store.loadLatestCheckpoint, 'undefined', '旧快照方法名不得暴露给引擎');
   // **反向自证（issue #640）**：快照本体也已退役——不是「换了个名字」，而是整条竖切（IPC 白名单 /
-  // agentd 路由 / portal 端点 / `run_checkpoints` 表）都没了。名字一旦回来（引擎回退或有人
+  // agentd 路由 / portal 端点 / 快照表）都没了。名字一旦回来（引擎回退或有人
   // 「顺手补上」），本用例会红，而不是默默多一个没人调的方法。
   for (const retired of ['saveRunSnapshot', 'loadLatestRunSnapshot']) {
     assert.equal(typeof store[retired], 'undefined', `快照方法 ${retired} 已随 #640 退役，不得再现`);
@@ -195,7 +195,7 @@ test('STORE_METHODS：必需/可选契约与 status 读接口在 IPC 白名单�
 // ⚠ **erix-agent 0.33.0（issue #838 S2，本站 #530）：`runSnapshot` 这个能力名已从上游名单里删除**
 //   （现查 0.33.0：`test/contract/transcript-store.js` 里 `runSnapshot` **0 命中**；`OPTIONAL_CAPABILITIES`
 //   只剩 `runState` / `runStateStatus` / `rawRows` / `fastPathProbes` 四组）。本站当时只是**从申报里摘掉**，
-//   方法本体连同 IPC 白名单 / agentd 路由 / portal 端点 / `run_checkpoints` 表一起留给了另单——
+//   方法本体连同 IPC 白名单 / agentd 路由 / portal 端点 / 快照表一起留给了另单——
 //   **那个另单已落地：issue #640 把整条竖切删干净了**（表由迁移 `0041` DROP）。
 //   ⇒ 本文件的 peer 桩不再实现快照方法，上面的反向自证钉住「不得再加回来」。
 transcriptStoreContract('station-ipc-store', async () => {

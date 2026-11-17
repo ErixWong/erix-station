@@ -164,9 +164,9 @@ sg docker -c "docker exec $DB_NAME pg_isready -U station -d station_test -t 15"
   绝不指向真库 `station-db`）。**未设置 ⇒ 整个真库文件 `skip`，不是「假通过」**：入口文案由
   `portal/test/pg-fixture.js` 的 `SKIP_WITHOUT_PG` 单点持有（「TEST_DATABASE_URL 未设置：真库用例需一次性
   postgres:16（docs/testing.md §2.2.1），无 PG 时整体跳过」），**所有真库文件共用同一句话**，**不要再抄出第三种说法**。
-  （现查：真库文件 = `delta-not-persisted-db.test.js` / `migrate-fresh-db.test.js` / `prune-checkpoints-db.test.js`，
-  **不止两处** ⇒ 本句不写个数，写「所有」；新增真库文件就接入同一入口，别另起一句 skip 文案。
-  接入形态分两支：`delta-not-persisted-db` 与 `prune-checkpoints-db` 是 `import { SKIP_WITHOUT_PG } from './pg-fixture.js'`，
+  （现查：真库文件 = `delta-not-persisted-db.test.js` / `migrate-fresh-db.test.js`（旧第三支 `prune-checkpoints-db.test.js`
+  已随 issue #640 撤表退役），**不止一处** ⇒ 本句不写个数，写「所有」；新增真库文件就接入同一入口，别另起一句 skip 文案。
+  接入形态分两支：`delta-not-persisted-db` 是 `import { SKIP_WITHOUT_PG } from './pg-fixture.js'`，
   而 `migrate-fresh-db.test.js` 里是**字面重复的一份同文案**（它比 `SKIP_WITHOUT_PG` 这个导出更早，没回头收干）
   ⇒ 改那句话得同时改两处：`pg-fixture.js` 的导出 + `migrate-fresh-db.test.js` 的字面量。）
   ⇒ 看门禁报告时，**「N skipped」不是失败也不是绿**：要真验迁移/夹具链路，必须带 `TEST_DATABASE_URL` 跑一遍全量
@@ -341,16 +341,16 @@ SQL
 
 ### 3.4 崩溃恢复 / 幂等（守不变式 3；契约 = runner §6/§7/§9 + schema.sql + model §2.8）
 
-> 契约依据：runner §6.4/§6.5（崩溃路径）、§7.3/§7.5/§7.6（事件幂等/spool/run_end）、§9.5（revision CAS）；schema.sql §5（`run_events.client_event_id` 唯一）、§8（`run_queue` 租约字段）、§5（`run_checkpoints` 单行）；model §2.8（方案 B 恢复流程）。
+> 契约依据：runner §6.4/§6.5（崩溃路径）、§7.3/§7.5/§7.6（事件幂等/spool/run_end）、~~§9.5（revision CAS）~~（随 #640 退役）；schema.sql §5（`run_events.client_event_id` 唯一）、§8（`run_queue` 租约字段）；~~§5（快照表单行，表名见冻结 baseline）~~（已由迁移 `0041` 撤，issue #640 ⇒ 恢复面只剩 `transcript_rounds` + `transcript_recovery_rows`）；model §2.8（方案 B 恢复流程）。
 
 | 用例 | 动作 | 期望 | 判定 |
 |---|---|---|---|
-| R1 kill agentd | `sg docker -c "docker kill fde-alice"`（agentd=容器主进程） | Docker `unless-stopped` 拉起；心跳 3 次丢失（45s）→ 租约 90s 到期 → re-claim（`resume:true`）→ 从 checkpoint 续跑（runner §6.4） | run 未终态前被同 run_id re-claim；`run_queue.attempts` +1；`resume=true` |
+| R1 kill agentd | `sg docker -c "docker kill fde-alice"`（agentd=容器主进程） | Docker `unless-stopped` 拉起；心跳 3 次丢失（45s）→ 租约 90s 到期 → re-claim（`resume:true`）→ ~~从 checkpoint 续跑~~ **从账本续跑**（`transcript_rounds` + 恢复行；快照那条路随 #640 没了）（runner §6.4） | run 未终态前被同 run_id re-claim；`run_queue.attempts` +1；`resume=true` |
 | R2 kill worker | 仅 kill worker 进程（agentd 存活） | agentd `release`（`worker_crashed`）→ 立即 re-claim（`attempts++`、`resume:true`）（runner §6.4） | 同上，但 release 由 agentd 发起 |
 | R3 容器重启（整容器） | `docker restart fde-alice` | 新 agentd 扫描 spool → 重传未 ack → re-claim 续跑（runner §7.5/§6.4） | spool 不丢（在 HOME bind mount 持久卷）+ 事件不重不漏 |
 | R4 重复 batch（同 `client_event_id`） | 重发同一 U3 批次 | `INSERT ... ON CONFLICT (run_id, client_event_id) DO NOTHING`，响应 `stored < 请求条数`、`200`，不产生重复事件（schema.sql §5 + portal §9.4） | `run_events` 中该 `client_event_id` 恰一条 |
 | R5 乱序 batch | 乱序重发 attempt N 与 N+1 的批次 | 逐事件幂等去重；`seq` 按到达顺序分配、**单调递增**（#502 起**允许跳号**：stream 档不占号 + 重复投递烧号）；run 内逻辑顺序由 `client_event_id` 的 `(attempt,计数)` 编码（runner §7.3） | 无重复行 + `seq` 单调递增（**不要求连续**） |
-| R6 checkpoint 旧 revision 被拒（CAS） | U8 提交 `revision <= 当前` | `409 checkpoint_stale`；agentd 不重试（runner §9.5 + portal §9.8） | DB 内 snapshot 未被旧值覆盖 |
+| ~~R6 checkpoint 旧 revision 被拒（CAS）~~ | **已退役（#640）**：U8/U9 端点已删 ⇒ 打过去 `404 not_found`（回归断言在 `portal/test/http-runstate.test.js`） | ~~`409 checkpoint_stale`~~ | — |
 | R7 lease 过期回收 + `claim_token` fencing | 让租约过期（不续租）→ 另一 agentd re-claim → 旧 agentd 写 | reaper 回收租约；旧 `claim_token` 任何写 → `409 lease_lost` / 心跳 `lease_lost`（runner §4.2/§6.4） | 旧写被拒、不污染 DB |
 | R8 spool 写满 | 塞满 spool 配额（每 run 256MB / 每容器 1GB ⚠️）且内存队列也满 | 事件不静默丢，run 显式 `spool_full`（retryable）（runner §7.5 + portal §6.4） | run 失败码 = `spool_full` |
 | R9 spool 损坏（撕裂写） | 制造末行不完整 | 扫描截断到最后一个完整换行、丢弃残缺尾行、告警（runner §7.5） | 不崩溃、不重传残缺行、日志告警 |
@@ -386,7 +386,7 @@ internal 通道与公开端点的 `validation_failed` **统一为 `400`**（port
 | token 错/吊销 → | `401 token_invalid` / `401 token_revoked` |
 | 租约失配 → | `409 lease_lost` |
 | 终态写 → | `409 run_terminal`（幂等命中视成功，portal §9.13） |
-| checkpoint 旧 revision → | `409 checkpoint_stale` |
+| ~~checkpoint 旧 revision → `409 checkpoint_stale`~~ | **已退役（#640）**：`checkpoint_stale` 不再由本站任何路径产出（表与端点都没了）；旧 agentd 打过来是 `404 not_found` |
 | 5xx/网络 → | 无限指数退避重试（agentd 侧，portal §9.13/§4.5） |
 
 #### 3.6.2 U1–U12 契约测试矩阵（必测最小集）
@@ -401,7 +401,7 @@ internal 通道与公开端点的 `validation_failed` **统一为 `400`**（port
 | U4 heartbeat | 逐 run 续租 `renewed` / `lease_lost`（reason 取值）、吊销经 `401 token_revoked`（非 200 `revoked:true`，审计 #34 F-C）、`stop_run_ids` 兑底（portal §9.5） |
 | U5 transcript | 同 round 同 body `200 {inserted:false}` / 不同 body `409 round_conflict` / 不同 dedupKey `409 round_conflict`（portal §9.7） |
 | U6/U7 load/recall | 分页 `next_cursor`（U6 run 作用域 = round 号；S1 session 作用域 = 不透明串 `<round>:<append_seq>`，portal §9.8b）、U7 `501 not_implemented` 降级（P1 可 501，portal §9.7）。⚠ 旧文列的 `400 response_too_large` **不存在**（`grep -rn response_too_large portal/src` 零命中；读侧无体积闸，见 portal §9.7 更正） |
-| U8/U9 checkpoint | 首次/前进 `200`、`409 checkpoint_stale`、`204`（无）、终态仍可读（portal §9.8） |
+| ~~U8/U9 checkpoint~~ | **已退役（#640）**：四个 `/checkpoint*` 端点带有效内部认证打过去必须 `404 not_found`（**不是 500/405**），判据在 `portal/test/http-runstate.test.js`；表由迁移 `0041` 撤，真库用例在 `portal/test/migrate-fresh-db.test.js` |
 | U10/U11 approvals | 重复创建返回原单 `200`、`409 approval_expired` 迟到决定、U11 轮询（portal §9.10） |
 | U12 release | `requeued`/`failed_max_attempts`/`cancelled` 三分支 + 重复 release 幂等 + `409 lease_lost`（portal §9.11） |
 
@@ -612,7 +612,7 @@ P1 交付完成 = 同时满足：
 | 认证与预览 ticket/cookie | [`portal.md`](api/portal.md) §2.5/§2.7/§2.8/§5 |
 | internal 端点 U1–U12 | [`portal.md`](api/portal.md) §9；[`runner-integration.md`](design/runner-integration.md) §4 |
 | 文件物化契约 | [`user-space.md`](design/user-space.md) §4/§5/§6/§7/§8 |
-| 崩溃恢复/幂等/checkpoint | [`runner-integration.md`](design/runner-integration.md) §6/§7/§9；[`model.md`](data/model.md) §2.8 |
+| 崩溃恢复/幂等（~~/checkpoint~~ 已随 #640 退役） | [`runner-integration.md`](design/runner-integration.md) §6/§7/§9；[`model.md`](data/model.md) §2.8（§1.11/§2.9 是历史口径） |
 | 路由发布/reconciler | [`topology.md`](design/topology.md) §5/§8；[`schema.sql`](data/schema.sql) §9；[`model.md`](data/model.md) §2.5 |
 | P1 部署范围/防火墙/migration | [`deploy-contract.md`](design/deploy-contract.md) §3/§4.4/§7/§8 |
 | 部署变量/运行时参数 | [`env.md`](env.md) §0/§5/§10/§11 |
