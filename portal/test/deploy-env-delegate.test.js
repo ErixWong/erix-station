@@ -1548,4 +1548,31 @@ test('活二⑲ 解析得出的参数默认值不许白丢：末位默认值 / �
     + '两形（末位 `X = \'ERIX_X\'` / 解构别名 `{ k: NAME = \'ERIX_X\' }`）少解析一形 = 那一形白丢');
 });
 
+test('活二⑳ 「不许猜」的边界仍在：rest 参数 / 无默认值的解构成员 / 解析不出的默认值都得进 unsupported', () => {
+  // ⑲说「解析得出的不许白丢」，这一格钉它的反面：**解析不出的一律不许猜成外层同名常量**。
+  // 三形都是「名字确实被绑定了，但绑的是什么值静态上看不出来」：
+  //   · `...REST_ENV` 收到的是变长实参数组；
+  //   · `{ k: DESTRUCT_ENV }` 的值来自调用方传的对象；
+  //   · `DEF_DYN = globalThis.zz?.a` 的默认值不是字面量、也不是已知名。
+  // 三形都必须断开外层同名常量（幻影不许进枚举）、逐条进 unsupported。
+  const src = [
+    "const REST_ENV = 'ERIX_A5_REST_PHANTOM';",
+    "const DESTRUCT_ENV = 'ERIX_A5_DESTRUCT_PHANTOM';",
+    'export function restParam(A, ...REST_ENV) { return process.env[REST_ENV]; }',
+    'export function destructParam({ k: DESTRUCT_ENV }) { return process.env[DESTRUCT_ENV]; }',
+    'export function unresolvableDef(DEF_DYN = globalThis.zz?.a) { return process.env[DEF_DYN]; }',
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('shadow-no-guess', src);
+  assert.deepEqual(keys, [],
+    `三个静态上判不出的读形里出现了具体 env 名（实际 ${JSON.stringify(keys)}）：那一格在**猜**——`
+    + '猜中幻影（外层同名常量）就把动态读错记成静态 key，猜错方向就把该登记的旋钮从三腿判据里抽掉');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), [
+    'fx.js:3 process.env[REST_ENV]',
+    'fx.js:4 process.env[DESTRUCT_ENV]',
+    'fx.js:5 process.env[DEF_DYN]',
+  ],
+    `三形逐条登记的动态读不对（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}）：`
+    + '少一条就是那一形被猜成了某个名字（rest / 解构成员 / 不可解析默认值）');
+});
+
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
