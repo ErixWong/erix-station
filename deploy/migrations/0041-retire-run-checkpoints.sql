@@ -3,7 +3,7 @@
 -- 撤的是什么：erix-agent 0.14.0 那套 **run snapshot** 的落点（`docs/data/schema.sql` §8 建的表，
 --   `0006-session-transcript.sql:31-33` 给它加了 session 侧的 `transcript_key` + 部分唯一索引，
 --   `0034-prune-stale-run-checkpoints.sql` 清过一次存量）。写侧是 `TranscriptStore.saveRunSnapshot`，
---   读侧是 `loadLatestRunSnapshot`，经 agentd 转四个 internal 端点（U8/U9 run 作用域 + S4/S5 session 作用域）进来。
+--   读侧是 `loadLatestRunSnapshot`，经 agentd 转四个 internal 端点（U8/U9 run 作用域 + S3/S4 session 作用域）进来。
 --
 -- 为什么现在可以撤（两条判据都要成立，缺一就不撤；同 `0032` 的纪律）：
 --   ① **引擎侧零调用**：erix-agent 0.33.0（上游 #838 S2，本站 #530）把 run snapshot 整个退役，

@@ -8564,7 +8564,7 @@ M1: run:05beae2d-… → done + notifications「宏「跑完告诉我」」   �
 
 **撤表判据（真库 `station` 只读现查，2026-11-17 09:37）**：17 行 / `pg_total_relation_size` **565,248 B**
 （与 §8.126.2 记的 `0034` + `VACUUM FULL` 后那个读数**逐字相同**，⇒ 0.33 上线后零写入、体积也没漂）；
-`max(updated_at)` = **2026-11-11 03:30:15**（早于 0.33 上线）；**零视图 / 零触发器 / 零外键入边**
+`max(updated_at)` = **2026-11-11 01:32:41+00**（= 09:32:41 CST，早于 0.33 上线）；**零视图 / 零触发器 / 零外键入边**
 （`run_checkpoints_run_id_fkey` 里本站是 **child 端**，`confdeltype = a`）⇒ `DROP` 不会级联掉任何东西。
 撤前整表备份：`~/backups/run_checkpoints-pre-0041-261117-0937.sql.gz`（17 行，成本可忽略）。
 部署面：FDE 容器与 dev portal **已全部 0.33.0** ⇒ 现场不再有任何 writer，「旧 runner 还在写」这一条不成立。

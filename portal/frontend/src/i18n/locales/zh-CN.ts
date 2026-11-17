@@ -356,7 +356,7 @@ export const zhCN = {
       strategyFallback: '压缩未使用配置的策略：引擎兜底 sliding-window（整轮丢弃、不摘要，第 {round} 轮起）',
       metadataMissing: '模型上下文元数据缺失：本次 run 的压缩与聚合输出预算已关闭',
       capabilityDegraded: '存储端缺少 {method} 能力：本次 run 对应的持久化被跳过（中途崩溃不可恢复）',
-      resumeJournalSkipped: '崩溃轮的 {count} 条工具结果未入账（第 {round} 轮），下次恢复将依赖快照',
+      resumeJournalSkipped: '崩溃轮的 {count} 条工具结果未入账（第 {round} 轮），下次恢复将依赖账本（run snapshot 已于 #640 退役）',
       resumeJournalSome: '若干',
       // issue #438 切片 B（erix-agent 0.29.0）：`LoopEvent` 新增的两类**展示类**诊断事件。
       // 数字没给就 `?`（#283）、外来标识符过形状闸（#261）——调用方已归一，文案不得再编数。

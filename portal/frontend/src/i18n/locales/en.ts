@@ -339,7 +339,7 @@ export const en = {
       strategyFallback: 'compaction is not using the configured strategy: the engine fallback "sliding-window" drops whole head rounds without summarising (from round {round})',
       metadataMissing: 'model context metadata missing: compaction and the aggregate output budget are disabled for this run',
       capabilityDegraded: 'store lacks the {method} capability: that persistence is skipped for this run (no mid-run crash resume)',
-      resumeJournalSkipped: '{count} tool result(s) from the crash round (round {round}) were not written to the ledger; the next resume relies on the snapshot',
+      resumeJournalSkipped: '{count} tool result(s) from the crash round (round {round}) were not written to the ledger; the next resume relies on the ledger (run snapshots were retired in #640)',
       resumeJournalSome: 'some',
       // issue #438 slice B (erix-agent 0.29.0): the two display-class diagnostics the LoopEvent union
       // grew. Missing numbers are already normalised to "?" by the caller (#283); foreign identifiers

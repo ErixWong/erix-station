@@ -208,7 +208,7 @@ test('U2 /state：cancelling 期间的 running 写入 → 200 幂等 ack（不�
 // 这条断言的是**退役的形状**，不是「功能还在」：带**有效**内部认证（容器 token + 有效 claim token +
 // writer fencing）打过去必须 **404 `not_found`**，不能是 500（路由分支被删但 handler 里还留着半截
 // ⇒ `internal.putCheckpoint is not a function` 那种 500），也不能是 405（方法对了路径还在 = 端点没删干净）。
-// 两个作用域（U8/U9 run 作用域、S4/S5 session 作用域）各钉一次，`/latest` 与裸路径各钉一次。
+// 两个作用域（U8/U9 run 作用域、S3/S4 session 作用域）各钉一次，`/latest` 与裸路径各钉一次。
 // 反向自证：同时打一条**仍活着**的 `/runstate` ⇒ 必须不是 404（否则 404 是路由前缀坏了，不是端点没了）。
 // ---------------------------------------------------------------------------
 test('#640 退役回归：四个 /checkpoint* 端点带有效内部认证打过去 ⇒ 404 not_found（不是 500/405）', async () => {
