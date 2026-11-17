@@ -14,6 +14,8 @@ import { startOffboardingLoop } from './offboarding.js';
 import { startRoutesLoop } from './routes.js';
 import { startRouteDriftMonitor } from './routesdrift.js';
 import { startMacroEvalLoop } from './macro-eval.js';
+// issue #616：意图消费者（dispatcher）与超时回收 loop——评估循环只产意图，执行/收尾在这里接线。
+import { createIntentDispatcher, startPendingSweepLoop } from './macro-dispatcher.js';
 import { startReaperLoop, notifySessionEvents } from './internal.js';
 import { gracefulShutdown, SHUTDOWN_LOOPS_MS_DEFAULT } from './shutdown.js';
 import {
@@ -76,7 +78,11 @@ async function serve() {
   // issue #474 S3 一期：动态文件漂移**只读**对账（60s + 启动一次；只 warn + 审计，绝不写盘）。
   const driftMonitor = startRouteDriftMonitor(pool, config);
   // issue #525 W2：宏平台评估循环（只产触发意图，不执行；水位线逐条推进；60s + 启动一次）。
-  const macroEvalLoop = startMacroEvalLoop(pool, config);
+  // issue #616：评估器产出的意图由 dispatcher **消费**（onIntents 接线），否则三条主功能全断且留永久 pending 行。
+  const intentDispatcher = createIntentDispatcher({ pool, config });
+  const macroEvalLoop = startMacroEvalLoop(pool, config, { onIntents: (intents) => intentDispatcher.dispatch(intents) });
+  // issue #616 要求④：超时回收清扫单独起 loop（职责与评估不同，不合并）；pending 超阈→failed。
+  const macroSweepLoop = startPendingSweepLoop(pool, config);
   const provisionerLoop = startProvisionerLoop(pool, config);
   const reaperLoop = startReaperLoop(pool);
   server.listen(config.port, config.host, () => {
@@ -108,6 +114,7 @@ async function serve() {
     { name: 'routes', ...routesLoop },
     { name: 'routes-drift', ...driftMonitor },
     { name: 'macro-eval', ...macroEvalLoop },
+    { name: 'macro-sweep', ...macroSweepLoop },
     { name: 'provisioner', ...provisionerLoop },
     { name: 'reaper', ...reaperLoop },
   ];

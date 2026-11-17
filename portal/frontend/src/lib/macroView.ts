@@ -31,6 +31,8 @@ export interface MacroAssignment {
   id: string;
   templateId: string;
   sessionId: string | null;
+  /** 订阅的运行目录（issue #623：`scope='user'` 订阅必填 `~/projects/<name>`；会话级为 null）。可选以免扰动既有会话级构造。 */
+  cwd?: string | null;
   until: string | null;
   enabled: boolean;
   expired: boolean;
@@ -118,6 +120,7 @@ export function normalizeAssignment(row: Record<string, unknown> | null | undefi
     id: String(row.id ?? ''),
     templateId: String(row.template_id ?? row.templateId ?? ''),
     sessionId: str(row.session_id ?? row.sessionId ?? null),
+    cwd: str(row.cwd ?? null),
     until: iso(row.until),
     enabled,
     expired,
@@ -343,7 +346,14 @@ export function watermarkState(assignments: MacroAssignment[], nowMs: number): W
     .sort();
   const last = stamps.length > 0 ? stamps[stamps.length - 1] : null;
   const stale = active.some((a) => {
-    if (a.lastEvaluatedAt === null) return true;
+    if (a.lastEvaluatedAt === null) {
+      // 尚未评估 ≠ 水位线陈旧（`09` §1.1 把「首次订阅」与「水位线陈旧」分开）：
+      // 只有过了宽限窗（`createdAt + 3 × 间隔`）仍没推进过，才算陈旧——执行器真挂了
+      // 仍会被抓到，但不对刚建的订阅误报（否则每个新订阅都闪一次 ⚠，狼来了）。
+      if (a.createdAt === null) return false;
+      const created = Date.parse(a.createdAt);
+      return !Number.isNaN(created) && nowMs - created > WATERMARK_STALE_MS;
+    }
     const ts = Date.parse(a.lastEvaluatedAt);
     return Number.isNaN(ts) || nowMs - ts > WATERMARK_STALE_MS;
   });

@@ -99,7 +99,7 @@ describe('只列会话级模板（`07` §3.2）', () => {
     expect(wrapper.text()).not.toContain('每日 9 点');
   });
 
-  it('user scope 的实例（顶栏那份）列用户级模板、复选框禁用并说明「管理员代配」', async () => {
+  it('user scope 的实例（顶栏那份）列用户级模板，且可自己启用（不再是只读复选框）', async () => {
     stubFetch();
     const { wrapper } = mountMenu({ scope: 'user', variant: 'config' });
     await new Promise((r) => setTimeout(r, 0));
@@ -107,8 +107,10 @@ describe('只列会话级模板（`07` §3.2）', () => {
 
     const items = wrapper.findAll('[data-test="macro-config-item"]');
     expect(items.map((n) => n.attributes('data-template-id'))).toEqual(['t-daily']);
-    expect(items[0].find('input').attributes('disabled')).toBeDefined();
-    expect(wrapper.text()).toContain('由管理员代配');
+    // issue #623：user scope 不再只读——没有禁用的复选框，而是有一个「启用」按钮。
+    expect(items[0].find('[data-test="macro-config-check"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="macro-user-enable"]').exists()).toBe(true);
+    expect(wrapper.text()).not.toContain('由管理员代配');
   });
 
   it('原始枚举不进 UI：面板里既没有 `run-notify` 也没有 `scheduled-task`', async () => {
@@ -187,5 +189,77 @@ describe('chip 文案（颜色不承重：文字标签在 DOM 里）', () => {
     }];
     await new Promise((r) => setTimeout(r, 0));
     expect(wrapper.find('[data-test="macro-chip"]').text()).toContain('1 启用');
+  });
+});
+
+describe('用户级模板可订阅（issue #623：顶栏 user scope 不再只读）', () => {
+  /** 带 /api/dirs 与 PUT /api/macro-assignments 的桩（DOM 断言，不用 w.emitted()）。 */
+  function stubWithDirs(initialItems: unknown[] = []): RecordedCall[] {
+    const calls: RecordedCall[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : String(input);
+      const method = (init?.method ?? 'GET').toUpperCase();
+      calls.push({ url, method, body: typeof init?.body === 'string' ? JSON.parse(init.body) : null });
+      const json = (obj: unknown) => new Response(JSON.stringify(obj), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      if (url.includes('/api/dirs')) {
+        return json({ dirs: [{ name: 'acme', cwd: '~/projects/acme', running_count: 0, queued_count: 0 }] });
+      }
+      if (url.includes('/api/macro-assignments')) {
+        if (method === 'PUT') {
+          const b = (typeof init?.body === 'string' ? JSON.parse(init.body) : {}) as { templateId?: string; cwd?: string };
+          return json({ assignment: { id: 'ua-1', template_id: b.templateId, session_id: null, cwd: b.cwd, enabled: true, effective_enabled: true } });
+        }
+        return json({ items: initialItems });
+      }
+      return json({ items: [
+        { id: 't-daily', kind: 'scheduled-task', name: '每日 9 点', params: {}, scope: 'user', audience: 'all' },
+      ] });
+    }));
+    return calls;
+  }
+
+  it('启用 → 选目录 → 一次 PUT /api/macro-assignments（带 templateId 与 cwd），并显示已启用', async () => {
+    const calls = stubWithDirs();
+    const { wrapper } = mountMenu({ scope: 'user', variant: 'config' });
+    await new Promise((r) => setTimeout(r, 0));
+    await wrapper.find('[data-test="macro-config-button"]').trigger('click');
+
+    await wrapper.find('[data-test="macro-user-enable"]').trigger('click');
+    await new Promise((r) => setTimeout(r, 0));
+    // 展开后出现目录选择器（DirSelect）与一个真实目录选项。
+    const picker = wrapper.find('[data-test="macro-user-dirpicker"]');
+    expect(picker.exists()).toBe(true);
+    const select = picker.find('select');
+    expect(select.exists()).toBe(true);
+    expect(select.findAll('option').map((o) => o.attributes('value'))).toContain('~/projects/acme');
+
+    await select.setValue('~/projects/acme');
+    await new Promise((r) => setTimeout(r, 0));
+
+    const put = calls.find((c) => c.method === 'PUT');
+    expect(put).toBeTruthy();
+    expect(put?.url).toBe('/api/macro-assignments');
+    expect(put?.body).toMatchObject({ templateId: 't-daily', cwd: '~/projects/acme' });
+    // 订阅后行内显示「已启用」（DOM 断言）。
+    expect(wrapper.find('[data-test="macro-user-enabled"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain('已启用');
+  });
+
+  it('已启用后点「取消订阅」→ 一次 DELETE /api/macro-assignments/:id', async () => {
+    const calls = stubWithDirs([
+      { id: 'ua-9', template_id: 't-daily', session_id: null, cwd: '~/projects/acme', enabled: true, effective_enabled: true },
+    ]);
+    const macro = useMacroStore();
+    const { wrapper } = mountMenu({ scope: 'user', variant: 'config' });
+    await new Promise((r) => setTimeout(r, 0));
+    await wrapper.find('[data-test="macro-config-button"]').trigger('click');
+
+    expect(wrapper.find('[data-test="macro-user-enabled"]').exists()).toBe(true);
+    await wrapper.find('[data-test="macro-user-disable"]').trigger('click');
+    await new Promise((r) => setTimeout(r, 0));
+
+    const del = calls.find((c) => c.method === 'DELETE');
+    expect(del?.url).toBe('/api/macro-assignments/ua-9');
+    expect(macro.userAssignments.length).toBe(0);
   });
 });

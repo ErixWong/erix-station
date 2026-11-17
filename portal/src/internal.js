@@ -175,6 +175,10 @@ export function assembleTicket({
       task: message?.content ?? '',
       message_id: message?.id ?? null,
       model: run.model ?? null,
+      // issue #627 ③：本次 run 的轮数上限（宿主写在 `runs.run_state.host_max_rounds`）。
+      // null = 没声明 ⇒ runner 继续用容器级 ERIX_MAX_ROUNDS 默认。agentd 拿到非空值时
+      // 以 per-run 环境量覆盖（见 runner/agentd.js buildWorkerEnv）。
+      max_rounds: run.max_rounds ?? null,
       resume: attempts > 1,
       attachments: Array.isArray(message?.attachments) ? message.attachments : [],
       ...(gitName || gitEmail ? { git_identity: { name: gitName, email: gitEmail } } : {}),
@@ -302,7 +306,8 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), bas
   if (!row) return null;
 
   const run = await pool.query(
-    `SELECT r.id, r.session_id, s.model, s.cwd
+    `SELECT r.id, r.session_id, s.model, s.cwd,
+            (r.run_state ->> 'host_max_rounds')::int AS max_rounds
        FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE r.id = $1`,
     [row.run_id],
   );
@@ -351,7 +356,8 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), bas
     queueId: row.queue_id,
     claimToken: row.claim_token,
     leaseUntil: row.lease_until,
-    run: { id: runRow.id, session_id: runRow.session_id, model: runRow.model, cwd: runRow.cwd ?? null },
+    run: { id: runRow.id, session_id: runRow.session_id, model: runRow.model, cwd: runRow.cwd ?? null,
+      max_rounds: runRow.max_rounds ?? null },
     project,
     message: { ...currentMessage, content: taskText },
     attempts: Number(row.attempts),
