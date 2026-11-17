@@ -1220,6 +1220,26 @@ async function routeApi(req, res, ctx, url) {
     await requireSession(req, ctx);
     return sendJson(res, 200, await macroRoutes.userTemplates({ pool: ctx.pool }));
   }
+  // ---- issue #623：用户级订阅（`scope='user'` 模板如 scheduled-task 的开户入口；⚠ 不能放 `/api/admin/*`，#450 白名单）。
+  // 属主一律当前 session 的 user（不接受 body 里的 userId）；响应复用 `toAssignmentSnapshot`。
+  // ⚠ `DELETE .../:id` 排在 GET/PUT 之前注册：同名空间的静态段要先注册（口径同上 `unread-count` 那条注释）。
+  const userMacroAssignOneMatch = pathname.match(/^\/api\/macro-assignments\/([^/]+)$/);
+  if (req.method === 'DELETE' && userMacroAssignOneMatch) {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.deleteUserAssignment({
+      pool: ctx.pool, userId: s.user.id, assignmentId: decodeUuid(userMacroAssignOneMatch[1]),
+    }));
+  }
+  if (pathname === '/api/macro-assignments') {
+    const s = await requireSession(req, ctx);
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await macroRoutes.userAssignments({ pool: ctx.pool, userId: s.user.id }));
+    }
+    if (req.method === 'PUT') {
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      return sendJson(res, 200, await macroRoutes.putUserAssignment({ pool: ctx.pool, userId: s.user.id, body }));
+    }
+  }
   // ⚠ `unread-count` 排在 `/notifications/:id/read` 之前：两段都是 `/api/notifications/xxx`，
   // 后者的 `:id` 能吃掉 `unread-count`（同名空间里的静态段要先注册，口径同 macro-runs/summary）。
   if (req.method === 'GET' && pathname === '/api/notifications/unread-count') {
