@@ -18,9 +18,11 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
+import { validateKindParams, claimMacroRun, MacroError } from '../src/macros.js';
 import {
   startMacroEvalLoop, isWatermarkStale, isQuietHours, inTz8, atToEpochMs, parseDurationMs,
   EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE, SILENCE_DEFAULT_THRESHOLD_MS,
+  parseQuietSpec, quietSpecFor, DEFAULT_MAX_PER_DAY, DEFAULT_QUIET_SPEC, NOTIFY_KINDS,
 } from '../src/macro-eval.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
