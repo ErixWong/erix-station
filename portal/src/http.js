@@ -45,6 +45,7 @@ import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置�
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
 import * as platformPrompts from './platform-prompts.js'; // #596 片 A：管理台「提示词」面板（读 + 写）
 import * as uploadSettings from './upload-settings.js'; // #485 片 A：单文件上限进管理台（DB 优先 env，每次上传现读）
+import * as secrets from './secrets.js';   // #608：配置槽加解密（错误码 secret_key_missing）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
 import * as delegation from './delegation.js'; // 子 run（delegation）读侧：名册 + 账本两个只读端点
@@ -797,6 +798,11 @@ export function createServer({
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof secrets.SecretError) {
+        // #608：密钥面的错误（缺 key / 解不开 / 值非法）有自己的 code 集合，别混进 validation_failed。
+        sendJson(res, err.httpStatus ?? 503, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       if (err instanceof market.MarketError) {
         // #595：市场域自己的错误载体（`code` 集合是 §7 的契约：validation_failed /
         // capability_not_found / capability_not_published / capability_budget_exceeded /
@@ -1351,7 +1357,10 @@ async function routeApi(req, res, ctx, url) {
     } else if (action === 'uninstall') {
       result = await market.uninstallCapability({ pool: ctx.pool, config: ctx.config, fde, slug, log: ctx.log });
     } else {
-      result = await market.setCapabilityEnabled({ pool: ctx.pool, fde, slug, enabled: body?.enabled });
+      // #608：MCP 的启用闸要解析槽值（缺必填 ⇒ 409），所以要把 config 递下去（里面带 mcpSecretKey）。
+      result = await market.setCapabilityEnabled({
+        pool: ctx.pool, fde, slug, enabled: body?.enabled, config: ctx.config,
+      });
     }
     await auth.audit(ctx.pool, {
       actorId: s.user.id,
@@ -1933,6 +1942,41 @@ async function handleAdminApi(req, res, ctx, url) {
       details: { id: item.id, state: item.state },
     });
     return sendJson(res, 200, { item });
+  }
+  // #608 §7.2：凭据读写（**只写不读**：GET 只回 has_value 元数据，永不含值）。
+  const adminMarketSecretsMatch = pathname.match(/^\/api\/admin\/market\/items\/([^/]+)\/secrets$/);
+  if (adminMarketSecretsMatch) {
+    const itemId = decodeUuid(adminMarketSecretsMatch[1]);
+    if (req.method === 'GET') {
+      const item = await market.getAdminItem({ pool: ctx.pool, itemId });
+      return sendJson(res, 200, { item: { id: item.id, slug: item.slug, slots: await market.listSlots({ pool: ctx.pool, itemId }) } });
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      // 非法 scope **当场 400**（审计必修）：静默当 global 意味着「想写某台工位的凭据，结果写成了全局」，
+      // 而全局值会被所有工位解析到——这是把一次误操作放大成一次凭据扩散。
+      const scopeRaw = body?.scope ?? 'global';
+      if (scopeRaw !== 'global' && scopeRaw !== 'fde') {
+        throw new HttpError(400, 'validation_failed', 'scope 只允许 global | fde',
+          { details: { field: 'scope', scope: scopeRaw } });
+      }
+      const scope = scopeRaw;
+      const fdeId = scope === 'fde' ? decodeUuid(String(body?.fde_id ?? '')) : null;
+      const out = await market.setSlotValues({
+        pool: ctx.pool, itemId, actorId: session.user.id, scope, fdeId,
+        values: body?.values ?? {}, key: ctx.config.mcpSecretKey,
+      });
+      await auth.audit(ctx.pool, {
+        actorId: session.user.id,
+        action: 'admin.capability_secrets_updated',
+        target: `capability:${itemId}`,
+        // 审计只记「改了哪几个槽 + 作用域」：**绝不含值**，连长度都不记（长度也是信息）。
+        details: { scope, fde_id: fdeId, names: Object.keys(body?.values ?? {}), changed: out.changed },
+      });
+      return sendJson(res, 200, { item: { id: itemId, slots: await market.listSlots({ pool: ctx.pool, itemId }) } });
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
   const adminMarketItemMatch = pathname.match(/^\/api\/admin\/market\/items\/([^/]+)$/);
   if (adminMarketItemMatch) {
@@ -5018,6 +5062,55 @@ async function handleInternal(req, res, ctx, url) {
   }
 
   // U4 heartbeat（§9.5）
+  // #608 §7.2：MCP 配置下发（**只给 agentd**：per-container token 鉴权；worker 没有 token）。
+  // 返回的是**已解析的明文值**——这是「凭据平台注入」的唯一出口，所以：
+  //   ① 只对**自己这台容器所属的 FDE** 发（identity.user 由 token 推出，不接受 query 指定）；
+  //   ② 审计只记 server / 槽位名，绝不记值；
+  //   ③ 响应不缓存（no-store），避免中间层留存。
+  if (pathname === '/api/internal/mcp/servers') {
+    if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    // ⚠ `fde_name` 在 `identity.container` 上，**不在** `identity.user` 上（真机 e2e 抓到的）：
+    // 写成 `user.fde_name` ⇒ 恒 undefined ⇒ 早退空清单 ⇒ 症状是「装了 MCP 但 run 里 declared=1
+    // registered=0 missing=1」，而 portal 侧一切正常（没有任何报错）。
+    const fde = { id: user.id, name: container?.fde_name };
+    if (!fde.name) {
+      ctx.log?.warn?.('[internal/mcp] container identity 缺 fde_name，无法解析 MCP 配置');
+      return sendJson(res, 200, { servers: [], missing: [] });
+    }
+    let out;
+    try {
+      out = await market.resolveMcpServersForFde({
+        pool: ctx.pool, fde, key: ctx.config.mcpSecretKey, log: ctx.log,
+      });
+    } catch (err) {
+      // 缺 key / 解密全失败 ⇒ 降级成「一台都没有」，让 run 正常继续（不把 run 打死）。
+      ctx.log?.warn?.(`[internal/mcp] resolve failed fde=${fde.name}: ${err.message}`);
+      out = { servers: [], missing: [] };
+    }
+    res.setHeader('cache-control', 'no-store');
+    await auth.audit(ctx.pool, {
+      actorId: null,
+      action: 'internal.mcp_servers_resolved',
+      target: `fde:${fde.name}`,
+      details: {
+        servers: out.servers.map((s) => s.name),
+        slots: out.servers.flatMap((s) => Object.keys(s.values ?? {})),
+        missing: out.missing,
+      },
+    }).catch(() => {});
+    return sendJson(res, 200, out);
+  }
+  if (pathname === '/api/internal/mcp/tools-cache') {
+    if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    requireJson(req);
+    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const slug = typeof body?.slug === 'string' ? body.slug : '';
+    if (!market.SKILL_SLUG_RE.test(slug)) {
+      throw new HttpError(400, 'validation_failed', 'slug 不合法', { details: { field: 'slug', slug } });
+    }
+    const out = await market.recordToolsCache({ pool: ctx.pool, slug, tools: body?.tools ?? [] });
+    return sendJson(res, 200, out);
+  }
   if (pathname === '/api/internal/heartbeat') {
     if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     requireJson(req);

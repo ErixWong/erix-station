@@ -3236,7 +3236,110 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 2 MiB 原文编码后约 2.75 MiB，而 `maxBodyBytes` 默认只有 64 KiB —— 沿用默认值会让 413 先于任何校验发生，
 调用方拿到的是「体太大」而不是「你的包哪里不对」（§4.15 记的是同一个坑的另一半）。
 
-### 4.18 管理台提示词面板（`/api/admin/prompts`，issue #596 片 A）
+### 4.18 MCP 通道（`kind='mcp'` 条目、配置槽、内部下发，issue #608）
+
+契约正文在 `docs/design/mcp-integration.md`（v2）；本节只记**端点面与错误码**。
+与 §4.17 的关系：MCP 与 skill 共用同一张 `capability_items`（`kind` 分家）与同一套
+`/api/market/*` 用户面端点，**差异只在三处**：发布体没有 `bundle`、多了 `transport/command/url`、
+多了「配置槽」（凭据）这条独立通道。
+
+#### 4.18-1 发布 / 编辑 `kind='mcp'`
+
+`POST /api/admin/market/items` 与 `PUT /api/admin/market/items/:id` 的请求体多出这些字段
+（`kind:"mcp"` 时**没有** `bundle`）：
+
+```jsonc
+{ "kind": "mcp", "slug": "erix-search", "name": "…", "summary": "…",
+  "when_to_use": "…", "version": "1.0.0",
+  "transport": "stdio" | "http",
+  "command": "node", "args": ["server.mjs"],        // transport=stdio 必填 command
+  "url": "https://…/mcp",                            // transport=http 必填 url（只允许 http/https）
+  "reason": "stateful|tool_surface_gt_12|shared_quota|credential_boundary",
+  "exposure": "direct" | "deferred" | "hidden",      // 缺省 deferred
+  "lifecycle": "run" | "run-keep-alive",             // P1 两者行为相同，为 P2 预留
+  "timeout_ms": 30000,
+  "slots": [ { "name": "ERIX_SEARCH_TOKEN", "kind": "secret" | "config",
+               "inject": "env" | "header", "required": true, "description": "…" } ] }
+```
+
+校验要点（实现只在 `portal/src/market.js` 的 `validateMcpFields`，判据 `portal/test/market-mcp.test.js`）：
+
+- `transport` 三选一里的两个（`sse` 等一律 400）；`stdio` 必须给 `command` 且**不含空格**
+  （`command` 是 argv[0]，不是 shell 串）；`http` 必须给 `url` 且 scheme ∈ {http,https}；两者互斥。
+- `reason` 缺或不在四选一 ⇒ **`capability_reason_required`**（专属码，前端据此高亮那个下拉）。
+- `resident` 只接受 `false`/缺省；其它值 ⇒ `capability_kind_unsupported`（P1 不做常驻容器）。
+- `slots` 上限 16 条；`name` 匹配 `^[A-Z][A-Z0-9_]{0,63}$` 且**不许撞保留名**
+  （`PATH`/`HOME`/`ERIX_*`/`MCP_*`/`NODE_*` 等，两侧都判）；`kind:'secret'` 只能 `inject:'env'` 或 `'header'`
+  （`context` 一律不许：那是模型可见的上下文，秘密进那里等于写进提示词）；`stdio` 只能 `env`、`http` 才能 `header`；重名 ⇒ `capability_slot_invalid`。
+- 发布闸门（`POST …/publish`）：skill 要「当前版本有包」，**MCP 要「配置完整」**（`command` 或 `url`），
+  否则 `409 capability_not_published`，`details.reason` = `mcp_config_incomplete`。
+
+#### 4.18-2 配置槽（凭据）：**只写不读**
+
+| 端点 | 方法 | 说明 |
+| --- | --- | --- |
+| `/api/admin/market/items/:id/secrets` | `GET` | 槽位元数据（**响应里没有任何字段承载值**，连长度都没有） |
+| `/api/admin/market/items/:id/secrets` | `PUT` | 写/删值（`null` = 删除）⇒ 200 回新的槽位元数据 |
+
+```jsonc
+// GET 的响应
+{ "item": { "id": "…", "slug": "erix-search", "slots": [
+  { "name": "ERIX_SEARCH_TOKEN", "kind": "secret", "inject": "env", "required": true,
+    "description": "…", "scope": "global", "fde_id": null,
+    "updated_at": "…", "updated_by": "…", "has_value": true } ] } }
+// PUT 的请求体
+{ "scope": "global" | "fde", "fde_id": "<uuid，scope=fde 时必填>",
+  "values": { "ERIX_SEARCH_TOKEN": "明文", "OTHER": null } }
+```
+
+- 加密：AES-256-GCM，key 来自 `MCP_SECRET_KEY`（base64 的 32 字节，`deploy/.env`），
+  AAD = `<item_id>:<name>:<scope>:<fde_id|空串>` ⇒ **密文不可跨条目/跨槽/跨 FDE 搬移**
+  （搬过去解不开，判据 `portal/test/secrets.test.js` S-2/S-3）。
+- **缺 key 不是「用默认 key」**：`MCP_SECRET_KEY` 为空 ⇒ 加解密一律 `503 secret_key_missing`
+  （读元数据仍可用，`has_value` 恒 false）。轮换口径：换 key ⇒ 旧密文解不开 ⇒ 槽位显示未设置 ⇒ 重填。
+- 解析优先级：**fde 覆盖 global**；解不开的值按「没设置」处理（fail-closed 进 `missing`）。
+- 审计：`admin.capability_secrets_updated`，`details` 只有 `{scope, fde_id, names[], changed}`，**无值**。
+
+#### 4.18-3 内部通道（只给 agentd，worker 拿不到）
+
+| 端点 | 方法 | 说明 |
+| --- | --- | --- |
+| `/api/internal/mcp/servers` | `GET` | 本容器所属 FDE 的已解析 MCP 配置（**含明文槽值**，`no-store`） |
+| `/api/internal/mcp/tools-cache` | `POST` | 回填 `manifest.tools_cache`（`list` 之后由 runner 上报） |
+
+```jsonc
+// GET /api/internal/mcp/servers
+{ "servers": [ { "name": "erix-search", "slug": "erix-search", "transport": "stdio",
+                 "command": "node", "args": ["server.mjs"], "url": null,
+                 "exposure": "deferred", "lifecycle": "run", "timeout_ms": 30000,
+                 "slots": [ … ], "values": { "ERIX_SEARCH_TOKEN": "明文" } } ],
+  "missing": [ { "slug": "other", "names": ["TOKEN"] } ] }
+// POST /api/internal/mcp/tools-cache
+{ "slug": "erix-search",
+  "tools": [ { "name": "search", "description": "…", "inputSchema": { … } } ] }
+```
+
+`tools_cache` 的用途有两个：`deferred` 档让模型先「按需检索」到工具名再调网关；管理台/用户面显示
+「这个 server 有几个工具、分别叫什么」。它是**缓存**（可被下一次 `list` 覆盖），不是真相源。
+
+- 鉴权：per-container token（`X-Station-Token`，与其它 `/api/internal/*` 同一条中间件）；
+  **FDE 身份只从 token 推出**，不接受 query/body 指定 ⇒ 拿不到别人的槽值。
+- 槽值解析失败（缺 key / 解密失败 / 条目被停用）**不让 run 死**：降级成「这台 FDE 一个 MCP 都没有」
+  + `warn` 日志，run 正常继续（症状是工具消失，而不是 run 500）。
+- 审计：`internal.mcp_servers_resolved`，`details` 只有 `{servers[], slots[](名字), missing[]}`。
+
+#### 4.18-4 用户面的差异（相对 §4.17）
+
+- `GET /api/market/items` / `GET /api/market/items/:slug` 的每项多带
+  `kind`、`exposure`、`reason`、`transport`、`secrets_ready`（bool；该条目**所有必填槽**在本 FDE 都有值）。
+- **启用闸**：`POST /api/market/items/:slug/enabled` 对 MCP 条目先解析槽位，缺必填 ⇒
+  `409 capability_secret_missing`，`details.missing = ["NAME", …]`。这条闸**每次 `enabled:true` 都查**
+  （不只在状态迁移时查）——槽值可能在启用后被删掉或 key 轮换后解不开，此时「再点一次启用」必须同样拦住。
+- **安装不落盘**：MCP 的 `install` 只写 `fde_capability_installs`，响应 `disk:"none"`（没有包可写）。
+  真正落到容器里的只有两处物化产物：`~/.erix/mcp.json`（`{version, servers[]}`，**不含值**）与
+  `~/.erix/capabilities.json` 的 `mcp` 段（只放 `name/description/exposure/tool_count`）。
+
+### 4.19 管理台提示词面板（`/api/admin/prompts`，issue #596 片 A）
 
 **一句话**：平台对 agent 说的三句话（`~/AGENTS.md` 的**补充约定**、`~/AGENTS.md` 的**整段覆写**、
 **会话标题的 system**）从「改 `portal/src/materializer.js` + 重建 station-portal 镜像」变成
@@ -3259,7 +3362,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 （没东西可失效）。表不存在 / 读失败 / 读超时 ⇒ **回落内置**（`reason` 见下），**永不 500**：
 配置面坏了不能让物化与改名挂掉。
 
-#### 4.18-1 `GET /api/admin/prompts`
+#### 4.19-1 `GET /api/admin/prompts`
 
 `200`（**表不存在 / DB 读失败 / 读超时也是 200**）：
 
@@ -3293,7 +3396,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 | `addendum.text` / `agentsMd.override` / `titlePrompt.text` | DB 里的当前值（`""` = 跟随内置）。读侧**不做长度校验**：手工 `UPDATE` 进来的超长值**照用**（换成内置会让管理台显示的和实际生效的对不上）|
 | `*.isDefault` | 该格是否在跟随内置（`= (text === '')`）—— 「来源」不许靠 UI 猜 |
 | `agentsMd.isOverridden` | `override !== ''`。页面要显式标「已偏离内置模板」并给「恢复内置」按钮 |
-| `agentsMd.templateBytes` / `effectiveBytes` | 都是**按固定示例工位名 `example` 渲染的整份文件字节数**：默认态下逐数相同，覆写/追加后的差值就是净变化。⚠ 这是**预览**口径；**写侧闸不是这个名**，见 §4.18-3 |
+| `agentsMd.templateBytes` / `effectiveBytes` | 都是**按固定示例工位名 `example` 渲染的整份文件字节数**：默认态下逐数相同，覆写/追加后的差值就是净变化。⚠ 这是**预览**口径；**写侧闸不是这个名**，见 §4.19-3 |
 | `agentsMd.effectiveText` | 同一份「现在生效的全文」，用固定示例名 `example` 渲染 ⇒ **零时间戳、零 run id**（页面要能对比文本、测试要能断言；这份文本会进模型请求的 system 位，动态量会让 prompt 缓存整条失效）|
 | `*.maxBytes` | 该格的**写侧**上限（8192 / 16384 / 2000）。DB 里没有 CHECK，这里才是闸 |
 | `agentsMd.renderedLimitBytes` | 注入侧对**整份** `~/AGENTS.md` 的上限（= `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES`，跨包对账由判据 `P9` 钉住，不许手抄）|
@@ -3305,7 +3408,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 `templateBytes` / `effectiveBytes` / `effectiveText` 都按**固定示例工位名**
 `example`（7 字符）渲染，而**写侧闸按最长合法工位名**算那份标识行的预算
 （从 `FDE_NAME_RE` 导出的 `FDE_NAME_MAX_LEN`，现算不抄数字；理由与
-字节级后果见 §4.18-3）。⇒ 同一份文本，页面完全可以显示「离
+字节级后果见 §4.19-3）。⇒ 同一份文本，页面完全可以显示「离
 `renderLimitBytes` 还有几百字节」而保存仍然吃 `400`
 （`details.rendered_bytes` 超过 `details.render_limit_bytes`）。
 **所以前端不许拿这两个预览数自己预判「到上限就禁用保存」**：以 `PUT`
@@ -3314,7 +3417,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 「页面数字没到啊」。
 | `reason` | `null`（DB 生效）/ `no_row`（未配置）/ `read_failed`（表缺失或 DB 抛错）/ `read_timeout`（查询发出去但 `PLATFORM_PROMPTS_READ_TIMEOUT_MS` 内没回）。三种回落**两两可区分**：把「DB 卡住」说成「管理台还没配过」会让值班去配一个值，而真故障在连接上 |
 
-#### 4.18-2 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`
+#### 4.19-2 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`
 
 ```
 PUT /api/admin/prompts/addendum
@@ -3336,7 +3439,7 @@ Content-Type: application/json
 ⚠ **不新增错误码**：这一节的全部失败都是既有的 `validation_failed` / `forbidden` /
 `method_not_allowed` / `internal`（`details.field` 负责说清是哪一格）。
 
-#### 4.18-3 渲染规则与那条硬闸（为什么「保存成功」还不够）
+#### 4.19-3 渲染规则与那条硬闸（为什么「保存成功」还不够）
 
 ```
 正文主体 = override !== '' ? override : 内置模板正文
@@ -3395,7 +3498,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 判据：`P13`（造一组「示例名装得下、最坏名装不下」的输入 ⇒ 必须 400 且一格不写，并钉 SQL 送参里
 那份标识行字节就是最坏情况那一份）。
 
-#### 4.18-4 `materializeEnqueued` 与生效时机
+#### 4.19-4 `materializeEnqueued` 与生效时机
 
 保存成功之后给**全部启用中的 FDE**（`status IN ('active','awaiting_credential')`，与全量重建同一条
 谓词）入队重物化（`outbox.js#enqueueMaterializeChange`，op `upsert`）。**不做「设置 + 入队」的原子性**：
@@ -3415,7 +3518,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 成功那几次的标题**逐字等于** `X`（且 `title_source='manual'`）
 ⇒ 自定义提示词确实生效。
 这**不是 #596 引入的缺陷**：改名走 #322 定下的唯一入口 `generateTitle()`，
-`sanitizeTitle` 一字未动（口径见 §4.18 引言里那句「提示词不是守卫」）。
+`sanitizeTitle` 一字未动（口径见 §4.19 引言里那句「提示词不是守卫」）。
 两处值得另开单议，本单不动：① 空 `content` 是否先重试一次再判 502；
 ② 这条 502 现在写 `retryable:false`，而实测重试常常能成。
 

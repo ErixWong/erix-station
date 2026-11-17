@@ -23,7 +23,7 @@ import { FDE_NAME_MAX_LEN } from './projects.js';
 import { resolveEffectiveAgentsMd } from './platform-prompts.js';
 // issue #595 §5：市场索引的读库侧在 market.js（渲染在本文件，读在数据层——「谁该装什么」的判据
 // 只有一处，物化面与安装面不能各持一份）。只要 SQL/行映射，不要它的错误类，故指名 import。
-import { listCapabilitiesForFde } from './market.js';
+import { listCapabilitiesForFde, listMcpServersForFde } from './market.js';
 
 // 容器内用户名固定 erix（⚠️ 待决策者确认，user-space §2.4）。
 export const FDE_CONTAINER_USER = 'erix';
@@ -156,8 +156,72 @@ export function renderConfigJson({ llmBaseUrl }) {
   });
 }
 
-export function renderMcpJson() {
-  return json({ mcpServers: {} });
+/**
+ * issue #608 §5.1：`~/.erix/mcp.json` —— runner 侧 MCP 客户端的**结构**输入。
+ *
+ * 三条硬口径：
+ *   ① **不含值**：只有槽位声明（`slots[].name/inject/required`）。值在平台 DB 加密存，
+ *      run 启动时由 agentd 经内部通道现取（§6.1）⇒ 这个文件被 `readFile` 读到也没有秘密。
+ *   ② **形状不是标准 `mcpServers`**：故意用 `{version, servers[]}`——标准形状会让别的工具
+ *      以为「这份配置能直接用」，而它其实缺值。名字不同就不会被误读。
+ *   ③ **逐字节确定**：按 name 升序、无时间戳、无随机量；空 ⇒ `{"version":1,"servers":[]}`。
+ *
+ * `exposure` 的差异（§4.3）体现在 `tools` 上：`direct` 带 `inputSchema`（runner 会展开成独立工具），
+ * `deferred` 只带 name/description（必须先 search）。单 server 的 schema 总量超上限 ⇒ 丢掉 schema
+ * 并把该条降级成 deferred（渲染是纯函数，降级只体现在输出里，不写日志）。
+ * @param {Array<object>} servers `listMcpServersForFde` 的形状（hidden 已在上游过滤）
+ */
+/** §4.3：单 server 的 direct schema 总量上限，超了降级 deferred（渲染侧判，纯函数）。 */
+export const MCP_MAX_SCHEMA_BYTES = 64 * 1024;
+
+export function renderMcpJson(servers) {
+  const list = Array.isArray(servers) ? servers : [];
+  const out = list
+    // `hidden` 是**不物化**档（§4.1）：查询层已经滤过一遍，这里再滤一次是纵深防御——
+    // mcp.json 是 runner 唯一读得到配置的地方，让它出现就等于「可达」。
+    .filter((s) => s && typeof s.name === 'string' && s.name !== '' && s.exposure !== 'hidden')
+    .map((s) => {
+      const exposure = ['direct', 'deferred', 'hidden'].includes(s.exposure) ? s.exposure : 'deferred';
+      const tools = (Array.isArray(s.tools) ? s.tools : [])
+        .filter((t) => t && typeof t.name === 'string' && t.name !== '')
+        .map((t) => ({
+          name: t.name,
+          description: typeof t.description === 'string' ? t.description : '',
+          ...(exposure === 'direct' && t.inputSchema && typeof t.inputSchema === 'object'
+            ? { inputSchema: t.inputSchema } : {}),
+        }))
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      let effExposure = exposure;
+      if (exposure === 'direct') {
+        const bytes = Buffer.byteLength(JSON.stringify(tools), 'utf8');
+        if (bytes > MCP_MAX_SCHEMA_BYTES) {
+          // 超限 ⇒ 降级 deferred（丢掉 schema 再算一次，避免把 64 KiB 的 schema 送进容器）
+          for (const t of tools) delete t.inputSchema;
+          effExposure = 'deferred';
+        }
+      }
+      const base = {
+        name: s.name,
+        transport: s.transport === 'http' ? 'http' : 'stdio',
+        exposure: effExposure,
+        lifecycle: s.lifecycle === 'run-keep-alive' ? 'run-keep-alive' : 'run',
+        timeout_ms: Number.isInteger(s.timeout_ms) ? s.timeout_ms : 60000,
+        slots: (Array.isArray(s.slots) ? s.slots : [])
+          .filter((x) => x && typeof x.name === 'string')
+          .map((x) => ({ name: x.name, inject: x.inject === 'header' ? 'header' : 'env', required: x.required !== false }))
+          .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+        tools,
+      };
+      if (base.transport === 'stdio') {
+        base.command = typeof s.command === 'string' ? s.command : '';
+        base.args = (Array.isArray(s.args) ? s.args : []).filter((a) => typeof a === 'string');
+      } else {
+        base.url = typeof s.url === 'string' ? s.url : '';
+      }
+      return base;
+    })
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return json({ version: 1, servers: out });
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +453,7 @@ export function agentsMdRenderedBytes(
  * 排序在渲染侧再做一次（SQL 里也排）：两侧各自都能兑现字节确定性，判据不同源。
  * @param {Array<object>} capabilities §5 形状的条目（含 enabled=false 的，runner 要用它的 id）
  */
-export function renderCapabilitiesJson(capabilities) {
+export function renderCapabilitiesJson(capabilities, mcpServers = []) {
   const list = Array.isArray(capabilities) ? capabilities : [];
   const skills = list
     .filter((s) => s && typeof s.id === 'string' && s.id.length > 0)
@@ -404,7 +468,19 @@ export function renderCapabilitiesJson(capabilities) {
       readme: typeof s.readme === 'string' ? s.readme : null,
     }))
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  return json({ version: 1, skills });
+  // §5.2：MCP 段**只放路由信号**（name/description/exposure/tool_count），**不放工具名**——
+  // 工具名进提示词就是几百 token，而工具清单已经在 `mcp.json` 里（runner 读得到）。
+  const mcp = (Array.isArray(mcpServers) ? mcpServers : [])
+    // hidden 不进清单：它在提示词里出现就等于告诉模型「有个用不了的东西」，纯噪音。
+    .filter((s) => s && typeof s.name === 'string' && s.name !== '' && s.exposure !== 'hidden')
+    .map((s) => ({
+      name: s.name,
+      description: typeof s.description === 'string' ? s.description : '',
+      exposure: ['direct', 'deferred'].includes(s.exposure) ? s.exposure : 'deferred',
+      tool_count: Array.isArray(s.tools) ? s.tools.length : 0,
+    }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return json({ version: 1, skills, mcp });
 }
 
 // P5 去项目化（directory-as-project §3/§5）：ports.json 升为 FDE 级单一文件 ~/.erix/ports.json——
@@ -468,10 +544,26 @@ export function hostPathFor(root, fdeName, containerPath) {
  * 骨架 + FDE 级 ports.json；旧项目脚手架靠 stale 清理（manifest 机制）自然移除。
  * @returns { files: [{ containerPath, hostPath, content, mode }] }
  */
-export function buildFilePlan({
-  fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root, generation,
-  platformPrompts = null, capabilities = [],
-}) {
+/**
+ * 有效 MCP server 清单：**降级判定只做一次**，`mcp.json` 与 `capabilities.json` 共享同一份结果。
+ * 为什么必须共享（审计必修）：两边各算一次时，超 64 KiB 的 `direct` server 在 mcp.json 里已降级成
+ * `deferred`，而索引里仍写 `direct` ⇒ runner 按 direct 期待独立工具、实际一个都没有（静默不一致）。
+ * @returns {Array<object>} 每项是 server 的浅拷贝，`exposure` 已是**生效值**
+ */
+export function effectiveMcpServers(servers, { log = null } = {}) {
+  const list = Array.isArray(servers) ? servers : [];
+  return list.map((s) => {
+    if (!s || s.exposure !== 'direct') return s;
+    const tools = Array.isArray(s.tools) ? s.tools : [];
+    const bytes = Buffer.byteLength(JSON.stringify(tools.map((t) => ({ ...t }))), 'utf8');
+    if (bytes <= MCP_MAX_SCHEMA_BYTES) return s;
+    log?.warn?.(`[materializer] mcp direct 降级 deferred：server=${s.name} schema=${bytes}B > ${MCP_MAX_SCHEMA_BYTES}B`);
+    return { ...s, exposure: 'deferred', tools: tools.map((t) => ({ name: t.name, description: t.description })) };
+  });
+}
+
+export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root, generation,
+  capabilities = [], mcpServers = [], platformPrompts = null, log = null }) {
   const files = [];
   const add = (containerPath, content, mode = FILE_MODE) => {
     files.push({ containerPath, hostPath: hostPathFor(root, fdeName, containerPath), content, mode });
@@ -485,11 +577,12 @@ export function buildFilePlan({
   }));
   add(`${CONTAINER_HOME}/bin/github-pinproxy.py`, GITHUB_PINPROXY_SCRIPT);
   add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmBaseUrl }));
-  add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson());
+  const effectiveMcp = effectiveMcpServers(mcpServers, { log });
+  add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson(effectiveMcp));
   add(`${CONTAINER_HOME}/.erix/ports.json`, renderPortsJson({ fdeName, allocations, observedPorts, generation }));
   // #595：能力市场索引。缺省空数组 ⇒ 没装任何东西时它就是个空清单文件（不是「文件不存在」），
   // runner 因此永远有一条确定的读路径，不必区分「没装」与「还没物化过」。
-  add(`${CONTAINER_HOME}/.erix/capabilities.json`, renderCapabilitiesJson(capabilities));
+  add(`${CONTAINER_HOME}/.erix/capabilities.json`, renderCapabilitiesJson(capabilities, effectiveMcp));
   return files;
 }
 
@@ -527,17 +620,13 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
    * 渲染 + 落盘该 FDE 全部平台文件 + manifest（提交点）。
    * 返回 manifest 内容与最终 generation（供测试断言）。
    */
-  async function materialize({
-    fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, generation, prevManifest,
-    platformPrompts = null, capabilities = [], materializedAt = new Date(),
-  }) {
+  async function materialize({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, generation, prevManifest,
+    capabilities = [], mcpServers = [], platformPrompts = null, materializedAt = new Date() }) {
     const rootReal = path.resolve(root);
     const prevFiles = (prevManifest && prevManifest.files) || {};
 
-    const files = buildFilePlan({
-      fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root: rootReal, generation,
-      platformPrompts, capabilities,
-    });
+    const files = buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root: rootReal, generation,
+      capabilities, mcpServers, platformPrompts, log });
 
     ensureWorkspaceDirs(files);
 
@@ -817,11 +906,20 @@ async function readFdeDesiredState(pool, fdeId, config, log = console) {
   } catch (err) {
     log.warn?.(`[materializer] capabilities read failed fde=${fdeId}: ${err.message}`);
   }
+  // §5.1：MCP server 清单（只取 published && enabled && 非 hidden）。与 skills 同一条降级口径：
+  // 读失败 ⇒ 空数组 + warn，**不让对账停**（最坏结果是这一轮容器里没有 MCP，而不是平台文件面崩掉）。
+  let mcpServers = [];
+  try {
+    mcpServers = await listMcpServersForFde(pool, fdeId);
+  } catch (err) {
+    log.warn?.(`[materializer] mcp servers read failed fde=${fdeId}: ${err.message}`);
+  }
   return {
     fdeName,
     allocations: allocs.rows,
     observedPorts,
     capabilities,
+    mcpServers,
     llmBaseUrl: config.llmPublicBaseUrl,
     baseDomain: config.baseDomain,
   };
@@ -923,6 +1021,8 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
         observedPorts: state.observedPorts,
         // #595：市场索引随 desired state 一起下来（读失败时是空数组，见 readFdeDesiredState）
         capabilities: state.capabilities,
+        // #608：MCP server 清单同理（只取 published && enabled && 非 hidden）
+        mcpServers: state.mcpServers ?? [],
         generation: Number(row.revision),
         prevManifest,
         platformPrompts,

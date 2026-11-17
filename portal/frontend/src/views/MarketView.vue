@@ -15,13 +15,16 @@ import {
   MARKET_ITEMS_PATH,
   bytesText,
   countText,
+  exposureMessageKey,
   installStateMessageKey,
   installStateOf,
+  kindMessageKey,
   marketErrorText,
   marketUserItemPath,
   MAX_ENABLED_SKILLS,
   normalizeMarketDetail,
   normalizeMarketItems,
+  reasonMessageKey,
   type MarketDetail,
   type MarketListItem,
 } from '../lib/market';
@@ -132,6 +135,8 @@ function onUninstall(item: MarketListItem): void {
 }
 
 function onToggleEnabled(item: MarketListItem): void {
+  // 双保险：按钮已经 disabled，但 `secrets_ready=false` 时一次请求都不该发出去（§8.2）。
+  if (secretsBlocked(item)) return;
   const next = !item.enabled;
   void run(
     item,
@@ -143,9 +148,24 @@ function onToggleEnabled(item: MarketListItem): void {
   );
 }
 
-/** MCP 条目（§9：P0 只留表结构，没有消费者）⇒ 不给安装按钮。 */
+/** MCP 条目（#608 §8.2）：种类不同只在「要不要提凭据」上分岔，动作本身一模一样。 */
 function isMcp(item: MarketListItem): boolean {
   return item.kind === 'mcp';
+}
+
+/**
+ * `secrets_ready === false` ⇒ 「启用」是死按钮（§8.2：用户面**没有填值入口**，
+ * 只能等管理员在管理台写入）。三档里的 `null`（服务端没说）**不拦**——以服务端 409 为准。
+ */
+function secretsBlocked(item: MarketListItem): boolean {
+  return isMcp(item) && item.secretsReady === false;
+}
+
+/** 工具数：MCP 且从没被 FDE 连过 ⇒ 「工具数未知…」，**不写 0**（与管理台 toolscache 同一口径）。 */
+function toolsText(item: MarketListItem): string {
+  return item.toolCount === null && isMcp(item)
+    ? t('market.mcp.toolsUnknown')
+    : t('market.tools', { count: countText(item.toolCount) });
 }
 </script>
 
@@ -206,9 +226,10 @@ function isMcp(item: MarketListItem): boolean {
             <span v-if="item.version" class="text-xs text-black/45">
               {{ t('market.version', { version: item.version }) }}
             </span>
-            <span v-if="isMcp(item)" data-test="market-kind-mcp" class="text-xs text-black/45">
-              {{ t('market.kindMcp') }}
-            </span>
+            <span
+              :data-test="`market-kind-${item.slug}`"
+              class="rounded border border-black/10 px-1.5 text-xs text-black/55"
+            >{{ t(kindMessageKey(item.kind)) }}</span>
           </div>
           <p class="text-sm text-black/70">{{ item.summary }}</p>
 
@@ -220,10 +241,21 @@ function isMcp(item: MarketListItem): boolean {
             >{{ tag }}</span>
           </p>
 
+          <!-- #608 §4.4：准入理由走 i18n（不直接把英文枚举喷给人看）；skill 带了理由 ⇒ 忽略 -->
+          <p
+            v-if="isMcp(item) && item.reason !== null"
+            :data-test="`market-reason-${item.slug}`"
+            class="text-xs text-black/55"
+          >{{ t('market.reasonLabel', { reason: t(reasonMessageKey(item.reason)) }) }}</p>
+
           <!-- 数字缺失 ⇒ 「—」，不是 0（归一化层已保证 null，这里只负责显示）-->
           <p class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-black/55">
             <span :data-test="`market-tools-${item.slug}`">
-              {{ t('market.tools', { count: countText(item.toolCount) }) }}
+              {{ toolsText(item) }}
+            </span>
+            <!-- MCP 卡面多一个档位在眼前（§8.2：让人知道它是展开、走网关、还是根本没物化）-->
+            <span v-if="isMcp(item)" :data-test="`market-exposure-${item.slug}`">
+              {{ t('market.mcp.exposureLabel', { exposure: t(exposureMessageKey(item.exposure)) }) }}
             </span>
             <span :data-test="`market-score-${item.slug}`">
               {{ t('market.securityScore', { score: countText(item.securityScore) }) }}
@@ -249,22 +281,26 @@ function isMcp(item: MarketListItem): boolean {
 
           <div class="flex flex-wrap items-center gap-2">
             <button
-              v-if="!isMcp(item)"
               :data-test="`market-install-${item.slug}`"
               type="button"
               class="rounded-md bg-brand px-2.5 py-1 text-sm text-white disabled:opacity-50"
               :disabled="busySlug !== null"
               @click="onInstall(item)"
             >{{ item.installed ? t('market.reinstall') : t('market.install') }}</button>
-            <span v-else class="text-xs text-black/45">{{ t('market.installBlockedMcp') }}</span>
             <button
-              v-if="item.installed && !isMcp(item)"
+              v-if="item.installed"
               :data-test="`market-toggle-${item.slug}`"
               type="button"
               class="rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5 disabled:opacity-50"
-              :disabled="busySlug !== null"
+              :disabled="busySlug !== null || secretsBlocked(item)"
               @click="onToggleEnabled(item)"
             >{{ item.enabled ? t('market.disable') : t('market.enable') }}</button>
+            <!-- 缺凭据：只说在等谁，**不给填值框**（用户面不能写凭据，§8.2）-->
+            <span
+              v-if="secretsBlocked(item)"
+              :data-test="`market-secrets-pending-${item.slug}`"
+              class="text-xs text-black/55"
+            >{{ t('market.mcp.secretsPending') }}</span>
             <button
               v-if="item.installed"
               :data-test="`market-uninstall-${item.slug}`"

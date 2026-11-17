@@ -41,6 +41,17 @@ export function adminMarketItemPath(id: string): string {
 }
 
 /**
+ * MCP 凭据端点（#608 §7.2）：`GET` 回**声明 + 有没有值**，`PUT` 写值。
+ *
+ * ⚠ 这个地址是「只写不读」的判据锚点（§3.1 / §10）：**GET 永不回值**，所以地址上也不许挂 query
+ * （挂 `?reveal=1` 之类就是在给「读值」留门）。视图里对它只有两种调用形态：GET（读声明）与
+ * PUT（写值），`AdminMarketView.spec.ts` 有源码级断言钉这一点。
+ */
+export function adminMarketSecretsPath(id: string): string {
+  return `${adminMarketItemPath(id)}/secrets`;
+}
+
+/**
  * 单 FDE **启用**技能的上限（§4 的 `MAX_ENABLED_SKILLS`；policy，不是 ops 参数 ⇒ 没有 env 旋钮）。
  * ⚠ 这个数字出现在前端**只为了写文案**：前端不做本地拦截（启用请求照发，409 照接）。
  * 服务端 `details` 里若带了实际生效值，以它为准（见 `budgetLimitOf`）。
@@ -85,6 +96,18 @@ export interface MarketFileEntry {
 export interface MarketListItem {
   slug: string;
   kind: string;
+  /**
+   * MCP 的准入理由（#608 §4.4：`stateful` / `tool_surface_gt_12` / `shared_quota` /
+   * `credential_boundary`；skill 不带）。`null` = 服务端没说 ⇒ 卡片整段不出（**不**写「无理由」）。
+   */
+  reason: string | null;
+  /** MCP 的暴露档（§4.3 `direct`/`deferred`/`hidden`）。`null` = 没说（skill 条目就是 null）。 */
+  exposure: string | null;
+  /**
+   * MCP 的必填槽是否齐（§7.2 用户面 `secrets_ready`）。
+   * 三档：`true` 齐 / `false` 缺（⇒「启用」禁用）/ `null` 服务端没说（⇒ 不拦，以服务端 409 为准）。
+   */
+  secretsReady: boolean | null;
   name: string;
   summary: string;
   version: string;
@@ -101,6 +124,45 @@ export interface MarketListItem {
   installedVersion: string | null;
 }
 
+/**
+ * MCP 的一条配置槽声明（§4.1：`name` / `kind` / `inject` / `required` / `description`）。
+ * 值**不在这里**——值只在 `McpSecretSlot` 的 `hasValue` 里以「有没有」的形态出现（§3.1 只写不读）。
+ */
+export interface McpSlotSpec {
+  name: string;
+  kind: string;
+  inject: string;
+  required: boolean;
+  description: string;
+}
+
+/** 一条 MCP 条目的连接配置（§3 的 manifest 形状；缺键 ⇒ 空串 / `null`，不补「看起来合理」的值）。 */
+export interface McpConfig {
+  transport: string;
+  command: string;
+  args: string[];
+  url: string;
+  exposure: string;
+  lifecycle: string;
+  reason: string | null;
+  timeoutMs: number | null;
+  slots: McpSlotSpec[];
+  /** `manifest.tools_cache_at`（runner 回填的时间戳，§6.6）。`null` = 从没回填过。 */
+  toolsCacheAt: string | null;
+}
+
+/** 管理台「凭据」区的一行（§7.2 的 GET secrets：永不含值）。 */
+export interface McpSecretSlot {
+  name: string;
+  kind: string;
+  inject: string;
+  required: boolean;
+  /** `has_value`：有值 / 没值。**值本身不在 DTO 里**，所以界面只能说「已设置 / 未设置」。 */
+  hasValue: boolean;
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
 /** 用户面详情（§7-2：含 `SKILL.md` 正文）。 */
 export interface MarketDetail extends MarketListItem {
   /** 「何时用」——§2 里是 L3 的路由信号（必填）；服务端没给 ⇒ 空串，UI 整段不出。 */
@@ -114,6 +176,8 @@ export interface MarketDetail extends MarketListItem {
   tools: MarketTool[];
   files: MarketFileEntry[];
   warnings: SecurityWarning[];
+  /** MCP 配置（§3 的 manifest 段）；skill 条目各键为缺席形状。 */
+  mcp: McpConfig;
 }
 
 /** 管理台表格的一行（§7-3：列表带 `installs` 计数）。 */
@@ -136,6 +200,8 @@ export interface AdminMarketDetail extends AdminMarketItem {
   tools: MarketTool[];
   files: MarketFileEntry[];
   warnings: SecurityWarning[];
+  /** MCP 配置 + `tools_cache_at`（§8.1 详情的「工具清单」区要用）。 */
+  mcp: McpConfig;
 }
 
 // ── 归一化的底座（永不抛）────────────────────────────────────────────────────
@@ -221,12 +287,16 @@ function paramsOf(raw: unknown): MarketToolParam[] {
   }));
 }
 
-/** 工具清单：`tools[]` 或 `manifest.tools[]`（§2 的 manifest 里也有一份）。 */
+/** 工具清单：`tools[]` 或 `manifest.tools[]` 或 `manifest.tools_cache[]`（MCP 的那份是 runner 回填的，#608 §6.6）。 */
 function toolsOf(row: Record<string, unknown>): MarketTool[] {
   const manifest = asRecord(row.manifest);
   const raw = Array.isArray(row.tools)
     ? row.tools
-    : Array.isArray(manifest?.tools) ? (manifest?.tools as unknown[]) : [];
+    : Array.isArray(manifest?.tools)
+      ? (manifest?.tools as unknown[])
+      : Array.isArray(manifest?.tools_cache)
+        ? (manifest?.tools_cache as unknown[])
+        : [];
   return raw.flatMap((entry): MarketTool[] => {
     if (typeof entry === 'string' && entry !== '') {
       return [{ name: entry, description: null, params: [] }];
@@ -283,6 +353,277 @@ function scoreOf(row: Record<string, unknown>): number | null {
   return scoreOrNull(row.security_score ?? row.securityScore ?? row.score);
 }
 
+// ── MCP（#608）：枚举、组合矩阵、归一化、表单判据 ───────────────────────────────
+
+/** §4.3 的三个暴露档（`hidden` 在 P1 = 装了但不生效，§0-4）。 */
+export const MCP_EXPOSURES = ['direct', 'deferred', 'hidden'] as const;
+export type McpExposure = (typeof MCP_EXPOSURES)[number];
+
+/** §10-8：`timeout_ms` 的上限是 300 s（超出属干一眼假）。 */
+export const MCP_MAX_TIMEOUT_MS = 300_000;
+
+/** §4.4 的四个准入理由（MCP 必填；skill 带了服务端会忽略）。 */
+export const MCP_REASONS = [
+  'stateful',
+  'tool_surface_gt_12',
+  'shared_quota',
+  'credential_boundary',
+] as const;
+export type McpReason = (typeof MCP_REASONS)[number];
+
+export const MCP_TRANSPORTS = ['stdio', 'http'] as const;
+export type McpTransport = (typeof MCP_TRANSPORTS)[number];
+
+/** §3 的 `lifecycle`：P1 两档行为相同（§13），字段先留着。 */
+export const MCP_LIFECYCLES = ['run', 'run-keep-alive'] as const;
+
+export const MCP_SLOT_KINDS = ['config', 'secret'] as const;
+export type McpSlotKind = (typeof MCP_SLOT_KINDS)[number];
+
+/** 一个「什么都没填」的槽行（管理台表单用它做初值与「新增一行」的模板）。 */
+export function emptyMcpSlot(): McpSlotDraft {
+  return { name: '', kind: 'secret', required: true, description: '' };
+}
+
+/**
+ * §4.2 的组合矩阵：一个槽在给定 (条目 kind, transport) 下**唯一**合法的 `inject`。
+ *
+ * 拿它把表单里的 `inject` 锁成只读（而不是让管理员选一个「stdio 却要 header」的组合拖到运行期才炸）。
+ * 不认识的 transport ⇒ `null`（前端不赌：不锁也不发，让服务端的 `capability_slot_invalid` 说话）。
+ */
+export function injectForTransport(kind: string, transport: string): 'context' | 'env' | 'header' | null {
+  if (kind !== 'mcp') return 'context'; // §4.2：skill 只允许 context（**唯一**）
+  if (transport === 'stdio') return 'env';
+  if (transport === 'http') return 'header';
+  return null;
+}
+
+/** 槽行草稿（表单里的形状；`inject` **不在这里**，它由 `injectForTransport` 现算，见 §4.2）。 */
+export interface McpSlotDraft {
+  name: string;
+  kind: string;
+  required: boolean;
+  description: string;
+}
+
+/** MCP 表单草稿（字段面 §4；数字与数组在界面上是文本输入，发出前由 `buildMcpFields` 转形）。 */
+export interface McpFormDraft {
+  transport: string;
+  command: string;
+  /** 一行一个参数（参数里可以带空格，所以不能按空格切）。 */
+  args: string;
+  url: string;
+  exposure: string;
+  lifecycle: string;
+  timeoutMs: string;
+  reason: string;
+  slots: McpSlotDraft[];
+}
+
+export function emptyMcpForm(): McpFormDraft {
+  return {
+    transport: 'stdio', command: '', args: '', url: '',
+    exposure: 'deferred', lifecycle: 'run', timeoutMs: '', reason: '',
+    slots: [],
+  };
+}
+
+/** 一行一个参数 ⇒ 数组（丢空行；保留行内空格，那可以是合法参数）。 */
+export function splitArgs(text: string): string[] {
+  return text.split('\n').map((line) => line.trim()).filter((line) => line !== '');
+}
+
+/**
+ * 表单草稿 → `manifest` 字段（§3 的形状）。
+ *
+ * 只发**适用的**那些键：stdio 带 `command`/`args`，http 带 `url`（互不串门，免得前端自己造出
+ * 「stdio + url」这种不在矩阵里的形状）；`timeout_ms` 只在能收成合法整数时才发（否则发个 `null`
+ * 会被服务端读成「清掉默认值」）。`resident` 恒 `false`（§3：P1 只形态①）。
+ */
+export function buildMcpFields(draft: McpFormDraft): Record<string, unknown> {
+  const transport = draft.transport;
+  const out: Record<string, unknown> = {
+    transport,
+    exposure: draft.exposure,
+    lifecycle: draft.lifecycle,
+    resident: false,
+    reason: draft.reason,
+    slots: draft.slots.map((slot) => ({
+      name: slot.name.trim(),
+      kind: slot.kind,
+      inject: injectForTransport('mcp', transport) ?? '',
+      required: slot.required === true,
+      description: slot.description,
+    })),
+  };
+  if (transport === 'http') {
+    out.url = draft.url.trim();
+  } else {
+    out.command = draft.command.trim();
+    out.args = splitArgs(draft.args);
+  }
+  const timeout = Number(draft.timeoutMs.trim());
+  if (draft.timeoutMs.trim() !== '' && Number.isSafeInteger(timeout) && timeout > 0) {
+    out.timeout_ms = timeout;
+  }
+  return out;
+}
+
+/** MCP 表单的「一眼假」拦项（同 bundle 的口径：只挡必然 400 的体，其余留给服务端）。 */
+export type McpFormIssueCode =
+  | 'reasonMissing'
+  | 'commandMissing'
+  | 'urlMissing'
+  | 'timeoutInvalid'
+  | 'slotNameMissing'
+  | 'slotNameDuplicate';
+
+export interface McpFormIssue {
+  code: McpFormIssueCode;
+  /** 可选的补充信息（如重复的槽名、哪一行）。 */
+  detail?: string;
+}
+
+/**
+ * MCP 表单的本地拦项清单（空数组 = 可以发请求）。只包含四件事：
+ *   * `reason` 没选（§4.4 必填 ⇒ 不发一个必然 `capability_reason_required` 的体）；
+ *   * stdio 没 `command` / http 没 `url`（§4.1）；
+ *   * `timeout_ms` 填了但不是正整数或不超 300 s（§10-8）；
+ *   * 槽名为空 / item 内重名（§4.1「item 内唯一」，主键就是 `(item_id,name)`）。
+ * 名字正则、保留名、url 协议、command 含空格……全部留给服务端（前端不赌 §4.1 的全表）。
+ */
+export function checkMcpForm(draft: McpFormDraft): McpFormIssue[] {
+  const issues: McpFormIssue[] = [];
+  if (draft.reason === '') issues.push({ code: 'reasonMissing' });
+  if (draft.transport === 'http') {
+    if (draft.url.trim() === '') issues.push({ code: 'urlMissing' });
+  } else if (draft.command.trim() === '') {
+    issues.push({ code: 'commandMissing' });
+  }
+  const raw = draft.timeoutMs.trim();
+  if (raw !== '') {
+    const timeout = Number(raw);
+    if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > MCP_MAX_TIMEOUT_MS) {
+      issues.push({ code: 'timeoutInvalid', detail: raw });
+    }
+  }
+  const seen = new Set<string>();
+  for (const slot of draft.slots) {
+    const name = slot.name.trim();
+    if (name === '') {
+      issues.push({ code: 'slotNameMissing' });
+    } else if (seen.has(name)) {
+      issues.push({ code: 'slotNameDuplicate', detail: name });
+    } else {
+      seen.add(name);
+    }
+  }
+  return issues;
+}
+
+/** 归一化的一条槽声明（只收认识的键；形状完全不认识 ⇒ `null`，整行丢弃）。 */
+function slotSpecOf(value: unknown): McpSlotSpec | null {
+  const row = asRecord(value);
+  if (row === null) return null;
+  const name = str(row.name);
+  if (name === null || name === '') return null;
+  return {
+    name,
+    kind: str(row.kind) ?? 'secret',
+    inject: str(row.inject) ?? '',
+    required: row.required !== false,
+    description: strOrEmpty(row.description),
+  };
+}
+
+/** 槽声明清单：`slots[]` / `manifest.slots[]` / `params[]`（表名是 `capability_params`）都收。 */
+function slotsOf(row: Record<string, unknown>): McpSlotSpec[] {
+  const manifest = asRecord(row.manifest);
+  const raw = Array.isArray(row.slots)
+    ? row.slots
+    : Array.isArray(manifest?.slots)
+      ? (manifest?.slots as unknown[])
+      : Array.isArray(row.params)
+        ? (row.params as unknown[])
+        : [];
+  return raw.flatMap((entry): McpSlotSpec[] => {
+    const slot = slotSpecOf(entry);
+    return slot === null ? [] : [slot];
+  });
+}
+
+/**
+ * MCP 配置段（§3 的 manifest 形状）。永不抛；skill 条目拿到的是全空形状（不会把 `''` 当「stdio」）。
+ *
+ * ⚠ 读值的键一个都不读：这里只收声明（transport/command/args/url/exposure/lifecycle/reason/
+ * timeout_ms/slots/tools_cache_at）。
+ */
+function mcpOf(row: Record<string, unknown>): McpConfig {
+  const manifest = asRecord(row.manifest) ?? {};
+  const pick = (key: string): unknown => row[key] ?? manifest[key];
+  const argsRaw = pick('args');
+  return {
+    transport: strOrEmpty(pick('transport')),
+    command: strOrEmpty(pick('command')),
+    args: Array.isArray(argsRaw)
+      ? (argsRaw as unknown[]).filter((x): x is string => typeof x === 'string')
+      : [],
+    url: strOrEmpty(pick('url')),
+    exposure: strOrEmpty(pick('exposure')),
+    lifecycle: strOrEmpty(pick('lifecycle')),
+    reason: str(pick('reason')),
+    timeoutMs: countOrNull(pick('timeout_ms') ?? pick('timeoutMs')),
+    slots: slotsOf(row),
+    toolsCacheAt: str(pick('tools_cache_at') ?? pick('toolsCacheAt')),
+  };
+}
+
+/**
+ * GET `/api/admin/market/items/:id/secrets` → 凭据行（§7.2）。
+ *
+ * 只从白名单键里读（`name / kind / inject / required / has_value / updated_at / updated_by`）——
+ * **值不在其中**：即使服务端多发了一个 `value`（不应发生）也不会被收进来，这是
+ * 「凭据区没有任何读值入口」的结构性保证（单测有源码级 + 数据级两道断言）。
+ * 信封 `{item:{slots}}` / `{slots}` / 裸数组三种都收；不认识 ⇒ 空清单。
+ */
+export function normalizeMcpSecrets(raw: unknown): McpSecretSlot[] {
+  const bag = asRecord(raw);
+  const inner = asRecord(bag?.item) ?? bag;
+  const rawSlots = Array.isArray(inner?.slots)
+    ? (inner?.slots as unknown[])
+    : Array.isArray(raw)
+      ? (raw as unknown[])
+      : [];
+  return rawSlots.flatMap((entry): McpSecretSlot[] => {
+    const row = asRecord(entry);
+    const name = row === null ? null : str(row.name);
+    if (row === null || name === null || name === '') return [];
+    return [{
+      name,
+      kind: str(row.kind) ?? 'secret',
+      inject: str(row.inject) ?? '',
+      required: row.required !== false,
+      hasValue: row.has_value === true,
+      updatedAt: str(row.updated_at ?? row.updatedAt),
+      updatedBy: str(row.updated_by ?? row.updatedBy),
+    }];
+  });
+}
+
+/**
+ * PUT secrets 的请求体（§7.2）：`{scope, fde_id?, values:{NAME: 值 | null}}`。
+ * `null` = 删除该值（所以「清空一个槽」不是发空串，而是发 `null`）。
+ */
+export function buildSecretPayload(
+  values: Record<string, string | null>,
+  scope: 'global' | 'fde' = 'global',
+  fdeId?: string,
+): string {
+  const body: Record<string, unknown> = { scope, values };
+  if (scope === 'fde' && fdeId !== undefined && fdeId !== '') body.fde_id = fdeId;
+  return JSON.stringify(body);
+}
+
 /**
  * `SKILL.md` 正文（§7-2 只说「详情含 `SKILL.md` 正文」，**没给字段起名**）。
  * 按「最像正文」的键依次找；`files[]` 里若真带了 `SKILL.md` 的 content 也算。
@@ -308,9 +649,17 @@ function readmeOf(row: Record<string, unknown>): string | null {
 function baseItem(row: Record<string, unknown>): MarketListItem {
   const tools = toolsOf(row);
   const warnings = warningsOrNull(row);
+  const mcp = mcpOf(row);
   return {
     slug: strOrEmpty(row.slug),
     kind: str(row.kind) ?? 'skill',
+    // reason / exposure 在列表里可能在顶层，也可能只在其 manifest 里（§7.2 只钉了「每条带」）。
+    reason: str(row.reason) ?? mcp.reason,
+    exposure: str(row.exposure) ?? (mcp.exposure === '' ? null : mcp.exposure),
+    // 三档：显式 true / 显式 false / 根本没这个键（`null`）。「没说」不拦住按钮。
+    secretsReady: typeof row.secrets_ready === 'boolean'
+      ? row.secrets_ready
+      : typeof row.secretsReady === 'boolean' ? row.secretsReady : null,
     name: strOrEmpty(row.name),
     summary: strOrEmpty(row.summary),
     version: strOrEmpty(row.version),
@@ -357,6 +706,7 @@ export function normalizeMarketDetail(raw: unknown): MarketDetail | null {
     tools: toolsOf(row),
     files: filesOf(row),
     warnings: warnings ?? [],
+    mcp: mcpOf(row),
   };
 }
 
@@ -383,6 +733,7 @@ export function normalizeAdminDetail(raw: unknown): AdminMarketDetail | null {
     tools: toolsOf(row),
     files: filesOf(row),
     warnings: warnings ?? [],
+    mcp: mcpOf(row),
   };
 }
 
@@ -408,6 +759,49 @@ export type MarketStateKey =
 export function stateMessageKey(state: string | null | undefined): MarketStateKey {
   const suffix = typeof state === 'string' ? STATE_KEY[state] : undefined;
   return suffix === undefined ? 'market.state.unknown' : `market.state.${suffix}`;
+}
+
+// ── kind / reason / exposure 的文案键（§8.2：不显示英文枚举）─────────────────
+
+const KIND_KEY: Record<string, 'skill' | 'mcp'> = { skill: 'skill', mcp: 'mcp' };
+
+export type MarketKindKey = 'market.kind.skill' | 'market.kind.mcp' | 'market.kind.unknown';
+
+/** kind → i18n 键；不认识的种类退到 `unknown`（不把 `quartz` 这种英文枚举直接上屏）。 */
+export function kindMessageKey(kind: string | null | undefined): MarketKindKey {
+  const suffix = typeof kind === 'string' ? KIND_KEY[kind] : undefined;
+  return suffix === undefined ? 'market.kind.unknown' : `market.kind.${suffix}`;
+}
+
+const REASON_KEY: Record<string, McpReason> = Object.fromEntries(
+  MCP_REASONS.map((reason) => [reason, reason]),
+) as Record<string, McpReason>;
+
+export type MarketReasonKey =
+  | `market.reason.${McpReason}`
+  | 'market.reason.unknown';
+
+/**
+ * 准入理由 → i18n 键（§8.2：卡片上的是中文/英文句子，不是 `tool_surface_gt_12` 这种枚举）。
+ * 认不出 ⇒ `market.reason.unknown`（不裸露枚举）。调用方自己处理「服务端没说 ⇒ 整段不出」（`null`）。
+ */
+export function reasonMessageKey(reason: string | null | undefined): MarketReasonKey {
+  const suffix = typeof reason === 'string' ? REASON_KEY[reason] : undefined;
+  return suffix === undefined ? 'market.reason.unknown' : `market.reason.${suffix}`;
+}
+
+const EXPOSURE_KEY: Record<string, McpExposure> = Object.fromEntries(
+  MCP_EXPOSURES.map((exposure) => [exposure, exposure]),
+) as Record<string, McpExposure>;
+
+export type MarketExposureKey =
+  | `market.mcp.exposure.${McpExposure}`
+  | 'market.mcp.exposure.unknown';
+
+/** 暴露档 → i18n 键（§8.3：`market.mcp.exposure.{direct,deferred,hidden}`）；认不出 ⇒ `unknown`。 */
+export function exposureMessageKey(exposure: string | null | undefined): MarketExposureKey {
+  const suffix = typeof exposure === 'string' ? EXPOSURE_KEY[exposure] : undefined;
+  return suffix === undefined ? 'market.mcp.exposure.unknown' : `market.mcp.exposure.${suffix}`;
 }
 
 /**
@@ -526,9 +920,14 @@ export type MarketErrorKey =
   | 'market.errors.budgetExceeded'
   | 'market.errors.kindUnsupported'
   | 'market.errors.installFailed'
+  | 'market.errors.reasonRequired'
+  | 'market.errors.slotInvalid'
+  | 'market.errors.secretMissing'
+  | 'market.errors.secretKeyMissing'
+  | 'market.errors.packageShape'
   | 'market.errors.generic';
 
-/** §7 的六个码 → i18n 键（`validation_failed` 走两条分支，见 `marketErrorText`）。 */
+/** §7 的六个码 + #608 §7.3 的五个新码 → i18n 键（`validation_failed` 走两条分支，见 `marketErrorText`）。 */
 const ERROR_KEY_BY_CODE: Record<string, MarketErrorKey> = {
   validation_failed: 'market.errors.validationGeneric',
   capability_not_found: 'market.errors.notFound',
@@ -536,16 +935,25 @@ const ERROR_KEY_BY_CODE: Record<string, MarketErrorKey> = {
   capability_budget_exceeded: 'market.errors.budgetExceeded',
   capability_kind_unsupported: 'market.errors.kindUnsupported',
   capability_install_failed: 'market.errors.installFailed',
+  capability_reason_required: 'market.errors.reasonRequired',
+  capability_slot_invalid: 'market.errors.slotInvalid',
+  capability_secret_missing: 'market.errors.secretMissing',
+  capability_package_shape: 'market.errors.packageShape',
+  secret_key_missing: 'market.errors.secretKeyMissing',
 };
 
-/** 管理台表单认识的字段名（§3 的静态校验项；认不出就不标红，不猜是哪个框）。 */
+/** 管理台表单认识的字段名（§3 的静态校验项 + #608 §4 的 MCP 字段；认不出就不标红，不猜）。 */
 export type AdminFieldKey =
   | 'slug' | 'name' | 'summary' | 'when_to_use' | 'version'
-  | 'author' | 'tags' | 'license' | 'description_md' | 'bundle';
+  | 'author' | 'tags' | 'license' | 'description_md' | 'bundle'
+  | 'transport' | 'command' | 'args' | 'url' | 'exposure' | 'lifecycle'
+  | 'timeout_ms' | 'reason' | 'slots';
 
 const FORM_FIELD_KEYS: AdminFieldKey[] = [
   'slug', 'name', 'summary', 'when_to_use', 'version',
   'author', 'tags', 'license', 'description_md', 'bundle',
+  'transport', 'command', 'args', 'url', 'exposure', 'lifecycle',
+  'timeout_ms', 'reason', 'slots',
 ];
 
 /** `400 validation_failed` 的 `details.field` → 表单字段；认不出 ⇒ `null`（整表一条错误）。 */
@@ -565,6 +973,19 @@ export function budgetLimitOf(error: unknown): number {
     | Record<string, unknown>
     | undefined;
   return countOrNull(details?.max ?? details?.max_enabled ?? details?.maxEnabled) ?? MAX_ENABLED_SKILLS;
+}
+
+/** §11：启用缺必填槽的 409 里 `details.missing` 可能是数组、逗号串或没给。 */
+function missingSlotsOf(error: unknown): string {
+  const details = (error as Partial<ApiError> | undefined)?.details as
+    | Record<string, unknown>
+    | undefined;
+  const raw = details?.missing ?? details?.missing_slots;
+  if (Array.isArray(raw)) {
+    return raw.filter((x): x is string => typeof x === 'string' && x !== '').join(', ');
+  }
+  if (typeof raw === 'string') return raw;
+  return '';
 }
 
 /**
@@ -599,6 +1020,27 @@ export function marketErrorText(error: unknown): string {
         reason: str(details.reason) ?? (serverMessage || t('market.errors.reasonUnknown')),
       });
     }
+    case 'market.errors.slotInvalid': {
+      // §4.2：`details` 带 `{transport, inject}`——组合矩阵被拒时点名是哪一对对不上。
+      const details = (err?.details ?? {}) as Record<string, unknown>;
+      const combo = str(details.combo)
+        ?? [str(details.transport), str(details.inject)].filter((x): x is string => x !== null).join(' + ');
+      return t('market.errors.slotInvalid', { combo: combo === '' ? '—' : combo });
+    }
+    case 'market.errors.secretMissing': {
+      const missing = missingSlotsOf(error);
+      return t('market.errors.secretMissing', { slots: missing === '' ? '—' : missing });
+    }
+    case 'market.errors.packageShape': {
+      // §4.5：红色形状的命中项在 `details.pattern` 里（服务端原文不译，但只在有值时拼进去）。
+      const details = (err?.details ?? {}) as Record<string, unknown>;
+      const shape = str(details.pattern) ?? str(details.shape) ?? serverMessage;
+      return t('market.errors.packageShape', { shape: shape === null || shape === '' ? '—' : shape });
+    }
+    case 'market.errors.secretKeyMissing':
+      return t('market.errors.secretKeyMissing');
+    case 'market.errors.reasonRequired':
+      return t('market.errors.reasonRequired');
     default:
       return t('market.errors.generic', {
         status: typeof err?.status === 'number' ? err.status : 0,
