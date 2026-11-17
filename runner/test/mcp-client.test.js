@@ -638,3 +638,29 @@ test('MC-22 组合矩阵的传输侧（§4.2）：http 只把 header 槽变头�
     values: { X_API_KEY: 'k', PLAIN: 'p' },
   }), { 'x-api-key': 'k' }, 'env 槽在 http 传输里不得变成头');
 });
+
+test('MC-24【反向】发现到的工具必须进外部可见视图（原地改，不重新赋值）', async () => {
+  const srv = fakeStdioSpawn();
+  const client = createMcpClient({ server: stdioServer, spawnImpl: srv.spawnImpl });
+  assert.equal(client.tools.length, 0, '创建时没有工具（懒启动）');
+  const list = await client.listTools();
+  assert.ok(list.length > 0, '服务端给了工具');
+  assert.equal(client.tools.length, list.length,
+    '`tools` 属性停在旧数组 ⇒ pool.list() 永远报「工具 0 个」、`call` 报 mcp_tool_unknown（真机症状）');
+  assert.deepEqual(client.tools.map((t) => t.name), list.map((t) => t.name));
+  assert.equal(client.status().toolsCached, true);
+  await client.close();
+});
+
+test('MC-25 pool.registerTools 之后 pool.list() 与 status 都反映新工具', async () => {
+  const srv = fakeStdioSpawn();
+  const pool = createMcpPool({
+    servers: [{ ...stdioServer, exposure: 'deferred' }], spawnImpl: srv.spawnImpl,
+  });
+  const c = pool.get(stdioServer.name);
+  const list = await c.listTools();
+  assert.equal(pool.list()[0].toolCount, list.length);
+  assert.equal(pool.registerTools(stdioServer.name, []), true);
+  assert.equal(pool.list()[0].toolCount, 0, 'registerTools 必须能清空（缓存回填是覆盖语义）');
+  await pool.closeAll();
+});
