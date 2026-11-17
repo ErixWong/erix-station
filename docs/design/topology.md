@@ -119,7 +119,7 @@ N 个 worker ──IPC──▶ agentd（唯一 HTTP 客户端、唯一持 token
 ```
 
 - **物理通道只有一条**（agentd 聚合），worker 零凭据、零网络 IO
-- 逻辑上按 `run_id` 隔离：claim（长轮询）/ heartbeat（含租约续期）/ events（批量）/ rounds / checkpoint / usage / approvals / finish（端点契约见 [runner-integration.md](runner-integration.md) §4.2）
+- 逻辑上按 `run_id` 隔离：claim（长轮询）/ heartbeat（含租约续期）/ events（批量）/ rounds / usage / approvals（`checkpoint` 已随 #640 退役） / finish（端点契约见 [runner-integration.md](runner-integration.md) §4.2）
 - 断线：agentd 重连 + 未确认事件重传（at-least-once + `client_event_id` 幂等，见 issue #8）
 - **hosts 注入（创建 FDE 容器时，docker `--add-host` 或等价受控方式）**：`station.<base>` 与 `llm.<base>` 都映射到**该 FDE 的 bridge 网关 IP**（默认池 `10.200.<n>.1`；大 FDE `10.201.<n>.1`），**不走内网/公网 DNS**。开发期 `*.localhost` 变通对容器无效，必须同样注入（env.md §0/§1）
 
