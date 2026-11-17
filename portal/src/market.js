@@ -1248,8 +1248,11 @@ export async function listCapabilitiesForFde(pool, fdeId) {
     `SELECT i.slug, i.name, i.summary, i.when_to_use, i.manifest, inst.enabled
        FROM fde_capability_installs inst
        JOIN capability_items i ON i.id = inst.item_id
-      WHERE inst.fde_id = $1 AND i.state = 'published'
+      WHERE inst.fde_id = $1 AND i.state = 'published' AND i.kind = 'skill'
       ORDER BY i.slug`, [fdeId]);
+  // ⚠ `kind = 'skill'` 这条不能省（#608 真机 e2e 抓到的）：MCP 条目没有包，混进 skills 清单会让
+  // capabilities.json 宣称「有个技能叫 mock-echo」，而 runner 去 `~/.erix/skills/mock-echo` 找不到东西
+  // ——症状是「装了个技能但工具不存在」，且 MCP 的 id 与 skill 的 id 在同一个命名空间里互相顶。
   return r.rows.map(toCapabilityIndexEntry);
 }
 

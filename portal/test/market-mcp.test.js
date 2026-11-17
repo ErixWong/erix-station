@@ -22,7 +22,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import {
-  MarketError, MCP_LIMITS, installCapability, listMcpServersForFde, listSlots, publishItem,
+  MarketError, MCP_LIMITS, installCapability, listCapabilitiesForFde, listMcpServersForFde, listSlots, publishItem,
   resolveMcpServersForFde, setCapabilityEnabled, setItemState, setSlotValues, validateBundle,
   validateMcpFields,
 } from '../src/market.js';
@@ -194,6 +194,18 @@ class McpFake {
         return (this.items.find((i) => i.id === x.item_id)?.kind ?? 'skill') === kind;
       }).length;
       return { rows: [{ n }] };
+    }
+    if (s.includes('FROM fde_capability_installs inst') && s.includes("i.kind = 'skill'")) {
+      const rows = [...this.installs.values()]
+        .filter((x) => x.fde_id === params[0])
+        .map((x) => ({ inst: x, item: this.items.find((i) => i.id === x.item_id) }))
+        .filter(({ item }) => item && item.kind === 'skill' && item.state === 'published')
+        .sort((a, b) => (a.item.slug < b.item.slug ? -1 : 1))
+        .map(({ inst, item }) => ({
+          slug: item.slug, name: item.name, summary: item.summary,
+          when_to_use: item.when_to_use, manifest: item.manifest, enabled: inst.enabled,
+        }));
+      return { rows };
     }
     if (s.includes('FROM fde_capability_installs inst') && s.includes("i.kind = 'mcp'")) {
       const rows = [...this.installs.values()]
@@ -394,6 +406,34 @@ test('MC-8 解析：只取 published && enabled && 非 hidden；fde 覆盖 globa
   await setCapabilityEnabled({ pool, fde, slug: 'alpha', enabled: false, config: { mcpSecretKey: KEY } });
   assert.deepEqual(await listMcpServersForFde(pool, fde.id), []);
   assert.deepEqual((await resolveMcpServersForFde({ pool, fde, key: KEY })).servers, []);
+});
+
+// ---------------------------------------------------------------------------
+// MC-10：两个清单互不串味（真机 e2e 抓到的缺陷）
+// ---------------------------------------------------------------------------
+
+test('MC-10【反向】MCP 条目不许出现在 skills 清单里（kind 过滤），反之亦然', async () => {
+  const pool = new McpFake();
+  const fde = { id: 'fde-1', name: 'alice' };
+  const mcp = await publishItem({ pool, fields: MCP_FIELDS('hub') });
+  await setItemState({ pool, itemId: mcp.id, state: 'published' });
+  await installCapability({ pool, config: tmpConfig().config, fde, slug: 'hub' });
+
+  // MCP 装了 ⇒ mcp 清单有它、skills 清单**一条都没有**
+  assert.equal((await listMcpServersForFde(pool, fde.id)).length, 1);
+  assert.deepEqual(await listCapabilitiesForFde(pool, fde.id), [],
+    'MCP 条目混进 skills 清单 ⇒ capabilities.json 会宣称一个不存在的技能包');
+
+  // 反过来：造一条 skill 条目（fake 里直接塞）⇒ skills 清单有它、mcp 清单没有
+  pool.items.push({
+    id: 'item-skill', kind: 'skill', slug: 'real-skill', name: '真技能', summary: 's',
+    when_to_use: 'w', manifest: { skill_id: 'real-skill', tools: [{ name: 't' }] },
+    state: 'published', version: '1.0.0',
+  });
+  pool.installs.set(`fde-1|item-skill`, { fde_id: 'fde-1', item_id: 'item-skill', version: '1.0.0', enabled: true });
+  const skills = await listCapabilitiesForFde(pool, fde.id);
+  assert.deepEqual(skills.map((x) => x.id), ['real-skill']);
+  assert.equal((await listMcpServersForFde(pool, fde.id)).length, 1, 'skills 也不许串进 mcp 清单');
 });
 
 // ---------------------------------------------------------------------------
