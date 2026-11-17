@@ -19,7 +19,7 @@ import { randomUUID } from 'node:crypto';
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import {
   toPublicTemplate, toAdminRunItem, userTemplates, sessionAssignments, putAssignment,
-  deleteAssignment, sessionMacroRuns, adminTemplates, adminCreateTemplate, adminPatchTemplate,
+  deleteAssignment, sessionMacroRuns, userMacroRuns, adminTemplates, adminCreateTemplate, adminPatchTemplate,
   adminMacroRuns, adminMacroRunDetail, adminRunsSummary,
 } from '../src/macro-routes.js';
 import { MacroError, createTemplate, assignTemplate, claimMacroRun, finishMacroRun, deleteTemplate, updateTemplate } from '../src/macros.js';
@@ -267,5 +267,52 @@ test('#613 adminTemplates 下发 subscriberCount：2/0、取消订阅不计入�
     }
     await adminTemplates({ pool: spy, query: new URLSearchParams() });
     assert.equal(groupByQueries, 1, '一次 GROUP BY 拿全表；逐模板一条查询就是 N+1');
+  });
+});
+
+// ── #614 用户级全局流水端点 ────────────────────────────────────────────────────
+
+test('#614 userMacroRuns：属主过滤 = 当前用户，只看到自己的流水', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const u1 = await seedScene(pool, 'u614a');
+    const u2 = await seedScene(pool, 'u614b');
+    const tpl = await createTemplate(pool, { kind: 'run-review', name: 'rev-614', scope: 'session', params: {} });
+    const a1 = await assignTemplate(pool, { templateId: tpl.id, userId: u1.userId, sessionId: u1.sessionId });
+    const a2 = await assignTemplate(pool, { templateId: tpl.id, userId: u2.userId, sessionId: u2.sessionId });
+    const r1 = await claimMacroRun(pool, { assignmentId: a1.id, anchor: 'e1', criterion: 'terminal', bucket: 'b' });
+    const r2 = await claimMacroRun(pool, { assignmentId: a2.id, anchor: 'e2', criterion: 'terminal', bucket: 'b' });
+    assert.ok(r1 && r2, '两条流水都该建成');
+
+    const mine = await userMacroRuns({ pool, userId: u1.userId });
+    assert.deepEqual(mine.items.map((x) => x.id), [r1.id], 'u1 只看到自己那一条');
+    assert.ok(!mine.items.some((x) => x.id === r2.id), '别人的流水不许出现');
+
+    const theirs = await userMacroRuns({ pool, userId: u2.userId });
+    assert.deepEqual(theirs.items.map((x) => x.id), [r2.id], 'u2 反过来只看到自己那一条');
+  });
+});
+
+test('#614 userMacroRuns：响应不含 snapshot_id / worktree_path / verdict_raw（即使 DB 里有值）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'u614c');
+    const tpl = await createTemplate(pool, { kind: 'run-review', name: 'rev-614c', scope: 'session', params: {} });
+    const a = await assignTemplate(pool, { templateId: tpl.id, userId, sessionId });
+    // 认领时就给 snapshot_id / worktree_path 填真值 ⇒ 若实现不剥，键就会出现（反向自证打这里）
+    const r = await claimMacroRun(pool, {
+      assignmentId: a.id, anchor: 'e', criterion: 'terminal', bucket: 'b',
+      snapshotId: 'snap-xyz', worktreePath: '/tmp/wt-xyz',
+    });
+    await pool.query('UPDATE macro_runs SET verdict_raw = $1 WHERE id = $2', ['RAW_ERR', r.id]);
+
+    const list = await userMacroRuns({ pool, userId });
+    assert.equal(list.items.length, 1);
+    const keys = Object.keys(list.items[0]);
+    assert.ok(!keys.includes('snapshot_id'), 'snapshot_id 必须被剥掉');
+    assert.ok(!keys.includes('worktree_path'), 'worktree_path 必须被剥掉');
+    assert.ok(!keys.includes('verdict_raw'), '原始错误码 verdict_raw 必须被剥掉');
+    // 与会话级同形：仍带用户面字段与会话/游标结构
+    assert.ok('assignment_id' in list.items[0] && 'status' in list.items[0] && 'started_at' in list.items[0]);
+    assert.ok('items' in list && 'nextCursor' in list, '响应形状与会话级一致');
+    assert.equal(list.nextCursor, null);
   });
 });
