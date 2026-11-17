@@ -188,3 +188,104 @@ test('CI-9 tmp 目录里的真文件读得出来，并给出 §5 的字段面', 
   });
   assert.ok(out.section.includes('`real_one`'));
 });
+
+// ---------------------------------------------------------------------------
+// issue #608 §5.2 / §6.5：`mcp` 段（与 skills **共享**同一个 4 KiB）
+// ---------------------------------------------------------------------------
+
+const mcpEntry = (name, over = {}) => ({
+  name,
+  description: `描述 ${name}`,
+  exposure: 'deferred',
+  tool_count: 2,
+  ...over,
+});
+
+/** 假 fs + 指定 skills/mcp 两段内容（`mcp: undefined` = 旧版 portal 根本不写这个键）。 */
+function capsFs(skills, mcp) {
+  const body = { version: 1, skills };
+  if (mcp !== undefined) body.mcp = mcp;
+  return fakeFs({ body: JSON.stringify(body) });
+}
+
+test('CI-10 mcp 段行形状逐字照 §6.5，且绝不把工具名带进上下文', () => {
+  const f = capsFs([], [mcpEntry('github', { description: 'GitHub 仓库与 PR 操作' })]);
+  const out = buildCapabilityIndex({ home: '/fake/home', fs: f });
+  assert.ok(out.section.includes('## 平台 MCP 服务（能力市场）'), out.section);
+  const line = '- github — GitHub 仓库与 PR 操作；工具 2 个；用法：mcp({action:"search"}) 找工具后 call';
+  assert.ok(out.section.includes(line), `段里必须出现契约那一行：\n${out.section}`);
+  // §5.2 的红线：工具名进上下文就是几百 token，所以 `mcp` 段只允许四个字段。
+  assert.ok(!out.section.includes('create_issue'), '工具名不得进上下文');
+  assert.deepEqual(out.mcp, [{
+    name: 'github', description: 'GitHub 仓库与 PR 操作', exposure: 'deferred', tool_count: 2,
+  }]);
+});
+
+test('CI-11 direct 与 hidden 的 server 不进段；【反向】exposure 一改行就消失', () => {
+  const f = capsFs([], [
+    mcpEntry('alpha'),
+    mcpEntry('beta', { exposure: 'direct' }),
+    mcpEntry('gamma', { exposure: 'hidden' }),
+  ]);
+  const out = buildCapabilityIndex({ home: '/fake/home', fs: f });
+  assert.ok(out.section.includes('- alpha —'));
+  assert.ok(!out.section.includes('beta'), 'direct 的工具已是独立工具，再列一遍白花字节');
+  assert.ok(!out.section.includes('gamma'), 'hidden 连提示词里都不许出现（§10.7）');
+  // 反向：把 alpha 也改成 direct ⇒ 整段消失（不是「换了种写法」）
+  const allDirect = buildCapabilityIndex({
+    home: '/fake/home',
+    fs: capsFs([], [mcpEntry('alpha', { exposure: 'direct' })]),
+  });
+  assert.equal(allDirect.mcpSection, '');
+  assert.equal(allDirect.section, '', '只剩 direct/hidden ⇒ 段整体为空，等于没这段');
+});
+
+test('CI-12 共享 4 KiB：预算紧时截的是 mcp 段，skills 一条不少【反向】', () => {
+  const skills = [skill('aaa'), skill('bbb')];
+  const many = [];
+  for (let i = 0; i < 40; i += 1) many.push(mcpEntry(`srv${String(i).padStart(2, '0')}`));
+  const total = 1400;   // 紧到只够 skills + 几条 mcp
+  const out = buildCapabilityIndex({ home: '/fake/home', fs: capsFs(skills, many), maxBytes: total });
+  // ① skills 必须**逐字节等于**「没有 mcp 段时」的渲染（共享预算只准往下让）
+  assert.equal(out.skillsSection, renderCapabilityIndex(skills, { maxBytes: total }),
+    'skills 段被 mcp 挤动了（§5.2「skills 段永不被 mcp 挤掉」）');
+  for (const id of ['aaa', 'bbb']) assert.ok(out.section.includes(`\`${id}\``), `技能 ${id} 被挤掉了`);
+  // ② 挤掉的必须是 mcp：有截尾行，且真少列了若干 server
+  assert.match(out.mcpSection, /还有 \d+ 个 server 未列出/, '预算紧却没写「未列出」= 静默吞信息');
+  assert.ok(out.mcpSection.includes('- srv00 —'));
+  assert.ok(!out.mcpSection.includes('- srv39 —'), 'mcp 段必须按 name 从尾部截');
+  // ③ 两段加起来仍在上限内（截断提示不许把上限顶穿）
+  assert.ok(Buffer.byteLength(out.section, 'utf8') <= total,
+    `整段 ${Buffer.byteLength(out.section, 'utf8')} 字节 > 预算 ${total}`);
+});
+
+test('CI-13 mcp 超预算按 name 升序截尾并记账；整段始终 ≤ 4 KiB', () => {
+  const many = [];
+  for (let i = 0; i < 400; i += 1) many.push(mcpEntry(`s${String(i).padStart(3, '0')}`));
+  const out = buildCapabilityIndex({ home: '/fake/home', fs: capsFs([], many) });
+  assert.ok(Buffer.byteLength(out.section, 'utf8') <= CAPABILITY_MAX_SECTION_BYTES);
+  assert.match(out.section, /还有 \d+ 个 server 未列出/);
+  assert.ok(out.section.includes('- s000 —'));
+  assert.ok(!out.section.includes('- s399 —'));
+});
+
+test('CI-14 没有 mcp 段（旧版 portal）⇒ section 逐字节等于 v1【反向防回归】', () => {
+  const skills = [skill('aaa'), skill('bbb')];
+  const out = buildCapabilityIndex({ home: '/fake/home', fs: capsFs(skills, undefined) });
+  assert.equal(out.mcpSection, '');
+  assert.equal(out.section, renderCapabilityIndex(skills),
+    '加了 mcp 段之后，旧文件的输出必须一字节都不变（prompt 缓存前缀不许漂）');
+  assert.deepEqual(out.mcp, [], '缺段 ⇒ 空数组，绝不是 undefined（调用方要能直接 map）');
+  // 反向：显式空数组与缺键必须同结果
+  const emptyArr = buildCapabilityIndex({ home: '/fake/home', fs: capsFs(skills, []) });
+  assert.equal(out.section, emptyArr.section);
+});
+
+test('CI-15 mcp 段自身形状不对只丢自己，skills 照常渲染', () => {
+  const f = capsFs([skill('aaa')], [mcpEntry('ok_one'), null, { description: '没有名字' }, 42]);
+  const out = buildCapabilityIndex({ home: '/fake/home', fs: f });
+  assert.equal(out.status, 'ok');
+  assert.ok(out.section.includes('`aaa`'), 'skills 不许被 mcp 的坏条目连坐');
+  assert.deepEqual(out.mcp.map((s) => s.name), ['ok_one']);
+  assert.ok(out.section.includes('- ok_one —'));
+});
