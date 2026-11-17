@@ -3250,9 +3250,9 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
   （`command` 是 argv[0]，不是 shell 串）；`http` 必须给 `url` 且 scheme ∈ {http,https}；两者互斥。
 - `reason` 缺或不在四选一 ⇒ **`capability_reason_required`**（专属码，前端据此高亮那个下拉）。
 - `resident` 只接受 `false`/缺省；其它值 ⇒ `capability_kind_unsupported`（P1 不做常驻容器）。
-- `slots` 上限 12 条；`name` 匹配 `^[A-Z][A-Z0-9_]{0,63}$` 且**不许撞保留名**
-  （`PATH`/`HOME`/`ERIX_*`/`MCP_*`/`NODE_*` 等，两侧都判）；`kind:'secret'` 只能 `inject:'env'`
-  （秘密不进 header 日志）；`stdio` 只能 `env`、`http` 才能 `header`；重名 ⇒ `capability_slot_invalid`。
+- `slots` 上限 16 条；`name` 匹配 `^[A-Z][A-Z0-9_]{0,63}$` 且**不许撞保留名**
+  （`PATH`/`HOME`/`ERIX_*`/`MCP_*`/`NODE_*` 等，两侧都判）；`kind:'secret'` 只能 `inject:'env'` 或 `'header'`
+  （`context` 一律不许：那是模型可见的上下文，秘密进那里等于写进提示词）；`stdio` 只能 `env`、`http` 才能 `header`；重名 ⇒ `capability_slot_invalid`。
 - 发布闸门（`POST …/publish`）：skill 要「当前版本有包」，**MCP 要「配置完整」**（`command` 或 `url`），
   否则 `409 capability_not_published`，`details.reason` = `mcp_config_incomplete`。
 
@@ -3275,7 +3275,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 ```
 
 - 加密：AES-256-GCM，key 来自 `MCP_SECRET_KEY`（base64 的 32 字节，`deploy/.env`），
-  AAD = `item:<item_id>:<name>:<scope>:<fde_id|->` ⇒ **密文不可跨条目/跨槽/跨 FDE 搬移**
+  AAD = `<item_id>:<name>:<scope>:<fde_id|空串>` ⇒ **密文不可跨条目/跨槽/跨 FDE 搬移**
   （搬过去解不开，判据 `portal/test/secrets.test.js` S-2/S-3）。
 - **缺 key 不是「用默认 key」**：`MCP_SECRET_KEY` 为空 ⇒ 加解密一律 `503 secret_key_missing`
   （读元数据仍可用，`has_value` 恒 false）。轮换口径：换 key ⇒ 旧密文解不开 ⇒ 槽位显示未设置 ⇒ 重填。

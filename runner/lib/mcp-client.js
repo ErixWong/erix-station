@@ -314,6 +314,9 @@ function createStdioTransport({
     });
     child.on('exit', (code, signal) => {
       gone = { code, signal };
+      // 组长退出**不补刀**：pgid 可能已被 OS 复用（杀掉无关进程组的代价远大于漏杀一个孤儿），
+      // 与 shell 子进程组（`agentd.js` 的 `shellPgids`）同一口径。真正的兜底在宿主侧：
+      // worker 任何一条终止路径都会过 `killChildGroups`，那里按账本整组补杀（§6.8）。
       notifyProcess('exit', child?.pid ?? 0);
       const why = mcpError(
         MCP_ERRORS.UNREACHABLE,

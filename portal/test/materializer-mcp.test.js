@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { MCP_MAX_SCHEMA_BYTES, renderCapabilitiesJson, renderMcpJson } from '../src/materializer.js';
+import { MCP_MAX_SCHEMA_BYTES, buildFilePlan, renderCapabilitiesJson, renderMcpJson } from '../src/materializer.js';
 
 const SERVER = (over = {}) => ({
   name: 'erix-search', description: '内部搜索', transport: 'stdio', command: 'node',
@@ -44,6 +44,23 @@ test('MM-3 direct 但 schema 超 64 KiB ⇒ 降级 deferred 且丢掉 schema（�
 
   const small = JSON.parse(renderMcpJson([SERVER({ exposure: 'direct' })])).servers[0];
   assert.equal(small.exposure, 'direct');
+});
+
+test('MM-3b【反向】降级后的 exposure 必须同步进 capabilities.json（两份产物同一份判定）', () => {
+  const big = { type: 'object', properties: { x: { description: 'y'.repeat(MCP_MAX_SCHEMA_BYTES) } } };
+  const servers = [SERVER({ exposure: 'direct', tools: [{ name: 'a', description: 'd', inputSchema: big }] })];
+  const warns = [];
+  const files = buildFilePlan({
+    fdeName: 'alice', baseDomain: 'localhost', llmBaseUrl: 'http://llm', allocations: [],
+    root: '/tmp/x', generation: 1, capabilities: [], mcpServers: servers,
+    log: { warn: (m) => warns.push(m) },
+  });
+  const mcp = JSON.parse(files.find((f) => f.containerPath.endsWith('mcp.json')).content);
+  const caps = JSON.parse(files.find((f) => f.containerPath.endsWith('capabilities.json')).content);
+  assert.equal(mcp.servers[0].exposure, 'deferred');
+  assert.equal(caps.mcp[0].exposure, 'deferred',
+    '索引里仍写 direct ⇒ runner 期待独立工具而实际一个都没有（两份产物各算一次就会这样）');
+  assert.equal(warns.length, 1, '降级必须留一条 warn（否则「为什么没有独立工具」无从追）');
 });
 
 test('MM-4 传输面：stdio 只出 command/args、http 只出 url；缺字段补空串不补 undefined', () => {

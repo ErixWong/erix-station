@@ -1908,7 +1908,14 @@ async function handleAdminApi(req, res, ctx, url) {
     if (req.method === 'PUT') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-      const scope = body?.scope === 'fde' ? 'fde' : 'global';
+      // 非法 scope **当场 400**（审计必修）：静默当 global 意味着「想写某台工位的凭据，结果写成了全局」，
+      // 而全局值会被所有工位解析到——这是把一次误操作放大成一次凭据扩散。
+      const scopeRaw = body?.scope ?? 'global';
+      if (scopeRaw !== 'global' && scopeRaw !== 'fde') {
+        throw new HttpError(400, 'validation_failed', 'scope 只允许 global | fde',
+          { details: { field: 'scope', scope: scopeRaw } });
+      }
+      const scope = scopeRaw;
       const fdeId = scope === 'fde' ? decodeUuid(String(body?.fde_id ?? '')) : null;
       const out = await market.setSlotValues({
         pool: ctx.pool, itemId, actorId: session.user.id, scope, fdeId,
@@ -5011,8 +5018,14 @@ async function handleInternal(req, res, ctx, url) {
   //   ③ 响应不缓存（no-store），避免中间层留存。
   if (pathname === '/api/internal/mcp/servers') {
     if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
-    const fde = { id: user.id, name: user.fde_name };
-    if (!fde.name) return sendJson(res, 200, { servers: [], missing: [] });
+    // ⚠ `fde_name` 在 `identity.container` 上，**不在** `identity.user` 上（真机 e2e 抓到的）：
+    // 写成 `user.fde_name` ⇒ 恒 undefined ⇒ 早退空清单 ⇒ 症状是「装了 MCP 但 run 里 declared=1
+    // registered=0 missing=1」，而 portal 侧一切正常（没有任何报错）。
+    const fde = { id: user.id, name: container?.fde_name };
+    if (!fde.name) {
+      ctx.log?.warn?.('[internal/mcp] container identity 缺 fde_name，无法解析 MCP 配置');
+      return sendJson(res, 200, { servers: [], missing: [] });
+    }
     let out;
     try {
       out = await market.resolveMcpServersForFde({ pool: ctx.pool, fde, key: ctx.config.mcpSecretKey });
