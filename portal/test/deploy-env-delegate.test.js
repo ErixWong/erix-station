@@ -1530,4 +1530,22 @@ test('活二⑱ 表达式体箭头的遮蔽区间只覆盖体本身：箭头**�
     + '）：多出一条就是箭头后面那条静态读被误判了（区间过宽 = 假红，与幻影 key 相反的静默方向）');
 });
 
+test('活二⑲ 解析得出的参数默认值不许白丢：末位默认值 / 解构别名默认值都要解析成那个常量', () => {
+  // 与⑰同一块地基、方向相反的两面：默认值文本里多一个 `)` 就解析不出 ⇒ 能解析的被丢进 `unsupported`
+  // （假红）；而 `{ k: NAME = 'ERIX_X' }` 这一支旧代码写死 `def: null` ⇒ 同样把解析得出的默认值白丢。
+  // 两形各钉一条，**必须**从默认值里解析出那个 env 名（进枚举）、**不许**出现在 unsupported 里：
+  // 白丢一个可解析的名字，就等于那个旋钮从三腿判据里消失（它不再要求 compose / Env / 白名单齐）。
+  const src = [
+    "export function plainDefault(DEF_PLAIN = 'ERIX_A5_DEF_PLAIN_OK') { return process.env[DEF_PLAIN]; }",
+    "export function aliasedDefault({ k: DEF_ALIAS = 'ERIX_A5_DEF_ALIAS_OK' } = {}) { return process.env[DEF_ALIAS]; }",
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('param-default-resolvable', src);
+  assert.deepEqual(keys, ['ERIX_A5_DEF_ALIAS_OK', 'ERIX_A5_DEF_PLAIN_OK'],
+    `两个可解析的参数默认值没全进枚举（实际 ${JSON.stringify(keys)}）：默认值解析不出就被当成动态名，`
+    + '那个旋钮从三腿判据里消失（不是报错，是静默降级）');
+  assert.deepEqual(unsupported, [],
+    `可解析的默认值被丢进 unsupported 了（实际 ${JSON.stringify(unsupported.map((u) => u.shape))}）：`
+    + '两形（末位 `X = \'ERIX_X\'` / 解构别名 `{ k: NAME = \'ERIX_X\' }`）少解析一形 = 那一形白丢');
+});
+
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
