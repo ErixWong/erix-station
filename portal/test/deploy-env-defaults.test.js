@@ -16,6 +16,7 @@ import { parse } from 'yaml';
 import { loadConfig } from '../src/config.js';
 
 const COMPOSE = new URL('../../deploy/docker-compose.yml', import.meta.url);
+const ENV_EXAMPLE = new URL('../../deploy/.env.example', import.meta.url);
 
 /** 取 compose 里 `${VAR:-默认}` 的默认段；写成裸值（无插值）时原样返回。 */
 function interpolationDefault(value) {
@@ -96,4 +97,89 @@ test('#450 管理台 host 默认 = admin.<BASE_DOMAIN>，且 compose 把 ADMIN_P
   assert.equal(interpolationDefault(env.ADMIN_IP_ALLOWLIST), '', '默认必须是空 = 不挂 ipAllowList（不破坏现网）');
   assert.equal(interpolationDefault(env.ADMIN_PUBLIC_HOST), '', '默认必须是空 = 由 BASE_DOMAIN 推导');
   assert.equal(loadConfig({}).adminHost, 'admin.localhost');
+});
+
+// ---------------------------------------------------------------------------
+// issue #643 A：三根自构建镜像的引用**不许有缺省值**（静态锁，行为锁在
+// `test/deploy-compose-failclosed.test.js`，那边跑真 compose，这边钉「文本形态」）。
+//
+// 病根：`deploy/.env` 是 gitignore 的（`.gitignore` 里 `.env` / `.env.*`）⇒ 新 worktree / 新机器
+// 根本没有它；而 `${VAR:-回落值}` 在缺文件时**静默**用回落值 ⇒ 任何一次 `up -d` 都能把**共享
+// dev 栈**换成 `:local` / `traefik/whoami` 而一声不响。`:-` ⇒ `:?` 之后缺值即报错。
+//
+// 为什么静态锁与行为锁都要：行为锁能抓「回落值回来了」，但它跑不起来时就 skip（无 docker）；
+// 而只靠文本判据又会漏「文案没点名变量 ⇒ 报错现场根本认不出是哪根旋钮」这一类（M4 的形态）。
+// ---------------------------------------------------------------------------
+
+/** 四处插值点（service 路径是 compose 报错时会点名的那一个，写进断言消息便于对现场）。 */
+const FAIL_CLOSED_REFS = [
+  { varName: 'STATION_DOCKER_PROXY_IMAGE', at: 'services.station-docker-proxy.image', path: ['station-docker-proxy', 'image'] },
+  { varName: 'STATION_PORTAL_IMAGE', at: 'services.station-portal.image', path: ['station-portal', 'image'] },
+  { varName: 'FDE_IMAGE', at: 'services.station-docker-proxy.environment.IMAGE_ALLOWLIST', path: ['station-docker-proxy', 'environment', 'IMAGE_ALLOWLIST'] },
+  { varName: 'FDE_IMAGE', at: 'services.station-portal.environment.FDE_IMAGE', path: ['station-portal', 'environment', 'FDE_IMAGE'] },
+];
+/** `.env.example` 里必须登记（且留空）的三根变量。 */
+const REGISTERED_REFS = ['STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE'];
+
+function composeValueAt(doc, path) {
+  // path 的根是 `services`（上面的 `at` 写的是 compose 报错时点名的路径，含 services 前缀）
+  let node = doc.services;
+  for (const key of path) {
+    node = node?.[key];
+    assert.notEqual(node, undefined, `compose 里 ${path.join('.')} 不见了（判据的坐标先失效）`);
+  }
+  return String(node);
+}
+
+test('#643 A 四处镜像引用必须是 ${VAR:?…}，且不许残留 ${VAR:-回落} 形态', () => {
+  const doc = parse(fs.readFileSync(COMPOSE, 'utf8'));
+  const problems = [];
+  for (const ref of FAIL_CLOSED_REFS) {
+    const raw = composeValueAt(doc, ref.path);
+    // `${VAR:?msg}`（消息里不许出现 `}`，compose 的插值文法到第一个 `}` 结束）
+    const m = /^\$\{([A-Z0-9_]+):\?([^}]*)\}$/.exec(raw);
+    if (!m) problems.push(`${ref.at} = ${JSON.stringify(raw)}：不是 ${ref.varName}:?… 形态（回落值回来了？）`);
+    else if (m[1] !== ref.varName) problems.push(`${ref.at} 插的是 ${m[1]}，不是 ${ref.varName}`);
+    if (raw.includes(':-')) problems.push(`${ref.at} = ${JSON.stringify(raw)}：残留 :- 回落段`);
+  }
+  assert.deepEqual(problems, [],
+    '镜像引用必须缺值即拒：`deploy/.env` 不入库，带缺省值的那次 `up -d` 会静默换掉共享 dev 栈的镜像\n  '
+    + problems.join('\n  '));
+});
+
+test('#643 A `:?` 的报错文案必须点名对应变量（缺值现场要认得出是哪根旋钮）', () => {
+  const doc = parse(fs.readFileSync(COMPOSE, 'utf8'));
+  const problems = [];
+  for (const ref of FAIL_CLOSED_REFS) {
+    const raw = composeValueAt(doc, ref.path);
+    const msg = /^\$\{[A-Z0-9_]+:\?([^}]*)\}$/.exec(raw)?.[1] ?? '';
+    if (!msg.includes(ref.varName)) {
+      problems.push(`${ref.at}：文案 ${JSON.stringify(msg)} 里没有 ${ref.varName}`);
+    }
+    // 两种合法形态都要在文案里：scratch 的 tag 形态与部署的 digest 形态（只说一种 = 现场猜）
+    if (!/\blocal\b|whoami/.test(msg)) problems.push(`${ref.at}：文案没给 scratch 本地形态（:local / whoami）`);
+    if (!msg.includes('sha256:')) problems.push(`${ref.at}：文案没给部署 pin 形态（image@sha256:…）`);
+  }
+  assert.deepEqual(problems, [], 'compose 的缺值文案要点名变量并给两种合法形态：\n  ' + problems.join('\n  '));
+});
+
+test('#643 A deploy/.env.example 必须登记这三根，且值不许是「抄了就能起栈」的具体引用', () => {
+  const text = fs.readFileSync(ENV_EXAMPLE, 'utf8');
+  const lines = text.split('\n');
+  const problems = [];
+  for (const key of REGISTERED_REFS) {
+    // 只认**未被注释**的 `KEY=` 行：注释里的示例值是给人看的，不算运维的填写处。
+    const active = lines.filter((l) => new RegExp(`^${key}\\s*=`).test(l));
+    if (active.length !== 1) {
+      problems.push(`${key}：.env.example 里未注释的登记行有 ${active.length} 行（要恰好 1 行；`
+        + '0 行 = 运维找不到填写处，>1 行 = 后者静默覆盖前者）');
+      continue;
+    }
+    const value = active[0].slice(active[0].indexOf('=') + 1).trim();
+    if (value !== '') {
+      problems.push(`${key}：模板给的是 ${JSON.stringify(value)} ⇒ 复制模板就等于声明要动共享 dev 栈`
+        + '（这三根的口径是「留空 = 仍未声明」；空值也算缺失，compose 2.40 实测）');
+    }
+  }
+  assert.deepEqual(problems, [], problems.join('\n'));
 });
