@@ -873,7 +873,9 @@ test('#595 capabilities.json：§5 形状 + 逐字节确定 + 落盘模式；空
     '必须归平台管理路径（否则 stale 清理会把用户自己放的同名文件当平台文件误删，反之也是）');
 
   const doc = JSON.parse(entry.content);
-  assert.deepEqual(Object.keys(doc).sort(), ['skills', 'version'], '顶层只有 version 与 skills');
+  // #608：顶层多了 `mcp`（MCP server 的路由信号）。仍是**闭集**——多一个键就红。
+  assert.deepEqual(Object.keys(doc).sort(), ['mcp', 'skills', 'version'], '顶层只有 version / skills / mcp');
+  assert.deepEqual(doc.mcp, [], '没装 MCP 时 mcp 段是空数组（不是缺键）');
   assert.equal(doc.version, 1);
   // 停用项**也在**文件里（runner 要用它的 id 去填 excludeSkillIds，目录仍在磁盘）
   assert.deepEqual(doc.skills.map((s) => s.id), ['github', 'pdf_tools'], '必须按 id 升序（渲染侧兜一次排序）');
@@ -892,7 +894,8 @@ test('#595 capabilities.json：§5 形状 + 逐字节确定 + 落盘模式；空
   // 空市场也是合法文件：runner 读到它就是空段 = 提示词逐字节不变，不存在「文件还没生成」的分支
   // 缩进形态与 config.json / ports.json 同源（同一个 `json()` 助手）：两个文件长得不一样
   // 就会被当成「两套渲染器」，日后有人只改一套。
-  const EMPTY = `${JSON.stringify({ version: 1, skills: [] }, null, 2)}\n`;
+  // #608：空清单也带 `mcp: []`（闭集：version / skills / mcp）。
+  const EMPTY = `${JSON.stringify({ version: 1, skills: [], mcp: [] }, null, 2)}\n`;
   assert.equal(renderCapabilitiesJson([]), EMPTY);
   assert.equal(renderCapabilitiesJson(undefined), EMPTY);
   assert.equal(renderCapabilitiesJson([null, { name: '没有 id' }]), EMPTY,
@@ -976,7 +979,7 @@ test('#595 市场读失败 ⇒ capabilities.json 降级成空清单 + 一条 war
     assert.deepEqual(result, { processed: 1, claimed: 1 }, '市场读失败不得让这一轮对账失败');
     const p = path.join(root, 'alice', 'home', '.erix', 'capabilities.json');
     assert.ok(fs.existsSync(p), '读失败也必须落下这个文件（runner 需要一条确定的读路径）');
-    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), { version: 1, skills: [] },
+    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), { version: 1, skills: [], mcp: [] },
       '降级值必须是**空清单**，不是旧值、不是 null');
     assert.ok(warns.some((w) => /capabilities read failed/.test(w)), `必须留一条 warn：${JSON.stringify(warns)}`);
     // 同轮其余平台文件照常落盘（市场不是物化的前置条件）

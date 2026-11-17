@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { assertSafePath, ensureDirSafe, randomHex } from './fsutil.js';
 import { validateFdeName } from './projects.js';
 import { enqueueMaterializeChange } from './outbox.js';
+import { encryptValue, resolveSlots } from './secrets.js';
 
 // ---------------------------------------------------------------------------
 // 常量：§3 的天花板与 §4 的预算，全部集中在这里（HTTP 层与文档引用的必须是同一份）
@@ -377,6 +378,13 @@ export function validateBundle({ slug, whenToUse, bundle }) {
   }
 
   validateLayout(files);
+  // §4.5 红色形状：这类包在 skill 里几乎必然是错的（常驻/监听/PTY/写持久目录）⇒ 硬拒，不是 warn。
+  const shapeHits = scanPackageShape(files);
+  if (shapeHits.length > 0) {
+    throw new MarketError(
+      `包里有 ${shapeHits.length} 处「常驻/服务」形状（应做成 MCP，见 docs/design/skill-authoring.md §5）`,
+      { code: 'capability_package_shape', httpStatus: 400, details: { hits: shapeHits } });
+  }
   const entry = files.find((f) => f.path === ENTRYPOINT);
   const source = entry.content.toString('utf8');
   const { skillId, tools } = extractSkillMeta(source);
@@ -521,6 +529,9 @@ export function toAdminItemDto(row, extra = {}) {
     // 而 manifest 已是它的唯一来源（不让调用方自己数 files[]，那是另一份真相）。
     tool_count: toolCountOf(row.manifest),
     installs: row.installs === undefined ? undefined : Number(row.installs),
+    exposure: asJson(row.manifest, {}).exposure ?? null,
+    reason: asJson(row.manifest, {}).reason ?? null,
+    transport: asJson(row.manifest, {}).transport ?? null,
     created_at: row.created_at,
     published_at: row.published_at ?? null,
     retired_at: row.retired_at ?? null,
@@ -548,6 +559,12 @@ export function toUserItemDto(row) {
     installed_version: row.installed_version ?? null,
     enabled: row.enabled === true,
     updated_at: row.updated_at,
+    // §8.2：MCP 卡片要显示「为什么它是 MCP」与曝光档；skill 条目这三格为 null。
+    exposure: asJson(row.manifest, {}).exposure ?? null,
+    reason: asJson(row.manifest, {}).reason ?? null,
+    transport: asJson(row.manifest, {}).transport ?? null,
+    // §7.2：缺必填槽 ⇒ 前端禁用「启用」并提示等管理员配置（**不**告诉用户缺哪个槽）。
+    secrets_ready: row.secrets_ready === undefined ? null : row.secrets_ready === true,
   };
 }
 
@@ -789,9 +806,13 @@ async function selectInstall(pool, fdeId, slug) {
   return r.rows[0] ?? null;
 }
 
-async function countEnabled(pool, fdeId) {
+async function countEnabled(pool, fdeId, kind = 'skill') {
+  // §4：技能与 MCP 分开算预算——技能的账是「每轮铺多少 schema」，MCP 的账是「网关 + direct 工具」，
+  // 合成一个计数器会让「装了 12 个技能」把 MCP 也一起锁死。
   const r = await pool.query(
-    `SELECT count(*)::int AS n FROM fde_capability_installs WHERE fde_id = $1 AND enabled`, [fdeId]);
+    `SELECT count(*)::int AS n
+       FROM fde_capability_installs inst JOIN capability_items i ON i.id = inst.item_id
+      WHERE inst.fde_id = $1 AND inst.enabled AND i.kind = $2`, [fdeId, kind]);
   return Number(r.rows[0]?.n ?? 0);
 }
 
@@ -828,7 +849,8 @@ async function insertFiles(pool, { itemId, version, files }) {
  */
 export async function publishItem({ pool, actorId = null, fields = {} }) {
   const meta = validateMetadata(fields, { requireAll: true });
-  if (meta.kind === 'mcp') throw kindUnsupported(meta.slug);
+  // §4 MCP 条目：没有包，只有配置（transport/command|url/exposure/lifecycle/reason/slots）。
+  if (meta.kind === 'mcp') return publishMcpItem({ pool, actorId, meta, fields });
   // bundle 不是元数据（它是字节），不进 `validateMetadata` 的白名单，从**原始体**里取。
   const bundle = fields.bundle;
   if (bundle === undefined || bundle === null) throw bad('bundle 必填（发布必须带包）', { field: 'bundle' });
@@ -861,6 +883,27 @@ export async function updateItem({ pool, actorId = null, itemId, fields = {} }) 
   const next = { ...cur, ...meta };
   let manifest = asJson(cur.manifest, {});
   let security = { score: cur.security_score, warnings: asJson(cur.security_warnings, []) };
+
+  // §4 MCP 条目：配置面编辑（没有 bundle）。transport 变了要 bump version（runner 侧的连接方式变了）。
+  if (cur.kind === 'mcp') {
+    const { manifest: mcpManifest, slots } = validateMcpFields(fields, { requireAll: false });
+    const merged = { ...manifest, ...mcpManifest };
+    if (fields.transport !== undefined && fields.transport !== asJson(cur.manifest, {}).transport
+        && !meta.version) {
+      throw bad('改 transport 必须同时 bump version', { field: 'version', current: cur.version });
+    }
+    return withTransaction(pool, async (client) => {
+      const r = await client.query(
+        `UPDATE capability_items
+            SET name = $2, summary = $3, when_to_use = $4, description_md = $5, version = $6, author = $7,
+                tags = $8, license = $9, manifest = $10::jsonb, updated_at = now()
+          WHERE id = $1 RETURNING ${ITEM_COLUMNS}`,
+        [itemId, next.name, next.summary, next.when_to_use, next.description_md ?? '', next.version,
+          next.author ?? null, next.tags ?? [], next.license ?? null, JSON.stringify(merged)]);
+      if (fields.slots !== undefined) await replaceParams(client, { itemId, slots });
+      return toAdminItemDto(r.rows[0]);
+    });
+  }
 
   if (fields.bundle !== undefined && fields.bundle !== null) {
     if (!meta.version) throw bad('带 bundle 时必须给新的 version', { field: 'version' });
@@ -926,13 +969,27 @@ export function stateForVerb(verb) {
 export async function setItemState({ pool, itemId, state }) {
   if (!['draft', 'published', 'retired'].includes(state)) throw bad("state 只允许 draft/published/retired", { field: 'state' });
   if (state === 'published') {
-    // 发布闸门：当前版本必须真的**有包**。否则装上去是个空目录，而 capabilities.json 会告诉模型「有」。
-    const n = (await pool.query(
-      `SELECT count(*)::int AS n FROM capability_files
-        WHERE item_id = $1 AND version = (SELECT version FROM capability_items WHERE id = $1)`, [itemId])).rows[0]?.n ?? 0;
-    if (Number(n) === 0) {
-      throw new MarketError('当前版本没有包内容，不能发布',
-        { code: 'capability_not_published', httpStatus: 409, details: { reason: 'no_files_for_current_version' } });
+    const cur = (await pool.query('SELECT kind, manifest FROM capability_items WHERE id = $1', [itemId])).rows[0];
+    if (!cur) throw notFound(itemId);
+    if (cur.kind === 'mcp') {
+      // §4 MCP 的发布闸门不是「有包」而是「配置完整」：transport 必须有 command 或 url，
+      // 否则 runner 拿到一条什么都起不来的配置（症状是「装了但 list 里什么都没有」）。
+      const m = asJson(cur.manifest, {});
+      const ok = (m.transport === 'stdio' && typeof m.command === 'string' && m.command !== '')
+        || (m.transport === 'http' && typeof m.url === 'string' && m.url !== '');
+      if (!ok) {
+        throw new MarketError('MCP 条目缺 transport/command/url，不能发布',
+          { code: 'capability_not_published', httpStatus: 409, details: { reason: 'mcp_config_incomplete' } });
+      }
+    } else {
+      // 发布闸门：当前版本必须真的**有包**。否则装上去是个空目录，而 capabilities.json 会告诉模型「有」。
+      const n = (await pool.query(
+        `SELECT count(*)::int AS n FROM capability_files
+          WHERE item_id = $1 AND version = (SELECT version FROM capability_items WHERE id = $1)`, [itemId])).rows[0]?.n ?? 0;
+      if (Number(n) === 0) {
+        throw new MarketError('当前版本没有包内容，不能发布',
+          { code: 'capability_not_published', httpStatus: 409, details: { reason: 'no_files_for_current_version' } });
+      }
     }
   }
   const r = await pool.query(
@@ -982,9 +1039,20 @@ export async function listUserItems({ pool, fdeId }) {
        LEFT JOIN fde_capability_installs inst ON inst.item_id = i.id AND inst.fde_id = $1
       WHERE i.state = 'published'
       ORDER BY i.slug`, [fdeId]);
+  // §7.2：MCP 条目要带 `secrets_ready`（缺必填槽 ⇒ 前端禁用启用）。一次查完，别 N+1。
+  const mcpIds = r.rows.filter((row) => row.kind === 'mcp').map((row) => row.id);
+  const missingByItem = await mcpSecretsReadyMap(pool, fdeId, mcpIds);
   return {
-    items: r.rows.map(toUserItemDto),
-    budget: { max_enabled: LIMITS.maxEnabledSkills, enabled_now: await countEnabled(pool, fdeId) },
+    items: r.rows.map((row) => toUserItemDto({
+      ...row,
+      secrets_ready: row.kind === 'mcp' ? !missingByItem.has(row.id) : null,
+    })),
+    budget: {
+      max_enabled: LIMITS.maxEnabledSkills,
+      enabled_now: await countEnabled(pool, fdeId, 'skill'),
+      max_enabled_mcp: MCP_LIMITS.maxEnabledMcp,
+      enabled_now_mcp: await countEnabled(pool, fdeId, 'mcp'),
+    },
   };
 }
 
@@ -1001,8 +1069,9 @@ export async function getUserItem({ pool, fdeId, slug }) {
     `SELECT path, bytes, content FROM capability_files WHERE item_id = $1 AND version = $2 ORDER BY path`,
     [row.id, row.version])).rows;
   const readme = rows.find((f) => f.path === README_FILE);
+  const missingByItem = row.kind === 'mcp' ? await mcpSecretsReadyMap(pool, fdeId, [row.id]) : new Map();
   return {
-    ...toUserItemDto(row),
+    ...toUserItemDto({ ...row, secrets_ready: row.kind === 'mcp' ? !missingByItem.has(row.id) : null }),
     description_md: row.description_md ?? '',
     // 缺 SKILL.md ⇒ 空串（**不是 null**）：前端把它直接塞进 markdown 渲染器，null 会渲染成 "null"。
     readme_md: readme ? Buffer.from(readme.content).toString('utf8') : '',
@@ -1010,6 +1079,12 @@ export async function getUserItem({ pool, fdeId, slug }) {
     manifest: asJson(row.manifest, {}),
     security_warnings: asJson(row.security_warnings, []),
     files: rows.map((f) => ({ path: f.path, bytes: f.bytes })),
+    // §8.1/§8.2：MCP 条目把槽位**声明**给用户看（「需要管理员配置凭据」的说明），但**没有值**。
+    slots: row.kind === 'mcp'
+      ? (await listSlots({ pool, itemId: row.id })).map((s) => ({
+        name: s.name, kind: s.kind, inject: s.inject, required: s.required, description: s.description,
+      }))
+      : [],
   };
 }
 
@@ -1030,7 +1105,6 @@ export async function getUserItem({ pool, fdeId, slug }) {
 export async function installCapability({ pool, config, fde, slug, enabled, force = false, log = console }) {
   const item = await selectItemBySlug(pool, slug);
   if (!item) throw notFound(slug);
-  if (item.kind === 'mcp') throw kindUnsupported(slug);
   if (item.state !== 'published') {
     throw new MarketError(`条目状态是 ${item.state}，只有 published 可安装`,
       { code: 'capability_not_published', httpStatus: 409, details: { slug, state: item.state } });
@@ -1039,13 +1113,30 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
   const wantEnabled = enabled === undefined ? (existing ? existing.enabled : true) : Boolean(enabled);
   // 预算闸必须排在幂等判定**之前**：同版本但这次要求「从停用变启用」的请求，走的是下面那条
   // 只改账的分支——排在后面就会绕过预算（§4 的上限管的是 enabled 计数，与有没有写盘无关）。
+  const isMcp = item.kind === 'mcp';
+  const budget = isMcp
+    ? { limit: MCP_LIMITS.maxEnabledMcp, kind: 'mcp' }
+    : { limit: LIMITS.maxEnabledSkills, kind: 'skill' };
   if (wantEnabled && !(existing && existing.enabled)) {
-    const n = await countEnabled(pool, fde.id);
-    if (n >= LIMITS.maxEnabledSkills) {
-      throw new MarketError(`启用的技能已达上限 ${LIMITS.maxEnabledSkills} 个`,
+    const n = await countEnabled(pool, fde.id, budget.kind);
+    if (n >= budget.limit) {
+      throw new MarketError(`启用的${isMcp ? ' MCP server' : '技能'}已达上限 ${budget.limit} 个`,
         { code: 'capability_budget_exceeded', httpStatus: 409,
-          details: { max_enabled: LIMITS.maxEnabledSkills, enabled_now: n } });
+          details: { max_enabled: budget.limit, enabled_now: n, kind: budget.kind } });
     }
+  }
+  // §4 MCP：**不落盘**（没有包内容），只落账 + 排物化。
+  if (isMcp) {
+    await withTransaction(pool, async (client) => {
+      await client.query(
+        `INSERT INTO fde_capability_installs (fde_id, item_id, version, enabled)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (fde_id, item_id) DO UPDATE
+           SET version = EXCLUDED.version, enabled = EXCLUDED.enabled, updated_at = now()`,
+        [fde.id, item.id, item.version, wantEnabled]);
+      await enqueueMaterializeChange(client, { fdeId: fde.id, op: 'upsert' });
+    });
+    return { changed: true, slug, version: item.version, enabled: wantEnabled, disk: 'none' };
   }
   if (existing && existing.version === item.version && !force) {
     // 同版本 ⇒ **一个字节都不写盘**。但 `enabled` 是账本字段，请求里明确要变就得变：
@@ -1087,7 +1178,8 @@ export async function uninstallCapability({ pool, config, fde, slug, log = conso
   const item = await selectItemBySlug(pool, slug);
   if (!item) throw notFound(slug);
   const existing = await selectInstall(pool, fde.id, slug);
-  const removed = removeSkillDir({ config, fdeName: fde.name, slug, log });
+  // MCP 条目没有磁盘产物：卸载 = 删一行账（§4）。
+  const removed = item.kind === 'mcp' ? { removed: false } : removeSkillDir({ config, fdeName: fde.name, slug, log });
   await withTransaction(pool, async (client) => {
     await client.query('DELETE FROM fde_capability_installs WHERE fde_id = $1 AND item_id = $2', [fde.id, item.id]);
     if (existing) await enqueueMaterializeChange(client, { fdeId: fde.id, op: 'upsert' });
@@ -1097,7 +1189,7 @@ export async function uninstallCapability({ pool, config, fde, slug, log = conso
 }
 
 /** §4 启停：只改 DB 一行，磁盘一律不动（停用后目录仍在，重新启用不必重下）。 */
-export async function setCapabilityEnabled({ pool, fde, slug, enabled }) {
+export async function setCapabilityEnabled({ pool, fde, slug, enabled, config = null }) {
   if (typeof enabled !== 'boolean') throw bad('enabled 必须是布尔值', { field: 'enabled', actual: enabled });
   const item = await selectItemBySlug(pool, slug);
   if (!item) throw notFound(slug);
@@ -1107,12 +1199,26 @@ export async function setCapabilityEnabled({ pool, fde, slug, enabled }) {
     throw new MarketError('该条目尚未安装，无法启停',
       { code: 'capability_not_found', httpStatus: 404, details: { slug, reason: 'not_installed' } });
   }
+  const isMcp = item.kind === 'mcp';
+  const budget = isMcp
+    ? { limit: MCP_LIMITS.maxEnabledMcp, kind: 'mcp' }
+    : { limit: LIMITS.maxEnabledSkills, kind: 'skill' };
   if (enabled && !existing.enabled) {
-    const n = await countEnabled(pool, fde.id);
-    if (n >= LIMITS.maxEnabledSkills) {
-      throw new MarketError(`启用的技能已达上限 ${LIMITS.maxEnabledSkills} 个`,
+    const n = await countEnabled(pool, fde.id, budget.kind);
+    if (n >= budget.limit) {
+      throw new MarketError(`启用的${isMcp ? ' MCP server' : '技能'}已达上限 ${budget.limit} 个`,
         { code: 'capability_budget_exceeded', httpStatus: 409,
-          details: { max_enabled: LIMITS.maxEnabledSkills, enabled_now: n } });
+          details: { max_enabled: budget.limit, enabled_now: n, kind: budget.kind } });
+    }
+  }
+  // §4：MCP 只要请求「启用」就要查槽位——**不只在状态迁移时查**。
+  // 为什么：槽值可能在启用后被管理员删掉（或 key 轮换后解不开），此时「再点一次启用」必须同样拦住，
+  // 否则会出现「库里 enabled=true、运行时缺凭据、工具静默不存在」这种最难查的形态。
+  if (enabled && isMcp) {
+    const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id, key: config?.mcpSecretKey });
+    if (missing.length > 0) {
+      throw new MarketError('还有必填凭据没配置，无法启用（等管理员配置）', {
+        code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing } });
     }
   }
   const r = await withTransaction(pool, async (client) => {
@@ -1145,4 +1251,433 @@ export async function listCapabilitiesForFde(pool, fdeId) {
       WHERE inst.fde_id = $1 AND i.state = 'published'
       ORDER BY i.slug`, [fdeId]);
   return r.rows.map(toCapabilityIndexEntry);
+}
+
+// ---------------------------------------------------------------------------
+// §4/§5 MCP 通道（issue #608）：槽位声明、准入、安装面、物化读面
+// ---------------------------------------------------------------------------
+
+/** §4.1：槽位名同时是 env / header 名，字符集必须对两者都安全。 */
+export const SLOT_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
+export const MCP_TRANSPORTS = Object.freeze(['stdio', 'http']);
+export const MCP_EXPOSURES = Object.freeze(['direct', 'deferred', 'hidden']);
+export const MCP_LIFECYCLES = Object.freeze(['run', 'run-keep-alive']);
+export const MCP_REASONS = Object.freeze(['stateful', 'tool_surface_gt_12', 'shared_quota', 'credential_boundary']);
+
+/**
+ * §4.1 保留名：照 touwaka `buildSkillEnvironment` 的思路——参数名不许把安全关键变量顶掉。
+ * 前缀族（`ERIX_*` 等）用 `startsWith` 判，见 `isReservedSlotName`。
+ */
+export const RESERVED_SLOT_NAMES = Object.freeze([
+  'PATH', 'HOME', 'NODE_OPTIONS', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONSTARTUP',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE',
+]);
+const RESERVED_SLOT_PREFIXES = Object.freeze(['ERIX_', 'STATION_', 'SKILL_', 'MCP_']);
+
+export function isReservedSlotName(name) {
+  if (RESERVED_SLOT_NAMES.includes(name)) return true;
+  return RESERVED_SLOT_PREFIXES.some((p) => name.startsWith(p));
+}
+
+/** §4.3 的硬数字。`maxDirectTools` 与技能预算分账：direct 工具每轮都付上下文。 */
+export const MCP_LIMITS = Object.freeze({
+  maxEnabledMcp: 12,
+  maxDirectTools: 8,
+  maxServerSchemaBytes: 64 * 1024,
+  maxArgs: 32,
+  maxTimeoutMs: 300_000,
+  defaultTimeoutMs: 60_000,
+  maxSlots: 16,
+});
+
+/**
+ * §4.5 skill 包的**红色形状**：这些形状在包里几乎必然是错的（它们属于形态②/③的服务）。
+ * 命中即 `400 capability_package_shape`——不是 warning：这类包一旦装上就是「没有生命周期管理的常驻进程」。
+ * 判据是**源码文本**（平台不执行技能代码），所以只认能静态看见的写法。
+ */
+const PACKAGE_SHAPE_PATTERNS = Object.freeze([
+  { code: 'detached_spawn', re: /\bdetached\s*:\s*true\b/g, note: '自建常驻进程（应做成 MCP，见 mcp-integration.md §2）' },
+  { code: 'module_level_timer', re: /^(?!\s*(?:\/\/|\*)).*?\bsetInterval\s*\(/m, note: '模块级定时器会活过 run' },
+  { code: 'listens', re: /\b(?:\.listen\s*\(|createServer\s*\()/g, note: '监听端口绕过 ingress，且没人回收' },
+  { code: 'pty', re: /\bnode-pty\b|\bpty\.spawn\b/g, note: 'PTY 会话属于形态②/③' },
+  { code: 'writes_persistent_dir', re: /(?:writeFileSync|writeFile|appendFileSync|mkdirSync|createWriteStream)\s*\([^)]*(?:~\/\.erix|\/var\/|\/srv\/)/g, note: '写包外持久目录：状态该由平台持有' },
+  { code: 'declares_resident', re: /\bis_resident\b|\bresident\s*:\s*true\b/g, note: '声明常驻（P1 只支持形态①）' },
+]);
+
+/** @returns {Array<{code:string, path:string, note:string}>} */
+export function scanPackageShape(files) {
+  const hits = [];
+  for (const f of files) {
+    if (!f || !/\.(?:mjs|js|cjs|ts|py)$/.test(f.path)) continue;
+    const src = f.content.toString('utf8');
+    for (const p of PACKAGE_SHAPE_PATTERNS) {
+      p.re.lastIndex = 0;
+      if (p.re.test(src)) hits.push({ code: p.code, path: f.path, note: p.note });
+    }
+  }
+  return hits;
+}
+
+/**
+ * §4.2 组合矩阵：skill → context；mcp stdio → env；mcp http → header。
+ * `secret` 另加一条：不许 `context`（那是技能进程内面）。
+ * @param {Array<object>} slots 原始输入（未校验）
+ * @param {{kind: 'skill'|'mcp', transport?: string}} ctx
+ */
+export function validateSlots(slots, { kind, transport }) {
+  if (slots === undefined || slots === null) return [];
+  if (!Array.isArray(slots)) {
+    throw new MarketError('slots 必须是数组', { code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots' } });
+  }
+  if (slots.length > MCP_LIMITS.maxSlots) {
+    throw new MarketError(`slots 条数超过 ${MCP_LIMITS.maxSlots}`, {
+      code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots', actual: slots.length },
+    });
+  }
+  const allowedInject = kind === 'skill' ? ['context'] : transport === 'stdio' ? ['env'] : ['header'];
+  const out = [];
+  const seen = new Set();
+  for (const s of slots) {
+    if (s === null || typeof s !== 'object') throw bad('slots[] 必须是对象', { field: 'slots[]' });
+    const name = typeof s.name === 'string' ? s.name.trim() : '';
+    if (!SLOT_NAME_RE.test(name)) {
+      throw new MarketError(`槽位名必须匹配 ${SLOT_NAME_RE.source}`, {
+        code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.name', name },
+      });
+    }
+    if (isReservedSlotName(name)) {
+      throw new MarketError(`槽位名 "${name}" 是保留名（不许覆盖安全关键变量）`, {
+        code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.name', name, reason: 'reserved' },
+      });
+    }
+    if (seen.has(name)) {
+      throw new MarketError(`槽位名重复：${name}`, {
+        code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.name', name, reason: 'duplicate' },
+      });
+    }
+    seen.add(name);
+    const slotKind = s.kind;
+    if (slotKind !== 'config' && slotKind !== 'secret') {
+      throw new MarketError("槽位 kind 只允许 'config' | 'secret'", {
+        code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.kind', name },
+      });
+    }
+    const inject = s.inject;
+    if (!allowedInject.includes(inject)) {
+      throw new MarketError(`transport=${transport ?? '-'} / kind=${kind} 只允许 inject ∈ ${allowedInject.join('|')}`, {
+        code: 'capability_slot_invalid', httpStatus: 400,
+        details: { field: 'slots.inject', name, inject, allowed: allowedInject },
+      });
+    }
+    if (slotKind === 'secret' && inject === 'context') {
+      throw new MarketError('secret 槽不许 inject="context"（那等于把密钥交给技能代码）', {
+        code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.inject', name },
+      });
+    }
+    const description = typeof s.description === 'string' ? s.description.trim() : '';
+    if (description === '' || description.length > 200) {
+      throw new MarketError('槽位 description 必填且 ≤200 字符（管理员要知道这是什么）', {
+        code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.description', name },
+      });
+    }
+    out.push({ name, kind: slotKind, inject, required: s.required !== false, description });
+  }
+  return out;
+}
+
+/**
+ * §4.1/§4.3/§4.4：MCP 条目的字段面校验。
+ * 与 skill 的 `validateBundle` 互补：这里只校验**配置**，不碰包内容（MCP 没有包）。
+ * @returns {{meta: object, manifest: object, slots: Array<object>}}
+ */
+export function validateMcpFields(fields, { requireAll = false } = {}) {
+  if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) throw bad('请求体必须是 JSON 对象', { field: 'body' });
+  const pick = (k) => fields[k];
+  const need = (k, msg) => {
+    const v = pick(k);
+    if (v === undefined || v === null || (typeof v === 'string' && v.trim() === '')) {
+      if (requireAll) throw bad(msg ?? `${k} 必填`, { field: k });
+      return undefined;
+    }
+    return v;
+  };
+  const transport = need('transport', 'transport 必填（stdio | http）');
+  if (transport !== undefined && !MCP_TRANSPORTS.includes(transport)) {
+    throw bad("transport 只允许 'stdio' | 'http'", { field: 'transport', transport });
+  }
+  const exposure = pick('exposure') ?? 'deferred';
+  if (!MCP_EXPOSURES.includes(exposure)) throw bad(`exposure 只允许 ${MCP_EXPOSURES.join('|')}`, { field: 'exposure', exposure });
+  const lifecycle = pick('lifecycle') ?? 'run';
+  if (!MCP_LIFECYCLES.includes(lifecycle)) throw bad(`lifecycle 只允许 ${MCP_LIFECYCLES.join('|')}`, { field: 'lifecycle', lifecycle });
+  if (pick('resident') !== undefined && pick('resident') !== false) {
+    throw new MarketError('resident 在 P1 只支持 false（形态②/③ 未实现）', {
+      code: 'capability_kind_unsupported', httpStatus: 409, details: { field: 'resident', resident: pick('resident') },
+    });
+  }
+  const reasonRaw = pick('reason');
+  const reason = typeof reasonRaw === 'string' && reasonRaw.trim() !== '' ? reasonRaw.trim() : undefined;
+  if (reason === undefined && requireAll) {
+    // §7.3：缺准入理由用专属错误码（前端要据此高亮那个下拉，而不是显示一句泛泛的「参数不合法」）。
+    throw new MarketError('MCP 条目必须给准入理由（stateful / tool_surface_gt_12 / shared_quota / credential_boundary）', {
+      code: 'capability_reason_required', httpStatus: 400, details: { field: 'reason', allowed: MCP_REASONS },
+    });
+  }
+  if (reason !== undefined && !MCP_REASONS.includes(reason)) {
+    throw new MarketError(`reason 只允许 ${MCP_REASONS.join('|')}`, {
+      code: 'capability_reason_required', httpStatus: 400, details: { field: 'reason', reason },
+    });
+  }
+  const timeoutRaw = pick('timeout_ms');
+  let timeoutMs = MCP_LIMITS.defaultTimeoutMs;
+  if (timeoutRaw !== undefined && timeoutRaw !== null) {
+    if (!Number.isInteger(timeoutRaw) || timeoutRaw < 1000 || timeoutRaw > MCP_LIMITS.maxTimeoutMs) {
+      throw bad(`timeout_ms 必须是 1000..${MCP_LIMITS.maxTimeoutMs} 的整数`, { field: 'timeout_ms', actual: timeoutRaw });
+    }
+    timeoutMs = timeoutRaw;
+  }
+
+  // transport 必须进 manifest（它是 runner 侧选传输的唯一依据；只放 meta 会让物化出来没有传输方式）
+  const manifest = { transport, exposure, lifecycle, resident: false, timeout_ms: timeoutMs };
+  if (reason !== undefined) manifest.reason = reason;
+  if (transport === 'stdio') {
+    const command = need('command', 'stdio 必须给 command');
+    if (command !== undefined) {
+      if (typeof command !== 'string' || /\s/.test(command.trim())) {
+        throw bad('command 必须是**一个**可执行文件（不含空格；参数放 args）', { field: 'command', command });
+      }
+      manifest.command = command.trim();
+    }
+    const args = pick('args');
+    if (args !== undefined) {
+      if (!Array.isArray(args) || args.length > MCP_LIMITS.maxArgs || args.some((a) => typeof a !== 'string' || a.length > 500)) {
+        throw bad(`args 必须是最多 ${MCP_LIMITS.maxArgs} 条、每条 ≤500 字符的字符串数组`, { field: 'args' });
+      }
+      manifest.args = args;
+    }
+    if (pick('url') !== undefined) throw bad('stdio 条目不许给 url', { field: 'url' });
+  } else if (transport === 'http') {
+    const url = need('url', 'http 必须给 url');
+    if (url !== undefined) {
+      let u;
+      try { u = new URL(url); } catch { throw bad('url 不是合法 URL', { field: 'url', url }); }
+      if (!['http:', 'https:'].includes(u.protocol)) {
+        throw bad('url 只允许 http / https（file:/gopher:/data: 一律拒）', { field: 'url', protocol: u.protocol });
+      }
+      manifest.url = u.toString();
+    }
+    if (pick('command') !== undefined) throw bad('http 条目不许给 command', { field: 'command' });
+  }
+  const slots = validateSlots(pick('slots'), { kind: 'mcp', transport });
+  return { meta: { kind: 'mcp', transport }, manifest, slots };
+}
+
+/** 用给定 slots 覆盖条目的槽位声明（发布/编辑时用；同一事务内调用）。 */
+export async function replaceParams(client, { itemId, slots }) {
+  await client.query('DELETE FROM capability_params WHERE item_id = $1', [itemId]);
+  for (const s of slots ?? []) {
+    await client.query(
+      `INSERT INTO capability_params (item_id, name, kind, inject, required, description)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [itemId, s.name, s.kind, s.inject, s.required, s.description]);
+  }
+}
+
+/** §8.1 管理面「凭据」区：只回元数据，**永不含值**（连密文都不出库）。 */
+export async function listSlots({ pool, itemId }) {
+  const r = await pool.query(
+    `SELECT p.name, p.kind, p.inject, p.required, p.description,
+            v.scope, v.fde_id, v.updated_at, v.updated_by,
+            (v.id IS NOT NULL) AS has_value
+       FROM capability_params p
+       LEFT JOIN capability_param_values v
+         ON v.item_id = p.item_id AND v.name = p.name AND v.scope = 'global'
+      WHERE p.item_id = $1
+      ORDER BY p.name`, [itemId]);
+  const fdeRows = (await pool.query(
+    `SELECT name, fde_id, updated_at FROM capability_param_values WHERE item_id = $1 AND scope = 'fde'`,
+    [itemId])).rows;
+  const fdeMap = new Map(fdeRows.map((r2) => [`${r2.name}:${r2.fde_id}`, r2]));
+  return r.rows.map((row) => ({
+    name: row.name,
+    kind: row.kind,
+    inject: row.inject,
+    required: row.required === true,
+    description: row.description ?? '',
+    has_value: row.has_value === true,
+    updated_at: row.has_value ? row.updated_at : null,
+    updated_by: row.has_value ? (row.updated_by ?? null) : null,
+    fde_overrides: [...fdeMap.entries()]
+      .filter(([k]) => k.startsWith(`${row.name}:`))
+      .map(([, v]) => ({ fde_id: v.fde_id, updated_at: v.updated_at })),
+  }));
+}
+
+/**
+ * §7.2 `PUT /api/admin/market/items/:id/secrets`：写值（`null` = 删除该值）。
+ * 只写不读；值走 `encryptValue`（AAD 含 fde_id）。
+ */
+export async function setSlotValues({ pool, itemId, actorId = null, scope = 'global', fdeId = null, values = {}, key }) {
+  if (scope !== 'global' && scope !== 'fde') throw bad("scope 只允许 'global' | 'fde'", { field: 'scope', scope });
+  if (scope === 'fde' && (typeof fdeId !== 'string' || fdeId === '')) throw bad('scope=fde 时必须给 fde_id', { field: 'fde_id' });
+  if (values === null || typeof values !== 'object' || Array.isArray(values)) throw bad('values 必须是对象', { field: 'values' });
+  const declared = new Map((await pool.query(
+    'SELECT name, kind FROM capability_params WHERE item_id = $1', [itemId])).rows.map((r) => [r.name, r.kind]));
+  const writes = [];
+  for (const [name, raw] of Object.entries(values)) {
+    if (!declared.has(name)) {
+      throw new MarketError(`条目没有声明槽位 "${name}"`, {
+        code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'values', name, reason: 'undeclared' },
+      });
+    }
+    if (raw === null) { writes.push({ name, del: true }); continue; }
+    if (typeof raw !== 'string') {
+      throw new MarketError(`槽位 ${name} 的值必须是字符串或 null（null = 删除）`, {
+        code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'values', name },
+      });
+    }
+    writes.push({ name, blob: encryptValue({ itemId, name, scope, fdeId, plaintext: raw, key }) });
+  }
+  await withTransaction(pool, async (client) => {
+    for (const w of writes) {
+      if (w.del) {
+        await client.query(
+          `DELETE FROM capability_param_values WHERE item_id = $1 AND name = $2 AND scope = $3
+             AND ${scope === 'fde' ? 'fde_id = $4' : 'fde_id IS NULL'}`,
+          scope === 'fde' ? [itemId, w.name, scope, fdeId] : [itemId, w.name, scope]);
+      } else {
+        await client.query(
+          `INSERT INTO capability_param_values (item_id, name, scope, fde_id, value_encrypted, updated_by)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT ${scope === 'fde'
+            ? '(item_id, name, fde_id) WHERE scope = \'fde\''
+            : '(item_id, name) WHERE scope = \'global\''}
+           DO UPDATE SET value_encrypted = EXCLUDED.value_encrypted, updated_by = EXCLUDED.updated_by, updated_at = now()`,
+          [itemId, w.name, scope, scope === 'fde' ? fdeId : null, w.blob, actorId]);
+      }
+    }
+  });
+  return { changed: writes.length, scope, fde_id: scope === 'fde' ? fdeId : null };
+}
+
+/**
+ * §5.1 物化读面：一个 FDE 的 MCP server 清单（**只取 published && enabled && 非 hidden**）。
+ * 返回的形状就是 `renderMcpJson` 的输入（槽位只带声明，**不带值**）。
+ */
+export async function listMcpServersForFde(pool, fdeId) {
+  const r = await pool.query(
+    `SELECT i.slug, i.name, i.summary, i.manifest
+       FROM fde_capability_installs inst
+       JOIN capability_items i ON i.id = inst.item_id
+      WHERE inst.fde_id = $1 AND inst.enabled AND i.state = 'published' AND i.kind = 'mcp'
+      ORDER BY i.slug`, [fdeId]);
+  const out = [];
+  for (const row of r.rows) {
+    const m = asJson(row.manifest, {});
+    if (m.exposure === 'hidden') continue;                 // §5.1：hidden 整条不物化
+    const slots = (await pool.query(
+      `SELECT name, inject, required FROM capability_params WHERE item_id = $1 ORDER BY name`,
+      [(await pool.query('SELECT id FROM capability_items WHERE slug = $1', [row.slug])).rows[0]?.id])).rows;
+    out.push({
+      name: row.slug,
+      description: row.summary ?? '',
+      transport: m.transport,
+      command: m.command ?? null,
+      args: Array.isArray(m.args) ? m.args : [],
+      url: m.url ?? null,
+      exposure: m.exposure ?? 'deferred',
+      lifecycle: m.lifecycle ?? 'run',
+      timeout_ms: m.timeout_ms ?? MCP_LIMITS.defaultTimeoutMs,
+      slots: slots.map((s) => ({ name: s.name, inject: s.inject, required: s.required === true })),
+      tools: Array.isArray(m.tools_cache) ? m.tools_cache : [],
+    });
+  }
+  return out;
+}
+
+/**
+ * §6.1 内部通道的读面：给 agentd 的「已解析」清单（**含明文值**）。
+ * 只给 `published && enabled && 非 hidden`；缺必填槽 ⇒ 进 `missing` 且**不进 servers**（fail-closed）。
+ */
+export async function resolveMcpServersForFde({ pool, fde, key }) {
+  const servers = await listMcpServersForFde(pool, fde.id);
+  const ids = new Map((await pool.query(
+    `SELECT id, slug FROM capability_items WHERE slug = ANY($1::text[])`, [servers.map((s) => s.name)])).rows
+    .map((r) => [r.slug, r.id]));
+  const resolved = [];
+  const missing = [];
+  for (const s of servers) {
+    const itemId = ids.get(s.name);
+    const { values, missing: miss } = await resolveSlots({ pool, itemId, fdeId: fde.id, key });
+    if (miss.length > 0) { missing.push({ name: s.name, slots: miss }); continue; }
+    resolved.push({ ...s, values });
+  }
+  return { servers: resolved, missing };
+}
+
+/** 用户面 `secrets_ready`：按「必填槽是否有值」算（不解密，只看有没有行）。 */
+export async function mcpSecretsReadyMap(pool, fdeId, itemIds) {
+  if (!Array.isArray(itemIds) || itemIds.length === 0) return new Map();
+  const r = await pool.query(
+    `SELECT p.item_id, p.name,
+            EXISTS (SELECT 1 FROM capability_param_values v
+                     WHERE v.item_id = p.item_id AND v.name = p.name
+                       AND (v.scope = 'global' OR v.fde_id = $1)) AS has_value
+       FROM capability_params p
+      WHERE p.item_id = ANY($2::uuid[]) AND p.required`, [fdeId, itemIds]);
+  const bad = new Map();
+  for (const row of r.rows) {
+    if (row.has_value === true) continue;
+    const list = bad.get(row.item_id) ?? [];
+    list.push(row.name);
+    bad.set(row.item_id, list);
+  }
+  return bad;   // item_id → 缺的槽位名（空 = ready）
+}
+
+/** §6.6 元数据回填：runner 连上某个 server 后把 tools 报回来。 */
+export async function recordToolsCache({ pool, slug, tools }) {
+  if (!Array.isArray(tools) || tools.length > 200) throw bad('tools 必须是 ≤200 条的数组', { field: 'tools' });
+  const clean = tools
+    .filter((t) => t && typeof t.name === 'string' && t.name !== '')
+    .map((t) => ({
+      name: t.name.slice(0, 200),
+      description: typeof t.description === 'string' ? t.description.slice(0, 500) : '',
+      ...(t.inputSchema && typeof t.inputSchema === 'object' ? { inputSchema: t.inputSchema } : {}),
+    }));
+  const r = await pool.query(
+    `UPDATE capability_items
+        SET manifest = jsonb_set(jsonb_set(manifest, '{tools_cache}', $2::jsonb), '{tools_cache_at}', to_jsonb(now()::text)),
+            updated_at = now()
+      WHERE slug = $1 AND kind = 'mcp'
+      RETURNING id, slug`, [slug, JSON.stringify(clean)]);
+  if (!r.rows[0]) throw notFound(slug);
+  return { slug, tools: clean.length };
+}
+
+/**
+ * §4 MCP 条目的发布（`publishItem` 的 mcp 分支）：不写 `capability_files`，只写条目 + 槽位声明。
+ * 为什么单独一个函数而不是塞进 `publishItem`：两条路径的**字段面完全不同**（一个吃 bundle，
+ * 一个吃 transport/command/url/slots），塞在一起会让「bundle 必填」这类判据变成条件分支迷宫。
+ */
+async function publishMcpItem({ pool, actorId, meta, fields }) {
+  const { manifest: mcpManifest, slots } = validateMcpFields(fields, { requireAll: true });
+  const manifest = { ...mcpManifest };
+  const state = meta.state ?? 'draft';
+  return withTransaction(pool, async (client) => {
+    // 参数顺序与 skill 那条**逐字相同**（kind 也走 $1）：测试里的 FakePool 是按位置认列的，
+    // 两条 INSERT 用不同布局会让 fake 分叉成两套（fake 越像真 SQL，判据才越可信）。
+    const r = await client.query(
+      `INSERT INTO capability_items
+         (kind, slug, name, summary, when_to_use, description_md, version, author, tags, license,
+          state, manifest, security_score, security_warnings, created_by, published_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb,$15,
+               CASE WHEN $11 = 'published' THEN now() ELSE NULL END)
+       RETURNING ${ITEM_COLUMNS}`,
+      ['mcp', meta.slug, meta.name, meta.summary, meta.when_to_use, meta.description_md ?? '', meta.version,
+        meta.author ?? null, meta.tags ?? [], meta.license ?? null, state, JSON.stringify(manifest),
+        100, '[]', actorId]);
+    const item = r.rows[0];
+    await replaceParams(client, { itemId: item.id, slots });
+    return toAdminItemDto(item);
+  });
 }
