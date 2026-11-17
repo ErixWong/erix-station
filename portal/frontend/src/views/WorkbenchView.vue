@@ -67,12 +67,22 @@ const who = computed(() => {
 // ---- issue #528：宏用户面的接线 ----
 const macro = useMacroStore();
 const macroDrawerOpen = ref(false);
+/** 抽屉的会话指向：`string` ⇒ 会话级；`null` ⇒ 用户级全局（issue #614）。 */
+const macroDrawerSessionId = ref<string | null>(null);
 
-/** chip 的唯一动作：开流水抽屉（`07` §3.1——不在这里开模板下拉）。 */
-function openMacroDrawer(): void {
+/** 会话头 chip：开该会话的流水抽屉（`07` §3.1——不在这里开模板下拉）。 */
+function openSessionMacroDrawer(): void {
   if (!store.sessionId) return;
+  macroDrawerSessionId.value = store.sessionId;
   macroDrawerOpen.value = true;
   void macro.openDrawer(store.sessionId);
+}
+
+/** 顶栏用户级 chip：开用户级全局流水抽屉（跨会话；流水走 `/api/macro-runs`，卡片显示用户级模板）。 */
+function openUserMacroDrawer(): void {
+  macroDrawerSessionId.value = null;
+  macroDrawerOpen.value = true;
+  void macro.openDrawer(null);
 }
 
 function closeMacroDrawer(): void {
@@ -80,9 +90,10 @@ function closeMacroDrawer(): void {
   macro.closeDrawer();
 }
 
-/** 切会话 ⇒ 抽屉与面板数据一起收（不要把上一个会话的订阅/流水留在屏上）。 */
+/** 切会话 ⇒ 会话抽屉与面板数据一起收（不要把上一个会话的订阅/流水留在屏上）。
+ *  用户级抽屉不绑会话（issue #614），切会话不把它关掉。 */
 watch(() => store.sessionId, () => {
-  if (macroDrawerOpen.value) closeMacroDrawer();
+  if (macroDrawerOpen.value && macroDrawerSessionId.value !== null) closeMacroDrawer();
   macro.reset();
 });
 
@@ -306,7 +317,7 @@ function jumpToLatest() {
         v-if="store.sessionId"
         scope="session"
         :session-id="store.sessionId"
-        @open-runs="openMacroDrawer"
+        @open-runs="openSessionMacroDrawer"
       />
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
       <!-- issue #595 M1：能力市场入口（`#/market`）。用 `<a>` 而不是 `<button>`：既有顶栏单测拿的是
@@ -323,7 +334,8 @@ function jumpToLatest() {
         class="text-sm underline"
       >{{ t('common.adminConsole') }}</a>
       <!-- issue #528：顶栏那份是**用户级**模板（只读，管理员代配）+ 通知铃铛（未读角标）。 -->
-      <MacroMenu scope="user" />
+      <!-- issue #614：chip 点击必须打开**用户级**流水抽屉（以前没人接 emit ⇒ 静默丢弃）。 -->
+      <MacroMenu scope="user" @open-runs="openUserMacroDrawer" />
       <MacroBell />
       <LocaleSwitch />
       <button
@@ -403,10 +415,11 @@ function jumpToLatest() {
       </section>
     </main>
 
-    <!-- issue #528：覆盖式右抽屉（不是并排）。挂在根层：遮罩要盖整个视口，包含侧栏与顶栏。 -->
+    <!-- issue #528：覆盖式右抽屉（不是并排）。挂在根层：遮罩要盖整个视口，包含侧栏与顶栏。
+         issue #614：用户级抽屉 `session-id=null`，不能再用 `store.sessionId` 门掉（无会话也要能开）。 -->
     <MacroDrawer
-      v-if="macroDrawerOpen && store.sessionId"
-      :session-id="store.sessionId!"
+      v-if="macroDrawerOpen"
+      :session-id="macroDrawerSessionId"
       @close="closeMacroDrawer"
     />
   </div>
