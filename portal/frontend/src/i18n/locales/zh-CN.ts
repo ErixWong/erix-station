@@ -1030,7 +1030,7 @@ export const zhCN = {
       never: '—',
       updatedAt: '最后保存',
       updatedBy: '操作人',
-      updatedAtNever: '从未保存过（表里还没有那一行）',
+      updatedAtNever: '从未保存过（还没有人在管理台存过）',
       updatedAtUnparsable: '时间无法解析：{value}',
       reasonNoRow: '管理台从没存过任何一条 ⇒ 现在发出去的是内置提示词；在这里存一份就会覆盖它。',
       reasonReadFailed: '读不到 platform_prompts（表缺失或数据库抖动）⇒ 已回落内置提示词；物化与改名照常，不会被 500 弄挂。',

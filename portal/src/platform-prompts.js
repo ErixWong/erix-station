@@ -386,7 +386,13 @@ export function toPlatformPromptsDto({ resolved, row = null }) {
       bytes: utf8Bytes(resolved.titlePrompt),
     },
     readonly: READONLY_PROMPT_KEYS.map((key) => ({ key })),
-    updatedAt: isoOrNull(row?.updated_at ?? null),
+    // ⚙ 「从未保存过」的定义是**没有写者**（`updated_by IS NULL`），不是「表里没有那一行」：
+    //   0040 会 `INSERT … ON CONFLICT DO NOTHING` 种下 `id = 1`，而那一行的 `updated_at` 吃的是
+    //   `timestamptz NOT NULL DEFAULT now()` ⇒ 全新库上它**永远非 null**（那个值是「迁移跑过的
+    //   那一刻」）。只看 `updated_at` 就等于让界面宣称一个管理员从没做过的「最后保存」（评审 R3）。
+    //   不在迁移里动 `updated_at`（那会牵动已部署库），只在 DTO 这一侧把两个字段归成同一个口径。
+    //   判据 `P14`：有行但 `updated_by` 为 NULL ⇒ 两个字段都 `null`；`updated_by` 非空 ⇒ 都出真值。
+    updatedAt: isoOrNull(row?.updated_by == null ? null : row.updated_at ?? null),
     updatedBy: row?.updated_by ?? null,
     reason: resolved.reason ?? null,
     __budget: budget, // 不参与响应（`buildDtoForResponse` 会剔掉）；就是写侧闸要送进 SQL 的那份算术
