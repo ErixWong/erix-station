@@ -718,8 +718,8 @@ export const en = {
     reload: 'Reload',
     loading: 'Loading the market catalogue…',
     empty: 'No published capability packages yet.',
-    intro: 'Published skill packages. Install one into your FDE workspace; only enabled ones' +
-      ' reach the model tool surface.',
+    intro: 'Published skill packages and MCP servers. Install one into your FDE workspace; ' +
+      'only enabled ones reach the model tool surface.',
     budgetHint: 'Every enabled skill ships all of its tools into every single turn:' +
       ' one FDE can enable at most {max} at a time.',
     footnote: 'Uninstalling or disabling never re-downloads (disabling only flips a flag);' +
@@ -728,8 +728,6 @@ export const en = {
     tools: 'tools: {count}',
     securityScore: 'security score: {score}',
     scanHints: '{count} static scan hints',
-    kindMcp: 'MCP entry',
-    installBlockedMcp: 'P0 does not consume MCP, so this cannot be installed',
     // #608 §8.3: kind / admission reason / MCP-specific display copy (shared by user side + admin).
     kind: {
       skill: 'Skill package',
@@ -922,7 +920,7 @@ export const en = {
           command: 'command (stdio executable)',
           commandHint: 'Program name only (e.g. npx); every argument goes into the box below (the server rejects a command containing spaces).',
           args: 'args (one per line)',
-          argsHint: 'e.g. -y and @modelcontextprotocol/server-github on separate lines (spaces inside a line are kept).',
+          argsHint: "e.g. -y and {'@'}modelcontextprotocol/server-github on separate lines (spaces inside a line are kept).",
           url: 'url (http endpoint)',
           urlHint: 'e.g. https://srch.erix.vip/mcp; the scheme and reachability are the server\u2019s call (portal never connects itself).',
           exposure: 'exposure',
