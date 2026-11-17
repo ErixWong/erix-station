@@ -21,9 +21,12 @@
 //     `structuralMask()` **没有那条退路** ⇒ 其后所有真代码被一路抹到文件尾（现网实测同族：
 //     `runner/lib/final-text-toolcall.js:194` 的 `` /```[\s\S]*?```/g `` 把 `:195` 的 `}` 都抹平了）。
 //     现在两把尺共用 `regexLiteralSpan()`：`/` 的身份由**前一个有效 token** 定（运算符 / `,` / `;` / `=` /
-//     `=>` / `return` 等关键字 ⇒ 正则；标识符、数字、`)`、`]`、串尾 ⇒ 除法），且必须**在同一行内**找到闭合
+//     `=>` / `return` 等关键字 ⇒ 正则；标识符、数字、`]`、串尾 ⇒ 除法），且必须**在同一行内**找到闭合
 //     的 `/`，否则退回除法继续按注释判 ⇒ 认不准时的方向是保守的（宁可少认一个正则，也不许把真代码掩掉）。
-//     已知边界：`)` 之后一律按除法 ⇒ `if (x) /re/.test(y)` 这种「`)` 后紧跟正则」仍需写 `\/`；
+//     `)` 之后是正则还是除法**静态上判不出**（`f(1) / 2` 是除法、`if (x) /re/` 是正则），这里靠**括号配对
+//     的栈**回查那个 `(` 前面是不是 `if`/`for`/`while`/`switch`/`with`/`catch`：控制流头部 ⇒ 正则，
+//     调用/分组 ⇒ 除法（#587 族 A②：`if (a) /[/*]/.test(b)` 曾经把后面的真读取整段吞掉，静默）。
+//     已知边界：`]` 之后与串尾之后一律按除法（`arr[0] / 2` 常见，而 `]/re/` 几乎不存）；
 //     正则里写 `//` 必须 `\/\/`（同旧口径）。
 //     `stripComments()` 里正则**原样保留**（那是代码），`structuralMask()` 里正则**正文抹成空格**
 //     （定界符与 flags 留着）⇒ 正则里的括号/花括号/引号不再骗过括号配平，而「串里提到的形状不算读取」
@@ -52,12 +55,22 @@ const REGEX_KEYWORDS = new Set([
   'case', 'do', 'else', 'yield', 'await', 'default',
 ]);
 
-/** 前一个有效 token 处「这里可以是正则」吗？`prevCh === ''` = 文本起点（语句开头 ⇒ 可以是正则）。 */
-function canStartRegex(prevCh, prevWord) {
+/**
+ * 这些词之后的 `(...)` 是**控制流头部**：它们闭合后紧跟的 `/` 只能是正则起点（`if (x) /[*?]/u.test(y)`）。
+ * 而调用后的 `)` 紧跟 `/` 是除法（`const h = f(1) / 2`）。两者都是 `)` 结尾，所以上一层要记「这个 `)` 属于哪一类」。
+ */
+const CONTROL_HEAD_WORDS = new Set(['if', 'for', 'while', 'switch', 'with', 'catch']);
+
+/**
+ * 前一个有效 token 处「这里可以是正则」吗？`prevCh === ''` = 文本起点（语句开头 ⇒ 可以是正则）。
+ * `prevParenControl` = 刚闭合的那个 `(...)` 是不是控制流头部（`if (x) /re/` vs `f(x) / 2`）。
+ */
+function canStartRegex(prevCh, prevWord, prevParenControl = false) {
   if (prevCh === '') return true;
   if (/[\w$]/.test(prevCh)) return REGEX_KEYWORDS.has(prevWord);   // 标识符/数字之后 = 除法
-  // `)` `]` 与串尾之后按除法（保守那条）；其余标点（`,` `=` `(` `[` `;` `{` `}` `=>` `:` `?` `!` …）之后 = 正则
-  return prevCh !== ')' && prevCh !== ']' && prevCh !== "'" && prevCh !== '"' && prevCh !== '`';
+  if (prevCh === ')') return prevParenControl;                     // 控制流头之后 = 正则；调用/分组之后 = 除法
+  // `]` 与串尾之后按除法（保守那条）；其余标点（`,` `=` `(` `[` `;` `{` `}` `=>` `:` `?` `!` …）之后 = 正则
+  return prevCh !== ']' && prevCh !== "'" && prevCh !== '"' && prevCh !== '`';
 }
 
 /**
@@ -92,17 +105,22 @@ function regexLiteralSpan(text, i) {
 function makeTokenTracker() {
   const state = {
     prevCh: '', prevWord: '',
+    parenStack: [],          // 每层 `(` ：前面是不是控制流关键字
+    prevParenControl: false, // 最近闭合的那个 `)` 属于控制流头部还是调用/分组
     /** 追加一段代码文本，顺带更新「前一个 token」。 */
     note(s) {
       for (const c of s) {
         if (c === '\n' || c === ' ' || c === '\t' || c === '\r') continue;
+        // `(` 入栈时要先看**之前**那个词（处理完 `(` 本身 prevWord 就被清掉了）
+        if (c === '(') this.parenStack.push(CONTROL_HEAD_WORDS.has(this.prevWord));
+        else if (c === ')') this.prevParenControl = this.parenStack.pop() ?? false;
         this.prevWord = IDENT_CH.test(c) ? (IDENT_CH.test(this.prevCh) ? this.prevWord : '') + c : '';
         this.prevCh = c;
       }
       return s;
     },
     /** 一段**值**（正则字面量）刚刚结束：其后的 `/` 只能是除法 —— 显式钉成 `)`，不靠「最后一个字符碰巧是什么」 */
-    endValue() { this.prevCh = ')'; this.prevWord = ''; },
+    endValue() { this.prevCh = ')'; this.prevWord = ''; this.prevParenControl = false; },
   };
   return state;
 }
@@ -138,7 +156,7 @@ export function stripComments(text) {
       i += 1;
       continue;
     }
-    if (c === '/' && canStartRegex(tk.prevCh, tk.prevWord)) {   // 正则字面量：整段原样保留
+    if (c === '/' && canStartRegex(tk.prevCh, tk.prevWord, tk.prevParenControl)) {   // 正则字面量：整段原样保留
       const end = regexLiteralSpan(text, i);
       if (end > 0) { out.push(text.slice(i, end)); tk.endValue(); i = end; continue; }
     }
@@ -201,7 +219,7 @@ export function structuralMask(text) {
       i += 1;
       continue;
     }
-    if (c === '/' && canStartRegex(tk.prevCh, tk.prevWord)) {   // 正则：定界符与 flags 留着，正文**等长**抹平
+    if (c === '/' && canStartRegex(tk.prevCh, tk.prevWord, tk.prevParenControl)) {   // 正则：定界符与 flags 留着，正文**等长**抹平
       const end = regexLiteralSpan(text, i);
       if (end > 0) {
         const lit = text.slice(i, end);
