@@ -1508,4 +1508,26 @@ test('活二⑰ 参数遮蔽表要收全**每一个**参数位：末位参数漏
     + '没被遮蔽的静态读一起吞掉（对照组 `CTRL_ENV` 必须照常在里面）');
 });
 
+test('活二⑱ 表达式体箭头的遮蔽区间只覆盖体本身：箭头**之后**的静态读必须照常解析（不许拉回外围块尾）', () => {
+  // `=>` 的表达式体没有 `{` 可配。旧口径保守取「最内层**外围块**的结尾」，宁宽不窄；代价是**假红**：
+  // `const g = (KEY) => env[KEY]; … process.env[KEY]` —— 箭头**之后**那次读的是外层常量，却被算进箭头
+  // 参数的遮蔽区间 ⇒ 静态读形被判成动态 ⇒ 掉进 `unsupported`：那个 key 从此在三腿判据里隐形（又是静默）。
+  // 所以区间必须算窄到**体本身**，三个层级各钉一条（模块顶层 / 类体 / 函数体），每条形如
+  // 「遮蔽一条 + 紧跟一条静态读」：区间拉回外围块尾 ⇒ 那条静态读从枚举里消失、unsupported 多出一条。
+  const src = [
+    "const AW_ENV = 'ERIX_A5_ARROW_AFTER_OK';",
+    'export const top = (AW_ENV) => process.env[AW_ENV];',        // 遮蔽在体内
+    'export const afterTop = process.env[AW_ENV];',                // 顶层：区间拉宽就认不出它
+    'export class K { fld = (AW_ENV) => process.env[AW_ENV]; after = process.env[AW_ENV]; }',   // 类体同一层
+    'export function wrap() { const f = (AW_ENV) => process.env[AW_ENV]; return process.env[AW_ENV]; }',  // 函数体
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('arrow-expression-body', src);
+  assert.deepEqual(keys, ['ERIX_A5_ARROW_AFTER_OK'],
+    `箭头之后的静态读没进枚举（实际 ${JSON.stringify(keys)}）：表达式体的遮蔽区间拉到了外围块尾，`
+    + '把后面那些**读外层常量**的静态读形也算成动态 ⇒ 静态 key 隐形，三腿判据从此不再看它');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), ['fx.js:2 process.env[AW_ENV]', 'fx.js:4 process.env[AW_ENV]', 'fx.js:5 process.env[AW_ENV]'],
+    `只有**体内**那三条该进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}` 
+    + '）：多出一条就是箭头后面那条静态读被误判了（区间过宽 = 假红，与幻影 key 相反的静默方向）');
+});
+
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
