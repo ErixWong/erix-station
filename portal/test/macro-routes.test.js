@@ -300,7 +300,7 @@ test('#614 userMacroRuns：响应不含 snapshot_id / worktree_path / verdict_ra
     // 认领时就给 snapshot_id / worktree_path 填真值 ⇒ 若实现不剥，键就会出现（反向自证打这里）
     const r = await claimMacroRun(pool, {
       assignmentId: a.id, anchor: 'e', criterion: 'terminal', bucket: 'b',
-      snapshotId: 'snap-xyz', worktreePath: '/tmp/wt-xyz',
+      snapshotId: randomUUID(), worktreePath: '/tmp/wt-xyz',
     });
     await pool.query('UPDATE macro_runs SET verdict_raw = $1 WHERE id = $2', ['RAW_ERR', r.id]);
 
