@@ -189,6 +189,22 @@ function matchBrackets(masked, from) {
   return null;
 }
 
+/**
+ * 同上，但**也认 `(`**（解构里的 `(…)` 当成分组用，见 `paramBindingsIn`）。
+ * 单独一个函数而不是放宽 `matchBrackets`：那边是数据表扫描，`const T = (x)` 那种根本不该当表。
+ */
+function matchGroup(masked, from) {
+  const open = masked[from];
+  const close = { '{': '}', '[': ']', '(': ')' }[open];
+  if (!close) return null;
+  let depth = 0;
+  for (let i = from; i < masked.length; i += 1) {
+    if (masked[i] === open) depth += 1;
+    else if (masked[i] === close) { depth -= 1; if (depth === 0) return i + 1; }
+  }
+  return null;
+}
+
 /** 这些词之后的 `(...)` 是**控制流头部**，不是参数表（`for (const [k, v] of [[…]])` 那一形最容易误判）。 */
 const CONTROL_WORDS = new Set([
   'if', 'for', 'while', 'switch', 'catch', 'with', 'do', 'else', 'return', 'typeof',
@@ -246,6 +262,62 @@ function nextNonSpace(text, from) {
   return m ? from + m.index : null;
 }
 
+/** `[from, to)` 里第一个**非空白**下标（**不越过 `to`**：解构切出来的片段是空的就要如实返回 `null`）。 */
+function firstNonSpaceIn(text, from, to) {
+  const m = /\S/.exec(text.slice(from, to));
+  return m ? from + m.index : null;
+}
+
+/** 在 `[from, to)` 里找第一个**括号深度 0** 且满足 `want` 的字符；没有 ⇒ `-1`。 */
+function firstTopChar(masked, from, to, want) {
+  let depth = 0;
+  for (let i = from; i < to; i += 1) {
+    const c = masked[i];
+    if (c === '(' || c === '[' || c === '{') depth += 1;
+    else if (c === ')' || c === ']' || c === '}') depth -= 1;
+    else if (depth === 0 && want(c, i)) return i;
+  }
+  return -1;
+}
+
+/**
+ * 绑定模式片段里第一个**顶层默认值分界 `=`**；没有 ⇒ `-1`。
+ * 括号内的不算（`{ a: [1, 2] }` 里没默认值）；`=>`（默认值是个箭头）、`==` / `!=` / `<=` / `>=`
+ * 那些比较号也不算（认错了会把半个表达式当成绑定名）。
+ */
+function firstDefaultEq(masked, from, to) {
+  return firstTopChar(masked, from, to, (c, i) => c === '='
+    && !'>='.includes(masked[i + 1] ?? '') && !'=!<>'.includes(masked[i - 1] ?? ''));
+}
+
+/** 对象成员「`键 : 绑定目标`」的分界（同样只认深度 0；`{ 'a:b': x }` 那个冒号在串正文里，已被抹平）。 */
+function firstMemberColon(masked, from, to) {
+  return firstTopChar(masked, from, to, (c) => c === ':');
+}
+
+/**
+ * 一段**认不出**的绑定片段里出现过哪些名字 —— fail loudly 的记账面（#587 族 A 三轮①）。
+ * 认不出的形状不能静默返回「没绑定」：那等于让外层同名常量继续生效 = 幻影 key。这里把片段里
+ * 像名字的都算作「被绑定但解析不出值」，宁可是**假红**（读形进 `unsupported`）也不要静默放行。
+ * 排掉两类明显不是绑定的位置：`.` / `?.` 之后的属性名，以及紧跟 `:` 的**键名**（`{ k: x }` 里的 `k`）。
+ */
+function opaqueBindingNames(masked, from, to) {
+  const names = new Set();
+  const slice = masked.slice(from, to);
+  for (const m of slice.matchAll(new RegExp(IDENT_RE, 'g'))) {
+    const i = m.index;
+    const prev = slice[i - 1];
+    if (prev === '.' || prev === '?') continue;                       // `b.c` / `b?.c` 的 `c`
+    const after = slice.slice(i + m[0].length);
+    if (/^\s*:/.test(after)) continue;                                // `{ k: x }` 的键名 `k`
+    names.add(m[0]);
+  }
+  return [...names];
+}
+
+/** 能**结束**一个表达式的字符（ASI 判定用：`x\n const y` 才断，`(\n x` / `x +\n y` 那种没成形的不断）。 */
+const EXPRESSION_ENDS_RE = /[\w$)\]}'"`]/;
+
 /**
  * 换行之后**只能另起一句**的开头词（ASI 边界）：这些词不可能接着上一个表达式继续。
  * 反过来那些**能**接着表达式继续的词（`in` / `of` / `instanceof` / `new` 之外…）一律不列：
@@ -253,18 +325,10 @@ function nextNonSpace(text, from) {
  */
 const STATEMENT_HEAD_RE = /^(?:const|let|var|function|class|export|import|return|if|for|while|do|switch|try|catch|finally|else|throw|break|continue|debugger|await|yield|typeof|void|delete)\b/;
 
-/** 能**结束**一个表达式的字符（ASI 判定用：`x\n const y` 才断，`(\n x` 那种没成形的不断）。 */
-const EXPRESSION_ENDS_RE = /[\w$)\]}'"`]/;
 
 /**
  * **无花括号箭头**（表达式体）的区间结尾，从 `=>` 之后第一个下标起算：扫到第一个「深度 0 的结束符」
  * （`;` `,` `)` `]` `}`）或 ASI 语句边界为止。
- *
- * 旧口径取「最内层**外围块**的结尾」（`{` 都没写，没配对 ⇒ 保守拉宽），后果是实测的**假红**：
- * `const g = (KEY) => env[KEY]; … process.env[KEY]` —— 箭头**之后**那次读的是外层常量，却被算进
- * 箭头参数的遮蔽区间 ⇒ 静态读形被判成动态 ⇒ 进 `unsupported`（三腿判据看不见这个 key，另一种静默）。
- * 拉窄的边界必须**仍覆盖整个表达式体**：体内不可能出现深度 0 的 `;` `,` `)` `]` `}`（那些符号一出现
- * 就说明表达式已经结束），所以这一趟扫描只会停在真正的体尾。
  */
 function expressionBodyEnd(masked, from) {
   let depth = 0;
@@ -283,46 +347,55 @@ function expressionBodyEnd(masked, from) {
   return masked.length;
 }
 
+
 /** 无括号的单参数箭头 `KEY => …`：`KEY` 之前不许是标识符字符或闭合括号（挡掉 `(KEY) =>` 那种已有括号的形）。 */
 const BARE_ARROW_PARAM_RE = new RegExp(`(?<![\\w$)\\]}])(${IDENT_RE})\\s*=>`, 'g');
 
 /**
- * 一段**参数位**（或解构成员位）里有哪几个绑定：`[{ name, at, def|null }]`。
- * 认：`a` / `a = X` / `...rest` / `{ k, k2 = Y, old: alias }` / `[a, b]`（嵌套解构递归）。
- * 只认**绑定位**，操作数不当绑定（`if (foo === bar)` 里那个 `foo` 不会进来，控制流头部也已被调用方挡掉）。
+ * 一段**参数位 / 解构成员位**里有哪几个绑定：`{ bindings: [{ name, at, def|null }], unparsed: [{ at, to }] }`。
+ * 逐层递归，要覆盖合法 JS 的全部绑定形状（#587 族 A 三轮①：旧口径只解一层，`{ a: { b: KEY } }` /
+ * `{ a: [KEY] }` 这类「冒号右边还是解构」的成员**整个漏收** ⇒ `KEY` 不进遮蔽表 ⇒ 外层同名常量把
+ * 动态读错记成静态 key、`unsupported` 为空 = 假绿）：
+ *   · 简单名 `a`、带默认值 `a = 'ERIX_X'`、rest `...rest`（rest 的目标继续递归：`...[b, c]`）
+ *   · 数组解构 `[a, , b]`（洞不是绑定）、嵌套 `[{ x: Y }]`、`[a, ...[b, c]]`
+ *   · 对象解构 `{ k }` / `{ k = X }` / `{ old: alias = X }` / `{ 'a b': alias }` / `{ [k]: alias }`
+ *     ⇒ 冒号**右边**才是绑定；右边还是解构（`{ a: { b: X } }`）就继续往里钻
+ *   · 模式自带的默认值 `{ a: b } = {}`：那个默认值属于**整个模式**而不是 `b` 的绑定值
+ *     ⇒ 往里钻时不带上它（带上去就把「整个对象」当成了 `b` 的值，解析方向不对）
+ * **认不出的形状一律进 `unparsed`**（调用方据此 fail loudly），不许静默返回「这里没绑定」：
+ * 静默 = 外层同名常量继续生效 = 幻影 key（与上面那个假绿同形）。
+ * `memberIsObject` 只在**对象解构的成员位**为真（那里才有 `键:` 前缀可剥）；数组成员与参数位本身不是。
  */
-function paramBindingsIn(masked, code, from, to) {
-  let s = from + (masked.slice(from, to).length - masked.slice(from, to).trimStart().length);
-  while (masked.startsWith('...', s)) s += 3;
-  const text = masked.slice(s, to);
-  const simple = new RegExp(`^\\s*(${IDENT_RE})\\s*(?:=([\\s\\S]*))?$`).exec(text);
-  if (simple) {
-    const eq = text.indexOf('=');
-    return [{ name: simple[1], at: s + text.indexOf(simple[1]), def: eq < 0 ? null : code.slice(s + eq + 1, to).trim() }];
-  }
-  const first = text.trimStart()[0];
-  if (first !== '{' && first !== '[' && first !== '(') return [];
-  const bo = s + (text.length - text.trimStart().length);
-  const bc = matchBrackets(masked, bo);
-  if (bc == null) return [];
-  const out = [];
-  for (const [a, b] of splitTop(masked, bo + 1, bc - 1)) {
-    // `{ oldName: alias = DEFAULT }` ⇒ 绑定的是**冒号右边**那个名字，不是 `oldName`；默认值也要**带走**
-    // （`{ k: NAME = 'ERIX_X' }` 解析得出名字，旧代码在这里写死 `def: null` ⇒ 可解析的被丢 `unsupported`）
-    const member = masked.slice(a, b);
-    const aliased = new RegExp(`^\\s*${IDENT_RE}\\s*:\\s*(${IDENT_RE})\\s*(?:=([\\s\\S]*))?$`).exec(member);
-    if (aliased) {
-      const eq = member.indexOf('=', member.indexOf(aliased[1]) + aliased[1].length);
-      out.push({
-        name: aliased[1],
-        at: a + member.indexOf(aliased[1]),
-        def: eq < 0 ? null : code.slice(a + eq + 1, b).trim(),
-      });
-      continue;
+function paramBindingsIn(masked, code, from, to, memberIsObject = false) {
+  const bindings = [];
+  const unparsed = [];
+  const walk = (a, b, isObjectMember) => {
+    const s = firstNonSpaceIn(masked, a, b);
+    if (s == null) return;                                  // 空片段（数组的洞 `,`）⇒ 没有绑定
+    if (masked.startsWith('...', s)) { walk(s + 3, b, false); return; }   // rest：剩下的就是绑定目标
+    const eq = firstDefaultEq(masked, s, b);
+    const patEnd = eq < 0 ? b : eq;                         // 默认值分界**之前**才是模式
+    const def = eq < 0 ? null : code.slice(eq + 1, b).trim();
+    const p = firstNonSpaceIn(masked, s, patEnd);
+    const open = p == null ? '' : masked[p];
+    if (open === '{' || open === '[' || open === '(') {
+      const bc = matchGroup(masked, p);
+      // 括号不配对，或那个闭括号已经**越过**默认值分界 ⇒ 这段形状认不出，不许猜
+      if (bc == null || bc - 1 > patEnd) { unparsed.push({ at: s, to: b }); return; }
+      for (const [ma, mb] of splitTop(masked, p + 1, bc - 1)) walk(ma, mb, open === '{');
+      return;
     }
-    out.push(...paramBindingsIn(masked, code, a, b));      // 嵌套解构 / `...rest` / 带默认值的成员
-  }
-  return out;
+    if (isObjectMember) {
+      // 只在模式部分里找冒号：`{ k = c ? 'A' : 'B' }` 那个三元冒号坐在默认值里，不算成员分隔
+      const colon = firstMemberColon(masked, s, patEnd);
+      if (colon >= 0) { walk(colon + 1, b, false); return; }   // `{ k: 目标 = 默认值 }` ⇒ 目标在冒号右边
+    }
+    const name = new RegExp(`^(${IDENT_RE})$`).exec(masked.slice(s, patEnd).trim());
+    if (name) { bindings.push({ name: name[1], at: s, def }); return; }
+    unparsed.push({ at: s, to: b });
+  };
+  walk(from, to, memberIsObject);
+  return { bindings, unparsed };
 }
 
 /**
@@ -377,8 +450,17 @@ function collectParamBindings(code, masked, pairs, scopes, litsOf) {
   for (const site of sites) {
     if (site.to < site.from) continue;
     for (const [a, b] of splitTop(masked, site.from, site.to)) {
-      for (const p of paramBindingsIn(masked, code, a, b)) {
+      const { bindings, unparsed } = paramBindingsIn(masked, code, a, b);
+      for (const p of bindings) {
         out.push({ name: p.name, start: p.at, end: Math.max(site.end, p.at + p.name.length), lits: litsOf(p.def) });
+      }
+      // **解析不出的嵌套形状 ⇒ fail loudly**（#587 族 A 三轮①）：把那个片段里出现过的名字全部按
+      // 「被遮蔽但解析不出」记账 ⇒ 它在函数体内任何读形都进 `unsupported`（宁可假红）；反过来若静默
+      // 当「这里没绑定」，外层同名常量会被错记成静态 key（假绿），闸门那一层全绿。
+      for (const u of unparsed) {
+        for (const name of opaqueBindingNames(masked, u.at, u.to)) {
+          out.push({ name, start: u.at, end: Math.max(site.end, u.to), lits: null, opaque: true });
+        }
       }
     }
   }
