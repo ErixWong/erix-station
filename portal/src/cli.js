@@ -26,6 +26,8 @@ import {
   startProvisionerLoop,
 } from './provisioner.js';
 import { migrateLegacyCredential } from './git-credential.js';
+// issue #643 B：本地构建自曝（`revision=unknown` ⇒ 启动日志里一条 `local-build`）。
+import { warnIfLocalBuild } from './version-info.js';
 
 function usage() {
   // eslint-disable-next-line no-console
@@ -48,6 +50,13 @@ const SHUTDOWN_TOTAL_MS = 8000;
 
 async function serve() {
   const config = loadConfig();
+  // issue #643 B：**本地 scratch 构建自曝**，位置在 `loadConfig()` 之后、`migrate()` 之前。
+  // 为什么要在 migrate 之前：读版本不碰 DB（它只读镜像里的 `/app/build-info.json`），而 `migrate()`
+  // 失败会直接 `process.exit(1)`、DB 起不来时还要看 compose 的 `service_healthy` 门槛——自曝挂在它后面
+  // 就等于「只有 DB 好了才有机会说自己是本地构建」，而一个 crash-loop 的容器恰恰最需要这一句。
+  // 它自己也不抛（观测面不承重，#515 同口径），放这儿不会把启动路径弄挂。
+  // eslint-disable-next-line no-console
+  warnIfLocalBuild({ log: console });
   const pool = createPool(config.databaseUrl);
   if (config.migrateOnStart) {
     const migratePool = createPool(config.migrateDatabaseUrl);
