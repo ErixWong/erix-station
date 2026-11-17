@@ -13,6 +13,9 @@ import { computed, onMounted, onScopeDispose, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useMacroStore } from '../stores/macro';
 import { kindMessageKey, kindSuffixOf } from '../lib/macroView';
+// 目录选择器（issue #623：user-scope 订阅要选一个 `~/projects/<name>` 目录）——复用站内既有组件。
+import DirSelect from './DirSelect.vue';
+import { useWorkbenchStore } from '../stores/workbench';
 // 枚举单一真源（契约 `10` 篇 §1）：某个 kind 能不能在会话里订，看 `KIND_SCOPE`，
 // 不拿模板自带的 `scope` 字段猜（后者可以被实例写歪，前者是定义）。
 import { KIND_SCOPE } from '@shared/macro-kinds';
@@ -33,8 +36,11 @@ const emit = defineEmits<{ (e: 'open-runs'): void; (e: 'close'): void }>();
 
 const { t } = useI18n();
 const macro = useMacroStore();
+const workbench = useWorkbenchStore();
 const open = ref(false);
 const root = ref<HTMLElement | null>(null);
+/** 正在为哪个 user-scope 模板选目录（issue #623：一个下拉同时只开一个目录选择器）。 */
+const pickingTemplateId = ref<string | null>(null);
 
 /** 本实例该列哪些模板：会话面只列 `scope='session'`（`07` §3.2 的硬要求）。 */
 const listed = computed(() => (props.scope === 'user' ? macro.userTemplates : macro.sessionTemplates));
@@ -87,6 +93,42 @@ function onConfigClick(): void {
   open.value = !open.value;
 }
 
+// ── 用户级订阅（issue #623：顶栏 `scope='user'` 实例不再只读，可自己启用/取消）──
+
+/** 某个 user-scope 模板的订阅（取自 `userAssignmentByTemplate`，与会话级分开）。 */
+function userAssignmentOf(templateId: string) {
+  return macro.userAssignmentByTemplate.get(templateId) ?? null;
+}
+
+function isUserSubscribed(templateId: string): boolean {
+  const a = userAssignmentOf(templateId);
+  return a !== null && a.effectiveEnabled;
+}
+
+/** 展开某个 user 模板的目录选择器（首次展开时拉一次 /api/dirs）。 */
+async function openUserPicker(templateId: string): Promise<void> {
+  pickingTemplateId.value = templateId;
+  await workbench.loadDirs();
+}
+
+/**
+ * 从 DirSelect 的 `<select>` 取选中的目录（事件委派：change 从子组件的 select 冒泡上来）。
+ * 跳过「＋ 新建目录」占位项（`__new__`）。选中即 PUT（幂等）。
+ */
+async function onUserDirPick(templateId: string, event: Event): Promise<void> {
+  const el = event.target as HTMLSelectElement;
+  const cwd = el.value;
+  if (!cwd || cwd === '__new__') return;
+  const ok = await macro.assignUser(templateId, cwd);
+  if (ok) pickingTemplateId.value = null;
+}
+
+/** 取消一个 user-scope 订阅。 */
+async function cancelUserAssignment(templateId: string): Promise<void> {
+  const a = userAssignmentOf(templateId);
+  if (a) await macro.unassignUser(a.id);
+}
+
 function onDocPointerDown(event: MouseEvent): void {
   if (!open.value) return;
   if (root.value && event.target instanceof Node && root.value.contains(event.target)) return;
@@ -95,6 +137,7 @@ function onDocPointerDown(event: MouseEvent): void {
 
 onMounted(() => {
   void macro.loadTemplates();
+  if (props.scope === 'user') void macro.loadUserAssignments();
   if (typeof document !== 'undefined') document.addEventListener('mousedown', onDocPointerDown);
 });
 
@@ -139,6 +182,7 @@ onScopeDispose(() => {
           class="flex items-start gap-2"
         >
           <input
+            v-if="scope === 'session'"
             type="checkbox"
             data-test="macro-config-check"
             class="mt-1"
@@ -147,14 +191,51 @@ onScopeDispose(() => {
             :aria-label="t(kindMessageKey(tpl.kind))"
             @change="toggle(tpl.id, ($event.target as HTMLInputElement).checked)"
           />
+          <!-- 会话面用复选框；用户级面（issue #623）用启用/已启用状态位 -->
+          <span
+            v-else
+            data-test="macro-user-status"
+            :data-enabled="isUserSubscribed(tpl.id) ? 'true' : 'false'"
+            class="mt-1 select-none"
+            aria-hidden="true"
+          >{{ isUserSubscribed(tpl.id) ? '●' : '○' }}</span>
           <span class="min-w-0">
             <span class="block truncate text-sm">{{ tpl.name || t(kindMessageKey(tpl.kind)) }}</span>
             <span class="block text-[11px] leading-[1.5] text-black/50 dark:text-white/50"
                   data-test="macro-config-desc">{{ t(`macro.kind.desc.${kindSuffixOf(tpl.kind)}`) }}</span>
-            <!-- `user` scope 在会话面不出现；顶栏那份明确说「管理员代配」，避免用户找一个不存在的开关 -->
-            <span v-if="scope === 'user'" class="block text-[11px] text-black/40 dark:text-white/40">
-              {{ t('macro.config.userScopeHint') }}
-            </span>
+            <!-- `scope='user'` 面：以前只读，现在可自己启用（选一个 `~/projects/<name>` 目录）/取消。 -->
+            <div v-if="scope === 'user'" class="mt-1 flex flex-col gap-1">
+              <div class="flex items-center gap-2">
+                <button
+                  v-if="!isUserSubscribed(tpl.id) && pickingTemplateId !== tpl.id"
+                  type="button"
+                  data-test="macro-user-enable"
+                  class="rounded-md border border-black/15 px-2 py-0.5 text-xs hover:bg-black/5 dark:border-white/20 dark:hover:bg-white/10"
+                  @click="openUserPicker(tpl.id)"
+                >{{ t('macro.config.userScopeEnable') }}</button>
+                <span
+                  v-if="isUserSubscribed(tpl.id)"
+                  data-test="macro-user-enabled"
+                  class="text-[11px] text-green-700 dark:text-green-400"
+                >{{ t('macro.config.userScopeEnabled') }}<template v-if="userAssignmentOf(tpl.id)?.cwd"> · {{ userAssignmentOf(tpl.id)?.cwd }}</template></span>
+                <button
+                  v-if="isUserSubscribed(tpl.id)"
+                  type="button"
+                  data-test="macro-user-disable"
+                  class="rounded-md border border-black/15 px-2 py-0.5 text-xs hover:bg-black/5 dark:border-white/20 dark:hover:bg-white/10"
+                  @click="cancelUserAssignment(tpl.id)"
+                >{{ t('macro.config.userScopeCancel') }}</button>
+              </div>
+              <!-- 目录选择器：复用 DirSelect；change 冒泡到本层取 cwd 后 PUT。 -->
+              <div
+                v-if="pickingTemplateId === tpl.id"
+                data-test="macro-user-dirpicker"
+                @change="onUserDirPick(tpl.id, $event)"
+              >
+                <p class="text-[11px] text-black/50 dark:text-white/50">{{ t('macro.config.userScopeChooseDir') }}</p>
+                <DirSelect />
+              </div>
+            </div>
           </span>
         </li>
       </ul>
