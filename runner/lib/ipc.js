@@ -20,6 +20,29 @@ export const MSG = {
    *   - `heartbeat`：命令在跑但零 IPC 期间的保活心跳（缺陷 A），任意 IPC 天然刷 `lastIpcAt`。
    */
   SHELL_LIVENESS: 'shell_liveness',
+  /**
+   * issue #608（MCP 通道）§6.8：MCP server 子进程的**存活信号**，与 `SHELL_LIVENESS` 同类。
+   * `{ run_id, phase: 'spawn'|'exit', pgid, name }`：stdio server 用 `detached:true` 自成进程组
+   * （pgid = child.pid），agentd 记账后在**每一条** worker 终止路径上 `-pgid` 补杀。
+   * ⚠ 也是**宿主内部信号**：绝不入事件队列（否则多出一条 run_events/U3 事件）。
+   * worker 的 `finally` 只能盖住「自己走到收尾」那一条路，watchdog SIGKILL 盖不住（§6.8）。
+   */
+  MCP_PROCESS: 'mcp_process',
+  /**
+   * issue #608 §6.1：worker → agentd，要本次 run 的 MCP 配置（**含明文槽值**）。
+   * 为什么必须绕这一道：worker 不持 token——`buildWorkerEnv`（agentd.js）**删掉**
+   * `ERIX_STATION_TOKEN`，per-container token 只属于 agentd。
+   * `{ req_id, run_id }` ⇒ `MCP_CONFIG_RESPONSE`。**一次 run 只取一次**（与技能同口径）。
+   */
+  MCP_CONFIG_REQUEST: 'mcp_config_request',
+  /**
+   * issue #608 §6.6：worker → agentd 的元数据回填（`list` 现场发现到的工具清单）。
+   * `{ req_id, slug, tools: [{name, description, inputSchema?}] }`：agentd 代发
+   * `POST /api/internal/mcp/tools-cache` → portal 写 `manifest.tools_cache`。
+   * 为什么要回填：`search` 走的是本地缓存，缓存来自下次物化 ⇒ server 挂掉时仍可搜（§6.6）。
+   * 失败只记日志（回填是优化，不是 run 的依赖）。
+   */
+  MCP_TOOLS_CACHE: 'mcp_tools_cache',
   // agentd → worker
   RUN_START: 'run_start',
   STORE_RESPONSE: 'store_response',
@@ -34,6 +57,13 @@ export const MSG = {
    * LLM call*）。⇒ 收到它**不得**发 SIGKILL、不得起宽限、不得置 `ctx.dropped`。
    */
   STEER_ARM: 'steer_arm',
+  /**
+   * issue #608 §6.1：agentd → worker，代 portal 回本 run 的 server 声明**与明文槽值**。
+   * `{ req_id, ok, servers: [{name, values:{SLOT:v}}], missing: [{name, slots}], error? }`。
+   * 值只经 IPC 内存传递：agentd **不写盘、不写日志**（§10.3）；`ok:false` ⇒ worker 降级为
+   * 「本次 run 无 MCP」，**不打死 run**。
+   */
+  MCP_CONFIG_RESPONSE: 'mcp_config_response',
 };
 
 /**

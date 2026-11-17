@@ -247,6 +247,7 @@ export function buildContainerConfig({
       `ERIX_DELEGATE_ENABLED=${delegateEnvValue()}`,
       `ERIX_DELEGATE_MAX=${Number(process.env.ERIX_DELEGATE_MAX) || 2}`,
       `ERIX_DELEGATE_CHILD_ROUNDS=${Number(process.env.ERIX_DELEGATE_CHILD_ROUNDS) || 8}`,
+      `ERIX_MCP_CONFIG_TIMEOUT_MS=${Number(process.env.ERIX_MCP_CONFIG_TIMEOUT_MS) || 10000}`,
       `ERIX_DELEGATE_CHILD_TIMEOUT_MS=${Number(process.env.ERIX_DELEGATE_CHILD_TIMEOUT_MS) || 240000}`,
       // issue #557：终局正文「文本化工具调用」特征集（runner 读 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS`）。
       // ⚠ **宿主未设 ⇒ 这一项整个不出现**（连键都不带，见 `toolCallMarkersEnvValue` 的理由：默认清单的
