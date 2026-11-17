@@ -1,4 +1,12 @@
--- 0040-platform-prompts.sql —— 管理台「提示词」面板的数据层（issue #596 片 A / 工单 feat-261116-20，
+-- 0042-platform-prompts.sql —— 管理台「提示词」面板的数据层（issue #596 片 A / 工单 feat-261116-20，
+--
+-- ⚠ 现势再让号（2026-11-17，本单第三次）：0040 → 0042。
+--   判据：migrations.test.js「迁移 NNNN 编号全局唯一」闸。
+--   0040 被 #608 `0040-mcp-channel` 占用（已在 dev 库 Applied）；
+--   0041 被 #640 `0041-retire-run-checkpoints` 占用 ⇒ 本单取 0042。
+--   同号两支撞真库 checksum ⇒ 容器反复重启（0039 已撞过一次）。
+-- ⚠ 下方 `RAISE NOTICE '0040: …'` 前缀**故意不改**：它是重放日志标签，
+--   不是台账版本号；让号只改文件名与本注释自指号。
 -- 2026-11-16）。契约：docs/design/admin-prompts-panel-2026-11-16.md §2。
 --
 -- 背景：平台喂给模型的文本里，portal 侧可控的三条（`~/AGENTS.md` 的补充约定、`~/AGENTS.md` 的整段覆写、

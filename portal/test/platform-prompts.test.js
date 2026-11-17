@@ -63,7 +63,7 @@ function captureLog() {
 
 /**
  * `platform_prompts` 的内存 fake：**按 SQL 说的做**（AGENTS §8.14，不把新语句当未知放行），
- * 并把迁移 0040 的 DB 事实当约束执行：只能有一行（`id = 1`）。
+ * 并把迁移 0042 的 DB 事实当约束执行：只能有一行（`id = 1`）。
  * 注入位：`failSelect`（读抛错 = 表不存在）、`hangSelect`（读不返回 = 超时）、`failAudit`
  * （审计写失败 ⇒ 整条语句失败而设置**一格没变** = 语句级原子）、`failEnqueue`（入队抛错）、
  * `concurrent: N`（判据 `P12` 用：把「N 条保存同时在飞」建模进来，口径见 `query()` 里那段注释）。
@@ -97,7 +97,7 @@ class PromptsFakePool {
     // ★ `P12` 把真库的两件事实建模出来（真并行与真锁在 `portal/integration/platform-prompts-db.mjs`）：
     //   ① **到达栅栏**：两条保存都进到这条语句里才放行 ⇒ 假池不会把「并发」默默跑成串行
     //      （串行 = 假绿，那才是这里最坑的错；等不齐会报错而不是挂死）。
-    //   ② **行锁只在有行时存在**：`this.row !== null`（= 迁移 0040 已种首行）才排队 ⇒ 后一条的快照
+    //   ② **行锁只在有行时存在**：`this.row !== null`（= 迁移 0042 已种首行）才排队 ⇒ 后一条的快照
     //      必然是前一条写完之后的；`this.row === null`（未种行的旧形态）时 `FOR UPDATE` 锁不到任何
     //      东西 ⇒ 两条各拿一份空快照（丢更新的成因，同一个假池同一对输入 ⇒ 病复现得出来）。
     await this.arrivals();
@@ -367,7 +367,7 @@ test('P2c 读侧不做长度校验：手工 UPDATE 进来的超长值照常工�
 
 test('P14 「从未保存过」的定义是没有写者：迁移种的那一行（`updated_by` 为 NULL）⇒ `updatedAt` 与 '
   + '`updatedBy` 一起回 null（新库上不许报一个没人做过的「最后保存」）', async () => {
-  // 事实链：`0040-platform-prompts.sql` 会 `INSERT INTO platform_prompts (id) VALUES (1)` 种下首行，
+  // 事实链：`0042-platform-prompts.sql` 会 `INSERT INTO platform_prompts (id) VALUES (1)` 种下首行，
   // 而那一列是 `updated_at timestamptz NOT NULL DEFAULT now()` ⇒ 全新库上那一行**存在**且
   // `updated_at` **非 null**（那个值是「迁移跑过的时刻」），`updated_by` 才是 NULL。
   // DTO 若只看 `updated_at` 非空，界面就会宣称一个管理员从没做过的「最后保存」（评审 R3）。
@@ -618,7 +618,7 @@ test('P6b 等价性：SQL 侧那条渲染算术与 renderHomeAgentsMd 的真实�
  * 测试文件名规则 ⇒ **假池从不执行 `SAVE_SQL`** 里那段 `octet_length(...)`。实测：把
  * `$5::bigint + octet_length(nxt.addendum)` 改回 `$5::bigint`（= 追加段那一列自己的字节不再进闸），
  * `npm test` 照样全绿 —— 拦住超限的是 JS 预闸（`P6`/`P13` 只跑假池）；只有真库腿 `P6b-db` 会红，
- * 而它不在 `npm test`/CI（R1 已把这句写进契约 §4.18-3）。
+ * 而它不在 `npm test`/CI（R1 已把这句写进契约 §4.19-3）。
  *
  * 本格子挡的是「**SQL 那半边漂移**」：只钉算式的**片段形状**（两列各自的字节项 + 同一份常量预算），
  * 算式真值对账仍然归 `P6b-db`（它在真 PG 上逐组比 `gate.rendered_bytes` ≡ `agentsMdRenderedBytes`）。
@@ -951,12 +951,12 @@ test('P15 保存炸在驱动手里 ⇒ 500 的 message 是静态串（表名/约
 });
 
 // ---------------------------------------------------------------------------
-// `P12`：首写并发（评审 F1）。假池里两种快照 = 「已种行」（迁移 0040 现在的形态）与「无行」
+// `P12`：首写并发（评审 F1）。假池里两种快照 = 「已种行」（迁移 0042 现在的形态）与「无行」
 // （加种行之前的形态）：同一个假池、同一对输入，一边绿一边病 ⇒ 钉住的才是「种行」这件事本身。
 // 真并行与真行锁在 `portal/integration/platform-prompts-db.mjs`（真库腿）钉；这里钉的是语义。
 // ---------------------------------------------------------------------------
 
-/** 迁移 0040 种下的那一行：三列都是 DEFAULT `''`（= 跟随内置）。 */
+/** 迁移 0042 种下的那一行：三列都是 DEFAULT `''`（= 跟随内置）。 */
 const SEEDED_ROW = () => ({
   agents_md_addendum: '', agents_md_override: '', title_prompt: '', updated_at: null, updated_by: null,
 });
@@ -1541,7 +1541,7 @@ function stalePortalSectionRefs({ files, number, subjectRe, ownerRe }) {
 // 7. `D1` 两头说法：代码里的旋钮 / 端点 / DTO 键，文档必须同步点名
 // ---------------------------------------------------------------------------
 
-test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 DTO 键登记进 portal.md §4.18', async () => {
+test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 DTO 键登记进 portal.md §4.19', async () => {
   // 只在代码里加的旋钮运维找不到；只在文档里写的端点等于没做。口径照
   // `portal/test/upload-settings.test.js` US-12/US-15（同一族「两头说法」判据）。
   const envDoc = fs.readFileSync(new URL('../../docs/env.md', import.meta.url), 'utf8');
@@ -1553,8 +1553,8 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
   assert.match(example, new RegExp(READ_TIMEOUT_ENV_VAR), 'deploy/.env.example 必须登记这个旋钮');
 
   const apiDoc = fs.readFileSync(new URL('../../docs/api/portal.md', import.meta.url), 'utf8');
-  const section = apiSectionOf(apiDoc, '4.18');
-  // ① 端点表（文档开头那张清单）与 §4.18 都得写四条路径。
+  const section = apiSectionOf(apiDoc, '4.19');
+  // ① 端点表（文档开头那张清单）与 §4.19 都得写四条路径。
   for (const route of [
     'GET /api/admin/prompts', 'PUT /api/admin/prompts/addendum',
     'PUT /api/admin/prompts/agents-md', 'PUT /api/admin/prompts/title-prompt',
@@ -1572,13 +1572,13 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
     }
   }
   for (const key of keyNames) {
-    assert.ok(section.includes(key), `§4.18 缺 DTO 键 ${key} 的语义`);
+    assert.ok(section.includes(key), `§4.19 缺 DTO 键 ${key} 的语义`);
   }
   assert.ok(keyNames.has('materializeEnqueued') || section.includes('materializeEnqueued'),
     'materializeEnqueued 的语义（含 =0 的两种意思）必须写进文档');
 
   // ③ **不新增错误码**（契约 §6：一律 `validation_failed`）。两条一起测：
-  //    §4.18 里出现的「像错误码的反引号词」必须全是既有码或 `reason` 取值；
+  //    §4.19 里出现的「像错误码的反引号词」必须全是既有码或 `reason` 取值；
   //    而通用错误码那一节（§1.2）不许被塞进一个提示词专用的新码。
   const KNOWN_CODES = ['forbidden', 'internal', 'method_not_allowed', 'validation_failed'];
   const KNOWN_REASONS = ['no_row', 'read_failed', 'read_timeout'];   // `reason` 的取值，不是错误码
@@ -1588,15 +1588,15 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
     if (/_failed|_exceeded|_too_large|_not_allowed|_not_configured$/.test(t)) codes.add(t);
   }
   const invented = [...codes].filter((t) => !KNOWN_CODES.includes(t) && !KNOWN_REASONS.includes(t));
-  assert.deepEqual(invented.sort(), [], `§4.18 只许用既有错误码（发明了：${invented.join(', ')}）`);
+  assert.deepEqual(invented.sort(), [], `§4.19 只许用既有错误码（发明了：${invented.join(', ')}）`);
   const codeTable = apiDoc.slice(apiDoc.indexOf('### 1.2 通用错误码'), apiDoc.indexOf('### 1.3'));
   assert.ok(codeTable.length > 200, '通用错误码那一节必须还在（切片要用它当基线）');
   assert.doesNotMatch(codeTable, /prompt/i, '§1.2 不许出现提示词专用的新错误码（本单**零新码**）');
 
-  // ④ **§号口径**：提示词面板是 §4.18。凡提到 `platform_prompts` 的文件，正文里都不许留下
+  // ④ **§号口径**：提示词面板是 §4.19。凡提到 `platform_prompts` 的文件，正文里都不许留下
   //    指向 `§4.16` 的**引用**（§4.16 现在是 #586 的管理台「关于」面板）。漏改的现场就在
   //    `deploy/.env.example`：`PLATFORM_PROMPTS_READ_TIMEOUT_MS` 那行的文档指引，在本单把它换
-  //    成 4.18 之前指的就是邻居那一节（评审 R4）。本格子自己的注释也**不写成引用形态**，
+  //    成 4.19 之前指的就是邻居那一节（评审 R4）。本格子自己的注释也**不写成引用形态**，
   //    否则这条闸会扫到自己 —— `ownerRe` 只豁免 4.16 那一节现在真正的主人（#586）。
   //    白话提及（不带 `portal.md`、不带「见/契约/口径」那种）不算引用，不受这条约束。
   const stale = stalePortalSectionRefs({
@@ -1605,7 +1605,7 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
     subjectRe: /platform_prompts|PLATFORM_PROMPTS/,
     ownerRe: /#586|关于|about|version|版本/i,
   });
-  assert.deepEqual(stale, [], '提示词相关文件的正文里不许残留指向 §4.16 的引用（应当指向 §4.18）：\n'
+  assert.deepEqual(stale, [], '提示词相关文件的正文里不许残留指向 §4.16 的引用（应当指向 §4.19）：\n'
     + stale.join('\n'));
 
   // 常驻反向自证：同一个检查函数必须既能抓住退化式、也不误伤 §4.16 真正主人的合法引用，
@@ -1618,7 +1618,7 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
     // ② #586 的合法引用（同一行点名了主人）：必须**不**被抓到。
     ['x.ts', '// issue #586：「关于」面板（契约 docs/api/portal.md ' + REF_416 + '）。\n', []],
     // ③ 本节自己的正确引用：必须不被抓到。
-    ['y.md', 'platform_prompts 的契约见 docs/api/portal.md §4.18。\n', []],
+    ['y.md', 'platform_prompts 的契约见 docs/api/portal.md §4.19。\n', []],
   ];
   for (const [name, text, want] of SELF) {
     const got = stalePortalSectionRefs({
