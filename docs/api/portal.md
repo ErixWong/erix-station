@@ -3343,7 +3343,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 
 **一句话**：平台对 agent 说的三句话（`~/AGENTS.md` 的**补充约定**、`~/AGENTS.md` 的**整段覆写**、
 **会话标题的 system**）从「改 `portal/src/materializer.js` + 重建 station-portal 镜像」变成
-「管理台改一行 ⇒ 下一次 run / 下一次改名生效」。真相在 `platform_prompts`（迁移 `0042`，单行表）。
+「管理台改一行 ⇒ 下一次 run / 下一次改名生效」。真相在 `platform_prompts`（迁移 `0043`，单行表）。
 契约（为什么这么设计）见 `docs/design/admin-prompts-panel-2026-11-16.md` §2–§8；本节是 API 口径。
 
 **`""` 就是「跟随内置」**（三列同语义，DB 里不出现 `NULL`）：读侧因此**不需要**区分「没配」与
@@ -3381,7 +3381,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 ```
 
 ⚠ 例子里的 `no_row` 是「表不存在 / 一行都没有」那一档。已部署库上更常见的形态是「行在、但没人
-存过」（迁移 0042 种的那一行）：那一档 `reason` 是 `null`，而 `updatedAt` / `updatedBy` **仍按
+存过」（迁移 0043 种的那一行）：那一档 `reason` 是 `null`，而 `updatedAt` / `updatedBy` **仍按
 「从未保存过」报 `null`/`null`**。理由：种行走 `INSERT … ON CONFLICT DO NOTHING`，而
 `updated_at` 是 `timestamptz NOT NULL DEFAULT now()` ⇒ 全新库上那一列**有值**（迁移跑过的那一刻），
 `updated_by` 才是 NULL。只看 `updated_at` 就等于让界面宣称一个管理员从没做过的「最后保存」，
@@ -3533,14 +3533,14 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > 入队通知）、`portal/src/materializer.js`（`renderHomeAgentsMd({fdeName, addendum, override})` +
 > 渲染预算 + 物化时现读）、`portal/src/http.js`（四个端点）、`portal/src/title-llm.js` +
 > `sessions.js` + `session-title.js`（改名链路吃 DB 生效值；**提示词不是守卫**，落库前照旧 `sanitizeTitle`）、
-> `deploy/migrations/0042-platform-prompts.sql`。
+> `deploy/migrations/0043-platform-prompts.sql`。
 > ⚠ `materializer.js` ⇄ `platform-prompts.js` 是**双向引用**：两边都只在**函数体里**用对面的导出，
 > 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
 > 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P15` 及其变体 + `T1`/`T1b` + `D1`）、
 > `portal/test/materializer.test.js`（「默认渲染逐字节不变」由该文件 8 条 `renderHomeAgentsMd：…`
 > 既有断言承担，本分支对它们零改动；**这里不用 `M` 字头的判据号** —— 它在本仓已被
 > `materializer.test.js:750`（用户自建 `AGENTS.md`/`.gitignore` 在 stale 清理后存活）占用）、
-> `portal/test/migrations.test.js`（0042 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
+> `portal/test/migrations.test.js`（0043 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
 
 ---
 

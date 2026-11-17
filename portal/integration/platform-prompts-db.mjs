@@ -122,7 +122,7 @@ async function withLegGuard(label, bag, body) {
 }
 
 /**
- * 建一张最小的 `platform_prompts` + `audit_log`（+ 入队面那三张）：形状照迁移 0042 与 0026/0036，
+ * 建一张最小的 `platform_prompts` + `audit_log`（+ 入队面那三张）：形状照迁移 0043 与 0026/0036，
  * 只留这条语句用得上的东西（整库迁移不是这一腿的职责，那是 `db-integration.mjs`）。
  * ⚠ 种首行必须在这里也有：它正是被验那件事的前提（没有它，①的结论只能解释成"锁不住才正常"）。
  */

@@ -63,7 +63,7 @@ function captureLog() {
 
 /**
  * `platform_prompts` 的内存 fake：**按 SQL 说的做**（AGENTS §8.14，不把新语句当未知放行），
- * 并把迁移 0042 的 DB 事实当约束执行：只能有一行（`id = 1`）。
+ * 并把迁移 0043 的 DB 事实当约束执行：只能有一行（`id = 1`）。
  * 注入位：`failSelect`（读抛错 = 表不存在）、`hangSelect`（读不返回 = 超时）、`failAudit`
  * （审计写失败 ⇒ 整条语句失败而设置**一格没变** = 语句级原子）、`failEnqueue`（入队抛错）、
  * `concurrent: N`（判据 `P12` 用：把「N 条保存同时在飞」建模进来，口径见 `query()` 里那段注释）。
@@ -97,7 +97,7 @@ class PromptsFakePool {
     // ★ `P12` 把真库的两件事实建模出来（真并行与真锁在 `portal/integration/platform-prompts-db.mjs`）：
     //   ① **到达栅栏**：两条保存都进到这条语句里才放行 ⇒ 假池不会把「并发」默默跑成串行
     //      （串行 = 假绿，那才是这里最坑的错；等不齐会报错而不是挂死）。
-    //   ② **行锁只在有行时存在**：`this.row !== null`（= 迁移 0042 已种首行）才排队 ⇒ 后一条的快照
+    //   ② **行锁只在有行时存在**：`this.row !== null`（= 迁移 0043 已种首行）才排队 ⇒ 后一条的快照
     //      必然是前一条写完之后的；`this.row === null`（未种行的旧形态）时 `FOR UPDATE` 锁不到任何
     //      东西 ⇒ 两条各拿一份空快照（丢更新的成因，同一个假池同一对输入 ⇒ 病复现得出来）。
     await this.arrivals();
@@ -367,7 +367,7 @@ test('P2c 读侧不做长度校验：手工 UPDATE 进来的超长值照常工�
 
 test('P14 「从未保存过」的定义是没有写者：迁移种的那一行（`updated_by` 为 NULL）⇒ `updatedAt` 与 '
   + '`updatedBy` 一起回 null（新库上不许报一个没人做过的「最后保存」）', async () => {
-  // 事实链：`0042-platform-prompts.sql` 会 `INSERT INTO platform_prompts (id) VALUES (1)` 种下首行，
+  // 事实链：`0043-platform-prompts.sql` 会 `INSERT INTO platform_prompts (id) VALUES (1)` 种下首行，
   // 而那一列是 `updated_at timestamptz NOT NULL DEFAULT now()` ⇒ 全新库上那一行**存在**且
   // `updated_at` **非 null**（那个值是「迁移跑过的时刻」），`updated_by` 才是 NULL。
   // DTO 若只看 `updated_at` 非空，界面就会宣称一个管理员从没做过的「最后保存」（评审 R3）。
@@ -951,12 +951,12 @@ test('P15 保存炸在驱动手里 ⇒ 500 的 message 是静态串（表名/约
 });
 
 // ---------------------------------------------------------------------------
-// `P12`：首写并发（评审 F1）。假池里两种快照 = 「已种行」（迁移 0042 现在的形态）与「无行」
+// `P12`：首写并发（评审 F1）。假池里两种快照 = 「已种行」（迁移 0043 现在的形态）与「无行」
 // （加种行之前的形态）：同一个假池、同一对输入，一边绿一边病 ⇒ 钉住的才是「种行」这件事本身。
 // 真并行与真行锁在 `portal/integration/platform-prompts-db.mjs`（真库腿）钉；这里钉的是语义。
 // ---------------------------------------------------------------------------
 
-/** 迁移 0042 种下的那一行：三列都是 DEFAULT `''`（= 跟随内置）。 */
+/** 迁移 0043 种下的那一行：三列都是 DEFAULT `''`（= 跟随内置）。 */
 const SEEDED_ROW = () => ({
   agents_md_addendum: '', agents_md_override: '', title_prompt: '', updated_at: null, updated_by: null,
 });
