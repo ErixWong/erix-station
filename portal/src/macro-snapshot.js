@@ -13,6 +13,10 @@
 //   git -C <repo> ls-files --others --exclude-standard -z | rsync -a --from0 --files-from=- <repo>/ <wt>/
 //     // 未跟踪文件（rsync 缺失 ⇒ tar 回退，见 copyUntracked 注释）
 //
+// ⚠ **0 提交仓库（无 HEAD）不走上面三步**：`worktree add` 需要一个 commit 作基点，
+//   `diff HEAD` 也无基线可 diff ⇒ 三行全挂（issue #670：真机上 0 提交是**多数情形**）。
+//   无 HEAD 时改走**整树拷贝（含 `.git`）**，见 `copyWholeTree`。
+//
 // ⚠ worktree 必须落在 `~/projects/` **之外**，否则会被「收工灯」（在途工作树脏检查）
 //   当成用户自己的脏文件统计进去。默认根见 `defaultSnapshotRoot`；`isUnderProjects` 是守卫。
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -36,17 +40,31 @@ export const ORPHAN_AGE_MS = 60 * 60 * 1000;
  * ③ 失败门闸的全部 reason（任一失败都不启动审查）。契约常量：单测据此逐项锁定，
  * 新增/漏一个 reason 会红。`snapshot_root_in_projects` 是本站额外闸（worktree 必须
  * 在 `~/projects` 之外，否则污染收工灯），**不在任务的 7 个里**。
+ *
+ * `snapshot_copy_failed` 是 #670（0 提交仓库）新增的：**为什么不是既有的三个搬运 reason**——
+ *   - 不是 `worktree_add_failed`：0 提交分支**根本没有 worktree**（无基点可 add），
+ *     报它会把「git 结构问题」和「文件拷贝问题」混成一档，运维看 reason 分不开；
+ *   - 不是 `untracked_copy_failed`：那条特指 `copyUntracked` 只搬未跟踪文件的那一步，
+ *     整树拷贝搬的是**全部**（含 `.git` 与已跟踪内容），语义更宽、影响面不同；
+ *   - 不是 `patch_apply_failed`：0 提交无基线，压根不产生 patch。
+ * ⇒ 新失败模式需要一个自己的 reason（`macro-review` 按 `SNAPSHOT_FAILURE_REASONS.includes`
+ *   分类，加进来才会被归成 `snapshot_failed:*` 而不是掉进 `llm_failed` 兼容分支）。
  */
 export const SNAPSHOT_FAILURE_REASONS = Object.freeze([
   'worktree_add_failed',
   'patch_apply_failed',
   'untracked_copy_failed',
+  'snapshot_copy_failed',
   'snapshot_unstable',
   'snapshot_timeout',
   'snapshot_too_large',
   'disk_low',
   'snapshot_root_in_projects',
 ]);
+
+/** 整树拷贝的目标逃出了 `snapshotRoot` ⇒ 挂在 `err.code` 上（**不进 reason 表**：那是调用方
+ *  传错 `id`/`snapshotRoot` 的编程错误，必须响亮地抛出去，不许被降级成可重试的软失败）。 */
+export const SNAPSHOT_TARGET_ESCAPE = 'snapshot_target_escapes_root';
 
 /** `macro_runs.status` 的终态集合（与 0035 的 CHECK 对齐；本模块**不 import macros.js**，
  *  以保持零第三方依赖——portal 测试只跑本文件，不能把 pg 拖进来）。 */
@@ -93,13 +111,58 @@ export function gitGlobalArgs() {
   return ['-c', 'safe.directory=*', '--no-optional-locks'];
 }
 
-/** 跑 git，返回 stdout（utf8）。失败（非 0 退出）抛错，错误里带上 stderr 便于分类。 */
-function git(args, { timeout, maxBuffer = 64 * 1024 * 1024 } = {}) {
-  return execFileSync('git', [...gitGlobalArgs(), ...args], { encoding: 'utf8', timeout, maxBuffer }).toString();
+/**
+ * 跑 git，返回 stdout（utf8）。失败（非 0 退出）抛错。
+ *
+ * `stdio` 默认 **不传** ⇒ Node 的 execFileSync 默认**继承 stderr**（子进程的 `fatal:` 直接
+ * 进 portal 日志）。对「**预期会失败**」的探测（如 `rev-parse --verify HEAD` 遇上 0 提交）
+ * 这是污染：0 提交是多数情形（#670），每个快照都会漏几行看起来像故障的 `fatal:`。
+ * 这类探测显式传 `stdio: ['ignore','pipe','pipe']`：stderr 被捕获（顺便让
+ * `err.stderr` 有值，比继承时更好分类），也不再直接落盘。
+ */
+function git(args, { timeout, maxBuffer = 64 * 1024 * 1024, stdio } = {}) {
+  return execFileSync('git', [...gitGlobalArgs(), ...args],
+    { encoding: 'utf8', timeout, maxBuffer, ...(stdio ? { stdio } : {}) }).toString();
 }
 
 function sha256Text(s) {
   return crypto.createHash('sha256').update(s).digest('hex');
+}
+
+/**
+ * 取 HEAD 的 commit sha；**0 提交仓库（尚无 HEAD）返回空串 `''`**，不抛错。
+ *
+ * 用 `rev-parse --verify HEAD` 而非 `rev-parse HEAD`：前者在无 HEAD 时干净地以非 0 退出
+ * （`--verify` 的语义就是「不存在则失败」），后者会把 `HEAD` 当歧义参数报
+ * "ambiguous argument"（#670 真机原文），两种写法退出码一样但错误信息更易误判为
+ * 「仓库坏了」；这里统一以退出码分类：**失败 ⇒ 无 HEAD**，不猜别的成因。
+ *
+ * `runGit` 可注入，便于单测伪造「有 HEAD / 无 HEAD / git 本身炸了」三态。
+ *
+ * @param {string} repoDir
+ * @param {{timeout?:number, runGit?:function}} [opts]
+ * @returns {string} commit sha，或 `''`（0 提交）
+ */
+export function headShaOrEmpty(repoDir, { timeout, runGit = git } = {}) {
+  try {
+    return runGit(['-C', repoDir, 'rev-parse', '--verify', 'HEAD'],
+      // 0 提交时 git 会报 `fatal: Needed a single revision` —— 那是**预期内**的假，不该漏到日志里。
+      { timeout, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 仓库是否有 HEAD（= 至少一个提交）。0 提交是**多数情形**（见 issue #670：真机现查
+ * 7 个工位里 5 个 `rev-list --count HEAD` 为 0），不是异常态。
+ *
+ * @param {string} repoDir
+ * @param {{timeout?:number, runGit?:function}} [opts]
+ * @returns {boolean}
+ */
+export function hasHead(repoDir, opts = {}) {
+  return headShaOrEmpty(repoDir, opts) !== '';
 }
 
 function sha256File(absPath) {
@@ -154,10 +217,15 @@ function parseChangedTrackedPaths(statusOut) {
  *   作用是**同位置**的陈旧探测器（配合 sha 快速判漂移），不进比对用的 digest；否则
  *   搬运前（原目录）与搬运后（worktree）永远不等 ⇒ 每次都被判 `snapshot_unstable`。
  *
+ * ⚠ **`head` 允许为空**：0 提交仓库没有 HEAD，此时 `head === ''`（哨兵空串，**不是错误**、
+ *   也不是「未知」）。空串在搬运前后各取一次都是同一个值 ⇒ digest 仍可比对，一致性校验
+ *   照常有效（0 提交仓库的比对实际只靠 status + 内容 sha256，本来也不含 commit 维度）。
+ *
  * @returns {{ head:string, status:string, entries:object[], untracked:object[], totalBytes:number, digest:string }}
  */
 export function computeContentFingerprint(repoDir, { contentLevel = true, timeout } = {}) {
-  const head = git(['-C', repoDir, 'rev-parse', 'HEAD'], { timeout }).trim();
+  // 0 提交 ⇒ ''（见上：哨兵，不抛错）
+  const head = headShaOrEmpty(repoDir, { timeout });
   const status = git(['-C', repoDir, 'status', '--porcelain', '-uall'], { timeout });
   const untrackedPaths = parseZList(
     git(['-C', repoDir, 'ls-files', '--others', '--exclude-standard', '-z'], { timeout }),
@@ -268,6 +336,101 @@ export function copyUntracked(repoDir, worktreePath, { hasRsync = detectRsync() 
 }
 
 // ---------------------------------------------------------------------------
+// ①′ 0 提交仓库（无 HEAD）的搬运：整树拷贝（含 `.git`）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把原目录**整树**拷进快照目录，**含 `.git`**。0 提交（无 HEAD）仓库专用（issue #670）。
+ *
+ * 为什么是整树拷贝而不是 worktree + patch：`worktree add` 需要一个 commit 当基点，
+ * 0 提交仓库拿不出来。整树拷贝后：
+ *   - 快照**仍然是一个 git 仓库** ⇒ 审查 run 里 `git status` / `git diff` 照常可用；
+ *   - 所有文件天然是「未提交 / 未跟踪」⇒ 语义上等于「本次改动 = 全部内容」，正是审查
+ *     该看到的（D9 收工灯把「0 提交但有内容」当合法红态，同一语义）；
+ *   - index 一并拷过去 ⇒ `git add` 过但未 commit 的文件在快照里仍是已暂存（`A`），
+ *     审查者能看见「用户已经暂存了哪些」。
+ *
+ * 实现两条（与 `copyUntracked` 同样的「显式探测、显式降级、不硬依赖 rsync」口径）：
+ *   - `rsync -a <repo>/ <dst>/`（首选）：`-a` 保权限/软链、含 `.git`，源尾斜杠 = 拷**内容**；
+ *   - `fs.cpSync(<repo>, <dst>, {recursive:true})`（**回退**）：rsync 不在精简镜像里时用。
+ *     为什么这条用 cpSync 而不是像 `copyUntracked` 那样用 tar：整树要连 `.git` 一起搬，
+ *     tar 管道得自己管「先建目标目录 + 覆盖已存在文件 + 软链不跟随」，而 cpSync 是 Node
+ *     内置、默认不跟随软链，少一个外部依赖。**代价**：cpSync 不保留 mtime（默认
+ *     `preserveTimestamps:false`）——本模块的 digest 刻意不含 mtime（见
+ *     `computeContentFingerprint` 头注释），所以这个代价在这里无害；模式位仍按源写。
+ *
+ * ⚠ **不再调 `copyUntracked`**：整树拷贝**已经包含**未跟踪文件，再拷一遍是白干活（且两次
+ *   结果不一致时会掩盖真错）。“未跟踪文件也要搬”这条语义仍然是满足的，只是由整树拷贝一次做足。
+ *
+ * ⚠ 超时：`fs.cpSync` 没有 timeout 选项，超时由上层 `createSnapshot` 在调用前后各查一次
+ *   deadline 兜（`snapshot_timeout`）；rsync 分支直接把 timeout 交给 spawnSync。
+ *
+ * ⚠ 已知局限（不属本单范围，仅记录）：
+ *   1. 整树拷贝不是 `git worktree`，所以不会出现在 `git worktree list` 里 ⇒
+ *      `cleanOrphanWorktrees` 看**不到**它（它只从 `git worktree list` 取候选）。
+ *      本进程内的 `cleanup()` 靠 `fs.rmSync` 仍能清掉（见 `removeWorktree`）。
+ *      ⚠ 迨今 `cleanOrphanWorktrees` **还没有生产调用点**（W4a 只交了机制），所以两条搬运路
+ *      现在都不会自动回收；**接线时若只抓 `worktree list`，0 提交快照就永不回收（磁盘只涨
+ *      不跌）** ⇒ 接线时要么改成「另外扫 snapshotRoot 下的目录」，要么给整树拷贝留一个可枚举
+ *      的台账（本单不做，免得把 #670 的范围撑大）。
+ *   2. 若 `repoDir` 本身是个 linked worktree（`.git` 是个**文件**而非目录），拷过去的 `.git`
+ *      会指向不存在的 gitdir ⇒ 快照里的 git 命令会失败，表现为比对报错而不是静默错数据。
+ *
+ * ⚠ 已知代价（与有 HEAD 那条路的**语义差异**，已用单测钉住）：整树拷贝**连被 `.gitignore`
+ *   忽略的文件一起搬**（`copyUntracked` 那条路会 `--exclude-standard` 排除它们，典型就是
+ *   `node_modules`）。两个影响：
+ *     - 一致性校验**不受影响**：快照里的 git 同样读 `.gitignore` ⇒ 前后 `status` /
+ *       `ls-files --others` 一致 ⇒ digest 仍相等（单测钉住）；
+ *     - 体量门闸看不住它：`MAX_SIZE_BYTES` 算的是「变更 + 未跟踪**且不忽略**」的字节数 ⇒
+ *       一个带巨大 `node_modules` 的 0 提交仓库会突破预算。当时拍板接受（“0 提交的仓库
+ *     通常还小”），**真机若出现大 0 提交仓库变慢，优先从这里改**（如按
+ *     `git ls-files --others --exclude-standard` 反推忽略集、或拷前先看磁盘余量）。
+ *
+ * @param {string} repoDir
+ * @param {string} worktreePath
+ * @param {{snapshotRoot?:string|null, hasRsync?:boolean, timeout?:number}} [opts]
+ * @returns {{method:'rsync'|'cpSync'}}
+ */
+export function copyWholeTree(repoDir, worktreePath, {
+  snapshotRoot = null, hasRsync = detectRsync() !== null, timeout,
+} = {}) {
+  // 防路径穿越：worktreePath 是 `path.join(snapshotRoot, id)` 拼出来的，id 由调用方给
+  // （生产是 uuid，但 `createSnapshot` 的 id 可被覆盖）⇒ 显式核验拼接结果**真的**在
+  // snapshotRoot 之下（而不是只假定 id 看起来像 uuid）。`fs.cpSync` 不校这一层。
+  if (typeof snapshotRoot === 'string' && snapshotRoot.length > 0) {
+    const rootAbs = path.resolve(snapshotRoot);
+    const target = path.resolve(worktreePath);
+    const rel = path.relative(rootAbs, target);
+    const inside = rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+    if (!inside) {
+      const err = new Error(`snapshot copy target escapes snapshotRoot: ${target} not under ${rootAbs}`);
+      err.code = SNAPSHOT_TARGET_ESCAPE;
+      throw err;
+    }
+  }
+
+  if (hasRsync) {
+    // 直接 spawn、不过 shell：目录名可能有空格/奇怪字符，拼 shell 反而多一层引号风险
+    //（`copyUntracked` 过 shell 是因为它需要 git|rsync 管道，这里不需要）。
+    const r = spawnSync('rsync', ['-a', `${repoDir}/`, `${worktreePath}/`],
+      { encoding: 'utf8', timeout });
+    if (!r || r.status !== 0) {
+      throw new Error(`whole-tree rsync copy failed (status=${r?.status}): ${r?.stderr || r?.error || ''}`);
+    }
+    return { method: 'rsync' };
+  }
+
+  // 回退：Node 内置递归拷贝（语义等价 `rsync -a src/ dst/`：dst 成为 src 的一份拷贝，
+  // 而不是 dst/src）。
+  try {
+    fs.cpSync(repoDir, worktreePath, { recursive: true, force: true, errorOnExist: false });
+  } catch (err) {
+    throw new Error(`whole-tree cpSync copy failed: ${err?.message || err}`);
+  }
+  return { method: 'cpSync' };
+}
+
+// ---------------------------------------------------------------------------
 // ③ 失败门闸 + ① 搬运 + ② 前后比对（带一次重试）
 // ---------------------------------------------------------------------------
 
@@ -293,8 +456,37 @@ function removeWorktree(repoDir, worktreePath) {
   try { git(['-C', repoDir, 'worktree', 'prune']); } catch { /* 尽力 */ }
 }
 
-/** 一次完整搬运：worktree add → apply patch → copy untracked。任一步失败抛带 `.reason` 的错。 */
-function attemptTransfer({ repoDir, worktreePath, patchFile, hasRsync, timeout }) {
+/**
+ * 一次完整搬运。两条路径（按有无 HEAD 分叉）：
+ *   - **有 HEAD**（原路，未变）：worktree add → apply patch → copy untracked；
+ *   - **无 HEAD**（0 提交，#670）：`copyWholeTree` 整树拷贝（含 `.git`），**不**再走
+ *     worktree/patch/copyUntracked（三者都假定 HEAD 存在，或已被整树拷贝覆盖）。
+ * 任一步失败抛带 `.reason` 的错；目标越界则抛 `err.code === SNAPSHOT_TARGET_ESCAPE`（不降级）。
+ *
+ * @param {{repoDir:string, worktreePath:string, patchFile:string,
+ *   snapshotRoot?:string|null, hasRsync?:boolean, timeout?:number,
+ *   hasHeadOf?:() => boolean}} opts
+ */
+function attemptTransfer({
+  repoDir, worktreePath, patchFile, snapshotRoot = null, hasRsync, timeout,
+  // 默认自己探测（走 `git()` 包装，因而自带 #669 的 `-c safe.directory=*` + `--no-optional-locks`）；
+  // `createSnapshot` 会注入「复用指纹已取的结果」以省一次 git 调用，单测也可注入桩。
+  hasHeadOf = () => hasHead(repoDir, { timeout }),
+} = {}) {
+  if (!hasHeadOf()) {
+    // 0 提交：无基点 ⇒ 不能 worktree add，也没基线可 diff。整树拷贝（含 `.git`）。
+    // 未跟踪文件已在树里，**不**调 copyUntracked（避免重复搬）。
+    try {
+      copyWholeTree(repoDir, worktreePath, { snapshotRoot, hasRsync, timeout });
+    } catch (err) {
+      // 守卫错（目标越界）：编程错误，原样抛，不许被当成可重试的搬运失败。
+      if (err?.code === SNAPSHOT_TARGET_ESCAPE) throw err;
+      if (!err.reason) err.reason = 'snapshot_copy_failed';
+      throw err;
+    }
+    return;
+  }
+
   // 已提交内容
   try {
     git(['-C', repoDir, 'worktree', 'add', '--detach', worktreePath, 'HEAD'], { timeout });
@@ -377,6 +569,12 @@ export async function createSnapshot({
     return { ok: false, reason: 'snapshot_too_large', worktreePath };
   }
 
+  // 0 提交分叉（#670）：**复用上面指纹已经取过的结果**（`before.head === ''` ⇒ 无 HEAD），
+  // 省一次 `rev-parse` git 调用，且保证「比对口径」与「搬运口径」用的是同一个判定。
+  // 重试沿用同一个值：HEAD 中途出现/消失会让前后 digest 不等 ⇒ `snapshot_unstable`（保守、
+  // 不会静默按错的分支搬运）。
+  const headPresent = before.head !== '';
+
   const patchFile = path.join(os.tmpdir(), `${id}.patch`);
   fs.mkdirSync(snapshotRoot, { recursive: true });
 
@@ -393,7 +591,10 @@ export async function createSnapshot({
     if (timedOut()) { cleanup(); return { ok: false, reason: 'snapshot_timeout', worktreePath }; }
 
     try {
-      attemptTransfer({ repoDir, worktreePath, patchFile, hasRsync, timeout: remaining() });
+      attemptTransfer({
+        repoDir, worktreePath, patchFile, snapshotRoot, hasRsync, timeout: remaining(),
+        hasHeadOf: () => headPresent,
+      });
     } catch (err) {
       cleanup();
       if (timedOut()) return { ok: false, reason: 'snapshot_timeout', worktreePath };

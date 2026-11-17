@@ -17,12 +17,16 @@ import {
   computeContentFingerprint,
   createSnapshot,
   copyUntracked,
+  copyWholeTree,
+  hasHead,
+  headShaOrEmpty,
   isUnderProjects,
   shouldRemoveOrphan,
   parseWorktreeList,
   cleanOrphanWorktrees,
   makeMacroRunLookup,
   SNAPSHOT_FAILURE_REASONS,
+  SNAPSHOT_TARGET_ESCAPE,
   TERMINAL_MACRO_RUN_STATUSES,
   ORPHAN_AGE_MS,
 } from '../src/macro-snapshot.js';
@@ -60,6 +64,15 @@ function seedCommitted(repo, rel, content) {
   fs.writeFileSync(abs, content);
   sh('git', ['add', '-A'], repo);
   sh('git', ['commit', '-qm', 'base'], repo);
+}
+
+/** 0 提交仓库（`git init` + 配置，不 commit）——#670 的主角。 */
+function tmpRepoNoCommit() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'w670-repo-'));
+  sh('git', ['init', '-q'], dir);
+  sh('git', ['config', 'user.email', 't@example.com'], dir);
+  sh('git', ['config', 'user.name', 'tester'], dir);
+  return dir;
 }
 
 // --- 6. worktree 路径不在 ~/projects 下 ---------------------------------------
@@ -445,4 +458,165 @@ test('#669 真仓库上 rev-parse 能跑通（全局选项真的被 git() 用上
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
+});
+
+// ── issue #670：0 提交仓库（无 HEAD）─────────────────────────────────────────────
+//
+// 真机证据（#669 修完 dubious ownership 之后才暴露）：
+//   `git rev-parse HEAD` ⇒ `fatal: ambiguous argument 'HEAD': unknown revision or path
+//   not in the working tree.`（rc=128）
+// 而 0 提交是**多数情形**（issue 正文 `rev-list --count HEAD` 现查：7 个工位 5 个为 0），
+// D9 收工灯还把「0 提交但有内容」设计成合法红态 ⇒ 快照必须支持它，不能宣布「不能审查」。
+//
+// 方案 A（已拍板）：无 HEAD ⇒ **不用** worktree + patch（无基点可 add、无基线可 diff），
+// 改**整树拷贝（含 `.git`）**：快照仍是 git 仓库、所有文件天然未提交 ⇒ 语义正是
+// 「本次改动 = 全部内容」，且 `git add` 过的文件在快照里仍是已暂存。
+// 临时仓库全部自己造（tmp），不碰真实用户目录。
+
+// --- 判据 4：head 哨兵（反向自证二把哨兵改成抛错，本用例即红）------------------
+test('#670 computeContentFingerprint 在 0 提交仓库上返回 head === "" 且不抛错', () => {
+  const repo = tmpRepoNoCommit();
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'A\n');
+  let fp;
+  assert.doesNotThrow(() => { fp = computeContentFingerprint(repo); },
+    '0 提交不许抛（真机就是在这一行炸掉整个 M9 分派）');
+  assert.equal(fp.head, '', '0 提交必须是哨兵空串（不是 null/undefined，也不是抛错）');
+  assert.equal(hasHead(repo), false);
+  assert.match(fp.status, /a\.txt/, '状态文本照常取（0 提交照样有未跟踪内容）');
+  assert.match(fp.digest, /^[0-9a-f]{64}$/);
+  // 哨兵必须**稳定**：搬运前后各取一次要能比对（两边都是 '' 才谈得上一致性校验）
+  assert.equal(computeContentFingerprint(repo).digest, fp.digest, '同一仓库两次取指纹必须相等');
+});
+
+test('#670 hasHead/headShaOrEmpty：只看退出码与空串，判定用 rev-parse --verify HEAD', () => {
+  // 三态全由注入的 runGit 决定（可测；不靠 catch 猜成因）
+  assert.equal(hasHead('/r', { runGit: () => 'deadbeef\n' }), true, '拿到 sha ⇒ 有 HEAD');
+  assert.equal(hasHead('/r', { runGit: () => '   ' }), false, '空输出 ⇒ 无 HEAD');
+  assert.equal(hasHead('/r', { runGit: () => { throw new Error('exit 128'); } }), false,
+    '非 0 退出 ⇒ 无 HEAD（0 提交就是这个形状）');
+  assert.equal(headShaOrEmpty('/r', { runGit: () => { throw new Error('boom'); } }), '',
+    'head 哨兵必须是空串');
+  // 必须用 `--verify`（不带 --verify 的 `rev-parse HEAD` 会把 HEAD 当歧义参数，靠错误文案猜成因）
+  let seen = null;
+  hasHead('/r', { runGit: (args) => { seen = args; return 'x\n'; } });
+  assert.deepEqual(seen.slice(0, 5), ['-C', '/r', 'rev-parse', '--verify', 'HEAD']);
+  // 真仓库两侧都要给正确答案（注入桩挡不住「git 命令本身写错」这一类回归）
+  const committed = tmpRepo();
+  seedCommitted(committed, 'a.txt', 'x\n');
+  assert.equal(hasHead(committed), true);
+  assert.equal(headShaOrEmpty(committed), sh('git', ['-C', committed, 'rev-parse', 'HEAD']).trim());
+  assert.equal(hasHead(tmpRepoNoCommit()), false);
+});
+
+// --- 判据 1：0 提交 + 有文件但未 add -------------------------------------------
+test('#670 0 提交 + 有文件（未 add）⇒ createSnapshot ok:true 且内容与原目录一致', async () => {
+  const repo = tmpRepoNoCommit();
+  fs.writeFileSync(path.join(repo, 'plain.txt'), 'NOT-ADDED-1');
+  fs.mkdirSync(path.join(repo, 'deep/nested'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'deep/nested/f.txt'), 'NESTED-2');
+  const res = await createSnapshot({ repoDir: repo, snapshotRoot: tmpRoot(), hasRsync: true });
+  // 反向自证一的红点就在这行：去掉「无 HEAD 分支」⇒ worktree add HEAD 失败 ⇒ reason=worktree_add_failed
+  assert.equal(res.ok, true, `0 提交（未 add）快照必须成功，实际 reason=${res.reason}`);
+  assert.equal(fs.readFileSync(path.join(res.worktreePath, 'plain.txt'), 'utf8'), 'NOT-ADDED-1');
+  assert.equal(fs.readFileSync(path.join(res.worktreePath, 'deep', 'nested', 'f.txt'), 'utf8'), 'NESTED-2');
+  assert.equal(isUnderProjects(res.worktreePath), false, '快照仍在 projects 之外（不污染收工灯）');
+});
+
+// --- 判据 2：0 提交 + 已 git add 未 commit -------------------------------------
+test('#670 0 提交 + 已 git add 未 commit ⇒ ok:true，快照里 git status 看得见已暂存文件', async () => {
+  const repo = tmpRepoNoCommit();
+  fs.writeFileSync(path.join(repo, 'staged.js'), 'STAGED');
+  sh('git', ['add', 'staged.js'], repo);
+  fs.writeFileSync(path.join(repo, 'free.txt'), 'FREE'); // 另有一个从未 add 的
+  const res = await createSnapshot({ repoDir: repo, snapshotRoot: tmpRoot(), hasRsync: true });
+  assert.equal(res.ok, true, `0 提交（已 add）快照必须成功，实际 reason=${res.reason}`);
+  const st = sh('git', ['-C', res.worktreePath, 'status', '--porcelain', '-uall']);
+  assert.match(st, /^A {2}staged\.js$/m, 'index 一起拷过去 ⇒ 已暂存态在快照里仍是 A（审查者看得见用户暂存了什么）');
+  assert.match(st, /^\?\? free\.txt$/m, '未跟踪文件同样在（整树拷贝已含，不再重复 copyUntracked）');
+  assert.equal(fs.readFileSync(path.join(res.worktreePath, 'staged.js'), 'utf8'), 'STAGED');
+});
+
+// --- 判据 5：整树拷贝包含 .git（rsync 与 cpSync 回退两条都要） ------------------
+test('#670 快照带 .git（目录形态）且 git status 能跑；rsync 不可用时 cpSync 回退同样成立', async () => {
+  for (const hasRsync of [true, false]) {
+    const repo = tmpRepoNoCommit();
+    fs.writeFileSync(path.join(repo, 'x.txt'), 'X');
+    const res = await createSnapshot({ repoDir: repo, snapshotRoot: tmpRoot(), hasRsync });
+    assert.equal(res.ok, true, `hasRsync=${hasRsync} 时快照失败：${res.reason}`);
+    const gitEntry = path.join(res.worktreePath, '.git');
+    assert.ok(fs.existsSync(gitEntry), '快照必须带 .git，否则审查 run 里 git status 不可用');
+    assert.ok(fs.statSync(gitEntry).isDirectory(),
+      `hasRsync=${hasRsync}：整树拷贝的 .git 必须是**目录**（linked worktree 的 .git 是文件）`);
+    assert.match(sh('git', ['-C', res.worktreePath, 'status', '--porcelain', '-uall']), /x\.txt/);
+  }
+});
+
+// --- 判据 3：有 HEAD 的仓库仍走原路（worktree + patch），没被整树拷贝抢路 -------
+test('#670 有 HEAD 仍走 worktree+patch 原路（.git 是文件、且真的注册进 worktree list）', async () => {
+  const repo = tmpRepo();
+  seedCommitted(repo, 'tracked.js', 'console.log(1)\n');
+  seedCommitted(repo, 'base-untouched.txt', 'BASE\n'); // 只在 HEAD 里、没有未提交改动
+  fs.writeFileSync(path.join(repo, 'tracked.js'), 'console.log(2)\n');
+  fs.writeFileSync(path.join(repo, 'fresh.txt'), 'FRESH');
+  const res = await createSnapshot({ repoDir: repo, snapshotRoot: tmpRoot(), hasRsync: true });
+  assert.equal(res.ok, true, `有 HEAD 快照失败：${res.reason}`);
+  // 原路三样语义齐活：已提交（base）+ 未提交 diff（apply）+ 未跟踪（copyUntracked）
+  assert.equal(fs.readFileSync(path.join(res.worktreePath, 'base-untouched.txt'), 'utf8'), 'BASE\n',
+    '已提交内容必须由 worktree add 提供');
+  assert.equal(fs.readFileSync(path.join(res.worktreePath, 'tracked.js'), 'utf8'), 'console.log(2)\n');
+  assert.equal(fs.readFileSync(path.join(res.worktreePath, 'fresh.txt'), 'utf8'), 'FRESH');
+  // 路径判别器：worktree 的 `.git` 是**文件**（gitdir: …），整树拷贝的才是目录
+  assert.ok(fs.statSync(path.join(res.worktreePath, '.git')).isFile(),
+    '有 HEAD 必须仍是 git worktree；.git 变成目录说明 0 提交分支抢了原路');
+  const listed = sh('git', ['-C', repo, 'worktree', 'list', '--porcelain']);
+  assert.ok(listed.split('\n').some((l) => l === `worktree ${res.worktreePath}`),
+    '有 HEAD 的快照必须注册进 git worktree list（整树拷贝不会注册）');
+});
+
+// --- 新 reason 已登记（macro-review 按 includes 分类，漏登记会掉进 llm_failed） --
+test('#670 snapshot_copy_failed 已登记，且既有 8 个 reason 一个没删', () => {
+  assert.ok(SNAPSHOT_FAILURE_REASONS.includes('snapshot_copy_failed'),
+    '整树拷贝失败必须有 reason（否则 macro-review 会误归类为 llm_failed）');
+  for (const r of ['worktree_add_failed', 'patch_apply_failed', 'untracked_copy_failed',
+    'snapshot_unstable', 'snapshot_timeout', 'snapshot_too_large', 'disk_low',
+    'snapshot_root_in_projects']) {
+    assert.ok(SNAPSHOT_FAILURE_REASONS.includes(r), `既有 reason 不许被删：${r}`);
+  }
+});
+
+// --- 安全：整树拷贝目标必须在 snapshotRoot 之下（id 可被调用方覆盖） -----------
+test('#670 拷贝目标逃出 snapshotRoot ⇒ 抛 snapshot_target_escapes_root，且不落到根外', async () => {
+  const repo = tmpRepoNoCommit();
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'A');
+  const root = tmpRoot();
+  const escaping = path.resolve(path.join(root, '../../escaped-670'));
+  await assert.rejects(
+    () => createSnapshot({ repoDir: repo, snapshotRoot: root, id: '../../escaped-670', hasRsync: true }),
+    (err) => err?.code === SNAPSHOT_TARGET_ESCAPE,
+    '越界必须响亮抛出（编程错误），不许降级成可重试的软失败',
+  );
+  assert.equal(fs.existsSync(escaping), false, '守卫必须在拷贝**之前**，根外目录不许被创建');
+  assert.throws(
+    () => copyWholeTree(repo, path.join(root, '..', '..', 'x670'), { snapshotRoot: root }),
+    (err) => err?.code === SNAPSHOT_TARGET_ESCAPE,
+  );
+  // 正常 id 仍在根内 ⇒ 守卫没把合法路径一起挡掉
+  assert.doesNotThrow(() => copyWholeTree(repo, path.join(root, 'ok-670'), { snapshotRoot: root }));
+  assert.match(sh('git', ['-C', path.join(root, 'ok-670'), 'status', '--porcelain', '-uall']), /a\.txt/);
+});
+
+// --- 已知代价钉住：被 .gitignore 忽略的文件会一起拷过去，但不影响 digest 比对 ---
+test('#670 0 提交：忽略文件随整树拷贝过去（已知代价），status/digest 比对不受影响', async () => {
+  const repo = tmpRepoNoCommit();
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored/\n');
+  fs.mkdirSync(path.join(repo, 'ignored'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'ignored', 'junk.bin'), 'JUNK');
+  fs.writeFileSync(path.join(repo, 'keep.txt'), 'KEEP');
+  const res = await createSnapshot({ repoDir: repo, snapshotRoot: tmpRoot(), hasRsync: true });
+  assert.equal(res.ok, true, `前后 digest 必须仍相等（快照里的 git 同样按 .gitignore 过滤）：${res.reason}`);
+  assert.ok(fs.existsSync(path.join(res.worktreePath, 'ignored', 'junk.bin')),
+    '整树拷贝连忽略文件一起搬（0 提交仓库通常很小；见 copyWholeTree 的已知代价注释）');
+  const st = sh('git', ['-C', res.worktreePath, 'status', '--porcelain', '-uall']);
+  assert.doesNotMatch(st, /junk\.bin/, '被忽略的文件不许出现在 status 里（审查者看到的状态与原目录一致）');
+  assert.match(st, /keep\.txt/);
 });
