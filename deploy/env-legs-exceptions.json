@@ -153,7 +153,7 @@
   ],
   "unsupported": [
     {
-      "at": "runner/lib/mcp-client.js:94",
+      "at": "runner/lib/mcp-client.js:95",
       "read": "baseEnv[key]",
       "reason": "**读形认得、名字解析不出**的动态下标：`key` 来自 `STDIO_ENV_ALLOWLIST` 这个常量数组，而扫描器只看字面量读形（`baseEnv.ERIX_X`）。这条不是漏投，是**故意的白名单转发**：第三方 MCP server 只许拿到 PATH/HOME/LANG 这类无身份信息的环境变量（连 ERIX_STATION_TOKEN 都不在表里，`mcp-client.test.js` 有反向判据钉住）。逐条展开成字面量会让「加一个 key 忘记同步」变成两处改，反而更容易漂 —— 所以登记在这里，让扫描器知道这处已经被显式审视过。"
     },
