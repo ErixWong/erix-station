@@ -1210,13 +1210,15 @@ export async function setCapabilityEnabled({ pool, fde, slug, enabled, config = 
         { code: 'capability_budget_exceeded', httpStatus: 409,
           details: { max_enabled: budget.limit, enabled_now: n, kind: budget.kind } });
     }
-    // §4：MCP 启用前必须所有必填槽有值（fail-closed，别让用户看到一个装好却连不上的工具）。
-    if (isMcp) {
-      const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id, key: config?.mcpSecretKey });
-      if (missing.length > 0) {
-        throw new MarketError('还有必填凭据没配置，无法启用（等管理员配置）', {
-          code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing } });
-      }
+  }
+  // §4：MCP 只要请求「启用」就要查槽位——**不只在状态迁移时查**。
+  // 为什么：槽值可能在启用后被管理员删掉（或 key 轮换后解不开），此时「再点一次启用」必须同样拦住，
+  // 否则会出现「库里 enabled=true、运行时缺凭据、工具静默不存在」这种最难查的形态。
+  if (enabled && isMcp) {
+    const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id, key: config?.mcpSecretKey });
+    if (missing.length > 0) {
+      throw new MarketError('还有必填凭据没配置，无法启用（等管理员配置）', {
+        code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing } });
     }
   }
   const r = await withTransaction(pool, async (client) => {
@@ -1324,9 +1326,13 @@ export function scanPackageShape(files) {
  */
 export function validateSlots(slots, { kind, transport }) {
   if (slots === undefined || slots === null) return [];
-  if (!Array.isArray(slots)) throw bad('slots 必须是数组', { field: 'slots' });
+  if (!Array.isArray(slots)) {
+    throw new MarketError('slots 必须是数组', { code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots' } });
+  }
   if (slots.length > MCP_LIMITS.maxSlots) {
-    throw bad(`slots 条数超过 ${MCP_LIMITS.maxSlots}`, { field: 'slots', actual: slots.length });
+    throw new MarketError(`slots 条数超过 ${MCP_LIMITS.maxSlots}`, {
+      code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots', actual: slots.length },
+    });
   }
   const allowedInject = kind === 'skill' ? ['context'] : transport === 'stdio' ? ['env'] : ['header'];
   const out = [];
@@ -1408,7 +1414,14 @@ export function validateMcpFields(fields, { requireAll = false } = {}) {
       code: 'capability_kind_unsupported', httpStatus: 409, details: { field: 'resident', resident: pick('resident') },
     });
   }
-  const reason = need('reason', 'MCP 条目必须给准入理由（stateful / tool_surface_gt_12 / shared_quota / credential_boundary）');
+  const reasonRaw = pick('reason');
+  const reason = typeof reasonRaw === 'string' && reasonRaw.trim() !== '' ? reasonRaw.trim() : undefined;
+  if (reason === undefined && requireAll) {
+    // §7.3：缺准入理由用专属错误码（前端要据此高亮那个下拉，而不是显示一句泛泛的「参数不合法」）。
+    throw new MarketError('MCP 条目必须给准入理由（stateful / tool_surface_gt_12 / shared_quota / credential_boundary）', {
+      code: 'capability_reason_required', httpStatus: 400, details: { field: 'reason', allowed: MCP_REASONS },
+    });
+  }
   if (reason !== undefined && !MCP_REASONS.includes(reason)) {
     throw new MarketError(`reason 只允许 ${MCP_REASONS.join('|')}`, {
       code: 'capability_reason_required', httpStatus: 400, details: { field: 'reason', reason },
