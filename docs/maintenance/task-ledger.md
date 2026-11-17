@@ -8373,3 +8373,40 @@ fde `84007d94…` / proxy `3c3f6eb6…`）⇒ 部署再走一步，把栈整体�
 验完须还原（或按 §4.1 口径保持 dev 密码直通，由用户定）。
 
 **待办**：#611+#617、#614+#615、#616（均在跑）、#623、#624、#625、#626、#627。
+
+### 8.159 发版 v0.1.72 并部署到位（切版 + 三份 lockfile 补齐 + 5 台 FDE 重建 + 5/5 真机验收）（2026-11-17，主 agent）
+
+接 §8.157。`v0.1.71` 之后 main 上又有**产品代码**（`#622` 的 `fix(#613)`：`portal/src/macros.js` /
+`macro-routes.js` 下发 `adminTemplates.subscriberCount`，+106 行含测试）⇒ 需要一个能指认到那份树的版本号。
+
+**切版（`#629`，`1c4b74a`）**：三处 `package.json` + **三份 lockfile** 一起对齐到 `0.1.72`。
+⚠ **lockfile 的上两次切版（#604 / #612）只改了 `package.json`**，三份 lockfile 的 root 版本还停在
+`0.1.69`（`sed -n 1,10p` 现查：三份都在第 3、9 行）⇒ 本单补齐，不留「package.json 说 0.1.72、lockfile 说
+0.1.69」的第二本账。⚠ 另记：`node -p require('./package.json').version` 在本仓**不能当唯一判据**——
+它只读 package.json；判「三处 + 三份 lockfile 都对齐」得逐个 `node -p`（本单这么做的）。
+
+**发版前置两条铁律（`#620` 新增）逐条落地**：
+1. **tag 现查是否已存在**：`git tag -l 'v0.1.7*'` = `v0.1.7` / `v0.1.70` / `v0.1.71` ⇒ `v0.1.72` 未被占
+   （并 `git ls-remote --tags origin refs/tags/v0.1.72` 复核远端 0 条）。
+2. **tag 必须指向验过的树**：`#629` 合并后先等 **main 上该 commit 自己的 CI 跑绿**（run 的 `headSha =
+   1c4b74a`，`completed/success`），再在 `1c4b74a` 上打 annotated tag ⇒ tag 的树 = main 的树 = CI 验过的那份。
+   ⚠ 过程中撞到一次「**merge commit 的树 ≠ PR 分支的树**」：`#629` 合并时 main 上多插了一条 `#630`（台账
+   docs），`git rev-parse 1c4b74a^{tree}` 与 `3608695^{tree}` 不同 ⇒ 若照 PR 那次 CI 的结论去打 tag，
+   就是 §8.154/§8.155 记的那个形状。判据不是「PR 绿了」，是「**要打 tag 的那个 commit 自己绿了**」。
+
+**发布读数**：release run `43989025198` **completed/success**；三镜像 digest（`latest` 同步重新指向）：
+portal `sha256:3de136f0…`（`.Id effbf282…`）· fde `sha256:e953727a…`（`.Id 68bef8d0…`）·
+proxy `sha256:b9d93cdd…`（`.Id b2dbc1ee…`）。FDE 镜像拉取 **8m24s**。
+
+**部署**：`deploy/.env` 三 pin 换 0.1.72 形态①（备份 `/tmp/deploy.env.bak-261117-72`）→ `up -d` 重建
+portal/proxy → **先验在飞 run = 0** 再逐台 `docker rm -f fde-<name>` + `provision-fde`，5 台
+（`tetris`/`todo`/`blind`/`acc019`/`eric`）全部 `rc=0` 且 `image = 68bef8d0…`（= 新 pin 的 `.Id`）。
+
+**验收**：`/api/health` = `0.1.72 / revision 1c4b74a / built_at 2026-11-17T00:37:01Z`；5 台 FDE 容器内
+`/opt/erix/build-info.json` **逐格相同**；`E2E_UI=1 npm run test:integration:version` ⇒ **5/5 rc=0**
+（截图 `/tmp/version-surface-e2e.png`，158,412 字节：Server `0.1.72 / 1c4b74aec364… / 11/17/2026 12:37:01 AM`、
+平台引擎 `0.33.0`、每台 FDE 行镜像摘要 = `…fde@sha256:e953727a…` 与 pin 同源）。
+
+**一处遗留，如实记**：3 个 revoked 测试账号（`portsprobe` / `pw173jscw` / `ui17kbwg`）**没有容器**，
+About 面板上仍显示它们停用时的旧快照摘要（`941a157c…` / `4c1e7068…`）——那是**历史快照不是当前运行**，
+面板本来就把第三格标成 `derived copy, not authoritative`，不修（重建一个 revoked 账号的容器没有意义）。
