@@ -189,12 +189,142 @@ function matchBrackets(masked, from) {
   return null;
 }
 
+/** 这些词之后的 `(...)` 是**控制流头部**，不是参数表（`for (const [k, v] of [[…]])` 那一形最容易误判）。 */
+const CONTROL_WORDS = new Set([
+  'if', 'for', 'while', 'switch', 'catch', 'with', 'do', 'else', 'return', 'typeof',
+  'void', 'delete', 'new', 'case', 'await', 'yield', 'in', 'of',
+]);
+
+/** 全量括号配对（在 structuralMask 上跑）：`open → close`（不含）。串正文/注释/正则正文已抹平 ⇒ 内容骗不到结构。 */
+function bracketPairs(masked) {
+  const OPEN = { '(': ')', '[': ']', '{': '}' };
+  const CLOSE = { ')': '(', ']': '[', '}': '{' };
+  const pairs = new Map();
+  const stack = [];
+  for (let i = 0; i < masked.length; i += 1) {
+    const c = masked[i];
+    if (OPEN[c]) stack.push([c, i]);
+    else if (CLOSE[c]) {
+      const top = stack.pop();
+      if (top && top[0] === CLOSE[c]) pairs.set(top[1], i + 1);
+    }
+  }
+  return pairs;
+}
+
+/** 「最内层 `{}` 作用域」查询（= 那一层的**语句区**）。顶层 ⇒ `{whole:true, start:0, end:len}`。 */
+function braceScopes(masked, pairs) {
+  const braces = [...pairs].filter(([o]) => masked[o] === '{').sort((a, b) => a[0] - b[0]);
+  return (offset) => {
+    let best = null;
+    for (const [o, c] of braces) {
+      if (o >= offset) break;
+      if (offset < c) best = [o, c];        // 升序 ⇒ 最后命中的那对就是最内层
+    }
+    return best ? { start: best[0], end: best[1], whole: false } : { start: 0, end: masked.length, whole: true };
+  };
+}
+
+/** 顶层逗号切分（`masked` 上深度 0 的 `,` 才算分隔 ⇒ `f(a, {b: 1}, [c, d])` 切得对）。 */
+function splitTop(masked, from, to) {
+  const parts = [];
+  let depth = 0;
+  let start = from;
+  for (let i = from; i < to; i += 1) {
+    const c = masked[i];
+    if (c === '(' || c === '[' || c === '{') depth += 1;
+    else if (c === ')' || c === ']' || c === '}') depth -= 1;
+    else if (c === ',' && depth === 0) { parts.push([start, i]); start = i + 1; }
+  }
+  parts.push([start, to]);
+  return parts.filter(([a, b]) => masked.slice(a, b).trim() !== '');
+}
+
 /**
- * 建「这个名字能解析出哪些 env 名」的表。**必须按形状分优先级多趟建**，因为绑定会互相引用
+ * 一段**参数位**（或解构成员位）里有哪几个绑定：`[{ name, at, def|null }]`。
+ * 认：`a` / `a = X` / `...rest` / `{ k, k2 = Y, old: alias }` / `[a, b]`（嵌套解构递归）。
+ * 只认**绑定位**，操作数不当绑定（`if (foo === bar)` 里那个 `foo` 不会进来，控制流头部也已被调用方挡掉）。
+ */
+function paramBindingsIn(masked, code, from, to) {
+  let s = from + (masked.slice(from, to).length - masked.slice(from, to).trimStart().length);
+  while (masked.startsWith('...', s)) s += 3;
+  const text = masked.slice(s, to);
+  const simple = new RegExp(`^\\s*(${IDENT_RE})\\s*(?:=([\\s\\S]*))?$`).exec(text);
+  if (simple) {
+    const eq = text.indexOf('=');
+    return [{ name: simple[1], at: s + text.indexOf(simple[1]), def: eq < 0 ? null : code.slice(s + eq + 1, to).trim() }];
+  }
+  const first = text.trimStart()[0];
+  if (first !== '{' && first !== '[' && first !== '(') return [];
+  const bo = s + (text.length - text.trimStart().length);
+  const bc = matchBrackets(masked, bo);
+  if (bc == null) return [];
+  const out = [];
+  for (const [a, b] of splitTop(masked, bo + 1, bc - 1)) {
+    // `{ oldName: alias = DEFAULT }` ⇒ 绑定的是**冒号右边**那个名字，不是 `oldName`
+    const member = masked.slice(a, b);
+    const aliased = new RegExp(`^\\s*${IDENT_RE}\\s*:\\s*(${IDENT_RE})\\s*(?:=[\\s\\S]*)?$`).exec(member);
+    if (aliased) {
+      out.push({ name: aliased[1], at: a + member.indexOf(aliased[1]), def: null });
+      continue;
+    }
+    out.push(...paramBindingsIn(masked, code, a, b));      // 嵌套解构 / `...rest` / 带默认值的成员
+  }
+  return out;
+}
+
+/**
+ * **参数遮蔽表**：每个参数名 → `{ start, end, lits|null }`，`end` = 那个函数体的结尾。
+ * 参数表怎么认：括号对之后紧跟 `=>` 或 `{`，且括号前不是 `if`/`for`/… 这类控制词（⇒ 定义，不是调用）。
+ * `=>` 的**表达式体**没有 `{` 可配 ⇒ 保守取「最内层外围块的结尾」⇒ 宁可把遮蔽算宽（= 多进 unsupported，响），
+ * 也不许把遮蔽算窄（= 错记，静默）。#587 族 A⑤。
+ */
+function collectParamBindings(code, masked, pairs, scopes, litsOf) {
+  const out = [];
+  for (const [open, close] of [...pairs].filter(([o]) => masked[o] === '(').sort((a, b) => a[0] - b[0])) {
+    const tail = /^\s*(=>|\{)/.exec(masked.slice(close, close + 64));
+    if (!tail) continue;
+    const head = masked.slice(Math.max(0, open - 96), open);
+    const hw = new RegExp(`(${IDENT_RE})\\s*$`).exec(head);
+    if (hw && CONTROL_WORDS.has(hw[1])) continue;
+    let end;
+    if (tail[1] === '{') end = pairs.get(close + tail[0].length - 1) ?? scopes(open).end;
+    else end = scopes(close).end;
+    for (const [a, b] of splitTop(masked, open + 1, close)) {
+      for (const p of paramBindingsIn(masked, code, a, b)) out.push({ name: p.name, start: p.at, end, lits: litsOf(p.def) });
+    }
+  }
+  return out;
+}
+
+/** 读取点上有没有**遮蔽**？`{hit:false}` = 没有（照旧查文件级名字表）；`{hit:true, lits:null}` = 被遮蔽且名字解析不出 ⇒ fail loudly。 */
+function shadowAt(shadows, name, at) {
+  const list = shadows?.get(name);
+  if (!list || list.length === 0) return { hit: false };
+  const covering = list.filter((s) => at >= s.start && at < s.end);
+  if (covering.length === 0) return { hit: false };
+  const width = (s) => s.end - s.start;
+  const min = Math.min(...covering.map(width));
+  const cands = covering.filter((s) => width(s) === min);        // 最内层那一个（词法作用域赢）
+  if (cands.some((s) => s.lits == null)) return { hit: true, lits: null };
+  if (cands.length > 1) {
+    const key = (s) => [...s.lits].sort().join('\u0000');
+    if (new Set(cands.map(key)).size > 1) return { hit: true, lits: null };   // 同层两个不同绑定 ⇒ 不许猜
+  }
+  return { hit: true, lits: new Set(cands[0].lits) };
+}
+
+/**
+ * 建「这个名字能解析出哪些 env 名」的表 + **词法作用域遮蔽表**。**必须按形状分优先级多趟建**，因为绑定会互相引用
  * （`{ key = TOOLCALL_MARKERS_ENV }` 里的 `key` 依赖常量表，`const envName = LLM_TIMEOUT_ENV[field]`
  * 里的 `envName` 依赖数据表）：先收字面量与数据表，再收「别名 = 已知名」与「别名 = 已知名[...]」，
  * 最后迭代到不动点。解析不出的名字**不在表里**（调用方据此判 unsupported，不许静默放过）。
- * @returns {{ envObjs: Set<string>, names: Map<string, Set<string>> }}
+ *
+ * `names` 是**文件级**的（同名只有一本账），所以另发一张 `shadows`：参数位与块内重绑定各占一段区间，
+ * 读取点落在区间里就用区间里那份绑定（#587 族 A⑤：`function f(SHADOWED_ENV, env)` 里 `env[SHADOWED_ENV]`
+ * 读的是**参数**，不是顶层那个 `const SHADOWED_ENV = 'ERIX_X'` —— 旧扫描器把动态 key **错记**成那个静态名，
+ * 于是枚举里凭空多出一个没人读的 key，而真的动态读没进 `unsupported`（fail-closed 被绕过）。
+ * @returns {{ envObjs: Set<string>, names: Map<string, Set<string>>, shadows: Map<string, Array> }}
  */
 function analyzeEnvReads(code) {
   const masked = structuralMask(code);
@@ -243,17 +373,60 @@ function analyzeEnvReads(code) {
     changed = JSON.stringify(before) !== JSON.stringify(after);
     if (!changed) break;
   }
-  return { envObjs, names };
+
+  // ⑤ **作用域遮蔽**（#587 族 A⑤）：参数位与块内重绑定各自占一段区间，区间里的读取不许再用外层同名常量。
+  //    `litsOf` 与 `resolveExpr` 同口径（字面量 / 已知名 / `TABLE[...]`），解析不出 ⇒ `null` = 动态。
+  const pairs = bracketPairs(masked);
+  const scopes = braceScopes(masked, pairs);
+  const litsOf = (exprText) => {
+    if (typeof exprText !== 'string' || exprText.trim() === '') return null;
+    const lit = /^\s*['"]([^'"]+)['"]\s*$/.exec(exprText);
+    if (lit) return new Set([lit[1]]);
+    const id = new RegExp(`^\\s*(${IDENT_RE})\\s*$`).exec(exprText);
+    if (id && names.get(id[1])?.size) return new Set(names.get(id[1]));
+    const tbl = new RegExp(`^\\s*(${IDENT_RE})\\s*\\[[\\s\\S]*\\]\\s*$`).exec(exprText);
+    if (tbl && names.get(tbl[1])?.size) return new Set(names.get(tbl[1]));
+    return null;
+  };
+  const shadowList = [];
+  // ⑤a 参数遮蔽（含箭头函数、解构参数、`{ key = KNOWN }` 那种带默认值的参数）
+  shadowList.push(...collectParamBindings(code, masked, pairs, scopes, litsOf));
+  // ⑤b 块内 `const`/`let`/`var` 重绑定：顶层那些归 `names` 管（不算遮蔽），**块内**的才算遮蔽
+  const DECL_RE = new RegExp(`\\b(?:const|let|var)\\s+(${IDENT_RE})\\s*(?:=([^;\\n]*))?`, 'g');
+  for (const m of code.matchAll(DECL_RE)) {
+    if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;   // 串正文里的「const …」不算声明
+    const scope = scopes(m.index);
+    if (scope.whole) continue;
+    shadowList.push({ name: m[1], start: m.index, end: scope.end, lits: litsOf(m[2]) });
+  }
+  const shadows = new Map();
+  for (const s of shadowList) {
+    if (!shadows.has(s.name)) shadows.set(s.name, []);
+    shadows.get(s.name).push(s);
+  }
+  return { envObjs, names, shadows };
 }
 
-/** 下标表达式 → 名字集合；`null` = 解析不出字面量名（调用方必须进 unsupported 清单，不许静默放过）。 */
-function resolveExpr(expr, ctx) {
+/**
+ * 下标表达式 → 名字集合；`null` = 解析不出字面量名（调用方必须进 unsupported 清单，不许静默放过）。
+ * `at` = 表达式在**本篇代码**里的偏移 ⇒ 先查词法作用域遮蔽（#587 族 A⑤：被参数/块内声明遮蔽的名字，
+ * 外层那张文件级表**不再算数**；解析不出就 `null`，由调用方 fail loudly，**不许错记**）。
+ */
+function resolveExpr(expr, ctx, at = 0) {
   const lit = /^\s*['"]([^'"]+)['"]\s*$/.exec(expr);
   if (lit) return new Set([lit[1]]);
   const id = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(expr);
-  if (id && ctx.names.has(id[1])) return new Set(ctx.names.get(id[1]));
+  if (id) {
+    const sh = shadowAt(ctx.shadows, id[1], at);
+    if (sh.hit) return sh.lits ? new Set(sh.lits) : null;
+    return ctx.names.has(id[1]) ? new Set(ctx.names.get(id[1])) : null;
+  }
   const tbl = /^\s*([A-Za-z_$][\w$]*)\s*\[[\s\S]*\]\s*$/.exec(expr); // `T[field]` 直接写在读形里
-  if (tbl && ctx.names.has(tbl[1]) && ctx.names.get(tbl[1]).size > 0) return new Set(ctx.names.get(tbl[1]));
+  if (tbl) {
+    const sh = shadowAt(ctx.shadows, tbl[1], at);
+    const lits = sh.hit ? sh.lits : (ctx.names.get(tbl[1]) ?? null);
+    return lits && lits.size > 0 ? new Set(lits) : null;
+  }
   return null;
 }
 
@@ -989,3 +1162,5 @@ test('活一⑧ 解析不出 env 名的读形 ⇒ 进 unsupported 清单；不�
   assert.deepEqual(unsupportedProblems(RUNNER_SCAN.unsupported, registered), [],
     'runner 里的动态 env 读形与登记没咬合（未登记 / 过期 / 坐标漂移）');
 });
+
+export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
