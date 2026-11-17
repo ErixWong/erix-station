@@ -3232,6 +3232,109 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 2 MiB 原文编码后约 2.75 MiB，而 `maxBodyBytes` 默认只有 64 KiB —— 沿用默认值会让 413 先于任何校验发生，
 调用方拿到的是「体太大」而不是「你的包哪里不对」（§4.15 记的是同一个坑的另一半）。
 
+### 4.18 MCP 通道（`kind='mcp'` 条目、配置槽、内部下发，issue #608）
+
+契约正文在 `docs/design/mcp-integration.md`（v2）；本节只记**端点面与错误码**。
+与 §4.17 的关系：MCP 与 skill 共用同一张 `capability_items`（`kind` 分家）与同一套
+`/api/market/*` 用户面端点，**差异只在三处**：发布体没有 `bundle`、多了 `transport/command/url`、
+多了「配置槽」（凭据）这条独立通道。
+
+#### 4.18-1 发布 / 编辑 `kind='mcp'`
+
+`POST /api/admin/market/items` 与 `PUT /api/admin/market/items/:id` 的请求体多出这些字段
+（`kind:"mcp"` 时**没有** `bundle`）：
+
+```jsonc
+{ "kind": "mcp", "slug": "erix-search", "name": "…", "summary": "…",
+  "when_to_use": "…", "version": "1.0.0",
+  "transport": "stdio" | "http",
+  "command": "node", "args": ["server.mjs"],        // transport=stdio 必填 command
+  "url": "https://…/mcp",                            // transport=http 必填 url（只允许 http/https）
+  "reason": "stateful|tool_surface_gt_12|shared_quota|credential_boundary",
+  "exposure": "direct" | "deferred" | "hidden",      // 缺省 deferred
+  "lifecycle": "run" | "run-keep-alive",             // P1 两者行为相同，为 P2 预留
+  "timeout_ms": 30000,
+  "slots": [ { "name": "ERIX_SEARCH_TOKEN", "kind": "secret" | "config",
+               "inject": "env" | "header", "required": true, "description": "…" } ] }
+```
+
+校验要点（实现只在 `portal/src/market.js` 的 `validateMcpFields`，判据 `portal/test/market-mcp.test.js`）：
+
+- `transport` 三选一里的两个（`sse` 等一律 400）；`stdio` 必须给 `command` 且**不含空格**
+  （`command` 是 argv[0]，不是 shell 串）；`http` 必须给 `url` 且 scheme ∈ {http,https}；两者互斥。
+- `reason` 缺或不在四选一 ⇒ **`capability_reason_required`**（专属码，前端据此高亮那个下拉）。
+- `resident` 只接受 `false`/缺省；其它值 ⇒ `capability_kind_unsupported`（P1 不做常驻容器）。
+- `slots` 上限 16 条；`name` 匹配 `^[A-Z][A-Z0-9_]{0,63}$` 且**不许撞保留名**
+  （`PATH`/`HOME`/`ERIX_*`/`MCP_*`/`NODE_*` 等，两侧都判）；`kind:'secret'` 只能 `inject:'env'` 或 `'header'`
+  （`context` 一律不许：那是模型可见的上下文，秘密进那里等于写进提示词）；`stdio` 只能 `env`、`http` 才能 `header`；重名 ⇒ `capability_slot_invalid`。
+- 发布闸门（`POST …/publish`）：skill 要「当前版本有包」，**MCP 要「配置完整」**（`command` 或 `url`），
+  否则 `409 capability_not_published`，`details.reason` = `mcp_config_incomplete`。
+
+#### 4.18-2 配置槽（凭据）：**只写不读**
+
+| 端点 | 方法 | 说明 |
+| --- | --- | --- |
+| `/api/admin/market/items/:id/secrets` | `GET` | 槽位元数据（**响应里没有任何字段承载值**，连长度都没有） |
+| `/api/admin/market/items/:id/secrets` | `PUT` | 写/删值（`null` = 删除）⇒ 200 回新的槽位元数据 |
+
+```jsonc
+// GET 的响应
+{ "item": { "id": "…", "slug": "erix-search", "slots": [
+  { "name": "ERIX_SEARCH_TOKEN", "kind": "secret", "inject": "env", "required": true,
+    "description": "…", "scope": "global", "fde_id": null,
+    "updated_at": "…", "updated_by": "…", "has_value": true } ] } }
+// PUT 的请求体
+{ "scope": "global" | "fde", "fde_id": "<uuid，scope=fde 时必填>",
+  "values": { "ERIX_SEARCH_TOKEN": "明文", "OTHER": null } }
+```
+
+- 加密：AES-256-GCM，key 来自 `MCP_SECRET_KEY`（base64 的 32 字节，`deploy/.env`），
+  AAD = `<item_id>:<name>:<scope>:<fde_id|空串>` ⇒ **密文不可跨条目/跨槽/跨 FDE 搬移**
+  （搬过去解不开，判据 `portal/test/secrets.test.js` S-2/S-3）。
+- **缺 key 不是「用默认 key」**：`MCP_SECRET_KEY` 为空 ⇒ 加解密一律 `503 secret_key_missing`
+  （读元数据仍可用，`has_value` 恒 false）。轮换口径：换 key ⇒ 旧密文解不开 ⇒ 槽位显示未设置 ⇒ 重填。
+- 解析优先级：**fde 覆盖 global**；解不开的值按「没设置」处理（fail-closed 进 `missing`）。
+- 审计：`admin.capability_secrets_updated`，`details` 只有 `{scope, fde_id, names[], changed}`，**无值**。
+
+#### 4.18-3 内部通道（只给 agentd，worker 拿不到）
+
+| 端点 | 方法 | 说明 |
+| --- | --- | --- |
+| `/api/internal/mcp/servers` | `GET` | 本容器所属 FDE 的已解析 MCP 配置（**含明文槽值**，`no-store`） |
+| `/api/internal/mcp/tools-cache` | `POST` | 回填 `manifest.tools_cache`（`list` 之后由 runner 上报） |
+
+```jsonc
+// GET /api/internal/mcp/servers
+{ "servers": [ { "name": "erix-search", "slug": "erix-search", "transport": "stdio",
+                 "command": "node", "args": ["server.mjs"], "url": null,
+                 "exposure": "deferred", "lifecycle": "run", "timeout_ms": 30000,
+                 "slots": [ … ], "values": { "ERIX_SEARCH_TOKEN": "明文" } } ],
+  "missing": [ { "slug": "other", "names": ["TOKEN"] } ] }
+// POST /api/internal/mcp/tools-cache
+{ "slug": "erix-search",
+  "tools": [ { "name": "search", "description": "…", "inputSchema": { … } } ] }
+```
+
+`tools_cache` 的用途有两个：`deferred` 档让模型先「按需检索」到工具名再调网关；管理台/用户面显示
+「这个 server 有几个工具、分别叫什么」。它是**缓存**（可被下一次 `list` 覆盖），不是真相源。
+
+- 鉴权：per-container token（`X-Station-Token`，与其它 `/api/internal/*` 同一条中间件）；
+  **FDE 身份只从 token 推出**，不接受 query/body 指定 ⇒ 拿不到别人的槽值。
+- 槽值解析失败（缺 key / 解密失败 / 条目被停用）**不让 run 死**：降级成「这台 FDE 一个 MCP 都没有」
+  + `warn` 日志，run 正常继续（症状是工具消失，而不是 run 500）。
+- 审计：`internal.mcp_servers_resolved`，`details` 只有 `{servers[], slots[](名字), missing[]}`。
+
+#### 4.18-4 用户面的差异（相对 §4.17）
+
+- `GET /api/market/items` / `GET /api/market/items/:slug` 的每项多带
+  `kind`、`exposure`、`reason`、`transport`、`secrets_ready`（bool；该条目**所有必填槽**在本 FDE 都有值）。
+- **启用闸**：`POST /api/market/items/:slug/enabled` 对 MCP 条目先解析槽位，缺必填 ⇒
+  `409 capability_secret_missing`，`details.missing = ["NAME", …]`。这条闸**每次 `enabled:true` 都查**
+  （不只在状态迁移时查）——槽值可能在启用后被删掉或 key 轮换后解不开，此时「再点一次启用」必须同样拦住。
+- **安装不落盘**：MCP 的 `install` 只写 `fde_capability_installs`，响应 `disk:"none"`（没有包可写）。
+  真正落到容器里的只有两处物化产物：`~/.erix/mcp.json`（`{version, servers[]}`，**不含值**）与
+  `~/.erix/capabilities.json` 的 `mcp` 段（只放 `name/description/exposure/tool_count`）。
+
 ---
 
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
