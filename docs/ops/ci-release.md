@@ -251,6 +251,34 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
   `docker buildx build --load runner/`（FDE，本机需先按 `fde-image.mjs` 的口径传代理 + `--network=host`）、
   `docker buildx build --load deploy/fde-proxy`。
 
+### 4.1 CI 里有 PostgreSQL：真库腿不再静默 skip（#665）
+
+旧口径是「集成测试不在 CI 里」——CI 无 PG ⇒ 只有空库或只有真 SQL 执行才现形的
+那类缺陷在流水线上恒绿（根门禁只看 `# fail`，`# skipped` 不参与判定，一个静默 skip
+的腿和一个通过的 job 同色）。**这条口径自 #665 起作废**：质量门禁 job（`ci.yml` 的
+`gate`）已加 `services: postgres`（`postgres:16`，内置超级用户 `postgres`），步骤 ② 之后
+新增步骤 ②′ 注入 `TEST_DATABASE_URL` 并跑「必须真跑」的腿。
+
+当前接进来的两条（只加 service，不新开 job、不用 matrix、不加 Playwright）：
+
+- `portal/test/migrate-fresh-db.test.js`——空库 → baseline → bootstrap → 全部增量迁移，5 条；
+  bootstrap 会 `CREATE ROLE`、pg-fixture 会 `CREATE DATABASE` ⇒ service 账号必须超级用户。
+- `npm run test:integration:prompts`（`portal/integration/platform-prompts-db.mjs`）——写侧真
+  SQL 执行 + 种行（`FOR UPDATE` 只能锁已存在的行），7 条；在注入库里 `CREATE SCHEMA`。
+
+常驻「**skip 不算绿**」闸：`scripts/check-required-legs.mjs`（根脚本 `npm run check:ci-legs`，
+本地也能跑）。它对「必须真跑清单」：有 `TEST_DATABASE_URL` 时逐条真跑并断言 `# skipped
+== 0` 且真跑出 pass（skip>0 或 pass 低于期望 ⇒ 红）；没有 `TEST_DATABASE_URL` 时明确点名
+「这几条腿这次没跑」并 rc=1（不静默）。后续把其余 `test:integration:*` 接进来，只需往
+脚本的 `REQUIRED_LEGS` 加一条。
+
+**新增分钟（本地实测，非估算）**：两条腿墙钟 `migrate-fresh-db` **17.8s** +
+`test:integration:prompts` **1.6s** ≈ **19s**（含 node/npm 启动；`pg-fixture` 建库 5 次都算在
+migrate 那 17.8s 内，prompts 腿 0 次建库只建 schema）。再加 `postgres:16` service 容器拉起
++ `pg_isready` 健康等待（Actions runner 上该镜像很小，量级几秒到十几秒）。合计**新增约
+0.5～1 分钟**，叠在现量 2m6s～2m34s（见 §1 现价块）之上约 3 分钟，仍在 `timeout-minutes:
+20` 与 3-5 分钟口径内。若 service 拉起变慢或腿变多逼近上限，按 §4「停跑没有红灯」习惯处理。
+
 ---
 
 ## 5. GHCR 为什么免费、以及退路
@@ -270,6 +298,10 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
 ## 6. e2e 为什么不进 CI
 
 `portal/integration/wp*-e2e.mjs` 不进 CI，理由都是硬依赖：
+
+❗ **例外（#665）**：本节排除的是需要 docker daemon/IPAM/Tailscale 的 **e2e 栈**。只依赖裸
+`postgres` service（无 docker daemon / 无 IPAM / 无 Tailscale）的真库腿（`migrate-fresh-db` 与
+`test:integration:prompts`）**不属本节排除面**，已于 #665 接进质量门禁（见 §4.1）。
 
 1. 需要 **docker daemon + 起整栈**（postgres / traefik / litellm / portal / proxy / 真 FDE 容器）。
 2. **按栈派生的 IPAM 池（两腿同源）**（#227.3 立题，#270 才真的能分开）：
