@@ -216,6 +216,10 @@ services:
       #   按 `upload_settings.max_file_bytes`（管理台，迁移 0035）> 本值 > 默认 取，**每次上传现读**。
       #   改管理台不需要重建 portal 容器；改本值仍然需要（而且会被管理台里已保存的值盖住）。
       FILE_UPLOAD_MAX_BYTES: ${FILE_UPLOAD_MAX_BYTES:-33554432}
+      # #608：能力市场「配置槽」值的加密 key（base64 的 32 字节）。**没有默认值**：不写这一行 ⇒
+      # 空串 ⇒ 只能读 has_value 元数据、任何加解密都 503 `secret_key_missing`（fail-closed）。
+      # ⚠ 与 LITELLM_SALT_KEY 同类：一旦存过值就不能随手换（旧密文解不开 ⇒ 槽位显示未设置、管理员重填）。
+      MCP_SECRET_KEY: ${MCP_SECRET_KEY:-}
       ERIX_ARTIFACT_CAPTURE_BUDGET_MS: ${ERIX_ARTIFACT_CAPTURE_BUDGET_MS:-60000}
       ERIX_SHELL_TIMEOUT_MS: ${ERIX_SHELL_TIMEOUT_MS:-60000}
       ERIX_SHELL_MAX_TIMEOUT_MS: ${ERIX_SHELL_MAX_TIMEOUT_MS:-600000}
