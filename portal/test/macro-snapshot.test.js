@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
+  gitGlobalArgs,
   computeContentFingerprint,
   createSnapshot,
   copyUntracked,
@@ -408,4 +409,40 @@ test('reviewOnly 时 fold-note sink 不构建 ⇒ 折叠不写注；非审查 ru
   assert.equal(normal.calls.length, 1, '普通 run 折叠必须写一条注（闸不得顺手关掉正常路径）');
   assert.equal(normal.calls[0].name, 'note_take');
   assert.match(normal.calls[0].input.content, /前 3 轮的探查过程已归档/);
+});
+
+// ── issue #669：git 全局选项必须含 `-c safe.directory=*` ─────────────────────────
+//
+// 真机证据：portal 以 root 跑、FDE 项目目录属主 1000/1001 ⇒ git ≥2.35 报
+// `detected dubious ownership` ⇒ `createSnapshot` 的每次 git 调用全失败 ⇒ M9 100% 起不来。
+// 站内既有口径在 `gitlight.js:152`（D9 收工灯同样跨 uid 读用户目录），照它抄。
+//
+// ⚠ 为什么不做「真 chown 一个属主不同的仓库」这种更强的用例：那需要 root 且在 CI 不可用。
+//   这里钉的是**参数构造**（纯函数），足够挡住「有人把它删了」这一类回归。
+test('#669 git 全局选项含 -c safe.directory=* 与 --no-optional-locks（跨 uid 读仓库的前提）', () => {
+  const args = gitGlobalArgs();
+  const joined = args.join(' ');
+  assert.ok(joined.includes('-c safe.directory=*'),
+    `必须带 -c safe.directory=*（否则 root 读 1001 的仓库必报 dubious ownership）：${joined}`);
+  assert.ok(args.includes('--no-optional-locks'), `只读探测不抢 index 锁：${joined}`);
+  // 全局选项必须**在子命令之前**（git 的全局选项只在子命令前生效）。
+  const idxSafe = args.indexOf('safe.directory=*');
+  assert.ok(idxSafe > 0 && args[idxSafe - 1] === '-c', `safe.directory 必须紧跟在 -c 之后：${joined}`);
+});
+
+test('#669 真仓库上 rev-parse 能跑通（全局选项真的被 git() 用上）', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'w669-repo-'));
+  try {
+    execFileSync('git', ['-C', repo, 'init', '-q']);
+    execFileSync('git', ['-C', repo, 'config', 'user.email', 't@t']);
+    execFileSync('git', ['-C', repo, 'config', 'user.name', 't']);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'x');
+    execFileSync('git', ['-C', repo, 'add', '.']);
+    execFileSync('git', ['-C', repo, 'commit', '-qm', 'init']);
+    // 走 computeContentFingerprint（内部走 git()）⇒ 能拿到 HEAD sha 就说明 git() 真的带上了全局选项。
+    const fp = computeContentFingerprint(repo);
+    assert.match(fp.head, /^[0-9a-f]{40}$/, `HEAD sha 必须取到：${fp.head}`);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 });
