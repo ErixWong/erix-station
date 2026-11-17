@@ -979,11 +979,13 @@ const singleSourceProblems = [];
   }
   // #227.1：allowSharedReset（wp2b 对「有意重置共享 dev 库」的显式声明）只能出现在 lib 定义与 wp2b
   // 调用处——别的脚本出现这个选项 = 有人开始打算删共享 dev 库，必须停下来先确认语义。
-  const ALLOW_SHARED_RESET_FILES = new Set(['isolated-env.mjs', 'wp2b-e2e.mjs']);
+  // #661：`wp2b-e2e.mjs` 已退役（P5 退役了 `POST /api/projects`，它的前提消失）⇒ 现在**没有任何调用方**
+  // 允许声明「重置共享 dev 库」；白名单只留 lib 自己的定义。判据因此**更严**（原来是「只有 wp2b 可以」）。
+  const ALLOW_SHARED_RESET_FILES = new Set(['isolated-env.mjs']);
   const sharedResetOutliers = files.filter((f) => !ALLOW_SHARED_RESET_FILES.has(path.basename(f))
     && fs.readFileSync(f, 'utf8').includes('allowSharedReset'));
   if (sharedResetOutliers.length) {
-    singleSourceProblems.push(`allowSharedReset 出现在 lib/wp2b 之外（只有 wp2b 允许声明重置共享 dev 库）：${sharedResetOutliers.map((f) => path.relative(path.resolve(HERE, '../..'), f)).join(', ')}`);
+    singleSourceProblems.push(`allowSharedReset 出现在 lib 之外（#661 起没有任何脚本允许声明重置共享 dev 库，wp2b 已退役）：${sharedResetOutliers.map((f) => path.relative(path.resolve(HERE, '../..'), f)).join(', ')}`);
   }
   // #227.2：脚本里的 compose 命令串必须显式带 `-p `（隔离系用 `${COMPOSE_PROJECT_NAME:?…}`、共享系用
   // `${COMPOSE_PROJECT_NAME:-station}`）——出现不带 -p 的 `docker compose ` 即红：回到「忘 export 就对
