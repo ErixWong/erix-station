@@ -71,6 +71,21 @@ export function artifactPath(reportsRoot, templateName, date) {
 }
 
 /**
+ * 查 `users.fde_name`（产物根缺省口径用，#637 ②）。`intent.userId` = users.id。
+ * 查不到（无 userId / 行不存在 / 列 NULL / 查询报错）⇒ 返回 null，交 `defaultReportsRoot` 兜底 'user'：
+ * 产物仍落在挂载里，**不**能因取不到名字而退回不可见的容器内路径。
+ */
+async function lookupFdeName(pool, userId) {
+  if (!userId) return null;
+  try {
+    const { rows } = await pool.query('SELECT fde_name FROM users WHERE id = $1', [userId]);
+    return rows[0]?.fde_name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 取（或建）该 (user, template) 的长期宏会话。
  *
  * ⚠ **复用判据必须同时看 `origin` 与 `user_id`**：
@@ -126,7 +141,9 @@ export async function getOrCreateMacroSession(pool, { userId, templateName, cwd 
  *
  * @param {object} intent  W2 产出的意图（含已占位的 `macroRunId` 与参数快照 params.cwd/task/maxRounds）
  * @param {object} [opts]
- *   - `reportsRoot` 产物根（默认 `~/reports`；测试注入临时目录，别真写用户 `~/reports`）
+ *   - `reportsRoot` 产物根（**注入优先**；缺省 ⇒ 现算 = `config.userSpaceRoot` + `users.fde_name`，#637 ②；
+ *                   测试注入临时目录，别真写 `/srv/erix`）
+ *   - `config`      仅用于读 `userSpaceRoot`（缺省产物根口径），其余字段忽略。
  *   - `runTask`     执行体（生产=真跑一次 run；测试注入桩 runner）。
  *                   `(ctx) => Promise<{ ok, text?, error? } | void>`；抛异常或 `ok===false` ⇒ 失败。
  *   - `sessionsHome` notes 根（`<home>/sessions/<id>/notes` 的 `<home>`），透传给 runTask。
@@ -135,13 +152,14 @@ export async function getOrCreateMacroSession(pool, { userId, templateName, cwd 
  * @returns {{ status, verdict, sessionId, childRunId, artifactPath? , ... }}
  */
 export async function executeScheduledIntent(pool, intent, {
-  reportsRoot = defaultReportsRoot(),
+  reportsRoot = null,
   runTask,
   sessionsHome = os.homedir(),
   postMessageImpl = postMessage,
   notifyImpl = deliverIntent,
   now = new Date(),
   log = console,
+  config = {},
 } = {}) {
   const macroRunId = intent?.macroRunId;
   if (!macroRunId) {
@@ -208,7 +226,14 @@ export async function executeScheduledIntent(pool, intent, {
   }
 
   // —— 产物由**平台**落盘（模型被 jail 在项目 cwd，它写的文件会把用户收工灯弄红）——
-  const artifact = artifactPath(reportsRoot, templateName, date);
+  // 产物根：注入优先；缺省 ⇒ 按 `config.userSpaceRoot` + `users.fde_name` 现算（#637 ②）。
+  // intent.userId 是 users.id，产物要落到用户可见的 RW 挂载 ⇒ 查 users.fde_name；查不到 ⇒ fde_name=null
+  // ⇒ defaultReportsRoot 兜底 'user'（仍在挂载里，**不**退回 os.homedir()，否则又回到不可见的容器内路径）。
+  let root = reportsRoot;
+  if (root == null) {
+    root = defaultReportsRoot(await lookupFdeName(pool, userId), config?.userSpaceRoot);
+  }
+  const artifact = artifactPath(root, templateName, date);
   try {
     await fs.mkdir(path.dirname(artifact), { recursive: true });
     const text = (result && typeof result.text === 'string') ? result.text : String(result ?? '');
