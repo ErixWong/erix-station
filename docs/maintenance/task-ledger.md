@@ -8497,3 +8497,59 @@ M7 管道在真机上**确实通了**（`clock:2026-11-17` → `done`、宏会�
 `UPDATE users SET mail_otp_enabled=false WHERE login='eric'`（**原值 `t`**）。
 
 **待办**：#646（M1/M9 触发源，在跑）、#637（M7 产物三缺陷，在跑）。
+
+### 8.161 #643 A+B：compose 三处镜像引用缺值即报错 + 本地构建自曝（2026-11-17，主 agent 设计 + pi worker ×3 + 主 agent 收尾）
+
+现场：共享 dev 栈的 `station-portal` 从 GHCR digest pin 掉回 `revision=unknown` 的本地构建
+（12:19 另一 session 又把它 `docker compose build` 成 `erix-station-portal:local`，实况仍在），
+`/api/health` 只报「未知」、界面只显示「未知」、日志一声不响。根因链在 issue #643：
+`deploy/.env` 是 gitignore 的、**worktree 里根本没有它**，而 compose 写的是 `${VAR:-fallback}`
+⇒ 谁在 worktree 里跑一次 `up -d`（**不带 `--build`**）就把共享栈换成 scratch 镜像。
+
+**A（`30920fd`）** 三处一起改 `${VAR:?…}`（`station-portal.image:130` /
+`station-docker-proxy.image:72` / `IMAGE_ALLOWLIST:98`+`FDE_IMAGE:281`，**同一条不变式拆两处**，
+只改 image 行的话「本地构建悄悄进 allowlist」这条根因还留着）：
+- **`.env.example` 的值刻意留空**：空串照样被 `:?` 拒（compose 把空值当没设）⇒ 复制模板不等于
+  拿到改共享栈的许可；文案写明「填了 = 你有意换镜像」+ 本地 scratch 的写法（`:local`，且必须 `--build`）。
+- 判据两条：`portal/test/deploy-env-defaults.test.js`（静态锁 5 条，无 docker 也能跑）+
+  `test/deploy-compose-failclosed.test.js`（**真调 compose 的行为锁** 6 条，缺 docker 才 skip）。
+- 变异 4 个（恢复 portal 回落 / 恢复 allowlist 回落 / 摘掉 `.env.example` 的登记 / 文案里去掉变量名）
+  ⇒ 分别红 4 / 2 / 1 / 1 条，全在具名用例上。
+
+**B（`bc1fa9a` + `47f5943`）** 本地构建自曝两条腿：
+- 启动 `warnIfLocalBuild()`（`cli.js` 在 `loadConfig()` 之后、`migrate()` 之前；migrate 失败会
+  `exit(1)`，喊晚了这份日志就没人看到）；`GET /api/admin/version` 加**顶层真布尔** `localBuild`
+  （不塞进 `server`：「每格都是字符串」那条不变式正被 `admin-version-panel.test.js` 钉着）。
+- **判别位只认 `revision`**：`builtAt` 是另一个 ARG，它单独缺不说明这份构建没身份
+  —— 拿它当判据会把真发布件报成本地构建（变异 M-b 就是这条，红 6 条）。
+- 前端**只搬不推**：三态（`true`/`false` 是真话，缺键 ⇒ `null` ⇒ 不渲染），
+  并带一条源码级红线「`localBuild` 那侧的判定表达式不许出现 `revision`」+ 一条地板防红线空转。
+- 判据：后端 `portal/test/local-build-surface.test.js` 9 条（含 `cli.js` 接线锁）、前端 8 条。
+  变异 7 个（恒 false / 判据换 builtAt / 摘掉调用 / 面板不输出 / 去掉 v-if / 前端自推 / `'true'` 当真）
+  ⇒ 全部红在具名用例，摘掉调用那条**恰红在接线锁**。
+
+**真机验证**（不打断共享栈：全程只跑一次性容器，`docker ps` 前后对比 `station-*` 一字未动）
+- A：worktree 里 `docker compose -f deploy/docker-compose.yml up -d` ⇒ **rc=1**，stderr 点名
+  `STATION_PORTAL_IMAGE` 与服务路径；拿运维真 `.env` 现跑 ⇒ rc=0（正常部署没被拦）。
+- B：同一棵工作树构两份镜像 —— 不传 `STATION_REVISION` ⇒ 启动日志恰 1 条
+  `[version] local-build revision=unknown …`，端点 `localBuild=true`；传了 ⇒ **0 条**、`localBuild=false`。
+  `/api/health` 三格形状两次都没变（#586 的形状没动）。一次性容器/网络/镜像已全部清掉。
+
+**口径与坑（下次照抄）**
+- `--env-file <空文件>` 才能压掉 compose 的**自动装载**（`--project-directory` 不改装载点）；
+  行为锁必须显式给，否则本机有 `.env` 就测不出缺失、CI 又没 docker ⇒ 静态锁兜底。
+- `docker compose config` 在 `DOCKER_HOST` 是死的 tcp 端点时**照样 rc=0**（config 不连 daemon），
+  所以读 ops `.env` 做正向验不需要活的 docker 上下文，也不会误建容器。
+- compose 一次只报**第一个**插值错误，而 `FDE_IMAGE` 有两处、求值顺序未定义 ⇒
+  行为锁对「两处都点名」只采样取证（首轮只看到 `services.station-portal.environment.FDE_IMAGE`），
+  不把顺序写成断言。
+- 工单写「测试放 `test/`」时注意仓库**实际有 `test/` 与 `portal/test/` 两处**（#586 的先例在后者）：
+  A 那条按工单落 `test/`（它测的是 compose 本身，不碰 portal 源码），B 落 `portal/test/`。
+- **`ui` 腿留给下次发布件部署**：本单的面板标注只到 spec 层（真机面板要看的是带 `localBuild`
+  的端点 + 真镜像，共享栈现在是别人的本地构建，不该为验证去换它）。
+  复验命令：`PORTAL_URL=… E2E_UI_BASE=… node portal/integration/version-surface-e2e.mjs`。
+- 基线：主套件 2811 →（A）2820 →（B）2829，skipped 恒 83，rc=0；
+  前端 1644 → 1652（`NODE_ENV=` 跑，rc=0），`npm run typecheck` rc=0。
+
+**没做的**：C（advisory lock，#635 写侧已落、缺读侧对账 + 存量回填）本轮按用户指令**未动**，
+issue #643 保持 OPEN 并在单下留了口径。
