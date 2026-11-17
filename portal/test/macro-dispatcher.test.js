@@ -294,6 +294,54 @@ test('#637①-4 pollRunTask：run finished ⇒ ok:true 且 text 非空；failed 
   });
 });
 
+// —— #637①-4b【接线锁】：dispatcher **缺省** runTask 必须就是 pollRunTask ——
+// 上面 ①-4 直接测 `pollRunTask`、①-5 **注入** `runTask` ⇒ 两条都绕过 `defaultRunTask`。
+// 主 agent 复验时把 `defaultRunTask` 改回空壳桩 `({ok:true,text:''})` 跑测试：**全绿**
+// （①-5 的注释声称「改回空壳桩 ⇒ 本条红」，实测是假的 —— 它注入 runTask，压根不走缺省）。
+// 本条钉的是「接线」：**不注入** runTask，走 createIntentDispatcher 的缺省，
+// 断言产物正文来自 transcript（空壳桩会给空串 ⇒ 红）。
+test('#637①-4b【接线锁】dispatcher 缺省 runTask = pollRunTask（不注入也等终态）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T8b'));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'w616home-b-'));
+    const intent = await claimedIntent(pool, scene);
+    // 入队后 **100ms 才失败**（复刻「run 起来了一会儿才被网络错误打死」）。
+    // 判别器：空壳桩立刻返回 ok:true ⇒ 账 done（错）；缺省 pollRunTask 会等到 failed ⇒ 账 failed（对）。
+    // ⚠ 这就是真机 bug 的形状：`status=failed` 的 run 被记成 `done`。
+    const dispatcher = createIntentDispatcher({
+      pool,
+      config: { userSpaceRoot: home },
+      reportsRoot: home, sessionsHome: home,
+      log: { warn() {}, info() {} },
+      executeScheduledIntent: async (p, it, opts) => {
+        const { executeScheduledIntent: real } = await import('../src/macro-scheduled.js');
+        return real(p, it, {
+          ...opts,
+          postMessageImpl: async (...args) => {
+            const posted = await (await import('../src/sessions.js')).postMessage(...args);
+            const rid = posted?.run?.id;
+            if (rid) {
+              setTimeout(() => {
+                p.query(`UPDATE runs SET status='failed', error='{"code":"network","message":"fetch failed"}'::jsonb, ended_at=now() WHERE id=$1`, [rid])
+                  .catch(() => {});
+              }, 100);
+            }
+            return posted;
+          },
+        });
+      },
+    });
+    const out = await dispatcher.dispatch([intent]);
+    assert.equal(out.dispatched, 1);
+    const row = await rowOf(pool, intent.macroRunId);
+    // ⚠ 反向自证锚点：把 defaultRunTask 改回空壳桩 ⇒ 立刻 ok:true ⇒ 账 done ⇒ 本条红。
+    assert.equal(row.status, 'failed',
+      `run 后来 failed ⇒ 账必须 failed（空壳桩会立刻记 done）。实际 ${row.status}`);
+    await fs.rm(home, { recursive: true, force: true });
+  });
+});
+
 // —— #637①-5：run failed ⇒ macro_runs 落 failed 而非 done（真机 network 场景端到端）——
 test('#637①-5 run failed ⇒ macro_runs 落 failed 而非 done（真机 network 场景）', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {

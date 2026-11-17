@@ -21,7 +21,7 @@ import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import { claimMacroRun } from '../src/macros.js';
 import { claimRun } from '../src/internal.js';
 import {
-  executeScheduledIntent, artifactPath, macroOrigin, macroSessionTitle,
+  executeScheduledIntent, artifactPath, macroOrigin, macroSessionTitle, defaultReportsRoot,
 } from '../src/macro-scheduled.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
@@ -365,6 +365,12 @@ test('#637②-7 产物根缺省 = config.userSpaceRoot + users.fde_name（不是
     // ⚠ 反向自证锚点：把缺省改回 os.homedir()（旧 defaultReportsRoot）⇒ 这里 startsWith 失败、下面命中 ~/reports。
     assert.ok(!out.artifactPath.startsWith(path.join(os.homedir(), 'reports')),
       `缺省不得回落 os.homedir()/reports：${out.artifactPath}`);
+    // ⚠ 上面那条走的是**注入** userSpaceRoot 的路径，钉不到「缺省值」本身。
+    //   生产走的是缺省（没人给 config.userSpaceRoot 时就靠它）⇒ 缺省必须单独钉一次。
+    //   主 agent 复验时把缺省改成 os.homedir() 跑测试：**全绿**（因为注入把它遮住了）⇒ 补这条。
+    assert.ok(defaultReportsRoot('eric').startsWith('/srv/erix/users/'),
+      `缺省产物根必须是用户可见的 RW 挂载 /srv/erix/users/<fde>：${defaultReportsRoot('eric')}`);
+    assert.equal(defaultReportsRoot('eric'), '/srv/erix/users/eric/reports');
     assert.equal(await fs.readFile(out.artifactPath, 'utf8'), '产物正文', '产物仍由平台落盘、非空');
     await fs.rm(home, { recursive: true, force: true });
   });
