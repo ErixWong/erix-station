@@ -748,10 +748,15 @@ export const WRITE_METRICS_SQL = `INSERT INTO system_metrics (
 
 /** 磁盘行的多值 INSERT（每拍一条语句；冲突目标是复合主键 `(sampled_at, device)`）。 */
 export function disksInsertSql(count) {
+  // ⚠ 每行自己的参数是 **6 个**（device/path/fs/total/used/avail），`$1`（sampled_at）在每行复用。
+  // 所以下一行的起点是 `i * 6`，一行里要写到 `$${base + 7}`——**七列七个表达式**。
+  // 这里曾经写成 `i * 5` + 只写到 `base + 6`（六列六值），症状是**每一拍写库都 42601**
+  // `INSERT has more target columns than expressions`，而假 pool 的单测一个字都看不出来
+  // （只有真 postgres 会拒绝）⇒ 形状判据在 `portal/test/system-metrics.test.js`（占位符连续无空洞）。
   const rows = [];
   for (let i = 0; i < count; i += 1) {
-    const base = i * 5;
-    rows.push(`($1, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`);
+    const base = i * 6;
+    rows.push(`($1, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`);
   }
   return `INSERT INTO system_metrics_disks (sampled_at, device, path, fs, total_bytes, used_bytes, avail_bytes)
     VALUES ${rows.join(', ')}
