@@ -828,7 +828,6 @@ export const zhCN = {
       slotInvalid: '配置槽的组合不合法：{combo} 不在矩阵里（stdio 只能 env，http 只能 header）。',
       secretMissing: '启用不了：管理员还没配这几个槽的值（{slots}）。',
       packageShape: '技能包里命中了禁止的形状：{shape}（常驻类形状 P1 不收）。',
-      secretKeyMissing: '平台没配置凭据密钥（MCP_SECRET_KEY），现在写不了也解不了凭据。',
       generic: '请求失败（HTTP {status}）：{message}',
     },
   },
@@ -927,7 +926,6 @@ export const zhCN = {
         save: '写入',
         hasValue: '已设置',
         missing: '未设置',
-        keyMissing: '平台没配凭据密钥（MCP_SECRET_KEY）：槽位可以声明，值写不进去。',
         setResult: '{name} 已设置（值不会回显）。',
         cleared: '{name} 的值已删除。',
         kind: {

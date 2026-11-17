@@ -19,11 +19,15 @@
 //   * `run-notify`/`run-silence-alert` 的执行器 `deliverIntent` **不碰账**（只写 notifications）⇒
 //     由 dispatcher **自己** finish：投递成功⇒done，抛异常⇒failed。
 import os from 'node:os';
+import path from 'node:path';
 import { finishMacroRun, MacroError } from './macros.js';
 import { executeScheduledIntent } from './macro-scheduled.js';
 import { runMacroReview } from './macro-review.js';
 import { deliverIntent } from './notifications.js';
 import { fetchRunAssistantText } from './session-text.js';
+// issue #662：审查 run 的真实实现需要——起只读审查会话（postMessage）+ 建快照（createSnapshot）。
+import { postMessage as postMessageSession } from './sessions.js';
+import { createSnapshot as createSnapshotDefault } from './macro-snapshot.js';
 
 /** 超时回收阈值（要求④）：`pending` 且 `started_at` 早于 now-此值 ⇒ 判为「派发途中进程崩了」，落 failed。 */
 export const DISPATCH_TIMEOUT_MS = 10 * 60_000;
@@ -183,6 +187,96 @@ function notifyText(intent) {
   return { title: `宏「${name}」`, body };
 }
 
+// ── issue #662 C/D：审查 run 的真实执行体 ─────────────────────────────────────────
+
+/** 审查 run 的缺省轮数上限（run-review kind schema 的 `max_rounds` default=8）。 */
+export const DEFAULT_REVIEW_MAX_ROUNDS = 8;
+
+/** 审查轮数归一：1..100（与 `macro-kinds` run-review.max_rounds 同口径）；非法 ⇒ 缺省 8。 */
+function normalizeReviewMaxRounds(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 1 && n <= 100 ? n : DEFAULT_REVIEW_MAX_ROUNDS;
+}
+
+/**
+ * 取「原 run 的项目目录」（D）：`runs.session_id → chat_sessions.cwd`（**一次 JOIN**）。
+ * cwd 存的是容器相对形式 `~/projects/<name>`；portal 对用户空间是 RW 挂载，真实路径
+ * = `userSpaceRoot/<fde_name>/projects/<name>`（口径同 `macro-scheduled` 的 reportsRoot）。
+ * 拿不到（无 run / 无会话 / 无 cwd）⇒ null；非 `~/projects/<name>` 形态（如绝对路径）⇒ 原样交出
+ *（由快照自己因非 git 仓而失败并带回 reason）。
+ * @returns {Promise<string|null>}
+ */
+export async function resolveOriginalRepoDir(pool, { originalRunId, config } = {}) {
+  if (!originalRunId) return null;
+  const res = await pool.query(
+    `SELECT s.cwd, u.fde_name
+       FROM runs r JOIN chat_sessions s ON s.id = r.session_id
+       JOIN users u ON u.id = s.user_id
+      WHERE r.id = $1`,
+    [originalRunId],
+  );
+  const row = res.rows?.[0];
+  const cwd = typeof row?.cwd === 'string' ? row.cwd : '';
+  if (!cwd) return null;
+  const m = /^~\/projects\/([^/]+)\/?$/.exec(cwd);
+  if (!m) return cwd;
+  const userSpaceRoot = config?.userSpaceRoot ?? '/srv/erix/users';
+  return path.join(userSpaceRoot, row.fde_name ?? '', 'projects', m[1]);
+}
+
+/**
+ * 建一条**独立审查会话**（B：不复用宏会话，否则会把宏会话的 cwd 改掉）。cwd = 快照 worktree；
+ * origin = `review:<macroRunId>`（可追溯）；title = `审查 · <原 run 短 id>`。会话用完不删
+ *（历史留档），worktree 由 W4a 孤儿清扫回收（worktree_path 已落 macro_runs）。
+ */
+export async function createReviewSession(pool, { userId, cwd, originalRunId, macroRunId } = {}) {
+  const shortId = String(originalRunId ?? macroRunId ?? '').slice(0, 8);
+  const res = await pool.query(
+    `INSERT INTO chat_sessions (user_id, cwd, title, title_source, origin)
+     VALUES ($1, $2, $3, 'manual', $4)
+     RETURNING id`,
+    [userId, cwd, `审查 · ${shortId}`, `review:${macroRunId}`],
+  );
+  return res.rows?.[0]?.id ?? null;
+}
+
+/**
+ * `defaultReviewRunner` 的真实实现（C）。就写在**本文件**（复用模块私有的 `pollRunTask`，
+ * 不再多一道导出）：
+ *   1. 建一条独立只读审查会话（cwd = 快照 worktree）；
+ *   2. `postMessage({ content: brief, triggerKind:'synthetic', reviewOnly:true, cwd, maxRounds })`；
+ *   3. 轮询到终态（**复用同文件的 `pollRunTask`**，走读侧投影取正文）；
+ *   4. 返回正文；终态失败 ⇒ 抛错（`runMacroReview` 会归到 failed + unclassified，
+ *      那是「没判成」而非「判成没过」）。
+ * 所有外部件（postMessage / reviewTask / 轮询 opts）都可注入——测试不真调模型。
+ */
+export async function runReviewTaskDefault({
+  pool, brief, macroRunId, originalRunId = null, snapshot,
+  postMessage = postMessageSession, reviewTask = (ctx, opts) => pollRunTask(ctx, opts),
+  pollOpts, log = console, maxRounds = DEFAULT_REVIEW_MAX_ROUNDS,
+} = {}) {
+  const acct = await pool.query(
+    `SELECT a.user_id FROM macro_runs r JOIN macro_assignments a ON a.id = r.assignment_id WHERE r.id = $1`,
+    [macroRunId],
+  );
+  const userId = acct.rows?.[0]?.user_id ?? null;
+  const cwd = snapshot?.worktreePath ?? null;
+  if (!userId) throw new Error('审查会话缺 userId（无法起只读审查 run）');
+  if (!cwd) throw new Error('审查快照缺 worktreePath（cwd 无法指向隔离现场）');
+
+  const sessionId = await createReviewSession(pool, { userId, cwd, originalRunId, macroRunId });
+  const posted = await postMessage(pool, {
+    userId, sessionId, content: brief, triggerKind: 'synthetic', cwd, reviewOnly: true, maxRounds,
+  });
+  const childRunId = posted?.run?.id ?? null;
+  const res = await reviewTask({ pool, childRunId, sessionId }, pollOpts);
+  if (!res?.ok) {
+    const reason = res?.termination?.reason ?? 'unknown';
+    throw new Error(`审查 run 未成功（${reason}）：${res?.error ?? ''}`);
+  }
+  return typeof res.text === 'string' ? res.text : '';
+}
+
 /**
  * 创建一个意图分发器。所有执行器都可注入（默认 = 生产实现），便于「桩执行器」单测。
  *
@@ -200,6 +294,11 @@ export function createIntentDispatcher({
   sessionsHome = os.homedir(),
   runTask,
   reviewRunner,
+  // issue #662 D/B/C：快照与只读审查 run 的三个可注入件（缺省 = 生产实现）。
+  createSnapshot = createSnapshotDefault,
+  postMessage = postMessageSession,
+  reviewTask = (ctx, opts) => pollRunTask(ctx, opts),
+  reviewPollOpts,
   executeScheduledIntent: execScheduled = executeScheduledIntent,
   runMacroReview: execReview = runMacroReview,
   deliverIntent: deliver = deliverIntent,
@@ -210,10 +309,9 @@ export function createIntentDispatcher({
   // 生产缺省 runTask（#637 ①）：**真实实现** = 轮询 run 到终态、收集判决与正文（过去是空壳桩 ⇒
   // 立刻返回空文本 + done，把失败伪装成完成、产物为空）。超时不重试（`06` §8）。
   const defaultRunTask = async (ctx) => pollRunTask(ctx);
-  // 生产缺省 reviewRunner：没有模型适配器 ⇒ 明确抛错（dispatcher 会补 finish(failed)，不留 pending）。
-  const defaultReviewRunner = async () => {
-    throw new Error('未配置 reviewRunner（W4b 需要模型适配器；当前会落 failed 而非留 pending）');
-  };
+  // issue #662 C：缺省 reviewRunner 不再是「只会抛错的空壳」——在 run-review 分支里按「本次
+  // 快照 + 轮数」现建 `runReviewTaskDefault`（起只读审查会话 + 复用 pollRunTask 取正文）。
+  // 注入的 `reviewRunner` 优先（测试用桩）。
 
   /** 分派单条意图；抛异常由 `dispatch` 接住并收尾 failed。 */
   async function dispatchOne(intent) {
@@ -238,14 +336,39 @@ export function createIntentDispatcher({
           reportsRoot, sessionsHome, runTask: runTask ?? defaultRunTask, now: nowVal(), log, config,
         });
         return;
-      case 'run-review':
+      case 'run-review': {
+        // D：只在 run-review 分支建快照（run-notify 不建，快照有成本 ≤60s/≤500MB）。
+        // 原 run 的项目目录 = runs.session_id → chat_sessions.cwd（一次查询）。
+        const originalRunId = extractReviewRunId(intent);
+        const repoDir = await resolveOriginalRepoDir(pool, { originalRunId, config });
+        const snapshot = repoDir
+          ? await createSnapshot({ repoDir })
+          : { ok: false, reason: 'worktree_add_failed' };
+        // worktree_path / snapshot_id 落 macro_runs ⇒ W4a 孤儿清扫据 worktree_path 关联到账，
+        //   只在「终态>1h / running>1h」才回收（不写的话清扫会把在途审查的 worktree 也当孤儿删）。
+        if (snapshot?.ok) {
+          await pool.query(
+            `UPDATE macro_runs SET worktree_path = $2, snapshot_id = $3 WHERE id = $1`,
+            [macroRunId, snapshot.worktreePath, snapshot.snapshotId ?? null],
+          );
+        }
+        // 快照失败（ok:false）**原样传下去**，让 runMacroReview 走它已实现的失败出口
+        //（status=failed / verdict=unclassified / 不回灌）——**这里不自己吞**。
+        const runner = reviewRunner
+          ?? ((ctx) => runReviewTaskDefault({
+            pool, brief: ctx.brief, macroRunId: ctx.macroRunId, originalRunId, snapshot,
+            maxRounds: normalizeReviewMaxRounds(intent?.params?.max_rounds),
+            postMessage, reviewTask, pollOpts: reviewPollOpts, log,
+          }));
         await execReview(pool, {
           macroRunId,
-          originalRunId: extractReviewRunId(intent),
-          reviewRunner: reviewRunner ?? defaultReviewRunner,
+          originalRunId,
+          snapshot,
+          reviewRunner: runner,
           now: nowVal(),
         });
         return;
+      }
       case 'run-notify':
       case 'run-silence-alert': {
         // ⚠ 收件人是**普通用户**（intent.userId），不是 admin：deliverIntent 自己会挡「全管理员」情形。

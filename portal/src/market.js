@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { assertSafePath, ensureDirSafe, randomHex } from './fsutil.js';
 import { validateFdeName } from './projects.js';
 import { enqueueMaterializeChange } from './outbox.js';
-import { encryptValue, resolveSlots } from './secrets.js';
+import { normalizeValue, resolveSlots } from './secrets.js';
 
 // ---------------------------------------------------------------------------
 // 常量：§3 的天花板与 §4 的预算，全部集中在这里（HTTP 层与文档引用的必须是同一份）
@@ -1134,7 +1134,7 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
   }
   // 显式 `enabled:true` 的安装也要过同一道槽位闸（否则 install 就是 setCapabilityEnabled 的旁路）。
   if (isMcp && wantEnabled) {
-    const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id, key: config?.mcpSecretKey });
+    const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id });
     if (missing.length > 0) {
       throw new MarketError('还有必填凭据没配置，无法启用（等管理员配置）', {
         code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing } });
@@ -1230,7 +1230,7 @@ export async function setCapabilityEnabled({ pool, fde, slug, enabled, config = 
   // 为什么：槽值可能在启用后被管理员删掉（或 key 轮换后解不开），此时「再点一次启用」必须同样拦住，
   // 否则会出现「库里 enabled=true、运行时缺凭据、工具静默不存在」这种最难查的形态。
   if (enabled && isMcp) {
-    const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id, key: config?.mcpSecretKey });
+    const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id });
     if (missing.length > 0) {
       throw new MarketError('还有必填凭据没配置，无法启用（等管理员配置）', {
         code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing } });
@@ -1543,9 +1543,10 @@ export async function listSlots({ pool, itemId }) {
 
 /**
  * §7.2 `PUT /api/admin/market/items/:id/secrets`：写值（`null` = 删除该值）。
- * 只写不读；值走 `encryptValue`（AAD 含 fde_id）。
+ * **只写不读**：本函数没有任何「回读值」的分支，调用方也拿不到值（返回体只有 changed/scope）。
+ * 值以**明文**存库（决策见 `0042-mcp-plaintext-values.sql` 头部），因此这里只做形态校验。
  */
-export async function setSlotValues({ pool, itemId, actorId = null, scope = 'global', fdeId = null, values = {}, key }) {
+export async function setSlotValues({ pool, itemId, actorId = null, scope = 'global', fdeId = null, values = {} }) {
   if (scope !== 'global' && scope !== 'fde') throw bad("scope 只允许 'global' | 'fde'", { field: 'scope', scope });
   if (scope === 'fde' && (typeof fdeId !== 'string' || fdeId === '')) throw bad('scope=fde 时必须给 fde_id', { field: 'fde_id' });
   if (values === null || typeof values !== 'object' || Array.isArray(values)) throw bad('values 必须是对象', { field: 'values' });
@@ -1564,7 +1565,7 @@ export async function setSlotValues({ pool, itemId, actorId = null, scope = 'glo
         code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'values', name },
       });
     }
-    writes.push({ name, blob: encryptValue({ itemId, name, scope, fdeId, plaintext: raw, key }) });
+    writes.push({ name, value: normalizeValue({ name, value: raw }) });
   }
   await withTransaction(pool, async (client) => {
     for (const w of writes) {
@@ -1575,13 +1576,13 @@ export async function setSlotValues({ pool, itemId, actorId = null, scope = 'glo
           scope === 'fde' ? [itemId, w.name, scope, fdeId] : [itemId, w.name, scope]);
       } else {
         await client.query(
-          `INSERT INTO capability_param_values (item_id, name, scope, fde_id, value_encrypted, updated_by)
+          `INSERT INTO capability_param_values (item_id, name, scope, fde_id, value_plain, updated_by)
            VALUES ($1,$2,$3,$4,$5,$6)
            ON CONFLICT ${scope === 'fde'
             ? '(item_id, name, fde_id) WHERE scope = \'fde\''
             : '(item_id, name) WHERE scope = \'global\''}
-           DO UPDATE SET value_encrypted = EXCLUDED.value_encrypted, updated_by = EXCLUDED.updated_by, updated_at = now()`,
-          [itemId, w.name, scope, scope === 'fde' ? fdeId : null, w.blob, actorId]);
+           DO UPDATE SET value_plain = EXCLUDED.value_plain, updated_by = EXCLUDED.updated_by, updated_at = now()`,
+          [itemId, w.name, scope, scope === 'fde' ? fdeId : null, w.value, actorId]);
       }
     }
   });
@@ -1627,7 +1628,7 @@ export async function listMcpServersForFde(pool, fdeId) {
  * §6.1 内部通道的读面：给 agentd 的「已解析」清单（**含明文值**）。
  * 只给 `published && enabled && 非 hidden`；缺必填槽 ⇒ 进 `missing` 且**不进 servers**（fail-closed）。
  */
-export async function resolveMcpServersForFde({ pool, fde, key, log = null }) {
+export async function resolveMcpServersForFde({ pool, fde }) {
   const servers = await listMcpServersForFde(pool, fde.id);
   const ids = new Map((await pool.query(
     `SELECT id, slug FROM capability_items WHERE slug = ANY($1::text[])`, [servers.map((s) => s.name)])).rows
@@ -1636,7 +1637,7 @@ export async function resolveMcpServersForFde({ pool, fde, key, log = null }) {
   const missing = [];
   for (const s of servers) {
     const itemId = ids.get(s.name);
-    const { values, missing: miss } = await resolveSlots({ pool, itemId, fdeId: fde.id, key, log });
+    const { values, missing: miss } = await resolveSlots({ pool, itemId, fdeId: fde.id });
     if (miss.length > 0) { missing.push({ name: s.name, slots: miss }); continue; }
     resolved.push({ ...s, values });
   }
