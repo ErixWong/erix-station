@@ -157,6 +157,46 @@ export function computeExpectedVersions(migrationsDir = defaultMigrationsDir()) 
   return versions;
 }
 
+/**
+ * 台账里那些「本地已经没有对应文件」的 version（评审 R10）。纯函数、不碰 DB。
+ *
+ * 为什么要反向看：这里的循环一直只按**本地文件**正向查库（`WHERE version = $1`），从不反过来
+ * 对账 ⇒ `0039-platform-prompts` 换号成 `0040-platform-prompts` 之后，已部署库里那条旧行再也
+ * 匹配不上任何本地文件，它的 checksum **从此不再被校验**（库里形状被改了也没人报警）。
+ * 集合差：台账有、本地没有 ⇒ 孤儿。两侧都去重，输出升序（点名要可复现）。
+ */
+export function findOrphanLedgerVersions(ledgerVersions, localVersions) {
+  const local = new Set((localVersions ?? []).filter(Boolean));
+  const ledger = [...new Set((ledgerVersions ?? []).filter(Boolean))];
+  return ledger.filter((v) => !local.has(v)).sort();
+}
+
+/** warn 出口：有 `log.warn` 就用它，没有退回 `log.log`（注入的假 log 未必两个都有）。 */
+function warnLog(log, message) {
+  if (log && typeof log.warn === 'function') log.warn(message);
+  else if (log && typeof log.log === 'function') log.log(message);
+}
+
+/**
+ * 反向对账（评审 R10）：台账里有、本地 `deploy/migrations/` 没有 ⇒ **warn 点名**。
+ *
+ * ⚠ **不 fail**：已部署库不能回改（迁移历史是事实），这是运维面而不是正确性面；拒启会把一台
+ * 只是「换过一次号」的库锁在门外。也不静默删台账行（那会抹掉运维线索）。
+ */
+async function warnOrphanLedgerVersions(client, migrationsDir, log) {
+  const r = await client.query(`SELECT version FROM schema_migrations ORDER BY version`);
+  const ledger = (r.rows ?? []).map((row) => row.version);
+  const orphans = findOrphanLedgerVersions(ledger, computeExpectedVersions(migrationsDir));
+  if (orphans.length > 0) {
+    const dirHint = path.relative(REPO_ROOT, migrationsDir) || migrationsDir;
+    warnLog(log, `[migrate] ⚠️ 台账反向对账：schema_migrations 里有 ${orphans.length} 条 ${dirHint}`
+      + ` 没有的 version：${orphans.join(', ')} ⇒ 这些行的 checksum 从此不再被校验`
+      + `（换号 / 删文件的典型成因）。已部署库不回改 ⇒ 只报警不拒启；`
+      + `要消除报警就补回同名文件或手工清台账行（并登记）。`);
+  }
+  return orphans;
+}
+
 export async function isBaselineApplied(pool) {
   const r = await pool.query(
     `SELECT version FROM schema_migrations WHERE version = $1`,
@@ -327,7 +367,21 @@ export async function migrate(pool, opts = {}) {
       await exitMigrationRole(client, roleState, log);
     }
 
-    return { baselineAppliedNow: !baselineApplied, baselineChecksum: expectedBaselineChecksum };
+    // 反向对账（评审 R10）：上面那个循环只会正向查（本地文件 → 台账），这里补上反方向。
+    // 它**不许**把启动弄挂：连查询本身炸了（老库没这张表 / 没权限）也只 warn。
+    // 放在循环**之后**：刚应用完的迁移必然在本地有同名文件，不会把新行误报成孤儿。
+    let orphanLedgerVersions = [];
+    try {
+      orphanLedgerVersions = await warnOrphanLedgerVersions(client, migrationsDir, log);
+    } catch (err) {
+      warnLog(log, `[migrate] ⚠️ 台账反向对账没跑成（不影响启动）：${err?.message ?? err}`);
+    }
+
+    return {
+      baselineAppliedNow: !baselineApplied,
+      baselineChecksum: expectedBaselineChecksum,
+      orphanLedgerVersions,
+    };
   } finally {
     await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY]).catch(() => {});
     client.release();
