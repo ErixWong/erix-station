@@ -146,3 +146,109 @@ test('前端宏相关源文件从 shared 引枚举，不自己抄字面量', () 
     }
   }
 });
+
+// ── #625：KIND_SCHEMA 必须是契约 §1 的**逐字照抄**（含 default / required）──────────
+// 事故（#625）：schema 里只有 `type/values/min/max`，把契约里写好的 `default` 与 `required`
+// 全漏了 ⇒ ① 缺 `at` 的 `scheduled-task` 建得出来（永不触发）；② 前端只能按通用规则猜默认值
+// （`run-notify` 的 `states` 成 `[]` ⇒ 永远不会通知）。单靠「形状检查」抓不到这两条，
+// 所以这里**直接读契约 §1 的正文**跟 schema 对表：漂移立刻变红，而不是等到有人建模板。
+
+const CONTRACT_DOC = resolve(HERE, '../../docs/design/event-platform/10-implementation-contract.md');
+
+/** 把字面量文本切成 JS 值（支持 `'str'` / 整数 / 由字符串或整数组成的数组）。 */
+function parseLiteral(text) {
+  const t = text.trim();
+  if (t.startsWith('[')) {
+    return [...t.matchAll(/'([^']*)'|(\d+)/g)].map((m) => (m[1] !== undefined ? m[1] : Number(m[2])));
+  }
+  if (t.startsWith("'")) return t.slice(1, -1);
+  if (/^(true|false)$/.test(t)) return t === 'true';
+  if (/^-?\d+$/.test(t)) return Number(t);
+  return t;
+}
+
+/**
+ * 从契约 §1 的 `KIND_SCHEMA` 正文里取某 kind 某字段的规则原文。
+ * 文档里数组会跨行折行 ⇒ 先把空白压平再匹配（字段规则对象里没有嵌套 `{}`，`[^}]*` 够用）。
+ */
+function contractRule(kind, field) {
+  const doc = readFileSync(CONTRACT_DOC, 'utf8');
+  const from = doc.indexOf('## 1.');
+  const to = doc.indexOf('\n## 2.', from);
+  const sec = doc.slice(from, to < 0 ? undefined : to).replace(/\s+/g, ' ');
+  const kindAt = sec.indexOf(`'${kind}':`);
+  assert.ok(kindAt >= 0, `契约 §1 里没有 kind '${kind}'：schema 与契约谁改的？`);
+  const scope = sec.slice(kindAt, kindAt + 1200);
+  const m = scope.match(new RegExp(`\\b${field}:\\s*\\{([^}]*)\\}`));
+  return m ? m[1] : null;
+}
+
+/** 取规则文本里某个键的字面量（没有 ⇒ undefined）。 */
+function ruleValue(ruleText, key) {
+  const m = ruleText.match(new RegExp(`${key}:\\s*(\\[[^\\]]*\\]|'[^']*'|[^,}]+)`));
+  return m ? parseLiteral(m[1]) : undefined;
+}
+
+test('#625 KIND_SCHEMA 的 default/required/min/max/scope 与契约 §1 逐字一致（不许自己发明）', () => {
+  const schema = shared.KIND_SCHEMA;
+  assert.deepEqual(Object.keys(schema), shared.KINDS, 'KIND_SCHEMA 的 kind 集合必须与 KINDS 一致');
+  for (const kind of shared.KINDS) {
+    for (const [field, rule] of Object.entries(schema[kind])) {
+      const ruleText = contractRule(kind, field);
+      if (ruleText === null) {
+        // 契约 §1 没有这个字段 ⇒ 只允许**已记录在案的**budget 拍平字段（#617：`budget: {...}`
+        // 拍平成 `max_per_day` / `quiet_hours`，权威注释在 `shared/macro-kinds.js`）。
+        assert.ok(['max_per_day', 'quiet_hours'].includes(field),
+          `${kind}.${field} 既不在契约 §1 也不在已记录的拍平字段里：新增字段要先改契约`);
+        continue;
+      }
+      for (const key of ['default', 'required', 'min', 'max']) {
+        const docValue = ruleValue(ruleText, key);
+        const codeValue = rule[key];
+        if (docValue === undefined) {
+          assert.equal(codeValue, undefined,
+            `${kind}.${field}.${key}：契约 §1 没写，schema 却写了（发明出来的值）`);
+        } else {
+          assert.notEqual(codeValue, undefined,
+            `${kind}.${field}.${key}：契约 §1 写了 ${JSON.stringify(docValue)}，schema 里却缺了（#625 的原病）`);
+          assert.deepEqual(codeValue, docValue,
+            `${kind}.${field}.${key}：schema 是 ${JSON.stringify(codeValue)}，契约 §1 是 ${JSON.stringify(docValue)}`);
+        }
+      }
+    }
+    // scope 也只能照抄契约（`KIND_SCOPE` 与 schema 不许各说一套）
+    const doc = readFileSync(CONTRACT_DOC, 'utf8').replace(/\s+/g, ' ');
+    const kindBlock = doc.slice(doc.indexOf(`'${kind}':`));
+    const m = kindBlock.match(/scope:\s*'(\w+)'/);
+    assert.ok(m, `契约 §1 里 '${kind}' 缺 scope`);
+    assert.equal(shared.KIND_SCOPE[kind], m[1], `KIND_SCOPE['${kind}'] 与契约不一致`);
+  }
+});
+
+test('#625 契约里的 default 自身必须合法（默认值也在自己的取值/上下界里）', () => {
+  for (const [kind, fields] of Object.entries(shared.KIND_SCHEMA)) {
+    for (const [field, rule] of Object.entries(fields)) {
+      if (!('default' in rule)) continue;
+      const d = rule.default;
+      if (rule.type === 'enum') {
+        assert.ok(rule.values.includes(d), `${kind}.${field} 默认值不在 values 里`);
+      } else if (rule.type === 'enum[]') {
+        assert.ok(Array.isArray(d) && d.length > 0,
+          `${kind}.${field} 的默认值不许是空数组（空数组=永远不通知，#625 的病根）`);
+        assert.ok(d.every((v) => rule.values.includes(v)), `${kind}.${field} 默认值含 values 外的取值`);
+      } else if (rule.type === 'int') {
+        assert.ok(Number.isInteger(d), `${kind}.${field} 默认值必须是整数`);
+        if (rule.values) assert.ok(rule.values.includes(d), `${kind}.${field} 默认值不在 values 里`);
+        if (rule.min !== undefined) assert.ok(d >= rule.min, `${kind}.${field} 默认值 < min`);
+        if (rule.max !== undefined) assert.ok(d <= rule.max, `${kind}.${field} 默认值 > max`);
+      } else if (rule.type === 'duration') {
+        assert.match(d, shared.DURATION_RE, `${kind}.${field} 默认值不是 duration 形态`);
+      } else if (rule.type === 'time') {
+        assert.match(d, shared.TIME_RE, `${kind}.${field} 默认值不是 HH:MM`);
+      }
+      // 必填字段不该同时有默认值（有默认值就不会缺，`required` 是空话）
+      assert.equal(Boolean(rule.required) && 'default' in rule, false,
+        `${kind}.${field} 既 required 又有 default：口径自相矛盾`);
+    }
+  }
+});

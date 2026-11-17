@@ -657,6 +657,12 @@ export async function archiveSession(pool, { userId, sessionId }) {
 export async function postMessage(pool, {
   userId, sessionId, content, attachments, notify, record, onSessionTitle,
   triggerKind = 'user_send',
+  // issue #627 ②③：两个只给「平台自己起的 run」（宏 / 自动化）用的参数。
+  //  ② `cwd`：非空串且与会话当前 cwd 不同 ⇒ 事务内刷 `chat_sessions.cwd`（run 的 cwd 是 claim
+  //     时从会话行读的，不刷 = 继续在旧目录跑）。会话行本事务已 FOR UPDATE，与并发发送串行。
+  //  ③ `maxRounds`：本次 run 的轮数上限。**选定的路线 = 写进 run 行**，理由写在下面写入处。
+  // 两者对用户面发消息（routes 层）都不传 ⇒ 行为逐字不变。
+  cwd = null, maxRounds = null,
 }) {
   // 体校验（与 handlePostMessage 的前置校验同一函数；此处兜底，保证直接调用者也拿不到非法数据）
   const valid = validateMessageBody({ content, attachments });
@@ -786,6 +792,36 @@ export async function postMessage(pool, {
       `INSERT INTO run_queue (run_id, container_id, status) VALUES ($1, $2, 'pending')`,
       [runId, container.rows[0].id],
     );
+    // issue #627 ②：会话级 cwd 刷新（只对传了 cwd 的调用方生效）。放在同事务 ⇒ 与
+    // 「本 run 入队」原子：不会出现「run 已排但 cwd 仍旧」的一半状态。
+    const nextCwd = typeof cwd === 'string' && cwd.trim() !== '' ? cwd.trim() : null;
+    if (nextCwd !== null && nextCwd !== s.cwd) {
+      await client.query(
+        `UPDATE chat_sessions SET cwd = $2, updated_at = now() WHERE id = $1`,
+        [s.id, nextCwd],
+      );
+    }
+    // issue #627 ③：`maxRounds` 真的进 run。**路线选择与理由**（issue 里给了两条）：
+    //   查清：run 的 maxRounds 过去**只来自容器级 env** `ERIX_MAX_ROUNDS`（provisioner.js:231 注入、
+    //   worker.js:1105 parseMaxRounds，默认 16）——runs 表无 `max_rounds` 列、run_queue 无 payload 列、
+    //   claim ticket 也不带 ⇒ 根本不存在 per-run 通道，「只加 postMessage 参数」落不了地。
+    //   拍板：**写进 run 行**（本行），再让 claim 把它随 ticket 下行，agentd 以 per-run
+    //   `ERIX_MAX_ROUNDS` 起 worker——worker 已经读这个 env，一行不用改，语义与容器默认同一口径。
+    //   存在 `runs.run_state` 的 **`host_max_rounds`** 键上而不是新增列：加列要动迁移（#626/#627
+    //   硬要求：不动迁移，代价是 19 处 head 断言）。`run_state` 本列由引擎 `saveRunState` 服务端
+    //   `||` 合并写，它的键集里没有 `host_max_rounds` ⇒ 宿主的键不会被引擎覆盖（引擎也不读它）。
+    const mr = Number(maxRounds);
+    const safeMaxRounds = Number.isInteger(mr) && mr >= 1 && mr <= 100 ? mr : null;
+    // 区间与 `shared/macro-kinds.js` KIND_SCHEMA['scheduled-task'].maxRounds（min 1 / max 100）同口径；
+    // 非法值不写键（而不是写个 0）：没声明 = 用容器默认，不能把非法输入翻译成一个更小的小轮数。
+    if (safeMaxRounds !== null) {
+      await client.query(
+        `UPDATE runs SET run_state = COALESCE(run_state, '{}'::jsonb)
+                              || jsonb_build_object('host_max_rounds', $2::int)
+          WHERE id = $1`,
+        [runId, safeMaxRounds],
+      );
+    }
     // 消息关联 run（user 消息 = 它触发的 run）
     await client.query(`UPDATE messages SET run_id = $2 WHERE id = $1`, [msg.rows[0].id, runId]);
 
@@ -804,7 +840,11 @@ export async function postMessage(pool, {
         attachments: safeAttachments,
         created_at: msg.rows[0].created_at?.toISOString?.() ?? msg.rows[0].created_at,
       },
-      run: { id: run.rows[0].id, status: run.rows[0].status, trigger_kind: run.rows[0].trigger_kind },
+      run: {
+        id: run.rows[0].id, status: run.rows[0].status, trigger_kind: run.rows[0].trigger_kind,
+        // #627 ③：回显本次 run 真的带上了轮数上限（没带 = null，调用方可判）。
+        max_rounds: safeMaxRounds,
+      },
     };
 
     // G2：幂等记账并入业务事务（同 client 同事务）——状态码取本端点的契约值 202（portal.md §4.3）。

@@ -47,6 +47,34 @@ export function extractReviewRunId(intent) {
   return null;
 }
 
+/** 到期意图的固定分派坐标（`macro-eval.js#evalExpiry` 产的：`criterion='tick'` + `bucket='expiry'`）。 */
+export const EXPIRY_BUCKET = 'expiry';
+
+/**
+ * 是不是「到期」意图（issue #624）。
+ *
+ * ⚠ **为什么要在按 kind 分派**之前**拦一刀**：到期意图的 `templateKind` 是订阅原本的 kind
+ *   （`run-notify` / `scheduled-task` / …），直接落到 kind 分支上会：
+ *     - `scheduled-task` ⇒ **真的起一个 run**（到期只是不想再跑了，不是又要跑一次）；
+ *     - `run-review` ⇒ 白起一次审查；
+ *   到期是**生命周期的正常结束**，该做的只说一声 + 把账收成 `done`（**不是 `failed`**）。
+ */
+export function isExpiryIntent(intent) {
+  return intent?.criterion === 'tick' && intent?.bucket === EXPIRY_BUCKET;
+}
+
+/** 到期通知的正文：说清「到什么时候了、已停用」，而不是通用的「触发（tick）」。 */
+function expiryText(intent) {
+  const name = intent?.templateName ?? '?';
+  const until = intent?.evidence?.until;
+  const untilText = until ? `到期时刻 ${until}` : '已到到期时刻';
+  return {
+    title: `宏「${name}」已到期`,
+    body: intent?.evidence?.message ?? intent?.evidence?.body
+      ?? `宏「${name}」${untilText}，订阅已自动停用（正常生命周期结束，不是失败）。`,
+  };
+}
+
 /** 通知类意图的标题/正文（run-notify / run-silence-alert 共用）：优先用意图 evidence 里的文案。 */
 function notifyText(intent) {
   const name = intent?.templateName ?? '?';
@@ -92,6 +120,17 @@ export function createIntentDispatcher({
     const kind = intent?.templateKind;
     const macroRunId = intent?.macroRunId;
     if (!macroRunId) throw new Error('意图缺 macroRunId（无法收尾）');
+    // 到期先于 kind 分派（#624）：否则 `scheduled-task` 的到期会真的再起一个 run。
+    if (isExpiryIntent(intent)) {
+      // 到期 = 正常结束 ⇒ `done`；说一声走同一个 `deliverIntent`（无消费者就没人知道它停了）。
+      const { title, body } = expiryText(intent);
+      await deliver(pool, intent, {
+        recipients: intent.userId ? [intent.userId] : [],
+        success: true, title, body, now: nowVal(),
+      });
+      await finishMacroRun(pool, { macroRunId, status: 'done' });
+      return;
+    }
     switch (kind) {
       case 'scheduled-task':
         // 执行器自收尾（done/failed 都它自己 finish）⇒ dispatcher 不再 finish。

@@ -1702,6 +1702,10 @@ export const en = {
       title: 'Configure ▾',
       intro: 'Checking a box applies immediately — no save button; runs already triggered are not rolled back.',
       userScopeHint: 'Set up by an admin (user level, not subscribed per session)',
+      userScopeEnable: 'Enable',
+      userScopeEnabled: 'Enabled',
+      userScopeCancel: 'Unsubscribe',
+      userScopeChooseDir: 'Choose a directory to run in',
     },
     card: {
       enabledCount: '{count} enabled',

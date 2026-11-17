@@ -51,6 +51,15 @@ export const macroRunsPath = (sessionId: string): string =>
 /** 用户级全局流水端点（issue #614：顶栏 chip，属主 = 当前用户，不绑会话）。 */
 export const MACRO_RUNS_USER_PATH = '/api/macro-runs';
 
+/**
+ * 用户级订阅端点（issue #623：`scope='user'` 模板如 scheduled-task 的开户入口）。
+ * 不能放 `/api/admin/*`（#450 白名单）；属主一律当前用户（后端取 session user，不接受 body userId）。
+ */
+export const MACRO_ASSIGNMENTS_USER_PATH = '/api/macro-assignments';
+
+export const macroUserAssignmentPath = (assignmentId: string): string =>
+  `${MACRO_ASSIGNMENTS_USER_PATH}/${encodeURIComponent(assignmentId)}`;
+
 /** `07` §16：有未完成的记录才轮询，间隔 2s。 */
 export const MACRO_POLL_INTERVAL_MS = 2_000;
 /** 一次拉多少条流水（后端 `limit` 上限 100，契约 §3.1）。 */
@@ -66,6 +75,8 @@ export const useMacroStore = defineStore('macro', () => {
 
   /** 当前会话的订阅（`scope='user'` 的流水不在会话面显示，`07` §19.1）。 */
   const assignments = ref<MacroAssignment[]>([]);
+  /** 用户级订阅（issue #623：顶栏 user-scope 实例自己读写，与会话级 `assignments` 分开）。 */
+  const userAssignments = ref<MacroAssignment[]>([]);
   const runs = ref<MacroRun[]>([]);
   /** 流水的加载态：**首次加载 / 失败 / 已加载**三者分开（`07` §17.1「加载失败不能伪装成空」）。 */
   const runsLoading = ref(false);
@@ -99,6 +110,13 @@ export const useMacroStore = defineStore('macro', () => {
   const assignmentByTemplate = computed(() => {
     const map = new Map<string, MacroAssignment>();
     for (const a of assignments.value) map.set(a.templateId, a);
+    return map;
+  });
+
+  /** 用户级订阅按模板索引（issue #623：顶栏 user-scope 下拉用）。 */
+  const userAssignmentByTemplate = computed(() => {
+    const map = new Map<string, MacroAssignment>();
+    for (const a of userAssignments.value) map.set(a.templateId, a);
     return map;
   });
 
@@ -258,6 +276,50 @@ export const useMacroStore = defineStore('macro', () => {
     }
   }
 
+  // ── 用户级订阅（issue #623：`scope='user'` 模板如 scheduled-task 的开户入口）──────
+
+  /** 读我的用户级订阅（GET /api/macro-assignments，后端只返 `scope='user'` 的）。 */
+  async function loadUserAssignments(): Promise<void> {
+    try {
+      const body = await api<{ items?: Record<string, unknown>[] }>(MACRO_ASSIGNMENTS_USER_PATH);
+      userAssignments.value = (body?.items ?? [])
+        .map(normalizeAssignment)
+        .filter((a): a is MacroAssignment => a !== null);
+    } catch {
+      userAssignments.value = [];
+    }
+  }
+
+  /** 订阅一个用户级模板（PUT {templateId, cwd, until?}，幂等 upsert）。cwd 必填、`~/projects/<name>` 形式。 */
+  async function assignUser(templateId: string, cwd: string, until: string | null = null): Promise<boolean> {
+    try {
+      const body = await api<{ assignment?: Record<string, unknown> }>(MACRO_ASSIGNMENTS_USER_PATH, {
+        method: 'PUT',
+        body: JSON.stringify({ templateId, cwd, until }),
+      });
+      const next = normalizeAssignment(body?.assignment);
+      if (next) {
+        userAssignments.value = [...userAssignments.value.filter((a) => a.templateId !== next.templateId), next];
+      } else {
+        await loadUserAssignments();
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 取消一个用户级订阅（DELETE /api/macro-assignments/:id）。 */
+  async function unassignUser(assignmentId: string): Promise<boolean> {
+    try {
+      await api<unknown>(macroUserAssignmentPath(assignmentId), { method: 'DELETE' });
+      userAssignments.value = userAssignments.value.filter((a) => a.id !== assignmentId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // ── 通知（顶栏铃铛）─────────────────────────────────────────────────────────
 
   async function loadNotifications(): Promise<void> {
@@ -331,7 +393,7 @@ export const useMacroStore = defineStore('macro', () => {
     pollingSession.value = sessionId;
     if (sessionId === null) {
       assignments.value = [];
-      await Promise.all([loadTemplates(), loadRuns(null)]);
+      await Promise.all([loadTemplates(), loadUserAssignments(), loadRuns(null)]);
     } else {
       await Promise.all([loadTemplates(), loadAssignments(sessionId), loadRuns(sessionId)]);
     }
@@ -378,6 +440,7 @@ export const useMacroStore = defineStore('macro', () => {
     templatesLoaded.value = false;
     templatesFailed.value = false;
     assignments.value = [];
+    userAssignments.value = [];
     runs.value = [];
     runsLoaded.value = false;
     runsFailed.value = false;
@@ -391,12 +454,14 @@ export const useMacroStore = defineStore('macro', () => {
   return {
     templates, templatesLoading, templatesFailed, templatesLoaded,
     assignments, runs, runsLoading, runsFailed, runsLoaded, runsErrorText, runsNextCursor,
+    userAssignments,
     filterTemplateId, filterVerdict,
     notifications, notificationsLoading, notificationsFailed, notificationsLoaded, unreadCount,
     drawerOpen, pollingSession,
-    sessionTemplates, userTemplates, assignmentByTemplate, enabledAssignments,
+    sessionTemplates, userTemplates, assignmentByTemplate, enabledAssignments, userAssignmentByTemplate,
     visibleRuns, filterActive, panelStateValue, hasPending, verdictOptions,
     loadTemplates, loadAssignments, loadRuns, loadMoreRuns, assign, unassign,
+    loadUserAssignments, assignUser, unassignUser,
     loadNotifications, refreshUnreadCount, markRead,
     openDrawer, closeDrawer, refresh, setVerdictFilter, setTemplateFilter, clearFilters,
     stopPolling, schedulePoll, reset, now, setClock,

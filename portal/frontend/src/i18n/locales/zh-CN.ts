@@ -1715,6 +1715,11 @@ export const zhCN = {
       title: '配置 ▾',
       intro: '勾选即生效，没有保存按钮；已触发的历史不回滚。',
       userScopeHint: '由管理员代配（用户级，不在会话里订阅）',
+      // issue #623：`scope='user'` 模板（如定时任务）在顶栏可自己订阅——选一个 `~/projects/<name>` 目录即可。
+      userScopeEnable: '启用',
+      userScopeEnabled: '已启用',
+      userScopeCancel: '取消订阅',
+      userScopeChooseDir: '选择运行目录',
     },
     card: {
       enabledCount: '{count} 个启用',

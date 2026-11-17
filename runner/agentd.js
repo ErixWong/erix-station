@@ -1099,6 +1099,15 @@ function buildWorkerEnv(runStart, baseEnv = process.env) {
     childEnv.GIT_COMMITTER_NAME = identity.name;
     childEnv.GIT_COMMITTER_EMAIL = identity.email;
   }
+  // issue #627 ③：per-run 轮数上限。ticket 带了 `max_rounds`（宏 / 自动化起的 run）就覆盖
+  // 容器级默认——worker 本来就读 `ERIX_MAX_ROUNDS`（worker.js:1105 parseMaxRounds），
+  // 所以只需在这里把环境量换成本次的值，runner 侧零改动、且与容器默认同一解析口径。
+  // 区间 1..200 与 `lib/config.js` parseMaxRounds 一致；越界/非整数不覆盖（宁可回到容器默认，
+  // 也不要把一个脏值当预算传给引擎——引擎拿到 `maxRounds: 0` 会启动期 TypeError）。
+  const perRunMaxRounds = Number(runStart?.max_rounds);
+  if (Number.isInteger(perRunMaxRounds) && perRunMaxRounds >= 1 && perRunMaxRounds <= 200) {
+    childEnv.ERIX_MAX_ROUNDS = String(perRunMaxRounds);
+  }
   return childEnv;
 }
 
@@ -1285,6 +1294,14 @@ async function onWorkerFinished(ctx, msg) {
  * stop 路径（stop_request/stop_heartbeat，补报 aborted 的分支）。
  * 崩溃/lease_lost/revoke/resume 路径**不捕获**——run 还会继续，产物回收只发生在确认终态时。
  * best-effort：lib 内已全量兜底不抛出，失败仅 warn 日志，绝不得阻塞清场。
+ *
+ * issue #626（只读闸第四条旁路的排查结论）：**本函数不违反 review-only，故意不加闸**。
+ * 查清依据：`captureArtifact`（lib/artifacts.js:142）对 `cwd` 只做**读**——`git -C cwd diff HEAD`
+ * / `status --porcelain` / `readFileSync` 快照，不写不 checkout；落盘在 portal 侧
+ * `putRunArtifact`（portal/src/artifacts.js:65-103）写 `config.artifactsRoot/<runId>.tar.gz`，
+ * 默认 `/srv/erix/artifacts`（portal/src/config.js:309，portal 持久卷 bind mount），
+ * **不在用户空间**（不碰 `~/projects`）。⇒ 审查 run 上传产物 = 读 worktree + 写平台卷，
+ * 不弄脏用户目录，且产物本身就是审查要看的东西——跳过反而丢审查面。
  */
 async function captureRunArtifact(ctx) {
   const result = await captureAndUploadArtifact({
