@@ -1857,7 +1857,7 @@ async function handleAdminApi(req, res, ctx, url) {
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
 
-  // 管理台「提示词」面板（issue #596 片 A，契约 portal.md §4.18）：`GET` 读三块当前值 + 生效全文，
+  // 管理台「提示词」面板（issue #596 片 A，契约 portal.md §4.19）：`GET` 读三块当前值 + 生效全文，
   // `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}` 写。与 upload/settings 同口径：
   // **无需** `invalidate()`——物化与改名都每次现读。表不存在 / 读失败也回 `200`（回落内置，不是 500）；
   // **不新增错误码**，校验失败一律 `validation_failed`（`details.field`）。

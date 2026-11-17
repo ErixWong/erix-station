@@ -61,10 +61,10 @@
 | 管理 | `GET /api/admin/upload/settings` | **单文件上传上限：读**（#485 片 A，§4.15）。回的是**当前生效值** + **来源**（`db`/`env`/`default`）+ 允许区间；表不存在/读失败也回 `200`（不是 500）|
 | 管理 | `GET /api/admin/version` | **版本三格（「关于」面板）**（#586，§4.16）。只读：服务端 / 平台侧引擎 / 每台 FDE，三段各自标来源；不新增错误码 |
 | 管理 | `PUT /api/admin/upload/settings` | **单文件上传上限：写**（#485 片 A，§4.15）。`{maxFileBytes}` 必须是 `1 MiB`–`1 GiB` 的 JSON 整数，否则 `400 validation_failed` 且**不落库**；**下一次上传就生效**（无缓存 ⇒ 不需重启，也不需失效任何东西）|
-| 管理 | `GET /api/admin/prompts` | **平台提示词：读**（#596 片 A，§4.18）。三块（`~/AGENTS.md` 追加段 / 整段覆写 / 会话标题 system）的当前值 + 生效全文 + 字节预算 + 只读清单；**表不存在 / 读失败也回 `200`**（回落内置提示词，不是 500）|
-| 管理 | `PUT /api/admin/prompts/addendum` | **平台补充约定：写**（#596 片 A，§4.18）。`{text}`（`""` = 清空那一节）≤ 8192 字节，且**渲染后的整份 `~/AGENTS.md`** 必须 ≤ 16384 字节，否则 `400 validation_failed` 且**一条写语句都不发**；成功回完整 GET DTO + `materializeEnqueued` ⇒ **该工位下一次 run 生效** |
-| 管理 | `PUT /api/admin/prompts/agents-md` | **平台约定整段覆写：写**（#596 片 A，§4.18）。`{text}`（`""` = 恢复内置模板）≤ 16384 字节 + 同一条渲染闸；生效时机同上 |
-| 管理 | `PUT /api/admin/prompts/title-prompt` | **会话标题提示词：写**（#596 片 A，§4.18）。`{text}`（`""` = 用内置默认）≤ 2000 字节；**不涉物化**（`materializeEnqueued` 恒 `0`）⇒ **下一次改名就生效** |
+| 管理 | `GET /api/admin/prompts` | **平台提示词：读**（#596 片 A，§4.19）。三块（`~/AGENTS.md` 追加段 / 整段覆写 / 会话标题 system）的当前值 + 生效全文 + 字节预算 + 只读清单；**表不存在 / 读失败也回 `200`**（回落内置提示词，不是 500）|
+| 管理 | `PUT /api/admin/prompts/addendum` | **平台补充约定：写**（#596 片 A，§4.19）。`{text}`（`""` = 清空那一节）≤ 8192 字节，且**渲染后的整份 `~/AGENTS.md`** 必须 ≤ 16384 字节，否则 `400 validation_failed` 且**一条写语句都不发**；成功回完整 GET DTO + `materializeEnqueued` ⇒ **该工位下一次 run 生效** |
+| 管理 | `PUT /api/admin/prompts/agents-md` | **平台约定整段覆写：写**（#596 片 A，§4.19）。`{text}`（`""` = 恢复内置模板）≤ 16384 字节 + 同一条渲染闸；生效时机同上 |
+| 管理 | `PUT /api/admin/prompts/title-prompt` | **会话标题提示词：写**（#596 片 A，§4.19）。`{text}`（`""` = 用内置默认）≤ 2000 字节；**不涉物化**（`materializeEnqueued` 恒 `0`）⇒ **下一次改名就生效** |
 | 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
 | 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
 | 管理 | `POST /api/admin/tls/inspect` | **解析但不落盘**（#456 M2，§4.13-3a）：`{certPem,keyPem?}` → 证书元数据 + `keyMatches` 三态 + 覆盖判定 + `warnings`。**零副作用**（不写盘/DB/审计、不动 `tlsLive`、不烧上传配额）；每管理员 120 次/小时 |
@@ -3343,7 +3343,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 
 **一句话**：平台对 agent 说的三句话（`~/AGENTS.md` 的**补充约定**、`~/AGENTS.md` 的**整段覆写**、
 **会话标题的 system**）从「改 `portal/src/materializer.js` + 重建 station-portal 镜像」变成
-「管理台改一行 ⇒ 下一次 run / 下一次改名生效」。真相在 `platform_prompts`（迁移 `0040`，单行表）。
+「管理台改一行 ⇒ 下一次 run / 下一次改名生效」。真相在 `platform_prompts`（迁移 `0042`，单行表）。
 契约（为什么这么设计）见 `docs/design/admin-prompts-panel-2026-11-16.md` §2–§8；本节是 API 口径。
 
 **`""` 就是「跟随内置」**（三列同语义，DB 里不出现 `NULL`）：读侧因此**不需要**区分「没配」与
@@ -3381,7 +3381,7 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 ```
 
 ⚠ 例子里的 `no_row` 是「表不存在 / 一行都没有」那一档。已部署库上更常见的形态是「行在、但没人
-存过」（迁移 0040 种的那一行）：那一档 `reason` 是 `null`，而 `updatedAt` / `updatedBy` **仍按
+存过」（迁移 0042 种的那一行）：那一档 `reason` 是 `null`，而 `updatedAt` / `updatedBy` **仍按
 「从未保存过」报 `null`/`null`**。理由：种行走 `INSERT … ON CONFLICT DO NOTHING`，而
 `updated_at` 是 `timestamptz NOT NULL DEFAULT now()` ⇒ 全新库上那一列**有值**（迁移跑过的那一刻），
 `updated_by` 才是 NULL。只看 `updated_at` 就等于让界面宣称一个管理员从没做过的「最后保存」，
@@ -3533,14 +3533,14 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > 入队通知）、`portal/src/materializer.js`（`renderHomeAgentsMd({fdeName, addendum, override})` +
 > 渲染预算 + 物化时现读）、`portal/src/http.js`（四个端点）、`portal/src/title-llm.js` +
 > `sessions.js` + `session-title.js`（改名链路吃 DB 生效值；**提示词不是守卫**，落库前照旧 `sanitizeTitle`）、
-> `deploy/migrations/0040-platform-prompts.sql`。
+> `deploy/migrations/0042-platform-prompts.sql`。
 > ⚠ `materializer.js` ⇄ `platform-prompts.js` 是**双向引用**：两边都只在**函数体里**用对面的导出，
 > 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
 > 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P15` 及其变体 + `T1`/`T1b` + `D1`）、
 > `portal/test/materializer.test.js`（「默认渲染逐字节不变」由该文件 8 条 `renderHomeAgentsMd：…`
 > 既有断言承担，本分支对它们零改动；**这里不用 `M` 字头的判据号** —— 它在本仓已被
 > `materializer.test.js:750`（用户自建 `AGENTS.md`/`.gitignore` 在 stale 清理后存活）占用）、
-> `portal/test/migrations.test.js`（0040 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
+> `portal/test/migrations.test.js`（0042 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
 
 ---
 
