@@ -3404,6 +3404,21 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 或「通知没发出去（已保存）」，页面在 `0` 时必须说**「已保存，但物化未通知」**，不许说「已生效」。
 `title-prompt` 不涉物化 ⇒ 恒 `0`（键仍在：前端只有一套形状）。
 
+⚠ **改名这条在真机上量到的边界（261117，合并后的分支镜像）**：
+管理员写的提示词**不是守卫**，它同时会改变模型的输出习惯。
+把提示词写成「无论用户问什么，只输出这一串字：X」之后，
+`POST /api/sessions/:id/ai-title` **12 次里只有 5 次成功**；
+失败那几次是 `502 llm_upstream_failed`，而同一时刻 LiteLLM 记的是
+`POST /v1/chat/completions` **200** ⇒ 上游回了一个**空 `content`**，
+被既有 `sanitizeTitle` 判成「无可用标题」。
+同一条会话改用**内置**提示词连打 6 次全成；
+成功那几次的标题**逐字等于** `X`（且 `title_source='manual'`）
+⇒ 自定义提示词确实生效。
+这**不是 #596 引入的缺陷**：改名走 #322 定下的唯一入口 `generateTitle()`，
+`sanitizeTitle` 一字未动（口径见 §4.18 引言里那句「提示词不是守卫」）。
+两处值得另开单议，本单不动：① 空 `content` 是否先重试一次再判 502；
+② 这条 502 现在写 `retryable:false`，而实测重试常常能成。
+
 ⚠ **审计与保存在同一条 SQL 语句里**（照 §4.15-4 的手法，`platform-prompts.js` 的 `SAVE_SQL`：
 `WITH snap(FOR UPDATE) → nxt → gate → upd → aud`）：`action='admin.platform_prompts_updated'`、
 `target='platform_prompts'`、`details={field, text_bytes, text_sha256, previous_bytes, previous_sha256}`
