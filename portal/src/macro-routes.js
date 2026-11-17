@@ -27,7 +27,7 @@ import {
 import {
   listNotifications, markRead, unreadCount, normalizeNotificationsLimit,
 } from './notifications.js';
-import { fetchSession } from './sessions.js';
+import { fetchSession, validateSessionCwd } from './sessions.js';
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100; // 契约 §3.1：limit ∈ 1..100
@@ -68,6 +68,57 @@ export function toPublicTemplate(t) {
 export async function userTemplates({ pool }) {
   const rows = await listTemplates(pool, { isAdmin: false });
   return { items: rows.filter((t) => t.enabled === true).map(toPublicTemplate) };
+}
+
+// ── 用户级订阅（issue #623：scheduled-task 是 scope='user'，用户需要自己的订阅写入口）──
+//
+// 会话级那份（`/api/sessions/:id/macro-assignments`）订不了 user scope：`assignTemplate` 对
+// user scope 显式拒绝带 sessionId。这一对端点把「订到自己的 `~/projects/<name>` 目录里」这条
+// 开户路径补上——`session_id` 恒为 `NULL`、`cwd` 必填且校验落在 `~/projects/<name>` 一级目录。
+
+/**
+ * `cwd` 必填 + 复用会话面同一份校验与文案（`sessions.js` 的 `validateSessionCwd`）。
+ * user-scope 的订阅要跑在某个项目目录里，故 `cwd` 是必填（区别于会话级那份 cwd 恒为 null）。
+ * 缺失先给「必填」文案；有值后交给 `validateSessionCwd`（拒绝 `..`/绝对路径/多级目录）。
+ */
+function requireUserScopeCwd(cwd) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') {
+    throw new MacroError('validation_failed', 'cwd 必填（~/projects/<name> 一级目录）', { details: { field: 'cwd' } });
+  }
+  return validateSessionCwd(cwd.trim());
+}
+
+/**
+ * GET /api/macro-assignments：我的用户级订阅。
+ * ⚠ 只返回 `scope='user'` 的（会话级订阅在会话页看，别混进来）：先取 user-scope 模板 id 集合再按
+ *   `template_id` 过滤，`listAssignments` 不带 scope 维度（它只按 user/session 圈）。
+ * 属主 = 当前用户；响应复用 `toAssignmentSnapshot`（不含 worktree_path 之类运维字段）。
+ */
+export async function userAssignments({ pool, userId }) {
+  const tplRes = await pool.query(`SELECT id FROM macro_templates WHERE scope = 'user'`);
+  const userScopeIds = new Set(tplRes.rows.map((r) => r.id));
+  const all = await listAssignments(pool, { userId });
+  return { items: all.filter((a) => userScopeIds.has(a.template_id)) };
+}
+
+/**
+ * PUT /api/macro-assignments：body `{ templateId, cwd, until? }` ⇒ 幂等 upsert（`session_id` 恒 NULL）。
+ * user scope 模板不带 sessionId（`assignTemplate` 对 user scope 拒绝带 sessionId ⇒ 这里恒传 null）；
+ * 若前端误订 session-scope 模板，`assignTemplate` 会以「scope=session 必须给 session_id」400 挡下。
+ */
+export async function putUserAssignment({ pool, userId, body = {} }) {
+  const templateId = body?.templateId;
+  if (typeof templateId !== 'string' || !templateId) {
+    throw new MacroError('validation_failed', 'templateId 必填', { details: { field: 'templateId' } });
+  }
+  const cwd = requireUserScopeCwd(body?.cwd);
+  const assignment = await assignTemplate(pool, { templateId, userId, sessionId: null, cwd, until: body?.until ?? null });
+  return { assignment };
+}
+
+/** DELETE /api/macro-assignments/:id：取消自己的订阅（`unassignTemplate` 传 userId ⇒ 非属主/不存在都 404）。 */
+export async function deleteUserAssignment({ pool, userId, assignmentId }) {
+  return unassignTemplate(pool, { assignmentId, userId });
 }
 
 /** GET /api/sessions/:id/macro-assignments（先过属主闸：非属主/不存在 404）。 */
