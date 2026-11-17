@@ -233,6 +233,9 @@ services:
       ERIX_DELEGATE_ENABLED: ${ERIX_DELEGATE_ENABLED:-1}
       ERIX_DELEGATE_MAX: ${ERIX_DELEGATE_MAX:-2}
       ERIX_DELEGATE_CHILD_ROUNDS: ${ERIX_DELEGATE_CHILD_ROUNDS:-8}
+      # #608：worker 等 agentd 代取 MCP 配置的超时（agentd 侧同步调用 portal 内部通道）。
+      # 缺省 10s：够一次内部 HTTP 往返，又不至于让「portal 挂了」把 run 拖死。
+      ERIX_MCP_CONFIG_TIMEOUT_MS: ${ERIX_MCP_CONFIG_TIMEOUT_MS:-10000}
       ERIX_DELEGATE_CHILD_TIMEOUT_MS: ${ERIX_DELEGATE_CHILD_TIMEOUT_MS:-240000}
       # issue #557：终局正文「其实是一段被文本化的工具调用」的**特征集**（runner 侧 #243 的识别旋钮，
       # env 名与缺省特征集的唯一真相在 `runner/lib/final-text-toolcall.js` 的 `TOOLCALL_MARKERS_ENV` /
