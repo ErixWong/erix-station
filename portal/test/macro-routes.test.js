@@ -195,7 +195,17 @@ test('#526 用户面：模板过滤 + 订阅 PUT 幂等 + 会话流水 keyset', 
     const admDef = await adminTemplates({ pool, query: new URLSearchParams() });
     assert.ok(!admDef.items.some((t) => t.id === tDel.id), '默认不含软删');
     assert.ok(admDef.items.some((t) => t.id === tOff.id && t.enabled === false), '停用仍在 admin 面');
-    const created = await adminCreateTemplate({ pool, body: { kind: 'scheduled-task', name: 'adm-new', scope: 'user', params: { at: '09:00' } }, adminUserId: userId });
+    // #625：`scheduled-task` 的 `at`/`cwd`/`task` 都是契约 §1 的必填 ⇒ 走路由建模板也要带齐
+    //   （旧行为：缺 `cwd` 也能建成，结果是个永远不可用的模板）。
+    const created = await adminCreateTemplate({
+      pool,
+      body: {
+        kind: 'scheduled-task', name: 'adm-new', scope: 'user',
+        params: { at: '09:00', cwd: '~/projects/demo', task: '整理今日变更' },
+      },
+      adminUserId: userId,
+    });
+    assert.equal(created.template.params.maxRounds, 16, '路由建模板也要拿到服务端补的契约默认值（#625）');
     assert.equal(created.template.created_by, userId, 'admin 建模板记 created_by');
   });
 });
@@ -322,7 +332,11 @@ test('#614 userMacroRuns：响应不含 snapshot_id / worktree_path / verdict_ra
 
 // 建一个 user-scope 模板（scheduled-task）；用户面可订。
 async function seedUserScopeTemplate(pool, tag) {
-  return createTemplate(pool, { kind: 'scheduled-task', name: `sched-${tag}`, scope: 'user', params: { at: '09:00' } });
+  // #625：`scheduled-task` 的 at/cwd/task 是契约必填 ⇒ 造 fixture 要带齐。
+  return createTemplate(pool, {
+    kind: 'scheduled-task', name: `sched-${tag}`, scope: 'user',
+    params: { at: '09:00', cwd: '~/projects/demo', task: '整理今日变更' },
+  });
 }
 
 test('#623 PUT 建 user-scope 订阅 ⇒ 库里一行、session_id 为 NULL、cwd 有值', { skip: SKIP }, async () => {

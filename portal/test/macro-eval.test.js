@@ -582,3 +582,74 @@ test('#627① 同一 at 的两个订阅（jitter=10m）在不同时刻被 claim�
     assert.equal(tD, base, '对照组两条必须同拍（否则本用例证明不了什么）');
   });
 });
+
+// ── #624：`until` 到期必须由**评估循环自己**收敛 ─────────────────────────────────
+// 旧实现 `listEvaluableAssignments` 只有 `WHERE a.enabled = true`，「顺手停用」只发生在
+// `claimMacroRun` 里 ⇒ 只有走 tick claim 的 `scheduled-task` 晚一拍会被停用，
+// `run-notify` / `run-silence-alert`（不走 tick claim）**永远 enabled**：界面显示启用、
+// 实际到期了却没人关账，也没有任何「它到期了」的通知。
+
+/** 取订阅行的启用位（收敛的唯一可观测量）。 */
+async function enabledOf(pool, id) {
+  return (await pool.query('SELECT enabled FROM macro_assignments WHERE id = $1', [id])).rows[0].enabled;
+}
+
+test('#624① run-notify 订阅 until=now-1h ⇒ 一次 tick 后 enabled=false 且产一条到期意图',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'x1');
+    const tpl = await addTemplate(pool, 'run-notify', 'session', { states: ['failed'], channel: 'site' });
+    const asg = await addAssignment(pool, {
+      templateId: tpl, userId, sessionId, until: new Date(NOW_MS - 3600_000),
+    });
+    assert.equal(await enabledOf(pool, asg), true, '前置：造的是「已到期但仍启用」的订阅');
+    const loop = startMacroEvalLoop(pool, {}, { intervalMs: 10_000_000, now: () => new Date(NOW_MS), log: SILENT });
+    const r = await loop.tick();
+    loop.stop();
+    // ⚠ 反向自证：去掉 `listEvaluableAssignments` 里的 `applyExpiredAssignments` ⇒ 下面两条都红
+    //   （enabled 仍是 true，且到期订阅被过滤掉后一条意图也产不出）。
+    assert.equal(await enabledOf(pool, asg), false, '到期必须被停用（run-notify 不走 tick claim，没人替它收敛）');
+    assert.equal(r.intents.length, 1, '到期要说一声：产一条到期意图（#624 的另一半是它有消费者）');
+    assert.equal(r.intents[0].bucket, 'expiry');
+    assert.equal(r.intents[0].criterion, 'tick');
+    assert.match(r.intents[0].anchor, new RegExp(`^assignment:${asg}$`));
+  });
+});
+
+test('#624② until 在未来的订阅不受影响（仍启用、仍被取出、不产到期意图）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'x2');
+    const tpl = await addTemplate(pool, 'run-notify', 'session', { states: ['failed'], channel: 'site' });
+    const asg = await addAssignment(pool, {
+      templateId: tpl, userId, sessionId, until: new Date(NOW_MS + 3600_000),
+    });
+    const loop = startMacroEvalLoop(pool, {}, { intervalMs: 10_000_000, now: () => new Date(NOW_MS), log: SILENT });
+    const r = await loop.tick();
+    loop.stop();
+    assert.equal(await enabledOf(pool, asg), true, '没到期不许被关掉');
+    assert.equal(r.intents.length, 0, '没到期不许产到期意图');
+    const rows = await listEvaluableAssignments(pool, { now: new Date(NOW_MS) });
+    assert.ok(rows.some((a) => a.id === asg), '未到期订阅仍要被评估');
+  });
+});
+
+test('#624③ 到期收敛后不再被 listEvaluableAssignments 返回（也不会每拍重复产意图）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'x3');
+    const tpl = await addTemplate(pool, 'run-silence-alert', 'session', { threshold: '15m' });
+    const asg = await addAssignment(pool, {
+      templateId: tpl, userId, sessionId, until: new Date(NOW_MS - 3600_000),
+    });
+    // 第一次取订阅：到期项要被取到（否则到期意图永远产不出）
+    const first = await listEvaluableAssignments(pool, { now: new Date(NOW_MS) });
+    assert.ok(first.some((a) => a.id === asg), '本轮刚判到期的订阅必须仍被取一次（到期意图靠它）');
+    // 第二次取订阅：已停用 ⇒ 不再出现
+    const second = await listEvaluableAssignments(pool, { now: new Date(NOW_MS) });
+    assert.ok(!second.some((a) => a.id === asg), '到期收敛后不许再被返回（否则每拍都白跑一次）');
+    // 第三拍依旧不出现（收敛是持久的，不靠「本轮刚好产过」这个内存状态）。
+    // 循环层面的「只产一次」由 #525⑥ 钉（幂等键那一层）。
+    const third = await listEvaluableAssignments(pool, { now: new Date(NOW_MS + 60_000) });
+    assert.ok(!third.some((a) => a.id === asg), '再往后也不许复活');
+  });
+});
