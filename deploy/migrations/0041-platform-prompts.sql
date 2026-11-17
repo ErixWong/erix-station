@@ -1,4 +1,4 @@
--- 0040-platform-prompts.sql —— 管理台「提示词」面板的数据层（issue #596 片 A / 工单 feat-261116-20，
+-- 0041-platform-prompts.sql —— 管理台「提示词」面板的数据层（issue #596 片 A / 工单 feat-261116-20，
 -- 2026-11-16）。契约：docs/design/admin-prompts-panel-2026-11-16.md §2。
 --
 -- 背景：平台喂给模型的文本里，portal 侧可控的三条（`~/AGENTS.md` 的补充约定、`~/AGENTS.md` 的整段覆写、
@@ -59,6 +59,13 @@
 --     真的同时落了 `0039-capability-market` 与 `0039-platform-prompts` 两行台账而没有任何判据报警 ⇒
 --     本文件让号到 0040（未进任何已部署库，换号 + 重放安全：内容只有 IF NOT EXISTS / ON CONFLICT DO
 --     NOTHING / 只读 DO 块）。机械闸：`portal/test/migrations.test.js`「迁移编号 NNNN 全局唯一」。
+--   ⚠ **编号第二次让号（2026-11-17）**：dev 库 station-db 的
+--     schema_migrations 里已有 `0040-mcp-channel`（另一条尚未合进
+--     origin/main 的分支 Applied 过，applied_at 2026-11-17 02:25）
+--     ⇒ 本文件若占 0040 会与之撞号 ⇒ 刻意让到 0041。本文件仍未进
+--     任何已部署库，换号 + 重放安全（内容只有 IF NOT EXISTS /
+--     ON CONFLICT DO NOTHING / 只读 DO 块）。现势判据 =
+--     `portal/test/migrations.test.js`「迁移编号 NNNN 全局唯一」那条闸。
 
 CREATE TABLE IF NOT EXISTS platform_prompts (
   id                 int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
