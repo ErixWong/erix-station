@@ -23,6 +23,10 @@ interface FieldSpec {
   values?: unknown[];
   min?: number;
   max?: number;
+  /** 契约 §1 的默认值（#625）：表单初值**只从这里取**，与后端 `validateKindParams` 补的是同一份。 */
+  default?: unknown;
+  /** 契约 §1 的必填标记（#625）：缺了后端 400，前端只用来标「必填」。 */
+  required?: boolean;
 }
 const SCHEMA = KIND_SCHEMA as unknown as Record<string, Record<string, FieldSpec>>;
 const SCOPE = KIND_SCOPE as unknown as Record<string, string>;
@@ -106,12 +110,26 @@ const fixedScopeLabel = computed(() => {
   return scope === 'user' ? t('admin.macros.scopeUser') : t('admin.macros.scopeSession');
 });
 
-/** 给某字段一个合理默认值（enum 取首值、enum[] 取 []、int 取下界、其余空串）。 */
-function defaultValue(spec: FieldSpec): unknown {
-  if (spec.type === 'enum[]') return [];
-  if (spec.type === 'enum') return (spec.values ?? [])[0] ?? '';
-  if (spec.type === 'int') return spec.min ?? 1;
-  return '';
+/**
+ * 表单初值：**只取 schema 的 `default`**（issue #625）。
+ *
+ * 以前这里是一套「通用兜底规则」（enum 取首值、enum[] 取 `[]`、int 取 `min`），
+ * 它把「没写默认值」当成「默认就是空/下界」，于是：
+ *   - `run-notify` 建出来 `states: []` ⇒ **永远不会通知**，界面却显示 Enabled；
+ *   - `maxRounds` 变成 1（契约是 16）、`max_rounds` 同理。
+ * 现在后端 `validateKindParams` 会按契约补默认值，两边必须同源：
+ *   **schema 没写 `default` 的字段就不预填**（控件自然为空，要么用户填、要么按可选省略），
+ *   绝不在这层再造一套规则。
+ */
+function initialParams(entries: Array<[string, FieldSpec]>): Record<string, unknown> {
+  const next: Record<string, unknown> = {};
+  for (const [key, spec] of entries) {
+    if (!('default' in spec)) continue; // 无默认 ⇒ 不预填（而不是猜一个）
+    const d = spec.default;
+    // 数组要拷一份：否则 `toggleArrayValue` 会直接改到共享的 `KIND_SCHEMA` 常量上。
+    next[key] = Array.isArray(d) ? [...d] : d;
+  }
+  return next;
 }
 
 function openCreate(): void {
@@ -125,9 +143,7 @@ function closeCreate(): void {
 
 /** 换 kind：按新 kind 的 schema 重建 params（切 kind 时不残留别的 kind 的字段）。 */
 function onKindChange(): void {
-  const next: Record<string, unknown> = {};
-  for (const [key, spec] of schemaEntries.value) next[key] = defaultValue(spec);
-  form.params = next;
+  form.params = initialParams(schemaEntries.value);
 }
 
 function toggleArrayValue(key: string, value: unknown): void {
