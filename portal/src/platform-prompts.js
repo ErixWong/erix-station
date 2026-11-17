@@ -1,6 +1,6 @@
 // 管理台「提示词」面板的**读侧 + 写侧**（issue #596 片 A）。
 // 契约：`docs/design/admin-prompts-panel-2026-11-16.md`（§3 读侧 / §4 写侧 / §5 渲染 / §6 API / §8 判据）；
-// API 文档：`docs/api/portal.md` §4.19。表：迁移 `0042-platform-prompts.sql`（单行表，`''` = 跟随内置）。
+// API 文档：`docs/api/portal.md` §4.19。表：迁移 `0043-platform-prompts.sql`（单行表，`''` = 跟随内置）。
 //
 // 一句话：平台对 agent 说的三句话（`~/AGENTS.md` 的补充约定、`~/AGENTS.md` 的整段覆写、会话标题的
 // system）从「改代码 + 重建镜像」变成「管理台改一行，下一次 run / 下一次改名生效」。
