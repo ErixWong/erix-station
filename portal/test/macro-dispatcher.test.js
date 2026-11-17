@@ -255,24 +255,63 @@ test('7. 非到期的 run-notify 意图仍按 kind 分派（到期支不是万�
   });
 });
 
-// ── #637① 真实 runTask（pollRunTask）：等 run 到终态、收集判决与正文 ──────────────────
-// 种一条会话 + run + transcript。⚠ 正文种在 transcript_rounds.messages（不是 messages.content：
-// P3 PR②b 起 assistant 的 messages.content 是空串），pollRunTask 必须从这里取到正文。
+// ── #637① / #652 真实 runTask（pollRunTask）：等 run 到终态、收集判决与正文 ──────────────
+//
+// ⚠ **#652 的教训就写在本函数的形状里**：#637 的 fixture 自己造 transcript 行并**显式写了
+// `run_id`**，而真机 `transcript_rounds.run_id` **97% 是 NULL**（实测 96/3219；引擎 sidecar 走
+// session 维度写：`run_id = NULL` + `transcript_key = sessionId`，见 `transcript-store.js#appendRound`）
+// ⇒ 用例绿、线上产物 0 字节（fixture 比现实友好）。
+// 所以本函数**照写入方的原样**种行（erix-agent 0.23 账本形状，三行全部 `run_id = NULL`、
+// `transcript_key = sessionId`）：
+//   · `:input:<messageId>` 宿主预写行（postMessage 写的那条）
+//   · `:engine:round:<n>` 轮载体行（`messages` 为空数组）
+//   · `:msg:<n>:<seq>` 正文行（`kind:'message'`，assistant 正文在它的 `record.messages` 里）
+// ⚠ 正文只在 `record` 里：`messages.content` 对 assistant **恒为空串**（P3 PR②b 停双写），
+// 所以锚点行的 content 也种空串——文本只能从读侧投影拿。
 async function seedRun(pool, scene, { status = 'running', assistantText = '这是巡检结果：一切正常' } = {}) {
   const sessionId = crypto.randomUUID();
   const runId = crypto.randomUUID();
+  const messageId = crypto.randomUUID();
+  const round = 8; // 真机宏会话最后一轮的轮号（issue #652 的证据里就是 8）
   await pool.query(
     `INSERT INTO chat_sessions (id, user_id, project_id, title, title_source, status, last_seq)
-     VALUES ($1,$2,NULL,'s','manual','active',0)`, [sessionId, scene.userId]);
+     VALUES ($1,$2,NULL,'s','manual','active',2)`, [sessionId, scene.userId]);
   await pool.query(`INSERT INTO runs (id, session_id, status) VALUES ($1,$2,$3)`, [runId, sessionId, status]);
+  // 锚点行（messages 表）：user + assistant 各一条，**content 恒为空串**（PR②b 停双写）。
   await pool.query(
-    `INSERT INTO transcript_rounds (run_id, round, record, messages)
-     VALUES ($1,0,'{}'::jsonb,$2::jsonb)`,
-    [runId, JSON.stringify([
-      { role: 'user', content: '整理今日变更' },
-      { role: 'assistant', content: assistantText },
-    ])]);
-  return { sessionId, runId };
+    `INSERT INTO messages (id, session_id, run_id, seq, role, content, synthetic)
+     VALUES ($1,$2,$3,1,'user','',false), ($4,$2,$3,2,'assistant','',false)`,
+    [messageId, sessionId, runId, crypto.randomUUID()]);
+  // transcript 行：写入方口径（`run_id` 恒 NULL、`transcript_key = sessionId`、`append_seq` 用列默认）。
+  const insert = `INSERT INTO transcript_rounds
+       (run_id, transcript_key, dedup_key, round, record, folded, messages, folded_payload)
+     VALUES (NULL, $1, $2, $3, $4::jsonb, false, $5::jsonb, NULL)`;
+  const put = (dedupKey, record) => pool.query(
+    insert, [sessionId, dedupKey, round, JSON.stringify(record), JSON.stringify(record.messages ?? [])]);
+  const inputKey = `${sessionId}:input:${messageId}`;
+  await put(inputKey, { round, dedupKey: inputKey, messages: [{ role: 'user', content: '整理今日变更' }] });
+  const engineKey = `${sessionId}:engine:round:${round}`;
+  await put(engineKey, { round, dedupKey: engineKey, messages: [] });
+  const msgKey = `${sessionId}:msg:${round}:0`;
+  await put(msgKey, {
+    round, dedupKey: msgKey, kind: 'message', seq: 0,
+    messages: [{ role: 'assistant', content: [{ type: 'text', text: assistantText }] }],
+  });
+  return { sessionId, runId, round };
+}
+
+/** 只补「引擎写的那两行」（宿主预写的 `:input:` 行由真 postMessage 自己写）——端到端用例用。 */
+async function seedEngineRound(pool, { sessionId, round = 8, assistantText }) {
+  const insert = `INSERT INTO transcript_rounds
+       (run_id, transcript_key, dedup_key, round, record, folded, messages, folded_payload)
+     VALUES (NULL, $1, $2, $3, $4::jsonb, false, $5::jsonb, NULL)`;
+  const engineKey = `${sessionId}:engine:round:${round}`;
+  await pool.query(insert, [sessionId, engineKey, round,
+    JSON.stringify({ round, dedupKey: engineKey, messages: [] }), JSON.stringify([])]);
+  const msgKey = `${sessionId}:msg:${round}:0`;
+  const messages = [{ role: 'assistant', content: [{ type: 'text', text: assistantText }] }];
+  await pool.query(insert, [sessionId, msgKey, round,
+    JSON.stringify({ round, dedupKey: msgKey, kind: 'message', seq: 0, messages }), JSON.stringify(messages)]);
 }
 
 // —— #637①-4：finished ⇒ ok:true 且 text 非空；failed ⇒ ok:false ——
@@ -376,5 +415,111 @@ test('#637①-6 run 一直 queued ⇒ pollRunTask 超时返回 ok:false + run_ti
     assert.equal(res.ok, false, '超时 ⇒ ok:false');
     assert.equal(res.termination.reason, 'run_timeout', `超时 reason 必须是 run_timeout：${JSON.stringify(res.termination)}`);
     assert.ok(Date.now() - t0 < 3000, `短超时必须快速返回（实际 ${Date.now() - t0}ms，别真等 30 分钟）`);
+  });
+});
+
+// ── #652 正文取数口径（真机形态：transcript_key=sessionId、run_id 为 NULL）───────────────
+// 反向自证锚点：把 `collectRunFinalText` 改回自己写 `... FROM transcript_rounds WHERE run_id=$1`
+// ⇒ 下面 ①-③ 全红（真机就是这样：按 run_id 查恒 0 行 ⇒ 产物 0 字节）。
+test('#652-1 真实 transcript 形状（run_id NULL + transcript_key=sessionId）⇒ pollRunTask 的 text 非空',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T11'));
+    const { sessionId, runId } = await seedRun(pool, scene, { status: 'running' });
+    // fixture 自证：transcript 行必须**全是 run_id IS NULL**（否则就又变回「比现实友好」的假现场）。
+    const shape = await pool.query(
+      `SELECT count(*)::int AS total,
+              count(*) FILTER (WHERE run_id IS NULL)::int AS null_run_id,
+              count(*) FILTER (WHERE transcript_key = $1)::int AS by_session_key
+         FROM transcript_rounds`, [sessionId]);
+    assert.ok(shape.rows[0].total >= 3, `至少要有 input/载体/正文三行：${JSON.stringify(shape.rows[0])}`);
+    assert.equal(shape.rows[0].null_run_id, shape.rows[0].total,
+      '所有 transcript 行的 run_id 必须为 NULL（线上 97% 的样子）');
+    assert.equal(shape.rows[0].by_session_key, shape.rows[0].total,
+      '所有 transcript 行必须挂在 transcript_key=sessionId 上');
+    // assistant 锚点行的 content 必须是空串（PR②b 停双写）⇒ 正文不可能从 messages.content 拿到。
+    const anchor = await pool.query(
+      `SELECT content FROM messages WHERE run_id=$1 AND role='assistant'`, [runId]);
+    assert.equal(anchor.rows[0].content, '', 'assistant 锚点 content 恒为空串（fixture 不许作弊）');
+
+    await pool.query(`UPDATE runs SET status='finished', ended_at=now() WHERE id=$1`, [runId]);
+    // 生产接线：executeScheduledIntent 传给 runTask 的 ctx **本来就带 sessionId**（macro-scheduled.js）。
+    const res = await pollRunTask({ pool, childRunId: runId, sessionId }, { timeoutMs: 1000, pollMs: 5 });
+    assert.equal(res.ok, true);
+    assert.ok(typeof res.text === 'string' && res.text.includes('这是巡检结果'),
+      `text 必须是投影出来的 assistant 正文（非空）：${JSON.stringify(res.text)}`);
+  });
+});
+
+// —— #652-2 端到端：真 postMessage + 缺省 pollRunTask ⇒ 产物文件非 0 字节且就是那段正文 ——
+test('#652-2 端到端（真 postMessage）⇒ 产物落盘非 0 字节、内容 = 该 run 的 assistant 正文',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T12'));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'w652home-'));
+    const reportsRoot = path.join(home, 'reports');
+    const intent = await claimedIntent(pool, scene);
+    const body = '每日巡检：14 个文件有变更，无异常。';
+    const out = await executeScheduledIntent(pool, intent, {
+      reportsRoot, sessionsHome: home, log: { warn() {}, info() {} },
+      runTask: async (ctx) => {
+        // 引擎写侧的形状：正文只落 transcript（transcript_key=sessionId、run_id NULL），
+        // 并给该 run 留一条 content 为空串的 assistant 锚点行（= 读侧投影的落点）。
+        await seedEngineRound(pool, { sessionId: ctx.sessionId, assistantText: body });
+        const seq = await pool.query(
+          `SELECT COALESCE(max(seq),0)+1 AS s FROM messages WHERE session_id=$1`, [ctx.sessionId]);
+        await pool.query(
+          `INSERT INTO messages (id, session_id, run_id, seq, role, content, synthetic)
+           VALUES ($1,$2,$3,$4,'assistant','',false)`,
+          [crypto.randomUUID(), ctx.sessionId, ctx.childRunId, seq.rows[0].s]);
+        await pool.query(`UPDATE runs SET status='finished', ended_at=now() WHERE id=$1`, [ctx.childRunId]);
+        return pollRunTask(ctx, { timeoutMs: 1000, pollMs: 5 });
+      },
+    });
+    assert.equal(out.status, 'done');
+    assert.ok(out.artifactPath, `有输出就必须有产物路径：${JSON.stringify(out)}`);
+    const st = await fs.stat(out.artifactPath);
+    assert.ok(st.size > 0, `产物必须非 0 字节（#652 的现物就是 0 字节）：${out.artifactPath}`);
+    const written = await fs.readFile(out.artifactPath, 'utf8');
+    assert.ok(written.includes(body), `产物内容必须是该 run 的 assistant 正文，实际：${JSON.stringify(written)}`);
+    const row = await rowOf(pool, intent.macroRunId);
+    assert.equal(row.status, 'done');
+    assert.ok(!row.reason, `有产物时 reason 不得记 no_output：${row.reason}`);
+    await fs.rm(home, { recursive: true, force: true });
+  });
+});
+
+// —— #652-3 空正文的产物形态（拍板 (a)）：不落盘 + macro_runs.reason='no_output' ——
+test('#652-3 run 成功但无正文 ⇒ 不落 0 字节文件，账上记 reason=no_output', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T13'));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'w652home-e-'));
+    const reportsRoot = path.join(home, 'reports');
+    const intent = await claimedIntent(pool, scene);
+    const out = await executeScheduledIntent(pool, intent, {
+      reportsRoot, sessionsHome: home, log: { warn() {}, info() {} },
+      runTask: async (ctx) => {
+        // 没有任何 transcript 正文（引擎这一轮只跑了工具 / 正文取不到）⇒ text 应为 ''。
+        await pool.query(`UPDATE runs SET status='finished', ended_at=now() WHERE id=$1`, [ctx.childRunId]);
+        return pollRunTask(ctx, { timeoutMs: 1000, pollMs: 5 });
+      },
+    });
+    assert.equal(out.status, 'done', 'run 本身成功 ⇒ 账仍是 done（无产物不等于失败）');
+    assert.equal(out.artifactPath, null, `无输出 ⇒ 不落盘（artifactPath 必须 null），实际 ${out.artifactPath}`);
+    const files = [];
+    const walk = async (dir) => {
+      let entries = [];
+      try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) await walk(p); else files.push(p);
+      }
+    };
+    await walk(reportsRoot);
+    assert.deepEqual(files, [], `不该留下任何产物文件（0 字节文件是假账）：${files.join(', ')}`);
+    const row = await rowOf(pool, intent.macroRunId);
+    assert.equal(row.status, 'done');
+    assert.equal(row.reason, 'no_output', `账上必须能看出「本次无输出」，实际 reason=${row.reason}`);
+    await fs.rm(home, { recursive: true, force: true });
   });
 });
