@@ -779,6 +779,12 @@ export function createMcpClient({
    */
   async function ensureReady({ signal, attempt = 2 } = {}) {
     if (state === 'ready' && transport) return transport;
+    // ⚠ `closing` 在 `close()` 里同步置位（promise 还没 settle），所以这里必须**一并挡住**：
+    // `closeAll()` 是 `finally` 调的，而引擎收尾与在途工具存在竞态——一个迟到的调用如果
+    // 悄悄重新 spawn，就会留下一个谁都不再看的孤儿进程（正是 §6.8 要防的那类泄漏）。
+    if (state === 'closed' || closing) {
+      throw mcpError(MCP_ERRORS.UNREACHABLE, `MCP server ${server.name} 已随 run 关闭`);
+    }
     if (state === 'fused') {
       throw mcpError(MCP_ERRORS.UNREACHABLE, `MCP server ${server.name} 本次 run 已熔断（连续失败 ${failures} 次）`);
     }
