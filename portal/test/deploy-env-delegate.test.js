@@ -513,8 +513,11 @@ function shadowAt(shadows, name, at) {
  * 于是枚举里凭空多出一个没人读的 key，而真的动态读没进 `unsupported`（fail-closed 被绕过）。
  * @returns {{ envObjs: Set<string>, names: Map<string, Set<string>>, shadows: Map<string, Array> }}
  */
-function analyzeEnvReads(code) {
-  const masked = structuralMask(code);
+function analyzeEnvReads(code, rawText = null) {
+  // 掩码**从原文算**（#587 族 B 实测：`structuralMask(stripComments(x))` 与 `structuralMask(x)` 不等价 —
+  // 模板里嵌模板那种行会让两者在其后分叉，把**真代码**整行抹成「串正文」= 又一处静默漏扫）。
+  // `code` 仍必须是剥过注释的那一份：所有**内容匹配**都在它上面跑（env 名活在串正文里）。
+  const masked = structuralMask(rawText ?? code);
   const envObjs = new Set();
   const names = new Map();
   const addName = (id, lits) => {
@@ -648,8 +651,8 @@ function scanEnvReadsFromFiles(files, root) {
   for (const { file, text } of files) {
     const rel = path.relative(root, file);
     const code = stripComments(text);            // 注释 → 空格（行列位不变）⇒ 注释里的读形**不算读取**
-    const masked = structuralMask(code);         // 再把字符串正文抹平 ⇒ 用来判「这个位置是不是串里的文字」
-    const ctx = analyzeEnvReads(code);
+    const masked = structuralMask(text);         // 原文的「结构掩码」⇒ 判「这个位置是不是串/正则正文」用**原文**那份
+    const ctx = analyzeEnvReads(code, text);
     // env **对象**那一跳也可能带可选链（`process?.env?.X`，#587 族 A③）⇒ 前缀写成 `process\s*\??\.\s*env`。
     const objs = ['process\\s*\\??\\.\\s*env', ...[...ctx.envObjs].map(escRe)];
     const OBJ = `(?:${objs.join('|')})`;
@@ -1065,10 +1068,12 @@ const SELF_TEXT = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8');
 
 /**
  * 坐标引用形状。**故意**比「合法坐标」更宽：认 `.json`/绝对路径/行范围。
- * 写歪了要能点名并给出**能照着改**的文案，而不是「一个引用都没扫到」再报一句「这是说明文字」
+ * 写歪了要能点名并给出**能照着改**的文案，而不是「一个引用都没扫到」再报一句「这是说明文字」。
+ * 后缀后面钉 `(?![A-Za-z0-9_])`：否则 `env-legs-exceptions.json` 会被匹配成 `env-legs-exceptions.js`
+ * （前缀巧合），报出「文件不存在」这种**看着合理但不对**的文案。
  * —— 那句话对 `deploy/env-legs-exceptions.json:12` 是误导（它当然是坐标，只是不是 JS 坐标）。
  */
-const COORD_REF = /(?<abs>\/)?(?<path>[A-Za-z0-9_.+-]+(?:\/[A-Za-z0-9_.+-]+)*)\.(?<ext>js|mjs|cjs|json|ya?ml|yml|md|ts|sh|lock|env)(?::\s*(?<from>\d+)(?:\s*-\s*(?<to>\d+))?)?/g;
+const COORD_REF = /(?<abs>\/)?(?<path>[A-Za-z0-9_.+-]+(?:\/[A-Za-z0-9_.+-]+)*)\.(?<ext>js|mjs|cjs|json|ya?ml|yml|md|ts|sh|lock|env)(?![A-Za-z0-9_])(?::\s*(?<from>\d+)(?:\s*-\s*(?<to>\d+))?)?/g;
 /** 可核对的代码坐标只认 JS 源文件（`.json`/`.yml` 是**数据**，判据不替它核对内容）。 */
 const JS_SOURCE_EXT = new Set(['js', 'mjs', 'cjs']);
 /** 测试面（族 B①.1）：这些目录里的 env 名字多半是**断言字符串**，不是「产品代码在这儿读了它」。 */
@@ -2042,6 +2047,212 @@ test('活二㉓ 解构形状解析不出 ⇒ fail loudly 进 unsupported，不�
       `形状「${name}」那条动态读没进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => u.shape))}）：`
       + '解析不出就必须点名，不许静默放行（不设「记为已知边界」）');
   }
+});
+// ===========================================================================
+// 族 B（issue #587）：登记册的**坐标**与**豁免理由**能不能被糊弄
+//
+// 这一段的判据口径也只认事实：坐标**在不在树上、那一行到底写了什么、是不是测试面**。
+// 三格各自都带方向相反的对照组（真坐标必须绿），因为「把串正文一律抹掉」这种修法
+// 会顺手误杀 8 条真登记 —— 误杀真数据同样是判据坏了。
+// ===========================================================================
+
+/** 写一个临时**根目录**（`whereProblems` / `validateUnsupported` 都吃 `root` ⇒ 与真树共用同一把尺）。 */
+function fixtureRoot(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-coord-'));
+  for (const [f, text] of Object.entries(files)) {
+    const abs = path.join(dir, f);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, text);
+  }
+  return dir;
+}
+
+test('活二㉔ B-①.1 `where` 不许指向测试面：默认拒，显式 whereTest 豁免才放行（主 agent 的复现必须红）', () => {
+  const { entries } = loadEnvLegExceptions();
+  const token = entries.find((e) => e.key === 'ERIX_STATION_TOKEN');
+  assert.ok(token, 'ERIX_STATION_TOKEN 还在例外清单里（不许为了让判据变绿删条目）');
+  const prob = (patch) => whereProblems([{ ...token, ...patch }], RUNNER_ENV_KEYS).join('\n');
+  // ① 复现本体：`where` 指到「把这个名字当字符串写了 7 次」的测试文件 ⇒ 必须红并点名测试代码
+  const fake = prob({ where: 'portal/test/provisioner.test.js' });
+  assert.match(fake, /坐标指向测试代码/, '把 where 指到测试文件却没人报 ⇒ 「文本命中」又被当成坐标');
+  assert.match(fake, /ERIX_STATION_TOKEN/, '红得没有信息 = 没人能修（必须点名是哪个键）');
+  // ② 带行也拒：那一行确实是 `'ERIX_STATION_TOKEN='`，但它是**测试断言里的字符串**
+  assert.match(prob({ where: 'portal/test/provisioner.test.js:262' }), /坐标指向测试代码/);
+  // ③ 仓库根的 `test/**` 与任意 `*.test.js` 同口径
+  assert.match(prob({ where: 'test/lib/js-source.mjs:1' }), /坐标指向测试代码/);
+  // ④ 反向自证：盘上 27 条真登记的坐标一条都不在测试面，而且全都绿
+  assert.deepEqual(whereProblems(entries, RUNNER_ENV_KEYS), [], '盘上那份被测试面守卫误杀了');
+  assert.ok(!entries.some((e) => parseCoordRefs(e.where).some((r) => isTestFace(r.rel))),
+    '真登记里出现了测试面坐标（那要连带复核这条守卫是不是形同虚设）');
+  // ⑤ 豁免必须带理由；配不上坐标的豁免（死豁免）也红
+  assert.deepEqual(prob2(token, { where: 'portal/test/provisioner.test.js:262', whereTest: '注入面没有对应文件，只有夹具能核对' }), [],
+    '带理由的显式豁免应当放行（否则默认拒就变成了「测试面一律不可用」）');
+  assert.deepEqual(prob2(token, { where: 'portal/test/provisioner.test.js:262', whereTest: true, whereTestReason: '同上' }), [],
+    '`whereTest: true` + `whereTestReason` 是同一种豁免的另一种写法');
+  assert.match(prob({ where: 'portal/test/provisioner.test.js:262', whereTest: true }), /不合法/,
+    '光 `whereTest: true`（没理由）就放行 ⇒ 豁免本身成了免证');
+  assert.match(prob({ where: 'portal/test/provisioner.test.js:262', whereTest: '   ' }), /不合法/);
+  assert.match(prob({ where: 'runner/agentd.js:48', whereTest: '没坐标配的豁免' }), /死豁免/,
+    '声明了豁免但坐标不在测试面 ⇒ 留着就是第二本账');
+});
+
+/** 单条登记的坐标问题（数组，绿就是空数组）。 */
+function prob2(entry, patch) {
+  return whereProblems([{ ...entry, ...patch }], RUNNER_ENV_KEYS);
+}
+
+test('活二㉕ B-①.2 字符串正文不算坐标：散文串/正则正文/注释红，代码位 + 值位串 + 注入形绿', () => {
+  const dir = fixtureRoot({
+    'prose.js': "export const note = 'ERIX_B1_PROSE_ONLY 已经在 compose 里接好了';\n",
+    'read.js': 'export const v = process.env.ERIX_B1_DOT_READ;\n',
+    'table.js': "const T = Object.freeze({ a: 'ERIX_B1_TABLE_NAME' });\nexport const t = T;\n",
+    'inject.js': 'export function f(t) { return [`ERIX_B1_INJECT=${t}`]; }\n',
+    'regexy.js': 'export const re = /env.ERIX_B1_IN_REGEX/;\n',
+    'commented.js': '// export const v = process.env.ERIX_B1_IN_COMMENT;\nexport const w = 1;\n',
+  });
+  try {
+    const probs = (file, key) => whereProblems([{ key, reason: 'r', where: `${file}:1` }], new Map(), dir);
+    const prob = (file, key) => probs(file, key).join('\n');
+    for (const [file, key] of [
+      ['prose.js', 'ERIX_B1_PROSE_ONLY'],   // 散文串里顺带提到
+      ['regexy.js', 'ERIX_B1_IN_REGEX'],    // 正则正文里顺带提到
+      ['commented.js', 'ERIX_B1_IN_COMMENT'], // 注释正文
+    ]) {
+      assert.match(prob(file, key), /不含该 key/, `${file}:1 的名字只活在散文/正则/注释里，却还能当坐标 ⇒ 掩码那把尺没生效`);
+    }
+    for (const [file, key] of [
+      ['read.js', 'ERIX_B1_DOT_READ'],       // 代码位
+      ['table.js', 'ERIX_B1_TABLE_NAME'],    // 值位串：数据表里挑名字
+      ['inject.js', 'ERIX_B1_INJECT'],       // 注入形：`KEY=${v}`
+    ]) {
+      assert.deepEqual(probs(file, key), [], `${file}:1 是**真坐标**（env 名本来就以这种形状存在）却被误杀`);
+    }
+    // 真树反向自证：盘上真登记的 env 名**就活在串里**（参数默认值 / 注入模板 / 调用实参 / 数据表）
+    const inString = [
+      ['ERIX_STATION_TOKEN', 'portal/src/provisioner.js:366'],
+      ['ERIX_STATION_TOKEN', 'portal/src/provisioner.js:414'],
+      ['FDE_WORKER_UID', 'portal/src/config.js:391'],
+      [TIMEOUT_KEYS[0], 'runner/lib/llm-timeouts.js:58'],
+    ];
+    for (const [key, coord] of inString) {
+      const [rel, line] = coord.split(':');
+      const text = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8').split('\n')[Number(line) - 1];
+      assert.ok(text.includes(key), `夹具前提破了：${coord} 那一行应当含 ${key}，实际 ${JSON.stringify(text)}`);
+      assert.deepEqual(whereProblems([{ key, reason: 'r', where: coord }], RUNNER_ENV_KEYS), [],
+        `${coord} 被误杀 ⇒ 「串正文不算坐标」被做成了「串正文一律不认」，那是误杀真登记`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('活二㉖ B-①.3 行范围逐行验（不许静默只验首行）+ `.json`/绝对路径的文案要能照着改', () => {
+  const dir = fixtureRoot({
+    'range.js': [
+      'export const a = process.env.ERIX_B1_RANGE_KEY;',
+      'const pad = 1;',
+      'export const b = process.env.ERIX_B1_RANGE_KEY;',
+    ].join('\n'),
+  });
+  try {
+    const probs = (where) => whereProblems([{ key: 'ERIX_B1_RANGE_KEY', reason: 'r', where }], new Map(), dir);
+    const prob = (where) => probs(where).join('\n');
+    assert.deepEqual(probs('range.js:1'), []);
+    assert.deepEqual(probs('range.js:3'), []);
+    assert.deepEqual(probs('range.js:3-3'), [], '`N-N` 就是单行，不该红');
+    const wide = prob('range.js:1-3');
+    assert.match(wide, /不含该 key/, '第 2 行不含该 key 却没人报 ⇒ 行范围只验了首行（静默放过）');
+    assert.match(wide, /第 2 行/, '必须点名是哪一行没过');
+    assert.match(wide, /逐行/);
+    assert.match(prob('range.js:3-9'), /只有 3 行/);
+    assert.match(prob('range.js:3-1'), /行范围是反的/);
+    assert.match(prob('range.js:1-40'), />30/, '「整段」不是「一行证据」，要收窄');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  // `.json` / 绝对路径：单独出现时红，但文案要能照着改（旧文案报「这是说明文字」是误导）
+  const jsonCase = whereProblems(
+    [{ key: 'ERIX_STATION_TOKEN', reason: 'r', where: 'deploy/env-legs-exceptions.json:110' }], new Map()).join('\n');
+  assert.match(jsonCase, /不是 JS 源文件/);
+  assert.match(jsonCase, /reason/, '要告诉人「这条事实写进 reason，where 换成 JS 行」');
+  assert.doesNotMatch(jsonCase, /说明文字/, '对 `.json:行` 报「这是说明文字」会把人带偏（它当然是坐标，只是不是 JS 坐标）');
+  const absCase = whereProblems(
+    [{ key: 'ERIX_STATION_TOKEN', reason: 'r', where: `${path.join(RUNNER_ROOT, 'agentd.js')}:48` }], new Map()).join('\n');
+  assert.match(absCase, /绝对路径/);
+  assert.match(absCase, /仓库根相对/, '文案要给出具体的改法');
+});
+
+test('活二㉗ B-② `unsupported` 不许免证：绑定扫描器确认的读站点 + 理由必须含可核对坐标（虚构读形与乱写理由两条都红）', () => {
+  const dir = fixtureRoot({
+    'dyn.js': [
+      "const T = Object.freeze({ a: 'ERIX_B2_TABLE_NAME' });",
+      'export function pick(which, env = process.env) { return env[which]; }',
+      'export const lit = process.env.ERIX_B2_STATIC;',
+    ].join('\n'),
+    'test/probe.js': 'export const x = 1;\nconst T = Object.freeze({ a: ' + "'ERIX_B2_TABLE_NAME'" + ' });\n',
+  });
+  try {
+    const detected = scanEnvReads(dir).unsupported;
+    assert.deepEqual(detected.map((d) => `${d.at} ${d.shape}`), ['dyn.js:2 env[which]'],
+      `夹具必须先给出真动态读站点（实际 ${JSON.stringify(detected)}）`);
+    const ok = [{ at: 'dyn.js:2', read: 'env[which]', reason: '`which` 由调用方传入；同名旋钮的值域见 dyn.js:3' }];
+    assert.deepEqual(validateUnsupported(ok, dir, detected), [], '真读形 + 可核对引用应当绿');
+    // ① 虚构读形（扫描器在那个文件里根本没见过这个形状）⇒ 红
+    assert.match(validateUnsupported([{ ...ok[0], read: 'globalThis.__env__[which]' }], dir, detected).join('\n'),
+      /根本没看到这个读形/);
+    // ② 真读形、坐标却不是那一行 ⇒ 红（点名读形真正在哪一行）
+    const drift = validateUnsupported([{ ...ok[0], at: 'dyn.js:1' }], dir, detected).join('\n');
+    assert.match(drift, /不是这个读形所在的行/);
+    assert.match(drift, /dyn\.js:2/, '文案要给出真坐标');
+    // ③ 真读形、理由是自由散文 ⇒ 红
+    assert.match(validateUnsupported([{ ...ok[0], reason: '扫描器解析不出名字，反正这里没有配置面。' }], dir, detected).join('\n'),
+      /自由散文/);
+    // ④ 理由里的引用也要过同一把尺
+    assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 nope.js:1' }], dir, detected).join('\n'), /文件不存在/);
+    assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 dyn.js:2' }], dir, detected).join('\n'),
+      /没有任何 env 名的结构化证据/, '引用的那一行必须真的有 env 名（不然就是编的）');
+    assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 dyn.js:1-2' }], dir, detected).join('\n'),
+      /第 2 行/, '理由里的行范围同样逐行判');
+    assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 test/probe.js:2' }], dir, detected).join('\n'),
+      /坐标指向测试代码/);
+    assert.match(validateUnsupported([{ ...ok[0], at: 'test/probe.js:2' }], dir, detected).join('\n'), /坐标指向测试代码/);
+    // ⑤ 真树：登记必须与扫描器**现在**的读数咬合，理由里必须有带行号的 JS 坐标
+    const { unsupported: registered, problems } = loadEnvLegExceptions();
+    assert.deepEqual(problems, [], '真树的 `unsupported` 段没过「绑定读站点 + 理由含可核对坐标」这一关');
+    assert.deepEqual(registered.map((u) => u.at), RUNNER_SCAN.unsupported.map((d) => d.at),
+      '登记的坐标必须就是扫描器现在扫到的那些动态读站点（一条不多、一条不少）');
+    for (const u of registered) {
+      assert.ok(parseCoordRefs(u.reason).some((r) => JS_SOURCE_EXT.has(r.ext) && r.from != null),
+        `${u.at} 的理由里没有带行号的 JS 坐标引用 ⇒ 自由散文豁免：${u.reason}`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('活二㉘ 追加腿：文件**首字符**是正则字面量（字符类里含真 //）⇒ 同一行的真读取必须进枚举', () => {
+  // `canStartRegex()` 的 `if (prevCh === '') return true;`（文本/文件首字符处 `/` 是正则位）原先**没有判据**。
+  // 直调实验（父 agent）：`'/[//]/.test(process.env.ERIX_P3_LINE);'` 的掩码是 `/    /.test(…读取保留)`；
+  // 把那条分支改成 `false` 之后掩码变成 `/[                    ` ⇒ 同一行其后全是「行注释」，读取静默消失。
+  const src = '/[//]/.test(s); export const v = process.env.ERIX_A2_AT_FILE_START; const half = 1 / 2;';
+  const { keys } = scanFixture('file-start-regex', src);
+  assert.deepEqual(keys, ['ERIX_A2_AT_FILE_START'],
+    `文件首字符那个正则把同一行后面的代码吞了（实际 ${JSON.stringify(keys)}）`
+    + ' ⇒ 「首字符处可以是正则」这条分支没判据：认不出它 = 静默漏扫');
+  // 反向自证 A：同一形状**不在**首字符时也必须活（判据不许只押首字符那一格）
+  const notFirst = scanFixture('not-file-start-regex', `const x = 1;\n${src}`);
+  assert.deepEqual(notFirst.keys, ['ERIX_A2_AT_FILE_START']);
+  // 反向自证 B：首字符正则**正文里**提到的名字不算读取（同一条分支反过来也不许放宽）
+  const body = scanFixture('file-start-regex-body', '/[env.ERIX_A2_PHANTOM]s/.test(s); export const w = process.env.ERIX_A2_REAL_AFTER_BODY;');
+  assert.deepEqual(body.keys, ['ERIX_A2_REAL_AFTER_BODY'],
+    `首字符正则的正文被当成代码了（实际 ${JSON.stringify(body.keys)}）`);
+});
+
+test('活二㉙ 判据数地板：本文件格数 >= 43（族 A 合并后的读数）—— 只增不减，删格要留账', () => {
+  const cells = (SELF_TEXT.match(/^test\(/gm) ?? []).length;
+  assert.ok(cells >= 43,
+    `本文件只剩 ${cells} 格，低于族 A 合并后的地板 30 ⇒ 有人为了让闸门变绿直接删了判据：`
+    + '减格必须同时改写判据并留下说明，不许静默减');
 });
 
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
