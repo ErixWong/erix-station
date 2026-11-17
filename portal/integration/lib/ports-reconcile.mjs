@@ -8,9 +8,10 @@
 //      fde-platform §8.5），脚本里手拼字符串会得到第二份真相。
 //
 // 判据来源（逐条对应下方检查）：
-//   · `schema:1` / `fde` / `generation` 字段形态 = `portal/src/materializer.js` renderPortsJson；
-//   · `scope='fde'`、`role='spare'`、`exposure='private'`、`state ∈ {allocated, active}` =
-//     `portal/src/portalloc.js`（PREVIEW_SCOPE/ROLE/EXPOSURE + §8.6 首次放行升 active）；
+//   · `schema:2` / `fde` / `generation` / `block{start,end}` / `allocations[{port,url,in_use}]`
+//     字段形态 = `portal/src/materializer.js` renderPortsJson（**schema 2 起只载分配事实**，issue #361：
+//     `scope`/`role`/`exposure`/`state`/`run_id` 这些「使用面」字段已从文件里**剃除**，
+//     它们现在只存在于 DB 行上 ⇒ 本对账的清单侧不许再要求它们，DB 侧照旧验）；
 //   · 一块 10 条、号池 22000–29999、按 10 对齐 = `portal/src/previewpool.js`（issue #246 交付①）；
 //   · 只列活行（`state <> 'released'`）= materializer readFdeDesiredState 的同一条 WHERE。
 //
@@ -55,7 +56,7 @@ export function reconcilePortsJsonWithDb({ portsJson, dbRows, fdeName, baseDomai
   }
 
   summary.generation = portsJson.generation;
-  if (portsJson.schema !== 1) add(`ports.json.schema 期望 1，实际 ${JSON.stringify(portsJson.schema)}`);
+  if (portsJson.schema !== 2) add(`ports.json.schema 期望 2（#361 只载分配事实），实际 ${JSON.stringify(portsJson.schema)}`);
   if (portsJson.fde !== fdeName) add(`ports.json.fde 期望 ${JSON.stringify(fdeName)}（= 该 FDE 名），实际 ${JSON.stringify(portsJson.fde)}`);
   if (!Number.isInteger(portsJson.generation)) {
     add(`ports.json.generation 必须是数值（materializer 的 generation 计数器），实际 ${JSON.stringify(portsJson.generation)}`);
@@ -89,13 +90,20 @@ export function reconcilePortsJsonWithDb({ portsJson, dbRows, fdeName, baseDomai
     }
   }
 
-  // FDE 级 scope 的红线：scope='fde'、run_id 恒 NULL（迁移 0019 的 CHECK 要求 scope='run' 才有 run_id）。
+  // 清单侧只载**分配事实**（schema 2 / #361）：`port` / `url` / `in_use` 三个字段。
+  // ⚠ 这里**不许**再要求 scope/role/exposure/state/run_id —— 它们已被产品剃除（那是使用面幻觉字段），
+  //   对账若仍要求它们，就是判据围着旧口径转（261117 实测：main 上 wp2a 因此自 10-24 起一直红）。
   entries.forEach((e, i) => {
-    if (e?.scope !== 'fde') add(`ports.json.allocations[${i}].scope 期望 'fde'（FDE 级预分配），实际 ${JSON.stringify(e?.scope)}`);
-    if (e?.role !== 'spare') add(`ports.json.allocations[${i}].role 期望 'spare'（开户预分配），实际 ${JSON.stringify(e?.role)}`);
-    if (e?.exposure !== 'private') add(`ports.json.allocations[${i}].exposure 期望 'private'，实际 ${JSON.stringify(e?.exposure)}`);
-    if (!PREVIEW_LIVE_STATES.has(e?.state)) add(`ports.json.allocations[${i}].state 期望 allocated/active（清单只列活行），实际 ${JSON.stringify(e?.state)}`);
-    if (e?.run_id != null) add(`ports.json.allocations[${i}].run_id 期望 null（FDE 级预分配不绑 run），实际 ${JSON.stringify(e?.run_id)}`);
+    if (!Number.isInteger(Number(e?.port))) add(`ports.json.allocations[${i}].port 必须是整数，实际 ${JSON.stringify(e?.port)}`);
+    if (typeof e?.url !== 'string' || e.url === '') add(`ports.json.allocations[${i}].url 必须是非空串，实际 ${JSON.stringify(e?.url)}`);
+    if (!(e?.in_use === null || typeof e?.in_use === 'boolean')) {
+      add(`ports.json.allocations[${i}].in_use 必须是 boolean 或 null（观测缺失时为 null），实际 ${JSON.stringify(e?.in_use)}`);
+    }
+    for (const gone of ['scope', 'role', 'exposure', 'state', 'run_id']) {
+      if (Object.prototype.hasOwnProperty.call(e ?? {}, gone)) {
+        add(`ports.json.allocations[${i}] 仍带着已剃除的字段 \`${gone}\`（schema 2 只载分配事实，见 #361）`);
+      }
+    }
   });
 
   // 逐条与 DB 对账（按端口 join：ports.json 与 DB 都按 port 升序，仍显式建索引防顺序假设）。
@@ -109,13 +117,11 @@ export function reconcilePortsJsonWithDb({ portsJson, dbRows, fdeName, baseDomai
     }
     const hostname = buildHostname({ fdeName, port, baseDomain });
     const url = previewUrl(hostname, { publicBaseUrl });
+    // 清单侧不再有 scope/role/exposure/state（schema 2 剃除）⇒ 只比 DB 侧的 hostname/url 与派生口径，
+    // 再单独验 DB 行本身的不变式（FDE 级预分配 = scope 'fde'、role 'spare'、exposure 'private'、活状态、run_id 为 NULL）。
     const fields = [
       ['hostname', hostname, db.hostname],
       ['url', url, db.url],
-      ['scope', 'fde', db.scope],
-      ['role', 'spare', db.role],
-      ['exposure', 'private', db.exposure],
-      ['state', entry.state, db.state],
     ];
     for (const [field, expected, actual] of fields) {
       if (String(actual) !== String(expected)) {
@@ -130,6 +136,10 @@ export function reconcilePortsJsonWithDb({ portsJson, dbRows, fdeName, baseDomai
     }
     // FDE 级行的不变式（迁移 0019 的 CHECK：`scope='run'` 才允许 run_id）：DB 侧也得验，
     // 不然只有清单侧干净会漏掉「库里写了 run 级行但物化时丢掉 run_id」这种形态。
+    if (db.scope !== 'fde') add(`端口 ${port} 的 DB 行 scope 期望 'fde'（FDE 级预分配），实际 ${JSON.stringify(db.scope)}`);
+    if (db.role !== 'spare') add(`端口 ${port} 的 DB 行 role 期望 'spare'，实际 ${JSON.stringify(db.role)}`);
+    if (db.exposure !== 'private') add(`端口 ${port} 的 DB 行 exposure 期望 'private'，实际 ${JSON.stringify(db.exposure)}`);
+    if (!PREVIEW_LIVE_STATES.has(db.state)) add(`端口 ${port} 的 DB 行 state 期望 allocated/active，实际 ${JSON.stringify(db.state)}`);
     if (db.run_id != null) add(`端口 ${port} 的 DB 行带了 run_id=${JSON.stringify(db.run_id)}（scope='fde' 的预分配行 run_id 恒 NULL，迁移 0019 CHECK）`);
   }
   for (const db of rows) {
