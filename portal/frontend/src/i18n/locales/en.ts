@@ -845,6 +845,9 @@ export const en = {
       market: 'Capability market',
       // issue #586: About (the three version cells, read-only); views/AdminAboutView.vue.
       about: 'About',
+      // issue #650: "System" (host CPU / memory / disk / container counts, read-only); views/AdminSystemView.vue.
+      // After the capability market and before the pool usage view: both are read-only host snapshots (issue §tab order).
+      system: 'System',
       // issue #528 (event platform W5): admin tabs for macro templates / macro runs (`07` §21.1 key table).
       macros: 'Macro templates',
       macroRuns: 'Macro runs',
@@ -1425,6 +1428,69 @@ export const en = {
       fdesEmpty: 'The server says there are no FDE containers.',
       fdesUnreadable: 'containers.agent_version could not be read (that is "unreadable", not "no FDEs").',
       caveat: 'Provenance: the only authority is the build-info.json baked into the image; package.json is a build input, while git tags, image tags, digests and containers.agent_version are derived copies and must be labelled as such.',
+    },
+    // Host resource snapshot (views/AdminSystemView.vue, issue #650; contract docs/api/portal.md §4.18).
+    // Four hard rendering rules (each pinned by a spec case): anything unavailable says "unknown"
+    // (never 0); sampling disabled / no first tick yet / history unreadable are three different sentences;
+    // load must carry its normalized magnitude; disk is one row per device and unreadable paths must show.
+    system: {
+      title: 'System (host resources)',
+      intro: 'Read-only. A sampler reads /proc and statfs every 30s and stores it; the cards read the newest in-process tick while the charts read the bucketed rows - both come from the same sampler and may differ by one sampling period.',
+      retention: 'History retained for {days} days',
+      rangeLabel: 'History range',
+      loading: 'Reading host readings…',
+      notLoaded: 'Host readings not loaded yet (no request has been made).',
+      unknown: 'unknown',
+      noSample: 'No sampling tick yet, so this cell has no reading (that is not 0).',
+      noData: 'No data in this range',
+      historyUnavailable: 'History unavailable: {reason}',
+      // Three states: "disabled" only when the server says `enabled: false` (with how to turn it on);
+      // `enabled: true` with no reading is "waiting for the first tick"; a missing `enabled` (old backend)
+      // means say nothing at all - "it did not say" is not "it said no".
+      samplingDisabled: 'Sampling is disabled (SYSTEM_METRICS_ENABLED=0): no new readings appear here. To turn it on: set SYSTEM_METRICS_ENABLED=1 in the portal environment and restart the portal.',
+      waitingFirstSample: 'Sampling is enabled but the first tick has not landed yet (wait at most one sampling period, 30 seconds by default).',
+      cpuTitle: 'CPU',
+      cpuUsage: 'Usage (two-tick delta; the first tick after start cannot compute it)',
+      cpuCores: 'Cores',
+      // Normalization (named in the issue): a bare load=5 on a 36-core box reads as "about to explode".
+      // `≈` not `=`: load includes uninterruptible IO and is not core-weighted - it is a magnitude, not usage.
+      loadLine: 'load {load} across {cores} cores ≈ {pct}',
+      memTitle: 'Memory',
+      memAvailable: 'Available',
+      memCached: 'Cached',
+      memSwap: 'Swap used',
+      diskTitle: 'Disk',
+      diskMonitored: '{count} file system(s) monitored (deduplicated by device: one physical disk = one row)',
+      diskNone: 'This tick read no file system at all (SYSTEM_METRICS_DISK_PATHS unset, or every path unreadable).',
+      diskAvail: '{value} free',
+      diskUnreadable: 'unreadable: {reason}',
+      diskUnreadableNone: 'Every configured path was readable this round (nothing unreadable).',
+      // Boundary stated in issue #650: disks not mounted into the portal never appear by themselves,
+      // and this surface never claims to show "every disk on the host".
+      diskCaveat: 'Scope: only file systems mounted into the portal appear here (host disks that are not mounted do not); this surface does not claim to show every host disk.',
+      containersTitle: 'Containers',
+      containersUnreadable: 'Container counts unreadable (docker unreachable) - that is "unreadable", not "0 containers".',
+      containersStation: 'station-labelled',
+      containersFde: 'FDE (running / total)',
+      containersPausedStopped: 'paused / stopped',
+      driftLine: 'Reconcile: DB {db} ↔ Docker {docker}',
+      driftUnknown: 'Reconciliation not given (the DB-side container names could not be read, so neither agreement nor drift can be claimed).',
+      driftOnlyDb: 'only in DB: {names}',
+      driftOnlyDocker: 'only in Docker: {names}',
+      sampledAt: 'Sampled: {at}',
+      agoNow: 'just now',
+      agoSeconds: '{value}s ago',
+      agoMinutes: '{value} min ago',
+      agoHours: '{value}h ago',
+      agoDays: '{value}d ago',
+      timeFuture: 'Timestamp is in the future: {value} (the sampler and this clock disagree; not clamped to "just now")',
+      timeUnparsable: 'Unparsable timestamp: {value}',
+      bucketSeconds: 'each point = {value}s',
+      bucketMinutes: 'each point = {value} min',
+      bucketHours: 'each point = {value}h',
+      droppedPoints: '{count} history point(s) had an unrecognized shape and were dropped',
+      diskDropped: '{count} disk row(s) had an unrecognized shape and were dropped',
+      caveat: 'Scope: these are **host** readings (read from /proc and statfs inside the portal container, not cgroup-scoped), effective range {range}; they are not the usage of each FDE container.',
     },
     llm: {
       sectionTitle: 'LLM providers',

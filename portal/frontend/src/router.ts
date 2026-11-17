@@ -123,6 +123,14 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminAboutView.vue'),
         meta: { requiresRole: 'admin' },
       },
+      // issue #650：「系统」（宕主 CPU / 内存 / 磁盘 / 容器数，只读，§4.18）。与 `admin-about` 同级写法：
+      // 懒加载 + `requiresRole`，轮询只在 `AdminSystemView` 挂载后起（不挂载就不请求）。
+      {
+        path: 'system',
+        name: 'admin-system',
+        component: () => import('./views/AdminSystemView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
       // issue #529（事件平台 W6）：宏模板配置 + 宏执行历史。懒加载 + 照邻居 requiresRole:'admin'。
       {
         path: 'macros',

@@ -50,6 +50,9 @@ const tabs = [
   // issue #595 M2：能力市场发布台（条目表 + 发布/下线 + 扇描结果）。与证书/上传同为平台配置，
   // 因此排在号池占用（只读运维快照）之前。
   { name: 'admin-market', label: 'admin.tabs.market' },
+  // issue #650：「系统」（宕主 CPU / 内存 / 磁盘 / 容器数，只读）。插在能力市场之后、号池占用之前：
+  // 与号池占用同属**只读宕主快照**（先看人/配置，再来看宕主与号池），工单 §tab 位置就写了这一句。
+  { name: 'admin-system', label: 'admin.tabs.system' },
   // issue #350：号池占用总览（只读）。放在最后：先看用户/配置，选段时才来这里。
   { name: 'admin-preview-pool', label: 'admin.tabs.previewPool' },
   // issue #529（事件平台 W6）：宏模板配置 + 宏执行历史。追加在末尾（模板 → 执行历史）。
