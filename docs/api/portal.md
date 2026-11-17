@@ -3325,8 +3325,10 @@ Content-Type: application/json
 
 追加段的**节标题与引言由平台撰写**（措辞是契约 §5 定稿的：与上面那 8 条硬约束冲突时**以上面为准**）；
 管理员正文**逐字节照搬，不加工不改写**。内置模板本身受既有红线约束（零端口数字、零伞域字面量），
-`portal/test/materializer.test.js` 对**默认渲染**的断言一条都没改（判据 `M1`：不传新入参时输出
-逐字节等于本单之前 ⇒ 物化幂等，sha 不变 ⇒ 不重写文件）。
+`portal/test/materializer.test.js` 对**默认渲染**的断言一条都没改（「不传新入参时输出逐字节等于
+本单之前 ⇒ 物化幂等，sha 不变 ⇒ 不重写文件」这两个说法由该文件那 8 条 `renderHomeAgentsMd：…`
+既有断言加上本单的 `P1` 承担；**这里不写 `M` 字头的那个号** —— 它在本仓已被
+`materializer.test.js:750` 占用，见本节末尾那条注记）。
 
 **渲染闸是必须的，不是锦上添花**：注入侧（`runner/lib/agents-md.js`）对整份文件有 16 KiB 上限，
 超了**静默截断**只留 marker。没有这道闸，管理员写完 8 KiB 追加段会看到「保存成功」而什么都不发生，
@@ -3390,7 +3392,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
 > 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P11b` + `T1`/`T1b`）、
 > `portal/test/materializer.test.js`（「默认渲染逐字节不变」由该文件 8 条 `renderHomeAgentsMd：…`
-> 既有断言承担，本分支对它们零改动；**别写 `M1`** —— 那个号在本仓已被
+> 既有断言承担，本分支对它们零改动；**这里不用 `M` 字头的判据号** —— 它在本仓已被
 > `materializer.test.js:750`（用户自建 `AGENTS.md`/`.gitignore` 在 stale 清理后存活）占用）、
 > `portal/test/migrations.test.js`（0040 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
 
