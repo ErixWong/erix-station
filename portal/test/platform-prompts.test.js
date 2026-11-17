@@ -1627,4 +1627,43 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
     }).map((h) => h.replace(/: .*$/, ''));
     assert.deepEqual(got, want, `反向自证「${name}」的抓取结果不对：${JSON.stringify(got)}`);
   }
+
+  // ⑤（C 件补强）悬空引用扫描：同一行 提示词语境 + 引用旧号 ⇒ 违规
+  //    旧号 = §4.16（现 #586「关于」）或 §4.18（现 #608「MCP」）。
+  //    语境标记：platform_prompts / PLATFORM_PROMPTS / /api/admin/prompts / 提示词面板
+  //    只认引用形态（portal.md 或 契约/口径/见 紧邻 §N）；白话/主人行不计
+  const PROMPT_LINE = /platform_prompts|PLATFORM_PROMPTS|\/api\/admin\/prompts|提示词面板/;
+  const OWNER_LINE = /#586|关于|about|version|版本|#608|MCP|能力市场|marketplace/i;
+  const danglingRefs = (files, num) => {
+    const esc = num.replace('.', '\\.');
+    const ref = new RegExp('(?:portal\\.md[^\\n]{0,40}|(?:见|契约|口径|contract)'
+      + '[^\\n§]{0,60})§\\s*' + esc + '\\b');
+    const hits = [];
+    for (const f of files) {
+      const lines = f.text.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        const ln = lines[i];
+        if (PROMPT_LINE.test(ln) && ref.test(ln) && !OWNER_LINE.test(ln)) {
+          hits.push(`${f.path || f.name}:${i + 1}: ${ln.trim().slice(0, 160)}`);
+        }
+      }
+    }
+    return hits;
+  };
+  const allFiles = repoTextFiles(new URL('../..', import.meta.url));
+  const dangling = [...danglingRefs(allFiles, '4.16'), ...danglingRefs(allFiles, '4.18')];
+  assert.deepEqual(dangling, [], '提示词面板只许指 §4.19，悬空引用：\n'
+    + dangling.join('\n'));
+
+  // ⑥ portal.md 必须有「### 4.19 管理台提示词面板」标题。
+  assert.match(apiDoc, /^### 4\.19 管理台提示词面板/m,
+    'docs/api/portal.md 必须有 `### 4.19 管理台提示词面板` 标题');
+
+  // 常驻反向自证：把一行写成 §4.18 的 .env.example 喂进同一函数 ⇒ 判红
+  const REF_418 = '§' + '4.18';   // 拆着写：这一行本身不许被⑤扫到
+  const envProbe = [{ path: 'deploy/.env.example',
+    text: 'PLATFORM_PROMPTS_READ_TIMEOUT_MS=8000  # 详见 docs/api/portal.md ' + REF_418 }];
+  const got418 = danglingRefs(envProbe, '4.18').map((h) => h.replace(/: .*$/, ''));
+  assert.deepEqual(got418, ['deploy/.env.example:1'],
+    '反向自证：写成 §4.18 的 .env.example 必须被判红并点名那一行');
 });
