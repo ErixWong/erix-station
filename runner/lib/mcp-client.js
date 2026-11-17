@@ -86,7 +86,8 @@ export function envNameFor(slotName) {
  * stdio 子进程的 env（§10.9）：白名单 + 槽位值，`ERIX_*` / `STATION_*` 一律不传。
  * 为什么不继承全量：worker 的 env 里有平台身份（HOME/FDE_* / git 身份），
  * 第三方 server 拿到就是白送的身份信息；而它**必须**拿到的只有槽位声明的那几个。
- * @param {{server: object, values?: Record<string,string>, baseEnv?: NodeJS.ProcessEnv}} options
+ * @param {{server: object, values?: Record<string,string>,
+ *   baseEnv?: NodeJS.ProcessEnv}} options
  */
 export function buildStdioEnv({ server, values = {}, baseEnv = process.env }) {
   const out = {};
@@ -167,7 +168,8 @@ export function flattenToolContent(result) {
     if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text);
     else if (block?.type != null) parts.push('[image omitted]');
   }
-  if (parts.length === 0 && typeof result?.structuredContent === 'string') parts.push(result.structuredContent);
+  if (parts.length === 0 && typeof result?.structuredContent === 'string')
+    parts.push(result.structuredContent);
   return parts.join('\n');
 }
 
@@ -176,7 +178,8 @@ export function flattenToolContent(result) {
  * 掐**中间**而不是掐尾巴：工具结果的结论常常在末尾（列表计数、错误行），尾部是模型最需要的。
  * @returns {{text: string, truncated: boolean, fullPath: string|null}}
  */
-export function clipLargeResult(text, { runId, tmpRoot = RESULT_TMP_DIR, fsImpl = fs, rand, log = null } = {}) {
+export function clipLargeResult(text, { runId, tmpRoot = RESULT_TMP_DIR, fsImpl = fs, rand, log
+  = null } = {}) {
   const full = String(text ?? '');
   if (Buffer.byteLength(full, 'utf8') <= RESULT_INLINE_BYTES) {
     return { text: full, truncated: false, fullPath: null };
@@ -194,11 +197,13 @@ export function clipLargeResult(text, { runId, tmpRoot = RESULT_TMP_DIR, fsImpl 
     fullPath = null;
   }
   const head = Buffer.from(full, 'utf8').subarray(0, RESULT_HEAD_BYTES).toString('utf8');
-  const tail = Buffer.from(full, 'utf8').subarray(Math.max(0, Buffer.byteLength(full, 'utf8') - RESULT_TAIL_BYTES))
+  const tail = Buffer.from(full, 'utf8').subarray(Math.max(0, Buffer.byteLength(full, 'utf8') -
+    RESULT_TAIL_BYTES))
     .toString('utf8');
   const dropped = Math.max(0, full.length - head.length - tail.length);
   const marker = `…${dropped} chars truncated…`;
-  const tailText = fullPath ? `${marker}\n[全文已存 ${fullPath}（用 readFile 或 shell 的 head/tail 取）]` : marker;
+  const tailText = fullPath ? `${marker}\n[全文已存 ${fullPath}（用 readFile 或 shell 的 head/tail 取）]`
+    : marker;
   return { text: `${head}\n${tailText}\n${tail}`, truncated: true, fullPath };
 }
 
@@ -259,7 +264,8 @@ function createStdioTransport({
       msg = JSON.parse(trimmed);
     } catch {
       // 不少 server 会往 stdout 漏一行日志：只记字节数，**不记内容**（内容里可能带值，§10.3）。
-      emitLog(log, 'debug', 'mcp stdio line is not JSON-RPC, ignored', { bytes: Buffer.byteLength(trimmed) });
+      emitLog(log, 'debug', 'mcp stdio line is not JSON-RPC, ignored', { bytes:
+        Buffer.byteLength(trimmed) });
       return;
     }
     if (msg && msg.id !== undefined && pending.has(msg.id)) {
@@ -284,7 +290,8 @@ function createStdioTransport({
     if (closed) throw mcpError(MCP_ERRORS.UNREACHABLE, 'MCP client 已关闭');
     let spawned;
     try {
-      spawned = spawnImpl(server.command, Array.isArray(server.args) ? server.args.map(String) : [], {
+      spawned = spawnImpl(server.command, Array.isArray(server.args) ? server.args.map(String)
+        : [], {
         // `detached:true` = 自成进程组 ⇒ 杀它必须打 `-pgid`，也意味着 worker 死了它不会跟着死（§6.8）。
         detached: true,
         env: buildStdioEnv({ server, values, baseEnv }),
@@ -496,9 +503,11 @@ async function readJsonRpcFromResponse(res, id, { log = null } = {}) {
       const msg = JSON.parse(body);
       if (msg && (id === undefined || msg.id === id)) return msg;
       // 批次里的**响应数组**（streamable HTTP 允许多路复用一帧）：挑出我们要的那条。
-      if (Array.isArray(msg)) return msg.find((m) => m && (id === undefined || m.id === id)) ?? null;
+      if (Array.isArray(msg)) return msg.find((m) => m && (id === undefined || m.id === id)) ??
+        null;
     } catch {
-      emitLog(log, 'debug', 'mcp sse frame is not JSON-RPC, ignored', { bytes: Buffer.byteLength(body) });
+      emitLog(log, 'debug', 'mcp sse frame is not JSON-RPC, ignored', { bytes:
+        Buffer.byteLength(body) });
     }
     return null;
   };
@@ -579,7 +588,8 @@ function createHttpTransport({
           redirect: 'manual',
           signal: controller.signal,
         });
-        const location = res.status >= 300 && res.status < 400 ? res.headers?.get?.('location') : null;
+        const location = res.status >= 300 && res.status < 400 ? res.headers?.get?.('location')
+          : null;
         if (!location) break;
         if (hop >= 3) {
           throw mcpError(MCP_ERRORS.UNREACHABLE, 'MCP HTTP 重定向超过 3 跳');
@@ -609,7 +619,8 @@ function createHttpTransport({
       if (signal?.aborted === true || controller.signal.aborted) {
         throw mcpError(MCP_ERRORS.ABORTED, 'MCP HTTP 请求被宿主中止');
       }
-      throw mcpError(MCP_ERRORS.UNREACHABLE, `MCP HTTP 请求失败：${redactValues(String(err?.message ?? err), values)}`);
+      throw mcpError(MCP_ERRORS.UNREACHABLE, `MCP HTTP 请求失败：${redactValues(String(err?.message
+        ?? err), values)}`);
     } finally {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', onOuterAbort);
@@ -683,7 +694,8 @@ function createHttpTransport({
     async notify(method, params, { signal, timeoutMs: perCall } = {}) {
       nextId += 1;   // 同 stdio：通知不带 id，但占号，保证 id 在整条会话上唯一
       try {
-        await post({ jsonrpc: '2.0', method, params: params ?? {} }, { signal, timeoutMs: perCall });
+        await post({ jsonrpc: '2.0', method, params: params ?? {} }, { signal, timeoutMs:
+          perCall });
       } catch (err) {
         emitLog(log, 'debug', 'mcp notify dropped', {
           method, err: redactValues(String(err?.message ?? err), values),
@@ -789,7 +801,8 @@ export function createMcpClient({
       throw mcpError(MCP_ERRORS.UNREACHABLE, `MCP server ${server.name} 已随 run 关闭`);
     }
     if (state === 'fused') {
-      throw mcpError(MCP_ERRORS.UNREACHABLE, `MCP server ${server.name} 本次 run 已熔断（连续失败 ${failures} 次）`);
+      throw mcpError(MCP_ERRORS.UNREACHABLE, `MCP server ${server.name} 本次 run 已熔断（连续失败
+        ${failures} 次）`);
     }
     state = 'starting';
     let err = null;
@@ -865,7 +878,8 @@ export function createMcpClient({
         .map((tool) => ({
           name: tool.name,
           description: typeof tool.description === 'string' ? tool.description : '',
-          ...(tool.inputSchema && typeof tool.inputSchema === 'object' ? { inputSchema: tool.inputSchema } : {}),
+          ...(tool.inputSchema && typeof tool.inputSchema === 'object' ? { inputSchema:
+            tool.inputSchema } : {}),
         }));
       // 发现到的清单立刻进本地视图：`search` 与 `call` 的门禁读的就是它（§6.3）。
       // ⚠ **原地改，不要重新赋值**：`createMcpClient` 返回的 `tools` 属性指向这个数组，
@@ -879,7 +893,8 @@ export function createMcpClient({
     },
     /**
      * `tools/call` —— **永不重试**（§0 结论 6）。
-     * @returns {Promise<{text: string, isError: boolean, truncated: boolean, fullPath: string|null}>}
+     * @returns {Promise<{text: string, isError: boolean, truncated: boolean, fullPath:
+       string|null}>}
      */
     async callTool(tool, args, { signal } = {}) {
       const t = await ensureReady({ signal });   // 握手段的重试允许，调用本身不允许
@@ -894,7 +909,8 @@ export function createMcpClient({
           // MCP 规范：工具执行失败也走 `result.isError`，但不少服务端发的是 JSON-RPC error + content。
           const text = flattenToolContent(err.details);
           const clipped = clipLargeResult(text, { runId, tmpRoot, fsImpl });
-          return { text: clipped.text, isError: true, truncated: clipped.truncated, fullPath: clipped.fullPath };
+          return { text: clipped.text, isError: true, truncated: clipped.truncated, fullPath:
+            clipped.fullPath };
         }
         if (err?.code !== MCP_ERRORS.ABORTED) markBroken(err);
         throw err;

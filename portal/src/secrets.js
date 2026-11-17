@@ -112,7 +112,7 @@ export function decryptValue({ itemId, name, scope, fdeId = null, blob, key }) {
  * 优先级：fde 覆盖 > global。缺必填 ⇒ 进 `missing`；非必填缺失 ⇒ 不出现在 values 里。
  * @returns {Promise<{values: Record<string,string>, missing: string[]}>}
  */
-export async function resolveSlots({ pool, itemId, fdeId = null, key }) {
+export async function resolveSlots({ pool, itemId, fdeId = null, key, log = null }) {
   const params = (await pool.query(
     `SELECT name, kind, inject, required FROM capability_params WHERE item_id = $1 ORDER BY name`,
     [itemId])).rows;
@@ -145,6 +145,10 @@ export async function resolveSlots({ pool, itemId, fdeId = null, key }) {
     } catch {
       // 解不开 = 对运行期而言「没有这个值」。**不**把它当 500 抛出去：一条坏值不该让整个 run 起不来，
       // 但它必须进 missing，从而让该 server 不注册（fail-closed）。
+      // ⚠ 必须留一条**运维可见**的日志（审计必修）：这条最可能的成因是 `MCP_SECRET_KEY` 轮换过，
+      // 静默进 missing 时页面只说「未设置」，运维会去让管理员重填——而真相是**所有**值都解不开了。
+      // 日志只记名字与作用域，**不含值、不含密文**。
+      log?.warn?.('[secrets] 槽值解不开（key 轮换过？）', { item_id: itemId, name: p.name, scope: row.scope });
       if (p.required) missing.push(p.name);
     }
   }
