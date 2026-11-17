@@ -3337,8 +3337,22 @@ Content-Type: application/json
 | JS 预闸（写**之前**）| 常态超限 | 现读那一行拿到对面那一列的当前值 ⇒ 算出渲染后字节数 ⇒ 超了直接 400，**一条写语句都不发**（判据 `P6`）|
 | SQL 闸（同一条语句里）| 并发窗口（预闸读完之后别人改了对面那一列）| `INSERT … SELECT … WHERE rendered_bytes <= $7` ⇒ 超限就喂给 INSERT 0 行，**一格没写、审计零行**，JS 侧据 `written = 0` 报同一个 400 |
 
-两条闸报出的 `details` 逐字同形；SQL 里那段算术与真渲染的等价性由判据 `P6b` 逐组钉住（常量由 JS
-当参数送进 SQL，SQL 里不抄数字，口径同 §4.15-4 的 `$5/$6`）。
+两条闸报出的 `details` 逐字同形（常量由 JS 当参数送进 SQL，SQL 里不抄数字，口径同 §4.15-4 的
+`$5/$6`）。而「SQL 里那段算术 ≡ 真渲染」这件事**分两段钉，两段各管一半**，别混着夸：
+
+- **JS 侧**「预算算式 ≡ `renderHomeAgentsMd` 的真实字节」由 `P6b`
+  （`portal/test/platform-prompts.test.js`）逐组钉住。那条判据自己在注释里写明：SQL 里 `gate`
+  那段算术（`octet_length` / `convert_to`）在单测里**没有**执行过 —— 假池从不执行 SQL。
+- **SQL 侧**那段字节算术由 `P6b-db`（`portal/integration/platform-prompts-db.mjs`）钉：它在真
+  PostgreSQL 上把 `SAVE_SQL` 真跑一遍，逐组对账 `gate.rendered_bytes` 与 JS 的算子，并钉超限那档
+  `written = 0`、审计零行、一格没写。
+
+⚠ **限制（必须知道）**：`P6b-db` **不在 `npm test` 里** —— `npm test` 是裸 `node --test`，而
+`portal/integration/` 下的文件叫 `*.mjs`，不匹配它的测试文件名规则；CI 也没有 PostgreSQL 步骤。
+跑它得自己起一个专用临时库：`TEST_DATABASE_URL=… npm run test:integration:prompts`。
+后果：SQL 侧那段算术被改坏（比如 `$5::bigint + octet_length(nxt.addendum)` 退化成只算一列）在
+默认流水线上**测不出来** —— 拦下超限的是 JS 预闸（判据 `P6` / `P13` 都只跑假池，假池不执行 SQL），
+`npm test` 照样全绿，只有 `P6b-db` 会红而它不在这条流水线上。
 
 ⚠ **闸里的标识行按最坏情况算，不按示例名算**（评审 F2）：标识行是 `（FDE 标识：<fdeName>）`，而保存时
 不知道这份文件会渲染给哪些工位（全部启用中的都要重物化），所以预算取**最长合法工位名**：
