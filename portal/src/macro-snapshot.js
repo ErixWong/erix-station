@@ -372,6 +372,16 @@ export function copyUntracked(repoDir, worktreePath, { hasRsync = detectRsync() 
  *   2. 若 `repoDir` 本身是个 linked worktree（`.git` 是个**文件**而非目录），拷过去的 `.git`
  *      会指向不存在的 gitdir ⇒ 快照里的 git 命令会失败，表现为比对报错而不是静默错数据。
  *
+ * ⚠ 已知代价（与有 HEAD 那条路的**语义差异**，已用单测钉住）：整树拷贝**连被 `.gitignore`
+ *   忽略的文件一起搬**（`copyUntracked` 那条路会 `--exclude-standard` 排除它们，典型就是
+ *   `node_modules`）。两个影响：
+ *     - 一致性校验**不受影响**：快照里的 git 同样读 `.gitignore` ⇒ 前后 `status` /
+ *       `ls-files --others` 一致 ⇒ digest 仍相等（单测钉住）；
+ *     - 体量门闸看不住它：`MAX_SIZE_BYTES` 算的是「变更 + 未跟踪**且不忽略**」的字节数 ⇒
+ *       一个带巨大 `node_modules` 的 0 提交仓库会突破预算。当时拍板接受（“0 提交的仓库
+ *     通常还小”），**真机若出现大 0 提交仓库变慢，优先从这里改**（如按
+ *     `git ls-files --others --exclude-standard` 反推忽略集、或拷前先看磁盘余量）。
+ *
  * @param {string} repoDir
  * @param {string} worktreePath
  * @param {{snapshotRoot?:string|null, hasRsync?:boolean, timeout?:number}} [opts]
