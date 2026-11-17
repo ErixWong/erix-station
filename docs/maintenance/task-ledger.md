@@ -8922,3 +8922,123 @@ FDE 容器**逐台 `docker rm -f` + `provision-fde`**（换镜像必须重建）
   `mail_otp_enabled` 还原 true（验 e2e 期间临时关过）。
 
 **部署面变化（记一笔，免得下次照抄旧单）**：本版**不需要 `MCP_SECRET_KEY`**；`deploy/.env` 里若有可删。
+
+### 8.172 管理台提示词面板落地（#596，2026-11-17，主 agent + erix_run ×4 + copilot 
+ 独立评审）
+
+**交付**：portal 侧三条平台提示词改在**管理台**改，不重建镜像不重部署 
+  ——
+`platform_prompts.agents_md_addendum`（追加成 `~/AGENTS.md` 末尾一节）、
+ `agents_md_override`
+（整段替换正文主体）、`title_prompt`（AI 改名的 system）。
+ 住镜像里的四条只读，且**不给全文**
+（`portal/Dockerfile` 只 `COPY portal`，镜像里没有 `runner/`，
+ 给了就是撑不起的承诺）。
+口径：DB 是真相、单行表、读侧永不 500（`reason` 三条互不合并）、
+ **设置与审计在同一条 SQL**
+（`WITH snap(FOR UPDATE) → nxt → gate → upd → aud`，`http.js` 不许再补一笔）、
+写侧渲染硬闸 16384 B（与 `runner/lib/agents-md.js` 同数）、
+ 预算按**最长合法工位名**算而预览按 `example` 算
+（差 3 B，真机对得上）。迁移 `deploy/migrations/0043-platform-prompts.sql`；契约 
+ `docs/api/portal.md §4.19`。
+
+**验收（主 agent 亲手复跑，判绿只看退出码）**：根 `npm test` rc=0（`# tests 
+  3007 / pass 2906 / fail 0 /
+skipped 101`）、前端 `typecheck` rc=0 + `81 files / 1727 tests` rc=0、一次性 PG 上
+`migrate-fresh-db` **5/5 rc=0**（空库跑到 head）、`npm run test:integration:prompts` **7/7 
+ rc=0**
+（种行 × `FOR UPDATE` × 并发首写）。CI 质量门禁 pass 2m34s。合并 `a1662f8`（PR 
+ #641）。
+
+**变异自证清单（每条现场做退化式，各自 rc=1 且点名到格子）**：迁移 
+  `NNNN` 全局唯一（塞一支同号
+`0043-collision-proof.sql` ⇒「0043 被 2 个文件抢用」）· 文档 H3 唯一 · `#### 
+ N.N-x` **归属**闸
+（在 `### 4.19` 名下挂 `#### 4.18-9` ⇒ 点名「挂在谁下面 / 应叫什么」）· 
+ `P6c` SQL 形状闸（把
+`$5::bigint + octet_length(nxt.addendum)` 改成 `$5::bigint` ⇒ **只有 `P6c` 红**）· `P3` 
+ 空行两头
+（紧贴与两个空行都红）· `D1` 行 + 上方 5 行邻域扫悬空引用（真 
+ `.env.example` 翻转 ⇒ rc=1 点名
+`deploy/.env.example:88`）· `R10` 差集方向写反 ⇒ 三格全红。
+
+**真机 e2e（分支镜像 `p596-v5` + dev 栈边缘）**：保存 
+  200（`materializeEnqueued=6`、写者 uuid）；
+8191 B ⇒ `400`、`rendered_bytes=17512 > 16384`、**库里字节数不变**；
+ 三种坏请求体 400×3；
+宿主 `~/AGENTS.md` 引言与正文之间**恰好一个空行**、标识行仍是末行、
+ 清空后回到内置 9018 B；
+run 探针（明令不许调工具）`events/history` **`tool_use=0`**、1 轮、
+ 逐字引用管理员那一行；
+标题提示词「只输出这一串字：X」⇒ 返回**逐字等于** 
+ `X`（`title_source=manual`）；
+`updated_by` 置 NULL ⇒ 界面「从未保存过（还没有人在管理台存过）/ 操作人 
+ —」；
+`[migrate] applying 0043-platform-prompts` → `ok`，
+ 且**台账反向对账**当场点名一条真孤儿。
+截图：`/docker/erix_station_playwright/596-{before,after-save,after-reload,never-saved}.png`。
+
+**这单最值钱的六条账（写下来是给下一个人省考古）**
+
+1. **迁移号四次相撞**：0039 被 #595 取走、0040 被 #608、0041 被 #640、0042 被 
+ #670 那条线。
+   每次都是**现查**发现，不是猜；判据已落成「`NNNN` 全局唯一」闸 + 
+    `migrate.js` 的**台账反向对账** warn
+   （真机上它当场点出了本单第一次部署留下的孤儿 `0040-platform-prompts`）。
+   教训两条：**并行 session 下让号窗口赢不了，合并才是收敛动作**；
+    已应用的迁移改内容 ⇒ checksum 失配
+   ⇒ 容器反复重启（dev 库止血 = 删那条台账行重放，运维事实要在 warn 
+    文案与注释里说清）。
+2. **文档节号两次相撞**（`§4.16 → §4.18 → §4.19`）。
+ 没有闸时它会**假红**：`D1` 曾用「`indexOf` + 切到
+   `## 5.`」的粗切法，把邻居那节的错误码读成自己的。现在 H3 唯一 + 
+    `####` 归属 + `D1` 悬空引用三条闸都在。
+3. **夹具比现实友好（本单我自己中过一次）**：`D1` 
+ 的常驻反向自证喂的是内存夹具「标记与引用挤在同一行」，
+   而真 `deploy/.env.example` 的标记在**上一行** ⇒ 
+    真文件那行翻回旧号时**闸不响**（我拿真文件变异才抓到）。
+   修法：反向自证必须拿**真文件内容**做内存翻转，
+    旧夹具保留但不许顶替它。
+4. **`npm test` 的 `# skipped` 不参与门禁**：让号之后 `migrate-fresh-db` 的 head 
+ 断言红着
+   （`+ 0043-platform-prompts` / `- 0042-…`），而根门禁 rc=0 —— 无 
+    `TEST_DATABASE_URL` 时整文件 skip。
+   已把这条新鲜现场贴进 **#665**（CI 没有 PG ⇒ 这一整类恒绿）。
+5. **假池从不执行 `SAVE_SQL`**：SQL 侧渲染算式改坏在 `npm test` 里恒绿（`P6`/
+ `P13` 被 JS 预闸拦下）。
+   新增 `P6c` 只挡「退化式」；「形状对而值不对」仍只有真库腿 `P6b-db` 
+    会红 ⇒ 互补，不是替代。
+6. **两处环境口径**（新人必踩）：管理台 API 只认**管理台入口**（`:9443` + 
+ `Host: admin.<伞域>`，
+   `:8090/api/admin/*` 一律边缘 404，#450）；有邮箱的账号 `POST /api/auth/login` 回 
+    **200 但没有 cookie**
+   （`status=email_code_required`，要走 `/api/auth/login/email-code`）。另外 worktree 缺 
+    gitignored 的
+   `deploy/.env` ⇒ compose 默认把 `BASE_DOMAIN` 变成 `localhost` ⇒ 对账 hostname 
+    不符、循环报错。
+
+**已知边界（不阻塞，都记了账）**：
+  自定义标题提示词会改变模型输出习惯 —— 「只输出这一串字：X」实测
+12 次仅 5 成，失败是 `502 llm_upstream_failed` 而 LiteLLM 侧记 200 ⇒ 上游回**空 
+ `content`**，
+被既有 `sanitizeTitle` 判「无可用标题」；内置提示词 6/6。已写进 `§4.19-4`。
+本页 `toLocaleString()` 未传 `locale.value`（先例 `portal/frontend/src/views/
+ AdminUsersView.vue:620`）
+⇒ 时间**格式**随浏览器语言而非界面语言；playwright 容器 TZ=UTC，
+ 所以截图上的时刻是 UTC。
+行宽：本单新增部分行 >100 **字节**（本仓 `portal/test`+`portal/src` 既有 18% 
+ 的行 >100 B、最长 575 B，
+且没有机械闸）—— 新写的文档已按 100 B 折行，
+ 测试里的中文断言消息没有。
+**后续**：**#664**（三条 PUT 无限流，一次保存扇出 N 
+  次整份家目录重物化）、
+**#665**（CI 加 PostgreSQL + 常驻「skip 不算绿」闸）。
+
+**交接现场**：dev 栈 `station-portal` 现跑分支镜像 `erix-station/
+  portal:p596-v5`（**未换回发布镜像**，
+按用户决定等其他 session 跑完统一升级）；dev 库 `platform_prompts` 
+ 三列已清空（= 跟随内置）、
+`updated_by=NULL`；台账孤儿 `0040-platform-prompts` 已删；一次性验证 PG 容器 
+ `p596-verify-pg`
+（`127.0.0.1:55433`）与 `wt-596` / `wt-596b|c|d` 会话账本（`/tmp/erix-596*`）
+ 留着可复盘。
