@@ -8259,3 +8259,36 @@ pin 到 0.1.70（`…portal@sha256:9b9b5e91…`，容器 RepoDigests 已核）�
 - **`v0.1.71` 的 tag 还空着**：main 已是 `0.1.71`（`#612`，`f50dd4b`），但 `git tag -l 'v0.1.7*'` 只有
   `v0.1.7` / `v0.1.70`。§8.155 计划的重切**只差打 tag 这一步**，属并行 session 的账，本单不代打
   （同一版本两个 session 各打一次正是 §8.154 要记的那种混乱）。
+
+### 8.157 部署移到 v0.1.71 + 5 台 FDE 容器重建（版本分裂消除）（2026-11-17，主 agent）
+
+接 §8.156。§8.156 落 pin 的是 `v0.1.70`，而**同一晚 `v0.1.71` 已被并行 session 切出来并发布成功**
+（tag `v0.1.71` → release run `43917810893` success，三镜像 `latest` 已重新指向：portal `22644c7d…` /
+fde `84007d94…` / proxy `3c3f6eb6…`）⇒ 部署再走一步，把栈整体挪到 0.1.71，顺手消掉 §8.156 记的那处
+**版本分裂**（portal 0.1.70 vs FDE 容器 0.1.69，其中 `fde-eric` 还是 `revision unknown` 的本地 build）。
+
+**做法与读数**：
+- `deploy/.env` 三处换成 0.1.71 的**形态①** manifest digest（备份 `/tmp/deploy.env.bak-261117-71`）：
+  `FDE_IMAGE=…erix-station-fde@sha256:84007d94…`（拉取 1m20s，落盘 `.Id = a83b1f0b…`）、
+  `STATION_PORTAL_IMAGE=…portal@sha256:22644c7d…`（`.Id = e6536f76…`）、
+  `STATION_DOCKER_PROXY_IMAGE=…fde-proxy@sha256:3c3f6eb6…`（`.Id = ca85d467…`）。
+- `docker compose up -d` ⇒ `station-portal` / `station-docker-proxy` Recreated + healthy。
+- **FDE 容器重建**（runbook §2 第 5 条：`ensureFdeContainer` 只在容器不存在时创建，pin 变了不会自己生效）：
+  **先验在飞 run = 0**（`select count(*) from runs where status in ('running','queued')` ⇒ `0`，只余一条历史
+  `cancelling`），再逐台 `docker rm -f fde-<name>` + `provision-fde --fde-name <name>`，
+  5 台（`tetris` / `todo` / `blind` / `acc019` / `eric`）全部 `provision rc=0`、`image = a83b1f0b…`（= 新 pin 的 `.Id`）。
+  数据不丢的依据：工作区是宿主 bind mount（`/srv/erix/users/<name>/{home,projects,cache}`），容器是牲口。
+- **分裂消除**：portal `/api/health` = `0.1.71 / revision f50dd4b / built_at 2026-11-16T17:23:26Z`；
+  5 台 FDE 容器内 `/opt/erix/build-info.json` **逐格相同**（`0.1.71 / engine 0.33.0 / f50dd4b / 同一 built_at`）。
+  ⚠ FDE 镜像里那份文件在 **`/opt/erix/build-info.json`**（不是 portal 的 `/app/build-info.json`）——
+  拿 portal 的路径去 `docker exec fde-*` 会得到 `No such file`，别据此判「镜像里没烘」。
+
+**验收**：`E2E_UI=1 npm run test:integration:version` ⇒ **5/5 rc=0**，截图 `/tmp/version-surface-e2e.png`
+（160,348 字节）：About 面板 Server `0.1.71 / f50dd4bfb646… / 11/16/2026 5:23:26 PM`、平台引擎 `0.33.0`、
+每台 FDE 行带 `provision-time snapshot` 且镜像摘要 = `…fde@sha256:84007d94…`（与 pin 同源）。
+
+**一处环境兜底，如实记**：第一次跑 UI 腿被 skip，原因是 **`admin.fde.erix.vip` 解析不出**
+（`net::ERR_NAME_NOT_RESOLVED`）——**宿主自己 `getent hosts` 也解析不出**（伞域泛解析依赖的内网 DNS
+间歇性抽风，与 AGENTS §4 记的那条同族）。兜底：给 `erix_station_playwright` 容器 `/etc/hosts` 加
+`172.17.0.1 admin.fde.erix.vip station.fde.erix.vip`（Traefik `network_mode: host`，管理台入口在宿主 9443），
+重跑即 5/5。**这是测试环境兜底，不是产品修复**；容器重启后该行会消失，下次 skip 先查这一条。
