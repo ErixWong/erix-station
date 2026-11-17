@@ -8179,8 +8179,16 @@ commit **一致**）。dev 栈改 pin 该 digest（`deploy/.env:72`，备份 `/t
 - **tag 不是我打的**：`v0.1.70` 在我执行 `git tag` 前已由并行 session 建好（`a5deeb7`，release run
   `43910657016`，早我 8 分钟）。内容对（含 #586/#589），但**不含 #603 的 e2e 脚本**（#607 在其后合并）
   ⇒ 「拉 tag 的人手里没有 e2e 脚本」，要跑得从 main 取。下次发版会自然带上。
-- **vision 看图这一腿没做成**：`analyze_image` 连续 3 次 `http_request_failed`（上游 API 挂）⇒ 用
-  DOM 断言替代（文本/数值/溢出/控制台错误都机器判），「好不好看」这层没有第三方视觉确认。
+- **vision 看图这一腿：先判错、后补上（口径纠正）**。当时 `analyze_image` 连 4 次 `http_request_failed`，
+  我先记成「上游 API 挂」——**错**。真因是**本机 `llama.cpp` 容器已 `Exited` 3 周**（`:8008` 无响应），
+  而 vision 的默认模型 `Qwen3.5-4B` 就由它提供（经 relay `llm-gateway.internal` 映射）⇒ relay 报
+  `http_request_failed` 是**后端死了**，不是外网抽风。`docker start llama.cpp` 后 1s 出 OK。
+  **但 `analyze_image` 仍超时**：视觉推理 + 大图实测 **51s**，超过 pi 的 MCP 调用超时 ⇒ 改走 CLI
+  通道（`~/.local/bin/vision-mcp --file <png> "<问题>"`）拿到确认：三区块标题、Server 三格
+  `0.1.71 / f50dd4fb664… / 11/16 5:23 PM`、无红色报错/无空白/无重叠、每台 FDE 都带
+  `provision-time snapshot`。⚠ 它把 revision 读成 `f50dd4fb664…`（实际 `f50dd4bfb646…`）——
+  **易混字符误读**是 `vision-mcp` 文件头写明的已知短板 ⇒ **逐字判据（版本号/commit/revision）一律靠
+  DOM 或接口断言，看图只用来判「有没有渲染错乱/空白/重叠」**。
 - 另：跑 e2e 时发现真机 portal 被并行 session 重建过 ⇒ `revision/built_at` 变 `unknown`（本地
   `docker compose build` 没传 `STATION_REVISION`/`STATION_BUILD_DATE`，compose 缺省即 `unknown`）。
   这**恰好证明口径诚实**（本地乱建不会编合法版本号），也说明 CI 的 ④′ tripwire 才是这条的守门人。
