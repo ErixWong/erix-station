@@ -21,6 +21,8 @@ import { finishMacroRun, isAssignmentExpired, MACRO_VERDICTS, MacroError } from 
 import { postMessage, SessionError } from './sessions.js';
 import { SNAPSHOT_FAILURE_REASONS } from './macro-snapshot.js';
 import { fetchRunAssistantText, fetchUserTextTurns } from './session-text.js';
+// issue #676 ②：facts-only（审查暂不可用）模式下给用户发一条「本次未审查」通知。
+import { createNotification } from './notifications.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -301,15 +303,21 @@ function withTimeout(promiseFactory, timeoutMs) {
  * @param {boolean} [opts.remediate=true]     是否允许回灌（`red` 才回灌）
  * @param {(msg: object) => any} [opts.notify]  转人工/通知的 hook（默认 no-op）
  * @param {Date}   [opts.now]                 到期判定用（⑤：只比瞬时值）
+ * @param {boolean} [opts.reviewUnavailable]  #676 ②（丙=止血）：审查暂不可用（快照方案待定）。
+ *                                            true ⇒ 不调 runner / 不解析判决，直接落
+ *                                            `skipped` + `skipped_reason='review_unavailable'` + `verdict NULL`，
+ *                                            并发一条「完成审查暂未启用」通知。
  * @returns {Promise<{macroRunId: string, status: string, verdict: string|null, remediated: boolean, detail: object}>}
  */
 export async function runMacroReview(pool, {
   macroRunId, userId = null, reviewSessionId = null, originalRunId = null,
   snapshot = null, gitFacts = null, reviewRunner, reviewTimeoutMs = 10 * 60 * 1000,
   remediate = true, notify = async () => {}, postMessageImpl = postMessage, now = new Date(),
+  reviewUnavailable = false,
 } = {}) {
   if (!macroRunId) throw new MacroError('validation_failed', 'macroRunId 必填（W4b 只 finish 不 claim）');
-  if (typeof reviewRunner !== 'function') throw new MacroError('validation_failed', 'reviewRunner 必填');
+  // facts-only 模式不跑审查 ⇒ 不要求 reviewRunner（#676 ②）。
+  if (!reviewUnavailable && typeof reviewRunner !== 'function') throw new MacroError('validation_failed', 'reviewRunner 必填');
 
   // —— 账与订阅：一次读齐（depth / until / 缺省 user 与会话）——
   const acct = await pool.query(
@@ -333,6 +341,26 @@ export async function runMacroReview(pool, {
       detail: snap,
     }));
   };
+
+  // —— #676 ②（丙=止血）：facts-only「审查暂不可用」——不跑 runner / 不建快照 / 不解析判决 ——
+  // 只落一个事实（本次未审查），绝不冒充「审过了」（不写 done/unclassified 假绿）。
+  if (reviewUnavailable) {
+    const res = await done('skipped', { skippedReason: 'review_unavailable', now });
+    // 通知尽力而为（发失败不拖垮已落的账）。
+    if (safeUserId) {
+      try {
+        await createNotification(pool, {
+          userId: safeUserId, macroRunId, severity: 'info',
+          title: '完成审查暂未启用',
+          body: '完成审查暂未启用（快照方案待定，见 #673），本次未审查。',
+          createdAt: now,
+        });
+      } catch (err) {
+        await notify({ kind: 'review_unavailable_notify_failed', macroRunId, text: err?.message ?? String(err) }).catch(() => {});
+      }
+    }
+    return res;
+  }
 
   // —— 快照失败（W4a 的 reason）：失败出口，不是 red ——
   if (snapshot && snapshot.ok === false) {
