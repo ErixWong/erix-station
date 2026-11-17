@@ -858,6 +858,9 @@ export const zhCN = {
       // issue #485 片 A：上传上限（views/AdminUploadView.vue，契约 docs/api/portal.md §4.15）。
       // 放在证书之后、号池占用（只读运维快照）之前：它是一处**平台配置**。
       upload: '上传上限',
+      // issue #596 片 B：平台提示词面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.19）。
+      // 顺序 upload → prompts：两者都是「改一行而不必重建 station-portal」的平台配置。
+      prompts: '提示词',
       // issue #595 M2：能力市场发布台（views/AdminMarketView.vue，契约 §7 管理面）。
       // 排在上传之后、号池占用（只读运维快照）之前：它是一处平台配置。
       market: '能力市场',
@@ -1114,6 +1117,87 @@ export const zhCN = {
       srcDefault: '内置默认',
       envNotSet: '环境变量并未显式设置',
       footnote: '这是**单文件**上限，不是磁盘总量上限（总量配额是 #485 片 B，未实现）。它与 MAX_BODY_BYTES（JSON 请求体口径，默认 64 KiB）是两个不同的旋钮：上传不走后者。',
+    },
+    // issue #596 片 B：管理台「提示词」面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.19）。
+    // 三条生效时机各不相同 ⇒ 故意是三个键而不是一个共用句（判据 F7：三张卡不许共用一句）。
+    // readonly 四条只写「住在哪 + 改它要付什么代价」，不写全文：portal 镜像不含 runner/。
+    // ⚠ 这一段的值是纯文本渲染的（本页没有 markdown 渲染器，也不打算加依赖）⇒ 值里不许写成对星号
+    //   当强调：它在界面上只是一串杂字符。要强调请用 class；机械闸见 localeParity.spec.ts。
+    prompts: {
+      title: '平台提示词',
+      intro: '平台喂给模型的文本里，portal 侧可控的三条。改完不重启 portal、不重建镜像：物化与改名每次都现读数据库那一行。空串就是「跟随内置」。',
+      loading: '正在读取提示词…',
+      notLoaded: '尚未加载提示词（还没请求）。',
+      unknown: '未知',
+      never: '—',
+      updatedAt: '最后保存',
+      updatedBy: '操作人',
+      updatedAtNever: '从未保存过（还没有人在管理台存过）',
+      updatedAtUnparsable: '时间无法解析：{value}',
+      reasonNoRow: '管理台从没存过任何一条 ⇒ 现在发出去的是内置提示词；在这里存一份就会覆盖它。',
+      reasonReadFailed: '读不到 platform_prompts（表缺失或数据库抖动）⇒ 已回落内置提示词；物化与改名照常，不会被 500 弄挂。',
+      reasonReadTimeout: '读 platform_prompts 超时（数据库没在 PLATFORM_PROMPTS_READ_TIMEOUT_MS 内回答）⇒ 已回落内置提示词；这不是「没人配过」，真故障在连接上。',
+      reasonUnknown: '服务端回了一个本页不认识的回落原因（后端新加的 reason？）⇒ 现在用的是内置提示词，具体原因看服务端日志。',
+      source: '当前来源',
+      sourceDb: 'DB 覆写',
+      sourceBuiltin: '跟随内置',
+      sourceDbNote: '（这一格现在是管理台存的值，不是代码里那一份）',
+      bytesOf: '当前 {bytes} / 上限 {max}',
+      draftBytes: '草稿：{bytes}',
+      overLimit: '草稿 {bytes} 已超过上限 {max}：保存会被服务端拒（400）——这里不提前拦，服务端才是闸。',
+      cardAddendum: '平台补充约定（追加成 ~/AGENTS.md 末尾一节）',
+      addendumLabel: '追加段正文',
+      addendumHint: '那一节的标题与引言由平台撰写；你写的正文逐字节照搬，不加工不改写。清空就是不要那一节。',
+      timingAddendum: '生效时机：保存 ⇒ 入队重物化 ⇒ 该工位下一次 run 吃到这一节（不是当场，也不是下一次 portal 重启）。',
+      cardAgentsMd: '平台约定整段覆写（替换 ~/AGENTS.md 的正文主体）',
+      agentsMdLabel: '覆写正文',
+      agentsMdHint: '内置模板的正文主体整段被你这份替掉；末尾的「FDE 标识」行仍由代码追加，永远是最后一行、改不掉。',
+      timingAgentsMd: '生效时机：与追加段共用同一次物化通知 ⇒ 该工位下一次 run 生效；入队没成功时，要等下一次 portal 重启的全量重建才收敛。',
+      cardTitlePrompt: '会话标题提示词（AI 改名时的 system）',
+      titlePromptLabel: '标题提示词',
+      titlePromptHint: '它只决定「给会话起什么名」：不进 ~/AGENTS.md，也不参与物化。提示词不是守卫——落库前照旧 sanitize 标题。',
+      timingTitlePrompt: '生效时机：下一次改名就生效（手工「AI 改名」与自动改名走同一条解析路径；每次现读、无缓存，不用等 run，也不通知物化）。',
+      deviated: '已偏离内置模板：现在发出去的是你写的这份正文主体。',
+      followsTemplate: '跟随内置模板：没有覆写，发出去的就是代码里那一份。',
+      renderBudget: '整份 ~/AGENTS.md：生效 {effective} / 注入上限 {limit}（内置模板渲染出来是 {template}）',
+      renderBudgetNote: '这个数是按固定示例工位名 example 渲染的预览值（零时间戳 ⇒ 可对比），不是某个真工位的文件大小；而保存时的渲染闸按最长合法工位名算 ⇒ 真名字更长时，它可能比这里显示的略大。',
+      viewEffective: '查看当前生效全文',
+      hideEffective: '收起生效全文',
+      copy: '复制',
+      copied: '已复制。',
+      copyFailed: '复制失败（浏览器没给剪贴板能力），请手动选中。',
+      restoreBuiltin: '恢复内置',
+      titlePromptDefaultBytes: '内置默认（跟随内置时实际发出去的就是它）：{bytes}',
+      save: '保存',
+      reload: '重新读取',
+      saved: '已保存（下面显示的就是服务端落库后回读的那一份，不是你敲的那一串）。',
+      savedEnqueued: '已通知 {count} 个启用中的工位重新物化 ⇒ 各自下一次 run 生效。',
+      savedButNotNotified: '已保存，但物化未通知（portal 重启后全量重建收敛）。',
+      savedNoticeCountUnknown: '已保存，但服务端没回 materializeEnqueued ⇒ 本页按「未通知」处理，不说「已生效」。',
+      readonlyTitle: '住在镜像里的四条（本页只读）',
+      readonlyIntro: '这四条第一期不开放在线覆写。下面只写它们住在哪、改它要付什么代价。',
+      readonlyNoFullText: '本页不显示它们的全文：portal 镜像里没有 runner/（Dockerfile 只 COPY portal/），后端运行时读不到、也只把 key 发过来——在这里显示全文就是撑不起的承诺。要看全文请读仓库源码。',
+      readonlyUnknown: '服务端还列了本页没有说明文案的条目：{keys}（不猜它是什么）。',
+      readonly: {
+        runnerSystemPrompt: {
+          where: '住在 runner/worker.js 的 SYSTEM_PROMPT：每个主 run 的 system，拼在 ~/AGENTS.md 注入段之前。',
+          cost: '改它 = 改代码 + 重建并推送 FDE 镜像 + 重建全部 fde-* 容器（不是 station-portal），即一次全站发版；数据库里没有它的位置。',
+        },
+        childSystemPrompt: {
+          where: '住在 runner/lib/delegation.js 的 CHILD_SYSTEM_PROMPT：被派出去的子 run 的 system（明说它没有 delegate 工具）。',
+          cost: '同上：改代码 + 重建 FDE 镜像 + 重建容器。第一期不开放在线覆写（issue #596 把它排在 portal 侧三条之后）。',
+        },
+        toolDescriptions: {
+          where: '住在 runner/lib/file-tools.js、shell-tools.js、notes-tools.js 等文件里每个工具 schema 的 description 字段。',
+          cost: '改一句就要重建 FDE 镜像；工具描述直接决定模型怎么调参，回归面是全部工位的全部 run——比改措辞贵得多。',
+        },
+        engineNotices: {
+          where: '住在 runner/lib/engine-notices.js：把引擎诊断事件翻译成人能读的 LOG 的那一层（界面之外的那一半）。',
+          cost: '改它 = 改代码 + 重建 FDE 镜像，且它与 run_events 的键名逐条对账（runner/test/engine-notices.test.js）——不能只改字不改判据。',
+        },
+      },
+      errNotText: '这一格的草稿不是一个文本，连长度都算不出 ⇒ 没有发请求。',
+      footnote: '这三条之外平台还有 4 条提示词住在 runner 镜像里（见上面那张只读卡）。本期不做 per-FDE 覆盖，也不做版本历史：想知道是谁改的去看审计 action=admin.platform_prompts_updated（审计只存摘要，正文在这一行里）。',
     },
     // issue #449 管理台切片：邮件通道配置（views/AdminMailView.vue，契约 docs/api/portal.md §4.12）。
     // 本页是登录第二因素「邮箱验证码」的唯一开关；口令**只写不读**（服务端只回 hasPassword）。

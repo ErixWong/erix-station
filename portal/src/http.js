@@ -43,7 +43,8 @@ import { aboutPanel, healthVersionBlock } from './version-info.js';
 import { maskEmail } from './mailer.js'; // #449：邮件通道端口（登录邮箱验证码）
 import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置的 DB 读取侧（60s 缓存）
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
-import * as uploadSettings from './upload-settings.js';
+import * as platformPrompts from './platform-prompts.js'; // #596 片 A：管理台「提示词」面板（读 + 写）
+import * as uploadSettings from './upload-settings.js'; // #485 片 A：单文件上限进管理台（DB 优先 env，每次上传现读）
 import * as secrets from './secrets.js';   // #608：配置槽值的形态校验（只写不读）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
@@ -789,6 +790,11 @@ export function createServer({
         return;
       }
       if (err instanceof uploadSettings.UploadSettingsError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
+      if (err instanceof platformPrompts.PlatformPromptsError) {
+        // #596 片 A：httpStatus 与 `code` 自带 ⇒ **零新错误码、零新映射规则**（一律 `validation_failed`）。
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
@@ -1849,6 +1855,46 @@ async function handleAdminApi(req, res, ctx, url) {
       return sendJson(res, 200, result.settings);
     }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
+  // 管理台「提示词」面板（issue #596 片 A，契约 portal.md §4.19）：`GET` 读三块当前值 + 生效全文，
+  // `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}` 写。与 upload/settings 同口径：
+  // **无需** `invalidate()`——物化与改名都每次现读。表不存在 / 读失败也回 `200`（回落内置，不是 500）；
+  // **不新增错误码**，校验失败一律 `validation_failed`（`details.field`）。
+  if (pathname === '/api/admin/prompts') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await platformPrompts.getPlatformPrompts({
+        pool: ctx.pool, log: ctx.log,
+      }));
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  const adminPromptMatch = pathname.match(/^\/api\/admin\/prompts\/(addendum|agents-md|title-prompt)$/);
+  if (adminPromptMatch) {
+    if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    // 路由 slug → 写侧字段名（唯一一处映射；形状与上限的闸全在 `platform-prompts.js`）。
+    const field = {
+      addendum: 'addendum', 'agents-md': 'agentsMd', 'title-prompt': 'titlePrompt',
+    }[adminPromptMatch[1]];
+    requireJson(req);
+    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    // 体本身不是对象 ⇒ `details.field='body'`（不是 `'text'`：那时连请求体都不是一份请求体）。
+    // 形状闸只有 `platform-prompts.js` 一份，这里只是把**原始** body 递过去。
+    platformPrompts.assertJsonObjectBody(body);
+    const result = await platformPrompts.updatePlatformPrompts({
+      pool: ctx.pool,
+      field,
+      text: body.text,
+      actorId: session.user.id,
+      log: ctx.log,
+    });
+    // 审计**不在这里**写：`admin.platform_prompts_updated` 已经与旧值快照、渲染闸、upsert 挤进同一条
+    // CTE（`platform-prompts.js` 的 `SAVE_SQL`）。再补一笔 `auth.audit` 会退回「设置已生效而审计一行
+    // 没有」与「并发保存记错 `previous_*`」两个窗口，并且多写一条审计行（判据 `P8`）。
+    // 响应出自 `RETURNING`（不回显输入）+ `materializeEnqueued`（`=0` ⇒ 页面要说「已保存，但物化未通知」）。
+    return sendJson(res, 200, {
+      ...result.prompts, materializeEnqueued: result.materializeEnqueued,
+    });
   }
 
   // ---- issue #595 能力市场：管理面（§7）。全部已在 handleAdminApi 入口过 `requireAdmin`。

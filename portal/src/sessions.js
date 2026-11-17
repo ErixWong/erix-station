@@ -18,6 +18,8 @@ import {
 import { collectTranscriptFacts, projectSessionMessages } from './session-view.js';
 import { projectTranscriptForDisplay } from 'erix-agent';
 import { fetchUserTextTurns } from './session-text.js';
+// issue #596 片 A：手工改名的 system 从 `platform_prompts` 取（每次现读、无缓存 ⇒ 保存后下一次改名就生效）。
+import { resolveEffectiveTitlePrompt } from './platform-prompts.js';
 import { appendUserInputTurn } from './transcript-store.js';
 import { allocSeq } from './seq.js';
 // #322：本文件**不再直接调** `chatCompletion`（手工改名走 `./title-llm.js` 的唯一生成入口）；
@@ -1149,8 +1151,12 @@ export async function generateAiTitle(pool, {
   // 需要的东西：上下文拼成的 user 提示、超时、`ErrorCtor`（递 SessionError ⇒ `http.js` 的映射零改动）、
   // 以及日志用的 tag/session（日志文本与收口前一致）。预算/温度/系统提示不再在本文件出现——它们只
   // 在 `title-llm.js` 有一份，自动改名吃的是完全同一份。
+  // #596：`systemPrompt` = DB 生效值（读不到 ⇒ 内置 `TITLE_SYSTEM_PROMPT`，`resolveEffectiveTitlePrompt`
+  // 永不抛）。提示词**不是守卫**：下面照旧 `sanitizeTitle` 后才落库。
+  const titlePrompt = await resolveEffectiveTitlePrompt({ pool, log });
   const text = await generateTitle({
     provider,
+    systemPrompt: titlePrompt.text,
     userPrompt: buildAiTitlePrompt(contexts),
     timeoutMs,
     fetchImpl,

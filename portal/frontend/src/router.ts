@@ -90,7 +90,16 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminUploadView.vue'),
         meta: { requiresRole: 'admin' },
       },
-      // issue #595 M2：能力市场发布台（§7 管理面）。导航顺序：… → upload → **market** → pool。
+      // issue #596 片 B：提示词面板（§4.19）。导航顺序：… → certs → upload → **prompts** → pool。
+      // 与 upload 相邻的理由同一条：两者都是「改一行而不必重建 station-portal」的平台配置。
+      // 请求只在本视图挂载时发（`AdminPromptsView` 的 onMounted 是唯一触发点 ⇒ 判据 F1）。
+      {
+        path: 'prompts',
+        name: 'admin-prompts',
+        component: () => import('./views/AdminPromptsView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
+      // issue #595 M2：能力市场发布台（§7 管理面）。导航顺序：… → upload → prompts → **market** → pool。
       // 请求只在本视图挂载时发（`AdminMarketView` 的 onMounted 是唯一触发点）。
       {
         path: 'market',

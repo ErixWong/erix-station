@@ -28,7 +28,7 @@ import { normalizeValue, resolveSlots } from './secrets.js';
 // 常量：§3 的天花板与 §4 的预算，全部集中在这里（HTTP 层与文档引用的必须是同一份）
 // ---------------------------------------------------------------------------
 
-/** §3 的硬数字。改一个就要同步 docs/api/portal.md §4.16 与 docs/design/capability-market.md。 */
+/** §3 的硬数字。改一个就要同步 docs/api/portal.md §4.17 与 docs/design/capability-market.md。 */
 export const LIMITS = {
   maxEnabledSkills: 12,        // §4：`enabled` 的安装数 ≤ 12（runner 每轮都拼 index，条数直接进上下文）
   maxFiles: 50,

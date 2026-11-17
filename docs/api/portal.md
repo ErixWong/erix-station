@@ -61,6 +61,10 @@
 | 管理 | `GET /api/admin/upload/settings` | **单文件上传上限：读**（#485 片 A，§4.15）。回的是**当前生效值** + **来源**（`db`/`env`/`default`）+ 允许区间；表不存在/读失败也回 `200`（不是 500）|
 | 管理 | `GET /api/admin/version` | **版本三格（「关于」面板）**（#586，§4.16）。只读：服务端 / 平台侧引擎 / 每台 FDE，三段各自标来源；不新增错误码 |
 | 管理 | `PUT /api/admin/upload/settings` | **单文件上传上限：写**（#485 片 A，§4.15）。`{maxFileBytes}` 必须是 `1 MiB`–`1 GiB` 的 JSON 整数，否则 `400 validation_failed` 且**不落库**；**下一次上传就生效**（无缓存 ⇒ 不需重启，也不需失效任何东西）|
+| 管理 | `GET /api/admin/prompts` | **平台提示词：读**（#596 片 A，§4.19）。三块（`~/AGENTS.md` 追加段 / 整段覆写 / 会话标题 system）的当前值 + 生效全文 + 字节预算 + 只读清单；**表不存在 / 读失败也回 `200`**（回落内置提示词，不是 500）|
+| 管理 | `PUT /api/admin/prompts/addendum` | **平台补充约定：写**（#596 片 A，§4.19）。`{text}`（`""` = 清空那一节）≤ 8192 字节，且**渲染后的整份 `~/AGENTS.md`** 必须 ≤ 16384 字节，否则 `400 validation_failed` 且**一条写语句都不发**；成功回完整 GET DTO + `materializeEnqueued` ⇒ **该工位下一次 run 生效** |
+| 管理 | `PUT /api/admin/prompts/agents-md` | **平台约定整段覆写：写**（#596 片 A，§4.19）。`{text}`（`""` = 恢复内置模板）≤ 16384 字节 + 同一条渲染闸；生效时机同上 |
+| 管理 | `PUT /api/admin/prompts/title-prompt` | **会话标题提示词：写**（#596 片 A，§4.19）。`{text}`（`""` = 用内置默认）≤ 2000 字节；**不涉物化**（`materializeEnqueued` 恒 `0`）⇒ **下一次改名就生效** |
 | 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
 | 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
 | 管理 | `POST /api/admin/tls/inspect` | **解析但不落盘**（#456 M2，§4.13-3a）：`{certPem,keyPem?}` → 证书元数据 + `keyMatches` 三态 + 覆盖判定 + `warnings`。**零副作用**（不写盘/DB/审计、不动 `tlsLive`、不烧上传配额）；每管理员 120 次/小时 |
@@ -3141,7 +3145,7 @@ wp5/wp6 的「起一套隔离栈」相反：新栈必然自洽，拿它验版本
 
 真相分布（三处，各有唯一职责）：包内容与元数据在 `capability_items` / `capability_files`
 （迁移 `0039`），装没装/启没启在 `fde_capability_installs`，「磁盘上有」只是这两张表的**投影**
-——平台不做磁盘对账，用户手删了文件页面仍显示已装，出路是给「重新安装」（`force`，见 4.16-5）。
+——平台不做磁盘对账，用户手删了文件页面仍显示已装，出路是给「重新安装」（`force`，见 4.17-5）。
 
 **两条全局形状**（与 §4.2 `/api/admin/users` 同形，前端两种都收但以这套为准）：
 列表 = `{"items":[...]}`，详情 = `{"item":{...}}`；字段一律 `snake_case`。
@@ -3163,7 +3167,7 @@ wp5/wp6 的「起一套隔离栈」相反：新栈必然自洽，拿它验版本
 | `capability_kind_unsupported` | 409 | `kind='mcp'` 的发布/安装（本期没有消费者，§9） |
 | `capability_install_failed` | 500 | 落盘/删目录失败（`details.reason` 是 `E*` 或 `invalid_fde_name`） |
 
-#### 4.16-1 `GET /api/market/items`
+#### 4.17-1 `GET /api/market/items`
 
 `200`：`{"items":[<用户面列表项>], "budget":{"max_enabled":12,"enabled_now":<int>}}`。
 列表项：`slug, kind, name, summary, version, tags[], tool_count, security_score,
@@ -3171,7 +3175,7 @@ installed, installed_version(null|string), enabled, when_to_use, author, license
 `version` 是**已发布版本**，`installed_version` 是这台 FDE 实装的版本（不相等 = 页面该给「升级」）。
 列表**不取包字节**（`capability_files.content`）：50 条 × 2 MiB 会先把进程吃掉。
 
-#### 4.16-2 `GET /api/market/items/:slug`
+#### 4.17-2 `GET /api/market/items/:slug`
 
 `200`：`{"item":{...列表项..., "description_md":"", "readme_md":"", "tools":[{"name","description"}],
 "manifest":{...}, "security_warnings":[{"code","path","line","note"}], "files":[{"path","bytes"}]}}`。
@@ -3179,11 +3183,11 @@ installed, installed_version(null|string), enabled, when_to_use, author, license
 markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不合法（不匹配 `^[a-z0-9][a-z0-9-]{0,63}$`）
 在路径层就 `400`，不入库查一轮再报 404。
 
-#### 4.16-3 `POST /api/market/items/:slug/install`
+#### 4.17-3 `POST /api/market/items/:slug/install`
 
 体（可省略）：`{"enabled":true,"force":false}`。`enabled` 缺省 = 已装过就沿用现值，否则 `true`。
 `200`：`{"result":{"changed":bool,"slug","version","enabled","dir","files"|...,"idempotent":true?},
-"item":<4.16-2 形状>}`。回包带 `item` 是为了让前端装完立刻把卡片翻成「已装」，不必自己拼三个字段。
+"item":<4.17-2 形状>}`。回包带 `item` 是为了让前端装完立刻把卡片翻成「已装」，不必自己拼三个字段。
 
 判据顺序（顺序本身是契约，不是实现细节）：① 条目存在 / `kind` 可消费 / `state='published'`；
 ② **幂等**：同版本且非 `force` ⇒ `changed:false`，**一个字节都不写盘**（否则「用户手改过文件」与
@@ -3193,20 +3197,20 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 审计：`user.capability_installed` / `user.capability_uninstalled` / `user.capability_enabled`，
 `target=capability:<slug>`，`details` 只有 `{changed, version, enabled}`。
 
-#### 4.16-4 `POST /api/market/items/:slug/uninstall`
+#### 4.17-4 `POST /api/market/items/:slug/uninstall`
 
 无体（不带 `Content-Type` 也收：`requireJson` 只卡带体的两个动作）。`200 {"result":{"changed","slug",
 "dir_removed"},"item":{...}}`。删 slug 目录 + 删一行安装账；**目录本来就不存在也是 200**
 （幂等的定义是结果状态一致，不是「一定做了动作」）。只删 `<slug>/` 这一层，同级技能与 `~/.erix`
 里别的东西一个字节都不碰。
 
-#### 4.16-5 `POST /api/market/items/:slug/enabled`
+#### 4.17-5 `POST /api/market/items/:slug/enabled`
 
 体：`{"enabled":<bool>}`（必须是布尔，否则 400）。**只改 DB 一行，磁盘一律不动**——停用后目录仍在，
 重新启用不必重下；从停用回到启用要过预算闸。未安装 ⇒ `404 capability_not_found`
 （`details.reason="not_installed"`）。
 
-#### 4.16-6 管理面 `/api/admin/market/*`
+#### 4.17-6 管理面 `/api/admin/market/*`
 
 | 端点 | 方法 | 说明 |
 | --- | --- | --- |
@@ -3334,6 +3338,209 @@ markdown 渲染器，`null` 会渲染成字面量 "null"）。`slug` 形状不�
 - **安装不落盘**：MCP 的 `install` 只写 `fde_capability_installs`，响应 `disk:"none"`（没有包可写）。
   真正落到容器里的只有两处物化产物：`~/.erix/mcp.json`（`{version, servers[]}`，**不含值**）与
   `~/.erix/capabilities.json` 的 `mcp` 段（只放 `name/description/exposure/tool_count`）。
+
+### 4.19 管理台提示词面板（`/api/admin/prompts`，issue #596 片 A）
+
+**一句话**：平台对 agent 说的三句话（`~/AGENTS.md` 的**补充约定**、`~/AGENTS.md` 的**整段覆写**、
+**会话标题的 system**）从「改 `portal/src/materializer.js` + 重建 station-portal 镜像」变成
+「管理台改一行 ⇒ 下一次 run / 下一次改名生效」。真相在 `platform_prompts`（迁移 `0043`，单行表）。
+契约（为什么这么设计）见 `docs/design/admin-prompts-panel-2026-11-16.md` §2–§8；本节是 API 口径。
+
+**`""` 就是「跟随内置」**（三列同语义，DB 里不出现 `NULL`）：读侧因此**不需要**区分「没配」与
+「配了空」，`isDefault` 判据只有一条（`text === ''`）。整段覆写取空串 = **不要覆写** —— 没有
+「覆写成一份空文档」这种配置（标识行由代码追加，文件永远不为空）。
+
+**生效时机是这块的全部价值**，三条各不相同，页面必须逐条显示：
+
+| 块 | DB 列 | 落点 | 生效时机 |
+|---|---|---|---|
+| 平台补充约定 | `agents_md_addendum` | `~/AGENTS.md` 末尾「平台补充约定」那一节 | 保存 ⇒ 入队重物化 ⇒ **该工位下一次 run** |
+| 平台约定整段覆写 | `agents_md_override` | 替换 `renderHomeAgentsMd()` 的正文主体（标识行仍由代码追加）| 同上 |
+| 会话标题提示词 | `title_prompt` | `title-llm.js` 发请求时的 system | 保存 ⇒ **下一次改名**（手工「AI 改名」与自动改名同一条解析路径）|
+
+与 §4.15 同口径**不缓存**：物化与改名每次现读那一行 ⇒ 保存即生效，写侧也不需要 `invalidate()`
+（没东西可失效）。表不存在 / 读失败 / 读超时 ⇒ **回落内置**（`reason` 见下），**永不 500**：
+配置面坏了不能让物化与改名挂掉。
+
+#### 4.19-1 `GET /api/admin/prompts`
+
+`200`（**表不存在 / DB 读失败 / 读超时也是 200**）：
+
+```jsonc
+{
+  "addendum":    { "text": "", "isDefault": true, "maxBytes": 8192, "bytes": 0 },
+  "agentsMd":    { "override": "", "isOverridden": false, "isDefault": true,
+                   "templateBytes": 9021, "effectiveBytes": 9021, "effectiveText": "# FDE 工位约定\n…",
+                   "maxBytes": 16384, "renderedLimitBytes": 16384 },
+  "titlePrompt": { "text": "", "isDefault": true, "defaultText": "<内置 TITLE_SYSTEM_PROMPT>",
+                   "maxBytes": 2000, "bytes": 0 },
+  "readonly":    [ { "key": "runnerSystemPrompt" }, { "key": "childSystemPrompt" },
+                   { "key": "toolDescriptions" }, { "key": "engineNotices" } ],
+  "updatedAt": null, "updatedBy": null, "reason": "no_row"
+}
+```
+
+⚠ 例子里的 `no_row` 是「表不存在 / 一行都没有」那一档。已部署库上更常见的形态是「行在、但没人
+存过」（迁移 0043 种的那一行）：那一档 `reason` 是 `null`，而 `updatedAt` / `updatedBy` **仍按
+「从未保存过」报 `null`/`null`**。理由：种行走 `INSERT … ON CONFLICT DO NOTHING`，而
+`updated_at` 是 `timestamptz NOT NULL DEFAULT now()` ⇒ 全新库上那一列**有值**（迁移跑过的那一刻），
+`updated_by` 才是 NULL。只看 `updated_at` 就等于让界面宣称一个管理员从没做过的「最后保存」，
+所以「从未保存」的定义定在**没有写者**上（判据 `P14`；不在迁移里动 `updated_at`，那会牵动已部署库）。
+
+⚠ 例子里的 `9021` 只是「今天这一份内置模板按 `example` 渲染出来的字节数」，**不是契约值** ——
+模板一改它就变（内置模板的真相在 `materializer.js`，红线是它全文零端口数字、零伞域字面量）。
+
+
+| 键 | 语义 |
+|---|---|
+| `addendum.text` / `agentsMd.override` / `titlePrompt.text` | DB 里的当前值（`""` = 跟随内置）。读侧**不做长度校验**：手工 `UPDATE` 进来的超长值**照用**（换成内置会让管理台显示的和实际生效的对不上）|
+| `*.isDefault` | 该格是否在跟随内置（`= (text === '')`）—— 「来源」不许靠 UI 猜 |
+| `agentsMd.isOverridden` | `override !== ''`。页面要显式标「已偏离内置模板」并给「恢复内置」按钮 |
+| `agentsMd.templateBytes` / `effectiveBytes` | 都是**按固定示例工位名 `example` 渲染的整份文件字节数**：默认态下逐数相同，覆写/追加后的差值就是净变化。⚠ 这是**预览**口径；**写侧闸不是这个名**，见 §4.19-3 |
+| `agentsMd.effectiveText` | 同一份「现在生效的全文」，用固定示例名 `example` 渲染 ⇒ **零时间戳、零 run id**（页面要能对比文本、测试要能断言；这份文本会进模型请求的 system 位，动态量会让 prompt 缓存整条失效）|
+| `*.maxBytes` | 该格的**写侧**上限（8192 / 16384 / 2000）。DB 里没有 CHECK，这里才是闸 |
+| `agentsMd.renderedLimitBytes` | 注入侧对**整份** `~/AGENTS.md` 的上限（= `runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES`，跨包对账由判据 `P9` 钉住，不许手抄）|
+| `titlePrompt.defaultText` | 内置 `TITLE_SYSTEM_PROMPT` 全文（`""` 时实际发出去的就是它）|
+| `readonly[]` | 第一期**不开放在线覆写**的那 4 条，**只给 `key`**：portal 镜像不含 `runner/`（`portal/Dockerfile` 只 `COPY portal/ portal/`），运行时读不到 ⇒ 显示全文就是撒谎。中文说明在前端 i18n（zh + en）|
+| `updatedAt` / `updatedBy` | 最后一次保存的时间与操作人；「从未保存过」（= `updated_by IS NULL`，即**没有写者**，而不是「没有那一行」）⇒ 两个字段一起 `null`；见上面那条注记与判据 `P14` |
+
+⚠ **上面那两个字节数不是「存得进去」的承诺**（评审 F2，判据 `P13`）：
+`templateBytes` / `effectiveBytes` / `effectiveText` 都按**固定示例工位名**
+`example`（7 字符）渲染，而**写侧闸按最长合法工位名**算那份标识行的预算
+（从 `FDE_NAME_RE` 导出的 `FDE_NAME_MAX_LEN`，现算不抄数字；理由与
+字节级后果见 §4.19-3）。⇒ 同一份文本，页面完全可以显示「离
+`renderLimitBytes` 还有几百字节」而保存仍然吃 `400`
+（`details.rendered_bytes` 超过 `details.render_limit_bytes`）。
+**所以前端不许拿这两个预览数自己预判「到上限就禁用保存」**：以 `PUT`
+返回的 `details` 为准（那才是最坏情况那一份），并把这条 400 当成
+「工位名里有长名」的正常结果解释给人看，而不是一句
+「页面数字没到啊」。
+| `reason` | `null`（DB 生效）/ `no_row`（未配置）/ `read_failed`（表缺失或 DB 抛错）/ `read_timeout`（查询发出去但 `PLATFORM_PROMPTS_READ_TIMEOUT_MS` 内没回）。三种回落**两两可区分**：把「DB 卡住」说成「管理台还没配过」会让值班去配一个值，而真故障在连接上 |
+
+#### 4.19-2 `PUT /api/admin/prompts/{addendum,agents-md,title-prompt}`
+
+```
+PUT /api/admin/prompts/addendum
+Content-Type: application/json
+
+{"text": "- 收工前必须跑 npm run smoke。"}
+```
+
+| HTTP | 体 | 何时 |
+|---|---|---|
+| `200` | **完整 GET DTO**（出自 `RETURNING` ⇒ 回的是落库那份，不回显输入）+ `materializeEnqueued: <条数>` | 保存成功 |
+| `400` | `validation_failed` + `details={field:'text', max_bytes}` | `text` 不是字符串 / 键缺席 / `null` / 越界 ⇒ **不落库** |
+| `400` | `validation_failed` + `details={field:'body'}` | 请求体不是 JSON 对象（`"just a string"`、`42`、`[]`）|
+| `400` | `validation_failed` + `details={field:'text', max_bytes, rendered_bytes, render_limit_bytes}` | **渲染超限**：写下去之后整份 `~/AGENTS.md` > `render_limit_bytes` ⇒ **一条写语句都不发** |
+| `403` | `forbidden` | 非管理员 |
+| `405` | `method_not_allowed` | `PUT` 之外的方法 |
+| `500` | `internal` | 写了却没审计（有人把审计从那条语句里拆出去了）／数据库拒了这条语句（约束、表缺失、连接断）——后者的 message 是**静态串**，原因只进 portal 日志（不打 SQL 与参数值）⇒ 表名/列名/约束名不出现在响应里（判据 `P15`）|
+
+⚠ **不新增错误码**：这一节的全部失败都是既有的 `validation_failed` / `forbidden` /
+`method_not_allowed` / `internal`（`details.field` 负责说清是哪一格）。
+
+#### 4.19-3 渲染规则与那条硬闸（为什么「保存成功」还不够）
+
+```
+正文主体 = override !== '' ? override : 内置模板正文
+追加段   = addendum !== '' ? 节标题与引言（平台写）+ 管理员正文（逐字节照搬） : ''
+标识行   = （FDE 标识：<fdeName>）      ← 两种模式下都由**代码**追加，永远是最后一行、不可编辑
+```
+
+追加段的**节标题与引言由平台撰写**（措辞是契约 §5 定稿的：与上面那 8 条硬约束冲突时**以上面为准**）；
+管理员正文**逐字节照搬，不加工不改写**。内置模板本身受既有红线约束（零端口数字、零伞域字面量），
+`portal/test/materializer.test.js` 对**默认渲染**的断言一条都没改（「不传新入参时输出逐字节等于
+本单之前 ⇒ 物化幂等，sha 不变 ⇒ 不重写文件」这两个说法由该文件那 8 条 `renderHomeAgentsMd：…`
+既有断言加上本单的 `P1` 承担；**这里不写 `M` 字头的那个号** —— 它在本仓已被
+`materializer.test.js:750` 占用，见本节末尾那条注记）。
+
+**渲染闸是必须的，不是锦上添花**：注入侧（`runner/lib/agents-md.js`）对整份文件有 16 KiB 上限，
+超了**静默截断**只留 marker。没有这道闸，管理员写完 8 KiB 追加段会看到「保存成功」而什么都不发生，
+直到某天发现约定被切了一半。闸在**两处**（不是冗余）：
+
+| 位置 | 拦什么 | 形态 |
+|---|---|---|
+| JS 预闸（写**之前**）| 常态超限 | 现读那一行拿到对面那一列的当前值 ⇒ 算出渲染后字节数 ⇒ 超了直接 400，**一条写语句都不发**（判据 `P6`）|
+| SQL 闸（同一条语句里）| 并发窗口（预闸读完之后别人改了对面那一列）| `INSERT … SELECT … WHERE rendered_bytes <= $7` ⇒ 超限就喂给 INSERT 0 行，**一格没写、审计零行**，JS 侧据 `written = 0` 报同一个 400 |
+
+两条闸报出的 `details` 逐字同形（常量由 JS 当参数送进 SQL，SQL 里不抄数字，口径同 §4.15-4 的
+`$5/$6`）。而「SQL 里那段算术 ≡ 真渲染」这件事**分两段钉，两段各管一半**，别混着夸：
+
+- **JS 侧**「预算算式 ≡ `renderHomeAgentsMd` 的真实字节」由 `P6b`
+  （`portal/test/platform-prompts.test.js`）逐组钉住。那条判据自己在注释里写明：SQL 里 `gate`
+  那段算术（`octet_length` / `convert_to`）在单测里**没有**执行过 —— 假池从不执行 SQL。
+- **SQL 侧**那段字节算术由 `P6b-db`（`portal/integration/platform-prompts-db.mjs`）钉：它在真
+  PostgreSQL 上把 `SAVE_SQL` 真跑一遍，逐组对账 `gate.rendered_bytes` 与 JS 的算子，并钉超限那档
+  `written = 0`、审计零行、一格没写。
+- **SQL 侧的「形状」**（常驻，在 `npm test` 里）由 `P6c`（`portal/test/platform-prompts.test.js`）钉：
+  它不执行 SQL，只对 `SAVE_SQL` 的文本做**片段级**断言 —— `rendered_bytes` 必须显式含**两份列字节项**
+  （`agents_md_addendum` 与 `agents_md_override` 各自的 `octet_length(…)`）加同一份常量预算
+  （`$4`/`$5`/`$6`），且 SQL 里不许出现硬编码的字节常量；失败信息逐条点名（少了哪一列 / 哪一份常量）。
+  常驻反向自证：把「只算一列」与「一列都不算」两种退化式喂进同一个检查函数，各自判红并点名缺的那一列。
+  **它挡的是退化式，不是值**：写法对而算错（比如把某列按字符数而非字节数算）仍然只有 `P6b-db` 会红。
+
+⚠ **限制（必须知道）**：`P6b-db` **不在 `npm test` 里** —— `npm test` 是裸 `node --test`，而
+`portal/integration/` 下的文件叫 `*.mjs`，不匹配它的测试文件名规则；CI 也没有 PostgreSQL 步骤。
+跑它得自己起一个专用临时库：`TEST_DATABASE_URL=… npm run test:integration:prompts`。
+后果：SQL 侧那段算术被改坏（比如 `$5::bigint + octet_length(nxt.addendum)` 退化成只算一列）在
+默认流水线上**测不出来** —— 拦下超限的是 JS 预闸（判据 `P6` / `P13` 都只跑假池，假池不执行 SQL），
+`npm test` 照样全绿，只有 `P6b-db` 会红而它不在这条流水线上。（评审 R8 之后补一句：这一类
+「**退化式**」现在由常驻的 `P6c` 在 `npm test` 里拦住；上面那句限制对「形状对而值不对」仍然成立。）
+
+⚠ **闸里的标识行按最坏情况算，不按示例名算**（评审 F2）：标识行是 `（FDE 标识：<fdeName>）`，而保存时
+不知道这份文件会渲染给哪些工位（全部启用中的都要重物化），所以预算取**最长合法工位名**：
+长度从 `projects.js` 的 `FDE_NAME_RE` 单一真相导出（`FDE_NAME_MAX_LEN`，现算不抄 `63`；那个字符集
+只有 ASCII `[a-z0-9-]` ⇒ 字符数 ≡ 字节数）。拿 `example`（7 字符）卡 16 KiB 会放进一批「今天没超、
+下一个长名工位一渲染就超」的输入，而超那一档的后果正是上面那句**静默截断** —— 写侧闸存在的理由
+就是它，不能自己留一个 56 字节的洞。
+**两份名字各自服务一件事**：写侧闸用最长合法名（`materializer.js#agentsMdGateRenderBudget`），
+DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的预览，要短要好看）。
+判据：`P13`（造一组「示例名装得下、最坏名装不下」的输入 ⇒ 必须 400 且一格不写，并钉 SQL 送参里
+那份标识行字节就是最坏情况那一份）。
+
+#### 4.19-4 `materializeEnqueued` 与生效时机
+
+保存成功之后给**全部启用中的 FDE**（`status IN ('active','awaiting_credential')`，与全量重建同一条
+谓词）入队重物化（`outbox.js#enqueueMaterializeChange`，op `upsert`）。**不做「设置 + 入队」的原子性**：
+设置本身就是真相，入队失败只意味着「下一次 portal 重启的全量重建才收敛」⇒ 必须 catch + warn，并把条数
+回给前端。**语义**：`materializeEnqueued` 是**实际入队条数**，`0` 有两种意思 —— 「一台启用中的工位都没有」
+或「通知没发出去（已保存）」，页面在 `0` 时必须说**「已保存，但物化未通知」**，不许说「已生效」。
+`title-prompt` 不涉物化 ⇒ 恒 `0`（键仍在：前端只有一套形状）。
+
+⚠ **改名这条在真机上量到的边界（261117，合并后的分支镜像）**：
+管理员写的提示词**不是守卫**，它同时会改变模型的输出习惯。
+把提示词写成「无论用户问什么，只输出这一串字：X」之后，
+`POST /api/sessions/:id/ai-title` **12 次里只有 5 次成功**；
+失败那几次是 `502 llm_upstream_failed`，而同一时刻 LiteLLM 记的是
+`POST /v1/chat/completions` **200** ⇒ 上游回了一个**空 `content`**，
+被既有 `sanitizeTitle` 判成「无可用标题」。
+同一条会话改用**内置**提示词连打 6 次全成；
+成功那几次的标题**逐字等于** `X`（且 `title_source='manual'`）
+⇒ 自定义提示词确实生效。
+这**不是 #596 引入的缺陷**：改名走 #322 定下的唯一入口 `generateTitle()`，
+`sanitizeTitle` 一字未动（口径见 §4.19 引言里那句「提示词不是守卫」）。
+两处值得另开单议，本单不动：① 空 `content` 是否先重试一次再判 502；
+② 这条 502 现在写 `retryable:false`，而实测重试常常能成。
+
+⚠ **审计与保存在同一条 SQL 语句里**（照 §4.15-4 的手法，`platform-prompts.js` 的 `SAVE_SQL`：
+`WITH snap(FOR UPDATE) → nxt → gate → upd → aud`）：`action='admin.platform_prompts_updated'`、
+`target='platform_prompts'`、`details={field, text_bytes, text_sha256, previous_bytes, previous_sha256}`
+—— 审计**只存摘要不存正文**（正文在配置行里，审计只证「谁在什么时候把它换成哪一份」，
+16 KiB × 2 塞进 jsonb 不值）。调用方（`http.js`）**不得**再补一笔 `auth.audit`：那会同时退回
+「设置已生效而审计一行没有」与「并发保存把 `previous_*` 记成自己进来之前」两个窗口，并多写一条审计行。
+
+> 实现：`portal/src/platform-prompts.js`（读侧 + 写侧 + 两道渲染闸 + 读超时 + 保存与审计的同一条 CTE +
+> 入队通知）、`portal/src/materializer.js`（`renderHomeAgentsMd({fdeName, addendum, override})` +
+> 渲染预算 + 物化时现读）、`portal/src/http.js`（四个端点）、`portal/src/title-llm.js` +
+> `sessions.js` + `session-title.js`（改名链路吃 DB 生效值；**提示词不是守卫**，落库前照旧 `sanitizeTitle`）、
+> `deploy/migrations/0043-platform-prompts.sql`。
+> ⚠ `materializer.js` ⇄ `platform-prompts.js` 是**双向引用**：两边都只在**函数体里**用对面的导出，
+> 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
+> 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P15` 及其变体 + `T1`/`T1b` + `D1`）、
+> `portal/test/materializer.test.js`（「默认渲染逐字节不变」由该文件 8 条 `renderHomeAgentsMd：…`
+> 既有断言承担，本分支对它们零改动；**这里不用 `M` 字头的判据号** —— 它在本仓已被
+> `materializer.test.js:750`（用户自建 `AGENTS.md`/`.gitignore` 在 stale 清理后存活）占用）、
+> `portal/test/migrations.test.js`（0043 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
 
 ---
 
