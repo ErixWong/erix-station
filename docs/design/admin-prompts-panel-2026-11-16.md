@@ -18,7 +18,7 @@
 提示词版本历史。只读那 4 条在页面上**只列位置与生效路径，不显示全文** —— portal 镜像不含 `runner/`
 （`portal/Dockerfile` 只有 `COPY portal/ portal/`），portal 运行时读不到，显示全文就是撒谎。
 
-## 2. 数据模型（迁移 `deploy/migrations/0041-platform-prompts.sql`）
+## 2. 数据模型（迁移 `deploy/migrations/0040-platform-prompts.sql`）
 
 单行表，形状与理由照 0036（`upload_settings`）：`id int PK DEFAULT 1 CHECK (id = 1)` 把「只能有一行」写成 DB 事实。
 
