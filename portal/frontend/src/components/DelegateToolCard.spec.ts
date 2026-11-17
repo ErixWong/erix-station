@@ -92,13 +92,19 @@ describe('delegate 工具卡（接线到 DelegateChildDrawer）', () => {
     expect(wrapper.get('.delegate-state').text()).toBe('✓');
   });
 
-  it('ok:false（capacity_full）⇒ 没有按钮，状态位也不谎报成功', () => {
+  it('ok:false（capacity_full）⇒ 没有按钮，状态位是中性灰的 ✓（不是成功绿）', () => {
     const store = useWorkbenchStore();
     // tool_result 本身 ok:true（调用成功了），但**载荷** ok:false ⇒ 按钮的闸看载荷，不看卡片 ok。
     driveDelegate(store, { ok: false, reason: 'capacity_full' });
     const wrapper = mountPanel();
     expect(wrapper.find('.delegate-open-viewer').exists()).toBe(false);
-    expect(wrapper.find('.delegate-state').exists()).toBe(true);
+    // 状态位**不是绿勾**：文字仍是 `✓`（工具调用本身成功），但颜色必须是中性灰 —— 绿只留给
+    // `state:completed`。原来这条只断 `.exists()` ⇒ 名字写着「不谎报成功」而判据红不了
+    // （#602 复验时实测：拒单渲染出来是 `✓` + `text-black/50`）。下面三条把它钉死。
+    const state = wrapper.get('.delegate-state');
+    expect(state.text()).toBe('✓');
+    expect(state.classes()).toContain('text-black/50');
+    expect(state.classes()).not.toContain('text-green-600');
   });
 
   it('state:failed ⇒ 红；state:completed + termination:persistence_failed ⇒ 仍红（不谎报成功）', () => {
