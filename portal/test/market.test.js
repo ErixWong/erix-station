@@ -70,7 +70,8 @@ class MarketFake {
   constructor() {
     this.items = [];          // 行对象（id/slug/version/state/kind/manifest/...）
     this.files = new Map();   // `${item}|${version}|${path}` → {path, content(Buffer), bytes}
-    this.installs = new Map();// `${fde}|${item}` → {fde_id, item_id, version, enabled}
+    this.installs = new Map();
+    this.params = new Map();      // #608：配置槽声明（item_id|name → 行）// `${fde}|${item}` → {fde_id, item_id, version, enabled}
     this.outbox = [];
     this.revisions = new Map();
     this.seq = 0;
@@ -101,6 +102,30 @@ class MarketFake {
       this.items.push(it);
       return { rows: [it] };
     }
+    // #608：配置槽声明与值（MCP/skill 共用）。fake 只记形状，够 DTO/校验判据用。
+    if (s.includes('DELETE FROM capability_params WHERE item_id')) {
+      for (const [k] of [...this.params]) if (k.startsWith(`${params[0]}|`)) this.params.delete(k);
+      return { rows: [] };
+    }
+    if (s.includes('INSERT INTO capability_params')) {
+      this.params.set(`${params[0]}|${params[1]}`, {
+        item_id: params[0], name: params[1], kind: params[2], inject: params[3],
+        required: params[4], description: params[5],
+      });
+      return { rows: [] };
+    }
+    if (s.includes('SELECT name, kind, inject, required, description FROM capability_params')) {
+      const rows = [...this.params.values()].filter((x) => x.item_id === params[0]);
+      return { rows };
+    }
+    if (s.includes('SELECT name, inject, required FROM capability_params')) {
+      const rows = [...this.params.values()].filter((x) => x.item_id === params[0]);
+      return { rows: rows.map((x) => ({ name: x.name, inject: x.inject, required: x.required })) };
+    }
+    if (s.includes('SELECT name, kind FROM capability_params')) {
+      const rows = [...this.params.values()].filter((x) => x.item_id === params[0]);
+      return { rows: rows.map((x) => ({ name: x.name, kind: x.kind })) };
+    }
     if (s.includes('INSERT INTO capability_files')) {
       this.files.set(`${params[0]}|${params[1]}|${params[2]}`,
         { path: params[2], content: params[3], bytes: params[4] });
@@ -120,12 +145,23 @@ class MarketFake {
       this.outbox.push({ fde_id: params[0], op: params[1], revision: params[2] });
       return { rows: [] };
     }
+    if (s.includes('SELECT kind, manifest FROM capability_items')) {
+      const it = this.items.find((x) => x.id === params[0]);
+      return { rows: it ? [{ kind: it.kind, manifest: it.manifest }] : [] };
+    }
     if (s.includes('count(*)::int AS n FROM capability_files')) {
       const it = this.items.find((x) => x.id === params[0]);
       return { rows: [{ n: it ? this.filesOf(it.id, it.version).length : 0 }] };
     }
     if (s.includes('count(*)::int AS n FROM fde_capability_installs')) {
-      return { rows: [{ n: [...this.installs.values()].filter((x) => x.fde_id === params[0] && x.enabled).length }] };
+      // #608：预算分账——按 kind 过滤（params[1] 是 kind，缺省 skill）。
+      const kind = params[1] ?? 'skill';
+      const n = [...this.installs.values()].filter((x) => {
+        if (x.fde_id !== params[0] || !x.enabled) return false;
+        const item = this.items.find((i) => i.id === x.item_id);
+        return (item?.kind ?? 'skill') === kind;
+      }).length;
+      return { rows: [{ n }] };
     }
     if (s.includes('SELECT path, content, bytes FROM capability_files')) {
       return { rows: this.filesOf(params[0], params[1]).map((f) => ({ path: f.path, content: f.content, bytes: f.bytes })) };
@@ -501,7 +537,10 @@ test('MK-12 预算闸：启用数上限 12，第 13 个 409；停用的安装不
       await installCapability({ pool: h.pool, config: h.config, fde: h.fde, slug });
     }
     const list = await listUserItems({ pool: h.pool, fdeId: h.fde.id });
-    assert.deepEqual(list.budget, { max_enabled: 12, enabled_now: 12 }, '列表必须把预算回给页面');
+    // #608：预算分账——技能与 MCP 各一条线（合成一个计数器会让 12 个技能把 MCP 一起锁死）。
+    assert.deepEqual(list.budget, {
+      max_enabled: 12, enabled_now: 12, max_enabled_mcp: 12, enabled_now_mcp: 0,
+    }, '列表必须把预算回给页面（两个 kind 各一条）');
 
     const slug13 = 's12';
     await publishItem({ pool: h.pool, fields: { ...META(slug13), bundle: minimalBundle(slug13) } });
@@ -509,7 +548,7 @@ test('MK-12 预算闸：启用数上限 12，第 13 个 409；停用的安装不
     const e = await expectErr(installCapability({ pool: h.pool, config: h.config, fde: h.fde, slug: slug13 }));
     assert.equal(e.code, 'capability_budget_exceeded');
     assert.equal(e.httpStatus, 409);
-    assert.deepEqual(e.details, { max_enabled: 12, enabled_now: 12 });
+    assert.deepEqual(e.details, { max_enabled: 12, enabled_now: 12, kind: 'skill' });
     assert.equal(fs.existsSync(h.dir(slug13)), false, '被预算挡住时**不得落盘**（否则磁盘上多一个没人记账的目录）');
 
     // 装成停用 ⇒ 放行且不占预算（§4：预算只管 enabled）
@@ -528,21 +567,38 @@ test('MK-12 预算闸：启用数上限 12，第 13 个 409；停用的安装不
   } finally { h.after(); }
 });
 
-test('MK-13 kind="mcp" 本期一律 409 capability_kind_unsupported（发布与安装两侧）', async () => {
+test('MK-13 kind="mcp"：P1 可发布（无包），但 resident≠false 仍 409；安装不落盘', async () => {
   const h = await harness({ publish: false });
   try {
-    const e = await expectErr(publishItem({ pool: h.pool, fields: { ...META('mcp-one'), kind: 'mcp', bundle: minimalBundle('mcp-one') } }));
-    assert.equal(e.code, 'capability_kind_unsupported');
-    assert.equal(e.httpStatus, 409);
+    // ① 缺 MCP 必填字段 ⇒ 400（不是「kind 不支持」了，是「字段不全」）
+    const e0 = await expectErr(publishItem({ pool: h.pool, fields: { ...META('mcp-one'), kind: 'mcp' } }));
+    assert.equal(e0.code, 'validation_failed');
     assert.equal(h.pool.items.length, 0, '被拒的发布不该留下条目行');
-    // 手工塞一条 mcp（模拟 P1 之后库里真有）⇒ 安装面同样拒
-    await publishItem({ pool: h.pool, fields: { ...META('mcp-two'), bundle: minimalBundle('mcp-two') } });
-    const it = h.pool.items.find((i) => i.slug === 'mcp-two');
-    await setItemState({ pool: h.pool, itemId: it.id, state: 'published' });
-    it.kind = 'mcp';
-    const e2 = await expectErr(installCapability({ pool: h.pool, config: h.config, fde: h.fde, slug: 'mcp-two' }));
-    assert.equal(e2.code, 'capability_kind_unsupported');
-    assert.equal(fs.existsSync(h.dir('mcp-two')), false, '拒绝必须发生在落盘之前');
+
+    // ② resident 非 false ⇒ 409 capability_kind_unsupported（形态②/③ 未实现，fail-closed）
+    const e1 = await expectErr(publishItem({
+      pool: h.pool,
+      fields: {
+        ...META('mcp-one'), kind: 'mcp', transport: 'stdio', command: 'node', args: ['s.mjs'],
+        reason: 'stateful', resident: 'container', slots: [],
+      },
+    }));
+    assert.equal(e1.code, 'capability_kind_unsupported');
+    assert.equal(e1.httpStatus, 409);
+
+    // ③ 合法 MCP 条目：发布成功、无包行、安装只落账（磁盘上不该出现 skills/<slug>）
+    const item = await publishItem({
+      pool: h.pool,
+      fields: {
+        ...META('mcp-two'), kind: 'mcp', transport: 'stdio', command: 'node', args: ['s.mjs'],
+        reason: 'tool_surface_gt_12', slots: [],
+      },
+    });
+    assert.equal(item.kind, 'mcp');
+    await setItemState({ pool: h.pool, itemId: item.id, state: 'published' });
+    const r = await installCapability({ pool: h.pool, config: h.config, fde: h.fde, slug: 'mcp-two' });
+    assert.equal(r.disk, 'none', 'MCP 没有包内容 ⇒ 安装不落盘');
+    assert.equal(fs.existsSync(h.dir('mcp-two')), false, 'MCP 条目的目录不该被创建');
   } finally { h.after(); }
 });
 

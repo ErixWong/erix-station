@@ -283,6 +283,67 @@ describe('收工灯 gitLight.* 的语义红线（#359 / D9）', () => {
     expect(zhLight.label.grey).toBe('未检查');
     expect(enLight.label.grey.toLowerCase()).toContain('unchecked');
   });
+
+  // issue #608（§8.3）：市面 MCP 切片的五组 key 族必须双语成对，且枚举键名与契约一致。
+  // 「英文枚举不直接喷给人看」（§8.2）靠的就是这里：每个枚举值都得有一句人话。
+  it('issue #608：market.kind / market.reason / market.mcp / admin.market.secrets / admin.market.form.mcp 双语成对', () => {
+    const families: Array<[string, unknown, unknown]> = [
+      ['market.kind', zhCN.market.kind, en.market.kind],
+      ['market.reason', zhCN.market.reason, en.market.reason],
+      ['market.mcp', zhCN.market.mcp, en.market.mcp],
+      ['admin.market.secrets', zhCN.admin.market.secrets, en.admin.market.secrets],
+      ['admin.market.form.mcp', zhCN.admin.market.form.mcp, en.admin.market.form.mcp],
+    ];
+    for (const [name, zhBranch, enBranch] of families) {
+      const zhKeys = leafPaths(zhBranch).sort();
+      const enKeys = leafPaths(enBranch).sort();
+      expect(zhKeys.length, `${name} 不能是空族`).toBeGreaterThan(1);
+      expect(enKeys, `${name} 的叶子键两边一致`).toEqual(zhKeys);
+      for (const [key, value] of leafValues(zhBranch, name)) {
+        expect(value, `${key} 是真中文`).toMatch(CJK);
+      }
+      for (const [key, value] of leafValues(enBranch, name)) {
+        expect(value, `${key} 是真英文`).not.toMatch(CJK);
+      }
+    }
+    // §4.4 / §4.3 的枚举值一个不能少（少一个就是有一档只能给人看英文）
+    for (const bag of [zhCN.market.reason, en.market.reason]) {
+      expect(Object.keys(bag).filter((k) => k !== 'unknown').sort())
+        .toEqual(['credential_boundary', 'shared_quota', 'stateful', 'tool_surface_gt_12']);
+    }
+    for (const bag of [zhCN.market.mcp.exposure, en.market.mcp.exposure]) {
+      expect(Object.keys(bag).filter((k) => k !== 'unknown').sort())
+        .toEqual(['deferred', 'direct', 'hidden']);
+    }
+    // §8.2：用户面缺凭据只说「等管理员」，不出现任何「输入/填写」语气（填值入口不存在）
+    expect(zhCN.market.mcp.secretsPending).toMatch(/管理员/);
+    expect(zhCN.market.mcp.secretsPending).not.toMatch(/填|输入/);
+    expect(en.market.mcp.secretsPending).toMatch(/admin/i);
+    expect(en.market.mcp.secretsPending).not.toMatch(/enter|fill|input/i);
+    // §3.1：凭据区只有「有没有」，两边都不得写「查看值」这类语气
+    expect(zhCN.admin.market.secrets.hasValue).toMatch(/已设置/);
+    expect(zhCN.admin.market.secrets.hasValue).not.toMatch(/查看|明文|值：/);
+    expect(en.admin.market.secrets.hasValue.toLowerCase()).toContain('set');
+    expect(en.admin.market.secrets.hasValue.toLowerCase()).not.toMatch(/reveal|plaintext|value:/);
+    // §4.2：锁定的 inject 必须把「为什么不能选」写在文案里（点名 transport 与矩阵）
+    expect(zhCN.admin.market.form.mcp.injectLocked).toContain('{transport}');
+    expect(zhCN.admin.market.form.mcp.injectLocked).toContain('{inject}');
+    expect(en.admin.market.form.mcp.injectLocked).toContain('{transport}');
+    expect(en.admin.market.form.mcp.injectLocked).toContain('{inject}');
+  });
+
+  // #608 踩到的坑：消息文本里的裸 `@`（例：`@modelcontextprotocol/server-github`）会被 vue-i18n
+  // 当链接语法（message-compiler code 10），渲染直接抛 ⇒ 整个表单子树塌了（单测表现为
+  // 「表单不见了」而不是「文案不对」）。字面 `@` 必须写 `{'@'}`（与 ops{'@'}example.com 同口径）。
+  it('任何叶子消息里的字面 @ 都必须写成 {\'@\'}（裸 @ 会在渲染期炸掉整棵子树）', () => {
+    for (const [locale, messages] of [['zh-CN', zhCN], ['en', en]] as const) {
+      const bare: string[] = [];
+      for (const [key, value] of leafValues(messages)) {
+        if (typeof value === 'string' && value.replace(/\{'@'\}/g, '').includes('@')) bare.push(key);
+      }
+      expect(bare, `${locale} 还有没转义的裸 @`).toEqual([]);
+    }
+  });
 });
 
 // issue #596 片 B 交付后的**界面缺陷**（管理台「提示词」页把 markdown 星号原样显示出来了）：

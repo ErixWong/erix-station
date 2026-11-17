@@ -144,6 +144,9 @@ function makeRunCtx(runId) {
     // attempt 1 的孤儿 `bash -c sleep 360` 与 attempt 2 新起的）⇒ 每一条终止路径补杀整组。
     // Set 而非单值：同一次 attempt 内可以多次 shell 调用（并发/串行都有）。随 attempt 结束清空。
     shellPgids: new Set(),
+    // issue #608 §6.8：MCP server 的 detached 进程组，与 `shellPgids` **并列记账**（两条账
+    // 各有各的注销时机，合成一本只会让「谁该被杀」变成考古）。
+    mcpPgids: new Set(),
     // issue #288（缺陷 B）：本 attempt 的死因（watchdog 写入）；null = 还没杀过。
     killReport: null,
   };
@@ -970,6 +973,124 @@ function applyShellLiveness(ctx, msg, { now = Date.now, logImpl = log } = {}) {
 }
 
 /**
+ * MCP server 子进程组的补杀（issue #608 §6.8）——与 `killShellChildGroups` **同构、同教训**：
+ * worker 的 `finally`（`pool.closeAll()`）只能盖住「自己走到收尾」那一条路，盖不住 watchdog 的
+ * **SIGKILL** ⇒ 账本必须在宿主侧，并在**每一条** worker 终止路径上过一遍。
+ * stdio MCP server 用 `detached:true` 自成进程组（pgid = child.pid），组杀不到它。
+ * @returns {number[]} 实际发了信号的 pgid 列表（登记集已消费，重复调用为空）
+ */
+function killMcpChildGroups(ctx, { kill = defaultProcessKill, logImpl = log } = {}) {
+  const pgids = [...(ctx.mcpPgids ?? [])];
+  if (pgids.length === 0) return [];
+  // 先清空再杀（与 shell 侧同理）：同一次终止会在多条路径上过，登记集只能被消费一次。
+  ctx.mcpPgids = new Set();
+  const killed = [];
+  for (const pgid of pgids) {
+    try {
+      kill(-pgid, 'SIGKILL');
+      killed.push(pgid);
+    } catch (err) {
+      // ESRCH = 已自然退出（竞态，正常）；其它失败也不能阻断终止流程，但要留痕。
+      logImpl('warn', 'mcp child group kill failed (ignored)', {
+        run_id: ctx.runId, pgid, code: err?.code ?? null, msg: String(err?.message ?? err),
+      });
+    }
+  }
+  if (killed.length > 0) {
+    // 只报 pgid 与条数：MCP 侧的名字是管理员起的，可能带凭据线索，不进日志（§10.3）。
+    logImpl('warn', 'orphan mcp child groups killed', { run_id: ctx.runId, pgids: killed, count: killed.length });
+  }
+  return killed;
+}
+
+/**
+ * 两类 detached 子进程组的一次性补杀（§6.8）。**所有终止路径统一走这里**，新增路径时
+ * 只需记得一个函数名——漏一条就是「跨 attempt 无限累加的常驻服务」（#288 的真机形状）。
+ */
+function killChildGroups(ctx, deps = {}) {
+  const shell = killShellChildGroups(ctx, deps);
+  const mcp = killMcpChildGroups(ctx, deps);
+  return { shell, mcp };
+}
+
+/**
+ * `mcp_process` 消息的宿主侧账本（issue #608 §6.8）：与 `applyShellLiveness` 同型，但**没有**
+ * 心跳相（MCP 的长调用自带超时，不靠心跳保活）。**不是**事件通道：绝不进 `enqueueEvent`。
+ * @returns {'spawn'|'exit'|'ignored'}
+ */
+function applyMcpProcess(ctx, msg, { now = Date.now, logImpl = log } = {}) {
+  const phase = msg?.phase;
+  if (phase !== 'spawn' && phase !== 'exit') return 'ignored';
+  const pgid = Number(msg.pgid);
+  if (!Number.isInteger(pgid) || pgid <= 0) {
+    logImpl('warn', 'mcp process report without usable pgid', { run_id: ctx.runId, phase, pgid: msg.pgid ?? null });
+    return 'ignored';
+  }
+  if (!ctx.mcpPgids) ctx.mcpPgids = new Set();
+  if (phase === 'spawn') ctx.mcpPgids.add(pgid);
+  else ctx.mcpPgids.delete(pgid);
+  logImpl('debug', 'mcp child group registered', {
+    run_id: ctx.runId, phase, pgid, pending: ctx.mcpPgids.size,
+  });
+  ctx.lastIpcAt = now();   // 单测直接驱动时不依赖调用点（与 applyShellLiveness 同口径）
+  return phase;
+}
+
+/**
+ * 代 worker 取 MCP 配置（§6.1）：worker 不持 per-container token（`buildWorkerEnv` 删掉了
+ * `ERIX_STATION_TOKEN`），只能由 agentd 用**自己的** token 调 `GET /api/internal/mcp/servers`。
+ * ⚠ 失败 ⇒ `{ok:false}` 回给 worker（worker 降级为「本次 run 无 MCP」），**绝不把 run 打死**；
+ * ⚠ 响应里的明文槽值只走 IPC 内存：**不写盘、不写日志**（§10.3，日志只报条数）。
+ */
+async function mcpConfigResponse(ctx, msg, { request = internalRequest, logImpl = log } = {}) {
+  let out;
+  try {
+    const { data } = await request('GET', '/mcp/servers', { retries: 0 });
+    out = {
+      req_id: msg.req_id,
+      ok: true,
+      servers: Array.isArray(data?.servers) ? data.servers : [],
+      missing: Array.isArray(data?.missing) ? data.missing : [],
+    };
+    logImpl('info', 'mcp config proxied for run', {
+      run_id: ctx.runId, servers: out.servers.length, missing: out.missing.length,
+    });
+  } catch (err) {
+    out = {
+      req_id: msg.req_id, ok: false, servers: [],
+      missing: err instanceof InternalError && err.code === 'lease_lost' ? [] : [],
+      error: `${err?.code ?? 'internal'}:${String(err?.message ?? err)}`,
+    };
+    // 401 的两种语义要分开（与本站其它内部调用同径）：run 的 claim 被抢 ≠ token 被吊。
+    if (err instanceof InternalError && err.code === 'lease_lost') ctx.dropped = true;
+    logImpl('warn', 'mcp config proxy failed, run continues without mcp', {
+      run_id: ctx.runId, code: err?.code ?? null, msg: String(err?.message ?? err),
+    });
+  }
+  sendIpc(ctx.worker, { type: MSG.MCP_CONFIG_RESPONSE, ...out });
+  return out;
+}
+
+/**
+ * 代 worker 回填工具元数据缓存（§6.6）：`POST /api/internal/mcp/tools-cache`。
+ * 失败只记日志——回填是优化（让下一个 run 能离线 search），不是本次 run 的依赖。
+ */
+async function mcpToolsCacheAck(ctx, msg, { request = internalRequest, logImpl = log } = {}) {
+  const slug = typeof msg.slug === 'string' ? msg.slug : '';
+  const tools = Array.isArray(msg.tools) ? msg.tools : [];
+  if (slug === '' || tools.length === 0) return 'ignored';
+  try {
+    await request('POST', '/mcp/tools-cache', { body: { slug, tools }, retries: 0 });
+    logImpl('info', 'mcp tools cache backfilled', { run_id: ctx.runId, slug, tools: tools.length });
+  } catch (err) {
+    logImpl('warn', 'mcp tools cache backfill failed (ignored)', {
+      run_id: ctx.runId, slug, code: err?.code ?? null, msg: String(err?.message ?? err),
+    });
+  }
+  return 'sent';
+}
+
+/**
  * F6 watchdog 单轮巡检（从 heartbeatLoop 里抽出：「谁被杀、按什么顺序杀」必须可被单测确定性驱动）。
  * 行为与抽出前逐字一致：跳过无 worker / 正在收尾的 ctx → 刷 run 数据目录活动戳 → 静默超阈值则
  * **先 SIGKILL worker 组，再补杀登记的 shell 子进程组**（issue #288 缺陷 D 的顺序红线）。
@@ -1000,7 +1121,7 @@ function sweepWatchdog({
       ctx.killReport = { killed_by: 'watchdog', silent_ms: silentMs };
       if (ctx.workerPid) killProcessGroup(ctx.workerPid, 'SIGKILL', kill);
       // 顺序：worker 组先走，否则 shell 子进程还能被活着的 worker 自己收一轮。
-      killShellChildGroups(ctx, { kill, logImpl });
+      killChildGroups(ctx, { kill, logImpl });
       killedRuns.push({ run_id: ctx.runId, silent_ms: silentMs });
     }
   }
@@ -1046,12 +1167,12 @@ function abortRun(ctx, reason) {
       if (pid && ctx.workerPid === pid && state.runs.get(ctx.runId) === ctx) {
         killProcessGroup(pid, 'SIGKILL');
         // issue #288 缺陷 D：worker 组里没有 shell 子命令（detached 自成一族），跟着补一刀。
-        killShellChildGroups(ctx);
+        killChildGroups(ctx);
       }
     }, 5000);
   } else {
     // 无 IPC 通道（worker 已退出或从未连上）：没有宽限可等，登记过的 shell 组当场就成孤儿。
-    killShellChildGroups(ctx);
+    killChildGroups(ctx);
   }
   log('info', 'abort run', { run_id: ctx.runId, reason });
 }
@@ -1155,6 +1276,22 @@ function onWorkerMessage(ctx, runStart, msg) {
       if (msg.run_id === ctx.runId) applyShellLiveness(ctx, msg);
       break;
     }
+    case MSG.MCP_PROCESS: {
+      // issue #608 §6.8：MCP server 进程组登记。与 `SHELL_LIVENESS` 同类：宿主内部信号，
+      // **本分支绝不往事件队列里塞东西**（否则多出一条 run_events/U3 事件）。
+      if (msg.run_id === ctx.runId) applyMcpProcess(ctx, msg);
+      break;
+    }
+    case MSG.MCP_CONFIG_REQUEST: {
+      // issue #608 §6.1：代 worker 取配置（worker 没 token）。异步回包，**不卡住消息循环**；
+      // 任何失败都在 `mcpConfigResponse` 里内化成 `ok:false`，不会把 agentd 抛进未处理拒绝。
+      void mcpConfigResponse(ctx, msg);
+      break;
+    }
+    case MSG.MCP_TOOLS_CACHE:
+      // issue #608 §6.6：元数据回填（fire-and-forget，失败只记日志）。
+      void mcpToolsCacheAck(ctx, msg);
+      break;
     default:
       break;
   }
@@ -1308,12 +1445,12 @@ function cleanupRun(ctx, { archiveRunData: shouldArchive = false } = {}) {
       setTimeout(() => {
         if (pid && ctx.workerPid === pid) killProcessGroup(pid, 'SIGKILL');
         // issue #288 缺陷 D：组杀不到 detached 的 shell 子命令，补一刀（登记集已消费过则空操作）。
-        killShellChildGroups(ctx);
+        killChildGroups(ctx);
       }, 2000);
     }
   } else {
     // worker 已退出：还挂在登记集里的就是孤儿（worker 被 SIGKILL 时没机会自己收），当场补杀。
-    killShellChildGroups(ctx);
+    killChildGroups(ctx);
   }
   // issue #46 + #64 R1 配套：run 数据目录仅在终态清理（archiveRunData=true，onWorkerFinished 收敛成功后）
   // **归档**（runs/ → runs-archive/，conversation-state.md §5 P1 真相层归档 TTL 替代物理删除）；
@@ -1571,7 +1708,7 @@ function shutdown() {
   const hardExit = setTimeout(() => {
     log('warn', 'shutdown hard exit (drain did not finish)');
     // issue #288 缺陷 D：process.exit 之后没人再跑 drain/cleanup，孤儿 shell 组必须在这里先杀完。
-    for (const c of ctxs) killShellChildGroups(c);
+    for (const c of ctxs) killChildGroups(c);
     process.exit(0);
   }, 15000);
   void drainRuns(ctxs, { deadlineMs: 5000, kill: killProcessGroup, log: (m, e) => log('warn', m, e) })
@@ -1579,7 +1716,7 @@ function shutdown() {
       log('info', 'shutdown drain done', { drained: r.drained, pending: r.pending });
       // issue #288 缺陷 D：drain 的 kill 只能杀 worker 组；pending（SIGKILL 都杀不掉的 D 态 worker）
       // 场景下 onWorkerExit 跑不到 ⇒ cleanupRun 也跑不到 ⇒ 这里兼底。
-      for (const c of ctxs) killShellChildGroups(c);
+      for (const c of ctxs) killChildGroups(c);
       return drainPendingReports(); // 同上：drain 期间才产生的新补报
     })
     .finally(() => { clearTimeout(hardExit); process.exit(0); });
@@ -1662,6 +1799,11 @@ export {
   resolveRunCwd, buildWorkerEnv, CFG as testConfig,
   // issue #288：watchdog 巡检 / shell 子进程组账本 / 启动不变式，均为**单测可见面**（非对外契约）。
   sweepWatchdog, killShellChildGroups, applyShellLiveness, warnIfWatchdogBelowShellMax, makeRunCtx,
+  // issue #608 §6.8：MCP 侧的进程组账本与代理（与 shell 侧同一批测试入口，否则「每条终止
+  // 路径都补杀」只能靠真进程验，而本仓的单测约 5ms 一轮）。
+  killMcpChildGroups, killChildGroups, applyMcpProcess, mcpConfigResponse, mcpToolsCacheAck,
+  // 「代 worker 取配置」的**承重项是 token**，所以必须能让单测注入假 fetch 验一遍请求头。
+  internalRequest as testInternalRequest,
   // issue #500：`withRetry` 的重试判据是 `err instanceof InternalError && err.retryable`，
   // 所以「有限重试」那条用例必须能造**真**实例（造一个只长得像的错误对象会被判成不可重试 ⇒ 假绿）。
   InternalError,

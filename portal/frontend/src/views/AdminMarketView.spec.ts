@@ -14,13 +14,24 @@
 //   ⑦ 400 `validation_failed` + `details.field` ⇒ 那一格 aria-invalid + 错误行点名字段
 //   ⑧ 编辑不选文件 ⇒ PUT 不带 `bundle`（只改元数据）
 //   ⑨ 双语成对：`admin.market.*` 与 `admin.tabs.market`
+//   ⑩ MCP 发布面（#608 §8.1）：kind 切换与字段组、`reason` 缺失**不发请求**、slots 增删、
+//      `inject` 随 transport 锁定、凭据面板只显示「已设置 / 未设置」+ 源码级「没有读值入口」
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import AdminMarketView from './AdminMarketView.vue';
+// #608 §11 的「源码级断言不存在读值请求」：源码文本走 vite `?raw`（issue #349 的口径：
+// jsdom 下 `node:fs` 会被 externalize 成浏览器桩，`new URL(…, import.meta.url)` 在 vitest 下又是 http: URL）。
+import viewSource from './AdminMarketView.vue?raw';
+import marketSource from '../lib/market.ts?raw';
 import { i18n, setLocale } from '../i18n';
 import { zhCN } from '../i18n/locales/zh-CN';
 import { en } from '../i18n/locales/en';
-import { ADMIN_MARKET_ITEMS_PATH, adminMarketItemPath } from '../lib/market';
+import {
+  ADMIN_MARKET_ITEMS_PATH,
+  adminMarketItemPath,
+  adminMarketSecretsPath,
+  normalizeMcpSecrets,
+} from '../lib/market';
 
 interface Recorded { url: string; method: string; body: Record<string, unknown> | null }
 type Handler = (call: Recorded) => Response | undefined;
@@ -485,5 +496,299 @@ describe('⑨ 双语成对（admin.market.* / admin.tabs.market）', () => {
     const zhCodes = Object.keys(zhCN.admin.market.pathIssue).sort();
     expect(zhCodes).toEqual(Object.keys(en.admin.market.pathIssue).sort());
     expect([...zhCodes].sort()).toEqual(['absolute', 'empty', 'parentRef', 'separator', 'tooLong']);
+  });
+});
+
+// ── ⑩ MCP 发布面（#608 §8.1 / §11）─────────────────────────────────────
+
+/** 一条 `kind='mcp'` 的管理台详情（字段面按 §4 给全；`tools_cache` 是 runner 回填的那份）。 */
+function mcpDetailFixture(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'm1', kind: 'mcp', slug: 'srch', name: '检索服务', summary: '外部检索',
+    when_to_use: '要查外部资料时', version: '1.0.0', state: 'published', tags: ['search'],
+    transport: 'stdio', command: 'npx', args: ['-y', '@modelcontextprotocol/server-srch'], url: '',
+    exposure: 'deferred', lifecycle: 'run', timeout_ms: 30000, reason: 'stateful', resident: false,
+    slots: [{ name: 'SRCH_TOKEN', kind: 'secret', inject: 'env', required: true, description: '检索令牌' }],
+    // §8.1：工具清单就住在 `manifest.tools_cache`（runner 回填），`tools_cache_at` 是回填时间
+    manifest: {
+      tools_cache: [{ name: 'search', description: '搜一下' }],
+      tools_cache_at: '2026-11-17T08:00:00Z',
+    },
+    ...over,
+  };
+}
+
+/** 凭据行夹具（§7.2 的形状：只有声明 + 有没有值）。 */
+function secretSlotRow(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: 'A_TOKEN', kind: 'secret', inject: 'env', required: true,
+    has_value: false, updated_at: null, updated_by: null, ...over,
+  };
+}
+
+/** 列表 + 详情 + 凭据三个地址的分派桩（凭据回 `slotsFor()`；PUT 交给 `extra`）。 */
+function mcpHandler(
+  detail: Record<string, unknown>,
+  slotsFor: () => unknown[],
+  extra?: Handler,
+): Handler {
+  const slug = String(detail.slug ?? 'srch');
+  return (call) => {
+    if (call.method === 'GET'
+      && (call.url === ADMIN_MARKET_ITEMS_PATH || call.url.startsWith(`${ADMIN_MARKET_ITEMS_PATH}?`))) {
+      return json(200, { items: [item('m1', { kind: 'mcp', slug })] });
+    }
+    if (call.method === 'GET' && call.url === adminMarketItemPath('m1')) return json(200, { item: detail });
+    if (call.method === 'GET' && call.url === adminMarketSecretsPath('m1')) {
+      return json(200, { item: { slots: slotsFor() } });
+    }
+    return extra === undefined ? undefined : extra(call);
+  };
+}
+
+/** 挂列表 ⇒ 点开 mcp 详情（详情之后组件会自己再去打凭据地址）。 */
+async function openMcpFixture(
+  detail: Record<string, unknown>,
+  slotsFor: () => unknown[],
+  extra?: Handler,
+): Promise<{ wrapper: VueWrapper; calls: Recorded[] }> {
+  const mounted = await mountWith(mcpHandler(detail, slotsFor, extra));
+  await mounted.wrapper.get('[data-test="market-detail-srch"]').trigger('click');
+  await flushPromises();
+  return mounted;
+}
+
+/** 新建桩：列表 + `POST …/items` 回一条新条目。 */
+const createHandler: Handler = (call) => {
+  const base = listHandler(call);
+  if (base) return base;
+  if (call.method === 'POST' && call.url === ADMIN_MARKET_ITEMS_PATH) {
+    return json(200, { item: item('new1', { slug: 'srch', kind: 'mcp', state: 'draft' }) });
+  }
+  return undefined;
+};
+
+/** 开表单并把种类切到 mcp（后面的 MCP 用例都从这里出发）。 */
+async function openMcpForm(wrapper: VueWrapper): Promise<void> {
+  await openForm(wrapper);
+  await fillMeta(wrapper);
+  await wrapper.get('[data-test="field-kind"]').setValue('mcp');
+}
+
+describe('⑩ MCP 发布面（#608 §8.1）', () => {
+  it('详情：连接摘要 + reason/exposure 走 i18n + 工具清单（tools_cache 与回填时间）', async () => {
+    const { wrapper } = await openMcpFixture(mcpDetailFixture(), () => [secretSlotRow()]);
+    expect(exists(wrapper, 'market-detail-mcp')).toBe(true);
+    expect(text(wrapper, 'detail-mcp-endpoint')).toContain('npx -y @modelcontextprotocol/server-srch');
+    // 英文枚举不直接喷给人看（§8.2）
+    expect(text(wrapper, 'detail-mcp-exposure')).toContain('经网关');
+    expect(text(wrapper, 'detail-mcp-reason')).toContain('有状态');
+    expect(text(wrapper, 'detail-mcp-reason')).not.toContain('stateful');
+    expect(exists(wrapper, 'market-detail-toolscache-none')).toBe(false);
+    expect(text(wrapper, 'market-detail-toolscache')).toContain('search');
+    expect(text(wrapper, 'market-detail-toolscache-at')).toContain('2026-11-17T08:00:00Z');
+  });
+
+  it('工具清单未回填 ⇒ 「还没有 FDE 连过这个 server」（不拿空数组冒充「有工具」）', async () => {
+    const { wrapper } = await openMcpFixture(
+      mcpDetailFixture({ manifest: {} }),
+      () => [secretSlotRow()],
+    );
+    expect(exists(wrapper, 'market-detail-toolscache-none')).toBe(true);
+    expect(text(wrapper, 'market-detail-toolscache-none')).toContain('还没有 FDE 连过');
+    expect(exists(wrapper, 'market-detail-toolscache-at')).toBe(false);
+  });
+
+  it('凭据区只说「已设置 / 未设置」：服务端多发的明文不落地（DOM + DTO + 地址三道锁）', async () => {
+    const slots = [
+      secretSlotRow({
+        has_value: true, updated_at: '2026-11-17T07:00:00Z', updated_by: 'admin',
+        // 服务端不应该发这些键（§7.2）；发了也不得被收进 DTO / 上屏（canary）
+        value: 'CANARY-PLAIN', plaintext: 'CANARY-PLAIN-2', secret: 'CANARY-PLAIN-3',
+      }),
+      secretSlotRow({ name: 'B_CFG', kind: 'config', required: false }),
+    ];
+    const { wrapper, calls } = await openMcpFixture(mcpDetailFixture(), () => slots);
+    expect(text(wrapper, 'secret-row-A_TOKEN')).toContain('已设置');
+    expect(text(wrapper, 'secret-row-A_TOKEN')).toContain('2026-11-17T07:00:00Z');
+    expect(text(wrapper, 'secret-row-B_CFG')).toContain('未设置');
+    // canary：整页文本里不许出现任何明文（§10-3「不记录值」的 UI 面）
+    expect(wrapper.text()).not.toContain('CANARY');
+    // DTO 面：形状只有白名单那几格，值从结构上就溜不进来
+    const rows = normalizeMcpSecrets({ item: { slots } });
+    expect(rows).toHaveLength(2);
+    expect(Object.keys(rows[0] as unknown as Record<string, unknown>).sort())
+      .toEqual(['hasValue', 'inject', 'kind', 'name', 'required', 'updatedAt', 'updatedBy']);
+    expect(JSON.stringify(rows)).not.toContain('CANARY');
+    // 地址面：读凭据只有那一个地址，没子路径也没 query（挂 `?reveal=1` 就是给读值留门）
+    const secretCalls = calls.filter((c) => c.url.includes('/secrets'));
+    expect(secretCalls.map((c) => c.url)).toEqual([adminMarketSecretsPath('m1')]);
+    expect(secretCalls.every((c) => c.method === 'GET')).toBe(true);
+  });
+
+  it('源码级：视图对凭据地址只有一种 GET 与一种 PUT，lib 不读值键（§8.1 硬约束）', () => {
+    expect(viewSource.match(/adminMarketSecretsPath\(/g) ?? []).toHaveLength(2); // 一读一写
+    expect(viewSource.match(/api\(adminMarketSecretsPath\([^)]*\)\)/g) ?? []).toHaveLength(1);
+    expect(viewSource.match(/api\(adminMarketSecretsPath\([^)]*\),\s*\{\s*method:\s*'PUT'/g) ?? [])
+      .toHaveLength(1);
+    expect(viewSource).not.toMatch(/\?reveal|reveal=1|include_value|with_value|show_value|secrets\?/);
+    const fn = marketSource.match(/export function normalizeMcpSecrets[\s\S]*?\n\}/);
+    if (fn === null) throw new Error('normalizeMcpSecrets 必须能在 lib 源码里定位到（改名/换写法时本用例先红）');
+    expect(fn[0]).toContain('has_value');
+    expect(fn[0]).not.toMatch(/\brow\.(value|values|secret|plaintext)\b/);
+    expect(fn[0]).not.toMatch(/\[['"]values?['"]\]/);
+  });
+
+  it('「设置」modal：输入框从不回填旧值；PUT 只发 values，写完只重读声明（不回显）', async () => {
+    let stored = false;
+    const { wrapper, calls } = await openMcpFixture(mcpDetailFixture(), () => [secretSlotRow({ has_value: stored })],
+      (call) => (call.method === 'PUT' && call.url === adminMarketSecretsPath('m1')
+        ? (stored = true, json(200, { item: { slots: [secretSlotRow({ has_value: true })] } }))
+        : undefined));
+    expect(text(wrapper, 'secret-has-value-A_TOKEN')).toContain('未设置');
+    await wrapper.get('[data-test="secret-set-A_TOKEN"]').trigger('click');
+    await flushPromises();
+    const valueInput = wrapper.get('[data-test="secret-value"]');
+    expect((valueInput.element as HTMLInputElement).value).toBe(''); // 只写不读 ⇒ 没有旧值可回填
+    expect((valueInput.element as HTMLInputElement).type).toBe('password');
+    expect(exists(wrapper, 'secret-fde-id')).toBe(false);             // 默认 global，不先摆一个没用的格子
+    await valueInput.setValue('NEW-VALUE');
+    await wrapper.get('[data-test="secret-submit"]').trigger('submit');
+    await flushPromises();
+    const puts = calls.filter((c) => c.method === 'PUT');
+    expect(puts).toHaveLength(1);
+    expect(puts[0].body).toEqual({ scope: 'global', values: { A_TOKEN: 'NEW-VALUE' } });
+    expect(wrapper.text()).not.toContain('NEW-VALUE'); // 写完不回显，变的只有 `has_value` 那一格
+    expect(text(wrapper, 'secrets-result')).toContain('已设置');
+    expect(calls.filter((c) => c.method === 'GET' && c.url === adminMarketSecretsPath('m1'))).toHaveLength(2);
+    expect(text(wrapper, 'secret-has-value-A_TOKEN')).toContain('已设置');
+  });
+
+  it('空串提交发 `null`（＝删除该值）；fde 作用域带 `fde_id`', async () => {
+    const { wrapper, calls } = await openMcpFixture(mcpDetailFixture(), () => [secretSlotRow({ has_value: true })],
+      (call) => (call.method === 'PUT' && call.url === adminMarketSecretsPath('m1')
+        ? json(200, { item: { slots: [secretSlotRow()] } })
+        : undefined));
+    await wrapper.get('[data-test="secret-set-A_TOKEN"]').trigger('click');
+    await wrapper.get('[data-test="secret-scope"]').setValue('fde');
+    expect(exists(wrapper, 'secret-fde-id')).toBe(true);
+    await wrapper.get('[data-test="secret-fde-id"]').setValue('fde-77');
+    await wrapper.get('[data-test="secret-submit"]').trigger('submit');
+    await flushPromises();
+    const puts = calls.filter((c) => c.method === 'PUT');
+    expect(puts).toHaveLength(1);
+    expect(puts[0].body).toEqual({ scope: 'fde', fde_id: 'fde-77', values: { A_TOKEN: null } });
+    expect(text(wrapper, 'secrets-result')).toContain('已删除');
+  });
+
+  it('表单：kind 切到 mcp ⇒ MCP 字段组出现、包体区消失；transport 换档 ⇒ command/args ↔ url 互斥', async () => {
+    const { wrapper } = await mountWith(listHandler);
+    await openForm(wrapper);
+    expect(exists(wrapper, 'form-mcp')).toBe(false);
+    expect(exists(wrapper, 'field-bundle')).toBe(true);
+    await wrapper.get('[data-test="field-kind"]').setValue('mcp');
+    expect(exists(wrapper, 'form-mcp')).toBe(true);
+    expect(exists(wrapper, 'field-bundle')).toBe(false); // §7.2：`kind='mcp'` 不需要 bundle
+    expect(exists(wrapper, 'field-command')).toBe(true);
+    expect(exists(wrapper, 'field-url')).toBe(false);
+    await wrapper.get('[data-test="field-transport"]').setValue('http');
+    expect(exists(wrapper, 'field-url')).toBe(true);
+    expect(exists(wrapper, 'field-command')).toBe(false);
+    // exposure 三档各带一行可观察差异（§4.3）
+    for (const [value, expected] of [
+      ['direct', '模型可直接调'], ['deferred', '先 search 拿 schema 再 call'], ['hidden', '整条不物化'],
+    ] as const) {
+      await wrapper.get('[data-test="field-exposure"]').setValue(value);
+      expect(text(wrapper, 'mcp-exposure-hint'), value).toContain(expected);
+    }
+    // reason 是**必选下拉**：默认那格空，四个枚举各有中文句子
+    const options = wrapper.get('[data-test="field-reason"]').findAll('option');
+    expect(options.map((o) => o.element.getAttribute('value')))
+      .toEqual(['', 'stateful', 'tool_surface_gt_12', 'shared_quota', 'credential_boundary']);
+    expect(options[1].text()).toContain('有状态');
+  });
+
+  it('reason 没选 ⇒ 一次 POST 都不发；补齐后发的就是 §4 的 MCP 字段面', async () => {
+    const { wrapper, calls } = await mountWith(createHandler);
+    await openMcpForm(wrapper);
+    await wrapper.get('[data-test="field-command"]').setValue('npx');
+    await wrapper.get('[data-test="field-args"]').setValue('-y\n@modelcontextprotocol/server-srch');
+    await wrapper.get('[data-test="field-timeout_ms"]').setValue('45000');
+
+    await wrapper.get('[data-test="market-submit"]').trigger('submit');
+    await flushPromises();
+    expect(posts(calls, ADMIN_MARKET_ITEMS_PATH)).toHaveLength(0);
+    expect(text(wrapper, 'mcp-issues')).toContain('没选准入理由');
+    expect(wrapper.get('[data-test="field-reason"]').attributes('aria-invalid')).toBe('true');
+
+    // 超时超上限（§10-8：≤ 300 s）同属一眼假 ⇒ 照样不发
+    await wrapper.get('[data-test="field-reason"]').setValue('stateful');
+    await wrapper.get('[data-test="field-timeout_ms"]').setValue('900000');
+    await wrapper.get('[data-test="market-submit"]').trigger('submit');
+    await flushPromises();
+    expect(posts(calls, ADMIN_MARKET_ITEMS_PATH)).toHaveLength(0);
+    expect(text(wrapper, 'mcp-issues')).toContain('300000');
+
+    await wrapper.get('[data-test="field-timeout_ms"]').setValue('45000');
+    await wrapper.get('[data-test="market-submit"]').trigger('submit');
+    await flushPromises();
+    const hit = posts(calls, ADMIN_MARKET_ITEMS_PATH);
+    expect(hit).toHaveLength(1);
+    const body = hit[0].body as Record<string, unknown>;
+    expect(body.kind).toBe('mcp');
+    expect(body.transport).toBe('stdio');
+    expect(body.command).toBe('npx');
+    expect(body.args).toEqual(['-y', '@modelcontextprotocol/server-srch']);
+    expect(body.reason).toBe('stateful');
+    expect(body.exposure).toBe('deferred');
+    expect(body.lifecycle).toBe('run');
+    expect(body.timeout_ms).toBe(45000);
+    expect(body.resident).toBe(false);
+    expect(body.bundle).toBeUndefined(); // MCP 没有包体
+    // 只发顶层：请求体里**不许**再有一份 `manifest`（两份真相会漂移，服务端只读顶层）。
+    expect(body.manifest).toBeUndefined();
+  });
+
+  it('slots 增删行；`inject` 随 transport 锁死（只读说明，不是可选控件）；重名不发请求', async () => {
+    const { wrapper, calls } = await mountWith(createHandler);
+    await openMcpForm(wrapper);
+    expect(exists(wrapper, 'mcp-slots-none')).toBe(true);
+    await wrapper.get('[data-test="mcp-slot-add"]').trigger('click');
+    await flushPromises();
+    expect(exists(wrapper, 'mcp-slots-none')).toBe(false);
+    const injectCell = wrapper.get('[data-test="mcp-slot-0-inject"]');
+    // 锁：不是可选控件（§8.1 要的是只读说明，不是个默认选中的下拉）
+    expect(['INPUT', 'SELECT', 'TEXTAREA']).not.toContain(injectCell.element.tagName);
+    expect(injectCell.text()).toBe('env'); // mcp + stdio ⇒ `env` 是唯一合法档（§4.2）
+    await wrapper.get('[data-test="field-transport"]').setValue('http');
+    expect(wrapper.get('[data-test="mcp-slot-0-inject"]').text()).toBe('header');
+    expect(text(wrapper, 'mcp-inject-locked')).toContain('http');
+    expect(text(wrapper, 'mcp-inject-locked')).toContain('header');
+    await wrapper.get('[data-test="field-transport"]').setValue('stdio');
+    await wrapper.get('[data-test="mcp-slot-0-name"]').setValue('SRCH_TOKEN');
+    await wrapper.get('[data-test="mcp-slot-0-kind"]').setValue('config');
+    await wrapper.get('[data-test="mcp-slot-0-description"]').setValue('检索令牌');
+    await wrapper.get('[data-test="mcp-slot-add"]').trigger('click');
+    await wrapper.get('[data-test="mcp-slot-1-name"]').setValue('DROP_ME');
+    await wrapper.get('[data-test="mcp-slot-1-remove"]').trigger('click');
+    expect(exists(wrapper, 'mcp-slot-1')).toBe(false);
+
+    // 重名 ⇒ 不发请求（§4.1「item 内唯一」）
+    await wrapper.get('[data-test="mcp-slot-add"]').trigger('click');
+    await wrapper.get('[data-test="mcp-slot-1-name"]').setValue('SRCH_TOKEN');
+    await wrapper.get('[data-test="field-reason"]').setValue('stateful');
+    await wrapper.get('[data-test="field-command"]').setValue('npx');
+    await wrapper.get('[data-test="market-submit"]').trigger('submit');
+    await flushPromises();
+    expect(posts(calls, ADMIN_MARKET_ITEMS_PATH)).toHaveLength(0);
+    expect(text(wrapper, 'mcp-issues')).toContain('重复');
+
+    await wrapper.get('[data-test="mcp-slot-1-remove"]').trigger('click');
+    await wrapper.get('[data-test="market-submit"]').trigger('submit');
+    await flushPromises();
+    const body = posts(calls, ADMIN_MARKET_ITEMS_PATH)[0].body as Record<string, unknown>;
+    expect(body.slots).toEqual([{
+      name: 'SRCH_TOKEN', kind: 'config', inject: 'env', required: true, description: '检索令牌',
+    }]);
   });
 });
