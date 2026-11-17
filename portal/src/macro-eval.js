@@ -13,7 +13,7 @@
 //   求值成功（无论命中与否）→ UPDATE last_evaluated_at；求值抛异常 → **不写**（保持陈旧暴露故障）。
 //   ⇒ **先求值成功、再推进水位线**（顺序反了会把「求值抛异常」显示成健康），
 //     且**逐条写不批量**（批量会把失败的一起推进）。见 `tick()` 里 `advanceWatermark` 的位置。
-import { claimMacroRun, finishMacroRun } from './macros.js';
+import { claimMacroRun, finishMacroRun, applyExpiredAssignments } from './macros.js';
 // 评估间隔与陈旧余量是**跨端面**常量（执行器与用户面共用）⇒ 权威位在
 // `shared/macro-kinds.js`（issue #528 / 契约 `10` 篇 §1），本文件只 re-export。
 import { EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE, QUIET_WINDOW_RE } from '../shared/macro-kinds.js';
@@ -195,7 +195,7 @@ export function startMacroEvalLoop(pool, _config = {}, { log = console, interval
       let failed = 0;
       let rows;
       try {
-        rows = await listEvaluableAssignments(pool);
+        rows = await listEvaluableAssignments(pool, { now: new Date(nowMs) });
       } catch (err) {
         // 取订阅这一步失败 ⇒ 整轮没有任何订阅被求值 ⇒ 一个水位线都不推进（暴露为「循环没跑」）。
         log.warn?.(`[macro-eval] 取订阅失败（本轮不推进任何水位线）：${err?.message}`);
@@ -251,17 +251,34 @@ export function startMacroEvalLoop(pool, _config = {}, { log = console, interval
 
 /**
  * 取本轮要评估的订阅：JOIN `macro_templates` 拿 `kind/name/params/scope`
- * （`toAssignmentSnapshot` 不带 `kind`，而分派必须按 kind）。只取 `enabled=true`；
- * 「到期」不在此处过滤（到期扫描要的就是「DB 里仍 enabled 但 until 已过」这批）。
+ * （`toAssignmentSnapshot` 不带 `kind`，而分派必须按 kind）。
+ *
+ * ① **先收敛到期，再取订阅**（issue #624）：以前这里只写 `WHERE a.enabled = true`，
+ *   而「顺手停用」只发生在 `claimMacroRun` 里 ⇒ 只有走 tick claim 的 `scheduled-task`
+ *   会被停用，`run-notify` / `run-silence-alert`（不走 tick claim）**永远 enabled**。
+ *   现在本函数自己负责：先 `applyExpiredAssignments(pool, { now })`，然后只取 `enabled = true`。
+ *
+ * ② 但**本轮刚被停用的那批要一并取出来**（`disabledIds`）：到期扫描要的就是「`until`
+ *   已过」这批，假设它们不在结果里，`evalExpiry` 根本不会跑，到期意图一条也产不出
+ *   （#624 的另一半：「到期通知无消费者」）。它们只会被取**一轮**：下一拍 `applyExpiredAssignments`
+ *   的谓词带 `enabled`，已停的行不再进 `disabledIds` ⇒ 也不会重复产意图
+ *   （再加 `claimExpiryRun` 的幂等键，双保险）。
+ *
+ * @param {{now?: Date|number|string}} [opts] 收敛到哪个时刻（默认当前）；tick 传本轮的 `now`，
+ *   保证「判到期」与「产意图」用的是同一个时刻。
  */
-export async function listEvaluableAssignments(pool) {
+export async function listEvaluableAssignments(pool, { now = new Date() } = {}) {
+  const at = now instanceof Date ? now : new Date(now);
+  // ⚠ 不传 `userId`：评估循环是全量的，到期收敛也必须全量（按人传会把别人的到期漏掉）。
+  const { disabledIds } = await applyExpiredAssignments(pool, { now: at });
   const res = await pool.query(
     `SELECT a.id, a.template_id, a.user_id, a.session_id, a.cwd, a.until, a.enabled,
             a.last_evaluated_at, t.kind, t.name AS template_name, t.params, t.scope
        FROM macro_assignments a
        JOIN macro_templates t ON t.id = a.template_id
-      WHERE a.enabled = true
+      WHERE a.enabled = true OR a.id = ANY($1::uuid[])
       LIMIT 500`,
+    [disabledIds],
   );
   return res.rows.map((r) => ({
     id: r.id,
@@ -295,7 +312,8 @@ export async function evalOneAssignment(pool, a, nowMs, { log } = {}) {
   let evaluated = false;
   const expired = a.until != null && toMs(a.until) <= nowMs;
   if (expired) {
-    // 到期扫描（`10` 篇 §4）：产一条到期意图（停用本身由 W1 的 applyExpiredAssignments 顺手做）。
+    // 到期扫描（`10` 篇 §4）：产一条到期意图。停用本身已由 `listEvaluableAssignments` 的
+    // `applyExpiredAssignments` 做过（#624）；本支只负责「到期要说一声」，靠幂等键只产一次。
     const it = await evalExpiry(pool, a, nowMs, { log });
     if (it) intents.push(it);
     evaluated = true;
