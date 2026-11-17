@@ -35,7 +35,7 @@
 import {
   KINDS, AUDIENCES, SCOPES, KIND_SCOPE, KIND_SCHEMA,
   STATUS, TERMINAL_STATUSES, CRITERION, SKIPPED_REASON, VERDICT,
-  DURATION_RE, TIME_RE,
+  DURATION_RE, TIME_RE, QUIET_WINDOW_RE,
 } from '../shared/macro-kinds.js';
 
 /** 模板 kinds（单一真源：`shared/macro-kinds.js` 的 `KINDS`）。 */
@@ -85,6 +85,11 @@ export function validateKindParams(kind, params) {
     } else if (rule.type === 'time') {
       if (typeof value !== 'string' || !TIME_RE.test(value)) {
         throw new MacroError('validation_failed', `${key} 必须是 HH:MM（UTC+8）`, { details: where });
+      }
+    } else if (rule.type === 'quiet_window') {
+      // 形态：`"HH:MM-HH:MM"`（UTC+8）或 `"off"`；语义（跨午夜/默认）在 `macro-eval.js`。
+      if (typeof value !== 'string' || !QUIET_WINDOW_RE.test(value)) {
+        throw new MacroError('validation_failed', `${key} 必须是 HH:MM-HH:MM（UTC+8）或 'off'`, { details: where });
       }
     } else if (rule.type === 'path') {
       if (typeof value !== 'string' || value.length === 0 || value.includes('..')) {
