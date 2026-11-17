@@ -1267,6 +1267,14 @@ async function routeApi(req, res, ctx, url) {
       query: url.searchParams,
     }));
   }
+  // issue #614：顶栏**用户级** chip 的跨会话流水（属主 = 当前用户，不绑 session）。
+  // ⚠ 不能放 `/api/admin/*`（#450 白名单 deny）；与会话级那份同形（`{ items, nextCursor }`）。
+  if (req.method === 'GET' && pathname === '/api/macro-runs') {
+    const s = await requireSession(req, ctx);
+    return sendJson(res, 200, await macroRoutes.userMacroRuns({
+      pool: ctx.pool, userId: s.user.id, query: url.searchParams,
+    }));
+  }
 
   // ---- issue #595 能力市场：用户面（§7）。三条红线：只读 published、只作用于**当前登录用户自己的**
   // FDE、写操作一律审计。`fde_id` 与 `fde_name` 都取自 session，**不接受请求体里的 fde**

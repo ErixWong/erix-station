@@ -37,7 +37,8 @@ import {
 } from '../lib/macroView';
 
 const props = withDefaults(defineProps<{
-  sessionId: string;
+  /** `null` ⇒ 用户级全局面（issue #614：顶栏 chip，流水走 `/api/macro-runs`，卡片显示用户级模板）。 */
+  sessionId: string | null;
   /** 单价（每 token）。未确认 ⇒ 只给 token 不给钱（`07` §15 第 1 条）。 */
   price?: { inputPerToken?: number | null; outputPerToken?: number | null } | null;
 }>(), { price: null });
@@ -61,11 +62,26 @@ const healthMinutes = computed(() => minutesAgo(health.value.last, macro.now()))
 const expectedEverySeconds = computed(() => Math.round(EVAL_INTERVAL_MS / 1000));
 const staleAfterSeconds = computed(() => Math.round(STALE_INTERVAL_MULTIPLE * EVAL_INTERVAL_MS / 1000));
 
-/** 订阅卡片上的「上次评估 14:03:12」（`09` §3.1：用户能看到的唯一平台健康信号）。 */
-function lastEvaluatedText(assignmentId: string | null): string {
-  const a = macro.assignments.find((x) => x.id === assignmentId);
-  const clock = formatClock(a?.lastEvaluatedAt ?? null);
-  return clock ?? t('macro.card.notEvaluated');
+/** 用户级形态（`sessionId === null`，issue #614）：卡片列用户级模板而不是会话订阅。 */
+const isUserMode = computed(() => props.sessionId === null);
+
+interface SubscriptionCard { key: string; name: string; last: string | null }
+/** 订阅卡片区的数据源：会话面用生效订阅，用户面用 `scope='user'` 模板（`/api/macro-templates` 已只回 `audience='all'`）。 */
+const subscriptionCards = computed<SubscriptionCard[]>(() => {
+  if (isUserMode.value) {
+    return macro.userTemplates.map((tpl) => ({ key: `user:${tpl.id}`, name: tpl.name, last: null }));
+  }
+  return macro.enabledAssignments.map((a) => ({
+    key: a.id,
+    name: macro.templates.find((x) => x.id === a.templateId)?.name ?? '',
+    last: a.lastEvaluatedAt,
+  }));
+});
+/** 卡片标题上的「启用 N 个」：会话数生效订阅，用户数用户级模板。 */
+const subscriptionCount = computed(() => subscriptionCards.value.length);
+/** 卡片右侧的「上次评估 …」：会话取订阅水位线，用户级无会话水位线⇒「尚未评估」。 */
+function cardLastText(card: SubscriptionCard): string {
+  return formatClock(card.last) ?? t('macro.card.notEvaluated');
 }
 
 /** 汇总：本会话（范围必须先声明，§15 第 2 条）。 */
@@ -125,8 +141,8 @@ defineExpose({ retry, estimateOpen });
           @click="close"
         >←</button>
         <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ t('macro.title') }}</span>
-        <!-- 二级入口：[配置 ▾] 打开模板下拉（chip 只做「开抽屉」，这里只做「开下拉」） -->
-        <MacroMenu variant="config" scope="session" :session-id="sessionId" />
+        <!-- 二级入口：[配置 ▾] 打开模板下拉（chip 只做「开抽屉」，这里只做「开下拉」）。用户级抽屉里是只读的用户模板。 -->
+        <MacroMenu variant="config" :scope="isUserMode ? 'user' : 'session'" :session-id="sessionId" />
         <button
           type="button"
           data-test="macro-refresh"
@@ -167,19 +183,18 @@ defineExpose({ retry, estimateOpen });
       <!-- 订阅卡片（`09` §3.1）：每条订阅后面跟「上次评估 …」 -->
       <section class="border-b border-black/10 px-4 py-2 dark:border-white/10" data-test="macro-subscriptions">
         <p class="text-[11px] text-black/55 dark:text-white/55" data-test="macro-subscription-count">
-          {{ t('macro.card.enabledCount', { count: macro.enabledAssignments.length }) }}
+          {{ t('macro.card.enabledCount', { count: subscriptionCount }) }}
         </p>
         <ul class="mt-1 space-y-1">
           <li
-            v-for="a in macro.enabledAssignments"
-            :key="a.id"
+            v-for="card in subscriptionCards"
+            :key="card.key"
             class="flex items-center justify-between gap-2 text-sm"
             data-test="macro-subscription-card"
-            :data-assignment-id="a.id"
           >
-            <span class="min-w-0 truncate">{{ macro.templates.find((x) => x.id === a.templateId)?.name ?? '' }}</span>
+            <span class="min-w-0 truncate">{{ card.name }}</span>
             <span class="shrink-0 text-[11px] text-black/50 dark:text-white/50" data-test="macro-last-evaluated">
-              {{ t('macro.card.lastEvaluated', { at: lastEvaluatedText(a.id) }) }}
+              {{ t('macro.card.lastEvaluated', { at: cardLastText(card) }) }}
             </span>
           </li>
         </ul>
