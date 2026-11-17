@@ -49,7 +49,7 @@ worker 侧对上游的**全部**依赖面（D4'，再没有别的）：
 | 上游能力 | 导入路径 | 事实锚点（erix-agent v0.3.5 源码） |
 |---|---|---|
 | `runToolLoop` | `erix-agent` | 参数/返回值 typedef：`src/loop.js:562-626`；`termination` 取值集合：`src/loop.js:622` |
-| `TranscriptStore` 接口 | 接口约定 | 0.14.0 `appendRound` / `load` 必需；`saveRunSnapshot` / `loadLatestRunSnapshot`、`saveRunState` / `loadRunState`、`markRunState` 为可选分层能力；Station 以 `transcriptStoreContract` 验证 |
+| `TranscriptStore` 接口 | 接口约定 | 0.14.0 `appendRound` / `load` 必需；`saveRunState` / `loadRunState`、`markRunState` 为可选分层能力；Station 以 `transcriptStoreContract` 验证 |
 | 工具组装 | `erix-agent/tools` + 包根 | `createToolRegistry` / providers 从 tools 子路径导入；worker 从包根导入 provider / loop；notes 由包根 `createBuiltinNotesTools` 工厂装配；**文件工具（issue #228）= 上游 `createFileTools` 经本站 `createStationFileTools` 装配**（jail 谓词与调用方谓词相与；注册面 5 个工具），jail 仍由本站提供 |
 | 契约测试 | `erix-agent/contract-tests` | `transcriptStoreContract` / `modelConfigProviderContract` 验证宿主 adapter；`fileToolsContract`（28 项，上游 #184）验证本站 `createStationFileTools` 装配（`runner/test/file-tools-contract.test.js`，issue #228） |
 | 配置/凭据解析 | `erix-agent`（`config/*`） | `createJsonFileModelConfigProvider`（`~/.erix/config.json`，含占位 key + `endpoint=https://llm.<base>/v1`）为主；`createStaticModelConfigProvider` / `createEnvModelConfigProvider` / `resolveApiKey` / `apiKeyFile`（`src/config/api-key.js:9-30`）为上游能力，**H-B 下不使用 `apiKeyFile`/`resolveApiKey`**（容器内零 LLM 凭据，§11） |
@@ -57,7 +57,7 @@ worker 侧对上游的**全部**依赖面（D4'，再没有别的）：
 
 > **宿主组装的三个硬注意**（来自上游事实，worker 实现时必须遵守）：
 > 1. **多轮显式传 `task`**：本轮用户输入作为 `task` 字符串传入，否则 judge 拿旧种子当基准（`docs/host-upgrade-guide-v030.md` §1-2；`task > context.task > transcript 最后一条 user 文本`，`src/loop.js:597` typedef 注释）。
-> 2. **0.14.0 必需 store 方法仅两个**：`appendRound` + `load`。Station 另外成对暴露 `saveRunSnapshot` + `loadLatestRunSnapshot` 启用 crash-resume snapshot；写失败由 adapter retry，耗尽后抛 `checkpoint_failed`。`saveRunState` 与状态通道分开：snapshot 不包含顶层 `state`，`markRunState` 写 status。
+> 2. **0.14.0 必需 store 方法仅两个**：`appendRound` + `load`。Station **曾经**成对暴露 `saveRunSnapshot` + `loadLatestRunSnapshot`（**2026-11-17 已删，#640**）启用 crash-resume snapshot；写失败由 adapter retry，耗尽后抛 `checkpoint_failed`。`saveRunState` 与状态通道分开：snapshot 不包含顶层 `state`，`markRunState` 写 status。
 > 3. **judge 默认行为**：`maxRounds >= 16` 且未显式传 `reflection` 时 judge 自动开启（`src/loop.js:562` 注释）。worker 必须**显式传** `reflection` 配置（开/关/参数），不依赖默认值（host-upgrade-guide §0-1）——具体策略 ⚠️ 见 §15。
 
 ---
@@ -154,8 +154,8 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | U5 | `PUT /api/internal/runs/:id/transcript/rounds/:round` | store：`appendRound` | RoundRecord（含 `dedupKey`、`folded`、`messages`、`foldedPayload`） | `200 {inserted: bool}` | `UNIQUE(run_id, round)` + dedupKey（§9.3） |
 | U6 | `GET /api/internal/runs/:id/transcript` | store：`load` | — | `200 {records: [...]}` | 只读 |
 | U7 | `GET /api/internal/runs/:id/transcript/recall` | store：`recall` | query：`from_round` / `to_round` / `pattern` | `200 {text}` | 只读 |
-| U8 | `PUT /api/internal/runs/:id/checkpoint` | store：`saveRunSnapshot` | `{revision, snapshot}`（`revision` 单调 CAS；`seq` 仅为调用方本地元数据、不落库） | `200` / `409 checkpoint_stale`（旧 revision 被拒） | 单行覆盖写 + revision CAS（§9.5） |
-| U9 | `GET /api/internal/runs/:id/checkpoint/latest` | store：`loadLatestRunSnapshot` | — | `200 {checkpoint: {snapshot, revision, updated_at}}` / `204`（无） | 只读 |
+| ~~U8~~ | ~~`PUT /api/internal/runs/:id/checkpoint`~~ | ~~store：`saveRunSnapshot`~~ | **已退役（2026-11-17，#640）**：erix-agent 0.33.0 起引擎不再调用，端点与表一起删除；调用得 `404 not_found` | — | 恢复只靠账本 |
+| ~~U9~~ | ~~`GET /api/internal/runs/:id/checkpoint/latest`~~ | ~~store：`loadLatestRunSnapshot`~~ | **已退役（2026-11-17，#640）**，同上 ⇒ `404 not_found` | — | — |
 | U10 | `POST /api/internal/runs/:id/approvals` | 创建审批单 | `{tool_call_id, round, name, input_digest}` | `201 {approval_id}` | 一个工具调用至多一单（`approvals` `UNIQUE(run_id, tool_call_id)`，schema.sql） |
 | U11 | `GET /api/internal/approvals/:id` | 审批决定**轮询兜底** | — | `200 {status, decided_by?, decided_at?, note?}` | 只读 |
 | U12 | `POST /api/internal/runs/:id/release` | 主动放弃已领任务（准备工作失败 / worker 崩溃） | `{reason}` | `200`；portal 收敛：`runs.status='cancelling'` → queue `cancelled` + runs `finished`（aborted，A2）；否则 `attempts < max_attempts` → 回 `pending`（**attempts 不变**，A1）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)`（耗尽） | 重复 release 返回首次结果 |
@@ -281,7 +281,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | `worker_ready` | worker→agentd | `{pid}` | fork 后握手；agentd 收到后才发 `run_start` |
 | `run_start` | agentd→worker | `{run_id, session_id, attempt, task, cwd, project, model, resume, attachments, config: {model_config_path, reflection, wrapup}}` | worker 据此组装 `runToolLoop` 参数（§6.3；`config.json` 内为占位 key + `endpoint=https://llm.<base>/v1`，无独立 key 文件）；`cwd` = 项目目录 `~/projects/<project>`（D8 修订 2026-09-24 起，不再用 worktree）；`attempt` = 本次 start 次数（生成 `client_event_id`，§7.3）；`reflection`/`wrapup` 引擎策略由 portal 随 run_start 下发（§6.3-8 的载体） |
 | `event` | worker→agentd | `{run_id, client_event_id, type, ts, payload}` | 引擎回调透传（`onEvent` 8 类 / `onDelta` / `onReasoningDelta` / `onToolCall` / `onJudge`），**逐条即发**，批量在 agentd（§7.2）；`onUsage` **不产 IPC `event`**（仅喂 U2 终态载荷，§6.3-6）；`client_event_id` = `run_id:attempt:计数`（§7.3，重启/重领不碰撞） |
-| `store_request` | worker→agentd | `{req_id, method, args}` | `method ∈ appendRound/load/recall/markRunState/saveRunState/loadRunState/loadRunStateStatus/saveRunSnapshot/loadLatestRunSnapshot`；agentd 映射到 U2/U5-U9/runstate（§9.1），加 token 转发；`recall` 为 legacy 兼容，`loadRunStateStatus` 为宿主扩展 |
+| `store_request` | worker→agentd | `{req_id, method, args}` | `method ∈ appendRound/load/recall/markRunState/saveRunState/loadRunState/loadRunStateStatus`（`saveRunSnapshot` / `loadLatestRunSnapshot` 已于 #640 删除）；agentd 映射到 U2/U5-U9/runstate（§9.1），加 token 转发；`recall` 为 legacy 兼容，`loadRunStateStatus` 为宿主扩展 |
 | `store_response` | agentd→worker | `{req_id, ok, result?, error?: {code, message, retryable}}` | 对应 `store_request`；`ok:false` 时 worker 侧 adapter 按 §9.2 重试策略处理 |
 | `approval_request` | worker→agentd | `{req_id, run_id, tool_call_id, round, name, input_digest}` | `executeTool` 包装层发起；worker 挂起等待 |
 | `approval_decision` | agentd→worker | `{req_id, approval_id, decision: "approved"\|"denied", note?}` | resolve worker 的 await；超时/拒绝语义见 §10 |
@@ -424,7 +424,8 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 2. **机制复用**：现有 claim/lease/`claim_token`/`resume` 本就为 re-claim 设计（§4.2 ticket 已有 `resume`）；checkpoint 单行-per-run、`transcript_rounds` `UNIQUE(run_id, round)` 都以 run_id 为键，方案 B 无需跨 run 重映射。
 3. **容器崩溃场景天然是 B**：容器死时用户消息已在队列、无「用户新建 run」的机会窗口——必然仍要 re-claim 同一 run。方案 A 只在 worker 崩溃（agentd 存活）场景成立，两套恢复路径会分裂。
 
-**对 run snapshot 查询契约的影响（方案 B）**：`loadLatestRunSnapshot(run_id)` 恒按本 run_id 单行读；U9 返回 `revision`，resume 时 worker 续用 `revision+1` 起计（§9.5）。若决策者改选 A，需引入 `runs.resume_from_run_id`（源 run），U8/U9 按源 run 读写 snapshot、`load/recall` 按源 run 读 transcript——为 A 预留的列**本期不落 DDL**，仅记录改选 A 时的迁移路径。
+**对 run snapshot 查询契约的影响（方案 B）**：~~`loadLatestRunSnapshot(run_id)` 恒按本 run_id 单行读~~ ——
+**该方法与 U9 已于 2026-11-17 随 #640 退役**，此段仅存档方案 B 当年的推理；U9 返回 `revision`，resume 时 worker 续用 `revision+1` 起计（§9.5）。若决策者改选 A，需引入 `runs.resume_from_run_id`（源 run），U8/U9 按源 run 读写 snapshot、`load/recall` 按源 run 读 transcript——为 A 预留的列**本期不落 DDL**，仅记录改选 A 时的迁移路径。
 
 **对审计与 UI 的影响（方案 B）**：`run_queue.attempts` 每次 claim 递增；`audit_log` 记录 `run.claim` / `run.lease_superseded` / `run.attempt_exhausted`；UI 的 run 详情显示「第 N 次尝试」；`run_end` 事件 payload 带 `attempt`。**方案 B 的代价（A5 定稿）**：`runs.status` 在崩溃恢复期间**保持 `queued`/`running`**，**不**出现 `running ↔ failed(attempt)`——attempt 级失败只记 `run_queue.attempts` + `audit_log`，**不写 `runs.status='failed'`**；真正的 run 级终态 `failed` 仅由 `max_attempts` 耗尽（`max_attempts_exceeded`）或非重试性错误（`checkpoint_failed` 重试耗尽 / `rate_limited`，§9.2 / model.md §2.9）触发。
 
@@ -564,7 +565,7 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 >
 > batch ack 是「已受理」确认（对 durable 档 = 已落库），**不是「已推送到浏览器」确认**——SSE 推送是 portal 落库后的派生动作（portal.md §5）。
 
-**U2 终态提交 barrier**：agentd 在发送 U2 终态前必须满足：① 该 run 全部事件批已收到 `200`（batch ack 完成，含 spool 重传）；② 全部 store 调用（U5-U9）已完成。portal 端在 U2 终态事务内：置 runs 终态 + `run_queue → done` + 合成 `run_end` 事件（seq 最大）+ messages 回写 + usage_ledger。终态不可变；此后任何 U3/U5/U8/U10/state 写 → `409 run_terminal`（§4.5）——即终态是「不再接受事件/checkpoint」的硬屏障。`run_end` 事件 payload 带 `attempt`（供 UI 标注第几次尝试）。
+**U2 终态提交 barrier**：agentd 在发送 U2 终态前必须满足：① 该 run 全部事件批已收到 `200`（batch ack 完成，含 spool 重传）；② 全部 store 调用（U5–U7 + run-state；**U8/U9 已退役，#640**）已完成。portal 端在 U2 终态事务内：置 runs 终态 + `run_queue → done` + 合成 `run_end` 事件（seq 最大）+ messages 回写 + usage_ledger。终态不可变；此后任何 U3/U5/U10/state 写 → `409 run_terminal`（§4.5；U8 已退役，#640）——即终态是「不再接受事件/checkpoint」的硬屏障。`run_end` 事件 payload 带 `attempt`（供 UI 标注第几次尝试）。
 
 ---
 

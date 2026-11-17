@@ -21,7 +21,8 @@
 //   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:655-656`（runToolLoop 返回值 typedef；**按 0.29.0 现查**。
 //     0.18.0 时这块写在一行、位于 :511，0.19.0 起改成多行块，0.26.0 在 :490-491 ⇒ 防漂移测试的取值正则已同步）；
 //   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:1077-1081`，fail() 里
-//     「快照/markRunState 没落盘」时定值，并把 operation/phase/sideEffect 挂在 termination 上，
+//     「**transcript 账本 / run-state 写失败**」时定值 —— run snapshot 已于 2026-11-17 随 #640 退役、
+//     不再是成因；并把 operation/phase/sideEffect 挂在 termination 上，
 //     `orchestrator.js:1091` + `src/loop/termination.js:74` annotateTermination）；
 //   * 0.20.0 另有一处**只影响可达性**的变更（guide §4，上游 #282）：终局裁决处 `aborted` 压过
 //     `judge_done` / `final_guard_*` ⇒ 集合不变，但这三值在「用户点过停止」的 run 上不再可达。
