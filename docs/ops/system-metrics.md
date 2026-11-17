@@ -118,7 +118,7 @@ env 只在进程启动时读一次，改文件不重启是不生效的。
   `SYSTEM_METRICS_RETENTION_DAYS`，见 §7 的复评判据）。
 - 采样只读，零新挂载、零安全面改动：Docker 侧只用已在白名单里的 `/containers/json`；
   `stats`（1.02s/个）与 `/system/df`（15s）**不碰**——它们会把一拍的成本从毫秒级抬到秒级。
-- 迁移 `0042` 已应用；`docs/data/schema.sql` 是冻结件（baseline 不回写增量）。
+- 迁移 `0044` 已应用；`docs/data/schema.sql` 是冻结件（baseline 不回写增量）。
 
 ## 7. 为什么不用 Prometheus / Grafana（以及什么时候再谈）
 

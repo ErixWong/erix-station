@@ -580,9 +580,9 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 用例：`portal/test/macros.test.js`（幂等键、软删三分支、`until` 到期、四条枚举 CHECK）。
 
 
-### 1.34 `system_metrics` — 宿主资源指标的时序主表（issue #650，migration 0042）
+### 1.34 `system_metrics` — 宿主资源指标的时序主表（issue #650，migration 0044）
 
-> 同上：来自增量迁移 `0042-system-metrics.sql`；baseline `docs/data/schema.sql` 冻结、零字节不动。
+> 同上：来自增量迁移 `0044-system-metrics.sql`；baseline `docs/data/schema.sql` 冻结、零字节不动。
 > 要治的是「管理台没有任何宿主资源读面」：CPU / 内存 / 磁盘 / 容器数只能靠人 SSH 上机 `htop` + `docker ps`，
 > 症状是「FDE 变慢」而**平台自己不知道宿主是不是快满了**。API 形状见 `docs/api/portal.md` §4.18，
 > 运维动作（怎么关、怎么加盘）见 `docs/ops/system-metrics.md`。
@@ -634,7 +634,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 用例：`portal/test/system-metrics.test.js`；「全新库跑通 + 重放幂等」在 `portal/test/migrate-fresh-db.test.js`。
 
 
-### 1.35 `system_metrics_disks` — 同一拍里的逐盘行（issue #650，migration 0042）
+### 1.35 `system_metrics_disks` — 同一拍里的逐盘行（issue #650，migration 0044）
 
 **表用途**：一行 = **一块物理盘（一个文件系统）在一拍里的读数**。`sampled_at` 是 FK →
 `system_metrics (sampled_at)` 且 **`ON DELETE CASCADE`**（保留期清理只删主表，磁盘行跟着走 ⇒
@@ -987,4 +987,4 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | 16 | `max_attempts` 默认值与耗尽终态 | 默认 3；耗尽 → `failed(max_attempts_exceeded)` | §1.16/§2.8（已落 DDL） |
 | 17 | materializer outbox 复用 `route_outbox` vs 新增表 | ✅ 新增 `materialize_outbox` + `materialize_revisions`（A7，避免与路由 reconciler 争抢） | §1.22；user-space.md §7.1 |
 | 18 | `checkpoint_failed` 是否自动 re-claim | 不自动 re-claim（终态，人工重发；A3 定稿） | §2.9；portal.md §6.2 需同步提示口径 |
-| 19 | ⚠️ `system_metrics` / `system_metrics_disks` 用 `sampled_at`（`timestamptz`）当主键，**偏离 §3.4「主键一律 `VARCHAR(32)`」**（issue #650，migration 0042） | 保留偏离（自然键 = 采样时刻，天然幂等；`newId()` 只是每行 32 字节死重；理由全文见 §1.34）；若要回到规范是一次 additive 迁移 | §1.34–§1.35；`deploy/migrations/0042-system-metrics.sql` 头注同步标注 |
+| 19 | ⚠️ `system_metrics` / `system_metrics_disks` 用 `sampled_at`（`timestamptz`）当主键，**偏离 §3.4「主键一律 `VARCHAR(32)`」**（issue #650，migration 0044） | 保留偏离（自然键 = 采样时刻，天然幂等；`newId()` 只是每行 32 字节死重；理由全文见 §1.34）；若要回到规范是一次 additive 迁移 | §1.34–§1.35；`deploy/migrations/0044-system-metrics.sql` 头注同步标注 |
