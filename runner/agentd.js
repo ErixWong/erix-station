@@ -1285,6 +1285,14 @@ async function onWorkerFinished(ctx, msg) {
  * stop 路径（stop_request/stop_heartbeat，补报 aborted 的分支）。
  * 崩溃/lease_lost/revoke/resume 路径**不捕获**——run 还会继续，产物回收只发生在确认终态时。
  * best-effort：lib 内已全量兜底不抛出，失败仅 warn 日志，绝不得阻塞清场。
+ *
+ * issue #626（只读闸第四条旁路的排查结论）：**本函数不违反 review-only，故意不加闸**。
+ * 查清依据：`captureArtifact`（lib/artifacts.js:142）对 `cwd` 只做**读**——`git -C cwd diff HEAD`
+ * / `status --porcelain` / `readFileSync` 快照，不写不 checkout；落盘在 portal 侧
+ * `putRunArtifact`（portal/src/artifacts.js:65-103）写 `config.artifactsRoot/<runId>.tar.gz`，
+ * 默认 `/srv/erix/artifacts`（portal/src/config.js:309，portal 持久卷 bind mount），
+ * **不在用户空间**（不碰 `~/projects`）。⇒ 审查 run 上传产物 = 读 worktree + 写平台卷，
+ * 不弄脏用户目录，且产物本身就是审查要看的东西——跳过反而丢审查面。
  */
 async function captureRunArtifact(ctx) {
   const result = await captureAndUploadArtifact({
