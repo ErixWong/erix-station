@@ -54,6 +54,13 @@ import { collectAgentsMd, renderAgentsMdSection } from './lib/agents-md.js';
 // issue #595：能力市场的 L3 注入面——`~/.erix/capabilities.json` → 提示词末尾的「平台技能」段
 // + L2 的 `excludeSkillIds`（纯函数 + 可注入 fs，判据在 runner/test/capability-index.test.js）。
 import { buildCapabilityIndex } from './lib/capability-index.js';
+// issue #608：MCP 通道（网关工具 + direct 展开 + 进程组上报）。三个模块都是**可选能力**：
+// 装配失败只降级成「本次 run 无 MCP」，绝不允许把 run 打死（与 notes/skills 同口径）。
+import { createMcpPool } from './lib/mcp-client.js';
+import { createMcpTool } from './lib/mcp-tool.js';
+import {
+  loadMcpServers, createMcpConfigFetcher, createProcessReporter,
+} from './lib/mcp-servers.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
 // docs/host-consumer-contract.md §runToolLoop options 白名单含 system）——
@@ -122,6 +129,10 @@ const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，�
 4. 预计要跑比较久的命令（安装依赖、构建、跑测试、起 dev server）先把要做什么说出来，跑完再报结果；失败也要说清楚失败在哪一步、你接下来怎么绕过，不要把失败咽下去只给一个成功收尾。
 5. 播报是**进度**不是报告：一句话就够，不要为了播报而反复读同一个文件、也不要把它写成第二段交付摘要。`;
 
+// issue #608 §6.1：等 agentd 代取配置的上限。为什么必需：`ipcRequest` 本身无超时，
+// agentd 一旦卡住，worker 就永远停在「还没开始跑」——而那比「本次 run 没 MCP」严重得多。
+const MCP_CONFIG_TIMEOUT_MS = Number(process.env.ERIX_MCP_CONFIG_TIMEOUT_MS ?? 10_000);
+
 const nextReqId = createReqIdGenerator();
 let runStart = null;
 
@@ -153,6 +164,17 @@ process.on('message', (msg) => {
     case MSG.ABORT:
       if (abortController) abortController.abort();
       break;
+    // issue #608 §6.1：槽值只能由 agentd 代取（worker 环境里 `ERIX_STATION_TOKEN` 被删）。
+    // ⚠ 这里 resolve 的是**整条消息**而不是 `msg.result`：归一化在 `normalizeConfigResponse`
+    // 里做，它需要 `ok / servers / missing / error` 四个字段，只递 `result` 会丢掉降级信息。
+    case MSG.MCP_CONFIG_RESPONSE: {
+      const p = pendingStore.get(msg.req_id);
+      if (p) {
+        pendingStore.delete(msg.req_id);
+        p.resolve(msg);
+      }
+      break;
+    }
     case MSG.STEER_ARM:
       // 只装标记（见上面 steerArmed 的注释）。重复投递幂等；run 已结束时无 abortController 也无妨。
       steerArmed = true;
@@ -736,10 +758,85 @@ async function startRun(msg) {
     });
   }
   const skillToolNames = new Set(skillTools.tools.map((t) => t.name));
+  // issue #608 §6.2：MCP 装配。三个设计点：
+  //   ① **一次 run 只取一次配置**（§6.1）：槽值经 agentd 代理拿，不热更新；
+  //   ② 装配失败只降级：本段在 `runToolLoop` 之前，抛出去 = worker 死 = requeue（#451 F1b）；
+  //   ③ 不预先连接任何 server（§13 懒启动）：这里只是把声明组装成 client 造厂。
+  // reviewOnly 一律不给（§6.2 接线项）：审查快照的隔离靠「工具面没有能改外部世界的口」，
+  // 而 `mcp call` 能删仓库、能发 PR，正是那种口。
+  let mcpTool = null;
+  let mcpPool = null;
+  const mcpLog = (level, text, extra) => sendIpc(process, {
+    type: MSG.LOG, run_id: runId, level,
+    msg: extra && Object.keys(extra).length > 0
+      ? `${text} ${Object.entries(extra).map(([k, v]) => `${k}=${v}`).join(' ')}`
+      : text,
+  });
+  if (!reviewOnly) {
+    try {
+      const fetcher = createMcpConfigFetcher({
+        runId,
+        log: mcpLog,
+        // 给 IPC 一个上限：agentd 挂了不应让本 worker 永远停在「等配置」上。
+        request: () => Promise.race([
+          ipcRequest(MSG.MCP_CONFIG_REQUEST, { run_id: runId }),
+          new Promise((resolve) => setTimeout(() => resolve({
+            ok: false, error: 'mcp config request timed out',
+          }), MCP_CONFIG_TIMEOUT_MS).unref()),
+        ]),
+      });
+      const loaded = await loadMcpServers({
+        home: process.env.HOME || '/home/erix',
+        fetchConfig: () => fetcher.fetch(),
+        log: mcpLog,
+      });
+      // 没 server 也没缺槽 ⇒ 工具面逐字不变（一个只会回「没有可用 server」的
+      // 工具白占 schema 字节，还骗模型去试）。
+      if (loaded.servers.length > 0 || loaded.missing.length > 0) {
+        mcpPool = createMcpPool({
+          servers: loaded.servers,
+          missing: loaded.missing,
+          log: mcpLog,
+          runId,
+          // §6.8：spawn/exit 上报 pgid（与 shell 的 `SHELL_LIVENESS` 同族，绝不走 emitEvent）。
+          onProcess: createProcessReporter({ runId, send: (m) => sendIpc(process, m) }),
+        });
+        mcpTool = createMcpTool({
+          pool: mcpPool,
+          hidden: loaded.hidden,
+          log: mcpLog,
+          runId,
+          // §6.6 元数据回填：只上送给 agentd，portal 写库由它代发（worker 无 token）。
+          onToolsCache: (slug, tools) => sendIpc(process, {
+            type: MSG.MCP_TOOLS_CACHE, run_id: runId, req_id: nextReqId(), slug, tools,
+          }),
+        });
+      }
+      mcpLog('info', 'mcp assembled', {
+        status: loaded.status,
+        servers: loaded.servers.length,
+        missing: loaded.missing.length,
+        hidden: loaded.hidden.length,
+        rejected: loaded.rejected.length,
+        tools: mcpTool ? mcpTool.schemas.length : 0,
+      });
+    } catch (err) {
+      // 组装层已经兜住了失败；这里只是防「装配自己抛」（同 AGENTS.md/capabilities 冗余防线）。
+      mcpTool = null;
+      mcpPool = null;
+      mcpLog('warn', 'mcp unavailable, run continues without it', {
+        error: String(err?.message ?? err),
+      });
+    }
+  }
+  const mcpToolNames = new Set(mcpTool ? mcpTool.schemas.map((s) => s.name) : []);
   // issue #537 装配点②（baseToolSchemas，送给模型的面）：**必须与装配点①同口径**——只改一处等于没改。
   const baseToolSchemas = reviewOnly
     ? filterReviewSchemas(fileTools.schemas)
-    : [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
+    : [
+      ...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools,
+      ...(mcpTool ? mcpTool.schemas : []),
+    ];
   const noteToolNames = new Set(noteTools.schemas.map((s) => s.name));
   /** delegation 实例（开关关 ⇒ 恒 null；声明在 executeTool 之前，因为路由分支要读它）。 */
   let delegation = null;
@@ -769,6 +866,13 @@ async function startRun(msg) {
     // issue #537：审查 run 不给技能（宁严勿宽：技能可自带写/执行能力，与只读承诺相逆）。
     if (!reviewOnly && skillTools.executeTool && skillToolNames.has(options.name)) {
       return skillTools.executeTool(options.name, options.input);
+    }
+    // issue #608 §6.2/§6.7：MCP 工具（网关 `mcp` + `mcp__<server>__<tool>`）同为**独立分支**：
+    // registry 只吃纯 executors，而 MCP 要拿 run 的 `signal`（中止时必须取消 in-flight 请求），
+    // 那个 signal 只在引擎结构化 options 的顶层。`ctx.signal` 不能丢：丢了就是「用户点了停止，
+    // 第三方 server 还在跑」，与 #211 那条 shell 的老账同一个病。
+    if (!reviewOnly && mcpTool !== null && mcpToolNames.has(options.name)) {
+      return mcpTool.executeTool(options.name, options.input, { signal: options.signal, runId });
     }
     // issue #211：abort signal 必须转交。引擎契约把 run 的 signal 放在 executeTool 的**顶层**
     // options.signal（erix-agent 0.17.0 orchestrator.js:324 声明 + run-snapshot-executor.js:237
@@ -1326,6 +1430,20 @@ async function startRun(msg) {
         sendIpc(process, {
           type: MSG.LOG, run_id: runId, level: 'warn',
           msg: `notes onRunComplete failed: ${String(err?.message ?? err)}`,
+        });
+      }
+    }
+    // issue #608 §6.8：MCP server 子进程收尾（`stdin.end → SIGTERM → 200ms → SIGKILL`）。
+    // ⚠ 本 `finally` **盖不到 watchdog 的 SIGKILL**（那时 worker 根本没跑 handler）⇒ 真正的
+    // 兜底是 agentd 侧的 `ctx.mcpPgids`（#288 同款），这里只负责正常路径不残留。
+    // 失败只记日志：收尾错误不得覆盖 run 主错误（同 notes `onRunComplete` 的口径）。
+    if (mcpPool !== null) {
+      try {
+        await mcpPool.closeAll();
+      } catch (err) {
+        sendIpc(process, {
+          type: MSG.LOG, run_id: runId, level: 'warn',
+          msg: `mcp closeAll failed: ${String(err?.message ?? err)}`,
         });
       }
     }
