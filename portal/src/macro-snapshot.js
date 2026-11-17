@@ -367,8 +367,12 @@ export function copyUntracked(repoDir, worktreePath, { hasRsync = detectRsync() 
  *
  * ⚠ 已知局限（不属本单范围，仅记录）：
  *   1. 整树拷贝不是 `git worktree`，所以不会出现在 `git worktree list` 里 ⇒
- *      `cleanOrphanWorktrees` 看**不到**它（进不了一次跨进程崩溃的孤儿清扫）；
+ *      `cleanOrphanWorktrees` 看**不到**它（它只从 `git worktree list` 取候选）。
  *      本进程内的 `cleanup()` 靠 `fs.rmSync` 仍能清掉（见 `removeWorktree`）。
+ *      ⚠ 迨今 `cleanOrphanWorktrees` **还没有生产调用点**（W4a 只交了机制），所以两条搬运路
+ *      现在都不会自动回收；**接线时若只抓 `worktree list`，0 提交快照就永不回收（磁盘只涨
+ *      不跌）** ⇒ 接线时要么改成「另外扫 snapshotRoot 下的目录」，要么给整树拷贝留一个可枚举
+ *      的台账（本单不做，免得把 #670 的范围撑大）。
  *   2. 若 `repoDir` 本身是个 linked worktree（`.git` 是个**文件**而非目录），拷过去的 `.git`
  *      会指向不存在的 gitdir ⇒ 快照里的 git 命令会失败，表现为比对报错而不是静默错数据。
  *
