@@ -444,9 +444,10 @@ try {
   const hostOf = (port) => `${fdeName}-p-${port}.${baseDomain}`;
   const urlOf = (port) => `http://${hostOf(port)}:18090`;
   const ports = Array.from({ length: 10 }, (_, i) => 22000 + i);
-  const entry = (port, over = {}) => ({ scope: 'fde', port, role: 'spare', run_id: null, url: urlOf(port), exposure: 'private', state: 'allocated', ...over });
+  // schema 2（#361）：清单侧只载分配事实 `{port,url,in_use}` —— scope/role/exposure/state/run_id 已被产品剃除
+  const entry = (port, over = {}) => ({ port, url: urlOf(port), in_use: null, ...over });
   const row = (port, over = {}) => ({ port, hostname: hostOf(port), url: urlOf(port), scope: 'fde', role: 'spare', exposure: 'private', state: 'allocated', run_id: null, ...over });
-  const jsonOf = (list, over = {}) => ({ schema: 1, fde: fdeName, generation: 7, allocations: list, ...over });
+  const jsonOf = (list, over = {}) => ({ schema: 2, fde: fdeName, generation: 7, block: list.length ? { start: Number(list[0].port), end: Number(list.at(-1).port) } : null, allocations: list, ...over });
   const goodJson = jsonOf(ports.map((p) => entry(p)));
   const goodRows = ports.map((p) => row(p));
   const run = (portsJson, dbRows) => reconcilePortsJsonWithDb({ portsJson, dbRows, fdeName, baseDomain, publicBaseUrl }).problems;
@@ -459,10 +460,11 @@ try {
     ['清单少一条（块没发满）', jsonOf(goodJson.allocations.slice(0, 9)), goodRows],
     ['generation 不是数值', jsonOf(goodJson.allocations, { generation: '7' }), goodRows],
     ['fde 字段指向别人', jsonOf(goodJson.allocations, { fde: 'someoneelse' }), goodRows],
-    ['schema 不是 1', jsonOf(goodJson.allocations, { schema: 2 }), goodRows],
+    ['schema 不是 2（#361 只载分配事实）', jsonOf(goodJson.allocations, { schema: 1 }), goodRows],
     ['scope 退回 run 级（0019 前的形态）', goodJson, goodRows.map((r, i) => (i === 0 ? { ...r, scope: 'run' } : r))],
     ['DB 活行里混进 released（清单没跟上）', goodJson, goodRows.map((r, i) => (i === 3 ? { ...r, state: 'released' } : r))],
-    ['json 与 DB 状态不一致', jsonOf(goodJson.allocations.map((e, i) => (i === 1 ? { ...e, state: 'active' } : e))), goodRows],
+    ['清单里混回已剃除字段（state）', jsonOf(goodJson.allocations.map((e, i) => (i === 1 ? { ...e, state: 'active' } : e))), goodRows],
+    ['清单条目缺 url', jsonOf(goodJson.allocations.map((e, i) => (i === 2 ? { port: e.port, in_use: null } : e))), goodRows],
     ['清单里的 url 端口不是公开入口的端口', goodJson, goodRows.map((r) => ({ ...r, url: r.url.replace(':18090', ':8090') }))],
     ['hostname 前缀不是该 FDE', goodJson, goodRows.map((r) => ({ ...r, hostname: r.hostname.replace(fdeName, 'otherfde') }))],
     ['端口在号池外（旧 4000–4009 时代）', jsonOf([4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009].map((p) => entry(p))),

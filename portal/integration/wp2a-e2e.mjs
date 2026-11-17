@@ -218,7 +218,10 @@ function curl({ url, host = null, headers = [], args = '', out = 'resp' }) {
   const bodyFile = path.join(S.artifactsRoot, `${out}.body`);
   const hostArg = host ? `-H ${JSON.stringify(`Host: ${host}`)} ` : '';
   const headerArgs = headers.map((h) => `-H ${JSON.stringify(h)} `).join('');
-  const cmd = `curl -s -D ${JSON.stringify(headerFile)} -o ${JSON.stringify(bodyFile)} -w '%{http_code}' ${hostArg}${headerArgs}${args} ${JSON.stringify(url)}`;
+  // `--ipv4`：本机把 `*.localhost` 解析成 `::1`（RFC 6761 的 glibc 行为），而隔离栈的
+  // Traefik / FDE 代理只监听 IPv4 ⇒ 不加这一条，「无票直连」那条等待会**超时**（261117 实测：
+  // 段 ⑥ 卡 30s 后红，其余段全绿）。强制 IPv4 才打到真实端口上。
+  const cmd = `curl -s --ipv4 -D ${JSON.stringify(headerFile)} -o ${JSON.stringify(bodyFile)} -w '%{http_code}' ${hostArg}${headerArgs}${args} ${JSON.stringify(url)}`;
   const status = execSync(cmd, { encoding: 'utf8', stdio: 'pipe' }).trim();
   const headersText = fs.existsSync(headerFile) ? fs.readFileSync(headerFile, 'utf8') : '';
   const body = fs.existsSync(bodyFile) ? fs.readFileSync(bodyFile, 'utf8') : '';
