@@ -717,7 +717,7 @@ export const en = {
     backToWorkbench: '← Back to workbench',
     reload: 'Reload',
     loading: 'Loading the market catalogue…',
-    empty: 'No published capability packages yet.',
+    empty: 'No published entries yet (skill packages or MCP servers).',
     intro: 'Published skill packages and MCP servers. Install one into your FDE workspace; ' +
       'only enabled ones reach the model tool surface.',
     budgetHint: 'Every enabled skill ships all of its tools into every single turn:' +
