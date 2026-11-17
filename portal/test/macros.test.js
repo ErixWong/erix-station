@@ -36,6 +36,8 @@ import {
   listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate,
   listAssignments, assignTemplate, unassignTemplate, applyExpiredAssignments,
   claimMacroRun, finishMacroRun, listMacroRuns,
+  // #625：默认值/必填闸的两面——服务端补齐（`validateKindParams`）与契约真源（`KIND_SCHEMA`）。
+  validateKindParams, KIND_SCHEMA,
 } from '../src/macros.js';
 import { createNotification } from '../src/notifications.js'; // #526：软删判定接真表后，本文件要能写通知行
 
@@ -48,6 +50,14 @@ const fixture = URL_VALUE ? createPgFixture(URL_VALUE, { prefix: 'w524' }) : nul
 
 /** 夹具包一层：用例体只拿 pool（`withFreshDatabase` 跑完整链：baseline → bootstrap → 全部增量含 0035）。 */
 const withFreshDb = (fn) => fixture.withFreshDatabase(({ pool }) => fn(pool), { log: () => {} });
+
+/**
+ * #625：`scheduled-task` 的必填参数（契约 §1：`at`/`cwd`/`task` 都是 `required: true`）。
+ * 以前 `validateKindParams` 对缺字段 `continue` ⇒ 夹具给 `params: {}` 也建得成；
+ * 现在缺任一个就 400 ⇒ 所有 `scheduled-task` 夹具必须带齐（可缺的 `maxRounds`/`jitter`
+ * 故意不带，用来验「服务端会补契约默认值」）。
+ */
+const SCHEDULED_PARAMS = Object.freeze({ at: '09:00', cwd: '/p', task: 't' });
 
 /** 建一个能过 FK 的最小场景：user → project → session。id 由 UUIDv4 给（不 cwd 派生，同 runs.id 红线）。 */
 async function seedScene(pool, tag) {
@@ -264,7 +274,9 @@ test('#524 软删三分支（07 §2.3）：零引用物理删 / 只有订阅级�
       '零引用必须物理删，不留 deleted_at 的僵尸行');
 
     // ── 分支二：只有订阅、无执行记录 ⇒ 物理删 + 级联删订阅
-    const t2 = await createTemplate(pool, { kind: 'scheduled-task', name: '只有订阅', scope: 'user' });
+    const t2 = await createTemplate(pool, {
+      kind: 'scheduled-task', name: '只有订阅', scope: 'user', params: SCHEDULED_PARAMS,
+    });
     const a2 = await assignTemplate(pool, { templateId: t2.id, userId });
     const r2 = await deleteTemplate(pool, { templateId: t2.id });
     assert.equal(r2.mode, 'deleted_with_assignments');
@@ -321,7 +333,9 @@ test('#524 until 到期 ⇒ enabled=false（红线③的 DB 那一半；到期�
   await withFreshDb(async (pool) => {
     const { userId, sessionId } = await seedScene(pool, 'a3');
     const sessionTpl = await createTemplate(pool, { kind: 'run-notify', name: '临时开一小时', scope: 'session' });
-    const userTpl = await createTemplate(pool, { kind: 'scheduled-task', name: '临时开一小时（全局）', scope: 'user' });
+    const userTpl = await createTemplate(pool, {
+      kind: 'scheduled-task', name: '临时开一小时（全局）', scope: 'user', params: SCHEDULED_PARAMS,
+    });
 
     const live = await assignTemplate(pool, {
       templateId: sessionTpl.id, userId, sessionId, until: new Date(Date.now() + 3600_000),
@@ -402,7 +416,9 @@ test('#524 枚举 CHECK 拒绝非法值：kind / status / criterion / skipped_re
 test('#524 订阅形状：NULLS NOT DISTINCT 挡重复订阅 / scope 决定 session_id / admin 受众 / 取消订阅两分支', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     const { userId, sessionId } = await seedScene(pool, 'a5');
-    const userScope = await createTemplate(pool, { kind: 'scheduled-task', name: '每天早上', scope: 'user' });
+    const userScope = await createTemplate(pool, {
+      kind: 'scheduled-task', name: '每天早上', scope: 'user', params: SCHEDULED_PARAMS,
+    });
     const first = await assignTemplate(pool, { templateId: userScope.id, userId });
     const again = await assignTemplate(pool, { templateId: userScope.id, userId });
     assert.equal(again.id, first.id,
@@ -519,7 +535,8 @@ test('#524 订阅形状：NULLS NOT DISTINCT 挡重复订阅 / scope 决定 sess
         kind: 'scheduled-task', name: 'x', scope: 'session',
         params: { at: '09:00', cwd: '/p', task: 't', maxRounds: 4 },
       }), 'scheduled-task 只能 scope=user');
-      // params 按 kind schema：缺字段不算错，但**多字段/错值**必须拦
+      // params 按 kind schema：**缺必填**（#625，如 `scheduled-task` 缺 `at`）、
+      // **多字段/错值**都要拦；可缺字段缺了 ⇒ 服务端补契约默认值（不报错，见 #625 那组用例）。
       await assertMacroError('validation_failed', () => createTemplate(pool, {
         kind: 'run-notify', name: 'x', scope: 'session', params: { tone: 'brief' },
       }), 'run-notify 不认识 tone');
@@ -570,3 +587,92 @@ test('#524 订阅形状：NULLS NOT DISTINCT 挡重复订阅 / scope 决定 sess
       assert.equal((await finishMacroRun(pool, { macroRunId: run.id, status: 'done', verdict: 'pass' })).status, 'done');
     });
   });
+
+// ── #625：`KIND_SCHEMA` 的 `default` / `required` 必须真的生效（契约 §1）────────────
+// 起因：schema 里只有 type/values/min/max，于是
+//   ① `validateKindParams` 对缺字段 `continue` ⇒ 能建出**没有 `at`** 的 `scheduled-task`
+//      （永不触发、静默死），界面还显示 Enabled；
+//   ② 前端只能用通用规则猜默认值 ⇒ `run-notify` 建出来 `states: []`（**永远不会通知**）。
+// 这三条用例钉的就是「缺必填要 400」与「可缺字段由**服务端**补契约默认值（API 直连也拿到）」。
+
+test('#625 建 scheduled-task 缺 at/cwd/task 任一 ⇒ validation_failed 400（旧行为：静默建成永不触发的模板）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    await seedScene(pool, 'd1');
+    for (const missing of ['at', 'cwd', 'task']) {
+      const params = { ...SCHEDULED_PARAMS };
+      delete params[missing];
+      const err = await assertMacroError('validation_failed', () => createTemplate(pool, {
+        kind: 'scheduled-task', name: `缺-${missing}`, scope: 'user', params,
+      }), `缺 ${missing} 必须拦`);
+      assert.equal(err.httpStatus, 400, `缺 ${missing} 要回 400（路由靠 httpStatus 映射）`);
+      assert.equal(err.details?.field, `params.${missing}`, 'details 要指到具体字段，前端才标得红');
+    }
+    // ⚠ 反向自证：把 `at` 的 `required: true` 从 KIND_SCHEMA 去掉 ⇒ 第一条不再抛 ⇒ 本条红。
+    assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM macro_templates')).rows[0].n, 0,
+      '报错的模板不许留下半行（不是"抛了但还是写进去"）');
+  });
+});
+
+test('#625 建 scheduled-task 只给三个必填 ⇒ 响应与库里都是契约默认值（maxRounds=16 / jitter=10m）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    await seedScene(pool, 'd2');
+    const t = await createTemplate(pool, {
+      kind: 'scheduled-task', name: '只给必填', scope: 'user', params: SCHEDULED_PARAMS,
+    });
+    const EXPECT = { at: '09:00', cwd: '/p', task: 't', maxRounds: 16, jitter: '10m' };
+    assert.deepEqual(t.params, EXPECT, '响应必须带补齐的默认值（前端不再自己猜）');
+    assert.deepEqual(
+      (await pool.query('SELECT params FROM macro_templates WHERE id = $1', [t.id])).rows[0].params,
+      EXPECT, '默认值必须**落库**（validateKindParams 的返回值不写库 = 补了又丢）');
+  });
+});
+
+test('#625 建 run-notify 不给 states ⇒ 契约那五个默认值，不是 []（[] 永不通知却显示 Enabled）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    await seedScene(pool, 'd3');
+    const t = await createTemplate(pool, {
+      kind: 'run-notify', name: '全默认', scope: 'session', params: {},
+    });
+    assert.deepEqual(t.params.states,
+      ['failed', 'capped', 'aborted', 'persistence_failed', 'guard_unverified'],
+      'states 必须是契约 §1 的默认集合（**不是** 空数组）');
+    assert.equal(t.params.channel, 'site', 'channel 也要补上（enum 的唯一取值）');
+    // ⚠ 反向自证：把 states 的 `default` 从 KIND_SCHEMA 去掉 ⇒ states 根本不在 params 里 ⇒ 本条红。
+    // 默认值还必须是**拷贝**：否则调用方一 push 就改到共享的 schema 常量上（跨请求串味）。
+    const p = validateKindParams('run-notify', {});
+    p.states.push('completed');
+    assert.deepEqual(KIND_SCHEMA['run-notify'].states.default,
+      ['failed', 'capped', 'aborted', 'persistence_failed', 'guard_unverified'],
+      'schema 的默认值数组不许被调用方改到（必须每次拷一份）');
+  });
+});
+
+test('#625 updateTemplate 也补默认值，且缺必填的 patch 一样 400', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    await seedScene(pool, 'd4');
+    const t = await createTemplate(pool, {
+      kind: 'run-review', name: '审查', scope: 'session', params: { max_rounds: 3 },
+    });
+    assert.deepEqual(t.params, { max_rounds: 3, review_depth: 1, on_fail: 'reflow' },
+      '显式写的 3 不许被默认值 8 覆盖；没写的可缺字段才补');
+    // patch 里没写的可缺字段 ⇒ 按契约补齐；显式值原样保留
+    const patched = await updateTemplate(pool, {
+      templateId: t.id, patch: { params: { max_rounds: 5 } },
+    });
+    assert.deepEqual(patched.params, { max_rounds: 5, review_depth: 1, on_fail: 'reflow' });
+    // patch 缺必填（scheduled-task 少 task）⇒ 同样 400，不许"只改一半"写进去
+    const st = await createTemplate(pool, {
+      kind: 'scheduled-task', name: '必填闸', scope: 'user', params: SCHEDULED_PARAMS,
+    });
+    const bad = { at: '10:00', cwd: '/p' };
+    await assertMacroError('validation_failed',
+      () => updateTemplate(pool, { templateId: st.id, patch: { params: bad } }));
+    assert.deepEqual(
+      (await pool.query('SELECT params FROM macro_templates WHERE id = $1', [st.id])).rows[0].params,
+      { ...SCHEDULED_PARAMS, maxRounds: 16, jitter: '10m' },
+      '失败的 patch 不许动库里的 params');
+  });
+});
