@@ -190,11 +190,328 @@ function matchBrackets(masked, from) {
 }
 
 /**
- * 建「这个名字能解析出哪些 env 名」的表。**必须按形状分优先级多趟建**，因为绑定会互相引用
+ * 同上，但**也认 `(`**（解构里的 `(…)` 当成分组用，见 `paramBindingsIn`）。
+ * 单独一个函数而不是放宽 `matchBrackets`：那边是数据表扫描，`const T = (x)` 那种根本不该当表。
+ */
+function matchGroup(masked, from) {
+  const open = masked[from];
+  const close = { '{': '}', '[': ']', '(': ')' }[open];
+  if (!close) return null;
+  let depth = 0;
+  for (let i = from; i < masked.length; i += 1) {
+    if (masked[i] === open) depth += 1;
+    else if (masked[i] === close) { depth -= 1; if (depth === 0) return i + 1; }
+  }
+  return null;
+}
+
+/** 这些词之后的 `(...)` 是**控制流头部**，不是参数表（`for (const [k, v] of [[…]])` 那一形最容易误判）。 */
+const CONTROL_WORDS = new Set([
+  'if', 'for', 'while', 'switch', 'catch', 'with', 'do', 'else', 'return', 'typeof',
+  'void', 'delete', 'new', 'case', 'await', 'yield', 'in', 'of',
+]);
+
+/** 全量括号配对（在 structuralMask 上跑）：`open → close`（不含）。串正文/注释/正则正文已抹平 ⇒ 内容骗不到结构。 */
+function bracketPairs(masked) {
+  const OPEN = { '(': ')', '[': ']', '{': '}' };
+  const CLOSE = { ')': '(', ']': '[', '}': '{' };
+  const pairs = new Map();
+  const stack = [];
+  for (let i = 0; i < masked.length; i += 1) {
+    const c = masked[i];
+    if (OPEN[c]) stack.push([c, i]);
+    else if (CLOSE[c]) {
+      const top = stack.pop();
+      if (top && top[0] === CLOSE[c]) pairs.set(top[1], i + 1);
+    }
+  }
+  return pairs;
+}
+
+/** 「最内层 `{}` 作用域」查询（= 那一层的**语句区**）。顶层 ⇒ `{whole:true, start:0, end:len}`。 */
+function braceScopes(masked, pairs) {
+  const braces = [...pairs].filter(([o]) => masked[o] === '{').sort((a, b) => a[0] - b[0]);
+  return (offset) => {
+    let best = null;
+    for (const [o, c] of braces) {
+      if (o >= offset) break;
+      if (offset < c) best = [o, c];        // 升序 ⇒ 最后命中的那对就是最内层
+    }
+    return best ? { start: best[0], end: best[1], whole: false } : { start: 0, end: masked.length, whole: true };
+  };
+}
+
+/** 顶层逗号切分（`masked` 上深度 0 的 `,` 才算分隔 ⇒ `f(a, {b: 1}, [c, d])` 切得对）。 */
+function splitTop(masked, from, to) {
+  const parts = [];
+  let depth = 0;
+  let start = from;
+  for (let i = from; i < to; i += 1) {
+    const c = masked[i];
+    if (c === '(' || c === '[' || c === '{') depth += 1;
+    else if (c === ')' || c === ']' || c === '}') depth -= 1;
+    else if (c === ',' && depth === 0) { parts.push([start, i]); start = i + 1; }
+  }
+  parts.push([start, to]);
+  return parts.filter(([a, b]) => masked.slice(a, b).trim() !== '');
+}
+
+/** 从 `from` 起第一个**非空白**字符的下标；没有 ⇒ `null`。 */
+function nextNonSpace(text, from) {
+  const m = /\S/.exec(text.slice(from));
+  return m ? from + m.index : null;
+}
+
+/** `[from, to)` 里第一个**非空白**下标（**不越过 `to`**：解构切出来的片段是空的就要如实返回 `null`）。 */
+function firstNonSpaceIn(text, from, to) {
+  const m = /\S/.exec(text.slice(from, to));
+  return m ? from + m.index : null;
+}
+
+/** 在 `[from, to)` 里找第一个**括号深度 0** 且满足 `want` 的字符；没有 ⇒ `-1`。 */
+function firstTopChar(masked, from, to, want) {
+  let depth = 0;
+  for (let i = from; i < to; i += 1) {
+    const c = masked[i];
+    if (c === '(' || c === '[' || c === '{') depth += 1;
+    else if (c === ')' || c === ']' || c === '}') depth -= 1;
+    else if (depth === 0 && want(c, i)) return i;
+  }
+  return -1;
+}
+
+/**
+ * 绑定模式片段里第一个**顶层默认值分界 `=`**；没有 ⇒ `-1`。
+ * 括号内的不算（`{ a: [1, 2] }` 里没默认值）；`=>`（默认值是个箭头）、`==` / `!=` / `<=` / `>=`
+ * 那些比较号也不算（认错了会把半个表达式当成绑定名）。
+ */
+function firstDefaultEq(masked, from, to) {
+  return firstTopChar(masked, from, to, (c, i) => c === '='
+    && !'>='.includes(masked[i + 1] ?? '') && !'=!<>'.includes(masked[i - 1] ?? ''));
+}
+
+/** 对象成员「`键 : 绑定目标`」的分界（同样只认深度 0；`{ 'a:b': x }` 那个冒号在串正文里，已被抹平）。 */
+function firstMemberColon(masked, from, to) {
+  return firstTopChar(masked, from, to, (c) => c === ':');
+}
+
+/**
+ * 一段**认不出**的绑定片段里出现过哪些名字 —— fail loudly 的记账面（#587 族 A 三轮①）。
+ * 认不出的形状不能静默返回「没绑定」：那等于让外层同名常量继续生效 = 幻影 key。这里把片段里
+ * 像名字的都算作「被绑定但解析不出值」，宁可是**假红**（读形进 `unsupported`）也不要静默放行。
+ * 排掉两类明显不是绑定的位置：`.` / `?.` 之后的属性名，以及紧跟 `:` 的**键名**（`{ k: x }` 里的 `k`）。
+ */
+function opaqueBindingNames(masked, from, to) {
+  const names = new Set();
+  const slice = masked.slice(from, to);
+  for (const m of slice.matchAll(new RegExp(IDENT_RE, 'g'))) {
+    const i = m.index;
+    const prev = slice[i - 1];
+    if (prev === '.' || prev === '?') continue;                       // `b.c` / `b?.c` 的 `c`
+    const after = slice.slice(i + m[0].length);
+    if (/^\s*:/.test(after)) continue;                                // `{ k: x }` 的键名 `k`
+    names.add(m[0]);
+  }
+  return [...names];
+}
+
+
+/** 能**结束**一个表达式的字符（ASI 判定用：`x\n const y` 才断，`(\n x` / `x +\n y` 那种没成形的不断）。 */
+const EXPRESSION_ENDS_RE = /[\w$)\]}'"`]/;
+
+/**
+ * 换行之后**能**接着上一行表达式的开头（⇒ ASI **不**插分号 ⇒ 表达式体还要往下延伸）：
+ * 运算符 / 成员访问 `.` `?.` / 调用 `(` / 下标 `[` / 模板续写（反引号），以及 `in` / `of` /
+ * `instanceof` 这三个「看着像新语句、其实接在上一行」的词（把它们当边界会把遮蔽算窄 = 错记，静默）。
+ *
+ * **反过来才是主方向**（#587 族 A 三轮②）：下一行以普通标识符 / 数字 / 声明关键字开头 ⇒ 那个换行
+ * 必然插分号 ⇒ 体到此为止。旧口径**只列了「哪些词算边界」**（`STATEMENT_HEAD_RE`），于是
+ * `const f = (KEY) => env[KEY]\nprocess.env[KEY];` 里下一行以 `process` 开头不算边界 ⇒ 遮蔽拉到文件尾
+ * ⇒ 箭头**之后**那条读外层常量的静态读形被误判成动态 = **假红**（那个 key 从三腿判据里隐形）。
+ * 两头都要成立：只把「不可能续行」的开头当边界，`a\n .b(K)` / 跨行三元 / 跨行 `??` 必须仍全覆盖
+ * （区间算窄过头 = 体后半段那些动态读又会被错记成外层静态名 = 回到假绿）。
+ */
+const EXPRESSION_CONTINUATION_RE = /^(?:[.?([+*/%<>=!&|^,;:~`-]|\*\*|=>|\?\?|in\b|of\b|instanceof\b)/;
+
+/**
+ * **无花括号箭头**（表达式体）的区间结尾，从 `=>` 之后第一个下标起算：扫到第一个「深度 0 的结束符」
+ * （`;` `,` `)` `]` `}`）或 ASI 语句边界为止。
+ *
+ * 旧口径取「最内层**外围块**的结尾」（`{` 都没写，没配对 ⇒ 保守拉宽），后果是实测的**假红**：
+ * `const g = (KEY) => env[KEY]; … process.env[KEY]` —— 箭头**之后**那次读的是外层常量，却被算进
+ * 箭头参数的遮蔽区间 ⇒ 静态读形被判成动态 ⇒ 进 `unsupported`（三腿判据看不见这个 key，另一种静默）。
+ * 拉窄的边界必须**仍覆盖整个表达式体**：体内不可能出现深度 0 的 `;` `,` `)` `]` `}`（那些符号一出现
+ * 就说明表达式已经结束），所以这一趟扫描只会停在真正的体尾。
+ *
+ * ASI 那一跳要看**原文**（`code`）而不是掩码：串正文被抹成空格后，`a\n 'x'` 那种「下一行以串开头」
+ * 会被 `nextNonSpace(masked, …)` 跳到串后面去，误认成续行。`code` 与 `masked` 等长、坐标同一套。
+ */
+function expressionBodyEnd(code, masked, from) {
+  let depth = 0;
+  let last = '';
+  for (let i = from; i < masked.length; i += 1) {
+    const c = masked[i];
+    if (c === '(' || c === '[' || c === '{') { depth += 1; last = c; continue; }
+    if (c === ')' || c === ']' || c === '}') { if (depth === 0) return i; depth -= 1; last = c; continue; }
+    if (depth === 0 && (c === ';' || c === ',')) return i;
+    if (depth === 0 && c === '\n' && EXPRESSION_ENDS_RE.test(last)) {
+      const nx = nextNonSpace(code, i + 1);
+      // 下一行没东西了（文件尾）也算边界；否则只有「能续行」的开头才让体继续下去。
+      if (nx == null || !EXPRESSION_CONTINUATION_RE.test(code.slice(nx))) return i;
+    }
+    if (!/\s/.test(c)) last = c;
+  }
+  return masked.length;
+}
+
+
+/** 无括号的单参数箭头 `KEY => …`：`KEY` 之前不许是标识符字符或闭合括号（挡掉 `(KEY) =>` 那种已有括号的形）。 */
+const BARE_ARROW_PARAM_RE = new RegExp(`(?<![\\w$)\\]}])(${IDENT_RE})\\s*=>`, 'g');
+
+/**
+ * 一段**参数位 / 解构成员位**里有哪几个绑定：`{ bindings: [{ name, at, def|null }], unparsed: [{ at, to }] }`。
+ * 逐层递归，要覆盖合法 JS 的全部绑定形状（#587 族 A 三轮①：旧口径只解一层，`{ a: { b: KEY } }` /
+ * `{ a: [KEY] }` 这类「冒号右边还是解构」的成员**整个漏收** ⇒ `KEY` 不进遮蔽表 ⇒ 外层同名常量把
+ * 动态读错记成静态 key、`unsupported` 为空 = 假绿）：
+ *   · 简单名 `a`、带默认值 `a = 'ERIX_X'`、rest `...rest`（rest 的目标继续递归：`...[b, c]`）
+ *   · 数组解构 `[a, , b]`（洞不是绑定）、嵌套 `[{ x: Y }]`、`[a, ...[b, c]]`
+ *   · 对象解构 `{ k }` / `{ k = X }` / `{ old: alias = X }` / `{ 'a b': alias }` / `{ [k]: alias }`
+ *     ⇒ 冒号**右边**才是绑定；右边还是解构（`{ a: { b: X } }`）就继续往里钻
+ *   · 模式自带的默认值 `{ a: b } = {}`：那个默认值属于**整个模式**而不是 `b` 的绑定值
+ *     ⇒ 往里钻时不带上它（带上去就把「整个对象」当成了 `b` 的值，解析方向不对）
+ * **认不出的形状一律进 `unparsed`**（调用方据此 fail loudly），不许静默返回「这里没绑定」：
+ * 静默 = 外层同名常量继续生效 = 幻影 key（与上面那个假绿同形）。
+ * `memberIsObject` 只在**对象解构的成员位**为真（那里才有 `键:` 前缀可剥）；数组成员与参数位本身不是。
+ */
+function paramBindingsIn(masked, code, from, to, memberIsObject = false) {
+  const bindings = [];
+  const unparsed = [];
+  const walk = (a, b, isObjectMember) => {
+    const s = firstNonSpaceIn(masked, a, b);
+    if (s == null) return;                                  // 空片段（数组的洞 `,`）⇒ 没有绑定
+    if (masked.startsWith('...', s)) { walk(s + 3, b, false); return; }   // rest：剩下的就是绑定目标
+    const eq = firstDefaultEq(masked, s, b);
+    const patEnd = eq < 0 ? b : eq;                         // 默认值分界**之前**才是模式
+    const def = eq < 0 ? null : code.slice(eq + 1, b).trim();
+    const p = firstNonSpaceIn(masked, s, patEnd);
+    const open = p == null ? '' : masked[p];
+    if (open === '{' || open === '[' || open === '(') {
+      const bc = matchGroup(masked, p);
+      // 括号不配对，或那个闭括号已经**越过**默认值分界 ⇒ 这段形状认不出，不许猜
+      if (bc == null || bc - 1 > patEnd) { unparsed.push({ at: s, to: b }); return; }
+      for (const [ma, mb] of splitTop(masked, p + 1, bc - 1)) walk(ma, mb, open === '{');
+      return;
+    }
+    if (isObjectMember) {
+      // 只在模式部分里找冒号：`{ k = c ? 'A' : 'B' }` 那个三元冒号坐在默认值里，不算成员分隔
+      const colon = firstMemberColon(masked, s, patEnd);
+      if (colon >= 0) { walk(colon + 1, b, false); return; }   // `{ k: 目标 = 默认值 }` ⇒ 目标在冒号右边
+    }
+    const name = new RegExp(`^(${IDENT_RE})$`).exec(masked.slice(s, patEnd).trim());
+    if (name) { bindings.push({ name: name[1], at: s, def }); return; }
+    unparsed.push({ at: s, to: b });
+  };
+  walk(from, to, memberIsObject);
+  return { bindings, unparsed };
+}
+
+/**
+ * **参数遮蔽表**：每个参数名 → `{ start, end, lits|null }`，`end` = 那个函数体的结尾。
+ * 参数表怎么认：括号对之后紧跟 `=>` 或 `{`；`{` 形还要求括号前不是 `if`/`for`/… 这类控制词（⇒ 定义，不是调用）。
+ * `=>` 形**不许**用控制词挡：`return (KEY) => env[KEY]` 也是定义（旧口径一律挡掉 ⇒ `return`/`typeof` 后面的
+ * 箭头参数整个不进遮蔽表 = 动态 key 被错记成文件级静态名的又一处假绿）。
+ *
+ * 两处必须同时成立，否则会各红一边：
+ *   · **所有参数位都要进来**（含**末位**）：`pairs` 里的 `close` 是「右括号**之后**」的 exclusive 下标 ⇒
+ *     参数位是 `[open + 1, close - 1)`。旧代码写 `splitTop(masked, open + 1, close)` ⇒ 末位参数的片段
+ *     里带着那个 `)` ⇒ `KEY)` 匹配不上任何绑定形状 ⇒ **末位参数整个漏收**（`function f(KEY){}`、
+ *     `read(KEY){}`、`(KEY)=>` 实测 `shadows=[]`），动态 key 于是沿用文件级常量 = 幻影 key 进枚举、
+ *     `unsupported` 为空 = 闸门放行。带默认值的末位参数同理受害，只是方向相反：默认值文本尾随一个 `)`
+ *     ⇒ `litsOf` 解析不出 ⇒ 可解析的 `function f(X = OUTER)` 被丢进 `unsupported`（假红）。
+ *   · **遮蔽区间要算窄**（见 `expressionBodyEnd`）：表达式体只覆盖体本身，不延伸到外围块尾。
+ */
+function collectParamBindings(code, masked, pairs, scopes, litsOf) {
+  const out = [];
+  /**
+   * 函数体尾，从**体的第一个下标** `from` 起算：体是 `{` 开头 ⇒ 那对花括号的尾；否则（表达式体）⇒
+   * `expressionBodyEnd`。两者都再 `Math.min(外围块尾)`：箭头不可能比包住它的那个 `{}` 还长，
+   * 这条上限既把表达式体扫描的代价钉在局部（大文件里不会一路扫到文件尾），也保证新口径
+   * **只会比旧口径窄，不会更宽**（旧口径就是这个上限）。
+   */
+  const bodyEnd = (from, ceiling) => {
+    const b = nextNonSpace(masked, from);
+    const raw = b != null && masked[b] === '{'
+      ? (pairs.get(b) ?? scopes(b).end)
+      : expressionBodyEnd(code, masked, from);
+    return Math.min(raw, ceiling);
+  };
+  const sites = [];
+  for (const [open, close] of [...pairs].filter(([o]) => masked[o] === '(').sort((a, b) => a[0] - b[0])) {
+    const tail = /^\s*(=>|\{)/.exec(masked.slice(close, close + 64));
+    if (!tail) continue;
+    if (tail[1] === '{') {
+      const head = masked.slice(Math.max(0, open - 96), open);
+      const hw = new RegExp(`(${IDENT_RE})\\s*$`).exec(head);
+      if (hw && CONTROL_WORDS.has(hw[1])) continue;      // `if (x) {` / `for (const [k, v] of …) {` 不是定义
+    }
+    // 参数位 = `(` 与 `)` 之间（`close` 已经**越过**右括号 ⇒ 必须 -1，否则末位参数片段里带着 `)`）。
+    // 体首：`{` 形从那个花括号**本身**起算（`tail[0]` 末尾就是它）；`=>` 形从箭头之后起算。
+    const bodyFrom = tail[1] === '{' ? close + tail[0].length - 1 : close + tail[0].length;
+    sites.push({ from: open + 1, to: close - 1, end: bodyEnd(bodyFrom, scopes(close).end) });
+  }
+  // **无括号**的单参数箭头 `KEY => env[KEY]`：没有 `(` 可配 ⇒ 单独一趟，否则这一形的参数永远漏收
+  for (const m of masked.matchAll(BARE_ARROW_PARAM_RE)) {
+    const name = m[1];
+    sites.push({ from: m.index, to: m.index + name.length, end: bodyEnd(m.index + m[0].length, scopes(m.index).end) });
+  }
+  for (const site of sites) {
+    if (site.to < site.from) continue;
+    for (const [a, b] of splitTop(masked, site.from, site.to)) {
+      const { bindings, unparsed } = paramBindingsIn(masked, code, a, b);
+      for (const p of bindings) {
+        out.push({ name: p.name, start: p.at, end: Math.max(site.end, p.at + p.name.length), lits: litsOf(p.def) });
+      }
+      // **解析不出的嵌套形状 ⇒ fail loudly**（#587 族 A 三轮①）：把那个片段里出现过的名字全部按
+      // 「被遮蔽但解析不出」记账 ⇒ 它在函数体内任何读形都进 `unsupported`（宁可假红）；反过来若静默
+      // 当「这里没绑定」，外层同名常量会被错记成静态 key（假绿），闸门那一层全绿。
+      for (const u of unparsed) {
+        for (const name of opaqueBindingNames(masked, u.at, u.to)) {
+          out.push({ name, start: u.at, end: Math.max(site.end, u.to), lits: null, opaque: true });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** 读取点上有没有**遮蔽**？`{hit:false}` = 没有（照旧查文件级名字表）；`{hit:true, lits:null}` = 被遮蔽且名字解析不出 ⇒ fail loudly。 */
+function shadowAt(shadows, name, at) {
+  const list = shadows?.get(name);
+  if (!list || list.length === 0) return { hit: false };
+  const covering = list.filter((s) => at >= s.start && at < s.end);
+  if (covering.length === 0) return { hit: false };
+  const width = (s) => s.end - s.start;
+  const min = Math.min(...covering.map(width));
+  const cands = covering.filter((s) => width(s) === min);        // 最内层那一个（词法作用域赢）
+  if (cands.some((s) => s.lits == null)) return { hit: true, lits: null };
+  if (cands.length > 1) {
+    const key = (s) => [...s.lits].sort().join('\u0000');
+    if (new Set(cands.map(key)).size > 1) return { hit: true, lits: null };   // 同层两个不同绑定 ⇒ 不许猜
+  }
+  return { hit: true, lits: new Set(cands[0].lits) };
+}
+
+/**
+ * 建「这个名字能解析出哪些 env 名」的表 + **词法作用域遮蔽表**。**必须按形状分优先级多趟建**，因为绑定会互相引用
  * （`{ key = TOOLCALL_MARKERS_ENV }` 里的 `key` 依赖常量表，`const envName = LLM_TIMEOUT_ENV[field]`
  * 里的 `envName` 依赖数据表）：先收字面量与数据表，再收「别名 = 已知名」与「别名 = 已知名[...]」，
  * 最后迭代到不动点。解析不出的名字**不在表里**（调用方据此判 unsupported，不许静默放过）。
- * @returns {{ envObjs: Set<string>, names: Map<string, Set<string>> }}
+ *
+ * `names` 是**文件级**的（同名只有一本账），所以另发一张 `shadows`：参数位与块内重绑定各占一段区间，
+ * 读取点落在区间里就用区间里那份绑定（#587 族 A⑤：`function f(SHADOWED_ENV, env)` 里 `env[SHADOWED_ENV]`
+ * 读的是**参数**，不是顶层那个 `const SHADOWED_ENV = 'ERIX_X'` —— 旧扫描器把动态 key **错记**成那个静态名，
+ * 于是枚举里凭空多出一个没人读的 key，而真的动态读没进 `unsupported`（fail-closed 被绕过）。
+ * @returns {{ envObjs: Set<string>, names: Map<string, Set<string>>, shadows: Map<string, Array> }}
  */
 function analyzeEnvReads(code) {
   const masked = structuralMask(code);
@@ -205,8 +522,10 @@ function analyzeEnvReads(code) {
     if (!names.has(id)) names.set(id, new Set());
     for (const l of lits) names.get(id).add(l);
   };
-  // env 对象别名：`env = process.env`（参数默认值或 `const env = process.env`，两种写法同一条正则）
-  for (const m of code.matchAll(new RegExp(`(${IDENT_RE})\\s*=\\s*process\\.env(?!\\.)(?!\\s*=[^=])`, 'g'))) envObjs.add(m[1]);
+  // env 对象别名：`env = process.env`（参数默认值或 `const env = process.env`，两种写法同一条正则）。
+  // `env = process?.env` 同样是别名（#587 族 A③）：不认就把它的读形整条扫不到 = 静默。
+  // 但 `x = process?.env?.ERIX_X` 取的是**值**而不是 env 对象 ⇒ 后面紧跟 `?.` 的那一种要排掉。
+  for (const m of code.matchAll(new RegExp(`(${IDENT_RE})\\s*=\\s*process\\s*\\??\\.\\s*env(?!\\?\\.)(?!\\.)(?!\\s*=[^=])`, 'g'))) envObjs.add(m[1]);
 
   // ① 字符串常量：`const FOO_ENV = 'ERIX_X'`
   for (const m of code.matchAll(new RegExp(`\\b(?:const|let|var)?\\s*(${IDENT_RE})\\s*=\\s*['"]([^'"]+)['"]`, 'g'))) {
@@ -243,17 +562,60 @@ function analyzeEnvReads(code) {
     changed = JSON.stringify(before) !== JSON.stringify(after);
     if (!changed) break;
   }
-  return { envObjs, names };
+
+  // ⑤ **作用域遮蔽**（#587 族 A⑤）：参数位与块内重绑定各自占一段区间，区间里的读取不许再用外层同名常量。
+  //    `litsOf` 与 `resolveExpr` 同口径（字面量 / 已知名 / `TABLE[...]`），解析不出 ⇒ `null` = 动态。
+  const pairs = bracketPairs(masked);
+  const scopes = braceScopes(masked, pairs);
+  const litsOf = (exprText) => {
+    if (typeof exprText !== 'string' || exprText.trim() === '') return null;
+    const lit = /^\s*['"]([^'"]+)['"]\s*$/.exec(exprText);
+    if (lit) return new Set([lit[1]]);
+    const id = new RegExp(`^\\s*(${IDENT_RE})\\s*$`).exec(exprText);
+    if (id && names.get(id[1])?.size) return new Set(names.get(id[1]));
+    const tbl = new RegExp(`^\\s*(${IDENT_RE})\\s*\\[[\\s\\S]*\\]\\s*$`).exec(exprText);
+    if (tbl && names.get(tbl[1])?.size) return new Set(names.get(tbl[1]));
+    return null;
+  };
+  const shadowList = [];
+  // ⑤a 参数遮蔽（含箭头函数、解构参数、`{ key = KNOWN }` 那种带默认值的参数）
+  shadowList.push(...collectParamBindings(code, masked, pairs, scopes, litsOf));
+  // ⑤b 块内 `const`/`let`/`var` 重绑定：顶层那些归 `names` 管（不算遮蔽），**块内**的才算遮蔽
+  const DECL_RE = new RegExp(`\\b(?:const|let|var)\\s+(${IDENT_RE})\\s*(?:=([^;\\n]*))?`, 'g');
+  for (const m of code.matchAll(DECL_RE)) {
+    if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;   // 串正文里的「const …」不算声明
+    const scope = scopes(m.index);
+    if (scope.whole) continue;
+    shadowList.push({ name: m[1], start: m.index, end: scope.end, lits: litsOf(m[2]) });
+  }
+  const shadows = new Map();
+  for (const s of shadowList) {
+    if (!shadows.has(s.name)) shadows.set(s.name, []);
+    shadows.get(s.name).push(s);
+  }
+  return { envObjs, names, shadows };
 }
 
-/** 下标表达式 → 名字集合；`null` = 解析不出字面量名（调用方必须进 unsupported 清单，不许静默放过）。 */
-function resolveExpr(expr, ctx) {
+/**
+ * 下标表达式 → 名字集合；`null` = 解析不出字面量名（调用方必须进 unsupported 清单，不许静默放过）。
+ * `at` = 表达式在**本篇代码**里的偏移 ⇒ 先查词法作用域遮蔽（#587 族 A⑤：被参数/块内声明遮蔽的名字，
+ * 外层那张文件级表**不再算数**；解析不出就 `null`，由调用方 fail loudly，**不许错记**）。
+ */
+function resolveExpr(expr, ctx, at = 0) {
   const lit = /^\s*['"]([^'"]+)['"]\s*$/.exec(expr);
   if (lit) return new Set([lit[1]]);
   const id = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(expr);
-  if (id && ctx.names.has(id[1])) return new Set(ctx.names.get(id[1]));
+  if (id) {
+    const sh = shadowAt(ctx.shadows, id[1], at);
+    if (sh.hit) return sh.lits ? new Set(sh.lits) : null;
+    return ctx.names.has(id[1]) ? new Set(ctx.names.get(id[1])) : null;
+  }
   const tbl = /^\s*([A-Za-z_$][\w$]*)\s*\[[\s\S]*\]\s*$/.exec(expr); // `T[field]` 直接写在读形里
-  if (tbl && ctx.names.has(tbl[1]) && ctx.names.get(tbl[1]).size > 0) return new Set(ctx.names.get(tbl[1]));
+  if (tbl) {
+    const sh = shadowAt(ctx.shadows, tbl[1], at);
+    const lits = sh.hit ? sh.lits : (ctx.names.get(tbl[1]) ?? null);
+    return lits && lits.size > 0 ? new Set(lits) : null;
+  }
   return null;
 }
 
@@ -288,15 +650,22 @@ function scanEnvReadsFromFiles(files, root) {
     const code = stripComments(text);            // 注释 → 空格（行列位不变）⇒ 注释里的读形**不算读取**
     const masked = structuralMask(code);         // 再把字符串正文抹平 ⇒ 用来判「这个位置是不是串里的文字」
     const ctx = analyzeEnvReads(code);
-    const objs = ['process\\.env', ...[...ctx.envObjs].map(escRe)];
-    // 读形：`对象 . 名字` 或 `对象 [ 表达式 ]`（`?.` 两种位置都认）。前视 `(?<![\w$.])` 挡住 `childEnv.X`
-    // 这类「别的对象也叫 env 结尾」的假别名。
+    // env **对象**那一跳也可能带可选链（`process?.env?.X`，#587 族 A③）⇒ 前缀写成 `process\s*\??\.\s*env`。
+    const objs = ['process\\s*\\??\\.\\s*env', ...[...ctx.envObjs].map(escRe)];
+    const OBJ = `(?:${objs.join('|')})`;
+    // 读形：`对象 . 名字` 或 `对象 [ 表达式 ]`。**成员那一跳的可选链必须单独认**：点号那支写成
+    // `(?:\?\.|\.)` 而不是 `(?:\?\.)?\.` —— `process.env?.X` 里 `?.` 之后**没有**第二个点，旧写法两支都不匹配
+    // ⇒ 整形扫不到（#587 族 A③：扫不到 = 静默漏过，等于这道闸门对这个旋钮不存在）。
+    // 前视 `(?<![\w$.])` 挡住 `childEnv.X` / `foo?.BAR` 这类「别的对象也叫 env 结尾」的假别名。
     const readRe = new RegExp(
-      `(?<![\\w$.])(?:${objs.join('|')})(?:\\?\\.)?(?:\\.(${IDENT_RE})|\\[\\s*([^\\]\\n]*?)\\s*\\])`, 'g');
+      `(?<![\\w$.])${OBJ}(?:\\?\\.|\\.)\\s*(${IDENT_RE})`
+      + `|(?<![\\w$.])${OBJ}(?:\\?\\.)?\\s*\\[\\s*([^\\]\\n]*?)\\s*\\]`, 'g');
     // 写形态整段抹成空格（`process.env.X = v` 是给子进程传值，不是「这个 env 名有配置面」）；
     // 只抹「对象 + 成员 + 等号」这一段，赋值**右侧**照旧参与匹配。
+    // 整个「对象+成员」段必须**包在一个分组里**再尾随 `=`：否则 `|` 会把 `\s*=` 只挂到第二支上，
+    // 第一支（点号读形）就变成「凡点号读形都抹掉」= 读形自己把自己抹了。
     const writeRe = new RegExp(
-      `(?<![\\w$.])(?:${objs.join('|')})(?:\\?\\.)?(?:\\.${IDENT_RE}|\\[[^\\]]*\\])\\s*=(?!=)`, 'g');
+      `((?<![\\w$.])${OBJ}(?:\\?\\.|\\.)\\s*${IDENT_RE}|(?<![\\w$.])${OBJ}(?:\\?\\.)?\\s*\\[[^\\]]*\\])\\s*=(?!=)`, 'g');
     const writable = code.replace(writeRe, (m) => ' '.repeat(m.length));
     let line = 1;
     let scanFrom = 0;
@@ -313,7 +682,12 @@ function scanEnvReadsFromFiles(files, root) {
       if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;
       if (m[1] !== undefined) { add(m[1], rel, line, 'dot'); continue; }
       const expr = m[2] ?? '';
-      const lit = resolveExpr(expr, ctx);
+      // 表达式在**本篇代码**里的偏移：从 `[` 之后第一个非空白起算。遮蔽表按偏移开区间记账，
+      // 不传这个数就等于**永远查不到遮蔽**（#587 族 A⑤ 的机件会退化成死代码，而闸门照样全绿）。
+      const lb = m[0].indexOf('[');
+      const after = lb < 0 ? '' : m[0].slice(lb + 1);
+      const at = lb < 0 ? m.index : m.index + lb + 1 + (after.length - after.replace(/^\s+/, '').length);
+      const lit = resolveExpr(expr, ctx, at);
       if (lit) { for (const n of lit) add(n, rel, line, `index:${expr.trim()}`); continue; }
       // 读形认得、名字解析不出（运行期拼名那类）⇒ **fail closed**：进 unsupported 清单，
       // 必须逐条登记进 `deploy/env-legs-exceptions.json` 的 `unsupported` 段并写理由，否则判据红。
@@ -787,12 +1161,14 @@ function whereProblems(entries, sources, root = REPO_ROOT) {
         return;
       }
       const { code, ctx } = analyze(ref.rel);
-      const target = code.split('\n')[ref.line - 1];
+      const lines = code.split('\n');
+      const target = lines[ref.line - 1];
+      const lineStart = ref.line === 1 ? 0 : lines.slice(0, ref.line - 1).join('\n').length + 1;
       if (target === undefined) {
         problems.push(`${tag} 指到第 ${ref.line} 行，但那个文件只有 ${code.split('\n').length} 行 ⇒ 坐标过期`);
         return;
       }
-      if (lineMentionsKey(target, ctx, e.key)) return;
+      if (lineMentionsKey(target, ctx, e.key, lineStart)) return;
       problems.push(`${tag} 那一行**不含该 key**（也没有能解析到它的常量名）。实际内容：`
         + `\`${target.trim().slice(0, 90)}\` ⇒ 坐标是编的或已漂移：**行号看着合理不等于它对**`
         + '（注释里出现过也不算，剥完注释才算）');
@@ -802,10 +1178,10 @@ function whereProblems(entries, sources, root = REPO_ROOT) {
 }
 
 /** 那一行含该 key 的字面量，或含一个能解析到它的常量名（表驱动那种真坐标必须算通过）。 */
-function lineMentionsKey(lineText, ctx, key) {
+function lineMentionsKey(lineText, ctx, key, lineStart = 0) {
   if (lineText.includes(key)) return true;
   for (const m of lineText.matchAll(new RegExp(IDENT_RE, 'g'))) {
-    const lits = resolveExpr(m[0], ctx);
+    const lits = resolveExpr(m[0], ctx, lineStart + m.index);
     if (lits && lits.has(key)) return true;
   }
   return false;
@@ -989,3 +1365,438 @@ test('活一⑧ 解析不出 env 名的读形 ⇒ 进 unsupported 清单；不�
   assert.deepEqual(unsupportedProblems(RUNNER_SCAN.unsupported, registered), [],
     'runner 里的动态 env 读形与登记没咬合（未登记 / 过期 / 坐标漂移）');
 });
+
+// ===========================================================================
+// 族 A（issue #587）：闸门的**语言事实**——正则字面量 / 可选链 / 词法作用域
+//
+// 这一段的判据口径只认两种：**该被扫到的名字必须在枚举里** / **不该被错记的名字必须不在**。
+// 不写「某函数被调用了」「某分支被执行了」这类形状断言：那种格子在机件被拆掉后照样会绿。
+// 每格都带一个**方向相反的对照组**，所以「把机件拆掉」与「把机件做得过宽」都会红。
+// ===========================================================================
+
+/**
+ * 写一个临时夹具并扫它：`src` 给字符串 = 单文件 `fx.js`；给对象 = 多个文件（**别名表是按文件建的**，
+ * 想让某个形状「只有它自己」时必须单独放一个文件，否则隔壁文件的别名会替它背书）。
+ * @returns {{ keys: string[], unsupported: Array }}
+ */
+function scanFixture(name, src) {
+  const files = typeof src === 'string' ? { 'fx.js': src } : src;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `env-lang-${name}-`));
+  try {
+    for (const [f, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, f), text);
+    const { keys, unsupported } = scanEnvReads(dir);
+    return { keys: [...keys.keys()].sort(), unsupported };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('活二⑨ 正则字面量不是注释：字符类里的「斜杠星」之后，真读取必须仍在枚举里（六种形状）', () => {
+  // 旧状态机按 `/*` `//` 文本切，不认正则定界符 ⇒ `/[/*]/` 里那个坐在**字符类**里的「斜杠星」被当成块注释
+  // 起点：`stripComments()` 靠「未闭合 ⇒ 原样退回」侥幸活下来，`structuralMask()` **没有那条退路**
+  // ⇒ 其后所有真读取被当成串正文放过 = 静默漏扫（现网同形：`runner/lib/file-tools.js:67`）。
+  // 所以夹具里故意放一个**其后的真块注释**：谁把 `stripComments()` 那条正则识别拆掉，这里就会被
+  // 「假 `/*` 一路吃到真 `*/`」吞掉中间的读取，两把尺少任一把都红。
+  const src = [
+    'const cls = /[/*]/;                                  // 字符类里坐着 /*',
+    'export const a = process.env.ERIX_A2_AFTER_CLASS;',
+    'const clsU = /[*?]/u;',
+    'export const b = process.env.ERIX_A2_AFTER_CLASS_U;',
+    'const sep = /a\\/b/; const sep2 = /\\/\\//;         // 正则里的转义斜杠',
+    'export const c = process.env.ERIX_A2_AFTER_ESCAPED;',
+    'const x = a / b; const re = /[/*]/; const y = c / d; // 正则夹在两次除法中间',
+    'export const d = process.env.ERIX_A2_BETWEEN_DIV;',
+    'const cls2 = /[/]*/; const e2 = process.env.ERIX_A2_AFTER_CLASS_SLASH; const w = 1 / 2;',
+    'export function f(e) { return /[*?]/u.test(e); }',
+    'export const g = process.env.ERIX_A2_AFTER_RETURN;',
+    '/* 真块注释里提到 process.env.ERIX_A2_GHOST_BLOCK */',
+    'export const h = process.env.ERIX_A2_AFTER_BLOCK;',
+    '// 行注释里提到 process.env.ERIX_A2_GHOST_LINE',
+  ].join('\n');
+  const { keys } = scanFixture('regex', src);
+  assert.deepEqual(keys, [
+    'ERIX_A2_AFTER_BLOCK', 'ERIX_A2_AFTER_CLASS', 'ERIX_A2_AFTER_CLASS_SLASH', 'ERIX_A2_AFTER_CLASS_U',
+    'ERIX_A2_AFTER_ESCAPED', 'ERIX_A2_AFTER_RETURN', 'ERIX_A2_BETWEEN_DIV',
+  ].sort(), `正则识别漏了形状 ⇒ 它后面的真读取被整段吞掉（实际只扫到 ${JSON.stringify(keys)}）。`
+    + '缺哪几个名字 = 哪一段代码被当成注释/串正文抹平了');
+  // 反向自证：正则识别**不许**把真注释重新当代码（注释里那两个假名字必须仍然不存在）
+  for (const ghost of ['ERIX_A2_GHOST_BLOCK', 'ERIX_A2_GHOST_LINE']) {
+    assert.ok(!keys.includes(ghost), `${ghost} 只活在注释里却进了枚举 ⇒ 「正则 vs 注释」的判定被改坏了`);
+  }
+});
+
+test('活二⑩ 正则**正文里提到的**读形不算读取（掩码那把尺也必须认正则，否则正则里的文字会造假 key）', () => {
+  // 与上一格方向相反：`structuralMask()` 把正则正文抹平之后，`/process.env.ERIX_X/` 里那段文字
+  // 才不会被当成读取点。谁只在 `stripComments()` 里认正则、`structuralMask()` 里不认，这一格当场红。
+  const src = [
+    'const re = /process.env.ERIX_A2_IN_REGEX_DOT/;',
+    'const re2 = /env.ERIX_A2_IN_REGEX_ALIAS/;',
+    'export const ok = process.env.ERIX_A2_OUTSIDE_REGEX;',
+  ].join('\n');
+  const { keys } = scanFixture('regex-body', src);
+  assert.deepEqual(keys, ['ERIX_A2_OUTSIDE_REGEX'],
+    `正则正文里的文字被当成读取了（实际 ${JSON.stringify(keys)}）⇒ 掩码不认正则字面量：`
+    + '假 key 会带着「三腿缺」的帽子红在闸门里，而真值一个也看不见');
+});
+
+test('活二⑪ 可选链读形五种都要进枚举（`process.env?.X` / `env?.X` / `process?.env?.X` / `process.env?.[\'X\']` / `env?.[表名]`）', () => {
+  // 旧 `readRe` 只有 `(?:\?\.)?(?:\. NAME | \[…\])`：`process.env?.X` 里 `?.` 之后**没有**第二个点，
+  // 两支都不匹配 ⇒ 整形扫不到 0 次；`process?.env` 更是连**对象别名**都匹配不上（别名表与读形两处都要改）。
+  // 别名那一支必须单独放一个文件：别名是**按文件**建的，隔壁文件的 `env = process.env` 会替它背书。
+  const { keys, unsupported } = scanFixture('optchain', {
+    'shapes.js': [
+      "const T = Object.freeze({ a: 'ERIX_A3_TABLE_KEY' });",
+      'export function pick(which, env = process.env) {',
+      '  const name = T[which];',
+      '  return [',
+      '    process.env.ERIX_A3_DOT,',
+      '    env.ERIX_A3_ALIAS_DOT,',
+      '    process.env["ERIX_A3_BRACKET"],',
+      '    process.env?.ERIX_A3_OPTCHAIN,',
+      '    env?.ERIX_A3_ALIAS_OPT,',
+      '    process?.env?.ERIX_A3_OPTPROC,',
+      "    process.env?.['ERIX_A3_OPT_BRACKET'],",
+      '    env?.[name],',
+      '    env?.[which],',
+      '  ];',
+      '}',
+      'export const falseAlias = (childEnv) => childEnv.ERIX_A3_FALSE_ALIAS;',
+      'export const nestedEnv = (spec) => spec.env.ERIX_A3_NESTED_ALIAS;',
+      'export const notEnv = (foo) => foo?.ERIX_A3_NOT_ENV_OBJECT;',
+    ].join('\n'),
+    'alias-only.js': 'export function viaAlias(env = process?.env) { return env.ERIX_A3_ALIAS_FROM_OPTCHAIN; }\n',
+  });
+  assert.deepEqual(keys, [
+    'ERIX_A3_ALIAS_DOT', 'ERIX_A3_ALIAS_FROM_OPTCHAIN', 'ERIX_A3_ALIAS_OPT', 'ERIX_A3_BRACKET',
+    'ERIX_A3_DOT', 'ERIX_A3_OPTPROC', 'ERIX_A3_OPT_BRACKET', 'ERIX_A3_OPTCHAIN', 'ERIX_A3_TABLE_KEY',
+  ].sort(), `可选链那一支没进枚举（实际 ${JSON.stringify(keys)}）⇒ 读形扫不到 = 那个旋钮在闸门里不存在`);
+  // 读形认得、名字来自调用方 ⇒ 不许静默放过，必须进 `unsupported`（fail loudly）
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), ['shapes.js:13 env?.[which]'],
+    `解析不出名字的动态读形没进 unsupported（实际 ${JSON.stringify(unsupported)}）`);
+  // 对象前缀那条前视不许被放宽：`childEnv.X` / `foo?.X` 都不是 env 对象
+  for (const phantom of ['ERIX_A3_FALSE_ALIAS', 'ERIX_A3_NESTED_ALIAS', 'ERIX_A3_NOT_ENV_OBJECT']) {
+    assert.ok(!keys.includes(phantom),
+      `${phantom} 来自**别的对象**（名字以 env 结尾 / 只是碰巧写了可选链）却进了枚举 ⇒ 前缀被放宽了`);
+  }
+});
+
+test('活二⑫ 参数遮蔽：`function f(OUTER_ENV, env)` 里 `env[OUTER_ENV]` 是动态读，不许错记成外层常量的名字', () => {
+  // #587 族 A⑤：`names` 那张表是**文件级**的，旧扫描器据此把动态 key **错记**成外层常量值
+  // ⇒ 枚举里凭空多出一个没人读的 key（还看起来是对的），而真的动态读没进 `unsupported`
+  // ⇒ fail-closed 被绕过。两个方向都要判：phantom 必须不在、unsupported 必须有那一条。
+  const src = [
+    "const OUTER_ENV = 'ERIX_A5_PHANTOM_WHEN_MISATTRIBUTED';",
+    "const PLAIN_ENV = 'ERIX_A5_STATIC_OK';",
+    'export function shadowed(OUTER_ENV, env = process.env) { return env[OUTER_ENV]; }',
+    'export function plain(env = process.env) { return env[PLAIN_ENV]; }',
+    "export function defaulted(KEY = 'ERIX_A5_PARAM_LITERAL', env = process.env) { return env[KEY]; }",
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('shadow-param', src);
+  assert.ok(!keys.includes('ERIX_A5_PHANTOM_WHEN_MISATTRIBUTED'),
+    `被参数遮蔽的动态读形被**错记**成外层常量的名字了（枚举 ${JSON.stringify(keys)}）：`
+    + '错记比漏记更坏 —— 枚举里那个 key 看起来是对的，真的动态读却隐形了');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), ['fx.js:3 env[OUTER_ENV]'],
+    `参数遮蔽下的动态读形没进 unsupported（实际 ${JSON.stringify(unsupported)}）⇒ fail-closed 被绕过`);
+  // 两个对照组：遮蔽**不许**宽到把静态读形与「参数自带字面量」也吞掉
+  assert.deepEqual(keys, ['ERIX_A5_PARAM_LITERAL', 'ERIX_A5_STATIC_OK'],
+    `静态读形被遮蔽误伤（实际 ${JSON.stringify(keys)}）：遮蔽算宽了同样是漏扫`);
+});
+
+test('活二⑬ 块内重绑定遮蔽：`const` / `let` / `var` 三种重声明都要断开外层同名常量（三形各一条）', () => {
+  // 工单要求「至少做到同一函数/块内 const/参数 遮蔽后不再认外层同名常量」——`var` 也一起判：
+  // 它同样在读取点之前重新绑定了那个名字（静态上判不准它到底指谁 ⇒ 宁可进 unsupported）。
+  const src = [
+    "const C_ENV = 'ERIX_A5_PHANTOM_CONST';",
+    "const L_ENV = 'ERIX_A5_PHANTOM_LET';",
+    "const V_ENV = 'ERIX_A5_PHANTOM_VAR';",
+    'export function useConst(env = process.env) { const C_ENV = globalThis.zz?.a; return env[C_ENV]; }',
+    'export function useLet(env = process.env) { let L_ENV = globalThis.zz?.b; return env[L_ENV]; }',
+    'export function useVar(env = process.env) { var V_ENV = globalThis.zz?.c; return env[V_ENV]; }',
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('shadow-block', src);
+  for (const phantom of ['ERIX_A5_PHANTOM_CONST', 'ERIX_A5_PHANTOM_LET', 'ERIX_A5_PHANTOM_VAR']) {
+    assert.ok(!keys.includes(phantom),
+      `${phantom} 来自一个被块内重声明遮蔽的动态读形，却进了枚举（实际 ${JSON.stringify(keys)}）`);
+  }
+  assert.deepEqual(unsupported.map((u) => u.shape), ['env[C_ENV]', 'env[L_ENV]', 'env[V_ENV]'],
+    `块内重声明的动态读形没逐条进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => u.shape))}）`
+    + ' ⇒ 三形里少一形就是那一形在闸门里隐形');
+});
+
+test('活二⑭ 遮蔽不许外溢：同名常量在遮蔽区间**之外**照常解析（遮蔽算宽 = 另一种静默漏扫）', () => {
+  const src = [
+    "const SH_ENV = 'ERIX_A5_SCOPE_OUTSIDE_OK';",
+    'export function shadowed(SH_ENV, env = process.env) { return env[SH_ENV]; }',
+    'export function outerUse(env = process.env) { return env[SH_ENV]; }',
+    'export const topUse = process.env[SH_ENV];',
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('shadow-scope', src);
+  assert.deepEqual(keys, ['ERIX_A5_SCOPE_OUTSIDE_OK'],
+    `遮蔽算到了整个文件（枚举 ${JSON.stringify(keys)}）：遮蔽区间 = 那个函数体，不是全文件`
+    + ' —— 把动态与静态一起判成动态 = 三腿判据看不见这个 key，照样静默');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), ['fx.js:2 env[SH_ENV]'],
+    `只有被遮蔽的那一条该进 unsupported（实际 ${JSON.stringify(unsupported)}）`);
+});
+
+test('活二⑮ `)` 之后：控制流头部接正则、调用接除法（两种都不许吞掉后面的真读取）', () => {
+  // `if (x) /re/.test(y)` 与 `f(1) / 2` 都以 `)` 结尾，静态上单看前一个字符判不出。
+  // 旧口径一律按除法 ⇒ `if (flag) /[/*]/.test(name);` 之后又被「假 `/*`」整段吞掉（同一族的静默）。
+  // 现在靠括号栈回查那个 `(` 前面是不是控制流关键字。两向都要有牙：
+  //   把 `)` 一律按除法 → `ERIX_A2_AFTER_IFREGEX` 消失；一律按正则 → 两个除法行被当正则抹平。
+  const src = [
+    'if (flag) /[/*]/.test(name);',
+    'export const a = process.env.ERIX_A2_AFTER_IFREGEX;',
+    'const half = compute(1) / 2; const other = process.env.ERIX_A2_AFTER_CALLDIV; const t = 3 / 4;',
+    'const ratio = (width) / (height); const more = process.env.ERIX_A2_AFTER_GROUPDIV; const u = 5 / 6;',
+  ].join('\n');
+  const { keys } = scanFixture('paren-slash', src);
+  assert.deepEqual(keys, ['ERIX_A2_AFTER_CALLDIV', 'ERIX_A2_AFTER_GROUPDIV', 'ERIX_A2_AFTER_IFREGEX'],
+    '`if (x) /re/` 与 `f(1) / 2` 的判定判错了（实际 ' + JSON.stringify(keys) + '）：'
+    + '一律按除法会吞掉正则后面的读取，一律按正则会把除法当正则抹平');
+});
+
+test('活二⑯ 斜杠认不准时必须退回除法：同一行内找不到闭合斜杠就不许跨行去找（三形都不许吞掉后面的真读取）', () => {
+  // `regexLiteralSpan()` 的「必须同行闭合」那条是**方向守卫**：正则本来就不许跨行，所以
+  // 「这一行没有第二个斜杠」就意味着它不是正则 ⇒ 退回除法、继续按注释判。
+  // 守卫拆掉后它会一路叓到下一行的 `/`：`stripComments()` 里原样留、`structuralMask()` 里整段抹平
+  // ⇒ 又一个「真读取被当成串正文」的静默形状。（下面三形的共同点：斜杠坐在正则位上、本行没闭合。）
+  const shapes = {
+    'bare-slash-then-regex': ['export const junk = [\n  1,\n  /2,\n];', 'export const re = /[*?]/u;'],
+    'unclosed-class': ['if (flag) /[a/;', 'export const re = /[*?]/u;'],
+    'wrapped-division': ['export const per = a ==\n  / 2;', 'export const re = /[*?]/u;'],
+  };
+  for (const [name, [head, tail]] of Object.entries(shapes)) {
+    // 真读取**夹在中间**：那才是会被跨行正则抹平的位置（放在尾行后面就并判不到这个方向）
+    const src = `${head}\nexport const v = process.env.ERIX_A2_AFTER_UNSAFE_SLASH;\n${tail}\n`;
+    const { keys } = scanFixture(`slash-${name}`, src);
+    assert.ok(keys.includes('ERIX_A2_AFTER_UNSAFE_SLASH'),
+      `形状「${name}」之后那个真读取不见了（实际 ${JSON.stringify(keys)}）：认不准的斜杠被当成了正则，`
+      + '跨行抹平了后面的代码 = 静默漏扫（认不准就得按除法，不许猜它是正则）');
+  }
+});
+
+test('活二⑰ 参数遮蔽表要收全**每一个**参数位：末位参数漏收 = 幻影 key 进枚举、unsupported 为空（假绿）', () => {
+  // #587 族 A 返工。`bracketPairs()` 给的 `close` 是「右括号**之后**」的 exclusive 下标，旧代码把参数位
+  // 写成 `[open + 1, close)` ⇒ 末位参数的片段尾随一个 `)` ⇒ `LAST_ENV)` 匹配不上任何绑定形状
+  // ⇒ **末位参数整个漏收**。后果是假绿：被遮蔽的动态读沿用文件级同名常量 ⇒ 枚举里多出一个**没人读**的
+  // key（还看起来是对的），`unsupported` 却空着 ⇒ fail-closed 被绕过（`gate.sh` 那一层全绿）。
+  // 所以每种参数位都要**逐行点名**：普通函数 / 对象方法 / 类方法 / 类字段箭头 / 顶层箭头 / 无括号单参数
+  // 箭头，少收任何一形，那一行的读形既不进 unsupported、又把幻影 key 送进枚举。
+  const src = [
+    "const LAST_ENV = 'ERIX_A5_LASTPHANTOM';",
+    "const CTRL_ENV = 'ERIX_A5_LASTCTRL_OK';",
+    'export function plain(SH_ENV, LAST_ENV) { return process.env[LAST_ENV]; }',
+    'export const obj = { read(SH_ENV, LAST_ENV) { return process.env[LAST_ENV]; } };',
+    'export class C { read(SH_ENV, LAST_ENV) { return process.env[LAST_ENV]; } }',
+    'export class D { fld = (SH_ENV, LAST_ENV) => process.env[LAST_ENV]; }',
+    'export const topArrow = (SH_ENV, LAST_ENV) => process.env[LAST_ENV];',
+    'export const bareArrow = LAST_ENV => process.env[LAST_ENV];',
+    'export const ctrl = process.env[CTRL_ENV];',      // 对照组：没被遮蔽的静态读要照常进枚举
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('shadow-last-param', src);
+  assert.ok(!keys.includes('ERIX_A5_LASTPHANTOM'),
+    'ERIX_A5_LASTPHANTOM 只在**被参数遮蔽**的读形里出现过，却进了枚举（实际 ' + JSON.stringify(keys) + '）：'
+    + '那个参数没进遮蔽表 ⇒ 动态读沿用了文件级同名常量 = 幻影 key。错记比漏记更坏 —— 它看起来是对的，'
+    + '而真的动态读在 unsupported 里隐形');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`),
+    [3, 4, 5, 6, 7, 8].map((n) => `fx.js:${n} process.env[LAST_ENV]`),
+    `六形末位参数的动态读没**逐条**进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}）：`
+    + '少一条就是那一形（普通函数 / 对象方法 / 类方法 / 类字段箭头 / 顶层箭头 / 无括号箭头）的参数没进遮蔽表');
+  assert.deepEqual(keys, ['ERIX_A5_LASTCTRL_OK'],
+    `枚举里出现了不该有的 key（实际 ${JSON.stringify(keys)}）：末位参数的遮蔽既不许错记成静态、也不许把` 
+    + '没被遮蔽的静态读一起吞掉（对照组 `CTRL_ENV` 必须照常在里面）');
+});
+
+test('活二⑱ 表达式体箭头的遮蔽区间只覆盖体本身：箭头**之后**的静态读必须照常解析（不许拉回外围块尾）', () => {
+  // `=>` 的表达式体没有 `{` 可配。旧口径保守取「最内层**外围块**的结尾」，宁宽不窄；代价是**假红**：
+  // `const g = (KEY) => env[KEY]; … process.env[KEY]` —— 箭头**之后**那次读的是外层常量，却被算进箭头
+  // 参数的遮蔽区间 ⇒ 静态读形被判成动态 ⇒ 掉进 `unsupported`：那个 key 从此在三腿判据里隐形（又是静默）。
+  // 所以区间必须算窄到**体本身**，三个层级各钉一条（模块顶层 / 类体 / 函数体），每条形如
+  // 「遮蔽一条 + 紧跟一条静态读」：区间拉回外围块尾 ⇒ 那条静态读从枚举里消失、unsupported 多出一条。
+  const src = [
+    "const AW_ENV = 'ERIX_A5_ARROW_AFTER_OK';",
+    'export const top = (AW_ENV) => process.env[AW_ENV];',        // 遮蔽在体内
+    'export const afterTop = process.env[AW_ENV];',                // 顶层：区间拉宽就认不出它
+    'export class K { fld = (AW_ENV) => process.env[AW_ENV]; after = process.env[AW_ENV]; }',   // 类体同一层
+    'export function wrap() { const f = (AW_ENV) => process.env[AW_ENV]; return process.env[AW_ENV]; }',  // 函数体
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('arrow-expression-body', src);
+  assert.deepEqual(keys, ['ERIX_A5_ARROW_AFTER_OK'],
+    `箭头之后的静态读没进枚举（实际 ${JSON.stringify(keys)}）：表达式体的遮蔽区间拉到了外围块尾，`
+    + '把后面那些**读外层常量**的静态读形也算成动态 ⇒ 静态 key 隐形，三腿判据从此不再看它');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), ['fx.js:2 process.env[AW_ENV]', 'fx.js:4 process.env[AW_ENV]', 'fx.js:5 process.env[AW_ENV]'],
+    `只有**体内**那三条该进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}` 
+    + '）：多出一条就是箭头后面那条静态读被误判了（区间过宽 = 假红，与幻影 key 相反的静默方向）');
+});
+
+test('活二⑲ 解析得出的参数默认值不许白丢：默认值必须被**解析成那个常量**（外层同名常量不许顶上来）', () => {
+  // 与⑰同一块地基、方向相反的两面：默认值文本里多一个 `)` 就解析不出 ⇒ 能解析的被丢进 `unsupported`
+  // （假红）；而 `{ k: NAME = 'ERIX_X' }` 这一支旧代码写死 `def: null` ⇒ 同样把解析得出的默认值白丢。
+  //
+  // **三轮审计点名的盲区**（判据质量问题，不是机件问题）：本格原先只断言「枚举里有那两个名字 +
+  // `unsupported` 为空」，而 `analyzeEnvReads()` 的**文件级字面量收集器**（那一趟 `const|let|var` 写成
+  // 可选的正则）也会把参数默认值文本里的 `DEF_PLAIN = 'ERIX_…'` 当成文件级常量收下 ⇒ 把「参数默认值
+  // 绑定解析」整块拆掉，那两个名字仍然在枚举里、`unsupported` 仍然为空 ⇒ 本格照样绿 = 没牙。
+  // 现在夹具里放**同名但值不同**的外层常量，并且**直接断言遮蔽表本身**：
+  //   · 枚举里必须是**默认值**那两个名字：外层同名值一旦出现 = 默认值绑定没进遮蔽表（幻影 key）
+  //   · `unsupported` 必须为空：可解析的名字不许被丢进 fail-closed 清单（丢一个 = 那个旋钮消失）
+  //   · 遮蔽表里必须有「那个名字 → 那个字面量」的绑定：钉的是**解析结果**，不是下游侥幸
+  const src = [
+    "const DEF_PLAIN = 'ERIX_A5_DEF_OUTER_PLAIN';",        // 同名外层常量：默认值解析没接上就会被它顶替
+    "const DEF_ALIAS = 'ERIX_A5_DEF_OUTER_ALIAS';",
+    "export function plainDefault(DEF_PLAIN = 'ERIX_A5_DEF_PLAIN_OK') { return process.env[DEF_PLAIN]; }",
+    "export function aliasedDefault({ k: DEF_ALIAS = 'ERIX_A5_DEF_ALIAS_OK' } = {}) { return process.env[DEF_ALIAS]; }",
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('param-default-resolvable', src);
+  assert.deepEqual(keys, ['ERIX_A5_DEF_ALIAS_OK', 'ERIX_A5_DEF_PLAIN_OK'],
+    `两个可解析的参数默认值没全**按默认值**进枚举（实际 ${JSON.stringify(keys)}）：默认值解析不出就被当成`
+    + '动态名（那个旋钮从三腿判据里消失），或被外层同名常量顶替（枚举里是个没人读的幻影 key）');
+  for (const phantom of ['ERIX_A5_DEF_OUTER_PLAIN', 'ERIX_A5_DEF_OUTER_ALIAS']) {
+    assert.ok(!keys.includes(phantom),
+      `${phantom} 进了枚举：那是**外层同名常量**的值，读取点坐在参数默认值的遮蔽区间里，读的是默认值。`
+      + '它出现就说明默认值绑定没进遮蔽表（默认值解析被拆掉）');
+  }
+  assert.deepEqual(unsupported, [],
+    `可解析的默认值被丢进 unsupported 了（实际 ${JSON.stringify(unsupported.map((u) => u.shape))}）：`
+    + '两形（末位 `X = \'ERIX_X\'` / 解构别名 `{ k: NAME = \'ERIX_X\' }`）少解析一形 = 那一形白丢');
+  // 直接钉遮蔽表：默认值必须成为那个名字的区间绑定（不看下游收集器的侥幸）
+  const shadows = analyzeEnvReads(stripComments(src)).shadows;
+  for (const [name, lit] of [['DEF_PLAIN', 'ERIX_A5_DEF_PLAIN_OK'], ['DEF_ALIAS', 'ERIX_A5_DEF_ALIAS_OK']]) {
+    const got = (shadows.get(name) ?? []).map((s) => (s.lits ? [...s.lits] : null));
+    assert.ok(got.some((l) => l != null && l.length === 1 && l[0] === lit),
+      `参数默认值没被解析成遮蔽绑定（要求 ${name} → [${JSON.stringify(lit)}]，实际 ${JSON.stringify(got)}）：`
+      + '默认值解析被移除时，文件级字面量收集器仍会把那个名字**顺带**收进静态表 ⇒ 只看枚举与 unsupported '
+      + '两本账看不出机件被拆（审计点名的假绿形状），所以这里钉的是解析结果本身');
+  }
+});
+
+test('活二⑳ 「不许猜」的边界仍在：rest 参数 / 无默认值的解构成员 / 解析不出的默认值都得进 unsupported', () => {
+  // ⑲说「解析得出的不许白丢」，这一格钉它的反面：**解析不出的一律不许猜成外层同名常量**。
+  // 三形都是「名字确实被绑定了，但绑的是什么值静态上看不出来」：
+  //   · `...REST_ENV` 收到的是变长实参数组；
+  //   · `{ k: DESTRUCT_ENV }` 的值来自调用方传的对象；
+  //   · `DEF_DYN = globalThis.zz?.a` 的默认值不是字面量、也不是已知名。
+  // 三形都必须断开外层同名常量（幻影不许进枚举）、逐条进 unsupported。
+  const src = [
+    "const REST_ENV = 'ERIX_A5_REST_PHANTOM';",
+    "const DESTRUCT_ENV = 'ERIX_A5_DESTRUCT_PHANTOM';",
+    'export function restParam(A, ...REST_ENV) { return process.env[REST_ENV]; }',
+    'export function destructParam({ k: DESTRUCT_ENV }) { return process.env[DESTRUCT_ENV]; }',
+    'export function unresolvableDef(DEF_DYN = globalThis.zz?.a) { return process.env[DEF_DYN]; }',
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('shadow-no-guess', src);
+  assert.deepEqual(keys, [],
+    `三个静态上判不出的读形里出现了具体 env 名（实际 ${JSON.stringify(keys)}）：那一格在**猜**——`
+    + '猜中幻影（外层同名常量）就把动态读错记成静态 key，猜错方向就把该登记的旋钮从三腿判据里抽掉');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), [
+    'fx.js:3 process.env[REST_ENV]',
+    'fx.js:4 process.env[DESTRUCT_ENV]',
+    'fx.js:5 process.env[DEF_DYN]',
+  ],
+    `三形逐条登记的动态读不对（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}）：`
+    + '少一条就是那一形被猜成了某个名字（rest / 解构成员 / 不可解析默认值）');
+});
+
+test('活二㉑ 嵌套解构要**逐层**进遮蔽表：`{ a: { b: X } }` 漏一层 = 幻影 key 进枚举而 unsupported 为空', () => {
+  // 三轮审计的假绿：`function f({ a: { b: KEY } }) { return process.env[KEY] }` 里 `KEY` **没进遮蔽表**
+  // ⇒ 外层同名常量把那条动态读错记成静态 key（实测 keys=["ERIX_AUDIT_PHANTOM"]、unsupported=[]）。
+  // 旧 `paramBindingsIn()` 只把「冒号右边是个简单标识符」当绑定；冒号右边还是解构时，递归进去的那个片段
+  // 以 `a:` 开头 ⇒ 既不是名字也不是 `{`/`[` ⇒ **静默返回空**（= 这里没遮蔽），于是闸门全绿。
+  // 每一层都要有名字进来：对象套对象 / 对象套数组 / 数组套对象 / 数组套数组（带洞）/ rest 的目标是解构 /
+  // 箭头参数的嵌套解构。带默认值的那一形方向相反（**必须解析成那个常量**，见⑲同一口径）。
+  const src = [
+    "const NEST_ENV = 'ERIX_A5_NESTED_PHANTOM';",
+    "const CTRL_ENV = 'ERIX_A5_NESTED_CTRL_OK';",
+    'export function objInObj({ a: { b: NEST_ENV } }) { return process.env[NEST_ENV]; }',       // 审计原形
+    'export function objInArr({ a: [NEST_ENV] }) { return process.env[NEST_ENV]; }',
+    'export function arrInObj([{ x: NEST_ENV }]) { return process.env[NEST_ENV]; }',
+    'export function arrInArr([, { x: [NEST_ENV] }]) { return process.env[NEST_ENV]; }',         // 洞 + 嵌套
+    'export function arrRest([first, ...[NEST_ENV]]) { return process.env[NEST_ENV]; }',         // rest 的目标
+    "export function nestedDefault({ a: { b: DEF_NEST = 'ERIX_A5_NESTED_DEF_OK' } }) { return process.env[DEF_NEST]; }",
+    'export const arrowNested = ({ a: { b: NEST_ENV } }) => process.env[NEST_ENV];',             // 箭头那一形
+    'export const ctrl = process.env[CTRL_ENV];',                                                 // 对照组
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('nested-destructuring', src);
+  assert.ok(!keys.includes('ERIX_A5_NESTED_PHANTOM'),
+    'ERIX_A5_NESTED_PHANTOM 只出现在**被参数遮蔽**的读形里却进了枚举（实际 ' + JSON.stringify(keys) + '）：'
+    + '那一层的解构成员没进遮蔽表 ⇒ 动态读沿用了文件级同名常量 = 幻影 key，而真的动态读在 unsupported 里隐形');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`),
+    [3, 4, 5, 6, 7, 9].map((n) => `fx.js:${n} process.env[NEST_ENV]`),
+    `六形嵌套解构的动态读没**逐条**进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}）：`
+    + '少一条就是那一形（对象套对象 / 对象套数组 / 数组套对象 / 数组套数组带洞 / rest 目标 / 箭头参数）没被递归到');
+  assert.deepEqual(keys, ['ERIX_A5_NESTED_CTRL_OK', 'ERIX_A5_NESTED_DEF_OK'],
+    `枚举不对（实际 ${JSON.stringify(keys)}）：嵌套里**解析得出的默认值**（ERIX_A5_NESTED_DEF_OK）必须在，`
+    + '没被遮蔽的静态对照（ERIX_A5_NESTED_CTRL_OK）也必须在 —— 少任何一个都是把「遮蔽」与「解析」算错方向');
+});
+
+test('活二㉒ ASI 箭头（省略分号）：表达式体必须在行尾结束，但**续行形状**不许跟着一起算窄', () => {
+  // 三轮审计的假红：`const f = (KEY) => process.env[KEY]` 换行后接 `process.env[KEY];` ⇒ **两条**读取都进
+  // `unsupported`、`keys=[]`。`expressionBodyEnd()` 原先只列「哪些开头算边界」（关键词清单），下一行以普通
+  // 标识符 `process` 开头不算边界 ⇒ 遮蔽拉到文件尾，箭头**之后**那条读外层常量的静态读被误判成动态。
+  // 反向判据（只有「能接在上一行」的开头才算续行）有两个方向，两个都要钉：
+  //   · 过宽（旧口径）：ASI 之后那条静态读从枚举里消失、unsupported 多一条
+  //   · 过窄（矫枉过正）：`.concat()` / `??` / 跨行三元那些**还在体内**的读形被当成体外 ⇒ 它们会错记成
+  //     外层同名常量（幻影 key）并少几条 unsupported
+  const src = [
+    "const ASI_ENV = 'ERIX_A5_ASI_AFTER_OK';",
+    'export const asi = (ASI_ENV) => process.env[ASI_ENV]',   // 省略分号：体只能到本行为止
+    'process.env[ASI_ENV];',                                   // 外层作用域的静态读 ⇒ 必须进枚举
+    "const CHAIN_ENV = 'ERIX_A5_CHAIN_PHANTOM';",
+    'export const chain = (CHAIN_ENV) => process.env[CHAIN_ENV]',
+    '  ?? process.env[CHAIN_ENV];',                            // 续行：仍在体内
+    'export const dot = (CHAIN_ENV) => process.env[CHAIN_ENV]',
+    '  .concat(process.env[CHAIN_ENV]);',                      // 续行：`(K) => a\n  .b(K)` 同一形
+    "const TERN_ENV = 'ERIX_A5_TERN_PHANTOM';",
+    'export const tern = (TERN_ENV) => flag',
+    '  ? process.env[TERN_ENV]',
+    '  : process.env[TERN_ENV];',                              // 跨行三元：两支都在体内
+    "const SEMI_ENV = 'ERIX_A5_SEMI_AFTER_OK';",
+    'export const semi = (SEMI_ENV) => process.env[SEMI_ENV];',  // 分号收尾：体到此为止
+    'process.env[SEMI_ENV];',
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('asi-arrow-body-end', src);
+  assert.deepEqual(keys, ['ERIX_A5_ASI_AFTER_OK', 'ERIX_A5_SEMI_AFTER_OK'],
+    `箭头**之后**那两条外层静态读没进枚举（实际 ${JSON.stringify(keys)}）：表达式体的边界算宽了 —— `
+    + '省略分号时体必须在行尾（ASI）结束，不许把下一行吞进遮蔽区间（吞了就是一条静态 key 从三腿判据里隐形）');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), [
+    'fx.js:2 process.env[ASI_ENV]',
+    'fx.js:5 process.env[CHAIN_ENV]',
+    'fx.js:6 process.env[CHAIN_ENV]',
+    'fx.js:7 process.env[CHAIN_ENV]',
+    'fx.js:8 process.env[CHAIN_ENV]',
+    'fx.js:11 process.env[TERN_ENV]',
+    'fx.js:12 process.env[TERN_ENV]',
+    'fx.js:14 process.env[SEMI_ENV]',
+  ],
+    `体内动态读该逐条登记的清单不对（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}）：`
+    + '少一条就是体被算窄了（`??` / `.concat()` / 跨行三元那些续行还在体内，把它们当体外就会错记成外层同名常量）；'
+    + '多一条就是体被算宽了（把 ASI 之后的外层读也圈了进来）');
+  for (const phantom of ['ERIX_A5_CHAIN_PHANTOM', 'ERIX_A5_TERN_PHANTOM']) {
+    assert.ok(!keys.includes(phantom),
+      `${phantom} 进了枚举：体内（含续行那几行）的读形被算到了体**外面**，于是沿用文件级同名常量 = 幻影 key`);
+  }
+});
+
+test('活二㉓ 解构形状解析不出 ⇒ fail loudly 进 unsupported，不许静默当成「这里没遮蔽」', () => {
+  // ㉑把能认的形状收全了；这一格钉**认不出**的那些：不许静默返回「没绑定」（那等于外层同名常量继续生效，
+  // 与㉑那个假绿同形），必须把名字按「遮蔽但解析不出」记账 ⇒ 读形逐条进 `unsupported`。
+  // 三形都不是合法解构（`键: 成员表达式` / `键: 调用` / 括号不配对），共同点是**静态上认不出绑定目标**。
+  const shapes = {
+    'member-expression-target': 'export function weird({ a: LEAK_ENV.c }) { return process.env[LEAK_ENV]; }',
+    'call-target': 'export function callish({ a: LEAK_ENV() }) { return process.env[LEAK_ENV]; }',
+    'unbalanced-brackets': 'export function broken({ a: [LEAK_ENV } }) { return process.env[LEAK_ENV]; }',
+  };
+  for (const [name, line] of Object.entries(shapes)) {
+    const src = ["const LEAK_ENV = 'ERIX_A5_OPAQUE_PHANTOM';", line].join('\n');
+    const { keys, unsupported } = scanFixture(`opaque-${name}`, src);
+    assert.deepEqual(keys, [],
+      `形状「${name}」的扫描结果里有具体 env 名（实际 ${JSON.stringify(keys)}）：认不出的解构被当成`
+      + '「这里没绑定」⇒ 外层同名常量被错记成静态 key。错记比漏记更坏：枚举里那个 key 看起来是对的，'
+      + '而真的动态读在 unsupported 里隐形（fail-closed 被绕过）');
+    assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`), ['fx.js:2 process.env[LEAK_ENV]'],
+      `形状「${name}」那条动态读没进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => u.shape))}）：`
+      + '解析不出就必须点名，不许静默放行（不设「记为已知边界」）');
+  }
+});
+
+export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
