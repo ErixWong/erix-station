@@ -8449,3 +8449,56 @@ About 面板上仍显示它们停用时的旧快照摘要（`941a157c…` / `4c1
   `market-mcp.test.js` 6 条；后者是**反向判据**：跨 FDE 搬密文必须解不开、`hidden` 必须整条不物化、
   缺槽必须 409、`detached:true` 必须被红色形状拒）。
 - **文档**：`docs/api/portal.md` §4.18（发布体 / 配置槽只写不读 / 内部下发 / 用户面差异 + 错误码）。
+
+### 8.161 MCP 通道 P1 收尾：三切片合并 + 真机 e2e + copilot 独立审计（#608，2026-11-17，主 agent + 两个 erix_run）
+
+**合并**：三个 worktree 分支（`-02` portal / `-03` runner / `-04` 前端）合进 `feat-261117-01-mcp-channel`
+再追平 main（`5ae41ce`），冲突只有台账一处（main 已占 8.156..8.159 ⇒ 本单让到 8.160/8.161）。
+
+**合并后撞出来的门禁**（都不是「测试写错了」）：
+1. `ERIX_MCP_CONFIG_TIMEOUT_MS` 三腿缺两条（compose / provisioner / fde-proxy 的 `ENV_KEY_ALLOW`）——
+   `deploy-env-delegate` 的「配置面收得下、现场投不进」那条直接红。三腿补齐，缺省 10000ms。
+2. 新增两条**动态 env 读形**必须登记（`runner/lib/mcp-client.js` 的 `baseEnv[key]` 白名单转发、
+   `runner/worker.js` 的 `process.env[name]` 日志回读），否则 #557 的「静默漏投」判据红。
+3. 例外清单是**坐标账**：`config.js` 插 5 行、`provisioner.js` 插 1 行、`worker.js` 长 100 行
+   ⇒ 十几条 `where` 全部漂移。写了个一次性重钉脚本（按 key/读形就近匹配）把坐标挪回去，**理由没动**。
+
+**真机 e2e（本机 dev 栈，本地构建镜像 + mock MCP server）**：
+- 发布 `mock-echo`（stdio / `reason=stateful` / `exposure=deferred` / 一个必填 secret 槽）→ 发布闸门过
+  （MCP 的闸是「配置完整」而不是「有包」）。
+- `GET …/secrets` 只回 `has_value`，`PUT` 写值后仍是 `has_value:true`、响应里**没有值**；
+  `grep -c PLATFORM_INJECTED ~/.erix/*.json` = **0**（值只活在 run 内存里）。
+- 物化：`mcp.json` 是 `{version,servers[]}` 自定义形状（带槽位**声明**、不带值）；
+  `capabilities.json` 的 `mcp` 段只放 name/description/exposure/tool_count。
+- run 里 `declared=1 registered=1 tools=1`；`mcp({action:"list"})` → 「工具 2 个 [已发现 2 个工具]」；
+  `mcp({action:"call"})` → **`PLATFORM_INJECTED:hello-mcp`**（平台注入的槽值真的到了子进程）；
+  `direct` 档展开成 `mcp__mock_echo__echo` 并同样回显前缀；`hidden` 不展开且 `call` 回 `mcp_tool_hidden`。
+- `tools_cache` 回填链路通：agentd 日志 `mcp tools cache backfilled tools=2`，DB 里
+  `manifest.tools_cache` 有两条工具；收尾后容器内 `pgrep -f mock-mcp` = **0**（无孤儿）。
+
+**真机抓到的 3 个真缺陷**（单测全绿也发现不了，只有跑起来才现形）：
+1. **内部通道取错字段**：`/api/internal/mcp/servers` 用了 `user.fde_name`，而 `fde_name` 在
+   `identity.container` 上 ⇒ 恒 `undefined` ⇒ 早退空清单。症状是 `declared=1 registered=0 missing=1`
+   且 **portal 侧一条错都没有**（这条路原本只测了 market 层，没测 http 层的身份形状）。
+2. **MCP 条目串进 skills 清单**：`listCapabilitiesForFde` 少了 `i.kind='skill'` ⇒ `capabilities.json`
+   同时宣称「有个技能 mock-echo」（而它没有包），run 里会出现「装了个技能但工具不存在」。
+3. **`listTools` 重新赋值 `tools`**：`tools = list` 让 `createMcpClient` 暴露的 `tools` 属性永远停在
+   创建时那份 ⇒ `pool.list()` 恒报「工具 0 个」、`call` 恒 `mcp_tool_unknown`，而客户端内部明明拿到了
+   工具。改成原地 `tools.length = 0; tools.push(...list)`，补 MC-24/MC-25 反向判据。
+
+**copilot 只读审计（12 条，逐条自己复核后处置）**：
+- 采纳并修 7 条：安装默认 `enabled=true` 绕过槽闸（改成 MCP 默认 false + 显式启用也过闸）；
+  PUT 部分更新把 `hidden` 静默改回 `deferred`（`requireAll:false` 不许填缺省值）；
+  非法 `scope` 静默当 global（改 400）；用户面 DTO 不带 `manifest`（`args`/`url` 是最容易塞凭据的两格）；
+  `direct` 超 64 KiB 降级只同步了 `mcp.json`、没同步 `capabilities.json`（抽 `effectiveMcpServers` 共享判定 + warn）；
+  解不开的槽值静默进 missing（补运维日志，成因九成是 key 轮换）；`mcp-client` 15 行超 100 字节。
+- **驳回 2 条**（附理由）：「组长退出后孤儿后代」——按 pgid 补刀有 PID 复用风险，且仓库对 shell 子进程组
+  早就是这个口径，两侧必须一致，要改属安全策略变更 ⇒ 登记为 §12.1 已知边界 + 钉住会红的判据（MC-6）。
+  「hidden 会在 list 里露名字」——hidden 在物化层就整条剔除，`list` 那段是配置被篡改时的防御路径，
+  且用户本来就能读自己的 `mcp.json`。
+- 记边界 3 条：短槽值可能被 server 回显进会话（值本来就要交给 server，redact 只覆盖 stderr/错误面）、
+  `deploy/.env` 的 `MCP_SECRET_KEY` 无默认值（缺 key ⇒ 503，这是设计）、§4.18 的槽位上限/`inject` 口径
+  与实现漂移（文档按实现改：上限 16、`secret` 可 `header`、AAD 是 `<item>:<name>:<scope>:<fdeId|空>`）。
+
+**验证**：根 `npm test` ⇒ **2820 pass / 0 fail / 83 skipped**；前端 `typecheck` rc=0、
+`npm test` ⇒ 79 files / **1663 tests**；runner 侧 `node --test 'runner/test/*.test.js'` rc=0。
