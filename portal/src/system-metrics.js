@@ -198,8 +198,17 @@ export function parseUptime(text) {
 /**
  * `/proc/mounts` → **只有真实块设备**的挂载行：`{device, path, fs}`。
  *
- * 只认 `source` 以 `/dev/` 开头的行（issue #650 的口径）：`overlay` / `tmpfs` / `cgroup` / `proc`
- * 那几十行不是「一块盘」，进面板就是噪声。
+ * 只认真实块设备前缀（`/dev/sd*`、`/dev/nvme*`、`/dev/vd*`、`/dev/mapper/*`、`/dev/md*`，见
+ * `REAL_BLOCK_DEVICE_PREFIXES`）：`overlay` / `tmpfs` / `cgroup` / `proc` 那几十行不是「一块盘」，
+ * 进面板就是噪声。
+ *
+ * ⚠ **比「`source` 以 `/dev/` 开头」窄**（这是本轮修掉的缺陷）：`/dev/loop0` 是 snap 的 squashfs、
+ *   `/dev/ram*` 是内存盘、`/dev/zram*` 是压缩内存盘 —— 它们确实挂在 `/dev/` 下，但既不是宿主数据盘、
+ *   用量也毫无运维含义（snap 的 squashfs 是**只读**压缩镜像，`statfs` 报的百分比是镜像填充度）。
+ *   本机 `/proc/mounts` 里 `/dev/loop0..loop15` 有十几条 ⇒ 旧口径会让面板凭空多出十几行假盘。
+ *   排除名单见 `PSEUDO_DEVICE_PATTERN`；分区号（`nvme0n1p2`、`sda1`、`vda2`、`md1`）都在允许前缀之后，
+ *   不需要额外规则。
+ *
  * ⚠ 代价必须写清：容器内的 `/proc/mounts` 是**容器自己的命名空间**，所以
  *   · bind mount 会报**宿主设备**（实测 `/srv/erix/users` → `/dev/nvme0n1p2 ext4`）⇒ 设备名拿得到；
  *   · 而**没被挂进 portal 的盘根本不在这里**⇒ 不会自动出现（`docs/ops/system-metrics.md` 的边界条）。
@@ -211,7 +220,7 @@ export function parseProcMounts(text) {
     const parts = line.trim().split(/\s+/);
     if (parts.length < 3) continue;
     const [source, mountPoint, fstype] = parts;
-    if (!source.startsWith('/dev/')) continue;
+    if (!isRealBlockDevice(unescapeMountPath(source))) continue;
     rows.push({
       device: unescapeMountPath(source),
       path: unescapeMountPath(mountPoint),
@@ -219,6 +228,33 @@ export function parseProcMounts(text) {
     });
   }
   return rows;
+}
+
+/**
+ * 真实块设备的允许前缀（issue #650 磁盘口径 + 本轮缺陷修正）。
+ * 只列「是一块数据盘」的那几族；loop/ram/zram 见 `PSEUDO_DEVICE_PATTERN`。
+ */
+export const REAL_BLOCK_DEVICE_PREFIXES = Object.freeze([
+  '/dev/sd',      // SATA / SCSI（含分区 sda1）
+  '/dev/nvme',    // NVMe（含分区 nvme0n1p2）
+  '/dev/vd',      // virtio / 云盘（含分区 vda2）
+  '/dev/mapper/', // LVM 与 LUKS（dm-<n> 的别名，运维读得懂的就是这个名）
+  '/dev/md',      // 软 RAID（md0、md1p1）
+]);
+
+/**
+ * 挂在 `/dev/` 下但**不是盘**的那些：snap 的 squashfs（loop）、内存盘（ram）、压缩内存盘（zram）。
+ * 必须在前缀判定之后再过一遍：`/dev/loop0` 不以五个允许前缀开头，理论上已经进不来，但
+ * `/dev/md…`/`/dev/sd…` 这类前缀将来若被别的名字蹭到，这一道仍然挡得住（防御性冗余，成本一个正则）。
+ */
+export const PSEUDO_DEVICE_PATTERN = /^\/dev\/(loop\d*|ram\d*|zram\d*)$/;
+
+/** `source` 是不是一块真实数据盘（`/proc/mounts` 第一列）。 */
+export function isRealBlockDevice(source) {
+  const value = String(source ?? '');
+  if (!value.startsWith('/dev/')) return false;
+  if (PSEUDO_DEVICE_PATTERN.test(value)) return false;
+  return REAL_BLOCK_DEVICE_PREFIXES.some((prefix) => value.startsWith(prefix));
 }
 
 function unescapeMountPath(value) {
