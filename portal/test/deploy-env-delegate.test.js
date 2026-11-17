@@ -461,15 +461,22 @@ function scanEnvReadsFromFiles(files, root) {
     const code = stripComments(text);            // 注释 → 空格（行列位不变）⇒ 注释里的读形**不算读取**
     const masked = structuralMask(code);         // 再把字符串正文抹平 ⇒ 用来判「这个位置是不是串里的文字」
     const ctx = analyzeEnvReads(code);
-    const objs = ['process\\.env', ...[...ctx.envObjs].map(escRe)];
-    // 读形：`对象 . 名字` 或 `对象 [ 表达式 ]`（`?.` 两种位置都认）。前视 `(?<![\w$.])` 挡住 `childEnv.X`
-    // 这类「别的对象也叫 env 结尾」的假别名。
+    // env **对象**那一跳也可能带可选链（`process?.env?.X`，#587 族 A③）⇒ 前缀写成 `process\s*\??\.\s*env`。
+    const objs = ['process\\s*\\??\\.\\s*env', ...[...ctx.envObjs].map(escRe)];
+    const OBJ = `(?:${objs.join('|')})`;
+    // 读形：`对象 . 名字` 或 `对象 [ 表达式 ]`。**成员那一跳的可选链必须单独认**：点号那支写成
+    // `(?:\?\.|\.)` 而不是 `(?:\?\.)?\.` —— `process.env?.X` 里 `?.` 之后**没有**第二个点，旧写法两支都不匹配
+    // ⇒ 整形扫不到（#587 族 A③：扫不到 = 静默漏过，等于这道闸门对这个旋钮不存在）。
+    // 前视 `(?<![\w$.])` 挡住 `childEnv.X` / `foo?.BAR` 这类「别的对象也叫 env 结尾」的假别名。
     const readRe = new RegExp(
-      `(?<![\\w$.])(?:${objs.join('|')})(?:\\?\\.)?(?:\\.(${IDENT_RE})|\\[\\s*([^\\]\\n]*?)\\s*\\])`, 'g');
+      `(?<![\\w$.])${OBJ}(?:\\?\\.|\\.)\\s*(${IDENT_RE})`
+      + `|(?<![\\w$.])${OBJ}(?:\\?\\.)?\\s*\\[\\s*([^\\]\\n]*?)\\s*\\]`, 'g');
     // 写形态整段抹成空格（`process.env.X = v` 是给子进程传值，不是「这个 env 名有配置面」）；
     // 只抹「对象 + 成员 + 等号」这一段，赋值**右侧**照旧参与匹配。
+    // 整个「对象+成员」段必须**包在一个分组里**再尾随 `=`：否则 `|` 会把 `\s*=` 只挂到第二支上，
+    // 第一支（点号读形）就变成「凡点号读形都抹掉」= 读形自己把自己抹了。
     const writeRe = new RegExp(
-      `(?<![\\w$.])(?:${objs.join('|')})(?:\\?\\.)?(?:\\.${IDENT_RE}|\\[[^\\]]*\\])\\s*=(?!=)`, 'g');
+      `((?<![\\w$.])${OBJ}(?:\\?\\.|\\.)\\s*${IDENT_RE}|(?<![\\w$.])${OBJ}(?:\\?\\.)?\\s*\\[[^\\]]*\\])\\s*=(?!=)`, 'g');
     const writable = code.replace(writeRe, (m) => ' '.repeat(m.length));
     let line = 1;
     let scanFrom = 0;
@@ -486,7 +493,12 @@ function scanEnvReadsFromFiles(files, root) {
       if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;
       if (m[1] !== undefined) { add(m[1], rel, line, 'dot'); continue; }
       const expr = m[2] ?? '';
-      const lit = resolveExpr(expr, ctx);
+      // 表达式在**本篇代码**里的偏移：从 `[` 之后第一个非空白起算。遮蔽表按偏移开区间记账，
+      // 不传这个数就等于**永远查不到遮蔽**（#587 族 A⑤ 的机件会退化成死代码，而闸门照样全绿）。
+      const lb = m[0].indexOf('[');
+      const after = lb < 0 ? '' : m[0].slice(lb + 1);
+      const at = lb < 0 ? m.index : m.index + lb + 1 + (after.length - after.replace(/^\s+/, '').length);
+      const lit = resolveExpr(expr, ctx, at);
       if (lit) { for (const n of lit) add(n, rel, line, `index:${expr.trim()}`); continue; }
       // 读形认得、名字解析不出（运行期拼名那类）⇒ **fail closed**：进 unsupported 清单，
       // 必须逐条登记进 `deploy/env-legs-exceptions.json` 的 `unsupported` 段并写理由，否则判据红。
@@ -960,12 +972,14 @@ function whereProblems(entries, sources, root = REPO_ROOT) {
         return;
       }
       const { code, ctx } = analyze(ref.rel);
-      const target = code.split('\n')[ref.line - 1];
+      const lines = code.split('\n');
+      const target = lines[ref.line - 1];
+      const lineStart = ref.line === 1 ? 0 : lines.slice(0, ref.line - 1).join('\n').length + 1;
       if (target === undefined) {
         problems.push(`${tag} 指到第 ${ref.line} 行，但那个文件只有 ${code.split('\n').length} 行 ⇒ 坐标过期`);
         return;
       }
-      if (lineMentionsKey(target, ctx, e.key)) return;
+      if (lineMentionsKey(target, ctx, e.key, lineStart)) return;
       problems.push(`${tag} 那一行**不含该 key**（也没有能解析到它的常量名）。实际内容：`
         + `\`${target.trim().slice(0, 90)}\` ⇒ 坐标是编的或已漂移：**行号看着合理不等于它对**`
         + '（注释里出现过也不算，剥完注释才算）');
@@ -975,10 +989,10 @@ function whereProblems(entries, sources, root = REPO_ROOT) {
 }
 
 /** 那一行含该 key 的字面量，或含一个能解析到它的常量名（表驱动那种真坐标必须算通过）。 */
-function lineMentionsKey(lineText, ctx, key) {
+function lineMentionsKey(lineText, ctx, key, lineStart = 0) {
   if (lineText.includes(key)) return true;
   for (const m of lineText.matchAll(new RegExp(IDENT_RE, 'g'))) {
-    const lits = resolveExpr(m[0], ctx);
+    const lits = resolveExpr(m[0], ctx, lineStart + m.index);
     if (lits && lits.has(key)) return true;
   }
   return false;
