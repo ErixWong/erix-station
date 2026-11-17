@@ -384,8 +384,8 @@ test('0041 撤 run_checkpoints：全新库跑到 head、表确实不在、DROP �
       // includes('0041') 断「0041 确在链上」，head 断「链末」——两件事。
       assert.ok(versions.includes('0041-retire-run-checkpoints'),
         '台账必须有 0041（迁移 runner 真的应用了它，而不是只躺在目录里）');
-      assert.equal(versions[versions.length - 1], '0044-system-metrics',
-        'head 就是 0044-system-metrics（#679 之后；这条断言只在有 PG 时跑，CI 无 PG 期间它是哑的）');
+      assert.equal(versions[versions.length - 1], '0045-macro-skipped-reason-review-unavailable',
+        'head 就是 0045-macro-skipped-reason-review-unavailable（#679 的 0044-system-metrics 之后；只在有 PG 时跑）');
       assert.equal(versions.length, computeExpectedVersions().length, '台账 = baseline + 全部增量');
 
       // ② 表真的不在了（`to_regclass` 不存在给 NULL，不因缺表报错）。
