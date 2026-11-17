@@ -8095,6 +8095,15 @@ W6（#529 管理台 UI）。
 **已知边界（未做，别当 bug）**：名册/账本仍无 TTL；`stale` 只做标记（门户不判死活、不改写名册，
 因为名册 `pid` 是容器内 PID）；`activity` 不覆盖「流式正文」（子 run 未开 `partialPersistence`）；
 跨会话/跨 FDE 的全局 agent 面板不做；子 run 的停止/steer 按钮不做（前台子 `cancel` 恒 `not_owned`）。
+
+**`stale` 在界面上基本不可达（2026-11-17 现验代码，不是凭记忆）**：`liveCount` 把 `activity.stale === true`
+的行**减掉**（`portal/frontend/src/composables/useDelegateActivity.ts:287-289`），而徽标可见性是
+`liveCount > 0 || degraded`（`DelegateActivityBadge.vue:31`），面板的唯一开关又是那颗徽标
+⇒ **只剩 stale 子时（= 父 run 已收尾那种主流形态）徽标整段不出、面板打不开**，`DelegateActivityBar`
+里那段 `stale` 中性灰样式**只在「另有一个活态子陪着」时才画得出来**。这不是漏做：#602 之后那条路径
+改由工具卡上的 `orphaned` 中性 `·` 表达（见 §8.156），所以「父 run 收尾」这一面在界面上**是有表达的**，
+只是不走 `stale` 那条渲染分支。要真让 `stale` 自己撑起一块界面，得先回答「父 run 都结束了，这块面板
+还该存在吗」——属于产品决定，不在这里顺手做。
 ### 8.153 能力市场 P0：技能包发布/浏览/安装 + 宿主侧能力索引注入（#595，2026-11-16，主 agent + 两个 pi worker + copilot 评审）
 
 **为什么**：FDE 用户拿不到「平台提供的能力」——技能只能靠镜像 bundled（`/opt/erix/skills`，只有 1 个）
