@@ -8419,7 +8419,7 @@ portal/proxy → **先验在飞 run = 0** 再逐台 `docker rm -f fde-<name>` + 
 **一处遗留，如实记**：3 个 revoked 测试账号（`portsprobe` / `pw173jscw` / `ui17kbwg`）**没有容器**，
 About 面板上仍显示它们停用时的旧快照摘要（`941a157c…` / `4c1e7068…`）——那是**历史快照不是当前运行**，
 面板本来就把第三格标成 `derived copy, not authoritative`，不修（重建一个 revoked 账号的容器没有意义）。
-### 8.157 能力市场 P1：MCP 通道 portal 切片（#608，2026-11-17，主 agent 自己写 + 两个 erix_run 并行跑 runner/前端）
+### 8.160 能力市场 P1：MCP 通道 portal 切片（#608，2026-11-17，主 agent 自己写 + 两个 erix_run 并行跑 runner/前端）
 
 - **为什么主 agent 自己写**：这一片的两个 pi worker 后台 run 连续被外部终止（`Async runner process … exited
   before writing a result`，6h 内两次），第三次改用 `erix_run`（带 sessionDir，可续跑）跑 runner 与前端，
