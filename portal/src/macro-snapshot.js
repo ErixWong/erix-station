@@ -102,6 +102,40 @@ function sha256Text(s) {
   return crypto.createHash('sha256').update(s).digest('hex');
 }
 
+/**
+ * 取 HEAD 的 commit sha；**0 提交仓库（尚无 HEAD）返回空串 `''`**，不抛错。
+ *
+ * 用 `rev-parse --verify HEAD` 而非 `rev-parse HEAD`：前者在无 HEAD 时干净地以非 0 退出
+ * （`--verify` 的语义就是「不存在则失败」），后者会把 `HEAD` 当歧义参数报
+ * "ambiguous argument"（#670 真机原文），两种写法退出码一样但错误信息更易误判为
+ * 「仓库坏了」；这里统一以退出码分类：**失败 ⇒ 无 HEAD**，不猜别的成因。
+ *
+ * `runGit` 可注入，便于单测伪造「有 HEAD / 无 HEAD / git 本身炸了」三态。
+ *
+ * @param {string} repoDir
+ * @param {{timeout?:number, runGit?:function}} [opts]
+ * @returns {string} commit sha，或 `''`（0 提交）
+ */
+export function headShaOrEmpty(repoDir, { timeout, runGit = git } = {}) {
+  try {
+    return runGit(['-C', repoDir, 'rev-parse', '--verify', 'HEAD'], { timeout }).trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 仓库是否有 HEAD（= 至少一个提交）。0 提交是**多数情形**（见 issue #670：真机现查
+ * 7 个工位里 5 个 `rev-list --count HEAD` 为 0），不是异常态。
+ *
+ * @param {string} repoDir
+ * @param {{timeout?:number, runGit?:function}} [opts]
+ * @returns {boolean}
+ */
+export function hasHead(repoDir, opts = {}) {
+  return headShaOrEmpty(repoDir, opts) !== '';
+}
+
 function sha256File(absPath) {
   const buf = fs.readFileSync(absPath);
   return crypto.createHash('sha256').update(buf).digest('hex');
@@ -154,10 +188,15 @@ function parseChangedTrackedPaths(statusOut) {
  *   作用是**同位置**的陈旧探测器（配合 sha 快速判漂移），不进比对用的 digest；否则
  *   搬运前（原目录）与搬运后（worktree）永远不等 ⇒ 每次都被判 `snapshot_unstable`。
  *
+ * ⚠ **`head` 允许为空**：0 提交仓库没有 HEAD，此时 `head === ''`（哨兵空串，**不是错误**、
+ *   也不是「未知」）。空串在搬运前后各取一次都是同一个值 ⇒ digest 仍可比对，一致性校验
+ *   照常有效（0 提交仓库的比对实际只靠 status + 内容 sha256，本来也不含 commit 维度）。
+ *
  * @returns {{ head:string, status:string, entries:object[], untracked:object[], totalBytes:number, digest:string }}
  */
 export function computeContentFingerprint(repoDir, { contentLevel = true, timeout } = {}) {
-  const head = git(['-C', repoDir, 'rev-parse', 'HEAD'], { timeout }).trim();
+  // 0 提交 ⇒ ''（见上：哨兵，不抛错）
+  const head = headShaOrEmpty(repoDir, { timeout });
   const status = git(['-C', repoDir, 'status', '--porcelain', '-uall'], { timeout });
   const untrackedPaths = parseZList(
     git(['-C', repoDir, 'ls-files', '--others', '--exclude-standard', '-z'], { timeout }),
