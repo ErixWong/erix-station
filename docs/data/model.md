@@ -580,6 +580,88 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 用例：`portal/test/macros.test.js`（幂等键、软删三分支、`until` 到期、四条枚举 CHECK）。
 
 
+### 1.34 `system_metrics` — 宿主资源指标的时序主表（issue #650，migration 0042）
+
+> 同上：来自增量迁移 `0042-system-metrics.sql`；baseline `docs/data/schema.sql` 冻结、零字节不动。
+> 要治的是「管理台没有任何宿主资源读面」：CPU / 内存 / 磁盘 / 容器数只能靠人 SSH 上机 `htop` + `docker ps`，
+> 症状是「FDE 变慢」而**平台自己不知道宿主是不是快满了**。API 形状见 `docs/api/portal.md` §4.18，
+> 运维动作（怎么关、怎么加盘）见 `docs/ops/system-metrics.md`。
+
+**表用途**：每 `SYSTEM_METRICS_INTERVAL_SECONDS`（默认 30）秒一行，是宿主指标的**历史真相**。
+设计决定里最要紧的一条是「只存原始点，查询时分桶」——不做「原始 + 小时汇总」双层表（那要两套写路径
+加一个降采样 job）；30d × 30s = 86,400 行的主键范围扫是毫秒级，而分桶在服务端做，浏览器永远拿不到原始点。
+
+| 列组 | 语义 |
+|---|---|
+| `sampled_at` `timestamptz` **PRIMARY KEY** | **自然键**：这一拍的采样时刻（应用侧的 `Date`，与 `written_at` 同拍）。写侧 `ON CONFLICT (sampled_at) DO NOTHING` ⇒ 重放是空操作。**这是对全局规范的显式偏离，见下一段** |
+| `cpu_usage_pct numeric(5,2)` / `cpu_cores smallint` / `load1`/`load5`/`load15 numeric(8,3)` | CPU 占用是**两次 `/proc/stat` 的差**算出的（不是累计值）；`numeric(5,2)` 装得下 0.00–999.99，多核半开以上不会溢出。`load*` 直接透传 `/proc/loadavg`（单位是「 runnable 平均个数」，与核数相关 ⇒ 不除核数，口径在 `parseLoadavg`） |
+| `mem_*_bytes bigint` / `swap_used_bytes` | `MemTotal` / `MemTotal-MemAvailable` / `MemAvailable` / `Cached`（+ SwapUsed）。`mem_used_bytes` 与 API 里的 `mem.usedPct` 同源；`MemAvailable` 缺失时**不拿 `MemFree` 顶替**（`numOrNull` ⇒ `null`，不把「不知道」当 0） |
+| `uptime_seconds bigint` | `/proc/uptime` 第一字段——页面上「宿主已运行 N 天」的唯一来源（也是「DB 里的行是不是陈旧」的交叉校验） |
+| `containers_total` / `_running` / `_station`、`fde_total` / `fde_running` | 容器计数口径写死在 `countContainers()`：总数 = 宿主全部；`station` = `Labels['station.managed']='true'`；`fde` = managed 或名字形如 `fde-*`。只读已在 Docker 白名单里的 `/containers/json`——**`stats`（1.02s/个）与 `/system/df`（15s）本单不碰** |
+| `drift_count integer` | 「DB 说 N 台 ↔ Docker 实际 M 台」的对称差个数（`containerDrift()`）。只存**个数**：是谁（`onlyDb`/`onlyDocker`）只在 `latest` 里给，历史曲线不需要点名 |
+| `written_at timestamptz NOT NULL` | 应用侧写（AGENTS §3.4：DDL 不写 `DEFAULT now()`），与 `sampled_at` 同拍；两者差得远就是写慢了的证据 |
+
+**`sampled_at` 当主键 = 对 AGENTS §3.4「主键一律 `VARCHAR(32)` 单层字符串」的显式偏离（⚠️ 待决策者确认，issue #650 已标注）**
+
+本站全局规范是「主键一律 `VARCHAR(32)` 单层字符串（`newId()`）」。这两张表**故意不遵守**，理由：
+
+1. **时间序列表的自然键就是采样时刻**——它天然唯一（一拍一个时刻）、天然有序（范围扫即主键扫）、
+   天然幂等（`ON CONFLICT (sampled_at) DO NOTHING` 直接可用，不需要先查一次「这一拍写过没有」）。
+   再加一个代理键不会多换来任何一个好处，只会让幂等键退化成「`id` 唯一 + 采样时刻靠约定」。
+2. **`newId()` 在这里只是每行 32 字节的死重量**：30 天基线 86,400 行 ⇒ 约 2.7 MB 纯索引死重（再加
+   一个 `sampled_at` 二级索引才能真正等价）。而这张表的全部读法都是「按时间范围取」，
+   `VARCHAR(32)` 主键在那个读法上一个字都服务不到。
+3. **代价是可控且可逆的**：这两张表零外键指向它们（只有 disks → 主表的 `ON DELETE CASCADE`），
+   没有跨表 JOIN 依赖主键形状；将来真要换 `VARCHAR(32)`，是一次 additive 迁移（加列 + 回填 + 换键），
+   不需要改任何读面语义。
+
+> 同意的偏离必须先写进本文再写迁移（不是反过来）。⚠ 本条待决策者确认；若要回到规范，
+> 开口在 issue #650，不在本文自改。
+
+**保留期与膨胀口径**：默认留 `SYSTEM_METRICS_RETENTION_DAYS = 30` 天（合法区间 1–365，越界回落默认 + warn）。
+清理**不单开循环**，挂在 reaper 已有的**小时级**清理槽上（`internal.js`，一小时一个事务）；
+`purgeSystemMetrics()` 那句 `DELETE` 额外带一个 `AND sampled_at < (SELECT MAX(sampled_at) ...)`
+——**保住最新一拍**（采样器停了很久再启动时，「now() - 30d」可能已晚于库里唯一那批旧行，全删会让
+历史图彻底空白），代价是主键上一次 index scan，毫秒级。磁盘行不单独清，靠 `ON DELETE CASCADE` 跟着走。
+
+膨胀量级（写死在这里，便于下次算）：每拍 = 1 行主表 + N 行磁盘表（默认 N=1）。30s 拍频下
+一天 = 2,880 行主表行，30 天 = 86,400 行；每行 18 个窄列，量级上「一张表几十 MB」而不是 GB——
+这就是它不需要分区、不需要汇总层的原因。**拍频是写入成本的唯一旋钮**（`5s` 是最小可用粒度，
+低于它写放大开始咬人；`300s` 以上曲线已经不够看）。
+
+写入方 = 只有 `portal/src/system-metrics.js`（`writeSample`，一个事务里写两张表）；读取方 =
+同文件的 `querySeries()`（服务端分桶 + 5s 进程内缓存）与 `toApiLatest()`（内存那一拍）。
+用例：`portal/test/system-metrics.test.js`；「全新库跑通 + 重放幂等」在 `portal/test/migrate-fresh-db.test.js`。
+
+
+### 1.35 `system_metrics_disks` — 同一拍里的逐盘行（issue #650，migration 0042）
+
+**表用途**：一行 = **一块物理盘（一个文件系统）在一拍里的读数**。`sampled_at` 是 FK →
+`system_metrics (sampled_at)` 且 **`ON DELETE CASCADE`**（保留期清理只删主表，磁盘行跟着走 ⇒
+只有一句 `DELETE`，不会出现「主表清了、磁盘表还在堆」的半于状态）。
+
+**主键是 `(sampled_at, device)`，不是 `(sampled_at, path)`**——这是本表存在的语义：
+同一个文件系统上 bind 了多个路径时，`statfs` 的结果**完全相同**（它们本来就是同一个盘），
+按 path 当键会让面板出现「三行一模一样的 937G」，还会让「已监控 N 个文件系统」的 N 变成谎。所以
+写侧按设备去重（`diskRows()`）：`/proc/mounts` → 只留**真块设备**（`REAL_BLOCK_DEVICE_PREFIXES`，
+并排除 `/dev/loop*`、`/dev/ram*`、`/dev/zram*` 这类伪设备）→ 同设备多路径取**最短 path**
+（最短 = 最接近挂载根，面板上给人看的那一行要的是挂载点而不是某个嵌套 bind）。
+
+| 列 | 语义 |
+|---|---|
+| `device text` | `/proc/mounts` 的**来源设备**——bind mount 下报的是**宿主**设备（实测），所以它能当「同一块盘」的身份证。挂载表**先过 `isRealBlockDevice()`**：只留 `/dev/sd*`、`/dev/nvme*`、`/dev/vd*`、`/dev/mapper/*`、`/dev/md*` 五族，并再挡一遍 `/dev/loop*`/`ram*`/`zram*`。前缀匹配不到（典型：容器里的 `/` 是 overlay，source 不是 `/dev/`）⇒ `device='unknown'`、`fs='unknown'`，**这一行仍然出**（只是说不清它是谁） |
+| `path text` | 容器内**被 `statfs` 的那个路径**（来自 `SYSTEM_METRICS_DISK_PATHS`，同设备取最短，等长再按字典序⇒ 确定性）。它是展示用的引用，**不是键**——换一条 env 路径不会换一行历史 |
+| `fs text` | `ext4` / `overlay` / `xfs` …，直接透传 mounts 表的 fstype |
+| `total_bytes` / `used_bytes` / `avail_bytes bigint` | `statfs` 的 `df` 口径：`total = blocks*bsize`、`used = total - bfree*bsize`、`avail = bavail*bsize`（**拿 `bavail` 当 free 去算 used** 会把 root 预留那几十 G 算成「没人用」，与 `df -h` 差一截）；四个源字段任何一个缺失 ⇒ 整行不写（`NOT NULL` 三列不能写「不知道」），该路径落到 `diskUnreadable`；usedPct 在 API 层现算，表里不存百分比 |
+
+**边界（写进数据层而不是只写进面板）**：未挂进 portal 容器的盘**不会自动出现在这里**——容器看不见
+宿主挂载表，能 `statfs` 的只有 `SYSTEM_METRICS_DISK_PATHS` 里写了、且容器内真实存在的路径。
+配了但读不到的路径不会静默消失：它进 `latest.diskUnreadable[]`（带 `reason`）露面，只是**不落库**
+（一行读不到字节数的磁盘行在历史图上只会变成贴底的假线）。
+
+写入方与读取方与 §1.34 同一处（`disksInsertSql()` 的多值 `INSERT … ON CONFLICT (sampled_at, device) DO NOTHING`）。
+
+
 ---
 
 ## 2. 状态机
@@ -905,3 +987,4 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | 16 | `max_attempts` 默认值与耗尽终态 | 默认 3；耗尽 → `failed(max_attempts_exceeded)` | §1.16/§2.8（已落 DDL） |
 | 17 | materializer outbox 复用 `route_outbox` vs 新增表 | ✅ 新增 `materialize_outbox` + `materialize_revisions`（A7，避免与路由 reconciler 争抢） | §1.22；user-space.md §7.1 |
 | 18 | `checkpoint_failed` 是否自动 re-claim | 不自动 re-claim（终态，人工重发；A3 定稿） | §2.9；portal.md §6.2 需同步提示口径 |
+| 19 | ⚠️ `system_metrics` / `system_metrics_disks` 用 `sampled_at`（`timestamptz`）当主键，**偏离 §3.4「主键一律 `VARCHAR(32)`」**（issue #650，migration 0042） | 保留偏离（自然键 = 采样时刻，天然幂等；`newId()` 只是每行 32 字节死重；理由全文见 §1.34）；若要回到规范是一次 additive 迁移 | §1.34–§1.35；`deploy/migrations/0042-system-metrics.sql` 头注同步标注 |
