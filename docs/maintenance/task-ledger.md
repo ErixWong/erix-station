@@ -8497,7 +8497,7 @@ M7 管道在真机上**确实通了**（`clock:2026-11-17` → `done`、宏会�
 `UPDATE users SET mail_otp_enabled=false WHERE login='eric'`（**原值 `t`**）。
 
 **待办**：#646（M1/M9 触发源，在跑）、#637（M7 产物三缺陷，在跑）。
-### 8.162 能力市场 P1：MCP 通道 portal 切片（#608，2026-11-17，主 agent 自己写 + 两个 erix_run 并行跑 runner/前端）
+### 8.164 能力市场 P1：MCP 通道 portal 切片（#608，2026-11-17，主 agent 自己写 + 两个 erix_run 并行跑 runner/前端）
 
 - **为什么主 agent 自己写**：这一片的两个 pi worker 后台 run 连续被外部终止（`Async runner process … exited
   before writing a result`，6h 内两次），第三次改用 `erix_run`（带 sessionDir，可续跑）跑 runner 与前端，
@@ -8528,7 +8528,7 @@ M7 管道在真机上**确实通了**（`clock:2026-11-17` → `done`、宏会�
   缺槽必须 409、`detached:true` 必须被红色形状拒）。
 - **文档**：`docs/api/portal.md` §4.18（发布体 / 配置槽只写不读 / 内部下发 / 用户面差异 + 错误码）。
 
-### 8.163 MCP 通道 P1 收尾：三切片合并 + 真机 e2e + copilot 独立审计（#608，2026-11-17，主 agent + 两个 erix_run）
+### 8.165 MCP 通道 P1 收尾：三切片合并 + 真机 e2e + copilot 独立审计（#608，2026-11-17，主 agent + 两个 erix_run）
 
 **合并**：三个 worktree 分支（`-02` portal / `-03` runner / `-04` 前端）合进 `feat-261117-01-mcp-channel`
 再追平 main（`5ae41ce`），冲突只有台账一处（main 已占 8.156..8.159 ⇒ 本单让到 8.160/8.161）。
@@ -8580,3 +8580,59 @@ M7 管道在真机上**确实通了**（`clock:2026-11-17` → `done`、宏会�
 
 **验证**：根 `npm test` ⇒ **2820 pass / 0 fail / 83 skipped**；前端 `typecheck` rc=0、
 `npm test` ⇒ 79 files / **1663 tests**；runner 侧 `node --test 'runner/test/*.test.js'` rc=0。
+
+### 8.161 事件平台收尾：#646 终态触发源 + #637 M7 产物，以及「fixture 比现实友好」的连环坑（2026-11-17，主 agent + erix_run × 2）
+
+接 §8.160。**11 个缺陷全部修完合并**，最后一轮真机复验把 M1 与 M7 都跑通了，但也挖出第 12 个（#652，在跑）。
+
+| 单 | PR | 合并 | 内容 |
+|---|---|---|---|
+| #646 | #649 | `8735f9f` | **M1/M9 的触发源**：`finishRun` 产生终态宏意图 |
+| #637 | #651 | `e7842e1` | M7 三缺陷：`pollRunTask` 真实实现 / 产物落用户可见挂载 / 中文名保留 |
+| #652 | — | 在跑 | M7 产物恒 0 字节（`run_id` 97% 是 NULL） |
+
+#### 真机复验结果（这是整轮的目标）
+
+```
+M7: clock:2026-11-17 → done                          评估→claim→意图→dispatcher→执行器→收尾 全通
+产物: /srv/erix/users/eric/reports/每日巡检/2026-11-17.md   ← 用户可见挂载 + 中文名保留 ✅
+M1: run:05beae2d-… → done + notifications「宏「跑完告诉我」」   ← 终态通知真的发出去了 ✅
+```
+
+**M1 与 M7 都是首次端到端可用。** 但产物文件 **0 字节** —— 见下。
+
+---
+
+#### 这一轮最值钱的教训：**fixture 比现实友好，用例就绿得毫无意义**
+
+三个连环坑，全是同一形态：
+
+1. **#637 的 `runTask` 用例**：①-4 直接测 `pollRunTask`、①-5 **注入** `runTask`
+   ⇒ 两条都绕过 `defaultRunTask`。用例注释写着「改回空壳桩 ⇒ 本条红」，**实测是假的**。
+2. **#637 的产物根用例**：全部**注入** `config.userSpaceRoot`
+   ⇒ 把缺省改回 `os.homedir()` 仍然全绿。**缺省值从来没被测过。**
+3. **#652 的 transcript 用例**：自己造 `transcript_rounds` 行并**显式写了 `run_id`**，
+   而线上 **3219 行里只有 96 行有 `run_id`**（97% 是 NULL，真相在 `transcript_key = sessionId`）
+   ⇒ 用例绿、线上产物恒空。
+
+⇒ **三条可复用口径**：
+
+- **凡 `x = default` 的参数，必须有一条「不传 x」的用例钉住缺省本身。**
+  注入式用例只能证明「注入的东西生效」，证明不了缺省。
+- **凡「从表里读一行」的用例，fixture 必须复刻线上真实的列分布**（哪些列基本为 NULL）。
+  自己编一个「各列都填好」的行，等于给自己发绿卡。
+- **判据要落在「用户最终看到的东西」上**：M7 的判据原本是「账上 `done`」，
+  而真正该验的是「产物文件非空且内容正确」。**账上 done 与产出可用是两件事**（§8.160 已记，
+  这轮又验证了一次）。
+
+#### 过程账
+
+- **#646 的 `emitTerminalMacroIntents`** 用可注入 `config.onMacroIntents` 接线（不 import dispatcher），
+  异步 `.then().catch()` 不阻塞 run 收尾 —— 这两条是工单里写死的，执行体照做了。
+- **#637 的 `pollRunTask`** 替换空壳桩；`safe()` 改 `\p{L}` 保留中文；
+  产物根改 `/srv/erix/users/<fde_name>/reports`。
+- **两次后台 run 被 pi 重启杀掉**（w-611 死 2 次）⇒ `resume` 救回，已在 §8.160 记。
+- **`git worktree remove` 之后再 `cd` 进去会报 No such file**（本轮踩了一次，
+  导致后续命令链静默失败）⇒ 清理与后续操作要分开两条命令。
+
+**待办**：#652（M7 产物正文，在跑）。修完后需再跑一次真机确认产物非空。
