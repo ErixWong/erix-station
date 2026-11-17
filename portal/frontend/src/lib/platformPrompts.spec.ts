@@ -277,7 +277,7 @@ describe('契约节号机械闸：面板只许 §4.19（第三次撞号后的常
 
   it('反向自证：写着 §4.18 的样本喂进函数必须判红并点名', () => {
     // 提示词语境行 + §4.18 ⇒ 必须红（共享文件 requireContext=true）。
-    const sample = 'NODE=x\n// 提示词面板引用 docs/api/portal.md §4.18-2\n';
+    const sample = 'NODE=x\n// 提示词面板旧号 §4.18-2（测试样本，非真引用）\n';
     const hits = findSectionDrift(sample, '.env.example', true);
     expect(hits, '提示词语境的旧号 §4.18 必须被判红').toHaveLength(1);
     expect(hits[0]).toContain('.env.example:2');
