@@ -1693,4 +1693,71 @@ test('文档编号唯一性闸：docs/api/portal.md 的三级标题号（H3 的 
   // 边界：`4.4` 与 `4.4a` 是两个号（文档里大量使用字母后缀，误判就是假红）；小节 `#### 4.16-1` 不参与。
   assert.deepEqual(duplicateSectionNumbers('### 4.4 乙\n### 4.4a 丙\n#### 4.4-1 丁\n#### 4.4-1 戊'), {},
     '字母后缀子号与 `####` 小节不许被判成撞号');
+  // ↑ 这里说「`####` 不参与」**只针对本闸**（撞号命名空间）：小节号自己另有归属闸 ——
+  //   下面那条「小节号必须挂在同名 H3 下」。两道闸各管一件事，不是这里写漏了。
+});
+
+// ---------------------------------------------------------------------------
+// 上一节那条闸的**盲区**（评审 R9）：`duplicateSectionNumbers` 只读 H3，而小节写的是
+// `#### N.N-x`——那个 `N.N` 本意就是「我挂在哪个 H3 下面」，却从来没人对账过。
+// 现场：合并 `origin/main` 后能力市场那一节是 `### 4.17`，而它下面**六个**小节仍叫
+// `#### 4.16-1 … 4.16-6`（§4.16 早已是 #586 的管理台「关于」）⇒ 按小节号去找节会找到邻居家。
+// 裁决：闸扩成「小节号 ≡ 它上面那个 H3 的号」，违规点名（哪个小节、挂在哪个 H3 下、应该叫什么）。
+// 口径：比较的是**数字本体**（`### 4.4a` 下面的 `#### 4.4-1` 算对，字母后缀不参与比较）；
+// 不带号的 `####` 小标题不参与；文档里代码块内没有 `#### N.N-x` 形状的行（实测），
+// 所以本闸不跟踪围栏。
+//
+// 反向自证（常驻）：把 `#### 4.16-1` 挂在 `### 4.17` 下面必须判红且点名两个标题。
+// ---------------------------------------------------------------------------
+
+/**
+ * 「小节号与主人不一致」的清单（干净文档 ⇒ 空数组）。
+ * 每条都带：那一行原文、它挂在哪个 H3 下、以及它**应该**叫什么。
+ */
+function subsectionNumbersOutOfParent(markdown) {
+  const bad = [];
+  let h3 = null;   // 当前那个 H3（`### N.N[a-z]*`）
+  for (const line of markdown.split('\n')) {
+    const m3 = /^### (\d+\.\d+)([a-z]*)\s/.exec(line);
+    if (m3) { h3 = { num: m3[1], title: line.trim() }; continue; }
+    const m4 = /^#### (\d+\.\d+)-/.exec(line);
+    if (!m4) continue;
+    if (!h3) {
+      bad.push(`${line.trim()} ⇒ 上面没有任何「### N.N」可挂（它得先有个主人）`);
+      continue;
+    }
+    if (m4[1] === h3.num) continue;
+    bad.push(`${line.trim()} ⇒ 挂在 ${h3.title} 下面，小节号必须与主人同号（应为 #### ${h3.num}-…）`);
+  }
+  return bad;
+}
+
+test('文档小节归属闸：`#### N.N-x` 的小节号必须等于它上面那个 H3 的号（评审 R9 的盲区）', () => {
+  const doc = fs.readFileSync(path.join(HERE, '../../docs/api/portal.md'), 'utf8');
+  const out = subsectionNumbersOutOfParent(doc);
+  assert.deepEqual(out, [],
+    'docs/api/portal.md 里每个「#### N.N-x」的小节号必须与它所属那一节同号：\n' + out.join('\n'));
+
+  // 常驻反向自证·①：真实现场那个形状（`#### 4.16-1` 挂在 `### 4.17` 下面）必须判红。
+  const misplaced = subsectionNumbersOutOfParent([
+    '### 4.17 能力市场（`/api/market/*`，issue #595）',
+    '#### 4.16-1 `GET /api/market/items`',
+    '#### 4.17-2 `GET /api/market/items/:slug`',
+  ].join('\n'));
+  assert.equal(misplaced.length, 1, `只许抓到那一条违规（实得 ${JSON.stringify(misplaced)}）`);
+  assert.match(misplaced[0], /#### 4\.16-1/, '要点名**哪个小节**');
+  assert.match(misplaced[0], /### 4\.17 能力市场/, '要点名它**挂在哪个 H3 下**');
+  assert.match(misplaced[0], /#### 4\.17-/, '要给出它应该叫什么（否则修的人还得自己推）');
+
+  // 常驻反向自证·②：同号但挂错节（两道闸都不拦的形状，只有这条拦得住）。
+  assert.equal(subsectionNumbersOutOfParent('### 4.16 关于\n### 4.17 市场\n#### 4.16-1 装').length, 1,
+    '小节号在自己的节里、但人已换到下一节 ⇒ 必须报（这正是 H3 唯一性闸的盲区）');
+
+  // 常驻反向自证·③：干净形状不许误伤（同号、字母后缀主人、不带号的小标题、主人之前没有小节）。
+  const CLEAN = ['### 4.17 市场', '#### 4.17-1 甲', '#### 4.17-2 乙', '#### 形状约定',
+    '### 4.4a 边（字母后缀的主人）', '#### 4.4-1 丙'].join('\n');
+  assert.deepEqual(subsectionNumbersOutOfParent(CLEAN), [],
+    '合法形状不许假红（字母后缀的主人名下用数字本体比较）');
+  // 边界：小节出现在任何 H3 之前 ⇒ 也要点名（不能默默放过）。
+  assert.match(subsectionNumbersOutOfParent('#### 4.2-1 孤儿').join('\n'), /没有任何/, '无主小节也要点名');
 });
