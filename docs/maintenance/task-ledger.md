@@ -8292,3 +8292,76 @@ fde `84007d94…` / proxy `3c3f6eb6…`）⇒ 部署再走一步，把栈整体�
 间歇性抽风，与 AGENTS §4 记的那条同族）。兜底：给 `erix_station_playwright` 容器 `/etc/hosts` 加
 `172.17.0.1 admin.fde.erix.vip station.fde.erix.vip`（Traefik `network_mode: host`，管理台入口在宿主 9443），
 重跑即 5/5。**这是测试环境兜底，不是产品修复**；容器重启后该行会消失，下次 skip 先查这一条。
+
+### 8.158 事件平台真机 e2e 首轮：主链路可用，但**三条主功能根本没接通**（2026-11-17 凌晨，主 agent + copilot 独立验收）
+
+接 §8.148。八单合并后主 agent 判断只到「代码交付」档，`0 模板 / 0 订阅 / 0 执行账 / 0 通知`
+说明整条链路一次都没端到端跑过。本单做首轮真机 e2e，**结论推翻了自己此前的乐观判断**。
+
+**方法**：curl 打 API + playwright 实点 + 截图（逐张读过）+ DOM 文本断言。
+环境：dev 栈（portal up 3h healthy / db up 7d / Traefik 8090 用户面 + 9443 管理台）。
+报告：`~/worker-reports-261108/e2e-event-platform-261117.md`。
+
+#### 验通的（逐条实测）
+
+管理台：两个新 tab 都在；建模板成功；5 筛选齐全；汇总口径**正确**
+（`triggered=6/done=4`，`byVerdict` 各 25% —— **分母是 done 不是 triggered**）；「跳过」单列；
+无 session 列；Cost 缺数据显示 `—` 不是 `↑0 ↓0`。
+用户面：三个件都在（chip / 铃铛 / 侧栏 Automation 分组）；会话级 chip 点开 "Watch log" 抽屉
+（宽 510px ✓、只有 Template/Verdict 两个筛选 ✓、空态 ✓）；挂订阅后顶部状态条 + 5 个判决映射 ✓；
+模板列表不含运维字段 ✓；通知全链路（角标 1 → 列表 → 标记已读 → 0，`read_at` 落库）✓。
+后端：评估循环真在跑，`[macro-eval] 跳过 anchor=clock:2026-11-17 reason=quiet_hours`，
+**UTC+8 日期正确**（01:0x 本地 ⇒ 11-17，不是 UTC 的 11-16）。
+
+#### 抓到的 8 个缺陷（主 agent 4 + 独立验收者 4，全部现验过）
+
+| # | issue | 严重度 | 一句话 |
+|---|---|---|---|
+| 1 | **#616** | **致命** | **评估器产出的意图没有任何消费者**：`executeScheduledIntent` / `runMacroReview` **只被自己的测试引用**，`cli.js` 只启动循环，`void tick()` 把返回值丢掉 ⇒ M1/M9/M7 三条主功能全断，且通过门禁的意图留下**永久 `pending` 行** |
+| 2 | **#623** | **高** | `scheduled-task` 是 `scope='user'`，但**用户没有任何订阅写入口**（user 模板只读 + 唯一订阅接口是会话级 + `assignTemplate` 拒绝 user+sessionId）⇒ M7 **开户路径不存在**，e2e 那条订阅是 `psql INSERT` 进去的 |
+| 3 | #611 | 高 | `quiet_hours` 对所有 kind 无条件生效 ⇒ 用户设 01:00 的任务每天被静默跳过；冻结常量不可配；窗口内**直接丢弃**（设计要求「积压到窗口外合并发一封」） |
+| 4 | #614 | 高 | 顶栏用户级 `MacroMenu` 的 chip **点了没反应**（`<MacroMenu scope="user" />` 无 `@open-runs` 监听）+ `openMacroDrawer()` 硬依赖 `sessionId`（语义错配） |
+| 5 | #624 | 中 | `until` 到期后**订阅永不停用**（`listEvaluableAssignments` 不看 `until`，只有 `claimMacroRun` 顺手收敛 ⇒ 不走 claim 的 kind 永远 enabled）+ 到期通知无消费者 |
+| 6 | #625 | 中 | `KIND_SCHEMA` 缺 `default`/`required` ⇒ UI 建 `run-notify` 时 `states: []`（**永远不会通知**，界面却显示 Enabled）；`at`/`cwd`/`task` 非严格必填 |
+| 7 | #626 | 中 | W4a 只读闸**第四条旁路**：`fold-notes.js` 直调 `executors('note_take')`，绕过 `executeTool` 的 reviewOnly 闸 ⇒ 审查 run 折叠上下文时仍会写 notes |
+| 8 | #627 | 中 | M7 三处静默失效：`jitter` 存了不用、复用宏会话不刷 `cwd`、`maxRounds` 没进 run |
+
+另：**#617**（`max_per_day`/`quiet_hours` 不在 `KIND_SCHEMA` ⇒ 预算闸是死代码）—— 与 #611 同源，合并做。
+已修合并：#613（订阅数，PR #622）。
+
+#### 这一轮最值钱的三条口径
+
+1. **「八单全绿 + CI pass + 单测全绿」不等于「功能可用」。**
+   #616 那种「零件全交付了、没人接线」的缺陷，**任何单测都抓不到** ——
+   每个零件的单测都在测「这个零件对不对」，没人测「它们连起来了吗」。
+   ⇒ **每批多单合并后，必须有一次「从用户动作到系统结果」的端到端走查**，
+   而且要走**产品路径**（e2e 里那条订阅是 `psql INSERT` 的，这本身就是信号：走不通才需要绕）。
+
+2. **派单边界要问「谁调用它」，不只问「它做什么」。**
+   W2 的单写明「不执行动作，只产意图」，W7 的单写明「交付执行器」——
+   两张单都完成了，**但「谁把意图交给执行器」不属于任何一张单**。
+   这与 §8.146 记的「没人起 run」是**同一类错误换了位置**。
+   ⇒ 拆单时对每个「产出一份数据」的模块，必须显式指派一个「消费它的单」；
+   否则就是两个半成品拼不成产品。
+
+3. **独立验收（copilot 只读）必须给「找漏」的指令，不是「复核」的指令。**
+   这轮 prompt 是「不要复述主 agent 的结论，去找他漏掉的东西」，结果它抓到
+   #623/#624/#625/#626/#627 五条我漏的（#623 直接决定 M7 是否可用）。
+   反例：若 prompt 写「请复核这份 e2e 报告」，它大概率只会确认我的结论。
+
+#### 操作坑（记一笔）
+
+- **`erix_run` 的后台 run 会被 pi 进程重启杀掉**（status.json 停在 `running`/0 轮、树里零提交）。
+  本轮 w-611 就这么死了一次，用 `resume: <status.json 路径>` 救回来。
+- **`gh pr merge` 冲突失败后，紧接着删远端分支会把 PR 变成 CLOSED**（不是留在 OPEN）。
+  本轮 §8.157 的台账 PR 就这么没了，只能重开。⇒ 合并失败时**先别删分支**。
+- **台账编号会被并行 session 抢先**：本单原本写 8.157，被另一个 session 占了 ⇒ 让号到 8.158。
+- **vision MCP 上游间歇失败**，但模型能直接读图 —— `read` 一张 png 即可，不必依赖 vision 服务。
+
+#### 环境副作用（待还原）
+
+为让 `eric` 能密码登录做 UI e2e，临时改了 dev 库：
+`UPDATE users SET mail_otp_enabled=false WHERE login='eric'`（**原值 `t`**）。
+验完须还原（或按 §4.1 口径保持 dev 密码直通，由用户定）。
+
+**待办**：#611+#617、#614+#615、#616（均在跑）、#623、#624、#625、#626、#627。
