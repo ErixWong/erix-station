@@ -397,7 +397,23 @@ test('P14 「从未保存过」的定义是没有写者：迁移种的那一行�
 // 2. 写侧：渲染规则与两条闸（`P3`–`P6`）
 // ---------------------------------------------------------------------------
 
-test('P3 保存追加段 ⇒ 渲染含平台写的节 + 管理员正文逐字照搬 + 标识行仍是最后一行', async () => {
+/**
+ * 引言那一行与管理员正文之间的**空行数**（判据 `P3` 的分隔形状本体，也是常驻反向自证的入口）。
+ * 返回 `0` = 正文紧贴引言（评审 R5 在真机宿主文件里看到的形状），`1` = 契约 §5 样例那一档。
+ * 锚点找不到就直接抛：「什么都没找到」不许默成 0 或 1（那会把一条红变成一条绿的假绿）。
+ */
+function blankLinesBetween(text, leftAnchor, rightAnchor) {
+  const at = text.indexOf(leftAnchor);
+  assert.ok(at >= 0, `反向自证失败：左锚点没找到（${leftAnchor.slice(0, 30)}…）`);
+  const from = at + leftAnchor.length;
+  const to = text.indexOf(rightAnchor, from);
+  assert.ok(to >= 0, '反向自证失败：右锚点在左锚点之后没出现');
+  const gap = text.slice(from, to);
+  assert.match(gap, /^\n+$/, '两个锚点之间只许是换行（夹了别的字 = 锚点选错了，得先修这里）');
+  return gap.length - 1;   // `\n` = 紧贴（0 个空行），`\n\n` = 恰好一个空行
+}
+
+test('P3 保存追加段 ⇒ 渲染含平台写的节 + 引言与正文**恰为一个空行** + 正文逐字照搬 + 标识行仍是最后一行', async () => {
   const pool = new PromptsFakePool();
   const adminText = '- 上线前必须跑 `npm run smoke`，不过不许收工。\n- 周报周五交。';
   const saved = await updatePlatformPrompts({ pool, field: 'addendum', text: adminText, actorId: ACTOR });
@@ -419,12 +435,49 @@ test('P3 保存追加段 ⇒ 渲染含平台写的节 + 管理员正文逐字照
   assert.ok(eff.text.endsWith('\n'), '文件仍以换行收尾（与内置渲染一致）');
   // 节标题在标识行**之前**
   assert.ok(eff.text.indexOf('## 平台补充约定') < eff.text.indexOf('（FDE 标识：alice）'));
-  // 追加段的开销字节 = 节标题 + 引言 + 两个分隔（口径与写侧预算同一处算）
+
+  // ★ 分隔形状（评审 R5）：引言与管理员正文之间**恰好一个**空行（契约 §5 样例就是那么画的）。
+  //   曾经的现场：渲染出来是 `…第 N 条」。\nADMIN正文`（紧贴），而 `materializer.js` 里的注释反说
+  //   「末尾自带一个空行」⇒ 裁决是**改代码向契约靠**，注释改成真话。
+  const INTRO_LAST_LINE = '> 除非本节明确写出「覆盖上面第 N 条」。';
+  assert.equal(blankLinesBetween(eff.text, INTRO_LAST_LINE, adminText), 1,
+    '引言与管理员正文之间必须恰好一个空行（少一个 = 向契约那个例子不像，多一个 = 多一个空行也要红）');
+  // 常量面同样钉住（这里就是那个空行的**产地**）：引言行之后必须两个 `\n`，且不得三个。
+  assert.ok(AGENTS_MD_ADDENDUM_HEADER.endsWith(`${INTRO_LAST_LINE}\n\n`),
+    '引言末尾必须恰好两个换行（= 一个空行）');
+  assert.equal(AGENTS_MD_ADDENDUM_HEADER.endsWith('\n\n\n'), false, '引言末尾不许多出第二个空行');
+  // 常驻反向自证：同一个函数必须把「紧贴」与「两个空行」两种退化式都算成≠ 1，
+  // 否则上面那条绿只是「恰好现在对上了」（新加的空行项被删回去时抓不到）。
+  const DEGENERATE = [
+    ['紧贴（评审 R5 的真实现场）', `X\n${adminText}`],
+    ['两个空行（往另一个方向多一个）', `X\n\n\n${adminText}`],
+  ];
+  for (const [label, text] of DEGENERATE) {
+    assert.notEqual(blankLinesBetween(text, 'X', adminText), 1,
+      `反向自证失败：退化式「${label}」在判据里必须算违规（实得 ${blankLinesBetween(text, 'X', adminText)}）`);
+  }
+  assert.equal(blankLinesBetween(`X\n\n${adminText}`, 'X', adminText), 1, '反向自证的正例那一档必须是 1');
+
+  // 追加段的开销字节 = 节标题 + 引言（含末尾那个空行）+ 两个分隔（口径与写侧预算同一处算）
   const budget = agentsMdRenderBudget({ fdeName: 'example' });
   assert.equal(
     budget.addendumOverheadBytes,
     2 + bytes(AGENTS_MD_ADDENDUM_HEADER),
     '追加段开销 = 前置空行 + 节标题与引言（正文另计）',
+  );
+  // 那个空行的**字节账**：+1 字节就来自「引言最后一行之后」（从 `\n` 变成 `\n\n`），
+  // 所以下面三条必须同时成立：预算里那一段尾长恰好 2 字节；而渲染出来的整份文件比预算多一个
+  // 正文本身（无额外字节）。改回一个换行 ⇒ 第一条红（尾长变 1）。
+  assert.equal(
+    Buffer.byteLength(AGENTS_MD_ADDENDUM_HEADER.slice(
+      AGENTS_MD_ADDENDUM_HEADER.lastIndexOf(INTRO_LAST_LINE) + INTRO_LAST_LINE.length)),
+    2,
+    '引言最后一行之后只剩 2 个字节（行尾 `\n` + 空行 `\n`）——这就是评审 R5 那 +1 字节的位置');
+  const aliceBudget = agentsMdRenderBudget({ fdeName: 'alice' });
+  assert.equal(
+    bytes(eff.text),
+    agentsMdRenderedBytes(aliceBudget, { addendum: adminText, override: '' }),
+    '预算算式与 `alice` 那一档的真渲染逐字节同数（那 1 字节在常量侧与渲染侧是同一处，没走两份）',
   );
 });
 
