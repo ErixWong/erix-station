@@ -31,6 +31,8 @@ export interface MacroAssignment {
   id: string;
   templateId: string;
   sessionId: string | null;
+  /** 订阅的运行目录（issue #623：`scope='user'` 订阅必填 `~/projects/<name>`；会话级为 null）。可选以免扰动既有会话级构造。 */
+  cwd?: string | null;
   until: string | null;
   enabled: boolean;
   expired: boolean;
@@ -118,6 +120,7 @@ export function normalizeAssignment(row: Record<string, unknown> | null | undefi
     id: String(row.id ?? ''),
     templateId: String(row.template_id ?? row.templateId ?? ''),
     sessionId: str(row.session_id ?? row.sessionId ?? null),
+    cwd: str(row.cwd ?? null),
     until: iso(row.until),
     enabled,
     expired,

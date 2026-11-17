@@ -8095,6 +8095,15 @@ W6（#529 管理台 UI）。
 **已知边界（未做，别当 bug）**：名册/账本仍无 TTL；`stale` 只做标记（门户不判死活、不改写名册，
 因为名册 `pid` 是容器内 PID）；`activity` 不覆盖「流式正文」（子 run 未开 `partialPersistence`）；
 跨会话/跨 FDE 的全局 agent 面板不做；子 run 的停止/steer 按钮不做（前台子 `cancel` 恒 `not_owned`）。
+
+**`stale` 在界面上基本不可达（2026-11-17 现验代码，不是凭记忆）**：`liveCount` 把 `activity.stale === true`
+的行**减掉**（`portal/frontend/src/composables/useDelegateActivity.ts:287-289`），而徽标可见性是
+`liveCount > 0 || degraded`（`DelegateActivityBadge.vue:31`），面板的唯一开关又是那颗徽标
+⇒ **只剩 stale 子时（= 父 run 已收尾那种主流形态）徽标整段不出、面板打不开**，`DelegateActivityBar`
+里那段 `stale` 中性灰样式**只在「另有一个活态子陪着」时才画得出来**。这不是漏做：#602 之后那条路径
+改由工具卡上的 `orphaned` 中性 `·` 表达（见 §8.156），所以「父 run 收尾」这一面在界面上**是有表达的**，
+只是不走 `stale` 那条渲染分支。要真让 `stale` 自己撑起一块界面，得先回答「父 run 都结束了，这块面板
+还该存在吗」——属于产品决定，不在这里顺手做。
 ### 8.153 能力市场 P0：技能包发布/浏览/安装 + 宿主侧能力索引注入（#595，2026-11-16，主 agent + 两个 pi worker + copilot 评审）
 
 **为什么**：FDE 用户拿不到「平台提供的能力」——技能只能靠镜像 bundled（`/opt/erix/skills`，只有 1 个）
@@ -8410,3 +8419,81 @@ portal/proxy → **先验在飞 run = 0** 再逐台 `docker rm -f fde-<name>` + 
 **一处遗留，如实记**：3 个 revoked 测试账号（`portsprobe` / `pw173jscw` / `ui17kbwg`）**没有容器**，
 About 面板上仍显示它们停用时的旧快照摘要（`941a157c…` / `4c1e7068…`）——那是**历史快照不是当前运行**，
 面板本来就把第三格标成 `derived copy, not authoritative`，不修（重建一个 revoked 账号的容器没有意义）。
+
+### 8.160 事件平台 e2e 首轮的 11 个缺陷修复：从「零件齐了」到「管道真通」（2026-11-17，主 agent + erix_run × 5 + copilot 验收）
+
+接 §8.158。首轮 e2e 抓到 11 个缺陷，本轮修掉 9 个（#613/#616/#611+#617/#614+#615/#623/#624+#625/#626+#627），
+另开 2 个（#637 M7 产物、#646 M1/M9 触发源）正在跑。
+
+| 单 | PR | 合并 | 内容 |
+|---|---|---|---|
+| #613 | #622 | `c019825` | 管理台订阅数列（后端 `subscriberCount`） |
+| #616 | #632 | `d5a9e46` | **意图消费者 dispatcher**（M1/M9/M7 的接线） |
+| #611+#617 | #633 | `36ecea6` | `quiet_hours` 只对通知型 + 读 params + 窗内不丢弃；`max_per_day` 进 schema |
+| #614+#615 | #634 | `80a994b` | 顶栏死入口 + 假警报；新增 `GET /api/macro-runs` |
+| #623 | #638 | `dbe27e3` | **用户级订阅端点**（M7 开户路径） |
+| #626+#627 | #642 | `2ad6888` | 只读闸第四条旁路；M7 三处静默失效 |
+| #624+#625 | #645 | `5ae41ce` | 契约 `default`/`required` 进 schema；`until` 到期收敛 |
+
+**每个 PR 主 agent 都亲跑判据 + 跑 2–3 个变异**（本轮累计 17 个变异，全部命中）。
+
+---
+
+#### 最重要的两条：**管道的两端都曾经是空的**
+
+1. **#616：意图没有消费者。** `executeScheduledIntent` / `runMacroReview` **全仓只被自己的测试引用**。
+   `cli.js` 只启动评估循环，`void tick()` 把返回值丢掉。
+2. **#646（待修）：终态意图没有生产者。** `run-notify` / `run-review` 是**终态触发**型，
+   而 `finishRun`（`internal.js`）**没有任何一行碰宏平台**。代码自己在 `macro-eval.js:306` 写着
+   「由 W1 的终态触发驱动」—— 那个「W1 的终态触发」不存在。
+
+⇒ **同一类错误第三次换位置出现**：
+§8.146「没人起 run」→ §8.158 #616「没人消费意图」→ 本条「没人产生终态意图」。
+三次都是「接口/函数交付了，但**调用它的那一方**不属于任何一张单」。
+**口径升级：拆单时对每个「产出一份数据」和「消费一份数据」的模块，都要显式指派对端；
+只写「它做什么」不够，必须写「谁调它」。**
+
+#### 真机验证才暴露的那一层（#637，待修）
+
+M7 管道在真机上**确实通了**（`clock:2026-11-17` → `done`、宏会话建出来、run 入队），
+但顺着往下看产出是**零**：
+- `defaultRunTask` 是**空壳桩** ⇒ 不等待、产物空、**失败记成 `done`**
+- 产物写 `/root/reports`（容器内、未挂载）⇒ 用户看不到、重建即丢
+- `safe()` 用 `[^\w.\-]` ⇒ **中文宏名整段压成一个 `_`** ⇒ 所有中文宏挤同一目录互相覆盖
+
+⇒ **「链路通了」与「产出可用」是两件事**。判据必须是
+「用户能看到的最终产物对不对」，不能停在「账上写了 done」。
+
+#### 派单与协作的账
+
+- **5 条 worker 全部 `erix_run`**，无一换执行体；轮数 72–120。
+- **两次后台 run 被 pi 进程重启杀掉**（w-611 死 2 次），靠 `resume` / 重派救回。
+  ⇒ 长跑单要盯，或接受「死后 resume 是常态」。
+- **rebase 到快速前进的 main 是主要成本**：本轮 5 个 PR 全部要 rebase 1–3 次，
+  其中 #645 一次 rebase 把冲突文件里的 fixture 修复**冲掉了**（`Unexpected end of input` +
+  5 条用例红），手工补回。
+  ⇒ 口径：**rebase 解冲突后必须重跑全量判据**，不能只看冲突标记消失。
+- **跨单语义交互要主动核对**：#625 让 `scheduled-task` 的 `at`/`cwd`/`task` 成必填，
+  而 #623 的 fixture 建于其前 ⇒ rebase 后 5 条红。这是**正确的交互**（不是谁的 bug），
+  改 fixture 即恢复。⇒ 一张单改了校验，要 grep 别的单有没有造违反新校验的 fixture。
+
+#### 环境操作坑（记一笔）
+
+- **worktree 没有 `deploy/.env`**（gitignore + worktree 不带未跟踪文件）⇒
+  `docker compose build` 会落到默认 `erix-station/portal:local`，
+  而**运行中的容器用的是 GHCR digest pin**（`STATION_PORTAL_IMAGE` 在 `.env` 里）
+  ⇒ 以为重建了、其实没换。查法：`docker inspect <c> --format '{{.Config.Image}}'`。
+- **`.env` 里是 digest 引用 ⇒ `docker compose build` 直接失败**
+  （`refusing to create a tag with a digest reference`）。本地构建必须显式
+  `STATION_PORTAL_IMAGE=erix-station/portal:local`。
+- **验证完必须还原 digest pin**（否则部署记录与实况分裂）。本轮已还原。
+- **`gh pr merge` 冲突失败后紧接着删远端分支 ⇒ PR 变 CLOSED**（不是留 OPEN）。
+  §8.157 的台账 PR 就这么没了。⇒ 合并失败先别删分支。
+- **vision MCP 上游间歇失败**，但模型能直接读图 —— `read` 一张 png 即可。
+
+#### 环境副作用（待还原）
+
+为让 `eric` 能密码登录做 UI e2e，临时改了 dev 库：
+`UPDATE users SET mail_otp_enabled=false WHERE login='eric'`（**原值 `t`**）。
+
+**待办**：#646（M1/M9 触发源，在跑）、#637（M7 产物三缺陷，在跑）。
