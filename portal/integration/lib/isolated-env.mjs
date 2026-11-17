@@ -606,15 +606,20 @@ export async function assertHostPortsAvailable(ports, { host = '127.0.0.1' } = {
  * @param {{ repoRoot?: string, webPort: string, websecurePort: string }} opts
  * @returns {string} 生成的 traefik.yml 路径
  */
-export function writeTraefikStatic(dir, { repoRoot = REPO_ROOT, webPort, websecurePort }) {
+export function writeTraefikStatic(dir, { repoRoot = REPO_ROOT, webPort, websecurePort, adminPort = null }) {
   assert.ok(webPort, 'writeTraefikStatic: webPort is required');
   assert.ok(websecurePort, 'writeTraefikStatic: websecurePort is required');
   const source = fs.readFileSync(path.join(repoRoot, 'deploy/traefik/traefik.yml'), 'utf8');
   assert.ok(source.includes('address: ":8090"') && source.includes('address: ":8443"'),
     'Traefik static config has the expected entrypoint addresses');
-  const output = source
+  let output = source
     .replace('address: ":8090"', `address: ":${webPort}"`)
     .replace('address: ":8443"', `address: ":${websecurePort}"`);
+  // #261117 实测：`traefik.yml` 里还有**第三个写死端口** `:9443`（管理台入口 adminsecure，
+  // 见 AGENTS.md §5「端口在 traefik.yml 里写死」）。隔离栈的 edge 是 `network_mode: host`，
+  // 不换它就会跟**共享栈**的 9443 撞端口 ⇒ 容器 `Restarting (1)` 崩循环、整个隔离栈的入口不监听，
+  // 下游 e2e 全部连不上（wp2a 段⑥ curl 退出码 7 就是这么来的）。
+  if (adminPort) output = output.replace('address: ":9443"', `address: ":${adminPort}"`);
   const target = path.join(dir, 'traefik.yml');
   fs.writeFileSync(target, output);
   return target;
