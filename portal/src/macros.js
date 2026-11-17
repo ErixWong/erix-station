@@ -35,7 +35,7 @@
 import {
   KINDS, AUDIENCES, SCOPES, KIND_SCOPE, KIND_SCHEMA,
   STATUS, TERMINAL_STATUSES, CRITERION, SKIPPED_REASON, VERDICT,
-  DURATION_RE, TIME_RE,
+  DURATION_RE, TIME_RE, QUIET_WINDOW_RE,
 } from '../shared/macro-kinds.js';
 
 /** 模板 kinds（单一真源：`shared/macro-kinds.js` 的 `KINDS`）。 */
@@ -85,6 +85,11 @@ export function validateKindParams(kind, params) {
     } else if (rule.type === 'time') {
       if (typeof value !== 'string' || !TIME_RE.test(value)) {
         throw new MacroError('validation_failed', `${key} 必须是 HH:MM（UTC+8）`, { details: where });
+      }
+    } else if (rule.type === 'quiet_window') {
+      // 形态：`"HH:MM-HH:MM"`（UTC+8）或 `"off"`；语义（跨午夜/默认）在 `macro-eval.js`。
+      if (typeof value !== 'string' || !QUIET_WINDOW_RE.test(value)) {
+        throw new MacroError('validation_failed', `${key} 必须是 HH:MM-HH:MM（UTC+8）或 'off'`, { details: where });
       }
     } else if (rule.type === 'path') {
       if (typeof value !== 'string' || value.length === 0 || value.includes('..')) {
@@ -490,6 +495,31 @@ export async function applyExpiredAssignments(pool, { now = new Date(), userId =
     `UPDATE macro_assignments SET enabled = false WHERE ${filter} RETURNING id`, params,
   );
   return { disabledIds: res.rows.map((r) => r.id), disabled: res.rowCount };
+}
+
+/**
+ * 每个模板的**在用订阅数**（issue #613：管理台「订阅数」列，`07` §2「不是装饰：停用前要知道影响谁」）。
+ *
+ * ⚠ 口径（定死，改动前先想清楚这条列是给谁看的）：
+ * **只数 `enabled = true` 的订阅**。管理员点「Disable」时想知道的是「停用会掐掉谁**正在用**的」——
+ * 已取消订阅（`enabled = false`，即 `unassignTemplate` 的停用支 / `applyExpiredAssignments` 的到期支）
+ * 的人本来就不会再跑，停用不影响他们，计入就会虚高、反而误导。
+ * 注意**不**叠加「到期」推导（`isAssignmentExpired`）：到期只是还没被关账，行上的事实口径以
+ * `enabled` 为准，且本列要能一条 SQL 走完（不能在 JS 里逐行判过期，那会逼出 N+1 式的后处理）。
+ *
+ * 全表一次 `GROUP BY template_id`（**禁止**逐模板查 ⇒ 无 N+1）。
+ * 返回 `Map<templateId, number>`；没有任何**启用**订阅的模板**不出现在 Map 里**，
+ * 落 `0` 由调用方负责（区分「没人订」= `0` 与「后端没下发」= `undefined` 是前端的职责）。
+ */
+export async function subscriberCountsByTemplate(pool) {
+  // `::int` 不是顺手：`COUNT(*)` 是 bigint，node-pg 会回传字符串，直接塞进 JSON 就成 `"2"`。
+  const res = await runner(pool).query(
+    `SELECT template_id, COUNT(*)::int AS count
+       FROM macro_assignments
+      WHERE enabled
+      GROUP BY template_id`,
+  );
+  return new Map(res.rows.map((r) => [r.template_id, Number(r.count)]));
 }
 
 /** 订阅列表（默认关掉到期的那些 ⇒ `effective_enabled` 与 `enabled` 在这里天然一致）。 */

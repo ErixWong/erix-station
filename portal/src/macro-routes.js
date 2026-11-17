@@ -20,6 +20,7 @@
 import {
   MacroError, MACRO_VERDICTS, validateMacroEnum, validateMacroCriterion, validateMacroRunStatus,
   listTemplates, createTemplate, updateTemplate, deleteTemplate,
+  subscriberCountsByTemplate,
   listAssignments, assignTemplate, unassignTemplate,
   toMacroRunSnapshot, encodeMacroRunCursor, decodeMacroRunCursor,
 } from './macros.js';
@@ -137,6 +138,58 @@ export async function sessionMacroRuns({ pool, sessionId, userId, query = new UR
   return { items: page, nextCursor: hasMore ? encodeMacroRunCursor(page[page.length - 1]) : null };
 }
 
+/**
+ * GET /api/macro-runs —— 用户级全局流水（issue #614）。
+ *
+ * 顶栏用户级 chip（`scope='user'` 的模板：定时任务这类不绑会话的东西）的流水本就跨会话，
+ * 所以属主过滤 = `macro_assignments.user_id = 当前用户`，**不带 session_id**。
+ * 查询参数（`criterion`/`verdict`/`limit`/`cursor`）与响应形状（`{ items, nextCursor }`）与会话级那份
+ * **一致**，复用同一条 keyset 口径与 `toMacroRunSnapshot`。
+ * ⚠ 用户面口径再剥 `snapshot_id` / `worktree_path` / `verdict_raw`（原始错误码）——`09` §3.2：
+ *   这三个不该出现在用户面响应里（会话级那份把它们交给前端归一层丢，这里按 §3.2 在出口就剥掉）。
+ * ⚠ 不能放 `/api/admin/*`（#450 白名单会 deny）。
+ */
+export async function userMacroRuns({ pool, userId, query = new URLSearchParams() }) {
+  const where = ['a.user_id = $1'];
+  const params = [userId];
+  const criterion = query.get('criterion');
+  if (criterion) {
+    validateMacroCriterion(criterion);
+    params.push(criterion);
+    where.push(`r.criterion = $${params.length}`);
+  }
+  const verdict = query.get('verdict');
+  if (verdict) {
+    validateMacroEnum('verdict', verdict, MACRO_VERDICTS);
+    params.push(verdict);
+    where.push(`r.verdict = $${params.length}`);
+  }
+  const cursor = query.get('cursor');
+  if (cursor) {
+    const c = decodeMacroRunCursor(cursor);
+    params.push(c.startedAt, c.id);
+    where.push(`(r.started_at, r.id) < ($${params.length - 1}, $${params.length})`);
+  }
+  const limit = normalizeNotificationsLimit(toLimit(query.get('limit')));
+  params.push(limit + 1);
+  const res = await pool.query(
+    `SELECT r.* FROM macro_runs r
+       JOIN macro_assignments a ON a.id = r.assignment_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY r.started_at DESC, r.id DESC LIMIT $${params.length}`,
+    params,
+  );
+  const snaps = res.rows.map(toMacroRunSnapshot);
+  const hasMore = snaps.length > limit;
+  const page = hasMore ? snaps.slice(0, limit) : snaps;
+  const items = page.map((snap) => {
+    if (!snap) return snap;
+    const { snapshot_id: _sn, worktree_path: _wt, verdict_raw: _vr, ...userFacing } = snap;
+    return userFacing;
+  });
+  return { items, nextCursor: hasMore ? encodeMacroRunCursor(page[page.length - 1]) : null };
+}
+
 // ── 通知（用户面）─────────────────────────────────────────────────────────────
 
 export async function notificationsList({ pool, userId, query = new URLSearchParams() }) {
@@ -159,11 +212,15 @@ export async function notificationsUnreadCount({ pool, userId }) {
 // ── 管理台 ────────────────────────────────────────────────────────────────────
 
 export async function adminTemplates({ pool, query = new URLSearchParams() }) {
-  const items = await listTemplates(pool, {
-    isAdmin: true,
-    includeDeleted: toBool(query.get('includeDeleted')),
-  });
-  return { items };
+  const includeDeleted = toBool(query.get('includeDeleted'));
+  const items = await listTemplates(pool, { isAdmin: true, includeDeleted });
+  // issue #613：补「订阅数」列（`07` §2：停用前要知道影响谁）。口径见 `subscriberCountsByTemplate`：
+  // **只算 `enabled = true`** 的订阅。一次全表 `GROUP BY`，不在循环里查 ⇒ 无 N+1。
+  // `includeDeleted=true` 走的是同一份计数 ⇒ 软删模板也带这个数（软删不抹订阅行，见 `deleteTemplate` 分支一）。
+  // 没任何启用订阅 ⇒ `0`（**不是** `null`/`undefined`：前端拿 `undefined` 显示 `—`，
+  // 那是「后端没下发」的意思，不能拿它冒充「没人订」）。
+  const counts = await subscriberCountsByTemplate(pool);
+  return { items: items.map((t) => ({ ...t, subscriberCount: counts.get(t.id) ?? 0 })) };
 }
 
 export async function adminCreateTemplate({ pool, body = {}, adminUserId }) {

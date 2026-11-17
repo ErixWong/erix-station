@@ -19,7 +19,7 @@ import { randomUUID } from 'node:crypto';
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import {
   toPublicTemplate, toAdminRunItem, userTemplates, sessionAssignments, putAssignment,
-  deleteAssignment, sessionMacroRuns, adminTemplates, adminCreateTemplate, adminPatchTemplate,
+  deleteAssignment, sessionMacroRuns, userMacroRuns, adminTemplates, adminCreateTemplate, adminPatchTemplate,
   adminMacroRuns, adminMacroRunDetail, adminRunsSummary,
 } from '../src/macro-routes.js';
 import { MacroError, createTemplate, assignTemplate, claimMacroRun, finishMacroRun, deleteTemplate, updateTemplate } from '../src/macros.js';
@@ -196,5 +196,123 @@ test('#526 用户面：模板过滤 + 订阅 PUT 幂等 + 会话流水 keyset', 
     assert.ok(admDef.items.some((t) => t.id === tOff.id && t.enabled === false), '停用仍在 admin 面');
     const created = await adminCreateTemplate({ pool, body: { kind: 'scheduled-task', name: 'adm-new', scope: 'user', params: { at: '09:00' } }, adminUserId: userId });
     assert.equal(created.template.created_by, userId, 'admin 建模板记 created_by');
+  });
+});
+
+// ── #613 管理台「订阅数」列 ────────────────────────────────────────────────────────
+
+/**
+ * `07` §2 要这一列的理由是「停用前要知道影响谁」，所以本用例同时钉三件事：
+ *  1. 有在用订阅的模板 ⇒ 具体数字（不是 —）；一个都没有 ⇒ `0`（前端拿 `undefined` 显示 `—`，
+ *     那是「后端没下发」的意思，不能和「没人订」混为一个值）；
+ *  2. 口径只算 `enabled = true`：挂在**同一个模板**上的取消订阅不计入（挂在另一张表上就测不出口径）；
+ *  3. 软删模板（`includeDeleted=true`）也带数：软删不抹订阅行 ⇒ 这一行的影响面照样看得见。
+ * 外加一条反 N+1 自证：模板数从 3 涨到 8 ⇒ 计数 SQL 仍只发一条 `GROUP BY`。
+ */
+test('#613 adminTemplates 下发 subscriberCount：2/0、取消订阅不计入、软删也带数、无 N+1', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const u1 = await seedScene(pool, 's613a');
+    const u2 = await seedScene(pool, 's613b');
+    const u3 = await seedScene(pool, 's613c');
+
+    const tTwo = await createTemplate(pool, { kind: 'run-notify', name: 'subs-two', scope: 'session', params: {} });
+    const tZero = await createTemplate(pool, { kind: 'run-notify', name: 'subs-zero', scope: 'session', params: {} });
+
+    // 两条在用订阅：订阅键是 (template_id,user_id,session_id,cwd) ⇒ 必须换人才能真长出第二条
+    await assignTemplate(pool, { templateId: tTwo.id, userId: u1.userId, sessionId: u1.sessionId });
+    await assignTemplate(pool, { templateId: tTwo.id, userId: u2.userId, sessionId: u2.sessionId });
+
+    // 第三条挂在**同一个模板**上、随后取消：先有账 ⇒ unassign 走「停用支」（enabled=false 的行留在表里）
+    const aOff = await assignTemplate(pool, { templateId: tTwo.id, userId: u3.userId, sessionId: u3.sessionId });
+    const rOff = await claimMacroRun(pool, { assignmentId: aOff.id, anchor: 'c613', criterion: 'terminal', bucket: 'b' });
+    await finishMacroRun(pool, { macroRunId: rOff.id, status: 'done', verdict: 'pass' });
+    const cancelled = await deleteAssignment({ pool, sessionId: u3.sessionId, userId: u3.userId, assignmentId: aOff.id });
+    assert.equal(cancelled.mode, 'disabled', '必须是停用支：deleted 支会把行删掉 ⇒ 本用例退化成空断言');
+    const offRow = await pool.query('SELECT enabled FROM macro_assignments WHERE id = $1', [aOff.id]);
+    assert.equal(offRow.rows[0]?.enabled, false, '取消订阅后行仍在且 enabled=false');
+
+    // 软删模板（有账 ⇒ 软删支，订阅行保留）
+    const tDel = await createTemplate(pool, { kind: 'run-notify', name: 'subs-del', scope: 'session', params: {} });
+    const aDel = await assignTemplate(pool, { templateId: tDel.id, userId: u1.userId, sessionId: u1.sessionId });
+    const rDel = await claimMacroRun(pool, { assignmentId: aDel.id, anchor: 'c613d', criterion: 'terminal', bucket: 'b' });
+    await finishMacroRun(pool, { macroRunId: rDel.id, status: 'done', verdict: 'pass' });
+    await deleteTemplate(pool, { templateId: tDel.id });
+
+    const byId = new Map((await adminTemplates({ pool, query: new URLSearchParams() })).items.map((t) => [t.id, t]));
+    assert.ok(byId.has(tTwo.id) && byId.has(tZero.id), '两个模板都应在 admin 列表里');
+    const two = byId.get(tTwo.id);
+    const zero = byId.get(tZero.id);
+
+    // 字段必须下发且是 number（缺字段 ⇒ 前端只能显示 —，正是本 issue 的病根）
+    for (const it of [two, zero]) {
+      assert.ok('subscriberCount' in it, 'subscriberCount 必须在响应里');
+      assert.equal(typeof it.subscriberCount, 'number', `必须是 number，实际 ${typeof it.subscriberCount}`);
+      assert.ok(Number.isInteger(it.subscriberCount), '不能是 bigint 字符串（node-pg 会把 COUNT(*) 回传成 "2"）');
+    }
+    assert.equal(two.subscriberCount, 2, '两条在用订阅；第三条已取消不计入 ⇒ 2 而不是 3');
+    assert.equal(zero.subscriberCount, 0, '没人订必须是 0，不是 null/undefined');
+    assert.notEqual(zero.subscriberCount, null);
+
+    // 软删模板：includeDeleted=true 也带这个数
+    const admDel = (await adminTemplates({ pool, query: new URLSearchParams('includeDeleted=true') }))
+      .items.find((t) => t.id === tDel.id);
+    assert.ok(admDel && admDel.deleted_at, '软删行看得到');
+    assert.equal(admDel.subscriberCount, 1, '软删不抹订阅行 ⇒ 删除影响面照样要看得见');
+
+    // 反 N+1：模板数从 3 涨到 8 ⇒ 订阅数查询仍只发一条 GROUP BY
+    let groupByQueries = 0;
+    const spy = { query: (sql, params) => { if (/macro_assignments/i.test(sql) && /GROUP\s+BY/i.test(sql)) groupByQueries += 1; return pool.query(sql, params); } };
+    for (let i = 0; i < 5; i += 1) {
+      await createTemplate(pool, { kind: 'run-notify', name: `subs-extra-${i}`, scope: 'session', params: {} });
+    }
+    await adminTemplates({ pool: spy, query: new URLSearchParams() });
+    assert.equal(groupByQueries, 1, '一次 GROUP BY 拿全表；逐模板一条查询就是 N+1');
+  });
+});
+
+// ── #614 用户级全局流水端点 ────────────────────────────────────────────────────
+
+test('#614 userMacroRuns：属主过滤 = 当前用户，只看到自己的流水', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const u1 = await seedScene(pool, 'u614a');
+    const u2 = await seedScene(pool, 'u614b');
+    const tpl = await createTemplate(pool, { kind: 'run-review', name: 'rev-614', scope: 'session', params: {} });
+    const a1 = await assignTemplate(pool, { templateId: tpl.id, userId: u1.userId, sessionId: u1.sessionId });
+    const a2 = await assignTemplate(pool, { templateId: tpl.id, userId: u2.userId, sessionId: u2.sessionId });
+    const r1 = await claimMacroRun(pool, { assignmentId: a1.id, anchor: 'e1', criterion: 'terminal', bucket: 'b' });
+    const r2 = await claimMacroRun(pool, { assignmentId: a2.id, anchor: 'e2', criterion: 'terminal', bucket: 'b' });
+    assert.ok(r1 && r2, '两条流水都该建成');
+
+    const mine = await userMacroRuns({ pool, userId: u1.userId });
+    assert.deepEqual(mine.items.map((x) => x.id), [r1.id], 'u1 只看到自己那一条');
+    assert.ok(!mine.items.some((x) => x.id === r2.id), '别人的流水不许出现');
+
+    const theirs = await userMacroRuns({ pool, userId: u2.userId });
+    assert.deepEqual(theirs.items.map((x) => x.id), [r2.id], 'u2 反过来只看到自己那一条');
+  });
+});
+
+test('#614 userMacroRuns：响应不含 snapshot_id / worktree_path / verdict_raw（即使 DB 里有值）', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId, sessionId } = await seedScene(pool, 'u614c');
+    const tpl = await createTemplate(pool, { kind: 'run-review', name: 'rev-614c', scope: 'session', params: {} });
+    const a = await assignTemplate(pool, { templateId: tpl.id, userId, sessionId });
+    // 认领时就给 snapshot_id / worktree_path 填真值 ⇒ 若实现不剥，键就会出现（反向自证打这里）
+    const r = await claimMacroRun(pool, {
+      assignmentId: a.id, anchor: 'e', criterion: 'terminal', bucket: 'b',
+      snapshotId: randomUUID(), worktreePath: '/tmp/wt-xyz',
+    });
+    await pool.query('UPDATE macro_runs SET verdict_raw = $1 WHERE id = $2', ['RAW_ERR', r.id]);
+
+    const list = await userMacroRuns({ pool, userId });
+    assert.equal(list.items.length, 1);
+    const keys = Object.keys(list.items[0]);
+    assert.ok(!keys.includes('snapshot_id'), 'snapshot_id 必须被剥掉');
+    assert.ok(!keys.includes('worktree_path'), 'worktree_path 必须被剥掉');
+    assert.ok(!keys.includes('verdict_raw'), '原始错误码 verdict_raw 必须被剥掉');
+    // 与会话级同形：仍带用户面字段与会话/游标结构
+    assert.ok('assignment_id' in list.items[0] && 'status' in list.items[0] && 'started_at' in list.items[0]);
+    assert.ok('items' in list && 'nextCursor' in list, '响应形状与会话级一致');
+    assert.equal(list.nextCursor, null);
   });
 });
