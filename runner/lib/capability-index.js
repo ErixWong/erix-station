@@ -39,14 +39,14 @@ function clip(s, max = CAPABILITY_FIELD_MAX_CHARS) {
  * 形状校验：只认 §5 的 `{version, skills: [...]}`，其余一律降级。
  * 为什么不做宽松兼容（比如裸数组）：这份文件只有一个生产者（portal/src/materializer.js），
  * 形状对不上就说明**两侧版本不同步**，此时静默兼容会把「平台以为装了、模型一条都看不见」藏起来。
- * @returns {{skills: Array<object>, note: string|null}}
+ * @returns {{skills: Array<object>, mcp: Array<object>, note: string|null}}
  */
 export function normalizeCapabilities(raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { skills: [], note: 'capabilities.json 顶层不是对象，忽略' };
+    return { skills: [], mcp: [], note: 'capabilities.json 顶层不是对象，忽略' };
   }
   if (!Array.isArray(raw.skills)) {
-    return { skills: [], note: 'capabilities.json 缺少 skills 数组，忽略' };
+    return { skills: [], mcp: [], note: 'capabilities.json 缺少 skills 数组，忽略' };
   }
   const out = [];
   let dropped = 0;
@@ -64,7 +64,25 @@ export function normalizeCapabilities(raw) {
     });
   }
   out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));   // 字节确定性的一半
-  return { skills: out, note: dropped > 0 ? `capabilities.json 里有 ${dropped} 条缺 id 的条目，已忽略` : null };
+  // issue #608 §5.2：`mcp` 段是**可选**的（旧版 portal 不写它）。缺省 ⇒ `[]`，绝不能因为缺段
+  // 就把 skills 一起降级——那会让「加一个 MCP」把技能全弄没（P0 行为回退）。
+  const mcp = [];
+  for (const s of Array.isArray(raw.mcp) ? raw.mcp : []) {
+    // `name` 是唯一硬要求：它是 `mcp({action:"call", server:<name>})` 的寻址键，名字没了就调不到。
+    if (!s || typeof s !== 'object' || typeof s.name !== 'string' || !s.name) { continue; }
+    mcp.push({
+      name: s.name,
+      description: typeof s.description === 'string' ? s.description : '',
+      // 缺省按 `deferred`：§4.3 里 deferred 是「只走网关」的保守档，误判成 direct 会多塞工具面。
+      exposure: typeof s.exposure === 'string' ? s.exposure : 'deferred',
+      tool_count: Number.isInteger(s.tool_count) && s.tool_count >= 0 ? s.tool_count : 0,
+    });
+  }
+  mcp.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const note = dropped > 0
+    ? `capabilities.json 里有 ${dropped} 条缺 id 的条目，已忽略`
+    : null;
+  return { skills: out, mcp, note };
 }
 
 /**
@@ -78,7 +96,7 @@ export function readCapabilityIndex(options = {}) {
   const home = options.home || process.env.HOME || '/home/erix';
   const f = { ...DEF_FS, ...(options.fs ?? {}) };
   const file = path.join(home, '.erix', CAPABILITIES_BASENAME);
-  const degrade = (status, note) => ({ status, skills: [], path: file, note });
+  const degrade = (status, note) => ({ status, skills: [], mcp: [], path: file, note });
 
   if (!f.existsSync(file)) return degrade('missing', null);   // 没装过任何技能：完全正常，不记 note
   let text;
@@ -93,9 +111,11 @@ export function readCapabilityIndex(options = {}) {
   } catch (err) {
     return degrade('bad_json', `capabilities.json 不是合法 JSON：${err?.message ?? err}`);
   }
-  const { skills, note } = normalizeCapabilities(parsed);
+  const { skills, mcp, note } = normalizeCapabilities(parsed);
+  // 形状不对时两侧**一起**降级（不“只信 mcp 段”）：同一份文件只有一个生产者，半信半疑会把
+  // “两侧版本不同步”藏得更深。
   if (skills.length === 0 && note) return { ...degrade('bad_shape', note), note };
-  return { status: 'ok', skills, path: file, note };
+  return { status: 'ok', skills, mcp, path: file, note };
 }
 
 /** L2 的输入：停用项的 id 交给 `buildSkillTools({excludeSkillIds})`（目录仍在磁盘，必须显式排除）。 */
@@ -173,24 +193,75 @@ export function renderCapabilityIndex(skills, options = {}) {
 }
 
 /**
+ * 渲染「## 平台 MCP 服务」段（§6.5）。与技能段共享同一个 4 KiB，所以预算从外部递进来。
+ * 只渲染走网关的 server：`direct` 的工具已是独立工具（模型在工具面里直接看得到，再列一遍
+ * 白花字节），`hidden` 永不出现（§6.3：连 `search` 都拦，更不能在提示词里给它打广告）。
+ * @param {Array<object>} servers `normalizeCapabilities` 的 `mcp` 段（已过形状筛）
+ * @param {{maxBytes?: number}} [options] 剩余预算（skills 段先拿）
+ * @returns {string} 前导 `\n\n`；无可渲染条目 ⇒ `''`（保证“没 MCP ⇒ 逐字节等于 v1”）
+ */
+export function renderMcpIndex(servers, options = {}) {
+  const max = Number.isInteger(options.maxBytes) && options.maxBytes > 0
+    ? options.maxBytes : CAPABILITY_MAX_SECTION_BYTES;
+  const list = (Array.isArray(servers) ? servers : [])
+    .filter((s) => s && s.exposure !== 'direct' && s.exposure !== 'hidden');
+  if (list.length === 0) return '';
+  // 渲染侧再排一次 name 升序（与技能段同理：本函数自己就要兑现字节确定性）。
+  const sorted = [...list].sort((a, b) => (String(a.name) < String(b.name) ? -1
+    : String(a.name) > String(b.name) ? 1 : 0));
+  const head = ['## 平台 MCP 服务（能力市场）', ''];
+  const lines = [...head];
+  let used = 2 + Buffer.byteLength(head.join('\n'), 'utf8');   // 2 = 前导 `\n\n`
+  let shown = 0;
+  for (const s of sorted) {
+    // 行形状逐字照 §6.5 的样例；「用法」后缀是契约原文（不是我们编的事实）。
+    const line = `- ${s.name} — ${clip(s.description) || s.name}；工具 ${s.tool_count} 个；`
+      + '用法：mcp({action:"search"}) 找工具后 call';
+    const cost = Buffer.byteLength(`${line}\n`, 'utf8');
+    // 预留一行给「还有 N 个 server 未列出」，口径同技能段：宁可少列一条也不越上限。
+    if (used + cost + 96 > max) break;
+    lines.push(line);
+    used += cost;
+    shown += 1;
+  }
+  const omitted = sorted.length - shown;
+  if (omitted > 0) {
+    lines.push('');
+    lines.push(`（还有 ${omitted} 个 server 未列出）`);
+  }
+  return `\n\n${lines.join('\n')}`;
+}
+
+/**
  * worker 用的**一次调用**：读 → 拆 → 渲染。
  * 整段自带 try/catch：注入的 fs 门面自己抛（比如 `existsSync` 没实现）也只降级成空段。
- * @returns {{section: string, excludeSkillIds: string[], skills: Array<object>, status: string, note: string|null}}
+ * @returns {{section: string, excludeSkillIds: string[], skills: Array<object>, mcp: Array<object>, status: string, note: string|null}}
  */
 export function buildCapabilityIndex(options = {}) {
   try {
     const read = readCapabilityIndex(options);
     const { enabled, excludeSkillIds } = splitByEnabled(read.skills);
+    const total = Number.isInteger(options.maxBytes) && options.maxBytes > 0
+      ? options.maxBytes : CAPABILITY_MAX_SECTION_BYTES;
+    const skillsSection = renderCapabilityIndex(enabled, { ...options, maxBytes: total });
+    // 共享 4 KiB 的**分配顺序就是契约**（§5.2）：skills 先按 v1 原行为拿满，MCP 只吃剩下的。
+    // 倒过来就是「多装一个 MCP 把技能挤掉」——那是 P0 行为回退，也是反向用例要红的地方。
+    const remaining = total - Buffer.byteLength(skillsSection, 'utf8');
+    const mcpSection = renderMcpIndex(read.mcp, { maxBytes: remaining });
     return {
-      section: renderCapabilityIndex(enabled, options),
+      section: skillsSection + mcpSection,
+      skillsSection,
+      mcpSection,
       excludeSkillIds,
       skills: read.skills,
+      mcp: read.mcp,
       status: read.status,
       note: read.note,
     };
   } catch (err) {
     return {
-      section: '', excludeSkillIds: [], skills: [], status: 'unreadable',
+      section: '', skillsSection: '', mcpSection: '', excludeSkillIds: [], skills: [], mcp: [],
+      status: 'unreadable',
       note: `capabilities 采集失败：${err?.message ?? err}`,
     };
   }

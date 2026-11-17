@@ -55,13 +55,19 @@ export function readMcpConfig({ home = process.env.HOME || '/home/erix', fsImpl 
   try {
     text = fsImpl.readFileSync(file, 'utf8');
   } catch (err) {
-    return { status: 'unreadable', servers: [], note: `读取失败：${String(err?.message ?? err)}`, path: file };
+    return {
+      status: 'unreadable', servers: [], path: file,
+      note: `读取失败：${String(err?.message ?? err)}`,
+    };
   }
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch (err) {
-    return { status: 'bad_json', servers: [], note: `JSON 解析失败：${String(err?.message ?? err)}`, path: file };
+    return {
+      status: 'bad_json', servers: [], path: file,
+      note: `JSON 解析失败：${String(err?.message ?? err)}`,
+    };
   }
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.servers)) {
     return { status: 'bad_shape', servers: [], note: '缺 servers 数组', path: file };
@@ -137,7 +143,11 @@ export function combineServers({ servers = [], valuesByName = {}, missingFromAge
     if (!m || typeof m.name !== 'string') continue;
     if (missing.some((x) => x.name === m.name)) continue;
     if (registered.some((x) => x.name === m.name)) continue;
-    missing.push({ name: m.name, slots: Array.isArray(m.slots) ? m.slots : [], reason: m.reason ?? 'agent_missing' });
+    missing.push({
+      name: m.name,
+      slots: Array.isArray(m.slots) ? m.slots : [],
+      reason: m.reason ?? 'agent_missing',
+    });
   }
   return { registered, missing, hidden, rejected };
 }
@@ -234,8 +244,11 @@ export async function loadMcpServers({
   const conf = readMcpConfig({ home, fsImpl });
   if (conf.status !== 'ok') {
     // 文件读不到（含「市场还是空的」）是**正常态**：静默降级，一条 info 记账。
-    if (log) log('info', 'mcp config not available, run continues without mcp', { status: conf.status });
-    return { status: conf.status, servers: [], missing: [], hidden: [], rejected: [], note: conf.note };
+    if (log) log('info', 'mcp config not available, run continues without mcp',
+      { status: conf.status });
+    return {
+      status: conf.status, servers: [], missing: [], hidden: [], rejected: [], note: conf.note,
+    };
   }
   const needsValues = conf.servers.some((s) => allSlots(s).length > 0);
   let fetched = { ok: true, valuesByName: {}, missing: [], error: null };
@@ -251,7 +264,8 @@ export async function loadMcpServers({
   if (needsValues && fetched.ok !== true) {
     // 取不到值就**整体不注册**：一个连不上 hub 的 server 配上空凭据去调，只会以 401 收场，
     // 而模型从 401 里学不到「凭据没拿到」这件事（§6.1 的降级口径）。
-    if (log) log('warn', 'mcp config unavailable, run continues without mcp', { error: fetched.error });
+    if (log) log('warn', 'mcp config unavailable, run continues without mcp',
+      { error: fetched.error });
     return {
       status: 'config_unavailable', servers: [], missing: [], hidden: [], rejected: [],
       note: fetched.error ?? 'config fetch failed',

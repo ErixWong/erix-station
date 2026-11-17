@@ -38,8 +38,9 @@ export const SEARCH_DESC_CLIP_CHARS = 120;
 /** 网关工具 schema（§6.3 **逐字**：字段名、enum、required、描述文案都不许改）。 */
 export const MCP_GATEWAY_SCHEMA = Object.freeze({
   name: MCP_GATEWAY_TOOL,
-  description: '调用平台配置的 MCP 服务器。list 看有哪些 server；search 找工具（用本地元数据缓存，'
-    + 'server 没连也能搜）；call 调工具；status 看连接态。',
+  description: '调用平台配置的 MCP 服务器。list 看有哪些 server；'
+    + 'search 找工具（用本地元数据缓存，server 没连也能搜）；'
+    + 'call 调工具；status 看连接态。',
   inputSchema: {
     type: 'object',
     properties: {
@@ -97,7 +98,10 @@ export function expandDirectTools(rows = [], {
   const tools = [];
   const downgraded = [];
   for (const [server, list] of [...byServer.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-    const bytes = list.reduce((sum, r) => sum + Buffer.byteLength(JSON.stringify(r.definition ?? {}), 'utf8'), 0);
+    const bytes = list.reduce(
+      (sum, r) => sum + Buffer.byteLength(JSON.stringify(r.definition ?? {}), 'utf8'),
+      0,
+    );
     if (bytes > schemaBudgetBytes) {
       // 降级理由要留痕：管理员在管理台看到的是 direct，模型面却是 deferred，不记就是灵异事件。
       downgraded.push({ server, reason: 'schema_budget', bytes, limit: schemaBudgetBytes });
@@ -105,8 +109,9 @@ export function expandDirectTools(rows = [], {
     }
     for (const row of list.slice().sort((a, b) => String(a.tool).localeCompare(String(b.tool)))) {
       const name = directToolName(server, row.tool);
-      const inputSchema = row.definition?.inputSchema && typeof row.definition.inputSchema === 'object'
-        ? row.definition.inputSchema
+      const rawSchema = row.definition?.inputSchema;
+      const inputSchema = rawSchema && typeof rawSchema === 'object'
+        ? rawSchema
         : { type: 'object', properties: {}, additionalProperties: true };
       tools.push({
         name,
@@ -208,13 +213,16 @@ export function createMcpTool({
     const rows = pool.list();
     const lines = [];
     for (const s of rows.sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
-      if (hiddenServers.has(String(s.name))) continue;   // §10.7：hidden 连「存在」都不承认
+      // §10.7：hidden 连「存在」都不承认
+      if (hiddenServers.has(String(s.name))) continue;
       let toolCount = (s.tools ?? []).length;
       let discovered = '';
       if (toolCount === 0) {
         // 懒启动（§13：run 启动不拉任何 server）+ 元数据回填（§6.6）。
         const out = await discover(s.name, { signal });
-        discovered = out.ok ? ` [已发现 ${out.count} 个工具]` : ` [发现失败：${out.error}]`;
+        discovered = out.ok
+          ? ` [已发现 ${out.count} 个工具]`
+          : ` [发现失败：${out.error}]`;
         const after = pool.get(s.name)?.tools ?? [];
         toolCount = after.length;
       }
@@ -222,10 +230,19 @@ export function createMcpTool({
         + `工具 ${toolCount} 个${discovered}`);
     }
     for (const m of pool.missing ?? []) {
-      lines.push(`- ${m?.name ?? '?'} — 未注册（缺配置槽：${(m?.slots ?? []).join(', ')}）`);
+      const slots = (m?.slots ?? []).join(', ');
+      lines.push(`- ${m?.name ?? '?'} — 未注册（缺配置槽：${slots}）`);
     }
-    for (const name of hiddenServers) lines.push(`- ${name} — exposure=hidden（本平台不可调用）`);
-    if (lines.length === 0) return { content: '没有可用的 MCP server（未安装或全部 hidden）。', metadata: {} };
+    for (const name of hiddenServers) {
+      lines.push(`- ${name} — exposure=hidden（本平台不可调用）`);
+    }
+    if (lines.length === 0) {
+      return {
+        content: '没有可用的 MCP server'
+          + '（未安装或全部 hidden）。',
+        metadata: {},
+      };
+    }
     return {
       content: `MCP server ${rows.length} 个：\n${lines.join('\n')}`,
       metadata: { servers: rows.length, downgraded: downgraded.length },
@@ -252,15 +269,19 @@ export function createMcpTool({
     if (hits.length === 0) {
       // 空手而归也要给下一步动作：否则模型会以为「没有这个能力」，而事实是缓存还没被发现过。
       return {
-        content: '无命中；若该 server 从未连过，先 mcp({action:"list"}) 触发发现。',
+        content: '无命中；若该 server 从未连过，'
+          + '先 mcp({action:"list"}) 触发发现。',
         metadata: { hits: 0 },
       };
     }
     const shown = hits.slice(0, searchLimit);
     const more = hits.length - shown.length;
+    const head = `命中 ${hits.length} 个工具`
+      + (more > 0 ? `（只列前 ${searchLimit} 个，还有 ${more} 个）` : '')
+      + '：\n';
     return {
-      content: `命中 ${hits.length} 个工具${more > 0 ? `（只列前 ${searchLimit} 个，还有 ${more} 个）` : ''}：\n`
-        + `${shown.join('\n')}\n调用：mcp({action:"call",server:"<server>",tool:"<tool>",args:{…}})`,
+      content: head + `${shown.join('\n')}`
+        + '\n调用：mcp({action:"call",server:"<server>",tool:"<tool>",args:{…}})',
       metadata: { hits: hits.length },
     };
   }
@@ -277,7 +298,8 @@ export function createMcpTool({
     // §10.7：hidden 的 server **连调用都不承认存在**（P1 没有审批通道，fail-closed）。
     if (hiddenServers.has(serverName)) {
       return toolError(MCP_TOOL_ERRORS.HIDDEN,
-        `server ${serverName} 被标为 hidden，本平台不可调用`, { server: serverName, tool: toolName });
+        `server ${serverName} 被标为 hidden，本平台不可调用`,
+        { server: serverName, tool: toolName });
     }
     if (serverName === '') {
       // 只给 tool：本站**不猜**（§6.3）。candidates 给全，模型下一轮自己补 server。
@@ -304,7 +326,8 @@ export function createMcpTool({
     } catch (err) {
       const code = err?.code ?? MCP_ERRORS.UNREACHABLE;
       // ⚠ 值不进错误详情（§10.3）：`err.message` 在传输层已经过 redactValues。
-      return toolError(code, oneLine(err?.message ?? err, 300), { server: serverName, tool: toolName });
+      return toolError(code, oneLine(err?.message ?? err, 300),
+        { server: serverName, tool: toolName });
     }
     return {
       content: out?.text ?? '',
@@ -325,9 +348,16 @@ export function createMcpTool({
       .sort((a, b) => String(a.name).localeCompare(String(b.name)));
     const lines = rows.map((s) => `- ${s.name} — state=${s.status?.state ?? 'unknown'}`
       + ` toolsCached=${s.status?.toolsCached === true}`
-      + (s.status?.lastError || s.status?.error ? ` lastError=${oneLine(s.status.lastError ?? s.status.error, 160)}` : ''));
-    if (lines.length === 0) return { content: '没有已注册的 MCP server。', metadata: { servers: 0 } };
-    return { content: `MCP 状态（不触发连接）：\n${lines.join('\n')}`, metadata: { servers: rows.length } };
+      + (s.status?.lastError || s.status?.error
+        ? ` lastError=${oneLine(s.status.lastError ?? s.status.error, 160)}`
+        : ''));
+    if (lines.length === 0) {
+      return { content: '没有已注册的 MCP server。', metadata: { servers: 0 } };
+    }
+    return {
+      content: `MCP 状态（不触发连接）：\n${lines.join('\n')}`,
+      metadata: { servers: rows.length },
+    };
   }
 
   /**
