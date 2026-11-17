@@ -20,6 +20,7 @@ import {
   parseProcMounts, isRealBlockDevice, diskRows, pickBucketSeconds, seriesSql,
   retentionPurgeSql, purgeSystemMetrics, querySeries, clearSeriesCache,
   countContainers, containerDrift, startMetricsSampler, toApiLatest, metricsApiPayload,
+  disksInsertSql, WRITE_METRICS_SQL,
   BUCKET_SECONDS, SERIES_TARGET_POINTS, METRIC_RANGES, DOCKER_LIST_TTL_MS,
 } from '../src/system-metrics.js';
 import { startReaperLoop } from '../src/internal.js';
@@ -748,6 +749,38 @@ test('#650 采样器：diskPaths 缺省 ⇒ 只看 `/`（env 没配也要有东�
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // 6) 保留期清理
 // ─────────────────────────────────────────────────────────────────────────────────────────
+
+test('#650 写库 SQL 形状：列数 = 表达式数、占位符连续无空洞（假 pool 抓不到，只有真库会 42601）', () => {
+  // 这条判据的由来：`disksInsertSql` 曾把每行参数写成 5 个（实际 6 个）⇒ 七列六个值 ⇒
+  // **每一拍写库都 42601 `INSERT has more target columns than expressions`**。37 条假 pool 单测全绿，
+  // 因为假 pool 只记 SQL 文本、不解析它；只有真 postgres 会拒。⇒ 这里直接钉语句的**形状**。
+  const cols = /INSERT INTO system_metrics \(([\s\S]*?)\)\s*VALUES/.exec(WRITE_METRICS_SQL)[1]
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  const vals = /\bVALUES\s*\(([\s\S]*?)\)\s*ON CONFLICT/.exec(WRITE_METRICS_SQL)[1]
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  assert.equal(cols.length, vals.length, `WRITE_METRICS_SQL：${cols.length} 列就要 ${vals.length} 个值`);
+  assert.deepEqual(vals.map((v) => Number(v.slice(1))),
+    Array.from({ length: cols.length }, (_, i) => i + 1), 'WRITE_METRICS_SQL 的 $1..$N 必须连续');
+
+  for (const count of [1, 2, 5]) {
+    const sql = disksInsertSql(count);
+    const dcols = /INSERT INTO system_metrics_disks \(([\s\S]*?)\)\s*VALUES/.exec(sql)[1]
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    const tuples = [...sql.split(/\bVALUES\b/)[1].split(/\bON CONFLICT\b/)[0].matchAll(/\(([^)]*)\)/g)]
+      .map((m) => m[1].split(',').map((s) => s.trim()));
+    assert.equal(tuples.length, count, `count=${count} 就该有 ${count} 行`);
+    for (const t of tuples) {
+      assert.equal(t.length, dcols.length, `每行 ${dcols.length} 列就要 ${dcols.length} 个表达式（旧 bug 就死在这一句）`);
+    }
+    // `$1`（sampled_at）在每行**复用**（所以 flat 里 1 会重复出现 count 次），每行自己的 6 个参数不重复
+    // ⇒ 判据是「去重后的集合恰好是 1..1+count*6」，不是「flat 等于 1..N」。
+    const flat = tuples.flat().map((p) => Number(p.slice(1)));
+    const uniq = [...new Set(flat)].sort((a, b) => a - b);
+    assert.deepEqual(uniq, Array.from({ length: 1 + count * 6 }, (_, i) => i + 1),
+      `count=${count}：占位符集合必须恰好是 1..${1 + count * 6}（既不能跳号也不能多出来）`);
+    assert.equal(flat.filter((n) => n === 1).length, count, '$1 每行复用一次（sampled_at 每行相同）');
+  }
+});
 
 test('#650 purgeSystemMetrics：日期参数走绑定变量（配置写错不许变成 SQL 语法错）', async () => {
   const pool = new MetricsPool();
