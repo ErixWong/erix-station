@@ -3434,10 +3434,30 @@ Content-Type: application/json
 | `400` | `validation_failed` + `details={field:'text', max_bytes, rendered_bytes, render_limit_bytes}` | **渲染超限**：写下去之后整份 `~/AGENTS.md` > `render_limit_bytes` ⇒ **一条写语句都不发** |
 | `403` | `forbidden` | 非管理员 |
 | `405` | `method_not_allowed` | `PUT` 之外的方法 |
+| `429` | `rate_limited` + `Retry-After` 头（`retryable:true`） | **保存过于频繁**（#664）：按「操作者 + 端点」限流，超阈值 ⇒ **一条写语句都不发** |
 | `500` | `internal` | 写了却没审计（有人把审计从那条语句里拆出去了）／数据库拒了这条语句（约束、表缺失、连接断）——后者的 message 是**静态串**，原因只进 portal 日志（不打 SQL 与参数值）⇒ 表名/列名/约束名不出现在响应里（判据 `P15`）|
 
 ⚠ **不新增错误码**：这一节的全部失败都是既有的 `validation_failed` / `forbidden` /
-`method_not_allowed` / `internal`（`details.field` 负责说清是哪一格）。
+`method_not_allowed` / `internal` / `rate_limited`（`details.field` 负责说清是哪一格）。
+
+**限流（#664）**：三条 `PUT` 各挂一个 `createRateLimiter`（口径照登录 / `mailtest` / `tls*`）；
+只读的那条 `GET /api/admin/prompts` **不限流**。限的是**成功保存**（`createRateLimiter` 只有
+`recordFailure` 一个计数入口）——越界 / 形状错的 `400` 没有扇出，**不计入、不烧配额**。
+键 = `platformPrompt:<端点 slug>:<操作者 id>` ⇒ **三个端点各自独立计数**，不同管理员互不影响。
+
+超阈的响应形状（与登录 / `mailtest` 同一个 429 信封）：
+
+```json
+{ "error": { "code": "rate_limited", "message": "提示词保存过于频繁，请稍后再试", "retryable": true } }
+```
+
+配 `Retry-After: <秒>` 响应头。阈值默认 **30 次成功保存 / (操作者 + 端点) / 60 分钟窗口**，
+触顶封禁 60 分钟（`blockMs`）；`config.platformPromptsRateLimit.{maxFailures,windowMs,blockMs,maxEntries}`
+可覆盖（非 env 旋钮，同 `mailTestRateLimit` / `tlsUploadRateLimit` 那档：只在代码里给默认，未接 env）。
+阈值的依据（写进 `http.js` 注释）：一次保存给**全部启用中的工位**（谓词
+`fde_name IS NOT NULL AND status IN ('active','awaiting_credential')`）各入队一条物化 + 一行审计，
+消费侧 latest-wins 只合并「真重写」不合并入队写放大，故在源头钳；30 留 ≥3× 人手编辑余量，
+且与既有登录类限流同量级（login 5 / mailTest 5 / tlsUpload 10 / tlsInspect 120 之间）。
 
 #### 4.19-3 渲染规则与那条硬闸（为什么「保存成功」还不够）
 
