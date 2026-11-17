@@ -355,3 +355,88 @@ test('0032 撤退役/备份表：全新库跑到 head、三张表确实不在、
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #640：`run_checkpoints` 随 erix-agent 0.33.0 退役（run snapshot 整条竖切）。
+// 静态形状闸在 `portal/test/migrations.test.js`，这里补**只有真库能给**的四件事：
+//   ① 全新库跑完整条迁移链（含 0041）不炸，head 就是 0041；
+//   ② 跑完之后 `run_checkpoints` **确实不存在**（「先按冻结 baseline 建、再由 0041 撤」这条路真的走通）；
+//   ③ DROP 是真 DROP：把 baseline + 0006 的现场重建出来（带 0006 的 session 侧键与部分唯一索引），
+//      再跑一遍 0041 ⇒ 表与它的索引一起没了，而 `runs`（FK 的 parent 端）毫发无伤；
+//   ④ 幂等：表已没了再跑一遍 0041 仍 rc=0（`IF EXISTS` 生效），且裸 `DROP` 此刻必须 42P01
+//      —— 这条反向自证就是「为什么 ①②③ 不是恒真」的读数。
+// ---------------------------------------------------------------------------
+test('0041 撤 run_checkpoints：全新库跑到 head、表确实不在、DROP 是真撤、重放 rc=0（#640）', { skip: SKIP }, async () => {
+  const MIG0041 = fs.readFileSync(
+    path.join(HERE, '../../deploy/migrations/0041-retire-run-checkpoints.sql'), 'utf8');
+  const MIG0006 = fs.readFileSync(
+    path.join(HERE, '../../deploy/migrations/0006-session-transcript.sql'), 'utf8');
+  const BASELINE = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+
+  await withFreshDatabase(async (database) => {
+    const pool = createPool(dbUrl(database), { max: 1 });
+    try {
+      // ① 空库 → baseline → bootstrap → 全部增量（含 0041）。0041 的 `SET LOCAL lock_timeout` 在
+      //    runner 的事务里跑，这一步本身就是「没写 VACUUM / 没自己 BEGIN」的读数。
+      await migrate(pool, { env: { DATABASE_URL: dbUrl(database) }, log: { log: () => {} } });
+      const ledger = await pool.query(`SELECT version FROM schema_migrations ORDER BY version`);
+      const versions = ledger.rows.map((r) => r.version);
+      assert.ok(versions.includes('0041-retire-run-checkpoints'),
+        '台账必须有 0041（迁移 runner 真的应用了它，而不是只躺在目录里）');
+      assert.equal(versions[versions.length - 1], '0041-retire-run-checkpoints', 'head 就是 0041');
+      assert.equal(versions.length, computeExpectedVersions().length, '台账 = baseline + 全部增量');
+
+      // ② 表真的不在了（`to_regclass` 不存在给 NULL，不因缺表报错）。
+      const gone = await pool.query(`SELECT to_regclass('public.run_checkpoints') AS reg`);
+      assert.equal(gone.rows[0].reg, null, '迁移链跑完 run_checkpoints 必须已不存在');
+      // 冻结 baseline 没被改：它**继续包含**那句 CREATE TABLE（新库靠它先建表，才轮得到 0041 去撤）。
+      assert.match(BASELINE, /CREATE TABLE run_checkpoints \(/,
+        'baseline 是冻结件：删表只在 0041 里做，不许回写 baseline');
+
+      // ③ DROP 是真撤：把现场重建出来（baseline 的建表 + 0006 的 session 侧键与部分唯一索引），
+      //    再跑一遍 0041 ⇒ 表与随表的索引都没了，而 parent 端 `runs` 还在。
+      const createStmt = /CREATE TABLE run_checkpoints \([\s\S]*?\n\);/.exec(BASELINE);
+      assert.ok(createStmt, 'baseline 里应能找到 run_checkpoints 的建表语句（冻结件不许改）');
+      // 0006 的两条（先加列、再建部分唯一索引）逐字取自那个冻结文件 —— 缺 `transcript_key` 就建不了索引。
+      const addKey = /ALTER TABLE run_checkpoints ADD COLUMN IF NOT EXISTS transcript_key[^;]*;/.exec(MIG0006);
+      const sessionIdx = /CREATE UNIQUE INDEX IF NOT EXISTS run_checkpoints_session_uidx[\s\S]*?;/.exec(MIG0006);
+      assert.ok(addKey && sessionIdx, '0006 里应能找到 session 侧加列与部分唯一索引（冻结件不许改）');
+      await pool.query(createStmt[0]);
+      await pool.query(addKey[0]);
+      await pool.query(sessionIdx[0]);
+      const before = await pool.query(
+        `SELECT conname, confdeltype, confrelid::regclass AS parent
+           FROM pg_constraint
+          WHERE conrelid = 'run_checkpoints'::regclass AND contype = 'f'`);
+      assert.equal(before.rows.length, 1, '现场：FK 必须挂在 run_checkpoints（本站是 child 端）');
+      assert.equal(before.rows[0].conname, 'run_checkpoints_run_id_fkey');
+      assert.equal(String(before.rows[0].parent), 'runs', 'parent 是 runs ⇒ 撤 child 不动 parent');
+      assert.equal(before.rows[0].confdeltype, 'a', 'confdeltype = a（NO ACTION）⇒ 撤表不牵连 runs 的行');
+
+      await pool.query(MIG0041);
+      assert.equal((await pool.query(`SELECT to_regclass('public.run_checkpoints') AS reg`)).rows[0].reg, null,
+        '0041 必须真能把这张表撤掉');
+      const idxLeft = await pool.query(
+        `SELECT indexname FROM pg_indexes WHERE tablename = 'run_checkpoints'`);
+      assert.equal(idxLeft.rows.length, 0, '随表的索引（主键 + 0006 的部分唯一）必须一起没了');
+      assert.notEqual((await pool.query(`SELECT to_regclass('public.runs') AS reg`)).rows[0].reg, null,
+        'runs（FK parent 端）不得被连带撤掉');
+
+      // ④ 幂等 + 反向自证：此刻表已不在 ⇒ 再跑一遍 0041 必须 rc=0（`IF EXISTS` 生效），
+      //    而**裸** DROP 必须 42P01——这条同时证明「②③ 的通过不是因为 PG 宽松」。
+      await pool.query(MIG0041);
+      assert.equal((await pool.query(`SELECT to_regclass('public.run_checkpoints') AS reg`)).rows[0].reg, null,
+        '重放不得凭空长出这张表');
+      const bare = await pool.query('DROP TABLE public.run_checkpoints').then(() => null, (e) => e);
+      assert.ok(bare, '裸 DROP 一张已不存在的表必须报错（否则上面的幂等断言是恒真的）');
+      assert.equal(bare.code, '42P01', `裸 DROP 缺表应是 42P01，实得 ${bare.code}`);
+
+      // ⑤ 台账不许因为「表早没了」而少一行：重放整条链（migrate 再来一遍）仍然幂等。
+      await migrate(pool, { env: { DATABASE_URL: dbUrl(database) }, log: { log: () => {} } });
+      const again = await pool.query(`SELECT count(*)::int AS n FROM schema_migrations`);
+      assert.equal(again.rows[0].n, versions.length, '重放整条迁移链：台账行数不变');
+    } finally {
+      await pool.end();
+    }
+  });
+});
