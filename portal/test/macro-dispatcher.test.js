@@ -28,6 +28,7 @@ import { executeScheduledIntent } from '../src/macro-scheduled.js';
 import {
   createIntentDispatcher, reclaimTimedOutPendingRuns, extractReviewRunId, pollRunTask,
 } from '../src/macro-dispatcher.js';
+import { assembleTicket } from '../src/internal.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
 const SKIP = URL_VALUE ? false : SKIP_WITHOUT_PG;
@@ -42,6 +43,7 @@ const ids = (tag) => ({
 });
 
 const QUIET_FREE_NOW = () => new Date('2026-11-16T02:00:00.000Z'); // UTC+8 = 10:00 ⇒ 非免打扰、已过 09:00
+const QUIET = { info() {}, warn() {}, error() {} }; // issue #662：静默日志（避免分派器的 warn 刷屏干扰判读）
 
 /** 造一套可跑 scheduled-task 的现场（#623：user scope 无 HTTP 入口 ⇒ 直接 INSERT；until 留 NULL 避开 #624）。 */
 async function seedScene(pool, scene, { cwd = '~/projects/w616demo', params = '{"at":"09:00","cwd":"~/projects/w616demo","task":"整理今日变更","maxRounds":16}' } = {}) {
@@ -522,4 +524,193 @@ test('#652-3 run 成功但无正文 ⇒ 不落 0 字节文件，账上记 reason
     assert.equal(row.reason, 'no_output', `账上必须能看出「本次无输出」，实际 reason=${row.reason}`);
     await fs.rm(home, { recursive: true, force: true });
   });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// issue #662：M9 完成审查的最后一块——快照接入 + 只读审查 run（独立会话 + review-only）
+//          + per-run 标志（A 段）。全部**桩**（不真调模型）。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 一套可走 run-review 的现场：用户/容器/被审会话（cwd=~/projects/rv）+ 原 run（终态）+ run-review 订阅。 */
+async function seedReviewScene(pool, scene) {
+  const sessionId = crypto.randomUUID();
+  const runId = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO users (id, login, password_hash, status, fde_name) VALUES ($1,$2,'x','active',$2)`,
+    [scene.userId, scene.login],
+  );
+  await pool.query(
+    `INSERT INTO containers (id, user_id, runner_token_hash, image, agent_version, status, fde_name, container_name)
+     VALUES ($1,$2,$3,'img','0.32.0','running',$4,$5)`,
+    [scene.containerId, scene.userId, hashToken('tok-662'), scene.login, `fde-${scene.login}`],
+  );
+  await pool.query(
+    `INSERT INTO chat_sessions (id, user_id, project_id, title, model, cwd, status, last_seq)
+     VALUES ($1,$2,NULL,'被审会话','mock-model','~/projects/rv','active',2)`,
+    [sessionId, scene.userId],
+  );
+  await pool.query(
+    `INSERT INTO runs (id, session_id, status, termination, rounds, usage, error)
+     VALUES ($1,$2,'finished','{"reason":"end_turn"}',4,'{"input_tokens":1,"output_tokens":1}','{"code":"none"}')`,
+    [runId, sessionId],
+  );
+  await pool.query(
+    `INSERT INTO messages (id, session_id, run_id, seq, role, content)
+     VALUES ($1,$2,$3,1,'user','把登录修好'), ($4,$2,$3,2,'assistant','我修好了，测试全过')`,
+    [crypto.randomUUID(), sessionId, runId, crypto.randomUUID()],
+  );
+  await pool.query(
+    `INSERT INTO macro_templates (id, kind, name, params, audience, scope)
+     VALUES ($1,'run-review',$2,'{}','all','session')`,
+    [scene.templateId, `rv-${scene.login}`],
+  );
+  await pool.query(
+    `INSERT INTO macro_assignments (id, template_id, user_id, session_id, until, enabled)
+     VALUES ($1,$2,$3,$4,NULL,true)`,
+    [scene.assignmentId, scene.templateId, scene.userId, sessionId],
+  );
+  return { ...scene, sessionId, runId };
+}
+
+/** 认领一条 run-review 并造出分发器要的意图（anchor=run:<原 run>）。 */
+async function claimReviewIntent(pool, scene) {
+  const { id: macroRunId } = await claimMacroRun(pool, {
+    assignmentId: scene.assignmentId, anchor: `run:${scene.runId}`, criterion: 'terminal', bucket: scene.runId,
+  });
+  return {
+    templateKind: 'run-review', macroRunId, anchor: `run:${scene.runId}`, userId: scene.userId,
+    params: { max_rounds: 5 }, evidence: {},
+  };
+}
+
+const reviewRowOf = (pool, id) => pool.query(
+  `SELECT status, verdict, reason, remediation_text, child_run_id, worktree_path, snapshot_id
+     FROM macro_runs WHERE id = $1`, [id]).then((r) => r.rows[0]);
+
+// —— #662-1：run-review 分派**建快照**，且 worktreePath 传到 runMacroReview ——
+test('#662-1 run-review 分派建快照，快照 worktreePath 传给 runMacroReview（并落 macro_runs.worktree_path）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedReviewScene(pool, ids('R1'));
+    const intent = await claimReviewIntent(pool, scene);
+    const WT = '/tmp/wt-662-r1';
+    let snapCalls = 0;
+    let snapArg = null;
+    let snapshotPassed = null;
+    const fake = { ok: true, snapshotId: 'snap-1', worktreePath: WT, contentDigest: 'd' };
+    const d = createIntentDispatcher({
+      pool, log: QUIET,
+      createSnapshot: async (a) => { snapCalls += 1; snapArg = a; return fake; },
+      runMacroReview: async (_p, o) => { snapshotPassed = o.snapshot; return { macroRunId: o.macroRunId, status: 'done', verdict: 'pass' }; },
+    });
+    await d.dispatch([intent]);
+    assert.equal(snapCalls, 1, 'createSnapshot 必须恰好调用一次');
+    assert.ok(snapArg && typeof snapArg.repoDir === 'string' && snapArg.repoDir, `createSnapshot 必须带 repoDir：${JSON.stringify(snapArg)}`);
+    assert.equal(snapshotPassed?.worktreePath, WT, `worktreePath 必须传到 runMacroReview：${JSON.stringify(snapshotPassed)}`);
+    assert.equal(snapshotPassed?.ok, true, '快照对象（含 ok:true）必须原样传下去');
+    const row = await reviewRowOf(pool, intent.macroRunId);
+    assert.equal(row.worktree_path, WT, 'worktree_path 必须落 macro_runs（供 W4a 孤儿清扫关联回收）');
+  });
+});
+
+// —— #662-2：快照失败（ok:false）⇒ 原样传下去走 runMacroReview 的失败出口（不回灌）——
+test('#662-2 快照失败 ⇒ status=failed / verdict=unclassified / 不回灌 / 审查 runner 不起',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedReviewScene(pool, ids('R2'));
+    const intent = await claimReviewIntent(pool, scene);
+    let runnerCalled = 0;
+    const d = createIntentDispatcher({
+      pool, log: QUIET,
+      createSnapshot: async () => ({ ok: false, reason: 'disk_low', worktreePath: '/tmp/wt-r2' }),
+      reviewRunner: () => { runnerCalled += 1; return '结论：整改\n不该跑到这里'; },
+      // runMacroReview 用真实缺省实现（快照失败出口已实现）
+    });
+    await d.dispatch([intent]);
+    const row = await reviewRowOf(pool, intent.macroRunId);
+    assert.equal(row.status, 'failed', `快照失败 ⇒ failed：${JSON.stringify(row)}`);
+    assert.equal(row.verdict, 'unclassified', '快照失败 ⇒ unclassified');
+    assert.equal(row.remediation_text, null, '不回灌：remediation_text 必为 null');
+    assert.equal(row.child_run_id, null, '不回灌：child_run_id 必为 null');
+    assert.equal(runnerCalled, 0, '快照失败时绝不该起审查 run');
+  });
+});
+
+// —— #662-3：审查 run 是 review-only（postMessage 收到 reviewOnly===true）——
+test('#662-3 缺省审查 runner：postMessage 收到 reviewOnly===true + triggerKind=synthetic',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedReviewScene(pool, ids('R3'));
+    const intent = await claimReviewIntent(pool, scene);
+    const WT = '/tmp/wt-662-r3';
+    let pmOpts = null;
+    const d = createIntentDispatcher({
+      pool, log: QUIET,
+      createSnapshot: async () => ({ ok: true, snapshotId: 's', worktreePath: WT, contentDigest: 'd' }),
+      postMessage: async (_p, o) => { pmOpts = o; return { run: { id: crypto.randomUUID() } }; },
+      reviewTask: async () => ({ ok: true, text: '结论：通过', termination: { reason: 'finished', error: null }, error: null }),
+      // reviewRunner 不注入 ⇒ 走缺省 runReviewTaskDefault
+    });
+    await d.dispatch([intent]);
+    assert.ok(pmOpts, '缺省审查 runner 必须调用 postMessage');
+    assert.equal(pmOpts.reviewOnly, true, `审查 run 必须声明 reviewOnly:true，实得：${pmOpts.reviewOnly}`);
+    assert.equal(pmOpts.triggerKind, 'synthetic', '审查 run 必须是 synthetic');
+  });
+});
+
+// —— #662-4：审查 run 的 cwd = 快照 worktree（postMessage 收到 cwd===worktreePath）——
+test('#662-4 缺省审查 runner：postMessage 的 cwd === snapshot.worktreePath（独立只读会话）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedReviewScene(pool, ids('R4'));
+    const intent = await claimReviewIntent(pool, scene);
+    const WT = '/tmp/wt-662-r4-isolated';
+    let pmOpts = null;
+    const d = createIntentDispatcher({
+      pool, log: QUIET,
+      createSnapshot: async () => ({ ok: true, snapshotId: 's', worktreePath: WT, contentDigest: 'd' }),
+      postMessage: async (_p, o) => { pmOpts = o; return { run: { id: crypto.randomUUID() } }; },
+      reviewTask: async () => ({ ok: true, text: '结论：通过', termination: { reason: 'finished', error: null }, error: null }),
+    });
+    await d.dispatch([intent]);
+    assert.ok(pmOpts, '缺省审查 runner 必须调用 postMessage');
+    assert.equal(pmOpts.cwd, WT, `cwd 必须 = 快照 worktree，实得：${pmOpts.cwd}`);
+  });
+});
+
+// —— #662-5：端到端（桩 runner）结论：整改 ⇒ verdict=red + 回灌（既有行为不变）——
+test('#662-5 桩 runner 返回「结论：整改」⇒ verdict=red + 回灌（remediation_text/child_run_id 落账）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedReviewScene(pool, ids('R5'));
+    const intent = await claimReviewIntent(pool, scene);
+    let runnerCalled = 0;
+    const d = createIntentDispatcher({
+      pool, log: QUIET,
+      createSnapshot: async () => ({ ok: true, snapshotId: 's', worktreePath: '/tmp/wt-662-r5', contentDigest: 'd' }),
+      reviewRunner: ({ brief }) => { runnerCalled += 1; assert.ok(brief.includes('原任务'), '工作包应含原任务段'); return '结论：整改\n有 3 个未跟踪文件'; },
+      // runMacroReview 用真实缺省实现 + 真实回灌 postMessage
+    });
+    await d.dispatch([intent]);
+    assert.equal(runnerCalled, 1, '审查 runner 跑一次');
+    const row = await reviewRowOf(pool, intent.macroRunId);
+    assert.equal(row.status, 'done');
+    assert.equal(row.verdict, 'red', `桩返回整改 ⇒ red：${JSON.stringify(row)}`);
+    assert.ok(row.remediation_text && row.remediation_text.startsWith('[系统] '), `回灌正文以 [系统] 开头：${row.remediation_text}`);
+    assert.ok(row.child_run_id, 'red 已回灌 ⇒ child_run_id 应落账');
+  });
+});
+
+// —— #662-A：per-run review-only 标志（纯函数，无需 DB）——
+test('#662-A assembleTicket 下行 review_only + agentd 仅 true 置 RUN_REVIEW_ONLY=1', async () => {
+  const base = { queueId: 'q', claimToken: 'c', leaseUntil: '2026-01-01T00:00:00Z', project: {}, message: { content: 'x' }, attempts: 1 };
+  assert.equal(assembleTicket({ ...base, run: { id: 'r', session_id: 's', review_only: true } }).run.review_only, true);
+  assert.equal(assembleTicket({ ...base, run: { id: 'r', session_id: 's', review_only: false } }).run.review_only, null, 'false ⇒ null（区分没声明/声明关）');
+  assert.equal(assembleTicket({ ...base, run: { id: 'r', session_id: 's' } }).run.review_only, null, '缺失 ⇒ null');
+  process.env.FDE_HOME = process.env.FDE_HOME || '/tmp/erix-662-home';
+  process.env.ERIX_STATION_TOKEN = process.env.ERIX_STATION_TOKEN || 'test-token';
+  const { buildWorkerEnv } = await import('../../runner/agentd.js');
+  assert.equal(buildWorkerEnv({ review_only: true }, {}).RUN_REVIEW_ONLY, '1', 'review_only=true ⇒ RUN_REVIEW_ONLY=1');
+  assert.ok(!('RUN_REVIEW_ONLY' in buildWorkerEnv({ review_only: false }, {})), 'false ⇒ 不设 RUN_REVIEW_ONLY');
+  assert.ok(!('RUN_REVIEW_ONLY' in buildWorkerEnv({}, {})), '缺失 ⇒ 不设 RUN_REVIEW_ONLY');
 });
