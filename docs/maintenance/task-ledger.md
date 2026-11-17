@@ -8888,3 +8888,37 @@ dev 那条是 e2e 密文，明文世界里无法解释）；`secrets.js` 从「�
 - **本版内容**：#653（MCP 通道 P1，§8.166/§8.167）+ #666（配置槽改明文，§8.169）。
 - **部署注意（与 0.1.73 不同的一点）**：**不需要** `MCP_SECRET_KEY` 了——`deploy/.env` 里若已写，
   可以删掉（留着也无害，只是没人读）。
+
+### 8.171 发版 v0.1.74 并部署到位（6 台 FDE 重建 + 真机验收：明文槽值注入链路）（2026-11-17，主 agent）
+
+**为什么发 0.1.74 而不是部署 0.1.73**：`v0.1.73` 的 release 已成功、三镜像已推，但它带的是**加密版**配置槽；
+紧接着 §8.169 改成明文 ⇒ **v0.1.73 不部署**，从 main 重切 0.1.74（不动已发布 tag，§8.155 立的规矩）。
+
+**发布**：`v0.1.74` → run `44038416314` success（`images-digest.json` 三镜像 digest + imageId 齐全）。
+**部署**（`deploy/.env` 三 pin 换形态①，备份 `/tmp/deploy.env.bak-261117-174`）：
+
+| 镜像 | digest |
+|---|---|
+| portal | `sha256:d5dd586d…` |
+| fde | `sha256:bbe47b06…` |
+| fde-proxy | `sha256:fac4fd99…` |
+
+拉取核对：三镜像 `docker image inspect .Id` **逐一等于**清单里的 `imageId`
+（portal `027e2554…` / fde `c02cfde6…` / proxy `2f35b048…`）。FDE 镜像 ~2.5 GB，首次 `docker pull`
+在 20 min 超时线附近抖了两次（layer 重试），第三次 20 min 内完成。
+
+**起栈 + 重建**：`up -d` 重建 portal/db/proxy；迁移日志 `applying 0042`；`/api/health` = `0.1.74 / 9101d71 / 2026-11-17T07:24:23Z`。
+FDE 容器**逐台 `docker rm -f` + `provision-fde`**（换镜像必须重建）：`eric` / `tetris` / `todo` / `blind` /
+`acc019` / `alice` 六台，`docker inspect .Image` **全部等于 `c02cfde6…`**，健康检查全 healthy；
+容器内 `/opt/erix/build-info.json` = `0.1.74 / 9101d71 / 0.33.0`。
+
+**真机验收（这次验的是「明文槽值真的能注入」，不是「服务起得来」）**：
+- 库里确认：写值后 `capability_param_values.value_plain` = **`PLAINTEXT_174`**（明文，列名也改了，没有 `value_encrypted`）。
+- 物化确认：`~/.erix/mcp.json` 只有槽位声明，`grep -c PLAINTEXT_174 ~/.erix/*.json` = **全 0**。
+- run 确认：`mcp assembled status=ok servers=1 tools=1` → `mcp({action:"list"})` 发现 **2 个工具** →
+  `mcp({action:"call"})` 回显 **`PLAINTEXT_174:hi-174`**（平台注入的值真的到了子进程）。
+- 收尾确认：容器内 `pgrep -f mock-mcp` = **0**。
+- 清理：条目 retire、值删除（`capability_param_values` 归零）、`~/mock-mcp` 删除、eric 的
+  `mail_otp_enabled` 还原 true（验 e2e 期间临时关过）。
+
+**部署面变化（记一笔，免得下次照抄旧单）**：本版**不需要 `MCP_SECRET_KEY`**；`deploy/.env` 里若有可删。
