@@ -23,6 +23,7 @@ import {
   startMacroEvalLoop, isWatermarkStale, isQuietHours, inTz8, atToEpochMs, parseDurationMs,
   EVAL_INTERVAL_MS, STALE_INTERVAL_MULTIPLE, SILENCE_DEFAULT_THRESHOLD_MS, evaluateSkipGates,
   parseQuietSpec, quietSpecFor, DEFAULT_MAX_PER_DAY, DEFAULT_QUIET_SPEC, NOTIFY_KINDS,
+  evalClock, jitterSpanMs, jitterOffsetMs, JITTER_MAX_MS, listEvaluableAssignments,
 } from '../src/macro-eval.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
@@ -490,4 +491,83 @@ test('#617⚑9 scheduled-task 传 quiet_hours/max_per_day ⇒ MacroError 400', (
     assert.equal(err.code, 'validation_failed');
     assert.equal(err.httpStatus, 400, `scheduled-task 不收 ${field} ⇒ 400`);
   }
+});
+
+// ── #627① `jitter` 真的参与 clock 判点 ─────────────────────────────────────────
+// 过去 `jitter` 只是被 KIND_SCHEMA 收进 params、`evalClock` 从不读它（存了不用，比不填更糟：
+// 用户以为它生效了）。本用例钉两件事：① 同 at 的两个订阅必须在**不同时刻**被 claim；
+// ② 每个订阅的 claim 时刻必须逐字等于 `at + 确定性偏移`（不是「碰巧不同」）。
+test('#627① jitter 口径：解析、钳到 0–30m、未填为 0、偏移确定性', () => {
+  assert.equal(jitterSpanMs({ jitter: '10m' }), 600_000);
+  assert.equal(jitterSpanMs({ jitter: '30m' }), JITTER_MAX_MS);
+  assert.equal(jitterSpanMs({ jitter: '2h' }), JITTER_MAX_MS, '越界 ⇒ 钳到上限 30m（不得拖到下午）');
+  assert.equal(jitterSpanMs({}), 0, '未填 ⇒ 0：不打散（不凭空造缺省，否则所有任务莫名延后）');
+  assert.equal(jitterSpanMs({ jitter: '0m' }), 0);
+  assert.equal(jitterSpanMs({ jitter: '乱写' }), 0, '非法形态 ⇒ 0（等价于没填）');
+  const span = jitterSpanMs({ jitter: '10m' });
+  const o = jitterOffsetMs('assign-a', span);
+  assert.ok(o >= 0 && o <= span, '偏移必须落在 [0, span]');
+  assert.equal(o, jitterOffsetMs('assign-a', span), '同一订阅的偏移必须逐次相同（每拍判点漂移=会漏 tick）');
+  assert.equal(jitterOffsetMs('assign-a', 0), 0, 'span=0 ⇒ 无偏移');
+  assert.notEqual(jitterOffsetMs('assign-a', span), jitterOffsetMs('assign-b', span),
+    '不同订阅必须错开（这就是 jitter 的全部用途：打散同刻并发）');
+});
+
+test('#627① 同一 at 的两个订阅（jitter=10m）在不同时刻被 claim；不填 jitter 的对照组同时刻', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const { userId } = await seedScene(pool, 'j1');
+    const tplJ = await addTemplate(pool, 'scheduled-task', 'user', { at: '10:00', jitter: '10m' });
+    const tplN = await addTemplate(pool, 'scheduled-task', 'user', { at: '10:00' }); // 对照组：无 jitter
+    // 固定 id ⇒ 偏移可预演（hash 是确定性的），断言才能钉到分钟而不是「大概不同」。
+    const idA = 'aaaaaaaa-0000-4000-8000-000000000001';
+    const idB = '11111111-1111-4111-8111-111111111111';
+    const idC = 'cccccccc-0000-4000-8000-000000000001';
+    const idD = 'dddddddd-0000-4000-8000-000000000002';
+    const addWithId = async (id, templateId) => {
+      await pool.query(
+        `INSERT INTO macro_assignments (id, template_id, user_id, session_id, cwd, until, enabled)
+         VALUES ($1,$2,$3,NULL,$4,NULL,true)`,
+        [id, templateId, userId, `/no/such/cwd-${id.slice(0, 8)}`]);
+    };
+    await addWithId(idA, tplJ);
+    await addWithId(idB, tplJ);
+    await addWithId(idC, tplN);
+    await addWithId(idD, tplN);
+
+    const rows = await listEvaluableAssignments(pool);
+    const row = (id) => {
+      const r = rows.find((x) => x.id === id);
+      assert.ok(r, `订阅 ${id} 应被评估循环取到`);
+      return r;
+    };
+    const base = atToEpochMs('2026-11-16', '10:00');
+    assert.equal(base, NOW_MS, '现场：NOW 恰为 at ⇒ 无 jitter 时立刻 tick');
+
+    /** 分钟探针：返回第一次产出 tick 意图的时刻（= 被 claim 的时刻）。 */
+    const firstFire = async (r) => {
+      for (let k = 0; k <= 31; k += 1) {
+        const t = NOW_MS + k * 60_000;
+        const it = await evalClock(pool, r, t, { log: SILENT });
+        if (it) return t;
+      }
+      return null;
+    };
+
+    const tA = await firstFire(row(idA));
+    const tB = await firstFire(row(idB));
+    assert.ok(tA && tB, 'jitter 只能推迟判点，不得把任务挤掉');
+    assert.notEqual(tA, tB, '同 at + jitter=10m ⇒ 两个订阅必须在**不同时刻**被 claim');
+    // 钉到分钟：探针步长 60s ⇒ 首个命中时刻 = at + ceil(偏移/60s)×60s。
+    const expect = (id, params) => base + Math.ceil(jitterOffsetMs(id, jitterSpanMs(params)) / 60_000) * 60_000;
+    assert.equal(tA, expect(idA, row(idA).params), 'A 的 claim 时刻必须等于 at + 它的确定性偏移');
+    assert.equal(tB, expect(idB, row(idB).params), 'B 同上（偏移不同 ⇒ 时刻不同）');
+    assert.ok(tA > base && tB > base, '两条都被推迟了（= jitter 在起作用，不是判点没变）');
+    assert.ok(tA <= base + JITTER_MAX_MS && tB <= base + JITTER_MAX_MS, '偏移不得越出 30m 上限');
+
+    // 对照组：同 at、**没填 jitter** ⇒ 两条仍在同一拍被 claim（证明分离确实是 jitter 造成的）。
+    const tC = await firstFire(row(idC));
+    const tD = await firstFire(row(idD));
+    assert.equal(tC, base, '未填 jitter ⇒ at 当刻就 claim');
+    assert.equal(tD, base, '对照组两条必须同拍（否则本用例证明不了什么）');
+  });
 });
