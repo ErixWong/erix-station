@@ -740,7 +740,7 @@ export const zhCN = {
     reload: '刷新',
     loading: '正在读取市场目录…',
     empty: '还没有已发布的技能包。',
-    intro: '这里列的是平台已发布的技能包：安装到你的 FDE 工位，启用后才会进入模型的工具面。',
+    intro: '这里列的是平台已发布的技能包与 MCP 服务：安装到你的 FDE 工位，启用后才会进入模型的工具面。',
     budgetHint: '一个启用的技能会把它的全部工具铺进每一轮请求：单个 FDE 最多同时启用 {max} 个。',
     footnote: '停用只改开关，不删文件也不重新下载；手改过包里的文件可以用「重新安装」盖回去；' +
       '卸载会真的删掉 <你的工位>/.erix/skills 下那个目录。',
@@ -748,8 +748,6 @@ export const zhCN = {
     tools: '工具：{count}',
     securityScore: '安全分：{score}',
     scanHints: '{count} 条静态扫描提示',
-    kindMcp: 'MCP 条目',
-    installBlockedMcp: 'P0 不消费 MCP，装不了',
     // #608 §8.3：种类 / 准入理由 / MCP 专有的展示文案（用户面与管理台共用同一套，不各写一份）。
     kind: {
       skill: '技能包',
@@ -941,7 +939,7 @@ export const zhCN = {
           command: 'command（stdio 可执行文件）',
           commandHint: '只填程序名（例：npx）；参数全部往下面那框放（服务端会拒含空格的 command）。',
           args: 'args（一行一个参数）',
-          argsHint: '例：-y 与 @modelcontextprotocol/server-github 各占一行（行内空格保留）。',
+          argsHint: "例：-y 与 {'@'}modelcontextprotocol/server-github 各占一行（行内空格保留）。",
           url: 'url（http 端点）',
           urlHint: '例：https://srch.erix.vip/mcp；协议与可达性由服务端判（portal 自己不连它）。',
           exposure: 'exposure（暴露档）',
