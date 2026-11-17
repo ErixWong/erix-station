@@ -355,7 +355,7 @@ SQL
 | R8 spool 写满 | 塞满 spool 配额（每 run 256MB / 每容器 1GB ⚠️）且内存队列也满 | 事件不静默丢，run 显式 `spool_full`（retryable）（runner §7.5 + portal §6.4） | run 失败码 = `spool_full` |
 | R9 spool 损坏（撕裂写） | 制造末行不完整 | 扫描截断到最后一个完整换行、丢弃残缺尾行、告警（runner §7.5） | 不崩溃、不重传残缺行、日志告警 |
 | R10 `run_end` 唯一产生方 | 跑完一个 run | `run_end` 事件**仅由 portal 在 U2 终态事务合成**（worker 不经 U3 发 run_end，runner §7.6）；该事件 seq 为该 run 最大 | `run_events` 中该 run 恰一条 `type='run_end'`，且来源为 U2 终态事务 |
-| R11 终态 barrier | 终态后写 U3/U8/state | `409 run_terminal`（portal §9.6/§9.13） | 终态不可再写 |
+| R11 终态 barrier | 终态后写 U3/run-state | `409 run_terminal`（portal §9.6/§9.13） | 终态不可再写 |
 
 ### 3.5 路由发布（守不变式 2；契约 = topology §5/§8 + schema.sql `route_outbox`/`route_revisions` + model §2.5）
 

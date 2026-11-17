@@ -29,7 +29,8 @@ docker build -t erix-station/fde:local runner/
 
 ## 范围与偏差
 
-- **erix-agent 0.14.0 store 契约**：`appendRound` / `load` 是仅有的必需方法；配对的 `saveRunSnapshot` / `loadLatestRunSnapshot`、`saveRunState` / `loadRunState`、`markRunState` 是可选能力。Station 通过 `transcriptStoreContract` 验证 adapter；`loadRunStateStatus` 是宿主扩展，不是引擎必需方法。
+- **erix-agent 0.14.0 store 契约**：`appendRound` / `load` 是仅有的必需方法；`saveRunState` / `loadRunState`、`markRunState` 是可选能力。Station 通过 `transcriptStoreContract` 验证 adapter；`loadRunStateStatus` 是宿主扩展，不是引擎必需方法。
+  ⚠ **`saveRunSnapshot` / `loadLatestRunSnapshot` 已于 2026-11-17 删除（issue #640）**：erix-agent **0.33.0** 起引擎不再调用它们（上游 `docs/host-upgrade-guide-0.33.0.md` §2.2），本仓也不再提供 —— 恢复只靠账本。
 - **run state 分路**：`saveRunState` 写快照但剔除顶层 `state`；`markRunState` 写独立状态列。新状态字段由迁移 `0014-run-state-status.sql` 提供，legacy 快照中的 `state` 仍可读。
 - **notes 生命周期与保留**：0.14.0 notes 仅有 `run` scope，`scopeRef` 是逻辑 `runId`；agentd 下发的 `notesDir` 固定为 `<FDE_HOME>/runs/<runId>/notes`，所以跨 attempt/resume 保留，终态确认后随整个 run 目录移入 `runs-archive/<runId>/`。可验证的文件路径为 `<FDE_HOME>/runs-archive/<runId>/notes/run/<runId>/<key>.json`。`onRunComplete()` 只将 active notes 标为 done；没有 `onRunStart`，Station 不调用 `store.purge()`。归档 sweep 删除整个目录树（含 notes、tombstone 和空 scope 目录），因此单独 purge 不会增加清理覆盖面。
 - **保留策略与 ADR-018 D7 的差异**：终态 run 的 notes 保留阈值采用 `ERIX_ARCHIVE_TTL_HOURS`（默认 168h）；归档时刷新目录 mtime，agentd 启动时若归档目录 mtime 超阈值才物理清理，因此实际删除发生在阈值之后的下一次启动，并非定时器准点删除。上游 D7 的 session clock 以 transcript mtime/调度器状态判断 session 是否仍活跃；Station 没有 session-scope notes，run 是 notes 的唯一 scope，故不以 session transcript mtime 延长或缩短单个 run 的寿命。要延长保留，增大 `ERIX_ARCHIVE_TTL_HOURS`；设为 `0` 可禁用归档清扫、无限期保留。
