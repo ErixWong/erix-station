@@ -923,7 +923,6 @@ export type MarketErrorKey =
   | 'market.errors.reasonRequired'
   | 'market.errors.slotInvalid'
   | 'market.errors.secretMissing'
-  | 'market.errors.secretKeyMissing'
   | 'market.errors.packageShape'
   | 'market.errors.generic';
 
@@ -939,7 +938,6 @@ const ERROR_KEY_BY_CODE: Record<string, MarketErrorKey> = {
   capability_slot_invalid: 'market.errors.slotInvalid',
   capability_secret_missing: 'market.errors.secretMissing',
   capability_package_shape: 'market.errors.packageShape',
-  secret_key_missing: 'market.errors.secretKeyMissing',
 };
 
 /** 管理台表单认识的字段名（§3 的静态校验项 + #608 §4 的 MCP 字段；认不出就不标红，不猜）。 */
@@ -1037,8 +1035,6 @@ export function marketErrorText(error: unknown): string {
       const shape = str(details.pattern) ?? str(details.shape) ?? serverMessage;
       return t('market.errors.packageShape', { shape: shape === null || shape === '' ? '—' : shape });
     }
-    case 'market.errors.secretKeyMissing':
-      return t('market.errors.secretKeyMissing');
     case 'market.errors.reasonRequired':
       return t('market.errors.reasonRequired');
     default:

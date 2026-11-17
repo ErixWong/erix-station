@@ -810,7 +810,6 @@ export const en = {
       slotInvalid: 'Invalid slot combination: {combo} is not in the matrix (stdio only takes env, http only takes header).',
       secretMissing: 'Cannot enable: these slots have no value set yet ({slots}).',
       packageShape: 'The skill package matches a forbidden shape: {shape} (resident-style shapes are not accepted in P1).',
-      secretKeyMissing: 'The platform has no credential key configured (MCP_SECRET_KEY): credentials can be neither written nor decrypted.',
       generic: 'Request failed (HTTP {status}): {message}',
     },
   },
@@ -905,7 +904,6 @@ export const en = {
         save: 'Write',
         hasValue: 'Set',
         missing: 'Not set',
-        keyMissing: 'The platform has no credential key (MCP_SECRET_KEY): slots can be declared, values cannot be written.',
         setResult: '{name} is set (the value is not echoed back).',
         cleared: 'The value of {name} was deleted.',
         kind: {
