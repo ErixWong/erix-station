@@ -1,6 +1,6 @@
 // 管理台「提示词」面板的**读侧 + 写侧**（issue #596 片 A）。
 // 契约：`docs/design/admin-prompts-panel-2026-11-16.md`（§3 读侧 / §4 写侧 / §5 渲染 / §6 API / §8 判据）；
-// API 文档：`docs/api/portal.md` §4.18。表：迁移 `0041-platform-prompts.sql`（单行表，`''` = 跟随内置）。
+// API 文档：`docs/api/portal.md` §4.18。表：迁移 `0040-platform-prompts.sql`（单行表，`''` = 跟随内置）。
 //
 // 一句话：平台对 agent 说的三句话（`~/AGENTS.md` 的补充约定、`~/AGENTS.md` 的整段覆写、会话标题的
 // system）从「改代码 + 重建镜像」变成「管理台改一行，下一次 run / 下一次改名生效」。
@@ -23,7 +23,7 @@
 //      `updatePlatformPrompts` 里那段 **JS 预闸**（那一段 `闸一（写之前）`）：预读多付的只是
 //      1 条 SELECT，而删掉它就是拿「超限也先把正文写进库里」换的。
 //   4. **响应一律来自 `RETURNING`**（不信输入）：「保存成功」说的是库里现在那份文本。
-//   5. **产品上限不在 DB CHECK，在这里**（分层见 0041 头注释）。两条闸：字段自身上限 +
+//   5. **产品上限不在 DB CHECK，在这里**（分层见 0040 头注释）。两条闸：字段自身上限 +
 //      **渲染后**整份 `~/AGENTS.md` ≤ `AGENTS_MD_INJECT_MAX_BYTES`。第二条是必须的：注入侧
 //      （`runner/lib/agents-md.js`）超过 16 KiB 会**静默截断**只留 marker —— 不拦就是「管理员写完
 //      8 KiB 追加段什么也不会发生，直到某天发现约定被切了一半」。
@@ -394,7 +394,7 @@ export function toPlatformPromptsDto({ resolved, row = null }) {
     },
     readonly: READONLY_PROMPT_KEYS.map((key) => ({ key })),
     // ⚙ 「从未保存过」的定义是**没有写者**（`updated_by IS NULL`），不是「表里没有那一行」：
-    //   0041 会 `INSERT … ON CONFLICT DO NOTHING` 种下 `id = 1`，而那一行的 `updated_at` 吃的是
+    //   0040 会 `INSERT … ON CONFLICT DO NOTHING` 种下 `id = 1`，而那一行的 `updated_at` 吃的是
     //   `timestamptz NOT NULL DEFAULT now()` ⇒ 全新库上它**永远非 null**（那个值是「迁移跑过的
     //   那一刻」）。只看 `updated_at` 就等于让界面宣称一个管理员从没做过的「最后保存」（评审 R3）。
     //   不在迁移里动 `updated_at`（那会牵动已部署库），只在 DTO 这一侧把两个字段归成同一个口径。
