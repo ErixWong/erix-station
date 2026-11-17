@@ -453,10 +453,10 @@ function buildPayload(bundle?: { files: unknown[] }) {
     license: form.value.license === '' ? undefined : form.value.license,
     description_md: form.value.description_md === '' ? undefined : form.value.description_md,
     kind: form.value.kind,
-    // 契约 §7.2 只钉了「`kind='mcp'` 的字段面 = §4」，没钉这些键进服务端后落在**顶层还是 `manifest`**；
-    // 两处发同一份 `buildMcpFields()` 输出 ⇒ 后端读哪边都对，也不会出现两份矛盾的值。
+    // MCP 字段**只发顶层**：服务端 `validateMcpFields` 读的就是顶层，`manifest` 由它自己组装。
+    // 曾经同时发一份 `manifest`（「读哪边都对」）——那等于在请求体里放两份真相，两边一旦漂移
+    // 就只有服务端那一份算数、前端这份静默骗人（主 agent 评审时删掉）。
     ...mcpFields,
-    ...(isMcp.value ? { manifest: mcpFields } : {}),
     bundle,
   };
 }

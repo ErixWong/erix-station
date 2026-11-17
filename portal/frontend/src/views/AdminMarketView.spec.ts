@@ -745,7 +745,8 @@ describe('⑩ MCP 发布面（#608 §8.1）', () => {
     expect(body.timeout_ms).toBe(45000);
     expect(body.resident).toBe(false);
     expect(body.bundle).toBeUndefined(); // MCP 没有包体
-    expect(body.manifest).toMatchObject({ transport: 'stdio', reason: 'stateful', slots: [] });
+    // 只发顶层：请求体里**不许**再有一份 `manifest`（两份真相会漂移，服务端只读顶层）。
+    expect(body.manifest).toBeUndefined();
   });
 
   it('slots 增删行；`inject` 随 transport 锁死（只读说明，不是可选控件）；重名不发请求', async () => {
