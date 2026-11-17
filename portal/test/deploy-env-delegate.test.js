@@ -1476,4 +1476,36 @@ test('活二⑯ 斜杠认不准时必须退回除法：同一行内找不到闭�
   }
 });
 
+test('活二⑰ 参数遮蔽表要收全**每一个**参数位：末位参数漏收 = 幻影 key 进枚举、unsupported 为空（假绿）', () => {
+  // #587 族 A 返工。`bracketPairs()` 给的 `close` 是「右括号**之后**」的 exclusive 下标，旧代码把参数位
+  // 写成 `[open + 1, close)` ⇒ 末位参数的片段尾随一个 `)` ⇒ `LAST_ENV)` 匹配不上任何绑定形状
+  // ⇒ **末位参数整个漏收**。后果是假绿：被遮蔽的动态读沿用文件级同名常量 ⇒ 枚举里多出一个**没人读**的
+  // key（还看起来是对的），`unsupported` 却空着 ⇒ fail-closed 被绕过（`gate.sh` 那一层全绿）。
+  // 所以每种参数位都要**逐行点名**：普通函数 / 对象方法 / 类方法 / 类字段箭头 / 顶层箭头 / 无括号单参数
+  // 箭头，少收任何一形，那一行的读形既不进 unsupported、又把幻影 key 送进枚举。
+  const src = [
+    "const LAST_ENV = 'ERIX_A5_LASTPHANTOM';",
+    "const CTRL_ENV = 'ERIX_A5_LASTCTRL_OK';",
+    'export function plain(SH_ENV, LAST_ENV) { return process.env[LAST_ENV]; }',
+    'export const obj = { read(SH_ENV, LAST_ENV) { return process.env[LAST_ENV]; } };',
+    'export class C { read(SH_ENV, LAST_ENV) { return process.env[LAST_ENV]; } }',
+    'export class D { fld = (SH_ENV, LAST_ENV) => process.env[LAST_ENV]; }',
+    'export const topArrow = (SH_ENV, LAST_ENV) => process.env[LAST_ENV];',
+    'export const bareArrow = LAST_ENV => process.env[LAST_ENV];',
+    'export const ctrl = process.env[CTRL_ENV];',      // 对照组：没被遮蔽的静态读要照常进枚举
+  ].join('\n');
+  const { keys, unsupported } = scanFixture('shadow-last-param', src);
+  assert.ok(!keys.includes('ERIX_A5_LASTPHANTOM'),
+    'ERIX_A5_LASTPHANTOM 只在**被参数遮蔽**的读形里出现过，却进了枚举（实际 ' + JSON.stringify(keys) + '）：'
+    + '那个参数没进遮蔽表 ⇒ 动态读沿用了文件级同名常量 = 幻影 key。错记比漏记更坏 —— 它看起来是对的，'
+    + '而真的动态读在 unsupported 里隐形');
+  assert.deepEqual(unsupported.map((u) => `${u.at} ${u.shape}`),
+    [3, 4, 5, 6, 7, 8].map((n) => `fx.js:${n} process.env[LAST_ENV]`),
+    `六形末位参数的动态读没**逐条**进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => `${u.at} ${u.shape}`))}）：`
+    + '少一条就是那一形（普通函数 / 对象方法 / 类方法 / 类字段箭头 / 顶层箭头 / 无括号箭头）的参数没进遮蔽表');
+  assert.deepEqual(keys, ['ERIX_A5_LASTCTRL_OK'],
+    `枚举里出现了不该有的 key（实际 ${JSON.stringify(keys)}）：末位参数的遮蔽既不许错记成静态、也不许把` 
+    + '没被遮蔽的静态读一起吞掉（对照组 `CTRL_ENV` 必须照常在里面）');
+});
+
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
