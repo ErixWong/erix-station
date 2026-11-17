@@ -240,6 +240,52 @@ function splitTop(masked, from, to) {
   return parts.filter(([a, b]) => masked.slice(a, b).trim() !== '');
 }
 
+/** 从 `from` 起第一个**非空白**字符的下标；没有 ⇒ `null`。 */
+function nextNonSpace(text, from) {
+  const m = /\S/.exec(text.slice(from));
+  return m ? from + m.index : null;
+}
+
+/**
+ * 换行之后**只能另起一句**的开头词（ASI 边界）：这些词不可能接着上一个表达式继续。
+ * 反过来那些**能**接着表达式继续的词（`in` / `of` / `instanceof` / `new` 之外…）一律不列：
+ * `a\n in obj` 是同一个表达式，ASI 不插分号 ⇒ 把它当边界会把遮蔽算窄（= 错记，静默）。
+ */
+const STATEMENT_HEAD_RE = /^(?:const|let|var|function|class|export|import|return|if|for|while|do|switch|try|catch|finally|else|throw|break|continue|debugger|await|yield|typeof|void|delete)\b/;
+
+/** 能**结束**一个表达式的字符（ASI 判定用：`x\n const y` 才断，`(\n x` 那种没成形的不断）。 */
+const EXPRESSION_ENDS_RE = /[\w$)\]}'"`]/;
+
+/**
+ * **无花括号箭头**（表达式体）的区间结尾，从 `=>` 之后第一个下标起算：扫到第一个「深度 0 的结束符」
+ * （`;` `,` `)` `]` `}`）或 ASI 语句边界为止。
+ *
+ * 旧口径取「最内层**外围块**的结尾」（`{` 都没写，没配对 ⇒ 保守拉宽），后果是实测的**假红**：
+ * `const g = (KEY) => env[KEY]; … process.env[KEY]` —— 箭头**之后**那次读的是外层常量，却被算进
+ * 箭头参数的遮蔽区间 ⇒ 静态读形被判成动态 ⇒ 进 `unsupported`（三腿判据看不见这个 key，另一种静默）。
+ * 拉窄的边界必须**仍覆盖整个表达式体**：体内不可能出现深度 0 的 `;` `,` `)` `]` `}`（那些符号一出现
+ * 就说明表达式已经结束），所以这一趟扫描只会停在真正的体尾。
+ */
+function expressionBodyEnd(masked, from) {
+  let depth = 0;
+  let last = '';
+  for (let i = from; i < masked.length; i += 1) {
+    const c = masked[i];
+    if (c === '(' || c === '[' || c === '{') { depth += 1; last = c; continue; }
+    if (c === ')' || c === ']' || c === '}') { if (depth === 0) return i; depth -= 1; last = c; continue; }
+    if (depth === 0 && (c === ';' || c === ',')) return i;
+    if (depth === 0 && c === '\n' && EXPRESSION_ENDS_RE.test(last)) {
+      const nx = nextNonSpace(masked, i + 1);
+      if (nx != null && STATEMENT_HEAD_RE.test(masked.slice(nx))) return i;
+    }
+    if (!/\s/.test(c)) last = c;
+  }
+  return masked.length;
+}
+
+/** 无括号的单参数箭头 `KEY => …`：`KEY` 之前不许是标识符字符或闭合括号（挡掉 `(KEY) =>` 那种已有括号的形）。 */
+const BARE_ARROW_PARAM_RE = new RegExp(`(?<![\\w$)\\]}])(${IDENT_RE})\\s*=>`, 'g');
+
 /**
  * 一段**参数位**（或解构成员位）里有哪几个绑定：`[{ name, at, def|null }]`。
  * 认：`a` / `a = X` / `...rest` / `{ k, k2 = Y, old: alias }` / `[a, b]`（嵌套解构递归）。
@@ -261,11 +307,17 @@ function paramBindingsIn(masked, code, from, to) {
   if (bc == null) return [];
   const out = [];
   for (const [a, b] of splitTop(masked, bo + 1, bc - 1)) {
-    // `{ oldName: alias = DEFAULT }` ⇒ 绑定的是**冒号右边**那个名字，不是 `oldName`
+    // `{ oldName: alias = DEFAULT }` ⇒ 绑定的是**冒号右边**那个名字，不是 `oldName`；默认值也要**带走**
+    // （`{ k: NAME = 'ERIX_X' }` 解析得出名字，旧代码在这里写死 `def: null` ⇒ 可解析的被丢 `unsupported`）
     const member = masked.slice(a, b);
-    const aliased = new RegExp(`^\\s*${IDENT_RE}\\s*:\\s*(${IDENT_RE})\\s*(?:=[\\s\\S]*)?$`).exec(member);
+    const aliased = new RegExp(`^\\s*${IDENT_RE}\\s*:\\s*(${IDENT_RE})\\s*(?:=([\\s\\S]*))?$`).exec(member);
     if (aliased) {
-      out.push({ name: aliased[1], at: a + member.indexOf(aliased[1]), def: null });
+      const eq = member.indexOf('=', member.indexOf(aliased[1]) + aliased[1].length);
+      out.push({
+        name: aliased[1],
+        at: a + member.indexOf(aliased[1]),
+        def: eq < 0 ? null : code.slice(a + eq + 1, b).trim(),
+      });
       continue;
     }
     out.push(...paramBindingsIn(masked, code, a, b));      // 嵌套解构 / `...rest` / 带默认值的成员
@@ -275,23 +327,59 @@ function paramBindingsIn(masked, code, from, to) {
 
 /**
  * **参数遮蔽表**：每个参数名 → `{ start, end, lits|null }`，`end` = 那个函数体的结尾。
- * 参数表怎么认：括号对之后紧跟 `=>` 或 `{`，且括号前不是 `if`/`for`/… 这类控制词（⇒ 定义，不是调用）。
- * `=>` 的**表达式体**没有 `{` 可配 ⇒ 保守取「最内层外围块的结尾」⇒ 宁可把遮蔽算宽（= 多进 unsupported，响），
- * 也不许把遮蔽算窄（= 错记，静默）。#587 族 A⑤。
+ * 参数表怎么认：括号对之后紧跟 `=>` 或 `{`；`{` 形还要求括号前不是 `if`/`for`/… 这类控制词（⇒ 定义，不是调用）。
+ * `=>` 形**不许**用控制词挡：`return (KEY) => env[KEY]` 也是定义（旧口径一律挡掉 ⇒ `return`/`typeof` 后面的
+ * 箭头参数整个不进遮蔽表 = 动态 key 被错记成文件级静态名的又一处假绿）。
+ *
+ * 两处必须同时成立，否则会各红一边：
+ *   · **所有参数位都要进来**（含**末位**）：`pairs` 里的 `close` 是「右括号**之后**」的 exclusive 下标 ⇒
+ *     参数位是 `[open + 1, close - 1)`。旧代码写 `splitTop(masked, open + 1, close)` ⇒ 末位参数的片段
+ *     里带着那个 `)` ⇒ `KEY)` 匹配不上任何绑定形状 ⇒ **末位参数整个漏收**（`function f(KEY){}`、
+ *     `read(KEY){}`、`(KEY)=>` 实测 `shadows=[]`），动态 key 于是沿用文件级常量 = 幻影 key 进枚举、
+ *     `unsupported` 为空 = 闸门放行。带默认值的末位参数同理受害，只是方向相反：默认值文本尾随一个 `)`
+ *     ⇒ `litsOf` 解析不出 ⇒ 可解析的 `function f(X = OUTER)` 被丢进 `unsupported`（假红）。
+ *   · **遮蔽区间要算窄**（见 `expressionBodyEnd`）：表达式体只覆盖体本身，不延伸到外围块尾。
  */
 function collectParamBindings(code, masked, pairs, scopes, litsOf) {
   const out = [];
+  /**
+   * 函数体尾，从**体的第一个下标** `from` 起算：体是 `{` 开头 ⇒ 那对花括号的尾；否则（表达式体）⇒
+   * `expressionBodyEnd`。两者都再 `Math.min(外围块尾)`：箭头不可能比包住它的那个 `{}` 还长，
+   * 这条上限既把表达式体扫描的代价钉在局部（大文件里不会一路扫到文件尾），也保证新口径
+   * **只会比旧口径窄，不会更宽**（旧口径就是这个上限）。
+   */
+  const bodyEnd = (from, ceiling) => {
+    const b = nextNonSpace(masked, from);
+    const raw = b != null && masked[b] === '{'
+      ? (pairs.get(b) ?? scopes(b).end)
+      : expressionBodyEnd(masked, from);
+    return Math.min(raw, ceiling);
+  };
+  const sites = [];
   for (const [open, close] of [...pairs].filter(([o]) => masked[o] === '(').sort((a, b) => a[0] - b[0])) {
     const tail = /^\s*(=>|\{)/.exec(masked.slice(close, close + 64));
     if (!tail) continue;
-    const head = masked.slice(Math.max(0, open - 96), open);
-    const hw = new RegExp(`(${IDENT_RE})\\s*$`).exec(head);
-    if (hw && CONTROL_WORDS.has(hw[1])) continue;
-    let end;
-    if (tail[1] === '{') end = pairs.get(close + tail[0].length - 1) ?? scopes(open).end;
-    else end = scopes(close).end;
-    for (const [a, b] of splitTop(masked, open + 1, close)) {
-      for (const p of paramBindingsIn(masked, code, a, b)) out.push({ name: p.name, start: p.at, end, lits: litsOf(p.def) });
+    if (tail[1] === '{') {
+      const head = masked.slice(Math.max(0, open - 96), open);
+      const hw = new RegExp(`(${IDENT_RE})\\s*$`).exec(head);
+      if (hw && CONTROL_WORDS.has(hw[1])) continue;      // `if (x) {` / `for (const [k, v] of …) {` 不是定义
+    }
+    // 参数位 = `(` 与 `)` 之间（`close` 已经**越过**右括号 ⇒ 必须 -1，否则末位参数片段里带着 `)`）。
+    // 体首：`{` 形从那个花括号**本身**起算（`tail[0]` 末尾就是它）；`=>` 形从箭头之后起算。
+    const bodyFrom = tail[1] === '{' ? close + tail[0].length - 1 : close + tail[0].length;
+    sites.push({ from: open + 1, to: close - 1, end: bodyEnd(bodyFrom, scopes(close).end) });
+  }
+  // **无括号**的单参数箭头 `KEY => env[KEY]`：没有 `(` 可配 ⇒ 单独一趟，否则这一形的参数永远漏收
+  for (const m of masked.matchAll(BARE_ARROW_PARAM_RE)) {
+    const name = m[1];
+    sites.push({ from: m.index, to: m.index + name.length, end: bodyEnd(m.index + m[0].length, scopes(m.index).end) });
+  }
+  for (const site of sites) {
+    if (site.to < site.from) continue;
+    for (const [a, b] of splitTop(masked, site.from, site.to)) {
+      for (const p of paramBindingsIn(masked, code, a, b)) {
+        out.push({ name: p.name, start: p.at, end: Math.max(site.end, p.at + p.name.length), lits: litsOf(p.def) });
+      }
     }
   }
   return out;
