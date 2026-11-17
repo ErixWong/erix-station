@@ -73,9 +73,22 @@ export async function purgeSystemMetrics(pool, { retentionDays }) {
 
 // ── 纯解析函数（全部可注入文本，单测不碰真实 `/proc`）────────────────────────────────────
 
-/** 只认有限数字；其余（缺字段 / `NaN` / 脏值）⇒ `null`，**绝不当成 0**（#586 口径）。 */
+/**
+ * 只认有限数字；其余（缺字段 / `NaN` / 脏值）⇒ `null`，**绝不当成 0**（#586 口径）。
+ *
+ * ⚠ 本轮修掉的**第二个缺陷**（旧实现把「没给」当 0）：`Number(String(undefined ?? '').trim())`
+ *   = `Number('')` = **0**，而 `Number(null)` 也是 0 ⇒ 缺字段、空行、`null` 全都静默变成「真的 0」。
+ *   后果逐条：`/proc/loadavg` 整个读不到 ⇒ load 三格变 0.00（面板说「负载很轻」）；
+ *   `statfs` 少一个 `bavail` ⇒ 算出「用了 100%」；pg 回 `NULL` 的分桶行 ⇒ 图上出现一排 0 点。
+ *   全部方向都是「把不知道说成很忙/很忙」，而这一个监控页面存在的理由就是分辨宿主忙不忙。
+ *   现在：空串 / 纯空白 / `null` / `undefined` / 非有限数 ⇒ `null`；`'0'` 与 `0` 仍是真 0。
+ */
 function numOrNull(value) {
-  const n = typeof value === 'number' ? value : Number(String(value ?? '').trim());
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const text = String(value).trim();
+  if (text === '') return null;
+  const n = Number(text);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -449,6 +462,41 @@ export function containerDrift(dbNames, dockerNames) {
   const onlyDb = [...a].filter((n) => !b.has(n)).sort();
   const onlyDocker = [...b].filter((n) => !a.has(n)).sort();
   return { db: a.size, docker: b.size, onlyDb, onlyDocker, count: onlyDb.length + onlyDocker.length };
+}
+
+/**
+ * `GET /api/admin/system/metrics` 的响应本体（契约 `docs/api/portal.md` §4.18，字段形状见 issue #650 §API）。
+ *
+ * 抽成函数而不是写在 `http.js` 的 if 链里，理由：`http.js` 已 5000+ 行，而本端点的业务全部是
+ * 「拼三份读数 + 一个降级分支」，写在路由链里会让那段注释比代码长（本仓已多次为此把业务抽出去）。
+ *
+ * 三条硬口径（逐条有单测）：
+ *   · `range` 非法 ⇒ **回落 `1h`**，不报 400——这是一个只读观测面，把一个拼错的查询参数变成错误页
+ *     只会让人多进一次后台；回落后把**生效的值**回在 `range` 字段里（页面据此渲染选中态，不撒谎）。
+ *   · `querySeries` 抛错 ⇒ `seriesError` 给原因字符串，而 **`latest` 仍必须 200 正常返回**：
+ *     卡片读的是进程内那一拍，DB 挂了它依旧有数（决定 2）——这是本端点存在的理由，不是降级补丁。
+ *     此时 `series.points` 给空数组（页面画「该区间无数据」，不画一条贴底的假线）。
+ *   · 采样器没跑（`SYSTEM_METRICS_ENABLED=0`）或还没有第一拍 ⇒ `latest: null`，**不是 500**。
+ *
+ * @param {{pool: object, sampler?: {latest?: () => object|null}, retentionDays?: number|null,
+ *          range?: string, now?: () => number}} input
+ */
+export async function metricsApiPayload({
+  pool, sampler = null, retentionDays = null, range = DEFAULT_METRIC_RANGE, now = () => Date.now(),
+} = {}) {
+  // 非法 `range` 在这里（而不是在 HTTP 层）回落：`querySeries` 本来也是同一个口径，两处共用一个判定。
+  const key = METRIC_RANGES[range] ? range : DEFAULT_METRIC_RANGE;
+  const latest = toApiLatest(typeof sampler?.latest === 'function' ? sampler.latest() : null);
+  let series = { bucketSeconds: pickBucketSeconds(METRIC_RANGES[key]), points: [] };
+  let seriesError = null;
+  try {
+    const { bucketSeconds, points } = await querySeries(pool, { range: key, now });
+    series = { bucketSeconds, points };
+  } catch (err) {
+    // 只给原因字符串（`code` 优先，没 code 才给 message）：堆栈与 SQL 片段不该出现在管理台响应里。
+    seriesError = String(err?.code ?? err?.message ?? err);
+  }
+  return { latest, series, range: key, retentionDays: retentionDays ?? null, seriesError };
 }
 
 /**
