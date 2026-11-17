@@ -326,11 +326,6 @@ export function loadConfig(env = process.env) {
     userSpaceRootHost: env.ERIX_USERSPACE_ROOT_HOST || env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
     // Workspace 自动清理默认关闭；显式正数才会设置 purge deadline 并启用目录 sweep。
     workspaceRetentionDays: nonNegativeIntEnv(env, 'ERIX_WORKSPACE_RETENTION_DAYS', 0),
-    // #608 §3.1：配置槽值的 AES-256-GCM key（base64 的 32 字节）。**不给默认值**——
-    // 缺它就只允许读「已设置/未设置」元数据，任何加解密都会 503 `secret_key_missing`。
-    // 为什么不做「缺省时自动生成并落盘」：那会把 key 写进容器层/配置面，等于把锁和钥匙放一起；
-    // 轮换口径是「换 env ⇒ 旧密文解不开 ⇒ 页面显示未设置 ⇒ 管理员重填」。
-    mcpSecretKey: env.MCP_SECRET_KEY || '',
     // FDE 工作区属主 UID/GID（user-space §6.1：1000/1000）。
     fdeUid: intEnv(env, 'FDE_USER_UID', 1000),
     fdeGid: intEnv(env, 'FDE_USER_GID', 1000),

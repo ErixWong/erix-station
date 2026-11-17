@@ -45,7 +45,7 @@ import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置�
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
 import * as platformPrompts from './platform-prompts.js'; // #596 片 A：管理台「提示词」面板（读 + 写）
 import * as uploadSettings from './upload-settings.js'; // #485 片 A：单文件上限进管理台（DB 优先 env，每次上传现读）
-import * as secrets from './secrets.js';   // #608：配置槽加解密（错误码 secret_key_missing）
+import * as secrets from './secrets.js';   // #608：配置槽值的形态校验（只写不读）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
 import * as delegation from './delegation.js'; // 子 run（delegation）读侧：名册 + 账本两个只读端点
@@ -799,8 +799,8 @@ export function createServer({
         return;
       }
       if (err instanceof secrets.SecretError) {
-        // #608：密钥面的错误（缺 key / 解不开 / 值非法）有自己的 code 集合，别混进 validation_failed。
-        sendJson(res, err.httpStatus ?? 503, errorBody(err.code, err.message, false, err.details));
+        // #608：槽值面的错误（空串 / 超长 / 未声明）有自己的 code 集合，别混进 validation_failed。
+        sendJson(res, err.httpStatus ?? 400, errorBody(err.code, err.message, false, err.details));
         return;
       }
       if (err instanceof market.MarketError) {
@@ -1357,7 +1357,7 @@ async function routeApi(req, res, ctx, url) {
     } else if (action === 'uninstall') {
       result = await market.uninstallCapability({ pool: ctx.pool, config: ctx.config, fde, slug, log: ctx.log });
     } else {
-      // #608：MCP 的启用闸要解析槽值（缺必填 ⇒ 409），所以要把 config 递下去（里面带 mcpSecretKey）。
+      // #608：MCP 的启用闸要解析槽值（缺必填 ⇒ 409），所以要把 config 递下去。
       result = await market.setCapabilityEnabled({
         pool: ctx.pool, fde, slug, enabled: body?.enabled, config: ctx.config,
       });
@@ -1965,7 +1965,7 @@ async function handleAdminApi(req, res, ctx, url) {
       const fdeId = scope === 'fde' ? decodeUuid(String(body?.fde_id ?? '')) : null;
       const out = await market.setSlotValues({
         pool: ctx.pool, itemId, actorId: session.user.id, scope, fdeId,
-        values: body?.values ?? {}, key: ctx.config.mcpSecretKey,
+        values: body?.values ?? {},
       });
       await auth.audit(ctx.pool, {
         actorId: session.user.id,
@@ -5079,9 +5079,7 @@ async function handleInternal(req, res, ctx, url) {
     }
     let out;
     try {
-      out = await market.resolveMcpServersForFde({
-        pool: ctx.pool, fde, key: ctx.config.mcpSecretKey, log: ctx.log,
-      });
+      out = await market.resolveMcpServersForFde({ pool: ctx.pool, fde });
     } catch (err) {
       // 缺 key / 解密全失败 ⇒ 降级成「一台都没有」，让 run 正常继续（不把 run 打死）。
       ctx.log?.warn?.(`[internal/mcp] resolve failed fde=${fde.name}: ${err.message}`);
