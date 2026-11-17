@@ -113,10 +113,22 @@ test('#450 管理台 host 默认 = admin.<BASE_DOMAIN>，且 compose 把 ADMIN_P
 
 /** 四处插值点（service 路径是 compose 报错时会点名的那一个，写进断言消息便于对现场）。 */
 const FAIL_CLOSED_REFS = [
-  { varName: 'STATION_DOCKER_PROXY_IMAGE', at: 'services.station-docker-proxy.image', path: ['station-docker-proxy', 'image'] },
-  { varName: 'STATION_PORTAL_IMAGE', at: 'services.station-portal.image', path: ['station-portal', 'image'] },
-  { varName: 'FDE_IMAGE', at: 'services.station-docker-proxy.environment.IMAGE_ALLOWLIST', path: ['station-docker-proxy', 'environment', 'IMAGE_ALLOWLIST'] },
-  { varName: 'FDE_IMAGE', at: 'services.station-portal.environment.FDE_IMAGE', path: ['station-portal', 'environment', 'FDE_IMAGE'] },
+  {
+    varName: 'STATION_DOCKER_PROXY_IMAGE', at: 'services.station-docker-proxy.image',
+    path: ['station-docker-proxy', 'image'],
+  },
+  {
+    varName: 'STATION_PORTAL_IMAGE', at: 'services.station-portal.image',
+    path: ['station-portal', 'image'],
+  },
+  {
+    varName: 'FDE_IMAGE', at: 'services.station-docker-proxy.environment.IMAGE_ALLOWLIST',
+    path: ['station-docker-proxy', 'environment', 'IMAGE_ALLOWLIST'],
+  },
+  {
+    varName: 'FDE_IMAGE', at: 'services.station-portal.environment.FDE_IMAGE',
+    path: ['station-portal', 'environment', 'FDE_IMAGE'],
+  },
 ];
 /** `.env.example` 里必须登记（且留空）的三根变量。 */
 const REGISTERED_REFS = ['STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE'];
@@ -157,7 +169,9 @@ test('#643 A `:?` 的报错文案必须点名对应变量（缺值现场要认�
       problems.push(`${ref.at}：文案 ${JSON.stringify(msg)} 里没有 ${ref.varName}`);
     }
     // 两种合法形态都要在文案里：scratch 的 tag 形态与部署的 digest 形态（只说一种 = 现场猜）
-    if (!/\blocal\b|whoami/.test(msg)) problems.push(`${ref.at}：文案没给 scratch 本地形态（:local / whoami）`);
+    if (!/\blocal\b|whoami/.test(msg)) {
+      problems.push(`${ref.at}：文案没给 scratch 本地形态（:local / whoami）`);
+    }
     if (!msg.includes('sha256:')) problems.push(`${ref.at}：文案没给部署 pin 形态（image@sha256:…）`);
   }
   assert.deepEqual(problems, [], 'compose 的缺值文案要点名变量并给两种合法形态：\n  ' + problems.join('\n  '));
