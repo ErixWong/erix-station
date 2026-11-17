@@ -1,6 +1,6 @@
 // 管理台「提示词」面板的**读侧 + 写侧**（issue #596 片 A）。
 // 契约：`docs/design/admin-prompts-panel-2026-11-16.md`（§3 读侧 / §4 写侧 / §5 渲染 / §6 API / §8 判据）；
-// API 文档：`docs/api/portal.md` §4.18。表：迁移 `0040-platform-prompts.sql`（单行表，`''` = 跟随内置）。
+// API 文档：`docs/api/portal.md` §4.19。表：迁移 `0042-platform-prompts.sql`（单行表，`''` = 跟随内置）。
 //
 // 一句话：平台对 agent 说的三句话（`~/AGENTS.md` 的补充约定、`~/AGENTS.md` 的整段覆写、会话标题的
 // system）从「改代码 + 重建镜像」变成「管理台改一行，下一次 run / 下一次改名生效」。
@@ -77,7 +77,7 @@ export const READ_TIMEOUT_ENV_VAR = 'PLATFORM_PROMPTS_READ_TIMEOUT_MS';
 /** env 里「正整数」的唯一可接受写法：十进制数字串（`''` 先前已当「没配」处理）。 */
 const POSITIVE_INT_RE = /^[0-9]+$/;
 
-/** 审计：`action` / `target` 与 `docs/api/portal.md` §4.18-4 登记的必须一致（改这里就要改文档）。 */
+/** 审计：`action` / `target` 与 `docs/api/portal.md` §4.19-4 登记的必须一致（改这里就要改文档）。 */
 export const AUDIT_ACTION = 'admin.platform_prompts_updated';
 export const AUDIT_TARGET = 'platform_prompts';
 
