@@ -556,7 +556,14 @@ export async function updatePlatformPrompts({ pool, field, text, actorId = null,
     row = written?.rows?.[0] ?? null;
   } catch (err) {
     // 假 pool 的形状闸 / 真库的约束冲突都从这里出去：不静默当「保存成功」。
-    throw new PlatformPromptsError('internal', `保存 platform_prompts 失败：${err?.message ?? err}`, {
+    // ⚠ 发给客户端的 message 一律是**静态串**（先例：`upload-settings.js` 那两条 `internal`）。
+    //   `http.js` 把 `err.message` 原样 `sendJson` 出去，而驱动原文长这样：
+    //   `insert or update on table "platform_prompts" violates check constraint "…"` ⇒ 拼进去
+    //   就是把表名 / 列名 / 约束名直接送到浏览器（评审 R6）。细节只进服务端日志，且日志也
+    //   **不打整条 SQL 与参数值** —— 参数里就是管理员写的正文，可能含用户内容。
+    log?.warn?.('platform_prompts 保存失败（响应体是静态文案，原因只在日志）：%s',
+      String(err?.message ?? err).slice(0, 300));
+    throw new PlatformPromptsError('internal', '保存提示词失败（数据库拒了这条语句，原因见 portal 日志）', {
       httpStatus: 500,
     });
   }

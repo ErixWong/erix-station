@@ -3317,7 +3317,7 @@ Content-Type: application/json
 | `400` | `validation_failed` + `details={field:'text', max_bytes, rendered_bytes, render_limit_bytes}` | **渲染超限**：写下去之后整份 `~/AGENTS.md` > `render_limit_bytes` ⇒ **一条写语句都不发** |
 | `403` | `forbidden` | 非管理员 |
 | `405` | `method_not_allowed` | `PUT` 之外的方法 |
-| `500` | `internal` | 写了却没审计（有人把审计从那条语句里拆出去了）|
+| `500` | `internal` | 写了却没审计（有人把审计从那条语句里拆出去了）／数据库拒了这条语句（约束、表缺失、连接断）——后者的 message 是**静态串**，原因只进 portal 日志（不打 SQL 与参数值）⇒ 表名/列名/约束名不出现在响应里（判据 `P15`）|
 
 ⚠ **不新增错误码**：这一节的全部失败都是既有的 `validation_failed` / `forbidden` /
 `method_not_allowed` / `internal`（`details.field` 负责说清是哪一格）。
@@ -3397,7 +3397,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > `deploy/migrations/0040-platform-prompts.sql`。
 > ⚠ `materializer.js` ⇄ `platform-prompts.js` 是**双向引用**：两边都只在**函数体里**用对面的导出，
 > 谁在模块顶层读一次对面的绑定就在求值期 TDZ（判据 `P11` 起两个子进程两种顺序各加载一次钉住）。
-> 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P14` 及其变体 + `T1`/`T1b` + `D1`）、
+> 单测：`portal/test/platform-prompts.test.js`（格子 `P1`–`P15` 及其变体 + `T1`/`T1b` + `D1`）、
 > `portal/test/materializer.test.js`（「默认渲染逐字节不变」由该文件 8 条 `renderHomeAgentsMd：…`
 > 既有断言承担，本分支对它们零改动；**这里不用 `M` 字头的判据号** —— 它在本仓已被
 > `materializer.test.js:750`（用户自建 `AGENTS.md`/`.gitignore` 在 stale 清理后存活）占用）、
