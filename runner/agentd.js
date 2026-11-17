@@ -235,7 +235,8 @@ async function internalRequest(method, p, { body, claimToken, retries = 0, timeo
   const retryable = res.status >= 500 || res.status === 429;
   const err = new InternalError(res.status, code, message, retryable);
 
-  // lease_lost / run_terminal / checkpoint_stale / 4xx 等 → 不重试（由调用方按语义处理）。
+  // lease_lost / run_terminal / 其余 4xx → 不重试（由调用方按语义处理）。
+  // （旧 `checkpoint_stale` 同批退役：那是快照表的 revision CAS 专有的 409，issue #640。）
   if (res.status === 409) err.retryable = false;
   throw err;
 }
@@ -521,7 +522,7 @@ function assertSessionKey(ctx, args) {
  *     **在而失败** = 承诺过而这次的「已清理」是假话 ⇒ 下一次续跑会把**上一代**的 `tool-executed`
  *     当本代证据 ⇒ 跳过本该发生的副作用。无限重试就是把这句假话撑下去。
  *   · **写**（`appendRecoveryRow`）：本站不特殊（仍走 `withRetry` 缺省无限），与其余账本写
- *     （`appendRound` / `saveRunState` / `saveRunSnapshot`）同口径 —— 引擎自己那一层
+ *     （`appendRound` / `saveRunState`）同口径 —— 引擎自己那一层
  *     （`persistClassified` 的 `retryAttempts` + 退避）已给「写坏了的账本」定了终局 `phase: transcript`，
  *     本站不在中间加第二层重试预算（两层各重试一轮 = 排障时看不出是谁在等）。
  *
@@ -688,38 +689,10 @@ async function handleStoreRequest(ctx, method, args, deps = {}) {
       );
       return r.data;
     }
-    case 'saveRunSnapshot': {
-      const revision = Number(args?.revision ?? 0);
-      const snapshot = args?.snapshot ?? {};
-      if (sessionKey) {
-        const key = assertSessionKey(ctx, args);
-        const r = await withRetry(
-          () => request('PUT', `/transcript/${encodeURIComponent(key)}/checkpoint${writerQs}`, { body: { revision, snapshot }, claimToken: ctx.claimToken }),
-          { what: `saveRunSnapshot key=${key} rev=${revision}` },
-        );
-        return r.data;
-      }
-      const r = await withRetry(
-        () => request('PUT', `/runs/${runId}/checkpoint`, { body: { revision, snapshot }, claimToken: ctx.claimToken }),
-        { what: `saveRunSnapshot run=${runId} rev=${revision}` },
-      );
-      return r.data;
-    }
-    case 'loadLatestRunSnapshot': {
-      if (sessionKey) {
-        const key = assertSessionKey(ctx, args);
-        const r = await withRetry(
-          () => request('GET', `/transcript/${encodeURIComponent(key)}/checkpoint/latest${writerQs}`, { claimToken: ctx.claimToken }),
-          { what: `loadLatestRunSnapshot key=${key}` },
-        );
-        return r.data; // {checkpoint:{snapshot,revision,updated_at}} 或 204 → null
-      }
-      const r = await withRetry(
-        () => request('GET', `/runs/${runId}/checkpoint/latest`, { claimToken: ctx.claimToken }),
-        { what: `loadLatestRunSnapshot run=${runId}` },
-      );
-      return r.data; // {checkpoint:{snapshot,revision,updated_at}} 或 204 → null
-    }
+    // ⚠ `saveRunSnapshot` / `loadLatestRunSnapshot` 两个 case（各两条转发：session 与 run 作用域）已随
+    //   issue #640 删除：erix-agent 0.33.0 起引擎不再调它们 ⇒ agentd 的转发、portal 的四个
+    //   `/checkpoint*` 端点与快照表（迁移 `0041`）同批退役。未知 method 会由下面的
+    //   `default` 抛 `unknown store method: …`（引擎已不会发出该 method ⇒ 真抛出来就是回退，该红）。
     // ── issue #500：账本恢复行三件套（引擎 0.33.0 可选能力；**只走 session 端点**）──
     // 三个都只有一句转发 + 有限重试（为何有限见 `RECOVERY_ROWS_MAX_RETRIES` 那段）。
     // 返回体**原样透传**（`{added}` / `{rows}` / `{cleared}`）：判据与「非数组 ⇒ 抛」都在

@@ -1741,45 +1741,13 @@ function collectRoundText(row) {
 }
 
 // ---------------------------------------------------------------------------
-// U8/U9 checkpoint
+// U8/U9 checkpoint（已退役，issue #640）
+//
+// erix-agent 0.33.0（上游 #838 S2，本站 #530）不再读写 run snapshot ⇒ `putCheckpoint` /
+// `getLatestCheckpoint` / `putSessionCheckpoint` / `getSessionLatestCheckpoint` 四个函数、
+// 四个 `/checkpoint*` 端点、agentd 的四条转发与那张快照表（迁移 `0041` DROP）同批删除。
+// 旧 agentd 若还在打这些路径，拿到的是 **404 `not_found`**（见 http.js 的分支注释）。
 // ---------------------------------------------------------------------------
-
-export async function putCheckpoint(pool, { container, user, runId, claimToken, body }) {
-  const revision = body?.revision;
-  if (!Number.isInteger(revision) || revision < 0) {
-    throw new InternalError(400, 'validation_failed', 'revision 必须为非负整数');
-  }
-  if (!body?.snapshot || typeof body.snapshot !== 'object' || Array.isArray(body.snapshot)) {
-    throw new InternalError(400, 'validation_failed', 'snapshot 必须为对象');
-  }
-  const run = await fetchRun(pool, runId, user.id);
-  if (isTerminal(run.status)) throw new InternalError(409, 'run_terminal', 'run already terminal');
-  await assertClaimToken(pool, runId, claimToken);
-
-  const res = await pool.query(
-    `INSERT INTO run_checkpoints (run_id, snapshot, revision, updated_at)
-     VALUES ($1, $2, $3, now())
-     ON CONFLICT (run_id) DO UPDATE
-       SET snapshot = EXCLUDED.snapshot, revision = EXCLUDED.revision, updated_at = now()
-       WHERE run_checkpoints.revision < EXCLUDED.revision
-     RETURNING revision`,
-    [runId, JSON.stringify(body.snapshot), revision],
-  );
-  if (res.rows.length === 0) {
-    throw new InternalError(409, 'checkpoint_stale', 'checkpoint revision 不大于当前（CAS 拒绝）');
-  }
-  return { revision: Number(res.rows[0].revision) };
-}
-
-export async function getLatestCheckpoint(pool, { container, user, runId, claimToken }) {
-  const run = await fetchRun(pool, runId, user.id);
-  if (!isTerminal(run.status)) await assertClaimToken(pool, runId, claimToken);
-
-  const res = await pool.query(`SELECT snapshot, revision, updated_at FROM run_checkpoints WHERE run_id = $1`, [runId]);
-  const row = res.rows?.[0];
-  if (!row) return null;
-  return { checkpoint: { snapshot: row.snapshot, revision: Number(row.revision), updated_at: row.updated_at } };
-}
 
 // ---------------------------------------------------------------------------
 // session-scoped transcript（issue #81 P2，docs/design/conversation-state.md §4.1）
@@ -1941,49 +1909,6 @@ export async function getSessionTranscript(pool, { container, user, key, claimTo
   const nextCursor = last ? `${Number(last.round)}:${String(last.append_seq)}` : null;
   const records = res.rows.map((r) => ({ round: Number(r.round), ...r.record }));
   return { records, next_cursor: nextCursor };
-}
-
-/** session checkpoint 覆盖写 + revision CAS（同 U8 语义，键 = transcript key）。 */
-export async function putSessionCheckpoint(pool, { container, user, key, claimToken, writerRunId, body }) {
-  const revision = body?.revision;
-  if (!Number.isInteger(revision) || revision < 0) {
-    throw new InternalError(400, 'validation_failed', 'revision 必须为非负整数');
-  }
-  if (!body?.snapshot || typeof body.snapshot !== 'object' || Array.isArray(body.snapshot)) {
-    throw new InternalError(400, 'validation_failed', 'snapshot 必须为对象');
-  }
-  await fetchSession(pool, key, user.id);
-  await fetchWriterRun(pool, writerRunId, user.id, key);
-  await assertClaimToken(pool, writerRunId, claimToken);
-
-  const res = await pool.query(
-    `INSERT INTO run_checkpoints (run_id, transcript_key, snapshot, revision, updated_at)
-     VALUES ($1, $2, $3, $4, now())
-     ON CONFLICT (transcript_key) WHERE transcript_key IS NOT NULL DO UPDATE
-       SET snapshot = EXCLUDED.snapshot, revision = EXCLUDED.revision, updated_at = now()
-       WHERE run_checkpoints.revision < EXCLUDED.revision
-     RETURNING revision`,
-    [writerRunId, key, JSON.stringify(body.snapshot), revision],
-  );
-  if (res.rows.length === 0) {
-    throw new InternalError(409, 'checkpoint_stale', 'checkpoint revision 不大于当前（CAS 拒绝）');
-  }
-  return { revision: Number(res.rows[0].revision) };
-}
-
-/** session checkpoint 读取；无 → null（HTTP 204）。 */
-export async function getSessionLatestCheckpoint(pool, { container, user, key, claimToken, writerRunId }) {
-  await fetchSession(pool, key, user.id);
-  await fetchWriterRun(pool, writerRunId, user.id, key);
-  await assertClaimToken(pool, writerRunId, claimToken);
-
-  const res = await pool.query(
-    `SELECT snapshot, revision, updated_at FROM run_checkpoints WHERE transcript_key = $1`,
-    [key],
-  );
-  const row = res.rows?.[0];
-  if (!row) return null;
-  return { checkpoint: { snapshot: row.snapshot, revision: Number(row.revision), updated_at: row.updated_at } };
 }
 
 function runStateStatusRecord(statusRecord, hasStatusRecord, runState, key) {
