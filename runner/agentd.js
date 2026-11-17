@@ -1202,6 +1202,13 @@ function buildWorkerEnv(runStart, baseEnv = process.env) {
   if (Number.isInteger(perRunMaxRounds) && perRunMaxRounds >= 1 && perRunMaxRounds <= 200) {
     childEnv.ERIX_MAX_ROUNDS = String(perRunMaxRounds);
   }
+  // issue #662：per-run 只读审查标志。ticket 带 `review_only: true`（宏审查 run）⇒ 置
+  // `RUN_REVIEW_ONLY='1'`，worker.js 的 `isReviewOnly()` 就是读这个 env（判 `=== '1'`）。
+  // ⚠ 严格布尔：只有 true 才置 `'1'`；`false`/缺失**不设**（而不是写 `'0'`）——区分「没声明」
+  //   与「声明关」，不设时 worker 回落到容器默认（baseEnv 里本来就没这个变量）。
+  if (runStart?.review_only === true) {
+    childEnv.RUN_REVIEW_ONLY = '1';
+  }
   return childEnv;
 }
 

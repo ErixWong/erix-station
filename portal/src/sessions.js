@@ -661,6 +661,12 @@ export async function postMessage(pool, {
   //  ③ `maxRounds`：本次 run 的轮数上限。**选定的路线 = 写进 run 行**，理由写在下面写入处。
   // 两者对用户面发消息（routes 层）都不传 ⇒ 行为逐字不变。
   cwd = null, maxRounds = null,
+  //  ④ issue #662：`reviewOnly` = 本次 run 是「只读审查 run」的宿主声明（专为宏审查 run 用）。
+  //    与 `maxRounds` 同路（写进 `runs.run_state` 的 **`host_review_only`** jsonb 键，**不加列**、
+  //    不动迁移），下行经 `internal.assembleTicket` 的 `review_only` → `runner/agentd.js` 的
+  //    `childEnv.RUN_REVIEW_ONLY`。⚠ 严格布尔：只有 `=== true` 才落键；`false`/缺省**不写**
+  //    （区分「没声明」与「声明关」，回落到容器默认；worker 的 `isReviewOnly()` 判 `=== '1'`）。
+  reviewOnly = false,
 }) {
   // 体校验（与 handlePostMessage 的前置校验同一函数；此处兜底，保证直接调用者也拿不到非法数据）
   const valid = validateMessageBody({ content, attachments });
@@ -818,6 +824,17 @@ export async function postMessage(pool, {
                               || jsonb_build_object('host_max_rounds', $2::int)
           WHERE id = $1`,
         [runId, safeMaxRounds],
+      );
+    }
+    // issue #662：`reviewOnly` 进 run（per-run，容器多 run 共用 ⇒ 进程级 env 不够）。
+    // 与 `host_max_rounds` 完全同路：同一张 `run_state` 的 `||` 合并写；**只有 true 才落键**
+    // （`false`/缺省不写，区分「没声明」与「声明关」；agentd 只对 true 置 RUN_REVIEW_ONLY='1'）。
+    if (reviewOnly === true) {
+      await client.query(
+        `UPDATE runs SET run_state = COALESCE(run_state, '{}'::jsonb)
+                              || jsonb_build_object('host_review_only', true)
+          WHERE id = $1`,
+        [runId],
       );
     }
     // 消息关联 run（user 消息 = 它触发的 run）
