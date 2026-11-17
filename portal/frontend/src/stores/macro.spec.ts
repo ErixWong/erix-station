@@ -241,15 +241,28 @@ describe('水位线（判据⑤的数据面）', () => {
     expect(macro.watermark(FIXED).stale).toBe(true);
   });
 
-  it('首次订阅（水位线为 null）= 陈旧且标记「尚未评估」', () => {
+  it('首次订阅且过了宽限窗（水位线仍 null）⇒ 陈旧且标记「尚未评估」（#615）', () => {
+    const macro = useMacroStore();
+    // createdAt 早于 FIXED 一个宽限窗（3×60s=180s）以上 ⇒ 执行器真没跑 ⇒ 该报
+    macro.assignments = [{
+      id: 'a-1', templateId: 't-1', sessionId: SESSION, until: null,
+      enabled: true, expired: false, effectiveEnabled: true,
+      lastEvaluatedAt: null, createdAt: new Date(FIXED - 10 * 60_000).toISOString(),
+    }];
+    const state = macro.watermark(FIXED);
+    expect(state.stale).toBe(true);
+    expect(state.neverEvaluated).toBe(true);
+  });
+
+  it('刚建的首次订阅（null 且在宽限窗内）⇒ 尚未评估但不算陈旧（#615 不再狼来了）', () => {
     const macro = useMacroStore();
     macro.assignments = [{
       id: 'a-1', templateId: 't-1', sessionId: SESSION, until: null,
       enabled: true, expired: false, effectiveEnabled: true,
-      lastEvaluatedAt: null, createdAt: null,
+      lastEvaluatedAt: null, createdAt: new Date(FIXED).toISOString(),
     }];
     const state = macro.watermark(FIXED);
-    expect(state.stale).toBe(true);
+    expect(state.stale).toBe(false);
     expect(state.neverEvaluated).toBe(true);
   });
 

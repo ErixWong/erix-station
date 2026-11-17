@@ -34,30 +34,50 @@ export const KIND_SCOPE = Object.freeze({
 
 /**
  * **每个 kind 的参数 schema**（`10-implementation-contract.md` §1 的唯一真源）。
- * `required` 缺了报错；`enum`/`enum[]` 校验取值；`int` 校验上下界；`duration` 只校验形态。
+ * `required` 缺了报错；`default` 缺了由**服务端补上**（issue #625：不只前端补——API 直连也要拿到默认值）；
+ * `enum`/`enum[]` 校验取值；`int` 校验上下界；`duration` 只校验形态。
  * ⚠ 只做**形状**校验，不做语义校验（语义在各宏的实现里）。
+ *
+ * ⚠ **`default` / `required` 必须与契约 §1 逐字一致**（issue #625 的起因就是这里缺了两项）：
+ *   缺 `default` ⇒ 前端只能用通用规则猜（`run-notify` 建出来 `states: []` ⇒ **永远不会通知**、
+ *   界面却显示 Enabled）；缺 `required` ⇒ `validateKindParams` 对缺字段 `continue`，
+ *   能建出没有 `at` 的 `scheduled-task`（永不触发、静默死）。
+ *   防漂测试：`portal/test/macro-kinds-single-source.test.js`。
+ *
+ * ⚠ **budget 拍平成 `max_per_day` / `quiet_hours` 两个顶层字段，不嵌套 `budget: {...}`**：
+ *   `validateKindParams`（`macros.js`）只支持 `enum/enum[]/int/duration/time/path/text/quiet_window`
+ *   这些**扁平类型**，加 `object` 要多写一层递归校验；拍平实现简单、前端按 `KIND_SCHEMA` 直接出表单。
+ *   且 `validateKindParams` **拒绝未知键**（防拼错字段静默失效），所以字段必须**显式列进来**才填得进去（#617）。
+ *   只给**通知型两个 kind** 加：`scheduled-task`/`run-review` 靠 `clock:<date>` 幂等键控频，
+ *   没有「别把我淹了」的诉求，也不该被 quiet_hours 挡（#611）。
  */
 export const KIND_SCHEMA = Object.freeze({
   'run-notify': {
     states: { type: 'enum[]', values: ['completed', 'failed', 'capped', 'aborted',
+      'persistence_failed', 'guard_unverified'], default: ['failed', 'capped', 'aborted',
       'persistence_failed', 'guard_unverified'] },
-    channel: { type: 'enum', values: ['site'] },
+    channel: { type: 'enum', values: ['site'], default: 'site' },
+    // budget 拆出来的两个字段（`04` §201）：`max_per_day`（别把我淹了）+ `quiet_hours`（什么时候值得叫我）。
+    max_per_day: { type: 'int', min: 1, max: 200 },
+    quiet_hours: { type: 'quiet_window' },
   },
   'run-silence-alert': {
-    threshold: { type: 'duration' },
-    phases: { type: 'enum[]', values: ['tool_running', 'awaiting_llm'] },
+    threshold: { type: 'duration', default: '15m', min: '1m', max: '2h' },
+    phases: { type: 'enum[]', values: ['tool_running', 'awaiting_llm'], default: ['tool_running'] },
+    max_per_day: { type: 'int', min: 1, max: 200 },
+    quiet_hours: { type: 'quiet_window' },
   },
   'run-review': {
-    review_depth: { type: 'int', values: [0, 1] },
-    on_fail: { type: 'enum', values: ['reflow', 'notify_only'] },
-    max_rounds: { type: 'int', min: 1, max: 100 },
+    review_depth: { type: 'int', values: [0, 1], default: 1 },
+    on_fail: { type: 'enum', values: ['reflow', 'notify_only'], default: 'reflow' },
+    max_rounds: { type: 'int', default: 8, min: 1, max: 100 },
   },
   'scheduled-task': {
-    at: { type: 'time' },
-    cwd: { type: 'path' },
-    task: { type: 'text', max: 8000 },
-    maxRounds: { type: 'int', min: 1, max: 100 },
-    jitter: { type: 'duration' },
+    at: { type: 'time', required: true },
+    cwd: { type: 'path', required: true },
+    task: { type: 'text', required: true, max: 8000 },
+    maxRounds: { type: 'int', default: 16, min: 1, max: 100 },
+    jitter: { type: 'duration', default: '10m', min: '0m', max: '30m' },
   },
 });
 
@@ -92,6 +112,11 @@ export const VERDICT = Object.freeze(['pass', 'red', 'no-op-claim', 'needs-human
 export const DURATION_RE = /^\d+(ms|s|m|h)$/;
 /** `time` 参数的形态（`HH:MM`，UTC+8）。 */
 export const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+/**
+ * `quiet_hours` 参数的形态：`"HH:MM-HH:MM"`（UTC+8，start 与 end 各自是合法时刻）或 `"off"`（不静默）。
+ * 语义在 `macro-eval.js`（解析 + 跨午夜判定），这里只管形状。
+ */
+export const QUIET_WINDOW_RE = /^(off|([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d)$/;
 
 /**
  * 评估间隔（`09` 篇 §1.1）。与枚举一样是**跨端面**的：执行器拿它当轮询周期，
