@@ -31,6 +31,7 @@ import {
   filterReviewSchemas,
   isReviewOnly,
 } from '../../runner/lib/review-tools.js';
+import { createFoldNoteSink } from '../../runner/lib/fold-notes.js';
 
 const HOUR = ORPHAN_AGE_MS;
 
@@ -333,4 +334,78 @@ test('makeMacroRunLookup：按 worktree_path 查 macro_runs，命中映射三列
   assert.equal(miss, null, '无行 ⇒ null（孤儿判据 3）');
   assert.match(seen[0].sql, /FROM macro_runs WHERE worktree_path = \$1/);
   assert.deepEqual(seen[0].params, ['/present']);
+});
+
+// ── issue #626：只读闸的**第四条**旁路（fold-notes）────────────────────────────
+// 前三条（delegate / note / skill）都在 `executeTool` 这条路上；第四条**不走 executeTool**：
+// `runner/lib/fold-notes.js` 的投递器直调 `noteTools.executors('note_take', …)`，
+// 所以 executeTool 上的闸**结构上管不到它**，只能在**构建点**（worker.js 的装配段）挡。
+// 「只读面」= 模型能调的工具 ∪ 宿主回调里会写东西的钩子——前几轮只审了前者。
+test('worker.js 四条旁路都在 reviewOnly 闸内（接线锁，#626 补第四条）', () => {
+  const src = fs.readFileSync(
+    new URL('../../runner/worker.js', import.meta.url), 'utf8');
+  // 旁路① delegation 创建（子 run 自带 shell，只读过滤传不下去）
+  assert.match(src, /if \(delegateEnabled && !reviewOnly\) \{/,
+    '旁路① delegate 创建未按 reviewOnly 闸住');
+  // 旁路② note 路由
+  assert.match(src, /if \(!reviewOnly && noteTools\.executeTool && noteToolNames\.has\(options\.name\)\)/,
+    '旁路② note 路由未按 reviewOnly 闸住');
+  // 旁路③ skill 路由
+  assert.match(src, /if \(!reviewOnly && skillTools\.executeTool && skillToolNames\.has\(options\.name\)\)/,
+    '旁路③ skill 路由未按 reviewOnly 闸住');
+  // 旁路④ fold-note sink：闸必须在**构建点**（这条不经 executeTool）
+  assert.match(src, /const foldNoteSink = !reviewOnly && typeof noteTools\.executors === 'function'/,
+    '旁路④ fold-note sink 构建未按 reviewOnly 闸住 ⇒ 审查 run 折叠时会往会话 notes 写入');
+  // 根因（写进测试，别下次又以为是 executeTool 的事）：投递确实直调 executors
+  const foldSrc = fs.readFileSync(
+    new URL('../../runner/lib/fold-notes.js', import.meta.url), 'utf8');
+  assert.match(foldSrc, /executors\('note_take'/,
+    'fold-notes 仍直调 executors（第四条旁路的根因；若改成走 executeTool，闸的位置要重评）');
+  // 接线只依赖 sink 非空 ⇒ 「不构建」= 真的没接上（不是构建了但被别处忽略）
+  assert.match(src, /\.\.\.\(foldNoteSink \? \{ onFoldSummary: foldNoteSink\.onFoldSummary \} : \{\}\)/,
+    'onFoldSummary 的接线必须只依赖 foldNoteSink 非空');
+  // 四条闸一个不能少（去掉任一条 ⇒ 计数跌破 4 ⇒ 红）
+  const gates = (src.match(/!reviewOnly/g) || []).length;
+  assert.ok(gates >= 4, `!reviewOnly 只出现 ${gates} 次，四条旁路至少要 4 次`);
+});
+
+// 行为锁（不只是 regex）：把 worker.js 的 `#392:C-fold-notes` 装配段**原样求值**（技法同
+// `runner/test/model-metadata.test.js` 对 `#309:engine-model-params` 的做法），在两种 reviewOnly 下
+// 跑一次折叠投递：审查 run 必须**一条 note_take 也不发**，普通 run 必须发一条。
+test('reviewOnly 时 fold-note sink 不构建 ⇒ 折叠不写注；非审查 run 照写（行为锁）', async () => {
+  const src = fs.readFileSync(
+    new URL('../../runner/worker.js', import.meta.url), 'utf8');
+  const seg = src.match(/\/\* #392:C-fold-notes:start \*\/([\s\S]*?)\/\* #392:C-fold-notes:end \*\//);
+  assert.ok(seg, '找不到 #392:C-fold-notes 装配段（标记改名要同步这条锁）');
+  const build = (reviewOnly) => {
+    const calls = [];
+    const noteTools = {
+      executors: async (name, input) => { calls.push({ name, input }); return { ok: true }; },
+    };
+    const run = new Function(
+      'reviewOnly', 'noteTools', 'runId', 'createFoldNoteSink', 'sendIpc', 'process', 'MSG',
+      `${seg[1]}\nreturn foldNoteSink;`,
+    );
+    const foldNoteSink = run(reviewOnly, noteTools, 'run-626', createFoldNoteSink,
+      () => {}, { env: {} }, { LOG: 'log' });
+    // `calls` 在外层闭包里（noteTools.executors 的捕获变量），不靠被求值段自己报数。
+    return { foldNoteSink, calls };
+  };
+  const payload = {
+    text: '折叠摘要：前 3 轮的探查过程已归档', source: 'mechanical', strategy: 'statistical',
+    bytes: 1024, fingerprint: 'fp-626', round: 4,
+  };
+
+  const review = build(true);
+  assert.equal(review.foldNoteSink, null, 'reviewOnly ⇒ sink 必须不构建（第四条旁路的闸就在这）');
+  // 即使有人绕过构建点手工调一次投递（模拟引擎仍回调），也必须没有任何写入：sink 是 null，没有 onFoldSummary。
+  assert.equal(review.foldNoteSink?.onFoldSummary ?? null, null);
+  assert.deepEqual(review.calls, [], '审查 run 一条 note_take 也不许发');
+
+  const normal = build(false);
+  assert.equal(normal.foldNoteSink?.enabled, true, '非审查 run 必须照常接线');
+  await normal.foldNoteSink.onFoldSummary(payload);
+  assert.equal(normal.calls.length, 1, '普通 run 折叠必须写一条注（闸不得顺手关掉正常路径）');
+  assert.equal(normal.calls[0].name, 'note_take');
+  assert.match(normal.calls[0].input.content, /前 3 轮的探查过程已归档/);
 });
