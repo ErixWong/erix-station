@@ -256,6 +256,16 @@ async function createFdeUser(loginName) {
     }),
   });
   assert.equal(response.status, 201, `create user ${loginName}`);
+  // ⚠ 管理台代设口令 ⇒ 产品要求「首次登录必须先改口令」（`POST /api/sessions` 会 403
+  // `password_change_required`，261117 实测）。这是**产品行为，不是 bug**，所以用例要按真实用户
+  // 走一遍改口令：登录拿到 cookie 后调 `POST /api/me/password` 把标记清掉，再继续后续断言。
+  // （不这么做的替代方案是往库里塞 `password_changed_at`，那等于绕过被测行为，判据会失真。）
+  const firstLogin = await login(loginName, response.body.totp_secret);
+  const changed = await api(firstLogin, '/api/me/password', {
+    method: 'POST',
+    body: JSON.stringify({ current_password: S.password, new_password: S.password }),
+  });
+  assert.equal(changed.status, 200, `clear password_change_required for ${loginName}: ${JSON.stringify(changed.body)}`);
   assert.ok(response.body.totp_secret, 'opt-in TOTP：totp_enabled=true 时种子只在下发一次的创建响应里出现');
   assert.deepEqual(response.body.onboarding, {
     state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
@@ -536,11 +546,14 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
         `migration ${version} is applied`,
       );
     }
+    // ⚠ 迁移 **0032-drop-retired-tables.sql** 把 `llm_models_retired` / `llm_providers_retired`
+    // **撤掉了**（#503：退役/备份表不再保留）⇒ 旧断言「`${table}_retired` 必须存在」会永远红（实测 0 !== 1）。
+    // 现在的正确口径：正表与退役表**都必须不存在**（退役表只在 0010→0032 之间的窗口里存在过）。
     for (const table of ['llm_providers', 'llm_models']) {
       assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}'`), '0',
         `${table} is retired`);
-      assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}_retired'`), '1',
-        `${table}_retired is retained`);
+      assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}_retired'`), '0',
+        `${table}_retired 必须已被迁移 0032 撤掉（#503）；出现 = 0032 没跑或有人把表加回来了`);
     }
     for (const table of ['git_hosts', 'fde_git_accounts', 'fde_onboarding']) {
       assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}'`), '1',

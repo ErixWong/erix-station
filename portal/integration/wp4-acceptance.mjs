@@ -269,9 +269,11 @@ async function provisionAndCollect(u) {
   assert.equal(containerNetIp(u.container, networkName), u.backendIp, `${u.login}: 容器 IP 必须 = 后端固定位 .2`);
 
   const mine = await portalApi('/api/me/ports', { cookie: u.cookie });
-  const ports = await mine.json().catch(() => null);
-  assert.equal(mine.status, 200, `GET /api/me/ports (${u.login}): ${JSON.stringify(ports).slice(0, 200)}`);
-  assert.ok(Array.isArray(ports) && ports.length > 0, `${u.login}: 应有一块预览端口（实际 ${JSON.stringify(ports).slice(0, 200)}）`);
+  const raw = await mine.json().catch(() => null);
+  assert.equal(mine.status, 200, `GET /api/me/ports (${u.login}): ${JSON.stringify(raw).slice(0, 200)}`);
+  // /api/me/ports 返回 {"items":[…]}（不是裸数组）——两种形态都接住，端口仍从产品读侧取（不自己猜）。
+  const ports = Array.isArray(raw) ? raw : (Array.isArray(raw?.items) ? raw.items : []);
+  assert.ok(ports.length > 0, `${u.login}: 应有一块预览端口（实际 ${JSON.stringify(raw).slice(0, 200)}）`);
   const first = ports[0];
   u.portId = first.id;
   u.port = Number(first.port);
