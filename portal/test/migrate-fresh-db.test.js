@@ -359,7 +359,7 @@ test('0032 撤退役/备份表：全新库跑到 head、三张表确实不在、
 // ---------------------------------------------------------------------------
 // issue #640：`run_checkpoints` 随 erix-agent 0.33.0 退役（run snapshot 整条竖切）。
 // 静态形状闸在 `portal/test/migrations.test.js`，这里补**只有真库能给**的四件事：
-//   ① 全新库跑完整条迁移链（含 0041）不炸，head 就是 0043-platform-prompts；
+//   ① 全新库跑完整条迁移链（含 0041）不炸，head 就是 0044-system-metrics；
 //   ② 跑完之后 `run_checkpoints` **确实不存在**（「先按冻结 baseline 建、再由 0041 撤」这条路真的走通）；
 //   ③ DROP 是真 DROP：把 baseline + 0006 的现场重建出来（带 0006 的 session 侧键与部分唯一索引），
 //      再跑一遍 0041 ⇒ 表与它的索引一起没了，而 `runs`（FK 的 parent 端）毫发无伤；
@@ -384,8 +384,8 @@ test('0041 撤 run_checkpoints：全新库跑到 head、表确实不在、DROP �
       // includes('0041') 断「0041 确在链上」，head 断「链末」——两件事。
       assert.ok(versions.includes('0041-retire-run-checkpoints'),
         '台账必须有 0041（迁移 runner 真的应用了它，而不是只躺在目录里）');
-      assert.equal(versions[versions.length - 1], '0043-platform-prompts',
-        'head 就是 0043-platform-prompts');
+      assert.equal(versions[versions.length - 1], '0044-system-metrics',
+        'head 就是 0044-system-metrics（#679 之后；这条断言只在有 PG 时跑，CI 无 PG 期间它是哑的）');
       assert.equal(versions.length, computeExpectedVersions().length, '台账 = baseline + 全部增量');
 
       // ② 表真的不在了（`to_regclass` 不存在给 NULL，不因缺表报错）。

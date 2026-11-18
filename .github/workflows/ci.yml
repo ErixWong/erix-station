@@ -41,6 +41,25 @@ jobs:
     concurrency:
       group: ci-${{ github.ref }}
       cancel-in-progress: true
+    # issue #665：给质量门禁接一台真 PG，让「只有空库/真 SQL 执行才现形」的那类缺陷在流水线上会红。
+    # 只加 service、不新开 job、不用 matrix（§4/§5 红线：Free 账号超额是停跑不是扣费、且没有红灯）。
+    # 版本选 postgres:16：仓库真库测试口径就指定一次性 postgres:16（docs/testing.md §2.2.1，
+    # 见 portal/test/pg-fixture.js 的 SKIP 文案与 migrate-fresh-db.test.js 顶部注释），且 pg-fixture
+    # 用的 `DROP DATABASE … WITH (FORCE)` 需 PG ≥ 13。账号用内置超级用户 postgres：migrate.js 的
+    # bootstrap.sql 会 CREATE ROLE、pg-fixture.js 会 CREATE DATABASE（需 CREATEDB）、
+    # platform-prompts-db.mjs 会 CREATE SCHEMA —— 三者都要超级用户，故直接用 postgres 超管。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: station_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d station_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       # 前端 devDependencies（vite/tailwind/vitest）要求 NODE_ENV 不是 production，否则 npm ci 会跳过 devDeps。
       # 镜像构建里才是 NODE_ENV=production（portal/Dockerfile:17），两者不冲突。
@@ -97,6 +116,16 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm test
+
+      # ---- ②′ 真库腿 + 「skip 不算绿」闸（issue #665）----
+      # 根门禁只看 `# fail`，一个静默 skip 的真库腿与一个通过的 job 同色。这里注入 TEST_DATABASE_URL
+      # 后跑 scripts/check-required-legs.mjs：它自己拉起 migrate-fresh-db（5）与
+      # test:integration:prompts（7）两条腿，断言它们 `# skipped == 0` 且真跑出 pass；
+      # 任一条被 skip（比如 PG service 没起来、DSN 错导致又变 skip）⇒ 闸红。
+      - name: '②′ 真库腿 + skip 不算绿闸（postgres service）'
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/station_test
+        run: node scripts/check-required-legs.mjs
 
       # ---- ③ runner 单测：`node --test` 不带目录参数（AGENTS.md §4 口径：
       #      `node --test runner/test/` 会把目录当模块加载 → Cannot find module，别用）----
