@@ -9223,3 +9223,30 @@ M9 降级 `reviewUnavailable` ⇒ `skipped` / `review_unavailable` / `verdict NU
 同步进一位）；`jail-mounts.js` 接线让 `config.js`/`provisioner.js` 行号漂移 ⇒ `deploy/env-legs-exceptions.json`
 的 5 处 `where` 坐标必须同步，否则活二⑤/⑥ 报「坐标是编的或已漂移」（**这条是 CI 抓的，本地目标判据
 抓不到**）。
+
+### 8.177 发版 v0.1.75（#650 系统面板首发）+ 真机验收抓两条缺陷 → hotfix v0.1.76（2026-11-18，主 agent）
+
+**v0.1.75**（`0fc21de`，release run `44211299395` success）：三镜像 digest portal `61f4f01b…` /
+fde `fc921da1…` / proxy `c9a94c31…`。部署只重建 `station-portal` + `station-docker-proxy`
+（`--no-deps`，**没动 station-db**），迁移 `applying 0044-system-metrics`，`/api/health` = `0.1.75 / 0fc21de`。
+FDE 镜像**故意不动**（本版 runner 零改动，重建 6 台只会打断并行 session；新 digest 记在此行备用）。
+
+**真机 e2e 通过**：DB 每 30s 落一行（75s 落 3 行）· `series` 3 个点/桶宽 30s · 真机 UI
+`https://admin.fde.erix.vip:9443/#/admin/system` 四卡四图、`console errors: none` · vision 读图
+`CPU 52.4% / load 19.15 36核≈53.2% / 内存 31GiB/125.7GiB 24.7% / 磁盘 683.3GiB/936.8GiB 72.9% /
+容器 57·216 FDE 7/8`、无重叠截断空白 NaN。
+
+**同一次读图抓到两条真缺陷（vision 独立复述同样两条）**：
+1. 磁盘那一行设备名与类型都是「未知」——容器里 `/` 是 `overlay`，而解析层只收真实块设备行 ⇒ 找不到挂载行。
+2. FDE 计数与对账误报——`isFde` 的「名字前缀 `fde-`」把别的项目容器（`fde-workshop-db` /
+   `fde-workshop-db-old-261107`，无 station 标签）算成 FDE ⇒ 面板报「DB 6 台 ↔ Docker 8 台」并点名。
+
+**hotfix v0.1.76**（PR #687 = `577a813`，merge `db73d7d`）：① 解析层全收、「哪行算一块盘」只由
+`isRealBlockDevice` 判；去重键改 **statfs 三元组**（一个文件系统一行），设备名取真实块设备那条、path 取最短那条
+⇒ 默认 `/` 诚实报 `overlay`，加了宿主目录后同一行自动升级成 `/dev/nvme0n1p2`；② `isFde` **只认
+`station.managed`**。新增/改写 5 条判据（42/42）；仓库全量 3060 条 / 2956 过 / 0 红；前端 1802 条 rc=0。
+
+**部署面必须记一笔的现场**：我 09:05 把 portal 换到 0.1.75 digest 后，**09:12 被另一并行 session 用本地构建
+`erix-station/portal:local`（revision `5b128df`）覆盖**（同一份 `deploy/docker-compose.yml`，issue #643 那个
+共享栈竞争）⇒ e2e 跑在「含本次合并的 0.1.75 代码树」的构建上，**不能声称跑在发布 digest 上**；`.env` 三处 pin
+保留为发布 digest（portal/proxy 已换、FDE 未换），运行中 portal 与 `.env` 的不一致是别人覆盖造成的。
