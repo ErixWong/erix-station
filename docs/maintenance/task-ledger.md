@@ -8825,9 +8825,14 @@ clock:2026-11-17 | done
   不把顺序写成断言。
 - 工单写「测试放 `test/`」时注意仓库**实际有 `test/` 与 `portal/test/` 两处**（#586 的先例在后者）：
   A 那条按工单落 `test/`（它测的是 compose 本身，不碰 portal 源码），B 落 `portal/test/`。
-- **`ui` 腿留给下次发布件部署**：本单的面板标注只到 spec 层（真机面板要看的是带 `localBuild`
-  的端点 + 真镜像，共享栈现在是别人的本地构建，不该为验证去换它）。
-  复验命令：`PORTAL_URL=… E2E_UI_BASE=… node portal/integration/version-surface-e2e.mjs`。
+- **`ui` 腿（面板标注）已在真机验过**，而且验的正是**别人那份本地构建**（2026-11-18 08:5x 现查：
+  共享栈 `station-portal` 顶着另一 session 的 `erix-station/portal:p596-v5`，
+  `/api/health` 报 `station:0.1.74 / revision:unknown / builtAt:unknown`）：
+  `docker logs station-portal | grep -c local-build` = **1**；`GET /api/admin/version` 顶层
+  `localBuild: true`；管理台「关于」的服务端那一节渲染出中性标注（playwright 容器实拍，文案逐字核过：
+  「Local build: no build-info was baked into this portal image …」）。
+  ⇒ 这同时就是验收 3「**另一 session 再起一次本地构建 ⇒ 它自己也会自曝**」的实证，不用等发版。
+  日常复验命令（下次发布件部署时照跑）：`PORTAL_URL=… E2E_UI_BASE=… node portal/integration/version-surface-e2e.mjs`。
 - 基线：主套件 2811 →（A）2820 →（B）2829，skipped 恒 83，rc=0；
   前端 1644 → 1652（`NODE_ENV=` 跑，rc=0），`npm run typecheck` rc=0。
 
