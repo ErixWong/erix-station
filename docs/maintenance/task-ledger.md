@@ -9074,3 +9074,94 @@ run 探针（明令不许调工具）`events/history` **`tool_use=0`**、1 轮�
 **本版遗留（发布部署时补）**：**真机 e2e 未做**（决策者选「合并后随发布验」）⇒ 部署时补：真 portal + 真 DB +
 真管理员登录，验「采样器真的在写库 + 面板四卡有数 + 图表有点」。浏览器渲染已用「vite build + 桩 API + playwright
 容器真 Chromium + vision 读图」验过（四卡齐全、无 `NaN`/`undefined`/`null`、无重叠截断），但那不是真机链路。
+
+### 8.174 管理台提示词三条 PUT 挂上限流（#664，2026-11-18，PR #682 = `0c91d08`）
+
+**为什么限流而不是去重**（issue 要求先查再写死）：`portal/src/outbox.js` 的
+`enqueueMaterializeOp` 是裸 `INSERT INTO materialize_outbox`，**入队侧没有去重**；
+该文件仅有的两条 `ON CONFLICT` 在 `route_outbox (aggregate, aggregate_id)` 与
+`materialize_revisions (fde_id)`，后者是**每 FDE 一行的 revision head**，不是合并 
+ outbox 行。
+消费侧 `materializer.js#claimMaterializeRows` 的 latest-wins 只把「真重写」合并成
+每 FDE 每 claim 周期 ≤1 次，**不合并**入队行数、revision bump 与审计行，
+ 也不跨 claim 周期合并。
+⇒ 一次保存的写放大（W 条 outbox + W 次 revision + W 次家目录重写 + 1 行审计，
+W = 启用中的工位，谓词 `fde_name IS NOT NULL AND status IN 
+ ('active','awaiting_credential')`，
+`platform-prompts.js:191`）只能在**源头**钳。要加去重是第二个改动，
+ 本单没做。
+
+**做法口径**（可复用的三条判断）：
+- 键 = `platformPrompt:<端点 slug>:<操作者 id>` ⇒ 三条端点各自独立计数，
+  不同管理员互不影响；
+- 闸在**读体之前**，**只在真保存之后计一次** —— `createRateLimiter` 只有 
+  `recordFailure` 一个计数入口，
+  所以越界/形状错的 `400`（没有扇出）**不烧配额**。
+   挂限流器时先想清楚「哪一类请求真的造成了代价」；
+- 默认 30 次成功保存 /(操作者+端点)/ 60 分钟、触顶封 60 分钟；
+  `config.platformPromptsRateLimit.*`
+  可覆盖但**没接 env**（同 `mailTestRateLimit` 那档），所以 `§4.19` 
+   里明写「非 env 旋钮」，不留假旋钮。
+
+**判据落点**（`portal/test/platform-prompts.test.js`，本单 +79/−4，合并后整文件 
+  29/29）：
+`#664P16` 三条端点逐个打满（前 3 次 200、第 4 次 429），断到状态码 + 
+ `code=rate_limited` +
+`retryable:true` + 正数 `Retry-After`，**用真请求而不是 grep 源码**；
+ 同格证键含操作者
+（root 被封后第二个管理员仍 200）。`#664P16b` 把阈值抬到 
+ 1000（等于摘掉限流器）⇒ 连打全 200、
+零 429。`P10` 的扇出从「看返回码」抬成 `materializeEnqueued == 3`，
+ 且**断言消息里写死那条谓词**
+（N 的口径 = 启用中的工位，不是全量工位）。
+
+**验证**：主 agent 把 `http.js` 里那道判定真摘掉 ⇒ rc=1 且点名
+`端点 addendum 漏挂限流器：第 4 次应当 429（key=platformPrompt:adde…`；根 `npm 
+ test` rc=0
+（`3049 / 2948 / 0 / 101`）；`check:agents-hotlayer` rc=0；CI 质量门禁 pass 2m33s。
+
+### 8.175 CI 接上真 PostgreSQL + 常驻「skip 不算绿」闸（#665，2026-11-18，PR #683 = 
+ `026424b`）
+
+**做法**：给现有 `gate` job 加 `services: postgres:16` + 步骤 
+  **②′**（`TEST_DATABASE_URL` 注入），
+**没有新开 job、没有 matrix**（`docs/ops/ci-release.md` §5：Free 
+  账号超额是**停跑**不是扣费，
+且**没有红灯**）。版本/权限的理由写在 workflow 注释里：
+ 仓库真库口径本就指定一次性 `postgres:16`、
+`DROP DATABASE … WITH (FORCE)` 需 PG ≥ 13，而 `migrate.js` 的 bootstrap 会 `CREATE ROLE`、
+`pg-fixture.js` 会 `CREATE DATABASE`、`platform-prompts-db.mjs` 会 `CREATE SCHEMA` ⇒ 
+ 必须超级用户。
+
+**代价实测**（261118，两个 PR 同一批）：步骤 ②′ 在 runner 上 **13 秒**；
+  整个质量门禁
+从 **2m33s**（#682，无 PG）到 **2m53s**（#683，有 PG）⇒ 加 PG 的净代价 **+20 秒/
+ job**。
+本地两条腿墙钟 32s、40s。这类「要不要往 CI 加东西」的账要先量再决定，
+ 别用「几分钟」蒙。
+
+**「skip 不算绿」不是全局禁 skip**：`scripts/check-required-legs.mjs`（`npm run 
+  check:ci-legs`）
+只对 `REQUIRED_LEGS` 清单负责，每条带 `why` 与 `minPass`，要求 `fail == 0` 且 
+ **`skipped == 0`**
+且 `pass >= minPass`；**没有 `TEST_DATABASE_URL` 时不静默** —— 
+ 点名「这几条腿这次没跑」并 rc=1。
+要接新的必须真跑的腿，只往清单里加一条。本地也能跑，
+ 否则就是又一个只在 CI 存在的样子货。
+
+**闸上线第一天就在 main 上抓到一条真红**：`origin/main` 已有 
+  `0044-system-metrics.sql`（#679），
+而 `portal/test/migrate-fresh-db.test.js:387` 仍断言 head == `0043-platform-prompts`
+⇒ `+ '0044-system-metrics' / - '0043-platform-prompts'`。CI 一路绿，**就因为 CI 
+ 里没有 PG** ——
+这是本单前提的第二个实例（第一个在 #596 那次，见 §8.172）。修在 
+ `9a220e9`：
+**只抬期望值与注释，断言语义不动** —— head 仍要求有人显式认账，
+  没改成「读 `deploy/migrations/`
+末项」那种恒真式（改成恒真式就等于从此没人看 head）。
+
+**留给下一个加迁移的人的口径**：现在 CI 会替你跑这两条腿；
+  但**在本地无 PG 时它们仍是 skip**，
+`npm test` 的 `rc=0` 不含它们 ⇒ 要证明新迁移在空库上成立，注入 
+ `TEST_DATABASE_URL` 跑
+`npm run check:ci-legs`（见 `docs/testing.md` §2.2.1）。
