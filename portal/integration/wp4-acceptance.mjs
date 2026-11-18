@@ -52,6 +52,8 @@ function dockerStdin(args, input) {
 // M6：DB 数据目录可参数化（STATION_DB_DIR，与 deploy/docker-compose.yml 的挂载一致），
 // 不再硬删共享固定路径 /docker/station-db——并行跑/多栈场景互不误伤。
 const DB_DIR = (process.env.STATION_DB_DIR || '/docker/station-db').replace(/\/+$/, '');
+/** 库容器的名字：隔离跑法必须用自己的（station-db-<栈 id>），否则会往共享 dev 库写（#661 实测）。 */
+const DB_CONTAINER = process.env.STATION_DB_NAME || 'station-db';
 function removeDbDir() {
   const parent = path.posix.dirname(DB_DIR);
   const name = path.posix.basename(DB_DIR);
@@ -95,11 +97,14 @@ function waitFor(fn, { label, timeoutMs, intervalMs = 100 }) {
 }
 
 function psql(query) {
-  return docker(`exec station-db psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
+  // #661（261117 实测）：这里原先把容器名**写死成 station-db**（共享 dev 库）⇒ 隔离跑法下
+  // 种子数据会打进**生产/dev 库**（实测报 users_login_key 重复 —— 那是 dev 库里已有的 alice）。
+  // 容器名必须从 env 派生：隔离栈是 station-db-<栈 id>。
+  return docker(`exec ${DB_CONTAINER} psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
 }
 
 function psqlStdin(sql) {
-  dockerStdin('exec -i station-db psql -U station -d station -v ON_ERROR_STOP=1', sql);
+  dockerStdin(`exec -i ${DB_CONTAINER} psql -U station -d station -v ON_ERROR_STOP=1`, sql);
 }
 
 function readCookie(setCookie) {
@@ -162,20 +167,31 @@ async function login(name) {
   assert.ok(u.cookie, `session cookie ${name}`);
 }
 
-async function createProject(name) {
+/**
+ * #661（261117 重写）：`POST /api/projects` 已被 **P5「目录即项目」退役**（410 `project_api_retired`），
+ * 项目级端口随之并入 **FDE 级一块 10 条**。本函数改成 P5 语义：
+ *   ① 断言退役 API 仍 410（把它钉住，防有人把老路加回来）；
+ *   ② provision-fde（与 wp2a 同一入口：portal 容器里的 cli）；
+ *   ③ 端口从产品读侧 `GET /api/me/ports` 取（不自己猜 —— 与 wp2a 同口径）。
+ */
+async function provisionFde(name) {
   const u = S.users[name];
-  const r = await fetch(`${PORTAL}/api/projects`, {
+  const retired = await fetch(`${PORTAL}/api/projects`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${u.cookie}` },
-    body: JSON.stringify({ name: `proj-${name}`, repo_url: `https://git.example/${name}/proj.git`, template: 'node' }),
+    body: JSON.stringify({ name: `proj-${name}` }),
   });
-  const body = await r.json();
-  assert.equal(r.status, 201, `create project ${name}: ${JSON.stringify(body)}`);
-  u.projectId = body.project.id;
-  u.portId = body.ports[0].id;
-  u.port = body.ports[0].port;
-  u.hostname = body.ports[0].hostname;
-  assert.equal(body.ports[0].state, 'allocated');
+  assert.equal(retired.status, 410, `P5：POST /api/projects 必须 410（实际 ${retired.status}）`);
+  docker(`exec ${STATION_PORTAL_NAME} node portal/src/cli.js provision-fde --fde-name ${name}`);
+  const mine = await fetch(`${PORTAL}/api/me/ports`, { headers: { Cookie: `fde_session_dev=${u.cookie}` } });
+  const ports = await mine.json();
+  assert.equal(mine.status, 200, `GET /api/me/ports ${name}: ${JSON.stringify(ports).slice(0, 200)}`);
+  assert.ok(Array.isArray(ports) && ports.length > 0, `${name} 应当有一块端口（实际 ${JSON.stringify(ports).slice(0, 200)}）`);
+  const first = ports[0];
+  u.portId = first.id;
+  u.port = first.port;
+  u.hostname = first.hostname;
+  assert.ok(u.port && u.hostname, `${name} 的端口/hostname 必须非空（实际 ${JSON.stringify(first)}）`);
 }
 
 function containerIp(name) {
@@ -219,8 +235,8 @@ test('WP4 端到端验收：6 条真机断言（隔离/403/cookie 边界/未分�
     await insertUser('bob');
     await login('alice');
     await login('bob');
-    await createProject('alice');
-    await createProject('bob');
+    await provisionFde('alice');
+    await provisionFde('bob');
     assert.notEqual(S.users.alice.hostname, S.users.bob.hostname, '两 allocation hostname 不冲突（端口块按用户独立，跨用户同端口号是设计内行为）');
 
     // 2) provision 双 FDE（同一 runner 镜像；alice 跑 agentd，bob 另起 echo server 当预览上游）
