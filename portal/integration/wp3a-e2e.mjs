@@ -202,6 +202,8 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + LiteLL
   S.staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-static-wp3a-'));
   S.staticFile = writeTraefikStatic(S.staticRoot, {
     repoRoot: REPO_ROOT, webPort: TRAEFIK_WEB_PORT, websecurePort: TRAEFIK_WEBSECURE_PORT,
+    // #261117：隔离栈必须换掉管理口 :9443（与共享栈撞端口 ⇒ edge 崩循环 ⇒ 整个栈没入口）
+    adminPort: process.env.TRAEFIK_ADMIN_PORT || '19443',
   });
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);

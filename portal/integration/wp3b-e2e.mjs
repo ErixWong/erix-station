@@ -400,6 +400,8 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
   S.artifactsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-artifacts-wp3b-'));
   S.staticFile = writeTraefikStatic(S.staticRoot, {
     repoRoot: REPO_ROOT, webPort: TRAEFIK_WEB_PORT, websecurePort: process.env.TRAEFIK_WEBSECURE_PORT || '8443',
+    // #261117：隔离栈必须换掉管理口 :9443（与共享栈撞端口 ⇒ edge 崩循环 ⇒ 整个栈没入口）
+    adminPort: process.env.TRAEFIK_ADMIN_PORT || '19443',
   });
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
@@ -598,7 +600,13 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
 
     // 事件含 mock LLM 驱动的 delta + round 事件（worker 经 IPC 回 agentd 批量上报）
     const evTypes = psql(`SELECT string_agg(DISTINCT type, ',' ORDER BY type) FROM run_events WHERE run_id='${run1}'`);
-    assert.ok(evTypes.includes('assistant_delta'), `含 assistant_delta 事件：${evTypes}`);
+    // ⚠ #502 起**碎片事件不再落库**（`assistant_delta`/`reasoning_delta`/`tool_call_delta`，
+    // 见 `portal/src/http.js` 的「#502：碎片不再从库里补发」注释）⇒ 从 `run_events` 里断言它必然红。
+    // 正文证据改读**整轮终稿**：`round_end.payload.final_text`（#502 后的口径）。
+    const finalText = psql(`SELECT COALESCE(string_agg(payload->>'final_text', '|'), '') FROM run_events WHERE run_id='${run1}' AND type='round_end'`);
+    assert.ok(finalText && finalText.trim() !== '', `round_end.final_text 必须非空（#502 后正文的唯一落库形态；实际 ${JSON.stringify(finalText)}）`);
+    assert.ok(!evTypes.includes('assistant_delta'),
+      `#502 起碎片事件不再落库，run_events 里出现 assistant_delta 说明有人在写回碎片（实际 ${evTypes}）`);
     assert.ok(evTypes.includes('round_start'), `含 round_start 事件：${evTypes}`);
     assert.ok(evTypes.includes('round_end'), `含 round_end 事件：${evTypes}`);
 

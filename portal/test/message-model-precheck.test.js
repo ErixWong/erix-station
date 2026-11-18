@@ -423,3 +423,126 @@ test('issue #261014 B2：体校验 400 优先于模型预检（未知 id 也先�
     await s.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// ④ 写路径必须失效 TTL 缓存（261118 真机 e2e 抓到的产品 bug）
+// ---------------------------------------------------------------------------
+//
+// 现场：管理员刚建好的模型，用户立刻发消息 ⇒ `409 llm_model_not_found`，文案「绑定的主模型在
+// LLM 网关里**已不存在**」——可同一时刻 `GET /model/info` 明明查得到它（wp6 诊断三方 id 全打出来了）。
+// 根因：`dataPlaneNameMap` 的模块级 TTL 缓存（60s）**只有过期这一条出路**，建/改/删模型都不失效
+// ⇒ 用户被一段过期快照挡在门外，且错误文案把人指向「模型没了」这个错方向。
+// 判据（行为面，不测内部函数名）：删掉网关里的模型后**立刻**再发一次消息，必须已经是 409，
+// 且网关被打第二次（说明缓存真的被丢了，而不是靠 60s 过期蒙对）。
+
+test('261118：deleteModel 之后 TTL 缓存立刻失效——删完再发消息立即 409（不用等 60s）', async () => {
+  const gateway = fakeGateway();
+  // 假网关补两个写路径方法：findGatewayModel 走 listModels，deleteModel 真把条目摘掉。
+  gateway.deleteModel = async (id) => {
+    gateway.state.models = { data: (gateway.state.models.data ?? []).filter((m) => m.model_info.id !== id) };
+    return { deleted: id };
+  };
+  const s = await startServer({ gateway });
+  try {
+    assert.equal((await postMessage(s, { content: 'a' })).status, 202, '第一发：三个槽位都在 ⇒ 放行');
+    assert.equal(gateway.state.calls, 1, '第一发打了一次 /model/info 并缓存');
+
+    await llm.deleteModel(gateway, 'mid-main');
+    // deleteModel 自己也会 listModels 一次（findGatewayModel）⇒ 以删除之后的读数为基准
+    const callsAfterDelete = gateway.state.calls;
+
+    const after = await postMessage(s, { content: 'b' });
+    assert.equal(after.status, 409, '删掉主模型后**立刻**发消息必须 409（旧缓存不许再放行）');
+    assert.equal((await after.json()).error.code, 'llm_model_not_found');
+    assert.equal(gateway.state.calls, callsAfterDelete + 1,
+      '写路径失效缓存 ⇒ 第二发必须重新打网关；若缓存没失效这里会停在 callsAfterDelete（靠 60s TTL 蒙对）');
+  } finally {
+    await s.close();
+  }
+});
+
+test('261118：在飞的 /model/info 不许把「刚发生的失效」悄悄撤销（代际号 race）', async () => {
+  // 现场：A 请求正在 await listModels（拿到的是**建模型之前**的旧目录），B 请求此刻把模型建好并
+  // 失效缓存。A 回来若无条件写回缓存 ⇒ 失效被撤销，用户继续吃 60s 过期快照。
+  // 判据：A 回来之后**下一次**发消息必须重新打网关（calls 递增），且看到新模型。
+  let releaseFirstList;
+  const firstListGate = new Promise((resolve) => { releaseFirstList = resolve; });
+  let listCalls = 0;
+  const state = { models: modelInfo('mid-emb', 'mid-vis') }; // 主模型还不在目录里
+  const gateway = {
+    state,
+    async listModels() {
+      listCalls += 1;
+      if (listCalls === 1) {
+        // 第一趟：先卡住，等测试放行（模拟「读在飞」），且返回的是**旧快照**
+        const snapshot = state.models;
+        await firstListGate;
+        return snapshot;
+      }
+      return state.models;
+    },
+  };
+  const s = await startServer({ gateway });
+  try {
+    const inflight = postMessage(s, { content: 'a' }); // 这一发会在 listModels 里卡住
+    // 等它真的进了 listModels（否则 releaseFirstList 还没意义）
+    for (let i = 0; i < 200 && listCalls === 0; i += 1) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(listCalls, 1, '第一发已经进到网关读里（在飞）');
+
+    // B 请求：模型建好了（目录变了）+ 失效缓存
+    state.models = modelInfo('mid-main', 'mid-emb', 'mid-vis');
+    llm.invalidateDataPlaneNameCache();
+
+    releaseFirstList(); // 放行那趟在飞的读（它拿到的是旧快照）
+    const first = await inflight;
+    assert.equal(first.status, 409, '在飞的那一发按它自己那趟的读数判：旧目录里没有主模型 ⇒ 409');
+
+    const after = await postMessage(s, { content: 'b' });
+    assert.equal(after.status, 202, '下一发必须看到新目录（在飞的旧快照不许写回缓存）');
+    assert.equal(listCalls, 2, '下一发必须重新打网关；若旧快照被写回，这里会停在 1（靠 60s TTL 蒙对）');
+  } finally {
+    await s.close();
+  }
+});
+
+test('261118：updateModel 写成功但读回失败时，缓存仍必须已失效（审计 MED①）', async () => {
+  // 现场：`client.updateModel()` 已经写成功，紧接着的读回（findGatewayModel）失败 ⇒ 若失效放在
+  // 读回之后，写已落地而缓存还是旧的 —— 本 PR 要修的 bug 换个入口。
+  // 判据：读回抛错之后，**下一次发消息必须重新打网关**（calls 递增）。缓存在读回之前就失效了才会这样。
+  let listCalls = 0;
+  let failOnCall = null; // 只让「写成功之后那次读回」失败（updateModel 开头还有一次预读，别误伤）
+  const state = { models: modelInfo('mid-main', 'mid-emb', 'mid-vis') };
+  const gateway = {
+    state,
+    async listModels() {
+      listCalls += 1;
+      if (failOnCall === listCalls) throw Object.assign(new Error('read-back down'), { httpStatus: 503 });
+      return state.models;
+    },
+    async updateModel() {
+      // 写成功：把主模型从目录里摘掉（模拟改名后旧名消失）
+      state.models = modelInfo('mid-emb', 'mid-vis');
+      return { updated: true };
+    },
+  };
+  const s = await startServer({ gateway });
+  try {
+    assert.equal((await postMessage(s, { content: 'a' })).status, 202, '第一发：目录齐全 ⇒ 放行');
+    const callsAfterFirst = listCalls;
+    assert.equal(callsAfterFirst, 1, '第一发打了一次并缓存');
+
+    // updateModel 的调用序列：预读（第 2 次 listModels）→ 写 → 读回（第 3 次）。只让第 3 次失败。
+    failOnCall = callsAfterFirst + 2;
+    await assert.rejects(() => llm.updateModel(gateway, 'mid-main', { name: 'renamed' }),
+      '读回失败必须冒泡（不能静默吞）');
+    assert.equal(listCalls, callsAfterFirst + 2, '预读 + 读回各一次，写本身不打列表');
+
+    failOnCall = null;
+    const after = await postMessage(s, { content: 'b' });
+    assert.equal(listCalls, callsAfterFirst + 3,
+      '预读 + 读回 + 第二发 = +3。若失效放在读回之后，第二发会吃旧缓存 ⇒ 这里只有 +2');
+    assert.equal(after.status, 409, '缓存已失效 + 目录里主模型没了 ⇒ 必须 409（不是拿旧缓存放行 202）');
+  } finally {
+    await s.close();
+  }
+});
