@@ -105,7 +105,9 @@ async function phaseHappy() {
   if (running.status !== 200) return out({ ok: false, error: 'state running not 200', run_id: runId, status: running.status, data: running.data, sse });
 
   const ev1 = await call('POST', `/api/internal/runs/${runId}/events`, {
-    body: { batch_id: 'happy-1', events: [{ client_event_id: `${runId}:1:0`, type: 'assistant_delta', ts: null, payload: eventPayload('hi') }, { client_event_id: `${runId}:1:1`, type: 'round_end', ts: null, payload: { round: 1 } }] },
+    body: { batch_id: 'happy-1', // ⚠ #502 起**碎片事件不落库**（`assistant_delta`/`reasoning_delta`/`tool_call_delta`）⇒ 夹具改用
+    // 非碎片事件（`round_start` + `round_end`），否则 `stored` 只会是 1 而断言期望 2（261117 实测 1 !== 2）。
+    events: [{ client_event_id: `${runId}:1:0`, type: 'round_start', ts: null, payload: { round: 1 } }, { client_event_id: `${runId}:1:1`, type: 'round_end', ts: null, payload: { round: 1, final_text: 'hi' } }] },
     extraHeaders: X,
   });
   if (ev1.status !== 200) return out({ ok: false, error: 'events not 200', run_id: runId, status: ev1.status, data: ev1.data });
