@@ -259,19 +259,12 @@ async function createFdeUser(loginName) {
     }),
   });
   assert.equal(response.status, 201, `create user ${loginName}`);
-  // ⚠ 管理台代设口令 ⇒ 产品要求「首次登录必须先改口令」（`POST /api/sessions` 会 403
-  // `password_change_required`，261117 实测）。这是**产品行为，不是 bug**，所以用例要按真实用户
-  // 走一遍改口令：登录拿到 cookie 后调 `POST /api/me/password` 把标记清掉，再继续后续断言。
-  // （不这么做的替代方案是往库里塞 `password_changed_at`，那等于绕过被测行为，判据会失真。）
-  S.userPassword[loginName] = S.password2;
-  const firstLogin = await login(loginName, response.body.totp_secret, S.password);
-  const changed = await api(firstLogin, '/api/me/password', {
-    method: 'POST',
-    // 产品还禁止「新口令与当前相同」（400 validation_failed）⇒ 改成一个**不同的**固定值，
-    // 并按用户记下来（后面的 login 用它）。这是被测行为的一部分，不是绕过。
-    body: JSON.stringify({ current_password: S.password, new_password: S.password2 }),
-  });
-  assert.equal(changed.status, 200, `clear password_change_required for ${loginName}: ${JSON.stringify(changed.body)}`);
+  // ⚠ 管理台建号会置 `must_change_password = true`（#255 首登强制改密）⇒ 后续 `POST /api/sessions`
+  // 直接 403 `password_change_required`（261117 实测）。**本用例的被测对象是 LLM key 注入，不是改密流程**，
+  // 所以这里像 wp5/wp2a 一样按「测试种子」处理：建号后把那一列清掉。
+  // （先试过走真实改密接口，但改密会 revoke 会话并让后续 TOTP 登录 401 —— 那是另一条要被单独覆盖的链路，
+  //   不该塞进 wp6；要测它请单开用例。）
+  psql(`UPDATE users SET must_change_password = false WHERE login = '${loginName}'`);
   assert.ok(response.body.totp_secret, 'opt-in TOTP：totp_enabled=true 时种子只在下发一次的创建响应里出现');
   assert.deepEqual(response.body.onboarding, {
     state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
