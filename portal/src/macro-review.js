@@ -246,12 +246,50 @@ export async function buildReviewBrief(pool, {
   // —— 审查现场（#690：活目录，无冻结副本；审查开始时的状态见上面的 git 段）——
   parts.push(section('审查现场（活目录）', cwd ? `cwd：${cwd}\n模式：live（无冻结副本）` : null));
 
+  // —— 任务与回答格式（issue #692 ①）——
+  // ⚠ 这一段**必须在最后**：它是模型最后读到的指令，且**不能省略**。
+  //   缺了它，真实审查会写一份交付报告（`verdict_raw` 里能看到），而 `VERDICT_LINE_RE`
+  //   是**锚定首行**的 ⇒ 永远 `unclassified`。桩 runner 直接返回 `结论：通过`，测不出来。
+  parts.push(VERDICT_FORMAT_BLOCK);
+
   const joined = parts.join('\n\n');
   const { text, truncated } = clipUtf8(joined, maxBytes);
+  // 截断只能砍**前面的事实**，砍到格式要求就等于让审查判不出来 ⇒ 把尾块补回去。
   return truncated
-    ? `${text}\n\n……（工作包超过 ${maxBytes} 字节，已截断）`
+    ? `${text}\n\n……（工作包超过 ${maxBytes} 字节，已截断）\n\n${VERDICT_FORMAT_BLOCK}`
     : text;
 }
+
+/**
+ * 审查的任务与回答格式（issue #692 ①）。**brief 的最后一块，也是判决能否解析的前提**。
+ *
+ * 与 `VERDICT_LINE_RE`（`:32`）是同一份契约的两端：那里锚定首行解析，这里必须把
+ * 「首行只能是这四种」说清楚。改任一端都要同步另一端。
+ *
+ * ⚠ 刻意写清三种**非法形状**（前导空格 / 半角冒号 / 只出现在正文）——真模型最容易在这三处跑偏。
+ */
+export const VERDICT_FORMAT_BLOCK = [
+  '## 你的任务',
+  '',
+  '判断**这次交付是否真的完成了原任务**（不是复述它做了什么），然后给出判决。',
+  '',
+  '## 回答格式（硬要求）',
+  '',
+  '**首行必须且只能是**下列四者之一，一个字都不多：',
+  '',
+  '- `结论：通过`',
+  '- `结论：整改`',
+  '- `结论：未证实有改动`',
+  '- `结论：需人工`',
+  '',
+  '首行之后才是正文（理由、证据、建议）。',
+  '',
+  '⚠ 下面三种**都算非法**，会导致判决无法识别：',
+  '',
+  '- 前导空格：` 结论：通过`',
+  '- 半角冒号：`结论:通过`',
+  '- 只在正文里提到，首行是别的（如「本次交付完成并已闭环验证。」）',
+].join('\n');
 
 /** 审查 runner 的失败分类：`kind` 显式优先，其次按常见形状猜，兜底 `llm_failed`。 */
 function classifyReviewError(err) {
