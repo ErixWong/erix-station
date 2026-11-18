@@ -3622,6 +3622,15 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 - `latest` 里任何一项拿不到 ⇒ **`null`，绝不是 `0` / 空串**（#586 口径：把「未知」渲染成 0 会把「不知道」
   说成「很闲」）。`containers` 可以是整个 `null`（docker 不可达）——那是「读不到」而不是「0 台」；
   `containers.drift` 是「DB 说 N 台 ↔ Docker 实际 M 台」的对账（`onlyDb` / `onlyDocker` 点名到容器）。
+  **FDE 容器只按 `station.managed=true` 标签判定**（`fde` / `fdeRunning` / `fdeNames` 三格同源）：
+  名字前缀 `fde-` **不算**——宿主上另一个项目的容器可能就叫 `otherproj-db`，按前缀算会凭空多出两台
+  「只在 Docker 里」的假告警（261118 真机验收实测）。反过来，一台丢了标签的 FDE 会以 `onlyDb` 的形态
+  出现在对账里，那正是要看见的信号。
+- `latest.disk[]`：**一个文件系统一行**，去重键是 `statfs` 的三元组（`total/used/avail`），不是设备名——
+  容器里 `/` 是 `overlay`、bind 进来的宿主目录报 `/dev/nvme0n1p2`，两者是同一个文件系统（三个数一样）。
+  归并后**设备名/类型取真实块设备那一条**（`overlay` 让位给 `/dev/nvme0n1p2`），`path` 取最短那条。
+  默认 `SYSTEM_METRICS_DISK_PATHS=/` 时设备名会诚实报 `overlay`（容器视图，不是造假）——
+  想看真实设备名就把宿主目录也挂进 portal 并加进 `DISK_PATHS`（`docs/ops/system-metrics.md`）。
 - `latest.disk[]` **之外**另带 `latest.diskUnreadable[]`：配了但 `statfs` 失败的路径也要露面，
   否则「已监控 N 个文件系统」就成了悄悄少了一行的谎。
 - `series.points[]`：**服务端分桶后的点**，绝不把原始点发给浏览器（30d × 30s = 86,400 行）。
