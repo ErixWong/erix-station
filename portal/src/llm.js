@@ -840,10 +840,12 @@ export async function updateModel(gateway, id, {
       update.litellm_params = params;
     }
     await client.updateModel(update);
+    // ⚠ 失效必须紧跟**写成功**那一刻，不能等下面那次读回：读回（findGatewayModel）自己也会
+    // 失败（网关抖/条目刚改完还没稳定），一失败就 throw ⇒ 写已落地而缓存还是旧的，正是
+    // 本 PR 要修的那个 bug 换个入口（261118 审计 MED①）。
+    invalidateDataPlaneNameCache();
   }
   const updated = toModel(await findGatewayModel(client, id));
-  // 改名/改参数都可能让目录里的 id↔name 映射变化 ⇒ 写路径一律失效
-  invalidateDataPlaneNameCache();
   return updated;
 }
 

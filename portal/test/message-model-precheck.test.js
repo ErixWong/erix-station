@@ -504,3 +504,45 @@ test('261118：在飞的 /model/info 不许把「刚发生的失效」悄悄撤�
     await s.close();
   }
 });
+
+test('261118：updateModel 写成功但读回失败时，缓存仍必须已失效（审计 MED①）', async () => {
+  // 现场：`client.updateModel()` 已经写成功，紧接着的读回（findGatewayModel）失败 ⇒ 若失效放在
+  // 读回之后，写已落地而缓存还是旧的 —— 本 PR 要修的 bug 换个入口。
+  // 判据：读回抛错之后，**下一次发消息必须重新打网关**（calls 递增）。缓存在读回之前就失效了才会这样。
+  let listCalls = 0;
+  let failOnCall = null; // 只让「写成功之后那次读回」失败（updateModel 开头还有一次预读，别误伤）
+  const state = { models: modelInfo('mid-main', 'mid-emb', 'mid-vis') };
+  const gateway = {
+    state,
+    async listModels() {
+      listCalls += 1;
+      if (failOnCall === listCalls) throw Object.assign(new Error('read-back down'), { httpStatus: 503 });
+      return state.models;
+    },
+    async updateModel() {
+      // 写成功：把主模型从目录里摘掉（模拟改名后旧名消失）
+      state.models = modelInfo('mid-emb', 'mid-vis');
+      return { updated: true };
+    },
+  };
+  const s = await startServer({ gateway });
+  try {
+    assert.equal((await postMessage(s, { content: 'a' })).status, 202, '第一发：目录齐全 ⇒ 放行');
+    const callsAfterFirst = listCalls;
+    assert.equal(callsAfterFirst, 1, '第一发打了一次并缓存');
+
+    // updateModel 的调用序列：预读（第 2 次 listModels）→ 写 → 读回（第 3 次）。只让第 3 次失败。
+    failOnCall = callsAfterFirst + 2;
+    await assert.rejects(() => llm.updateModel(gateway, 'mid-main', { name: 'renamed' }),
+      '读回失败必须冒泡（不能静默吞）');
+    assert.equal(listCalls, callsAfterFirst + 2, '预读 + 读回各一次，写本身不打列表');
+
+    failOnCall = null;
+    const after = await postMessage(s, { content: 'b' });
+    assert.equal(listCalls, callsAfterFirst + 3,
+      '预读 + 读回 + 第二发 = +3。若失效放在读回之后，第二发会吃旧缓存 ⇒ 这里只有 +2');
+    assert.equal(after.status, 409, '缓存已失效 + 目录里主模型没了 ⇒ 必须 409（不是拿旧缓存放行 202）');
+  } finally {
+    await s.close();
+  }
+});

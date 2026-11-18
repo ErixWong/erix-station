@@ -524,5 +524,32 @@ test('WP4 验收（收窄）：跨 FDE 隔离 / strip-cookie 不透传 / 未路�
       console.log(`[wp4] ③ 未路由 Host → 404 OK（${strayHost}）`);
     });
 
-    console.log('\n[wp4] ✅ 三条独有断言全部通过：跨 FDE 隔离 / strip-cookie 不透传 / 未路由 Host→404');
+    // ---------------------------------------------------------------------
+    // 断言④ 吊销收敛：token 被吊销 → agentd 优雅退出 → deprovision 回收容器，另一个 FDE 不受影响
+    //
+    // ⚠ 这条是**旧 wp4 的 ⑥**，261118 收窄重写时被我连同 463 行一起删掉了，独立审计（MED③）
+    // 指出它是全仓**唯一**覆盖（`grep -rn 'token_revoked' portal/integration/` 只剩注释）。
+    // 现按 `docker logs` 读（agentd 是容器主进程，JSON 直接进 stdout，不再需要老版的日志文件通道）。
+    // 语义：置 `containers.status='removed'`（offboard 的 DB 信号）⇒ agentd 下一次 claim/heartbeat
+    // 得 401 token_revoked ⇒ 双循环收敛退出；随后 deprovision 回收容器/网络。
+    // ---------------------------------------------------------------------
+    await t.test('断言④ token 吊销 → agentd 优雅退出 → 回收只影响本 FDE', async () => {
+      const { alice, bob } = S.users;
+      // psql() 只收单行 SQL（换行经 sg/JSON.stringify 会变字面 \n）
+      psql(`UPDATE containers SET status = 'removed', updated_at = now() WHERE fde_name = '${alice.fdeName}' AND status <> 'removed'`);
+      await waitFor(() => {
+        const out = safe(() => docker(`logs ${alice.container} 2>&1`)) ?? '';
+        return out.includes('"msg":"agentd exiting"') && out.includes('"revoke":"token_revoked"') ? out : null;
+      }, { label: 'agentd 收 token_revoked 并优雅退出', timeoutMs: 120000, intervalMs: 1000 });
+
+      docker(`exec ${STATION_PORTAL_NAME} node portal/src/cli.js deprovision-fde --fde-name ${alice.fdeName}`);
+      await waitFor(() => (safe(() => docker(`inspect ${alice.container} --format {{.Id}}`).trim()) ? null : true),
+        { label: `${alice.container} 已回收`, timeoutMs: 90000 });
+
+      assert.equal(docker(`inspect ${bob.container} --format {{.State.Status}}`).trim(), 'running',
+        `断言④ deprovision ${alice.fdeName} 不得影响 ${bob.fdeName}（隔离回收）`);
+      console.log(`[wp4] ④ token_revoked → agentd 优雅退出 → 回收 ${alice.fdeName}，${bob.fdeName} 不受影响 OK`);
+    });
+
+    console.log('\n[wp4] ✅ 四条断言全部通过：跨 FDE 隔离 / strip-cookie 不透传 / 未路由 Host→404 / 吊销收敛');
   });
