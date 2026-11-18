@@ -696,6 +696,29 @@ export function createServer({
     blockMs: config.tlsInspectRateLimit?.blockMs ?? 60 * 60 * 1000,
     maxEntries: config.tlsInspectRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
   });
+  // #664 管理台提示词三条 PUT（`addendum` / `agents-md` / `title-prompt`）：每次**成功保存**都会给
+  // **全部启用中的 FDE** 各入队一条物化（`platform-prompts.js` 的 `enqueueMaterializeForAllFdes`：谓词
+  // `fde_name IS NOT NULL AND status IN ('active','awaiting_credential')`）⇒ 一次保存扇出 W 条
+  // outbox 行 + W 次 revision bump + W 次家目录重物化 + 一行审计（W = 启用中的工位数，真机 dev 实测 6）。
+  // 消费侧（`materializer.js#claimMaterializeRows`）的 latest-wins 只把「真重写」合并成「每 FDE 每 claim
+  // 周期 ≤1 次」，**不合并**入队侧的行/revision/审计，也不合并跨多个 claim 周期的重写 ⇒ 扇出的写放大
+  // 仍要在**源头**钳住。`ADMIN_IP_ALLOWLIST` 为空（放行全部），「只有管理员碰得到」不成立。
+  // 阈值 **30 次成功保存 / 操作者+端点 / 60 分钟**（口径照 mailTest/tls：createRateLimiter 只有 recordFailure
+  // 一个计数入口 ⇒ 每次真保存记一次）：
+  //   * 上界（不夹人手编辑）：单面板现实最猛的一轮改文案 < 10 次/小时，30 留 ≥3× 余量 ⇒ 正常管理员看不到 429；
+  //   * 下界（钳写放大）：30/hr/端点 ⇒ 单操作者单端点每小时入队写 ≤ 30×W 行 + 30 行审计（W=6 时 ≤180），
+  //     有界且小；blockMs=60min 让脚本连点一旦触顶就整点冷却，之后不再叠行；
+  //   * 同量级（issue 要求「与既有登录类限流同量级」）：login 5 / mailTest 5 / tlsUpload 10（真改线上握手）
+  //     / tlsInspect 120（纯 CPU 解析）——一次提示词保存比换证书轻、但比纯解析重（有扇出）⇒ 取 30，
+  //     落在 tlsUpload(10) 与 tlsInspect(120) 之间。
+  // 键含**端点 slug** ⇒ 三个端点各自独立计数；只读的那条 GET 不限流。
+  const platformPromptsLimiter = createRateLimiter({
+    maxFailures: config.platformPromptsRateLimit?.maxFailures ?? 30,
+    windowMs: config.platformPromptsRateLimit?.windowMs ?? 60 * 60 * 1000,
+    blockMs: config.platformPromptsRateLimit?.blockMs ?? 60 * 60 * 1000,
+    maxEntries: config.platformPromptsRateLimit?.maxEntries
+      ?? config.loginRateLimit?.maxEntries ?? 10000,
+  });
   // #449：邮件通道读取侧（SMTP 参数存 DB，见 `mail-provider.js`）。`mailerProvider` 参数仅供测试注入 fake。
   // 为什么不在启动时同步读一次：登录是热路径但启动不是；真正的「现在到底能不能发信」每次登录时由
   // `ctx.mailerProvider.get()` 回答（60s 缓存 + 急停硬闸）。这里只在 `config.mail` 存在（= `loadConfig`
@@ -716,7 +739,7 @@ export function createServer({
   const ctx = {
     pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter,
     mailerProvider: mailProvider, emailCodeLimiter, emailSendLimiter, mailTestLimiter, docker,
-    tlsUploadLimiter, tlsVerifyLimiter, tlsInspectLimiter,
+    tlsUploadLimiter, tlsVerifyLimiter, tlsInspectLimiter, platformPromptsLimiter,
     // #456：真机校验的注入点（生产 = `tls.connect` + `/proc/net/route`；单测换成假 socket / 假路由表）。
     tlsConnect, tlsRoutePath,
     // #456：最近一次**真机校验**结果（内存态，单实例）。GET 只回缓存，绝不主动连（那是 verify 端点的事）。
@@ -1887,10 +1910,22 @@ async function handleAdminApi(req, res, ctx, url) {
   const adminPromptMatch = pathname.match(/^\/api\/admin\/prompts\/(addendum|agents-md|title-prompt)$/);
   if (adminPromptMatch) {
     if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    // #664：保存一次会给**全部启用中的 FDE** 各扇出一条物化（见 `platformPromptsLimiter` 上方注释），
+    // 所以按「操作者 + 端点」限流。闸在**读体之前**（超限连体都不必解析），且**只在真保存后**记一次
+    // （`createRateLimiter` 只有 recordFailure 一个计数入口）——400 校验失败没有扇出，不烧配额。
+    const slug = adminPromptMatch[1];
+    const promptLimitKey = `platformPrompt:${slug}:${session.user.id}`;
+    const promptGate = ctx.platformPromptsLimiter.check(promptLimitKey);
+    if (!promptGate.allowed) {
+      throw new HttpError(429, 'rate_limited', '提示词保存过于频繁，请稍后再试', {
+        retryable: true,
+        headers: { 'Retry-After': String(promptGate.retryAfterSeconds) },
+      });
+    }
     // 路由 slug → 写侧字段名（唯一一处映射；形状与上限的闸全在 `platform-prompts.js`）。
     const field = {
       addendum: 'addendum', 'agents-md': 'agentsMd', 'title-prompt': 'titlePrompt',
-    }[adminPromptMatch[1]];
+    }[slug];
     requireJson(req);
     const body = await readJsonBody(req, ctx.config.maxBodyBytes);
     // 体本身不是对象 ⇒ `details.field='body'`（不是 `'text'`：那时连请求体都不是一份请求体）。
@@ -1903,6 +1938,8 @@ async function handleAdminApi(req, res, ctx, url) {
       actorId: session.user.id,
       log: ctx.log,
     });
+    // 保存已成 ⇒ 这次真会扇出 ⇒ 计一次（越界/形状错的 400 在上面已抛 ⇒ 不走到这里 ⇒ 不计）。
+    ctx.platformPromptsLimiter.recordFailure(promptLimitKey);
     // 审计**不在这里**写：`admin.platform_prompts_updated` 已经与旧值快照、渲染闸、upsert 挤进同一条
     // CTE（`platform-prompts.js` 的 `SAVE_SQL`）。再补一笔 `auth.audit` 会退回「设置已生效而审计一行
     // 没有」与「并发保存记错 `previous_*`」两个窗口，并且多写一条审计行（判据 `P8`）。
