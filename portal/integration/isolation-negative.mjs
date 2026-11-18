@@ -444,9 +444,10 @@ try {
   const hostOf = (port) => `${fdeName}-p-${port}.${baseDomain}`;
   const urlOf = (port) => `http://${hostOf(port)}:18090`;
   const ports = Array.from({ length: 10 }, (_, i) => 22000 + i);
-  const entry = (port, over = {}) => ({ scope: 'fde', port, role: 'spare', run_id: null, url: urlOf(port), exposure: 'private', state: 'allocated', ...over });
+  // schema 2（#361）：清单侧只载分配事实 `{port,url,in_use}` —— scope/role/exposure/state/run_id 已被产品剃除
+  const entry = (port, over = {}) => ({ port, url: urlOf(port), in_use: null, ...over });
   const row = (port, over = {}) => ({ port, hostname: hostOf(port), url: urlOf(port), scope: 'fde', role: 'spare', exposure: 'private', state: 'allocated', run_id: null, ...over });
-  const jsonOf = (list, over = {}) => ({ schema: 1, fde: fdeName, generation: 7, allocations: list, ...over });
+  const jsonOf = (list, over = {}) => ({ schema: 2, fde: fdeName, generation: 7, block: list.length ? { start: Number(list[0].port), end: Number(list.at(-1).port) } : null, allocations: list, ...over });
   const goodJson = jsonOf(ports.map((p) => entry(p)));
   const goodRows = ports.map((p) => row(p));
   const run = (portsJson, dbRows) => reconcilePortsJsonWithDb({ portsJson, dbRows, fdeName, baseDomain, publicBaseUrl }).problems;
@@ -459,10 +460,11 @@ try {
     ['清单少一条（块没发满）', jsonOf(goodJson.allocations.slice(0, 9)), goodRows],
     ['generation 不是数值', jsonOf(goodJson.allocations, { generation: '7' }), goodRows],
     ['fde 字段指向别人', jsonOf(goodJson.allocations, { fde: 'someoneelse' }), goodRows],
-    ['schema 不是 1', jsonOf(goodJson.allocations, { schema: 2 }), goodRows],
+    ['schema 不是 2（#361 只载分配事实）', jsonOf(goodJson.allocations, { schema: 1 }), goodRows],
     ['scope 退回 run 级（0019 前的形态）', goodJson, goodRows.map((r, i) => (i === 0 ? { ...r, scope: 'run' } : r))],
     ['DB 活行里混进 released（清单没跟上）', goodJson, goodRows.map((r, i) => (i === 3 ? { ...r, state: 'released' } : r))],
-    ['json 与 DB 状态不一致', jsonOf(goodJson.allocations.map((e, i) => (i === 1 ? { ...e, state: 'active' } : e))), goodRows],
+    ['清单里混回已剃除字段（state）', jsonOf(goodJson.allocations.map((e, i) => (i === 1 ? { ...e, state: 'active' } : e))), goodRows],
+    ['清单条目缺 url', jsonOf(goodJson.allocations.map((e, i) => (i === 2 ? { port: e.port, in_use: null } : e))), goodRows],
     ['清单里的 url 端口不是公开入口的端口', goodJson, goodRows.map((r) => ({ ...r, url: r.url.replace(':18090', ':8090') }))],
     ['hostname 前缀不是该 FDE', goodJson, goodRows.map((r) => ({ ...r, hostname: r.hostname.replace(fdeName, 'otherfde') }))],
     ['端口在号池外（旧 4000–4009 时代）', jsonOf([4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009].map((p) => entry(p))),
@@ -977,11 +979,13 @@ const singleSourceProblems = [];
   }
   // #227.1：allowSharedReset（wp2b 对「有意重置共享 dev 库」的显式声明）只能出现在 lib 定义与 wp2b
   // 调用处——别的脚本出现这个选项 = 有人开始打算删共享 dev 库，必须停下来先确认语义。
-  const ALLOW_SHARED_RESET_FILES = new Set(['isolated-env.mjs', 'wp2b-e2e.mjs']);
+  // #661：`wp2b-e2e.mjs` 已退役（P5 退役了 `POST /api/projects`，它的前提消失）⇒ 现在**没有任何调用方**
+  // 允许声明「重置共享 dev 库」；白名单只留 lib 自己的定义。判据因此**更严**（原来是「只有 wp2b 可以」）。
+  const ALLOW_SHARED_RESET_FILES = new Set(['isolated-env.mjs']);
   const sharedResetOutliers = files.filter((f) => !ALLOW_SHARED_RESET_FILES.has(path.basename(f))
     && fs.readFileSync(f, 'utf8').includes('allowSharedReset'));
   if (sharedResetOutliers.length) {
-    singleSourceProblems.push(`allowSharedReset 出现在 lib/wp2b 之外（只有 wp2b 允许声明重置共享 dev 库）：${sharedResetOutliers.map((f) => path.relative(path.resolve(HERE, '../..'), f)).join(', ')}`);
+    singleSourceProblems.push(`allowSharedReset 出现在 lib 之外（#661 起没有任何脚本允许声明重置共享 dev 库，wp2b 已退役）：${sharedResetOutliers.map((f) => path.relative(path.resolve(HERE, '../..'), f)).join(', ')}`);
   }
   // #227.2：脚本里的 compose 命令串必须显式带 `-p `（隔离系用 `${COMPOSE_PROJECT_NAME:?…}`、共享系用
   // `${COMPOSE_PROJECT_NAME:-station}`）——出现不带 -p 的 `docker compose ` 即红：回到「忘 export 就对

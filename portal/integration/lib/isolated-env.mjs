@@ -162,7 +162,7 @@ export function applyStackIpamPoolEnv(env = process.env, stackId = env.STATION_S
  *  1. 未设置 ⇒ 抛错，并点名「缺省会 rm -rf 共享 dev 库数据目录」；
  *  2. 设了但不在 OS 临时目录内 ⇒ 也抛（`ERIX_E2E_ALLOW_DB_DIR=1` 是显式豁免，用于真机有意复用某路径）。
  *
- * `allowSharedReset`（#227.1，**只允许 wp2b 用**）：调用方**显式声明「我就是要重置共享 dev 库」**——
+ * `allowSharedReset`（#227.1；#661 起 **wp2b 已退役 ⇒ 没有任何调用方**，仅作隔离护栏的夹具语义保留）：调用方**显式声明「我就是要重置共享 dev 库」**——
  * 未设置时不抛、直接解析为共享栈的 `/docker/station-db`；解析结果恰等于该路径时豁免临时目录检查，
  * 其余路径照旧严格（不把豁免面扩大成「任意非临时路径」）。确认这个重置语义前不要复制到别的脚本
  * （`isolation-negative.mjs` 的单一来源断言把出现处钉在 lib + wp2b）。
@@ -221,7 +221,7 @@ export function removeDbDir(docker, env = process.env, options = {}) {
  * 生成该脚本专用的 `removeDbDir()` 闭包（各 e2e 的 docker 执行器是本地函数，这样调用点保持零参数）。
  *
  * @param {{ docker: (args: string) => unknown, env?: Record<string, string | undefined>, allowSharedReset?: boolean }} opts
- *   allowSharedReset 只允许 wp2b（共享栈重置）传，见 resolveDbDir 与单一来源断言。
+ *   allowSharedReset 原先只允许 wp2b（共享栈重置）传；wp2b 退役后无调用方，见 resolveDbDir 与单一来源断言。
  * @returns {{ removeDbDir: () => void, dbDir: () => string }}
  */
 export function createDbDirCleaner({ docker, env = process.env, allowSharedReset = false }) {
@@ -606,15 +606,20 @@ export async function assertHostPortsAvailable(ports, { host = '127.0.0.1' } = {
  * @param {{ repoRoot?: string, webPort: string, websecurePort: string }} opts
  * @returns {string} 生成的 traefik.yml 路径
  */
-export function writeTraefikStatic(dir, { repoRoot = REPO_ROOT, webPort, websecurePort }) {
+export function writeTraefikStatic(dir, { repoRoot = REPO_ROOT, webPort, websecurePort, adminPort = null }) {
   assert.ok(webPort, 'writeTraefikStatic: webPort is required');
   assert.ok(websecurePort, 'writeTraefikStatic: websecurePort is required');
   const source = fs.readFileSync(path.join(repoRoot, 'deploy/traefik/traefik.yml'), 'utf8');
   assert.ok(source.includes('address: ":8090"') && source.includes('address: ":8443"'),
     'Traefik static config has the expected entrypoint addresses');
-  const output = source
+  let output = source
     .replace('address: ":8090"', `address: ":${webPort}"`)
     .replace('address: ":8443"', `address: ":${websecurePort}"`);
+  // #261117 实测：`traefik.yml` 里还有**第三个写死端口** `:9443`（管理台入口 adminsecure，
+  // 见 AGENTS.md §5「端口在 traefik.yml 里写死」）。隔离栈的 edge 是 `network_mode: host`，
+  // 不换它就会跟**共享栈**的 9443 撞端口 ⇒ 容器 `Restarting (1)` 崩循环、整个隔离栈的入口不监听，
+  // 下游 e2e 全部连不上（wp2a 段⑥ curl 退出码 7 就是这么来的）。
+  if (adminPort) output = output.replace('address: ":9443"', `address: ":${adminPort}"`);
   const target = path.join(dir, 'traefik.yml');
   fs.writeFileSync(target, output);
   return target;
