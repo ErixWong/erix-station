@@ -86,6 +86,17 @@ function runnerDefaults() {
   };
 }
 
+/** 在文件里找**第一处**含 needle 的行号（1 起）。判据引用产品行号时必须走它，不硬编码。 */
+function lineOf(rel, needle) {
+  const lines = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8').split('\n');
+  // ⚠ 跳过**注释行**：注释里提到这个名字不算（261117 实测：`lineOf` 找到了 `:361` 的注释，
+  // 而坐标校验剥注释后自然判它「不含该 key」⇒ 判据自己误杀真登记）。
+  const isComment = (l) => /^\s*(\/\/|\/\*|\*)/.test(l);
+  const i = lines.findIndex((l) => l.includes(needle) && !isComment(l));
+  assert.ok(i >= 0, `${rel} 里找不到 ${JSON.stringify(needle)} ⇒ 产品代码改名/搬走了，判据要跟着改`);
+  return i + 1;
+}
+
 // 动态 import（runner 侧的解析器是本站 env 默认值的唯一真相）
 const { isDelegateEnabled, parseDelegateMax, parseDelegateChildRounds, parseDelegateChildTimeoutMs }
   = await import(RUNNER_CONFIG.href);
@@ -1472,6 +1483,9 @@ function validateUnsupported(items, root = REPO_ROOT, detected = null) {
         + '拿「同一文件里另一行含某个 env 名」充数不算证据（#587 族 B 返工④，审计实测可绕过）');
     }
     reasonRefs.forEach((r, j) => {
+      // #587 族 B 四轮返工（261117 实测）：理由里**提到测试文件**是**背景说明**（「某某 test 有反向判据钉住」），
+      // 不是坐标 ⇒ 不按坐标校验，否则真登记会被自己的散文误杀（这是假红，不是漏放）。
+      if (isTestFace(r.rel)) return;
       const range = r.from == null ? '' : `:${r.from}${r.to != null && r.to !== r.from ? `-${r.to}` : ''}`;
       problems.push(...coord(r, { key: null, sources: null, tag: `${at} 的理由里的第 ${j + 1} 个引用 ${r.rel}${range}` }));
     });
@@ -2242,10 +2256,12 @@ test('活二㉕ B-①.2 字符串正文不算坐标：散文串/正则正文/注
     }
     // 真树反向自证：盘上真登记的 env 名**就活在串里**（参数默认值 / 注入模板 / 调用实参 / 数据表）
     const inString = [
-      ['ERIX_STATION_TOKEN', 'portal/src/provisioner.js:366'],
-      ['ERIX_STATION_TOKEN', 'portal/src/provisioner.js:414'],
-      ['FDE_WORKER_UID', 'portal/src/config.js:391'],
-      [TIMEOUT_KEYS[0], 'runner/lib/llm-timeouts.js:58'],
+      // ⚠ 行号**动态解析**，不硬编码：产品代码一改行号（261117 rebase 实测漂过），硬编码的判据就变成
+      // 「断言产品行号」而不是「断言坐标可核对」——那种判据每合一次别人的 PR 就红一次。
+      ['ERIX_STATION_TOKEN', `portal/src/provisioner.js:${lineOf('portal/src/provisioner.js', "key = 'ERIX_STATION_TOKEN'")}`],
+      ['ERIX_STATION_TOKEN', `portal/src/provisioner.js:${lineOf('portal/src/provisioner.js', 'ERIX_STATION_TOKEN=${token}')}`],
+      ['FDE_WORKER_UID', `portal/src/config.js:${lineOf('portal/src/config.js', 'FDE_WORKER_UID')}`],
+      [TIMEOUT_KEYS[0], `runner/lib/llm-timeouts.js:${lineOf('runner/lib/llm-timeouts.js', `'${TIMEOUT_KEYS[0]}'`)}`],
     ];
     for (const [key, coord] of inString) {
       const [rel, line] = coord.split(':');
@@ -2326,8 +2342,10 @@ test('活二㉗ B-② `unsupported` 不许免证：绑定扫描器确认的读�
       /没有任何 env 名的结构化证据/, '引用的那一行必须真的有 env 名（不然就是编的）');
     assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 dyn.js:1-2' }], dir, detected).join('\n'),
       /第 2 行/, '理由里的行范围同样逐行判');
+    // 四轮返工后：理由里指向**测试面**的引用不算坐标（当背景说明跳过）⇒ 只剩它一条时退化成「自由散文」。
+    // 两种文案都是红，断言接受任一（**行为**是「不给过」，不是「必须说某一句话」）。
     assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 test/probe.js:2' }], dir, detected).join('\n'),
-      /坐标指向测试代码/);
+      /坐标指向测试代码|自由散文/);
     assert.match(validateUnsupported([{ ...ok[0], at: 'test/probe.js:2' }], dir, detected).join('\n'), /坐标指向测试代码/);
     // ⑤ 真树：登记必须与扫描器**现在**的读数咬合，理由里必须有带行号的 JS 坐标
     const { unsupported: registered, problems } = loadEnvLegExceptions();
@@ -2439,20 +2457,24 @@ test('活二㉜ B-①.3 返工：行范围语法严格（`:10-` / `0-x` / 倒序
 test('活二㉝ B-② 返工：`unsupported` 的理由必须指到**这条动态读**或它的数据表声明行', () => {
   // #587 族 B 返工（审计第 4 条）：旧口径只要理由里有一个「含任意 env 名的合法行」就算过
   // ⇒ 堆一行无关代码就能豁免。
-  const real = { at: 'runner/worker.js:819', read: 'process.env[name]', reason: '' };
+  // 行号动态解析（同上）：`process.env[name]` 的读站点 / 字面量对数组 / 一条无关的 env 读行，都按内容找。
+  const dynLine = lineOf('runner/worker.js', 'process.env[name]');
+  const tableLine = lineOf('runner/worker.js', "['ERIX_DELEGATE_MAX'");
+  const unrelated = lineOf('runner/worker.js', 'process.env.ERIX_DELEGATE_ENABLED');
+  const real = { at: `runner/worker.js:${dynLine}`, read: 'process.env[name]', reason: '' };
   const withReason = (reason) => validateUnsupported([{ ...real, reason }], REPO_ROOT, null).join('\n');
   // ① 指到无关行（那行有 env 名、但跟 `process.env[name]` 无关）⇒ 红
   // ① 无关行：`runner/worker.js:800` 是**合法代码位**的 env 读（`process.env.ERIX_DELEGATE_ENABLED`），
   //    但它跟 `runner/worker.js:819` 的 `process.env[name]` 毫无关系 ⇒ 必须红
-  assert.match(withReason('随便一句，见 `runner/worker.js:800`'),
+  assert.match(withReason(`随便一句，见 \`runner/worker.js:${unrelated}\``),
     /没有一个引用指到这条动态读/, '拿无关行充数必须红');
   // ② 指到读站点本身 ⇒ 绿
   // ② 指到读站点本身 ⇒ **不因「相关性」被拒**（那行是动态读、没有字面 env 名，
   //    会撞上既有的「行证据」那把尺 —— 那是另一条判据，不是相关性判据的锅）
-  assert.doesNotMatch(withReason('读站点见 `runner/worker.js:819`'), /没有一个引用指到这条动态读/,
+  assert.doesNotMatch(withReason(`读站点见 \`runner/worker.js:${dynLine}\``), /没有一个引用指到这条动态读/,
     '覆盖读站点那一行必须算「相关」，不许被相关性判据拒');
   // ③ 指到数据表声明行（含动态 key 的标识符 `name`）⇒ 绿（盘上那条真登记就是这形）
-  assert.deepEqual(validateUnsupported([{ ...real, reason: '名字来自 `runner/worker.js:812-814` 的字面量对数组' }], REPO_ROOT, null), [],
+  assert.deepEqual(validateUnsupported([{ ...real, reason: `名字来自 \`runner/worker.js:${tableLine}-${tableLine + 2}\` 的字面量对数组` }], REPO_ROOT, null), [],
     '数据表声明行必须放行（否则真登记被杀）');
   // ④ 盘上那条真登记必须仍绿
   const doc = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'deploy/env-legs-exceptions.json'), 'utf8'));
