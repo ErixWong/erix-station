@@ -402,10 +402,14 @@ export async function updateProvider(gateway, name, { base_url, enabled, credent
   };
   const result = await client.updateCredential(name, body);
   return toProviderMutationResult(result, { name, info: body.credential_info, values });
+  // credential 变更（api_base / 凭据）会改模型目录里的条目
+  invalidateDataPlaneNameCache();
 }
 
 export async function deleteProvider(gateway, name) {
   return getGatewayClient(gateway).deleteCredential(name);
+  // credential 删除会连带删掉它名下的模型 ⇒ 目录变了
+  invalidateDataPlaneNameCache();
 }
 
 function validateMaxTokens(value) {
@@ -655,11 +659,15 @@ export async function createModel(gateway, input = {}) {
       .map(String),
   );
   try {
-    return await client.createModel({
+    const created = await client.createModel({
       model_name: normalizedModelName,
       litellm_params: params,
       model_info,
     });
+    // 新模型已进目录 ⇒ 让 TTL 缓存立刻跟上（否则用户 60s 内会收到误导性的
+    // 「模型已不存在」409，261118 实测）
+    invalidateDataPlaneNameCache();
+    return created;
   } catch (createError) {
     try {
       const modelsAfterFailure = gatewayModels(await client.listModels());
@@ -829,13 +837,18 @@ export async function updateModel(gateway, id, {
     }
     await client.updateModel(update);
   }
-  return toModel(await findGatewayModel(client, id));
+  const updated = toModel(await findGatewayModel(client, id));
+  // 改名/改参数都可能让目录里的 id↔name 映射变化 ⇒ 写路径一律失效
+  invalidateDataPlaneNameCache();
+  return updated;
 }
 
 export async function deleteModel(gateway, id) {
   const client = getGatewayClient(gateway);
   const current = await findGatewayModel(client, id);
-  return client.deleteModel(current.model_info?.id ?? id);
+  const result = await client.deleteModel(current.model_info?.id ?? id);
+  invalidateDataPlaneNameCache();
+  return result;
 }
 
 function slot(model_id, name, type) {
@@ -892,6 +905,24 @@ const HEARTBEAT_NAME_SLOTS = [
 
 /** Single-slot module TTL cache for the gateway model catalog (name map + per-name metadata). */
 const dataPlaneNameCache = { client: null, at: 0, map: null };
+
+/**
+ * 丢弃「数据面名 / id 映射」的 TTL 缓存。
+ *
+ * 为什么必须显式失效（261118 实测的真 bug）：缓存只有 TTL（60s）过期这一条出路，
+ * **写路径从不失效** ⇒ 管理员刚建好的模型，用户在最多 60 秒内发消息会撞
+ * `409 llm_model_not_found`，而文案是「绑定的主模型在 LLM 网关里**已不存在**」——
+ * 模型明明在目录里（同一时刻 `GET /model/info` 能查到），错误信息把「缓存旧」说成了
+ * 「模型没了」，运维会去查错方向。删除模型时反向同理（旧缓存里还在 ⇒ 放行）。
+ *
+ * 口径：**只在写路径调用**（create/update/delete model、credential 变更）；
+ * 读路径一律靠 TTL，别在热路径上加失效（心跳每 15s 一趟，失效等于每趟都打网关）。
+ */
+export function invalidateDataPlaneNameCache() {
+  dataPlaneNameCache.client = null;
+  dataPlaneNameCache.at = 0;
+  dataPlaneNameCache.map = null;
+}
 
 function errorStatus(error) {
   return error?.httpStatus ?? error?.status ?? error?.cause?.httpStatus ?? null;

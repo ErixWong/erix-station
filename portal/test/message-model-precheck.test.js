@@ -423,3 +423,40 @@ test('issue #261014 B2：体校验 400 优先于模型预检（未知 id 也先�
     await s.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// ④ 写路径必须失效 TTL 缓存（261118 真机 e2e 抓到的产品 bug）
+// ---------------------------------------------------------------------------
+//
+// 现场：管理员刚建好的模型，用户立刻发消息 ⇒ `409 llm_model_not_found`，文案「绑定的主模型在
+// LLM 网关里**已不存在**」——可同一时刻 `GET /model/info` 明明查得到它（wp6 诊断三方 id 全打出来了）。
+// 根因：`dataPlaneNameMap` 的模块级 TTL 缓存（60s）**只有过期这一条出路**，建/改/删模型都不失效
+// ⇒ 用户被一段过期快照挡在门外，且错误文案把人指向「模型没了」这个错方向。
+// 判据（行为面，不测内部函数名）：删掉网关里的模型后**立刻**再发一次消息，必须已经是 409，
+// 且网关被打第二次（说明缓存真的被丢了，而不是靠 60s 过期蒙对）。
+
+test('261118：deleteModel 之后 TTL 缓存立刻失效——删完再发消息立即 409（不用等 60s）', async () => {
+  const gateway = fakeGateway();
+  // 假网关补两个写路径方法：findGatewayModel 走 listModels，deleteModel 真把条目摘掉。
+  gateway.deleteModel = async (id) => {
+    gateway.state.models = { data: (gateway.state.models.data ?? []).filter((m) => m.model_info.id !== id) };
+    return { deleted: id };
+  };
+  const s = await startServer({ gateway });
+  try {
+    assert.equal((await postMessage(s, { content: 'a' })).status, 202, '第一发：三个槽位都在 ⇒ 放行');
+    assert.equal(gateway.state.calls, 1, '第一发打了一次 /model/info 并缓存');
+
+    await llm.deleteModel(gateway, 'mid-main');
+    // deleteModel 自己也会 listModels 一次（findGatewayModel）⇒ 以删除之后的读数为基准
+    const callsAfterDelete = gateway.state.calls;
+
+    const after = await postMessage(s, { content: 'b' });
+    assert.equal(after.status, 409, '删掉主模型后**立刻**发消息必须 409（旧缓存不许再放行）');
+    assert.equal((await after.json()).error.code, 'llm_model_not_found');
+    assert.equal(gateway.state.calls, callsAfterDelete + 1,
+      '写路径失效缓存 ⇒ 第二发必须重新打网关；若缓存没失效这里会停在 callsAfterDelete（靠 60s TTL 蒙对）');
+  } finally {
+    await s.close();
+  }
+});

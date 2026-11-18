@@ -312,6 +312,30 @@ async function sendMessageAndWait(alias, content, timeoutMs = 180000) {
     method: 'POST',
     body: JSON.stringify({ content }),
   });
+  if (response.status !== 202) {
+    // 失败现场取证：把「绑定行 / portal 模型目录 / LiteLLM 模型目录」三方 id 一次打全，
+    // 否则只看到 llm_model_not_found 无从判断是「没建进去」还是「id 口径不一致」。
+    const fde = FDE_NAMES[alias];
+    // 列名以 0010 迁移为准：main / embedding / vision 三槽（没有 small）
+    // 列名以 information_schema 现查为准：键列是 `fde_id`（不是 fde_name）
+    const binding = psql(`SELECT main_model_id || ' | ' || coalesce(main_model_name,'-') FROM fde_llm_bindings WHERE fde_id=(SELECT id FROM users WHERE fde_name='${fde}')`).trim();
+    const portalModels = await adminApi('/api/admin/llm/models');
+    const portalDump = (portalModels.body.items ?? []).map((m) => `${m.id}:${m.model_name}`).join(',');
+    let litellmDump = '(unreachable)';
+    try {
+      const master = process.env.LITELLM_MASTER_KEY;
+      litellmDump = docker(`exec ${process.env.STATION_LITELLM_NAME || 'station-litellm'} node -e ${JSON.stringify(
+        'fetch("http://127.0.0.1:4000/model/info",{headers:{Authorization:"Bearer "+process.env.LITELLM_MASTER_KEY}}).then(r=>r.json()).then(j=>console.log(JSON.stringify((j.data||[]).map(d=>d.model_info?.id+":"+d.model_name)))).catch(e=>console.log("ERR "+e.message))',
+      )}`).trim();
+      void master;
+    } catch (error) {
+      litellmDump = `(dump failed: ${error.message})`;
+    }
+    console.log(`[wp6][诊断] 发消息失败 status=${response.status} body=${JSON.stringify(response.body)}`);
+    console.log(`[wp6][诊断] fde_llm_bindings(main_model_id|main_model_name|small_model_id|small_model_name)=${binding}`);
+    console.log(`[wp6][诊断] portal /api/admin/llm/models = ${portalDump}`);
+    console.log(`[wp6][诊断] LiteLLM /model/info(id:name) = ${litellmDump}`);
+  }
   assert.equal(response.status, 202, `send message (${alias}): ${JSON.stringify(response.body)}`);
   const runId = response.body.run.id;
   const status = await waitFor(() => {
@@ -478,10 +502,33 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
       if (present.length) docker(`network rm ${present.join(' ')}`);
     });
     // issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；compose/docker build 按需失效缓存）。
-    teardown('rm -rf userspace 临时目录', () => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
-    teardown('rm -rf dynamic 临时目录', () => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
-    teardown('rm -rf static 临时目录', () => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
-    teardown('rm -rf artifacts 临时目录', () => fs.rmSync(S.artifactsRoot, { recursive: true, force: true }));
+    // ⚠ FDE 容器（uid≠宿主）会在 userspace 下建 `platform/git` 之类子目录，宿主 `rmSync` 直接
+    // EACCES（261118 实测：正文断言全过、却挂在清场 ⇒ 一条本该全绿的 e2e 被判红）。
+    // 口径与 wp2a 同一份：先 chmod 走一遍，删不掉再借容器里的 root 删。
+    const rmTree = (dir) => {
+      if (!dir || !fs.existsSync(dir)) return;
+      const fix = (d) => {
+        let ents = [];
+        try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { /* 读不了就直接 chmod */ }
+        try { fs.chmodSync(d, 0o700); } catch { /* 非属主时 chmod 也会失败，交给下面的 rm 报 */ }
+        for (const e of ents) if (e.isDirectory()) fix(path.join(d, e.name));
+      };
+      fix(dir);
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      } catch (error) {
+        const image = process.env.FDE_IMAGE || process.env.STATION_PORTAL_IMAGE;
+        if (!image) throw error;
+        execSync(`docker run --rm --user 0 --entrypoint sh -v ${JSON.stringify(`${dir}:/x`)} ${image} -c 'rm -rf /x/* /x/.[!.]* 2>/dev/null || true'`, {
+          stdio: 'pipe',
+        });
+        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      }
+    };
+    teardown('rm -rf userspace 临时目录', () => rmTree(S.userspaceRoot));
+    teardown('rm -rf dynamic 临时目录', () => rmTree(S.dynamicRoot));
+    teardown('rm -rf static 临时目录', () => rmTree(S.staticRoot));
+    teardown('rm -rf artifacts 临时目录', () => rmTree(S.artifactsRoot));
     // lib 的 removeDbDir 对 docker 失败不抛（teardown 语义），以返回 null 记失败——这里翻译成显式失败。
     teardown('removeDbDir', () => {
       if (removeDbDir() === null) throw new Error('lib removeDbDir 返回 null（docker 删除执行失败，STATION_DB_DIR 未清掉）');
