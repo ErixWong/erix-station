@@ -168,6 +168,9 @@ const S = {
   artifactsRoot: null,
   staticFile: null,
   password: 'correct horse battery staple',
+  // 管理台代设口令后产品要求改口令，且**新旧不许相同** ⇒ 这个是用例里统一改成的那个值
+  password2: 'correct horse battery staple v2',
+  userPassword: {},   // loginName -> 改口令之后的口令（login 的缺省值从这里取）
   adminCookie: null,
   gitHostId: null,
   onboardingLlm: null,
@@ -186,7 +189,7 @@ function fdeContainer(alias) {
   return `fde-${FDE_NAMES[alias]}`;
 }
 
-async function login(loginName, secret, password = S.password) {
+async function login(loginName, secret, password = (S.userPassword?.[loginName] ?? S.password)) {
   const step1 = await fetch(`${PORTAL}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -260,10 +263,13 @@ async function createFdeUser(loginName) {
   // `password_change_required`，261117 实测）。这是**产品行为，不是 bug**，所以用例要按真实用户
   // 走一遍改口令：登录拿到 cookie 后调 `POST /api/me/password` 把标记清掉，再继续后续断言。
   // （不这么做的替代方案是往库里塞 `password_changed_at`，那等于绕过被测行为，判据会失真。）
-  const firstLogin = await login(loginName, response.body.totp_secret);
+  S.userPassword[loginName] = S.password2;
+  const firstLogin = await login(loginName, response.body.totp_secret, S.password);
   const changed = await api(firstLogin, '/api/me/password', {
     method: 'POST',
-    body: JSON.stringify({ current_password: S.password, new_password: S.password }),
+    // 产品还禁止「新口令与当前相同」（400 validation_failed）⇒ 改成一个**不同的**固定值，
+    // 并按用户记下来（后面的 login 用它）。这是被测行为的一部分，不是绕过。
+    body: JSON.stringify({ current_password: S.password, new_password: S.password2 }),
   });
   assert.equal(changed.status, 200, `clear password_change_required for ${loginName}: ${JSON.stringify(changed.body)}`);
   assert.ok(response.body.totp_secret, 'opt-in TOTP：totp_enabled=true 时种子只在下发一次的创建响应里出现');

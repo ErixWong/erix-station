@@ -506,9 +506,10 @@ test('WP4 验收（收窄）：跨 FDE 隔离 / strip-cookie 不透传 / 未路�
         return res.status === '200' ? res : null;
       }, { label: `带预览 cookie 命中 echo 200 (${alice.hostname})`, timeoutMs: 60000 });
       const echoed = JSON.parse(ok200.body);
-      assert.equal(echoed.headers.host, alice.hostname, 'echo 回显 Host = 该预览 host（确实代理到本 FDE 后端）');
-      assert.equal(echoed.headers['x-auth-user'], alice.fdeName, 'X-Auth-User 由 forwardAuth 放行后透传（证明走放行分支而非绕过边缘）');
-      assert.equal(echoed.headers.cookie ?? '', '', '断言② strip-cookie：边缘把请求侧 Cookie 整头剥掉，应用看不到平台 cookie');
+      // 本脚本的 echo 直接回显 q.headers（不像 wp2a 的探针包一层 {headers}），所以字段就在顶层。
+      assert.equal(echoed.host, alice.hostname, 'echo 回显 Host = 该预览 host（确实代理到本 FDE 后端）');
+      assert.equal(echoed['x-auth-user'], alice.fdeName, 'X-Auth-User 由 forwardAuth 放行后透传（证明走放行分支而非绕过边缘）');
+      assert.equal(echoed.cookie ?? '', '', '断言② strip-cookie：边缘把请求侧 Cookie 整头剥掉，应用看不到平台 cookie');
       console.log('[wp4] ② strip-cookie OK（带预览 cookie 200，上游 echo 无 cookie 头）');
     });
 
