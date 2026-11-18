@@ -104,6 +104,9 @@ export const CRITERION = Object.freeze(['terminal', 'silent', 'tick', 'mechanica
 export const SKIPPED_REASON = Object.freeze([
   'budget_exhausted', 'quiet_hours', 'human_present', 'run_in_progress',
   'deferred', 'deferred_timeout', 'active_run_in_cwd', 'cancelled_by_user',
+  // issue #676（丙=止血）：M9 降级为「只出事实、不下判决」——审查暂不可用（快照方案待定，见 #673）。
+  // 这一档同样是「为什么没做」，不是错误码。
+  'review_unavailable',
 ]);
 /** 归一化后的结果判定；原话留在 `verdict_raw`，口径改了可以回溯重算。 */
 export const VERDICT = Object.freeze(['pass', 'red', 'no-op-claim', 'needs-human', 'unclassified']);

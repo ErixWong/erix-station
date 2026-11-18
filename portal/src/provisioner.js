@@ -20,6 +20,8 @@ import { enqueueRouteChange } from './outbox.js';
 import { provisionFdePreviewPorts } from './portalloc.js';
 import { allocSeq } from './seq.js';
 import { broadcastRevoke, drainQueueAfterRun, runEndPartialKeys, retirePartialBuffer } from './internal.js';
+// issue #676：bind mount 表（含宿主子目录 / 容器目标）的单一真值——不再在本文件拄一遍。
+import { buildJailBinds, JAIL_RUN_CWD_HOST_SUFFIXES } from '../shared/jail-mounts.js';
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
 import { removeGitCredentialFile, setGitCredential, platformCredentialPresent, migrateLegacyCredential } from './git-credential.js';
 import { mintGitAccount } from './git-mint.js';
@@ -207,17 +209,10 @@ export function buildContainerConfig({
   runUser = null, // '1001:1000' 等；镜像不具备双 UID 用户时用 --user 兜底（FDE_DEV_USER，⚠️ dev 偏差）
   capAdd = ['SETUID', 'SETGID', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'KILL'], // 契约 §6.2：root 启动→drop 1001、fork 1002 所需最小集（含跨 UID kill 的 CAP_KILL）
 }) {
-  const home = `/home/${homeUser}`;
   const hostRoot = path.join(path.resolve(userSpaceRoot), fdeName);
-  const binds = [
-    `${hostRoot}/home:${home}`,
-    `${hostRoot}/projects:${home}/projects`,
-    `${hostRoot}/cache:${home}/cache`,
-    // #399：平台托管的 git 凭据——**挂目录不挂文件**（bind 不存在的文件 Docker 会造目录），
-    // 只读：容器内 agent 连 root 都写不动，git 的「认证被拒 ⇒ erase」再也删不掉那行。
-    // 镜像 /etc/gitconfig 的 fill-only helper 读 /run/erix/git/credentials（system 级、排 store 前）。
-    `${hostRoot}/platform/git:/run/erix/git:ro`,
-  ];
+  // #676：挂载点单一真值表（`shared/jail-mounts.js`）——home / projects / cache + 平台 git（ro）。
+  //   #399：平台托管的 git 凭据——挂目录不挂文件、只读（bind 不存在的文件 Docker 会造目录）。
+  const binds = buildJailBinds({ hostRoot, homeUser });
   // P3 纵深防御：bind source realpath 后必须仍在 userSpaceRoot 内（防 symlink 逃逸）。
   for (const b of binds) assertBindSourceInsideRoot(userSpaceRoot, b.split(':')[0]);
   const body = {
@@ -300,7 +295,7 @@ export function buildNetworkConfig({ name, subnet, gateway, fdeName, stackId = '
 export function ensureUserSpaceMountDirs({ userSpaceRoot, fdeName, uid, gid, log = console }) {
   const root = path.resolve(userSpaceRoot);
   const fdeRoot = path.join(root, fdeName);
-  for (const sub of ['home', 'projects', 'cache']) {
+  for (const sub of JAIL_RUN_CWD_HOST_SUFFIXES) { // home / projects / cache（单一真值，#676）
     ensureDirSafe(root, path.join(fdeRoot, sub), { mode: 0o2770, uid, gid, log });
   }
   // #399：平台托管凭据目录（portal 独占写；ro bind 进容器 /run/erix/git）。
