@@ -102,9 +102,9 @@ describe('AdminLayout tab 导航（#449 邮件通道）', () => {
 
     // 裸路由把 tab 桩成 `/<name>`，所以 href 是 `/admin-mail`（真实应用里是 `/admin/mail`，
     // 路由表那条由本用例末尾的 `routes` 断言钉住）。
-    // ⚠ 9 = 到号池占用为止（#596 的 prompts 与 #595 的 market 两颗 tab 都插在 upload 与 pool
-    //   之间 ⇒ 原本窗口里的 8 格多了一格；本用例只钉 mail 的相邻，多带一格不影响判据）。
-    const links = wrapper.findAll('nav a').slice(0, 9);
+    // ⚠ 10 = 到号池占用为止（#596 的 prompts、#595 的 market、#650 的 system 三颗 tab 都插在
+    //   upload 与 pool 之间 ⇒ 原本窗口里的 8 格多了两格；本用例只钉 mail 的相邻，多带不影响判据）。
+    const links = wrapper.findAll('nav a').slice(0, 10);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-mail');
 
@@ -141,7 +141,7 @@ describe('AdminLayout tab 导航（#456 证书页）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 9);
+    const links = wrapper.findAll('nav a').slice(0, 10);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-tls');
 
@@ -177,7 +177,7 @@ describe('AdminLayout tab 导航（#485 片 A 上传上限）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 9);
+    const links = wrapper.findAll('nav a').slice(0, 10);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-upload');
     expect(links.find((link) => link.attributes('href') === '/admin-upload')!.text()).toBe('上传上限');
@@ -186,14 +186,15 @@ describe('AdminLayout tab 导航（#485 片 A 上传上限）', () => {
     // ⚠ #595 在 upload 与 pool 之间插了「能力市场」、#596 片 B 又插了「提示词」⇒ 这里的相邻判据
     //    同步改（精确相邻由下面两条各自钉）。
     expect(hrefs.indexOf('/admin-upload')).toBe(hrefs.indexOf('/admin-tls') + 1);
-    // ⚠ 两条并行单各自往 upload 与 pool 之间插了一颗 tab ⇒ 合并后顺序固定为
-    //    upload → prompts → market → pool，两边「紧接 upload 之后」的旧相邻各让一步（同一个形状：
-    //    以前 #485 插 upload 时也改掉过 #456 那条）。判据本身（存在 + 指向 + 在号池之前）一个字没让。
+    // ⚠ 三颗 tab 分别由 #595 / #596 / #650 插在 upload 与 pool 之间 ⇒ 合并后顺序固定为
+    //    upload → prompts → market → system → pool，旧「紧接 upload 之后」的相邻各让一步
+    //    （同一个形状：以前 #485 插 upload 时也改掉过 #456 那条）。判据本身（存在 + 指向 + 在号池之前）一个字没让。
     expect(hrefs.indexOf('/admin-prompts')).toBe(hrefs.indexOf('/admin-upload') + 1);
     expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-prompts') + 1);
-    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-market') + 1);
+    expect(hrefs.indexOf('/admin-system')).toBe(hrefs.indexOf('/admin-market') + 1);
+    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-system') + 1);
     // tab 总数：这一格是「加 tab 必须同步改本文件桩路由」那条红线的正面（漏改 ⇒ 挂载就抛，不会走到这里）
-    expect(hrefs).toHaveLength(9);
+    expect(hrefs).toHaveLength(10);
 
     // 路由表本身：`/admin` 的 children 里有 `upload` → `admin-upload`，懒加载且要求 admin 角色
     const adminRoute = routes.find((route) => route.path === '/admin')!;
@@ -217,7 +218,7 @@ describe('AdminLayout tab 导航（#596 片 B 提示词面板）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 9);
+    const links = wrapper.findAll('nav a').slice(0, 10);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-prompts');
     expect(links.find((link) => link.attributes('href') === '/admin-prompts')!.text()).toBe('提示词');
@@ -255,11 +256,11 @@ describe('AdminLayout tab 导航（#595 能力市场）', () => {
     expect(hrefs).toContain('/admin-market');
     expect(links.find((link) => link.attributes('href') === '/admin-market')!.text()).toBe('能力市场');
 
-    // 精确相邻：prompts → **market** → pool（market 只插在平台配置段末尾，pool 仍是该段末尾）
-    // ⚠ 原判据是「upload → market → pool」；#596 的「提示词」与本单并行落地、插在 upload 与
-    //    market 之间 ⇒ 前一条相邻改成「prompts → market」；「market 紧挨 pool 之前」原样保留。
+    // 精确相邻：prompts → **market** → system → pool（#596 的提示词在 market 之前、#650 的系统在
+    // market 之后；pool 仍是平台配置段的末尾）
     expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-prompts') + 1);
-    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-market') + 1);
+    expect(hrefs.indexOf('/admin-system')).toBe(hrefs.indexOf('/admin-market') + 1);
+    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-system') + 1);
 
     // 路由表本身：`/admin` 的 children 里有 `market` → `admin-market`，懒加载且要求 admin 角色
     const adminRoute = routes.find((route) => route.path === '/admin')!;
@@ -267,6 +268,37 @@ describe('AdminLayout tab 导航（#595 能力市场）', () => {
     expect(marketRoute.path).toBe('market');
     expect(marketRoute.meta).toEqual({ requiresRole: 'admin' });
     expect(typeof marketRoute.component).toBe('function');
+  });
+});
+
+// issue #650：新 tab「系统」必须真在导航里且指向 `admin-system`（同 #449/#456/#485/#595 的判据形状：
+// 只加路由不加 tab ⇒ 这一页在管理台里没有入口，等于没做）。
+describe('AdminLayout tab 导航（#650 系统监控）', () => {
+  it('导航里有「系统」，指向 admin-system，排在能力市场之后、号池占用之前', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
+    const auth = useAuthStore();
+    auth.user = ADMIN_WITH_SEAT as never;
+    auth.ready = true;
+    const router = makeRouter();
+    router.push('/');
+    await router.isReady();
+    const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
+
+    const links = wrapper.findAll('nav a');
+    const hrefs = links.map((link) => link.attributes('href'));
+    expect(hrefs).toContain('/admin-system');
+    expect(links.find((link) => link.attributes('href') === '/admin-system')!.text()).toBe('系统');
+
+    // 精确相邻：market → **system** → pool（只读运维快照与号池占用挨在一起，且 system 在 pool 之前）
+    expect(hrefs.indexOf('/admin-system')).toBe(hrefs.indexOf('/admin-market') + 1);
+    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-system') + 1);
+
+    // 路由表本身：`/admin` 的 children 里有 `system` → `admin-system`，懒加载且要求 admin 角色
+    const adminRoute = routes.find((route) => route.path === '/admin')!;
+    const systemRoute = (adminRoute.children ?? []).find((child) => child.name === 'admin-system')!;
+    expect(systemRoute.path).toBe('system');
+    expect(systemRoute.meta).toEqual({ requiresRole: 'admin' });
+    expect(typeof systemRoute.component).toBe('function');
   });
 });
 

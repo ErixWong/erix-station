@@ -10,6 +10,11 @@ import crypto from 'node:crypto';
 import { EVENT_TIER_STREAM, eventTierOf } from 'erix-agent'; // issue #502：碎片档的**唯一**判据来自引擎分级表
 import { hashToken, audit } from './auth.js';
 import { purgeExpired } from './idempotency.js';
+// issue #650：宿主指标保留期清理挂**本文件已有的小时级清理槽**（与幂等键 TTL 同一槽）。
+// ⚠ 这行 import 新开了一条循环引用：`internal → system-metrics → provisioner → internal`。它是安全的：
+//   两侧用到的都是**函数声明**（提升）且都只在运行期调用，模块初始化期不读对方导出的 `const`；
+//   由 `portal/test/idle-backoff-520.test.js`（真进 internal.js）与 `system-metrics.test.js` 两侧单测兼面。
+import { purgeSystemMetrics } from './system-metrics.js';
 import { allocSeq } from './seq.js';
 import { snapshotQueuedInputs, drainAfterRunTerminal } from './queued-inputs.js'; // #370
 import { getFdeLlmHeartbeatModels } from './llm.js';
@@ -2649,6 +2654,9 @@ export function startReaperLoop(pool, {
   log = console,
   sleep = sleepCancellable,
   now = () => Date.now(),
+  // issue #650：宿主指标保留期清理。两个旋钮由调用方（`cli.js serve`）从 `config.systemMetrics` 递过来；
+  // **默认 `null` = 不挂这一支**，单测与旧调用点（`startReaperLoop(pool)`）一行不改也不会多一条 SQL。
+  systemMetricsRetentionDays = null,
 } = {}) {
   let lastPurgeAt = 0;
   const abort = new AbortController();
@@ -2669,6 +2677,22 @@ export function startReaperLoop(pool, {
           if (purged > 0) log.log?.(`[reaper] purged ${purged} expired idempotency_keys`);
         } catch (err) {
           log.warn?.(`[reaper] idempotency purge error: ${err.message}`);
+        }
+        // issue #650：宿主指标保留期清理挂**同一个槽**（一小时一个事务，而不是一拍一个）。
+        // 磁盘行靠 `system_metrics_disks` 的 `ON DELETE CASCADE` 跟着走，所以只需一句 DELETE。
+        // 失败只 warn：历史图少清一小时不会弄坑任何东西，而 reaper 的主职（租约回收）不许被它拖住。
+        if (systemMetricsRetentionDays) {
+          try {
+            const purged = await purgeSystemMetrics(pool, {
+              retentionDays: systemMetricsRetentionDays,
+            });
+            if (purged > 0) {
+              const days = systemMetricsRetentionDays;
+              log.log?.(`[reaper] purged ${purged} system_metrics rows older than ${days}d`);
+            }
+          } catch (err) {
+            log.warn?.(`[reaper] system_metrics purge error: ${err?.message ?? err}`);
+          }
         }
       }
       // 节拍不变（15s），但**可中断**：`stop()` 不必再等完这一拍（#506 评审③同口径）。

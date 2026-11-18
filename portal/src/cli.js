@@ -17,6 +17,9 @@ import { startMacroEvalLoop } from './macro-eval.js';
 // issue #616：意图消费者（dispatcher）与超时回收 loop——评估循环只产意图，执行/收尾在这里接线。
 import { createIntentDispatcher, startPendingSweepLoop } from './macro-dispatcher.js';
 import { startReaperLoop, notifySessionEvents } from './internal.js';
+// issue #650：宿主资源采样器。**只在 `serve` 里启动**（`createServer` 不启动它）——否则每一个
+// 拿 `createServer` 的单测都会被一个 unref 定时器拖住（拍里还会读真实 `/proc` 与 DB）。
+import { startMetricsSampler } from './system-metrics.js';
 import { gracefulShutdown, SHUTDOWN_LOOPS_MS_DEFAULT } from './shutdown.js';
 import {
   createDockerClient,
@@ -99,7 +102,22 @@ async function serve() {
   // issue #616 要求④：超时回收清扫单独起 loop（职责与评估不同，不合并）；pending 超阈→failed。
   const macroSweepLoop = startPendingSweepLoop(pool, config);
   const provisionerLoop = startProvisionerLoop(pool, config);
-  const reaperLoop = startReaperLoop(pool);
+  // issue #650：宿主指标的保留期清理**不单开循环**，挂 reaper 已有的小时级清理槽（一小时一个事务）。
+  // `ENABLED=0` 时也照清：采样停了但旧行还得按保留期缩，否则「关掉采样」反而让表永远堆在那儿。
+  const reaperLoop = startReaperLoop(pool, {
+    systemMetricsRetentionDays: config.systemMetrics?.retentionDays ?? null,
+  });
+  // issue #650：宿主资源采样器（CPU/内存/磁盘/容器数）。与其余 reconciler 同形：只在 `serve` 里起、
+  // 挂进 `loops` 走关停路径。`SYSTEM_METRICS_ENABLED=0` 时 `startMetricsSampler` **不建定时器**（它
+  // 自己看 `config.systemMetrics.enabled`），因此那一支既不写库也不拖住退出；但句柄仍然要起，因为
+  // `GET /api/admin/system/metrics` 需要一个存在的 `latest()`（它回 `null`，不是 500）。
+  // 拍本身不读未注环境的真实环境：`/proc` + `statfs` + docker socket 都是容器里就有的宿主读数（issue #650 实测）。
+  const metricsSampler = startMetricsSampler({ pool, config, log: console });
+  // `GET /api/admin/system/metrics` 的 `latest` 格要读它（口径：`latest` 与 `series` 是**同一个**采样器的
+  // 两份读数，不是两份真相）。递送方式照 #616 的 `config.onMacroIntents` 同一条通道：`ctx.config` 与这里
+  // 的 `config` 是**同一个对象引用**，而 `serve` 同步跑完这一行才 `listen` ⇒ 不可能有请求早于它。
+  // ⚠ **不在 `http.js` 里新建采样器**（那会绕过 `ENABLED=0` 与关停接线，还可能重复起 sweep）。
+  config.metricsSampler = metricsSampler;
   server.listen(config.port, config.host, () => {
     // eslint-disable-next-line no-console
     console.log(
@@ -132,6 +150,10 @@ async function serve() {
     { name: 'macro-sweep', ...macroSweepLoop },
     { name: 'provisioner', ...provisionerLoop },
     { name: 'reaper', ...reaperLoop },
+    // issue #650：采样器只供 `stop()`（它的定时器已 `unref()`，且拍内没有可 await 的 `done`——
+    // `gracefulShutdown` 对缺 `done` 的循环直接跳过，不会多等）。写失败只 warn 的口径下，
+    // 停机时丢掉在途那一拍是可接受的（下一拍 `ON CONFLICT DO NOTHING` 重放，不丢正确性）。
+    { name: 'system-metrics', ...metricsSampler },
   ];
   let shuttingDown = false;
   const shutdown = async () => {
