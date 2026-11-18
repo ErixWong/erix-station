@@ -1,72 +1,118 @@
-// WP4 端到端验收（issue #13 walking skeleton 里程碑）：一条命令跑通 + 6 条真机断言。
-// 断言清单（issue #13）：① 跨 FDE 隔离 ② 未认证 403 ③ cookie 不透传上游 ④ 未分配端口不可达 ⑤ 事件落 DB ⑥ SSE 收到。
-// 拓扑：FDE alice = 真实 runner 镜像（agentd 跑 run，断言 ⑤⑥）；FDE bob = 同镜像 + docker exec 起 echo server（断言 ①②③④）。
-// 依据：docs/design/fde-platform.md §8/§9、topology.md §4-L3/§5、portal.md §2.7/§2.8/§9。
-// ⚠️ 不可与其它 e2e 并行：会 down 掉本机 station 栈、删 /docker/station-db（或 STATION_DB_DIR）。
-// ⚠️ e2e 前置：**必须导出 `HTTP_PROXY`/`HTTPS_PROXY`**（FDE 镜像构建要联网下 gh/tea/glab）；
-//   隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）——本脚本**绝不删除共享镜像 tag**
-//   （issue #178，口径集中在 lib/fde-image.mjs）。
+// WP4 验收（#661 收窄重写）：只保留 wp4 **真正独有**的三条真机断言。
+//
+// 为什么收窄：旧版 6 条断言里只有 3 条没被其它脚本覆盖，其余是重复造轮子（且旧版用硬编码端口
+// PORTAL=127.0.0.1:18080 / TRAEFIK_WEB=127.0.0.1:8090 与共享栈 compose 形态，在隔离栈 28080/18090 上
+// 必然 401/打错栈）。这版**登录 / 种子 / 起栈 / provision-fde 全部照抄 wp2a-e2e.mjs 那套已跑通的实现**
+// （readCookie / insertUser / login / assertIsolatedEnvironment + writeTraefikStatic + writeDynamicStub +
+//  派生 env + compose up + provision-fde），不另写第二套。
+//
+// 保留的三条（wp4 的独有价）：
+//   ① 跨 FDE 隔离（D3「每 FDE 一网」）：provision 两个栈内 FDE（alice=FDE_NAME / bob=<栈id>bob），
+//      双向都有真实 echo 监听的前提下，从一侧容器打另一侧 backend IP:port ⇒ 必须是**网络不可达类**
+//      失败（BLOCKED / 超时），**不许**是 ECONNREFUSED（被拒=包已到达对端=隔离失败）；且两 FDE 网络
+//      不同、各是池内一块独占小网段、且都不 publish 端口（D4）。
+//   ② 预览 cookie 不透传上游（strip-cookie）：带预览 cookie 命中 200 时，上游 echo 探针**收不到**
+//      `cookie` 头（边缘 forwardAuth 放行 + strip-cookie 中间件把请求侧 Cookie 整头剥掉）。
+//   ③ 未路由 Host ⇒ 404：一个没被分配的 Host 打到边缘必须 404（不是 403、不是 200）。
+//
+// 删掉的断言 → 由谁覆盖（不静默删）：
+//   · 未认证 403 + `preview_ticket_required`（含 deny CORS 头）→ **wp2a ⑥**
+//   · 同块未分配端口 → 404、路由 backend 恒 .2:port、routes.yml 精确 subnet → **wp3a**
+//   · 签票 302→cookie、allocated→active、事件落 DB（run_events）→ **wp2a ⑦ / wp3a**
+//   · SSE 下行 ping + token_revoked 收敛退出、deprovision 只回收本 FDE → **wp2a ⑧ / wp3b**
+//   · POST /api/projects 410（项目 API 退役）、userspace/端口下发 → **wp2a ①②③**
+//   · LLM binding / mock LLM runner（旧 ⑤⑥ 的前置）→ **wp5 / wp6**
+//
+// 运行（必须带隔离 env，否则护栏在第一条 docker 之前硬失败；见 lib/isolated-env.mjs）：
+//   rm -rf /tmp/station-db-<栈id>        # 必清：上一轮 alice 残留会撞 users_login_key + 旧 TOTP 让 step2 401
+//   source <隔离 env>
+//   node portal/integration/wp4-acceptance.mjs
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execSync, spawn } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
-import { ensureLlmBinding } from './lib/llm-binding.mjs';
+import { parseCidr, intToIp } from '../src/ipam.js';
+import { BASE_DOMAIN, composeDomainEnv } from './lib/compose-domain.mjs';
 import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
-// issue #495 ①（#412 遗留）：compose 的 `--env-file` 与「等宿主侧物化文件」的失败分类（唯一定义处 lib/e2e-preflight.mjs）。
+import {
+  assertHostPortsAvailable, applyStackIpamPoolEnv, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  writeDynamicStub, deriveIsolationComposeEnv, deriveFdeIpamPools, memoizeOnce,
+} from './lib/isolated-env.mjs';
 import { COMPOSE_ENV_FILE, assertComposeEnvFile } from './lib/e2e-preflight.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-// #227.2：显式 -p 把「我就是要动共享栈 station」写进命令（不再靠 compose 文件 name: 的隐式兜底；
-// 设了 COMPOSE_PROJECT_NAME 则显式改用该 project）。
-const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:-station}" --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
-// issue #495 ①：上面命令串固定带 --env-file deploy/.env，而它不入 git ⇒ git worktree / 新 clone 里
-// 必然缺。docker compose 要到**整轮镜像构建之后**才报 couldn't find env file（#412 部署机实测白烧 10.7 分钟），
-// 所以这条预检放在模块加载时——它先于本文件任何一次 docker/compose；文件在场时零输出。
+// compose 一律显式 -p（${VAR:?} 未 export 即非零退出点名），env-file + compose 文件同 wp2a。
+const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME required for isolated e2e}" --env-file deploy/.env -f deploy/docker-compose.yml';
+// 模块加载即检 env-file 在场（先于本文件任何一次 docker/compose）。
 assertComposeEnvFile({ envFile: COMPOSE_ENV_FILE, cwd: REPO_ROOT, label: 'wp4-acceptance' });
-const PORTAL = 'http://127.0.0.1:18080';
-const TRAEFIK_WEB = 'http://127.0.0.1:8090';
+// 两腿一次派生（放行面 + 分配段同值）。
+applyStackIpamPoolEnv(process.env);
+
+// —— 入口句柄全部 env 派生（缺省值只为可读，隔离跑法由护栏强制显式传）——
+const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
+const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
+const TRAEFIK_WEB_PORT = process.env.TRAEFIK_WEB_PORT || '8090';
+const TRAEFIK_WEBSECURE_PORT = process.env.TRAEFIK_WEBSECURE_PORT || '8443';
+const TRAEFIK_WEB = `http://127.0.0.1:${TRAEFIK_WEB_PORT}`;
+const DOMAIN_COMPOSE_ENV = composeDomainEnv(TRAEFIK_WEB_PORT);
+const STATION_DB_NAME = process.env.STATION_DB_NAME || 'station-db';
+const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
 const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
 
+// 两个**栈内** FDE（命名含栈 id，避免与共享栈 fde-alice/fde-bob 互删）：
+//   alice = env.FDE_NAME（起栈 env 提供，如 e2e587alice）；bob = `<栈id>bob`（本脚本自造）。
+const STACK_ID = process.env.STATION_STACK_ID;
+const FDE_A = process.env.FDE_NAME || 'alice';
+const FDE_B = `${STACK_ID}bob`;
+// bob 也要进护栏的 fdeNames 校验：护栏对每个 entry 要求 value 含栈 id + 唯一 + 安全名，并要求其
+// `env` 键在环境里存在（不要求 env 键值==value）。故显式注入一个合成键。
+process.env.FDE_B_NAME = FDE_B;
+const FDE_CONTAINER_A = `fde-${FDE_A}`;
+const FDE_CONTAINER_B = `fde-${FDE_B}`;
+
+// 本栈 FDE 网段必须落在派生保留段内（如 10.201.N.0/24）；FDE_POOL=large ⇒ 每 FDE 一块 /28。
+const POOL_SEGMENT = STACK_ID ? deriveFdeIpamPools(STACK_ID) : null;
+const POOL_PREFIX = POOL_SEGMENT ? POOL_SEGMENT.split('.').slice(0, 3).join('.') : null;
+
+const isolationComposeEnv = memoizeOnce(() => (process.env.IPAM_RESERVED_SUBNETS
+  ? {}
+  : deriveIsolationComposeEnv({ docker, ownFdeNetwork: FDE_CONTAINER_A })));
+
+// —— 下列辅助函数与 wp2a-e2e.mjs 同一份实现（换行/引号坑见 wp2a F-6 注释）——
+function sgWrapped(cmd) {
+  if (/\n|\r/.test(cmd)) {
+    throw new Error(`经 sg/JSON.stringify 层的命令不得含换行: ${JSON.stringify(cmd)}`);
+  }
+  return `sg docker -c ${JSON.stringify(cmd)}`;
+}
+
 function docker(args) {
-  return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
-    encoding: 'utf8',
-    stdio: 'pipe',
-    cwd: REPO_ROOT,
-  });
+  return execSync(sgWrapped(`docker ${args}`), { encoding: 'utf8', stdio: 'pipe', cwd: REPO_ROOT });
 }
 
 function dockerStdin(args, input) {
-  return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
-    encoding: 'utf8',
-    input,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    cwd: REPO_ROOT,
-  });
+  return execSync(sgWrapped(`docker ${args}`), { encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'], cwd: REPO_ROOT });
 }
 
-// M6：DB 数据目录可参数化（STATION_DB_DIR，与 deploy/docker-compose.yml 的挂载一致），
-// 不再硬删共享固定路径 /docker/station-db——并行跑/多栈场景互不误伤。
-const DB_DIR = (process.env.STATION_DB_DIR || '/docker/station-db').replace(/\/+$/, '');
-/** 库容器的名字：隔离跑法必须用自己的（station-db-<栈 id>），否则会往共享 dev 库写（#661 实测）。 */
-const DB_CONTAINER = process.env.STATION_DB_NAME || 'station-db';
-function removeDbDir() {
-  const parent = path.posix.dirname(DB_DIR);
-  const name = path.posix.basename(DB_DIR);
-  safe(() => docker(`run --rm -v ${JSON.stringify(parent)}:/host alpine rm -rf ${JSON.stringify(`/host/${name}`)}`));
-}
+const { removeDbDir } = createDbDirCleaner({ docker });
 
 function compose(args, env = {}) {
-  return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, {
+  return execSync(sgWrapped(`${COMPOSE} ${args}`), {
     encoding: 'utf8',
     stdio: 'pipe',
     cwd: REPO_ROOT,
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...DOMAIN_COMPOSE_ENV, ...isolationComposeEnv(), ...stackPaths(), ...env },
   });
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function safe(fn) {
@@ -77,387 +123,403 @@ function safe(fn) {
   }
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function waitFor(fn, { label, timeoutMs, intervalMs = 100 }) {
-  const t0 = Date.now();
-  return new Promise((resolve, reject) => {
-    const tick = async () => {
-      try {
-        const v = await fn();
-        if (v) return resolve(v);
-      } catch { /* retry */ }
-      if (Date.now() - t0 > timeoutMs) return reject(new Error(`timeout: ${label}`));
-      setTimeout(tick, intervalMs);
-    };
-    tick();
-  });
-}
-
-function psql(query) {
-  // #661（261117 实测）：这里原先把容器名**写死成 station-db**（共享 dev 库）⇒ 隔离跑法下
-  // 种子数据会打进**生产/dev 库**（实测报 users_login_key 重复 —— 那是 dev 库里已有的 alice）。
-  // 容器名必须从 env 派生：隔离栈是 station-db-<栈 id>。
-  return docker(`exec ${DB_CONTAINER} psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
-}
-
-function psqlStdin(sql) {
-  dockerStdin(`exec -i ${DB_CONTAINER} psql -U station -d station -v ON_ERROR_STOP=1`, sql);
+async function waitFor(fn, { timeoutMs = 120000, intervalMs = 500, label = 'condition' } = {}) {
+  const start = Date.now();
+  let lastErr;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const v = await fn();
+      if (v) return v;
+    } catch (e) {
+      lastErr = e;
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`timeout waiting for ${label}${lastErr ? `: ${lastErr.message}` : ''}`);
 }
 
 function readCookie(setCookie) {
-  const m = /fde_session_dev=([^;]+)/.exec(setCookie ?? '');
-  return m ? m[1] : null;
+  const first = (setCookie || '').split(',')[0];
+  const nameVal = first.split(';')[0];
+  const idx = nameVal.indexOf('=');
+  return nameVal.slice(idx + 1);
+}
+
+function psql(query) {
+  if (/\n|\r/.test(query)) {
+    throw new Error(`psql() 的 SQL 必须是单行（换行经 sg/JSON.stringify 会变成字面 \\n）: ${JSON.stringify(query)}`);
+  }
+  return docker(`exec -i ${STATION_DB_NAME} psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
+}
+
+function psqlStdin(sql) {
+  dockerStdin(`exec -i ${STATION_DB_NAME} psql -U station -d station -v ON_ERROR_STOP=1`, sql);
+}
+
+function curl({ url, host = null, headers = [], args = '', out = 'resp' }) {
+  const headerFile = path.join(S.artifactsRoot, `${out}.hdr`);
+  const bodyFile = path.join(S.artifactsRoot, `${out}.body`);
+  const hostArg = host ? `-H ${JSON.stringify(`Host: ${host}`)} ` : '';
+  const headerArgs = headers.map((h) => `-H ${JSON.stringify(h)} `).join('');
+  // `--ipv4`：宿主把 *.localhost 解析成 ::1，隔离栈 Traefik/FDE 只监听 IPv4 ⇒ 不强制 IPv4 会超时。
+  const cmd = `curl -s --ipv4 -D ${JSON.stringify(headerFile)} -o ${JSON.stringify(bodyFile)} -w '%{http_code}' ${hostArg}${headerArgs}${args} ${JSON.stringify(url)}`;
+  const status = execSync(cmd, { encoding: 'utf8', stdio: 'pipe' }).trim();
+  const headersText = fs.existsSync(headerFile) ? fs.readFileSync(headerFile, 'utf8') : '';
+  const body = fs.existsSync(bodyFile) ? fs.readFileSync(bodyFile, 'utf8') : '';
+  return { status, headers: headersText, body };
 }
 
 const S = {
   userspaceRoot: null,
   dynamicRoot: null,
+  staticRoot: null,
+  artifactsRoot: null,
+  staticFile: null,
+  routesFile: null,
+  cookieJar: null,
   password: 'correct horse battery staple',
-  users: {}, // name -> { userId, totpSecret, cookie, projectId, portId, port, hostname, containerIp }
-  logDir: null,
-  agentdLogPath: null,
-};
-let logProc = null;
-
-const FDE_ENV = {
-  FDE_IMAGE,
-  FDE_CMD: '[]',
-  FDE_DEV_USER: '',
-  FDE_DEV_MODE: '1',
-  FDE_AGENT_VERSION: '0.1.0',
+  users: {
+    alice: { login: 'alice', fdeName: FDE_A, container: FDE_CONTAINER_A, userId: '00000000-0000-0000-0000-000000000001' },
+    bob: { login: 'bob', fdeName: FDE_B, container: FDE_CONTAINER_B, userId: '00000000-0000-0000-0000-000000000002' },
+  },
 };
 
-const RUNNER = {
-  run1: '00000000-0000-0000-0000-000000000301',
-  queue1: '00000000-0000-0000-0000-000000000401',
-  session1: '00000000-0000-0000-0000-000000000501',
-  message1: '00000000-0000-0000-0000-000000000601',
-};
-
-async function insertUser(name) {
-  const ids = { alice: '00000000-0000-4000-8000-000000000001', bob: '00000000-0000-4000-8000-000000000002' };
-  const passwordHash = await auth.hashPassword(S.password);
-  const totpSecret = totp.generateSecret(20);
-  psqlStdin(`
-    INSERT INTO users (id, login, display_name, role, fde_name, auth_source, status, password_hash, totp_secret)
-    VALUES ('${ids[name]}', '${name}', '${name}', 'fde', '${name}', 'local', 'active', '${passwordHash}', '${totpSecret}');
-  `);
-  S.users[name] = { userId: ids[name], totpSecret };
+function stackPaths() {
+  const paths = {
+    ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
+    TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+    TRAEFIK_STATIC_HOST: S.staticFile,
+  };
+  return Object.fromEntries(Object.entries(paths).filter(([, value]) => value !== undefined && value !== null));
 }
 
-async function login(name) {
-  const u = S.users[name];
+function readRoutes() {
+  return S.routesFile && fs.existsSync(S.routesFile) ? fs.readFileSync(S.routesFile, 'utf8') : '';
+}
+
+// —— 种子 + 登录（照抄 wp2a insertUser / login）——
+async function insertUser({ id, login, role = 'fde', fdeName = null }) {
+  const passwordHash = await auth.hashPassword(S.password);
+  const secret = totp.generateSecret(20);
+  psqlStdin(`
+    INSERT INTO users (id, login, display_name, role, fde_name, auth_source, status, password_hash, totp_secret)
+    VALUES ('${id}', '${login}', '${login}', '${role}', ${fdeName ? `'${fdeName}'` : 'NULL'}, 'local', 'active',
+            '${passwordHash}', '${secret}');
+  `);
+  return secret;
+}
+
+async function login(loginName, secret) {
   const step1 = await fetch(`${PORTAL}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ login: name, password: S.password }),
+    body: JSON.stringify({ login: loginName, password: S.password }),
   });
-  assert.equal(step1.status, 200, `login step1 ${name}`);
-  const { pending_token } = await step1.json();
+  assert.equal(step1.status, 200, `login step1 (${loginName})`);
+  const { pending_token: pendingToken } = await step1.json();
   const step2 = await fetch(`${PORTAL}/api/auth/login/totp`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pending_token, code: totp.totp(u.totpSecret) }),
+    body: JSON.stringify({ pending_token: pendingToken, code: totp.totp(secret) }),
   });
-  assert.equal(step2.status, 200, `login step2 ${name}`);
-  u.cookie = readCookie(step2.headers.get('set-cookie'));
-  assert.ok(u.cookie, `session cookie ${name}`);
+  assert.equal(step2.status, 200, `login step2 (${loginName})`);
+  const cookie = readCookie(step2.headers.get('set-cookie'));
+  assert.ok(cookie, `session cookie (${loginName})`);
+  return cookie;
 }
 
-/**
- * #661（261117 重写）：`POST /api/projects` 已被 **P5「目录即项目」退役**（410 `project_api_retired`），
- * 项目级端口随之并入 **FDE 级一块 10 条**。本函数改成 P5 语义：
- *   ① 断言退役 API 仍 410（把它钉住，防有人把老路加回来）；
- *   ② provision-fde（与 wp2a 同一入口：portal 容器里的 cli）；
- *   ③ 端口从产品读侧 `GET /api/me/ports` 取（不自己猜 —— 与 wp2a 同口径）。
- */
-async function provisionFde(name) {
-  const u = S.users[name];
-  const retired = await fetch(`${PORTAL}/api/projects`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${u.cookie}` },
-    body: JSON.stringify({ name: `proj-${name}` }),
+function portalApi(pathname, { method = 'GET', cookie, body } = {}) {
+  return fetch(`${PORTAL}${pathname}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(cookie ? { Cookie: `fde_session_dev=${cookie}` } : {}),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
-  assert.equal(retired.status, 410, `P5：POST /api/projects 必须 410（实际 ${retired.status}）`);
-  docker(`exec ${STATION_PORTAL_NAME} node portal/src/cli.js provision-fde --fde-name ${name}`);
-  const mine = await fetch(`${PORTAL}/api/me/ports`, { headers: { Cookie: `fde_session_dev=${u.cookie}` } });
-  const ports = await mine.json();
-  assert.equal(mine.status, 200, `GET /api/me/ports ${name}: ${JSON.stringify(ports).slice(0, 200)}`);
-  assert.ok(Array.isArray(ports) && ports.length > 0, `${name} 应当有一块端口（实际 ${JSON.stringify(ports).slice(0, 200)}）`);
-  const first = ports[0];
-  u.portId = first.id;
-  u.port = first.port;
-  u.hostname = first.hostname;
-  assert.ok(u.port && u.hostname, `${name} 的端口/hostname 必须非空（实际 ${JSON.stringify(first)}）`);
 }
 
 function containerIp(name) {
-  return docker(`inspect fde-${name} --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'`).trim();
+  return docker(`inspect ${name} --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'`).trim();
 }
 
-test('WP4 端到端验收：6 条真机断言（隔离/403/cookie 边界/未分配端口/事件落 DB/SSE）', { timeout: 15 * 60 * 1000 }, async (t) => {
-  S.userspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-users-wp4-'));
-  S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp4-'));
-  fs.chmodSync(S.userspaceRoot, 0o755);
-  fs.chmodSync(S.dynamicRoot, 0o755);
+function containerNetIp(container, networkName) {
+  return docker(`inspect ${container} --format '{{index .NetworkSettings.Networks "${networkName}" "IPAddress"}}'`).trim();
+}
 
-  const cleanup = () => {
-    if (logProc) { try { logProc.kill('SIGKILL'); } catch {} logProc = null; }
-    safe(() => docker('rm -f fde-alice fde-bob 2>/dev/null || true'));
-    safe(() => docker('network rm fde-alice fde-bob 2>/dev/null || true'));
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    // issue #178：不删镜像——compose up --build 按需重建；共享 tag 绝不能被 e2e 删除（见文件头）。
-    safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
-    safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
-    if (S.logDir) safe(() => fs.rmSync(S.logDir, { recursive: true, force: true }));
-    removeDbDir();
-  };
-  t.after(cleanup);
+// provision 一个栈内 FDE 并采集其网段 / 后端 IP / 一块预览端口（口径与 wp2a 一致：端口从
+// GET /api/me/ports 读，不自己猜）。
+async function provisionAndCollect(u) {
+  u.totpSecret = await insertUser({ id: u.userId, login: u.login, role: 'fde', fdeName: u.fdeName });
+  u.cookie = await login(u.login, u.totpSecret);
 
-  try {
-    // 0) 预清理 + 构建 + 起栈
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    removeDbDir();
-    buildFdeImage(FDE_IMAGE);
-    // 启动迁移完成后，管理台 API 才能创建 LiteLLM credential/model/binding。
-    compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, MIGRATE_ON_START: '1', ...FDE_ENV });
+  docker(`exec ${STATION_PORTAL_NAME} node portal/src/cli.js provision-fde --fde-name ${u.fdeName}`);
+  await waitFor(() => (safe(() => docker(`inspect ${u.container} --format {{.State.Status}}`).trim()) === 'running' ? 'running' : null),
+    { label: `${u.container} running`, timeoutMs: 180000 });
 
-    await waitFor(async () => {
-      const r = await fetch(`${PORTAL}/healthz`).catch(() => null);
-      return r && r.status === 200;
-    }, { label: 'portal healthz', timeoutMs: 240000, intervalMs: 1000 });
+  const netRow = psql(`SELECT network_name||'|'||subnet||'|'||gateway FROM fde_networks WHERE fde_id='${u.userId}'`);
+  const [networkName, subnet, gateway] = netRow.split('|');
+  assert.ok(networkName && subnet && gateway, `${u.login}: fde_networks 行不完整（${netRow}）`);
+  assert.equal(networkName, `fde-${u.fdeName}`, `${u.login}: 网络名必须 = fde-<fdeName>（D3 每 FDE 一网）`);
+  u.networkName = networkName;
+  u.subnet = subnet;
+  u.gateway = gateway;
+  u.backendIp = intToIp((parseCidr(subnet).base + 2) >>> 0);
+  // 容器在 fde 网络里的地址必须 = 后端固定位 .2（路由 backend 恒等于它，见 routes.js）。
+  assert.equal(containerNetIp(u.container, networkName), u.backendIp, `${u.login}: 容器 IP 必须 = 后端固定位 .2`);
 
-    // 1) 双 FDE 用户 + 登录 + 建项目（各自端口块）
-    await insertUser('alice');
-    await insertUser('bob');
-    await login('alice');
-    await login('bob');
-    await provisionFde('alice');
-    await provisionFde('bob');
-    assert.notEqual(S.users.alice.hostname, S.users.bob.hostname, '两 allocation hostname 不冲突（端口块按用户独立，跨用户同端口号是设计内行为）');
+  const mine = await portalApi('/api/me/ports', { cookie: u.cookie });
+  const ports = await mine.json().catch(() => null);
+  assert.equal(mine.status, 200, `GET /api/me/ports (${u.login}): ${JSON.stringify(ports).slice(0, 200)}`);
+  assert.ok(Array.isArray(ports) && ports.length > 0, `${u.login}: 应有一块预览端口（实际 ${JSON.stringify(ports).slice(0, 200)}）`);
+  const first = ports[0];
+  u.portId = first.id;
+  u.port = Number(first.port);
+  u.hostname = first.hostname;
+  assert.ok(u.port && u.hostname, `${u.login}: port/hostname 必须非空（实际 ${JSON.stringify(first)}）`);
+}
 
-    // 2) provision 双 FDE（同一 runner 镜像；alice 跑 agentd，bob 另起 echo server 当预览上游）
-    docker('exec station-portal node portal/src/cli.js provision-fde --fde-name alice');
-    docker('exec station-portal node portal/src/cli.js provision-fde --fde-name bob');
-    await waitFor(() => (psql(`SELECT status FROM containers WHERE fde_name='bob'`) === 'running' ? true : null),
-      { label: 'fde-bob running', timeoutMs: 60000 });
+// —— 断言① 用的三个 node 内联脚本（都不得含会在 sg/JSON 层出问题的字符；单引号可，双引号会被正确转义）——
+const echoJs = (port) => `require('http').createServer((q,s)=>{s.setHeader('content-type','application/json');s.end(JSON.stringify(q.headers))}).listen(${port})`;
+const selfProbeJs = (port) => `fetch('http://127.0.0.1:${port}/',{signal:AbortSignal.timeout(3000)}).then(r=>{console.log('SELF_OK',r.status);process.exit(0)}).catch(e=>{console.log('SELF_FAIL',e.cause?.code||e.name);process.exit(1)})`;
+const crossProbeJs = (ip, port) => `fetch('http://${ip}:${port}/',{signal:AbortSignal.timeout(4000)}).then(r=>{console.log('REACHED',r.status);process.exit(3)}).catch(e=>{console.log('BLOCKED',e.cause?.code||e.name);process.exit(0)})`;
+// 「网络不可达 / DROP」类失败码：跨 FDE 隔离被 DROP ⇒ 不可达/超时；**不含 ECONNREFUSED**
+// （ECONNREFUSED = 包已到达对端端口但端口关 = 隔离失败，对端拒绝而非被防火墙丢掉）。
+const UNREACHABLE = new Set(['EHOSTUNREACH', 'ENETUNREACH', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'ECONNRESET', 'TimeoutError', 'AbortError']);
 
-    // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings 生成，无 binding 无 LLM 出口。
-    // 只给 alice 配 mock binding（bob 必须保持无配置——本脚本断言 bob 不受影响）。
-    await ensureLlmBinding({
-      docker,
-      dynamicDir: S.dynamicRoot,
-      fdeName: 'alice',
-      adminLogin: 'wp4-admin',
-      adminPassword: 'wp4-admin-pass-123',
+test('WP4 验收（收窄）：跨 FDE 隔离 / strip-cookie 不透传 / 未路由 Host→404',
+  { timeout: 15 * 60 * 1000 }, async (t) => {
+    // —— 套件级 teardown（照 wp2a：清理失败必须红、零残留复查）——
+    const teardownFailures = [];
+    const teardown = (action, fn) => {
+      try {
+        fn();
+      } catch (error) {
+        const detail = String(error?.stderr || error?.message || error).trim().split('\n')[0];
+        console.warn(`[wp4] teardown ${action} 失败:`, detail);
+        teardownFailures.push(action);
+      }
+    };
+    const dockerOut = (args) => docker(args).split('\n').map((line) => line.trim()).filter(Boolean);
+    const containerNamesPresent = (...names) => {
+      const wanted = new Set(names);
+      return dockerOut('ps -a --format {{.Names}}').filter((n) => wanted.has(n));
+    };
+    const networkNamesPresent = (...names) => {
+      const wanted = new Set(names);
+      return dockerOut('network ls --format {{.Name}}').filter((n) => wanted.has(n));
+    };
+    const ownedNames = [FDE_CONTAINER_A, FDE_CONTAINER_B];
+    const ownedNetworks = [FDE_CONTAINER_A, FDE_CONTAINER_B];
+    let stackTouched = false;
+
+    const residual = [];
+    const cleanup = () => {
+      if (stackTouched) {
+        teardown('compose down -v', () => compose('down -v'));
+        teardown(`rm -f ${ownedNames.join(' ')}`, () => {
+          const present = containerNamesPresent(...ownedNames);
+          if (present.length) docker(`rm -f ${present.join(' ')}`);
+        });
+        teardown(`network rm ${ownedNetworks.join(' ')}`, () => {
+          const present = networkNamesPresent(...ownedNetworks);
+          if (present.length) docker(`network rm ${present.join(' ')}`);
+        });
+        teardown('removeDbDir', () => {
+          if (removeDbDir() === null) throw new Error('lib removeDbDir 返回 null（STATION_DB_DIR 未清掉）');
+        });
+        try {
+          const stackId = process.env.STATION_STACK_ID;
+          const project = process.env.COMPOSE_PROJECT_NAME;
+          if (stackId) {
+            residual.push(...dockerOut(`ps -a --filter label=station.stack=${stackId} -q`).map((id) => `容器 ${id}（label station.stack=${stackId}）`));
+            residual.push(...dockerOut(`network ls --filter label=station.stack=${stackId} -q`).map((id) => `网络 ${id}（label station.stack=${stackId}）`));
+          }
+          if (project) {
+            residual.push(...dockerOut(`ps -a --filter label=com.docker.compose.project=${project} -q`).map((id) => `容器 ${id}（compose project ${project}）`));
+            residual.push(...dockerOut(`network ls --filter label=com.docker.compose.project=${project} -q`).map((id) => `网络 ${id}（compose project ${project}）`));
+          }
+          residual.push(...containerNamesPresent(...ownedNames).map((n) => `容器 ${n}（按名复查）`));
+          residual.push(...networkNamesPresent(...ownedNetworks).map((n) => `网络 ${n}（按名复查）`));
+        } catch (error) {
+          const detail = String(error?.stderr || error?.message || error).trim().split('\n')[0];
+          console.warn('[wp4] teardown 零残留复查 执行失败:', detail);
+          teardownFailures.push(`零残留复查执行失败：${detail}`);
+        }
+      }
+      const rmTree = (dir) => {
+        if (!dir || !fs.existsSync(dir)) return;
+        const fix = (d) => {
+          let ents = [];
+          try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { /* 读不了就直接 chmod */ }
+          try { fs.chmodSync(d, 0o700); } catch { /* 非属主时交给下面的 rm 报 */ }
+          for (const e of ents) if (e.isDirectory()) fix(path.join(d, e.name));
+        };
+        fix(dir);
+        try {
+          fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        } catch (error) {
+          const image = process.env.FDE_IMAGE || process.env.STATION_PORTAL_IMAGE;
+          if (!image) throw error;
+          execSync(`docker run --rm --user 0 --entrypoint sh -v ${JSON.stringify(`${dir}:/x`)} ${image} -c 'rm -rf /x/* /x/.[!.]* 2>/dev/null; exit 0'`, { stdio: 'pipe' });
+          if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        }
+      };
+      teardown('rm -rf userspace 临时目录', () => S.userspaceRoot && rmTree(S.userspaceRoot));
+      teardown('rm -rf dynamic 临时目录', () => S.dynamicRoot && rmTree(S.dynamicRoot));
+      teardown('rm -rf static 临时目录', () => S.staticRoot && rmTree(S.staticRoot));
+      teardown('rm -rf artifacts 临时目录', () => S.artifactsRoot && rmTree(S.artifactsRoot));
+      const problems = [
+        ...teardownFailures.map((action) => `清理动作失败：${action}`),
+        ...residual.map((item) => `残留资源：${item}`),
+      ];
+      assert.deepEqual(problems, [], `wp4 清场未清干净（清理失败必须红）:\n${problems.join('\n')}`);
+    };
+    t.after(cleanup);
+
+    let fatal = null;
+    const step = (name, fn) => t.test(name, async (st) => {
+      if (fatal) {
+        st.skip(`前置段已失败，跳过（首个失败：${fatal.message}）`);
+        return;
+      }
+      try {
+        await fn(st);
+      } catch (err) {
+        if (!fatal) fatal = err;
+        throw err;
+      }
     });
 
-    const bobIp = containerIp('bob');
-    const aliceIp = containerIp('alice');
-    assert.ok(/^10\.200\./.test(bobIp) && /^10\.200\./.test(aliceIp), `两容器都在 /29 池内: alice=${aliceIp} bob=${bobIp}`);
-    const netsOf = (n) => Object.keys(JSON.parse(docker(`inspect fde-${n}`))[0].NetworkSettings.Networks);
-    const [aliceNet] = netsOf('alice');
-    const [bobNet] = netsOf('bob');
-    assert.notEqual(aliceNet, bobNet, `两 FDE 网络不同（D3 每FDE一网）：${aliceNet} vs ${bobNet}`);
-    // 不变式 D4：FDE 容器不 publish 端口
-    for (const n of ['alice', 'bob']) {
-      const pb = docker(`inspect fde-${n} --format '{{json .HostConfig.PortBindings}}'`).trim();
-      assert.equal(pb, '{}', `断言① 前置：fde-${n} 无 publish 端口（D4），得到 ${pb}`);
-    }
+    await step('① 隔离护栏 + 临时夹具 + edge watch 桩（必须早于 compose up）', async () => {
+      // 两个 FDE 都进护栏：都必须是含栈 id 的栈内名，否则 fde-<name> 会与共享栈同名互删。
+      assertIsolatedEnvironment({
+        litellm: false,
+        fdeNames: [
+          { env: 'FDE_NAME', value: FDE_A, sharedDefault: 'alice' },
+          { env: 'FDE_B_NAME', value: FDE_B, sharedDefault: 'bob' },
+        ],
+      });
+      await assertHostPortsAvailable([PORTAL_HOST_PORT, TRAEFIK_WEB_PORT, TRAEFIK_WEBSECURE_PORT]);
+      assert.ok(process.env.BASE_DOMAIN, 'BASE_DOMAIN 必须 export（不 export 缺省 localhost，预览 host 口径不一致）');
 
-    // 双端各起 echo server（回显请求头 JSON）——① 的正向对照 + ③ 的预览上游替身。
-    // 两端都有真实监听后，跨向探测的失败才是「网络隔离」证据（否则 ECONNREFUSED 假绿，评审 ①/M3）。
-    const echoJs = (port) => `require('http').createServer((q,s)=>{s.setHeader('content-type','application/json');s.end(JSON.stringify(q.headers))}).listen(${port})`;
-    docker(`exec -d fde-bob node -e ${JSON.stringify(echoJs(S.users.bob.port))}`);
-    docker(`exec -d fde-alice node -e ${JSON.stringify(echoJs(S.users.alice.port))}`);
+      S.userspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-users-wp4-'));
+      S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp4-'));
+      S.staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-static-wp4-'));
+      S.artifactsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-artifacts-wp4-'));
+      S.routesFile = path.join(S.dynamicRoot, 'routes.yml');
+      S.cookieJar = path.join(S.artifactsRoot, 'preview-cookies.txt');
+      S.staticFile = writeTraefikStatic(S.staticRoot, {
+        repoRoot: REPO_ROOT, webPort: TRAEFIK_WEB_PORT, websecurePort: TRAEFIK_WEBSECURE_PORT,
+        adminPort: process.env.TRAEFIK_ADMIN_PORT || '19443',
+      });
+      for (const dir of [S.userspaceRoot, S.dynamicRoot, S.staticRoot, S.artifactsRoot]) fs.chmodSync(dir, 0o755);
 
-    // 等 agentd（alice）上线
-    await waitFor(() => (docker('logs fde-alice 2>&1').includes('sse ping received') ? true : null),
-      { label: 'agentd sse ping', timeoutMs: 90000, intervalMs: 1000 });
-
-    // echo 就绪自探（评审 F5/m1：exec -d 返回 ≠ 端口已监听）
-    const selfProbeJs = (port) => `fetch('http://127.0.0.1:${port}/',{signal:AbortSignal.timeout(3000)}).then(r=>{console.log('SELF_OK',r.status);process.exit(0)}).catch(e=>{console.log('SELF_FAIL',e.cause?.code||e.name);process.exit(1)})`;
-    for (const n of ['alice', 'bob']) {
-      await waitFor(() => {
-        const out = safe(() => docker(`exec fde-${n} node -e ${JSON.stringify(selfProbeJs(S.users[n].port))}`)) ?? '';
-        return out.includes('SELF_OK') ? out : null;
-      }, { label: `echo 就绪 fde-${n}:${S.users[n].port}`, timeoutMs: 30000, intervalMs: 500 });
-    }
-
-    // ================================================================
-    // 断言 ①：跨 FDE 隔离——双向都有真实监听的前提下，跨向必须失败且失败码属
-    // 「网络不可达/DROP」类（≠ECONNREFUSED，否则 = 包已到达对端端口 = 隔离失败）
-    // ================================================================
-    const probeJs = (ip, port) => `fetch('http://${ip}:${port}/',{signal:AbortSignal.timeout(4000)}).then(r=>{console.log('REACHED',r.status);process.exit(3)}).catch(e=>{console.log('BLOCKED',e.cause?.code||e.name);process.exit(0)})`;
-    const UNREACHABLE = new Set(['EHOSTUNREACH', 'ENETUNREACH', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'ECONNRESET', 'TimeoutError', 'AbortError']);
-    for (const [from, to, toIp] of [['alice', 'bob', bobIp], ['bob', 'alice', aliceIp]]) {
-      const out = docker(`exec fde-${from} node -e ${JSON.stringify(probeJs(toIp, S.users[to].port))}`);
-      assert.match(out, /BLOCKED/, `断言① 跨 FDE 隔离：fde-${from} → ${toIp}:${S.users[to].port} 必须不可达（得到 ${out}）`);
-      const code = (out.match(/BLOCKED (\S+)/) ?? [])[1] ?? '';
-      assert.ok(UNREACHABLE.has(code), `断言① 失败码必须是网络不可达类而非 ECONNREFUSED（隔离被 DROP，非对端拒绝）：${code}`);
-    }
-    console.log('[wp4] ① 跨 FDE 隔离 OK（双向真实监听 + 失败码=网络隔离 DROP + 不 publish 端口）');
-
-    // ================================================================
-    // 断言 ②：未认证 403——无预览凭证经 Traefik 打预览路由 → fail-closed 403
-    // ================================================================
-    await waitFor(() => {
-      const routesFile = path.join(S.dynamicRoot, 'routes.yml');
-      return fs.existsSync(routesFile) && fs.readFileSync(routesFile, 'utf8').includes(S.users.bob.hostname) ? true : null;
-    }, { label: 'routes.yml 含 bob router', timeoutMs: 60000 });
-
-    const respNo = execSync(
-      `curl -s -w '\n%{http_code}' -H 'Host: ${S.users.bob.hostname}' ${TRAEFIK_WEB}/`,
-      { encoding: 'utf8', stdio: 'pipe' },
-    ).trim();
-    const [bodyNo, codeNo] = [respNo.slice(0, respNo.lastIndexOf('\n')), respNo.slice(respNo.lastIndexOf('\n') + 1)];
-    assert.equal(codeNo, '403', '断言② 未认证 403（fail-closed）');
-    assert.ok(bodyNo.includes('preview_ticket_required'), `断言② 403 必须来自 forward-auth（error code 校验）：${bodyNo.slice(0, 120)}`);
-    console.log('[wp4] ② 未认证 403 OK（preview_ticket_required）');
-
-    // ================================================================
-    // 断言 ③：cookie 不透传上游——portal session cookie 经 forwardAuth+strip-cookie 绝不到达 dev server
-    // ================================================================
-    const issue = await fetch(`${PORTAL}/api/ports/${S.users.bob.portId}/preview-ticket`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${S.users.bob.cookie}` },
-      body: '{}',
+      const stub = writeDynamicStub(S.dynamicRoot);
+      assert.equal(stub.created, true, '刚 mkdtemp 的动态目录里桩必须是「新写」');
+      assert.equal(fs.readFileSync(stub.file, 'utf8'), 'http: {}\n', '桩正文必须是合法空配置 http: {}');
+      assert.equal(writeDynamicStub(S.dynamicRoot).created, false, '幂等：对自己的桩再调一次不得重写');
     });
-    assert.equal(issue.status, 201, '签发 bob ticket');
-    const { ticket } = await issue.json();
 
-    // ticket 换预览 cookie（302 bootstrap），捕获 Set-Cookie
-    const bootstrap = execSync(
-      `curl -s -D - -o /dev/null -H 'Host: ${S.users.bob.hostname}' '${TRAEFIK_WEB}/?preview_ticket=${ticket}'`,
-      { encoding: 'utf8', stdio: 'pipe' },
-    );
-    assert.ok(/HTTP.*302|HTTP\/1\.1 302/.test(bootstrap.split('\n')[0]), 'ticket bootstrap 302');
-    const setCookieLine = bootstrap.split('\n').find((l) => /^set-cookie:/i.test(l));
-    assert.ok(setCookieLine, '302 带 Set-Cookie（预览 cookie）');
-    const previewCookie = setCookieLine.slice(setCookieLine.indexOf(':') + 1).split(';')[0].trim(); // name=value（兼容头名带大小写/空格）
-
-    // 手动带上「portal session cookie + 预览 cookie」打预览路由——上游 echo 必须看不到任何 Cookie
-    const echoBody = execSync(
-      `curl -s -H 'Host: ${S.users.bob.hostname}' -H 'Cookie: fde_session_dev=${S.users.bob.cookie}; ${previewCookie}' ${TRAEFIK_WEB}/`,
-      { encoding: 'utf8', stdio: 'pipe' },
-    );
-    const echoHeaders = JSON.parse(echoBody);
-    assert.equal(echoHeaders.cookie, undefined, `断言③ cookie 不透传上游（strip-cookie 生效）：${echoBody.slice(0, 200)}`);
-    console.log('[wp4] ③ cookie 不透传上游 OK（strip-cookie 删除全部 Cookie）');
-
-    // ================================================================
-    // 断言 ④：未分配端口不可达——两个负例均 404：
-    // (a) 完全未知 Host（无 router）；(b) 同 FDE 同项目但块内未分配端口（评审 M3：
-    //     防 reconciler 未来引入通配 router 把未分配端口也挂出去）
-    // ================================================================
-    const strayHost = `stray-${Date.now()}.fde.localhost`;
-    const codeStray = execSync(
-      `curl -s -o /dev/null -w '%{http_code}' -H 'Host: ${strayHost}' ${TRAEFIK_WEB}/`,
-      { encoding: 'utf8', stdio: 'pipe' },
-    ).trim();
-    assert.equal(codeStray, '404', '断言④a 未路由 Host → 404');
-    // bob 项目名 = proj-bob；块首 4000 已分配，4008（slot+1）未分配 → hostname 语法合法但无 router
-    const unallocPort = S.users.bob.port + 8;
-    const unallocHost = S.users.bob.hostname.replace(new RegExp(`-${String(S.users.bob.port).padStart(4, '0')}\\.fde\\.`), `-${String(unallocPort).padStart(4, '0')}.fde.`);
-    assert.notEqual(unallocHost, undefined);
-    const codeUnalloc = execSync(
-      `curl -s -o /dev/null -w '%{http_code}' -H 'Host: ${unallocHost}' ${TRAEFIK_WEB}/`,
-      { encoding: 'utf8', stdio: 'pipe' },
-    ).trim();
-    assert.equal(codeUnalloc, '404', `断言④b 同块未分配端口不可达（${unallocHost} → 404）`);
-    console.log('[wp4] ④ 未分配端口不可达 OK（未知 Host + 同块未分配端口均 404）');
-
-    // ================================================================
-    // 断言 ⑥：SSE 下行 + 吊销收敛——① agentd 的 SSE 长连（portal → 容器，ping 证明下行通）；
-    // ② deprovision → token 吊销 → agentd 停领收敛退出。
-    // 已知限制（portal.md §10.3/§6.3 同源）：deprovision-fde 走 CLI 独立进程，
-    // 内存 SSE hub 的 revoke 推送跨不了进程（当前唯一主动事件实际不可达），收敛靠
-    // 心跳/claim 的 token_revoked（≤90s）；进程内推送留待 admin 端点接入（issue 记录）。
-    // ================================================================
-    S.logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-wp4-logs-')); // m5：不硬编码共享目录
-    S.agentdLogPath = path.join(S.logDir, 'agentd.log');
-    const logFd = fs.openSync(S.agentdLogPath, 'w');
-    logProc = spawn('sg', ['docker', '-c', 'docker logs -f fde-alice 2>&1'], {
-      cwd: REPO_ROOT,
-      stdio: ['ignore', logFd, 'inherit'],
+    await step('② 起栈（自建 FDE 镜像 + compose up + portal healthz）', async () => {
+      stackTouched = true;
+      safe(() => compose('down -v'));
+      removeDbDir();
+      buildFdeImage(FDE_IMAGE);
+      compose('up -d --build', { MIGRATE_ON_START: '1', FDE_IMAGE });
+      await waitFor(async () => (await fetch(`${PORTAL}/healthz`).catch(() => null))?.status === 200,
+        { label: `portal healthz (${PORTAL})`, timeoutMs: 240000 });
     });
-    fs.closeSync(logFd); // m5：spawn 已复制 fd，及时关闭防泄漏
-    await waitFor(() => {
-      const out = safe(() => fs.readFileSync(S.agentdLogPath, 'utf8')) ?? '';
-      return out.includes('sse connected') && out.includes('sse ping received') ? out : null;
-    }, { label: 'SSE 下行通（agentd 连上并收到 ping）', timeoutMs: 60000 });
 
-    // ================================================================
-    // 断言 ⑤：事件落 DB——真实 agentd claim → worker 跑（mock LLM）→ run_events 落库
-    // ================================================================
-    psqlStdin(`
-      DELETE FROM run_queue WHERE run_id='${RUNNER.run1}';
-      DELETE FROM messages WHERE run_id='${RUNNER.run1}';
-      DELETE FROM runs WHERE id='${RUNNER.run1}';
-      DELETE FROM chat_sessions WHERE id='${RUNNER.session1}';
-    `);
-    psqlStdin(`
-      INSERT INTO chat_sessions (id, user_id, project_id, title, model, last_seq)
-      VALUES ('${RUNNER.session1}', '${S.users.alice.userId}', '${S.users.alice.projectId}', 'wp4', 'mock-model', 1)
-      ON CONFLICT (id) DO NOTHING;
-      INSERT INTO runs (id, session_id, status) VALUES ('${RUNNER.run1}', '${RUNNER.session1}', 'queued');
-      INSERT INTO messages (id, session_id, run_id, seq, role, content)
-      VALUES ('${RUNNER.message1}', '${RUNNER.session1}', '${RUNNER.run1}', 1, 'user', 'WP4 acceptance task');
-      INSERT INTO run_queue (id, run_id, container_id, status)
-      VALUES ('${RUNNER.queue1}', '${RUNNER.run1}', (SELECT id FROM containers WHERE fde_name='alice'), 'pending');
-    `);
+    await step('③ provision 两个栈内 FDE（alice + bob）：登录、网段、后端 IP、一块预览端口', async () => {
+      await provisionAndCollect(S.users.alice);
+      await provisionAndCollect(S.users.bob);
 
-    // run 跑完（mock LLM 延迟 5s × 轮次）
-    await waitFor(() => {
-      const st = psql(`SELECT status FROM runs WHERE id='${RUNNER.run1}'`);
-      return (st === 'finished' || st === 'failed') ? st : null;
-    }, { label: 'run 终态', timeoutMs: 120000, intervalMs: 1000 });
-    const runStatus = psql(`SELECT status FROM runs WHERE id='${RUNNER.run1}'`);
-    assert.equal(runStatus, 'finished', 'run 终态 finished');
+      // 两端各起 echo 监听（真实监听 ⇒ 后面的跨向失败才是「隔离 DROP」证据，不是「没人监听」）。
+      for (const u of [S.users.alice, S.users.bob]) {
+        docker(`exec -d ${u.container} node -e ${JSON.stringify(echoJs(u.port))}`);
+      }
+      // echo 就绪自证（exec -d 返回 ≠ 端口已监听）。
+      for (const u of [S.users.alice, S.users.bob]) {
+        await waitFor(() => {
+          const out = safe(() => docker(`exec ${u.container} node -e ${JSON.stringify(selfProbeJs(u.port))}`)) ?? '';
+          return out.includes('SELF_OK') ? out : null;
+        }, { label: `echo 就绪 ${u.container}:${u.port}`, timeoutMs: 30000 });
+      }
+    });
 
-    const evCount = psql(`SELECT count(*) FROM run_events WHERE run_id='${RUNNER.run1}'`);
-    assert.ok(Number(evCount) > 0, `断言⑤ 事件落 DB：run_events ${evCount} 条`);
-    const evIds = psql(`SELECT string_agg(client_event_id, ',' ORDER BY seq) FROM run_events WHERE run_id='${RUNNER.run1}'`);
-    assert.ok(evIds.includes(':1:0'), `client_event_id 命名空间正确（:attempt:n）：${evIds}`);
-    const seqList = psql(`SELECT string_agg(seq::text, ',' ORDER BY seq) FROM (SELECT seq FROM run_events WHERE session_id='${RUNNER.session1}' UNION SELECT seq FROM messages WHERE session_id='${RUNNER.session1}') x`).split(',').map(Number);
-    assert.deepEqual(seqList, seqList.map((_, i) => i + 1), `session seq 严格递增无空洞：${seqList.join(',')}`);
-    const runEndLast = psql(`SELECT type FROM run_events WHERE run_id='${RUNNER.run1}' ORDER BY seq DESC LIMIT 1`);
-    assert.equal(runEndLast, 'run_end', 'run_end 为最后一条事件');
-    console.log(`[wp4] ⑤ 事件落 DB OK（${evCount} 条事件，seq 连续，run_end 末位）`);
+    await step('④ 断言①：跨 FDE 隔离——双向真实监听下跨向必须不可达（非 ECONNREFUSED）；两网不同、各池内独占小段、不 publish', async () => {
+      const { alice, bob } = S.users;
 
-    // 吊销收敛（断言 ⑥ 收口，评审 M1(b) 采纳）：分两步——
-    // (a) 真·令牌吊销：置 containers.status='removed'（offboard 的 DB 信号）→ agentd 下一次
-    //     claim/heartbeat 得 401 token_revoked → agentd 收敛退出（'agentd exiting'，评审修复后可达）
-    // (b) deprovision 回收容器/网络（此时 agentd 已退出，docker stop 立即完成）
-    // 注：SSE revoke 进程内推送仍跨不了 CLI 进程（issue #22），此处走的是心跳/claim 兑底路径。
-    psqlStdin(`UPDATE containers SET status = 'removed', updated_at = now() WHERE fde_name = 'alice' AND status <> 'removed';`);
-    // claim/heartbeat 得 401 → revokeReason='token_revoked' → 双循环收敛 → 'agentd exiting'（评审修复后可达，实测 ≤45s）。
-    // 心跳侧日志为 'token revoked'（401 message），收敛信号以带 revoke 原因的退出日志为准。
-    await waitFor(() => {
-      const out = safe(() => fs.readFileSync(S.agentdLogPath, 'utf8')) ?? '';
-      return out.includes('"msg":"agentd exiting"') && out.includes('"revoke":"token_revoked"') ? out : null;
-    }, { label: 'agentd 收 token_revoked 并优雅退出', timeoutMs: 90000, intervalMs: 1000 });
+      // 两个 FDE 网络不同（D3 每 FDE 一网）。
+      assert.notEqual(alice.networkName, bob.networkName, `两 FDE 网络必须不同：${alice.networkName} vs ${bob.networkName}`);
+      assert.notEqual(alice.subnet, bob.subnet, `两 FDE 网段必须不同：${alice.subnet} vs ${bob.subnet}`);
 
-    docker('exec station-portal node portal/src/cli.js deprovision-fde --fde-name alice');
-    await waitFor(() => (psql(`SELECT status FROM containers WHERE fde_name='alice'`) === 'removed' ? true : null),
-      { label: 'containers.status = removed', timeoutMs: 30000 });
-    const bobStillThere = safe(() => docker('inspect fde-bob --format {{.State.Status}}').trim());
-    assert.equal(bobStillThere, 'running', 'deprovision alice 不得影响 bob（隔离回收）');
-    console.log('[wp4] ⑥ SSE 下行 + 吊销收敛 OK（token_revoked → agentd 优雅退出 → 容器回收，bob 不受影响）');
+      // 每 FDE 一块**独占小段**：本栈 FDE_POOL=large ⇒ /28（拓扑 §3 的缺省 /29 在 large 池放宽为 /28）；
+      // 都落在派生保留段（POOL_PREFIX）内，绝非整段 /24 或 /16。
+      for (const u of [alice, bob]) {
+        const prefix = parseCidr(u.subnet).prefixLen;
+        assert.ok(prefix >= 28, `${u.login}: 网段必须 ≤ /28 的独占小段（FDE_POOL=large ⇒ /28），实际 /${prefix}`);
+        assert.ok(u.backendIp.startsWith(POOL_PREFIX + '.'), `${u.login}: 后端 IP ${u.backendIp} 必须在派生保留段 ${POOL_SEGMENT} 内`);
+      }
+      assert.notEqual(alice.backendIp, bob.backendIp, '两后端 IP 必须不同');
 
-    console.log('\n[wp4] ✅ 6 条真机断言全部通过：跨 FDE 隔离 / 未认证 403 / cookie 不透传 / 未分配端口不可达 / 事件落 DB / SSE 下行+吊销收敛');
-  } catch (err) {
-    try {
-        console.log('\n[wp4] --- portal logs ---');
-        console.log(docker('logs station-portal --tail 60 2>&1'));
-        console.log('\n[wp4] --- fde-alice logs ---');
-        console.log(docker('logs fde-alice --tail 60 2>&1'));
-        console.log('\n[wp4] --- fde-bob logs ---');
-        console.log(docker('logs fde-bob --tail 40 2>&1'));
-    } catch { /* 尽力打印 */ }
-    throw err;
-  }
-});
+      // D4：FDE 容器不 publish 任何端口。
+      for (const u of [alice, bob]) {
+        const pb = docker(`inspect ${u.container} --format '{{json .HostConfig.PortBindings}}'`).trim();
+        assert.equal(pb, '{}', `${u.login}: fde 容器不得 publish 端口（D4），得到 ${pb}`);
+      }
+
+      // 双向跨向探测：from 容器打 to 后端 IP:port，必须 BLOCKED 且失败码属「网络不可达」类。
+      for (const [from, to] of [['alice', 'bob'], ['bob', 'alice']]) {
+        const f = S.users[from];
+        const o = S.users[to];
+        const out = docker(`exec ${f.container} node -e ${JSON.stringify(crossProbeJs(o.backendIp, o.port))}`);
+        assert.match(out, /BLOCKED/, `断言① 跨 FDE 隔离：${f.container} → ${o.backendIp}:${o.port} 必须不可达（得到 ${out.trim()}）`);
+        const code = (out.match(/BLOCKED (\S+)/) ?? [])[1] ?? '';
+        assert.ok(UNREACHABLE.has(code), `断言① 失败码必须是网络不可达类而非 ECONNREFUSED（隔离被 DROP，非对端拒绝）：${code}`);
+      }
+      console.log(`[wp4] ① 跨 FDE 隔离 OK（${alice.networkName}/${bob.networkName} 不同网、各 ≤/28 且在 ${POOL_SEGMENT}、不 publish、双向 DROP 非 ECONNREFUSED）`);
+    });
+
+    await step('⑤ 断言②：strip-cookie——带预览 cookie 命中 200，上游 echo 收不到 cookie 头（用 alice）', async () => {
+      const { alice } = S.users;
+      // 路由必须先物化（reconciler 异步写 routes.yml）。
+      await waitFor(() => (readRoutes().includes(alice.hostname) ? 'routed' : null),
+        { label: `routes.yml 含 ${alice.hostname}`, timeoutMs: 120000 });
+
+      const issued = await portalApi(`/api/ports/${alice.portId}/preview-ticket`, { method: 'POST', cookie: alice.cookie, body: {} });
+      const ticket = await issued.json().catch(() => ({}));
+      assert.equal(issued.status, 201, `签发 alice 预览票据：${JSON.stringify(ticket)}`);
+      assert.match(ticket.ticket, /^pt_/, 'ticket 形态 pt_<base64url>');
+
+      const boot = await waitFor(async () => {
+        const res = curl({ url: `${TRAEFIK_WEB}/?preview_ticket=${ticket.ticket}`, host: alice.hostname, args: `-c ${JSON.stringify(S.cookieJar)}`, out: 'bootstrap' });
+        return res.status === '302' ? res : null;
+      }, { label: `带票据兑换 302 (${alice.hostname})`, timeoutMs: 60000 });
+      assert.match(boot.headers, /^set-cookie:\s*\S*fde_preview\S*=/im, 'Set-Cookie 种下预览 cookie');
+
+      const ok200 = await waitFor(async () => {
+        const res = curl({ url: `${TRAEFIK_WEB}/`, host: alice.hostname, args: `-b ${JSON.stringify(S.cookieJar)}`, out: 'with-cookie' });
+        return res.status === '200' ? res : null;
+      }, { label: `带预览 cookie 命中 echo 200 (${alice.hostname})`, timeoutMs: 60000 });
+      const echoed = JSON.parse(ok200.body);
+      assert.equal(echoed.headers.host, alice.hostname, 'echo 回显 Host = 该预览 host（确实代理到本 FDE 后端）');
+      assert.equal(echoed.headers['x-auth-user'], alice.fdeName, 'X-Auth-User 由 forwardAuth 放行后透传（证明走放行分支而非绕过边缘）');
+      assert.equal(echoed.headers.cookie ?? '', '', '断言② strip-cookie：边缘把请求侧 Cookie 整头剥掉，应用看不到平台 cookie');
+      console.log('[wp4] ② strip-cookie OK（带预览 cookie 200，上游 echo 无 cookie 头）');
+    });
+
+    await step('⑥ 断言③：未路由 Host → 404（不是 403、不是 200）', async () => {
+      const suffix = S.users.alice.hostname.slice(S.users.alice.hostname.indexOf('.')); // 如 .fde.localhost
+      const strayHost = `wp4-stray-${Date.now()}${suffix}`;
+      const stray = await waitFor(async () => {
+        const res = curl({ url: `${TRAEFIK_WEB}/`, host: strayHost, out: 'stray-host' });
+        return res.status === '404' ? res : null;
+      }, { label: `未路由 Host ${strayHost} → 404`, timeoutMs: 60000 });
+      assert.equal(stray.status, '404', `断言③ 未分配 Host 必须 404（不是 403、不是 200）`);
+      console.log(`[wp4] ③ 未路由 Host → 404 OK（${strayHost}）`);
+    });
+
+    console.log('\n[wp4] ✅ 三条独有断言全部通过：跨 FDE 隔离 / strip-cookie 不透传 / 未路由 Host→404');
+  });
