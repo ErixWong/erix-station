@@ -123,7 +123,7 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminAboutView.vue'),
         meta: { requiresRole: 'admin' },
       },
-      // issue #650：「系统」（宕主 CPU / 内存 / 磁盘 / 容器数，只读，§4.18）。与 `admin-about` 同级写法：
+      // issue #650：「系统」（宕主 CPU / 内存 / 磁盘 / 容器数，只读，§4.20）。与 `admin-about` 同级写法：
       // 懒加载 + `requiresRole`，轮询只在 `AdminSystemView` 挂载后起（不挂载就不请求）。
       {
         path: 'system',

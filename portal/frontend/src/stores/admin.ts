@@ -71,7 +71,7 @@ import {
   type TlsStatus,
 } from '../lib/tlsSettings';
 
-// issue #650 管理台「系统」面板（§4.18）。DTO 归一化与展示格式化全在 `lib/systemMetrics`（纯函数可单测），
+// issue #650 管理台「系统」面板（§4.20）。DTO 归一化与展示格式化全在 `lib/systemMetrics`（纯函数可单测），
 // 这里只负责「一次调用 = 一次请求」+ 错误透传。**三态（enabled / latest / seriesError）在 lib 里各自收成独立字段**，
 // store 不合并也不推——一个读数兼不了另外两个的说法。
 import {
@@ -298,7 +298,7 @@ export const useAdminStore = defineStore('admin', {
     versionInfoLoaded: false,
     versionInfoLoading: false,
     versionInfoErr: null as string | null,
-    // issue #650：宿主资源快照（§4.18）。与版本三格同构：`…Loaded` 与 `…Metrics` 分开
+    // issue #650：宿主资源快照（§4.20）。与版本三格同构：`…Loaded` 与 `…Metrics` 分开
     // （「还没请求」≠「服务端说没有这一拍」）。轮询**覆盖上一份**而不追历史：本页只要最新一拍
     // 与当前区间的分桶结果，历史真相在库里。
     systemMetrics: null as SystemMetrics | null,
@@ -431,10 +431,10 @@ export const useAdminStore = defineStore('admin', {
     },
 
     /**
-     * issue #650：`GET /api/admin/system/metrics?range=`（管理台「系统」，§4.18）。
+     * issue #650：`GET /api/admin/system/metrics?range=`（管理台「系统」，§4.20）。
      *
      * 一次调用 = 一次请求（与 `loadVersionInfo` / `loadPreviewUsage` 同口径）。非法 / 缺省 range
-     * **不拼参数**：§4.18 说非法入参由服务端回落成 `1h` 并把生效值回在 `range` 里，前端再造一份缺省
+     * **不拼参数**：§4.20 说非法入参由服务端回落成 `1h` 并把生效值回在 `range` 里，前端再造一份缺省
      * 就是第二份口径（它会把页面选中态领看）。
      *
      * 返回 `null` = 成功，否则是已本地化的错误行（调用方直接上屏）。**轮询失败不抹旧读数**：

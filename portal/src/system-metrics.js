@@ -465,7 +465,7 @@ export function containerDrift(dbNames, dockerNames) {
 }
 
 /**
- * `GET /api/admin/system/metrics` 的响应本体（契约 `docs/api/portal.md` §4.18，字段形状见 issue #650 §API）。
+ * `GET /api/admin/system/metrics` 的响应本体（契约 `docs/api/portal.md` §4.20，字段形状见 issue #650 §API）。
  *
  * 抽成函数而不是写在 `http.js` 的 if 链里，理由：`http.js` 已 5000+ 行，而本端点的业务全部是
  * 「拼三份读数 + 一个降级分支」，写在路由链里会让那段注释比代码长（本仓已多次为此把业务抽出去）。
@@ -772,7 +772,7 @@ export function disksInsertSql(count) {
 }
 
 /**
- * 进程内那一拍 → API 的 `latest`（响应形状的唯一定义处，契约 `docs/api/portal.md` §4.18）。
+ * 进程内那一拍 → API 的 `latest`（响应形状的唯一定义处，契约 `docs/api/portal.md` §4.20）。
  *
  * 三条硬口径：
  *   · 缺值 ⇒ `null`，**永不**是 `0` / 空串 / `undefined`（#586：拿不到的指标渲染成「未知」）；

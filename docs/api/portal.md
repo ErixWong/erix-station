@@ -3544,7 +3544,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 
 ---
 
-### 4.18 管理台系统监控（`GET /api/admin/system/metrics`，issue #650）
+### 4.20 管理台系统监控（`GET /api/admin/system/metrics`，issue #650）
 
 **一句话**：宿主 CPU / 内存 / 磁盘 / 容器数的唯一读面——真相本来就在（`htop` / `free` / `df` / `docker ps`），
 但界面上一个读数都没有，症状「FDE 变慢」而平台不知道宿主是不是快满了（与 §4.16 版本三格同形）。

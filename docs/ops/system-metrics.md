@@ -1,7 +1,7 @@
 # 宿主资源监控（系统监控指标）：运维怎么做（issue #650）
 
 > **这一页只回答「怎么做」**：怎么关、怎么加盘、怎么读数、保留期怎么清、什么时候才该换方案。
-> 数据形状与字段语义在 `docs/data/model.md` §1.34–§1.35，API 契约在 `docs/api/portal.md` §4.18，
+> 数据形状与字段语义在 `docs/data/model.md` §1.34–§1.35，API 契约在 `docs/api/portal.md` §4.20，
 > 参数登记在 `docs/env.md` §10.5，立案理由与决策账在 GitHub issue #650（本文不重复）。
 > 实现只有一处：`portal/src/system-metrics.js`（采样 / 落库 / 分桶 / API 载荷）+ `cli.js serve` 起采样器
 > + `internal.js` 的 reaper 清理槽 + `http.js` 的 `GET /api/admin/system/metrics`。
