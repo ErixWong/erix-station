@@ -9250,3 +9250,33 @@ FDE 镜像**故意不动**（本版 runner 零改动，重建 6 台只会打断�
 `erix-station/portal:local`（revision `5b128df`）覆盖**（同一份 `deploy/docker-compose.yml`，issue #643 那个
 共享栈竞争）⇒ e2e 跑在「含本次合并的 0.1.75 代码树」的构建上，**不能声称跑在发布 digest 上**；`.env` 三处 pin
 保留为发布 digest（portal/proxy 已换、FDE 未换），运行中 portal 与 `.env` 的不一致是别人覆盖造成的。
+
+### 8.178 v0.1.76 发布部署 + #650 真机复验（两条缺陷确认消失）（2026-11-18，主 agent）
+
+**发布**：tag `v0.1.76` → `40fe2a7`，release run `44234338172` **success**；三镜像 digest
+portal `0b05bd2f…` / fde `3f8a76bd…` / proxy `06bc445a…`。
+
+**部署**：`deploy/.env` 换 portal + proxy 两处 pin（**FDE 仍故意不动**，本版 runner 零改动）；
+`docker compose up -d --no-deps station-portal`（不碰 station-db）；`/api/health` = `0.1.76 / 40fe2a7`。
+
+**真机复验（同一台宿主、同一管理台入口）**：
+
+```
+GET /api/admin/system/metrics   disk: [('overlay','overlay','/',73)]          ← 不再是 unknown/unknown
+                                containers: fde=6 fdeRunning=6 station=6
+                                drift: {db:6, docker:6, onlyDb:[], onlyDocker:[], count:0}   ← 假告警消失
+真机 UI（playwright 容器 + vision 读图）
+                                CPU 52.4% · load 18.49 / 36 核 ≈ 51.4%
+                                内存 31.2 GiB / 125.7 GiB 24.8%
+                                磁盘 overlay / overlay · 683.7 GiB / 936.8 GiB (73.0%)
+                                容器 57/216 · FDE 6/6 · 「对账：DB 6 台 ↔ Docker 6 台」**无红字**
+                                三张图折线+面积正常 · 无排版错乱/截断/重叠/空白 · 无 NaN/undefined/null
+console errors                  none
+```
+
+宿主上那两台同名干扰项（`otherproj-db` / `otherproj-db-old-261107`，无 station 标签）仍在跑，
+面板**不再**把它们算进 FDE —— 这就是「只认标签」那条判据的现场反证。
+
+**口径提醒（下一单别踩）**：`/` 报 `overlay` 是**正确**的，不是数据缺失——容器看到的就是 overlay 视图；
+要看真实设备名（`/dev/nvme0n1p2`）就把宿主目录也挂进 portal 并加进 `SYSTEM_METRICS_DISK_PATHS`，
+届时同一行会自动升级设备名（`docs/ops/system-metrics.md` §5）。
