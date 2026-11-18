@@ -9042,3 +9042,30 @@ run 探针（明令不许调工具）`events/history` **`tool_use=0`**、1 轮�
  `p596-verify-pg`
 （`127.0.0.1:55433`）与 `wt-596` / `wt-596b|c|d` 会话账本（`/tmp/erix-596*`）
  留着可复盘。
+
+### 8.173 切版 0.1.74 → 0.1.75（管理台「系统」监控面板首发版）（2026-11-18，主 agent）
+
+**这一版带什么**：issue #650 的管理台「系统」tab —— 宿主 CPU / 内存 / 磁盘 / 容器数定时落库 + 1h/6h/24h/7d/30d
+图表（PR #679，merge `23a4301`）。口径全文见 `docs/api/portal.md` §4.20、`docs/data/model.md` §1.34–§1.35、
+`docs/ops/system-metrics.md`。
+
+**交付面**：迁移 `0044-system-metrics.sql`（两张表）· `portal/src/system-metrics.js`（采样器 + 分桶查询 + 保留期清理）·
+`config.js` 四个 env（`SYSTEM_METRICS_ENABLED` / `_INTERVAL_SECONDS` / `_RETENTION_DAYS` / `_DISK_PATHS`）·
+`cli.js` serve 启动 · `internal.js` 清理挂 reaper 小时槽 · `http.js` `GET /api/admin/system/metrics` ·
+前端「系统」tab（四卡 + sparkline + 五档范围 + 5s 轮询，零新依赖）。
+
+**两处「同号」是这一单的意外工作量**（各修一轮，都是并行 session 先占了号）：
+① 迁移原取 0042 → main 已有 `0042-mcp-plaintext-values`（#608）→ 改 0043 → main 又落 `0043-platform-prompts`（#596）
+→ 定稿 **0044**；② 契约节号原 §4.18 → 被 MCP（#608）占 → §4.19 → 被提示词面板（#596）占 → 定稿 **§4.20**。
+`migrations.test.js` 的头号与六处位置断言两轮各进一位；0043 那支的「是当前末位」改成「倒数第二支」。
+
+**真库验证抓到一个阻断级 bug**（单测抓不到的形状）：`disksInsertSql` 每行参数写成 5 个（实际 6 个）⇒ 七列六个值
+⇒ **每一拍写库都 `42601`**，只留一条 warn 而 `latest` 卡片照样有数 ⇒ 只有历史图永远空。修法 + 一条形状判据
+（列数 = 表达式数、占位符集合恰好 `1..1+count*6`），并把 SQL 改回旧形状反向自证该条会红。
+
+**门禁**（合并前本机实跑）：仓库全量 `npm test` rc=0（3047 条 / 2946 过 / 0 红）· `migrations` 40/40 ·
+`system-metrics` 40/40 · 前端 `typecheck` rc=0 · 前端 84 文件 / 1802 条 · CI「质量门禁」pass（2m33s）。
+
+**本版遗留（发布部署时补）**：**真机 e2e 未做**（决策者选「合并后随发布验」）⇒ 部署时补：真 portal + 真 DB +
+真管理员登录，验「采样器真的在写库 + 面板四卡有数 + 图表有点」。浏览器渲染已用「vite build + 桩 API + playwright
+容器真 Chromium + vision 读图」验过（四卡齐全、无 `NaN`/`undefined`/`null`、无重叠截断），但那不是真机链路。
