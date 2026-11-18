@@ -86,6 +86,17 @@ function runnerDefaults() {
   };
 }
 
+/** 在文件里找**第一处**含 needle 的行号（1 起）。判据引用产品行号时必须走它，不硬编码。 */
+function lineOf(rel, needle) {
+  const lines = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8').split('\n');
+  // ⚠ 跳过**注释行**：注释里提到这个名字不算（261117 实测：`lineOf` 找到了 `:361` 的注释，
+  // 而坐标校验剥注释后自然判它「不含该 key」⇒ 判据自己误杀真登记）。
+  const isComment = (l) => /^\s*(\/\/|\/\*|\*)/.test(l);
+  const i = lines.findIndex((l) => l.includes(needle) && !isComment(l));
+  assert.ok(i >= 0, `${rel} 里找不到 ${JSON.stringify(needle)} ⇒ 产品代码改名/搬走了，判据要跟着改`);
+  return i + 1;
+}
+
 // 动态 import（runner 侧的解析器是本站 env 默认值的唯一真相）
 const { isDelegateEnabled, parseDelegateMax, parseDelegateChildRounds, parseDelegateChildTimeoutMs }
   = await import(RUNNER_CONFIG.href);
@@ -513,8 +524,11 @@ function shadowAt(shadows, name, at) {
  * 于是枚举里凭空多出一个没人读的 key，而真的动态读没进 `unsupported`（fail-closed 被绕过）。
  * @returns {{ envObjs: Set<string>, names: Map<string, Set<string>>, shadows: Map<string, Array> }}
  */
-function analyzeEnvReads(code) {
-  const masked = structuralMask(code);
+function analyzeEnvReads(code, rawText = null) {
+  // 掩码**从原文算**（#587 族 B 实测：`structuralMask(stripComments(x))` 与 `structuralMask(x)` 不等价 —
+  // 模板里嵌模板那种行会让两者在其后分叉，把**真代码**整行抹成「串正文」= 又一处静默漏扫）。
+  // `code` 仍必须是剥过注释的那一份：所有**内容匹配**都在它上面跑（env 名活在串正文里）。
+  const masked = structuralMask(rawText ?? code);
   const envObjs = new Set();
   const names = new Map();
   const addName = (id, lits) => {
@@ -648,8 +662,8 @@ function scanEnvReadsFromFiles(files, root) {
   for (const { file, text } of files) {
     const rel = path.relative(root, file);
     const code = stripComments(text);            // 注释 → 空格（行列位不变）⇒ 注释里的读形**不算读取**
-    const masked = structuralMask(code);         // 再把字符串正文抹平 ⇒ 用来判「这个位置是不是串里的文字」
-    const ctx = analyzeEnvReads(code);
+    const masked = structuralMask(text);         // 原文的「结构掩码」⇒ 判「这个位置是不是串/正则正文」用**原文**那份
+    const ctx = analyzeEnvReads(code, text);
     // env **对象**那一跳也可能带可选链（`process?.env?.X`，#587 族 A③）⇒ 前缀写成 `process\s*\??\.\s*env`。
     const objs = ['process\\s*\\??\\.\\s*env', ...[...ctx.envObjs].map(escRe)];
     const OBJ = `(?:${objs.join('|')})`;
@@ -729,7 +743,10 @@ const RUNNER_SCAN = scanEnvReads(RUNNER_ROOT, { rootLabel: 'runner' });
 const RUNNER_ENV_KEYS = scanEnvKeys(RUNNER_ROOT);
 assertScannerFoundKeys(RUNNER_ENV_KEYS.size, `扫描根 ${path.relative(process.cwd(), RUNNER_ROOT)}/`);
 
-/** 例外清单：读 + 判**理由字段**（没有理由的例外不算例外）。返回 `{ entries, problems }`。 */
+/**
+ * 例外清单：读 + 判**理由字段** + 现跑咬合。返回 `{ entries, unsupported, problems }`。
+ * `unsupported` 的核对**必须带扫描器现在的结果**（族 B②：登记要绑定到真读站点，不许自由散文）。
+ */
 function loadEnvLegExceptions() {
   let doc;
   try {
@@ -743,7 +760,7 @@ function loadEnvLegExceptions() {
   return {
     entries,
     unsupported,
-    problems: [...validateEntries(entries), ...validateUnsupported(unsupported)],
+    problems: [...validateEntries(entries), ...validateUnsupported(unsupported, REPO_ROOT, RUNNER_SCAN.unsupported)],
   };
 }
 
@@ -1053,7 +1070,51 @@ const TIMEOUT_KEYS = [...new Set(Object.values(LLM_TIMEOUT_ENV))];
 /** 本文件自己的源码（判据拿它自证「没有把 env 名抄进来」）。 */
 const SELF_TEXT = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8');
 
-const WHERE_REF = /([A-Za-z0-9_./-]+\.(?:js|mjs|cjs))(?::(\d+))?/g;
+// ===========================================================================
+// 族 B（issue #587）：**可核对坐标**的唯一一把尺
+//
+// `where`、`unsupported[].at`、以及 `unsupported[].reason` 里引用的坐标**全部走这里**，
+// 否则「理由里的引用」与「坐标字段」会分叉成两本账（族 B②要的正是「同一个引用换个位置写也得住」）。
+// ===========================================================================
+
+/**
+ * 坐标引用形状。**故意**比「合法坐标」更宽：认 `.json`/绝对路径/行范围。
+ * 写歪了要能点名并给出**能照着改**的文案，而不是「一个引用都没扫到」再报一句「这是说明文字」。
+ * 后缀后面钉 `(?![A-Za-z0-9_])`：否则 `env-legs-exceptions.json` 会被匹配成 `env-legs-exceptions.js`
+ * （前缀巧合），报出「文件不存在」这种**看着合理但不对**的文案。
+ * —— 那句话对 `deploy/env-legs-exceptions.json:12` 是误导（它当然是坐标，只是不是 JS 坐标）。
+ */
+const COORD_REF = /(?<abs>\/)?(?<path>[A-Za-z0-9_.+-]+(?:\/[A-Za-z0-9_.+-]+)*)\.(?<ext>js|mjs|cjs|json|ya?ml|yml|md|ts|sh|lock|env)(?![A-Za-z0-9_])(?::\s*(?<from>\d+)(?:\s*-\s*(?<to>\d+))?)?/g;
+/** 可核对的代码坐标只认 JS 源文件（`.json`/`.yml` 是**数据**，判据不替它核对内容）。 */
+const JS_SOURCE_EXT = new Set(['js', 'mjs', 'cjs']);
+/** 测试面（族 B①.1）：这些目录里的 env 名字多半是**断言字符串**，不是「产品代码在这儿读了它」。 */
+const TEST_FACE_DIRS = new Set(['test', 'tests', '__tests__', 'node_modules', 'fixtures', 'probes', 'integration']);
+
+/** `portal/test/provisioner.test.js`、`test/lib/js-source.mjs`、`**\/*.test.js` ⇒ 测试面。 */
+function isTestFace(rel) {
+  const segs = String(rel ?? '').split('/');
+  const base = segs[segs.length - 1] ?? '';
+  // #587 族 B 返工①：旧口径只认 `.test.js`，`.spec.mjs` / `.spec.ts` 这类**测试面漏网**
+  // （审计实测：`x.spec.mjs` 里的裸串坐标被当成有效坐标）。
+  return segs.some((s) => TEST_FACE_DIRS.has(s)) || /\.(test|spec)\.[cm]?[jt]s$/.test(base);
+}
+
+/** 从一段文本里取坐标引用（`where`、`unsupported.reason` 共用）。 */
+function parseCoordRefs(text) {
+  return [...String(text ?? '').matchAll(COORD_REF)].map((m) => ({
+    raw: m[0],
+    abs: m.groups.abs === '/',
+    ext: m.groups.ext,
+    rel: `${m.groups.path}.${m.groups.ext}`,
+    from: m.groups.from ? Number(m.groups.from) : null,
+    to: m.groups.to ? Number(m.groups.to) : null,
+    // #587 族 B 返工③：行号从 1 起；`:10-`（缺右端点）在正则里被当成 `:10` 静默接受 ⇒ 显式标坏。
+    // ⚠ 那个 `-` **不在** `m[0]` 里（COORD_REF 只吃到 `:10`）⇒ 必须看匹配**之后**的文本。
+    badRange: /^\s*-/.test(String(text ?? '').slice(m.index + m[0].length))
+      || (m.groups.from != null && Number(m.groups.from) < 1)
+      || (m.groups.to != null && Number(m.groups.to) < 1),
+  }));
+}
 
 function splitCoord(at) {
   const m = /^(.*):(\d+)$/.exec(String(at ?? '').trim());
@@ -1062,22 +1123,373 @@ function splitCoord(at) {
 
 const normRead = (t) => String(t ?? '').replace(/\s+/g, '');
 
-/** 扫描器认得读形、但解析不出 env 名的那些（运行期拼名）—— 每一条都必须登记并带理由。 */
-/** `root` 默认仓库根（盘上那份）；夹具把 `root` 换成临时目录，共用同一把尺。 */
-function validateUnsupported(items, root = REPO_ROOT) {
+/** 第 `n` 行（1 起）在文本里的 `[start, end)`；没有那一行 ⇒ null。 */
+function lineRange(text, n) {
+  let start = 0;
+  for (let i = 1; i < n; i += 1) {
+    const nl = text.indexOf('\n', start);
+    if (nl < 0) return null;
+    start = nl + 1;
+  }
+  const nl = text.indexOf('\n', start);
+  return [start, nl < 0 ? text.length : nl];
+}
+
+/** `code`（已剥注释）与 `masked`（再把串/正则正文抹平）**不相等**的位置 = 串正文/正则正文 ⇒ 不是代码位。 */
+function isCodePosition(code, masked, start, len) {
+  for (let i = start; i < start + len; i += 1) {
+    if (i >= code.length || masked[i] !== code[i]) return false;
+  }
+  return true;
+}
+
+/** 包住 `pos` 的那段**被抹平的正文**（从 `code` 取原文）；`pos` 自己在代码位 ⇒ null。 */
+function maskedBodyAround(code, masked, pos) {
+  const blank = (i) => i >= 0 && i < code.length && code[i] !== '\n' && masked[i] === ' ';
+  if (!blank(pos) || code[pos] === ' ') return null;
+  let a = pos;
+  let b = pos;
+  while (blank(a - 1)) a -= 1;
+  while (blank(b + 1)) b += 1;
+  return code.slice(a, b + 1);
+}
+
+/**
+ * `key` 在 `code[start, end)` 里有没有**结构性**出现（族 B①.2「字符串正文不算坐标」的可执行口径）：
+ *   ① 代码位：`process.env.KEY` / `env.KEY` / 裸标识符 `KEY`；
+ *   ② 字符串正文**就是这个 env 名**：`{ a: 'KEY' }` 数据表、`'KEY'` 白名单成员、`key = 'KEY'` 默认值；
+ *   ③ 串正文是**注入形** `KEY=…`：provisioner 的 `` `ERIX_X=${v}` ``。
+ * 反例（都不算坐标）：散文串里顺带提到（`'KEY 已经接好'`）、注释正文、正则正文。
+ * 为什么 ②③ 必须放过：真读取坐标里 env 名**本来就活在串里**（数据表 / 白名单 / 注入模板），
+ * 一律抹平会把 8 条真登记一起误杀 —— 那是「判据围着样本转」的反面。
+ */
+function mentionsKeyIn(code, masked, start, end, key, opts = {}) {
+  // #587 族 B 返工①：**测试面豁免**下不许再拿「裸串恰好等于 key」当坐标——
+  // 审计实测：`where` 指向 `*.spec.mjs` + 任意非空 `whereTest` 理由 ⇒ 一个只在断言串里
+  // 出现的假坐标就能过。数据表那种裸串坐标（`{ a: 'ERIX_X' }`）在**非测试面**仍然放行。
+  const allowBareString = opts.allowBareString !== false;
+  let i = start;
+  while (i < end) {
+    i = code.indexOf(key, i);
+    if (i < 0 || i >= end) return false;
+    if (isCodePosition(code, masked, i, key.length)) return true;
+    const body = maskedBodyAround(code, masked, i);
+    if (body !== null) {
+      const t = body.trim();
+      // #587 族 B 返工②：**正则正文不算坐标**（正则不是代码）。掩码保留定界符 ⇒ 回退到
+      // 被抹平区段的起点，看它的定界符：`/` ⇒ 正则，`'`/`"`/`` ` `` ⇒ 字符串（数据表那种裸串才算坐标）。
+      let rs = i;
+      while (rs > 0 && code[rs - 1] !== '\n' && masked[rs - 1] === ' ') rs -= 1;
+      const delim = code[rs - 1];
+      if (delim !== '/') {
+        if (t.startsWith(`${key}=`)) return true;   // 注入形 `KEY=…` 恒算
+        if (allowBareString && t === key) {
+          // #587 族 B 三轮②：**对象键位**的串不是数据证据（`{'ERIX_X': 1}` 里 key 只是属性名）。
+          // 只有**值位**串算（`a: 'ERIX_X'`、`['ERIX_X']`、`key = 'ERIX_X'`）⇒ 看闭引号之后的第一个非空字符。
+          let re2 = i;
+          while (re2 < masked.length && code[re2] !== '\n' && masked[re2] === ' ') re2 += 1;
+          // 跳过**闭引号**（掩码把引号留下了，但它在串正文之外 ⇒ 停在引号上会看不见后面的 `:`）
+          if (code[re2] === "'" || code[re2] === '"' || code[re2] === '`') re2 += 1;
+          // #587 族 B 四轮：**计算键** `{ ['ERIX_X']: 1 }` —— 闭引号之后先跟 `]`，再才是 `:`
+          while (code[re2] === ' ' || code[re2] === '\t') re2 += 1;
+          if (code[re2] === ']') { re2 += 1; }
+          let k = re2;
+          while (k < code.length && (code[k] === ' ' || code[k] === '\t')) k += 1;
+          if (code[k] !== ':') {
+            // #587 族 B 四轮：**裸标量声明不算数据证据**（`const MSG = 'ERIX_X'` 只是文案）。
+            // 真坐标的裸串都在**容器内**：对象值 `a: 'ERIX_X'`、数组元素 `['ERIX_X', v]`、
+            // 调用实参 `intEnv(env, 'ERIX_X', 1002)` ⇒ 该行必须出现 `(`/`{`/`[`。
+            // 判据看**串前面那个符号**：`:`/`(`/`[`/`,` ⇒ 容器内的值（对象值、数组元素、调用实参）；
+            // `=` ⇒ 标量声明（`const MSG = 'ERIX_X'` 只是文案，不算数据证据）。
+            let pv = rs - 2;   // `rs-1` 是**开引号**，要看它前面那个符号
+            while (pv >= 0 && (code[pv] === ' ' || code[pv] === '\t')) pv -= 1;
+            if ([':', '(', '[', ','].includes(code[pv])) return true;
+            // `=` 也有一类合法：**形参默认值**（`key = 'ERIX_X'` 在参数表里）⇒ 该行前面出现过 `(`
+            if (code[pv] === '=') {
+              const ls2 = code.lastIndexOf('\n', pv - 1) + 1;
+              return code.slice(ls2, pv).includes('(');
+            }
+            return false;
+          }
+        }
+      }
+    }
+    i += 1;
+  }
+  return false;
+}
+
+/** 那一行含该 key 的字面量，或含一个能解析到它的常量名（表驱动那种真坐标必须算通过）。 */
+function lineMentionsKey(code, masked, ctx, key, start, end, opts = {}) {
+  if (mentionsKeyIn(code, masked, start, end, key, opts)) return true;
+  for (const m of code.slice(start, end).matchAll(new RegExp(IDENT_RE, 'g'))) {
+    const at = start + m.index;
+    if (!isCodePosition(code, masked, at, m[0].length)) continue;   // 串正文里「长得像标识符」的文字不算名字引用
+    // #587 族 B 三轮②（续）：**声明目标本身不是读取**。`const item = { 'ERIX_X': 1 }` 里 `item`
+    // 会被名字表解析成那个 key，于是「对象键位」的假坐标从这条路绕回来了（父 agent 实测）。
+    {
+      let t2 = at + m[0].length;
+      while (t2 < code.length && (code[t2] === ' ' || code[t2] === '\t')) t2 += 1;
+      const isAssign = code[t2] === '=' && code[t2 + 1] !== '=' && code[t2 + 1] !== '>';
+      if (isAssign) {
+        let t3 = at - 1;
+        while (t3 >= 0 && (code[t3] === ' ' || code[t3] === '\t')) t3 -= 1;
+        const before = code.slice(Math.max(0, t3 - 5), t3 + 1);
+        if (/[;{}(,]\s*(const|let|var)?$/.test(before) || /\b(const|let|var)\s*$/.test(before)) continue;
+      }
+    }
+    const lits = resolveExpr(m[0], ctx, at);
+    if (lits && lits.has(key)) return true;
+  }
+  return false;
+}
+
+/** 那一行有没有「某个 env 名」的结构化证据（`unsupported` 的理由引用没有 key 上下文，用这个口径）。 */
+function lineHasEnvEvidence(code, masked, start, end) {
+  for (const m of code.slice(start, end).matchAll(new RegExp(IDENT_RE, 'g'))) {
+    if (!ENV_LITERAL.test(m[0]) || m[0].length < 5) continue;
+    const at = start + m.index;
+    if (isCodePosition(code, masked, at, m[0].length)) return true;
+    const body = maskedBodyAround(code, masked, at);
+    if (body !== null) {
+      const t = body.trim();
+      if (t === m[0] || t.startsWith(`${m[0]}=`)) return true;
+    }
+  }
+  return false;
+}
+
+/** 测试面坐标的**显式豁免**（默认拒）：`whereTest: '<非空理由>'`，或 `whereTest: true` + `whereTestReason`。 */
+function testFaceWaiver(e) {
+  if (typeof e?.whereTest === 'string' && e.whereTest.trim() !== '') return e.whereTest.trim();
+  if (e?.whereTest === true && typeof e?.whereTestReason === 'string' && e.whereTestReason.trim() !== '') {
+    return e.whereTestReason.trim();
+  }
+  return null;
+}
+
+/**
+ * 一把尺（按 root 建，带文件缓存）。`problemsFor(ref, { key, sources, tag, waiverDeclared })`：
+ *   · 绝对路径 / 非 JS 后缀 / **测试面** ⇒ 红（文案要能照着改）；
+ *   · 文件不存在 / 行号越界 ⇒ 红；
+ *   · 给了行 ⇒ **逐行**验（行范围 `f.js:10-12` 不许静默只验首行）；
+ *   · `key` 给了 ⇒ 那一行必须含该 key（①②③ 之一）或能解析到它的常量名；`key` 为 null ⇒ 只要该行有 env 名的结构化证据。
+ */
+function makeCoordChecker(root) {
+  const cache = new Map();
+  const read = (rel) => {
+    if (!cache.has(rel)) {
+      const raw = fs.readFileSync(path.join(root, rel), 'utf8');
+      const code = stripComments(raw);
+      // 族 B①.2：**坐标判定必须看 structuralMask**（串正文 + 正则正文 + 注释一起抹平）。
+      // `stripComments` 只剥注释 ⇒ 「测试文件把 env 名当字符串写了 7 次」也能当坐标（#587 族 B 的复现本体）。
+      // 族 B①.2：坐标判定必须看 `structuralMask`（串正文 + 正则正文 + 注释一起抹平）——
+      // `stripComments` 只剥注释 ⇒「测试文件把 env 名当字符串写了 7 次」也能当坐标（#587 族 B 的复现本体）。
+      // 掩码**必须从原文算**：`structuralMask(stripComments(x))` 与 `structuralMask(x)` **不等价**（实测
+      // `portal/src/provisioner.js`：`:229` 那个「模板里嵌模板」的行之后两者就分叉，`:366` 整行被误抹成
+      // 串正文 ⇒ 真坐标 `portal/src/provisioner.js:366` 会被判「不含该 key」）。两者都保留行列位 ⇒ 同下标可比。
+      cache.set(rel, { code, masked: structuralMask(raw), ctx: analyzeEnvReads(code) });
+    }
+    return cache.get(rel);
+  };
+
+  return function problemsFor(ref, opts) {
+    const { key, sources, tag, waiverDeclared = false } = opts;
+    const problems = [];
+    const range = ref.from == null ? '' : `:${ref.from}${ref.to != null && ref.to !== ref.from ? `-${ref.to}` : ''}`;
+    const shown = `${ref.rel}${range}`;
+    if (ref.badRange) {
+      problems.push(`${tag} 的行范围\`${ref.raw}\`**语法不合法**：行号从 1 起，右端点不许省（\`:10-\` 要写成 \`:10-10\` 或直接 \`:10\`）⇒ 旧口径把 \`:10-\` 当成 \`:10\` 静默接受，等于放过一个写坏了的坐标`);
+      return problems;
+    }
+    if (ref.abs) {
+      problems.push(`${tag} 是**绝对路径**（\`${ref.raw}\`）⇒ 坐标必须是**仓库根相对**路径，改成 \`${ref.rel}${range}\` 这种写法`
+        + '（判据要在别人的机器、CI 的临时目录里也能跑；绝对路径把机器写进了登记）');
+      return problems;
+    }
+    if (!JS_SOURCE_EXT.has(ref.ext)) {
+      problems.push(`${tag}（\`${ref.raw}\`）不是 JS 源文件 ⇒ 判据只核对 \`.js\`/\`.mjs\`/\`.cjs\` 的行内容`
+        + `（\`.${ref.ext}\` 是数据/文档，它的行号会随格式化漂移）。把这条事实写进 \`reason\`，`
+        + `\`where\` 改成真正读这个 env 的那一行（例：\`runner/lib/<模块>.js:<行>\`）`);
+      return problems;
+    }
+    if (isTestFace(ref.rel)) {
+      if (!waiverDeclared) {
+        problems.push(`${tag} **坐标指向测试代码**（\`${shown}\` 在 \`test\`/\`*.test.js\` 面）⇒ 测试里出现这个 env 名`
+          + '（通常只是断言用的**字符串**）不等于产品代码在那里读它。改成 runner/portal 里的真读站点坐标；'
+          + "确有例外就显式声明 \`\"whereTest\": \"<为什么只能指测试面>\"\`（默认拒，不是默认放行）");
+        return problems;
+      }
+    }
+    const abs = path.join(root, ref.rel);
+    if (!fs.existsSync(abs)) {
+      problems.push(`${tag} **文件不存在**（坐标指向不存在的文件 ${ref.rel}）⇒ 等于没取证`);
+      return problems;
+    }
+    const { code, masked, ctx } = read(ref.rel);
+    const total = code.split('\n').length;
+    if (ref.from == null) {
+      const underRunner = path.resolve(abs).startsWith(RUNNER_ROOT + path.sep);
+      if (underRunner) {
+        const relToCheck = path.relative(RUNNER_ROOT, abs).split(path.sep).join('/');
+        if (sources?.get(key)?.has(relToCheck)) return problems;
+        problems.push(`${tag} 只给了文件没给行，而扫描器在 \`${relToCheck}\` 里**没发现对 ${key} 的活读**`
+          + ' —— 坐标是**注释背书**的（#557 那条 `ERIX_AGENT_VERSION` 就栽在这一点上，见它的 reason）');
+        return problems;
+      }
+      // #587 族 B 三轮①：**文件级**引用也必须带豁免选项（旧代码在这里漏传 ⇒ 豁免下
+      // 文件级引用照样吃裸串，审计实测可绕过）
+      if (key != null && mentionsKeyIn(code, masked, 0, code.length, key, { allowBareString: !opts.waiverDeclared })) return problems;
+      if (key == null) return problems;
+      problems.push(`${tag} 只给了文件，而整个文件的**代码**（剥掉注释、抹掉串正文后）里没有 ${key} ⇒ 坐标过期`);
+      return problems;
+    }
+    if (ref.to != null && ref.to < ref.from) {
+      problems.push(`${tag} 的行范围是反的（:${ref.from}-${ref.to}）⇒ 写成 \`${ref.rel}:${ref.to}-${ref.from}\``);
+      return problems;
+    }
+    if (ref.to != null && ref.to - ref.from > 30) {
+      problems.push(`${tag} 的行范围宽 ${ref.to - ref.from + 1} 行（>30）⇒ 「整段」不是在给一行证据：`
+        + '收窄成真读取那一行，或用 `；` 分别引用');
+      return problems;
+    }
+    for (let ln = ref.from; ln <= (ref.to ?? ref.from); ln += 1) {
+      const span = lineRange(code, ln);
+      if (span == null) {
+        problems.push(`${tag} 指到第 ${ln} 行，但那个文件只有 ${total} 行 ⇒ 坐标过期`);
+        continue;
+      }
+      const ok = typeof opts.lineOk === 'function'
+        ? opts.lineOk(ln, code.slice(span[0], span[1]))
+        : (key == null ? lineHasEnvEvidence(code, masked, span[0], span[1])
+          : lineMentionsKey(code, masked, ctx, key, span[0], span[1], { allowBareString: !opts.waiverDeclared }));
+      if (ok) continue;
+      const text = code.slice(span[0], span[1]).trim().slice(0, 90);
+      const why = typeof opts.lineOk === 'function'
+        ? opts.lineWhy
+        : (key == null
+          ? '那一行**没有任何 env 名的结构化证据**（既不是代码位的 env 名，也不是值位串里的 env 名）'
+          : '那一行**不含该 key**（也没有能解析到它的常量名）');
+      problems.push(`${tag} ${why}。实际内容：\`${text}\` ⇒ 坐标是编的或已漂移：`
+        + '**行号看着合理不等于它对**（注释里出现过、串里顺带提到过都不算，要代码位或值位串）'
+        + (ref.to != null && ref.to !== ref.from
+            ? `\n  行范围 \`${range}\` 是**逐行**判的：第 ${ln} 行没过就红，不许静默只验首行`
+            : ''));
+    }
+    return problems;
+  };
+}
+
+/**
+ * `where` 是**可校验坐标**（活二 + 族 B①）：每个引用都必须存在、必须是 JS 源文件、必须不在测试面，
+ * 带行的那**几行**必须含该 key 的字面量（代码位 / 值位串 / 注入形）或能解析到它的常量名；
+ * 只给文件不给行 ⇒ 扫描器必须在那个文件里发现对该 key 的**活读**。`sources` 传 `RUNNER_ENV_KEYS`。
+ */
+
+/**
+ * `unsupported` 段的「不许免证」（族 B②）：
+ *   · `at` 必须是**扫描器现在真的认得出的动态读站点**（`detected` 传 `scanEnvReads(...).unsupported`；
+ *     不传 ⇒ 只跑坐标卫生检验，给不需要咬合的夹具用）；文件不存在 / 行号不含该读形 ⇒ 红；
+ *   · 理由必须含至少一个可核对的 `路径.js:行` 引用，而且那个引用过**同一把尺**（同不在测试面、
+ *     不许绝对路径、不许 `.json`）—— 自由散文不接受；
+ *   · `read` / `reason` / 重复登记 的旧口径全部保留（只加不减）。
+ * @param {Array} items 登记的 `unsupported` 条目
+ * @param {string} root 坐标解析的根（盘上那份 = 仓库根；夹具 = 临时目录）
+ * @param {Array<{at:string, shape:string}>|null} detected 扫描器现在扫到的动态读形（带 rootLabel 的坐标）
+ */
+function validateUnsupported(items, root = REPO_ROOT, detected = null) {
   const problems = [];
   const seen = new Set();
+  const coord = makeCoordChecker(root);
   items.forEach((u, i) => {
     const at = `unsupported[${i}]`;
     if (u === null || typeof u !== 'object' || Array.isArray(u)) { problems.push(`${at} 不是对象`); return; }
-    const { rel, line } = splitCoord(u.at);
-    if (!rel || line == null) problems.push(`${at} 的 \`at\` 必须是 \`路径.js:行\` 坐标（实际 ${JSON.stringify(u.at)}）`);
-    else if (!fs.existsSync(path.join(root, rel))) problems.push(`${at} 的 \`at\` 指向不存在的文件 ${rel}`);
+    const refs = parseCoordRefs(u.at);
+    if (refs.length !== 1 || refs[0].from == null || refs[0].to != null) {
+      problems.push(`${at} 的 \`at\` 必须是 \`路径.js:行\` 坐标（实际 ${JSON.stringify(u.at)}）`);
+    } else {
+      const ref = refs[0];
+      const sameShape = detected?.find((d) => splitCoord(d.at).rel === ref.rel && normRead(d.shape) === normRead(u.read)) ?? null;
+      problems.push(...coord(ref, {
+        key: null,
+        sources: null,
+        tag: `${at} 的 \`at\`（${u.at}）`,
+        lineOk: detected === null ? () => true : (ln) => detected.some((d) => {
+          const c = splitCoord(d.at);
+          return c.rel === ref.rel && c.line === ln && normRead(d.shape) === normRead(u.read);
+        }),
+        lineWhy: sameShape
+          ? `那一行**不是这个读形所在的行**：同一个读形现在在 \`${sameShape.at}\` ⇒ 坐标必须指到那一行（别把动态读登在旁边那行）`
+          : `扫描器在 \`${ref.rel}\` 里**根本没看到这个读形**（登记的 \`${u.read}\` 是虚构的或已改形）`
+            + ' ⇒ 现跑一次扫描器、照抄它给出的形状与行号',
+      }));
+    }
     if (typeof u.read !== 'string' || u.read.trim() === '') problems.push(`${at} 缺 \`read\`（要登记的是那个**读形**本身）`);
     if (typeof u.reason !== 'string' || u.reason.trim() === '') {
       problems.push(`${at}（read=${u.read}）**缺理由字段 reason**：没有理由的例外不算例外`);
+      return;
     }
-    const k = `${rel}::${normRead(u.read)}`;
+    // 理由必须引事实（族 B②）：至少一个 JS 坐标引用，且**每一个**引用都过同一把尺
+    const reasonRefs = parseCoordRefs(u.reason);
+    const usable = reasonRefs.filter((r) => !r.abs && JS_SOURCE_EXT.has(r.ext) && !isTestFace(r.rel));
+    if (usable.length === 0) {
+      problems.push(`${at}（read=${u.read}）的理由是**自由散文**：里面没有一个可核对的 \`路径.js:行\` 引用`
+        + ' ⇒ 「扫不出来」这件事必须能被重新核对（名字从哪里来？给我那行坐标）：写不成坐标的理由不算理由');
+    }
+    // #587 族 B 返工④：理由里的引用必须**指到这条动态读自己**（覆盖 `at` 那一行），
+    // 或指到它的**数据表声明行**（那一行含 `read` 里那个动态 key 的标识符，如 `process.env[name]` 的 `name`）。
+    // 审计实测：只要求「引用一个含任意 env 名的合法行」⇒ 堆一行无关代码就能豁免。
+    const atRef = splitCoord(u.at);
+    const keyIdent = /\[\s*([A-Za-z_$][\w$]*)\s*\]/.exec(String(u.read ?? ''))?.[1] ?? null;
+    // ⚠ 这里**没有** `read` 可用（`validateUnsupported` 只建了 `coord`）——自建一个读器，
+    // 否则 `try/catch` 会把 ReferenceError 吞掉、`existing` 恒空、相关性检查静默失效。
+    const readSrc = (rel) => {
+      const raw = fs.readFileSync(path.join(root, rel), 'utf8');
+      return { code: stripComments(raw), masked: structuralMask(raw) };
+    };
+    /** 该行是**声明/数据表**行吗？判据：有 env 名字面量（代码位或值位串），且**它自己不是 env 读行**。
+     *  #587 族 B 三轮④：审计实测「第 3 行 `const unrelated = process.env.ERIX_UNRELATED + name;`」
+     *  曾被当成数据表声明给第 5 行的动态读背书 —— env 读行不是声明行，这条把它挡掉。 */
+    const isDeclLike = (rel, from, to) => {
+      const { code, masked } = readSrc(rel);
+      const totalLines = code.split('\n').length;
+      const clampLn = (n) => Math.min(Math.max(1, n), totalLines);
+      const a = lineRange(code, clampLn(from));
+      if (a == null) return false;
+      const b = to == null || to === from ? a : (lineRange(code, clampLn(to)) ?? a);
+      const seg = code.slice(a[0], b[1]);
+      if (/\bprocess\s*\.\s*env\b|\benv\s*[.[]/.test(seg)) return false;   // 自己就是 env 读行
+      // #587 族 B 四轮：**裸标量声明不算数据表**（`const MSG = 'ERIX_X'` 只是文案，审计实测能背书动态读）。
+      // 数据表的形状是「容器内的值」⇒ 该行必须出现 `{` 或 `[`。
+      if (!/[\[{]/.test(seg)) return false;
+      return lineHasEnvEvidence(code, masked, a[0], b[1]);
+    };
+    const existingUsable = usable.filter((r) => { try { readSrc(r.rel); return true; } catch { return false; } });
+    const relatedOk = existingUsable.length === 0 || existingUsable.some((r) => {
+      if (r.rel !== atRef.rel) return false;
+      if (r.from == null) return true;                       // 文件级引用：至少同一文件
+      const lo = r.from;
+      const hi = r.to ?? r.from;
+      if (atRef.line != null && lo <= atRef.line && atRef.line <= hi) return true;   // 覆盖读站点
+      // 能力边界（写进注释，不藏）：**模板拼名**算不出单一标识符 ⇒ 只能要求「同一文件」。
+      // 代价：模板形状下同文件里拿无关行充数仍可能过；但 `env[name]` 这类**算得出标识符**的形状
+      // 已被下面那条「必须是声明行」堵死（审计实测的两条绕过都属于这一类）。
+      if (keyIdent == null) return true;
+      return isDeclLike(r.rel, lo, hi);                                              // 声明/数据表行
+    });
+    if (!relatedOk) {
+      problems.push(`${at}（read=${u.read}）的理由里**没有一个引用指到这条动态读**：要么覆盖 \`${u.at}\` 那一行，`
+        + `要么指到它的数据表声明行（那一行得含 \`${keyIdent ?? '<动态 key 的标识符>'}\`）⇒ `
+        + '拿「同一文件里另一行含某个 env 名」充数不算证据（#587 族 B 返工④，审计实测可绕过）');
+    }
+    reasonRefs.forEach((r, j) => {
+      // #587 族 B 四轮返工（261117 实测）：理由里**提到测试文件**是**背景说明**（「某某 test 有反向判据钉住」），
+      // 不是坐标 ⇒ 不按坐标校验，否则真登记会被自己的散文误杀（这是假红，不是漏放）。
+      if (isTestFace(r.rel)) return;
+      const range = r.from == null ? '' : `:${r.from}${r.to != null && r.to !== r.from ? `-${r.to}` : ''}`;
+      problems.push(...coord(r, { key: null, sources: null, tag: `${at} 的理由里的第 ${j + 1} 个引用 ${r.rel}${range}` }));
+    });
+    const k = `${splitCoord(u.at).rel}::${normRead(u.read)}`;
     if (seen.has(k)) problems.push(`${at}（read=${u.read}）重复登记：同一个读形只能有一条`);
     seen.add(k);
   });
@@ -1122,69 +1534,34 @@ function unsupportedProblems(detected, registered) {
  */
 function whereProblems(entries, sources, root = REPO_ROOT) {
   const problems = [];
-  const cache = new Map();
-  const analyze = (rel) => {
-    if (!cache.has(rel)) {
-      const code = stripComments(fs.readFileSync(path.join(root, rel), 'utf8'));
-      cache.set(rel, { code, ctx: analyzeEnvReads(code) });
-    }
-    return cache.get(rel);
-  };
+  const coord = makeCoordChecker(root);
   entries.forEach((e, i) => {
     const at = `exceptions[${i}]`;
     const where = typeof e?.where === 'string' ? e.where.trim() : '';
     if (where === '') { problems.push(`${at}（key=${e?.key}）**缺 where**：没有可校验坐标的例外等于没取证`); return; }
-    const refs = [...where.matchAll(WHERE_REF)].map((m) => ({ rel: m[1], line: m[2] ? Number(m[2]) : null }));
+    const refs = parseCoordRefs(where);
     if (refs.length === 0) {
       problems.push(`${at}（key=${e.key}）的 where 里没有任何 \`路径.js[:行]\` 引用 ⇒ 「${where}」是**说明文字**，`
         + '不是坐标：判据扫不到它，它会随改动自己变成假的');
       return;
     }
+    const waiver = testFaceWaiver(e);
+    if (e?.whereTest !== undefined && waiver === null) {
+      problems.push(`${at}（key=${e.key}）的 \`whereTest\` 豁免**不合法**：要么写 \`whereTest: "<非空理由>"\`，`
+        + '要么 `whereTest: true` + `whereTestReason: "<非空理由>"`（光 `whereTest: true` 就是开了个没理由的口子）');
+    }
+    let usedWaiver = false;
     refs.forEach((ref, j) => {
-      const tag = `${at}（key=${e.key}）where 的第 ${j + 1} 个引用 ${ref.rel}${ref.line ? `:${ref.line}` : ''}`;
-      const abs = path.join(root, ref.rel);
-      if (!fs.existsSync(abs)) {
-        problems.push(`${tag} **文件不存在** ⇒ 坐标指向不在树上的文件，等于没取证`);
-        return;
-      }
-      if (ref.line == null) {
-        const underRunner = path.resolve(abs).startsWith(RUNNER_ROOT + path.sep);
-        if (underRunner) {
-          const relToCheck = path.relative(RUNNER_ROOT, abs);
-          if (sources.get(e.key)?.has(relToCheck)) return;
-          problems.push(`${tag} 只给了文件没给行，而扫描器在 \`${relToCheck}\` 里**没发现对 ${e.key} 的活读**`
-            + ' —— 坐标是**注释背书**的（#557 那条 `ERIX_AGENT_VERSION` 就栽在这一点上，见它的 reason）');
-          return;
-        }
-        if (analyze(ref.rel).code.includes(e.key)) return;
-        problems.push(`${tag} 只给了文件，而整个文件的**代码**（剥掉注释后）里没有 ${e.key} ⇒ 坐标过期`);
-        return;
-      }
-      const { code, ctx } = analyze(ref.rel);
-      const lines = code.split('\n');
-      const target = lines[ref.line - 1];
-      const lineStart = ref.line === 1 ? 0 : lines.slice(0, ref.line - 1).join('\n').length + 1;
-      if (target === undefined) {
-        problems.push(`${tag} 指到第 ${ref.line} 行，但那个文件只有 ${code.split('\n').length} 行 ⇒ 坐标过期`);
-        return;
-      }
-      if (lineMentionsKey(target, ctx, e.key, lineStart)) return;
-      problems.push(`${tag} 那一行**不含该 key**（也没有能解析到它的常量名）。实际内容：`
-        + `\`${target.trim().slice(0, 90)}\` ⇒ 坐标是编的或已漂移：**行号看着合理不等于它对**`
-        + '（注释里出现过也不算，剥完注释才算）');
+      const range = ref.from == null ? '' : `:${ref.from}${ref.to != null && ref.to !== ref.from ? `-${ref.to}` : ''}`;
+      const tag = `${at}（key=${e.key}）where 的第 ${j + 1} 个引用 ${ref.rel}${range}`;
+      if (isTestFace(ref.rel) && waiver !== null) usedWaiver = true;
+      problems.push(...coord(ref, { key: e.key, sources, tag, waiverDeclared: waiver !== null }));
     });
+    if (waiver !== null && !usedWaiver) {
+      problems.push(`${at}（key=${e.key}）声明了 \`whereTest\` 豁免，但坐标里没有一个在测试面 ⇒ **死豁免**（第二本账），删掉它`);
+    }
   });
   return problems;
-}
-
-/** 那一行含该 key 的字面量，或含一个能解析到它的常量名（表驱动那种真坐标必须算通过）。 */
-function lineMentionsKey(lineText, ctx, key, lineStart = 0) {
-  if (lineText.includes(key)) return true;
-  for (const m of lineText.matchAll(new RegExp(IDENT_RE, 'g'))) {
-    const lits = resolveExpr(m[0], ctx, lineStart + m.index);
-    if (lits && lits.has(key)) return true;
-  }
-  return false;
 }
 
 test('活二⑤ `where` 是坐标不是说明文字：五种假坐标都要红，盘上那份要全绿', () => {
@@ -1342,8 +1719,8 @@ test('活一⑧ 解析不出 env 名的读形 ⇒ 进 unsupported 清单；不�
     assert.match(unsupported[0].shape, /^env\[`ERIX_DYN_/);
     // ② 没登记 ⇒ 红
     assert.match(unsupportedProblems(unsupported, []).join('\n'), /没登记在 deploy\/env-legs-exceptions\.json/);
-    // ③ 登记带理由 ⇒ 绿（同一把尺，共用 validateUnsupported）
-    const reg = [{ at: 'dyn.js:1', read: unsupported[0].shape, reason: '拼名来自调用方，本站没有对应配置面' }];
+    // ③ 登记带理由 ⇒ 绿（同一把尺，共用 validateUnsupported；理由必须带可核对的 `路径:行`，族 B②）
+    const reg = [{ at: 'dyn.js:1', read: unsupported[0].shape, reason: '拼名来自调用方；同名旋钮的值域见 dyn.js:2' }];
     assert.deepEqual(unsupportedProblems(unsupported, reg), []);
     assert.deepEqual(validateUnsupported(reg, dir), []);
     // ④ 去掉理由 ⇒ 红（复用「无理由 ⇒ 红」那套机制的同一句措辞）
@@ -1797,6 +2174,362 @@ test('活二㉓ 解构形状解析不出 ⇒ fail loudly 进 unsupported，不�
       `形状「${name}」那条动态读没进 unsupported（实际 ${JSON.stringify(unsupported.map((u) => u.shape))}）：`
       + '解析不出就必须点名，不许静默放行（不设「记为已知边界」）');
   }
+});
+// ===========================================================================
+// 族 B（issue #587）：登记册的**坐标**与**豁免理由**能不能被糊弄
+//
+// 这一段的判据口径也只认事实：坐标**在不在树上、那一行到底写了什么、是不是测试面**。
+// 三格各自都带方向相反的对照组（真坐标必须绿），因为「把串正文一律抹掉」这种修法
+// 会顺手误杀 8 条真登记 —— 误杀真数据同样是判据坏了。
+// ===========================================================================
+
+/** 写一个临时**根目录**（`whereProblems` / `validateUnsupported` 都吃 `root` ⇒ 与真树共用同一把尺）。 */
+function fixtureRoot(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-coord-'));
+  for (const [f, text] of Object.entries(files)) {
+    const abs = path.join(dir, f);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, text);
+  }
+  return dir;
+}
+
+test('活二㉔ B-①.1 `where` 不许指向测试面：默认拒，显式 whereTest 豁免才放行（主 agent 的复现必须红）', () => {
+  const { entries } = loadEnvLegExceptions();
+  const token = entries.find((e) => e.key === 'ERIX_STATION_TOKEN');
+  assert.ok(token, 'ERIX_STATION_TOKEN 还在例外清单里（不许为了让判据变绿删条目）');
+  const prob = (patch) => whereProblems([{ ...token, ...patch }], RUNNER_ENV_KEYS).join('\n');
+  // ① 复现本体：`where` 指到「把这个名字当字符串写了 7 次」的测试文件 ⇒ 必须红并点名测试代码
+  const fake = prob({ where: 'portal/test/provisioner.test.js' });
+  assert.match(fake, /坐标指向测试代码/, '把 where 指到测试文件却没人报 ⇒ 「文本命中」又被当成坐标');
+  assert.match(fake, /ERIX_STATION_TOKEN/, '红得没有信息 = 没人能修（必须点名是哪个键）');
+  // ② 带行也拒：那一行确实是 `'ERIX_STATION_TOKEN='`，但它是**测试断言里的字符串**
+  assert.match(prob({ where: 'portal/test/provisioner.test.js:262' }), /坐标指向测试代码/);
+  // ③ 仓库根的 `test/**` 与任意 `*.test.js` 同口径
+  assert.match(prob({ where: 'test/lib/js-source.mjs:1' }), /坐标指向测试代码/);
+  // ④ 反向自证：盘上 27 条真登记的坐标一条都不在测试面，而且全都绿
+  assert.deepEqual(whereProblems(entries, RUNNER_ENV_KEYS), [], '盘上那份被测试面守卫误杀了');
+  assert.ok(!entries.some((e) => parseCoordRefs(e.where).some((r) => isTestFace(r.rel))),
+    '真登记里出现了测试面坐标（那要连带复核这条守卫是不是形同虚设）');
+  // ⑤ 豁免必须带理由；配不上坐标的豁免（死豁免）也红
+  assert.deepEqual(prob2(token, { where: 'portal/test/provisioner.test.js:262', whereTest: '注入面没有对应文件，只有夹具能核对' }), [],
+    '带理由的显式豁免应当放行（否则默认拒就变成了「测试面一律不可用」）');
+  assert.deepEqual(prob2(token, { where: 'portal/test/provisioner.test.js:262', whereTest: true, whereTestReason: '同上' }), [],
+    '`whereTest: true` + `whereTestReason` 是同一种豁免的另一种写法');
+  assert.match(prob({ where: 'portal/test/provisioner.test.js:262', whereTest: true }), /不合法/,
+    '光 `whereTest: true`（没理由）就放行 ⇒ 豁免本身成了免证');
+  assert.match(prob({ where: 'portal/test/provisioner.test.js:262', whereTest: '   ' }), /不合法/);
+  assert.match(prob({ where: 'runner/agentd.js:48', whereTest: '没坐标配的豁免' }), /死豁免/,
+    '声明了豁免但坐标不在测试面 ⇒ 留着就是第二本账');
+});
+
+/** 单条登记的坐标问题（数组，绿就是空数组）。 */
+function prob2(entry, patch) {
+  return whereProblems([{ ...entry, ...patch }], RUNNER_ENV_KEYS);
+}
+
+test('活二㉕ B-①.2 字符串正文不算坐标：散文串/正则正文/注释红，代码位 + 值位串 + 注入形绿', () => {
+  const dir = fixtureRoot({
+    'prose.js': "export const note = 'ERIX_B1_PROSE_ONLY 已经在 compose 里接好了';\n",
+    'read.js': 'export const v = process.env.ERIX_B1_DOT_READ;\n',
+    'table.js': "const T = Object.freeze({ a: 'ERIX_B1_TABLE_NAME' });\nexport const t = T;\n",
+    'inject.js': 'export function f(t) { return [`ERIX_B1_INJECT=${t}`]; }\n',
+    'regexy.js': 'export const re = /env.ERIX_B1_IN_REGEX/;\n',
+    'commented.js': '// export const v = process.env.ERIX_B1_IN_COMMENT;\nexport const w = 1;\n',
+  });
+  try {
+    const probs = (file, key) => whereProblems([{ key, reason: 'r', where: `${file}:1` }], new Map(), dir);
+    const prob = (file, key) => probs(file, key).join('\n');
+    for (const [file, key] of [
+      ['prose.js', 'ERIX_B1_PROSE_ONLY'],   // 散文串里顺带提到
+      ['regexy.js', 'ERIX_B1_IN_REGEX'],    // 正则正文里顺带提到
+      ['commented.js', 'ERIX_B1_IN_COMMENT'], // 注释正文
+    ]) {
+      assert.match(prob(file, key), /不含该 key/, `${file}:1 的名字只活在散文/正则/注释里，却还能当坐标 ⇒ 掩码那把尺没生效`);
+    }
+    for (const [file, key] of [
+      ['read.js', 'ERIX_B1_DOT_READ'],       // 代码位
+      ['table.js', 'ERIX_B1_TABLE_NAME'],    // 值位串：数据表里挑名字
+      ['inject.js', 'ERIX_B1_INJECT'],       // 注入形：`KEY=${v}`
+    ]) {
+      assert.deepEqual(probs(file, key), [], `${file}:1 是**真坐标**（env 名本来就以这种形状存在）却被误杀`);
+    }
+    // 真树反向自证：盘上真登记的 env 名**就活在串里**（参数默认值 / 注入模板 / 调用实参 / 数据表）
+    const inString = [
+      // ⚠ 行号**动态解析**，不硬编码：产品代码一改行号（261117 rebase 实测漂过），硬编码的判据就变成
+      // 「断言产品行号」而不是「断言坐标可核对」——那种判据每合一次别人的 PR 就红一次。
+      ['ERIX_STATION_TOKEN', `portal/src/provisioner.js:${lineOf('portal/src/provisioner.js', "key = 'ERIX_STATION_TOKEN'")}`],
+      ['ERIX_STATION_TOKEN', `portal/src/provisioner.js:${lineOf('portal/src/provisioner.js', 'ERIX_STATION_TOKEN=${token}')}`],
+      ['FDE_WORKER_UID', `portal/src/config.js:${lineOf('portal/src/config.js', 'FDE_WORKER_UID')}`],
+      [TIMEOUT_KEYS[0], `runner/lib/llm-timeouts.js:${lineOf('runner/lib/llm-timeouts.js', `'${TIMEOUT_KEYS[0]}'`)}`],
+    ];
+    for (const [key, coord] of inString) {
+      const [rel, line] = coord.split(':');
+      const text = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8').split('\n')[Number(line) - 1];
+      assert.ok(text.includes(key), `夹具前提破了：${coord} 那一行应当含 ${key}，实际 ${JSON.stringify(text)}`);
+      assert.deepEqual(whereProblems([{ key, reason: 'r', where: coord }], RUNNER_ENV_KEYS), [],
+        `${coord} 被误杀 ⇒ 「串正文不算坐标」被做成了「串正文一律不认」，那是误杀真登记`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('活二㉖ B-①.3 行范围逐行验（不许静默只验首行）+ `.json`/绝对路径的文案要能照着改', () => {
+  const dir = fixtureRoot({
+    'range.js': [
+      'export const a = process.env.ERIX_B1_RANGE_KEY;',
+      'const pad = 1;',
+      'export const b = process.env.ERIX_B1_RANGE_KEY;',
+    ].join('\n'),
+  });
+  try {
+    const probs = (where) => whereProblems([{ key: 'ERIX_B1_RANGE_KEY', reason: 'r', where }], new Map(), dir);
+    const prob = (where) => probs(where).join('\n');
+    assert.deepEqual(probs('range.js:1'), []);
+    assert.deepEqual(probs('range.js:3'), []);
+    assert.deepEqual(probs('range.js:3-3'), [], '`N-N` 就是单行，不该红');
+    const wide = prob('range.js:1-3');
+    assert.match(wide, /不含该 key/, '第 2 行不含该 key 却没人报 ⇒ 行范围只验了首行（静默放过）');
+    assert.match(wide, /第 2 行/, '必须点名是哪一行没过');
+    assert.match(wide, /逐行/);
+    assert.match(prob('range.js:3-9'), /只有 3 行/);
+    assert.match(prob('range.js:3-1'), /行范围是反的/);
+    assert.match(prob('range.js:1-40'), />30/, '「整段」不是「一行证据」，要收窄');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  // `.json` / 绝对路径：单独出现时红，但文案要能照着改（旧文案报「这是说明文字」是误导）
+  const jsonCase = whereProblems(
+    [{ key: 'ERIX_STATION_TOKEN', reason: 'r', where: 'deploy/env-legs-exceptions.json:110' }], new Map()).join('\n');
+  assert.match(jsonCase, /不是 JS 源文件/);
+  assert.match(jsonCase, /reason/, '要告诉人「这条事实写进 reason，where 换成 JS 行」');
+  assert.doesNotMatch(jsonCase, /说明文字/, '对 `.json:行` 报「这是说明文字」会把人带偏（它当然是坐标，只是不是 JS 坐标）');
+  const absCase = whereProblems(
+    [{ key: 'ERIX_STATION_TOKEN', reason: 'r', where: `${path.join(RUNNER_ROOT, 'agentd.js')}:48` }], new Map()).join('\n');
+  assert.match(absCase, /绝对路径/);
+  assert.match(absCase, /仓库根相对/, '文案要给出具体的改法');
+});
+
+test('活二㉗ B-② `unsupported` 不许免证：绑定扫描器确认的读站点 + 理由必须含可核对坐标（虚构读形与乱写理由两条都红）', () => {
+  const dir = fixtureRoot({
+    'dyn.js': [
+      "const T = Object.freeze({ a: 'ERIX_B2_TABLE_NAME' });",
+      'export function pick(which, env = process.env) { return env[which]; }',
+      'export const lit = process.env.ERIX_B2_STATIC;',
+    ].join('\n'),
+    'test/probe.js': 'export const x = 1;\nconst T = Object.freeze({ a: ' + "'ERIX_B2_TABLE_NAME'" + ' });\n',
+  });
+  try {
+    const detected = scanEnvReads(dir).unsupported;
+    assert.deepEqual(detected.map((d) => `${d.at} ${d.shape}`), ['dyn.js:2 env[which]'],
+      `夹具必须先给出真动态读站点（实际 ${JSON.stringify(detected)}）`);
+    const ok = [{ at: 'dyn.js:2', read: 'env[which]', reason: '`which` 由调用方传入；同名旋钮的值域见 dyn.js:1' }];   // 三轮④后：引用必须指到读站点或数据表声明行
+    assert.deepEqual(validateUnsupported(ok, dir, detected), [], '真读形 + 可核对引用应当绿');
+    // ① 虚构读形（扫描器在那个文件里根本没见过这个形状）⇒ 红
+    assert.match(validateUnsupported([{ ...ok[0], read: 'globalThis.__env__[which]' }], dir, detected).join('\n'),
+      /根本没看到这个读形/);
+    // ② 真读形、坐标却不是那一行 ⇒ 红（点名读形真正在哪一行）
+    const drift = validateUnsupported([{ ...ok[0], at: 'dyn.js:1' }], dir, detected).join('\n');
+    assert.match(drift, /不是这个读形所在的行/);
+    assert.match(drift, /dyn\.js:2/, '文案要给出真坐标');
+    // ③ 真读形、理由是自由散文 ⇒ 红
+    assert.match(validateUnsupported([{ ...ok[0], reason: '扫描器解析不出名字，反正这里没有配置面。' }], dir, detected).join('\n'),
+      /自由散文/);
+    // ④ 理由里的引用也要过同一把尺
+    assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 nope.js:1' }], dir, detected).join('\n'), /文件不存在/);
+    assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 dyn.js:2' }], dir, detected).join('\n'),
+      /没有任何 env 名的结构化证据/, '引用的那一行必须真的有 env 名（不然就是编的）');
+    assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 dyn.js:1-2' }], dir, detected).join('\n'),
+      /第 2 行/, '理由里的行范围同样逐行判');
+    // 四轮返工后：理由里指向**测试面**的引用不算坐标（当背景说明跳过）⇒ 只剩它一条时退化成「自由散文」。
+    // 两种文案都是红，断言接受任一（**行为**是「不给过」，不是「必须说某一句话」）。
+    assert.match(validateUnsupported([{ ...ok[0], reason: '值域见 test/probe.js:2' }], dir, detected).join('\n'),
+      /坐标指向测试代码|自由散文/);
+    assert.match(validateUnsupported([{ ...ok[0], at: 'test/probe.js:2' }], dir, detected).join('\n'), /坐标指向测试代码/);
+    // ⑤ 真树：登记必须与扫描器**现在**的读数咬合，理由里必须有带行号的 JS 坐标
+    const { unsupported: registered, problems } = loadEnvLegExceptions();
+    assert.deepEqual(problems, [], '真树的 `unsupported` 段没过「绑定读站点 + 理由含可核对坐标」这一关');
+    assert.deepEqual(registered.map((u) => u.at), RUNNER_SCAN.unsupported.map((d) => d.at),
+      '登记的坐标必须就是扫描器现在扫到的那些动态读站点（一条不多、一条不少）');
+    for (const u of registered) {
+      assert.ok(parseCoordRefs(u.reason).some((r) => JS_SOURCE_EXT.has(r.ext) && r.from != null),
+        `${u.at} 的理由里没有带行号的 JS 坐标引用 ⇒ 自由散文豁免：${u.reason}`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('活二㉘ 追加腿：文件**首字符**是正则字面量（字符类里含真 //）⇒ 同一行的真读取必须进枚举', () => {
+  // `canStartRegex()` 的 `if (prevCh === '') return true;`（文本/文件首字符处 `/` 是正则位）原先**没有判据**。
+  // 直调实验（父 agent）：`'/[//]/.test(process.env.ERIX_P3_LINE);'` 的掩码是 `/    /.test(…读取保留)`；
+  // 把那条分支改成 `false` 之后掩码变成 `/[                    ` ⇒ 同一行其后全是「行注释」，读取静默消失。
+  const src = '/[//]/.test(s); export const v = process.env.ERIX_A2_AT_FILE_START; const half = 1 / 2;';
+  const { keys } = scanFixture('file-start-regex', src);
+  assert.deepEqual(keys, ['ERIX_A2_AT_FILE_START'],
+    `文件首字符那个正则把同一行后面的代码吞了（实际 ${JSON.stringify(keys)}）`
+    + ' ⇒ 「首字符处可以是正则」这条分支没判据：认不出它 = 静默漏扫');
+  // 反向自证 A：同一形状**不在**首字符时也必须活（判据不许只押首字符那一格）
+  const notFirst = scanFixture('not-file-start-regex', `const x = 1;\n${src}`);
+  assert.deepEqual(notFirst.keys, ['ERIX_A2_AT_FILE_START']);
+  // 反向自证 B：首字符正则**正文里**提到的名字不算读取（同一条分支反过来也不许放宽）
+  const body = scanFixture('file-start-regex-body', '/[env.ERIX_A2_PHANTOM]s/.test(s); export const w = process.env.ERIX_A2_REAL_AFTER_BODY;');
+  assert.deepEqual(body.keys, ['ERIX_A2_REAL_AFTER_BODY'],
+    `首字符正则的正文被当成代码了（实际 ${JSON.stringify(body.keys)}）`);
+});
+
+test('活二㉙ 判据数地板：本文件格数 >= 43（族 A 合并后的读数）—— 只增不减，删格要留账', () => {
+  const cells = (SELF_TEXT.match(/^test\(/gm) ?? []).length;
+  assert.ok(cells >= 43,
+    `本文件只剩 ${cells} 格，低于族 A 合并后的地板 30 ⇒ 有人为了让闸门变绿直接删了判据：`
+    + '减格必须同时改写判据并留下说明，不许静默减');
+});
+
+
+test('活二㉚ B-①.1 返工：`.spec.*` 也是测试面；豁免面**不许**拿「裸串恰好等于 key」当坐标', () => {
+  // #587 族 B 返工（审计 cp-2611171142 第 1 条，10/10）：旧口径只认 `.test.js`，
+  // `x.spec.mjs` 漏网；而 `whereTest` 只要理由非空就放行 ⇒ 「只在断言串里出现的假坐标」能过。
+  const { entries } = loadEnvLegExceptions();
+  const token = entries.find((e) => e.key === 'ERIX_STATION_TOKEN');
+  assert.ok(token, 'ERIX_STATION_TOKEN 还在例外清单里（不许为了让判据变绿删条目）');
+  // ① 文件名规则本身：**不带** `test/` 目录段的路径也必须被认出（否则这条判据是被目录规则顺带满足的，
+  //    把 `.spec` 从正则里删掉它照样绿 —— 父 agent 变异 M-C1 就是这么暴露出来的空刀）
+  assert.ok(isTestFace('runner/zz.spec.mjs'), '`.spec.mjs` 必须是测试面（不带 test/ 目录段时也要认）');
+  assert.ok(isTestFace('runner/zz.spec.ts'), '`.spec.ts` 同上');
+  assert.ok(isTestFace('runner/zz.test.mjs'), '`.test.mjs` 同上');
+  assert.ok(!isTestFace('runner/lib/real-module.js'), '产品代码不许被误判成测试面（否则真坐标全被杀）');
+  // ② 豁免面：拿**只含裸串**的测试行当坐标 ⇒ 必须仍红（豁免只放宽「测试面」，不放宽「真读取」）
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'env-gate-waiver-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'test'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'test/probe.js'), "assert.ok('ERIX_STATION_TOKEN');\n");
+    const bare = whereProblems(
+      [{ ...token, where: 'test/probe.js:1', whereTest: '这是真站点' }], RUNNER_ENV_KEYS, tmp).join('\n');
+    assert.match(bare, /不含该 key/, '`whereTest` 豁免下拿裸串当坐标必须仍红（审计实测可绕过的那条）');
+    // ③ 反向自证：**注入形** `KEY=…` 在豁免下仍算（真站点不许被杀）
+    fs.writeFileSync(path.join(tmp, 'test/inject.js'), "const e = `ERIX_STATION_TOKEN=${tok}`;\n");
+    assert.deepEqual(
+      whereProblems([{ ...token, where: 'test/inject.js:1', whereTest: '注入面' }], RUNNER_ENV_KEYS, tmp), [],
+      '注入形 `ERIX_X=…` 是真站点，豁免下必须仍能过');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  // ④ 盘上 27 条真登记的坐标一条都不在测试面，而且全都绿
+  assert.deepEqual(whereProblems(entries, RUNNER_ENV_KEYS), [], '盘上那份被测试面守卫误杀了');
+});
+
+test('活二㉛ B-①.2 返工：**正则正文**不算坐标（数据表裸串仍算）', () => {
+  // #587 族 B 返工（审计第 2 条）：`const re = /ERIX_X/;` 里那一行被当成有效坐标。
+  const { entries } = loadEnvLegExceptions();
+  const token = entries.find((e) => e.key === 'ERIX_STATION_TOKEN');
+  // 造一个**真存在**的临时 root：正则正文里有 key，另一行是数据表裸串
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'env-gate-regex-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'lib/re.js'),
+      "const re = /ERIX_STATION_TOKEN/;\nexport const TABLE = { a: 'ERIX_STATION_TOKEN' };\n");
+    const prob = (where) => whereProblems([{ ...token, where }], RUNNER_ENV_KEYS, tmp).join('\n');
+    assert.match(prob('lib/re.js:1'), /不含该 key/,
+      '正则正文里出现 key 不算坐标（正则不是代码）');
+    assert.deepEqual(whereProblems([{ ...token, where: 'lib/re.js:2' }], RUNNER_ENV_KEYS, tmp), [],
+      '数据表裸串那一行必须仍算坐标（否则 27 条真登记里会误杀）');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  // 反向自证（真仓库）：盘上那条靠裸串坐标的登记必须仍绿
+  assert.deepEqual(whereProblems(entries, RUNNER_ENV_KEYS), [],
+    '盘上那份被这条守卫误杀了');
+});
+
+test('活二㉜ B-①.3 返工：行范围语法严格（`:10-` / `0-x` / 倒序 一律拒）', () => {
+  // #587 族 B 返工（审计第 3 条）：`:10-` 被当成 `:10` 静默接受；`0-3` 也能过（行 0 映射到首行）。
+  const refs = parseCoordRefs('a.js:10- b.js:0-3 c.js:12-10 d.js:414 e.js:10-12');
+  const by = (f) => refs.find((r) => r.rel === f);
+  assert.equal(by('a.js').badRange, true, '`:10-`（缺右端点）必须标坏 —— 审计实测被当成 `:10` 接受');
+  assert.equal(by('b.js').badRange, true, '`:0-3` 必须标坏（行号从 1 起）');
+  assert.equal(by('d.js').badRange, false, '`:414` 是合法单行坐标，不许误杀');
+  assert.equal(by('e.js').badRange, false, '`:10-12` 是合法区间');
+  const { entries } = loadEnvLegExceptions();
+  const token = entries.find((e) => e.key === 'ERIX_STATION_TOKEN');
+  const prob = (where) => whereProblems([{ ...token, where }], RUNNER_ENV_KEYS).join('\n');
+  assert.match(prob('portal/src/provisioner.js:414-'), /语法不合法/, '`:414-` 必须红');
+  assert.match(prob('portal/src/provisioner.js:0-3'), /语法不合法/, '`:0-3` 必须红');
+  assert.match(prob('portal/src/provisioner.js:414-390'), /行范围是反的/, '倒序必须红');
+});
+
+test('活二㉝ B-② 返工：`unsupported` 的理由必须指到**这条动态读**或它的数据表声明行', () => {
+  // #587 族 B 返工（审计第 4 条）：旧口径只要理由里有一个「含任意 env 名的合法行」就算过
+  // ⇒ 堆一行无关代码就能豁免。
+  // 行号动态解析（同上）：`process.env[name]` 的读站点 / 字面量对数组 / 一条无关的 env 读行，都按内容找。
+  const dynLine = lineOf('runner/worker.js', 'process.env[name]');
+  const tableLine = lineOf('runner/worker.js', "['ERIX_DELEGATE_MAX'");
+  const unrelated = lineOf('runner/worker.js', 'process.env.ERIX_DELEGATE_ENABLED');
+  const real = { at: `runner/worker.js:${dynLine}`, read: 'process.env[name]', reason: '' };
+  const withReason = (reason) => validateUnsupported([{ ...real, reason }], REPO_ROOT, null).join('\n');
+  // ① 指到无关行（那行有 env 名、但跟 `process.env[name]` 无关）⇒ 红
+  // ① 无关行：`runner/worker.js:800` 是**合法代码位**的 env 读（`process.env.ERIX_DELEGATE_ENABLED`），
+  //    但它跟 `runner/worker.js:819` 的 `process.env[name]` 毫无关系 ⇒ 必须红
+  assert.match(withReason(`随便一句，见 \`runner/worker.js:${unrelated}\``),
+    /没有一个引用指到这条动态读/, '拿无关行充数必须红');
+  // ② 指到读站点本身 ⇒ 绿
+  // ② 指到读站点本身 ⇒ **不因「相关性」被拒**（那行是动态读、没有字面 env 名，
+  //    会撞上既有的「行证据」那把尺 —— 那是另一条判据，不是相关性判据的锅）
+  assert.doesNotMatch(withReason(`读站点见 \`runner/worker.js:${dynLine}\``), /没有一个引用指到这条动态读/,
+    '覆盖读站点那一行必须算「相关」，不许被相关性判据拒');
+  // ③ 指到数据表声明行（含动态 key 的标识符 `name`）⇒ 绿（盘上那条真登记就是这形）
+  assert.deepEqual(validateUnsupported([{ ...real, reason: `名字来自 \`runner/worker.js:${tableLine}-${tableLine + 2}\` 的字面量对数组` }], REPO_ROOT, null), [],
+    '数据表声明行必须放行（否则真登记被杀）');
+  // ④ 盘上那条真登记必须仍绿
+  const doc = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'deploy/env-legs-exceptions.json'), 'utf8'));
+  assert.deepEqual(validateUnsupported(doc.unsupported ?? [], REPO_ROOT, null), [], '盘上真登记被误杀了');
+});
+
+
+test('活二㉞ B-①②④ 三轮返工：对象键位不算坐标 / 文件级豁免同样不许裸串 / env 读行不是数据表声明', () => {
+  // 三条都是审计 cp-2611171231 实测出来的绕过，各给一个决定性夹具。
+  const { entries } = loadEnvLegExceptions();
+  const token = entries.find((e) => e.key === 'ERIX_STATION_TOKEN');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'env-gate-r3-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'lib'), { recursive: true });
+    fs.mkdirSync(path.join(tmp, 'test'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'lib/objkey.js'), "const item = { 'ERIX_STATION_TOKEN': 1 };\n");
+    fs.writeFileSync(path.join(tmp, 'test/waive.js'), "assert.ok('ERIX_STATION_TOKEN');\n");
+    const prob = (where, extra = {}) => whereProblems([{ ...token, where, ...extra }], RUNNER_ENV_KEYS, tmp).join('\n');
+    // ① 对象**键位**串不算坐标（审计：`{'ERIX_X': 1}` 曾被接受）
+    assert.match(prob('lib/objkey.js:1'), /不含该 key/,
+      '对象键位（属性名）不是数据证据，必须红');
+    // ①b **计算键** `{ ['ERIX_X']: 1 }`：闭引号后跟 `]` 再跟 `:`（审计四轮实测可绕过）
+    fs.writeFileSync(path.join(tmp, 'lib/computed.js'), "const item = { ['ERIX_STATION_TOKEN']: 1 };\n");
+    assert.match(prob('lib/computed.js:1'), /不含该 key/, '计算键位也不是数据证据，必须红');
+    // ①c **裸标量声明**不算数据表：`const MSG = 'ERIX_X'` 只是文案（审计四轮实测能背书动态读）
+    fs.writeFileSync(path.join(tmp, 'lib/scalar.js'), "const MSG = 'ERIX_STATION_TOKEN';\n");
+    assert.match(prob('lib/scalar.js:1'), /不含该 key/, '裸标量声明不是数据表，必须红');
+    // ①d 反向自证：**容器内**的值位裸串仍算（真数据 `config.js:391` 那种）
+    fs.writeFileSync(path.join(tmp, 'lib/table.js'), "export const T = { a: 'ERIX_STATION_TOKEN' };\n");
+    assert.deepEqual(whereProblems([{ ...token, where: 'lib/table.js:1' }], RUNNER_ENV_KEYS, tmp), [],
+      '容器内的值位裸串必须仍算坐标（否则真数据里的数据表登记会被误杀）');
+    // ② 文件级引用（不带行号）在**豁免**下也不许吃裸串（旧代码在这里漏传豁免选项）
+    const waived = prob('test/waive.js', { whereTest: '这是真站点' });
+    assert.match(waived, /只给了文件|不含该 key|注释背书|没发现对/,
+      '文件级 + 豁免 也不许拿裸串当坐标（实际：' + waived.slice(0, 160) + '）');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  // ③ `unsupported.reason` 的 ±3 邻域不许拿**另一条 env 读行**当数据表声明背书
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-gate-r3b-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'near.js'), [
+      'const TABLE = { a: 1 };',                                   // 1
+      'export const stat = process.env.ERIX_R3_STATIC;',            // 2
+      'export function pick(name, env = process.env) {',            // 3
+      '  const unrelated = process.env.ERIX_R3_UNRELATED + name;',  // 4 ← 无关的 env 读行，含 name
+      '  return env[name];',                                        // 5 ← 真动态读
+      '}',                                                          // 6
+    ].join('\n'));
+    const at = 'near.js:5';
+    const bad = validateUnsupported([{ at, read: 'env[name]', reason: '见 near.js:4' }], dir, null).join('\n');
+    assert.match(bad, /没有一个引用指到这条动态读/,
+      '把「另一条 env 读行」当数据表声明背书必须红（审计实测可绕过）');
+    const good = validateUnsupported([{ at, read: 'env[name]', reason: '读站点见 near.js:5' }], dir, null);
+    assert.ok(!good.some((x) => /没有一个引用指到这条动态读/.test(x)),
+      '覆盖读站点本身必须算「相关」（那行没字面 env 名，会被另一把尺拦，不是相关性判据的锅）');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
