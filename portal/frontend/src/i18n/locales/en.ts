@@ -1429,7 +1429,7 @@ export const en = {
       fdesUnreadable: 'containers.agent_version could not be read (that is "unreadable", not "no FDEs").',
       caveat: 'Provenance: the only authority is the build-info.json baked into the image; package.json is a build input, while git tags, image tags, digests and containers.agent_version are derived copies and must be labelled as such.',
     },
-    // Host resource snapshot (views/AdminSystemView.vue, issue #650; contract docs/api/portal.md §4.18).
+    // Host resource snapshot (views/AdminSystemView.vue, issue #650; contract docs/api/portal.md §4.20).
     // Four hard rendering rules (each pinned by a spec case): anything unavailable says "unknown"
     // (never 0); sampling disabled / no first tick yet / history unreadable are three different sentences;
     // load must carry its normalized magnitude; disk is one row per device and unreadable paths must show.

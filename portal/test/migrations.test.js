@@ -1621,8 +1621,11 @@ test('迁移 0043-platform-prompts：种首行（让 FOR UPDATE 有行可锁）+
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0043 存在');
   // 本单让号到 0043 后它就是当前末位（0040→#608 mcp-channel、0041→#640 retire、0042→#670 mcp-plaintext 都排在它之前）。
-  assert.equal(files[files.length - 1], file,
-    '0043 是当前末位（0040-mcp-channel、0041-retire-run-checkpoints、0042-mcp-plaintext-values 都在它之前；新迁移只能追加）');
+  // #650 追加 `0044-system-metrics.sql` 之后 0043 不再是末位 ⇒ 判据改成「位置固定 + 只能往后追加」
+  // （形状同 0033..0041 那几支的位次断言：钉的是「不许回头插队」，不是「永远是最后一支」）。
+  assert.equal(files[files.length - 2], file,
+    '0043 是倒数第二支（0040-mcp-channel、0041-retire-run-checkpoints、0042-mcp-plaintext-values 在它之前，'
+    + '0044-system-metrics 追加在它之后；新迁移只能追加）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,

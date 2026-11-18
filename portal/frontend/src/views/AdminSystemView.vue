@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 管理台 · 「系统」（issue #650，契约 `docs/api/portal.md` §4.18）。**只读**，没有任何写操作。
+// 管理台 · 「系统」（issue #650，契约 `docs/api/portal.md` §4.20）。**只读**，没有任何写操作。
 //
 // 这页存在的理由与「关于」（#586）同形：宿主 CPU / 内存 / 磁盘 / 容器数一直有真相（`htop` / `free` /
 // `df` / `docker ps`），但界面上一个读数都没有 —— 症状是「FDE 变慢」，而平台不知道宿主快满了。
@@ -54,7 +54,7 @@ const loading = computed(() => admin.systemMetricsLoading);
 const error = computed(() => admin.systemMetricsErr);
 
 /**
- * 选中态用**服务端回显的生效区间**（§4.18：非法入参被回落成 `1h` 并把生效值回在 `range` 里）。
+ * 选中态用**服务端回显的生效区间**（§4.20：非法入参被回落成 `1h` 并把生效值回在 `range` 里）。
  * 首次请求还没回来时用本地值，否则一排按钮会有一瞬间全不亮。
  */
 const activeRange = computed<string>(() => metrics.value?.range ?? requestedRange.value);
@@ -110,7 +110,7 @@ const loadLine = computed(() => {
   return t('admin.system.loadLine', { load: parts.load, cores: parts.cores, pct: parts.pct });
 });
 
-/** 桶宽一句话：`samples === 1` 时也要说清粒度（§4.18：一个点时分桶结果与原始点等价，读者需要知道）。 */
+/** 桶宽一句话：`samples === 1` 时也要说清粒度（§4.20：一个点时分桶结果与原始点等价，读者需要知道）。 */
 const bucketText = computed(() => {
   const seconds = metrics.value?.series.bucketSeconds ?? null;
   const parts = bucketPartsOf(seconds);

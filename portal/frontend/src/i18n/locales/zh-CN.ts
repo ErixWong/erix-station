@@ -1439,7 +1439,7 @@ export const zhCN = {
       fdesUnreadable: '读不到 containers.agent_version（这是「读不到」，不是「没有 FDE」）。',
       caveat: '口径：唯一权威是镜像内烘的 build-info.json；package.json 只是构建输入，而 git tag / 镜像 tag / digest / containers.agent_version 都是派生副本，展示时必须标口径。',
     },
-    // 宕主资源快照（views/AdminSystemView.vue，issue #650；契约 docs/api/portal.md §4.18）。
+    // 宕主资源快照（views/AdminSystemView.vue，issue #650；契约 docs/api/portal.md §4.20）。
     // 四条硬口径（逐条有 spec 用例钉住）：拿不到一律说「未知」（绝不渲染成 0）；
     // 采样关闭 / 没第一拍 / 历史不可用是**三句不同的话**；load 必须给归一化幅度；
     // 磁盘按设备一行且读不到的路径要露面。

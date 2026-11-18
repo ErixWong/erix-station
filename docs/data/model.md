@@ -584,7 +584,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 > 同上：来自增量迁移 `0044-system-metrics.sql`；baseline `docs/data/schema.sql` 冻结、零字节不动。
 > 要治的是「管理台没有任何宿主资源读面」：CPU / 内存 / 磁盘 / 容器数只能靠人 SSH 上机 `htop` + `docker ps`，
-> 症状是「FDE 变慢」而**平台自己不知道宿主是不是快满了**。API 形状见 `docs/api/portal.md` §4.18，
+> 症状是「FDE 变慢」而**平台自己不知道宿主是不是快满了**。API 形状见 `docs/api/portal.md` §4.20，
 > 运维动作（怎么关、怎么加盘）见 `docs/ops/system-metrics.md`。
 
 **表用途**：每 `SYSTEM_METRICS_INTERVAL_SECONDS`（默认 30）秒一行，是宿主指标的**历史真相**。
