@@ -9165,3 +9165,61 @@ W = 启用中的工位，谓词 `fde_name IS NOT NULL AND status IN
 `npm test` 的 `rc=0` 不含它们 ⇒ 要证明新迁移在空库上成立，注入 
  `TEST_DATABASE_URL` 跑
 `npm run check:ci-legs`（见 `docs/testing.md` §2.2.1）。
+
+### 8.176 M9 完成审查：接上触发链、连撞四个真机缺陷、最后降级为「诚实不做」（#662 / #669 / #670 / #673 / #676，2026-11-17～18）
+
+**这一条记的是「全部做完、CI 全绿、变异全命中，真机一次都跑不通」的完整链条**，因为四个缺陷
+没有一个是逻辑错，全是「测试环境比现实友好」。
+
+**① #662 补齐 M9 的最后一块件**（PR #668 = `9f9c553`）：`defaultReviewRunner` 原来只会
+`throw new Error('未配置 reviewRunner')` ⇒ M9 从未审查过任何东西；且 `run-review` 分支**根本没建快照**
+（W4a 的隔离白做）。三件：`host_review_only`（`run_state` jsonb 键，照 #627 `host_max_rounds` 三段先例，
+**不动迁移**）→ ticket `review_only` → `childEnv.RUN_REVIEW_ONLY`；快照接入 + `worktree_path` 落库
+（不落则 W4a 孤儿清扫会把在途 worktree 删掉）；`runReviewTaskDefault`（独立只读会话，cwd = 快照，
+复用 #652 的 `pollRunTask`）。三个变异全命中。
+
+**② 真机第一跑：`dubious ownership`**（#669，PR #671 = `d217eab`）。portal 以 root 跑、FDE 项目属主
+1000/1001 ⇒ git ≥2.35 一律拒绝（CVE-2022-24765 缓解）。站内已有解法在 `gitlight.js:152`（D9 收工灯
+同样跨 uid 读用户目录）：`-c safe.directory=*` + `--no-optional-locks`。抽出 `gitGlobalArgs()` 纯函数
+钉参数。**真机 before/after**：去掉 ⇒ `fatal: detected dubious ownership`；加上 ⇒ `ok:true`。
+⚠ 不用 `git config --global --add safe.directory <path>`（往容器 `~/.gitconfig` 逐目录累积，重建即丢）。
+
+**③ 真机第二跑：`ambiguous argument 'HEAD'`**（#670，PR #672 = `e37c54d`）。`hello-station` 是 **0 提交**
+仓库。真机现查 **0 提交是多数情形**（`todoapp`/`r2-app`/`echo-probe-e2e` 全是 0），而 D9 专门为
+「0 提交但有内容」设计过红态 ⇒ 平台自己承认这是常态，`createSnapshot` 却没考虑。修法：`headShaOrEmpty`
+（`rev-parse --verify` 只看退出码）、`head` 允许空串哨兵、无 HEAD 走 `copyWholeTree`（整树拷贝含 `.git`，
+rsync→cpSync 降级，显式防路径穿越）。**真机三情形**：0 提交未 add / 已 add 都 `ok:true`；
+有 2 提交的 digest `90cc8eab40` 与 #669 验证时**逐字相同**（原路无回归）。
+
+**④ 真机第三跑：假绿**（#673）。链路全通了，账上落 `done | unclassified`，但审查 run 的 `pwd` 是
+`/home/erix/projects/root/.erix/w4a-snapshots/<id>` —— **多了一段 `/home/erix/projects`**，里面只有一个空
+`.git`，模型老实报告「仅 .git 空仓库」，judge 判 done。根因：快照建在 **portal 容器自己的盘**
+（`/root/.erix/w4a-snapshots`，内容是对的），而审查 run 在 **FDE runner 容器**里跑，
+`docker inspect fde-eric` 的 mount 只有 `home`/`projects`/`cache`/`platform/git` —— **没有那条**。
+runner 把绝对路径当 jail 内相对路径拼、`mkdir` 出空目录，**全程不报错**。
+⚠ 同一轮还发现 `fde-eric` 容器建于 03:18 而 #662 是 07:40 合的 ⇒ `RUN_REVIEW_ONLY` **根本没生效**
+（实测审查 run 用了 `shell`×8 + `writeFile`×1 全 `ok:true`，而只读集只有 3 个工具）——
+**改 runner 代码必须重建 FDE 镜像 + 容器**，这条口径此前没写进文档。
+
+**⑤ 拍板：先止血（丙）**（#676，PR #684 = `5b128df`）。用户判定「每次搬 500MB 副本太麻烦」，
+快照 vs 活目录指纹（甲/乙）**待重新拍板**。丙 = 两件：`validateRunCwd` 纯函数（`~/projects/<name>` 或
+jail 内绝对路径，`platform/git` 不许，`..` 穿越拒）+ **jail 表收成单一真值**
+（`portal/shared/jail-mounts.js`，原来散在 `resolveOriginalRepoDir` 与 provisioner 两处）；
+M9 降级 `reviewUnavailable` ⇒ `skipped` / `review_unavailable` / `verdict NULL` / 发通知。
+**判据里显式断言 `status !== 'done'`** —— 这一条就是本单存在的理由。真机验：五条 cwd 判定全对，
+`terminal | skipped | NULL | review_unavailable` + 通知「完成审查暂未启用」。
+
+**两个可复用的教训**
+
+- **「变异全命中」证明的是测试有效，不是功能可用。** #662 三个变异全红、CI 全绿，真机一次跑不通。
+  判据要落在**用户最终看到的东西**上（这里的判据是「审查 run 的 `pwd` 有内容」和「verdict 不是
+  unclassified」），不是「账上 done」。
+- **「变异没红」有两种可能**：测试太弱，**或者变异打错了层**。丙 的第一版变异打在 dispatcher 的调用处
+  （硬编码函数绕过了测试的计数器）⇒ 什么都没红；真守卫在 `macro-review.js` 的 `reviewUnavailable` 分支里。
+  分清这两者只能把守卫逐行读一遍。
+
+**顺带**：迁移让号（本单原 `0044`，并行 session 先合了 `0044-system-metrics` ⇒ 改
+`0045-macro-skipped-reason-review-unavailable`，`MIGRATION_HEAD` 44→45，19 处 head 文案 + 7 处位次断言
+同步进一位）；`jail-mounts.js` 接线让 `config.js`/`provisioner.js` 行号漂移 ⇒ `deploy/env-legs-exceptions.json`
+的 5 处 `where` 坐标必须同步，否则活二⑤/⑥ 报「坐标是编的或已漂移」（**这条是 CI 抓的，本地目标判据
+抓不到**）。
