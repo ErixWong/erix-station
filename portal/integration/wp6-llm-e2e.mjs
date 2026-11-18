@@ -519,10 +519,11 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
       } catch (error) {
         const image = process.env.FDE_IMAGE || process.env.STATION_PORTAL_IMAGE;
         if (!image) throw error;
-        // ⚠ 这里**不许**重定向 stderr 或加 `|| true` 兜底：那是 #224 的静默吞错形态，
-        // `isolation-negative.mjs --strict` 会按文本点名红（它扫的就是这个字面量）。
-        // 清理失败必须冒泡成红，不许静默。
-        execSync(`docker run --rm --user 0 --entrypoint sh -v ${JSON.stringify(`${dir}:/x`)} ${image} -c 'rm -rf /x/*'`, {
+        // ⚠ 两个都不能少：**不许**重定向 stderr 或加 `|| true` 兜底（#224 的静默吞错形态，
+        // `isolation-negative.mjs --strict` 按文本扫这个字面量）；同时 glob **必须带点项**
+        // `/x/.[!.]*`——只写 `/x/*` 会把 `.git` / `.env` 这类点文件漏在盘上（261118 二审 LOW①，
+        // 命令级复现：`hidden_remains=True`）。带 `-f` 时无匹配也不报错，所以不需要兜底。
+        execSync(`docker run --rm --user 0 --entrypoint sh -v ${JSON.stringify(`${dir}:/x`)} ${image} -c 'rm -rf /x/* /x/.[!.]*'`, {
           stdio: 'pipe',
         });
         if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
