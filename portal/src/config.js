@@ -407,6 +407,80 @@ export function loadConfig(env = process.env) {
       blockMs: intEnv(env, 'PREVIEW_TICKET_RATE_LIMIT_BLOCK_MS', 60 * 1000),
       maxEntries: intEnv(env, 'RATE_LIMIT_MAX_ENTRIES', 10000),
     },
+    // issue #650：宿主资源监控（采样器只在 `cli.js serve` 启动，`createServer` 不启动它）。
+    systemMetrics: systemMetricsSettings(env),
+  };
+}
+
+/**
+ * 布尔开关 env：**只认 `0` / `1`**（issue #650 的 `SYSTEM_METRICS_ENABLED` 口径）。
+ *
+ * 为什么不像 `MIGRATE_ON_START !== '0'` 那样「除 0 外都算开」：那种写法把 `false` / `no` / 拼错的
+ * `0 ` 当成「开」，而应急刹车恰恰是「运维以为关了、实际没关」最坑的一种失败（写库出问题时的唯一
+ * 手段就是一条 env）。现在：`0`⇒false、`1`⇒true、未设/空串⇒默认，**其余值 warn 后按默认**
+ * （说了话但说错了 ⇒ 必须出声；静默采纳其中一侧都是猜）。
+ */
+function strictBoolEnv(env, key, fallback) {
+  const raw = env[key];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const s = String(raw).trim();
+  if (s === '0') return false;
+  if (s === '1') return true;
+  // eslint-disable-next-line no-console
+  console.warn(`[config] ⚠️ ${key}=${JSON.stringify(raw)} 不是 0/1，按默认 ${fallback ? 1 : 0} 处理`
+    + '（这一项是应急开关，不许拿拼写错误当开/关）');
+  return fallback;
+}
+
+/**
+ * 带范围的整数 env：合法且在 `[min,max]` 内才采纳，否则**回落默认 + warn**（issue #650）。
+ *
+ * 为什么是「回落默认」而不是「夹到边界」：越界值几乎总是手误（`SYSTEM_METRICS_INTERVAL_SECONDS=3` 想写
+ * `30`），默默夹成 5 会让写入频率与运维的意图差 6 倍而没人知道；回落默认 + 一条 warn 至少把错摆在日志里。
+ */
+function clampedIntEnv(env, key, fallback, min, max) {
+  const raw = env[key];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const v = Number(String(raw).trim());
+  if (Number.isSafeInteger(v) && v >= min && v <= max) return v;
+  // eslint-disable-next-line no-console
+  console.warn(`[config] ⚠️ ${key}=${JSON.stringify(raw)} 不是 ${min}–${max} 的整数，回退默认 ${fallback}`);
+  return fallback;
+}
+
+/**
+ * 逗号分隔路径列表（`SYSTEM_METRICS_DISK_PATHS`）：trim → 去空 → 去重，全空 ⇒ 回落 `[fallback]`。
+ * 去重的理由：同一个路径写两遍在写侧会被 `diskRows` 按设备合并成一行，但那是**巧合而不是语义**；
+ * 在配置面就重掉，面板上「已监控 N 个文件系统」的 N 才与 env 里写的条数对得上。
+ */
+function csvListEnv(env, key, fallback) {
+  const raw = env[key];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return [fallback];
+  const seen = [];
+  for (const part of String(raw).split(',')) {
+    const item = part.trim();
+    if (item && !seen.includes(item)) seen.push(item);
+  }
+  return seen.length > 0 ? seen : [fallback];
+}
+
+/**
+ * 宿主资源监控的四个旋钮（issue #650，全部走 env，不上 DB 单行表）。
+ *
+ * 为何不走 `upload_settings` 那种「DB 优先 env」：这四项都是「装好就不动」的运维参数，而 e2e 栈
+ * 必须能在**初始化前**用 env 关掉（DB 层做不到：栈起来时 DB 里还没有配置行）。将来要在线改是
+ * additive 的第二步，不影响本单表结构（口径见 `docs/ops/system-metrics.md`）。
+ */
+function systemMetricsSettings(env) {
+  return {
+    // 应急刹车：写库出问题（DB 快满 / 写放大 / 磁盘 IO 飙）时一条 env 停掉，不用改代码发版；
+    // 手工复测空闲负载（`docs/ops/db-idle-load.md`）时先关掉拿干净基线。
+    enabled: strictBoolEnv(env, 'SYSTEM_METRICS_ENABLED', true),
+    // 写入成本与曲线粒度的唯一旋钮（5s 是最小可用粒度：低于它写放大开始咬人；300s 是曲线已不够看）。
+    intervalSeconds: clampedIntEnv(env, 'SYSTEM_METRICS_INTERVAL_SECONDS', 30, 5, 300),
+    retentionDays: clampedIntEnv(env, 'SYSTEM_METRICS_RETENTION_DAYS', 30, 1, 365),
+    // 容器看不见宿主挂载表 ⇒ 这里写的必须是**portal 容器内存在**的路径（加盘 = compose 一行 + env 一行）。
+    diskPaths: csvListEnv(env, 'SYSTEM_METRICS_DISK_PATHS', '/'),
   };
 }
 

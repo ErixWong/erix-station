@@ -3544,6 +3544,93 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 
 ---
 
+### 4.20 管理台系统监控（`GET /api/admin/system/metrics`，issue #650）
+
+**一句话**：宿主 CPU / 内存 / 磁盘 / 容器数的唯一读面——真相本来就在（`htop` / `free` / `df` / `docker ps`），
+但界面上一个读数都没有，症状「FDE 变慢」而平台不知道宿主是不是快满了（与 §4.16 版本三格同形）。
+实现只在 `portal/src/system-metrics.js`（`metricsApiPayload` / `toApiLatest` / `querySeries`），
+`http.js` 那一支只做转发；表的口径见 `docs/data/model.md` §1.34–§1.35，运维动作见 `docs/ops/system-metrics.md`。
+
+**鉴权**：`requireAdmin`（所有 `/api/admin/*` 在入口统一过，非 admin ⇒ 403，本端点不重复加）。
+**只读、零副作用、零新错误码**——本端点在任何降级分支下都是 `200`（下面三条硬口径）。
+
+**请求**：`?range=` 五个取值 `1h` / `6h` / `24h` / `7d` / `30d`（缺省 `1h`）。
+**非法取值 ⇒ 回落到 `1h`，不是 400**：这是一个只读观测面，把一个拼错的查询参数变成错误页只会让人多进一次
+后台；回落后**生效的值**回在响应的 `range` 字段里（页面据此渲染选中态，不撒谎）。
+桶宽不是查询参数而是服务端按 `range` 选的（目标 ≤240 个点）：
+
+| `range` | 桶宽 | 最多点数 |
+| --- | --- | --- |
+| `1h` | 30s | 120 |
+| `6h` | 300s | 72 |
+| `24h` | 900s | 96 |
+| `7d` | 3600s | 168 |
+| `30d` | 21600s | 30 |
+
+**响应 `200`**（字段形状的唯一定义处是 `toApiLatest()`，下面是逐字段）：
+
+```jsonc
+{
+  "latest": {                                   // 采样器没跑 / 还没第一拍 ⇒ 整个字段是 null（不是 500）
+    "sampled_at": "2026-11-17T08:12:30.000Z",   // 这一拍的采样时刻（ISO，UTC）；卡片可能是 N 秒前的数
+    "cpu":  { "usagePct": 12.34, "cores": 16, "load": [1.02, 0.88, 0.71] },
+    "mem":  { "totalBytes": 66000000000, "usedBytes": 41000000000, "availableBytes": 25000000000,
+              "cachedBytes": 12000000000, "swapUsedBytes": 0, "usedPct": 62.1 },
+    "disk": [ { "device": "/dev/nvme0n1p2", "path": "/", "fs": "ext4",
+                "totalBytes": 1960000000000, "usedBytes": 1820000000000, "availBytes": 40000000000,
+                "usedPct": 92.9 } ],
+    "diskUnreadable": [ { "path": "/srv/data", "reason": "ENOENT" } ],
+    "containers": { "total": 41, "running": 33, "paused": 0, "stopped": 8,
+                    "station": 12, "fde": 7, "fdeRunning": 6,
+                    "drift": { "db": 7, "docker": 7, "onlyDb": [], "onlyDocker": [], "count": 0 } }
+  },
+  "series": { "bucketSeconds": 30,              // 本次生效的桶宽（由 `range` 算出，不是入参回显）
+              "points": [ { "t": "2026-11-17T08:12:00.000Z", "cpuAvg": 11.2, "cpuMax": 33.4,
+                            "memUsed": 40900000000, "containersRunning": 33, "samples": 2 } ] },
+  "range": "1h",                                // **生效的** range（非法入参已被回落成 `1h`）
+  "retentionDays": 30,                          // 来自 `config.systemMetrics.retentionDays`；拿不到 ⇒ null
+  "seriesError": null,                          // 历史查询失败时是原因字符串，成功时是 null
+  "enabled": true                               // 采样器到底开没开（`sampler?.enabled === true`；没有采样器 ⇒ false）
+}
+```
+
+逐字段口径（四条都有单测钉在 `portal/test/system-metrics.test.js`）：
+
+- `latest`：**进程内最新一拍**，不是 DB 回读。采样器未启动（`SYSTEM_METRICS_ENABLED=0`）或还没跑到第一拍
+  ⇒ `latest: null`，**不是 500、也不是空对象**（前端的两种空态文案「采样已关闭」/「等待首拍」据此区分；
+  页面本身是 #650 的下一单，本节的响应形状已经钉下）。
+- `latest` 里任何一项拿不到 ⇒ **`null`，绝不是 `0` / 空串**（#586 口径：把「未知」渲染成 0 会把「不知道」
+  说成「很闲」）。`containers` 可以是整个 `null`（docker 不可达）——那是「读不到」而不是「0 台」；
+  `containers.drift` 是「DB 说 N 台 ↔ Docker 实际 M 台」的对账（`onlyDb` / `onlyDocker` 点名到容器）。
+- `latest.disk[]` **之外**另带 `latest.diskUnreadable[]`：配了但 `statfs` 失败的路径也要露面，
+  否则「已监控 N 个文件系统」就成了悄悄少了一行的谎。
+- `series.points[]`：**服务端分桶后的点**，绝不把原始点发给浏览器（30d × 30s = 86,400 行）。
+  `t` 是桶起点（ISO 字符串），`samples` 是这个桶里聚合了几行原始点（只有 1 个点时页面要说清粒度）。
+  分桶结果按 `range` 缓存 5s（`SERIES_CACHE_TTL_MS`），与前端 5s 轮询对齐 ⇒ 10 个人同开这页的 DB 查询量与 1 个人相同。
+- `retentionDays` 只是**回显配置**，让页面能写「保留 30 天」而不必硬编码；清理动作不在这个端点上（挂 reaper 小时槽）。
+- `enabled`（**additive**，#650 前端单补）：采样器到底开没开。只看 `sampler?.enabled === true`——
+  `sampler` 为 `null`（`SYSTEM_METRICS_ENABLED=0` 时 `cli.js serve` 根本不建它）⇒ `false`。
+  为什么需要它而不是让前端从 `latest === null` 反推：那个形状同时兼容「采样已关闭」与「刚重启还没第一拍」
+  两个相反结论（前者要去改 env + 重启，后者只要等 30s），前端分不出来 ⇒ 这句话必须由说得出它的一方说。
+
+**错误语义（本端点零新错误码，三个降级分支都是 200）**：
+
+| 情况 | 结果 |
+| --- | --- |
+| 非 admin（含未登录） | `403`——统一入口拦的，不是本端点发的 |
+| `querySeries` 抛错（DB 挂了 / 表不存在 / 超时） | `200` + `seriesError: "<原因>"`，`series.points` 是**空数组**，而 **`latest` 仍正常有数**——卡片读的是进程内那一拍，这是本端点存在的理由，不是降级补丁 |
+| 采样器没跑 / 第一拍未到 | `200` + `latest: null` |
+| `range` 非法（`?range=1w`） | `200` + `range: "1h"` |
+
+`seriesError` 只给**原因字符串**（`err.code` 优先，没 code 才给 `message`）：堆栈与 SQL 片段不出现在管理台响应里。
+
+**两个读数的关系（口径说明，别当成两份真相）**：`latest` 与 `series` 来自**同一个**采样器
+（`cli.js serve` 经 `config.metricsSampler` 递进来，不在 `http.js` 里新建），只是取法不同——
+`latest` 是那一拍的内存副本，`series` 是同一采样器已落库的行在 DB 里分桶后的结果。
+所以两者可以差一个采样周期（卡片刚采了新拍，而分桶结果缓存 5s 且未落库的那拍不在图里），这是预期而不是 bug。
+
+---
+
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
 
 ### 5.1 传输语义
