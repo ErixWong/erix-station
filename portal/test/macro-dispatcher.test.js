@@ -587,54 +587,29 @@ const reviewRowOf = (pool, id) => pool.query(
   `SELECT status, verdict, reason, remediation_text, child_run_id, worktree_path, snapshot_id
      FROM macro_runs WHERE id = $1`, [id]).then((r) => r.rows[0]);
 
-// —— #662-1：run-review 分派**建快照**，且 worktreePath 传到 runMacroReview ——
-test('#662-1 run-review 分派建快照，快照 worktreePath 传给 runMacroReview（并落 macro_runs.worktree_path）',
+// —— #690-1：run-review 分派不建快照 ⇒ snapshot_id/worktree_path 皆 NULL，且默认走真审查（读活目录）——
+test('#690-1 run-review 分派不建快照：snapshot_id/worktree_path 皆 NULL，默认（live）真审查落 done',
   { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     const scene = await seedReviewScene(pool, ids('R1'));
     const intent = await claimReviewIntent(pool, scene);
-    const WT = '/tmp/wt-662-r1';
-    let snapCalls = 0;
-    let snapArg = null;
-    let snapshotPassed = null;
-    const fake = { ok: true, snapshotId: crypto.randomUUID(), worktreePath: WT, contentDigest: 'd' };
+    let runnerCalled = 0;
     const d = createIntentDispatcher({
-      pool, log: QUIET, config: { reviewMode: 'snapshot' },
-      createSnapshot: async (a) => { snapCalls += 1; snapArg = a; return fake; },
-      runMacroReview: async (_p, o) => { snapshotPassed = o.snapshot; return { macroRunId: o.macroRunId, status: 'done', verdict: 'pass' }; },
+      pool, log: QUIET,
+      // 不传 reviewMode ⇒ 缺省 'live'（#690：读活目录）。反向自证 3：把缺省改回 'disabled'
+      // ⇒ 本用例会红（降级成 skipped，下面的 status==='done' 断言不成立）。
+      reviewRunner: () => { runnerCalled += 1; return '结论：通过'; },
     });
     await d.dispatch([intent]);
-    assert.equal(snapCalls, 1, 'createSnapshot 必须恰好调用一次');
-    assert.ok(snapArg && typeof snapArg.repoDir === 'string' && snapArg.repoDir, `createSnapshot 必须带 repoDir：${JSON.stringify(snapArg)}`);
-    assert.equal(snapshotPassed?.worktreePath, WT, `worktreePath 必须传到 runMacroReview：${JSON.stringify(snapshotPassed)}`);
-    assert.equal(snapshotPassed?.ok, true, '快照对象（含 ok:true）必须原样传下去');
+    assert.equal(runnerCalled, 1, 'live 默认必须起审查 runner');
     const row = await reviewRowOf(pool, intent.macroRunId);
-    assert.equal(row.worktree_path, WT, 'worktree_path 必须落 macro_runs（供 W4a 孤儿清扫关联回收）');
+    assert.equal(row.status, 'done', `live 默认 ⇒ 真审查 done：${JSON.stringify(row)}`);
+    assert.equal(row.worktree_path, null, `#690：不再写 worktree_path：${row.worktree_path}`);
+    assert.equal(row.snapshot_id, null, `#690：不再写 snapshot_id：${row.snapshot_id}`);
   });
 });
 
-// —— #662-2：快照失败（ok:false）⇒ 原样传下去走 runMacroReview 的失败出口（不回灌）——
-test('#662-2 快照失败 ⇒ status=failed / verdict=unclassified / 不回灌 / 审查 runner 不起',
-  { skip: SKIP }, async () => {
-  await withFreshDb(async (pool) => {
-    const scene = await seedReviewScene(pool, ids('R2'));
-    const intent = await claimReviewIntent(pool, scene);
-    let runnerCalled = 0;
-    const d = createIntentDispatcher({
-      pool, log: QUIET, config: { reviewMode: 'snapshot' },
-      createSnapshot: async () => ({ ok: false, reason: 'disk_low', worktreePath: '/tmp/wt-r2' }),
-      reviewRunner: () => { runnerCalled += 1; return '结论：整改\n不该跑到这里'; },
-      // runMacroReview 用真实缺省实现（快照失败出口已实现）
-    });
-    await d.dispatch([intent]);
-    const row = await reviewRowOf(pool, intent.macroRunId);
-    assert.equal(row.status, 'failed', `快照失败 ⇒ failed：${JSON.stringify(row)}`);
-    assert.equal(row.verdict, 'unclassified', '快照失败 ⇒ unclassified');
-    assert.equal(row.remediation_text, null, '不回灌：remediation_text 必为 null');
-    assert.equal(row.child_run_id, null, '不回灌：child_run_id 必为 null');
-    assert.equal(runnerCalled, 0, '快照失败时绝不该起审查 run');
-  });
-});
+// —— #662-2（原「快照失败⇒failed」）已随 #690 删除：无快照 ⇒ 无「快照失败」这一格失败出口。
 
 // —— #662-3：审查 run 是 review-only（postMessage 收到 reviewOnly===true）——
 test('#662-3 缺省审查 runner：postMessage 收到 reviewOnly===true + triggerKind=synthetic',
@@ -642,11 +617,9 @@ test('#662-3 缺省审查 runner：postMessage 收到 reviewOnly===true + trigge
   await withFreshDb(async (pool) => {
     const scene = await seedReviewScene(pool, ids('R3'));
     const intent = await claimReviewIntent(pool, scene);
-    const WT = `/srv/erix/users/${scene.login}/projects/wt-r3`;
     let pmOpts = null;
     const d = createIntentDispatcher({
-      pool, log: QUIET, config: { userSpaceRoot: '/srv/erix/users', reviewMode: 'snapshot' },
-      createSnapshot: async () => ({ ok: true, snapshotId: crypto.randomUUID(), worktreePath: WT, contentDigest: 'd' }),
+      pool, log: QUIET, config: { userSpaceRoot: '/srv/erix/users' },
       postMessage: async (_p, o) => { pmOpts = o; return { run: { id: crypto.randomUUID() } }; },
       reviewTask: async () => ({ ok: true, text: '结论：通过', termination: { reason: 'finished', error: null }, error: null }),
       // reviewRunner 不注入 ⇒ 走缺省 runReviewTaskDefault
@@ -658,23 +631,22 @@ test('#662-3 缺省审查 runner：postMessage 收到 reviewOnly===true + trigge
   });
 });
 
-// —— #662-4：审查 run 的 cwd = 快照 worktree（postMessage 收到 cwd===worktreePath）——
-test('#662-4 缺省审查 runner：postMessage 的 cwd === snapshot.worktreePath（独立只读会话）',
+// —— #690-4：审查 run 的 cwd = 原会话的 `~/projects/<name>`（不是宿主绝对路径）——
+test('#690-4 缺省审查 runner：postMessage 的 cwd === 原会话 cwd（~/projects/<name>，非宿主绝对路径）',
   { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     const scene = await seedReviewScene(pool, ids('R4'));
     const intent = await claimReviewIntent(pool, scene);
-    const WT = `/srv/erix/users/${scene.login}/projects/wt-r4-isolated`;
     let pmOpts = null;
     const d = createIntentDispatcher({
-      pool, log: QUIET, config: { userSpaceRoot: '/srv/erix/users', reviewMode: 'snapshot' },
-      createSnapshot: async () => ({ ok: true, snapshotId: crypto.randomUUID(), worktreePath: WT, contentDigest: 'd' }),
+      pool, log: QUIET, config: { userSpaceRoot: '/srv/erix/users' },
       postMessage: async (_p, o) => { pmOpts = o; return { run: { id: crypto.randomUUID() } }; },
       reviewTask: async () => ({ ok: true, text: '结论：通过', termination: { reason: 'finished', error: null }, error: null }),
     });
     await d.dispatch([intent]);
     assert.ok(pmOpts, '缺省审查 runner 必须调用 postMessage');
-    assert.equal(pmOpts.cwd, WT, `cwd 必须 = 快照 worktree，实得：${pmOpts.cwd}`);
+    // 被审会话 cwd = '~/projects/rv'（seedReviewScene 写死）。反向自证 1：把 cwd 改回宿主绝对路径 ⇒ 此断言红。
+    assert.equal(pmOpts.cwd, '~/projects/rv', `cwd 必须 = 原会话的 ~/projects/<name>，实得：${pmOpts.cwd}`);
   });
 });
 
@@ -686,8 +658,7 @@ test('#662-5 桩 runner 返回「结论：整改」⇒ verdict=red + 回灌（re
     const intent = await claimReviewIntent(pool, scene);
     let runnerCalled = 0;
     const d = createIntentDispatcher({
-      pool, log: QUIET, config: { reviewMode: 'snapshot' },
-      createSnapshot: async () => ({ ok: true, snapshotId: crypto.randomUUID(), worktreePath: '/tmp/wt-662-r5', contentDigest: 'd' }),
+      pool, log: QUIET,
       reviewRunner: ({ brief }) => { runnerCalled += 1; assert.ok(brief.includes('原任务'), '工作包应含原任务段'); return '结论：整改\n有 3 个未跟踪文件'; },
       // runMacroReview 用真实缺省实现 + 真实回灌 postMessage
     });
@@ -715,25 +686,22 @@ test('#662-A assembleTicket 下行 review_only + agentd 仅 true 置 RUN_REVIEW_
   assert.ok(!('RUN_REVIEW_ONLY' in buildWorkerEnv({}, {})), '缺失 ⇒ 不设 RUN_REVIEW_ONLY');
 });
 
-// —— #676-6（丙=止血）：run-review 默认走 facts-only「只出事实、不下判决」——
-test('#676-6 run-review 默认（reviewMode=disabled）⇒ skipped/review_unavailable、verdict NULL、不建快照、发了通知',
+// —— #676-6 / #690（丙档保留）：`reviewMode='disabled'` 一键关 ⇒ facts-only「只出事实、不下判决」——
+test('#676-6 reviewMode=disabled（运维一键关）⇒ skipped/review_unavailable、verdict NULL、不起 runner、发了通知',
   { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     const scene = await seedReviewScene(pool, ids('R6'));
     const intent = await claimReviewIntent(pool, scene);
-    let snapCalls = 0;
     let runnerCalls = 0;
     const d = createIntentDispatcher({
-      pool, log: QUIET,
-      // 不传 config ⇒ reviewMode 缺省 'disabled'（丙）。
-      createSnapshot: async () => { snapCalls += 1; return { ok: true, worktreePath: '/tmp/x' }; },
+      pool, log: QUIET, config: { reviewMode: 'disabled' },
+      // #690：默认已改成 'live'；丙档要显式 `reviewMode='disabled'` 才触发（运维一键关）。
       reviewRunner: () => { runnerCalls += 1; return '结论：通过'; },
     });
     await d.dispatch([intent]);
     const row = await reviewRowOf(pool, intent.macroRunId);
     assert.equal(row.status, 'skipped', `facts-only ⇒ skipped：${JSON.stringify(row)}`);
     assert.equal(row.verdict, null, `facts-only ⇒ verdict 必为 NULL：${JSON.stringify(row)}`);
-    assert.equal(snapCalls, 0, 'facts-only 绝不建快照');
     assert.equal(runnerCalls, 0, 'facts-only 绝不起审查 runner');
     // skipped_reason='review_unavailable' 单独查（reviewRowOf 未带这列）。
     const sk = await pool.query(`SELECT skipped_reason FROM macro_runs WHERE id=$1`, [intent.macroRunId]);
@@ -754,7 +722,7 @@ test('#676-7 facts-only 显式断言 status !== done（不落 done|unclassified 
   await withFreshDb(async (pool) => {
     const scene = await seedReviewScene(pool, ids('R7'));
     const intent = await claimReviewIntent(pool, scene);
-    const d = createIntentDispatcher({ pool, log: QUIET });
+    const d = createIntentDispatcher({ pool, log: QUIET, config: { reviewMode: 'disabled' } });
     await d.dispatch([intent]);
     const row = await reviewRowOf(pool, intent.macroRunId);
     assert.notEqual(row.status, 'done', `存在理由：降级后绝不能是 done：${JSON.stringify(row)}`);
