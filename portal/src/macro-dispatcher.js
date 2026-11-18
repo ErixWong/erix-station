@@ -188,10 +188,19 @@ function notifyText(intent) {
 
 // ── issue #662 C/D：审查 run 的真实执行体 ─────────────────────────────────────────
 
-/** 审查 run 的缺省轮数上限（run-review kind schema 的 `max_rounds` default=8）。 */
-export const DEFAULT_REVIEW_MAX_ROUNDS = 8;
+/**
+ * 审查 run 的缺省轮数上限。
+ *
+ * issue #695（真机证据）：曾经是 **8**，而一次真实审查会读到 8 轮还在干活 ⇒ 撞 `max_rounds_cap`
+ * 被强制收尾 ⇒ 终稿是**半截**（实测拿到的是 DSML 工具调用碎片）⇒ `verdict=unclassified`。
+ * 同一份代码把上限调到 **24** 后，同一场景一次跑完并给出合法判决（`结论：未证实有改动`）。
+ *
+ * 为什么不是“越大越好”：轮数就是钱。24 的取据是「真机一次完整审查读文件 + 推理的实测轮数」
+ * 加上余量；订阅仍可用 `max_rounds` 覆盖（1..100）。
+ */
+export const DEFAULT_REVIEW_MAX_ROUNDS = 24;
 
-/** 审查轮数归一：1..100（与 `macro-kinds` run-review.max_rounds 同口径）；非法 ⇒ 缺省 8。 */
+/** 审查轮数归一：1..100（与 `macro-kinds` run-review.max_rounds 同口径）；非法 ⇒ 缺省值。 */
 function normalizeReviewMaxRounds(v) {
   const n = Number(v);
   return Number.isInteger(n) && n >= 1 && n <= 100 ? n : DEFAULT_REVIEW_MAX_ROUNDS;

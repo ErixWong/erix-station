@@ -27,6 +27,7 @@ import { startMacroEvalLoop } from '../src/macro-eval.js';
 import { executeScheduledIntent } from '../src/macro-scheduled.js';
 import {
   createIntentDispatcher, reclaimTimedOutPendingRuns, extractReviewRunId, pollRunTask,
+  DEFAULT_REVIEW_MAX_ROUNDS,
 } from '../src/macro-dispatcher.js';
 import { assembleTicket } from '../src/internal.js';
 
@@ -730,4 +731,22 @@ test('#676-7 facts-only 显式断言 status !== done（不落 done|unclassified 
     assert.equal(row.status, 'skipped');
     assert.equal(row.verdict, null);
   });
+});
+
+// —— issue #695：审查 run 的轮数预算 ——
+//
+// 真机证据：默认值曾经是 **8**，而一次真实审查读到 8 轮**还在干活** ⇒ 撞 `max_rounds_cap`
+// 被强制收尾 ⇒ 终稿是半截（实测拿到 DSML 工具调用碎片）⇒ `verdict=unclassified`。
+// 同一份代码把上限调到 24 后，同一场景一次跑完并给出合法判决（`结论：未证实有改动`）。
+//
+// 这条钉的是「别再被改回 8」：8 是**已知不够**的值，不是口味问题。
+test('#695 审查缺省轮数 ≥ 20（8 轮实测撞上限、终稿半截 ⇒ unclassified）', () => {
+  assert.ok(DEFAULT_REVIEW_MAX_ROUNDS >= 20,
+    `审查缺省轮数不能低于 20（实测 8 轮不够，撞 max_rounds_cap ⇒ 终稿半截）；当前 ${DEFAULT_REVIEW_MAX_ROUNDS}`);
+});
+
+test('#695 KIND_SCHEMA 的 run-review.max_rounds 缺省与代码常量同源', async () => {
+  const { KIND_SCHEMA } = await import('../shared/macro-kinds.js');
+  assert.equal(KIND_SCHEMA['run-review'].max_rounds.default, DEFAULT_REVIEW_MAX_ROUNDS,
+    '订阅面默认值（KIND_SCHEMA）与执行面默认值（DEFAULT_REVIEW_MAX_ROUNDS）必须一致，否则 UI 填的与实跑的不同');
 });

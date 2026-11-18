@@ -70,7 +70,7 @@ export const KIND_SCHEMA = Object.freeze({
   'run-review': {
     review_depth: { type: 'int', values: [0, 1], default: 1 },
     on_fail: { type: 'enum', values: ['reflow', 'notify_only'], default: 'reflow' },
-    max_rounds: { type: 'int', default: 8, min: 1, max: 100 },
+    max_rounds: { type: 'int', default: 24, min: 1, max: 100 },
   },
   'scheduled-task': {
     at: { type: 'time', required: true },
