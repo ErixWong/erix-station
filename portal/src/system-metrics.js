@@ -209,22 +209,22 @@ export function parseUptime(text) {
 }
 
 /**
- * `/proc/mounts` → **只有真实块设备**的挂载行：`{device, path, fs}`。
+ * `/proc/mounts` → 挂载行 `{device, path, fs}`（**全部**条目，不做块设备过滤）。
  *
- * 只认真实块设备前缀（`/dev/sd*`、`/dev/nvme*`、`/dev/vd*`、`/dev/mapper/*`、`/dev/md*`，见
- * `REAL_BLOCK_DEVICE_PREFIXES`）：`overlay` / `tmpfs` / `cgroup` / `proc` 那几十行不是「一块盘」，
- * 进面板就是噪声。
+ * 为什么解析层**不再**过滤（261118 真机验收改的口径）：容器里的 `/` 是 `overlay`，不是块设备；
+ * 过滤掉之后 `/` 找不到挂载行 ⇒ 面板上唯一那块盘的设备名与类型都成了「未知」（真机截图实测）。
+ * 现在解析层老实全收，**「哪一行才算一块盘」的判断留给 `diskRows`**（`isRealBlockDevice` 仍是
+ * 那个谓词的唯一定义处）：真实块设备行用来**命名**，`overlay` / `tmpfs` 之类只当**兜底**，
+ * 且不参与「一块盘一行」的去重键。
  *
- * ⚠ **比「`source` 以 `/dev/` 开头」窄**（这是本轮修掉的缺陷）：`/dev/loop0` 是 snap 的 squashfs、
- *   `/dev/ram*` 是内存盘、`/dev/zram*` 是压缩内存盘 —— 它们确实挂在 `/dev/` 下，但既不是宿主数据盘、
- *   用量也毫无运维含义（snap 的 squashfs 是**只读**压缩镜像，`statfs` 报的百分比是镜像填充度）。
- *   本机 `/proc/mounts` 里 `/dev/loop0..loop15` 有十几条 ⇒ 旧口径会让面板凭空多出十几行假盘。
- *   排除名单见 `PSEUDO_DEVICE_PATTERN`；分区号（`nvme0n1p2`、`sda1`、`vda2`、`md1`）都在允许前缀之后，
- *   不需要额外规则。
+ * 真实块设备前缀：`/dev/sd*`、`/dev/nvme*`、`/dev/vd*`、`/dev/mapper/*`、`/dev/md*`
+ * （见 `REAL_BLOCK_DEVICE_PREFIXES`）。`/dev/loop0`（snap squashfs）、`/dev/ram*`、`/dev/zram*`
+ * 确实在 `/dev/` 下但不是宿主数据盘（本机 `/proc/mounts` 里 loop 有十几条）⇒ 由
+ * `isRealBlockDevice` 判为 false，**不会被拿来当设备名**。
  *
- * ⚠ 代价必须写清：容器内的 `/proc/mounts` 是**容器自己的命名空间**，所以
- *   · bind mount 会报**宿主设备**（实测 `/srv/erix/users` → `/dev/nvme0n1p2 ext4`）⇒ 设备名拿得到；
- *   · 而**没被挂进 portal 的盘根本不在这里**⇒ 不会自动出现（`docs/ops/system-metrics.md` 的边界条）。
+ * ⚠ 容器内的 `/proc/mounts` 是**容器自己的命名空间**：bind mount 会报**宿主设备**（实测
+ *   `/srv/erix/users` → `/dev/nvme0n1p2 ext4`）⇒ 设备名拿得到；而**没被挂进 portal 的盘根本不在这里**
+ *   ⇒ 不会自动出现（`docs/ops/system-metrics.md` 的边界条）。
  * 八进制转义（`\040` = 空格）要还原，否则带空格的挂载点匹配不上。
  */
 export function parseProcMounts(text) {
@@ -233,7 +233,6 @@ export function parseProcMounts(text) {
     const parts = line.trim().split(/\s+/);
     if (parts.length < 3) continue;
     const [source, mountPoint, fstype] = parts;
-    if (!isRealBlockDevice(unescapeMountPath(source))) continue;
     rows.push({
       device: unescapeMountPath(source),
       path: unescapeMountPath(mountPoint),
@@ -326,18 +325,37 @@ export async function diskRows({ paths, mounts, statfs }) {
       continue;
     }
     const mount = longestPrefixMount(mountList, path);
+    const real = isRealBlockDevice(mount?.device ?? '');
     const row = {
       device: mount?.device ?? 'unknown',
       fs: mount?.fs ?? 'unknown',
       path,
       ...bytes,
     };
-    const prev = byDevice.get(row.device);
-    // 同设备多路径 ⇒ 取最短 path（长度相同再按字典序，保证**确定性**：同一台机器每次给同一行）。
-    if (!prev || row.path.length < prev.path.length
-      || (row.path.length === prev.path.length && row.path < prev.path)) {
-      byDevice.set(row.device, row);
+    // **去重键 = statfs 三元组**（一个文件系统 = 一行），不是设备名。为什么不用设备名：
+    // 容器里 `/` 是 `overlay`、而 bind 进来的宿主目录是 `/dev/nvme0n1p2`——它们**是同一个文件系统**
+    // （statfs 三个数一模一样），按设备名去重会出两行同数的盘；按设备名又没法把 `overlay` 与
+    // `/dev/nvme0n1p2` 归并。按三元组归并之后：默认 `DISK_PATHS=/` 只有一行（设备名诚实地报
+    // `overlay`），而一旦把宿主目录也挂进来，同一行会自动升级成真实设备名 `/dev/nvme0n1p2`。
+    // ⚠ 代价：两个不同文件系统恰好 total/used/avail 三个数完全相同时会被并成一行（概率可忽略，
+    //   且真发生时两行本来也长得一模一样、无法分辨）。
+    const key = `${row.totalBytes}:${row.usedBytes}:${row.availBytes}`;
+    const prev = byDevice.get(key);
+    if (!prev) {
+      byDevice.set(key, row);
+      continue;
     }
+    // 归并规则（两件事分别取优，不是整行二选一）：
+    //   · **设备名/类型**：真实块设备优先（`overlay` 让位给 `/dev/nvme0n1p2`）；
+    //   · **path**：最短优先（同长按字典序 ⇒ 同一台机器每次给同一行，确定性）。
+    // 分开取优的理由：容器里 `/`（overlay、最短 path）与 bind 进来的宿主目录（真实设备名）是同一个
+    // 文件系统，只留一行时人既想看最短的挂载点、又想要真实设备名。
+    const prevReal = isRealBlockDevice(prev.device);
+    const named = real && !prevReal ? row : (prevReal && !real ? prev : null);
+    const shorter = row.path.length < prev.path.length
+      || (row.path.length === prev.path.length && row.path < prev.path) ? row : prev;
+    const base = named ?? prev;
+    byDevice.set(key, { ...base, path: shorter.path });
   }
   const rows = [...byDevice.values()].sort((a, b) => a.path.localeCompare(b.path));
   return { rows, unreadable };
@@ -432,7 +450,12 @@ export function countContainers(list) {
   const items = Array.isArray(list) ? list : [];
   const nameOf = (c) => String((c?.Names?.[0] ?? c?.name ?? '')).replace(/^\//, '');
   const managed = (c) => (c?.Labels ?? {})['station.managed'] === 'true';
-  const isFde = (c) => managed(c) || /^fde-/.test(nameOf(c));
+  // FDE 容器**只认 `station.managed` 标签**（261118 真机验收修掉的误报）：名字前缀 `fde-` 不算数。
+  // 现场反例：宿主上另一个项目的两个容器叫 `fde-workshop-db` / `fde-workshop-db-old-261107`，
+  // 它们没有任何 station 标签，却被前缀规则算成 FDE ⇒ 面板显示「DB 6 台 ↔ Docker 8 台」并点名
+  // 这两台「只在 Docker 里」。真 FDE 六台**全都**带标签（provisioner 必写），所以标签是完备的判据；
+  // 反过来说，一台丢了标签的 FDE 会以 `onlyDb` 的形态出现在对账里——那正是要看见的信号。
+  const isFde = (c) => managed(c);
   const running = (c) => c?.State === 'running';
   const paused = (c) => c?.State === 'paused';
   const runningFde = items.filter((c) => isFde(c) && running(c));

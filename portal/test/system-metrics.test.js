@@ -366,21 +366,25 @@ const MOUNTS_FIXTURE = [
   '/dev/nvme0n1p2 /mnt/with\\040space ext4 rw 0 0',
 ].join('\n');
 
-test('#650 parseProcMounts：只认真实块设备，loop/ram/zram 一律排除', () => {
+test('#650 parseProcMounts：解析层**全收**（块设备判定交给 isRealBlockDevice / diskRows）', () => {
+  // 261118 真机验收改的口径：容器里 `/` 是 `overlay`，解析层若把它滤掉，面板上唯一那块盘的
+  // 设备名与类型就都成了「未知」。所以解析层不再过滤，「哪一行算一块盘」由 diskRows 决定。
   const rows = parseProcMounts(MOUNTS_FIXTURE);
   const devices = rows.map((r) => r.device);
   for (const want of ['/dev/nvme0n1p2', '/dev/sda1', '/dev/vda2', '/dev/mapper/vg--data-lv', '/dev/md0']) {
-    assert.ok(devices.includes(want), `${want} 必须收：它是真实块设备`);
+    assert.ok(devices.includes(want), `${want} 必须在结果里（真实块设备）`);
   }
-  for (const gone of ['/dev/loop0', '/dev/loop7', '/dev/ram0', '/dev/zram0']) {
-    assert.ok(!devices.includes(gone), `${gone} 不许出现：它不是盘（squashfs 镜像 / 内存盘）`);
-  }
-  assert.deepEqual(devices.filter((d) => !d.startsWith('/dev/')), [], '非 /dev/ 的 source 不该进结果');
+  assert.ok(devices.includes('overlay'), '`overlay` 必须收：容器里的 `/` 就是它（兜底要用）');
+  assert.ok(devices.includes('tmpfs'), '`tmpfs` 也收（兜底用；它不会参与去重键）');
   assert.ok(rows.some((r) => r.path === '/mnt/with space'), '\\040 必须还原成空格，否则前缀匹配会漏');
   // 同一设备的多条挂载行**原样保留**（去重是 `diskRows` 的职责，不在解析层）：fixture 里 3 行
   assert.equal(devices.filter((d) => d === '/dev/nvme0n1p2').length, 3);
   assert.deepEqual(rows.find((r) => r.device === '/dev/md0'),
     { device: '/dev/md0', path: '/mnt/md', fs: 'ext4' });
+  // 但「是不是一块盘」这个判断本身没变松：loop/ram/zram 依旧 false（它们只是**不被拿来当设备名**）。
+  for (const notDisk of ['/dev/loop0', '/dev/loop7', '/dev/ram0', '/dev/zram0']) {
+    assert.equal(isRealBlockDevice(notDisk), false, `${notDisk} 不是盘`);
+  }
 });
 
 test('#650 isRealBlockDevice：判定谓词逐值钉（`/dev/` 前缀不等于「是一块盘」）', () => {
@@ -435,7 +439,6 @@ test('#650 diskRows：statfs 读不到的路径进 unreadable（不写 0、不�
 });
 
 test('#650 diskRows：设备名取**最长前缀**匹配的挂载行；匹配不到 ⇒ unknown 但仍出这一行', async () => {
-  const same = { blocks: 100, bfree: 10, bavail: 5 };
   const mounts = [
     { device: '/dev/sdb1', path: '/srv/erix', fs: 'xfs' },
     { device: '/dev/sdc1', path: '/srv/erix/users', fs: 'ext4' },
@@ -443,8 +446,10 @@ test('#650 diskRows：设备名取**最长前缀**匹配的挂载行；匹配不
   const { rows } = await diskRows({
     paths: ['/srv/erix/users/alice', '/var/lib/docker'],
     mounts,
+    // 两个路径给**不同**数值：去重键是 statfs 三元组，同值会被并成一行（那是另一条用例的事）。
     statfs: makeStatfs({
-      '/srv/erix/users/alice': same, '/var/lib/docker': same,
+      '/srv/erix/users/alice': { blocks: 100, bfree: 10, bavail: 5 },
+      '/var/lib/docker': { blocks: 200, bfree: 20, bavail: 10 },
     }),
   });
   assert.deepEqual(rows.map((r) => [r.path, r.device, r.fs]), [
@@ -452,13 +457,41 @@ test('#650 diskRows：设备名取**最长前缀**匹配的挂载行；匹配不
     ['/var/lib/docker', 'unknown', 'unknown'],
   ], '最长前缀优先：`/srv/erix/users` 赢过 `/srv/erix`；挂载表里没有前缀匹配的行 ⇒ unknown（仍然出这一行）');
 
-  // 挂载表只有 `/` 时它前缀匹配一切（容器里 `/` 是 overlay 时根本不在挂载表的 `/dev/` 名单里 ⇒ unknown）
   const rootOnly = await diskRows({
     paths: ['/'],
     mounts: [{ device: '/dev/nvme0n1p2', path: '/', fs: 'ext4' }],
     statfs: makeStatfs(),
   });
-  assert.equal(rootOnly.rows[0].device, '/dev/nvme0n1p2');
+  assert.equal(rootOnly.rows[0].device, '/dev/nvme0n1p2', '挂载表只有 `/` 时它就是那一行');
+});
+
+test('#650 diskRows：容器里的 `/` 是 overlay ⇒ 设备名/类型取挂载行，**不再双「未知」**（261118 真机）', async () => {
+  // 真机反例：部署后 `/api/admin/system/metrics` 返回 device='unknown', fs='unknown'，面板上唯一那块盘
+  // 两格都是「未知」。根因是解析层把非块设备滤掉了。现在兜底取挂载行 ⇒ `overlay` / `overlay`。
+  const { rows } = await diskRows({
+    paths: ['/'],
+    mounts: parseProcMounts(MOUNTS_FIXTURE),   // fixture 第一条就是 `overlay / overlay ...`
+    statfs: makeStatfs(),
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].device, 'overlay', '设备名诚实地报 overlay（不冒充 /dev/xxx）');
+  assert.equal(rows[0].fs, 'overlay', '类型也报 overlay');
+  assert.ok(rows[0].totalBytes > 0, '尺寸/用量照样有（statfs 走的是底层文件系统）');
+});
+
+test('#650 diskRows：overlay 与 /dev/… 是**同一个文件系统** ⇒ 并成一行，且升级成真实设备名', async () => {
+  // 容器里 `/` 是 overlay、bind 进来的宿主目录是 `/dev/nvme0n1p2`，两者 statfs 三个数一模一样。
+  // 按设备名去重会出两行同数的盘；按 statfs 三元组归并 ⇒ 一行，且真实设备名优先。
+  const same = { blocks: 937000000, bfree: 214000000, bavail: 150000000 };
+  const { rows } = await diskRows({
+    paths: ['/', '/srv/erix/users'],
+    mounts: parseProcMounts(MOUNTS_FIXTURE),
+    statfs: makeStatfs({ '/': same, '/srv/erix/users': same }),
+  });
+  assert.equal(rows.length, 1, '同一文件系统只能一行（否则面板出现两行一模一样的 937G）');
+  assert.equal(rows[0].device, '/dev/nvme0n1p2', '真实块设备名优先于 overlay');
+  assert.equal(rows[0].fs, 'ext4');
+  assert.equal(rows[0].path, '/', 'path 取最短那个');
 });
 
 test('#650 diskRows：statfs 结果缺字段 ⇒ unreadable（NOT NULL 三列不许写「不知道」）', async () => {
@@ -538,7 +571,7 @@ test('#650 querySeries：服务端分桶 + 按 range 缓存 5s + 脏值不当 0'
 // 4) 容器计数与对账
 // ─────────────────────────────────────────────────────────────────────────────────────────
 
-test('#650 countContainers：总数 = 宿主全部（含 exited），明细按 station.managed / fde-*', () => {
+test('#650 countContainers：FDE **只认 station.managed 标签**，名字前缀不算（261118 真机误报）', () => {
   const c = countContainers(CONTAINER_LIST);
   assert.equal(c.total, 5, '`/containers/json?all=1` 的全部；不带 all=1 会少三台 ⇒ 「总数」是错数');
   assert.equal(c.running, 3);
@@ -549,6 +582,16 @@ test('#650 countContainers：总数 = 宿主全部（含 exited），明细按 s
   assert.equal(c.fdeRunning, 1, 'paused 与 exited 都不算 running');
   assert.deepEqual(c.fdeNames, ['fde-bob', 'fde-eric', 'fde-old'],
     '名字集合给对账用（对账要的是**谁**）；前导 `/` 由 nameOf 剥掉');
+  // 真机反例：另一个项目的两个容器叫 `fde-workshop-db` / `fde-workshop-db-old-261107`，没有任何
+  // station 标签，却被前缀规则算成 FDE ⇒ 面板显示「DB 6 台 ↔ Docker 8 台」并点名这两台。
+  const collision = countContainers([
+    { Names: ['/fde-workshop-db'], State: 'running', Labels: {} },
+    { Names: ['/fde-workshop-db-old-261107'], State: 'exited', Labels: {} },
+    { Names: ['/fde-eric'], State: 'running', Labels: { 'station.managed': 'true' } },
+  ]);
+  assert.equal(collision.fde, 1, '名字像 FDE 但没标签 ⇒ 不算（前缀是别人的命名空间，不是判据）');
+  assert.deepEqual(collision.fdeNames, ['fde-eric']);
+
   assert.deepEqual(countContainers('not-an-array'), {
     total: 0, running: 0, paused: 0, stopped: 0, station: 0, fde: 0, fdeRunning: 0, fdeNames: [],
   }, '脏输入 ⇒ 空计数（调用方按 status/形状判过才走到这里）');
