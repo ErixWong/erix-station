@@ -1,4 +1,4 @@
-// WP4 验收（#661 收窄重写）：只保留 wp4 **真正独有**的三条真机断言。
+// WP4 验收（#661 收窄重写）：保留 wp4 **真正独有**的四条真机断言。
 //
 // 为什么收窄：旧版 6 条断言里只有 3 条没被其它脚本覆盖，其余是重复造轮子（且旧版用硬编码端口
 // PORTAL=127.0.0.1:18080 / TRAEFIK_WEB=127.0.0.1:8090 与共享栈 compose 形态，在隔离栈 28080/18090 上
@@ -14,12 +14,19 @@
 //   ② 预览 cookie 不透传上游（strip-cookie）：带预览 cookie 命中 200 时，上游 echo 探针**收不到**
 //      `cookie` 头（边缘 forwardAuth 放行 + strip-cookie 中间件把请求侧 Cookie 整头剥掉）。
 //   ③ 未路由 Host ⇒ 404：一个没被分配的 Host 打到边缘必须 404（不是 403、不是 200）。
+//   ④ 吊销收敛：`containers.status='removed'` ⇒ agentd 下一次 claim/heartbeat 得 401
+//      `token_revoked` ⇒ 优雅退出（`docker logs` 里 `"msg":"agentd exiting"` + `"revoke":"token_revoked"`）
+//      ⇒ deprovision 回收容器，**另一个 FDE 仍 running**（隔离回收）。
+//      ⚠ 这条是 261118 收窄重写时被误删、由独立审计 MED③ 指出才补回的：它是全仓**唯一**覆盖
+//      `token_revoked` 收敛退出的 e2e（`grep -rn 'token_revoked' portal/integration/` 之前只剩注释）。
+//      原来的覆盖对照表把它错记到「wp2a ⑧ / wp3b」——那两个**都不验** agentd 的退出日志。
 //
 // 删掉的断言 → 由谁覆盖（不静默删）：
 //   · 未认证 403 + `preview_ticket_required`（含 deny CORS 头）→ **wp2a ⑥**
 //   · 同块未分配端口 → 404、路由 backend 恒 .2:port、routes.yml 精确 subnet → **wp3a**
 //   · 签票 302→cookie、allocated→active、事件落 DB（run_events）→ **wp2a ⑦ / wp3a**
-//   · SSE 下行 ping + token_revoked 收敛退出、deprovision 只回收本 FDE → **wp2a ⑧ / wp3b**
+//   · SSE 下行 ping → **wp2a ⑧**；`token_revoked` 收敛退出 + deprovision 隔离回收 → **本文件断言④**
+//     （不是 wp2a/wp3b：那两个脚本都不读 agentd 退出日志，261118 二审 LOW② 纠正了这条错记）
 //   · POST /api/projects 410（项目 API 退役）、userspace/端口下发 → **wp2a ①②③**
 //   · LLM binding / mock LLM runner（旧 ⑤⑥ 的前置）→ **wp5 / wp6**
 //
