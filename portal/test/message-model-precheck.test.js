@@ -460,3 +460,47 @@ test('261118：deleteModel 之后 TTL 缓存立刻失效——删完再发消息
     await s.close();
   }
 });
+
+test('261118：在飞的 /model/info 不许把「刚发生的失效」悄悄撤销（代际号 race）', async () => {
+  // 现场：A 请求正在 await listModels（拿到的是**建模型之前**的旧目录），B 请求此刻把模型建好并
+  // 失效缓存。A 回来若无条件写回缓存 ⇒ 失效被撤销，用户继续吃 60s 过期快照。
+  // 判据：A 回来之后**下一次**发消息必须重新打网关（calls 递增），且看到新模型。
+  let releaseFirstList;
+  const firstListGate = new Promise((resolve) => { releaseFirstList = resolve; });
+  let listCalls = 0;
+  const state = { models: modelInfo('mid-emb', 'mid-vis') }; // 主模型还不在目录里
+  const gateway = {
+    state,
+    async listModels() {
+      listCalls += 1;
+      if (listCalls === 1) {
+        // 第一趟：先卡住，等测试放行（模拟「读在飞」），且返回的是**旧快照**
+        const snapshot = state.models;
+        await firstListGate;
+        return snapshot;
+      }
+      return state.models;
+    },
+  };
+  const s = await startServer({ gateway });
+  try {
+    const inflight = postMessage(s, { content: 'a' }); // 这一发会在 listModels 里卡住
+    // 等它真的进了 listModels（否则 releaseFirstList 还没意义）
+    for (let i = 0; i < 200 && listCalls === 0; i += 1) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(listCalls, 1, '第一发已经进到网关读里（在飞）');
+
+    // B 请求：模型建好了（目录变了）+ 失效缓存
+    state.models = modelInfo('mid-main', 'mid-emb', 'mid-vis');
+    llm.invalidateDataPlaneNameCache();
+
+    releaseFirstList(); // 放行那趟在飞的读（它拿到的是旧快照）
+    const first = await inflight;
+    assert.equal(first.status, 409, '在飞的那一发按它自己那趟的读数判：旧目录里没有主模型 ⇒ 409');
+
+    const after = await postMessage(s, { content: 'b' });
+    assert.equal(after.status, 202, '下一发必须看到新目录（在飞的旧快照不许写回缓存）');
+    assert.equal(listCalls, 2, '下一发必须重新打网关；若旧快照被写回，这里会停在 1（靠 60s TTL 蒙对）');
+  } finally {
+    await s.close();
+  }
+});

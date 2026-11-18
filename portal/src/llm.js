@@ -379,6 +379,8 @@ export async function createProvider(gateway, input = {}) {
     credential_info: info,
     credential_values: values,
   });
+  // credential 变更会改模型目录里的条目（模型归属、api_base）⇒ 失效 TTL 缓存
+  invalidateDataPlaneNameCache();
   return toProviderMutationResult(result, { name: name.trim(), info, values });
 }
 
@@ -401,15 +403,17 @@ export async function updateProvider(gateway, name, { base_url, enabled, credent
     ...(values === undefined ? {} : { credential_values: values }),
   };
   const result = await client.updateCredential(name, body);
-  return toProviderMutationResult(result, { name, info: body.credential_info, values });
-  // credential 变更（api_base / 凭据）会改模型目录里的条目
+  // credential 变更（api_base / 凭据）会改模型目录里的条目 ⇒ 失效 TTL 缓存
+  // ⚠ 必须在 return **之前**（261118 第一版写成 return 之后的死代码，靠自检 grep 抓到）
   invalidateDataPlaneNameCache();
+  return toProviderMutationResult(result, { name, info: body.credential_info, values });
 }
 
 export async function deleteProvider(gateway, name) {
-  return getGatewayClient(gateway).deleteCredential(name);
-  // credential 删除会连带删掉它名下的模型 ⇒ 目录变了
+  const result = await getGatewayClient(gateway).deleteCredential(name);
+  // credential 删除会连带删掉它名下的模型 ⇒ 目录变了。⚠ 必须在 return 之前（同 updateProvider）
   invalidateDataPlaneNameCache();
+  return result;
 }
 
 function validateMaxTokens(value) {
@@ -907,6 +911,17 @@ const HEARTBEAT_NAME_SLOTS = [
 const dataPlaneNameCache = { client: null, at: 0, map: null };
 
 /**
+ * 缓存代际号：只在 `invalidateDataPlaneNameCache()` 里自增。
+ *
+ * 为什么要它（261118 审计自查发现的 race）：`dataPlaneNameMap()` 会 `await listModels()`，
+ * 而在这次 await 期间可能有人写模型并失效缓存；等它回来，**旧快照**会被无条件写回缓存，
+ * 于是「失效」被这趟在飞的读悄悄撤销，用户继续吃 60s 的过期快照。
+ * 修法：读侧在 await **之前**记下代际号，写回缓存时**只有代际没变**才落盘；变了就只把
+ * 这一趟的结果返回给当前调用方（它拿到的是它自己那趟的真实读数），不污染缓存。
+ */
+let dataPlaneNameCacheGeneration = 0;
+
+/**
  * 丢弃「数据面名 / id 映射」的 TTL 缓存。
  *
  * 为什么必须显式失效（261118 实测的真 bug）：缓存只有 TTL（60s）过期这一条出路，
@@ -919,6 +934,7 @@ const dataPlaneNameCache = { client: null, at: 0, map: null };
  * 读路径一律靠 TTL，别在热路径上加失效（心跳每 15s 一趟，失效等于每趟都打网关）。
  */
 export function invalidateDataPlaneNameCache() {
+  dataPlaneNameCacheGeneration += 1;
   dataPlaneNameCache.client = null;
   dataPlaneNameCache.at = 0;
   dataPlaneNameCache.map = null;
@@ -969,10 +985,15 @@ async function dataPlaneNameMap(client, { now, ttlMs, listModels }) {
     && at - dataPlaneNameCache.at <= ttlMs) {
     return dataPlaneNameCache.map;
   }
+  const generationAtStart = dataPlaneNameCacheGeneration;
   const map = await loadDataPlaneNameMap(client, { listModels });
-  dataPlaneNameCache.client = client;
-  dataPlaneNameCache.at = at;
-  dataPlaneNameCache.map = map;
+  // 在飞的这一趟期间有人失效过缓存（写模型/credential）⇒ 本次读数可能已经过期，
+  // **只返回给当前调用方，不写回缓存**（否则等于把失效悄悄撤销掉）。
+  if (generationAtStart === dataPlaneNameCacheGeneration) {
+    dataPlaneNameCache.client = client;
+    dataPlaneNameCache.at = at;
+    dataPlaneNameCache.map = map;
+  }
   return map;
 }
 
