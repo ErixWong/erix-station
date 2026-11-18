@@ -218,7 +218,10 @@ function curl({ url, host = null, headers = [], args = '', out = 'resp' }) {
   const bodyFile = path.join(S.artifactsRoot, `${out}.body`);
   const hostArg = host ? `-H ${JSON.stringify(`Host: ${host}`)} ` : '';
   const headerArgs = headers.map((h) => `-H ${JSON.stringify(h)} `).join('');
-  const cmd = `curl -s -D ${JSON.stringify(headerFile)} -o ${JSON.stringify(bodyFile)} -w '%{http_code}' ${hostArg}${headerArgs}${args} ${JSON.stringify(url)}`;
+  // `--ipv4`：本机把 `*.localhost` 解析成 `::1`（RFC 6761 的 glibc 行为），而隔离栈的
+  // Traefik / FDE 代理只监听 IPv4 ⇒ 不加这一条，「无票直连」那条等待会**超时**（261117 实测：
+  // 段 ⑥ 卡 30s 后红，其余段全绿）。强制 IPv4 才打到真实端口上。
+  const cmd = `curl -s --ipv4 -D ${JSON.stringify(headerFile)} -o ${JSON.stringify(bodyFile)} -w '%{http_code}' ${hostArg}${headerArgs}${args} ${JSON.stringify(url)}`;
   const status = execSync(cmd, { encoding: 'utf8', stdio: 'pipe' }).trim();
   const headersText = fs.existsSync(headerFile) ? fs.readFileSync(headerFile, 'utf8') : '';
   const body = fs.existsSync(bodyFile) ? fs.readFileSync(bodyFile, 'utf8') : '';
@@ -396,10 +399,35 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       }
       // 本脚本自己的临时目录（不碰 docker；护栏拦下时也一样要清）。
       // issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；compose up --build 按需重建）。
-      teardown('rm -rf userspace 临时目录', () => S.userspaceRoot && fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
-      teardown('rm -rf dynamic 临时目录', () => S.dynamicRoot && fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
-      teardown('rm -rf static 临时目录', () => S.staticRoot && fs.rmSync(S.staticRoot, { recursive: true, force: true }));
-      teardown('rm -rf artifacts 临时目录', () => S.artifactsRoot && fs.rmSync(S.artifactsRoot, { recursive: true, force: true }));
+      // #261117 实测：FDE 容器（uid≠宿主）会在这些临时目录里建子目录 ⇒ 宿主 `fs.rmSync` 会
+      // EPERM/EACCES（容器写入的文件宿主删不掉）。清场**必须**先 chmod 再删，否则「清理失败」
+      // 把一条本来全绿的 e2e 判红（且看不出是环境问题还是回归）。
+      const rmTree = (dir) => {
+        if (!dir || !fs.existsSync(dir)) return;
+        const fix = (d) => {
+          let ents = [];
+          try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { /* 读不了就直接 chmod */ }
+          try { fs.chmodSync(d, 0o700); } catch { /* 非属主时 chmod 也会失败，交给下面的 rm 报 */ }
+          for (const e of ents) if (e.isDirectory()) fix(path.join(d, e.name));
+        };
+        fix(dir);
+        try {
+          fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        } catch (error) {
+          // 兜底：FDE 容器（uid≠宿主）建的子目录（实测 `.../platform/git`）宿主连 rmdir 都 EACCES，
+          // 而 `chmod` 也改不动（非属主）。用容器里的 root 删 —— 这才是「清场」在这套拓扑下的正确做法，
+          // 否则一条全绿的 e2e 会因为「宿主删不掉容器的文件」被判红（261117 实测）。
+          const image = process.env.FDE_IMAGE || process.env.STATION_PORTAL_IMAGE;
+          if (!image) throw error;
+          execSync(`docker run --rm --user 0 --entrypoint sh -v ${JSON.stringify(`${dir}:/x`)} ${image} -c 'rm -rf /x/* /x/.[!.]* 2>/dev/null; exit 0'`,
+            { stdio: 'pipe' });
+          if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        }
+      };
+      teardown('rm -rf userspace 临时目录', () => S.userspaceRoot && rmTree(S.userspaceRoot));
+      teardown('rm -rf dynamic 临时目录', () => S.dynamicRoot && rmTree(S.dynamicRoot));
+      teardown('rm -rf static 临时目录', () => S.staticRoot && rmTree(S.staticRoot));
+      teardown('rm -rf artifacts 临时目录', () => S.artifactsRoot && rmTree(S.artifactsRoot));
       const problems = [
         ...teardownFailures.map((action) => `清理动作失败：${action}`),
         ...residual.map((item) => `残留资源：${item}`),
@@ -451,6 +479,9 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       S.cookieJar = path.join(S.artifactsRoot, 'preview-cookies.txt');
       S.staticFile = writeTraefikStatic(S.staticRoot, {
         repoRoot: REPO_ROOT, webPort: TRAEFIK_WEB_PORT, websecurePort: TRAEFIK_WEBSECURE_PORT,
+        // 管理台入口（`:9443` 在 traefik.yml 里写死）也必须换端口：edge 是 host 网络，
+        // 不换就与**共享栈**的 9443 撞端口 ⇒ 容器 Restarting、整个隔离栈入口不监听（261117 实测）。
+        adminPort: process.env.TRAEFIK_ADMIN_PORT || '19443',
       });
       for (const dir of [S.userspaceRoot, S.dynamicRoot, S.staticRoot, S.artifactsRoot]) fs.chmodSync(dir, 0o755);
 
@@ -666,6 +697,10 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       assert.equal(issued.status, 201, `签发预览票据：${JSON.stringify(ticket)}`);
       assert.match(ticket.ticket, /^pt_/, 'ticket 形态 pt_<base64url>');
       assert.ok(Number.isInteger(ticket.expires_in) && ticket.expires_in > 0, `expires_in 是正整数（缺省 60s ⇒ 签完立刻兑换）：${ticket.expires_in}`);
+      // 从 wp2b 折入（issue #661）：**精确** TTL 也要钉住。只断言「正整数」会把
+      // `PREVIEW_TICKET_TTL_SECONDS` 的默认值漂移（60 → 3600）放过去。
+      assert.equal(ticket.expires_in, 60,
+        `票据 TTL 默认必须是 60s（PREVIEW_TICKET_TTL_SECONDS 默认值；实际 ${ticket.expires_in}）`);
       assert.equal(ticket.url, `http://${S.hostname}:${TRAEFIK_WEB_PORT}?preview_ticket=${ticket.ticket}`,
         '签票返回的 url = 该 host 的公开入口（scheme/端口从 PORTAL_PUBLIC_BASE_URL 派生，#57 阶段2）');
 

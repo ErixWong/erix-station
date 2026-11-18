@@ -167,7 +167,7 @@ function dockerStdin(args, input) {
 // • 隔离跑法 ⇒ 与 wp2a 完全同（缺 STATION_DB_DIR 硬失败 + 只允许删临时目录内的路径）；
 // • 共享跑法（无任何隔离信号）⇒ 保留「重置共享 dev 库 /docker/station-db」的既定语义，但改为
 //   **显式** env 注入（缺省补 STATION_DB_DIR + ERIX_E2E_ALLOW_DB_DIR=1 豁免），不再靠脚本内私有缺省。
-//   （lib 的「共享重置」选项（resolveDbDir 第三参）只允许 wp2b 声明——wp3b 用上面的 env 形态表达同一语义，
+//   （lib 的「共享重置」选项（resolveDbDir 第三参）原先只允许 wp2b（#661 起 wp2b 已退役）声明——wp3b 用上面的 env 形态表达同一语义，
 //     选项出现处由 isolation-negative 的单一来源断言钉住。）
 const { removeDbDir } = createDbDirCleaner({
   docker,
@@ -454,7 +454,10 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
         TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
         ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
         ERIX_ARTIFACTS_ROOT_HOST: S.artifactsRoot,
-        STATION_DB_DIR: S.dbDir,
+        // #661 实测：这里原先写 `S.dbDir`，而 **S.dbDir 在本文件里从来没被赋值** ⇒ 护栏读到
+        // `undefined` 报「STATION_DB_DIR 未设置」，wp3b 在起栈前 2 秒就红（跟隔离配置无关，是脚本自身的空引用）。
+        // 正确口径与 `removeDbDir()` 同源：隔离跑法就是 process.env 里的值；共享跑法用共享栈的既定目录。
+        STATION_DB_DIR: ISOLATED_MODE ? process.env.STATION_DB_DIR : SHARED_STACK.dbDir,
       },
       envFile: process.env.STATION_SHARED_ENV ?? 'deploy/.env',
       label: `wp3b 隔离实例（stack=${S.stackId ?? process.env.STATION_STACK_ID ?? '?'}）`,
