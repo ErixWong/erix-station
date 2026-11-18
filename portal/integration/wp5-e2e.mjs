@@ -356,7 +356,15 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     const userSeq = sent.body.message.seq;
     const events = await readSseDuring(run1, userSeq);
     assert.ok(events.find((e) => e.type === 'round_start'), 'SSE 含 round_start');
-    assert.ok(events.find((e) => e.type === 'assistant_delta'), 'SSE 含 assistant_delta');
+    // ⚠ #502 起**碎片事件（assistant_delta / reasoning_delta / tool_call_delta）不再落库、也不再经
+    // SSE 补发**（`portal/src/http.js`「#502：碎片不再从库里补发」）⇒ 断言它会永远红。
+    // 正文证据改看**整轮终稿**：`round_end.final_text`（与 wp3b 同一口径）。
+    const roundEnd = events.find((e) => e.type === 'round_end');
+    assert.ok(roundEnd, 'SSE 含 round_end');
+    assert.ok(String(roundEnd.data?.final_text ?? '').trim() !== '',
+      `round_end.final_text 必须非空（#502 后正文的唯一形态；实际 ${JSON.stringify(roundEnd.data)?.slice(0, 200)}）`);
+    assert.ok(!events.some((e) => e.type === 'assistant_delta'),
+      'SSE 里出现 assistant_delta 说明碎片又被补发了（#502 之后不该有）');
     assert.ok(events.at(-1).type === 'run_end' && events.at(-1).data.run_id === run1, 'SSE 末位 run_end');
 
     // 6) assistant 回写 + seq 连续（messages+run_events 合并后从 1 严格递增无空洞）
