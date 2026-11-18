@@ -473,6 +473,25 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 > 也未进 `portal/src/provisioner.js` 的 Env 下行集，所以现在只能靠**容器创建时直接注入**（或进容器改 env 后重建）生效；
 > 要像 `ERIX_MAX_ROUNDS` 那样走「portal env → provisioner → 容器 env」的光纤，需后续单登记两处（改值本身无需重建镜像）。
 
+### 10.5 补登：portal 侧环境变量（宿主资源监控，issue #650，2026-11-17 登记）
+
+> 以下四个旋钮全部由 portal 进程读取（`portal/src/config.js` 的 `systemMetricsSettings()`，汇成 `config.systemMetrics`），
+> **不上 DB 单行表**。为何不走 `upload_settings` 那种「DB 优先 env」：这四项都是「装好就不动」的运维参数，
+> 而 e2e 栈必须能在**初始化前**用 env 关掉（DB 层做不到：栈起来时 DB 里还没有配置行）。
+> 三个解析器各自的口径（全部有单测）：`strictBoolEnv` **只认 `0`/`1`**、`clampedIntEnv` **区间内才采纳否则回落默认**、
+> `csvListEnv` trim→去空→**去重**。改值都只需**重建/重启 portal 容器 env，无需重建镜像**；操作口径见 `docs/ops/system-metrics.md`。
+
+| 变量 | 用途 | 默认 / 示例 |
+|---|---|---|
+| `SYSTEM_METRICS_ENABLED` | 采样器总开关，兼**应急刹车**（issue #650）：`1` 开（默认）、`0` 关——关掉后 `startMetricsSampler` **不建定时器**（既不读 `/proc` 也不写库），而 `GET /api/admin/system/metrics` 仍返 `200` 且 `latest: null`（不是 500），管理台「系统」页据此显示「采样已关闭」。**只认严格 `0`/`1`**：`false`/`no`/带空格这类拼写错误会 `console.warn` 后**按默认（开）**处理——为什么不像 `MIGRATE_ON_START !== '0'` 那样「除 0 外都算开」：那种写法把拼错当成「开」，而应急刹车最坑的失败就是「运维以为关了、实际没关」 | `1` |
+| `SYSTEM_METRICS_INTERVAL_SECONDS` | 采样拍频（秒），**写入成本与曲线粒度的唯一旋钮**：5s 是最小可用粒度（低于它写放大开始咬人），300s 以上曲线已经不够看。**合法区间 5–300**；越界/非整数 ⇒ `console.warn` + **回落默认 30**（而不是夹到边界：`3` 想写 `30` 时默默夹成 5 会让写入频率与运维意图差 6 倍而没人知道） | `30` |
+| `SYSTEM_METRICS_RETENTION_DAYS` | 历史保留天数：清理挂在 reaper 的**小时级**清理槽上（`internal.js`，一小时一个事务，不单开循环），且 `ENABLED=0` 时**照清**（采样停了旧行还得缩）。**合法区间 1–365**，越界同样回落默认 + warn。生效口径同时决两个读数：API 响应的 `retentionDays` 字段与 `series` 的 `30d` 档能拉到多远 | `30` |
+| `SYSTEM_METRICS_DISK_PATHS` | 要监控的**容器内**路径，逗号分隔（如 `/,/srv/erix`）。解析：trim → 去空 → **去重**（同一路径写两遍会在配置面就重掉，否则面板「已监控 N 个文件系统」的 N 与 env 写的条数对不上）；全空 ⇒ 回落 `[/]`。⚠ 容器看不见宿主挂载表：这里写的必须是 **portal 容器内真实存在**的路径——**加盘 = `deploy/docker-compose.yml` 加一行 ro bind mount + 本变量加一条，同一次改动** | `/` |
+
+> **下发链路现状**（本单未动 `deploy/`）：这四个名字目前**不在** `deploy/docker-compose.yml` 的 `station-portal` env 里，
+> 也不在 fde-proxy `ENV_KEY_ALLOW` / provisioner 的 Env 下行集里——它们只作用于 **portal 进程自身**，不需要下发 FDE。
+> 要改值：在 compose 里给 `station-portal` 加 env（或 `.env`）后重建 portal 容器；未设置时全部走上表的默认值。
+
 ---
 
 ## 11. P1 运行时参数表（超时 / 背压 / 时间权威 / 日志）
