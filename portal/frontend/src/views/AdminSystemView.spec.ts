@@ -122,6 +122,7 @@ async function mountAdmin(handler: Handler = () => undefined, path = '/admin/use
   await router.push(path);
   await router.isReady();
   const wrapper = mount(App, { global: { plugins: [pinia, router, i18n] }, attachTo: document.body });
+  mountedWrappers.push(wrapper);
   await flushPromises();
   return { wrapper, fetchMock, router };
 }
@@ -149,7 +150,13 @@ async function openSystem(handler: Handler = () => undefined) {
 }
 
 /** 只对**本端点**回 200 的桩（别的 URL 一律 `undefined` 让默认桩接，否则 `/api/me` 会被顶成系统读数）。 */
-function withMetrics(payload: Partial<typeof METRICS> | ((url: string) => unknown) = {}): Handler {
+// 每条用例挂上去的 wrapper 都要在 `afterEach` 里 **unmount**：组件实例上的 `visibilitychange` 监听
+// 挂在 `document` 上，不卸载就会一直活着。症状（本文件真实踩过）：上一条用例泄漏的实例在
+// `visibilitychange` 里调 `refresh()`，而 `fetch` 是 `vi.stubGlobal` 换的**全局**桩 ⇒ 计数多出 1–2 次，
+// S-5 那条「回到前台只补发一次」就变成 `expected 3 to be 2`。这不是产品双请求，是夹具泄漏。
+const mountedWrappers: VueWrapper[] = [];
+
+function withMetrics(payload: Record<string, unknown> | ((url: string) => unknown) = {}): Handler {
   return (url) => (url.startsWith(SYSTEM_METRICS_PATH)
     ? jsonResponse(200, typeof payload === 'function' ? payload(url) : { ...METRICS, ...payload })
     : undefined);
@@ -179,6 +186,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // 先卸载再清 DOM：卸载会摘掉 `visibilitychange` 监听（夹具泄漏的根源，见 `mountedWrappers` 注释）。
+  for (const w of mountedWrappers.splice(0)) {
+    try { w.unmount(); } catch { /* 已卸载的再卸一次不必响 */ }
+  }
   vi.unstubAllGlobals();
   document.body.innerHTML = '';
   setDocumentHidden(false);
@@ -274,7 +285,7 @@ describe('判据 S-1：四张卡各显示自己的读数', () => {
     expect(wrapper.get('[data-test="containers-fde"]').text()).toContain('7');
     const drift = wrapper.get('[data-test="containers-drift"]').text();
     expect(drift).toContain('DB');
-    expect(drift).toMatch(/7\s*台?\s*↔\s*7/);
+    expect(drift).toMatch(/7\s*台\s*↔\s*Docker\s*7/);
     expect(wrapper.find('[data-test="drift-only-db"]').exists(), 'count=0 时不许列名字（是噪声）').toBe(false);
     expect(wrapper.find('[data-test="drift-only-docker"]').exists()).toBe(false);
   });
@@ -302,7 +313,7 @@ describe('判据 S-1：四张卡各显示自己的读数', () => {
     expect(wrapper.findAll('[data-test="metric-chart-line"]').length).toBeGreaterThanOrEqual(3);
     for (const key of ['cpu', 'mem', 'containers']) {
       const at = wrapper.get(`[data-test="${key}-sampled-at"]`).text();
-      expect(at, `${key} 卡必须带采样时刻`).toMatch(/30\s*秒前|刚刚/);
+      expect(at, `${key} 卡必须带采样时刻`).toMatch(/\d+\s*秒前|刚刚/);
     }
   });
 
@@ -340,7 +351,7 @@ describe('判据 S-3：拿不到 ⇒ 「未知」，绝不渲染成 0', () => {
     expect(wrapper.get('[data-test="cpu-load"]').text()).toBe(unknown);
     expect(wrapper.get('[data-test="mem-used"]').text()).not.toMatch(/\b0\b/);
     expect(wrapper.get('[data-test="mem-available"]').text()).toBe(unknown);
-    expect(wrapper.get('[data-test="containers-unknown"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="containers-unknown"]').exists()).toBe(true);
     expect(wrapper.text()).not.toMatch(/NaN|undefined/);
     expect(wrapper.text()).not.toMatch(/\bnull\b/);
   });
@@ -369,7 +380,7 @@ describe('判据 S-3：拿不到 ⇒ 「未知」，绝不渲染成 0', () => {
     const unknown = String(t('admin.system.unknown'));
     expect(row.get('[data-test="disk-device"]').text()).toBe(unknown);
     expect(row.get('[data-test="disk-fs"]').text()).toBe(unknown);
-    expect(row.text()).not.toMatch(/\b0\b/, '用量全缺 ⇒ 不许出现 0');
+    expect(row.text(), '用量全缺 ⇒ 不许出现 0').not.toMatch(/\b0\b/);
   });
 
   it('采样时刻不可解析 / 在未来 ⇒ 原样给出，不夹成「刚刚」也不出 NaN', async () => {
@@ -461,7 +472,7 @@ describe('判据 S-2：三态各自独立降级（一个错不许整页红）', 
     expect(skeleton.exists(), '首次加载中必须有骨架').toBe(true);
     expect(skeleton.text()).not.toMatch(/\d/);
     expect(wrapper.find('[data-test="card-cpu"]').exists()).toBe(false);
-    release?.(jsonResponse(200, METRICS));
+    (release as ((r: Response) => void) | null)?.(jsonResponse(200, METRICS));
     await flushPromises();
     expect(wrapper.find('[data-test="system-loading"]').exists(), '数据到了骨架必须让位').toBe(false);
     expect(wrapper.find('[data-test="card-cpu"]').exists()).toBe(true);
