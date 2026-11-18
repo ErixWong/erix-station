@@ -620,6 +620,19 @@ export function writeTraefikStatic(dir, { repoRoot = REPO_ROOT, webPort, websecu
   // 不换它就会跟**共享栈**的 9443 撞端口 ⇒ 容器 `Restarting (1)` 崩循环、整个隔离栈的入口不监听，
   // 下游 e2e 全部连不上（wp2a 段⑥ curl 退出码 7 就是这么来的）。
   if (adminPort) output = output.replace('address: ":9443"', `address: ":${adminPort}"`);
+  // ⚠ 硬闸（261117 实测的根因）：隔离栈的 web 端口一旦不是共享栈的 8090，就**必须**换掉管理口 9443——
+  // 否则 edge 是 host 网络、与共享栈的 9443 撞端口 ⇒ 容器 `Restarting (1)` 崩循环 ⇒ 整个隔离栈**没有入口**
+  // ⇒ 下游 agentd 连不上 SSE、所有直连/路由断言 curl 退出码 7，而症状看起来像「网络问题」。
+  // 之前 wp3a/wp3b/wp5/wp6 四个调用点全都漏传 ⇒ 它们从来没在隔离模式跑通过。
+  if (String(webPort) !== '8090') {
+    if (!adminPort) {
+      throw new Error('writeTraefikStatic: 隔离跑法必须传 adminPort（web 端口≠8090 时管理口 :9443 会与共享栈撞端口，'
+        + 'edge 会崩循环、整个隔离栈没有入口）。传 process.env.TRAEFIK_ADMIN_PORT 或一个与共享栈不同的端口。');
+    }
+    if (output.includes('address: ":9443"')) {
+      throw new Error(`writeTraefikStatic: 静态配置里仍有共享栈的管理口 :9443（adminPort=${adminPort}）⇒ 替换没生效`);
+    }
+  }
   const target = path.join(dir, 'traefik.yml');
   fs.writeFileSync(target, output);
   return target;
