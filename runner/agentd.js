@@ -1180,6 +1180,25 @@ function abortRun(ctx, reason) {
 // ---------------------------------------------------------------------------
 // worker 生命周期（§5/§6）
 // ---------------------------------------------------------------------------
+/**
+ * per-run 旋钮：从 ticket 的 `run` 里挑出「本 run 专属」的两个字段，供 `runStart` 字面量展开。
+ *
+ * issue #693：这两个字段曾经**根本不在 `runStart` 里**，导致 `buildWorkerEnv` 读到的永远是
+ * `undefined` ⇒ #627 ③（per-run 轮数）与 #662（只读审查）在真机上从未生效，而且完全静默。
+ *
+ * 为什么抽成函数：`runStart` 那个字面量在一个巨型函数里，没法直接测；抽出来之后
+ * 用例可以走「ticket 形状 → childEnv」的整条，并用源码级守卫钉住「字面量真的展开了它」。
+ *
+ * ⚠ `max_rounds` 用 `!= null`（`null` 才是「没给」；`0`/负数由 worker 的 `parseMaxRounds` 兜）；
+ *   `review_only` 严格 `=== true`（区分「没声明」与「声明关」，与 `buildWorkerEnv` 同一口径）。
+ */
+export function perRunKnobs(run) {
+  const out = {};
+  if (run?.max_rounds != null) out.max_rounds = run.max_rounds;
+  if (run?.review_only === true) out.review_only = true;
+  return out;
+}
+
 function buildWorkerEnv(runStart, baseEnv = process.env) {
   const childEnv = { ...baseEnv };
   // §11：worker 无凭据——剔除 token；HOME 指向 erix（工作区属主）。
@@ -1600,6 +1619,13 @@ async function handleTicket(ticket) {
     // 之后心跳刷新 state.llmModels 不影响本 run（进行中 run 的模型名在其生命周期内锁定）。
     models: state.llmModels,
     ...(run.git_identity ? { git_identity: run.git_identity } : {}),
+    // issue #693：per-run 旋钮必须**真的进 runStart**。`buildWorkerEnv(runStart)` 里读的是
+    // `runStart.max_rounds` / `runStart.review_only`，而本字面量是个**白名单** —— 漏一个字段，
+    // 那一整条链路（`runs.run_state` → ticket → childEnv）就在最后一米静默断开。
+    // 实测：#627 ③（per-run 轮数）与 #662（只读审查）**从未生效过**，因为这里没有它们。
+    // ⚠ 抽成 `perRunKnobs` 是为了可测（见 `runner/test/agentd-perrun-knobs.test.js`）；
+    //   那个用例会断言**本行真的展开了它** —— 把这一行删了就会红。
+    ...perRunKnobs(run),
   };
   try {
     spawnWorker(ctx, runStart);
