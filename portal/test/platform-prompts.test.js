@@ -1021,7 +1021,10 @@ test('P12b 跨字段并发首写（已种行）⇒ 两格都在，先写那一�
 test('P10 入队条数 = 启用中的 FDE 数；入队抛错 ⇒ 保存仍然成功 + materializeEnqueued=0 + warn', async () => {
   const pool = new PromptsFakePool({ fdes: ['f1', 'f2', 'f3'] });
   const saved = await updatePlatformPrompts({ pool, field: 'addendum', text: '约定', actorId: ACTOR });
-  assert.equal(saved.materializeEnqueued, 3, '三台启用中的工位 ⇒ 三条入队');
+  assert.equal(saved.materializeEnqueued, 3,
+    '三台启用中的工位 ⇒ 三条入队（N 的口径 = `enqueueMaterializeForAllFdes` '
+    + '列启用中工位的谓词 `fde_name IS NOT NULL AND status IN ('
+    + "'active', 'awaiting_credential')`，不是全量工位）");
   assert.equal(pool.outbox.length, 3);
   const outboxParams = pool.outbox.map((r) => r.params);
   assert.deepEqual(outboxParams.map((p) => p[0]).sort(), ['f1', 'f2', 'f3'], '每条都点名一台 FDE');
@@ -1071,6 +1074,11 @@ const FDE_USER = {
   id: 'd0000000-0000-4000-8000-0000000000a2', login: 'alice', display_name: 'Alice',
   role: 'fde', fde_name: 'alice', auth_source: 'local', status: 'active',
 };
+// #664：第二个管理员（证限流 key 含**操作者**：root 被封不影响 root2）。
+const ADMIN2 = {
+  id: 'd0000000-0000-4000-8000-0000000000a3', login: 'root2', display_name: 'Root2',
+  role: 'admin', fde_name: null, auth_source: 'local', status: 'active',
+};
 
 /**
  * FakePool + `platform_prompts` 那三条 SQL（HTTP 层要真走会话鉴权，所以复用 FakePool 的会话面）。
@@ -1083,10 +1091,10 @@ const FDE_USER = {
  */
 class HttpPromptsPool extends FakePool {
   constructor(opts = {}) {
-    super({ users: [ADMIN, FDE_USER] });
+    super({ users: [ADMIN, ADMIN2, FDE_USER] });
     this.prompts = new PromptsFakePool(opts);
     this.prompts.audit = this.audit;        // 同一个数组：两条计数入口合成一本账
-    for (const u of [ADMIN, FDE_USER]) {
+    for (const u of [ADMIN, ADMIN2, FDE_USER]) {
       const token = `${u.login}-tok`;
       this.tokens = this.tokens || new Map();
       this.tokens.set(u.login, token);
@@ -1109,7 +1117,7 @@ class HttpPromptsPool extends FakePool {
   }
 }
 
-async function startAdmin({ poolOpts = {} } = {}) {
+async function startAdmin({ poolOpts = {}, rateLimit } = {}) {
   const pool = new HttpPromptsPool(poolOpts);
   const config = {
     cookie: cookieSettings('dev-http', 604800),
@@ -1123,6 +1131,8 @@ async function startAdmin({ poolOpts = {} } = {}) {
     maxBodyBytes: 64 * 1024, maxLoginLength: 128, maxPasswordLength: 256,
     staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-prompts-')),
     userSpaceRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'station-userspace-prompts-')),
+    // #664：只给提示词限流留一个测试旋钮（不传 ⇒ http.js 默认 30）。
+    ...(rateLimit ? { platformPromptsRateLimit: rateLimit } : {}),
     fdeUid: process.getuid?.() ?? 1000,
     fdeGid: process.getgid?.() ?? 1000,
   };
@@ -1238,6 +1248,71 @@ test('P8c HTTP：GET DTO 是契约 §6 那一套键；PUT 200 = 保存后的完�
     assert.equal(badMethod.json.error.code, 'method_not_allowed');
     const badPath = await readResp(await call(s, { path: '/api/admin/prompts/nope', method: 'PUT', body: { text: '' } }));
     assert.equal(badPath.status, 404, '未知子路径 ⇒ 落到既有 404，不新造码');
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 4b. #664 三条提示词 PUT 的速率限制（限流器口径照登录 / mailtest / tls）。
+//   四条判据对应：③ 真请求打出 429 + code + retryable；④ 三条端点都覆盖；
+//   key = 操作者 + 端点（换端点 / 换操作者互不影响）；反向自证见下一条 `P16b`。
+// ---------------------------------------------------------------------------
+
+test('#664P16 三条 PUT 各自独立限流：同端点第 4 次成功保存 ⇒ 429；换端点/换操作者不受影响', async () => {
+  const s = await startAdmin({
+    rateLimit: { maxFailures: 3, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
+  });
+  try {
+    // 三条端点逐个打满：前 3 次 200、第 4 次 429。key 含端点 slug ⇒ 三条互不影响
+    // ⇒ 若 key 只按操作者，后两条端点会在 addendum 已封后直接 429（这里前 3 次仍 200 ⇒ 键含端点）。
+    for (const slug of ['addendum', 'agents-md', 'title-prompt']) {
+      for (let i = 0; i < 3; i += 1) {
+        const ok = await readResp(await call(s, {
+          path: `/api/admin/prompts/${slug}`, method: 'PUT', body: { text: `约定-${slug}-${i}` },
+        }));
+        assert.equal(ok.status, 200, `端点 ${slug} 未触顶的第 ${i + 1} 次应 200；实际 ${ok.status} ${ok.text}`);
+      }
+      const res = await call(s, {
+        path: `/api/admin/prompts/${slug}`, method: 'PUT', body: { text: `约定-${slug}-blocked` },
+      });
+      const blocked = await readResp(res);
+      assert.equal(blocked.status, 429,
+        `端点 ${slug} 漏挂限流器：第 4 次应当 429（key=platformPrompt:${slug}:<actor>）；实际 ${blocked.status} ${blocked.text}`);
+      assert.equal(blocked.json.error.code, 'rate_limited', `端点 ${slug} 的 429 必须是 rate_limited 码`);
+      assert.equal(blocked.json.error.retryable, true, `端点 ${slug} 的 429 必须 retryable:true`);
+      assert.ok(Number(res.headers.get('retry-after')) > 0,
+        `端点 ${slug} 的 429 必须带正数 Retry-After 头`);
+    }
+    // key 含操作者：root 已把三条都打到封禁，另一管理员 root2 保存 addendum 仍应 200。
+    const other = await readResp(await call(s, {
+      path: '/api/admin/prompts/addendum', method: 'PUT', body: { text: '另一个管理员' }, login: 'root2',
+    }));
+    assert.equal(other.status, 200,
+      `限流 key 含操作者：root 已被封，root2 保存 addendum 仍应 200；实际 ${other.status} ${other.text}`);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#664P16b 反向自证：把限流器摘掉（阈值放到 1000）⇒ 三条端点连打 6 次全 200、绝不 429', async () => {
+  // 把阈值放到一个管理员不可能达到的值 ⇒ 等于摘掉限流器。三条端点连打都回 200、
+  // 一个 429 也没 ⇒ 上一格（P16）那个 429 确实是限流器造的（而不是假池 / 别的闸），且每个端点都挂了它。
+  // 反向自证：把 `http.js` 里某个端点的限流闸摘掉，P16 那条带 `端点 <slug>` 的断言必红并点名该端点。
+  const s = await startAdmin({
+    rateLimit: { maxFailures: 1000, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
+  });
+  try {
+    for (const slug of ['addendum', 'agents-md', 'title-prompt']) {
+      for (let i = 0; i < 6; i += 1) {
+        const r = await readResp(await call(s, {
+          path: `/api/admin/prompts/${slug}`, method: 'PUT', body: { text: `连点-${slug}-${i}` },
+        }));
+        assert.notEqual(r.status, 429,
+          `端点 ${slug}：限流器摘掉后第 ${i + 1} 次不该再 429；实际 ${r.status} ${r.text}`);
+        assert.equal(r.status, 200, `端点 ${slug} 第 ${i + 1} 次应当 200；实际 ${r.status} ${r.text}`);
+      }
+    }
   } finally {
     await s.close();
   }
