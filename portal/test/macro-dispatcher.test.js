@@ -599,7 +599,7 @@ test('#662-1 run-review 分派建快照，快照 worktreePath 传给 runMacroRev
     let snapshotPassed = null;
     const fake = { ok: true, snapshotId: crypto.randomUUID(), worktreePath: WT, contentDigest: 'd' };
     const d = createIntentDispatcher({
-      pool, log: QUIET,
+      pool, log: QUIET, config: { reviewMode: 'snapshot' },
       createSnapshot: async (a) => { snapCalls += 1; snapArg = a; return fake; },
       runMacroReview: async (_p, o) => { snapshotPassed = o.snapshot; return { macroRunId: o.macroRunId, status: 'done', verdict: 'pass' }; },
     });
@@ -621,7 +621,7 @@ test('#662-2 快照失败 ⇒ status=failed / verdict=unclassified / 不回灌 /
     const intent = await claimReviewIntent(pool, scene);
     let runnerCalled = 0;
     const d = createIntentDispatcher({
-      pool, log: QUIET,
+      pool, log: QUIET, config: { reviewMode: 'snapshot' },
       createSnapshot: async () => ({ ok: false, reason: 'disk_low', worktreePath: '/tmp/wt-r2' }),
       reviewRunner: () => { runnerCalled += 1; return '结论：整改\n不该跑到这里'; },
       // runMacroReview 用真实缺省实现（快照失败出口已实现）
@@ -642,10 +642,10 @@ test('#662-3 缺省审查 runner：postMessage 收到 reviewOnly===true + trigge
   await withFreshDb(async (pool) => {
     const scene = await seedReviewScene(pool, ids('R3'));
     const intent = await claimReviewIntent(pool, scene);
-    const WT = '/tmp/wt-662-r3';
+    const WT = `/srv/erix/users/${scene.login}/projects/wt-r3`;
     let pmOpts = null;
     const d = createIntentDispatcher({
-      pool, log: QUIET,
+      pool, log: QUIET, config: { userSpaceRoot: '/srv/erix/users', reviewMode: 'snapshot' },
       createSnapshot: async () => ({ ok: true, snapshotId: crypto.randomUUID(), worktreePath: WT, contentDigest: 'd' }),
       postMessage: async (_p, o) => { pmOpts = o; return { run: { id: crypto.randomUUID() } }; },
       reviewTask: async () => ({ ok: true, text: '结论：通过', termination: { reason: 'finished', error: null }, error: null }),
@@ -664,10 +664,10 @@ test('#662-4 缺省审查 runner：postMessage 的 cwd === snapshot.worktreePath
   await withFreshDb(async (pool) => {
     const scene = await seedReviewScene(pool, ids('R4'));
     const intent = await claimReviewIntent(pool, scene);
-    const WT = '/tmp/wt-662-r4-isolated';
+    const WT = `/srv/erix/users/${scene.login}/projects/wt-r4-isolated`;
     let pmOpts = null;
     const d = createIntentDispatcher({
-      pool, log: QUIET,
+      pool, log: QUIET, config: { userSpaceRoot: '/srv/erix/users', reviewMode: 'snapshot' },
       createSnapshot: async () => ({ ok: true, snapshotId: crypto.randomUUID(), worktreePath: WT, contentDigest: 'd' }),
       postMessage: async (_p, o) => { pmOpts = o; return { run: { id: crypto.randomUUID() } }; },
       reviewTask: async () => ({ ok: true, text: '结论：通过', termination: { reason: 'finished', error: null }, error: null }),
@@ -686,7 +686,7 @@ test('#662-5 桩 runner 返回「结论：整改」⇒ verdict=red + 回灌（re
     const intent = await claimReviewIntent(pool, scene);
     let runnerCalled = 0;
     const d = createIntentDispatcher({
-      pool, log: QUIET,
+      pool, log: QUIET, config: { reviewMode: 'snapshot' },
       createSnapshot: async () => ({ ok: true, snapshotId: crypto.randomUUID(), worktreePath: '/tmp/wt-662-r5', contentDigest: 'd' }),
       reviewRunner: ({ brief }) => { runnerCalled += 1; assert.ok(brief.includes('原任务'), '工作包应含原任务段'); return '结论：整改\n有 3 个未跟踪文件'; },
       // runMacroReview 用真实缺省实现 + 真实回灌 postMessage
@@ -713,4 +713,53 @@ test('#662-A assembleTicket 下行 review_only + agentd 仅 true 置 RUN_REVIEW_
   assert.equal(buildWorkerEnv({ review_only: true }, {}).RUN_REVIEW_ONLY, '1', 'review_only=true ⇒ RUN_REVIEW_ONLY=1');
   assert.ok(!('RUN_REVIEW_ONLY' in buildWorkerEnv({ review_only: false }, {})), 'false ⇒ 不设 RUN_REVIEW_ONLY');
   assert.ok(!('RUN_REVIEW_ONLY' in buildWorkerEnv({}, {})), '缺失 ⇒ 不设 RUN_REVIEW_ONLY');
+});
+
+// —— #676-6（丙=止血）：run-review 默认走 facts-only「只出事实、不下判决」——
+test('#676-6 run-review 默认（reviewMode=disabled）⇒ skipped/review_unavailable、verdict NULL、不建快照、发了通知',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedReviewScene(pool, ids('R6'));
+    const intent = await claimReviewIntent(pool, scene);
+    let snapCalls = 0;
+    let runnerCalls = 0;
+    const d = createIntentDispatcher({
+      pool, log: QUIET,
+      // 不传 config ⇒ reviewMode 缺省 'disabled'（丙）。
+      createSnapshot: async () => { snapCalls += 1; return { ok: true, worktreePath: '/tmp/x' }; },
+      reviewRunner: () => { runnerCalls += 1; return '结论：通过'; },
+    });
+    await d.dispatch([intent]);
+    const row = await reviewRowOf(pool, intent.macroRunId);
+    assert.equal(row.status, 'skipped', `facts-only ⇒ skipped：${JSON.stringify(row)}`);
+    assert.equal(row.verdict, null, `facts-only ⇒ verdict 必为 NULL：${JSON.stringify(row)}`);
+    assert.equal(snapCalls, 0, 'facts-only 绝不建快照');
+    assert.equal(runnerCalls, 0, 'facts-only 绝不起审查 runner');
+    // skipped_reason='review_unavailable' 单独查（reviewRowOf 未带这列）。
+    const sk = await pool.query(`SELECT skipped_reason FROM macro_runs WHERE id=$1`, [intent.macroRunId]);
+    assert.equal(sk.rows[0].skipped_reason, 'review_unavailable');
+    // 发了通知：notifications 表有一条给该用户、挂这条 macroRun。
+    const n = await pool.query(
+      `SELECT title, body FROM notifications WHERE user_id=$1 AND macro_run_id=$2`,
+      [scene.userId, intent.macroRunId],
+    );
+    assert.equal(n.rows.length, 1, `应发且仅发一条「未审查」通知：${JSON.stringify(n.rows)}`);
+    assert.match(n.rows[0].title, /审查/);
+  });
+});
+
+// —— #676-7（本单的存在理由）：降级后**绝不落假绿 done**——
+test('#676-7 facts-only 显式断言 status !== done（不落 done|unclassified 假绿）',
+  { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedReviewScene(pool, ids('R7'));
+    const intent = await claimReviewIntent(pool, scene);
+    const d = createIntentDispatcher({ pool, log: QUIET });
+    await d.dispatch([intent]);
+    const row = await reviewRowOf(pool, intent.macroRunId);
+    assert.notEqual(row.status, 'done', `存在理由：降级后绝不能是 done：${JSON.stringify(row)}`);
+    assert.notEqual(row.verdict, 'unclassified', '更不能是 done|unclassified 那套假绿');
+    assert.equal(row.status, 'skipped');
+    assert.equal(row.verdict, null);
+  });
 });

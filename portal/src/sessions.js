@@ -25,6 +25,8 @@ import { allocSeq } from './seq.js';
 // #322：本文件**不再直接调** `chatCompletion`（手工改名走 `./title-llm.js` 的唯一生成入口）；
 // 下面三个「一次对话请求」的通用件仍在此重新导出，只为既有调用方与文档口径不受影响。
 import { chatCompletionsUrl, extractAssistantText, redactSecret } from './llm-chat.js';
+// issue #676 ①：越界 cwd 校验要 jail 的单一真值表（宿主子目录 / 哪些能当 run cwd）。
+import { JAIL_RUN_CWD_HOST_SUFFIXES } from '../shared/jail-mounts.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -60,6 +62,71 @@ export function validateSessionCwd(value) {
     });
   }
   return `~/projects/${name}`;
+}
+
+/**
+ * issue #676 ①：校验**一条 run 的 cwd 是否落在该用户的 jail 内**（纯函数，与
+ * `validateSessionCwd` 并列；导出以便单测）。这是「响亮失败」的闸门——过去
+ * `postMessage` / `createReviewSession` 任意字符串都收，错 cwd 会「账上 done、实际空转」。
+ *
+ * 接受两类形态：
+ *  1. `~/projects/<name>` 相对形式 —— 走既有 `validateSessionCwd`（会话约定，回归口径不变）。
+ *  2. **绝对路径**，且必须在该用户 jail 之内：`<userSpaceRoot>/<fde>/{home,projects,cache}/…`。
+ *     jail 子目录取自 `JAIL_RUN_CWD_HOST_SUFFIXES`（`platform/git` 不在内 ⇒ 被拒，它是平台挂载点）。
+ *     判前一律 `path.resolve` 规范化，防 `..` 穿越。
+ *
+ * 其余（越界绝对路径、`platform/git`、相对但非 `~/projects/`、`..` 穿出 jail、空）
+ * ⇒ `SessionError('validation_failed', ...)`，`details.field='cwd'`。
+ *
+ * @param {string} cwd
+ * @param {{ userSpaceRoot?: string, fdeName?: string|null }} ctx 绝对路径判定需要两者；
+ *        缺 userSpaceRoot/fdeName（如账户无 fde）时，绝对路径一律拒（无法证明在 jail 内）。
+ * @returns {string} 规范后的 cwd（相对形式原样；绝对形式取 resolve 结果）
+ */
+export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') {
+    throw new SessionError('validation_failed', 'cwd 不能为空', { details: { field: 'cwd' } });
+  }
+  const value = cwd.trim();
+
+  // 形态 1：`~/projects/<name>`——交给既有校验器（其内部已拒 . / .. / 穿越）。
+  if (value.startsWith('~/')) {
+    return validateSessionCwd(value);
+  }
+
+  // 非绝对路径（如 `projects/x`、相对 `foo`）既不是会话约定也不可信 ⇒ 拒。
+  if (!path.isAbsolute(value)) {
+    throw new SessionError('validation_failed', 'cwd 必须是 ~/projects/<name> 或 jail 内的绝对路径', {
+      details: { field: 'cwd' },
+    });
+  }
+
+  // 形态 2：绝对路径 ⇒ 规范化后必须落在 `<userSpaceRoot>/<fde>/{home,projects,cache}` 之下。
+  const root = typeof userSpaceRoot === 'string' && userSpaceRoot.trim() !== '' ? userSpaceRoot : null;
+  const fde = typeof fdeName === 'string' && fdeName.trim() !== '' ? fdeName.trim() : null;
+  if (!root || !fde) {
+    throw new SessionError('validation_failed', '绝对 cwd 需要 userSpaceRoot 与 fde_name 才能判定 jail 归属', {
+      details: { field: 'cwd' },
+    });
+  }
+  const jailRoot = path.resolve(root, fde); // `<userSpaceRoot>/<fde>`（resolve 已吃掉 `..`）
+  const target = path.resolve(value);
+  const rel = path.relative(jailRoot, target);
+  // 逃出 jail（rel 以 `..` 开头或为空/绝对）⇒ 拒。
+  if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    throw new SessionError('validation_failed', `cwd 越出用户 jail（${jailRoot}）：${value}`, {
+      details: { field: 'cwd' },
+    });
+  }
+  // 第一段子目录必须是允许当 run cwd 的 jail 子目录（home / projects / cache；platform/git 被排除）。
+  const firstSeg = rel.split(path.sep)[0];
+  if (!JAIL_RUN_CWD_HOST_SUFFIXES.includes(firstSeg)) {
+    const allowed = JAIL_RUN_CWD_HOST_SUFFIXES.join(', ');
+    throw new SessionError('validation_failed', `cwd 所在 jail 子目录不可作 run 目录（允许：${allowed}）：${value}`, {
+      details: { field: 'cwd', allowed: JAIL_RUN_CWD_HOST_SUFFIXES },
+    });
+  }
+  return target;
 }
 /** 单条 user 消息内容上限（portal.md §4.3）。 */
 export const MAX_MESSAGE_CONTENT_LENGTH = 100_000;
@@ -663,6 +730,9 @@ export async function postMessage(pool, {
   //  ③ `maxRounds`：本次 run 的轮数上限。**选定的路线 = 写进 run 行**，理由写在下面写入处。
   // 两者对用户面发消息（routes 层）都不传 ⇒ 行为逐字不变。
   cwd = null, maxRounds = null,
+  //  issue #676 ①：`config` 只为绝对路径 cwd 的 jail 校验提供 `userSpaceRoot`（相对形式无需）。
+  //    缺省 ⇒ `{}`：相对 `~/projects/<name>` 照旧通过；绝对路径会因缺 userSpaceRoot 而被拒（响亮失败）。
+  config = {},
   //  ④ issue #662：`reviewOnly` = 本次 run 是「只读审查 run」的宿主声明（专为宏审查 run 用）。
   //    与 `maxRounds` 同路（写进 `runs.run_state` 的 **`host_review_only`** jsonb 键，**不加列**、
   //    不动迁移），下行经 `internal.assembleTicket` 的 `review_only` → `runner/agentd.js` 的
@@ -696,6 +766,15 @@ export async function postMessage(pool, {
     const fde = await client.query(`SELECT fde_name FROM users WHERE id = $1`, [userId]);
     if (fde.rows[0]?.fde_name) {
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fde.rows[0].fde_name}`]);
+    }
+
+    // issue #676 ①：越界 cwd **响亮失败**——在写任何行（消息 / run / run_queue）之前先验。
+    // 过去 `postMessage` 任意字符串都收 → 错 cwd（如快照建在 portal 本地盘 `/root/.erix/...`）
+    // 会「账上 done、实际空转」。校验器（`validateRunCwd`）拒绝 ⇒ SessionError → 本事务 ROLLBACK，
+    // 会话 cwd 不刷、run 不入队（调用方看到 validation_failed，而不是假绿）。
+    const nextCwd = typeof cwd === 'string' && cwd.trim() !== '' ? cwd.trim() : null;
+    if (nextCwd !== null && nextCwd !== s.cwd) {
+      validateRunCwd(nextCwd, { userSpaceRoot: config?.userSpaceRoot, fdeName: fde.rows[0]?.fde_name ?? null });
     }
 
     // issue #37 评审（major）：必须同时排除 revoked_at 非空的容器——deprovision 前置事务先吊销 token
@@ -800,7 +879,7 @@ export async function postMessage(pool, {
     );
     // issue #627 ②：会话级 cwd 刷新（只对传了 cwd 的调用方生效）。放在同事务 ⇒ 与
     // 「本 run 入队」原子：不会出现「run 已排但 cwd 仍旧」的一半状态。
-    const nextCwd = typeof cwd === 'string' && cwd.trim() !== '' ? cwd.trim() : null;
+    // #676 ①：`nextCwd` 已在事务开头经 `validateRunCwd` 校验（越界早在入队前就抛），此处只做刷新。
     if (nextCwd !== null && nextCwd !== s.cwd) {
       await client.query(
         `UPDATE chat_sessions SET cwd = $2, updated_at = now() WHERE id = $1`,
