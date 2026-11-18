@@ -19,17 +19,14 @@
 //   * `run-notify`/`run-silence-alert` 的执行器 `deliverIntent` **不碰账**（只写 notifications）⇒
 //     由 dispatcher **自己** finish：投递成功⇒done，抛异常⇒failed。
 import os from 'node:os';
-import path from 'node:path';
 import { finishMacroRun, MacroError } from './macros.js';
 import { executeScheduledIntent } from './macro-scheduled.js';
 import { runMacroReview } from './macro-review.js';
 import { deliverIntent } from './notifications.js';
 import { fetchRunAssistantText } from './session-text.js';
-// issue #662：审查 run 的真实实现需要——起只读审查会话（postMessage）+ 建快照（createSnapshot）。
+// issue #662：审查 run 的真实实现需要——起只读审查会话（postMessage，reviewOnly）。
+// #690：不建快照——审查 run 的 cwd = 原会话的活目录（`~/projects/<name>`，会话约定形式）。
 import { postMessage as postMessageSession, validateRunCwd } from './sessions.js';
-// #676：jail 宿主子目录的单一真值表（`resolveOriginalRepoDir` 的 projects 段从它取）。
-import { jailHostDir } from '../shared/jail-mounts.js';
-import { createSnapshot as createSnapshotDefault } from './macro-snapshot.js';
 
 /** 超时回收阈值（要求④）：`pending` 且 `started_at` 早于 now-此值 ⇒ 判为「派发途中进程崩了」，落 failed。 */
 export const DISPATCH_TIMEOUT_MS = 10 * 60_000;
@@ -201,36 +198,26 @@ function normalizeReviewMaxRounds(v) {
 }
 
 /**
- * 取「原 run 的项目目录」（D）：`runs.session_id → chat_sessions.cwd`（**一次 JOIN**）。
- * cwd 存的是容器相对形式 `~/projects/<name>`；portal 对用户空间是 RW 挂载，真实路径
- * = `userSpaceRoot/<fde_name>/projects/<name>`（口径同 `macro-scheduled` 的 reportsRoot）。
- * 拿不到（无 run / 无会话 / 无 cwd）⇒ null；非 `~/projects/<name>` 形态（如绝对路径）⇒ 原样交出
- *（由快照自己因非 git 仓而失败并带回 reason）。
+ * 取「原 run 会话的活目录 cwd」（#690：不建快照，审查直接读这个活目录）。
+ * `runs.session_id → chat_sessions.cwd`（**一次 JOIN**），交出 DB 里存的**会话约定形式**
+ * `~/projects/<name>`（`validateRunCwd` 第一支认它）——**不是**宿主绝对路径。
+ * 拿不到（无 run / 无会话 / 无 cwd）⇒ null。
  * @returns {Promise<string|null>}
  */
-export async function resolveOriginalRepoDir(pool, { originalRunId, config } = {}) {
+export async function resolveOriginalSessionCwd(pool, { originalRunId } = {}) {
   if (!originalRunId) return null;
   const res = await pool.query(
-    `SELECT s.cwd, u.fde_name
-       FROM runs r JOIN chat_sessions s ON s.id = r.session_id
-       JOIN users u ON u.id = s.user_id
-      WHERE r.id = $1`,
+    `SELECT s.cwd FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE r.id = $1`,
     [originalRunId],
   );
-  const row = res.rows?.[0];
-  const cwd = typeof row?.cwd === 'string' ? row.cwd : '';
-  if (!cwd) return null;
-  const m = /^~\/projects\/([^/]+)\/?$/.exec(cwd);
-  if (!m) return cwd;
-  const userSpaceRoot = config?.userSpaceRoot ?? '/srv/erix/users';
-  // #676：projects 宿主目录取自 jail 单一真值表（与 provisioner / 校验器同一源，不三拄）。
-  return path.join(jailHostDir(userSpaceRoot, row.fde_name ?? '', 'projects'), m[1]);
+  const cwd = res.rows?.[0]?.cwd;
+  return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : null;
 }
 
 /**
- * 建一条**独立审查会话**（B：不复用宏会话，否则会把宏会话的 cwd 改掉）。cwd = 快照 worktree；
- * origin = `review:<macroRunId>`（可追溯）；title = `审查 · <原 run 短 id>`。会话用完不删
- *（历史留档），worktree 由 W4a 孤儿清扫回收（worktree_path 已落 macro_runs）。
+ * 建一条**独立审查会话**（B：不复用宏会话，否则会把宏会话的 cwd 改掉）。cwd = 原会话的活目录
+ *（#690：不建快照）；origin = `review:<macroRunId>`（可追溯）；title = `审查 · <原 run 短 id>`。
+ * 会话用完不删（历史留档）。
  */
 export async function createReviewSession(pool, { userId, cwd, originalRunId, macroRunId, config = {} } = {}) {
   const shortId = String(originalRunId ?? macroRunId ?? '').slice(0, 8);
@@ -252,7 +239,7 @@ export async function createReviewSession(pool, { userId, cwd, originalRunId, ma
 /**
  * `defaultReviewRunner` 的真实实现（C）。就写在**本文件**（复用模块私有的 `pollRunTask`，
  * 不再多一道导出）：
- *   1. 建一条独立只读审查会话（cwd = 快照 worktree）；
+ *   1. 建一条独立只读审查会话（cwd = 原会话的活目录，#690）；
  *   2. `postMessage({ content: brief, triggerKind:'synthetic', reviewOnly:true, cwd, maxRounds })`；
  *   3. 轮询到终态（**复用同文件的 `pollRunTask`**，走读侧投影取正文）；
  *   4. 返回正文；终态失败 ⇒ 抛错（`runMacroReview` 会归到 failed + unclassified，
@@ -260,7 +247,7 @@ export async function createReviewSession(pool, { userId, cwd, originalRunId, ma
  * 所有外部件（postMessage / reviewTask / 轮询 opts）都可注入——测试不真调模型。
  */
 export async function runReviewTaskDefault({
-  pool, brief, macroRunId, originalRunId = null, snapshot,
+  pool, brief, macroRunId, originalRunId = null, cwd = null,
   postMessage = postMessageSession, reviewTask = (ctx, opts) => pollRunTask(ctx, opts),
   pollOpts, log = console, maxRounds = DEFAULT_REVIEW_MAX_ROUNDS, config = {},
 } = {}) {
@@ -269,9 +256,8 @@ export async function runReviewTaskDefault({
     [macroRunId],
   );
   const userId = acct.rows?.[0]?.user_id ?? null;
-  const cwd = snapshot?.worktreePath ?? null;
   if (!userId) throw new Error('审查会话缺 userId（无法起只读审查 run）');
-  if (!cwd) throw new Error('审查快照缺 worktreePath（cwd 无法指向隔离现场）');
+  if (!cwd) throw new Error('审查缺活目录 cwd（无法起只读审查 run）');
 
   const sessionId = await createReviewSession(pool, { userId, cwd, originalRunId, macroRunId, config });
   const posted = await postMessage(pool, {
@@ -303,8 +289,7 @@ export function createIntentDispatcher({
   sessionsHome = os.homedir(),
   runTask,
   reviewRunner,
-  // issue #662 D/B/C：快照与只读审查 run 的三个可注入件（缺省 = 生产实现）。
-  createSnapshot = createSnapshotDefault,
+  // issue #662 B/C：只读审查 run 的两个可注入件（缺省 = 生产实现）。
   postMessage = postMessageSession,
   reviewTask = (ctx, opts) => pollRunTask(ctx, opts),
   reviewPollOpts,
@@ -319,7 +304,7 @@ export function createIntentDispatcher({
   // 立刻返回空文本 + done，把失败伪装成完成、产物为空）。超时不重试（`06` §8）。
   const defaultRunTask = async (ctx) => pollRunTask(ctx);
   // issue #662 C：缺省 reviewRunner 不再是「只会抛错的空壳」——在 run-review 分支里按「本次
-  // 快照 + 轮数」现建 `runReviewTaskDefault`（起只读审查会话 + 复用 pollRunTask 取正文）。
+  // 活目录 + 轮数」现建 `runReviewTaskDefault`（起只读审查会话 + 复用 pollRunTask 取正文）。
   // 注入的 `reviewRunner` 优先（测试用桩）。
 
   /** 分派单条意图；抛异常由 `dispatch` 接住并收尾 failed。 */
@@ -346,14 +331,10 @@ export function createIntentDispatcher({
         });
         return;
       case 'run-review': {
-        // D：只在 run-review 分支建快照（run-notify 不建，快照有成本 ≤60s/≤500MB）。
-        // 原 run 的项目目录 = runs.session_id → chat_sessions.cwd（一次查询）。
+        // #690：不建快照——审查 run 直接读**活目录**（原会话的 `~/projects/<name>`，会话约定形式）。
         const originalRunId = extractReviewRunId(intent);
-        // issue #676 ②（丙 = 止血）：`reviewMode='disabled'`（缺省）⇒ **只出事实、不下判决**：
-        //   不调 reviewRunner、不建快照、不解析判决；runMacroReview 落 skipped/review_unavailable、
-        //   verdict NULL，并给用户发一条「审查暂未启用」通知。甲/乙（快照 / 活目录指纹）见 #673，
-        //   定下来后把 reviewMode 改成 `'snapshot'` / `'live-fingerprint'` 走下面的真审查。
-        const reviewMode = config?.reviewMode ?? 'disabled';
+        // `reviewMode='disabled'` 是运维一键关（丙：只出事实、不下判决）；默认 `'live'` = 读活目录。
+        const reviewMode = config?.reviewMode ?? 'live';
         if (reviewMode === 'disabled') {
           await execReview(pool, {
             macroRunId,
@@ -364,31 +345,19 @@ export function createIntentDispatcher({
           });
           return;
         }
-        // —— 真审查路径（甲 = 快照；乙 = 活目录指纹待接）——
-        const repoDir = await resolveOriginalRepoDir(pool, { originalRunId, config });
-        const snapshot = repoDir
-          ? await createSnapshot({ repoDir })
-          : { ok: false, reason: 'worktree_add_failed' };
-        // worktree_path / snapshot_id 落 macro_runs ⇒ W4a 孤儿清扫据 worktree_path 关联到账，
-        //   只在「终态>1h / running>1h」才回收（不写的话清扫会把在途审查的 worktree 也当孤儿删）。
-        if (snapshot?.ok) {
-          await pool.query(
-            `UPDATE macro_runs SET worktree_path = $2, snapshot_id = $3 WHERE id = $1`,
-            [macroRunId, snapshot.worktreePath, snapshot.snapshotId ?? null],
-          );
-        }
-        // 快照失败（ok:false）**原样传下去**，让 runMacroReview 走它已实现的失败出口
-        //（status=failed / verdict=unclassified / 不回灌）——**这里不自己吞**。
+        // —— 真审查路径（读活目录：#690 不建快照、不再写 worktree_path/snapshot_id）——
+        // cwd = 原会话的 `~/projects/<name>`（`validateRunCwd` 认这个形式）。
+        const cwd = await resolveOriginalSessionCwd(pool, { originalRunId });
         const runner = reviewRunner
           ?? ((ctx) => runReviewTaskDefault({
-            pool, brief: ctx.brief, macroRunId: ctx.macroRunId, originalRunId, snapshot,
+            pool, brief: ctx.brief, macroRunId: ctx.macroRunId, originalRunId, cwd,
             maxRounds: normalizeReviewMaxRounds(intent?.params?.max_rounds),
             postMessage, reviewTask, pollOpts: reviewPollOpts, log, config,
           }));
         await execReview(pool, {
           macroRunId,
           originalRunId,
-          snapshot,
+          cwd,
           reviewRunner: runner,
           now: nowVal(),
         });

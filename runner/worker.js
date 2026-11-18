@@ -36,8 +36,8 @@ import { resolveRunModel, resolveModelMetadata } from './lib/llm-models.js';
 import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
 import { createJail, createStationFileTools, STATION_MASKED_PATHS, platformReadExceptions } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
-// issue #537（W4a 审查快照与隔离）：审查 run 只读工具装配（纯函数、只 import node: 内建，
-// 故 portal/test/macro-snapshot.test.js 能跨目录 import 同一份口径做反向自证二）。
+// issue #537 / #662（审查 run 只读隔离）：审查 run 只读工具装配（纯函数、只 import node: 内建，
+// 故能被 portal 侧测试跨目录 import 同一份口径）。#690：只读面与快照是两件事，快照删了、这里留。
 import { isReviewOnly, filterReviewExecutors, filterReviewSchemas } from './lib/review-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';

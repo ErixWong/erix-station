@@ -4,12 +4,12 @@
  * 分工与红线：
  *  - W2 已 `claimMacroRun`（本模块拿到**已占位**的 `macroRunId`，只 `finishMacroRun`，不 claim；
  *    幂等 `(assignment, anchor, criterion, bucket)` 是 claim 的键，本模块不再造一套）。
- *  - W4a（`macro-snapshot.js`）负责快照构建；它的 7+1 个失败 reason 在这里是**失败出口**，
- *    不是「判成没过」。
+ *  - #690：审查 run 直接读**活目录**（不建快照）——`runMacroReview` 不再接收快照产物，
+ *    也没有「快照失败」这一格失败出口。
  *  - `finishMacroRun` 有终态闸（terminal → 非 terminal 抛 409）：本模块每个 macro run
  *    只收口一次，且从不把终态行往回推。
  *
- * 失败出口口径（④）：超时 / LLM 失败 / 快照失败 ⇒ `failed` + `unclassified`（没判成）；
+ * 失败出口口径（④）：超时 / LLM 失败 ⇒ `failed` + `unclassified`（没判成）；
  * 首行非法 ⇒ `done` + `unclassified` + `verdict_raw`（判了但判不了）；
  * 回灌 409 ⇒ `skipped` + `deferred` + **保留原判决**（不重试）。
  */
@@ -19,7 +19,6 @@ import { promisify } from 'node:util';
 
 import { finishMacroRun, isAssignmentExpired, MACRO_VERDICTS, MacroError } from './macros.js';
 import { postMessage, SessionError } from './sessions.js';
-import { SNAPSHOT_FAILURE_REASONS } from './macro-snapshot.js';
 import { fetchRunAssistantText, fetchUserTextTurns } from './session-text.js';
 // issue #676 ②：facts-only（审查暂不可用）模式下给用户发一条「本次未审查」通知。
 import { createNotification } from './notifications.js';
@@ -163,11 +162,11 @@ function section(title, body) {
  * ① 事实采集 → 工作包（拼进审查 run 的 task 文本；只跑在平台侧，**不跑测试**）。
  *
  * ⚠ 只读审查不许声称「测试通过」——验证命令的事实固定文案：
- * 「原 run 在指纹 X 上跑过这些命令，退出码 Y；本次审查未独立复验。」
+ * 「原 run 跑过这些命令，退出码 Y；本次审查未独立复验。」
  * 工作包总长上限 {@link MAX_BRIEF_BYTES}，超出截断并在尾部标注。
  */
 export async function buildReviewBrief(pool, {
-  reviewSessionId, originalRunId = null, gitFacts = null, snapshot = null,
+  reviewSessionId, originalRunId = null, gitFacts = null, cwd = null,
   ignoredFiles = null, transcriptRows = null, maxBytes = MAX_BRIEF_BYTES,
 } = {}) {
   const parts = [];
@@ -206,11 +205,10 @@ export async function buildReviewBrief(pool, {
 
   // —— 验证命令与退出码：只报事实，不声称复验 ——
   const verifications = extractVerificationCommands(transcriptRows);
-  const fingerprint = snapshot?.contentFingerprint ?? null;
   const verificationLines = verifications.length > 0
     ? verifications.map((v) => `- ${v.command} ⇒ 退出码 ${v.exitCode ?? '（未知）'}`)
     : ['（transcript 里没找到验证命令）'];
-  verificationLines.push(`- 本次审查只读：原 run 在指纹 ${fingerprint ?? '（无指纹）'} 上跑过这些命令，退出码见上；本次审查未独立复验。`);
+  verificationLines.push('- 本次审查只读：原 run 跑过这些命令，退出码见上；本次审查未独立复验。');
   parts.push(section('验证命令与退出码（未独立复验）', verificationLines.join('\n')));
 
   // —— 终止/用量事实 ——
@@ -245,16 +243,8 @@ export async function buildReviewBrief(pool, {
   parts.push(section('被排除的 ignored 文件',
     Array.isArray(ignored) ? (ignored.length > 0 ? ignored.join('\n') : '（无）') : null));
 
-  // —— 快照身份（W4a 产物）——
-  if (snapshot && snapshot.ok !== false) {
-    parts.push(section('快照身份', [
-      `snapshot_id: ${snapshot.snapshotId ?? '（无）'}`,
-      `content_fingerprint: ${snapshot.contentFingerprint ?? '（无）'}`,
-      `worktree_path: ${snapshot.worktreePath ?? '（无）'}`,
-    ].join('\n')));
-  } else {
-    parts.push(section('快照身份', null));
-  }
+  // —— 审查现场（#690：活目录，无冻结副本；审查开始时的状态见上面的 git 段）——
+  parts.push(section('审查现场（活目录）', cwd ? `cwd：${cwd}\n模式：live（无冻结副本）` : null));
 
   const joined = parts.join('\n\n');
   const { text, truncated } = clipUtf8(joined, maxBytes);
@@ -267,7 +257,6 @@ export async function buildReviewBrief(pool, {
 function classifyReviewError(err) {
   const kind = err?.kind ?? err?.errorClass ?? null;
   if (kind === 'timeout' || err?.name === 'TimeoutError' || err?.code === 'ETIMEDOUT') return 'timeout';
-  if (SNAPSHOT_FAILURE_REASONS.includes(kind)) return `snapshot_failed:${kind}`;
   return kind ?? 'llm_failed';
 }
 
@@ -294,8 +283,8 @@ function withTimeout(promiseFactory, timeoutMs) {
  * @param {string} [opts.userId]              缺省取订阅的 user_id
  * @param {string} [opts.reviewSessionId]     被审查的原会话；缺省取订阅的 session_id
  * @param {string} [opts.originalRunId]       被审查的原 run（终止/用量/终稿事实源）
- * @param {object} [opts.snapshot]            W4a 产物 `{ok, snapshotId, contentFingerprint, worktreePath}`；
- *                                            `ok:false` 必带 `reason`（SNAPSHOT_FAILURE_REASONS 之一）⇒ 失败出口
+ * @param {string} [opts.cwd]                 审查现场 = 原会话的活目录（#690：不建快照，`~/projects/<name>`）。
+ *                                            仅进工作包「审查现场」段，不再有快照失败出口。
  * @param {object} [opts.gitFacts]            `collectGitFacts` 产物；缺省 = 工作包里 git 段为（无）
  * @param {(ctx: {brief: string, macroRunId: string}) => Promise<string>|string} opts.reviewRunner
  *                                            审查 run 文本面（真机是 runner；测试是桩，不真调模型）
@@ -303,7 +292,7 @@ function withTimeout(promiseFactory, timeoutMs) {
  * @param {boolean} [opts.remediate=true]     是否允许回灌（`red` 才回灌）
  * @param {(msg: object) => any} [opts.notify]  转人工/通知的 hook（默认 no-op）
  * @param {Date}   [opts.now]                 到期判定用（⑤：只比瞬时值）
- * @param {boolean} [opts.reviewUnavailable]  #676 ②（丙=止血）：审查暂不可用（快照方案待定）。
+ * @param {boolean} [opts.reviewUnavailable]  #676 ②（丙=止血）：审查被运维关闭（`reviewMode='disabled'`）。
  *                                            true ⇒ 不调 runner / 不解析判决，直接落
  *                                            `skipped` + `skipped_reason='review_unavailable'` + `verdict NULL`，
  *                                            并发一条「完成审查暂未启用」通知。
@@ -311,7 +300,7 @@ function withTimeout(promiseFactory, timeoutMs) {
  */
 export async function runMacroReview(pool, {
   macroRunId, userId = null, reviewSessionId = null, originalRunId = null,
-  snapshot = null, gitFacts = null, reviewRunner, reviewTimeoutMs = 10 * 60 * 1000,
+  cwd = null, gitFacts = null, reviewRunner, reviewTimeoutMs = 10 * 60 * 1000,
   remediate = true, notify = async () => {}, postMessageImpl = postMessage, now = new Date(),
   reviewUnavailable = false,
 } = {}) {
@@ -352,7 +341,7 @@ export async function runMacroReview(pool, {
         await createNotification(pool, {
           userId: safeUserId, macroRunId, severity: 'info',
           title: '完成审查暂未启用',
-          body: '完成审查暂未启用（快照方案待定，见 #673），本次未审查。',
+          body: '完成审查已由运维关闭（reviewMode=disabled），本次未审查。',
           createdAt: now,
         });
       } catch (err) {
@@ -362,18 +351,11 @@ export async function runMacroReview(pool, {
     return res;
   }
 
-  // —— 快照失败（W4a 的 reason）：失败出口，不是 red ——
-  if (snapshot && snapshot.ok === false) {
-    const reason = SNAPSHOT_FAILURE_REASONS.includes(snapshot.reason)
-      ? snapshot.reason : `snapshot_failed:${snapshot.reason ?? 'unknown'}`;
-    return done('failed', { verdict: 'unclassified', reason: `快照构建失败：${reason}` });
-  }
-
   // —— ① 工作包 ——
   let brief;
   try {
     brief = await buildReviewBrief(pool, {
-      reviewSessionId: sessionId, originalRunId, gitFacts, snapshot,
+      reviewSessionId: sessionId, originalRunId, gitFacts, cwd,
     });
   } catch (err) {
     return done('failed', { verdict: 'unclassified', reason: `工作包构建失败：${err?.message ?? String(err)}` });
