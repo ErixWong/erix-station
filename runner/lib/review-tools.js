@@ -6,7 +6,7 @@
 //   * 不给 `note_*`：审查是只读观察，笔记写的是宿主会话目录，不该污染。
 //
 // ⚠ 这个模块**只 import node: 内建**，因此既能被 `runner/worker.js` import（同包），
-//   也能被 `portal/test/macro-snapshot.test.js` import（跨目录的纯函数，不拖 erix-agent）。
+//   也能被 portal 侧测试跨目录 import（跨目录的纯函数，不拖 erix-agent）。
 //   worker.js 的两处装配点（registry 与 baseToolSchemas）**共用这里的同一份口径**——
 //   「只改一处等于没改」，所以口径收敛到一个常量 + 两个过滤函数，两处都调它。
 import process from 'node:process';

@@ -96,30 +96,29 @@
 
 ### 4.1 还要补三组事实（2026-11-15 审计后补）
 
-**① 快照身份**（回答「审的是哪一份成果」）：
+**① 审查现场**（回答「审的是哪一份成果」）：审查读的是原会话的**活目录**（见 §5.1），
+没有「冻结副本」概念，所以只描述「审查开始时那一刻的活目录」。
 
 | 事实 | 为什么 |
 |---|---|
-| 原目录的 `HEAD` sha + 冻结 worktree 的 `HEAD` sha | 两者必须相同，不同就说明基线错了 |
-| 已跟踪/未跟踪变更清单 + 工作树内容摘要 hash | `git diff --stat` 只是统计，**不是可复核的变更清单** |
-| 冻结时刻 | 判断"这次审查对应哪一刻" |
+| 审查开始时的 `HEAD`（sha / 分支 / detached） | 说清「审的是哪一刻的仓库状态」 |
+| `git status --porcelain -uall` + `git diff --stat` 摘要 | 工作树当时的改动面；`--stat` 只是统计，**不是可复核的变更清单** |
 
-**② 验证与快照的绑定**（回答「那些测试结果还算不算数」）：
+**② 验证与审查的绑定**（回答「那些测试结果还算不算数」）：
 
 | 事实 | 为什么 |
 |---|---|
 | 命令原文 + cwd + 退出码 + 结束时间 | 只有退出码不知道跑的是什么 |
 | 具名失败用例（若有） | 「失败 3 个」不如「`not ok 7 - 空态四种`」 |
-| **验证时**的文件树/HEAD 指纹 | 否则旧测试可能发生在最后一次编辑**之前**，不能证明当前 worktree |
 
-⇒ **只读审查不许声称「测试通过」**。它能说的是：「原 run 在指纹 X 上跑过这些命令，退出码 Y；
+⇒ **只读审查不许声称「测试通过」**。它能说的是：「原 run 跑过这些命令，退出码 Y；
 本次审查未独立复验。」这是两件事，文档必须分开写。
 
-**③ 过滤边界**（回答「这份快照是不是完整的」）：
+**③ 过滤边界**（回答「审查看到的东西是不是完整的」）：
 
 | 事实 | 为什么 |
 |---|---|
-| 排除了哪些 ignored 文件（清单） | 排除掉构建配置会让 agent 把不完整快照当完整 |
+| 排除了哪些 ignored 文件（清单） | 排除掉构建配置会让 agent 把不完整目录当完整 |
 | 密钥/环境文件如何脱敏 | `.env` 之类既不能给也不能静默丢弃，要记「已脱敏」 |
 
 ⚠ 审计原话：「只读审查无需声称测试通过」—— 这一条比原来那句「验证过没有」准确，已采纳。
@@ -128,94 +127,57 @@
 
 | 项 | 做法 |
 |---|---|
-| 会话 | **新会话**（`trigger_kind='synthetic'`），同容器、同 cwd |
-| 审查对象 | **worktree**：`git worktree add --detach <path> HEAD` + 把脏文件带进去 |
-| 只读 | jail root = worktree、`writable: []`、**不给 `shell`**、**不给 note** |
+| 会话 | **新会话**（`trigger_kind='synthetic'`），同容器、**同 cwd（原会话的 `~/projects/<项目名>`）** |
+| 审查对象 | **活目录**（原会话的工作目录，不建快照）——理由见 §5.1 |
+| 只读 | jail root = 活目录、`writable: []`、**不给 `shell`**、**不给 note** |
 | 工具面 | 只有 `readFile` / `searchText` / `tree` |
 | 输出 | 见 §6 |
-| 清理 | `git worktree remove --force` |
+| 清理 | 无（不建副本，审查结束没有要回收的东西） |
 
-### 5.1 为什么必须 worktree
+### 5.1 为什么不做快照（直接读活目录）
 
-`capacity` 实际是 **2**（`runner/agentd.js:56` `ERIX_AGENTD_CAPACITY || 2`，`:418` 显式发送；
-`:15-17` 注释写明「同项目并行放行…同 cwd 两个 run 各自隔离…工作文件碰撞由用户 git 自治」）**【实测】**。
+M9 的审查 run 把 cwd 直接指向**原会话的工作目录**（DB 里存的 `~/projects/<项目名>`，
+每个普通 run 都在用这个路径），**不再**为审查单独 `git worktree add` 建冻结副本。
 
-⇒ 同一 cwd 可能有两个 run 在写。**不冻结，「通过」指哪一刻的工作树就说不清。**
+判据（口径，不是某次事故的过程）：
 
-`git worktree add` 共享 object database ⇒ **省掉的是 `.git` 历史的复制**。
-⚠ 但**仍要 checkout 整棵 tracked 工作树**（成本 ∝ checkout 的文件数/字节数），
-再加上补丁与未跟踪文件的搬运 —— 所以「成本 ∝ 脏文件数」这个说法**过强**，已改。
+1. **前提不成立**：「必须 worktree」的唯一硬前提是「同一 cwd 同时有两个 run 在写」。
+   但真实工作流是「开一棵 worktree → 派一个 agent 干 → 干完再来审计」，这期间没人碰同一目录。
+   前提不成立，就没有「通过指哪一刻的工作树说不清」这个问题。
+2. **即便成立也不值这个价**：万一真出现两个 agent 同目录，后果只是「审查读到稍微新一点的
+   状态」——它仍在判断「这活干得好不好」，看到更新的代码不算错判。冻结只换来「稍旧一点的一致视图」，
+   换不来判决的正确性。
+3. **路径问题整个消失**：活目录走的是会话约定 `~/projects/<项目名>`（`validateRunCwd` 认它），
+   不引入「portal 建在别处、runner 看不见、跨容器路径翻译、孤儿清扫」这一整套零件。
+   快照要解决的一致性问题，代价是这些零件；读活目录根本不需要它们。
+4. **搬运是重资产、收益薄**：整树拷贝/worktree 的成本随项目规模与脏文件数增长，
+   还要四道门闸（超时/字节/文件数/磁盘），每多一道多一个失败原因；而这些只买到「稍旧的视图」。
 
-**它只 checkout 已提交内容，看不到未提交改动** —— 而那正是最常见的审查对象，所以必须补：
-
-```bash
-git -C <原目录> worktree add --detach <wt> HEAD
-git -C <原目录> diff HEAD --binary > /tmp/<id>.patch
-git -C <wt> apply /tmp/<id>.patch
-git -C <原目录> ls-files --others --exclude-standard -z \
-  | rsync -a --from0 --files-from=- <原目录>/ <wt>/
-```
+⇒ **口径**：审查读**活目录**；一致性交给「审查开始时的 HEAD + git status 摘要」（§4.1）去描述，
+而不是靠一份冻结副本来保证。运维若要关掉审查，用 `reviewMode='disabled'`（不再写副本相关列）。
 
 ### 5.2 为什么只读必须「不给 shell」
 
 `shell` 是 `bash -c <command>`，无命令白名单（`runner/lib/shell-tools.js:84-98,192`）**【实测】**。
-`cwd` 只是起点，`cd ~/projects/foo` 就逃出 worktree ⇒ jail 管不到它。
+`cwd` 只是起点，`cd ~/projects/foo` 就逃出审查目录 ⇒ jail 管不到它。
 
 ⚠ 两道门都要关，且**装配点有两处**：`runner/worker.js:613-615`（registry）与 `:643`（`baseToolSchemas`）
 **【实测】**。只改一处等于没改。
 
-### 5.3 worktree 的建/清生命周期（任何一步失败都不许开始审查）
+### 5.3 审查现场的生命周期（读活目录 ⇒ 没有建/清这一环）
 
-```
-建：worktree add → diff HEAD --binary → apply → rsync 未跟踪 → 【一致性校验】→ 启动审查
-清：审查结束 → worktree remove --force → 删 patch → 记账
-```
+读活目录后**没有**「建快照 / 搬运 / 一致性校验 / 清 worktree / 孤儿清扫」这条流水线——
+审查 run 起在活目录上、结束就结束，平台侧不产生需要回收的副本。于是：
 
-| 环节 | 失败时 |
-|---|---|
-| `worktree add` 失败 | 记 `state=failed` + `reason=worktree_add_failed`，**不启动审查**，通知用户 |
-| `git apply` 非零退出 | 丢弃半成品、`remove --force`、记 `patch_apply_failed`、不启动审查 |
-| `rsync` 失败 | 同上，记 `untracked_copy_failed` |
-| **一致性校验不过** | 见下 |
+- **没有搬运**：无 `worktree add` / `diff --binary` / `apply` / `rsync` ⇒ 也没有它们各自的失败原因。
+- **没有一致性校验**：不比对「搬运前后指纹」；审查读到的即审查开始时的活目录（前提见 §5.1 判据 1）。
+- **没有孤儿清扫**：`macro_runs.worktree_path` / `snapshot_id` 两列保留（历史数据），但**不再写入**、
+  也没有启动扫描去回收它们。
+- **失败出口收敛**：只剩「审查 run 超时 / LLM 失败 / 工作包构建失败 / 首行非法 / 回灸 409」（§5.4），
+  不再有快照那批 `worktree_add_failed` / `patch_apply_failed` / `disk_low` 等。
 
-**一致性校验**（补上 copilot 指出的原子性缺口）：
-
-⚠ **只 hash `git status` 文本不够** —— 同一路径内容变了、status 文本可以完全不变
-（比如一个已修改文件的第二/第三次编辑）。所以取**内容级**指纹：
-
-```
-HEAD sha
-+ git status --porcelain -uall（含路径与状态码）
-+ 每个变更文件的 (path, size, mtime, sha256) 清单
-+ 未跟踪文件同样取 sha256
-→ 整体 sha256 作为 snapshot_id
-```
-
-搬运前后各取一次，不一致 ⇒ **重试一次；仍不一致 ⇒ 记 `snapshot_unstable` 并放弃本次审查**
-（不许拿拼凑树去审）。`snapshot_id` 落 `macro_runs`，判决与它绑定。
-
-**孤儿清理**：worktree 路径登记进 `macro_runs.worktree_path`。portal 启动时扫一遍
-`git worktree list`，命中任一条件即 `git worktree remove --force`：
-
-| 条件 | 为什么 |
-|---|---|
-| 对应 `macro_runs` 已终态 > 1 小时 | 正常收尾没清掉 |
-| 对应 `macro_runs` 仍是 `running` 但 `started_at` > 1 小时 | **进程崩溃留下的**，永远等不到终态 |
-| `macro_runs` 行根本不存在 | 建 worktree 后、写库前就死了 |
-
-⚠ 第二条是审计指出的遗漏：只扫「已终态」会漏掉崩溃态。
-清理本身失败 ⇒ 记 warn + 留到下次启动（**不阻塞**，但必须可见）。
-
-**预算**（可执行阈值，不是"各设上限"）：
-
-| 项 | 阈值 | 超限行为 |
-|---|---|---|
-| `worktree add` 耗时 | 60s | 中止 + `snapshot_timeout` |
-| 快照总字节（含未跟踪） | 500 MB | 中止 + `snapshot_too_large` |
-| 变更文件数 | 5000 | 中止 + `snapshot_too_large` |
-| 磁盘余量 | < 2 GB | 中止 + `disk_low` |
-
-超限一律**不启动审查**、通知用户，不静默跑半小时。
+只读仍然由 jail + 「不给 shell」保证（§5.2）：审查 agent 只能读、不能改活目录，
+所以「读活目录」不会带来「审查把目录改了」的风险。
 
 ### 5.4 五种失败出口（每种都要有持久状态）
 
@@ -223,7 +185,7 @@ HEAD sha
 |---|---|---|---|---|
 | 审查 run 超时（8 轮 / 240s 到点） | `failed` | `unclassified`（未判） | 用户 | ❌ |
 | LLM / API 失败 | `failed` | `unclassified` | 用户 | ❌ |
-| 工作包构建失败（§5.3 任一环） | `failed` | `unclassified` | 用户 | ❌ |
+| 工作包构建失败（§4.1 事实采集出错） | `failed` | `unclassified` | 用户 | ❌ |
 | 首行格式非法 | `done` | `unclassified` | 用户 + 管理员 | ❌（存原文供人看） |
 | 回灌 409 `run_in_progress` | `skipped` | **保留原判决** | **不通知**（人在场） | ❌，记 `deferred` |
 
@@ -397,7 +359,7 @@ macro_runs           07 的字段 + 下列 M9 专用列：
                        reason         text，失败原因（§5.4 前四行）
                        remediation_text text，回灌正文
                        child_session_id · child_run_id · depth · parent_macro_run_id
-                       worktree_path  text，建好的 worktree 路径（§5.3 孤儿清扫用）
+                       worktree_path · snapshot_id  历史遗留列（#690 起不再写入，审查读活目录）
 ```
 
 **幂等键只有一套**，见 `07` 的 `UNIQUE (assignment_id, anchor, criterion, bucket)`。
@@ -411,9 +373,9 @@ M9 上：`criterion` ∈ `{mechanical, semantic}`、`bucket` = 触发它的 run 
 | 风险 | 防线 |
 |---|---|
 | 回灌成环 | `depth ≤ 1` + 幂等键 |
-| 审查对象在变 | worktree 冻结（含脏文件） |
+| 审查对象在变 | 读活目录时读到稍新的状态不算错判（§5.1 判据 2）；仍保留「同 cwd 有活跃 run 不启动」的 soft-guard |
 | 用户以为在守、其实没守 | 到期通知 + 面板「上次评估时刻」+ 管理台 `skipped_reason` |
-| 审查者改了用户代码 | worktree + `writable: []` + 无 shell |
+| 审查者改了用户代码 | jail + `writable: []` + 无 shell（审查只读，见 §5.2） |
 | 成本失控 | 值守有 `until`；单次预算 8 轮 / 240s；同 cwd 有活跃 run 不启动 |
 
 ### 11.1 「同 cwd 无活跃 run」必须是原子的
@@ -430,7 +392,7 @@ M7 定时任务、M9 审查，全部走同一个条件写入。只在 M9 这边�
 人优先必须由**会话级互斥**（同会话单活跃 run）+ 排队规则落实。
 
 **人优先**（`08` §11 那条）同理：用户发消息时若审查在排队 ⇒ 审查标 `superseded`，
-**不得回灌过期结论**，重新开始时针对新快照重审。
+**不得回灌过期结论**，重新开始时针对新状态重审。
 
 ## 12. 待定
 

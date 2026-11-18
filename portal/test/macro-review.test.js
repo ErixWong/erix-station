@@ -199,13 +199,12 @@ test('until 到期 ⇒ 判决入账（done/red）但不触发回灌', { skip: SK
   });
 });
 
-// —— ④ 失败出口：超时 / LLM 失败 / 快照失败 ⇒ failed + unclassified，不回灌 ——
-test('失败出口：timeout / llm 失败 / 快照失败都记 failed+unclassified', { skip: SKIP }, async (t) => {
+// —— ④ 失败出口：超时 / LLM 失败 ⇒ failed + unclassified，不回灌（#690：无快照失败出口）——
+test('失败出口：timeout / llm 失败都记 failed+unclassified', { skip: SKIP }, async (t) => {
   await withFreshDb(async (pool) => {
     const cases = [
       ['timeout', { reviewRunner: () => { const e = new Error('slow'); e.kind = 'timeout'; throw e; } }],
       ['llm', { reviewRunner: () => { throw Object.assign(new Error('api down'), { kind: 'llm_error' }); } }],
-      ['snapshot', { snapshot: { ok: false, reason: 'snapshot_timeout' } }],
     ];
     for (const [tag, extra] of cases) {
       const scene = await seedScene(pool, ids(`F${tag}`));
