@@ -209,6 +209,8 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
   S.artifactsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-artifacts-wp5-'));
   S.staticFile = writeTraefikStatic(S.staticRoot, {
     repoRoot: REPO_ROOT, webPort: TRAEFIK_WEB_PORT, websecurePort: process.env.TRAEFIK_WEBSECURE_PORT,
+    // #261117：隔离栈必须换掉管理口 :9443（与共享栈撞端口 ⇒ edge 崩循环 ⇒ 整个栈没入口）
+    adminPort: process.env.TRAEFIK_ADMIN_PORT || '19443',
   });
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
