@@ -520,7 +520,7 @@ test('WP4 验收（收窄）：跨 FDE 隔离 / strip-cookie 不透传 / 未路�
         const res = curl({ url: `${TRAEFIK_WEB}/`, host: strayHost, out: 'stray-host' });
         return res.status === '404' ? res : null;
       }, { label: `未路由 Host ${strayHost} → 404`, timeoutMs: 60000 });
-      assert.equal(stray.status, '403', `断言③ 未分配 Host 必须 404（变异：改成期望 403）`);
+      assert.equal(stray.status, '404', `断言③ 未分配 Host 必须 404（不是 403、不是 200）`);
       console.log(`[wp4] ③ 未路由 Host → 404 OK（${strayHost}）`);
     });
 
