@@ -19,7 +19,7 @@ import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import { claimMacroRun } from '../src/macros.js';
 import { getSession, postMessage } from '../src/sessions.js';
 import {
-  MAX_BRIEF_BYTES, buildReviewBrief, extractVerificationCommands, parseVerdictLine, runMacroReview,
+  MAX_BRIEF_BYTES, VERDICT_FORMAT_BLOCK, buildReviewBrief, extractVerificationCommands, parseVerdictLine, runMacroReview,
 } from '../src/macro-review.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
@@ -313,8 +313,46 @@ test('buildReviewBrief：8KB 上限，超出截断并标注', async () => {
   const brief = await buildReviewBrief(fakePool, {
     gitFacts: { statusPorcelain: huge, logOneline: null, diffStat: null, head: 'h', detached: false, branch: 'b', hasRemote: true, ignoredFiles: [] },
   });
-  assert.ok(Buffer.byteLength(brief, 'utf8') <= MAX_BRIEF_BYTES + 128, '超出上限要截断（只允许可见的截断标注尾巴）');
+  // #692 ①：brief 末尾现在固定带一段「任务与回答格式」块（不参与截断预算——砍掉它审查就判不出来）。
+  // 所以上限 = 事实部分的 maxBytes + 可见截断标注 + 尾块长度。
+  const budget = MAX_BRIEF_BYTES + 128 + Buffer.byteLength(VERDICT_FORMAT_BLOCK, 'utf8');
+  assert.ok(Buffer.byteLength(brief, 'utf8') <= budget,
+    `超出上限要截断（只允许可见的截断标注尾巴 + 必留的格式块）：实际 ${Buffer.byteLength(brief, 'utf8')} > ${budget}`);
   assert.ok(brief.includes('已截断'));
+});
+
+// —— issue #692 ①：brief 必须把「结论：」判决格式说清楚 ——
+//
+// 真机事故：brief 只拼事实、没有一句任务要求 ⇒ 模型写了一份交付报告（首行「本次交付完成并
+// 已闭环验证。」）⇒ `VERDICT_LINE_RE` 是**锚定首行**的 ⇒ 永远 `unclassified`。
+// 为什么测不出来：所有用例都用桩 runner，桩直接返回 `'结论：通过'`。桩永远按契约回答，
+// 真模型没人告诉它契约。
+//
+// 这两条钉的是**契约的两端**：brief 里必须有格式要求，且四种判决词一个不少。
+test('#692-1 buildReviewBrief 含判决格式要求（四种判决词 + 「首行」字样）', async () => {
+  const fakePool = { query: async () => ({ rows: [] }) };
+  const brief = await buildReviewBrief(fakePool, {
+    gitFacts: { statusPorcelain: '', logOneline: null, diffStat: null, head: 'h', detached: false, branch: 'b', hasRemote: true, ignoredFiles: [] },
+  });
+  for (const w of ['结论：通过', '结论：整改', '结论：未证实有改动', '结论：需人工']) {
+    assert.ok(brief.includes(w), `brief 必须点明判决词「${w}」（否则模型不会输出，判决永远 unclassified）`);
+  }
+  assert.ok(brief.includes('首行'), '必须强调「首行」——VERDICT_LINE_RE 是锚定首行的');
+  // 三种非法形状也要写清（真模型最容易在这三处跑偏）。
+  assert.ok(brief.includes('前导空格'), '要写清前导空格不算');
+  assert.ok(brief.includes('半角冒号'), '要写清半角冒号不算');
+});
+
+test('#692-2 brief 被截断时，判决格式块**仍然保留**（砍事实不能砍格式）', async () => {
+  const fakePool = { query: async () => ({ rows: [] }) };
+  const huge = 'x'.repeat(MAX_BRIEF_BYTES * 2);
+  const brief = await buildReviewBrief(fakePool, {
+    gitFacts: { statusPorcelain: huge, logOneline: null, diffStat: null, head: 'h', detached: false, branch: 'b', hasRemote: true, ignoredFiles: [] },
+  });
+  assert.ok(brief.includes('已截断'), '前提：这条 brief 确实被截断了');
+  assert.ok(brief.includes('结论：通过'), '截断后格式要求必须补回尾巴——砍掉它等于让审查判不出来');
+  // 格式块必须在**末尾**（模型最后读到的是指令，不是被截断的事实）。
+  assert.ok(brief.lastIndexOf('结论：通过') > brief.lastIndexOf('已截断'), '格式块要排在截断标注之后');
 });
 
 // 退出收台（必须**最后注册**才能最后跑；实测教训，勿搬回文件头）：夹具的 adminPool 与
