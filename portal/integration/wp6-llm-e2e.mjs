@@ -168,6 +168,9 @@ const S = {
   artifactsRoot: null,
   staticFile: null,
   password: 'correct horse battery staple',
+  // 管理台代设口令后产品要求改口令，且**新旧不许相同** ⇒ 这个是用例里统一改成的那个值
+  password2: 'correct horse battery staple v2',
+  userPassword: {},   // loginName -> 改口令之后的口令（login 的缺省值从这里取）
   adminCookie: null,
   gitHostId: null,
   onboardingLlm: null,
@@ -186,7 +189,7 @@ function fdeContainer(alias) {
   return `fde-${FDE_NAMES[alias]}`;
 }
 
-async function login(loginName, secret, password = S.password) {
+async function login(loginName, secret, password = (S.userPassword?.[loginName] ?? S.password)) {
   const step1 = await fetch(`${PORTAL}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -256,6 +259,12 @@ async function createFdeUser(loginName) {
     }),
   });
   assert.equal(response.status, 201, `create user ${loginName}`);
+  // ⚠ 管理台建号会置 `must_change_password = true`（#255 首登强制改密）⇒ 后续 `POST /api/sessions`
+  // 直接 403 `password_change_required`（261117 实测）。**本用例的被测对象是 LLM key 注入，不是改密流程**，
+  // 所以这里像 wp5/wp2a 一样按「测试种子」处理：建号后把那一列清掉。
+  // （先试过走真实改密接口，但改密会 revoke 会话并让后续 TOTP 登录 401 —— 那是另一条要被单独覆盖的链路，
+  //   不该塞进 wp6；要测它请单开用例。）
+  psql(`UPDATE users SET must_change_password = false WHERE login = '${loginName}'`);
   assert.ok(response.body.totp_secret, 'opt-in TOTP：totp_enabled=true 时种子只在下发一次的创建响应里出现');
   assert.deepEqual(response.body.onboarding, {
     state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
@@ -303,6 +312,30 @@ async function sendMessageAndWait(alias, content, timeoutMs = 180000) {
     method: 'POST',
     body: JSON.stringify({ content }),
   });
+  if (response.status !== 202) {
+    // 失败现场取证：把「绑定行 / portal 模型目录 / LiteLLM 模型目录」三方 id 一次打全，
+    // 否则只看到 llm_model_not_found 无从判断是「没建进去」还是「id 口径不一致」。
+    const fde = FDE_NAMES[alias];
+    // 列名以 0010 迁移为准：main / embedding / vision 三槽（没有 small）
+    // 列名以 information_schema 现查为准：键列是 `fde_id`（不是 fde_name）
+    const binding = psql(`SELECT main_model_id || ' | ' || coalesce(main_model_name,'-') FROM fde_llm_bindings WHERE fde_id=(SELECT id FROM users WHERE fde_name='${fde}')`).trim();
+    const portalModels = await adminApi('/api/admin/llm/models');
+    const portalDump = (portalModels.body.items ?? []).map((m) => `${m.id}:${m.model_name}`).join(',');
+    let litellmDump = '(unreachable)';
+    try {
+      const master = process.env.LITELLM_MASTER_KEY;
+      litellmDump = docker(`exec ${process.env.STATION_LITELLM_NAME || 'station-litellm'} node -e ${JSON.stringify(
+        'fetch("http://127.0.0.1:4000/model/info",{headers:{Authorization:"Bearer "+process.env.LITELLM_MASTER_KEY}}).then(r=>r.json()).then(j=>console.log(JSON.stringify((j.data||[]).map(d=>d.model_info?.id+":"+d.model_name)))).catch(e=>console.log("ERR "+e.message))',
+      )}`).trim();
+      void master;
+    } catch (error) {
+      litellmDump = `(dump failed: ${error.message})`;
+    }
+    console.log(`[wp6][诊断] 发消息失败 status=${response.status} body=${JSON.stringify(response.body)}`);
+    console.log(`[wp6][诊断] fde_llm_bindings(main_model_id|main_model_name|small_model_id|small_model_name)=${binding}`);
+    console.log(`[wp6][诊断] portal /api/admin/llm/models = ${portalDump}`);
+    console.log(`[wp6][诊断] LiteLLM /model/info(id:name) = ${litellmDump}`);
+  }
   assert.equal(response.status, 202, `send message (${alias}): ${JSON.stringify(response.body)}`);
   const runId = response.body.run.id;
   const status = await waitFor(() => {
@@ -415,6 +448,8 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
   S.artifactsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-artifacts-wp6-'));
   S.staticFile = writeTraefikStatic(S.staticRoot, {
     repoRoot: REPO_ROOT, webPort: TRAEFIK_WEB_PORT, websecurePort: process.env.TRAEFIK_WEBSECURE_PORT,
+    // #261117：隔离栈必须换掉管理口 :9443（与共享栈撞端口 ⇒ edge 崩循环 ⇒ 整个栈没入口）
+    adminPort: process.env.TRAEFIK_ADMIN_PORT || '19443',
   });
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
@@ -467,10 +502,37 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
       if (present.length) docker(`network rm ${present.join(' ')}`);
     });
     // issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；compose/docker build 按需失效缓存）。
-    teardown('rm -rf userspace 临时目录', () => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
-    teardown('rm -rf dynamic 临时目录', () => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
-    teardown('rm -rf static 临时目录', () => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
-    teardown('rm -rf artifacts 临时目录', () => fs.rmSync(S.artifactsRoot, { recursive: true, force: true }));
+    // ⚠ FDE 容器（uid≠宿主）会在 userspace 下建 `platform/git` 之类子目录，宿主 `rmSync` 直接
+    // EACCES（261118 实测：正文断言全过、却挂在清场 ⇒ 一条本该全绿的 e2e 被判红）。
+    // 口径与 wp2a 同一份：先 chmod 走一遍，删不掉再借容器里的 root 删。
+    const rmTree = (dir) => {
+      if (!dir || !fs.existsSync(dir)) return;
+      const fix = (d) => {
+        let ents = [];
+        try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { /* 读不了就直接 chmod */ }
+        try { fs.chmodSync(d, 0o700); } catch { /* 非属主时 chmod 也会失败，交给下面的 rm 报 */ }
+        for (const e of ents) if (e.isDirectory()) fix(path.join(d, e.name));
+      };
+      fix(dir);
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      } catch (error) {
+        const image = process.env.FDE_IMAGE || process.env.STATION_PORTAL_IMAGE;
+        if (!image) throw error;
+        // ⚠ 两个都不能少：**不许**重定向 stderr 或加 `|| true` 兜底（#224 的静默吞错形态，
+        // `isolation-negative.mjs --strict` 按文本扫这个字面量）；同时 glob **必须带点项**
+        // `/x/.[!.]*`——只写 `/x/*` 会把 `.git` / `.env` 这类点文件漏在盘上（261118 二审 LOW①，
+        // 命令级复现：`hidden_remains=True`）。带 `-f` 时无匹配也不报错，所以不需要兜底。
+        execSync(`docker run --rm --user 0 --entrypoint sh -v ${JSON.stringify(`${dir}:/x`)} ${image} -c 'rm -rf /x/* /x/.[!.]*'`, {
+          stdio: 'pipe',
+        });
+        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      }
+    };
+    teardown('rm -rf userspace 临时目录', () => rmTree(S.userspaceRoot));
+    teardown('rm -rf dynamic 临时目录', () => rmTree(S.dynamicRoot));
+    teardown('rm -rf static 临时目录', () => rmTree(S.staticRoot));
+    teardown('rm -rf artifacts 临时目录', () => rmTree(S.artifactsRoot));
     // lib 的 removeDbDir 对 docker 失败不抛（teardown 语义），以返回 null 记失败——这里翻译成显式失败。
     teardown('removeDbDir', () => {
       if (removeDbDir() === null) throw new Error('lib removeDbDir 返回 null（docker 删除执行失败，STATION_DB_DIR 未清掉）');
@@ -534,11 +596,14 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
         `migration ${version} is applied`,
       );
     }
+    // ⚠ 迁移 **0032-drop-retired-tables.sql** 把 `llm_models_retired` / `llm_providers_retired`
+    // **撤掉了**（#503：退役/备份表不再保留）⇒ 旧断言「`${table}_retired` 必须存在」会永远红（实测 0 !== 1）。
+    // 现在的正确口径：正表与退役表**都必须不存在**（退役表只在 0010→0032 之间的窗口里存在过）。
     for (const table of ['llm_providers', 'llm_models']) {
       assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}'`), '0',
         `${table} is retired`);
-      assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}_retired'`), '1',
-        `${table}_retired is retained`);
+      assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}_retired'`), '0',
+        `${table}_retired 必须已被迁移 0032 撤掉（#503）；出现 = 0032 没跑或有人把表加回来了`);
     }
     for (const table of ['git_hosts', 'fde_git_accounts', 'fde_onboarding']) {
       assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}'`), '1',
