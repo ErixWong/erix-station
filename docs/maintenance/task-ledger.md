@@ -9280,3 +9280,54 @@ console errors                  none
 **口径提醒（下一单别踩）**：`/` 报 `overlay` 是**正确**的，不是数据缺失——容器看到的就是 overlay 视图；
 要看真实设备名（`/dev/nvme0n1p2`）就把宿主目录也挂进 portal 并加进 `SYSTEM_METRICS_DISK_PATHS`，
 届时同一行会自动升级设备名（`docs/ops/system-metrics.md` §5）。
+
+### 8.179 M9 完成审查真机跑通：砍掉快照 + 连挖三个「桩测友好、现实失明」的缺陷（#690 / #692 / #693 / #695，2026-11-18）
+
+**决策：不做快照**（#673 关闭）。M9 的审查 run 直接读**活目录**（`~/projects/<项目名>`）。
+
+理由是用户拍回来的：设计 `08` §5.1 的依据是「`capacity=2` ⇒ 同一 cwd 可能两个 run 在写」，
+但**实际工作流是「开 worktree → 派 agent 干 → 干完审计」，这期间没人碰** —— 本 session 四个子任务
+（`wt-662`/`wt-670`/`wt-676`/`wt-690`）全是这个形状，一次都没撞上「目录变了」。
+就算撞上，后果也只是「审查读到稍新一点的状态」，不算错判。
+**真机量过**：45 个 git 仓库里 35 个（78%）无 HEAD ⇒ `git worktree add` 建不出来 ⇒ 只能整树拷贝
+⇒ worktree 是优化不是替代；145MB 总量 / 平均 3MB ⇒ 500MB 门闸是摆设，真正的成本是**机器零件**
+（两套搬运 + 路径翻译 + 清扫 + 每步一个失败原因）。
+
+**#690 砍掉**（PR #691 = `a412ec5`，净 **-1584/+117**）：删 `macro-snapshot.js`（725 行）+ 测试（622 行）；
+`run-review` 的 cwd 改用**会话约定形式** `~/projects/<name>` —— 这是**每个普通 run 都在用的路径**，
+已验证可用 ⇒ #673 那一整套（portal 建在 `/root/.erix/`、runner 看不见、路径翻译、孤儿清扫）**根本不存在**。
+`reviewMode` 默认 `'disabled'` → `'live'`，保留 `'disabled'` 供运维一键关。
+**刻意保留**：`worktree_path`/`snapshot_id` 两列（有历史数据，删列要迁移）；`RUN_REVIEW_ONLY` 链路（只读面是另一件事）。
+
+**#692/#693/#695 三个缺陷** —— 真机终验依次挖出，**每一个都是「测试测的是函数，不是接线」**：
+
+1. **#693【根因级】`agentd` 的 `runStart` 是白名单字面量，`max_rounds`/`review_only` 不在里面**
+   ⇒ `buildWorkerEnv(runStart)` 读到的永远是 `undefined` ⇒ **#627 ③（per-run 轮数）与 #662（只读审查）
+   在真机上从未生效**。真机后果：审查 run 照样能 `shell`/`writeFile`（`REVIEW_ONLY_TOOL_NAMES` 只有 3 个）。
+   为什么测不出来：#627/#662 的用例都**直接调 `buildWorkerEnv(fakeRunStart)`**，桩喂理想对象。
+   修：抽出 `perRunKnobs(run)` 纯函数 + **源码级守卫**（断言 `runStart` 字面量真的展开了它、
+   且不许手抄字段）—— 用例拿不到那个字面量（在巨型函数内部），只能从源码断言「那一行还在」。
+2. **#692① brief 从没要求输出 `结论：` 行** ⇒ 真实审查写一份交付报告 ⇒ 锚定首行解析不到 ⇒ 永远
+   `unclassified`。桩 runner 直接返回 `'结论：通过'`，桩永远按契约回答，**真模型没人告诉它契约**。
+   修：`VERDICT_FORMAT_BLOCK` 放 brief **最后**（模型最后读到的是指令）+ 写清三种非法形状
+   （前导空格 / 半角冒号 / 只在正文）；**截断时把尾块补回来**（砍事实不能砍格式）。
+3. **#695 缺省轮数 8 太小**：真机 `max_rounds=8` ⇒ `termination=max_rounds_cap`、`rounds=8`、
+   `verdict_raw` 是 **DSML 工具调用碎片** ⇒ `unclassified`（**看起来像「没判成」，实际是「没跑完」**）。
+   同一场景 `24` ⇒ 一次跑完，首行 `结论：未证实有改动` ⇒ `verdict=no-op-claim`。修：8 → 24，
+   `KIND_SCHEMA` 与契约文档同步（订阅面默认值必须与执行面同源）。
+
+**部署缺口（口径，此前没写进文档）**：`fde-eric` 一直跑**已发布的旧 FDE 镜像**（`sha256:bbe47b06…`，
+早于 #662），里面连 `buildWorkerEnv` 那段都没有 ⇒ 与 #693 叠加。
+**改 `runner/` 下任何代码必须重建 FDE 镜像 + 重建 FDE 容器**，否则 portal 侧的新行为到 runner 就断。
+dev 栈做法：`docker build -t erix-station/fde:local runner/` → `deploy/.env` 的 `FDE_IMAGE`
+写成完整 `sha256:<image id>`（production 校验要求）→ 重建 `station-docker-proxy` + `station-portal`
+→ 删 `fde-*` 容器后 `onboardFde()` 重建（`onboardFde` 是幂等的，容器还在就不换镜像）。
+
+**M9 真机终态（五条判据全绿）**：审查会话 cwd = 活目录；只读面只有 `readFile`/`searchText`/`tree`
+（模型臆想的 `edit` 调用被执行器回 `Unknown tool: edit`，项目 `git status` 干净 —— **schema 过滤生效**）；
+`verdict=no-op-claim`（四值之一）；`snapshot_id`/`worktree_path` 皆 NULL；`max_rounds` 精确停在设定值
+（这条反过来证明 #693 修好了）。
+
+**可复用的两条**：① **「变异全命中」证明的是测试有效，不是功能可用** —— #662 三个变异全红、CI 全绿，
+真机一次跑不通。② **桩喂的是理想对象，所以「被测函数正确」永远不等于「接线正确」** ——
+判据要打在**组装点**或**用户最终看到的东西**上；#693 的源码级守卫就是这么来的。
