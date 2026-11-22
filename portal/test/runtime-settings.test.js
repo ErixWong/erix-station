@@ -1166,6 +1166,16 @@ test('RS-17 真库那一腿：保存后热读**立刻**是新值 + 管理台读�
       const CONFIG = { sessionTtlSeconds: 777, sessionTtlSecondsSource: 'env' };
       invalidateSessionTtlCache();
 
+      // 真库前置：`audit_log.actor_id` 上有 FK（`audit_log_actor_id_fkey`）⇒ 要往审计里落一个
+      // 真 actor，就必须先有这个人。**这一格是 P2a 的真库腿在本单第一次真跑才跑出来的红**
+      //（之前每一轮都因为没设 `TEST_DATABASE_URL` 而 skip ⇒ `INSERT` 直接吃 23503）。
+      // RS-11 全程 `actorId: null` 所以看不见这一格；本格要判的恰恰是「`updated_by` 是真的
+      // 那个 actor」⇒ 不许改成 `null` 绕过，只能把人立出来。
+      await pool.query(
+        `INSERT INTO users (id, login, password_hash, status) VALUES ($1, $2, 'x', 'active')`,
+        [ACTOR, 'w677-p2a-actor'],
+      );
+
       // 库里没行 ⇒ env 那一档。真表由迁移 0046 建好（夹具跑完整条迁移链）。
       assert.equal(await readSessionTtlSeconds({ pool, config: CONFIG, log: pgSilent }), 777);
 
@@ -1192,6 +1202,20 @@ test('RS-17 真库那一腿：保存后热读**立刻**是新值 + 管理台读�
         (err) => err.code === 'validation_failed' && err.details.field === 'value',
       );
       assert.equal((await listRuntimeSettingsAdmin({ pool, config: CONFIG, log: pgSilent })).items[0].value, 120);
+
+      // #701 返修 MED 在**真驱动**上也算一次：冷缓存四路并发 ⇒ 只许发一条 SELECT。
+      // 假库里那一格（RS-18）只能判「形状」，这里判的是真 node-pg 连接上会不会被放大成 4 条往返。
+      invalidateSessionTtlCache();
+      let selects = 0;
+      const counted = {
+        query: (sql, args) => { selects += 1; return pool.query(sql, args); },
+        connect: () => pool.connect(),
+      };
+      const concurrent = await Promise.all(Array.from({ length: 4 }, () => readSessionTtlSeconds({
+        pool: counted, config: CONFIG, log: pgSilent,
+      })));
+      assert.deepEqual(concurrent, [120, 120, 120, 120], '真库上四路也必须拿同一个值');
+      assert.equal(selects, 1, `真库上四路并发也只许一条 SQL（实发 ${selects} 条）`);
       invalidateSessionTtlCache();
     }, { log: pgSilent.log });
   });
