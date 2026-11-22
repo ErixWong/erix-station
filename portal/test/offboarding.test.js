@@ -1006,3 +1006,37 @@ test('#677 P3③ 循环：现读到的值也交给 schedule-workspace-purge（�
     assert.ok(days > 13.9 && days < 14.1,
       `purge deadline 必须按现读的 14 天算（实得 ${days.toFixed(2)} 天 = 还在吃启动快照）`);
   });
+
+test('#677 P3④ 循环递给 sweep 的就是现读到的那个数（直接看参数，两格旋钮各用一次注入缝）', async () => {
+  // 与 P3② 的分工：那一格判**效果**（真清理真删目录），这一格判**参数本身**——
+  // 红法不同：M-1（循环改回读 config）会让 `seen` 停在启动快照 `[7, 7]` 而不是 `[30, 0]`。
+  const fake = makeParkedSleep();
+  let hot = 30;
+  const seen = [];
+  let clock = 1_700_000_000_000;
+  const pool = new OffboardingPoolWithSettings({ state: 'done' });
+  const loop = startOffboardingLoop(
+    pool,
+    { userSpaceRoot: '/tmp/station-p3-seam', workspaceRetentionDays: 7 },
+    {
+      docker: {}, log: quietLog, sleep: fake.sleep, now: () => clock,
+      readRetention: async () => hot,
+      sweep: async (_pool, _config, opts) => {
+        seen.push(opts?.retentionDays);
+        return { disabled: false, purged: 0, failed: 0 };
+      },
+    },
+  );
+  await parkedTick(fake, 1);
+  assert.deepEqual(seen, [30],
+    `第一拍 sweep 收到的必须是现读到的 30，不是启动快照的 7（实得 ${JSON.stringify(seen)}）`);
+  hot = 0;
+  clock += HOUR_MS + 1000;
+  fake.pass();
+  await parkedTick(fake, 2);
+  assert.deepEqual(seen, [30, 0],
+    `改完之后下一拍必须是新值 0（实得 ${JSON.stringify(seen)}）`);
+  loop.stop();
+  await loop.settled;
+  assert.equal(loop.failure(), null);
+});
