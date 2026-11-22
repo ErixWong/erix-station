@@ -861,6 +861,9 @@ export const zhCN = {
       // issue #596 片 B：平台提示词面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.19）。
       // 顺序 upload → prompts：两者都是「改一行而不必重建 station-portal」的平台配置。
       prompts: '提示词',
+      // issue #677 P2b：运行时设置列表（views/AdminRuntimeSettingsView.vue，契约 §4.21）。
+      // 紧跟 prompts：三块（upload / prompts / runtime）都是「改一行而不必重建镜像」的平台配置。
+      runtime: '运行时设置',
       // issue #595 M2：能力市场发布台（views/AdminMarketView.vue，契约 §7 管理面）。
       // 排在上传之后、号池占用（只读运维快照）之前：它是一处平台配置。
       market: '能力市场',
@@ -1201,6 +1204,49 @@ export const zhCN = {
       },
       errNotText: '这一格的草稿不是一个文本，连长度都算不出 ⇒ 没有发请求。',
       footnote: '这三条之外平台还有 4 条提示词住在 runner 镜像里（见上面那张只读卡）。本期不做 per-FDE 覆盖，也不做版本历史：想知道是谁改的去看审计 action=admin.platform_prompts_updated（审计只存摘要，正文在这一行里）。',
+    },
+    // issue #677 P2b：管理台「运行时设置」列表（views/AdminRuntimeSettingsView.vue，契约 §4.21）。
+    // 与 admin.upload 同族，但**是一列表**（P3 会往 registry 里逐格加旋钮）⇒ 文案里不许出现
+    // 「这一个旋钮」那种硬编码口径，也不许写具体区间（区间是服务端 registry 的真相，不在 i18n 第抄）。
+    // ⚠ 值是纯文本渲染（本页无 markdown 渲染器）⇒ 值里不写成对星号当强调（#596 踩过）。
+    runtime: {
+      title: '运行时设置',
+      intro: '平台运行旋钮的管理台入口。每一项连同它的「来源」与「生效方式」一起显示：'
+        + '只报一个数，运维不知道「改的这个数到底听不听」。'
+        + '这一页改的值存进数据库，按 DB > 环境变量 > 内置默认 的优先级盖过前者，改完不必重建镜像。',
+      loading: '正在读取运行时设置…',
+      loadError: '列表没读出来 ⇒ 下面只列错误，不拿旧数据当现状（错误文案是服务端原文）：',
+      notLoaded: '尚未加载运行时设置（还没请求）。',
+      empty: '服务端没有列出任何可管理的配置项（registry 里还无可写的旋钮）。',
+      colKey: '配置项',
+      colValue: '当前值',
+      colSource: '来源',
+      colApplyMode: '生效方式',
+      colUpdatedAt: '更新时间',
+      colChange: '改这个值',
+      unknown: '未知',
+      never: '从未（这一项还没被管理台存过）',
+      sourceDb: '管理台（DB）',
+      sourceEnv: '环境变量',
+      sourceDefault: '内置默认',
+      applyHot: '立即生效',
+      applyRestart: '需重启',
+      save: '保存',
+      saving: '正在保存…',
+      saved: '已保存（下面那个数就是服务端落库后回读的那一个），{apply}',
+      reload: '重新读取',
+      errNotInteger: '不是整数（空、小数、科学计数法都算不是）⇒ 没有发请求。',
+      errNoItem: '服务端没回配置项内容（响应里没有 item）⇒ 这一行没刷新，也没当成保存成功。',
+      fieldKey: '配置项名字',
+      fieldValue: '新的值',
+      fieldBody: '请求体',
+      fieldPointed: '（服务端说错在：{field}）',
+      // 尾注三件事：① 前端不抢服务端的闸；② restart 档「已保存 ≠ 生效」；③ §4.21 的生效时机边界
+      // —— 读侧缓存按进程，所以「立即」只对处理这次 PUT 的那个进程成立，多副本最多 5 秒后才收敛。
+      footnote: '前端不做区间校验：解析得出整数就照发（越界由服务端拒并零写库，§4.21）。'
+        + '生效方式显示「需重启」的项，改完要重启 station-portal 才生效'
+        + '——页面上那句「已保存」不等于生效。'
+        + '而「立即生效」也不越进程：多副本部署下，其它 station-portal 进程最多 5 秒后才看到新值。',
     },
     // issue #449 管理台切片：邮件通道配置（views/AdminMailView.vue，契约 docs/api/portal.md §4.12）。
     // 本页是登录第二因素「邮箱验证码」的唯一开关；口令**只写不读**（服务端只回 hasPassword）。

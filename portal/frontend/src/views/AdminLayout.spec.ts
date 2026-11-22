@@ -102,9 +102,10 @@ describe('AdminLayout tab 导航（#449 邮件通道）', () => {
 
     // 裸路由把 tab 桩成 `/<name>`，所以 href 是 `/admin-mail`（真实应用里是 `/admin/mail`，
     // 路由表那条由本用例末尾的 `routes` 断言钉住）。
-    // ⚠ 10 = 到号池占用为止（#596 的 prompts、#595 的 market、#650 的 system 三颗 tab 都插在
-    //   upload 与 pool 之间 ⇒ 原本窗口里的 8 格多了两格；本用例只钉 mail 的相邻，多带不影响判据）。
-    const links = wrapper.findAll('nav a').slice(0, 10);
+    // ⚠ 11 = 到号池占用为止（#596 的 prompts、#595 的 market、#650 的 system、#677 的 runtime 四颗
+    //   tab 都插在 upload 与 pool 之间 ⇒ 原本窗口里的 8 格多了三格；本用例只钉 mail 的相邻，
+    //   多带不影响判据）。
+    const links = wrapper.findAll('nav a').slice(0, 11);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-mail');
 
@@ -141,17 +142,17 @@ describe('AdminLayout tab 导航（#456 证书页）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 10);
+    const links = wrapper.findAll('nav a').slice(0, 11);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-tls');
 
     const tlsLink = links.find((link) => link.attributes('href') === '/admin-tls')!;
     expect(tlsLink.text()).toBe('证书');
 
-    // 顺序：users → llm → repos → mail → **certs** → upload → prompts → market → pool
+    // 顺序：users → llm → repos → mail → **certs** → upload → prompts → runtime → market → system → pool
     // ⚠ 第二条原本断言「号池占用紧挨证书」，#485 片 A 在两者之间插了「上传上限」⇒ 相邻关系改了。
     //    这里改成钉「证书排在邮件之后 + 号池占用仍在窗口末格」，精确相邻由下面 #485 那条钉。
-    //    窗口取 9 格：#596/#595 又各插了一颗平台配置 tab（理由同上条用例的注释）。
+    //    窗口取 11 格：#596 / #595 / #650 / #677 又各插了一颗平台配置 tab（理由同上条用例的注释）。
     expect(hrefs.indexOf('/admin-tls')).toBe(hrefs.indexOf('/admin-mail') + 1);
     expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.length - 1);
 
@@ -177,24 +178,27 @@ describe('AdminLayout tab 导航（#485 片 A 上传上限）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 10);
+    const links = wrapper.findAll('nav a').slice(0, 11);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-upload');
     expect(links.find((link) => link.attributes('href') === '/admin-upload')!.text()).toBe('上传上限');
 
-    // 顺序：certs → **upload** → prompts → market → pool（平台配置挨在一起，只读的号池占用永远留最后）
+    // 顺序：certs → **upload** → prompts → runtime → market → system → pool（平台配置挨在一起，
+    // 只读的号池占用永远留最后）
     // ⚠ #595 在 upload 与 pool 之间插了「能力市场」、#596 片 B 又插了「提示词」⇒ 这里的相邻判据
-    //    同步改（精确相邻由下面两条各自钉）。
+    //    同步改（精确相邻由下面几条各自钉）。
     expect(hrefs.indexOf('/admin-upload')).toBe(hrefs.indexOf('/admin-tls') + 1);
-    // ⚠ 三颗 tab 分别由 #595 / #596 / #650 插在 upload 与 pool 之间 ⇒ 合并后顺序固定为
-    //    upload → prompts → market → system → pool，旧「紧接 upload 之后」的相邻各让一步
+    // ⚠ 四颗 tab 分别由 #595 / #596 / #650 / #677 插在 upload 与 pool 之间 ⇒ 合并后顺序固定为
+    //    upload → prompts → runtime → market → system → pool，旧「紧接 upload 之后」的相邻各让一步
     //    （同一个形状：以前 #485 插 upload 时也改掉过 #456 那条）。判据本身（存在 + 指向 + 在号池之前）一个字没让。
     expect(hrefs.indexOf('/admin-prompts')).toBe(hrefs.indexOf('/admin-upload') + 1);
-    expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-prompts') + 1);
+    expect(hrefs.indexOf('/admin-runtime')).toBe(hrefs.indexOf('/admin-prompts') + 1);
+    expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-runtime') + 1);
     expect(hrefs.indexOf('/admin-system')).toBe(hrefs.indexOf('/admin-market') + 1);
     expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-system') + 1);
     // tab 总数：这一格是「加 tab 必须同步改本文件桩路由」那条红线的正面（漏改 ⇒ 挂载就抛，不会走到这里）
-    expect(hrefs).toHaveLength(10);
+    // ⚠ 11 = #677 P2b 在 prompts 与 market 之间插了「运行时设置」⇒ 到号池占用为止多一格。
+    expect(hrefs).toHaveLength(11);
 
     // 路由表本身：`/admin` 的 children 里有 `upload` → `admin-upload`，懒加载且要求 admin 角色
     const adminRoute = routes.find((route) => route.path === '/admin')!;
@@ -218,14 +222,14 @@ describe('AdminLayout tab 导航（#596 片 B 提示词面板）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 10);
+    const links = wrapper.findAll('nav a').slice(0, 11);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-prompts');
     expect(links.find((link) => link.attributes('href') === '/admin-prompts')!.text()).toBe('提示词');
 
-    // 顺序：upload → **prompts** → market → pool（三者都是平台配置；只读的号池占用仍留最后）
-    // ⚠ #595 的「能力市场」与本单并行落地、插在 prompts 与 pool 之间 ⇒ 「pool 紧挨 prompts」
-    //    让位给「market 紧挨 prompts」；「排在 upload 之后、号池占用之前」两条判据原样保留。
+    // 顺序：upload → **prompts** → runtime → market → pool（都是平台配置；只读的号池占用仍留最后）
+    // ⚠ #595 的「能力市场」与本单并行落地、插在 prompts 与 pool 之间；#677 P2b 又在两者之间插了
+    //    「运行时设置」⇒ 「pool 紧挨 prompts」早己让位；「排在 upload 之后、号池占用之前」原样保留。
     expect(hrefs.indexOf('/admin-prompts')).toBe(hrefs.indexOf('/admin-upload') + 1);
     expect(hrefs.indexOf('/admin-preview-pool')).toBeGreaterThan(hrefs.indexOf('/admin-prompts'));
 
@@ -256,9 +260,9 @@ describe('AdminLayout tab 导航（#595 能力市场）', () => {
     expect(hrefs).toContain('/admin-market');
     expect(links.find((link) => link.attributes('href') === '/admin-market')!.text()).toBe('能力市场');
 
-    // 精确相邻：prompts → **market** → system → pool（#596 的提示词在 market 之前、#650 的系统在
-    // market 之后；pool 仍是平台配置段的末尾）
-    expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-prompts') + 1);
+    // 精确相邻：prompts → runtime → **market** → system → pool（#596 的提示词与 #677 的运行时设置
+    // 在 market 之前、#650 的系统在 market 之后；pool 仍是平台配置段的末尾）
+    expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-runtime') + 1);
     expect(hrefs.indexOf('/admin-system')).toBe(hrefs.indexOf('/admin-market') + 1);
     expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-system') + 1);
 
