@@ -126,17 +126,27 @@ export const AUDIT_TARGET = 'upload_settings';
  * 一条语句就同时收掉这两个洞：语句级原子（要么全生效要么全不生效），旧值取的是**本语句的快照**。
  *
  * 三个刻意的细节：
- *   1. `prev` 带 `FOR UPDATE`：READ COMMITTED 下光靠 CTE 快照，并发第二条 PUT 仍可能读到「自己进来之前」
- *      的旧值（它会在 `ON CONFLICT` 上等行锁，但 `prev` 已经取完了）。行锁把它推到「前一条提交之后」，
- *      `previous_*` 才是**紧邻的前一个值**。
- *   2. 「DB 旧值可用不可用」的判定在 SQL 里只做**区间比较**（`BETWEEN $5 AND $6`，两个数字是参数，
+ *   1. `prev` **不许**带 `FOR UPDATE`（#698 真库实测，别改回去）。理由不是「不需要锁」，而是**加了也拿不到
+ *      旧值**：同一条语句里所有 sub-statement 共用**同一个语句级快照**，而这条语句自己含 data-modifying
+ *      CTE（`upd`）——带锁的 `prev` 因此看不见 `upd` 正要改的那一行，实测 `prev` **恒空集**（postgres:16：
+ *      二写 `previous_raw=null`、`rowCount=0`、`audit_rows=0` ⇒ 管理台恒 500 而值已落库）。真要行级串行化
+ *      得把「读旧值」拆成独立语句 + 显式事务，那是另一套口径（且会退回「设置改了而审计没写」的窗口）。
+ *      接受的代价：两条**真重叠**的保存可能都记同一个 `previous_*`（快照语义）；US-19 在 fake 里测的串行
+ *      链不等于真库并发语义，真库侧的判据是 `portal/test/upload-settings-real-db.test.js`。
+ *   2. `aud` 与主查询都必须 `LEFT JOIN prev_eff ON true`（#698 的另一半，与上面那条**各自独立**）：
+ *      首写时 `upload_settings` 里没有旧行 ⇒ `prev_eff` 是空集，写成 `FROM upd, prev_eff`（内连接）会把
+ *      `upd` 那一行一起吃掉 ⇒ 主查询 0 行（调用方按「读回不可用」判 500）、审计一行不写，而**值已落库**。
+ *      `prev` 至多一行（`WHERE id = 1` 命中主键）⇒ `LEFT JOIN … ON true` 不会把行数放大成多行。
+ *   3. 「DB 旧值可用不可用」的判定在 SQL 里只做**区间比较**（`BETWEEN $5 AND $6`，两个数字是参数，
  *      由 JS 常量传进来 ⇒ 常量仍然只有一处）。旧值取自 `bigint` 列 ⇒ 文本必是纯数字，所以这条比较与
  *      JS 侧 `parseDbMaxFileBytes` 在这条路径上等价；等价性由 `portal/test/upload-settings.test.js`
  *      的 US-20 钉住（SQL 派生的 previous_* 与 JS 派生的必须逐值相同），不是靠注释声明。
- *   3. `details` 的键与旧实现（`http.js` 里手写的 `auth.audit`）逐字相同，事后审计查询不受影响。
+ *      ⚠ 首写（无旧行）时 SQL 侧走的是 `LEFT JOIN` 出来的 NULL（审计记 `previous_max_bytes=null`），
+ *      而 JS 侧 `previous` 回的是兜底值（`env`/`default`）—— 这一格两边**刻意不同形**，由真库用例第 1 格钉住。
+ *   4. `details` 的键与旧实现（`http.js` 里手写的 `auth.audit`）逐字相同，事后审计查询不受影响。
  */
 const SAVE_SQL = `WITH prev AS (
-   SELECT max_file_bytes::text AS raw FROM upload_settings WHERE id = 1 FOR UPDATE
+   SELECT max_file_bytes::text AS raw FROM upload_settings WHERE id = 1
  ), prev_eff AS (
    SELECT prev.raw AS raw,
           CASE WHEN prev.raw IS NOT NULL AND prev.raw::bigint BETWEEN $5 AND $6
@@ -158,13 +168,13 @@ const SAVE_SQL = `WITH prev AS (
             'max_file_bytes', upd.max_file_bytes::bigint,
             'previous_max_bytes', prev_eff.max_bytes,
             'previous_source', prev_eff.source)
-     FROM upd, prev_eff
+     FROM upd LEFT JOIN prev_eff ON true
    RETURNING 1 AS audit_row
  )
 SELECT upd.max_file_bytes::text AS max_file_bytes, upd.updated_at, upd.updated_by,
        prev_eff.raw AS previous_raw,
        (SELECT count(*) FROM aud)::int AS audit_rows
-  FROM upd, prev_eff`;
+  FROM upd LEFT JOIN prev_eff ON true`;
 
 /** 校验/状态类错误：`httpStatus` + `details.field`（`http.js` 的统一信封按此映射）。 */
 export class UploadSettingsError extends Error {

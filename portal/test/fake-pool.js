@@ -258,9 +258,19 @@ export class FakePool {
         throw new Error('fake：upload_settings 写入必须是单条 upsert（INSERT … ON CONFLICT (id) DO UPDATE）');
       }
       if (!/VALUES \(1,/.test(sql)) throw new Error('fake：upload_settings 是单行表，插入必须写死 id = 1');
-      // 形状闸（复 audit 活二）：旧值不锁行，并发两条 PUT 就仍会各自读到「自己进来之前」的旧值。
-      if (!/FOR UPDATE/.test(sql)) {
-        throw new Error('fake：prev 必须 `FOR UPDATE`——否则 `previous_*` 仍可能是隔了一条写入的旧值');
+      // 形状闸（#698 返修）：prev 带 `FOR UPDATE` 时，同一条含 data-modifying CTE 的语句里它**看不见本语句
+      // 要改的那一行**（真库 postgres:16 实测：`previous_raw` 恒 null、`rowCount` 恒 0 ⇒ 保存恒 500）。
+      // fake 按这个实测口径裁决（看到 `FOR UPDATE` 就直接报错，而不是比真库更宽容）。
+      if (/\bFOR UPDATE\b/.test(sql)) {
+        throw new Error('fake：prev 不许带 `FOR UPDATE`——同一条含 data-modifying CTE 的语句里它看不见本语句'
+          + '要改的那行 ⇒ prev 恒空 ⇒ previous_* 拿不到旧值且主查询 0 行（issue #698 的现场）');
+      }
+      // 形状闸（#698 的另一半）：首写没有旧行，`FROM upd, prev_eff`（内连接）会把 upsert 那一行一起吃掉
+      // ⇒ 主查询 0 行、审计不写 ⇒ 保存恒 500。两处都必须是 `LEFT JOIN prev_eff ON true`（所以数两次）。
+      const leftJoins = (sql.match(/LEFT JOIN\s+prev_eff\s+ON\s+true/gi) || []).length;
+      if (leftJoins !== 2) {
+        throw new Error(`fake：aud 与主查询都必须 \`LEFT JOIN prev_eff ON true\`（首写无旧行，内连接会把` +
+          `\`upd\` 那一行一起吃掉，issue #698）；当前命中 ${leftJoins} 处，应为 2 处`);
       }
       if (params.length !== 8) throw new Error(`fake：upload_settings 保存语句应带 8 个参数，实际 ${params.length}`);
       const [maxFileBytes, updatedBy, fallbackBytes, fallbackSource, minBytes, maxBytes, action, target] = params;
