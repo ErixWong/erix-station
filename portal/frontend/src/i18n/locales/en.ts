@@ -1240,7 +1240,9 @@ export const en = {
       footnote: 'The UI does not police ranges: any parsed integer is sent as-is (out of range ⇒ the '
         + 'server rejects it and writes nothing, §4.21). A row whose “Takes effect” column says '
         + 'it needs a restart only applies after station-portal restarts — “Saved” here never '
-        + 'means “in effect”.',
+        + 'means “in effect”. And “takes effect immediately” does not cross processes: in a '
+        + 'multi-replica deployment the other station-portal processes see the new value after at '
+        + 'most 5 seconds.',
     },
     // issue #449 admin slice: mail channel settings (views/AdminMailView.vue, contract docs/api/portal.md §4.12).
     // This page is the only switch for the email-code second factor; the password is write-only
