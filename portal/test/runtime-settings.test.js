@@ -16,6 +16,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
+import { createPgFixture } from './pg-fixture.js';
+
 import {
   RUNTIME_SETTING_REGISTRY, RuntimeSettingsError, isKnownSetting,
   readRuntimeSettings, applyRuntimeOverrides, saveRuntimeSetting,
@@ -24,6 +26,15 @@ import {
 } from '../src/runtime-settings.js';
 
 const ACTOR = 'd0000000-0000-4000-8000-0000000000a1';
+
+// RS-11 是**真库**格子（环境门口径同 `migrate-fresh-db.test.js`：无 PG 就整体 skip，不假通过）。
+const SUPER_DATABASE_URL = (process.env.TEST_DATABASE_URL || '').trim();
+const PG_SKIP = SUPER_DATABASE_URL
+  ? false
+  : 'TEST_DATABASE_URL 未设置：RS-11 需一次性 postgres:16（docs/testing.md §2.2.1）';
+const pgFixture = SUPER_DATABASE_URL
+  ? createPgFixture(SUPER_DATABASE_URL, { prefix: 'w677' }) : null;
+const pgSilent = { log() {}, warn() {}, error() {}, debug() {} };
 
 // ---------------------------------------------------------------------------
 // 夹具
@@ -293,7 +304,8 @@ test('RS-6 写 = 一条 SQL：单次 pool.query，DTO 来自 RETURNING，审计�
   assert.equal(pool.selectCount, 0, '保存路径不该再单独发一次 SELECT（旧值在同一条语句里取）');
   const { sql, params } = pool.sqlLog[0];
   for (const fragment of [
-    /WITH\s+prev\s+AS\s*\(/i, /FOR\s+UPDATE/i,           // 旧值快照 + 行锁
+    /WITH\s+prev\s+AS\s*\(/i,                      // 旧值快照与写入同一条语句
+    /\bLEFT JOIN prev\b/i,                          // 首写无旧行也要有审计行
     /INSERT\s+INTO\s+runtime_settings\b/i,               // upsert
     /ON\s+CONFLICT\s*\(key\)\s+DO\s+UPDATE/i,            // 单行 upsert
     /RETURNING\b/i,                                      // DTO 的来源
@@ -301,6 +313,10 @@ test('RS-6 写 = 一条 SQL：单次 pool.query，DTO 来自 RETURNING，审计�
   ]) {
     assert.match(sql, fragment, `那条 SQL 必须含 ${fragment}（缺一样就退回"两个 await"的洞）`);
   }
+  // `FOR UPDATE` 不许回来：在**含 data-modifying CTE 的语句里**，锁定读看不见本语句自己改的那行
+  // ⇒ `prev` 恒为空集 ⇒ `previous_value` 恒 null（真库实测，postgres:16.15，见 RS-11 与 SQL 上方注释）。
+  assert.doesNotMatch(sql, /\bFOR\s+UPDATE\b/i,
+    'prev 不许加 `FOR UPDATE`（真库上它会让旧值快照变成空集；要串行化请靠 ON CONFLICT 的行锁）');
   assert.equal(params[0], ACTOR, 'actor 是第一个参数（审计的 actor_id）');
   assert.equal(params[1], 'demo.limit', 'key 作为参数送进去（不拼 SQL 文本）');
   assert.equal(params[2], '20', '值以 JSON 文本 + `$3::jsonb` 送进去（SQL 侧不猜类型）');
@@ -450,3 +466,95 @@ test('RS-10 读侧超时旋钮：RUNTIME_SETTINGS_READ_TIMEOUT_MS 只收正整�
   assert.ok(elapsed >= 35 && elapsed < 1400,
     `env 给 40ms 就必须在 40ms 附近给答案（实测 ${elapsed}ms；若接近 1500ms = 旋钮没接上）`);
 });
+
+// ---------------------------------------------------------------------------
+// 5. 真库那一腿（RS-11）：只有真的 postgres 才能给的答案
+//
+// 为什么必须有这一格（2026-11-19 实测，不是假想敌）：`SAVE_SQL` 里那句 `prev` 原先照 0036 带了
+// `FOR UPDATE`。**fake pool 里全绿**（它按 SQL 文本分支，不会模拟 PG 的可见性规则），而真库上
+// 「一条含 data-modifying CTE 的语句里，锁定读看不见本语句自己改的那一行」⇒ `prev` 恒空集
+// ⇒ `previous_value` 恒 `null`（0036 那个形状的主查询还是内连接 ⇒ 整条语句零行返回）。
+// ⇒ 「旧值必须来自同一语句的快照」这条口径在真机上其实**没成立**，而单测看不见。
+// 这一格就是那条判据的常驻版本（无 PG 时整体 skip，不参与假通过）。
+// ---------------------------------------------------------------------------
+
+test('RS-11 真库：写=一条语句真的落库 + previous_value 是真旧值 + 审计恰好一行 + key CHECK 真挡人',
+  { skip: PG_SKIP }, async () => {
+    assert.ok(pgFixture, 'TEST_DATABASE_URL 给了却没有夹具');
+    // 夹具自己建库、跑完整条迁移链（含 0046）、并把迁移好的 pool 交进来；收尾它负责。
+    await pgFixture.withFreshDatabase(async ({ pool }) => {
+        const table = await pool.query(`SELECT to_regclass('public.runtime_settings') AS reg`);
+        assert.notEqual(table.rows[0].reg, null, '迁移链跑完 runtime_settings 必须存在');
+        const cols = await pool.query(
+          `SELECT column_name, data_type FROM information_schema.columns
+            WHERE table_name = 'runtime_settings' ORDER BY ordinal_position`);
+        assert.deepEqual(
+          cols.rows.map((r) => `${r.column_name}:${r.data_type}`),
+          ['key:text', 'value:jsonb', 'updated_at:timestamp with time zone', 'updated_by:uuid'],
+          '表形必须是 key-value + jsonb（P3 加旋钮 = 一条 INSERT，零 DDL）',
+        );
+
+        // ① 首写（表里没有那一行）：审计必须**照写**（`LEFT JOIN prev` 的存在理由）。
+        const first = await saveRuntimeSetting({
+          pool, actorId: null, key: 'demo.limit', value: 20, registry: TEST_REGISTRY, log: pgSilent,
+        });
+        assert.equal(first.value, 20, 'RETURNING 回的就是刚写入的值');
+        assert.equal(first.previousValue, null, '首写没有旧值 ⇒ null（不是报错）');
+        assert.equal(await auditCount(pool), 1, '首写也必须留下一行审计');
+
+        // ② 再写：`previous_value` 必须是**真旧值**。这一条就是 fake pool 测不出来的那个洞。
+        const second = await saveRuntimeSetting({
+          pool, actorId: null, key: 'demo.limit', value: 31, registry: TEST_REGISTRY, log: pgSilent,
+        });
+        assert.equal(second.value, 31, 'upsert 走的是 DO UPDATE（库里只有一行）');
+        assert.equal(second.previousValue, 20,
+          'previous_value 必须是紧邻的前一个值 20（拿到 null = prev 又变成空集 = FOR UPDATE 回来了）');
+        assert.equal(await auditCount(pool), 2, '两次保存 = 两行审计（一条不多一条不少）');
+        const only = await pool.query('SELECT count(*)::int AS n FROM runtime_settings');
+        assert.equal(only.rows[0].n, 1, '同一 key 两次保存只许有一行（ON CONFLICT (key) 生效）');
+
+        // ③ 读侧 + 覆盖层：真库上的 jsonb 值（这里 node-pg 直接给 JS number）。
+        const read = await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: pgSilent });
+        assert.deepEqual(read.values, { 'demo.limit': 31 }, '读侧拿到的是真库里的 jsonb 值');
+        assert.deepEqual(read.problems, [{ key: 'demo.interval_ms', reason: 'no_row' }],
+          '有行且合法的那格不许报问题；**没行**的那格必须报 no_row（未配置是常态 ⇒ 只登记不 warn）');
+        const cfg = await applyRuntimeOverrides({ demoLimit: 10 }, { pool, registry: TEST_REGISTRY, log: pgSilent });
+        assert.equal(cfg.demoLimit, 31, '覆盖层在真库上也是 DB > env');
+
+        // ④ 手工绕过写侧塞一个非法值 ⇒ 读侧必须回落并点名（这一条在真机上要真的能进去，
+        //    所以才刻意**没**给 value 写值域 CHECK，见迁移 0046 头注释）。
+        await pool.query(`UPDATE runtime_settings SET value = '\"1e4\"'::jsonb WHERE key = 'demo.limit'`);
+        const badLog = collectingLog();
+        const bad = await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: badLog });
+        assert.deepEqual(bad.values, {}, '"1e4" 不许被收成 1');
+        assert.equal(bad.problems[0].reason, 'not_a_count', '回落理由要点名');
+        assert.match(badLog.seen.warn[0], /demo\.limit/, 'warn 要点名 key');
+        assert.equal(
+          (await applyRuntimeOverrides({ demoLimit: 10 }, { pool, registry: TEST_REGISTRY, log: pgSilent })).demoLimit,
+          10, '非法值 ⇒ 回落 env（真库版）');
+        await pool.query(`UPDATE runtime_settings SET value = '{\"a\":1}'::jsonb WHERE key = 'demo.limit'`);
+        assert.deepEqual((await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: pgSilent })).values, {},
+          'jsonb 里是对象 ⇒ 同样判非法（口径 3 的读侧对应面）');
+
+        // ⑤ key 形状是 DB 事实：拼错/大写的 key 当场被 CHECK 拒（不是静默多出一行幽灵配置）。
+        const rejected = await pool
+          .query(`INSERT INTO runtime_settings (key, value) VALUES ('X', '1'::jsonb)`)
+          .then(() => null, (e) => e);
+        assert.ok(rejected, '坏 key 必须被拒');
+        assert.equal(rejected.code, '23514', `坏 key 应触发 check_violation(23514)，实得 ${rejected.code}`);
+
+        // ⑥ 迁移可整体重放：再跑一遍 0046 的 SQL，表与行数都不许变。
+        const mig = fs.readFileSync(
+          new URL('../../deploy/migrations/0046-runtime-settings.sql', import.meta.url), 'utf8');
+        await pool.query(mig);
+        assert.equal((await pool.query('SELECT count(*)::int AS n FROM runtime_settings')).rows[0].n, 1,
+          '重放 0046 不许多出/丢掉任何一行');
+    });
+  });
+
+/** 本单那个动作的审计行数（RS-11 用；别的动作的审计行不算进来）。 */
+async function auditCount(pool) {
+  const r = await pool.query(
+    'SELECT count(*)::int AS n FROM audit_log WHERE action = $1', [AUDIT_ACTION]);
+  return r.rows[0].n;
+}
