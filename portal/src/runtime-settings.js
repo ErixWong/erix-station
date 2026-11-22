@@ -194,6 +194,17 @@ export const WORKSPACE_RETENTION_MAX_DAYS = 3650; // 10 年，理由见上面那
 export const WORKSPACE_RETENTION_DEFAULT_DAYS = 0;
 
 /**
+ * 给人看的一行提示（**可选字段**，只给有反直觉边界的旋钮写）。口径：
+ *   * 它是**文案**，不是第二份真相 —— 不参与任何判定，真相在 `docs/api/portal.md` §4.21；
+ *   * DTO 只在登记了的那格带上它（没登记 ⇒ 连键都没有），前端才能「有就渲染、没有就不占行」；
+ *   * 为什么只有第二格有：`0` 那一档的语义不是「把已排定的删除也撤了」（A/B 两方向刻意不对称，
+ *     裁定与理由见 §4.21）。这个坑不写在行面上，运维就会把旋钮当「暂停/撤销」两用开关。
+ */
+export const WORKSPACE_RETENTION_HINT = '0 = 关掉自动清理，但不会取消已排定的删除：'
+  + '改回正数后，已过期的工位会在下一次清理被删除；'
+  + '而 0 期间完成离职的工位不会被补上期限（也不会被追删）。';
+
+/**
  * 读侧解析：与 `parseSessionTtlSeconds` 同一套形状（只认「安全整数」或「纯十进制数字串」，
  * 区间外拒），差别只有两点：下界是 **0**，以及 `0` 必须**原样通过**（它是有效值）。
  * `'1e3'` / `' 7 '` / `'7.0'` / `'-1'` / `true` / `null` / 对象 一律拒（台账 §8.126 那一族）。
@@ -252,6 +263,7 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     applyMode: 'hot',
     parse: parseWorkspaceRetentionDays,
     validate: validateWorkspaceRetentionDays,
+    hint: WORKSPACE_RETENTION_HINT,
   }),
 });
 
@@ -1166,6 +1178,16 @@ function toIso(value) {
 }
 
 /**
+ * `hint` 是**可选键**：registry 那一格登记了才带，没登记就连键都不存（不是 `null`、不是空串）。
+ * 为什么不是「人人一个 null」：RS-16 钉的是「一项的键就是那八个」，而前端也得自己判空才能
+ * 不渲染一行空提示。带与不带都由 registry 说话，前端只照 DTO 渲染。
+ */
+function withHint(dto, entry) {
+  const hint = entry?.hint;
+  return typeof hint === 'string' && hint !== '' ? { ...dto, hint } : dto;
+}
+
+/**
  * 一条登记项 ⇒ 响应 DTO（`source` 三档 `db | env | default`，`reason` 只在回落时有点名理由）。
  *
  * `envTier` 是调用方算好的**过了闸的** env 那一档（`resolveEnvTier`）：管理台报的那个值必须与
@@ -1189,16 +1211,16 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
     updatedBy: row?.updated_by ?? null,
   };
   if (parsed?.ok) {
-    return { ...base, value: parsed.value, source: 'db', reason: null };
+    return withHint({ ...base, value: parsed.value, source: 'db', reason: null }, entry);
   }
   // 回落：值来自 env 那一档（或 registry 默认），`reason` 说清为什么不是 db。
   // `row` 存在但值非法 ⇒ 保留库里那行的 updated_at/by（它们是真发生过的事），只是值不用它。
-  return {
+  return withHint({
     ...base,
     value: envTier?.value,
     source: envTier?.source ?? 'default',
     reason: row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row'),
-  };
+  }, entry);
 }
 
 /**
@@ -1261,7 +1283,9 @@ export async function listRuntimeSettingsAdmin({
 
 /** 保存后的 DTO：值/时间/人**只来自 `RETURNING`**（口径 4），`label`/`applyMode` 是 registry 的静态元数据。 */
 function toSavedItem(entry, saved) {
-  return {
+  // `hint` 与 GET 同一口径（只在登记了的那格带）：保存后的那个 item 会直接替掉界面上的那一行，
+  // 这里漏了它，保存完提示就消失（判据：RS-29 的 PUT 腿 + 前端视图 spec 的保存腿）。
+  return withHint({
     key: saved.key,
     label: entry?.label ?? saved.key,
     value: saved.value,
@@ -1270,7 +1294,7 @@ function toSavedItem(entry, saved) {
     applyMode: entry?.applyMode === 'hot' ? 'hot' : 'restart',
     updatedAt: saved.updatedAt ?? null,
     updatedBy: saved.updatedBy ?? null,
-  };
+  }, entry);
 }
 
 /**
