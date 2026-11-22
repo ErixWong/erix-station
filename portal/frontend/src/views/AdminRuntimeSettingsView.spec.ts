@@ -394,3 +394,35 @@ describe('R8 保存成功：回填服务端回读的生效值 + 只在那一行�
     expect(useAdminStore().runtimeSaveField).toBe('body');
   });
 });
+
+describe('R9 在写的那一行说「正在保存」，并锁住整页的写', () => {
+  it('PUT 未归 ⇒ 那一行出「正在保存…」、两行的保存按钮全禁；归了才说「已保存」', async () => {
+    let release!: (r: Response) => void;
+    const gate = new Promise<Response>((resolve) => { release = resolve; });
+    stubFetch((call) => (call.method === 'GET' ? json(200, DTO) : gate));
+    const w = await mountView();
+
+    await setDraft(w, TTL_KEY, '7200');
+    await w.get(`[data-test="runtime-save-${TTL_KEY}"]`).trigger('click');
+    await flushPromises();
+
+    expect(text(w, `runtime-saving-${TTL_KEY}`)).toContain('正在保存');
+    const disabled = (key: string) =>
+      (w.get(`[data-test="runtime-save-${key}"]`).element as HTMLButtonElement).disabled;
+    expect(disabled(TTL_KEY)).toBe(true);
+    expect(disabled(SECOND_KEY)).toBe(true);
+    expect(exists(w, `runtime-saved-${TTL_KEY}`)).toBe(false);
+
+    release(json(200, {
+      item: {
+        key: TTL_KEY, label: '会话有效期（秒）', value: 7200, source: 'db', applyMode: 'hot',
+        updatedAt: '2026-11-23T02:00:00.000Z', updatedBy: 'u-root',
+      },
+    }));
+    await flushPromises();
+
+    expect(exists(w, `runtime-saving-${TTL_KEY}`)).toBe(false);
+    expect(text(w, `runtime-saved-${TTL_KEY}`)).toContain('已保存');
+    expect(disabled(SECOND_KEY)).toBe(false);
+  });
+});
