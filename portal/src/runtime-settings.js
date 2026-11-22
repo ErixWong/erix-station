@@ -44,9 +44,12 @@
 //      ⇒ **调用方不得再补 `auth.audit`**（那会把原子性退回成两个 await，还多写一笔审计）。
 //
 // P1 的边界（别在代码里假装已完成，判据在 `portal/test/runtime-settings.test.js`）：
-//   * `RUNTIME_SETTING_REGISTRY` 是**空对象**：一格真实旋钮都没迁（P3 逐批填），机制本身用
-//     注入的测试 registry 验。所以 `applyRuntimeOverrides` 在真机上目前一条 SQL 都不发。
-//   * 没有 HTTP 端点（`GET/PUT /api/admin/runtime-settings` 与它一起在 P3 落地）。
+//   * `RUNTIME_SETTING_REGISTRY` 自 **P2a** 起有**第一格** `session.ttl_seconds`（其余旋钮仍归 P3 逐批填）。
+//     ⇒ `applyRuntimeOverrides` 在真机上从此**每次 `serve()` 发一次读**（不再是零 SQL），
+//     启动路径的那一次是**整表一次**、不是每 key 一次（第 3 条）。
+//   * HTTP 端点（`GET/PUT /api/admin/runtime-settings`）自 **P2a** 起在 `http.js`（形状在下面的
+//     `listRuntimeSettingsAdmin` / `updateRuntimeSettingAdmin`，http 层只做匹配 + 鉴权 + 转发）。
+//   * 热读：P2a 只有 `readSessionTtlSeconds` 一格（其余旋钮的热读归 P3 逐批填）。
 //   * 迁移 0046 建表；接线在 `cli.js` 的 `serve()`（`migrate()` 之后、`createServer` 之前，
 //     且**所有 `start*Loop` 也用覆盖后的 config**，否则覆盖层只对 HTTP 生效）。
 //
@@ -67,15 +70,20 @@ export const AUDIT_ACTION = 'admin.runtime_settings_updated';
 export const AUDIT_TARGET_PREFIX = 'runtime_settings';
 
 /**
- * 旋钮登记表。**P1 保持空对象** —— 一格真实旋钮都没迁（那是 P3）。
+ * 旋钮登记表。P2a 起了第一格 `session.ttl_seconds`，其余归 P3 逐批填。
  *
  * 条目形状（P3 往里加，一格一条；键名同时是 DB 里的 `key`，受 0046 的 CHECK 约束
  * `^[a-z][a-z0-9_.]{2,63}$`）：
  *
  *   'demo.limit': {
+ *     label: '演示上限',                     // 人话名字（管理台显示用）；**不是**第二份真相，
+ *                                           //   只是 UI 文案，改了不影响行为
  *     configPath: 'demoLimit',              // 点分路径 ⇒ 只覆盖这一条 config 字段
  *     envVar: 'DEMO_LIMIT',                 // 只用于日志/文档点名，不在这里读 env
  *     defaultValue: 10,                     // 连 env 都没给时的兜底（第三档）
+ *     applyMode: 'hot',                     // `'hot'` = 下一次读就生效；**其余一律按 `'restart'` 渲染**
+ *                                           //   （未知值当 `'restart'` 是安全侧：多提醒一次重启，
+ *                                           //   比让人以为已经生效好。渲染侧只认 `'hot'`）
  *     parse(raw) {                          // 读侧：DB 里的 jsonb → 可用值
  *       …return { ok: true, value: n };     //   不可用 ⇒ { ok: false, reason: 'not_a_count' }
  *     },                                    //   ⚠ 不许抛，也不许 `Number(raw)` 了事
@@ -86,8 +94,83 @@ export const AUDIT_TARGET_PREFIX = 'runtime_settings';
  *
  * 三档从哪来（口径 1）：`parse` 出来的 DB 值 > `config[configPath]`（env 那一档，
  * 由 `loadConfig` 算过）> `defaultValue`。
+ *
+ * ⚠ **`applyMode: 'hot'` 的一格必须在这里显式声明**，且写路径要接上失效（见
+ * `HOT_READ_INVALIDATORS`）：热读有 5s 缓存，保存后不失效就是「界面保存了、值没变」。
  */
-export const RUNTIME_SETTING_REGISTRY = Object.freeze({});
+
+/**
+ * 第一格旋钮 `session.ttl_seconds` 的口径（P2a）。
+ *
+ * 区间两端都是**产品口径**，不是随手拍的数：
+ *   * 下限 **60 秒**：比一个小于一分钟的会话更容易出事 —— 会话在每个 `/api/me` 上续期，
+ *     续期节流间隔是 `SESSION_RENEW_INTERVAL_SECONDS`（默认 3600s），把 TTL 压到分钟级以下
+ *     等于让用户在两次续期之间被踢下线（症状是「页面开着就掉登录」）。
+ *   * 上限 **2592000 秒 = 30 天**：再长就是「事实上永不过期」，与 `sessions` 表存在的理由
+ *     （可宽限吊销）相冲。
+ * 默认 **604800 = 7 天**，与 `config.js` 的 `DEFAULT_SESSION_TTL_SECONDS` 同值（单测钉住同源，
+ * 照 `upload-settings.test.js` 的「默认值三处同源」那一格）。
+ */
+export const SESSION_TTL_KEY = 'session.ttl_seconds';
+export const SESSION_TTL_MIN_SECONDS = 60;
+export const SESSION_TTL_MAX_SECONDS = 2592000; // 30 天
+export const SESSION_TTL_DEFAULT_SECONDS = 604800; // 7 天，与 config.js / compose / docs/env.md 同源
+
+/**
+ * 读侧解析（口径 2）：只认「JSON number 里的安全正整数」或「纯十进制数字串」。
+ *
+ * ⚠ 判定**不靠** `Number(raw)` / `parseInt(raw)`（台账 §8.126）：`'1e4'`、`' 60 '`、`'60s'`、
+ * `'0x10'`、`'1.5'`、`''` 全部当场拒。数字串先过 `/^[0-9]+$/` 再转数，转数只是搬运、不是裁决。
+ * 区间外也拒（返回点名区间的 reason）：手工 `UPDATE` 成 `5` 的那种行宁可**回落**，
+ * 也不要「会话 5 秒就过期」这种查半天的现象（口径照 `upload-settings.js#parseDbMaxFileBytes`：
+ * 区间外 = 不可用 = 回落）。
+ */
+export function parseSessionTtlSeconds(raw) {
+  let text;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw)) return { ok: false, reason: 'not_a_ttl_seconds' };
+    text = String(raw);
+  } else if (typeof raw === 'string') {
+    text = raw;
+  } else {
+    return { ok: false, reason: 'not_a_ttl_seconds' }; // 布尔 / null / 对象 / 数组
+  }
+  if (!/^[0-9]+$/.test(text)) return { ok: false, reason: 'not_a_ttl_seconds' };
+  const value = Number(text); // 上面已经只放纯数字进来 ⇒ 这里只是搬运
+  if (!Number.isSafeInteger(value)) return { ok: false, reason: 'not_a_ttl_seconds' };
+  if (value < SESSION_TTL_MIN_SECONDS || value > SESSION_TTL_MAX_SECONDS) {
+    return { ok: false, reason: 'ttl_out_of_range' };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * 写侧校验：只收 `number` 类型的安全整数（`'86400'` 这种**字符串**照样拒 —— JSON 标量闸
+ * 放得过字符串，真值闸必须拦下，否则界面里填一个带引号的值就静默换了一档）。
+ * 合格 ⇒ `true`；不合格 ⇒ 返回点名的原因字符串（上层 `fail()` 负麦 `details.field='value'`）。
+ */
+export function validateSessionTtlSeconds(value) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    return `必须是 ${SESSION_TTL_MIN_SECONDS}–${SESSION_TTL_MAX_SECONDS} 的整数秒（不接受字符串、小数、布尔）`;
+  }
+  if (value < SESSION_TTL_MIN_SECONDS || value > SESSION_TTL_MAX_SECONDS) {
+    return `必须在 ${SESSION_TTL_MIN_SECONDS}–${SESSION_TTL_MAX_SECONDS} 秒之间（1 分钟 ~ 30 天）`;
+  }
+  return true;
+}
+
+export const RUNTIME_SETTING_REGISTRY = Object.freeze({
+  [SESSION_TTL_KEY]: Object.freeze({
+    key: SESSION_TTL_KEY,
+    label: '登录会话有效期（秒）',
+    configPath: 'sessionTtlSeconds',
+    envVar: 'SESSION_TTL_SECONDS',
+    defaultValue: SESSION_TTL_DEFAULT_SECONDS,
+    applyMode: 'hot',
+    parse: parseSessionTtlSeconds,
+    validate: validateSessionTtlSeconds,
+  }),
+});
 
 /** 校验/状态类错误：`httpStatus` + `code` + `details.field`（HTTP 层按此映射 400）。 */
 export class RuntimeSettingsError extends Error {
@@ -485,6 +568,11 @@ export async function saveRuntimeSetting({
         { httpStatus: 500 });
     }
     await client.query('COMMIT');
+    // ⑤ **写完就失效热读缓存**（M-1 点名的就是这一行）。它在 `COMMIT` **之后**：事务 rolled back 时
+    //    库里仍是旧值，先失效只会让下一次读再打一次 DB（无害），但会短暂把「写失败」说成
+    //    「新值已生效」。查表而不是 `if (key === 'session.ttl_seconds')`：登记表在
+    //    `HOT_READ_INVALIDATORS`，P3 加热读旋钮只改那一处。
+    HOT_READ_INVALIDATORS.get(key)?.();
     logger?.debug?.(`[runtime-settings] ${key} 已写入（actor=${String(actorId)}）`);
     return {
       key: row.key,
@@ -501,4 +589,250 @@ export async function saveRuntimeSetting({
   } finally {
     client.release();
   }
+}
+
+// ---------------------------------------------------------------------------
+// 热读（P2a 第一格：`session.ttl_seconds`）
+// ---------------------------------------------------------------------------
+
+/**
+ * 热读缓存的存活时间（毫秒）。**5 秒是口径，不是性能参数**：
+ * 它定义的是「管理台改了 TTL 之后，最坏多久全部进程都看到新值」这个上界。
+ * 不做成 0（每请求现读）是刻意的：`/api/me` 是每个登录用户每个页面加载都要打的一次，
+ * 让一次纯配置读挂在那条路径上 = 让 `runtime_settings` 成为登录面的依赖（#520 那一单的病根）。
+ */
+export const SESSION_TTL_CACHE_TTL_MS = 5000;
+
+/**
+ * 单格模块级缓存（形状照 `llm.js` 的 `dataPlaneNameCache`，连**代际号**一起照）：
+ * `{ pool, at, resolved }`。键到 pool 是刻意的：测试与多池场景下不许 A 池的读数喂给 B 池。
+ */
+const sessionTtlCache = { pool: null, at: 0, resolved: null };
+
+/**
+ * 缓存代际号，只在 `invalidateSessionTtlCache()` 里自增。为什么必须有（`llm.js` 那一单已经付过账）：
+ * 本函数会 `await` 一次 DB 读，await 期间可能有人保存并失效了缓存；等这趟回来，**旧快照**会被
+ * 无条件写回缓存 ⇒ 「失效」被这趟在飞的读撤销。读侧在 await **之前**记下代际号，写回时只有
+ * 代际没变才落盘；变了就只把结果给当前调用方（它拿到的仍是它自己那趟的真实读数）。
+ */
+let sessionTtlCacheGeneration = 0;
+
+/**
+ * 丢弃 TTL 缓存。**只在写路径调用**（`saveRuntimeSetting` 的 `COMMIT` 之后）。
+ *
+ * ⚠ 失效只覆盖**本进程**：多副本时别的进程最坏还要吃 5 秒旧值（ TTL 到点自己恢复）。
+ *   所以口径是「下一次读、最多 5 秒内生效」，**不是**强一致，也不是「每个请求都现读 DB」。
+ */
+export function invalidateSessionTtlCache() {
+  sessionTtlCacheGeneration += 1;
+  sessionTtlCache.pool = null;
+  sessionTtlCache.at = 0;
+  sessionTtlCache.resolved = null;
+}
+
+/**
+ * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。P2a 只有一格；P3 加第二格热读旋钮时在这里
+ * 多登记一行，**不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
+ */
+export const HOT_READ_INVALIDATORS = new Map([[SESSION_TTL_KEY, invalidateSessionTtlCache]]);
+
+/** env 那一档的值：`config[configPath]`（`loadConfig` 已算成 `env > 字面默认`）⇒ 没有则 registry 默认。 */
+function envTierValue(entry, config) {
+  const tier = getPath(config, entry?.configPath ?? '');
+  return tier === undefined ? entry?.defaultValue : tier;
+}
+
+/**
+ * env 那一档的**来源**（`'env' | 'default'`），给管理台如实显示「当前生效值从哪来」。
+ * 优先看 `config[<configPath>Source]`（#485 为 `FILE_UPLOAD_MAX_BYTES` 立的那格：判据是
+ * 「env 里有没有显式写这个键」，而不是「它是否等于默认值」——显式写了恰好等于默认值，来源是 env）。
+ * 没有这个标注字段（P3 的新条目可能没有）⇒ 退回 P1 的口径：`config` 里有值就算 env，没有算 default。
+ */
+function envTierSource(entry, config) {
+  const flagPath = `${entry?.configPath ?? ''}Source`;
+  if (config && Object.hasOwn(config, flagPath)) {
+    return config[flagPath] === 'env' ? 'env' : 'default';
+  }
+  return getPath(config, entry?.configPath) === undefined ? 'default' : 'env';
+}
+
+/**
+ * 会话 TTL 的**热读**入口（`http.js` 的建会话/续期路径调它）。
+ *
+ * 口径与 `readRuntimeSettings` 逐字相同（DB 有效值 > env > registry 默认，读侧永不抛），
+ * 差别只有两件：① 结果进 5s 缓存；② 只回一个数（调用方是热路径，不关心回落理由）。
+ *
+ * ⚠ 注释里别写成「每请求现读 DB」：真实形状是**最多 5 秒一次**（同池内命中缓存不发 SQL）。
+ *   多副本时最坏 5 秒内各副本读到的值可以不同（本进程保存会立刻失效，别的进程靠 TTL 到点）。
+ *
+ * @param {object} opts `{ pool, config, now?, log?, env?, registry?, ttlMs?, timeoutMs? }`
+ *   `now` / `ttlMs` 可注入 ⇒ 缓存的两端（命中 / 过期）能在假库里判定，不用真等 5 秒。
+ * @returns {Promise<number>} 生效的 TTL 秒数；三档都给不出值 ⇒ `SESSION_TTL_DEFAULT_SECONDS`
+ *   （绝不回 `undefined`：调用方把它交给 `createSession`，`undefined` 会变成「库里没有 TTL」）
+ */
+export async function readSessionTtlSeconds({
+  pool, config, now = Date.now, log = console, env = process.env,
+  registry = RUNTIME_SETTING_REGISTRY, ttlMs = SESSION_TTL_CACHE_TTL_MS, timeoutMs,
+} = {}) {
+  const entry = registry?.[SESSION_TTL_KEY] ?? RUNTIME_SETTING_REGISTRY[SESSION_TTL_KEY];
+  const fallback = () => {
+    const value = envTierValue(entry, config);
+    return value === undefined ? SESSION_TTL_DEFAULT_SECONDS : value;
+  };
+  const at = now();
+  if (ttlMs > 0 && sessionTtlCache.resolved !== null
+    && sessionTtlCache.pool === pool && at - sessionTtlCache.at <= ttlMs) {
+    return sessionTtlCache.resolved;
+  }
+  const generationAtStart = sessionTtlCacheGeneration;
+  let value;
+  try {
+    // 复用整表那一次读（同一份 SQL、同一份超时、同一份永不抛口径）——不另开一条 per-key 的 SELECT。
+    const { values } = await readRuntimeSettings({ pool, registry, timeoutMs, env, log });
+    const dbValue = values?.[SESSION_TTL_KEY];
+    value = Number.isSafeInteger(dbValue) ? dbValue : fallback();
+  } catch (err) {
+    // 双保险：`readRuntimeSettings` 自己永不抛，但它上面还套着 registry 注入这条缝
+    //（假库/假 registry 传进来就是这里的形状）⇒ 热路径一行都不许抛（抛了就是 `/api/me` 500）。
+    log?.debug?.(`[runtime-settings] readSessionTtlSeconds 兜底 env/默认（${err?.message ?? err}）`);
+    value = fallback();
+  }
+  if (generationAtStart === sessionTtlCacheGeneration) {
+    sessionTtlCache.pool = pool;
+    sessionTtlCache.at = at;
+    sessionTtlCache.resolved = value;
+  }
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// 管理台读/写（`GET /api/admin/runtime-settings`、`PUT /api/admin/runtime-settings/:key`）
+// ---------------------------------------------------------------------------
+
+/**
+ * 管理台专用的一条读：比读侧那条多取 `updated_at` / `updated_by`。
+ *
+ * 为什么不复用上面那条 `SELECT_SQL`：它只有 `key, value`，而管理台要能说「谁在什么时候改的」
+ * （#659 那套「一行配置要能说出自己从哪来、被谁改过」的口径）。改它就得动 P1 已审计通过的
+ * 读侧 SQL 与它的判据（RS-11 直接钉那条语句的形状），而这条读只在管理台一次点击里发生
+ * ⇒ 宁可多一条语句，也不在热路径上多带两个列。**共用的是超时、`parse`、永不抛口径**，
+ * 只有列清单不同。
+ */
+const SELECT_ADMIN_SQL = 'SELECT key, value, updated_at, updated_by FROM runtime_settings ORDER BY key';
+
+/** `Date` ⇒ ISO 字符串（与其它 DTO 的时间字段同形状；拿不到就 `null`，不发明值）。 */
+function toIso(value) {
+  if (value instanceof Date) return value.toISOString();
+  return typeof value === 'string' && value ? value : null;
+}
+
+/** 一条登记项 ⇒ 响应 DTO（`source` 三档 `db | env | default`，`reason` 只在回落时有点名理由）。 */
+function toSettingItem(entry, row, config, fallbackReason = null) {
+  const raw = row?.value;
+  let parsed = { ok: false, reason: 'no_row' };
+  if (row) {
+    try {
+      parsed = entry?.parse ? entry.parse(raw) : { ok: false, reason: 'no_parse' };
+    } catch (err) {
+      parsed = { ok: false, reason: `parse_threw:${err?.message ?? err}` };
+    }
+  }
+  const base = {
+    key: entry.key,
+    label: entry.label ?? entry.key,
+    applyMode: entry.applyMode === 'hot' ? 'hot' : 'restart',
+    updatedAt: row ? toIso(row.updated_at) : null,
+    updatedBy: row?.updated_by ?? null,
+  };
+  if (parsed?.ok) {
+    return { ...base, value: parsed.value, source: 'db', reason: null };
+  }
+  // 回落：值来自 env 那一档（或 registry 默认），`reason` 说清为什么不是 db。
+  // `row` 存在但值非法 ⇒ 保留库里那行的 updated_at/by（它们是真发生过的事），只是值不用它。
+  return {
+    ...base,
+    value: envTierValue(entry, config),
+    source: envTierSource(entry, config),
+    reason: row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row'),
+  };
+}
+
+/**
+ * `GET /api/admin/runtime-settings` 的全部内容：**永不抛**（口径 1）。
+ *
+ * 表不存在 / DB 挂了 / 读超时 ⇒ 仍然 200，每一项的 `source` 落在 `env`/`default` 上并带
+ * `reason`（`read_failed` / `read_timeout` / `no_row` / `not_a_ttl_seconds` / `ttl_out_of_range`）。
+ * 「管理页打不开」不是配置面坏了该有的后果 —— 打不开就看不到当前用的是哪一档，正是要看的时候。
+ *
+ * @returns {Promise<{items:Array<object>}>} 顺序 = registry 的声明顺序（稳定，界面不跳）
+ */
+export async function listRuntimeSettingsAdmin({
+  pool, config, registry = RUNTIME_SETTING_REGISTRY, timeoutMs, env = process.env, log = console,
+} = {}) {
+  const keys = Object.keys(registry);
+  const entries = keys.map((key) => registry[key]).filter((entry) => entry?.configPath);
+  if (entries.length === 0) return { items: [] };
+
+  let fallbackReason = 'no_pool';
+  let rowByKey = new Map();
+  if (pool && typeof pool.query === 'function') {
+    // 读到东西了 ⇒ 回落的理由是「库里没这一行 / 这一行的值不可用」（`toSettingItem` 里逐 key 定），
+    // 不再是「没有池子」。两个理由必须分开：一个是「没配」，一个是「读不到」。
+    fallbackReason = 'no_row';
+    const budget = Number.isSafeInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs
+      : readTimeoutMs({ env, log });
+    let result;
+    try {
+      result = await withReadTimeout(pool.query(SELECT_ADMIN_SQL), budget);
+    } catch (err) {
+      fallbackReason = 'read_failed';
+      const detail = [err?.code, err?.message].filter(Boolean).join(' ') || '未知错误';
+      // 管理页读失败要 warn（有人在屏幕前等答案，不像启动路径那样只能靠 debug）。
+      log?.warn?.(`[runtime-settings] 管理台读 runtime_settings 失败（${detail}）`
+        + ` ⇒ 各项回落 env/默认并如实标 source（响应仍是 200）`);
+    }
+    if (result === READ_TIMEOUT) {
+      fallbackReason = 'read_timeout';
+      log?.debug?.(`[runtime-settings] 管理台读 runtime_settings 超过 ${budget}ms 未返回`
+        + ' ⇒ 各项回落 env/默认并如实标 source');
+    } else if (result && Array.isArray(result.rows)) {
+      for (const row of result.rows) {
+        if (row && typeof row.key === 'string') rowByKey.set(row.key, row);
+      }
+    }
+  } else {
+    log?.warn?.('[runtime-settings] 管理台读没有可用的 pool ⇒ 各项回落 env/默认并如实标 source');
+  }
+  return { items: entries.map((entry) => toSettingItem(entry, rowByKey.get(entry.key), config, fallbackReason)) };
+}
+
+/** 保存后的 DTO：值/时间/人**只来自 `RETURNING`**（口径 4），`label`/`applyMode` 是 registry 的静态元数据。 */
+function toSavedItem(entry, saved) {
+  return {
+    key: saved.key,
+    label: entry?.label ?? saved.key,
+    value: saved.value,
+    source: 'db',
+    reason: null,
+    applyMode: entry?.applyMode === 'hot' ? 'hot' : 'restart',
+    updatedAt: saved.updatedAt ?? null,
+    updatedBy: saved.updatedBy ?? null,
+  };
+}
+
+/**
+ * `PUT /api/admin/runtime-settings/:key` 的转发器（形状照 `platform-prompts.js#adminUpdatePrompt`：
+ * **形状闸只有一份，全在这里，http 只是匹配 + 鉴权 + 转发**）。
+ *
+ * 返回 `{ item, previousValue }`：`item` 是给前端的 DTO，`previousValue` 只进 debug/日志，
+ * 响应体里**刻意没有它**（前端不显示，而多一个字段就是多一个要维护的形状；库里与审计里都有）。
+ *
+ * 审计已由 `saveRuntimeSetting` 在同一个事务里写好 ⇒ **调用方不得再补 `auth.audit`**。
+ */
+export async function updateRuntimeSettingAdmin({
+  pool, actorId = null, key, value, registry = RUNTIME_SETTING_REGISTRY, log = console,
+} = {}) {
+  const saved = await saveRuntimeSetting({ pool, actorId, key, value, registry, log });
+  const entry = Object.hasOwn(registry, saved.key ?? key) ? registry[saved.key ?? key] : null;
+  return { item: toSavedItem(entry, saved), previousValue: saved.previousValue };
 }

@@ -20,12 +20,16 @@ function nonNegativeIntEnv(env, key, fallback) {
 }
 
 /**
- * 「这个大小类 env 旋钮当前生效的值是从哪来的」（issue #485 片 A，只用于 `FILE_UPLOAD_MAX_BYTES`）。
+ * 「这个大小类 env 旋钮当前生效的值是从哪来的」（issue #485 片 A 立的那格）。
  * 返回 `'env'` 仅当：env 里**显式写了**这个键、非空串、且它能过 `intEnv` 的采纳条件（有限正数）。
  * 否则 `'default'`。为什么不能只看「键在不在」：`intEnv` 对 `0` / `'abc'` 会回落 fallback，
  * 那时告诉运维「现在是 env 的值」就是指着一个不生效的数。下面的谓词与 `intEnv` 逐字同形（两处必须同口径）。
+ *
+ * 名字里没有 `Upload` 是因为它现在服务**两个**旋钮：`FILE_UPLOAD_MAX_BYTES`（#485）与
+ * `SESSION_TTL_SECONDS`（#677 P2a，管理台 `GET /api/admin/runtime-settings` 要能说「这一档从哪来」）。
+ * 新旋钮要报真实来源就接这里，**不要**拿「值等不等于默认值」当判据。
  */
-function envUploadSource(env, key) {
+function envValueSource(env, key) {
   const raw = env[key];
   if (raw === undefined || raw === null || String(raw).trim() === '') return 'default';
   const v = Number(raw);
@@ -244,6 +248,13 @@ export function loadConfig(env = process.env) {
     cookieProfile,
     cookie: cookieSettings(cookieProfile, sessionTtlSeconds),
     sessionTtlSeconds,
+    // #677 P2a：上面那个值的**来源**（`source: db | env | default` 里后两档的唯一区分手段）。
+    // 判据与 `fileUploadMaxBytesSource` 逐字同形：看「env 里有没有显式写这个键并且能被 `intEnv` 采纳」，
+    // 不是看它等不等于默认值。**为什么非要有这一格**：`sessionTtlSeconds` 永远有值（没给就是默认 7 天），
+    // 所「它在不在 config 里」区分不出 env 与默认 ⇒ 管理台会把「压根没配」报成「env 配的」。
+    // ⚠ `config.cookie.maxAge` 仍是这里算出的副本：`runtime_settings` 改了它不会动，
+    //   所以签 cookie 的地方必须用刚读到的生效 TTL 覆盖 `maxAge`（口径见 `http.js` 的四处登录/续期点）。
+    sessionTtlSecondsSource: envValueSource(env, 'SESSION_TTL_SECONDS'),
     // 两步登录（portal.md §2.2）：待决令牌短期、单次消费
     pendingTokenTtlSeconds: intEnv(env, 'PENDING_TOKEN_TTL_SECONDS', 120),
     // 邮件通道（issue #449，portal.md §2.3a/§2.3b + env.md「邮件通道（MAIL_*）」）。
@@ -303,7 +314,7 @@ export function loadConfig(env = process.env) {
     // 上面那个值的**来源**（管理台要显示「当前生效值从哪来」）。判据是「env 里有没有显式写这个键」，
     // 不是「它是否等于 fileUploadMaxBytes」：`FILE_UPLOAD_MAX_BYTES=0` 这种**给了但非法**的值会被
     // `intEnv` 回落成默认值，此时来源必须报 `default`（报 `env` 就是在指着一个根本不生效的值）。
-    fileUploadMaxBytesSource: envUploadSource(env, 'FILE_UPLOAD_MAX_BYTES'),
+    fileUploadMaxBytesSource: envValueSource(env, 'FILE_UPLOAD_MAX_BYTES'),
     // issue #64 R1：run 终态产物（worktree bundle tar.gz）存储与上限。
     // 持久卷 bind mount（deploy-contract §2.2 ④）；上限默认 20MB，与 agentd 侧截断口径一致。
     artifactsRoot: env.ERIX_ARTIFACTS_ROOT || '/srv/erix/artifacts',

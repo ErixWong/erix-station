@@ -45,6 +45,7 @@ import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置�
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
 import * as platformPrompts from './platform-prompts.js'; // #596 片 A：管理台「提示词」面板（读 + 写）
 import * as uploadSettings from './upload-settings.js'; // #485 片 A：单文件上限进管理台（DB 优先 env，每次上传现读）
+import * as runtimeSettings from './runtime-settings.js'; // #677 P2a：会话 TTL 进管理台（DB > env > 默认，热读）
 import * as secrets from './secrets.js';   // #608：配置槽值的形态校验（只写不读）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
@@ -822,6 +823,15 @@ export function createServer({
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof runtimeSettings.RuntimeSettingsError) {
+        // #677 P2a：写侧的三类 400（`unknown_setting` / `scalar_required` / `validation_failed`）在 HTTP 边界
+        // **一律映成既有的 `validation_failed`**（零新错误码，口径同上面 `platform-prompts` 那一块）。
+        // 模块里保留那三个细粒度 code 是给非 HTTP 调用方（CLI/脚本）定位用的；给运维的真相在
+        // `details.field`（`key` 还是 `value`）与 `details.known` 里，它们原样透传。500 仍是 `internal`。
+        const code = err.httpStatus === 400 ? 'validation_failed' : err.code;
+        sendJson(res, err.httpStatus, errorBody(code, err.message, false, err.details));
+        return;
+      }
       if (err instanceof secrets.SecretError) {
         // #608：槽值面的错误（空串 / 超长 / 未声明）有自己的 code 集合，别混进 validation_failed。
         sendJson(res, err.httpStatus ?? 400, errorBody(err.code, err.message, false, err.details));
@@ -1057,12 +1067,24 @@ async function routeApi(req, res, ctx, url) {
     // 两条 401（无 cookie / 会话失效）与旧写法逐字同义，响应体不变。
     const session = await requireSession(req, ctx);
     const token = getCookie(req, config.cookie.name);
+    // #677 P2a：会话 TTL 现在是**可热改的运行时旋钮**（`runtime_settings.session.ttl_seconds`）。
+    // ⚠ 这一行**不是**「每个 `/api/me` 都发一次 DB 读」：`readSessionTtlSeconds` 带 5s 缓存，
+    //   同一进程内同池最多 5 秒一次整表读（多副本同理，最坏 5 秒内各副本读数可以不同）。
+    //   不缓存才是真 bug：那会把 `runtime_settings` 变成登录面的强依赖（#520 那一单的病根）。
+    //   口径：管理台改完 → 本进程下一次读就变（写路径会失效缓存）；别的副本最多 5 秒追上。
+    const ttlSeconds = await runtimeSettings.readSessionTtlSeconds({
+      pool, config, log: ctx.log,
+    });
     const renewed = await auth.renewSession(pool, session.session.id, {
-      ttlSeconds: config.sessionTtlSeconds,
+      ttlSeconds,
       renewIntervalMs: config.sessionRenewIntervalSeconds * 1000,
     });
     const headers = {};
-    if (renewed) headers['Set-Cookie'] = sessionCookieHeader(config.cookie, token);
+    // cookie 的 `Max-Age` 必须跟着**刚才签发会话用的那个数**：`config.cookie.maxAge` 是
+    // `loadConfig` 时算的副本（DB 改了它不会动），拿它发 cookie 就是「库里 1 小时、浏览器里 7 天」。
+    if (renewed) {
+      headers['Set-Cookie'] = sessionCookieHeader({ ...config.cookie, maxAge: ttlSeconds }, token);
+    }
     return sendJson(res, 200, { user: session.user }, headers);
   }
   // ---- #255 自助改密（首登强制改密的唯一出口，portal.md §2.6a）----
@@ -1948,6 +1970,57 @@ async function handleAdminApi(req, res, ctx, url) {
     return sendJson(res, 200, {
       ...result.prompts, materializeEnqueued: result.materializeEnqueued,
     });
+  }
+
+  // 管理台「运行时设置」（issue #677 P2a，契约 portal.md §4.21）：`GET` 读每个旋钮的生效值 + 来源，
+  // `PUT /api/admin/runtime-settings/:key` 写。与上面几块同口径：**形状闸只有一份，全在
+  // `runtime-settings.js`**，这一层只做匹配 + 鉴权（入口已 `requireAdmin`）+ 转发；
+  // **不新增错误码**（写侧三类 400 一律 `validation_failed`，`details.field` 点名是 `key` 还是 `value`）；
+  // 表不存在 / 读失败也回 `200`（回落 env/默认 + `source` 如实，见 §4.21）。
+  if (pathname === '/api/admin/runtime-settings') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await runtimeSettings.listRuntimeSettingsAdmin({
+        pool: ctx.pool, config: ctx.config, log: ctx.log,
+      }));
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  // key 的形状与 0046 的 CHECK（`^[a-z][a-z0-9_.]{2,63}$`）同形：不匹配的路径段（`../`、中文、
+  // 超长）在这里就是「没有这个路由」⇒ 404，而不是拿去库里绕一圈再报 400。
+  const adminRuntimeSettingMatch = pathname.match(/^\/api\/admin\/runtime-settings\/([a-z][a-z0-9_.]{2,63})$/);
+  if (adminRuntimeSettingMatch) {
+    if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    // 未知的 key 在**发 SQL 之前**拒（400 + `details.field='key'` + `details.known`）：未登记的 key
+    // 写进去就是一行永不生效的孤儿配置。`updateRuntimeSettingAdmin` 里还有一道同样的闸（给
+    // CLI/脚本用），两处同源（`isKnownSetting`），不是第二份真相。
+    const key = decodeURIComponent(adminRuntimeSettingMatch[1]);
+    if (!runtimeSettings.isKnownSetting(key)) {
+      throw new HttpError(400, 'validation_failed', `未知的运行时配置项：${key}`, {
+        details: { field: 'key', known: Object.keys(runtimeSettings.RUNTIME_SETTING_REGISTRY) },
+      });
+    }
+    requireJson(req);
+    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    // 体本身不是对象 ⇒ `details.field='body'`（与 prompts 那块逐字同口径）。
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      throw new HttpError(400, 'validation_failed', '请求体必须是 JSON 对象', {
+        details: { field: 'body' },
+      });
+    }
+    // 值/区间的闸全在 `runtime-settings.js`（标量闸 + registry 的 `validate`），**在发 SQL 之前**：
+    // 非法值必须零写库、零审计（判据在 `portal/test/admin-runtime-settings-api.test.js`）。
+    const result = await runtimeSettings.updateRuntimeSettingAdmin({
+      pool: ctx.pool,
+      actorId: session.user.id,
+      key,
+      value: body.value,
+      log: ctx.log,
+    });
+    // 审计**不在这里**写：`admin.runtime_settings_updated` 已经与 upsert 在**同一个事务**里
+    // （`runtime-settings.js` 的 `BEGIN` → `SELECT … FOR UPDATE` → upsert → 审计 → `COMMIT`）。
+    // 在这里补 `auth.audit` 会退回「设置已生效而审计一行没有」那个窗口，还多写一笔（口径同
+    // 上面 upload/settings 与 prompts 那两块）。保存的失效钩子也在数据层（`HOT_READ_INVALIDATORS`）。
+    return sendJson(res, 200, { item: result.item });
   }
 
   // ---- issue #595 能力市场：管理面（§7）。全部已在 handleAdminApi 入口过 `requireAdmin`。
@@ -3771,10 +3844,12 @@ async function handleLoginStep1(req, res, ctx) {
   // （偏离规格 §7.1「强制 TOTP」：NULL secret 原语义 = 第二步永远失败 = 永久锁死；
   //   现改为「未注册即跳过」，用户决策 2026-09-22，规格同步见 issue）
   if (secondFactor === 'password_direct_no_second_factor') {
+    // #677 P2a：会话 TTL 热读（口径与 `/api/me` 那一处逐字相同：DB > env > 默认，5s 缓存）。
+    const ttlSeconds = await runtimeSettings.readSessionTtlSeconds({ pool, config, log: ctx.log });
     const session = await auth.createSession(pool, result.user.id, {
       ip,
       userAgent: req.headers['user-agent'] ?? null,
-      ttlSeconds: config.sessionTtlSeconds,
+      ttlSeconds,
     });
     // #449：method 明确写出「这一层没做第二因素」（邮件通道未配置）——审计能区分「有两层」与「只有一层」。
     await auditLoginSuccess(pool, result.user, 'password_direct_no_second_factor');
@@ -3786,7 +3861,7 @@ async function handleLoginStep1(req, res, ctx) {
       password_change_required: result.mustChangePassword === true,
       user: result.user,
     }, {
-      'Set-Cookie': sessionCookieHeader(config.cookie, session.token),
+      'Set-Cookie': sessionCookieHeader({ ...config.cookie, maxAge: ttlSeconds }, session.token),
     });
   }
 
@@ -4070,10 +4145,12 @@ async function handleLoginEmailCode(req, res, ctx) {
     throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
   }
 
+  // #677 P2a：会话 TTL 热读（DB > env > 默认，5s 缓存；见 `/api/me` 那一段的完整口径）。
+  const ttlSeconds = await runtimeSettings.readSessionTtlSeconds({ pool, config, log: ctx.log });
   const session = await auth.createSession(pool, loaded.user.id, {
     ip,
     userAgent: req.headers['user-agent'] ?? null,
-    ttlSeconds: config.sessionTtlSeconds,
+    ttlSeconds,
   });
   // 审计要能区分「走的是哪条」：同一枚 pending 可以是 `second_factor_choice` 签发的（该账号有 TOTP），
   // 用户选了邮件码 = 主动走了较弱的那一条 ⇒ 记 `email_code_alt`（#449 OR 语义的可审计口径）。
@@ -4097,7 +4174,7 @@ async function handleLoginEmailCode(req, res, ctx) {
     200,
     // #255：与 §2.3（TOTP 第二步）逐字同口径——`password_change_required` 恒为布尔且必须出现。
     { password_change_required: loaded.mustChangePassword === true, user: loaded.user },
-    { 'Set-Cookie': sessionCookieHeader(config.cookie, session.token) },
+    { 'Set-Cookie': sessionCookieHeader({ ...config.cookie, maxAge: ttlSeconds }, session.token) },
   );
 }
 
@@ -4286,13 +4363,16 @@ async function handleLoginTotp(req, res, ctx) {
 
   ctx.totpLimiter.reset(accountKey);
   ctx.totpTokenLimiter.reset(tokenKey);
+  // #677 P2a：会话 TTL 热读。工单上列了三处消费点（续期 / 口令直通 / 邮件码），**TOTP 这一步是第四处**：
+  // 漏掉它的后果不是报错而是「注册了 TOTP 的人登录还是拿 env 的 TTL」，且界面上看不出来。
+  const ttlSeconds = await runtimeSettings.readSessionTtlSeconds({ pool, config, log: ctx.log });
   const session = await auth.createSession(pool, result.user.id, {
     ip,
     userAgent: req.headers['user-agent'] ?? null,
-    ttlSeconds: config.sessionTtlSeconds,
+    ttlSeconds,
   });
   await auditLoginSuccess(pool, result.user, 'totp');
-  const cookieHeader = sessionCookieHeader(config.cookie, session.token);
+  const cookieHeader = sessionCookieHeader({ ...config.cookie, maxAge: ttlSeconds }, session.token);
   // #255：与上一直通分支同口径——第二步才是本分支真正发会话的地方，受限旗标必须在这里带出去
   // （否则注册了 TOTP 的受限账号只能靠「第一个请求返 403」发现自己要改密）。
   return sendJson(res, 200, { password_change_required: result.mustChangePassword === true, user: result.user }, {
