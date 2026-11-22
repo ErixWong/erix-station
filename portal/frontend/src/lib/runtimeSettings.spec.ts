@@ -41,7 +41,9 @@ describe('runtimeSettings: 归一化是显式白名单', () => {
     expect(Object.keys(out as object).sort()).toEqual(
       ['applyMode', 'key', 'label', 'source', 'updatedAt', 'updatedBy', 'value'],
     );
-    expect(out?.extra).toBeUndefined();
+    // 断言的仍是「没点名的键不进来」；双重转型只是为了让 `vue-tsc` 能走到这一步：
+    // `RuntimeSettingItem` 既没有 `extra` 属性（直写是 TS2339），也没有索引签名（单转是 TS2352）。
+    expect((out as unknown as Record<string, unknown>).extra).toBeUndefined();
   });
 
   it('value 缺席 ⇒ null（不是 0）：「服务端没告诉我」不许显示成「当前是 0」', () => {
