@@ -1000,6 +1000,10 @@ export const useAdminStore = defineStore('admin', {
      *     响应里没有 `item` ⇒ 不回填不报成功，宁可说一句「没回数据」。
      */
     async saveRuntimeSetting(key: string, draft: string): Promise<string | null> {
+      // 已有旋钮在写 ⇒ 本次直接不做（**先判后清**：否则一次被丢弃的调用会把在写那一次的
+      // err / saved 状态擦掉）。UI 侧 `runtimeSaving !== null` 就把每行的保存按钮都禁了，所以
+      // 这条并发闸只能被直接调 store 的调用方碰到（本页把按钮禁了不等于后端禁了并发）。
+      if (this.runtimeSaving !== null) return null;
       this.runtimeSavedKey = null;
       this.runtimeSaveErr = null;
       this.runtimeSaveField = null;
@@ -1009,7 +1013,6 @@ export const useAdminStore = defineStore('admin', {
         this.runtimeSaveErr = t('admin.runtime.errNotInteger');
         return this.runtimeSaveErr;
       }
-      if (this.runtimeSaving !== null) return null; // 已有旋钮在写 ⇒ 不并发写（后端的失效钩子按 key 走）
       this.runtimeSaving = key;
       try {
         const data = await api<unknown>(runtimeSettingSavePath(key), {
