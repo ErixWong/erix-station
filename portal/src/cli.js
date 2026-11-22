@@ -31,6 +31,9 @@ import {
 import { migrateLegacyCredential } from './git-credential.js';
 // issue #643 B：本地构建自曝（`revision=unknown` ⇒ 启动日志里一条 `local-build`）。
 import { warnIfLocalBuild } from './version-info.js';
+// issue #677 P1：运行时配置覆盖层（`runtime_settings`，DB > env > 默认）。**只在 `serve` 用**——
+// 其它子命令不服务请求，接了只是给 `migrate` 那类一次性进程多一次无谓的 DB 往返。
+import { applyRuntimeOverrides } from './runtime-settings.js';
 
 function usage() {
   // eslint-disable-next-line no-console
@@ -81,51 +84,58 @@ async function serve() {
     await migratePool.end().catch(() => {});
     await bootstrapPool.end().catch(() => {});
   }
-  const server = createServer({ pool, config });
+  // issue #677 P1：**运行时配置覆盖层**（DB > env > 默认，见 ./runtime-settings.js 的六条硬口径）。
+  // 位置刻意在 `migrate()` **之后**、`createServer()` **之前**：表（迁移 0046）必须先存在，
+  // 否则每次启动都白走一次「读不到 ⇒ 回落」；而 HTTP 与下面**每一个循环**都必须拿到同一份
+  // 被覆盖过的 config——只改 `createServer` 那一处的话，覆盖层就只对 HTTP 生效，
+  // reconciler 还在用 env 那份旧值（这正是 P3 逐批迁旋钮时会踩的坑，所以本轮一次接完）。
+  // ⚠ `applyRuntimeOverrides` 自己**永不抛**（读侧口径），所以它不会把启动路径弄挂。
+  const effectiveConfig = await applyRuntimeOverrides(config, { pool, log: console });
+  const server = createServer({ pool, config: effectiveConfig });
   // 启动物化、开户、路由与容器对账循环；开户与 reconcile 独立避免慢 provision 阻塞对账。
-  const materializerLoop = startMaterializerLoop(pool, config);
-  const onboardingLoop = startOnboardingLoop(pool, config);
-  const offboardingLoop = startOffboardingLoop(pool, config);
-  const routesLoop = startRoutesLoop(pool, config);
+  const materializerLoop = startMaterializerLoop(pool, effectiveConfig);
+  const onboardingLoop = startOnboardingLoop(pool, effectiveConfig);
+  const offboardingLoop = startOffboardingLoop(pool, effectiveConfig);
+  const routesLoop = startRoutesLoop(pool, effectiveConfig);
   // issue #474 S3 一期：动态文件漂移**只读**对账（60s + 启动一次；只 warn + 审计，绝不写盘）。
-  const driftMonitor = startRouteDriftMonitor(pool, config);
+  const driftMonitor = startRouteDriftMonitor(pool, effectiveConfig);
   // issue #525 W2：宏平台评估循环（只产触发意图，不执行；水位线逐条推进；60s + 启动一次）。
   // issue #616：评估器产出的意图由 dispatcher **消费**（onIntents 接线），否则三条主功能全断且留永久 pending 行。
-  const intentDispatcher = createIntentDispatcher({ pool, config });
-  const macroEvalLoop = startMacroEvalLoop(pool, config, { onIntents: (intents) => intentDispatcher.dispatch(intents) });
+  const intentDispatcher = createIntentDispatcher({ pool, config: effectiveConfig });
+  const macroEvalLoop = startMacroEvalLoop(pool, effectiveConfig, { onIntents: (intents) => intentDispatcher.dispatch(intents) });
   // issue #646：M1 终态通知 / M9 完成审查是**终态触发**型，产生端在 `internal.finishRun`（不在评估循环里）。
-  // 用**同一个** dispatcher 消费：把 `dispatch` 经 `config.onMacroIntents` 注入——`createServer`/`finishRun`
+  // 用**同一个** dispatcher 消费：把 `dispatch` 经 `effectiveConfig.onMacroIntents` 注入——`createServer`/`finishRun`
   // 拿到的 `config` 是同一个对象引用（`cli.serve` 同步跑完这三行才 `listen`，无请求早于此），
   // 所以 finishRun 经 `setRunState(…, { config: ctx.config })` 就能拿到。⚠ **不在 internal.js 里新建 dispatcher**
   //（那会绕过本处接线、还可能重复起 sweep loop）。
-  config.onMacroIntents = (intents) => intentDispatcher.dispatch(intents);
+  effectiveConfig.onMacroIntents = (intents) => intentDispatcher.dispatch(intents);
   // issue #616 要求④：超时回收清扫单独起 loop（职责与评估不同，不合并）；pending 超阈→failed。
-  const macroSweepLoop = startPendingSweepLoop(pool, config);
-  const provisionerLoop = startProvisionerLoop(pool, config);
+  const macroSweepLoop = startPendingSweepLoop(pool, effectiveConfig);
+  const provisionerLoop = startProvisionerLoop(pool, effectiveConfig);
   // issue #650：宿主指标的保留期清理**不单开循环**，挂 reaper 已有的小时级清理槽（一小时一个事务）。
   // `ENABLED=0` 时也照清：采样停了但旧行还得按保留期缩，否则「关掉采样」反而让表永远堆在那儿。
   const reaperLoop = startReaperLoop(pool, {
-    systemMetricsRetentionDays: config.systemMetrics?.retentionDays ?? null,
+    systemMetricsRetentionDays: effectiveConfig.systemMetrics?.retentionDays ?? null,
   });
   // issue #650：宿主资源采样器（CPU/内存/磁盘/容器数）。与其余 reconciler 同形：只在 `serve` 里起、
   // 挂进 `loops` 走关停路径。`SYSTEM_METRICS_ENABLED=0` 时 `startMetricsSampler` **不建定时器**（它
   // 自己看 `config.systemMetrics.enabled`），因此那一支既不写库也不拖住退出；但句柄仍然要起，因为
   // `GET /api/admin/system/metrics` 需要一个存在的 `latest()`（它回 `null`，不是 500）。
   // 拍本身不读未注环境的真实环境：`/proc` + `statfs` + docker socket 都是容器里就有的宿主读数（issue #650 实测）。
-  const metricsSampler = startMetricsSampler({ pool, config, log: console });
+  const metricsSampler = startMetricsSampler({ pool, config: effectiveConfig, log: console });
   // `GET /api/admin/system/metrics` 的 `latest` 格要读它（口径：`latest` 与 `series` 是**同一个**采样器的
-  // 两份读数，不是两份真相）。递送方式照 #616 的 `config.onMacroIntents` 同一条通道：`ctx.config` 与这里
-  // 的 `config` 是**同一个对象引用**，而 `serve` 同步跑完这一行才 `listen` ⇒ 不可能有请求早于它。
+  // 两份读数，不是两份真相）。递送方式照 #616 的 `onMacroIntents` 同一条通道：`ctx.config` 与这里
+  // 的 `effectiveConfig` 是**同一个对象引用**，而 `serve` 同步跑完这一行才 `listen` ⇒ 不可能有请求早于它。
   // ⚠ **不在 `http.js` 里新建采样器**（那会绕过 `ENABLED=0` 与关停接线，还可能重复起 sweep）。
-  config.metricsSampler = metricsSampler;
-  server.listen(config.port, config.host, () => {
+  effectiveConfig.metricsSampler = metricsSampler;
+  server.listen(effectiveConfig.port, effectiveConfig.host, () => {
     // eslint-disable-next-line no-console
     console.log(
-      `[portal] listening on http://${config.host}:${config.port} (cookie=${config.cookie.name}, secure=${config.cookie.secure})`,
+      `[portal] listening on http://${effectiveConfig.host}:${effectiveConfig.port} (cookie=${effectiveConfig.cookie.name}, secure=${effectiveConfig.cookie.secure})`,
     );
     // eslint-disable-next-line no-console
     console.log(
-      `[portal] reconcilers started (materializer root=${config.userSpaceRoot}, traefik dynamic=${config.traefikDynamicDir}, docker=${config.dockerHost})`,
+      `[portal] reconcilers started (materializer root=${effectiveConfig.userSpaceRoot}, traefik dynamic=${effectiveConfig.traefikDynamicDir}, docker=${effectiveConfig.dockerHost})`,
     );
     // eslint-disable-next-line no-console
     console.log('[portal] onboarding loop started');
