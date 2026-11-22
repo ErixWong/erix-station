@@ -3665,6 +3665,64 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 
 ---
 
+### 4.21 管理台运行时设置（`/api/admin/runtime-settings`，issue #677 P2）
+
+**一句话**：把「只能改 env 再重建镜像」的那类平台旋钮搬进管理台。真相在 `runtime_settings`
+（迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
+六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
+
+**P2 只有第一格旋钮**（其余 22 个归 P3 逐批迁）：`session.ttl_seconds`（env `SESSION_TTL_SECONDS`，
+区间 `60..2592000` 秒，`applyMode = hot`）。
+
+#### `GET /api/admin/runtime-settings`（管理员）
+
+响应 `200`：
+
+```json
+{ "items": [
+  { "key": "session.ttl_seconds", "label": "会话有效期（秒）",
+    "value": 86400, "source": "db", "applyMode": "hot",
+    "updatedAt": "2026-11-19T02:11:04.000Z", "updatedBy": "…" } ] }
+```
+
+- `source` 三档，**如实标注这一档从哪来**：`db`（库里那行）/ `env`（环境变量）/ `default`（内置默认）。
+  页面必须显示它——只显示值的话，运维不知道「我改的这个数到底听不听」。
+- **表不存在 / 读失败也回 `200`**（回落 env/默认 + `source` 如实）。理由与 §4.15 同口径：
+  运维故障不该把管理台锁死；写侧才是严格闸。
+- `applyMode` 两档：`hot` = **下一次读就生效**（不需要重启）；`restart` = 需重启 `station-portal` 才生效。
+  这一档是**声明**，不是承诺——页面照它显示，别自己猜。
+
+#### `PUT /api/admin/runtime-settings/{key}`（管理员）
+
+请求体 `{ "value": <标量> }`（只收 JSON 标量：number / boolean / string；对象、数组、`null` 一律 400）。
+
+- `200` ⇒ `{ "item": { …同 GET 的一项… } }`。DTO **只来自 `RETURNING`**，所以「我以为是这个值」与
+  「库里现在是这个值」不会分离。
+- `400 validation_failed`，`details.field` 三档：`key`（未登记；`details.known` 列可用 key）、
+  `value`（形状/区间不过）、`body`（体不是对象）。
+- 路径段不匹配 key 形状（`^[a-z][a-z0-9_.]{2,63}$`，与迁移 `0046` 的 `CHECK` 同形）⇒ `404`
+  （「没有这个路由」，而不是拿去库里绕一圈）。
+- **写与审计在同一个事务里**（`BEGIN` → upsert → 审计 → 检查审计行数 === 1 → `COMMIT`）。
+  审计失败 ⇒ **设置一起回滚** ⇒ 「生效了但审计没写」在结构上不可表示。所以**调用方不要再补
+  `auth.audit`**（会重复记账）。
+
+#### 生效时机（这一节的全部价值）
+
+`session.ttl_seconds` 是 `hot`：登录建会话 / 会话续期时**现读**（不是启动期快照），所以
+**下一次登录或续期就用新值**，不需要重启。为了让每次请求不都打一次 DB，读侧带 **5 秒 TTL 缓存**，
+且**写路径（PUT）成功即失效**——所以「PUT 完 → 下一次登录」是立即生效的，不用等 5 秒。
+
+边界（如实写）：**多副本**部署下，其它副本最多 5 秒后才看到新值（缓存是按进程的，写失效只作用于处理
+这次 PUT 的那个进程）。要更强一致性得加跨进程失效通道，不在本片范围。
+
+#### 与 §4.15 / §4.19 的关系
+
+三块是同一类东西（「改一行不必重建镜像」的平台配置），差别只在**存储形状**与**生效时机**：
+§4.15 上传上限是单行表、每次上传现读；§4.19 提示词是单行三列、每次物化现读；本节的
+`runtime_settings` 是 key-value（P3 要一批批加旋钮，多列每批都要改 DDL，所以选 key-value）。
+
+---
+
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
 
 ### 5.1 传输语义
