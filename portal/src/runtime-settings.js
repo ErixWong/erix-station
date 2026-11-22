@@ -217,8 +217,10 @@ const SELECT_SQL = 'SELECT key, value FROM runtime_settings ORDER BY key';
  *   4. `$2::jsonb`：值由 JS `JSON.stringify(标量)` 送来，SQL 侧不猜类型（口径 3 的另一半）。
  *
  * 已知残留（说在明处）：**同一 key 的首次并发写**（库里还没有那一行）锁不到任何行 ⇒ 两条都可能
- * 把 `previous_value` 记成 `null`（生效值仍由 `ON CONFLICT` 的行锁串行化，不丢）。这一条 0046 的
- * 头注释里也记着；要收它得给 key 加 advisory lock，别拿 `FOR UPDATE` 收（见上面第二条）。
+ * 把 `previous_value` 记成 `null`（生效值仍由 `ON CONFLICT` 的行锁串行化，不丢）。0046 的头注释里
+ * 也记着同一条残留 —— ⚠ 那一段写的是旧 `prev` CTE 的形状，而**已应用的迁移按 sha256 不可改**
+ * （`deploy/migrations/README.md`：连注释都不能改）⇒ 它的措辞停在旧形状，**以这里为准**。
+ * 要收它得给 key 加 advisory lock，别拿 `FOR UPDATE` 收（见上面第二条）。
  */
 
 /** 事务第 1 条：单独一条锁定读写旧值（无旧行 ⇒ 空集，首写的 `previous_value` 就是 `null`）。 */
