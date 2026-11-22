@@ -20,6 +20,10 @@
 //   RS-11 真库：一个事务真的落库 + 审计被 trigger 抑制时设置没改 + 行锁真的拦人 + key CHECK
 //   RS-12…RS-16 第一格的解析/校验、热读三档、5s 缓存的两端、保存后失效、管理台读侧三档来源
 //   RS-17 真库：保存后热读**不等 5 秒**就是新值 + 管理台读侧报 source=db + 非法值写不进库
+//   RS-18…RS-20 **PR #701 返修 MED**：冷缓存并发只发一条 SQL（in-flight 合并）/ 那趟失败必清槽 /
+//         在飞期间保存成功也要清槽（三条各钉一条红法，见 §7 的注释）
+//   RS-21   **PR #701 返修 LOW③**：env 兜底值也必须过 registry 的 `parse`/`validate`
+//           （坏值 ⇒ 回落默认 + 点名 warn；好值照收；DB 优先级不许因为这道闸漂移）
 //
 // 隔离约定（docs/testing.md §2.1）：本地 fake pool，不碰真实 DB；不起 HTTP。
 import test from 'node:test';
@@ -922,6 +926,8 @@ async function auditCount(pool) {
 // 判据取自工单 §2①②③：解析/校验、DB 优先、回落、缓存命中、写后失效。
 // 前两格是纯函数，后面几格都用**假库 + 注入的 `now`**（不真等 5 秒，也不真起 HTTP —— HTTP 那几格
 // 在 `portal/test/admin-runtime-settings-api.test.js`，那里才能判「PUT 完下一次登录就生效」）。
+//
+// ⚠ 本节的格子彼此共享**模块级**热读缓存与 in-flight 槽 ⇒ 每段前后都 `invalidateSessionTtlCache()`。
 // ---------------------------------------------------------------------------
 
 /** 一条能同时服务「整表读」与「管理台读（带 updated_*）」的假池子；按 SQL 里有没有 updated_at 分流。 */
@@ -1189,3 +1195,269 @@ test('RS-17 真库那一腿：保存后热读**立刻**是新值 + 管理台读�
       invalidateSessionTtlCache();
     }, { log: pgSilent.log });
   });
+
+// ---------------------------------------------------------------------------
+// 7. #701 返修：热读的 in-flight 合并（MED）+ env 兜底与 DB 同一套闸（LOW③）
+//
+//   RS-18 冷缓存并发 ⇒ 只发一条 SQL（形状照 `llm.js` 的 TTL 缓存「按 client 身份分槽」）
+//   RS-19 在飞那趟**失败** ⇒ 槽必须清掉（不许把之后所有读钉在同一个已落定的 promise 上）
+//   RS-20 在飞期间 `saveRuntimeSetting` 成功 ⇒ 放行后的下一次读必须重发 SQL（失效器也清槽）
+//   RS-21 env 兜底值也过 registry 的 `parse`/`validate` ⇒ 坏值回落默认 + 点名 warn；好值照收
+// ---------------------------------------------------------------------------
+
+/**
+ * 「整表读要先等在飞闸门上」的假库（RS-18 / RS-20 要判的是**在飞期间**那个时间窗：并发第二路
+ * 必须挤进来，才知道它到底有没有复用那一趟）。继承 `FakeRuntimePool` ⇒ 事务/审计/回滚那套语义
+ * 照旧，只给整表读加一道闸，并在**进入时**取快照（在飞期间库里改了也看不见，同形于真库
+ * READ COMMITTED 下一条语句自己的快照）。
+ */
+class GatingRuntimePool extends FakeRuntimePool {
+  constructor(opts = {}) {
+    super(opts);
+    this.gate = null;               // 非 null ⇒ 下一条整表读挂在它上面（= 那一趟「在飞」）
+    this.releaseThrows = false;     // 放行时让这趟抛 ⇒ RS-19 的「在飞那趟挂了」
+  }
+
+  query(sql, params = []) {
+    const text = String(sql);
+    const isTableRead = /\bruntime_settings\b/i.test(text) && !/\bINSERT\b/i.test(text)
+      && !/\bFOR\s+UPDATE\b/i.test(text);
+    if (!isTableRead || !this.gate) return super.query(sql, params);
+    this.queryCount += 1;
+    this.sqlLog.push({ sql: text, params });
+    const merged = new Map(this.committed);
+    for (const [k, v] of (this.pending ?? new Map())) merged.set(k, v);
+    const rows = [...merged.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))
+      .map(([key, value]) => ({ key, value }));
+    const gate = this.gate;
+    return gate.then(() => {
+      if (this.releaseThrows) {
+        throw Object.assign(new Error('connection terminated unexpectedly'), { code: '08006' });
+      }
+      return { rows, rowCount: rows.length };
+    });
+  }
+}
+
+/** 可在跑测中途翻转「这条读坏不坏」的假库（RS-19 要的是**抖动 → 恢复**那一段时间形状）。 */
+function flakyPool({ rows = [] } = {}) {
+  const pool = {
+    queryCount: 0,
+    sqlLog: [],
+    rows,
+    broken: true,
+    async query(sql) {
+      pool.queryCount += 1;
+      pool.sqlLog.push(String(sql));
+      if (pool.broken) {
+        throw Object.assign(
+          new Error('relation "runtime_settings" does not exist'), { code: '42P01' });
+      }
+      const withMeta = /updated_at/.test(String(sql));
+      return {
+        rows: pool.rows.map((r) => (withMeta ? r : { key: r.key, value: r.value })),
+        rowCount: pool.rows.length,
+      };
+    },
+  };
+  return pool;
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test('RS-18 冷缓存的并发热读只发一条 SQL（MED：续期热路径不许被并发放大成 N 条读 + 各等 1.5s）',
+  async () => {
+    invalidateSessionTtlCache();
+    const CONFIG = { sessionTtlSeconds: 777, sessionTtlSecondsSource: 'env' };
+    const pool = new GatingRuntimePool({ rows: [{ key: SESSION_TTL_KEY, value: 3600 }] });
+    let release;
+    pool.gate = new Promise((resolve) => { release = () => resolve(); });
+
+    // 冷缓存（刚失效）+ 四路同时进来 = 一波登录/续期撞上同一刻的读。
+    const four = Array.from({ length: 4 }, () => readSessionTtlSeconds({
+      pool, config: CONFIG, log: silentLog,
+    }));
+    await tick();                          // 让第一路真的把 SQL 发出去（进入「在飞」）
+    assert.equal(pool.queryCount, 1,
+      `四路并发必须合并成 **1 条** SQL（实发 ${pool.queryCount} 条 = 没有 in-flight 合并）`);
+
+    // 槽是按 **pool 身份**分的：B 池不许蹭 A 池那一趟（照 `llm.js#dataPlaneNameCache` 的口径）。
+    const other = ttlPool({ rows: [{ key: SESSION_TTL_KEY, value: 900 }] });
+    assert.equal(await readSessionTtlSeconds({ pool: other, config: CONFIG, log: silentLog }), 900,
+      '另一个池子必须自己发（拿 A 池在飞那趟的结果就是跨池串读数）');
+    assert.equal(other.queryCount, 1, 'B 池那一读是真的发的');
+
+    release();
+    assert.deepEqual(await Promise.all(four), [3600, 3600, 3600, 3600],
+      '四路必须拿到同一趟的同一个值');
+    assert.equal(pool.queryCount, 1, '合并之后仍然只有一条 SQL（不许补发）');
+
+    // 合并不许把缓存弄丢：那一趟的结果照样回填 ⇒ 紧接着的读零 SQL。
+    assert.equal(await readSessionTtlSeconds({ pool, config: CONFIG, log: silentLog }), 3600);
+    assert.equal(pool.queryCount, 1, '在飞那趟必须照常回填缓存（否则每次都重新发一条）');
+    invalidateSessionTtlCache();
+  });
+
+test('RS-19 在飞那趟失败 ⇒ 清槽，之后的读重新发 SQL（不许被钉在同一个已落定的 promise 上）',
+  async () => {
+    invalidateSessionTtlCache();
+    const CONFIG = { sessionTtlSeconds: 777, sessionTtlSecondsSource: 'env' };
+    const pool = flakyPool({ rows: [{ key: SESSION_TTL_KEY, value: 3600 }] });
+    let clock = 1_000_000;
+    const read = () => readSessionTtlSeconds({
+      pool, config: CONFIG, now: () => clock, log: silentLog,
+    });
+
+    // ① 第一趟：DB 抛（表不在 = 最真实的抖动形状）⇒ 读侧照旧给回落值，**绝不抛**（口径 1）。
+    assert.equal(await read(), 777, '失败那趟也要给答案（抛了就是 /api/me 与登录一起 500）');
+    assert.equal(pool.queryCount, 1);
+
+    // ② 缓存里钉着的是失败那趟填的回落值 ⇒ 先让 TTL 到点（多副本追上就靠这一条路）。
+    pool.broken = false;                     // DB 恢复
+    clock += SESSION_TTL_CACHE_TTL_MS + 1;
+    assert.equal(await read(), 3600, '恢复后必须读到**库里**的值，不是被钉住的 777');
+    assert.equal(pool.queryCount, 2, '必须重新发 SQL（复用已落定那一趟 = 失败路径没清槽，变异 M-2）');
+
+    // ③ 在飞那趟**挂掉**时挤进来的共享者：不许抛、不许自己再发一条，并且槽也不能留下。
+    invalidateSessionTtlCache();
+    const gate = new GatingRuntimePool({ rows: [{ key: SESSION_TTL_KEY, value: 3600 }] });
+    let release;
+    gate.gate = new Promise((resolve) => { release = () => resolve(); });
+    gate.releaseThrows = true;               // 放行时那一趟抛
+    const first = readSessionTtlSeconds({
+      pool: gate, config: CONFIG, now: () => clock, log: silentLog,
+    });
+    await tick();
+    const second = readSessionTtlSeconds({
+      pool: gate, config: CONFIG, now: () => clock, log: silentLog,
+    });
+    assert.equal(gate.queryCount, 1, '第二路必须复用那一趟（共享者不许自己再发一条）');
+    release();
+    assert.equal(await first, 777, '那一趟挂了 ⇒ 发起方按回落给答案');
+    assert.equal(await second, 777, '共享者也按回落给答案（共享一个 rejected promise 不许把读弄抛）');
+    gate.gate = null;
+    clock += SESSION_TTL_CACHE_TTL_MS + 1;
+    assert.equal(await readSessionTtlSeconds({
+      pool: gate, config: CONFIG, now: () => clock, log: silentLog,
+    }), 3600, '挂掉那一趟之后必须重新发一条读，拿到真值 3600（槽被钉住就永远是 777）');
+    assert.equal(gate.queryCount, 2, `失败之后必须重发（实发 ${gate.queryCount} 条）`);
+    invalidateSessionTtlCache();
+  });
+
+test('RS-20 在飞期间保存成功 ⇒ 放行后的下一次读重发 SQL（写路径失效也要清 in-flight 槽）',
+  async () => {
+    invalidateSessionTtlCache();
+    const CONFIG = { sessionTtlSeconds: 777, sessionTtlSecondsSource: 'env' };
+    const pool = new GatingRuntimePool({ rows: [{ key: SESSION_TTL_KEY, value: 60 }] });
+    let release;
+    pool.gate = new Promise((resolve) => { release = () => resolve(); });
+
+    const inFlight = readSessionTtlSeconds({ pool, config: CONFIG, log: silentLog });
+    await tick();
+    assert.equal(pool.queryCount, 1, '第一路已经把读发出去了（它在飞）');
+
+    // 在飞期间完成一次保存（同进程写路径：COMMIT 之后调失效器）。
+    const saved = await saveRuntimeSetting({
+      pool, actorId: ACTOR, key: SESSION_TTL_KEY, value: 3600, log: silentLog,
+    });
+    assert.equal(saved.value, 3600);
+    assert.equal(pool.storedValue(SESSION_TTL_KEY), 3600, '库里真的是新值');
+    const afterSave = pool.queryCount;
+
+    // 失效之后、放行**之前**发起下一次读：那一刻槽必须已经是空的，它只能自己发一条。
+    const nextRead = readSessionTtlSeconds({ pool, config: CONFIG, log: silentLog });
+    release();
+    assert.equal(await inFlight, 60, '在飞那一趟拿的是它发起那一刻的库（不是 PUT 之后的值）');
+    assert.equal(await nextRead, 3600,
+      'PUT 完的下一次读必须是新值（拿到 60 = 复用了 PUT 之前就发起的那一趟）');
+    assert.equal(pool.queryCount, afterSave + 1,
+      `下一次读必须真的重发一条（实发 ${pool.queryCount - afterSave} 条；0 = 失效器没清槽）`);
+    invalidateSessionTtlCache();
+  });
+
+test('RS-21 env 兜底也过 registry 那套闸（LOW③：不留「DB 严格、env 宽松」两套真相）', async () => {
+  const BAD = [
+    ['低于下限', '30', 'ttl_out_of_range'],
+    ['高于上限', '2592001', 'ttl_out_of_range'],
+    ['小数', '60.5', 'not_a_ttl_seconds'],
+    ['压根不是数', 'abc', 'not_a_ttl_seconds'],
+  ];
+  for (const [label, raw, reason] of BAD) {
+    // `loadConfig` 走通用 `intEnv`（`Number()` 语义）⇒ 它照样收下 `30` / `2592001` / `60.5`。
+    // 这一格钉的正是「config 收下了，但运行时那一层**不认**」——只钉 config 是假绿。
+    const cfg = loadConfig({ COOKIE_PROFILE: 'dev-http', SESSION_TTL_SECONDS: raw });
+    const env = { SESSION_TTL_SECONDS: raw };
+    const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    invalidateSessionTtlCache();
+    const hotLog = collectingLog();
+    const hot = await readSessionTtlSeconds({
+      pool: ttlPool(), config: cfg, env, log: hotLog,   // 库里没这一行 ⇒ 落到 env 那一档
+    });
+    assert.equal(hot, SESSION_TTL_DEFAULT_SECONDS,
+      `${label}：env SESSION_TTL_SECONDS=${raw} 过不了闸 ⇒ 必须回落默认 604800（实得 ${hot}）`);
+    const named = hotLog.seen.warn.filter((m) => m.includes(SESSION_TTL_KEY)
+      && m.includes('SESSION_TTL_SECONDS'));
+    assert.equal(named.length, 1,
+      `坏 env 值必须点名 warn 一次（key + env 名），实得 ${JSON.stringify(hotLog.seen.warn)}`);
+    assert.match(named[0], new RegExp(escaped), 'warn 要带上那个坏值本身（运维要看得见它没生效）');
+    assert.match(named[0], new RegExp(reason), 'warn 要带上被拒的理由（越界与不是数是两种处理动作）');
+
+    const listLog = collectingLog();
+    const list = await listRuntimeSettingsAdmin({
+      pool: ttlPool(), config: cfg, env, log: listLog,
+    });
+    assert.equal(list.items[0].value, SESSION_TTL_DEFAULT_SECONDS,
+      `${label}：管理台报的值必须与热读用的是同一个数`);
+    assert.equal(list.items[0].source, 'default',
+      '来源必须如实报 default —— env 那个值压根没生效，报 env 就是指着不生效的数（#485 那格口径）');
+    assert.ok(listLog.seen.warn.some((m) => m.includes('SESSION_TTL_SECONDS') && m.includes(raw)),
+      `管理台那一路也要点名（实得 ${JSON.stringify(listLog.seen.warn)}）`);
+  }
+
+  // 好值：正常采用，且来源如实报 env、一条 warn 都不许有（不许把闸做成「env 一律不信」。）
+  invalidateSessionTtlCache();
+  const okEnv = { SESSION_TTL_SECONDS: '86400' };
+  const okCfg = loadConfig({ COOKIE_PROFILE: 'dev-http', SESSION_TTL_SECONDS: '86400' });
+  const okLog = collectingLog();
+  assert.equal(await readSessionTtlSeconds({
+    pool: ttlPool(), config: okCfg, env: okEnv, log: okLog,
+  }), 86400, '合法 env 值照旧采用（这一格红 = 闸被做成了「env 全不信」）');
+  const okList = await listRuntimeSettingsAdmin({
+    pool: ttlPool(), config: okCfg, env: okEnv, log: okLog,
+  });
+  assert.equal(okList.items[0].value, 86400);
+  assert.equal(okList.items[0].source, 'env', '合法值来源仍是 env（不是被误降成 default）');
+  assert.deepEqual(okLog.seen.warn, [], `合法值不许 warn（实得 ${JSON.stringify(okLog.seen.warn)}）`);
+
+  // 优先级不许因为这道闸漂移：DB 有合法行时照样用 DB 的（env 坏不坏都一样）。
+  invalidateSessionTtlCache();
+  assert.equal(await readSessionTtlSeconds({
+    pool: ttlPool({ rows: [{ key: SESSION_TTL_KEY, value: 120 }] }),
+    config: loadConfig({ COOKIE_PROFILE: 'dev-http', SESSION_TTL_SECONDS: '30' }),
+    env: { SESSION_TTL_SECONDS: '30' }, log: silentLog,
+  }), 120, 'DB > env > 默认：闸只作用在 env 那一档，不许把 DB 也压下去');
+
+  // 闸是**条目自己声明**的：条目没写 parse/validate（P3 的新旋钮形状）⇒ 原样通过，不凭空发明。
+  const NO_GATE_REGISTRY = {
+    'demo.plain': {
+      key: 'demo.plain', configPath: 'demoPlain', envVar: 'DEMO_PLAIN', defaultValue: 5,
+    },
+  };
+  const plain = await listRuntimeSettingsAdmin({
+    pool: ttlPool(), config: { demoPlain: 99 }, registry: NO_GATE_REGISTRY,
+    env: { DEMO_PLAIN: '99' }, log: silentLog,
+  });
+  assert.equal(plain.items[0].value, 99, '没声明闸的条目不许被这一层的区间裁决拦住');
+  assert.equal(plain.items[0].source, 'env');
+
+  // 启动那一路（覆盖层）必须走**同一把**闸：否则「界面说 30、启动算的是 30、热读用的是默认」。
+  invalidateSessionTtlCache();
+  const overlaid = await applyRuntimeOverrides(
+    loadConfig({ COOKIE_PROFILE: 'dev-http', SESSION_TTL_SECONDS: '30' }),
+    { pool: new FakeRuntimePool(), env: { SESSION_TTL_SECONDS: '30' }, log: silentLog },
+  );
+  assert.equal(overlaid.sessionTtlSeconds, SESSION_TTL_DEFAULT_SECONDS,
+    '覆盖层也必须把坏 env 值降回默认（两套真相的另一半就在这条路上）');
+  invalidateSessionTtlCache();
+});

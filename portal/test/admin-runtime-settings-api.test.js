@@ -1,8 +1,8 @@
 // issue #677 P2a：管理台「运行时设置」HTTP 层判据（契约 `docs/api/portal.md` §4.21）。
 //
-// 这一层只验**入口**：鉴权、状态码、DTO 形状、`details.field` 三档、以及「非法值零写库」。
-// 值的解析/区间/回落/缓存/事务原子性都在 `portal/test/runtime-settings.test.js`（RS-1..RS-17），
-// 这里**不重复**那些判据——重复一份就是第二份真相。
+// 这一层只验**入口**：鉴权、状态码、DTO 形状、`details.field` 四档（`key` / `value` / `body`）、
+// 以及「非法值零写库」。值的解析/区间/回落/缓存/事务原子性都在
+// `portal/test/runtime-settings.test.js`（RS-1..RS-21），这里**不重复**那些判据 —— 重复一份就是第二份真相。
 //
 // 隔离约定（docs/testing.md §2.1）：`FakePool`（认证/会话）+ 本地子类补 `runtime_settings`
 // 那几条 SQL，零真 HTTP 外呼、零真 DB。
@@ -156,14 +156,45 @@ const readJson = async (res) => {
 // ① 鉴权：非管理员两向都 403，且**零写库**
 // ---------------------------------------------------------------------------
 
+/**
+ * 「零写库」的**唯一量尺**（#701 返修 LOW①）：数捕获到的**所有 DML**，而不是某两个计数器。
+ *
+ * 为什么不能只盯 `runtimeUpsertCalls` / `runtimeAuditCalls`：那两个各自只在对应分支自增
+ *（一个只数 `INSERT INTO runtime_settings`，一个只数 `INSERT INTO audit_log`）⇒「403 之后其实
+ * 发了另一形写语句」（`UPDATE runtime_settings` / `DELETE …` / 写别的表）在旧判据下**绿着过**。
+ * 现在改成「凡是写就不许有」：`INSERT` / `UPDATE` / `DELETE` 一律算，鉴权自身那些 `SELECT` 不算；
+ * 只有 `idempotency_keys` 那族例外（框架层的幂等记账，不是业务写，与 TLS 那块同口径）。
+ */
+function dmlStatements(statements) {
+  return (statements ?? [])
+    .map((s) => String(typeof s === 'string' ? s : (s?.sql ?? '')))
+    .filter((sql) => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql))
+    .filter((sql) => !/\bidempotency_keys\b/i.test(sql));
+}
+
 test('RS-API-1 非管理员 GET / PUT 都 403，且 PUT 一条写语句都不发', async () => {
+  // 量尺自证（判据自己也得有牙）：旧口径看不见的那三形，新的必须抱住。
+  assert.deepEqual(dmlStatements([
+    'SELECT * FROM runtime_settings', '  SELECT 1 FROM sessions',
+    'INSERT INTO idempotency_keys (a) VALUES (1)',
+  ]), [], '鉴权的 SELECT 与幂等记账不算写');
+  assert.equal(dmlStatements([
+    'UPDATE runtime_settings SET value = $1',
+    'DELETE FROM runtime_settings',
+    'INSERT INTO whatever (a) VALUES (1)',
+  ]).length, 3, '旧判据会漏的三形（UPDATE / DELETE / 写别的表）都必须算写');
+
   const s = await startStack();
   try {
     const got = await call(s, { login: 'alice' });
     assert.equal(got.status, 403, 'FDE 读管理台运行时设置必须 403');
 
-    const put = await call(s, { method: 'PUT', key: SESSION_TTL_KEY, body: { value: 60 }, login: 'alice' });
+    const put = await call(
+      s, { method: 'PUT', key: SESSION_TTL_KEY, body: { value: 60 }, login: 'alice' });
     assert.equal(put.status, 403, 'FDE 写管理台运行时设置必须 403');
+    const writes = dmlStatements(s.pool.statements);
+    assert.equal(writes.length, 0,
+      `403 之后**任何一形写语句**都不许发（实发 ${writes.length} 条：${writes.join(' | ')}）`);
     assert.equal(s.pool.runtimeUpsertCalls, 0, '403 之后不许有任何 runtime_settings 写（鉴权在写之前）');
     assert.equal(s.pool.runtimeAuditCalls, 0, '也不许写审计');
   } finally {
@@ -261,8 +292,10 @@ test('RS-API-5 PUT 未知 key ⇒ 400 details.field=key，且零写库', async (
       Array.isArray(body.error?.details?.known) && body.error.details.known.includes(SESSION_TTL_KEY),
       'details.known 要列可用 key（前端据此提示）',
     );
-    assert.equal(s.pool.runtimeUpsertCalls, 0, '未登记的 key 不许发写语句');
-    assert.equal(s.pool.runtimeAuditCalls, 0);
+    assert.equal(dmlStatements(s.pool.statements).length, 0,
+      `未登记的 key 不许发**任何一形**写语句（实发 ${dmlStatements(s.pool.statements).join(' | ')}）`);
+    assert.equal(s.pool.runtimeUpsertCalls, 0, '未登记的 key 不许发 upsert');
+    assert.equal(s.pool.runtimeAuditCalls, 0, '也不许写审计');
   } finally {
     await s.close();
   }
@@ -284,7 +317,9 @@ test('RS-API-6 PUT 非法值（形状/区间）⇒ 400 details.field=value，且
       const json = await readJson(res);
       assert.equal(json.error?.code, 'validation_failed', `${label}: 错误码`);
       assert.equal(json.error?.details?.field, 'value', `${label}: field 必须点名 value`);
-      assert.equal(s.pool.runtimeUpsertCalls, 0, `${label}: 非法值不许发写语句`);
+      assert.equal(dmlStatements(s.pool.statements).length, 0,
+        `${label}: 非法值不许发**任何一形**写语句（实发 ${dmlStatements(s.pool.statements).join(' | ')}）`);
+      assert.equal(s.pool.runtimeUpsertCalls, 0, `${label}: 非法值不许发 upsert`);
       assert.equal(s.pool.runtimeAuditCalls, 0, `${label}: 更不许写审计`);
     } finally {
       await s.close();
@@ -301,4 +336,36 @@ test('RS-API-7 自证：SESSION_TTL_KEY 真在 registry 里，且 applyMode=hot 
   const entry = RUNTIME_SETTING_REGISTRY[SESSION_TTL_KEY];
   assert.equal(entry.applyMode, 'hot', '这一格是 hot，否则「改完立即生效」这条判据不成立');
   assert.equal(entry.envVar, 'SESSION_TTL_SECONDS', 'env 兜底名必须与 docs/env.md 一致');
+});
+
+// ---------------------------------------------------------------------------
+// ⑧ body 本身不是对象 ⇒ `details.field='body'`（#701 返修 LOW②）
+// ---------------------------------------------------------------------------
+
+test("RS-API-8 PUT 的 body 是 null / 数组 / 字符串 ⇒ 400 details.field=body，且零写库", async () => {
+  // 实现一直是对的（独立审计拿临时 HTTP 探针验过），但**没有防回归格**：形状闸只长在 `http.js`
+  // 那一处，有人把「不是对象」那一支删掉、或退化成直接取 `body.value`，旧格子一格都不会红。
+  // ⚠ 必须发**合法但不是对象**的 JSON：空体 PUT 会被 `readJsonBody` 兼平成 `{}` ⇒ 判的是
+  //   `field=value` 那一格（RS-API-6），不是这一格。
+  for (const [label, rawBody] of [['null', 'null'], ['数组', '[1,2]'], ['字符串', '"86400"']]) {
+    const s = await startStack();
+    try {
+      const res = await fetch(`${s.base}/api/admin/runtime-settings/${SESSION_TTL_KEY}`, {
+        method: 'PUT',
+        headers: { cookie: s.cookieFor('root'), 'content-type': 'application/json' },
+        body: rawBody,
+      });
+      assert.equal(res.status, 400, `${label} 当请求体必须 400（实得 ${res.status}）`);
+      const json = await readJson(res);
+      assert.equal(json.error?.code, 'validation_failed', `${label}：错误码`);
+      assert.equal(json.error?.details?.field, 'body',
+        `${label}：field 必须点名是 **body** 不对（实得 ${JSON.stringify(json.error?.details)}）`);
+      const writes = dmlStatements(s.pool.statements);
+      assert.equal(writes.length, 0, `${label}：形状都不对的请求不许留下一形写（${writes.join(' | ')}）`);
+      assert.equal(s.pool.runtimeUpsertCalls, 0, `${label}：更不许发 upsert`);
+      assert.equal(s.pool.runtimeAuditCalls, 0, `${label}：也不许写审计`);
+    } finally {
+      await s.close();
+    }
+  }
 });
