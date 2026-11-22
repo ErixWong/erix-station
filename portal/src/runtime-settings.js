@@ -173,17 +173,26 @@ const SELECT_SQL = 'SELECT key, value FROM runtime_settings ORDER BY key';
 /**
  * 保存 = **一条**语句做完三件事：读旧值 → upsert → 写审计（口径 6，形状照 0036 的 `SAVE_SQL`）。
  *
- *   1. `prev` 带 `FOR UPDATE`：READ COMMITTED 下光靠 CTE 快照，并发第二写仍可能读到
- *      「自己进来之前」的旧值 ⇒ 行锁把它推到「前一条提交之后」，`previous_value` 才是紧邻的前一值。
- *   2. `LEFT JOIN prev`：首写没有旧行可锁（`prev` 是空集）。写成内连接的话，审计那一支会
- *      跟着 `upd` 一起空掉 ⇒ 「保存成功但零审计行」，而审计与设置同生共死是这条语句的存在理由。
+ *   1. `prev` **不带 `FOR UPDATE`** —— 这一处**刻意偏离 0036**，理由是 2026-11-19 在
+ *      postgres:16.15 上实测的（同一台一次性容器，探针记录见 `portal/test/runtime-settings.test.js`
+ *      的 RS-11 与工单报告）：一条**含 data-modifying CTE** 的语句里，锁定读**看不见本语句自己改的
+ *      那一行** ⇒ 带上 `FOR UPDATE` 的 `prev` 在真库上恒为**空集**（有旧行、无旧行都是空）。
+ *      后果不是「少了个锁」而是**少了一整段**：`previous_value` 恒 `null`，
+ *      而 0036 那个形状的主查询是 `FROM upd, prev_eff`（内连接）⇒ 主 SELECT 零行
+ *      ⇒ `aud` 那一支也零行 ⇒ 「设置写进去了、审计一行没有」。去掉 `FOR UPDATE` 之后实测
+ *      `previous_value` = 真旧值、`audit_log` 恰好 1 行。
+ *      ⇒ 谁要把 `FOR UPDATE` 加回来，必须先在真库上证明它不是空集（RS-11 就是那条判据）。
+ *   2. `LEFT JOIN prev`（两处）：首写没有旧行（`prev` 天然是空集）。写成内连接的话，审计那一支
+ *      会跟着 `upd` 一起空掉 ⇒ 「保存成功但零审计行」，而审计与设置同生共死是这条语句的存在理由。
+ *      （实测：无旧行 + 内连接 = `audit_log` 0 行，见上面那组探针的 D 组。）
  *   3. `$3::jsonb`：值由 JS `JSON.stringify(标量)` 送来，SQL 侧不猜类型（口径 3 的另一半）。
  *   4. `RETURNING` 出真落库的那一行 ⇒ 响应 DTO 不信输入（口径 4）。
- *   5. 已知残留（0046 头注释里也记了）：**同一 key 的首次并发写**里两条语句都可能把
- *      `previous_value` 记成 `null`。生效值不受影响；要收它得给 key 加 advisory lock。
+ *   5. 已知残留（0046 头注释里也记了）：**同一 key 并发写**时 `prev` 取的是本语句快照，
+ *      第二写的 `previous_value` 可能是「自己进来之前」的值（写入本身由 `ON CONFLICT` 的行锁串行化，
+ *      生效值不受影响）。要收它得给 key 加 advisory lock，别拿 `FOR UPDATE` 收（见第 1 条）。
  */
 const SAVE_SQL = `WITH prev AS (
-   SELECT value FROM runtime_settings WHERE key = $2 FOR UPDATE
+   SELECT value FROM runtime_settings WHERE key = $2
  ), upd AS (
    INSERT INTO runtime_settings (key, value, updated_at, updated_by)
    VALUES ($2, $3::jsonb, now(), $1)
