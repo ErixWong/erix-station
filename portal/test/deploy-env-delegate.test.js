@@ -3467,16 +3467,9 @@ test('#587-S1-⑨ 差异分类只认**语法位置与索引事实**：路径像 
     const index = buildEnvSiteIndex(dir);
     const cls = (key, coord) => shadowGapSemantic(key, coord, { root: dir, index });
     const at = (n) => `${SI_MED_PROV}:${n}`;
-    // ① 两个**语法位置**：`Env: […]` 数组元素 / `body.Env.push(…)` 参数位 ⇒ injection
-    const inj = cls('ERIX_SI_MED_INJECT', at(SI_MED_L.envElem));
-    assert.equal(inj.kind, 'injection', `Env 数组元素位应判 injection（实际 ${inj.kind}：${inj.why}）`);
-    assert.match(inj.why, /Env\[\] 数组字面量/, '理由要点名是哪个语法位（第 3 步才知道要登记什么）');
-    const push = cls('ERIX_SI_MED_PUSH', at(SI_MED_L.pushArg));
-    assert.equal(push.kind, 'injection', `.Env.push 参数位应判 injection（实际 ${push.kind}：${push.why}）`);
-    assert.match(push.why, /Env\.push\(\) 参数位/);
-    // ② **同一个文件**里的日志模板行（`KEY=${v}` 住在 log() 里）：路径一模一样、文本形状也一模一样，
-    //    但语法位置不是注入位 ⇒ 必须不是 injection；也不是声明位 ⇒ 必须归不出来（红）。
-    //    这一行就是变异 M-1（「把语义判据换回只看路径」）的靶子。
+    // ① 变异 M-1 的靶子：**同一个文件**里的日志模板行（`KEY=${v}` 住在 `log()` 里）——路径与文本
+    //    形状都和注入位一模一样，但**语法位置**不是注入位 ⇒ 必须不是 injection；也不是声明位
+    //    ⇒ 必须归不出来（红）。先判它：变异时红得能看见病名。
     const tpl = cls('ERIX_SI_MED_LOGTPL', at(SI_MED_L.logTpl));
     assert.notEqual(tpl.kind, 'injection',
       `语义判据吃了路径 ⇒ 「文件叫 provisioner.js 就一律 injection」（MED① 的病，实际：${tpl.why}）`);
@@ -3487,6 +3480,13 @@ test('#587-S1-⑨ 差异分类只认**语法位置与索引事实**：路径像 
     // 反向自证：**形状兜底**对同一行会说 injection ⇒ 上面那格杀的不是运气，是语义判据在换答案
     assert.equal(shadowGapByShape('ERIX_SI_MED_LOGTPL', at(SI_MED_L.logTpl), dir), 'injection',
       '兜底尺对这一行应该仍然判错（否则本格的对照前提破了）');
+    // ② 两个**语法位置**：`Env: […]` 数组元素 / `body.Env.push(…)` 参数位 ⇒ injection
+    const inj = cls('ERIX_SI_MED_INJECT', at(SI_MED_L.envElem));
+    assert.equal(inj.kind, 'injection', `Env 数组元素位应判 injection（实际 ${inj.kind}：${inj.why}）`);
+    assert.match(inj.why, /Env\[\] 数组字面量/, '理由要点名是哪个语法位（第 3 步才知道要登记什么）');
+    const push = cls('ERIX_SI_MED_PUSH', at(SI_MED_L.pushArg));
+    assert.equal(push.kind, 'injection', `.Env.push 参数位应判 injection（实际 ${push.kind}：${push.why}）`);
+    assert.match(push.why, /Env\.push\(\) 参数位/);
     // ③ 声明位 + 索引里另有真读站点 ⇒ mention-only（两个事实缺一不可）
     const tbl = cls('ERIX_SI_MED_TABLE', at(SI_MED_L.tableDecl));
     assert.equal(tbl.kind, 'mention-only', `数据表声明位应判 mention-only（实际 ${tbl.kind}：${tbl.why}）`);
