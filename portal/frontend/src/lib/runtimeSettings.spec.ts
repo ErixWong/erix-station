@@ -67,6 +67,27 @@ describe('runtimeSettings: 归一化是显式白名单', () => {
   it('label 缺席时回落成 key（页面不至于空一列）', () => {
     expect(normalizeRuntimeSettingItem({ key: 'k.x' })?.label).toBe('k.x');
   });
+
+  // `hint` 是 DTO 里的**可选键**（§4.21 + `portal/src/runtime-settings.js` 的 `withHint`：
+  // registry 那一格登记了才带）。归一化必须保住「缺席」这个事实：补一个 `hint: null` / `''`
+  // 就把「后端没说」变成了「后端说了个空」，渲染层也就没法「没有就不占行」（视图 spec 那一格钉 DOM）。
+  it('hint 缺席 / 空串 / 非字符串 ⇒ 键不出现（不是 null、不是空串）；非空字符串原样保留', () => {
+    const keysOf = (raw: unknown) => Object.keys(normalizeRuntimeSettingItem(raw) ?? {}).sort();
+    const base = { key: 'k.x', label: 'L' };
+
+    // 缺席（没这个键）以及后端可能发的各档“没内容”：键一律不出现
+    for (const raw of [undefined, '', '   ', '\t\n', null, 7, 0, true, false, [], { a: 1 }]) {
+      expect(keysOf({ ...base, hint: raw }), `hint=${String(raw)}`).not.toContain('hint');
+    }
+    expect(keysOf(base)).not.toContain('hint');
+
+    // 非空字符串 ⇒ 保留且不删改空白（文案的真相在服务端，前端不重写它）
+    const kept = normalizeRuntimeSettingItem({ ...base, hint: 'x' });
+    expect(kept?.hint).toBe('x');
+    expect(keysOf({ ...base, hint: 'x' })).toEqual(
+      ['applyMode', 'hint', 'key', 'label', 'source', 'updatedAt', 'updatedBy', 'value'],
+    );
+  });
 });
 
 describe('runtimeSettings: 列表与保存响应', () => {
