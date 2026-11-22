@@ -3671,8 +3671,17 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**P2 只有第一格旋钮**（其余 22 个归 P3 逐批迁）：`session.ttl_seconds`（env `SESSION_TTL_SECONDS`，
-区间 `60..2592000` 秒，`applyMode = hot`）。
+**已迁的旋钮（两格）**（其余 21 个归 P3 逐批迁）：
+
+| key | env 兜底位 | 值域 | `applyMode` | 生效点 |
+| --- | --- | --- | --- | --- |
+| `session.ttl_seconds` | `SESSION_TTL_SECONDS` | 整数 `60..2592000` 秒 | `hot` | 登录建会话 / 续期时现读 |
+| `workspace.retention_days` | `ERIX_WORKSPACE_RETENTION_DAYS` | 整数 `0..3650` 天（**`0` 是有效值** = 不自动清理） | `hot` | offboarding 循环每一拍现读 |
+
+两格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+**上界 `3650` 是产品口径不是算术溢出**：超过 10 年的「离职保留」与「永不清理」在运维上不可区分，
+而后者已有确定表达（`0`）⇒ 上界外的值只能是把单位填错了（想写 30 天写成秒/毫秒那一族）。
+越界的 env 值被闸拦下后回落**默认 `0`**，是更保守的一档（少删目录，不会误删）。
 
 #### `GET /api/admin/runtime-settings`（管理员）
 
@@ -3688,7 +3697,8 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 - `source` 三档，**如实标注这一档从哪来**：`db`（库里那行）/ `env`（环境变量）/ `default`（内置默认）。
   页面必须显示它——只显示值的话，运维不知道「我改的这个数到底听不听」。
 - ⚠ **env 那一档也要过写侧那套闸**（`parse`/`validate`，与 DB 值调用的是同一个函数；#701 返修）：
-  `session.ttl_seconds` 的 env 值必须是**整数且落在 `60..2592000`**。`30` / `2592001` / `60.5` / `abc`
+  `session.ttl_seconds` 的 env 值必须是**整数且落在 `60..2592000`**，`workspace.retention_days` 的
+  必须是**整数且落在 `0..3650`**。`30` / `2592001` / `60.5` / `abc` / `1e3` / `4000`
   这一类过不了闸的值 ⇒ **视为「env 没给」**⇒ 回落内置默认、`source` 如实报 `default`（不是 `env`），
   并留一条**点名 key + env 名 + 坏值 + 被拒理由**的 warn；读侧仍不抛。
   为什么：`loadConfig` 的通用 `intEnv` 走 `Number()` 语义（上面那四个收了三个），只靠它就会出现
@@ -3721,6 +3731,15 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 
 边界（如实写）：**多副本**部署下，其它副本最多 5 秒后才看到新值（缓存是按进程的，写失效只作用于处理
 这次 PUT 的那个进程）。要更强一致性得加跨进程失效通道，不在本片范围。
+
+`workspace.retention_days` 也是 `hot`（#677 P3 第一批）：`startOffboardingLoop` **每一拍现读**，
+并把读到的数当显式参数递给两个消费者——`runOffboardingOnce`（写 `workspace_purge_after` 截止期）与
+`sweepOffboardedWorkspaces`（`=== 0 ⇒ 这一拍不清理`）。所以「管理台把 30 改成 0」下一拍就不再删目录，
+「把 0 改成 14」下一拍开始按 14 天清；**不需要重建容器**（这就是本批存在的全部理由）。
+两条口径要说清：① **不是每拍一条 SQL** —— 同一台 5s 缓存 + 同池在飞合并，拍频基准 5s / 空闲退避到 30s
+⇒ 最坏与拍频同量级的一条整表 SELECT（这张表只有几行）；② 读侧**永不抛** ⇒ 配置面坏了不会把销号循环
+停摆，只是退回用 env/默认那一档（默认 `0` = 不删，安全侧）。
+⚠ `0` 在 sweep 里判的是**传进来的那个数**，不是启动期快照（`config.workspaceRetentionDays` 只做缺省值）。
 
 另两条同一条路径上的口径（#701 返修补写）：
 
