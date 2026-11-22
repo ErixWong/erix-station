@@ -46,6 +46,18 @@ import {
   type PlatformPrompts,
   type PromptFieldKey,
 } from '../lib/platformPrompts';
+// issue #677 P2b：管理台「运行时设置」页（§4.21）。DTO 归一化 / 请求体构造 / 400 字段映射全在 lib
+// （纯函数可单测）；这里只负责「一次调用 = 一次请求」+ 错误透传。**不缓存**（后端读侧自己带 5s TTL
+// 缓存，这一页要看的正是「现在生效的是哪一个」，重进本页就该看到新快照）。
+import {
+  RUNTIME_SETTINGS_PATH,
+  buildRuntimeSettingPayload,
+  normalizeRuntimeSettingSaved,
+  normalizeRuntimeSettingsList,
+  replaceRuntimeSetting,
+  runtimeSettingFieldOf,
+  type RuntimeSettingItem,
+} from '../lib/runtimeSettings';
 // issue #586 管理台「关于」面板（§4.16）。DTO 归一化全在 `lib/versionSurface`（纯函数可单测），
 // 这里只负责「一次调用 = 一次请求」+ 错误透传。**前端一个字都不推算版本**：三格各自读自己的字段。
 import {
@@ -84,6 +96,21 @@ import {
 // issue #101 P3：前端自产文案（「错误：」前缀）走 i18n 单例——options store 非组件上下文，
 // useI18n() 会抛 MUST_BE_CALL_SETUP_TOP，故统一走 i18n.global.t。
 // 注意：服务端透传的 error.message（errText）不译，仅拼接前缀。
+// 400 的 `details.field` 只可能是 §4.21 点名的三档（`key`/`value`/`body`）。类型从 lib 的判据函数
+// 反推，不在这里重抄一遍联合字面量（重抄就是第二份真相，lib 加一档这里就会静默漏一档）。
+type RuntimeSettingField = NonNullable<ReturnType<typeof runtimeSettingFieldOf>>;
+
+/**
+ * `PUT /api/admin/runtime-settings/{key}`（§4.21）的路径。
+ *
+ * ⚠ lib 里没有这个函数（`runtimeSettings.ts` 已验收、不许改），而这个拼接只有本文件的写侧要用
+ * ⇒ 就地一个 3 行小函数，不为它单开一个模块。`encodeURIComponent` 是必需而非装饰：key 的形状是
+ * `^[a-z][a-z0-9_.]{2,63}$`（迁移 0046 的 CHECK），今天不含需要转义的字符，但一旦 registry 放进
+ * 含 `%`/`?`/`#` 的 key，不编码就会把一条设置写成两条路由。
+ */
+const runtimeSettingSavePath = (key: string): string =>
+  `${RUNTIME_SETTINGS_PATH}/${encodeURIComponent(key)}`;
+
 const t = i18n.global.t;
 
 export interface LlmModel {
@@ -346,6 +373,20 @@ export const useAdminStore = defineStore('admin', {
     promptSavedField: null as PromptFieldKey | null,
     // `materializeEnqueued` 的语义结论（`0` 与「没给」都是要显式说出口的事，不许静默）。
     promptNotice: null as MaterializeNotice | null,
+    // issue #677 P2b：管理台「运行时设置」列表（§4.21）。与 upload 那段同构，但**是列表**（P3 会往
+    // registry 里一格一格加旋钮），所以「正在保存」「刚保存」「被标红」三件事都必须带 **key**，
+    // 布尔位做不到这件事（一个布尔位 = 一整页的按钮同时转圈）。
+    runtimeSettings: [] as RuntimeSettingItem[],
+    runtimeSettingsLoaded: false, // 「还没请求」与「服务端说 registry 里没东西」是两件事
+    runtimeSettingsLoading: false,
+    runtimeSettingsErr: null as string | null,
+    // **正在保存的 key**（不是布尔）：每行一颗保存按钮，禁用与转圈都只该落在被按下的那一行。
+    runtimeSaving: null as string | null,
+    runtimeSaveErr: null as string | null,
+    // 400 的 `details.field`（§4.21：`key`/`value`/`body`）；null = 认不出是哪一处，退化成整页一条。
+    runtimeSaveField: null as RuntimeSettingField | null,
+    // 最近一次**成功**保存的 key（页面据此只在那一行显示「已保存」）。
+    runtimeSavedKey: null as string | null,
     // issue #456 M2：管理台证书页（§4.13）。**私钥永不进这里**：状态只有 DTO 白名单
     // （`lib/tlsSettings.normalizeTlsStatus` / `normalizeTlsInspect`），连字段名字面量都不在本文件里。
     tlsStatus: null as TlsStatus | null,
@@ -920,6 +961,80 @@ export const useAdminStore = defineStore('admin', {
         return this.uploadSaveErr;
       } finally {
         this.uploadSaving = false;
+      }
+    },
+
+    /**
+     * issue #677 P2b：`GET /api/admin/runtime-settings`（§4.21）——每个旋钮的生效值 + 来源 + 生效方式。
+     *
+     * 服务端在**表不存在 / 读失败 / 读超时**时也回 `200`（回落 env/默认且 `source` 如实），所以这一页
+     * 不需要处理「配置面挂了」那一条错路；一次调用 = 一次请求（不缓存，与后端同口径）。
+     */
+    async loadRuntimeSettings(): Promise<string | null> {
+      this.runtimeSettingsLoading = true;
+      this.runtimeSettingsErr = null;
+      try {
+        const data = await api<unknown>(RUNTIME_SETTINGS_PATH);
+        this.runtimeSettings = normalizeRuntimeSettingsList(data);
+        this.runtimeSettingsLoaded = true;
+        return null;
+      } catch (e) {
+        // 读失败就是读失败：不把「拿不到列表」当成「registry 是空的」（空态与错误态是两句话）。
+        this.runtimeSettings = [];
+        this.runtimeSettingsErr = t('admin.errorPrefix') + this.errText(e);
+        return this.runtimeSettingsErr;
+      } finally {
+        this.runtimeSettingsLoading = false;
+      }
+    },
+
+    /**
+     * issue #677 P2b：`PUT /api/admin/runtime-settings/{key}`（§4.21）——只改一个旋钮。
+     *
+     * 三条口径：
+     *   · **解析不出整数就一个请求都不发**（`buildRuntimeSettingPayload` 返回 `null`）：发一个
+     *     `null` 只是把「用户还没填」伪装成「用户填了个非法值」，还会洗一把服务端的写路。
+     *     此时 `runtimeSaveField` 固定是 `'value'`（本层自己判的，不装成服务端回的）。
+     *   · 解析得出整数就**照发**，越界不提前拦（服务端才是闸，§4.21 与 §4.15 / §4.19 同口径）。
+     *   · 成功 ⇒ 用**响应 DTO** 回填那一行（它出自 `RETURNING` ⇒ 是真落库的值，不是回显输入）；
+     *     响应里没有 `item` ⇒ 不回填不报成功，宁可说一句「没回数据」。
+     */
+    async saveRuntimeSetting(key: string, draft: string): Promise<string | null> {
+      // 已有旋钮在写 ⇒ 本次直接不做（**先判后清**：否则一次被丢弃的调用会把在写那一次的
+      // err / saved 状态擦掉）。UI 侧 `runtimeSaving !== null` 就把每行的保存按钮都禁了，所以
+      // 这条并发闸只能被直接调 store 的调用方碰到（本页把按钮禁了不等于后端禁了并发）。
+      if (this.runtimeSaving !== null) return null;
+      this.runtimeSavedKey = null;
+      this.runtimeSaveErr = null;
+      this.runtimeSaveField = null;
+      const payload = buildRuntimeSettingPayload(draft);
+      if (payload === null) {
+        this.runtimeSaveField = 'value';
+        this.runtimeSaveErr = t('admin.runtime.errNotInteger');
+        return this.runtimeSaveErr;
+      }
+      this.runtimeSaving = key;
+      try {
+        const data = await api<unknown>(runtimeSettingSavePath(key), {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        });
+        const saved = normalizeRuntimeSettingSaved(data);
+        if (saved === null) {
+          this.runtimeSaveField = 'body';
+          this.runtimeSaveErr = t('admin.runtime.errNoItem');
+          return this.runtimeSaveErr;
+        }
+        this.runtimeSettings = replaceRuntimeSetting(this.runtimeSettings, saved);
+        this.runtimeSettingsLoaded = true;
+        this.runtimeSavedKey = saved.key;
+        return null;
+      } catch (e) {
+        this.runtimeSaveField = runtimeSettingFieldOf(e);
+        this.runtimeSaveErr = t('admin.errorPrefix') + this.errText(e);
+        return this.runtimeSaveErr;
+      } finally {
+        this.runtimeSaving = null;
       }
     },
 

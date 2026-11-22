@@ -1,0 +1,428 @@
+// issue #677 P2b：管理台「运行时设置」列表页的单测（`AdminRuntimeSettingsView.vue`，契约
+// `docs/api/portal.md` §4.21）。
+//
+// 装配照 `AdminUploadView.spec.ts` / `AdminPromptsView.spec.ts`：直接挂视图（本页不依赖路由）+
+// 真实 i18n 单例 + pinia + 按 URL/方法分派的 fetch 桩（判据要读**请求体**，所以桩必须记下 body）。
+// ⚠ 断言一律走 DOM / 请求桩，**不用 `w.emitted()`**（本机 `NODE_ENV=production` 下恒空 ⇒ 假红）。
+//
+// 用例名 R1–R8 就是工单 §2⑤ 的判据编号（R1–R5 是必做的那五格）：
+//   R1 挂载只发 1 次 GET（懒挂载：进管理台不请求，切到这一 tab 才恰好 1 次）
+//   R2 列表按 DTO 渲染两行：label / key / 值 / 来源 / 生效方式 / 更新时间一起出
+//   R3 `value: null` 显示「未知」，**不是 0**（#390-A：键缺席不是 0）
+//   R4 输入 7200 点保存 ⇒ `PUT /api/admin/runtime-settings/{key}`，body 是 `{"value":7200}`
+//   R5 服务端 400 + `details.field='value'` ⇒ **只有那一行**标红并显示错误文案
+//   R6 越界照发（服务端才是闸）+ 解析不出整数 ⇒ 零请求
+//   R7 空列表 / GET 失败 / 未加载 三态各自独立（错误不冒充空态，也不白屏）
+//   R8 保存成功那一行显示「已保存」并回填服务端回读的生效值（不是用户敲的那一串）
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
+import { createPinia, setActivePinia } from 'pinia';
+import AdminRuntimeSettingsView from './AdminRuntimeSettingsView.vue';
+import { i18n, setLocale } from '../i18n';
+import { useAdminStore } from '../stores/admin';
+
+const GET_PATH = '/api/admin/runtime-settings';
+const TTL_KEY = 'session.ttl_seconds';
+const TTL_PATH = `${GET_PATH}/${TTL_KEY}`;
+const SECOND_KEY = 'runner.max_concurrent_runs';
+
+/** 后端 P2a 钉住的 DTO 形状（§4.21）：值 + 来源 + 生效方式 + 更新时间，一格一条。 */
+const DTO = {
+  items: [
+    {
+      key: TTL_KEY, label: '会话有效期（秒）', value: 86400,
+      source: 'db', applyMode: 'hot',
+      updatedAt: '2026-11-19T02:11:04.000Z', updatedBy: '3f2c0000-0000-4000-8000-0000000000a1',
+    },
+    {
+      key: SECOND_KEY, label: '单工位并发 run 上限', value: 4,
+      source: 'env', applyMode: 'restart',
+      updatedAt: null, updatedBy: null,
+    },
+  ],
+};
+
+interface Recorded { url: string; method: string; body: unknown }
+type Handler = (call: Recorded) => Response | undefined | Promise<Response | undefined>;
+
+function stubFetch(handler: Handler): Recorded[] {
+  const calls: Recorded[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const raw = typeof init?.body === 'string' ? init.body : null;
+    const call: Recorded = { url, method, body: raw === null ? null : JSON.parse(raw) };
+    calls.push(call);
+    const response = await handler(call);
+    if (!response) throw new Error(`fetch 桩没有处理 ${method} ${url}`);
+    return response;
+  }));
+  return calls;
+}
+
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status, headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function errorResponse(
+  status: number,
+  code: string,
+  message: string,
+  details?: Record<string, unknown>,
+): Response {
+  const error = { code, message, retryable: false, ...(details ? { details } : {}) };
+  return json(status, { error });
+}
+
+/** 默认桩：GET 回 `get`；PUT 回 `put`（缺省 200 + 把那一格的值换成请求体里的数，其余照旧）。 */
+function stubDefault(get: unknown = DTO, put?: (call: Recorded) => Response): Recorded[] {
+  return stubFetch((call) => {
+    if (call.url === GET_PATH && call.method === 'GET') return json(200, get);
+    if (call.url.startsWith(`${GET_PATH}/`) && call.method === 'PUT') {
+      const key = decodeURIComponent(call.url.slice(GET_PATH.length + 1));
+      const value = (call.body as { value: unknown }).value;
+      return put
+        ? put(call)
+        : json(200, {
+          item: {
+            key, label: key, value, source: 'db', applyMode: 'hot',
+            updatedAt: '2026-11-23T00:00:00.000Z', updatedBy: 'u-root',
+          },
+        });
+    }
+    return undefined;
+  });
+}
+
+async function mountView(): Promise<VueWrapper> {
+  const wrapper = mount(AdminRuntimeSettingsView, { global: { plugins: [i18n] } });
+  await flushPromises();
+  return wrapper;
+}
+
+const text = (w: VueWrapper, testId: string) => w.get(`[data-test="${testId}"]`).text();
+const exists = (w: VueWrapper, testId: string) => w.find(`[data-test="${testId}"]`).exists();
+const inputEl = (w: VueWrapper, key: string) =>
+  w.get(`[data-test="runtime-input-${key}"]`).element as HTMLInputElement;
+const puts = (calls: Recorded[]) => calls.filter((c) => c.method === 'PUT');
+const gets = (calls: Recorded[]) => calls.filter((c) => c.method === 'GET');
+
+async function setDraft(w: VueWrapper, key: string, value: string) {
+  await w.get(`[data-test="runtime-input-${key}"]`).setValue(value);
+  await flushPromises();
+}
+
+async function clickSave(w: VueWrapper, key: string) {
+  await w.get(`[data-test="runtime-save-${key}"]`).trigger('click');
+  await flushPromises();
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  setLocale('zh-CN');
+  setActivePinia(createPinia());
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('R1 挂载恰好一次 GET', () => {
+  it('进页面 ⇒ 只发 1 次 GET，且打的是 §4.21 那个路径', async () => {
+    const calls = stubDefault();
+    await mountView();
+
+    expect(gets(calls)).toHaveLength(1);
+    expect(gets(calls)[0].url).toBe(GET_PATH);
+    expect(puts(calls)).toHaveLength(0);
+  });
+
+  it('store 侧：loaded=true 且 err=null（区分「没请求」与「服务端说 registry 是空的」）', async () => {
+    stubDefault();
+    await mountView();
+    const store = useAdminStore();
+    expect(store.runtimeSettingsLoaded).toBe(true);
+    expect(store.runtimeSettingsErr).toBeNull();
+    expect(store.runtimeSettings.map((row) => row.key)).toEqual([TTL_KEY, SECOND_KEY]);
+  });
+});
+
+describe('R2 两行按 DTO 渲染：值 + 来源 + 生效方式一起出', () => {
+  it('两行都有 label / key / 值 / 来源 / 生效方式 / 更新时间（只显示数字不算过关）', async () => {
+    stubDefault();
+    const w = await mountView();
+
+    expect(exists(w, `runtime-row-${TTL_KEY}`)).toBe(true);
+    expect(exists(w, `runtime-row-${SECOND_KEY}`)).toBe(true);
+
+    expect(text(w, `runtime-label-${TTL_KEY}`)).toBe('会话有效期（秒）');
+    expect(text(w, `runtime-key-${TTL_KEY}`)).toBe(TTL_KEY);
+    expect(text(w, `runtime-value-${TTL_KEY}`)).toBe('86400');
+    expect(text(w, `runtime-source-${TTL_KEY}`)).toContain('管理台');
+    expect(text(w, `runtime-apply-${TTL_KEY}`)).toContain('立即生效');
+    expect(text(w, `runtime-updated-${TTL_KEY}`)).toContain('2026-11-19T02:11:04.000Z');
+
+    // 第二行：env + restart 两档各自的文案与 db + hot 不同（共用一句就等于把声明丢了）
+    expect(text(w, `runtime-value-${SECOND_KEY}`)).toBe('4');
+    expect(text(w, `runtime-source-${SECOND_KEY}`)).toContain('环境变量');
+    expect(text(w, `runtime-apply-${SECOND_KEY}`)).toContain('需重启');
+    // 从没被管理台存过 ⇒ 说「从未」，不显示空串或假时间
+    expect(text(w, `runtime-updated-${SECOND_KEY}`)).toContain('从未');
+  });
+
+  it('表头五列都在（配置项 / 当前值 / 来源 / 生效方式 / 更新时间）', async () => {
+    stubDefault();
+    const w = await mountView();
+    const head = w.get('table thead').text();
+    for (const label of ['配置项', '当前值', '来源', '生效方式', '更新时间']) {
+      expect(head).toContain(label);
+    }
+  });
+
+  it('英文 locale 下同一页是英文（双语都真的写了）', async () => {
+    setLocale('en');
+    stubDefault();
+    const w = await mountView();
+    expect(text(w, `runtime-source-${TTL_KEY}`)).toContain('Admin console');
+    expect(text(w, `runtime-apply-${SECOND_KEY}`)).toContain('restart');
+  });
+});
+
+describe('R3 value=null 显示「未知」，不是 0', () => {
+  it('服务端没给 value ⇒ 那一格「未知」、输入框留空（不预填 0）', async () => {
+    const noValue = {
+      items: [{ key: TTL_KEY, label: '会话有效期（秒）', source: 'default', applyMode: 'hot' }],
+    };
+    stubFetch((call) => (call.method === 'GET' ? json(200, noValue) : undefined));
+    const w = await mountView();
+
+    expect(text(w, `runtime-value-${TTL_KEY}`)).toBe('未知');
+    expect(inputEl(w, TTL_KEY).value).toBe('');
+    // 值没给不影响保存：前端不拿「未知」当校验失败（服务端才是闸）
+    const save = w.get(`[data-test="runtime-save-${TTL_KEY}"]`);
+    await setDraft(w, TTL_KEY, '7200');
+    expect((save.element as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+describe('R4 保存：PUT /{key} + body {"value":7200}', () => {
+  it('输入 7200 点保存 ⇒ PUT 到该 key，body 逐字节是 {"value":7200}（number 不是字符串）', async () => {
+    const calls = stubDefault();
+    const w = await mountView();
+    await setDraft(w, TTL_KEY, '7200');
+    await clickSave(w, TTL_KEY);
+
+    expect(puts(calls)).toHaveLength(1);
+    expect(puts(calls)[0].url).toBe(TTL_PATH);
+    expect(JSON.stringify(puts(calls)[0].body)).toBe('{"value":7200}');
+    expect(typeof (puts(calls)[0].body as { value: unknown }).value).toBe('number');
+  });
+
+  it('保存第二行 ⇒ 打到第二行的 key（一列表不是只有一个旋钮）', async () => {
+    const calls = stubDefault();
+    const w = await mountView();
+    await setDraft(w, SECOND_KEY, '9');
+    await clickSave(w, SECOND_KEY);
+
+    expect(puts(calls)).toHaveLength(1);
+    expect(puts(calls)[0].url).toBe(`${GET_PATH}/${SECOND_KEY}`);
+  });
+});
+
+describe('R5 400 按行标红（别行不跟着抖）', () => {
+  it('details.field=value ⇒ 只有那一行 aria-invalid + 服务端文案可见', async () => {
+    const tooSmall = errorResponse(
+      400, 'validation_failed', 'session.ttl_seconds 必须在 60–2592000 之间',
+      { field: 'value', min: 60, max: 2592000 },
+    );
+    stubDefault(DTO, () => tooSmall);
+    const w = await mountView();
+    await setDraft(w, TTL_KEY, '5');
+    await clickSave(w, TTL_KEY);
+
+    expect(inputEl(w, TTL_KEY).getAttribute('aria-invalid')).toBe('true');
+    expect(text(w, `runtime-error-${TTL_KEY}`)).toContain('60–2592000');
+    expect(exists(w, `runtime-saved-${TTL_KEY}`)).toBe(false);
+    // 另一行什么都没做过 ⇒ 不许被同一次失败标红
+    expect(inputEl(w, SECOND_KEY).getAttribute('aria-invalid')).not.toBe('true');
+    expect(exists(w, `runtime-error-${SECOND_KEY}`)).toBe(false);
+    expect(useAdminStore().runtimeSaveField).toBe('value');
+  });
+
+  it('details.field=key/body ⇒ 那一行不标红，改为整页一行点名是哪一处', async () => {
+    stubDefault(DTO, () => errorResponse(400, 'validation_failed', '未知的运行时配置项', {
+      field: 'key', known: [TTL_KEY],
+    }));
+    const w = await mountView();
+    await setDraft(w, TTL_KEY, '7200');
+    await clickSave(w, TTL_KEY);
+
+    expect(inputEl(w, TTL_KEY).getAttribute('aria-invalid')).not.toBe('true');
+    expect(text(w, 'runtime-field-error')).toContain('配置项名字');
+  });
+});
+
+describe('R6 前端不做区间校验；解析不出整数就一个请求都不发', () => {
+  it('越界的整数照发（1 秒 / 一亿秒都不在前端拦）', async () => {
+    const calls = stubDefault();
+    const w = await mountView();
+    await setDraft(w, TTL_KEY, '1');
+    await clickSave(w, TTL_KEY);
+    await setDraft(w, TTL_KEY, '99999999');
+    await clickSave(w, TTL_KEY);
+    expect(puts(calls).map((c) => (c.body as { value: number }).value)).toEqual([1, 99999999]);
+  });
+
+  it('空 / 小数 / 负数草稿 ⇒ 按钮禁用、点下去零 PUT', async () => {
+    const calls = stubDefault();
+    const w = await mountView();
+    for (const draft of ['', '1.5', '-1']) {
+      await setDraft(w, TTL_KEY, draft);
+      const save = w.get(`[data-test="runtime-save-${TTL_KEY}"]`);
+      expect((save.element as HTMLButtonElement).disabled, `草稿「${draft}」`).toBe(true);
+      await save.trigger('click');
+      await flushPromises();
+    }
+    expect(puts(calls)).toHaveLength(0);
+  });
+
+  it('store 侧：草稿解析不出整数 ⇒ 零请求 + field=value + 「不是整数」这句话', async () => {
+    const calls = stubDefault();
+    await mountView();
+    const store = useAdminStore();
+    const err = await store.saveRuntimeSetting(TTL_KEY, '1e4');
+    expect(err).toContain('不是整数');
+    expect(store.runtimeSaveField).toBe('value');
+    expect(puts(calls)).toHaveLength(0);
+  });
+});
+
+describe('R7 三态互不冒充', () => {
+  it('GET 500 ⇒ 有错误条、没有列表、也没有「空态」', async () => {
+    const down = errorResponse(500, 'internal', 'db down');
+    stubFetch((call) => (call.method === 'GET' ? down : undefined));
+    const w = await mountView();
+    const store = useAdminStore();
+    expect(exists(w, 'runtime-load-error')).toBe(true);
+    expect(text(w, 'runtime-load-error')).toContain('db down');
+    expect(exists(w, 'runtime-empty')).toBe(false);
+    expect(exists(w, `runtime-row-${TTL_KEY}`)).toBe(false);
+    expect(store.runtimeSettingsLoaded).toBe(false);
+  });
+
+  it('200 但 items 为空 ⇒ 是空态，不是错误条', async () => {
+    stubDefault({ items: [] });
+    const w = await mountView();
+    expect(exists(w, 'runtime-empty')).toBe(true);
+    expect(exists(w, 'runtime-load-error')).toBe(false);
+  });
+
+  it('请求从未发生 ⇒ 显示「尚未加载」，不是空态也不是加载中（三态不互名）', async () => {
+    stubDefault();
+    const store = useAdminStore();
+    // 把唯一触发点拆掉 ⇒ 本页今天就是「什么都没请求」的状态
+    vi.spyOn(store, 'loadRuntimeSettings').mockResolvedValue(null);
+    const w = mount(AdminRuntimeSettingsView, { global: { plugins: [i18n] } });
+    await flushPromises();
+
+    expect(exists(w, 'runtime-not-loaded')).toBe(true);
+    expect(exists(w, 'runtime-empty')).toBe(false);
+    expect(exists(w, 'runtime-load-error')).toBe(false);
+    expect(store.runtimeSettingsLoaded).toBe(false);
+  });
+
+  it('请求还在飞 ⇒ 是「加载中」，不提前拿空态充数；飞完才出列表', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    stubFetch(async (call) => {
+      if (call.method === 'GET') { await gate; return json(200, DTO); }
+      return undefined;
+    });
+    const w = mount(AdminRuntimeSettingsView, { global: { plugins: [i18n] } });
+    await flushPromises();
+
+    expect(exists(w, 'runtime-loading')).toBe(true);
+    expect(exists(w, 'runtime-empty')).toBe(false);
+    expect(exists(w, `runtime-row-${TTL_KEY}`)).toBe(false);
+
+    release();
+    await flushPromises();
+    expect(exists(w, 'runtime-loading')).toBe(false);
+    expect(exists(w, `runtime-row-${TTL_KEY}`)).toBe(true);
+  });
+
+  it('点「重新读取」⇒ 再发恰好一次 GET（本页不缓存）', async () => {
+    const calls = stubDefault();
+    const w = await mountView();
+    await w.get('[data-test="runtime-reload"]').trigger('click');
+    await flushPromises();
+    expect(gets(calls)).toHaveLength(2);
+  });
+});
+
+describe('R8 保存成功：回填服务端回读的生效值 + 只在那一行说「已保存」', () => {
+  it('敲 7200 而服务端回读 43200 ⇒ 输入框与当前值都是 43200，且「已保存」只在那一行', async () => {
+    stubDefault(DTO, (call) => {
+      const key = decodeURIComponent(call.url.slice(GET_PATH.length + 1));
+      return json(200, {
+        item: {
+          key, label: '会话有效期（秒）', value: 43200, source: 'db', applyMode: 'hot',
+          updatedAt: '2026-11-23T01:00:00.000Z', updatedBy: 'u-root',
+        },
+      });
+    });
+    const w = await mountView();
+    await setDraft(w, TTL_KEY, '7200');
+    await clickSave(w, TTL_KEY);
+
+    expect(inputEl(w, TTL_KEY).value).toBe('43200');
+    expect(text(w, `runtime-value-${TTL_KEY}`)).toBe('43200');
+    expect(text(w, `runtime-saved-${TTL_KEY}`)).toContain('已保存');
+    expect(exists(w, `runtime-saved-${SECOND_KEY}`)).toBe(false);
+  });
+
+  it('200 但响应里没有 item ⇒ 不说「已保存」，也不把输入当成已落库', async () => {
+    stubDefault(DTO, () => json(200, {}));
+    const w = await mountView();
+    await setDraft(w, TTL_KEY, '7200');
+    await clickSave(w, TTL_KEY);
+
+    expect(exists(w, `runtime-saved-${TTL_KEY}`)).toBe(false);
+    expect(text(w, `runtime-value-${TTL_KEY}`)).toBe('86400');
+    expect(useAdminStore().runtimeSaveField).toBe('body');
+  });
+});
+
+describe('R9 在写的那一行说「正在保存」，并锁住整页的写', () => {
+  it('PUT 未归 ⇒ 那一行出「正在保存…」、两行的保存按钮全禁；归了才说「已保存」', async () => {
+    let release!: (r: Response) => void;
+    const gate = new Promise<Response>((resolve) => { release = resolve; });
+    stubFetch((call) => (call.method === 'GET' ? json(200, DTO) : gate));
+    const w = await mountView();
+
+    await setDraft(w, TTL_KEY, '7200');
+    await w.get(`[data-test="runtime-save-${TTL_KEY}"]`).trigger('click');
+    await flushPromises();
+
+    expect(text(w, `runtime-saving-${TTL_KEY}`)).toContain('正在保存');
+    const disabled = (key: string) =>
+      (w.get(`[data-test="runtime-save-${key}"]`).element as HTMLButtonElement).disabled;
+    expect(disabled(TTL_KEY)).toBe(true);
+    expect(disabled(SECOND_KEY)).toBe(true);
+    expect(exists(w, `runtime-saved-${TTL_KEY}`)).toBe(false);
+
+    release(json(200, {
+      item: {
+        key: TTL_KEY, label: '会话有效期（秒）', value: 7200, source: 'db', applyMode: 'hot',
+        updatedAt: '2026-11-23T02:00:00.000Z', updatedBy: 'u-root',
+      },
+    }));
+    await flushPromises();
+
+    expect(exists(w, `runtime-saving-${TTL_KEY}`)).toBe(false);
+    expect(text(w, `runtime-saved-${TTL_KEY}`)).toContain('已保存');
+    expect(disabled(SECOND_KEY)).toBe(false);
+  });
+});

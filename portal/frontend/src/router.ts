@@ -99,6 +99,16 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminPromptsView.vue'),
         meta: { requiresRole: 'admin' },
       },
+      // issue #677 P2b：运行时设置列表（§4.21）。导航顺序：… → upload → prompts → **runtime** → market。
+      // 与 upload / prompts 同族：都是「改一行而不必重建 station-portal」的平台配置。
+      // 懒加载 + requiresRole 照邻居；**请求只在视图挂载时发**（`AdminRuntimeSettingsView` 的
+      // onMounted 是唯一触发点 ⇒ 进管理台不请求，切到这一 tab 才恰好 1 次）。
+      {
+        path: 'runtime',
+        name: 'admin-runtime',
+        component: () => import('./views/AdminRuntimeSettingsView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
       // issue #595 M2：能力市场发布台（§7 管理面）。导航顺序：… → upload → prompts → **market** → pool。
       // 请求只在本视图挂载时发（`AdminMarketView` 的 onMounted 是唯一触发点）。
       {
