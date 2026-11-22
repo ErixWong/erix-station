@@ -29,9 +29,21 @@
 //      「每次上传现读、不缓存」，于是「查询发出去而**不返回**」= 每次上传都挂住（前端逐文件上传 ⇒ N 文件
 //      N 次读）。「永不抛」必须同时覆盖**抛错**（`catch` → `read_failed`）与**不返回**（超时 → `read_timeout`），
 //      少后者那条硬口径就是假的。超时按「读不到」处理：回落 env/默认、上传照常、只留 debug 不刷 warn。
-//   6. **保存 = 一条 SQL 语句**（`SAVE_SQL` 那条 CTE：读旧值 + upsert + 写审计）。审计与设置必须同生共死，
-//      旧值必须来自同一语句的快照：分开发就是「并发保存记错 `previous_*`」与「设置已生效而审计没写」两个洞。
-//      ⇒ 调用方（`http.js`）**不得**再补 `auth.audit`。用例：US-15/16/17（活一）、US-18/19/20/21（活二）。
+//   6. **保存 = 一个事务**（`BEGIN` → `SELECT … FOR UPDATE` → upsert → 审计 → `COMMIT`，见
+//      `updateUploadSettings`；旧名「保存 = 一条 SQL 语句」已作废，理由在下面）。审计与设置必须
+//      **同生共死**（同一个事务，出错 `ROLLBACK` 后两者都不落），且 `previous_*` 必须是**紧邻的前一个
+//      已提交值**（否则审计看不出「谁把谁改成了谁」）。
+//      ⚠ **为什么单语句不可兼得**（#698 两轮实测，别改回去）：一条含 data-modifying CTE 的语句里，
+//      所有 sub-statement 共用**同一个语句级快照**，`FOR UPDATE` 因此**看不见本语句要改的那一行**
+//      （postgres:16：`prev` 恒空集 ⇒ 保存恒 500，而值已落库）；**去掉它就没有行锁** ⇒ 并发两条保存的
+//      `previous_*` 都指向**并发前**的值，审计链断（独立审计 MED）。 ⇒ 原子性与「看见前一条已提交的
+//      写入」在一条语句里只能选一个，**只能拆成事务**：`FOR UPDATE` 单独一条语句才既拿得到最新已提交
+//      值又拿得到行锁。**原子性由事务保证**，不再由「一条语句」保证。
+//      旧值派生**只保留 JS 一处**（`parseDbMaxFileBytes`），SQL 不再自带一份 CASE ⇒ 审计的 `previous_*`
+//      与接口返回的 `previous` 由**同一次派生**产出（US-20 的等价性由构造成立）。
+//      ⇒ 调用方（`http.js`）**不得**再补 `auth.audit`。用例：US-15/16/17（活一）、US-18/20/21
+//      （活二：事务形状 + 等价性 + 原子性，fake 侧）+ `upload-settings-real-db.test.js` 的并发链
+//      （行锁与可见性只有真库能判，fake 不模拟 MVCC ⇒ 在那儿测并发会拿到假绿）。
 
 /** 与 `config.js` 的 `fileUploadMaxBytes` 默认值必须同数（32 MiB）；compose 里第三处同值。 */
 export const DEFAULT_MAX_FILE_BYTES = 32 * 1024 * 1024;
@@ -115,67 +127,49 @@ export const AUDIT_ACTION = 'admin.upload_settings_updated';
 export const AUDIT_TARGET = 'upload_settings';
 
 /**
- * 保存 = **一条**语句做完三件事：读旧值 → upsert → 写审计（复 audit 活二）。
+ * 保存 = **一个显式事务**：`BEGIN` → `PREVIOUS_SQL`（单独一条，带行锁）→ `UPSERT_SQL` → `AUDIT_SQL`
+ * → `COMMIT`（复 audit 活二 + #698 两轮返修）。下面三个常量就是事务里的三条语句，**顺序不可改**。
  *
- * 为什么必须是一条：原来 `updateUploadSettings` 里 `SELECT` → `UPSERT`，`http.js` 再 `await auth.audit()`，
- * 三个 await 之间谁都可能插进来：
- *   * 两个管理员同时保存 ⇒ 两边都先读到同一个旧值 ⇒ 后写那条的 `previous_*` 记的是**它进来之前**的数，
- *     事后看审计就看不出「谁把谁改成了谁」——审计存在的唯一理由。
- *   * 审计 `INSERT` 失败（连接断、`audit_log` 被锁、迁移没跑）⇒ 设置**已经生效**而审计一行没有，
- *     而且响应是 200（`audit` 在 `sendJson` 之前抛的话是 500，但设置照样已经改了 —— 更糟）。
- * 一条语句就同时收掉这两个洞：语句级原子（要么全生效要么全不生效），旧值取的是**本语句的快照**。
+ * 为什么不是三条自动提交的语句、也不是上一版那条单语句 CTE（两个洞各自的历史）：
+ *   * 不是「三个分开发的 await」：两个管理员同时保存 ⇒ 两边都先读到同一个旧值 ⇒ 后写那条的
+ *     `previous_*` 记的是**它进来之前**的数；审计 `INSERT` 失败 ⇒ 设置已生效而审计一行没有。
+ *     显式事务把这两个窗口一起收掉：`FOR UPDATE` 把并发第二条挡在锁外（它等到的是**前一个写完
+ *     之后**的值），`ROLLBACK` 让审计与设置同生共死。
+ *   * 不是单语句 CTE：#698 真库实测「同一条含 data-modifying CTE 的语句里 `FOR UPDATE` 看不见
+ *     本语句要改的那一行」⇒ 带锁就恒 500、去掉锁就审计链断（为什么不可兼得见文件头硬口径 6）。
  *
- * 三个刻意的细节：
- *   1. `prev` **不许**带 `FOR UPDATE`（#698 真库实测，别改回去）。理由不是「不需要锁」，而是**加了也拿不到
- *      旧值**：同一条语句里所有 sub-statement 共用**同一个语句级快照**，而这条语句自己含 data-modifying
- *      CTE（`upd`）——带锁的 `prev` 因此看不见 `upd` 正要改的那一行，实测 `prev` **恒空集**（postgres:16：
- *      二写 `previous_raw=null`、`rowCount=0`、`audit_rows=0` ⇒ 管理台恒 500 而值已落库）。真要行级串行化
- *      得把「读旧值」拆成独立语句 + 显式事务，那是另一套口径（且会退回「设置改了而审计没写」的窗口）。
- *      接受的代价：两条**真重叠**的保存可能都记同一个 `previous_*`（快照语义）；US-19 在 fake 里测的串行
- *      链不等于真库并发语义，真库侧的判据是 `portal/test/upload-settings-real-db.test.js`。
- *   2. `aud` 与主查询都必须 `LEFT JOIN prev_eff ON true`（#698 的另一半，与上面那条**各自独立**）：
- *      首写时 `upload_settings` 里没有旧行 ⇒ `prev_eff` 是空集，写成 `FROM upd, prev_eff`（内连接）会把
- *      `upd` 那一行一起吃掉 ⇒ 主查询 0 行（调用方按「读回不可用」判 500）、审计一行不写，而**值已落库**。
- *      `prev` 至多一行（`WHERE id = 1` 命中主键）⇒ `LEFT JOIN … ON true` 不会把行数放大成多行。
- *   3. 「DB 旧值可用不可用」的判定在 SQL 里只做**区间比较**（`BETWEEN $5 AND $6`，两个数字是参数，
- *      由 JS 常量传进来 ⇒ 常量仍然只有一处）。旧值取自 `bigint` 列 ⇒ 文本必是纯数字，所以这条比较与
- *      JS 侧 `parseDbMaxFileBytes` 在这条路径上等价；等价性由 `portal/test/upload-settings.test.js`
- *      的 US-20 钉住（SQL 派生的 previous_* 与 JS 派生的必须逐值相同），不是靠注释声明。
- *      ⚠ 首写（无旧行）时 SQL 侧走的是 `LEFT JOIN` 出来的 NULL（审计记 `previous_max_bytes=null`），
- *      而 JS 侧 `previous` 回的是兜底值（`env`/`default`）—— 这一格两边**刻意不同形**，由真库用例第 1 格钉住。
- *   4. `details` 的键与旧实现（`http.js` 里手写的 `auth.audit`）逐字相同，事后审计查询不受影响。
+ * 四个刻意的细节：
+ *   1. `FOR UPDATE` **只能出现在 `PREVIOUS_SQL` 这一条独立语句里**（挪进 `UPSERT_SQL` 就是退回
+ *      #698 那个 500）。它是整个并发口径的唯一支点：READ COMMITTED 下它读到的是**最新已提交**的值，
+ *      并把行锁一直拿到 `COMMIT` ⇒ 并发第二条保存卡在这一句上，等到的就是前一个写完之后的值。
+ *   2. `previous_*` **只由 JS 派生一次**（`parseDbMaxFileBytes` 那一套）：审计里写的与接口返回的是
+ *      同一次计算的结果 ⇒ US-20 的「逐值等价」由构造成立，SQL 里不再自带第二份判定。
+ *      顺带修正一处**刻意不同形**：首写（无旧行）时审计不再记 `null`，而是记「改动前真正在用的兜底值」
+ *      （`env`/`default`），与接口 `previous` 同一个数 —— 判据见真库用例第 1 格。
+ *   3. `details` 的键与旧实现（`http.js` 里手写的 `auth.audit`）逐字相同（`max_file_bytes` /
+ *      `previous_max_bytes` / `previous_source`），事后审计查询不受影响；只是不再由一条 CTE 算出来。
+ *   4. 读侧（`SELECT_SQL` / 超时 / 回落）与本事务无关，仍走 `pool.query`（口径 1/2/5 一字未动）。
  */
-const SAVE_SQL = `WITH prev AS (
-   SELECT max_file_bytes::text AS raw FROM upload_settings WHERE id = 1
- ), prev_eff AS (
-   SELECT prev.raw AS raw,
-          CASE WHEN prev.raw IS NOT NULL AND prev.raw::bigint BETWEEN $5 AND $6
-               THEN prev.raw::bigint ELSE $3 END AS max_bytes,
-          CASE WHEN prev.raw IS NOT NULL AND prev.raw::bigint BETWEEN $5 AND $6
-               THEN 'db' ELSE $4 END AS source
-     FROM prev
- ), upd AS (
-   INSERT INTO upload_settings (id, max_file_bytes, updated_at, updated_by)
+
+/**
+ * 事务第 1 条：单独一条 `SELECT … FOR UPDATE`。`::text` 的理由同 `SELECT_SQL`（不把 int8 的驱动行为
+ * 当语义）。取的是 `raw`（未派生的原始值）：可用不可用、区间外拿什么顶，全部交给 JS 侧那一处判定。
+ */
+const PREVIOUS_SQL = `SELECT max_file_bytes::text AS raw
+   FROM upload_settings WHERE id = 1 FOR UPDATE`;
+
+/** 事务第 2 条：单行 upsert（口径 4）。响应 DTO 一律来自 `RETURNING`（不信输入）。 */
+const UPSERT_SQL = `INSERT INTO upload_settings (id, max_file_bytes, updated_at, updated_by)
    VALUES (1, $1, now(), $2)
    ON CONFLICT (id) DO UPDATE
       SET max_file_bytes = EXCLUDED.max_file_bytes,
           updated_at = now(),
           updated_by = EXCLUDED.updated_by
-   RETURNING max_file_bytes::text AS max_file_bytes, updated_at, updated_by
- ), aud AS (
-   INSERT INTO audit_log (actor_id, action, target, details)
-   SELECT $2, $7::text, $8::text, jsonb_build_object(
-            'max_file_bytes', upd.max_file_bytes::bigint,
-            'previous_max_bytes', prev_eff.max_bytes,
-            'previous_source', prev_eff.source)
-     FROM upd LEFT JOIN prev_eff ON true
-   RETURNING 1 AS audit_row
- )
-SELECT upd.max_file_bytes::text AS max_file_bytes, upd.updated_at, upd.updated_by,
-       prev_eff.raw AS previous_raw,
-       (SELECT count(*) FROM aud)::int AS audit_rows
-  FROM upd LEFT JOIN prev_eff ON true`;
+   RETURNING max_file_bytes::text AS max_file_bytes, updated_at, updated_by`;
 
+/** 事务第 3 条：审计。与 upsert 同一个事务 ⇒ 审计写不进去就**设置也没改**（US-21 钉这一点）。 */
+const AUDIT_SQL = 'INSERT INTO audit_log (actor_id, action, target, details)'
+  + ' VALUES ($1, $2, $3, $4)';
 /** 校验/状态类错误：`httpStatus` + `details.field`（`http.js` 的统一信封按此映射）。 */
 export class UploadSettingsError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -338,15 +332,22 @@ function cleanMaxFileBytes(value) {
 }
 
 /**
- * `PUT /api/admin/upload/settings`：校验 + **一条** CTE 语句（读旧值 → upsert → 写审计）。
+ * `PUT /api/admin/upload/settings`：校验 + **一个显式事务**（`BEGIN` → `SELECT … FOR UPDATE`
+ * → upsert → 审计 → `COMMIT`；硬口径 6）。
  *
- * 两件事分开说清：
+ * 三件事分开说清：
  *   * **响应里的生效值来自 `RETURNING`**（不是回显输入）——「保存成功」说的是库里现在的值。
- *   * **旧值与审计在同一语句里**（复 audit 活二）：本函数自己写审计，调用方（`http.js`）**不得**
- *     再补一笔 `auth.audit`——那会把原子性退回成两个 await，而且多写一条审计（US-18 钉的就是这两点）。
- *     与 `updateMailSettings`「审计归调用方」的分工在这里刻意不同：那一单没有「旧值必须与写入同快照」的要求。
+ *   * **`previous_*` 由本函数单点派生**（还是 `parseDbMaxFileBytes` 那一套）：接口返回的 `previous`
+ *     与审计里写的 `previous_*` 是同一次计算的结果 ⇒ 「逐值等价」（US-20）不再需要第二份实现去对齐。
+ *   * **本函数自己写审计**，调用方（`http.js`）**不得**再补一笔 `auth.audit`——那会把原子性退回成
+ *     两个 await，而且多写一条审计（US-18 钉的就是这两点）。与 `updateMailSettings`「审计归调用方」
+ *     的分工在这里刻意不同：那一单没有「previous 必须是紧邻的前一个已提交值」的要求。
  *
- * 失败形状：审计写不进去 ⇒ 整条语句失败 ⇒ **设置没改**（语句级原子）；错误带 `httpStatus` 往上招。
+ * 失败形状：事务里任何一步失败 ⇒ `ROLLBACK` ⇒ **设置一格没改**、审计零行（US-21 钉这一点）；
+ * 错误带 `httpStatus` 往上招。`client.release()` 在 `finally`：审计写失败也不许把连接漏在池外。
+ *
+ * ⚠ 事务里**不套**读侧超时：`withReadTimeout` 服务的是读侧那条「永不抛、不许把上传挂住」的判据；
+ *   写侧失败本来就是 5xx，给它套超时只会把「已拿到行锁」的写挂成一个半途状态。
  *
  * @returns {Promise<{settings:object, previous:{maxFileBytes:number, source:string}}>}
  */
@@ -355,32 +356,58 @@ export async function updateUploadSettings({ pool, config = {}, log = console, a
     fail('body', '请求体必须是对象');
   }
   const maxFileBytes = cleanMaxFileBytes(fields.maxFileBytes);
-  // 「DB 旧值不可用时用什么顶」仍然只由 JS 这一套算（envFallbackBytes / envIsExplicit），
-  // 以**参数**形式送进 SQL ⇒ 区间常量也只有一处（`MIN/MAX_MAX_FILE_BYTES`），SQL 里不抄数字。
-  const written = await pool.query(SAVE_SQL, [
-    maxFileBytes, actorId,
-    envFallbackBytes(config), envIsExplicit(config) ? 'env' : 'default',
-    MIN_MAX_FILE_BYTES, MAX_MAX_FILE_BYTES,
-    AUDIT_ACTION, AUDIT_TARGET,
-  ]);
-  const row = written?.rows?.[0] ?? null;
-  const resolved = resolveFromRow(row, { config });
-  if (resolved.source !== 'db') {
-    // 写进去的值读回来却不可用 = 我们的区间常量与写侧校验漂移了（例：日后只改了一处）。
-    // 不能静默回落到 env：那会让管理台显示"保存成功但生效值是别的数"这种不可调试的形态。
-    throw new UploadSettingsError('internal', `写入的 max_file_bytes=${maxFileBytes} 读回后不可用`, { httpStatus: 500 });
+  // 事务必须钉在**同一条连接**上：`pool.query()` 每次另借一条连接，`FOR UPDATE` 拿到的行锁会随那条
+  // 语句结束而放掉 ⇒ 并发第二条不必等 ⇒ 两条审计的 `previous_*` 都指向并发前（= 本轮要修的 MED）。
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // ① 单独一条拿锁语句：并发第二条卡在这里等，等到的就是前一个写完之后的值（口径 6 的全部支点）。
+    const prev = await client.query(PREVIOUS_SQL);
+    // ② 写这一行；`RETURNING` 是响应的唯一真相（口径 4）。
+    const written = await client.query(UPSERT_SQL, [maxFileBytes, actorId]);
+    const row = written?.rows?.[0] ?? null;
+    const resolved = resolveFromRow(row, { config });
+    if (resolved.source !== 'db') {
+      // 写进去的值读回来却不可用 = 我们的区间常量与写侧校验漂移了（例：日后只改了一处）。
+      // 不能静默回落到 env：那会让管理台显示"保存成功但生效值是别的数"这种不可调试的形态。
+      throw new UploadSettingsError('internal', `写入的 max_file_bytes=${maxFileBytes} 读回后不可用`, {
+        httpStatus: 500,
+      });
+    }
+    // ③ 旧值**只在这一处派生**：区间内 = 库里那个数（source=db），无行/区间外 = 当时真正在用的兜底值
+    //    （source=env|default）。审计与接口共用它 ⇒ 两边不可能漂（旧版 SQL 里那份 CASE 已删）。
+    const previousRaw = prev?.rows?.[0]?.raw ?? null;
+    const previous = resolveFromRow(
+      previousRaw == null ? null : { max_file_bytes: previousRaw }, { config },
+    );
+    // ④ 审计：与 upsert 同生共死。`details` 的三个键与旧实现（`http.js` 手写的 `auth.audit`）逐字相同。
+    const audited = await client.query(AUDIT_SQL, [
+      actorId,
+      AUDIT_ACTION,
+      AUDIT_TARGET,
+      JSON.stringify({
+        max_file_bytes: resolved.maxBytes,
+        previous_max_bytes: previous.maxBytes,
+        previous_source: previous.source,
+      }),
+    ]);
+    if (Number(audited?.rowCount) !== 1) {
+      // 理论上到不了：审计与 upsert 在同一个事务里。留着是因为它正是这个事务存在的理由——
+      // 「设置生效了而审计没写」在事务里不可表示；真出现 = 有人把审计改成了可跳过的形状。
+      throw new UploadSettingsError('internal', `保存成功但审计写了 ${audited?.rowCount ?? 0} 行`, {
+        httpStatus: 500,
+      });
+    }
+    await client.query('COMMIT');
+    return {
+      settings: toUploadSettingsDto({ resolved, row, config }),
+      previous: { maxFileBytes: previous.maxBytes, source: previous.source },
+    };
+  } catch (error) {
+    // `ROLLBACK` 自己失败（连接已断）不许盖掉真正的错误：要报给运维的是那一条。
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
-  if (Number(row?.audit_rows) !== 1) {
-    // 理论上到不了：同一条语句里 `aud` 与 `upd` 同生共死。留着是因为它正是本条 SQL 存在的理由——
-    // 「设置生效了而审计没写」在这条语句里不可表示；真出现 = 有人把 `aud` 改成了可跳过的形状。
-    throw new UploadSettingsError('internal', `保存成功但审计写了 ${row?.audit_rows ?? 0} 行`, { httpStatus: 500 });
-  }
-  // `previous` 走 JS 侧同一套解析（策略只一处）；SQL 里那份 CASE 只为审计的 `details` 服务，
-  // 两者的等价性由单测逐值钉住（US-20），不是靠注释声明。
-  const previousRaw = row?.previous_raw ?? null;
-  const previous = resolveFromRow(previousRaw == null ? null : { max_file_bytes: previousRaw }, { config });
-  return {
-    settings: toUploadSettingsDto({ resolved, row, config }),
-    previous: { maxFileBytes: previous.maxBytes, source: previous.source },
-  };
 }
