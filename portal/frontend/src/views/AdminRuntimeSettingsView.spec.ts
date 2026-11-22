@@ -439,6 +439,10 @@ describe('R8 保存成功：回填服务端回读的生效值 + 只在那一行�
     expect(exists(w, `runtime-saved-${TTL_KEY}`)).toBe(false);
     expect(text(w, `runtime-value-${TTL_KEY}`)).toBe('86400');
     expect(useAdminStore().runtimeSaveField).toBe('body');
+    // 本层自判的 `body`（不是服务端 400 回来的）同样只走整页一行，不挂到行上
+    expect(text(w, 'runtime-field-error')).toContain('请求体');
+    expect(exists(w, `runtime-error-${TTL_KEY}`)).toBe(false);
+    expect(inputEl(w, TTL_KEY).getAttribute('aria-invalid')).not.toBe('true');
   });
 });
 
