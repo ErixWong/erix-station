@@ -216,6 +216,15 @@ onMounted(async () => {
               :data-test="`runtime-key-${item.key}`"
               class="mt-0.5 block text-[11px] text-black/45"
             >{{ item.key }}</code>
+            <!-- 服务端登记了 hint 的那一行才有的小字（§4.21：只在那一格带 `hint` 键）。
+                 `item.hint` 出自 lib 的归一化：没登记 ⇒ **键不存在**，于是这一整个 `<p>` 不渲染
+                 （不是留一个空 `<p>` 撑高度）。文案是服务端给的，本页原样照抄：不翻译、不补写、
+                 也不拿它做任何判定（真相在 registry 与 §4.21，这里只是把它说给人看）。 -->
+            <p
+              v-if="item.hint"
+              :data-test="`runtime-hint-${item.key}`"
+              class="mt-0.5 block max-w-prose text-[11px] leading-4 text-black/50"
+            >{{ item.hint }}</p>
           </td>
           <td class="py-1 pr-2">
             <span

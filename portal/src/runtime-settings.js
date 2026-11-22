@@ -44,12 +44,18 @@
 //      ⇒ **调用方不得再补 `auth.audit`**（那会把原子性退回成两个 await，还多写一笔审计）。
 //
 // P1 的边界（别在代码里假装已完成，判据在 `portal/test/runtime-settings.test.js`）：
-//   * `RUNTIME_SETTING_REGISTRY` 自 **P2a** 起有**第一格** `session.ttl_seconds`（其余旋钮仍归 P3 逐批填）。
+//   * `RUNTIME_SETTING_REGISTRY` 自 **P2a** 起有**第一格** `session.ttl_seconds`，自 **P3 第一批**起
+//     有**第二格** `workspace.retention_days`（其余旋钮仍逐批填；判据 RS-7 钉住「只有这两格」，
+//     顺手多迁一格当场红）。
 //     ⇒ `applyRuntimeOverrides` 在真机上从此**每次 `serve()` 发一次读**（不再是零 SQL），
 //     启动路径的那一次是**整表一次**、不是每 key 一次（第 3 条）。
 //   * HTTP 端点（`GET/PUT /api/admin/runtime-settings`）自 **P2a** 起在 `http.js`（形状在下面的
 //     `listRuntimeSettingsAdmin` / `updateRuntimeSettingAdmin`，http 层只做匹配 + 鉴权 + 转发）。
-//   * 热读：P2a 只有 `readSessionTtlSeconds` 一格（其余旋钮的热读归 P3 逐批填）。
+//   * 热读：P2a 只有 `readSessionTtlSeconds` 一格；**P3 第一批**把它那套机件（5s 缓存 + 代际号
+//     + 同池在飞合并 + 写路径失效 + env 过闸 + 一次热读只一条 warn + 永不抛）抽成了
+//     `createHotReader`，于是 `readWorkspaceRetentionDays` 是同一工厂的第二份实例。
+//     拓新格只需：registry 加一格 + `createHotReader({...})` 一行 + `HOT_READ_INVALIDATORS` 登记一行
+//     + 消费者把启动期 `config.X` 换成现读（判据 RS-23~RS-28）。
 //   * 迁移 0046 建表；接线在 `cli.js` 的 `serve()`（`migrate()` 之后、`createServer` 之前，
 //     且**所有 `start*Loop` 也用覆盖后的 config**，否则覆盖层只对 HTTP 生效）。
 //
@@ -70,7 +76,8 @@ export const AUDIT_ACTION = 'admin.runtime_settings_updated';
 export const AUDIT_TARGET_PREFIX = 'runtime_settings';
 
 /**
- * 旋钮登记表。P2a 起了第一格 `session.ttl_seconds`，其余归 P3 逐批填。
+ * 旋钮登记表。P2a 起了第一格 `session.ttl_seconds`，P3 第一批起了第二格
+ * `workspace.retention_days`，其余归 P3 逐批填。
  *
  * 条目形状（P3 往里加，一格一条；键名同时是 DB 里的 `key`，受 0046 的 CHECK 约束
  * `^[a-z][a-z0-9_.]{2,63}$`）：
@@ -159,6 +166,83 @@ export function validateSessionTtlSeconds(value) {
   return true;
 }
 
+/**
+ * 第二格旋钮 `workspace.retention_days` 的口径（#677 P3 第一批）。
+ *
+ * `0` 是**有效值并且是默认值**，含义是「不做自动清理」—— 它不是「没配」，所以三件事必须分开：
+ *   * `parse` 不许把 `0` 当假值丢掉（`if (!raw) return 不可用` 是最顺手也最容易犯的错）；
+ *   * `validate` 的下界是 **0**（不是 1）：管理台要能把「关掉清理」写回去；
+ *   * 消费者（`offboarding.js`）判「 disabled」只能拿**现读到的那个数**比 `=== 0`，
+ *     不许再拿启动期的 `config` 快照判（那正是本批要拆掉的形状）。
+ *
+ * 上界 **3650 天 = 10 年**，理由是产品口径而不是溢出算术：
+ *   * `config.js` 的 `nonNegativeIntEnv`（`:17`）只要求「安全整数且 ≥ 0」—— 它**没有上界**，
+ *     所以 env 那一档今天能写出任意大的数。registry 的闸必须自己给一个，否则「保留期」这一格
+ *     在 DB 侧可以被写成任意数，而管理台显示的是同一格。
+ *   * 「离职后保留多久」的现实尺度是天/月级：超过 10 年与「永不清理」在运维上不可区分，
+ *     而「永不清理」已经有确定表达（`0`）⇒ 上界之外的值只能是把单位填错了
+ *     （想写 30 天写成 `2592000`（秒）或 `30*86400*1000`（毫秒）那一族，#8.126 同族现象）。
+ *   * 算术侧：`scheduleWorkspacePurge` 把它拼成 `now() + ($2 * interval '1 day')`，
+ *      absurd 的数会让 `workspace_purge_after` 撞到 `timestamptz` 上界（PG 294276 年）而让
+ *     那一步 offboarding 直接失败；3650 天离那个上界有一万个数量级，写错单位则一步之遥。
+ *   * 越界的 env 值（例如既有部署写了 `4000`）由 `resolveEnvTier` 那一道闸拦下 ⇒ 落回**默认 0**
+ *     = 「不清理」，是**更保守**的一档（少删目录），不会造成误删（判据：RS-24 的上界那一格）。
+ */
+export const WORKSPACE_RETENTION_KEY = 'workspace.retention_days';
+export const WORKSPACE_RETENTION_MAX_DAYS = 3650; // 10 年，理由见上面那段
+// 0 = 关闭自动清理，与 config.js / compose / docs/env.md 同源
+export const WORKSPACE_RETENTION_DEFAULT_DAYS = 0;
+
+/**
+ * 给人看的一行提示（**可选字段**，只给有反直觉边界的旋钮写）。口径：
+ *   * 它是**文案**，不是第二份真相 —— 不参与任何判定，真相在 `docs/api/portal.md` §4.21；
+ *   * DTO 只在登记了的那格带上它（没登记 ⇒ 连键都没有），前端才能「有就渲染、没有就不占行」；
+ *   * 为什么只有第二格有：`0` 那一档的语义不是「把已排定的删除也撤了」（A/B 两方向刻意不对称，
+ *     裁定与理由见 §4.21）。这个坑不写在行面上，运维就会把旋钮当「暂停/撤销」两用开关。
+ */
+export const WORKSPACE_RETENTION_HINT = '0 = 关掉自动清理，但不会取消已排定的删除：'
+  + '改回正数后，已过期的工位会在下一次清理被删除；'
+  + '而 0 期间完成离职的工位不会被补上期限（也不会被追删）。';
+
+/**
+ * 读侧解析：与 `parseSessionTtlSeconds` 同一套形状（只认「安全整数」或「纯十进制数字串」，
+ * 区间外拒），差别只有两点：下界是 **0**，以及 `0` 必须**原样通过**（它是有效值）。
+ * `'1e3'` / `' 7 '` / `'7.0'` / `'-1'` / `true` / `null` / 对象 一律拒（台账 §8.126 那一族）。
+ */
+export function parseWorkspaceRetentionDays(raw) {
+  let text;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw)) return { ok: false, reason: 'not_a_retention_days' };
+    text = String(raw);
+  } else if (typeof raw === 'string') {
+    text = raw;
+  } else {
+    return { ok: false, reason: 'not_a_retention_days' }; // 布尔 / null / 对象 / 数组
+  }
+  if (!/^[0-9]+$/.test(text)) return { ok: false, reason: 'not_a_retention_days' };
+  const value = Number(text); // 上面已经只放非负纯数字进来 ⇒ 这里只是搬运
+  if (!Number.isSafeInteger(value)) return { ok: false, reason: 'not_a_retention_days' };
+  if (value > WORKSPACE_RETENTION_MAX_DAYS) {
+    return { ok: false, reason: 'retention_days_out_of_range' };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * 写侧校验：只收 `number` 类型的安全整数（字符串 `'7'` 照样拒，口径与 TTL 那格逐字相同）。
+ * 合格 ⇒ `true`；不合格 ⇒ 返回点名的原因字符串。⚠ 下界写的是 **0**，别顺手写成 1。
+ */
+export function validateWorkspaceRetentionDays(value) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    return `必须是 0–${WORKSPACE_RETENTION_MAX_DAYS} 的整数天（不接受字符串、小数、布尔）`;
+  }
+  if (value < 0) return `不能是负数（0 = 不自动清理，${WORKSPACE_RETENTION_MAX_DAYS} = 保留 10 年）`;
+  if (value > WORKSPACE_RETENTION_MAX_DAYS) {
+    return `必须在 0–${WORKSPACE_RETENTION_MAX_DAYS} 天之间（0 = 不自动清理；要更长请写 0）`;
+  }
+  return true;
+}
+
 export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
@@ -169,6 +253,17 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     applyMode: 'hot',
     parse: parseSessionTtlSeconds,
     validate: validateSessionTtlSeconds,
+  }),
+  [WORKSPACE_RETENTION_KEY]: Object.freeze({
+    key: WORKSPACE_RETENTION_KEY,
+    label: '已离职工位目录保留天数（0 = 不自动清理）',
+    configPath: 'workspaceRetentionDays',
+    envVar: 'ERIX_WORKSPACE_RETENTION_DAYS',
+    defaultValue: WORKSPACE_RETENTION_DEFAULT_DAYS,
+    applyMode: 'hot',
+    parse: parseWorkspaceRetentionDays,
+    validate: validateWorkspaceRetentionDays,
+    hint: WORKSPACE_RETENTION_HINT,
   }),
 });
 
@@ -594,79 +689,277 @@ export async function saveRuntimeSetting({
 }
 
 // ---------------------------------------------------------------------------
-// 热读（P2a 第一格：`session.ttl_seconds`）
+// 热读（P2a 第一格 `session.ttl_seconds` + P3 第一批第二格 `workspace.retention_days`）
 // ---------------------------------------------------------------------------
 
 /**
  * 热读缓存的存活时间（毫秒）。**5 秒是口径，不是性能参数**：
- * 它定义的是「管理台改了 TTL 之后，最坏多久全部进程都看到新值」这个上界。
+ * 它定义的是「管理台改了这一格之后，最坏多久全部进程都看到新值」这个上界。
  * 不做成 0（每请求现读）是刻意的：`/api/me` 是每个登录用户每个页面加载都要打的一次，
  * 让一次纯配置读挂在那条路径上 = 让 `runtime_settings` 成为登录面的依赖（#520 那一单的病根）。
+ * ⚠ 所有热读旋钮**共用这一个数**（P2a 定下的口径），不要给第二格单独拍一个 3 秒/10 秒：
+ *   「改完最多 5 秒生效」是对外的一句话，变成逐旋钮不同就是三句话。
  */
-export const SESSION_TTL_CACHE_TTL_MS = 5000;
+export const HOT_READ_CACHE_TTL_MS = 5000;
+
+/** P2a 起就在对外的名字（单测引它钉口径）；值就是上面那一个，不留两份数。 */
+export const SESSION_TTL_CACHE_TTL_MS = HOT_READ_CACHE_TTL_MS;
 
 /**
- * 单格模块级缓存（形状照 `llm.js` 的 `dataPlaneNameCache`，连**代际号**一起照）：
- * `{ pool, at, resolved }`。键到 pool 是刻意的：测试与多池场景下不许 A 池的读数喂给 B 池。
- */
-const sessionTtlCache = { pool: null, at: 0, resolved: null };
-
-/**
- * 缓存代际号，只在 `invalidateSessionTtlCache()` 里自增。为什么必须有（`llm.js` 那一单已经付过账）：
- * 本函数会 `await` 一次 DB 读，await 期间可能有人保存并失效了缓存；等这趟回来，**旧快照**会被
- * 无条件写回缓存 ⇒ 「失效」被这趟在飞的读撤销。读侧在 await **之前**记下代际号，写回时只有
- * 代际没变才落盘；变了就只把结果给当前调用方（它拿到的仍是它自己那趟的真实读数）。
- */
-let sessionTtlCacheGeneration = 0;
-
-/**
- * **in-flight 合并槽**（#701 返修 MED）：`{ pool, promise }`，形状照 `llm.js` 的 TTL 缓存那套
- * 「按 client 身份分槽」的思路 —— 槽键到 **pool 身份**，A 池的在飞读不许喂给 B 池。
+ * 一格热读旋钮的全部机件 ⇒ `{ read, invalidate }`（**P3 抽的工厂**）。
  *
- * 为什么必须有（review 实测的形状）：这条读挂在**续期热路径**（`http.js:1071`）上，而缓存
- * 刚失效/刚过期那一刻是**并发**的：4 路同时打到冷缓存 ⇒ 4 条 SQL，DB 慢时每路各自可能等满
- * 读超时（默认 1500ms，`:61`）⇒ 一次 DB 抖动把一整波登录/续期各挂 1.5 秒。合并后同一波只发
- * **一条** SQL，其余各路复用同一趟的结果（等同一份时间，但不再各发一条、也不再各占一条连接）。
+ * 为什么抽：P2a 那一格是 60 行缓存 + 40 行在飞合并 + 40 行回落，**没有一格是 TTL 特有的**
+ *（特有的只有 key 名、人话名字、以及三档都给不出值时那个数）。拓到第二格就是 140 行副本，
+ * 而副本意味着「同一个 bug 要修两次」（#485/#698/#701 在那两上付过账）。所以这里只把
+ * **三件参数**（key / warnLabel / fallbackDefault）接进去，其余口径逐字搬过来：
+ *   1. **缓存** `{ pool, at, resolved }` + **代际号**（键到 pool 身份，并防「在飞那趟撤销失效」）；
+ *   2. **in-flight 合并**：同池并发冷读只发**一条** SQL；落定必清槽，**失败也清**；
+ *   3. **一次热读最多一条 warn**（`hotReadWarnMerger`）+ **读侧永不抛** + env 那一档也过闸。
  *
- * ⚠ 两条容易漏的口径（判据 RS-18 / RS-19 / RS-20 各钉一条）：
- *   1. **落定必清槽，失败也要清**：不清槽 ⇒ 之后所有读都钉在同一个**已落定**的 promise 上
- *      （失败那趟尤其糟：它没有缓存可兜，每次都被拉回去重放同一个失败）。
- *   2. **写路径失效也要清槽**：只清缓存的话，「PUT 完的下一次读」可能命中 PUT **之前**就发起的
- *      那一趟 ⇒ 拿到旧值，且那次读**不发 SQL**（写进去了却看不见，是比慢更难查的形状）。
+ * ⚠ 每一格热读旋钮**自己一份缓存与一个槽**（工厂里的那三个局部量）：共用一份就是
+ *   「保存 TTL 会把保留天数那一格的缓存一起抹掉」，然它们读的是同一张表但不同 key。
+ *
+ * @param {object} opts
+ * @param {string} opts.key            registry 里的 key（= 取 `values[key]`、也是 problems 里那一格）
+ * @param {string} opts.warnLabel      人话名字（只进日志/错误文案；**不是**第二份真相）
+ * @param {number} opts.fallbackDefault 三档都给不出值时的绝对兵（绝不回 `undefined`）
  */
-const sessionTtlInFlight = { pool: null, promise: null };
+function createHotReader({ key, warnLabel, fallbackDefault, cacheTtlMs = HOT_READ_CACHE_TTL_MS }) {
+  /**
+   * 单格模块级缓存（形状照 `llm.js` 的 `dataPlaneNameCache`，连**代际号**一起照）：
+   * `{ pool, at, resolved }`。键到 pool 是刻意的：测试与多池场景下不许 A 池的读数喂给 B 池。
+   */
+  const cache = { pool: null, at: 0, resolved: null };
 
-/** 只有槽里还是**自己那一趟**时才清（在飞期间被失效过、或已被新趟接替 ⇒ 不许撤销别人的槽）。 */
-function releaseSessionTtlInFlight(task) {
-  if (sessionTtlInFlight.promise === task) {
-    sessionTtlInFlight.pool = null;
-    sessionTtlInFlight.promise = null;
+  /**
+   * 缓存代际号，只在下面那个 `invalidate()` 里自增。为什么必须有（`llm.js` 那一单已经付过账）：
+   * 本函数会 `await` 一次 DB 读，await 期间可能有人保存并失效了缓存；等这趟回来，**旧快照**会被
+   * 无条件写回缓存 ⇒ 「失效」被这趟在飞的读撤销。读侧在 await **之前**记下代际号，写回时只有
+   * 代际没变才落盘；变了就只把结果给当前调用方（它拿到的仍是它自己那趟的真实读数）。
+   */
+  let generation = 0;
+
+  /**
+   * **in-flight 合并槽**（#701 返修 MED）：`{ pool, promise }`，形状照 `llm.js` 的 TTL 缓存那套
+   * 「按 client 身份分槽」的思路 —— 槽键到 **pool 身份**，A 池的在飞读不许喂给 B 池。
+   *
+   * 为什么必须有（review 实测的形状）：这条读挂在**续期热路径**（`http.js` 的 `/api/me`）与
+   * **每一拍 offboarding** 上，而缓存刚失效/刚过期那一刻是**并发**的：4 路同时打到冷缓存
+   * ⇒ 4 条 SQL，DB 慢时每路各自可能等满读超时（默认 1500ms）⇒ 一次 DB 抖动把一整波登录/
+   * 续期各挂 1.5 秒。合并后同一波只发**一条** SQL，其余各路复用同一趟的结果（等同一份时间，
+   * 但不再各发一条、也不再各占一条连接）。
+   *
+   * ⚠ 两条容易漏的口径（判据 RS-18 / RS-19 / RS-20 各钉一条，第二格是同形的 RS-26/RS-27）：
+   *   1. **落定必清槽，失败也要清**：不清槽 ⇒ 之后所有读都钉在同一个**已落定**的 promise 上
+   *      （失败那趟尤其糟：它没有缓存可兜，每次都被拉回去重放同一个失败）。
+   *   2. **写路径失效也要清槽**：只清缓存的话，「PUT 完的下一次读」可能命中 PUT **之前**就发起的
+   *      那一趟 ⇒ 拿到旧值，且那次读**不发 SQL**（写进去了却看不见，是比慢更难查的形状）。
+   */
+  const inFlight = { pool: null, promise: null };
+
+  /** 只有槽里还是**自己那一趟**时才清（在飞期间被失效过、或已被新趟接替 ⇒ 不许撤销别人的槽）。 */
+  function releaseInFlight(task) {
+    if (inFlight.promise === task) {
+      inFlight.pool = null;
+      inFlight.promise = null;
+    }
   }
+
+  /**
+   * 丢弃这一格的缓存。**只在写路径调用**（`saveRuntimeSetting` 的 `COMMIT` 之后，经由
+   * `HOT_READ_INVALIDATORS`）。
+   *
+   * ⚠ 失效只覆盖**本进程**：多副本时别的进程最坏还要吃 5 秒旧值（TTL 到点自己恢复）。
+   *   所以口径是「下一次读、最多 5 秒内生效」，**不是**强一致，也不是「每个请求都现读 DB」。
+   *
+   * ⚠ 它同时清 **in-flight 槽**（#701 返修 MED 第二条）：在飞的那一趟是在写**之前**发起的，
+   *   它的结果已经是旧世界；不清槽就是「保存成功而界面还显示旧值」那条路。
+   */
+  function invalidate() {
+    generation += 1;
+    cache.pool = null;
+    cache.at = 0;
+    cache.resolved = null;
+    inFlight.pool = null;
+    inFlight.promise = null;
+  }
+
+  /**
+   * 一趟**真的发了 SQL** 的读（in-flight 合并的最小单位）：读整表 → 取 `key` 那一格
+   * → 按代际号回填缓存。**口径 1 不变**：这一趟算不出值时照样给回落值。
+   *
+   * 它**会抛**一支「DB 读不可用」（唯一的抛点，在缓存回填**之后**）：
+   *   * 抛给外层 ⇒ 外层按「读不到」回落（返回值与 debug 形状不变；warn 的形状见下面那个合并器）；
+   *   * 更重要的是让 in-flight 槽知道「这一趟是**失败落定**」，从而在失败路径上也清槽。
+   *     不抛的话「失败」与「成功」在槽看来同形 ⇒ 「失败必清槽」退化成「跑完了顺手清」，
+   *     RS-19 那一格就红不了（变异会绿着过）。
+   *
+   * ⚠ #701 二审 LOW②：这一趟的 warn **最多一条**（`hotReadWarnMerger`），并且算好的回落值挂在
+   *   抛出的错误的 `details.fallbackValue` 上 —— 外层与共享者**复用**它，不再自己重算一遍
+   *   env 闸（重算一遍 = 同一条 env warn 的第二份，也正是那半条刷屏的来源）。
+   */
+  async function flight({ pool, config, now, log, env, registry, entry, timeoutMs }) {
+    const generationAtStart = generation;
+    const at = now();
+    const warns = hotReadWarnMerger(log, warnLabel);
+    const fallback = () => {
+      // env 那一档也要过 registry 的闸（LOW③）：坏值 ⇒ 视为没给 ⇒ registry 默认 + 点名 warn。
+      const value = resolveEnvTier(entry, config, { env, log: warns.log }).value;
+      return value === undefined ? fallbackDefault : value;
+    };
+    let value;
+    let readUnavailable = null;
+    try {
+      try {
+        // 复用整表那一次读（同一份 SQL、同一份超时、同一份永不抛口径）——不另开 per-key 的 SELECT。
+        const { values, problems } = await readRuntimeSettings({
+          pool, registry, timeoutMs, env, log: warns.log,
+        });
+        const dbValue = values?.[key];
+        if (Number.isSafeInteger(dbValue)) {
+          value = dbValue;
+        } else {
+          // 故障（表不在 / 挂住 / 没有池子）与「有行但值坏」要分开：前者才是「这趟没读到东西」。
+          const reason = (problems ?? []).find((p) => p?.key === key)?.reason;
+          if (DB_READ_FAILURE_REASONS.has(reason)) readUnavailable = String(reason);
+          value = fallback();
+        }
+      } catch (err) {
+        // 双保险：`readRuntimeSettings` 自己永不抛，但它上面还套着 registry 注入这条缝
+        //（假库/假 registry 传进来就是这里的形状）⇒ 热路径一行都不许抛。
+        readUnavailable = `threw:${err?.message ?? err}`;
+        value = fallback();
+      }
+      if (generationAtStart === generation) {
+        cache.pool = pool;
+        cache.at = at;
+        cache.resolved = value;
+      }
+      if (readUnavailable) {
+        throw new RuntimeSettingsError('read_unavailable',
+          `${warnLabel} 的 DB 读不可用（${readUnavailable}）⇒ 已回落 env/默认`,
+          // `fallbackValue`：这一趟算好的回落值。`read_unavailable` 只在本模块内部被接住（全仓
+          // 调用方只有下面那个 `read`）⇒ 这些 `details` 不会泄漏到 HTTP 响应里。
+          { httpStatus: 500, details: { fallbackValue: value } });
+      }
+      return value;
+    } finally {
+      // 成功与失败都只在这里播那**唯一一条** warn（放 `finally`：连意外抛出也不吞掉理由）。
+      warns.emit();
+    }
+  }
+
+  /**
+   * 热读入口（口径与 `readRuntimeSettings` 逐字相同：DB 有效值 > env > registry 默认，读侧永不抛），
+   * 差别只有三件：① 结果进 5s 缓存；② 同池的并发冷读**合并成一趟 SQL**；③ 只回一个数。
+   *
+   * ⚠ 注释里别写成「每请求现读 DB」：真实形状是**最多 5 秒一次**（同池内命中缓存不发 SQL），
+   *   而同一波并发冷读只发**一条**（`inFlight`）。多副本时最坏 5 秒内各副本读到的值可以不同
+   *  （本进程保存会立刻失效，别的进程靠 TTL 到点）。
+   *
+   * @param {object} opts `{ pool, config, now?, log?, env?, registry?, ttlMs?, timeoutMs? }`
+   *   `now` / `ttlMs` 可注入 ⇒ 缓存的两端（命中 / 过期）能在假库里判定，不用真等 5 秒。
+   *   ⚠ 共享在飞那趟的调用方拿到的是**发起方**那趟的 `timeoutMs`（生产里只有一个池、一份 config，
+   *     所以这不是第二份真相；测试里并发那格必须用同一组参数）。
+   * @returns {Promise<number>} 生效的值；三档都给不出 ⇒ `fallbackDefault`（绝不回 `undefined`）
+   */
+  async function read({
+    pool, config, now = Date.now, log = console, env = process.env,
+    registry = RUNTIME_SETTING_REGISTRY, ttlMs = cacheTtlMs, timeoutMs,
+  } = {}) {
+    const entry = registry?.[key] ?? RUNTIME_SETTING_REGISTRY[key];
+    const at = now();
+    if (ttlMs > 0 && cache.resolved !== null
+      && cache.pool === pool && at - cache.at <= ttlMs) {
+      return cache.resolved;
+    }
+    const fallbackOnly = () => {
+      // 在飞那趟挂了/或压根没起：外层自己算一次回落值（同样是过闸的那一套，见 LOW③）。
+      const value = resolveEnvTier(entry, config, { env, log }).value;
+      return value === undefined ? fallbackDefault : value;
+    };
+    /**
+     * 那一趟失败时怎么把答案交出去（#701 二审 LOW②的另一半）：**复用那一趟算好的回落值**，
+     * 不再自己 `resolveEnvTier` 一遍。原本每接住一次 `read_unavailable` 就把同一条「env 兜底被拒」
+     * 再 warn 一遍（发起方一遍 + 每个共享者各一遍）叠加 `readRuntimeSettings` 自己那条 DB 故障
+     * warn ⇒ 一次热读三条、DB 抖动期刷屏。那一趟的 warn 已在 `flight` 的 `finally` 里播完
+     *（那一趟只一条），这里**只留 debug**。
+     *
+     * ⚠ 共享者拿到的是**发起方**那趟算出的回落值：与它自己那趟共用 `timeoutMs` 是同一个口径
+     *   （生产只有一份 config / env；测试里并发那格必须同参数）。
+     */
+    const answerOfFailedFlight = (err) => {
+      const carried = err?.details?.fallbackValue;
+      if (carried !== undefined) return carried;
+      // 不是那一趟递上来的回落（罕见的注入形状）⇒ 自己算，允许它自己 warn 一条。
+      return fallbackOnly();
+    };
+    // ② in-flight 合并：同池已有读在飞 ⇒ **复用那一趟**，不再发第二条 SQL（这就是 MED 的全部）。
+    if (inFlight.promise && inFlight.pool === pool) {
+      log?.debug?.(`[runtime-settings] 复用同池在飞的 ${warnLabel} 读（不重复发 SQL）`);
+      try {
+        return await inFlight.promise;
+      } catch (err) {
+        log?.debug?.(`[runtime-settings] 在飞那趟失败 ⇒ 本次读复用那一趟的回落值（${err?.message ?? err}）`);
+        return answerOfFailedFlight(err);
+      }
+    }
+    const task = flight({ pool, config, now, log, env, registry, entry, timeoutMs });
+    inFlight.pool = pool;
+    inFlight.promise = task;
+    // **成功与失败都要清槽**：`.then(onOk, onErr)` 两支都挂 `release`，而不是只在成功分支挂 ——
+    // 一次 DB 抖动把之后所有读钉在同一个已落定的 promise 上，比慢更难查。
+    // 挂在这里而不是 `finally` 里：清槽是**槽的**责任，`flight` 只管读数与缓存回填。
+    task.then(() => releaseInFlight(task), () => releaseInFlight(task));
+    try {
+      return await task;
+    } catch (err) {
+      // 口径 1：读侧永不抛。`flight` 里已经填过回落缓存、也已经播过那唯一一条 warn，
+      // 这里只负责把那一趟算好的值交出去（不再重算 env 闸 = 不再多一条重复 warn，LOW②）。
+      log?.debug?.(`[runtime-settings] ${key} 热读兜底 env/默认（${err?.message ?? err}）`);
+      return answerOfFailedFlight(err);
+    }
+  }
+
+  // `cache` / `inFlight` 跟着递出去只为单测能摸到槽（不要求它们存在，只用来钉「失败后槽是空的」）。
+  return { read, invalidate, cache, inFlight };
 }
 
+const sessionTtlHotReader = createHotReader({
+  key: SESSION_TTL_KEY,
+  warnLabel: 'session TTL',
+  fallbackDefault: SESSION_TTL_DEFAULT_SECONDS,
+});
+
+const workspaceRetentionHotReader = createHotReader({
+  key: WORKSPACE_RETENTION_KEY,
+  warnLabel: 'workspace 保留天数',
+  fallbackDefault: WORKSPACE_RETENTION_DEFAULT_DAYS,
+});
+
 /**
- * 丢弃 TTL 缓存。**只在写路径调用**（`saveRuntimeSetting` 的 `COMMIT` 之后）。
- *
- * ⚠ 失效只覆盖**本进程**：多副本时别的进程最坏还要吃 5 秒旧值（ TTL 到点自己恢复）。
- *   所以口径是「下一次读、最多 5 秒内生效」，**不是**强一致，也不是「每个请求都现读 DB」。
- *
- * ⚠ 它同时清 **in-flight 槽**（#701 返修 MED 第二条）：在飞的那一趟是在写**之前**发起的，
- *   它的结果已经是旧世界；不清槽就是「保存成功而界面还显示旧值」那条路。
+ * 丢弃 TTL 缓存（P2a 对外的名字；实现是上面那个工厂里每一格自己的 `invalidate`）。
+ * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（RS-7 钉住身份），P3 抽工厂后也不能换成间接层。
  */
 export function invalidateSessionTtlCache() {
-  sessionTtlCacheGeneration += 1;
-  sessionTtlCache.pool = null;
-  sessionTtlCache.at = 0;
-  sessionTtlCache.resolved = null;
-  sessionTtlInFlight.pool = null;
-  sessionTtlInFlight.promise = null;
+  sessionTtlHotReader.invalidate();
+}
+
+/** 丢弃 `workspace.retention_days` 的缓存与在飞槽（口径与上面逐字相同；写路径在 `COMMIT` 后调）。 */
+export function invalidateWorkspaceRetentionCache() {
+  workspaceRetentionHotReader.invalidate();
 }
 
 /**
- * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。P2a 只有一格；P3 加第二格热读旋钮时在这里
- * 多登记一行，**不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
+ * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。一格一行；加新的热读旋钮就在这里多登记一行，
+ * **不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
+ * ⚠ **漏登记这一行是 P3 那族最典型的坑**：保存能写进库、界面也会回填 DTO，但本进程的
+ *   热读还是旧值（最多 5 秒，而在飞那一趟是**不限时**的旧值）。
  */
-export const HOT_READ_INVALIDATORS = new Map([[SESSION_TTL_KEY, invalidateSessionTtlCache]]);
+export const HOT_READ_INVALIDATORS = new Map([
+  [SESSION_TTL_KEY, invalidateSessionTtlCache],
+  [WORKSPACE_RETENTION_KEY, invalidateWorkspaceRetentionCache],
+]);
 
 /**
  * #701 返修 LOW③：**env 兜底值也必须过 registry 的 `parse`/`validate`**（与 DB 值同一套闸）。
@@ -719,14 +1012,23 @@ function gateRegistryValue(entry, candidate) {
  * 只在「这一档的值来自 `config` 且过了闸」时被问到的那份旧口径：优先看 `config[<configPath>Source]`
  * （#485 为 `FILE_UPLOAD_MAX_BYTES` 立的那格：判据是「env 里有没有显式写这个键」，而不是
  * 「它是否等于默认值」——显式写了恰好等于默认值，来源是 env）。
- * 没有这个标注字段（P3 的新条目可能没有）⇒ 退回 P1 的口径：`config` 里有值就算 env，没有算 default。
+ *
+ * 没有这个标注字段（P3 的新条目可能没有）⇒ 原来的口径是「`config` 里有值就算 env」。那一条
+ * 对**永远有值的旋钮**会抖：`workspace.retention_days` 的 `loadConfig` 默认就是 `0`，而 `0` 不是
+ * 「没值」⇒ 运维压根没配过 `ERIX_WORKSPACE_RETENTION_DAYS`，管理台却会说「这一格是 env 配的」。
+ * P3 第一批改成：值恰好等于 registry 默认 ⇒ 报 `default`（分不清的时候宁可**少声称**一次 env，
+ * 「界面说 env 其实没配」是 #485/#701 一路在拆的那一类抖）；值与默认不同 ⇒ 才是真的有人给了。
+ * ⚠ 不拿它当「显式写了默认值」的判据：那条路仍走 `config[...Source]`（或由 `resolveEnvTier` 里
+ *   「env 原话在」那一支直接定成 `env`），这里的收窄只作用在**没有标注字段**的条目上。
  */
 function configTierSource(entry, config) {
   const flagPath = `${entry?.configPath ?? ''}Source`;
   if (config && Object.hasOwn(config, flagPath)) {
     return config[flagPath] === 'env' ? 'env' : 'default';
   }
-  return getPath(config, entry?.configPath) === undefined ? 'default' : 'env';
+  const value = getPath(config, entry?.configPath);
+  if (value === undefined) return 'default';
+  return value === entry?.defaultValue ? 'default' : 'env';
 }
 
 /**
@@ -777,7 +1079,7 @@ function resolveEnvTier(entry, config, { env = process.env, log = console } = {}
 
 /**
  * DB 那一档「**压根没读到**」的理由族（与「读到了但值不可用」分开：前者是故障，后者是数据）。
- * 只有故障族会把在飞那一趟标成失败（见 `sessionTtlFlight` 里那条 throw 的理由）。
+ * 只有故障族会把在飞那一趟标成失败（见 `createHotReader` 里 `flight` 的那条 throw）。
  */
 const DB_READ_FAILURE_REASONS = new Set(['read_failed', 'read_timeout', 'no_pool']);
 
@@ -787,7 +1089,7 @@ const DB_READ_FAILURE_REASONS = new Set(['read_failed', 'read_timeout', 'no_pool
  *
  * 为什么必须有（二审实测的形状）：DB 读失败（`read_failed`）**叠加** `SESSION_TTL_SECONDS`
  * 是坏值时，一次热读原本 warn **三条** —— `readRuntimeSettings` 一条「读 runtime_settings 失败」
- * + `sessionTtlFlight` 的回落算一条「env 兜底被拒」+ 外层接住 `read_unavailable` 后又算一条
+ * + 那一趟的回落算一条「env 兜底被拒」+ 外层接住 `read_unavailable` 后又算一条
  *（同一条文案的第二份，内容逐字相同）。DB 抖动期间**每个请求**都走这条路（缓存里钉着的就是
  * 回落值，5s 到点又来一趟）⇒ 刷屏；而 `docs/api/portal.md` §4.21 与 `docs/env.md` 的口径是
  * 「坏 env 留**一条**点名 warn」。
@@ -798,8 +1100,10 @@ const DB_READ_FAILURE_REASONS = new Set(['read_failed', 'read_timeout', 'no_pool
  *
  * ⚠ 只有一件事要说时**原文照播**（不改既有文案：RS-13 ② / RS-21 钉的就是那两条的原话）。
  * ⚠ 攒的范围只有**这一趟**：局部对象，不跨请求、不跨 pool，也不是进程级 once（下一趟该说还得说）。
+ * ⚠ `warnLabel` 是拼那一条**汇总**文案用的人话名字（P3 抽工厂后逐格不同）；单件的原文文案
+ *   一个字都不动 —— 那些原话是被单测钉住的。
  */
-function hotReadWarnMerger(log) {
+function hotReadWarnMerger(log, warnLabel = 'session TTL') {
   const pieces = [];
   return {
     /** 喂给下游（`readRuntimeSettings` / `resolveEnvTier`）：debug 原样转，warn 先攒着不直接落。 */
@@ -814,7 +1118,7 @@ function hotReadWarnMerger(log) {
       if (pieces.length === 1) { log?.warn?.(pieces[0]); return; }
       const body = pieces.map((m, i) => `${i + 1}) ${m.replace(/^\[runtime-settings\]\s*/, '')}`);
       log?.warn?.(
-        `[runtime-settings] 这一次 session TTL 热读同时撞上有 ${pieces.length} 件事，合成一条`
+        `[runtime-settings] 这一次 ${warnLabel} 热读同时撞上有 ${pieces.length} 件事，合成一条`
         + '（逐条播就是刷屏：DB 抖动期每个请求都走这条路）⇒ ' + body.join(' ；'),
       );
     },
@@ -822,146 +1126,34 @@ function hotReadWarnMerger(log) {
 }
 
 /**
- * 一趟**真的发了 SQL** 的读（in-flight 合并的最小单位）：读整表 → 取 `session.ttl_seconds`
- * → 按代际号回填缓存。**口径 1 不变**：这一趟算不出值时照样给回落值。
- *
- * 它**会抛**一支「DB 读不可用」（唯一的抛点，在缓存回填**之后**）：
- *   * 抛给外层 ⇒ 外层按「读不到」回落（返回值与 debug 形状不变；warn 的形状见上面那个合并器）；
- *   * 更重要的是让 in-flight 槽知道「这一趟是**失败落定**」，从而在失败路径上也清槽。
- *     不抛的话「失败」与「成功」在槽看来同形 ⇒ 「失败必清槽」退化成「跑完了顺手清」，
- *     RS-19 那一格就红不了（变异 M-2 会绿着过）。
- *
- * ⚠ #701 二审 LOW②：这一趟的 warn **最多一条**（`hotReadWarnMerger`），并且算好的回落值挂在
- *   抛出的错误的 `details.fallbackSeconds` 上 —— 外层与共享者**复用**它，不再自己重算一遍
- *   env 闸（重算一遍 = 同一条 env warn 的第二份，也正是那半条刷屏的来源）。
- */
-async function sessionTtlFlight({
-  pool, config, now, log, env, registry, entry, timeoutMs,
-}) {
-  const generationAtStart = sessionTtlCacheGeneration;
-  const at = now();
-  const warns = hotReadWarnMerger(log);
-  const fallback = () => {
-    // env 那一档也要过 registry 的闸（LOW③）：坏值 ⇒ 视为没给 ⇒ registry 默认 + 点名 warn。
-    const value = resolveEnvTier(entry, config, { env, log: warns.log }).value;
-    return value === undefined ? SESSION_TTL_DEFAULT_SECONDS : value;
-  };
-  let value;
-  let readUnavailable = null;
-  try {
-    try {
-      // 复用整表那一次读（同一份 SQL、同一份超时、同一份永不抛口径）——不另开 per-key 的 SELECT。
-      const { values, problems } = await readRuntimeSettings({
-        pool, registry, timeoutMs, env, log: warns.log,
-      });
-      const dbValue = values?.[SESSION_TTL_KEY];
-      if (Number.isSafeInteger(dbValue)) {
-        value = dbValue;
-      } else {
-        // 故障（表不在 / 挂住 / 没有池子）与「有行但值坏」要分开：前者才是「这趟没读到东西」。
-        const reason = (problems ?? []).find((p) => p?.key === SESSION_TTL_KEY)?.reason;
-        if (DB_READ_FAILURE_REASONS.has(reason)) readUnavailable = String(reason);
-        value = fallback();
-      }
-    } catch (err) {
-      // 双保险：`readRuntimeSettings` 自己永不抛，但它上面还套着 registry 注入这条缝
-      //（假库/假 registry 传进来就是这里的形状）⇒ 热路径一行都不许抛（抛了就是 `/api/me` 500）。
-      readUnavailable = `threw:${err?.message ?? err}`;
-      value = fallback();
-    }
-    if (generationAtStart === sessionTtlCacheGeneration) {
-      sessionTtlCache.pool = pool;
-      sessionTtlCache.at = at;
-      sessionTtlCache.resolved = value;
-    }
-    if (readUnavailable) {
-      throw new RuntimeSettingsError('read_unavailable',
-        `session TTL 的 DB 读不可用（${readUnavailable}）⇒ 已回落 env/默认`,
-        // `fallbackSeconds`：这一趟算好的回落值。`read_unavailable` 只在本模块内部被接住（全仓
-        // 唯一调用方是 `readSessionTtlSeconds`）⇒ 这些 `details` 不会泄漏到 HTTP 响应里。
-        { httpStatus: 500, details: { fallbackSeconds: value } });
-    }
-    return value;
-  } finally {
-    // 成功与失败都只在这里播那**唯一一条** warn（放 `finally`：连意外抛出也不吞掉理由）。
-    warns.emit();
-  }
-}
-
-/**
- * 会话 TTL 的**热读**入口（`http.js` 的建会话/续期路径调它）。
- *
- * 口径与 `readRuntimeSettings` 逐字相同（DB 有效值 > env > registry 默认，读侧永不抛），
- * 差别只有三件：① 结果进 5s 缓存；② 同池的并发冷读**合并成一趟 SQL**；③ 只回一个数
- * （调用方是热路径，不关心回落理由）。
- *
- * ⚠ 注释里别写成「每请求现读 DB」：真实形状是**最多 5 秒一次**（同池内命中缓存不发 SQL），
- *   而同一波并发冷读只发**一条**（`sessionTtlInFlight`）。
- *   多副本时最坏 5 秒内各副本读到的值可以不同（本进程保存会立刻失效，别的进程靠 TTL 到点）。
+ * 会话 TTL 的**热读**入口（`http.js` 的建会话/续期路径调它）。P2a 的对外形状，实现已搬进
+ * `createHotReader` —— **对外行为逐字不变**（RS-14~RS-22 那九格原样绿就是这件事的判据），
+ * 差别只有两处纯文字：错误文案里 `fallbackSeconds` 改叫 `fallbackValue`（只在本模块内部流动），
+ * 以及 debug 文案里的名字换成参数化的 `warnLabel`。
  *
  * @param {object} opts `{ pool, config, now?, log?, env?, registry?, ttlMs?, timeoutMs? }`
- *   `now` / `ttlMs` 可注入 ⇒ 缓存的两端（命中 / 过期）能在假库里判定，不用真等 5 秒。
- *   ⚠ 共享在飞那趟的调用方拿到的是**发起方**那趟的 `timeoutMs`（生产里只有一个池、一份 config，
- *     所以这不是第二份真相；测试里并发那格必须用同一组参数，见 RS-18）。
  * @returns {Promise<number>} 生效的 TTL 秒数；三档都给不出值 ⇒ `SESSION_TTL_DEFAULT_SECONDS`
  *   （绝不回 `undefined`：调用方把它交给 `createSession`，`undefined` 会变成「库里没有 TTL」）
  */
-export async function readSessionTtlSeconds({
-  pool, config, now = Date.now, log = console, env = process.env,
-  registry = RUNTIME_SETTING_REGISTRY, ttlMs = SESSION_TTL_CACHE_TTL_MS, timeoutMs,
-} = {}) {
-  const entry = registry?.[SESSION_TTL_KEY] ?? RUNTIME_SETTING_REGISTRY[SESSION_TTL_KEY];
-  const at = now();
-  if (ttlMs > 0 && sessionTtlCache.resolved !== null
-    && sessionTtlCache.pool === pool && at - sessionTtlCache.at <= ttlMs) {
-    return sessionTtlCache.resolved;
-  }
-  const fallbackOnly = () => {
-    // 在飞那趟挂了/或压根没起：外层自己算一次回落值（同样是过闸的那一套，见 LOW③）。
-    const value = resolveEnvTier(entry, config, { env, log }).value;
-    return value === undefined ? SESSION_TTL_DEFAULT_SECONDS : value;
-  };
-  /**
-   * 那一趟失败时怎么把答案交出去（#701 二审 LOW②的另一半）：**复用那一趟算好的回落值**，
-   * 不再自己 `resolveEnvTier` 一遍。原本每接住一次 `read_unavailable` 就把同一条「env 兜底被拒」
-   * 再 warn 一遍（发起方一遍 + 每个共享者各一遍），叠加 `readRuntimeSettings` 自己那条 DB 故障
-   * warn ⇒ 一次热读三条、DB 抖动期刷屏。那一趟的 warn 已在 `sessionTtlFlight` 的 `finally` 里
-   * 播完（那一趟只一条），这里**只留 debug**。
-   *
-   * ⚠ 共享者拿到的是**发起方**那趟算出的回落值：与它自己那趟共用 `timeoutMs` 是同一个口径
-   *   （生产只有一份 config / env；测试里并发那格必须同参数，见 RS-18 / RS-22）。
-   */
-  const answerOfFailedFlight = (err) => {
-    const carried = err?.details?.fallbackSeconds;
-    if (carried !== undefined) return carried;
-    // 不是那一趟递上来的回落（罕见的注入形状）⇒ 自己算，允许它自己 warn 一条。
-    return fallbackOnly();
-  };
-  // ② in-flight 合并：同池已有读在飞 ⇒ **复用那一趟**，不再发第二条 SQL（这就是 MED 的全部）。
-  if (sessionTtlInFlight.promise && sessionTtlInFlight.pool === pool) {
-    log?.debug?.('[runtime-settings] 复用同池在飞的 session TTL 读（不重复发 SQL）');
-    try {
-      return await sessionTtlInFlight.promise;
-    } catch (err) {
-      log?.debug?.(`[runtime-settings] 在飞那趟失败 ⇒ 本次读复用那一趟的回落值（${err?.message ?? err}）`);
-      return answerOfFailedFlight(err);
-    }
-  }
-  const task = sessionTtlFlight({ pool, config, now, log, env, registry, entry, timeoutMs });
-  sessionTtlInFlight.pool = pool;
-  sessionTtlInFlight.promise = task;
-  // **成功与失败都要清槽**（M-2 点名的就是这一支）：`.then(onOk, onErr)` 两支都挂 `release`，
-  // 而不是只在成功分支挂 —— 一次 DB 抖动把之后所有读钉在同一个已落定的 promise 上，比慢更难查。
-  // 挂在这里而不是 `finally` 里：清槽是**槽的**责任，`sessionTtlFlight` 只管读数与缓存回填。
-  task.then(() => releaseSessionTtlInFlight(task), () => releaseSessionTtlInFlight(task));
-  try {
-    return await task;
-  } catch (err) {
-    // 口径 1：读侧永不抛。`sessionTtlFlight` 里已经填过回落缓存、也已经播过那唯一一条 warn，
-    // 这里只负责把那一趟算好的值交出去（不再重算 env 闸 = 不再多一条重复 warn，LOW②）。
-    log?.debug?.(`[runtime-settings] readSessionTtlSeconds 兜底 env/默认（${err?.message ?? err}）`);
-    return answerOfFailedFlight(err);
-  }
+export function readSessionTtlSeconds(options = {}) {
+  return sessionTtlHotReader.read(options);
+}
+
+/**
+ * `workspace.retention_days` 的**热读**入口（P3 第一批；调用方是 `offboarding.js` 的循环）。
+ *
+ * 口径与 `readSessionTtlSeconds` 同一套（同一工厂）：DB 有效值 > env（过闸）> registry 默认，
+ * 5s 缓存 + 同池在飞合并 + 写路径失效，**读侧永不抛**，一次热读最多一条 warn。
+ *
+ * ⚠ 与 TTL 那格**不共用缓存与槽**：共用一份就是「保存 TTL 把保留天数的缓存一起抹掉」，
+ *   而两格读的是同一张表的不同 key（判据：RS-25 那格的两把失效）。
+ *
+ * @param {object} opts 同上
+ * @returns {Promise<number>} 生效的保留天数；三档都给不出 ⇒ `0`（= **不自动清理**，安全侧）。
+ *   绝不回 `undefined`：调用方拿它比 `=== 0` 决定这一拍要不要清理。
+ */
+export function readWorkspaceRetentionDays(options = {}) {
+  return workspaceRetentionHotReader.read(options);
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1175,16 @@ const SELECT_ADMIN_SQL = 'SELECT key, value, updated_at, updated_by FROM runtime
 function toIso(value) {
   if (value instanceof Date) return value.toISOString();
   return typeof value === 'string' && value ? value : null;
+}
+
+/**
+ * `hint` 是**可选键**：registry 那一格登记了才带，没登记就连键都不存（不是 `null`、不是空串）。
+ * 为什么不是「人人一个 null」：RS-16 钉的是「一项的键就是那八个」，而前端也得自己判空才能
+ * 不渲染一行空提示。带与不带都由 registry 说话，前端只照 DTO 渲染。
+ */
+function withHint(dto, entry) {
+  const hint = entry?.hint;
+  return typeof hint === 'string' && hint !== '' ? { ...dto, hint } : dto;
 }
 
 /**
@@ -1009,16 +1211,16 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
     updatedBy: row?.updated_by ?? null,
   };
   if (parsed?.ok) {
-    return { ...base, value: parsed.value, source: 'db', reason: null };
+    return withHint({ ...base, value: parsed.value, source: 'db', reason: null }, entry);
   }
   // 回落：值来自 env 那一档（或 registry 默认），`reason` 说清为什么不是 db。
   // `row` 存在但值非法 ⇒ 保留库里那行的 updated_at/by（它们是真发生过的事），只是值不用它。
-  return {
+  return withHint({
     ...base,
     value: envTier?.value,
     source: envTier?.source ?? 'default',
     reason: row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row'),
-  };
+  }, entry);
 }
 
 /**
@@ -1081,7 +1283,9 @@ export async function listRuntimeSettingsAdmin({
 
 /** 保存后的 DTO：值/时间/人**只来自 `RETURNING`**（口径 4），`label`/`applyMode` 是 registry 的静态元数据。 */
 function toSavedItem(entry, saved) {
-  return {
+  // `hint` 与 GET 同一口径（只在登记了的那格带）：保存后的那个 item 会直接替掉界面上的那一行，
+  // 这里漏了它，保存完提示就消失（判据：RS-29 的 PUT 腿 + 前端视图 spec 的保存腿）。
+  return withHint({
     key: saved.key,
     label: entry?.label ?? saved.key,
     value: saved.value,
@@ -1090,7 +1294,7 @@ function toSavedItem(entry, saved) {
     applyMode: entry?.applyMode === 'hot' ? 'hot' : 'restart',
     updatedAt: saved.updatedAt ?? null,
     updatedBy: saved.updatedBy ?? null,
-  };
+  }, entry);
 }
 
 /**

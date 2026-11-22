@@ -24,7 +24,14 @@ export type RuntimeSettingSource = (typeof RUNTIME_SETTING_SOURCES)[number];
 export const RUNTIME_SETTING_APPLY_MODES = ['hot', 'restart'] as const;
 export type RuntimeSettingApplyMode = (typeof RUNTIME_SETTING_APPLY_MODES)[number];
 
-/** 一个配置项（GET `items[]` 与 PUT `item` 同形）。 */
+/**
+ * 一个配置项（GET `items[]` 与 PUT `item` 同形）。
+ *
+ * `hint` 是**可选键**（后端 registry 那一格登记了才带，没登记就连键都没有 —— 不是 `null`、
+ * 不是空串，见 `portal/src/runtime-settings.js` 的 `withHint` 与 §4.21）。
+ * 为什么不是「人人一个 null」：那一行小字要「有就渲染、没有就不占行」，一个恒存在的 `null`
+ * 只能让渲染层自己判空，而键的缺席/存在本身就是后端给的信号。
+ */
 export interface RuntimeSettingItem {
   key: string;
   label: string;
@@ -33,6 +40,8 @@ export interface RuntimeSettingItem {
   applyMode: RuntimeSettingApplyMode;
   updatedAt: string | null;
   updatedBy: string | null;
+  /** 服务端登记过的行内提示文案（原样照抄，本页不翻译、不参与任何判定）。 */
+  hint?: string;
 }
 
 const asSource = (raw: unknown): RuntimeSettingSource =>
@@ -55,12 +64,20 @@ const asScalarOrNull = (raw: unknown): RuntimeSettingItem['value'] => {
 const asTextOrNull = (raw: unknown): string | null =>
   typeof raw === 'string' && raw.trim() !== '' ? raw : null;
 
+/**
+ * `hint` 走的是**白名单里的可选键**：非字符串 / 空串 / 纯空白 ⇒ **键不出现**（不是 `hint: null`、
+ * 不是 `hint: ''`）。差别是可断言的：`'hint' in item` 与渲染层的 `v-if` 都以键的缺席为准，
+ * 归一化时补一个 `null` 就是把「后端没说」变成「后端说了个空」，前端也就没法「没有就不占行」。
+ */
+const withOptionalHint = <T extends object>(out: T, raw: unknown): T & { hint?: string } =>
+  typeof raw === 'string' && raw.trim() !== '' ? { ...out, hint: raw } : out;
+
 /** 单项归一化（GET 的 `items[]` 与 PUT 的 `item` 共用这一份）。 */
 export function normalizeRuntimeSettingItem(raw: unknown): RuntimeSettingItem | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
   if (typeof r.key !== 'string' || r.key.trim() === '') return null;
-  return {
+  return withOptionalHint({
     key: r.key,
     label: typeof r.label === 'string' && r.label.trim() !== '' ? r.label : r.key,
     value: asScalarOrNull(r.value),
@@ -68,7 +85,7 @@ export function normalizeRuntimeSettingItem(raw: unknown): RuntimeSettingItem | 
     applyMode: asApplyMode(r.applyMode),
     updatedAt: asTextOrNull(r.updatedAt),
     updatedBy: asTextOrNull(r.updatedBy),
-  };
+  }, r.hint);
 }
 
 /** `GET` 响应归一化：只认 `items` 数组，**按 key 去重且保持服务端顺序**（顺序是 registry 的顺序）。 */
