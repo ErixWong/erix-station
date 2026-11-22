@@ -577,34 +577,76 @@ test('US-17【活一·工单口径】DB 卡住（读取不返回）时上传**�
     }
   });
 
-test('US-18【活二】保存只发**一条**语句，且那条语句同时写 upload_settings 与 audit_log（旧值也在这条里取）', async () => {
+/** 把一条语句归类成事务形状里的一个角色（认不出来就回 `OTHER:…`，让断言消息能说清是什么）。 */
+function txRole(sql) {
+  const head = String(sql).trim().split(/\s+/)[0].toUpperCase();
+  if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(head)) return head;
+  if (/INSERT INTO upload_settings/.test(sql)) return 'UPSERT';
+  if (/INSERT INTO audit_log/.test(sql)) return 'AUDIT';
+  if (/FROM upload_settings/.test(sql)) return /\bFOR UPDATE\b/.test(sql) ? 'SELECT_FOR_UPDATE' : 'SELECT';
+  return `OTHER:${String(sql).replace(/\s+/g, ' ').slice(0, 40)}`;
+}
+
+/** 保存路径产生的语句流水（事务语句 + 两张表的语句；其余（会话鉴权等）不算进形状）。 */
+const saveShape = (pool) => pool.statements
+  .filter((r) => /^(BEGIN|COMMIT|ROLLBACK)$/.test(String(r.sql).trim())
+    || /upload_settings|audit_log/.test(r.sql))
+  .map((r) => ({ role: txRole(r.sql), sql: String(r.sql).replace(/\s+/g, ' ') }));
+
+test('US-18【活二】保存 = 一个事务：BEGIN → 单独一条 SELECT … FOR UPDATE → upsert → 审计 → COMMIT', async () => {
   const pool = new FakePool();
   pool.uploadSettings = { max_file_bytes: 8 * MIB, updated_at: new Date(), updated_by: null };
   await updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 2 * MIB } });
-  const touched = pool.statements.filter((r) => /upload_settings|audit_log/.test(r.sql));
-  assert.equal(touched.length, 1,
-    `保存必须是**一条**语句（读旧值 + upsert + 审计）；实际发了 ${touched.length} 条：`
-    + touched.map((r) => r.sql.replace(/\s+/g, ' ').slice(0, 60)).join(' | '));
-  const sql = touched[0].sql;
-  assert.match(sql, /INSERT INTO upload_settings/, '这条要写设置');
-  assert.match(sql, /INSERT INTO audit_log/, '同一条要写审计（分开两个 await 就是活二那个洞）');
-  assert.match(sql, /\bWITH\s+prev\b/i, '旧值必须在同一条语句里取（另发一条 SELECT 就是可插队的窗口）');
-  assert.equal(pool.audit.length, 1, '一次保存恰好一条审计（调用方再补一笔 auth.audit 就是重复记账）');
+  const shape = saveShape(pool);
+  // 顺序就是契约（口径 6）：少 BEGIN 就没有原子性，`SELECT` 排在 upsert 之后就看不见前一个已提交值。
+  assert.deepEqual(shape.map((s) => s.role), ['BEGIN', 'SELECT_FOR_UPDATE', 'UPSERT', 'AUDIT', 'COMMIT'],
+    `保存的事务形状必须是 BEGIN → SELECT … FOR UPDATE → upsert → 审计 → COMMIT，实得：`
+    + shape.map((s) => s.role).join(' → '));
+  const forUpdate = shape[1].sql;
+  assert.doesNotMatch(forUpdate, /INSERT INTO/,
+    '拿旧值那条必须**单独一条**（嵌进 upsert 就是上一版那条 CTE：同语句内 FOR UPDATE 看不见本语句要改的行）');
+  assert.match(shape[2].sql, /ON CONFLICT \(id\) DO UPDATE/, '写这一行仍是单行 upsert（口径 4）');
+  assert.match(shape[2].sql, /RETURNING/, '响应必须来自 RETURNING（不信输入）');
+  assert.doesNotMatch(shape[2].sql, /\bFOR UPDATE\b/, 'upsert 那条里不许出现 FOR UPDATE（#698 的 500 现场）');
+  assert.equal(shape.filter((s) => s.role === 'AUDIT').length, 1,
+    '一次保存恰好一条审计（调用方再补一笔 auth.audit 就是重复记账）');
+  assert.equal(pool.audit.length, 1, '库里也必须恰好一行（形状对了但没落库同样是假绿）');
+  assert.equal(pool.statements.filter((r) => /^ROLLBACK$/.test(String(r.sql).trim())).length, 0,
+    '成功路径不许出现 ROLLBACK（COMMIT 之后再 ROLLBACK 是空操作，但形状说明有人在自我怀疑）');
 });
 
-test('US-19【活二】并发两次保存：每条审计的 previous 是**紧邻的前一个值**，不是自己进来之前的那个数', async () => {
+// ⚠ **这一格是形状闸，不是并发判据。** fake pool 按 SQL 文本同步裁决，**不模拟 PG 的行锁与可见性**
+// ⇒ 它在 fake 里恒绿恒红都推不出真库行为（上一版就是被这种"恒绿"放过了 500，被这一版的"恒绿"
+// 放过了审计链 MED）。并发链的真判据在真库文件：
+// `portal/test/upload-settings-real-db.test.js` 的「#698b 并发链（真并发：两个连接）」那一格。
+// 这里只钉「形状对不对」：`SELECT … FOR UPDATE` 必须在 upsert **之前**、且与 upsert/审计**在同一个事务里**
+// ——形状错了，真库上那条链必然也错；形状对了也不保证链对（所以必须有真库那一格）。
+test('US-19【活二·形状闸】SELECT … FOR UPDATE 必须在 upsert 之前且同在一个事务里（并发链本身在真库文件判）', async () => {
   const pool = new FakePool();
   pool.uploadSettings = { max_file_bytes: 8 * MIB, updated_at: new Date(), updated_by: null };
+  await updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 2 * MIB } });
+  const roles = saveShape(pool).map((s) => s.role);
+  const at = (role) => roles.indexOf(role);
+  assert.ok(at('BEGIN') >= 0 && at('SELECT_FOR_UPDATE') >= 0, `事务与拿锁语句都必须存在：${roles.join(' → ')}`);
+  assert.ok(at('SELECT_FOR_UPDATE') < at('UPSERT'),
+    '拿锁/取旧值必须**在写之前**：写在后就读不到"前一个已提交值"，审计的 previous_* 就成了自己进来之前的数');
+  assert.ok(at('BEGIN') < at('SELECT_FOR_UPDATE') && at('SELECT_FOR_UPDATE') < at('COMMIT'),
+    '拿锁必须在同一个事务里：事务外的 FOR UPDATE 随语句结束就放锁 ⇒ 并发第二条不必等（= 本轮要修的 MED）');
+  assert.ok(at('AUDIT') > at('BEGIN') && at('AUDIT') < at('COMMIT'), '审计也必须在同一个事务里（同生共死）');
+
+  // 反面对照（把"fake 不是并发判据"这件事本身钉住）：同一个 fake 上并发两次保存，两条审计的
+  // `previous_max_bytes` 是**同一个值**（8 MiB）——正是独立审计那条 MED 的形状。真库上带着 FOR UPDATE
+  // 时它们是串成链的（{8 MiB, 2 MiB}），fake 里没有锁 ⇒ 拿不到那个结果。**别把这条读成"链已测"。**
+  const racy = new FakePool();
+  racy.uploadSettings = { max_file_bytes: 8 * MIB, updated_at: new Date(), updated_by: null };
   await Promise.all([
-    updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 2 * MIB } }),
-    updateUploadSettings({ pool, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 4 * MIB } }),
+    updateUploadSettings({ pool: racy, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 2 * MIB } }),
+    updateUploadSettings({ pool: racy, config: ENV32, actorId: ADMIN.id, fields: { maxFileBytes: 4 * MIB } }),
   ]);
-  const auditPrev = pool.audit.map((a) => JSON.parse(a.details).previous_max_bytes).sort((x, y) => x - y);
-  // 一条语句 ⇒ 第二条看到的是第一条写完的值：{8 MiB, 2 MiB} 两个**不同**的旧值。
-  // 旧的「先 SELECT 再 UPSERT」⇒ 两条都先读到 8 MiB ⇒ {8 MiB, 8 MiB} ⇒ 本条红（变异读数见交付报告）。
-  assert.deepEqual(auditPrev, [2 * MIB, 8 * MIB],
-    '两条审计必须串成一条链（8→2→4）。两条都记 8 MiB 就是"看不出谁把谁改成谁"');
-  assert.equal(pool.uploadSettings.max_file_bytes, 4 * MIB, '最后写入的值必须是终值');
+  const prevs = racy.audit.map((a) => JSON.parse(a.details).previous_max_bytes);
+  assert.equal(new Set(prevs).size, 1,
+    `fake 里没有行锁 ⇒ 两条并发保存都记并发前的同一个值（实得 ${JSON.stringify(prevs)}）。`
+    + '若这条变红，说明 fake 开始模拟锁/可见性了：那时请把真库那一格的口径搬过来，别在这里判语义。');
 });
 
 test('US-20【活二】审计里 previous_* 与接口返回的 previous **逐值等价**（SQL 那份 CASE 不许自成一套）', async () => {

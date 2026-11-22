@@ -1886,10 +1886,11 @@ async function handleAdminApi(req, res, ctx, url) {
         actorId: session.user.id,
         fields: body,
       });
-      // 审计**不在这里**写（复 audit 活二）：`admin.upload_settings_updated` 已经和 upsert 挤进同一条 CTE 语句
-      //（`upload-settings.js` 的 `SAVE_SQL`）。原来这里是「upsert 已成 → 再 await 一笔 INSERT」：
-      // INSERT 失败就是「设置已生效而审计一行没有」，并发保存还会把 `previous_*` 记成自己进来之前的数。
-      // 再补一笔 `auth.audit` 会退回那两个窗口，并且多写一条审计行（`upload-settings.test.js` US-18 钉这一点）。
+      // 审计**不在这里**写（复 audit 活二 + #698b）：`admin.upload_settings_updated` 已经与 upsert 挤进
+      // **同一个事务**（`upload-settings.js` 的 `BEGIN` → `SELECT … FOR UPDATE` → upsert → 审计 → `COMMIT`）。
+      // 最早这里是「upsert 已成 → 再 await 一笔 INSERT」：INSERT 失败就是「设置已生效而审计一行没有」，
+      // 并发保存还会把 `previous_*` 记成自己进来之前的数。再补一笔 `auth.audit` 会退回那两个窗口，
+      // 并且多写一条审计行（`upload-settings.test.js` US-18 钉这一点）。
       return sendJson(res, 200, result.settings);
     }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
