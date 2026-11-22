@@ -2999,19 +2999,24 @@ Content-Type: application/json
   （portal 服务没有 `env_file`）。但它的角色变了：它设的是**兜底值**，不再是「改了就生效」的旋钮。
 - 审计：每次保存写一条 `admin.upload_settings_updated`（`target='upload_settings'`，
   `details={max_file_bytes, previous_max_bytes, previous_source}`）—— 只记新值看不出「谁把谁改下来的」。
-- ⚠ **审计与保存在同一条 SQL 语句里**（复 audit 活二，`upload-settings.js` 的 `SAVE_SQL`：一条带 CTE 的
-  `WITH prev … upd … aud …`）。旧实现是「`SELECT` 旧值 → `UPSERT` → `await auth.audit()`」三个 await：
-  并发保存时两条都先读到同一个旧值 ⇒ `previous_*` 记的是**自己进来之前**的数（审计就白记了）；
-  审计 `INSERT` 失败 ⇒ **设置已生效而审计一行没有**。一条语句把两个窗口一起收掉：语句级原子
-  （审计写不进去 ⇒ 设置也没改），旧值取的是本语句快照并带 `FOR UPDATE` 行锁。调用方**不得**再补一笔
-  `auth.audit`（会退回两个窗口并多写一条）。判据：`upload-settings.test.js` US-18/19/20/21。
-- 「DB 旧值是否可用」的判定在 SQL 里只做**区间比较**，两个边界由 JS 常量当**参数**送进去（`$5/$6`）⇒
-  区间常量仍然只有 `MIN/MAX_MAX_FILE_BYTES` 一处；SQL 那份 CASE 与 JS `parseDbMaxFileBytes` 的等价性
-  由 US-20 逐值钉住（不是靠注释声明）。
+- ⚠ **保存在一个显式事务里**（#698 返修后的口径，取代早先的「与保存在同一条 SQL 语句里」）：
+  `upload-settings.js` 的 `BEGIN` → `SELECT … FOR UPDATE`（单独一条）→ upsert → 审计 → `COMMIT`，
+  出错 `ROLLBACK`。要收掉的两个窗口没变（复 audit 活二）：并发保存把 `previous_*` 记成**自己进来之前**
+  的数；审计 `INSERT` 失败 ⇒ 设置已生效而审计一行没有。
+  **为什么不再是单语句**：一条含 data-modifying CTE 的语句里 `FOR UPDATE` **看不见本语句要改的那一行**
+  （postgres:16 实测 ⇒ 旧值恒空 ⇒ 保存恒 500 而值已落库）；去掉它就没有行锁 ⇒ 并发两条保存的
+  `previous_*` 都指向并发前的值（审计链断）。**原子性由事务保证**，不再由「一条语句」保证。
+  调用方**不得**再补一笔 `auth.audit`（会退回两个窗口并多写一条）。判据：`upload-settings.test.js`
+  US-18/19/20/21（形状与原子性）+ `upload-settings-real-db.test.js` 的并发链那一格（行锁与可见性
+  只有真库能判；fake 按 SQL 文本裁决，在它上面测并发会拿到假绿）。
+- 旧值派生**只有 JS 一处**（`parseDbMaxFileBytes`）：SQL 不再自带一份区间 CASE，审计里写的 `previous_*`
+  与接口返回的 `previous` 是同一次计算的结果 ⇒ 两边不可能漂（US-20 由构造成立）。
+  副作用：首写（无旧行）时审计记的是**当时真正在用的兜底值**（`previous_source=env|default`）而不是
+  `null`——「改动前生效的上限是多少」才是审计要回答的问题；区间外的旧值同档（记兜底值，不记库里那个）。
 - 上限仍是**单文件**，不是总量。**片 B（每 FDE 目录总量上限）不在本节**：那是 ext4 project quota，
   判据是「容器里 `dd` 也要失败」。上传前 `du` 一遍目录当闸门是**假闸门**（拦住人、放过 agent），本单明确没做。
 
-> 实现：`portal/src/upload-settings.js`（读侧 + 写侧 + 优先级 + 读超时 + 保存与审计的同一条 CTE）、`portal/src/http.js`（两个端点、
+> 实现：`portal/src/upload-settings.js`（读侧 + 写侧 + 优先级 + 读超时 + 保存事务与审计）、`portal/src/http.js`（两个端点、
 > 上传端点的现读接入）、`portal/src/config.js`（`fileUploadMaxBytesSource`）、
 > `deploy/migrations/0036-upload-settings.sql`。
 > 单测：`portal/test/upload-settings.test.js`、`portal/test/migrations.test.js`（0036 那一段）。
@@ -3483,8 +3488,8 @@ Content-Type: application/json
 | JS 预闸（写**之前**）| 常态超限 | 现读那一行拿到对面那一列的当前值 ⇒ 算出渲染后字节数 ⇒ 超了直接 400，**一条写语句都不发**（判据 `P6`）|
 | SQL 闸（同一条语句里）| 并发窗口（预闸读完之后别人改了对面那一列）| `INSERT … SELECT … WHERE rendered_bytes <= $7` ⇒ 超限就喂给 INSERT 0 行，**一格没写、审计零行**，JS 侧据 `written = 0` 报同一个 400 |
 
-两条闸报出的 `details` 逐字同形（常量由 JS 当参数送进 SQL，SQL 里不抄数字，口径同 §4.15-4 的
-`$5/$6`）。而「SQL 里那段算术 ≡ 真渲染」这件事**分两段钉，两段各管一半**，别混着夸：
+两条闸报出的 `details` 逐字同形（常量由 JS 当参数送进 SQL，SQL 里不抄数字；这条口径最早来自
+§4.15-4 的 `$5/$6`——#698b 后那一单的区间判定已收敛到 JS 一处，但「常量只有一处、由参数送进去」没变）。而「SQL 里那段算术 ≡ 真渲染」这件事**分两段钉，两段各管一半**，别混着夸：
 
 - **JS 侧**「预算算式 ≡ `renderHomeAgentsMd` 的真实字节」由 `P6b`
   （`portal/test/platform-prompts.test.js`）逐组钉住。那条判据自己在注释里写明：SQL 里 `gate`
