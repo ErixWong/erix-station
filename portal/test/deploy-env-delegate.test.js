@@ -744,6 +744,107 @@ const RUNNER_ENV_KEYS = scanEnvKeys(RUNNER_ROOT);
 assertScannerFoundKeys(RUNNER_ENV_KEYS.size, `扫描根 ${path.relative(process.cwd(), RUNNER_ROOT)}/`);
 
 /**
+ * #587 折中方案第 1 步：**key 关联的站点索引**（issue #587 的分析报告 §2.2「结构白名单」的地基）。
+ *
+ * 闸门现在的事实是「这一行**看起来**提到 key」（`whereProblems()` → `lineMentionsKey()` 的文本启发式），
+ * 而它手上其实有**结构事实**：`scanEnvReadsFromFiles()` 产出的读站点 `keys`。
+ * 本函数只做一件事：把那份产出**改成可查的形状**——**不重扫、不再写一套解析**
+ * （第二套遍历/正则 = 第二本账，正是 #557/#587 反复付账的形状）。所以：
+ *   · 站点集合与 `scanEnvReads(root).keys` **一字不差**（「影子①」拿双向集合相等钉住这一点）；
+ *   · 索引里**不会**出现扫描器没登记的站点 ⇒ 日志模板 / 数据对象的 `reason` / 注释都进不来。
+ *
+ * 形状（`Map` 三层，键都是**扫描器给的原值**，不做任何加工）：
+ *   `readSites`   `Map(key → Map(rel → Map(line → [shape, ...])))`
+ *     —— 三层里最后那层是**数组**：同一行读两次（`env.A || env.A`）留两条，不许折叠成一条。
+ *   `injections`  同形状，**第 3 步的位置**（见下面 `addInjectionSite` 的注释），现在恒空。
+ *
+ * 能回答的问题（`siteIndexProblems()` 只用这几个口子，别的都不认）：
+ *   `hasReadSite(key, rel, line)` 这个坐标**是不是**该 key 的读站点（行级）
+ *   `hasReadInFile(key, rel)`     该 key 在这个文件里有没有读站点（文件级引用）
+ *   `sitesOf(key)` / `linesOf(key, rel)` / `filesOf(key)`  取证用（报错文案要能指着真站点改）
+ * @param {string} root 扫描根（仓库根 ⇒ `rel` 与例外清单的 `where` 同一个口径）
+ */
+function buildEnvSiteIndex(root, opts = {}) {
+  const { keys, unsupported } = scanEnvReads(root, opts);
+  const readSites = new Map();
+  const bucketOf = (store, key, rel) => {
+    if (!store.has(key)) store.set(key, new Map());
+    const perFile = store.get(key);
+    if (!perFile.has(rel)) perFile.set(rel, new Map());
+    return perFile.get(rel);
+  };
+  for (const [key, perFile] of keys) {
+    for (const [rel, list] of perFile) {
+      for (const site of list) {
+        const byLine = bucketOf(readSites, key, rel);
+        if (!byLine.has(site.line)) byLine.set(site.line, []);
+        byLine.get(site.line).push(site.shape);      // 同一行多次读 ⇒ 一条一个 shape，不许折叠
+      }
+    }
+  }
+  /**
+   * **第 3 步往这里加**（#587 折中方案，分析报告 §2.2 的 `kind = injection`）：
+   *   只从 `portal/src/provisioner.js` 的 `buildContainerConfig()` 里 Docker `body.Env` **数组元素**
+   *   与 `body.Env.push()` 产出站点（审计当时的读数是 `:224-253` 与 `:277`，行号会漂，要现跑取），
+   *   `:410`（`ensureFdeContainer()` 传进来的 `env`）只有在证明它流入 `body.Env` 之后才算来源。
+   *   登记方式：`index.addInjectionSite(key, rel, line)`；`hasSite()` 会同时认两类站点，
+   *   所以**判定结构不用再改**——第 3 步只填这张表。日志里的 `` `KEY=${v}` `` 不是注入站点：
+   *   它进不了 `body.Env`，因此第 3 步也不会进这张表（「影子②」钉的就是这个形状）。
+   */
+  const injections = new Map();
+  const shapesAt = (store, key, rel, line) => store.get(key)?.get(rel)?.get(line) ?? null;
+  const linesOf = (store, key, rel) => {
+    const byLine = store.get(key)?.get(rel);
+    return byLine ? [...byLine.keys()].sort((a, b) => a - b) : [];
+  };
+  const dumpOf = (store, key) => {
+    const out = [];
+    for (const [rel, byLine] of store.get(key) ?? []) {
+      for (const [line, shapes] of byLine) {
+        for (const shape of shapes) out.push({ rel, line, shape });
+      }
+    }
+    return out.sort((a, b) => a.rel.localeCompare(b.rel) || a.line - b.line);
+  };
+  return {
+    root,
+    keys,                       // 扫描器原样产出（「影子①」据此核对索引没加工）
+    unsupported,                // 同上：动态读形留给第 2 步做 provenance，本步只透传
+    readSites,
+    injections,
+    /** 【第 3 步的入口】登记一个注入站点；现在没人调 ⇒ `injections` 恒空。 */
+    addInjectionSite(key, rel, line, shape = 'body.Env') {
+      const byLine = bucketOf(injections, key, rel);
+      if (!byLine.has(line)) byLine.set(line, []);
+      byLine.get(line).push(shape);
+      return this;
+    },
+    /** 该 key 的全部读站点 `[{rel, line, shape}]`（报错文案与「影子①」的取证都读它）。 */
+    sitesOf: (key) => dumpOf(readSites, key),
+    injectionSitesOf: (key) => dumpOf(injections, key),
+    linesOf: (key, rel) => linesOf(readSites, key, rel),
+    injectionLinesOf: (key, rel) => linesOf(injections, key, rel),
+    filesOf: (key) => [...(readSites.get(key)?.keys() ?? [])].sort(),
+    hasReadSite: (key, rel, line) => shapesAt(readSites, key, rel, line) !== null,
+    hasInjectionSite: (key, rel, line) => shapesAt(injections, key, rel, line) !== null,
+    hasReadInFile: (key, rel) => readSites.get(key)?.has(rel) === true,
+    hasInjectionInFile: (key, rel) => injections.get(key)?.has(rel) === true,
+    /** 第 4 步的判定入口：读站点**或**注入站点都算结构证据（现在等价于只有读站点）。
+     *  ⚠ 这一支带行号是**判据的牙**：去掉 line（只剩文件级）就是变异 M-2 的靶子。 */
+    hasSite: (key, rel, line) => shapesAt(readSites, key, rel, line) !== null
+      || shapesAt(injections, key, rel, line) !== null,   // ← M-2 变异点：索引去掉行号
+    hasSiteInFile: (key, rel) => readSites.get(key)?.has(rel) === true
+      || injections.get(key)?.has(rel) === true,
+    keyCount: () => keys.size,
+    siteCount: () => [...keys.values()].reduce((n, perFile) => n
+      + [...perFile.values()].reduce((m, list) => m + list.length, 0), 0),
+  };
+}
+
+/** 真树的站点索引（影子对照用；建一次 ~2s，别在每格里重扫）。 */
+const REPO_SITE_INDEX = buildEnvSiteIndex(REPO_ROOT);
+
+/**
  * 例外清单：读 + 判**理由字段** + 现跑咬合。返回 `{ entries, unsupported, problems }`。
  * `unsupported` 的核对**必须带扫描器现在的结果**（族 B②：登记要绑定到真读站点，不许自由散文）。
  */
@@ -1562,6 +1663,91 @@ function whereProblems(entries, sources, root = REPO_ROOT) {
     }
   });
   return problems;
+}
+
+/** 索引里该 key 的读站点清单（写成 `rel:line(shape)`，只取前 6 条，报错时能照着改）。 */
+function describeSites(index, key, limit = 6) {
+  const inj = index.injectionSitesOf(key).map((s) => ({ ...s, shape: `injection:${s.shape}` }));
+  const all = [...index.sitesOf(key), ...inj];
+  if (all.length === 0) return '（索引里这个 key 一个读站点都没有 ⇒ 它要么没被真读，要么扫描器认不出那个读形）';
+  const rest = all.length > limit ? `…（共 ${all.length} 条）` : '';
+  return all.slice(0, limit).map((s) => `${s.rel}:${s.line}(${s.shape})`).join('、') + rest;
+}
+
+/**
+ * **影子**版的 `where` 校验（#587 折中方案第 1 步）：**只被下面的测试调用，没接进闸门**。
+ * 与 `whereProblems()` 的差别只有一处：那一行内容不再用「文本命中」判，而是问索引
+ * 「这个坐标**是不是该 key 的读站点**」（`index.hasSite()`）。其余尺子（绝对路径 / 非 JS 后缀 /
+ * 测试面 / 文件不存在 / 行范围语法 / 越界）**故意走同一把尺**（`makeCoordChecker` 的 `lineOk` 入口），
+ * 否则两边的差异就混进了「卫生检验」的噪声，影子对照也就读不出东西。
+ *   · 多引用（`a.js:12；b.js:34`）⇒ **每个**都要成立；
+ *   · 文件级引用（`rel` 不带行号）⇒ 要求该 key 在该文件**有读站点**；
+ *   · 返回与 `whereProblems()` **同形**的 `string[]`（文案前缀一致 ⇒ 能按坐标对齐做对照）。
+ * @param {Array} entries 例外清单的 `exceptions`
+ * @param {object} index `buildEnvSiteIndex(root)` 的产出（root 必须与下面的 root 同一个）
+ * @param {string} root 坐标解析的根（盘上那份 = 仓库根；夹具 = 临时目录）
+ */
+function siteIndexProblems(entries, index, root = REPO_ROOT) {
+  const problems = [];
+  const coord = makeCoordChecker(root);
+  entries.forEach((e, i) => {
+    const at = `exceptions[${i}]`;
+    const where = typeof e?.where === 'string' ? e.where.trim() : '';
+    if (where === '') { problems.push(`${at}（key=${e?.key}）**缺 where**：没有可校验坐标的例外等于没取证`); return; }
+    const refs = parseCoordRefs(where);
+    if (refs.length === 0) {
+      problems.push(`${at}（key=${e.key}）的 where 里没有任何 \`路径.js[:行]\` 引用 ⇒ 「${where}」是**说明文字**，`
+        + '不是坐标：判据扫不到它，它会随改动自己变成假的');
+      return;
+    }
+    const waiver = testFaceWaiver(e);
+    if (e?.whereTest !== undefined && waiver === null) {
+      problems.push(`${at}（key=${e.key}）的 \`whereTest\` 豁免**不合法**：要么写 \`whereTest: "<非空理由>"\`，`
+        + '要么 `whereTest: true` + `whereTestReason: "<非空理由>"`（光 `whereTest: true` 就是开了个没理由的口子）');
+    }
+    let usedWaiver = false;
+    refs.forEach((ref, j) => {
+      const to = ref.to != null && ref.to !== ref.from ? `-${ref.to}` : '';
+      const range = ref.from == null ? '' : `:${ref.from}${to}`;
+      const tag = `${at}（key=${e.key}）where 的第 ${j + 1} 个引用 ${ref.rel}${range}`;
+      if (isTestFace(ref.rel) && waiver !== null) usedWaiver = true;
+      // 尺子在「文件级 + runner 下」那一支只认 `sources.get(key).has(rel)`，而本函数把内容判定
+      // 接过来了 ⇒ 把**这一个** rel 当钥匙递进去，让那支闭嘴（否则它会报「对 null 的活读」）。
+      const relKey = path.relative(RUNNER_ROOT, path.join(root, ref.rel)).split(path.sep).join('/');
+      const lineOk = (ln) => index.hasSite(e.key, ref.rel, ln);   // ← M-1 变异点：行级 → 文件级
+      const lineWhy = `那一行**不是 ${e.key} 的读站点**（索引里没有 \`${ref.rel}:${ref.from}\` 这条站点；`
+        + `该 key 在索引里的真站点是：${describeSites(index, e.key)}）`;
+      problems.push(...coord(ref, {
+        key: null, sources: new Map([[null, new Set([relKey])]]), tag,
+        waiverDeclared: waiver !== null, lineOk, lineWhy,
+      }));
+      if (ref.from == null && !index.hasSiteInFile(e.key, ref.rel)) {
+        problems.push(`${tag} 只给了文件没给行，而索引里 \`${ref.rel}\` **没有对 ${e.key} 的读站点**`
+          + `（文件级引用要求这个文件真的读了它，提到过它的散文 / 数据表行 / 注释都不算）。`
+          + `该 key 的真站点：${describeSites(index, e.key)}`);
+      }
+    });
+    if (waiver !== null && !usedWaiver) {
+      problems.push(`${at}（key=${e.key}）声明了 \`whereTest\` 豁免，但坐标里没有一个在测试面 ⇒ **死豁免**（第二本账），删掉它`);
+    }
+  });
+  return problems;
+}
+
+/**
+ * 把「问题列表」压成**坐标身份**集合（两边的文案必然不同，但「哪个坐标被判红」必须能对齐）。
+ * 取的是 `whereProblems` / `siteIndexProblems` **共用**的那个 `tag` 前缀（同一条登记、同一个引用序号、
+ * 同一个坐标），非坐标级的问题（缺 where / 说明文字 / 死豁免）折成 `key@整条`。
+ */
+function coordIds(problems) {
+  const ids = new Set();
+  for (const p of problems) {
+    const ref = /^exceptions\[(\d+)\]（key=([^）]+)）where 的第 (\d+) 个引用 (\S+?)(?=[\s（]|$)/.exec(p);
+    if (ref) { ids.add(`${ref[2]}@${ref[4]}#${ref[3]}`); continue; }
+    const head = /^exceptions\[(\d+)\]（key=([^）]+)）/.exec(p);
+    ids.add(head ? `${head[2]}@整条登记#${head[1]}` : `其他@${p.slice(0, 40)}`);
+  }
+  return [...ids].sort();
 }
 
 test('活二⑤ `where` 是坐标不是说明文字：五种假坐标都要红，盘上那份要全绿', () => {
@@ -2530,6 +2716,253 @@ test('活二㉞ B-①②④ 三轮返工：对象键位不算坐标 / 文件级�
     assert.ok(!good.some((x) => /没有一个引用指到这条动态读/.test(x)),
       '覆盖读站点本身必须算「相关」（那行没字面 env 名，会被另一把尺拦，不是相关性判据的锅）');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+/**
+ * #587 第 1 步的夹具（**内联临时目录**，不是盘上的 `portal/test/fixtures/`）。理由三条：
+ *   ① 本文件已有的夹具都是 `fixtureRoot()` 现搭临时目录（活二㉕㉖㉗ 同一口径），新开一棵盘上
+ *      夹具树 = 两套夹具约定；
+ *   ② `scanTargets` 的 `SCAN_SKIP_DIRS` 与 `isTestFace` 都认 `fixtures` / `test` ⇒ 盘上夹具会被
+ *      真树扫描跳过、被坐标尺当测试面拒，索引口径反而要多一层解释；
+ *   ③ 内联夹具的源码就在断言旁边 ⇒ 报告里能直接指「第几行是什么形状」，不用再去读一个文件。
+ * ⚠ 行号是**约定**（`SI_L` 就是行号表）：夹具改一行内容要跟着改 `SI_L`，这一格的价就在这儿。
+ */
+const SI_FILES = {
+  'lib/read.js': [
+    'export const v = process.env.ERIX_SI_FIX_KEY;',   // SI_L.dot      真读站点（点号形）
+    'export const msg = `ERIX_SI_FIX_KEY=${v}`;',   // SI_L.log      日志模板（形似注入的假坐标）
+    "export const rows = [{ key: 'OTHER', reason: 'ERIX_SI_FIX_KEY' }];",   // SI_L.reason 数据对象的值位串
+    'export const pad = 1;',   // SI_L.pad      同文件里没读这个 key 的另一行
+    // SI_L.twice：同一行读两次（索引不许折叠成一条）
+    'export const twice = process.env.ERIX_SI_FIX_KEY || process.env.ERIX_SI_FIX_KEY;',
+    "const OTHER_ENV = 'ERIX_SI_FIX_OTHER';",   // SI_L.otherDecl  常量名（不是读形）
+    'export const alias = process.env[OTHER_ENV];',   // SI_L.otherRead 常量名下标读
+  ].join('\n'),
+  'lib/table.js': [
+    "const LLM_TABLE = Object.freeze({ a: 'ERIX_SI_FIX_TABLE' });",   // SI_L.table 数据表声明行（不是读站点）
+    // SI_L.tableRead：真读站点（行内没有 env 名字面量，名字从表里来）
+    'export function pick(f, env = process.env) { const name = LLM_TABLE[f]; return env?.[name]; }',
+  ].join('\n'),
+  'lib/only-string.js': "export const note = 'ERIX_SI_FIX_STRAY 只是文案';\n",   // SI_L.stray
+};
+const SI_L = {
+  dot: 1, log: 2, reason: 3, pad: 4, twice: 5, otherDecl: 6, otherRead: 7,
+  table: 1, tableRead: 2, stray: 1,
+};
+const SI_KEY = 'ERIX_SI_FIX_KEY';
+const siEntry = (where, key = SI_KEY) => ({ key, reason: '夹具：影子判定的靶子', where });
+
+/** 建夹具 + 索引（每格自己搭自己拆，不共享临时目录）。 */
+function siFixture() {
+  const dir = fixtureRoot(SI_FILES);
+  return { dir, index: buildEnvSiteIndex(dir) };
+}
+
+/** 影子尺对单条夹具登记的问题（数组，绿就是空数组）。 */
+function siProblems(dir, index, where, key = SI_KEY) {
+  return siteIndexProblems([siEntry(where, key)], index, dir);
+}
+
+test('#587-S1-① 索引形状：一比一转自扫描器产出（同文件多行 / 同一行两次读都分得开），注入位是空槽', () => {
+  const { dir, index } = siFixture();
+  try {
+    // ① 索引必须是 `scanEnvReads()` 产出的一比一转置 —— **不许第二套解析**：站点逐条比。
+    const fromScan = [];
+    for (const [key, perFile] of index.keys) {
+      for (const [rel, list] of perFile) {
+        for (const s of list) fromScan.push(`${rel}:${s.line} ${key} ${s.shape}`);
+      }
+    }
+    const fromIndex = [];
+    for (const key of index.keys.keys()) {
+      for (const s of index.sitesOf(key)) fromIndex.push(`${s.rel}:${s.line} ${key} ${s.shape}`);
+    }
+    assert.deepEqual(fromIndex.sort(), fromScan.sort(), '索引与扫描器产出不一致 ⇒ 索引自己加了货或掉了货');
+    assert.ok(index.keyCount() >= 3 && index.siteCount() >= 4,
+      `夹具前提破了：${index.keyCount()} keys / ${index.siteCount()} 站点`);
+    // ② 同文件**多行**分得开
+    assert.deepEqual(index.linesOf(SI_KEY, 'lib/read.js'), [SI_L.dot, SI_L.twice],
+      '同文件两处真读站点必须逐行登记（折叠成文件级 = M-2 那把刀要抓的东西）');
+    // ③ 同一行**读两次**不许折叠成一条
+    assert.equal(index.readSites.get(SI_KEY).get('lib/read.js').get(SI_L.twice).length, 2,
+      '同一行两次读取被折叠 ⇒ 索引丢信息（`env.A || env.A` 那种读形就看不见了）');
+    // ④ 常量名 / 数据表那两形也要有站点（真登记里就有：`runner/lib/llm-timeouts.js:103`）
+    assert.deepEqual(index.linesOf('ERIX_SI_FIX_OTHER', 'lib/read.js'), [SI_L.otherRead]);
+    assert.deepEqual(index.linesOf('ERIX_SI_FIX_TABLE', 'lib/table.js'), [SI_L.tableRead]);
+    // ⑤ 注入站点是**留好的空槽**：现在恒空，但 `addInjectionSite` 一填 `hasSite` 就得认
+    assert.equal(index.injections.size, 0, '第 1 步不许提前把注入站点接进来（那会改变影子口径）');
+    assert.equal(index.hasSite(SI_KEY, 'lib/read.js', SI_L.log), false);
+    index.addInjectionSite(SI_KEY, 'lib/read.js', SI_L.log);
+    assert.equal(index.hasSite(SI_KEY, 'lib/read.js', SI_L.log), true,
+      '注入站点的入口失效了 ⇒ 第 3 步往这张表里填东西会白填（那是空的洞，不是空的槽）');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S1-② 夹具 1：where 指日志模板那一行 ⇒ 影子判红，而旧启发式放行（证明闸门行为没变）', () => {
+  const { dir, index } = siFixture();
+  try {
+    const coord = `lib/read.js:${SI_L.log}`;
+    const why = siProblems(dir, index, coord).join('\n');
+    assert.match(why, /不是 ERIX_SI_FIX_KEY 的读站点/,
+      '那一行是形似注入的日志模板（审计 #12 的形状：KEY=${v} 活在 console.log 的模板里），影子尺必须红');
+    assert.match(why, /lib\/read\.js:1\(dot\)/, `红得没信息：文案要指出真读站点在第 ${SI_L.dot} 行`);
+    // 反向自证：旧启发式**放行**它 ⇒ 本格杀的是影子尺的牙；闸门（旧尺）口径一个字都没动
+    assert.deepEqual(whereProblems([siEntry(coord)], new Map(), dir), [],
+      '旧启发式对日志模板的口径变了 ⇒ 本格的对照前提破了（产品形变了或闸门被动过）');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S1-③ 夹具 2：where 指数据对象里 reason 值那一行 ⇒ 影子判红，旧启发式放行', () => {
+  const { dir, index } = siFixture();
+  try {
+    const coord = `lib/read.js:${SI_L.reason}`;
+    const why = siProblems(dir, index, coord).join('\n');
+    assert.match(why, /不是 ERIX_SI_FIX_KEY 的读站点/, '那一行只是数据对象里的值位串（审计 #10 的形状）');
+    assert.match(why, /reason|值位串|文案/, '文案要说清它是什么形状，不然人不知道怎么改');
+    assert.deepEqual(whereProblems([siEntry(coord)], new Map(), dir), [], '旧启发式口径：值位串算坐标（本步不改它）');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S1-④ 夹具 3：where 指真读站点 ⇒ 影子判绿（点号形 / 常量名下标形 / 表驱动形都不许误杀）', () => {
+  const { dir, index } = siFixture();
+  try {
+    const green = [
+      [`lib/read.js:${SI_L.dot}`, SI_KEY],
+      [`lib/read.js:${SI_L.twice}`, SI_KEY],
+      [`lib/read.js:${SI_L.otherRead}`, 'ERIX_SI_FIX_OTHER'],
+      [`lib/table.js:${SI_L.tableRead}`, 'ERIX_SI_FIX_TABLE'],   // 行内没字面量，名字从数据表来
+    ];
+    for (const [coord, key] of green) {
+      assert.deepEqual(siProblems(dir, index, coord, key), [],
+        `${coord} 是扫描器登记的**真读站点**却被影子判红 ⇒ 切换后会误杀真登记（#557 那一族）`);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S1-⑤ 夹具 4：where 指同文件里没读这个 key 的另一行 ⇒ 影子判红（M-2 的靶子）', () => {
+  const { dir, index } = siFixture();
+  try {
+    const coord = `lib/read.js:${SI_L.pad}`;
+    const why = siProblems(dir, index, coord).join('\n');
+    assert.match(why, /不是 ERIX_SI_FIX_KEY 的读站点/, `${coord} 那一行什么都没读，只因同文件别处读了它`);
+    assert.match(why, /lib\/read\.js:1\(dot\)/, '必须指出真站点在哪几行（照着改才有方向）');
+    assert.match(why, /lib\/read\.js:5\(dot\)/, '两处真读站点都要列出来（同文件多行不许被折叠）');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S1-⑥ 文件级引用与多引用：每个引用都要成立，文件级要求那个文件真的读了它', () => {
+  const { dir, index } = siFixture();
+  try {
+    // 文件级：那个文件真读了这个 key ⇒ 绿
+    assert.deepEqual(siProblems(dir, index, 'lib/read.js'), [], '文件级引用：那个文件确实读了它却被判红 = 误杀');
+    // 文件级：key 只在文案里出现 ⇒ 红
+    const stray = siProblems(dir, index, 'lib/only-string.js', 'ERIX_SI_FIX_STRAY').join('\n');
+    assert.match(stray, /没有对 ERIX_SI_FIX_STRAY 的读站点/, '只有串里提到的文件不能当文件级坐标');
+    // 多引用：一真一假 ⇒ 必须红，并且**点名是第二个**（旧尺也是每条都验，口径对齐）
+    const two = `lib/read.js:${SI_L.dot}；lib/read.js:${SI_L.pad}`;
+    const multi = siProblems(dir, index, two).join('\n');
+    assert.match(multi, /第 2 个引用 lib\/read\.js:4/, '多引用只验第一条就放行 ⇒ `a.js:1；b.js:2` 会漏验');
+    assert.doesNotMatch(multi, /第 1 个引用 lib\/read\.js:1/, '第 1 个是真站点，不该被报');
+    // 行范围逐行：范围里夹一行没读 ⇒ 红并点名那一行
+    const range = siProblems(dir, index, `lib/read.js:${SI_L.dot}-${SI_L.pad}`).join('\n');
+    assert.match(range, /第 2 行|第 3 行|第 4 行/, '行范围不许静默只验首行');
+    // 卫生检验走**同一把尺**（否则对照噪声分不清「不是站点」还是「坐标写坏了」）
+    const badExt = [{ key: SI_KEY, reason: 'r', where: 'lib/x.json:1' }];
+    const strayJson = siteIndexProblems(badExt, index, dir).join('\n');
+    assert.match(strayJson, /不是 JS 源文件/);
+    assert.match(siProblems(dir, index, 'lib/nope.js:1').join('\n'), /文件不存在/);
+    assert.match(siProblems(dir, index, `${path.join(dir, 'lib/read.js')}:1`).join('\n'), /绝对路径/);
+    assert.match(siteIndexProblems([{ key: SI_KEY, reason: 'r' }], index, dir).join('\n'),
+      /缺 where/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S1-⑦ 影子尺只认结构：注释行 / 散文串都红，真站点绿（索引不等于「文件里提过」）', () => {
+  const dir = fixtureRoot({
+    'a.js': [
+      '// export const v = process.env.ERIX_SI_C_COMMENT;',   // 1 注释里的旧代码（#557 的翻车形状）
+      "export const note = 'ERIX_SI_C_COMMENT 已接好';",   // 2 散文串
+      'export const real = process.env.ERIX_SI_C_COMMENT;',   // 3 真读站点
+    ].join('\n'),
+  });
+  try {
+    const index = buildEnvSiteIndex(dir);
+    assert.deepEqual(index.linesOf('ERIX_SI_C_COMMENT', 'a.js'), [3],
+      '注释 / 串正文被算成了读站点 ⇒ 索引不再等于扫描器给的事实');
+    for (const ln of [1, 2]) {
+      assert.match(siProblems(dir, index, `a.js:${ln}`, 'ERIX_SI_C_COMMENT').join('\n'),
+        /不是 ERIX_SI_C_COMMENT 的读站点/, `第 ${ln} 行不是读站点却被影子放行`);
+    }
+    assert.deepEqual(siProblems(dir, index, 'a.js:3', 'ERIX_SI_C_COMMENT'), []);
+    // 旧尺对注释行同样红（这一维两边同向）⇒ 本格不是在重复旧尺，是在钉「索引=扫描器事实」
+    const old = whereProblems([siEntry('a.js:1', 'ERIX_SI_C_COMMENT')], new Map(), dir).join('\n');
+    assert.match(old, /不含该 key/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+/**
+ * 影子对照里**允许**的差异类别（= 第 4 步切换前必须先修的三件事）。
+ * 写成了**规则**而不是坐标清单：清单会把「现在长这样」抄成第二本账（产品行号一漂就红一次，
+ * 而红得没有信息），规则只回答一个问题 —— 「这条差异能不能被解释成已知的三类之一」。
+ *   · `injection`     坐标指的是 Docker `Env` 注入点 / inspect 读回 helper ⇒ 第 3 步登记成站点；
+ *   · `host-source`   同名不同源：那个文件读它的是 **portal**（不是本站 runner 的配置面）；
+ *   · `mention-only`  那一行**提到**了这个 env 名（数据表声明行 / 文案行），但真读站点在别处；
+ *   · `null`          解释不了 ⇒ 必须红（新出现的假坐标，或索引漏了真读形）。
+ */
+function shadowGapClass(key, coord) {
+  const { rel, line } = splitCoord(coord);
+  if (rel === 'portal/src/provisioner.js') return 'injection';
+  if (rel === 'portal/src/config.js') return 'host-source';
+  if (line == null) return null;
+  let text = null;
+  try {
+    const raw = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+    text = stripComments(raw).split('\n')[line - 1] ?? '';
+  } catch { return null; }
+  return text.includes(key) ? 'mention-only' : null;
+}
+
+test('#587-S1-⑧ 影子对照真树：影子尺只会更严，多杀的必须逐条归进已知三类（第 4 步能不能切就看它）', () => {
+  const { entries } = loadEnvLegExceptions();
+  assert.ok(entries.length > 0, '例外清单读不到 ⇒ 对照没意义');
+  const gate = whereProblems(entries, RUNNER_ENV_KEYS);
+  const shadow = siteIndexProblems(entries, REPO_SITE_INDEX);
+  const gateIds = coordIds(gate);
+  const shadowIds = coordIds(shadow);
+  const onlyShadow = shadowIds.filter((x) => !gateIds.includes(x));
+  const onlyGate = gateIds.filter((x) => !shadowIds.includes(x));
+  // 差异按类归堆（`key@coord#第几个引用`）
+  const buckets = new Map();
+  const unexplained = [];
+  for (const id of onlyShadow) {
+    const [key, rest] = id.split('@');
+    const coord = rest.replace(/#\d+$/, '');
+    const kind = shadowGapClass(key, coord);
+    if (kind === null) { unexplained.push(id); continue; }
+    if (!buckets.has(kind)) buckets.set(kind, []);
+    buckets.get(kind).push(id);
+  }
+  const counts = Object.fromEntries([...buckets].map(([k, v]) => [k, v.length]).sort());
+  console.log(`# SHADOW 真树对照：登记 ${entries.length} 条 / 旧尺 ${gate.length} / 影子 ${shadow.length} 条`);
+  console.log(`# SHADOW 分类计数 ${JSON.stringify(counts)}（未归类 ${unexplained.length} 条）`);
+  console.log(`# SHADOW 旧尺红而影子绿（切换会放宽的）：${JSON.stringify(onlyGate)}`);
+  for (const p of shadow) console.log(`# SHADOW-DIFF ${p.replace(/\s+/g, ' ').slice(0, 240)}`);
+  // 方向：结构成员判定只会**更严**。旧尺报的问题影子尺没报 ⇒ 索引有洞（漏读形或语法尺没共用）。
+  assert.deepEqual(onlyGate, [],
+    '旧尺判红而影子尺判绿 ⇒ 索引比文本尺还松（要么漏了读形，要么坐标语法没走同一把尺）');
+  assert.deepEqual(unexplained, [],
+    '影子多杀的坐标归不进已知三类 ⇒ 要么是新造的假坐标（好事，登记该改），要么索引漏了真读形（坏事）：'
+    + '逐条看上面的 SHADOW-DIFF 定性后再动，不许为了让这格变绿去改 deploy/env-legs-exceptions.json');
+  // 三类的**现值**（第 2/3 步落地后这里必须跟着变，变的时候就是「可以切了」的信号）
+  const want = { 'host-source': 1, injection: 5, 'mention-only': TIMEOUT_KEYS.length * 2 };
+  assert.deepEqual(counts, want,
+    `影子差异的分布变了（现在 ${JSON.stringify(counts)}）⇒ 有人动了例外清单/产品代码，或索引判定漂了`
+    + '：按 SHADOW-DIFF 逐条定性，然后把这里的期望值改成新现实（并更新工单报告），不许反着改登记');
+  // 差异还在 ⇒ 现在**不能**切闸门（第 4 步的前提是这三类清零）
+  assert.ok(onlyShadow.length > 0,
+    '影子尺与旧尺读数已经一致 ⇒ 三类差异都清了，可以走第 4 步切换（把这格换成「两边必须完全相等」）');
+  // 盘上那份的**旧尺**读数必须还是全绿 —— 影子没被接进闸门
+  assert.deepEqual(gate, [], '闸门行为变了：盘上那份被判红了（本步红线：闸门一个字不许变）');
 });
 
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
