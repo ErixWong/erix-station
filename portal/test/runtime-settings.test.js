@@ -46,7 +46,7 @@ import {
   WORKSPACE_RETENTION_KEY, WORKSPACE_RETENTION_MAX_DAYS, WORKSPACE_RETENTION_DEFAULT_DAYS,
   parseWorkspaceRetentionDays, validateWorkspaceRetentionDays,
   readWorkspaceRetentionDays, invalidateWorkspaceRetentionCache,
-  listRuntimeSettingsAdmin,
+  listRuntimeSettingsAdmin, updateRuntimeSettingAdmin, WORKSPACE_RETENTION_HINT,
 } from '../src/runtime-settings.js';
 import { loadConfig } from '../src/config.js';
 
@@ -2171,3 +2171,88 @@ test('RS-28 真库那一腿（第二格）：写 7 ⇒ 热读 7、不等 5 秒�
       invalidateWorkspaceRetentionCache();
     });
   });
+
+// ---------------------------------------------------------------------------
+// #677 P3 收尾批：把「`0` 的语义」这件事的**另一半**钉住 —— 运维在界面上看得见那句人话，
+// 而那句话在文档里有对应的契约（口径见 docs/api/portal.md §4.21「`0` 的语义」那一小节）。
+//   RS-29 registry 的 `hint` + DTO 只在登记了的那格带它（GET 与 PUT 两路都要带）。
+//   RS-30 文档契约在场，且它点名的三条判据真的存在（契约不许空指一个不存在的判据）。
+// ---------------------------------------------------------------------------
+
+test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那格连键都没有', async () => {
+  const entry = RUNTIME_SETTING_REGISTRY[WORKSPACE_RETENTION_KEY];
+  assert.equal(typeof entry.hint, 'string', '这一格必须登记 hint（0 的边界不写在行面上就会被误用）');
+  assert.ok(entry.hint.length > 0 && entry.hint.length <= 120,
+    `hint 是界面里的一行小字：实得 ${entry.hint.length} 字（太长 = 页面里变成一段）`);
+  assert.match(entry.hint, /不会取消已排定的删除/,
+    'hint 必须点名那个反直觉的边界（这句与 §4.21 那句是同一件事的两种说法，RS-30 钉它们不漂）');
+  assert.match(entry.hint, /^0/, '这一格最常被误读的就是 0 那一档 ⇒ hint 必须从 0 说起');
+
+  // GET 两格：登记了的那格原样带出，没登记的那格**不许**出现这个键（缺席 ≠ null ≠ 空串）。
+  const cfg = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
+  const list = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: cfg, env: {}, log: silentLog });
+  assert.equal(list.items.length, 2);
+  const retItem = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
+  assert.equal(retItem.hint, WORKSPACE_RETENTION_HINT,
+    'DTO 必须逐字透出 registry 那句话（前端自己另写一份 = 第二份真相）');
+  assert.equal(Object.hasOwn(list.items[0], 'hint'), false,
+    'session.ttl_seconds 没登记 hint ⇒ 这个键必须缺席（RS-16 那句「一项就是那八个键」也靠这一半成立）');
+
+  // 回落那一档也带（表不存在时界面更要看得见这句：那一档下 0 同样是「不自动清理」）。
+  const dead = await listRuntimeSettingsAdmin({
+    pool: ttlPool({ throwOnSelect: Object.assign(
+      new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
+    config: cfg, log: collectingLog(),
+  });
+  assert.equal(dead.items.find((i) => i.key === WORKSPACE_RETENTION_KEY).hint, WORKSPACE_RETENTION_HINT,
+    '读失败回落那一档也必须带 hint（界面正是要在那时解释 0 是什么意思）');
+
+  // PUT 的 DTO 也带：前端拿响应里那个 item 直接替掉界面上的那一行 ⇒ 漏了它，保存完提示就消失。
+  const pool = new FakeRuntimePool({
+    returning: {
+      key: WORKSPACE_RETENTION_KEY, value: 7,
+      updated_at: new Date('2026-11-23T00:00:00.000Z'), updated_by: ACTOR,
+    },
+  });
+  const { item } = await updateRuntimeSettingAdmin({
+    pool, actorId: ACTOR, key: WORKSPACE_RETENTION_KEY, value: 7, log: silentLog,
+  });
+  assert.equal(item.value, 7, '写侧本身不许被 hint 这件事带偏');
+  assert.equal(item.hint, WORKSPACE_RETENTION_HINT,
+    '保存后的 item 也要带 hint（否则「一保存提示就没了」，而那正是最需要它的时候）');
+  assert.equal(Object.hasOwn(item, 'hint'), true);
+});
+
+test('RS-30 文档契约在场：§4.21 那一小节 + env 那一行 + 它点名的三条判据真的存在', () => {
+  const apiDoc = fs.readFileSync(new URL('../../docs/api/portal.md', import.meta.url), 'utf8');
+  const envDoc = fs.readFileSync(new URL('../../docs/env.md', import.meta.url), 'utf8');
+  const offFile = fs.readFileSync(new URL('./offboarding.test.js', import.meta.url), 'utf8');
+
+  // ① §4.21 里那一小节在，且两个方向都写到了（只写一个方向 = 契约还是半个）。
+  const section = apiDoc.slice(
+    apiDoc.indexOf('的语义：关掉的是「清理动作」'),
+    apiDoc.indexOf('#### 与 §4.15 / §4.19 的关系'),
+  );
+  assert.ok(section.length > 200, '§4.21 里那一小节被删了或挪走了（切片切出来是空的）');
+  assert.match(section, /A 方向/, 'A 方向（0 期间完成离职 ⇒ 不补期限）必须在契约里');
+  assert.match(section, /B 方向/, 'B 方向（已过期 ⇒ 改回正数下一拍兑现）必须在契约里');
+  assert.match(section, /不重新等 N 天|不重新等 7 天/, 'B 方向那句「不重新等」是不许被改形的口径');
+  assert.match(section, /刻意不对称/, '不对称是刻意的 —— 这句没了，下一个人就会「顺手补齐」另一半');
+  assert.match(section, /#677 P3⑤[\s\S]*#677 P3⑥/, '契约必须点名判据（否则它是条无法执行的口头口径）');
+
+  // ② 契约点名的那三条判据真的存在（红法：改名/删掉判据 ⇒ 这里红，而不是文档空指）。
+  for (const name of ['#677 P3⑤', '#677 P3⑥', '#677 P3⑦']) {
+    assert.ok(offFile.includes(name), `契约点名的判据在 offboarding.test.js 里找不到：${name}`);
+  }
+
+  // ③ env 那一行同步（运维只看 env 口径表也必须看到「停清理 ≠ 撤销已排期限」），
+  //    且它与 registry 的 hint 用的是同一个关键词 ⇒ 两处文案不许各说一套。
+  assert.match(envDoc, /关掉清理 ≠ 取消已排定的删除/,
+    'docs/env.md 的 ERIX_WORKSPACE_RETENTION_DAYS 行必须同步这一句');
+  assert.match(envDoc, /§4\.21/, 'env 那一行要给出契约的落点（否则它只是第二份没有出处的口径）');
+  assert.ok(
+    WORKSPACE_RETENTION_HINT.includes('不会取消已排定的删除')
+      && envDoc.includes('取消已排定的删除') && section.includes('取消已排定的删除'),
+    'hint / env 行 / §4.21 三处必须说同一件事（关键词漂开 = 有人在偷偷改其中一处的口径）',
+  );
+});
