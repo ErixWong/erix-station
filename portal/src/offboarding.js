@@ -8,6 +8,7 @@ import { removeGitCredentialFile } from './git-credential.js';
 import { assertSafePath } from './fsutil.js';
 import { validateFdeName } from './projects.js';
 import { disableGiteaAccount } from './git-mint.js';
+import { readWorkspaceRetentionDays } from './runtime-settings.js';
 import { attachLoopWatch, envInt, idleDelayMs, MAX_BACKOFF_MS_SAFE, sleepCancellable } from './loop-timing.js';
 
 const STEPS = [
@@ -501,6 +502,13 @@ function deleteWorkspaceDirectory(root, fdeName) {
 /**
  * Remove only completed, explicitly scheduled offboarding workspaces. User and
  * offboarding database rows remain as permanent account and audit records.
+ *
+ * issue #677 P3 第一批：「这一格开关开没开」的判据改成看**传进来的那个数**（`retentionDays`），
+ * 不再直接抓 `config`。缺省仍从 `config.workspaceRetentionDays` 取（既有调用方与单测不受影响），
+ * 但调用方（`startOffboardingLoop`）现在每一拍把 `readWorkspaceRetentionDays` 现读到的值递进来
+ * ⇒ 管理台改了保留天数，下一拍就按新值决定清理不清理（以前是启动期快照，改一个数要重建容器）。
+ * ⚠ `=== 0` 那一判**只许**用这个局部量：绕回去读 `config` 就是把旋钮退回 `restart` 语义，
+ *   而界面写着「热生效」（判据：`offboarding.test.js` 的「按传入值判 disabled」那一格）。
  */
 export async function sweepOffboardedWorkspaces(pool, config, {
   log = console,
@@ -508,8 +516,11 @@ export async function sweepOffboardedWorkspaces(pool, config, {
   limit = PURGE_BATCH_SIZE,
   removeWorkspace = deleteWorkspaceDirectory,
   lockFde = withFdeProvisioningLock,
+  retentionDays,
 } = {}) {
-  if ((config.workspaceRetentionDays ?? 0) === 0) return { disabled: true, purged: 0, failed: 0 };
+  // `?? 0` 而不是 `retentionDays || ...`：`0` 是「不清理」这个**有效值**，不是「没给」。
+  const effectiveRetentionDays = retentionDays ?? config.workspaceRetentionDays ?? 0;
+  if (effectiveRetentionDays === 0) return { disabled: true, purged: 0, failed: 0 };
   const expired = await pool.query(
     `SELECT fde_id, fde_name, workspace_purge_after
        FROM fde_offboarding
@@ -555,6 +566,16 @@ export async function sweepOffboardedWorkspaces(pool, config, {
  *     （默认 30s）。说「完全不影响日程」是错的，说「会被退避饿死」也是错的（判据：用例 C1）。
  *  3. 句柄补成 #506 同形（`stop`/`done`/`settled`/`failure`）：`stop()` 现在会 abort 正在睡的那一拍。
  * `now` 也是注入缝（生产仍是 `Date.now()`）——闸门必须能在假时钟下被测到，否则只能真等 1h。
+ *
+ * issue #677 P3 第一批：本循环还多担一件 —— **每拍现读 `workspace.retention_days`**。
+ *   * 读一次喂两个消费者：`runOffboardingOnce`（写 `workspace_purge_after` 的截止期）与
+ *     `sweepOffboardedWorkspaces`（`=== 0 ⇒ 不清理`）。两者以前都拿启动期快照的 config。
+ *   * **不是「每拍一条 SQL」**：`readWorkspaceRetentionDays` 自带 5s 缓存 + 同池在飞合并，
+ *     拍频基准 5s / 空闲退避到 30s ⇒ 最坏与拍频同量级的一条整表 SELECT（这张表只有几行）。
+ *     不把它挂到每拍而只挂到 1h 闸门里也行，但那样 `runOffboardingOnce` 就还在吃快照——
+ *     「同一个旋钮两种新鲜度」是 #677 一路在拆的形状。
+ *   * 现读**永不抛**（读侧口径）⇒ 循环不会因为配置面坏了而停摆；读不到就用 env/默认。
+ *   * `now` / `env` 一并递下去：假时钟推过 1h 同时也让 5s 缓存到点，判据不用真等。
  */
 export function startOffboardingLoop(pool, config, {
   docker,
@@ -564,6 +585,8 @@ export function startOffboardingLoop(pool, config, {
   now = () => Date.now(),
   env = process.env, // 单测注入旋钮用；生产不传 ⇒ process.env
   idleBackoffMaxMs = envInt('OFFBOARDING_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log, env }),
+  readRetention = readWorkspaceRetentionDays, // 注入缝：判据要能钉「下一拍用新值」而不靠真库
+  sweep = sweepOffboardedWorkspaces,          // 注入缝：同上（要能看见清理真正收到了哪个值）
 } = {}) {
   if (!docker) docker = createDockerClient({ dockerHost: config.dockerHost });
   let consecutiveFailures = 0;
@@ -579,12 +602,17 @@ export function startOffboardingLoop(pool, config, {
           if (recovered > 0) log.warn?.(`[offboarding] recovered ${recovered} interrupted task(s)`);
           recoveredInterruptedWork = true;
         }
-        const { claimed = false } = (await runOffboardingOnce(pool, config, { docker, log })) ?? {};
+        // #677 P3：这一拍用的保留天数是**现读**的（5s 缓存 + 在飞合并，不是一条 SQL/拍）。
+        // 放在认领之前，是因为两个消费者（认领后的截止期 + 下面的清理）都要拿同一个新鲜度。
+        const retentionDays = await readRetention({ pool, config, now, log, env });
+        const work = await runOffboardingOnce(pool, config, { docker, log, retentionDays });
+        const { claimed = false } = work ?? {};
         // 清理闸门与「有没有活」无关（语义见上面注释第 2 条）；`Date.now()` → `now()` 只是可测缝，不是行为改动。
         // ⚠ 它是**每拍检查一次**的时间门：空闲拍退到 30s ⇒ 清理最坏比原定时刻晚一个拍（≤ max），不是按秒准时。
         const tickAt = now();
         if (tickAt - lastSweepAt >= SWEEP_INTERVAL_MS) {
-          await sweepOffboardedWorkspaces(pool, config, { log });
+          // `retentionDays` 是显式参数：清理的开关判据从此看这一拍的现读值，不看启动快照。
+          await sweep(pool, config, { log, retentionDays });
           lastSweepAt = tickAt;
         }
         consecutiveFailures = 0;

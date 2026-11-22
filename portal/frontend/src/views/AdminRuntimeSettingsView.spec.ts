@@ -15,6 +15,8 @@
 //   R6 越界照发（服务端才是闸）+ 解析不出整数 ⇒ 零请求
 //   R7 空列表 / GET 失败 / 未加载 三态各自独立（错误不冒充空态，也不白屏）
 //   R8 保存成功那一行显示「已保存」并回填服务端回读的生效值（不是用户敲的那一串）
+//   R10 `hint`（#706）：服务端只在登记了的那一格带 `hint` 键 ⇒ 那一行下方出小字；
+//       没登记的那一行**不存在** `runtime-hint-*` 元素（断言查询为空，不是断言文案为空）
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
@@ -475,5 +477,60 @@ describe('R9 在写的那一行说「正在保存」，并锁住整页的写', (
     expect(exists(w, `runtime-saving-${TTL_KEY}`)).toBe(false);
     expect(text(w, `runtime-saved-${TTL_KEY}`)).toContain('已保存');
     expect(disabled(SECOND_KEY)).toBe(false);
+  });
+});
+
+// ── R10（#706 收尾）：`hint` 的渲染 ─────────────────────────────────────────────
+// 后端只在 registry 登记了 hint 的那一格带上 `hint` 键（`portal/src/runtime-settings.js` 的
+// `withHint`，契约 §4.21）：没登记就**连键都没有**。所以这一页的口径是「有就在那一行下方渲染
+// 一行小字，没有就整个元素不存在」—— 判据是 DOM 里那个元素在不在，不是文案空不空：留一个
+// 空 `<p>` 既撑高度，又让「后端没给提示」与「提示是一句空话」在页面上长得一模一样。
+describe('R10 hint：有就在那一行下方渲染，没有就不存在那个元素', () => {
+  const RETENTION_KEY = 'workspace.retention_days';
+  const HINT = '0 = 关掉自动清理，但不会取消已排定的删除：'
+    + '改回正数后，已过期的工位会在下一次清理被删除；'
+    + '而 0 期间完成离职的工位不会被补上期限（也不会被追删）。';
+
+  /** 第一行是「登记了 hint 的那一格」；第二行照旧（后端没登记 ⇒ DTO 里连 `hint` 键都没有）。 */
+  const withHintDto = () => ({
+    items: [
+      {
+        key: RETENTION_KEY, label: '已离职工位目录保留天数（0 = 不自动清理）', value: 0,
+        source: 'db', applyMode: 'hot',
+        updatedAt: '2026-11-23T03:00:00.000Z', updatedBy: 'u-root',
+        hint: HINT,
+      },
+      DTO.items[1],
+    ],
+  });
+
+  it('DTO 给了 hint ⇒ 那一行下方原文显示；没给的那一行查不到 runtime-hint-* 元素', async () => {
+    stubDefault(withHintDto());
+    const w = await mountView();
+
+    expect(text(w, `runtime-hint-${RETENTION_KEY}`)).toBe(HINT);
+    // 没有 hint 的那一行：**该 data-test 查询为空**（不是「元素在、只是文案为空」）
+    expect(exists(w, `runtime-hint-${SECOND_KEY}`), '第二行不该有提示元素').toBe(false);
+    expect(w.find(`[data-test="runtime-hint-${SECOND_KEY}"]`).exists()).toBe(false);
+    // 整页只许有这一个提示元素 ⇒ 「一律渲染空 <p>」当场红（会变成 2 个）
+    expect(w.findAll('[data-test^="runtime-hint-"]')).toHaveLength(1);
+  });
+
+  it('保存后提示不许消失：PUT 响应的 item 也带 hint ⇒ 回填那一行仍是那句话', async () => {
+    stubDefault(withHintDto(), () => json(200, {
+      item: {
+        key: RETENTION_KEY, label: '已离职工位目录保留天数（0 = 不自动清理）', value: 30,
+        source: 'db', applyMode: 'hot',
+        updatedAt: '2026-11-23T04:00:00.000Z', updatedBy: 'u-root',
+        hint: HINT,
+      },
+    }));
+    const w = await mountView();
+    await setDraft(w, RETENTION_KEY, '30');
+    await clickSave(w, RETENTION_KEY);
+
+    expect(text(w, `runtime-value-${RETENTION_KEY}`)).toBe('30');
+    expect(text(w, `runtime-hint-${RETENTION_KEY}`)).toBe(HINT);
+    expect(w.findAll('[data-test^="runtime-hint-"]')).toHaveLength(1);
   });
 });
