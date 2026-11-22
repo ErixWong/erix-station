@@ -17,9 +17,14 @@ export class FakePool {
     // 存的是 `{ max_file_bytes, updated_at, updated_by }`（max_file_bytes 存 **number**，
     // 出参时再按真驱动的形状转成字符串，见下面 `FROM upload_settings` 分支的长注）。
     this.uploadSettings = null;
-    // #485 复 audit（活二）：注入「审计 `INSERT` 失败」。保存是一条 CTE 语句 ⇒ 注入成立时整条语句
-    // 失败而设置**一格没变**（语句级原子）。默认 false = 不注入。
+    // #485 复 audit（活二）：注入「审计 `INSERT` 失败」。保存现在是一个**事务** ⇒ 注入成立时产品侧
+    // `ROLLBACK` ⇒ 设置**一格没变**、审计零行（事务级原子，US-21）。默认 false = 不注入。
     this.failAudit = false;
+    // #698b：**连接级事务的撤销账**（只在「本连接当前正在一个事务里」时非 null，见 `connect()`）。
+    // fake 原本完全不模拟事务：`ROLLBACK` 落空 ⇒ 「审计写不进去 ⇒ 设置也没改」在 fake 里不可表示
+    //（而那是硬口径 6 的一半）。这里只补**最小的一块**：事务里的写记下怎么撤销，`ROLLBACK` 逐条撤销、
+    // `COMMIT` 丢弃。⚠ **刻意不模拟 MVCC / 行锁**（见 `connect()` 的注）——并发可见性不在 fake 的口径里。
+    this._txUndo = null;
     // #456：证书台账（`tls_certificates`）。**不是真相源**（真相是盘上证书文件），只记「谁什么时候装了什么」。
     this.tlsCerts = [];
     // #456 M2：**语句流水**（`{sql, params}`，每条进来的语句）。只给「零副作用」这类判据用：
@@ -247,81 +252,46 @@ export class FakePool {
       return { rows: [] };
     }
 
-    // ---- #485 片 A 复 audit（活二）：保存 = 读旧值 + upsert + 写审计，**一条** CTE 语句 ----
-    // ⚠ 必须排在下面那条 `INSERT INTO audit_log` 之前：这条 SQL 同时含两张表的 INSERT，
-    // 让通用审计分支先认到就会**吞掉 upsert**（设置没改、只多一条审计，用例却绿 = 假绿）。
-    // fake 真模拟三件事：① 旧值取的是**本语句开始时**的库状态（快照）；② `previous_*` 的区间判定
-    // **按 SQL 写的做**（`BETWEEN $5 AND $6` 没写就放宽 ⇒ 「区间判定被删」这种变异会红）；
-    //   ③ `failAudit` 注入时整条语句失败而 `uploadSettings` **一格没变**（语句级原子，对应 US-20）。
-    if (sql.includes('INSERT INTO upload_settings') && /\bWITH\s+prev\b/i.test(sql)) {
-      if (!/ON CONFLICT \(id\) DO UPDATE/.test(sql)) {
-        throw new Error('fake：upload_settings 写入必须是单条 upsert（INSERT … ON CONFLICT (id) DO UPDATE）');
-      }
-      if (!/VALUES \(1,/.test(sql)) throw new Error('fake：upload_settings 是单行表，插入必须写死 id = 1');
-      // 形状闸（#698 返修）：prev 带 `FOR UPDATE` 时，同一条含 data-modifying CTE 的语句里它**看不见本语句
-      // 要改的那一行**（真库 postgres:16 实测：`previous_raw` 恒 null、`rowCount` 恒 0 ⇒ 保存恒 500）。
-      // fake 按这个实测口径裁决（看到 `FOR UPDATE` 就直接报错，而不是比真库更宽容）。
-      if (/\bFOR UPDATE\b/.test(sql)) {
-        throw new Error('fake：prev 不许带 `FOR UPDATE`——同一条含 data-modifying CTE 的语句里它看不见本语句'
-          + '要改的那行 ⇒ prev 恒空 ⇒ previous_* 拿不到旧值且主查询 0 行（issue #698 的现场）');
-      }
-      // 形状闸（#698 的另一半）：首写没有旧行，`FROM upd, prev_eff`（内连接）会把 upsert 那一行一起吃掉
-      // ⇒ 主查询 0 行、审计不写 ⇒ 保存恒 500。两处都必须是 `LEFT JOIN prev_eff ON true`（所以数两次）。
-      const leftJoins = (sql.match(/LEFT JOIN\s+prev_eff\s+ON\s+true/gi) || []).length;
-      if (leftJoins !== 2) {
-        throw new Error(`fake：aud 与主查询都必须 \`LEFT JOIN prev_eff ON true\`（首写无旧行，内连接会把` +
-          `\`upd\` 那一行一起吃掉，issue #698）；当前命中 ${leftJoins} 处，应为 2 处`);
-      }
-      if (params.length !== 8) throw new Error(`fake：upload_settings 保存语句应带 8 个参数，实际 ${params.length}`);
-      const [maxFileBytes, updatedBy, fallbackBytes, fallbackSource, minBytes, maxBytes, action, target] = params;
-      const value = Number(maxFileBytes);
-      if (!Number.isFinite(value)) throw new Error('fake：max_file_bytes 是 bigint NOT NULL，不能是 undefined/null/NaN');
-      if (value <= 0) throw new Error('fake：CHECK (max_file_bytes > 0) 被违反');
-      if (fallbackSource !== 'env' && fallbackSource !== 'default') {
-        throw new Error(`fake：previous_source 回落位只可能是 env/default，实际 ${fallbackSource}`);
-      }
-      // 旧值：与 `FROM upload_settings` 分支同形状（bigint ⇒ 字符串）。
-      const previousRaw = this.uploadSettings ? String(this.uploadSettings.max_file_bytes) : null;
-      const previousValue = previousRaw === null ? null : Number(previousRaw);
-      // SQL 里那句 CASE 的等价实现；`BETWEEN $5 AND $6` 被删 ⇒ 判定放宽（不兼平）。
-      const requireRange = /BETWEEN\s+\$5\s+AND\s+\$6/.test(sql);
-      const dbUsable = previousValue !== null && Number.isSafeInteger(previousValue)
-        && (!requireRange || (previousValue >= Number(minBytes) && previousValue <= Number(maxBytes)));
-      const previousMaxBytes = dbUsable ? previousValue : Number(fallbackBytes);
-      const previousSource = dbUsable ? 'db' : fallbackSource;
-      // 注入审计失败：真库里这是一条语句 ⇒ 设置与审计同生共死。fake 必须同样“要么全做要么全不做”，
-      // 不然它比产品更宽容，“审计写不进去也照样改成了”就测不出来（US-20）。
-      if (this.failAudit) throw new Error('fake：audit_log 写入失败（注入）');
-      this.uploadSettings = { max_file_bytes: value, updated_at: new Date(), updated_by: updatedBy };
-      this.audit.push({
-        actor_id: updatedBy,
-        action,
-        target,
-        // 真库把这列存成 jsonb；这里保持与旧实现（`auth.audit` 传 `JSON.stringify`）**同形状**，
-        // 免得“形状变了”与“内容变了”两个不同的红揉成一条。
-        details: JSON.stringify({
-          max_file_bytes: value,
-          previous_max_bytes: previousMaxBytes,
-          previous_source: previousSource,
-        }),
-      });
-      return {
-        rows: [{
-          max_file_bytes: String(value),
-          updated_at: this.uploadSettings.updated_at,
-          updated_by: updatedBy,
-          previous_raw: previousRaw,
-          audit_rows: 1,
-        }],
-        rowCount: 1,
-      };
-    }
-
-    // audit（best-effort）
+    // ---- #698b：保存 = **一个事务**（`BEGIN` → `SELECT … FOR UPDATE` → upsert → 审计 → `COMMIT`）----
+    // 旧版这里是一条 `WITH prev … upd … aud` 的 CTE 语句（`SAVE_SQL`），fake 在这一条语句里一次性做完
+    // 「读旧值 + 写设置 + 写审计」。产品侧改成事务后，那套模拟整块作废：
+    //   * 「同一语句内 `FOR UPDATE` 看不见本语句要改的行」（上一版硬闸的依据）不再是产品形状；
+    //   * `previous_*` 由 JS 单点派生，fake 不再自己算一份区间判定（那正是"比产品更宽容"的第二套策略）；
+    //   * 原子性改由 `connect()` 里的**撤销账**表达（`ROLLBACK` ⇒ 写回去，见那里）。
+    // 留下的只有两条**形状闸**（都比真库松，不在 fake 里判语义）：
+    //   ① `FOR UPDATE` 不许出现在 upsert 那条语句里（`INSERT INTO upload_settings` 分支）；
+    //   ② `upload_settings` 的审计必须落在事务里（`INSERT INTO audit_log` 分支）。
+    // ⚠ **fake 不模拟行锁与可见性**：并发保存的链（谁记谁的旧值）在 fake 里没有意义，判据在
+    //   `portal/test/upload-settings-real-db.test.js`。在 fake 上测并发 = 拿 fake 的调度当 PG 的语义。
+    // audit（best-effort；`auth.audit` 与 #698b 的保存事务都走这一条）
     if (sql.includes('INSERT INTO audit_log')) {
+      // 形状闸（#698b）：一条语句同时写两张表 = 上一版 `SAVE_SQL` 那条 CTE（硬口径 6 已作废），
+      // 在这里挡下来比“诚 quietly 吞掉 upsert”好：不挡的话设置没改、只多一条审计，用例却绿。
+      if (sql.includes('INSERT INTO upload_settings')) {
+        throw new Error('fake：写设置与写审计必须是**事务里的两条语句**（硬口径 6）；'
+          + '一条语句同时写两张表是上一版的 CTE 形状（#698：它既拿不到行锁又看不见本语句要改的那行）');
+      }
       const [actorId, action, target, details] = params;
-      this.audit.push({ actor_id: actorId, action, target, details });
-      return { rows: [] };
+      // 形状闸（#698b，对应硬口径 6「审计与设置同生共死」）：`upload_settings` 的审计必须落在事务里。
+      // 真库允许审计在事务外插（不报），所以这道闸**只为这一张表的审计服务**——其它 action 走
+      // `auth.audit`（本就无事务）⇒ 不管。拿不到事务上下文 = 产品把审计挪到了 COMMIT 之后。
+      if (target === 'upload_settings' && !this._txUndo) {
+        throw new Error('fake：upload_settings 的审计必须在 `BEGIN`…`COMMIT` 之间（硬口径 6）；'
+          + '事务外写审计就是「设置已生效而审计一行没有」那个窗口（#698 活二）');
+      }
+      if (this.failAudit) throw new Error('fake：audit_log 写入失败（注入）');
+      const row = { actor_id: actorId, action, target, details };
+      this.audit.push(row);
+      // 事务里插的审计 → 记一条撤销（`ROLLBACK` 只摸本事务插的那几行，按对象身份删，
+      // 不会误删同期另一条路径（如 `auth.audit`）插的无辜行）。
+      if (this._txUndo) {
+        this._txUndo.push(() => {
+          const i = this.audit.indexOf(row);
+          if (i >= 0) this.audit.splice(i, 1);
+        });
+      }
+      // `rowCount: 1` 是真库形状（单行 INSERT）：产品侧拿它当「审计必须落一行」的闸（US-21 同族）。
+      return { rows: [], rowCount: 1 };
     }
 
     // ---- #449：邮件通道配置（mail_settings 单行表） ----
@@ -364,7 +334,7 @@ export class FakePool {
       return { rows: this.mailSettings ? [{ ...this.mailSettings }] : [], rowCount: this.mailSettings ? 1 : 0 };
     }
 
-    // ---- #485 片 A：单文件上传上限（upload_settings 单行表，迁移 0035） ----
+    // ---- #485 片 A：单文件上传上限（upload_settings 单行表，迁移 0035/0036）----
     // 写侧按 SQL 文本真模拟（AGENTS §8.14 “不把新 SQL 当未知放行”），并把迁移 0035 的两条
     // 约束当 **DB 事实**执行：① 只能有一行（id = 1）；② `CHECK (max_file_bytes > 0)`。
     // 产品侧漏了这两条时 fake 会炸 ⇒ 用例变红，而不是静默存下一个“半个值”。
@@ -373,13 +343,33 @@ export class FakePool {
         throw new Error('fake：upload_settings 写入必须是单条 upsert（INSERT … ON CONFLICT (id) DO UPDATE）');
       }
       if (!/VALUES \(1,/.test(sql)) throw new Error('fake：upload_settings 是单行表，插入必须写死 id = 1');
+      // 形状闸（#698b）：`FOR UPDATE` 不许出现在 upsert 那条语句里。真库不报（比它松的不是这条闸，
+      // 而是“拿不到旧值”这个事实）：同一条含 data-modifying 的语句里 `FOR UPDATE` 看不见本语句要改的
+      // 那行（#698 第一轮实测）⇒ 锁白拿、旧值拿不到。行锁必须在 `PREVIOUS_SQL` 那一条单独语句里。
+      if (/\bFOR UPDATE\b/.test(sql)) {
+        throw new Error('fake：`FOR UPDATE` 不许嵌在 upsert 语句里（#698：同一条含 data-modifying 的语句里'
+          + '它看不见本语句要改的那行）——它必须是事务里单独的那条 SELECT');
+      }
       if (params.length !== 2) throw new Error(`fake：upload_settings upsert 应带 2 个参数，实际 ${params.length}`);
       const [maxFileBytes, updatedBy] = params;
       const value = Number(maxFileBytes);
       if (!Number.isFinite(value)) throw new Error('fake：max_file_bytes 是 bigint NOT NULL，不能是 undefined/null/NaN');
       if (value <= 0) throw new Error('fake：CHECK (max_file_bytes > 0) 被违反');
+      // 事务里写的 → 记下“怎么写回去”（US-21：审计写不进去 ⇒ 设置一格没变）。
+      const before = this.uploadSettings;
+      if (this._txUndo) this._txUndo.push(() => { this.uploadSettings = before; });
       this.uploadSettings = { max_file_bytes: value, updated_at: new Date(), updated_by: updatedBy };
       return { rows: [{ ...this.uploadSettings, max_file_bytes: String(value) }], rowCount: 1 };
+    }
+
+    // #698b：保存事务的第 1 条 —— 单独一条 `SELECT … FOR UPDATE`（拿锁 + 拿最新已提交值）。
+    // fake **不模拟锁**（它只把当前状态回出去），但必须按 SQL 的列清单回列（#472 同一条红线）：
+    // 产品要的是 `AS raw`，那它就只拿得 `raw`；漏了别名 ⇒ 拿不到旧值 ⇒ 用例会红，不是被兼平成假绿。
+    if (/FROM upload_settings/.test(sql) && /\bFOR UPDATE\b/.test(sql)) {
+      const alias = /\bAS\s+(\w+)\s+FROM/i.exec(sql)?.[1] ?? 'max_file_bytes';
+      // bigint → 字符串（与下面 `FROM upload_settings` 分支同一理由：不拿驱动默认行为当语义）。
+      const raw = this.uploadSettings === null ? null : String(this.uploadSettings.max_file_bytes);
+      return { rows: raw === null ? [] : [{ [alias]: raw }], rowCount: raw === null ? 0 : 1 };
     }
 
     if (sql.includes('FROM upload_settings')) {
@@ -544,9 +534,47 @@ export class FakePool {
 
   async end() {}
 
-  // issue #183：git-credential 的 updateAssignedAccount 现走事务（pool.connect）；
-  // fake pool 用同一 query 处理器充当事务 client（BEGIN/COMMIT 落入默认空行）。
+  /**
+   * 事务入口。两类使用者：
+   *   * #183（git-credential）等：拿它当一个能跑 `BEGIN`/`COMMIT` 的普通句柄（行为不变）；
+   *   * #698b（保存上传上限）：需要 fake **真的能回滚** —— 否则「审计写不进去 ⇒ 设置也没改」
+   *     这条硬口径（US-21）在 fake 里不可表示（旧版它是靠“一条语句要么全做要么全不做”兼平的，
+   *     产品改成事务后那个兼平就没了 ⇒ 必须补事务形状本身）。
+   *
+   * 只补三件事：`BEGIN` 开一份撤销账、`COMMIT` 丢账、`ROLLBACK` 逐条撤销。
+   * ⚠ **刻意不模拟 MVCC / 行锁**（不去做“事务间互相看不见未提交写”）：做了就是拿 fake 的调度
+   *   当 PG 的语义，而 #698 的 MED 正是这么漏过去的——并发审计链的判据在真库文件里。`BEGIN` 重复
+   *   与无事务时的 `COMMIT`/`ROLLBACK` 都**不报错**（PG 只给 warning）：不要比真库更严。
+   */
   async connect() {
-    return { query: (sql, params) => this.query(sql, params), release() {} };
+    const pool = this;
+    const client = {
+      /** 本连接当前事务的撤销账；null = 不在事务里。 */
+      _undo: null,
+      async query(sql, params) {
+        const head = String(sql).trim().split(/\s+/)[0].toUpperCase();
+        if (head === 'BEGIN') client._undo = client._undo ?? [];
+        // 只把记账窗口开在**同步分发那一段**（基类 `query` 的分支全是同步的）：窗口再宽就会把
+        // 同期另一条路径（`auth.audit` 走 `pool.query`）的写也记到本事务账上，`ROLLBACK` 就会误伤。
+        const outer = pool._txUndo;
+        pool._txUndo = client._undo;
+        let pending;
+        try {
+          pending = pool.query(sql, params);
+        } finally {
+          pool._txUndo = outer;
+        }
+        const out = await pending;
+        if (head === 'COMMIT') client._undo = null;
+        if (head === 'ROLLBACK') {
+          const undo = client._undo ?? [];
+          client._undo = null;
+          for (const fn of undo.reverse()) fn();
+        }
+        return out;
+      },
+      release() {},
+    };
+    return client;
   }
 }
