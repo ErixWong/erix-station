@@ -1204,12 +1204,13 @@ export const en = {
     runtime: {
       title: 'Runtime settings',
       intro: 'The admin console entry for the platform knobs. Every row shows the value together '
-        + 'with its source and how it takes effect: a bare number leaves operators guessing whether '
-        + 'the knob they changed is even listened to. Values saved here go into the database and take '
-        + 'precedence over the environment variable and the built-in default, with no image rebuild.',
+        + 'with its source and how it takes effect: a bare number leaves operators guessing '
+        + 'whether the knob they changed is even listened to. Values saved here go into the '
+        + 'database and take precedence over the environment variable and the built-in default, '
+        + 'with no image rebuild.',
       loading: 'Loading runtime settings…',
-      loadError: 'The list could not be read, so nothing below is presented as the current state '
-        + '(the message is the server’s own):',
+      loadError: 'The list could not be read, so nothing below is presented as the current '
+        + 'state (the message is the server’s own):',
       notLoaded: 'Runtime settings not loaded yet (no request has been made).',
       empty: 'The server listed no manageable settings (the registry has no writable knob yet).',
       colKey: 'Setting',
@@ -1237,12 +1238,12 @@ export const en = {
       fieldValue: 'New value',
       fieldBody: 'the request body',
       fieldPointed: ' (the server says the fault is in: {field})',
-      footnote: 'The UI does not police ranges: any parsed integer is sent as-is (out of range ⇒ the '
-        + 'server rejects it and writes nothing, §4.21). A row whose “Takes effect” column says '
-        + 'it needs a restart only applies after station-portal restarts — “Saved” here never '
-        + 'means “in effect”. And “takes effect immediately” does not cross processes: in a '
-        + 'multi-replica deployment the other station-portal processes see the new value after at '
-        + 'most 5 seconds.',
+      footnote: 'The UI does not police ranges: any parsed integer is sent as-is '
+        + '(out of range ⇒ the server rejects it and writes nothing, §4.21). A row whose '
+        + '“Takes effect” column says it needs a restart only applies after station-portal '
+        + 'restarts — “Saved” here never means “in effect”. And “takes effect immediately” does '
+        + 'not cross processes: in a multi-replica deployment the other station-portal processes '
+        + 'see the new value after at most 5 seconds.',
     },
     // issue #449 admin slice: mail channel settings (views/AdminMailView.vue, contract docs/api/portal.md §4.12).
     // This page is the only switch for the email-code second factor; the password is write-only
