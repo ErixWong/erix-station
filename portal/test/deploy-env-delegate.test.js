@@ -3574,7 +3574,13 @@ test('#587-S1-⑩ portal helper 间接读由**代码推出**并归 host-source�
     // 推导是幂等的（同一个 root 只扫一次，两次调用给同一批事实）
     assert.equal(index.deriveHostSourceSites(), derived, 'derive 不幂等 ⇒ 第二张表会被重复登记');
     // 真树：`FDE_WORKER_UID` 那条差异必须归 host-source，理由点名调用点与 helper 两头坐标
-    REPO_SITE_INDEX.deriveHostSourceSites();
+    // 真树的推导读数：只装**带命名空间前缀**的 env 名（`NAMESPACED_ENV_NAME` 与扫描器给读站点的
+    // 准入规则同一条）⇒ `PREVIEW_*` / `SESSION_TTL_SECONDS` 这些 helper 调用点被推出但不算 env 站点。
+    const realDerived = REPO_SITE_INDEX.deriveHostSourceSites();
+    const siteTag = (s) => `${s.rel}:${s.line}←helper ${s.helperRel}:${s.helperDeclLine}`;
+    const uidSites = realDerived.filter((s) => s.key === 'FDE_WORKER_UID').map(siteTag).join('、');
+    console.log(`# HOST-SITES 真树推出 ${realDerived.length} 条 helper 间接读站点（由 unsupported 反推，`
+      + `非手抄）；FDE_WORKER_UID ⇒ ${uidSites || '没推出'}`);
     const real = shadowGapSemantic('FDE_WORKER_UID', 'portal/src/config.js:406');
     assert.equal(real.kind, 'host-source',
       `config.js:406 是合法的 portal 间接读，不是「仅仅提到 key」（实际 ${real.kind}：${real.why}）`);
