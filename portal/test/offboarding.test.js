@@ -7,8 +7,11 @@ import {
   initialOffboardingSteps,
   retryOffboarding,
   runOffboardingOnce,
+  startOffboardingLoop,
   sweepOffboardedWorkspaces,
 } from '../src/offboarding.js';
+// #677 P3 第一批：`workspace.retention_days` 的写路径失效钩子（判据用它演「管理台刚保存」）。
+import { invalidateWorkspaceRetentionCache } from '../src/runtime-settings.js';
 // #252 的回归保护：preview_grants 的 baseline CHECK（含双向的 `used ⇔ used_at`）在 fake 里的等价模拟
 // （与 portal/test/preview-ports.test.js 共用一份规则；旧 fake 只模拟 revoked ⇔ revoked_at，
 // 于是「把 used ticket 一并抓 revoked」在单测里结构上不可能红）。
@@ -783,3 +786,223 @@ test('#252⑥ 整笔回滚不留下半成品：撤权撞 CHECK ⇒ ROLLBACK 后 
   await pool.query('ROLLBACK');
   assert.deepEqual(pool.cloneTables(), before, '回滚 = 整笔还原（真机就是这个形状：500 之后旧行仍活）');
 });
+
+// ---------------------------------------------------------------------------
+// issue #677 P3 第一批：`workspace.retention_days` 成了**热读旋钮** ⇒ 消费者的开关判据
+// 不许再吃启动期的 `config` 快照。两格判据分工：
+//   · sweep 本体：`=== 0 ⇒ disabled` 必须按**传进来的那个数**判（变异 M-2）。
+//   · 循环本体：清理那一拍的现读值必须真的落到 sweep 上（变异 M-1），且**下一拍**就是新值。
+// 循环那两格走**真热读**（`readWorkspaceRetentionDays` 未替换）+ 真 `sweepOffboardedWorkspaces`，
+// 只在假库里换掉 `runtime_settings` 那一读 ⇒ 红的是接线，不是夹具。
+//
+// 假睡眠/`waitUntil` 的口径照 `idle-backoff-520.test.js`（假睡眠不自己醒，由测试 `pass()` 推进；
+// 等「停在某一拍」用截止时刻而不是轮次预算，#531 的假红就出在轮次预算上）。
+// ---------------------------------------------------------------------------
+
+/** 认得 `runtime_settings` 整表读的销号假库：库里那一行写什么，由测试中途翻。 */
+class OffboardingPoolWithSettings extends OffboardingPool {
+  constructor(opts = {}) {
+    super(opts);
+    this.retentionRow = undefined;   // `undefined` = 库里没有这一行（未配置）
+    this.retentionReads = 0;
+  }
+
+  async query(sql, params = []) {
+    const normalized = String(sql).replace(/\s+/g, ' ').trim();
+    if (/\bFROM runtime_settings\b/i.test(normalized) && !/\bINSERT\b/i.test(normalized)) {
+      this.retentionReads += 1;
+      const rows = this.retentionRow === undefined
+        ? [] : [{ key: 'workspace.retention_days', value: this.retentionRow }];
+      return { rows, rowCount: rows.length };
+    }
+    return super.query(sql, params);
+  }
+}
+
+/** 那条清理 SELECT 发了几次（`disabled` 的形状 = 一次都不发）。 */
+function sweepSelects(pool) {
+  const marker = 'SELECT fde_id, fde_name, workspace_purge_after';
+  return pool.queryLog.filter(({ sql }) => sql.includes(marker)).length;
+}
+
+function makeParkedSleep() {
+  const sleeps = [];
+  let pending = null;
+  const sleep = (ms, signal) => new Promise((resolve) => {
+    sleeps.push(ms);
+    const entry = { done: false };
+    entry.finish = (ok) => {
+      if (entry.done) return;
+      entry.done = true;
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (pending === entry) pending = null;
+      resolve(ok);
+    };
+    const onAbort = () => entry.finish(false);
+    if (signal?.aborted) { entry.finish(false); return; }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    pending = entry;
+  });
+  return {
+    sleeps,
+    sleep,
+    pass() {
+      if (!pending) throw new Error('循环没停在 sleep 上（夹具用错）');
+      pending.finish(true);
+    },
+  };
+}
+
+async function waitUntil(cond, label, deadlineMs = 15_000) {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    if (cond()) return;
+    if (Date.now() > deadline) {
+      for (let i = 0; i < 5 && !cond(); i += 1) await new Promise((r) => setImmediate(r));
+      if (cond()) return;
+      assert.fail(`等超时（${deadlineMs}ms + 5 轮宽限，同机负载？）：${label}`);
+    }
+    await new Promise((r) => setImmediate(r));
+  }
+}
+
+async function parkedTick(fake, n) {
+  await waitUntil(() => fake.sleeps.length >= n,
+    `循环应已走到第 ${n} 拍 sleep；实际 ${fake.sleeps.length} 拍`);
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+const quietLog = { warn() {}, error() {}, debug() {}, log() {} };
+
+test('#677 P3① sweep 的开关判据按**传入的** retentionDays，不按 config 快照（变异 M-2）', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-p3-sweep-value-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const workspace = path.join(root, FDE_NAME);
+  const now = new Date('2026-10-07T00:00:00Z');
+  const expired = () => new Date(now.getTime() - 1);
+  const passthrough = { lockFde: async (_pool, _name, work) => work(), now };
+
+  // ① config 说 30（开着），传进来 **0** ⇒ 必须 disabled 且**一条清理 SQL 都不发**。
+  //    变异 M-2（判据改回读 `config.workspaceRetentionDays`）在这里以「purged:1 / 目录没了」点名红。
+  fs.mkdirSync(workspace);
+  const p1 = new OffboardingPool({ state: 'done', purgeAfter: expired() });
+  const r1 = await sweepOffboardedWorkspaces(
+    p1, { userSpaceRoot: root, workspaceRetentionDays: 30 }, { ...passthrough, retentionDays: 0 },
+  );
+  assert.deepEqual(r1, { disabled: true, purged: 0, failed: 0 },
+    '传进来 0 就是关了：config 里那个 30 不许再算数');
+  assert.equal(sweepSelects(p1), 0, 'disabled ⇒ 一条 SQL 都不发');
+  assert.equal(fs.existsSync(workspace), true, '目录必须还在');
+
+  // ② 反向：config 说 0（关着），传进来 14 ⇒ 必须真的清（缺省从 config 取，显式值压过它）。
+  const p2 = new OffboardingPool({ state: 'done', purgeAfter: expired() });
+  const r2 = await sweepOffboardedWorkspaces(
+    p2, { userSpaceRoot: root, workspaceRetentionDays: 0 }, { ...passthrough, retentionDays: 14 },
+  );
+  assert.deepEqual(r2, { disabled: false, purged: 1, failed: 0 });
+  assert.equal(fs.existsSync(workspace), false, '按**传入值**清理了');
+
+  // ③ 不传 ⇒ 缺省仍取 config（既有调用方与既有单测的形状不许变）。
+  fs.mkdirSync(workspace);
+  const p3 = new OffboardingPool({ state: 'done', purgeAfter: expired() });
+  const r3 = await sweepOffboardedWorkspaces(
+    p3, { userSpaceRoot: root, workspaceRetentionDays: 0 }, passthrough,
+  );
+  assert.deepEqual(r3, { disabled: true, purged: 0, failed: 0 }, '不传 ⇒ 用 config（0 = 关）');
+  const p4 = new OffboardingPool({ state: 'done', purgeAfter: expired() });
+  const r4 = await sweepOffboardedWorkspaces(
+    p4, { userSpaceRoot: root, workspaceRetentionDays: 30 }, passthrough,
+  );
+  assert.deepEqual(r4, { disabled: false, purged: 1, failed: 0 }, '不传 ⇒ 用 config（30 = 开）');
+});
+
+test('#677 P3② 循环：清理那一拍**现读**保留天数 ⇒ 下一拍用的就是新值（变异 M-1，真热读+真清理）',
+  async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-p3-loop-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const workspace = path.join(root, FDE_NAME);
+    fs.mkdirSync(workspace);
+    // 到期时刻按**墙钟**判（`sweepOffboardedWorkspaces` 的 `now` 缺省是 `new Date()`，循环没换它）。
+    const pool = new OffboardingPoolWithSettings({
+      state: 'done', purgeAfter: new Date(Date.now() - 60_000),
+    });
+    pool.retentionRow = 0;              // 库里说「不清理」，而启动期快照 config 是 7
+    invalidateWorkspaceRetentionCache();
+
+    const fake = makeParkedSleep();
+    let clock = 1_700_000_000_000;
+    const loop = startOffboardingLoop(pool, { userSpaceRoot: root, workspaceRetentionDays: 7 }, {
+      docker: {}, log: quietLog, sleep: fake.sleep, now: () => clock,
+    });
+
+    // ① 第一拍：闸门开（`lastSweepAt=0`），但现读到的是 **0** ⇒ 这一拍不许清。
+    //    红法：`purged:1` + 目录没了 = 循环还在吃启动快照（M-1）。
+    await parkedTick(fake, 1);
+    assert.equal(sweepSelects(pool), 0, '库里写 0 ⇒ 这一拍不清（config 的 7 是启动期快照，不算数）');
+    assert.equal(fs.existsSync(workspace), true);
+    assert.ok(pool.retentionReads >= 1, '这一拍确实现读过（一次都没读 = 压根没接线）');
+
+    // ② 管理台把它改成 14（本进程的写路径在 COMMIT 后失效缓存 = 下面这一行干的事）
+    //    ⇒ 跨过 1h 闸门的**下一拍**必须按新值清。
+    pool.retentionRow = 14;
+    invalidateWorkspaceRetentionCache();
+    clock += HOUR_MS + 1000;
+    fake.pass();
+    await parkedTick(fake, 2);
+    assert.equal(sweepSelects(pool), 1, '下一拍必须真的发清理那条 SQL（0 = 现读值没交给 sweep）');
+    assert.equal(fs.existsSync(workspace), false, '按新值（14 天）真的把目录清了');
+
+    // ③ 再翻回 0 ⇒ 再下一拍又关掉（两个方向都必须是现读的，红一次就说得清是哪一半）。
+    pool.retentionRow = 0;
+    fs.mkdirSync(workspace);            // 再放一个目录，让「清没清」可观察
+    invalidateWorkspaceRetentionCache();
+    clock += HOUR_MS + 1000;
+    fake.pass();
+    await parkedTick(fake, 3);
+    assert.equal(sweepSelects(pool), 1, '关掉之后不再发清理 SQL');
+    assert.equal(fs.existsSync(workspace), true, '0 = 不清：目录必须还在');
+
+    loop.stop();
+    await loop.settled;
+    assert.equal(loop.failure(), null, '循环本体不许因为现读而挂掉（现读永不抛）');
+  });
+
+test('#677 P3③ 循环：现读到的值也交给 schedule-workspace-purge（同一个旋钮不许两种新鲜度）',
+  async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-p3-deadline-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+    // ① 库里写 0 ⇒ 即便启动快照是 7，也不许给这次销号写下 purge deadline（`0 = 不清理`）。
+    const offPool = new OffboardingPoolWithSettings({ state: 'pending' });
+    offPool.retentionRow = 0;
+    invalidateWorkspaceRetentionCache();
+    const fakeOff = makeParkedSleep();
+    let clock = 1_700_000_000_000;
+    const offCfg = { userSpaceRoot: root, workspaceRetentionDays: 7 };
+    const offLoop = startOffboardingLoop(offPool, offCfg, {
+      docker: fakeDocker(), log: quietLog, sleep: fakeOff.sleep, now: () => clock,
+    });
+    await parkedTick(fakeOff, 1);
+    offLoop.stop();
+    await offLoop.settled;
+    assert.equal(offPool.job.state, 'done', '这一拍确实把活干完了');
+    assert.equal(offPool.job.workspace_purge_after, null,
+      '库里 0 ⇒ 不写 purge deadline（写了 = 还在用启动快照的 7）');
+
+    // ② 库里写 14 ⇒ deadline 必须按 14 天算，不是启动快照的 7 天。
+    const onPool = new OffboardingPoolWithSettings({ state: 'pending' });
+    onPool.retentionRow = 14;
+    invalidateWorkspaceRetentionCache();
+    const fakeOn = makeParkedSleep();
+    const onCfg = { userSpaceRoot: root, workspaceRetentionDays: 7 };
+    const onLoop = startOffboardingLoop(onPool, onCfg, {
+      docker: fakeDocker(), log: quietLog, sleep: fakeOn.sleep, now: () => clock,
+    });
+    await parkedTick(fakeOn, 1);
+    onLoop.stop();
+    await onLoop.settled;
+    assert.equal(onPool.job.state, 'done');
+    const days = (onPool.job.workspace_purge_after.getTime() - Date.now()) / 86_400_000;
+    assert.ok(days > 13.9 && days < 14.1,
+      `purge deadline 必须按现读的 14 天算（实得 ${days.toFixed(2)} 天 = 还在吃启动快照）`);
+  });
