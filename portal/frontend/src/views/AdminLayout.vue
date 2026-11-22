@@ -47,6 +47,10 @@ const tabs = [
   // 号池占用（只读快照）之前。请求只在该视图挂载时发（`AdminPromptsView` 的 onMounted 是唯一触发点）。
   { name: 'admin-upload', label: 'admin.tabs.upload' },
   { name: 'admin-prompts', label: 'admin.tabs.prompts' },
+  // issue #677 P2b：运行时设置列表（§4.21）。紧随 prompts：upload / prompts / runtime 三块都是
+  // 「改一行而不必重建镜像」的平台配置，因此仍排在号池占用（只读运维快照）之前。
+  // 请求只在该视图挂载时发（`AdminRuntimeSettingsView` 的 onMounted 是唯一触发点）。
+  { name: 'admin-runtime', label: 'admin.tabs.runtime' },
   // issue #595 M2：能力市场发布台（条目表 + 发布/下线 + 扇描结果）。与证书/上传同为平台配置，
   // 因此排在号池占用（只读运维快照）之前。
   { name: 'admin-market', label: 'admin.tabs.market' },

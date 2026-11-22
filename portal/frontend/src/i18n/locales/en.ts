@@ -840,6 +840,10 @@ export const en = {
       // docs/api/portal.md §4.19). Order upload → prompts: both are platform settings that used
       // to require rebuilding station-portal.
       prompts: 'Prompts',
+      // issue #677 P2b: runtime settings list (views/AdminRuntimeSettingsView.vue, contract §4.21).
+      // Right after prompts: upload / prompts / runtime are all platform settings that used to
+      // require rebuilding station-portal.
+      runtime: 'Runtime settings',
       // issue #595 M2: capability market console (views/AdminMarketView.vue, contract §7 admin API).
       // After the upload limit and before the read-only pool view: it is platform configuration.
       market: 'Capability market',
@@ -1191,6 +1195,52 @@ export const en = {
       },
       errNotText: 'This draft is not text, so not even its length can be computed — no request was sent.',
       footnote: 'Beyond these three, the platform has four more prompts living in the runner image (see the read-only card above). Slice 1 has no per-FDE override and no version history: to see who changed what, read the audit action admin.platform_prompts_updated (the audit stores digests only; the text lives in that configuration row).',
+    },
+    // issue #677 slice P2b: admin "Runtime settings" list (views/AdminRuntimeSettingsView.vue,
+    // contract docs/api/portal.md §4.21). Same family as admin.upload but a *list* (issue P3 keeps
+    // adding knobs to the registry), so the copy must never hard-code "this one knob" or a concrete
+    // range — the range is the server registry's truth, not something i18n copies here.
+    // ⚠ Values render as plain text (no markdown renderer on this page): no asterisk pairs for emphasis.
+    runtime: {
+      title: 'Runtime settings',
+      intro: 'The admin console entry for the platform knobs. Every row shows the value together '
+        + 'with its source and how it takes effect: a bare number leaves operators guessing whether '
+        + 'the knob they changed is even listened to. Values saved here go into the database and take '
+        + 'precedence over the environment variable and the built-in default, with no image rebuild.',
+      loading: 'Loading runtime settings…',
+      loadError: 'The list could not be read, so nothing below is presented as the current state '
+        + '(the message is the server’s own):',
+      notLoaded: 'Runtime settings not loaded yet (no request has been made).',
+      empty: 'The server listed no manageable settings (the registry has no writable knob yet).',
+      colKey: 'Setting',
+      colValue: 'Current value',
+      colSource: 'Source',
+      colApplyMode: 'Takes effect',
+      colUpdatedAt: 'Updated at',
+      colChange: 'Change this value',
+      unknown: 'unknown',
+      never: 'never (the admin console never saved this one)',
+      sourceDb: 'Admin console (database)',
+      sourceEnv: 'Environment variable',
+      sourceDefault: 'Built-in default',
+      applyHot: 'takes effect immediately',
+      applyRestart: 'needs a restart',
+      save: 'Save',
+      saving: 'Saving…',
+      saved: 'Saved (the number below is the one the server read back after writing), {apply}',
+      reload: 'Reload',
+      errNotInteger: 'Not an integer (empty, a decimal or scientific notation all count as not) '
+        + '⇒ no request was sent.',
+      errNoItem: 'The server returned no setting (the response has no item) ⇒ this row was not '
+        + 'refreshed and is not treated as saved.',
+      fieldKey: 'the setting name',
+      fieldValue: 'New value',
+      fieldBody: 'the request body',
+      fieldPointed: ' (the server says the fault is in: {field})',
+      footnote: 'The UI does not police ranges: any parsed integer is sent as-is (out of range ⇒ the '
+        + 'server rejects it and writes nothing, §4.21). A row whose “Takes effect” column says '
+        + 'it needs a restart only applies after station-portal restarts — “Saved” here never '
+        + 'means “in effect”.',
     },
     // issue #449 admin slice: mail channel settings (views/AdminMailView.vue, contract docs/api/portal.md §4.12).
     // This page is the only switch for the email-code second factor; the password is write-only
