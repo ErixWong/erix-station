@@ -792,6 +792,15 @@ function buildEnvSiteIndex(root, opts = {}) {
    *   它进不了 `body.Env`，因此第 3 步也不会进这张表（「影子②」钉的就是这个形状）。
    */
   const injections = new Map();
+  let hostSourcesDerived = null;
+  /**
+   * **第三张表：portal/宿主侧的 helper 间接读站点**（MED②）。与 `injections` 的差别：它不是「留好的
+   * 空槽」，而是 `deriveHostSourceSites()` 从扫描器自己的 `unsupported` + 调用点字符串实参**推出来**的
+   * （坐标不手抄）。故意**不**进 `hasSite()` —— 影子的口径是「runner 读站点」，portal 侧那条读是
+   * **另一个来源**；把它当读站点放行 = 把 MED② 的误杀抹平后谎称两边口径已经一致（第 4 步要的是
+   * 「分类清楚」，不是「读数好看」）。它存在的意义：`shadowGapSemantic()` 的 `host-source` 判据有事实可问。
+   */
+  const hostSources = new Map();
   const shapesAt = (store, key, rel, line) => store.get(key)?.get(rel)?.get(line) ?? null;
   const linesOf = (store, key, rel) => {
     const byLine = store.get(key)?.get(rel);
@@ -819,6 +828,36 @@ function buildEnvSiteIndex(root, opts = {}) {
       byLine.get(line).push(shape);
       return this;
     },
+    /** 登记一个 **host-source** 站点（MED②）；`meta` 是推导过程的事实（helper 坐标等），报错时要能指着。 */
+    addHostSourceSite(key, rel, line, meta = {}) {
+      const byLine = bucketOf(hostSources, key, rel);
+      if (!byLine.has(line)) byLine.set(line, []);
+      byLine.get(line).push(meta);
+      return this;
+    },
+    /**
+     * 【MED② 的入口】**由代码推出** helper 间接读站点并登记（幂等：按 root 缓存，只推一次）。
+     * 调它不是为了把影子洗绿（那些坐标仍然判红），而是为了让差异分类能回答「这条红到底是什么来源」。
+     */
+    deriveHostSourceSites() {
+      if (hostSourcesDerived === null) {
+        hostSourcesDerived = deriveHostSourceSites(root, unsupported);
+        for (const s of hostSourcesDerived) this.addHostSourceSite(s.key, s.rel, s.line, s);
+      }
+      return hostSourcesDerived;
+    },
+    hostSources,
+    /** 该 key 的全部 host-source 站点 `[{rel, line, …推导事实}]`。 */
+    hostSourceSitesOf: (key) => {
+      const out = [];
+      for (const [rel, byLine] of hostSources.get(key) ?? []) {
+        for (const [line, metas] of byLine) {
+          for (const meta of metas) out.push({ rel, line, ...meta });
+        }
+      }
+      return out.sort((a, b) => a.rel.localeCompare(b.rel) || a.line - b.line);
+    },
+    hasHostSourceSite: (key, rel, line) => shapesAt(hostSources, key, rel, line) !== null,
     /** 该 key 的全部读站点 `[{rel, line, shape}]`（报错文案与「影子①」的取证都读它）。 */
     sitesOf: (key) => dumpOf(readSites, key),
     injectionSitesOf: (key) => dumpOf(injections, key),
@@ -2900,26 +2939,443 @@ test('#587-S1-⑦ 影子尺只认结构：注释行 / 散文串都红，真站�
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #587 第 1 步返修（review 两条 MED）。**这段只做一件事**：把「差异属于哪一类」从
+// *路径/文本形状* 换成 *可复核的语法与索引事实*，并把 portal 侧的 helper 间接读**推**出来。
+//
+// MED① 的病（原 `shadowGapClass()`）：`rel === 'portal/src/provisioner.js'` ⇒ `injection`、
+// `rel === 'portal/src/config.js'` ⇒ `host-source`、行内含 key ⇒ `mention-only`。三条都是**拿文本
+// 猜语义** —— 和被换掉的那把闸门是同一个病。第 4 步要拿这份分类决定「切换前补什么」，
+// 分类错了就补错方向（同文件的任意同名注释/散文坐标都能被算进已知类）。现在的三条判据：
+//   `injection`     该 key 的字面出现落在**容器 env 组装位**（`Env: […]` 数组 / `.Env.push(…)` 参数 /
+//                   `buildContainerConfig({ env: […] })` 的选项数组；第三条由**现跑产品代码**证明流入）；
+//   `host-source`   该坐标是 `deriveHostSourceSites()` 推出来的「helper 间接读」站点（见下面 F1–F3）；
+//   `mention-only`  该 key 在这一行是**被声明的字符串值**（`const-init` / `table-member` /
+//                   `default-param` 三形之一）**且**该 key 在索引里另有真读站点 —— 两个事实缺一不可；
+//   `null`          三条都不成立 ⇒ **必须红**（`#587-S1-⑧` 的 `unexplained` + `#587-S1-⑨` 直接钉）。
+// 形状尺（路径 + 行内含 key）只留作**兜底**，并且**计数**：`#587-S1-⑧` 断言真树 `fallbackCount === 0`。
+//
+// MED② 的病：`portal/src/config.js` 的 `intEnv(env, 'FDE_WORKER_UID', 1002)` 是**合法**的 portal 侧
+// env 读取（helper 用 `env[key]` 取值），但那条读站点扫描器看不见（动态下标进 `unsupported`）⇒
+// 影子判它「不是读站点」。这是**误杀**，不能叫「仅仅提到 key」（那是把真读取登记成文案），也不能
+// 并进 runner 读站点（那是另一个来源）。所以：不手抄坐标，而是**从扫描器已有的 `unsupported` +
+// 调用点的字符串实参把站点推出来**（`deriveHostSourceSites`），登记进第三张表 `hostSources`。
+// `host-source` 的语义定义：**env 对象由调用方传入、key 由调用点以字符串实参给出、调用点在 runner
+// 包外**（runner 是这把闸门的枚举根 ⇒ 包外的读天然不是「本站 runner 的读站点」，而是另一个来源）。
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * 影子对照里**允许**的差异类别（= 第 4 步切换前必须先修的三件事）。
- * 写成了**规则**而不是坐标清单：清单会把「现在长这样」抄成第二本账（产品行号一漂就红一次，
- * 而红得没有信息），规则只回答一个问题 —— 「这条差异能不能被解释成已知的三类之一」。
- *   · `injection`     坐标指的是 Docker `Env` 注入点 / inspect 读回 helper ⇒ 第 3 步登记成站点；
- *   · `host-source`   同名不同源：那个文件读它的是 **portal**（不是本站 runner 的配置面）；
- *   · `mention-only`  那一行**提到**了这个 env 名（数据表声明行 / 文案行），但真读站点在别处；
- *   · `null`          解释不了 ⇒ 必须红（新出现的假坐标，或索引漏了真读形）。
+ * 源码事实表：`剥注释码文 / 结构掩码 / 括号配对`。三件都来自**已有**的那两把尺
+ * （`stripComments` / `structuralMask` / `bracketPairs`）—— 本函数不新增解析器
+ * （第二套解析 = 第二本账，#557/#587 反复付账的那个形状）。
+ * @returns {{text:string,code:string,masked:string,pairs:Map<number,number>}|null}
  */
-function shadowGapClass(key, coord) {
+function srcFacts(root, rel) {
+  const id = `${root}\u0000${rel}`;
+  if (SRC_FACTS.has(id)) return SRC_FACTS.get(id);
+  let f = null;
+  try {
+    const text = fs.readFileSync(path.join(root, rel), 'utf8');
+    const code = stripComments(text);          // 注释 → 空格（**串正文留着**）
+    const masked = structuralMask(text);       // 再把串/正则正文抹平 ⇒ 括号配平用这份
+    f = { text, code, masked, pairs: bracketPairs(masked) };
+  } catch { f = null; }
+  SRC_FACTS.set(id, f);
+  return f;
+}
+const SRC_FACTS = new Map();
+
+/** 偏移 → 行号（1 起）。那两把尺都保留行列位 ⇒ 数换行就是行号（扫描器同一口径）。 */
+function lineAt(text, offset) {
+  let n = 1;
+  for (let i = 0; i < offset; i += 1) if (text[i] === '\n') n += 1;
+  return n;
+}
+
+/** 包住 `offset` 的括号对，**由内到外**（`close` 不含）—— 判「这个位置在哪个语法壳里」用。 */
+function enclosingPairs(masked, pairs, offset) {
+  const out = [];
+  for (const [open, close] of pairs) {
+    if (open < offset && offset < close) out.push({ open, close, kind: masked[open] });
+  }
+  return out.sort((a, b) => b.open - a.open);
+}
+
+/** 容器 `[from, to)` 里 `to` 之前最后一个**深度 0** 的 `want` 字符（`{ a: 1, b: 2 }` 只看见顶层那些）。 */
+function lastTopChar(masked, from, to, want) {
+  let found = -1;
+  let depth = 0;
+  for (let i = from; i < to; i += 1) {
+    const c = masked[i];
+    if (c === '(' || c === '[' || c === '{') depth += 1;
+    else if (c === ')' || c === ']' || c === '}') depth -= 1;
+    else if (depth === 0 && want(c, i)) found = i;
+  }
+  return found;
+}
+
+/** 该 key 在 `[from, to)` 里的**字面出现**位置（词边界；注释已被 `code` 抹平 ⇒ 注释里的不算）。 */
+function keyOffsetsIn(code, from, to, key) {
+  const out = [];
+  const re = new RegExp(`(?<![\w$.])${escRe(key)}(?![\w$])`, 'g');
+  for (const m of code.slice(from, to).matchAll(re)) out.push(from + m.index);
+  return out;
+}
+
+/**
+ * `[from, to)` 里**整串正文恰好等于这个 key** 的字符串字面量。认法：`masked` 抹平了正文而 `code` 没抹
+ * ⇒ 那是串正文；两侧定界符是同款引号 ⇒ 那是个**独立**字符串字面量（`'ERIX_X'`）。
+ * `` `ERIX_X=${v}` `` 进不来（右邻是 `$`）—— 注入形不是「被声明的名字」，正好交给 `injection` 判据。
+ */
+function exactStringLiterals(code, masked, from, to, key) {
+  const out = [];
+  const body = (k) => k < to && masked[k] === ' ' && code[k] !== ' ' && code[k] !== '\n';
+  let i = from;
+  while (i < to) {
+    if (!body(i)) { i += 1; continue; }
+    let j = i;
+    while (body(j)) j += 1;
+    const q = i > 0 ? code[i - 1] : '';
+    if ((q === "'" || q === '"') && code[j] === q && code.slice(i, j) === key) {
+      out.push({ bodyStart: i, bodyEnd: j, qStart: i - 1, qEnd: j + 1 });
+    }
+    i = j + 1;
+  }
+  return out;
+}
+
+/** `env` 选项 ⇒ `body.Env` 的**执行证明**（现跑产品代码，跑一次缓存）。证不出来 ⇒ 那条判据不放行。 */
+const ENV_FLOW_OPTS = {
+  fdeName: 'fde-flow-probe', containerName: 'c', image: 'i', cmd: ['-port', '4000'],
+  networkName: 'n', ip: '1.2.3.4', gateway: '1.2.3.1', baseDomain: 'd.example',
+  llmHost: 'llm.d.example', portalPublicBaseUrl: 'https://station.d.example',
+};
+const ENV_FLOW_PROBE = 'ERIX_SI_FLOW_PROBE_KEY=1';
+const ENV_BUILDER_NAME = 'buildContainerConfig';
+/** 「那个 `(` 是 `buildContainerConfig(…)` 的实参括号」的形状（在结构掩码上看 ⇒ 串正文里的名字不算）。 */
+const BUILDER_HEAD_RE = new RegExp(`${ENV_BUILDER_NAME}\\s*$`);
+const { buildContainerConfig } = await import('../src/provisioner.js');
+let envFlowProof = null;
+function envOptionFlowsIntoEnvArray() {
+  if (envFlowProof === null) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-flow-'));
+    try {
+      const body = buildContainerConfig(
+        { ...ENV_FLOW_OPTS, userSpaceRoot: dir, env: [ENV_FLOW_PROBE] });
+      envFlowProof = { holds: Array.isArray(body?.Env) && body.Env.includes(ENV_FLOW_PROBE) };
+    } catch (e) {
+      envFlowProof = { holds: false, error: e.message };
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  return envFlowProof.holds;
+}
+
+/**
+ * 「**容器 env 的组装位**」= 三个**语法位置**（`rel` 只用来读文件，**不参与判断** —— MED① 的牙）：
+ *   `Env[]`        对象字面量里名为 `Env` 的**数组**成员值（Docker create body；`Env` 是 Docker API 字段名）
+ *   `Env.push()`   `x.Env.push( … )` 的参数区
+ *   `env-opt[]`    名为 `env` 的数组成员值，且它处在 `buildContainerConfig( … )` 的**实参**里
+ *                  ——「这个选项会流进 `body.Env`」由 `envOptionFlowsIntoEnvArray()` 现跑产品代码证明，
+ *                  不是注释说的。审计当时把 `:410` 记成「只有在证明它流入 `body.Env` 之后才算来源」。
+ * @returns {Array<{kind:string,from:number,to:number,fromLine:number,toLine:number,at:string}>}
+ */
+function envAssemblySpans(root, rel) {
+  const id = `${root}\u0000${rel}`;
+  if (ENV_SPANS.has(id)) return ENV_SPANS.get(id);
+  const f = srcFacts(root, rel);
+  const out = [];
+  const push = (kind, from, to, at) => out.push({
+    kind, from, to, at,
+    fromLine: lineAt(f.code, from), toLine: lineAt(f.code, Math.max(from, to - 1)),
+  });
+  const arrayValueOf = (propRe) => {
+    const found = [];
+    if (!f) return found;
+    for (const m of f.code.matchAll(propRe)) {
+      if (!isCodePosition(f.code, f.masked, m.index, m[0].length)) continue;   // 串正文里的「Env:」不算
+      const lb = nextNonSpace(f.masked, m.index + m[0].length);
+      if (lb == null || f.masked[lb] !== '[') continue;                        // 值不是数组 ⇒ 不是注入位
+      const end = matchBrackets(f.masked, lb);
+      if (end != null) found.push({ lb, end, at: lineAt(f.code, m.index) });
+    }
+    return found;
+  };
+  if (f) {
+    for (const x of arrayValueOf(/\bEnv\s*:\s*/g)) {
+      push('Env[] 数组字面量', x.lb, x.end, `第 ${x.at} 行的 \`Env:\``);
+    }
+    for (const m of f.code.matchAll(/\.\s*Env\s*\.\s*push\s*\(/g)) {
+      if (!isCodePosition(f.code, f.masked, m.index, m[0].length)) continue;
+      const open = m.index + m[0].length - 1;
+      const close = matchGroup(f.masked, open);
+      if (close == null) continue;
+      push('Env.push() 参数位', open + 1, close - 1, `第 ${lineAt(f.code, m.index)} 行的 \`.Env.push(\``);
+    }
+    if (envOptionFlowsIntoEnvArray()) {
+      for (const x of arrayValueOf(/\benv\s*:\s*/g)) {
+        const builderCall = enclosingPairs(f.masked, f.pairs, x.lb).some((w) => w.kind === '(' &&
+          BUILDER_HEAD_RE.test(f.masked.slice(Math.max(0, w.open - 40), w.open)));
+        if (!builderCall) continue;
+        push('env-opt[] 选项数组（已执行证明流入 body.Env）', x.lb, x.end,
+          `${ENV_BUILDER_NAME}({ env: … }) 的第 ${x.at} 行`);
+      }
+    }
+  }
+  ENV_SPANS.set(id, out);
+  return out;
+}
+const ENV_SPANS = new Map();
+
+/**
+ * 这一行上的 env 名是**被声明**还是在干别的 —— 三个语法形（都要求「整串正文就是这个 key」）：
+ *   `const-init`    `const X = 'ERIX_X'`（常量声明的右值）
+ *   `table-member`  `{ field: 'ERIX_X' }`（对象字面量成员的值位，且那个字面量**绑在名字上**）
+ *   `default-param` `function f(x, key = 'ERIX_X')`（参数默认值）
+ * 三形都不是「对 env 对象取值」⇒ 这一行**不可能**是读站点。返回 `null` = 不像声明位（不猜）。
+ */
+function keyDeclFormAt(f, lit) {
+  const { masked, pairs } = f;
+  const back = (n) => masked.slice(Math.max(0, lit.bodyStart - n), lit.bodyStart);
+  if (/(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*['"]$/.test(back(80))) return 'const-init';
+  const wrap = enclosingPairs(masked, pairs, lit.bodyStart);
+  const inner = wrap[0];
+  if (!inner) return null;
+  if (inner.kind === '{') {
+    const colon = lastTopChar(masked, inner.open + 1, lit.qStart, (c) => c === ':');
+    if (colon < 0 || masked.slice(colon + 1, lit.qStart).trim() !== '') return null;  // 冒号后还有代码
+    const DECL_HEAD = /(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*(?:Object\.\w+\(\s*)?$/;
+    const bound = wrap.find((w) => DECL_HEAD.test(masked.slice(Math.max(0, w.open - 80), w.open)));
+    return bound ? 'table-member' : null;
+  }
+  if (inner.kind === '(') {
+    const head = masked.slice(Math.max(0, inner.open - 60), inner.open);
+    const isParams = /\bfunction\s+[A-Za-z_$][\w$]*\s*$/.test(head) || /=>\s*$/.test(head);
+    // 默认值分界那个 `=`：比较号 / `=>` 不算（同 `firstDefaultEq` 的口径，只是这里要「最后一个」）
+    const eq = lastTopChar(masked, inner.open + 1, lit.qStart, (c, i) => c === '='
+      && !'=><'.includes(masked[i + 1] ?? '') && !'=!<>'.includes(masked[i - 1] ?? ''));
+    if (isParams && eq >= 0 && masked.slice(eq + 1, lit.qStart).trim() === '') {
+      return 'default-param';
+    }
+  }
+  return null;
+}
+
+/** 一个文件里的**具名函数**清单：`{ name, params, declLine, bodyFrom, bodyTo }`（解构参数位记 `null`）。 */
+function functionInventory(root, rel) {
+  const id = `${root}\u0000${rel}`;
+  if (FN_INV.has(id)) return FN_INV.get(id);
+  const f = srcFacts(root, rel);
+  const out = [];
+  if (f) {
+    for (const m of f.code.matchAll(new RegExp(`\\bfunction\\s+(${IDENT_RE})\\s*\\(`, 'g'))) {
+      if (!isCodePosition(f.code, f.masked, m.index, m[0].length)) continue;
+      const open = m.index + m[0].length - 1;
+      const close = matchGroup(f.masked, open);
+      if (close == null) continue;
+      const params = splitTop(f.masked, open + 1, close - 1).map(([a, b]) => {
+        const eq = firstDefaultEq(f.masked, a, b);
+        const m2 = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(f.masked.slice(a, eq < 0 ? b : eq));
+        return m2 ? m2[1] : null;
+      });
+      const braceAt = nextNonSpace(f.masked, close);
+      const bodyFrom = braceAt ?? close;
+      const bodyTo = braceAt != null && f.masked[braceAt] === '{'
+        ? (matchBrackets(f.masked, braceAt) ?? f.code.length) : f.code.length;
+      out.push({ name: m[1], params, declLine: lineAt(f.code, m.index), bodyFrom, bodyTo });
+    }
+  }
+  FN_INV.set(id, out);
+  return out;
+}
+const FN_INV = new Map();
+
+/** 调用点在 **runner 包外** ⇒ 它是「另一个来源」。口径是**枚举根归属**，不是文件名猜语义。 */
+function isHostSideSite(rel) {
+  const posix = String(rel ?? '').split(path.sep).join('/');
+  return posix !== 'runner' && !posix.startsWith('runner/');
+}
+
+/** helper 形：`对象[下标]` 且**两边都是裸标识符**（`process.env[name]` 不匹配：那不是间接读） */
+const HELPER_READ_SHAPE = /^\s*([A-Za-z_$][\w$]*)\s*(?:\?\.)?\s*\[\s*([A-Za-z_$][\w$]*)\s*\]\s*$/;
+
+/**
+ * 从扫描器已有的 `unsupported` **推出**「portal helper 间接读」站点（MED②）。四个事实，缺一不可：
+ *   F1 有一条**动态下标读**且名字解析不出（`unsupported` 条目），且读形是 `对象[下标]`——**两边都是裸
+ *      标识符**：`process.env[name]` 不算（那是直接读宿主 env，不是「env 由调用方传进来」）；
+ *   F2 那条读所在的函数把 **env 对象**与 **key 名**都当**参数**收 ⇒ 它是 helper，值由调用方给；
+ *   F3 调用点把该 env 名当**字符串字面量实参**传进那个参数位（⇒ key 在调用点静态可知），且 env 实参是
+ *      扫描器认得的 env 对象（`process.env` 或 `env = process.env` 那类别名）；
+ *   F4 调用点在 runner 包外（`isHostSideSite`）⇒ 它记成 `host-source`，不冒充 runner 读站点。
+ * 名字解析是**文本级**的：同文件同名函数才算它自己（跨文件撞名不许串账）；helper 的声明行不算调用点。
+ * ⚠ 只认 `function NAME(…)` 声明形（箭头 helper 不在现网形状里）—— 认不出就归不出来 ⇒ 红，不静默。
+ */
+function deriveHostSourceSites(root, unsupported) {
+  if (HOST_SITES.has(root)) return HOST_SITES.get(root);
+  const facts = new Map();
+  const ofRel = (rel) => {
+    if (!facts.has(rel)) facts.set(rel, { f: srcFacts(root, rel), ctx: null });
+    return facts.get(rel);
+  };
+  const ctxOf = (rel) => {
+    const box = ofRel(rel);
+    if (box.f && box.ctx === null) box.ctx = analyzeEnvReads(box.f.code, box.f.text);
+    return box.ctx;
+  };
+  const out = [];
+  const seen = new Set();
+  const helpers = [];
+  for (const u of unsupported ?? []) {
+    const dyn = HELPER_READ_SHAPE.exec(u.shape ?? '');
+    if (!dyn) continue;                        // F1：不是「裸对象[裸名字]」⇒ 不是 helper 间接读
+    const { rel, line } = splitCoord(u.at);
+    const box = ofRel(rel);
+    if (!box.f || line == null) continue;
+    const span = lineRange(box.f.code, line);
+    if (!span) continue;
+    const fn = functionInventory(root, rel)
+      .filter((x) => span[0] >= x.bodyFrom && span[0] < x.bodyTo)
+      .sort((a, b) => a.bodyFrom - b.bodyFrom).pop();      // 最内层那个函数
+    if (!fn) continue;
+    const keyIdx = fn.params.indexOf(dyn[2]);
+    const envIdx = fn.params.indexOf(dyn[1]);
+    if (keyIdx < 0 || envIdx < 0) continue;                // F2：key/env 不都是参数 ⇒ 值不是调用方给的
+    const id = `${fn.name}\u0000${rel}\u0000${fn.declLine}`;
+    if (seen.has(id)) continue;                            // 同一个 helper 里多条动态读 ⇒ 只推一次
+    seen.add(id);
+    helpers.push({ name: fn.name, rel, declLine: fn.declLine, readLine: line, keyIdx, envIdx,
+      shape: `${dyn[1]}[${dyn[2]}]` });
+  }
+  for (const h of helpers) {
+    for (const file of scanTargets(root)) {
+      const rel = path.relative(root, file).split(path.sep).join('/');
+      const box = ofRel(rel);
+      if (!box.f) continue;
+      const own = functionInventory(root, rel).some((x) => x.name === h.name);
+      if (own && rel !== h.rel) continue;                  // 跨文件撞名 ⇒ 那是另一个同名函数
+      const ctx = ctxOf(rel);
+      for (const m of box.f.code.matchAll(new RegExp(`(?<![\\w$.])${escRe(h.name)}\\s*\\(`, 'g'))) {
+        if (!isCodePosition(box.f.code, box.f.masked, m.index, m[0].length)) continue;
+        const open = m.index + m[0].length - 1;
+        const close = matchGroup(box.f.masked, open);
+        if (close == null || (own && lineAt(box.f.code, m.index) === h.declLine)) continue;
+        const args = splitTop(box.f.masked, open + 1, close - 1);
+        if (args.length <= h.keyIdx) continue;
+        const rawKey = box.f.code.slice(args[h.keyIdx][0], args[h.keyIdx][1]).trim();
+        const lit = /^['"]([^'"]+)['"]$/.exec(rawKey);
+        if (!lit || !NAMESPACED_ENV_NAME.test(lit[1])) continue;   // F3：key 不是 env 名形状的串 ⇒ 不推
+        const envSpan = args[h.envIdx] ?? [0, 0];
+        const envArg = box.f.code.slice(envSpan[0], envSpan[1]).trim();
+        if (!/^process\s*\??\.\s*env$/.test(envArg) && !ctx?.envObjs.has(envArg)) continue;
+        out.push({ key: lit[1], rel, line: lineAt(box.f.code, m.index), helperName: h.name,
+          helperRel: h.rel, helperDeclLine: h.declLine, helperReadLine: h.readLine,
+          helperShape: h.shape, keyArg: rawKey, envArg, keyParam: h.keyIdx + 1,
+          hostSide: isHostSideSite(rel) });
+      }
+    }
+  }
+  HOST_SITES.set(root, out);
+  return out;
+}
+const HOST_SITES = new Map();
+
+/** 索引里那个 key 的 host-source 站点（先确保推过；`deriveHostSourceSites` 按 root 缓存 ⇒ 只跑一次）。 */
+function hostSourceSitesOf(index, key) {
+  if (typeof index?.deriveHostSourceSites !== 'function') return [];
+  index.deriveHostSourceSites();
+  return index.hostSourceSitesOf(key);
+}
+
+/**
+ * **语义**判据：只问可复核事实。返回 `{ kind, why, via }`；三条都不成立 ⇒ `kind: null` +
+ * `why` 写清「每条判据为什么不成立」（调用方必须红，**不许默认塞进某一类**）。
+ * 顺序 = 由特指到宽泛：同一行可能同时像两样（`config.js:406` 既是对象成员、又是 helper 调用点），
+ * 越具体的越先判 ⇒ `host-source` 必须排在 `mention-only` 前面（变异 M-2 就换这条顺序）。
+ */
+function shadowGapSemantic(key, coord, { root = REPO_ROOT, index = REPO_SITE_INDEX } = {}) {
+  const { rel, line } = splitCoord(coord);
+  if (line == null) return { kind: null, via: 'none', why: '坐标没有行号 ⇒ 没有语法位置可查' };
+  const f = srcFacts(root, rel);
+  if (!f) return { kind: null, via: 'none', why: `${rel} 读不到 ⇒ 没有源码事实可查` };
+  const span = lineRange(f.code, line);
+  if (!span) return { kind: null, via: 'none', why: `${rel} 没有第 ${line} 行` };
+  const offs = keyOffsetsIn(f.code, span[0], span[1], key);
+  if (offs.length === 0) {
+    return { kind: null, via: 'none', why: `第 ${line} 行**没有** ${key} 这个字面量（注释已抹平）` };
+  }
+  const misses = [];
+  // ① injection：该 key 的字面出现**落在容器 env 组装位里**（语法位置，与文件名无关）
+  const spans = envAssemblySpans(root, rel);
+  for (const off of offs) {
+    for (const s of spans) {
+      if (off < s.from || off >= s.to) continue;
+      return { kind: 'injection', via: 'semantic',
+        why: `第 ${line} 行的 ${key} 处在 ${rel} 的**${s.kind}**语法位置里（${s.at}，`
+          + `区间第 ${s.fromLine}-${s.toLine} 行）⇒ 它是「组装进容器 env」的位置，不是 env 读站点` };
+    }
+  }
+  misses.push(`injection：那一行不在任何 Env 组装位（该文件里那些位是 ${
+    spans.map((s) => `${s.kind}@${s.fromLine}-${s.toLine}`).join('、') || '空'}）`);
+  // ② host-source：坐标是**由代码推出**的 helper 间接读站点
+  const atCoord = (s) => s.rel === rel && s.line === line;
+  const hs = hostSourceSitesOf(index, key).find((s) => atCoord(s) && s.hostSide);
+  if (hs) {
+    const at = `${hs.helperRel}:${hs.helperDeclLine}`;
+    const readAt = `${hs.helperRel}:${hs.helperReadLine}`;
+    return { kind: 'host-source', via: 'semantic',
+      why: `调用点 ${rel}:${line} 把 ${hs.keyArg} 当**字符串实参**传给 helper ${at}`
+        + `（第 ${hs.keyParam} 个参数位），helper 在 ${readAt} 用 ${hs.helperShape}`
+        + ` 动态下标取值 ⇒ 这条读站点扫描器看不见（它就在 unsupported 清单里）；`
+        + `env 实参是 ${hs.envArg}（扫描器认得的 env 对象），而调用点在 **runner 包外**`
+        + ' ⇒ 这是 portal/宿主侧的**间接读**，与 runner 的直接读站点是两个来源'
+        + '（不是「仅仅提到 key」，也不是注入位）' };
+  }
+  misses.push('host-source：推导出的 helper 间接读站点里没有这个坐标');
+  // ③ mention-only：本行是**被声明的字符串值** + 该 key 在索引里**另有真读站点**（两个事实都要）
+  const decls = exactStringLiterals(f.code, f.masked, span[0], span[1], key)
+    .map((lit) => ({ lit, form: keyDeclFormAt(f, lit) })).filter((x) => x.form !== null);
+  const elsewhere = index.sitesOf(key).filter((s) => !(s.rel === rel && s.line === line));
+  if (decls.length > 0 && elsewhere.length > 0) {
+    return { kind: 'mention-only', via: 'semantic',
+      why: `第 ${line} 行的 ${key} 是**${decls[0].form}**（整串正文就是这个 key 的字符串字面量被绑成数据/`
+        + `默认值 ⇒ 本行不对 env 取值），且该 key 的真读站点在别处：${describeSites(index, key, 4)}` };
+  }
+  misses.push(decls.length === 0
+    ? `mention-only：第 ${line} 行那个 ${key} 不是「被声明的字符串值」（const-init / table-member / `
+      + 'default-param 三形都不像）'
+    : 'mention-only：索引里这个 key 在别处**没有**真读站点 ⇒ 「只有声明、没人读」不许算文案');
+  return { kind: null, via: 'none', why: misses.join('；') };
+}
+
+/**
+ * **兜底**（故意保留的旧形状尺：路径 + 行内含 key）。只允许在语义判据决定不了时被调用，
+ * 而且必须计数 —— `#587-S1-⑧` 断言真树 `fallbackCount === 0`：「靠形状猜」一旦出现就必须显式红，
+ * 不许悄悄把新差异吸进老类别（那正是 MED① 的失效形状）。
+ */
+function shadowGapByShape(key, coord, root = REPO_ROOT) {
   const { rel, line } = splitCoord(coord);
   if (rel === 'portal/src/provisioner.js') return 'injection';
   if (rel === 'portal/src/config.js') return 'host-source';
   if (line == null) return null;
-  let text = null;
-  try {
-    const raw = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
-    text = stripComments(raw).split('\n')[line - 1] ?? '';
-  } catch { return null; }
-  return text.includes(key) ? 'mention-only' : null;
+  const f = srcFacts(root, rel);
+  if (!f || line == null) return null;
+  const span = lineRange(f.code, line);
+  if (!span) return null;
+  return f.code.slice(span[0], span[1]).includes(key) ? 'mention-only' : null;
+}
+
+/**
+ * 影子差异的类别（= 第 4 步切换前必须先修的三件事）+ 走了哪条路。写成了**判据**而不是坐标清单：
+ * 清单会把「现在长这样」抄成第二本账（产品行号一漂就红一次，而红得没有信息）。
+ * @param {{stats?:{fallbackCount:number,fallbackHits:string[]}}} [opts] 兜底计数（调用方断言它为 0）
+ */
+function shadowGapClass(key, coord, opts = {}) {
+  const r = shadowGapSemantic(key, coord, opts);
+  if (r.kind !== null) return r;
+  const stats = opts.stats ?? { fallbackCount: 0, fallbackHits: [] };
+  const kind = shadowGapByShape(key, coord, opts.root ?? REPO_ROOT);
+  stats.fallbackCount += 1;
+  stats.fallbackHits.push(`${key}@${coord} ⇒ ${String(kind)}（语义判据：${r.why}）`);
+  return { kind, via: 'fallback', why: `形状兜底（路径/行内含 key）；语义判据：${r.why}` };
 }
 
 test('#587-S1-⑧ 影子对照真树：影子尺只会更严，多杀的必须逐条归进已知三类（第 4 步能不能切就看它）', () => {
@@ -2931,20 +3387,23 @@ test('#587-S1-⑧ 影子对照真树：影子尺只会更严，多杀的必须�
   const shadowIds = coordIds(shadow);
   const onlyShadow = shadowIds.filter((x) => !gateIds.includes(x));
   const onlyGate = gateIds.filter((x) => !shadowIds.includes(x));
-  // 差异按类归堆（`key@coord#第几个引用`）
+  // 差异按类归堆（`key@coord#第几个引用`）；归类走**语义判据**，兜底必须计数
   const buckets = new Map();
   const unexplained = [];
+  const stats = { fallbackCount: 0, fallbackHits: [] };
   for (const id of onlyShadow) {
     const [key, rest] = id.split('@');
     const coord = rest.replace(/#\d+$/, '');
-    const kind = shadowGapClass(key, coord);
-    if (kind === null) { unexplained.push(id); continue; }
+    const { kind, why, via } = shadowGapClass(key, coord, { stats });
+    if (kind === null) { unexplained.push(`${id} —— ${why}`); continue; }
     if (!buckets.has(kind)) buckets.set(kind, []);
     buckets.get(kind).push(id);
+    console.log(`# SHADOW-CLASS ${id} ⇒ ${kind}（${via}）：${why.replace(/\s+/g, ' ').slice(0, 300)}`);
   }
   const counts = Object.fromEntries([...buckets].map(([k, v]) => [k, v.length]).sort());
   console.log(`# SHADOW 真树对照：登记 ${entries.length} 条 / 旧尺 ${gate.length} / 影子 ${shadow.length} 条`);
-  console.log(`# SHADOW 分类计数 ${JSON.stringify(counts)}（未归类 ${unexplained.length} 条）`);
+  console.log(`# SHADOW 分类计数 ${JSON.stringify(counts)}（未归类 ${unexplained.length} 条`
+    + ` / 兜底 ${stats.fallbackCount} 条）`);
   console.log(`# SHADOW 旧尺红而影子绿（切换会放宽的）：${JSON.stringify(onlyGate)}`);
   for (const p of shadow) console.log(`# SHADOW-DIFF ${p.replace(/\s+/g, ' ').slice(0, 240)}`);
   // 方向：结构成员判定只会**更严**。旧尺报的问题影子尺没报 ⇒ 索引有洞（漏读形或语法尺没共用）。
@@ -2952,9 +3411,19 @@ test('#587-S1-⑧ 影子对照真树：影子尺只会更严，多杀的必须�
     '旧尺判红而影子尺判绿 ⇒ 索引比文本尺还松（要么漏了读形，要么坐标语法没走同一把尺）');
   assert.deepEqual(unexplained, [],
     '影子多杀的坐标归不进已知三类 ⇒ 要么是新造的假坐标（好事，登记该改），要么索引漏了真读形（坏事）：'
-    + '逐条看上面的 SHADOW-DIFF 定性后再动，不许为了让这格变绿去改 deploy/env-legs-exceptions.json');
+    + '逐条看上面的 SHADOW-CLASS / SHADOW-DIFF 定性后再动，不许为了让这格变绿去改登记');
+  // 兜底必须是 **0**（MED①）：真树这 14 条全部由语义判据决定 ⇒ 「靠路径/文本形状猜」不许发生。
+  // 非 0 的含义：出现了新形状（语义判据认不出）⇒ 要么补判据（带夹具），要么登记该改；
+  // **不许**放着兜底当答案（那正好把 MED① 的病重新养回来）。
+  assert.equal(stats.fallbackCount, 0,
+    `差异分类里有 ${stats.fallbackCount} 条走了**形状兜底**（语义判据决定不了）⇒ 必须显式处理：`
+    + `\n${stats.fallbackHits.join('\n')}`);
   // 三类的**现值**（第 2/3 步落地后这里必须跟着变，变的时候就是「可以切了」的信号）
-  const want = { 'host-source': 1, injection: 5, 'mention-only': TIMEOUT_KEYS.length * 2 };
+  // ⚙ 语义判据落地后从 `{1,5,8}` 改成 `{1,4,9}`：`portal/src/provisioner.js:362` 的
+  //   `readContainerEnv(inspectData, key = 'ERIX_STATION_TOKEN')` 按**语法位置**不在任何 Env 组装位里
+  //   —— 它是「把 env 名声明成默认参数」的读侧 helper（审计 §3 自己写了「不是注入也不是 process.env 读」，
+  //   例外清单那条 reason 也写了「不是注入点」）。旧形状闸把它算成 injection ⇒ 第 3 步会去补错方向。
+  const want = { 'host-source': 1, injection: 4, 'mention-only': TIMEOUT_KEYS.length * 2 + 1 };
   assert.deepEqual(counts, want,
     `影子差异的分布变了（现在 ${JSON.stringify(counts)}）⇒ 有人动了例外清单/产品代码，或索引判定漂了`
     + '：按 SHADOW-DIFF 逐条定性，然后把这里的期望值改成新现实（并更新工单报告），不许反着改登记');
@@ -2963,6 +3432,157 @@ test('#587-S1-⑧ 影子对照真树：影子尺只会更严，多杀的必须�
     '影子尺与旧尺读数已经一致 ⇒ 三类差异都清了，可以走第 4 步切换（把这格换成「两边必须完全相等」）');
   // 盘上那份的**旧尺**读数必须还是全绿 —— 影子没被接进闸门
   assert.deepEqual(gate, [], '闸门行为变了：盘上那份被判红了（本步红线：闸门一个字不许变）');
+});
+
+/**
+ * MED① 的夹具：**路径故意也叫 `portal/src/provisioner.js`** —— 旧形状闸会把它里而每一行都算
+ * injection（那正是 MED① 的病）。行号是约定（`SI_MED_L`）：改文本要跟着改行号表。
+ */
+const SI_MED_FILES = {
+  'portal/src/provisioner.js': [
+    'export function buildContainerConfig({ env = [], fdeName, log }) {',   // 1  入参默认值不是 `env:` 属性位
+    '  const body = {',                                                     // 2
+    '    Env: [',                                                           // 3
+    '      ...(env ?? []),',                                                // 4
+    '      `ERIX_SI_MED_INJECT=${fdeName}`,',                               // 5  ← 真注入位（Env 数组元素）
+    '    ],',                                                               // 6
+    '  };',                                                                 // 7
+    '  if (fdeName) body.Env.push(`ERIX_SI_MED_PUSH=${fdeName}`);',  // 8  ← 真注入位（.Env.push 参数）
+    '  log(`ERIX_SI_MED_LOGTPL=${fdeName}`);',                       // 9  ← 形状像注入但不是注入位
+    '  const TABLE = Object.freeze({ a: \'ERIX_SI_MED_TABLE\' });',     // 10 ← 声明位（另有真读站点）
+    '  const ORPHAN = Object.freeze({ a: \'ERIX_SI_MED_ORPHAN\' });',   // 11 ← 只有声明，没人读
+    '  return body;',                                                // 12
+    '}',                                                             // 13
+  ].join('\n'),
+  'lib/reader.js': 'export const v = process.env.ERIX_SI_MED_TABLE;\n',  // 1  ← 真读站点（在别的文件）
+};
+const SI_MED_L = {
+  envElem: 5, pushArg: 8, logTpl: 9, tableDecl: 10, orphanDecl: 11,
+};
+const SI_MED_PROV = 'portal/src/provisioner.js';
+
+test('#587-S1-⑨ 差异分类只认**语法位置与索引事实**：路径像 provisioner 又不是注入位（MED①）', () => {
+  const dir = fixtureRoot(SI_MED_FILES);
+  try {
+    const index = buildEnvSiteIndex(dir);
+    const cls = (key, coord) => shadowGapSemantic(key, coord, { root: dir, index });
+    const at = (n) => `${SI_MED_PROV}:${n}`;
+    // ① 两个**语法位置**：`Env: […]` 数组元素 / `body.Env.push(…)` 参数位 ⇒ injection
+    const inj = cls('ERIX_SI_MED_INJECT', at(SI_MED_L.envElem));
+    assert.equal(inj.kind, 'injection', `Env 数组元素位应判 injection（实际 ${inj.kind}：${inj.why}）`);
+    assert.match(inj.why, /Env\[\] 数组字面量/, '理由要点名是哪个语法位（第 3 步才知道要登记什么）');
+    const push = cls('ERIX_SI_MED_PUSH', at(SI_MED_L.pushArg));
+    assert.equal(push.kind, 'injection', `.Env.push 参数位应判 injection（实际 ${push.kind}：${push.why}）`);
+    assert.match(push.why, /Env\.push\(\) 参数位/);
+    // ② **同一个文件**里的日志模板行（`KEY=${v}` 住在 log() 里）：路径一模一样、文本形状也一模一样，
+    //    但语法位置不是注入位 ⇒ 必须不是 injection；也不是声明位 ⇒ 必须归不出来（红）。
+    //    这一行就是变异 M-1（「把语义判据换回只看路径」）的靶子。
+    const tpl = cls('ERIX_SI_MED_LOGTPL', at(SI_MED_L.logTpl));
+    assert.notEqual(tpl.kind, 'injection',
+      `语义判据吃了路径 ⇒ 「文件叫 provisioner.js 就一律 injection」（MED① 的病，实际：${tpl.why}）`);
+    assert.equal(tpl.kind, null,
+      `三条判据都不成立就必须归不出来（实际 ${tpl.kind}：${tpl.why}）—— 不许默认塞一类`);
+    assert.match(tpl.why, /injection：/, '归不出来时要说清每条判据为什么不过');
+    assert.match(tpl.why, /mention-only：/);
+    // 反向自证：**形状兜底**对同一行会说 injection ⇒ 上面那格杀的不是运气，是语义判据在换答案
+    assert.equal(shadowGapByShape('ERIX_SI_MED_LOGTPL', at(SI_MED_L.logTpl), dir), 'injection',
+      '兜底尺对这一行应该仍然判错（否则本格的对照前提破了）');
+    // ③ 声明位 + 索引里另有真读站点 ⇒ mention-only（两个事实缺一不可）
+    const tbl = cls('ERIX_SI_MED_TABLE', at(SI_MED_L.tableDecl));
+    assert.equal(tbl.kind, 'mention-only', `数据表声明位应判 mention-only（实际 ${tbl.kind}：${tbl.why}）`);
+    assert.match(tbl.why, /table-member/);
+    assert.match(tbl.why, /lib\/reader\.js:1\(dot\)/, '理由要点名「真读站点在别的文件」');
+    // ④ 只有声明位、索引里**没有**任何真读站点 ⇒ 不许算 mention-only（「没人读的死名字」是第 4 步要抓的）
+    const orphan = cls('ERIX_SI_MED_ORPHAN', at(SI_MED_L.orphanDecl));
+    assert.equal(orphan.kind, null, `只有声明、没人读 ⇒ 不许归 mention-only（实际 ${orphan.kind}）`);
+    assert.match(orphan.why, /没有.*真读站点|没有真读站点/, '要说清第二根事实不过：索引里没读到过这个 key');
+    // ⑤ 兜底**必须计数**（否则它会悄悄把新差异吸进老类别）：同一行走 `shadowGapClass` 就要报 1 次
+    const stats = { fallbackCount: 0, fallbackHits: [] };
+    const viaFallback = shadowGapClass('ERIX_SI_MED_LOGTPL', at(SI_MED_L.logTpl),
+      { root: dir, index, stats });
+    assert.equal(viaFallback.via, 'fallback', '语义判据不行才轮得到兜底');
+    assert.equal(viaFallback.kind, 'injection', '兜底就是那把旧形状尺 ⇒ 对这一行它判 injection');
+    assert.equal(stats.fallbackCount, 1, '走了兜底却没记账 ⇒ 「兜底为 0」那条断言是空的（MED①）');
+    assert.match(stats.fallbackHits.join('\n'), /ERIX_SI_MED_LOGTPL@/);
+    // ⑥ 同一批语义判据在真树上对 `provisioner.js:362` 换答案：旧尺说 injection，语义说声明位
+    const rbCoord = `${SI_MED_PROV}:${lineOf(SI_MED_PROV, "key = 'ERIX_STATION_TOKEN'")}`;
+    const readBack = shadowGapSemantic('ERIX_STATION_TOKEN', rbCoord);
+    assert.equal(readBack.kind, 'mention-only',
+      `${rbCoord} 是读侧 helper 的默认参数声明位，不许算注入位（实际 ${readBack.kind}：${readBack.why}）`);
+    assert.match(readBack.why, /default-param/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+/**
+ * MED② 的夹具：helper 与调用点同文件（真树 `portal/src/config.js` 就是这个形状）。
+ * 故意再加一份**同名 helper 在 runner 包里**的副本：同一条推导事实（F1–F3）都成立，但调用点
+ * 在枚举根**内** ⇒ 不许叫 `host-source`（那一类只装「另一个来源」）。
+ */
+const SI_HOST_FILES = {
+  'portal/src/hostconfig.js': [
+    'function intEnv(env, key, fallback) {',                          // 1  helper：env 与 key 都是参数
+    '  const v = Number(env[key] ?? fallback);',                      // 2  动态下标 ⇒ 扫描器进 unsupported
+    '  return Number.isFinite(v) && v > 0 ? v : fallback;',            // 3
+    '}',                                                              // 4
+    'export function loadCfg(env = process.env) {',                   // 5  env 别名（扫描器认这文件有 env）
+    "  return { workerUid: intEnv(env, 'ERIX_SI_MED_UID', 1002) };",  // 6  调用点：key 是字符串实参
+    '}',                                                              // 7
+  ].join('\n'),
+  'runner/lib/inner.js': [
+    'function intEnv(env, key, fallback) {',                          // 1  同名 helper，但在 runner 包里
+    '  const v = Number(env[key] ?? fallback);',                      // 2
+    '  return v ?? 0;',                                               // 3
+    '}',                                                              // 4
+    'export function loadCfg(env = process.env) {',                   // 5
+    "  return { uid: intEnv(env, 'ERIX_SI_MED_RUNNER', 1) };",       // 6  调用点在枚举根内
+    '}',                                                              // 7
+  ].join('\n'),
+};
+
+test('#587-S1-⑩ portal helper 间接读由**代码推出**并归 host-source：不是 mention-only（MED②）', () => {
+  const dir = fixtureRoot(SI_HOST_FILES);
+  try {
+    const index = buildEnvSiteIndex(dir);
+    // 推导的**输入**必须是扫描器自己的 unsupported 清单（不是手抄坐标）
+    const unsupportedAt = 'portal/src/hostconfig.js:2';
+    assert.ok(index.unsupported.some((u) => u.at === unsupportedAt && /env\[key\]/.test(u.shape)),
+      `夹具前提破了：扫描器没把动态下标报进 unsupported（实际 ${JSON.stringify(index.unsupported)}）`);
+    const derived = index.deriveHostSourceSites();
+    const uid = derived.find((s) => s.key === 'ERIX_SI_MED_UID');
+    const derivedIds = derived.map((s) => `${s.key}@${s.rel}:${s.line}`).join('、');
+    assert.ok(uid, `没推出 ERIX_SI_MED_UID（推出的是：${derivedIds}）`);
+    assert.deepEqual([uid.rel, uid.line], ['portal/src/hostconfig.js', 6], '调用点坐标推错了');
+    assert.deepEqual([uid.helperRel, uid.helperDeclLine, uid.helperReadLine],
+      ['portal/src/hostconfig.js', 1, 2], 'helper 坐标推错了（理由要能指着它）');
+    assert.equal(index.hasSite('ERIX_SI_MED_UID', uid.rel, uid.line), false,
+      'host-source 站点不许冒充读站点（那会把影子口径静默放宽）');
+    assert.equal(index.hasHostSourceSite('ERIX_SI_MED_UID', uid.rel, uid.line), true, '第三张表没落进去');
+    const r = shadowGapSemantic('ERIX_SI_MED_UID', `${uid.rel}:${uid.line}`, { root: dir, index });
+    assert.equal(r.kind, 'host-source', `应判 host-source（实际 ${r.kind}：${r.why}）`);
+    assert.match(r.why, /hostconfig\.js:6/, '理由必须点名调用点坐标');
+    assert.match(r.why, /hostconfig\.js:1/, '理由必须点名 helper 声明坐标');
+    assert.match(r.why, /hostconfig\.js:2/);                   // 动态下标那一行也在理由里
+    // 反向：同名 helper 但调用点在 **runner 包里** ⇒ 同一条推导事实成立，却不是「另一个来源」
+    const inRunner = derived.find((s) => s.key === 'ERIX_SI_MED_RUNNER');
+    assert.ok(inRunner && inRunner.hostSide === false,
+      `runner 包内的那条应推出但标 hostSide=false（实际 ${JSON.stringify(inRunner)}）`);
+    const nrCoord = `${inRunner.rel}:${inRunner.line}`;
+    const nr = shadowGapSemantic('ERIX_SI_MED_RUNNER', nrCoord, { root: dir, index });
+    assert.notEqual(nr.kind, 'host-source',
+      `runner 自己包里的 helper 读形不该被叫成「另一个来源」（实际 ${nr.kind}）`);
+    assert.equal(nr.kind, null, '既不是注入位也不是声明位 ⇒ 必须红，不许靠同名规则撑一个类别');
+    // 推导是幂等的（同一个 root 只扫一次，两次调用给同一批事实）
+    assert.equal(index.deriveHostSourceSites(), derived, 'derive 不幂等 ⇒ 第二张表会被重复登记');
+    // 真树：`FDE_WORKER_UID` 那条差异必须归 host-source，理由点名调用点与 helper 两头坐标
+    REPO_SITE_INDEX.deriveHostSourceSites();
+    const real = shadowGapSemantic('FDE_WORKER_UID', 'portal/src/config.js:406');
+    assert.equal(real.kind, 'host-source',
+      `config.js:406 是合法的 portal 间接读，不是「仅仅提到 key」（实际 ${real.kind}：${real.why}）`);
+    assert.match(real.why, /config\.js:406/, '理由要点名调用点（review 要的那一句）');
+    assert.match(real.why, /config\.js:12\b/, '理由要点名 helper `intEnv` 的声明行 :12');
+    assert.match(real.why, /config\.js:13\b/, '还要点名真正取值的 `env[key]` 那一行');
+    assert.equal(real.why.includes('mention-only'), false, '理由里不许同时出现另一个类别名');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
