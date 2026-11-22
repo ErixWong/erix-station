@@ -459,11 +459,13 @@ export async function applyRuntimeOverrides(config, opts = {}) {
       value = values[key];
       tierByKey.set(key, 'db');
     } else {
-      // env 那一档 = `config[path]`（`loadConfig` 已算成 `env > 字面默认`）；它也没有 ⇒
-      // registry 的 `defaultValue`（第三档）。回落的理由已在 `readRuntimeSettings` 里点过名。
-      const envTier = getPath(config, path);
-      value = envTier === undefined ? entry?.defaultValue : envTier;
-      tierByKey.set(key, envTier === undefined ? 'default' : 'env');
+      // env 那一档 = `resolveEnvTier`（值来自 `env[envVar]` 原话或 `config[path]`，**且过了 registry
+      // 的闸**）；它也没有 ⇒ registry 的 `defaultValue`（第三档）。回落的理由已在
+      // `readRuntimeSettings` 里点过名。⚠ 必须走同一个 `resolveEnvTier`（#701 返修 LOW③）：
+      // 启动这一路宽松、热读那一路严格，就是「同一个旋钮两套真相」（界面显示的值与实际用的漂）。
+      const envTier = resolveEnvTier(entry, config, { env: opts.env ?? process.env, log: logger });
+      value = envTier.value;
+      tierByKey.set(key, envTier.source === 'default' ? 'default' : 'env');
     }
     if (value === undefined) continue; // 三档都给不出值 ⇒ 这一格不动，别发明 undefined
     setPath(next, path, value);
@@ -618,16 +620,46 @@ const sessionTtlCache = { pool: null, at: 0, resolved: null };
 let sessionTtlCacheGeneration = 0;
 
 /**
+ * **in-flight 合并槽**（#701 返修 MED）：`{ pool, promise }`，形状照 `llm.js` 的 TTL 缓存那套
+ * 「按 client 身份分槽」的思路 —— 槽键到 **pool 身份**，A 池的在飞读不许喂给 B 池。
+ *
+ * 为什么必须有（review 实测的形状）：这条读挂在**续期热路径**（`http.js:1071`）上，而缓存
+ * 刚失效/刚过期那一刻是**并发**的：4 路同时打到冷缓存 ⇒ 4 条 SQL，DB 慢时每路各自可能等满
+ * 读超时（默认 1500ms，`:61`）⇒ 一次 DB 抖动把一整波登录/续期各挂 1.5 秒。合并后同一波只发
+ * **一条** SQL，其余各路复用同一趟的结果（等同一份时间，但不再各发一条、也不再各占一条连接）。
+ *
+ * ⚠ 两条容易漏的口径（判据 RS-18 / RS-19 / RS-20 各钉一条）：
+ *   1. **落定必清槽，失败也要清**：不清槽 ⇒ 之后所有读都钉在同一个**已落定**的 promise 上
+ *      （失败那趟尤其糟：它没有缓存可兜，每次都被拉回去重放同一个失败）。
+ *   2. **写路径失效也要清槽**：只清缓存的话，「PUT 完的下一次读」可能命中 PUT **之前**就发起的
+ *      那一趟 ⇒ 拿到旧值，且那次读**不发 SQL**（写进去了却看不见，是比慢更难查的形状）。
+ */
+const sessionTtlInFlight = { pool: null, promise: null };
+
+/** 只有槽里还是**自己那一趟**时才清（在飞期间被失效过、或已被新趟接替 ⇒ 不许撤销别人的槽）。 */
+function releaseSessionTtlInFlight(task) {
+  if (sessionTtlInFlight.promise === task) {
+    sessionTtlInFlight.pool = null;
+    sessionTtlInFlight.promise = null;
+  }
+}
+
+/**
  * 丢弃 TTL 缓存。**只在写路径调用**（`saveRuntimeSetting` 的 `COMMIT` 之后）。
  *
  * ⚠ 失效只覆盖**本进程**：多副本时别的进程最坏还要吃 5 秒旧值（ TTL 到点自己恢复）。
  *   所以口径是「下一次读、最多 5 秒内生效」，**不是**强一致，也不是「每个请求都现读 DB」。
+ *
+ * ⚠ 它同时清 **in-flight 槽**（#701 返修 MED 第二条）：在飞的那一趟是在写**之前**发起的，
+ *   它的结果已经是旧世界；不清槽就是「保存成功而界面还显示旧值」那条路。
  */
 export function invalidateSessionTtlCache() {
   sessionTtlCacheGeneration += 1;
   sessionTtlCache.pool = null;
   sessionTtlCache.at = 0;
   sessionTtlCache.resolved = null;
+  sessionTtlInFlight.pool = null;
+  sessionTtlInFlight.promise = null;
 }
 
 /**
@@ -636,19 +668,60 @@ export function invalidateSessionTtlCache() {
  */
 export const HOT_READ_INVALIDATORS = new Map([[SESSION_TTL_KEY, invalidateSessionTtlCache]]);
 
-/** env 那一档的值：`config[configPath]`（`loadConfig` 已算成 `env > 字面默认`）⇒ 没有则 registry 默认。 */
-function envTierValue(entry, config) {
-  const tier = getPath(config, entry?.configPath ?? '');
-  return tier === undefined ? entry?.defaultValue : tier;
+/**
+ * #701 返修 LOW③：**env 兜底值也必须过 registry 的 `parse`/`validate`**（与 DB 值同一套闸）。
+ *
+ * 修的是「同一个旋钮两套真相」：`config.js` 的 `intEnv` 走的是 `Number()` 语义，它收 `30`、
+ * `2592001`、`60.5`（都是有限正数），而 registry 的闸要求**整数且 60..2592000**。在那之前
+ * DB 那一路严格、env 那一路宽松 —— 独立审计的实测（AUDIT-REPORT §4）：三个越界值都以
+ * `source=env` 被采纳，而 DB 里写同样的值会被 400 拒掉。
+ *
+ * 口径（**不改通用 `intEnv`**，那会连带影响别的旋钮；闸落在 registry 驱动的这一层）：
+ *   * env 值过不了闸 ⇒ **视为「env 没给」**⇒ 回落 registry 的 `defaultValue`，`source` 如实报
+ *     `default`（不许再报 `env`：报 `env` 就是在指着一个根本不生效的数，#485 那格的口径）；
+ *   * 一条**点名 key + env 名 + 原值 + 被拒理由**的 warn（读侧仍**不抛**，硬口径 1 不动）；
+ *   * 条目没声明 `parse`/`validate`（P3 的新旋钮）⇒ 不加闸，原样通过（闸是条目自己声明的）。
+ *
+ * 判读顺序：**先看 env 原话**（`env[entry.envVar]`），没有原话才看 `config[configPath]`。
+ * 为什么必须拿原话判：`loadConfig` 的 `Number()` 已经把坏值揉过一遍（`'abc'` → 默认值、
+ * `' 86400 '` → 86400、`'1e5'` → 100000），揉完的形状在 config 里**看不出它是坏值**。
+ *
+ * @returns {{ ok: boolean, value?: unknown, reason?: string }}
+ */
+function gateRegistryValue(entry, candidate) {
+  let value = candidate;
+  if (entry.parse) {
+    let parsed;
+    try {
+      parsed = entry.parse(candidate);   // 与 DB 值调用的是**同一个函数**，不是第二份实现
+    } catch (err) {
+      return { ok: false, reason: `parse_threw:${err?.message ?? err}` };
+    }
+    if (!parsed?.ok) return { ok: false, reason: parsed?.reason ?? 'rejected_by_parse' };
+    value = parsed.value;
+  }
+  if (entry.validate) {
+    let why;
+    try {
+      why = entry.validate(value);
+    } catch (err) {
+      return { ok: false, reason: `validate_threw:${err?.message ?? err}` };
+    }
+    if (why !== true) {
+      return { ok: false, reason: typeof why === 'string' && why ? why : 'rejected_by_validate' };
+    }
+  }
+  return { ok: true, value };
 }
 
 /**
  * env 那一档的**来源**（`'env' | 'default'`），给管理台如实显示「当前生效值从哪来」。
- * 优先看 `config[<configPath>Source]`（#485 为 `FILE_UPLOAD_MAX_BYTES` 立的那格：判据是
- * 「env 里有没有显式写这个键」，而不是「它是否等于默认值」——显式写了恰好等于默认值，来源是 env）。
+ * 只在「这一档的值来自 `config` 且过了闸」时被问到的那份旧口径：优先看 `config[<configPath>Source]`
+ * （#485 为 `FILE_UPLOAD_MAX_BYTES` 立的那格：判据是「env 里有没有显式写这个键」，而不是
+ * 「它是否等于默认值」——显式写了恰好等于默认值，来源是 env）。
  * 没有这个标注字段（P3 的新条目可能没有）⇒ 退回 P1 的口径：`config` 里有值就算 env，没有算 default。
  */
-function envTierSource(entry, config) {
+function configTierSource(entry, config) {
   const flagPath = `${entry?.configPath ?? ''}Source`;
   if (config && Object.hasOwn(config, flagPath)) {
     return config[flagPath] === 'env' ? 'env' : 'default';
@@ -657,16 +730,124 @@ function envTierSource(entry, config) {
 }
 
 /**
+ * env 那一档的裁决：`{ value, source, gated }`。值是**过了闸**的那个（`'86400'` 这种数字串
+ * 由 `parse` 搬成 number），过不了 ⇒ registry 默认 + `source='default'` + 一条点名 warn。
+ *
+ * @param {object} entry registry 条目
+ * @param {object} config `loadConfig()` 的返回值（或测试手递的等价物）
+ * @param {object} opts   `{ env, log }`（`env` 只用来取**原话**做裁决，不是第二份真相）
+ */
+function resolveEnvTier(entry, config, { env = process.env, log = console } = {}) {
+  const fallbackValue = entry?.defaultValue;
+  const envName = typeof entry?.envVar === 'string' ? entry.envVar : '';
+  const raw = envName && env ? env[envName] : undefined;
+  const rawGiven = raw !== undefined && raw !== null && String(raw).trim() !== '';
+  const cfgValue = getPath(config, entry?.configPath ?? '');
+  // 条目**没声明闸**（P3 的新旋钮可能还没写 `parse`）⇒ 这一层不做任何裁决，走旧口径：
+  // 值就是 `config[path]`。为什么要退回旧路：没有 `parse` 就没人把 `'99'` 搬成 `99`，
+  // 拿 env 原话当值等于把字符串塞进 config（对 P3 是白丢的一格行为变更）。
+  if (!entry?.parse && !entry?.validate) {
+    return {
+      value: cfgValue === undefined ? fallbackValue : cfgValue,
+      source: cfgValue === undefined ? 'default' : configTierSource(entry, config),
+      gated: null,
+    };
+  }
+  const candidate = rawGiven ? raw : cfgValue;
+  if (candidate === undefined) return { value: fallbackValue, source: 'default', gated: null };
+  const verdict = gateRegistryValue(entry, candidate);
+  if (verdict.ok) {
+    return {
+      value: verdict.value,
+      source: rawGiven ? 'env' : configTierSource(entry, config),
+      gated: null,
+    };
+  }
+  const whence = rawGiven
+    ? `env ${envName}=${JSON.stringify(candidate)}`
+    : `config.${entry?.configPath ?? '?'}=${JSON.stringify(candidate)}（env ${envName} 未显式给）`;
+  // 点名 key + env 名 + 原值 + 理由：值班的人要能一眼看出「这个 env 值根本没生效，去哪改」。
+  log?.warn?.(
+    `[runtime-settings] ${entry?.key ?? '?'} 的 env 兜底被拒（${whence} 过不了写侧那套闸：`
+    + `${verdict.reason}）⇒ 视为 env 没给，回落默认 ${JSON.stringify(fallbackValue)}`
+    + '（DB / env / 默认三档共用同一套 parse/validate，不留两套真相）',
+  );
+  return { value: fallbackValue, source: 'default', gated: verdict.reason };
+}
+
+/**
+ * DB 那一档「**压根没读到**」的理由族（与「读到了但值不可用」分开：前者是故障，后者是数据）。
+ * 只有故障族会把在飞那一趟标成失败（见 `sessionTtlFlight` 里那条 throw 的理由）。
+ */
+const DB_READ_FAILURE_REASONS = new Set(['read_failed', 'read_timeout', 'no_pool']);
+
+/**
+ * 一趟**真的发了 SQL** 的读（in-flight 合并的最小单位）：读整表 → 取 `session.ttl_seconds`
+ * → 按代际号回填缓存。**口径 1 不变**：这一趟算不出值时照样给回落值。
+ *
+ * 它**会抛**一支「DB 读不可用」（唯一的抛点，在缓存回填**之后**）：
+ *   * 抛给外层 ⇒ 外层按「读不到」回落（与以前完全同形的 warn/debug 与返回值）；
+ *   * 更重要的是让 in-flight 槽知道「这一趟是**失败落定**」，从而在失败路径上也清槽。
+ *     不抛的话「失败」与「成功」在槽看来同形 ⇒ 「失败必清槽」退化成「跑完了顺手清」，
+ *     RS-19 那一格就红不了（变异 M-2 会绿着过）。
+ */
+async function sessionTtlFlight({
+  pool, config, now, log, env, registry, entry, timeoutMs,
+}) {
+  const generationAtStart = sessionTtlCacheGeneration;
+  const at = now();
+  const fallback = () => {
+    // env 那一档也要过 registry 的闸（LOW③）：坏值 ⇒ 视为没给 ⇒ registry 默认 + 点名 warn。
+    const value = resolveEnvTier(entry, config, { env, log }).value;
+    return value === undefined ? SESSION_TTL_DEFAULT_SECONDS : value;
+  };
+  let value;
+  let readUnavailable = null;
+  try {
+    // 复用整表那一次读（同一份 SQL、同一份超时、同一份永不抛口径）——不另开一条 per-key 的 SELECT。
+    const { values, problems } = await readRuntimeSettings({ pool, registry, timeoutMs, env, log });
+    const dbValue = values?.[SESSION_TTL_KEY];
+    if (Number.isSafeInteger(dbValue)) {
+      value = dbValue;
+    } else {
+      // 故障（表不在 / 挂住 / 没有池子）与「有行但值坏」要分开：前者才是「这趟没读到东西」。
+      const reason = (problems ?? []).find((p) => p?.key === SESSION_TTL_KEY)?.reason;
+      if (DB_READ_FAILURE_REASONS.has(reason)) readUnavailable = String(reason);
+      value = fallback();
+    }
+  } catch (err) {
+    // 双保险：`readRuntimeSettings` 自己永不抛，但它上面还套着 registry 注入这条缝
+    //（假库/假 registry 传进来就是这里的形状）⇒ 热路径一行都不许抛（抛了就是 `/api/me` 500）。
+    readUnavailable = `threw:${err?.message ?? err}`;
+    value = fallback();
+  }
+  if (generationAtStart === sessionTtlCacheGeneration) {
+    sessionTtlCache.pool = pool;
+    sessionTtlCache.at = at;
+    sessionTtlCache.resolved = value;
+  }
+  if (readUnavailable) {
+    throw new RuntimeSettingsError('read_unavailable',
+      `session TTL 的 DB 读不可用（${readUnavailable}）⇒ 已回落 env/默认`, { httpStatus: 500 });
+  }
+  return value;
+}
+
+/**
  * 会话 TTL 的**热读**入口（`http.js` 的建会话/续期路径调它）。
  *
  * 口径与 `readRuntimeSettings` 逐字相同（DB 有效值 > env > registry 默认，读侧永不抛），
- * 差别只有两件：① 结果进 5s 缓存；② 只回一个数（调用方是热路径，不关心回落理由）。
+ * 差别只有三件：① 结果进 5s 缓存；② 同池的并发冷读**合并成一趟 SQL**；③ 只回一个数
+ * （调用方是热路径，不关心回落理由）。
  *
- * ⚠ 注释里别写成「每请求现读 DB」：真实形状是**最多 5 秒一次**（同池内命中缓存不发 SQL）。
+ * ⚠ 注释里别写成「每请求现读 DB」：真实形状是**最多 5 秒一次**（同池内命中缓存不发 SQL），
+ *   而同一波并发冷读只发**一条**（`sessionTtlInFlight`）。
  *   多副本时最坏 5 秒内各副本读到的值可以不同（本进程保存会立刻失效，别的进程靠 TTL 到点）。
  *
  * @param {object} opts `{ pool, config, now?, log?, env?, registry?, ttlMs?, timeoutMs? }`
  *   `now` / `ttlMs` 可注入 ⇒ 缓存的两端（命中 / 过期）能在假库里判定，不用真等 5 秒。
+ *   ⚠ 共享在飞那趟的调用方拿到的是**发起方**那趟的 `timeoutMs`（生产里只有一个池、一份 config，
+ *     所以这不是第二份真相；测试里并发那格必须用同一组参数，见 RS-18）。
  * @returns {Promise<number>} 生效的 TTL 秒数；三档都给不出值 ⇒ `SESSION_TTL_DEFAULT_SECONDS`
  *   （绝不回 `undefined`：调用方把它交给 `createSession`，`undefined` 会变成「库里没有 TTL」）
  */
@@ -675,34 +856,40 @@ export async function readSessionTtlSeconds({
   registry = RUNTIME_SETTING_REGISTRY, ttlMs = SESSION_TTL_CACHE_TTL_MS, timeoutMs,
 } = {}) {
   const entry = registry?.[SESSION_TTL_KEY] ?? RUNTIME_SETTING_REGISTRY[SESSION_TTL_KEY];
-  const fallback = () => {
-    const value = envTierValue(entry, config);
-    return value === undefined ? SESSION_TTL_DEFAULT_SECONDS : value;
-  };
   const at = now();
   if (ttlMs > 0 && sessionTtlCache.resolved !== null
     && sessionTtlCache.pool === pool && at - sessionTtlCache.at <= ttlMs) {
     return sessionTtlCache.resolved;
   }
-  const generationAtStart = sessionTtlCacheGeneration;
-  let value;
+  const fallbackOnly = () => {
+    // 在飞那趟挂了/或压根没起：外层自己算一次回落值（同样是过闸的那一套，见 LOW③）。
+    const value = resolveEnvTier(entry, config, { env, log }).value;
+    return value === undefined ? SESSION_TTL_DEFAULT_SECONDS : value;
+  };
+  // ② in-flight 合并：同池已有读在飞 ⇒ **复用那一趟**，不再发第二条 SQL（这就是 MED 的全部）。
+  if (sessionTtlInFlight.promise && sessionTtlInFlight.pool === pool) {
+    log?.debug?.('[runtime-settings] 复用同池在飞的 session TTL 读（不重复发 SQL）');
+    try {
+      return await sessionTtlInFlight.promise;
+    } catch (err) {
+      log?.debug?.(`[runtime-settings] 在飞那趟失败 ⇒ 本次读兜底 env/默认（${err?.message ?? err}）`);
+      return fallbackOnly();
+    }
+  }
+  const task = sessionTtlFlight({ pool, config, now, log, env, registry, entry, timeoutMs });
+  sessionTtlInFlight.pool = pool;
+  sessionTtlInFlight.promise = task;
+  // **成功与失败都要清槽**（M-2 点名的就是这一支）：`.then(onOk, onErr)` 两支都挂 `release`，
+  // 而不是只在成功分支挂 —— 一次 DB 抖动把之后所有读钉在同一个已落定的 promise 上，比慢更难查。
+  // 挂在这里而不是 `finally` 里：清槽是**槽的**责任，`sessionTtlFlight` 只管读数与缓存回填。
+  task.then(() => releaseSessionTtlInFlight(task), () => releaseSessionTtlInFlight(task));
   try {
-    // 复用整表那一次读（同一份 SQL、同一份超时、同一份永不抛口径）——不另开一条 per-key 的 SELECT。
-    const { values } = await readRuntimeSettings({ pool, registry, timeoutMs, env, log });
-    const dbValue = values?.[SESSION_TTL_KEY];
-    value = Number.isSafeInteger(dbValue) ? dbValue : fallback();
+    return await task;
   } catch (err) {
-    // 双保险：`readRuntimeSettings` 自己永不抛，但它上面还套着 registry 注入这条缝
-    //（假库/假 registry 传进来就是这里的形状）⇒ 热路径一行都不许抛（抛了就是 `/api/me` 500）。
+    // 口径 1：读侧永不抛。`sessionTtlFlight` 里已经填过回落缓存，这里只负责把答案交出去。
     log?.debug?.(`[runtime-settings] readSessionTtlSeconds 兜底 env/默认（${err?.message ?? err}）`);
-    value = fallback();
+    return fallbackOnly();
   }
-  if (generationAtStart === sessionTtlCacheGeneration) {
-    sessionTtlCache.pool = pool;
-    sessionTtlCache.at = at;
-    sessionTtlCache.resolved = value;
-  }
-  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -726,8 +913,13 @@ function toIso(value) {
   return typeof value === 'string' && value ? value : null;
 }
 
-/** 一条登记项 ⇒ 响应 DTO（`source` 三档 `db | env | default`，`reason` 只在回落时有点名理由）。 */
-function toSettingItem(entry, row, config, fallbackReason = null) {
+/**
+ * 一条登记项 ⇒ 响应 DTO（`source` 三档 `db | env | default`，`reason` 只在回落时有点名理由）。
+ *
+ * `envTier` 是调用方算好的**过了闸的** env 那一档（`resolveEnvTier`）：管理台报的那个值必须与
+ * 热读真正用的那个值是同一个数（#701 返修 LOW③：两边各算一套就是界面与行为分叉）。
+ */
+function toSettingItem(entry, row, envTier, fallbackReason = null) {
   const raw = row?.value;
   let parsed = { ok: false, reason: 'no_row' };
   if (row) {
@@ -751,8 +943,8 @@ function toSettingItem(entry, row, config, fallbackReason = null) {
   // `row` 存在但值非法 ⇒ 保留库里那行的 updated_at/by（它们是真发生过的事），只是值不用它。
   return {
     ...base,
-    value: envTierValue(entry, config),
-    source: envTierSource(entry, config),
+    value: envTier?.value,
+    source: envTier?.source ?? 'default',
     reason: row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row'),
   };
 }
@@ -803,7 +995,16 @@ export async function listRuntimeSettingsAdmin({
   } else {
     log?.warn?.('[runtime-settings] 管理台读没有可用的 pool ⇒ 各项回落 env/默认并如实标 source');
   }
-  return { items: entries.map((entry) => toSettingItem(entry, rowByKey.get(entry.key), config, fallbackReason)) };
+  return {
+    items: entries.map((entry) => toSettingItem(
+      entry,
+      rowByKey.get(entry.key),
+      // env 那一档也要过 registry 的闸（#701 返修 LOW③）：坏 env 值 ⇒ 报 `default` + 点名 warn，
+      // 不许报一个「界面显示 env 的 30、实际却不会用这个数」的假来源。
+      resolveEnvTier(entry, config, { env, log }),
+      fallbackReason,
+    )),
+  };
 }
 
 /** 保存后的 DTO：值/时间/人**只来自 `RETURNING`**（口径 4），`label`/`applyMode` 是 registry 的静态元数据。 */
