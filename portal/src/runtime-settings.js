@@ -3,9 +3,12 @@
 // 一句话：把「配置只有 env 一份真相、改一个数字要重建容器」换成「DB 是真相、env 是兜底」，
 // 优先级 **`DB > env > 默认`**。env 一条都没少（那是 P5 的退役账），P1 只搬目的地与机制。
 //
-// 六条硬口径**逐条照抄 `portal/src/upload-settings.js` 的头注释**（#485 那两片把它打磨过，
+// 六条硬口径**照抄 `portal/src/upload-settings.js` 的头注释**（#485 那两片把它打磨过，
 // 复 audit 的返修尤其别改回去）。为什么照抄而不是自己发明：那是同一形状（DB 存配置 + 读侧
-// 永不抛 + 写侧一条 CTE）已经付过账的版本，第二套口径 = 第二本账。
+// 永不抛 + 写侧保存配置）已经付过账的版本，第二套口径 = 第二本账。
+// ⚠ **第 4/6 条现在比那边这一份新**：#698 返修把「保存 = 一条 CTE 语句」改成了「保存 = 一个
+// 显式事务」（论证见下面第 6 条），本单直接按那个结论落地，不等它合进 main ⇒ 当前分支里的
+// `upload-settings.js` 仍是旧的单语句形状，比对时不要把它当参照（那正是本条要修的口径）。
 //   1. **优先级 `DB > env > 默认`**，且**读侧永不抛**：表不存在 / DB 抖动 / 值非法 ⇒
 //      回落 env（env 也没有 ⇒ registry 的 `defaultValue`）+ 一条**点名 key** 的 `warn`。
 //      配置面坏了不许把功能锁死（与 `mail-provider`「读取失败绝不 500」、`upload-settings`
@@ -17,15 +20,27 @@
 //   3. **写侧只接受 JSON 标量**（`typeof value` 是 `'number' | 'boolean' | 'string'`）：
 //      对象 / 数组 / `null` / `NaN` / `Infinity` / 函数 / `undefined` 一律拒。表是 `jsonb`，
 //      存进 `{"a":1}` 读出来就是个对象 —— 类型纪律从列类型退化成 jsonb 之后，这道闸是承重墙。
-//   4. **单行 upsert 一条 SQL**（`INSERT … ON CONFLICT (key) DO UPDATE … RETURNING`），
-//      响应 DTO 一律来自 `RETURNING`（不信输入）——「保存成功」说的是库里现在的值。
+//   4. **单行 upsert**（`INSERT … ON CONFLICT (key) DO UPDATE … RETURNING`），响应 DTO 一律来自
+//      `RETURNING`（不信输入）——「保存成功」说的是库里现在的值。⚠ 它**不再是「一条 SQL」**：
+//      写与审计在**同一个显式事务**里（第 6 条），「一条语句」从来不是本模块的原子性来源。
 //   5. **读侧带超时**（默认 1500ms，`RUNTIME_SETTINGS_READ_TIMEOUT_MS` 可覆盖；超时按
 //      「读不到」处理 ⇒ 回落 + 只留 debug）。⚠ 「永不抛」必须同时覆盖**抛错**（`catch`）与
 //      **不返回**（到点没回），只 `catch` 抛错是假口径 —— 不返回就永远进不了 catch
 //      （`upload-settings.js` 头注释第 5 条有完整论证：那一单的病根是「每次上传都发的那次
 //      读取」，本模块是「每次 `serve()` 都发的那次读取」，同一形状）。
-//   6. **写操作与审计同生共死**：一条 CTE 语句里读旧值 + upsert + 写审计（动作名
-//      `admin.runtime_settings_updated`），照 `upload-settings.js` 的 `SAVE_SQL` 形状。
+//   6. **写与审计在同一个事务里**（`BEGIN` → `SELECT … FOR UPDATE` 取旧值 → upsert → 审计 →
+//      **在事务内**检查审计行数 === 1 → `COMMIT`；任何一步失败 ⇒ `ROLLBACK` + 抛）。
+//      ⇒ **「设置生效而审计没写」不可表示**：审计被静默抑制（trigger `RETURN NULL`、rule）时
+//      连设置一起回滚，调用方拿到 500 而库里一格没改（判据：RS-6b 假库 + RS-11 真库 trigger）。
+//      ⚠ 旧口径「一条 CTE 语句 = 同生共死」**已作废**（#677 P1 返修，独立审计的两条 MED）：
+//        * 单语句里 `audit_rows` 只能在 `pool.query()` **返回之后**判，而那一刻语句**已经提交**
+//          ⇒ 审计被抑制时是「报错但设置已生效」，检查不能撤销任何事。
+//        * 同一形状的另一半是旧值：一条**含 data-modifying CTE** 的语句里 `FOR UPDATE`
+//          **看不见本语句要改的那一行**（真库实测 ⇒ `prev` 恒空集 ⇒ `previous_value` 恒 `null`）
+//          ⇒ 「拿行锁」与「写这一行」在一条语句里**不可兼得**（#698 在 `upload-settings.js` 上
+//          撞的是同一堵墙，两轮读数都在那边文件头第 6 条里）。
+//      ⇒ 与 #698 返修后的 `upload-settings.js#updateUploadSettings` **同形状**：`FOR UPDATE` 单独
+//      一条语句，**原子性由事务保证**，不再由「一条语句」保证。
 //      ⇒ **调用方不得再补 `auth.audit`**（那会把原子性退回成两个 await，还多写一笔审计）。
 //
 // P1 的边界（别在代码里假装已完成，判据在 `portal/test/runtime-settings.test.js`）：
@@ -162,58 +177,65 @@ export function isKnownSetting(key, registry = RUNTIME_SETTING_REGISTRY) {
   return typeof key === 'string' && Object.hasOwn(registry, key);
 }
 
+/** 孤儿行上报时一条 warn 里最多列几个 key（剩下的只报总数，不刷屏）。 */
+const MAX_ORPHAN_KEYS_IN_WARN = 5;
+
 /**
  * 读侧的一条 SELECT：**整表一次读**，不是 per-key 一次。
  * `value` 是 `jsonb` ⇒ node-pg 直接给 JS 值（对象/字符串/数字/布尔都可能是它）。
  * 整表而不是 `WHERE key = ANY($1)`：读侧要能看见「库里有一行但 registry 不认」这件事
  * （P3 逐批迁时，一行孤儿配置是必须能说出口的形态），而表只装旋钮、行数个位数。
+ * ⚠ 既然整表读，**读到了就必须说话**（#677 P1 返修 MED①）：registry 不认的行走
+ * `unknown_key`（见下面孤儿行那一段），不许只存进 `rowByKey` 然后从不遭提到。
  */
 const SELECT_SQL = 'SELECT key, value FROM runtime_settings ORDER BY key';
 
 /**
- * 保存 = **一条**语句做完三件事：读旧值 → upsert → 写审计（口径 6，形状照 0036 的 `SAVE_SQL`）。
+ * 保存 = **一个显式事务**（口径 6）：`BEGIN` → `PREVIOUS_SQL`（单独一条，带行锁）→ `UPSERT_SQL`
+ * → `AUDIT_SQL` → **在事务内检查审计行数** → `COMMIT`。下面三个常量就是事务里的三条语句，
+ * **顺序不可改**（形状照 #698 返修后的 `upload-settings.js`，不再照 0036 的单语句 CTE）。
  *
- *   1. `prev` **不带 `FOR UPDATE`** —— 这一处**刻意偏离 0036**，理由是 2026-11-19 在
- *      postgres:16.15 上实测的（同一台一次性容器，探针记录见 `portal/test/runtime-settings.test.js`
- *      的 RS-11 与工单报告）：一条**含 data-modifying CTE** 的语句里，锁定读**看不见本语句自己改的
- *      那一行** ⇒ 带上 `FOR UPDATE` 的 `prev` 在真库上恒为**空集**（有旧行、无旧行都是空）。
- *      后果不是「少了个锁」而是**少了一整段**：`previous_value` 恒 `null`，
- *      而 0036 那个形状的主查询是 `FROM upd, prev_eff`（内连接）⇒ 主 SELECT 零行
- *      ⇒ `aud` 那一支也零行 ⇒ 「设置写进去了、审计一行没有」。去掉 `FOR UPDATE` 之后实测
- *      `previous_value` = 真旧值、`audit_log` 恰好 1 行。
- *      ⇒ 谁要把 `FOR UPDATE` 加回来，必须先在真库上证明它不是空集（RS-11 就是那条判据）。
- *   2. `LEFT JOIN prev`（两处）：首写没有旧行（`prev` 天然是空集）。写成内连接的话，审计那一支
- *      会跟着 `upd` 一起空掉 ⇒ 「保存成功但零审计行」，而审计与设置同生共死是这条语句的存在理由。
- *      （实测：无旧行 + 内连接 = `audit_log` 0 行，见上面那组探针的 D 组。）
- *   3. `$3::jsonb`：值由 JS `JSON.stringify(标量)` 送来，SQL 侧不猜类型（口径 3 的另一半）。
- *   4. `RETURNING` 出真落库的那一行 ⇒ 响应 DTO 不信输入（口径 4）。
- *   5. 已知残留（0046 头注释里也记了）：**同一 key 并发写**时 `prev` 取的是本语句快照，
- *      第二写的 `previous_value` 可能是「自己进来之前」的值（写入本身由 `ON CONFLICT` 的行锁串行化，
- *      生效值不受影响）。要收它得给 key 加 advisory lock，别拿 `FOR UPDATE` 收（见第 1 条）。
+ * 为什么不是以前那条单语句 CTE（两个洞都是实测出来的，不是推想）：
+ *   * **审计行数检查只能在语句返回之后做，而那一刻已经提交** ⇒ trigger `RETURN NULL` 把审计
+ *     吃掉时，调用方拿到 500 但**设置已生效**（“报错但已生效”）。放进事务后检查在 `COMMIT`
+ *     之前 ⇒ 不满足就 `ROLLBACK`，两边一起不落（真库判据：RS-11 的 trigger 那一段）。
+ *   * **旧值取不到锁**：一条**含 data-modifying CTE** 的语句里所有 sub-statement 共用同一个
+ *     语句级快照 ⇒ `FOR UPDATE` **看不见本语句要改的那一行**。2026-11-19 在 postgres:16.15 上
+ *     实测（一次性容器，探针记录见工单报告与 RS-11）：带 `FOR UPDATE` 的 `prev` 恒为**空集**
+ *     （有旧行、无旧行都是空）⇒ `previous_value` 恒 `null`。⇒ 单语句里「拿行锁」与「写这一行」
+ *     **不可兼得**，只能拆事务：`FOR UPDATE` **单独一条**才既拿得到最新已提交值又拿得到行锁。
+ *
+ * 四个刻意的细节：
+ *   1. `FOR UPDATE` **只能出现在 `PREVIOUS_SQL` 这一条独立语句里**（挪进 `UPSERT_SQL` 就是退回
+ *      那个 `previous_value` 恒 `null` 的 500 形状）。它是并发口径的唯一支点：READ COMMITTED 下
+ *      它读到的是**最新已提交**的值，并把行锁一直拿到 `COMMIT` ⇒ 并发第二条保存卡在这一句上，
+ *      等到的就是前一个写完之后的值（真库判据：RS-11 的「拦路连接」那一段）。
+ *   2. `previous_value` **现在由 JS 从 `PREVIOUS_SQL` 那一行取**（不再由 SQL 里的 CTE 算）：
+ *      审计里写的与接口返回的是**同一个值**，不存在第二份派生逻辑可漂。
+ *   3. `details` 的三个键（`key` / `value` / `previous_value`）与旧 CTE 版逐字相同 ⇒ 已有的审计
+ *      查询不受影响；只是不再由 SQL 算出来。`value` 取 `RETURNING` 里那一个（不信输入）。
+ *   4. `$2::jsonb`：值由 JS `JSON.stringify(标量)` 送来，SQL 侧不猜类型（口径 3 的另一半）。
+ *
+ * 已知残留（说在明处）：**同一 key 的首次并发写**（库里还没有那一行）锁不到任何行 ⇒ 两条都可能
+ * 把 `previous_value` 记成 `null`（生效值仍由 `ON CONFLICT` 的行锁串行化，不丢）。这一条 0046 的
+ * 头注释里也记着；要收它得给 key 加 advisory lock，别拿 `FOR UPDATE` 收（见上面第二条）。
  */
-const SAVE_SQL = `WITH prev AS (
-   SELECT value FROM runtime_settings WHERE key = $2
- ), upd AS (
-   INSERT INTO runtime_settings (key, value, updated_at, updated_by)
-   VALUES ($2, $3::jsonb, now(), $1)
+
+/** 事务第 1 条：单独一条锁定读写旧值（无旧行 ⇒ 空集，首写的 `previous_value` 就是 `null`）。 */
+const PREVIOUS_SQL = 'SELECT value FROM runtime_settings WHERE key = $1 FOR UPDATE';
+
+/** 事务第 2 条：单行 upsert（口径 4）。响应 DTO 一律来自 `RETURNING`（不信输入）。 */
+const UPSERT_SQL = `INSERT INTO runtime_settings (key, value, updated_at, updated_by)
+   VALUES ($1, $2::jsonb, now(), $3)
    ON CONFLICT (key) DO UPDATE
       SET value = EXCLUDED.value,
           updated_at = now(),
           updated_by = EXCLUDED.updated_by
-   RETURNING key, value, updated_at, updated_by
- ), aud AS (
-   INSERT INTO audit_log (actor_id, action, target, details)
-   SELECT $1, $4::text, $5::text, jsonb_build_object(
-            'key', upd.key,
-            'value', upd.value,
-            'previous_value', prev.value)
-     FROM upd LEFT JOIN prev ON true
-   RETURNING 1 AS audit_row
- )
-SELECT upd.key, upd.value, upd.updated_at, upd.updated_by,
-       prev.value AS previous_value,
-       (SELECT count(*) FROM aud)::int AS audit_rows
-  FROM upd LEFT JOIN prev ON true`;
+   RETURNING key, value, updated_at, updated_by`;
+
+/** 事务第 3 条：审计。与 upsert 同一个事务 ⇒ 审计写不进去就**设置也没改**（口径 6）。 */
+const AUDIT_SQL = 'INSERT INTO audit_log (actor_id, action, target, details)'
+  + ' VALUES ($1, $2, $3, $4)';
 
 /**
  * 读全部登记项：**永不抛、永不挂**（口径 1 + 5）。
@@ -222,8 +244,10 @@ SELECT upd.key, upd.value, upd.updated_at, upd.updated_by,
  *   `timeoutMs` 缺省时由 `readTimeoutMs()` 现算（读 `RUNTIME_SETTINGS_READ_TIMEOUT_MS`）。
  * @returns {Promise<{values:Record<string,unknown>, problems:Array<{key:string,reason:string}>}>}
  *   `values` 只放**可用**的 DB 值；不可用的 key 一条都不在 `values` 里，
- *   只在 `problems` 里点名（`read_failed` / `read_timeout` / `no_row` / `invalid_db_value`，
- *   四种理由分开：运维的处理动作不一样，报错了就不能互捣）。
+ *   只在 `problems` 里点名（`read_failed` / `read_timeout` / `no_row` / `invalid_db_value` /
+ *   `unknown_key`，五种理由分开：运维的处理动作不一样，报错了就不能互捣）。
+ *   `unknown_key` = 库里有这一行但 registry 不认（孤儿行）：它不是某个登记项的回落理由，
+ *   而是一行永不生效的配置 ⇒ 单独一个 reason，且只聚合 warn 一次（不逐行刷屏）。
  */
 export async function readRuntimeSettings({
   pool, registry = RUNTIME_SETTING_REGISTRY, timeoutMs, env = process.env, log = console,
@@ -266,8 +290,30 @@ export async function readRuntimeSettings({
 
   const rows = Array.isArray(result?.rows) ? result.rows : [];
   const rowByKey = new Map();
+  const orphans = new Set();
   for (const row of rows) {
-    if (row && typeof row.key === 'string') rowByKey.set(row.key, row);
+    if (row && typeof row.key === 'string') {
+      rowByKey.set(row.key, row);
+      // 孤儿行：registry 不认的 key。必须**看得见**（P3 逐批往 registry 加/删条目 ⇒ 删完库里
+      // 就剩孤儿行；一行永不生效的配置不说话就是运维的考古题）。
+      if (!Object.hasOwn(registry, row.key)) orphans.add(row.key);
+    }
+    // 其余额外形状（`key` 不是字符串）刻意不当孤儿报：0046 里 `key` 是 `text PRIMARY KEY`（非空），
+    // 真表里出不来这种行；拿不准的名字写进 problems 只会污染那份「能按 key 行动」的名单。
+  }
+  // 孤儿行：进 `problems`（reason=`unknown_key`，逐 key 点名），但**只 warn 一次**（聚合）。
+  // 依旧不抛（口径 1）：一行孤儿配置不能把服务钉住；`values` 里也不出现它（不生效）。
+  const orphanKeys = [...orphans].sort();
+  for (const key of orphanKeys) problems.push({ key, reason: 'unknown_key' });
+  if (orphanKeys.length > 0) {
+    const shown = orphanKeys.slice(0, MAX_ORPHAN_KEYS_IN_WARN).join(', ');
+    const rest = orphanKeys.length > MAX_ORPHAN_KEYS_IN_WARN
+      ? `，其余 ${orphanKeys.length - MAX_ORPHAN_KEYS_IN_WARN} 个未列出` : '';
+    log?.warn?.(
+      `[runtime-settings] runtime_settings 里有 ${orphanKeys.length} 行 registry 不认的 key`
+      + `（${shown}${rest}）⇒ 不进覆盖层、也不回落（它们压根没登记；`
+      + 'P3 删 registry 条目后库里留下的就是这种行，要人清理）。',
+    );
   }
   for (const key of keys) {
     if (!rowByKey.has(key)) {
@@ -350,13 +396,22 @@ export async function applyRuntimeOverrides(config, opts = {}) {
 }
 
 /**
- * 写侧：校验 + **一条** CTE 语句（读旧值 → upsert → 写审计，口径 6）。
+ * 写侧：校验 + **一个显式事务**（`BEGIN` → `SELECT … FOR UPDATE` 取旧值 → upsert → 审计 →
+ * 事务内检查审计行数 → `COMMIT`，口径 6）。
  *
- * 三种情况一律**抛**（HTTP 层映射 400），且**一条 SQL 都不发**：
+ * 三种情况一律**抛**（HTTP 层映射 400），且**一条 SQL 都不发、也不从池里借连接**：
  *   * `key` 不在 registry ⇒ `unknown_setting`（未登记的 key 写进去就是一行永不生效的配置）；
  *   * `value` 不是 JSON 标量 ⇒ `scalar_required`（口径 3）；
  *   * registry 的 `validate` 拒绝 ⇒ `validation_failed`。
  * 成功 ⇒ 返回**来自 `RETURNING`** 的那一行（`{ key, value, updatedAt, updatedBy, … }`）。
+ *
+ * 失败形状：事务里任何一步失败 ⇒ `ROLLBACK` ⇒ **设置一格没改**、审计零行（RS-6b 钉这一点）。
+ * 审计被静默抑制（trigger `RETURN NULL` 那类）也算失败：审计行数在 `COMMIT` **之前**判，
+ * 所以不存在「设置生效了而审计一行没有」那个窗口（真库判据：RS-11 的 trigger 那一段）。
+ * `client.release()` 在 `finally`：报错也不许把连接漏在池外。
+ *
+ * ⚠ 事务里**不套**读侧超时（`withReadTimeout`）：那套服务的是「读侧永不抛、不许把启动挂住」；
+ *   写侧失败本来就是 5xx，给它套超时只会把「已拿到行锁」的写挂成半途状态。
  *
  * @param {object} opts `{ pool, actorId?, key, value, registry?, log? }`
  */
@@ -394,29 +449,54 @@ export async function saveRuntimeSetting({
     fail('value', `value 不合格：${String(why ?? '校验失败')}`);
   }
 
-  const written = await pool.query(SAVE_SQL, [
-    actorId, key, JSON.stringify(value),
-    AUDIT_ACTION, `${AUDIT_TARGET_PREFIX}:${key}`,
-  ]);
-  const row = written?.rows?.[0] ?? null;
-  if (!row) {
-    // 语句级原子：没有 `upd` 行就没有审计行。走到这里说明 SQL 形状漂了。
-    throw new RuntimeSettingsError('internal', `写入 ${key} 成功却没有 RETURNING 行`, {
-      httpStatus: 500,
-    });
+  // 事务必须钉在**同一条连接**上：`pool.query()` 每次另借一条连接，`FOR UPDATE` 拿到的行锁会随
+  // 那条语句结束而放掉 ⇒ 并发第二条不必等 ⇒ 旧值又是「自己进来之前」的那个（#698 的病根）。
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // ① 单独一条锁定读：并发第二条卡在这一句上，等到的就是前一个写完之后的值（口径 6 的支点）。
+    const previous = await client.query(PREVIOUS_SQL, [key]);
+    const previousValue = previous?.rows?.[0]?.value ?? null;
+    // ② 写这一行；`RETURNING` 是响应的唯一真相（口径 4）。
+    const written = await client.query(UPSERT_SQL, [key, JSON.stringify(value), actorId]);
+    const row = written?.rows?.[0] ?? null;
+    if (!row) {
+      // upsert 带了 `RETURNING` 却不给行 = SQL 形状漂了（审计也在同一个事务里 ⇒ 一起回滚）。
+      throw new RuntimeSettingsError('internal', `写入 ${key} 成功却没有 RETURNING 行`, {
+        httpStatus: 500,
+      });
+    }
+    // ③ 审计：与 upsert 同生共死。`details` 的三个键与旧 CTE 版逐字相同；`previous_value` 与接口
+    //    返回的是**同一个值**（都由上面那一行锁定读派生 ⇒ 不可能漂）。
+    const audited = await client.query(AUDIT_SQL, [
+      actorId,
+      AUDIT_ACTION,
+      `${AUDIT_TARGET_PREFIX}:${key}`,
+      JSON.stringify({ key: row.key, value: row.value, previous_value: previousValue }),
+    ]);
+    // ④ **在 `COMMIT` 之前**检查（这一行就是 MED② 的全部内容）：审计被 trigger/rule 静默抑制时
+    //    设置也必须跟着回滚 —— 挪到 `COMMIT` 之后就只能「报错但已生效」了（M-2 两刀点名的就是它）。
+    const auditRows = Number(audited?.rowCount ?? 0);
+    if (auditRows !== 1) {
+      throw new RuntimeSettingsError('internal',
+        `保存 ${key} 成功但审计写了 ${audited?.rowCount ?? 0} 行（已 ROLLBACK ⇒ 设置未生效）`,
+        { httpStatus: 500 });
+    }
+    await client.query('COMMIT');
+    logger?.debug?.(`[runtime-settings] ${key} 已写入（actor=${String(actorId)}）`);
+    return {
+      key: row.key,
+      value: row.value,
+      updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+      updatedBy: row.updated_by ?? null,
+      previousValue: previousValue,
+      auditRows,
+    };
+  } catch (error) {
+    // `ROLLBACK` 自己失败（连接已断）不许盖掉真正的错误：要报给运维的是那一条。
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
-  if (Number(row.audit_rows) !== 1) {
-    // 理论上到不了：`aud` 与 `upd` 在同一条语句里。真出现 = 有人把审计那一支改成可跳过的形状。
-    throw new RuntimeSettingsError('internal',
-      `保存 ${key} 成功但审计写了 ${row?.audit_rows ?? 0} 行`, { httpStatus: 500 });
-  }
-  logger?.debug?.(`[runtime-settings] ${key} 已写入（actor=${String(actorId)}）`);
-  return {
-    key: row.key,
-    value: row.value,
-    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
-    updatedBy: row.updated_by ?? null,
-    previousValue: row.previous_value ?? null,
-    auditRows: Number(row.audit_rows),
-  };
 }

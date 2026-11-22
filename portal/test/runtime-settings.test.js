@@ -5,11 +5,15 @@
 // 传进 `readRuntimeSettings` / `applyRuntimeOverrides` / `saveRuntimeSetting` 的 `registry` 参数。
 // 空 registry 本身也有一格（RS-7）钉住「P1 未迁旋钮」这件事——它红了就说明有人在 P1 里偷迁了。
 //
-// 判据取自工单 §1④ 的六格（RS-1…RS-6），另加四格钉住 P1 的边界：
+// 判据取自工单 §1④ 的六格（RS-1…RS-6），另加五格钉住 P1 的边界与返修：
+//   RS-4b 孤儿行（registry 不认的 key）⇒ problems 点名 + 只聚合 warn 一次 + 不抛（MED①）
+//   RS-6  写 = **一个事务**（BEGIN → FOR UPDATE → upsert → 审计 → COMMIT）+ RS-6b 审计被抑制
+//         ⇒ 抛 500 且设置没落库（MED②；检查必须在 COMMIT 之前）
 //   RS-7 空 registry（P1 现状：一格未迁、启动路径零 SQL）
 //   RS-8 迁移 0046 的形状（jsonb / key 形状 CHECK / 零值域 CHECK / 无 BEGIN / 无 FK / baseline 冻结）
 //   RS-9 `serve()` 接线（覆盖层在 migrate 之后、createServer 之前，且**所有循环**都用它）
 //   RS-10 读侧超时旋钮（`RUNTIME_SETTINGS_READ_TIMEOUT_MS`：只收正整数、且真的传给 setTimeout）
+//   RS-11 真库：一个事务真的落库 + 审计被 trigger 抑制时设置没改 + 行锁真的拦人 + key CHECK
 //
 // 隔离约定（docs/testing.md §2.1）：本地 fake pool，不碰真实 DB；不起 HTTP。
 import test from 'node:test';
@@ -89,54 +93,136 @@ function collectingLog() {
 /**
  * 本地 fake pool（形状照 `portal/test/fake-pool.js` 的口径：**SQL 里没写的东西不好心补**，
  * 未预期的语句直接抛，而不是放行造成假绿）。
- * `sqlLog` / `queryCount` 是给「零写库」「只发一条」那两条判据数的。
+ * `sqlLog` / `queryCount` 是给「零写库」「事务形状」那两条判据数的。
+ *
+ * `connect()` 的**提交/回滚语义**照 `fake-pool.js` 给 git-credential（#183）与 upload-settings
+ * （#698）用的那一套：`BEGIN` 开账 → `ROLLBACK` 逐条撤销 → `COMMIT` 落账。本 fake 的「账」是
+ * `pending`（事务内的 upsert/审计）与 `committed`（已提交状态）两层：这样「审计被抑制 ⇒
+ * 设置也没落库」在 fake 上也能真判（不是只盯 SQL 文本的形状闸）。
+ * ⚠ fake **不模拟 MVCC / 行锁**（并发链那部分只有真库能判，见 RS-11）。
  */
 class FakeRuntimePool {
   constructor({
     rows = [], throwOnSelect = null, hangOnSelect = false, hangOnWrite = false, returning = null,
-    auditRows = 1,
+    auditRowCount = 1, upsertReturnsRow = true,
   } = {}) {
-    this.rows = rows;
     this.throwOnSelect = throwOnSelect;
     this.hangOnSelect = hangOnSelect;
     this.hangOnWrite = hangOnWrite;
     this.returning = returning;
-    this.auditRows = auditRows;
+    // 审计影响行数：0 = 模拟「审计被静默抑制」（真库里就是 trigger `RETURN NULL`）。
+    this.auditRowCount = auditRowCount;
+    this.upsertReturnsRow = upsertReturnsRow;
+    this.committed = new Map(rows.map((r) => [r.key, r.value]));   // 已提交的 runtime_settings
+    this.auditCommitted = [];                                       // 已提交的审计行
+    this.pending = null;                                            // 事务内未提交的 upsert
+    this.auditPending = null;                                       // 事务内未提交的审计
+    this.inTx = false;
     this.sqlLog = [];
     this.queryCount = 0;
-    this.selectCount = 0;
-    this.writeCount = 0;
+    this.connectCount = 0;
+    this.releaseCount = 0;
   }
 
   query(sql, params = []) {
     this.queryCount += 1;
-    this.sqlLog.push({ sql, params });
-    const isWrite = /\bINSERT\b/i.test(sql);
-    if (isWrite) {
-      this.writeCount += 1;
-      if (this.hangOnWrite) return new Promise(() => {});
-      const row = this.returning ?? {
-        key: params[1],
-        value: JSON.parse(params[2]),
-        updated_at: new Date('2026-11-19T00:00:00.000Z'),
-        updated_by: params[0],
-        previous_value: null,
-        audit_rows: this.auditRows,
-      };
-      return Promise.resolve({ rows: [row] });
+    this.sqlLog.push({ sql: String(sql), params });
+    const text = String(sql);
+    if (/^\s*BEGIN\b/i.test(text)) {
+      this.inTx = true;             // 重复 BEGIN：PG 只给 warning ⇒ fake 也不许比真库更严
+      this.pending = this.pending ?? new Map();
+      this.auditPending = this.auditPending ?? [];
+      return Promise.resolve({ rows: [], rowCount: 0 });
     }
-    if (/\bruntime_settings\b/i.test(sql)) {
-      this.selectCount += 1;
+    if (/^\s*COMMIT\b/i.test(text)) {
+      for (const [k, v] of (this.pending ?? new Map())) this.committed.set(k, v);
+      this.auditCommitted.push(...(this.auditPending ?? []));
+      this.pending = null;
+      this.auditPending = null;
+      this.inTx = false;
+      return Promise.resolve({ rows: [], rowCount: 0 });
+    }
+    if (/^\s*ROLLBACK\b/i.test(text)) {
+      this.pending = null;          // 逐条撤销：事务里的 upsert 与审计一起消失
+      this.auditPending = null;
+      this.inTx = false;
+      return Promise.resolve({ rows: [], rowCount: 0 });
+    }
+    if (/\bINSERT\b/i.test(text)) return this.#write(text, params);
+    if (/\bruntime_settings\b/i.test(text)) {
+      if (/\bFOR\s+UPDATE\b/i.test(text)) {
+        const key = params[0];
+        const missing = !this.committed.has(key) && !(this.pending ?? new Map()).has(key);
+        if (missing) return Promise.resolve({ rows: [], rowCount: 0 });   // 首写：无旧行
+        const value = this.pending?.has(key) ? this.pending.get(key) : this.committed.get(key);
+        return Promise.resolve({ rows: [{ value }], rowCount: 1 });
+      }
+      // 整表读（`SELECT_SQL`）：已提交 + 事务内未提交的改动（未提交的部分只有本连接看得见）。
+      const merged = new Map(this.committed);
+      for (const [k, v] of (this.pending ?? new Map())) merged.set(k, v);
       if (this.hangOnSelect) return new Promise(() => {});
       if (this.throwOnSelect) return Promise.reject(this.throwOnSelect);
-      return Promise.resolve({ rows: this.rows });
+      const rows = [...merged.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))
+        .map(([key, value]) => ({ key, value }));
+      return Promise.resolve({ rows, rowCount: rows.length });
     }
-    return Promise.reject(new Error(`FakeRuntimePool：未预期的 SQL：${sql.slice(0, 80)}`));
+    return Promise.reject(new Error(`FakeRuntimePool：未预期的 SQL：${text.slice(0, 80)}`));
+  }
+
+  // 事务里的两条写：upsert 进 pending（提交才落账），审计按 `auditRowCount` 决定写不写得进。
+  #write(text, params) {
+    if (this.hangOnWrite) return new Promise(() => {});
+    if (/INSERT\s+INTO\s+audit_log\b/i.test(text)) {
+      if (this.auditRowCount === 0) return Promise.resolve({ rows: [], rowCount: 0 });
+      (this.auditPending ??= []).push(JSON.parse(params[3]));
+      return Promise.resolve({ rows: [], rowCount: 1 });
+    }
+    const [key, jsonValue, actorId] = params;
+    const stored = this.returning?.value ?? JSON.parse(jsonValue);
+    (this.pending ??= new Map()).set(key, stored);
+    if (!this.upsertReturnsRow) return Promise.resolve({ rows: [], rowCount: 0 });
+    return Promise.resolve({
+      rows: [this.returning ?? {
+        key,
+        value: stored,
+        updated_at: new Date('2026-11-19T00:00:00.000Z'),
+        updated_by: actorId,
+      }],
+      rowCount: 1,
+    });
+  }
+
+  /** 当前「库里」的值（已提交那一层 —— 没 COMMIT 的不算落库）。 */
+  storedValue(key) {
+    return this.committed.get(key);
+  }
+
+  /** 把 sqlLog 归成角色序列（事务形状判据用）。 */
+  roles() {
+    return this.sqlLog.map(({ sql }) => {
+      if (/^\s*BEGIN\b/i.test(sql)) return 'BEGIN';
+      if (/^\s*COMMIT\b/i.test(sql)) return 'COMMIT';
+      if (/^\s*ROLLBACK\b/i.test(sql)) return 'ROLLBACK';
+      if (/INSERT\s+INTO\s+audit_log\b/i.test(sql)) return 'AUDIT';
+      if (/INSERT\s+INTO\s+runtime_settings\b/i.test(sql)) return 'UPSERT';
+      if (/\bFOR\s+UPDATE\b/i.test(sql)) return 'SELECT_FOR_UPDATE';
+      return 'OTHER';
+    });
   }
 
   /** 写库那条语句里是否出现 `INSERT`（RS-5 的「零写库」判据）。 */
   insertStatements() {
     return this.sqlLog.filter((s) => /\bINSERT\b/i.test(s.sql));
+  }
+
+  /** 事务必须钉在同一条连接上 ⇒ `pool.connect()` + `release()`（#698 的同形病根）。 */
+  connect() {
+    this.connectCount += 1;
+    const self = this;
+    return {
+      query: (sql, params) => self.query(sql, params),
+      release: () => { self.releaseCount += 1; },
+    };
   }
 }
 
@@ -257,7 +343,75 @@ test('RS-4 非法值回落 + 点名 warn：DB 行是字符串 "1e4" ⇒ 回落 e
 });
 
 // ---------------------------------------------------------------------------
-// 3. 写侧：严格 + 一条 SQL + 审计同生共死（口径 3 + 4 + 6）
+// 2b. 孤儿行：registry 不认的 key 必须说话（#677 返修 MED①）
+// ---------------------------------------------------------------------------
+
+test('RS-4b 孤儿行（库里有行但 registry 不认）⇒ problems 逐 key 点名 + 只聚合 warn 一次 + 不抛',
+  async () => {
+    // 真实可发生的形状：P3 逐批往 registry 加/删条目，**删完条目库里就剩孤儿行**。
+    // `SELECT_SQL` 是整表一次读 ⇒ 读到了就必须说话（旧实现只存进 rowByKey 从不遭提
+    // ⇒ 运维完全看不见，独立审计 MED①）。
+    const pool = new FakeRuntimePool({ rows: [
+      { key: 'demo.limit', value: 20 },
+      { key: 'ghost.old_limit', value: 3 },
+      { key: 'demo.removed_in_p3', value: 4 },
+    ] });
+    const log = collectingLog();
+    let threw = null;
+    const r = await readRuntimeSettings({
+      pool, registry: TEST_REGISTRY, timeoutMs: 200, env: {}, log,
+    }).catch((e) => { threw = e; return null; });
+
+    assert.equal(threw, null, '孤儿行不许把读侧弄抛（硬口径 1：配置面不承重）');
+    assert.deepEqual(
+      r.problems.filter((p) => p.reason === 'unknown_key').map((p) => p.key).sort(),
+      ['demo.removed_in_p3', 'ghost.old_limit'],
+      '两个孤儿 key 必须各进一条 problems（reason=unknown_key、**点名 key**）',
+    );
+    assert.deepEqual(Object.keys(r.values), ['demo.limit'],
+      '孤儿 key 不许出现在 values（它压根没登记 ⇒ 不生效）');
+    assert.equal(r.values['ghost.old_limit'], undefined, '同上，逐 key 钉住');
+    assert.deepEqual(
+      r.problems.filter((p) => p.key === 'demo.interval_ms').map((p) => p.reason), ['no_row'],
+      '登记项自己的理由不许被孤儿行污染（no_row 就是 no_row，不能碎成 unknown_key）',
+    );
+    assert.equal(log.seen.warn.length, 1,
+      `整张表只允许**一条**聚合 warn（实得 ${log.seen.warn.length} 条：${log.seen.warn.join(' | ')}）`);
+    assert.match(log.seen.warn[0], /ghost\.old_limit/, '聚合 warn 必须点到名');
+    assert.match(log.seen.warn[0], /demo\.removed_in_p3/, '两个 key 都要在里面');
+    assert.match(log.seen.warn[0], /2/, '必须报总数（运维要知道有多少行要清）');
+
+    // 覆盖层：孤儿行既不进 config，也不影响登记项那一格走 DB 值。
+    const out = await applyRuntimeOverrides({ demoLimit: 10 }, {
+      pool, registry: TEST_REGISTRY, timeoutMs: 200, env: {}, log: collectingLog(),
+    });
+    assert.equal(out.demoLimit, 20, '孤儿行不许干扰登记项走 DB 那一档');
+    assert.equal(out['ghost.old_limit'], undefined, '孤儿 key 不许被塞进 config');
+    // 只有 registry 声明过的两个 configPath 会被写（`demo.interval_ms` 无行 ⇒ 走默认 1000）。
+    assert.deepEqual(Object.keys(out).sort(), ['demo', 'demoLimit'], '覆盖层只动 registry 声明过的字段');
+    assert.ok(!JSON.stringify(out).includes('ghost'), '孤儿 key 连名字都不许出现在结果里');
+
+    // 聚合上限：孤儿很多时仍然只一条 warn，只列前 5 个 + 总数（一行一条就是刷屏）。
+    const many = new FakeRuntimePool({ rows: [
+      ...Array.from({ length: 7 }, (_, i) => ({ key: `ghost.k${i + 1}`, value: i })),
+      { key: 'demo.limit', value: 1 },
+    ] });
+    const manyLog = collectingLog();
+    const manyRead = await readRuntimeSettings({
+      pool: many, registry: TEST_REGISTRY, timeoutMs: 200, env: {}, log: manyLog,
+    });
+    assert.equal(manyRead.problems.filter((p) => p.reason === 'unknown_key').length, 7,
+      'problems 逐 key 一条不少（只有 warn 会聚合）');
+    assert.equal(manyLog.seen.warn.length, 1, '七个孤儿行也只许一条 warn');
+    const shown = manyLog.seen.warn[0].match(/ghost\.k\d/g) ?? [];
+    assert.equal(shown.length, 5,
+      `一条 warn 最多列 5 个 key（实得 ${shown.length}：${manyLog.seen.warn[0]}）`);
+    assert.match(manyLog.seen.warn[0], /7/, '但总数要说得出（7 行）');
+    assert.match(manyLog.seen.warn[0], /2 个未列出/, '未列出的个数也要说清');
+  });
+
+// ---------------------------------------------------------------------------
+// 3. 写侧：严格 + 一个事务 + 审计同生共死（口径 3 + 4 + 6）
 // ---------------------------------------------------------------------------
 
 test('RS-5 写侧严格：未知 key / 非 JSON 标量 / validate 不过 ⇒ 抛，且这三种都零 SQL（更不许发 INSERT）', async () => {
@@ -282,70 +436,121 @@ test('RS-5 写侧严格：未知 key / 非 JSON 标量 / validate 不过 ⇒ 抛
     assert.equal(err.code, code, `${name}：错误码必须是 ${code}，实得 ${err.code}`);
     assert.equal(err.httpStatus, 400, `${name}：必须映射成 400`);
     assert.equal(pool.queryCount, 0, `${name}：一条 SQL 都不许发（校验在发 SQL 之前）`);
+    assert.equal(pool.connectCount, 0, `${name}：也不许从池里借连接（事务都不能开）`);
     assert.deepEqual(pool.sqlLog, [], `${name}：sqlLog 必须空`);
     assert.deepEqual(pool.insertStatements(), [], `${name}：零写库（未登记的 key 落库就是永不生效的幽灵行）`);
   }
 });
 
-test('RS-6 写 = 一条 SQL：单次 pool.query，DTO 来自 RETURNING，审计与写同一条语句', async () => {
-  const pool = new FakeRuntimePool({
-    // 故意让 RETURNING 与输入不同 ⇒ DTO 取输入的话必红（口径 4：不信输入）。
-    returning: {
-      key: 'demo.limit', value: 4242,
-      updated_at: new Date('2026-11-19T00:00:00.000Z'),
-      updated_by: ACTOR, previous_value: 7, audit_rows: 1,
-    },
+test('RS-6 写 = 一个事务：BEGIN → FOR UPDATE 取旧值 → upsert → 审计 → COMMIT，DTO 来自 RETURNING',
+  async () => {
+    const pool = new FakeRuntimePool({
+      // 故意让 RETURNING 与输入不同 ⇒ DTO 取输入的话必红（口径 4：不信输入）。
+      returning: {
+        key: 'demo.limit', value: 4242,
+        updated_at: new Date('2026-11-19T00:00:00.000Z'),
+        updated_by: ACTOR,
+      },
+    });
+    const dto = await saveRuntimeSetting({
+      pool, actorId: ACTOR, key: 'demo.limit', value: 20, registry: TEST_REGISTRY, log: silentLog,
+    });
+
+    // ① 事务形状（硬口径 6）。旧版那格叫「写 = 一条 SQL」，口径已作废（#677 返修 MED②）。
+    assert.deepEqual(pool.roles(), ['BEGIN', 'SELECT_FOR_UPDATE', 'UPSERT', 'AUDIT', 'COMMIT'],
+      `保存必须是那五步（实得 ${JSON.stringify(pool.roles())}）—— 少一步就是「两个 await」或「自动提交」的洞`);
+    assert.equal(pool.connectCount, 1, '必须从池里借**一条**连接（pool.query 每次另借一条 ⇒ 锁会提前放）');
+    assert.equal(pool.releaseCount, 1, '连接必须归还（finally 里 release）');
+    assert.ok(!pool.roles().includes('ROLLBACK'), '成功路径不许回滚');
+
+    const byRole = (role) => pool.sqlLog[pool.roles().indexOf(role)];
+    const prev = byRole('SELECT_FOR_UPDATE');
+    const upsert = byRole('UPSERT');
+    const audit = byRole('AUDIT');
+    // ② 取旧值那条必须是**单独一条**带锁语句：旧版的 500 就是因为 `FOR UPDATE` 待在
+    //    含 data-modifying CTE 的语句里（真库上锁定读看不见本语句要改的那行）。
+    assert.match(prev.sql, /^\s*SELECT\b[\s\S]*\bFOR\s+UPDATE\s*$/i, '旧值必须是单独一条锁定读');
+    assert.doesNotMatch(prev.sql, /\bINSERT\b/i, '取旧值那条自己不许写库（写写在 UPSERT 里）');
+    assert.deepEqual(prev.params, ['demo.limit'], 'key 走参数，不拼 SQL 文本');
+    assert.ok(pool.roles().indexOf('SELECT_FOR_UPDATE') < pool.roles().indexOf('UPSERT'),
+      '锁必须在写之前拿（否则并发第二条不必等 ⇒ 旧值又是「自己进来之前」那个）');
+    // ③ upsert：单行 ON CONFLICT，且**不许带 `FOR UPDATE`**（那是要 500 的那个形状）。
+    for (const fragment of [
+      /INSERT\s+INTO\s+runtime_settings\b/i, /ON\s+CONFLICT\s*\(key\)\s+DO\s+UPDATE/i,
+      /RETURNING\b/i,
+    ]) {
+      assert.match(upsert.sql, fragment, `upsert 必须含 ${fragment}`);
+    }
+    assert.doesNotMatch(upsert.sql, /\bFOR\s+UPDATE\b/i,
+      'upsert 里不许出现 FOR UPDATE（真库上那会让旧值变成空集 ⇒ previous_value 恒 null）');
+    assert.equal(upsert.params[0], 'demo.limit', 'key 是第一个参数');
+    assert.equal(upsert.params[1], '20', '值以 JSON 文本 + `$2::jsonb` 送进去（SQL 侧不猜类型）');
+    assert.equal(upsert.params[2], ACTOR, 'actor 进 updated_by');
+    // ④ 审计：与写同一个事务（在 BEGIN…COMMIT 之间），action/target 不许漂。
+    assert.ok(pool.roles().indexOf('AUDIT') < pool.roles().indexOf('COMMIT'),
+      '审计必须在 COMMIT 之前（事务外写审计 = 「设置已生效而审计一行没有」那个窗口）');
+    assert.equal(audit.params[0], ACTOR, '审计的 actor_id');
+    assert.equal(audit.params[1], AUDIT_ACTION, '审计动作名必须是 admin.runtime_settings_updated');
+    assert.equal(audit.params[2], `${AUDIT_TARGET_PREFIX}:demo.limit`, '审计 target 点名到 key');
+    assert.deepEqual(JSON.parse(audit.params[3]),
+      { key: 'demo.limit', value: 4242, previous_value: null },
+      'details 三个键逐字不变，且 value 取 RETURNING 里那个（不信输入）');
+    assert.equal(pool.auditCommitted.length, 1, '提交后库里恰好一行审计');
+
+    // ⑤ DTO 来自 RETURNING，不是回显输入。
+    assert.equal(dto.value, 4242, 'DTO 的 value 来自 RETURNING（不是回显输入的 20）');
+    assert.equal(dto.key, 'demo.limit');
+    assert.equal(dto.updatedAt, '2026-11-19T00:00:00.000Z', 'Date 出参要成 ISO 字符串');
+    assert.equal(dto.updatedBy, ACTOR);
+    assert.equal(dto.previousValue, null, '无旧行 ⇒ previousValue 是 null（不是报错）');
+    assert.equal(dto.auditRows, 1);
+    assert.equal(pool.storedValue('demo.limit'), 4242, 'COMMIT 之后设置才真的落账');
   });
-  const dto = await saveRuntimeSetting({
-    pool, actorId: ACTOR, key: 'demo.limit', value: 20, registry: TEST_REGISTRY, log: silentLog,
+
+test('RS-6b 审计被抑制 ⇒ 抛 500 且**设置没落库**（检查在 COMMIT 之前，不许「报错但已生效」）',
+  async () => {
+    // 假库里的「审计被抑制」= 审计那句 rowCount 0（真库那一版是 BEFORE INSERT trigger
+    // `RETURN NULL`，见 RS-11）。关键是：抛错之外，**设置必须一格没改**。
+    const pool = new FakeRuntimePool({ auditRowCount: 0 });
+    const err = await saveRuntimeSetting({
+      pool, actorId: ACTOR, key: 'demo.limit', value: 20, registry: TEST_REGISTRY, log: silentLog,
+    }).then(() => null, (e) => e);
+    assert.ok(err, '审计 0 行必须抛（否则就是静默的「设置生效而审计无痕」）');
+    assert.ok(err instanceof RuntimeSettingsError, '必须是 RuntimeSettingsError');
+    assert.equal(err.code, 'internal', '它是内部不一致，不是用户输入错');
+    assert.equal(err.httpStatus, 500);
+    assert.equal(pool.storedValue('demo.limit'), undefined,
+      '设置必须一格没改（检查在 COMMIT **之前**；把检查挪到 COMMIT 之后就是 M-2 那一刀）');
+    assert.deepEqual(pool.auditCommitted, [], '审计也没落账');
+    assert.ok(!pool.roles().includes('COMMIT'),
+      `这条路径上**不许**出现 COMMIT（实得 ${JSON.stringify(pool.roles())}）`);
+    assert.deepEqual(pool.roles(),
+      ['BEGIN', 'SELECT_FOR_UPDATE', 'UPSERT', 'AUDIT', 'ROLLBACK'], '失败路径必须显式 ROLLBACK');
+    assert.equal(pool.releaseCount, 1, '报错也要把连接还回池子');
+
+    // RETURNING 空集（SQL 形状漂了）同样：抛 500 + 回滚 + 不落库。
+    const noRow = new FakeRuntimePool({ upsertReturnsRow: false });
+    const err2 = await saveRuntimeSetting({
+      pool: noRow, actorId: ACTOR, key: 'demo.limit', value: 20,
+      registry: TEST_REGISTRY, log: silentLog,
+    }).then(() => null, (e) => e);
+    assert.ok(err2, 'RETURNING 空集也必须抛');
+    assert.equal(err2.httpStatus, 500);
+    assert.equal(noRow.storedValue('demo.limit'), undefined, '同样不许落库');
+    assert.ok(!noRow.roles().includes('COMMIT'), '同样不许提交');
+
+    // 事务里某一步直接报错（驱动抛错）也要 ROLLBACK + 归还连接。
+    const boom = new FakeRuntimePool();
+    boom.query = ((orig) => (sql, params) => (/INSERT\s+INTO\s+audit_log\b/i.test(String(sql))
+      ? Promise.reject(new Error('boom')) : orig.call(boom, sql, params)))(boom.query);
+    const err3 = await saveRuntimeSetting({
+      pool: boom, actorId: ACTOR, key: 'demo.limit', value: 20,
+      registry: TEST_REGISTRY, log: silentLog,
+    }).then(() => null, (e) => e);
+    assert.equal(err3?.message, 'boom', '原错误必须原样往上招（不许被 ROLLBACK 盖掉）');
+    assert.equal(boom.releaseCount, 1, 'finally 里必须 release');
+    assert.equal(boom.storedValue('demo.limit'), undefined, '抛错那一档设置也没落库');
   });
-
-  assert.equal(pool.queryCount, 1, `保存必须只发一条 SQL，实发 ${pool.queryCount} 条`);
-  assert.equal(pool.selectCount, 0, '保存路径不该再单独发一次 SELECT（旧值在同一条语句里取）');
-  const { sql, params } = pool.sqlLog[0];
-  for (const fragment of [
-    /WITH\s+prev\s+AS\s*\(/i,                      // 旧值快照与写入同一条语句
-    /\bLEFT JOIN prev\b/i,                          // 首写无旧行也要有审计行
-    /INSERT\s+INTO\s+runtime_settings\b/i,               // upsert
-    /ON\s+CONFLICT\s*\(key\)\s+DO\s+UPDATE/i,            // 单行 upsert
-    /RETURNING\b/i,                                      // DTO 的来源
-    /INSERT\s+INTO\s+audit_log\b/i,                      // 审计与写同生共死
-  ]) {
-    assert.match(sql, fragment, `那条 SQL 必须含 ${fragment}（缺一样就退回"两个 await"的洞）`);
-  }
-  // `FOR UPDATE` 不许回来：在**含 data-modifying CTE 的语句里**，锁定读看不见本语句自己改的那行
-  // ⇒ `prev` 恒为空集 ⇒ `previous_value` 恒 null（真库实测，postgres:16.15，见 RS-11 与 SQL 上方注释）。
-  assert.doesNotMatch(sql, /\bFOR\s+UPDATE\b/i,
-    'prev 不许加 `FOR UPDATE`（真库上它会让旧值快照变成空集；要串行化请靠 ON CONFLICT 的行锁）');
-  assert.equal(params[0], ACTOR, 'actor 是第一个参数（审计的 actor_id）');
-  assert.equal(params[1], 'demo.limit', 'key 作为参数送进去（不拼 SQL 文本）');
-  assert.equal(params[2], '20', '值以 JSON 文本 + `$3::jsonb` 送进去（SQL 侧不猜类型）');
-  assert.equal(params[3], AUDIT_ACTION, '审计动作名必须是 admin.runtime_settings_updated');
-  assert.equal(params[4], `${AUDIT_TARGET_PREFIX}:demo.limit`, '审计 target 点名到 key');
-
-  assert.equal(dto.value, 4242, 'DTO 的 value 来自 RETURNING（不是回显输入的 20）');
-  assert.equal(dto.key, 'demo.limit');
-  assert.equal(dto.updatedAt, '2026-11-19T00:00:00.000Z', 'Date 出参要成 ISO 字符串');
-  assert.equal(dto.updatedBy, ACTOR);
-  assert.equal(dto.previousValue, 7, '旧值也来自同一条语句的快照');
-});
-
-test('RS-6b 审计行不为 1 ⇒ 抛（审计与设置同生共死，不许"设置生效而审计没写"）', async () => {
-  const pool = new FakeRuntimePool({ auditRows: 0 });
-  const err = await saveRuntimeSetting({
-    pool, actorId: ACTOR, key: 'demo.limit', value: 20, registry: TEST_REGISTRY, log: silentLog,
-  }).then(() => null, (e) => e);
-  assert.ok(err, 'audit_rows=0 必须抛（那条 CTE 存在的理由就是这件事不可表示）');
-  assert.equal(err.httpStatus, 500, '它是内部不一致，不是用户输入错');
-
-  const noRow = new FakeRuntimePool({ returning: null, auditRows: 0 });
-  noRow.returning = undefined;
-  const err2 = await saveRuntimeSetting({
-    pool: { query: () => Promise.resolve({ rows: [] }) },
-    actorId: ACTOR, key: 'demo.limit', value: 20, registry: TEST_REGISTRY, log: silentLog,
-  }).then(() => null, (e) => e);
-  assert.ok(err2, 'RETURNING 空集也必须抛（语句级原子被破坏的形状）');
-});
 
 // ---------------------------------------------------------------------------
 // 4. P1 的边界：一格未迁、迁移形状、serve() 接线、超时旋钮
@@ -470,86 +675,194 @@ test('RS-10 读侧超时旋钮：RUNTIME_SETTINGS_READ_TIMEOUT_MS 只收正整�
 // ---------------------------------------------------------------------------
 // 5. 真库那一腿（RS-11）：只有真的 postgres 才能给的答案
 //
-// 为什么必须有这一格（2026-11-19 实测，不是假想敌）：`SAVE_SQL` 里那句 `prev` 原先照 0036 带了
+// 为什么必须有这一格（2026-11-19 实测，不是假想敌）：旧实现的 `prev` 原先照 0036 带了
 // `FOR UPDATE`。**fake pool 里全绿**（它按 SQL 文本分支，不会模拟 PG 的可见性规则），而真库上
 // 「一条含 data-modifying CTE 的语句里，锁定读看不见本语句自己改的那一行」⇒ `prev` 恒空集
-// ⇒ `previous_value` 恒 `null`（0036 那个形状的主查询还是内连接 ⇒ 整条语句零行返回）。
-// ⇒ 「旧值必须来自同一语句的快照」这条口径在真机上其实**没成立**，而单测看不见。
-// 这一格就是那条判据的常驻版本（无 PG 时整体 skip，不参与假通过）。
+// ⇒ `previous_value` 恒 `null`。⇒ 「旧值必须拿得到锁」这条口径在真机上其实**没成立**，而单测看不见。
+//
+// 本轮返修（MED②）把写侧从「一条语句」改成「一个显式事务」后，真库那一腿多丁两件 fake
+// 给不出的事（两件都是本单的灵魂，fake 只能下形状闸）：
+//   * ⑦ **审计被静默抑制 ⇒ 抛 500 且 `runtime_settings` 的值一格没改**（BEFORE INSERT trigger
+//     `RETURN NULL`）。这是 MED② 从「理论」变成「机器判据」的那一步：在旧实现（检查在语句
+//     返回之后 = 已提交之后）上跑这一格必红 —— 审计审计抑制而设置照旧生效。
+//   * ⑧ **`FOR UPDATE` 单独一条语句真的拿得到行锁**（拦路连接占住那一行 ⇒ 保存必须卡住）。
+//     fake 不模拟 MVCC ⇒ 它只能断言「SQL 里有 FOR UPDATE」，锁不锁得住只有真库能判。
+// 无 PG 时整体 skip，不参与假通过。
 // ---------------------------------------------------------------------------
 
-test('RS-11 真库：写=一条语句真的落库 + previous_value 是真旧值 + 审计恰好一行 + key CHECK 真挡人',
+test('RS-11 真库：写=一个事务真的落库 + previous_value 是真旧值 + 审计被抑制则设置不回滚不了'
+  + ' + 行锁真的拦人 + key CHECK 真挡人',
   { skip: PG_SKIP }, async () => {
     assert.ok(pgFixture, 'TEST_DATABASE_URL 给了却没有夹具');
     // 夹具自己建库、跑完整条迁移链（含 0046）、并把迁移好的 pool 交进来；收尾它负责。
+    // poolMax=3 是为了⑧：拦路连接 + 被检的保存之外还要留一条**空余连接**，否则「保存卡住」
+    // 可能只是卡在**池子排队**上而不是卡在行锁上（那就是假绿）。
     await pgFixture.withFreshDatabase(async ({ pool }) => {
-        const table = await pool.query(`SELECT to_regclass('public.runtime_settings') AS reg`);
-        assert.notEqual(table.rows[0].reg, null, '迁移链跑完 runtime_settings 必须存在');
-        const cols = await pool.query(
-          `SELECT column_name, data_type FROM information_schema.columns
-            WHERE table_name = 'runtime_settings' ORDER BY ordinal_position`);
-        assert.deepEqual(
-          cols.rows.map((r) => `${r.column_name}:${r.data_type}`),
-          ['key:text', 'value:jsonb', 'updated_at:timestamp with time zone', 'updated_by:uuid'],
-          '表形必须是 key-value + jsonb（P3 加旋钮 = 一条 INSERT，零 DDL）',
-        );
+      const table = await pool.query(`SELECT to_regclass('public.runtime_settings') AS reg`);
+      assert.notEqual(table.rows[0].reg, null, '迁移链跑完 runtime_settings 必须存在');
+      const cols = await pool.query(
+        `SELECT column_name, data_type FROM information_schema.columns
+          WHERE table_name = 'runtime_settings' ORDER BY ordinal_position`);
+      assert.deepEqual(
+        cols.rows.map((r) => `${r.column_name}:${r.data_type}`),
+        ['key:text', 'value:jsonb', 'updated_at:timestamp with time zone', 'updated_by:uuid'],
+        '表形必须是 key-value + jsonb（P3 加旋钮 = 一条 INSERT，零 DDL）',
+      );
 
-        // ① 首写（表里没有那一行）：审计必须**照写**（`LEFT JOIN prev` 的存在理由）。
-        const first = await saveRuntimeSetting({
-          pool, actorId: null, key: 'demo.limit', value: 20, registry: TEST_REGISTRY, log: pgSilent,
-        });
-        assert.equal(first.value, 20, 'RETURNING 回的就是刚写入的值');
-        assert.equal(first.previousValue, null, '首写没有旧值 ⇒ null（不是报错）');
-        assert.equal(await auditCount(pool), 1, '首写也必须留下一行审计');
+      // ① 首写（表里没有那一行）：审计必须**照写**（事务里 `PREVIOUS_SQL` 大然空集 ⇒
+      //    `previous_value` 记 null，而不是「没旧行就没审计」）。审计行数 1 现在来自
+      //    `INSERT … rowCount`（不再来自 CTE 里那个 count）。
+      const first = await saveRuntimeSetting({
+        pool, actorId: null, key: 'demo.limit', value: 20, registry: TEST_REGISTRY, log: pgSilent,
+      });
+      assert.equal(first.value, 20, 'RETURNING 回的就是刚写入的值');
+      assert.equal(first.previousValue, null, '首写没有旧值 ⇒ null（不是报错）');
+      assert.equal(first.auditRows, 1, 'rowCount 就是 1（检查在 COMMIT 之前拿到的那个数）');
+      assert.equal(await auditCount(pool), 1, '首写也必须留下一行审计');
 
-        // ② 再写：`previous_value` 必须是**真旧值**。这一条就是 fake pool 测不出来的那个洞。
-        const second = await saveRuntimeSetting({
-          pool, actorId: null, key: 'demo.limit', value: 31, registry: TEST_REGISTRY, log: pgSilent,
-        });
-        assert.equal(second.value, 31, 'upsert 走的是 DO UPDATE（库里只有一行）');
-        assert.equal(second.previousValue, 20,
-          'previous_value 必须是紧邻的前一个值 20（拿到 null = prev 又变成空集 = FOR UPDATE 回来了）');
-        assert.equal(await auditCount(pool), 2, '两次保存 = 两行审计（一条不多一条不少）');
-        const only = await pool.query('SELECT count(*)::int AS n FROM runtime_settings');
-        assert.equal(only.rows[0].n, 1, '同一 key 两次保存只许有一行（ON CONFLICT (key) 生效）');
+      // ② 再写：`previous_value` 必须是**真旧值**。这一条就是 fake pool 测不出来的那个洞
+      //    （旧版靠 `prev` CTE 拿，带锁就恒 null；现在靠事务里单独一条锁定读）。
+      const second = await saveRuntimeSetting({
+        pool, actorId: null, key: 'demo.limit', value: 31, registry: TEST_REGISTRY, log: pgSilent,
+      });
+      assert.equal(second.value, 31, 'upsert 走的是 DO UPDATE（库里只有一行）');
+      assert.equal(second.previousValue, 20,
+        'previous_value 必须是紧邻的前一个值 20（拿到 null = 锁定读又变成空集）');
+      assert.equal(await auditCount(pool), 2, '两次保存 = 两行审计（一条不多一条不少）');
+      const auditChain = await pool.query(
+        `SELECT details ->> 'previous_value' AS prev, details -> 'value' AS val
+           FROM audit_log WHERE action = $1 ORDER BY id`, [AUDIT_ACTION]);
+      // jsonb 的 `null` 经 `->>` 出来就是 SQL NULL（node-pg 给 JS null）—— 不是“没这个键”。
+      assert.deepEqual(auditChain.rows.map((r) => r.prev), [null, '20'],
+        '审计里的 previous_value 必须与接口返回的同一个数（首写 null，次写 20）');
+      assert.deepEqual(auditChain.rows.map((r) => r.val), [20, 31],
+        'details.value 取的是 RETURNING 里那个（jsonb 直接给 JS 数）');
+      const only = await pool.query('SELECT count(*)::int AS n FROM runtime_settings');
+      assert.equal(only.rows[0].n, 1, '同一 key 两次保存只许有一行（ON CONFLICT (key) 生效）');
 
-        // ③ 读侧 + 覆盖层：真库上的 jsonb 值（这里 node-pg 直接给 JS number）。
-        const read = await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: pgSilent });
-        assert.deepEqual(read.values, { 'demo.limit': 31 }, '读侧拿到的是真库里的 jsonb 值');
-        assert.deepEqual(read.problems, [{ key: 'demo.interval_ms', reason: 'no_row' }],
-          '有行且合法的那格不许报问题；**没行**的那格必须报 no_row（未配置是常态 ⇒ 只登记不 warn）');
-        const cfg = await applyRuntimeOverrides({ demoLimit: 10 }, { pool, registry: TEST_REGISTRY, log: pgSilent });
-        assert.equal(cfg.demoLimit, 31, '覆盖层在真库上也是 DB > env');
+      // ③ 读侧 + 覆盖层：真库上的 jsonb 值（这里 node-pg 直接给 JS number）。
+      const read = await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: pgSilent });
+      assert.deepEqual(read.values, { 'demo.limit': 31 }, '读侧拿到的是真库里的 jsonb 值');
+      assert.deepEqual(read.problems, [{ key: 'demo.interval_ms', reason: 'no_row' }],
+        '有行且合法的那格不许报问题；**没行**的那格必须报 no_row（未配置是常态 ⇒ 只登记不 warn）');
+      const cfg = await applyRuntimeOverrides({ demoLimit: 10 },
+        { pool, registry: TEST_REGISTRY, log: pgSilent });
+      assert.equal(cfg.demoLimit, 31, '覆盖层在真库上也是 DB > env');
 
-        // ④ 手工绕过写侧塞一个非法值 ⇒ 读侧必须回落并点名（这一条在真机上要真的能进去，
-        //    所以才刻意**没**给 value 写值域 CHECK，见迁移 0046 头注释）。
-        await pool.query(`UPDATE runtime_settings SET value = '\"1e4\"'::jsonb WHERE key = 'demo.limit'`);
-        const badLog = collectingLog();
-        const bad = await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: badLog });
-        assert.deepEqual(bad.values, {}, '"1e4" 不许被收成 1');
-        assert.equal(bad.problems[0].reason, 'not_a_count', '回落理由要点名');
-        assert.match(badLog.seen.warn[0], /demo\.limit/, 'warn 要点名 key');
-        assert.equal(
-          (await applyRuntimeOverrides({ demoLimit: 10 }, { pool, registry: TEST_REGISTRY, log: pgSilent })).demoLimit,
-          10, '非法值 ⇒ 回落 env（真库版）');
-        await pool.query(`UPDATE runtime_settings SET value = '{\"a\":1}'::jsonb WHERE key = 'demo.limit'`);
-        assert.deepEqual((await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: pgSilent })).values, {},
-          'jsonb 里是对象 ⇒ 同样判非法（口径 3 的读侧对应面）');
+      // ③b 孤儿行在真库上也必须说话（MED① 的读侧判据）：手工塞一行 registry 不认的 key。
+      await pool.query(
+        `INSERT INTO runtime_settings (key, value) VALUES ('ghost.old_limit', '9'::jsonb)`);
+      const orphanLog = collectingLog();
+      const orphan = await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: orphanLog });
+      assert.deepEqual(
+        orphan.problems.filter((p) => p.reason === 'unknown_key').map((p) => p.key),
+        ['ghost.old_limit'], '真库上的孤儿行也必须进 problems 并点名 key');
+      assert.equal(orphanLog.seen.warn.length, 1, '只聚合 warn 一次');
+      assert.match(orphanLog.seen.warn[0], /ghost\.old_limit/, 'warn 点名 key');
+      assert.equal(orphan.values['ghost.old_limit'], undefined, '孤儿行进不了 values（不生效）');
+      await pool.query(`DELETE FROM runtime_settings WHERE key = 'ghost.old_limit'`);
 
-        // ⑤ key 形状是 DB 事实：拼错/大写的 key 当场被 CHECK 拒（不是静默多出一行幽灵配置）。
-        const rejected = await pool
-          .query(`INSERT INTO runtime_settings (key, value) VALUES ('X', '1'::jsonb)`)
-          .then(() => null, (e) => e);
-        assert.ok(rejected, '坏 key 必须被拒');
-        assert.equal(rejected.code, '23514', `坏 key 应触发 check_violation(23514)，实得 ${rejected.code}`);
+      // ④ 手工绕过写侧塞一个非法值 ⇒ 读侧必须回落并点名（这一条在真机上要真的能进去，
+      //    所以才刻意**没**给 value 写值域 CHECK，见迁移 0046 头注释）。
+      await pool.query(
+        `UPDATE runtime_settings SET value = '\"1e4\"'::jsonb WHERE key = 'demo.limit'`);
+      const badLog = collectingLog();
+      const bad = await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: badLog });
+      assert.deepEqual(bad.values, {}, '"1e4" 不许被收成 1');
+      assert.equal(bad.problems[0].reason, 'not_a_count', '回落理由要点名');
+      assert.match(badLog.seen.warn[0], /demo\.limit/, 'warn 要点名 key');
+      assert.equal(
+        (await applyRuntimeOverrides({ demoLimit: 10 },
+          { pool, registry: TEST_REGISTRY, log: pgSilent })).demoLimit,
+        10, '非法值 ⇒ 回落 env（真库版）');
+      await pool.query(
+        `UPDATE runtime_settings SET value = '{\"a\":1}'::jsonb WHERE key = 'demo.limit'`);
+      assert.deepEqual(
+        (await readRuntimeSettings({ pool, registry: TEST_REGISTRY, log: pgSilent })).values, {},
+        'jsonb 里是对象 ⇒ 同样判非法（口径 3 的读侧对应面）');
 
-        // ⑥ 迁移可整体重放：再跑一遍 0046 的 SQL，表与行数都不许变。
-        const mig = fs.readFileSync(
-          new URL('../../deploy/migrations/0046-runtime-settings.sql', import.meta.url), 'utf8');
-        await pool.query(mig);
-        assert.equal((await pool.query('SELECT count(*)::int AS n FROM runtime_settings')).rows[0].n, 1,
-          '重放 0046 不许多出/丢掉任何一行');
-    });
+      // ⑤ key 形状是 DB 事实：拼错/大写的 key 当场被 CHECK 拒（不是静默多出一行幽灵配置）。
+      const rejected = await pool
+        .query(`INSERT INTO runtime_settings (key, value) VALUES ('X', '1'::jsonb)`)
+        .then(() => null, (e) => e);
+      assert.ok(rejected, '坏 key 必须被拒');
+      assert.equal(rejected.code, '23514', `坏 key 应触发 check_violation(23514)，实得 ${rejected.code}`);
+
+      // ⑥ 迁移可整体重放：再跑一遍 0046 的 SQL，表与行数都不许变。
+      const mig = fs.readFileSync(
+        new URL('../../deploy/migrations/0046-runtime-settings.sql', import.meta.url), 'utf8');
+      await pool.query(mig);
+      const after = await pool.query('SELECT count(*)::int AS n FROM runtime_settings');
+      assert.equal(after.rows[0].n, 1, '重放 0046 不许多出/丢掉任何一行');
+
+      // ⑦ **本单的灵魂（MED②）**：审计被静默抑制 ⇒ 抛 500 且**设置一格没改**。
+      //    `BEFORE INSERT … RETURN NULL` 是 PG 里最静默的抑制方式（不报错，就是那一行消失了），
+      //    旧实现（单语句 + 语句返回后才检查）在这一格上是「报错但设置已生效」。
+      const valueBefore = (await pool.query(
+        `SELECT value FROM runtime_settings WHERE key = 'demo.limit'`)).rows[0].value;
+      const auditsBefore = await auditCount(pool);
+      await pool.query(`CREATE FUNCTION w677_suppress_audit() RETURNS trigger AS $$
+         BEGIN RETURN NULL; END $$ LANGUAGE plpgsql`);
+      await pool.query(`CREATE TRIGGER w677_audit_suppressed BEFORE INSERT ON audit_log
+         FOR EACH ROW EXECUTE FUNCTION w677_suppress_audit()`);
+      try {
+        const armed = await pool.query(
+          `SELECT count(*)::int AS n FROM pg_trigger WHERE tgname = 'w677_audit_suppressed'`);
+        assert.equal(armed.rows[0].n, 1, 'trigger 没装上 ⇒ 下面那堆断言是在空转');
+        const err = await saveRuntimeSetting({
+          pool, actorId: null, key: 'demo.limit', value: 77, registry: TEST_REGISTRY, log: pgSilent,
+        }).then(() => null, (e) => e);
+        assert.ok(err, '审计被抑制必须抛（否则就是静默的「设置生效而审计无痕」）');
+        assert.ok(err instanceof RuntimeSettingsError, '必须是 RuntimeSettingsError');
+        assert.equal(err.httpStatus, 500, `必须映射 500，实得 ${err.httpStatus}`);
+        assert.equal(err.code, 'internal', `code 必须是 internal，实得 ${err.code}`);
+        assert.match(err.message, /审计写了 0 行/, `错误要说出写了 0 行，实得：${err.message}`);
+        const valueAfter = (await pool.query(
+          `SELECT value FROM runtime_settings WHERE key = 'demo.limit'`)).rows[0].value;
+        assert.deepEqual(valueAfter, valueBefore,
+          `设置必须一格没改（ROLLBACK 生效）：前 ${JSON.stringify(valueBefore)}`
+          + ` 后 ${JSON.stringify(valueAfter)}（旧实现这里是 77 ⇒ MED② 的洞）`);
+        assert.equal(await auditCount(pool), auditsBefore,
+          '审计一行也不许多出（被抑制的那笔不许“补”在事务外）');
+      } finally {
+        await pool.query(
+          'DROP TRIGGER IF EXISTS w677_audit_suppressed ON audit_log').catch(() => {});
+        await pool.query('DROP FUNCTION IF EXISTS w677_suppress_audit()').catch(() => {});
+      }
+      assert.equal((await pool.query(
+        `SELECT count(*)::int AS n FROM pg_trigger WHERE tgname = 'w677_audit_suppressed'`))
+        .rows[0].n, 0, '测完必须拆干净（否则后面每一格都写不进审计）');
+
+      // ⑧ `FOR UPDATE` 单独一条语句**真的拦人**：拿另一条连接占住那一行，保存必须卡住
+      //    （fake 不模拟 MVCC，只能验 SQL 里有这几个字；锁住与不锁住只有真库能分）。
+      await pool.query(`UPDATE runtime_settings SET value = '20'::jsonb WHERE key = 'demo.limit'`);
+      const blocker = await pool.connect();
+      let pending = true;
+      let outcome = null;
+      try {
+        await blocker.query('BEGIN');
+        await blocker.query(
+          `SELECT value FROM runtime_settings WHERE key = 'demo.limit' FOR UPDATE`);
+        const saving = saveRuntimeSetting({
+          pool, actorId: null, key: 'demo.limit', value: 40, registry: TEST_REGISTRY, log: pgSilent,
+        }).then((r) => { pending = false; outcome = { ok: r }; },
+          (e) => { pending = false; outcome = { err: e }; });
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        assert.ok(pending,
+          '别人持有那一行的行锁时，保存必须还卡着（拿不到锁 = 旧值会是「自己进来之前」那个 ⇒ '
+          + '#698 的审计链洞；卡住也证明 poolMax 够用，不是卡在池子排队）');
+        await blocker.query('COMMIT');
+        await saving;
+        assert.ok(outcome?.ok, `放行后保存必须成功，实得 ${JSON.stringify(outcome?.err?.message)}`);
+        assert.equal(outcome.ok.previousValue, 20,
+          '放行后读到的旧值必须是锁里最新已提交的那一个（20）');
+        assert.equal(outcome.ok.value, 40);
+        assert.equal(await auditCount(pool), auditsBefore + 1, '放行后那一笔审计正常落下');
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => {});
+        blocker.release();
+      }
+    }, { poolMax: 3 });
   });
 
 /** 本单那个动作的审计行数（RS-11 用；别的动作的审计行不算进来）。 */
