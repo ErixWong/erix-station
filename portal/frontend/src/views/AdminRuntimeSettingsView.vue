@@ -12,7 +12,11 @@
 //   ③ 前端**不抢服务端的闸**：解析得出整数就照发（哪怕越界），由 `400 validation_failed` +
 //      `details.field` 回来标红；解析不出整数才不发请求。所以这里**没有** min/max 之类的区间校验。
 //   ④ `value` 是 `null`（服务端没给/给了不认识的形状）⇒ 显示「未知」，**不是 0**（#390-A 纪律）。
-//   ⑤ 一行的错误只标那一行：`details.field='value'` 落在被按下的那一行的输入框上，别跟着抖。
+//   ⑤ 错误**按 `details.field` 归到唯一一处**（§4.21，与 `AdminUploadView` 的 `maxFileBytes` 同口径）：
+//      `field='value'` ⇒ 只落在被按下的那一行（那一行的输入框标红 + 那一行下面一句文案）；
+//      `field='key'` / `'body'` 以及**认不出 field 的错误** ⇒ 只落在整页那一行。同一句错**只出一次**，
+//      不许既挂在那一行又写进整页（#702 review 的 LOW：两处同时渲染 ⇒ 用户看到同一句错两次，
+//      而"整页一行"的定位被那一行的红框削弱）。归属由 `rowError()` 一处决定，别处只消费结果。
 import { computed, onMounted, reactive, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useAdminStore } from '../stores/admin';
@@ -84,29 +88,40 @@ function updatedAtText(item: RuntimeSettingItem): string {
 }
 
 // ── 每行的错误 / 成功态 ─────────────────────────────────────────────────────────
-/** 这一行有没有错误：只有**被按下的那一行**才有（别的行什么都没做过）。 */
+/**
+ * 这一行的行内错误 —— **唯一的 field 分派点**。
+ *
+ * 两个条件缺一不可：
+ *   · `details.field === 'value'`：服务端（或本层的"不是整数"）明说错在**值**里 ⇒ 那才是这一行的框；
+ *     `key` / `body` / 认不出 field 的错误跟某个输入框无关，一律走整页那一行（`pageFieldError`）。
+ *   · 且它必须是**被按下的那一行**：`runtimeSaveField` 只说"错在值里"，不说错在哪一行。
+ *
+ * ⚠ `rowInvalid()` 与模板里的行文案都只读这个函数的结果 ⇒ 分派口径只有一处，改这里就够。
+ */
 function rowError(item: RuntimeSettingItem): string | null {
+  if (admin.runtimeSaveField !== 'value') return null;
   if (attemptKey.value !== item.key) return null;
   return admin.runtimeSaveErr;
 }
 
-/** 输入框标红的条件：错误确实指向"值"这一档（`key`/`body` 不是这一行的框错了）。 */
+/** 输入框标红：与行内文案同一个判据（错误归这一行 ⇒ 框才红）。 */
 function rowInvalid(item: RuntimeSettingItem): boolean {
-  return rowError(item) !== null && admin.runtimeSaveField === 'value';
+  return rowError(item) !== null;
 }
 
 /**
- * `key` / `body` 级的错误：它不是某个输入框的错，但也不该静默 ⇒ 单独一行点名服务端指的是哪一处。
- * `value` 级由那一行的红框 + 文案承担，这里不再重复一遍。
+ * 整页那一行的错误：`key` / `body` / **认不出 field** 的保存错误（`value` 级由那一行承担，这里不重复）。
+ * 认不出 field 时不拼"错在：xxx"那句 —— 不知道是哪一处就别假装知道，但这句话**不许丢**
+ * （`admin.ts` 里 `runtimeSaveField` 的注释早就写了「null ⇒ 退化成整页一条」，之前渲染层没做到）。
  */
 const pageFieldError = computed<string | null>(() => {
   const err = admin.runtimeSaveErr;
   if (err === null || attemptKey.value === null) return null;
-  if (admin.runtimeSaveField === 'value' || admin.runtimeSaveField === null) return null;
+  if (admin.runtimeSaveField === 'value') return null;
   const field = admin.runtimeSaveField === 'key'
     ? t('admin.runtime.fieldKey')
-    : t('admin.runtime.fieldBody');
-  return `${err}${t('admin.runtime.fieldPointed', { field })}`;
+    : admin.runtimeSaveField === 'body' ? t('admin.runtime.fieldBody') : null;
+  return field === null ? err : `${err}${t('admin.runtime.fieldPointed', { field })}`;
 });
 
 /** 保存按钮的禁用条件：没加载完 / 有别的旋钮在写 / 这一格草稿解析不出整数。 */
