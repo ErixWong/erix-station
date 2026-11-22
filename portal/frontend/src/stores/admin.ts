@@ -380,10 +380,13 @@ export const useAdminStore = defineStore('admin', {
     runtimeSettingsLoaded: false, // 「还没请求」与「服务端说 registry 里没东西」是两件事
     runtimeSettingsLoading: false,
     runtimeSettingsErr: null as string | null,
-    // **正在保存的 key**（不是布尔）：每行一颗保存按钮，禁用与转圈都只该落在被按下的那一行。
+    // **最近一次在写 / 刚写完的 key**（不是布尔）：每行一颗保存按钮，转圈与「已保存」只落在被按下的
+    // 那一行；禁用是**整页**的（`runtimeSaving !== null` ⇒ 所有行的按钮全禁，见视图 `saveDisabled`）。
     runtimeSaving: null as string | null,
     runtimeSaveErr: null as string | null,
-    // 400 的 `details.field`（§4.21：`key`/`value`/`body`）；null = 认不出是哪一处，退化成整页一条。
+    // 400 的 `details.field`（§4.21：`key`/`value`/`body`），本层只**如实转记**服务端说的那一处，
+    // 不自己猜；null = 认不出是哪一处。**归属在渲染层分派**（`AdminRuntimeSettingsView` 的 `rowError`）：
+    // `value` ⇒ 只标被尝试那一行；`key` / `body` / null ⇒ 只走整页一行，不重复出现在两处。
     runtimeSaveField: null as RuntimeSettingField | null,
     // 最近一次**成功**保存的 key（页面据此只在那一行显示「已保存」）。
     runtimeSavedKey: null as string | null,
@@ -998,6 +1001,9 @@ export const useAdminStore = defineStore('admin', {
      *   · 解析得出整数就**照发**，越界不提前拦（服务端才是闸，§4.21 与 §4.15 / §4.19 同口径）。
      *   · 成功 ⇒ 用**响应 DTO** 回填那一行（它出自 `RETURNING` ⇒ 是真落库的值，不是回显输入）；
      *     响应里没有 `item` ⇒ 不回填不报成功，宁可说一句「没回数据」。
+     *
+     * 失败时本层只记下 `details.field`（哪一处），**不决定它显示在哪**：那一行还是整页一行，
+     * 是渲染层按 field 分派的事（#702 review 的 LOW 就出在渲染层曾经两处同时渲染）。
      */
     async saveRuntimeSetting(key: string, draft: string): Promise<string | null> {
       // 已有旋钮在写 ⇒ 本次直接不做（**先判后清**：否则一次被丢弃的调用会把在写那一次的
