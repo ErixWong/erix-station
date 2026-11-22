@@ -782,55 +782,110 @@ function resolveEnvTier(entry, config, { env = process.env, log = console } = {}
 const DB_READ_FAILURE_REASONS = new Set(['read_failed', 'read_timeout', 'no_pool']);
 
 /**
+ * 一次**热读**的 warn 合并器（#701 二审 LOW②）：这一趟里下游想 warn 的东西先攒着，
+ * 出去之前**最多播一条**。
+ *
+ * 为什么必须有（二审实测的形状）：DB 读失败（`read_failed`）**叠加** `SESSION_TTL_SECONDS`
+ * 是坏值时，一次热读原本 warn **三条** —— `readRuntimeSettings` 一条「读 runtime_settings 失败」
+ * + `sessionTtlFlight` 的回落算一条「env 兜底被拒」+ 外层接住 `read_unavailable` 后又算一条
+ *（同一条文案的第二份，内容逐字相同）。DB 抖动期间**每个请求**都走这条路（缓存里钉着的就是
+ * 回落值，5s 到点又来一趟）⇒ 刷屏；而 `docs/api/portal.md` §4.21 与 `docs/env.md` 的口径是
+ * 「坏 env 留**一条**点名 warn」。
+ *
+ * **选「合并成一条」而不是「把 env 那条降成 debug」**：要的那一条必须**同时**说清两件事
+ *（DB 侧为什么没读到 + env 那个值为什么被拒）。降 debug 只会留下 DB 那条文案 ⇒ 运维看不见
+ * env 那一档也坏了 = 少一半真相（#485 立的「回落要点名是哪一档没生效」口径）。
+ *
+ * ⚠ 只有一件事要说时**原文照播**（不改既有文案：RS-13 ② / RS-21 钉的就是那两条的原话）。
+ * ⚠ 攒的范围只有**这一趟**：局部对象，不跨请求、不跨 pool，也不是进程级 once（下一趟该说还得说）。
+ */
+function hotReadWarnMerger(log) {
+  const pieces = [];
+  return {
+    /** 喂给下游（`readRuntimeSettings` / `resolveEnvTier`）：debug 原样转，warn 先攒着不直接落。 */
+    log: {
+      debug: (m) => log?.debug?.(m),
+      warn: (m) => { pieces.push(String(m)); },
+      error: (m) => { pieces.push(String(m)); },
+    },
+    /** 这一趟唯一的那条 warn：0 件不播；1 件原文播；≥2 件拼成一条（每件的原话都在）。 */
+    emit() {
+      if (pieces.length === 0) return;
+      if (pieces.length === 1) { log?.warn?.(pieces[0]); return; }
+      const body = pieces.map((m, i) => `${i + 1}) ${m.replace(/^\[runtime-settings\]\s*/, '')}`);
+      log?.warn?.(
+        `[runtime-settings] 这一次 session TTL 热读同时撞上有 ${pieces.length} 件事，合成一条`
+        + '（逐条播就是刷屏：DB 抖动期每个请求都走这条路）⇒ ' + body.join(' ；'),
+      );
+    },
+  };
+}
+
+/**
  * 一趟**真的发了 SQL** 的读（in-flight 合并的最小单位）：读整表 → 取 `session.ttl_seconds`
  * → 按代际号回填缓存。**口径 1 不变**：这一趟算不出值时照样给回落值。
  *
  * 它**会抛**一支「DB 读不可用」（唯一的抛点，在缓存回填**之后**）：
- *   * 抛给外层 ⇒ 外层按「读不到」回落（与以前完全同形的 warn/debug 与返回值）；
+ *   * 抛给外层 ⇒ 外层按「读不到」回落（返回值与 debug 形状不变；warn 的形状见上面那个合并器）；
  *   * 更重要的是让 in-flight 槽知道「这一趟是**失败落定**」，从而在失败路径上也清槽。
  *     不抛的话「失败」与「成功」在槽看来同形 ⇒ 「失败必清槽」退化成「跑完了顺手清」，
  *     RS-19 那一格就红不了（变异 M-2 会绿着过）。
+ *
+ * ⚠ #701 二审 LOW②：这一趟的 warn **最多一条**（`hotReadWarnMerger`），并且算好的回落值挂在
+ *   抛出的错误的 `details.fallbackSeconds` 上 —— 外层与共享者**复用**它，不再自己重算一遍
+ *   env 闸（重算一遍 = 同一条 env warn 的第二份，也正是那半条刷屏的来源）。
  */
 async function sessionTtlFlight({
   pool, config, now, log, env, registry, entry, timeoutMs,
 }) {
   const generationAtStart = sessionTtlCacheGeneration;
   const at = now();
+  const warns = hotReadWarnMerger(log);
   const fallback = () => {
     // env 那一档也要过 registry 的闸（LOW③）：坏值 ⇒ 视为没给 ⇒ registry 默认 + 点名 warn。
-    const value = resolveEnvTier(entry, config, { env, log }).value;
+    const value = resolveEnvTier(entry, config, { env, log: warns.log }).value;
     return value === undefined ? SESSION_TTL_DEFAULT_SECONDS : value;
   };
   let value;
   let readUnavailable = null;
   try {
-    // 复用整表那一次读（同一份 SQL、同一份超时、同一份永不抛口径）——不另开一条 per-key 的 SELECT。
-    const { values, problems } = await readRuntimeSettings({ pool, registry, timeoutMs, env, log });
-    const dbValue = values?.[SESSION_TTL_KEY];
-    if (Number.isSafeInteger(dbValue)) {
-      value = dbValue;
-    } else {
-      // 故障（表不在 / 挂住 / 没有池子）与「有行但值坏」要分开：前者才是「这趟没读到东西」。
-      const reason = (problems ?? []).find((p) => p?.key === SESSION_TTL_KEY)?.reason;
-      if (DB_READ_FAILURE_REASONS.has(reason)) readUnavailable = String(reason);
+    try {
+      // 复用整表那一次读（同一份 SQL、同一份超时、同一份永不抛口径）——不另开 per-key 的 SELECT。
+      const { values, problems } = await readRuntimeSettings({
+        pool, registry, timeoutMs, env, log: warns.log,
+      });
+      const dbValue = values?.[SESSION_TTL_KEY];
+      if (Number.isSafeInteger(dbValue)) {
+        value = dbValue;
+      } else {
+        // 故障（表不在 / 挂住 / 没有池子）与「有行但值坏」要分开：前者才是「这趟没读到东西」。
+        const reason = (problems ?? []).find((p) => p?.key === SESSION_TTL_KEY)?.reason;
+        if (DB_READ_FAILURE_REASONS.has(reason)) readUnavailable = String(reason);
+        value = fallback();
+      }
+    } catch (err) {
+      // 双保险：`readRuntimeSettings` 自己永不抛，但它上面还套着 registry 注入这条缝
+      //（假库/假 registry 传进来就是这里的形状）⇒ 热路径一行都不许抛（抛了就是 `/api/me` 500）。
+      readUnavailable = `threw:${err?.message ?? err}`;
       value = fallback();
     }
-  } catch (err) {
-    // 双保险：`readRuntimeSettings` 自己永不抛，但它上面还套着 registry 注入这条缝
-    //（假库/假 registry 传进来就是这里的形状）⇒ 热路径一行都不许抛（抛了就是 `/api/me` 500）。
-    readUnavailable = `threw:${err?.message ?? err}`;
-    value = fallback();
+    if (generationAtStart === sessionTtlCacheGeneration) {
+      sessionTtlCache.pool = pool;
+      sessionTtlCache.at = at;
+      sessionTtlCache.resolved = value;
+    }
+    if (readUnavailable) {
+      throw new RuntimeSettingsError('read_unavailable',
+        `session TTL 的 DB 读不可用（${readUnavailable}）⇒ 已回落 env/默认`,
+        // `fallbackSeconds`：这一趟算好的回落值。`read_unavailable` 只在本模块内部被接住（全仓
+        // 唯一调用方是 `readSessionTtlSeconds`）⇒ 这些 `details` 不会泄漏到 HTTP 响应里。
+        { httpStatus: 500, details: { fallbackSeconds: value } });
+    }
+    return value;
+  } finally {
+    // 成功与失败都只在这里播那**唯一一条** warn（放 `finally`：连意外抛出也不吞掉理由）。
+    warns.emit();
   }
-  if (generationAtStart === sessionTtlCacheGeneration) {
-    sessionTtlCache.pool = pool;
-    sessionTtlCache.at = at;
-    sessionTtlCache.resolved = value;
-  }
-  if (readUnavailable) {
-    throw new RuntimeSettingsError('read_unavailable',
-      `session TTL 的 DB 读不可用（${readUnavailable}）⇒ 已回落 env/默认`, { httpStatus: 500 });
-  }
-  return value;
 }
 
 /**
@@ -866,14 +921,30 @@ export async function readSessionTtlSeconds({
     const value = resolveEnvTier(entry, config, { env, log }).value;
     return value === undefined ? SESSION_TTL_DEFAULT_SECONDS : value;
   };
+  /**
+   * 那一趟失败时怎么把答案交出去（#701 二审 LOW②的另一半）：**复用那一趟算好的回落值**，
+   * 不再自己 `resolveEnvTier` 一遍。原本每接住一次 `read_unavailable` 就把同一条「env 兜底被拒」
+   * 再 warn 一遍（发起方一遍 + 每个共享者各一遍），叠加 `readRuntimeSettings` 自己那条 DB 故障
+   * warn ⇒ 一次热读三条、DB 抖动期刷屏。那一趟的 warn 已在 `sessionTtlFlight` 的 `finally` 里
+   * 播完（那一趟只一条），这里**只留 debug**。
+   *
+   * ⚠ 共享者拿到的是**发起方**那趟算出的回落值：与它自己那趟共用 `timeoutMs` 是同一个口径
+   *   （生产只有一份 config / env；测试里并发那格必须同参数，见 RS-18 / RS-22）。
+   */
+  const answerOfFailedFlight = (err) => {
+    const carried = err?.details?.fallbackSeconds;
+    if (carried !== undefined) return carried;
+    // 不是那一趟递上来的回落（罕见的注入形状）⇒ 自己算，允许它自己 warn 一条。
+    return fallbackOnly();
+  };
   // ② in-flight 合并：同池已有读在飞 ⇒ **复用那一趟**，不再发第二条 SQL（这就是 MED 的全部）。
   if (sessionTtlInFlight.promise && sessionTtlInFlight.pool === pool) {
     log?.debug?.('[runtime-settings] 复用同池在飞的 session TTL 读（不重复发 SQL）');
     try {
       return await sessionTtlInFlight.promise;
     } catch (err) {
-      log?.debug?.(`[runtime-settings] 在飞那趟失败 ⇒ 本次读兜底 env/默认（${err?.message ?? err}）`);
-      return fallbackOnly();
+      log?.debug?.(`[runtime-settings] 在飞那趟失败 ⇒ 本次读复用那一趟的回落值（${err?.message ?? err}）`);
+      return answerOfFailedFlight(err);
     }
   }
   const task = sessionTtlFlight({ pool, config, now, log, env, registry, entry, timeoutMs });
@@ -886,9 +957,10 @@ export async function readSessionTtlSeconds({
   try {
     return await task;
   } catch (err) {
-    // 口径 1：读侧永不抛。`sessionTtlFlight` 里已经填过回落缓存，这里只负责把答案交出去。
+    // 口径 1：读侧永不抛。`sessionTtlFlight` 里已经填过回落缓存、也已经播过那唯一一条 warn，
+    // 这里只负责把那一趟算好的值交出去（不再重算 env 闸 = 不再多一条重复 warn，LOW②）。
     log?.debug?.(`[runtime-settings] readSessionTtlSeconds 兜底 env/默认（${err?.message ?? err}）`);
-    return fallbackOnly();
+    return answerOfFailedFlight(err);
   }
 }
 

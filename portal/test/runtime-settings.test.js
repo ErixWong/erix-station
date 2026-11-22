@@ -24,6 +24,8 @@
 //         在飞期间保存成功也要清槽（三条各钉一条红法，见 §7 的注释）
 //   RS-21   **PR #701 返修 LOW③**：env 兜底值也必须过 registry 的 `parse`/`validate`
 //           （坏值 ⇒ 回落默认 + 点名 warn；好值照收；DB 优先级不许因为这道闸漂移）
+//   RS-22   **PR #701 二审 LOW②**：DB 读失败**叠加**坏 env ⇒ 同一次热读只 warn 一条，
+//           且那一条同时点名两件事（DB 侧原因 + env 侧被拒的理由）；单件事的文案不许被改形
 //
 // 隔离约定（docs/testing.md §2.1）：本地 fake pool，不碰真实 DB；不起 HTTP。
 import test from 'node:test';
@@ -1495,3 +1497,97 @@ test('RS-21 env 兜底也过 registry 那套闸（LOW③：不留「DB 严格、
     '覆盖层也必须把坏 env 值降回默认（两套真相的另一半就在这条路上）');
   invalidateSessionTtlCache();
 });
+
+// ---------------------------------------------------------------------------
+// PR #701 二审 LOW②：DB 读失败**叠加**坏 env 时，一次热读只许 warn 一条
+//
+// 修的是「刷屏 + 半边真相」：DB 抖动期间每个请求都走「读失败 ⇒ 回落」这条路，而回落里还要过
+// env 那道闸。旧形状下一次热读会 warn **三条**（`readRuntimeSettings` 一条 DB 故障 + 本趟
+// 算 env 兜底一条 + 外层接住 `read_unavailable` 后又把同一条 env 文案重播一条），而
+// `docs/api/portal.md` §4.21 / `docs/env.md` 的口径是「坏 env 留一条点名 warn」。
+// 现在：**同一趟最多一条**，且那一条必须同时说清两件事（缺一半 = 运维少一半真相）。
+// ---------------------------------------------------------------------------
+
+test('RS-22 DB 读失败叠加坏 env ⇒ 同一次热读只 warn 一条，且一条里同时说清两件事（二审 LOW②）',
+  async () => {
+    const BAD_ENV = { SESSION_TTL_SECONDS: '30' };   // 区间 60..2592000 之外 ⇒ 必须被拒
+    const BAD_CFG = { sessionTtlSeconds: 30, sessionTtlSecondsSource: 'env' };
+
+    // ① 判据本体（变异 M-2 点名的就是这一格：把 warn 拆回两条 ⇒ 这里以「3 条 ≠ 1 条」点名红）。
+    invalidateSessionTtlCache();
+    const log = collectingLog();
+    const dead = flakyPool({ rows: [{ key: SESSION_TTL_KEY, value: 3600 }] });   // broken=true
+    assert.equal(await readSessionTtlSeconds({ pool: dead, config: BAD_CFG, env: BAD_ENV, log }),
+      SESSION_TTL_DEFAULT_SECONDS, '两档都不可用 ⇒ 回落 registry 默认（数值口径不许因为 warn 合并漂移）');
+    assert.equal(dead.queryCount, 1, '那一趟必须真的发过读（红要红在「warn 几条」，不是「没跑到」）');
+    assert.equal(log.seen.warn.length, 1,
+      `同一次热读**最多一条** warn（实得 ${log.seen.warn.length} 条：${JSON.stringify(log.seen.warn)}）`);
+    const [both] = log.seen.warn;
+    assert.match(both, /42P01/, '那一条里必须带 DB 侧的原因（驱动给的 code，不带就是要人猜）');
+    assert.match(both, /读 runtime_settings 失败/, 'DB 侧：要说清是「读失败」，不是「库里没值」');
+    assert.match(both, new RegExp(SESSION_TTL_KEY.replace(/\./g, '\\.')), '必须点名是哪个旋钮');
+    assert.match(both, /SESSION_TTL_SECONDS/, 'env 侧：要点名是哪个环境变量');
+    assert.match(both, /"30"/, 'env 侧：要带上被拒的那个坏值原话');
+    assert.match(both, /ttl_out_of_range/, 'env 侧：要带上被拒的理由（区间外与不是数是两种处理动作）');
+
+    // ② 反向：只 DB 故障、env 合法 ⇒ 仍然恰好一条，且**不许**冒出 env 那半截（合并 ≠ 一律加一句），
+    //    也不许把值一起回落成默认（env 是好的，就该用 env 的）。
+    invalidateSessionTtlCache();
+    const dbOnly = collectingLog();
+    const dead2 = flakyPool({ rows: [{ key: SESSION_TTL_KEY, value: 3600 }] });
+    assert.equal(await readSessionTtlSeconds({
+      pool: dead2, config: { sessionTtlSeconds: 86400, sessionTtlSecondsSource: 'env' },
+      env: { SESSION_TTL_SECONDS: '86400' }, log: dbOnly,
+    }), 86400, 'DB 挂了但 env 合法 ⇒ 用 env 的值（合并 warn 不许顺手把值也回落掉）');
+    assert.equal(dbOnly.seen.warn.length, 1,
+      `只坏 DB 也只许一条（实得 ${JSON.stringify(dbOnly.seen.warn)}）`);
+    assert.doesNotMatch(dbOnly.seen.warn[0], /env 兜底被拒/, 'env 没坏就不许说 env 被拒（拼盘式合并）');
+    assert.doesNotMatch(dbOnly.seen.warn[0], /同时撞上有/, '只有一件事 ⇒ **原文照播**（RS-13 ② 钉的是原话）');
+
+    // ③ 反向：只坏 env（DB 正常、库里没行）⇒ 一条，且必须是 RS-21 那条原话，不许被重新措辞。
+    invalidateSessionTtlCache();
+    const envOnly = collectingLog();
+    assert.equal(await readSessionTtlSeconds({
+      pool: ttlPool(), config: BAD_CFG, env: BAD_ENV, log: envOnly,
+    }), SESSION_TTL_DEFAULT_SECONDS);
+    assert.equal(envOnly.seen.warn.length, 1,
+      `只坏 env 也只许一条（实得 ${JSON.stringify(envOnly.seen.warn)}）`);
+    assert.match(envOnly.seen.warn[0], /env 兜底被拒/);
+    assert.doesNotMatch(envOnly.seen.warn[0], /同时撞上有/, '单件事不许被改形（否则 RS-21 那批原话判据全废）');
+
+    // ④ 抖动期的真实形状：一波并发热读共享同一趟**失败**的在飞读 ⇒ 整波只许一条。
+    //    旧形状这里是 1（DB）+ 5（每个调用方各重算一遍 env）= 6 条；共享者必须只留 debug。
+    invalidateSessionTtlCache();
+    const wave = collectingLog();
+    const gate = new GatingRuntimePool({ rows: [{ key: SESSION_TTL_KEY, value: 3600 }] });
+    let release;
+    gate.gate = new Promise((resolve) => { release = () => resolve(); });
+    gate.releaseThrows = true;                     // 放行时那一趟抛 = 抖动最真实的形状
+    const five = Array.from({ length: 5 }, () => readSessionTtlSeconds({
+      pool: gate, config: BAD_CFG, env: BAD_ENV, log: wave,
+    }));
+    await tick();
+    release();
+    assert.deepEqual(await Promise.all(five),
+      Array.from({ length: 5 }, () => SESSION_TTL_DEFAULT_SECONDS),
+      '五路都按回落给答案（共享一个 rejected promise 不许把读弄抛，RS-19 同口径）');
+    assert.equal(gate.queryCount, 1, '整波只发一条 SQL（MED 的合并口径不许因为这次动 warn 而漂移）');
+    assert.equal(wave.seen.warn.length, 1,
+      `一波并发热读**整波**只许一条 warn（实得 ${wave.seen.warn.length} 条：${JSON.stringify(wave.seen.warn)}）`);
+
+    // ⑤ 预算是**每一趟**，不是进程级 once：缓存到点的下一趟照样得再说一次（否则故障被静音）。
+    invalidateSessionTtlCache();
+    const twice = collectingLog();
+    const stillBroken = flakyPool({ rows: [{ key: SESSION_TTL_KEY, value: 3600 }] });
+    let clock = 5_000_000;
+    const readAgain = () => readSessionTtlSeconds({
+      pool: stillBroken, config: BAD_CFG, env: BAD_ENV, now: () => clock, log: twice,
+    });
+    assert.equal(await readAgain(), SESSION_TTL_DEFAULT_SECONDS);
+    clock += SESSION_TTL_CACHE_TTL_MS + 1;         // 缓存到点 ⇒ 又热读一趟（DB 还坏着）
+    assert.equal(await readAgain(), SESSION_TTL_DEFAULT_SECONDS);
+    assert.equal(stillBroken.queryCount, 2, '第二趟必须真的重新发读（否则这一格只数到一条是假绿）');
+    assert.equal(twice.seen.warn.length, 2,
+      `两趟热读**各一条**（合并是「每趟一条」，不是「进程里只播一次」；实得 ${twice.seen.warn.length}）`);
+    invalidateSessionTtlCache();
+  });
