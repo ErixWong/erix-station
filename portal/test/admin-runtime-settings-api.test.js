@@ -157,32 +157,88 @@ const readJson = async (res) => {
 // ---------------------------------------------------------------------------
 
 /**
- * 「零写库」的**唯一量尺**（#701 返修 LOW①）：数捕获到的**所有 DML**，而不是某两个计数器。
+ * 「零写库」的**唯一量尺**（#701 返修 LOW① + 二审 LOW①）：数**写动词出现在语句的任何位置**，
+ * 而不是「语句以什么开头」。
  *
  * 为什么不能只盯 `runtimeUpsertCalls` / `runtimeAuditCalls`：那两个各自只在对应分支自增
  *（一个只数 `INSERT INTO runtime_settings`，一个只数 `INSERT INTO audit_log`）⇒「403 之后其实
  * 发了另一形写语句」（`UPDATE runtime_settings` / `DELETE …` / 写别的表）在旧判据下**绿着过**。
- * 现在改成「凡是写就不许有」：`INSERT` / `UPDATE` / `DELETE` 一律算，鉴权自身那些 `SELECT` 不算；
- * 只有 `idempotency_keys` 那族例外（框架层的幂等记账，不是业务写，与 TLS 那块同口径）。
+ *
+ * 为什么**不能看开头**（二审 LOW①，独立审计实测：`WITH … INSERT` 计数 0）：
+ * `WITH x AS (…) INSERT INTO …` 这种 data-modifying CTE 是**真写**，但开头是 `WITH`
+ * ⇒ 旧的 `/^\s*(INSERT|UPDATE|DELETE)/` 直接漏掉。本仓的写路径就有这一族形状（`upload-settings.js`
+ * 的旧 `SAVE_SQL`、CTE 里记账的写法），所以「这条 SQL 以 SELECT 开头」根本不能当成「它不写」。
+ *
+ * 现在的形状（三种写形，位置无关）：`INSERT INTO <表>` / `UPDATE <表> … SET` / `DELETE FROM <表>`。
+ * ⚠ 反向的「别把读判成写」同样必须有，否则鉴权自己那些 SELECT 会把判据刷成假红：
+ *   · `WITH x AS (SELECT 1) SELECT * FROM x` —— **纯读 CTE** 一形都不占；
+ *   · `SELECT … FOR UPDATE` —— 锁定读，后面没有 `SET` ⇒ 不算写（`UPDATE` 必须跟 `SET` 才算）。
+ *
+ * `idempotency_keys` 那族例外按**写入目标**判，不按「语句里出现过这个名字」判（二审 §2 点名的第二
+ * 个漏）：`INSERT INTO runtime_settings … SELECT … FROM idempotency_keys` 写的仍是业务表 ⇒ 算写；
+ * 只有「这条语句写的全是 `idempotency_keys`」（框架层的幂等记账，与 TLS 那块同口径）才免。
  */
+const FRAMEWORK_ONLY_TABLE = 'idempotency_keys';
+
+/** 三种写形的「动词 + 目标表」。`UPDATE` 要求同句里跟着 `SET`（把 `FOR UPDATE` 这种锁定读排除掉）。 */
+const WRITE_TARGET_RES = [
+  /\bINSERT\s+INTO\s+("?[A-Za-z_][\w$]*"?(?:\."?[A-Za-z_][\w$]*"?)?)/gi,
+  /\bDELETE\s+FROM\s+("?[A-Za-z_][\w$]*"?(?:\."?[A-Za-z_][\w$]*"?)?)/gi,
+  /\bUPDATE\s+("?[A-Za-z_][\w$]*"?(?:\."?[A-Za-z_][\w$]*"?)?)[\s\S]*?\bSET\b/gi,
+];
+
+/** 目标表名：去引号、去掉 schema 前缀、小写（`public."Idempotency_Keys"` ⇒ `idempotency_keys`）。 */
+function targetName(raw) {
+  return String(raw).replace(/"/g, '').split('.').pop().toLowerCase();
+}
+
+/** 这条语句写了**哪些**表（认三种写形的动词 + 目标，位置无关；一条都不写 ⇒ 空数组）。 */
+function writeTargets(sql) {
+  const out = [];
+  // `matchAll` 内部会复制正则（不把 `lastIndex` 留在共享对象上），所以这里可以复用常量。
+  for (const re of WRITE_TARGET_RES) for (const m of sql.matchAll(re)) out.push(targetName(m[1]));
+  return out;
+}
+
 function dmlStatements(statements) {
   return (statements ?? [])
     .map((s) => String(typeof s === 'string' ? s : (s?.sql ?? '')))
-    .filter((sql) => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql))
-    .filter((sql) => !/\bidempotency_keys\b/i.test(sql));
+    .filter((sql) => {
+      const targets = writeTargets(sql);
+      // 有写目标，且**至少一个不是**幂等记账表 ⇒ 这条是真写（混合形状也算：CTE 记账 + 主体写业务表）。
+      return targets.length > 0 && targets.some((t) => t !== FRAMEWORK_ONLY_TABLE);
+    });
 }
 
 test('RS-API-1 非管理员 GET / PUT 都 403，且 PUT 一条写语句都不发', async () => {
-  // 量尺自证（判据自己也得有牙）：旧口径看不见的那三形，新的必须抱住。
+  // 量尺自证（判据自己也得有牙）：二审 LOW① 的红法就是这一格 —— 把量尺改回「只看语句开头」，
+  // `WITH … INSERT` 那条必须点名红。**四种写形都必须算写**，一条都不许漏（漏 = 「零写库」假绿）。
+  for (const [label, sql] of [
+    ['裸 INSERT', 'INSERT INTO whatever (a) VALUES (1)'],
+    ['WITH … INSERT（data-modifying CTE）',
+      'WITH s AS (SELECT 1 AS n) INSERT INTO runtime_settings (key, value) SELECT \'k\', n FROM s'],
+    ['UPDATE … SET', 'UPDATE runtime_settings SET value = $1'],
+    ['WITH … UPDATE（CTE 里改）',
+      'WITH s AS (SELECT 1 AS n) UPDATE runtime_settings SET value = (SELECT n FROM s)'],
+    ['DELETE FROM', 'DELETE FROM runtime_settings'],
+    ['WITH … DELETE FROM（CTE 里删）',
+      'WITH s AS (SELECT 1 AS n) DELETE FROM runtime_settings WHERE value = (SELECT n FROM s)'],
+  ]) {
+    assert.deepEqual(dmlStatements([sql]), [sql], `${label} 必须算写（漏掉它 = 「零写库」是假绿）`);
+  }
+  // 反向：这些**必须不算写**（把读判成写 = 判据天天红，等于没有判据）。
   assert.deepEqual(dmlStatements([
-    'SELECT * FROM runtime_settings', '  SELECT 1 FROM sessions',
-    'INSERT INTO idempotency_keys (a) VALUES (1)',
-  ]), [], '鉴权的 SELECT 与幂等记账不算写');
-  assert.equal(dmlStatements([
-    'UPDATE runtime_settings SET value = $1',
-    'DELETE FROM runtime_settings',
-    'INSERT INTO whatever (a) VALUES (1)',
-  ]).length, 3, '旧判据会漏的三形（UPDATE / DELETE / 写别的表）都必须算写');
+    'SELECT * FROM runtime_settings',
+    '  SELECT 1 FROM sessions',
+    'WITH x AS (SELECT 1) SELECT * FROM x',                          // 纯读 CTE：一形都不占
+    'SELECT value FROM runtime_settings WHERE key = $1 FOR UPDATE',   // 锁定读：UPDATE 后没有 SET
+    'INSERT INTO idempotency_keys (a) VALUES (1)',                    // 框架幂等记账（目标就是它）
+    'WITH d AS (DELETE FROM idempotency_keys WHERE k = $1 RETURNING 1) SELECT 1', // 只记幂等账
+  ]), [], '鉴权的 SELECT / 纯读 CTE / 锁定读 / 只写幂等表的记账都不算写');
+  // 例外只按**目标**免：「语句里提到 idempotency_keys」不是免检牌（旧口径在这里计数 0）。
+  assert.deepEqual(dmlStatements([
+    'INSERT INTO runtime_settings (key, value) SELECT key, value FROM idempotency_keys',
+  ]).length, 1, '写的是业务表、只是**提到**幂等表 ⇒ 仍算写（旧口径整条排除 = 漏真写）');
 
   const s = await startStack();
   try {
