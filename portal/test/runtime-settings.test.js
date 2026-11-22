@@ -1454,6 +1454,16 @@ test('RS-21 env 兜底也过 registry 那套闸（LOW③：不留「DB 严格、
   assert.equal(okList.items[0].source, 'env', '合法值来源仍是 env（不是被误降成 default）');
   assert.deepEqual(okLog.seen.warn, [], `合法值不许 warn（实得 ${JSON.stringify(okLog.seen.warn)}）`);
 
+  // 没有 env 原话、坏值**只在 config 里**（手递的 config、或别的进程算出来的）⇒ 同一把闸照样拦。
+  invalidateSessionTtlCache();
+  const configOnlyLog = collectingLog();
+  assert.equal(await readSessionTtlSeconds({
+    pool: ttlPool(), config: { sessionTtlSeconds: 2592001, sessionTtlSecondsSource: 'env' },
+    env: {}, log: configOnlyLog,
+  }), SESSION_TTL_DEFAULT_SECONDS, '坏值只长在 config 里也必须回落默认（不许只判 env 原话）');
+  assert.ok(configOnlyLog.seen.warn.some((m) => m.includes('config.sessionTtlSeconds')),
+    `来源要点名是 config 那一档（实得 ${JSON.stringify(configOnlyLog.seen.warn)}）`);
+
   // 优先级不许因为这道闸漂移：DB 有合法行时照样用 DB 的（env 坏不坏都一样）。
   invalidateSessionTtlCache();
   assert.equal(await readSessionTtlSeconds({
