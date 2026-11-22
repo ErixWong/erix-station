@@ -40,8 +40,12 @@ import {
   readTimeoutMs, DEFAULT_READ_TIMEOUT_MS, READ_TIMEOUT_ENV_VAR,
   AUDIT_ACTION, AUDIT_TARGET_PREFIX,
   SESSION_TTL_KEY, SESSION_TTL_MIN_SECONDS, SESSION_TTL_MAX_SECONDS, SESSION_TTL_DEFAULT_SECONDS,
-  SESSION_TTL_CACHE_TTL_MS, parseSessionTtlSeconds, validateSessionTtlSeconds,
+  SESSION_TTL_CACHE_TTL_MS, HOT_READ_CACHE_TTL_MS,
+  parseSessionTtlSeconds, validateSessionTtlSeconds,
   readSessionTtlSeconds, invalidateSessionTtlCache, HOT_READ_INVALIDATORS,
+  WORKSPACE_RETENTION_KEY, WORKSPACE_RETENTION_MAX_DAYS, WORKSPACE_RETENTION_DEFAULT_DAYS,
+  parseWorkspaceRetentionDays, validateWorkspaceRetentionDays,
+  readWorkspaceRetentionDays, invalidateWorkspaceRetentionCache,
   listRuntimeSettingsAdmin,
 } from '../src/runtime-settings.js';
 import { loadConfig } from '../src/config.js';
@@ -573,11 +577,13 @@ test('RS-6b 审计被抑制 ⇒ 抛 500 且**设置没落库**（检查在 COMMI
 // 4. P1 的边界：一格未迁、迁移形状、serve() 接线、超时旋钮
 // ---------------------------------------------------------------------------
 
-test('RS-7 P2a 边界：产品 registry 只有**第一格** session.ttl_seconds（其余旋钮仍归 P3）', async () => {
-  // P1 时这一格钉的是「registry 是空对象」；P2a 迁了第一格 ⇒ 判据改成「只迁了这一格」。
-  // 它红了的读法不变：有人在 P2a 里顺手多迁了一格（或把热读口径弄丢了）。
-  assert.deepEqual(Object.keys(RUNTIME_SETTING_REGISTRY), ['session.ttl_seconds'],
-    'P2a 只许迁 `session.ttl_seconds`（其余旋钮 P3 逐批填）');
+test('RS-7 P3 第一批边界：registry 只有 session.ttl_seconds + workspace.retention_days', async () => {
+  // P1 时这一格钉的是「registry 是空对象」；P2a 迁了第一格 ⇒ 判据改成「只迁了这一格」；
+  // P3 第一批迁了第二格 ⇒ 判据改成「就这两格，不多不少」。
+  // 它红了的读法不变：有人顺手多迁了一格（或把热读口径弄丢了）。
+  assert.deepEqual(Object.keys(RUNTIME_SETTING_REGISTRY),
+    ['session.ttl_seconds', 'workspace.retention_days'],
+    'P3 第一批只许迁 `session.ttl_seconds` + `workspace.retention_days`（其余旋钮逐批填）');
   assert.ok(Object.isFrozen(RUNTIME_SETTING_REGISTRY), 'registry 必须冻结（运行期没人能塞旋钮进来）');
   const entry = RUNTIME_SETTING_REGISTRY['session.ttl_seconds'];
   assert.ok(Object.isFrozen(entry), '条目也必须冻结');
@@ -601,6 +607,40 @@ test('RS-7 P2a 边界：产品 registry 只有**第一格** session.ttl_seconds�
   // 写路径的失效钩子必须接上（M-1 的形状闸那一半：光在 registry 里写 `applyMode: 'hot'` 不算）。
   assert.equal(HOT_READ_INVALIDATORS.get('session.ttl_seconds'), invalidateSessionTtlCache,
     'applyMode=hot 的旋钮必须在 HOT_READ_INVALIDATORS 里登记，否则保存完本进程还要吃 5s 旧值');
+
+  // ---- P3 第一批的第二格：同一套口径，逐字段再钉一次（少一个字段在管理页上就是「说不清楚」）----
+  const retEntry = RUNTIME_SETTING_REGISTRY[WORKSPACE_RETENTION_KEY];
+  assert.ok(retEntry, '第二格必须在 registry 里');
+  assert.ok(Object.isFrozen(retEntry), '条目也必须冻结');
+  assert.equal(retEntry.key, WORKSPACE_RETENTION_KEY);
+  assert.equal(retEntry.configPath, 'workspaceRetentionDays', 'config 字段名（与 config.js:343 同名）');
+  assert.equal(retEntry.envVar, 'ERIX_WORKSPACE_RETENTION_DAYS', '只用于日志/文档点名，不在这里读 env');
+  assert.equal(retEntry.applyMode, 'hot', '本批的全部意义就是改这个数不用重建容器');
+  assert.ok(typeof retEntry.label === 'string' && retEntry.label.length > 0);
+  assert.match(retEntry.label, /0/, 'label 要把「0 = 不自动清理」写进去：这一格的 0 是个有效值，'
+    + '界面上不解释就会被人当成「没填」');
+  // 默认值**同源**：本模块 / `config.js` 的字面默认 / compose 的 `${...:-0}` 三处同数（漂了的后果
+  // 不是报错，而是管理台显示一个机器实际不会用的数 —— 口径照 RS-7 上半与 US-13）。
+  assert.equal(retEntry.defaultValue, WORKSPACE_RETENTION_DEFAULT_DAYS);
+  assert.equal(WORKSPACE_RETENTION_DEFAULT_DAYS, 0, '默认必须是 0 = 关（与 docs/env.md、compose 同一句话）');
+  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).workspaceRetentionDays,
+    WORKSPACE_RETENTION_DEFAULT_DAYS,
+    'registry 默认值必须等于 loadConfig 在干净 env 下算出的那个数');
+  assert.match(compose, /ERIX_WORKSPACE_RETENTION_DAYS:\s*\$\{ERIX_WORKSPACE_RETENTION_DAYS:-0\}/,
+    'compose 的默认值与本模块同源（P5 退役 env 之前两边不许漂）');
+  // 上界要能说清为什么是这个数（它是产品口径，不是算术溢出；理由在源码注释里）。
+  assert.equal(WORKSPACE_RETENTION_MAX_DAYS, 3650);
+  assert.equal(parseWorkspaceRetentionDays(WORKSPACE_RETENTION_MAX_DAYS).ok, true, '上界内（含端点）');
+  assert.equal(parseWorkspaceRetentionDays(WORKSPACE_RETENTION_MAX_DAYS + 1).ok, false, '越界 ⇒ 回落');
+  // 热读旋钮的失效钩子：**漏这一行是 P3 那族最典型的坑**（保存能落库、DTO 也回填，
+  // 但本进程的热读还是旧值）。登记必须是导出的那一个函数本身（不是间接层）。
+  assert.equal(HOT_READ_INVALIDATORS.get(WORKSPACE_RETENTION_KEY),
+    invalidateWorkspaceRetentionCache,
+    '第二格也必须登记失效钩子，否则管理台保存完 offboarding 还是拿旧值');
+  assert.notEqual(HOT_READ_INVALIDATORS.get(WORKSPACE_RETENTION_KEY),
+    HOT_READ_INVALIDATORS.get(SESSION_TTL_KEY),
+    '两格各有各的缓存 ⇒ 各有各的失效函数（共用一个就是「保存 TTL 把保留天数也抹了」）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 2, '登记表里就是两格（热读旋钮数 = 失效钩子数）');
 
   assert.equal(isKnownSetting('demo.limit'), false, '真实 registry 里没有 demo.limit');
   assert.equal(isKnownSetting('constructor'), false,
@@ -1107,8 +1147,11 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   const dbPool = ttlPool({
     rows: [{ key: SESSION_TTL_KEY, value: 3600, updated_at: at, updated_by: ACTOR }],
   });
-  const fromDb = await listRuntimeSettingsAdmin({ pool: dbPool, config: CONFIG_ENV, log: silentLog });
-  assert.equal(fromDb.items.length, 1);
+  const fromDb = await listRuntimeSettingsAdmin({
+    pool: dbPool, config: CONFIG_ENV, env: {}, log: silentLog,
+  });
+  // 两格旋钮 ⇒ 两份 items（本批把第二格迁进来后这个数就是 2；多一格就红 = 顺手多迁）。
+  assert.equal(fromDb.items.length, 2);
   assert.deepEqual(Object.keys(fromDb.items[0]).sort(),
     ['applyMode', 'key', 'label', 'reason', 'source', 'updatedAt', 'updatedBy', 'value'].sort());
   assert.deepEqual(fromDb.items[0], {
@@ -1116,6 +1159,15 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     applyMode: 'hot', updatedAt: at.toISOString(), updatedBy: ACTOR,
   });
   assert.match(dbPool.sqlLog[0], /updated_at/, '管理台那条读要带 updated_*（要能说「谁改的」）');
+
+  // ①b 第二格：库里没它的行 ⇒ 不报 db，而是如实报 env/默认（即使**同一份响应里**第一格是 db）。
+  // 「一格里有值、另一格说不清」是真形状，不许被第一格的 db 带着写成 db。
+  const retItem = fromDb.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
+  assert.ok(retItem, '第二格必须出现在管理台响应里（界面是列表驱动，不列出来 = 没迁）');
+  assert.equal(retItem.source, 'default');
+  assert.equal(retItem.value, 0, 'env 也没给 ⇒ 第三档就是 0 = 不自动清理（不是 undefined、不是 null）');
+  assert.equal(retItem.reason, 'no_row');
+  assert.equal(retItem.applyMode, 'hot', '不提醒重启 = 本批的对外承诺（写错就是界面撒谎）');
 
   // ② env：库里没行，且 env 显式给了值 ⇒ source=env、值就是 config 里那个。
   const fromEnv = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: CONFIG_ENV, log: silentLog });
@@ -1138,7 +1190,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     pool: ttlPool({ throwOnSelect: Object.assign(new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
     config: CONFIG_ENV, log: deadLog,
   });
-  assert.equal(dead.items.length, 1);
+  assert.equal(dead.items.length, 2, '读失败时两格都要给得出来（不是只给第一格）');
   assert.equal(dead.items[0].source, 'env');
   assert.equal(dead.items[0].reason, 'read_failed');
   assert.equal(deadLog.seen.warn.length, 1, '有人在屏幕前等答案 ⇒ 读失败要 warn（不像启动路径只能 debug）');
@@ -1590,4 +1642,532 @@ test('RS-22 DB 读失败叠加坏 env ⇒ 同一次热读只 warn 一条，且�
     assert.equal(twice.seen.warn.length, 2,
       `两趟热读**各一条**（合并是「每趟一条」，不是「进程里只播一次」；实得 ${twice.seen.warn.length}）`);
     invalidateSessionTtlCache();
+  });
+
+// ---------------------------------------------------------------------------
+// 8. P3 第一批：第二格真实旋钮 `workspace.retention_days`
+//
+// 判据取自工单 §2②：registry 解析/校验（含 **`0` 是有效值** 与上界理由）、热读三档、缓存、
+// 写后失效、并发只发一条、在飞失败清槽、env 也过闸、一次热读最多一条 warn、真库腿。
+// 形状逐格照抄第 6/7 节（同一套机件 ⇒ 判据形状也必须一样，否则第二格是「另一套口径」）。
+//
+// ⚠ 这一节的格子共享**模块级**的两份热读缓存/槽 ⇒ 每段前后都 `invalidateWorkspaceRetentionCache()`
+//   （要牵扯 TTL 那格时两把一起失效）。
+// ---------------------------------------------------------------------------
+
+const CFG = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
+
+test('RS-23 workspace.retention_days 的解析与校验：非负整数、0 是有效值、上界 3650', () => {
+  assert.equal(WORKSPACE_RETENTION_DEFAULT_DAYS, 0,
+    '默认 0 = 不自动清理（config.js / compose / docs/env.md 同源）');
+  assert.equal(WORKSPACE_RETENTION_MAX_DAYS, 3650, '上界 = 10 年（产品口径，理由在源码注释里）');
+
+  // 收：**0 必须收**（它是「关掉清理」这个有效值，不是「没填」—— 这是这一格与 TTL 那格唯一的下界差异，
+  // 也是 `if (!raw)` 那一族最容易顺手写错的地方），加两端点与中间值。
+  for (const good of [0, 1, 7, 30, 3650, '0', '7', '3650', '007']) {
+    const r = parseWorkspaceRetentionDays(good);
+    assert.equal(r.ok, true, `${JSON.stringify(good)} 必须收`);
+    assert.equal(r.value, Number(good));
+  }
+  assert.deepEqual(parseWorkspaceRetentionDays(0), { ok: true, value: 0 },
+    '0 不许被当成假值丢掉（丢了就变成「库里写了不清理，读出来却回落」）');
+  // 拒：`Number()` / `parseInt()` 会放进来或算错的那一族（台账 §8.126）+ 负数 + 越界。
+  for (const bad of [
+    '1e3', ' 7 ', '7s', '', '0x10', '7.0', '1.5', '3651', '-1', '-0',
+    -1, 3651, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1e21,
+    true, false, null, undefined, {}, [], ['7'],
+  ]) {
+    assert.equal(parseWorkspaceRetentionDays(bad).ok, false,
+      `${JSON.stringify(bad) ?? String(bad)} 必须拒`);
+  }
+  assert.equal(parseWorkspaceRetentionDays(3651).reason, 'retention_days_out_of_range');
+  assert.equal(parseWorkspaceRetentionDays('1e3').reason, 'not_a_retention_days');
+
+  // 写侧：只收 number 类型的安全整数。`'7'`（字符串）必须拒 —— 否则界面上多一种「看着对其实换了档」。
+  for (const good of [0, 7, 3650]) {
+    assert.equal(validateWorkspaceRetentionDays(good), true, `${good} 必须放行（0 也是）`);
+  }
+  for (const bad of ['7', '', 3651, -1, 1.5, true, null, {}, [], Number.NaN]) {
+    const why = validateWorkspaceRetentionDays(bad);
+    assert.notEqual(why, true, `${JSON.stringify(bad) ?? String(bad)} 写侧必须拒`);
+    assert.equal(typeof why, 'string', '拒绝必须返回点名的原因字符串');
+  }
+  // 负数与越界要各说各话（一个要问「是不是想写 0」，一个要问「是不是单位填错了」）。
+  assert.match(String(validateWorkspaceRetentionDays(-1)), /0/);
+  assert.match(String(validateWorkspaceRetentionDays(3651)), /3650/);
+});
+
+test('RS-24 第二格热读三档：DB > env（过闸）> 默认 0；任何一档坏了都绝不抛', async () => {
+  invalidateWorkspaceRetentionCache();
+
+  // ① DB 有有效值 ⇒ 用它，不是 env 的那个（红 = DB 被绕过 = 界面是装饰品）。
+  const dbPool = ttlPool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 7 }] });
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: dbPool, config: CFG, env: {}, log: silentLog,
+  }), 7);
+  assert.equal(dbPool.queryCount, 1, '确实发了那次读');
+
+  // ①b 库里写的是 **0** ⇒ 读出来必须是 0，不许「顺手回落」成 env 的 30。
+  invalidateWorkspaceRetentionCache();
+  const zeroPool = ttlPool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 0 }] });
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: zeroPool, config: CFG, env: {}, log: silentLog,
+  }), 0, '0 是「关掉清理」这个真值：回落成 30 就是「库里说不清理、实际清 30 天」');
+
+  // ② 库里值非法（手工 UPDATE 成 '1e3'）⇒ 回落 env，且点名 warn 一次。
+  invalidateWorkspaceRetentionCache();
+  const log = collectingLog();
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: ttlPool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: '1e3' }] }),
+    config: CFG, env: {}, log,
+  }), 30);
+  assert.equal(log.seen.warn.length, 1, `恰好一条（实得 ${JSON.stringify(log.seen.warn)}）`);
+  assert.match(log.seen.warn[0], new RegExp(WORKSPACE_RETENTION_KEY.replace(/\./g, '\\.')),
+    'warn 要点名是哪个 key');
+
+  // ③ 库里没这一行（未配置是常态）⇒ env 那一档，不 warn。
+  invalidateWorkspaceRetentionCache();
+  const log2 = collectingLog();
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: ttlPool(), config: CFG, env: {}, log: log2,
+  }), 30);
+  assert.deepEqual(log2.seen.warn, [], '没有行不是故障，不许刷屏');
+
+  // ④ 表不存在 / DB 挂了 ⇒ 回落，**绝不抛**（抛了就是整个 offboarding 循环停摆）。
+  invalidateWorkspaceRetentionCache();
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: ttlPool({ throwOnSelect: Object.assign(new Error('no such table'), { code: '42P01' }) }),
+    config: CFG, env: {}, log: silentLog,
+  }), 30);
+
+  // ⑤ 连 pool 都没有 ⇒ 还是回落（不抛）。
+  invalidateWorkspaceRetentionCache();
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: null, config: CFG, env: {}, log: silentLog,
+  }), 30);
+
+  // ⑥ 三档全空 ⇒ registry 默认 0，且**绝不是 undefined**（undefined 交给 `=== 0` 判据就是「清」）。
+  invalidateWorkspaceRetentionCache();
+  const none = await readWorkspaceRetentionDays({
+    pool: ttlPool(), config: {}, env: {}, log: silentLog,
+  });
+  assert.equal(none, WORKSPACE_RETENTION_DEFAULT_DAYS);
+  assert.notEqual(none, undefined, 'undefined === 0 是 false ⇒ 循环会以为「清理开着」');
+
+  // ⑦ 读挂住不返回 ⇒ 按时给答案（不许把循环那一拍挂死）。
+  invalidateWorkspaceRetentionCache();
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: ttlPool({ hang: true }), config: CFG, env: {}, log: silentLog, timeoutMs: 30,
+  }), 30);
+
+  // ⑧ 上界外的值（`config.js` 的 `nonNegativeIntEnv` 收得下 4000，registry 不收）⇒ 回落**默认 0**
+  //    = 更保守的一档（少删目录，不会误删），并点名是哪一档没生效。
+  invalidateWorkspaceRetentionCache();
+  const overLog = collectingLog();
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: ttlPool(), config: { workspaceRetentionDays: 4000, workspaceRetentionDaysSource: 'env' },
+    env: {}, log: overLog,
+  }), 0, '越界 ⇒ 回落默认 0（不是 4000，也不是 undefined）');
+  assert.ok(overLog.seen.warn.some((m) => m.includes('config.workspaceRetentionDays')
+    && m.includes('retention_days_out_of_range')),
+    `要点名是哪一档、为什么（实得 ${JSON.stringify(overLog.seen.warn)}）`);
+
+  // ⑨ 两格读的是同一张表 ⇒ 一格有行、另一格没行时互不干扰（不许「有一格能读」就把另一格也当有值）。
+  invalidateWorkspaceRetentionCache();
+  invalidateSessionTtlCache();
+  const mixed = ttlPool({ rows: [{ key: SESSION_TTL_KEY, value: 120 }] });
+  assert.equal(await readSessionTtlSeconds({ pool: mixed, config: CFG, env: {}, log: silentLog }),
+    120);
+  invalidateWorkspaceRetentionCache();
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: mixed, config: CFG, env: {}, log: silentLog,
+  }), 30, 'TTL 那格有行不许让保留天数那格凭空读出一个数');
+  invalidateWorkspaceRetentionCache();
+});
+
+test('RS-25 第二格缓存：同池 5s 内命中不发 SQL、过期后重读、换池不串、两格各有各的缓存', async () => {
+  assert.equal(HOT_READ_CACHE_TTL_MS, 5000, '5 秒是口径（两格共用同一个数，别给第二格单独拍一个）');
+  assert.equal(SESSION_TTL_CACHE_TTL_MS, HOT_READ_CACHE_TTL_MS,
+    'TTL 那格的 5s 与这一格必须是同一个数：「改完最多 5 秒生效」是对外的一句话');
+  invalidateWorkspaceRetentionCache();
+  const pool = ttlPool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 7 }] });
+  let clock = 2_000_000;
+  const now = () => clock;
+  const read = () => readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, now, log: silentLog,
+  });
+
+  assert.equal(await read(), 7);
+  assert.equal(pool.queryCount, 1);
+  clock += HOT_READ_CACHE_TTL_MS;           // 边界内（`<=`）⇒ 命中
+  assert.equal(await read(), 7);
+  assert.equal(pool.queryCount, 1, '5s 内命中缓存 ⇒ 不许发第二条 SQL（每拍一条 = 给空闲循环加往返）');
+
+  pool.rows = [{ key: WORKSPACE_RETENTION_KEY, value: 14 }];
+  clock += 1;                               // 过界 ⇒ 重读
+  assert.equal(await read(), 14, '过期后必须重读（钉住旧值 = 改了不清理，30 天后目录还在）');
+  assert.equal(pool.queryCount, 2);
+
+  // 换池子不串读数（键到 pool 身份）。
+  const other = ttlPool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 21 }] });
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: other, config: CFG, env: {}, now, log: silentLog,
+  }), 21, 'B 池必须自己读（拿 A 池的缓存就是跨池串读数）');
+  assert.equal(other.queryCount, 1);
+
+  // **两格各有各的缓存**：读 TTL 不许把保留天数的缓存顶掉（共用一份工厂状态就是这里的红）。
+  // （先把 A 池的槽重新填回 —— 上面那一次 B 池的读合法地顶掉了它，键到池身份就是要顶。）
+  assert.equal(await read(), 14);
+  const before = pool.queryCount;
+  invalidateSessionTtlCache();
+  await readSessionTtlSeconds({ pool, config: CFG, env: {}, now, log: silentLog });
+  assert.equal(await read(), 14);
+  assert.equal(pool.queryCount, before + 1,
+    '只有 TTL 那一格该发 SQL（这里 +2 = 保留天数的缓存被 TTL 的读顶掉了）');
+  // 反向也要成：保留天数的读不许顶掉 TTL 那一格的缓存。
+  const beforeTtl = pool.queryCount;
+  assert.equal(await readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, now, log: silentLog,
+  }), 14);
+  assert.equal(await readSessionTtlSeconds({ pool, config: CFG, env: {}, now, log: silentLog }),
+    SESSION_TTL_DEFAULT_SECONDS,
+    '这一份 config 里没有 sessionTtlSeconds ⇒ TTL 读到的就是第三档（604800）');
+  assert.equal(pool.queryCount, beforeTtl,
+    '两格都不许重新发 SQL（保留天数命中自己的缓存，TTL 也命中它自己那一份）');
+  invalidateWorkspaceRetentionCache();
+});
+
+test('RS-25b 保存后缓存立即失效（M-3 点名的形状：删掉失效登记那一行就必须红）', async () => {
+  invalidateWorkspaceRetentionCache();
+  invalidateSessionTtlCache();
+  const pool = new FakeRuntimePool();
+  // 先读一次：库里没行 ⇒ env 那一档 30 被缓存住。
+  assert.equal(await readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, log: silentLog,
+  }), 30);
+  assert.equal(pool.queryCount, 1, '第一读真的发了读');
+
+  const saved = await saveRuntimeSetting({
+    pool, actorId: ACTOR, key: WORKSPACE_RETENTION_KEY, value: 7, log: silentLog,
+  });
+  assert.equal(saved.value, 7, '写侧收 7');
+  assert.equal(pool.storedValue(WORKSPACE_RETENTION_KEY), 7, '库里真的是新值');
+  // 从**保存之后**开始数 SQL：否则保存自己那五条（BEGIN/…/COMMIT）会把「没重发」掩盖成「重发了」。
+  const afterSave = pool.queryCount;
+
+  const next = await readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, log: silentLog,
+  });
+  assert.equal(next, 7, '保存之后**下一次读**就是新值（读到 30 = HOT_READ_INVALIDATORS 少登记这一行）');
+  assert.equal(pool.queryCount, afterSave + 1, '这次读必须真的再发一次 SQL（命中旧缓存就是假绿）');
+
+  const afterSecond = pool.queryCount;
+  assert.equal(await readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, log: silentLog,
+  }), 7);
+  assert.equal(pool.queryCount, afterSecond, '失效后那一读已把新值填回缓存');
+
+  // 写侧收 **0**（管理台要能把「关掉清理」写回去），并且 0 也要立刻生效。
+  const off = await saveRuntimeSetting({
+    pool, actorId: ACTOR, key: WORKSPACE_RETENTION_KEY, value: 0, log: silentLog,
+  });
+  assert.equal(off.value, 0, 'validate 的下界是 0：不许写成 1（那会让「关掉清理」存不进去）');
+  assert.equal(await readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, log: silentLog,
+  }), 0, '写 0 之后下一次读就是 0（不是缓存里的 7）');
+
+  // 反向：保存**另一格**旋钮不许把这一格的缓存抹掉（各格各一份；红 = 工厂里共享了槽）。
+  await saveRuntimeSetting({
+    pool, actorId: ACTOR, key: SESSION_TTL_KEY, value: 3600, log: silentLog,
+  });
+  const afterTtlSave = pool.queryCount;
+  assert.equal(await readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, log: silentLog,
+  }), 0);
+  assert.equal(pool.queryCount, afterTtlSave,
+    '保存 TTL 之后本格仍应**命中缓存**（+1 = 工厂里两格共用了缓存，TTL 的失效把本格也抹了）');
+  invalidateWorkspaceRetentionCache();
+  invalidateSessionTtlCache();
+});
+
+test('RS-26 第二格并发：冷缓存四路只发一条 SQL，另一池自己发，合并后照常回填缓存', async () => {
+  invalidateWorkspaceRetentionCache();
+  const pool = new GatingRuntimePool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 14 }] });
+  let release;
+  pool.gate = new Promise((resolve) => { release = () => resolve(); });
+
+  const four = Array.from({ length: 4 }, () => readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, log: silentLog,
+  }));
+  await tick();
+  assert.equal(pool.queryCount, 1,
+    `四路并发必须合并成 **1 条** SQL（实发 ${pool.queryCount} 条 = 没有 in-flight 合并）`);
+
+  const other = ttlPool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 21 }] });
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: other, config: CFG, env: {}, log: silentLog,
+  }), 21, 'B 池不许蹭 A 池在飞那一趟');
+
+  release();
+  assert.deepEqual(await Promise.all(four), [14, 14, 14, 14], '四路必须拿到同一趟的同一个值');
+  assert.equal(pool.queryCount, 1, '合并之后仍然只有一条 SQL（不许补发）');
+  assert.equal(await readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, log: silentLog,
+  }), 14);
+  assert.equal(pool.queryCount, 1, '在飞那趟必须照常回填缓存');
+  invalidateWorkspaceRetentionCache();
+});
+
+test('RS-26b 第二格在飞那趟失败 ⇒ 清槽；在飞期间保存 ⇒ 也清槽（两条都不许把读钉死）', async () => {
+  invalidateWorkspaceRetentionCache();
+  const pool = flakyPool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 14 }] });
+  let clock = 3_000_000;
+  const read = () => readWorkspaceRetentionDays({
+    pool, config: CFG, env: {}, now: () => clock, log: silentLog,
+  });
+
+  // ① 第一趟 DB 抛 ⇒ 读侧照旧给回落值（绝不抛），缓存里钉的是回落值。
+  assert.equal(await read(), 30, '失败那趟也要给答案（抛了就是 offboarding 循环停摆）');
+  assert.equal(pool.queryCount, 1);
+
+  // ② DB 恢复 + TTL 到点 ⇒ 必须重发 SQL 读到库里的值（复用已落定那一趟 = 失败没清槽）。
+  pool.broken = false;
+  clock += HOT_READ_CACHE_TTL_MS + 1;
+  assert.equal(await read(), 14, '恢复后必须读到**库里**的值，不是被钉住的 30');
+  assert.equal(pool.queryCount, 2, '必须重新发 SQL（失败路径没清槽就红在这里）');
+
+  // ③ 在飞那趟**挂掉**时挤进来的共享者：不许抛、不许自己再发一条，槽也不许留下。
+  invalidateWorkspaceRetentionCache();
+  const gate = new GatingRuntimePool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 14 }] });
+  let release;
+  gate.gate = new Promise((resolve) => { release = () => resolve(); });
+  gate.releaseThrows = true;
+  const first = readWorkspaceRetentionDays({
+    pool: gate, config: CFG, env: {}, now: () => clock, log: silentLog,
+  });
+  await tick();
+  const second = readWorkspaceRetentionDays({
+    pool: gate, config: CFG, env: {}, now: () => clock, log: silentLog,
+  });
+  assert.equal(gate.queryCount, 1, '第二路必须复用那一趟');
+  release();
+  assert.equal(await first, 30, '那一趟挂了 ⇒ 发起方按回落给答案');
+  assert.equal(await second, 30, '共享者也按回落给答案（共享 rejected promise 不许把读弄抛）');
+  gate.gate = null;
+  clock += HOT_READ_CACHE_TTL_MS + 1;
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: gate, config: CFG, env: {}, now: () => clock, log: silentLog,
+  }), 14, '失败落定后槽必须空着 ⇒ 下一次重新发读');
+
+  // ④ 在飞期间**保存**（真写路径 ⇒ 经 `HOT_READ_INVALIDATORS` 失效并清槽）。
+  invalidateWorkspaceRetentionCache();
+  const g2 = new GatingRuntimePool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 60 }] });
+  let release2;
+  g2.gate = new Promise((resolve) => { release2 = () => resolve(); });
+  const inFlight = readWorkspaceRetentionDays({
+    pool: g2, config: CFG, env: {}, now: () => clock, log: silentLog,
+  });
+  await tick();
+  const saved = await saveRuntimeSetting({
+    pool: g2, actorId: ACTOR, key: WORKSPACE_RETENTION_KEY, value: 90, log: silentLog,
+  });
+  assert.equal(saved.value, 90, '写路径真的把库里改成了 90');
+  const afterSave = g2.queryCount;
+
+  // 失效之后、放行**之前**发起下一次读：那一刻槽必须已经是空的，它只能自己发一条。
+  const nextRead = readWorkspaceRetentionDays({
+    pool: g2, config: CFG, env: {}, now: () => clock, log: silentLog,
+  });
+  release2();
+  assert.equal(await inFlight, 60, '在飞那一趟拿的是它发起那一刻的库（不是 PUT 之后的值）');
+  assert.equal(await nextRead, 90,
+    'PUT 完的下一次读必须是新值（拿到 60 = 复用了 PUT 之前就发起的那一趟 ⇒ 失效器没清槽）');
+  assert.equal(g2.queryCount, afterSave + 1,
+    `下一次读必须真的重发一条（实发 ${g2.queryCount - afterSave} 条）`);
+  invalidateWorkspaceRetentionCache();
+});
+
+test('RS-27 第二格 env 也过 registry 那套闸 + 一次热读最多一条 warn', async () => {
+  const BAD = [
+    ['上界外', '4000', 'retention_days_out_of_range'],
+    ['小数', '7.5', 'not_a_retention_days'],
+    ['压根不是数', 'abc', 'not_a_retention_days'],
+    ['科学计数', '1e3', 'not_a_retention_days'],
+  ];
+  for (const [label, raw, reason] of BAD) {
+    // `config.js` 走通用 `nonNegativeIntEnv`（`Number()` 语义）⇒ `1e3` 它照样收成 1000。
+    // 这一格钉的正是「config 收下了，但运行时那一层不认」（RS-21 同形）。
+    const cfg = loadConfig({ COOKIE_PROFILE: 'dev-http', ERIX_WORKSPACE_RETENTION_DAYS: raw });
+    const env = { ERIX_WORKSPACE_RETENTION_DAYS: raw };
+    invalidateWorkspaceRetentionCache();
+    const hotLog = collectingLog();
+    const hot = await readWorkspaceRetentionDays({
+      pool: ttlPool(), config: cfg, env, log: hotLog,
+    });
+    assert.equal(hot, WORKSPACE_RETENTION_DEFAULT_DAYS,
+      `${label}：env=${raw} 过不了闸 ⇒ 必须回落默认 0（实得 ${hot}）`);
+    const named = hotLog.seen.warn.filter((m) => m.includes(WORKSPACE_RETENTION_KEY)
+      && m.includes('ERIX_WORKSPACE_RETENTION_DAYS'));
+    assert.equal(named.length, 1,
+      `坏 env 值必须点名 warn 一次（key + env 名），实得 ${JSON.stringify(hotLog.seen.warn)}`);
+    assert.match(named[0], new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+      'warn 要带上那个坏值本身');
+    assert.match(named[0], new RegExp(reason), 'warn 要带上被拒的理由');
+  }
+
+  // 合法值照收，且不 warn：`0` 也在这一列（它是**显式关掉**，不是「没配」）。
+  for (const raw of ['0', '14', '3650']) {
+    invalidateWorkspaceRetentionCache();
+    const log = collectingLog();
+    const cfg = loadConfig({ COOKIE_PROFILE: 'dev-http', ERIX_WORKSPACE_RETENTION_DAYS: raw });
+    assert.equal(await readWorkspaceRetentionDays({
+      pool: ttlPool(), config: cfg, env: { ERIX_WORKSPACE_RETENTION_DAYS: raw }, log,
+    }), Number(raw), `env ${raw} 必须照收`);
+    assert.deepEqual(log.seen.warn, [], `合法值不许 warn（实得 ${JSON.stringify(log.seen.warn)}）`);
+  }
+
+  // 来源如实：compose 的 `ERIX_WORKSPACE_RETENTION_DAYS: ${...:-0}` 在真机上**永远会把这个键具象出来**
+  //（没配也是字符串 `"0"`）⇒ 热读与管理台报 `source=env` 是真话；而 `env` 里压根没这个键时
+  //（本机直跑、手递 config）必须报 `default`，不许拿「config 里有 0」当 env。
+  invalidateWorkspaceRetentionCache();
+  const zeroEnvCfg = loadConfig({
+    COOKIE_PROFILE: 'dev-http', ERIX_WORKSPACE_RETENTION_DAYS: '0',
+  });
+  const zeroList = await listRuntimeSettingsAdmin({
+    pool: ttlPool(), config: zeroEnvCfg,
+    env: { ERIX_WORKSPACE_RETENTION_DAYS: '0' }, log: silentLog,
+  });
+  const zeroItem = zeroList.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
+  assert.equal(zeroItem.value, 0, '显式写了 0 ⇒ 值就是 0（不许因为「等于默认」就被当成没配）');
+  assert.equal(zeroItem.source, 'env', '显式写了 0 ⇒ 来源是 env（#485 的口径：判据是「显式写了没有」）');
+  invalidateWorkspaceRetentionCache();
+  const bareList = await listRuntimeSettingsAdmin({
+    pool: ttlPool(), config: {}, env: {}, log: silentLog,
+  });
+  assert.equal(bareList.items.find((i) => i.key === WORKSPACE_RETENTION_KEY).source, 'default',
+    '压根没配 ⇒ 管理台不许说「env 配的」');
+
+  // ⚠ 这一格钉的是 `configTierSource` 在 P3 第一批的**收窄**：条目没有 `<configPath>Source` 标注、
+  //   而 `config` 里那个值又恰好**等于 registry 默认** ⇒ 不许报 `env`。旧口径（「config 里有值就算
+  //   env」）在这一格永远是假话：`loadConfig` 无论有没有配都会给 `workspaceRetentionDays` 写个数。
+  const bareZero = await listRuntimeSettingsAdmin({
+    pool: ttlPool(), config: { workspaceRetentionDays: 0 }, env: {}, log: silentLog,
+  });
+  assert.equal(bareZero.items.find((i) => i.key === WORKSPACE_RETENTION_KEY).source, 'default',
+    '值等于默认 ⇒ 分不清就不声称是 env 配的（宁可少报一档）');
+  // 收窄不等于一律降 default：值与默认不同 ⇒ 确实有人给了那一档，仍报 env。
+  const notDefault = await listRuntimeSettingsAdmin({
+    pool: ttlPool(), config: { workspaceRetentionDays: 14 }, env: {}, log: silentLog,
+  });
+  assert.equal(notDefault.items.find((i) => i.key === WORKSPACE_RETENTION_KEY).source, 'env',
+    '值与默认不同 ⇒ 不许被收窄误伤成 default');
+
+  // 管理台报的来源必须与热读真正用的那个数是同一套（RS-21 LOW③ 同口径）。
+  invalidateWorkspaceRetentionCache();
+  const badListLog = collectingLog();
+  const badList = await listRuntimeSettingsAdmin({
+    pool: ttlPool(),
+    config: loadConfig({ COOKIE_PROFILE: 'dev-http', ERIX_WORKSPACE_RETENTION_DAYS: '1e3' }),
+    env: { ERIX_WORKSPACE_RETENTION_DAYS: '1e3' }, log: badListLog,
+  });
+  const badItem = badList.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
+  assert.equal(badItem.value, 0, '坏 env ⇒ 界面显示默认 0，不是显示那个不会生效的 1000');
+  assert.equal(badItem.source, 'default');
+  assert.ok(badListLog.seen.warn.some((m) => m.includes('ERIX_WORKSPACE_RETENTION_DAYS')),
+    '界面这条路也要点名 warn（不能只在热读那条路上说）');
+
+  // 一次热读最多一条 warn：DB 抖动**叠加**坏 env ⇒ 一条里同时说清两件事（RS-22 同形）。
+  invalidateWorkspaceRetentionCache();
+  const bothLog = collectingLog();
+  const dead = flakyPool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 14 }] });
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: dead, config: { workspaceRetentionDays: 4000, workspaceRetentionDaysSource: 'env' },
+    env: {}, log: bothLog,
+  }), 0);
+  assert.equal(dead.queryCount, 1, '那一趟必须真的发过读');
+  assert.equal(bothLog.seen.warn.length, 1,
+    `同一次热读**最多一条** warn（实得 ${bothLog.seen.warn.length} 条：${JSON.stringify(bothLog.seen.warn)}）`);
+  assert.match(bothLog.seen.warn[0], /42P01/, '一条里要带 DB 侧原因');
+  assert.match(bothLog.seen.warn[0], /retention_days_out_of_range/, '一条里要带 env 侧理由');
+  assert.match(bothLog.seen.warn[0], /同时撞上有/, '两件事 ⇒ 走合并那条文案');
+
+  // 只有一件事时**原文照播**，不许被合并文案改形。
+  invalidateWorkspaceRetentionCache();
+  const envOnly = collectingLog();
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: ttlPool(), config: { workspaceRetentionDays: 4000, workspaceRetentionDaysSource: 'env' },
+    env: {}, log: envOnly,
+  }), 0);
+  assert.equal(envOnly.seen.warn.length, 1);
+  assert.doesNotMatch(envOnly.seen.warn[0], /同时撞上有/, '单件事不许被改形');
+
+  // 预算是**每一趟**：缓存到点的下一趟照样再说一次（故障不许被静音）。
+  invalidateWorkspaceRetentionCache();
+  const twice = collectingLog();
+  const stillBroken = flakyPool({ rows: [{ key: WORKSPACE_RETENTION_KEY, value: 14 }] });
+  let clock = 9_000_000;
+  const readAgain = () => readWorkspaceRetentionDays({
+    pool: stillBroken, config: CFG, env: {}, now: () => clock, log: twice,
+  });
+  assert.equal(await readAgain(), 30);
+  clock += HOT_READ_CACHE_TTL_MS + 1;
+  assert.equal(await readAgain(), 30);
+  assert.equal(stillBroken.queryCount, 2, '第二趟必须真的重新发读');
+  assert.equal(twice.seen.warn.length, 2, `两趟各一条（实得 ${twice.seen.warn.length}）`);
+  invalidateWorkspaceRetentionCache();
+});
+
+test('RS-28 真库那一腿（第二格）：写 7 ⇒ 热读 7、不等 5 秒；删行 ⇒ 回落 env（无 PG 则 skip）',
+  { skip: PG_SKIP }, async () => {
+    assert.ok(pgFixture, 'TEST_DATABASE_URL 给了却没有夹具');
+    await pgFixture.withFreshDatabase(async ({ pool }) => {
+      const CONFIG = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
+      invalidateWorkspaceRetentionCache();
+      // 真库前置：`audit_log.actor_id` 有 FK ⇒ 要落审计就得先有这个人（RS-17 真跑才红出来的那一格）。
+      await pool.query(
+        `INSERT INTO users (id, login, password_hash, status) VALUES ($1, $2, 'x', 'active')`,
+        [ACTOR, 'w677-p3-actor'],
+      );
+
+      // 库里没行 ⇒ env 那一档。
+      assert.equal(await readWorkspaceRetentionDays({ pool, config: CONFIG, log: pgSilent }), 30);
+
+      // 真库保存 7 ⇒ 同进程下一次读立刻是 7（写路径失效 + 真库整表读）。
+      const saved = await saveRuntimeSetting({
+        pool, actorId: ACTOR, key: WORKSPACE_RETENTION_KEY, value: 7, log: pgSilent,
+      });
+      assert.equal(saved.value, 7);
+      assert.equal(saved.updatedBy, ACTOR);
+      assert.equal(await readWorkspaceRetentionDays({ pool, config: CONFIG, log: pgSilent }), 7,
+        '真库上「保存完下一拍就用新值」必须是事实（假库那条只判形状）');
+
+      // **0** 也能存能读（这一格的关键有效值；jsonb 的 0 回读成 JS number 0）。
+      await saveRuntimeSetting({
+        pool, actorId: ACTOR, key: WORKSPACE_RETENTION_KEY, value: 0, log: pgSilent,
+      });
+      assert.equal(await readWorkspaceRetentionDays({ pool, config: CONFIG, log: pgSilent }), 0,
+        'jsonb 的 0 回读成 0，不许被当成「库里没值」');
+
+      // 管理台：第二格报 source=db（第一格的 source 不许带它）。
+      const list = await listRuntimeSettingsAdmin({ pool, config: CONFIG, log: pgSilent });
+      const item = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
+      assert.equal(item.source, 'db');
+      assert.equal(item.value, 0);
+      assert.equal(item.updatedBy, ACTOR);
+
+      // 手工删行 ⇒ 回到 env 那一档（30），并且不抛。
+      await pool.query('DELETE FROM runtime_settings WHERE key = $1', [WORKSPACE_RETENTION_KEY]);
+      invalidateWorkspaceRetentionCache();
+      assert.equal(await readWorkspaceRetentionDays({ pool, config: CONFIG, log: pgSilent }), 30);
+
+      // 手工写一个绕过写侧闸的坏行 ⇒ 读侧回落 + 绝不抛（口径 2 在真库上算一次）。
+      await pool.query(
+        `INSERT INTO runtime_settings (key, value) VALUES ($1, $2::jsonb)`,
+        [WORKSPACE_RETENTION_KEY, '"1e3"'],
+      );
+      invalidateWorkspaceRetentionCache();
+      assert.equal(await readWorkspaceRetentionDays({ pool, config: CONFIG, log: pgSilent }), 30,
+        '手工写的坏值 ⇒ 回落 env，不抛');
+      invalidateWorkspaceRetentionCache();
+    });
   });
