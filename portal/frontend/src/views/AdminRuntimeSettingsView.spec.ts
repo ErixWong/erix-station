@@ -249,7 +249,7 @@ describe('R5 400 按行标红（别行不跟着抖）', () => {
     // 另一行什么都没做过 ⇒ 不许被同一次失败标红
     expect(inputEl(w, SECOND_KEY).getAttribute('aria-invalid')).not.toBe('true');
     expect(exists(w, `runtime-error-${SECOND_KEY}`)).toBe(false);
-    // 同一句错只许出在一处：归了那一行，整页那行就不许再重复一遗
+    // 同一句错只许出在一处：归了那一行，整页那行就不许再重复一遍
     expect(exists(w, 'runtime-field-error')).toBe(false);
     expect(useAdminStore().runtimeSaveField).toBe('value');
   });
