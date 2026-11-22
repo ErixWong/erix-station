@@ -10,7 +10,8 @@
 //   R2 列表按 DTO 渲染两行：label / key / 值 / 来源 / 生效方式 / 更新时间一起出
 //   R3 `value: null` 显示「未知」，**不是 0**（#390-A：键缺席不是 0）
 //   R4 输入 7200 点保存 ⇒ `PUT /api/admin/runtime-settings/{key}`，body 是 `{"value":7200}`
-//   R5 服务端 400 + `details.field='value'` ⇒ **只有那一行**标红并显示错误文案
+//   R5 服务端 400 ⇒ 错误**只出现在一处**：`details.field='value'` 只标被尝试那一行；
+//      `'key'` / `'body'` / 认不出 field ⇒ 只走整页一行，**任何一行都没有行内错误**（#702 的 LOW）
 //   R6 越界照发（服务端才是闸）+ 解析不出整数 ⇒ 零请求
 //   R7 空列表 / GET 失败 / 未加载 三态各自独立（错误不冒充空态，也不白屏）
 //   R8 保存成功那一行显示「已保存」并回填服务端回读的生效值（不是用户敲的那一串）
@@ -248,7 +249,53 @@ describe('R5 400 按行标红（别行不跟着抖）', () => {
     // 另一行什么都没做过 ⇒ 不许被同一次失败标红
     expect(inputEl(w, SECOND_KEY).getAttribute('aria-invalid')).not.toBe('true');
     expect(exists(w, `runtime-error-${SECOND_KEY}`)).toBe(false);
+    // 同一句错只许出在一处：归了那一行，整页那行就不许再重复一遗
+    expect(exists(w, 'runtime-field-error')).toBe(false);
     expect(useAdminStore().runtimeSaveField).toBe('value');
+  });
+
+  // #702 review 的 LOW：以前 `key`/`body` 会**同时**出现在被尝试那一行与整页一行 ⇒ 同一句错两遍。
+  // 口径（§4.21 + `AdminUploadView`）：只有 `field='value'` 才挂到行上，其余一律只走整页那一行。
+  it.each([
+    { field: 'key', pointed: '配置项名字', message: '未知的运行时配置项' },
+    { field: 'body', pointed: '请求体', message: '请求体形状不对' },
+  ] as const)(
+    'details.field=$field ⇒ 整页一行点名是哪一处，且**任何一行**都没有行内错误也不标红',
+    async ({ field, pointed, message }) => {
+      stubDefault(DTO, () => errorResponse(400, 'validation_failed', message, { field }));
+      const w = await mountView();
+      await setDraft(w, TTL_KEY, '7200');
+      await clickSave(w, TTL_KEY);
+
+      // 整页那一行：有服务端那句话，也点名了是哪一处
+      expect(exists(w, 'runtime-field-error')).toBe(true);
+      expect(text(w, 'runtime-field-error')).toContain(message);
+      expect(text(w, 'runtime-field-error')).toContain(pointed);
+      // 被尝试那一行与另一行：既没有行内文案，输入框也不红
+      for (const key of [TTL_KEY, SECOND_KEY]) {
+        expect(exists(w, `runtime-error-${key}`), `field=${field} 时 ${key} 不该有行内文案`).toBe(false);
+        expect(inputEl(w, key).getAttribute('aria-invalid'),
+          `field=${field} 时 ${key} 的框不该红`).not.toBe('true');
+      }
+      expect(exists(w, `runtime-saved-${TTL_KEY}`)).toBe(false);
+      expect(useAdminStore().runtimeSaveField).toBe(field);
+    },
+  );
+
+  // 认不出 field（非 §4.21 点名的三档，例如 500）⇒ 这句话**不许丢**：从行内改到整页一行，
+  // 而不是两处都写（也不能两处都没）。以前它落在行内、整页一行是空的。
+  it('details.field 认不出（如 500）⇒ 整页一行说这句话，任何一行都没有行内错误', async () => {
+    stubDefault(DTO, () => errorResponse(500, 'internal', 'station-portal 暂时不可用'));
+    const w = await mountView();
+    await setDraft(w, TTL_KEY, '7200');
+    await clickSave(w, TTL_KEY);
+
+    expect(useAdminStore().runtimeSaveField).toBeNull();
+    expect(text(w, 'runtime-field-error')).toContain('station-portal 暂时不可用');
+    for (const key of [TTL_KEY, SECOND_KEY]) {
+      expect(exists(w, `runtime-error-${key}`), `${key} 不该有行内文案`).toBe(false);
+      expect(inputEl(w, key).getAttribute('aria-invalid'), `${key} 的框不该红`).not.toBe('true');
+    }
   });
 
   it('details.field=key/body ⇒ 那一行不标红，改为整页一行点名是哪一处', async () => {
