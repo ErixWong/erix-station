@@ -358,6 +358,11 @@ materializer 对所有 JSON 统一「**固定键序**（按渲染模板插入序
 | `erix-worker` | **1002** | 1000 | FDE 容器 | 每 run 一个；跑 `runToolLoop`/工具；无平台控制面凭据，可经 HOME 文件读取显式投放的 Git 凭据（§4.1.1） |
 | portal（materializer 写入身份） | **0（root）** | 0 | portal 容器 | 控制面：需 `chown`（把工作区目录属主设成 1000）、写 Docker API、写 Traefik 动态配置（600）与 LLM key 文件 |
 
+> **这三个 UID 由镜像固定，不是 env 旋钮**：`runner/Dockerfile` 用 `useradd -u 1000/1001/1002` 建号、
+> 启动时 `setpriv` drop 到 1001 —— 改 UID 要改 Dockerfile 并重建镜像。**唯一的 env 例外是 `FDE_WORKER_UID`**
+> （agentd fork worker 时切 UID 用；portal 侧也读它写 git `safe.directory`）。曾有的 `FDE_AGENTD_UID` 是死键
+> （读进 config 无人消费，UID 早已焊在镜像里），已于 #677 env 清理删除。
+
 > 三 UID（1000/1001/1002）共享 GID 1000，是为了让 agentd（1001）能建 worktree、worker（1002）能读写工作区（见 §6.2 组权限），同时保持三者 UID 不同——worker（1002）读不到 agentd（1001）的 `/proc/<pid>/environ`，token 不泄漏（runner §11.3 的「不同 UID 优先」落地）。
 
 ### 6.2 目录/文件权限与 umask

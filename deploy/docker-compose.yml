@@ -280,7 +280,6 @@ services:
       # 地址；LiteLLM 默认发布在 4100，可通过 LITELLM_HOST_PORT 为隔离栈指定独立端口。
       LLM_GATEWAY_HOST: ${LLM_GATEWAY_HOST:-http://127.0.0.1:4100}
       # issue #117：预留 gateway admin 配置供后续阶段使用；当前 portal 不调用这些配置。
-      LLM_GATEWAY_MODE: ${LLM_GATEWAY_MODE:-self}
       LLM_GATEWAY_ADMIN_URL: ${LLM_GATEWAY_ADMIN_URL:-http://station-litellm:4000}
       LLM_GATEWAY_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
       FDE_POOL: ${FDE_POOL:-default}
@@ -307,7 +306,6 @@ services:
       FDE_AGENT_VERSION: ${FDE_AGENT_VERSION:-dev}
       # FDE 内存限额（issue #27 已决 2026-09-18：默认 4g——B 档镜像下 dotnet build/chromium 峰值需要；`0` 不限）
       FDE_MEMORY_LIMIT: ${FDE_MEMORY_LIMIT:-4g}
-      FDE_AGENTD_UID: ${FDE_AGENTD_UID:-1001}
       FDE_WORKER_UID: ${FDE_WORKER_UID:-1002}
       # 预览 session 派生密钥（HMAC-SHA256，portal.md §2.7）；生产必须显式改掉此 dev 占位
       SESSION_SIGNING_KEY: ${SESSION_SIGNING_KEY:-erix-station-dev-signing-key-change-me}
