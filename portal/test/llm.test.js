@@ -2210,7 +2210,6 @@ async function startAdminServer(seed = {}) {
     kdfConcurrency: 2,
     kdfQueueLimit: 100,
     kdfQueueTimeoutMs: 30000,
-    maxBodyBytes: 64 * 1024,
     staticDir,
   };
   const pool = new HttpLlmPool(seed);

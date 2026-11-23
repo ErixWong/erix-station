@@ -74,7 +74,7 @@ async function startStack({ users = [ENABLED, DISABLED, UNKNOWN, NO_SEAT, RESTRI
     loginRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
     totpRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 5, maxEntries: 100 },
     kdfConcurrency: 2, kdfQueueLimit: 10, kdfQueueTimeoutMs: 30_000,
-    maxBodyBytes: 64 * 1024, maxLoginLength: 128, maxPasswordLength: 256,
+    maxLoginLength: 128, maxPasswordLength: 256,
     staticDir,
     userSpaceRoot: userspace,
     // 属主：默认取**本进程真的能设**的值（非 root 只能 chown 到自身 uid / 所属组，

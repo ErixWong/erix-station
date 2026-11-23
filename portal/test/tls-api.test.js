@@ -73,7 +73,6 @@ async function startServer({ dynamicDir, connect } = {}) {
     kdfConcurrency: 1,
     kdfQueueLimit: 10,
     kdfQueueTimeoutMs: 1000,
-    maxBodyBytes: 64 * 1024,
     staticDir,
     // #456：证书面依赖的三个配置（`loadConfig` 的真实字段名）
     traefikDynamicDir: dir,

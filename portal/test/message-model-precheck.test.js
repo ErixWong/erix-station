@@ -164,7 +164,6 @@ async function startServer({ binding = bindingRow(), gateway = fakeGateway(), po
     kdfConcurrency: 2,
     kdfQueueLimit: 100,
     kdfQueueTimeoutMs: 30000,
-    maxBodyBytes: 64 * 1024,
     maxLoginLength: 128,
     maxPasswordLength: 256,
     staticDir,

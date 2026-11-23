@@ -53,11 +53,12 @@ export const MIN_MAX_FILE_BYTES = 1024 * 1024;
 
 /**
  * 管理台允许的区间上限：1 GiB。
- * ⚠ 工单原文写的是「`≤ MAX_BODY_BYTES 上限`」，那条**照字面不可满足**：`MAX_BODY_BYTES` 默认
+ * ⚠ 工单原文写的是「`≤ JSON 请求体上限`」，那条**照字面不可满足**：JSON 请求体上限（`http.js` 的
+ * `DEFAULT_JSON_BODY_LIMIT`）默认
  * 64 KiB（`docs/env.md`），比 1 MiB 的下限还小 ⇒ 区间是空集。原因不是笔误而是口径错配——
  * 上传**根本不走** `readJsonBody`（`http.js#handleFileUpload` 的注释：走它任何真实文件都会 413），
  * 两个旋钮量的是不同的东西。这里取一个明确的产品天花板（1 GiB = 32 × 默认值），并在文档里写明
- * 它与 `MAX_BODY_BYTES` 无关；要放宽就改这一个常量。
+ * 它与 JSON 请求体上限无关；要放宽就改这一个常量。
  */
 export const MAX_MAX_FILE_BYTES = 1024 * 1024 * 1024;
 
