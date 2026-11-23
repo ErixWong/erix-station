@@ -3673,16 +3673,17 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**已迁的旋钮（四格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
+**已迁的旋钮（五格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
 
 | key | env 兜底位 | 值域 | `applyMode` | 生效点 |
 | --- | --- | --- | --- | --- |
 | `session.ttl_seconds` | `SESSION_TTL_SECONDS` | 整数 `60..2592000` 秒 | `hot` | 登录建会话 / 续期时现读 |
 | `workspace.retention_days` | `ERIX_WORKSPACE_RETENTION_DAYS` | 整数 `0..3650` 天（**`0` 是有效值** = 不自动清理） | `hot` | offboarding 循环每一拍现读 |
+| `preview.session_ttl_seconds` | `PREVIEW_SESSION_TTL_SECONDS` | 整数 `60..86400` 秒（默认 `900`；**`0` 非法**：签出来即过期） | `hot` | `handleForwardAuth` 签发 / 续期预览 cookie 时现读（`preview.js` 算 `expires_at` + `http.js` 的 `Set-Cookie` `Max-Age`，同一请求共用一次） |
 | `preview.ticket_ttl_seconds` | `PREVIEW_TICKET_TTL_SECONDS` | 整数 `1..3600` 秒（**`0` 非法**：签出来即过期） | `hot` | 签预览票时现读（批量整批共用一次） |
 | `session.auto_title_min_new` | `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 整数 `1..100` 轮（默认 `3`；**`0` 非法**：每拍重算标题） | `hot` | `evaluateAutoTitle()` 每次评估标题时现读（`session-title.js`） |
 
-四格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+五格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
 **上界 `3650` 是产品口径不是算术溢出**：超过 10 年的「离职保留」与「永不清理」在运维上不可区分，
 而后者已有确定表达（`0`）⇒ 上界外的值只能是把单位填错了（想写 30 天写成秒/毫秒那一族）。
 越界的 env 值被闸拦下后回落**默认 `0`**，是更保守的一档（少删目录，不会误删）。
