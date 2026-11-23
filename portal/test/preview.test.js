@@ -506,6 +506,48 @@ test('authorizeForwardAuth：有效预览 cookie → 200 放行 + 滚动续期',
   assert.equal(g.expires_at.getTime(), later(900).getTime());
 });
 
+test('#677 P3④ authorizeForwardAuth 现读入参：两个消费点都跟 sessionTtlSeconds（非快照 900）',
+  async () => {
+    // 这一格钉的是 `preview.js` 的两个消费者（handleTicket / handleSessionCookie）：
+    // 调用方（http.js）现读 `preview.session_ttl_seconds` 后把值递进来，两处算的 `expires_at`
+    // 必须跟入参，**不是** `config.previewSessionTtlSeconds`（快照 900）。变异①把消费者改回
+    // `config.previewSessionTtlSeconds` ⇒ 两半都算成 900 ⇒ 这一格点名红。
+    // config 的快照是 900、入参给 1800（两者拉开才能分清用的是哪一档）。
+    assert.equal(config.previewSessionTtlSeconds, 900, '快照必须是 900，才能与入参 1800 分辨');
+
+    // ① ticket 消费派生 session（handleTicket 的 expires_at）。
+    const { pool, grants } = makePool();
+    const ticket = 'pt_hot_ttl_ticket';
+    grants.push({
+      id: 'g1', token_hash: hashToken(ticket), user_id: 'u1', issuer_id: 'u1', allocation_id: 'pa1',
+      parent_ticket_id: null, kind: 'ticket', state: 'active', expires_at: later(60), used_at: null,
+      revoked_at: null,
+    });
+    await authorizeForwardAuth(pool, config, {
+      hostname: ALLOC.hostname, uri: `/?preview_ticket=${ticket}`, scheme: 'http', now: NOW,
+      sessionTtlSeconds: 1800,
+    });
+    const sess = grants.find((x) => x.kind === 'session');
+    assert.ok(sess, '派生 session 已落库');
+    assert.equal(new Date(sess.expires_at).getTime() - NOW.getTime(), 1800_000,
+      '派生 session expires_at 必须 = now + 1800s（不是快照 900）');
+
+    // ② cookie 滚动续期（handleSessionCookie 的 expires_at）。
+    const cookie = 's_hot_ttl_cookie';
+    const { pool: p2, grants: g2 } = makePool();
+    g2.push({
+      id: 'g4', token_hash: hashToken(cookie), user_id: 'u1', issuer_id: null, allocation_id: 'pa1',
+      parent_ticket_id: 'g-parent', kind: 'session', state: 'active', expires_at: later(600),
+      used_at: null, revoked_at: null,
+    });
+    await authorizeForwardAuth(p2, config, {
+      hostname: ALLOC.hostname, cookieValue: cookie, now: NOW, sessionTtlSeconds: 1800,
+    });
+    const refreshed = g2.find((x) => x.id === 'g4');
+    assert.equal(refreshed.expires_at.getTime() - NOW.getTime(), 1800_000,
+      '续期后的 expires_at 必须 = now + 1800s（不是快照 900）');
+  });
+
 test('authorizeForwardAuth：private 越权（非 owner 主体）→ 403', async () => {
   const { pool, grants } = makePool({
     users: [
