@@ -207,7 +207,7 @@ async function startStack({ configOverrides = {}, users = [ADMIN, UPLOADER, NO_U
     loginRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
     totpRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 5, maxEntries: 100 },
     kdfConcurrency: 2, kdfQueueLimit: 10, kdfQueueTimeoutMs: 30_000,
-    maxBodyBytes: 64 * 1024, maxLoginLength: 128, maxPasswordLength: 256,
+    maxLoginLength: 128, maxPasswordLength: 256,
     staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')),
     userSpaceRoot: userspace,
     fdeUid: process.getuid?.() ?? 1000,
@@ -440,7 +440,7 @@ test('US-13 迁移 0035：单行表 + bigint + CHECK > 0 + 幂等 + 末尾只读
 });
 
 test('US-14 loadConfig：FILE_UPLOAD_MAX_BYTES 的来源标注（给了但非法 ⇒ default，不许谎报 env）', () => {
-  const base = { MAX_BODY_BYTES: '1024' };
+  const base = { MAX_LOGIN_LENGTH: '128' };
   const unset = loadConfig(base);
   assert.equal(unset.fileUploadMaxBytes, DEFAULT_MAX_FILE_BYTES);
   assert.equal(unset.fileUploadMaxBytesSource, 'default');

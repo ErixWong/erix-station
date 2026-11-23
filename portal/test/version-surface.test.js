@@ -121,7 +121,7 @@ async function startServer(pool) {
       loginRateLimit: { maxFailures: 20, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
       totpRateLimit: { maxFailures: 20, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 20, maxEntries: 100 },
       kdfConcurrency: 1, kdfQueueLimit: 10, kdfQueueTimeoutMs: 1000,
-      maxBodyBytes: 64 * 1024, maxLoginLength: 128, maxPasswordLength: 256, staticDir,
+      maxLoginLength: 128, maxPasswordLength: 256, staticDir,
     },
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

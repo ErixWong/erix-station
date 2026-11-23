@@ -468,7 +468,7 @@ async function startUsageServer({ store, users = [ADMIN, ALICE] } = {}) {
     loginRateLimit: { maxFailures: 100, windowMs: 60_000, blockMs: 60_000, maxEntries: 10000 },
     totpRateLimit: { maxFailures: 100, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 100, maxEntries: 10000 },
     kdfConcurrency: 2, kdfQueueLimit: 100, kdfQueueTimeoutMs: 30000,
-    maxBodyBytes: 64 * 1024, maxLoginLength: 128, maxPasswordLength: 256,
+    maxLoginLength: 128, maxPasswordLength: 256,
     staticDir,
     baseDomain: BASE,
     portalPublicBaseUrl: PUBLIC_BASE,

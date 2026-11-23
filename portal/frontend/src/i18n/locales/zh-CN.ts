@@ -1122,7 +1122,7 @@ export const zhCN = {
       srcEnv: '环境变量那一档',
       srcDefault: '内置默认',
       envNotSet: '环境变量并未显式设置',
-      footnote: '这是**单文件**上限，不是磁盘总量上限（总量配额是 #485 片 B，未实现）。它与 MAX_BODY_BYTES（JSON 请求体口径，默认 64 KiB）是两个不同的旋钮：上传不走后者。',
+      footnote: '这是**单文件**上限，不是磁盘总量上限（总量配额是 #485 片 B，未实现）。它与 JSON 请求体上限（`http.js` 的模块常量 `DEFAULT_JSON_BODY_LIMIT`，默认 64 KiB；消息端点另走 `MESSAGE_BODY_LIMIT` 1 MiB）是两个不同的旋钮：上传不走后者。',
     },
     // issue #596 片 B：管理台「提示词」面板（views/AdminPromptsView.vue，契约 docs/api/portal.md §4.19）。
     // 三条生效时机各不相同 ⇒ 故意是三个键而不是一个共用句（判据 F7：三张卡不许共用一句）。

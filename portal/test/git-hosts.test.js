@@ -115,7 +115,6 @@ async function startHttpServer() {
     kdfConcurrency: 1,
     kdfQueueLimit: 10,
     kdfQueueTimeoutMs: 1000,
-    maxBodyBytes: 64 * 1024,
     staticDir: process.cwd(),
   };
   const pool = new HttpGitHostPool();

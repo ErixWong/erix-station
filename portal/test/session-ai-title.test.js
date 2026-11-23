@@ -114,7 +114,6 @@ async function startServer(poolOpts = {}) {
     kdfConcurrency: 2,
     kdfQueueLimit: 100,
     kdfQueueTimeoutMs: 30000,
-    maxBodyBytes: 64 * 1024,
     llmGatewayUrl: 'http://127.0.0.1:4100',
     llmGatewayAdminUrl: 'http://station-litellm:4000',
     maxLoginLength: 128,

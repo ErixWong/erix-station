@@ -62,7 +62,6 @@ async function startServer({ users = [], overrides = {}, pool: customPool, llmGa
     kdfConcurrency: 2,
     kdfQueueLimit: 100,
     kdfQueueTimeoutMs: 30000,
-    maxBodyBytes: 64 * 1024,
     maxLoginLength: 128,
     maxPasswordLength: 256,
     staticDir,
@@ -690,17 +689,20 @@ test('登录失败限流：连续失败达阈值 → 429 rate_limited + Retry-Af
 });
 
 test('超大请求体 → 413 payload_too_large 标准错误信封', async () => {
-  const s = await startServer({ overrides: { maxBodyBytes: 100 } });
+  // 全站默认 JSON 请求体上限 64 KiB（`DEFAULT_JSON_BODY_LIMIT`，issue #677 由模块常量承载）：
+  // 登录端点不传显式上限 ⇒ 走默认。发一个明显超过 64 KiB 的 body 验证默认闸仍生效且未被放大。
+  const s = await startServer();
   try {
     const r = await fetch(`${s.base}/api/auth/login`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ login: 'alice', password: 'x'.repeat(200) }),
+      body: JSON.stringify({ login: 'alice', password: 'x'.repeat(70 * 1024) }),
     });
     assert.equal(r.status, 413);
     const body = await r.json();
     assert.equal(body.error.code, 'payload_too_large');
     assert.ok(body.error.message);
     assert.equal(body.error.retryable, false);
+    assert.equal(body.error.details.max_bytes, 65536, '全站默认上限必须是 64 KiB（不许被放大）');
   } finally {
     await s.close();
   }
@@ -991,7 +993,6 @@ test('KDF 队列满 → 503 kdf_busy（快速失败，不无限排队）', async
     kdfConcurrency: 1,
     kdfQueueLimit: 0,
     kdfQueueTimeoutMs: 30000,
-    maxBodyBytes: 64 * 1024,
     maxLoginLength: 128,
     maxPasswordLength: 256,
     staticDir,
