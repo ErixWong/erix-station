@@ -1928,27 +1928,35 @@ function validateUnsupported(items, root = REPO_ROOT, detected = null) {
  * 扫描结果 ↔ `unsupported` 登记的咬合（**fail closed 的那半**）：
  *   · 扫出来没登记 ⇒ 红（「解析不出名字」不能是免费的）；
  *   · 登记了但扫描器现在认不出来 ⇒ 红（过期条目 = 第二本账）；
- *   · 读形对得上但行号漂了 ⇒ 红（坐标必须现跑核对，不许靠记忆）。
+ *   · 读形对得上但行号漂了 ⇒ 红（坐标必须现跑核对，不许靠记忆）；
+ *   · **核销单位是「出现」不是「行」**（返修 HIGH / #587 审计）：扫描器按出现逐条推入，同一行两处
+ *     动态读是两条独立账；若按坐标（`路径:行`）核销，一条登记会把整行核销掉，第二处动态读就
+ *     「再没人要求解释」= 静默漏账（正是这道闸门要消灭的）。所以下面用**检出对象身份**当核销键、
+ *     且只在**尚未被核销**的检出里找 ⇒ 一条登记恰好核销一条出现，缺一处就红。
  */
 function unsupportedProblems(detected, registered) {
   const problems = [];
-  const matched = new Set();
+  const matched = new Set();          // 已核销的「出现」（存检出条目本身，不存 `at` 字符串）
   for (const r of registered) {
     const { rel, line } = splitCoord(r.at);
-    const hit = detected.find((d) => splitCoord(d.at).rel === rel && normRead(d.shape) === normRead(r.read));
+    // 先要**同一行**上、读形对得上、且还没被别的登记核销掉的那一条；同一行没有再退一步找别行（判漂移）。
+    const free = (d) => !matched.has(d) && splitCoord(d.at).rel === rel
+      && normRead(d.shape) === normRead(r.read);
+    let hit = detected.find((d) => free(d) && splitCoord(d.at).line === line);
+    let drifted = false;
+    if (!hit) { hit = detected.find(free); drifted = hit != null; }
     if (!hit) {
       problems.push(`unsupported 登记的 ${r.at}（read=${r.read}）扫描器现在**认不出来** ⇒ 过期条目：那个读形已改形或已删，删掉这条登记`);
       continue;
     }
-    const hitLine = splitCoord(hit.at);
-    if (hitLine.line !== line) {
+    if (drifted) {
       problems.push(`unsupported 登记的坐标 ${r.at} **行号漂了**：同一个读形现在在 ${hit.at} ⇒ 现跑一次更新坐标（别删条目了事）`);
       continue;
     }
-    matched.add(hit.at);
+    matched.add(hit);
   }
   for (const d of detected) {
-    if (matched.has(d.at)) continue;
+    if (matched.has(d)) continue;
     problems.push(`扫描器在 ${d.at} 发现一个**解析不出 env 名**的读取 ${d.shape}，但没登记在 deploy/env-legs-exceptions.json 的 \`unsupported\` 段`
       + ' ⇒ 动态读形静默漏过 = #557 的根因形状；登记它并写明理由（或把它改成字面量读形）');
   }
@@ -4196,6 +4204,37 @@ test('#587-S2-⑦ 真树不许静默：扫描面里每一处三形（含拷贝�
     assert.deepEqual(s2Coords(buildEnvSiteIndex(delDir), 'ERIX_S2_DEL_DIRECT'), ['a.js:1(dot)'],
       '`delete process.env.KEY` 的旧口径变了 ⇒ 本步只该加别名识别，不该改读写判定');
   } finally { fs.rmSync(delDir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑧ 同一行两处动态读 ⇒ 逐条核销：一条登记只盖一处，另一处静默消失必须红', () => {
+  // 夹具：同一行两处 `Reflect.get(process.env, <动态名>)` ⇒ 扫描器推入**两条** unsupported，
+  // 坐标相同（同 `路径:行`）但 shape/expr 不同。旧口径按坐标核销 ⇒ 一条登记把整行核销掉，
+  // 第二处动态读再没人要求解释（静默漏账）。
+  const dir = fixtureRoot({
+    'lib/same-line.js': [
+      'export const a = Reflect.get(process.env, nameA) + Reflect.get(process.env, nameB);',
+      'const nameA = pick(); const nameB = pick();',
+    ].join('\n'),
+  });
+  try {
+    const scan = scanEnvReads(dir);
+    const detected = scan.unsupported.filter((u) => u.at.startsWith('lib/same-line.js'));
+    // 前置：扫描器确实**按出现**推了两条，坐标同一个 ⇒ 这是「同一行两条账」的靶子。
+    assert.equal(detected.length, 2, `同一行两处动态读应检出 2 条（实际 ${JSON.stringify(detected)}）`);
+    assert.equal(new Set(detected.map((d) => d.at)).size, 1,
+      '两条动态读应在**同一个坐标**（同一行）上，否则本夹具没测到同一行漏账');
+    const at = detected[0].at;
+    const reg = (d) => ({ at: d.at, read: d.shape, reason: '名字由调用方拼，值域见 lib/same-line.js:2' });
+    // 只登记**一条** ⇒ 另一处动态读没被核销 ⇒ 咬合尺必须点名它（红）。
+    const oneProblems = unsupportedProblems(detected, [reg(detected[0])]);
+    assert.ok(oneProblems.length >= 1,
+      `只登记一条时另一处动态读必须报「没登记」（实际 ${JSON.stringify(oneProblems)}）`);
+    assert.match(oneProblems.join('\n'), new RegExp(`扫描器在 ${at.replace(/[.]/g, '\\.')}`),
+      '报错文案必须点名那一行的漏账坐标');
+    // 两条都登记 ⇒ 全部核销 ⇒ 绿。
+    assert.deepEqual(unsupportedProblems(detected, detected.map(reg)), [],
+      '两处都登记了却还报未核销 ⇒ 核销逻辑过头了');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
