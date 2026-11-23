@@ -2242,7 +2242,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'PUT') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       // 额度/周期直接交给 setFdeBudget 校验（金额：null 或 ≤ 上限的有限正数；周期：白名单 '1d'/'1mo'）；
       // 非法值⇒ LlmError validation_failed→ 400。budget_period 缺省⇒ setFdeBudget 内部默认 '1mo'。
       const quota = await llm.setFdeBudget(ctx.pool, {
