@@ -1241,8 +1241,10 @@ station-portal user enable  --login <login>
 
 | 字段 | 说明 |
 |---|---|
-| `content` | 必填，非空字符串 |
+| `content` | 必填，非空字符串，**≤ 100,000 字符**（业务上限，超限 `400 validation_failed` + `details.field='content'`） |
 | `attachments` | 可选，数组，元素 `{ "kind": "file\|image", "path": "<容器内路径>", "name": "..." }`；P1 仅支持引用容器内已存在路径 |
+
+> **两层上限（issue #677）**：**业务上限** `content` ≤ 100,000 字符（`sessions.js` 的 `MAX_MESSAGE_CONTENT_LENGTH`），超限 ⇒ `400 validation_failed` 且 `details.field='content'`；**传输上限** 请求体整体 ≤ **1 MiB**（`http.js` 的 `MESSAGE_BODY_LIMIT`），超限 ⇒ `413 payload_too_large` 且 `details.max_bytes` = 本端点上限。两层分层且互不误伤：一条中文 `content` 取满业务上限约 **300 KB**（UTF-8 每字符 3 字节），远超全站默认的 **64 KiB** 传输闸，故本端点与 §4.3a 单独放宽到 1 MiB（约束：> 业务上限 × 3 且 ≤ `MAX_ROUND_BYTES`），让「content 过长」这条业务错误真的可达（而不是先被传输层 413）。
 
 响应 `202`（已受理；run 异步执行，进展走 SSE）：
 
@@ -1257,7 +1259,8 @@ station-portal user enable  --login <login>
 
 | HTTP | code | 场景 |
 |---|---|---|
-| 400 | `validation_failed` | content 为空 |
+| 400 | `validation_failed` | content 为空 / 超过 100,000 字符（`details.field='content'`） |
+| 413 | `payload_too_large` | 请求体整体超过 **1 MiB**（`MESSAGE_BODY_LIMIT`）；`details.max_bytes` = 本端点上限（区别于全站默认的 64 KiB） |
 | 404 | `not_found` | session 不存在/不属本人 |
 | 409 | `run_in_progress` | 该 session 已有进行中 run |
 | 409 | `llm_model_not_found` | **绑定的模型在网关里已不存在**（#261014 切片 B2）：属主 active binding 的某个已配置槽位 `model_info.id` 不在网关 `/model/info` 里。`details` = `{slot, model_id}`；判据/选型理由见 §1.2。预检位置：体校验与幂等占位之后、**开业务事务与写 transcript 之前** ⇒ 失败时**不留用户消息、不入队 run、不把失败钉进幂等台账**（走 `release` 路径，同 key 可原样重试）。网关不可达时放行（消息照发）；无活绑定由下一条 `llm_not_configured` 负责 |
@@ -1279,7 +1282,7 @@ station-portal user enable  --login <login>
 
 | 字段 | 说明 |
 |---|---|
-| `content` / `attachments` | 与 §4.3 逐字同规则（同一个 `validateMessageBody`） |
+| `content` / `attachments` | 与 §4.3 **逐字同规则**（同一个 `validateMessageBody`），两层上限也同 §4.3：`content` ≤ 100,000 字符（业务闸，超限 `400 validation_failed` + `details.field='content'`），请求体整体 ≤ **1 MiB**（传输闸 `MESSAGE_BODY_LIMIT`，超限 `413 payload_too_large` + `details.max_bytes`）——本端点与 §4.3 共用同一个 `readJsonBody(req, MESSAGE_BODY_LIMIT)`，两层口径完全一致 |
 | `kind` | `"steer"`（**转向**：当前轮跑完就停下，用这句话继续）\| `"follow_up"`（**排队**：当前任务正常结束后按顺序发）。缺省 `steer`。其它值 → 400 |
 
 响应 `202`（与 §4.3 同码：两条路都是「已受理，后续异步发生」——直发那路是等 runner 领，入队那路是等终态投），两种形状（**前端两种都必须认**）：
@@ -2720,7 +2723,7 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 `certPem` = **整份 fullchain**（**叶子必须在前**；顺序反了会被 400 拒，见下表 4a/4b），
 `keyPem` = 对应私钥。两份各 **≤ 64 KiB**（超 ⇒ `400 validation_failed` + `details.field`）。
 **落盘字节 = 你提交的原样字节**（不重排、不裁剪、不重新序列化；`certs/tls.crt` 逐字节等于请求里的 `certPem`）。
-> 体级闸：本端点的请求体整体上限 **256 KiB**（不是默认的 `MAX_BODY_BYTES` 64 KiB——两份 64 KiB 的 PEM
+> 体级闸：本端点的请求体整体上限 **256 KiB**（不是默认的 JSON 请求体上限 64 KiB（`http.js` 的 `DEFAULT_JSON_BODY_LIMIT`）——两份 64 KiB 的 PEM
 > 加上 JSON 转义放不进 64 KiB，那样会先撞 `413 payload_too_large` 而拿不到字段级错误）。超过 256 KiB 仍是
 > `413 payload_too_large`（§1.2，全局语义不变）。
 `confirmDomains` 可选：前端把证书里提取到的名字预填成可编辑 input，用户删/补后回传；**它不能超出证书能力**。
@@ -2863,7 +2866,7 @@ Cookie: <会话 cookie>
 2. **流式落盘，不把 body 读进内存**。逐 chunk 写 temp（`fsutil.writeTempFileFromStream`）+ `fsync` +
    超限时**主动 destroy 流**并删 temp。上限**每次请求现取**，优先级 `upload_settings.max_file_bytes`（DB，管理台）
    `>` FILE_UPLOAD_MAX_BYTES `>` 默认 33554432（32 MiB）——取数与回落口径见 §4.15，env 旋钮见 `docs/env.md` §10.1。
-   反过来说：门户共用的 `MAX_BODY_BYTES`（64 KiB）**不适用**在这里 —— 那是 JSON 请求体的口径，
+   反过来说：门户共用的 JSON 请求体上限（默认 64 KiB，`http.js` 的 `DEFAULT_JSON_BODY_LIMIT`）**不适用**在这里 —— 那是 JSON 请求体的口径，
    拿它卡上传会把所有真实文件判成 413。
 3. **no-clobber 用 `link`，不用 `rename`**。`rename(2)` **总是替换**目标，所以「先 `lstat` 看存在、
    再 rename」这两步之间 agent（或另一个上传）创建了同名文件时会被**静默覆盖**。提交点用

@@ -4213,7 +4213,7 @@ delegate + #468 那几波推高，别再引旧数。）
 2. **不覆盖是默认**：目标存在 ⇒ `409 file_exists`（`details.path`）；`overwrite=1` 才覆盖。`rename` 的 `EISDIR`/`ENOTEMPTY` 映射成 `409 file_exists` + `details.reason='target_is_dir'`（否则是 500 裸错误）。
 3. **no-clobber 只有 `linkSync` 是保证**：`renameSync` **恒覆盖**（它就是覆盖语义），`lstat` 快路径是**优化不是安全保证**。实现 = 流式写 `.upload-*.tmp`（`O_CREAT|O_EXCL|O_NOFOLLOW`、`0600`）→ `fchown(fdeUid, fdeGid)` → `fchmod 0660` → `fsync` → `linkSync`（`EEXIST` ⇒ `false` ⇒ 409）。abort / 超限 ⇒ `unlink` 临时文件，**不留残留、不留半截文件**。
 4. **portal 以 root 跑 ⇒ 必须 `fchown` 同时给 uid 与 gid**：只给 uid 会留 `gid=0`（§8.71 同族），FDE 里的 agent（uid 1002 / 主组 1000）就改不动收到的文件。真机实测 `-rw-rw---- 1 eric eric` 逐条对过。
-5. **上限 32 MiB 独立于 `MAX_BODY_BYTES`**（`FILE_UPLOAD_MAX_BYTES`，`413 file_too_large` + `details.max_bytes`）。⚠ **compose 必须显式写 `environment`**——portal 服务**没有 `env_file`**，只在 `deploy/.env` 里加变量不生效（`deploy-env-defaults` 那族判据盯的就是这种两头说法）。
+5. **上限 32 MiB 独立于 JSON 请求体上限（默认 64 KiB）**（`FILE_UPLOAD_MAX_BYTES`，`413 file_too_large` + `details.max_bytes`）。⚠ **compose 必须显式写 `environment`**——portal 服务**没有 `env_file`**，只在 `deploy/.env` 里加变量不生效（`deploy-env-defaults` 那族判据盯的就是这种两头说法）。
 6. **`=== true` 全站，不许 `Boolean()`**：`Boolean('f') === true` 会让 `"false"` 字符串变成「已开启」。开关三处（`admin.js#safeUser`、`auth.js#toSessionUser`、前端 `stores/auth.ts`）全部 `=== true`；**前端缺键 = 未知 = 不显示按钮**（与 #390-A「键缺席不是 false」同一纪律）。
 
 **开关全链（片 A）**：迁移 **`0029-user-file-upload.sql`**（`ADD COLUMN IF NOT EXISTS … boolean NOT NULL DEFAULT false`，`schema.sql` 一字节未改）；`toSessionUser(row)` 是**唯一 DTO 构造器**（`authenticate` / `verifyTotp` / `loadActiveUser` / `findSessionUser` 四处共用，四处 SELECT 都必须带列——漏一处就是「登录后没按钮、刷新后有」）；`createUser` 的**复活分支显式 `file_upload_enabled = false`**（重新启用 = 重新授权，不继承旧权限）；管理台**三态**（缺键 = 未知 ⇒ 禁用保存，且保存只提交该字段，不顺手回写别的）。
@@ -4232,7 +4232,7 @@ delegate + #468 那几波推高，别再引旧数。）
 
 **现状（2026-11-10 退役核对）**：`#472` CLOSED；本单代码在现网 **v0.1.62** 里完好（`upload_disabled` / `file_upload_enabled` / `resolveJailedRoot` 均在，`schema_migrations` head = `0029-user-file-upload`）。**开关现状（决策者 2026-11-10 拍板）**：`eric` 的 `file_upload_enabled = true` **有意保留**（验收时开启，`audit_log` `2026-11-09 08:56:36Z`、`target=eric`；其余用户全 `false` = 出厂默认）——**别再当「探针残留」去复原它**。
 
-**已知边界**：v1 **无配额**（任一用户可写满 userspace，影响所有容器）——**已开单 [#485](https://github.com/ErixWong/erix-station/issues/485) 承接**（① 单文件上限进管理台、DB 优先 env；② 每 FDE 目录总量上限走**文件系统配额**，判据是「容器里 `dd` 也必须失败」，不是「上传被拦」）；`MAX_BODY_BYTES` 与上传上限是两套数，改一个不影响另一个；上传只落到 `~/projects/<project>` 内（沿用 `dirs.js` 同一个 jail 谓词，`resolveJailedRoot` 是从那里**抽出来的**，不是复制的第二份）。⚠ userspace 真实路径是 **`/srv/erix/users`**（`ERIX_USERSPACE_ROOT_HOST`），文档惯例写的 `/docker/erix/users` 在本机不存在，别照惯例 grep。
+**已知边界**：v1 **无配额**（任一用户可写满 userspace，影响所有容器）——**已开单 [#485](https://github.com/ErixWong/erix-station/issues/485) 承接**（① 单文件上限进管理台、DB 优先 env；② 每 FDE 目录总量上限走**文件系统配额**，判据是「容器里 `dd` 也必须失败」，不是「上传被拦」）；`JSON 请求体上限` 与上传上限是两套数，改一个不影响另一个；上传只落到 `~/projects/<project>` 内（沿用 `dirs.js` 同一个 jail 谓词，`resolveJailedRoot` 是从那里**抽出来的**，不是复制的第二份）。⚠ userspace 真实路径是 **`/srv/erix/users`**（`ERIX_USERSPACE_ROOT_HOST`），文档惯例写的 `/docker/erix/users` 在本机不存在，别照惯例 grep。
 
 ### 8.109 composer 输入框按内容自适应高度（issue #466 / #467，2026-11-10 落地）
 
@@ -6229,10 +6229,10 @@ env 值 ⇒ 值班看一眼就知道该去改哪一边。零新错误码（`vali
 都是既有码），所以 §1.2 无新增。
 
 **工单原文有一条口径本身是错的**（照字面做会做出一个空区间）：片 A 第 3 条写「范围校验
-`1 MiB ≤ v ≤ MAX_BODY_BYTES 上限`」。但 `MAX_BODY_BYTES` 默认 **64 KiB** < 1 MiB 下限 ⇒ 区间为空集；
+`1 MiB ≤ v ≤ JSON 请求体上限`」。但 JSON 请求体上限默认 **64 KiB** < 1 MiB 下限 ⇒ 区间为空集；
 根因不是笔误而是**口径错配** —— 上传**根本不走** `readJsonBody`（`http.js#handleFileUpload` 的注释：
 走它任何真实文件都会 413），两个旋钮量的是不同的东西。落地取明确产品天花板 **1 GiB**（= 32 × 默认值），
-理由写在 `upload-settings.js` 的常量注释与 §4.15，并把「它与 `MAX_BODY_BYTES` 无关」写进文档。
+理由写在 `upload-settings.js` 的常量注释与 §4.15，并把「它与 JSON 请求体上限无关」写进文档。
 
 **判据读数**（判绿只看退出码）：`portal/test/upload-settings.test.js` **14/14 通过**（US-1..US-14，含 HTTP 层
 真 tmp userspace + FakePool）；`portal/test/migrations.test.js` **31/31**（head 断言 34 → 35 全量进位：
@@ -9434,7 +9434,7 @@ dev 栈做法：`docker build -t erix-station/fde:local runner/` → `deploy/.en
 |---|---|---|
 | **限流类**（`LOGIN_RATE_LIMIT_*` / `TOTP_*` / `PREVIEW_TICKET_RATE_LIMIT_*` / `KDF_*` / `RATE_LIMIT_MAX_ENTRIES`） | 10 | **不做**：配置在启动时被 `createRateLimiter(config.x)` / `createSemaphore(...)` **封装进对象**且持有失败计数 ⇒ 现读不生效。要热生效只能 ① 改限流器 API 每次传配置（计数保留）或 ② 变更时重建（**会清空失败计数 ⇒ 管理员改配置等于给攻击者解封**）。这是安全语义决策，且与并行 session 的 LLM 额度工作相邻，**本 session 不碰** |
 | 容器注入类（`ERIX_MAX_ROUNDS` / `ERIX_ARTIFACT_*` / `ERIX_SHELL_*` / `ERIX_DELEGATE_*` 等 13 条） | 13 | **不做**：provisioner 注入 FDE 容器 env ⇒ 改 DB 只影响**新 provision** 的容器，进界面会造成「界面说 20、容器跑 15」两套真相 |
-| `MAX_BODY_BYTES` | 1 | 未做（49 个调用点，干净可做，留给后续） |
+| JSON 请求体上限 env（#677 前） | 1 | 已完成（#677：值降为 `http.js` 的 `DEFAULT_JSON_BODY_LIMIT` 模块常量（仍 64 KiB），env 本身删除，调用点走默认） |
 
 ### 教训
 

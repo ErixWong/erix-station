@@ -660,7 +660,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   // 默认值**同源**：三处（本模块 / config.js 的字面默认 / compose 的 `${...:-604800}`）必须同数。
   // 漂了的后果不是报错而是管理台显示一个机器实际不会用的数（口径照 `upload-settings.test.js` US-13）。
   assert.equal(entry.defaultValue, SESSION_TTL_DEFAULT_SECONDS);
-  assert.equal(SESSION_TTL_DEFAULT_SECONDS, loadConfig({ MAX_BODY_BYTES: '1024' }).sessionTtlSeconds,
+  assert.equal(SESSION_TTL_DEFAULT_SECONDS, loadConfig({ MAX_LOGIN_LENGTH: '128' }).sessionTtlSeconds,
     'registry 默认值必须等于 loadConfig 在干净 env 下算出的那个数');
   const compose = fs.readFileSync(new URL('../../deploy/docker-compose.yml', import.meta.url), 'utf8');
   assert.match(compose, /SESSION_TTL_SECONDS:\s*\$\{SESSION_TTL_SECONDS:-604800\}/,
@@ -685,7 +685,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   // 不是报错，而是管理台显示一个机器实际不会用的数 —— 口径照 RS-7 上半与 US-13）。
   assert.equal(retEntry.defaultValue, WORKSPACE_RETENTION_DEFAULT_DAYS);
   assert.equal(WORKSPACE_RETENTION_DEFAULT_DAYS, 0, '默认必须是 0 = 关（与 docs/env.md、compose 同一句话）');
-  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).workspaceRetentionDays,
+  assert.equal(loadConfig({ MAX_LOGIN_LENGTH: '128' }).workspaceRetentionDays,
     WORKSPACE_RETENTION_DEFAULT_DAYS,
     'registry 默认值必须等于 loadConfig 在干净 env 下算出的那个数');
   assert.match(compose, /ERIX_WORKSPACE_RETENTION_DAYS:\s*\$\{ERIX_WORKSPACE_RETENTION_DAYS:-0\}/,
@@ -722,7 +722,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   // 默认值**同源**：本模块 / `config.js` 的字面默认（15*60=900）/ compose 的 `${...:-900}` 三处同数。
   assert.equal(pstEntry.defaultValue, PREVIEW_SESSION_TTL_DEFAULT_SECONDS);
   assert.equal(PREVIEW_SESSION_TTL_DEFAULT_SECONDS, 900, '默认必须 900 = 15 分钟（三处同源）');
-  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).previewSessionTtlSeconds,
+  assert.equal(loadConfig({ MAX_LOGIN_LENGTH: '128' }).previewSessionTtlSeconds,
     PREVIEW_SESSION_TTL_DEFAULT_SECONDS,
     'registry 默认值必须等于 loadConfig 在干净 env 下算出的那个数');
   assert.match(compose, /PREVIEW_SESSION_TTL_SECONDS:\s*\$\{PREVIEW_SESSION_TTL_SECONDS:-900\}/,
@@ -2417,7 +2417,7 @@ test('RS-31 preview.ticket_ttl_seconds 的解析与校验：严格十进制正�
   assert.equal(PREVIEW_TICKET_TTL_MIN_SECONDS, 1);
   assert.equal(PREVIEW_TICKET_TTL_MAX_SECONDS, 3600, '1 小时');
   assert.equal(PREVIEW_TICKET_TTL_DEFAULT_SECONDS, 60, '与 config.js 同源');
-  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).previewTicketTtlSeconds,
+  assert.equal(loadConfig({ MAX_LOGIN_LENGTH: '128' }).previewTicketTtlSeconds,
     PREVIEW_TICKET_TTL_DEFAULT_SECONDS, 'registry 默认必须等于 loadConfig 干净 env 算出的数');
 
   for (const good of [1, 60, 3600, '1', '60', '3600', '060']) {
@@ -2930,7 +2930,7 @@ test('RS-40 session.auto_title_min_new 的解析与校验：严格十进制正�
   assert.equal(AUTO_TITLE_MIN_NEW_MIN, 1);
   assert.equal(AUTO_TITLE_MIN_NEW_MAX, 100);
   assert.equal(AUTO_TITLE_MIN_NEW_DEFAULT, 3, '与 config.js 同源');
-  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).sessionAutoTitleMinNew,
+  assert.equal(loadConfig({ MAX_LOGIN_LENGTH: '128' }).sessionAutoTitleMinNew,
     AUTO_TITLE_MIN_NEW_DEFAULT, 'registry 默认必须等于 loadConfig 干净 env 算出的数');
 
   for (const good of [1, 3, 100, '1', '3', '100', '003']) {
@@ -3216,7 +3216,7 @@ test('RS-46 第四格 env 也过 registry 那套闸 + 一次热读最多一条 w
     ['压根不是数', 'abc', 'not_a_auto_title_min_new'],
   ];
   for (const [label, raw, reason] of BAD) {
-    const cfg = loadConfig({ MAX_BODY_BYTES: '1024', ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw });
+    const cfg = loadConfig({ MAX_LOGIN_LENGTH: '128', ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw });
     const env = { ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw };
     invalidateAutoTitleMinNewCache();
     const hotLog = collectingLog();
@@ -3236,7 +3236,7 @@ test('RS-46 第四格 env 也过 registry 那套闸 + 一次热读最多一条 w
   for (const raw of ['1', '2', '100']) {
     invalidateAutoTitleMinNewCache();
     const log = collectingLog();
-    const cfg = loadConfig({ MAX_BODY_BYTES: '1024', ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw });
+    const cfg = loadConfig({ MAX_LOGIN_LENGTH: '128', ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw });
     assert.equal(await readAutoTitleMinNew({
       pool: ttlPool(), config: cfg, env: { ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw }, log,
     }), Number(raw), `env ${raw} 必须照收`);
@@ -3354,7 +3354,7 @@ test('RS-49 preview.session_ttl_seconds 的解析与校验：严格十进制正�
   assert.equal(PREVIEW_SESSION_TTL_MIN_SECONDS, 60);
   assert.equal(PREVIEW_SESSION_TTL_MAX_SECONDS, 86400);
   assert.equal(PREVIEW_SESSION_TTL_DEFAULT_SECONDS, 900, '与 config.js / compose 同源');
-  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).previewSessionTtlSeconds,
+  assert.equal(loadConfig({ MAX_LOGIN_LENGTH: '128' }).previewSessionTtlSeconds,
     PREVIEW_SESSION_TTL_DEFAULT_SECONDS, 'registry 默认必须等于 loadConfig 干净 env 算出的数');
 
   for (const good of [60, 900, 86400, '60', '900', '86400', '0900']) {
@@ -3638,7 +3638,7 @@ test('RS-55 第五格 env 也过 registry 那套闸 + 一次热读最多一条 w
     ['压根不是数', 'abc', 'not_a_session_ttl_seconds'],
   ];
   for (const [label, raw, reason] of BAD) {
-    const cfg = loadConfig({ MAX_BODY_BYTES: '1024', PREVIEW_SESSION_TTL_SECONDS: raw });
+    const cfg = loadConfig({ MAX_LOGIN_LENGTH: '128', PREVIEW_SESSION_TTL_SECONDS: raw });
     const env = { PREVIEW_SESSION_TTL_SECONDS: raw };
     invalidatePreviewSessionTtlCache();
     const hotLog = collectingLog();
@@ -3658,7 +3658,7 @@ test('RS-55 第五格 env 也过 registry 那套闸 + 一次热读最多一条 w
   for (const raw of ['60', '900', '86400']) {
     invalidatePreviewSessionTtlCache();
     const log = collectingLog();
-    const cfg = loadConfig({ MAX_BODY_BYTES: '1024', PREVIEW_SESSION_TTL_SECONDS: raw });
+    const cfg = loadConfig({ MAX_LOGIN_LENGTH: '128', PREVIEW_SESSION_TTL_SECONDS: raw });
     assert.equal(await readPreviewSessionTtlSeconds({
       pool: ttlPool(), config: cfg, env: { PREVIEW_SESSION_TTL_SECONDS: raw }, log,
     }), Number(raw), `env ${raw} 必须照收`);
