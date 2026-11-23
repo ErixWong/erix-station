@@ -3727,6 +3727,13 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   「库里现在是这个值」不会分离。
 - `400 validation_failed`，`details.field` 三档：`key`（未登记；`details.known` 列可用 key）、
   `value`（形状/区间不过）、`body`（体不是对象）。
+- **数值的两侧之分（`1e3` 这一类，#709 unproven 裁定）**：写侧只认 body 里的 JSON 类型。——
+  `{"value": 1e3}` 里的 `1e3` 是 **JSON number**（解析时已塌成整数），`1e3` 与 `1000` 是同一个值
+  ⇒ 区间内即 **`200` 收下、库里存 `1000`**（科学记数写法不会多出一套真相）；而 `{"value": "1e3"}`
+  是**字符串**，`validate` 只放 number ⇒ **`400 validation_failed`**（`details.field='value'`）。
+  这与 env 兜底位**相反**：env 那档走 `parse` 的 `/^[0-9]+$/`，`1e3` 过不了 ⇒ 视为没给、回落默认（见上方
+  env 那一档的口径与 `docs/env.md`）。一句话：`1e3` 写进 body 被收（=1000），写进 env / 当字符串都不算数。
+  判据 `runtime-settings.test.js` RS-31b。
 - 路径段不匹配 key 形状（`^[a-z][a-z0-9_.]{2,63}$`，与迁移 `0046` 的 `CHECK` 同形）⇒ `404`
   （「没有这个路由」，而不是拿去库里绕一圈）。
 - **写与审计在同一个事务里**（`BEGIN` → upsert → 审计 → 检查审计行数 === 1 → `COMMIT`）。
