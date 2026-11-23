@@ -1110,7 +1110,7 @@ export const en = {
       srcEnv: 'Environment variable',
       srcDefault: 'Built-in default',
       envNotSet: 'the environment variable is not explicitly set',
-      footnote: 'This is a **per-file** limit, not a disk quota (total size is #485 slice B, not implemented). It is a different knob from MAX_BODY_BYTES (the JSON request-body limit, 64 KiB by default): uploads never go through the latter.',
+      footnote: 'This is a **per-file** limit, not a disk quota (total size is #485 slice B, not implemented). It is a different knob from the JSON request-body limit (the `DEFAULT_JSON_BODY_LIMIT` module constant in `http.js`, 64 KiB by default; the message endpoints use a separate `MESSAGE_BODY_LIMIT` of 1 MiB): uploads never go through the latter.',
     },
     // issue #596 slice B: admin prompts panel (views/AdminPromptsView.vue, docs/api/portal.md §4.19).
     // The three effective moments differ, so they are three separate keys on purpose — one
