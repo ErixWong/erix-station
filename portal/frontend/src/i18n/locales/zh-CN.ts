@@ -1619,6 +1619,21 @@ export const zhCN = {
       // 409 active_run_conflict：前缀译，其后拼服务端原因（不译）
       conflictPrefix: '已拒绝（409）：',
       forceSave: '确认无影响，强制保存',
+      budgetTitle: '每日额度（USD/天）',
+      budgetLabel: '每日额度（USD）',
+      budgetPlaceholder: '留空 = 不限',
+      budgetSave: '保存额度',
+      budgetSaved: '额度已保存',
+      budgetTodaySpend: '今日已用',
+      budgetRemaining: '剩余',
+      budgetResetAt: '下次重置',
+      budgetUnlimited: '不限',
+      usageTitle: '近 14 天用量',
+      usageDate: '日期',
+      usageSpend: '花费 (USD)',
+      usageTokens: 'Token 合计',
+      usageEmpty: '暂无用量数据',
+      unpricedWarning: '所选模型里有未定价模型：其用量按 0 计，日额度对它不生效。',
     },
     // FDE 用户区（AdminView #fdeSection）
     fde: {
