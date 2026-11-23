@@ -104,6 +104,8 @@
 | LLM 管理 | `PATCH /api/admin/llm/models/:id` | **改模型：调用名 `call_name`（数据面）与显示名 `name` 是两个字段**（#296，§4.9） |
 | LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」 |
 | LLM 管理 | `DELETE /api/admin/llm/models/:id` | 删模型（附虚拟 key 清理） |
+| LLM 管理 | `GET/PUT /api/admin/fdes/:fde/llm/quota` | 读/设 **FDE 每日额度（USD/天）**（#719，§4.10） |
+| LLM 管理 | `GET /api/admin/fdes/:fde/llm/usage?days=14` | 近 N 天用量（直读 LiteLLM 聚合端点，#719，§4.10） |
 
 > LLM 管理这条线**其余**端点（供应商增删、`GET/PUT /api/admin/fdes/:name/llm`、
 > `POST /api/admin/fdes/:name/llm/heartbeat`、`GET /api/admin/llm/model-catalog`、
@@ -2395,6 +2397,23 @@ SELECT fde_id FROM fde_llm_bindings
   改名已在网关落定，把 PATCH 拖成 500 只会诱导管理员重试第二次改名；不自动回滚的理由同 §8.25。
 - 「门户内改名不是漂移源」这句话从此要打个补丁：**改名会把引用它的 FDE 变成漂移**（`*_model_name`
   暂时指向旧名），立即对账就是为了让这个窗口尽量短——就地注释见 `AGENTS.md` §8.25。
+
+### 4.10 管理台 FDE 每日额度与用量（`/api/admin/fdes/:fde/llm/quota` · `/usage`，#719）
+
+额度口径：**单位 USD/天**，落 LiteLLM 虚拟 key 的 `max_budget` + `budget_duration:"1d"`；
+DB 真相位 = `fde_llm_bindings.daily_budget_usd`（迁移 0047，`NULL`=不限额）。portal **绝不自算 token**，
+今日与历史用量全读 LiteLLM 自己的端点。三个端点均**需 admin**（`requireAdmin`，非 admin ⇒ 403 `forbidden`）；
+`:fde` 路径参数走与其余 admin 端点同一套 `validateFdeName`（非法语法 ⇒ 400 `validation_failed`，`details.field='fde_name'`）。
+
+| 方法 + 路径 | 请求 | 成功响应 | 错误 |
+| --- | --- | --- | --- |
+| `PUT /api/admin/fdes/:fde/llm/quota` | body `{ daily_budget_usd: number \| null }`（`null` = 不限；否则需为 ≤ 100000 的有限正数）| `200 { quota }`（形状同 GET）| `400 validation_failed`（`details.field='daily_budget_usd'`：0/负/NaN/超上限；**此时不调网关、不写 DB**）；`404 not_found`（无 active litellm binding）；`502`/`503`/`504` `LlmGatewayError`（网关失败 ⇒ **不写 DB**，宁可保持旧值也不造 DB/key 分叉） |
+| `GET /api/admin/fdes/:fde/llm/quota` | — | `200 { quota }`：`{ daily_budget_usd, max_budget, budget_duration, budget_reset_at, spend, remaining }`（`remaining = max_budget - spend`，无额度时 `null`；`daily_budget_usd` 取自 DB，其余取自 `keyInfo`）| `404 not_found`（无 active binding）；`5xx` 同上。**响应永不出现完整 `api_key`** |
+| `GET /api/admin/fdes/:fde/llm/usage?days=14` | `days` 缺省 14；需为 1–90 的整数 | `200 { days: [{ date, spend, prompt_tokens, completion_tokens, total_tokens, api_requests }], totals: { spend, total_tokens } }`（日期区间按本地 UTC+8算，向 LiteLLM 传 `timezone=480`）| `400 validation_failed`（`details.field='days'`：非整数 / <1 / >90）；`404 not_found`（无 binding 或无 `gateway_user_id`）；`5xx` 同上 |
+
+为什么 PUT **先网关后 DB**：额度活在 key 上，网关写失败而 DB 已改 ⇒ 下次重铸 key 会从新值下发、但当前 key 仍旧额度（分叉）；反之若先写库后网关失败则库里有额度、key 上没有。取“宁可旧值”，**网关成功才落库**。
+
+错误映射零新码（§8.20）：额度校验复用 `LlmError('validation_failed')`、`not_found`；网关不可达沿用 `LlmGatewayError`→`httpStatus`。实现见 `portal/src/llm.js` 的 `setFdeDailyBudget` / `getFdeDailyBudget` / `getFdeDailyUsage`；行为以 `portal/test/llm.test.js` 为准。
 
 ### 4.11 文件预览四通道与 kkFileView 网关（issue #366）
 
