@@ -346,11 +346,11 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
   });
 });
 
-describe('UserLlmPane · 每日额度（#719）', () => {
+describe('UserLlmPane · 周期额度（#719）', () => {
   const QUOTA = {
     quota: {
-      daily_budget_usd: 5, max_budget: 5, budget_duration: '1d',
-      budget_reset_at: '2026-11-24T16:00:00Z', spend: 1.25, remaining: 3.75,
+      budget_usd: 5, budget_period: '1mo', max_budget: 5, budget_duration: '1mo',
+      budget_reset_at: '2026-11-24T16:00:00Z', spend: 1.25, remaining: 3.75, spend_scope: 'period',
     },
   };
   const USAGE = {
@@ -380,7 +380,7 @@ describe('UserLlmPane · 每日额度（#719）', () => {
     const fetchFn = fetchMock((url, init) => extra?.(url, init)
       ?? (url === '/api/admin/fdes/alice/llm' && !init?.method
         ? jsonResponse(200, GET_CONFIG)
-        : url === '/api/admin/fdes/alice/llm/quota' && !init?.method
+        : url === '/api/admin/fdes/alice/llm/budget' && !init?.method
           ? jsonResponse(200, QUOTA)
         : url.startsWith('/api/admin/fdes/alice/llm/usage') && !init?.method
           ? jsonResponse(200, USAGE)
@@ -399,49 +399,70 @@ describe('UserLlmPane · 每日额度（#719）', () => {
   }
 
   const quotaPuts = (fetchFn: ReturnType<typeof fetchMock>) =>
-    fetchFn.mock.calls.filter(([u, i]) => String(u).includes('/llm/quota') && i?.method === 'PUT');
+    fetchFn.mock.calls.filter(([u, i]) => String(u).includes('/llm/budget') && i?.method === 'PUT');
 
-  it('渲染今日已用 / 剩余 / 本地重置时刻，以及近 14 天用量表', async () => {
+  it('渲染本周期已用（spend_scope=period）/ 剩余 / 本地重置时刻；周期下拉默认 1mo；近 30 天表与 UTC 桶注释', async () => {
     const { wrapper } = await mountQuota();
     expect(wrapper.find('[data-test="daily-budget"]').exists()).toBe(true);
+    // spend_scope=period ⇒ 标签「本周期已用」
+    expect(wrapper.find('[data-test="budget-state"]').text()).toContain('本周期已用');
     expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('1.25');
     expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('3.75');
+    // 周期下拉：默认 1mo（GET budget 回显 budget_period=1mo），两个选项每月/每日
+    const periodSel = wrapper.find('[data-test="budget-period"]').element as HTMLSelectElement;
+    expect(periodSel.value).toBe('1mo');
+    expect(wrapper.find('[data-test="budget-period"]').findAll('option').map((o) => o.text()))
+      .toEqual(['每月', '每日']);
     // 重置时刻：本地时区格式化（不是原始 ISO 串）
     const expectedReset = new Date('2026-11-24T16:00:00Z').toLocaleString();
     expect(wrapper.find('[data-test="budget-reset"]').text()).toBe(expectedReset);
     expect(wrapper.find('[data-test="budget-reset"]').text()).not.toContain('2026-11-24T16:00:00Z');
-    // 近 14 天表：两行，日期/花费/token
+    // 近 30 天表：两行 + UTC 日桶说明
     const rows = wrapper.findAll('[data-test="usage-row"]');
     expect(rows).toHaveLength(2);
     expect(rows[0].text()).toContain('2026-11-22');
     expect(rows[0].text()).toContain('150');
-    // 额度回显：GET quota 的 daily_budget_usd 进输入框
+    expect(wrapper.find('[data-test="daily-budget"]').text()).toContain('按 UTC 日分桶，与额度周期无关');
+    // 额度回显：GET budget 的 budget_usd 进输入框
     expect((wrapper.find('[data-test="budget-input"]').element as HTMLInputElement).value).toBe('5');
   });
 
-  it('保存发出正确 body {daily_budget_usd:number}；保存成功后回显', async () => {
+  it('spend_scope=lifetime（无额度）⇒ 已用标签为「累计已用（未设额度）」，不是「本周期已用」', async () => {
+    const { wrapper } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/budget') && !init?.method) {
+        return jsonResponse(200, { quota: { budget_usd: null, budget_period: null, max_budget: null, budget_duration: null, budget_reset_at: null, spend: 0.084178176, remaining: null, spend_scope: 'lifetime' } });
+      }
+      return undefined;
+    });
+    expect(wrapper.find('[data-test="budget-state"]').text()).toContain('累计已用（未设额度）');
+    expect(wrapper.find('[data-test="budget-state"]').text()).not.toContain('本周期已用');
+    expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('0.084178176');
+  });
+
+  it('保存发出正确 body {budget_usd:number, budget_period}；保存成功后回显', async () => {
     const { wrapper, fetchFn } = await mountQuota((url, init) => {
-      if (String(url).includes('/llm/quota') && init?.method === 'PUT') {
-        return jsonResponse(200, { quota: { daily_budget_usd: 10, max_budget: 10, budget_duration: '1d', budget_reset_at: '2026-11-24T16:00:00Z', spend: 0, remaining: 10 } });
+      if (String(url).includes('/llm/budget') && init?.method === 'PUT') {
+        return jsonResponse(200, { quota: { budget_usd: 10, budget_period: '1mo', max_budget: 10, budget_duration: '1mo', budget_reset_at: '2026-11-24T16:00:00Z', spend: 0, remaining: 10, spend_scope: 'period' } });
       }
       return undefined;
     });
     await wrapper.find('[data-test="budget-input"]').setValue('10');
+    await wrapper.find('[data-test="budget-period"]').setValue('1mo');
     await wrapper.find('[data-test="budget-save"]').trigger('click');
     await flushPromises();
     const puts = quotaPuts(fetchFn);
     expect(puts).toHaveLength(1);
-    expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ daily_budget_usd: 10 });
+    expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ budget_usd: 10, budget_period: '1mo' });
     expect(wrapper.find('[data-test="budget-msg"]').text()).toBe('额度已保存');
-    // 回显：PUT 响应的 quota.daily_budget_usd=10 回填输入框与剩余
+    // 回显：PUT 响应的 quota.budget_usd=10 回填输入框与剩余
     expect((wrapper.find('[data-test="budget-input"]').element as HTMLInputElement).value).toBe('10');
     expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('10');
   });
 
-  it('输入框留空 → 保存发 {daily_budget_usd:null}（清空 = 不限）', async () => {
+  it('输入框留空 → 保存发 {budget_usd:null}（清空 = 不限，period 一并清空不发送）', async () => {
     const { wrapper, fetchFn } = await mountQuota((url, init) => {
-      if (String(url).includes('/llm/quota') && init?.method === 'PUT') {
-        return jsonResponse(200, { quota: { daily_budget_usd: null, max_budget: null, budget_duration: null, budget_reset_at: null, spend: 0, remaining: null } });
+      if (String(url).includes('/llm/budget') && init?.method === 'PUT') {
+        return jsonResponse(200, { quota: { budget_usd: null, budget_period: null, max_budget: null, budget_duration: null, budget_reset_at: null, spend: 0, remaining: null, spend_scope: 'lifetime' } });
       }
       return undefined;
     });
@@ -449,7 +470,7 @@ describe('UserLlmPane · 每日额度（#719）', () => {
     await wrapper.find('[data-test="budget-save"]').trigger('click');
     await flushPromises();
     const puts = quotaPuts(fetchFn);
-    expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ daily_budget_usd: null });
+    expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ budget_usd: null });
     // 清空后 remaining = null ⇒ 显示「不限」
     expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('不限');
   });
