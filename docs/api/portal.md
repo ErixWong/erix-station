@@ -2078,7 +2078,9 @@ COMMIT
 > **为什么要它**：预览票是 **host 级**的（一张票只绑一条 allocation / 一个 host，§2.8），而一个 FDE 拿到的是
 > **一整段** `PREVIEW_PORT_COUNT`（默认 10）个 host ⇒ 前后端分离的应用（前端 22000 + 后端 22001）
 > 要逐个点「打开预览」，真机实测「跳 host 要点 2 次」。本端点把「一次点击 = 签 N 张票」变成**一次请求**，
-> 前端一次点击开 N 个标签页。**票的语义一个字没变**（仍然一次性、60 秒、host 级、逐张落 `preview_grants`）。
+> 前端一次点击开 N 个标签页。**票的语义一个字没变**（仍然一次性、host 级、逐张落 `preview_grants`；
+> 有效期是**默认 60 秒**、**可在管理台改**（`preview.ticket_ttl_seconds`，区间 `1..3600`，§4.21），
+> 改完**下一张签出的票**才用新值——已发出的票不改寿命）。
 
 请求体（可选字段）：
 
@@ -2155,7 +2157,7 @@ COMMIT
 > 已有的 `withFdeLock` 锁键是 `fde:${fdeName}`，**串行化不了不同 FDE 抢同一个空闲块**，
 > 所以「迁移 0019 的全局部分唯一索引 + 新事务重算」才是正解，不要指望加锁（规格 §8.2）。
 
-> **前端已接入（#246 交付② 单 B）**；#247 的批量端点也已接入：工作台左侧栏的预览端口面板有「打开全部预览 / Open all previews」，一次点击 = 签 + 开 N 个标签页（**不做二次确认**——票 60 秒过期）；弹窗被拦时面板给出带票的可点链接列表兜底。批量签票**同样只在点击时发生**（挂载/折叠/刷新都不签）。
+> **前端已接入（#246 交付② 单 B）**；#247 的批量端点也已接入：工作台左侧栏的预览端口面板有「打开全部预览 / Open all previews」，一次点击 = 签 + 开 N 个标签页（**不做二次确认**——票默认 60 秒过期，有效期可在管理台改 `1..3600`、下一次签票生效）；弹窗被拦时面板给出带票的可点链接列表兜底。批量签票**同样只在点击时发生**（挂载/折叠/刷新都不签）。
 
 ### 4.8 工具审批（Approvals）
 
@@ -3758,16 +3760,25 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 停摆，只是退回用 env/默认那一档（默认 `0` = 不删，安全侧）。
 ⚠ `0` 在 sweep 里判的是**传进来的那个数**，不是启动期快照（`config.workspaceRetentionDays` 只做缺省值）。
 
-`preview.ticket_ttl_seconds` 也是 `hot`（#677 P3 第二批）：`POST /api/preview/ticket` 与
-`POST /api/preview/tickets` **每次签票现读**，新 TTL 下一张票就换。**不写进票**：票里只存
-「过期时刻」不存「用了多长 TTL」，改 TTL 既不会让已签出的票提前死，也不会把它续长——
+`preview.ticket_ttl_seconds` 也是 `hot`（#677 P3 第二批）：单据 `POST /api/ports/:id/preview-ticket`
+与批量 `POST /api/me/ports/batch-tickets` **每次签票现读**，新 TTL 下一张票就换。**不写进票**：
+票里只存「过期时刻」不存「用了多长 TTL」，改 TTL 既不会让已签出的票提前死，也不会把它续长——
 **已发出的票只改长度、不改寿命**（与 session 那一格同一条口径，原因在上一子段）。
 
-两条签票路径共用同一个 TTL（#709 补）：单发 `issuePreviewTicket` 与批量 `issuePreviewTickets` 均取
-`previewTicketTtlSecondsNow()` 一次；批量**整批共用一次读取**（一批一张票一个时长，不因循环逐张重读而
-中途变脸）。批量格响应里的 `items[].expires_at` 与**落库的 `preview_grants.expires_at`** 同源于这同一次读取
-（两者都等于 `签发时刻 + 现读 TTL`）。写侧拒绝该键时 `previewTicketTtlSecondsNow()` 抛 `SettingUnavailableError`
-⇒ 签票返回 `503`（宁可 503 也不静默签一张按默认寿命的票，口径同 session 那一格）。
+两条签票路径共用同一个旋钮（#709 补；#709b 按 `portal/src/http.js` 修正端点名 / 函数名 / 失败行为）：
+单据 `handlePreviewTicket` 与批量 `handleBatchPreviewTickets` 各自调一次
+`runtime-settings.js` 的 `readPreviewTicketTtlSeconds()`，把读到的数当**显式入参** `ticketTtlSeconds`
+递给 `preview.js#issuePreviewTicket`（本模块不自己读库）。批量**整批共用那一次读取**（`http.js` 在
+循环外读一次，循环里每张票与审计都复用同一个值 ⇒ 一批一张票一个时长，不因逐张重读而中途变脸）。
+批量格响应里的 `items[].expires_at` 与**落库的 `preview_grants.expires_at`** 同源于这一次读取：
+库内那一行由 `preview.js` 用**同一个 `now` + 同一个 TTL** 算，响应那一个由 `http.js` 用同一组数算
+⇒ 两边逐字相等；单据响应只有 `expires_in`（同一个秒数），**没有** `expires_at`。
+
+⚠ **读不到不返回 `503`**（#709b 修正：旧稿写的 `previewTicketTtlSecondsNow()` / `issuePreviewTickets` /
+`SettingUnavailableError` ⇒ `503` 在源码里都不存在）。热读**永不抛**（`createHotReader` 里那一支
+`read_unavailable` 只在本模块内部被接住），回落阶梯是 **DB 有效值 > env（过 registry 闸）>
+registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotReadWarnMerger`）⇒ 票照签，
+只是按回落那一档的寿命算（宁可签一张按回落寿命的票，也不把预览面板锁死；口径同上面两格热读）。
 
 另两条同一条路径上的口径（#701 返修补写）：
 
