@@ -283,7 +283,6 @@ services:
       LLM_GATEWAY_MODE: ${LLM_GATEWAY_MODE:-self}
       LLM_GATEWAY_ADMIN_URL: ${LLM_GATEWAY_ADMIN_URL:-http://station-litellm:4000}
       LLM_GATEWAY_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
-      PORT_QUOTA: ${PORT_QUOTA:-40}
       FDE_POOL: ${FDE_POOL:-default}
       IPAM_RESERVED_SUBNETS: ${IPAM_RESERVED_SUBNETS:-}
       # IPAM **分配器**从哪一段里切（issue #270）。缺省值逐字 = #270 之前 portal/src/ipam.js 硬编码的
