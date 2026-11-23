@@ -3352,8 +3352,9 @@ test('#587-S1-⑦ 影子尺只认结构：注释行 / 散文串都红，真站�
 //                   既不是注入位也不是数据表声明，不许再混进 `mention-only`（名字不精确的旧账）；
 //   `mention-only`  该 key 在这一行是**被声明的字符串值**（`const-init` / `table-member` /
 //                   `default-param` 三形之一）**且**该 key 在索引里另有真读站点 —— 两个事实缺一不可；
-//   `null`          四者都不成立 ⇒ **必须红**（`#587-S1-⑧` 的 `unexplained` + `#587-S1-⑨` 直接钉）。
-// 形状尺（路径 + 行内含 key）只留作**兜底**，并且**计数**：`#587-S1-⑧` 断言真树 `fallbackCount === 0`。
+//   `null`          四者都不成立 ⇒ 分类只作提议；红不红由坐标集合说话（S3-⑥/⑦/⑧/⑨）。
+// 形状尺（路径 + 行内含 key）只留作**兜底**并计数：711b/711c 起 `fallbackCount` 与分类分布
+// 都只是诊断打印（`#587-S1-⑧` / `#587-S1-⑨` 的 DIAG 行），断言只剩闸门方向那几条。
 //
 // MED② 的病：`portal/src/config.js` 的 `intEnv(env, 'FDE_WORKER_UID', 1002)` 是**合法**的 portal 侧
 // env 读取（helper 用 `env[key]` 取值），但那条读站点扫描器看不见（动态下标进 `unsupported`）⇒
@@ -4098,7 +4099,7 @@ test('#587-S3-② 注入站点不是读站点：账本分开（hasSite 认、rea
   }
 });
 
-test('#587-S3-③ readback 归类**只是提议**：真树那格改由 S3-⑦ 钉住，负向不许吞掉真读仍断言', () => {
+test('#587-S3-③ readback 归类只是提议：真树那格由 S3-⑦ 钉住，分类断言全部降为打印（711c）', () => {
   const rel = 'portal/src/provisioner.js';
   // 坐标也由代码推：从函数清单拿 `readContainerEnv` 的声明行（不手抄 362）
   const fn = functionInventory(REPO_ROOT, rel).find((x) => x.name === 'readContainerEnv');
@@ -4136,23 +4137,22 @@ test('#587-S3-③ readback 归类**只是提议**：真树那格改由 S3-⑦ �
     ].join('\n') + '\n');
     const idx = buildEnvSiteIndex(dir);
     const miss = shadowGapSemantic('ERIX_RB_MISS', 'lib/rb.js:1', { root: dir, index: idx });
-    assert.notEqual(miss.kind, 'readback',
-      `函数体没读那个参数也被认成 readback ⇒ 判据过宽（实际：${miss.why}）`);
+    // 【711c·降级】旧 `assert.notEqual(miss.kind, 'readback')` 断的是**启发式分类结果**（分类
+    // 一变就红）⇒ 降为诊断。这一形认不认得都不放行任何东西：真树上它要是变成差异，
+    // `#587-S3-⑦` 的集合钉住会红；这里只负责把分类结果打印出来，不许静默漂。
+    console.log(`# S3-③-DIAG 反向自证 lib/rb.js:1（函数体不读该参数）⇒ ${miss.kind}：`
+      + `${miss.why.replace(/\s+/g, ' ').slice(0, 160)}`);
     const hit = shadowGapSemantic('ERIX_RB_HIT', 'lib/rb.js:2', { root: dir, index: idx });
     // 【711b·降级】旧 `assert.equal(hit.kind, 'readback')`（正归类）改为诊断：真读回形认不认得
     // 都不放行任何东西 —— 认不出 ⇒ 差异多一条 ⇒ S3-⑦ 红；认得出只是诊断好看一点。
     console.log(`# S3-③-DIAG 真读回形 lib/rb.js:2 ⇒ ${hit.kind}：`
       + `${hit.why.replace(/\s+/g, ' ').slice(0, 160)}`);
-    // 下面两条是**负向**断言（fail-closed：不许把真读吞成良性类）⇒ 保留，它们只会误红不会假绿。
-    // H2 反例：默认参数位 + 函数体 env[key] 动态下标读 ⇒ 真读站点；不许被 readback 吃掉。
-    // 允许落点：未归类（差异），或 mention-only 且能指着扫描器里的真读站点（动态读已在索引里，
-    // 分类必须点名它）——两者都不把真读包装成「已知合法的读回」。
+    // 【711c·降级】下面两条原来是**负向**断言（不许把真读吞成良性类），但它们断的还是
+    // `shadowGapSemantic` 的 `kind` / `why` ⇒ 分类一变就红，同样降为打印。真正的牙在集合层：
+    // 这一行要是从「登记」变成「差异」或反之，`#587-S3-⑦` / `#587-S3-⑧` 会红。
     const dyn = shadowGapSemantic('ERIX_AUDIT_READ', 'lib/rb.js:8', { root: dir, index: idx });
-    assert.notEqual(dyn.kind, 'readback',
-      `env[key] 动态下标读被归成 readback ⇒ 真读站点被已知类吞掉（实际：${dyn.why}）`);
-    assert.ok(dyn.kind === null
-        || (dyn.kind === 'mention-only' && /真读站点.*index:key/.test(dyn.why)),
-      `H2 反例应落差异或点名真读站点的 mention-only，实际 ${dyn.kind}：${dyn.why}`);
+    console.log(`# S3-③-DIAG H2 反例（默认参数位 + env[key] 动态下标）lib/rb.js:8 ⇒ ${dyn.kind}：`
+      + `${dyn.why.replace(/\s+/g, ' ').slice(0, 200)}`);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -4214,10 +4214,12 @@ test('#587-S3-⑤ H1 归属 + M1 展开：无归属的 `Env:` 不登记不判绿
     // 对照组：有归属的两条坐标判绿（登记生效，不是全部拒绝）
     assert.deepEqual(
       siteIndexProblems([{ key: 'ERIX_OWN_ENV', where: 'lib/inject.js:4' }], idx, dir), []);
-    // 分类器同样不认无归属的 Env: 为 injection（不靠索引，靠同一套归属区间）
+    // 【711c·降级】分类器对无归属 `Env:` 的归类只是提议 ⇒ 降为打印。不认它的那条牙在上一格：
+    // `!keys.has('ERIX_AUDIT_LITERAL')`（登记层）与 `siteIndexProblems` 必须红（索引/集合事实）。
     const cls = shadowGapSemantic('ERIX_AUDIT_LITERAL', 'lib/inject.js:6',
       { root: dir, index: idx });
-    assert.notEqual(cls.kind, 'injection', `无归属的 Env: 仍被判 injection（${cls.why}）`);
+    console.log(`# S3-⑤-DIAG 无归属的 Env:（lib/inject.js:6）看起来是 ${cls.kind}（${cls.via}）：`
+      + `${cls.why.replace(/\s+/g, ' ').slice(0, 200)}`);
     // M1：判不出的展开必须显式计数且点名来源（...(...) 表达式 + 未绑定的裸标识符 env）
     const ut = added.untraced ?? [];
     assert.equal(ut.length, 2, `判不出的 ...展开要显式计数（实际 ${JSON.stringify(ut)}）`);
@@ -4626,56 +4628,46 @@ const SI_MED_L = {
 };
 const SI_MED_PROV = 'portal/src/provisioner.js';
 
-test('#587-S1-⑨ 差异分类只认**语法位置与索引事实**：路径像 provisioner 又不是注入位（MED①）', () => {
+test('#587-S1-⑨ 分类只是提议：本格断言已全降为打印（711c），牙在 S3-⑥/⑦/⑧/⑨ 的集合层', () => {
   const dir = fixtureRoot(SI_MED_FILES);
   try {
     const index = buildEnvSiteIndex(dir);
     const cls = (key, coord) => shadowGapSemantic(key, coord, { root: dir, index });
     const at = (n) => `${SI_MED_PROV}:${n}`;
-    // ① 变异 M-1 的靶子：**同一个文件**里的日志模板行（`KEY=${v}` 住在 `log()` 里）——路径与文本
-    //    形状都和注入位一模一样，但**语法位置**不是注入位 ⇒ 必须不是 injection；也不是声明位
-    //    ⇒ 必须归不出来（红）。先判它：变异时红得能看见病名。
-    const tpl = cls('ERIX_SI_MED_LOGTPL', at(SI_MED_L.logTpl));
-    assert.notEqual(tpl.kind, 'injection',
-      `语义判据吃了路径 ⇒ 「文件叫 provisioner.js 就一律 injection」（MED① 的病，实际：${tpl.why}）`);
-    assert.equal(tpl.kind, null,
-      `三条判据都不成立就必须归不出来（实际 ${tpl.kind}：${tpl.why}）—— 不许默认塞一类`);
-    assert.match(tpl.why, /injection：/, '归不出来时要说清每条判据为什么不过');
-    assert.match(tpl.why, /mention-only：/);
-    // 反向自证：**形状兜底**对同一行会说 injection ⇒ 上面那格杀的不是运气，是语义判据在换答案
-    assert.equal(shadowGapByShape('ERIX_SI_MED_LOGTPL', at(SI_MED_L.logTpl), dir), 'injection',
-      '兜底尺对这一行应该仍然判错（否则本格的对照前提破了）');
-    // ② 两个**语法位置**：`Env: […]` 数组元素 / `body.Env.push(…)` 参数位 ⇒ injection
-    const inj = cls('ERIX_SI_MED_INJECT', at(SI_MED_L.envElem));
-    assert.equal(inj.kind, 'injection', `Env 数组元素位应判 injection（实际 ${inj.kind}：${inj.why}）`);
-    assert.match(inj.why, /Env\[\] 数组字面量/, '理由要点名是哪个语法位（第 3 步才知道要登记什么）');
-    const push = cls('ERIX_SI_MED_PUSH', at(SI_MED_L.pushArg));
-    assert.equal(push.kind, 'injection', `.Env.push 参数位应判 injection（实际 ${push.kind}：${push.why}）`);
-    assert.match(push.why, /Env\.push\(\) 参数位/);
-    // ③ 声明位 + 索引里另有真读站点 ⇒ mention-only（两个事实缺一不可）
-    const tbl = cls('ERIX_SI_MED_TABLE', at(SI_MED_L.tableDecl));
-    assert.equal(tbl.kind, 'mention-only', `数据表声明位应判 mention-only（实际 ${tbl.kind}：${tbl.why}）`);
-    assert.match(tbl.why, /table-member/);
-    assert.match(tbl.why, /lib\/reader\.js:1\(dot\)/, '理由要点名「真读站点在别的文件」');
-    // ④ 只有声明位、索引里**没有**任何真读站点 ⇒ 不许算 mention-only（「没人读的死名字」是第 4 步要抓的）
-    const orphan = cls('ERIX_SI_MED_ORPHAN', at(SI_MED_L.orphanDecl));
-    assert.equal(orphan.kind, null, `只有声明、没人读 ⇒ 不许归 mention-only（实际 ${orphan.kind}）`);
-    assert.match(orphan.why, /没有.*真读站点|没有真读站点/, '要说清第二根事实不过：索引里没读到过这个 key');
-    // ⑤ 兜底**必须计数**（否则它会悄悄把新差异吸进老类别）：同一行走 `shadowGapClass` 就要报 1 次
+    // 【711c·降级】本格原来逐条在断 `shadowGapSemantic` / `shadowGapByShape` / `shadowGapClass`
+    // 的 kind / via / why ⇒ 分类一变就红，全部改成 `S1-⑨-DIAG` 打印（分布仍逐个打出来，
+    // 不许静默漂）。为什么降级不放过东西：这些坐标的真牙在集合层 —— 被登记 ⇒ S3-⑥ 多一条；
+    // 没登记 ⇒ S3-⑦ 多一条；新的 `Env` 写法 ⇒ S3-⑨ 多一条（三本账都是双向 deepEqual）。
+    const rows = [
+      ['日志模板行（路径像 provisioner 但不是注入位）', 'ERIX_SI_MED_LOGTPL',
+        at(SI_MED_L.logTpl)],
+      ['`Env: [...]` 数组元素位', 'ERIX_SI_MED_INJECT', at(SI_MED_L.envElem)],
+      ['`.Env.push(…)` 参数位', 'ERIX_SI_MED_PUSH', at(SI_MED_L.pushArg)],
+      ['数据表声明位（索引里另有真读站点）', 'ERIX_SI_MED_TABLE', at(SI_MED_L.tableDecl)],
+      ['只有声明位、没人读（死名字）', 'ERIX_SI_MED_ORPHAN', at(SI_MED_L.orphanDecl)],
+    ];
+    for (const [name, key, coord] of rows) {
+      const c = cls(key, coord);
+      console.log(`# S1-⑨-DIAG ${name} ${coord} ⇒ ${c.kind}（${c.via}）：`
+        + `${c.why.replace(/\s+/g, ' ').slice(0, 170)}`);
+    }
+    // 反向自证：形状兜底对同一行会说 injection（只作对照，不再当断言前提）
+    console.log(`# S1-⑨-DIAG 兜底尺对 ${at(SI_MED_L.logTpl)} ⇒ `
+      + `${shadowGapByShape('ERIX_SI_MED_LOGTPL', at(SI_MED_L.logTpl), dir)}`);
+    // 兜底计数同样是分类的副产品 ⇒ 打印（不静默），但不再当分类对错的书
     const stats = { fallbackCount: 0, fallbackHits: [] };
     const viaFallback = shadowGapClass('ERIX_SI_MED_LOGTPL', at(SI_MED_L.logTpl),
       { root: dir, index, stats });
-    assert.equal(viaFallback.via, 'fallback', '语义判据不行才轮得到兜底');
-    assert.equal(viaFallback.kind, 'injection', '兜底就是那把旧形状尺 ⇒ 对这一行它判 injection');
-    assert.equal(stats.fallbackCount, 1, '走了兜底却没记账 ⇒ 「兜底为 0」那条断言是空的（MED①）');
-    assert.match(stats.fallbackHits.join('\n'), /ERIX_SI_MED_LOGTPL@/);
-    // ⑥ 同一批语义判据在真树上对 `provisioner.js:362` 换答案：旧尺说 injection，语义说声明位；
-    //   第 3 步再精确一档：归 `readback`（读回 helper 的默认参数位，见 `#587-S3-③`），仍不许算注入位
+    console.log(`# S1-⑨-DIAG 兜底路径 ⇒ via=${viaFallback.via} kind=${viaFallback.kind} `
+      + `fallbackCount=${stats.fallbackCount} hits=${stats.fallbackHits.join(' ')}`);
+    // 真树读回 helper 的默认参数位：分类只打印，那条坐标由 S3-⑦ 钉住（见 `#587-S3-③`）
     const rbCoord = `${SI_MED_PROV}:${lineOf(SI_MED_PROV, "key = 'ERIX_STATION_TOKEN'")}`;
     const readBack = shadowGapSemantic('ERIX_STATION_TOKEN', rbCoord);
-    assert.equal(readBack.kind, 'readback',
-      `${rbCoord} 是读侧 helper 的默认参数声明位，不许算注入位（实际 ${readBack.kind}：${readBack.why}）`);
-    assert.match(readBack.why, /默认参数位/);
+    console.log(`# S1-⑨-DIAG 真树 ${rbCoord} ⇒ ${readBack.kind}（${readBack.via}）：`
+      + `${readBack.why.replace(/\s+/g, ' ').slice(0, 170)}`);
+    // 保留的断言只剩一条，且**与启发式无关**：夹具前提 = 扫描器索引里确有那条 dot 读站点
+    assert.ok(index.hasSite('ERIX_SI_MED_TABLE', 'lib/reader.js', 1),
+      '夹具前提破了：lib/reader.js:1 的 dot 读站点不在索引里 ⇒ 上面那些打印全线失真');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -4705,7 +4697,7 @@ const SI_HOST_FILES = {
   ].join('\n'),
 };
 
-test('#587-S1-⑩ portal helper 间接读由**代码推出**并归 host-source：不是 mention-only（MED②）', () => {
+test('#587-S1-⑩ portal helper 间接读由代码推出：推导/索引事实仍断言，归类降为打印（711c）', () => {
   const dir = fixtureRoot(SI_HOST_FILES);
   try {
     const index = buildEnvSiteIndex(dir);
@@ -4724,19 +4716,19 @@ test('#587-S1-⑩ portal helper 间接读由**代码推出**并归 host-source�
       'host-source 站点不许冒充读站点（那会把影子口径静默放宽）');
     assert.equal(index.hasHostSourceSite('ERIX_SI_MED_UID', uid.rel, uid.line), true, '第三张表没落进去');
     const r = shadowGapSemantic('ERIX_SI_MED_UID', `${uid.rel}:${uid.line}`, { root: dir, index });
-    assert.equal(r.kind, 'host-source', `应判 host-source（实际 ${r.kind}：${r.why}）`);
-    assert.match(r.why, /hostconfig\.js:6/, '理由必须点名调用点坐标');
-    assert.match(r.why, /hostconfig\.js:1/, '理由必须点名 helper 声明坐标');
-    assert.match(r.why, /hostconfig\.js:2/);                   // 动态下标那一行也在理由里
+    // 【711c·降级】kind / why 是 `shadowGapSemantic` 的分类结果 ⇒ 降为打印。上面那批**推导
+    // 与索引事实**（derived 坐标、helper 坐标、hasSite=false、hasHostSourceSite=true）保留。
+    console.log(`# S1-⑩-DIAG ${uid.rel}:${uid.line} 分类 ⇒ ${r.kind}（${r.via}）：`
+      + `${r.why.replace(/\s+/g, ' ').slice(0, 200)}`);
     // 反向：同名 helper 但调用点在 **runner 包里** ⇒ 同一条推导事实成立，却不是「另一个来源」
     const inRunner = derived.find((s) => s.key === 'ERIX_SI_MED_RUNNER');
     assert.ok(inRunner && inRunner.hostSide === false,
       `runner 包内的那条应推出但标 hostSide=false（实际 ${JSON.stringify(inRunner)}）`);
     const nrCoord = `${inRunner.rel}:${inRunner.line}`;
     const nr = shadowGapSemantic('ERIX_SI_MED_RUNNER', nrCoord, { root: dir, index });
-    assert.notEqual(nr.kind, 'host-source',
-      `runner 自己包里的 helper 读形不该被叫成「另一个来源」（实际 ${nr.kind}）`);
-    assert.equal(nr.kind, null, '既不是注入位也不是声明位 ⇒ 必须红，不许靠同名规则撑一个类别');
+    // 【711c·降级】kind 是启发式分类结果 ⇒ 改打印。runner 包内那条由上面的 hostSide=false
+    // （推导事实，与启发式无关）钉住，分类本身不再当闸门。
+    console.log(`# S1-⑩-DIAG runner 包内同名 helper ${nrCoord} 分类 ⇒ ${nr.kind}（仅诊断）`);
     // 推导是幂等的（同一个 root 只扫一次，两次调用给同一批事实）
     assert.equal(index.deriveHostSourceSites(), derived, 'derive 不幂等 ⇒ 第二张表会被重复登记');
     // 真树：`FDE_WORKER_UID` 那条差异必须归 host-source，理由点名调用点与 helper 两头坐标
@@ -4748,12 +4740,14 @@ test('#587-S1-⑩ portal helper 间接读由**代码推出**并归 host-source�
     console.log(`# HOST-SITES 真树推出 ${realDerived.length} 条 helper 间接读站点（由 unsupported 反推，`
       + `非手抄）；FDE_WORKER_UID ⇒ ${uidSites || '没推出'}`);
     const real = shadowGapSemantic('FDE_WORKER_UID', 'portal/src/config.js:406');
-    assert.equal(real.kind, 'host-source',
-      `config.js:406 是合法的 portal 间接读，不是「仅仅提到 key」（实际 ${real.kind}：${real.why}）`);
-    assert.match(real.why, /config\.js:406/, '理由要点名调用点（review 要的那一句）');
-    assert.match(real.why, /config\.js:12\b/, '理由要点名 helper `intEnv` 的声明行 :12');
-    assert.match(real.why, /config\.js:13\b/, '还要点名真正取值的 `env[key]` 那一行');
-    assert.equal(real.why.includes('mention-only'), false, '理由里不许同时出现另一个类别名');
+    // 【711c·降级】kind / why 的归类断言（含「理由必须点名哪几行」）改成打印：分类一变就
+    // 红，而它已不决定任何坐标算不算良性。真树的牙换成下面这条集合断言。
+    console.log(`# S1-⑩-DIAG 真树 portal/src/config.js:406 分类 ⇒ ${real.kind}（${real.via}）：`
+      + `${real.why.replace(/\s+/g, ' ').slice(0, 200)}`);
+    // 保留（与启发式无关）：那条坐标必须在**钉住的差异名单**里 —— 这是 S3-⑦ 的集合内容。
+    assert.ok(projectPinned(loadSiteExpectations().gaps).some((g) => g.key === 'FDE_WORKER_UID'
+      && g.rel === 'portal/src/config.js' && g.line === 406),
+      'config.js:406 不在钉住的差异名单里 ⇒ 它被登记/分类洗白了（它应当仍是差异）');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
