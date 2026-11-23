@@ -244,6 +244,10 @@ const budgetPeriodInput = ref('1mo');
 const savingBudget = ref(false);
 const budgetMsg = ref('');
 const budgetErr = ref('');
+// 读取失败旗标（#719）：budget/usage 的 GET 撞上非 404（网关 5xx / 超时 / 网络）⇒ 置位，
+// 模板显式报错，不再伪造 0/不限/空表；404（无 active binding）走静默降级，不置位。
+const budgetLoadErr = ref(false);
+const usageLoadErr = ref(false);
 
 // 已用标签：按后端 spend_scope 决定（不重推）。'period'⇒本周期已用；其余⇒累计已用（未设额度）。
 const spendScopeLabel = computed(() => (
@@ -276,20 +280,26 @@ function budgetToInput(value: number | null | undefined): string {
 }
 
 async function loadQuotaAndUsage() {
-  // 无 active binding ⇒ budget/usage 会 404：静默降级（不阻断整个 pane）。
+  // 无 active binding ⇒ budget/usage 会 404（ApiError.code === 'not_found'）：静默降级（不阻断整个 pane，
+  // 也不报错——额度区本就靠 cfg.api_key 隐藏）。其它错误（网关 5xx / 超时 / 网络）⇒ 置对应
+  // *LoadErr 并清空数据，**绝不伪造 0 / 不限 / 空表**（读失败不等于「额度为 0」）。
+  budgetLoadErr.value = false;
+  usageLoadErr.value = false;
   try {
     const q = await api<{ quota: Quota }>(`/api/admin/fdes/${fde}/llm/budget`);
     quota.value = q.quota ?? null;
     budgetInput.value = budgetToInput(q.quota?.budget_usd);
     budgetPeriodInput.value = q.quota?.budget_period ?? '1mo';
-  } catch {
+  } catch (e) {
     quota.value = null;
+    if (!(e instanceof ApiError && e.code === 'not_found')) budgetLoadErr.value = true;
   }
   try {
     const u = await api<{ days: UsageDay[] }>(`/api/admin/fdes/${fde}/llm/usage?days=30`);
     usageDays.value = Array.isArray(u.days) ? u.days : [];
-  } catch {
+  } catch (e) {
     usageDays.value = [];
+    if (!(e instanceof ApiError && e.code === 'not_found')) usageLoadErr.value = true;
   }
 }
 
@@ -467,7 +477,8 @@ async function onSaveBudget() {
           @click="onSaveBudget"
         >{{ t('admin.llm.budgetSave') }}</button>
       </div>
-      <div data-test="budget-state" class="grid gap-0.5 text-sm">
+      <p v-if="budgetLoadErr" data-test="budget-load-error" class="syserr" role="alert">{{ t('admin.llm.budgetLoadFailed') }}</p>
+      <div v-else data-test="budget-state" class="grid gap-0.5 text-sm">
         <span>{{ spendScopeLabel }}：<b data-test="budget-spend">{{ quota?.spend ?? 0 }}</b> USD</span>
         <span>{{ t('admin.llm.budgetRemaining') }}：<b data-test="budget-remaining">{{ quota?.remaining == null ? t('admin.llm.budgetUnlimited') : quota.remaining }}</b></span>
         <span v-if="budgetResetLocal">{{ t('admin.llm.budgetResetAt') }}：<b data-test="budget-reset">{{ budgetResetLocal }}</b></span>
@@ -477,7 +488,7 @@ async function onSaveBudget() {
 
       <p class="mt-1 text-sm font-medium">{{ t('admin.llm.usageTitle') }}</p>
       <p class="text-xs text-black/45">{{ t('admin.llm.usageBucketNote') }}</p>
-      <table data-test="usage-table" class="w-full text-left text-sm">
+      <table v-if="!usageLoadErr" data-test="usage-table" class="w-full text-left text-sm">
         <thead>
           <tr class="text-xs text-black/55"><th>{{ t('admin.llm.usageDate') }}</th><th>{{ t('admin.llm.usageSpend') }}</th><th>{{ t('admin.llm.usageTokens') }}</th></tr>
         </thead>
@@ -487,7 +498,8 @@ async function onSaveBudget() {
           </tr>
         </tbody>
       </table>
-      <p v-if="!usageDays.length" class="text-xs text-black/45">{{ t('admin.llm.usageEmpty') }}</p>
+      <p v-if="usageLoadErr" data-test="usage-load-error" class="syserr" role="alert">{{ t('admin.llm.usageLoadFailed') }}</p>
+      <p v-else-if="!usageDays.length" class="text-xs text-black/45">{{ t('admin.llm.usageEmpty') }}</p>
     </div>
 
     <form

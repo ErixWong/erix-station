@@ -727,7 +727,8 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
     ⇒ 所以 `30d`/`7d`/`1m` 都不能当“多少天/月”用，一律不列入白名单。
   - 重置锚点靠 `litellm_settings.timezone:"Asia/Shanghai"` + `budget_reset_time:"00:00"`（见 `deploy/litellm/config.yaml`）：默认 UTC 零点 = 本地 08:00，锚到本地 00:00 才与「一天」直觉一致。
   - **重置任务约 597s 一跳**（LiteLLM 后台 budget reset 循环的粒度），重置时刻之后额度不一定瞬时归零，最坏有一个跳的滞后。
-  - **`proxy_batch_write_at: 60`** ⇒ spend 落库是批量写（约每 60s 一跳），因此**最坏可超发约 60 秒**（超限判定读到的是至多 60s 前的 spend）。
+  - **`proxy_batch_write_at: 60`** ⇒ 只影响 **spend 落库/报表与日聚合的时效**（约每 60s 一跳），**不是超发窗口，不要当上限承诺**。因为**超限判定在鉴权阶段先做预算预留**：LiteLLM v1.103.2 对**可估价**请求在转发前调用 `reserve_budget_for_request`（`proxy/spend_tracking/budget_reservation.py:205-296`），用 tokenizer 估输入 token、按模型定价估上限并预留到额度计数器，响应回来再结算——所以额度在请求进上游前就已占用，不依赖这 60s 的批量落库。
+  - **无法估价的请求**（`estimate_request_max_cost` 返回 `None`，例如模型不在成本表里）回退到「读时判定」；而这类模型通常又没配定价 ⇒ `spend` 恒记 0 ⇒ 额度对它**永不触发**（与下一条「未定价模型不生效」是同一条因果，管理台额度区已显式警告）。
   - **未定价模型不生效**：`pricing_configured=false` 的模型 `spend` 恒记 0（§11.5 上文），累计不到额度上 ⇒ 周期额度对「只用未定价模型」的 FDE 实际拦不住（管理台已在额度区显式警告）。
   - **`tpd_limit` 为何不可用**：该端点是 **batch-only**（`/user/daily/activity` 的 `tpd_limit` 只在批量查询里回，不能按 key 直接下发成限额），故本单只用 `max_budget`（USD），不用 tpd_limit。
   - **`spend` 是运行计数器 ⇒ `spend_scope`**：`/key/info` 的 `spend` 只有在存在 `budget_duration` 时才按周期归零；**无额度时是终身累计**。因此 `getFdeBudget` 返回 `spend_scope`：`budget_duration` 非空⇒`'period'`（本周期已用），无额度⇒`'lifetime'`（终身累计）——这是前端已用标签的**唯一依据**（无额度的 FDE 不得把 `spend` 标成“本周期已用”）。

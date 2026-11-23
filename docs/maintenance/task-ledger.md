@@ -9427,6 +9427,6 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
 **`spend_scope`（前端已用标签唯一依据）**：`/key/info` 的 `spend` 是运行计数器，只在存在 `budget_duration` 时按周期归零；**无额度时是终身累计**。故 `getFdeBudget` 返回 `spend_scope`：`budget_duration` 非空⇒`'period'`（本周期已用）、无额度⇒`'lifetime'`（终身累计）；前端不重推（实测 dev 上 eric 无额度 key 的 `spend=0.084178176` 而近 14 天日聚合合计只有 `0.038631168` ⇒ 无额度时 `spend` 不是周期值）。
 
 **UTC 日桶限制**：日聚合表（`/user/daily/activity`，`common_daily_activity.py:563-600`）是 **UTC 日**分桶；`timezone`（传 480）**只决定 end_date 是否把今天扩成一个 UTC 桶**，历史日期 pass-through。故「本周期已用」（网关实时计数器）与用量表最后一行（UTC 日桶）**天然可能对不上**，两者**不互相校验**。
-**重置锚点**靠 config 的 `timezone`+`budget_reset_time`；**重置任务约 597s 一跳**；**超发窗口**源于 `proxy_batch_write_at: 60`（spend 批量写，最坏约 60s）；`tpd_limit` 是 batch-only 不可用。
+**重置锚点**靠 config 的 `timezone`+`budget_reset_time`；**重置任务约 597s 一跳**；`proxy_batch_write_at: 60` 只影响 spend 落库/报表与日聚合的时效，**不是超发窗口**（超限判定在鉴权阶段先做预算预留：v1.103.2 对可估价请求转发前调 `reserve_budget_for_request`（`proxy/spend_tracking/budget_reservation.py:205-296`）估 token 并按定价预留、响应回来再结算；无法估价的请求回退读时判定，而这类模型通常又没配定价⇒`spend` 恒记 0⇒额度永不触发，与「未定价模型不生效」同一条因果）；`tpd_limit` 是 batch-only 不可用。
 
 **未做的真机验收（本单 LiteLLM 容器未起，均未跑）**：① 额度触发 429；② 重置是否真落在本地周期错点；③ `/user/daily/activity/aggregated` 真机响应形状（周期语义本身已由主 agent 在 v1.103.2 容器实测）。判绿只看退出码：根 `npm test`、前端 `typecheck`/`test` 均 rc=0。
