@@ -577,13 +577,13 @@ test('RS-6b 审计被抑制 ⇒ 抛 500 且**设置没落库**（检查在 COMMI
 // 4. P1 的边界：一格未迁、迁移形状、serve() 接线、超时旋钮
 // ---------------------------------------------------------------------------
 
-test('RS-7 P3 第一批边界：registry 只有 session.ttl_seconds + workspace.retention_days', async () => {
+test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_days + preview.ticket_ttl_seconds', async () => {
   // P1 时这一格钉的是「registry 是空对象」；P2a 迁了第一格 ⇒ 判据改成「只迁了这一格」；
-  // P3 第一批迁了第二格 ⇒ 判据改成「就这两格，不多不少」。
+  // P3 第一批迁了第二格，P3 第二批迁了第三格 ⇒ 判据改成「就这三格，不多不少」。
   // 它红了的读法不变：有人顺手多迁了一格（或把热读口径弄丢了）。
   assert.deepEqual(Object.keys(RUNTIME_SETTING_REGISTRY),
-    ['session.ttl_seconds', 'workspace.retention_days'],
-    'P3 第一批只许迁 `session.ttl_seconds` + `workspace.retention_days`（其余旋钮逐批填）');
+    ['session.ttl_seconds', 'workspace.retention_days', 'preview.ticket_ttl_seconds'],
+    'P3 只许迁这三格（其余旋钮逐批填）');
   assert.ok(Object.isFrozen(RUNTIME_SETTING_REGISTRY), 'registry 必须冻结（运行期没人能塞旋钮进来）');
   const entry = RUNTIME_SETTING_REGISTRY['session.ttl_seconds'];
   assert.ok(Object.isFrozen(entry), '条目也必须冻结');
@@ -640,7 +640,7 @@ test('RS-7 P3 第一批边界：registry 只有 session.ttl_seconds + workspace.
   assert.notEqual(HOT_READ_INVALIDATORS.get(WORKSPACE_RETENTION_KEY),
     HOT_READ_INVALIDATORS.get(SESSION_TTL_KEY),
     '两格各有各的缓存 ⇒ 各有各的失效函数（共用一个就是「保存 TTL 把保留天数也抹了」）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 2, '登记表里就是两格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 3, '登记表里就是三格（热读旋钮数 = 失效钩子数）');
 
   assert.equal(isKnownSetting('demo.limit'), false, '真实 registry 里没有 demo.limit');
   assert.equal(isKnownSetting('constructor'), false,
@@ -1150,8 +1150,8 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   const fromDb = await listRuntimeSettingsAdmin({
     pool: dbPool, config: CONFIG_ENV, env: {}, log: silentLog,
   });
-  // 两格旋钮 ⇒ 两份 items（本批把第二格迁进来后这个数就是 2；多一格就红 = 顺手多迁）。
-  assert.equal(fromDb.items.length, 2);
+  // 三格旋钮 ⇒ 三份 items（P3 第二批把第三格迁进来后这个数就是 3；多一格就红 = 顺手多迁）。
+  assert.equal(fromDb.items.length, 3);
   assert.deepEqual(Object.keys(fromDb.items[0]).sort(),
     ['applyMode', 'key', 'label', 'reason', 'source', 'updatedAt', 'updatedBy', 'value'].sort());
   assert.deepEqual(fromDb.items[0], {
@@ -1168,6 +1168,13 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   assert.equal(retItem.value, 0, 'env 也没给 ⇒ 第三档就是 0 = 不自动清理（不是 undefined、不是 null）');
   assert.equal(retItem.reason, 'no_row');
   assert.equal(retItem.applyMode, 'hot', '不提醒重启 = 本批的对外承诺（写错就是界面撒谎）');
+
+  // ①c 第三格（preview.ticket_ttl_seconds）：库里没它的行 ⇒ 如实报默认 60（不被第一格的 db 带着写）。
+  const ttlItem = fromDb.items.find((i) => i.key === 'preview.ticket_ttl_seconds');
+  assert.ok(ttlItem, '第三格必须出现在管理台响应里（列表驱动，不列出来 = 没迁）');
+  assert.equal(ttlItem.source, 'default');
+  assert.equal(ttlItem.value, 60, 'env 也没给 ⇒ 默认 60（与 config.js 同源）');
+  assert.equal(ttlItem.applyMode, 'hot', '预览票也是热生效旋钮');
 
   // ② env：库里没行，且 env 显式给了值 ⇒ source=env、值就是 config 里那个。
   const fromEnv = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: CONFIG_ENV, log: silentLog });
@@ -1190,7 +1197,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     pool: ttlPool({ throwOnSelect: Object.assign(new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
     config: CONFIG_ENV, log: deadLog,
   });
-  assert.equal(dead.items.length, 2, '读失败时两格都要给得出来（不是只给第一格）');
+  assert.equal(dead.items.length, 3, '读失败时三格都要给得出来（不是只给前几格）');
   assert.equal(dead.items[0].source, 'env');
   assert.equal(dead.items[0].reason, 'read_failed');
   assert.equal(deadLog.seen.warn.length, 1, '有人在屏幕前等答案 ⇒ 读失败要 warn（不像启动路径只能 debug）');
@@ -2191,12 +2198,15 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   // GET 两格：登记了的那格原样带出，没登记的那格**不许**出现这个键（缺席 ≠ null ≠ 空串）。
   const cfg = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
   const list = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: cfg, env: {}, log: silentLog });
-  assert.equal(list.items.length, 2);
+  assert.equal(list.items.length, 3);
   const retItem = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
   assert.equal(retItem.hint, WORKSPACE_RETENTION_HINT,
     'DTO 必须逐字透出 registry 那句话（前端自己另写一份 = 第二份真相）');
   assert.equal(Object.hasOwn(list.items[0], 'hint'), false,
     'session.ttl_seconds 没登记 hint ⇒ 这个键必须缺席（RS-16 那句「一项就是那八个键」也靠这一半成立）');
+  // 第三格也登记了 hint ⇒ DTO 必须逐字透出（否则管理台看不到范围提示）。
+  assert.equal(list.items.find((i) => i.key === 'preview.ticket_ttl_seconds').hint,
+    '一次预览票从签出到过期的秒数；1..3600（默认 60）');
 
   // 回落那一档也带（表不存在时界面更要看得见这句：那一档下 0 同样是「不自动清理」）。
   const dead = await listRuntimeSettingsAdmin({

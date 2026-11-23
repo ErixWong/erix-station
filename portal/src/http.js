@@ -4733,7 +4733,16 @@ async function handleBatchPreviewTickets(req, res, ctx) {
   }
 
   // ⑤ 审计逐张各一行（不写 url —— 它带票）。
-  const expiresAt = new Date(now.getTime() + ctx.config.previewTicketTtlSeconds * 1000).toISOString();
+  // #677 P3 第二批：预览票有效期现在是**可热改的运行时旋钮**（`runtime_settings.preview.
+  // ticket_ttl_seconds`）。⚠ 这一行**不是**「每个请求都发一次 DB 读」：只在**签发预览票**
+  //   这一次走；且 `readPreviewTicketTtlSeconds` 带 5s 缓存 + 同池在飞合并，同进程同池
+  //   最多 5 秒一次整表读（口径与会话 TTL 那格逐字相同）。管理台改完 → 本进程下一次
+  //   签票就用新值（写路径会失效缓存）；别的副本最多 5 秒追上。票的其它语义（`expiresAt`
+  //   的算法、响应形状）一概不动，只把「用哪个秒数」从启动快照改成现读。
+  const ticketTtlSeconds = await runtimeSettings.readPreviewTicketTtlSeconds({
+    pool: ctx.pool, config: ctx.config, log: ctx.log,
+  });
+  const expiresAt = new Date(now.getTime() + ticketTtlSeconds * 1000).toISOString();
   for (const { target, result } of issued) {
     await auth.audit(ctx.pool, {
       actorId: session.user.id,

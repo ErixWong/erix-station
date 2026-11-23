@@ -243,6 +243,67 @@ export function validateWorkspaceRetentionDays(value) {
   return true;
 }
 
+// --- preview.ticket_ttl_seconds 专用闸（P3 第二批：预览票有效期进 DB） ------------------
+// 上界 3600 秒（1 小时）的理由：预览票是「点开一条链接临时进面板」的一次性短票，
+// 短才有意义（越短被截获/重放的窗口越小）；工单给的参考范围 1..3600 我照用 ——
+// 60 秒是默认（与 config.js:410 同源），上界取整小时是「一张票最多覆盖一次排障会话」，
+// 再长就该发会话 cookie 而不是票。下界 1（不含 0）：0 秒的票签出来立刻过期 = 白发，
+// 与「不自动清理 = 0」那种 0-有语义 的旋钮不同，这里的 0 只会造成「签了却进不去」的困惑。
+export const PREVIEW_TICKET_TTL_KEY = 'preview.ticket_ttl_seconds';
+export const PREVIEW_TICKET_TTL_MIN_SECONDS = 1;
+export const PREVIEW_TICKET_TTL_MAX_SECONDS = 3600; // 1 小时，理由见上面那段
+// 默认与 config.js 的 `previewTicketTtlSeconds`（PREVIEW_TICKET_TTL_SECONDS 兜底 60）同源。
+export const PREVIEW_TICKET_TTL_DEFAULT_SECONDS = 60;
+export const PREVIEW_TICKET_TTL_HINT = '一次预览票从签出到过期的秒数；1..3600（默认 60）';
+
+/**
+ * 严格十进制正整数（形状口径同上面两格：只认 `/^[0-9]+$/` 的非负整数字面，再要求 > 0）。
+ * 非法输入一律 `{ ok: false, reason }`，绝不返回 NaN，也绝不用 `Number()`/`parseInt()` 了事。
+ */
+export function parsePreviewTicketTtlSeconds(raw) {
+  let text;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw)) {
+      return { ok: false, reason: 'not_a_ticket_ttl_seconds' };
+    }
+    text = String(raw);
+  } else if (typeof raw === 'string') {
+    text = raw;
+  } else {
+    return { ok: false, reason: 'not_a_ticket_ttl_seconds' };
+  }
+  // 只认纯十进制数字：`'1e3'`（科学记数）、`' 60 '`（带空白）、`'+5'`（带符号）、
+  // `'60.0'`（小数）、空串 全部在这一步被挡掉；`'-5'` 带负号同样进不来。
+  if (!/^[0-9]+$/.test(text)) {
+    return { ok: false, reason: 'not_a_ticket_ttl_seconds' };
+  }
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) {
+    return { ok: false, reason: 'not_a_ticket_ttl_seconds' };
+  }
+  // 形状闸只判「是不是正整数」；区间（含 0 与上界）交给 validate，两层各管一件事。
+  if (value <= 0) {
+    return { ok: false, reason: 'ticket_ttl_out_of_range' };
+  }
+  return { ok: true, value };
+}
+
+/** 管理台写入前的取值闸：返回 `true` 或一句给人看的中文原因。 */
+export function validatePreviewTicketTtlSeconds(value) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    return `必须是 ${PREVIEW_TICKET_TTL_MIN_SECONDS}–${PREVIEW_TICKET_TTL_MAX_SECONDS}` +
+      ' 的整数秒（不接受字符串、小数、布尔）';
+  }
+  if (value < PREVIEW_TICKET_TTL_MIN_SECONDS) {
+    return `不能是 ${value}（预览票至少 ${PREVIEW_TICKET_TTL_MIN_SECONDS} 秒；0 秒签出来即过期）`;
+  }
+  if (value > PREVIEW_TICKET_TTL_MAX_SECONDS) {
+    return `必须在 ${PREVIEW_TICKET_TTL_MIN_SECONDS}–${PREVIEW_TICKET_TTL_MAX_SECONDS} 秒之间` +
+      `（1 秒 ~ 1 小时；再长请改用会话 cookie 而不是票）`;
+  }
+  return true;
+}
+
 export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
@@ -264,6 +325,17 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseWorkspaceRetentionDays,
     validate: validateWorkspaceRetentionDays,
     hint: WORKSPACE_RETENTION_HINT,
+  }),
+  [PREVIEW_TICKET_TTL_KEY]: Object.freeze({
+    key: PREVIEW_TICKET_TTL_KEY,
+    label: '预览票有效期（秒）',
+    configPath: 'previewTicketTtlSeconds',
+    envVar: 'PREVIEW_TICKET_TTL_SECONDS',
+    defaultValue: PREVIEW_TICKET_TTL_DEFAULT_SECONDS,
+    applyMode: 'hot',
+    parse: parsePreviewTicketTtlSeconds,
+    validate: validatePreviewTicketTtlSeconds,
+    hint: PREVIEW_TICKET_TTL_HINT,
   }),
 });
 
@@ -937,6 +1009,12 @@ const workspaceRetentionHotReader = createHotReader({
   fallbackDefault: WORKSPACE_RETENTION_DEFAULT_DAYS,
 });
 
+const previewTicketTtlHotReader = createHotReader({
+  key: PREVIEW_TICKET_TTL_KEY,
+  warnLabel: 'preview 票有效期',
+  fallbackDefault: PREVIEW_TICKET_TTL_DEFAULT_SECONDS,
+});
+
 /**
  * 丢弃 TTL 缓存（P2a 对外的名字；实现是上面那个工厂里每一格自己的 `invalidate`）。
  * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（RS-7 钉住身份），P3 抽工厂后也不能换成间接层。
@@ -950,6 +1028,11 @@ export function invalidateWorkspaceRetentionCache() {
   workspaceRetentionHotReader.invalidate();
 }
 
+/** 丢弃 `preview.ticket_ttl_seconds` 的缓存与在飞槽（口径同上；签票路径现读，写后立即生效）。 */
+export function invalidatePreviewTicketTtlCache() {
+  previewTicketTtlHotReader.invalidate();
+}
+
 /**
  * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。一格一行；加新的热读旋钮就在这里多登记一行，
  * **不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
@@ -959,6 +1042,7 @@ export function invalidateWorkspaceRetentionCache() {
 export const HOT_READ_INVALIDATORS = new Map([
   [SESSION_TTL_KEY, invalidateSessionTtlCache],
   [WORKSPACE_RETENTION_KEY, invalidateWorkspaceRetentionCache],
+  [PREVIEW_TICKET_TTL_KEY, invalidatePreviewTicketTtlCache],
 ]);
 
 /**
@@ -1154,6 +1238,19 @@ export function readSessionTtlSeconds(options = {}) {
  */
 export function readWorkspaceRetentionDays(options = {}) {
   return workspaceRetentionHotReader.read(options);
+}
+
+/**
+ * `preview.ticket_ttl_seconds` 的**热读**入口（P3 第二批；调用方是 `http.js` 签发预览票那一次）。
+ *
+ * 口径与上面两格同一套（同一工厂）：DB 有效值 > env（过闸）> registry 默认（60），
+ * 5s 缓存 + 同池在飞合并 + 写路径失效，**读侧永不抛**，一次热读最多一条 warn。
+ *
+ * @param {object} opts `{ pool, config, now?, log?, env? }`
+ * @returns {Promise<number>} 生效的票有效期秒数；三档都给不出 ⇒ `60`（绝不回 `undefined`）。
+ */
+export function readPreviewTicketTtlSeconds(options = {}) {
+  return previewTicketTtlHotReader.read(options);
 }
 
 // ---------------------------------------------------------------------------
