@@ -345,3 +345,126 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
     expect(err.wrapper.text()).toContain('Error: fde_name 非法');
   });
 });
+
+describe('UserLlmPane · 每日额度（#719）', () => {
+  const QUOTA = {
+    quota: {
+      daily_budget_usd: 5, max_budget: 5, budget_duration: '1d',
+      budget_reset_at: '2026-11-24T16:00:00Z', spend: 1.25, remaining: 3.75,
+    },
+  };
+  const USAGE = {
+    days: [
+      { date: '2026-11-22', spend: 2, prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, api_requests: 3 },
+      { date: '2026-11-23', spend: 1.5, prompt_tokens: 200, completion_tokens: 100, total_tokens: 300, api_requests: 5 },
+    ],
+    totals: { spend: 3.5, total_tokens: 450 },
+  };
+
+  function quotaProviders(mainPricing: boolean | undefined) {
+    return [
+      {
+        id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
+        models: [
+          { id: 'm1', provider_id: 'p1', model_id: 'pk-m1', model_name: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, enabled: true, pricing_configured: mainPricing },
+          { id: 'm2', provider_id: 'p1', model_id: 'pk-m2', model_name: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, enabled: true, pricing_configured: true },
+        ],
+      },
+    ] as unknown as LlmProvider[];
+  }
+
+  async function mountQuota(
+    extra?: (url: string, init?: RequestInit) => Response | undefined,
+    providers: LlmProvider[] = PROVIDERS,
+  ) {
+    const fetchFn = fetchMock((url, init) => extra?.(url, init)
+      ?? (url === '/api/admin/fdes/alice/llm' && !init?.method
+        ? jsonResponse(200, GET_CONFIG)
+        : url === '/api/admin/fdes/alice/llm/quota' && !init?.method
+          ? jsonResponse(200, QUOTA)
+        : url.startsWith('/api/admin/fdes/alice/llm/usage') && !init?.method
+          ? jsonResponse(200, USAGE)
+        : url === '/api/admin/users'
+          ? jsonResponse(200, { items: [FDE_USER] })
+          : jsonResponse(404, { error: { code: 'not_found', message: 'not found' } })));
+    vi.stubGlobal('fetch', fetchFn);
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const wrapper = mount(UserLlmPane, {
+      props: { user: FDE_USER, providers, gitHosts: [] },
+      global: { plugins: [pinia, i18n] },
+    });
+    await flushPromises();
+    return { wrapper, fetchFn };
+  }
+
+  const quotaPuts = (fetchFn: ReturnType<typeof fetchMock>) =>
+    fetchFn.mock.calls.filter(([u, i]) => String(u).includes('/llm/quota') && i?.method === 'PUT');
+
+  it('渲染今日已用 / 剩余 / 本地重置时刻，以及近 14 天用量表', async () => {
+    const { wrapper } = await mountQuota();
+    expect(wrapper.find('[data-test="daily-budget"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('1.25');
+    expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('3.75');
+    // 重置时刻：本地时区格式化（不是原始 ISO 串）
+    const expectedReset = new Date('2026-11-24T16:00:00Z').toLocaleString();
+    expect(wrapper.find('[data-test="budget-reset"]').text()).toBe(expectedReset);
+    expect(wrapper.find('[data-test="budget-reset"]').text()).not.toContain('2026-11-24T16:00:00Z');
+    // 近 14 天表：两行，日期/花费/token
+    const rows = wrapper.findAll('[data-test="usage-row"]');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].text()).toContain('2026-11-22');
+    expect(rows[0].text()).toContain('150');
+    // 额度回显：GET quota 的 daily_budget_usd 进输入框
+    expect((wrapper.find('[data-test="budget-input"]').element as HTMLInputElement).value).toBe('5');
+  });
+
+  it('保存发出正确 body {daily_budget_usd:number}；保存成功后回显', async () => {
+    const { wrapper, fetchFn } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/quota') && init?.method === 'PUT') {
+        return jsonResponse(200, { quota: { daily_budget_usd: 10, max_budget: 10, budget_duration: '1d', budget_reset_at: '2026-11-24T16:00:00Z', spend: 0, remaining: 10 } });
+      }
+      return undefined;
+    });
+    await wrapper.find('[data-test="budget-input"]').setValue('10');
+    await wrapper.find('[data-test="budget-save"]').trigger('click');
+    await flushPromises();
+    const puts = quotaPuts(fetchFn);
+    expect(puts).toHaveLength(1);
+    expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ daily_budget_usd: 10 });
+    expect(wrapper.find('[data-test="budget-msg"]').text()).toBe('额度已保存');
+    // 回显：PUT 响应的 quota.daily_budget_usd=10 回填输入框与剩余
+    expect((wrapper.find('[data-test="budget-input"]').element as HTMLInputElement).value).toBe('10');
+    expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('10');
+  });
+
+  it('输入框留空 → 保存发 {daily_budget_usd:null}（清空 = 不限）', async () => {
+    const { wrapper, fetchFn } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/quota') && init?.method === 'PUT') {
+        return jsonResponse(200, { quota: { daily_budget_usd: null, max_budget: null, budget_duration: null, budget_reset_at: null, spend: 0, remaining: null } });
+      }
+      return undefined;
+    });
+    await wrapper.find('[data-test="budget-input"]').setValue('');
+    await wrapper.find('[data-test="budget-save"]').trigger('click');
+    await flushPromises();
+    const puts = quotaPuts(fetchFn);
+    expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ daily_budget_usd: null });
+    // 清空后 remaining = null ⇒ 显示「不限」
+    expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('不限');
+  });
+
+  it('未定价警告：已选模型 pricing_configured=false 时出现', async () => {
+    const { wrapper } = await mountQuota(undefined, quotaProviders(false));
+    expect(wrapper.find('[data-test="unpriced-warning"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="unpriced-warning"]').text()).toContain('未定价');
+  });
+
+  it('未定价警告：已选模型都定价（undefined/true）时不出现', async () => {
+    const { wrapper } = await mountQuota(undefined, quotaProviders(true));
+    expect(wrapper.find('[data-test="unpriced-warning"]').exists()).toBe(false);
+    // 默认 PROVIDERS（无 pricing_configured 字段 = 未知）也不告警（只报 === false）
+    const dflt = await mountQuota();
+    expect(dflt.wrapper.find('[data-test="unpriced-warning"]').exists()).toBe(false);
+  });
+});
