@@ -216,16 +216,20 @@ onMounted(async () => {
   await loadQuotaAndUsage();
 });
 
-// ── issue #719：每日额度（USD/天） + 今日/历史用量 ──────────────────
-// 额度读写走 /llm/quota；今日花费/重置时刻从 GET quota 的 spend/remaining/budget_reset_at 取；
-// 近 14 天表走 /llm/usage。portal 绝不自算 token（全读 LiteLLM）。
+// ── issue #719：周期额度（USD / 周期，周期由 budget_duration 决定） + 近 30 天用量 ──────
+// 额度读写走 /llm/budget；已用/剩余/重置时刻从 GET budget 的 spend/remaining/budget_reset_at 取；
+// 已用口径（标签唯一依据）是 spend_scope：'period'⇒本周期已用，'lifetime'⇒终身累计（无额度）——
+// **前端绝不自己推导**（/key/info 的 spend 只有存在 budget_duration 时才按周期归零）。
+// 近 30 天表走 /llm/usage。portal 绝不自算 token（全读 LiteLLM）。
 interface Quota {
-  daily_budget_usd: number | null;
+  budget_usd: number | null;
+  budget_period: string | null;
   max_budget: number | null;
   budget_duration: string | null;
   budget_reset_at: string | null;
   spend: number | null;
   remaining: number | null;
+  spend_scope: 'period' | 'lifetime' | null;
 }
 interface UsageDay {
   date: string;
@@ -235,9 +239,18 @@ interface UsageDay {
 const quota = ref<Quota | null>(null);
 const usageDays = ref<UsageDay[]>([]);
 const budgetInput = ref<string | number>('');
+// 周期下拉：默认 '1mo'（白名单只允许 '1d' / '1mo'，原样透传 LiteLLM，绝不自算换算）。
+const budgetPeriodInput = ref('1mo');
 const savingBudget = ref(false);
 const budgetMsg = ref('');
 const budgetErr = ref('');
+
+// 已用标签：按后端 spend_scope 决定（不重推）。'period'⇒本周期已用；其余⇒累计已用（未设额度）。
+const spendScopeLabel = computed(() => (
+  quota.value?.spend_scope === 'period'
+    ? t('admin.llm.budgetSpendPeriod')
+    : t('admin.llm.budgetSpendLifetime')
+));
 
 // 重置时刻按**本地时区**格式化（issue 要求不显示 UTC）。
 const budgetResetLocal = computed(() => {
@@ -248,7 +261,7 @@ const budgetResetLocal = computed(() => {
 });
 
 // 未定价警告（坑 3）：从 providers（= admin store 的 models）里按已保存的 main/embedding/vision
-// 的 model_id 找 pricing_configured === false 的模型；存在则警告（其用量记 0，日额度对它不生效）。
+// 的 model_id 找 pricing_configured === false 的模型；存在则警告（其用量记 0，额度对它不生效）。
 const unpricedSelected = computed(() => {
   const ids = [cfg.value?.main?.model_id, cfg.value?.embedding?.model_id, cfg.value?.vision?.model_id]
     .filter((x): x is string => Boolean(x));
@@ -263,16 +276,17 @@ function budgetToInput(value: number | null | undefined): string {
 }
 
 async function loadQuotaAndUsage() {
-  // 无 active binding ⇒ quota/usage 会 404：静默降级（不阻断整个 pane）。
+  // 无 active binding ⇒ budget/usage 会 404：静默降级（不阻断整个 pane）。
   try {
-    const q = await api<{ quota: Quota }>(`/api/admin/fdes/${fde}/llm/quota`);
+    const q = await api<{ quota: Quota }>(`/api/admin/fdes/${fde}/llm/budget`);
     quota.value = q.quota ?? null;
-    budgetInput.value = budgetToInput(q.quota?.daily_budget_usd);
+    budgetInput.value = budgetToInput(q.quota?.budget_usd);
+    budgetPeriodInput.value = q.quota?.budget_period ?? '1mo';
   } catch {
     quota.value = null;
   }
   try {
-    const u = await api<{ days: UsageDay[] }>(`/api/admin/fdes/${fde}/llm/usage?days=14`);
+    const u = await api<{ days: UsageDay[] }>(`/api/admin/fdes/${fde}/llm/usage?days=30`);
     usageDays.value = Array.isArray(u.days) ? u.days : [];
   } catch {
     usageDays.value = [];
@@ -285,15 +299,18 @@ async function onSaveBudget() {
   budgetMsg.value = '';
   budgetErr.value = '';
   const raw = String(budgetInput.value ?? '').trim();
-  // 留空 = 不限 ⇒ null；否则 Number（非法值交服务端 400，不本地拦）。
-  const body = raw === '' ? { daily_budget_usd: null } : { daily_budget_usd: Number(raw) };
+  // 留空 = 不限 ⇒ budget_usd: null（period 一并清空，不发送 period）；否则金额 + 周期两项都带。
+  const body: Record<string, unknown> = raw === ''
+    ? { budget_usd: null }
+    : { budget_usd: Number(raw), budget_period: budgetPeriodInput.value };
   try {
-    const r = await api<{ quota: Quota }>(`/api/admin/fdes/${fde}/llm/quota`, {
+    const r = await api<{ quota: Quota }>(`/api/admin/fdes/${fde}/llm/budget`, {
       method: 'PUT',
       body: JSON.stringify(body),
     });
     quota.value = r.quota ?? null;
-    budgetInput.value = budgetToInput(r.quota?.daily_budget_usd); // 保存成功后回显
+    budgetInput.value = budgetToInput(r.quota?.budget_usd); // 保存成功后回显
+    budgetPeriodInput.value = r.quota?.budget_period ?? '1mo';
     budgetMsg.value = t('admin.llm.budgetSaved');
   } catch (e) {
     budgetErr.value = t('admin.errorPrefix') + (e instanceof Error ? e.message : String(e));
@@ -418,7 +435,7 @@ async function onSaveBudget() {
       </template>
     </div>
 
-    <!-- issue #719：每日额度区（仅在有 active binding 时显示） -->
+    <!-- issue #719：周期额度区（仅在有 active binding 时显示） -->
     <div v-if="cfg?.api_key" data-test="daily-budget" class="mt-4 grid gap-2 rounded-md border border-black/15 p-3">
       <p class="text-sm font-medium">{{ t('admin.llm.budgetTitle') }}</p>
       <p v-if="unpricedSelected.length" data-test="unpriced-warning" class="syserr">{{ t('admin.llm.unpricedWarning') }}</p>
@@ -433,6 +450,15 @@ async function onSaveBudget() {
           :placeholder="t('admin.llm.budgetPlaceholder')"
           class="w-40 rounded-md border border-black/20 px-2 py-1 text-sm"
         >
+        <label class="text-xs text-black/55">{{ t('admin.llm.budgetPeriodLabel') }}</label>
+        <select
+          v-model="budgetPeriodInput"
+          data-test="budget-period"
+          class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+        >
+          <option value="1mo">{{ t('admin.llm.budgetPeriodMonthly') }}</option>
+          <option value="1d">{{ t('admin.llm.budgetPeriodDaily') }}</option>
+        </select>
         <button
           type="button"
           data-test="budget-save"
@@ -442,7 +468,7 @@ async function onSaveBudget() {
         >{{ t('admin.llm.budgetSave') }}</button>
       </div>
       <div data-test="budget-state" class="grid gap-0.5 text-sm">
-        <span>{{ t('admin.llm.budgetTodaySpend') }}：<b data-test="budget-spend">{{ quota?.spend ?? 0 }}</b> USD</span>
+        <span>{{ spendScopeLabel }}：<b data-test="budget-spend">{{ quota?.spend ?? 0 }}</b> USD</span>
         <span>{{ t('admin.llm.budgetRemaining') }}：<b data-test="budget-remaining">{{ quota?.remaining == null ? t('admin.llm.budgetUnlimited') : quota.remaining }}</b></span>
         <span v-if="budgetResetLocal">{{ t('admin.llm.budgetResetAt') }}：<b data-test="budget-reset">{{ budgetResetLocal }}</b></span>
       </div>
@@ -450,6 +476,7 @@ async function onSaveBudget() {
       <p v-if="budgetErr" data-test="budget-err" class="syserr" role="alert">{{ budgetErr }}</p>
 
       <p class="mt-1 text-sm font-medium">{{ t('admin.llm.usageTitle') }}</p>
+      <p class="text-xs text-black/45">{{ t('admin.llm.usageBucketNote') }}</p>
       <table data-test="usage-table" class="w-full text-left text-sm">
         <thead>
           <tr class="text-xs text-black/55"><th>{{ t('admin.llm.usageDate') }}</th><th>{{ t('admin.llm.usageSpend') }}</th><th>{{ t('admin.llm.usageTokens') }}</th></tr>
