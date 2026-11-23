@@ -62,7 +62,7 @@ async function startStack({ files = {}, kkHandler, kkDead = false } = {}) {
     loginRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
     totpRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 5, maxEntries: 100 },
     kdfConcurrency: 2, kdfQueueLimit: 10, kdfQueueTimeoutMs: 30_000,
-    maxBodyBytes: 64 * 1024, maxLoginLength: 128, maxPasswordLength: 256,
+    maxLoginLength: 128, maxPasswordLength: 256,
     staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')),
     userSpaceRoot: userspace,
     previewSessionSigningKey: SECRET,

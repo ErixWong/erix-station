@@ -4213,7 +4213,7 @@ delegate + #468 那几波推高，别再引旧数。）
 2. **不覆盖是默认**：目标存在 ⇒ `409 file_exists`（`details.path`）；`overwrite=1` 才覆盖。`rename` 的 `EISDIR`/`ENOTEMPTY` 映射成 `409 file_exists` + `details.reason='target_is_dir'`（否则是 500 裸错误）。
 3. **no-clobber 只有 `linkSync` 是保证**：`renameSync` **恒覆盖**（它就是覆盖语义），`lstat` 快路径是**优化不是安全保证**。实现 = 流式写 `.upload-*.tmp`（`O_CREAT|O_EXCL|O_NOFOLLOW`、`0600`）→ `fchown(fdeUid, fdeGid)` → `fchmod 0660` → `fsync` → `linkSync`（`EEXIST` ⇒ `false` ⇒ 409）。abort / 超限 ⇒ `unlink` 临时文件，**不留残留、不留半截文件**。
 4. **portal 以 root 跑 ⇒ 必须 `fchown` 同时给 uid 与 gid**：只给 uid 会留 `gid=0`（§8.71 同族），FDE 里的 agent（uid 1002 / 主组 1000）就改不动收到的文件。真机实测 `-rw-rw---- 1 eric eric` 逐条对过。
-5. **上限 32 MiB 独立于 `MAX_BODY_BYTES`**（`FILE_UPLOAD_MAX_BYTES`，`413 file_too_large` + `details.max_bytes`）。⚠ **compose 必须显式写 `environment`**——portal 服务**没有 `env_file`**，只在 `deploy/.env` 里加变量不生效（`deploy-env-defaults` 那族判据盯的就是这种两头说法）。
+5. **上限 32 MiB 独立于 JSON 请求体上限（默认 64 KiB）**（`FILE_UPLOAD_MAX_BYTES`，`413 file_too_large` + `details.max_bytes`）。⚠ **compose 必须显式写 `environment`**——portal 服务**没有 `env_file`**，只在 `deploy/.env` 里加变量不生效（`deploy-env-defaults` 那族判据盯的就是这种两头说法）。
 6. **`=== true` 全站，不许 `Boolean()`**：`Boolean('f') === true` 会让 `"false"` 字符串变成「已开启」。开关三处（`admin.js#safeUser`、`auth.js#toSessionUser`、前端 `stores/auth.ts`）全部 `=== true`；**前端缺键 = 未知 = 不显示按钮**（与 #390-A「键缺席不是 false」同一纪律）。
 
 **开关全链（片 A）**：迁移 **`0029-user-file-upload.sql`**（`ADD COLUMN IF NOT EXISTS … boolean NOT NULL DEFAULT false`，`schema.sql` 一字节未改）；`toSessionUser(row)` 是**唯一 DTO 构造器**（`authenticate` / `verifyTotp` / `loadActiveUser` / `findSessionUser` 四处共用，四处 SELECT 都必须带列——漏一处就是「登录后没按钮、刷新后有」）；`createUser` 的**复活分支显式 `file_upload_enabled = false`**（重新启用 = 重新授权，不继承旧权限）；管理台**三态**（缺键 = 未知 ⇒ 禁用保存，且保存只提交该字段，不顺手回写别的）。
@@ -4232,7 +4232,7 @@ delegate + #468 那几波推高，别再引旧数。）
 
 **现状（2026-11-10 退役核对）**：`#472` CLOSED；本单代码在现网 **v0.1.62** 里完好（`upload_disabled` / `file_upload_enabled` / `resolveJailedRoot` 均在，`schema_migrations` head = `0029-user-file-upload`）。**开关现状（决策者 2026-11-10 拍板）**：`eric` 的 `file_upload_enabled = true` **有意保留**（验收时开启，`audit_log` `2026-11-09 08:56:36Z`、`target=eric`；其余用户全 `false` = 出厂默认）——**别再当「探针残留」去复原它**。
 
-**已知边界**：v1 **无配额**（任一用户可写满 userspace，影响所有容器）——**已开单 [#485](https://github.com/ErixWong/erix-station/issues/485) 承接**（① 单文件上限进管理台、DB 优先 env；② 每 FDE 目录总量上限走**文件系统配额**，判据是「容器里 `dd` 也必须失败」，不是「上传被拦」）；`MAX_BODY_BYTES` 与上传上限是两套数，改一个不影响另一个；上传只落到 `~/projects/<project>` 内（沿用 `dirs.js` 同一个 jail 谓词，`resolveJailedRoot` 是从那里**抽出来的**，不是复制的第二份）。⚠ userspace 真实路径是 **`/srv/erix/users`**（`ERIX_USERSPACE_ROOT_HOST`），文档惯例写的 `/docker/erix/users` 在本机不存在，别照惯例 grep。
+**已知边界**：v1 **无配额**（任一用户可写满 userspace，影响所有容器）——**已开单 [#485](https://github.com/ErixWong/erix-station/issues/485) 承接**（① 单文件上限进管理台、DB 优先 env；② 每 FDE 目录总量上限走**文件系统配额**，判据是「容器里 `dd` 也必须失败」，不是「上传被拦」）；`JSON 请求体上限` 与上传上限是两套数，改一个不影响另一个；上传只落到 `~/projects/<project>` 内（沿用 `dirs.js` 同一个 jail 谓词，`resolveJailedRoot` 是从那里**抽出来的**，不是复制的第二份）。⚠ userspace 真实路径是 **`/srv/erix/users`**（`ERIX_USERSPACE_ROOT_HOST`），文档惯例写的 `/docker/erix/users` 在本机不存在，别照惯例 grep。
 
 ### 8.109 composer 输入框按内容自适应高度（issue #466 / #467，2026-11-10 落地）
 
@@ -6229,10 +6229,10 @@ env 值 ⇒ 值班看一眼就知道该去改哪一边。零新错误码（`vali
 都是既有码），所以 §1.2 无新增。
 
 **工单原文有一条口径本身是错的**（照字面做会做出一个空区间）：片 A 第 3 条写「范围校验
-`1 MiB ≤ v ≤ MAX_BODY_BYTES 上限`」。但 `MAX_BODY_BYTES` 默认 **64 KiB** < 1 MiB 下限 ⇒ 区间为空集；
+`1 MiB ≤ v ≤ JSON 请求体上限`」。但 JSON 请求体上限默认 **64 KiB** < 1 MiB 下限 ⇒ 区间为空集；
 根因不是笔误而是**口径错配** —— 上传**根本不走** `readJsonBody`（`http.js#handleFileUpload` 的注释：
 走它任何真实文件都会 413），两个旋钮量的是不同的东西。落地取明确产品天花板 **1 GiB**（= 32 × 默认值），
-理由写在 `upload-settings.js` 的常量注释与 §4.15，并把「它与 `MAX_BODY_BYTES` 无关」写进文档。
+理由写在 `upload-settings.js` 的常量注释与 §4.15，并把「它与 JSON 请求体上限无关」写进文档。
 
 **判据读数**（判绿只看退出码）：`portal/test/upload-settings.test.js` **14/14 通过**（US-1..US-14，含 HTTP 层
 真 tmp userspace + FakePool）；`portal/test/migrations.test.js` **31/31**（head 断言 34 → 35 全量进位：
@@ -9460,7 +9460,7 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
 |---|---|---|
 | **限流类**（`LOGIN_RATE_LIMIT_*` / `TOTP_*` / `PREVIEW_TICKET_RATE_LIMIT_*` / `KDF_*` / `RATE_LIMIT_MAX_ENTRIES`） | 10 | **不做**：配置在启动时被 `createRateLimiter(config.x)` / `createSemaphore(...)` **封装进对象**且持有失败计数 ⇒ 现读不生效。要热生效只能 ① 改限流器 API 每次传配置（计数保留）或 ② 变更时重建（**会清空失败计数 ⇒ 管理员改配置等于给攻击者解封**）。这是安全语义决策，且与并行 session 的 LLM 额度工作相邻，**本 session 不碰** |
 | 容器注入类（`ERIX_MAX_ROUNDS` / `ERIX_ARTIFACT_*` / `ERIX_SHELL_*` / `ERIX_DELEGATE_*` 等 13 条） | 13 | **不做**：provisioner 注入 FDE 容器 env ⇒ 改 DB 只影响**新 provision** 的容器，进界面会造成「界面说 20、容器跑 15」两套真相 |
-| `MAX_BODY_BYTES` | 1 | 未做（49 个调用点，干净可做，留给后续） |
+| JSON 请求体上限 env（#677 前） | 1 | 已完成（#677：值降为 `http.js` 的 `DEFAULT_JSON_BODY_LIMIT` 模块常量（仍 64 KiB），env 本身删除，调用点走默认） |
 
 ### 教训
 
@@ -9468,3 +9468,38 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
   （它的消费者读的是 `config.cookie`，不是 `config.cookieProfile`）。三级都空才算死。
 - **删 `config.js` 的行是有成本的**：行号漂移会打断 env 闸门的坐标钉住，闸门会红（这是它该干的），
   每次都要同步 `deploy/env-legs-exceptions.json` 与 `deploy-env-delegate.test.js` 里的真树坐标。
+
+### 8.184 #677 Tier 2B 收口：`MAX_BODY_BYTES` **不做旋钮**，只放宽两个消息端点（2026-11-23，主 agent + erix_run ×2 + copilot 对抗审查）
+
+**接 8.183 的「未做（49 个调用点，干净可做）」**：本单结论是**不做那个旋钮**，改做「把消息端点从全站默认里摘出来」。
+
+**四条现查事实（推翻/修正了先前判断）**：
+1. **64 KiB 不是无出处**：`docs/api/portal.md:374` 写死了登录的 64 KiB 约束；`config.js` 原注释写明目的是「防止超大字段触发 scrypt 或打爆内存」。⇒ **不许放大全站默认**。
+2. **100k 字符业务闸在 64 KiB 下结构性不可达**：中文 UTF-8 100k 字符 ≈ 300 KB，用户永远先撞 413 `payload_too_large`，看不到「content 过长」。`session-http.test.js` 只测纯函数所以照绿。
+3. **`MAX_BODY_BYTES` 与 `MAX_ROUND_BYTES` 两个 env 都是假旋钮**：`deploy/docker-compose.yml` 的 station-portal 用**显式 environment 列表**（无 `env_file`），两者都不在其中 ⇒ 运维在 `deploy/.env` 里设了**不生效**。
+4. **宿主预写没有体积闸**：`transcript-store.js` 的 `appendRound` 直接 INSERT，不校验 `MAX_ROUND_BYTES`；那个 400 只在 internal HTTP 写轮路径（`internal.js`）。⇒ 「消息超 round 上限必然 400」是错的。
+
+**copilot 对抗审查抓到我 4 个错（全部成立，逐条回代码验过）**：
+- `4 字节/token` **不保守、方向反了**：引擎 estimator 是 CJK **1.5 token/字符** × margin 1.15（`node_modules/erix-agent/src/tokens.js`）⇒ 中文 **1.74 字节/token**、英文 3.04。`×4` 对中文**高估 2.3 倍**；「262144×4 正好 1 MiB ⇒ 1MiB 就是整个上下文窗口」是**数字巧合**，不是推导。
+- 「消息超 round 上限必然 400」错（见事实 4）。
+- 「`MAX_ROUND_BYTES` env 可调」在生产是假的（见事实 3）。
+- 「内存不是理由」也不全对：`readJsonBody` 峰值 ≈ **3–4 倍** body（chunks → concat → toString → parse），且 station-portal **无 `mem_limit`**。
+
+**落地（`fix-261123-14-json-body-limit`，5 个 commit）**：
+
+| 改动 | 内容 |
+|---|---|
+| 两个模块常量 | `http.js` 新增 `DEFAULT_JSON_BODY_LIMIT = 64*1024`（全站默认，46 处走它）与 `MESSAGE_BODY_LIMIT = 1024*1024`（**只**给 `/messages`、`/queued-inputs`）；注释写死两条约束：> `MAX_MESSAGE_CONTENT_LENGTH × 3` 且 ≤ `MAX_ROUND_BYTES` |
+| 删假 env | `config.maxBodyBytes` + env `MAX_BODY_BYTES` 删掉（值保留为常量）；`docs/env.md` / `.env.example` / 5 处台账字面量同步 |
+| 44 处死引用 | `readJsonBody(req, ctx.config.maxBodyBytes)` → `readJsonBody(req)`（字段已删，原来靠默认参数吃 `undefined` 假绿） |
+| **保留** | `MAX_MESSAGE_CONTENT_LENGTH = 100_000` 一个字没动（原计划要删，错）——现在它**可达**了 |
+| 防回潮哨兵 | `message-body-limit.test.js` 源码级两条：`http.js` 不许再出现 `config.maxBodyBytes`；`readJsonBody` 第二实参只认白名单 |
+
+**判据（真实 HTTP 面，不测纯函数）**：`portal/test/message-body-limit.test.js` 6 格 —— ① 10 万中文字符 ⇒ 202（带「已超旧 64 KiB」前提自证）；② 10 万零 1 ⇒ 400 `validation_failed` + `details.field='content'`（**业务闸可达自证**）；③ >1 MiB ⇒ 413 且 `details.max_bytes=1048576`；④ 登录 >64 KiB ⇒ **仍 413** `max_bytes=65536`（全站默认没被放大）；⑤ 413 不占幂等占位；⑥ 防回潮哨兵。
+**父 agent 变异实测（自己做，不采信 worker 报告）**：`MESSAGE_BODY_LIMIT` 改回 64 KiB ⇒ ①②③ 红、④⑤ 绿；哨兵变异 ⇒ `not ok 6`。最终树 `npm test` **rc=0 / 3221 tests / 3106 pass / 0 fail / 115 skipped**。
+
+**合并 origin/main 后哨兵抓到一个新引入的死引用**：#719 的 `PUT /api/admin/fdes/:fdeName/llm/budget` 带回了 `readJsonBody(req, ctx.config.maxBodyBytes)` ⇒ 哨兵立刻红，改成 `readJsonBody(req)` 后复绿。**这就是加哨兵的用处**。
+
+**残余（未开单，两条都是真洞）**：
+1. **宿主预写无体积闸**：`transcript-store.js#appendRound` 不校验序列化后的 record 体积 ⇒ 超过 `MAX_ROUND_BYTES` 的记录能绕过 internal 那道 400 直接落库。
+2. **`MAX_ROUND_BYTES` 仍没接进 compose**：它的 env 覆盖在生产依旧无效（本单只删了 `MAX_BODY_BYTES`，没动它——它是 round 契约的调参口，接进 compose 还是删掉需要单独决定）。

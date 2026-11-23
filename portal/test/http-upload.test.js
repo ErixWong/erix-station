@@ -74,7 +74,7 @@ async function startStack({ users = [ENABLED, DISABLED, UNKNOWN, NO_SEAT, RESTRI
     loginRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
     totpRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 5, maxEntries: 100 },
     kdfConcurrency: 2, kdfQueueLimit: 10, kdfQueueTimeoutMs: 30_000,
-    maxBodyBytes: 64 * 1024, maxLoginLength: 128, maxPasswordLength: 256,
+    maxLoginLength: 128, maxPasswordLength: 256,
     staticDir,
     userSpaceRoot: userspace,
     // 属主：默认取**本进程真的能设**的值（非 root 只能 chown 到自身 uid / 所属组，
@@ -377,7 +377,7 @@ test('超过 FILE_UPLOAD_MAX_BYTES ⇒ 413 file_too_large + details.max_bytes，
     assert.equal(fs.existsSync(path.join(s.proj, 'big.bin')), false);
     assert.ok(await waitFor(() => remnants(s.proj).length === 0), '超限之后不得留下 .tmp 残骸');
 
-    // 上限是**这个端点**的：MAX_BODY_BYTES(64KiB) 不参与，否则任何真实上传都会 413。
+    // 上限是**这个端点**的：JSON 请求体上限（默认 64 KiB）不参与，否则任何真实上传都会 413。
     const ok = await fetch(uploadUrl({ base: s.base, name: 'small.bin' }), {
       method: 'POST',
       headers: { cookie: s.cookieFor('alice'), 'content-type': 'application/octet-stream' },

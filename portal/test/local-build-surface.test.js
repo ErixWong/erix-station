@@ -184,7 +184,7 @@ test('#643B-3b：端点 `GET /api/admin/version` 下发真布尔 `localBuild`（
       loginRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, maxEntries: 10 },
       totpRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 5, maxEntries: 10 },
       kdfConcurrency: 1, kdfQueueLimit: 5, kdfQueueTimeoutMs: 1000,
-      maxBodyBytes: 4096, maxLoginLength: 128, maxPasswordLength: 256,
+      maxLoginLength: 128, maxPasswordLength: 256,
       staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'station-643-static-')),
     };
     pool.sessions.push({
