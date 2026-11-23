@@ -413,8 +413,8 @@ export const PREVIEW_SESSION_TTL_MAX_SECONDS = 86400; // 1 天：临时排障面
 // 默认与 config.js 的 `previewSessionTtlSeconds`（intEnv 兜底 15*60=900）、compose 的 `:-900` 同源。
 export const PREVIEW_SESSION_TTL_DEFAULT_SECONDS = 900;
 export const PREVIEW_SESSION_TTL_HINT =
-  '预览会话有效期（秒）：签发 / 续期预览 cookie 时现读（preview.js + http.js Set-Cookie），' +
-  '60..86400（默认 900 = 15 分钟）；0 非法（签出来即过期 = 白发）；上界 1 天（临时排障面）';
+  '预览会话有效期（秒）：签发/续期预览 cookie 时现读，60..86400（默认 900=15 分钟）；' +
+  '0 非法（签出即过期）；上界 1 天';
 
 /**
  * 严格十进制正整数（形状口径同上面四格：只认 `/^[0-9]+$/` 的非负整数字面，再要求区间内）。
