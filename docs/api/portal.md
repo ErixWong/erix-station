@@ -2078,7 +2078,9 @@ COMMIT
 > **为什么要它**：预览票是 **host 级**的（一张票只绑一条 allocation / 一个 host，§2.8），而一个 FDE 拿到的是
 > **一整段** `PREVIEW_PORT_COUNT`（默认 10）个 host ⇒ 前后端分离的应用（前端 22000 + 后端 22001）
 > 要逐个点「打开预览」，真机实测「跳 host 要点 2 次」。本端点把「一次点击 = 签 N 张票」变成**一次请求**，
-> 前端一次点击开 N 个标签页。**票的语义一个字没变**（仍然一次性、60 秒、host 级、逐张落 `preview_grants`）。
+> 前端一次点击开 N 个标签页。**票的语义一个字没变**（仍然一次性、host 级、逐张落 `preview_grants`；
+> 有效期是**默认 60 秒**、**可在管理台改**（`preview.ticket_ttl_seconds`，区间 `1..3600`，§4.21），
+> 改完**下一张签出的票**才用新值——已发出的票不改寿命）。
 
 请求体（可选字段）：
 
@@ -2113,7 +2115,7 @@ COMMIT
 | `id` / `port` | 这条票对应的 allocation 与端口（前端按 `id` 把票对回列表行；顺序已与请求一致） |
 | `url` | **已带 `?preview_ticket=` 的完整地址**（与单据端点 §2.8 同形同口径：scheme/端口按公开入口派生，前端不得自行拼接） |
 | `ticket` | 一次性短效 token（只存 `sha256`，§2.8） |
-| `expires_at` | ISO 时间戳；**整批共用一个**（同一个签发时刻 + 同一份 `PREVIEW_TICKET_TTL_SECONDS`）⇒ 前端不需要为每张票各算一次 TTL。单据端点给的是 `expires_in`（秒），本端点给绝对时刻，理由：一次开 N 个标签页时「各自剩多少秒」没有意义，**必须立刻开**才是判据 |
+| `expires_at` | ISO 时间戳；**整批共用一个**（同一个签发时刻 + 现读 `preview.ticket_ttl_seconds`，**DB > env > 默认**，契约见 §4.21）⇒ 前端不需要为每张票各算一次 TTL。单据端点给的是 `expires_in`（秒），本端点给绝对时刻，理由：一次开 N 个标签页时「各自剩多少秒」没有意义，**必须立刻开**才是判据 |
 
 校验顺序即判据（①② 在任何 SQL 之前）：
 
@@ -2133,7 +2135,7 @@ COMMIT
   包进一个事务不会更原子，只会白占连接）。实现是「**先全量预检 → 再逐张签发 → 失败补偿**」：
   预检（①②③）在任何签发之前完成 ⇒ 越界/超限这类可预期失败**零写入**；签发途中的意外（并发下 allocation 被释放、
   DB 抖动）会用一条 `UPDATE preview_grants SET state='revoked', revoked_at=COALESCE(revoked_at, now())` 把本批
-  **已签的票全部收回**再抛错（既有 `500` 口径）⇒ 既**不返回半截 `items`**，库里也不留 60 秒内还能换预览 cookie 的残票。
+  **已签的票全部收回**再抛错（既有 `500` 口径）⇒ 既**不返回半截 `items`**，库里也不留 TTL 内还能换预览 cookie 的残票。
 - **审计：逐张各写一行**（`action='auth.preview_ticket_issued'`、`actor_id`=签发者、`target`=该行的预览 host、
   `details={grant_kind:'ticket', allocation_id, port, token_hash_prefix, expires_at}`）。口径照 §2.8 B3：
   **绝不入 ticket 明文、也绝不入带票的 `url`**（与 forward-auth 审计的 `pathOnly` 同一条纪律）；
@@ -2155,7 +2157,7 @@ COMMIT
 > 已有的 `withFdeLock` 锁键是 `fde:${fdeName}`，**串行化不了不同 FDE 抢同一个空闲块**，
 > 所以「迁移 0019 的全局部分唯一索引 + 新事务重算」才是正解，不要指望加锁（规格 §8.2）。
 
-> **前端已接入（#246 交付② 单 B）**；#247 的批量端点也已接入：工作台左侧栏的预览端口面板有「打开全部预览 / Open all previews」，一次点击 = 签 + 开 N 个标签页（**不做二次确认**——票 60 秒过期）；弹窗被拦时面板给出带票的可点链接列表兜底。批量签票**同样只在点击时发生**（挂载/折叠/刷新都不签）。
+> **前端已接入（#246 交付② 单 B）**；#247 的批量端点也已接入：工作台左侧栏的预览端口面板有「打开全部预览 / Open all previews」，一次点击 = 签 + 开 N 个标签页（**不做二次确认**——票默认 60 秒过期，有效期可在管理台改 `1..3600`、下一次签票生效）；弹窗被拦时面板给出带票的可点链接列表兜底。批量签票**同样只在点击时发生**（挂载/折叠/刷新都不签）。
 
 ### 4.8 工具审批（Approvals）
 
@@ -3671,17 +3673,23 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**已迁的旋钮（两格）**（其余 21 个归 P3 逐批迁）：
+**已迁的旋钮（三格）**（其余 20 个归 P3 逐批迁）：
 
 | key | env 兜底位 | 值域 | `applyMode` | 生效点 |
 | --- | --- | --- | --- | --- |
 | `session.ttl_seconds` | `SESSION_TTL_SECONDS` | 整数 `60..2592000` 秒 | `hot` | 登录建会话 / 续期时现读 |
 | `workspace.retention_days` | `ERIX_WORKSPACE_RETENTION_DAYS` | 整数 `0..3650` 天（**`0` 是有效值** = 不自动清理） | `hot` | offboarding 循环每一拍现读 |
+| `preview.ticket_ttl_seconds` | `PREVIEW_TICKET_TTL_SECONDS` | 整数 `1..3600` 秒（**`0` 非法**：签出来即过期） | `hot` | 签预览票时现读（批量整批共用一次） |
 
-两格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+三格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
 **上界 `3650` 是产品口径不是算术溢出**：超过 10 年的「离职保留」与「永不清理」在运维上不可区分，
 而后者已有确定表达（`0`）⇒ 上界外的值只能是把单位填错了（想写 30 天写成秒/毫秒那一族）。
 越界的 env 值被闸拦下后回落**默认 `0`**，是更保守的一档（少删目录，不会误删）。
+`preview.ticket_ttl_seconds` 的上界 `3600`（1 小时）同样是产品口径：预览票是「点开一条链接临时进面板」
+的一次性短票，短才有意义（越短被截获/重放的窗口越小）；`3600` = 一张票最多覆盖一次排障会话，再长就该发
+会话 cookie 而不是票。下界 `1`（**不含 `0`**）与上面 `retention_days` 那种「`0` = 有语义」相反：这里 `0`
+秒的票签出来立刻过期 = 白发，只会造成「签了却进不去」的困惑，所以 `0` 判非法。默认 `60` 与 `config.js`
+的 `previewTicketTtlSeconds` 同源。
 
 #### `GET /api/admin/runtime-settings`（管理员）
 
@@ -3704,8 +3712,19 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   为什么：`loadConfig` 的通用 `intEnv` 走 `Number()` 语义（上面那四个收了三个），只靠它就会出现
   「DB 写同样的值被 400 拒、env 写却静默生效」的两套真相；闸落在 registry 驱动的这一层
   （启动覆盖层 / 热读 / 本节这个 GET 共用同一个裁决器），通用 `intEnv` 不改（它服务别的旋钮）。
-- **表不存在 / 读失败也回 `200`**（回落 env/默认 + `source` 如实）。理由与 §4.15 同口径：
-  运维故障不该把管理台锁死；写侧才是严格闸。
+- **表不存在 / 读失败也回 `200`**（回落 env/默认，或回落**启动时的 DB 快照** —— 就是下一条那两档
+  `reason`；`source` 一律如实）。理由与 §4.15 同口径：运维故障不该把管理台锁死；写侧才是严格闸。
+- ⚠ **启动快照那一档的 `reason` 要分两档（#709 MED① + #709b LOW①）**：启动时从 DB 覆盖进来的
+  那一格（config 上带 `<path>Source='db'`）在读不到行时手里那个数仍是**启动时的 DB 快照**
+  ⇒ `source` 如实报 `db`，而 `reason` 按「为什么读不到」分叉（故障与没配不许共用一个理由）：
+  · `db_read_failed_using_boot_snapshot` —— 查询抛错 / 超时 / 没有 pool（故障族）= **真读不到**
+    ⇒ 运维该去看 DB（warn：「读不到 DB 行（read_failed…）⇒ 暂用启动时的 DB 快照」）；
+  · `no_row_using_boot_snapshot` —— **查询成功、只是表里没有这一行**（正常：还没人配过）
+    = **不是读失败** ⇒ 运维要去管理台改值而不是查连接（warn 单独一条，点名「查询成功、但表里
+    没有这一行」，不许顶着故障那条文案）。
+  其余情形的 `reason` 逐字不变（`no_row` / `read_failed` / `read_timeout` / 行在但值不可用）；
+  两档都是 `200`、都不抛。判据 `portal/test/runtime-settings.test.js`
+  「#709 MED① DB 读失败…」与「#709b LOW① 查询成功 + 无那一行」两格。
 - `applyMode` 两档：`hot` = **下一次读就生效**（不需要重启）；`restart` = 需重启 `station-portal` 才生效。
   这一档是**声明**，不是承诺——页面照它显示，别自己猜。
 - `hint`（**可选键**）：给管理员看的一行提示，registry 那一格登记了才带；**没登记就不有这个键**
@@ -3721,6 +3740,13 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   「库里现在是这个值」不会分离。
 - `400 validation_failed`，`details.field` 三档：`key`（未登记；`details.known` 列可用 key）、
   `value`（形状/区间不过）、`body`（体不是对象）。
+- **数值的两侧之分（`1e3` 这一类，#709 unproven 裁定）**：写侧只认 body 里的 JSON 类型。——
+  `{"value": 1e3}` 里的 `1e3` 是 **JSON number**（解析时已塌成整数），`1e3` 与 `1000` 是同一个值
+  ⇒ 区间内即 **`200` 收下、库里存 `1000`**（科学记数写法不会多出一套真相）；而 `{"value": "1e3"}`
+  是**字符串**，`validate` 只放 number ⇒ **`400 validation_failed`**（`details.field='value'`）。
+  这与 env 兜底位**相反**：env 那档走 `parse` 的 `/^[0-9]+$/`，`1e3` 过不了 ⇒ 视为没给、回落默认（见上方
+  env 那一档的口径与 `docs/env.md`）。一句话：`1e3` 写进 body 被收（=1000），写进 env / 当字符串都不算数。
+  判据 `runtime-settings.test.js` RS-31b。
 - 路径段不匹配 key 形状（`^[a-z][a-z0-9_.]{2,63}$`，与迁移 `0046` 的 `CHECK` 同形）⇒ `404`
   （「没有这个路由」，而不是拿去库里绕一圈）。
 - **写与审计在同一个事务里**（`BEGIN` → upsert → 审计 → 检查审计行数 === 1 → `COMMIT`）。
@@ -3744,6 +3770,26 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 ⇒ 最坏与拍频同量级的一条整表 SELECT（这张表只有几行）；② 读侧**永不抛** ⇒ 配置面坏了不会把销号循环
 停摆，只是退回用 env/默认那一档（默认 `0` = 不删，安全侧）。
 ⚠ `0` 在 sweep 里判的是**传进来的那个数**，不是启动期快照（`config.workspaceRetentionDays` 只做缺省值）。
+
+`preview.ticket_ttl_seconds` 也是 `hot`（#677 P3 第二批）：单据 `POST /api/ports/:id/preview-ticket`
+与批量 `POST /api/me/ports/batch-tickets` **每次签票现读**，新 TTL 下一张票就换。**不写进票**：
+票里只存「过期时刻」不存「用了多长 TTL」，改 TTL 既不会让已签出的票提前死，也不会把它续长——
+**已发出的票只改长度、不改寿命**（与 session 那一格同一条口径，原因在上一子段）。
+
+两条签票路径共用同一个旋钮（#709 补；#709b 按 `portal/src/http.js` 修正端点名 / 函数名 / 失败行为）：
+单据 `handlePreviewTicket` 与批量 `handleBatchPreviewTickets` 各自调一次
+`runtime-settings.js` 的 `readPreviewTicketTtlSeconds()`，把读到的数当**显式入参** `ticketTtlSeconds`
+递给 `preview.js#issuePreviewTicket`（本模块不自己读库）。批量**整批共用那一次读取**（`http.js` 在
+循环外读一次，循环里每张票与审计都复用同一个值 ⇒ 一批一张票一个时长，不因逐张重读而中途变脸）。
+批量格响应里的 `items[].expires_at` 与**落库的 `preview_grants.expires_at`** 同源于这一次读取：
+库内那一行由 `preview.js` 用**同一个 `now` + 同一个 TTL** 算，响应那一个由 `http.js` 用同一组数算
+⇒ 两边逐字相等；单据响应只有 `expires_in`（同一个秒数），**没有** `expires_at`。
+
+⚠ **读不到不返回 `503`**（#709b 修正：旧稿写的 `previewTicketTtlSecondsNow()` / `issuePreviewTickets` /
+`SettingUnavailableError` ⇒ `503` 在源码里都不存在）。热读**永不抛**（`createHotReader` 里那一支
+`read_unavailable` 只在本模块内部被接住），回落阶梯是 **DB 有效值 > env（过 registry 闸）>
+registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotReadWarnMerger`）⇒ 票照签，
+只是按回落那一档的寿命算（宁可签一张按回落寿命的票，也不把预览面板锁死；口径同上面两格热读）。
 
 另两条同一条路径上的口径（#701 返修补写）：
 

@@ -390,6 +390,40 @@ test('issuePreviewTicket：admin 代签他人 private 放行（issuer=subject=ad
   assert.ok(out.ticket);
 });
 
+// #677 P3 第二批返修：`issuePreviewTicket` 的 TTL 入参契约。这一格钉的是**缺省那半边**：
+// 两个 HTTP 消费点都改成现读之后，本体仍必须保持「不传参 = 启动快照」，否则本文件上面
+// 那几格直调与 #429 的血缘桩会被一起牵动；同时钉住「响应 `expires_in` 与库内 `expires_at`
+// 同源」（M-2 那一刀改的就是这条）。
+test('#677 P3②返修 issuePreviewTicket 的 TTL 入参契约：不传 = config 快照、传值 = 两处同源', async () => {
+  const { pool, grants } = makePool();
+  const session = { user: { id: 'u1', role: 'fde' } };
+
+  // ① 不传 `ticketTtlSeconds` ⇒ 与旧版逐字一致：响应与库内都取 `config` 的 60。
+  const legacy = await issuePreviewTicket(pool, config, {
+    allocationId: 'pa1', session, now: NOW,
+  });
+  assert.equal(legacy.expires_in, 60, '缺省必须取 config.previewTicketTtlSeconds（不是 undefined）');
+  assert.equal(new Date(grants.at(-1).expires_at).getTime() - NOW.getTime(), 60_000);
+
+  // ② 缺省是「取 config」而不是「写死 60」：config 换 45、依旧不传参 ⇒ 45。
+  const { pool: p45, grants: g45 } = makePool();
+  const fromConfig = await issuePreviewTicket(p45, { ...config, previewTicketTtlSeconds: 45 }, {
+    allocationId: 'pa1', session, now: NOW,
+  });
+  assert.equal(fromConfig.expires_in, 45, '缺省跟着 config 走');
+  assert.equal(new Date(g45.at(-1).expires_at).getTime() - NOW.getTime(), 45_000);
+
+  // ③ 传显式值（HTTP 消费点把现读值递进来的形状）⇒ 响应与库内**同一个数**。
+  const hot = await issuePreviewTicket(pool, config, {
+    allocationId: 'pa1', session, now: NOW, ticketTtlSeconds: 30,
+  });
+  assert.equal(hot.expires_in, 30);
+  assert.equal(new Date(grants.at(-1).expires_at).getTime() - NOW.getTime(), 30_000,
+    'expires_at 必须跟着入参走：响应说 30、库里落 60 = 同一个请求内分叉');
+  // config 仍是 60（同一个对象）⇒ 证明上面那两个 30 来自入参，不是 config 被改了。
+  assert.equal(config.previewTicketTtlSeconds, 60);
+});
+
 // ---- forward-auth ----
 test('authorizeForwardAuth：无凭证 403 / 未知 host 404 / released 403', async () => {
   const { pool } = makePool();
