@@ -55,6 +55,26 @@ import { MacroError } from './macros.js'; // #526：宏域错误载体（httpSta
 import * as market from './market.js'; // #595：能力市场（校验/安装面），本文件只做「匹配+鉴权+转发+审计」
 import { metricsApiPayload } from './system-metrics.js'; // #650：管理台系统监控（响应本体在那个模块，本文件只做匹配+递旋钮）
 
+/**
+ * **全站 JSON 请求体默认上限（内存护栏 + scrypt 保护）。**
+ *
+ * 值 64 KiB。它替代了原 env `MAX_BODY_BYTES` 的默认值（该 env 从未接进
+ * `deploy/docker-compose.yml` 的 station-portal environment 列表 ⇒ 生产设了也不生效，是个假旋钮，
+ * issue #677 已删）。保留 64 KiB 的理由：① 防超大登录字段触发 scrypt / 打爆内存；
+ * ② 有文档依据（`docs/api/portal.md` 登录请求体约束）。46 个调用点共用它，**不许放大**。
+ */
+const DEFAULT_JSON_BODY_LIMIT = 64 * 1024;
+
+/**
+ * **消息端点（`POST /api/sessions/:id/messages` 与 `.../queued-inputs`）的请求体上限。**
+ *
+ * 值 1 MiB。只给这两个「用户输入正文本身」的端点放宽，约束两条：
+ * ① 必须 **>** `MAX_MESSAGE_CONTENT_LENGTH`（`sessions.js` = 100_000 字符）× 3 —— 中文 UTF-8
+ *    最坏每字符 3 字节 ≈ 300 KB，否则业务闸在 64 KiB 传输闸下永远不可达（用户看到 413 而非「content 过长」）；
+ * ② 必须 **≤** `MAX_ROUND_BYTES`（`internal.js` 默认 1 MiB，单轮 transcript 记录上限，消息会进这个记录）。
+ */
+const MESSAGE_BODY_LIMIT = 1024 * 1024;
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -495,7 +515,7 @@ function requestHasNoBody(req) {
 }
 
 /** 读取 JSON 请求体：Content-Length 早期拒绝 413；流式超限也 413（不 destroy 连接，回错误信封）。 */
-function readJsonBody(req, limit) {
+function readJsonBody(req, limit = DEFAULT_JSON_BODY_LIMIT) {
   return new Promise((resolve, reject) => {
     const contentLength = req.headers['content-length'];
     if (contentLength) {
@@ -2802,7 +2822,7 @@ function queuedInputDeps(ctx) {
 async function handlePostQueuedInput(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const body = await readJsonBody(req, MESSAGE_BODY_LIMIT);
   // 校验前置到幂等包装之前（F3 口径，同 handlePostMessage）：非法体 400 且不占幂等占位行。
   // `kind` 缺省 = `steer`（前端主键 Enter 的动作，也是旧客户端不传 kind 时唯一的合理默认）。
   // ⚠ 缺省必须在**算 requestHash 之前**定形：否则「不传 kind」与「传 steer」的同 key 重试会被
@@ -2888,7 +2908,7 @@ async function handlePostMessage(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
   // 先读体（与其它端点一致：413/400 行为不受密钥校验影响），再校验体与 Idempotency-Key 头
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const body = await readJsonBody(req, MESSAGE_BODY_LIMIT);
   // F3：请求体校验**前置到幂等包装之前**——非法体 400 且不占幂等占位行；
   // 否则首次非法体占位后，同 key 的合法重试会因 request_hash 不同撞 409 idempotency_key_reuse。
   const { content, attachments } = sessions.validateMessageBody(body);
