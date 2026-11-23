@@ -2198,22 +2198,24 @@ async function handleAdminApi(req, res, ctx, url) {
     }
   }
 
-  // issue #719：每 FDE 日额度（USD/天）。两个独立 matcher，**不改上面那个老 /llm 正则**（避免回归）；
+  // issue #719：每 FDE 周期额度（USD / 周期）。两个独立 matcher，**不改上面那个老 /llm 正则**（避免回归）；
   // 鉴权继承 handleAdminApi 的 requireAdmin，fde_name 语法复用 decodeAdminFdeName。
-  const adminFdeQuotaMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/llm\/quota$/);
-  if (adminFdeQuotaMatch) {
-    const fdeName = decodeAdminFdeName(adminFdeQuotaMatch[1]);
+  const adminFdeBudgetMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/llm\/budget$/);
+  if (adminFdeBudgetMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeBudgetMatch[1]);
     if (req.method === 'GET') {
-      const quota = await llm.getFdeDailyBudget(ctx.pool, { fdeName, gateway: ctx.llmGateway });
+      const quota = await llm.getFdeBudget(ctx.pool, { fdeName, gateway: ctx.llmGateway });
       return sendJson(res, 200, { quota });
     }
     if (req.method === 'PUT') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-      // 额度直接交给 setFdeDailyBudget 校验（null 或 ≤ 上限的有限正数）；非法值⇒ LlmError validation_failed→ 400。
-      const quota = await llm.setFdeDailyBudget(ctx.pool, {
+      // 额度/周期直接交给 setFdeBudget 校验（金额：null 或 ≤ 上限的有限正数；周期：白名单 '1d'/'1mo'）；
+      // 非法值⇒ LlmError validation_failed→ 400。budget_period 缺省⇒ setFdeBudget 内部默认 '1mo'。
+      const quota = await llm.setFdeBudget(ctx.pool, {
         fdeName,
-        dailyBudgetUsd: body?.daily_budget_usd,
+        budgetUsd: body?.budget_usd,
+        budgetPeriod: body?.budget_period,
         gateway: ctx.llmGateway,
       });
       return sendJson(res, 200, { quota });
@@ -2226,14 +2228,15 @@ async function handleAdminApi(req, res, ctx, url) {
     const fdeName = decodeAdminFdeName(adminFdeUsageMatch[1]);
     if (req.method === 'GET') {
       const rawDays = url.searchParams.get('days');
-      let days = 14;
-      if (rawDays !== null && rawDays !== '') {
+      let days = 30;
+      // 建议 5：只要带了 `days` 参数（含空串 `?days=`）就必须是 1–90 整数；只有完全不写才走默认 30。
+      if (rawDays !== null) {
         days = Number(rawDays);
         if (!Number.isInteger(days) || days < 1 || days > 90) {
           throw new HttpError(400, 'validation_failed', 'days 必须为 1–90 的整数', { details: { field: 'days' } });
         }
       }
-      const usage = await llm.getFdeDailyUsage(ctx.pool, { fdeName, gateway: ctx.llmGateway, days });
+      const usage = await llm.getFdeBudgetUsage(ctx.pool, { fdeName, gateway: ctx.llmGateway, days });
       return sendJson(res, 200, usage);
     }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');

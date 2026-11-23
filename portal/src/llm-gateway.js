@@ -1,4 +1,14 @@
 // Zero-dependency LiteLLM admin API client. Never include credentials in errors.
+import { createHash } from 'node:crypto';
+
+// issue #719 评审必修 1：`/key/info` 是 GET，明文虚拟 key 会拼进 URL 的 query（`?key=sk-...`），
+// 而 LiteLLM 的 access log 会记录完整请求 URL ⇒ 明文 key 落盘。改传 **key 的 sha256 hex**：
+// LiteLLM v1.103.2 的 `/key/info` 接受 token 的 sha256（主 agent 真机验过：`?key=<64位hex>` ⇒ 200，
+// key_alias/spend 均正确），既保留查询能力又不泄露明文。**脱敏责任在本模块**：调用方（llm.js）永远
+// 给明文 key，只有出网时换成 hash，所有既有调用点（不只 #719 新加的）因此一并受益。
+export function hashKeyForInfo(key) {
+  return createHash('sha256').update(String(key ?? '')).digest('hex');
+}
 
 export class LlmGatewayError extends Error {
   constructor(status, message) {
@@ -136,7 +146,7 @@ export function createLlmGatewayClient({
     deleteKey: (body) => post('/key/delete', body),
     blockKey: (body) => post('/key/block', body),
     unblockKey: (body) => post('/key/unblock', body),
-    keyInfo: (key) => request('GET', '/key/info', { query: { key } }),
+    keyInfo: (key) => request('GET', '/key/info', { query: { key: hashKeyForInfo(key) } }),
     // issue #719：读 LiteLLM 自己的每日用量聚合端点，portal 绝不自算 token。
     userDailyActivity: (query) => request('GET', '/user/daily/activity/aggregated', { query }),
     listModels: () => request('GET', '/model/info'),

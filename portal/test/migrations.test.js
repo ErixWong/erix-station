@@ -25,8 +25,9 @@ const RESERVED_MIGRATION_NUMS = new Set([]);
 // 判据：migrations.test.js「NNNN 全局唯一」闸 + migrate.js 台账反向对账。
 // 0042 已被 #670 那条线 `0042-mcp-plaintext-values` 取走 ⇒ 第四次让号到 0043
 //（撞号会撞真库 checksum / 容器反复重启）。
-// 现势（issue #719，2026-11-23）：本单追加 `0047-fde-daily-budget.sql`（`fde_llm_bindings` 加
-// `daily_budget_usd numeric(12,6)`，每 FDE 日额度落库，key 重铸时从此列恢复）⇒ head 46 → 47。
+// 现势（issue #719，2026-11-23）：本单追加 `0047-fde-budget.sql`（`fde_llm_bindings` 加
+// `budget_usd numeric(12,6)` + `budget_period text`，每 FDE 周期额度落库（周期白名单 '1d'/'1mo'），
+// key 重铸时从这两列恢复）⇒ head 46 → 47（周期改造仍写在同一个 0047，未合并故直接改写、不新开 0048）。
 const MIGRATION_HEAD = 47;
 const MIGRATION_NUMS = Array.from({ length: MIGRATION_HEAD }, (_, i) => i + 1)
   .filter((n) => !RESERVED_MIGRATION_NUMS.has(n));
@@ -1864,4 +1865,41 @@ test('文档小节归属闸：`#### N.N-x` 的小节号必须等于它上面那�
     '合法形状不许假红（字母后缀的主人名下用数字本体比较）');
   // 边界：小节出现在任何 H3 之前 ⇒ 也要点名（不能默默放过）。
   assert.match(subsectionNumbersOutOfParent('#### 4.2-1 孤儿').join('\n'), /没有任何/, '无主小节也要点名');
+});
+
+// ---------------------------------------------------------------------------
+// 迁移 0047-fde-budget（issue #719 周期额度改造）：把每日额度改成周期额度，未合并故直接改写、不新开 0048。
+// 断言：两列存在（budget_usd numeric(12,6) + budget_period text）、两条 CHECK（枚举白名单 + 配对 NULL）、
+// 幂等（ADD COLUMN IF NOT EXISTS + 按名 DROP CONSTRAINT IF EXISTS）、lock_timeout、末尾只读 DO 块。
+// ---------------------------------------------------------------------------
+
+test('迁移 0047-fde-budget：周期额度两列 + 枚举/配对两条 CHECK + 幂等 + 不写 BEGIN/COMMIT', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes('0047-fde-budget.sql'), '0047-fde-budget 存在（旧名 fde-daily-budget 已 git mv）');
+  assert.ok(!files.includes('0047-fde-daily-budget.sql'), '旧文件名不得残留');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, 'head=0047（连续无空洞）');
+  assert.ok(!files.some((f) => /^0048-/.test(f)), '周期改造直接改写 0047，不得新开 0048');
+
+  const sql = fs.readFileSync(path.join(dir, '0047-fde-budget.sql'), 'utf8');
+  // 两列 + 金额精度
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS budget_usd numeric\(12,6\)/);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS budget_period text/);
+  // ① 枚举 CHECK（照 usage_ledger.source 的 IN 写法）：只允许 '1d'/'1mo'
+  assert.match(sql, /CHECK \(budget_period IN \('1d', '1mo'\)\)/);
+  // ② 配对 CHECK：金额与周期同生同灭（NULL ⇔ NULL）
+  assert.match(sql, /CHECK \(\(budget_usd IS NULL\) = \(budget_period IS NULL\)\)/);
+  // 幂等：列 IF NOT EXISTS + 配对约束按名 DROP IF EXISTS 后 ADD
+  assert.match(sql, /DROP CONSTRAINT IF EXISTS fde_llm_bindings_budget_pair_null_check/);
+  assert.match(sql, /SET lock_timeout/);
+  // 自己不写事务边界（归 runner）
+  assert.doesNotMatch(sql, /^\s*BEGIN\s*;/im, '不写 BEGIN（事务边界归 runner）');
+  assert.doesNotMatch(sql, /^\s*COMMIT\s*;/im, '不写 COMMIT');
+  // 只读 DO 块（无写操作）
+  assert.match(sql, /DO \$do\$/);
+  assert.doesNotMatch(sql, /INSERT INTO|UPDATE fde_llm_bindings SET/i, 'DO 块只读，不得写库');
+
+  // 冻结 baseline 不回写这两列
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  assert.ok(!baseline.includes('budget_period'), 'baseline 不得回写 budget_period');
 });
