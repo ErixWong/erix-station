@@ -9468,3 +9468,38 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
   （它的消费者读的是 `config.cookie`，不是 `config.cookieProfile`）。三级都空才算死。
 - **删 `config.js` 的行是有成本的**：行号漂移会打断 env 闸门的坐标钉住，闸门会红（这是它该干的），
   每次都要同步 `deploy/env-legs-exceptions.json` 与 `deploy-env-delegate.test.js` 里的真树坐标。
+
+### 8.184 #677 Tier 2B 收口：`MAX_BODY_BYTES` **不做旋钮**，只放宽两个消息端点（2026-11-23，主 agent + erix_run ×2 + copilot 对抗审查）
+
+**接 8.183 的「未做（49 个调用点，干净可做）」**：本单结论是**不做那个旋钮**，改做「把消息端点从全站默认里摘出来」。
+
+**四条现查事实（推翻/修正了先前判断）**：
+1. **64 KiB 不是无出处**：`docs/api/portal.md:374` 写死了登录的 64 KiB 约束；`config.js` 原注释写明目的是「防止超大字段触发 scrypt 或打爆内存」。⇒ **不许放大全站默认**。
+2. **100k 字符业务闸在 64 KiB 下结构性不可达**：中文 UTF-8 100k 字符 ≈ 300 KB，用户永远先撞 413 `payload_too_large`，看不到「content 过长」。`session-http.test.js` 只测纯函数所以照绿。
+3. **`MAX_BODY_BYTES` 与 `MAX_ROUND_BYTES` 两个 env 都是假旋钮**：`deploy/docker-compose.yml` 的 station-portal 用**显式 environment 列表**（无 `env_file`），两者都不在其中 ⇒ 运维在 `deploy/.env` 里设了**不生效**。
+4. **宿主预写没有体积闸**：`transcript-store.js` 的 `appendRound` 直接 INSERT，不校验 `MAX_ROUND_BYTES`；那个 400 只在 internal HTTP 写轮路径（`internal.js`）。⇒ 「消息超 round 上限必然 400」是错的。
+
+**copilot 对抗审查抓到我 4 个错（全部成立，逐条回代码验过）**：
+- `4 字节/token` **不保守、方向反了**：引擎 estimator 是 CJK **1.5 token/字符** × margin 1.15（`node_modules/erix-agent/src/tokens.js`）⇒ 中文 **1.74 字节/token**、英文 3.04。`×4` 对中文**高估 2.3 倍**；「262144×4 正好 1 MiB ⇒ 1MiB 就是整个上下文窗口」是**数字巧合**，不是推导。
+- 「消息超 round 上限必然 400」错（见事实 4）。
+- 「`MAX_ROUND_BYTES` env 可调」在生产是假的（见事实 3）。
+- 「内存不是理由」也不全对：`readJsonBody` 峰值 ≈ **3–4 倍** body（chunks → concat → toString → parse），且 station-portal **无 `mem_limit`**。
+
+**落地（`fix-261123-14-json-body-limit`，5 个 commit）**：
+
+| 改动 | 内容 |
+|---|---|
+| 两个模块常量 | `http.js` 新增 `DEFAULT_JSON_BODY_LIMIT = 64*1024`（全站默认，46 处走它）与 `MESSAGE_BODY_LIMIT = 1024*1024`（**只**给 `/messages`、`/queued-inputs`）；注释写死两条约束：> `MAX_MESSAGE_CONTENT_LENGTH × 3` 且 ≤ `MAX_ROUND_BYTES` |
+| 删假 env | `config.maxBodyBytes` + env `MAX_BODY_BYTES` 删掉（值保留为常量）；`docs/env.md` / `.env.example` / 5 处台账字面量同步 |
+| 44 处死引用 | `readJsonBody(req, ctx.config.maxBodyBytes)` → `readJsonBody(req)`（字段已删，原来靠默认参数吃 `undefined` 假绿） |
+| **保留** | `MAX_MESSAGE_CONTENT_LENGTH = 100_000` 一个字没动（原计划要删，错）——现在它**可达**了 |
+| 防回潮哨兵 | `message-body-limit.test.js` 源码级两条：`http.js` 不许再出现 `config.maxBodyBytes`；`readJsonBody` 第二实参只认白名单 |
+
+**判据（真实 HTTP 面，不测纯函数）**：`portal/test/message-body-limit.test.js` 6 格 —— ① 10 万中文字符 ⇒ 202（带「已超旧 64 KiB」前提自证）；② 10 万零 1 ⇒ 400 `validation_failed` + `details.field='content'`（**业务闸可达自证**）；③ >1 MiB ⇒ 413 且 `details.max_bytes=1048576`；④ 登录 >64 KiB ⇒ **仍 413** `max_bytes=65536`（全站默认没被放大）；⑤ 413 不占幂等占位；⑥ 防回潮哨兵。
+**父 agent 变异实测（自己做，不采信 worker 报告）**：`MESSAGE_BODY_LIMIT` 改回 64 KiB ⇒ ①②③ 红、④⑤ 绿；哨兵变异 ⇒ `not ok 6`。最终树 `npm test` **rc=0 / 3221 tests / 3106 pass / 0 fail / 115 skipped**。
+
+**合并 origin/main 后哨兵抓到一个新引入的死引用**：#719 的 `PUT /api/admin/fdes/:fdeName/llm/budget` 带回了 `readJsonBody(req, ctx.config.maxBodyBytes)` ⇒ 哨兵立刻红，改成 `readJsonBody(req)` 后复绿。**这就是加哨兵的用处**。
+
+**残余（未开单，两条都是真洞）**：
+1. **宿主预写无体积闸**：`transcript-store.js#appendRound` 不校验序列化后的 record 体积 ⇒ 超过 `MAX_ROUND_BYTES` 的记录能绕过 internal 那道 400 直接落库。
+2. **`MAX_ROUND_BYTES` 仍没接进 compose**：它的 env 覆盖在生产依旧无效（本单只删了 `MAX_BODY_BYTES`，没动它——它是 round 契约的调参口，接进 compose 还是删掉需要单独决定）。
