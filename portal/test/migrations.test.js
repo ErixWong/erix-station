@@ -25,7 +25,9 @@ const RESERVED_MIGRATION_NUMS = new Set([]);
 // 判据：migrations.test.js「NNNN 全局唯一」闸 + migrate.js 台账反向对账。
 // 0042 已被 #670 那条线 `0042-mcp-plaintext-values` 取走 ⇒ 第四次让号到 0043
 //（撞号会撞真库 checksum / 容器反复重启）。
-const MIGRATION_HEAD = 46;
+// 现势（issue #719，2026-11-23）：本单追加 `0047-fde-daily-budget.sql`（`fde_llm_bindings` 加
+// `daily_budget_usd numeric(12,6)`，每 FDE 日额度落库，key 重铸时从此列恢复）⇒ head 46 → 47。
+const MIGRATION_HEAD = 47;
 const MIGRATION_NUMS = Array.from({ length: MIGRATION_HEAD }, (_, i) => i + 1)
   .filter((n) => !RESERVED_MIGRATION_NUMS.has(n));
 
@@ -1113,7 +1115,7 @@ test('迁移 0033-delta-events-not-persisted：形态 M 是纯清理（零 DDL�
   // 0035（`macro-platform`，issue #524）追加之后本行退一支；0037（`notifications-and-origin`，
   // issue #526）再退一支 —— 口径不变：靠**绝对位置**钉住。
   // 而不是「0033 必须永远排末位」——后者已经被上面那 19 处 head 断言接管（它们现在钉 0037）。
-  assert.equal(files[files.length - 14], file, '0033 是倒数第十二支（0034..0042 + 0043-platform-prompts + 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面，不许回头插队）');
+  assert.equal(files[files.length - 15], file, '0033 是倒数第十二支（0034..0042 + 0043-platform-prompts + 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面，不许回头插队）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里"索引""VACUUM"这些词都会出现，整文件 indexOf 会假绿）。
@@ -1173,7 +1175,7 @@ test('迁移 0034-prune-stale-run-checkpoints：纯清理（零 DDL）、cutoff 
   const file = '0034-prune-stale-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0034 存在');
-  assert.equal(files[files.length - 13], file, '0034 是倒数第十二支（新迁移只能追加，不回改已应用的编号）；0035..0045 之后它不再是末位');
+  assert.equal(files[files.length - 14], file, '0034 是倒数第十二支（新迁移只能追加，不回改已应用的编号）；0035..0045 之后它不再是末位');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里 "VACUUM""索引""DELETE" 这些词都会出现，整文件判会假绿/假红）。
@@ -1247,7 +1249,7 @@ test('迁移 0035-macro-platform：三表齐全、两条唯一键在、FK 的 ON
   const file = '0035-macro-platform.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0035 存在');
-  assert.equal(files[files.length - 12], file, '0035 是倒数第十一支（0036..0045 追加在它后面；新迁移只能追加，不回改已应用的编号）');
+  assert.equal(files[files.length - 13], file, '0035 是倒数第十一支（0036..0045 追加在它后面；新迁移只能追加，不回改已应用的编号）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 去掉**整行注释**（保留 `$$ ... $$` 内部语句），否则「注释里提到 DROP TABLE」会被误判。
@@ -1323,7 +1325,7 @@ test('迁移 0038-transcript-recovery-rows：幂等键/append_seq 排序/只新�
   const file = '0038-transcript-recovery-rows.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0038 存在');
-  assert.equal(files[files.length - 9], file, '0038 是倒数第七支（0039-capability-market / 0040-mcp-channel / 0041 / 0042 / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
+  assert.equal(files[files.length - 10], file, '0038 是倒数第七支（0039-capability-market / 0040-mcp-channel / 0041 / 0042 / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -1404,7 +1406,7 @@ test('迁移 0039-capability-market：三表齐全、包内容按 (item,version)
   const file = '0039-capability-market.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0039 存在');
-  assert.equal(files[files.length - 8], file, '0039 是倒数第六支（0040-mcp-channel / 0041-retire / 0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面；新迁移只能追加）');
+  assert.equal(files[files.length - 9], file, '0039 是倒数第六支（0040-mcp-channel / 0041-retire / 0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面；新迁移只能追加）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -1529,7 +1531,7 @@ test('迁移 0041-retire-run-checkpoints：DROP 形状四 constraint（IF EXISTS
   const file = '0041-retire-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0041 存在');
-  assert.equal(files[files.length - 6], file, '0041 是倒数第四支（0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
+  assert.equal(files[files.length - 7], file, '0041 是倒数第四支（0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**语句区**（整行注释剥掉）：头注释里 DROP / VACUUM / BEGIN / CASCADE 这些词都要出现，
@@ -1623,7 +1625,7 @@ test('迁移 0043-platform-prompts：种首行（让 FOR UPDATE 有行可锁）+
   // 本单让号到 0043 后它就是当前末位（0040→#608 mcp-channel、0041→#640 retire、0042→#670 mcp-plaintext 都排在它之前）。
   // #650 追加 `0044-system-metrics.sql` 之后 0043 不再是末位 ⇒ 判据改成「位置固定 + 只能往后追加」
   // （形状同 0033..0041 那几支的位次断言：钉的是「不许回头插队」，不是「永远是最后一支」）。
-  assert.equal(files[files.length - 4], file,
+  assert.equal(files[files.length - 5], file,
     '0043 是倒数第二支（0040-mcp-channel、0041-retire-run-checkpoints、0042-mcp-plaintext-values 在它之前，'
     + '0044-system-metrics 追加在它之后；新迁移只能追加）');
   assert.deepEqual(
