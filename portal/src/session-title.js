@@ -30,6 +30,9 @@ import { buildAutoTitlePrompt, generateTitle, resolveTitleLlmProvider } from './
 // issue #596 片 A：自动改名的 system 也从 `platform_prompts` 取（与手工改名同一份生效值）。
 // `resolveEffectiveTitlePrompt` **永不抛**（读失败/无行/超时 ⇒ 回落内置），不破坏本文件的静默契约。
 import { resolveEffectiveTitlePrompt } from './platform-prompts.js';
+// #677 P3 第三批：自动标题防抖阈值改热读旋钮 `session.auto_title_min_new`（DB 优先、写后生效）。
+// `runtime-settings.js` 是叶子配置模块（不 import 本文件）⇒ 无反向依赖；读侧永不抛，不破本模块静默契约。
+import { readAutoTitleMinNew } from './runtime-settings.js';
 
 /** 自动标题长度上限（issue #88：≤30 字符左右；agent 侧生成时已按同口径清洗，此处再过一遍幂等）。 */
 export const AUTO_TITLE_MAX_LEN = 30;
@@ -185,9 +188,11 @@ export async function evaluateAutoTitle(pool, {
 } = {}) {
   const cfg = config ?? loadConfig(process.env);
   if (cfg.sessionAutoTitle === false) return null; // 开关关闭（ERIX_SESSION_AUTO_TITLE=0）
-  const minNew = Number.isInteger(cfg.sessionAutoTitleMinNew) && cfg.sessionAutoTitleMinNew > 0
-    ? cfg.sessionAutoTitleMinNew
-    : AUTO_TITLE_DEFAULT_MIN_NEW;
+  // #677 P3 第三批：minNew **现读**热旋钮 `session.auto_title_min_new`（DB 有效值 > env（过闸）>
+  // registry 默认 3）。`readAutoTitleMinNew` 带 5s 缓存 + 同池在飞合并 ⇒ 不是「每次评估一条 SQL」，
+  // 同进程同池最多 5 秒一次整表读；管理台写完会失效缓存，下一轮评估就用新值。读侧永不抛
+  // （DB 挂 / 无 pool ⇒ 回落 config / 默认），不破坏本模块「自动改名绝不弄失败终态」的红线。
+  const minNew = await readAutoTitleMinNew({ pool, config: cfg, log });
   try {
     const sres = await pool.query(
       `SELECT id, user_id, title, title_source, cwd, auto_title_seq, last_seq, status
