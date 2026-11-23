@@ -1266,6 +1266,68 @@ test('forward-auth：Host 带端口（dev :8090）——cookie 已签发路径 2
   }
 });
 
+test('#677 P3④ forward-auth 的 Set-Cookie Max-Age 用现读值（非 previewCookie.maxAge 快照）',
+  async () => {
+    // 变异①的另一半：http.js `previewCookieHeader` 若改回 `cookie.maxAge`（启动快照），
+    // `config.previewCookie.maxAge` 是 `config.js:412` 启动时算死的 ⇒ 热改旋钮后 cookie
+    // 会与新 `expires_at` 分叉。本格让 DB 现读 4321（与快照 900 拉开）⇒ Set-Cookie 必须
+    // `Max-Age=4321`；改回快照就变 900 ⇒ 这一格点名红。
+    const HOST = 'alice-p-4000.fde.erix.vip';
+    const sessionToken = 's_hot_ttl_cookie_http';
+    const grants = new Map([[hashToken(sessionToken), {
+      id: 'g1', token_hash: hashToken(sessionToken), user_id: 'u1', allocation_id: 'pa1',
+      kind: 'session', state: 'active', revoked_at: null,
+      expires_at: new Date(Date.now() + 600_000),
+    }]]);
+    const pool = {
+      async query(sql, params = []) {
+        if (sql.includes('FROM port_allocations a')) {
+          const a = { id: 'pa1', fde_id: 'u1', state: 'active', exposure: 'private', hostname: HOST,
+            fde_name: 'alice', user_status: 'active' };
+          return { rows: params[0] === HOST.toLowerCase() ? [a] : [] };
+        }
+        if (sql.includes("FROM preview_grants WHERE token_hash = $1 AND kind = 'session'")) {
+          const g = grants.get(params[0]);
+          return { rows: g ? [g] : [] };
+        }
+        if (sql.includes('SELECT id, role, status FROM users WHERE id = $1')) {
+          return { rows: [{ id: 'u1', role: 'fde', status: 'active' }] };
+        }
+        if (/FROM runtime_settings/.test(String(sql))) {
+          return { rows: [{ key: 'preview.session_ttl_seconds', value: 4321 }], rowCount: 1 };
+        }
+        return { rows: [] };
+      },
+      async end() {},
+    };
+    const s = await startServer({ pool, overrides: {
+      previewSessionTtlSeconds: 900,
+      previewCookie: { name: 'fde_preview_dev', secure: false, httpOnly: true, sameSite: 'Lax',
+        path: '/', maxAge: 900 },
+    } });
+    try {
+      const res = await fetch(`${s.base}/api/forward-auth`, {
+        headers: {
+          'x-forwarded-host': HOST,
+          'x-forwarded-proto': 'http',
+          Cookie: `fde_preview_dev=${sessionToken}`,
+        },
+      });
+      assert.equal(res.status, 200, `cookie 路径应放行，实际 ${res.status}`);
+      const setCookie = res.headers.get('set-cookie') ?? '';
+      assert.match(setCookie, /Max-Age=4321/,
+        `Max-Age 必须是现读的 4321（实得 ${setCookie}；= 改回了 previewCookie.maxAge 快照 900）`);
+      assert.doesNotMatch(setCookie, /Max-Age=900\b/,
+        '不许是启动快照的 900（= Set-Cookie 没接现读）');
+      // 属性照旧：HttpOnly / SameSite / Path 仍在（只换 maxAge，不改其他 cookie 属性）。
+      assert.match(setCookie, /HttpOnly/);
+      assert.match(setCookie, /SameSite=Lax/);
+      assert.match(setCookie, /Path=\//);
+    } finally {
+      await s.close();
+    }
+  });
+
 test('POST /api/ports/:id/preview-ticket：无会话 401；有会话 201 且存哈希（portal.md §2.8）', async () => {
   const password = 'pw';
   const user = {

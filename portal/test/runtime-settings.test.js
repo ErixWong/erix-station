@@ -54,6 +54,10 @@ import {
   AUTO_TITLE_MIN_NEW_DEFAULT, parseAutoTitleMinNew, validateAutoTitleMinNew,
   AUTO_TITLE_MIN_NEW_HINT,
   readAutoTitleMinNew, invalidateAutoTitleMinNewCache,
+  PREVIEW_SESSION_TTL_KEY, PREVIEW_SESSION_TTL_MIN_SECONDS, PREVIEW_SESSION_TTL_MAX_SECONDS,
+  PREVIEW_SESSION_TTL_DEFAULT_SECONDS, parsePreviewSessionTtlSeconds,
+  validatePreviewSessionTtlSeconds, PREVIEW_SESSION_TTL_HINT,
+  readPreviewSessionTtlSeconds, invalidatePreviewSessionTtlCache,
 } from '../src/runtime-settings.js';
 import { loadConfig } from '../src/config.js';
 
@@ -588,14 +592,15 @@ test('RS-6b 审计被抑制 ⇒ 抛 500 且**设置没落库**（检查在 COMMI
 // ---------------------------------------------------------------------------
 
 test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_days'
-  + ' + preview.ticket_ttl_seconds + session.auto_title_min_new', async () => {
+  + ' + preview.ticket_ttl_seconds + session.auto_title_min_new + preview.session_ttl_seconds',
+  async () => {
   // P1 时这一格钉的是「registry 是空对象」；P2a 迁了第一格 ⇒ 判据改成「只迁了这一格」；
-  // P3 第一/二/三批各迁一格 ⇒ 判据改成「就这四格，不多不少」。
+  // P3 第一/二/三批各迁一格、第五批迁第五格 ⇒ 判据改成「就这五格，不多不少」。
   // 它红了的读法不变：有人顺手多迁了一格（或把热读口径弄丢了）。
   assert.deepEqual(Object.keys(RUNTIME_SETTING_REGISTRY),
     ['session.ttl_seconds', 'workspace.retention_days', 'preview.ticket_ttl_seconds',
-      'session.auto_title_min_new'],
-    'P3 只许迁这四格（其余旋钮逐批填）');
+      'session.auto_title_min_new', 'preview.session_ttl_seconds'],
+    'P3 只许迁这五格（其余旋钮逐批填）');
   assert.ok(Object.isFrozen(RUNTIME_SETTING_REGISTRY), 'registry 必须冻结（运行期没人能塞旋钮进来）');
   const entry = RUNTIME_SETTING_REGISTRY['session.ttl_seconds'];
   assert.ok(Object.isFrozen(entry), '条目也必须冻结');
@@ -659,7 +664,35 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   assert.notEqual(HOT_READ_INVALIDATORS.get(AUTO_TITLE_MIN_NEW_KEY),
     HOT_READ_INVALIDATORS.get(PREVIEW_TICKET_TTL_KEY),
     '第四格不许共用第三格的失效函数（保存标题阈值不该抹掉预览票缓存）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 4, '登记表里就是四格（热读旋钮数 = 失效钩子数）');
+  // 第五格（P3 第五批）：同一套口径，失效钩子也必须是导出的那一个函数本身（漏登记 = 保存后本进程
+  // 还要吃旧值）；与其余格各有各的缓存、各有各的失效函数。
+  const pstEntry = RUNTIME_SETTING_REGISTRY[PREVIEW_SESSION_TTL_KEY];
+  assert.ok(pstEntry, '第五格必须在 registry 里');
+  assert.ok(Object.isFrozen(pstEntry), '条目也必须冻结');
+  assert.equal(pstEntry.key, PREVIEW_SESSION_TTL_KEY);
+  assert.equal(pstEntry.configPath, 'previewSessionTtlSeconds', 'config 字段名（与 config.js:411 同名）');
+  assert.equal(pstEntry.envVar, 'PREVIEW_SESSION_TTL_SECONDS', '只用于日志/文档点名，不在这里读 env');
+  assert.equal(pstEntry.applyMode, 'hot', '签发/续期预览会话时现读，本批的全部意义就是改这个数不用重建');
+  assert.ok(typeof pstEntry.label === 'string' && pstEntry.label.length > 0);
+  // 默认值**同源**：本模块 / `config.js` 的字面默认（15*60=900）/ compose 的 `${...:-900}` 三处同数。
+  assert.equal(pstEntry.defaultValue, PREVIEW_SESSION_TTL_DEFAULT_SECONDS);
+  assert.equal(PREVIEW_SESSION_TTL_DEFAULT_SECONDS, 900, '默认必须 900 = 15 分钟（三处同源）');
+  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).previewSessionTtlSeconds,
+    PREVIEW_SESSION_TTL_DEFAULT_SECONDS,
+    'registry 默认值必须等于 loadConfig 在干净 env 下算出的那个数');
+  assert.match(compose, /PREVIEW_SESSION_TTL_SECONDS:\s*\$\{PREVIEW_SESSION_TTL_SECONDS:-900\}/,
+    'compose 的默认值与本模块同源（P5 退役 env 之前两边不许漂）');
+  assert.equal(PREVIEW_SESSION_TTL_MIN_SECONDS, 60);
+  assert.equal(PREVIEW_SESSION_TTL_MAX_SECONDS, 86400);
+  assert.equal(parsePreviewSessionTtlSeconds(PREVIEW_SESSION_TTL_MAX_SECONDS).ok, true, '上界内（含端点）');
+  assert.equal(
+    parsePreviewSessionTtlSeconds(PREVIEW_SESSION_TTL_MAX_SECONDS + 1).ok, false, '越界 ⇒ 回落');
+  assert.equal(HOT_READ_INVALIDATORS.get(PREVIEW_SESSION_TTL_KEY), invalidatePreviewSessionTtlCache,
+    '第五格也必须登记失效钩子，否则管理台保存完下一个预览请求还是拿旧值');
+  assert.notEqual(HOT_READ_INVALIDATORS.get(PREVIEW_SESSION_TTL_KEY),
+    HOT_READ_INVALIDATORS.get(PREVIEW_TICKET_TTL_KEY),
+    '第五格不许共用第三格的失效函数（会话 TTL 与票 TTL 各有各的缓存）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 5, '登记表里就是五格（热读旋钮数 = 失效钩子数）');
 
   assert.equal(isKnownSetting('demo.limit'), false, '真实 registry 里没有 demo.limit');
   assert.equal(isKnownSetting('constructor'), false,
@@ -1169,7 +1202,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   const fromDb = await listRuntimeSettingsAdmin({
     pool: dbPool, config: CONFIG_ENV, env: {}, log: silentLog,
   });
-  assert.equal(fromDb.items.length, 4);
+  assert.equal(fromDb.items.length, 5);
   assert.deepEqual(Object.keys(fromDb.items[0]).sort(),
     ['applyMode', 'key', 'label', 'reason', 'source', 'updatedAt', 'updatedBy', 'value'].sort());
   assert.deepEqual(fromDb.items[0], {
@@ -1201,6 +1234,13 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   assert.equal(atItem.value, 3, 'env 也没给 ⇒ 默认 3（与 config.js / session-title.js 同源）');
   assert.equal(atItem.applyMode, 'hot', '自动标题阈值也是热生效旋钮');
 
+  // ⚠e 第五格（preview.session_ttl_seconds）：库里没它的行 ⇒ 如实报默认 900（不被别的格带着写）。
+  const pstItem = fromDb.items.find((i) => i.key === 'preview.session_ttl_seconds');
+  assert.ok(pstItem, '第五格必须出现在管理台响应里（列表驱动，不列出来 = 没迁）');
+  assert.equal(pstItem.source, 'default');
+  assert.equal(pstItem.value, 900, 'env 也没给 ⇒ 默认 900（与 config.js / compose 同源）');
+  assert.equal(pstItem.applyMode, 'hot', '预览会话有效期也是热生效旋钮');
+
   // ② env：库里没行，且 env 显式给了值 ⇒ source=env、值就是 config 里那个。
   const fromEnv = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: CONFIG_ENV, log: silentLog });
   assert.deepEqual(fromEnv.items[0].source, 'env');
@@ -1222,7 +1262,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     pool: ttlPool({ throwOnSelect: Object.assign(new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
     config: CONFIG_ENV, log: deadLog,
   });
-  assert.equal(dead.items.length, 4, '读失败时四格都要给得出来（不是只给前几格）');
+  assert.equal(dead.items.length, 5, '读失败时五格都要给得出来（不是只给前几格）');
   assert.equal(dead.items[0].source, 'env');
   assert.equal(dead.items[0].reason, 'read_failed');
   assert.equal(deadLog.seen.warn.length, 1, '有人在屏幕前等答案 ⇒ 读失败要 warn（不像启动路径只能 debug）');
@@ -2223,7 +2263,7 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   // GET 两格：登记了的那格原样带出，没登记的那格**不许**出现这个键（缺席 ≠ null ≠ 空串）。
   const cfg = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
   const list = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: cfg, env: {}, log: silentLog });
-  assert.equal(list.items.length, 4);
+  assert.equal(list.items.length, 5);
   const retItem = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
   assert.equal(retItem.hint, WORKSPACE_RETENTION_HINT,
     'DTO 必须逐字透出 registry 那句话（前端自己另写一份 = 第二份真相）');
@@ -2240,6 +2280,12 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   assert.match(atHint, /1\.\.100/, 'hint 必须带值域（界面不写就会被误填 0 / 1e2）');
   assert.match(atHint, /不是硬关闭/, 'hint 必须带上「上界不是硬关闭」（#710 LOW① 的口径）');
   assert.ok(atHint.length <= 120, `hint 是界面一行小字：实得 ${atHint.length} 字`);
+
+  // 第五格也登记了 hint ⇒ DTO 逐字透出（预览会话 TTL 的 60..86400 不写在行面上会被误填）。
+  const pstHint = list.items.find((i) => i.key === 'preview.session_ttl_seconds').hint;
+  assert.equal(pstHint, PREVIEW_SESSION_TTL_HINT, 'DTO 必须逐字透出 registry 那句 hint');
+  assert.match(pstHint, /60\.\.86400/, 'hint 必须带值域（界面不写就会被误填 0 / 1e3）');
+  assert.ok(pstHint.length <= 120, `hint 是界面一行小字：实得 ${pstHint.length} 字`);
 
   // 回落那一档也带（表不存在时界面更要看得见这句：那一档下 0 同样是「不自动清理」）。
   const dead = await listRuntimeSettingsAdmin({
@@ -3235,3 +3281,387 @@ test('RS-48 §4.21 的旋钮表与 registry 键集合逐格一致（表头列数
     assert.match(atText, /默认 `?3`?/, '第四格那一行必须写出默认 3（三处同源）');
     assert.match(atText, /evaluateAutoTitle/, '第四格那一行必须写出生效点（谁在什么时候读它）');
   });
+
+// ---------------------------------------------------------------------------
+// 11. P3 第五批：第五格真实旋钮 `preview.session_ttl_seconds`（#677）。
+//   RS-49 解析/校验（严格正整数 + 区间 60..86400）；RS-49b 写侧 1e3 两侧之分；
+//   RS-50 热读三档；RS-51 缓存；RS-52 写后失效（M-2 去登记 ⇒ 红）；RS-53 并发只发一条 SQL；
+//   RS-54 在飞失败清槽；RS-55 env 也过闸 + 一次热读最多一条 warn；RS-56 真库腿；
+//   RS-57 §4.21 第五行多钉一层（值域/默认/生效点）。
+// ⚠ 本节格子共享**模块级**热读缓存/槽 ⇒ 每段前后都 `invalidatePreviewSessionTtlCache()`。
+// ---------------------------------------------------------------------------
+
+// env/config 那一档的固定值：1800（与默认 900 拉开距离，才能验「回落用的是哪一档」）。
+const PSCFG = { previewSessionTtlSeconds: 1800, previewSessionTtlSecondsSource: 'env' };
+
+test('RS-49 preview.session_ttl_seconds 的解析与校验：严格十进制正整数 + 区间 60..86400', () => {
+  assert.equal(PREVIEW_SESSION_TTL_MIN_SECONDS, 60);
+  assert.equal(PREVIEW_SESSION_TTL_MAX_SECONDS, 86400);
+  assert.equal(PREVIEW_SESSION_TTL_DEFAULT_SECONDS, 900, '与 config.js / compose 同源');
+  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).previewSessionTtlSeconds,
+    PREVIEW_SESSION_TTL_DEFAULT_SECONDS, 'registry 默认必须等于 loadConfig 干净 env 算出的数');
+
+  for (const good of [60, 900, 86400, '60', '900', '86400', '0900']) {
+    const r = parsePreviewSessionTtlSeconds(good);
+    assert.equal(r.ok, true, `${JSON.stringify(good)} 必须收`);
+    assert.equal(r.value, Number(good));
+  }
+  for (const bad of [
+    '1e3', ' 900 ', '900x', '', '0x10', '90.5', '86401', '0', '-1', '+60',
+    0, -1, 90.5, 86401, Number.NaN, Number.POSITIVE_INFINITY, 1e21,
+    true, false, null, undefined, {}, [], ['900'],
+  ]) {
+    assert.equal(parsePreviewSessionTtlSeconds(bad).ok, false,
+      `${JSON.stringify(bad) ?? String(bad)} 必须拒`);
+  }
+  // 0 / 59 是区间外的合法数字（与保留天数那格的 0-有效相反）；上界外也是 out_of_range。
+  assert.equal(parsePreviewSessionTtlSeconds(0).reason, 'session_ttl_seconds_out_of_range',
+    '0 是合法数字但区间外 ⇒ out_of_range（不是 not_a_...）');
+  assert.equal(parsePreviewSessionTtlSeconds(86401).reason, 'session_ttl_seconds_out_of_range');
+  assert.equal(parsePreviewSessionTtlSeconds('1e3').reason, 'not_a_session_ttl_seconds');
+  assert.equal(parsePreviewSessionTtlSeconds(' 900 ').reason, 'not_a_session_ttl_seconds',
+    '带空白的串必须拒（Number() 会收成 900，那是第二套真相）');
+  assert.equal(parsePreviewSessionTtlSeconds('+60').ok, false, '带符号的串必须拒');
+
+  for (const good of [60, 900, 86400]) {
+    assert.equal(validatePreviewSessionTtlSeconds(good), true, `${good} 必须放行`);
+  }
+  for (const bad of ['900', '', '86400', 0, -1, 86401, 90.5, true, null, {}, [], Number.NaN]) {
+    const why = validatePreviewSessionTtlSeconds(bad);
+    assert.notEqual(why, true, `${JSON.stringify(bad) ?? String(bad)} 写侧必须拒`);
+    assert.equal(typeof why, 'string', '拒绝必须返回点名的原因字符串');
+  }
+  assert.match(String(validatePreviewSessionTtlSeconds(86401)), /86400/);
+  assert.match(String(validatePreviewSessionTtlSeconds(0)), /60/);
+});
+
+test('RS-49b 写侧的 1e3 两侧之分：JSON number 1e3 收并规整成 1000，字符串 "1e3" 仍拒', async () => {
+  const num = parsePreviewSessionTtlSeconds(1e3);
+  assert.equal(num.ok, true, 'number 1e3（=1000）必须收（写侧接受任何合法 JSON number）');
+  assert.equal(num.value, 1000, '1e3 必须规整成 1000');
+  assert.equal(validatePreviewSessionTtlSeconds(1e3), true, 'validate 也放行 number 1e3');
+  assert.equal(parsePreviewSessionTtlSeconds('1e3').ok, false, '字符串 "1e3" 必须判非法');
+  assert.notEqual(validatePreviewSessionTtlSeconds('1e3'), true, '写侧 validate 必须拒字符串 "1e3"');
+  invalidatePreviewSessionTtlCache();
+  const pool = new FakeRuntimePool();
+  const saved = await saveRuntimeSetting({
+    pool, actorId: ACTOR, key: PREVIEW_SESSION_TTL_KEY, value: 1e3, log: silentLog,
+  });
+  assert.equal(saved.value, 1000, 'DTO 值必须是 1000（RETURNING 真相）');
+  assert.equal(pool.storedValue(PREVIEW_SESSION_TTL_KEY), 1000, '库里真的是 1000');
+  const pool2 = new FakeRuntimePool();
+  const err = await saveRuntimeSetting({
+    pool: pool2, actorId: ACTOR, key: PREVIEW_SESSION_TTL_KEY, value: '1e3', log: silentLog,
+  }).then(() => null, (e) => e);
+  assert.ok(err instanceof RuntimeSettingsError, '字符串 "1e3" 必须抛 RuntimeSettingsError');
+  assert.equal(err.code, 'validation_failed', '字符串 "1e3" ⇒ validation_failed（HTTP 400）');
+  assert.equal(pool2.queryCount, 0, '字符串校验在发 SQL 之前 ⇒ 零 SQL');
+  invalidatePreviewSessionTtlCache();
+});
+
+test('RS-50 第五格热读三档：DB > env（过闸）> 默认 900；任何一档坏了都绝不抛', async () => {
+  invalidatePreviewSessionTtlCache();
+  const dbPool = ttlPool({ rows: [{ key: PREVIEW_SESSION_TTL_KEY, value: 7200 }] });
+  assert.equal(await readPreviewSessionTtlSeconds({
+    pool: dbPool, config: PSCFG, env: {}, log: silentLog,
+  }), 7200);
+  assert.equal(dbPool.queryCount, 1, '确实发了那次读');
+
+  // 库里非法值 ⇒ 回落 env 1800，点名 warn 一次。
+  invalidatePreviewSessionTtlCache();
+  const log = collectingLog();
+  assert.equal(await readPreviewSessionTtlSeconds({
+    pool: ttlPool({ rows: [{ key: PREVIEW_SESSION_TTL_KEY, value: '1e3' }] }),
+    config: PSCFG, env: {}, log,
+  }), 1800);
+  assert.equal(log.seen.warn.length, 1, `恰好一条（实得 ${JSON.stringify(log.seen.warn)}）`);
+  assert.match(log.seen.warn[0], new RegExp(PREVIEW_SESSION_TTL_KEY.replace(/\./g, '\\.')),
+    'warn 要点名是哪个 key');
+
+  // 库里没行 ⇒ env 1800，不 warn。
+  invalidatePreviewSessionTtlCache();
+  const log2 = collectingLog();
+  assert.equal(await readPreviewSessionTtlSeconds({
+    pool: ttlPool(), config: PSCFG, env: {}, log: log2,
+  }), 1800);
+  assert.deepEqual(log2.seen.warn, [], '没有行不是故障，不许刷屏');
+
+  // 表不存在 ⇒ 回落 env，绝不抛。
+  invalidatePreviewSessionTtlCache();
+  assert.equal(await readPreviewSessionTtlSeconds({
+    pool: ttlPool({ throwOnSelect: Object.assign(new Error('no such table'), { code: '42P01' }) }),
+    config: PSCFG, env: {}, log: silentLog,
+  }), 1800);
+
+  // 连 pool 都没有 ⇒ 回落 env，不抛。
+  invalidatePreviewSessionTtlCache();
+  assert.equal(await readPreviewSessionTtlSeconds({
+    pool: null, config: PSCFG, env: {}, log: silentLog,
+  }), 1800);
+
+  // 三档全空 ⇒ 默认 900，绝不 undefined。
+  invalidatePreviewSessionTtlCache();
+  const none = await readPreviewSessionTtlSeconds({
+    pool: ttlPool(), config: {}, env: {}, log: silentLog,
+  });
+  assert.equal(none, PREVIEW_SESSION_TTL_DEFAULT_SECONDS);
+  assert.notEqual(none, undefined, 'undefined 交给 cookie maxAge / expires_at 就是 NaN');
+
+  // 读挂住 ⇒ 按时给答案（timeoutMs 注入）。
+  invalidatePreviewSessionTtlCache();
+  assert.equal(await readPreviewSessionTtlSeconds({
+    pool: ttlPool({ hang: true }), config: PSCFG, env: {}, log: silentLog, timeoutMs: 30,
+  }), 1800);
+
+  // env 越界（config.js 的 intEnv 收得下 86401，registry 不收）⇒ 回落默认 900，点名档与理由。
+  invalidatePreviewSessionTtlCache();
+  const overLog = collectingLog();
+  assert.equal(await readPreviewSessionTtlSeconds({
+    pool: ttlPool(),
+    config: { previewSessionTtlSeconds: 86401, previewSessionTtlSecondsSource: 'env' },
+    env: {}, log: overLog,
+  }), 900, '越界 ⇒ 回落默认 900（不是 86401，也不是 undefined）');
+  assert.ok(overLog.seen.warn.some((m) => m.includes('config.previewSessionTtlSeconds')
+    && m.includes('session_ttl_seconds_out_of_range')),
+    `要点名是哪一档、为什么（实得 ${JSON.stringify(overLog.seen.warn)}）`);
+
+  // 本格有行不许让另一格凭空读数（同一张表；各格独立）。
+  invalidatePreviewSessionTtlCache();
+  invalidatePreviewTicketTtlCache();
+  const mixed = ttlPool({ rows: [{ key: PREVIEW_SESSION_TTL_KEY, value: 7200 }] });
+  assert.equal(await readPreviewSessionTtlSeconds({
+    pool: mixed, config: PSCFG, env: {}, log: silentLog,
+  }), 7200);
+  invalidatePreviewTicketTtlCache();
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: mixed, config: PCFG, env: {}, log: silentLog,
+  }), 45, '会话 TTL 那格有行不许让预览票那格凭空读出一个数');
+  invalidatePreviewSessionTtlCache();
+  invalidatePreviewTicketTtlCache();
+});
+
+test('RS-51 第五格缓存：同池 5s 内命中不发 SQL、过期重读、换池不串、本格不被另格顶掉',
+  async () => {
+    invalidatePreviewSessionTtlCache();
+    const pool = ttlPool({ rows: [{ key: PREVIEW_SESSION_TTL_KEY, value: 7200 }] });
+    let clock = 4_000_000;
+    const now = () => clock;
+    const read = () => readPreviewSessionTtlSeconds({
+      pool, config: PSCFG, env: {}, now, log: silentLog,
+    });
+    assert.equal(await read(), 7200);
+    assert.equal(pool.queryCount, 1);
+    clock += HOT_READ_CACHE_TTL_MS;
+    assert.equal(await read(), 7200);
+    assert.equal(pool.queryCount, 1, '5s 内命中 ⇒ 不发第二条 SQL');
+    pool.rows = [{ key: PREVIEW_SESSION_TTL_KEY, value: 120 }];
+    clock += 1;
+    assert.equal(await read(), 120, '过期后必须重读');
+    assert.equal(pool.queryCount, 2);
+    const other = ttlPool({ rows: [{ key: PREVIEW_SESSION_TTL_KEY, value: 60 }] });
+    assert.equal(await readPreviewSessionTtlSeconds({
+      pool: other, config: PSCFG, env: {}, now, log: silentLog,
+    }), 60, 'B 池必须自己读');
+    assert.equal(other.queryCount, 1);
+    // 本格缓存不被别格的读顶掉（各格各一份工厂状态）。
+    assert.equal(await read(), 120);
+    const before = pool.queryCount;
+    invalidatePreviewTicketTtlCache();
+    await readPreviewTicketTtlSeconds({ pool, config: PCFG, env: {}, now, log: silentLog });
+    assert.equal(await read(), 120);
+    assert.equal(pool.queryCount, before + 1,
+      '只有预览票那格该发 SQL（+2 = 本格缓存被预览票顶掉了）');
+    invalidatePreviewSessionTtlCache();
+  });
+
+test('RS-52 第五格保存后立即失效：PUT 完下一个预览请求就是新值（M-2 去登记 ⇒ 这一格红）',
+  async () => {
+    invalidatePreviewSessionTtlCache();
+    const pool = new FakeRuntimePool();
+    assert.equal(await readPreviewSessionTtlSeconds({
+      pool, config: PSCFG, env: {}, log: silentLog,
+    }), 1800);
+    const saved = await saveRuntimeSetting({
+      pool, actorId: ACTOR, key: PREVIEW_SESSION_TTL_KEY, value: 7200, log: silentLog,
+    });
+    assert.equal(saved.value, 7200);
+    assert.equal(pool.storedValue(PREVIEW_SESSION_TTL_KEY), 7200, '库里真的是新值');
+    const afterSave = pool.queryCount;
+    const next = await readPreviewSessionTtlSeconds({
+      pool, config: PSCFG, env: {}, log: silentLog,
+    });
+    assert.equal(next, 7200, '保存后下一次读就是新值（读到 1800 = 失效钩子少登记）');
+    assert.equal(pool.queryCount, afterSave + 1, '这次读必须真的再发一次 SQL');
+    const afterSecond = pool.queryCount;
+    assert.equal(await readPreviewSessionTtlSeconds({
+      pool, config: PSCFG, env: {}, log: silentLog,
+    }), 7200);
+    assert.equal(pool.queryCount, afterSecond, '失效后那一读已把新值填回缓存');
+    // 反向：保存另一格不许抹掉本格缓存。
+    await saveRuntimeSetting({
+      pool, actorId: ACTOR, key: PREVIEW_TICKET_TTL_KEY, value: 30, log: silentLog,
+    });
+    const afterOtherSave = pool.queryCount;
+    assert.equal(await readPreviewSessionTtlSeconds({
+      pool, config: PSCFG, env: {}, log: silentLog,
+    }), 7200);
+    assert.equal(pool.queryCount, afterOtherSave, '保存预览票之后本格仍应命中缓存');
+    invalidatePreviewSessionTtlCache();
+    invalidatePreviewTicketTtlCache();
+  });
+
+test('RS-53 第五格并发：冷缓存四路只发一条 SQL，另一池自己发，合并后照常回填缓存',
+  async () => {
+    invalidatePreviewSessionTtlCache();
+    const pool = new GatingRuntimePool({ rows: [{ key: PREVIEW_SESSION_TTL_KEY, value: 7200 }] });
+    let release;
+    pool.gate = new Promise((resolve) => { release = () => resolve(); });
+    const four = Array.from({ length: 4 }, () => readPreviewSessionTtlSeconds({
+      pool, config: PSCFG, env: {}, log: silentLog,
+    }));
+    await tick();
+    assert.equal(pool.queryCount, 1,
+      `四路并发必须合并成 **1 条** SQL（实发 ${pool.queryCount} 条）`);
+    const other = ttlPool({ rows: [{ key: PREVIEW_SESSION_TTL_KEY, value: 60 }] });
+    assert.equal(await readPreviewSessionTtlSeconds({
+      pool: other, config: PSCFG, env: {}, log: silentLog,
+    }), 60, 'B 池不许蹭 A 池在飞那一趟');
+    release();
+    assert.deepEqual(await Promise.all(four), [7200, 7200, 7200, 7200]);
+    assert.equal(pool.queryCount, 1, '合并之后仍只有一条 SQL');
+    assert.equal(await readPreviewSessionTtlSeconds({
+      pool, config: PSCFG, env: {}, log: silentLog,
+    }), 7200);
+    assert.equal(pool.queryCount, 1, '在飞那趟必须照常回填缓存');
+    invalidatePreviewSessionTtlCache();
+  });
+
+test('RS-54 第五格在飞那趟失败 ⇒ 清槽（不许把之后所有读钉在失败那一趟上）', async () => {
+  invalidatePreviewSessionTtlCache();
+  const pool = flakyPool({ rows: [{ key: PREVIEW_SESSION_TTL_KEY, value: 7200 }] });
+  let clock = 5_000_000;
+  const read = () => readPreviewSessionTtlSeconds({
+    pool, config: PSCFG, env: {}, now: () => clock, log: silentLog,
+  });
+  assert.equal(await read(), 1800, '失败那趟也要给答案（抛了就是预览放行链路 500）');
+  assert.equal(pool.queryCount, 1);
+  pool.broken = false;
+  clock += HOT_READ_CACHE_TTL_MS + 1;
+  assert.equal(await read(), 7200, '恢复后必须读到库里的值，不是被钉住的 1800');
+  assert.equal(pool.queryCount, 2, '必须重新发 SQL（失败路径没清槽就红在这里）');
+  invalidatePreviewSessionTtlCache();
+  const gate = new GatingRuntimePool({ rows: [{ key: PREVIEW_SESSION_TTL_KEY, value: 7200 }] });
+  let release;
+  gate.gate = new Promise((resolve) => { release = () => resolve(); });
+  gate.releaseThrows = true;
+  const first = readPreviewSessionTtlSeconds({
+    pool: gate, config: PSCFG, env: {}, now: () => clock, log: silentLog,
+  });
+  await tick();
+  const second = readPreviewSessionTtlSeconds({
+    pool: gate, config: PSCFG, env: {}, now: () => clock, log: silentLog,
+  });
+  assert.equal(gate.queryCount, 1, '第二路必须复用那一趟');
+  release();
+  assert.equal(await first, 1800, '那一趟挂了 ⇒ 发起方按回落给答案');
+  assert.equal(await second, 1800, '共享者也按回落给答案');
+  gate.gate = null;
+  clock += HOT_READ_CACHE_TTL_MS + 1;
+  assert.equal(await readPreviewSessionTtlSeconds({
+    pool: gate, config: PSCFG, env: {}, now: () => clock, log: silentLog,
+  }), 7200, '挂掉之后必须重新发读拿到真值');
+  invalidatePreviewSessionTtlCache();
+});
+
+test('RS-55 第五格 env 也过 registry 那套闸 + 一次热读最多一条 warn', async () => {
+  const BAD = [
+    ['上界外', '86401', 'session_ttl_seconds_out_of_range'],
+    ['下界外', '59', 'session_ttl_seconds_out_of_range'],
+    ['小数', '90.5', 'not_a_session_ttl_seconds'],
+    ['科学计数', '1e3', 'not_a_session_ttl_seconds'],
+    ['压根不是数', 'abc', 'not_a_session_ttl_seconds'],
+  ];
+  for (const [label, raw, reason] of BAD) {
+    const cfg = loadConfig({ MAX_BODY_BYTES: '1024', PREVIEW_SESSION_TTL_SECONDS: raw });
+    const env = { PREVIEW_SESSION_TTL_SECONDS: raw };
+    invalidatePreviewSessionTtlCache();
+    const hotLog = collectingLog();
+    const hot = await readPreviewSessionTtlSeconds({
+      pool: ttlPool(), config: cfg, env, log: hotLog,
+    });
+    assert.equal(hot, PREVIEW_SESSION_TTL_DEFAULT_SECONDS,
+      `${label}：env=${raw} 过不了闸 ⇒ 回落默认 900（实得 ${hot}）`);
+    const named = hotLog.seen.warn.filter((m) => m.includes(PREVIEW_SESSION_TTL_KEY)
+      && m.includes('PREVIEW_SESSION_TTL_SECONDS'));
+    assert.equal(named.length, 1,
+      `坏 env 值必须点名 warn 一次，实得 ${JSON.stringify(hotLog.seen.warn)}`);
+    assert.match(named[0], new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+      'warn 要带上那个坏值本身');
+    assert.match(named[0], new RegExp(reason), 'warn 要带上被拒的理由');
+  }
+  for (const raw of ['60', '900', '86400']) {
+    invalidatePreviewSessionTtlCache();
+    const log = collectingLog();
+    const cfg = loadConfig({ MAX_BODY_BYTES: '1024', PREVIEW_SESSION_TTL_SECONDS: raw });
+    assert.equal(await readPreviewSessionTtlSeconds({
+      pool: ttlPool(), config: cfg, env: { PREVIEW_SESSION_TTL_SECONDS: raw }, log,
+    }), Number(raw), `env ${raw} 必须照收`);
+    assert.deepEqual(log.seen.warn, [], `合法值不许 warn（实得 ${JSON.stringify(log.seen.warn)}）`);
+  }
+  invalidatePreviewSessionTtlCache();
+});
+
+test('RS-56 真库那一腿（第五格）：写 7200 ⇒ 热读 7200、不等 5 秒；删行 ⇒ 回落 env（无 PG skip）',
+  { skip: PG_SKIP }, async () => {
+    assert.ok(pgFixture, 'TEST_DATABASE_URL 给了却没有夹具');
+    await pgFixture.withFreshDatabase(async ({ pool }) => {
+      const CONFIG = { previewSessionTtlSeconds: 1800, previewSessionTtlSecondsSource: 'env' };
+      const read = () => readPreviewSessionTtlSeconds({ pool, config: CONFIG, log: pgSilent });
+      invalidatePreviewSessionTtlCache();
+      await pool.query(
+        `INSERT INTO users (id, login, password_hash, status) VALUES ($1, $2, 'x', 'active')`,
+        [ACTOR, 'w677-p3b5-actor'],
+      );
+      assert.equal(await read(), 1800);
+      const saved = await saveRuntimeSetting({
+        pool, actorId: ACTOR, key: PREVIEW_SESSION_TTL_KEY, value: 7200, log: pgSilent,
+      });
+      assert.equal(saved.value, 7200);
+      assert.equal(saved.updatedBy, ACTOR);
+      assert.equal(await read(), 7200,
+        '真库上「保存完下一个预览请求就用新值」必须是事实');
+      const list = await listRuntimeSettingsAdmin({ pool, config: CONFIG, log: pgSilent });
+      const item = list.items.find((i) => i.key === PREVIEW_SESSION_TTL_KEY);
+      assert.equal(item.source, 'db');
+      assert.equal(item.value, 7200);
+      assert.equal(item.updatedBy, ACTOR);
+      await pool.query('DELETE FROM runtime_settings WHERE key = $1', [PREVIEW_SESSION_TTL_KEY]);
+      invalidatePreviewSessionTtlCache();
+      assert.equal(await read(), 1800);
+      await pool.query(
+        `INSERT INTO runtime_settings (key, value) VALUES ($1, $2::jsonb)`,
+        [PREVIEW_SESSION_TTL_KEY, '"1e3"'],
+      );
+      invalidatePreviewSessionTtlCache();
+      assert.equal(await read(), 1800,
+        '手工写的坏值 ⇒ 回落 env，不抛');
+      invalidatePreviewSessionTtlCache();
+    });
+  });
+
+test('RS-57 §4.21 第五格那一行多钉一层：值域 / 默认 / 生效点都写出来', () => {
+  const apiDoc = fs.readFileSync(new URL('../../docs/api/portal.md', import.meta.url), 'utf8');
+  const start = apiDoc.indexOf('### 4.21 管理台运行时设置');
+  assert.ok(start >= 0, '§4.21 那一节被删了或改标题了（判据切不到片）');
+  const sliceEnd = apiDoc.indexOf('#### `GET /api/admin/runtime-settings`', start);
+  const region = apiDoc.slice(start, sliceEnd);
+  const dataRows = region.split('\n').filter((l) => l.startsWith('|')).slice(2)
+    .map((line) => line.split('|').slice(1, -1).map((c) => c.trim()));
+  const row = dataRows.find((c) => c[0].replace(/`/g, '') === PREVIEW_SESSION_TTL_KEY);
+  assert.ok(row, '§4.21 的旋钮表里没有 preview.session_ttl_seconds 那一行');
+  const text = row.join(' ');
+  assert.match(text, /60\.\.86400/, '第五格那一行必须写出值域 `60..86400`（与 RS-49 同一区间）');
+  assert.match(text, /默认 `?900`?/, '第五格那一行必须写出默认 900（三处同源）');
+  assert.match(text, /handleForwardAuth|Set-Cookie|preview\.js/,
+    '第五格那一行必须写出生效点（谁在什么时候读它）');
+});
