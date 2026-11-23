@@ -5,7 +5,10 @@
     "多一条红、少一条红。形状启发式只打印「看起来是哪一类」，不参与通过判定。",
     "坐标不是手抄的：`ENV_SITE_DUMP=1 node --test portal/test/deploy-env-delegate.test.js`",
     "打出 `# COORD-DUMP` 两行，抄的就是当前真树的现推读数。",
-    "改任何一条都要同时改 reason（为什么在名单里）；reason 写不出 = 该重开 #587 讨论。"
+    "改任何一条都要同时改 reason（为什么在名单里）；reason 写不出 = 该重开 #587 讨论。",
+    "#587 返修 711c：加了第三个数组 `envMentions` —— S3-⑨ 的「Env 词元记账」是闭合式不变量：",
+    "扫描根里每个大写 `Env` 词元必须落进三桶之一（① 已登记注入站点区间 ② 已识别拼装 span 的",
+    "untraced 桶 ③ 本名单）；落不进任何一桶 ⇒ S3-⑨ 红并打印 rel:line 与行原文。新写法必然多一条。"
   ],
   "injectionSites": [
     {
@@ -205,6 +208,92 @@
       "line": 61,
       "occ": 2,
       "reason": "同一行的第 2 个引用 ⇒ 独立占一条坐标（不许与 occ 1 折叠）"
+    }
+  ],
+  "envMentions": [
+    {
+      "key": "Env",
+      "rel": "deploy/fde-proxy/server.js",
+      "line": 50,
+      "occ": 1,
+      "reason": "代理侧键白名单成员（字符串键 Env）：只是 Docker 请求体的键名，代理不拼装容器 env"
+    },
+    {
+      "key": "Env",
+      "rel": "deploy/fde-proxy/server.js",
+      "line": 480,
+      "occ": 1,
+      "reason": "代理侧入参校验 !Array.isArray(body.Env)：读客户端传来的 body，不是本站注入拼装位"
+    },
+    {
+      "key": "Env",
+      "rel": "deploy/fde-proxy/server.js",
+      "line": 481,
+      "occ": 1,
+      "reason": "拒绝文案串里的 Env 字样（散文），不是代码形：Env must include ERIX_FDE_NAME=<fde>"
+    },
+    {
+      "key": "Env",
+      "rel": "deploy/fde-proxy/server.js",
+      "line": 484,
+      "occ": 1,
+      "reason": "代理侧校验循环 for (const e of body.Env)：读客户端 body，不拼装、不注入"
+    },
+    {
+      "key": "Env",
+      "rel": "deploy/fde-proxy/server.js",
+      "line": 486,
+      "occ": 1,
+      "reason": "拒绝文案串里的 Env 字样（散文）：Env entries must be strings"
+    },
+    {
+      "key": "Env",
+      "rel": "deploy/fde-proxy/server.js",
+      "line": 491,
+      "occ": 1,
+      "reason": "拒绝文案模板串里的 Env 字样（散文）：Env entry must be KEY=VALUE: ${e}"
+    },
+    {
+      "key": "Env",
+      "rel": "deploy/fde-proxy/server.js",
+      "line": 496,
+      "occ": 1,
+      "reason": "拒绝文案模板串里的 Env 字样（散文）：Env key not allowed: ${key}"
+    },
+    {
+      "key": "Env",
+      "rel": "deploy/fde-proxy/server.js",
+      "line": 500,
+      "occ": 1,
+      "reason": "拒绝文案模板串里的 Env 字样（散文）：Env ERIX_FDE_NAME must equal ${fdeName}"
+    },
+    {
+      "key": "Env",
+      "rel": "deploy/fde-proxy/server.js",
+      "line": 504,
+      "occ": 1,
+      "reason": "拒绝文案串里的 Env 字样（散文，与 :481 同文）：Env must include ERIX_FDE_NAME=<fde>"
+    },
+    {
+      "key": "Env",
+      "rel": "portal/integration/wp3a-e2e.mjs",
+      "line": 180,
+      "occ": 1,
+      "reason": "e2e 断言从 docker inspect 的 Config.Env 读回容器 env（读侧，归 issue #712 口径）"
+    },
+    {
+      "key": "Env",
+      "rel": "portal/integration/wp3b-e2e.mjs",
+      "line": 365,
+      "occ": 1,
+      "reason": "同 wp3a-e2e.mjs:180：e2e 从 Config.Env 读回做断言，不是注入拼装位（issue #712）"
+    },
+    {
+      "key": "Env",
+      "rel": "portal/src/provisioner.js",
+      "line": 363,
+      "occ": 1,
+      "reason": "readContainerEnv 从 inspect 的 Config.Env 读回原文（第 2 步读侧，非注入位；别名链残余见 issue #712）"
     }
   ]
 }

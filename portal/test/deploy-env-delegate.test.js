@@ -4250,7 +4250,7 @@ const ENV_SITE_EXPECTATIONS_FILE = path.join(
 function loadSiteExpectations() {
   const doc = JSON.parse(fs.readFileSync(ENV_SITE_EXPECTATIONS_FILE, 'utf8'));
   const out = {};
-  for (const field of ['injectionSites', 'gaps']) {
+  for (const field of ['injectionSites', 'gaps', 'envMentions']) {
     assert.ok(Array.isArray(doc[field]), `${field} 必须是数组（实际 ${typeof doc[field]}）`);
     doc[field].forEach((r, i) => {
       const at = `${field}[${i}]（key=${r?.key}）`;
@@ -4258,6 +4258,10 @@ function loadSiteExpectations() {
         && Number.isInteger(r?.line), `${at} 缺 key/rel/line 坐标`);
       const why = typeof r?.reason === 'string' ? r.reason.trim() : '';
       assert.ok(why !== '', `${at} 缺 reason：钉住一条坐标必须写清它为什么在名单里`);
+      if (field === 'envMentions') {
+        assert.ok(r.occ === undefined || Number.isInteger(r.occ),
+          `${at} 的 occ 必须是整数（同一行第几个「Env」词元，1 起）`);
+      }
     });
     out[field] = doc[field];
   }
@@ -4511,6 +4515,89 @@ test('#587-S3-⑧ 反例六种在钉住口径下必须红（H1×3 / H2×3 / M1×
   const by = Object.fromEntries(rows.map((r) => [r.key, r.via]));
   console.log(`# S3-⑧ 汇总（哪条反例红在哪条判据）：${JSON.stringify(by)}`);
 });
+
+/**
+ * 【711c 返修 · S3-⑨ 的引擎】**大写 `Env` 词元记账**（闭合式不变量，不枚举形态）。
+ * 三审实测：`Object.defineProperty(b,'Env',…)` / `b['Env']=…` / `class X { Env = … }` /
+ * `b.Env.push(模板)` 这四种拼装形既不进 `injectionSites` 也不进 `gaps` ⇒ S3-⑥/⑦ 全绿、静默消失。
+ * 不再补第 N 种写法，改成计数不变量：扫描根里**每一个**大写 `Env` 词元必须落进三桶之一 ——
+ *   ① 已登记的注入站点区间：落在 `envAssemblySpans` 认出的拼装区间里，且该区间确实登记出
+ *      注入（判据与 `registerInjectionSites` 同一条：区间内有引号紧贴的 `KEY=` 字面量）；
+ *   ② 已识别 env 拼装 span 的 untraced 桶：落在已识别区间里但零登记（带 span 的 kind/`at` 当原因）；
+ *   ③ 期望文件 `envMentions` 白名单（坐标 + 理由，人工维护）—— 由 `#587-S3-⑨` 比对本函数的
+ *      `unaccounted` 列表完成（双向，多一条/少一条都红）。
+ * 词元口径：`code`（剥注释、**串正文留着**）上整词匹配 `Env` ⇒ 标识符 / 属性名 / 字符串键都算，
+ * 注释里的不算，`process.env` 这种小写不算，`ENV` / `ERIX_ENV` / `Environment` 都不算。
+ */
+const ENV_TOKEN_RE = /(?<![A-Za-z0-9_$])Env(?![A-Za-z0-9_$])/g;
+
+/** `Env` 词元落在哪个已识别拼装区间里（含头部那个 `Env` 词元本身）；不在任何区间 ⇒ null。 */
+function envSpanOwning(f, spans, offset) {
+  for (const s of spans) {
+    // 头部：`Env:` 属性名 / `.Env.push(` 里的 `Env` 在 span.from **之前**，必须一起算进区间，
+    // 否则真树 221/277 那两处的 `Env` 自己会掉进 unaccounted（那是已登记站点，不是漏网）。
+    const head = f.code.slice(0, s.from);
+    const hm = /Env\s*\.\s*push\s*\($/.exec(head) ?? /Env\s*:\s*$/.exec(head);
+    const from = hm ? s.from - hm[0].length : s.from;
+    if (offset >= from && offset < s.to) return s;
+  }
+  return null;
+}
+
+/** 这个已识别区间是不是**真的登记出了**注入站点（与 `registerInjectionSites` 同一判据）。 */
+function spanRegistersInjection(f, span) {
+  for (const m of f.code.slice(span.from, span.to).matchAll(/([A-Z][A-Z0-9_]*)=/g)) {
+    const q = f.code[span.from + m.index - 1];
+    if (q === '`' || q === '"' || q === "'") return true;
+  }
+  return false;
+}
+
+/**
+ * 现推的 `Env` 词元账本 ⇒ `{ accountedSite, accountedSpan, unaccounted }`。
+ * `unaccounted` 条目 = `{ key:'Env', rel, line, occ, text }`（`text` = 行原文，红时要能指着看）。
+ */
+function deriveEnvMentions(root = REPO_ROOT) {
+  const out = { accountedSite: 0, accountedSpan: 0, unaccounted: [] };
+  for (const file of scanTargets(root)) {
+    const rel = path.relative(root, file).split(path.sep).join('/');
+    const f = srcFacts(root, rel);
+    if (!f) continue;
+    const spans = envAssemblySpans(root, rel);
+    let occ = 0;
+    let lastLine = 0;
+    for (const m of f.code.matchAll(ENV_TOKEN_RE)) {
+      const line = lineAt(f.code, m.index);
+      occ = line === lastLine ? occ + 1 : 1;
+      lastLine = line;
+      const owner = envSpanOwning(f, spans, m.index);
+      if (owner) {
+        if (spanRegistersInjection(f, owner)) out.accountedSite += 1;
+        else out.accountedSpan += 1;
+        continue;
+      }
+      const lr = lineRange(f.text, line);
+      out.unaccounted.push({
+        key: 'Env', rel, line, occ, text: lr ? f.text.slice(lr[0], lr[1]).trim() : '',
+      });
+    }
+  }
+  out.unaccounted.sort(cmpCoord);
+  return out;
+}
+
+test('#587-S3-⑨ Env 词元全部记账：每个大写 `Env` 必须落进三桶之一（闭合式，新写法必然多一条）',
+  () => {
+    const { accountedSite, accountedSpan, unaccounted } = deriveEnvMentions();
+    console.log(`# S3-⑨ Env 词元：桶① 已登记注入站点区间 ${accountedSite} 个 / `
+      + `桶② 已识别拼装 span（untraced）${accountedSpan} 个 / 未记账 ${unaccounted.length} 条`);
+    for (const u of unaccounted) {
+      console.log(`# S3-⑨ unaccounted ${u.rel}:${u.line}#${u.occ} | ${u.text}`);
+    }
+    assertPinned('S3-⑨ Env 词元未记账集合',
+      unaccounted.map(({ key, rel, line, occ }) => ({ key, rel, line, occ })),
+      () => loadSiteExpectations().envMentions);
+  });
 
 /**
  * MED① 的夹具：**路径故意也叫 `portal/src/provisioner.js`** —— 旧形状闸会把它里而每一行都算
