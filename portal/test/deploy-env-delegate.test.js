@@ -3916,6 +3916,8 @@ const S2_FILES = {
     'const { [T]: fromTable } = process.env;',                         // 8 计算名从表里来
     'const { cfg } = opts;',                                          // 9 负例：普通解构的成员不是 env 对象
     'export const viaCfg = cfg.ERIX_S2_DES_NOT_ENV;',                 // 10
+    "const { 'ERIX_S2_DES_QUOTED': q } = process.env;",              // 11 引号键名
+    "const { ERIX_S2_DES_DEFAULT = 'x' } = process.env;",              // 12 带默认值
   ].join('\n'),
   'lib/failclosed.js': [
     // 1 名字来源的数据表（登记的理由要引它那一行：族 B② 要求理由引到可核对的声明位）
@@ -3942,6 +3944,7 @@ const S2_L = {
   assignDot: 2, assignIdx: 3, assignOpt: 5, realias: 7, notEnv: 9,
   reflectLit: 1, reflectName: 3, reflectHas: 4, reflectAlias: 6, reflectNeg: 7, reflectWrite: 8,
   desShort: 1, desRenamed: 2, desLineA: 4, desLineB: 5, desTable: 8, desNotEnv: 10,
+  desQuoted: 11, desDefault: 12,
   fcTable: 1,
   fcReflectDyn: 2, fcReflectNoArg: 3, fcComputed: 4, fcRest: 5, fcCopy: 6, fcKeys: 7, fcForIn: 8,
   fcBound: 9, fcSpread: 11, fcNeg: 13, fcNegForIn: 14, fcNegComputed: 15, fcOptAlias: 17,
@@ -4016,6 +4019,8 @@ test('#587-S2-③ 解构 env：简写 / 重命名 / 多行 / 表驱动计算名�
       ['ERIX_S2_DES_RENAMED', S2_L.desRenamed],
       ['ERIX_S2_DES_LINE_A', S2_L.desLineA],
       ['ERIX_S2_DES_LINE_B', S2_L.desLineB],
+      ['ERIX_S2_DES_QUOTED', S2_L.desQuoted],
+      ['ERIX_S2_DES_DEFAULT', S2_L.desDefault],
     ];
     for (const [key, line] of want) {
       assert.deepEqual(s2Coords(index, key), [`lib/destructure.js:${line}(destructure)`],
