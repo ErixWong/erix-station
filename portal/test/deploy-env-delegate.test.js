@@ -3472,7 +3472,11 @@ function envOptionFlowsIntoEnvArray() {
 
 /**
  * 「**容器 env 的组装位**」= 三个**语法位置**（`rel` 只用来读文件，**不参与判断** —— MED① 的牙）：
- *   `Env[]`        对象字面量里名为 `Env` 的**数组**成员值（Docker create body；`Env` 是 Docker API 字段名）
+ *   `Env[]`        对象字面量里名为 `Env` 的**数组**成员值（Docker create body；`Env` 是 Docker API 字段名），
+ *                  且必须**证明归属**（H1 返修）：该字面量绑在名字上且同文件有 `NAME.Env.push(`，
+ *                  或它是 create 调用的直接实参——语法形只证明形状，不证明这是容器 body（假绿反例：
+ *                  `const other = { Env: ['X=1'] }`）。证明不了 ⇒ 不发区间（fail-closed：宁可漏登记让
+ *                  影子报差异，也不要误登记把例外判绿）。
  *   `Env.push()`   `x.Env.push( … )` 的参数区
  *   `env-opt[]`    名为 `env` 的数组成员值，且它处在 `buildContainerConfig( … )` 的**实参**里
  *                  ——「这个选项会流进 `body.Env`」由 `envOptionFlowsIntoEnvArray()` 现跑产品代码证明，
@@ -3496,16 +3500,54 @@ function envAssemblySpans(root, rel) {
       const lb = nextNonSpace(f.masked, m.index + m[0].length);
       if (lb == null || f.masked[lb] !== '[') continue;                        // 值不是数组 ⇒ 不是注入位
       const end = matchBrackets(f.masked, lb);
-      if (end != null) found.push({ lb, end, at: lineAt(f.code, m.index) });
+      if (end != null) found.push({ lb, end, propAt: m.index, at: lineAt(f.code, m.index) });
     }
     return found;
   };
   if (f) {
-    for (const x of arrayValueOf(/\bEnv\s*:\s*/g)) {
+    // H1（返修）：`Env:` / `.Env.push(` 只是语法形，还要**归属证明**才发区间。可证的两个形态
+    //（工单三选一里文本可推的那两条；「ContainerCreate 请求体构造」按 create 实参形状认）：
+    //   P1 对象字面量绑在名字上（`const NAME = {` / `NAME = {`）且同文件存在 `NAME.Env.push(`
+    //      ——「Env 数组成员」和「push 链」互证同一个 body；
+    //   P2 对象字面量是 create 调用（`*.createContainer(` / `*.create(`）的直接实参。
+    // 都推不出 ⇒ 不发区间：漏登记让影子报差异（可见），误登记会把例外判绿（假绿）。
+    const envHits = arrayValueOf(/\bEnv\s*:\s*/g);
+    const ownerNameAt = (propAt) => {
+      const obj = enclosingPairs(f.masked, f.pairs, propAt).find((w) => w.kind === '{');
+      if (!obj) return null;
+      const head = f.masked.slice(Math.max(0, obj.open - 80), obj.open);
+      const hm = /(?:^|[^\w$.])(?:const\s+|let\s+|var\s+)?([A-Za-z_$][\w$]*)\s*=\s*$/.exec(head);
+      return hm ? hm[1] : null;
+    };
+    const hasEnvPushOn = (name) => {
+      const re = new RegExp(`(?<![\\w$.])${escRe(name)}\\s*\\.\\s*Env\\s*\\.\\s*push\\s*\\(`, 'g');
+      for (const m of f.code.matchAll(re)) {
+        if (isCodePosition(f.code, f.masked, m.index, name.length)) return true;
+      }
+      return false;
+    };
+    const isCreateArg = (propAt) => {
+      const call = enclosingPairs(f.masked, f.pairs, propAt).find((w) => w.kind === '(');
+      if (!call) return false;
+      return /(?:createContainer|ContainerCreate|\.create)\s*$/i
+        .test(f.masked.slice(Math.max(0, call.open - 40), call.open));
+    };
+    const provenBody = new Set();
+    for (const x of envHits) {
+      const nm = ownerNameAt(x.propAt);
+      const ok = nm && (hasEnvPushOn(nm) || isCreateArg(x.propAt));
+      if (ok && !provenBody.has(nm)) provenBody.add(nm);
+    }
+    // M-a 变异点：把上面的 provenBody 判据整个去掉（退回「任何 `Env:` 数组都算」）
+    // ⇒ H1 反例（无归属的 `const other = { Env: [...] }`）重新被登记并判绿，S3-⑤ 点名红。
+    for (const x of envHits) {
+      if (!provenBody.has(ownerNameAt(x.propAt))) continue;
       push('Env[] 数组字面量', x.lb, x.end, `第 ${x.at} 行的 \`Env:\``);
     }
     for (const m of f.code.matchAll(/\.\s*Env\s*\.\s*push\s*\(/g)) {
       if (!isCodePosition(f.code, f.masked, m.index, m[0].length)) continue;
+      const rm = /([A-Za-z_$][\w$]*)\s*$/.exec(f.code.slice(0, m.index));
+      if (!rm || !provenBody.has(rm[1])) continue;   // H1：接收者追不到已证明的容器 body ⇒ 不发区间
       const open = m.index + m[0].length - 1;
       const close = matchGroup(f.masked, open);
       if (close == null) continue;
@@ -3691,11 +3733,14 @@ function hostSourceSitesOf(index, key) {
  *   `.Env.push(` 参数位 / 已执行证明流入 `body.Env` 的 `env:` 选项位）；在每个区间里找
  *   「字面量以引号开头、紧跟 `KEY=`」的形（注入形的定义：`` `KEY=${…}` `` / `'KEY=…'`），
  *   `KEY` 即被注入的键，行号 = 字面量开头所在行。认不出 ⇒ 不登记 ⇒ 影子继续红（fail-closed）。
+ * M1（返修）：数组里的 `...展开` 不再静默跳过——裸标识符能追到同文件 `const NAME = [` 字面量就
+ * 进去登记（规则带「追至」痕迹）；追不到（参数、表达式、跨文件）就记进 `added.untraced` 显式计数。
  * 只接 `REPO_SITE_INDEX`（影子尺）⇒ 夹具索引恒空、闸门（`whereProblems`）零改动。
  * @returns {Array<{key:string, rel:string, line:number, rule:string}>} 登记了哪些站点（推导过程可指着）
  */
 function registerInjectionSites(index, root = REPO_ROOT) {
   const added = [];
+  const untraced = [];
   for (const file of scanTargets(root)) {
     const rel = path.relative(root, file).split(path.sep).join('/');
     const f = srcFacts(root, rel);
@@ -3710,17 +3755,61 @@ function registerInjectionSites(index, root = REPO_ROOT) {
         index.addInjectionSite(m[1], rel, line, a.kind);
         added.push({ key: m[1], rel, line, rule: `${a.kind} ← ${a.at}` });
       }
+      // M1：区间里的 `...展开` —— 可判就追，判不出就显式计数（M-c 变异点：把 untraced.push
+      // 改成静默 `continue` ⇒ S3-⑤ 的计数格红）。
+      for (const s of f.code.slice(a.from, a.to).matchAll(/\.\.\.\s*/g)) {
+        if (!isCodePosition(f.code, f.masked, a.from + s.index, 3)) continue;   // 串正文里的 … 不算
+        const rest = f.code.slice(a.from + s.index + s[0].length);
+        const src = /^[^,\]]*/.exec(rest)[0].trim();
+        const ident = /^([A-Za-z_$][\w$]*)\s*(?=[,\]\s)]|$)/.exec(rest);
+        let traced = false;
+        if (ident) {
+          const decRe = new RegExp(`(?:const|let|var)\\s+${escRe(ident[1])}\\s*=\\s*\\[`, 'g');
+          for (const d of f.code.matchAll(decRe)) {
+            if (!isCodePosition(f.code, f.masked, d.index, d[0].length)) continue;
+            const lb = d.index + d[0].length - 1;
+            const end = matchBrackets(f.masked, lb);
+            if (end == null) continue;
+            traced = true;
+            for (const m of f.code.slice(lb, end).matchAll(/([A-Z][A-Z0-9_]*)=/g)) {
+              const kAt = lb + m.index;
+              const q = f.code[kAt - 1];
+              if (q !== '`' && q !== '"' && q !== "'") continue;
+              const kLine = lineAt(f.code, kAt);
+              index.addInjectionSite(m[1], rel, kLine, a.kind);
+              added.push({ key: m[1], rel, line: kLine,
+                rule: `${a.kind} ← ...${ident[1]} 追至第 ${lineAt(f.code, d.index)} 行来源` });
+            }
+          }
+        }
+        if (traced) continue;
+        untraced.push({ rel, line: lineAt(f.code, a.from + s.index), rule: `${a.kind} 内的 ...展开`,
+          src: src.slice(0, 48) });
+      }
     }
   }
+  added.untraced = untraced;
   return added;
 }
 // 真树影子索引接上注入登记（M-1 变异点：去掉这一行 ⇒ 那 4 条注入差异必须重新红）
 registerInjectionSites(REPO_SITE_INDEX);
 
+/** H2（返修）：这一处参数使用是不是**动态下标读**（`env[key]` 那类：参数处在 `X[param]` 的
+ * 下标位且下标里只有它）——那是拿 key 去真取值，是真读站点，不是读回。 */
+function isDynamicIndexUse(f, at, name) {
+  const br = enclosingPairs(f.masked, f.pairs, at).find((p) => p.kind === '[');
+  if (!br || f.masked.slice(br.open + 1, br.close - 1).trim() !== name) return false;
+  return /[\w$)\]"'`]\s*\[\s*$/.test(f.masked.slice(Math.max(0, br.open - 40), br.open + 1));
+}
+
 /**
  * 【第 3 步】`readback` 的语义判据（**由代码推**）：key 字面量处在具名函数
  * `function NAME(…)` 的**默认参数位**（`keyDeclFormAt` ⇒ `default-param`），吃下这个默认值的形参
- * 是裸标识符，且函数体里又把这个形参读了一遍（代码位；模板插值 `${key}` 也是代码位）
+ * 是裸标识符，且函数体里又把这个形参读了一遍（代码位；模板插值 `${key}` 也是代码位），
+ * 并且**函数体没有把它当动态下标读**（H2 返修：`env[key]` = 拿 key 真取值 ⇒ 真读站点，
+ * 归差异/unsupported，不许当 readback 吃掉）。真正的 readback 形态以 `provisioner.js:362`
+ * 为准：`readContainerEnv` 把 key 拼成前缀（`${key}=`）再 `startsWith` 比较，不做下标取值；
+ * 固定字面量读回（`env.ERIX_X` / `env['ERIX_X']`）同形。
  * ⇒ 这个字面量是「读回 helper 的默认 key」（如 `readContainerEnv(inspectData, key = 'ERIX…'））。
  * 缺任何一环 ⇒ `null`（退回 `mention-only`，不猜）；只认 `function NAME(…)` 声明形，与
  * `deriveHostSourceSites` 同一限制（箭头形认不出就是推不出，不装懂）。
@@ -3747,13 +3836,23 @@ function readbackDefaultParamSite(root, rel, line, key) {
     if (eq < 0 || f.masked.slice(eq + 1, lit.qStart).trim() !== '') continue;
     const pm = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(f.masked.slice(slot[0], eq));
     if (!pm) continue;
-    // 函数体是否把同一参数读回：裸标识符 + 代码位（模板插值 `${key}` 保留为代码 ⇒ 也算）
+    // 函数体是否把同一参数读回：裸标识符 + 代码位（模板插值 `${key}` 保留为代码 ⇒ 也算）。
+    // H2 反例：函数体用 `env[key]` 动态下标读同一参数 ⇒ 真读站点，这条默认参数不许判 readback。
+    // M-b 变异点：去掉 dynSub 的 `continue`（退回「默认参数位 + 参数再现就算 readback」）
+    // ⇒ S3-③ 的 dynamicEnv 反例那格红。
+    let dynSub = false;
+    let useAt = -1;
     const useRe = new RegExp(`(?:^|[^\w$.])${escRe(pm[1])}(?![\w$])`, 'g');
     for (const m of f.code.matchAll(useRe)) {
       const at = m.index + m[0].length - pm[1].length;
       if (at < fn.bodyFrom || at >= fn.bodyTo) continue;
       if (!isCodePosition(f.code, f.masked, at, pm[1].length)) continue;
-      return { name: hm[1], param: pm[1], declLine: fn.declLine, useLine: lineAt(f.code, at) };
+      if (isDynamicIndexUse(f, at, pm[1])) { dynSub = true; continue; }
+      if (useAt < 0) useAt = at;
+    }
+    if (dynSub) continue;                       // 有动态下标读 ⇒ 这是真读站点，不是读回
+    if (useAt >= 0) {
+      return { name: hm[1], param: pm[1], declLine: fn.declLine, useLine: lineAt(f.code, useAt) };
     }
   }
   return null;
@@ -3813,7 +3912,8 @@ function shadowGapSemantic(key, coord, { root = REPO_ROOT, index = REPO_SITE_IND
         + ` ⇒ 它是 inspect 读回 helper 的默认 key：既不是注入位（不在任何 Env 组装区间里），` 
         + '也不是数据表声明（第 3 步单独归类，不再冒充 mention-only）' };
   }
-  misses.push('readback：那一行不是「具名函数默认参数位 + 函数体读同一参数」的读回形');
+  misses.push('readback：那一行不是「具名函数默认参数位 + 函数体固定形读回」的读回形'
+    + '（函数体用 env[key] 动态下标读 = 真读站点，已排除，不许当 readback 吃掉）');
   // ③ mention-only：本行是**被声明的字符串值** + 该 key 在索引里**另有真读站点**（两个事实都要）
   const decls = exactStringLiterals(f.code, f.masked, span[0], span[1], key)
     .map((lit) => ({ lit, form: keyDeclFormAt(f, lit) })).filter((x) => x.form !== null);
@@ -3958,6 +4058,8 @@ test('#587-S3-① 注入站点可解析：四个键各有站点，坐标 = 现�
     }
   }
   console.log(`# S3-登记计数 ${added.length} 条（含非例外清单的键，全部由语法区间推导）`);
+  console.log(`# S3-untraced展开 ${(added.untraced ?? []).length} 条判不出的 ...展开：${
+    (added.untraced ?? []).map((u) => `${u.rel}:${u.line}(${u.src})`).join('、') || '无'}`);
 });
 
 test('#587-S3-② 注入站点不是读站点：账本分开（hasSite 认、readSites 不认），影子判它们绿', () => {
@@ -3993,13 +4095,22 @@ test('#587-S3-③ readback 归类：读回 helper 的默认参数位归 readback
   // M-2 变异点：去掉规则②½ ⇒ 它退回旧归类 `mention-only`，这格与 `#587-S1-⑧` 分布一起红
   assert.notEqual(cls.kind, 'mention-only', ':362 仍被当作 mention-only ⇒ readback 归类没生效');
   // 反向自证（夹具，不改盘上树）：默认参数位但函数体不读该参数 ⇒ 不许认 readback（宁窄勿宽）；
-  // 函数体用 `env[key]` 读同一参数 ⇒ 必认。
+  // 函数体把 key 拼前缀后 startsWith 比较（真形态，同 provisioner.js:362）⇒ 必认 readback；
+  // H2 反例（audit 原样）：函数体用 `env[key]` 动态下标读同一参数 ⇒ 真读站点，不许判 readback。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-rb-'));
   try {
     fs.mkdirSync(path.join(dir, 'lib'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'lib', 'rb.js'), [
       "export function unusedDefault(env, key = 'ERIX_RB_MISS') { return env.RB_OTHER; }",
-      "export function usedReadback(env, key = 'ERIX_RB_HIT') { return env[key]; }",
+      "export function usedReadback(env, key = 'ERIX_RB_HIT') {",
+      '  const prefix = `${key}=`;',
+      '  const line = env.find((e) => typeof e === "string" && e.startsWith(prefix));',
+      '  return line ? line.slice(prefix.length) : null;',
+      '}',
+      'function dynamicEnv(env = process.env,',
+      "  key = 'ERIX_AUDIT_READ') {",
+      '  return env[key];',
+      '}',
       'export const v1 = process.env.ERIX_RB_MISS;',
       'export const v2 = process.env.ERIX_RB_HIT;',
     ].join('\n') + '\n');
@@ -4009,7 +4120,17 @@ test('#587-S3-③ readback 归类：读回 helper 的默认参数位归 readback
       `函数体没读那个参数也被认成 readback ⇒ 判据过宽（实际：${miss.why}）`);
     const hit = shadowGapSemantic('ERIX_RB_HIT', 'lib/rb.js:2', { root: dir, index: idx });
     assert.equal(hit.kind, 'readback',
-      `函数体用 env[key] 读回同一参数应归 readback（实际 ${hit.kind}：${hit.why}）`);
+      '真读回形（key 拼前缀 + startsWith 比较，同 provisioner.js:362）应归 readback'
+      + `（实际 ${hit.kind}：${hit.why}）`);
+    // H2 反例：默认参数位 + 函数体 env[key] 动态下标读 ⇒ 真读站点；不许被 readback 吃掉。
+    // 允许落点：未归类（差异），或 mention-only 且能指着扫描器里的真读站点（动态读已在索引里，
+    // 分类必须点名它）——两者都不把真读包装成「已知合法的读回」。
+    const dyn = shadowGapSemantic('ERIX_AUDIT_READ', 'lib/rb.js:8', { root: dir, index: idx });
+    assert.notEqual(dyn.kind, 'readback',
+      `env[key] 动态下标读被归成 readback ⇒ 真读站点被已知类吞掉（实际：${dyn.why}）`);
+    assert.ok(dyn.kind === null
+        || (dyn.kind === 'mention-only' && /真读站点.*index:key/.test(dyn.why)),
+      `H2 反例应落差异或点名真读站点的 mention-only，实际 ${dyn.kind}：${dyn.why}`);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -4035,6 +4156,54 @@ test('#587-S3-④ 反向牙：拿「没做过注入登记」的同树索引跑 �
     }
   }
   assert.equal(reds, 4, `预期重新红 4 条，实际 ${reds} ⇒ 注入坐标的数量变了，核对 S3-INJECT 读数`);
+});
+
+test('#587-S3-⑤ H1 归属 + M1 展开：无归属的 `Env:` 不登记不判绿；...展开可判就追、判不出显式计数', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-h1-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'lib', 'inject.js'), [
+      "const base = ['ERIX_SPREAD_TRACKED=lit'];",                       // 1 ...base 可追 ⇒ 登记
+      'export function buildCfg(opts, env) {',                           // 2
+      '  const body = { Env: [...base, ...(opts.env ?? []), ...env,',    // 3
+      "    `ERIX_OWN_ENV=own`] };",                                      // 4
+      "  body.Env.push('ERIX_OWN_PUSH=p');",                             // 5
+      "  const other = { Env: ['ERIX_AUDIT_LITERAL=literal'] };",        // 6 H1 反例：无归属
+      '  return { body, other };',                                       // 7
+      '}',                                                               // 8
+    ].join('\n') + '\n');
+    const idx = buildEnvSiteIndex(dir);
+    const added = registerInjectionSites(idx, dir);
+    const keys = new Set(added.map((s) => s.key));
+    assert.ok(keys.has('ERIX_SPREAD_TRACKED'),
+      'M1：`...base` 能追到同文件数组字面量却不登记 ⇒ 漏项回归');
+    assert.ok(keys.has('ERIX_OWN_ENV') && keys.has('ERIX_OWN_PUSH'),
+      '有归属（Env 数组 + body.Env.push 链互证）的注入位必须登记');
+    assert.ok(!keys.has('ERIX_AUDIT_LITERAL'),
+      'H1：任意对象的 `Env:` 无归属也被登记 ⇒ 假绿回归（假例：const other = { Env: [\'X=1\'] }）');
+    // 那一行必须点名红：拿它当唯一引用造例外，问题清单不许空
+    const red = siteIndexProblems(
+      [{ key: 'ERIX_AUDIT_LITERAL', where: 'lib/inject.js:6' }], idx, dir);
+    assert.ok(red.length > 0, 'H1 反例那一行被判绿（应红）⇒ 误登记把例外洗白了');
+    assert.match(red.join('\n'), /不是 ERIX_AUDIT_LITERAL 的读站点/);
+    // 对照组：有归属的两条坐标判绿（登记生效，不是全部拒绝）
+    assert.deepEqual(
+      siteIndexProblems([{ key: 'ERIX_OWN_ENV', where: 'lib/inject.js:4' }], idx, dir), []);
+    // 分类器同样不认无归属的 Env: 为 injection（不靠索引，靠同一套归属区间）
+    const cls = shadowGapSemantic('ERIX_AUDIT_LITERAL', 'lib/inject.js:6',
+      { root: dir, index: idx });
+    assert.notEqual(cls.kind, 'injection', `无归属的 Env: 仍被判 injection（${cls.why}）`);
+    // M1：判不出的展开必须显式计数且点名来源（...(...) 表达式 + 未绑定的裸标识符 env）
+    const ut = added.untraced ?? [];
+    assert.equal(ut.length, 2, `判不出的 ...展开要显式计数（实际 ${JSON.stringify(ut)}）`);
+    assert.ok(ut.some((u) => u.src.includes('opts.env')) && ut.some((u) => u.src === 'env'),
+      `计数里必须点名展开来源（实际 ${JSON.stringify(ut.map((u) => u.src))}）`);
+    const tracked = added.find((s) => s.key === 'ERIX_SPREAD_TRACKED');
+    assert.match(tracked.rule, /\.\.\.base 追至第 1 行来源/, '追踪登记必须留「追至」痕迹');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  // 真树可见性：判不出的展开在真树里也存在（运行时来源），必须被计数而不是静默
+  const { added } = rederiveInjectionSites();
+  console.log(`# S3-⑤ 真树 untraced 展开 ${(added.untraced ?? []).length} 条（显式计数，非静默）`);
 });
 
 /**
