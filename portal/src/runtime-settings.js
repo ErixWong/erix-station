@@ -243,6 +243,77 @@ export function validateWorkspaceRetentionDays(value) {
   return true;
 }
 
+// --- preview.ticket_ttl_seconds 专用闸（P3 第二批：预览票有效期进 DB） ------------------
+// 上界 3600 秒（1 小时）的理由：预览票是「点开一条链接临时进面板」的一次性短票，
+// 短才有意义（越短被截获/重放的窗口越小）；工单给的参考范围 1..3600 我照用 ——
+// 60 秒是默认（与 config.js:410 同源），上界取整小时是「一张票最多覆盖一次排障会话」，
+// 再长就该发会话 cookie 而不是票。下界 1（不含 0）：0 秒的票签出来立刻过期 = 白发，
+// 与「不自动清理 = 0」那种 0-有语义 的旋钮不同，这里的 0 只会造成「签了却进不去」的困惑。
+export const PREVIEW_TICKET_TTL_KEY = 'preview.ticket_ttl_seconds';
+export const PREVIEW_TICKET_TTL_MIN_SECONDS = 1;
+export const PREVIEW_TICKET_TTL_MAX_SECONDS = 3600; // 1 小时，理由见上面那段
+// 默认与 config.js 的 `previewTicketTtlSeconds`（PREVIEW_TICKET_TTL_SECONDS 兜底 60）同源。
+export const PREVIEW_TICKET_TTL_DEFAULT_SECONDS = 60;
+export const PREVIEW_TICKET_TTL_HINT = '一次预览票从签出到过期的秒数；1..3600（默认 60）';
+
+/**
+ * 严格十进制正整数（形状口径同上面两格：只认 `/^[0-9]+$/` 的非负整数字面，再要求 > 0）。
+ * 非法输入一律 `{ ok: false, reason }`，绝不返回 NaN，也绝不用 `Number()`/`parseInt()` 了事。
+ */
+export function parsePreviewTicketTtlSeconds(raw) {
+  let text;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw)) {
+      return { ok: false, reason: 'not_a_ticket_ttl_seconds' };
+    }
+    text = String(raw);
+  } else if (typeof raw === 'string') {
+    text = raw;
+  } else {
+    return { ok: false, reason: 'not_a_ticket_ttl_seconds' };
+  }
+  // 只认纯十进制数字：`'1e3'`（科学记数）、`' 60 '`（带空白）、`'+5'`（带符号）、
+  // `'60.0'`（小数）、空串 全部在这一步被挡掉；`'-5'` 带负号同样进不来。
+  if (!/^[0-9]+$/.test(text)) {
+    return { ok: false, reason: 'not_a_ticket_ttl_seconds' };
+  }
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) {
+    return { ok: false, reason: 'not_a_ticket_ttl_seconds' };
+  }
+  // 形状闸也把区间兑一下（与会话/保留天数两格同形：parse 与 validate 两道都过一遍区间）。
+  // 下界 1 ⇒ `0` 在这一层就被拒（reason 归 `out_of_range`，不是 `not_a_...`：它是合法数字、只是不合法）。上界同。
+  if (value < PREVIEW_TICKET_TTL_MIN_SECONDS || value > PREVIEW_TICKET_TTL_MAX_SECONDS) {
+    return { ok: false, reason: 'ticket_ttl_out_of_range' };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * 管理台写入前的取值闸：返回 `true` 或一句给人看的中文原因。
+ *
+ * ⚠ `1e3` 的两侧之分（#709 unproven 裁定）：**写侧接受任何合法 JSON number**——JSON 把科学记数法
+ * 在解析时就塌成了普通整数，`1e3` 与 `1000` 是同一个值 ⇒ 走下面的 safe-integer 支放行（区间内），
+ * 库里落的是 `1000`。只有**字符串** `"1e3"`（以及 `' 60 '`/`'60s'` 那一族）才在这一层被拒。
+ * 这与 **env 侧相反**：env 那档走 `parse` 的 `/^[0-9]+$/` 正则支，`1e3` 过不了 ⇒ 视为没给、回落默认（见
+ * `parsePreviewTicketTtlSeconds` 与 RS-31b / RS-37 / env.md）。一句话：`1e3` 写进 body 被收（=1000），
+ * 写进 env / 作为字符串都不算数。
+ */
+export function validatePreviewTicketTtlSeconds(value) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    return `必须是 ${PREVIEW_TICKET_TTL_MIN_SECONDS}–${PREVIEW_TICKET_TTL_MAX_SECONDS}` +
+      ' 的整数秒（不接受字符串、小数、布尔）';
+  }
+  if (value < PREVIEW_TICKET_TTL_MIN_SECONDS) {
+    return `不能是 ${value}（预览票至少 ${PREVIEW_TICKET_TTL_MIN_SECONDS} 秒；0 秒签出来即过期）`;
+  }
+  if (value > PREVIEW_TICKET_TTL_MAX_SECONDS) {
+    return `必须在 ${PREVIEW_TICKET_TTL_MIN_SECONDS}–${PREVIEW_TICKET_TTL_MAX_SECONDS} 秒之间` +
+      `（1 秒 ~ 1 小时；再长请改用会话 cookie 而不是票）`;
+  }
+  return true;
+}
+
 export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
@@ -264,6 +335,17 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseWorkspaceRetentionDays,
     validate: validateWorkspaceRetentionDays,
     hint: WORKSPACE_RETENTION_HINT,
+  }),
+  [PREVIEW_TICKET_TTL_KEY]: Object.freeze({
+    key: PREVIEW_TICKET_TTL_KEY,
+    label: '预览票有效期（秒）',
+    configPath: 'previewTicketTtlSeconds',
+    envVar: 'PREVIEW_TICKET_TTL_SECONDS',
+    defaultValue: PREVIEW_TICKET_TTL_DEFAULT_SECONDS,
+    applyMode: 'hot',
+    parse: parsePreviewTicketTtlSeconds,
+    validate: validatePreviewTicketTtlSeconds,
+    hint: PREVIEW_TICKET_TTL_HINT,
   }),
 });
 
@@ -550,8 +632,10 @@ export async function applyRuntimeOverrides(config, opts = {}) {
     const path = entry?.configPath;
     if (!path) continue;
     let value;
+    let fromDb = false;
     if (Object.prototype.hasOwnProperty.call(values, key)) {
       value = values[key];
+      fromDb = true;
       tierByKey.set(key, 'db');
     } else {
       // env 那一档 = `resolveEnvTier`（值来自 `env[envVar]` 原话或 `config[path]`，**且过了 registry
@@ -564,6 +648,13 @@ export async function applyRuntimeOverrides(config, opts = {}) {
     }
     if (value === undefined) continue; // 三档都给不出值 ⇒ 这一格不动，别发明 undefined
     setPath(next, path, value);
+    // #709 MED①：把「这一格的值此刻来自哪一档」也标到新 config 上（`<path>Source`，与 `config.js`
+    // 里 `sessionTtlSecondsSource` 那套先例同形）。DB 那一档必须标成 `db`——否则 `effectiveConfig`
+    // 带着旧库值、却没有「它来自 DB」的标注，热读器在运行期 DB 读失败回落到它时，`configTierSource`
+    // 只能凭值猜（env 变量在 ⇒ 谎报 `env`）。env/default 两支不盖标注：它们的 boot 值本就来自 env/默认
+    // （热读回落时 `resolveEnvTier` 的 rawGiven 分支 / `configTierSource` 的默认收窄会各自报对），
+    // 且读失败整档时若盖标注会破坏「覆盖层内容与 config 相同」这条既有口径（RS-1）。
+    if (fromDb) next[`${path}Source`] = 'db';
   }
   // 「哪几格走了哪一档」要说得出口（口径 2：回落必须说清用的是哪个值）。`problems` 是回落的
   // 具体理由（表不存在 / 挂住 / 值非法），与档位一起进同一条 debug，排查时一条就够用。
@@ -937,6 +1028,12 @@ const workspaceRetentionHotReader = createHotReader({
   fallbackDefault: WORKSPACE_RETENTION_DEFAULT_DAYS,
 });
 
+const previewTicketTtlHotReader = createHotReader({
+  key: PREVIEW_TICKET_TTL_KEY,
+  warnLabel: 'preview 票有效期',
+  fallbackDefault: PREVIEW_TICKET_TTL_DEFAULT_SECONDS,
+});
+
 /**
  * 丢弃 TTL 缓存（P2a 对外的名字；实现是上面那个工厂里每一格自己的 `invalidate`）。
  * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（RS-7 钉住身份），P3 抽工厂后也不能换成间接层。
@@ -950,6 +1047,11 @@ export function invalidateWorkspaceRetentionCache() {
   workspaceRetentionHotReader.invalidate();
 }
 
+/** 丢弃 `preview.ticket_ttl_seconds` 的缓存与在飞槽（口径同上；签票路径现读，写后立即生效）。 */
+export function invalidatePreviewTicketTtlCache() {
+  previewTicketTtlHotReader.invalidate();
+}
+
 /**
  * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。一格一行；加新的热读旋钮就在这里多登记一行，
  * **不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
@@ -959,6 +1061,7 @@ export function invalidateWorkspaceRetentionCache() {
 export const HOT_READ_INVALIDATORS = new Map([
   [SESSION_TTL_KEY, invalidateSessionTtlCache],
   [WORKSPACE_RETENTION_KEY, invalidateWorkspaceRetentionCache],
+  [PREVIEW_TICKET_TTL_KEY, invalidatePreviewTicketTtlCache],
 ]);
 
 /**
@@ -1024,7 +1127,12 @@ function gateRegistryValue(entry, candidate) {
 function configTierSource(entry, config) {
   const flagPath = `${entry?.configPath ?? ''}Source`;
   if (config && Object.hasOwn(config, flagPath)) {
-    return config[flagPath] === 'env' ? 'env' : 'default';
+    // #709 MED①：标注可以是三档 `env | default | db`。`applyRuntimeOverrides` 会把「启动时从
+    // DB 覆盖进来的那一格」标成 `db`。旧口径把非 `env` 一律塌成 `default` ⇒「DB 读失败、手里
+    // 只有启动时的 DB 快照」被谎报成 default/env（运维去改 env，其实值来自旧库）。如实透传三档。
+    const annotated = config[flagPath];
+    if (annotated === 'env' || annotated === 'default' || annotated === 'db') return annotated;
+    return 'default';
   }
   const value = getPath(config, entry?.configPath);
   if (value === undefined) return 'default';
@@ -1156,6 +1264,19 @@ export function readWorkspaceRetentionDays(options = {}) {
   return workspaceRetentionHotReader.read(options);
 }
 
+/**
+ * `preview.ticket_ttl_seconds` 的**热读**入口（P3 第二批；调用方是 `http.js` 签发预览票那一次）。
+ *
+ * 口径与上面两格同一套（同一工厂）：DB 有效值 > env（过闸）> registry 默认（60），
+ * 5s 缓存 + 同池在飞合并 + 写路径失效，**读侧永不抛**，一次热读最多一条 warn。
+ *
+ * @param {object} opts `{ pool, config, now?, log?, env? }`
+ * @returns {Promise<number>} 生效的票有效期秒数；三档都给不出 ⇒ `60`（绝不回 `undefined`）。
+ */
+export function readPreviewTicketTtlSeconds(options = {}) {
+  return previewTicketTtlHotReader.read(options);
+}
+
 // ---------------------------------------------------------------------------
 // 管理台读/写（`GET /api/admin/runtime-settings`、`PUT /api/admin/runtime-settings/:key`）
 // ---------------------------------------------------------------------------
@@ -1215,11 +1336,26 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
   }
   // 回落：值来自 env 那一档（或 registry 默认），`reason` 说清为什么不是 db。
   // `row` 存在但值非法 ⇒ 保留库里那行的 updated_at/by（它们是真发生过的事），只是值不用它。
+  // #709 MED①：若 `envTier.source==='db'` 且读不到行 ⇒ 这一档用的是「启动时从 DB 覆盖进来的
+  // 快照」，`reason` 必须点明用的是启动时快照，而不是谎报 env/default（否则运维会去改一个
+  // 根本不影响这个值的 env）。
+  // #709b LOW①：但「启动时快照」那一档还要再分两种，**故障与没配不能共用一个理由**：
+  //   · `fallbackReason` 是故障族（`read_failed` / `read_timeout` / `no_pool`）⇒ 真读不到
+  //     ⇒ `db_read_failed_using_boot_snapshot`（运维该去看 DB）；
+  //   · `fallbackReason==='no_row'`（SELECT 成功了、只是表里没有这一行）⇒ 那是**正常状态**
+  //     ⇒ `no_row_using_boot_snapshot`（说成「读失败」会把运维支去查一根根本没坏的连接）。
+  //   其余理由（如行在但值不可用）仍当故障族处理：不抵赖成「没配」。
+  const bootSnapshot = envTier?.source === 'db' && !row;
+  const bootSnapshotReason = fallbackReason === 'no_row'
+    ? 'no_row_using_boot_snapshot'
+    : 'db_read_failed_using_boot_snapshot';
   return withHint({
     ...base,
     value: envTier?.value,
     source: envTier?.source ?? 'default',
-    reason: row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row'),
+    reason: bootSnapshot
+      ? bootSnapshotReason
+      : (row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row')),
   }, entry);
 }
 
@@ -1270,14 +1406,29 @@ export async function listRuntimeSettingsAdmin({
     log?.warn?.('[runtime-settings] 管理台读没有可用的 pool ⇒ 各项回落 env/默认并如实标 source');
   }
   return {
-    items: entries.map((entry) => toSettingItem(
-      entry,
-      rowByKey.get(entry.key),
-      // env 那一档也要过 registry 的闸（#701 返修 LOW③）：坏 env 值 ⇒ 报 `default` + 点名 warn，
-      // 不许报一个「界面显示 env 的 30、实际却不会用这个数」的假来源。
-      resolveEnvTier(entry, config, { env, log }),
-      fallbackReason,
-    )),
+    items: entries.map((entry) => {
+      const item = toSettingItem(
+        entry,
+        rowByKey.get(entry.key),
+        // env 那一档也要过 registry 的闸（#701 返修 LOW③）：坏 env 值 ⇒ 报 `default` + 点名 warn，
+        // 不许报一个「界面显示 env 的 30、实际却不会用这个数」的假来源。
+        resolveEnvTier(entry, config, { env, log }),
+        fallbackReason,
+      );
+      // #709 MED①：报 `db` + boot snapshot 的那一档，必须在 warn 里说清手里那个数是启动时快照
+      // ——运维看到 source=db 会去找库，而不是去改 env。
+      // #709b LOW①：故障族与「没这一行」两条文案分开（后者不许说自已是读失败）。
+      if (item.source === 'db' && item.reason === 'db_read_failed_using_boot_snapshot') {
+        log?.warn?.(`[runtime-settings] ${item.key} 读不到 DB 行（${fallbackReason}）`
+          + ` ⇒ 暂用启动时的 DB 快照 ${JSON.stringify(item.value)}，source 如实报 db`
+          + '（不是 env；DB 恢复前改 env 不影响这个值）');
+      } else if (item.source === 'db' && item.reason === 'no_row_using_boot_snapshot') {
+        log?.warn?.(`[runtime-settings] ${item.key} 的 DB 查询成功、但表里没有这一行`
+          + ` ⇒ 暂用启动时的 DB 快照 ${JSON.stringify(item.value)}，source 如实报 db`
+          + '（不是 env；这一格还没人配过 = DB 没坏，要去改值请开管理台而不是查连接）');
+      }
+      return item;
+    }),
   };
 }
 

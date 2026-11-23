@@ -1257,6 +1257,138 @@ test('#247① 批量 = N 张票：每张各落一行 preview_grants、响应顺�
   }
 });
 
+test('#677 P3② 批量签票用 **DB 值**：runtime_settings 写 30 ⇒ 响应 expires_at ≈ now+30（非 60）',
+  async () => {
+    // 这一格钉的是消费者接线（http.js 签票路径现读 `preview.ticket_ttl_seconds`）。
+    // 默认 `startPortsServer` 把 config.previewTicketTtlSeconds 钉在 60；本格给 pool 包
+    // 一层，让整表读（`SELECT key, value FROM runtime_settings`）返回 DB 行 30 ⇒
+    // 签票响应 `items[].expires_at` 必须按 DB 的 30（不是启动快照 60）算。
+    const store = batchSeed();
+    const { base, aliceCookie, pool, close } = await startPortsServer({ store });
+    const origQuery = pool.query.bind(pool);
+    pool.query = async (sql, params) => {
+      if (/FROM runtime_settings/.test(String(sql))) {
+        return { rows: [{ key: 'preview.ticket_ttl_seconds', value: 30 }], rowCount: 1 };
+      }
+      return origQuery(sql, params);
+    };
+    try {
+      const ids = [batchUuid(1), batchUuid(2)];
+      // #709b LOW②：响应侧那条「按 30 算」的锚点取在**发请求之前**（`t0`）：窗口里只会含
+      // 服务端那一段（进程内假库 = 毫秒级），测试体自己在断言前磨多久都不会把 60 秒快照推进窗口。
+      const t0 = Date.now();
+      const res = await postBatch(base, aliceCookie, { allocation_ids: ids });
+      assert.equal(res.status, 201);
+      const body = await res.json();
+      assert.equal(body.items.length, 2, '两行都签成了（响应形状未变：{items:[...]}）');
+      const deltaMs = new Date(body.items[0].expires_at).getTime() - t0;
+      // 硬判据：用的是 DB 的 30，不是启动快照的 60（M-1 改回 ctx.config.* ⇒ 这里 ≈60s 红）。
+      assert.ok(deltaMs > 20_000 && deltaMs <= 31_000,
+        `expires_at 应为 t0+30s（DB 值），实得 ${Math.round(deltaMs / 1000)}s`);
+      assert.ok(deltaMs < 50_000,
+        `实得 ${Math.round(deltaMs / 1000)}s = 还在用启动快照的 60（没改成现读）`);
+      // #709 MED②：响应里的 `expires_at` 另有来源（http 循环外算的一个值），只钉响应会被
+      // 「响应 30 / 库里 60」蒙混过去 ⇒ 必须再钉落库那两行 grant 自己的 `expires_at`。
+      // #709b LOW②：钉法改成**与响应对齐**，不再是绝对时间差窗口（二审：测试体若耗时 >29s，
+      //   60 秒快照的 delta 也能落进 (20s, 31s] ⇒ 假绿）。两边本就同源：`http.js` 在循环外取
+      //   一个 `now` 并只现读一次 TTL，库内那一行（`preview.js` 用同一个 `now` + 同一个 TTL）与
+      //   响应那一个（`http.js` 用同一组数）逐字相等 ⇒ 这半边的判据与测试体耗时无关。
+      //   （M-2 变异：把这里改回绝对窗口 + 注入 +30s 偏移 ⇒ 这一格点名红。）
+      const tickets = store.grants.filter((g) => g.kind === 'ticket');
+      assert.equal(tickets.length, 2, '两行都落到库里（kind=ticket）');
+      const responseExpiresMs = new Date(body.items[0].expires_at).getTime();
+      for (const g of tickets) {
+        const driftMs = Math.abs(new Date(g.expires_at).getTime() - responseExpiresMs);
+        assert.ok(driftMs < 1_000,
+          `落库 expires_at 必须与响应 items[].expires_at 同源，实差 ${driftMs}ms`
+          + '（差 ≈30s = 库里那行还在吃启动快照的 60，响应却被钉成 30 ⇒ 两套真相）');
+      }
+    } finally {
+      pool.query = origQuery;
+      await close();
+    }
+  });
+
+// 给 pool 包一层：让热旋钮的整表读（`SELECT key, value FROM runtime_settings`）回指定的行。
+// `rows: []` = 「DB 通着、但没有那一行」（回落档的输入），不是「读失败」。
+// 返回一个还原函数：把测试自己改过的 `pool.query` 换回去（照上一格同样的包法：端口层
+// 不关心它从哪来，只要求同一个池上可换可逆）。
+function stubRuntimeSettingsRows(pool, rows) {
+  const orig = pool.query.bind(pool);
+  pool.query = async (sql, params) => (
+    /FROM runtime_settings/.test(String(sql))
+      ? { rows, rowCount: rows.length }
+      : orig(sql, params)
+  );
+  return () => { pool.query = orig; };
+}
+
+function postTicket(base, cookie, allocationId) {
+  return fetch(`${base}/api/ports/${allocationId}/preview-ticket`, {
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    body: '{}',
+  });
+}
+
+test('#677 P3②返修 单据端点用 **DB 值**：DB 写 30 ⇒ expires_in === 30、落库 expires_at ≈ now+30（非 60）',
+  async () => {
+    // 工单点名的一格。上一轮只把**批量**端点改成现读，单据端点（`POST /api/ports/:id/preview-ticket`）
+    // 仍吃启动快照 ⇒ 同一个旋钮两种行为（运维改了值，批量票变了、单据票没变）。
+    // 本格把 DB 改成 30：单据签出来的票必须按 30，不是启动快照的 60。
+    // ⚠ 单据端点的响应形状只有 `{ ticket, url, expires_in }`（**没有** `expires_at`），所以
+    //   「≈ now+30」这半边钉在**落库那行 grant 的 `expires_at`** 上——它才是票的真到期。
+    const store = batchSeed();
+    const { base, aliceCookie, pool, close } = await startPortsServer({ store });
+    const dbRows = [{ key: 'preview.ticket_ttl_seconds', value: 30 }];
+    const restore = stubRuntimeSettingsRows(pool, dbRows);
+    try {
+      const before = store.grants.length;
+      const res = await postTicket(base, aliceCookie, batchUuid(2));
+      assert.equal(res.status, 201);
+      const body = await res.json();
+      assert.deepEqual(Object.keys(body).sort(), ['expires_in', 'ticket', 'url'], '响应形状未变');
+      assert.ok(body.url.endsWith(`?preview_ticket=${body.ticket}`), 'url 与票仍对得上（没改坏别的口径）');
+      // 硬判据 ①：`expires_in` 用的是 DB 的 30，不是启动快照的 60（M-2 改回 config ⇒ 这里 60 红）。
+      assert.equal(body.expires_in, 30,
+        `expires_in 应为 DB 的 30，实得 ${body.expires_in}（= 还在吃启动快照）`);
+      const tickets = store.grants.slice(before).filter((g) => g.kind === 'ticket');
+      assert.equal(tickets.length, 1, '恰好落一行 grant');
+      // 硬判据 ②：库里 `expires_at` ≈ now+30（M-1 把现读改回快照 ⇒ 这里 ≈ 60s 红）。
+      const deltaMs = new Date(tickets[0].expires_at).getTime() - Date.now();
+      assert.ok(deltaMs > 20_000 && deltaMs <= 31_000,
+        `落库 expires_at 应为 now+30s（DB 值），实得 ${Math.round(deltaMs / 1000)}s`);
+      assert.ok(deltaMs < 50_000,
+        `实得 ${Math.round(deltaMs / 1000)}s = 单据端点还在吃启动快照的 60（没接现读）`);
+    } finally {
+      restore();
+      await close();
+    }
+  });
+
+test('#677 P3②返修 单据端点：DB 通着但**无那一行** ⇒ 回落默认 60（不是 0 / 不是 undefined）', async () => {
+  // 回落档也得钉在消费点上：热读「永不抛 + 三档兜底」的口径只有在消费点才能验到。
+  // 这一格防的是：现读接错了（或挂了）把票签成 `expires_in: 0` ⇒ 一张签出来就过期的票。
+  const store = batchSeed();
+  const { base, aliceCookie, pool, close } = await startPortsServer({ store });
+  const restore = stubRuntimeSettingsRows(pool, []);
+  try {
+    const before = store.grants.length;
+    const res = await postTicket(base, aliceCookie, batchUuid(3));
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(body.expires_in, 60, 'DB 无行 ⇒ 回落 env/默认档 60');
+    const grant = store.grants.slice(before).filter((g) => g.kind === 'ticket')[0];
+    assert.ok(grant, '仍然签成了票（回落不等于拒绝签发）');
+    const deltaMs = new Date(grant.expires_at).getTime() - Date.now();
+    assert.ok(deltaMs > 50_000 && deltaMs <= 60_000,
+      `回落应为 now+60s，实得 ${Math.round(deltaMs / 1000)}s`);
+  } finally {
+    restore();
+    await close();
+  }
+});
+
 test('#247② 越界（别人的 / 未知的 / 已 released）⇒ 404 not_found 且一张都不签（零残票、零审计、同一句响应）', async () => {
   const store = batchSeed({
     extraRows: [
