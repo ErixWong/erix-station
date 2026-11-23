@@ -26,6 +26,7 @@ import {
   generateAutoTitle,
 } from '../src/session-title.js';
 import { createSession, updateSession, postMessage, AI_TITLE_SYSTEM_PROMPT, AI_TITLE_MAX_TOKENS } from '../src/sessions.js';
+import { invalidateAutoTitleMinNewCache } from '../src/runtime-settings.js';
 import { buildAutoTitlePrompt, TITLE_SYSTEM_PROMPT } from '../src/title-llm.js';
 import { LLM_CHAT_DEFAULT_MAX_TOKENS } from '../src/llm-chat.js';
 import { createSessionTextHandler, inputTranscriptRow, engineTranscriptRow } from './fake-session-text.js';
@@ -496,7 +497,8 @@ test('issue #114：并发抢占（UPDATE 命中 0 行）→ 不回调（安静�
 const CFG = { sessionAutoTitle: true, sessionAutoTitleMinNew: 3 };
 
 /** 可编排 fake pool：一张 chat_sessions 行 + messages 数组（+ 可选的 FDE 活绑定，#322 自动生成用）。 */
-function titlePool({ session = {}, messages = [], transcriptRows = [], binding = null } = {}) {
+function titlePool({ session = {}, messages = [], transcriptRows = [], binding = null,
+  runtimeRows = [] } = {}) {
   const queries = [];
   const sess = {
     id: 's1', user_id: 'u1', title: '', title_source: 'auto', cwd: '~/projects/demo',
@@ -531,6 +533,11 @@ function titlePool({ session = {}, messages = [], transcriptRows = [], binding =
       // `return { rows: [] }` 就是「没有活绑定」的自然形态。
       if (sql.includes('FROM fde_llm_bindings')) {
         return { rows: binding ? [binding] : [] };
+      }
+      if (sql.includes('FROM runtime_settings')) {
+        // #677 P3 第三批：evaluateAutoTitle 现读 `session.auto_title_min_new` 热旋钮会发这一次整表读；
+        // 缺省空行 ⇒ 回落 config/默认（与真实库无这行同形）。
+        return { rows: runtimeRows };
       }
       if (sql.startsWith('UPDATE chat_sessions')) {
         // 模拟 DB 守卫：UPDATE 只写 title_source='auto' 的行
@@ -610,6 +617,39 @@ test('evaluateAutoTitle：manual 行绝不覆盖（并发手工 PATCH 语义）'
   assert.equal(title, null);
   assert.equal(pool.updates.length, 0, 'manual 行零 UPDATE');
 });
+
+test('evaluateAutoTitle：minNew 现读热旋钮——DB 行降低阈值 ⇒ 本轮就刷新（M-1 改回快照 ⇒ 这一格红）',
+  async () => {
+    // 同一组消息（新 user 轮=2，与现标题关键词重叠⇒漂移启发式不触发），只改 DB 里的
+    // `session.auto_title_min_new`：无行时走 config 的 3 ⇒ 2<3 不刷新；DB 写 2 ⇒ 2>=2 刷新。
+    // ⇒ “下一轮评估用新值”必须由现读实现；若消费者退回启动快照（只读 config=3）⇒ 两路
+    //   都返回 null ⇒ 第二断言红。
+    invalidateAutoTitleMinNewCache();
+    const session = { title: '修复登录 bug', title_source: 'auto', auto_title_seq: 10, last_seq: 12 };
+    const msgs = [
+      { role: 'user', content: '登录页面又白屏了', seq: 11 },
+      { role: 'user', content: '登录还是不对', seq: 12 },
+    ];
+    // ① 库里没这行 ⇒ config 快照 3 ⇒ 2<3 防抖不刷新 ⇒ 返回 null、零 UPDATE。
+    const poolA = titlePool({ session, messages: msgs });
+    const titleA = await evaluateAutoTitle(poolA, {
+      sessionId: 's1', config: CFG, log: { warn() {}, info() {} },
+    });
+    assert.equal(titleA, null, 'minNew=3 时 2 轮新消息不够阈值 ⇒ 不刷新');
+    assert.equal(poolA.updates.length, 0, '未达阈值 ⇒ 零 UPDATE');
+    // ② 库里写了 min_new=2 ⇒ 2>=2 刷新 ⇒ 降级链落库（无活绑定⇒首条用户消息截断）。
+    invalidateAutoTitleMinNewCache();
+    const poolB = titlePool({
+      session, messages: msgs,
+      runtimeRows: [{ key: 'session.auto_title_min_new', value: 2 }],
+    });
+    const titleB = await evaluateAutoTitle(poolB, {
+      sessionId: 's1', config: CFG, log: { warn() {}, info() {} },
+    });
+    assert.ok(titleB, 'DB 把阈值降到 2 ⇒ 本轮就刷新（现读生效，不是启动快照）');
+    assert.equal(poolB.updates.length, 1, '刷新⇒恰好一条 UPDATE');
+    invalidateAutoTitleMinNewCache();
+  });
 
 test('evaluateAutoTitle：UPDATE 命中 0 行（评估期间被改 manual）→ 安静放弃、不推 SSE', async () => {
   // 模拟竞态：SELECT 时还是 auto，UPDATE 时被并发 PATCH 置 manual → rowCount=0。

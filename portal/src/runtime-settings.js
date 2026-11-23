@@ -45,15 +45,17 @@
 //
 // P1 的边界（别在代码里假装已完成，判据在 `portal/test/runtime-settings.test.js`）：
 //   * `RUNTIME_SETTING_REGISTRY` 自 **P2a** 起有**第一格** `session.ttl_seconds`，自 **P3 第一批**起
-//     有**第二格** `workspace.retention_days`（其余旋钮仍逐批填；判据 RS-7 钉住「只有这两格」，
-//     顺手多迁一格当场红）。
+//     有**第二格** `workspace.retention_days`，**P3 第二批**加**第三格** `preview.ticket_ttl_seconds`，
+//     **P3 第三批**加**第四格** `session.auto_title_min_new`（其余旋钮仍逐批填；判据 RS-7 钉住
+//     「只有这四格」，顺手多迁一格当场红）。
 //     ⇒ `applyRuntimeOverrides` 在真机上从此**每次 `serve()` 发一次读**（不再是零 SQL），
 //     启动路径的那一次是**整表一次**、不是每 key 一次（第 3 条）。
 //   * HTTP 端点（`GET/PUT /api/admin/runtime-settings`）自 **P2a** 起在 `http.js`（形状在下面的
 //     `listRuntimeSettingsAdmin` / `updateRuntimeSettingAdmin`，http 层只做匹配 + 鉴权 + 转发）。
 //   * 热读：P2a 只有 `readSessionTtlSeconds` 一格；**P3 第一批**把它那套机件（5s 缓存 + 代际号
 //     + 同池在飞合并 + 写路径失效 + env 过闸 + 一次热读只一条 warn + 永不抛）抽成了
-//     `createHotReader`，于是 `readWorkspaceRetentionDays` 是同一工厂的第二份实例。
+//     `createHotReader`，于是 `readWorkspaceRetentionDays` 是同一工厂的第二份实例，
+//     `readPreviewTicketTtlSeconds` / `readAutoTitleMinNew` 是第三、第四份实例。
 //     拓新格只需：registry 加一格 + `createHotReader({...})` 一行 + `HOT_READ_INVALIDATORS` 登记一行
 //     + 消费者把启动期 `config.X` 换成现读（判据 RS-23~RS-28）。
 //   * 迁移 0046 建表；接线在 `cli.js` 的 `serve()`（`migrate()` 之后、`createServer` 之前，
@@ -314,6 +316,78 @@ export function validatePreviewTicketTtlSeconds(value) {
   return true;
 }
 
+// --- session.auto_title_min_new 专用闸（P3 第三批：自动标题防抖阈值进 DB） ----------------
+// 语义：一次自动标题刷新要求「距上次自动更新至少 N 轮新用户消息」，是**每次评估标题时**用的
+// 防抖阈值（消费者 `session-title.js` 的 `evaluateAutoTitle()`）。区间自己定 `1..100`，理由：
+//   * 下界 1：`1` = 每轮新 user 消息都刷新（最敏感）；`0` 会绕过防抖、每拍都重算标题、白烧
+//     token，且和 `shouldRefreshTitle` 里「首条（auto_title_seq 为 NULL）必生成」的语义叠成
+//     歧义 ⇒ 与预览票的「0 = 签出来即过期」同理，这里的 0 只会造成困惑，不是有效值。
+//   * 上界 100：这是「会话轮数」启发式的阈值，不是时长；100 轮已足够把自动改名压到近乎关
+//     （真到那个量级该直接 `ERIX_SESSION_AUTO_TITLE=0` 关掉），再大只是把「几乎不刷」写成一个大
+//     数，没有产品意义。默认 3 与 `config.js:327` 的 `intEnv(..., 'ERIX_SESSION_AUTO_TITLE_MIN_NEW', 3)`
+//     及 `session-title.js` 的 `AUTO_TITLE_DEFAULT_MIN_NEW` **三处同源**。
+export const AUTO_TITLE_MIN_NEW_KEY = 'session.auto_title_min_new';
+export const AUTO_TITLE_MIN_NEW_MIN = 1;
+export const AUTO_TITLE_MIN_NEW_MAX = 100; // 见上：100 轮已近乎「不自动刷」，再大只是数字更大
+// 默认与 config.js 的 `sessionAutoTitleMinNew`（intEnv 兜底 3）同源。
+export const AUTO_TITLE_MIN_NEW_DEFAULT = 3;
+export const AUTO_TITLE_MIN_NEW_HINT =
+  '自动标题刷新的防抖阈值：距上次自动更新至少 N 轮新用户消息才刷新；1..100（默认 3）';
+
+/**
+ * 严格十进制正整数（形状口径同上面三格：只认 `/^[0-9]+$/` 的非负整数字面，再要求区间内）。
+ * 非法输入一律 `{ ok: false, reason }`，绝不返回 NaN，也绝不用 `Number()`/`parseInt()` 了事。
+ */
+export function parseAutoTitleMinNew(raw) {
+  let text;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw)) {
+      return { ok: false, reason: 'not_a_auto_title_min_new' };
+    }
+    text = String(raw);
+  } else if (typeof raw === 'string') {
+    text = raw;
+  } else {
+    return { ok: false, reason: 'not_a_auto_title_min_new' };
+  }
+  // 只认纯十进制数字：`'1e2'`、`' 3 '`、`'+2'`、`'3.0'`、空串、`'-1'` 全部在这一步挡掉。
+  if (!/^[0-9]+$/.test(text)) {
+    return { ok: false, reason: 'not_a_auto_title_min_new' };
+  }
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) {
+    return { ok: false, reason: 'not_a_auto_title_min_new' };
+  }
+  // 形状闸也把区间兑一下（与前三格同形：parse 与 validate 两道都过一遍区间）。
+  // 下界 1 ⇒ `0` 在这一层被拒（reason 归 `out_of_range`，不是 `not_a_...`）。上界同。
+  if (value < AUTO_TITLE_MIN_NEW_MIN || value > AUTO_TITLE_MIN_NEW_MAX) {
+    return { ok: false, reason: 'auto_title_min_new_out_of_range' };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * 管理台写入前的取值闸：返回 `true` 或一句给人看的中文原因。
+ *
+ * ⚠ `1e2` 的两侧之分（照 #709 裁定）：写侧接受任何合法 JSON number（`1e2` 塌成 `100` ⇒ 区间内
+ * 放行、库里落 100）；只有字符串 `"1e2"` 走 parse 的正则支被拒 ⇒ env 侧 `1e2` 视为没给、回落默认。
+ */
+export function validateAutoTitleMinNew(value) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    return `必须是 ${AUTO_TITLE_MIN_NEW_MIN}–${AUTO_TITLE_MIN_NEW_MAX}`
+      + ' 的整数轮（不接受字符串、小数、布尔）';
+  }
+  if (value < AUTO_TITLE_MIN_NEW_MIN) {
+    return `不能是 ${value}（防抖阈值至少 ${AUTO_TITLE_MIN_NEW_MIN} 轮；`
+      + '0 轮 = 每拍重算标题、白烧 token）';
+  }
+  if (value > AUTO_TITLE_MIN_NEW_MAX) {
+    return `必须在 ${AUTO_TITLE_MIN_NEW_MIN}–${AUTO_TITLE_MIN_NEW_MAX} 轮之间` +
+      `（1 轮 ~ 100 轮；再大请直接用 ERIX_SESSION_AUTO_TITLE=0 关掉自动标题）`;
+  }
+  return true;
+}
+
 export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
@@ -346,6 +420,17 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parsePreviewTicketTtlSeconds,
     validate: validatePreviewTicketTtlSeconds,
     hint: PREVIEW_TICKET_TTL_HINT,
+  }),
+  [AUTO_TITLE_MIN_NEW_KEY]: Object.freeze({
+    key: AUTO_TITLE_MIN_NEW_KEY,
+    label: '自动标题刷新防抖阈值（轮）',
+    configPath: 'sessionAutoTitleMinNew',
+    envVar: 'ERIX_SESSION_AUTO_TITLE_MIN_NEW',
+    defaultValue: AUTO_TITLE_MIN_NEW_DEFAULT,
+    applyMode: 'hot',
+    parse: parseAutoTitleMinNew,
+    validate: validateAutoTitleMinNew,
+    hint: AUTO_TITLE_MIN_NEW_HINT,
   }),
 });
 
@@ -1034,6 +1119,12 @@ const previewTicketTtlHotReader = createHotReader({
   fallbackDefault: PREVIEW_TICKET_TTL_DEFAULT_SECONDS,
 });
 
+const autoTitleMinNewHotReader = createHotReader({
+  key: AUTO_TITLE_MIN_NEW_KEY,
+  warnLabel: '自动标题防抖阈值',
+  fallbackDefault: AUTO_TITLE_MIN_NEW_DEFAULT,
+});
+
 /**
  * 丢弃 TTL 缓存（P2a 对外的名字；实现是上面那个工厂里每一格自己的 `invalidate`）。
  * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（RS-7 钉住身份），P3 抽工厂后也不能换成间接层。
@@ -1052,6 +1143,11 @@ export function invalidatePreviewTicketTtlCache() {
   previewTicketTtlHotReader.invalidate();
 }
 
+/** 丢弃 `session.auto_title_min_new` 的缓存与在飞槽（口径同上；每次评估标题现读，写后立即生效）。 */
+export function invalidateAutoTitleMinNewCache() {
+  autoTitleMinNewHotReader.invalidate();
+}
+
 /**
  * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。一格一行；加新的热读旋钮就在这里多登记一行，
  * **不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
@@ -1062,6 +1158,7 @@ export const HOT_READ_INVALIDATORS = new Map([
   [SESSION_TTL_KEY, invalidateSessionTtlCache],
   [WORKSPACE_RETENTION_KEY, invalidateWorkspaceRetentionCache],
   [PREVIEW_TICKET_TTL_KEY, invalidatePreviewTicketTtlCache],
+  [AUTO_TITLE_MIN_NEW_KEY, invalidateAutoTitleMinNewCache],
 ]);
 
 /**
@@ -1275,6 +1372,21 @@ export function readWorkspaceRetentionDays(options = {}) {
  */
 export function readPreviewTicketTtlSeconds(options = {}) {
   return previewTicketTtlHotReader.read(options);
+}
+
+/**
+ * `session.auto_title_min_new` 的**热读**入口（P3 第三批；调用方是 `session-title.js` 的
+ * `evaluateAutoTitle()`，每次评估自动标题那一次）。
+ *
+ * 口径与上面三格同一套（同一工厂）：DB 有效值 > env（过闸）> registry 默认（3），
+ * 5s 缓存 + 同池在飞合并 + 写路径失效，**读侧永不抛**，一次热读最多一条 warn。评估自动标题
+ * 本就是「一轮一次」的低频动作，5s 缓存下同进程不会为它多打 DB。
+ *
+ * @param {object} opts `{ pool, config, now?, log?, env? }`
+ * @returns {Promise<number>} 生效的防抖阈值（轮）；三档都给不出 ⇒ `3`（绝不回 `undefined`）。
+ */
+export function readAutoTitleMinNew(options = {}) {
+  return autoTitleMinNewHotReader.read(options);
 }
 
 // ---------------------------------------------------------------------------

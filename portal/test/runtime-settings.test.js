@@ -50,6 +50,9 @@ import {
   PREVIEW_TICKET_TTL_KEY, PREVIEW_TICKET_TTL_MIN_SECONDS, PREVIEW_TICKET_TTL_MAX_SECONDS,
   PREVIEW_TICKET_TTL_DEFAULT_SECONDS, parsePreviewTicketTtlSeconds, validatePreviewTicketTtlSeconds,
   readPreviewTicketTtlSeconds, invalidatePreviewTicketTtlCache,
+  AUTO_TITLE_MIN_NEW_KEY, AUTO_TITLE_MIN_NEW_MIN, AUTO_TITLE_MIN_NEW_MAX,
+  AUTO_TITLE_MIN_NEW_DEFAULT, parseAutoTitleMinNew, validateAutoTitleMinNew,
+  readAutoTitleMinNew, invalidateAutoTitleMinNewCache,
 } from '../src/runtime-settings.js';
 import { loadConfig } from '../src/config.js';
 
@@ -583,13 +586,15 @@ test('RS-6b 审计被抑制 ⇒ 抛 500 且**设置没落库**（检查在 COMMI
 // 4. P1 的边界：一格未迁、迁移形状、serve() 接线、超时旋钮
 // ---------------------------------------------------------------------------
 
-test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_days + preview.ticket_ttl_seconds', async () => {
+test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_days'
+  + ' + preview.ticket_ttl_seconds + session.auto_title_min_new', async () => {
   // P1 时这一格钉的是「registry 是空对象」；P2a 迁了第一格 ⇒ 判据改成「只迁了这一格」；
-  // P3 第一批迁了第二格，P3 第二批迁了第三格 ⇒ 判据改成「就这三格，不多不少」。
+  // P3 第一/二/三批各迁一格 ⇒ 判据改成「就这四格，不多不少」。
   // 它红了的读法不变：有人顺手多迁了一格（或把热读口径弄丢了）。
   assert.deepEqual(Object.keys(RUNTIME_SETTING_REGISTRY),
-    ['session.ttl_seconds', 'workspace.retention_days', 'preview.ticket_ttl_seconds'],
-    'P3 只许迁这三格（其余旋钮逐批填）');
+    ['session.ttl_seconds', 'workspace.retention_days', 'preview.ticket_ttl_seconds',
+      'session.auto_title_min_new'],
+    'P3 只许迁这四格（其余旋钮逐批填）');
   assert.ok(Object.isFrozen(RUNTIME_SETTING_REGISTRY), 'registry 必须冻结（运行期没人能塞旋钮进来）');
   const entry = RUNTIME_SETTING_REGISTRY['session.ttl_seconds'];
   assert.ok(Object.isFrozen(entry), '条目也必须冻结');
@@ -646,7 +651,14 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   assert.notEqual(HOT_READ_INVALIDATORS.get(WORKSPACE_RETENTION_KEY),
     HOT_READ_INVALIDATORS.get(SESSION_TTL_KEY),
     '两格各有各的缓存 ⇒ 各有各的失效函数（共用一个就是「保存 TTL 把保留天数也抹了」）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 3, '登记表里就是三格（热读旋钮数 = 失效钩子数）');
+  // 第四格（P3 第三批）：同一套口径，失效钩子也必须是导出的那一个函数本身（漏登记 = 保存后本进程
+  // 还要吃旧值）；与其余格各有各的缓存、各有各的失效函数。
+  assert.equal(HOT_READ_INVALIDATORS.get(AUTO_TITLE_MIN_NEW_KEY), invalidateAutoTitleMinNewCache,
+    '第四格也必须登记失效钩子，否则管理台保存完下一轮评估标题还是拿旧值');
+  assert.notEqual(HOT_READ_INVALIDATORS.get(AUTO_TITLE_MIN_NEW_KEY),
+    HOT_READ_INVALIDATORS.get(PREVIEW_TICKET_TTL_KEY),
+    '第四格不许共用第三格的失效函数（保存标题阈值不该抹掉预览票缓存）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 4, '登记表里就是四格（热读旋钮数 = 失效钩子数）');
 
   assert.equal(isKnownSetting('demo.limit'), false, '真实 registry 里没有 demo.limit');
   assert.equal(isKnownSetting('constructor'), false,
@@ -1156,8 +1168,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   const fromDb = await listRuntimeSettingsAdmin({
     pool: dbPool, config: CONFIG_ENV, env: {}, log: silentLog,
   });
-  // 三格旋钮 ⇒ 三份 items（P3 第二批把第三格迁进来后这个数就是 3；多一格就红 = 顺手多迁）。
-  assert.equal(fromDb.items.length, 3);
+  assert.equal(fromDb.items.length, 4);
   assert.deepEqual(Object.keys(fromDb.items[0]).sort(),
     ['applyMode', 'key', 'label', 'reason', 'source', 'updatedAt', 'updatedBy', 'value'].sort());
   assert.deepEqual(fromDb.items[0], {
@@ -1182,6 +1193,13 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   assert.equal(ttlItem.value, 60, 'env 也没给 ⇒ 默认 60（与 config.js 同源）');
   assert.equal(ttlItem.applyMode, 'hot', '预览票也是热生效旋钮');
 
+  // ①d 第四格（session.auto_title_min_new）：库里没它的行 ⇒ 如实报默认 3（不被别的格带着写）。
+  const atItem = fromDb.items.find((i) => i.key === AUTO_TITLE_MIN_NEW_KEY);
+  assert.ok(atItem, '第四格必须出现在管理台响应里（列表驱动，不列出来 = 没迁）');
+  assert.equal(atItem.source, 'default');
+  assert.equal(atItem.value, 3, 'env 也没给 ⇒ 默认 3（与 config.js / session-title.js 同源）');
+  assert.equal(atItem.applyMode, 'hot', '自动标题阈值也是热生效旋钮');
+
   // ② env：库里没行，且 env 显式给了值 ⇒ source=env、值就是 config 里那个。
   const fromEnv = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: CONFIG_ENV, log: silentLog });
   assert.deepEqual(fromEnv.items[0].source, 'env');
@@ -1203,7 +1221,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     pool: ttlPool({ throwOnSelect: Object.assign(new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
     config: CONFIG_ENV, log: deadLog,
   });
-  assert.equal(dead.items.length, 3, '读失败时三格都要给得出来（不是只给前几格）');
+  assert.equal(dead.items.length, 4, '读失败时四格都要给得出来（不是只给前几格）');
   assert.equal(dead.items[0].source, 'env');
   assert.equal(dead.items[0].reason, 'read_failed');
   assert.equal(deadLog.seen.warn.length, 1, '有人在屏幕前等答案 ⇒ 读失败要 warn（不像启动路径只能 debug）');
@@ -2204,7 +2222,7 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   // GET 两格：登记了的那格原样带出，没登记的那格**不许**出现这个键（缺席 ≠ null ≠ 空串）。
   const cfg = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
   const list = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: cfg, env: {}, log: silentLog });
-  assert.equal(list.items.length, 3);
+  assert.equal(list.items.length, 4);
   const retItem = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
   assert.equal(retItem.hint, WORKSPACE_RETENTION_HINT,
     'DTO 必须逐字透出 registry 那句话（前端自己另写一份 = 第二份真相）');
@@ -2213,6 +2231,9 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   // 第三格也登记了 hint ⇒ DTO 必须逐字透出（否则管理台看不到范围提示）。
   assert.equal(list.items.find((i) => i.key === 'preview.ticket_ttl_seconds').hint,
     '一次预览票从签出到过期的秒数；1..3600（默认 60）');
+  // 第四格也登记了 hint ⇒ DTO 逐字透出（防抖阈值的 1..100 不写在行面上会被误填）。
+  assert.equal(list.items.find((i) => i.key === AUTO_TITLE_MIN_NEW_KEY).hint,
+    '自动标题刷新的防抖阈值：距上次自动更新至少 N 轮新用户消息才刷新；1..100（默认 3）');
 
   // 回落那一档也带（表不存在时界面更要看得见这句：那一档下 0 同样是「不自动清理」）。
   const dead = await listRuntimeSettingsAdmin({
@@ -2788,4 +2809,367 @@ test('#709b LOW① 查询成功 + 无那一行 ⇒ reason 不是读失败（no_r
     });
     assert.equal(envItems.find((i) => i.key === PREVIEW_TICKET_TTL_KEY).reason, 'no_row',
       'env 那一档的 reason 逐字不变（LOW① 只动 boot snapshot 那一档的分叉）');
+  });
+
+// ---------------------------------------------------------------------------
+// 10. P3 第三批：第四格真实旋钮 `session.auto_title_min_new`（#677）。
+// ---------------------------------------------------------------------------
+
+// env/config 那一档的固定值：5（与默认 3 拉开距离，才能验「回落用的是哪一档」）。
+const ATCFG = { sessionAutoTitleMinNew: 5, sessionAutoTitleMinNewSource: 'env' };
+
+test('RS-40 session.auto_title_min_new 的解析与校验：严格十进制正整数 + 区间 1..100', () => {
+  assert.equal(AUTO_TITLE_MIN_NEW_MIN, 1);
+  assert.equal(AUTO_TITLE_MIN_NEW_MAX, 100);
+  assert.equal(AUTO_TITLE_MIN_NEW_DEFAULT, 3, '与 config.js 同源');
+  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).sessionAutoTitleMinNew,
+    AUTO_TITLE_MIN_NEW_DEFAULT, 'registry 默认必须等于 loadConfig 干净 env 算出的数');
+
+  for (const good of [1, 3, 100, '1', '3', '100', '003']) {
+    const r = parseAutoTitleMinNew(good);
+    assert.equal(r.ok, true, `${JSON.stringify(good)} 必须收`);
+    assert.equal(r.value, Number(good));
+  }
+  for (const bad of [
+    '1e2', ' 3 ', '3x', '', '0x10', '2.5', '6e2', '0', '-1', '-3', '101', '+2',
+    0, -1, 2.5, 101, Number.NaN, Number.POSITIVE_INFINITY, 1e21,
+    true, false, null, undefined, {}, [], ['3'],
+  ]) {
+    assert.equal(parseAutoTitleMinNew(bad).ok, false,
+      `${JSON.stringify(bad) ?? String(bad)} 必须拒`);
+  }
+  // 0 是「每拍重算标题」的非法值（与保留天数那格的 0-有效相反）；上界外是 out_of_range。
+  assert.equal(parseAutoTitleMinNew(0).reason, 'auto_title_min_new_out_of_range',
+    '0 是合法数字但区间外 ⇒ out_of_range（不是 not_a_...）');
+  assert.equal(parseAutoTitleMinNew(101).reason, 'auto_title_min_new_out_of_range');
+  assert.equal(parseAutoTitleMinNew('1e2').reason, 'not_a_auto_title_min_new');
+  assert.equal(parseAutoTitleMinNew(' 3 ').reason, 'not_a_auto_title_min_new',
+    '带空白的串必须拒（Number() 会收成 3，那是第二套真相）');
+  assert.equal(parseAutoTitleMinNew('+2').ok, false, '带符号的串必须拒');
+
+  for (const good of [1, 3, 100]) {
+    assert.equal(validateAutoTitleMinNew(good), true, `${good} 必须放行`);
+  }
+  for (const bad of ['3', '', '100', 0, -1, 101, 2.5, true, null, {}, [], Number.NaN]) {
+    const why = validateAutoTitleMinNew(bad);
+    assert.notEqual(why, true, `${JSON.stringify(bad) ?? String(bad)} 写侧必须拒`);
+    assert.equal(typeof why, 'string', '拒绝必须返回点名的原因字符串');
+  }
+  // 上界与下界的拒绝要能说清是哪个数（M-3：去掉 validate 上界 ⇒ 这一条红）。
+  assert.match(String(validateAutoTitleMinNew(101)), /100/);
+  assert.match(String(validateAutoTitleMinNew(0)), /1/);
+});
+
+test('RS-40b 写侧的 1e2 两侧之分：JSON number 1e2 收并规整成 100，字符串 "1e2" 仍拒', async () => {
+  const num = parseAutoTitleMinNew(1e2);
+  assert.equal(num.ok, true, 'number 1e2（=100）必须收（写侧接受任何合法 JSON number）');
+  assert.equal(num.value, 100, '1e2 必须规整成 100');
+  assert.equal(validateAutoTitleMinNew(1e2), true, 'validate 也放行 number 1e2');
+  assert.equal(parseAutoTitleMinNew('1e2').ok, false, '字符串 "1e2" 必须判非法');
+  assert.notEqual(validateAutoTitleMinNew('1e2'), true, '写侧 validate 必须拒字符串 "1e2"');
+  invalidateAutoTitleMinNewCache();
+  const pool = new FakeRuntimePool();
+  const saved = await saveRuntimeSetting({
+    pool, actorId: ACTOR, key: AUTO_TITLE_MIN_NEW_KEY, value: 1e2, log: silentLog,
+  });
+  assert.equal(saved.value, 100, 'DTO 值必须是 100（RETURNING 真相）');
+  assert.equal(pool.storedValue(AUTO_TITLE_MIN_NEW_KEY), 100, '库里真的是 100');
+  const pool2 = new FakeRuntimePool();
+  const err = await saveRuntimeSetting({
+    pool: pool2, actorId: ACTOR, key: AUTO_TITLE_MIN_NEW_KEY, value: '1e2', log: silentLog,
+  }).then(() => null, (e) => e);
+  assert.ok(err instanceof RuntimeSettingsError, '字符串 "1e2" 必须抛 RuntimeSettingsError');
+  assert.equal(err.code, 'validation_failed', '字符串 "1e2" ⇒ validation_failed（HTTP 400）');
+  assert.equal(err.httpStatus, 400, '必须映射成 400');
+  assert.equal(pool2.queryCount, 0, '字符串校验在发 SQL 之前 ⇒ 零 SQL');
+  invalidateAutoTitleMinNewCache();
+});
+
+test('RS-41 第四格热读三档：DB > env（过闸）> 默认 3；任何一档坏了都绝不抛', async () => {
+  invalidateAutoTitleMinNewCache();
+  const dbPool = ttlPool({ rows: [{ key: AUTO_TITLE_MIN_NEW_KEY, value: 8 }] });
+  assert.equal(await readAutoTitleMinNew({
+    pool: dbPool, config: ATCFG, env: {}, log: silentLog,
+  }), 8);
+  assert.equal(dbPool.queryCount, 1, '确实发了那次读');
+
+  // 库里非法值 ⇒ 回落 env 5，点名 warn 一次。
+  invalidateAutoTitleMinNewCache();
+  const log = collectingLog();
+  assert.equal(await readAutoTitleMinNew({
+    pool: ttlPool({ rows: [{ key: AUTO_TITLE_MIN_NEW_KEY, value: '1e2' }] }),
+    config: ATCFG, env: {}, log,
+  }), 5);
+  assert.equal(log.seen.warn.length, 1, `恰好一条（实得 ${JSON.stringify(log.seen.warn)}）`);
+  assert.match(log.seen.warn[0], new RegExp(AUTO_TITLE_MIN_NEW_KEY.replace(/\./g, '\\.')),
+    'warn 要点名是哪个 key');
+
+  // 库里没行 ⇒ env 5，不 warn。
+  invalidateAutoTitleMinNewCache();
+  const log2 = collectingLog();
+  assert.equal(await readAutoTitleMinNew({
+    pool: ttlPool(), config: ATCFG, env: {}, log: log2,
+  }), 5);
+  assert.deepEqual(log2.seen.warn, [], '没有行不是故障，不许刷屏');
+
+  // 表不存在 ⇒ 回落 env，绝不抛。
+  invalidateAutoTitleMinNewCache();
+  assert.equal(await readAutoTitleMinNew({
+    pool: ttlPool({ throwOnSelect: Object.assign(new Error('no such table'), { code: '42P01' }) }),
+    config: ATCFG, env: {}, log: silentLog,
+  }), 5);
+
+  // 连 pool 都没有 ⇒ 回落 env，不抛。
+  invalidateAutoTitleMinNewCache();
+  assert.equal(await readAutoTitleMinNew({
+    pool: null, config: ATCFG, env: {}, log: silentLog,
+  }), 5);
+
+  // 三档全空 ⇒ 默认 3，绝不 undefined。
+  invalidateAutoTitleMinNewCache();
+  const none = await readAutoTitleMinNew({
+    pool: ttlPool(), config: {}, env: {}, log: silentLog,
+  });
+  assert.equal(none, AUTO_TITLE_MIN_NEW_DEFAULT);
+  assert.notEqual(none, undefined, 'undefined 交给防抖比较就是 NaN');
+
+  // 读挂住 ⇒ 按时给答案（timeoutMs 注入）。
+  invalidateAutoTitleMinNewCache();
+  assert.equal(await readAutoTitleMinNew({
+    pool: ttlPool({ hang: true }), config: ATCFG, env: {}, log: silentLog, timeoutMs: 30,
+  }), 5);
+
+  // env 越界（config.js 的 intEnv 收得下 101，registry 不收）⇒ 回落默认 3，点名档与理由。
+  invalidateAutoTitleMinNewCache();
+  const overLog = collectingLog();
+  assert.equal(await readAutoTitleMinNew({
+    pool: ttlPool(),
+    config: { sessionAutoTitleMinNew: 101, sessionAutoTitleMinNewSource: 'env' },
+    env: {}, log: overLog,
+  }), 3, '越界 ⇒ 回落默认 3（不是 101，也不是 undefined）');
+  assert.ok(overLog.seen.warn.some((m) => m.includes('config.sessionAutoTitleMinNew')
+    && m.includes('auto_title_min_new_out_of_range')),
+    `要点名是哪一档、为什么（实得 ${JSON.stringify(overLog.seen.warn)}）`);
+
+  // 本格有行不许让另一格凭空读数（同一张表；各格独立）。
+  invalidateAutoTitleMinNewCache();
+  invalidatePreviewTicketTtlCache();
+  const mixed = ttlPool({ rows: [{ key: AUTO_TITLE_MIN_NEW_KEY, value: 8 }] });
+  assert.equal(await readAutoTitleMinNew({
+    pool: mixed, config: ATCFG, env: {}, log: silentLog,
+  }), 8);
+  invalidatePreviewTicketTtlCache();
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: mixed, config: PCFG, env: {}, log: silentLog,
+  }), 45, '标题阈值那格有行不许让预览票那格凭空读出一个数');
+  invalidateAutoTitleMinNewCache();
+  invalidatePreviewTicketTtlCache();
+});
+
+test('RS-42 第四格缓存：同池 5s 内命中不发 SQL、过期重读、换池不串、本格不被另格顶掉',
+  async () => {
+    invalidateAutoTitleMinNewCache();
+    const pool = ttlPool({ rows: [{ key: AUTO_TITLE_MIN_NEW_KEY, value: 8 }] });
+    let clock = 4_000_000;
+    const now = () => clock;
+    const read = () => readAutoTitleMinNew({
+      pool, config: ATCFG, env: {}, now, log: silentLog,
+    });
+    assert.equal(await read(), 8);
+    assert.equal(pool.queryCount, 1);
+    clock += HOT_READ_CACHE_TTL_MS;
+    assert.equal(await read(), 8);
+    assert.equal(pool.queryCount, 1, '5s 内命中 ⇒ 不发第二条 SQL');
+    pool.rows = [{ key: AUTO_TITLE_MIN_NEW_KEY, value: 2 }];
+    clock += 1;
+    assert.equal(await read(), 2, '过期后必须重读');
+    assert.equal(pool.queryCount, 2);
+    const other = ttlPool({ rows: [{ key: AUTO_TITLE_MIN_NEW_KEY, value: 6 }] });
+    assert.equal(await readAutoTitleMinNew({
+      pool: other, config: ATCFG, env: {}, now, log: silentLog,
+    }), 6, 'B 池必须自己读');
+    assert.equal(other.queryCount, 1);
+    // 本格缓存不被别格的读顶掉（各格各一份工厂状态）。
+    assert.equal(await read(), 2);
+    const before = pool.queryCount;
+    invalidatePreviewTicketTtlCache();
+    await readPreviewTicketTtlSeconds({ pool, config: PCFG, env: {}, now, log: silentLog });
+    assert.equal(await read(), 2);
+    assert.equal(pool.queryCount, before + 1,
+      '只有预览票那格该发 SQL（+2 = 本格缓存被预览票顶掉了）');
+    invalidateAutoTitleMinNewCache();
+  });
+
+test('RS-43 第四格保存后立即失效：PUT 完下一次评估就是新值（M-2 去登记 ⇒ 这一格红）',
+  async () => {
+    invalidateAutoTitleMinNewCache();
+    const pool = new FakeRuntimePool();
+    assert.equal(await readAutoTitleMinNew({
+      pool, config: ATCFG, env: {}, log: silentLog,
+    }), 5);
+    const saved = await saveRuntimeSetting({
+      pool, actorId: ACTOR, key: AUTO_TITLE_MIN_NEW_KEY, value: 8, log: silentLog,
+    });
+    assert.equal(saved.value, 8);
+    assert.equal(pool.storedValue(AUTO_TITLE_MIN_NEW_KEY), 8, '库里真的是新值');
+    const afterSave = pool.queryCount;
+    const next = await readAutoTitleMinNew({
+      pool, config: ATCFG, env: {}, log: silentLog,
+    });
+    assert.equal(next, 8, '保存后下一次读就是新值（读到 5 = 失效钩子少登记）');
+    assert.equal(pool.queryCount, afterSave + 1, '这次读必须真的再发一次 SQL');
+    const afterSecond = pool.queryCount;
+    assert.equal(await readAutoTitleMinNew({
+      pool, config: ATCFG, env: {}, log: silentLog,
+    }), 8);
+    assert.equal(pool.queryCount, afterSecond, '失效后那一读已把新值填回缓存');
+    // 反向：保存另一格不许抹掉本格缓存。
+    await saveRuntimeSetting({
+      pool, actorId: ACTOR, key: PREVIEW_TICKET_TTL_KEY, value: 30, log: silentLog,
+    });
+    const afterOtherSave = pool.queryCount;
+    assert.equal(await readAutoTitleMinNew({
+      pool, config: ATCFG, env: {}, log: silentLog,
+    }), 8);
+    assert.equal(pool.queryCount, afterOtherSave, '保存预览票之后本格仍应命中缓存');
+    invalidateAutoTitleMinNewCache();
+    invalidatePreviewTicketTtlCache();
+  });
+
+test('RS-44 第四格并发：冷缓存四路只发一条 SQL，另一池自己发，合并后照常回填缓存',
+  async () => {
+    invalidateAutoTitleMinNewCache();
+    const pool = new GatingRuntimePool({ rows: [{ key: AUTO_TITLE_MIN_NEW_KEY, value: 8 }] });
+    let release;
+    pool.gate = new Promise((resolve) => { release = () => resolve(); });
+    const four = Array.from({ length: 4 }, () => readAutoTitleMinNew({
+      pool, config: ATCFG, env: {}, log: silentLog,
+    }));
+    await tick();
+    assert.equal(pool.queryCount, 1,
+      `四路并发必须合并成 **1 条** SQL（实发 ${pool.queryCount} 条）`);
+    const other = ttlPool({ rows: [{ key: AUTO_TITLE_MIN_NEW_KEY, value: 6 }] });
+    assert.equal(await readAutoTitleMinNew({
+      pool: other, config: ATCFG, env: {}, log: silentLog,
+    }), 6, 'B 池不许蹭 A 池在飞那一趟');
+    release();
+    assert.deepEqual(await Promise.all(four), [8, 8, 8, 8]);
+    assert.equal(pool.queryCount, 1, '合并之后仍只有一条 SQL');
+    assert.equal(await readAutoTitleMinNew({
+      pool, config: ATCFG, env: {}, log: silentLog,
+    }), 8);
+    assert.equal(pool.queryCount, 1, '在飞那趟必须照常回填缓存');
+    invalidateAutoTitleMinNewCache();
+  });
+
+test('RS-45 第四格在飞那趟失败 ⇒ 清槽（不许把之后所有读钉在失败那一趟上）', async () => {
+  invalidateAutoTitleMinNewCache();
+  const pool = flakyPool({ rows: [{ key: AUTO_TITLE_MIN_NEW_KEY, value: 8 }] });
+  let clock = 5_000_000;
+  const read = () => readAutoTitleMinNew({
+    pool, config: ATCFG, env: {}, now: () => clock, log: silentLog,
+  });
+  assert.equal(await read(), 5, '失败那趟也要给答案（抛了就是评估标题链路 500）');
+  assert.equal(pool.queryCount, 1);
+  pool.broken = false;
+  clock += HOT_READ_CACHE_TTL_MS + 1;
+  assert.equal(await read(), 8, '恢复后必须读到库里的值，不是被钉住的 5');
+  assert.equal(pool.queryCount, 2, '必须重新发 SQL（失败路径没清槽就红在这里）');
+  invalidateAutoTitleMinNewCache();
+  const gate = new GatingRuntimePool({ rows: [{ key: AUTO_TITLE_MIN_NEW_KEY, value: 8 }] });
+  let release;
+  gate.gate = new Promise((resolve) => { release = () => resolve(); });
+  gate.releaseThrows = true;
+  const first = readAutoTitleMinNew({
+    pool: gate, config: ATCFG, env: {}, now: () => clock, log: silentLog,
+  });
+  await tick();
+  const second = readAutoTitleMinNew({
+    pool: gate, config: ATCFG, env: {}, now: () => clock, log: silentLog,
+  });
+  assert.equal(gate.queryCount, 1, '第二路必须复用那一趟');
+  release();
+  assert.equal(await first, 5, '那一趟挂了 ⇒ 发起方按回落给答案');
+  assert.equal(await second, 5, '共享者也按回落给答案');
+  gate.gate = null;
+  clock += HOT_READ_CACHE_TTL_MS + 1;
+  assert.equal(await readAutoTitleMinNew({
+    pool: gate, config: ATCFG, env: {}, now: () => clock, log: silentLog,
+  }), 8, '挂掉之后必须重新发读拿到真值');
+  invalidateAutoTitleMinNewCache();
+});
+
+test('RS-46 第四格 env 也过 registry 那套闸 + 一次热读最多一条 warn', async () => {
+  const BAD = [
+    ['上界外', '101', 'auto_title_min_new_out_of_range'],
+    ['下界外', '0', 'auto_title_min_new_out_of_range'],
+    ['小数', '2.5', 'not_a_auto_title_min_new'],
+    ['科学计数', '1e2', 'not_a_auto_title_min_new'],
+    ['压根不是数', 'abc', 'not_a_auto_title_min_new'],
+  ];
+  for (const [label, raw, reason] of BAD) {
+    const cfg = loadConfig({ MAX_BODY_BYTES: '1024', ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw });
+    const env = { ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw };
+    invalidateAutoTitleMinNewCache();
+    const hotLog = collectingLog();
+    const hot = await readAutoTitleMinNew({
+      pool: ttlPool(), config: cfg, env, log: hotLog,
+    });
+    assert.equal(hot, AUTO_TITLE_MIN_NEW_DEFAULT,
+      `${label}：env=${raw} 过不了闸 ⇒ 回落默认 3（实得 ${hot}）`);
+    const named = hotLog.seen.warn.filter((m) => m.includes(AUTO_TITLE_MIN_NEW_KEY)
+      && m.includes('ERIX_SESSION_AUTO_TITLE_MIN_NEW'));
+    assert.equal(named.length, 1,
+      `坏 env 值必须点名 warn 一次，实得 ${JSON.stringify(hotLog.seen.warn)}`);
+    assert.match(named[0], new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+      'warn 要带上那个坏值本身');
+    assert.match(named[0], new RegExp(reason), 'warn 要带上被拒的理由');
+  }
+  for (const raw of ['1', '2', '100']) {
+    invalidateAutoTitleMinNewCache();
+    const log = collectingLog();
+    const cfg = loadConfig({ MAX_BODY_BYTES: '1024', ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw });
+    assert.equal(await readAutoTitleMinNew({
+      pool: ttlPool(), config: cfg, env: { ERIX_SESSION_AUTO_TITLE_MIN_NEW: raw }, log,
+    }), Number(raw), `env ${raw} 必须照收`);
+    assert.deepEqual(log.seen.warn, [], `合法值不许 warn（实得 ${JSON.stringify(log.seen.warn)}）`);
+  }
+  invalidateAutoTitleMinNewCache();
+});
+
+test('RS-47 真库那一腿（第四格）：写 8 ⇒ 热读 8、不等 5 秒；删行 ⇒ 回落 env（无 PG skip）',
+  { skip: PG_SKIP }, async () => {
+    assert.ok(pgFixture, 'TEST_DATABASE_URL 给了却没有夹具');
+    await pgFixture.withFreshDatabase(async ({ pool }) => {
+      const CONFIG = { sessionAutoTitleMinNew: 5, sessionAutoTitleMinNewSource: 'env' };
+      invalidateAutoTitleMinNewCache();
+      await pool.query(
+        `INSERT INTO users (id, login, password_hash, status) VALUES ($1, $2, 'x', 'active')`,
+        [ACTOR, 'w677-p3b3-actor'],
+      );
+      assert.equal(await readAutoTitleMinNew({ pool, config: CONFIG, log: pgSilent }), 5);
+      const saved = await saveRuntimeSetting({
+        pool, actorId: ACTOR, key: AUTO_TITLE_MIN_NEW_KEY, value: 8, log: pgSilent,
+      });
+      assert.equal(saved.value, 8);
+      assert.equal(saved.updatedBy, ACTOR);
+      assert.equal(await readAutoTitleMinNew({ pool, config: CONFIG, log: pgSilent }), 8,
+        '真库上「保存完下一轮评估就用新值」必须是事实');
+      const list = await listRuntimeSettingsAdmin({ pool, config: CONFIG, log: pgSilent });
+      const item = list.items.find((i) => i.key === AUTO_TITLE_MIN_NEW_KEY);
+      assert.equal(item.source, 'db');
+      assert.equal(item.value, 8);
+      assert.equal(item.updatedBy, ACTOR);
+      await pool.query('DELETE FROM runtime_settings WHERE key = $1', [AUTO_TITLE_MIN_NEW_KEY]);
+      invalidateAutoTitleMinNewCache();
+      assert.equal(await readAutoTitleMinNew({ pool, config: CONFIG, log: pgSilent }), 5);
+      await pool.query(
+        `INSERT INTO runtime_settings (key, value) VALUES ($1, $2::jsonb)`,
+        [AUTO_TITLE_MIN_NEW_KEY, '"1e2"'],
+      );
+      invalidateAutoTitleMinNewCache();
+      assert.equal(await readAutoTitleMinNew({ pool, config: CONFIG, log: pgSilent }), 5,
+        '手工写的坏值 ⇒ 回落 env，不抛');
+      invalidateAutoTitleMinNewCache();
+    });
   });
