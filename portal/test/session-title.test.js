@@ -78,7 +78,8 @@ test('shouldRefreshTitle：零重合旁路不受 `minNew` 上界约束——minN
   // 了（或拿「上界 100 = 关掉」写了文档），而不是产品行为漂了。
   assert.equal(AUTO_TITLE_MIN_NEW_MAX, 100, '上界仍是 100（本格拿它当真实上界用）');
   const base = {
-    title: 'existing login title', autoTitleSeq: 10, newUserCount: 1, minNew: AUTO_TITLE_MIN_NEW_MAX,
+    title: 'existing login title', autoTitleSeq: 10,
+    newUserCount: 1, minNew: AUTO_TITLE_MIN_NEW_MAX,
   };
   // 零重合 + 只 1 轮 + 阈值已到上界 ⇒ 仍刷新（审计实测同形状）。
   assert.equal(
@@ -92,7 +93,9 @@ test('shouldRefreshTitle：零重合旁路不受 `minNew` 上界约束——minN
   );
   // 主判据自己也要在上界处能响：整 100 轮 ⇒ 刷（旁路与主判据两条路各自成立）。
   assert.equal(
-    shouldRefreshTitle({ ...base, newUserCount: AUTO_TITLE_MIN_NEW_MAX, latestUserContent: 'login' }),
+    shouldRefreshTitle({
+      ...base, newUserCount: AUTO_TITLE_MIN_NEW_MAX, latestUserContent: 'login',
+    }),
     true,
   );
 });
