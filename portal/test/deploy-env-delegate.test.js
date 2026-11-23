@@ -1146,7 +1146,8 @@ assertScannerFoundKeys(RUNNER_ENV_KEYS.size, `扫描根 ${path.relative(process.
  * 形状（`Map` 三层，键都是**扫描器给的原值**，不做任何加工）：
  *   `readSites`   `Map(key → Map(rel → Map(line → [shape, ...])))`
  *     —— 三层里最后那层是**数组**：同一行读两次（`env.A || env.A`）留两条，不许折叠成一条。
- *   `injections`  同形状，**第 3 步的位置**（见下面 `addInjectionSite` 的注释），现在恒空。
+ *   `injections`  同形状，**注入站点**表（第 3 步）：真树影子索引由 `registerInjectionSites` 登记，
+ *                 夹具索引仍恒空（登记只接 `REPO_SITE_INDEX`，见下面 `addInjectionSite` 的注释）。
  *
  * 能回答的问题（`siteIndexProblems()` 只用这几个口子，别的都不认）：
  *   `hasReadSite(key, rel, line)` 这个坐标**是不是**该 key 的读站点（行级）
@@ -1173,13 +1174,11 @@ function buildEnvSiteIndex(root, opts = {}) {
     }
   }
   /**
-   * **第 3 步往这里加**（#587 折中方案，分析报告 §2.2 的 `kind = injection`）：
-   *   只从 `portal/src/provisioner.js` 的 `buildContainerConfig()` 里 Docker `body.Env` **数组元素**
-   *   与 `body.Env.push()` 产出站点（审计当时的读数是 `:224-253` 与 `:277`，行号会漂，要现跑取），
-   *   `:410`（`ensureFdeContainer()` 传进来的 `env`）只有在证明它流入 `body.Env` 之后才算来源。
-   *   登记方式：`index.addInjectionSite(key, rel, line)`；`hasSite()` 会同时认两类站点，
-   *   所以**判定结构不用再改**——第 3 步只填这张表。日志里的 `` `KEY=${v}` `` 不是注入站点：
-   *   它进不了 `body.Env`，因此第 3 步也不会进这张表（「影子②」钉的就是这个形状）。
+   * **注入站点表（第 3 步已落地）**：登记不在本函数里做 —— 由 `registerInjectionSites`（文件后半，
+   * #587 折中方案第 3 步）复用 `envAssemblySpans` 的**语法区间**从代码推导后调 `addInjectionSite`，
+   * 且只接 `REPO_SITE_INDEX`（夹具索引恒空 ⇒ `#587-S1-⑤` 的原意「构建期不许偷偷接进来」保留）。
+   * 日志里的 `` `KEY=${v}` `` 不是注入站点：它进不了 `body.Env`，推导规则也就不会进这张表
+   * （「影子②」钉的就是这个形状）。
    */
   const injections = new Map();
   let hostSourcesDerived = null;
@@ -1211,7 +1210,7 @@ function buildEnvSiteIndex(root, opts = {}) {
     unsupported,                // 同上：动态读形留给第 2 步做 provenance，本步只透传
     readSites,
     injections,
-    /** 【第 3 步的入口】登记一个注入站点；现在没人调 ⇒ `injections` 恒空。 */
+    /** 登记一个注入站点；调用方 = `registerInjectionSites`（只接 `REPO_SITE_INDEX` ⇒ 夹具恒空）。 */
     addInjectionSite(key, rel, line, shape = 'body.Env') {
       const byLine = bucketOf(injections, key, rel);
       if (!byLine.has(line)) byLine.set(line, []);
@@ -3684,6 +3683,38 @@ function hostSourceSitesOf(index, key) {
 }
 
 /**
+ * 【第 3 步】把**注入站点**登记进索引 —— 坐标由**代码推导**，不手抄：
+ *   规则 = `shadowGapSemantic` ① 用的同一套语法区间（`envAssemblySpans`：`Env:` 数组位 /
+ *   `.Env.push(` 参数位 / 已执行证明流入 `body.Env` 的 `env:` 选项位）；在每个区间里找
+ *   「字面量以引号开头、紧跟 `KEY=`」的形（注入形的定义：`` `KEY=${…}` `` / `'KEY=…'`），
+ *   `KEY` 即被注入的键，行号 = 字面量开头所在行。认不出 ⇒ 不登记 ⇒ 影子继续红（fail-closed）。
+ * 只接 `REPO_SITE_INDEX`（影子尺）⇒ 夹具索引恒空、闸门（`whereProblems`）零改动。
+ * @returns {Array<{key:string, rel:string, line:number, rule:string}>} 登记了哪些站点（推导过程可指着）
+ */
+function registerInjectionSites(index, root = REPO_ROOT) {
+  const added = [];
+  for (const file of scanTargets(root)) {
+    const rel = path.relative(root, file).split(path.sep).join('/');
+    const f = srcFacts(root, rel);
+    if (!f) continue;
+    for (const a of envAssemblySpans(root, rel)) {
+      for (const m of f.code.slice(a.from, a.to).matchAll(/([A-Z][A-Z0-9_]*)=/g)) {
+        const at = a.from + m.index;
+        const q = f.code[at - 1];
+        // 必须是「字面量开头就是 KEY=」：引号紧贴在 KEY 左边（`${X=…}` 那种不算）
+        if (q !== '`' && q !== '"' && q !== "'") continue;
+        const line = lineAt(f.code, at);
+        index.addInjectionSite(m[1], rel, line, a.kind);
+        added.push({ key: m[1], rel, line, rule: `${a.kind} ← ${a.at}` });
+      }
+    }
+  }
+  return added;
+}
+// 真树影子索引接上注入登记（M-1 变异点：去掉这一行 ⇒ 那 4 条注入差异必须重新红）
+registerInjectionSites(REPO_SITE_INDEX);
+
+/**
  * **语义**判据：只问可复核事实。返回 `{ kind, why, via }`；三条都不成立 ⇒ `kind: null` +
  * `why` 写清「每条判据为什么不成立」（调用方必须红，**不许默认塞进某一类**）。
  * 顺序 = 由特指到宽泛：同一行可能同时像两样（`config.js:406` 既是对象成员、又是 helper 调用点），
@@ -3810,26 +3841,106 @@ test('#587-S1-⑧ 影子对照真树：影子尺只会更严，多杀的必须�
   assert.deepEqual(unexplained, [],
     '影子多杀的坐标归不进已知三类 ⇒ 要么是新造的假坐标（好事，登记该改），要么索引漏了真读形（坏事）：'
     + '逐条看上面的 SHADOW-CLASS / SHADOW-DIFF 定性后再动，不许为了让这格变绿去改登记');
-  // 兜底必须是 **0**（MED①）：真树这 14 条全部由语义判据决定 ⇒ 「靠路径/文本形状猜」不许发生。
+  // 兜底必须是 **0**（MED①）：真树这些差异全部由语义判据决定 ⇒ 「靠路径/文本形状猜」不许发生。
   // 非 0 的含义：出现了新形状（语义判据认不出）⇒ 要么补判据（带夹具），要么登记该改；
   // **不许**放着兜底当答案（那正好把 MED① 的病重新养回来）。
   assert.equal(stats.fallbackCount, 0,
     `差异分类里有 ${stats.fallbackCount} 条走了**形状兜底**（语义判据决定不了）⇒ 必须显式处理：`
     + `\n${stats.fallbackHits.join('\n')}`);
-  // 三类的**现值**（第 2/3 步落地后这里必须跟着变，变的时候就是「可以切了」的信号）
-  // ⚙ 语义判据落地后从 `{1,5,8}` 改成 `{1,4,9}`：`portal/src/provisioner.js:362` 的
-  //   `readContainerEnv(inspectData, key = 'ERIX_STATION_TOKEN')` 按**语法位置**不在任何 Env 组装位里
-  //   —— 它是「把 env 名声明成默认参数」的读侧 helper（审计 §3 自己写了「不是注入也不是 process.env 读」，
-  //   例外清单那条 reason 也写了「不是注入点」）。旧形状闸把它算成 injection ⇒ 第 3 步会去补错方向。
-  const want = { 'host-source': 1, injection: 4, 'mention-only': TIMEOUT_KEYS.length * 2 + 1 };
+  // 各类的**现值**（每一步落地后这里必须跟着变，变的时候就是「可以切了」的信号）
+  // ⚙ 第 3 步登记注入站点后从 `{host-source:1, injection:4, mention-only:9}`（共 14）改成
+  //   `{host-source:1, mention-only:9}`（共 10）：那 4 条 injection（`provisioner.js:224`/`:277`/
+  //   `:410×2`）现在坐在了**索引里**（`registerInjectionSites` 由语法区间推导坐标，`hasSite` 认）
+  //   ⇒ 它们从「影子多杀」变成「合法站点」，差异里整个消失（M-1：去掉登记 ⇒ 它们重新红）。
+  //   剩的两类：`host-source:1` 是 `config.js:406` 的 helper 间接读（故意不进 `hasSite`，第 4 步
+  //   要处理）；`mention-only:9` 是超时四项表声明行 ×2 + `provisioner.js:362` 的默认参数位（读回
+  //   helper 的默认 key，不是注入位 —— 下一步另归类，见 `#587-S3-③`，届时这里再变）。
+  const want = { 'host-source': 1, 'mention-only': TIMEOUT_KEYS.length * 2 + 1 };
   assert.deepEqual(counts, want,
     `影子差异的分布变了（现在 ${JSON.stringify(counts)}）⇒ 有人动了例外清单/产品代码，或索引判定漂了`
     + '：按 SHADOW-DIFF 逐条定性，然后把这里的期望值改成新现实（并更新工单报告），不许反着改登记');
-  // 差异还在 ⇒ 现在**不能**切闸门（第 4 步的前提是这三类清零）
+  // 差异还在 ⇒ 现在**不能**切闸门（第 4 步的前提是这些类清零）
   assert.ok(onlyShadow.length > 0,
     '影子尺与旧尺读数已经一致 ⇒ 三类差异都清了，可以走第 4 步切换（把这格换成「两边必须完全相等」）');
   // 盘上那份的**旧尺**读数必须还是全绿 —— 影子没被接进闸门
   assert.deepEqual(gate, [], '闸门行为变了：盘上那份被判红了（本步红线：闸门一个字不许变）');
+});
+
+/**
+ * 【第 3 步共用】独立重推一遍：新建一个干净索引 + 现跑 `registerInjectionSites` ⇒ 拿到「现推的
+ * 坐标清单」。判据① 拿它对照影子索引：坐标两边都由同一套规则现推，谁也没手抄。
+ */
+function rederiveInjectionSites() {
+  const probe = buildEnvSiteIndex(REPO_ROOT);
+  return { probe, added: registerInjectionSites(probe) };
+}
+
+test('#587-S3-① 注入站点可解析：四个键各有站点，坐标 = 现推的那份（不是手抄清单）', () => {
+  const { added } = rederiveInjectionSites();
+  assert.ok(added.length > 0, '重推登记了 0 条 ⇒ 推导规则对真树瞎了');
+  console.log(`# S3-INJECT ${JSON.stringify(added)}`);
+  const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME', 'ERIX_STATION_BASE_URL', 'ERIX_AGENT_VERSION'];
+  for (const key of KEYS) {
+    const derived = [...new Set(added.filter((s) => s.key === key)
+      .map((s) => `${s.rel}:${s.line}`))].sort();
+    assert.ok(derived.length > 0, `${key}: 一条也没推出 ⇒ 规则认不出真树的注入形`);
+    const inIndex = [...new Set(REPO_SITE_INDEX.injectionSitesOf(key)
+      .map((s) => `${s.rel}:${s.line}`))].sort();
+    assert.deepEqual(inIndex, derived,
+      `${key}: 影子索引里的注入坐标与现推的不一致（坐标必须由代码推导，两边都得现跑）`);
+    // 方向自证：这 4 个键的注入形在真树只住在 provisioner（行号不手抄，文件名是方向不是坐标）
+    for (const coord of derived) {
+      assert.equal(coord.split(':')[0], 'portal/src/provisioner.js',
+        `${key} 的注入坐标跑到了 ${coord} ⇒ 扫描面里出现了第二个注入方，得先看是不是合法`);
+    }
+    // 每一条登记的坐标：`hasSite` 必须认（注入形也是合法站点），且带着规则痕迹
+    for (const s of added.filter((x) => x.key === key)) {
+      assert.ok(REPO_SITE_INDEX.hasSite(key, s.rel, s.line),
+        `hasSite 不认已登记的注入站点 ${s.rel}:${s.line}`);
+      assert.match(s.rule, /^Env\[\]|^Env\.push\(\)|^env-opt/, `推导痕迹缺失：${s.rule}`);
+    }
+  }
+  console.log(`# S3-登记计数 ${added.length} 条（含非例外清单的键，全部由语法区间推导）`);
+});
+
+test('#587-S3-② 注入站点不是读站点：账本分开（hasSite 认、readSites 不认），影子判它们绿', () => {
+  const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME', 'ERIX_STATION_BASE_URL', 'ERIX_AGENT_VERSION'];
+  for (const key of KEYS) {
+    const sites = REPO_SITE_INDEX.injectionSitesOf(key);
+    assert.ok(sites.length > 0, `${key} 没有注入站点（先让 ① 绿）`);
+    for (const s of sites) {
+      // 两本账分开：注入形住在 `injections`，不住 `readSites` ⇒ 「不是读站点」有结构证据
+      const inReads = REPO_SITE_INDEX.sitesOf(key).some((r) => r.rel === s.rel && r.line === s.line);
+      assert.ok(!inReads, `${key}@${s.rel}:${s.line} 被当成**读站点**登记了（两本账串账）`);
+      // 影子尺对这条坐标判绿：拿它当唯一引用造一条形同盘上登记的例外，问题清单必须空
+      const problems = siteIndexProblems([{ key, where: `${s.rel}:${s.line}` }], REPO_SITE_INDEX);
+      assert.deepEqual(problems, [],
+        `已登记的注入坐标 ${s.rel}:${s.line} 被影子判红（合法站点不该红）`);
+    }
+  }
+});
+
+test('#587-S3-④ 反向牙：拿「没做过注入登记」的同树索引跑 ⇒ 那 4 条必须重新红且仍归 injection', () => {
+  // 同树重建一个**不登记**的索引（= M-1 变异「去掉登记」的等价形态，不用改盘上文件）
+  const bare = buildEnvSiteIndex(REPO_ROOT);
+  const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME', 'ERIX_STATION_BASE_URL', 'ERIX_AGENT_VERSION'];
+  let reds = 0;
+  for (const key of KEYS) {
+    const derived = REPO_SITE_INDEX.injectionSitesOf(key);
+    assert.ok(derived.length > 0, `${key} 在影子索引里没站点（① 先绿）`);
+    for (const s of derived) {
+      assert.ok(!bare.hasSite(key, s.rel, s.line),
+        `不登记的索引竟也认 ${s.rel}:${s.line} ⇒ 登记被接进了构建期（不该）`);
+      const why = siteIndexProblems([{ key, where: `${s.rel}:${s.line}` }], bare).join('\n');
+      assert.match(why, new RegExp(`不是 ${key} 的读站点`),
+        `去掉登记后 ${key}@${s.rel}:${s.line} 没重新红 ⇒ 这格没牙`);
+      reds += 1;
+      // 归类仍是 injection：分类器靠语法区间，不靠索引里有没有这条 ⇒ 登记只是「洗绿」不是「改口」
+      const cls = shadowGapSemantic(key, `${s.rel}:${s.line}`);
+      assert.equal(cls.kind, 'injection', `去掉登记后 ${key}@${s.rel}:${s.line} 应重新归 injection`);
+    }
+  }
+  assert.equal(reds, 4, `预期重新红 4 条，实际 ${reds} ⇒ 注入坐标的数量变了，核对 S3-INJECT 读数`);
 });
 
 /**
