@@ -1639,6 +1639,8 @@ export const zhCN = {
       usageTokens: 'Token 合计',
       usageEmpty: '暂无用量数据',
       unpricedWarning: '所选模型里有未定价模型：其用量按 0 计，额度对它不生效。',
+      budgetLoadFailed: '无法读取额度（网关错误）',
+      usageLoadFailed: '无法读取用量（网关错误）',
     },
     // FDE 用户区（AdminView #fdeSection）
     fde: {

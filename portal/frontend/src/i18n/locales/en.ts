@@ -1636,6 +1636,8 @@ export const en = {
       usageTokens: 'Total tokens',
       usageEmpty: 'No usage data',
       unpricedWarning: 'Some selected models have no pricing configured: their usage is recorded as 0, so the budget does not take effect for them.',
+      budgetLoadFailed: 'Failed to load the budget (gateway error)',
+      usageLoadFailed: 'Failed to load usage (gateway error)',
     },
     fde: {
     mailOtpSection: 'Email verification code',

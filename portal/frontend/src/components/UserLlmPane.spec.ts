@@ -488,4 +488,64 @@ describe('UserLlmPane · 周期额度（#719）', () => {
     const dflt = await mountQuota();
     expect(dflt.wrapper.find('[data-test="unpriced-warning"]').exists()).toBe(false);
   });
+
+  it('quota GET 500 ⇒ 显式报错（budget-load-error）：不渲染 budget-state/budget-spend、不伪造 0、不出现「不限」；写控件仍可用', async () => {
+    const { wrapper } = await mountQuota((url, init) => {
+      if (url === '/api/admin/fdes/alice/llm/budget' && !init?.method) {
+        return jsonResponse(500, { error: { code: 'server_error', message: 'gateway down' } });
+      }
+      return undefined;
+    });
+    expect(wrapper.find('[data-test="budget-load-error"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="budget-load-error"]').text()).toContain('无法读取额度');
+    expect(wrapper.find('[data-test="budget-state"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="budget-spend"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('不限');
+    // 读失败不影响写：保存按钮与输入框照旧可用
+    expect(wrapper.find('[data-test="budget-input"]').exists()).toBe(true);
+    const saveBtn = wrapper.find('[data-test="budget-save"]').element as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(false);
+  });
+
+  it('usage GET 500 ⇒ 显式报错（usage-load-error）：不显示「暂无用量数据」；额度区不受牵连', async () => {
+    const { wrapper } = await mountQuota((url, init) => {
+      if (url.startsWith('/api/admin/fdes/alice/llm/usage') && !init?.method) {
+        return jsonResponse(500, { error: { code: 'server_error', message: 'gateway down' } });
+      }
+      return undefined;
+    });
+    expect(wrapper.find('[data-test="usage-load-error"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="usage-load-error"]').text()).toContain('无法读取用量');
+    expect(wrapper.text()).not.toContain('暂无用量');
+    expect(wrapper.find('[data-test="usage-table"]').exists()).toBe(false);
+    // 两个读互相独立：用量读失败不影响额度区正常渲染
+    expect(wrapper.find('[data-test="budget-load-error"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('1.25');
+  });
+
+  it('quota GET 404（无 active binding）⇒ 静默降级：既不报错也不渲染额度区', async () => {
+    // 真实无绑定态：config 无 api_key ⇒ 额度区整块隐藏；budget/usage 404 也不报错。
+    const { wrapper } = await mountQuota((url, init) => {
+      if (url === '/api/admin/fdes/alice/llm' && !init?.method) {
+        return jsonResponse(200, { config: { provider_id: 'p1', api_key: null }, active_run: false });
+      }
+      if ((url === '/api/admin/fdes/alice/llm/budget' || url.startsWith('/api/admin/fdes/alice/llm/usage')) && !init?.method) {
+        return jsonResponse(404, { error: { code: 'not_found', message: 'no active binding' } });
+      }
+      return undefined;
+    });
+    expect(wrapper.find('[data-test="daily-budget"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="budget-load-error"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="usage-load-error"]').exists()).toBe(false);
+
+    // 更强守卫：即便额度区可见（有 api_key），budget 404（not_found）也不得置 budgetLoadErr ⇒ 静默降级。
+    const vis = await mountQuota((url, init) => {
+      if (url === '/api/admin/fdes/alice/llm/budget' && !init?.method) {
+        return jsonResponse(404, { error: { code: 'not_found', message: 'no active binding' } });
+      }
+      return undefined;
+    });
+    expect(vis.wrapper.find('[data-test="budget-load-error"]').exists()).toBe(false);
+    expect(vis.wrapper.find('[data-test="budget-state"]').exists()).toBe(true);
+  });
 });
