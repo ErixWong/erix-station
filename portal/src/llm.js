@@ -45,6 +45,22 @@ export function maskKey(key) {
   return `sk-...${key.slice(-4)}`;
 }
 
+// 周期额度（USD / 周期）的写侧口径：有限正数且 ≤ 上限才算「设了额度」；
+// null / 0 / 负数 / NaN / 超上限都不算（0 会撞 LiteLLM「一分都不能花」的语义，故不当额度）。
+// 周期由 LiteLLM 的 budget_duration 决定，白名单只允许 '1d' 与 '1mo'（默认 '1mo'）。
+// ⚠️ 绝不能自己换算周期（主 agent 在 LiteLLM v1.103.2 实测）：'1mo' = 每月 1 日重置且只支持 1 个月
+//   （value!=1 抛错，duration_parser.py:355 _handle_month_reset）；'30d' 被特判成月、'7d' = 每周一、
+//   '1m' = 1 分钟——所以只把白名单字符串原样透传，任何自己换算都会踩坑。
+export const BUDGET_PERIODS = ['1d', '1mo'];
+export const DEFAULT_BUDGET_PERIOD = '1mo';
+const BUDGET_MAX_USD = 100_000;
+function isFinitePositiveBudget(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= BUDGET_MAX_USD;
+}
+function isValidBudgetPeriod(value) {
+  return typeof value === 'string' && BUDGET_PERIODS.includes(value);
+}
+
 function getGatewayClient(candidate) {
   if (candidate && typeof candidate === 'object' && [
     'listModels', 'generateKey', 'updateKey', 'deleteKey', 'listCredentials', 'createCredential',
@@ -870,7 +886,7 @@ export async function getFdeLlmConfig(pool, userId) {
   const r = await pool.query(
     `SELECT provider_id, api_key, gateway, gateway_user_id, key_id, key_alias, state,
             main_model_id, main_model_name, embedding_model_id, embedding_model_name,
-            vision_model_id, vision_model_name
+            vision_model_id, vision_model_name, budget_usd, budget_period
        FROM fde_llm_bindings
       WHERE fde_id = $1 AND state = 'active' AND gateway = 'litellm'`,
     [userId],
@@ -885,6 +901,8 @@ export async function getFdeLlmConfig(pool, userId) {
     key_id: row.key_id ?? null,
     key_alias: row.key_alias,
     api_key: row.api_key ?? null,
+    budget_usd: row.budget_usd == null ? null : Number(row.budget_usd),
+    budget_period: row.budget_period ?? null,
     main: slot(row.main_model_id, row.main_model_name, 'text'),
     embedding: slot(row.embedding_model_id, row.embedding_model_name, 'embedding'),
     vision: slot(row.vision_model_id, row.vision_model_name, 'vision'),
@@ -1293,6 +1311,188 @@ export async function getFdeLlmEcho(pool, fdeName) {
   return { ...config, api_key: config.api_key == null ? null : maskKey(config.api_key) };
 }
 
+// ── issue #719：每 FDE 周期额度（USD / 周期）的读写 ───────────────────────────────
+// 口径：额度单位 USD / 周期，周期由 LiteLLM 的 budget_duration 决定（白名单 '1d'/'1mo'，默认 '1mo'），金额落 max_budget；
+// portal **绝不自算 token、也绝不换算周期**，用量全读 LiteLLM 自己的端点。
+
+function numOrNull(value) {
+  const n = typeof value === 'number' ? value : Number(value);
+  return value == null || value === '' || !Number.isFinite(n) ? null : n;
+}
+
+function intOr0(value) {
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
+// 把 keyInfo 的响应（形如 { info: { max_budget, budget_duration, budget_reset_at, spend } }，
+// 也可能是平铺）收成额度视图；budget_usd/budget_period 一律取 DB（真相），其余取网关读数。
+// spend_scope 是前端标签的**唯一依据**：网关 spend 是运行计数器——只有 key 上存在 budget_duration
+// 时才按周期归零（⇒ 'period'，本周期已用）；无 budget_duration（无额度）时是终身累计（⇒ 'lifetime'）。
+// 实测 dev eric 的 key spend=0.084178176，而近 14 天日聚合合计只有 0.038631168 ⇒ 无额度时把
+// spend 当「今日已用」是错的，必须按 spend_scope 区分；前端不要自己重新推导。
+function projectQuota(dbBudgetUsd, dbBudgetPeriod, infoPayload) {
+  const info = (infoPayload && typeof infoPayload === 'object' && infoPayload.info
+    && typeof infoPayload.info === 'object') ? infoPayload.info : (infoPayload ?? {});
+  const maxBudget = numOrNull(info.max_budget);
+  const budgetDuration = info.budget_duration ?? null;
+  const spend = numOrNull(info.spend);
+  const remaining = maxBudget == null ? null : maxBudget - (spend ?? 0);
+  return {
+    budget_usd: dbBudgetUsd,
+    budget_period: dbBudgetPeriod,
+    max_budget: maxBudget,
+    budget_duration: budgetDuration,
+    budget_reset_at: info.budget_reset_at ?? null,
+    spend,
+    remaining,
+    spend_scope: budgetDuration ? 'period' : 'lifetime',
+  };
+}
+
+/**
+ * 设一个 FDE 的周期额度（USD / 周期，周期白名单 '1d'/'1mo'）。顺序：先网关 updateKey（含额度或清空），
+ * 后回写 DB；网关失败**不写 DB**（宁可保持旧值，也不造 DB/key 分叉）；非法值在打网关前就拒（零网关调用）。
+ */
+export async function setFdeBudget(pool, { fdeName, budgetUsd, budgetPeriod = DEFAULT_BUDGET_PERIOD, gateway } = {}) {
+  if (!(budgetUsd === null || isFinitePositiveBudget(budgetUsd))) {
+    throw new LlmError('validation_failed',
+      `budget_usd 必须为 null（不限额）或 ≤ ${BUDGET_MAX_USD} 的有限正数`,
+      { details: { field: 'budget_usd' } });
+  }
+  // 设了额度才校验周期；budgetUsd===null（清空额度）时周期被忽略并一并清空，故不必校验。
+  if (budgetUsd !== null && !isValidBudgetPeriod(budgetPeriod)) {
+    throw new LlmError('validation_failed',
+      `budget_period 必须是 ${BUDGET_PERIODS.map((p) => `'${p}'`).join(' 或 ')}（不能自己换算：'30d'⇒月、'7d'⇒每周一、'1m'⇒1 分钟）`,
+      { details: { field: 'budget_period' } });
+  }
+  const hasBudget = isFinitePositiveBudget(budgetUsd);
+  const period = hasBudget ? budgetPeriod : null;
+  const gatewayClient = getGatewayClient(gateway);
+
+  // 建议 4：事务**不跨网关调用**（updateKey 有 10s 超时，不该在持 advisory lock 时网络 I/O）。
+  // ① 先读 binding（不持锁）拿 api_key + generation；网关失败 ⇒ 什么都没写（事务尚未开）。
+  const u = await pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
+  if (u.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
+  const userId = u.rows[0].id;
+  const before = await pool.query(
+    `SELECT api_key, generation FROM fde_llm_bindings WHERE fde_id = $1 AND state = 'active' AND gateway = 'litellm'`,
+    [userId],
+  );
+  const beforeRow = before.rows[0];
+  if (!beforeRow || !beforeRow.api_key) {
+    throw new LlmError('not_found', 'no active litellm binding', { httpStatus: 404 });
+  }
+  const apiKeyBefore = beforeRow.api_key;
+  const generationBefore = beforeRow.generation;
+
+  // ② 事务外调 updateKey（有额度⇒原样下发白名单周期；无额度⇒显式清空两项，主 agent 真机验过 200 且两列清空）。
+  const body = hasBudget
+    ? { key: apiKeyBefore, max_budget: budgetUsd, budget_duration: budgetPeriod }
+    : { key: apiKeyBefore, max_budget: null, budget_duration: null };
+  await gatewayClient.updateKey(body);
+
+  // ③ 短事务：advisory lock → 重读 binding（api_key + generation）；变了⇒说明期间发生了 key 轮换/重绑，
+  //    刚才的 updateKey 可能打在了旧 key 上 ⇒ 抛 409 让调用方重试；未变才 UPDATE。**网关失败不写 DB** 仍成立
+  //    （updateKey 在上面已报，根本不会走到这）。
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fdeName}`]);
+    const cur = await client.query(
+      `SELECT api_key, generation FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE`,
+      [userId],
+    );
+    const curRow = cur.rows[0];
+    if (!curRow || curRow.api_key !== apiKeyBefore || curRow.generation !== generationBefore) {
+      await client.query('COMMIT').catch(() => {});
+      throw new LlmError('conflict',
+        '写入额度期间该 FDE 的 key 被轮换/重绑，请重试', { httpStatus: 409 });
+    }
+    // 周期列：有额度才写，无额度随金额一并清空（保持配对 CHECK）。
+    await client.query(
+      `UPDATE fde_llm_bindings SET budget_usd = $2, budget_period = $3, updated_at = now() WHERE fde_id = $1`,
+      [userId, hasBudget ? budgetUsd : null, period],
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    // ROLLBACK 失败不静默吞（写侧已尽力，但回滚异常要留痕）。
+    await client.query('ROLLBACK').catch((rerr) => console.warn('setFdeBudget ROLLBACK failed:', rerr?.message ?? rerr));
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  // ④ COMMIT 后回读 quota 失败**不让整个 PUT 报错**（写入已生效）：返回 DB 里的值并忽略回读失败。
+  try {
+    return await getFdeBudget(pool, { fdeName, gateway });
+  } catch (readbackErr) {
+    console.warn('setFdeBudget: commit 后回读网关额度失败，返回 DB 口径（spend/remaining 置 null）:', readbackErr?.message ?? readbackErr);
+    return {
+      budget_usd: hasBudget ? budgetUsd : null,
+      budget_period: period,
+      max_budget: hasBudget ? budgetUsd : null,
+      budget_duration: period,
+      budget_reset_at: null,
+      spend: null,
+      remaining: null,
+      spend_scope: hasBudget ? 'period' : 'lifetime',
+    };
+  }
+}
+
+/** 读一个 FDE 的周期额度 + 额度态（binding 取 DB 真相，额度明细取网关 keyInfo）。绝不外汋完整 api_key。 */
+export async function getFdeBudget(pool, { fdeName, gateway } = {}) {
+  const u = await pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
+  if (u.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
+  const config = await getFdeLlmConfig(pool, u.rows[0].id);
+  if (!config || !config.api_key) {
+    throw new LlmError('not_found', 'no active litellm binding', { httpStatus: 404 });
+  }
+  const info = await getGatewayClient(gateway).keyInfo(config.api_key);
+  return projectQuota(config.budget_usd ?? null, config.budget_period ?? null, info);
+}
+
+/** 近 N 天（默认 30，上限 90）每日用量，读 LiteLLM 自己的聚合端点；日期区间按本地 UTC+8（timezone=480）。 */
+export async function getFdeBudgetUsage(pool, { fdeName, gateway, days = 30 } = {}) {
+  const d = Number.isFinite(days) && days >= 1 ? Math.min(Math.floor(days), 90) : 30;
+  const u = await pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
+  if (u.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
+  const config = await getFdeLlmConfig(pool, u.rows[0].id);
+  if (!config || !config.gateway_user_id) {
+    throw new LlmError('not_found', 'no active litellm binding', { httpStatus: 404 });
+  }
+  // 本地 UTC+8：把 UTC 时刻平移 480 分钟后取 ISO 日期前缀，得到的就是北京时间那一天。
+  const nowMs = Date.now();
+  const isoDaysAgo = (n) => new Date(nowMs + 480 * 60_000 - n * 86_400_000).toISOString().slice(0, 10);
+  const payload = await getGatewayClient(gateway).userDailyActivity({
+    user_id: config.gateway_user_id,
+    start_date: isoDaysAgo(d - 1),
+    end_date: isoDaysAgo(0),
+    timezone: 480,
+  });
+  const results = Array.isArray(payload?.results) ? payload.results : (Array.isArray(payload) ? payload : []);
+  const dayRows = results
+    .map((r) => {
+      const m = (r && typeof r.metrics === 'object' && r.metrics !== null) ? r.metrics : (r ?? {});
+      return {
+        date: r?.date ?? r?.timestamp ?? null,
+        spend: numOrNull(m.spend) ?? 0,
+        prompt_tokens: intOr0(m.prompt_tokens),
+        completion_tokens: intOr0(m.completion_tokens),
+        total_tokens: intOr0(m.total_tokens),
+        api_requests: intOr0(m.api_requests),
+      };
+    })
+    .filter((row) => row.date != null)
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const totals = {
+    spend: dayRows.reduce((sum, row) => sum + (numOrNull(row.spend) ?? 0), 0),
+    total_tokens: dayRows.reduce((sum, row) => sum + row.total_tokens, 0),
+  };
+  return { days: dayRows, totals };
+}
+
 function validateSlotModel(model, { slotName, modelId, providerId, expectedType, requireToolCalling }) {
   const fail = (message) => {
     throw new LlmError('validation_failed', message, {
@@ -1354,13 +1554,18 @@ function isMissingGatewayKeyError(error) {
   return /(?:\b(?:virtual\s+)?key\b|\btoken\b).{0,80}\b(?:not found|does not exist|doesn't exist|not exist|unknown|missing|not present|could not be found|cannot be found)\b|\b(?:not found|does not exist|doesn't exist|not exist|unknown|missing|not present|could not be found|cannot be found).{0,80}\b(?:key|token)\b|\bno (?:such )?(?:virtual )?key\b/i.test(message);
 }
 
-async function generateFdeKey(client, { fdeId, fdeName, gatewayUserId, selectedModels }) {
+async function generateFdeKey(client, { fdeId, fdeName, gatewayUserId, selectedModels, budgetUsd, budgetPeriod }) {
   const userId = gatewayUserId || await ensureGatewayUser(client, { fdeName, userId: fdeId });
   const result = await client.generateKey({
     models: selectedModelNames(selectedModels),
     user_id: userId,
     key_alias: `fde-${fdeName}`,
     metadata: { fde_id: fdeId, fde_name: fdeName },
+    // 坑 2（key 轮换丢额度）：重铸 key 时必须把 DB 里的额度 + 周期重新下发到新 key，
+    // 否则轮换一次丢一次（不变式 3：DB 是真相、key 是牲口）。周期原样透传，绝不换算。
+    ...(isFinitePositiveBudget(budgetUsd)
+      ? { max_budget: budgetUsd, budget_duration: budgetPeriod }
+      : {}),
   });
   if (typeof result?.key !== 'string' || !result.key) {
     throw new LlmGatewayError(502, 'LiteLLM did not return a virtual key');
@@ -1418,7 +1623,7 @@ export async function setFdeLlmConfig(pool, {
     const existing = await client.query(
       `SELECT provider_id, api_key, gateway, gateway_user_id, key_id, key_alias, state,
               main_model_id, main_model_name, embedding_model_id, embedding_model_name,
-              vision_model_id, vision_model_name, generation
+              vision_model_id, vision_model_name, budget_usd, budget_period, generation
          FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE`,
       [userId],
     );
@@ -1476,9 +1681,15 @@ export async function setFdeLlmConfig(pool, {
     if (current?.state === 'active' && current.gateway === 'litellm'
       && typeof current.api_key === 'string' && current.api_key.length > 0) {
       try {
+        const dbBudget = current.budget_usd == null ? null : Number(current.budget_usd);
+        const dbPeriod = current.budget_period ?? null;
         await gatewayClient.updateKey({
           key: current.api_key,
           models: selectedModelNames(selected),
+          // 坑 2：改白名单重存已有 key 时一并把 DB 里的额度下发（DB 有额度→设，无→显式清空）。
+          ...(isFinitePositiveBudget(dbBudget)
+            ? { max_budget: dbBudget, budget_duration: dbPeriod }
+            : { max_budget: null, budget_duration: null }),
         });
         generated = {
           gatewayUserId: current.gateway_user_id ?? null,
@@ -1499,6 +1710,8 @@ export async function setFdeLlmConfig(pool, {
         fdeName,
         gatewayUserId: current?.gateway_user_id ?? null,
         selectedModels: selected,
+        budgetUsd: current?.budget_usd == null ? null : Number(current.budget_usd),
+        budgetPeriod: current?.budget_period ?? DEFAULT_BUDGET_PERIOD,
       });
     }
     if (current) {
@@ -1632,7 +1845,7 @@ export async function syncFdeLlmBindingOnOnboard(pool, { fdeId, fdeName, restore
     const r = await client.query(
       `SELECT state, provider_id, api_key, key_id, key_alias, gateway, gateway_user_id,
               main_model_id, main_model_name, embedding_model_id, embedding_model_name,
-              vision_model_id, vision_model_name
+              vision_model_id, vision_model_name, budget_usd, budget_period
          FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE`,
       [fdeId],
     );
@@ -1667,6 +1880,8 @@ export async function syncFdeLlmBindingOnOnboard(pool, { fdeId, fdeName, restore
         fdeName,
         gatewayUserId: row.gateway_user_id ?? null,
         selectedModels: selected,
+        budgetUsd: row.budget_usd == null ? null : Number(row.budget_usd),
+        budgetPeriod: row.budget_period ?? DEFAULT_BUDGET_PERIOD,
       });
       oldKey = row.api_key ?? null;
       oldWasGatewayKey = row.gateway === 'litellm' && oldKey !== null;

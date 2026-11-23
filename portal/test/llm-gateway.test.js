@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createLlmGatewayClient, LlmGatewayError } from '../src/llm-gateway.js';
+import { createLlmGatewayClient, LlmGatewayError, hashKeyForInfo } from '../src/llm-gateway.js';
 
 async function startStub(handler) {
   const server = http.createServer((req, res) => handler(req, res));
@@ -85,7 +85,8 @@ test('LiteLLM admin API request contract: all client methods, paths, verbs, auth
       ['POST', '/key/delete'],
       ['POST', '/key/block'],
       ['POST', '/key/unblock'],
-      ['GET', '/key/info?key=sk+info%2F%2B'],
+      // #719 必修 1：`/key/info` 是 GET，明文 key 会落进 access log 的 URL ⇒ 出网前换成 sha256 hex。
+      ['GET', `/key/info?key=${hashKeyForInfo('sk info/+')}`],
       ['GET', '/model/info'],
       ['POST', '/model/new'],
       ['PATCH', '/model/model-id-1/update'],
