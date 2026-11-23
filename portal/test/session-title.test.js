@@ -26,7 +26,7 @@ import {
   generateAutoTitle,
 } from '../src/session-title.js';
 import { createSession, updateSession, postMessage, AI_TITLE_SYSTEM_PROMPT, AI_TITLE_MAX_TOKENS } from '../src/sessions.js';
-import { invalidateAutoTitleMinNewCache } from '../src/runtime-settings.js';
+import { invalidateAutoTitleMinNewCache, AUTO_TITLE_MIN_NEW_MAX } from '../src/runtime-settings.js';
 import { buildAutoTitlePrompt, TITLE_SYSTEM_PROMPT } from '../src/title-llm.js';
 import { LLM_CHAT_DEFAULT_MAX_TOKENS } from '../src/llm-chat.js';
 import { createSessionTextHandler, inputTranscriptRow, engineTranscriptRow } from './fake-session-text.js';
@@ -69,6 +69,31 @@ test('shouldRefreshTitle：话题漂移启发式——≥1 轮新消息且与现
   assert.equal(
     shouldRefreshTitle({ title: '修复登录 bug', autoTitleSeq: 10, newUserCount: 0, latestUserContent: '登录页还是白屏', minNew: 3 }),
     false,
+  );
+});
+
+test('shouldRefreshTitle：零重合旁路不受 `minNew` 上界约束——minNew=100 + 1 轮 + 零重合 ⇒ 仍 refresh=true', () => {
+  // #710 LOW①：契约（docs/api/portal.md §4.21）与 registry 注释都改了口径：上界 100 = 「阈值可设到
+  // 很高」，**不是硬关闭**，因为话题漂移旁路不吃 N。本格钉住这个事实：它红了就是有人把旁路拿掉
+  // 了（或拿「上界 100 = 关掉」写了文档），而不是产品行为漂了。
+  assert.equal(AUTO_TITLE_MIN_NEW_MAX, 100, '上界仍是 100（本格拿它当真实上界用）');
+  const base = {
+    title: 'existing login title', autoTitleSeq: 10, newUserCount: 1, minNew: AUTO_TITLE_MIN_NEW_MAX,
+  };
+  // 零重合 + 只 1 轮 + 阈值已到上界 ⇒ 仍刷新（审计实测同形状）。
+  assert.equal(
+    shouldRefreshTitle({ ...base, latestUserContent: 'completely unrelated topic' }), true,
+    'minNew=100 + 1 轮新消息 + 关键词零重合 ⇒ 必须仍 refresh=true（旁路不吃 N）',
+  );
+  // 反面对照：同阈值下关键词有重合 ⇒ 不刷（证明上面那格是旁路给的，不是主判据给的）。
+  assert.equal(
+    shouldRefreshTitle({ ...base, latestUserContent: 'login page still blank' }), false,
+    '有重合时 100 轮阈值就是 100 轮：少一轮不刷（排除「测试因为别的原因绿」）',
+  );
+  // 主判据自己也要在上界处能响：整 100 轮 ⇒ 刷（旁路与主判据两条路各自成立）。
+  assert.equal(
+    shouldRefreshTitle({ ...base, newUserCount: AUTO_TITLE_MIN_NEW_MAX, latestUserContent: 'login' }),
+    true,
   );
 });
 
