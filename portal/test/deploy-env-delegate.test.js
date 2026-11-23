@@ -4353,11 +4353,14 @@ test('#587-S3-⑦ 影子差异集合被钉住：真树差异与期望文件 deep
  *   · 没被登记 ⇒ `where` 那条坐标仍是差异且差异集合多一条 ⇒ 红在 **S3-⑦**；
  *   · 两者都不是 ⇒ 被静默吞掉（最坏的一形），同样红。
  * `claim` = 例外清单会指的那一行（key 字面量所在行）；表格里的行号是约定，改文本要跟着改。
+ * `expectVia` = **落点也被钉住**：当前哪条形走哪条路是人工定下的事实。启发式把它改到另一条路上
+ *（例：把归属证明拆了 ⇒ H1c 从「留在差异」变成「被登记」）⇒ 同样红，逼人工改表并写理由。
  */
 const PIN_COUNTEREX = [
   {
     name: 'H1a 普通对象自己 `.Env.push()`',
     key: 'ERIX_AUDIT_H1A_PUSH',
+    expectVia: 'S3-⑥',
     claim: { rel: 'lib/h1a.js', line: 3 },
     files: {
       'lib/h1a.js': [
@@ -4372,6 +4375,7 @@ const PIN_COUNTEREX = [
   {
     name: 'H1b 来源不明的同名参数',
     key: 'ERIX_AUDIT_H1B_PARAM',
+    expectVia: 'S3-⑥',
     claim: { rel: 'lib/h1b.js', line: 3 },
     files: {
       'lib/h1b.js': [
@@ -4386,6 +4390,7 @@ const PIN_COUNTEREX = [
   {
     name: 'H1c 浅拷贝后在新对象上 push',
     key: 'ERIX_AUDIT_H1C_COPY',
+    expectVia: 'S3-⑦',
     claim: { rel: 'lib/h1c.js', line: 5 },
     files: {
       'lib/h1c.js': [
@@ -4402,6 +4407,7 @@ const PIN_COUNTEREX = [
   {
     name: 'H2a `env[key.toUpperCase()]`',
     key: 'ERIX_AUDIT_H2_UPPER',
+    expectVia: 'S3-⑦',
     claim: { rel: 'lib/h2a.js', line: 2 },
     files: {
       'lib/h2a.js': [
@@ -4415,6 +4421,7 @@ const PIN_COUNTEREX = [
   {
     name: 'H2b 别名下标 `const k = key; env[k]`',
     key: 'ERIX_AUDIT_H2_ALIAS',
+    expectVia: 'S3-⑦',
     claim: { rel: 'lib/h2b.js', line: 2 },
     files: {
       'lib/h2b.js': [
@@ -4429,6 +4436,7 @@ const PIN_COUNTEREX = [
   {
     name: 'H2c 模板下标 `env[`${key}`]`',
     key: 'ERIX_AUDIT_H2_TEMPLATE',
+    expectVia: 'S3-⑦',
     claim: { rel: 'lib/h2c.js', line: 2 },
     files: {
       'lib/h2c.js': [
@@ -4442,6 +4450,7 @@ const PIN_COUNTEREX = [
   {
     name: 'M1 同文件无关作用域的同名 `base`',
     key: 'ERIX_AUDIT_M1_SCOPE',
+    expectVia: 'S3-⑥',
     claim: { rel: 'lib/m1.js', line: 2 },
     files: {
       'lib/m1.js': [
@@ -4487,13 +4496,18 @@ test('#587-S3-⑧ 反例六种在钉住口径下必须红（H1×3 / H2×3 / M1×
     const v = pinRedVerdict(c);
     console.log(`# S3-⑧ ${c.name}（${c.key}）⇒ ${v.via ?? '没红'}｜${v.why}｜`
       + `${JSON.stringify(v.extra)}`);
-    return { name: c.name, key: c.key, via: v.via, why: v.why };
+    return { name: c.name, key: c.key, via: v.via, why: v.why, expectVia: c.expectVia };
   });
   const silent = rows.filter((r) => r.via === null);
   assert.deepEqual(silent, [],
     `这些反例既没被登记成注入站点（S3-⑥ 多一条）也没留在差异里（S3-⑦ 多一条）`
     + ` ⇒ 被静默吞掉了：${JSON.stringify(silent.map((r) => r.name))}`);
   assert.equal(rows.length, PIN_COUNTEREX.length, '反例必须逐条给出红法（不多不少）');
+  // 落点表也被钉住：某条形从「被登记」改成「留差异」（或反之）⇒ 必须人工改本表并写理由。
+  const moved = rows.filter((r) => r.via !== r.expectVia);
+  assert.deepEqual(moved.map((r) => `${r.name}：钉住 ${r.expectVia} ⇒ 现在 ${r.via}`), [],
+    '反例的红法落点变了 ⇒ 提议层的行为变了（例：归属证明被拆 ⇒ H1c 从留差异变成被登记）；'
+    + '确认是真改了就把本表的 expectVia 改成新现实并写理由');
   const by = Object.fromEntries(rows.map((r) => [r.key, r.via]));
   console.log(`# S3-⑧ 汇总（哪条反例红在哪条判据）：${JSON.stringify(by)}`);
 });
