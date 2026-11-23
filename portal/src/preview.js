@@ -338,9 +338,16 @@ export async function authorizeForwardAuth(pool, config, { hostname, hostHeader 
 /**
  * 签发一次性预览 ticket（portal.md §2.8）。返回 { ticket, url, expires_in } 或 { error }。
  * 可见性：private → owner/admin；org-visible/public → 任意已认证用户；他人资源 404（不泄露存在性）。
+ *
+ * `ticketTtlSeconds`（#677 P3 第二批返修）：票有效期现在是**可热改的运行时旋钮**
+ * （`runtime_settings.preview.ticket_ttl_seconds`），所以由**调用方现读后显式传进来**——
+ * 本函数不自己读库（保持纯函数口径：不新增 DB 往返、不依赖 runtime-settings）。
+ * 缺省取 `config.previewTicketTtlSeconds`（启动快照）⇒ 不传该参的既有调用（含单测桩）行为逐字不变。
+ * 同一份值同时用于库内 `expires_at` 与响应 `expires_in`（二者必须同源，否则界面与真到期分叉）。
  */
 export async function issuePreviewTicket(pool, config, {
   allocationId, session, ip = null, ua = null, now = new Date(), publicBaseUrl = null,
+  ticketTtlSeconds = config.previewTicketTtlSeconds,
 } = {}) {
   const r = await pool.query(
     `SELECT id, fde_id, state, exposure, hostname, url FROM port_allocations WHERE id = $1`,
@@ -362,7 +369,8 @@ export async function issuePreviewTicket(pool, config, {
 
   const ticket = `pt_${crypto.randomBytes(32).toString('base64url')}`;
   const tokenHash = hashToken(ticket);
-  const expiresAt = new Date(now.getTime() + config.previewTicketTtlSeconds * 1000);
+  // TTL 来自上面的显式入参（缺省 = 启动快照）；调用方现读热旋钮后传入 ⇒ 本行不再碰 config。
+  const expiresAt = new Date(now.getTime() + ticketTtlSeconds * 1000);
   await pool.query(
     `INSERT INTO preview_grants
         (token_hash, user_id, issuer_id, allocation_id, kind, state, expires_at, created_ip, created_ua, login_session_id)
@@ -387,6 +395,7 @@ export async function issuePreviewTicket(pool, config, {
   return {
     ticket,
     url: `${base}?preview_ticket=${ticket}`,
-    expires_in: config.previewTicketTtlSeconds,
+    // 与库内 `expires_at` 同一个数（同一份 `ticketTtlSeconds`）：响应说的有效期就是真到期。
+    expires_in: ticketTtlSeconds,
   };
 }

@@ -4592,12 +4592,21 @@ async function handlePreviewTicket(req, res, ctx, portId) {
     });
   }
 
+  // #677 P3 第二批返修：单据端点也**现读**热旋钮（与批量端点同一口径、同一个
+  // `readPreviewTicketTtlSeconds`）——上一轮只改了批量，同一个旋钮两处消费点就出现两种行为
+  // （运维改了值，批量票变了、单据票没变）。⚠ 这一行**不是**「每个请求都发一次 DB 读」：只在
+  //   **签发预览票**这一次走；`readPreviewTicketTtlSeconds` 带 5s 缓存 + 同池在飞合并，同进程
+  //   同池最多 5 秒一次整表读；管理台写完会失效缓存，本进程下一次签票就用新值。
+  const ticketTtlSeconds = await runtimeSettings.readPreviewTicketTtlSeconds({
+    pool: ctx.pool, config: ctx.config, log: ctx.log,
+  });
   const result = await preview.issuePreviewTicket(ctx.pool, ctx.config, {
     allocationId: portId,
     session,
     ip,
     ua: req.headers['user-agent'] ?? null,
     publicBaseUrl: previewPublicBaseFromRequest(req),
+    ticketTtlSeconds,
   });
   if (result.error) {
     const { status, code } = result.error;
@@ -4617,8 +4626,9 @@ async function handlePreviewTicket(req, res, ctx, portId) {
  * 不给 ⇒ 该 FDE **全部活行**（`state <> 'released'`，含 `scope='project'` 遗留行），按 `port ASC`。
  *
  * 三条实现纪律（评审口径）：
- *  ① **复用** `preview.issuePreviewTicket`（幂等/哈希/过期/审计口径只有一份；本文件不复制签发逻辑，
- *     `preview.js` 的 `issuePreviewTicket` 本体一字未改）；
+ *  ① **复用** `preview.issuePreviewTicket`（幂等/哈希/过期/审计口径只有一份；本文件不复制签发逻辑。
+ *     口径修正：#677 P3 第二批返修给本体加了一个**显式 TTL 入参** `ticketTtlSeconds`（缺省取
+ *     `config.previewTicketTtlSeconds` ⇒ 不传参的旧调用逐字不变），除此之外签发逻辑仍只有一份）；
  *  ② **上限 = `PREVIEW_PORT_COUNT`**（与号池块大小同源，不写死数字）；超出 ⇒ `400 validation_failed`
  *     + `details.field='allocation_ids'`（**零新错误码**）；
  *  ③ 越界（别人的 / 不存在的 / 已 released 的 allocation）⇒ 复用 `404 not_found`（与单据端点同码，
@@ -4702,14 +4712,25 @@ async function handleBatchPreviewTickets(req, res, ctx) {
   }
 
   // ④ 逐张签发（同一 `now` ⇒ 整批同一个 expires_at，响应里不用为每张票各算一次 TTL）。
+  // #677 P3 第二批：预览票有效期现在是**可热改的运行时旋钮**（`runtime_settings.preview.
+  // ticket_ttl_seconds`）。⚠ 这一行**不是**「每个请求都发一次 DB 读」：只在**签发预览票**
+  //   这一次走；且 `readPreviewTicketTtlSeconds` 带 5s 缓存 + 同池在飞合并，同进程同池
+  //   最多 5 秒一次整表读（口径与会话 TTL 那格逐字相同）。管理台改完 → 本进程下一次
+  //   签票就用新值（写路径会失效缓存）；别的副本最多 5 秒追上。票的其它语义（`expiresAt`
+  //   的算法、响应形状）一概不动，只把「用哪个秒数」从启动快照改成现读。
+  // ⚠ 同一请求**只现读一次**：下面循环里每张票与 ⑤ 的审计都复用同一个 `ticketTtlSeconds`
+  //   （不是多调一次：两次调用会命中 5s 缓存，但同一批票的两个数必须同源，不靠缓存当保证）。
   const now = new Date();
   const ua = req.headers['user-agent'] ?? null;
   const publicBaseUrl = previewPublicBaseFromRequest(req);
+  const ticketTtlSeconds = await runtimeSettings.readPreviewTicketTtlSeconds({
+    pool: ctx.pool, config: ctx.config, log: ctx.log,
+  });
   const issued = [];
   try {
     for (const target of targets) {
       const result = await preview.issuePreviewTicket(ctx.pool, ctx.config, {
-        allocationId: target.id, session, ip, ua, now, publicBaseUrl,
+        allocationId: target.id, session, ip, ua, now, publicBaseUrl, ticketTtlSeconds,
       });
       if (result.error) {
         const { status, code } = result.error;
@@ -4732,16 +4753,8 @@ async function handleBatchPreviewTickets(req, res, ctx) {
     throw err;
   }
 
-  // ⑤ 审计逐张各一行（不写 url —— 它带票）。
-  // #677 P3 第二批：预览票有效期现在是**可热改的运行时旋钮**（`runtime_settings.preview.
-  // ticket_ttl_seconds`）。⚠ 这一行**不是**「每个请求都发一次 DB 读」：只在**签发预览票**
-  //   这一次走；且 `readPreviewTicketTtlSeconds` 带 5s 缓存 + 同池在飞合并，同进程同池
-  //   最多 5 秒一次整表读（口径与会话 TTL 那格逐字相同）。管理台改完 → 本进程下一次
-  //   签票就用新值（写路径会失效缓存）；别的副本最多 5 秒追上。票的其它语义（`expiresAt`
-  //   的算法、响应形状）一概不动，只把「用哪个秒数」从启动快照改成现读。
-  const ticketTtlSeconds = await runtimeSettings.readPreviewTicketTtlSeconds({
-    pool: ctx.pool, config: ctx.config, log: ctx.log,
-  });
+  // ⑤ 审计逐张各一行（不写 url —— 它带票）。`ticketTtlSeconds` 复用 ④ 那一次现读（见上），
+  //    所以审计里的 `expires_at`、响应里的 `expires_at` 与票在库里的 `expires_at` 同一个数。
   const expiresAt = new Date(now.getTime() + ticketTtlSeconds * 1000).toISOString();
   for (const { target, result } of issued) {
     await auth.audit(ctx.pool, {
