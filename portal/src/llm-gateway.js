@@ -137,6 +137,8 @@ export function createLlmGatewayClient({
     blockKey: (body) => post('/key/block', body),
     unblockKey: (body) => post('/key/unblock', body),
     keyInfo: (key) => request('GET', '/key/info', { query: { key } }),
+    // issue #719：读 LiteLLM 自己的每日用量聚合端点，portal 绝不自算 token。
+    userDailyActivity: (query) => request('GET', '/user/daily/activity/aggregated', { query }),
     listModels: () => request('GET', '/model/info'),
     createModel: (body) => post('/model/new', body),
     updateModel: ({ model_id, ...body }) => patch(`/model/${encodeURIComponent(model_id)}/update`, body),

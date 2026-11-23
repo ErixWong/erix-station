@@ -23,6 +23,9 @@ import {
   getFdeLlmEcho,
   getFdeLlmHeartbeatModels,
   setFdeLlmConfig,
+  setFdeDailyBudget,
+  getFdeDailyBudget,
+  getFdeDailyUsage,
   revokeFdeLlmConfigTx,
   syncFdeLlmBindingOnOnboard,
   LlmError,
@@ -66,6 +69,10 @@ class LlmFakePool {
     this.deleteModelError = null;
     this.updateKeyError = null;
     this.activeRun = false;     // N2/N3：fdeHasActiveRun 同口径的活跃 run 开关（llm.js 事务内复检用）
+    // issue #719：keyInfo 可注入额度明细、userDailyActivity 可注入用量；均记录调用供断言。
+    this.keyInfoExtra = null;
+    this.dailyActivityResult = { results: [] };
+    this.userDailyActivityCalls = [];
   }
 
   #gatewayError(status, message) {
@@ -271,7 +278,14 @@ class LlmFakePool {
 
   async keyInfo(key) {
     this.gatewayCalls.push({ method: 'keyInfo', key });
-    return { info: { key_alias: key } };
+    return { info: { key_alias: key, ...(this.keyInfoExtra ?? {}) } };
+  }
+
+  async userDailyActivity(query) {
+    this.gatewayCalls.push({ method: 'userDailyActivity', query });
+    this.userDailyActivityCalls.push(query);
+    if (this.userDailyActivityError) throw this.userDailyActivityError;
+    return this.dailyActivityResult;
   }
 
   async query(sql, params = []) {
@@ -440,6 +454,7 @@ class LlmFakePool {
         main_model_name: b.main_model_name ?? null,
         embedding_model_id: b.embedding_model_id ?? null, vision_model_id: b.vision_model_id ?? null,
         embedding_model_name: b.embedding_model_name ?? null, vision_model_name: b.vision_model_name ?? null,
+        daily_budget_usd: b.daily_budget_usd ?? null,
       }] : [] };
     }
     if (sql.includes('SELECT state, provider_id, api_key, key_id, key_alias, gateway, gateway_user_id')) {
@@ -495,6 +510,12 @@ class LlmFakePool {
         });
         if (incrementGeneration) b.generation = (b.generation ?? 1) + 1;
       }
+      return { rows: [], rowCount: b ? 1 : 0 };
+    }
+    if (sql.includes('UPDATE fde_llm_bindings') && sql.includes('SET daily_budget_usd = $2')) {
+      const [fdeId, dailyBudgetUsd] = params;
+      const b = this.bindings.find((x) => x.fde_id === fdeId);
+      if (b) { b.daily_budget_usd = dailyBudgetUsd; b.updated_at = new Date(); }
       return { rows: [], rowCount: b ? 1 : 0 };
     }
     if (sql.includes('INSERT INTO fde_llm_bindings')) {
@@ -1932,7 +1953,8 @@ test('setFdeLlmConfig：active LiteLLM key 原地更新白名单，不铸新 key
 
   assert.deepEqual(
     pool.gatewayCalls.filter((call) => call.method === 'updateKey').map((call) => call.body),
-    [{ key: original.api_key, models: ['deepseek-flash', 'text-embedding-3'] }],
+    [{ key: original.api_key, models: ['deepseek-flash', 'text-embedding-3'], max_budget: null, budget_duration: null }],
+    '重存已有 key 时一并带 max_budget/budget_duration（#719：DB 无额度 ⇒ 显式 null）',
   );
   assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 1);
   assert.equal(updated.api_key, first.api_key);
@@ -2635,4 +2657,221 @@ test('B1：syncFdeLlmBindingOnOnboard——needRecreate 时 active binding 仍�
   );
   assert.equal(empty.outbox.length, 0, '新 FDE 没有 binding 时，provision sync 不写路由 outbox');
   assert.equal(empty.gatewayCalls.length, 0, '新 FDE 没有 binding 时，provision sync 不调用 LiteLLM');
+});
+
+// ---------------------------------------------------------------------------
+// issue #719：每 FDE 日额度（USD/天）读写 + 历史用量（读 LiteLLM，不自算）。
+// ---------------------------------------------------------------------------
+
+function budgetPool({ dailyBudgetUsd = null, withUser = true } = {}) {
+  return new LlmFakePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [{
+      fde_id: 'u1', gateway: 'litellm', state: 'active', generation: 1,
+      provider_id: 'p1', api_key: 'sk-live-abcdef123456', key_id: 'key-1', key_alias: 'fde-alice',
+      gateway_user_id: withUser ? 'gateway-user-alice' : null,
+      main_model_id: 'deepseek-flash', main_model_name: 'DeepSeek Flash',
+      daily_budget_usd: dailyBudgetUsd,
+    }],
+  });
+}
+
+test('#719 setFdeDailyBudget：updateKey body 带 max_budget + budget_duration:"1d"，后回写 DB', async () => {
+  const pool = budgetPool({ dailyBudgetUsd: '2.000000' });
+  pool.keyInfoExtra = { max_budget: 10, budget_duration: '1d', budget_reset_at: '2026-11-24T00:00:00Z', spend: 1 };
+  const quota = await setFdeDailyBudget(pool, { fdeName: 'alice', dailyBudgetUsd: 10, gateway: pool });
+  const upd = pool.gatewayCalls.find((c) => c.method === 'updateKey');
+  assert.ok(upd, '应调用 updateKey');
+  assert.equal(upd.body.key, 'sk-live-abcdef123456');
+  assert.equal(upd.body.max_budget, 10);
+  assert.equal(upd.body.budget_duration, '1d');
+  // 先网关后 DB：UPDATE 的 sqlLog 必须排在 updateKey 之后（网关失败不写 DB 的前提）。
+  assert.equal(pool.bindings[0].daily_budget_usd, 10, 'DB 回写为新额度');
+  // 响应是 quota 形状（同 GET），daily_budget_usd 取 DB 真相、明细取 keyInfo。
+  assert.equal(quota.daily_budget_usd, 10);
+  assert.equal(quota.max_budget, 10);
+  assert.equal(quota.budget_duration, '1d');
+  assert.equal(quota.budget_reset_at, '2026-11-24T00:00:00Z');
+  assert.equal(quota.spend, 1);
+  assert.equal(quota.remaining, 9);
+});
+
+test('#719 setFdeDailyBudget：null 清空 → updateKey 两字段都传 null', async () => {
+  const pool = budgetPool({ dailyBudgetUsd: '5.000000' });
+  pool.keyInfoExtra = { max_budget: null, budget_duration: null, budget_reset_at: null, spend: 0 };
+  const quota = await setFdeDailyBudget(pool, { fdeName: 'alice', dailyBudgetUsd: null, gateway: pool });
+  const upd = pool.gatewayCalls.find((c) => c.method === 'updateKey');
+  assert.equal(upd.body.max_budget, null);
+  assert.equal(upd.body.budget_duration, null);
+  assert.equal(pool.bindings[0].daily_budget_usd, null, 'DB 清空为 null');
+  assert.equal(quota.remaining, null, '无额度时 remaining = null');
+});
+
+test('#719 setFdeDailyBudget：非法值（0/负/NaN/非数/超上限）→ validation_failed 且不调网关', async () => {
+  for (const bad of [0, -1, Number.NaN, 'x', 100001, Infinity]) {
+    const pool = budgetPool({ dailyBudgetUsd: '5.000000' });
+    await assert.rejects(
+      () => setFdeDailyBudget(pool, { fdeName: 'alice', dailyBudgetUsd: bad, gateway: pool }),
+      (e) => e instanceof LlmError && e.code === 'validation_failed' && e.details?.field === 'daily_budget_usd',
+      `传入 ${String(bad)} 应被拒`,
+    );
+    assert.equal(pool.gatewayCalls.filter((c) => c.method === 'updateKey').length, 0, `${String(bad)} 不应打网关`);
+    assert.equal(pool.gatewayCalls.length, 0, `${String(bad)} 完全没调网关`);
+    assert.equal(pool.bindings[0].daily_budget_usd, '5.000000', `${String(bad)} 被拒时 DB 不变`);
+  }
+});
+
+test('#719 setFdeDailyBudget：边界 100000 合法（≤ 上限）、updateKey 失败 → DB 未变（不造分叉）', async () => {
+  const okPool = budgetPool({ dailyBudgetUsd: null });
+  await setFdeDailyBudget(okPool, { fdeName: 'alice', dailyBudgetUsd: 100000, gateway: okPool });
+  assert.equal(okPool.bindings[0].daily_budget_usd, 100000, '上限值本身合法');
+
+  const failPool = budgetPool({ dailyBudgetUsd: '7.000000' });
+  failPool.updateKeyError = new Error('gateway down');
+  await assert.rejects(() => setFdeDailyBudget(failPool, { fdeName: 'alice', dailyBudgetUsd: 20, gateway: failPool }));
+  assert.equal(failPool.bindings[0].daily_budget_usd, '7.000000', '网关失败 ⇒ DB 保持旧值');
+  assert.equal(failPool.sqlLog.some((s) => s.sql.includes('SET daily_budget_usd = $2')), false, '网关失败 ⇒ 根本没发 UPDATE');
+});
+
+test('#719 getFdeDailyBudget：daily_budget_usd 取 DB、明细取 keyInfo；响应不含明文 api_key', async () => {
+  const pool = budgetPool({ dailyBudgetUsd: '5.000000' });
+  pool.keyInfoExtra = { max_budget: 5, budget_duration: '1d', budget_reset_at: '2026-11-24T00:00:00Z', spend: 1.25 };
+  const quota = await getFdeDailyBudget(pool, { fdeName: 'alice', gateway: pool });
+  assert.deepEqual(Object.keys(quota).sort(),
+    ['budget_duration', 'budget_reset_at', 'daily_budget_usd', 'max_budget', 'remaining', 'spend']);
+  assert.equal(quota.daily_budget_usd, 5, 'numeric 串 5.000000 转成数字 5');
+  assert.equal(quota.max_budget, 5);
+  assert.equal(quota.spend, 1.25);
+  assert.equal(quota.remaining, 3.75);
+  // keyInfo 用真实 api_key 去查，但响应里绝不出现完整 key。
+  assert.equal(pool.gatewayCalls.find((c) => c.method === 'keyInfo').key, 'sk-live-abcdef123456');
+  assert.equal(JSON.stringify(quota).includes('sk-live-abcdef123456'), false, '响应不含明文 api_key');
+});
+
+test('#719 getFdeDailyBudget：无 active litellm binding → not_found，且不打网关', async () => {
+  const pool = budgetPool();
+  pool.bindings[0].state = 'revoked';
+  await assert.rejects(
+    () => getFdeDailyBudget(pool, { fdeName: 'alice', gateway: pool }),
+    (e) => e instanceof LlmError && e.httpStatus === 404,
+  );
+  assert.equal(pool.gatewayCalls.length, 0);
+});
+
+test('#719 getFdeDailyUsage：映射 + totals；query 带 timezone:480 + 14 天区间（UTC+8）', async () => {
+  const pool = budgetPool({ dailyBudgetUsd: '10.000000' });
+  pool.dailyActivityResult = {
+    results: [
+      { date: '2026-11-22', metrics: { spend: 2, prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, api_requests: 3 } },
+      { date: '2026-11-23', metrics: { spend: 1.5, prompt_tokens: 200, completion_tokens: 100, total_tokens: 300, api_requests: 5 } },
+    ],
+  };
+  const usage = await getFdeDailyUsage(pool, { fdeName: 'alice', gateway: pool });
+  assert.deepEqual(usage.days.map((d) => d.date), ['2026-11-22', '2026-11-23']);
+  assert.deepEqual(usage.days[0], {
+    date: '2026-11-22', spend: 2, prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, api_requests: 3,
+  });
+  assert.deepEqual(usage.totals, { spend: 3.5, total_tokens: 450 });
+  const q = pool.userDailyActivityCalls[0];
+  assert.equal(q.user_id, 'gateway-user-alice');
+  assert.equal(q.timezone, 480);
+  assert.match(q.start_date, /^\d{4}-\d{2}-\d{2}$/);
+  assert.match(q.end_date, /^\d{4}-\d{2}-\d{2}$/);
+  const spanDays = (Date.parse(q.end_date) - Date.parse(q.start_date)) / 86_400_000;
+  assert.equal(spanDays, 13, '默认 days=14 ⇒ 区间跨度 13 天');
+});
+
+test('#719 getFdeDailyUsage：days 上限 90（超界钳到 89 天跨度）/ 非法 days 回落 14', async () => {
+  const pool = budgetPool({ dailyBudgetUsd: '10.000000' });
+  await getFdeDailyUsage(pool, { fdeName: 'alice', gateway: pool, days: 1000 });
+  const big = pool.userDailyActivityCalls.at(-1);
+  assert.equal((Date.parse(big.end_date) - Date.parse(big.start_date)) / 86_400_000, 89, 'days=1000 钳到 90 ⇒ 跨度 89');
+
+  const pool2 = budgetPool();
+  await getFdeDailyUsage(pool2, { fdeName: 'alice', gateway: pool2, days: 'abc' });
+  const bad = pool2.userDailyActivityCalls.at(-1);
+  assert.equal((Date.parse(bad.end_date) - Date.parse(bad.start_date)) / 86_400_000, 13, '非法 days 回落 14');
+});
+
+test('#719 getFdeDailyUsage：网关不可达 ⇒ 抛 LlmGatewayError（不吞）', async () => {
+  const pool = budgetPool();
+  pool.userDailyActivityError = new Error('unreachable');
+  await assert.rejects(
+    () => getFdeDailyUsage(pool, { fdeName: 'alice', gateway: pool }),
+    (e) => e.message === 'unreachable',
+  );
+});
+
+test('#719 generateFdeKey 轮换带额度：setFdeLlmConfig 在 key 缺失重铸时把 DB 的 daily_budget_usd 下发到新 key', async () => {
+  // 坑 2：binding 有 active litellm key，但网关报 key 不存在 ⇒ 走重铸；重铸必须带 max_budget。
+  const pool = new LlmFakePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    providers: [{ id: 'p1', name: 'deepseek', base_url: 'https://api.deepseek.com/v1', enabled: true }],
+    models: [
+      { id: 'm-main', provider_id: 'p1', model_id: 'deepseek-flash', name: 'DeepSeek Flash', type: 'text', tool_calling: true, enabled: true },
+      { id: 'm-vis', provider_id: 'p1', model_id: 'deepseek-flash', name: 'DeepSeek Vision', type: 'vision', tool_calling: false, enabled: true },
+    ],
+    bindings: [{
+      fde_id: 'u1', gateway: 'litellm', state: 'active', generation: 1, provider_id: 'p1',
+      api_key: 'sk-gone-key', key_id: 'key-1', key_alias: 'fde-alice', gateway_user_id: 'gu-alice',
+      main_model_id: 'm-main', main_model_name: 'DeepSeek Flash',
+      embedding_model_id: null, embedding_model_name: null, vision_model_id: null, vision_model_name: null,
+      daily_budget_usd: '8.000000',
+    }],
+  });
+  // 让 updateKey 报「key 不存在」，触发重铸路径。
+  pool.updateKeyError = Object.assign(new Error('key not found'), { status: 404 });
+  await setFdeLlmConfig(pool, { fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main', vision_model_id: 'm-vis', force: true, gateway: pool });
+  const gen = pool.gatewayCalls.find((c) => c.method === 'generateKey');
+  assert.ok(gen, '应重铸 key');
+  assert.equal(gen.body.max_budget, 8, '重铸必须带 DB 里的额度');
+  assert.equal(gen.body.budget_duration, '1d');
+});
+
+test('#719 generateFdeKey 轮换带额度：syncFdeLlmBindingOnOnboard 恢复 revoked binding 时也带 DB 额度', async () => {
+  const pool = new LlmFakePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    providers: [{ id: 'p1', name: 'p1', base_url: 'https://api.deepseek.com/v1', enabled: true }],
+    models: [{ id: 'm-main', provider_id: 'p1', model_id: 'deepseek-flash', name: 'DeepSeek Flash', type: 'text', tool_calling: true, enabled: true }],
+    bindings: [{
+      fde_id: 'u1', gateway: 'litellm', state: 'revoked', generation: 1, provider_id: 'p1',
+      api_key: null, key_id: null, key_alias: 'fde-alice', gateway_user_id: 'gu-alice',
+      main_model_id: 'm-main', main_model_name: 'DeepSeek Flash', daily_budget_usd: '3.500000',
+    }],
+  });
+  await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: true, gateway: pool });
+  const gen = pool.gatewayCalls.find((c) => c.method === 'generateKey');
+  assert.ok(gen, '恢复 revoked 应重铸 key');
+  assert.equal(gen.body.max_budget, 3.5, '重铸必须带 DB 里的额度');
+  assert.equal(gen.body.budget_duration, '1d');
+});
+
+test('#719 setFdeLlmConfig 重存已有 key：updateKey 一并带 DB 额度（有额度→设，无→显式清空）', async () => {
+  // active litellm binding，改 main_model_id ⇒ 非 sameBinding ⇒ 走 updateKey 重存路径。
+  const mk = (dailyBudgetUsd) => new LlmFakePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    providers: [{ id: 'p1', name: 'deepseek', base_url: 'https://api.deepseek.com/v1', enabled: true }],
+    models: [
+      { id: 'm-main', provider_id: 'p1', model_id: 'deepseek-flash', name: 'DeepSeek Flash', type: 'text', tool_calling: true, enabled: true },
+      { id: 'm-vis', provider_id: 'p1', model_id: 'deepseek-flash', name: 'DeepSeek Vision', type: 'vision', tool_calling: false, enabled: true },
+    ],
+    bindings: [{
+      fde_id: 'u1', gateway: 'litellm', state: 'active', generation: 1, provider_id: 'p1',
+      api_key: 'sk-live-key', key_id: 'key-1', key_alias: 'fde-alice', gateway_user_id: 'gu-alice',
+      main_model_id: 'm-main', main_model_name: 'DeepSeek Flash',
+      embedding_model_id: null, embedding_model_name: null, vision_model_id: null, vision_model_name: null,
+      daily_budget_usd: dailyBudgetUsd,
+    }],
+  });
+  const withBudget = mk('6.000000');
+  await setFdeLlmConfig(withBudget, { fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main', vision_model_id: 'm-vis', force: true, gateway: withBudget });
+  const u1 = withBudget.gatewayCalls.find((c) => c.method === 'updateKey');
+  assert.equal(u1.body.max_budget, 6);
+  assert.equal(u1.body.budget_duration, '1d');
+
+  const noBudget = mk(null);
+  await setFdeLlmConfig(noBudget, { fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main', vision_model_id: 'm-vis', force: true, gateway: noBudget });
+  const u2 = noBudget.gatewayCalls.find((c) => c.method === 'updateKey');
+  assert.equal(u2.body.max_budget, null);
+  assert.equal(u2.body.budget_duration, null);
 });
