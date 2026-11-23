@@ -58,7 +58,30 @@ import {
   PREVIEW_SESSION_TTL_DEFAULT_SECONDS, parsePreviewSessionTtlSeconds,
   validatePreviewSessionTtlSeconds, PREVIEW_SESSION_TTL_HINT,
   readPreviewSessionTtlSeconds, invalidatePreviewSessionTtlCache,
+  ONBOARDING_IDLE_BACKOFF_MS_KEY, OFFBOARDING_IDLE_BACKOFF_MS_KEY, PROVISIONER_IDLE_BACKOFF_MS_KEY,
+  IDLE_BACKOFF_MS_MIN, IDLE_BACKOFF_MS_SHARED_MAX, PROVISIONER_IDLE_BACKOFF_MS_BUSINESS_CAP,
+  ONBOARDING_IDLE_BACKOFF_MS_DEFAULT, OFFBOARDING_IDLE_BACKOFF_MS_DEFAULT,
+  PROVISIONER_IDLE_BACKOFF_MS_DEFAULT,
+  ONBOARDING_IDLE_BACKOFF_MS_HINT, OFFBOARDING_IDLE_BACKOFF_MS_HINT, PROVISIONER_IDLE_BACKOFF_MS_HINT,
+  parseOnboardingIdleBackoffMs, validateOnboardingIdleBackoffMs,
+  parseOffboardingIdleBackoffMs, validateOffboardingIdleBackoffMs,
+  parseProvisionerIdleBackoffMs, validateProvisionerIdleBackoffMs,
+  readOnboardingIdleBackoffMaxMs, invalidateOnboardingIdleBackoffCache,
+  readOffboardingIdleBackoffMaxMs, invalidateOffboardingIdleBackoffCache,
+  readProvisionerIdleBackoffMaxMs, invalidateProvisionerIdleBackoffCache,
 } from '../src/runtime-settings.js';
+import { MAX_BACKOFF_MS_SAFE } from '../src/loop-timing.js';
+import {
+  IDLE_BACKOFF_MAX_MS_DEFAULT as ONBOARDING_LOOP_DEFAULT,
+} from '../src/onboarding.js';
+import {
+  IDLE_BACKOFF_MAX_MS_DEFAULT as OFFBOARDING_LOOP_DEFAULT,
+} from '../src/offboarding.js';
+import {
+  IDLE_BACKOFF_MAX_MS_DEFAULT as PROVISIONER_LOOP_DEFAULT,
+  IDLE_BACKOFF_MAX_MS_BUSINESS_CAP as PROVISIONER_LOOP_CAP,
+  resolveIdleBackoffMaxMs,
+} from '../src/provisioner.js';
 import { loadConfig } from '../src/config.js';
 
 const ACTOR = 'd0000000-0000-4000-8000-0000000000a1';
@@ -592,15 +615,18 @@ test('RS-6b 审计被抑制 ⇒ 抛 500 且**设置没落库**（检查在 COMMI
 // ---------------------------------------------------------------------------
 
 test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_days'
-  + ' + preview.ticket_ttl_seconds + session.auto_title_min_new + preview.session_ttl_seconds',
-  async () => {
+  + ' + preview.ticket_ttl_seconds + session.auto_title_min_new + preview.session_ttl_seconds'
+  + ' + 三个退避旋钮', async () => {
   // P1 时这一格钉的是「registry 是空对象」；P2a 迁了第一格 ⇒ 判据改成「只迁了这一格」；
-  // P3 第一/二/三批各迁一格、第五批迁第五格 ⇒ 判据改成「就这五格，不多不少」。
+  // P3 第一/二/三批各迁一格、第五批迁第五格、第六批一次迁三个循环的空闲退避上限
+  // ⇒ 判据改成「就这八格，不多不少」。
   // 它红了的读法不变：有人顺手多迁了一格（或把热读口径弄丢了）。
   assert.deepEqual(Object.keys(RUNTIME_SETTING_REGISTRY),
     ['session.ttl_seconds', 'workspace.retention_days', 'preview.ticket_ttl_seconds',
-      'session.auto_title_min_new', 'preview.session_ttl_seconds'],
-    'P3 只许迁这五格（其余旋钮逐批填）');
+      'session.auto_title_min_new', 'preview.session_ttl_seconds',
+      'loop.onboarding_idle_backoff_ms', 'loop.offboarding_idle_backoff_ms',
+      'loop.provisioner_idle_backoff_ms'],
+    'P3 只许迁这八格（其余旋钮逐批填）');
   assert.ok(Object.isFrozen(RUNTIME_SETTING_REGISTRY), 'registry 必须冻结（运行期没人能塞旋钮进来）');
   const entry = RUNTIME_SETTING_REGISTRY['session.ttl_seconds'];
   assert.ok(Object.isFrozen(entry), '条目也必须冻结');
@@ -692,7 +718,18 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   assert.notEqual(HOT_READ_INVALIDATORS.get(PREVIEW_SESSION_TTL_KEY),
     HOT_READ_INVALIDATORS.get(PREVIEW_TICKET_TTL_KEY),
     '第五格不许共用第三格的失效函数（会话 TTL 与票 TTL 各有各的缓存）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 5, '登记表里就是五格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 8, '登记表里就是八格（热读旋钮数 = 失效钩子数）');
+
+  // P3 第六批的三格：同一个口径再钉一次（各自一个导出的失效函数，且互相不许共用）。
+  assert.equal(HOT_READ_INVALIDATORS.get(ONBOARDING_IDLE_BACKOFF_MS_KEY),
+    invalidateOnboardingIdleBackoffCache);
+  assert.equal(HOT_READ_INVALIDATORS.get(OFFBOARDING_IDLE_BACKOFF_MS_KEY),
+    invalidateOffboardingIdleBackoffCache);
+  assert.equal(HOT_READ_INVALIDATORS.get(PROVISIONER_IDLE_BACKOFF_MS_KEY),
+    invalidateProvisionerIdleBackoffCache);
+  assert.equal(new Set([...HOT_READ_INVALIDATORS.values()]).size, HOT_READ_INVALIDATORS.size,
+    '一格一个失效函数：共用就是「保存开户那格把对账那格的缓存也抹了」（RS-51 钉另一面）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 8, '登记表里就是八格（热读旋钮数 = 失效钩子数）');
 
   assert.equal(isKnownSetting('demo.limit'), false, '真实 registry 里没有 demo.limit');
   assert.equal(isKnownSetting('constructor'), false,
@@ -1202,7 +1239,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   const fromDb = await listRuntimeSettingsAdmin({
     pool: dbPool, config: CONFIG_ENV, env: {}, log: silentLog,
   });
-  assert.equal(fromDb.items.length, 5);
+  assert.equal(fromDb.items.length, 8);
   assert.deepEqual(Object.keys(fromDb.items[0]).sort(),
     ['applyMode', 'key', 'label', 'reason', 'source', 'updatedAt', 'updatedBy', 'value'].sort());
   assert.deepEqual(fromDb.items[0], {
@@ -1262,7 +1299,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     pool: ttlPool({ throwOnSelect: Object.assign(new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
     config: CONFIG_ENV, log: deadLog,
   });
-  assert.equal(dead.items.length, 5, '读失败时五格都要给得出来（不是只给前几格）');
+  assert.equal(dead.items.length, 8, '读失败时八格都要给得出来（不是只给前几格）');
   assert.equal(dead.items[0].source, 'env');
   assert.equal(dead.items[0].reason, 'read_failed');
   assert.equal(deadLog.seen.warn.length, 1, '有人在屏幕前等答案 ⇒ 读失败要 warn（不像启动路径只能 debug）');
@@ -2263,7 +2300,7 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   // GET 两格：登记了的那格原样带出，没登记的那格**不许**出现这个键（缺席 ≠ null ≠ 空串）。
   const cfg = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
   const list = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: cfg, env: {}, log: silentLog });
-  assert.equal(list.items.length, 5);
+  assert.equal(list.items.length, 8);
   const retItem = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
   assert.equal(retItem.hint, WORKSPACE_RETENTION_HINT,
     'DTO 必须逐字透出 registry 那句话（前端自己另写一份 = 第二份真相）');
@@ -3665,3 +3702,247 @@ test('RS-57 §4.21 第五格那一行多钉一层：值域 / 默认 / 生效点�
   assert.match(text, /handleForwardAuth|Set-Cookie|preview\.js/,
     '第五格那一行必须写出生效点（谁在什么时候读它）');
 });
+
+// 11. #677 P3 第六批：三个循环空闲退避旋钮（loop.*_idle_backoff_ms）一起迁。
+//   这一族的形状与前面四格不同：**一次迁三格，且三格是同一类旋钮**。于是这里要钉的是三件事：
+//     · 值域不许自己发明（RS-49）—— 上界必须引用 `loop-timing.js` 的共享上限 / 对账的业务上限，
+//       且 provisioner 那条「env=60000 ⇒ 生效 15000」的既有钳位行为必须原样存在（新旧同值）；
+//     · 三格各自一份热读实例（RS-51）—— 共用一个实例就是「保存开户那格把对账那格的缓存抹掉」，
+//       那一刀（变异②）在这格点名红；
+//     · registry 登记 / 写路径失效 / 契约文档三处都齐全（RS-50 / RS-52 / RS-53）。
+//   「现读位置在每一拍决定 sleep 之前」那一半在 `portal/test/idle-backoff-hot-677.test.js`
+//   （循环侧的夹具在那里；变异①「改回启动快照」在那里点名红）。
+// ---------------------------------------------------------------------------
+
+test('RS-49 三个退避旋钮的闸：值域全部来自循环侧既有钳位逻辑（自己发明上界 ⇒ 这一格红）', () => {
+  // 上界的来历必须**可追**：开户 / 销号 = 共享的 `MAX_BACKOFF_MS_SAFE`（Node timer 语义边界），
+  // 对账 = 本循环的业务上限（漂移发现延迟是业务承诺）。两个数都不许在 registry 里各写一份。
+  assert.equal(IDLE_BACKOFF_MS_SHARED_MAX, MAX_BACKOFF_MS_SAFE,
+    '开户/销号的上界必须引用 loop-timing 的共享上限，不是 registry 里另抄一个数');
+  assert.equal(IDLE_BACKOFF_MS_SHARED_MAX, 60_000);
+  assert.equal(PROVISIONER_IDLE_BACKOFF_MS_BUSINESS_CAP, PROVISIONER_LOOP_CAP,
+    '对账的上界必须与 provisioner.js 的 IDLE_BACKOFF_MAX_MS_BUSINESS_CAP 同源');
+  assert.equal(PROVISIONER_IDLE_BACKOFF_MS_BUSINESS_CAP, 15_000, '对账的业务上限是 15000');
+  assert.ok(PROVISIONER_IDLE_BACKOFF_MS_BUSINESS_CAP < IDLE_BACKOFF_MS_SHARED_MAX,
+    '这一族的意义所在：对账的默认 < 共享上限 ⇒ 越界回落与钳位必须落到同一个数');
+  assert.equal(IDLE_BACKOFF_MS_MIN, 1, '0ms = 每拍空转（#506 修掉的形状）⇒ 和非法值一样不进闸');
+
+  // 三格的默认值与各自循环模块同源（漂了的后果不是报错，是管理台显示一个不会生效的数）。
+  assert.equal(ONBOARDING_IDLE_BACKOFF_MS_DEFAULT, ONBOARDING_LOOP_DEFAULT);
+  assert.equal(OFFBOARDING_IDLE_BACKOFF_MS_DEFAULT, OFFBOARDING_LOOP_DEFAULT);
+  assert.equal(PROVISIONER_IDLE_BACKOFF_MS_DEFAULT, PROVISIONER_LOOP_DEFAULT);
+  assert.equal(RUNTIME_SETTING_REGISTRY[PROVISIONER_IDLE_BACKOFF_MS_KEY].defaultValue,
+    PROVISIONER_IDLE_BACKOFF_MS_BUSINESS_CAP,
+    '对账那一格「默认 == 业务上限」是钳位语义等价的前提，漂开就要重新论证');
+
+  // 三条 registry 条目逐字段（envVar 必须是循环真正直读的那个名字，不是 registry 起的新名）。
+  const loopKeys = Object.keys(RUNTIME_SETTING_REGISTRY).filter((k) => k.startsWith('loop.'));
+  assert.equal(loopKeys.length, 3, '本批只迁三个 loop.* 退避旋钮');
+  for (const key of loopKeys) {
+    const entry = RUNTIME_SETTING_REGISTRY[key];
+    assert.equal(entry.key, key);
+    assert.ok(Object.isFrozen(entry), `${key} 的条目必须冻结`);
+    assert.equal(entry.applyMode, 'hot', `${key} 的全部意义就是不用重启`);
+    assert.equal(typeof entry.hint, 'string', `${key} 必须在界面行面上写清值域`);
+    assert.ok(entry.hint.length <= 120, `${key} 的 hint 是界面一行小字：实得 ${entry.hint.length} 字`);
+  }
+  assert.equal(RUNTIME_SETTING_REGISTRY[ONBOARDING_IDLE_BACKOFF_MS_KEY].envVar,
+    'ONBOARDING_IDLE_BACKOFF_MAX_MS');
+  assert.equal(RUNTIME_SETTING_REGISTRY[OFFBOARDING_IDLE_BACKOFF_MS_KEY].envVar,
+    'OFFBOARDING_IDLE_BACKOFF_MAX_MS');
+  assert.equal(RUNTIME_SETTING_REGISTRY[PROVISIONER_IDLE_BACKOFF_MS_KEY].envVar,
+    'PROVISIONER_IDLE_BACKOFF_MAX_MS');
+
+  // 形状闸（三格同口径）：只认纯十进制数字；`'1e4'` / `' 30000 '` / `'-1'` / 小数 / 布尔都不收。
+  for (const bad of ['1e4', ' 30000 ', '-1', '0', '30000.0', '', 30.5, true, null, undefined]) {
+    assert.equal(parseOnboardingIdleBackoffMs(bad).ok, false, `开户格收了 ${JSON.stringify(bad)}`);
+    assert.equal(parseOffboardingIdleBackoffMs(bad).ok, false, `销号格收了 ${JSON.stringify(bad)}`);
+    assert.equal(parseProvisionerIdleBackoffMs(bad).ok, false, `对账格收了 ${JSON.stringify(bad)}`);
+  }
+  assert.deepEqual(parseOnboardingIdleBackoffMs(60_000), { ok: true, value: 60_000 },
+    '上界端点必须收（注释里写了「要更激进就配 60000」）');
+  assert.deepEqual(parseProvisionerIdleBackoffMs(5_000), { ok: true, value: 5_000 },
+    '5000 = 逃生口（不退避）必须收');
+  // 越界拒，且 reason **点名是哪一格**（三格同族 ⇒ 共用 reason 会让人查错循环）。
+  assert.equal(parseOnboardingIdleBackoffMs(60_001).reason, 'onboarding_idle_backoff_out_of_range');
+  assert.equal(parseOffboardingIdleBackoffMs(60_001).reason,
+    'offboarding_idle_backoff_out_of_range');
+  assert.equal(parseProvisionerIdleBackoffMs(15_001).reason,
+    'provisioner_idle_backoff_out_of_range');
+  assert.equal(parseProvisionerIdleBackoffMs(60_000).ok, false,
+    '对账格的 60000 是越界（它的上限是业务上限 15000，不是共享上限）');
+
+  // 写侧原因必须点名上界与来历（运维看到「60000」要知道是谁定的）。
+  assert.match(validateOnboardingIdleBackoffMs(60_001), /60000/);
+  assert.match(validateOffboardingIdleBackoffMs(60_001), /60000/);
+  assert.match(validateProvisionerIdleBackoffMs(16_000), /15000/);
+  assert.match(validateProvisionerIdleBackoffMs(16_000), /业务承诺|漂移/);
+  assert.equal(validateOnboardingIdleBackoffMs(30_000), true);
+  assert.equal(validateProvisionerIdleBackoffMs(15_000), true);
+  assert.match(validateProvisionerIdleBackoffMs(0), /空转/);
+
+  // **钳位行为保留**（工单点名的一条）：env=60000 走旧路径 ⇒ warn + 钳到 15000；
+  // 走新的 registry 闸 ⇒ 拒 + 回落默认 15000。生效值必须**同一个数**，旧路径那条 warn 不许消失。
+  const oldWarns = [];
+  assert.equal(
+    resolveIdleBackoffMaxMs({ log: { warn: (m) => oldWarns.push(String(m)) },
+      env: { PROVISIONER_IDLE_BACKOFF_MAX_MS: '60000' } }),
+    15_000, '旧路径（env 单用）必须仍然钳到业务上限');
+  assert.equal(oldWarns.length, 1, `旧路径那条 warn 必须还在（实得 ${JSON.stringify(oldWarns)}）`);
+  assert.match(oldWarns[0], /PROVISIONER_IDLE_BACKOFF_MAX_MS/);
+  assert.match(oldWarns[0], /15000/);
+});
+
+test('RS-50 三个退避旋钮的热读三档：DB > env（过闸）> 默认；越界不绕过钳位', async () => {
+  // 好值：env 生效（每格用自己的 env 名，名字写错就是「配了个空气」那一族）。
+  invalidateOnboardingIdleBackoffCache();
+  assert.equal(await readOnboardingIdleBackoffMaxMs({
+    pool: ttlPool(), config: {}, env: { ONBOARDING_IDLE_BACKOFF_MAX_MS: '7500' }, log: silentLog,
+  }), 7_500);
+  invalidateOffboardingIdleBackoffCache();
+  assert.equal(await readOffboardingIdleBackoffMaxMs({
+    pool: ttlPool(), config: {}, env: { OFFBOARDING_IDLE_BACKOFF_MAX_MS: '8000' }, log: silentLog,
+  }), 8_000);
+  // 三档全空 ⇒ 各自默认（30000 / 30000 / 15000），绝不 undefined。
+  invalidateProvisionerIdleBackoffCache();
+  assert.equal(await readProvisionerIdleBackoffMaxMs({
+    pool: ttlPool(), config: {}, env: {}, log: silentLog,
+  }), PROVISIONER_IDLE_BACKOFF_MS_DEFAULT);
+
+  // env 越界 ⇒ 回落**本格默认** + 点名 warn：开户 60001 ⇒ 30000（旧路径也是 30000，口径没漂）。
+  invalidateOnboardingIdleBackoffCache();
+  const overLog = collectingLog();
+  assert.equal(await readOnboardingIdleBackoffMaxMs({
+    pool: ttlPool(), config: {}, env: { ONBOARDING_IDLE_BACKOFF_MAX_MS: '60001' }, log: overLog,
+  }), ONBOARDING_IDLE_BACKOFF_MS_DEFAULT);
+  assert.ok(overLog.seen.warn.some((m) => m.includes(ONBOARDING_IDLE_BACKOFF_MS_KEY)
+    && m.includes('ONBOARDING_IDLE_BACKOFF_MAX_MS')),
+    `要点名是哪一格、哪个 env（实得 ${JSON.stringify(overLog.seen.warn)}）`);
+
+  // 对账那一格是这一族的关键：env=60000 ⇒ **15000**（业务上限），既不是 60000 也不是 30000。
+  invalidateProvisionerIdleBackoffCache();
+  const capLog = collectingLog();
+  assert.equal(await readProvisionerIdleBackoffMaxMs({
+    pool: ttlPool(), config: {}, env: { PROVISIONER_IDLE_BACKOFF_MAX_MS: '60000' }, log: capLog,
+  }), PROVISIONER_IDLE_BACKOFF_MS_BUSINESS_CAP,
+    'env 侧的钳位不许因为搬进 registry 就被绕过（放宽到 4 倍 = 漂移发现延迟被静默改掉）');
+  assert.ok(capLog.seen.warn.some((m) => m.includes('PROVISIONER_IDLE_BACKOFF_MAX_MS')),
+    `被闸拒了要说话（实得 ${JSON.stringify(capLog.seen.warn)}）`);
+
+  // DB 值优先于 env；DB 值越界 ⇒ 落 env 那一档的好值（不是直接跳默认）。
+  invalidateOffboardingIdleBackoffCache();
+  const bad = ttlPool({ rows: [{ key: OFFBOARDING_IDLE_BACKOFF_MS_KEY, value: 90_000 }] });
+  assert.equal(await readOffboardingIdleBackoffMaxMs({
+    pool: bad, config: {}, env: { OFFBOARDING_IDLE_BACKOFF_MAX_MS: '8000' }, log: silentLog,
+  }), 8_000, 'DB 坏值 ⇒ 回落 env 那一档（与前面几格同一套 fallback 口径）');
+  invalidateOffboardingIdleBackoffCache();
+  const good = ttlPool({ rows: [{ key: OFFBOARDING_IDLE_BACKOFF_MS_KEY, value: 12_000 }] });
+  assert.equal(await readOffboardingIdleBackoffMaxMs({
+    pool: good, config: {}, env: { OFFBOARDING_IDLE_BACKOFF_MAX_MS: '8000' }, log: silentLog,
+  }), 12_000, 'DB 好值必须压过 env');
+  invalidateOffboardingIdleBackoffCache();
+
+  // 表不在 / 连 pool 都没有 ⇒ 回落 env，绝不抛（循环不许因为配置面坏了停摆）。
+  invalidateOnboardingIdleBackoffCache();
+  assert.equal(await readOnboardingIdleBackoffMaxMs({
+    pool: ttlPool({ throwOnSelect: Object.assign(new Error('no such table'), { code: '42P01' }) }),
+    config: {}, env: { ONBOARDING_IDLE_BACKOFF_MAX_MS: '9000' }, log: silentLog,
+  }), 9_000);
+  assert.equal(await readOnboardingIdleBackoffMaxMs({
+    pool: null, config: {}, env: {}, log: silentLog,
+  }), ONBOARDING_IDLE_BACKOFF_MS_DEFAULT);
+  invalidateOnboardingIdleBackoffCache();
+});
+
+test('RS-51 三格各自一份热读实例：值不串、缓存不串、失效不串（共用实例 ⇒ 这一格红）',
+  async () => {
+    invalidateOnboardingIdleBackoffCache();
+    invalidateOffboardingIdleBackoffCache();
+    invalidateProvisionerIdleBackoffCache();
+    // 同一张表、三个 key、三个不同的数：共用一份实例（同一个 key + 同一份缓存）必拿错数。
+    const pool = ttlPool({ rows: [
+      { key: ONBOARDING_IDLE_BACKOFF_MS_KEY, value: 11_111 },
+      { key: OFFBOARDING_IDLE_BACKOFF_MS_KEY, value: 22_222 },
+      { key: PROVISIONER_IDLE_BACKOFF_MS_KEY, value: 12_222 },
+    ] });
+    const readOn = () => readOnboardingIdleBackoffMaxMs({
+      pool, config: {}, env: {}, log: silentLog,
+    });
+    const readOff = () => readOffboardingIdleBackoffMaxMs({
+      pool, config: {}, env: {}, log: silentLog,
+    });
+    const readProv = () => readProvisionerIdleBackoffMaxMs({
+      pool, config: {}, env: {}, log: silentLog,
+    });
+    assert.equal(await readOn(), 11_111, '开户格读到自己的那一行');
+    assert.equal(await readOff(), 22_222, '销号格读到自己的那一行（串到开户那行 = 共用实例）');
+    assert.equal(await readProv(), 12_222, '对账格读到自己的那一行');
+
+    // 缓存：同一池 5s 内命中自己那一格，不再发 SQL。
+    const afterThree = pool.queryCount;
+    assert.equal(await readOn(), 11_111);
+    assert.equal(pool.queryCount, afterThree, '5s 内重复读不许再发 SQL');
+
+    // 失效只抹自己那一格：保存销号不该让开户那格重读（「保存 TTL 抹掉保留天数」的同型坑）。
+    invalidateOffboardingIdleBackoffCache();
+    assert.equal(await readOff(), 22_222);
+    assert.equal(pool.queryCount, afterThree + 1, '只有被失效那一格该发 SQL');
+    const beforeOther = pool.queryCount;
+    assert.equal(await readOn(), 11_111);
+    assert.equal(await readProv(), 12_222);
+    assert.equal(pool.queryCount, beforeOther,
+      '别格被失效不许把这两格的缓存一起抹掉（+N = 三格共用了一份缓存槽）');
+
+    // 换池不串：B 池必须自己读，不吃 A 池的缓存。
+    const poolB = ttlPool({ rows: [{ key: PROVISIONER_IDLE_BACKOFF_MS_KEY, value: 6_000 }] });
+    assert.equal(await readProvisionerIdleBackoffMaxMs({
+      pool: poolB, config: {}, env: {}, log: silentLog,
+    }), 6_000);
+    assert.equal(poolB.queryCount, 1, 'B 池必须自己发一条');
+    invalidateOnboardingIdleBackoffCache();
+    invalidateOffboardingIdleBackoffCache();
+    invalidateProvisionerIdleBackoffCache();
+  });
+
+test('RS-52 三格都登记了写路径失效（HOT_READ_INVALIDATORS 少一行 ⇒ 这一格点名红）', () => {
+  assert.equal(HOT_READ_INVALIDATORS.get(ONBOARDING_IDLE_BACKOFF_MS_KEY),
+    invalidateOnboardingIdleBackoffCache);
+  assert.equal(HOT_READ_INVALIDATORS.get(OFFBOARDING_IDLE_BACKOFF_MS_KEY),
+    invalidateOffboardingIdleBackoffCache);
+  assert.equal(HOT_READ_INVALIDATORS.get(PROVISIONER_IDLE_BACKOFF_MS_KEY),
+    invalidateProvisionerIdleBackoffCache);
+  // 通用不变式：每个 `applyMode:'hot'` 的格子都必须有一行失效登记（漏的那一格保存后本进程还吃旧值）。
+  const hotKeys = Object.entries(RUNTIME_SETTING_REGISTRY)
+    .filter(([, e]) => e.applyMode === 'hot').map(([k]) => k).sort();
+  assert.deepEqual([...HOT_READ_INVALIDATORS.keys()].sort(), hotKeys,
+    'hot 旋钮的集合必须与失效登记表逐格一致');
+});
+
+test('RS-53 §4.21 的三行必须写出默认 / 值域 / 生效点（本批的文档契约，删行或含糊其辞 ⇒ 红）',
+  () => {
+    const apiDoc = fs.readFileSync(new URL('../../docs/api/portal.md', import.meta.url), 'utf8');
+    const start = apiDoc.indexOf('### 4.21 管理台运行时设置');
+    const end = apiDoc.indexOf('#### `GET /api/admin/runtime-settings`', start);
+    assert.ok(start >= 0 && end > start, '§4.21 切片切不到（标题被改了？）');
+    const rows = apiDoc.slice(start, end).split('\n').filter((l) => l.startsWith('|'));
+    const splitCells = (line) => line.split('|').slice(1, -1).map((c) => c.trim());
+    const dataRows = rows.slice(2).map(splitCells);
+    const rowOf = (key) => {
+      const cells = dataRows.find((c) => c[0].replace(/`/g, '') === key);
+      assert.ok(cells, `§4.21 少了 ${key} 那一行`);
+      return cells.join(' ');
+    };
+    const onb = rowOf(ONBOARDING_IDLE_BACKOFF_MS_KEY);
+    assert.match(onb, /1\.\.60000/, '开户那行必须写值域 1..60000（与 RS-49 同一区间）');
+    assert.match(onb, /默认 `?30000`?/, '开户那行必须写默认 30000');
+    assert.match(onb, /每一拍|每一 拍/, '开户那行必须写生效点：每一拍决定 sleep 之前现读');
+    const off = rowOf(OFFBOARDING_IDLE_BACKOFF_MS_KEY);
+    assert.match(off, /1\.\.60000/);
+    assert.match(off, /默认 `?30000`?/);
+    assert.match(off, /每一拍/);
+    const prov = rowOf(PROVISIONER_IDLE_BACKOFF_MS_KEY);
+    assert.match(prov, /1\.\.15000/, '对账那行必须写 1..15000（上界是业务上限，不是 60000）');
+    assert.match(prov, /默认 `?15000`?/);
+    assert.match(prov, /业务上限|业务承诺/, '对账那行必须说明上界是业务上限（不是算术溢出）');
+    assert.match(prov, /每一拍/);
+  });
