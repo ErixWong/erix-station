@@ -445,7 +445,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | 变量 | 用途 | 默认 / 示例 |
 |---|---|---|
 | `ERIX_SESSION_AUTO_TITLE` | 会话标题自动生成与自动更新总开关（issue #88）：worker 侧在 `runToolLoop` 正常返回后用既有 provider 发一次轻量非流式补全（首条用户消息 + finalText 各截 500 字符，≤30 字符标题，10s 超时，maxTokens 512），标题随 `run_finished` 上报、portal 异步评估落库（不阻塞消息主链路）；失败/空降级链：首条用户消息截断 → cwd basename。手工改过的标题（`title_source='manual'`）不被覆盖。**下发光纤**：portal env → provisioner Env → FDE 容器 env | `1`（开；`0` = 关闭） |
-| `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 防抖阈值 N：距上次自动标题更新 ≥ N 轮新 user 消息才刷新（或话题漂移启发式命中：≥1 轮新消息且与现标题关键词零重合）。portal 侧落库评估用，不下发 worker | `3` |
+| `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 自动标题刷新防抖阈值 N（轮）：距上次自动标题更新 ≥ N 轮新 user 消息才刷新（或话题漂移启发式命中：≥1 轮新消息且与现标题关键词零重合）。portal 侧落库评估用，不下发 worker。自 **#677 P3 第三批** 起它只是**兜底位**：真值在 `runtime_settings.session.auto_title_min_new`（管理台可改，`applyMode=hot`，契约 `docs/api/portal.md` §4.21）——`evaluateAutoTitle()` **每次评估现读**，管理台保存后**下一轮评估就用新值**，不用重建容器（带 5s 缓存 + 写后失效）。⚠ **env 值也必须过 registry 那套闸**（`parse`/`validate`：整数且 `1..100`；默认 3 与 `config.js` / `session-title.js` 三处同源）——`1e2` / `2.5` / `0` / `101` 这类过不了闸的值**视为没给** ⇒ 回落默认 `3` + 一条点名 key 与本变量名的 warn，管理台 `source` 报 `default`（判据 `runtime-settings.test.js` RS-41 / RS-46）。通用 `intEnv` 的 `Number()` 语义在这一格**不再算数**。⚠ **`1e2` 两侧之分**：以上为 env 侧口径；写侧（PUT body 的 JSON）接受任何合法 JSON number，`1e2` 会被收并规整成 `100`（同 §4.21 与 `runtime-settings.js` 写侧注释）。⚠ **未进 compose**：P5 防回潮闸把 `station-portal.environment` 冻成「只许变小」⇒ 新旋钮进不了 compose（标准 compose 部署上改本行不生效，走非 compose 部署路径的进程 env 才生效）。判据 `runtime-settings.test.js` RS-40~RS-47 | `3` |
 
 ### 10.4 补登：worker 侧 LLM provider 超时相（runner `lib/llm-timeouts.js`，issue #261，2026-10-12 登记）
 
