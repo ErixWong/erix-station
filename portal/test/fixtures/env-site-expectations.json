@@ -1,0 +1,210 @@
+{
+  "$comment": [
+    "#587 第 3 步（设计改判 711b）：坐标级白名单。判据不再「证明某条差异是良性的」，",
+    "而是把两个集合钉住 —— S3-⑥ 比 injectionSites、S3-⑦ 比 gaps，双向 deepEqual：",
+    "多一条红、少一条红。形状启发式只打印「看起来是哪一类」，不参与通过判定。",
+    "坐标不是手抄的：`ENV_SITE_DUMP=1 node --test portal/test/deploy-env-delegate.test.js`",
+    "打出 `# COORD-DUMP` 两行，抄的就是当前真树的现推读数。",
+    "改任何一条都要同时改 reason（为什么在名单里）；reason 写不出 = 该重开 #587 讨论。"
+  ],
+  "injectionSites": [
+    {
+      "key": "ERIX_STATION_BASE_URL",
+      "rel": "portal/src/provisioner.js",
+      "line": 224,
+      "occ": 1,
+      "reason": "buildContainerConfig 的 `Env:` 数组元素（第 221 行那个数组 = 容器 create body）"
+    },
+    {
+      "key": "ERIX_MAX_ROUNDS",
+      "rel": "portal/src/provisioner.js",
+      "line": 226,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，portal env → FDE 容器 env 的下发面（issue #84 P5）"
+    },
+    {
+      "key": "ERIX_AGENTD_CAPACITY",
+      "rel": "portal/src/provisioner.js",
+      "line": 227,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，agentd 可调参数下发"
+    },
+    {
+      "key": "ERIX_ARTIFACT_MAX_BYTES",
+      "rel": "portal/src/provisioner.js",
+      "line": 228,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，artifact 上限下发"
+    },
+    {
+      "key": "ERIX_ARTIFACT_CAPTURE_BUDGET_MS",
+      "rel": "portal/src/provisioner.js",
+      "line": 229,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，artifact 抓取预算下发"
+    },
+    {
+      "key": "ERIX_SHELL_TIMEOUT_MS",
+      "rel": "portal/src/provisioner.js",
+      "line": 230,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，shell 超时下发"
+    },
+    {
+      "key": "ERIX_SHELL_MAX_TIMEOUT_MS",
+      "rel": "portal/src/provisioner.js",
+      "line": 231,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，shell 超时上限下发"
+    },
+    {
+      "key": "ERIX_SHELL_OUTPUT_MAX_BYTES",
+      "rel": "portal/src/provisioner.js",
+      "line": 232,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，shell 输出上限下发"
+    },
+    {
+      "key": "ERIX_SESSION_AUTO_TITLE",
+      "rel": "portal/src/provisioner.js",
+      "line": 236,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，会话标题开关下发（issue #88 / #114）"
+    },
+    {
+      "key": "ERIX_DELEGATE_ENABLED",
+      "rel": "portal/src/provisioner.js",
+      "line": 242,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，delegation P1 四连下发之一（三处同改）"
+    },
+    {
+      "key": "ERIX_DELEGATE_MAX",
+      "rel": "portal/src/provisioner.js",
+      "line": 243,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，delegation P1 四连下发之一"
+    },
+    {
+      "key": "ERIX_DELEGATE_CHILD_ROUNDS",
+      "rel": "portal/src/provisioner.js",
+      "line": 244,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，delegation P1 四连下发之一"
+    },
+    {
+      "key": "ERIX_MCP_CONFIG_TIMEOUT_MS",
+      "rel": "portal/src/provisioner.js",
+      "line": 245,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，delegation P1 下发面（MCP 配置超时）"
+    },
+    {
+      "key": "ERIX_DELEGATE_CHILD_TIMEOUT_MS",
+      "rel": "portal/src/provisioner.js",
+      "line": 246,
+      "occ": 1,
+      "reason": "同上：`Env:` 数组元素，delegation P1 四连下发之一"
+    },
+    {
+      "key": "ERIX_FINAL_TEXT_TOOLCALL_MARKERS",
+      "rel": "portal/src/provisioner.js",
+      "line": 253,
+      "occ": 1,
+      "reason": "`Env:` 数组里条件展开的那一项（issue #557）：宿主未设 ⇒ 整项不出现，仍是注入位"
+    },
+    {
+      "key": "ERIX_AGENT_VERSION",
+      "rel": "portal/src/provisioner.js",
+      "line": 277,
+      "occ": 1,
+      "reason": "`body.Env.push()` 参数位；`body` 的归属由 :221 的 `Env:` 数组与 push 链互证"
+    },
+    {
+      "key": "ERIX_FDE_NAME",
+      "rel": "portal/src/provisioner.js",
+      "line": 410,
+      "occ": 1,
+      "reason": "`buildContainerConfig({ env: [...] })` 选项数组元素（已执行证明 env 选项流入 body.Env）"
+    },
+    {
+      "key": "ERIX_STATION_TOKEN",
+      "rel": "portal/src/provisioner.js",
+      "line": 410,
+      "occ": 1,
+      "reason": "同一处 `env:` 选项数组元素（token 注入，F6 单点生成）"
+    }
+  ],
+  "gaps": [
+    {
+      "key": "FDE_WORKER_UID",
+      "rel": "portal/src/config.js",
+      "line": 406,
+      "occ": 2,
+      "reason": "读在宿主侧 helper `intEnv`（config.js:12 的 `env[key]` 动态下标）⇒ 索引里无这一行的站点"
+    },
+    {
+      "key": "ERIX_STATION_TOKEN",
+      "rel": "portal/src/provisioner.js",
+      "line": 362,
+      "occ": 3,
+      "reason": "`readContainerEnv` 的默认参数位（inspect 读回 helper），不是对 env 取值"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_FIRST_BYTE_MS",
+      "rel": "runner/lib/llm-timeouts.js",
+      "line": 58,
+      "occ": 1,
+      "reason": "LLM_TIMEOUT_ENV 数据表成员声明行（整串正文就是这个 key），真读站点在 :103"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_FIRST_BYTE_MS",
+      "rel": "runner/lib/llm-timeouts.js",
+      "line": 58,
+      "occ": 2,
+      "reason": "同一行的第 2 个引用（where 把「真读点」与「env 名来自数据表」都写成 :58）⇒ 独立占一条坐标"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_STREAM_IDLE_MS",
+      "rel": "runner/lib/llm-timeouts.js",
+      "line": 59,
+      "occ": 1,
+      "reason": "同 :58 那一族：数据表成员声明行，真读站点在 :103；第 1 个引用"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_STREAM_IDLE_MS",
+      "rel": "runner/lib/llm-timeouts.js",
+      "line": 59,
+      "occ": 2,
+      "reason": "同一行的第 2 个引用 ⇒ 独立占一条坐标（不许与 occ 1 折叠）"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_STREAM_TOTAL_MS",
+      "rel": "runner/lib/llm-timeouts.js",
+      "line": 60,
+      "occ": 1,
+      "reason": "同 :58 那一族：数据表成员声明行，真读站点在 :103；第 1 个引用"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_STREAM_TOTAL_MS",
+      "rel": "runner/lib/llm-timeouts.js",
+      "line": 60,
+      "occ": 2,
+      "reason": "同一行的第 2 个引用 ⇒ 独立占一条坐标（不许与 occ 1 折叠）"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_REQUEST_MS",
+      "rel": "runner/lib/llm-timeouts.js",
+      "line": 61,
+      "occ": 1,
+      "reason": "同 :58 那一族：数据表成员声明行，真读站点在 :103；第 1 个引用"
+    },
+    {
+      "key": "ERIX_LLM_TIMEOUT_REQUEST_MS",
+      "rel": "runner/lib/llm-timeouts.js",
+      "line": 61,
+      "occ": 2,
+      "reason": "同一行的第 2 个引用 ⇒ 独立占一条坐标（不许与 occ 1 折叠）"
+    }
+  ]
+}

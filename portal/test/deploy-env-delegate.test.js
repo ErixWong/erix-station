@@ -4207,6 +4207,121 @@ test('#587-S3-⑤ H1 归属 + M1 展开：无归属的 `Env:` 不登记不判绿
   console.log(`# S3-⑤ 真树 untraced 展开 ${(added.untraced ?? []).length} 条（显式计数，非静默）`);
 });
 
+// ---------------------------------------------------------------------------
+// 【设计改判 711b】通过判定从「证明某条差异是良性的」换成「钉住已知集合」。
+// 形状启发式（`shadowGapSemantic` / `shadowGapByShape` / `readbackDefaultParamSite` /
+// `isDynamicIndexUse`）只**提议**「这条差异看起来是哪一类」，**不再决定**它算不算良性；
+// 决定权在坐标级白名单 `portal/test/fixtures/env-site-expectations.json`（`injectionSites`
+// + `gaps`，每条带 `reason`）。双向 deepEqual ⇒ 多一条红、少一条红 ⇒ 集合任何变动都要人工
+// 改期望文件并写理由，这正是 #587 要的「可审计白名单」语义。
+// 反例不必再证明启发式是对的：要么被登记成注入站点 ⇒ S3-⑥ 多一条红，要么留在差异里
+// ⇒ S3-⑦ 多一条红，两条路都红。
+// ---------------------------------------------------------------------------
+
+/** 坐标级白名单文件（唯一能通过的东西）。 */
+const ENV_SITE_EXPECTATIONS_FILE = path.join(
+  REPO_ROOT, 'portal', 'test', 'fixtures', 'env-site-expectations.json');
+
+/** 读白名单并逐条核对形状：坐标级（key/rel/line[/occ]）+ 必须带非空 `reason`。 */
+function loadSiteExpectations() {
+  const doc = JSON.parse(fs.readFileSync(ENV_SITE_EXPECTATIONS_FILE, 'utf8'));
+  const out = {};
+  for (const field of ['injectionSites', 'gaps']) {
+    assert.ok(Array.isArray(doc[field]), `${field} 必须是数组（实际 ${typeof doc[field]}）`);
+    doc[field].forEach((r, i) => {
+      const at = `${field}[${i}]（key=${r?.key}）`;
+      assert.ok(typeof r?.key === 'string' && typeof r?.rel === 'string'
+        && Number.isInteger(r?.line), `${at} 缺 key/rel/line 坐标`);
+      const why = typeof r?.reason === 'string' ? r.reason.trim() : '';
+      assert.ok(why !== '', `${at} 缺 reason：钉住一条坐标必须写清它为什么在名单里`);
+    });
+    out[field] = doc[field];
+  }
+  return out;
+}
+
+/** 坐标身份（与 `coordIds()` 同一个形状：`key@rel:line#occ`，两本账能对齐）。 */
+function coordIdOf(rec) {
+  return `${rec.key}@${rec.rel}:${rec.line}#${rec.occ ?? 1}`;
+}
+
+/** `coordIds()` 的 id ⇒ 坐标记录；对不上坐标形状（整条登记级问题）原样留着 ⇒ 必然对不齐。 */
+function coordFromId(id) {
+  const m = /^(.+)@(.+):(\d+)#(\d+)$/.exec(id);
+  return m ? { key: m[1], rel: m[2], line: Number(m[3]), occ: Number(m[4]) } : { key: id, rel: '',
+    line: -1, occ: 1, raw: id };
+}
+
+/** 固定排序（现推与期望两边同一口径，`deepEqual` 才只比集合内容不比顺序）。 */
+function cmpCoord(a, b) {
+  return String(a.rel).localeCompare(String(b.rel)) || (a.line ?? 0) - (b.line ?? 0)
+    || String(a.key).localeCompare(String(b.key)) || (a.occ ?? 1) - (b.occ ?? 1);
+}
+
+/** 现推的注入站点集合 ⇒ 坐标记录（同 `key+rel+line` 的第几条记 `occ`，排序后编号）。 */
+function deriveInjectionSiteRecords(added) {
+  const seen = new Map();
+  return [...added]
+    .map((s) => ({ key: s.key, rel: s.rel, line: s.line }))
+    .sort(cmpCoord)
+    .map((r) => {
+      const id = `${r.key}@${r.rel}:${r.line}`;
+      const occ = (seen.get(id) ?? 0) + 1;
+      seen.set(id, occ);
+      return { ...r, occ };
+    });
+}
+
+/** 现推的影子差异集合（与 `#587-S1-⑧` 的 `onlyShadow` 同一口径：影子红而旧文本尺不红）。 */
+function deriveGapRecords() {
+  const { entries } = loadEnvLegExceptions();
+  const gateIds = new Set(coordIds(whereProblems(entries, RUNNER_ENV_KEYS)));
+  return coordIds(siteIndexProblems(entries, REPO_SITE_INDEX))
+    .filter((id) => !gateIds.has(id))
+    .map(coordFromId)
+    .sort(cmpCoord);
+}
+
+/** 期望条目 ⇒ 与现推同形状的坐标记录（`occ` 缺省 1），排序后供 `deepEqual`。 */
+function projectPinned(list) {
+  return list.map(({ key, rel, line, occ = 1 }) => ({ key, rel, line, occ })).sort(cmpCoord);
+}
+
+/** 双向差集：红的时候必须能指着「多了哪条 / 少了哪条」。 */
+function setDiff(derived, expected) {
+  const d = derived.map(coordIdOf);
+  const e = expected.map(coordIdOf);
+  return { extra: d.filter((id) => !e.includes(id)), missing: e.filter((id) => !d.includes(id)) };
+}
+
+/** `ENV_SITE_DUMP=1` 时把现推坐标打到 stdout：期望文件里的读数就是这么打的，不是手抄。 */
+function dumpCoordSet(label, recs) {
+  if (!process.env.ENV_SITE_DUMP) return;
+  console.log(`# COORD-DUMP ${label} ${JSON.stringify(recs)}`);
+}
+
+/** 钉住判据的共用断言：先打现推读数，再集合双向相等，红时打印 extra / missing。 */
+function assertPinned(label, derived, loadPinned) {
+  dumpCoordSet(label, derived);
+  const expected = projectPinned(loadPinned());
+  const { extra, missing } = setDiff(derived, expected);
+  console.log(`# ${label}：现推 ${derived.length} 条 / 钉住 ${expected.length} 条`
+    + `（extra ${extra.length} / missing ${missing.length}）`);
+  assert.deepEqual(derived, expected,
+    `${label} 与钉住的期望不一致（多一条红、少一条红）：`
+    + `extra=${JSON.stringify(extra)} missing=${JSON.stringify(missing)}`);
+}
+
+test('#587-S3-⑥ 注入站点集合被钉住：现推集合与期望文件 deepEqual（双向，多一条/少一条都红）',
+  () => {
+    const derived = deriveInjectionSiteRecords(rederiveInjectionSites().added);
+    assertPinned('S3-⑥ 注入站点集合', derived, () => loadSiteExpectations().injectionSites);
+  });
+
+test('#587-S3-⑦ 影子差异集合被钉住：真树差异与期望文件 deepEqual（双向，同上）', () => {
+  assertPinned('S3-⑦ 影子差异集合', deriveGapRecords(), () => loadSiteExpectations().gaps);
+});
+
 /**
  * MED① 的夹具：**路径故意也叫 `portal/src/provisioner.js`** —— 旧形状闸会把它里而每一行都算
  * injection（那正是 MED① 的病）。行号是约定（`SI_MED_L`）：改文本要跟着改行号表。
