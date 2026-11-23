@@ -3935,7 +3935,8 @@ test('#587-S3-① 注入站点可解析：四个键各有站点，坐标 = 现�
   const { added } = rederiveInjectionSites();
   assert.ok(added.length > 0, '重推登记了 0 条 ⇒ 推导规则对真树瞎了');
   console.log(`# S3-INJECT ${JSON.stringify(added)}`);
-  const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME', 'ERIX_STATION_BASE_URL', 'ERIX_AGENT_VERSION'];
+  const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME',
+    'ERIX_STATION_BASE_URL', 'ERIX_AGENT_VERSION'];
   for (const key of KEYS) {
     const derived = [...new Set(added.filter((s) => s.key === key)
       .map((s) => `${s.rel}:${s.line}`))].sort();
@@ -3960,13 +3961,15 @@ test('#587-S3-① 注入站点可解析：四个键各有站点，坐标 = 现�
 });
 
 test('#587-S3-② 注入站点不是读站点：账本分开（hasSite 认、readSites 不认），影子判它们绿', () => {
-  const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME', 'ERIX_STATION_BASE_URL', 'ERIX_AGENT_VERSION'];
+  const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME',
+    'ERIX_STATION_BASE_URL', 'ERIX_AGENT_VERSION'];
   for (const key of KEYS) {
     const sites = REPO_SITE_INDEX.injectionSitesOf(key);
     assert.ok(sites.length > 0, `${key} 没有注入站点（先让 ① 绿）`);
     for (const s of sites) {
       // 两本账分开：注入形住在 `injections`，不住 `readSites` ⇒ 「不是读站点」有结构证据
-      const inReads = REPO_SITE_INDEX.sitesOf(key).some((r) => r.rel === s.rel && r.line === s.line);
+      const inReads = REPO_SITE_INDEX.sitesOf(key)
+        .some((r) => r.rel === s.rel && r.line === s.line);
       assert.ok(!inReads, `${key}@${s.rel}:${s.line} 被当成**读站点**登记了（两本账串账）`);
       // 影子尺对这条坐标判绿：拿它当唯一引用造一条形同盘上登记的例外，问题清单必须空
       const problems = siteIndexProblems([{ key, where: `${s.rel}:${s.line}` }], REPO_SITE_INDEX);
@@ -4013,7 +4016,8 @@ test('#587-S3-③ readback 归类：读回 helper 的默认参数位归 readback
 test('#587-S3-④ 反向牙：拿「没做过注入登记」的同树索引跑 ⇒ 那 4 条必须重新红且仍归 injection', () => {
   // 同树重建一个**不登记**的索引（= M-1 变异「去掉登记」的等价形态，不用改盘上文件）
   const bare = buildEnvSiteIndex(REPO_ROOT);
-  const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME', 'ERIX_STATION_BASE_URL', 'ERIX_AGENT_VERSION'];
+  const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME',
+    'ERIX_STATION_BASE_URL', 'ERIX_AGENT_VERSION'];
   let reds = 0;
   for (const key of KEYS) {
     const derived = REPO_SITE_INDEX.injectionSitesOf(key);
