@@ -10,3 +10,8 @@ general_settings:
 litellm_settings:
   set_verbose: false
   json_logs: true
+  # 日额度的重置锚点（issue #719）：LiteLLM 的 budget_duration:"1d" 默认按 UTC 零点重置，
+  # 对国内团队等于本地 08:00 才刷新 —— 早八前用不了、且与「一天」的直觉不符。
+  # 显式锚到本地时区 + 本地零点，让额度在北京时间 00:00 归零。
+  timezone: "Asia/Shanghai"
+  budget_reset_time: "00:00"

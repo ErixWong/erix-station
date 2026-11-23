@@ -9405,6 +9405,32 @@ dev 栈做法：`docker build -t erix-station/fde:local runner/` → `deploy/.en
 **并行迁旋钮的已知代价**：#714 与 #715 同时往 registry 加格子 ⇒ 合并冲突 17 块（8+7+2），
 全是「两边各加新块、无语义冲突」，解法 = 两边都保留 + 把「格数」断言从 7/5 改成 8。**registry 是并行批次必然的冲突热点。**
 
+### 8.182 #719 FDE 周期 LLM 额度（USD / 周期）+ 用量历史（#719，2026-11-23，erix 编码助手）
+
+**口径（未合并单内已改造，本号就地修订不新开）**：额度单位 **USD / 周期**，周期由 LiteLLM 虚拟 key 的 `budget_duration` 决定；**白名单只允许 `'1d'` 与 `'1mo'`（默认 `'1mo'`）**，portal 只原样透传、**绝不自己推导/换算周期**。
+DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`（迁移 0047，已从 `0047-fde-daily-budget.sql` 改名为 `0047-fde-budget.sql`，`NULL`=不限额）。
+**两条结构约束（照 `usage_ledger.source` 写法）**：① `CHECK (budget_period IN ('1d','1mo'))` 枚举白名单；② `CHECK ((budget_usd IS NULL) = (budget_period IS NULL))` 两列同 NULL / 同非 NULL。迁移 `ADD COLUMN IF NOT EXISTS` 幂等 + `SET lock_timeout`。
+**portal 绝不自算 token、不做第二套统计**：本周期与历史用量全读 LiteLLM 自己的端点。
+
+**改了哪些文件**（原 4 commit + 本轮改造 2 commit，均 `Refs #719`）：
+- 原 `2f23848`/`12b333b`/`99041f2`/docs：初版每日额度（M1–M4）。
+- 改造 `47a164d`：迁移 0047 `git mv` 改名 + `budget_usd`/`budget_period` 两列与两条 CHECK；`llm.js`（`setFdeDailyBudget`→`setFdeBudget`、`getFdeDailyBudget`→`getFdeBudget`、`getFdeDailyUsage`→`getFdeBudgetUsage`（days 默认 30/上限 90），常量 `BUDGET_PERIODS`/`DEFAULT_BUDGET_PERIOD`/`BUDGET_MAX_USD`，各铸 key/重存路径带两列）；`llm-gateway.js`（`keyInfo` 出网 sha256）；`http.js`（matcher `/llm/quota`→`/llm/budget`）。
+- 改造 `a088417`：前端 `UserLlmPane.vue` 额度区金额+周期下拉、`spend_scope` 驱动的已用标签；i18n 双语同步。
+
+**三个坑（都做了处理）**：
+1. **key 轮换丢额度**：`generateFdeKey` 与 `updateKey` 重存的**所有**路径（改白名单重存、key 缺失重铸、onboard 恢复）都从 DB 的 `budget_usd`+`budget_period` 重新下发到新 key（重存时：有额度⇒两项，无额度⇒显式 `max_budget:null,budget_duration:null`）—— 不变式 3（DB 是真相、key 是牲口）。
+2. **DB/key 分叉**：`setFdeBudget` 严格「先 `updateKey`、后 UPDATE」，网关失败**不写库**（宁可保持旧值）；非法值在打网关**之前**就拒（`validation_failed`，`details.field`=`budget_usd`/`budget_period`），零网关调用；`budget_usd=null` 时 period 一并清空。
+3. **未定价模型不生效**：`pricing_configured=false` 的模型 `spend` 恒记 0，累计不到额度上 ⇒ 管理台额度区显式警告。
+
+**周期语义（主 agent 在运行中 LiteLLM v1.103.2 实测，写死进注释/文档）**：`1d`=每天 `reset_time_of_day`（本环境 `Asia/Shanghai` 本地零点）；`1mo`=**每月 1 日**且 `value!=1` 直接抛错（只支持 1 个月）；`30d` 被特判成月、`7d`=每周一、`1m`=1 分钟——都不是“多少天/月后”，所以白名单之外一律不接。
+
+**`spend_scope`（前端已用标签唯一依据）**：`/key/info` 的 `spend` 是运行计数器，只在存在 `budget_duration` 时按周期归零；**无额度时是终身累计**。故 `getFdeBudget` 返回 `spend_scope`：`budget_duration` 非空⇒`'period'`（本周期已用）、无额度⇒`'lifetime'`（终身累计）；前端不重推（实测 dev 上 eric 无额度 key 的 `spend=0.084178176` 而近 14 天日聚合合计只有 `0.038631168` ⇒ 无额度时 `spend` 不是周期值）。
+
+**UTC 日桶限制**：日聚合表（`/user/daily/activity`，`common_daily_activity.py:563-600`）是 **UTC 日**分桶；`timezone`（传 480）**只决定 end_date 是否把今天扩成一个 UTC 桶**，历史日期 pass-through。故「本周期已用」（网关实时计数器）与用量表最后一行（UTC 日桶）**天然可能对不上**，两者**不互相校验**。
+**重置锚点**靠 config 的 `timezone`+`budget_reset_time`；**重置任务约 597s 一跳**；`proxy_batch_write_at: 60` 只影响 spend 落库/报表与日聚合的时效，**不是超发窗口**（超限判定在鉴权阶段先做预算预留：v1.103.2 对可估价请求转发前调 `reserve_budget_for_request`（`proxy/spend_tracking/budget_reservation.py:205-296`）估 token 并按定价预留、响应回来再结算；无法估价的请求回退读时判定，而这类模型通常又没配定价⇒`spend` 恒记 0⇒额度永不触发，与「未定价模型不生效」同一条因果）；`tpd_limit` 是 batch-only 不可用。
+
+**未做的真机验收（本单 LiteLLM 容器未起，均未跑）**：① 额度触发 429；② 重置是否真落在本地周期错点；③ `/user/daily/activity/aggregated` 真机响应形状（周期语义本身已由主 agent 在 v1.103.2 容器实测）。判绿只看退出码：根 `npm test`、前端 `typecheck`/`test` 均 rc=0。
+
 ### 8.183 #677 env 清理：删 2 个死旋钮 + 4 个 auth 旋钮进管理台（#718 / #720，2026-11-23，主 agent）
 
 > 编号说明：**跳过 8.182** —— 那个号已被并行 session 的 PR #722（#719 每日 LLM 额度）占用，避免撞号。
