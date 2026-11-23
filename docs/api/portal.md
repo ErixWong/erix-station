@@ -3673,15 +3673,16 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**已迁的旋钮（三格）**（其余 20 个归 P3 逐批迁）：
+**已迁的旋钮（四格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
 
 | key | env 兜底位 | 值域 | `applyMode` | 生效点 |
 | --- | --- | --- | --- | --- |
 | `session.ttl_seconds` | `SESSION_TTL_SECONDS` | 整数 `60..2592000` 秒 | `hot` | 登录建会话 / 续期时现读 |
 | `workspace.retention_days` | `ERIX_WORKSPACE_RETENTION_DAYS` | 整数 `0..3650` 天（**`0` 是有效值** = 不自动清理） | `hot` | offboarding 循环每一拍现读 |
 | `preview.ticket_ttl_seconds` | `PREVIEW_TICKET_TTL_SECONDS` | 整数 `1..3600` 秒（**`0` 非法**：签出来即过期） | `hot` | 签预览票时现读（批量整批共用一次） |
+| `session.auto_title_min_new` | `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 整数 `1..100` 轮（默认 `3`；**`0` 非法**：每拍重算标题） | `hot` | `evaluateAutoTitle()` 每次评估标题时现读（`session-title.js`） |
 
-三格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+四格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
 **上界 `3650` 是产品口径不是算术溢出**：超过 10 年的「离职保留」与「永不清理」在运维上不可区分，
 而后者已有确定表达（`0`）⇒ 上界外的值只能是把单位填错了（想写 30 天写成秒/毫秒那一族）。
 越界的 env 值被闸拦下后回落**默认 `0`**，是更保守的一档（少删目录，不会误删）。
@@ -3690,6 +3691,17 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 会话 cookie 而不是票。下界 `1`（**不含 `0`**）与上面 `retention_days` 那种「`0` = 有语义」相反：这里 `0`
 秒的票签出来立刻过期 = 白发，只会造成「签了却进不去」的困惑，所以 `0` 判非法。默认 `60` 与 `config.js`
 的 `previewTicketTtlSeconds` 同源。
+
+`session.auto_title_min_new` 的上界 `100` 也同样是产品口径，但**这句必须说准**（#710 LOW①）：`100` 的
+含义是「阈值可以设到很高」，**不是「设到 100 就等于关掉」**。`shouldRefreshTitle()` 除了「距上次自动
+更新 ≥ N 轮」这条主判据外，还有一条**话题漂移旁路**（`≥1` 轮新消息且最新用户消息与现标题**关键词零
+重合** ⇒ 刷新），而**这条旁路不吃 N**：`minNew=100` + 只 1 轮新消息 + 零重合，照样 `refresh=true`
+（判据：`portal/test/session-title.test.js`「零重合旁路不受 `minNew` 上界约束」那一格）。所以真要关掉
+自动改名请用总开关 `ERIX_SESSION_AUTO_TITLE=0`，别把本旋钮的上界当开关用。
+下界 `1`（**不含 `0`**）与第三格同理：`0` 轮 = 每拍重算标题、白烧 token，且与「首条（`auto_title_seq`
+为 `NULL`）必生成」叠成歧义 ⇒ `0` 判非法（`auto_title_min_new_out_of_range`）。默认 `3` **三处同源**：
+本 registry 的 `defaultValue`、`config.js` 的 `sessionAutoTitleMinNew`（`intEnv` 兜底 3）、
+`session-title.js` 的 `AUTO_TITLE_DEFAULT_MIN_NEW`。
 
 #### `GET /api/admin/runtime-settings`（管理员）
 
@@ -3706,7 +3718,8 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   页面必须显示它——只显示值的话，运维不知道「我改的这个数到底听不听」。
 - ⚠ **env 那一档也要过写侧那套闸**（`parse`/`validate`，与 DB 值调用的是同一个函数；#701 返修）：
   `session.ttl_seconds` 的 env 值必须是**整数且落在 `60..2592000`**，`workspace.retention_days` 的
-  必须是**整数且落在 `0..3650`**。`30` / `2592001` / `60.5` / `abc` / `1e3` / `4000`
+  必须是**整数且落在 `0..3650`**，`session.auto_title_min_new` 的必须是**整数且落在 `1..100`**。
+  `30` / `2592001` / `60.5` / `abc` / `1e3` / `4000` / `1e2` / `101`
   这一类过不了闸的值 ⇒ **视为「env 没给」**⇒ 回落内置默认、`source` 如实报 `default`（不是 `env`），
   并留一条**点名 key + env 名 + 坏值 + 被拒理由**的 warn；读侧仍不抛。
   为什么：`loadConfig` 的通用 `intEnv` 走 `Number()` 语义（上面那四个收了三个），只靠它就会出现
@@ -3729,8 +3742,9 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   这一档是**声明**，不是承诺——页面照它显示，别自己猜。
 - `hint`（**可选键**）：给管理员看的一行提示，registry 那一格登记了才带；**没登记就不有这个键**
   （不是 `null`、不是空串）⇒ 前端不许因此渲染一行空提示。它是**文案**，不参与任何判定，
-  也不是第二份真相：它说的事实以本节为准（目前只有 `workspace.retention_days` 登记了它，
-  因为那一格的 `0` 有一个反直觉的边界，见下面「`0` 的语义」那一小节）。
+  也不是第二份真相：它说的事实以本节为准（目前登记了它的是 `workspace.retention_days`、
+  `preview.ticket_ttl_seconds`、`session.auto_title_min_new` 三格，第一格 `session.ttl_seconds` 没有；
+  `retention_days` 那句是因为它的 `0` 有一个反直觉的边界，见下面「`0` 的语义」那一小节）。
 
 #### `PUT /api/admin/runtime-settings/{key}`（管理员）
 
@@ -3747,6 +3761,10 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   这与 env 兜底位**相反**：env 那档走 `parse` 的 `/^[0-9]+$/`，`1e3` 过不了 ⇒ 视为没给、回落默认（见上方
   env 那一档的口径与 `docs/env.md`）。一句话：`1e3` 写进 body 被收（=1000），写进 env / 当字符串都不算数。
   判据 `runtime-settings.test.js` RS-31b。
+  **同一口径对本批的第四格 `session.auto_title_min_new` 逐字成立**（同一套写侧，不是第二套语义）：
+  `{"value": 1e2}` 里的 `1e2` 是 JSON number、解析时塌成 `100` ⇒ 区间内 `200` 收下、库里存 `100`；
+  `{"value": "1e2"}` 是字符串 ⇒ `400 validation_failed`（`details.field='value'`）；env 那档的 `1e2`
+  走 `parse` 的正则支过不了 ⇒ 视为没给、回落默认 `3`。判据 RS-40b。**这句话只写在本段，每格不重复。**
 - 路径段不匹配 key 形状（`^[a-z][a-z0-9_.]{2,63}$`，与迁移 `0046` 的 `CHECK` 同形）⇒ `404`
   （「没有这个路由」，而不是拿去库里绕一圈）。
 - **写与审计在同一个事务里**（`BEGIN` → upsert → 审计 → 检查审计行数 === 1 → `COMMIT`）。
@@ -3799,6 +3817,13 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
   写路径失效也清）。所以「最多 5 秒一次」是上界，而**同一波并发不会把它放大成 N 条往返**。
 - 共享那一趟的调用方拿到的超时 = **发起方**那一趟的 `RUNTIME_SETTINGS_READ_TIMEOUT_MS`（同进程同默认，
   所以不是第二份旋钮）。
+
+`session.auto_title_min_new` 也是 `hot`（#677 P3 第三批）：`session-title.js#evaluateAutoTitle()` 在
+**每次评估标题时现读**（`readAutoTitleMinNew()`，在防抖判据之前），所以「管理台把 3 改成 10」⇒
+**下一轮评估就用 10**，不用重建容器。同样不是「每次评估一条 SQL」：同池 5s 缓存 + 在飞合并；同样
+**永不抛**，回落阶梯 **DB 有效值 > env（过 registry 闸）> registry 默认 `3`**，并留一次热读最多一条
+点名 warn。⚠ 生效时机只到「下一轮评估」这一层：它不管已落库的旧标题（旧标题等下一次刷新被覆盖），
+也不是总开关（关掉自动改名是 `ERIX_SESSION_AUTO_TITLE=0`，见上面「上界 `100`」那一段）。
 
 #### `workspace.retention_days = 0` 的语义：关掉的是「清理动作」，不是「已排的期限」
 
