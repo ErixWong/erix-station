@@ -159,10 +159,6 @@ function defaultStaticDir() {
 export function loadConfig(env = process.env) {
   const sessionTtlSeconds = intEnv(env, 'SESSION_TTL_SECONDS', DEFAULT_SESSION_TTL_SECONDS);
   const cookieProfile = env.COOKIE_PROFILE || 'prod';
-  const llmGatewayMode = env.LLM_GATEWAY_MODE || 'self';
-  if (llmGatewayMode !== 'self' && llmGatewayMode !== 'external') {
-    throw new Error('LLM_GATEWAY_MODE 必须为 self 或 external');
-  }
   // 邮件通道（issue #449，决策者 2026-11-04 改口径）：**SMTP 参数存 DB**（`mail_settings` 单行，
   // 管理台维护，读取侧 `portal/src/mail-provider.js`），env 只留一个旋钮：
   //   `MAIL_TRANSPORT=disabled` —— 运维急停：为真时无论 DB 怎么配都不发信（决策 D3b 的硬闸）。
@@ -245,7 +241,6 @@ export function loadConfig(env = process.env) {
       env.MIGRATE_DATABASE_URL || env.DATABASE_URL || 'postgres://station:station@127.0.0.1:5432/station',
     bootstrapDatabaseUrl:
       env.BOOTSTRAP_DATABASE_URL || env.MIGRATE_DATABASE_URL || env.DATABASE_URL || 'postgres://station:station@127.0.0.1:5432/station',
-    cookieProfile,
     cookie: cookieSettings(cookieProfile, sessionTtlSeconds),
     sessionTtlSeconds,
     // #677 P2a：上面那个值的**来源**（`source: db | env | default` 里后两档的唯一区分手段）。
@@ -378,7 +373,6 @@ export function loadConfig(env = process.env) {
     llmPublicBaseUrl: resolvePublicBaseUrl(env, 'LLM_PUBLIC_BASE_URL', env.LLM_HOST || `llm.${env.BASE_DOMAIN || 'localhost'}`),
     // Traefik 在 host 网络；LiteLLM 迁移期通过宿主回环 4100 暴露数据面。
     llmGatewayUrl: env.LLM_GATEWAY_HOST || 'http://127.0.0.1:4100',
-    llmGatewayMode,
     llmGatewayAdminUrl: env.LLM_GATEWAY_ADMIN_URL || 'http://station-litellm:4000',
     llmGatewayMasterKey: env.LLM_GATEWAY_MASTER_KEY || '',
     // 默认池 / 保留网段（IPAM；fde-platform §8.2 / topology §3）。
@@ -401,7 +395,6 @@ export function loadConfig(env = process.env) {
     // 资源限额（deploy-contract §6.2；issue #27 已决 2026-09-18）：默认 4g（B 档镜像下 dotnet build/chromium 峰值），可配 0 表示不限。
     fdeMemoryLimit: env.FDE_MEMORY_LIMIT || '4g',
     // 容器内双 UID（runner-integration/user-space §6.1：agentd 1001 / worker 1002，GID 1000）。
-    agentdUid: intEnv(env, 'FDE_AGENTD_UID', 1001),
     workerUid: intEnv(env, 'FDE_WORKER_UID', 1002),
     // portal 经自研 admission proxy 访问 Docker API（deploy-contract §5；不直挂 docker.sock）。
     dockerHost: env.DOCKER_HOST || 'tcp://station-docker-proxy:2375',

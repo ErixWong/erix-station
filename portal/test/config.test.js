@@ -121,19 +121,17 @@ test('issue #114：sessionAutoTitle 默认关；仅显式 ERIX_SESSION_AUTO_TITL
 test('issue #117 phase 1：gateway 配置默认 self，并从环境读取 admin API 和 master key', () => {
   const base = { ...DEV, FDE_IMAGE: 'traefik/whoami' };
   const defaults = loadConfig(base);
-  assert.equal(defaults.llmGatewayMode, 'self');
+  // #677 env 清理：`LLM_GATEWAY_MODE` 已删（只校验不生效；指向外部网关靠 LLM_GATEWAY_HOST/ADMIN_URL）
   assert.equal(defaults.llmGatewayUrl, 'http://127.0.0.1:4100');
   assert.equal(defaults.llmGatewayAdminUrl, 'http://station-litellm:4000');
   assert.equal(defaults.llmGatewayMasterKey, '');
 
   const configured = loadConfig({
     ...base,
-    LLM_GATEWAY_MODE: 'external',
     LLM_GATEWAY_HOST: 'https://gateway.example.test',
     LLM_GATEWAY_ADMIN_URL: 'https://gateway.example.test',
     LLM_GATEWAY_MASTER_KEY: 'sk-test-only',
   });
-  assert.equal(configured.llmGatewayMode, 'external');
   assert.equal(configured.llmGatewayUrl, 'https://gateway.example.test');
   assert.equal(configured.llmGatewayAdminUrl, 'https://gateway.example.test');
   assert.equal(configured.llmGatewayMasterKey, 'sk-test-only');
@@ -145,13 +143,6 @@ test('issue #110：workspace retention 默认 0（永不自动清理），正数
   assert.equal(loadConfig({ ...base, ERIX_WORKSPACE_RETENTION_DAYS: '0' }).workspaceRetentionDays, 0);
   assert.equal(loadConfig({ ...base, ERIX_WORKSPACE_RETENTION_DAYS: '14' }).workspaceRetentionDays, 14);
   assert.equal(loadConfig({ ...base, ERIX_WORKSPACE_RETENTION_DAYS: '-1' }).workspaceRetentionDays, 0);
-});
-
-test('issue #117 phase 1：拒绝未知 gateway mode', () => {
-  assert.throws(
-    () => loadConfig({ ...DEV, FDE_IMAGE: 'traefik/whoami', LLM_GATEWAY_MODE: 'proxy' }),
-    /LLM_GATEWAY_MODE/,
-  );
 });
 
 test('PORTAL_INTERNAL_HOSTS：缺省为空，逗号分隔值 trim 并过滤空项', () => {
