@@ -1129,7 +1129,7 @@ async function routeApi(req, res, ctx, url) {
     }
     if (req.method === 'PUT') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const result = await gitCredential.setGitCredential({
         pool: ctx.pool,
         actorId: session.user.id,
@@ -1144,7 +1144,7 @@ async function routeApi(req, res, ctx, url) {
     }
     if (req.method === 'DELETE') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const result = await gitCredential.deleteGitCredential({
         pool: ctx.pool,
         actorId: session.user.id,
@@ -1319,7 +1319,7 @@ async function routeApi(req, res, ctx, url) {
       return sendJson(res, 200, await macroRoutes.userAssignments({ pool: ctx.pool, userId: s.user.id }));
     }
     if (req.method === 'PUT') {
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       return sendJson(res, 200, await macroRoutes.putUserAssignment({ pool: ctx.pool, userId: s.user.id, body }));
     }
   }
@@ -1348,7 +1348,7 @@ async function routeApi(req, res, ctx, url) {
       return sendJson(res, 200, await macroRoutes.sessionAssignments({ pool: ctx.pool, sessionId, userId: s.user.id }));
     }
     if (req.method === 'PUT') {
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       return sendJson(res, 200, await macroRoutes.putAssignment({ pool: ctx.pool, sessionId, userId: s.user.id, body }));
     }
   }
@@ -1415,7 +1415,7 @@ async function routeApi(req, res, ctx, url) {
     let body = {};
     if (action !== 'uninstall') {
       requireJson(req);
-      body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      body = await readJsonBody(req);
     }
     let result;
     if (action === 'install') {
@@ -1512,7 +1512,7 @@ async function handleAdminApi(req, res, ctx, url) {
       return sendJson(res, 200, await macroRoutes.adminTemplates({ pool: ctx.pool, query: url.searchParams }));
     }
     if (req.method === 'POST') {
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       return sendJson(res, 200, await macroRoutes.adminCreateTemplate({ pool: ctx.pool, body, adminUserId: session.user.id }));
     }
   }
@@ -1520,7 +1520,7 @@ async function handleAdminApi(req, res, ctx, url) {
   if (adminMacroTemplateMatch) {
     const templateId = decodeUuid(adminMacroTemplateMatch[1]);
     if (req.method === 'PATCH') {
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       return sendJson(res, 200, await macroRoutes.adminPatchTemplate({ pool: ctx.pool, templateId, body }));
     }
     if (req.method === 'DELETE') {
@@ -1556,7 +1556,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'PUT') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const result = await gitCredential.setGitCredential({
         pool: ctx.pool,
         actorId: session.user.id,
@@ -1588,7 +1588,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'POST') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const provider = await llm.createProvider(ctx.llmGateway, body);
       return sendJson(res, 201, { provider });
     }
@@ -1598,7 +1598,7 @@ async function handleAdminApi(req, res, ctx, url) {
     const providerId = decodeURIComponent(adminProviderMatch[1]);
     if (req.method === 'PATCH') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const provider = await llm.updateProvider(ctx.llmGateway, providerId, body);
       return sendJson(res, 200, { provider });
     }
@@ -1612,7 +1612,7 @@ async function handleAdminApi(req, res, ctx, url) {
   const adminProviderModelsMatch = pathname.match(/^\/api\/admin\/llm\/providers\/([^/]+)\/models$/);
   if (adminProviderModelsMatch && req.method === 'POST') {
     requireJson(req);
-    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const body = await readJsonBody(req);
     const model = await llm.createModel(ctx.llmGateway, {
       ...body,
       provider_id: decodeURIComponent(adminProviderModelsMatch[1]),
@@ -1630,7 +1630,7 @@ async function handleAdminApi(req, res, ctx, url) {
     const modelId = decodeURIComponent(adminModelMatch[1]);
     if (req.method === 'PATCH') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const model = await llm.updateModel(ctx.llmGateway, modelId, body);
       // #296：改了「调用名」（`call_name` → 数据面 `model_name`）就是真改名 ⇒ 立刻铺一次 #289 的
       // 对账，别让人等「心跳 15s + TTL 60s」。两个硬条件：**只传 ctx.llmGateway 单例**（§8.25
@@ -1665,7 +1665,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'POST') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const llmSelection = await llm.validateFdeLlmSelection(ctx.llmGateway, body?.llm);
       const rawGitHostId = body?.git_host_id;
       if (typeof rawGitHostId !== 'string'
@@ -1782,7 +1782,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (action === 'reset-password' && req.method === 'POST') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const resetMaxPasswordLength = await runtimeSettings.readMaxPasswordLength({
         pool: ctx.pool, config: ctx.config, log: ctx.log,
       });
@@ -1805,7 +1805,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (action === null && req.method === 'PATCH') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       // 2026-11-06：打开「邮件验证码」开关前必须确认 SMTP 真能用。
       // 全局 `transport` 不再是功能闸（per-user 开关说了算），所以「开关开着但发不出信」会变成
       // 「这个人登不进去」——在保存这一刻拦住，比让他到登录页才发现便宜得多。
@@ -1842,7 +1842,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'POST') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const host = await gitHosts.createGitHost(ctx.pool, body);
       return sendJson(res, 201, { host });
     }
@@ -1853,7 +1853,7 @@ async function handleAdminApi(req, res, ctx, url) {
     const hostId = decodeUuid(adminGitHostMatch[1]);
     if (req.method === 'PATCH') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const host = await gitHosts.updateGitHost(ctx.pool, hostId, body);
       return sendJson(res, 200, { host });
     }
@@ -1897,7 +1897,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'PUT') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const result = await mailSettings.updateMailSettings({
         pool: ctx.pool,
         actorId: session.user.id,
@@ -1935,7 +1935,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'PUT') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const result = await uploadSettings.updateUploadSettings({
         pool: ctx.pool,
         config: ctx.config,
@@ -1985,7 +1985,7 @@ async function handleAdminApi(req, res, ctx, url) {
       addendum: 'addendum', 'agents-md': 'agentsMd', 'title-prompt': 'titlePrompt',
     }[slug];
     requireJson(req);
-    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const body = await readJsonBody(req);
     // 体本身不是对象 ⇒ `details.field='body'`（不是 `'text'`：那时连请求体都不是一份请求体）。
     // 形状闸只有 `platform-prompts.js` 一份，这里只是把**原始** body 递过去。
     platformPrompts.assertJsonObjectBody(body);
@@ -2035,7 +2035,7 @@ async function handleAdminApi(req, res, ctx, url) {
       });
     }
     requireJson(req);
-    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const body = await readJsonBody(req);
     // 体本身不是对象 ⇒ `details.field='body'`（与 prompts 那块逐字同口径）。
     if (body === null || typeof body !== 'object' || Array.isArray(body)) {
       throw new HttpError(400, 'validation_failed', '请求体必须是 JSON 对象', {
@@ -2073,8 +2073,8 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'POST') {
       requireJson(req);
-      // bundle 是 JSON 里的 base64：2 MiB 原文编码后约 2.75 MiB，而 `config.maxBodyBytes` 默认只有
-      // 64 KiB ⇒ 这一条路由必须显式抬高上限，否则 413 会先于任何校验发生（§4.15 记的同一条坑）。
+      // bundle 是 JSON 里的 base64：2 MiB 原文编码后约 2.75 MiB，而全站默认的 JSON 请求体上限
+      // （`DEFAULT_JSON_BODY_LIMIT`）只有 64 KiB ⇒ 这一条路由必须显式抬高上限，否则 413 会先于任何校验发生（§4.15 记的同一条坑）。
       const body = await readJsonBody(req, market.BUNDLE_MAX_BODY_BYTES);
       const item = await market.publishItem({ pool: ctx.pool, actorId: session.user.id, fields: body });
       await auth.audit(ctx.pool, {
@@ -2114,7 +2114,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'PUT') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       // 非法 scope **当场 400**（审计必修）：静默当 global 意味着「想写某台工位的凭据，结果写成了全局」，
       // 而全局值会被所有工位解析到——这是把一次误操作放大成一次凭据扩散。
       const scopeRaw = body?.scope ?? 'global';
@@ -2171,7 +2171,7 @@ async function handleAdminApi(req, res, ctx, url) {
       throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
     }
     requireJson(req);
-    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const body = await readJsonBody(req);
     const gitHostId = body?.git_host_id == null || body.git_host_id === ''
       ? null
       : decodeUuid(String(body.git_host_id));
@@ -2215,7 +2215,7 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'PUT') {
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const config = await llm.setFdeLlmConfig(ctx.pool, {
         actorId: session.user.id,
         fdeName,
@@ -2302,7 +2302,7 @@ async function resolveAdminFde(ctx, fdeName) {
  */
 async function handleAdminMailTest(req, res, ctx, session) {
   requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const raw = body?.to;
   if (!mailSettings.isEmail(raw)) {
     throw new HttpError(400, 'validation_failed', 'to 必须是有效邮箱地址', { details: { field: 'to' } });
@@ -2365,7 +2365,7 @@ async function handleAdminMailTest(req, res, ctx, session) {
 /**
  * 证书上传请求体的**整体**上限。
  *
- * 为什么不是 `config.maxBodyBytes`（默认 64 KiB）：两份 PEM **各**允许 64 KiB（工单 §4），
+ * 为什么不是默认的 JSON 请求体上限（`DEFAULT_JSON_BODY_LIMIT`，默认 64 KiB）：两份 PEM **各**允许 64 KiB（工单 §4），
  * 合起来再加 JSON 转义就超过 64 KiB —— 用默认闸会在 `readJsonBody` 里先变成 413，
  * 而工单要求的是「超 64 KiB ⇒ 400 `validation_failed` + `details.field`」。所以：
  * 体级闸放到 256 KiB（宽松，只防离谱体积），**字段级 64 KiB 判据在 `tls-cert.js#validateUpload`**。
@@ -2651,7 +2651,7 @@ async function handleAdminListFdePorts(req, res, ctx, session, fdeName) {
  */
 async function handleAdminMoveFdePortsBlock(req, res, ctx, session, fdeName) {
   requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const blockStart = body?.block_start;
   if (!Number.isInteger(blockStart) || !isPreviewPortInPool(blockStart) || !isAlignedPreviewBlockStart(blockStart)) {
     throw new HttpError(400, 'validation_failed',
@@ -2723,7 +2723,7 @@ async function handleListSessions(req, res, ctx) {
 async function handleCreateSession(req, res, ctx) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const created = await sessions.createSession(ctx.pool, {
     userId: session.user.id,
     projectId: body?.cwd ?? body?.project_id, // P5：cwd 为准；project_id 为过渡别名（并行 worker 契约漂移兼容，issue #84）
@@ -2755,7 +2755,7 @@ async function handleGetSession(req, res, ctx, sessionId) {
 async function handlePatchSession(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const updated = await sessions.updateSession(ctx.pool, { userId: session.user.id, sessionId, title: body?.title });
   // issue #107：手工改名成功同样推一条 `session_updated`（与 session-title.js evaluateAutoTitle 同构，
   // 形状 { ts, type, payload:{ title } }）——多标签页 / SessionPicker 的列表标题实时同步。
@@ -2784,7 +2784,7 @@ async function handleArchiveSession(req, res, ctx, sessionId) {
 async function handleAiTitle(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  await readJsonBody(req, ctx.config.maxBodyBytes); // 无体（空 JSON {}）；仍读掉请求体保持行为一致
+  await readJsonBody(req); // 无体（空 JSON {}）；仍读掉请求体保持行为一致
   const updated = await sessions.generateAiTitle(ctx.pool, {
     userId: session.user.id,
     sessionId,
@@ -2966,7 +2966,7 @@ async function handlePostMessage(req, res, ctx, sessionId) {
 async function handleStopSession(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  await readJsonBody(req, ctx.config.maxBodyBytes); // 无体（空 JSON {}）
+  await readJsonBody(req); // 无体（空 JSON {}）
   const result = await sessions.stopSession(ctx.pool, {
     userId: session.user.id, sessionId,
     // #277-A2：「未开始就被直接终态」那条路 portal 是终态的**唯一产出者**，所以 `run_end` 也由它合成，
@@ -3774,7 +3774,7 @@ async function handleGetRunArtifact(req, res, ctx, runId) {
 async function handleLoginStep1(req, res, ctx) {
   const { pool, config } = ctx;
   requireJson(req);
-  const body = await readJsonBody(req, config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const login = typeof body.login === 'string' ? body.login.trim() : '';
   const password = typeof body.password === 'string' ? body.password : '';
   if (!login || !password) {
@@ -4149,7 +4149,7 @@ async function handleSecondFactorChoice(req, res, ctx, { user, email, ip, mailer
 async function handleLoginEmailCode(req, res, ctx) {
   const { pool, config } = ctx;
   requireJson(req);
-  const body = await readJsonBody(req, config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const pendingToken = typeof body.pending_token === 'string' ? body.pending_token : '';
   const code = typeof body.code === 'string' ? body.code.trim() : '';
   if (!pendingToken || !code) {
@@ -4238,7 +4238,7 @@ async function handleLoginEmailCode(req, res, ctx) {
 async function handleLoginEmailCodeResend(req, res, ctx) {
   const { pool, config } = ctx;
   requireJson(req);
-  const body = await readJsonBody(req, config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const pendingToken = typeof body.pending_token === 'string' ? body.pending_token : '';
   if (!pendingToken) {
     throw new HttpError(400, 'validation_failed', 'pending_token 为必填');
@@ -4360,7 +4360,7 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
 async function handleLoginTotp(req, res, ctx) {
   const { pool, config } = ctx;
   requireJson(req);
-  const body = await readJsonBody(req, config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const pendingToken = typeof body.pending_token === 'string' ? body.pending_token : '';
   const code = typeof body.code === 'string' ? body.code : '';
   if (!pendingToken || !code) {
@@ -4645,7 +4645,7 @@ function previewPublicBaseFromRequest(req) {
 async function handlePreviewTicket(req, res, ctx, portId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  await readJsonBody(req, ctx.config.maxBodyBytes); // 无体（空 JSON {}）
+  await readJsonBody(req); // 无体（空 JSON {}）
 
   const ip = req.socket.remoteAddress || 'unknown';
   const rlKey = `ticket:${session.user.id}:${ip}`;
@@ -4715,7 +4715,7 @@ async function handlePreviewTicket(req, res, ctx, portId) {
 async function handleBatchPreviewTickets(req, res, ctx) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const rawIds = body?.allocation_ids;
 
   // ① 形状校验（零 SQL）：可选字段；给了就必须是非空、无重复、合法的 UUID 字符串数组，且不超过上限。
@@ -4877,7 +4877,7 @@ async function handleBatchPreviewTickets(req, res, ctx) {
 async function handleChangeMyPassword(req, res, ctx) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const body = await readJsonBody(req);
   // #677 Tier 2A：口令长度上限是热读旋钮 ⇒ 本请求现读一次，喂给两处 validatePassword/changeOwnPassword。
   const ownMaxPasswordLength = await runtimeSettings.readMaxPasswordLength({
     pool: ctx.pool, config: ctx.config, log: ctx.log,
@@ -5092,7 +5092,7 @@ function publicOriginOf(req, ctx) {
 async function handleFilePreviewTicket(req, res, ctx) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const body = await readJsonBody(req);
   const jailed = dirs.resolveJailedFile({
     userSpaceRoot: ctx.config.userSpaceRoot,
     fdeName: session.user.fde_name,
@@ -5248,7 +5248,7 @@ async function handleInternal(req, res, ctx, url) {
   if (pathname === '/api/internal/claim') {
     if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     requireJson(req);
-    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const body = await readJsonBody(req);
     const capacity = body.capacity ?? 1;
     const holdMs = body.hold_ms ?? 30000;
 
@@ -5325,7 +5325,7 @@ async function handleInternal(req, res, ctx, url) {
   if (pathname === '/api/internal/mcp/tools-cache') {
     if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     requireJson(req);
-    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const body = await readJsonBody(req);
     const slug = typeof body?.slug === 'string' ? body.slug : '';
     if (!market.SKILL_SLUG_RE.test(slug)) {
       throw new HttpError(400, 'validation_failed', 'slug 不合法', { details: { field: 'slug', slug } });
@@ -5336,7 +5336,7 @@ async function handleInternal(req, res, ctx, url) {
   if (pathname === '/api/internal/heartbeat') {
     if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     requireJson(req);
-    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const body = await readJsonBody(req);
     // issue #289：把 serve 进程的 llmGateway 单例透传给心跳对账；必须传 ctx.llmGateway 本身，
     // 不可在此现造 client——llm.js 的映射 TTL 缓存按 client 对象身份分槽，现造 ⇒ 每次心跳多打一次 GET /model/info。
     const result = await internal.heartbeat(ctx.pool, { container, user, body, llmGateway: ctx.llmGateway, log: ctx.log });
@@ -5456,7 +5456,7 @@ async function handleInternal(req, res, ctx, url) {
     if (sub === '/state') {
       if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       // #322 真机取证：`config` 必须下传 —— 自动改名要在 portal 侧调网关，网关地址只有 ctx.config 里那份
       // （`llmGatewayAdminUrl`）在容器里可达；漏传 ⇒ 退回 `127.0.0.1:4100` ⇒ ECONNREFUSED ⇒ 静默降级。
       const result = await internal.setRunState(ctx.pool, { container, user, runId, claimToken, body, config: ctx.config });
@@ -5472,7 +5472,7 @@ async function handleInternal(req, res, ctx, url) {
     if (sub === '/release') {
       if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const result = await internal.releaseRun(ctx.pool, { container, user, runId, claimToken, body });
       return sendJson(res, 200, result);
     }
@@ -5544,7 +5544,7 @@ async function handleInternal(req, res, ctx, url) {
     if (sub === '/approvals') {
       if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
       requireJson(req);
-      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const body = await readJsonBody(req);
       const result = await internal.createApproval(ctx.pool, { container, user, runId, claimToken, body });
       return sendJson(res, result.status, { approval_id: result.approval_id });
     }
