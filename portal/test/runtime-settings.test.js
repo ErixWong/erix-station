@@ -69,6 +69,23 @@ import {
   readOnboardingIdleBackoffMaxMs, invalidateOnboardingIdleBackoffCache,
   readOffboardingIdleBackoffMaxMs, invalidateOffboardingIdleBackoffCache,
   readProvisionerIdleBackoffMaxMs, invalidateProvisionerIdleBackoffCache,
+  PENDING_TOKEN_TTL_SECONDS_KEY, SESSION_RENEW_INTERVAL_SECONDS_KEY,
+  MAX_PASSWORD_LENGTH_KEY, MAX_LOGIN_LENGTH_KEY,
+  PENDING_TOKEN_TTL_SECONDS_MIN, PENDING_TOKEN_TTL_SECONDS_MAX, PENDING_TOKEN_TTL_SECONDS_DEFAULT,
+  SESSION_RENEW_INTERVAL_SECONDS_MIN, SESSION_RENEW_INTERVAL_SECONDS_MAX,
+  SESSION_RENEW_INTERVAL_SECONDS_DEFAULT,
+  MAX_PASSWORD_LENGTH_MIN, MAX_PASSWORD_LENGTH_MAX, MAX_PASSWORD_LENGTH_DEFAULT,
+  MAX_LOGIN_LENGTH_MIN, MAX_LOGIN_LENGTH_MAX, MAX_LOGIN_LENGTH_DEFAULT,
+  PENDING_TOKEN_TTL_SECONDS_HINT, SESSION_RENEW_INTERVAL_SECONDS_HINT,
+  MAX_PASSWORD_LENGTH_HINT, MAX_LOGIN_LENGTH_HINT,
+  parsePendingTokenTtlSeconds, validatePendingTokenTtlSeconds,
+  parseSessionRenewIntervalSeconds, validateSessionRenewIntervalSeconds,
+  parseMaxPasswordLength, validateMaxPasswordLength,
+  parseMaxLoginLength, validateMaxLoginLength,
+  readPendingTokenTtlSeconds, invalidatePendingTokenTtlCache,
+  readSessionRenewIntervalSeconds, invalidateSessionRenewIntervalCache,
+  readMaxPasswordLength, invalidateMaxPasswordLengthCache,
+  readMaxLoginLength, invalidateMaxLoginLengthCache,
 } from '../src/runtime-settings.js';
 import { MAX_BACKOFF_MS_SAFE } from '../src/loop-timing.js';
 import {
@@ -616,17 +633,19 @@ test('RS-6b 审计被抑制 ⇒ 抛 500 且**设置没落库**（检查在 COMMI
 
 test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_days'
   + ' + preview.ticket_ttl_seconds + session.auto_title_min_new + preview.session_ttl_seconds'
-  + ' + 三个退避旋钮', async () => {
+  + ' + 三个退避旋钮 + 四个认证旋钮（#677 Tier 2A）', async () => {
   // P1 时这一格钉的是「registry 是空对象」；P2a 迁了第一格 ⇒ 判据改成「只迁了这一格」；
-  // P3 第一/二/三批各迁一格、第五批迁第五格、第六批一次迁三个循环的空闲退避上限
-  // ⇒ 判据改成「就这八格，不多不少」。
+  // P3 各批逐格迁到八格；#677 Tier 2A 一次迁四个「无状态、每请求读」的认证旋钮
+  // ⇒ 判据改成「就这十二格，不多不少」。
   // 它红了的读法不变：有人顺手多迁了一格（或把热读口径弄丢了）。
   assert.deepEqual(Object.keys(RUNTIME_SETTING_REGISTRY),
     ['session.ttl_seconds', 'workspace.retention_days', 'preview.ticket_ttl_seconds',
       'session.auto_title_min_new', 'preview.session_ttl_seconds',
       'loop.onboarding_idle_backoff_ms', 'loop.offboarding_idle_backoff_ms',
-      'loop.provisioner_idle_backoff_ms'],
-    'P3 只许迁这八格（其余旋钮逐批填）');
+      'loop.provisioner_idle_backoff_ms',
+      'auth.pending_token_ttl_seconds', 'auth.session_renew_interval_seconds',
+      'auth.max_password_length', 'auth.max_login_length'],
+    '只许迁这十二格（其余旋钮逐批填）');
   assert.ok(Object.isFrozen(RUNTIME_SETTING_REGISTRY), 'registry 必须冻结（运行期没人能塞旋钮进来）');
   const entry = RUNTIME_SETTING_REGISTRY['session.ttl_seconds'];
   assert.ok(Object.isFrozen(entry), '条目也必须冻结');
@@ -718,7 +737,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   assert.notEqual(HOT_READ_INVALIDATORS.get(PREVIEW_SESSION_TTL_KEY),
     HOT_READ_INVALIDATORS.get(PREVIEW_TICKET_TTL_KEY),
     '第五格不许共用第三格的失效函数（会话 TTL 与票 TTL 各有各的缓存）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 8, '登记表里就是八格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 12, '登记表里就是十二格（热读旋钮数 = 失效钩子数）');
 
   // P3 第六批的三格：同一个口径再钉一次（各自一个导出的失效函数，且互相不许共用）。
   assert.equal(HOT_READ_INVALIDATORS.get(ONBOARDING_IDLE_BACKOFF_MS_KEY),
@@ -729,7 +748,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
     invalidateProvisionerIdleBackoffCache);
   assert.equal(new Set([...HOT_READ_INVALIDATORS.values()]).size, HOT_READ_INVALIDATORS.size,
     '一格一个失效函数：共用就是「保存开户那格把对账那格的缓存也抹了」（RS-51 钉另一面）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 8, '登记表里就是八格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 12, '登记表里就是十二格（热读旋钮数 = 失效钩子数）');
 
   assert.equal(isKnownSetting('demo.limit'), false, '真实 registry 里没有 demo.limit');
   assert.equal(isKnownSetting('constructor'), false,
@@ -1239,7 +1258,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   const fromDb = await listRuntimeSettingsAdmin({
     pool: dbPool, config: CONFIG_ENV, env: {}, log: silentLog,
   });
-  assert.equal(fromDb.items.length, 8);
+  assert.equal(fromDb.items.length, 12);
   assert.deepEqual(Object.keys(fromDb.items[0]).sort(),
     ['applyMode', 'key', 'label', 'reason', 'source', 'updatedAt', 'updatedBy', 'value'].sort());
   assert.deepEqual(fromDb.items[0], {
@@ -1299,7 +1318,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     pool: ttlPool({ throwOnSelect: Object.assign(new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
     config: CONFIG_ENV, log: deadLog,
   });
-  assert.equal(dead.items.length, 8, '读失败时八格都要给得出来（不是只给前几格）');
+  assert.equal(dead.items.length, 12, '读失败时十二格都要给得出来（不是只给前几格）');
   assert.equal(dead.items[0].source, 'env');
   assert.equal(dead.items[0].reason, 'read_failed');
   assert.equal(deadLog.seen.warn.length, 1, '有人在屏幕前等答案 ⇒ 读失败要 warn（不像启动路径只能 debug）');
@@ -2300,7 +2319,7 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   // GET 两格：登记了的那格原样带出，没登记的那格**不许**出现这个键（缺席 ≠ null ≠ 空串）。
   const cfg = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
   const list = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: cfg, env: {}, log: silentLog });
-  assert.equal(list.items.length, 8);
+  assert.equal(list.items.length, 12);
   const retItem = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
   assert.equal(retItem.hint, WORKSPACE_RETENTION_HINT,
     'DTO 必须逐字透出 registry 那句话（前端自己另写一份 = 第二份真相）');
@@ -3945,4 +3964,162 @@ test('RS-53 §4.21 的三行必须写出默认 / 值域 / 生效点（本批的�
     assert.match(prov, /默认 `?15000`?/);
     assert.match(prov, /业务上限|业务承诺/, '对账那行必须说明上界是业务上限（不是算术溢出）');
     assert.match(prov, /每一拍/);
+  });
+
+// ---------------------------------------------------------------------------
+// 13. #677 Tier 2A：四个「无状态、每请求读」的认证旋钮。
+//   RS-58 解析/校验（严格十进制正整数 + 各自区间）；RS-59 热读三档 + 坏 env 点名 warn；
+//   RS-60 四格各自独立实例（值不串）；RS-61 写路径失效登记齐；RS-62 §4.21 文档行；
+//   RS-63 真库腿（无 PG skip）。共享模块级热读缓存 ⇒ 每段前后 invalidate。
+// ---------------------------------------------------------------------------
+const AUTH_KNOBS = [
+  {
+    key: PENDING_TOKEN_TTL_SECONDS_KEY, env: 'PENDING_TOKEN_TTL_SECONDS',
+    parse: parsePendingTokenTtlSeconds, validate: validatePendingTokenTtlSeconds,
+    read: readPendingTokenTtlSeconds, invalidate: invalidatePendingTokenTtlCache,
+    min: PENDING_TOKEN_TTL_SECONDS_MIN, max: PENDING_TOKEN_TTL_SECONDS_MAX,
+    def: PENDING_TOKEN_TTL_SECONDS_DEFAULT, notReason: 'not_a_pending_token_ttl_seconds',
+    envValue: 200, dbValue: 300,
+  },
+  {
+    key: SESSION_RENEW_INTERVAL_SECONDS_KEY, env: 'SESSION_RENEW_INTERVAL_SECONDS',
+    parse: parseSessionRenewIntervalSeconds, validate: validateSessionRenewIntervalSeconds,
+    read: readSessionRenewIntervalSeconds, invalidate: invalidateSessionRenewIntervalCache,
+    min: SESSION_RENEW_INTERVAL_SECONDS_MIN, max: SESSION_RENEW_INTERVAL_SECONDS_MAX,
+    def: SESSION_RENEW_INTERVAL_SECONDS_DEFAULT,
+    notReason: 'not_a_session_renew_interval_seconds', envValue: 2000, dbValue: 3000,
+  },
+  {
+    key: MAX_PASSWORD_LENGTH_KEY, env: 'MAX_PASSWORD_LENGTH',
+    parse: parseMaxPasswordLength, validate: validateMaxPasswordLength,
+    read: readMaxPasswordLength, invalidate: invalidateMaxPasswordLengthCache,
+    min: MAX_PASSWORD_LENGTH_MIN, max: MAX_PASSWORD_LENGTH_MAX,
+    def: MAX_PASSWORD_LENGTH_DEFAULT, notReason: 'not_a_max_password_length',
+    envValue: 200, dbValue: 300,
+  },
+  {
+    key: MAX_LOGIN_LENGTH_KEY, env: 'MAX_LOGIN_LENGTH',
+    parse: parseMaxLoginLength, validate: validateMaxLoginLength,
+    read: readMaxLoginLength, invalidate: invalidateMaxLoginLengthCache,
+    min: MAX_LOGIN_LENGTH_MIN, max: MAX_LOGIN_LENGTH_MAX,
+    def: MAX_LOGIN_LENGTH_DEFAULT, notReason: 'not_a_max_login_length',
+    envValue: 100, dbValue: 200,
+  },
+];
+
+test('RS-58 Tier 2A 解析/校验：四格严格正整数 + 各自区间；越界拒、垃圾点名 not_*', () => {
+  for (const k of AUTH_KNOBS) {
+    assert.equal(k.parse(k.min).value, k.min, `${k.key} 下界内`);
+    assert.equal(k.parse(k.max).value, k.max, `${k.key} 上界内`);
+    assert.equal(k.parse(k.def).value, k.def, `${k.key} 默认值合法`);
+    assert.equal(k.parse(k.max + 1).ok, false, `${k.key} 上界+1 拒`);
+    assert.equal(k.parse(k.min - 1).ok, false, `${k.key} 下界-1 拒`);
+    assert.equal(typeof k.parse(k.max + 1).reason, 'string', `${k.key} 越界给原因`);
+    for (const bad of ['1e4', ' 30 ', '-1', '1.5', '', 'abc', true, null, {}, [], NaN]) {
+      assert.equal(k.parse(bad).ok, false, `${k.key} 垃圾 ${String(bad)} 拒`);
+      assert.equal(k.parse(bad).reason, k.notReason, `${k.key} 类型不符点名 ${k.notReason}`);
+    }
+    assert.equal(k.validate(k.def), true, `${k.key} 默认合法`);
+    assert.equal(typeof k.validate(k.min - 1), 'string', `${k.key} 越下界返原因`);
+    assert.equal(typeof k.validate(k.max + 1), 'string', `${k.key} 越上界返原因`);
+    assert.equal(typeof k.validate('12'), 'string', `${k.key} 字符串非法`);
+    assert.ok(String(k.validate(k.max + 1)).includes(String(k.max)), `${k.key} 越界点名上界`);
+  }
+});
+
+test('RS-59 Tier 2A 热读三档：DB > env（过闸）> 默认；坏 env ⇒ 默认 + 点名 warn', async () => {
+  for (const k of AUTH_KNOBS) {
+    k.invalidate();
+    const db = await k.read({
+      pool: ttlPool({ rows: [{ key: k.key, value: k.dbValue }] }), config: {}, env: {},
+      log: silentLog,
+    });
+    assert.equal(db, k.dbValue, `${k.key} 取 DB 值`);
+    k.invalidate();
+    const ev = await k.read({
+      pool: ttlPool({}), config: {}, env: { [k.env]: String(k.envValue) }, log: silentLog,
+    });
+    assert.equal(ev, k.envValue, `${k.key} env 过闸生效`);
+    k.invalidate();
+    const log = collectingLog();
+    const dv = await k.read({
+      pool: ttlPool({}), config: {}, env: { [k.env]: String(k.max + 1) }, log,
+    });
+    assert.equal(dv, k.def, `${k.key} 越界 env ⇒ 默认（不采纳坏值）`);
+    assert.ok(log.seen.warn.length >= 1, `${k.key} 坏 env 必须点名 warn`);
+    k.invalidate();
+    assert.equal(
+      await k.read({ pool: ttlPool({}), config: {}, env: {}, log: silentLog }),
+      k.def, `${k.key} 无 DB 无 env ⇒ 默认`);
+    k.invalidate();
+  }
+});
+
+test('RS-60 Tier 2A 四格各自独立实例：同表四行各读各的、值不串', async () => {
+  const rows = AUTH_KNOBS.map((k) => ({ key: k.key, value: k.dbValue }));
+  const pool = ttlPool({ rows });
+  for (const k of AUTH_KNOBS) k.invalidate();
+  for (const k of AUTH_KNOBS) {
+    assert.equal(
+      await k.read({ pool, config: {}, env: {}, log: silentLog }), k.dbValue,
+      `${k.key} 不被别格串值`);
+  }
+  for (const k of AUTH_KNOBS) k.invalidate();
+});
+
+test('RS-61 Tier 2A 四格都登记了写路径失效（少一行 ⇒ 这一格点名红）', () => {
+  for (const k of AUTH_KNOBS) {
+    assert.equal(HOT_READ_INVALIDATORS.get(k.key), k.invalidate, `${k.key} 必须登记失效钩子`);
+  }
+  const fns = AUTH_KNOBS.map((k) => HOT_READ_INVALIDATORS.get(k.key));
+  assert.equal(new Set(fns).size, 4, '四格必须是四个不同的失效函数（共用 ⇒ 串缓存）');
+});
+
+test('RS-62 Tier 2A §4.21 四行必须写出 envVar / 默认 / 值域 / 生效点', () => {
+  const apiDoc = fs.readFileSync(new URL('../../docs/api/portal.md', import.meta.url), 'utf8');
+  const start = apiDoc.indexOf('### 4.21 管理台运行时设置');
+  const end = apiDoc.indexOf('#### `GET /api/admin/runtime-settings`', start);
+  const rows = apiDoc.slice(start, end).split('\n').filter((l) => l.startsWith('|')).slice(2);
+  for (const k of AUTH_KNOBS) {
+    const row = rows.find((r) => r.includes('`' + k.key + '`'));
+    assert.ok(row, `§4.21 缺 ${k.key} 那一行`);
+    assert.ok(row.includes(k.env), `${k.key} 行必须写 envVar`);
+    assert.ok(row.includes('`hot`'), `${k.key} 行必须写 applyMode=hot`);
+    assert.ok(new RegExp('默认 `?' + k.def + '`?').test(row), `${k.key} 行必须写默认`);
+    assert.ok(new RegExp(k.min + '\\.\\.\\.?' + k.max).test(row), `${k.key} 行必须写值域`);
+    assert.ok(/现读/.test(row), `${k.key} 行必须写生效点（现读）`);
+  }
+});
+
+test('RS-63 Tier 2A 真库腿：保存⇒热读立即新值、删行⇒回落 env、坏行⇒回落不抛（无 PG skip）',
+  { skip: PG_SKIP }, async () => {
+    assert.ok(pgFixture, 'TEST_DATABASE_URL 给了却没有夹具');
+    await pgFixture.withFreshDatabase(async ({ pool }) => {
+      await pool.query(
+        `INSERT INTO users (id, login, password_hash, status) VALUES ($1, $2, 'x', 'active')`,
+        [ACTOR, 'w677-t2a-actor'],
+      );
+      for (const k of AUTH_KNOBS) {
+        k.invalidate();
+        const envCfg = { [k.env]: String(k.envValue) };
+        const read = () => k.read({ pool, config: {}, env: envCfg, log: pgSilent });
+        assert.equal(await read(), k.envValue, `${k.key} 无 DB 行 ⇒ env 档`);
+        const saved = await saveRuntimeSetting({
+          pool, actorId: ACTOR, key: k.key, value: k.dbValue, log: pgSilent,
+        });
+        assert.equal(saved.value, k.dbValue);
+        assert.equal(await read(), k.dbValue, `${k.key} 保存后立即新值（不等 5 秒）`);
+        await pool.query('DELETE FROM runtime_settings WHERE key = $1', [k.key]);
+        k.invalidate();
+        assert.equal(await read(), k.envValue, `${k.key} 删行 ⇒ 回落 env`);
+        await pool.query(
+          `INSERT INTO runtime_settings (key, value) VALUES ($1, $2::jsonb)`,
+          [k.key, '"abc"'],
+        );
+        k.invalidate();
+        assert.equal(await read(), k.envValue, `${k.key} 坏 DB 值 ⇒ 回落 env、不抛`);
+        await pool.query('DELETE FROM runtime_settings WHERE key = $1', [k.key]);
+        k.invalidate();
+      }
+    });
   });
