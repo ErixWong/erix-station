@@ -289,7 +289,16 @@ export function parsePreviewTicketTtlSeconds(raw) {
   return { ok: true, value };
 }
 
-/** 管理台写入前的取值闸：返回 `true` 或一句给人看的中文原因。 */
+/**
+ * 管理台写入前的取值闸：返回 `true` 或一句给人看的中文原因。
+ *
+ * ⚠ `1e3` 的两侧之分（#709 unproven 裁定）：**写侧接受任何合法 JSON number**——JSON 把科学记数法
+ * 在解析时就塌成了普通整数，`1e3` 与 `1000` 是同一个值 ⇒ 走下面的 safe-integer 支放行（区间内），
+ * 库里落的是 `1000`。只有**字符串** `"1e3"`（以及 `' 60 '`/`'60s'` 那一族）才在这一层被拒。
+ * 这与 **env 侧相反**：env 那档走 `parse` 的 `/^[0-9]+$/` 正则支，`1e3` 过不了 ⇒ 视为没给、回落默认（见
+ * `parsePreviewTicketTtlSeconds` 与 RS-31b / RS-37 / env.md）。一句话：`1e3` 写进 body 被收（=1000），
+ * 写进 env / 作为字符串都不算数。
+ */
 export function validatePreviewTicketTtlSeconds(value) {
   if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
     return `必须是 ${PREVIEW_TICKET_TTL_MIN_SECONDS}–${PREVIEW_TICKET_TTL_MAX_SECONDS}` +

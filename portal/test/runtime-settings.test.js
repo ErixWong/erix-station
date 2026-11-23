@@ -2326,6 +2326,37 @@ test('RS-31 preview.ticket_ttl_seconds 的解析与校验：严格十进制正�
   assert.match(String(validatePreviewTicketTtlSeconds(0)), /1/);
 });
 
+test('RS-31b 写侧的 1e3 两侧之分：JSON number 1e3 收并规整成 1000（不拒），字符串 "1e3" 仍拒', async () => {
+  // 裁定（#709 unproven）：写侧接受**任何合法 JSON number**；科学记数法在 JSON 解析时已塌成普通整数，
+  // 故 1e3 与 1000 是同一个值 ⇒ 必须收、库里存的是 1000；只有**字符串** "1e3" 才判非法。
+  // （env 侧相反：`PREVIEW_TICKET_TTL_SECONDS=1e3` 过不了 `/^[0-9]+$/` ⇒ 视为没给，见 RS-37 / env.md。）
+  // ① parse/validate：number 走 safe-integer 支 ⇒ 收成 1000；string 走正则支 ⇒ 挡掉。
+  const num = parsePreviewTicketTtlSeconds(1e3);
+  assert.equal(num.ok, true, 'number 1e3（=1000）必须收（写侧接受任何合法 JSON number）');
+  assert.equal(num.value, 1000, '1e3 必须规整成 1000（同一个值，不是两套真相）');
+  assert.equal(validatePreviewTicketTtlSeconds(1e3), true, 'validate 也放行 number 1e3');
+  assert.equal(parsePreviewTicketTtlSeconds('1e3').ok, false, '字符串 "1e3" 必须判非法');
+  assert.notEqual(validatePreviewTicketTtlSeconds('1e3'), true, '写侧 validate 必须拒字符串 "1e3"');
+  // ② 落库侧：save(value:1e3) 必须真把 1000 写进库（不是原样存 '1e3'，也不是被拒）。
+  invalidatePreviewTicketTtlCache();
+  const pool = new FakeRuntimePool();
+  const saved = await saveRuntimeSetting({
+    pool, actorId: ACTOR, key: PREVIEW_TICKET_TTL_KEY, value: 1e3, log: silentLog,
+  });
+  assert.equal(saved.value, 1000, 'DTO 值必须是 1000（RETURNING 真相）');
+  assert.equal(pool.storedValue(PREVIEW_TICKET_TTL_KEY), 1000, '库里真的是 1000（不是 1e3 文本）');
+  // ③ 落库侧反向：字符串 "1e3" 走 save ⇒ validation_failed（HTTP 400），零 SQL。
+  const pool2 = new FakeRuntimePool();
+  const err = await saveRuntimeSetting({
+    pool: pool2, actorId: ACTOR, key: PREVIEW_TICKET_TTL_KEY, value: '1e3', log: silentLog,
+  }).then(() => null, (e) => e);
+  assert.ok(err instanceof RuntimeSettingsError, '字符串 "1e3" 必须抛 RuntimeSettingsError');
+  assert.equal(err.code, 'validation_failed', '字符串 "1e3" ⇒ validation_failed（HTTP 400）');
+  assert.equal(err.httpStatus, 400, '必须映射成 400');
+  assert.equal(pool2.queryCount, 0, '字符串 "1e3" 校验在发 SQL 之前 ⇒ 零 SQL');
+  invalidatePreviewTicketTtlCache();
+});
+
 test('RS-32 第三格热读三档：DB > env（过闸）> 默认 60；任何一档坏了都绝不抛', async () => {
   invalidatePreviewTicketTtlCache();
   const dbPool = ttlPool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }] });
