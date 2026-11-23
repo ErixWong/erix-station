@@ -12,6 +12,10 @@ import * as auth from '../src/auth.js';
 import { hashToken } from '../src/auth.js';
 import * as totp from '../src/totp.js';
 import { FakePool } from './fake-pool.js';
+import {
+  invalidatePendingTokenTtlCache,
+  invalidateMaxPasswordLengthCache,
+} from '../src/runtime-settings.js';
 
 const TEST_GIT_HOST_ID = 'c0000000-0000-4000-8000-000000000011';
 const TEST_LLM = { provider_id: 'mock-provider', main_model_id: 'mock-main' };
@@ -1323,6 +1327,107 @@ test('#677 P3④ forward-auth 的 Set-Cookie Max-Age 用现读值（非 previewC
       assert.match(setCookie, /HttpOnly/);
       assert.match(setCookie, /SameSite=Lax/);
       assert.match(setCookie, /Path=\//);
+    } finally {
+      await s.close();
+    }
+  });
+
+/**
+ * #677 Tier 2A 热读集成测试的池子：`runtime_settings` 整表读（`SELECT_SQL` 无参），
+ * 返回调用方给的 `{key → value}` 行；读侧自己按 key 过滤并过 registry 闸。其余查询转基类。
+ * 用途：让某个 auth 旋钮的 DB 现读值与 `startServer` 的 config 快照拉开，证明消费者走现读。
+ */
+class SettingsFakePool extends FakePool {
+  constructor({ settings = {}, ...opts } = {}) {
+    super(opts);
+    this.settings = settings;
+  }
+
+  async query(sql, params = []) {
+    if (/FROM runtime_settings/.test(String(sql))) {
+      const rows = Object.entries(this.settings).map(([key, value]) => ({ key, value }));
+      return { rows, rowCount: rows.length };
+    }
+    return super.query(sql, params);
+  }
+}
+
+test('#677 Tier 2A pending_token：expires_in 与落库 ttlSeconds 现读同源（非 config 快照）',
+  async () => {
+    // 变异 M-1 的捕获：`http.js` 若把 `expires_in` 改回 `config.pendingTokenTtlSeconds`
+    // （启动快照 120），现读 DB 覆盖 45 就会与响应分叉。本格 DB 现读 45 ⇒
+    // `expires_in` 必须 45，且落库 `login_pending.expires_at` 也是同一 45（同请求同源）。
+    invalidatePendingTokenTtlCache();
+    const password = 'correct horse battery staple';
+    const totpSecret = totp.generateSecret(20);
+    const user = {
+      id: 'u1', login: 'alice', display_name: 'Alice', role: 'admin', fde_name: null,
+      auth_source: 'local', status: 'active',
+      password_hash: await auth.hashPassword(password),
+      totp_secret: totpSecret, last_totp_step: null,
+    };
+    const pool = new SettingsFakePool({
+      users: [user],
+      settings: { 'auth.pending_token_ttl_seconds': 45 },
+    });
+    const s = await startServer({ pool, overrides: { pendingTokenTtlSeconds: 120 } });
+    try {
+      const step1 = await fetch(`${s.base}/api/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ login: 'alice', password }),
+      });
+      assert.equal(step1.status, 200);
+      const body1 = await step1.json();
+      assert.equal(body1.status, 'totp_required');
+      assert.equal(body1.expires_in, 45,
+        `expires_in 必须是现读的 45（实得 ${body1.expires_in}；= 改回了启动快照 120）`);
+      assert.notEqual(body1.expires_in, 120, '不许是启动快照的 120（= expires_in 没接现读）');
+      // 同源：落库那一行的 ttl（expires_at - created_at）必须与响应 expires_in 是同一个现读值。
+      const pending = pool.pending.at(-1);
+      assert.ok(pending, 'step1 必须签发一条 login_pending');
+      const storedTtl = Math.round(
+        (new Date(pending.expires_at) - new Date(pending.created_at)) / 1000,
+      );
+      assert.equal(storedTtl, body1.expires_in,
+        '落库 ttlSeconds 与响应 expires_in 必须同源（同请求只现读一次）');
+      assert.equal(storedTtl, 45);
+    } finally {
+      await s.close();
+    }
+  });
+
+test('#677 Tier 2A max_password_length：登录长度校验现读（非 config.maxPasswordLength 快照）',
+  async () => {
+    // 变异 M-2 的捕获：`http.js` 登录长度校验若改回 `config.maxPasswordLength`（快照 256），
+    // 现读 DB 覆盖 8 就不生效。本格 DB 现读 8 ⇒ 12 字符口令必须 400「超过上限 8」；
+    // 改回快照则 12 ≤ 256 不早退 → 走到 authenticate 拿 401 ⇒ 这一格点名红。
+    invalidateMaxPasswordLengthCache();
+    const user = {
+      id: 'u1', login: 'alice', display_name: 'Alice', role: 'admin', fde_name: null,
+      auth_source: 'local', status: 'active',
+      password_hash: await auth.hashPassword('correct horse battery staple'),
+      totp_secret: null, last_totp_step: null,
+    };
+    const pool = new SettingsFakePool({
+      users: [user],
+      settings: { 'auth.max_password_length': 8 },
+    });
+    const s = await startServer({ pool, overrides: { maxPasswordLength: 256 } });
+    try {
+      const login12 = 'alice';
+      const password12 = 'longer-than8';
+      assert.equal(password12.length, 12);
+      const res = await fetch(`${s.base}/api/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ login: login12, password: password12 }),
+      });
+      const body = await res.json().catch(() => ({}));
+      assert.equal(res.status, 400,
+        `12 字符口令必须被现读上限 8 拒（实得 ${res.status}；= 改回了快照 256）`);
+      assert.match(JSON.stringify(body), /超过上限 8/,
+        `错误须点名现读上限 8（实得 ${JSON.stringify(body)}）`);
+      assert.doesNotMatch(JSON.stringify(body), /超过上限 256/,
+        '不许点名快照的 256（= 长度校验没接现读）');
     } finally {
       await s.close();
     }
