@@ -326,7 +326,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_CMD` | 平台规范固定（FDE 容器命令；开发期 whoami 站台用，生产为 `station-agentd` 入口） | JSON 数组；开发期 `["-port","4000"]`（首个项目块首端口，fde-platform §8.2） |
 | `FDE_AGENT_VERSION` | **仅作显式 override**（issue #404 结案）：不设 ⇒ 版本真相来自镜像内 `build-info.json`；设成真值 ⇒ 同时注进容器 env `ERIX_AGENT_VERSION` 覆盖构建产物，并写进新建容器的 `containers.agent_version`（后续由心跳校正为实际值）。`dev` 是占位，**不算钉值、不注入容器** | 不设（占位 `dev`） |
 | `FDE_MEMORY_LIMIT` | 平台规范固定（deploy-contract §6.2 资源限额；**已决 2026-09-18，issue #27**） | `4g`（B 档镜像下 dotnet build/chromium 峰值需要；`0` 表示不限） |
-| `FDE_AGENTD_UID` / `FDE_WORKER_UID` | 平台规范固定（runner-integration §11.3 / user-space §6.1 双 UID） | `1001` / `1002`（GID 同 `1000`；开发期 whoami 镜像不具备双 UID 用户，用 `--user 1001:1000` 兜底） |
+| `FDE_WORKER_UID` | 容器内 worker 的 UID（agentd fork worker 时切；portal 侧给 agent shell 写 git `safe.directory`） | `1002`（GID 同 `1000`） |
 | `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；#366 兼任 `/pv/<code>` 能力码签名密钥 `previewSessionSigningKey`；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
 | `KK_INTERNAL_BASE_URL` | portal 访问 kkFileView 预览引擎的容器网地址（#366，portal.md §4.11；浏览器永远不碰它） | `http://kkfileview:8012` |
 | `KKFILEVIEW_IMAGE` | kkFileView 镜像。**官方 Hub 镜像停在 4.1.0（无 `file://` 本地协议，不支持 ro 挂载预览设计），上游 5.x 未发布镜像 → 自建**（`deploy/kkfileview/build-image.sh`，生产按 digest 钉死） | `erix-station/kkfileview:5.0.3`（dev 本地 build） |
@@ -336,7 +336,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `PREVIEW_SESSION_TTL_SECONDS` | 预览会话 cookie 的 TTL（秒）。自 #677 P3 第五批起它只是**兜底位**：真值在 `runtime_settings.preview.session_ttl_seconds`（管理台可改，`applyMode=hot`，契约 `docs/api/portal.md` §4.21）——**下一次签发 / 续期预览 cookie 就用新 TTL**，不用重建容器。⚠ 两个消费点都现读：`preview.js` 的 `handleTicket`/`handleSessionCookie` 算库内 `expires_at`，`http.js` 的 `handleForwardAuth` 发 `Set-Cookie` 的 `Max-Age`（`config.previewCookie.maxAge` 那个启动快照不再参与）。⚠ env 值也必须过 registry 那套闸（`parse`/`validate`：整数且 `60..86400`）——`1e3`/`60.5`/`-1`/`59`/`86401` 过不了闸视为没给 ⇒ 回落默认 `900` + 一条点名 key 与本变量名的 warn（`source` 报 `default`）。写侧（PUT body）接受任何合法 JSON number（`1e3` 塌成 `1000`），只有字符串 `"1e3"` 被拒（`1e3` 两侧之分同 §4.21）。取值来源：平台规范固定（portal.md §2.8；**已决 2026-09-18，issue #27**） | `900`（预览 cookie 15min 滚动续期） |
 | `LLM_GATEWAY_HOST` | Traefik host-network 使用的 LiteLLM 数据面回环地址 | `http://127.0.0.1:4100` |
 | `LITELLM_HOST_PORT` | LiteLLM 在宿主回环发布的端口；隔离栈必须指定与其它栈不同的端口 | `4100` |
-| `LLM_GATEWAY_MODE` / `LLM_GATEWAY_ADMIN_URL` | portal LiteLLM admin API 配置；该 LiteLLM 版本管理面与数据面同服务。`self` 使用 backend 上的本栈 LiteLLM，`external` 指向外部网关。AI-title 从 portal 容器经此 backend URL 调用数据面 | `self` / `http://station-litellm:4000` |
+| `LLM_GATEWAY_ADMIN_URL` | portal 调 LiteLLM 管理 API 的地址（管理面与数据面同服务） | `http://station-litellm:4000` |
 | `LITELLM_MASTER_KEY` / `LLM_GATEWAY_MASTER_KEY` | LiteLLM proxy admin key（`sk-` 前缀）；Compose 把同一秘密映射到 portal 配置项；只放 `deploy/.env`（600），不得提交 | 独立强随机值 |
 | `LITELLM_SALT_KEY` | LiteLLM 加密 DB 凭据的 salt；写入 `litellm` 库数据后不可更改；只放 `deploy/.env`（600） | 独立强随机值 |
 | `LITELLM_DB_USER` / `LITELLM_DB_PASSWORD` | 独立 LiteLLM 数据库角色；新建 DB 数据目录时由 `deploy/db-init/01-litellm.sh` 创建角色与库；容器 `DATABASE_URL` 指向 `station-db:5432/litellm`，不得复用 portal 的 DB 角色 | `litellm` / 独立随机值 |
