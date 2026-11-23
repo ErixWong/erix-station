@@ -3714,6 +3714,17 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   （启动覆盖层 / 热读 / 本节这个 GET 共用同一个裁决器），通用 `intEnv` 不改（它服务别的旋钮）。
 - **表不存在 / 读失败也回 `200`**（回落 env/默认 + `source` 如实）。理由与 §4.15 同口径：
   运维故障不该把管理台锁死；写侧才是严格闸。
+- ⚠ **启动快照那一档的 `reason` 要分两档（#709 MED① + #709b LOW①）**：启动时从 DB 覆盖进来的
+  那一格（config 上带 `<path>Source='db'`）在读不到行时手里那个数仍是**启动时的 DB 快照**
+  ⇒ `source` 如实报 `db`，而 `reason` 按「为什么读不到」分叉（故障与没配不许共用一个理由）：
+  · `db_read_failed_using_boot_snapshot` —— 查询抛错 / 超时 / 没有 pool（故障族）= **真读不到**
+    ⇒ 运维该去看 DB（warn：「读不到 DB 行（read_failed…）⇒ 暂用启动时的 DB 快照」）；
+  · `no_row_using_boot_snapshot` —— **查询成功、只是表里没有这一行**（正常：还没人配过）
+    = **不是读失败** ⇒ 运维要去管理台改值而不是查连接（warn 单独一条，点名「查询成功、但表里
+    没有这一行」，不许顶着故障那条文案）。
+  其余情形的 `reason` 逐字不变（`no_row` / `read_failed` / `read_timeout` / 行在但值不可用）；
+  两档都是 `200`、都不抛。判据 `portal/test/runtime-settings.test.js`
+  「#709 MED① DB 读失败…」与「#709b LOW① 查询成功 + 无那一行」两格。
 - `applyMode` 两档：`hot` = **下一次读就生效**（不需要重启）；`restart` = 需重启 `station-portal` 才生效。
   这一档是**声明**，不是承诺——页面照它显示，别自己猜。
 - `hint`（**可选键**）：给管理员看的一行提示，registry 那一格登记了才带；**没登记就不有这个键**

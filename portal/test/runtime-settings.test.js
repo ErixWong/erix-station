@@ -2736,3 +2736,56 @@ test('#709 MED① 工厂统一：session/workspace/preview 三格 DB 读失败�
     assert.equal(envPv.source, 'env', '标 env 且 DB 读失败 ⇒ 仍报 env（没被改成 db）');
     assert.equal(envPv.reason, 'read_failed', '标 env 那一格的 reason 仍是 read_failed（不是 boot snapshot）');
   });
+
+// ---------------------------------------------------------------------------
+// #709b LOW①：「查询成功但没有这一行」不是「读失败」
+// ---------------------------------------------------------------------------
+
+test('#709b LOW① 查询成功 + 无那一行 ⇒ reason 不是读失败（no_row_using_boot_snapshot）',
+  async () => {
+    // 二审 LOW①：`toSettingItem()` 以前只用 `envTier.source === 'db' && !row` 判「启动快照」，
+    // 于是「SELECT 成功、表里没有这一行」（**正常状态**：还没人配过）也被说成读失败
+    // ⇒ 运维拿着「DB 读失败」去查一根好端端的库。这一格钉两种理由必须可区分。
+    // M-1（变异）：把 `no_row` 那一支改回一律 `db_read_failed_using_boot_snapshot` ⇒ ①②③ 红。
+    const boot = await bootOverlaidConfig(
+      [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }],   // 启动时 DB 里**有**这行 ⇒ 值被标成 db 快照
+      { previewTicketTtlSeconds: 60 },
+    );
+    // ① 报告面：库里那一行现在没了（SELECT 成功、零行）⇒ DB 通着，只是没人配过。
+    const emptyRead = ttlPool({ rows: [] });
+    const adminLog = collectingLog();
+    const { items } = await listRuntimeSettingsAdmin({
+      pool: emptyRead, config: boot, env: {}, log: adminLog,
+    });
+    const pv = items.find((i) => i.key === PREVIEW_TICKET_TTL_KEY);
+    assert.equal(pv.source, 'db', '值仍是启动时的 DB 快照 ⇒ source 仍如实报 db（不是 env）');
+    assert.equal(pv.value, 30, '手里那个数仍是启动时快照 30（LOW① 只改理由，不改值）');
+    assert.equal(pv.reason, 'no_row_using_boot_snapshot',
+      `查询成功 + 无行 ⇒ reason 点名「没这一行」，实得 ${pv.reason}`);
+    // ② 反面对：不许再顶着那条「读失败」的理由。
+    assert.notEqual(pv.reason, 'db_read_failed_using_boot_snapshot',
+      '「查询成功但没有这一行」不许说成「读失败」');
+    // ③ warn 跟着分叉：要说「查询成功、表里没有这一行」，不许播故障那条。
+    const said = adminLog.seen.warn.filter((m) => m.includes(PREVIEW_TICKET_TTL_KEY));
+    assert.ok(said.some((m) => /查询成功、但表里没有这一行|还没有人配过/.test(m)),
+      `warn 要说清是「没这一行」而不是故障（实得 ${JSON.stringify(said)}）`);
+    assert.ok(!said.some((m) => /读不到 DB 行|DB 恢复前/.test(m)),
+      `不许播「DB 读失败」那条故障文案（实得 ${JSON.stringify(said)}）`);
+    // ④ 对照：真的读失败（SELECT 抛错）时仍是故障口径 ⇒ 两档不许塌成同一个值。
+    const dead = ttlPool({
+      throwOnSelect: Object.assign(new Error('no such table'), { code: '42P01' }),
+    });
+    const { items: deadItems } = await listRuntimeSettingsAdmin({
+      pool: dead, config: boot, env: {}, log: collectingLog(),
+    });
+    assert.equal(deadItems.find((i) => i.key === PREVIEW_TICKET_TTL_KEY).reason,
+      'db_read_failed_using_boot_snapshot', '真读失败仍是 db_read_failed_using_boot_snapshot');
+    // ⑤ 对照：没有启动快照那一档（值来自 env）时，查询成功 + 无行仍是既有的 `no_row`（未受影响）。
+    const { items: envItems } = await listRuntimeSettingsAdmin({
+      pool: emptyRead,
+      config: { previewTicketTtlSeconds: 45, previewTicketTtlSecondsSource: 'env' },
+      env: {}, log: collectingLog(),
+    });
+    assert.equal(envItems.find((i) => i.key === PREVIEW_TICKET_TTL_KEY).reason, 'no_row',
+      'env 那一档的 reason 逐字不变（LOW① 只动 boot snapshot 那一档的分叉）');
+  });

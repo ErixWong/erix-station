@@ -1337,15 +1337,24 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
   // 回落：值来自 env 那一档（或 registry 默认），`reason` 说清为什么不是 db。
   // `row` 存在但值非法 ⇒ 保留库里那行的 updated_at/by（它们是真发生过的事），只是值不用它。
   // #709 MED①：若 `envTier.source==='db'` 且读不到行 ⇒ 这一档用的是「启动时从 DB 覆盖进来的
-  // 快照」（此刻 DB 读失败 / 无行），`reason` 必须点明 `db_read_failed_using_boot_snapshot`，
-  // 而不是谎报 env/default（否则运维会去改一个根本不影响这个值的 env）。
+  // 快照」，`reason` 必须点明用的是启动时快照，而不是谎报 env/default（否则运维会去改一个
+  // 根本不影响这个值的 env）。
+  // #709b LOW①：但「启动时快照」那一档还要再分两种，**故障与没配不能共用一个理由**：
+  //   · `fallbackReason` 是故障族（`read_failed` / `read_timeout` / `no_pool`）⇒ 真读不到
+  //     ⇒ `db_read_failed_using_boot_snapshot`（运维该去看 DB）；
+  //   · `fallbackReason==='no_row'`（SELECT 成功了、只是表里没有这一行）⇒ 那是**正常状态**
+  //     ⇒ `no_row_using_boot_snapshot`（说成「读失败」会把运维支去查一根根本没坏的连接）。
+  //   其余理由（如行在但值不可用）仍当故障族处理：不抵赖成「没配」。
   const bootSnapshot = envTier?.source === 'db' && !row;
+  const bootSnapshotReason = fallbackReason === 'no_row'
+    ? 'no_row_using_boot_snapshot'
+    : 'db_read_failed_using_boot_snapshot';
   return withHint({
     ...base,
     value: envTier?.value,
     source: envTier?.source ?? 'default',
     reason: bootSnapshot
-      ? 'db_read_failed_using_boot_snapshot'
+      ? bootSnapshotReason
       : (row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row')),
   }, entry);
 }
@@ -1406,12 +1415,17 @@ export async function listRuntimeSettingsAdmin({
         resolveEnvTier(entry, config, { env, log }),
         fallbackReason,
       );
-      // #709 MED①：报 `db` + `db_read_failed_using_boot_snapshot` 的那一档，必须在 warn 里说清
-      // 「DB 读失败，暂用启动时快照」——运维看到 source=db 会去找库，而不是去改 env。
+      // #709 MED①：报 `db` + boot snapshot 的那一档，必须在 warn 里说清手里那个数是启动时快照
+      // ——运维看到 source=db 会去找库，而不是去改 env。
+      // #709b LOW①：故障族与「没这一行」两条文案分开（后者不许说自已是读失败）。
       if (item.source === 'db' && item.reason === 'db_read_failed_using_boot_snapshot') {
         log?.warn?.(`[runtime-settings] ${item.key} 读不到 DB 行（${fallbackReason}）`
           + ` ⇒ 暂用启动时的 DB 快照 ${JSON.stringify(item.value)}，source 如实报 db`
           + '（不是 env；DB 恢复前改 env 不影响这个值）');
+      } else if (item.source === 'db' && item.reason === 'no_row_using_boot_snapshot') {
+        log?.warn?.(`[runtime-settings] ${item.key} 的 DB 查询成功、但表里没有这一行`
+          + ` ⇒ 暂用启动时的 DB 快照 ${JSON.stringify(item.value)}，source 如实报 db`
+          + '（不是 env；这一格还没人配过 = DB 没坏，要去改值请开管理台而不是查连接）');
       }
       return item;
     }),
