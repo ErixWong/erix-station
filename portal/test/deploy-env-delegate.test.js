@@ -480,7 +480,8 @@ function collectParamBindings(code, masked, pairs, scopes, litsOf) {
     for (const [a, b] of splitTop(masked, site.from, site.to)) {
       const { bindings, unparsed } = paramBindingsIn(masked, code, a, b);
       for (const p of bindings) {
-        out.push({ name: p.name, start: p.at, end: Math.max(site.end, p.at + p.name.length), lits: litsOf(p.def) });
+        out.push({ name: p.name, start: p.at, end: Math.max(site.end, p.at + p.name.length),
+          lits: litsOf(p.def), def: p.def });
       }
       // **解析不出的嵌套形状 ⇒ fail loudly**（#587 族 A 三轮①）：把那个片段里出现过的名字全部按
       // 「被遮蔽但解析不出」记账 ⇒ 它在函数体内任何读形都进 `unsupported`（宁可假红）；反过来若静默
@@ -513,6 +514,360 @@ function shadowAt(shadows, name, at) {
 }
 
 /**
+ * **作用域感知的 env 别名存活事件表**（返修 MED①）：对每个 env 别名算出若干 `{ start, end, kind }`
+ * 区间，`kind ∈ env | kill | ambig`：
+ *   · env ⇒ 这段区间里该名字确实是 env 拷贝/转发（`{ ...process.env }` / `= process.env` / 引用另一个
+ *     env 对象）；
+ *   · kill ⇒ 被**重赋值**或被**参数 / 块声明遮蔽**成明确的非 env（`= other` / 无初值的 `function f(e)`）
+ *     ⇒ 此后 `e.KEY` **不再**算读站点；
+ *   · ambig ⇒ 绑成了一个静态拿不准的东西（函数调用 / 成员访问等）⇒ 读它 **fail-loud**，不许静默当读站点。
+ * 复用 `shadows`（参数/块声明的词法区间）与 `scopes`（重赋值所在块尾）；没产事件的读点默认仍算 env。
+ */
+function buildAliasOverrides(code, masked, envObjs, copyAliases, shadows, scopes) {
+  const ENV_OBJ_TEXT = /\bprocess\s*\??\.\s*env\b/;
+  const classify = (text, self) => {
+    if (text == null) return 'kill';                 // 无初值（裸参数 / 裸声明）⇒ 不是我们那份拷贝
+    const t = text.replace(/\s+/g, ' ').trim();
+    if (t === '') return 'kill';
+    if (ENV_OBJ_TEXT.test(t)) return 'env';
+    for (const o of envObjs) {                        // 引用另一个 env 对象 ⇒ env（`{ ...baseEnv }` 等）
+      if (o !== self && new RegExp(`\\b${escRe(o)}\\b`).test(t)) return 'env';
+    }
+    if (/^[A-Za-z_$][\w$]*$/.test(t) && !envObjs.has(t)) return 'kill';   // `= other`
+    if (/^(?:['"\[{(]|\bnew\b|\btrue\b|\bfalse\b|\bnull\b|\bundefined\b|\d)/.test(t)) return 'kill';
+    return 'ambig';                                   // 函数调用 / 成员访问等拿不准
+  };
+  const out = new Map();
+  const add = (nm, start, end, kind) => {
+    if (!(end > start)) return;
+    if (!out.has(nm)) out.set(nm, []);
+    out.get(nm).push({ start, end, kind });
+  };
+  for (const nm of copyAliases) {
+    // (a) 参数 / 块声明遮蔽（复用 `shadows` 的词法区间）：无初值 ⇒ kill；有初值按 env-object 分类
+    for (const s of shadows.get(nm) ?? []) {
+      const rhs = s.opaque ? undefined : (s.def != null ? s.def : (s.init != null ? s.init : null));
+      add(nm, s.start, s.end, s.opaque ? 'ambig' : classify(rhs, nm));
+    }
+    // (b) 声明初值 / 重赋值 / 参数默认值 `nm = rhs`：区间 = 该绑定所在块尾
+    const re = new RegExp(`(?<![\\w$.])${escRe(nm)}\\s*=(?!=)`, 'g');
+    for (const m of code.matchAll(re)) {
+      if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;   // 串正文里的「x = …」不是代码
+      const from = nextNonSpace(masked, m.index + m[0].length);
+      if (from == null) continue;
+      const rhs = code.slice(from, exprEndAt(masked, from));
+      add(nm, m.index, scopes(m.index).end, classify(rhs, nm));
+    }
+  }
+  return out;
+}
+
+/** 读点 `at` 上别名 `name` 还是不是 env：true=是（算读站点）/ false=已失效（drop）/ null=拿不准（fail-loud）。 */
+function aliasEnvAt(overrides, name, at) {
+  const list = overrides?.get(name);
+  if (!list || list.length === 0) return true;         // 没建事件 ⇒ 默认 env（旧行为 / 真树不变）
+  const cov = list.filter((e) => at >= e.start && at < e.end);
+  if (cov.length === 0) return true;                   // 读点不被任何绑定覆盖 ⇒ 默认 env
+  const w = (e) => e.end - e.start;
+  const min = Math.min(...cov.map(w));
+  const cands = cov.filter((e) => w(e) === min);        // 最内层 / 最晚那一段（重赋值遮蔽外层初绑）
+  if (new Set(cands.map((e) => e.kind)).size > 1) return null;   // 同层多个不同结论 ⇒ 拿不准
+  const kind = cands[0].kind;
+  return kind === 'env' ? true : kind === 'ambig' ? null : false;
+}
+
+/** 读形匹配位置上的**对象**还是不是 env（区分 `process.env` 字面量 vs 需作用域判定的别名）。 */
+function aliasEnvState(code, ctx, at) {
+  const head = code.slice(at, at + 40);
+  if (/^process\s*\??\.\s*env\b/.test(head)) return 'env';   // 直接 process.env ⇒ 恒读
+  const m = /^[A-Za-z_$][\w$]*/.exec(head);
+  const nm = m && m[0];
+  if (!nm || !ctx.envObjs.has(nm)) return 'env';             // 认不出的对象 ⇒ 保守当 env（旧行为）
+  const s = aliasEnvAt(ctx.aliasOverrides, nm, at);
+  return s === true ? 'env' : s === null ? 'ambig' : 'dead';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #587 折中方案**第 2 步**（261123）：三种「在 env 上取名字」的漏形 + fail-closed 兜底。
+//
+// 审计（`/tmp/audit-587/AUDIT-REPORT.md` 第 1 节）第 5/6/7 行那三形的读数都是
+// `keys=[]` **且** `unsupported=[]`：既不登记也不报错 ⇒ 「`unsupported` 为空」被当成「没有动态读」
+// = 假绿。本段补的是**形状识别**（`Object.assign` 的 env 别名 / `Reflect.get` / 解构），
+// 外加一条兜底口径：**认得出「在 env 上取名字」却解析不出静态 key ⇒ 必须进 `unsupported`**。
+// 允许误报（宁可假红），**不许静默**；而「完全没有 env 语义的普通对象操作」不许进来（判据带负例）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** env 对象表达式的**文本**口径（去空白后比对）：`process.env` / `process?.env`。 */
+const ENV_OBJECT_TEXT = /^process\??\.env$/;
+/** `Reflect.<op>(env, key)` 里算「读」的 op —— `set` / `deleteProperty` 是**写**形 ⇒ 不是读站点。 */
+const REFLECT_READ_OPS = new Set(['get', 'has']);
+/** `Object.<op>(env)` 一次取走**全部**名字 ⇒ 永远没有静态 key，只能 fail closed。 */
+const ENV_ENUM_OPS = new Set(['keys', 'values', 'entries']);
+
+/**
+ * 表达式（从 `from` 起）的**结束**下标：括号深度 0 上遇到 `,` `;` 换行，或一个**没有配对**的右括号就停。
+ * 两个状态机都保留行列位 ⇒ 停下来的位置仍是同一份文本的下标。
+ */
+function exprEndAt(masked, from) {
+  let depth = 0;
+  for (let i = from; i < masked.length; i += 1) {
+    const c = masked[i];
+    if (c === '(' || c === '[' || c === '{') depth += 1;
+    else if (c === ')' || c === ']' || c === '}') {
+      if (depth === 0) return i;
+      depth -= 1;
+    } else if (depth === 0 && (c === ',' || c === ';' || c === '\n')) return i;
+  }
+  return masked.length;
+}
+
+/**
+ * `[from, to)` 这段表达式**是不是 env 对象**（第 2 步的唯一口径，三形共用）。
+ * 认四种：① `process.env` / `process?.env`；② 已登记的别名（`env = process.env` 那一路）；
+ * ③ 拷贝形 `Object.assign(…, <env>, …)` —— 任一实参是 env 对象 ⇒ 结果带着 env 的属性；
+ * ④ 展开形 `{ …<env> }`。括号配平在 `masked` 上做 ⇒ 串正文里的括号骗不到它，名字比较在 `code` 上做。
+ */
+function isEnvSourceAt(code, masked, envObjs, from, to, depth = 0) {
+  if (from == null || to == null || from >= to || depth > 4) return false;
+  const flat = code.slice(from, to).replace(/\s+/g, '');
+  if (ENV_OBJECT_TEXT.test(flat)) return true;
+  if (/^[A-Za-z_$][\w$]*$/.test(flat) && envObjs.has(flat)) return true;
+  // `env ?? {}` / `process.env || {}`：兜底一个空对象不改「取的就是 env」这件事。
+  // 真树同形：`portal/src/version-info.js` 入口里的 `… = env ?? {}`（审计 #7 提过那一行）。
+  const fb = lastTopChar(masked, from, to,
+    (c, i) => (c === '?' && masked[i + 1] === '?') || (c === '|' && masked[i + 1] === '|'));
+  if (fb > from) {
+    const after = nextNonSpace(masked, fb + 2);
+    if (after != null && after < to && masked[after] === '{'
+      && isEnvSourceAt(code, masked, envObjs, from, fb, depth + 1)) return true;
+  }
+  const open = nextNonSpace(masked, from);
+  if (open == null || open >= to || depth >= 4) return false;
+  if (masked[open] === '{') {                      // ④ 展开形：`{ ...process.env }`
+    const close = matchBrackets(masked, open);
+    if (close == null || close > to) return false;
+    return splitTop(masked, open + 1, close - 1).some(([a, b]) => {
+      const dot = code.slice(a, b).indexOf('...');
+      return dot >= 0 && isEnvSourceAt(code, masked, envObjs, a + dot + 3, b, depth + 1);
+    });
+  }
+  if (masked.indexOf('(', from) < 0 || masked.indexOf('(', from) >= to) return false;
+  const paren = masked.indexOf('(', from);
+  if (!/^\s*Object\s*\.\s*assign\s*$/.test(code.slice(from, paren))) return false;   // ③ 拷贝形
+  const close = matchGroup(masked, paren);
+  if (close == null || close > to) return false;
+  return splitTop(masked, paren + 1, close - 1)
+    .some(([a, b]) => isEnvSourceAt(code, masked, envObjs, a, b, depth + 1));
+}
+
+/**
+ * env 的**拷贝 / 再别名**（审计 #5）：`const e = Object.assign({}, process.env)`、
+ * `const e = { ...process.env }`，以及「再别名」`const f = e` ⇒ 之后 `e.KEY` / `e['KEY']` 都是真读站点。
+ * 两条边界：① 解构成员绑的是**值**不是 env 对象（`const { A } = process.env` 里的 `A` 由
+ * `scanDestructureReads` 收成读站点，不许在这里变成「A 是 env 对象」）；② `x.y = Object.assign(…)`
+ * 这种「成员位当目标」认不出 ⇒ 那次的整表拷贝由 `scanEnvCopyReads` fail closed，不静默。
+ * 别名可以套别名 ⇒ 迭代到不动点。
+ * @returns {string[]} 新增的 env 对象别名（同时就地写进 `envObjs`）
+ */
+function envCopyAliases(code, masked, envObjs) {
+  const added = [];
+  // 「`{…} =`」= 解构模式的括号对：里面的标识符是**被解构出来的值**，不是 env 对象
+  const patterns = [];
+  for (const [o, c] of bracketPairs(masked)) {
+    if (masked[o] !== '{') continue;
+    const eq = nextNonSpace(masked, c);
+    const ok = eq != null && masked[eq] === '=' && !'=><'.includes(masked[eq + 1] ?? '');
+    if (ok) patterns.push([o, c]);
+  }
+  const inPattern = (idx) => patterns.some(([o, c]) => idx > o && idx < c);
+  const re = new RegExp(`(?<![\\w$.])(${IDENT_RE})\\s*=(?![=>])`, 'g');
+  for (let pass = 0; pass < 4; pass += 1) {
+    const before = added.length;
+    for (const m of code.matchAll(re)) {
+      const id = m[1];
+      if (envObjs.has(id) || inPattern(m.index)) continue;
+      if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;   // 串正文里的「x = …」不是代码
+      const from = nextNonSpace(masked, m.index + m[0].length);
+      if (from == null) continue;
+      const to = exprEndAt(masked, from);
+      if (!isEnvSourceAt(code, masked, envObjs, from, to)) continue;
+      if (ENV_OBJECT_TEXT.test(code.slice(from, to).replace(/\s+/g, ''))) continue;  // 直形旧正则已收
+      envObjs.add(id);
+      added.push(id);
+    }
+    if (added.length === before) break;
+  }
+  return added;
+}
+
+/**
+ * 解构成员 → 「读了哪个名字」：`{ A }` / `{ A: alias }` / `{ 'A': v }` 是**静态名**（A 被读），
+ * `{ [e]: v }` 是**计算名**（要解析），`{ ...rest }` 与认不出的成员一律记成「解析不出」⇒ fail closed。
+ */
+function destructMember(code, masked, from, to) {
+  const seg = code.slice(from, to);
+  const start = from + (seg.length - seg.trimStart().length);
+  const text = seg.trim();
+  if (text.startsWith('...')) return { kind: 'rest', start };
+  if (masked[start] === '[') {
+    const close = matchBrackets(masked, start);
+    const inner = close == null ? null : firstNonSpaceIn(masked, start + 1, close - 1);
+    if (inner == null) return { kind: 'rest', start };
+    return { kind: 'computed', start, exprStart: inner, exprEnd: close - 1 };
+  }
+  const m = /^(?:['"]([^'"]+)['"]|([A-Za-z_$][\w$]*))/.exec(text);
+  return m ? { kind: 'static', name: m[1] ?? m[2], start } : { kind: 'rest', start };
+}
+
+/**
+ * 形⑥ `Reflect.get(env, 'KEY')` / `Reflect.has(env, 'KEY')`（审计 #6）：成员名在**第二个实参**上。
+ * 解析得出（字面量 / 已知名 / `TABLE[...]`）⇒ 读站点；解析不出（`Reflect.get(env, name)`）⇒ unsupported。
+ * 第一个实参不是 env 对象（`Reflect.get(other, 'ERIX_X')`）⇒ 与这把闸门**无关**，不许进 unsupported。
+ */
+function scanReflectReads(code, masked, ctx, sink) {
+  const re = new RegExp(`(?<![\\w$.])Reflect\\s*\\.\\s*(${IDENT_RE})\\s*\\(`, 'g');
+  for (const m of code.matchAll(re)) {
+    if (!REFLECT_READ_OPS.has(m[1])) continue;                                  // `Reflect.set` 是写
+    if (!isCodePosition(code, masked, m.index, m[0].length)) continue;           // 串/正则正文
+    const open = m.index + m[0].length - 1;
+    const close = matchGroup(masked, open);
+    if (close == null) continue;
+    const args = splitTop(masked, open + 1, close - 1);
+    if (args.length === 0) continue;
+    if (!isEnvSourceAt(code, masked, ctx.envObjs, args[0][0], args[0][1])) continue;
+    const line = sink.lineOf(m.index);
+    const shape = code.slice(m.index, close).replace(/\s+/g, ' ').trim();
+    if (args.length < 2) { sink.fail(line, shape, ''); continue; }               // 连名字位都没有
+    const [ka, kb] = args[1];
+    const expr = code.slice(ka, kb).trim();
+    const lit = resolveExpr(expr, ctx, firstNonSpaceIn(masked, ka, kb) ?? ka);
+    if (lit) { for (const n of lit) sink.add(n, line, `reflect:${m[1]}`); continue; }
+    sink.fail(line, shape, expr);
+  }
+}
+
+/**
+ * 形⑦ 解构（审计 #7）：`const { KEY } = process.env` / `const { KEY: alias } = process?.env`
+ * / `const { [K_ENV]: v } = env`（别名与表驱动同权）。计算名解析不出 ⇒ unsupported；
+ * `...rest` 一次取走**剩下全部**名字 ⇒ 也 unsupported（它没有静态 key，静默就是第二个假绿）。
+ * RHS 不是 env 对象（`const { a } = other`）⇒ 与这把闸门无关，整条形都不许进。
+ */
+function scanDestructureReads(code, masked, ctx, sink) {
+  // 一个解构模式 `{ … } = <env 源>` 的成员逐条记账（声明形与赋值形共用同一条口径）。
+  const emitPattern = (brace) => {
+    const close = matchBrackets(masked, brace);
+    if (close == null) return;
+    const eq = nextNonSpace(masked, close);
+    if (eq == null || masked[eq] !== '=' || '=><'.includes(masked[eq + 1] ?? '')) return;
+    const rhs = nextNonSpace(masked, eq + 1);
+    if (rhs == null) return;
+    const rhsEnd = exprEndAt(masked, rhs);
+    if (!isEnvSourceAt(code, masked, ctx.envObjs, rhs, rhsEnd)) return;
+    sink.consumed.add(rhs);                 // 这条拷贝形已按成员逐条记账 ⇒ 别再算成整表拷贝
+    const pattern = code.slice(brace, rhsEnd).replace(/\s+/g, ' ').trim();
+    for (const [a, b] of splitTop(masked, brace + 1, close - 1)) {
+      const mem = destructMember(code, masked, a, b);
+      const line = sink.lineOf(mem.start);
+      if (mem.kind === 'static') { sink.add(mem.name, line, 'destructure'); continue; }
+      if (mem.kind === 'computed') {
+        const expr = code.slice(mem.exprStart, mem.exprEnd).trim();
+        const lit = resolveExpr(expr, ctx, mem.exprStart);
+        if (lit) { for (const n of lit) sink.add(n, line, `destructure:[${expr}]`); continue; }
+        sink.fail(line, pattern, expr);
+        continue;
+      }
+      sink.fail(line, pattern, code.slice(mem.start, b).trim());      // `...rest` / 认不出的成员
+    }
+  };
+  // 声明形：`const/let/var { … } = env`。
+  for (const m of code.matchAll(/\b(?:const|let|var)\s*\{/g)) {
+    if (!isCodePosition(code, masked, m.index, m[0].length)) continue;
+    emitPattern(m.index + m[0].length - 1);
+  }
+  // 赋值形（返修 MED②）：`({ … } = env)`——语句级解构赋值**必须**被圆括号包住（否则 `{} = x` 被当空
+  // 块标签）。旧扫描器只认声明形 ⇒ `({ KEY } = process.env)` 与 `({ [k]: v } = process.env)` **静默漏过**
+  // （既不站点也不 unsupported）。这里与声明形同口径：静态键名→读站点、计算属性解析不出→unsupported。
+  // 声明形那个 `{` 前面是 `const ` 的空格、赋值形那个 `{` 前面是 `(` ⇒ 两趟不会撞到同一个 brace。
+  for (const m of code.matchAll(/\(\s*\{/g)) {
+    if (!isCodePosition(code, masked, m.index, m[0].length)) continue;
+    emitPattern(m.index + m[0].length - 1);
+  }
+}
+
+/**
+ * 形⑧ **fail-closed 兜底**（本步的灵魂）：认得出「在 env 上取名字」却永远给不出静态 key 的形 ⇒
+ * `unsupported`。三形：① `Object.assign(…, env, …)` / `{ …env }` 的整表拷贝而结果**没**被绑成 env
+ * 别名（`Object.assign(cfg, process.env)`：之后谁读 `cfg.KEY` 静态看不出来）；
+ * ② `Object.keys|values|entries(env)`；③ `for (const k in env)`。
+ * 负例（一条都不许进）：`Object.assign(a, b)`、`Object.keys(other)`、`for (const k in other)`、
+ * 以及**已绑成别名**的拷贝（那条形由点号/下标读形逐条记账，再报一次就是双记）。
+ */
+function scanEnvCopyReads(code, masked, ctx, sink) {
+  const envObjs = ctx.envObjs;
+  // 没有展开位就没有对象字面量拷贝可查 ⇒ 不为这一形白跑一趟括号配对（全仓每文件一次）
+  const pairs = masked.includes('...') ? bracketPairs(masked) : new Map();
+  /** `X = <拷贝形>` 且 `X` 已经是 env 对象别名 ⇒ 这条拷贝已被别名跟踪。 */
+  const boundToAlias = (from) => {
+    let i = from - 1;
+    while (i >= 0 && /\s/.test(masked[i])) i -= 1;
+    if (i < 0 || masked[i] !== '=' || '=!<>'.includes(masked[i - 1] ?? '')) return false;
+    let j = i - 1;
+    while (j >= 0 && /\s/.test(masked[j])) j -= 1;
+    const end = j + 1;
+    while (j >= 0 && /[\w$]/.test(masked[j])) j -= 1;
+    const id = masked.slice(j + 1, end);
+    return id !== '' && envObjs.has(id);
+  };
+  /** 那个 `{` 处在**对象字面量**位吗（`=` `(` `[` `,` `:` `;` `{` 之后，或 `return` 之后）。 */
+  const objectLiteralAt = (i) => {
+    let p = i - 1;
+    while (p >= 0 && /\s/.test(masked[p])) p -= 1;
+    if (p < 0) return false;
+    if ('=([{,:;'.includes(masked[p])) return true;
+    return /\breturn$/.test(code.slice(Math.max(0, p - 8), p + 1));
+  };
+  const report = (from, to, at = from) => sink.fail(sink.lineOf(at),
+    code.slice(from, to).replace(/\s+/g, ' ').trim(), '');
+  // ① `Object.assign` 与 ② `Object.keys|values|entries`
+  for (const m of code.matchAll(/(?<![\w$.])Object\s*\.\s*(assign|keys|values|entries)\s*\(/g)) {
+    if (!isCodePosition(code, masked, m.index, m[0].length)) continue;
+    const open = m.index + m[0].length - 1;
+    const close = matchGroup(masked, open);
+    if (close == null) continue;
+    const args = splitTop(masked, open + 1, close - 1);
+    if (!args.some(([a, b]) => isEnvSourceAt(code, masked, envObjs, a, b))) continue;
+    if (m[1] !== 'assign' && !ENV_ENUM_OPS.has(m[1])) continue;      // 只认三枚举形 + assign
+    if (m[1] === 'assign' && (boundToAlias(m.index) || sink.consumed.has(m.index))) continue;
+    report(m.index, close);
+  }
+  // ①b 展开形 `{ …process.env }`：从**展开位**反查它所在的那个对象字面量（比逐个 `{` 配平便宜）
+  const seenLiteral = new Set();
+  for (const m of masked.matchAll(/\.\.\./g)) {
+    const wrap = enclosingPairs(masked, pairs, m.index).find((w) => w.kind === '{');
+    if (!wrap || !objectLiteralAt(wrap.open) || seenLiteral.has(wrap.open)) continue;
+    const operand = nextNonSpace(masked, m.index + 3);
+    if (operand == null) continue;
+    const segEnd = firstTopChar(masked, operand, wrap.close, (c) => c === ',');
+    const to = segEnd < 0 ? wrap.close - 1 : segEnd;
+    if (!isEnvSourceAt(code, masked, envObjs, operand, to, 2)) continue;
+    seenLiteral.add(wrap.open);
+    if (boundToAlias(wrap.open) || sink.consumed.has(wrap.open)) continue;
+    // 坐标指到**展开位**那一行（对象字面量可能跨好几行；指到开括号行会让人找不到是哪一份拷贝）
+    report(wrap.open, wrap.close, m.index);
+  }
+  // ③ `for (const k in process.env)`
+  const forIn = /\bfor\s*\(\s*(?:const\s+|let\s+|var\s+)?([A-Za-z_$][\w$]*)\s+in\s+/g;
+  for (const m of code.matchAll(forIn)) {
+    if (!isCodePosition(code, masked, m.index, m[0].length)) continue;
+    const from = m.index + m[0].length;
+    const rp = masked.indexOf(')', from);
+    if (rp < 0) continue;
+    if (!isEnvSourceAt(code, masked, envObjs, nextNonSpace(masked, from) ?? from, rp)) continue;
+    report(m.index, rp + 1);
+  }
+}
+
+/**
  * 建「这个名字能解析出哪些 env 名」的表 + **词法作用域遮蔽表**。**必须按形状分优先级多趟建**，因为绑定会互相引用
  * （`{ key = TOOLCALL_MARKERS_ENV }` 里的 `key` 依赖常量表，`const envName = LLM_TIMEOUT_ENV[field]`
  * 里的 `envName` 依赖数据表）：先收字面量与数据表，再收「别名 = 已知名」与「别名 = 已知名[...]」，
@@ -540,6 +895,11 @@ function analyzeEnvReads(code, rawText = null) {
   // `env = process?.env` 同样是别名（#587 族 A③）：不认就把它的读形整条扫不到 = 静默。
   // 但 `x = process?.env?.ERIX_X` 取的是**值**而不是 env 对象 ⇒ 后面紧跟 `?.` 的那一种要排掉。
   for (const m of code.matchAll(new RegExp(`(${IDENT_RE})\\s*=\\s*process\\s*\\??\\.\\s*env(?!\\?\\.)(?!\\.)(?!\\s*=[^=])`, 'g'))) envObjs.add(m[1]);
+  // env 的**拷贝别名**（#587 第 2 步①，审计 #5）：`const e = Object.assign({}, process.env)` 与
+  // `const e = { ...process.env }` 也得进 `envObjs` —— 不认，之后 `e.ERIX_X` 既不进 keys 也不进
+  // unsupported = 静默漏过（审计当时的读数就是两个空集合）。
+  const copyAliases = new Set(envCopyAliases(code, masked, envObjs));
+  for (const id of copyAliases) envObjs.add(id);
 
   // ① 字符串常量：`const FOO_ENV = 'ERIX_X'`
   for (const m of code.matchAll(new RegExp(`\\b(?:const|let|var)?\\s*(${IDENT_RE})\\s*=\\s*['"]([^'"]+)['"]`, 'g'))) {
@@ -600,14 +960,20 @@ function analyzeEnvReads(code, rawText = null) {
     if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;   // 串正文里的「const …」不算声明
     const scope = scopes(m.index);
     if (scope.whole) continue;
-    shadowList.push({ name: m[1], start: m.index, end: scope.end, lits: litsOf(m[2]) });
+    shadowList.push({ name: m[1], start: m.index, end: scope.end, lits: litsOf(m[2]), init: m[2] });
   }
   const shadows = new Map();
   for (const s of shadowList) {
     if (!shadows.has(s.name)) shadows.set(s.name, []);
     shadows.get(s.name).push(s);
   }
-  return { envObjs, names, shadows };
+  // ⑥ **作用域感知的 env 别名存活**（返修 MED①）：一个拷贝/参数别名只有在「最后一次把它绑成
+  //   env 源、且此后没被改成非 env」的区间里才算 env 对象。事件分三态：env（绑成 env 源）/
+  //   kill（重赋值或参数·块声明遮蔽成明确非 env ⇒ 此后 `e.KEY` **不再**算读站点）/ ambig（绑成
+  //   拿不准的东西 ⇒ 读它 **fail-loud** 进 unsupported，不许静默当读站点）。没被任何事件覆盖的
+  //   读点默认仍算 env（与改动前一致 ⇒ 真树不变）。复用 `shadows` 的词法区间与 `scopes`。
+  const aliasOverrides = buildAliasOverrides(code, masked, envObjs, copyAliases, shadows, scopes);
+  return { envObjs, names, shadows, aliasOverrides };
 }
 
 /**
@@ -694,6 +1060,15 @@ function scanEnvReadsFromFiles(files, root) {
       // 模板插值 `${…}` 里的代码不算串正文（`structuralMask` 特意留着），所以
       // `` msg: `${name}=${process.env[name]}` `` 这种活在模板里的读取不会被误杀。
       if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;
+      // 作用域感知（返修 MED①）：读形匹配上的**对象**若是个已被重赋值 / 被参数·块声明遮蔽成
+      // 非 env 的别名 ⇒ `e.KEY` 不再算读站点（drop）；若那个别名当前绑的是静态拿不准的东西 ⇒
+      // **fail-loud** 进 unsupported（不许静默当读站点）。`process.env` 字面量恒读，不受影响。
+      const objState = aliasEnvState(code, ctx, m.index);
+      if (objState === 'dead') continue;
+      if (objState === 'ambig') {
+        unsupported.push({ at: `${rel}:${line}`, shape: m[0].trim(), expr: '(别名绑定不确定)' });
+        continue;
+      }
       if (m[1] !== undefined) { add(m[1], rel, line, 'dot'); continue; }
       const expr = m[2] ?? '';
       // 表达式在**本篇代码**里的偏移：从 `[` 之后第一个非空白起算。遮蔽表按偏移开区间记账，
@@ -707,6 +1082,21 @@ function scanEnvReadsFromFiles(files, root) {
       // 必须逐条登记进 `deploy/env-legs-exceptions.json` 的 `unsupported` 段并写理由，否则判据红。
       unsupported.push({ at: `${rel}:${line}`, shape: m[0].trim(), expr: expr.trim() });
     }
+    // 三种「成员名不在点号/下标位置上」的取名字形（#587 第 2 步，审计 #5/#6/#7）+ fail-closed 兜底。
+    // 同一个 sink ⇒ 同一个 `keys` / `unsupported`，**不弄第二本账**；`consumed` 用来告知兜底尺
+    // 「这条整表拷贝已按成员/别名逐条记过账」，免得同一行双记。
+    // 行号用 `lineAt()`（上面那个 `lineUpTo` 是**单调**状态机，新形的偏移不保证递增）。
+    const sink = {
+      consumed: new Set(),
+      lineOf: (idx) => lineAt(code, idx),
+      add: (name, ln, shape) => add(name, rel, ln, shape),
+      fail: (ln, shapeText, exprText) => unsupported.push({
+        at: `${rel}:${ln}`, shape: shapeText, expr: exprText,
+      }),
+    };
+    scanReflectReads(code, masked, ctx, sink);
+    scanDestructureReads(code, masked, ctx, sink);
+    scanEnvCopyReads(code, masked, ctx, sink);
   }
   return { keys, unsupported };
 }
@@ -1640,27 +2030,35 @@ function validateUnsupported(items, root = REPO_ROOT, detected = null) {
  * 扫描结果 ↔ `unsupported` 登记的咬合（**fail closed 的那半**）：
  *   · 扫出来没登记 ⇒ 红（「解析不出名字」不能是免费的）；
  *   · 登记了但扫描器现在认不出来 ⇒ 红（过期条目 = 第二本账）；
- *   · 读形对得上但行号漂了 ⇒ 红（坐标必须现跑核对，不许靠记忆）。
+ *   · 读形对得上但行号漂了 ⇒ 红（坐标必须现跑核对，不许靠记忆）；
+ *   · **核销单位是「出现」不是「行」**（返修 HIGH / #587 审计）：扫描器按出现逐条推入，同一行两处
+ *     动态读是两条独立账；若按坐标（`路径:行`）核销，一条登记会把整行核销掉，第二处动态读就
+ *     「再没人要求解释」= 静默漏账（正是这道闸门要消灭的）。所以下面用**检出对象身份**当核销键、
+ *     且只在**尚未被核销**的检出里找 ⇒ 一条登记恰好核销一条出现，缺一处就红。
  */
 function unsupportedProblems(detected, registered) {
   const problems = [];
-  const matched = new Set();
+  const matched = new Set();          // 已核销的「出现」（存检出条目本身，不存 `at` 字符串）
   for (const r of registered) {
     const { rel, line } = splitCoord(r.at);
-    const hit = detected.find((d) => splitCoord(d.at).rel === rel && normRead(d.shape) === normRead(r.read));
+    // 先要**同一行**上、读形对得上、且还没被别的登记核销掉的那一条；同一行没有再退一步找别行（判漂移）。
+    const free = (d) => !matched.has(d) && splitCoord(d.at).rel === rel
+      && normRead(d.shape) === normRead(r.read);
+    let hit = detected.find((d) => free(d) && splitCoord(d.at).line === line);
+    let drifted = false;
+    if (!hit) { hit = detected.find(free); drifted = hit != null; }
     if (!hit) {
       problems.push(`unsupported 登记的 ${r.at}（read=${r.read}）扫描器现在**认不出来** ⇒ 过期条目：那个读形已改形或已删，删掉这条登记`);
       continue;
     }
-    const hitLine = splitCoord(hit.at);
-    if (hitLine.line !== line) {
+    if (drifted) {
       problems.push(`unsupported 登记的坐标 ${r.at} **行号漂了**：同一个读形现在在 ${hit.at} ⇒ 现跑一次更新坐标（别删条目了事）`);
       continue;
     }
-    matched.add(hit.at);
+    matched.add(hit);
   }
   for (const d of detected) {
-    if (matched.has(d.at)) continue;
+    if (matched.has(d)) continue;
     problems.push(`扫描器在 ${d.at} 发现一个**解析不出 env 名**的读取 ${d.shape}，但没登记在 deploy/env-legs-exceptions.json 的 \`unsupported\` 段`
       + ' ⇒ 动态读形静默漏过 = #557 的根因形状；登记它并写明理由（或把它改成字面量读形）');
   }
@@ -3588,6 +3986,437 @@ test('#587-S1-⑩ portal helper 间接读由**代码推出**并归 host-source�
     assert.match(real.why, /config\.js:12\b/, '理由要点名 helper `intEnv` 的声明行 :12');
     assert.match(real.why, /config\.js:13\b/, '还要点名真正取值的 `env[key]` 那一行');
     assert.equal(real.why.includes('mention-only'), false, '理由里不许同时出现另一个类别名');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+/**
+ * #587 折中方案**第 2 步**的夹具（三形 + fail-closed）。行号是约定（`S2_L`）：改文本要跟着改行号表。
+ * 一个文件只装一种形状 ⇒ 删掉对应的识别分支时只有那一格会红（变异表要能逐刀点名）。
+ */
+const S2_FILES = {
+  'lib/alias.js': [
+    'const e = Object.assign({}, process.env);',                       // 1 拷贝别名（审计 #5 那一形）
+    'export const dot = e.ERIX_S2_ASSIGN_DOT;',                        // 2 点号读
+    "export const idx = e['ERIX_S2_ASSIGN_INDEX'];",                     // 3 下标读
+    'const opt = Object.assign({}, process?.env);',                    // 4 可选链同权
+    'export const viaOpt = opt.ERIX_S2_ASSIGN_OPT;',                   // 5
+    'const again = e;',                                                // 6 再别名
+    'export const viaAgain = again.ERIX_S2_REALIAS;',                  // 7
+    'const plain = Object.assign({}, defaults);',                      // 8 负例：普通拷贝不是 env
+    'export const notEnv = plain.ERIX_S2_NOT_ENV;',                    // 9
+  ].join('\n'),
+  'lib/reflect.js': [
+    "export const a = Reflect.get(process.env, 'ERIX_S2_REFLECT_LIT');",   // 1 字面量名
+    'const K_ENV = \'ERIX_S2_REFLECT_NAME\';',                            // 2 常量名（读形里没有字面量）
+    'export const b = Reflect.get(process.env, K_ENV);',                  // 3
+    "export const c = Reflect.has(process.env, 'ERIX_S2_REFLECT_HAS');",  // 4 has 也算读
+    'const e = Object.assign({}, process.env);',                          // 5
+    "export const d = Reflect.get(e, 'ERIX_S2_REFLECT_ALIAS');",          // 6 别名上的 Reflect
+    "export const n = Reflect.get(other, 'ERIX_S2_REFLECT_NEG');",        // 7 负例：普通对象
+    "Reflect.set(process.env, 'ERIX_S2_REFLECT_WRITE', '1');",            // 8 写形不是读站点
+  ].join('\n'),
+  'lib/destructure.js': [
+    'const { ERIX_S2_DES_SHORT } = process.env;',                    // 1 简写
+    'const { ERIX_S2_DES_RENAMED: alias } = process?.env;',          // 2 重命名 + 可选链
+    'const {',                                                        // 3 多行解构：每个成员自己一行
+    '  ERIX_S2_DES_LINE_A,',                                          // 4
+    '  ERIX_S2_DES_LINE_B: b,',                                        // 5
+    '} = process.env;',                                                // 6
+    "const T = Object.freeze({ a: 'ERIX_S2_DES_TABLE' });",            // 7 数据表（不是读站点）
+    'const { [T]: fromTable } = process.env;',                         // 8 计算名从表里来
+    'const { cfg } = opts;',                                          // 9 负例：普通解构的成员不是 env 对象
+    'export const viaCfg = cfg.ERIX_S2_DES_NOT_ENV;',                 // 10
+    "const { 'ERIX_S2_DES_QUOTED': q } = process.env;",              // 11 引号键名
+    "const { ERIX_S2_DES_DEFAULT = 'x' } = process.env;",              // 12 带默认值
+  ].join('\n'),
+  'lib/failclosed.js': [
+    // 1 名字来源的数据表（登记的理由要引它那一行：族 B② 要求理由引到可核对的声明位）
+    "export const KNOB_TABLE = Object.freeze({ a: 'ERIX_S2_TABLE_NAMES' });",
+    'export const a = Reflect.get(process.env, name);',              // 2 动态 Reflect ⇒ unsupported
+    'export const b = Reflect.get(process.env);',                    // 3 连名字位都没有 ⇒ unsupported
+    'const { [name]: v } = process.env;',                            // 4 计算解构名 ⇒ unsupported
+    'const { ERIX_S2_KEPT, ...rest } = process.env;',                // 5 静态名是站点，rest 不是
+    'Object.assign(cfg, process.env);',                              // 6 整表拷贝没绑别名 ⇒ unsupported
+    'export const ks = Object.keys(process.env);',                    // 7 枚举 ⇒ unsupported
+    'for (const k in process.env) { use(k); }',                       // 8 for-in ⇒ unsupported
+    'const ok = Object.assign({}, process.env);',                    // 9 负例：绑成别名 ⇒ 不双记
+    'export const viaOk = ok.ERIX_S2_BOUND;',                        // 10
+    'const spreadOk = { ...process.env };',                          // 11 负例：展开形绑成别名
+    'export const viaSpread = spreadOk.ERIX_S2_SPREAD_BOUND;',       // 12
+    "export const neg = [Reflect.get(other, name), Object.keys(opts)];", // 13 负例：普通对象
+    'for (const k in other) { use(k); }',                            // 14 负例
+    'const { [name]: n2 } = other;',                                 // 15 负例
+    'const q = Object.assign({}, process?.env);',                    // 16 可选链的拷贝形也是别名
+    'export const viaQ = q.ERIX_S2_OPT_ALIAS;',                      // 17
+  ].join('\n'),
+};
+const S2_L = {
+  assignDot: 2, assignIdx: 3, assignOpt: 5, realias: 7, notEnv: 9,
+  reflectLit: 1, reflectName: 3, reflectHas: 4, reflectAlias: 6, reflectNeg: 7, reflectWrite: 8,
+  desShort: 1, desRenamed: 2, desLineA: 4, desLineB: 5, desTable: 8, desNotEnv: 10,
+  desQuoted: 11, desDefault: 12,
+  fcTable: 1,
+  fcReflectDyn: 2, fcReflectNoArg: 3, fcComputed: 4, fcRest: 5, fcCopy: 6, fcKeys: 7, fcForIn: 8,
+  fcBound: 9, fcSpread: 11, fcNeg: 13, fcNegForIn: 14, fcNegComputed: 15, fcOptAlias: 17,
+};
+
+/** 夹具 + 扫描产出（每格自己搭自己拆）。 */
+function s2Fixture() {
+  const dir = fixtureRoot(S2_FILES);
+  return { dir, index: buildEnvSiteIndex(dir), scan: scanEnvReads(dir) };
+}
+
+/** 站点坐标清单 `rel:line`（按 key 取），报错时能照着改。 */
+const s2Coords = (index, key) => index.sitesOf(key).map((s) => `${s.rel}:${s.line}(${s.shape})`);
+
+function s2At(key, rel, line) {
+  return { key, reason: '夹具：第 2 步三形的靶子', where: `${rel}:${line}` };
+}
+
+test('#587-S2-① 拷贝别名（`Object.assign({}, process.env)` / `{ ...process.env }`）之后的点号与下标都是读站点', () => {
+  const { dir, index } = s2Fixture();
+  try {
+    const want = [
+      ['ERIX_S2_ASSIGN_DOT', S2_L.assignDot, 'dot'],
+      [`ERIX_S2_ASSIGN_INDEX`, S2_L.assignIdx, `index:'ERIX_S2_ASSIGN_INDEX'`],
+      ['ERIX_S2_ASSIGN_OPT', S2_L.assignOpt, 'dot'],
+      ['ERIX_S2_REALIAS', S2_L.realias, 'dot'],
+    ];
+    for (const [key, line, shape] of want) {
+      assert.deepEqual(s2Coords(index, key), [`lib/alias.js:${line}(${shape})`],
+        `${key} 必须认成「env 拷贝别名上的读站点」（实际 ${JSON.stringify(s2Coords(index, key))}）`
+        + ' ⇒ 审计 #5 的读数就是 keys=[] 且 unsupported=[]：既不登记也不报错');
+      // 影子尺（第 1 步那张索引）必须吃到它：指到真站点 ⇒ 判绿
+      assert.deepEqual(siteIndexProblems([s2At(key, 'lib/alias.js', line)], index, dir), [],
+        `${key} 的真站点被影子尺判红 ⇒ 索引没吃到拷贝别名`);
+    }
+    // 负例：`Object.assign({}, defaults)` 不是 env ⇒ 那一形一条都不许进
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_NOT_ENV'), [],
+      '普通对象上的 `Object.assign` 拷贝被当成 env 别名了 ⇒ 会把无关读形灌进枚举');
+    assert.deepEqual(index.linesOf('ERIX_S2_ASSIGN_DOT', 'lib/reflect.js'), [],
+      '别名表是**按文件**建的 ⇒ 隔壁文件的 `e.` 不许跟着背书');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-② `Reflect.get(env, \'KEY\')` / `Reflect.has` 是读站点（字面量名 / 常量名 / 别名都算）', () => {
+  const { dir, index } = s2Fixture();
+  try {
+    const want = [
+      ['ERIX_S2_REFLECT_LIT', S2_L.reflectLit, 'get'],
+      ['ERIX_S2_REFLECT_NAME', S2_L.reflectName, 'get'],   // 那一行里没有 env 名字面量，名字从常量表来
+      ['ERIX_S2_REFLECT_HAS', S2_L.reflectHas, 'has'],
+      ['ERIX_S2_REFLECT_ALIAS', S2_L.reflectAlias, 'get'], // 第一个实参是拷贝别名
+    ];
+    for (const [key, line, op] of want) {
+      assert.deepEqual(s2Coords(index, key), [`lib/reflect.js:${line}(reflect:${op})`],
+        `${key} 必须认成 Reflect 读站点（实际 ${JSON.stringify(s2Coords(index, key))}）`);
+      assert.deepEqual(siteIndexProblems([s2At(key, 'lib/reflect.js', line)], index, dir), [],
+        `${key} 的真站点被影子尺判红 ⇒ 索引没吃到 Reflect 形`);
+    }
+    // 两个负例：普通对象上的 Reflect.get、以及 `Reflect.set` 写形
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_REFLECT_NEG'), [],
+      '`Reflect.get(other, …)` 被算成了 env 读取 ⇒ 闸门枚举会被无关对象污染');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_REFLECT_WRITE'), [],
+      '`Reflect.set` 是**写**形 ⇒ 不许当读站点（与 `env.X = v` 同一条旧口径）');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-③ 解构 env：简写 / 重命名 / 多行 / 表驱动计算名都要成读站点（普通解构不算）', () => {
+  const { dir, index } = s2Fixture();
+  try {
+    const want = [
+      ['ERIX_S2_DES_SHORT', S2_L.desShort],
+      ['ERIX_S2_DES_RENAMED', S2_L.desRenamed],
+      ['ERIX_S2_DES_LINE_A', S2_L.desLineA],
+      ['ERIX_S2_DES_LINE_B', S2_L.desLineB],
+      ['ERIX_S2_DES_QUOTED', S2_L.desQuoted],
+      ['ERIX_S2_DES_DEFAULT', S2_L.desDefault],
+    ];
+    for (const [key, line] of want) {
+      assert.deepEqual(s2Coords(index, key), [`lib/destructure.js:${line}(destructure)`],
+        `${key} 必须认成解构读站点，且**行号是它自己那一行**（实际 ${JSON.stringify(s2Coords(index, key))}）`);
+    }
+    // 表驱动那种计算名：那一行里没有 env 名字面量，名字从 `T` 那张表来
+    const tableSites = s2Coords(index, 'ERIX_S2_DES_TABLE');
+    assert.deepEqual(tableSites, ['lib/destructure.js:8(destructure:[T])'],
+      `表驱动的计算解构名没解析出来（实际 ${JSON.stringify(tableSites)}）`);
+    const tableCoord = s2At('ERIX_S2_DES_TABLE', 'lib/destructure.js', S2_L.desTable);
+    assert.deepEqual(siteIndexProblems([tableCoord], index, dir), [], '表驱动解构被影子尺判红 ⇒ 索引没吃到');
+    // 负例：普通解构的成员不是 env 对象，之后 `cfg.KEY` 也不许算读取
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_DES_NOT_ENV'), [],
+      '`const { cfg } = opts` 的成员被当成了 env 对象 ⇒ 解构那一形会把无关读形灌进枚举');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-④ fail-closed：在 env 上取名字却解析不出静态 key ⇒ 必须进 unsupported（带 at + shape）', () => {
+  const { dir, index } = s2Fixture();
+  try {
+    const at = index.unsupported.filter((u) => u.at.startsWith('lib/failclosed.js'))
+      .map((u) => u.at).sort();
+    const wantAt = [S2_L.fcReflectDyn, S2_L.fcReflectNoArg, S2_L.fcComputed, S2_L.fcRest,
+      S2_L.fcCopy, S2_L.fcKeys, S2_L.fcForIn].map((n) => `lib/failclosed.js:${n}`).sort();
+    assert.deepEqual(at, wantAt,
+      `fail-closed 的读数不对（实际 ${JSON.stringify(at)}，应为 ${JSON.stringify(wantAt)}）`);
+    const atKey = `lib/failclosed.js:`;
+    const shapeAt = (n) => String(
+      index.unsupported.find((u) => u.at === `${atKey}${n}`)?.shape ?? '');
+    assert.match(shapeAt(S2_L.fcReflectDyn), /Reflect\.get\(\s*process\.env\s*,\s*name\s*\)/);
+    assert.match(shapeAt(S2_L.fcComputed), /\{\s*\[name\]:v\s*\}\s*=\s*process\.env|\[name\]/);
+    assert.match(shapeAt(S2_L.fcRest), /\.\.\./, 'rest 那一形没有静态 key ⇒ 也要登记，不许静默');
+    assert.match(shapeAt(S2_L.fcCopy), /Object\.assign\(\s*cfg\s*,\s*process\.env\s*\)/);
+    assert.match(shapeAt(S2_L.fcKeys), /Object\.keys\(\s*process\.env\s*\)/);
+    assert.match(shapeAt(S2_L.fcForIn), /for \(const k in process\.env\)/);
+    // 动态那一形**只**进 unsupported，不许同时被当成读站点（否则「登记了」这件事会被读站点掩盖）
+    assert.equal(index.keys.has('name'), false, '动态名的占位符被当成 env 名进了枚举');
+    // 静态那半个成员仍要是读站点（rest 不许把同一条解构里的静态名也拖下水）
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_KEPT'), ['lib/failclosed.js:5(destructure)'],
+      `同一条解构里的静态名丢了（实际 ${JSON.stringify(s2Coords(index, 'ERIX_S2_KEPT'))}）`);
+    // 兜底条目过**同一把登记尺**（族 B②）：理由必须引到那条动态读的名字来源（这里 = 数据表声明行）
+    const why = `名字由调用方拼，值域见 lib/failclosed.js:${S2_L.fcTable}`;
+    const reg = index.unsupported.filter((u) => u.at.startsWith('lib/failclosed.js'))
+      .map((u) => ({ at: u.at, read: u.shape, reason: why }));
+    const regProblems = validateUnsupported(reg, dir, index.unsupported);
+    assert.deepEqual(regProblems, [],
+      `扫出来的兜底条目写不成合法登记（尺子不认自己的产出）：\n${regProblems.join('\n')}`);
+    // 不登记 ⇒ 咬合尺必须红（fail closed 的另一半）
+    assert.ok(unsupportedProblems(index.unsupported, []).length >= wantAt.length,
+      '扫出来却没登记 ⇒ 咬合尺必须逐条报');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑤ fail-closed 的负例：普通对象那一形 / 已绑别名的拷贝 一条都不许进 unsupported', () => {
+  const { dir, index } = s2Fixture();
+  try {
+    const negLines = [S2_L.fcNeg, S2_L.fcNegForIn, S2_L.fcNegComputed, S2_L.fcBound, S2_L.fcSpread];
+    const hit = index.unsupported.filter((u) => u.at.startsWith('lib/failclosed.js')
+      && negLines.includes(splitCoord(u.at).line));
+    assert.deepEqual(hit, [],
+      `普通对象的 Reflect.get / for-in / 解构，或**已绑成别名**的拷贝被报成了动态读（实际 `
+      + `${JSON.stringify(hit.map((u) => u.at))}）⇒ unsupported 会被噪音撑满，登记就变成橡皮章`);
+    // 已绑别名那条仍然要能读到值（不是「不报」就等于「没看见」）
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_BOUND'), ['lib/failclosed.js:10(dot)'],
+      '已绑别名的拷贝没被跟踪 ⇒ 为了降噪把真读取也丢了');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_SPREAD_BOUND'), ['lib/failclosed.js:12(dot)'],
+      '展开形绑成别名后没被跟踪');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_OPT_ALIAS'), ['lib/failclosed.js:17(dot)'],
+      '`Object.assign({}, process?.env)` 的可选链拷贝形没被跟踪');
+    // 同一形但**没**绑别名 ⇒ 必须报（③ 与⑤ 的唯一区分就是「有没有人接着读」）
+    assert.ok(index.unsupported.some((u) => u.at === `lib/failclosed.js:${S2_L.fcCopy}`));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑥ 影子尺口径：新形状的站点判绿，形似站点（注释 / 日志模板 / 数据值）照旧判红', () => {
+  const dir = fixtureRoot({
+    'lib/shadow.js': [
+      "// const { ERIX_S2_SH } = process.env;                 // 1 注释里的旧代码（#557 的翻车形状）",
+      'export const note = \'ERIX_S2_SH 已接好\';',   // 2 散文串
+      "export const real = Reflect.get(process.env, 'ERIX_S2_SH');",   // 3 真读站点
+      'const { ERIX_S2_DC } = process.env;',                       // 4 真解构站点
+      'export const log = `ERIX_S2_DC=${ERIX_S2_DC}`;',            // 5 日志模板（不是站点）
+    ].join('\n'),
+  });
+  try {
+    const index = buildEnvSiteIndex(dir);
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_SH'), ['lib/shadow.js:3(reflect:get)'],
+      '注释行 / 散文串被算成了新形状站点 ⇒ 索引不再是扫描器给的事实');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_DC'), ['lib/shadow.js:4(destructure)'],
+      `解构站点行号漂了（实际 ${JSON.stringify(s2Coords(index, 'ERIX_S2_DC'))}）`);
+    for (const [key, line] of [['ERIX_S2_SH', 1], ['ERIX_S2_SH', 2], ['ERIX_S2_DC', 5]]) {
+      const why = siteIndexProblems([s2At(key, 'lib/shadow.js', line)], index, dir).join('\n');
+      assert.match(why, new RegExp(`不是 ${key} 的读站点`), `lib/shadow.js:${line} 不是站点却被放行`);
+    }
+    assert.deepEqual(siteIndexProblems([s2At('ERIX_S2_SH', 'lib/shadow.js', 3)], index, dir), []);
+    assert.deepEqual(siteIndexProblems([s2At('ERIX_S2_DC', 'lib/shadow.js', 4)], index, dir), []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑦ 真树不许静默：扫描面里每一处三形（含拷贝形）都必须留下站点、unsupported，或绑成别名', () => {
+  // 粗文本尺（故意与扫描器**不同实现**，只用来问「这一形出现过吗」）：允许多报，多报了只是要求
+  // 扫描器给出交代，不会少报 ⇒ 「静默漏过」一定会被抓住。
+  const index = REPO_SITE_INDEX;
+  const scanned = scanEnvReads(REPO_ROOT);
+  const linesWithRecord = new Map();     // rel → Set(line)
+  const addLine = (rel, ln) => {
+    if (!linesWithRecord.has(rel)) linesWithRecord.set(rel, new Set());
+    linesWithRecord.get(rel).add(ln);
+  };
+  for (const [, perFile] of scanned.keys) {
+    for (const [rel, list] of perFile) for (const s of list) addLine(rel, s.line);
+  }
+  for (const u of scanned.unsupported) {
+    const { rel, line } = splitCoord(u.at);
+    if (line != null) addLine(rel, line);
+  }
+  const silent = [];
+  const hits = [];
+  for (const file of scanTargets(REPO_ROOT)) {
+    const rel = path.relative(REPO_ROOT, file).split(path.sep).join('/');
+    const text = fs.readFileSync(file, 'utf8');
+    const code = stripComments(text);
+    const ctx = analyzeEnvReads(code, text);
+    const alts = ['process\\s*\\??\\.\\s*env', ...[...ctx.envObjs].map(escRe)];
+    const OBJ = `(?:${alts.join('|')})`;
+    const shapeRe = new RegExp(
+      `(?<![\\w$.])Reflect\\s*\\.\\s*(?:get|has)\\s*\\(\\s*${OBJ}`
+      + `|\\b(?:const|let|var)\\s*\\{[\\s\\S]{0,400}?\\}\\s*=\\s*${OBJ}`
+      + `|(?<![\\w$.])Object\\s*\\.\\s*assign\\s*\\([\\s\\S]{0,200}?${OBJ}`
+      + `|\\.\\.\\.\\s*${OBJ}`
+      + `|\\bObject\\s*\\.\\s*(?:keys|values|entries)\\s*\\(\\s*${OBJ}`
+      + `|\\bfor\\s*\\(\\s*(?:const\\s+|let\\s+|var\\s+)?[A-Za-z_$][\\w$]*\\s+in\\s+${OBJ}`, 'g');
+    for (const m of code.matchAll(shapeRe)) {
+      const startLine = lineAt(code, m.index);
+      const endLine = lineAt(code, m.index + m[0].length);
+      hits.push(`${rel}:${startLine}`);
+      let covered = false;
+      for (let ln = startLine; ln <= endLine + 2 && !covered; ln += 1) {
+        if (linesWithRecord.get(rel)?.has(ln)) covered = true;
+      }
+      // 拷贝形绑成了 env 别名 ⇒ 它的读取在**点号/下标**那一头逐条记账，这一行本身不算读站点
+      const before = code.slice(Math.max(0, m.index - 60), m.index + 1);
+      for (const id of ctx.envObjs) {
+        if (new RegExp(`\\b${escRe(id)}\\s*=[^=]`).test(`${before} `)) covered = true;
+      }
+      if (!covered) silent.push(`${rel}:${startLine} ${m[0].replace(/\s+/g, ' ').slice(0, 70)}`);
+    }
+  }
+  const fam = { reflect: 0, destructure: 0, copy: 0 };
+  for (const [, perFile] of scanned.keys) {
+    for (const [, list] of perFile) {
+      for (const s of list) {
+        if (s.shape.startsWith('reflect:')) fam.reflect += 1;
+        else if (s.shape.startsWith('destructure')) fam.destructure += 1;
+      }
+    }
+  }
+  const copyShape = /Object\.assign|Object\.(?:keys|values|entries)|for \(|\.\.\./;
+  fam.copy = scanned.unsupported.filter((u) => copyShape.test(u.shape)).length;
+  console.log(`# S2 真树现读：keys=${scanned.keys.size} 读站点=${index.siteCount()} `
+    + `unsupported=${scanned.unsupported.length}；新形状归因：reflect=${fam.reflect} `
+    + `destructure=${fam.destructure} 兜底条目=${fam.copy}；粗尺命中 ${hits.length} 处（`
+    + `${JSON.stringify(hits.slice(0, 12))}）`);
+  assert.deepEqual(silent, [],
+    `扫描面里有「这一形出现过、但扫描器一个字没说」的静默位：\n${silent.join('\n')}`);
+  // 真树的**具体**收益（行号现取，不手抄）：env 拷贝别名之后的 `delete childEnv.ERIX_STATION_TOKEN`
+  const delLine = lineOf('runner/agentd.js', 'delete childEnv.ERIX_STATION_TOKEN');
+  assert.ok(index.hasReadSite('ERIX_STATION_TOKEN', 'runner/agentd.js', delLine),
+    `runner/agentd.js:${delLine} 在 env 拷贝（{ ...baseEnv }）上取这个名字，索引里却没有站点`);
+  // `delete <env拷贝>.KEY` 与 `delete process.env.KEY` 必须是同一条口径（旧尺本来就把 delete 形算读）
+  const delDir = fixtureRoot({ 'a.js': 'delete process.env.ERIX_S2_DEL_DIRECT;\n' });
+  try {
+    assert.deepEqual(s2Coords(buildEnvSiteIndex(delDir), 'ERIX_S2_DEL_DIRECT'), ['a.js:1(dot)'],
+      '`delete process.env.KEY` 的旧口径变了 ⇒ 本步只该加别名识别，不该改读写判定');
+  } finally { fs.rmSync(delDir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑧ 同一行两处动态读 ⇒ 逐条核销：一条登记只盖一处，另一处静默消失必须红', () => {
+  // 夹具：同一行两处 `Reflect.get(process.env, <动态名>)` ⇒ 扫描器推入**两条** unsupported，
+  // 坐标相同（同 `路径:行`）但 shape/expr 不同。旧口径按坐标核销 ⇒ 一条登记把整行核销掉，
+  // 第二处动态读再没人要求解释（静默漏账）。
+  const dir = fixtureRoot({
+    'lib/same-line.js': [
+      'export const a = Reflect.get(process.env, nameA) + Reflect.get(process.env, nameB);',
+      'const nameA = pick(); const nameB = pick();',
+    ].join('\n'),
+  });
+  try {
+    const scan = scanEnvReads(dir);
+    const detected = scan.unsupported.filter((u) => u.at.startsWith('lib/same-line.js'));
+    // 前置：扫描器确实**按出现**推了两条，坐标同一个 ⇒ 这是「同一行两条账」的靶子。
+    assert.equal(detected.length, 2, `同一行两处动态读应检出 2 条（实际 ${JSON.stringify(detected)}）`);
+    assert.equal(new Set(detected.map((d) => d.at)).size, 1,
+      '两条动态读应在**同一个坐标**（同一行）上，否则本夹具没测到同一行漏账');
+    const at = detected[0].at;
+    const reg = (d) => ({ at: d.at, read: d.shape, reason: '名字由调用方拼，值域见 lib/same-line.js:2' });
+    // 只登记**一条** ⇒ 另一处动态读没被核销 ⇒ 咬合尺必须点名它（红）。
+    const oneProblems = unsupportedProblems(detected, [reg(detected[0])]);
+    assert.ok(oneProblems.length >= 1,
+      `只登记一条时另一处动态读必须报「没登记」（实际 ${JSON.stringify(oneProblems)}）`);
+    assert.match(oneProblems.join('\n'), new RegExp(`扫描器在 ${at.replace(/[.]/g, '\\.')}`),
+      '报错文案必须点名那一行的漏账坐标');
+    // 两条都登记 ⇒ 全部核销 ⇒ 绿。
+    assert.deepEqual(unsupportedProblems(detected, detected.map(reg)), [],
+      '两处都登记了却还报未核销 ⇒ 核销逻辑过头了');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑨ 解构**赋值**形与声明形同口径：静态键名⇒读站点、计算属性⇒unsupported', () => {
+  const dir = fixtureRoot({
+    'lib/assign-des.js': [
+      'let a = null; let v = null; const k = pick();',        // 1 目标变量与计算名来源
+      '({ ERIX_S2_DES_ASSIGN } = process.env);',              // 2 静态键名 ⇒ 读站点
+      '({ [k]: v } = process.env);',                          // 3 计算属性 ⇒ unsupported
+      '({ cfg } = opts);',                                    // 4 负例：非 env 源 ⇒ 整条形都不许进
+    ].join('\n'),
+  });
+  try {
+    const index = buildEnvSiteIndex(dir);
+    // 静态键名：与声明形同口径，认成 destructure 读站点、行号是成员自己那一行。
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_DES_ASSIGN'), ['lib/assign-des.js:2(destructure)'],
+      `解构赋值形的静态键名没成读站点（实际 ${JSON.stringify(s2Coords(index, 'ERIX_S2_DES_ASSIGN'))}）`
+      + ' ⇒ 旧扫描器只认声明形，这一形会静默漏过');
+    assert.deepEqual(
+      siteIndexProblems([s2At('ERIX_S2_DES_ASSIGN', 'lib/assign-des.js', 2)], index, dir), [],
+      '解构赋值形的站点被影子尺判红 ⇒ 索引没吃到赋值形');
+    // 计算属性：解析不出静态名 ⇒ fail-closed 进 unsupported。
+    const comp = index.unsupported.filter((u) => u.at === 'lib/assign-des.js:3');
+    assert.equal(comp.length, 1,
+      `计算属性解构赋值应进 unsupported（实际 ${JSON.stringify(comp)}）`);
+    assert.match(comp[0].shape, /\[\s*k\s*\]/, 'unsupported 应带上那个计算属性名');
+    // 负例：RHS 不是 env 源 ⇒ 既不站点也不 unsupported。
+    assert.equal(index.unsupported.filter((u) => u.at === 'lib/assign-des.js:4').length, 0,
+      '非 env 源的解构赋值不该进 unsupported');
+    assert.equal(index.sitesOf('cfg').length, 0, '非 env 源的解构成员被当成 env 读站点');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑩ 拷贝别名重赋值后失效：之后 e.KEY 不再算读站点；重赋值成拿不准 ⇒ fail-loud 进 unsupported', () => {
+  const dir = fixtureRoot({
+    'lib/reassign.js': [
+      'let e = Object.assign({}, process.env);',        // 1 拷贝别名（env 源）
+      'export const before = e.ERIX_S2_BEFORE;',        // 2 重赋值前 ⇒ 仍是读站点
+      'e = other;',                                     // 3 重赋值成明确非 env
+      'export const after = e.ERIX_S2_AFTER;',          // 4 重赋值后 ⇒ 不再算读站点
+      'let b = Object.assign({}, process.env);',        // 5 又一个拷贝别名
+      'b = resolveEnv();',                              // 6 重赋值成静态拿不准 ⇒ fail-loud
+      'export const ambig = b.ERIX_S2_AMBIG;',          // 7 不许静默 ⇒ 进 unsupported
+    ].join('\n'),
+  });
+  try {
+    const index = buildEnvSiteIndex(dir);
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_BEFORE'), ['lib/reassign.js:2(dot)'],
+      '重赋值前的读站点丢了 ⇒ 作用域判定过头');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_AFTER'), [],
+      `重赋值成非 env 之后 \`e.KEY\` 仍被算成读站点 ⇒ 假读站点（实际 ${
+        JSON.stringify(s2Coords(index, 'ERIX_S2_AFTER'))}）`);
+    // fail-loud：拿不准的重赋值 ⇒ 既不是站点、也必须进 unsupported（不许静默）。
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_AMBIG'), [],
+      '拿不准的别名绑定被静默当成了读站点');
+    assert.ok(index.unsupported.some((u) => u.at === 'lib/reassign.js:7'
+      && /ERIX_S2_AMBIG/.test(u.shape)),
+      '拿不准的别名绑定没进 unsupported ⇒ 静默漏过');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑪ 拷贝别名被参数 / 块声明遮蔽 ⇒ 遮蔽区间内 e.KEY 不算读站点（出了区间仍算）', () => {
+  const dir = fixtureRoot({
+    'lib/shadow-alias.js': [
+      'const e = Object.assign({}, process.env);',                    // 1 拷贝别名
+      'export const outer = e.ERIX_S2_OUTER;',                        // 2 外层 ⇒ 读站点
+      'function f(e) { return e.ERIX_S2_PARAMSH; }',                  // 3 参数同名遮蔽 ⇒ 不算
+      'export function g() { const e = opts; return e.ERIX_S2_BLOCKSH; }',  // 4 块内重声明 ⇒ 不算
+      'export const afterBlock = e.ERIX_S2_AFTEROUT;',                // 5 出了遮蔽 ⇒ 仍读站点
+    ].join('\n'),
+  });
+  try {
+    const index = buildEnvSiteIndex(dir);
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_OUTER'), ['lib/shadow-alias.js:2(dot)'],
+      '外层拷贝别名读站点丢了');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_PARAMSH'), [],
+      '参数同名遮蔽下 `e.KEY` 仍被算读站点 ⇒ 假站点（遮蔽区间未失效）');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_BLOCKSH'), [],
+      '块内 `const e = opts` 遮蔽下 `e.KEY` 仍被算读站点 ⇒ 假站点');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_AFTEROUT'), ['lib/shadow-alias.js:5(dot)'],
+      '出了遮蔽区间应恢复成读站点');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
