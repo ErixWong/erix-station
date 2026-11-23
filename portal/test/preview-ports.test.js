@@ -1257,6 +1257,39 @@ test('#247① 批量 = N 张票：每张各落一行 preview_grants、响应顺�
   }
 });
 
+test('#677 P3② 批量签票用 **DB 值**：runtime_settings 写 30 ⇒ 响应 expires_at ≈ now+30（非 60）',
+  async () => {
+    // 这一格钉的是消费者接线（http.js 签票路径现读 `preview.ticket_ttl_seconds`）。
+    // 默认 `startPortsServer` 把 config.previewTicketTtlSeconds 钉在 60；本格给 pool 包
+    // 一层，让整表读（`SELECT key, value FROM runtime_settings`）返回 DB 行 30 ⇒
+    // 签票响应 `items[].expires_at` 必须按 DB 的 30（不是启动快照 60）算。
+    const store = batchSeed();
+    const { base, aliceCookie, pool, close } = await startPortsServer({ store });
+    const origQuery = pool.query.bind(pool);
+    pool.query = async (sql, params) => {
+      if (/FROM runtime_settings/.test(String(sql))) {
+        return { rows: [{ key: 'preview.ticket_ttl_seconds', value: 30 }], rowCount: 1 };
+      }
+      return origQuery(sql, params);
+    };
+    try {
+      const ids = [batchUuid(1), batchUuid(2)];
+      const res = await postBatch(base, aliceCookie, { allocation_ids: ids });
+      assert.equal(res.status, 201);
+      const body = await res.json();
+      assert.equal(body.items.length, 2, '两行都签成了（响应形状未变：{items:[...]}）');
+      const deltaMs = new Date(body.items[0].expires_at).getTime() - Date.now();
+      // 硬判据：用的是 DB 的 30，不是启动快照的 60（M-1 改回 ctx.config.* ⇒ 这里 ≈60s 红）。
+      assert.ok(deltaMs > 20_000 && deltaMs <= 31_000,
+        `expires_at 应为 now+30s（DB 值），实得 ${Math.round(deltaMs / 1000)}s`);
+      assert.ok(deltaMs < 50_000,
+        `实得 ${Math.round(deltaMs / 1000)}s = 还在用启动快照的 60（没改成现读）`);
+    } finally {
+      pool.query = origQuery;
+      await close();
+    }
+  });
+
 test('#247② 越界（别人的 / 未知的 / 已 released）⇒ 404 not_found 且一张都不签（零残票、零审计、同一句响应）', async () => {
   const store = batchSeed({
     extraRows: [

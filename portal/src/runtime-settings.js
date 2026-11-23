@@ -281,8 +281,9 @@ export function parsePreviewTicketTtlSeconds(raw) {
   if (!Number.isSafeInteger(value)) {
     return { ok: false, reason: 'not_a_ticket_ttl_seconds' };
   }
-  // 形状闸只判「是不是正整数」；区间（含 0 与上界）交给 validate，两层各管一件事。
-  if (value <= 0) {
+  // 形状闸也把区间兑一下（与会话/保留天数两格同形：parse 与 validate 两道都过一遍区间）。
+  // 下界 1 ⇒ `0` 在这一层就被拒（reason 归 `out_of_range`，不是 `not_a_...`：它是合法数字、只是不合法）。上界同。
+  if (value < PREVIEW_TICKET_TTL_MIN_SECONDS || value > PREVIEW_TICKET_TTL_MAX_SECONDS) {
     return { ok: false, reason: 'ticket_ttl_out_of_range' };
   }
   return { ok: true, value };
