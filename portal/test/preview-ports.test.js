@@ -1274,27 +1274,34 @@ test('#677 P3② 批量签票用 **DB 值**：runtime_settings 写 30 ⇒ 响应
     };
     try {
       const ids = [batchUuid(1), batchUuid(2)];
+      // #709b LOW②：响应侧那条「按 30 算」的锚点取在**发请求之前**（`t0`）：窗口里只会含
+      // 服务端那一段（进程内假库 = 毫秒级），测试体自己在断言前磨多久都不会把 60 秒快照推进窗口。
+      const t0 = Date.now();
       const res = await postBatch(base, aliceCookie, { allocation_ids: ids });
       assert.equal(res.status, 201);
       const body = await res.json();
       assert.equal(body.items.length, 2, '两行都签成了（响应形状未变：{items:[...]}）');
-      const deltaMs = new Date(body.items[0].expires_at).getTime() - Date.now();
+      const deltaMs = new Date(body.items[0].expires_at).getTime() - t0;
       // 硬判据：用的是 DB 的 30，不是启动快照的 60（M-1 改回 ctx.config.* ⇒ 这里 ≈60s 红）。
       assert.ok(deltaMs > 20_000 && deltaMs <= 31_000,
-        `expires_at 应为 now+30s（DB 值），实得 ${Math.round(deltaMs / 1000)}s`);
+        `expires_at 应为 t0+30s（DB 值），实得 ${Math.round(deltaMs / 1000)}s`);
       assert.ok(deltaMs < 50_000,
         `实得 ${Math.round(deltaMs / 1000)}s = 还在用启动快照的 60（没改成现读）`);
       // #709 MED②：响应里的 `expires_at` 另有来源（http 循环外算的一个值），只钉响应会被
-      // 「响应 30 / 库里 60」蒙混过去。必须钉落库那两行 grant 自己的 `expires_at` ≈ now+30（不是 60）。
-      // （照单标的落库断言同形：M-2 把签票的 `ticketTtlSeconds` 参数改回启动快照 ⇒ 这里 ≈ 60s 红。）
+      // 「响应 30 / 库里 60」蒙混过去 ⇒ 必须再钉落库那两行 grant 自己的 `expires_at`。
+      // #709b LOW②：钉法改成**与响应对齐**，不再是绝对时间差窗口（二审：测试体若耗时 >29s，
+      //   60 秒快照的 delta 也能落进 (20s, 31s] ⇒ 假绿）。两边本就同源：`http.js` 在循环外取
+      //   一个 `now` 并只现读一次 TTL，库内那一行（`preview.js` 用同一个 `now` + 同一个 TTL）与
+      //   响应那一个（`http.js` 用同一组数）逐字相等 ⇒ 这半边的判据与测试体耗时无关。
+      //   （M-2 变异：把这里改回绝对窗口 + 注入 +30s 偏移 ⇒ 这一格点名红。）
       const tickets = store.grants.filter((g) => g.kind === 'ticket');
       assert.equal(tickets.length, 2, '两行都落到库里（kind=ticket）');
+      const responseExpiresMs = new Date(body.items[0].expires_at).getTime();
       for (const g of tickets) {
-        const grantDeltaMs = new Date(g.expires_at).getTime() - Date.now();
-        assert.ok(grantDeltaMs > 20_000 && grantDeltaMs <= 31_000,
-          `落库 expires_at 应为 now+30s（DB 值），实得 ${Math.round(grantDeltaMs / 1000)}s`);
-        assert.ok(grantDeltaMs < 50_000,
-          `实得 ${Math.round(grantDeltaMs / 1000)}s = 库里那行还在吃启动快照的 60（签发没传现读值）`);
+        const driftMs = Math.abs(new Date(g.expires_at).getTime() - responseExpiresMs);
+        assert.ok(driftMs < 1_000,
+          `落库 expires_at 必须与响应 items[].expires_at 同源，实差 ${driftMs}ms`
+          + '（差 ≈30s = 库里那行还在吃启动快照的 60，响应却被钉成 30 ⇒ 两套真相）');
       }
     } finally {
       pool.query = origQuery;
