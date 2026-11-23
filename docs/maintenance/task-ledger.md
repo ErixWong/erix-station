@@ -9404,3 +9404,25 @@ dev 栈做法：`docker build -t erix-station/fde:local runner/` → `deploy/.en
 
 **并行迁旋钮的已知代价**：#714 与 #715 同时往 registry 加格子 ⇒ 合并冲突 17 块（8+7+2），
 全是「两边各加新块、无语义冲突」，解法 = 两边都保留 + 把「格数」断言从 7/5 改成 8。**registry 是并行批次必然的冲突热点。**
+
+### 8.182 #719 FDE 每日 LLM 额度（USD/天）+ 用量历史（#719，2026-11-23，erix 编码助手）
+
+**口径（定稿不许改）**：额度单位 **USD/天**，落 LiteLLM 虚拟 key 的 `max_budget` + `budget_duration:"1d"`；
+DB 真相位 `fde_llm_bindings.daily_budget_usd`（迁移 0047，`numeric(12,6)`，`NULL`=不限额）。
+**portal 绝不自算 token、不做第二套统计**：今日与历史用量全读 LiteLLM 自己的端点。
+
+**改了哪些文件**（4 个 commit，均 `Refs #719`）：
+- `2f23848` M1：`deploy/litellm/config.yaml`（`litellm_settings` 加 `timezone:"Asia/Shanghai"`+`budget_reset_time:"00:00"`）、`deploy/migrations/0047-fde-daily-budget.sql`、`portal/src/llm-gateway.js`（`userDailyActivity`）、`portal/src/llm.js`（`setFdeDailyBudget`/`getFdeDailyBudget`/`getFdeDailyUsage` + 各重铸点带额度）。
+- `12b333b` M2：`portal/src/http.js`（两条独立 matcher：PUT/GET `/llm/quota`、GET `/llm/usage`，**未改老 `/llm` 正则**）。
+- `99041f2` M3：`portal/frontend/src/components/UserLlmPane.vue` + spec、i18n `en.ts`/`zh-CN.ts`（`admin.llm` 下补键，localeParity 对齐）。
+- 本轮：文档（fde-platform §11.5、portal §4.10、本台账）。migrations.test.js `MIGRATION_HEAD` 46→47 + 全部「倒数第 N 支」位次断言顺延。
+
+**三个坑（都做了处理）**：
+1. **key 轮换丢额度**：`generateFdeKey` 的所有调用点（改白名单重存、key 缺失重铸、onboard 恢复）都从 DB 的 `daily_budget_usd` 重新下发到新 key —— 不变式 3（DB 是真相、key 是牲口）。
+2. **DB/key 分叉**：`setFdeDailyBudget` 严格「先网关、后 DB」，网关失败**不写库**（宁可保持旧值）；非法值在打网关**之前**就拒（`validation_failed`），零网关调用。
+3. **未定价模型不生效**：`pricing_configured=false` 的模型 `spend` 恒记 0，累计不到额度上 ⇒ 管理台额度区显式警告（前端从已选 main/embedding/vision 的 model_id 找未定价模型）。
+
+**为什么用 `max_budget`（USD）而不是 `tpd_limit`**：`tpd_limit` 是 **batch-only**（只在批量查询里回，不能按 key 直接下发成限额）。
+**重置锚点**靠 config 的 `timezone`+`budget_reset_time`；**超发窗口**源于 `proxy_batch_write_at: 60`（spend 批量写，最坏约 60s）。
+
+**未做的真机验收（本单 LiteLLM 容器未起，均未跑）**：① 额度触发 429；② 重置是否真落在本地 00:00；③ `/user/daily/activity/aggregated` 真机响应形状。判绿只看退出码：根 `npm test`、前端 `typecheck`/`test` 均 rc=0。

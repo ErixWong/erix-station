@@ -716,7 +716,14 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 
 - `spend` 由 LiteLLM 按「token 数 × 该模型单价」累计到虚拟 key / user；定价配好后管理台铸出的 key `spend` 才会增长。
 - `max_budget` 超限 → LiteLLM 对数据面请求返回 **429**；erix-agent `classifyHttpError`（`src/providers/errors.js`）把 429 归类为 `code='rate_limited'`、`retryable=true`（`RETRYABLE_CODES` 含 `rate_limited`）→ 宿主需友好提示且避免继续重试烧配额（与 §11.4「额度用尽」一致）。
-- **现状**：portal 铸 key（`generateKey`）**暂未下发 `max_budget`**；LiteLLM 客户端是透传 body，需要时可加。因此当前无法仅靠管理台触发「budget 超限 429」，真机验收需直接在 LiteLLM 侧给 key 设 `max_budget`（见 issue #164 报告）。
+- **已下发（#719，2026-11-23）**：portal 铸 key / 重存 key 时**已按管理台设定的日额度下发 `max_budget` + `budget_duration:"1d"`**（单位 **USD/天**）。管理台用户管理的「每日额度」区即可设/清额度，无需再到 LiteLLM 侧手设：
+  - 额度落库在 `fde_llm_bindings.daily_budget_usd`（迁移 0047），是状态的**真相**（不变式 3：key 是牲口）——key 被吊销/重铸后额度会从这一列重新下发到新 key（`generateFdeKey` 所有调用点：改白名单重存、key 缺失重铸、onboard 恢复），修「key 轮换丢额度」。
+  - 重置锚点靠 `litellm_settings.timezone:"Asia/Shanghai"` + `budget_reset_time:"00:00"`（见 `deploy/litellm/config.yaml`）：默认 UTC 零点 = 本地 08:00，锚到本地 00:00 才与「一天」直觉一致。
+  - **重置任务约 10 分钟一跳**（LiteLLM 后台 budget reset 循环的粒度），本地 00:00 之后额度不一定瞬时归零，最坏有一个跳的滞后。
+  - **`proxy_batch_write_at: 60`** ⇒ spend 落库是批量写（约每 60s 一跳），因此**最坏可超发约 60 秒**（超限判定读到的是至多 60s 前的 spend）。
+  - **未定价模型不生效**：`pricing_configured=false` 的模型 `spend` 恒记 0（§11.5 上文），累计不到额度上 ⇒ 日额度对「只用未定价模型」的 FDE 实际拦不住（管理台已在额度区显式警告）。
+  - **`tpd_limit` 为何不可用**：该端点是 **batch-only**（`/user/daily/activity` 的 `tpd_limit` 只在批量查询里回，不能按 key 直接下发成限额），故本单只用 `max_budget`（USD），不用 tpd_limit。
+- **真机验收未跑（本单 LiteLLM 容器未起）**：「额度触发 429」「重置是否真落在本地 00:00」「`/user/daily/activity/aggregated` 真机响应形状」三项均未在真机验证。
 
 ---
 
