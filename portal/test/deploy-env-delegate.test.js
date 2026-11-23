@@ -480,7 +480,8 @@ function collectParamBindings(code, masked, pairs, scopes, litsOf) {
     for (const [a, b] of splitTop(masked, site.from, site.to)) {
       const { bindings, unparsed } = paramBindingsIn(masked, code, a, b);
       for (const p of bindings) {
-        out.push({ name: p.name, start: p.at, end: Math.max(site.end, p.at + p.name.length), lits: litsOf(p.def) });
+        out.push({ name: p.name, start: p.at, end: Math.max(site.end, p.at + p.name.length),
+          lits: litsOf(p.def), def: p.def });
       }
       // **解析不出的嵌套形状 ⇒ fail loudly**（#587 族 A 三轮①）：把那个片段里出现过的名字全部按
       // 「被遮蔽但解析不出」记账 ⇒ 它在函数体内任何读形都进 `unsupported`（宁可假红）；反过来若静默
@@ -510,6 +511,80 @@ function shadowAt(shadows, name, at) {
     if (new Set(cands.map(key)).size > 1) return { hit: true, lits: null };   // 同层两个不同绑定 ⇒ 不许猜
   }
   return { hit: true, lits: new Set(cands[0].lits) };
+}
+
+/**
+ * **作用域感知的 env 别名存活事件表**（返修 MED①）：对每个 env 别名算出若干 `{ start, end, kind }`
+ * 区间，`kind ∈ env | kill | ambig`：
+ *   · env ⇒ 这段区间里该名字确实是 env 拷贝/转发（`{ ...process.env }` / `= process.env` / 引用另一个
+ *     env 对象）；
+ *   · kill ⇒ 被**重赋值**或被**参数 / 块声明遮蔽**成明确的非 env（`= other` / 无初值的 `function f(e)`）
+ *     ⇒ 此后 `e.KEY` **不再**算读站点；
+ *   · ambig ⇒ 绑成了一个静态拿不准的东西（函数调用 / 成员访问等）⇒ 读它 **fail-loud**，不许静默当读站点。
+ * 复用 `shadows`（参数/块声明的词法区间）与 `scopes`（重赋值所在块尾）；没产事件的读点默认仍算 env。
+ */
+function buildAliasOverrides(code, masked, envObjs, copyAliases, shadows, scopes) {
+  const ENV_OBJ_TEXT = /\bprocess\s*\??\.\s*env\b/;
+  const classify = (text, self) => {
+    if (text == null) return 'kill';                 // 无初值（裸参数 / 裸声明）⇒ 不是我们那份拷贝
+    const t = text.replace(/\s+/g, ' ').trim();
+    if (t === '') return 'kill';
+    if (ENV_OBJ_TEXT.test(t)) return 'env';
+    for (const o of envObjs) {                        // 引用另一个 env 对象 ⇒ env（`{ ...baseEnv }` 等）
+      if (o !== self && new RegExp(`\\b${escRe(o)}\\b`).test(t)) return 'env';
+    }
+    if (/^[A-Za-z_$][\w$]*$/.test(t) && !envObjs.has(t)) return 'kill';   // `= other`
+    if (/^(?:['"\[{(]|\bnew\b|\btrue\b|\bfalse\b|\bnull\b|\bundefined\b|\d)/.test(t)) return 'kill';
+    return 'ambig';                                   // 函数调用 / 成员访问等拿不准
+  };
+  const out = new Map();
+  const add = (nm, start, end, kind) => {
+    if (!(end > start)) return;
+    if (!out.has(nm)) out.set(nm, []);
+    out.get(nm).push({ start, end, kind });
+  };
+  for (const nm of copyAliases) {
+    // (a) 参数 / 块声明遮蔽（复用 `shadows` 的词法区间）：无初值 ⇒ kill；有初值按 env-object 分类
+    for (const s of shadows.get(nm) ?? []) {
+      const rhs = s.opaque ? undefined : (s.def != null ? s.def : (s.init != null ? s.init : null));
+      add(nm, s.start, s.end, s.opaque ? 'ambig' : classify(rhs, nm));
+    }
+    // (b) 声明初值 / 重赋值 / 参数默认值 `nm = rhs`：区间 = 该绑定所在块尾
+    const re = new RegExp(`(?<![\\w$.])${escRe(nm)}\\s*=(?!=)`, 'g');
+    for (const m of code.matchAll(re)) {
+      if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;   // 串正文里的「x = …」不是代码
+      const from = nextNonSpace(masked, m.index + m[0].length);
+      if (from == null) continue;
+      const rhs = code.slice(from, exprEndAt(masked, from));
+      add(nm, m.index, scopes(m.index).end, classify(rhs, nm));
+    }
+  }
+  return out;
+}
+
+/** 读点 `at` 上别名 `name` 还是不是 env：true=是（算读站点）/ false=已失效（drop）/ null=拿不准（fail-loud）。 */
+function aliasEnvAt(overrides, name, at) {
+  const list = overrides?.get(name);
+  if (!list || list.length === 0) return true;         // 没建事件 ⇒ 默认 env（旧行为 / 真树不变）
+  const cov = list.filter((e) => at >= e.start && at < e.end);
+  if (cov.length === 0) return true;                   // 读点不被任何绑定覆盖 ⇒ 默认 env
+  const w = (e) => e.end - e.start;
+  const min = Math.min(...cov.map(w));
+  const cands = cov.filter((e) => w(e) === min);        // 最内层 / 最晚那一段（重赋值遮蔽外层初绑）
+  if (new Set(cands.map((e) => e.kind)).size > 1) return null;   // 同层多个不同结论 ⇒ 拿不准
+  const kind = cands[0].kind;
+  return kind === 'env' ? true : kind === 'ambig' ? null : false;
+}
+
+/** 读形匹配位置上的**对象**还是不是 env（区分 `process.env` 字面量 vs 需作用域判定的别名）。 */
+function aliasEnvState(code, ctx, at) {
+  const head = code.slice(at, at + 40);
+  if (/^process\s*\??\.\s*env\b/.test(head)) return 'env';   // 直接 process.env ⇒ 恒读
+  const m = /^[A-Za-z_$][\w$]*/.exec(head);
+  const nm = m && m[0];
+  if (!nm || !ctx.envObjs.has(nm)) return 'env';             // 认不出的对象 ⇒ 保守当 env（旧行为）
+  const s = aliasEnvAt(ctx.aliasOverrides, nm, at);
+  return s === true ? 'env' : s === null ? 'ambig' : 'dead';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -823,7 +898,8 @@ function analyzeEnvReads(code, rawText = null) {
   // env 的**拷贝别名**（#587 第 2 步①，审计 #5）：`const e = Object.assign({}, process.env)` 与
   // `const e = { ...process.env }` 也得进 `envObjs` —— 不认，之后 `e.ERIX_X` 既不进 keys 也不进
   // unsupported = 静默漏过（审计当时的读数就是两个空集合）。
-  for (const id of envCopyAliases(code, masked, envObjs)) envObjs.add(id);
+  const copyAliases = new Set(envCopyAliases(code, masked, envObjs));
+  for (const id of copyAliases) envObjs.add(id);
 
   // ① 字符串常量：`const FOO_ENV = 'ERIX_X'`
   for (const m of code.matchAll(new RegExp(`\\b(?:const|let|var)?\\s*(${IDENT_RE})\\s*=\\s*['"]([^'"]+)['"]`, 'g'))) {
@@ -884,14 +960,20 @@ function analyzeEnvReads(code, rawText = null) {
     if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;   // 串正文里的「const …」不算声明
     const scope = scopes(m.index);
     if (scope.whole) continue;
-    shadowList.push({ name: m[1], start: m.index, end: scope.end, lits: litsOf(m[2]) });
+    shadowList.push({ name: m[1], start: m.index, end: scope.end, lits: litsOf(m[2]), init: m[2] });
   }
   const shadows = new Map();
   for (const s of shadowList) {
     if (!shadows.has(s.name)) shadows.set(s.name, []);
     shadows.get(s.name).push(s);
   }
-  return { envObjs, names, shadows };
+  // ⑥ **作用域感知的 env 别名存活**（返修 MED①）：一个拷贝/参数别名只有在「最后一次把它绑成
+  //   env 源、且此后没被改成非 env」的区间里才算 env 对象。事件分三态：env（绑成 env 源）/
+  //   kill（重赋值或参数·块声明遮蔽成明确非 env ⇒ 此后 `e.KEY` **不再**算读站点）/ ambig（绑成
+  //   拿不准的东西 ⇒ 读它 **fail-loud** 进 unsupported，不许静默当读站点）。没被任何事件覆盖的
+  //   读点默认仍算 env（与改动前一致 ⇒ 真树不变）。复用 `shadows` 的词法区间与 `scopes`。
+  const aliasOverrides = buildAliasOverrides(code, masked, envObjs, copyAliases, shadows, scopes);
+  return { envObjs, names, shadows, aliasOverrides };
 }
 
 /**
@@ -978,6 +1060,15 @@ function scanEnvReadsFromFiles(files, root) {
       // 模板插值 `${…}` 里的代码不算串正文（`structuralMask` 特意留着），所以
       // `` msg: `${name}=${process.env[name]}` `` 这种活在模板里的读取不会被误杀。
       if (masked[m.index] === ' ' && code[m.index] !== ' ') continue;
+      // 作用域感知（返修 MED①）：读形匹配上的**对象**若是个已被重赋值 / 被参数·块声明遮蔽成
+      // 非 env 的别名 ⇒ `e.KEY` 不再算读站点（drop）；若那个别名当前绑的是静态拿不准的东西 ⇒
+      // **fail-loud** 进 unsupported（不许静默当读站点）。`process.env` 字面量恒读，不受影响。
+      const objState = aliasEnvState(code, ctx, m.index);
+      if (objState === 'dead') continue;
+      if (objState === 'ambig') {
+        unsupported.push({ at: `${rel}:${line}`, shape: m[0].trim(), expr: '(别名绑定不确定)' });
+        continue;
+      }
       if (m[1] !== undefined) { add(m[1], rel, line, 'dot'); continue; }
       const expr = m[2] ?? '';
       // 表达式在**本篇代码**里的偏移：从 `[` 之后第一个非空白起算。遮蔽表按偏移开区间记账，
@@ -4275,6 +4366,57 @@ test('#587-S2-⑨ 解构**赋值**形与声明形同口径：静态键名⇒读�
     assert.equal(index.unsupported.filter((u) => u.at === 'lib/assign-des.js:4').length, 0,
       '非 env 源的解构赋值不该进 unsupported');
     assert.equal(index.sitesOf('cfg').length, 0, '非 env 源的解构成员被当成 env 读站点');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑩ 拷贝别名重赋值后失效：之后 e.KEY 不再算读站点；重赋值成拿不准 ⇒ fail-loud 进 unsupported', () => {
+  const dir = fixtureRoot({
+    'lib/reassign.js': [
+      'let e = Object.assign({}, process.env);',        // 1 拷贝别名（env 源）
+      'export const before = e.ERIX_S2_BEFORE;',        // 2 重赋值前 ⇒ 仍是读站点
+      'e = other;',                                     // 3 重赋值成明确非 env
+      'export const after = e.ERIX_S2_AFTER;',          // 4 重赋值后 ⇒ 不再算读站点
+      'let b = Object.assign({}, process.env);',        // 5 又一个拷贝别名
+      'b = resolveEnv();',                              // 6 重赋值成静态拿不准 ⇒ fail-loud
+      'export const ambig = b.ERIX_S2_AMBIG;',          // 7 不许静默 ⇒ 进 unsupported
+    ].join('\n'),
+  });
+  try {
+    const index = buildEnvSiteIndex(dir);
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_BEFORE'), ['lib/reassign.js:2(dot)'],
+      '重赋值前的读站点丢了 ⇒ 作用域判定过头');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_AFTER'), [],
+      `重赋值成非 env 之后 \`e.KEY\` 仍被算成读站点 ⇒ 假读站点（实际 ${
+        JSON.stringify(s2Coords(index, 'ERIX_S2_AFTER'))}）`);
+    // fail-loud：拿不准的重赋值 ⇒ 既不是站点、也必须进 unsupported（不许静默）。
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_AMBIG'), [],
+      '拿不准的别名绑定被静默当成了读站点');
+    assert.ok(index.unsupported.some((u) => u.at === 'lib/reassign.js:7'
+      && /ERIX_S2_AMBIG/.test(u.shape)),
+      '拿不准的别名绑定没进 unsupported ⇒ 静默漏过');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑪ 拷贝别名被参数 / 块声明遮蔽 ⇒ 遮蔽区间内 e.KEY 不算读站点（出了区间仍算）', () => {
+  const dir = fixtureRoot({
+    'lib/shadow-alias.js': [
+      'const e = Object.assign({}, process.env);',                    // 1 拷贝别名
+      'export const outer = e.ERIX_S2_OUTER;',                        // 2 外层 ⇒ 读站点
+      'function f(e) { return e.ERIX_S2_PARAMSH; }',                  // 3 参数同名遮蔽 ⇒ 不算
+      'export function g() { const e = opts; return e.ERIX_S2_BLOCKSH; }',  // 4 块内重声明 ⇒ 不算
+      'export const afterBlock = e.ERIX_S2_AFTEROUT;',                // 5 出了遮蔽 ⇒ 仍读站点
+    ].join('\n'),
+  });
+  try {
+    const index = buildEnvSiteIndex(dir);
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_OUTER'), ['lib/shadow-alias.js:2(dot)'],
+      '外层拷贝别名读站点丢了');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_PARAMSH'), [],
+      '参数同名遮蔽下 `e.KEY` 仍被算读站点 ⇒ 假站点（遮蔽区间未失效）');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_BLOCKSH'), [],
+      '块内 `const e = opts` 遮蔽下 `e.KEY` 仍被算读站点 ⇒ 假站点');
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_AFTEROUT'), ['lib/shadow-alias.js:5(dot)'],
+      '出了遮蔽区间应恢复成读站点');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
