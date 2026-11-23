@@ -3838,7 +3838,8 @@ function readbackDefaultParamSite(root, rel, line, key) {
     if (!pm) continue;
     // 函数体是否把同一参数读回：裸标识符 + 代码位（模板插值 `${key}` 保留为代码 ⇒ 也算）。
     // H2 反例：函数体用 `env[key]` 动态下标读同一参数 ⇒ 真读站点，这条默认参数不许判 readback。
-    // M-b 变异点：去掉 dynSub 的 `continue`（退回「默认参数位 + 参数再现就算 readback」）
+    // M-b 变异点（已实证）：禁用下面的 `isDynamicIndexUse` 分支（退回「默认参数位 + 参数再现就
+    // 算 readback」；只去掉 `if (dynSub) continue` 不红，因为下标位使用不会进 useAt）
     // ⇒ S3-③ 的 dynamicEnv 反例那格红。
     let dynSub = false;
     let useAt = -1;
