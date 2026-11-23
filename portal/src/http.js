@@ -1077,9 +1077,12 @@ async function routeApi(req, res, ctx, url) {
     const ttlSeconds = await runtimeSettings.readSessionTtlSeconds({
       pool, config, log: ctx.log,
     });
+    const renewIntervalSeconds = await runtimeSettings.readSessionRenewIntervalSeconds({
+      pool, config, log: ctx.log,
+    });
     const renewed = await auth.renewSession(pool, session.session.id, {
       ttlSeconds,
-      renewIntervalMs: config.sessionRenewIntervalSeconds * 1000,
+      renewIntervalMs: renewIntervalSeconds * 1000,
     });
     const headers = {};
     // cookie 的 `Max-Age` 必须跟着**刚才签发会话用的那个数**：`config.cookie.maxAge` 是
@@ -1670,6 +1673,13 @@ async function handleAdminApi(req, res, ctx, url) {
           throw new admin.AdminError('validation_failed', 'azure provider 尚不支持开户', { details: { field: 'git_host_id' } });
         }
 
+        // #677 Tier 2A：登录/口令长度上限是热读旋钮 ⇒ 建用户前各现读一次，喂进 admin.createUser。
+        const createMaxLoginLength = await runtimeSettings.readMaxLoginLength({
+          pool: ctx.pool, config: ctx.config, log: ctx.log,
+        });
+        const createMaxPasswordLength = await runtimeSettings.readMaxPasswordLength({
+          pool: ctx.pool, config: ctx.config, log: ctx.log,
+        });
         created = await admin.createUser(client, {
           actorId: session.user.id,
           login: body?.login,
@@ -1680,8 +1690,8 @@ async function handleAdminApi(req, res, ctx, url) {
           totp_enabled: body?.totp_enabled === true,
           totpIssuer: ctx.config.totp?.issuer,
           limits: {
-            maxLoginLength: ctx.config.maxLoginLength,
-            maxPasswordLength: ctx.config.maxPasswordLength,
+            maxLoginLength: createMaxLoginLength,
+            maxPasswordLength: createMaxPasswordLength,
           },
           // #202：用真实 base 域拼最终预览 hostname 做整体校验（逐标签 ≤63 + 总长 ≤253）。
           baseDomain: ctx.config.baseDomain,
@@ -1753,9 +1763,12 @@ async function handleAdminApi(req, res, ctx, url) {
     if (action === 'reset-password' && req.method === 'POST') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const resetMaxPasswordLength = await runtimeSettings.readMaxPasswordLength({
+        pool: ctx.pool, config: ctx.config, log: ctx.log,
+      });
       const result = await admin.resetUserPassword(ctx.pool, userId, body?.password, {
         actorId: session.user.id,
-        limits: { maxPasswordLength: ctx.config.maxPasswordLength },
+        limits: { maxPasswordLength: resetMaxPasswordLength },
       });
       return sendJson(res, 200, result);
     }
@@ -3747,11 +3760,16 @@ async function handleLoginStep1(req, res, ctx) {
   if (!login || !password) {
     throw new HttpError(400, 'validation_failed', 'login 与 password 均为必填');
   }
-  if (login.length > config.maxLoginLength) {
-    throw new HttpError(400, 'validation_failed', `login 长度超过上限 ${config.maxLoginLength}`);
+  // #677 Tier 2A：两个长度上限是热读旋钮 ⇒ 本请求各现读一次并复用（不进循环、不读两遍）。
+  const maxLoginLength = await runtimeSettings.readMaxLoginLength({ pool, config, log: ctx.log });
+  const maxPasswordLength = await runtimeSettings.readMaxPasswordLength({
+    pool, config, log: ctx.log,
+  });
+  if (login.length > maxLoginLength) {
+    throw new HttpError(400, 'validation_failed', `login 长度超过上限 ${maxLoginLength}`);
   }
-  if (password.length > config.maxPasswordLength) {
-    throw new HttpError(400, 'validation_failed', `password 长度超过上限 ${config.maxPasswordLength}`);
+  if (password.length > maxPasswordLength) {
+    throw new HttpError(400, 'validation_failed', `password 长度超过上限 ${maxPasswordLength}`);
   }
 
   const ip = req.socket.remoteAddress || 'unknown';
@@ -3867,15 +3885,19 @@ async function handleLoginStep1(req, res, ctx) {
     });
   }
 
+  // #677 Tier 2A：待决令牌 TTL 现读一次，同时喂落库 ttlSeconds 与响应 expires_in（同请求同源）。
+  const pendingTtlSeconds = await runtimeSettings.readPendingTokenTtlSeconds({
+    pool, config, log: ctx.log,
+  });
   const pending = await auth.createPendingToken(pool, result.user.id, {
     ip,
     userAgent: req.headers['user-agent'] ?? null,
-    ttlSeconds: config.pendingTokenTtlSeconds,
+    ttlSeconds: pendingTtlSeconds,
   });
   return sendJson(res, 200, {
     status: 'totp_required',
     pending_token: pending.token,
-    expires_in: config.pendingTokenTtlSeconds,
+    expires_in: pendingTtlSeconds,
   });
 }
 
@@ -3946,7 +3968,11 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
   }
 
   // 待决令牌的 TTL 取 max(口令步 TTL, 码 TTL)：否则码还没过期、令牌先过期，`expires_in` 就是一句谎。
-  const pendingTtlSeconds = Math.max(config.pendingTokenTtlSeconds ?? 120, policy.ttlSeconds);
+  // #677 Tier 2A：口令步 TTL 现读一次（默认 120），再与码 TTL 取 max；与 TOTP 分支同一个旋钮。
+  const pendingBaseTtlSeconds = await runtimeSettings.readPendingTokenTtlSeconds({
+    pool, config, log: ctx.log,
+  });
+  const pendingTtlSeconds = Math.max(pendingBaseTtlSeconds, policy.ttlSeconds);
   const pending = await auth.createPendingToken(pool, user.id, {
     ip,
     userAgent: req.headers['user-agent'] ?? null,
@@ -4041,7 +4067,11 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
 async function handleSecondFactorChoice(req, res, ctx, { user, email, ip, mailer }) {
   const { pool, config } = ctx;
   const policy = emailCodePolicy(config);
-  const pendingTtlSeconds = Math.max(config.pendingTokenTtlSeconds ?? 120, policy.ttlSeconds);
+  // #677 Tier 2A：口令步 TTL 现读一次（默认 120）再与码 TTL 取 max；与另两条发码路径同一旋钮。
+  const pendingBaseTtlSeconds = await runtimeSettings.readPendingTokenTtlSeconds({
+    pool, config, log: ctx.log,
+  });
+  const pendingTtlSeconds = Math.max(pendingBaseTtlSeconds, policy.ttlSeconds);
   // pending 是两条路共同的入口：它建不成才是真错误（发信与它无关了）。
   const pending = await auth.createPendingToken(pool, user.id, {
     ip,
@@ -4828,7 +4858,11 @@ async function handleChangeMyPassword(req, res, ctx) {
   const session = await requireSession(req, ctx);
   requireJson(req);
   const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-  const limits = { maxPasswordLength: ctx.config.maxPasswordLength };
+  // #677 Tier 2A：口令长度上限是热读旋钮 ⇒ 本请求现读一次，喂给两处 validatePassword/changeOwnPassword。
+  const ownMaxPasswordLength = await runtimeSettings.readMaxPasswordLength({
+    pool: ctx.pool, config: ctx.config, log: ctx.log,
+  });
+  const limits = { maxPasswordLength: ownMaxPasswordLength };
   const currentPassword = body?.current_password;
   const newPassword = body?.new_password;
   // 形状校验放在限流/验哈希之前：畸形请求不该消耗 scrypt 配额。

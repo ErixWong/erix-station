@@ -616,17 +616,19 @@ test('RS-6b 审计被抑制 ⇒ 抛 500 且**设置没落库**（检查在 COMMI
 
 test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_days'
   + ' + preview.ticket_ttl_seconds + session.auto_title_min_new + preview.session_ttl_seconds'
-  + ' + 三个退避旋钮', async () => {
+  + ' + 三个退避旋钮 + 四个认证旋钮（#677 Tier 2A）', async () => {
   // P1 时这一格钉的是「registry 是空对象」；P2a 迁了第一格 ⇒ 判据改成「只迁了这一格」；
-  // P3 第一/二/三批各迁一格、第五批迁第五格、第六批一次迁三个循环的空闲退避上限
-  // ⇒ 判据改成「就这八格，不多不少」。
+  // P3 各批逐格迁到八格；#677 Tier 2A 一次迁四个「无状态、每请求读」的认证旋钮
+  // ⇒ 判据改成「就这十二格，不多不少」。
   // 它红了的读法不变：有人顺手多迁了一格（或把热读口径弄丢了）。
   assert.deepEqual(Object.keys(RUNTIME_SETTING_REGISTRY),
     ['session.ttl_seconds', 'workspace.retention_days', 'preview.ticket_ttl_seconds',
       'session.auto_title_min_new', 'preview.session_ttl_seconds',
       'loop.onboarding_idle_backoff_ms', 'loop.offboarding_idle_backoff_ms',
-      'loop.provisioner_idle_backoff_ms'],
-    'P3 只许迁这八格（其余旋钮逐批填）');
+      'loop.provisioner_idle_backoff_ms',
+      'auth.pending_token_ttl_seconds', 'auth.session_renew_interval_seconds',
+      'auth.max_password_length', 'auth.max_login_length'],
+    '只许迁这十二格（其余旋钮逐批填）');
   assert.ok(Object.isFrozen(RUNTIME_SETTING_REGISTRY), 'registry 必须冻结（运行期没人能塞旋钮进来）');
   const entry = RUNTIME_SETTING_REGISTRY['session.ttl_seconds'];
   assert.ok(Object.isFrozen(entry), '条目也必须冻结');
@@ -718,7 +720,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   assert.notEqual(HOT_READ_INVALIDATORS.get(PREVIEW_SESSION_TTL_KEY),
     HOT_READ_INVALIDATORS.get(PREVIEW_TICKET_TTL_KEY),
     '第五格不许共用第三格的失效函数（会话 TTL 与票 TTL 各有各的缓存）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 8, '登记表里就是八格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 12, '登记表里就是十二格（热读旋钮数 = 失效钩子数）');
 
   // P3 第六批的三格：同一个口径再钉一次（各自一个导出的失效函数，且互相不许共用）。
   assert.equal(HOT_READ_INVALIDATORS.get(ONBOARDING_IDLE_BACKOFF_MS_KEY),
@@ -729,7 +731,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
     invalidateProvisionerIdleBackoffCache);
   assert.equal(new Set([...HOT_READ_INVALIDATORS.values()]).size, HOT_READ_INVALIDATORS.size,
     '一格一个失效函数：共用就是「保存开户那格把对账那格的缓存也抹了」（RS-51 钉另一面）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 8, '登记表里就是八格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 12, '登记表里就是十二格（热读旋钮数 = 失效钩子数）');
 
   assert.equal(isKnownSetting('demo.limit'), false, '真实 registry 里没有 demo.limit');
   assert.equal(isKnownSetting('constructor'), false,
@@ -1239,7 +1241,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   const fromDb = await listRuntimeSettingsAdmin({
     pool: dbPool, config: CONFIG_ENV, env: {}, log: silentLog,
   });
-  assert.equal(fromDb.items.length, 8);
+  assert.equal(fromDb.items.length, 12);
   assert.deepEqual(Object.keys(fromDb.items[0]).sort(),
     ['applyMode', 'key', 'label', 'reason', 'source', 'updatedAt', 'updatedBy', 'value'].sort());
   assert.deepEqual(fromDb.items[0], {
@@ -1299,7 +1301,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     pool: ttlPool({ throwOnSelect: Object.assign(new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
     config: CONFIG_ENV, log: deadLog,
   });
-  assert.equal(dead.items.length, 8, '读失败时八格都要给得出来（不是只给前几格）');
+  assert.equal(dead.items.length, 12, '读失败时十二格都要给得出来（不是只给前几格）');
   assert.equal(dead.items[0].source, 'env');
   assert.equal(dead.items[0].reason, 'read_failed');
   assert.equal(deadLog.seen.warn.length, 1, '有人在屏幕前等答案 ⇒ 读失败要 warn（不像启动路径只能 debug）');
@@ -2300,7 +2302,7 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   // GET 两格：登记了的那格原样带出，没登记的那格**不许**出现这个键（缺席 ≠ null ≠ 空串）。
   const cfg = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
   const list = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: cfg, env: {}, log: silentLog });
-  assert.equal(list.items.length, 8);
+  assert.equal(list.items.length, 12);
   const retItem = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
   assert.equal(retItem.hint, WORKSPACE_RETENTION_HINT,
     'DTO 必须逐字透出 registry 那句话（前端自己另写一份 = 第二份真相）');
