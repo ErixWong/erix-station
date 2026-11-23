@@ -345,3 +345,207 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
     expect(err.wrapper.text()).toContain('Error: fde_name 非法');
   });
 });
+
+describe('UserLlmPane · 周期额度（#719）', () => {
+  const QUOTA = {
+    quota: {
+      budget_usd: 5, budget_period: '1mo', max_budget: 5, budget_duration: '1mo',
+      budget_reset_at: '2026-11-24T16:00:00Z', spend: 1.25, remaining: 3.75, spend_scope: 'period',
+    },
+  };
+  const USAGE = {
+    days: [
+      { date: '2026-11-22', spend: 2, prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, api_requests: 3 },
+      { date: '2026-11-23', spend: 1.5, prompt_tokens: 200, completion_tokens: 100, total_tokens: 300, api_requests: 5 },
+    ],
+    totals: { spend: 3.5, total_tokens: 450 },
+  };
+
+  function quotaProviders(mainPricing: boolean | undefined) {
+    return [
+      {
+        id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
+        models: [
+          { id: 'm1', provider_id: 'p1', model_id: 'pk-m1', model_name: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, enabled: true, pricing_configured: mainPricing },
+          { id: 'm2', provider_id: 'p1', model_id: 'pk-m2', model_name: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, enabled: true, pricing_configured: true },
+        ],
+      },
+    ] as unknown as LlmProvider[];
+  }
+
+  async function mountQuota(
+    extra?: (url: string, init?: RequestInit) => Response | undefined,
+    providers: LlmProvider[] = PROVIDERS,
+  ) {
+    const fetchFn = fetchMock((url, init) => extra?.(url, init)
+      ?? (url === '/api/admin/fdes/alice/llm' && !init?.method
+        ? jsonResponse(200, GET_CONFIG)
+        : url === '/api/admin/fdes/alice/llm/budget' && !init?.method
+          ? jsonResponse(200, QUOTA)
+        : url.startsWith('/api/admin/fdes/alice/llm/usage') && !init?.method
+          ? jsonResponse(200, USAGE)
+        : url === '/api/admin/users'
+          ? jsonResponse(200, { items: [FDE_USER] })
+          : jsonResponse(404, { error: { code: 'not_found', message: 'not found' } })));
+    vi.stubGlobal('fetch', fetchFn);
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const wrapper = mount(UserLlmPane, {
+      props: { user: FDE_USER, providers, gitHosts: [] },
+      global: { plugins: [pinia, i18n] },
+    });
+    await flushPromises();
+    return { wrapper, fetchFn };
+  }
+
+  const quotaPuts = (fetchFn: ReturnType<typeof fetchMock>) =>
+    fetchFn.mock.calls.filter(([u, i]) => String(u).includes('/llm/budget') && i?.method === 'PUT');
+
+  it('渲染本周期已用（spend_scope=period）/ 剩余 / 本地重置时刻；周期下拉默认 1mo；近 30 天表与 UTC 桶注释', async () => {
+    const { wrapper } = await mountQuota();
+    expect(wrapper.find('[data-test="daily-budget"]').exists()).toBe(true);
+    // spend_scope=period ⇒ 标签「本周期已用」
+    expect(wrapper.find('[data-test="budget-state"]').text()).toContain('本周期已用');
+    expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('1.25');
+    expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('3.75');
+    // 周期下拉：默认 1mo（GET budget 回显 budget_period=1mo），两个选项每月/每日
+    const periodSel = wrapper.find('[data-test="budget-period"]').element as HTMLSelectElement;
+    expect(periodSel.value).toBe('1mo');
+    expect(wrapper.find('[data-test="budget-period"]').findAll('option').map((o) => o.text()))
+      .toEqual(['每月', '每日']);
+    // 重置时刻：本地时区格式化（不是原始 ISO 串）
+    const expectedReset = new Date('2026-11-24T16:00:00Z').toLocaleString();
+    expect(wrapper.find('[data-test="budget-reset"]').text()).toBe(expectedReset);
+    expect(wrapper.find('[data-test="budget-reset"]').text()).not.toContain('2026-11-24T16:00:00Z');
+    // 近 30 天表：两行 + UTC 日桶说明
+    const rows = wrapper.findAll('[data-test="usage-row"]');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].text()).toContain('2026-11-22');
+    expect(rows[0].text()).toContain('150');
+    expect(wrapper.find('[data-test="daily-budget"]').text()).toContain('按 UTC 日分桶，与额度周期无关');
+    // 额度回显：GET budget 的 budget_usd 进输入框
+    expect((wrapper.find('[data-test="budget-input"]').element as HTMLInputElement).value).toBe('5');
+  });
+
+  it('spend_scope=lifetime（无额度）⇒ 已用标签为「累计已用（未设额度）」，不是「本周期已用」', async () => {
+    const { wrapper } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/budget') && !init?.method) {
+        return jsonResponse(200, { quota: { budget_usd: null, budget_period: null, max_budget: null, budget_duration: null, budget_reset_at: null, spend: 0.084178176, remaining: null, spend_scope: 'lifetime' } });
+      }
+      return undefined;
+    });
+    expect(wrapper.find('[data-test="budget-state"]').text()).toContain('累计已用（未设额度）');
+    expect(wrapper.find('[data-test="budget-state"]').text()).not.toContain('本周期已用');
+    expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('0.084178176');
+  });
+
+  it('保存发出正确 body {budget_usd:number, budget_period}；保存成功后回显', async () => {
+    const { wrapper, fetchFn } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/budget') && init?.method === 'PUT') {
+        return jsonResponse(200, { quota: { budget_usd: 10, budget_period: '1mo', max_budget: 10, budget_duration: '1mo', budget_reset_at: '2026-11-24T16:00:00Z', spend: 0, remaining: 10, spend_scope: 'period' } });
+      }
+      return undefined;
+    });
+    await wrapper.find('[data-test="budget-input"]').setValue('10');
+    await wrapper.find('[data-test="budget-period"]').setValue('1mo');
+    await wrapper.find('[data-test="budget-save"]').trigger('click');
+    await flushPromises();
+    const puts = quotaPuts(fetchFn);
+    expect(puts).toHaveLength(1);
+    expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ budget_usd: 10, budget_period: '1mo' });
+    expect(wrapper.find('[data-test="budget-msg"]').text()).toBe('额度已保存');
+    // 回显：PUT 响应的 quota.budget_usd=10 回填输入框与剩余
+    expect((wrapper.find('[data-test="budget-input"]').element as HTMLInputElement).value).toBe('10');
+    expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('10');
+  });
+
+  it('输入框留空 → 保存发 {budget_usd:null}（清空 = 不限，period 一并清空不发送）', async () => {
+    const { wrapper, fetchFn } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/budget') && init?.method === 'PUT') {
+        return jsonResponse(200, { quota: { budget_usd: null, budget_period: null, max_budget: null, budget_duration: null, budget_reset_at: null, spend: 0, remaining: null, spend_scope: 'lifetime' } });
+      }
+      return undefined;
+    });
+    await wrapper.find('[data-test="budget-input"]').setValue('');
+    await wrapper.find('[data-test="budget-save"]').trigger('click');
+    await flushPromises();
+    const puts = quotaPuts(fetchFn);
+    expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ budget_usd: null });
+    // 清空后 remaining = null ⇒ 显示「不限」
+    expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('不限');
+  });
+
+  it('未定价警告：已选模型 pricing_configured=false 时出现', async () => {
+    const { wrapper } = await mountQuota(undefined, quotaProviders(false));
+    expect(wrapper.find('[data-test="unpriced-warning"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="unpriced-warning"]').text()).toContain('未定价');
+  });
+
+  it('未定价警告：已选模型都定价（undefined/true）时不出现', async () => {
+    const { wrapper } = await mountQuota(undefined, quotaProviders(true));
+    expect(wrapper.find('[data-test="unpriced-warning"]').exists()).toBe(false);
+    // 默认 PROVIDERS（无 pricing_configured 字段 = 未知）也不告警（只报 === false）
+    const dflt = await mountQuota();
+    expect(dflt.wrapper.find('[data-test="unpriced-warning"]').exists()).toBe(false);
+  });
+
+  it('quota GET 500 ⇒ 显式报错（budget-load-error）：不渲染 budget-state/budget-spend、不伪造 0、不出现「不限」；写控件仍可用', async () => {
+    const { wrapper } = await mountQuota((url, init) => {
+      if (url === '/api/admin/fdes/alice/llm/budget' && !init?.method) {
+        return jsonResponse(500, { error: { code: 'server_error', message: 'gateway down' } });
+      }
+      return undefined;
+    });
+    expect(wrapper.find('[data-test="budget-load-error"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="budget-load-error"]').text()).toContain('无法读取额度');
+    expect(wrapper.find('[data-test="budget-state"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="budget-spend"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('不限');
+    // 读失败不影响写：保存按钮与输入框照旧可用
+    expect(wrapper.find('[data-test="budget-input"]').exists()).toBe(true);
+    const saveBtn = wrapper.find('[data-test="budget-save"]').element as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(false);
+  });
+
+  it('usage GET 500 ⇒ 显式报错（usage-load-error）：不显示「暂无用量数据」；额度区不受牵连', async () => {
+    const { wrapper } = await mountQuota((url, init) => {
+      if (url.startsWith('/api/admin/fdes/alice/llm/usage') && !init?.method) {
+        return jsonResponse(500, { error: { code: 'server_error', message: 'gateway down' } });
+      }
+      return undefined;
+    });
+    expect(wrapper.find('[data-test="usage-load-error"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="usage-load-error"]').text()).toContain('无法读取用量');
+    expect(wrapper.text()).not.toContain('暂无用量');
+    expect(wrapper.find('[data-test="usage-table"]').exists()).toBe(false);
+    // 两个读互相独立：用量读失败不影响额度区正常渲染
+    expect(wrapper.find('[data-test="budget-load-error"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('1.25');
+  });
+
+  it('quota GET 404（无 active binding）⇒ 静默降级：既不报错也不渲染额度区', async () => {
+    // 真实无绑定态：config 无 api_key ⇒ 额度区整块隐藏；budget/usage 404 也不报错。
+    const { wrapper } = await mountQuota((url, init) => {
+      if (url === '/api/admin/fdes/alice/llm' && !init?.method) {
+        return jsonResponse(200, { config: { provider_id: 'p1', api_key: null }, active_run: false });
+      }
+      if ((url === '/api/admin/fdes/alice/llm/budget' || url.startsWith('/api/admin/fdes/alice/llm/usage')) && !init?.method) {
+        return jsonResponse(404, { error: { code: 'not_found', message: 'no active binding' } });
+      }
+      return undefined;
+    });
+    expect(wrapper.find('[data-test="daily-budget"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="budget-load-error"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="usage-load-error"]').exists()).toBe(false);
+
+    // 更强守卫：即便额度区可见（有 api_key），budget 404（not_found）也不得置 budgetLoadErr ⇒ 静默降级。
+    const vis = await mountQuota((url, init) => {
+      if (url === '/api/admin/fdes/alice/llm/budget' && !init?.method) {
+        return jsonResponse(404, { error: { code: 'not_found', message: 'no active binding' } });
+      }
+      return undefined;
+    });
+    expect(vis.wrapper.find('[data-test="budget-load-error"]').exists()).toBe(false);
+    expect(vis.wrapper.find('[data-test="budget-state"]').exists()).toBe(true);
+  });
+});
