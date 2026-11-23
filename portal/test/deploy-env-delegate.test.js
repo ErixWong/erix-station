@@ -4347,6 +4347,158 @@ test('#587-S3-⑦ 影子差异集合被钉住：真树差异与期望文件 deep
 });
 
 /**
+ * 反例六种（二审 H1×3 / H2×3 / M1×1）在**钉住**口径下必须红。后果变了：不再是「被误判成
+ * 良性」，而是两条路之一：
+ *   · 被登记成注入站点 ⇒ 注入集合比名单多一条 ⇒ 红在 **S3-⑥**；
+ *   · 没被登记 ⇒ `where` 那条坐标仍是差异且差异集合多一条 ⇒ 红在 **S3-⑦**；
+ *   · 两者都不是 ⇒ 被静默吞掉（最坏的一形），同样红。
+ * `claim` = 例外清单会指的那一行（key 字面量所在行）；表格里的行号是约定，改文本要跟着改。
+ */
+const PIN_COUNTEREX = [
+  {
+    name: 'H1a 普通对象自己 `.Env.push()`',
+    key: 'ERIX_AUDIT_H1A_PUSH',
+    claim: { rel: 'lib/h1a.js', line: 3 },
+    files: {
+      'lib/h1a.js': [
+        'export function build() {',                          // 1
+        '  const b = { Env: [] };',                           // 2 普通对象，不是容器 create body
+        "  b.Env.push('ERIX_AUDIT_H1A_PUSH=1');",             // 3 ← 声称的注入位
+        '  return b;',                                        // 4
+        '}',                                                  // 5
+      ].join('\n') + '\n',
+    },
+  },
+  {
+    name: 'H1b 来源不明的同名参数',
+    key: 'ERIX_AUDIT_H1B_PARAM',
+    claim: { rel: 'lib/h1b.js', line: 3 },
+    files: {
+      'lib/h1b.js': [
+        'export const body = { Env: [`ERIX_AUDIT_H1B_BASE=1`] };',   // 1 文件级同名对象
+        'export function fill(body) {',                             // 2 参数遮蔽了它，身份不同
+        "  body.Env.push('ERIX_AUDIT_H1B_PARAM=1');",                // 3 ← 声称的注入位
+        '  return body;',                                            // 4
+        '}',                                                         // 5
+      ].join('\n') + '\n',
+    },
+  },
+  {
+    name: 'H1c 浅拷贝后在新对象上 push',
+    key: 'ERIX_AUDIT_H1C_COPY',
+    claim: { rel: 'lib/h1c.js', line: 5 },
+    files: {
+      'lib/h1c.js': [
+        'export function build() {',                                 // 1
+        '  const body = { Env: [] };',                              // 2
+        "  body.Env.push('ERIX_AUDIT_H1C_OWN=1');",                 // 3 把 body 自证成容器 body
+        '  const create = { ...body };',                            // 4 新对象（与 body 不同身份）
+        "  create.Env.push('ERIX_AUDIT_H1C_COPY=1');",              // 5 ← 声称的注入位
+        '  return create;',                                         // 6
+        '}',                                                        // 7
+      ].join('\n') + '\n',
+    },
+  },
+  {
+    name: 'H2a `env[key.toUpperCase()]`',
+    key: 'ERIX_AUDIT_H2_UPPER',
+    claim: { rel: 'lib/h2a.js', line: 2 },
+    files: {
+      'lib/h2a.js': [
+        'export function dynUpper(env = process.env,',                  // 1
+        "  key = 'ERIX_AUDIT_H2_UPPER') {",                             // 2 ← 声称坐标
+        '  return env[key.toUpperCase()];',                             // 3 真动态读
+        '}',                                                            // 4
+      ].join('\n') + '\n',
+    },
+  },
+  {
+    name: 'H2b 别名下标 `const k = key; env[k]`',
+    key: 'ERIX_AUDIT_H2_ALIAS',
+    claim: { rel: 'lib/h2b.js', line: 2 },
+    files: {
+      'lib/h2b.js': [
+        'export function dynAlias(env = process.env,',                  // 1
+        "  key = 'ERIX_AUDIT_H2_ALIAS') {",                             // 2 ← 声称坐标
+        '  const k = key;',                                             // 3 别名
+        '  return env[k];',                                             // 4 真动态读
+        '}',                                                            // 5
+      ].join('\n') + '\n',
+    },
+  },
+  {
+    name: 'H2c 模板下标 `env[`${key}`]`',
+    key: 'ERIX_AUDIT_H2_TEMPLATE',
+    claim: { rel: 'lib/h2c.js', line: 2 },
+    files: {
+      'lib/h2c.js': [
+        'export function dynTpl(env = process.env,',                    // 1
+        "  key = 'ERIX_AUDIT_H2_TEMPLATE') {",                          // 2 ← 声称坐标
+        '  return env[`${key}`];',                                      // 3 真动态读
+        '}',                                                            // 4
+      ].join('\n') + '\n',
+    },
+  },
+  {
+    name: 'M1 同文件无关作用域的同名 `base`',
+    key: 'ERIX_AUDIT_M1_SCOPE',
+    claim: { rel: 'lib/m1.js', line: 2 },
+    files: {
+      'lib/m1.js': [
+        'function unrelated() {',                                       // 1
+        "  const base = ['ERIX_AUDIT_M1_SCOPE=1'];",                    // 2 只在 unrelated() 里可见
+        '  return base;',                                               // 3
+        '}',                                                            // 4
+        'export function buildCfg() {',                                 // 5 外层作用域里没有 base
+        '  return buildContainerConfig({ env: [...base] });',            // 6 ← 它被当成可追的来源
+        '}',                                                            // 7
+      ].join('\n') + '\n',
+    },
+  },
+];
+
+/** 反例在钉住口径下的红法（只看这个 key）：登记 ⇒ S3-⑥ 多一条；否则 ⇒ S3-⑦ 多一条。 */
+function pinRedVerdict(c) {
+  const dir = fixtureRoot(c.files);
+  try {
+    const idx = buildEnvSiteIndex(dir);
+    const added = registerInjectionSites(idx, dir);
+    const pinnedInj = new Set(projectPinned(loadSiteExpectations().injectionSites).map(coordIdOf));
+    const extraSite = deriveInjectionSiteRecords(added)
+      .filter((r) => r.key === c.key)
+      .map(coordIdOf)
+      .filter((id) => !pinnedInj.has(id));
+    if (extraSite.length > 0) {
+      return { via: 'S3-⑥', why: '被登记成注入站点 ⇒ 注入集合多一条', extra: extraSite };
+    }
+    const pinnedGap = new Set(projectPinned(loadSiteExpectations().gaps).map(coordIdOf));
+    const claim = [{ key: c.key, where: `${c.claim.rel}:${c.claim.line}` }];
+    const extraGap = coordIds(siteIndexProblems(claim, idx, dir))
+      .filter((id) => !pinnedGap.has(id));
+    if (extraGap.length > 0) {
+      return { via: 'S3-⑦', why: '没被登记 ⇒ where 那条坐标仍是差异，且差异集合多一条', extra: extraGap };
+    }
+    return { via: null, why: '既没登记也不报差异 ⇒ 被静默吞掉（最坏的一形）', extra: [] };
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('#587-S3-⑧ 反例六种在钉住口径下必须红（H1×3 / H2×3 / M1×1，不再靠启发式是对的）', () => {
+  const rows = PIN_COUNTEREX.map((c) => {
+    const v = pinRedVerdict(c);
+    console.log(`# S3-⑧ ${c.name}（${c.key}）⇒ ${v.via ?? '没红'}｜${v.why}｜`
+      + `${JSON.stringify(v.extra)}`);
+    return { name: c.name, key: c.key, via: v.via, why: v.why };
+  });
+  const silent = rows.filter((r) => r.via === null);
+  assert.deepEqual(silent, [],
+    `这些反例既没被登记成注入站点（S3-⑥ 多一条）也没留在差异里（S3-⑦ 多一条）`
+    + ` ⇒ 被静默吞掉了：${JSON.stringify(silent.map((r) => r.name))}`);
+  assert.equal(rows.length, PIN_COUNTEREX.length, '反例必须逐条给出红法（不多不少）');
+  const by = Object.fromEntries(rows.map((r) => [r.key, r.via]));
+  console.log(`# S3-⑧ 汇总（哪条反例红在哪条判据）：${JSON.stringify(by)}`);
+});
+
+/**
  * MED① 的夹具：**路径故意也叫 `portal/src/provisioner.js`** —— 旧形状闸会把它里而每一行都算
  * injection（那正是 MED① 的病）。行号是约定（`SI_MED_L`）：改文本要跟着改行号表。
  */
