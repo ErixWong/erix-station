@@ -4528,8 +4528,10 @@ test('#587-S3-⑧ 反例六种在钉住口径下必须红（H1×3 / H2×3 / M1×
  *   ② 已识别 env 拼装 span 的 untraced 桶：落在已识别区间里但零登记（带 span 的 kind/`at` 当原因）；
  *   ③ 期望文件 `envMentions` 白名单（坐标 + 理由，人工维护）—— 由 `#587-S3-⑨` 比对本函数的
  *      `unaccounted` 列表完成（双向，多一条/少一条都红）。
- * 词元口径：`code`（剥注释、**串正文留着**）上整词匹配 `Env` ⇒ 标识符 / 属性名 / 字符串键都算，
- * 注释里的不算，`process.env` 这种小写不算，`ENV` / `ERIX_ENV` / `Environment` 都不算。
+ * 词元口径：`code`（剥注释、**串正文留着**）上整词匹配 `Env`；711d MED 起，**串正文里的词元**
+ * 只有「可参与 env 拼装」的两形（计算成员下标 / 属性名位，见 `envStringBodyCounts`）才算，
+ * 普通散文串不算；注释里的不算，`process.env` 这种小写不算，`ENV` / `ERIX_ENV` / `Environment`
+ * 都不算。
  */
 const ENV_TOKEN_RE = /(?<![A-Za-z0-9_$])Env(?![A-Za-z0-9_$])/g;
 
@@ -4551,6 +4553,90 @@ function spanRegistersInjection(f, span) {
   for (const m of f.code.slice(span.from, span.to).matchAll(/([A-Z][A-Z0-9_]*)=/g)) {
     const q = f.code[span.from + m.index - 1];
     if (q === '`' || q === '"' || q === "'") return true;
+  }
+  return false;
+}
+
+/** 往左找最近的非空白下标；越界 ⇒ null。 */
+function prevNonSpace(text, from) {
+  for (let i = from; i >= 0; i -= 1) if (!/\s/.test(text[i])) return i;
+  return null;
+}
+
+/** 串开口引号下标：从 `from-1` 往左第一个引号；遇换行 / `}`（模板插值收尾）⇒ 定位不了返回 -1。 */
+function quoteLeft(masked, from) {
+  for (let i = from - 1; i >= 0; i -= 1) {
+    const c = masked[i];
+    if (c === "'" || c === '"' || c === '`') return i;
+    if (c === '\n' || c === '}') return -1;
+  }
+  return -1;
+}
+
+/** 串闭引号下标：从 `from` 往右第一个同种引号；遇换行或模板插值 ⇒ null（定位不了）。 */
+function quoteRight(masked, from, q) {
+  for (let i = from; i < masked.length; i += 1) {
+    const c = masked[i];
+    if (c === q) return i;
+    if (c === '\n') return null;
+    if (q === '`' && c === '$' && masked[i + 1] === '{') return null;
+  }
+  return null;
+}
+
+/** 段内 `[from, to)` 有没有**深度 0** 的三元 `?`（`?.` / `??` 不算）。 */
+function hasTopTernary(masked, from, to) {
+  let depth = 0;
+  for (let i = from; i < to; i += 1) {
+    const c = masked[i];
+    if (c === '(' || c === '[' || c === '{') depth += 1;
+    else if (c === ')' || c === ']' || c === '}') depth -= 1;
+    else if (c === '?' && depth === 0 && !'?.'.includes(masked[i + 1] ?? '')) return true;
+  }
+  return false;
+}
+
+/**
+ * 711d MED：落在**串正文**里的 `Env` 词元要不要进 `unaccounted`。默认**不算** ——
+ * `const s = "Env"` 这类散文逼维护者给无害字符串改白名单，是四审点名的误报。两种「可参与
+ * env 拼装」的结构形例外（宁可假红，不静默放过）：
+ *   ① 计算成员下标 `b['Env']` / `b?.["Env"]` / ``b[`Env`]`` —— 包住串的 `[` 的接收者以标识符
+ *      字符 / `)` / `]` / `.` / 引号结尾，且该标识符不是控制流词（`return ['Env']` 是数组）；
+ *   ② 属性名位（`{ 'Env': [] }`、`case 'Env':`）—— 串（连同紧贴的计算键 `]`）之后第一个顶层
+ *      非空白字符是 `:`，且同段串之前没有顶层三元 `?`（排除 `c ? 'Env' : x`）。
+ * 注意（实测，别指望兜底）：`b['Env']=[]` **不在**任何已识别拼装 span 里（`envAssemblySpans`
+ * 只认有归属证明的 `Env:` 数组 / `.Env.push(` / `env:` 选项形），它红的唯一来源就是这里
+ * 把它算进 `unaccounted` —— 四审工单括号里「由桶②覆盖」的说法与实现不符，以实测为准。
+ */
+function envStringBodyCounts(f, start) {
+  const { masked } = f;
+  const open = quoteLeft(masked, start);
+  if (open < 0) return true;                     // 定位不了串边界 ⇒ 保守算进去（假红可见）
+  const close = quoteRight(masked, start, masked[open]);
+  let bracket = null;                            // 包住整个串的计算下标 `[`…`]`
+  for (const [o, c] of f.pairs) {
+    if (masked[o] !== '[') continue;
+    if (close != null && o < open && close < c && (!bracket || o > bracket[0])) bracket = [o, c];
+  }
+  if (bracket) {
+    const pv = prevNonSpace(masked, bracket[0] - 1);
+    const pc = pv == null ? '' : masked[pv];
+    if (pc === '.' || pc === ')' || pc === ']' || pc === "'" || pc === '"' || pc === '`'
+      || /[\w$]/.test(pc)) {
+      const word = /[A-Za-z_$][\w$]*$/.exec(masked.slice(0, pv + 1));
+      if (!(word && CONTROL_WORDS.has(word[0]))) return true;   // 形①：成员访问的计算下标
+    }
+  }
+  const spanTo = close != null
+    ? (bracket && bracket[1] > close ? bracket[1] : close + 1)
+    : start;
+  const after = nextNonSpace(masked, spanTo);
+  if (after != null && masked[after] === ':') {
+    const scope = braceScopes(masked, f.pairs)(start);
+    for (const [s0, s1] of splitTop(masked, scope.start, scope.end)) {
+      if (!(s0 <= open && open < s1)) continue;
+      if (!hasTopTernary(masked, s0, open)) return true;        // 形②：属性名位
+    }
   }
   return false;
 }
@@ -4578,6 +4664,9 @@ function deriveEnvMentions(root = REPO_ROOT) {
         else out.accountedSpan += 1;
         continue;
       }
+      // 711d MED：串正文里的词元默认不算（散文误报），计算下标 / 属性名位例外（见引擎注释）。
+      if (!isCodePosition(f.code, f.masked, m.index, m[0].length)
+        && !envStringBodyCounts(f, m.index)) continue;
       const lr = lineRange(f.text, line);
       out.unaccounted.push({
         key: 'Env', rel, line, occ, text: lr ? f.text.slice(lr[0], lr[1]).trim() : '',
