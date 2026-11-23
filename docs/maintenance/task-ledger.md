@@ -9371,3 +9371,36 @@ dev 栈做法：`docker build -t erix-station/fde:local runner/` → `deploy/.en
 
 **残余**：`#712` —— 第 2 步 fail-closed 只认「参数直接下标」，认不出「参数 → 别名 → `alias[key]`」的链（静默漏读）。
 **这比第 4 步更值得做**（它属于原始痛点本体）。
+
+### 8.181 #677 P3 第五/六批 + **真机验收** + 删死旋钮（#714 / #715 / #716，2026-11-23 下午，主 agent）
+
+**决定（先做分析再动手）**：剩下 19 个 E1 旋钮按「改了值什么时候生效」分三类，**只迁真热的 4 个**：
+
+| 类 | 数量 | 判据 | 处置 |
+|---|---|---|---|
+| 真热 | 4 | 消费点在 portal 侧、每次调用/每拍现读 | **迁**（本单做掉 4 个） |
+| 容器注入 | 13 | provisioner 写进 FDE 容器 env ⇒ 改 DB 只影响**新 provision** 的容器 | **不迁**（会造成「界面说 20、容器跑 15」两套真相，比不给界面更糟） |
+| 死旋钮 | 1 | `PORT_QUOTA` 全仓 0 消费点 | **删** |
+
+**交付**：
+- `#714` `3b1139f`：`preview.session_ttl_seconds`（默认 900 / `60..86400` / hot）。
+  **关键**：`config.previewCookie.maxAge` 是启动快照 ⇒ `http.js` 同一请求**只现读一次**，既算库内 `expires_at` 又算两处
+  `Set-Cookie` 的 `Max-Age`（否则「库里 30 分钟、浏览器 cookie 15 分钟」两套真相）。
+- `#715` `869c878`：三个空闲退避旋钮（开户/关户/对账），现读位置在 **`while` 里、算 delay 之前**（不是循环启动时的默认参数）；钳位保留。
+- `#716` `de4bcb7`：删 `PORT_QUOTA`（config / compose / `.env.example` / `docs/env.md` / baseline）。
+  附带成本：删 2 行让 `config.js` 行号上移 ⇒ env 闸门两处钉住坐标漂移，**闸门自己报警**（`not ok 17 where 是坐标`），按真实行号改到 405。
+
+**真机验收（这一步的价值最高，抓到两个只有真机能抓的问题）**：
+1. **构建用错了树**：主工作树被并行会话的 release 分支占着（不含迁移 `0046`）⇒ 建出来的镜像**没有 `runtime_settings` 表**。
+   改用 `origin/main` 的独立树重建才对。**「一棵树一个写者」的活教材。**
+2. **8 格全链路真机通过**：迁移应用 → 启动日志 `8/8 定档 / 回落理由 no_row`（#709 那条修复真机生效）→
+   GET 分级正确 → PUT 写 DB + 审计带 `previous_value` → **`session.ttl_seconds=7200` 后重新登录 `Set-Cookie: Max-Age=7200`（没重启）** →
+   校验 `0`/`3601`/字符串 `"120"` → 400、`1e2` → 200 存 100（#709 的 unproven 裁定真机验证）→
+   **UI 面**：tab 存在 / 8 行 / 每行独立 Save / 从 UI 保存后 DB 与审计都对 / vision 确认无渲染错误。测试写入已清理。
+
+**我的分析错了一处（已纠正，没删）**：`COOKIE_PROFILE` 我一开始判成死旋钮（`config.cookieProfile` 字段没人读），
+**但那是误判** —— 它经 `cookieSettings(cookieProfile, …)` → `config.cookie` 驱动登录 cookie 属性（`__Host-` / `Secure`），
+消费者读的是 `config.cookie` 不是 `config.cookieProfile`。**教训：判「死旋钮」要 grep 消费者，不能只 grep 字段名。**
+
+**并行迁旋钮的已知代价**：#714 与 #715 同时往 registry 加格子 ⇒ 合并冲突 17 块（8+7+2），
+全是「两边各加新块、无语义冲突」，解法 = 两边都保留 + 把「格数」断言从 7/5 改成 8。**registry 是并行批次必然的冲突热点。**
