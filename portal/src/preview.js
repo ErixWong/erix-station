@@ -124,7 +124,10 @@ export function normalizeHostHeader(rawHost) {
 }
 
 /** 校验一次性 ticket 凭证（portal.md §2.7 第 4/6 步）。 */
-async function handleTicket(pool, config, { ticket, allocation, uri, scheme, hostHeader = null, now }) {
+async function handleTicket(pool, config, {
+  ticket, allocation, uri, scheme, hostHeader = null, now,
+  sessionTtlSeconds = config.previewSessionTtlSeconds,
+}) {
   const h = hashToken(ticket);
   const r = await pool.query(
     `SELECT id, user_id, issuer_id, allocation_id, state, expires_at, used_at, revoked_at, login_session_id
@@ -163,7 +166,8 @@ async function handleTicket(pool, config, { ticket, allocation, uri, scheme, hos
   // 第 6 步：单事务原子消费 ticket + 确定性派生 session + 幂等建 session grant（crash-safe）。
   const sessionToken = derivePreviewSessionToken(ticket, config.previewSessionSigningKey);
   const sessionHash = hashToken(sessionToken);
-  const expiresAt = new Date(now.getTime() + config.previewSessionTtlSeconds * 1000);
+  // #677 P3 第五批：预览会话 TTL 是可热改旋钮，由调用方现读后传入（缺省 = 启动快照）。
+  const expiresAt = new Date(now.getTime() + sessionTtlSeconds * 1000);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -210,7 +214,10 @@ async function handleTicket(pool, config, { ticket, allocation, uri, scheme, hos
 }
 
 /** 校验 steady-state 预览 cookie（portal.md §2.7 第 7 步）。 */
-async function handleSessionCookie(pool, config, { cookie, allocation, now }) {
+async function handleSessionCookie(pool, config, {
+  cookie, allocation, now,
+  sessionTtlSeconds = config.previewSessionTtlSeconds,
+}) {
   const h = hashToken(cookie);
   const r = await pool.query(
     `SELECT id, user_id, allocation_id, state, expires_at, revoked_at
@@ -233,7 +240,8 @@ async function handleSessionCookie(pool, config, { cookie, allocation, now }) {
   if (exposureDeny) return { ...exposureDeny, ...audit };
 
   // 滚动续期（刷新 expires_at / last_seen_at 并重发 cookie）。
-  const expiresAt = new Date(now.getTime() + config.previewSessionTtlSeconds * 1000);
+  // #677 P3 第五批：TTL 同样取现读入参（缺省 = 启动快照），与 Set-Cookie 的 Max-Age 同源。
+  const expiresAt = new Date(now.getTime() + sessionTtlSeconds * 1000);
   await pool.query(
     `UPDATE preview_grants SET expires_at = $2, last_seen_at = $3 WHERE id = $1`,
     [g.id, expiresAt, now],
@@ -258,7 +266,11 @@ function buildLocation(scheme, hostname, cleanUri, hostHeader = null) {
  * 唯一例外（#241）：CORS 预检（OPTIONS + Access-Control-Request-Method）免**凭证**，
  * 但第 1/2 步（hostname 精确查表、`released` 拒绝）**照旧**——未知 host 仍 404、已释放仍 403。
  */
-export async function authorizeForwardAuth(pool, config, { hostname, hostHeader = null, uri = '/', cookieValue = null, method = 'GET', scheme = 'https', accessControlRequestMethod = null, now = new Date() } = {}) {
+export async function authorizeForwardAuth(pool, config, {
+  hostname, hostHeader = null, uri = '/', cookieValue = null, method = 'GET', scheme = 'https',
+  accessControlRequestMethod = null, now = new Date(),
+  sessionTtlSeconds = config.previewSessionTtlSeconds,
+} = {}) {
   // ⚠ **#275：这条查表必须自带「活行优先」的确定性排序，不能只按 hostname 取第一行。**
   // `port_allocations_live_hostname_key`（`docs/data/schema.sql` §4，baseline 冻结）与迁移 0019 的
   // `port_allocations_live_global_port_key` 都是**部分**唯一索引，谓词字面同为 `state <> 'released'`
@@ -319,11 +331,15 @@ export async function authorizeForwardAuth(pool, config, { hostname, hostHeader 
 
   const ticket = parsePreviewTicket(uri);
   if (ticket) {
-    const res = await handleTicket(pool, config, { ticket, allocation, uri, scheme, hostHeader, now });
+    const res = await handleTicket(pool, config, {
+      ticket, allocation, uri, scheme, hostHeader, now, sessionTtlSeconds,
+    });
     return { ...res, fdeName: allocation.fde_name };
   }
   if (cookieValue) {
-    const res = await handleSessionCookie(pool, config, { cookie: cookieValue, allocation, now });
+    const res = await handleSessionCookie(pool, config, {
+      cookie: cookieValue, allocation, now, sessionTtlSeconds,
+    });
     return { ...res, fdeName: allocation.fde_name };
   }
   return deny(403, 'preview_ticket_required', 'preview ticket required', {

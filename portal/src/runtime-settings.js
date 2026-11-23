@@ -46,7 +46,8 @@
 // P1 的边界（别在代码里假装已完成，判据在 `portal/test/runtime-settings.test.js`）：
 //   * `RUNTIME_SETTING_REGISTRY` 自 **P2a** 起有**第一格** `session.ttl_seconds`，自 **P3 第一批**起
 //     有**第二格** `workspace.retention_days`，**P3 第二批**加**第三格** `preview.ticket_ttl_seconds`，
-//     **P3 第三批**加**第四格** `session.auto_title_min_new`（其余旋钮仍逐批填；判据 RS-7 钉住
+//     **P3 第三批**加**第四格** `session.auto_title_min_new`，**P3 第五批**加**第五格**
+//     `preview.session_ttl_seconds`（其余旋钮仍逐批填；判据 RS-7 钉住
 //     「只有这四格」，顺手多迁一格当场红）。
 //     ⇒ `applyRuntimeOverrides` 在真机上从此**每次 `serve()` 发一次读**（不再是零 SQL），
 //     启动路径的那一次是**整表一次**、不是每 key 一次（第 3 条）。
@@ -55,7 +56,8 @@
 //   * 热读：P2a 只有 `readSessionTtlSeconds` 一格；**P3 第一批**把它那套机件（5s 缓存 + 代际号
 //     + 同池在飞合并 + 写路径失效 + env 过闸 + 一次热读只一条 warn + 永不抛）抽成了
 //     `createHotReader`，于是 `readWorkspaceRetentionDays` 是同一工厂的第二份实例，
-//     `readPreviewTicketTtlSeconds` / `readAutoTitleMinNew` 是第三、第四份实例。
+//     `readPreviewTicketTtlSeconds` / `readAutoTitleMinNew` 是第三、第四份实例，
+//     `readPreviewSessionTtlSeconds` 是第五份实例。
 //     拓新格只需：registry 加一格 + `createHotReader({...})` 一行 + `HOT_READ_INVALIDATORS` 登记一行
 //     + 消费者把启动期 `config.X` 换成现读（判据 RS-23~RS-28）。
 //   * 迁移 0046 建表；接线在 `cli.js` 的 `serve()`（`migrate()` 之后、`createServer` 之前，
@@ -397,6 +399,81 @@ export function validateAutoTitleMinNew(value) {
   return true;
 }
 
+// --- preview.session_ttl_seconds 专用闸（P3 第五批：预览会话有效期进 DB） ----------------
+// 语义：预览 session（点开 ticket 后签发的滚动续期 cookie 对应的会话 grant）的有效期秒数，
+// 是**签发/续期预览会话时**用的（消费者 `preview.js` 的 `handleTicket` / `handleSessionCookie`
+// 算 `expires_at`，`http.js` 的 `handleForwardAuth` 发 `Set-Cookie` 的 `Max-Age`）。区间 `60..86400`，
+// 理由：
+//   * 下界 60（1 分钟）：预览会话是「人开着面板连续操作」的滚动会话，比一次性预览票（1..3600）
+//     长，但短于 1 分钟会让正常阅读/操作节奏下 cookie 频繁过期、体验碎；`0` 同预览票——签出来
+//     即过期 = 白发，所以 `0` 非法。
+//   * 上界 86400（1 天）：预览是临时排障面，不该有「永不过期」的会话；超过 1 天与「退出即清」
+//     在产品上不可区分，且越界多半是把单位填错（想写 1 小时写成秒之外的数量级那一族）。
+// 默认 900（15 分钟）与 `config.js:411` 的 `intEnv('PREVIEW_SESSION_TTL_SECONDS', 15 * 60)`
+// 及 compose 的 `${PREVIEW_SESSION_TTL_SECONDS:-900}` **三处同源**。
+export const PREVIEW_SESSION_TTL_KEY = 'preview.session_ttl_seconds';
+export const PREVIEW_SESSION_TTL_MIN_SECONDS = 60;
+export const PREVIEW_SESSION_TTL_MAX_SECONDS = 86400; // 1 天：临时排障面不该有永不过期的会话
+// 默认与 config.js 的 `previewSessionTtlSeconds`（intEnv 兜底 15*60=900）、compose 的 `:-900` 同源。
+export const PREVIEW_SESSION_TTL_DEFAULT_SECONDS = 900;
+export const PREVIEW_SESSION_TTL_HINT =
+  '预览会话有效期（秒）：签发/续期预览 cookie 时现读，60..86400（默认 900=15 分钟）；' +
+  '0 非法（签出即过期）；上界 1 天';
+
+/**
+ * 严格十进制正整数（形状口径同上面四格：只认 `/^[0-9]+$/` 的非负整数字面，再要求区间内）。
+ * 非法输入一律 `{ ok: false, reason }`，绝不返回 NaN，也绝不用 `Number()`/`parseInt()` 了事。
+ */
+export function parsePreviewSessionTtlSeconds(raw) {
+  let text;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw)) {
+      return { ok: false, reason: 'not_a_session_ttl_seconds' };
+    }
+    text = String(raw);
+  } else if (typeof raw === 'string') {
+    text = raw;
+  } else {
+    return { ok: false, reason: 'not_a_session_ttl_seconds' };
+  }
+  // 只认纯十进制数字：`'1e3'`、`' 900 '`、`'+60'`、`'60.0'`、空串、`'-1'` 全部在这一步挡掉。
+  if (!/^[0-9]+$/.test(text)) {
+    return { ok: false, reason: 'not_a_session_ttl_seconds' };
+  }
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) {
+    return { ok: false, reason: 'not_a_session_ttl_seconds' };
+  }
+  // 形状闸也把区间兜一下（与前四格同形：parse 与 validate 两道都过一遍区间）。
+  // 下界 60 ⇒ `0` 在这一层被拒（reason 归 `out_of_range`，不是 `not_a_...`）；上界同。
+  if (value < PREVIEW_SESSION_TTL_MIN_SECONDS || value > PREVIEW_SESSION_TTL_MAX_SECONDS) {
+    return { ok: false, reason: 'session_ttl_seconds_out_of_range' };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * 管理台写入前的取值闸：返回 `true` 或一句给人看的中文原因。
+ *
+ * ⚠ `1e3` 的两侧之分（照 #709 裁定）：写侧接受任何合法 JSON number（`1e3` 塌成 `1000` ⇒ 区间内
+ * 放行、库里落 1000）；只有字符串 `"1e3"` 走 parse 的正则支被拒 ⇒ env 侧 `1e3` 视为没给、回落默认。
+ */
+export function validatePreviewSessionTtlSeconds(value) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    return `必须是 ${PREVIEW_SESSION_TTL_MIN_SECONDS}–${PREVIEW_SESSION_TTL_MAX_SECONDS}`
+      + ' 的整数秒（不接受字符串、小数、布尔）';
+  }
+  if (value < PREVIEW_SESSION_TTL_MIN_SECONDS) {
+    return `不能是 ${value}（预览会话至少 ${PREVIEW_SESSION_TTL_MIN_SECONDS} 秒；`
+      + '0 秒 = 签出来即过期、白发的 cookie，只会造成「签了却进不去」）';
+  }
+  if (value > PREVIEW_SESSION_TTL_MAX_SECONDS) {
+    return `必须在 ${PREVIEW_SESSION_TTL_MIN_SECONDS}–${PREVIEW_SESSION_TTL_MAX_SECONDS} 秒之间` +
+      '（60 秒 ~ 1 天；预览是临时排障面，不该有永不过期的会话）';
+  }
+  return true;
+}
+
 // --- loop.*_idle_backoff_ms 三格专用闸（P3 第六批：三个循环的空闲退避上限一起迁） ----------
 // 三个旋钮是同一类东西（「本轮没认领到活 ⇒ 退避阶梯封顶多少毫秒」），但**各自一格、各自一份
 // 热读实例**：共用一份缓存槽就是「保存开户那格的上限，把对账那一格的缓存一起抹掉」（判据
@@ -569,6 +646,17 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseAutoTitleMinNew,
     validate: validateAutoTitleMinNew,
     hint: AUTO_TITLE_MIN_NEW_HINT,
+  }),
+  [PREVIEW_SESSION_TTL_KEY]: Object.freeze({
+    key: PREVIEW_SESSION_TTL_KEY,
+    label: '预览会话有效期（秒）',
+    configPath: 'previewSessionTtlSeconds',
+    envVar: 'PREVIEW_SESSION_TTL_SECONDS',
+    defaultValue: PREVIEW_SESSION_TTL_DEFAULT_SECONDS,
+    applyMode: 'hot',
+    parse: parsePreviewSessionTtlSeconds,
+    validate: validatePreviewSessionTtlSeconds,
+    hint: PREVIEW_SESSION_TTL_HINT,
   }),
   [ONBOARDING_IDLE_BACKOFF_MS_KEY]: Object.freeze({
     key: ONBOARDING_IDLE_BACKOFF_MS_KEY,
@@ -1298,6 +1386,12 @@ const autoTitleMinNewHotReader = createHotReader({
   fallbackDefault: AUTO_TITLE_MIN_NEW_DEFAULT,
 });
 
+const previewSessionTtlHotReader = createHotReader({
+  key: PREVIEW_SESSION_TTL_KEY,
+  warnLabel: '预览会话有效期',
+  fallbackDefault: PREVIEW_SESSION_TTL_DEFAULT_SECONDS,
+});
+
 // P3 第六批：三个退避旋钮 = **三份独立实例**（各自一份缓存 / 代际号 / 在飞槽）。
 // 不要为了省三行代码把它们台成一个实例：同一条 SQL、但三个 key，共用槽就是互相抹缓存。
 const onboardingIdleBackoffHotReader = createHotReader({
@@ -1341,6 +1435,11 @@ export function invalidateAutoTitleMinNewCache() {
   autoTitleMinNewHotReader.invalidate();
 }
 
+/** 丢弃 `preview.session_ttl_seconds` 的缓存与在飞槽（口径同上；签发/续期预览会话现读，写后立即生效）。 */
+export function invalidatePreviewSessionTtlCache() {
+  previewSessionTtlHotReader.invalidate();
+}
+
 /** 丢弃 `loop.onboarding_idle_backoff_ms` 的缓存与在飞槽（口径同上；开户循环每一拍现读）。 */
 export function invalidateOnboardingIdleBackoffCache() {
   onboardingIdleBackoffHotReader.invalidate();
@@ -1367,6 +1466,7 @@ export const HOT_READ_INVALIDATORS = new Map([
   [WORKSPACE_RETENTION_KEY, invalidateWorkspaceRetentionCache],
   [PREVIEW_TICKET_TTL_KEY, invalidatePreviewTicketTtlCache],
   [AUTO_TITLE_MIN_NEW_KEY, invalidateAutoTitleMinNewCache],
+  [PREVIEW_SESSION_TTL_KEY, invalidatePreviewSessionTtlCache],
   [ONBOARDING_IDLE_BACKOFF_MS_KEY, invalidateOnboardingIdleBackoffCache],
   [OFFBOARDING_IDLE_BACKOFF_MS_KEY, invalidateOffboardingIdleBackoffCache],
   [PROVISIONER_IDLE_BACKOFF_MS_KEY, invalidateProvisionerIdleBackoffCache],
@@ -1598,6 +1698,21 @@ export function readPreviewTicketTtlSeconds(options = {}) {
  */
 export function readAutoTitleMinNew(options = {}) {
   return autoTitleMinNewHotReader.read(options);
+}
+
+/**
+ * `preview.session_ttl_seconds` 的**热读**入口（P3 第五批；调用方是 `http.js` 的
+ * `handleForwardAuth`，同一请求现读一次后透传给 `preview.authorizeForwardAuth`（算 `expires_at`）
+ * 与两处 `Set-Cookie`（算 `Max-Age`）。
+ *
+ * 口径与上面四格同一套（同一工厂）：DB 有效值 > env（过闸）> registry 默认（900），
+ * 5s 缓存 + 同池在飞合并 + 写路径失效，**读侧永不抛**，一次热读最多一条 warn。
+ *
+ * @param {object} opts `{ pool, config, now?, log?, env? }`
+ * @returns {Promise<number>} 生效的预览会话有效期秒数；三档都给不出 ⇒ `900`（绝不回 `undefined`）。
+ */
+export function readPreviewSessionTtlSeconds(options = {}) {
+  return previewSessionTtlHotReader.read(options);
 }
 
 /**
