@@ -9469,14 +9469,14 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
 - **删 `config.js` 的行是有成本的**：行号漂移会打断 env 闸门的坐标钉住，闸门会红（这是它该干的），
   每次都要同步 `deploy/env-legs-exceptions.json` 与 `deploy-env-delegate.test.js` 里的真树坐标。
 
-### 8.184 #677 Tier 2B 收口：`MAX_BODY_BYTES` **不做旋钮**，只放宽两个消息端点（2026-11-23，主 agent + erix_run ×2 + copilot 对抗审查）
+### 8.184 #677 Tier 2B 收口：JSON 请求体 env **不做旋钮**，只放宽两个消息端点（2026-11-23，主 agent + erix_run ×2 + copilot 对抗审查）
 
 **接 8.183 的「未做（49 个调用点，干净可做）」**：本单结论是**不做那个旋钮**，改做「把消息端点从全站默认里摘出来」。
 
 **四条现查事实（推翻/修正了先前判断）**：
 1. **64 KiB 不是无出处**：`docs/api/portal.md:374` 写死了登录的 64 KiB 约束；`config.js` 原注释写明目的是「防止超大字段触发 scrypt 或打爆内存」。⇒ **不许放大全站默认**。
 2. **100k 字符业务闸在 64 KiB 下结构性不可达**：中文 UTF-8 100k 字符 ≈ 300 KB，用户永远先撞 413 `payload_too_large`，看不到「content 过长」。`session-http.test.js` 只测纯函数所以照绿。
-3. **`MAX_BODY_BYTES` 与 `MAX_ROUND_BYTES` 两个 env 都是假旋钮**：`deploy/docker-compose.yml` 的 station-portal 用**显式 environment 列表**（无 `env_file`），两者都不在其中 ⇒ 运维在 `deploy/.env` 里设了**不生效**。
+3. **JSON 请求体 env（已在本单删除）与 `MAX_ROUND_BYTES` 当初都是假旋钮**：`deploy/docker-compose.yml` 的 station-portal 用**显式 environment 列表**（无 `env_file`），两者都不在其中 ⇒ 运维在 `deploy/.env` 里设了**不生效**。
 4. **宿主预写没有体积闸**：`transcript-store.js` 的 `appendRound` 直接 INSERT，不校验 `MAX_ROUND_BYTES`；那个 400 只在 internal HTTP 写轮路径（`internal.js`）。⇒ 「消息超 round 上限必然 400」是错的。
 
 **copilot 对抗审查抓到我 4 个错（全部成立，逐条回代码验过）**：
@@ -9490,7 +9490,7 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
 | 改动 | 内容 |
 |---|---|
 | 两个模块常量 | `http.js` 新增 `DEFAULT_JSON_BODY_LIMIT = 64*1024`（全站默认，46 处走它）与 `MESSAGE_BODY_LIMIT = 1024*1024`（**只**给 `/messages`、`/queued-inputs`）；注释写死两条约束：> `MAX_MESSAGE_CONTENT_LENGTH × 3` 且 ≤ `MAX_ROUND_BYTES` |
-| 删假 env | `config.maxBodyBytes` + env `MAX_BODY_BYTES` 删掉（值保留为常量）；`docs/env.md` / `.env.example` / 5 处台账字面量同步 |
+| 删假 env | `config.maxBodyBytes` + 那个同名 env（请求体上限，已删）删掉（值保留为常量）；`docs/env.md` / `.env.example` / 5 处台账字面量同步 |
 | 44 处死引用 | `readJsonBody(req, ctx.config.maxBodyBytes)` → `readJsonBody(req)`（字段已删，原来靠默认参数吃 `undefined` 假绿） |
 | **保留** | `MAX_MESSAGE_CONTENT_LENGTH = 100_000` 一个字没动（原计划要删，错）——现在它**可达**了 |
 | 防回潮哨兵 | `message-body-limit.test.js` 源码级两条：`http.js` 不许再出现 `config.maxBodyBytes`；`readJsonBody` 第二实参只认白名单 |
@@ -9502,4 +9502,4 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
 
 **残余（未开单，两条都是真洞）**：
 1. **宿主预写无体积闸**：`transcript-store.js#appendRound` 不校验序列化后的 record 体积 ⇒ 超过 `MAX_ROUND_BYTES` 的记录能绕过 internal 那道 400 直接落库。
-2. **`MAX_ROUND_BYTES` 仍没接进 compose**：它的 env 覆盖在生产依旧无效（本单只删了 `MAX_BODY_BYTES`，没动它——它是 round 契约的调参口，接进 compose 还是删掉需要单独决定）。
+2. **`MAX_ROUND_BYTES` 仍没接进 compose**：它的 env 覆盖在生产依旧无效（本单只删了请求体那个 env，没动它——它是 round 契约的调参口，接进 compose 还是删掉需要单独决定）。

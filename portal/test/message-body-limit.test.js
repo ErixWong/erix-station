@@ -144,11 +144,19 @@ async function startServer() {
 }
 
 const messagesUrl = (s) => `${s.base}/api/sessions/${SESSION_ID}/messages`;
+const queuedUrl = (s) => `${s.base}/api/sessions/${SESSION_ID}/queued-inputs`;
 function postMessage(s, content, headers = {}) {
   return fetch(messagesUrl(s), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Cookie: s.cookie, ...headers },
     body: JSON.stringify({ content, attachments: [] }),
+  });
+}
+function postQueued(s, content, headers = {}) {
+  return fetch(queuedUrl(s), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: s.cookie, ...headers },
+    body: JSON.stringify({ content, attachments: [], kind: 'steer' }),
   });
 }
 
@@ -243,10 +251,53 @@ test('#677 超限 413 不占幂等占位：同 Idempotency-Key 随后发合法�
 });
 
 // ---------------------------------------------------------------------------
-// 防回潮哨兵（源码级）：`maxBodyBytes` 字段已从 config.js 删，http.js 再读它就是读 undefined
-// 然后靠 readJsonBody 的默认参数碰巧落到 64 KiB（假绿：没有任何测试能抓“传 undefined 落默认”）。
+// ⑥⑦ 同一条闸也接在 `POST /api/sessions/:id/queued-inputs` 上（`handlePostQueuedInput`）：
+//    它读同一个 `MESSAGE_BODY_LIMIT`、调同一个 `validateMessageBody`。现存的
+//    `queued-inputs-http.test.js` 只测队列语义、没有 >64 KiB 的大体 ⇒ 若这条端点退回 64 KiB
+//    默认（有人删掉 `readJsonBody(req, MESSAGE_BODY_LIMIT)` 的第二实参），那边会全绿。
+//    这里补「大体进得来 + 业务闸可达」两条，把它确实读到了放宽后的上限钉住。
+//    桩形状取自 `queued-inputs-http.test.js` 的「无活跃 run ⇒ 直发」那一档（activeRun=null），
+//    响应形 `{posted:{message,run}, queued:null}`（与 §4.3 同形）。
 // ---------------------------------------------------------------------------
-test('#677 防回潮哨兵：http.js 不许再引用已删的 config.maxBodyBytes，且 readJsonBody 第二实参只认白名单', () => {
+test('#677 queued-inputs 中文正文 100,000 字符 ⇒ 202（同一条 1MiB 闸接在这条端点上，不误伤）', async () => {
+  const content = '中'.repeat(MAX_MESSAGE_CONTENT_LENGTH); // ≈300 KB，> 64 KiB
+  assert.ok(Buffer.byteLength(content, 'utf8') > DEFAULT_JSON_BODY_LIMIT,
+    '前提自证：这条正文超 64 KiB ⇒ queued-inputs 若退回默认闸就会 413');
+  const s = await startServer();
+  try {
+    const r = await postQueued(s, content);
+    const body = await r.json();
+    assert.notEqual(r.status, 413, `queued-inputs 不许被 64 KiB 默认闸误伤（实得 ${r.status}：${JSON.stringify(body).slice(0, 200)}）`);
+    assert.equal(r.status, 202, `无活跃 run 直发应 202（实得 ${r.status}：${JSON.stringify(body).slice(0, 200)}）`);
+    assert.equal(body.posted?.message?.role, 'user', '直发成功回显 user 消息（证明真跑完业务，不是空 202）');
+    assert.equal(body.queued, null, '无活跃 run 直发 ⇒ queued 为空');
+  } finally { await s.close(); }
+});
+
+test('#677 queued-inputs 中文正文 100,001 字符 ⇒ 400 validation_failed + details.field=content（业务闸在这条端点也可达）', async () => {
+  const content = '中'.repeat(MAX_MESSAGE_CONTENT_LENGTH + 1);
+  assert.ok(Buffer.byteLength(JSON.stringify({ content, attachments: [], kind: 'steer' }), 'utf8') < MESSAGE_BODY_LIMIT,
+    '前提自证：仍在 1MiB 传输上限内 ⇒ 一定走到 validateMessageBody，而非先被传输层 413');
+  const s = await startServer();
+  try {
+    const r = await postQueued(s, content);
+    const body = await r.json();
+    assert.notEqual(r.status, 413, '业务闸超长的正文不许先被传输层 413 掉');
+    assert.equal(r.status, 400);
+    assert.equal(body.error.code, 'validation_failed');
+    assert.equal(body.error.details.field, 'content', '错误必须点名 content（queued-inputs 调同一个 validateMessageBody）');
+  } finally { await s.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// 防回潮哨兵（源码级），三件事：
+//   ① `maxBodyBytes` 字段已从 config.js 删，http.js 再读它就是读 undefined
+//      然后靠 readJsonBody 的默认参数碰巧落到 64 KiB（假绿：没有任何测试能抓“传 undefined 落默认”）。
+//   ② readJsonBody 的第二实参只认白名单（拦住重新塞回已删字段名）。
+//   ③ 两条消息端点「各自」显式传 MESSAGE_BODY_LIMIT（不能只看全文件至少出现一次）——
+//      这是本哨兵从「名字白名单」升级来的点：旧写法对「哪个路由没传」是盲的。
+// ---------------------------------------------------------------------------
+test('#677 防回潮哨兵：http.js 不许引用已删的 config.maxBodyBytes、readJsonBody 第二实参只认白名单，且两条消息路由各自显式传 MESSAGE_BODY_LIMIT', () => {
   const src = fs.readFileSync(new URL('../src/http.js', import.meta.url), 'utf8');
 
   // ① 死引用：字段已从 config.js 删，任何 `config.maxBodyBytes` 都是假绿。
@@ -265,7 +316,30 @@ test('#677 防回潮哨兵：http.js 不许再引用已删的 config.maxBodyByte
   assert.deepEqual(bad, [],
     `readJsonBody 出现白名单外的第二实参：${JSON.stringify(bad)}（默认走 64 KiB 就写 readJsonBody(req)，别塞已删字段名）`);
 
-  // 自证：上面的白名单检查不是空断言——源码里确有真实调用形态被它放行。
-  assert.ok(tokens.includes('MESSAGE_BODY_LIMIT'), '夹具自证：源码里确有 readJsonBody(req, MESSAGE_BODY_LIMIT)');
+  // 自证（白名单检查不是空断言）：源码里确有 INTERNAL_* 形态被它放行。
   assert.ok(tokens.some((t) => t.startsWith('INTERNAL_')), '夹具自证：源码里确有 readJsonBody(req, INTERNAL_*)');
+
+  // ③ 两条消息端点「各自」必须显式 `readJsonBody(req, MESSAGE_BODY_LIMIT)`。
+  //    白名单（②）只保证「出现的名字合法」，不保证「每条路由都传了」：把 queued-inputs 那处退回
+  //    `readJsonBody(req)`，旧白名单哨兵照样全绿（它只数全文件至少出现过一次 MESSAGE_BODY_LIMIT）。
+  //    变异实验实证：queued 路由退回默认时，用例 ⑥⑦ 会红但旧白名单哨兵仍绿 ⇒ 故按函数切片逐路由断言。
+  const FN_DECL = /\bfunction\s+[A-Za-z_$][\w$]*\s*\(/g;
+  const regionOf = (header) => {
+    const s = src.indexOf(header);
+    assert.notEqual(s, -1, `http.js 里找不到 ${header}（函数改名会让本条哨兵空跑，先同步它）`);
+    FN_DECL.lastIndex = s + header.length; // 跳过自身声明，从其后找下一个函数头作为切片右界
+    const nxt = FN_DECL.exec(src);
+    return src.slice(s, nxt ? nxt.index : src.length);
+  };
+  const CALL = /readJsonBody\(\s*req\s*,\s*MESSAGE_BODY_LIMIT\s*\)/;
+  for (const [name, header] of [
+    ['handlePostQueuedInput', 'async function handlePostQueuedInput('],
+    ['handlePostMessage', 'async function handlePostMessage('],
+  ]) {
+    assert.match(regionOf(header), CALL,
+      `${name} 必须显式 readJsonBody(req, MESSAGE_BODY_LIMIT)：退回 readJsonBody(req) 会把它降回 64 KiB 默认 ⇒ 业务闸重新不可达`);
+  }
+  // 切片自证：右界没越界合并（否则两条断言共用同一段 = 假绿）。
+  assert.ok(!regionOf('async function handlePostQueuedInput(').includes('async function handlePostMessage'),
+    '切片自证：queued 函数体不得越过 message 函数头（regionOf 右界失效）');
 });
