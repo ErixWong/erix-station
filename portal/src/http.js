@@ -2198,6 +2198,47 @@ async function handleAdminApi(req, res, ctx, url) {
     }
   }
 
+  // issue #719：每 FDE 日额度（USD/天）。两个独立 matcher，**不改上面那个老 /llm 正则**（避免回归）；
+  // 鉴权继承 handleAdminApi 的 requireAdmin，fde_name 语法复用 decodeAdminFdeName。
+  const adminFdeQuotaMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/llm\/quota$/);
+  if (adminFdeQuotaMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeQuotaMatch[1]);
+    if (req.method === 'GET') {
+      const quota = await llm.getFdeDailyBudget(ctx.pool, { fdeName, gateway: ctx.llmGateway });
+      return sendJson(res, 200, { quota });
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      // 额度直接交给 setFdeDailyBudget 校验（null 或 ≤ 上限的有限正数）；非法值⇒ LlmError validation_failed→ 400。
+      const quota = await llm.setFdeDailyBudget(ctx.pool, {
+        fdeName,
+        dailyBudgetUsd: body?.daily_budget_usd,
+        gateway: ctx.llmGateway,
+      });
+      return sendJson(res, 200, { quota });
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
+  const adminFdeUsageMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/llm\/usage$/);
+  if (adminFdeUsageMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeUsageMatch[1]);
+    if (req.method === 'GET') {
+      const rawDays = url.searchParams.get('days');
+      let days = 14;
+      if (rawDays !== null && rawDays !== '') {
+        days = Number(rawDays);
+        if (!Number.isInteger(days) || days < 1 || days > 90) {
+          throw new HttpError(400, 'validation_failed', 'days 必须为 1–90 的整数', { details: { field: 'days' } });
+        }
+      }
+      const usage = await llm.getFdeDailyUsage(ctx.pool, { fdeName, gateway: ctx.llmGateway, days });
+      return sendJson(res, 200, usage);
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
   // 预览端口号池**占用总览**（issue #256 交付①，portal.md §4.7a）：只读。
   // 存在的理由：改块原本只能填数字试错（撞 409 preview_port_block_taken 才知道哪段被占），
   // 有了总览就能**先选空闲段**。鉴权走 handleAdminApi 的 requireAdmin（非 admin ⇒ 403，零新错误码）。
