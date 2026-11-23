@@ -377,7 +377,7 @@ test('超过 FILE_UPLOAD_MAX_BYTES ⇒ 413 file_too_large + details.max_bytes，
     assert.equal(fs.existsSync(path.join(s.proj, 'big.bin')), false);
     assert.ok(await waitFor(() => remnants(s.proj).length === 0), '超限之后不得留下 .tmp 残骸');
 
-    // 上限是**这个端点**的：MAX_BODY_BYTES(64KiB) 不参与，否则任何真实上传都会 413。
+    // 上限是**这个端点**的：JSON 请求体上限（默认 64 KiB）不参与，否则任何真实上传都会 413。
     const ok = await fetch(uploadUrl({ base: s.base, name: 'small.bin' }), {
       method: 'POST',
       headers: { cookie: s.cookieFor('alice'), 'content-type': 'application/octet-stream' },
