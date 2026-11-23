@@ -412,7 +412,10 @@ test('RS-4b 孤儿行（库里有行但 registry 不认）⇒ problems 逐 key �
     assert.equal(out.demoLimit, 20, '孤儿行不许干扰登记项走 DB 那一档');
     assert.equal(out['ghost.old_limit'], undefined, '孤儿 key 不许被塞进 config');
     // 只有 registry 声明过的两个 configPath 会被写（`demo.interval_ms` 无行 ⇒ 走默认 1000）。
-    assert.deepEqual(Object.keys(out).sort(), ['demo', 'demoLimit'], '覆盖层只动 registry 声明过的字段');
+    // #709 MED①：DB 覆盖进来的那一格会额外带一个 `<path>Source='db'` 标注（供热读器回落时
+    // 如实定来源）；这是从 registry 声明字段派生的合法标注，不是孤儿键。
+    assert.deepEqual(Object.keys(out).sort(), ['demo', 'demoLimit', 'demoLimitSource'],
+      '覆盖层只动 registry 声明过的字段（外加它派生的 <path>Source 标注）');
     assert.ok(!JSON.stringify(out).includes('ghost'), '孤儿 key 连名字都不许出现在结果里');
 
     // 聚合上限：孤儿很多时仍然只一条 warn，只列前 5 个 + 总数（一行一条就是刷屏）。
@@ -2621,4 +2624,84 @@ test('RS-38 真库那一腿（第三格）：写 30 ⇒ 热读 30、不等 5 秒
         '手工写的坏值 ⇒ 回落 env，不抛');
       invalidatePreviewTicketTtlCache();
     });
+  });
+
+// ---------------------------------------------------------------------------
+// #709 MED①：启动时 DB 覆盖后的 effectiveConfig 不能被骗成「env 回退」
+// ---------------------------------------------------------------------------
+
+// 造一个「启动时从 DB 覆盖进来」的 effectiveConfig：DB 有合法行 ⇒ applyRuntimeOverrides
+// 必须把那一格标成 `<path>Source='db'`（MED① 根因：以前只改值不标来源）。
+function bootOverlaidConfig(rows, base) {
+  return applyRuntimeOverrides(base, {
+    pool: ttlPool({ rows }), env: {}, log: silentLog,
+  });
+}
+
+test('#709 MED① applyRuntimeOverrides 把 DB 覆盖进来的那一格标成 <path>Source=db', async () => {
+  const boot = await bootOverlaidConfig(
+    [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }],
+    { previewTicketTtlSeconds: 60, sessionTtlSeconds: 604800, workspaceRetentionDays: 0 },
+  );
+  assert.equal(boot.previewTicketTtlSeconds, 30, 'DB 行压过默认 60');
+  assert.equal(boot.previewTicketTtlSecondsSource, 'db',
+    'MED① 根因：从 DB 覆盖进来的值必须标 db（旧实现不标 ⇒ 热读器回落时只能凭值猜 env）');
+  // 没走 DB 的那两格（env/默认）不许被误标成 db。
+  assert.notEqual(boot.sessionTtlSecondsSource, 'db', '未走 DB 的那格不盖 db 标注');
+  assert.notEqual(boot.workspaceRetentionDaysSource, 'db', '未走 DB 的那格不盖 db 标注');
+});
+
+test('#709 MED① DB 读失败⇒热读用启动时 DB 快照且 source 如实报 db + 点名 boot snapshot',
+  async () => {
+    const boot = await bootOverlaidConfig(
+      [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }],
+      { previewTicketTtlSeconds: 60 },
+    );
+    const dead = ttlPool({ throwOnSelect: Object.assign(new Error('no such table'), { code: '42P01' }) });
+    // ① 热读回落值：DB 挂了仍用启动时的 DB 快照 30（而不是 env/默认的 60）。
+    invalidatePreviewTicketTtlCache();
+    assert.equal(await readPreviewTicketTtlSeconds({ pool: dead, config: boot, env: {}, log: silentLog }),
+      30, 'DB 读失败 ⇒ 继续用启动时的 DB 快照 30（不谎改成 env/默认 60）');
+    // ② 报告面（管理台 GET）：这一档 source 必须如实报 db（不是 env）+ reason 点名 boot snapshot。
+    const adminLog = collectingLog();
+    const { items } = await listRuntimeSettingsAdmin({ pool: dead, config: boot, env: {}, log: adminLog });
+    const pv = items.find((i) => i.key === PREVIEW_TICKET_TTL_KEY);
+    assert.equal(pv.source, 'db', 'MED①：DB 读失败用的是旧 DB 值 ⇒ 不许谎报 source=env');
+    assert.notEqual(pv.source, 'env', '旧行为就是这里谎报 env（M-1 改回一律 env ⇒ 这一条红）');
+    assert.equal(pv.reason, 'db_read_failed_using_boot_snapshot',
+      'source=db 时 reason 必须点明用的是启动时快照');
+    assert.equal(pv.value, 30);
+    assert.ok(adminLog.seen.warn.some((m) => m.includes(PREVIEW_TICKET_TTL_KEY)
+      && /启动时.*快照|boot_snapshot|DB 快照/.test(m)),
+      `warn 要说清「DB 读失败、暂用启动时快照」（实得 ${JSON.stringify(adminLog.seen.warn)}）`);
+  });
+
+test('#709 MED① 工厂统一：session/workspace/preview 三格 DB 读失败都报 db + boot snapshot',
+  async () => {
+    const boot = await bootOverlaidConfig(
+      [
+        { key: SESSION_TTL_KEY, value: 3600 },
+        { key: WORKSPACE_RETENTION_KEY, value: 7 },
+        { key: PREVIEW_TICKET_TTL_KEY, value: 30 },
+      ],
+      { sessionTtlSeconds: 604800, workspaceRetentionDays: 0, previewTicketTtlSeconds: 60 },
+    );
+    for (const path of ['sessionTtlSeconds', 'workspaceRetentionDays', 'previewTicketTtlSeconds']) {
+      assert.equal(boot[`${path}Source`], 'db', `${path} 从 DB 覆盖进来必须标 db（工厂同一循环）`);
+    }
+    const dead = ttlPool({ throwOnSelect: Object.assign(new Error('no such table'), { code: '42P01' }) });
+    const { items } = await listRuntimeSettingsAdmin({ pool: dead, config: boot, env: {}, log: silentLog });
+    for (const key of [SESSION_TTL_KEY, WORKSPACE_RETENTION_KEY, PREVIEW_TICKET_TTL_KEY]) {
+      const it = items.find((i) => i.key === key);
+      assert.equal(it.source, 'db', `${key}: DB 读失败用旧 DB 快照 ⇒ 如实报 db`);
+      assert.equal(it.reason, 'db_read_failed_using_boot_snapshot', `${key}: reason 点名 boot snapshot`);
+    }
+    // 对照：标 env 的那一格 DB 读失败时仍报 env（没被 over-correct 成 db）。
+    const envCfg = { previewTicketTtlSeconds: 45, previewTicketTtlSecondsSource: 'env' };
+    const { items: envItems } = await listRuntimeSettingsAdmin({
+      pool: dead, config: envCfg, env: {}, log: silentLog,
+    });
+    const envPv = envItems.find((i) => i.key === PREVIEW_TICKET_TTL_KEY);
+    assert.equal(envPv.source, 'env', '标 env 且 DB 读失败 ⇒ 仍报 env（没被改成 db）');
+    assert.equal(envPv.reason, 'read_failed', '标 env 那一格的 reason 仍是 read_failed（不是 boot snapshot）');
   });
