@@ -1284,6 +1284,18 @@ test('#677 P3② 批量签票用 **DB 值**：runtime_settings 写 30 ⇒ 响应
         `expires_at 应为 now+30s（DB 值），实得 ${Math.round(deltaMs / 1000)}s`);
       assert.ok(deltaMs < 50_000,
         `实得 ${Math.round(deltaMs / 1000)}s = 还在用启动快照的 60（没改成现读）`);
+      // #709 MED②：响应里的 `expires_at` 另有来源（http 循环外算的一个值），只钉响应会被
+      // 「响应 30 / 库里 60」蒙混过去。必须钉落库那两行 grant 自己的 `expires_at` ≈ now+30（不是 60）。
+      // （照单标的落库断言同形：M-2 把签票的 `ticketTtlSeconds` 参数改回启动快照 ⇒ 这里 ≈ 60s 红。）
+      const tickets = store.grants.filter((g) => g.kind === 'ticket');
+      assert.equal(tickets.length, 2, '两行都落到库里（kind=ticket）');
+      for (const g of tickets) {
+        const grantDeltaMs = new Date(g.expires_at).getTime() - Date.now();
+        assert.ok(grantDeltaMs > 20_000 && grantDeltaMs <= 31_000,
+          `落库 expires_at 应为 now+30s（DB 值），实得 ${Math.round(grantDeltaMs / 1000)}s`);
+        assert.ok(grantDeltaMs < 50_000,
+          `实得 ${Math.round(grantDeltaMs / 1000)}s = 库里那行还在吃启动快照的 60（签发没传现读值）`);
+      }
     } finally {
       pool.query = origQuery;
       await close();
