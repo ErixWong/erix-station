@@ -26,6 +26,7 @@ import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
 import { removeGitCredentialFile, setGitCredential, platformCredentialPresent, migrateLegacyCredential } from './git-credential.js';
 import { mintGitAccount } from './git-mint.js';
 import { attachLoopWatch, envInt, idleDelayMs, MAX_BACKOFF_MS_SAFE, sleepCancellable } from './loop-timing.js';
+import { readProvisionerIdleBackoffMaxMs } from './runtime-settings.js';
 
 // ---------------------------------------------------------------------------
 // 代码层 Docker API 白名单（写死）
@@ -1238,6 +1239,13 @@ export function reconcileDidWork(stats = {}) {
  * 启动常驻对账循环（由 cli serve 调用）。
  * issue #520：节拍由「本轮有没有动手」驱动（见上面 `LOOP_INTERVAL_MS` 附近的注释）；
  * 句柄补成 #506 同形（`stop` / `done` / `settled` / `failure`）。
+ *
+ * issue #677 P3 第六批：`PROVISIONER_IDLE_BACKOFF_MAX_MS` 从**启动快照**（旧的默认参数
+ * `resolveIdleBackoffMaxMs({ log, env })`）改成**每一拍现读**，位置在**决定这一拍睡多久之前**。
+ *   * 钳位行为逐字保留：本格的 registry 值域上界 = 业务上限 15000（不是共享的 60000），
+ *     而它的默认值恰好也等于 15000 ⇒ 「越界 ⇒ 回落默认」与旧的「warn + 钳到 15000」是同一个
+ *     生效值（判据：`deploy-env-idle-backoff.test.js` G4）；`resolveIdleBackoffMaxMs` 本体未动。
+ *   * 三个退避旋钮各自一份热读实例（不共用）；本循环只拿自己那一格。
  */
 export function startProvisionerLoop(pool, config, {
   docker,
@@ -1245,7 +1253,9 @@ export function startProvisionerLoop(pool, config, {
   onPause,
   sleep = sleepCancellable,
   env = process.env, // 单测注入旋钮用；生产不传 ⇒ process.env
-  idleBackoffMaxMs = resolveIdleBackoffMaxMs({ log, env }),
+  now = () => Date.now(), // 注入缝：热读的 5s 缓存要能在假时钟下推得动
+  idleBackoffMaxMs = null, // 显式覆盖 ⇒ 不现读；不传则走下面的热读入口
+  readIdleBackoffMaxMs = readProvisionerIdleBackoffMaxMs, // 注入缝：钉「下一拍用新值」不靠真库
 } = {}) {
   if (!docker) docker = createDockerClient({ dockerHost: config.dockerHost });
   let consecutiveFailures = 0;
@@ -1257,7 +1267,11 @@ export function startProvisionerLoop(pool, config, {
         const stats = await reconcileOnce(pool, config, { docker, log });
         consecutiveFailures = 0;
         idleTicks = reconcileDidWork(stats) ? 0 : idleTicks + 1;
-        if (!(await sleep(idleDelayMs(idleTicks, { baseMs: LOOP_INTERVAL_MS, maxMs: idleBackoffMaxMs }), abort.signal))) break;
+        // #677 P3：这一拍的上限是**现读**的（位置在算 delay 之前，不是启动时算一次）；
+        // 读不到就落 env/默认 15000，越界被闸拦下后也是 15000（= 旧路径钳到业务上限的同一个值）。
+        const maxMs = idleBackoffMaxMs
+          ?? await readIdleBackoffMaxMs({ pool, config, now, log, env });
+        if (!(await sleep(idleDelayMs(idleTicks, { baseMs: LOOP_INTERVAL_MS, maxMs }), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[provisioner] loop error: ${err.message}`);

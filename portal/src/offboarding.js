@@ -8,8 +8,8 @@ import { removeGitCredentialFile } from './git-credential.js';
 import { assertSafePath } from './fsutil.js';
 import { validateFdeName } from './projects.js';
 import { disableGiteaAccount } from './git-mint.js';
-import { readWorkspaceRetentionDays } from './runtime-settings.js';
-import { attachLoopWatch, envInt, idleDelayMs, MAX_BACKOFF_MS_SAFE, sleepCancellable } from './loop-timing.js';
+import { readWorkspaceRetentionDays, readOffboardingIdleBackoffMaxMs } from './runtime-settings.js';
+import { attachLoopWatch, idleDelayMs, sleepCancellable } from './loop-timing.js';
 
 const STEPS = [
   'disable-user',
@@ -576,6 +576,10 @@ export async function sweepOffboardedWorkspaces(pool, config, {
  *     「同一个旋钮两种新鲜度」是 #677 一路在拆的形状。
  *   * 现读**永不抛**（读侧口径）⇒ 循环不会因为配置面坏了而停摆；读不到就用 env/默认。
  *   * `now` / `env` 一并递下去：假时钟推过 1h 同时也让 5s 缓存到点，判据不用真等。
+ *
+ * issue #677 P3 第六批：本循环还多现读一个旋钮 —— `loop.offboarding_idle_backoff_ms`。
+ *   * 现读位置：**决定这一拍睡多久之前**（不是启动时算一次）⇒ 上一拍还是 30s，改完下一拍就能回 5s。
+ *   * 与 `retention_days` 同一套机件、但**自己一份缓存**（不共用实例，否则两个旋钮互相抹缓存）。
  */
 export function startOffboardingLoop(pool, config, {
   docker,
@@ -584,8 +588,9 @@ export function startOffboardingLoop(pool, config, {
   sleep = sleepCancellable,
   now = () => Date.now(),
   env = process.env, // 单测注入旋钮用；生产不传 ⇒ process.env
-  idleBackoffMaxMs = envInt('OFFBOARDING_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log, env }),
+  idleBackoffMaxMs = null, // 显式覆盖 ⇒ 不现读（#520 既有用法）；不传则走下面的热读入口
   readRetention = readWorkspaceRetentionDays, // 注入缝：判据要能钉「下一拍用新值」而不靠真库
+  readIdleBackoffMaxMs = readOffboardingIdleBackoffMaxMs, // 注入缝：同上（退避上限那一格）
   sweep = sweepOffboardedWorkspaces,          // 注入缝：同上（要能看见清理真正收到了哪个值）
 } = {}) {
   if (!docker) docker = createDockerClient({ dockerHost: config.dockerHost });
@@ -617,7 +622,11 @@ export function startOffboardingLoop(pool, config, {
         }
         consecutiveFailures = 0;
         idleTicks = claimed ? 0 : idleTicks + 1;
-        if (!(await sleep(idleDelayMs(idleTicks, { baseMs: LOOP_INTERVAL_MS, maxMs: idleBackoffMaxMs }), abort.signal))) break;
+        // #677 P3：退避上限也是**现读**的，位置在「决定这一拍睡多久」之前（启动快照会让管理台
+        // 改完必须重启才生效）；与保留天数各自一份热读缓存，不共用实例。
+        const idleBackoffCapMs = idleBackoffMaxMs
+          ?? await readIdleBackoffMaxMs({ pool, config, now, log, env });
+        if (!(await sleep(idleDelayMs(idleTicks, { baseMs: LOOP_INTERVAL_MS, maxMs: idleBackoffCapMs }), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[offboarding] loop error: ${err.message}`);

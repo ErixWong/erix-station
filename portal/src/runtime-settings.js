@@ -65,6 +65,10 @@
 // env 那一档的值就是**传进来的 `config`**（它已经由 `loadConfig` 算成 `env > 字面默认`）；
 // 本模块只负责「DB 可用就压过它」，所以 `env` 参数只是给超时哨兵读的，不是第二份真相。
 
+// 循环侧的共享上限（60s）只在这里引用一次：三个退避旋钮的**上界不许自己发明**，
+// 口径源头是 `loop-timing.js`（Node timer 的 32 位语义边界）与对账循环的业务上限。
+import { MAX_BACKOFF_MS_SAFE } from './loop-timing.js';
+
 /** 读侧超时的默认值（毫秒）。口径照 `upload-settings.js` / `platform-prompts.js`：1500ms。 */
 export const DEFAULT_READ_TIMEOUT_MS = 1500;
 
@@ -393,6 +397,135 @@ export function validateAutoTitleMinNew(value) {
   return true;
 }
 
+// --- loop.*_idle_backoff_ms 三格专用闸（P3 第六批：三个循环的空闲退避上限一起迁） ----------
+// 三个旋钮是同一类东西（「本轮没认领到活 ⇒ 退避阶梯封顶多少毫秒」），但**各自一格、各自一份
+// 热读实例**：共用一份缓存槽就是「保存开户那格的上限，把对账那一格的缓存一起抹掉」（判据
+// RS-52），而三格的默认值与上界本来就不一样。
+//
+// 值域**不自己发明**，逐条抄自循环侧既有的钳位逻辑（判据 RS-50 钉住同源）：
+//   * 开户 / 销号：旧路径 `envInt(name, 30000, { max: MAX_BACKOFF_MS_SAFE })` ⇒ 区间 `1..60000`；
+//     越界的 env 在旧路径是「回落默认 30000 + warn」，在新路径是「registry 拒 ⇒ 回落 registry
+//     默认 30000」⇒ **生效值逐字相同**（env 侧的钳位既没被绕过也没被放宽）。
+//   * 对账：`provisioner.js#resolveIdleBackoffMaxMs()` 在共享上限之后还要按**本循环的业务上限**
+//     钳到 `IDLE_BACKOFF_MAX_MS_BUSINESS_CAP`（15000）。那一格的业务上限就是本格的 validate 上界；
+//     又因为它的**默认值恰好等于业务上限**，「越界 ⇒ 回落默认」与「越界 ⇒ 钳到上限」落到同一个
+//     数 ⇒ `env=60000 ⇒ 生效 15000` 这条既有行为（判据 `deploy-env-idle-backoff.test.js` G4）
+//     原样保留，`resolveIdleBackoffMaxMs` 本体一字未动（env 单用那条路仍然 warn + 钳）。
+export const ONBOARDING_IDLE_BACKOFF_MS_KEY = 'loop.onboarding_idle_backoff_ms';
+export const OFFBOARDING_IDLE_BACKOFF_MS_KEY = 'loop.offboarding_idle_backoff_ms';
+export const PROVISIONER_IDLE_BACKOFF_MS_KEY = 'loop.provisioner_idle_backoff_ms';
+
+/** 三格共用的下界：`0` 毫秒 = 每拍空转（正是 #506 修掉的形状），所以它和非法值一样不进闸。 */
+export const IDLE_BACKOFF_MS_MIN = 1;
+/** 开户 / 销号的上界 = 共享的 `MAX_BACKOFF_MS_SAFE`（60s）；这两个循环的业务上限就是它。 */
+export const IDLE_BACKOFF_MS_SHARED_MAX = MAX_BACKOFF_MS_SAFE;
+/** 对账的上界 = 本循环的业务上限（与 `provisioner.js` 的 `IDLE_BACKOFF_MAX_MS_BUSINESS_CAP` 同源）。 */
+export const PROVISIONER_IDLE_BACKOFF_MS_BUSINESS_CAP = 15_000;
+
+/** 三格的默认值：与各自循环模块的 `IDLE_BACKOFF_MAX_MS_DEFAULT` 同源（判据 RS-50 钉住相等）。 */
+export const ONBOARDING_IDLE_BACKOFF_MS_DEFAULT = 30_000;
+export const OFFBOARDING_IDLE_BACKOFF_MS_DEFAULT = 30_000;
+export const PROVISIONER_IDLE_BACKOFF_MS_DEFAULT = 15_000;
+
+export const ONBOARDING_IDLE_BACKOFF_MS_HINT =
+  '开户循环空闲退避的上限（毫秒）；1..60000（默认 30000）；认领到活立刻回 5000ms 基准，'
+  + '下一拍生效（本进程最多 5 秒内、多副本最多 5 秒）';
+export const OFFBOARDING_IDLE_BACKOFF_MS_HINT =
+  '销号循环空闲退避的上限（毫秒）；1..60000（默认 30000）；认领到活立刻回 5000ms 基准；'
+  + '1h 工作区清理闸门是每拍检查，会被拖后最多一个退避拍';
+export const PROVISIONER_IDLE_BACKOFF_MS_HINT =
+  '对账循环空闲退避的上限（毫秒）；1..15000（默认 15000）；上界 15000 是本循环的业务上限'
+  + '（漂移发现延迟是业务承诺），配 5000 = 不退避（#520 之前的固定节拍）';
+
+/**
+ * 三格共用的形状闸（口径与 `parsePreviewTicketTtlSeconds` / `parseAutoTitleMinNew` 逐字同形）：
+ * 只认 safe integer 的 JSON number，或**纯十进制数字串**（`'1e4'` / `' 30 '` / `'-1'` 一律拒），
+ * 再把区间兑一遍。非法输入一律 `{ ok:false, reason }`，绝不抛、绝不 `Number()` 了事。
+ * @param {unknown} raw @param {{max:number, notReason:string, rangeReason:string}} opts
+ */
+function parseIdleBackoffMs(raw, { max, notReason, rangeReason }) {
+  let text;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw)) return { ok: false, reason: notReason };
+    text = String(raw);
+  } else if (typeof raw === 'string') {
+    text = raw;
+  } else {
+    return { ok: false, reason: notReason };
+  }
+  if (!/^[0-9]+$/.test(text)) return { ok: false, reason: notReason };
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) return { ok: false, reason: notReason };
+  if (value < IDLE_BACKOFF_MS_MIN || value > max) return { ok: false, reason: rangeReason };
+  return { ok: true, value };
+}
+
+/** 三格共用的写侧闸：区间内 ⇒ `true`，否则一句点名上界来历的中文原因。 */
+function validateIdleBackoffMs(value, { max, overHint }) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    return `必须是 ${IDLE_BACKOFF_MS_MIN}–${max} 的整数毫秒（不接受字符串、小数、布尔）`;
+  }
+  if (value < IDLE_BACKOFF_MS_MIN) {
+    return `不能是 ${value}（至少 ${IDLE_BACKOFF_MS_MIN}ms；0ms = 每拍空转，正是 #506 修掉的形状）`;
+  }
+  if (value > max) {
+    return `必须在 ${IDLE_BACKOFF_MS_MIN}–${max}ms 之间（${max}ms 是这条循环的上界；${overHint}）`;
+  }
+  return true;
+}
+
+/** 开户格的形状闸（reason 点名本格：日志里不许出现另一个循环的名字）。 */
+export function parseOnboardingIdleBackoffMs(raw) {
+  return parseIdleBackoffMs(raw, {
+    max: IDLE_BACKOFF_MS_SHARED_MAX,
+    notReason: 'not_an_onboarding_idle_backoff_ms',
+    rangeReason: 'onboarding_idle_backoff_out_of_range',
+  });
+}
+
+/** 开户格的取值闸。 */
+export function validateOnboardingIdleBackoffMs(value) {
+  return validateIdleBackoffMs(value, {
+    max: IDLE_BACKOFF_MS_SHARED_MAX,
+    overHint: '再大就越过 Node timer 的 32 位语义边界，退避会退化成 1ms 空转，见 loop-timing.js',
+  });
+}
+
+/** 销号格的形状闸。 */
+export function parseOffboardingIdleBackoffMs(raw) {
+  return parseIdleBackoffMs(raw, {
+    max: IDLE_BACKOFF_MS_SHARED_MAX,
+    notReason: 'not_an_offboarding_idle_backoff_ms',
+    rangeReason: 'offboarding_idle_backoff_out_of_range',
+  });
+}
+
+/** 销号格的取值闸。 */
+export function validateOffboardingIdleBackoffMs(value) {
+  return validateIdleBackoffMs(value, {
+    max: IDLE_BACKOFF_MS_SHARED_MAX,
+    overHint: '再大就越过 Node timer 的 32 位语义边界，退避会退化成 1ms 空转，见 loop-timing.js',
+  });
+}
+
+/** 对账格的形状闸：上界是**业务上限 15000**，不是共享的 60000（越界 ⇒ 回落默认 15000）。 */
+export function parseProvisionerIdleBackoffMs(raw) {
+  return parseIdleBackoffMs(raw, {
+    max: PROVISIONER_IDLE_BACKOFF_MS_BUSINESS_CAP,
+    notReason: 'not_a_provisioner_idle_backoff_ms',
+    rangeReason: 'provisioner_idle_backoff_out_of_range',
+  });
+}
+
+/** 对账格的取值闸：越界的原因必须说清「这是业务承诺，不是算术溢出」。 */
+export function validateProvisionerIdleBackoffMs(value) {
+  return validateIdleBackoffMs(value, {
+    max: PROVISIONER_IDLE_BACKOFF_MS_BUSINESS_CAP,
+    overHint: '对账的漂移发现延迟是业务承诺，不许被一个旋钮放宽到 4 倍；要更快发现漂移就调小'
+      + '（5000 = #520 之前的固定节拍）',
+  });
+}
+
 export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
@@ -436,6 +569,41 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseAutoTitleMinNew,
     validate: validateAutoTitleMinNew,
     hint: AUTO_TITLE_MIN_NEW_HINT,
+  }),
+  [ONBOARDING_IDLE_BACKOFF_MS_KEY]: Object.freeze({
+    key: ONBOARDING_IDLE_BACKOFF_MS_KEY,
+    label: '开户循环空闲退避上限（毫秒）',
+    // config 里没有这一档（`ONBOARDING_IDLE_BACKOFF_MAX_MS` 是循环直读 env、不经 `loadConfig`），
+    // 所以 config 那一档永远「没给」⇒ 管理台报来源只会说 db / env / default，不假装是 config 配的。
+    configPath: 'onboardingIdleBackoffMaxMs',
+    envVar: 'ONBOARDING_IDLE_BACKOFF_MAX_MS',
+    defaultValue: ONBOARDING_IDLE_BACKOFF_MS_DEFAULT,
+    applyMode: 'hot',
+    parse: parseOnboardingIdleBackoffMs,
+    validate: validateOnboardingIdleBackoffMs,
+    hint: ONBOARDING_IDLE_BACKOFF_MS_HINT,
+  }),
+  [OFFBOARDING_IDLE_BACKOFF_MS_KEY]: Object.freeze({
+    key: OFFBOARDING_IDLE_BACKOFF_MS_KEY,
+    label: '销号循环空闲退避上限（毫秒）',
+    configPath: 'offboardingIdleBackoffMaxMs',
+    envVar: 'OFFBOARDING_IDLE_BACKOFF_MAX_MS',
+    defaultValue: OFFBOARDING_IDLE_BACKOFF_MS_DEFAULT,
+    applyMode: 'hot',
+    parse: parseOffboardingIdleBackoffMs,
+    validate: validateOffboardingIdleBackoffMs,
+    hint: OFFBOARDING_IDLE_BACKOFF_MS_HINT,
+  }),
+  [PROVISIONER_IDLE_BACKOFF_MS_KEY]: Object.freeze({
+    key: PROVISIONER_IDLE_BACKOFF_MS_KEY,
+    label: '对账循环空闲退避上限（毫秒）',
+    configPath: 'provisionerIdleBackoffMaxMs',
+    envVar: 'PROVISIONER_IDLE_BACKOFF_MAX_MS',
+    defaultValue: PROVISIONER_IDLE_BACKOFF_MS_DEFAULT,
+    applyMode: 'hot',
+    parse: parseProvisionerIdleBackoffMs,
+    validate: validateProvisionerIdleBackoffMs,
+    hint: PROVISIONER_IDLE_BACKOFF_MS_HINT,
   }),
 });
 
@@ -1130,6 +1298,26 @@ const autoTitleMinNewHotReader = createHotReader({
   fallbackDefault: AUTO_TITLE_MIN_NEW_DEFAULT,
 });
 
+// P3 第六批：三个退避旋钮 = **三份独立实例**（各自一份缓存 / 代际号 / 在飞槽）。
+// 不要为了省三行代码把它们台成一个实例：同一条 SQL、但三个 key，共用槽就是互相抹缓存。
+const onboardingIdleBackoffHotReader = createHotReader({
+  key: ONBOARDING_IDLE_BACKOFF_MS_KEY,
+  warnLabel: '开户循环空闲退避上限',
+  fallbackDefault: ONBOARDING_IDLE_BACKOFF_MS_DEFAULT,
+});
+
+const offboardingIdleBackoffHotReader = createHotReader({
+  key: OFFBOARDING_IDLE_BACKOFF_MS_KEY,
+  warnLabel: '销号循环空闲退避上限',
+  fallbackDefault: OFFBOARDING_IDLE_BACKOFF_MS_DEFAULT,
+});
+
+const provisionerIdleBackoffHotReader = createHotReader({
+  key: PROVISIONER_IDLE_BACKOFF_MS_KEY,
+  warnLabel: '对账循环空闲退避上限',
+  fallbackDefault: PROVISIONER_IDLE_BACKOFF_MS_DEFAULT,
+});
+
 /**
  * 丢弃 TTL 缓存（P2a 对外的名字；实现是上面那个工厂里每一格自己的 `invalidate`）。
  * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（RS-7 钉住身份），P3 抽工厂后也不能换成间接层。
@@ -1153,6 +1341,21 @@ export function invalidateAutoTitleMinNewCache() {
   autoTitleMinNewHotReader.invalidate();
 }
 
+/** 丢弃 `loop.onboarding_idle_backoff_ms` 的缓存与在飞槽（口径同上；开户循环每一拍现读）。 */
+export function invalidateOnboardingIdleBackoffCache() {
+  onboardingIdleBackoffHotReader.invalidate();
+}
+
+/** 丢弃 `loop.offboarding_idle_backoff_ms` 的缓存与在飞槽（口径同上；销号循环每一拍现读）。 */
+export function invalidateOffboardingIdleBackoffCache() {
+  offboardingIdleBackoffHotReader.invalidate();
+}
+
+/** 丢弃 `loop.provisioner_idle_backoff_ms` 的缓存与在飞槽（口径同上；对账循环每一拍现读）。 */
+export function invalidateProvisionerIdleBackoffCache() {
+  provisionerIdleBackoffHotReader.invalidate();
+}
+
 /**
  * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。一格一行；加新的热读旋钮就在这里多登记一行，
  * **不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
@@ -1164,6 +1367,9 @@ export const HOT_READ_INVALIDATORS = new Map([
   [WORKSPACE_RETENTION_KEY, invalidateWorkspaceRetentionCache],
   [PREVIEW_TICKET_TTL_KEY, invalidatePreviewTicketTtlCache],
   [AUTO_TITLE_MIN_NEW_KEY, invalidateAutoTitleMinNewCache],
+  [ONBOARDING_IDLE_BACKOFF_MS_KEY, invalidateOnboardingIdleBackoffCache],
+  [OFFBOARDING_IDLE_BACKOFF_MS_KEY, invalidateOffboardingIdleBackoffCache],
+  [PROVISIONER_IDLE_BACKOFF_MS_KEY, invalidateProvisionerIdleBackoffCache],
 ]);
 
 /**
@@ -1392,6 +1598,35 @@ export function readPreviewTicketTtlSeconds(options = {}) {
  */
 export function readAutoTitleMinNew(options = {}) {
   return autoTitleMinNewHotReader.read(options);
+}
+
+/**
+ * `loop.onboarding_idle_backoff_ms` 的**热读**入口（P3 第六批；调用方是 `onboarding.js` 的循环，
+ * 位置是**每一拍决定 sleep 之前**，不是启动时算一次）。
+ *
+ * 口径与上面四格同一套（同一工厂、**这一格自己一份缓存**）：DB 有效值 > env（过闸）> 默认 30000，
+ * 5s 缓存 + 同池在飞合并 + 写路径失效，**读侧永不抛**，一次热读最多一条 warn。
+ *
+ * @param {object} opts `{ pool, config, now?, log?, env? }`
+ * @returns {Promise<number>} 生效的退避上限毫秒；三档都给不出 ⇒ 30000（绝不回 `undefined`）。
+ */
+export function readOnboardingIdleBackoffMaxMs(options = {}) {
+  return onboardingIdleBackoffHotReader.read(options);
+}
+
+/** `loop.offboarding_idle_backoff_ms` 的热读入口（口径同上；默认 30000，自己一份缓存）。 */
+export function readOffboardingIdleBackoffMaxMs(options = {}) {
+  return offboardingIdleBackoffHotReader.read(options);
+}
+
+/**
+ * `loop.provisioner_idle_backoff_ms` 的热读入口（口径同上，**默认 15000**，自己一份缓存）。
+ *
+ * ⚠ 这一格的值域上界是**对账的业务上限** 15000（不是共享的 60000）：越界的 env/DB 值会被闸拦下
+ *   并落到默认 15000，与旧路径 `resolveIdleBackoffMaxMs` 的「warn + 钳到 15000」是同一个生效值。
+ */
+export function readProvisionerIdleBackoffMaxMs(options = {}) {
+  return provisionerIdleBackoffHotReader.read(options);
 }
 
 // ---------------------------------------------------------------------------

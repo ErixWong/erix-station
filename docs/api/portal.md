@@ -3673,7 +3673,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**已迁的旋钮（四格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
+**已迁的旋钮（七格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
 
 | key | env 兜底位 | 值域 | `applyMode` | 生效点 |
 | --- | --- | --- | --- | --- |
@@ -3681,8 +3681,27 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 | `workspace.retention_days` | `ERIX_WORKSPACE_RETENTION_DAYS` | 整数 `0..3650` 天（**`0` 是有效值** = 不自动清理） | `hot` | offboarding 循环每一拍现读 |
 | `preview.ticket_ttl_seconds` | `PREVIEW_TICKET_TTL_SECONDS` | 整数 `1..3600` 秒（**`0` 非法**：签出来即过期） | `hot` | 签预览票时现读（批量整批共用一次） |
 | `session.auto_title_min_new` | `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 整数 `1..100` 轮（默认 `3`；**`0` 非法**：每拍重算标题） | `hot` | `evaluateAutoTitle()` 每次评估标题时现读（`session-title.js`） |
+| `loop.onboarding_idle_backoff_ms` | `ONBOARDING_IDLE_BACKOFF_MAX_MS` | 整数 `1..60000` 毫秒（默认 `30000`；**`0` 非法**：每拍空转） | `hot` | onboarding 循环**每一拍**在决定 sleep 之前现读 |
+| `loop.offboarding_idle_backoff_ms` | `OFFBOARDING_IDLE_BACKOFF_MAX_MS` | 整数 `1..60000` 毫秒（默认 `30000`；**`0` 非法**） | `hot` | offboarding 循环**每一拍**在决定 sleep 之前现读 |
+| `loop.provisioner_idle_backoff_ms` | `PROVISIONER_IDLE_BACKOFF_MAX_MS` | 整数 `1..15000` 毫秒（默认 `15000`；上界 15000 是本循环的**业务上限**，不是 `60000`） | `hot` | provisioner 对账循环**每一拍**在决定 sleep 之前现读 |
 
 四格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+
+后三格（#677 P3 第六批：三个循环的空闲退避上限）也是同一套机件，但是**三份独立实例**（各自一份
+缓存与在飞槽）：共用一份就是「保存开户那格的上限，把对账那一格的缓存一起抹掉」。现读位置是
+**每一拍决定 sleep 之前**，不是循环启动时算一次（后者就是快照：改完要重启才生效）。
+
+**这三个旋钮的值域不是新发明的**，逐条抄自循环侧已有的钳位逻辑：开户 / 销号的旧路径是
+`envInt(name, 30000, { max: MAX_BACKOFF_MS_SAFE })`（上界 60s 是 Node timer 的 32 位语义边界，
+越过它退避会退化成 1ms 空转）⇒ 区间 `1..60000`；越界的 env 旧路径是「回落默认 30000 + warn」，
+搬进 registry 后是「闸拒 ⇒ 回落 registry 默认 30000」，**生效值逐字相同**。
+对账那一格不同：`provisioner.js#resolveIdleBackoffMaxMs()` 在共享上限之后还要按**本循环的业务上限**
+钳到 15000（「漂移即修」的发现延迟是业务承诺，不许被一个 env 放宽到 4 倍）⇒ 本格的值域上界就是
+`15000`；又因为它的默认值恰好也等于 15000，「越界 ⇒ 回落默认」与「越界 ⇒ 钳到上限」落到同一个数，
+所以既有行为（`PROVISIONER_IDLE_BACKOFF_MAX_MS=60000` ⇒ 生效 `15000` 且 warn 点名旋钮，判据
+`portal/test/deploy-env-idle-backoff.test.js` G4）**原样保留**，`resolveIdleBackoffMaxMs` 本体未动。
+`5000` 是运维逃生口（退避阶梯会被夹成恒定 5s = #520 之前的固定节拍）。
+
 **上界 `3650` 是产品口径不是算术溢出**：超过 10 年的「离职保留」与「永不清理」在运维上不可区分，
 而后者已有确定表达（`0`）⇒ 上界外的值只能是把单位填错了（想写 30 天写成秒/毫秒那一族）。
 越界的 env 值被闸拦下后回落**默认 `0`**，是更保守的一档（少删目录，不会误删）。
