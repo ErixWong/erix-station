@@ -3795,7 +3795,10 @@ function registerInjectionSites(index, root = REPO_ROOT) {
 registerInjectionSites(REPO_SITE_INDEX);
 
 /** H2（返修）：这一处参数使用是不是**动态下标读**（`env[key]` 那类：参数处在 `X[param]` 的
- * 下标位且下标里只有它）——那是拿 key 去真取值，是真读站点，不是读回。 */
+ * 下标位且下标里只有它）——那是拿 key 去真取值，是真读站点，不是读回。
+ * 【设计改判 711b】它是**提议层**（只减少假提议，让真树读数稳定在 18/10），**不是唯一防线**：
+ * 它对 `key.toUpperCase()` / 别名下标 / 模板下标都认不出，但那些形现在留在差异里 ⇒ S3-⑦ 红。
+ * 不要再把它接回「决定能不能判绿」的位置。 */
 function isDynamicIndexUse(f, at, name) {
   const br = enclosingPairs(f.masked, f.pairs, at).find((p) => p.kind === '[');
   if (!br || f.masked.slice(br.open + 1, br.close - 1).trim() !== name) return false;
@@ -3813,6 +3816,8 @@ function isDynamicIndexUse(f, at, name) {
  * ⇒ 这个字面量是「读回 helper 的默认 key」（如 `readContainerEnv(inspectData, key = 'ERIX…'））。
  * 缺任何一环 ⇒ `null`（退回 `mention-only`，不猜）；只认 `function NAME(…)` 声明形，与
  * `deriveHostSourceSites` 同一限制（箭头形认不出就是推不出，不装懂）。
+ * 【设计改判 711b】**诊断专用**：它的结论只进打印（`#587-S3-③` / `#587-S1-⑧` 的分类分布），
+ * 不再参与 `assert` 的通过判定；真树那条坐标的红绿由钉住的 `gaps` 集合说话。
  */
 function readbackDefaultParamSite(root, rel, line, key) {
   const f = srcFacts(root, rel);
@@ -3864,6 +3869,8 @@ function readbackDefaultParamSite(root, rel, line, key) {
  * `why` 写清「每条判据为什么不成立」（调用方必须红，**不许默认塞进某一类**）。
  * 顺序 = 由特指到宽泛：同一行可能同时像两样（`config.js:406` 既是对象成员、又是 helper 调用点），
  * 越具体的越先判 ⇒ `host-source` 必须排在 `mention-only` 前面（变异 M-2 就换这条顺序）。
+ * 【设计改判 711b】**提议层 / 诊断专用**：它只回答「这条差异看起来是哪一类」，**不得**参与
+ * `assert` 的通过判定（旧 `S1-⑧` 的三条分类断言已因此降级）；判不出也不得把它当绿灯理由。
  */
 function shadowGapSemantic(key, coord, { root = REPO_ROOT, index = REPO_SITE_INDEX } = {}) {
   const { rel, line } = splitCoord(coord);
@@ -3933,8 +3940,10 @@ function shadowGapSemantic(key, coord, { root = REPO_ROOT, index = REPO_SITE_IND
 
 /**
  * **兜底**（故意保留的旧形状尺：路径 + 行内含 key）。只允许在语义判据决定不了时被调用，
- * 而且必须计数 —— `#587-S1-⑧` 断言真树 `fallbackCount === 0`：「靠形状猜」一旦出现就必须显式红，
- * 不许悄悄把新差异吸进老类别（那正是 MED① 的失效形状）。
+ * 而且必须计数 —— 旧 `#587-S1-⑧` 断言真树 `fallbackCount === 0`，【设计改判 711b】该断言已
+ * 降级为诊断打印：兜底出现只说明**提议层认不出这一形**，不再直接判红；「不许静默吸进老类别」
+ * 现在由 `#587-S3-⑦` 的坐标集合钉住保证（认不出 ⇒ 它仍在差异里 ⇒ 与名单对不上 ⇒ 那格红）。
+ * 【诊断专用，勿接回通过路径】
  */
 function shadowGapByShape(key, coord, root = REPO_ROOT) {
   const { rel, line } = splitCoord(coord);
@@ -3963,7 +3972,8 @@ function shadowGapClass(key, coord, opts = {}) {
   return { kind, via: 'fallback', why: `形状兜底（路径/行内含 key）；语义判据：${r.why}` };
 }
 
-test('#587-S1-⑧ 影子对照真树：影子尺只会更严，多杀的必须逐条归进已知各类（第 4 步能不能切就看它）', () => {
+test('#587-S1-⑧ 影子对照真树：分类**已降为诊断**，多杀集合由 S3-⑦ 钉住（旧尺方向与闸门仍断言）',
+  () => {
   const { entries } = loadEnvLegExceptions();
   assert.ok(entries.length > 0, '例外清单读不到 ⇒ 对照没意义');
   const gate = whereProblems(entries, RUNNER_ENV_KEYS);
@@ -3994,16 +4004,21 @@ test('#587-S1-⑧ 影子对照真树：影子尺只会更严，多杀的必须�
   // 方向：结构成员判定只会**更严**。旧尺报的问题影子尺没报 ⇒ 索引有洞（漏读形或语法尺没共用）。
   assert.deepEqual(onlyGate, [],
     '旧尺判红而影子尺判绿 ⇒ 索引比文本尺还松（要么漏了读形，要么坐标语法没走同一把尺）');
-  assert.deepEqual(unexplained, [],
-    '影子多杀的坐标归不进已知各类 ⇒ 要么是新造的假坐标（好事，登记该改），要么索引漏了真读形（坏事）：'
-    + '逐条看上面的 SHADOW-CLASS / SHADOW-DIFF 定性后再动，不许为了让这格变绿去改登记');
-  // 兜底必须是 **0**（MED①）：真树这些差异全部由语义判据决定 ⇒ 「靠路径/文本形状猜」不许发生。
-  // 非 0 的含义：出现了新形状（语义判据认不出）⇒ 要么补判据（带夹具），要么登记该改；
-  // **不许**放着兜底当答案（那正好把 MED① 的病重新养回来）。
-  assert.equal(stats.fallbackCount, 0,
-    `差异分类里有 ${stats.fallbackCount} 条走了**形状兜底**（语义判据决定不了）⇒ 必须显式处理：`
-    + `\n${stats.fallbackHits.join('\n')}`);
-  // 各类的**现值**（每一步落地后这里必须跟着变，变的时候就是「可以切了」的信号）
+  // 【设计改判 711b·降级】旧 `assert.deepEqual(unexplained, [])` 改为**诊断打印**：让形状启发式
+  // 决定「这条差异算不算良性」在语法上不可穷尽（H1 普通对象自 push / H2 间接下标 / M1 错作用域
+  // `base` 各打穿过一轮）⇒ 通过判定现在只看 `#587-S3-⑥`/`#587-S3-⑦` 的坐标集合 deepEqual。
+  if (unexplained.length > 0) {
+    console.log(`# S1-⑧-DIAG 未归类 ${unexplained.length} 条（诊断，不判红）：`
+      + `\n${unexplained.map((u) => u.replace(/\s+/g, ' ').slice(0, 200)).join('\n')}`);
+  }
+  // 【设计改判 711b·降级】旧 `assert.equal(stats.fallbackCount, 0)`（MED①「兜底必须为 0」）改为
+  // **诊断打印**：兜底出现 = 提议层认不出这一形，值得看，但它不再决定红绿；「判不出不许静默」
+  // 现在由 `#587-S3-⑦` 的集合钉住保证（认不出 ⇒ 差异多一条 ⇒ 那格红）。
+  if (stats.fallbackCount > 0) {
+    console.log(`# S1-⑧-DIAG 走了形状兜底 ${stats.fallbackCount} 条（诊断，不判红）：`
+      + `\n${stats.fallbackHits.map((u) => u.replace(/\s+/g, ' ').slice(0, 200)).join('\n')}`);
+  }
+  // 各类的**现值**（【711b 起只是诊断分布】第 4 步「各类清零了没」的读数来源）
   // ⚙ 第 3 步登记注入站点后从 `{host-source:1, injection:4, mention-only:9}`（共 14）改成
   //   `{host-source:1, mention-only:9}`（共 10）：那 4 条 injection（`provisioner.js:224`/`:277`/
   //   `:410×2`）现在坐在了**索引里**（`registerInjectionSites` 由语法区间推导坐标，`hasSite` 认）
@@ -4011,11 +4026,12 @@ test('#587-S1-⑧ 影子对照真树：影子尺只会更严，多杀的必须�
   //   剩 10 条分三类：`host-source:1` 是 `config.js:406` 的 helper 间接读（故意不进 `hasSite`，
   //   第 4 步要处理）；`readback:1` 是 `provisioner.js:362` 的默认参数位（`readContainerEnv` 的默认
   //   key，第 3 步从 mention-only 里拆出单独归类，见 `#587-S3-③`；M-2 拆规则 ⇒ 它退回 mention-only
-  //   且这里变红）；`mention-only:8` 是超时四项的数据表声明行 ×2。
+  //   只反映在下面那行 DIAG 打印里（711b 起不再判红，分类不再是闸门））；`mention-only:8` 是超时四项的数据表声明行 ×2。
   const want = { 'host-source': 1, readback: 1, 'mention-only': TIMEOUT_KEYS.length * 2 };
-  assert.deepEqual(counts, want,
-    `影子差异的分布变了（现在 ${JSON.stringify(counts)}）⇒ 有人动了例外清单/产品代码，或索引判定漂了`
-    + '：按 SHADOW-DIFF 逐条定性，然后把这里的期望值改成新现实（并更新工单报告），不许反着改登记');
+  // 【设计改判 711b·降级】旧 `assert.deepEqual(counts, want)` 改为**诊断打印**：分布漂了不再
+  // 判红（漂没漂由 S3-⑥/S3-⑦ 的坐标集合说话），但分布本身仍必须打出来，不许静默漂过去。
+  console.log(`# S1-⑧-DIAG 分类分布 ${JSON.stringify(counts)} vs 旧期望 ${JSON.stringify(want)}`
+    + '（分布不再判红；集合级断言见 S3-⑥/S3-⑦）');
   // 差异还在 ⇒ 现在**不能**切闸门（第 4 步的前提是这些类清零）
   assert.ok(onlyShadow.length > 0,
     '影子尺与旧尺读数已经一致 ⇒ 各分类差异都清了，可以走第 4 步切换（把这格换成「两边必须完全相等」）');
@@ -4082,19 +4098,22 @@ test('#587-S3-② 注入站点不是读站点：账本分开（hasSite 认、rea
   }
 });
 
-test('#587-S3-③ readback 归类：读回 helper 的默认参数位归 readback（不再混进 mention-only）', () => {
+test('#587-S3-③ readback 归类**只是提议**：真树那格改由 S3-⑦ 钉住，负向不许吞掉真读仍断言', () => {
   const rel = 'portal/src/provisioner.js';
   // 坐标也由代码推：从函数清单拿 `readContainerEnv` 的声明行（不手抄 362）
   const fn = functionInventory(REPO_ROOT, rel).find((x) => x.name === 'readContainerEnv');
   assert.ok(fn, '`readContainerEnv` 不在函数清单里 ⇒ 读回 helper 搬走了，这条判据要跟着搬家');
+  // 【设计改判 711b·降级】旧的四条**正归类** assert（kind === 'readback' / via === 'semantic' /
+  // why 匹配两条）改为**诊断打印**：这条坐标算不算良性不再由分类决定，而由 `#587-S3-⑦` 钉住的
+  // 差异集合决定（它必须在名单里且名单不许漂）。M-2 变异（去掉 readback 规则）现在只改变下面
+  // 这行诊断、不再判红 —— 分类不当闸门就是改判的直接后果（旧 M-2 的牙由集合钉住接替）。
   const cls = shadowGapSemantic('ERIX_STATION_TOKEN', `${rel}:${fn.declLine}`);
-  assert.equal(cls.kind, 'readback',
-    `默认参数位应归 readback（实际 ${cls.kind}，via=${cls.via}：${cls.why}）`);
-  assert.equal(cls.via, 'semantic', 'readback 必须出自语义判据，不许是形状兜底认的');
-  assert.match(cls.why, /默认参数位/);
-  assert.match(cls.why, /读回/);
-  // M-2 变异点：去掉规则②½ ⇒ 它退回旧归类 `mention-only`，这格与 `#587-S1-⑧` 分布一起红
-  assert.notEqual(cls.kind, 'mention-only', ':362 仍被当作 mention-only ⇒ readback 归类没生效');
+  console.log(`# S3-③-DIAG ${rel}:${fn.declLine} 看起来是 ${cls.kind}（${cls.via}）：`
+    + `${cls.why.replace(/\s+/g, ' ').slice(0, 200)}`);
+  const pinnedGap = projectPinned(loadSiteExpectations().gaps)
+    .some((g) => g.key === 'ERIX_STATION_TOKEN' && g.rel === rel && g.line === fn.declLine);
+  assert.ok(pinnedGap,
+    `:362 不在钉住的差异名单里 ⇒ 这条坐标被登记/分类洗白了（它应当仍是差异）：${rel}:${fn.declLine}`);
   // 反向自证（夹具，不改盘上树）：默认参数位但函数体不读该参数 ⇒ 不许认 readback（宁窄勿宽）；
   // 函数体把 key 拼前缀后 startsWith 比较（真形态，同 provisioner.js:362）⇒ 必认 readback；
   // H2 反例（audit 原样）：函数体用 `env[key]` 动态下标读同一参数 ⇒ 真读站点，不许判 readback。
@@ -4120,9 +4139,11 @@ test('#587-S3-③ readback 归类：读回 helper 的默认参数位归 readback
     assert.notEqual(miss.kind, 'readback',
       `函数体没读那个参数也被认成 readback ⇒ 判据过宽（实际：${miss.why}）`);
     const hit = shadowGapSemantic('ERIX_RB_HIT', 'lib/rb.js:2', { root: dir, index: idx });
-    assert.equal(hit.kind, 'readback',
-      '真读回形（key 拼前缀 + startsWith 比较，同 provisioner.js:362）应归 readback'
-      + `（实际 ${hit.kind}：${hit.why}）`);
+    // 【711b·降级】旧 `assert.equal(hit.kind, 'readback')`（正归类）改为诊断：真读回形认不认得
+    // 都不放行任何东西 —— 认不出 ⇒ 差异多一条 ⇒ S3-⑦ 红；认得出只是诊断好看一点。
+    console.log(`# S3-③-DIAG 真读回形 lib/rb.js:2 ⇒ ${hit.kind}：`
+      + `${hit.why.replace(/\s+/g, ' ').slice(0, 160)}`);
+    // 下面两条是**负向**断言（fail-closed：不许把真读吞成良性类）⇒ 保留，它们只会误红不会假绿。
     // H2 反例：默认参数位 + 函数体 env[key] 动态下标读 ⇒ 真读站点；不许被 readback 吃掉。
     // 允许落点：未归类（差异），或 mention-only 且能指着扫描器里的真读站点（动态读已在索引里，
     // 分类必须点名它）——两者都不把真读包装成「已知合法的读回」。
@@ -4135,7 +4156,8 @@ test('#587-S3-③ readback 归类：读回 helper 的默认参数位归 readback
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('#587-S3-④ 反向牙：拿「没做过注入登记」的同树索引跑 ⇒ 那 4 条必须重新红且仍归 injection', () => {
+test('#587-S3-④ 反向牙：拿「没做过注入登记」的同树索引跑 ⇒ 那 4 条必须重新红（归类只是诊断）',
+  () => {
   // 同树重建一个**不登记**的索引（= M-1 变异「去掉登记」的等价形态，不用改盘上文件）
   const bare = buildEnvSiteIndex(REPO_ROOT);
   const KEYS = ['ERIX_STATION_TOKEN', 'ERIX_FDE_NAME',
@@ -4151,9 +4173,11 @@ test('#587-S3-④ 反向牙：拿「没做过注入登记」的同树索引跑 �
       assert.match(why, new RegExp(`不是 ${key} 的读站点`),
         `去掉登记后 ${key}@${s.rel}:${s.line} 没重新红 ⇒ 这格没牙`);
       reds += 1;
-      // 归类仍是 injection：分类器靠语法区间，不靠索引里有没有这条 ⇒ 登记只是「洗绿」不是「改口」
+      // 【711b·降级】旧 `assert.equal(cls.kind, 'injection')`（正归类）改为诊断打印：这格的牙是
+      // 上面那条「拿不登记的索引跑必须重新红」（结构事实），分类只用来解释那条红是什么来路。
       const cls = shadowGapSemantic(key, `${s.rel}:${s.line}`);
-      assert.equal(cls.kind, 'injection', `去掉登记后 ${key}@${s.rel}:${s.line} 应重新归 injection`);
+      console.log(`# S3-④-DIAG 去掉登记后 ${key}@${s.rel}:${s.line} 看起来是 ${cls.kind}：`
+        + `${cls.why.replace(/\s+/g, ' ').slice(0, 160)}`);
     }
   }
   assert.equal(reds, 4, `预期重新红 4 条，实际 ${reds} ⇒ 注入坐标的数量变了，核对 S3-INJECT 读数`);
