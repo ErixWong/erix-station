@@ -3673,7 +3673,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**已迁的旋钮（八格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
+**已迁的旋钮（十二格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
 
 | key | env 兜底位 | 值域 | `applyMode` | 生效点 |
 | --- | --- | --- | --- | --- |
@@ -3685,8 +3685,12 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 | `loop.onboarding_idle_backoff_ms` | `ONBOARDING_IDLE_BACKOFF_MAX_MS` | 整数 `1..60000` 毫秒（默认 `30000`；**`0` 非法**：每拍空转） | `hot` | onboarding 循环**每一拍**在决定 sleep 之前现读 |
 | `loop.offboarding_idle_backoff_ms` | `OFFBOARDING_IDLE_BACKOFF_MAX_MS` | 整数 `1..60000` 毫秒（默认 `30000`；**`0` 非法**） | `hot` | offboarding 循环**每一拍**在决定 sleep 之前现读 |
 | `loop.provisioner_idle_backoff_ms` | `PROVISIONER_IDLE_BACKOFF_MAX_MS` | 整数 `1..15000` 毫秒（默认 `15000`；上界 15000 是本循环的**业务上限**，不是 `60000`） | `hot` | provisioner 对账循环**每一拍**在决定 sleep 之前现读 |
+| `auth.pending_token_ttl_seconds` | `PENDING_TOKEN_TTL_SECONDS` | 整数 `1..3600` 秒（默认 `120`；**`0` 非法**：签发即过期的待决令牌） | `hot` | 登录第二步签发待决令牌 / 邮箱码重发时现读（`http.js` 的 `expires_in` 与落库 `ttlSeconds` 同一请求共用一次） |
+| `auth.session_renew_interval_seconds` | `SESSION_RENEW_INTERVAL_SECONDS` | 整数 `1..86400` 秒（默认 `3600`；>1 天滚动续期名存实亡） | `hot` | `/api/me` 续期时现读（算 `renewIntervalMs`） |
+| `auth.max_password_length` | `MAX_PASSWORD_LENGTH` | 整数 `1..4096` 字符（默认 `256`；下界 1 = 代码只校非空+≤上限、无最小长度常量；上界护 scrypt 代价） | `hot` | 登录 / 建用户 / 改密时现读（喂 `admin.validatePassword`） |
+| `auth.max_login_length` | `MAX_LOGIN_LENGTH` | 整数 `1..512` 字符（默认 `128`；login 进限流键/主机名种子 ⇒ 封顶防哈希内存面） | `hot` | 登录 / 建用户时现读（喂 `admin.validateLogin`） |
 
-八格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+十二格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
 
 后三格（#677 P3 第六批：三个循环的空闲退避上限）也是同一套机件，但是**三份独立实例**（各自一份
 缓存与在飞槽）：共用一份就是「保存开户那格的上限，把对账那一格的缓存一起抹掉」。现读位置是
