@@ -623,8 +623,10 @@ export async function applyRuntimeOverrides(config, opts = {}) {
     const path = entry?.configPath;
     if (!path) continue;
     let value;
+    let fromDb = false;
     if (Object.prototype.hasOwnProperty.call(values, key)) {
       value = values[key];
+      fromDb = true;
       tierByKey.set(key, 'db');
     } else {
       // env 那一档 = `resolveEnvTier`（值来自 `env[envVar]` 原话或 `config[path]`，**且过了 registry
@@ -637,6 +639,13 @@ export async function applyRuntimeOverrides(config, opts = {}) {
     }
     if (value === undefined) continue; // 三档都给不出值 ⇒ 这一格不动，别发明 undefined
     setPath(next, path, value);
+    // #709 MED①：把「这一格的值此刻来自哪一档」也标到新 config 上（`<path>Source`，与 `config.js`
+    // 里 `sessionTtlSecondsSource` 那套先例同形）。DB 那一档必须标成 `db`——否则 `effectiveConfig`
+    // 带着旧库值、却没有「它来自 DB」的标注，热读器在运行期 DB 读失败回落到它时，`configTierSource`
+    // 只能凭值猜（env 变量在 ⇒ 谎报 `env`）。env/default 两支不盖标注：它们的 boot 值本就来自 env/默认
+    // （热读回落时 `resolveEnvTier` 的 rawGiven 分支 / `configTierSource` 的默认收窄会各自报对），
+    // 且读失败整档时若盖标注会破坏「覆盖层内容与 config 相同」这条既有口径（RS-1）。
+    if (fromDb) next[`${path}Source`] = 'db';
   }
   // 「哪几格走了哪一档」要说得出口（口径 2：回落必须说清用的是哪个值）。`problems` 是回落的
   // 具体理由（表不存在 / 挂住 / 值非法），与档位一起进同一条 debug，排查时一条就够用。
@@ -1109,7 +1118,12 @@ function gateRegistryValue(entry, candidate) {
 function configTierSource(entry, config) {
   const flagPath = `${entry?.configPath ?? ''}Source`;
   if (config && Object.hasOwn(config, flagPath)) {
-    return config[flagPath] === 'env' ? 'env' : 'default';
+    // #709 MED①：标注可以是三档 `env | default | db`。`applyRuntimeOverrides` 会把「启动时从
+    // DB 覆盖进来的那一格」标成 `db`。旧口径把非 `env` 一律塌成 `default` ⇒「DB 读失败、手里
+    // 只有启动时的 DB 快照」被谎报成 default/env（运维去改 env，其实值来自旧库）。如实透传三档。
+    const annotated = config[flagPath];
+    if (annotated === 'env' || annotated === 'default' || annotated === 'db') return annotated;
+    return 'default';
   }
   const value = getPath(config, entry?.configPath);
   if (value === undefined) return 'default';
@@ -1313,11 +1327,17 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
   }
   // 回落：值来自 env 那一档（或 registry 默认），`reason` 说清为什么不是 db。
   // `row` 存在但值非法 ⇒ 保留库里那行的 updated_at/by（它们是真发生过的事），只是值不用它。
+  // #709 MED①：若 `envTier.source==='db'` 且读不到行 ⇒ 这一档用的是「启动时从 DB 覆盖进来的
+  // 快照」（此刻 DB 读失败 / 无行），`reason` 必须点明 `db_read_failed_using_boot_snapshot`，
+  // 而不是谎报 env/default（否则运维会去改一个根本不影响这个值的 env）。
+  const bootSnapshot = envTier?.source === 'db' && !row;
   return withHint({
     ...base,
     value: envTier?.value,
     source: envTier?.source ?? 'default',
-    reason: row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row'),
+    reason: bootSnapshot
+      ? 'db_read_failed_using_boot_snapshot'
+      : (row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row')),
   }, entry);
 }
 
@@ -1368,14 +1388,24 @@ export async function listRuntimeSettingsAdmin({
     log?.warn?.('[runtime-settings] 管理台读没有可用的 pool ⇒ 各项回落 env/默认并如实标 source');
   }
   return {
-    items: entries.map((entry) => toSettingItem(
-      entry,
-      rowByKey.get(entry.key),
-      // env 那一档也要过 registry 的闸（#701 返修 LOW③）：坏 env 值 ⇒ 报 `default` + 点名 warn，
-      // 不许报一个「界面显示 env 的 30、实际却不会用这个数」的假来源。
-      resolveEnvTier(entry, config, { env, log }),
-      fallbackReason,
-    )),
+    items: entries.map((entry) => {
+      const item = toSettingItem(
+        entry,
+        rowByKey.get(entry.key),
+        // env 那一档也要过 registry 的闸（#701 返修 LOW③）：坏 env 值 ⇒ 报 `default` + 点名 warn，
+        // 不许报一个「界面显示 env 的 30、实际却不会用这个数」的假来源。
+        resolveEnvTier(entry, config, { env, log }),
+        fallbackReason,
+      );
+      // #709 MED①：报 `db` + `db_read_failed_using_boot_snapshot` 的那一档，必须在 warn 里说清
+      // 「DB 读失败，暂用启动时快照」——运维看到 source=db 会去找库，而不是去改 env。
+      if (item.source === 'db' && item.reason === 'db_read_failed_using_boot_snapshot') {
+        log?.warn?.(`[runtime-settings] ${item.key} 读不到 DB 行（${fallbackReason}）`
+          + ` ⇒ 暂用启动时的 DB 快照 ${JSON.stringify(item.value)}，source 如实报 db`
+          + '（不是 env；DB 恢复前改 env 不影响这个值）');
+      }
+      return item;
+    }),
   };
 }
 
