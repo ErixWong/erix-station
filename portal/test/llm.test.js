@@ -2875,3 +2875,104 @@ test('#719 setFdeLlmConfig 重存已有 key：updateKey 一并带 DB 额度（�
   assert.equal(u2.body.max_budget, null);
   assert.equal(u2.body.budget_duration, null);
 });
+
+// ---------------------------------------------------------------------------
+// issue #719 M2：HTTP 层三条新路由（PUT/GET quota、GET usage）+ 鉴权。
+// ---------------------------------------------------------------------------
+
+function quotaSeed() {
+  return {
+    bindings: [{
+      fde_id: FDE_USER.id, gateway: 'litellm', state: 'active', generation: 1,
+      provider_id: 'p1', api_key: 'sk-http-live-key', key_id: 'key-1', key_alias: 'fde-alice',
+      gateway_user_id: 'gu-alice', main_model_id: 'deepseek-flash', main_model_name: 'DeepSeek Flash',
+      daily_budget_usd: null,
+    }],
+  };
+}
+
+test('#719 HTTP PUT quota → 200 {quota}，updateKey 带额度；GET 回显同形状且不含明文 key', async () => {
+  const { base, pool, admin, close } = await startAdminServer(quotaSeed());
+  try {
+    const H = { cookie: admin.cookie, 'content-type': 'application/json' };
+    pool.llm.keyInfoExtra = { max_budget: 12, budget_duration: '1d', budget_reset_at: '2026-11-24T00:00:00Z', spend: 4 };
+    let res = await fetch(`${base}/api/admin/fdes/alice/llm/quota`, { method: 'PUT', headers: H, body: JSON.stringify({ daily_budget_usd: 12 }) });
+    assert.equal(res.status, 200);
+    const put = await res.json();
+    assert.deepEqual(Object.keys(put.quota).sort(),
+      ['budget_duration', 'budget_reset_at', 'daily_budget_usd', 'max_budget', 'remaining', 'spend']);
+    assert.equal(put.quota.daily_budget_usd, 12);
+    assert.equal(put.quota.remaining, 8);
+    const upd = pool.llm.gatewayCalls.find((c) => c.method === 'updateKey');
+    assert.equal(upd.body.max_budget, 12);
+    assert.equal(upd.body.budget_duration, '1d');
+    assert.ok(!JSON.stringify(put).includes('sk-http-live-key'), '响应不含明文 api_key');
+
+    // GET 同形状
+    res = await fetch(`${base}/api/admin/fdes/alice/llm/quota`, { headers: { cookie: admin.cookie } });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).quota.daily_budget_usd, 12);
+
+    // null 清空
+    res = await fetch(`${base}/api/admin/fdes/alice/llm/quota`, { method: 'PUT', headers: H, body: JSON.stringify({ daily_budget_usd: null }) });
+    assert.equal(res.status, 200);
+    assert.equal(pool.llm.bindings[0].daily_budget_usd, null, 'DB 清空');
+  } finally { await close(); }
+});
+
+test('#719 HTTP PUT quota 非法值 → 400 validation_failed（field=daily_budget_usd）且不调网关', async () => {
+  const { base, pool, admin, close } = await startAdminServer(quotaSeed());
+  try {
+    const H = { cookie: admin.cookie, 'content-type': 'application/json' };
+    for (const bad of [0, -3, 200000]) {
+      const res = await fetch(`${base}/api/admin/fdes/alice/llm/quota`, { method: 'PUT', headers: H, body: JSON.stringify({ daily_budget_usd: bad }) });
+      assert.equal(res.status, 400);
+      const err = await res.json();
+      assert.equal(err.error.code, 'validation_failed');
+      assert.equal(err.error.details.field, 'daily_budget_usd');
+    }
+    assert.equal(pool.llm.gatewayCalls.filter((c) => c.method === 'updateKey').length, 0, '非法值不调网关');
+  } finally { await close(); }
+});
+
+test('#719 HTTP GET usage → 200 {days,totals}；days 非法→ 400', async () => {
+  const ctx = await startAdminServer(quotaSeed());
+  try {
+    ctx.pool.llm.dailyActivityResult = {
+      results: [
+        { date: '2026-11-22', metrics: { spend: 2, prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, api_requests: 3 } },
+        { date: '2026-11-23', metrics: { spend: 1.5, prompt_tokens: 200, completion_tokens: 100, total_tokens: 300, api_requests: 5 } },
+      ],
+    };
+    let res = await fetch(`${ctx.base}/api/admin/fdes/alice/llm/usage`, { headers: { cookie: ctx.admin.cookie } });
+    assert.equal(res.status, 200);
+    const usage = await res.json();
+    assert.deepEqual(usage.days.map((d) => d.date), ['2026-11-22', '2026-11-23']);
+    assert.deepEqual(usage.totals, { spend: 3.5, total_tokens: 450 });
+    const q = ctx.pool.llm.userDailyActivityCalls[0];
+    assert.equal(q.timezone, 480);
+    assert.equal(q.user_id, 'gu-alice');
+
+    for (const bad of ['abc', '0', '91', '1.5']) {
+      res = await fetch(`${ctx.base}/api/admin/fdes/alice/llm/usage?days=${bad}`, { headers: { cookie: ctx.admin.cookie } });
+      assert.equal(res.status, 400, `days=${bad} 应 400`);
+      assert.equal((await res.json()).error.details.field, 'days');
+    }
+  } finally { await ctx.close(); }
+});
+
+test('#719 HTTP quota/usage：fde role → 403（requireAdmin）', async () => {
+  const { base, pool, admin, close } = await startAdminServer(quotaSeed());
+  try {
+    pool.sessions.push({
+      id: 'ls-fde-q', user_id: FDE_USER.id, token_hash: auth.hashToken('tok-fde-q'),
+      created_at: new Date(), expires_at: new Date(Date.now() + 86_400_000), last_seen_at: new Date(), revoked_at: null,
+    });
+    const cookieName = admin.cookie.split('=')[0];
+    for (const p of ['/api/admin/fdes/alice/llm/quota', '/api/admin/fdes/alice/llm/usage']) {
+      const res = await fetch(`${base}${p}`, { headers: { cookie: `${cookieName}=tok-fde-q` } });
+      assert.equal(res.status, 403, `${p} 非 admin 应 403`);
+      assert.equal((await res.json()).error.code, 'forbidden');
+    }
+  } finally { await close(); }
+});
