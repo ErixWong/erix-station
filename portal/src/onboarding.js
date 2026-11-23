@@ -3,7 +3,8 @@ import { enqueueMaterializeChange } from './outbox.js';
 import { runMaterializerOnce } from './materializer.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
 import { LlmError, LlmGatewayError, setFdeLlmConfig } from './llm.js';
-import { attachLoopWatch, envInt, idleDelayMs, MAX_BACKOFF_MS_SAFE, sleepCancellable } from './loop-timing.js';
+import { attachLoopWatch, idleDelayMs, sleepCancellable } from './loop-timing.js';
+import { readOnboardingIdleBackoffMaxMs } from './runtime-settings.js';
 
 const STEPS = ['provision', 'materialize', 'llm-binding'];
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
@@ -332,7 +333,13 @@ function sleep(ms) {
  * 与 #506 的 `startRoutesLoop` 同形（`stop` / `done` / `settled` / `failure`）：改前只有
  * `stop()`，`stopLoopsAndWait` 对它只能记账跳过 ⇒ 优雅关闭既等不到它收尾、也等不到它从退避睡眠里
  * 醒来（最多白等一个节拍）。现在 `stop()` 会 abort 掉正在睡的那一拍，`done` 立刻落定。
- * 注入缝（`sleep` / 退避上限）照 #506：生产不传 ⇒ 真 `setTimeout` 与 env 默认值。
+ * 注入缝（`sleep` / 退避上限）照 #506：生产不传 ⇒ 真 `setTimeout`。
+ *
+ * issue #677 P3 第六批：`ONBOARDING_IDLE_BACKOFF_MAX_MS` 从**启动快照**改成**每一拍现读**。
+ *   * 现读位置：**决定这一拍睡多久之前**（不是循环启动时算一次）⇒ 管理台改完，最坏下一拍就用新值。
+ *   * 不是「每拍一条 SQL」：`readOnboardingIdleBackoffMaxMs` 自带 5s 缓存 + 同池在飞合并。
+ *   * 读侧永不抛 ⇒ 配置面坏了循环照转（回落 env / 默认 30000）。
+ *   * `idleBackoffMaxMs` 仍是显式覆盖口（#520 的既有用法）：给了就**不再现读**，便于单测钉死退避。
  */
 export function startOnboardingLoop(pool, config, {
   docker,
@@ -340,7 +347,9 @@ export function startOnboardingLoop(pool, config, {
   onPause,
   sleep = sleepCancellable,
   env = process.env, // 单测注入旋钮用；生产不传 ⇒ process.env
-  idleBackoffMaxMs = envInt('ONBOARDING_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log, env }),
+  now = () => Date.now(), // 注入缝：热读的 5s 缓存要能在假时钟下推得动
+  idleBackoffMaxMs = null, // 显式覆盖 ⇒ 不现读；不传就是下面的热读入口
+  readIdleBackoffMaxMs = readOnboardingIdleBackoffMaxMs, // 注入缝：钉「下一拍用新值」不靠真库
 } = {}) {
   if (!docker) docker = createDockerClient({ dockerHost: config.dockerHost });
   let consecutiveFailures = 0;
@@ -358,7 +367,11 @@ export function startOnboardingLoop(pool, config, {
         const { claimed = false } = (await runOnboardingOnce(pool, config, { docker, log })) ?? {};
         consecutiveFailures = 0;
         idleTicks = claimed ? 0 : idleTicks + 1;
-        if (!(await sleep(idleDelayMs(idleTicks, { baseMs: LOOP_INTERVAL_MS, maxMs: idleBackoffMaxMs }), abort.signal))) break;
+        // #677 P3：这一拍的上限是**现读**的（5s 缓存 + 在飞合并，不是一条 SQL/拍）。
+        // 放在算 delay 之前、而不是循环开头：启动时算一次就是快照，改 env/DB 要重启才生效。
+        const maxMs = idleBackoffMaxMs
+          ?? await readIdleBackoffMaxMs({ pool, config, now, log, env });
+        if (!(await sleep(idleDelayMs(idleTicks, { baseMs: LOOP_INTERVAL_MS, maxMs }), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[onboarding] loop error: ${err.message}`);
