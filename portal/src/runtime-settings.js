@@ -603,6 +603,156 @@ export function validateProvisionerIdleBackoffMs(value) {
   });
 }
 
+// ---- #677 Tier 2A：4 个「无状态、每请求读」的认证旋钮 ----
+// 默认值与 `config.js` 顶层那四个 `intEnv` 字段同源（判据 RS-50 钉住相等）；值域按代码语义取，
+// 理由写在各自 hint / validate 消息里。config.js 返回对象是扁平的（没有 `auth` 这一层）⇒
+// 下面 registry 的 configPath 用 `auth.*` 这种 config 永不提供的名字（口径同 P3 的 `loop.*`）：
+// 顶层那几个字段是 `intEnv` 揉过默认值的副本，若 configPath 指顶层会把「env 没给」误报成
+// `source=config`（#485 那格坑），所以 config 档留空 ⇒ 真相只走 env 原话 + registry 默认。
+export const PENDING_TOKEN_TTL_SECONDS_KEY = 'auth.pending_token_ttl_seconds';
+export const PENDING_TOKEN_TTL_SECONDS_MIN = 1; // 0 = 签发即过期的待决令牌，是坑，不进闸
+export const PENDING_TOKEN_TTL_SECONDS_MAX = 3600; // 1 小时：一步待决令牌是短期单次消费凭证
+export const PENDING_TOKEN_TTL_SECONDS_DEFAULT = 120; // 与 config.js pendingTokenTtlSeconds 同源
+export const PENDING_TOKEN_TTL_SECONDS_HINT = '两步登录待决令牌从签出到过期的秒数；1..3600（默认 120）';
+
+export const SESSION_RENEW_INTERVAL_SECONDS_KEY = 'auth.session_renew_interval_seconds';
+export const SESSION_RENEW_INTERVAL_SECONDS_MIN = 1;
+export const SESSION_RENEW_INTERVAL_SECONDS_MAX = 86_400; // 1 天：>1 天滚动续期名存实亡
+export const SESSION_RENEW_INTERVAL_SECONDS_DEFAULT = 3_600; // 60*60，与 config.js 同源
+export const SESSION_RENEW_INTERVAL_SECONDS_HINT =
+  '距上次续期超过该秒数才写库并重发 cookie；1..86400（默认 3600）';
+
+export const MAX_PASSWORD_LENGTH_KEY = 'auth.max_password_length';
+// 下界 1：口令策略只校验「非空 + ≤上限」、无最小长度常量（`admin.js` 顶部注释明说）；
+// 上界 4096：口令喂 scrypt，KDF 代价随输入涨，封顶护内存/CPU（默认 256 远在界内）。
+export const MAX_PASSWORD_LENGTH_MIN = 1;
+export const MAX_PASSWORD_LENGTH_MAX = 4096;
+export const MAX_PASSWORD_LENGTH_DEFAULT = 256; // 与 config.js maxPasswordLength 同源
+export const MAX_PASSWORD_LENGTH_HINT = '口令长度上限（字符）；1..4096（默认 256）';
+
+export const MAX_LOGIN_LENGTH_KEY = 'auth.max_login_length';
+// 上界 512：login 会进限流键、主机名种子与标识列，无上界长度就是哈希/内存面（默认 128 远在界内）。
+export const MAX_LOGIN_LENGTH_MIN = 1;
+export const MAX_LOGIN_LENGTH_MAX = 512;
+export const MAX_LOGIN_LENGTH_DEFAULT = 128; // 与 config.js maxLoginLength 同源
+export const MAX_LOGIN_LENGTH_HINT = '登录名长度上限（字符）；1..512（默认 128）';
+
+/**
+ * 四格共用的形状闸（口径与 `parseIdleBackoffMs` 逐字同形）：只认 safe integer 的 JSON number，
+ * 或**纯十进制数字串**（`'1e4'` / `' 30 '` / `'-1'` / `'1.5'` 一律拒），再把 `min..max` 兑一遍。
+ * 非法输入一律 `{ ok:false, reason }`，绝不抛、绝不 `Number()` 了事。
+ */
+function parsePositiveInt(raw, { min, max, notReason, rangeReason }) {
+  let text;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw)) return { ok: false, reason: notReason };
+    text = String(raw);
+  } else if (typeof raw === 'string') {
+    text = raw;
+  } else {
+    return { ok: false, reason: notReason };
+  }
+  if (!/^[0-9]+$/.test(text)) return { ok: false, reason: notReason };
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) return { ok: false, reason: notReason };
+  if (value < min || value > max) return { ok: false, reason: rangeReason };
+  return { ok: true, value };
+}
+
+/** 四格共用的写侧闸：区间内 ⇒ `true`，否则一句点名上下界来历的中文原因。 */
+function validatePositiveInt(value, { min, max, unit, minWhy, maxWhy }) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    return `必须是 ${min}–${max} 的整数${unit}（不接受字符串、小数、布尔）`;
+  }
+  if (value < min) return `不能是 ${value}（至少 ${min}${unit}；${minWhy}）`;
+  if (value > max) return `必须在 ${min}–${max}${unit}之间（${maxWhy}）`;
+  return true;
+}
+
+/** 待决令牌 TTL 的形状闸（reason 点名本格：日志里不许出现别的旋钮的名字）。 */
+export function parsePendingTokenTtlSeconds(raw) {
+  return parsePositiveInt(raw, {
+    min: PENDING_TOKEN_TTL_SECONDS_MIN,
+    max: PENDING_TOKEN_TTL_SECONDS_MAX,
+    notReason: 'not_a_pending_token_ttl_seconds',
+    rangeReason: 'pending_token_ttl_out_of_range',
+  });
+}
+
+/** 待决令牌 TTL 的取值闸。 */
+export function validatePendingTokenTtlSeconds(value) {
+  return validatePositiveInt(value, {
+    min: PENDING_TOKEN_TTL_SECONDS_MIN,
+    max: PENDING_TOKEN_TTL_SECONDS_MAX,
+    unit: '秒',
+    minWhy: '待决令牌至少 1 秒，0 秒 = 签发即过期',
+    maxWhy: '一步待决令牌是短期单次消费凭证，超过 1 小时就不是「短期」了',
+  });
+}
+
+/** 滚动续期间隔的形状闸。 */
+export function parseSessionRenewIntervalSeconds(raw) {
+  return parsePositiveInt(raw, {
+    min: SESSION_RENEW_INTERVAL_SECONDS_MIN,
+    max: SESSION_RENEW_INTERVAL_SECONDS_MAX,
+    notReason: 'not_a_session_renew_interval_seconds',
+    rangeReason: 'session_renew_interval_out_of_range',
+  });
+}
+
+/** 滚动续期间隔的取值闸。 */
+export function validateSessionRenewIntervalSeconds(value) {
+  return validatePositiveInt(value, {
+    min: SESSION_RENEW_INTERVAL_SECONDS_MIN,
+    max: SESSION_RENEW_INTERVAL_SECONDS_MAX,
+    unit: '秒',
+    minWhy: '续期间隔至少 1 秒，0 秒 = 每个 `/api/me` 都写库',
+    maxWhy: '超过 1 天就不再是「滚动」续期，该退回重新登录而不是把间隔拉到天级',
+  });
+}
+
+/** 口令长度上限的形状闸。 */
+export function parseMaxPasswordLength(raw) {
+  return parsePositiveInt(raw, {
+    min: MAX_PASSWORD_LENGTH_MIN,
+    max: MAX_PASSWORD_LENGTH_MAX,
+    notReason: 'not_a_max_password_length',
+    rangeReason: 'max_password_length_out_of_range',
+  });
+}
+
+/** 口令长度上限的取值闸：下界来历是「代码没有最小长度常量」，上界来历是 scrypt 代价。 */
+export function validateMaxPasswordLength(value) {
+  return validatePositiveInt(value, {
+    min: MAX_PASSWORD_LENGTH_MIN,
+    max: MAX_PASSWORD_LENGTH_MAX,
+    unit: '字符',
+    minWhy: '口令至少 1 字符；再小会让所有既有口令非法',
+    maxWhy: '口令要喂 scrypt，代价随输入涨，4096 是护 KDF 内存/CPU 的封顶',
+  });
+}
+
+/** 登录名长度上限的形状闸。 */
+export function parseMaxLoginLength(raw) {
+  return parsePositiveInt(raw, {
+    min: MAX_LOGIN_LENGTH_MIN,
+    max: MAX_LOGIN_LENGTH_MAX,
+    notReason: 'not_a_max_login_length',
+    rangeReason: 'max_login_length_out_of_range',
+  });
+}
+
+/** 登录名长度上限的取值闸：上界来历是限流键/主机名种子的哈希内存面。 */
+export function validateMaxLoginLength(value) {
+  return validatePositiveInt(value, {
+    min: MAX_LOGIN_LENGTH_MIN,
+    max: MAX_LOGIN_LENGTH_MAX,
+    unit: '字符',
+    minWhy: '登录名至少 1 字符',
+    maxWhy: 'login 会进限流键与主机名种子，无上界长度是哈希/内存面',
+  });
+}
+
 export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
@@ -692,6 +842,51 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseProvisionerIdleBackoffMs,
     validate: validateProvisionerIdleBackoffMs,
     hint: PROVISIONER_IDLE_BACKOFF_MS_HINT,
+  }),
+  [PENDING_TOKEN_TTL_SECONDS_KEY]: Object.freeze({
+    key: PENDING_TOKEN_TTL_SECONDS_KEY,
+    label: '两步登录待决令牌有效期（秒）',
+    // config 返回对象扁平、没有 `auth` 这一档 ⇒ config 那档永远「没给」（口径同 P3 的 `loop.*`）。
+    configPath: 'auth.pendingTokenTtlSeconds',
+    envVar: 'PENDING_TOKEN_TTL_SECONDS',
+    defaultValue: PENDING_TOKEN_TTL_SECONDS_DEFAULT,
+    applyMode: 'hot',
+    parse: parsePendingTokenTtlSeconds,
+    validate: validatePendingTokenTtlSeconds,
+    hint: PENDING_TOKEN_TTL_SECONDS_HINT,
+  }),
+  [SESSION_RENEW_INTERVAL_SECONDS_KEY]: Object.freeze({
+    key: SESSION_RENEW_INTERVAL_SECONDS_KEY,
+    label: '会话滚动续期间隔（秒）',
+    configPath: 'auth.sessionRenewIntervalSeconds',
+    envVar: 'SESSION_RENEW_INTERVAL_SECONDS',
+    defaultValue: SESSION_RENEW_INTERVAL_SECONDS_DEFAULT,
+    applyMode: 'hot',
+    parse: parseSessionRenewIntervalSeconds,
+    validate: validateSessionRenewIntervalSeconds,
+    hint: SESSION_RENEW_INTERVAL_SECONDS_HINT,
+  }),
+  [MAX_PASSWORD_LENGTH_KEY]: Object.freeze({
+    key: MAX_PASSWORD_LENGTH_KEY,
+    label: '口令长度上限（字符）',
+    configPath: 'auth.maxPasswordLength',
+    envVar: 'MAX_PASSWORD_LENGTH',
+    defaultValue: MAX_PASSWORD_LENGTH_DEFAULT,
+    applyMode: 'hot',
+    parse: parseMaxPasswordLength,
+    validate: validateMaxPasswordLength,
+    hint: MAX_PASSWORD_LENGTH_HINT,
+  }),
+  [MAX_LOGIN_LENGTH_KEY]: Object.freeze({
+    key: MAX_LOGIN_LENGTH_KEY,
+    label: '登录名长度上限（字符）',
+    configPath: 'auth.maxLoginLength',
+    envVar: 'MAX_LOGIN_LENGTH',
+    defaultValue: MAX_LOGIN_LENGTH_DEFAULT,
+    applyMode: 'hot',
+    parse: parseMaxLoginLength,
+    validate: validateMaxLoginLength,
+    hint: MAX_LOGIN_LENGTH_HINT,
   }),
 });
 
@@ -1412,6 +1607,32 @@ const provisionerIdleBackoffHotReader = createHotReader({
   fallbackDefault: PROVISIONER_IDLE_BACKOFF_MS_DEFAULT,
 });
 
+// #677 Tier 2A：4 个认证旋钮 = **四份独立实例**（各自一份缓存 / 代际号 / 在飞槽），
+// 不共用（防串值，同 P3 三退避批的口径）。
+const pendingTokenTtlHotReader = createHotReader({
+  key: PENDING_TOKEN_TTL_SECONDS_KEY,
+  warnLabel: '两步登录待决令牌有效期',
+  fallbackDefault: PENDING_TOKEN_TTL_SECONDS_DEFAULT,
+});
+
+const sessionRenewIntervalHotReader = createHotReader({
+  key: SESSION_RENEW_INTERVAL_SECONDS_KEY,
+  warnLabel: '会话滚动续期间隔',
+  fallbackDefault: SESSION_RENEW_INTERVAL_SECONDS_DEFAULT,
+});
+
+const maxPasswordLengthHotReader = createHotReader({
+  key: MAX_PASSWORD_LENGTH_KEY,
+  warnLabel: '口令长度上限',
+  fallbackDefault: MAX_PASSWORD_LENGTH_DEFAULT,
+});
+
+const maxLoginLengthHotReader = createHotReader({
+  key: MAX_LOGIN_LENGTH_KEY,
+  warnLabel: '登录名长度上限',
+  fallbackDefault: MAX_LOGIN_LENGTH_DEFAULT,
+});
+
 /**
  * 丢弃 TTL 缓存（P2a 对外的名字；实现是上面那个工厂里每一格自己的 `invalidate`）。
  * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（RS-7 钉住身份），P3 抽工厂后也不能换成间接层。
@@ -1455,6 +1676,26 @@ export function invalidateProvisionerIdleBackoffCache() {
   provisionerIdleBackoffHotReader.invalidate();
 }
 
+/** 丢弃 `auth.pending_token_ttl_seconds` 的缓存与在飞槽（口径同上；登录第二步签发/重发时现读）。 */
+export function invalidatePendingTokenTtlCache() {
+  pendingTokenTtlHotReader.invalidate();
+}
+
+/** 丢弃 `auth.session_renew_interval_seconds` 的缓存与在飞槽（口径同上；`/api/me` 续期时现读）。 */
+export function invalidateSessionRenewIntervalCache() {
+  sessionRenewIntervalHotReader.invalidate();
+}
+
+/** 丢弃 `auth.max_password_length` 的缓存与在飞槽（口径同上；登录/建用户/改密时现读）。 */
+export function invalidateMaxPasswordLengthCache() {
+  maxPasswordLengthHotReader.invalidate();
+}
+
+/** 丢弃 `auth.max_login_length` 的缓存与在飞槽（口径同上；登录/建用户时现读）。 */
+export function invalidateMaxLoginLengthCache() {
+  maxLoginLengthHotReader.invalidate();
+}
+
 /**
  * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。一格一行；加新的热读旋钮就在这里多登记一行，
  * **不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
@@ -1470,6 +1711,10 @@ export const HOT_READ_INVALIDATORS = new Map([
   [ONBOARDING_IDLE_BACKOFF_MS_KEY, invalidateOnboardingIdleBackoffCache],
   [OFFBOARDING_IDLE_BACKOFF_MS_KEY, invalidateOffboardingIdleBackoffCache],
   [PROVISIONER_IDLE_BACKOFF_MS_KEY, invalidateProvisionerIdleBackoffCache],
+  [PENDING_TOKEN_TTL_SECONDS_KEY, invalidatePendingTokenTtlCache],
+  [SESSION_RENEW_INTERVAL_SECONDS_KEY, invalidateSessionRenewIntervalCache],
+  [MAX_PASSWORD_LENGTH_KEY, invalidateMaxPasswordLengthCache],
+  [MAX_LOGIN_LENGTH_KEY, invalidateMaxLoginLengthCache],
 ]);
 
 /**
@@ -1742,6 +1987,26 @@ export function readOffboardingIdleBackoffMaxMs(options = {}) {
  */
 export function readProvisionerIdleBackoffMaxMs(options = {}) {
   return provisionerIdleBackoffHotReader.read(options);
+}
+
+/** `auth.pending_token_ttl_seconds` 的热读入口（默认 120，自己一份缓存；登录第二步每次签发/重发现读）。 */
+export function readPendingTokenTtlSeconds(options = {}) {
+  return pendingTokenTtlHotReader.read(options);
+}
+
+/** `auth.session_renew_interval_seconds` 的热读入口（默认 3600，自己一份缓存；`/api/me` 续期时现读）。 */
+export function readSessionRenewIntervalSeconds(options = {}) {
+  return sessionRenewIntervalHotReader.read(options);
+}
+
+/** `auth.max_password_length` 的热读入口（默认 256，自己一份缓存；登录/建用户/改密时现读）。 */
+export function readMaxPasswordLength(options = {}) {
+  return maxPasswordLengthHotReader.read(options);
+}
+
+/** `auth.max_login_length` 的热读入口（默认 128，自己一份缓存；登录/建用户时现读）。 */
+export function readMaxLoginLength(options = {}) {
+  return maxLoginLengthHotReader.read(options);
 }
 
 // ---------------------------------------------------------------------------
