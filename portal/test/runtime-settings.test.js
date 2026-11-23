@@ -47,6 +47,9 @@ import {
   parseWorkspaceRetentionDays, validateWorkspaceRetentionDays,
   readWorkspaceRetentionDays, invalidateWorkspaceRetentionCache,
   listRuntimeSettingsAdmin, updateRuntimeSettingAdmin, WORKSPACE_RETENTION_HINT,
+  PREVIEW_TICKET_TTL_KEY, PREVIEW_TICKET_TTL_MIN_SECONDS, PREVIEW_TICKET_TTL_MAX_SECONDS,
+  PREVIEW_TICKET_TTL_DEFAULT_SECONDS, parsePreviewTicketTtlSeconds, validatePreviewTicketTtlSeconds,
+  readPreviewTicketTtlSeconds, invalidatePreviewTicketTtlCache,
 } from '../src/runtime-settings.js';
 import { loadConfig } from '../src/config.js';
 
@@ -2266,3 +2269,356 @@ test('RS-30 文档契约在场：§4.21 那一小节 + env 那一行 + 它点名
     'hint / env 行 / §4.21 三处必须说同一件事（关键词漂开 = 有人在偷偷改其中一处的口径）',
   );
 });
+
+// ---------------------------------------------------------------------------
+// 9. P3 第二批：第三格真实旋钮 `preview.ticket_ttl_seconds`（#677）。
+//   RS-31 解析/校验（严格正整数 + 区间 1..3600）；RS-32 热读三档；RS-33 缓存；
+//   RS-34 写后失效（M-2 去登记 ⇒ 红）；RS-35 并发只发一条 SQL；RS-36 在飞失败清槽；
+//   RS-37 env 也过闸 + 一次热读最多一条 warn；RS-38 真库腿。
+// ⚠ 本节格子共享**模块级**热读缓存/槽 ⇒ 每段前后都 `invalidatePreviewTicketTtlCache()`。
+// ---------------------------------------------------------------------------
+
+// env 那一档用 45（与默认 60 不同 ⇒ 能分清「用的到底是 env 还是默认」）。
+const PCFG = { previewTicketTtlSeconds: 45, previewTicketTtlSecondsSource: 'env' };
+
+test('RS-31 preview.ticket_ttl_seconds 的解析与校验：严格十进制正整数 + 区间 1..3600', () => {
+  assert.equal(PREVIEW_TICKET_TTL_MIN_SECONDS, 1);
+  assert.equal(PREVIEW_TICKET_TTL_MAX_SECONDS, 3600, '1 小时');
+  assert.equal(PREVIEW_TICKET_TTL_DEFAULT_SECONDS, 60, '与 config.js 同源');
+  assert.equal(loadConfig({ MAX_BODY_BYTES: '1024' }).previewTicketTtlSeconds,
+    PREVIEW_TICKET_TTL_DEFAULT_SECONDS, 'registry 默认必须等于 loadConfig 干净 env 算出的数');
+
+  for (const good of [1, 60, 3600, '1', '60', '3600', '060']) {
+    const r = parsePreviewTicketTtlSeconds(good);
+    assert.equal(r.ok, true, `${JSON.stringify(good)} 必须收`);
+    assert.equal(r.value, Number(good));
+  }
+  for (const bad of [
+    '1e3', ' 60 ', '60s', '', '0x10', '1.5', '6e5', '0', '-1', '-60', '3601', '+5',
+    0, -1, 60.5, 3601, Number.NaN, Number.POSITIVE_INFINITY, 1e21,
+    true, false, null, undefined, {}, [], ['60'],
+  ]) {
+    assert.equal(parsePreviewTicketTtlSeconds(bad).ok, false,
+      `${JSON.stringify(bad) ?? String(bad)} 必须拒`);
+  }
+  // 0 是「签出来即过期」的非法值（与保留天数那格的 0-有效相反）；上界外是 out_of_range。
+  assert.equal(parsePreviewTicketTtlSeconds(0).reason, 'ticket_ttl_out_of_range',
+    '0 是合法数字但区间外 ⇒ out_of_range（不是 not_a_...）');
+  assert.equal(parsePreviewTicketTtlSeconds(3601).reason, 'ticket_ttl_out_of_range');
+  assert.equal(parsePreviewTicketTtlSeconds('1e3').reason, 'not_a_ticket_ttl_seconds');
+  assert.equal(parsePreviewTicketTtlSeconds(' 60 ').reason, 'not_a_ticket_ttl_seconds',
+    '带空白的串必须拒（Number() 会收成 60，那是第二套真相）');
+  assert.equal(parsePreviewTicketTtlSeconds('+5').ok, false, '带符号的串必须拒');
+
+  for (const good of [1, 60, 3600]) {
+    assert.equal(validatePreviewTicketTtlSeconds(good), true, `${good} 必须放行`);
+  }
+  for (const bad of ['60', '', '3600', 0, -1, 3601, 60.5, true, null, {}, [], Number.NaN]) {
+    const why = validatePreviewTicketTtlSeconds(bad);
+    assert.notEqual(why, true, `${JSON.stringify(bad) ?? String(bad)} 写侧必须拒`);
+    assert.equal(typeof why, 'string', '拒绝必须返回点名的原因字符串');
+  }
+  // 上界与下界的拒绝要能说清是哪个数（M-3：去掉 validate 上界 ⇒ 这一条红）。
+  assert.match(String(validatePreviewTicketTtlSeconds(3601)), /3600/);
+  assert.match(String(validatePreviewTicketTtlSeconds(0)), /1/);
+});
+
+test('RS-32 第三格热读三档：DB > env（过闸）> 默认 60；任何一档坏了都绝不抛', async () => {
+  invalidatePreviewTicketTtlCache();
+  const dbPool = ttlPool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }] });
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: dbPool, config: PCFG, env: {}, log: silentLog,
+  }), 30);
+  assert.equal(dbPool.queryCount, 1, '确实发了那次读');
+
+  // 库里非法值 ⇒ 回落 env 45，点名 warn 一次。
+  invalidatePreviewTicketTtlCache();
+  const log = collectingLog();
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: ttlPool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: '1e3' }] }),
+    config: PCFG, env: {}, log,
+  }), 45);
+  assert.equal(log.seen.warn.length, 1, `恰好一条（实得 ${JSON.stringify(log.seen.warn)}）`);
+  assert.match(log.seen.warn[0], new RegExp(PREVIEW_TICKET_TTL_KEY.replace(/\./g, '\\.')),
+    'warn 要点名是哪个 key');
+
+  // 库里没行 ⇒ env 45，不 warn。
+  invalidatePreviewTicketTtlCache();
+  const log2 = collectingLog();
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: ttlPool(), config: PCFG, env: {}, log: log2,
+  }), 45);
+  assert.deepEqual(log2.seen.warn, [], '没有行不是故障，不许刷屏');
+
+  // 表不存在 ⇒ 回落 env，绝不抛。
+  invalidatePreviewTicketTtlCache();
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: ttlPool({ throwOnSelect: Object.assign(new Error('no such table'), { code: '42P01' }) }),
+    config: PCFG, env: {}, log: silentLog,
+  }), 45);
+
+  // 连 pool 都没有 ⇒ 回落 env，不抛。
+  invalidatePreviewTicketTtlCache();
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: null, config: PCFG, env: {}, log: silentLog,
+  }), 45);
+
+  // 三档全空 ⇒ 默认 60，绝不 undefined（undefined 交给 expires_at 算术就是 NaN）。
+  invalidatePreviewTicketTtlCache();
+  const none = await readPreviewTicketTtlSeconds({
+    pool: ttlPool(), config: {}, env: {}, log: silentLog,
+  });
+  assert.equal(none, PREVIEW_TICKET_TTL_DEFAULT_SECONDS);
+  assert.notEqual(none, undefined, 'undefined 交给 expires_at 算术就是 NaN');
+
+  // 读挂住 ⇒ 按时给答案（timeoutMs 注入）。
+  invalidatePreviewTicketTtlCache();
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: ttlPool({ hang: true }), config: PCFG, env: {}, log: silentLog, timeoutMs: 30,
+  }), 45);
+
+  // env 越界（config.js 的 intEnv 收得下 4000，registry 不收）⇒ 回落默认 60，点名档与理由。
+  invalidatePreviewTicketTtlCache();
+  const overLog = collectingLog();
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: ttlPool(),
+    config: { previewTicketTtlSeconds: 4000, previewTicketTtlSecondsSource: 'env' },
+    env: {}, log: overLog,
+  }), 60, '越界 ⇒ 回落默认 60（不是 4000，也不是 undefined）');
+  assert.ok(overLog.seen.warn.some((m) => m.includes('config.previewTicketTtlSeconds')
+    && m.includes('ticket_ttl_out_of_range')),
+    `要点名是哪一档、为什么（实得 ${JSON.stringify(overLog.seen.warn)}）`);
+
+  // 本格有行不许让另两格凭空读数（同一张表；各格独立）。
+  invalidatePreviewTicketTtlCache();
+  invalidateWorkspaceRetentionCache();
+  const mixed = ttlPool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }] });
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: mixed, config: PCFG, env: {}, log: silentLog,
+  }), 30);
+  invalidateWorkspaceRetentionCache();
+  assert.equal(await readWorkspaceRetentionDays({
+    pool: mixed, config: PCFG, env: {}, log: silentLog,
+  }), 0, '票那格有行不许让保留天数那格凭空读出一个数');
+  invalidatePreviewTicketTtlCache();
+  invalidateWorkspaceRetentionCache();
+});
+
+test('RS-33 第三格缓存：同池 5s 内命中不发 SQL、过期重读、换池不串、本格不被另两格顶掉',
+  async () => {
+    invalidatePreviewTicketTtlCache();
+    const pool = ttlPool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }] });
+    let clock = 4_000_000;
+    const now = () => clock;
+    const read = () => readPreviewTicketTtlSeconds({
+      pool, config: PCFG, env: {}, now, log: silentLog,
+    });
+    assert.equal(await read(), 30);
+    assert.equal(pool.queryCount, 1);
+    clock += HOT_READ_CACHE_TTL_MS;
+    assert.equal(await read(), 30);
+    assert.equal(pool.queryCount, 1, '5s 内命中 ⇒ 不发第二条 SQL');
+    pool.rows = [{ key: PREVIEW_TICKET_TTL_KEY, value: 15 }];
+    clock += 1;
+    assert.equal(await read(), 15, '过期后必须重读');
+    assert.equal(pool.queryCount, 2);
+    const other = ttlPool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: 20 }] });
+    assert.equal(await readPreviewTicketTtlSeconds({
+      pool: other, config: PCFG, env: {}, now, log: silentLog,
+    }), 20, 'B 池必须自己读');
+    assert.equal(other.queryCount, 1);
+    // 本格缓存不被 TTL/保留天数的读顶掉（各格各一份工厂状态）。
+    assert.equal(await read(), 15);
+    const before = pool.queryCount;
+    invalidateSessionTtlCache();
+    await readSessionTtlSeconds({ pool, config: PCFG, env: {}, now, log: silentLog });
+    assert.equal(await read(), 15);
+    assert.equal(pool.queryCount, before + 1,
+      '只有 TTL 那格该发 SQL（+2 = 本格缓存被 TTL 顶掉了）');
+    invalidatePreviewTicketTtlCache();
+  });
+
+test('RS-34 第三格保存后立即失效：PUT 完下一次读就是新值（M-2 去登记 ⇒ 这一格红）',
+  async () => {
+    invalidatePreviewTicketTtlCache();
+    const pool = new FakeRuntimePool();
+    // 先读一次：库里没行 ⇒ env 那一档 45 被缓存住。
+    assert.equal(await readPreviewTicketTtlSeconds({
+      pool, config: PCFG, env: {}, log: silentLog,
+    }), 45);
+    const saved = await saveRuntimeSetting({
+      pool, actorId: ACTOR, key: PREVIEW_TICKET_TTL_KEY, value: 30, log: silentLog,
+    });
+    assert.equal(saved.value, 30);
+    assert.equal(pool.storedValue(PREVIEW_TICKET_TTL_KEY), 30, '库里真的是新值');
+    const afterSave = pool.queryCount;
+    const next = await readPreviewTicketTtlSeconds({
+      pool, config: PCFG, env: {}, log: silentLog,
+    });
+    assert.equal(next, 30, '保存后下一次读就是新值（读到 45 = 失效钩子少登记）');
+    assert.equal(pool.queryCount, afterSave + 1, '这次读必须真的再发一次 SQL');
+    // 失效只此一次：紧接着的第二次读重新命中缓存。
+    const afterSecond = pool.queryCount;
+    assert.equal(await readPreviewTicketTtlSeconds({
+      pool, config: PCFG, env: {}, log: silentLog,
+    }), 30);
+    assert.equal(pool.queryCount, afterSecond, '失效后那一读已把新值填回缓存');
+    // 反向：保存另一格不许抹掉本格缓存。
+    await saveRuntimeSetting({
+      pool, actorId: ACTOR, key: WORKSPACE_RETENTION_KEY, value: 7, log: silentLog,
+    });
+    const afterOtherSave = pool.queryCount;
+    assert.equal(await readPreviewTicketTtlSeconds({
+      pool, config: PCFG, env: {}, log: silentLog,
+    }), 30);
+    assert.equal(pool.queryCount, afterOtherSave, '保存保留天数之后本格仍应命中缓存');
+    invalidatePreviewTicketTtlCache();
+    invalidateWorkspaceRetentionCache();
+  });
+
+test('RS-35 第三格并发：冷缓存四路只发一条 SQL，另一池自己发，合并后照常回填缓存',
+  async () => {
+    invalidatePreviewTicketTtlCache();
+    const pool = new GatingRuntimePool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }] });
+    let release;
+    pool.gate = new Promise((resolve) => { release = () => resolve(); });
+    const four = Array.from({ length: 4 }, () => readPreviewTicketTtlSeconds({
+      pool, config: PCFG, env: {}, log: silentLog,
+    }));
+    await tick();
+    assert.equal(pool.queryCount, 1,
+      `四路并发必须合并成 **1 条** SQL（实发 ${pool.queryCount} 条）`);
+    const other = ttlPool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: 20 }] });
+    assert.equal(await readPreviewTicketTtlSeconds({
+      pool: other, config: PCFG, env: {}, log: silentLog,
+    }), 20, 'B 池不许蹭 A 池在飞那一趟');
+    release();
+    assert.deepEqual(await Promise.all(four), [30, 30, 30, 30]);
+    assert.equal(pool.queryCount, 1, '合并之后仍只有一条 SQL');
+    assert.equal(await readPreviewTicketTtlSeconds({
+      pool, config: PCFG, env: {}, log: silentLog,
+    }), 30);
+    assert.equal(pool.queryCount, 1, '在飞那趟必须照常回填缓存');
+    invalidatePreviewTicketTtlCache();
+  });
+
+test('RS-36 第三格在飞那趟失败 ⇒ 清槽（不许把之后所有读钉在失败那一趟上）', async () => {
+  invalidatePreviewTicketTtlCache();
+  const pool = flakyPool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }] });
+  let clock = 5_000_000;
+  const read = () => readPreviewTicketTtlSeconds({
+    pool, config: PCFG, env: {}, now: () => clock, log: silentLog,
+  });
+  // ① 第一趟 DB 抛 ⇒ 回落 env 45，绝不抛。
+  assert.equal(await read(), 45, '失败那趟也要给答案（抛了就是签票请求 500）');
+  assert.equal(pool.queryCount, 1);
+  // ② DB 恢复 + TTL 到点 ⇒ 必须重发 SQL 读到库里的 30。
+  pool.broken = false;
+  clock += HOT_READ_CACHE_TTL_MS + 1;
+  assert.equal(await read(), 30, '恢复后必须读到库里的值，不是被钉住的 45');
+  assert.equal(pool.queryCount, 2, '必须重新发 SQL（失败路径没清槽就红在这里）');
+  // ③ 在飞那趟挂掉时挤进来的共享者：不许抛、不许自己再发、槽不留。
+  invalidatePreviewTicketTtlCache();
+  const gate = new GatingRuntimePool({ rows: [{ key: PREVIEW_TICKET_TTL_KEY, value: 30 }] });
+  let release;
+  gate.gate = new Promise((resolve) => { release = () => resolve(); });
+  gate.releaseThrows = true;
+  const first = readPreviewTicketTtlSeconds({
+    pool: gate, config: PCFG, env: {}, now: () => clock, log: silentLog,
+  });
+  await tick();
+  const second = readPreviewTicketTtlSeconds({
+    pool: gate, config: PCFG, env: {}, now: () => clock, log: silentLog,
+  });
+  assert.equal(gate.queryCount, 1, '第二路必须复用那一趟');
+  release();
+  assert.equal(await first, 45, '那一趟挂了 ⇒ 发起方按回落给答案');
+  assert.equal(await second, 45, '共享者也按回落给答案');
+  gate.gate = null;
+  clock += HOT_READ_CACHE_TTL_MS + 1;
+  assert.equal(await readPreviewTicketTtlSeconds({
+    pool: gate, config: PCFG, env: {}, now: () => clock, log: silentLog,
+  }), 30, '挂掉之后必须重新发读拿到真值');
+  invalidatePreviewTicketTtlCache();
+});
+
+test('RS-37 第三格 env 也过 registry 那套闸 + 一次热读最多一条 warn', async () => {
+  const BAD = [
+    ['上界外', '4000', 'ticket_ttl_out_of_range'],
+    ['下界外', '0', 'ticket_ttl_out_of_range'],
+    ['小数', '7.5', 'not_a_ticket_ttl_seconds'],
+    ['科学计数', '1e3', 'not_a_ticket_ttl_seconds'],
+    ['压根不是数', 'abc', 'not_a_ticket_ttl_seconds'],
+  ];
+  for (const [label, raw, reason] of BAD) {
+    const cfg = loadConfig({ COOKIE_PROFILE: 'dev-http', PREVIEW_TICKET_TTL_SECONDS: raw });
+    const env = { PREVIEW_TICKET_TTL_SECONDS: raw };
+    invalidatePreviewTicketTtlCache();
+    const hotLog = collectingLog();
+    const hot = await readPreviewTicketTtlSeconds({
+      pool: ttlPool(), config: cfg, env, log: hotLog,
+    });
+    assert.equal(hot, PREVIEW_TICKET_TTL_DEFAULT_SECONDS,
+      `${label}：env=${raw} 过不了闸 ⇒ 回落默认 60（实得 ${hot}）`);
+    const named = hotLog.seen.warn.filter((m) => m.includes(PREVIEW_TICKET_TTL_KEY)
+      && m.includes('PREVIEW_TICKET_TTL_SECONDS'));
+    assert.equal(named.length, 1,
+      `坏 env 值必须点名 warn 一次，实得 ${JSON.stringify(hotLog.seen.warn)}`);
+    assert.match(named[0], new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+      'warn 要带上那个坏值本身');
+    assert.match(named[0], new RegExp(reason), 'warn 要带上被拒的理由');
+  }
+  for (const raw of ['1', '30', '3600']) {
+    invalidatePreviewTicketTtlCache();
+    const log = collectingLog();
+    const cfg = loadConfig({ COOKIE_PROFILE: 'dev-http', PREVIEW_TICKET_TTL_SECONDS: raw });
+    assert.equal(await readPreviewTicketTtlSeconds({
+      pool: ttlPool(), config: cfg, env: { PREVIEW_TICKET_TTL_SECONDS: raw }, log,
+    }), Number(raw), `env ${raw} 必须照收`);
+    assert.deepEqual(log.seen.warn, [], `合法值不许 warn（实得 ${JSON.stringify(log.seen.warn)}）`);
+  }
+  invalidatePreviewTicketTtlCache();
+});
+
+test('RS-38 真库那一腿（第三格）：写 30 ⇒ 热读 30、不等 5 秒；删行 ⇒ 回落 env（无 PG skip）',
+  { skip: PG_SKIP }, async () => {
+    assert.ok(pgFixture, 'TEST_DATABASE_URL 给了却没有夹具');
+    await pgFixture.withFreshDatabase(async ({ pool }) => {
+      const CONFIG = { previewTicketTtlSeconds: 45, previewTicketTtlSecondsSource: 'env' };
+      invalidatePreviewTicketTtlCache();
+      // 真库前置：audit_log.actor_id 有 FK ⇒ 先插这个人。
+      await pool.query(
+        `INSERT INTO users (id, login, password_hash, status) VALUES ($1, $2, 'x', 'active')`,
+        [ACTOR, 'w677-p3b2-actor'],
+      );
+      // 库里没行 ⇒ env 那一档 45。
+      assert.equal(await readPreviewTicketTtlSeconds({ pool, config: CONFIG, log: pgSilent }), 45);
+      // 真库保存 30 ⇒ 同进程下一次读立刻 30（写路径失效 + 真库整表读）。
+      const saved = await saveRuntimeSetting({
+        pool, actorId: ACTOR, key: PREVIEW_TICKET_TTL_KEY, value: 30, log: pgSilent,
+      });
+      assert.equal(saved.value, 30);
+      assert.equal(saved.updatedBy, ACTOR);
+      assert.equal(await readPreviewTicketTtlSeconds({ pool, config: CONFIG, log: pgSilent }), 30,
+        '真库上「保存完下一拍就用新值」必须是事实');
+      // 管理台：第三格报 source=db。
+      const list = await listRuntimeSettingsAdmin({ pool, config: CONFIG, log: pgSilent });
+      const item = list.items.find((i) => i.key === PREVIEW_TICKET_TTL_KEY);
+      assert.equal(item.source, 'db');
+      assert.equal(item.value, 30);
+      assert.equal(item.updatedBy, ACTOR);
+      // 手工删行 ⇒ 回到 env 那一档 45。
+      await pool.query('DELETE FROM runtime_settings WHERE key = $1', [PREVIEW_TICKET_TTL_KEY]);
+      invalidatePreviewTicketTtlCache();
+      assert.equal(await readPreviewTicketTtlSeconds({ pool, config: CONFIG, log: pgSilent }), 45);
+      // 手工写坏行 ⇒ 回落 env，不抛。
+      await pool.query(
+        `INSERT INTO runtime_settings (key, value) VALUES ($1, $2::jsonb)`,
+        [PREVIEW_TICKET_TTL_KEY, '"1e3"'],
+      );
+      invalidatePreviewTicketTtlCache();
+      assert.equal(await readPreviewTicketTtlSeconds({ pool, config: CONFIG, log: pgSilent }), 45,
+        '手工写的坏值 ⇒ 回落 env，不抛');
+      invalidatePreviewTicketTtlCache();
+    });
+  });
