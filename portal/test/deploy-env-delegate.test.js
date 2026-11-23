@@ -678,18 +678,16 @@ function scanReflectReads(code, masked, ctx, sink) {
  * RHS 不是 env 对象（`const { a } = other`）⇒ 与这把闸门无关，整条形都不许进。
  */
 function scanDestructureReads(code, masked, ctx, sink) {
-  const re = /\b(?:const|let|var)\s*\{/g;
-  for (const m of code.matchAll(re)) {
-    if (!isCodePosition(code, masked, m.index, m[0].length)) continue;
-    const brace = m.index + m[0].length - 1;
+  // 一个解构模式 `{ … } = <env 源>` 的成员逐条记账（声明形与赋值形共用同一条口径）。
+  const emitPattern = (brace) => {
     const close = matchBrackets(masked, brace);
-    if (close == null) continue;
+    if (close == null) return;
     const eq = nextNonSpace(masked, close);
-    if (eq == null || masked[eq] !== '=' || '=><'.includes(masked[eq + 1] ?? '')) continue;
+    if (eq == null || masked[eq] !== '=' || '=><'.includes(masked[eq + 1] ?? '')) return;
     const rhs = nextNonSpace(masked, eq + 1);
-    if (rhs == null) continue;
+    if (rhs == null) return;
     const rhsEnd = exprEndAt(masked, rhs);
-    if (!isEnvSourceAt(code, masked, ctx.envObjs, rhs, rhsEnd)) continue;
+    if (!isEnvSourceAt(code, masked, ctx.envObjs, rhs, rhsEnd)) return;
     sink.consumed.add(rhs);                 // 这条拷贝形已按成员逐条记账 ⇒ 别再算成整表拷贝
     const pattern = code.slice(brace, rhsEnd).replace(/\s+/g, ' ').trim();
     for (const [a, b] of splitTop(masked, brace + 1, close - 1)) {
@@ -705,6 +703,19 @@ function scanDestructureReads(code, masked, ctx, sink) {
       }
       sink.fail(line, pattern, code.slice(mem.start, b).trim());      // `...rest` / 认不出的成员
     }
+  };
+  // 声明形：`const/let/var { … } = env`。
+  for (const m of code.matchAll(/\b(?:const|let|var)\s*\{/g)) {
+    if (!isCodePosition(code, masked, m.index, m[0].length)) continue;
+    emitPattern(m.index + m[0].length - 1);
+  }
+  // 赋值形（返修 MED②）：`({ … } = env)`——语句级解构赋值**必须**被圆括号包住（否则 `{} = x` 被当空
+  // 块标签）。旧扫描器只认声明形 ⇒ `({ KEY } = process.env)` 与 `({ [k]: v } = process.env)` **静默漏过**
+  // （既不站点也不 unsupported）。这里与声明形同口径：静态键名→读站点、计算属性解析不出→unsupported。
+  // 声明形那个 `{` 前面是 `const ` 的空格、赋值形那个 `{` 前面是 `(` ⇒ 两趟不会撞到同一个 brace。
+  for (const m of code.matchAll(/\(\s*\{/g)) {
+    if (!isCodePosition(code, masked, m.index, m[0].length)) continue;
+    emitPattern(m.index + m[0].length - 1);
   }
 }
 
@@ -4234,6 +4245,36 @@ test('#587-S2-⑧ 同一行两处动态读 ⇒ 逐条核销：一条登记只盖
     // 两条都登记 ⇒ 全部核销 ⇒ 绿。
     assert.deepEqual(unsupportedProblems(detected, detected.map(reg)), [],
       '两处都登记了却还报未核销 ⇒ 核销逻辑过头了');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#587-S2-⑨ 解构**赋值**形与声明形同口径：静态键名⇒读站点、计算属性⇒unsupported', () => {
+  const dir = fixtureRoot({
+    'lib/assign-des.js': [
+      'let a = null; let v = null; const k = pick();',        // 1 目标变量与计算名来源
+      '({ ERIX_S2_DES_ASSIGN } = process.env);',              // 2 静态键名 ⇒ 读站点
+      '({ [k]: v } = process.env);',                          // 3 计算属性 ⇒ unsupported
+      '({ cfg } = opts);',                                    // 4 负例：非 env 源 ⇒ 整条形都不许进
+    ].join('\n'),
+  });
+  try {
+    const index = buildEnvSiteIndex(dir);
+    // 静态键名：与声明形同口径，认成 destructure 读站点、行号是成员自己那一行。
+    assert.deepEqual(s2Coords(index, 'ERIX_S2_DES_ASSIGN'), ['lib/assign-des.js:2(destructure)'],
+      `解构赋值形的静态键名没成读站点（实际 ${JSON.stringify(s2Coords(index, 'ERIX_S2_DES_ASSIGN'))}）`
+      + ' ⇒ 旧扫描器只认声明形，这一形会静默漏过');
+    assert.deepEqual(
+      siteIndexProblems([s2At('ERIX_S2_DES_ASSIGN', 'lib/assign-des.js', 2)], index, dir), [],
+      '解构赋值形的站点被影子尺判红 ⇒ 索引没吃到赋值形');
+    // 计算属性：解析不出静态名 ⇒ fail-closed 进 unsupported。
+    const comp = index.unsupported.filter((u) => u.at === 'lib/assign-des.js:3');
+    assert.equal(comp.length, 1,
+      `计算属性解构赋值应进 unsupported（实际 ${JSON.stringify(comp)}）`);
+    assert.match(comp[0].shape, /\[\s*k\s*\]/, 'unsupported 应带上那个计算属性名');
+    // 负例：RHS 不是 env 源 ⇒ 既不站点也不 unsupported。
+    assert.equal(index.unsupported.filter((u) => u.at === 'lib/assign-des.js:4').length, 0,
+      '非 env 源的解构赋值不该进 unsupported');
+    assert.equal(index.sitesOf('cfg').length, 0, '非 env 源的解构成员被当成 env 读站点');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
