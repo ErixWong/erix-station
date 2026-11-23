@@ -3673,19 +3673,20 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**已迁的旋钮（七格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
+**已迁的旋钮（八格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
 
 | key | env 兜底位 | 值域 | `applyMode` | 生效点 |
 | --- | --- | --- | --- | --- |
 | `session.ttl_seconds` | `SESSION_TTL_SECONDS` | 整数 `60..2592000` 秒 | `hot` | 登录建会话 / 续期时现读 |
 | `workspace.retention_days` | `ERIX_WORKSPACE_RETENTION_DAYS` | 整数 `0..3650` 天（**`0` 是有效值** = 不自动清理） | `hot` | offboarding 循环每一拍现读 |
+| `preview.session_ttl_seconds` | `PREVIEW_SESSION_TTL_SECONDS` | 整数 `60..86400` 秒（默认 `900`；**`0` 非法**：签出来即过期） | `hot` | `handleForwardAuth` 签发 / 续期预览 cookie 时现读（`preview.js` 算 `expires_at` + `http.js` 的 `Set-Cookie` `Max-Age`，同一请求共用一次） |
 | `preview.ticket_ttl_seconds` | `PREVIEW_TICKET_TTL_SECONDS` | 整数 `1..3600` 秒（**`0` 非法**：签出来即过期） | `hot` | 签预览票时现读（批量整批共用一次） |
 | `session.auto_title_min_new` | `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 整数 `1..100` 轮（默认 `3`；**`0` 非法**：每拍重算标题） | `hot` | `evaluateAutoTitle()` 每次评估标题时现读（`session-title.js`） |
 | `loop.onboarding_idle_backoff_ms` | `ONBOARDING_IDLE_BACKOFF_MAX_MS` | 整数 `1..60000` 毫秒（默认 `30000`；**`0` 非法**：每拍空转） | `hot` | onboarding 循环**每一拍**在决定 sleep 之前现读 |
 | `loop.offboarding_idle_backoff_ms` | `OFFBOARDING_IDLE_BACKOFF_MAX_MS` | 整数 `1..60000` 毫秒（默认 `30000`；**`0` 非法**） | `hot` | offboarding 循环**每一拍**在决定 sleep 之前现读 |
 | `loop.provisioner_idle_backoff_ms` | `PROVISIONER_IDLE_BACKOFF_MAX_MS` | 整数 `1..15000` 毫秒（默认 `15000`；上界 15000 是本循环的**业务上限**，不是 `60000`） | `hot` | provisioner 对账循环**每一拍**在决定 sleep 之前现读 |
 
-四格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+八格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
 
 后三格（#677 P3 第六批：三个循环的空闲退避上限）也是同一套机件，但是**三份独立实例**（各自一份
 缓存与在飞槽）：共用一份就是「保存开户那格的上限，把对账那一格的缓存一起抹掉」。现读位置是

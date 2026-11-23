@@ -438,11 +438,13 @@ function sessionCookieHeader(cookie, token) {
 }
 
 /** 预览 cookie（host-only，无 Domain）——ticket 换取 / 滚动续期重发（portal.md §2.7/§2.8）。 */
-function previewCookieHeader(cookie, token) {
+function previewCookieHeader(cookie, token, maxAgeSeconds = cookie.maxAge) {
   const parts = [`${cookie.name}=${token}`, `Path=${cookie.path}`];
   if (cookie.httpOnly) parts.push('HttpOnly');
   if (cookie.secure) parts.push('Secure');
-  parts.push(`SameSite=${cookie.sameSite}`, `Max-Age=${cookie.maxAge}`);
+  // #677 P3 第五批：cookie 属性照旧，但 `Max-Age` 用现读值（`config.previewCookie.maxAge` 是启动
+  // 时算死的快照，热改 `preview.session_ttl_seconds` 后必须跟着变，否则会话与 cookie 两套真相）。
+  parts.push(`SameSite=${cookie.sameSite}`, `Max-Age=${maxAgeSeconds}`);
   return parts.join('; ');
 }
 
@@ -4452,6 +4454,14 @@ async function handleForwardAuth(req, res, ctx) {
   const origin = req.headers.origin ?? null;
   const accessControlRequestMethod = req.headers['access-control-request-method'] ?? null;
 
+  // #677 P3 第五批：预览会话 TTL 现在是**可热改的运行时旋钮**（`preview.session_ttl_seconds`）。
+  // 与第二批签票同口径：**同一请求只现读一次**，下面透传给 authorizeForwardAuth（算 expires_at）
+  // 与两处 Set-Cookie（算 Max-Age）——会话真到期与 cookie Max-Age 必须同源，否则界面 cookie 还
+  // 没过期但库内已过期（或反之）。`readPreviewSessionTtlSeconds` 带 5s 缓存 + 同池在飞合并。
+  const sessionTtlSeconds = await runtimeSettings.readPreviewSessionTtlSeconds({
+    pool: ctx.pool, config: ctx.config, log: ctx.log,
+  });
+
   const result = await preview.authorizeForwardAuth(ctx.pool, ctx.config, {
     hostname: host || '',
     // 原始 Host（可能带端口）：302 Location 需要保留非默认端口（fix-250923-01，dev 8090/8443）。
@@ -4461,6 +4471,7 @@ async function handleForwardAuth(req, res, ctx) {
     method,
     scheme,
     accessControlRequestMethod,
+    sessionTtlSeconds,
   });
 
   // 审计：每次判定（无论通过与否）都写（portal.md §2.7）。details 不记 ticket/cookie 明文，也不记 query（F2：剥离所有 query，只记 path）。
@@ -4498,7 +4509,8 @@ async function handleForwardAuth(req, res, ctx) {
 
   if (result.outcome === 'redirect') {
     const headers = {
-      'Set-Cookie': previewCookieHeader(ctx.config.previewCookie, result.sessionToken),
+      'Set-Cookie': previewCookieHeader(
+        ctx.config.previewCookie, result.sessionToken, sessionTtlSeconds),
       Location: result.location,
       'Cache-Control': 'private, no-store',
       'Referrer-Policy': 'no-referrer',
@@ -4510,7 +4522,10 @@ async function handleForwardAuth(req, res, ctx) {
 
   // allow：200 + X-Auth-User（Traefik authResponseHeaders 透传）；session 续期重发 Set-Cookie。
   const headers = { 'X-Auth-User': result.fdeName || '' };
-  if (result.cookieToken) headers['Set-Cookie'] = previewCookieHeader(ctx.config.previewCookie, result.cookieToken);
+  if (result.cookieToken) {
+    headers['Set-Cookie'] = previewCookieHeader(
+      ctx.config.previewCookie, result.cookieToken, sessionTtlSeconds);
+  }
   sendJson(res, 200, {}, headers);
 }
 
