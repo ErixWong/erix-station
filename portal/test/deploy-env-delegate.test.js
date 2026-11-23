@@ -3979,10 +3979,10 @@ test('#587-S1-⑩ portal helper 间接读由**代码推出**并归 host-source�
     const uidSites = realDerived.filter((s) => s.key === 'FDE_WORKER_UID').map(siteTag).join('、');
     console.log(`# HOST-SITES 真树推出 ${realDerived.length} 条 helper 间接读站点（由 unsupported 反推，`
       + `非手抄）；FDE_WORKER_UID ⇒ ${uidSites || '没推出'}`);
-    const real = shadowGapSemantic('FDE_WORKER_UID', 'portal/src/config.js:406');
+    const real = shadowGapSemantic('FDE_WORKER_UID', 'portal/src/config.js:405');
     assert.equal(real.kind, 'host-source',
       `config.js:406 是合法的 portal 间接读，不是「仅仅提到 key」（实际 ${real.kind}：${real.why}）`);
-    assert.match(real.why, /config\.js:406/, '理由要点名调用点（review 要的那一句）');
+    assert.match(real.why, /config\.js:405/, '理由要点名调用点（review 要的那一句）');
     assert.match(real.why, /config\.js:12\b/, '理由要点名 helper `intEnv` 的声明行 :12');
     assert.match(real.why, /config\.js:13\b/, '还要点名真正取值的 `env[key]` 那一行');
     assert.equal(real.why.includes('mention-only'), false, '理由里不许同时出现另一个类别名');

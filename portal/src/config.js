@@ -381,8 +381,7 @@ export function loadConfig(env = process.env) {
     llmGatewayMode,
     llmGatewayAdminUrl: env.LLM_GATEWAY_ADMIN_URL || 'http://station-litellm:4000',
     llmGatewayMasterKey: env.LLM_GATEWAY_MASTER_KEY || '',
-    // 端口配额 / 默认池 / 保留网段（IPAM；fde-platform §8.2 / topology §3）。
-    portQuota: intEnv(env, 'PORT_QUOTA', 40),
+    // 默认池 / 保留网段（IPAM；fde-platform §8.2 / topology §3）。
     fdePool: env.FDE_POOL || 'default',
     // F9：栈所有权标签——reconcile 只清本栈（station.stack=<stackId>）的孤儿容器/网络，
     // 防并行栈互删；缺省 default（既有无 station.stack 标签的资产视为 default 栈）。
