@@ -52,6 +52,7 @@ import {
   readPreviewTicketTtlSeconds, invalidatePreviewTicketTtlCache,
   AUTO_TITLE_MIN_NEW_KEY, AUTO_TITLE_MIN_NEW_MIN, AUTO_TITLE_MIN_NEW_MAX,
   AUTO_TITLE_MIN_NEW_DEFAULT, parseAutoTitleMinNew, validateAutoTitleMinNew,
+  AUTO_TITLE_MIN_NEW_HINT,
   readAutoTitleMinNew, invalidateAutoTitleMinNewCache,
 } from '../src/runtime-settings.js';
 import { loadConfig } from '../src/config.js';
@@ -2232,8 +2233,13 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   assert.equal(list.items.find((i) => i.key === 'preview.ticket_ttl_seconds').hint,
     '一次预览票从签出到过期的秒数；1..3600（默认 60）');
   // 第四格也登记了 hint ⇒ DTO 逐字透出（防抖阈值的 1..100 不写在行面上会被误填）。
-  assert.equal(list.items.find((i) => i.key === AUTO_TITLE_MIN_NEW_KEY).hint,
-    '自动标题刷新的防抖阈值：距上次自动更新至少 N 轮新用户消息才刷新；1..100（默认 3）');
+  // 文案本身以 registry 常量为真相（不在判据里抄一份，否则改文案就要改两处）；
+  // #710 LOW① 那句「上界不是硬关闭」就在文案里 ⇒ 下面两行钉它不许退回去。
+  const atHint = list.items.find((i) => i.key === AUTO_TITLE_MIN_NEW_KEY).hint;
+  assert.equal(atHint, AUTO_TITLE_MIN_NEW_HINT, 'DTO 必须逐字透出 registry 那句 hint');
+  assert.match(atHint, /1\.\.100/, 'hint 必须带值域（界面不写就会被误填 0 / 1e2）');
+  assert.match(atHint, /不是硬关闭/, 'hint 必须带上「上界不是硬关闭」（#710 LOW① 的口径）');
+  assert.ok(atHint.length <= 120, `hint 是界面一行小字：实得 ${atHint.length} 字`);
 
   // 回落那一档也带（表不存在时界面更要看得见这句：那一档下 0 同样是「不自动清理」）。
   const dead = await listRuntimeSettingsAdmin({
@@ -3172,4 +3178,60 @@ test('RS-47 真库那一腿（第四格）：写 8 ⇒ 热读 8、不等 5 秒�
         '手工写的坏值 ⇒ 回落 env，不抛');
       invalidateAutoTitleMinNewCache();
     });
+  });
+
+// ---------------------------------------------------------------------------
+// 10. #710 MED：文档格数与 registry 一致（M-1 的落点：删掉 §4.21 表里第四行 ⇒ 这一格点名红）。
+//   为什么钉这条：§4.21 那张表是运维唯一的「哪些旋钮能改、改到哪」的清单。少一行不是排版问题，
+//   而是「已经能改的旋钮在契约里不存在」⇒ 运维照表操作会漏掉一格，管理台却真的听它。
+//   判据取**双向**（表 ⊆ registry 且 registry ⊆ 表），只钉一侧的话「文档多写一格」也照样漂。
+// ---------------------------------------------------------------------------
+
+test('RS-48 §4.21 的旋钮表与 registry 键集合逐格一致（表头列数也一致；M-1 删行 ⇒ 这一格红）',
+  () => {
+    const apiDoc = fs.readFileSync(new URL('../../docs/api/portal.md', import.meta.url), 'utf8');
+    const start = apiDoc.indexOf('### 4.21 管理台运行时设置');
+    assert.ok(start >= 0, '§4.21 那一节被删了或改标题了（判据切不到片）');
+    const end = apiDoc.indexOf('#### `GET /api/admin/runtime-settings`', start);
+    assert.ok(end > start, '§4.21 的 GET 小节标题被改名 ⇒ 切片切到整篇文档');
+    const region = apiDoc.slice(start, end);
+
+    const rows = region.split('\n').filter((l) => l.startsWith('|'));
+    assert.ok(rows.length >= 2, '§4.21 里那张旋钮表不见了（连表头都没有）');
+    const splitCells = (line) => line.split('|').slice(1, -1).map((c) => c.trim());
+    const header = splitCells(rows[0]);
+    assert.equal(header[0], 'key', '表第一列必须是 key（判据按第一列取 key）');
+    const dataRows = rows.slice(2).map(splitCells); // 第 2 行是 | --- | 分隔行
+
+    // 表头列数与每一行的格数一致（列数漂了 = 有人加了列却没给旧行补值）。
+    for (const cells of dataRows) {
+      assert.equal(cells.length, header.length,
+        `§4.21 表格有一行的格数是 ${cells.length}，表头是 ${header.length}：${cells[0]}`);
+    }
+
+    const tableKeys = dataRows.map((cells) => cells[0].replace(/`/g, ''));
+    assert.deepEqual(
+      [...tableKeys].sort(), Object.keys(RUNTIME_SETTING_REGISTRY).sort(),
+      '§4.21 的表行集合必须与 registry 键集合逐格一致：少一行 = 已能改的旋钮在契约里不存在，'
+      + '多一行 = 契约承诺了一个机器上根本没有的旋钮',
+    );
+
+    // 每一行必须把 registry 那一格的 envVar / applyMode 原样写出来（值域与默认在 RS-31/RS-40 钉）。
+    for (const [key, entry] of Object.entries(RUNTIME_SETTING_REGISTRY)) {
+      const cells = dataRows.find((c) => c[0].replace(/`/g, '') === key);
+      assert.ok(cells, `registry 有 ${key}，但 §4.21 的表里没有那一行`);
+      const rowText = cells.join(' ');
+      assert.ok(rowText.includes(entry.envVar),
+        `${key} 那一行必须写出 registry 登记的 envVar ${entry.envVar}（env 兜底位的名）`);
+      assert.ok(rowText.includes(entry.applyMode),
+        `${key} 那一行的 applyMode 必须是 registry 登记的那个（${entry.applyMode}）`);
+    }
+
+    // 本批那一格多钉一层（#710 MED 直接要求的四件：key / 默认 / 值域 / 生效点）：
+    // 只钉「行在」不够，行里没写默认与值域的话，运维仍然无从知道能改到哪。
+    const atRow = dataRows.find((c) => c[0].replace(/`/g, '') === AUTO_TITLE_MIN_NEW_KEY);
+    const atText = atRow.join(' ');
+    assert.match(atText, /1\.\.100/, '第四格那一行必须写出值域 `1..100`（与 RS-40 钉的同一区间）');
+    assert.match(atText, /默认 `?3`?/, '第四格那一行必须写出默认 3（三处同源）');
+    assert.match(atText, /evaluateAutoTitle/, '第四格那一行必须写出生效点（谁在什么时候读它）');
   });

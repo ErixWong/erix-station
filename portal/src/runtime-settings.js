@@ -322,17 +322,21 @@ export function validatePreviewTicketTtlSeconds(value) {
 //   * 下界 1：`1` = 每轮新 user 消息都刷新（最敏感）；`0` 会绕过防抖、每拍都重算标题、白烧
 //     token，且和 `shouldRefreshTitle` 里「首条（auto_title_seq 为 NULL）必生成」的语义叠成
 //     歧义 ⇒ 与预览票的「0 = 签出来即过期」同理，这里的 0 只会造成困惑，不是有效值。
-//   * 上界 100：这是「会话轮数」启发式的阈值，不是时长；100 轮已足够把自动改名压到近乎关
-//     （真到那个量级该直接 `ERIX_SESSION_AUTO_TITLE=0` 关掉），再大只是把「几乎不刷」写成一个大
-//     数，没有产品意义。默认 3 与 `config.js:327` 的 `intEnv(..., 'ERIX_SESSION_AUTO_TITLE_MIN_NEW', 3)`
+//   * 上界 100：这是「会话轮数」启发式的阈值，不是时长。**口径要说准（#710 LOW①）**：上界 100 =
+//     「阈值可设到很高」，**不是硬关闭**——`shouldRefreshTitle()` 除「≥ N 轮」外还有一条**话题漂移
+//     旁路**（≥1 轮新消息且与现标题关键词零重合 ⇒ 刷新），**旁路不吃 N** ⇒ `minNew=100` + 只 1 轮
+//     + 零重合仍然 `refresh=true`（判据：`session-title.test.js`「零重合旁路不受 `minNew` 上界约束」
+//     那一格）。真要关掉自动改名请用 `ERIX_SESSION_AUTO_TITLE=0`（总开关），本旋钮上界只抬阈值。
+//     默认 3 与 `config.js:327` 的 `intEnv(..., 'ERIX_SESSION_AUTO_TITLE_MIN_NEW', 3)`
 //     及 `session-title.js` 的 `AUTO_TITLE_DEFAULT_MIN_NEW` **三处同源**。
 export const AUTO_TITLE_MIN_NEW_KEY = 'session.auto_title_min_new';
 export const AUTO_TITLE_MIN_NEW_MIN = 1;
-export const AUTO_TITLE_MIN_NEW_MAX = 100; // 见上：100 轮已近乎「不自动刷」，再大只是数字更大
+export const AUTO_TITLE_MIN_NEW_MAX = 100; // 见上：上界只是抬阈值，不是硬关闭（零重合旁路不吃 N）
 // 默认与 config.js 的 `sessionAutoTitleMinNew`（intEnv 兜底 3）同源。
 export const AUTO_TITLE_MIN_NEW_DEFAULT = 3;
 export const AUTO_TITLE_MIN_NEW_HINT =
-  '自动标题刷新的防抖阈值：距上次自动更新至少 N 轮新用户消息才刷新；1..100（默认 3）';
+  '自动标题刷新的防抖阈值：距上次自动更新至少 N 轮新用户消息才刷新；1..100（默认 3）；' +
+  '上界 100 只是抬阈值，不是硬关闭——新消息与现标题关键词零重合时 1 轮也刷（口径见契约 §4.21）';
 
 /**
  * 严格十进制正整数（形状口径同上面三格：只认 `/^[0-9]+$/` 的非负整数字面，再要求区间内）。
@@ -383,7 +387,8 @@ export function validateAutoTitleMinNew(value) {
   }
   if (value > AUTO_TITLE_MIN_NEW_MAX) {
     return `必须在 ${AUTO_TITLE_MIN_NEW_MIN}–${AUTO_TITLE_MIN_NEW_MAX} 轮之间` +
-      `（1 轮 ~ 100 轮；再大请直接用 ERIX_SESSION_AUTO_TITLE=0 关掉自动标题）`;
+      `（1 轮 ~ 100 轮；再大请直接用 ERIX_SESSION_AUTO_TITLE=0 关掉自动标题：` +
+      '本旋钮的上界只是抬阈值，零重合旁路不吃它）';
   }
   return true;
 }
