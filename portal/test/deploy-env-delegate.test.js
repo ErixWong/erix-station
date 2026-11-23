@@ -24,6 +24,7 @@
 // （见「根因墓碑」那格）：谁把枚举源改回单文件，那格就红。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -163,6 +164,15 @@ const NAMESPACED_ENV_NAME = /^(?:ERIX|FDE|STATION)_[A-Z][A-Z0-9_]*$/;
 const SCAN_SKIP_DIRS = new Set(['node_modules', '.git', 'test', 'probes', 'skills', 'fixtures', 'dist']);
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
+/**
+ * 扫描面的**扩展名真相**（711d HIGH）：`scanTargets` 只收这里列的扩展名；判据 `#587-S3-⑩`
+ * 拿期望文件 `scannedExtensions` 钉住它，并要求扫描根下所有 git 跟踪文件的扩展名
+ * ∈ scannedExtensions ∪ ignoredExtensions —— 新扩展名（`.mts` / `.jsx`）要么被覆盖，
+ * 要么带理由进白名单，不会再静默失效。
+ */
+const SCANNED_EXTENSIONS = Object.freeze(['js', 'mjs', 'cjs']);
+const SCANNED_EXT_RE = new RegExp(`\\.(?:${SCANNED_EXTENSIONS.join('|')})$`);
+
 /** root 可以是目录（递归）或**单个文件**（活二判据② 的旧口径负例要拿单文件跑同一个扫描器）。 */
 function scanTargets(root) {
   const st = fs.statSync(root);
@@ -173,7 +183,8 @@ function scanTargets(root) {
     if (entry.isDirectory()) {
       if (SCAN_SKIP_DIRS.has(entry.name)) continue;
       out.push(...scanTargets(p));
-    } else if (entry.isFile() && /\.(?:js|mjs|cjs)$/.test(entry.name) && !/\.test\.js$/.test(entry.name)) {
+    } else if (entry.isFile() && SCANNED_EXT_RE.test(entry.name)
+      && !/\.test\.js$/.test(entry.name)) {
       out.push(p);
     }
   }
@@ -4689,6 +4700,77 @@ test('#587-S3-⑨ Env 词元全部记账：每个大写 `Env` 必须落进三桶
       unaccounted.map(({ key, rel, line, occ }) => ({ key, rel, line, occ })),
       () => loadSiteExpectations().envMentions);
   });
+
+/** 扫描根清单：真正会喂给 `scanTargets` 的根（REPO_ROOT 已含 RUNNER_ROOT，分开钉分开报）。 */
+const SCAN_ROOTS = [
+  { label: 'REPO_ROOT', dir: REPO_ROOT },
+  { label: 'RUNNER_ROOT', dir: RUNNER_ROOT },
+];
+
+/** 跟踪路径的扩展名：basename 最后一段点后缀；点文件（`.gitignore` 等）算无扩展 `''`。 */
+function extOfTracked(rel) {
+  const base = rel.slice(rel.lastIndexOf('/') + 1);
+  if (base.startsWith('.')) return '';
+  const dot = base.lastIndexOf('.');
+  return dot < 0 ? '' : base.slice(dot + 1);
+}
+
+/** root 下 git 跟踪文件（/ 分隔），按 `SCAN_SKIP_DIRS` 的目录级跳过语义过滤（同扫描器口径）。 */
+function trackedFilesUnder(root) {
+  const listed = execFileSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8' })
+    .split('\n').filter(Boolean);
+  return listed.filter((rel) => !rel.split('/').slice(0, -1).some((s) => SCAN_SKIP_DIRS.has(s)));
+}
+
+/**
+ * 711d HIGH：**扫描范围被钉住**。四审实测往 `.jsx`/`.html` 放 Env 拼装 S3-⑨ 仍 rc=0：
+ * 不变量只在被扫描的文件集内闭合，而那个文件集没被声明。本判据把口子钉死（闭合式，
+ * 不枚举形态）：扫描根下每一个 git 跟踪文件的扩展名必须 ∈ `scannedExtensions`（被扫描面，
+ * 同时钉住 `SCANNED_EXTENSIONS` 实现）或带理由的 `ignoredExtensions`（刻意不扫）；
+ * 两者都没有 ⇒ 红并列「未覆盖的文件」；ignored 里有死项（扩展名已不在树里）也红。
+ */
+test('#587-S3-⑩ 扫描范围被钉住：扫描根下所有 git 跟踪文件扩展名 ∈ scanned∪ignored', () => {
+  const doc = JSON.parse(fs.readFileSync(ENV_SITE_EXPECTATIONS_FILE, 'utf8'));
+  const scanned = doc.scannedExtensions;
+  const ignored = doc.ignoredExtensions;
+  assert.ok(Array.isArray(scanned) && scanned.every((x) => typeof x === 'string' && x !== ''),
+    `scannedExtensions 必须是非空字符串数组（实际 ${JSON.stringify(scanned)}）`);
+  assert.ok(Array.isArray(ignored), `ignoredExtensions 必须是数组（实际 ${typeof ignored}）`);
+  ignored.forEach((r, i) => {
+    const at = `ignoredExtensions[${i}]（ext=${JSON.stringify(r?.ext)}）`;
+    assert.ok(typeof r?.ext === 'string', `${at} 缺 ext（无扩展名也要用空串显式占位）`);
+    const why = typeof r?.reason === 'string' ? r.reason.trim() : '';
+    assert.ok(why !== '', `${at} 缺 reason：刻意不扫必须写清为什么不扫`);
+  });
+  assert.deepEqual([...scanned].sort(), [...SCANNED_EXTENSIONS].sort(),
+    'scannedExtensions 与扫描器实际集合不一致 ⇒ 改了 `scanTargets`/常量没改期望（或反之），'
+    + '「钉住的扫描范围」就与实际覆盖脱钩');
+  const ignoredExts = new Set(ignored.map((r) => r.ext));
+  const uncovered = [];
+  const present = new Set();
+  for (const { label, dir } of SCAN_ROOTS) {
+    const dist = new Map();
+    for (const rel of trackedFilesUnder(dir)) {
+      const e = extOfTracked(rel);
+      present.add(e);
+      dist.set(e, (dist.get(e) ?? 0) + 1);
+      if (!scanned.includes(e) && !ignoredExts.has(e)) uncovered.push(`${label}:${rel}`);
+    }
+    const pairs = [...dist.entries()].sort((a, b) => b[1] - a[1])
+      .map(([e, n]) => `${e === '' ? '(无扩展)' : e}=${n}`);
+    console.log(`# S3-⑩ 扩展名分布 ${label}（共 ${[...dist.values()].reduce((a, b) => a + b, 0)} 个）：`
+      + pairs.join(' '));
+  }
+  assert.deepEqual(uncovered.sort(), [],
+    `扩展名不在 scannedExtensions∪ignoredExtensions 的跟踪文件（新扩展名要么补覆盖、`
+    + `要么带理由进 ignored）：${JSON.stringify(uncovered.sort())}`);
+  const stale = [...ignoredExts].filter((e) => !present.has(e));
+  assert.deepEqual(stale, [],
+    `ignoredExtensions 有死项（扫描根下已无此扩展名的跟踪文件，白名单要跟着缩）：`
+    + JSON.stringify(stale));
+  console.log(`# S3-⑩ scanned=${JSON.stringify(scanned)} ignored=`
+    + JSON.stringify([...ignoredExts].map((e) => (e === '' ? '(无扩展)' : e))));
+});
 
 /**
  * MED① 的夹具：**路径故意也叫 `portal/src/provisioner.js`** —— 旧形状闸会把它里而每一行都算

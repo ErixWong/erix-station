@@ -11,7 +11,66 @@
     "untraced 桶 ③ 本名单）；落不进任何一桶 ⇒ S3-⑨ 红并打印 rel:line 与行原文。新写法必然多一条。",
     "#587 返修 711d：词元口径收紧 —— 串正文里的 `Env` 只有计算成员下标（`b['Env']`）与属性名位",
     "（`{ 'Env': … }`）才算，普通散文串不进 unaccounted：本名单因此删掉了 7 条纯文案坐标",
-    "（server.js 的 :50 白名单成员与 6 条拒绝文案），只留代码位（标识符/属性名/成员访问）。"
+    "（server.js 的 :50 白名单成员与 6 条拒绝文案），只留代码位（标识符/属性名/成员访问）。",
+    "#587 返修 711d HIGH：扫描范围钉住 —— scannedExtensions = 被扫描面（与扫描器实现互为钉子），",
+    "ignoredExtensions = 刻意不扫的扩展名白名单（每条带 reason）；S3-⑩ 要求扫描根（REPO_ROOT /",
+    "RUNNER_ROOT，按 SCAN_SKIP_DIRS 目录语义过滤）下所有 git 跟踪文件的扩展名落在两者并集内，",
+    "新扩展名（如 .mts/.jsx）既不覆盖也不登记 ⇒ 红；ignored 死项（树里已无该扩展）也红。"
+  ],
+  "scannedExtensions": ["js", "mjs", "cjs"],
+  "ignoredExtensions": [
+    {
+      "ext": "ts",
+      "reason": "portal/frontend 前端 TypeScript 源码（含 *.spec.ts）：vite 编译产物面，JS 的 Env 拼装不发生在这里"
+    },
+    {
+      "ext": "vue",
+      "reason": "portal/frontend 的 Vue 组件：同 ts，前端构建产物面，不由 Node 侧扫描器负责"
+    },
+    {
+      "ext": "md",
+      "reason": "文档/README/issue 笔记：散文，没有可执行的 env 拼装"
+    },
+    {
+      "ext": "sql",
+      "reason": "deploy/migrations 数据库迁移：SQL 面，Docker body 的 Env 数组不在此产生"
+    },
+    {
+      "ext": "json",
+      "reason": "package.json/tsconfig 等配置数据：JSON 无 JS 语法不存拼装；env 配置面另有三腿判据钉住"
+    },
+    {
+      "ext": "sh",
+      "reason": "shell 脚本（runner/entrypoint.sh、db-init 等）：下发走 export/--env，不构造 Docker body 的大写 Env"
+    },
+    {
+      "ext": "yml",
+      "reason": "CI/compose/traefik 配置：compose 的 env 面已由三腿判据（读同一份 yml）钉住，不是 JS 语法面"
+    },
+    {
+      "ext": "yaml",
+      "reason": "deploy/litellm/config.yaml：同 yml，配置文件不是 JS 拼装面"
+    },
+    {
+      "ext": "html",
+      "reason": "portal/frontend/index.html：vite 静态壳（前端入口模板），四审点名的 .html 口子由本条显式声明而非静默漏扫"
+    },
+    {
+      "ext": "css",
+      "reason": "portal/frontend/src/style.css 样式：非代码"
+    },
+    {
+      "ext": "py",
+      "reason": "docs/design 下单次复现脚本（toolcall-args-truncation repro）：文档附属品，不在运行面"
+    },
+    {
+      "ext": "base",
+      "reason": "deploy/kkfileview/Dockerfile.base：镜像构建文件（Docker 语法），不是 JS"
+    },
+    {
+      "ext": "",
+      "reason": "无扩展名与点文件（4 个 Dockerfile、.gitignore/.env.example 等）：构建/配置文件，无 JS 词元可言"
+    }
   ],
   "injectionSites": [
     {
