@@ -241,3 +241,31 @@ test('#677 超限 413 不占幂等占位：同 Idempotency-Key 随后发合法�
     assert.equal(ok.status, 202, '合法重试必须正常 202');
   } finally { await s.close(); }
 });
+
+// ---------------------------------------------------------------------------
+// 防回潮哨兵（源码级）：`maxBodyBytes` 字段已从 config.js 删，http.js 再读它就是读 undefined
+// 然后靠 readJsonBody 的默认参数碰巧落到 64 KiB（假绿：没有任何测试能抓“传 undefined 落默认”）。
+// ---------------------------------------------------------------------------
+test('#677 防回潮哨兵：http.js 不许再引用已删的 config.maxBodyBytes，且 readJsonBody 第二实参只认白名单', () => {
+  const src = fs.readFileSync(new URL('../src/http.js', import.meta.url), 'utf8');
+
+  // ① 死引用：字段已从 config.js 删，任何 `config.maxBodyBytes` 都是假绿。
+  const deadHits = src.match(/config\.maxBodyBytes/g) || [];
+  assert.equal(deadHits.length, 0,
+    `http.js 里不许再出现 config.maxBodyBytes（该字段已删，读它 = 读 undefined ⇒ 靠默认参数假绿），实得 ${deadHits.length} 处`);
+
+  // ② readJsonBody 的第二实参只允许：无实参 / 白名单常量。函数定义行 `function readJsonBody(req, limit = ...)` 单独放行。
+  const ALLOWED = new Set([
+    'MESSAGE_BODY_LIMIT', 'TLS_UPLOAD_BODY_LIMIT', 'market.BUNDLE_MAX_BODY_BYTES',
+    'INTERNAL_EVENTS_LIMIT', 'INTERNAL_ROUND_LIMIT', 'INTERNAL_RECOVERY_ROW_LIMIT', 'INTERNAL_LARGE_BODY_LIMIT',
+  ]);
+  const re = /(function\s+)?readJsonBody\(\s*req\s*,\s*([A-Za-z0-9_.]+)/g;
+  const tokens = [...src.matchAll(re)].filter((m) => !m[1]).map((m) => m[2]); // 排除定义行
+  const bad = [...new Set(tokens.filter((t) => !ALLOWED.has(t)))];
+  assert.deepEqual(bad, [],
+    `readJsonBody 出现白名单外的第二实参：${JSON.stringify(bad)}（默认走 64 KiB 就写 readJsonBody(req)，别塞已删字段名）`);
+
+  // 自证：上面的白名单检查不是空断言——源码里确有真实调用形态被它放行。
+  assert.ok(tokens.includes('MESSAGE_BODY_LIMIT'), '夹具自证：源码里确有 readJsonBody(req, MESSAGE_BODY_LIMIT)');
+  assert.ok(tokens.some((t) => t.startsWith('INTERNAL_')), '夹具自证：源码里确有 readJsonBody(req, INTERNAL_*)');
+});
