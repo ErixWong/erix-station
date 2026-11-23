@@ -295,9 +295,10 @@ export function loadConfig(env = process.env) {
     // KDF 等待队列上限与排队超时：队列满/超时快速失败（503 kdf_busy），不让请求无限排队。
     kdfQueueLimit: intEnv(env, 'KDF_QUEUE_LIMIT', 100),
     kdfQueueTimeoutMs: intEnv(env, 'KDF_QUEUE_TIMEOUT_MS', 30 * 1000),
-    // 请求体上限与字段上限（S3：防止超大 body/字段触发 scrypt 或打爆内存）
-    maxBodyBytes: intEnv(env, 'MAX_BODY_BYTES', 64 * 1024),
-    // issue #472 片 B：单文件上传上限。**与 maxBodyBytes 是两个东西**：后者是 JSON 请求体（默认 64KiB，
+    // 字段上限（S3：防止超大字段触发 scrypt 或打爆内存）。JSON 请求体上限原由一个 env（默认 64 KiB）
+    // 提供，issue #677 已删——它从未接进 compose ⇒ 生产设了也不生效，是个假旋钮；值改由 `http.js` 的
+    // 模块常量 `DEFAULT_JSON_BODY_LIMIT`（仍 64 KiB）承载。
+    // issue #472 片 B：单文件上传上限。**与 JSON 请求体上限是两个东西**：后者是 JSON 请求体（默认 64 KiB，
     // 上传走它则任何真文件都 413），本值由 `receiveUpload` 在流式写入里逐 chunk 兜。
     // ⚠ 它是**单文件**上限、**不是并发上限**：32MiB × N 个并发上传不会进内存（流式），但会同时占磁盘写
     // 与带宽；真正的总量闸门是配额（#472 R6：本版不做，见 docs/env.md）。

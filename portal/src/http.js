@@ -58,7 +58,7 @@ import { metricsApiPayload } from './system-metrics.js'; // #650：管理台系�
 /**
  * **全站 JSON 请求体默认上限（内存护栏 + scrypt 保护）。**
  *
- * 值 64 KiB。它替代了原 env `MAX_BODY_BYTES` 的默认值（该 env 从未接进
+ * 值 64 KiB。它替代了原请求体上限 env 的默认值（那个 env 从未接进
  * `deploy/docker-compose.yml` 的 station-portal environment 列表 ⇒ 生产设了也不生效，是个假旋钮，
  * issue #677 已删）。保留 64 KiB 的理由：① 防超大登录字段触发 scrypt / 打爆内存；
  * ② 有文档依据（`docs/api/portal.md` 登录请求体约束）。46 个调用点共用它，**不许放大**。
@@ -4962,7 +4962,7 @@ async function handleFileTree(req, res, ctx, url) {
  *      `receiveUpload` 内部，全在打开 temp 之前）→ 5. 流式落盘 → 6. 提交。
  * ⚠ 能力位必须在**读 body 之前**：否则一个没开上传的账号可以用一个 32MiB 的 PUT 把 portal 的
  * 内存/带宽花掉才被拒（而 portal 与全站共用一个进程）。判据直接数请求体的 `data` 事件次数。
- * ⚠ **不走 `readJsonBody`/`readRawBody`**：`MAX_BODY_BYTES` 默认 64KiB，走它任何真实上传都会 413；
+ * ⚠ **不走 `readJsonBody`/`readRawBody`**：JSON 请求体上限默认 64 KiB（`http.js` 的 `DEFAULT_JSON_BODY_LIMIT`），走它任何真实上传都会 413；
  *    上限在流式写入里逐 chunk 兜，值由 `upload_settings` 单行表 → `FILE_UPLOAD_MAX_BYTES` → 默认 32MiB
  *    依次回落（#485 片 A：管理台可改且改完立即生效，见 `portal/src/upload-settings.js`）。
  * 属主两个值都传（只传 uid 会留下 gid=0=root 组，agent 改不动），口径见 docs/design/user-space.md §6.2。

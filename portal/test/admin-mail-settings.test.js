@@ -105,7 +105,6 @@ async function startServer({ mailSettings = null, fail = null } = {}) {
     kdfConcurrency: 1,
     kdfQueueLimit: 10,
     kdfQueueTimeoutMs: 1000,
-    maxBodyBytes: 64 * 1024,
     staticDir,
     mail: { killSwitch: false },
   };

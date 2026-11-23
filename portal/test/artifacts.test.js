@@ -196,7 +196,7 @@ async function startHttp({ pool, maxBytes = 20 * 1024 * 1024 } = {}) {
     loginRateLimit: { maxFailures: 5, windowMs: 15 * 60e3, blockMs: 60e3, maxEntries: 10000 },
     totpRateLimit: { maxFailures: 5, windowMs: 15 * 60e3, blockMs: 60e3, perTokenMaxFailures: 5, maxEntries: 10000 },
     kdfConcurrency: 2, kdfQueueLimit: 100, kdfQueueTimeoutMs: 30000,
-    maxBodyBytes: 64 * 1024, maxLoginLength: 128, maxPasswordLength: 256,
+    maxLoginLength: 128, maxPasswordLength: 256,
     staticDir, artifactsRoot, artifactMaxBytes: maxBytes,
   };
   const server = createServer({ pool, config, log: { info: () => {}, warn: () => {}, error: () => {} } });

@@ -695,7 +695,7 @@ async function startHttp() {
     loginRateLimit: { maxFailures: 5, windowMs: 900_000, blockMs: 60_000, maxEntries: 1000 },
     totpRateLimit: { maxFailures: 5, windowMs: 900_000, blockMs: 60_000, perTokenMaxFailures: 5, maxEntries: 1000 },
     kdfConcurrency: 2, kdfQueueLimit: 100, kdfQueueTimeoutMs: 30_000,
-    maxBodyBytes: 64 * 1024, maxLoginLength: 128, maxPasswordLength: 256,
+    maxLoginLength: 128, maxPasswordLength: 256,
     staticDir, userSpaceRoot,
   };
   const server = createServer({ pool, config });
