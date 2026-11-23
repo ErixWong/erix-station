@@ -9430,3 +9430,41 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
 **重置锚点**靠 config 的 `timezone`+`budget_reset_time`；**重置任务约 597s 一跳**；`proxy_batch_write_at: 60` 只影响 spend 落库/报表与日聚合的时效，**不是超发窗口**（超限判定在鉴权阶段先做预算预留：v1.103.2 对可估价请求转发前调 `reserve_budget_for_request`（`proxy/spend_tracking/budget_reservation.py:205-296`）估 token 并按定价预留、响应回来再结算；无法估价的请求回退读时判定，而这类模型通常又没配定价⇒`spend` 恒记 0⇒额度永不触发，与「未定价模型不生效」同一条因果）；`tpd_limit` 是 batch-only 不可用。
 
 **未做的真机验收（本单 LiteLLM 容器未起，均未跑）**：① 额度触发 429；② 重置是否真落在本地周期错点；③ `/user/daily/activity/aggregated` 真机响应形状（周期语义本身已由主 agent 在 v1.103.2 容器实测）。判绿只看退出码：根 `npm test`、前端 `typecheck`/`test` 均 rc=0。
+
+### 8.183 #677 env 清理：删 2 个死旋钮 + 4 个 auth 旋钮进管理台（#718 / #720，2026-11-23，主 agent）
+
+> 编号说明：**跳过 8.182** —— 那个号已被并行 session 的 PR #722（#719 每日 LLM 额度）占用，避免撞号。
+
+**背景**：用户口径「env 尽量少搞，尽量放到 admin console」。先把 61 条 baseline 逐条做**三级追踪**
+（env → config 字段 → 字段真实消费者），结论分三类，只做前两类：
+
+### 已合并
+
+| PR | 内容 |
+|---|---|
+| `#718` `b74e3a9` | 删 `FDE_AGENTD_UID`（**死键**：三级全空；真 UID 焊在 `runner/Dockerfile:35` 的 `useradd -u 1001` + `:168` drop）、删 `LLM_GATEWAY_MODE`（**只校验不生效**）、删冗余字段 `config.cookieProfile`（env 仍活，经 `cookieSettings()` → `config.cookie`） |
+| `#720` `7142701` | 4 个无状态每请求读的 auth 旋钮进管理台：`auth.pending_token_ttl_seconds` / `auth.session_renew_interval_seconds` / `auth.max_password_length` / `auth.max_login_length`。registry **8 → 12 格** |
+
+**`LLM_GATEWAY_MODE` 值得单记**：`6c8ff99`（#117 phase 1）引入，文档写「`external` 指向外部网关」，
+但代码**只做 `self|external` 校验然后存字段，全仓 0 消费者**，`'external'` 字符串只出现在那一行校验里。
+**设了它 portal 照旧打 `http://station-litellm:4000`** —— 挂在 D6「LLM 走唯一出口网关」上的安全面误解。
+而且它本就多余：指向外部网关改 `LLM_GATEWAY_ADMIN_URL`（6 消费者）/ `LLM_GATEWAY_HOST`（13）即可。
+
+**判据**：config 21/21、bootstrap 4/4、delegate 69/69、runtime-settings 78 格、http 36/36、根单测 3192 / 3077 pass / 0 fail。
+父 agent 变异：`pending_token` TTL 退回快照 ⇒ `not ok 31` 点名红。
+删 `config.js` 行导致 env 闸门坐标漂移（`405 → 398`），**闸门自己报警**，按真实行号同步了例外清单与测试。
+
+### 审计结论：剩下三类，两类不做
+
+| 类 | 数量 | 处置 |
+|---|---|---|
+| **限流类**（`LOGIN_RATE_LIMIT_*` / `TOTP_*` / `PREVIEW_TICKET_RATE_LIMIT_*` / `KDF_*` / `RATE_LIMIT_MAX_ENTRIES`） | 10 | **不做**：配置在启动时被 `createRateLimiter(config.x)` / `createSemaphore(...)` **封装进对象**且持有失败计数 ⇒ 现读不生效。要热生效只能 ① 改限流器 API 每次传配置（计数保留）或 ② 变更时重建（**会清空失败计数 ⇒ 管理员改配置等于给攻击者解封**）。这是安全语义决策，且与并行 session 的 LLM 额度工作相邻，**本 session 不碰** |
+| 容器注入类（`ERIX_MAX_ROUNDS` / `ERIX_ARTIFACT_*` / `ERIX_SHELL_*` / `ERIX_DELEGATE_*` 等 13 条） | 13 | **不做**：provisioner 注入 FDE 容器 env ⇒ 改 DB 只影响**新 provision** 的容器，进界面会造成「界面说 20、容器跑 15」两套真相 |
+| `MAX_BODY_BYTES` | 1 | 未做（49 个调用点，干净可做，留给后续） |
+
+### 教训
+
+- **判「死旋钮」必须三级追踪**：只看 `config.X` 字段没人读会误判 —— `COOKIE_PROFILE` 就是这样被我一度判死
+  （它的消费者读的是 `config.cookie`，不是 `config.cookieProfile`）。三级都空才算死。
+- **删 `config.js` 的行是有成本的**：行号漂移会打断 env 闸门的坐标钉住，闸门会红（这是它该干的），
+  每次都要同步 `deploy/env-legs-exceptions.json` 与 `deploy-env-delegate.test.js` 里的真树坐标。
