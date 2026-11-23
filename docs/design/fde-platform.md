@@ -716,14 +716,23 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 
 - `spend` 由 LiteLLM 按「token 数 × 该模型单价」累计到虚拟 key / user；定价配好后管理台铸出的 key `spend` 才会增长。
 - `max_budget` 超限 → LiteLLM 对数据面请求返回 **429**；erix-agent `classifyHttpError`（`src/providers/errors.js`）把 429 归类为 `code='rate_limited'`、`retryable=true`（`RETRYABLE_CODES` 含 `rate_limited`）→ 宿主需友好提示且避免继续重试烧配额（与 §11.4「额度用尽」一致）。
-- **已下发（#719，2026-11-23）**：portal 铸 key / 重存 key 时**已按管理台设定的日额度下发 `max_budget` + `budget_duration:"1d"`**（单位 **USD/天**）。管理台用户管理的「每日额度」区即可设/清额度，无需再到 LiteLLM 侧手设：
-  - 额度落库在 `fde_llm_bindings.daily_budget_usd`（迁移 0047），是状态的**真相**（不变式 3：key 是牲口）——key 被吊销/重铸后额度会从这一列重新下发到新 key（`generateFdeKey` 所有调用点：改白名单重存、key 缺失重铸、onboard 恢复），修「key 轮换丢额度」。
+- **已下发（#719，2026-11-23 改造为周期额度）**：portal 铸 key / 重存 key 时**已按管理台设定的额度下发 `max_budget` + `budget_duration`**（单位 **USD / 周期**，周期由 `budget_duration` 决定）。管理台用户管理的「额度（USD / 周期）」区即可设/清额度（金额输入 + 周期下拉），无需再到 LiteLLM 侧手设：
+  - 额度落库在 `fde_llm_bindings.budget_usd` + `budget_period`（迁移 0047，两列同 NULL / 同非 NULL），是状态的**真相**（不变式 3：key 是牲口）——key 被吊销/重铸后额度会从这两列重新下发到新 key（`generateFdeKey` 与 `updateKey` 重存的所有路径：改白名单重存、key 缺失重铸、onboard 恢复），修「key 轮换丢额度」。
+  - **周期白名单只允许 `'1d'` 与 `'1mo'`（默认 `'1mo'`）**，且 portal **绝不自己推导/换算周期**，只把白名单字符串原样透传给 LiteLLM。语义（主 agent 在运行中的 LiteLLM v1.103.2 容器实测）：
+    - `1d`：每天 `reset_time_of_day`（本环境 `Asia/Shanghai` + `00:00` ⇒ 本地零点）。
+    - `1mo`：**每月 1 日** `reset_time_of_day`；且 `value != 1` 直接抛错（`duration_parser.py:355 _handle_month_reset`）——**只支持 1 个月**，`2mo` 不可用。
+    - `30d`：被**特判成月**（`_handle_day_reset` 里 `value == 30` ⇒ 月重置），**不是“30 天后”**。
+    - `7d`：**每周一**，不是“7 天后”。
+    - `1m`：**1 分钟**，不是 1 个月。
+    ⇒ 所以 `30d`/`7d`/`1m` 都不能当“多少天/月”用，一律不列入白名单。
   - 重置锚点靠 `litellm_settings.timezone:"Asia/Shanghai"` + `budget_reset_time:"00:00"`（见 `deploy/litellm/config.yaml`）：默认 UTC 零点 = 本地 08:00，锚到本地 00:00 才与「一天」直觉一致。
-  - **重置任务约 10 分钟一跳**（LiteLLM 后台 budget reset 循环的粒度），本地 00:00 之后额度不一定瞬时归零，最坏有一个跳的滞后。
+  - **重置任务约 597s 一跳**（LiteLLM 后台 budget reset 循环的粒度），重置时刻之后额度不一定瞬时归零，最坏有一个跳的滞后。
   - **`proxy_batch_write_at: 60`** ⇒ spend 落库是批量写（约每 60s 一跳），因此**最坏可超发约 60 秒**（超限判定读到的是至多 60s 前的 spend）。
-  - **未定价模型不生效**：`pricing_configured=false` 的模型 `spend` 恒记 0（§11.5 上文），累计不到额度上 ⇒ 日额度对「只用未定价模型」的 FDE 实际拦不住（管理台已在额度区显式警告）。
+  - **未定价模型不生效**：`pricing_configured=false` 的模型 `spend` 恒记 0（§11.5 上文），累计不到额度上 ⇒ 周期额度对「只用未定价模型」的 FDE 实际拦不住（管理台已在额度区显式警告）。
   - **`tpd_limit` 为何不可用**：该端点是 **batch-only**（`/user/daily/activity` 的 `tpd_limit` 只在批量查询里回，不能按 key 直接下发成限额），故本单只用 `max_budget`（USD），不用 tpd_limit。
-- **真机验收未跑（本单 LiteLLM 容器未起）**：「额度触发 429」「重置是否真落在本地 00:00」「`/user/daily/activity/aggregated` 真机响应形状」三项均未在真机验证。
+  - **`spend` 是运行计数器 ⇒ `spend_scope`**：`/key/info` 的 `spend` 只有在存在 `budget_duration` 时才按周期归零；**无额度时是终身累计**。因此 `getFdeBudget` 返回 `spend_scope`：`budget_duration` 非空⇒`'period'`（本周期已用），无额度⇒`'lifetime'`（终身累计）——这是前端已用标签的**唯一依据**（无额度的 FDE 不得把 `spend` 标成“本周期已用”）。
+  - **日聚合表是 UTC 日桶**（`common_daily_activity.py:563-600`）：`/user/daily/activity` 返回的是 **UTC 日**分桶；`timezone`（我们传 480）**只用于决定 end_date 是否把今天扩成一个 UTC 桶**，历史日期是 **pass-through**（不会把 UTC 桶重算成 UTC+8 日）。因此「本周期已用」（网关实时计数器、本地周期）与用量表最后一行（UTC 日桶）**天然可能对不上**，两者**不互相校验**。
+- **真机验收未跑（本单 LiteLLM 容器未起）**：「额度触发 429」「重置是否真落在本地周期错点」「`/user/daily/activity/aggregated` 真机响应形状」三项均未在真机验证（周期语义本身已由主 agent 在 v1.103.2 容器实测）。
 
 ---
 
