@@ -9687,3 +9687,80 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
 
 **闸（rebase 到 origin/main 后的最终树，父 agent 复跑）**：`npm test` **rc=0 / 3250 tests / 3135 pass / 0 fail / 115 skipped**；`node --test portal/test/login-email-code.test.js` **33 pass / 0 fail**（基线 29 + 新增 4）；`node --check` 三文件通过；`check:agents-hotlayer` **VERDICT ok**（热层 19366/19456，台账 186 条无重复）。
 **父 agent 变异实测**：拆窗口谓词 ⇒ ㉓+⑧b 红；不复制 `code_hash` ⇒ ㉑㉒ 红；「永不复用」短路 ⇒ ㉑㉒ 红；去掉「作废旧行」⇒ ㉑ 红；`expires_at` 改成续命 `now+ttl` ⇒ ㉑ 红。**假库对列名无牙**（把 INSERT 列名写成 `created_ua_bad` 单测仍全绿——`fake-pool.js` 按参数位解析的既有家族缺口，所有 INSERT 同病，硬化另开单）⇒ 改用**真 PG 对账**：正确列形带 `attempts=3 / max_attempts=5` 插入成功、错列名当场报错（事务内 INSERT 后 ROLLBACK，未在库里留数据）。
+
+### 8.192 `AGENTS.md` 热层清退：判据换成「policy 还是 fact」，19366 → 8798 字节（2026-11-24，主 agent）
+
+**触发**：用户看到预算条（热层 19366 / 19456，余 90 字节）要求查清里面写了什么，并给出判据
+**「热层要放的是 policy 不是事实」**。工单 `fix-261124-27-agents-hotlayer-policy-only`。
+
+**现验现场**（三条都当轮跑的，没抄旧账）：
+
+1. 预算 19456 是 `07f9198`（2026-11-11，当时热层 18371）`--sync` 写下的派生值 `ceil(n/512)*512+1024`；
+   之后 `d9a27c8` 18633 → `5c7fc2c` 18706 → `9c1bdd9` **19366**，**没有人 sync 却涨了 995**。
+   `--sync` 只写数、不留理由 ⇒ 这是棘轮：见底就抬 1KB，永远回不去。
+2. **热层当时正带着一条假事实**：§4.2「`max_budget` 仍未下发」，而
+   `docs/design/fde-platform.md:719` 写的是「**已下发**（#719，2026-11-23 改造为周期额度）」——
+   这条每轮全额注入给所有 agent，就是 §8.187 那类「教错文案」的同族，只是 `BANNED` 正则抓不到。
+   同族第二条：§8 末尾「当前已在 §8.126.1 之后」，而台账末尾当时是 §8.187。
+3. 逐块字节（脚本现算）：§4 六条 ⚠ 排障块 3320（其中「GitHub DNS/代理」985 是全局 §3.7 +
+   `~/projects/docs/git-github-ops.md` 的**第三份副本**，块自己末行就写着「最新口径见全局」）、
+   §4.2 LiteLLM 2722（25 行 / 平均 151 字节一行，其中「已知遗留」三条 667 全是历史）、
+   §7.2 D9 2108、§4.1 测试账号 1761、§5 端口表 1237。含日期 / SHA / `#NNN` / 版本号 / `file:line` /
+   测量数的行合计 **7090 字节**。
+
+**采用的判据**（已写进热层引言，让它自己防复胖）：一段话能改写成祈使句（做 X / 不做 X / 冲突时怎么办）
+= policy，留；只能写成「X 是什么值 / 是什么样 / 曾经出过什么事」= fact，出冷层。
+**policy 一句 + 指针，现场不许跟着 policy 一起进来。**
+
+**搬移去向**（先落冷层再从热层删，一条不丢）：
+
+- `docs/testing.md` **§1.3.1** 六条本机测试坑（`npx vitest` 挂死、vitest 全绿而 rc=1、
+  `NODE_ENV=production` 假红、worktree 缺 `node_modules` 与 120000 符号链接史、项数 1022→510、
+  devDependencies 装不上）；**§1.3.2** dev 栈登录事实与探针口径（入口、两账号第二因素、口令文件、
+  密码重置）。热层各留一行判据。
+- `docs/env.md` **§8.1.1**（新增）内网 DNS `dns.internal` 把 `github.com` 钉到半死地址、本机
+  `http.*` 配置实测、显式代理命令与「别在全局 env 设 `HTTP(S)_PROXY`」。
+- `docs/design/fde-platform.md` **§11.4** 末尾追加 LiteLLM 事实面（profile 起栈、虚拟 key 明文为何
+  入库、迁移 `0010` 清了旧 `api_key`、credential 无启停语义、`litellm_params.model` 不自动加前缀、
+  mock 来源与 `wp3a`–`wp6` 覆盖）；**附录 A.2** 追加四态语义 / ⚪ 不得渲染成绿 / portal 零 git 写 /
+  数据源与成本上界（`-uno` 实测撒谎）。
+- **不搬直接删**（冷层已有家，搬=抄第二本账）：端口表 cells ⇒ `edge-routing` §4/§6 + `env` §5/§8.2；
+  CI 复述 ⇒ `ci-release` §1–§7；热层闸自己的实现细节 ⇒ `scripts/agents-hotlayer-budget.mjs` 文件头 + §8.121。
+
+**结果**：热层 **19366 → 8798**（-10568，**-55%**），`AGENTS.md` 全文 21050 → **10164**；
+`--sync` 把预算按新热层重算为 **10240**（`--sync` 对字节预算是重算而非取 max，所以热层缩了预算跟着降）。
+
+**撞号现场（本单**连踩两次**，现验后两次改号）**：这条最初写的是 **§8.188**，而 `origin/main` 上
+并行 session 已用掉 188/189/190（`99ff95e`）；改到 **8.191** 再 rebase，发现另一个 session 也在同一轮
+把他们的 #737 那条从 8.188 顺延到 **8.191**（`c8ea4b6`，理由写的正是「并行 session 已占用 188/189/190」）
+⇒ 二次撞号，本条最终 **8.192**。
+**根因不是手滑，是判据本身漏了**：热层写的「挑号前先 `grep ... | tail -3`」查的是**自己的树**，
+而建分支之后 main 随时在动。⇒ 挑号前必须 `git fetch` 后在 **`origin/main`** 上查末尾，
+或直接在自己的条目里带一个别人复制不走的坐标（分支名 / PR 号）。见下方残余第 4 条。
+闸的 `ledger-integrity`（重复编号即红）是最后那道闸，本单两次都是它先报出来的，别绕。
+
+**闸**：`npm run check:agents-hotlayer` 六项全 `ok`；§8.N 引用面见登记表（`--sync` 抬地板到现值，
+搬移没丢引用）。
+
+**残余**（三条，都挂事实不挂版本号）：
+
+1. `--sync` 不要求理由 ⇒ 棘轮仍在。要焊死需给它加 `--reason`（照 `--rebaseline` 那样登记进
+   `scripts/agents-hotlayer-budget.json`），改动落在 `scripts/agents-hotlayer-budget.mjs` +
+   `test/agents-hotlayer.test.js` 的反向自证。
+2. `BANNED` 三条正则抓不到「仍未下发 / 已补 / 已删除 / 现已…」这类当下状态陈述——本单抓到的那条
+   假事实正是漏网的。加模式必须配套夹具，否则闸会变成新的假绿发生器。
+3. 全局冷层 `~/projects/docs/git-github-ops.md`（源 `pi-tools/docs/`，**另一个项目的树**）才是
+   GitHub 网络事实的规范家；本单只在**本仓** `docs/env.md` §8.1.1 落了一份，跨项目 git 写未做。
+4. **挑号判据要升级**：热层现在写的是「挑号前先 `grep -n '^### 8\.' docs/maintenance/task-ledger.md
+   | tail -3`」——**这只查自己的树**。本单 20 分钟内撞两次（上面那条），另一 session 同轮也撞了。
+   建议改成：先 `git fetch`，在 `origin/main` 上查末尾
+   （`git show origin/main:docs/maintenance/task-ledger.md | grep -n '^### 8\.' | tail -3`），
+   或给条目带一个不可复制的坐标（分支名 / PR 号）。改完同步 `AGENTS.md` §6 与 §8 末。
+
+**CI 现场（不是本单 diff 造成的，但挡住了合并）**：PR #744 两次跑都在门禁步骤 ②「根 npm ci + npm test」
+红：`admin-seat-content.test.js` 的 `#727-5b`（`500 !== 206`）与 `pv-proxy.test.js` 的
+`/api/file?mode=stream`（`fetch failed`）——全在预览流 / Range 这一面。同一步骤 PR #743 也红；
+本单本地全量三次：红 1（#727-5b）、绿、绿；两个红格子单跑各 13/13 绿。修它的是并行 session
+的 `fix-261124-06-filestream-own-fd`（`98a4571`「文件流改由 FileHandle 自己拥有 fd，消除 double-close」，
+该分支自己的 CI 已绿，**尚未进 main**）。本单不越界代修。
+
