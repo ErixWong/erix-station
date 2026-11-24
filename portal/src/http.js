@@ -3164,7 +3164,7 @@ async function handleSessionStream(req, res, ctx, sessionId) {
  * 表示还有更早批次。大小防护：limit 默认 500/上限 2000；payload 字符串叶值统一截 2000 字符
  * （tool_use.input / tool_call_delta.arguments_delta 可能很大），防超大响应。
  */
-const HISTORY_EVENT_TYPES = new Set([
+export const HISTORY_EVENT_TYPES = new Set([
   // issue #502 D-7：`tool_call_delta` 从本白名单**摘掉**（三类碎片里此前只有它在册）。
   // 理由：① 它已不再落库（`internal.js` 写入侧按引擎 `eventTierOf` 拦住），存量也由迁移 0033 清掉
   //   ⇒ 留在集合里是一个**永不命中**的谓词；② 它的**成型副本**在 `tool_use.input`，工具卡片的入参
@@ -3224,8 +3224,8 @@ const HISTORY_EVENT_TYPES = new Set([
   // 判据：`portal/test/textualized-toolcall.test.js`（源码级 + 行为级各一条，行为级就在本端点）。
   'textualized_tool_call',
 ]);
-const HISTORY_EVENT_DEFAULT_LIMIT = 500;
-const HISTORY_EVENT_MAX_LIMIT = 2000;
+export const HISTORY_EVENT_DEFAULT_LIMIT = 500;
+export const HISTORY_EVENT_MAX_LIMIT = 2000;
 const HISTORY_PAYLOAD_STRING_CAP = 2000;
 // issue #300：中止/失败 run 的**只读正文重建**。runner 的 catch 固定 `final_text: ''` ⇒ 该 run 在
 // `messages` 里**零助手锚点**，而正文区本来就只从锚点渲染 ⇒ 界面上这次 run 一片空白（实测标本
@@ -3302,7 +3302,7 @@ function buildPartialSnapshotFrames({ sessionId }) {
 }
 
 // 展示 payload 截断：字符串叶值超cap → 截断 + 标记（JSON 形状保持合法，前端 String() 路径原样可用）。
-function truncateHistoryPayload(value, depth = 0) {
+export function truncateHistoryPayload(value, depth = 0) {
   if (typeof value === 'string') {
     return value.length > HISTORY_PAYLOAD_STRING_CAP
       ? value.slice(0, HISTORY_PAYLOAD_STRING_CAP) + '…（已截断）'
@@ -3466,7 +3466,7 @@ async function projectPartialOutputItems(pool, candidates) {
 }
 
 /** 合成项参与升序排序，但**不占 limit、不参与 next_cursor/hasOlder**（那两个仍只由真实事件决定）。 */
-function mergeSynthItemsBySeq(realEvents, synthItems) {
+export function mergeSynthItemsBySeq(realEvents, synthItems) {
   if (!synthItems.length) return realEvents;
   const parts = synthItems.slice().sort((a, b) => a.seq - b.seq);
   const merged = [];
@@ -3652,7 +3652,7 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
  * `seq` = 该 run 在 `run_events` 里的**最大 seq**（不新分配）：`run_end` 行本来就在表里 ⇒ 分隔条天然落在
  * 本次 run 内容之后，且分页窗口外的行也拿得到（`MAX(seq)` 不受 `before` 限制）。
  */
-async function buildHistorySynthItems(pool, windowRows, { before = null, sessionId = null, pageLow = 0, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
+export async function buildHistorySynthItems(pool, windowRows, { before = null, sessionId = null, pageLow = 0, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
   const windowRunIds = distinctWindowRunIds(windowRows);
   // issue #514：**候选发现不能只认白名单行**。`stopSession` 的 killedQueued 分支（queued 从未开始
   // 就被取消）这次 run 只写**一行** `run_end`，而它不在下发白名单（红线）⇒ 这个 run 在白名单行里
