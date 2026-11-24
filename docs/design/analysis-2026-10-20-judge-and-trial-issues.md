@@ -135,9 +135,9 @@
 
 | 路径 | 内容 | 可信度 |
 |---|---|---|
-| `/home/eric/projects/erix-llm-kit/docs/delivery/analysis-261016-judge-final-plan.md` | reviewer 对定稿的独立审查（40KB，294 行，含探针记录与逐条问答） | 承重结论**已由主 agent 在 `9440b1c` 复验**；行号按 `2c1a8d3` 写，§1.3 已刷新 |
-| `/home/eric/projects/erix-llm-kit/docs/delivery/analysis-261016-judge-advisory.md` | erix_run 对我初版修法的审查 | ⚠ **部分作废**：引用了不存在的 `engine-judge` / `normalizeSessionJudgeDecision`（§1.1） |
-| `/home/eric/projects/erix-station/.work-orders/analysis-issues-261016.md` | 四条未处理项的初次综合分析 | ⚠ 同上，judge 段需按本文重述 |
+| `/home/devuser/projects/erix-llm-kit/docs/delivery/analysis-261016-judge-final-plan.md` | reviewer 对定稿的独立审查（40KB，294 行，含探针记录与逐条问答） | 承重结论**已由主 agent 在 `9440b1c` 复验**；行号按 `2c1a8d3` 写，§1.3 已刷新 |
+| `/home/devuser/projects/erix-llm-kit/docs/delivery/analysis-261016-judge-advisory.md` | erix_run 对我初版修法的审查 | ⚠ **部分作废**：引用了不存在的 `engine-judge` / `normalizeSessionJudgeDecision`（§1.1） |
+| `/home/devuser/projects/erix-station/.work-orders/analysis-issues-261016.md` | 四条未处理项的初次综合分析 | ⚠ 同上，judge 段需按本文重述 |
 | `/tmp/judge-probe/probe{,3,4,5,6,7}.mjs` | reviewer 的离线行为探针（fake-provider，**非真模型**） | 仓库外，`/tmp` 可能被清；结论已在 §2 重述 |
 | ~~`~/worker-reports-261016/audit-final-design-282-284-286-judge.md`~~ | copilot 审计 | **不存在**（§1.2） |
 

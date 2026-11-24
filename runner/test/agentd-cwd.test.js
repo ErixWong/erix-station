@@ -16,8 +16,8 @@ test.after(() => {
 });
 
 test('resolveRunCwd：run.cwd（~/projects/<name>）为权威 → 直达项目目录并确保存在', () => {
-  const cwd = resolveRunCwd({ id: 'r1', cwd: '~/projects/meeting_asr_app' });
-  assert.equal(cwd, path.join(process.env.FDE_HOME, 'projects', 'meeting_asr_app'));
+  const cwd = resolveRunCwd({ id: 'r1', cwd: '~/projects/demo_app' });
+  assert.equal(cwd, path.join(process.env.FDE_HOME, 'projects', 'demo_app'));
   assert.ok(fs.existsSync(cwd), '目录不存在时 mkdir 兜底（新建目录语义）');
 });
 

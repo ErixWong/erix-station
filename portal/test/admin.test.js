@@ -867,13 +867,13 @@ test('admin 用户管理：PATCH 更新资料并在禁用时吊销会话；重�
     const res = await fetch(`${base}/api/admin/users/${FDE_USER.id}`, {
       method: 'PATCH',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ display_name: ' Alice Wong ', role: 'admin', fde_name: 'alice-new', status: 'disabled' }),
+      body: JSON.stringify({ display_name: ' Alice Demo ', role: 'admin', fde_name: 'alice-new', status: 'disabled' }),
     });
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(
       { display_name: body.user.display_name, role: body.user.role, fde_name: body.user.fde_name, status: body.user.status },
-      { display_name: 'Alice Wong', role: 'admin', fde_name: 'alice-new', status: 'disabled' },
+      { display_name: 'Alice Demo', role: 'admin', fde_name: 'alice-new', status: 'disabled' },
     );
     assert.ok(pool.users.find((user) => user.id === FDE_USER.id).disabled_at instanceof Date);
     assert.ok(pool.sessions.find((session) => session.id === 'ls-alice-active').revoked_at);

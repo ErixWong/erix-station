@@ -31,7 +31,7 @@ function fakePool({ cwdCounts = {} } = {}) {
 test('listDirs：枚举一级目录（字典序），cwd 相对形式 + 运行态徽标聚合', async () => {
   const { root, projects } = tmpUserspace();
   try {
-    fs.mkdirSync(path.join(projects, 'meeting_asr_app'), { recursive: true }); // 下划线目录名必须可枚举（P5 自由命名）
+    fs.mkdirSync(path.join(projects, 'demo_app'), { recursive: true }); // 下划线目录名必须可枚举（P5 自由命名）
     fs.mkdirSync(path.join(projects, 'llm-smoke'), { recursive: true });
     fs.writeFileSync(path.join(projects, 'a-file.txt'), 'x'); // 文件不列为目录
     fs.symlinkSync(path.join(projects, 'llm-smoke'), path.join(projects, 'link-dir')); // symlink 不列为目录
@@ -39,16 +39,16 @@ test('listDirs：枚举一级目录（字典序），cwd 相对形式 + 运行�
     const pool = fakePool({
       cwdCounts: {
         '~/projects/llm-smoke': { running: 2, queued: 1 },
-        '~/projects/meeting_asr_app': { running: 0, queued: 0 },
+        '~/projects/demo_app': { running: 0, queued: 0 },
       },
     });
     const r = await listDirs(pool, { userId: 'u1', userSpaceRoot: root, fdeName: 'alice' });
-    assert.deepEqual(r.dirs.map((d) => d.name), ['llm-smoke', 'meeting_asr_app']);
-    const smoke = r.dirs[0];
+    assert.deepEqual(r.dirs.map((d) => d.name), ['demo_app', 'llm-smoke']);
+    const smoke = r.dirs[1];
     assert.equal(smoke.cwd, '~/projects/llm-smoke');
     assert.equal(smoke.running_count, 2);
     assert.equal(smoke.queued_count, 1);
-    assert.equal(r.dirs[1].running_count, 0, '无活跃 run 的目录徽标为 0');
+    assert.equal(r.dirs[0].running_count, 0, '无活跃 run 的目录徽标为 0');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -59,12 +59,12 @@ test('listDirs：隐藏目录（. 开头）不列——下拉只给真项目，�
   try {
     fs.mkdirSync(path.join(projects, '.pnpm-store'), { recursive: true }); // 真实案例：pnpm 缓存落在挂载根
     fs.mkdirSync(path.join(projects, '.config'), { recursive: true });
-    fs.mkdirSync(path.join(projects, 'lingolens'), { recursive: true });
+    fs.mkdirSync(path.join(projects, 'demo-project'), { recursive: true });
     fs.writeFileSync(path.join(projects, '.gitignore'), 'x'); // 隐藏文件同样不列
 
     const pool = fakePool({ cwdCounts: { '~/projects/.pnpm-store': { running: 1, queued: 0 } } });
     const r = await listDirs(pool, { userId: 'u1', userSpaceRoot: root, fdeName: 'alice' });
-    assert.deepEqual(r.dirs.map((d) => d.name), ['lingolens']);
+    assert.deepEqual(r.dirs.map((d) => d.name), ['demo-project']);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

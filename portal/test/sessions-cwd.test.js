@@ -36,7 +36,7 @@ function poolWith({ fdeName = 'alice' } = {}) {
 }
 
 test('validateSessionCwd：~/projects/<name> 合法（含下划线/点段/数字），其余一律拒绝', () => {
-  assert.equal(validateSessionCwd('~/projects/meeting_asr_app'), '~/projects/meeting_asr_app');
+  assert.equal(validateSessionCwd('~/projects/demo_app'), '~/projects/demo_app');
   assert.equal(validateSessionCwd('~/projects/a'), '~/projects/a');
   assert.equal(validateSessionCwd('~/projects/my.app-2'), '~/projects/my.app-2');
   for (const bad of [

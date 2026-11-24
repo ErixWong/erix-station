@@ -54,7 +54,7 @@ node --check "$RUNNER_JS"
 #### 1.2.2 单测
 
 ```bash
-cd /home/eric/projects/erix-station
+cd /home/devuser/projects/erix-station
 # ✅ 前置条件已满足：portal/ 与 package.json 已落地（数量见 §1.1 注，以实际输出为准）
 npm test                                    # 默认 Node 22
 PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node 24）

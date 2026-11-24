@@ -135,7 +135,7 @@ test('clipTitleFromMessage / fallbackTitleFromCwd：首条消息截断与 cwd ba
   assert.equal(clipTitleFromMessage('  多行\n消息  '), '多行 消息', '空白折叠（不换行——截断语义保留原文轮廓）');
   assert.equal(clipTitleFromMessage(''), null);
   assert.equal(clipTitleFromMessage(null), null);
-  assert.equal(fallbackTitleFromCwd('~/projects/meeting_asr_app'), 'meeting_asr_app');
+  assert.equal(fallbackTitleFromCwd('~/projects/demo_app'), 'demo_app');
   assert.equal(fallbackTitleFromCwd(`~/projects/${'a'.repeat(50)}`), 'a'.repeat(AUTO_TITLE_MAX_LEN), '长目录名截断 30 字符');
   assert.equal(fallbackTitleFromCwd(''), '未命名会话');
   assert.equal(fallbackTitleFromCwd(null), '未命名会话');
@@ -622,7 +622,7 @@ test('evaluateAutoTitle：生成的标题超 30 字符 → 清洗截断后落库
 
 test('evaluateAutoTitle：生成不合规（仅空引号）且首条消息为空 → 末级降级 cwd basename', async () => {
   const pool = withBinding(titlePool({
-    session: { cwd: '~/projects/meeting_asr_app' },
+    session: { cwd: '~/projects/demo_app' },
     messages: [{ role: 'user', content: '   ', seq: 1, run_id: 'r1' }],
   }));
   const f = fakeChatFetch();
@@ -631,7 +631,7 @@ test('evaluateAutoTitle：生成不合规（仅空引号）且首条消息为空
     log: { warn() {}, info() {} },
   });
   assert.equal(f.calls.length, 0, '这个夹具里没有 assistant 锚点 ⇒ 没有输入 ⇒ 不发请求，直接走降级链');
-  assert.equal(title, 'meeting_asr_app', '末级降级 = cwd basename');
+  assert.equal(title, 'demo_app', '末级降级 = cwd basename');
 });
 
 test('evaluateAutoTitle：manual 行绝不覆盖（并发手工 PATCH 语义）', async () => {

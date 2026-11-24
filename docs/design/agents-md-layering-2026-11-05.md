@@ -100,7 +100,7 @@ select count(distinct e.run_id) from run_events e join runs r on r.id=e.run_id
 | 子仓库 | `~/projects/<project>/<repo>/AGENTS.md` | ❌ | ✅ |
 
 实测盘点（`/srv/erix/users`）：平台文件 6 份（各 5.6–9.0 KB）；**项目级只有 1 份**
-（`eric/projects/meeting_asr_app/AGENTS.md`，911 B）；`~/projects/AGENTS.md` **一份都没有**。
+（`eric/projects/demo_app/AGENTS.md`，911 B）；`~/projects/AGENTS.md` **一份都没有**。
 ⇒ 本功能的**当前收益主要来自平台层**（那 9 KB），父/项目层是"为将来留位 + 让已有的那份生效"。
 
 ---

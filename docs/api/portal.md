@@ -1266,7 +1266,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 - 形态必须是 `~/projects/<name>`，`<name>` 为**一级目录**（不得含 `/`）——路径穿越就靠这一条拦；
 - `<name>` 为 `.` / `..` / 含控制字符（`\x00-\x1f`、`\x7f`）⇒ `400 validation_failed`（`details.field='project_id'`）；
 - **字符集与长度不限**：下划线、点、中文、空格、超过 63 字符都照收（容器内用户自建目录的自由命名权；
-  真库存量如 `~/projects/meeting_asr_app`）。`chat_sessions.cwd` 列**没有任何 CHECK**，服务端不按
+  真库存量如 `~/projects/demo_app`）。`chat_sessions.cwd` 列**没有任何 CHECK**，服务端不按
   「DNS label」收紧——P5 起目录名不进 hostname（迁移 `0008`），没有那个约束来源；
 - 目录不存在时服务端 `mkdir`（权限口径同工作区目录；已存在则幂等复用，不重建）。
 - **前端「＋ 新建目录」表单另有一层更严的规则**：`DIR_NAME_RE`（`portal/frontend/src/lib/constants.ts`，
@@ -3762,7 +3762,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   说成「很闲」）。`containers` 可以是整个 `null`（docker 不可达）——那是「读不到」而不是「0 台」；
   `containers.drift` 是「DB 说 N 台 ↔ Docker 实际 M 台」的对账（`onlyDb` / `onlyDocker` 点名到容器）。
   **FDE 容器只按 `station.managed=true` 标签判定**（`fde` / `fdeRunning` / `fdeNames` 三格同源）：
-  名字前缀 `fde-` **不算**——宿主上另一个项目的容器可能就叫 `fde-workshop-db`，按前缀算会凭空多出两台
+  名字前缀 `fde-` **不算**——宿主上另一个项目的容器可能就叫 `otherproj-db`，按前缀算会凭空多出两台
   「只在 Docker 里」的假告警（261118 真机验收实测）。反过来，一台丢了标签的 FDE 会以 `onlyDb` 的形态
   出现在对账里，那正是要看见的信号。
 - `latest.disk[]`：**一个文件系统一行**，去重键是 `statfs` 的三元组（`total/used/avail`），不是设备名——

@@ -7,7 +7,7 @@
 ## 1. 背景与动机
 
 「项目注册制」的前提是「平台先于工作」，但工位现实是「工作先于平台」：agent 直接
-`mkdir ~/projects/meeting_asr_app && git clone` 十秒完成，注册沦为事后补票或干脆不补，
+`mkdir ~/projects/demo_app && git clone` 十秒完成，注册沦为事后补票或干脆不补，
 平台视图与磁盘真实状态漂移。验尸 projects 实体承载的五项职责，仅「端口分配锚点」是硬的，
 其余（会话归属、run cwd、脚手架、slot/template）均可字符串化或退役。
 

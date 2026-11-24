@@ -451,7 +451,7 @@ export function countContainers(list) {
   const nameOf = (c) => String((c?.Names?.[0] ?? c?.name ?? '')).replace(/^\//, '');
   const managed = (c) => (c?.Labels ?? {})['station.managed'] === 'true';
   // FDE 容器**只认 `station.managed` 标签**（261118 真机验收修掉的误报）：名字前缀 `fde-` 不算数。
-  // 现场反例：宿主上另一个项目的两个容器叫 `fde-workshop-db` / `fde-workshop-db-old-261107`，
+  // 现场反例：宿主上另一个项目的两个容器叫 `otherproj-db` / `otherproj-db-old-261107`，
   // 它们没有任何 station 标签，却被前缀规则算成 FDE ⇒ 面板显示「DB 6 台 ↔ Docker 8 台」并点名
   // 这两台「只在 Docker 里」。真 FDE 六台**全都**带标签（provisioner 必写），所以标签是完备的判据；
   // 反过来说，一台丢了标签的 FDE 会以 `onlyDb` 的形态出现在对账里——那正是要看见的信号。

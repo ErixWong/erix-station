@@ -592,8 +592,8 @@ test('W-4 admin DTO 五个生产点都带 last_activity_at，且**值与库里�
   assert.equal(listed.items[0].last_activity_at, iso, '值必须等于库里那一刻（键存在挡不住漏列）');
 
   // ② updateUser（PATCH）——工单陷阱三：这两条 CTE 以前用 NULL::timestamptz 补 DTO 形状
-  const patched = await admin.updateUser(pool, USER_ID, { display_name: 'Alice Wong' });
-  assert.equal(patched.user.display_name, 'Alice Wong', 'PATCH 真的改了（不是提前返回）');
+  const patched = await admin.updateUser(pool, USER_ID, { display_name: 'Alice Demo' });
+  assert.equal(patched.user.display_name, 'Alice Demo', 'PATCH 真的改了（不是提前返回）');
   assert.equal(patched.user.last_activity_at, iso,
     'PATCH 返回的必须是**真实时刻**，不是 NULL —— 写 NULL 就会把「上周说过话」显示成「从未活动」');
 
@@ -632,21 +632,21 @@ test('W-4b 假池自己有牙：把旧写法（NULL::timestamptz 补 DTO 形状�
   // 变异一：RETURNING 不带列 + 外层 NULL 别名（本单之前的旧写法）
   const dropped = new AdminActivityPool([ADMIN_USER()]);
   dropped.mutateNullAlias = 'drop';
-  const r1 = await admin.updateUser(dropped, USER_ID, { display_name: 'Alice Wong' });
-  assert.equal(r1.user.display_name, 'Alice Wong', '变异没改掉 PATCH 本身（只改 DTO 那一列的取法）');
+  const r1 = await admin.updateUser(dropped, USER_ID, { display_name: 'Alice Demo' });
+  assert.equal(r1.user.display_name, 'Alice Demo', '变异没改掉 PATCH 本身（只改 DTO 那一列的取法）');
   assert.equal(r1.user.last_activity_at, null,
     '旧写法必须让假池交出 null（而不是替产品代码补真值）⇒ W-4 的「值相等」当场红');
 
   // 变异二：RETURNING 带了列，但外层又补同名 NULL 别名 —— PG 输出两列同名，node-pg 行对象里后者赢
   const aliased = new AdminActivityPool([ADMIN_USER()]);
   aliased.mutateNullAlias = 'aliasOnly';
-  const r2 = await admin.updateUser(aliased, USER_ID, { display_name: 'Alice Wong' });
+  const r2 = await admin.updateUser(aliased, USER_ID, { display_name: 'Alice Demo' });
   assert.equal(r2.user.last_activity_at, null,
     '同名别名列赢过真值（这是真库里的实际行为，不是假池的洁癖）⇒ 产品侧必须在 RETURNING 里拿列且不补 NULL');
 
   // 对照：不施变异时同一个池必须给真值（否则上面两条是「假池根本拿不到值」的假红）
   const clean = new AdminActivityPool([ADMIN_USER()]);
-  const r3 = await admin.updateUser(clean, USER_ID, { display_name: 'Alice Wong' });
+  const r3 = await admin.updateUser(clean, USER_ID, { display_name: 'Alice Demo' });
   assert.equal(r3.user.last_activity_at, iso, '同一份库、同一条 PATCH：不补 NULL 就拿得到真值');
 
   // 并且钉住产品 SQL 现在的形状：两条 CTE 都把列写进 RETURNING，块内不许出现 NULL 补位

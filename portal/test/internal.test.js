@@ -80,14 +80,14 @@ test('assembleTicket：resume = attempt > 1（方案 B re-claim）', () => {
 test('assembleTicket：P5 cwd 权威下行 + project 快照兼容旧 agentd（双列过渡）', () => {
   const t = assembleTicket({
     queueId: 'q1', claimToken: 'ct1', leaseUntil: new Date('2026-09-12T00:01:30Z'),
-    run: { id: 'run1', session_id: 's1', model: 'm', cwd: '~/projects/meeting_asr_app' },
-    project: { name: 'meeting_asr_app', root_path: '~/projects/meeting_asr_app' },
+    run: { id: 'run1', session_id: 's1', model: 'm', cwd: '~/projects/demo_app' },
+    project: { name: 'demo_app', root_path: '~/projects/demo_app' },
     message: { id: 'm1', content: 'hi', attachments: [] }, attempts: 1,
   });
-  assert.equal(t.run.cwd, '~/projects/meeting_asr_app');
+  assert.equal(t.run.cwd, '~/projects/demo_app');
   // project 快照保留（部署序 portal 先上、FDE 镜像后上：旧 agentd 只读 run.project）。
-  assert.equal(t.run.project.name, 'meeting_asr_app');
-  assert.equal(t.run.project.root_path, '~/projects/meeting_asr_app');
+  assert.equal(t.run.project.name, 'demo_app');
+  assert.equal(t.run.project.root_path, '~/projects/demo_app');
 
   // cwd 缺失（旧 DB 行未回填的极端态）→ 下行 null，agentd 侧回退 project.name。
   const legacy = assembleTicket({
@@ -107,10 +107,10 @@ test('assembleTicket：git identity 优先用户邮箱、缺失时回退，身�
   };
   const storedEmail = assembleTicket({
     ...base,
-    gitIdentity: { login: 'alice', display_name: 'Alice Wong', email: 'alice@corp.example' },
+    gitIdentity: { login: 'alice', display_name: 'Alice Demo', email: 'alice@corp.example' },
     baseDomain: 'station.example',
   });
-  assert.deepEqual(storedEmail.run.git_identity, { name: 'Alice Wong', email: 'alice@corp.example' });
+  assert.deepEqual(storedEmail.run.git_identity, { name: 'Alice Demo', email: 'alice@corp.example' });
 
   const fallbackEmail = assembleTicket({
     ...base,

@@ -50,16 +50,16 @@
 先完整读被审文档 144 行，再核代码与探针。实际执行：
 
 ```bash
-git -C /home/eric/projects/erix-station rev-parse HEAD
-git -C /home/eric/projects/erix-station --no-pager status --short
-git -C /home/eric/projects/erix-llm-kit rev-parse HEAD
-git -C /home/eric/projects/erix-llm-kit --no-pager status --short
+git -C /home/devuser/projects/erix-station rev-parse HEAD
+git -C /home/devuser/projects/erix-station --no-pager status --short
+git -C /home/devuser/projects/erix-llm-kit rev-parse HEAD
+git -C /home/devuser/projects/erix-llm-kit --no-pager status --short
 ```
 
 得到开头两个完整 SHA，两条 status 均无输出。另执行：
 
 ```bash
-git -C /home/eric/projects/erix-station --no-pager diff --stat e7eb8a7 9567b05
+git -C /home/devuser/projects/erix-station --no-pager diff --stat e7eb8a7 9567b05
 ```
 
 输出片段：
@@ -74,11 +74,11 @@ git -C /home/eric/projects/erix-station --no-pager diff --stat e7eb8a7 9567b05
 下文命令简写与实际使用一致：
 
 ```bash
-U=/home/eric/projects/erix-llm-kit
-S=/home/eric/projects/erix-station
+U=/home/devuser/projects/erix-llm-kit
+S=/home/devuser/projects/erix-station
 ```
 
-证据附件均在 `/home/eric/judge-analysis-sandbox/`，不是仓库内笔记：
+证据附件均在 `/home/devuser/judge-analysis-sandbox/`，不是仓库内笔记：
 
 | 文件 | 内容 |
 |---|---|
@@ -266,7 +266,7 @@ git -C "$U" show 9440b1c:src/loop/run-snapshot-executor.js |
 #### A9 station 不传 finalGuard：成立
 
 ```bash
-grep -c finalGuard /home/eric/projects/erix-station/runner/worker.js
+grep -c finalGuard /home/devuser/projects/erix-station/runner/worker.js
 ```
 
 ```text
@@ -323,7 +323,7 @@ probe7: TOTAL judge-control msgs observed by host via onRound: 1
 ```bash
 env -u ERIX_JUDGE_INTERVAL -u ERIX_NO_REFLECTION \
     -u ERIX_NO_ROUND_JUDGE -u ERIX_NO_FORCED_FINAL \
-  node /home/eric/judge-analysis-sandbox/independent-probe-261020.mjs
+  node /home/devuser/judge-analysis-sandbox/independent-probe-261020.mjs
 ```
 
 真实输出（最后全部 assert 通过）：
@@ -369,11 +369,11 @@ git -C "$S" grep -nE 'DIR_NAME_RE|CWD_RE|function validateSessionCwd|function bu
    实跑纯函数测试，排除同文件建目录测试：
 
    ```bash
-   cd /home/eric/projects/erix-station
+   cd /home/devuser/projects/erix-station
    node --test --test-name-pattern=validateSessionCwd portal/test/sessions-cwd.test.js
    ```
 
-   输出 `# tests 1 / # pass 1 / # fail 0`；已有断言接受 `meeting_asr_app`。独立补测前端真实正则：`cmms_test=false`。
+   输出 `# tests 1 / # pass 1 / # fail 0`；已有断言接受 `demo_app`。独立补测前端真实正则：`cmms_test=false`。
 
 2. **hostname 不含项目名：确认。**
 
@@ -411,7 +411,7 @@ git -C "$S" grep -nE 'DIR_NAME_RE|CWD_RE|function validateSessionCwd|function bu
 实际执行，均退出 0：
 
 ```bash
-cd /home/eric/projects/erix-llm-kit
+cd /home/devuser/projects/erix-llm-kit
 node scripts/docs-drift-check.mjs --verbose
 node scripts/docs-sync-check.mjs
 node scripts/docs-drift-check.mjs --strict
