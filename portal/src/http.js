@@ -2428,6 +2428,9 @@ async function handleAdminFdeFile(req, res, ctx, session, fdeName, url) {
   res.writeHead(data.status, data.headers);
   if (data.stream) {
     data.stream.on('error', () => res.destroy());
+    // #726 复审：客户端提前断开时 res 先毁，pipe 只会 unpipe、不会停源流；
+    // 源流会停在半途握着 fd。随 res 'close' 毁掉源流 ⇒ FileHandle 关一次。
+    res.on('close', () => data.stream.destroy());
     data.stream.pipe(res);
   } else {
     res.end(); // 416：只有头没有体
@@ -5245,6 +5248,9 @@ async function handleFilePreview(req, res, ctx, url) {
     res.writeHead(opened.status, opened.headers);
     if (opened.stream) {
       opened.stream.on('error', () => res.destroy());
+      // #726：res 先毁时 pipe 只 unpipe 不停源流；随 res 'close' 毁源流
+      // ⇒ FileHandle 自己关 fd（正常结束时 destroy 已关流是空操作）。
+      res.on('close', () => opened.stream.destroy());
       opened.stream.pipe(res);
     } else {
       res.end(); // 416：只有头没有体

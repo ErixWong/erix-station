@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { Writable } from 'node:stream';
 import { openFileStream, readFilePreview, DirError } from '../src/dirs.js';
 
 // /proc/self/fd 计数：readdirSync 会把自己那次打开的目录 fd 也数进去，但只要
@@ -205,4 +206,187 @@ test('#726 rootKind:projects（管理台根）同样受 fd 校验保护：正常
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ---- #726 复审：fd 唯一主体 = FileHandle ----
+// CI 上的形态是 `[portal] unhandled: [Error: EBADF: bad file descriptor, close]`，
+// 即进程级 unhandledRejection（portal 自己的 handler 只记日志不改退出码）。
+// 这里显式收集：监听器会抑制 Node 默认崩溃行为，所以必须自己断言为空
+//（见最后一条「全程」用例）。
+const unhandled = [];
+const onUnhandled = (err) => unhandled.push(err);
+const onUncaught = (err) => unhandled.push(err);
+process.on('unhandledRejection', onUnhandled);
+process.on('uncaughtException', onUncaught);
+
+// 等流落定：读完（end → autoClose）与提前 destroy 都会发 'close'。
+function settled(stream) {
+  if (stream.closed) return Promise.resolve(); // 已落定（读完后 close 可能先到）
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('流未在 5s 内 close')), 5000);
+    stream.once('close', () => { clearTimeout(timer); resolve(); });
+  });
+}
+
+// 未读完就销毁：error 可能来自在途读（已关 fd），不是本用例要探的事。
+function destroyEarly(stream) {
+  stream.on('error', () => {});
+  stream.destroy();
+  return settled(stream);
+}
+
+// 断言某个 fd 号已真正关闭：fstat 抛 EBADF（必须在任何可能复用该号的 open
+// 之前跑，故各用例都是‘拿到 close 事件后第一个动作就是它’）。
+function assertFdClosed(fd, label) {
+  assert.equal(typeof fd, 'number', `${label}：开流后应能拿到 fd 号`);
+  assert.throws(() => fs.fstatSync(fd), (e) => e.code === 'EBADF',
+    `${label}：流落定后 fd ${fd} 必须已关（fstat 应抛 EBADF）`);
+}
+
+// 7) destroy 早退：不读完就 destroy ⇒ fd 已关（EBADF + 计数回基线双判据）。
+test('#726-7 destroy 早退：未读完就 destroy ⇒ fd 已关（双判据）、无 unhandled',
+  async () => {
+    const { root, proj } = jail();
+    try {
+      fs.writeFileSync(path.join(proj, 'big.bin'), Buffer.alloc(1 << 20, 0x61));
+      const ARGS = {
+        userSpaceRoot: root, fdeName: 'alice', cwd: '~/projects/proj1', relPath: 'big.bin',
+      };
+      {
+        const w = await openFileStream(ARGS); // warmup：先坐实 libuv 线程池常驻 fd
+        await destroyEarly(w.stream);
+        await tick(40);
+      }
+      const base = fdCount();
+      const r = await openFileStream(ARGS);
+      const fd = r.stream.fd;
+      // 只读一块就摘：模拟客户端拿到首块就断开（旧形态留两个主体）。
+      r.stream.once('data', () => destroyEarly(r.stream));
+      await settled(r.stream);
+      assertFdClosed(fd, 'destroy 早退');
+      await tick(60);
+      assert.equal(fdCount(), base, 'destroy 早退后 fd 数回到基线（不漏不多）');
+      assert.equal(unhandled.length, 0, `无 unhandled，实际：${unhandled.map(String)}`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+// 8) 连续 N=200 开流+destroy：fd 数不增长（能抓住「关错号 / 漏关」）。
+test('#726-8 连续 200 次开流并各自 destroy ⇒ 进程 fd 数不增长', async () => {
+  const { root, proj } = jail();
+  try {
+    fs.writeFileSync(path.join(proj, 'loop.bin'), Buffer.alloc(64 * 1024, 0x62));
+    const ARGS = {
+      userSpaceRoot: root, fdeName: 'alice', cwd: '~/projects/proj1', relPath: 'loop.bin',
+    };
+    {
+      const w = await openFileStream(ARGS);
+      await destroyEarly(w.stream);
+      await tick(40);
+    }
+    const base = fdCount();
+    for (let i = 0; i < 200; i += 1) {
+      const r = await openFileStream(ARGS);
+      await destroyEarly(r.stream);
+    }
+    await tick(80);
+    assert.equal(fdCount(), base, '200 次开+destroy 后 fd 数必须回到基线');
+    assert.equal(unhandled.length, 0, `无 unhandled，实际：${unhandled.map(String)}`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// 9) 同一文件先 json（readFilePreview）再 stream：两条路各自关自己的 fd。
+test('#726-9 同一文件先 mode=json 再 mode=stream ⇒ 两路互不干扰', async () => {
+  const { root, proj } = jail();
+  try {
+    const text = '# alpha\n'.repeat(500);
+    fs.writeFileSync(path.join(proj, 'README.md'), text);
+    const A = {
+      userSpaceRoot: root, fdeName: 'alice', cwd: '~/projects/proj1', relPath: 'README.md',
+    };
+    {
+      await readFilePreview(A);
+      const w = await openFileStream({ ...A, disposition: 'download' });
+      await drain(w.stream);
+      await tick(40);
+    }
+    const base = fdCount();
+    const json = await readFilePreview(A); // json 通道（readFilePreview + finally 关）
+    assert.equal(json.kind, 'text');
+    assert.equal(json.data, text);
+    assert.equal(fdCount(), base, 'json 通道结束即已关 fd，不得影响后面的 stream');
+    const st = await openFileStream({ ...A, disposition: 'download' }); // stream 通道
+    assert.equal(st.status, 200);
+    assert.equal(st.headers['Content-Disposition'], 'attachment; filename="README.md"');
+    const fd = st.stream.fd;
+    assert.equal((await drain(st.stream)).toString('utf8'), text);
+    await settled(st.stream);
+    assertFdClosed(fd, 'json→stream 交替');
+    await tick(60);
+    assert.equal(fdCount(), base, '两路交替后 fd 数回到基线');
+    assert.equal(unhandled.length, 0, `无 unhandled，实际：${unhandled.map(String)}`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// 10) #727-5b 形态复刻：管理台那条路（rootKind='projects' + download）接到
+// fake res 桩上，并让 res 提前 destroy()（客户端提前断开）。
+test('#726-10 #727-5b 形态：download + fake res 提前 destroy ⇒ 无 unhandled、fd 已关',
+  async () => {
+    const { root, proj } = jail();
+    try {
+      fs.writeFileSync(path.join(proj, 'clip.mp4'), Buffer.alloc(256 * 1024, 0x63));
+      const ARGS = {
+        userSpaceRoot: root, fdeName: 'alice', rootKind: 'projects',
+        relPath: 'proj1/clip.mp4', disposition: 'download',
+      };
+      const mkRes = () => {
+        const res = new Writable({ write(_chunk, _enc, cb) { cb(); } });
+        res.writeHead = () => {}; // http 层的 writeHead(status, headers)
+        res.on('error', () => {}); // 真 ServerResponse 总是带 error 处理
+        return res;
+      };
+      // 与 http.js 两处写出路径（handleFilePreview / handleAdminFdeFile）逐句同形。
+      const writeOut = (stream, res) => {
+        stream.on('error', () => res.destroy());
+        res.on('close', () => stream.destroy());
+        stream.pipe(res);
+      };
+      {
+        const w = await openFileStream(ARGS);
+        const wr = mkRes();
+        writeOut(w.stream, wr);
+        wr.destroy();
+        await settled(w.stream);
+        await tick(40);
+      }
+      const base = fdCount();
+      const opened = await openFileStream(ARGS);
+      assert.equal(opened.status, 200);
+      assert.equal(opened.headers['Content-Disposition'], 'attachment; filename="clip.mp4"');
+      const fd = opened.stream.fd;
+      const res = mkRes();
+      writeOut(opened.stream, res);
+      res.destroy(); // 客户端提前断开：dest 先没，源流随 res 'close' 被毁
+      await settled(opened.stream);
+      assertFdClosed(fd, '#727-5b 形态');
+      await tick(60);
+      assert.equal(fdCount(), base, 'res 提前 destroy 后 fd 数回到基线');
+      assert.equal(unhandled.length, 0, `无 unhandled，实际：${unhandled.map(String)}`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+// 11) 全程汇总：上面所有形态（含旧形态的重复关闭）都没漏出 unhandled。
+test('#726-11 全程：本文件所有形态都没产生 unhandled 异常/拒绝', async () => {
+  await tick(120); // 给可能的延迟 close/finalizer 一个落定期
+  process.off('unhandledRejection', onUnhandled);
+  process.off('uncaughtException', onUncaught);
+  assert.deepEqual(unhandled.map((e) => `${e?.code || e?.name}: ${e?.message}`), [],
+    '全程不得有 unhandled（旧形态下这里会收到 EBADF close）');
 });
