@@ -198,6 +198,10 @@ function buildTree(userspace) {
   const root = path.join(userspace, 'alice', 'projects');
   fs.mkdirSync(path.join(root, 'proj-a', 'nested'), { recursive: true });
   fs.mkdirSync(path.join(root, 'proj-a', '.git'), { recursive: true });
+  // 点开头的**目录**：唯一的排除项是 `.git`，其余照常列（复审 MAJOR 1）
+  fs.mkdirSync(path.join(root, 'proj-a', '.github', 'workflows'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, 'proj-a', '.github', 'workflows', 'ci.yml'), 'on: push\n');
   fs.mkdirSync(path.join(root, 'proj-b'), { recursive: true });
   fs.writeFileSync(path.join(root, 'proj-a', 'README.md'), '# alpha\n');
   fs.writeFileSync(path.join(root, 'proj-a', '.gitignore'), 'node_modules\n');
@@ -381,7 +385,7 @@ test('#727-3 include_archived 缺席：列表不含归档、详情 404；带 =1 
   } finally { await s.close(); }
 });
 
-test('#727-3b q 过滤：命中 title/cwd，转义 % 与 _，空白与超长一律不加条件', async () => {
+test('#727-3b q 过滤：命中 title/cwd，转义 % 与 _，空白不加条件、超长 400', async () => {
   const s = await startStack();
   try {
     const hit = await s.get('/api/admin/fdes/alice/sessions?q=alpha');
@@ -398,11 +402,20 @@ test('#727-3b q 过滤：命中 title/cwd，转义 % 与 _，空白与超长一�
     const escaped = await s.get('/api/admin/fdes/alice/sessions?q=%25'); // 字面量 %
     assert.deepEqual(escaped.body.items, []);
 
-    for (const q of ['q=', 'q=%20%20', `q=${'x'.repeat(101)}`]) {
+    for (const q of ['q=', 'q=%20%20']) {
       const r = await s.get(`/api/admin/fdes/alice/sessions?${q}`);
       assert.equal(r.status, 200, q);
       assert.deepEqual(r.body.items.map((i) => i.id), [S_ACTIVE], q);
     }
+    // 超长（>100）⇒ 400，不是静默忽略（复审 MINOR 4：静默会让管理员以为搜过了）
+    const tooLong = await s.get(`/api/admin/fdes/alice/sessions?q=${'x'.repeat(101)}`);
+    assert.equal(tooLong.status, 400);
+    assert.equal(tooLong.body.error.code, 'validation_failed');
+    assert.deepEqual(tooLong.body.error.details, { field: 'q' });
+    assert.equal(tooLong.body.error.message, 'q 过长（≤100 字符）');
+    // 边界：恰好 100 字符仍可用
+    const justLong = await s.get(`/api/admin/fdes/alice/sessions?q=${'x'.repeat(100)}`);
+    assert.equal(justLong.status, 200);
     const sql = s.pool.statements.map((x) => x.sql).join('\n');
     assert.match(sql, /ILIKE \$2 ESCAPE '\\' OR cwd ILIKE \$2 ESCAPE '\\'/);
   } finally { await s.close(); }
@@ -498,6 +511,8 @@ test('#727-5 文件树：四条 400 与 after 续页、truncated 语义', async 
 
     const listing = await s.get('/api/admin/fdes/alice/files/tree?path=proj-a');
     assert.deepEqual(listing.body.entries, [
+      // 唯一的排除项是 `.git` 目录；其余点开头目录照常列（复审 MAJOR 1）
+      { name: '.github', type: 'dir' },
       { name: 'nested', type: 'dir' },
       { name: '.gitignore', type: 'file' },
       { name: 'README.md', type: 'file' },
@@ -507,7 +522,7 @@ test('#727-5 文件树：四条 400 与 after 续页、truncated 语义', async 
     const p1 = await s.get('/api/admin/fdes/alice/files/tree?path=proj-b&limit=2');
     assert.deepEqual(p1.body.entries.map((e) => e.name), ['f01.txt', 'f02.txt']);
     assert.equal(p1.body.truncated, true);
-    assert.equal(p1.body.next_after, 'f02.txt');
+    assert.equal(p1.body.next_after, 'f:f02.txt', '游标 = <rank>:<name>');
 
     const p2 = await s.get(
       `/api/admin/fdes/alice/files/tree?path=proj-b&after=${p1.body.next_after}&limit=2`,
@@ -563,6 +578,61 @@ test('#727-5b 单文件读取：json/stream/download 三档与牢笼 400', async
     const noPath = await s.get('/api/admin/fdes/alice/file');
     assert.equal(noPath.status, 400); // `'.'` 不是具体文件
     assert.equal(noPath.body.error.message, 'path 必须是文件');
+  } finally { await s.close(); }
+});
+
+test('#727-5c 分页并集 = 全量（同层目录+文件，游标必须带 rank）', async () => {
+  const s = await startStack();
+  try {
+    const all = await s.get('/api/admin/fdes/alice/files/tree?path=proj-a');
+    assert.equal(all.body.entries.filter((e) => e.type === 'dir').length, 2);
+    assert.equal(all.body.entries.filter((e) => e.type === 'file').length, 3);
+
+    const seen = [];
+    let after = null;
+    for (let guard = 0; ; guard += 1) {
+      assert.ok(guard <= 20, '游标必须收敛');
+      const tail = after ? `&after=${after}` : '';
+      const page = await s.get(
+        `/api/admin/fdes/alice/files/tree?path=proj-a&limit=1${tail}`,
+      );
+      assert.equal(page.status, 200);
+      assert.equal(page.body.entries.length, 1, '每页恰好 limit 项');
+      seen.push(...page.body.entries);
+      if (!page.body.truncated) {
+        assert.equal(page.body.next_after, null);
+        break;
+      }
+      after = page.body.next_after;
+    }
+    // 逐页翻到底的并集 == 一次性全量：既不重复、也不整组跳过文件组
+    assert.deepEqual(seen, all.body.entries);
+    assert.equal(new Set(seen.map((e) => e.name)).size, seen.length);
+  } finally { await s.close(); }
+});
+
+test('#727-5d after / mode 非法参数 ⇒ 400 且带 details.field', async () => {
+  const s = await startStack();
+  try {
+    for (const bad of ['nested', '0:zzz', 'x:zzz', '%3Azzz']) {
+      const r = await s.get(`/api/admin/fdes/alice/files/tree?after=${bad}`);
+      assert.equal(r.status, 400, bad);
+      assert.equal(r.body.error.code, 'validation_failed', bad);
+      assert.deepEqual(r.body.error.details, { field: 'after' }, bad);
+      assert.equal(r.body.error.message, 'after 非法', bad);
+    }
+    // mode 与用户面同口径：'' / json / stream / download 之外一律 400，不静默当 json
+    for (const bad of ['bogus', 'JSON', 'STREAM']) {
+      const r = await s.get(
+        `/api/admin/fdes/alice/file?path=proj-a/README.md&mode=${bad}`,
+      );
+      assert.equal(r.status, 400, bad);
+      assert.equal(r.body.error.code, 'validation_failed', bad);
+      assert.deepEqual(r.body.error.details, { field: 'mode' }, bad);
+      assert.equal(r.body.error.message, 'mode 只支持 json|stream|download', bad);
+    }
+    const ok = await s.get('/api/admin/fdes/alice/file?path=proj-a/README.md&mode=json');
+    assert.equal(ok.status, 200);
   } finally { await s.close(); }
 });
 

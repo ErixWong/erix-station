@@ -3929,7 +3929,7 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
 | GET | `/api/admin/fdes/:fdeName/sessions/:sessionId` | `limit` `cursor` `include_archived` | 同 §4.2 详情：`{ session（含 `queued_messages`）, messages, last_seq, next_cursor }` |
 | GET | `/api/admin/fdes/:fdeName/sessions/:sessionId/events/history` | `limit` `before` `include_archived` | 同 §4.4a：`{ events, next_cursor }`（含合成 `partial_output` / `run_termination`） |
 | GET | `/api/admin/fdes/:fdeName/sessions/:sessionId/folded/:round` | `include_archived` | 同 §4.4b：`{ round, turns, source, truncated, dropped_messages }` |
-| GET | `/api/admin/fdes/:fdeName/files/tree` | `path`（缺省 `.`）`after` `limit` | `{ entries: [{name, type}], truncated, next_after }`；根 = 该工位的 `~/projects` |
+| GET | `/api/admin/fdes/:fdeName/files/tree` | `path`（缺省 `.`）`after`（`d:<name>`\|`f:<name>`）`limit` | `{ entries: [{name, type}], truncated, next_after }`；根 = 该工位的 `~/projects` |
 | GET | `/api/admin/fdes/:fdeName/file` | `path` `mode=json\|stream\|download`（+ `Range` 请求头） | 同 §4.11：`json` 回 `{name, path, kind, data}`；`stream`/`download` 直接写字节流（支持 206 / 416） |
 
 参数口径：
@@ -3940,14 +3940,20 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
   （与 §4.7a 同码同文案）。
 - `include_archived`：只认 `1` / `true`。**缺席 ⇒ 与用户面逐字节一致**（列表不含归档，
   详情 / history / folded 对归档会话一律 404）；带上 ⇒ 三处都能读归档会话。
-- `q`：仅当「非空白字符串且 ≤100 字符」时按 `title` / `cwd` 做大小写不敏感的子串匹配
-  （`%` `_` `\` 按字面量处理，不当通配符）；未传 / 全空白 / 超长 ⇒ 等同不过滤。
+- `q`：非空白时按 `title` / `cwd` 做大小写不敏感的子串匹配（`%` `_` `\` 按字面量处理，
+  不当通配符）；未传 / 全空白 ⇒ 等同不过滤；**超过 100 字符 ⇒ `400 validation_failed`**
+  （`details.field='q'`，与 §4.2 列表共用同一个码）。
 - 分页：会话列表是 `(updated_at, id)` 游标（§1.3）；history 是 `limit` + `before`（§4.4a，
-  `next_cursor` 口径与用户面一致）；文件树是 `after` = 上一页最后一项的 **name**，
-  `truncated=true` 时 `next_after` = 本页尾项 name，**`truncated=false` 时 `next_after=null`**。
-- 文件树只列 `dir` / `file` 两种类型：符号链接不列也不跟随；`.git` **目录**不进树
-  （`.gitignore` / `.gitattributes` 等**文件**照常列、照常预览）。点开头的**目录**不列
-  （同 `GET /api/dirs` 的降噪口径）。
+  `next_cursor` 口径与用户面一致）；文件树是**复合游标** `after` = `<rank>:<name>`，
+  `rank` ∈ `d`（目录）| `f`（文件）——与「目录在前、各按 name 码点序」的展示序同序，
+  所以逐页翻到底的并集等于全量（只带裸 name 会整组跳过文件名排在目录名之后的那批项）。
+  `truncated=true` 时 `next_after` = 本页尾项的同格式游标，**`truncated=false` 时
+  `next_after=null`**；`after` 格式非法（缺 `:` 或 rank 不是 `d`/`f`）⇒
+  `400 validation_failed`「after 非法」（`details.field='after'`）。
+- 文件树只列 `dir` / `file` 两种类型：符号链接不列也不跟随；**唯一的排除项是 `.git`
+  目录**（元数据不外泄，口径同 #726），其余点开头的目录（`.github/`、`.erix/`、
+  `.vscode/`）与点开头的文件（`.gitignore` / `.gitattributes` / `.env`）照常列出、
+  照常预览——它们是排查对象。
 
 错误口径：
 

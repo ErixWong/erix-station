@@ -236,11 +236,10 @@ function escapeLikePattern(value) {
  *  待 #88 标题自动生成后再评估是否加回。
  *  issue #727（管理台只读浏览，默认行为逐字节不变）：
  *    · includeArchived=true ⇒ where 去掉 status 条件（默认仍过滤 active）；
- *    · q 是**新增的可选参数**（不是恢复 #94 拆掉的搜索框）：
- *    仅当「非空白字符串
- *      且 ≤100 字符」时追加 title/cwd 的 ILIKE 过滤（转义 \ % _ 并 ESCAPE
- *      反斜杠），
- *      其余情形（未传 / 全空白 / 超长）一律不加条件。
+ *    · q 是**新增的可选参数**（不是恢复 #94 拆掉的搜索框）：非空白时按
+ *      title/cwd 做 ILIKE 子串匹配（转义 \ % _ 并 ESCAPE 反斜杠）；
+ *      **超长（>100 字符）⇒ 400 `validation_failed`（`details.field='q'`）**；
+ *      未传 / 全空白 ⇒ 不加条件。
  */
 export async function listSessions(
   pool, { userId, projectId, cwd, cursor, limit = 20, includeArchived = false, q = null },
@@ -256,7 +255,14 @@ export async function listSessions(
     params.push(validateSessionCwd(cwd));
     where += ` AND cwd = $${params.length}`;
   }
-  if (typeof q === 'string' && q.trim() !== '' && q.length <= 100) {
+  if (typeof q === 'string' && q.trim() !== '') {
+    // 超长是「拼错了」而不是「不搜」：静默丢掉过滤会让管理员以为搜过了
+    //（复审 MINOR 4）。全空白仍等于未传（地址栏里留个空格不该报错）。
+    if (q.length > 100) {
+      throw new SessionError('validation_failed', 'q 过长（≤100 字符）', {
+        details: { field: 'q' },
+      });
+    }
     params.push(`%${escapeLikePattern(q)}%`);
     const p = params.length;
     where += ` AND (title ILIKE $${p} ESCAPE '\\' OR cwd ILIKE $${p} ESCAPE '\\')`;

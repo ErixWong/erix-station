@@ -69,10 +69,25 @@ function sessionNotFound() {
  */
 const AUDIT_DEDUP_WINDOW_MS = 5 * 60 * 1000;
 const auditDedup = new Map();
+/** 去重表的体积上限：超过就扫一遍扫掉过期项（见 `evictAuditDedup`）。 */
+const AUDIT_DEDUP_MAX = 5000;
 
 /** 单测用：清空去重表（模块级 Map 在测试进程里会跨用例残留）。 */
 export function resetAuditDedupForTest() {
   auditDedup.clear();
+}
+
+/**
+ * 体积兼底（**不是 LRU**）：这张表的键含 `path`，理论上可以被「扫一个干万个文件的目录」
+ * 无上限地堆下去，而它只服务 5 分钟窗口。所以：超上限先清所有**已过期**项；清完还超限
+ * 就整体 `clear()`（宁可少去重几行，也不让一个只读面把内存当自由存储）。
+ */
+function evictAuditDedup(now) {
+  if (auditDedup.size <= AUDIT_DEDUP_MAX) return;
+  for (const [key, ts] of auditDedup) {
+    if (now - ts >= AUDIT_DEDUP_WINDOW_MS) auditDedup.delete(key);
+  }
+  if (auditDedup.size > AUDIT_DEDUP_MAX) auditDedup.clear();
 }
 
 /**
@@ -87,6 +102,7 @@ async function writeAudit({
     const now = Date.now();
     const last = auditDedup.get(dedupKey);
     if (last != null && now - last < AUDIT_DEDUP_WINDOW_MS) return;
+    evictAuditDedup(now);
     auditDedup.set(dedupKey, now);
   }
   try {
@@ -322,8 +338,15 @@ export async function getFdeFile(
 ) {
   const fde = await resolveTargetFde(pool, fdeName);
   const relPath = query?.get('path');
-  const modeRaw = query?.get('mode') ?? 'json';
-  const mode = modeRaw === 'stream' || modeRaw === 'download' ? modeRaw : 'json';
+  const modeRaw = query?.get('mode') ?? '';
+  // 与用户面 `handleFilePreview` 同一口径：`''` / `json` 之外只认 `stream` / `download`，
+  // 其余 ⇒ 400。静默当 json 会把拼错的 `mode` 读成「预览成功」（复审 MINOR 2）。
+  if (modeRaw !== '' && modeRaw !== 'json' && modeRaw !== 'stream' && modeRaw !== 'download') {
+    throw new admin.AdminError('validation_failed', 'mode 只支持 json|stream|download', {
+      httpStatus: 400, details: { field: 'mode' },
+    });
+  }
+  const mode = modeRaw === '' ? 'json' : modeRaw;
   const base = {
     userSpaceRoot: ctx.config.userSpaceRoot,
     fdeName,

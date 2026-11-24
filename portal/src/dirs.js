@@ -324,16 +324,37 @@ export function resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath = '
 const PROJECTS_TREE_MAX = 2000;
 
 /**
+ * 树游标的组序（`d` 目录 < `f` 文件）：**与下面的排序主键同一条**。
+ * 游标必须携带它：排序是 dirs-first（type 主序），而只拿 name 比大小的游标会
+ * 把「名字码点排在目录名之后」的那批文件整批跳过（复审 MAJOR 1）。UI 的「目录
+ * 在前」语义要保留 ⇒ 游标改成复合键，而不是把排序降为纯 name。
+ */
+function treeRankOf(type) {
+  return type === 'dir' ? 'd' : 'f';
+}
+
+/** 解 `after`（`<rank>:<name>`）；格式不对 ⇒ 400（不静默当首页：那会默默重复上一页）。 */
+function parseTreeCursor(after) {
+  const raw = String(after);
+  const at = raw.indexOf(':');
+  const rank = at > 0 ? raw.slice(0, at) : '';
+  const name = raw.slice(at + 1); // name 里允许含 `:`（文件名合法），故只按首个冒号切
+  if ((rank !== 'd' && rank !== 'f') || name === '') {
+    throw new DirError('validation_failed', 'after 非法', { details: { field: 'after' } });
+  }
+  return { rank, name };
+}
+
+/**
  * 管理台项目文件树（issue #727）：根 = `<userSpaceRoot>/<fde>/projects`，
  * 单层懒展开。
  * 排序与 `fileTree` 同一口径（目录在前 + 各按 name 码点字典序，与 locale
  * 无关）；
  * 额外跳过 `.git` 目录（与 `resolveJailedUnderProjects` 同一口径）。
- * keyset：`after` = 上一页最后一项的 **name**（不是下标：新增/改名不会像
- * offset
- * 那样错位），只返 name 严格大于它的项；`truncated` = 过滤后候选仍多于
- * limit；
- * `next_after` = 本页最后一项 name，**`truncated === false` 时为 null**。
+ * keyset（**复合游标**）：`after` 与 `next_after` 都是 `<rank>:<name>`，`rank` ∈
+ * `d`（目录）| `f`（文件）——与上面的排序主键同序，所以逐页翻到底的并集等于全量。
+ * `truncated` = 过滤后候选仍多于 limit；`next_after` = 本页尾项的游标，
+ * **`truncated === false` 时为 null**。
  */
 export async function fileTreeUnderProjects(
   { userSpaceRoot, fdeName, relPath = '.', after = null, limit = 500 } = {},
@@ -350,12 +371,10 @@ export async function fileTreeUnderProjects(
   for (const d of fs.readdirSync(target, { withFileTypes: true })) {
     if (!isSafeDirName(d.name)) continue;
     if (d.isDirectory()) {
-      // 同 resolveJailedUnderProjects：`.git` 目录不进树。
+      // 只排除 `.git`（元数据不泄给管理台，口径同 `resolveJailedUnderProjects` 与 #726）。
+      // 其余点开头的目录**照常列出**：`.github/workflows`、`.erix`、`.vscode` 都是
+      // 排查对象，藏起来只会让管理员看不到已经改了的工作流（复审 MINOR 3）。
       if (d.name === '.git') continue;
-      // 点开头的**目录**不列（同 `listDirs` 的口径：挡掉 `.pnpm-store` 这类工具缓存目录，
-      // 它们不可能被选成 cwd，列出来只是噪音）。点开头的**文件**照常列——`.gitignore`
-      // / `.gitattributes` / `.env` 都是正常项目文件，#727 的红线只针对 `.git` 目录。
-      if (d.name.startsWith('.')) continue;
       entries.push({ name: d.name, type: 'dir' });
     } else if (d.isFile()) {
       entries.push({ name: d.name, type: 'file' });
@@ -369,12 +388,21 @@ export async function fileTreeUnderProjects(
   });
 
   const n = Math.min(Math.max(Number(limit) || 500, 1), PROJECTS_TREE_MAX);
-  const candidates = after == null || after === ''
+  const cursor = after == null || after === '' ? null : parseTreeCursor(after);
+  const candidates = cursor === null
     ? entries
-    : entries.filter((e) => e.name > String(after)); // 严格大于：上一页尾项不重发
+    // (rank, name) 严格大于：与上面的排序同一个比较，翻页不漏整组文件也不重发。
+    : entries.filter((e) => treeRankOf(e.type) > cursor.rank
+      || (treeRankOf(e.type) === cursor.rank && e.name > cursor.name));
   const truncated = candidates.length > n;
   const page = candidates.slice(0, n);
-  return { entries: page, truncated, next_after: truncated ? page[page.length - 1].name : null };
+  // 尾项游标与 `after` 同格式（带组序）：`truncated === false` 时仍给 null，客户端据此停翻页。
+  const last = page.length > 0 ? page[page.length - 1] : null;
+  return {
+    entries: page,
+    truncated,
+    next_after: truncated && last ? `${treeRankOf(last.type)}:${last.name}` : null,
+  };
 }
 
 /**
