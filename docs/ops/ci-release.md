@@ -134,6 +134,12 @@
 → ⑥ 换了 FDE 镜像还要重建 FDE 容器（见下面第 5 条）
 ```
 
+⚠️ **若本次发布包含 `deploy/litellm/config.yaml` 的改动**（`litellm_settings` 之类）：`up -d` **不会**重启
+`station-litellm`（它是 bind mount，文件内容变了容器不会自己重建/重启）⇒ 必须显式
+`docker compose --profile litellm restart station-litellm`，否则配置**不生效且没有任何报错**。
+2026-11-24 实测（#719 的 `timezone` + `budget_reset_time`）：重启前 `/key/info` 的 `budget_reset_at` 仍是 UTC 零点，
+重启后才是本地零点——只看「容器 Up」会以为已经生效。
+
 **前置（部署机）：GHCR 拉取现在可以不带凭据**
 
 仓库 `ErixWong/erix-station` **现为 public**（原为 private；可见性于 2026-10-19 实测确认，转公开的确切日期未考证），
