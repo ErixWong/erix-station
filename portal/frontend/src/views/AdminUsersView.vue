@@ -851,6 +851,14 @@ onBeforeUnmount(() => {
                 </td>
                 <td class="px-2 py-2">
                   <div class="flex flex-wrap items-center justify-end gap-1">
+                    <!-- issue #727 片 2：「会话/文件」——这人的工位内容（只读页）。深链带 `?fde=`，
+                         没有 `fde_name` 的行不渲染（没有工位就没有内容可看）。 -->
+                    <router-link
+                      v-if="user.fde_name"
+                      data-test="seat-content-link"
+                      :to="{ name: 'admin-seat-content', query: { fde: user.fde_name } }"
+                      class="rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
+                    >{{ t('admin.seatContent.fromUsersLink') }}</router-link>
                     <button
                       v-if="!user.offboarding"
                       type="button"
