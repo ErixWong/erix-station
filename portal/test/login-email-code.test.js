@@ -496,10 +496,13 @@ test('#449⑧b 初次发信也过发信限流（`email:<ip>` 同一把闸）：�
   const s = await startServer({ users: [await makeUser()], mailer });
   try {
     // 默认 20 次 / 15 分钟：第 21 次第一步必须被挡，且不产生第 21 封信 / 第 21 个 pending。
+    // ⚠ #737 后窗口内重复口令步会**复用**（不占发信配额）⇒ 这里每次把最新码行的 created_at 推早
+    //   61s 退出复用窗口（同 ㉓ 的技术），让每次都真发 ⇒ 限流计数才照旧累加（「同一把闸」判据不变）。
     const attempts = 20;
     for (let i = 0; i < attempts; i += 1) {
       const ok = await login(s.base);
       assert.equal(ok.status, 200, `第 ${i + 1} 次第一步应成功`);
+      s.pool.emailCodes[s.pool.emailCodes.length - 1].created_at = new Date(Date.now() - 61_000);
     }
     const blocked = await login(s.base);
     assert.equal(blocked.status, 429, '初次发信必须与重发共用同一把闸');
@@ -1223,5 +1226,114 @@ test('#449⑱ email_code_ttl_seconds 随第一步下发，分钟数跟着 EMAIL_
     } finally {
       await s.close();
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ㉑~㉔ #737 口令步发信幂等：窗口内重复口令步 ⇒ 复用已发的码、不再寄第二封
+// ---------------------------------------------------------------------------
+
+test('#449㉑ 窗口内第二次口令步 ⇒ 不发第二封信（同一枚码挂到新 pending，旧行作废，审计不记假账）', async () => {
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({ users: [await makeUser()], mailer });
+  try {
+    const first = await (await login(s.base)).json();
+    assert.equal(first.email_reused, undefined, '第一次必须真发一封');
+    const second = await (await login(s.base)).json();
+    assert.equal(second.status, 'email_code_required');
+    assert.equal(second.email_reused, true, '第二次是复用，不是新发');
+    assert.equal(second.resend_after, 60, '与 §2.3b 同口径：resend_after = policy.resendCooldownSeconds');
+    assert.equal(second.email_sent, undefined, '复用形状**不带** email_sent（缺席 = 本次没真发）');
+    assert.notEqual(second.pending_token, first.pending_token, '第二次口令步仍新建 pending');
+
+    assert.equal(state.sent.length, 1, '恰发一封：脚本重复走口令步不再刷屏');
+    assert.equal(s.pool.emailCodes.length, 2, '复用 = 插新行 + 废旧行');
+    const [a, b] = s.pool.emailCodes;
+    assert.equal(b.code_hash, a.code_hash, '新行逐字复制 code_hash（库里没明文，只能复制哈希）');
+    assert.ok(a.consumed_at, '旧行作废：一枚码同一时刻只服务一个 pending');
+    assert.equal(b.consumed_at, null);
+    assert.equal(b.expires_at.getTime(), a.expires_at.getTime(), 'expires_at 随码走、不续命');
+
+    const sent = s.pool.audit.filter((x) => x.action === 'auth.email_code_sent');
+    const reused = s.pool.audit.filter((x) => x.action === 'auth.email_code_reused');
+    assert.equal(sent.length, 1, 'email_code_sent 只有一条（复用写 sent 是假账）');
+    assert.equal(reused.length, 1, '复用要有自己的审计行');
+    const details = JSON.parse(reused[0].details);
+    assert.equal(details.reused_from_code_id, a.id);
+    assert.equal(details.code_hash_prefix, a.code_hash.slice(0, 12));
+    assert.equal(details.expires_at, a.expires_at.toISOString());
+    assert.ok(!JSON.stringify(details).includes(lastCode(state)), '审计照旧不含明文码');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#449㉒ 复用的那枚码在新 pending 上能过 §2.3a（交付判据：第一封邮件里的码对第二次口令步仍有效）', async () => {
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({ users: [await makeUser()], mailer });
+  try {
+    await (await login(s.base)).json();                 // 第一次口令步：真发一封
+    const second = await (await login(s.base)).json();  // 第二次口令步：复用，新 pending
+    assert.equal(second.email_reused, true);
+    assert.equal(state.sent.length, 1);
+
+    const code = lastCode(state); // **第一次**邮件里的明文码
+    const step2 = await postJson(s.base, '/api/auth/login/email-code', {
+      pending_token: second.pending_token, code,
+    });
+    assert.equal(step2.status, 200, await step2.clone().text());
+    const setCookie = step2.headers.get('set-cookie');
+    assert.ok(setCookie?.startsWith('fde_session_dev='), '旧邮件里的码在新 pending 上建了会话');
+    const token = setCookie.split(';')[0].split('=')[1];
+    const me = await fetch(`${s.base}/api/me`, { headers: { cookie: `fde_session_dev=${token}` } });
+    assert.equal(me.status, 200, '拿到的 cookie 真的能用');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#449㉓ 窗口外（旧行 created_at 推早 61s）⇒ 铸新码发新信，且旧行不因其而作废（回归锁：去重不许变成「永远不发」）', async () => {
+  // 产品侧 `now` 是 `new Date()` 不好注入 ⇒ 窗口判定按 fake 解析的参数算（$2=now、$3=windowSeconds），
+  // 这里把旧行 created_at 推早 61s，与把 now 推后 61s 在谓词上等价（不改函数签名）。
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({ users: [await makeUser()], mailer });
+  try {
+    await (await login(s.base)).json();
+    const old = s.pool.emailCodes[0];
+    old.created_at = new Date(Date.now() - 61_000);
+
+    const second = await (await login(s.base)).json();
+    assert.equal(second.status, 'email_code_required');
+    assert.equal(second.email_reused, undefined, '窗口外走原路径：不挂 email_reused');
+    assert.equal(state.sent.length, 2, '窗口外必须真发新信');
+    assert.equal(s.pool.emailCodes.length, 2);
+    const fresh = s.pool.emailCodes[1];
+    assert.notEqual(fresh.code_hash, old.code_hash, '新码是现铸的，不是复制');
+    assert.equal(old.consumed_at, null, '复用没发生 ⇒ 旧行不被顺手作废');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#449㉔ 已消费的码不可复用：走完 §2.3a 把码用掉后，第二次口令步必须真发新信', async () => {
+  // 复用的前提「手里还有一封能用的信」已不成立 ⇒ 必须发；否则用户拿不到任何码（死锁）。
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({ users: [await makeUser()], mailer });
+  try {
+    const first = await (await login(s.base)).json();
+    const code = lastCode(state);
+    const step2 = await postJson(s.base, '/api/auth/login/email-code', { pending_token: first.pending_token, code });
+    assert.equal(step2.status, 200);
+    assert.ok(s.pool.emailCodes[0].consumed_at, '码已被消费（会话也建了）');
+
+    const second = await (await login(s.base)).json();
+    assert.equal(second.status, 'email_code_required');
+    assert.equal(second.email_reused, undefined);
+    assert.equal(state.sent.length, 2, '已消费的码不可复用 ⇒ 第二封必须真发');
+    assert.equal(s.pool.audit.filter((x) => x.action === 'auth.email_code_reused').length, 0);
+    assert.equal(s.pool.emailCodes.length, 2);
+    assert.equal(s.pool.emailCodes[1].consumed_at, null, '第二行是新铸的可用码（未被任何路径碰过）');
+  } finally {
+    await s.close();
   }
 });
