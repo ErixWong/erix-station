@@ -663,6 +663,23 @@ hostname := <fde> "-p-" <portLabel> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> �
 - **出口 allowlist 移交给安全团队的网络层策略**（白名单内容由安全团队维护）：npm registry、pypi、GitHub/内部 git、镜像仓库；**LLM 域名不在白名单**——这是「唯一出口」的实现方式（决策者 2026-09，issue #3）。平台对安全团队的接口：容器网络名/命名规范（`fde-<name>`）+ 子网段 `10.200.0.0/16` 与 `10.201.0.0/16`（默认池 `/29` 与大 FDE `/28` 池；均保留给 FDE 网络专用，`control` 已取消，H-B 定稿 issue #5）、审计事件、以及「上游 LLM 只经网关」的架构事实
 - 若安全团队的出口策略未实施 → 「防用外部 key」降级为**审计 + 告警**，须管理层**书面知情**（性质不同）
 
+**LiteLLM 接入侧的事实面**（261124 自 `AGENTS.md` 热层搬入；热层只留判据）
+
+- **起栈形态**：`station-litellm` 是**可选 `litellm` profile**，需显式 `docker compose --profile litellm up -d`；
+  数据面与管理面**同端口**（端口与变量见 `docs/env.md` §8.2 / deploy-contract §2）。
+- **虚拟 key 明文为什么入库**：Traefik headers middleware 注入需要明文 ⇒ 明文只存
+  `fde_llm_bindings.api_key`（存储纪律见 `docs/data/model.md`）；**同 alias 铸新 key 会撞 LiteLLM
+  的唯一约束**，所以改配置只能走 `/key/update` 原地更新白名单。
+- **旧 `api_key`（上游真 key）已在迁移 `0010` 被清除并置 `revoked`** ⇒ 上游真 key 现在只存在于
+  LiteLLM credential（加密存 LiteLLM DB）。
+- **credential 没有启停语义**：模型的启停只能映射到 `/model/block|unblock`。
+- **`litellm_params.model`（管理台「Upstream model id」）不自动加前缀**：要写成
+  `<provider 前缀>/<上游模型>`（如 `openai/deepseek-flash`）——显式优于隐式。
+- **不对外暴露 LiteLLM 自带 UI**（不在验收面上，其前端有已知缺陷）。
+- **端到端 mock 响应由 LiteLLM 原生 `mock_response` 提供**；`station-mock-llm` 与
+  `portal/mock-gateway/` 已删除。LLM 集成 e2e（`wp3a`/`wp3b`/`wp4`/`wp5`/`wp6`）通过管理台 API
+  建 credential / mock model 与 FDE binding，覆盖虚拟 key 白名单与注入链，已不依赖旧架构。
+
 ### 11.5 用量与计费（定价、未知定价、spend 与 429）（issue #164）
 
 > 背景：管理台铸出的 per-FDE 虚拟 key `spend` 曾恒为 `0.0`——LiteLLM 成本表**按模型名匹配**，而我们的模型目录是自定义名（`deepseek-v4-pro`、`glm-5.3-flash-awq` 等），内置价目表里没有这些名字 → 金额算不出来。
@@ -880,6 +897,20 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
   API `GET /api/git-light?cwd=`（`docs/api/portal.md`）。
 - **不做什么**（防范围蔓延）：分支列表/分支数、detached、worktree/子模块结构、最后提交时刻、↑N/↓N、
   diff 内容、inotify 事件源——全不做（实测记录在 issue #359 正文与附录）。
+
+**状态面与实现边界**（261124 自 `AGENTS.md` 热层搬入）
+
+- **四态语义**：🔴 未落地（未提交 / 未跟踪 / 0 提交但有内容）→ 🟡 未推送（有提交未推 / 无远端 /
+  从未 fetch）→ 🟢 已收工；⚪ 读不到或未查完 ⇒ **⚪ 不得渲染成绿**（绿是承诺，没扫完就没资格承诺）。
+  一句话给用户的判据：「每天忙完之后要保证它是绿的」。
+- **portal 零 git 写**：不 init / 不 commit / 不 push / 不 checkout / 不代 clone（与「平台不 clone」
+  同口径）。写一律走 run = 界面上的「让 AI 收尾」，而且**只预填输入框不自动发**（发 run 占 capacity
+  且花 token）。搞不清就「问 AI」——**每个态都留这条兜底**。唯一保留的 git 细节是**仓库名**，
+  因为预填给 AI 的话必须指名目标仓库（一个目录多个仓库是真实现状）。
+- **数据源与成本上界**：宿主 portal 直读 `<userSpaceRoot>/<fde>/projects/<dir>/.git`（与 `/api/dirs`、
+  `/api/files/tree` 同一条 bind mount 通道）；一个仓库 = 一条 `git status --porcelain -uall` +
+  三次纯文本读 sha。**不得用 `-uno`**（实测它让 0 提交的根仓库对三个脏子仓库报空输出且 rc=0，
+  自认干净 ⇒ 直接撒谎）。上界靠 `.gitignore` 剪枝 + stdout 流式数到 50 即 kill + 2s 超时（超时落 ⚪）。
 
 ### A.3 编号说明：本表的 `D9` 与 `AGENTS.md` 的 `D9` 不是同一件事
 
