@@ -5,8 +5,8 @@
 //
 // 环境门（口径同 portal/test/litellm-live.test.js 的 env 门 + docs/testing.md §2.2.1）：
 //   有 PG：TEST_DATABASE_URL 指向一次性 postgres:16（必须是超级用户——bootstrap 要 CREATE ROLE）：
-//     sg docker -c "docker run -d --rm -p 127.0.0.1:15499:5432 -e POSTGRES_USER=station \
-//       -e POSTGRES_PASSWORD=test -e POSTGRES_DB=station_test postgres:16"
+//     docker run -d --rm -p 127.0.0.1:15499:5432 -e POSTGRES_USER=station \
+//       -e POSTGRES_PASSWORD=test -e POSTGRES_DB=station_test postgres:16
 //     TEST_DATABASE_URL=postgres://station:test@127.0.0.1:15499/station_test node --test portal/test/migrate-fresh-db.test.js
 //   无 PG：TEST_DATABASE_URL 未设置 ⇒ 整个文件 skip（不 fail，不参与假通过）。
 // 隔离约定（docs/testing.md §2.2.4）：只连注入的 URL，每个用例自建新库自建角色、用完即删；
