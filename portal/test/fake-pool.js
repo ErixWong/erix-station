@@ -388,7 +388,15 @@ export class FakePool {
     // ---- #449：登录邮箱验证码（login_email_codes） ----
     // 写侧：只接受 sha256 hex（产品代码的契约是「绝不存明文码」，fake 按契约拒明文）。
     if (sql.includes('INSERT INTO login_email_codes')) {
-      const [pendingTokenHash, codeHash, createdAt, expiresAt, maxAttempts, resendCount, ip, ua] = params;
+      // #737：`adoptEmailCode` 的 INSERT 比 `createEmailCode` 多一列 `attempts`（预算随码走）；
+      // 按 SQL 文本判列形（同族纪律：产品改列形 fake 必须跟着变）。
+      const withAttempts = /expires_at,\s*attempts,/.test(sql);
+      const [pendingTokenHash, codeHash, createdAt, expiresAt, a, b, c, d, e] = params;
+      const attempts = withAttempts ? Number(a ?? 0) : 0;
+      const maxAttempts = withAttempts ? b : a;
+      const resendCount = withAttempts ? c : b;
+      const ip = withAttempts ? d : c;
+      const ua = withAttempts ? e : d;
       if (!/^[0-9a-f]{64}$/.test(String(pendingTokenHash))) throw new Error('fake: pending_token_hash 必须是 sha256 hex');
       if (!/^[0-9a-f]{64}$/.test(String(codeHash))) throw new Error('fake: code_hash 必须是 sha256 hex（绝不存明文码）');
       if (!Number.isInteger(Number(maxAttempts))) throw new Error('fake: max_attempts NOT NULL');
@@ -398,7 +406,7 @@ export class FakePool {
         code_hash: codeHash,
         created_at: createdAt,
         expires_at: expiresAt,
-        attempts: 0,
+        attempts,
         max_attempts: Number(maxAttempts),
         resend_count: Number(resendCount ?? 0),
         consumed_at: null,
@@ -421,6 +429,38 @@ export class FakePool {
           ? [{
             id: row.id, code_hash: row.code_hash, expires_at: row.expires_at,
             attempts: row.attempts, max_attempts: row.max_attempts,
+          }]
+          : [],
+        rowCount: row ? 1 : 0,
+      };
+    }
+
+    // #737 复用读：同一账号窗口内「未消费且未过期」的最新一枚码（JOIN login_pending 按账号筛）。
+    // 谓词**按 SQL 文本真解析**（同 453 行上方纪律）：产品侧漏写 `consumed_at IS NULL` / 漏过期谓词 /
+    // 漏窗口谓词时，fake 跟着放宽 ⇒ 漏条件会被用例打红。窗口判定按传入参数算（$2=now、$3=windowSeconds），
+    // 产品侧 `now` 是 `new Date()` 不好注入 ⇒ 用例靠推早旧行的 created_at 来造「窗口外」。
+    if (sql.includes('FROM login_email_codes') && sql.includes('JOIN login_pending')) {
+      const [userId, now, windowSeconds] = params;
+      const requireUnconsumed = /c\.consumed_at\s+IS NULL/.test(sql);
+      const requireUnexpired = /c\.expires_at\s*>\s*\$2/.test(sql);
+      const requireWindow = /\$2\s*-\s*make_interval/.test(sql);
+      const windowStartMs = new Date(now).getTime() - Number(windowSeconds ?? 0) * 1000;
+      const rows = this.emailCodes
+        .filter((x) => {
+          const p = this.pending.find((pp) => pp.token_hash === x.pending_token_hash && pp.user_id === userId);
+          if (!p) return false;
+          if (requireUnconsumed && x.consumed_at !== null) return false;
+          if (requireUnexpired && !(new Date(x.expires_at) > new Date(now))) return false;
+          if (requireWindow && !(new Date(x.created_at) > new Date(windowStartMs))) return false;
+          return true;
+        })
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at) || String(b.id).localeCompare(String(a.id)));
+      const row = rows[0];
+      return {
+        rows: row
+          ? [{
+            id: row.id, code_hash: row.code_hash, created_at: row.created_at,
+            expires_at: row.expires_at, attempts: row.attempts, max_attempts: row.max_attempts,
           }]
           : [],
         rowCount: row ? 1 : 0,

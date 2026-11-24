@@ -470,7 +470,7 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 > **来源：增量迁移 [`deploy/migrations/0026-login-email-codes.sql`](../../deploy/migrations/0026-login-email-codes.sql)（唯一来源）**。
 > baseline `docs/data/schema.sql` 冻结、**不含本表**（改 baseline 会破坏 `0000_baseline` 的 checksum，见 deploy-contract §3.3）。
 
-TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网账号都没注册 TOTP ⇒ 登录实际只有口令一层。本表给「未注册 TOTP」的账号补第二层：口令通过后发一枚 6 位邮箱验证码（portal.md §2.3a），校验通过才建 `login_sessions`。**一行一枚码**；同一 `pending_token` 下「最新一条未消费」才是当前有效码。
+TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网账号都没注册 TOTP ⇒ 登录实际只有口令一层。本表给「未注册 TOTP」的账号补第二层：口令通过后发一枚 6 位邮箱验证码（portal.md §2.3a），校验通过才建 `login_sessions`。**一行一枚码**；同一 `pending_token` 下「最新一条未消费」才是当前有效码。**一枚码在同一时刻只服务一个 pending**：窗口内重复口令步（#737）不铸新码、不再发信，而是把旧码的 `code_hash` 逐字复制挂到新建的 pending 上（= 插新行 + 立即 `consumed_at` 废旧行）；`expires_at` 与 `attempts` **随码走、不随 pending 续命/刷新**（反复登录不许把码的寿命无限延长，尝试预算也不因复用而翻倍）。
 
 | 关键字段 | 语义 |
 |---|---|
