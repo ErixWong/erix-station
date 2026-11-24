@@ -102,10 +102,10 @@ describe('AdminLayout tab 导航（#449 邮件通道）', () => {
 
     // 裸路由把 tab 桩成 `/<name>`，所以 href 是 `/admin-mail`（真实应用里是 `/admin/mail`，
     // 路由表那条由本用例末尾的 `routes` 断言钉住）。
-    // ⚠ 11 = 到号池占用为止（#596 的 prompts、#595 的 market、#650 的 system、#677 的 runtime 四颗
-    //   tab 都插在 upload 与 pool 之间 ⇒ 原本窗口里的 8 格多了三格；本用例只钉 mail 的相邻，
-    //   多带不影响判据）。
-    const links = wrapper.findAll('nav a').slice(0, 11);
+    // ⚠ 12 = 到号池占用为止（#596 的 prompts、#595 的 market、#650 的 system、#677 的 runtime 四颗
+    //   tab 都插在 upload 与 pool 之间 ⇒ 原本窗口里的 8 格多了三格；#727 片 2 又在 users 之后插了
+    //   「工位内容」一格 ⇒ 窗口整体右移一格。本用例只钉 mail 的相邻，多带不影响判据）。
+    const links = wrapper.findAll('nav a').slice(0, 12);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-mail');
 
@@ -142,7 +142,7 @@ describe('AdminLayout tab 导航（#456 证书页）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 11);
+    const links = wrapper.findAll('nav a').slice(0, 12);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-tls');
 
@@ -178,7 +178,7 @@ describe('AdminLayout tab 导航（#485 片 A 上传上限）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 11);
+    const links = wrapper.findAll('nav a').slice(0, 12);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-upload');
     expect(links.find((link) => link.attributes('href') === '/admin-upload')!.text()).toBe('上传上限');
@@ -197,8 +197,9 @@ describe('AdminLayout tab 导航（#485 片 A 上传上限）', () => {
     expect(hrefs.indexOf('/admin-system')).toBe(hrefs.indexOf('/admin-market') + 1);
     expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-system') + 1);
     // tab 总数：这一格是「加 tab 必须同步改本文件桩路由」那条红线的正面（漏改 ⇒ 挂载就抛，不会走到这里）
-    // ⚠ 11 = #677 P2b 在 prompts 与 market 之间插了「运行时设置」⇒ 到号池占用为止多一格。
-    expect(hrefs).toHaveLength(11);
+    // ⚠ 12 = #677 P2b 在 prompts 与 market 之间插了「运行时设置」，#727 片 2 又在 users 之后插了
+    //   「工位内容」⇒ 到号池占用为止各多一格。
+    expect(hrefs).toHaveLength(12);
 
     // 路由表本身：`/admin` 的 children 里有 `upload` → `admin-upload`，懒加载且要求 admin 角色
     const adminRoute = routes.find((route) => route.path === '/admin')!;
@@ -222,7 +223,7 @@ describe('AdminLayout tab 导航（#596 片 B 提示词面板）', () => {
     await router.isReady();
     const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
 
-    const links = wrapper.findAll('nav a').slice(0, 11);
+    const links = wrapper.findAll('nav a').slice(0, 12);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-prompts');
     expect(links.find((link) => link.attributes('href') === '/admin-prompts')!.text()).toBe('提示词');

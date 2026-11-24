@@ -52,6 +52,15 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminUsersView.vue'),
         meta: { requiresRole: 'admin' },
       },
+      // issue #727 片 2：「工位内容」（该 FDE 的会话与文件，只读，契约 §4.22）。紧跟 users：
+      // 它是「看人」的延伸——users 行上的「会话/文件」链接直接跳到这里（`?fde=<fde_name>`）。
+      // 懒加载 + requiresRole 照邻居；请求只在 `AdminSeatContentView` 里发（未选 FDE 一个请求都不发）。
+      {
+        path: 'seat-content',
+        name: 'admin-seat-content',
+        component: () => import('./views/AdminSeatContentView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
       {
         path: 'llm',
         name: 'admin-llm',
