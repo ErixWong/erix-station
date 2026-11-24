@@ -21,6 +21,7 @@ import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle } from './session-title.js';
 import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
 import { samePayload, dedupConflictDetails, DEDUP_CONFLICT_CODE } from './transcript-payload.js';
+import { MAX_ROUND_BYTES, resolveMaxRoundBytes } from './transcript-limits.js'; // issue #261123-20 M1：常量下沉叶子模块（见下方 §9.7 指针注释）
 // issue #500：恢复行三个端点复用 store 层的同一套 SQL + 幂等判据（**不在这里重写一份**）：
 // 写路径 / 读路径 / 清盘各只有一处实现，否则会出现「store 适配器幂等、端点不幂等」这种单侧可观测的行为。
 import { createRecoveryRowStore } from './transcript-store.js';
@@ -62,25 +63,11 @@ const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
  */
 const TEXTUALIZED_MARKER_MAX_CHARS = 120;
 const PORTAL_RESERVED_EVENT_TYPES = new Set(['run_end', 'partial_output', 'attempt_killed', 'textualized_tool_call']);
-// portal.md §9.7：单轮 transcript 记录体积上限。**默认仍是契约值 1 MiB**，issue #371-B 起可由
-// env `MAX_ROUND_BYTES` 覆盖（真机复现「宿主拒 → 引擎剥归档重试一次」要把闸调小到几百 KB，
-// 不可能为此跑 160 轮）。⚠ 调之前先看下面那个算术——调小于它，正常折叠记录也会天天碰闸。
-// 算术（`test/internal-round-size-cap.test.js` 钉住）：上游 erix-agent#461 把折叠归档夹到 256 KiB
-// （`ERIX_FOLD_ARCHIVE_MAX_BYTES`）+ 非归档部分真机稳定≈ 20 KiB + `messages` 满预算
-// （203 161 估算 token × 2.78 B）≈ 565 KiB ⇒ 单条记录≈ 840 KiB < 1 MiB。
-const MAX_ROUND_BYTES_DEFAULT = 1024 * 1024;
-
-/**
- * 单轮上限解析（#371-B）：显式 env > 默认 1 MiB。非法值（非整数 / ≤0 / 乱码）**退回默认**，
- * 不拒启动——本值只是防护上限，配错时宁可回到契约值也不要让 portal 起不来。
- */
-export function resolveMaxRoundBytes(raw = process.env.MAX_ROUND_BYTES) {
-  if (raw === undefined || raw === null || raw === '') return MAX_ROUND_BYTES_DEFAULT;
-  const parsed = Number(String(raw).trim());
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) return MAX_ROUND_BYTES_DEFAULT;
-  return parsed;
-}
-const MAX_ROUND_BYTES = resolveMaxRoundBytes();
+// portal.md §9.7：单轮 transcript 记录体积上限常量已下沉到叶子模块 `./transcript-limits.js`
+//（issue #261123-20 M1：唯一写入口 `transcript-store.js#appendRound` 也要用它，放这里会成环
+//  internal → transcript-store → internal）。下面的转发保证既有导入面不破
+//（`test/internal-round-size-cap.test.js` 从本文件导入 `resolveMaxRoundBytes`）。
+export { resolveMaxRoundBytes };
 
 /** internal 通道统一错误（http.js 映射为标准错误信封，portal.md §9.13）。 */export class InternalError extends Error {
   constructor(status, code, message, { retryable = false, details } = {}) {
