@@ -297,7 +297,10 @@ export function resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath = '
         st = fs.lstatSync(cur);
       } catch (err) {
         if (err?.code === 'ENOENT') {
-          throw new DirError('not_found', 'path not found', { httpStatus: 404 });
+          // 与下面两条同形带 `details.field`：这是「路径」这一格的错，不是整页的错。
+          throw new DirError('not_found', 'path not found', {
+            httpStatus: 404, details: { field: 'path' },
+          });
         }
         throw err;
       }
@@ -347,7 +350,12 @@ export async function fileTreeUnderProjects(
   for (const d of fs.readdirSync(target, { withFileTypes: true })) {
     if (!isSafeDirName(d.name)) continue;
     if (d.isDirectory()) {
-      if (d.name === '.git') continue; // 同 resolveJailedUnderProjects：不进 git 元数据
+      // 同 resolveJailedUnderProjects：`.git` 目录不进树。
+      if (d.name === '.git') continue;
+      // 点开头的**目录**不列（同 `listDirs` 的口径：挡掉 `.pnpm-store` 这类工具缓存目录，
+      // 它们不可能被选成 cwd，列出来只是噪音）。点开头的**文件**照常列——`.gitignore`
+      // / `.gitattributes` / `.env` 都是正常项目文件，#727 的红线只针对 `.git` 目录。
+      if (d.name.startsWith('.')) continue;
       entries.push({ name: d.name, type: 'dir' });
     } else if (d.isFile()) {
       entries.push({ name: d.name, type: 'file' });
