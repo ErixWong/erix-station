@@ -9503,3 +9503,28 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
 **残余（未开单，两条都是真洞）**：
 1. **宿主预写无体积闸**：`transcript-store.js#appendRound` 不校验序列化后的 record 体积 ⇒ 超过 `MAX_ROUND_BYTES` 的记录能绕过 internal 那道 400 直接落库。
 2. **`MAX_ROUND_BYTES` 仍没接进 compose**：它的 env 覆盖在生产依旧无效（本单只删了 `MAX_BODY_BYTES`，没动它——它是 round 契约的调参口，接进 compose 还是删掉需要单独决定）。
+
+### 8.185 `transcript_rounds` 体积保险丝下沉到唯一写入口（2026-11-24，主 agent + erix_run）
+
+**接 8.184 的残余①**：`transcript_rounds` 有两条写入路径，闸只装在一条上 ——
+宿主预写（`sessions.js` postMessage → `appendUserTurn` → `transcript-store.js#appendRound`）**无任何体积检查**；
+agent 回传（`PUT /api/internal/transcript/:key/rounds/:N` → `internal.js#putRound`）有 `MAX_ROUND_BYTES`（1 MiB）。
+
+**先算清楚它今天可不可达**（现算，不是估）：预写 record 形态 = `{round, messages:[{role:'user',content:[{type:'text',text}]}], dedupKey, roundKey, ts}`，
+`attachments` **不进** record ⇒ record 体积只由 `content` 决定。实测：信封 296 B；10 万字符最坏（控制字符转义 6 B/字符）
+= **600,296 B**；10 万汉字 = 300,296 B；`MAX_ROUND_BYTES` 1 MiB ⇒ 余量 **448,280 B**。
+⇒ **今天结构上不可达**，但靠的是「两个数恰好差 448 KiB」这个巧合，不是有人拦。业务闸一放宽（例如为 10M 上下文模型改 100k 字符）就破。
+
+**做法（闸下沉到唯一写入口，不是在预写处打补丁）**：
+- 新增叶子模块 `portal/src/transcript-limits.js`：`MAX_ROUND_BYTES_DEFAULT` / `resolveMaxRoundBytes()` / `MAX_ROUND_BYTES` 从 `internal.js` **原样搬出**（连 256 KiB+20 KiB+565 KiB 那段算术注释一起）。
+  **原因**：`internal.js:26` 本来就 import `transcript-store.js`，若反过来取常量就成环（`internal → transcript-store → internal`）。`internal.js` 保留 `export { resolveMaxRoundBytes }` 转发，既有导入面不破。
+- `transcript-store.js#appendRound`：**先判后写** —— `Buffer.byteLength(JSON.stringify(record)) > MAX_ROUND_BYTES` ⇒ 抛 `{ code: 'transcript_record_too_large' }`，**INSERT 一次都不执行**。
+- `sessions.js#postMessage` 的 catch 新增该 code 的映射 ⇒ `400 validation_failed` + 「消息过长，存不下这一轮记录（上限 N 字节）」+ `details={field:'content', max_bytes}`，**不许升格成 500**。
+
+**判据**（`portal/test/transcript-record-fuse.test.js`，4 格）：① 超限抛错**且 fake client INSERT 计数 = 0**（先判后写的硬证据）；② 恰好 1 MiB 整 ⇒ 正常写入（边界不误伤）；③ 10 万汉字真 HTTP `POST /messages` ⇒ **202**（合法路径不误伤）；④ 源码级哨兵钉住 `sessions.js` 的映射分支（端到端触发需要放宽业务闸，正常情况下不可达，故用哨兵）。
+**父 agent 变异实测（自己做）**：把保险丝条件改成 `if (false)` ⇒ **① 红、②③④ 绿**，改回后全绿。
+最终树：`npm test` **rc=0 / 3227 tests / 3112 pass / 0 fail / 115 skipped**；`check:agents-hotlayer` `VERDICT ok`。
+
+**父 agent 复审另修**：worker 写的 `throw Object.assign(...)` 单行 200 字节，拆成 3 行（`style(677)` 那个 commit）。
+
+**残余**：`MAX_ROUND_BYTES` 的 env 覆盖在生产仍无效（没接进 compose 的 environment 列表，见 8.184 残余②）——删掉它还是接进去，需要先确认「真机复现要调小闸」这条用途还用不用。
