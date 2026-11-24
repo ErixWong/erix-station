@@ -66,6 +66,8 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 
 临时栈起停命令见 §2.2。集成测试用 `node --test` 或独立脚本驱动，但**必须**满足 §2.2 的隔离与清理约定；判定 = 测试进程退出码 0 + 临时资源（容器/网络/数据卷）已清理（§2.2.4）。
 
+> **另一档集成：活栈 e2e（不新起隔离栈）**——`portal/integration/version-surface-e2e.mjs`（`npm run test:integration:version`）与 `portal/integration/seat-content-e2e.mjs`（`npm run test:integration:seat`）验的是**本机活着的那套栈**（admin 入口 `E2E_UI_BASE` 缺省 `https://admin.fde.erix.vip:9443`，口令只从 `~/.config/creds/station-dev-password-file` 读）；HTTP 腿总是跑，浏览器腿要点名才跑：`E2E_UI=1 npm run test:integration:seat`（缺 playwright 容器则 skip，不算红）。
+
 #### 1.2.4 安全回归
 
 安全回归用例（§3.1/§3.2）**不能只写单测**——它们验证的是「容器网络/宿主防火墙/边缘认证」的真实行为，必须在真实 docker 网络与真实 Traefik/portal 栈上跑。本机可跑的部分用 `sg docker -c '...'` 起真容器验证；目标环境事实部分（如宿主是否真的跑了 `gitea:3000`/`mssql:1433`/`portainer:9000`）必须**目标环境实测**（topology §6.1「验收矩阵（目标环境实测，逐项打勾）」）。
