@@ -52,16 +52,16 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
   改用 DOM / 请求桩断言。
 - **验收 / 发版前先重装依赖再复跑拿基线**；每个 worktree 自备 `node_modules`（`npm ci --offline`）。
   派单红线是「不改依赖版本、不提交 lockfile 变动」，**不是**「禁止安装依赖」。
-- 本机测试环境的六条坑（成因、实测数、拆遗留链接的收尾）与 dev 栈登录事实 ⇒ `docs/testing.md` §1.3.1 / §1.3.2。
-- **本机连 GitHub 不通时先现验代理配置再动 git，别反复重试** ⇒ 全局 §3.7 + `docs/env.md` §8.1.1。
+- 本机测试环境的坑与 dev 栈登录事实 ⇒ `docs/testing.md` §1.3；本机坐标（版本/端口占用/口令路径）⇒ 冷层 `~/projects/docs/station-dev-machine.md`。
+- **本机连 GitHub 不通时先现验代理配置再动 git，别反复重试** ⇒ 全局 §3.7；本机代理取值/主机名 ⇒ 冷层 `~/projects/docs/station-dev-machine.md`。
 
 ### 4.1 dev 栈访问与探针口径（仅本地 dev）
 
-- 入口、账号、口令文件位置、第二因素现状 ⇒ `docs/testing.md` §1.3.2；**登录体字段是 `login` 不是 `username`**
+- 入口、账号、口令文件位置、第二因素现状 ⇒ `docs/testing.md` §1.3；**登录体字段是 `login` 不是 `username`**
 - **脚本/agent 要调 API ⇒ 用 API 令牌**（`Authorization: Bearer`，仅 admin 可签；契约与三步 curl
   ⇒ `docs/api/portal.md` §2.13）——**不登录就不碰第二因素，也就不寄邮件**
 - **一次性探针要会话就登 `admin`**；**别反复登 `eric`**（他走邮箱验证码：每次寄一封真邮件而脚本读不到码）
-- 要测第二因素：自建带 TOTP 的种子账号走 step1+step2（做法同 §1.3.2）
+- 要测第二因素：自建带 TOTP 的种子账号走 step1+step2（做法同 §1.3）
 
 ### 4.2 LLM 网关（LiteLLM）
 
@@ -79,7 +79,7 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 ## 5. 端口
 
 - **FDE 容器内的端口由平台分配（DB 为真相），不对宿主机 publish**（不变式 1、D4）
-- 本机端口登记与开发期取值（本机 80/443 被占 ⇒ 入口用 8090/8443）⇒ `docs/env.md` §5 / §8.2；
+- 本机端口占用实况与开发期取值 ⇒ 冷层 `~/projects/docs/station-dev-machine.md`；平台端口不变式 ⇒ `docs/env.md` §5；
   管理台入口 9443「改端口要动哪两处」与来源白名单 ⇒ `docs/deploy/edge-routing.md` §4 / §6
 
 ## 6. Git 与流程
@@ -92,6 +92,7 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 - **一单一账写 `docs/maintenance/task-ledger.md`**（编号 `8.N` 全局唯一、不重排；挑号前先
   `grep -n '^### 8\.' docs/maintenance/task-ledger.md | tail -3`，并行 session 会撞号，§8.116）。
   **别写进本页**：本页每次 agent run 全额注入（闸的引用口径见 §8.121）
+- **仓库文档必须可公开**：本机/内网坐标（内网 IP、tailnet IP、内网主机名、凭据文件路径、宿主端口占用、dev 账号名）不写进本仓库，一律放 `~/projects/docs/`，仓库里只留指针与现验判据；闸 `npm run check:doc-portable`（经 `npm test` 跑到）。
 
 ### 6.1 代码 PR 评审要求（合并前主 agent 必须亲自做完；文档 PR 不强制）
 
