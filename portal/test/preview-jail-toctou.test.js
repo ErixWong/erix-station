@@ -94,8 +94,9 @@ test('#726 openFileStream：真实文件仍可流式，读完后 fd 已关闭', 
     assert.equal(r.headers['Content-Length'], String(pdf.length));
     const buf = await drain(r.stream);
     assert.equal(buf.equals(pdf), true, '读出内容与原文件逐字节一致');
-    // autoClose 关掉 fd + 流 'close' 时 fh.close() 解除 FileHandle finalizer；
-    // 排空并等待 'close' 落定后，进程内打开的 fd 数应回到基线（没泄漏）。
+    // 单一关闭者：autoClose:false ⇒ 流不关 fd，排空时 'close' 事里 fh.close()
+    // 关一次并解除 FileHandle finalizer；排空并等待 'close' 落定后，进程内
+    // 打开的 fd 数应回到基线（没泄漏、也没双关）。
     await tick(60);
     assert.equal(fdCount(), base, '读完后 fd 已关闭（打开 fd 数回到基线）');
   } finally {
@@ -203,6 +204,91 @@ test('#726 rootKind:projects（管理台根）同样受 fd 校验保护：正常
     assert.ok(m.mock.callCount() >= 1, 'projects 根也经 openVerifiedFd 反查 fd');
     assert.equal(returned, undefined, '越狱被拒：未返回 stream');
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── issue #726 后续（本 PR fix-261124-04）：单一关闭者 ⇒ 无 unhandled EBADF ──
+// CI 上偶发的 unhandled `EBADF: bad file descriptor, close` 来自旧写法的双关闭
+// 者（autoClose:true 让流自己 close(fd)，又在 'close' 里 fh.close()）：流内部那次
+// close 失败无归处 ⇒ unhandled rejection。本地时序相关、3 次跑不现；下面两条用
+// 例确定性地走「读完前 destroy」与「正常读完」两条路径，钉住「fh.close() 只关一次、
+// fd 已关、且 0 条 unhandled rejection」。
+// unhandledRejection 收集器：用完必须在 finally 里 remove()，否则泄漏到其他用例。
+function installUnhandledCollector() {
+  const list = [];
+  const onUnhandled = (err) => { list.push(err); };
+  process.on('unhandledRejection', onUnhandled);
+  return {
+    list,
+    remove() { process.off('unhandledRejection', onUnhandled); },
+  };
+}
+
+// 7) 读完前被销毁（CI 翻车那条形态，确定性）：1 MiB 文件，openFileStream 后立刻
+//    destroy()（不排空），等 'close'；断言 0 条 unhandled rejection、fd 已关回基线。
+test('#726-单关闭者 openFileStream：读完前 stream.destroy() ⇒ 无 unhandled，fd 已关', async () => {
+  const { root, proj } = jail();
+  const collector = installUnhandledCollector();
+  try {
+    fs.writeFileSync(path.join(proj, 'big.bin'), Buffer.alloc(1024 * 1024, 0x61)); // 1 MiB
+    const ARGS = {
+      userSpaceRoot: root, fdeName: 'alice', cwd: '~/projects/proj1', relPath: 'big.bin',
+    };
+    // warmup：消 libuv 线程池首初始化的 fd 干扰，使基线干净（同用列 2）。
+    {
+      const w = await openFileStream(ARGS);
+      await drain(w.stream);
+      await tick(40);
+    }
+    const base = fdCount();
+    const r = await openFileStream(ARGS);
+    assert.equal(r.status, 200);
+    // 拿到 stream 后 fd 确实开着（+1）：避免“本来就没开”让后面的“已关”断言变空洞。
+    assert.equal(fdCount(), base + 1, '拿到 stream 时 fd 应为已开（+1）');
+    // 不排空、直接销毁；等 'close' 落定。closeOnce 会在 'close' 里只关一次。
+    const closed = new Promise((resolve) => r.stream.once('close', resolve));
+    r.stream.destroy();
+    await closed;
+    // 'close' 里 fh.close() 是异步的，给一个宏任务让它跑完。
+    await tick(60);
+    assert.equal(fdCount(), base, 'destroy 后 fd 已关（回到基线，只关了这一次）');
+    assert.deepEqual(
+      collector.list.map((e) => e?.code || String(e)), [],
+      '读完前销毁不得产生 unhandled rejection（旧双关闭者会漏出 EBADF）'
+    );
+    assert.equal(collector.list.length, 0, 'unhandled rejection 计数必须为 0');
+  } finally {
+    collector.remove();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// 8) 正常读完：确定性地走完整排空路径，同样断言 0 条 unhandled rejection、fd 已关。
+test('#726-单关闭者 openFileStream：正常排空读完 ⇒ 无 unhandled，fd 已关', async () => {
+  const { root, proj } = jail();
+  const collector = installUnhandledCollector();
+  try {
+    const data = Buffer.alloc(256 * 1024, 0x62); // 256 KiB
+    fs.writeFileSync(path.join(proj, 'full.bin'), data);
+    const ARGS = {
+      userSpaceRoot: root, fdeName: 'alice', cwd: '~/projects/proj1', relPath: 'full.bin',
+    };
+    {
+      const w = await openFileStream(ARGS);
+      await drain(w.stream);
+      await tick(40);
+    }
+    const base = fdCount();
+    const r = await openFileStream(ARGS);
+    assert.equal(fdCount(), base + 1, '拿到 stream 时 fd 应为已开（+1）');
+    const buf = await drain(r.stream); // 完整排空
+    assert.equal(buf.length, data.length, '内容长度一致');
+    await tick(60); // 等 'close' 里的 fh.close() 落定，也让可能的 unhandled 浮出
+    assert.equal(fdCount(), base, '读完后 fd 已关（回到基线）');
+    assert.equal(collector.list.length, 0, '正常读完也不得有 unhandled rejection');
+  } finally {
+    collector.remove();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
