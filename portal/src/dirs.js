@@ -812,26 +812,11 @@ export async function openFileStream({
   }
   let handedOff = false;
   try {
-    // fd 交给流：单一关闭者原则（修 CI 偶发 unhandled EBADF）。autoClose:false
-    // ⇒ 流不再自己 close(fd)，fd 只由 FileHandle 的 fh.close() 关一次。旧写法
-    // autoClose:true 又在流 'close' 里 fh.close()，是两个关闭者（流内部 close 与
-    // FileHandle close）竞争同一 fd：.catch 只吞了 fh.close() 这条 promise，流内部
-    // 那次 close 的失败无人接收 ⇒ 以 unhandled rejection 冒出。closed 标志保证幂等，
-    // 'close'/'error'/'end' 三个出口都收敛到 fh.close()（FileHandle 内部已关时是
-    // EBADF，吞掉即可），同时把 FileHandle 的 GC finalizer 解除。
-    const stream = fs.createReadStream(null, { fd: fh.fd, autoClose: false, start, end });
-    let closed = false;
-    const closeOnce = () => {
-      if (closed) return;
-      closed = true;
-      fh.close().catch(() => {});
-    };
-    // 三个出口都收敛到幂等的 closeOnce：'close'（提前 destroy/abort）、'error'
-    // （流错）、'end'（排空到 EOF）。autoClose:false 下 ReadStream 读到 EOF 只
-    // 发 'end' 不发 'close'，故必须听 'end'，否则正常读完这条路径会漏关 fd。
-    stream.on('close', closeOnce);
-    stream.on('error', closeOnce);
-    stream.on('end', closeOnce);
+    // fd 交给流：autoClose 保证流结束/出错时 fd 被关闭。FileHandle 自己的
+    // GC finalizer 会在 fd 已被流关掉后再关一次 ⇒ EBADF；故在
+    // 流 'close' 时显式 fh.close()（已关会抛 EBADF，吞掉），把 finalizer 解除。
+    const stream = fs.createReadStream(null, { fd: fh.fd, autoClose: true, start, end });
+    stream.on('close', () => { fh.close().catch(() => {}); });
     handedOff = true;
     return { name, path: rel, rel, size: st.size, mime, status, headers, stream };
   } finally {

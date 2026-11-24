@@ -34,6 +34,9 @@ const who = computed(() => {
 
 const tabs = [
   { name: 'admin-users', label: 'admin.tabs.users' },
+  // issue #727 片 2：「工位内容」（某个 FDE 的会话与文件，只读）。插在 users 之后：
+  // 它是「看人」的延伸，users 行上的链接是它的第二个入口。
+  { name: 'admin-seat-content', label: 'admin.tabs.seatContent' },
   { name: 'admin-llm', label: 'admin.tabs.llm' },
   { name: 'admin-repos', label: 'admin.tabs.repos' },
   // issue #449：邮件通道配置（登录第二因素「邮箱验证码」的开关）。放在仓库管理之后、号池之前：

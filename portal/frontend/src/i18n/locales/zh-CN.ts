@@ -850,6 +850,9 @@ export const zhCN = {
     tabs: {
       label: '管理台栏目',
       users: '用户管理',
+      // issue #727 片 2：「工位内容」（某个 FDE 的会话与文件，只读）；views/AdminSeatContentView.vue。
+      // 紧跟 users：它是「看人」的延伸。
+      seatContent: '工位内容',
       llm: 'LLM 管理',
       repos: '仓库管理',
       mail: '邮件通道',
@@ -875,6 +878,71 @@ export const zhCN = {
       // issue #528（事件平台 W5）：宏模板与宏流水的管理台栏目（按 `07` §21.1 的键名表）。
       macros: '宏模板',
       macroRuns: '宏流水',
+    },
+    // issue #727 片 2：「工位内容」页（views/AdminSeatContentView.vue + components/AdminTranscript.vue，
+    // 契约 §4.22）。只读页：文案里不得出现「发送/停止/上传」这类写侧动词。
+    seatContent: {
+      title: '工位内容',
+      // users 行上的跳转链接文案（views/AdminUsersView.vue）。
+      fromUsersLink: '会话/文件',
+      readOnly: '只读',
+      readOnlyHint: '本页只能看，不能改：没有任何写入、发送或上传入口。',
+      fdeLabel: '工位（FDE）',
+      selectFde: '选择一个工位…',
+      loadingUsers: '正在读取工位列表…',
+      noFdeUsers: '还没有带工位的用户。',
+      empty: {
+        title: '未选中内容',
+        hint: '从左边点一条会话看对话，或点一个文件看预览。',
+      },
+      sessions: {
+        title: '会话',
+        searchPlaceholder: '搜索标题或目录',
+        includeArchived: '含已归档',
+        empty: '这个工位还没有会话。',
+        loadMore: '加载更多会话',
+        untitled: '（无标题）',
+      },
+      files: {
+        title: '文件',
+        empty: '这个目录是空的。',
+        loadMore: '加载更多文件',
+        rootHint: '根目录 = 该工位的 ~/projects',
+      },
+      meta: {
+        cwd: '目录',
+        model: '模型',
+        status: '状态',
+        createdAt: '创建',
+        updatedAt: '更新',
+        messages: '消息数',
+        unknown: '—',
+      },
+      transcript: {
+        loadEarlier: '加载更早',
+        noEarlier: '已到最早一条',
+        empty: '这条会话还没有消息。',
+        toolDetails: '展开/收起详情',
+        toolDuration: '耗时 {duration}',
+        foldedBanner: '这段已被压缩折叠（第 {round} 轮的摘要）',
+        viewOriginal: '查看原文',
+        hideOriginal: '收起原文',
+        originalLoading: '正在读取原文…',
+        originalUnavailable: '原文已不可用（这个范围里没有留下正文）。',
+        originalFailed: '原文读取失败：{message}',
+        reasoning: '推理过程',
+        partialTruncated: '（正文被截断，上游只留了这一段）',
+        partialPlaceholder: '（这次运行没有留下可展示的正文）',
+        loading: '正在读取对话…',
+      },
+      preview: {
+        loading: '正在读取文件…',
+        download: '下载',
+        downloadInstead: '改为下载',
+        notPreviewable: '这类文件不在预览清单里，只能下载。',
+        imageAlt: '图片预览：{name}',
+        tooLargeHint: '文件太大或格式不支持，可以用下面的下载。',
+      },
     },
     // 能力市场·发布台（views/AdminMarketView.vue，issue #595 M2；契约 §7 管理面 + §8 管理台）。
     market: {
