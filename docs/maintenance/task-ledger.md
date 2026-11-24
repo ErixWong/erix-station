@@ -9800,8 +9800,15 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
   改写成「只带一个」的两种形状——原措辞会被读成「两个都发就拿 cookie」，实际那是 400；③ §2.13 补三步 curl
   配方（签 → 用 → 存哪）；④ `AGENTS.md` §4.1 与 `docs/testing.md` 各加一条「脚本要调 API 用令牌、别登录」。
 - **遗留（各挂可跑判据，不押版本号）**：① 令牌**没有界面**，看不见就等于不可吊销 ⇒ 已开 **#746**；
-  ② **经 Traefik 的真机验证未做**（配置面已核对：`deploy/traefik/` 只有 entryPoint 的 `forwardedHeaders`，
-  没有剥/改写 `Authorization` 的中间件）——判据：部署后 `curl -H 'Authorization: Bearer <token>'
-  `https://admin.fde.erix.vip:9443/api/me` 应 `200` + `X-Auth-Method: api_token`；若本地直连 200 而经边缘
-  401 即边缘剥头；③ 与本单无关的 CI 噪声记录：本 PR 之前该仓 CI 出现过一次 `#727-5b` `500 !== 200`
+  ② ~~经 Traefik 的真机验证未做~~ ⇒ **已验**（同日：dev 栈换本地构建镜像，走 `:9443` 入口实跑）：
+  `Bearer` 打 `GET /api/me` ⇒ `200` + `X-Auth-Method: api_token` + **`Set-Cookie` 0 行**（边缘不剥头）；
+  `cookie`+`Bearer` 同现 ⇒ `400 ambiguous_credential`；`Authorization: Basic …` ⇒ `401 unsupported_scheme`；
+  签发 ⇒ `201`（`scopes: []`、明文 46 字符只出一次）；列表里 `last_used_at` 有值且**连打三次不再写**
+  （节流为真）；吊销 ⇒ `200 {already_revoked:false}` → 再删 ⇒ `already_revoked:true` → 同令牌 ⇒ `401`；
+  `Bearer` 打 `/api/auth/logout` ⇒ `400 logout_not_applicable_for_tokens`；同名重签 ⇒ `409 token_name_taken`；
+  全程 `login_email_codes` **47→47**、eric 的 `login_pending` **94→94**（零邮件、零待决）；审计只有
+  `auth.token_created`/`auth.token_revoked` 两条且 `details` 无明文，库里 `token_hash` 长 64。探针令牌已
+  `DELETE`（不在 dev 库留外部凭据）。**顺带撞出一个开发流程坑**：`.env` 里 `STATION_PORTAL_IMAGE` 默认是
+  发布件的 digest 引用，裸跑 `docker compose build station-portal` 直接 `refusing to create a tag with a
+  digest reference` —— 已在 `docs/testing.md` §1.3.2 写明要用本地 tag 覆盖；③ 与本单无关的 CI 噪声记录：本 PR 之前该仓 CI 出现过一次 `#727-5b` `500 !== 200`
   （已由 **#745** 修）与两次 20 分钟取消（`concurrency` 挤兑，重跑即绿：`#741` 重跑后 3m14s pass）。

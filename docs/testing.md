@@ -118,8 +118,13 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 - 入口 `http://station.fde.erix.vip:8090/`（伞域泛解析，#57 阶段2；Traefik 只认
   `station.fde.erix.vip` / `100.100.0.3`，旧的 `hp.inteva.vip:8090` 已随 Host 路由切换失效）。
   deploy 栈 `station-portal`；代码更新后 `docker compose build station-portal && docker compose up -d station-portal`
-  生效。本机解析器负缓存解析不出时，可用 playwright 容器 `erix_station_playwright`（:8935，
-  resolver MAP 规则）或临时 hosts 条目兑底。
+  生效。⚠ **裸跑 `docker compose build` 会失败**：`.env` 里 `STATION_PORTAL_IMAGE` 默认是发布件的
+  **digest 引用**（`…@sha256:…`），docker 拒给 digest 当 tag（`refusing to create a tag with a digest
+  reference`）⇒ 开发时给一个本地 tag 覆盖（两个命令都要带，否则 `up` 仍按 `.env` 起）：
+  `STATION_PORTAL_IMAGE=erix-station/portal:local-<单号> docker compose build station-portal &&
+  STATION_PORTAL_IMAGE=… docker compose up -d station-portal`。这种本地构建没烘 `build-info.json`
+  （版本面 `localBuild=true`，**不能当发布件对账**）。本机解析器负缓存解析不出时，可用 playwright
+  容器 `erix_station_playwright`（:8935，resolver MAP 规则）或临时 hosts 条目兜底。
 - 账号 `admin`（`role=admin` → 管理台）与 `eric`（`fde:eric` → 工作台）**共用同一口令**；明文不入库
   不外传：`~/.config/mcp/creds/station-dev.password`（600，轮换直接改该文件 + 跑密码重置流程）。
   登录体字段是 `login` 不是 `username`。
@@ -129,6 +134,8 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
   ⇒ 一次性探针要会话就登 `admin`；**别反复登 `eric`**：每登一次用户邮箱就多一封，而脚本永远读不到
   那枚码（放大链与修法见 #737 / #736）。
 - 要测第二因素：照 `portal/integration/wp2a-e2e.mjs:288` 自建带 TOTP 的种子账号走 step1+step2。
+- **脚本要调 API 就别登录**：管理员代签一枚 API 令牌，之后 `Authorization: Bearer` 直连
+  （三步 curl 配方 ⇒ `docs/api/portal.md` §2.13）。令牌路径**零邮件、零会话**（#736）。
 - **脚本要调 API 就别登录**：管理员代签一枚 API 令牌，之后 `Authorization: Bearer` 直连
   （三步 curl 配方 ⇒ `docs/api/portal.md` §2.13）。令牌路径**零邮件、零会话**（#736）。
 - 密码重置：用 portal 自身 `hashPassword`（scrypt 自描述格式）生成后更新 `users.password_hash`
