@@ -9565,3 +9565,108 @@ cookie ⇒ 重试；而脚本读不到邮箱里的码 ⇒ 永不自愈 ⇒ 每�
 
 **闸**：`npm run check:agents-hotlayer` `VERDICT ok`，热层 19366 / 预算 19456（余 90 字节）。
 **残余**：热层几乎见底，下一条 §8 之前的判据必须先搬冷层或 `--sync` 抬预算，别挤成红。
+
+### 8.188 #727 片 1 后端：管理台按 FDE 只读浏览会话与项目文件（#727 / PR #729，2026-11-24，erix_run + 主 agent 复审 + copilot 审计）
+
+**需求**（用户定稿布局）：管理台新 tab，用户顶部下拉 → 左栏上会话清单、下文件树（根 = 该工位 `~/projects`）
+→ 右栏点会话看只读对话、点文件看预览。**只读**：零 POST / 零 SSE / 零 `/pv/`。
+
+**为什么能零复制复用工作台代码**：`sessions.js` 的属主校验**入参是 `userId`**（不是登录态，
+`sessions.js:186`），管理台把「目标 FDE 的 id」当 `userId` 传进去，得到的就是同一套校验与同一份 DTO。
+7 条端点全部 `/api/admin/fdes/:fdeName/...`（管理台 host 的边缘只放行 `/api/admin/*`，`routes.yml`）。
+
+**文件**：`portal/src/admin-seat-content.js`（新，348 行：7 个只读入口 + `resolveTargetFde`（按 `fde_name` 查，
+**不限 status**）+ 审计去重 `Map`）；`dirs.js`（`resolveJailedUnderProjects` 根 = `<userSpaceRoot>/<fde>/projects`、
+`fileTreeUnderProjects` **复合游标** `d:<name>`/`f:<name>`、`readFilePreview`/`openFileStream` 加 `rootKind`）；
+`sessions.js`（四处 `includeArchived` + `listSessions` 的 `q`，转义 `\ % _`）；`http.js`（7 路由 +
+`requireAdminReadMethod` + history 四助手/两常量改 `export`）；`admin.js`（`recordAdminAudit` 改 `export`）。
+
+**主 agent 复审抓到的 5 条（全部实测/读码确认后打回）**：
+1. **MAJOR 分页丢项（真 bug，已复现）**：排序是 dirs-first（type 主序），游标只比 `name` ⇒ 目录名排在文件名之后
+   时**整批文件永久不可达**。修法：游标改复合键，比较 `(rank, name)`；补「逐页翻到底的并集 = 全量」回归。
+2. `mode` 非法值静默当 json（用户面是 400）⇒ 改 400。3. 树里把所有点开头目录都跳过（连 `.github/`、
+   `.erix/` 都藏）⇒ 只跳 `.git`。4. `q` 超长静默忽略 ⇒ 改 400。5. 审计去重 Map 只增不删 ⇒ 超 5000 条先清过期项。
+
+**审计前置（copilot readonly + xhigh，14 分钟）**：1 BLOCKER（文件 jail TOCTOU，**既有缺陷**，另开 #726）
++ 4 MAJOR（`include_archived` 须贯穿五处、history 用 `before` 不是 `cursor`、详情要补 `queued_messages`、
+`endpointBase` 一个 prop 不够）+ 3 MINOR，全部并入本单或另单。
+
+**数据事实（实测，实现者不必重推）**：`chat_sessions.status` 值域 `active|archived`（现网 57 条 archived，
+其中 **42 条零消息**）；正文在 `transcript_rounds.record` 的 content blocks（含 `tool_result` 全文，
+最长 13,018 字符），**不在** `messages.content`；`tool_calls.result_digest` 是 **500 字截断预览**
+（`runner/worker.js:307-309`），不是哈希；归档只 `UPDATE status+updated_at`，无 `archived_by`
+（归档时刻 = `updated_at`，最后消息时间 = `max(messages.created_at)`，两者都可恢复）。
+
+**真机 e2e（2026-11-24 主 agent 亲跑，dev 栈重建后）**：7 端点全 200；跨 FDE 与不存在的 sessionId ⇒ 404
+**响应体逐字相同**；`.git` / `../alice` / `mode=bogus` ⇒ 400；归档会话不带开关 404、`include_archived=1` 200；
+用户入口（`:8090`）打 `/api/admin/*` ⇒ 边缘 `404 Not Found`；无 cookie ⇒ 401；`audit_log` 六种 action 全落行；
+同文件连打 3 次只写 1 行（去重生效）。**未跑到的一条**：非 admin 403 真机验证——`eric` 开了邮箱验证码，
+登录拿不到会话（`email_code_required`），不用改他人口令的方式绕过；该条由单测 #727-1 覆盖。
+判绿只看退出码：根 `npm test` **3236 tests / 0 fail / 115 skipped / rc=0**；新单测 13/13。
+
+**遗留（已写进 #727）**：前端片 2、`delegates` 两条（P2）、`getSession` 读全会话 transcript 行无 SQL limit
+（既有线性成本）、`admin-seat-content.js` 用 `await import('./http.js')` 反向引用 history 助手（ESM 合法，
+后续可抽独立模块）、工作台侧 `.git` 收紧与 TOCTOU 修复归 #726。
+
+### 8.189 #726 文件预览 jail TOCTOU：既有 HIGH 缺陷（审计发现 → 已修，PR #733 / #739）
+
+**怎么发现的**：copilot 对 #727 做只读审计时指出「jail 校验后按路径重开」的竞态；主 agent 逐条对账
+（`dirs.js:501` `resolveJailedFile()` → `:532` `fs.createReadStream(target)`、`:414` `readFileSync`），
+并实测 portal 以 **root** 运行（`portal/Dockerfile:67`、`docker exec station-portal id` = uid=0）、
+FDE 目录可写（`/srv/erix/users/*/` = `eric:eric` 组 rwx；权限混着：reconcile 目录 `0770`、
+`projects/<p>` 遗留 `2770`，口径见 `docs/design/user-space.md` §6.2）⇒ **成立**。
+
+**影响**：任何 FDE 在容器内用 `rename(2)` 把已校验文件换成 symlink，即可借 portal（root）读到
+别的 FDE 的 `.git-credentials`（实测存在 4 份）、别的项目 `.env`，以及 portal 自身 env
+（`DATABASE_URL` / `LLM_GATEWAY_MASTER_KEY` / `SESSION_SIGNING_KEY`）。打穿的是第一不变式「容器是信任边界」。
+
+**修复（PR #733，已合并 `c380847`）**：`openVerifiedFd({target, root})` —— `fsp.open(target)` 拿 fd →
+`readlink('/proc/self/fd/<fd>')` 反查真实路径 → 对 `real` 做 containment（越界即关 fd + 400）→ 用**同一个 fd**
+建流/读内容。`resolveJailedFile`/`resolvePreviewFile` 只增返回 `root`。附带工作台侧 `resolveJailedRoot` 拒
+`.git` 目录（`.gitignore` 等文件不受影响）。新增 6 条单测（桩 readlink 越界 ⇒ 拒读且**未创建 stream**、
+正常流式 + **读完后 fd 数回到基线**、Range 206/416、`.git/config` 400 而 `.gitignore` 可读、
+`readFilePreview` 同受保护、`rootKind:'projects'` 两条根都受保护）。
+
+**后续修复（PR #739，已合并 `6042698`）**：#735 的 CI 抓到偶发 unhandled `EBADF ... close`（本地 3 次复现不了）。
+根因是 **两个关闭者**：`autoClose: true` 让流关 fd，`close` 事件里又让 FileHandle 关一次 ⇒ 流内部那次 close
+的失败没有归处。修法：`autoClose: false` + `closeOnce` 幂等，`close`/`error`/`end` 三个出口都收敛到
+`fh.close()`（`autoClose:false` 下读到 EOF 只发 `end`，故必须听 `end`，否则正常读完漏关 fd）。补两条确定性
+回归（读完前 `destroy()` / 正常排空 ⇒ unhandled 计数断言为 0 + fd 已关）。
+
+**残余风险（已核查不可达）**：硬链接能绕过 `/proc/self/fd` 反查（它给的是打开时用的路径），但实测
+`fde-eric` 容器只挂自己的 `home/projects/cache`，容器内没有路径指向别人的文件 ⇒ 该向量不可达；
+将来若给 FDE 容器加共享挂载必须重评。
+
+### 8.190 #727 片 2 前端：管理台「工位内容」页 + 真机 e2e（#727 / PR #735，2026-11-24，erix_run + 主 agent 真机回访）
+
+**布局（用户定稿）**：顶部 FDE 下拉 + `[只读]` 标记；左栏 320px 上下分栏（上 40% 会话清单、下 60% 文件树，
+各自独立滚动）；右栏点会话看只读对话、点文件看预览。点会话 ⇒ 文件树**自动展开并高亮**该会话 `cwd`
+的一级目录。深链 `#/admin/seat-content?fde=&session=`；`AdminUsersView` 用户行加「会话/文件」跳转。
+
+**只读红线（三条，都有哨兵）**：① 零写请求；② 零 SSE（不碰 `EventSource`，哨兵计数恒 0）；③ 零 `/pv/`
+（不复用 `FilePreviewModal` —— URL 在 `lib/previewRoute.ts:73` 硬编码 `/api/file`，Office 分支还打
+`/api/preview-tickets`，而管理台 host 没有 `/pv/` 路由 ⇒ Office/zip 一律只给下载）。**不复用** `StreamPanel`
+（绑 workbench store，含 POST 发送 `:1585`、停止 `:1806`、SSE `:1141-1170`）与 `DirectoryTree`（硬编码
+`/api/files/tree?cwd=` + 上传流程）；**复用** `lib/toolSummary.ts`、`lib/markdown.ts`。
+
+**文件**：`views/AdminSeatContentView.vue`（616 行）、`components/AdminTranscript.vue`（513 行）、
+`components/AdminSeatTreeNode.vue`（98 行）、`stores/adminSeatContent.ts`（268 行）、router/AdminLayout/
+AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组判据）。
+
+**真机回访抓到的 1 个 MAJOR（单测抓不到，必须真机才现形）**：会话元信息行渲染出**裸 i18n key**
+（`admin.seatContent.meta.created: —`）。两个根因：① 视图用 `cell('created')`，语言包键是 `createdAt`；
+② 详情 DTO 的 `session` 来自 `fetchSession`，SELECT 列里**没有** `created_at`/`updated_at` ⇒ 值恒空。
+修法：键名对齐 + 这两格改用**左栏列表项**的值（列表 DTO 里有），深链直开且列表没加载到就**整格隐藏**
+（不拿「—」假装查过）；**不改后端热路径 SQL**。补哨兵：整页文本不得出现 `admin.seatContent.` 子串
+（语言包 parity 用例只比 zh/en 键集合，抓不到这种错配）。
+
+**真机 e2e（playwright + 本地 chromium，管理台 host，FDE=eric）**：登录 → `#/admin/seat-content` → 选 eric
+⇒ 50 条会话、10 个 FDE 选项、文件树展开 56 节点；点会话 ⇒ 工具卡（`took 16ms`）/红条 `failed — run failed`/
+绿条 `judge_done`/Reasoning 折叠/Markdown 正文全部渲染，元信息行 `created/updated` 显示真实时间；
+点文件 ⇒ 面包屑 `eric / acc-019 / .replay120.log` + 内容 + Download。**只读红线实测**：非登录写请求 **0**、
+`/pv/` **0**、`preview-tickets` **0**、页面异常 **0**、`/api/admin/fdes/` 调用 7 次全 200。
+判绿：`typecheck` rc=0、前端 88 files/1877 tests rc=0、根 `npm test` rc=0。
+
+**过程记录**：本单 CI 曾因分支与 main 冲突（GitHub 不为冲突 PR 创建 merge ref ⇒ 一条 run 都不生成，
+`gh pr checks` 显示 "no checks reported"）而假性「无 CI」；rebase 后 CI 才跑起来，随即抓出 8.189 那条
+偶发 EBADF。台账编号与并行 session 撞号两次（8.185、8.187 被占），按「不重排、不改号」续到 8.188/8.189/8.190。
