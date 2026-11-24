@@ -266,7 +266,7 @@
 | ① | 是 | 是 | 是 | `200 status='second_factor_choice'` | **#449 新增**：TOTP **或** 邮箱验证码任一通过。**第一步不发信**（懒发信，feat-261110-01）：码的第一封由客户端切到邮箱档时调 §2.3b 发出。响应见下 |
 | ② | 是 | — | — | `200 status='totp_required'` | 进入 §2.3。**含「开关开但没邮箱」**——绝不因为缺邮箱把已绑 TOTP 的人挡在门外 |
 | ③ | 否 | 非 `true` | — | `200 status='authenticated'` | 口令直通（审计 `method='password_direct_no_second_factor'`，§2.2 末）。**含「绑过 TOTP 但管理员把两条都关了」**——管理台会红字警告，见 §2.2 末 |
-| ④ | 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录**。**含「绑过 TOTP 但只允许邮件码」**（密钥原样保留，登录不碰它）|
+| ④ | 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录**。**含「绑过 TOTP 但只允许邮件码」**（密钥原样保留，登录不碰它）。**窗口内（默认 60s）重复口令步 ⇒ 不铸新码、不再发信，复用已发的码**（#737：防脚本「拿不到会话就重试」刷屏；响应带 `email_reused:true` 与 `resend_after`，见下方字段表）|
 | ⑤ | 否 | 是 | 否 | `409 email_not_registered` | **绝不静默退回纯口令**；`message` 给出路「请联系管理员补录邮箱」 |
 
 - ⚠ **① 必须排在 ② 之前**（写反就是本单要修的死开关）：已绑 TOTP 的账号打开 `mail_otp_enabled` 后，界面显示「已启用」而实际一封码都不发、也没有任何提示。
@@ -311,12 +311,20 @@
 { "status": "email_code_required", "pending_token": "pt_9f2c...", "expires_in": 600, "email_hint": "a***@e***.com", "email_code_ttl_seconds": 600 }
 ```
 
+同一账号**窗口内重复口令步**（≤ `EMAIL_CODE_RESEND_COOLDOWN_SECONDS`，默认 60s）的形状（#737）：**不铸新码、不发信**，把用户手里那一封的码挂到本次新建的 `pending_token` 上（复制 `code_hash`；`expires_at` 与 `attempts` 随码走，**不随新 pending 续命/刷新**）：
+
+```json
+{ "status": "email_code_required", "pending_token": "pt_7ab4...", "expires_in": 600, "email_hint": "a***@e***.com", "email_code_ttl_seconds": 600, "email_reused": true, "resend_after": 60 }
+```
+
 | 字段 | 说明 |
 |---|---|
 | `pending_token` | 一次性待决令牌，仅可用于 §2.3a/§2.3b；服务端只存其 `sha256`（`login_pending.token_hash`） |
 | `expires_in` | 该令牌的实际有效期（秒）= `max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`，默认 `600`。**为什么不直接用 120**：码的有效期是 600s，令牌 120s 就会让「码还没过期、令牌先死」成为常态，这个字段也就成了谎 |
 | `email_hint` | 脱敏收件人：本地部分保留首字符 + `***`；域名首段保留首字符 + `***`，TLD 及后续标签原样 ⇒ `alice@example.com` → `a***@e***.com`。**只用于「发到哪个邮箱了」的确认**，不含完整地址 |
 | `email_code_ttl_seconds` | **码**的有效期（秒）= `EMAIL_CODE_TTL_SECONDS`（默认 `600`）。登录页据此渲染「验证码 N 分钟内有效」——**客户端不得写死 10 分钟**，配置一改就是一句谎；与 `expires_in`（**令牌**有效期）不是同一个数，不要互相顶替 |
+| `email_reused` | **可选**，仅 `true` 时出现（#737）：窗口内重复口令步 ⇒ **复用已发的码、本次不发新信**（旧邮件里的明文码在新 `pending_token` 上仍能过 §2.3a）。**缺席 = 本次真发了一封**（用缺席表达，与 `email_sent`/`email_deferred` 同族口径）；复用不占 `email:<ip>` 发信限流配额 |
+| `resend_after` | 仅随 `email_reused: true` 出现：下一次允许**真正重发**（§2.3b）的秒数 = `EMAIL_CODE_RESEND_COOLDOWN_SECONDS`（默认 `60`）；与 §2.3b 响应里的 `resend_after` **同名同义** |
 
 > 本响应同样**不带** `password_change_required`（#255）：还没发 cookie，谈不上受限会话；这一位在 §2.3a 的成功响应里给。
 
@@ -482,6 +490,7 @@
 | action | 时机 | `details` |
 |---|---|---|
 | `auth.email_code_sent` | 码发出去了 | `{login, email_hint, code_hash_prefix, expires_at, resend_count?, at}`——`code_hash_prefix` 是 `sha256(码)` 的**前 12 位**；**绝无明文码** |
+| `auth.email_code_reused` | 窗口内重复口令步（#737）：同账号已有未消费且未过期的码 ⇒ **不发信**，把那枚码挂到新建 pending（插新行 + 废旧行） | `{login, email_hint, code_hash_prefix, reused_from_code_id, expires_at, at}`——`code_hash_prefix` 与 `sent` 那行同源（本来就是同一枚码）；`reused_from_code_id` 指向被作废的旧行；**绝无明文码**。复用**不写** `auth.email_code_sent`（写了是假账），也不占 `email:<ip>` 发信限流 |
 | `auth.email_code_failed` | 发信失败（§2.2 第④分支的 `503`；§2.3b 的重发失败；**或** ① 二选一分支的降级，此时不报错只 `200`，并额外带 `second_factor_choice: true`）| `{login, reason, at}`——`reason` 是 SMTP 错误的摘要（不含正文/口令）。① 分支的降级不是「发了一封没成功」而是**当下判定发不出去**，所以 `reason` 是通道事实：`email_channel_disabled`（SMTP 未启用 / 急停）或 `rate_limited`（`email:<ip>` 预检不允许）。懒发信的可用那条**不写任何发信审计** |
 | `auth.email_code_verified` | 校验通过并发了会话 | `{login, method, at}`，`method` = `email_code`（该账号无 TOTP，§2.2 第④分支）或 **`email_code_alt`**（该账号**同时有 TOTP**，走的是 ① 分支里较弱的那一条，#449）；同时另有一条 `auth.login_success`，**两处 `method` 同值**（一次登录一个口径）|
 | `auth.email_code_invalid` | ——**不写** | 码错不落审计：这是可重试的日常动作，写了只会被爆破尝试刷成噪声；失败次数由限流器持有 |
