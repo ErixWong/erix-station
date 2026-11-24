@@ -9528,3 +9528,40 @@ agent 回传（`PUT /api/internal/transcript/:key/rounds/:N` → `internal.js#pu
 **父 agent 复审另修**：worker 写的 `throw Object.assign(...)` 单行 200 字节，拆成 3 行（`style(677)` 那个 commit）。
 
 **残余**：`MAX_ROUND_BYTES` 的 env 覆盖在生产仍无效（没接进 compose 的 environment 列表，见 8.184 残余②）——**已删**（本单后续 commit）：该 env 从未接进 compose，是假旋钮（同 8.184 删 `MAX_BODY_BYTES` 的判据），改成 `transcript-limits.js` 的纯常量（`MAX_ROUND_BYTES_DEFAULT` / env 解析函数一并删，`internal.js` 的转发同删）；真机排障要调小闸就改 `transcript-limits.js` 那一行并重跑，不再引入 env；`test/internal-round-size-cap.test.js` 的 env 解析用例随函数删除，算术余量与两处源码级哨兵保留。
+
+### 8.187 登录验证码邮件刷屏：定位到「脚本重复走口令步」并修掉教错的文案（2026-11-24，主 agent）
+
+**用户报告**：登录时同一时间收到两封验证码邮件、码还不一样。
+
+**取证（全部现验，dev 栈 `station-db` / 库 `station`）**：
+
+1. 今天 14:30 那两封是**两次独立口令步**：`login_email_codes` id=46 (`14:30:32.837Z`) 与 id=47
+   (`14:30:36.244Z`)，`pending_token_hash` 分别是 `d6fc7cd5b4` / `cdf178376d`，两个 pending 的
+   `used_at` 都为空 ⇒ 不是同一流程重发（`/resend` 必带 `resend_count`，审计里也没有）。
+2. **一次 POST 只发一封**：单次 curl 登录 ⇒ 码表 +1 行、1 条 `auth.email_code_sent`、`time_total=0.96s`。
+3. 历史上 9 组「30 秒内成对」的发信，`login_pending.created_ua` **全是** `curl/8.5.0` 或 `HeadlessChrome`；
+   **真人浏览器 UA 从来没成过对**。
+4. 按来源清点已发出的码：curl（agent 探针）34 封，**其中 27 封从未被消费、直接过期**；headless e2e
+   11 封（2 封未用）；真人浏览器 2 封（全部用掉）。
+5. 归因实例（会话 `2026-11-24T01-16-41-834Z`，在验 #677/#777 的 TTL）：14:30:31 先
+   `curl … -d '{"login":"eric"}' -o /dev/null -w "login=%{http_code}"`，接着 `-b e2e-eric.txt`
+   打 `/api/admin/fdes/eric/dirs` 想用刚才的会话；3.4 秒后 14:30:35 **又登一次**去读响应体与 cookie jar。
+   同类形状在 11-16 16:59 也有一对（`-o /dev/null` 后 `-b cje.txt /api/sessions`，再 `-i` 重登）。
+
+**为什么"再登一次"（不是脚本手滑）**：`eric` 这格是 `email_code_required`，其口令步**只回
+`pending_token`、不发 `Set-Cookie`**（`http.js:4206` 的响应无 headers；全站只有 `4062`/`4387`/`4589`
+三处发会话 cookie）。脚本按 #449 之前「`POST /api/auth/login` = 拿到会话」的老写法写，必然拿不到
+cookie ⇒ 重试；而脚本读不到邮箱里的码 ⇒ 永不自愈 ⇒ 每重试一封。
+
+**触发原因（本单修这条）**：`AGENTS.md` §4.1 自 2026-10-13 `4e36161` 起一直写着「两账号未注册 TOTP，
+密码直通」，两句话现在都是假的（现验：`eric.totp_secret` 不为空、`totp_login_enabled=false`、
+`mail_otp_enabled=true`）。这一行每轮全额注入给所有 agent ⇒ 每个读它写探针的人都被教错。
+改成事实 + 一条「要会话就登 `admin`；要测第二因素照 `wp2a-e2e.mjs:288` 自建带 TOTP 的种子账号」。
+
+**放大与锁死另开两单**：#737（口令步发信无幂等：60s 冷却只装在 `/resend`，
+`handleEmailCodeRequired` 每次铸新码发新信）、#736（`api_tokens` 有表有规格但实现为零：库里 0 行、
+全仓无 `INSERT INTO api_tokens` ⇒ 非浏览器客户端只能走口令步）。#669 未修前，发信限流按
+`172.32.0.1`（Traefik 自己的地址）算 ⇒ 20 次/15 分钟是**全平台共用一桶**。
+
+**闸**：`npm run check:agents-hotlayer` `VERDICT ok`，热层 19366 / 预算 19456（余 90 字节）。
+**残余**：热层几乎见底，下一条 §8 之前的判据必须先搬冷层或 `--sync` 抬预算，别挤成红。
