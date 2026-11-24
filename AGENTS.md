@@ -90,7 +90,13 @@ hook 捕获事件，生产构建不发 devtools 事件 ⇒ `w.emitted()` 恒空�
 ### 4.1 dev 栈测试账号（仅本地 dev 环境，勿用于生产）
 
 - 入口：`http://station.fde.erix.vip:8090/`（伞域泛解析，#57 阶段2，2026-10-08 起；旧的 `dev.example.vip:8090` 已随 Host 路由切换失效——Traefik 只认 `station.fde.erix.vip` / `tailnet-host`。本机解析器负缓存解析不出时可用 playwright 容器 `erix_station_playwright`（:8935，resolver MAP 规则）或临时 hosts 条目兑底。deploy 栈 station-portal；代码更新后需 `docker compose build station-portal && docker compose up -d station-portal` 生效）
-- 测试账号：`admin`（role=admin → 管理台）、`eric`（fde:eric → 工作台），两账号**共用同一口令**——明文**不入库不外传**：存 `~/.config/creds/station-dev-password-file`（600，轮换直接改该文件+跑密码重置流程）。两账号未注册 TOTP，密码直通（登录体字段是 `login` 不是 `username`）
+- 测试账号：`admin`（role=admin → 管理台）、`eric`（fde:eric → 工作台），两账号**共用同一口令**——明文**不入库不外传**：存 `~/.config/creds/station-dev-password-file`（600，轮换直接改该文件+跑密码重置流程）。登录体字段是 `login` 不是 `username`
+- ⚠ **两个账号的第二因素不一样，别照旧文案写探针**（261124 现验 `users`）：`admin` 口令直通（一步就发
+  会话 cookie）；`eric` 有 `totp_secret` 但 `totp_login_enabled=false` + `mail_otp_enabled=true` ⇒ 走邮箱
+  验证码：**口令步只回 `pending_token`、不发 cookie，并当场寄一封真邮件**（码明文只在邮箱里，库里只有
+  sha256）。⇒ 一次性探针要会话就登 `admin`；要测第二因素照 `portal/integration/wp2a-e2e.mjs:288` 自建带
+  TOTP 的种子账号走 step1+step2。**别反复登 `eric`**：每登一次用户邮箱就多一封，而脚本永远读不到那枚码
+  （放大链与修法见 #737 / #736）
 - 密码重置：用 portal 自身 `hashPassword`（scrypt 自描述格式）生成后更新 `users.password_hash`（bootstrap-admin 不能重置已存在账号）
 
 ### 4.2 LLM 网关（LiteLLM，issue #117）
