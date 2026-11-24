@@ -436,7 +436,7 @@ describe('UserLlmPane · 周期额度（#719）', () => {
     });
     expect(wrapper.find('[data-test="budget-state"]').text()).toContain('累计已用（未设额度）');
     expect(wrapper.find('[data-test="budget-state"]').text()).not.toContain('本周期已用');
-    expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('0.084178176');
+    expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('0.084178');   // 显示层截到 6 位小数
   });
 
   it('保存发出正确 body {budget_usd:number, budget_period}；保存成功后回显', async () => {
@@ -456,7 +456,7 @@ describe('UserLlmPane · 周期额度（#719）', () => {
     expect(wrapper.find('[data-test="budget-msg"]').text()).toBe('额度已保存');
     // 回显：PUT 响应的 quota.budget_usd=10 回填输入框与剩余
     expect((wrapper.find('[data-test="budget-input"]').element as HTMLInputElement).value).toBe('10');
-    expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('10');
+    expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('10.00');   // 至少 2 位小数
   });
 
   it('输入框留空 → 保存发 {budget_usd:null}（清空 = 不限，period 一并清空不发送）', async () => {
@@ -473,6 +473,24 @@ describe('UserLlmPane · 周期额度（#719）', () => {
     expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ budget_usd: null });
     // 清空后 remaining = null ⇒ 显示「不限」
     expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('不限');
+  });
+
+  it('金额显示：浮点噪声截到 6 位小数、大数至少 2 位；用量表花费同口径', async () => {
+    const noisy = {
+      quota: {
+        budget_usd: 0.5, budget_period: '1mo', max_budget: 0.5, budget_duration: '1mo',
+        budget_reset_at: '2026-11-30T16:00:00Z', spend: 0.08440703999999999, remaining: 0.41559296, spend_scope: 'period',
+      },
+    };
+    const { wrapper } = await mountQuota((url, init) => (
+      url === '/api/admin/fdes/alice/llm/budget' && !init?.method ? jsonResponse(200, noisy) : undefined
+    ));
+    expect(wrapper.find('[data-test="budget-spend"]').text()).toBe('0.084407');
+    expect(wrapper.find('[data-test="budget-remaining"]').text()).toBe('0.415593');
+    // 用量表花费同口径（2 → 2.00、1.5 → 1.50）
+    const rows = wrapper.findAll('[data-test="usage-row"]');
+    expect(rows[0].text()).toContain('2.00');
+    expect(rows[1].text()).toContain('1.50');
   });
 
   it('未定价警告：已选模型 pricing_configured=false 时出现', async () => {
