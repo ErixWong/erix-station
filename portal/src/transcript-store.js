@@ -107,7 +107,11 @@ export function createSessionTranscriptStore(client) {
       // 本函数是唯一写入口：宿主预写（sessions.js postMessage → appendUserInputTurn，此前无闸）
       // 与 agent 回传（internal.js putRound，那里是传输层更早的一次 400 拦截）都从这里过。
       const fuseBytes = Buffer.byteLength(JSON.stringify(record), 'utf8');
-      if (fuseBytes > MAX_ROUND_BYTES) throw Object.assign(new Error(`transcript store: record is ${fuseBytes} bytes, exceeds ${MAX_ROUND_BYTES} byte limit`), { code: 'transcript_record_too_large' });
+      if (fuseBytes > MAX_ROUND_BYTES) {
+        const msg = `transcript store: record is ${fuseBytes} bytes, `
+          + `exceeds ${MAX_ROUND_BYTES} byte limit`;
+        throw Object.assign(new Error(msg), { code: 'transcript_record_too_large' });
+      }
       const inserted = await client.query(
         `INSERT INTO transcript_rounds
            (run_id, transcript_key, dedup_key, round, record, folded, messages, folded_payload)
