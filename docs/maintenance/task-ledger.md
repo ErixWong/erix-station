@@ -9670,3 +9670,20 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
 **过程记录**：本单 CI 曾因分支与 main 冲突（GitHub 不为冲突 PR 创建 merge ref ⇒ 一条 run 都不生成，
 `gh pr checks` 显示 "no checks reported"）而假性「无 CI」；rebase 后 CI 才跑起来，随即抓出 8.189 那条
 偶发 EBADF。台账编号与并行 session 撞号两次（8.185、8.187 被占），按「不重排、不改号」续到 8.188/8.189/8.190。
+
+### 8.191 #737 登录口令步发信幂等：同账号窗口内重复口令步不再寄第二封（2026-11-24，erix_run）
+
+**取证**：用户被登录验证码邮件刷屏。库里 34 封 agent curl 探针发的码 **27 封从未被消费、直接过期** ⇒ 一次 `POST /api/auth/login` 只发一封，重复邮件来自脚本**重复走口令步**：`email_code_required` 分支的口令步只回 `pending_token`、不发 `Set-Cookie`，脚本按「登录=拿到会话」的老写法拿不到 cookie 就重试 ⇒ 每重试一封；脚本读不到邮箱里的码 ⇒ 永不自愈。放大器：口令步发信**没有幂等**——60s 冷却只装在 `/resend`（`recordResend`），`handleEmailCodeRequired` 每次铸新码发新信。
+
+**设计取舍**（复用窗口 = `policy.resendCooldownSeconds`（60s），**不新增旋钮**（#677 口径：不留死旋钮））：
+- **为何复制 `code_hash` 而不是存明文**：库里只存 `sha256(code)`，校验侧比的是 `code_hash = sha256(输入)` ⇒ 复用**不需要明文**，把旧码的哈希字面值插到新 pending 即可让旧邮件里的码通过 §2.3a。为了复用去加明文列是往「绝不存明文码」的既有口径上打洞。
+- **为何作废旧行**：一枚码在同一时刻只服务**一个** pending（最新那次口令步）⇒ 尝试预算不因复用翻倍，`verifyEmailCode` 的「最新未消费」与 `invalidateOtherCodes` 的 `code_hash <> $keep` 判据都不留歧义。顺序**先插后废**（与 `handleEmailCodeRequired` 既有契约同族）：插失败不能留下「一枚可用码都没有」的死状态。
+- **为何不续命**：`expires_at` 用旧码字面值——反复口令步重试不许把码的寿命无限延长（否则脚本可以靠重试让一枚码永生）；`attempts` 同样随码走（预算跟码不跟 pending），复用不刷新尝试预算。
+- **复用不发信 ⇒ 不占 `email:<ip>` 发信限流配额**（那把闸计的是「真的发了一封信」），审计写 `auth.email_code_reused`（不是 `sent`——那是假账）。`/login/email-code/resend` 行为一字不改。
+
+**实现**：`login-email-code.js` 新增 `findReusableCode`（按 user_id JOIN `login_pending` 找窗口内「未消费且未过期」最新一枚；不加 `p.used_at` 谓词——pending 被用过时其码必然已被消费）与 `adoptEmailCode`（插新行复制 `code_hash`/`expires_at`/`attempts`，成功后按 id 作废旧行）；`http.js handleEmailCodeRequired` 在 `createPendingToken` 之后、铸码之前分叉：命中 ⇒ 复用返回（响应在既有五字段外加 `email_reused:true`/`resend_after`，不带 `email_sent`），未命中 ⇒ 原路径一字不改。契约见 portal.md §2.2 ④/§2.3a 审计表，数据口径见 model.md §1.30。
+
+**判据**（`portal/test/login-email-code.test.js` 新增 4 格）：㉑ 窗口内第二次口令步 ⇒ 恰发一封、两行 `code_hash` 相同、旧行 `consumed_at` 非空、`expires_at` 不续命、审计 `reused` 一条且 `sent` 只有一条；㉒ **交付判据**：第一次邮件里的明文码 + 第二次响应的 `pending_token` 过 §2.3a ⇒ 200 + `Set-Cookie`；㉓ 窗口外（旧行 `created_at` 推早 61s，窗口判定按 fake 解析 `$2`/`$3` 算，不改函数签名）⇒ 铸新码发新信且旧行不因其作废（回归锁：去重不许变成「永远不发」）；㉔ 已消费的码不可复用 ⇒ 第二封必须真发。**既有格子适配一处**：#449⑧b 的「重复口令步 20 次吃满发信限流」在新契约下窗口内会复用（不占配额），循环里把最新码行 `created_at` 推早 61s 退出复用窗口，「同一把闸」判据本身不变。fake-pool 按 SQL 文本真解析新增复用读分支（漏 `consumed_at IS NULL`/过期/窗口谓词都会被打红）与 INSERT 的 `attempts` 列形判别。
+
+**闸（rebase 到 origin/main 后的最终树，父 agent 复跑）**：`npm test` **rc=0 / 3250 tests / 3135 pass / 0 fail / 115 skipped**；`node --test portal/test/login-email-code.test.js` **33 pass / 0 fail**（基线 29 + 新增 4）；`node --check` 三文件通过；`check:agents-hotlayer` **VERDICT ok**（热层 19366/19456，台账 186 条无重复）。
+**父 agent 变异实测**：拆窗口谓词 ⇒ ㉓+⑧b 红；不复制 `code_hash` ⇒ ㉑㉒ 红；「永不复用」短路 ⇒ ㉑㉒ 红；去掉「作废旧行」⇒ ㉑ 红；`expires_at` 改成续命 `now+ttl` ⇒ ㉑ 红。**假库对列名无牙**（把 INSERT 列名写成 `created_ua_bad` 单测仍全绿——`fake-pool.js` 按参数位解析的既有家族缺口，所有 INSERT 同病，硬化另开单）⇒ 改用**真 PG 对账**：正确列形带 `attempts=3 / max_attempts=5` 插入成功、错列名当场报错（事务内 INSERT 后 ROLLBACK，未在库里留数据）。
