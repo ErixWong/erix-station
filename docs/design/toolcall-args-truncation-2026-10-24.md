@@ -5,7 +5,7 @@
 > 复测：`python3 docs/design/toolcall-args-truncation-2026-10-24-repro.py --shape nested --bytes 6000 --reps 3`。
 
 **报告时间**：2026-10-24 15:00 UTC（本地 23:00）
-**网关**：`https://llm-gateway.internal/v1`（nginx/1.29.7 + one-api/new-api，响应头 `X-Oneapi-Request-Id`）
+**网关**：自建 one-api 网关 `/v1`（主机名见冷层 `~/projects/docs/station-dev-machine.md`；取证事实保留：`nginx/1.29.7 + one-api/new-api`、响应头 `X-Oneapi-Request-Id`）
 **模型**：`qwen3.8-flash-next`
 **上游引擎（据 `system_fingerprint`）**：`vllm-0.30.1rc1.dev558+g0cbac6cd1-pp3-a23a86f6`
 **报告方环境**：客户端 pi 1.20（OpenAI `/v1/chat/completions` 流式），复现脚本见本目录 `toolcall-args-truncation-2026-10-24-repro.py`（纯 stdlib，无依赖）
