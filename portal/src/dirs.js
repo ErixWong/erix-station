@@ -5,6 +5,7 @@
 //       running/queued_count 从 runs 聚合（cwd 匹配）。只读——本模块无任何写路径。
 
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { CWD_RE, validateSessionCwd } from './sessions.js';
 import { commitTempFile, commitTempFileNoClobber, writeTempFileFromStream } from './fsutil.js';
@@ -175,6 +176,14 @@ function resolveJailedRoot({
       if (st.isSymbolicLink()) {
         throw new DirError('validation_failed', `path 含符号链接，拒绝${symlinkHint}`, { details: { field: 'path' } });
       }
+      // issue #726 附带：工作台侧同 `resolveJailedUnderProjects` 收紧——路径段是
+      // `.git` 且该段是目录 ⇒ 拒绝（git 元数据不泄给预览/树）。
+      // `.gitignore` 这类同名前缀文件不受影响。
+      if (seg === '.git' && st.isDirectory()) {
+        throw new DirError('validation_failed', 'path 不得进入 .git 目录', {
+          details: { field: 'path' },
+        });
+      }
     }
   }
   return { root, target, rel, project: name };
@@ -217,14 +226,16 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
  * **目标必须是非 symlink 的普通文件**。命中即抛 DirError，成功返回 { target, rel, st, project }。
  */
 export function resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath, notFoundHint = 'file' } = {}) {
-  const { target, rel, project } = resolveJailedRoot({
+  const { target, rel, project, root } = resolveJailedRoot({
     userSpaceRoot, fdeName, cwd, relPath, notFoundHint, symlinkHint: '读取', requireConcreteRelPath: true,
   });
   const st = fs.lstatSync(target);
   if (!st.isFile()) {
     throw new DirError('validation_failed', 'path 必须是文件', { details: { field: 'path' } });
   }
-  return { target, rel, st, project };
+  // issue #726：额外返回 root（只增字段，既有字段不变）：调用方 openVerifiedFd
+  // 需要它做 fd 真实路径的 containment 校验。
+  return { target, rel, st, project, root };
 }
 
 /**
@@ -593,28 +604,36 @@ export async function readFilePreview(
 ) {
   // rootKind（issue #727）：'project' 缺省 = 工作台旧行为；'projects' =
   // 管理台的根。
-  const { target, rel, st } = resolvePreviewFile({
+  const { target, rel, root } = resolvePreviewFile({
     userSpaceRoot, fdeName, cwd, relPath, rootKind,
   });
-  if (st.size > FILE_PREVIEW_MAX_BYTES) {
-    throw new DirError('file_too_large', `文件超过预览上限（${Math.floor(FILE_PREVIEW_MAX_BYTES / 1024 / 1024)}MB）`, {
-      httpStatus: 413,
-    });
-  }
+  // issue #726 TOCTOU：校验对象与打开对象必须是同一个 fd。顺序：
+  // 开 fd → 校验 realpath → stat → 大小闸 → 读。不再对字符串路径重开。
+  const { fh } = await openVerifiedFd({ target, root });
+  try {
+    const st = await fh.stat();
+    if (st.size > FILE_PREVIEW_MAX_BYTES) {
+      throw new DirError('file_too_large', `文件超过预览上限（${Math.floor(FILE_PREVIEW_MAX_BYTES / 1024 / 1024)}MB）`, {
+        httpStatus: 413,
+      });
+    }
 
-  const ext = path.extname(target).toLowerCase();
-  const buf = fs.readFileSync(target);
-  const mime = IMAGE_MIME[ext];
-  if (mime) {
-    // 图片：base64 data URL（SVG 经 <img> 加载不执行脚本，安全口径与浏览器一致）。
-    return { name: path.basename(target), path: rel, kind: 'image', data: `data:${mime};base64,${buf.toString('base64')}` };
+    const ext = path.extname(target).toLowerCase();
+    const buf = await fh.readFile();
+    const mime = IMAGE_MIME[ext];
+    if (mime) {
+      // 图片：base64 data URL（SVG 经 <img> 加载不执行脚本，安全口径与浏览器一致）。
+      return { name: path.basename(target), path: rel, kind: 'image', data: `data:${mime};base64,${buf.toString('base64')}` };
+    }
+    // 非图片：前 8KB NUL 嗅探判二进制（UTF-8 文本不可能含 NUL；二进制不猜测解码）。
+    const head = buf.subarray(0, 8192);
+    if (head.includes(0)) {
+      throw new DirError('unsupported_file_type', '二进制文件不支持预览', { httpStatus: 415 });
+    }
+    return { name: path.basename(target), path: rel, kind: 'text', data: buf.toString('utf8') };
+  } finally {
+    await fh.close();
   }
-  // 非图片：前 8KB NUL 嗅探判二进制（UTF-8 文本不可能含 NUL；二进制不猜测解码）。
-  const head = buf.subarray(0, 8192);
-  if (head.includes(0)) {
-    throw new DirError('unsupported_file_type', '二进制文件不支持预览', { httpStatus: 415 });
-  }
-  return { name: path.basename(target), path: rel, kind: 'text', data: buf.toString('utf8') };
 }
 
 /**
@@ -627,16 +646,61 @@ export async function readFilePreview(
  */
 function resolvePreviewFile({ userSpaceRoot, fdeName, cwd, relPath, rootKind = 'project' } = {}) {
   if (rootKind === 'projects') {
-    const { target, rel } = resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath });
+    const { target, rel, root } = resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath });
     const st = fs.lstatSync(target);
     if (!st.isFile()) {
       throw new DirError('validation_failed', 'path 必须是文件', {
         details: { field: 'path' },
       });
     }
-    return { target, rel, st };
+    // issue #726：额外返回 root（管理台那条根），供 openVerifiedFd 做 fd containment。
+    return { target, rel, st, root };
   }
   return resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath });
+}
+
+/**
+ * issue #726 TOCTOU 修复的核心助手：**校验对象与打开对象必须是同一个 fd**。
+ * 按路径 open 之后，用 /proc/self/fd/<n> 反查该 fd 真实指向的路径
+ * （readlink 会解析掉 symlink），再对它做 containment。这样即使攻击者在
+ * 字符串校验之后用 rename(2) 把 target 换成指向 jail 外的 symlink，open
+ * 跟随到的也是那个外部文件，readlink 会暴露它 ⇒ 拒绝。
+ * ENOENT（竞态：字符串校验后文件被删）映射成既有 404 `not_found`，不新造错误码。
+ * @returns {Promise<{fh:object, real:string}>} 调用方负责用完后关闭 fh。
+ */
+async function openVerifiedFd({ target, root } = {}) {
+  let fh;
+  try {
+    fh = await fsp.open(target, 'r');
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      throw new DirError('not_found', 'path not found', {
+        httpStatus: 404, details: { field: 'path' },
+      });
+    }
+    throw err;
+  }
+  let real;
+  try {
+    // Linux：/proc/self/fd/<n> 是指向 fd 真实 inode 的符号链接。
+    real = await fsp.readlink(`/proc/self/fd/${fh.fd}`);
+  } catch (err) {
+    await fh.close();
+    if (err?.code === 'ENOENT') {
+      throw new DirError('not_found', 'path not found', {
+        httpStatus: 404, details: { field: 'path' },
+      });
+    }
+    throw err;
+  }
+  const relToReal = path.relative(path.resolve(root), real);
+  if (relToReal.startsWith('..') || path.isAbsolute(relToReal)) {
+    await fh.close();
+    throw new DirError('validation_failed', 'path 越出目录根，拒绝读取', {
+      details: { field: 'path' },
+    });
+  }
+  return { fh, real };
 }
 
 /** 预览单文件大小上限（P6 issue #84）：超限报错而非截断，防误点大文件把 portal 内存打爆。 */
@@ -706,7 +770,7 @@ export async function openFileStream({
 } = {}) {
   // rootKind 同 readFilePreview（#727）：缺省 'project' ⇒
   // 下方逻辑与旧版逐字节等价。
-  const { target, rel, st } = resolvePreviewFile({
+  const { target, rel, st, root } = resolvePreviewFile({
     userSpaceRoot, fdeName, cwd, relPath, rootKind,
   });
   if (st.size > FILE_STREAM_MAX_BYTES) {
@@ -737,10 +801,27 @@ export async function openFileStream({
     headers['Content-Range'] = `bytes ${start}-${end}/${st.size}`;
   }
   headers['Content-Length'] = String(length);
-  return {
-    name, path: rel, rel, size: st.size, mime, status: parsed?.status === 'ok' ? 206 : 200,
-    headers, stream: fs.createReadStream(target, length === 0 ? { start: 0, end: -1 } : { start, end }),
-  };
+  // issue #726 TOCTOU：校验对象与打开对象必须是同一个 fd（不是字符串路径）。
+  // 416 分支已在上方提前 return（不开 fd）；这里只为真要开流的请求开 fd。
+  const { fh } = await openVerifiedFd({ target, root });
+  const status = parsed?.status === 'ok' ? 206 : 200;
+  if (length === 0) {
+    // 空文件/退化 Range：不需要流，立即关 fd（不泄漏）。
+    await fh.close();
+    return { name, path: rel, rel, size: st.size, mime, status, headers, stream: null };
+  }
+  let handedOff = false;
+  try {
+    // fd 交给流：autoClose 保证流结束/出错时 fd 被关闭。FileHandle 自己的
+    // GC finalizer 会在 fd 已被流关掉后再关一次 ⇒ EBADF；故在
+    // 流 'close' 时显式 fh.close()（已关会抛 EBADF，吞掉），把 finalizer 解除。
+    const stream = fs.createReadStream(null, { fd: fh.fd, autoClose: true, start, end });
+    stream.on('close', () => { fh.close().catch(() => {}); });
+    handedOff = true;
+    return { name, path: rel, rel, size: st.size, mime, status, headers, stream };
+  } finally {
+    if (!handedOff) await fh.close();
+  }
 }
 
 /** Content-Disposition filename 净化：去引号/反斜杠/控制符/分号，防头注入与断句。 */
