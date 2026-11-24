@@ -732,8 +732,13 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
   - **未定价模型不生效**：`pricing_configured=false` 的模型 `spend` 恒记 0（§11.5 上文），累计不到额度上 ⇒ 周期额度对「只用未定价模型」的 FDE 实际拦不住（管理台已在额度区显式警告）。
   - **`tpd_limit` 为何不可用**：该端点是 **batch-only**（`/user/daily/activity` 的 `tpd_limit` 只在批量查询里回，不能按 key 直接下发成限额），故本单只用 `max_budget`（USD），不用 tpd_limit。
   - **`spend` 是运行计数器 ⇒ `spend_scope`**：`/key/info` 的 `spend` 只有在存在 `budget_duration` 时才按周期归零；**无额度时是终身累计**。因此 `getFdeBudget` 返回 `spend_scope`：`budget_duration` 非空⇒`'period'`（本周期已用），无额度⇒`'lifetime'`（终身累计）——这是前端已用标签的**唯一依据**（无额度的 FDE 不得把 `spend` 标成“本周期已用”）。
+  - **首次设额度不清零历史（实测口径，不是 bug）**：`/key/update` 只改 `max_budget` / `budget_duration`，**不动 `spend`** ⇒
+    设额度那一刻的 `spend` 仍是历史累计，`remaining = max_budget − spend` 因此一开始就可能小于额度
+    （dev 实测：eric 设 `0.5`/月时 `spend=0.0844` ⇒ 剩余 `0.4156`）。这与 LiteLLM 的**判定口径一致**
+    （它也用同一个计数器比 `max_budget`），所以不是显示 bug；要让额度「从本月重新起算」，只能在设额度时把 `spend` 显式归零
+    —— **本单不做**（属产品决定：归零会抹掉累计花费，`total_spend` 另存）。
   - **日聚合表是 UTC 日桶**（`common_daily_activity.py:563-600`）：`/user/daily/activity` 返回的是 **UTC 日**分桶；`timezone`（我们传 480）**只用于决定 end_date 是否把今天扩成一个 UTC 桶**，历史日期是 **pass-through**（不会把 UTC 桶重算成 UTC+8 日）。因此「本周期已用」（网关实时计数器、本地周期）与用量表最后一行（UTC 日桶）**天然可能对不上**，两者**不互相校验**。
-- **真机验收未跑（本单 LiteLLM 容器未起）**：「额度触发 429」「重置是否真落在本地周期错点」「`/user/daily/activity/aggregated` 真机响应形状」三项均未在真机验证（周期语义本身已由主 agent 在 v1.103.2 容器实测）。
+- **真机验收（2026-11-24，dev 栈 + LiteLLM v1.103.2，主 agent 亲跑）**：① 额度超限 → `429 {"type":"budget_exceeded"}`；② 周期错点：`1mo` ⇒ `2026-12-01 00:00 +08`、`1d` ⇒ 次日 `00:00 +08`（config 生效后实测）；③ `/user/daily/activity/aggregated?timezone=480` 响应形状与映射一致；④ `/key/update` 传 `max_budget:null,budget_duration:null` ⇒ 两列一并清空；⑤ 管理台三端点端到端：`GET /llm/budget`（无额度 ⇒ `spend_scope:"lifetime"`）、`PUT 0.5/1mo` 后与 `/key/info` 逐字段对账一致、`GET /llm/usage?days=7` 七行、`?days=` 空串 ⇒ 400。唯一未观测的是「跨过真实零点那一刻的自动归零」（需等一个周期；重置任务约 597s 一跳）。
 
 ---
 
