@@ -2,8 +2,8 @@
 //
 // 环境门（口径逐字照抄 `portal/test/migrate-fresh-db.test.js` 的头注释）：
 //   有 PG：
-//     sg docker -c "docker run -d --rm -p 127.0.0.1:15499:5432 -e POSTGRES_USER=station \
-//       -e POSTGRES_PASSWORD=test -e POSTGRES_DB=station_test postgres:16.15"
+//     docker run -d --rm -p 127.0.0.1:15499:5432 -e POSTGRES_USER=station \
+//       -e POSTGRES_PASSWORD=test -e POSTGRES_DB=station_test postgres:16.15
 //     TEST_DATABASE_URL=postgres://station:test@127.0.0.1:15499/station_test \
 //       node --test portal/test/delta-not-persisted-db.test.js
 //   无 PG：`TEST_DATABASE_URL` 未设置 ⇒ **整个文件 skip**（不是假通过：`skip` 会让 rc 里带着它，

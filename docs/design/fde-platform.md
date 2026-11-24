@@ -1,7 +1,7 @@
 # FDE Station 设计文档
 
 > 状态：**规格 + 平台已上线**（v0.1.62，5 台 FDE 容器在跑，2026-11-10 复核；各节里仍标「未实现 / 待决策 / 待公司确认」的项以该处标注为准，不在本行统包）
-> 来源：2026-09-12 六轮设计讨论，归档于 [erix-llm-kit#24](https://gitea.internal/eric/erix-llm-kit/issues/24)
+> 来源：2026-09-12 六轮设计讨论，归档于内网 Gitea issue #24（主机名见冷层 `~/projects/docs/station-dev-machine.md`）
 > 上游：erix-agent（引擎）；本文只描述**宿主平台**。
 >
 > **本文只写「是什么」**。要理解「为什么」、查看**被否决的方案**、以及未覆盖场景如何推导，读 [`principles.md`](principles.md)。

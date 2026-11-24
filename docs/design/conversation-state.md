@@ -103,7 +103,7 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 ## 6. P3 实施契约（2026-10-08 定稿）
 
 > 决策者拍板（对话记录）：①「一说话就该写入 store」；②「投影不是上下文创建，是同一份数据换个角度」；③「折叠的是上下文，显示的是历史消息」。④ 经 PR① 真机检查后修订：历史会话不删除，增量回填可投影的 transcript 输入行。
-> 上游缺口已提 issue：`gitea.internal/eric/erix-llm-kit#95`（宿主展示投影契约缺失，含反模式与 helper 请求）。
+> 上游缺口已提 issue：内网 Gitea issue #95（erix-llm-kit；宿主展示投影契约缺失，含反模式与 helper 请求。主机名见冷层 `~/projects/docs/station-dev-machine.md`）
 
 ### 契约四条（实现必须遵守）
 

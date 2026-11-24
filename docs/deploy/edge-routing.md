@@ -190,7 +190,7 @@ compose 的插值默认值、`loadConfig({}).adminPort` 三者逐字比对，任
 - 单个条目非法 ⇒ 丢弃该条 + warn；全部非法 ⇒ 额外 warn「管理台入口不再受来源限制」（安全含义不能靠人推）。
 - **为什么空清单时生成器根本不输出中间件**：空 `sourceRange` 会被 Traefik 拒建（见 §3 的 ERR 原文），
   而「挂一个不存在的中间件」比不挂更危险（router 会被禁用）。所以「空 = 不出现」，不是「空 = `sourceRange: []`」。
-- 背景（#450 §D3）：本机 `*.fde.erix.vip → tailnet-host`（Tailscale），平台只在 tailnet 内可达；
+- 背景（#450 §D3）：本机 `*.fde.erix.vip` → 宿主 tailnet IP（取值见冷层 `~/projects/docs/station-dev-machine.md`）（Tailscale），平台只在 tailnet 内可达；
   但 **FDE 容器能经桥网关访问宿主任意监听端口**（#233 防火墙至今未落地）⇒ 新端口对容器可达。
   这条 env 是运维**当场能收紧**的旋钮，不是「已经安全了」的声明。
 
@@ -209,7 +209,7 @@ compose 的插值默认值、`loadConfig({}).adminPort` 三者逐字比对，任
 - **隔离矩阵**（状态码 + 后端命中数一致）：用户入口 `/api/admin/users` → 404 + **0** 次后端命中；
   管理台入口 `/api/sessions`、`/api/internal/x` → 404 + **0** 次后端命中；管理台入口 `/`、
   `/api/admin/users`、`/api/auth/login`、`/api/me` → 200 + 各有 1 次后端命中。
-- **来源白名单**：`ADMIN_IP_ALLOWLIST=10.0.0.0/8,100.64.0.0/10`（客户端不在内）⇒ 管理台三条路由全 403，
+- **来源白名单**：`ADMIN_IP_ALLOWLIST`（放行私网段 + tailnet CGNAT 段，具体取值见冷层 `~/projects/docs/station-dev-machine.md`；客户端不在内）⇒ 管理台三条路由全 403，
   用户面 200 不变，管理台请求 0 次后端命中；改成 `172.17.0.0/16`（客户端在内）⇒ 管理台 200、
   `/api/sessions` 仍 404（deny 不受白名单影响）。
 - 已知噪声：删除 `tls.yml` 时 Traefik 会打一行

@@ -18,7 +18,7 @@ import { FakePool } from './fake-pool.js';
 
 const PORTAL_HOST = 'station.fde.erix.vip';
 const PORTAL_ORIGIN = `https://${PORTAL_HOST}`;
-// dev 形态：现网入口带非默认端口（station.fde.erix.vip:8090 / tailnet-host:8090）
+// dev 形态：现网入口带非默认端口（station.fde.erix.vip:8090 / <宿主 tailnet IP>:8090）
 const DEV_HOST = 'station.fde.erix.vip:8090';
 const DEV_ORIGIN = `http://${DEV_HOST}`;
 

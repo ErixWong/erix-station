@@ -23,6 +23,7 @@
     "db:migrate": "node portal/src/cli.js migrate",
     "healthcheck": "node portal/src/cli.js healthcheck",
     "check:agents-hotlayer": "node scripts/agents-hotlayer-budget.mjs",
+    "check:doc-portable": "node scripts/check-doc-portable.mjs",
     "check:ci-legs": "node scripts/check-required-legs.mjs"
   },
   "dependencies": {

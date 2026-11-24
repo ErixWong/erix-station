@@ -11,25 +11,25 @@
 > - **目标环境探测**：机器事实（Docker 版本、端口可用性、资源、路径），必须在目标环境上实测，§9 给出探测命令。
 > - **平台规范固定**：规格已定，不随环境变化（域名规则、网络划分、「ingress 是唯一入口」、不 publish 的端口等）。
 >
-> 所有**实测数值**统一收敛到 §8「参考实例 A（开发机）」，仅作示例。**参考实例仅用于验证配置可跑通，不是设计约束、不是部署目标**；目标环境的对应取值必须重新探测或向决策者确认。
+> **本机/参考实例的实测数值不在本仓库**（见 `~/projects/docs/station-dev-machine.md`，冷层，不在公网）；凡涉及具体机器数值处仅作示例。**参考实例仅用于验证配置可跑通，不是设计约束、不是部署目标**；目标环境的对应取值必须重新探测或向决策者确认（§9）。
 
 ---
 
 ## 0. P1 本地开发环境最小集（先把开发跑起来，最优先看本节）
 
-> **优先级声明（决策者 2026-09，issue #3 评论）**：「公网443和本项目啥关系？我们是写代码啊，你随便搞个端口先把开发环境搞起来不行吗？」——**开发期不需要 443 / 公网可达 / DNS 泛解析 / 真实证书 / VPN**。本文 §1（DNS 泛解析行）、§2（整节）、§3（平台可达性行）、§5.1、§8.3、§9 第 6/10/11 项、附录 A 第 2/3/5 项均为**部署期事项（P1 开发不需要）**，已逐处标注；开发期只看本节即可开工。
+> **优先级声明（决策者 2026-09，issue #3 评论）**：「公网443和本项目啥关系？我们是写代码啊，你随便搞个端口先把开发环境搞起来不行吗？」——**开发期不需要 443 / 公网可达 / DNS 泛解析 / 真实证书 / VPN**。本文 §1（DNS 泛解析行）、§2（整节）、§3（平台可达性行）、§5.1、§8（值见冷层）、§9 第 6/10/11 项、附录 A 第 2/3/5 项均为**部署期事项（P1 开发不需要）**，已逐处标注；开发期只看本节即可开工。
 
 P1 本地开发（写代码、起栈联调）只需：
 
 | 项 | 开发期做法 |
 |---|---|
-| 入口端口 | **127.0.0.1 + 任意高端口**。默认建议：Traefik `websecure` → **`8443`**，`web` → **`8090`**（参考实例 A 上已用 `ss -tlnp` 确认两者空闲，2026-09）。**注意避开本机已占用端口**：80/443 被占（443 为 `nginx_reverse_proxy`）、8080 被占（`gitea_act_runner`）、5432 被占、8931~8934 是 playwright 容器（见 §8.2）；换机器或换端口前一律先 `ss -tlnp` 自查 |
-| portal 发布端口 | **`127.0.0.1:18080:8080`**（宿主 8080 已被 `gitea_act_runner` 占用 → 开发期 portal 宿主端口改用 `18080`，`PORTAL_HOST_PORT=18080`；容器内仍听 8080） |
+| 入口端口 | **127.0.0.1 + 任意高端口**。默认建议：Traefik `websecure` → **`8443`**，`web` → **`8090`**（参考实例 A 上已用 `ss -tlnp` 确认两者空闲，2026-09）。**注意避开本机已占用端口**（本机端口占用实况见冷层 `~/projects/docs/station-dev-machine.md`）；换机器或换端口前一律先 `ss -tlnp` 自查 |
+| portal 发布端口 | **`127.0.0.1:18080:8080`**（本机宿主 8080 已被占用（占用者见冷层） → 开发期 portal 宿主端口改用 `18080`，`PORTAL_HOST_PORT=18080`；容器内仍听 8080） |
 | 用户空间根 / 动态配置目录 | 开发期**可注入临时目录隔离**：`ERIX_USERSPACE_ROOT_HOST`（宿主用户空间根，默认 `/srv/erix/users`）与 `TRAEFIK_DYNAMIC_DIR_HOST`（Traefik 动态配置宿主目录，默认 `./traefik/dynamic`）——两者都**建议 0755**（portal 虽回加了 `CHOWN/DAC_OVERRIDE/FOWNER/SETGID/SETUID`（deploy-contract §1），开发期临时目录仍避免依赖特权位；station-docker-proxy 以 gid 1000 穿越目录（deploy-contract §5.1）；`mktemp -d` 默认 0700 需先 chmod） |
-| backend 子网 | **`172.32.0.0/24`**（本机 `172.30.0.0/16` 已被运行中的 `otherproj` 占用（`br-xxxxxxxxxxxx` / `172.30.0.1`）→ 开发期 `backend` 用 `172.32.0.0/24`，`BACKEND_SUBNET=172.32.0.0/24`；部署期规范值仍为 §5.2 的 `172.30.0.0/24`，由 `BACKEND_SUBNET` 覆盖） |
+| backend 子网 | **`172.32.0.0/24`**（本机该网段已被其他容器占用，取值见冷层 `~/projects/docs/station-dev-machine.md`）→ 开发期 `backend` 用 `172.32.0.0/24`，`BACKEND_SUBNET=172.32.0.0/24`；部署期规范值仍为 §5.2 的 `172.30.0.0/24`，由 `BACKEND_SUBNET` 覆盖） |
 | socket-proxy | 开发期**同样启用**：`station-docker-proxy` 单独挂 `/var/run/docker.sock`（RO），portal 经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问 Docker API（不直挂 socket）；白名单见 deploy-contract §5.1（自研 admission proxy：方法+路径白名单 12 条 + create 参数级校验；**不再用** tecnativa 类别级 env 门） |
 | DB 首次初始化 | 由 `deploy/db-init/00-init.sh` 在 `station-db` **首次启动（空数据目录）**时以超级用户完成一次：`schema.sql`（baseline）→ 设两角色口令 → 回填 baseline checksum → `bootstrap.sql`（授权 + ownership 归正）→ 收紧跨库 CONNECT；**开发期同样**。增量迁移（`deploy/migrations/*.sql`）**由 portal 自己跑**：`MIGRATE_ON_START=1`（compose 显式值），portal 在监听端口前应用（§10） |
-| 域名 | **开发期已使用真实泛解析域名（2026-10-08 定稿，issue #57）**：`*.fde.erix.vip` 泛解析 → 宿主机 Tailscale IP `tailnet-host`（比 DHCP LAN IP 稳定），浏览器/playwright/FDE 均可达；入口带端口 `:8090`（dev Traefik 不在 80/443）。`/etc/hosts` 逐条与 `*.localhost` 变通**降级为历史兜底**（仅本机无 DNS 可用时），不再是主路径。⚠️ 容器内解析与宿主无关：`station.<伞域>` / `llm.<伞域>` 恒走创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1），不依赖外部 DNS |
+| 域名 | **开发期已使用真实泛解析域名（2026-10-08 定稿，issue #57）**：`*.fde.erix.vip` 泛解析 → 宿主机 Tailscale IP（宿主 tailnet IP（取值见冷层））（比 DHCP LAN IP 稳定），浏览器/playwright/FDE 均可达；入口带端口 `:8090`（dev Traefik 不在 80/443）。`/etc/hosts` 逐条与 `*.localhost` 变通**降级为历史兜底**（仅本机无 DNS 可用时），不再是主路径。⚠️ 容器内解析与宿主无关：`station.<伞域>` / `llm.<伞域>` 恒走创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1），不依赖外部 DNS |
 | TLS | 自签证书，或直接 http 联调（当前 dev 采用 **http**：cookie 无 `Secure`，预览 URL 按 http 生成；升 https 时同步 `PORTAL_PUBLIC_BASE_URL`，见 §2 与验收清单） |
 | 证书方式 / DNS-01 / VPN-only / 公网可达性 / 443 冲突处理 | **一律部署期再管**（见 §2/§3/§5.1/§8.3 的「部署期事项」标注） |
 
@@ -54,9 +54,9 @@ P1 本地开发（写代码、起栈联调）只需：
 | `BASE_DOMAIN` | **伞域** = `fde.` + registrable domain；portal/LLM/预览的公共后缀（#57 定稿，旧语义「可注册域」作废） | 决策者定稿（2026-10-08） | `fde.erix.vip` |
 | `PORTAL_HOST` | portal 域名 = `station.` + 伞域 | 平台规范固定（规格 §6.3） | `station.fde.erix.vip` |
 | `FDE_WILDCARD_HOST` | 预览泛域名 = `*.<伞域>`（伞域名恰含 `fde`，不再额外拼 `.fde.` 段——`buildHostname` 的 `.fde.` 硬编码已随 #57 拆除）；必须与 portal 同 registrable domain，否则 SameSite 打死 iframe | 平台规范固定（规格 §6.3） | `*.fde.erix.vip`（#246 号池后的实际形态如 `eric-p-22000.fde.erix.vip`，grammar=`<fde>-p-<portLabel>.<伞域>`） |
-| DNS 泛解析 | ✅ **已配置（2026-10-08）**：一条 A 记录 `*.fde.erix.vip → tailnet-host`（宿主机 Tailscale IP）即覆盖 portal/llm/预览全部名字（`*.` 不覆盖裸域，平台无服务落裸域）。原「两条内网 A 记录 + 部署期事项」口径作废；解析器负缓存（路由器 dnsmasq 负 TTL）为唯一已知 dev 期坑，公共 DNS 正常 | 已落地 | 全球生效实测（权威 NS/阿里/Google 一致） |
+| DNS 泛解析 | ✅ **已配置（2026-10-08）**：一条 A 记录 `*.fde.erix.vip → 宿主 tailnet IP`（取值见冷层）（宿主机 Tailscale IP）即覆盖 portal/llm/预览全部名字（`*.` 不覆盖裸域，平台无服务落裸域）。原「两条内网 A 记录 + 部署期事项」口径作废；解析器负缓存（路由器 dnsmasq 负 TTL）为唯一已知 dev 期坑，公共 DNS 正常 | 已落地 | 全球生效实测（权威 NS/阿里/Google 一致） |
 | `llm.<伞域>`（LLM 数据面域名） | 解析双通道：容器内恒用 hosts 注入（`--add-host llm.<伞域>:<该 FDE 网关 IP>`）解析到 Traefik，**不依赖 DNS**（机制不变）；伞域收敛后该名字（`llm.fde.erix.vip`）也**顺带被 `*.fde.erix.vip` 泛解析覆盖**（浏览器偶访可达，dev http 下够用），无需单独 A 记录 | 平台规范固定（topology.md §4-L7，H-B） | `llm.fde.erix.vip` |
-| 代码托管（git host） | **git host 中立**：GitHub / Gitea / 其他自托管均可，平台不假设具体 git host；平台不代为 clone。Git 凭据可由 FDE 自行配置，或由 admin 通过 portal 凭据端点 write-through 到用户空间文件（见 `design/user-space.md` §4.1.1） | 决策者提供 | `gitea.internal`（内网自托管 Gitea——**仅为参考实例 A 的情况**，见 §8.1，非设计约束） |
+| 代码托管（git host） | **git host 中立**：GitHub / Gitea / 其他自托管均可，平台不假设具体 git host；平台不代为 clone。Git 凭据可由 FDE 自行配置，或由 admin 通过 portal 凭据端点 write-through 到用户空间文件（见 `design/user-space.md` §4.1.1） | 决策者提供 | 内网自托管 Gitea（主机名见冷层——**仅为参考实例 A 的情况**，非设计约束） |
 
 ## 2. 证书参数
 
@@ -64,7 +64,7 @@ P1 本地开发（写代码、起栈联调）只需：
 
 | 参数 | 语义 | 取值来源 | 示例值 |
 |---|---|---|---|
-| 证书方式 | 预览域名是泛域名，HTTP-01 无法签泛域名证书；DNS-01 是唯一免费方案。**伞域收敛后 SAN 简化为一张通配 `*.fde.erix.vip`**——`station.*`/`llm.*`/全部预览都落在同一单标签覆盖内（旧三条 SAN `station.<base>`+`*.fde.<base>`+`llm.<base>` 并集口径作废，#57）；所有 router 统一 `tls.domains=[{main:"*.fde.erix.vip"}]` 共享同一张证，规避 per-host 签发限速 | 决策者定稿方向（2026-10-08） | **Let's Encrypt DNS-01**（SAN=`*.fde.erix.vip`）。前提：`erix.vip` zone 可 API 操作（DNSPod，已确认 NS）；DNS-01 纯出站，**与 A 记录指向无关**（tailnet-host 不影响签发/续期）。**降级方案**：zone 不可 API 操作时改内部 CA（自签根下发到设备）；自签仅作本地兜底 |
+| 证书方式 | 预览域名是泛域名，HTTP-01 无法签泛域名证书；DNS-01 是唯一免费方案。**伞域收敛后 SAN 简化为一张通配 `*.fde.erix.vip`**——`station.*`/`llm.*`/全部预览都落在同一单标签覆盖内（旧三条 SAN `station.<base>`+`*.fde.<base>`+`llm.<base>` 并集口径作废，#57）；所有 router 统一 `tls.domains=[{main:"*.fde.erix.vip"}]` 共享同一张证，规避 per-host 签发限速 | 决策者定稿方向（2026-10-08） | **Let's Encrypt DNS-01**（SAN=`*.fde.erix.vip`）。前提：`erix.vip` zone 可 API 操作（DNSPod，已确认 NS）；DNS-01 纯出站，**与 A 记录指向无关**（tailnet IP 取值见冷层，不影响签发/续期）。**降级方案**：zone 不可 API 操作时改内部 CA（自签根下发到设备）；自签仅作本地兜底 |
 | `ACME_EMAIL` | ACME 账号注册邮箱 | 决策者提供 ⚠️ | 待填 |
 | `DNS_PROVIDER` / DNS-01 API token | DNS-01 的 provider 名称与 API 凭据；凭据经环境变量注入（见 §6），不写进配置文件 | 决策者提供 ⚠️，凭据文件注入 | 待填 |
 
@@ -116,7 +116,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | `TRAEFIK_WEB_PORT` | Traefik `web` entrypoint 的监听端口（Traefik 跑 **host 网络**，独占；对外唯一入口之一。H-B 定稿，issue #5） | 平台规范固定（规格 §5：只有 ingress 占 80/443）+ 目标环境探测（可用性，见 §9） | `80` |
 | `TRAEFIK_WEBSECURE_PORT` | Traefik `websecure` entrypoint 的监听端口（同上，host 网络） | 同上 | `443`（目标环境冲突未解时过渡用 `8443`，见 §5.1 与 §8.3） |
 | `TRAEFIK_ADMIN_PORT` | **管理台入口** `adminsecure` 的端口（#450 D0 定为 `9443`；避开 80/443/8090/8443 与号池 22000–29999）。⚠️ **两处耦合**：Traefik 真正 listen 的端口写在 `deploy/traefik/traefik.yml` 的 `adminsecure.address` 里**字面量**（静态文件不做 `${VAR}` 插值，实测见 `deploy/edge-routing.md` §4），而 `station-edge` 是 `network_mode: host`（宿主端口 = 容器端口，没有 `ports:` 可跟着 env 走）⇒ **改端口要同时改这两处，并且重启边缘**（静态配置只在启动时读）。两处一致性由 `portal/test/deploy-env-defaults.test.js` 机器判据钉住。管理台**不提供**端口写入口（写错静态配置 = 整个边缘起不来） | 部署面 `deploy/.env`（决策者 2026-11-05 定 9443） | `9443` |
-| portal 8080 | portal 服务端口，**publish 仅 `127.0.0.1:8080`（回环）**：portal 在 `backend` 网络，回环 publish 供 Traefik（host 网络）反代与 forwardAuth；不暴露 LAN（H-B 定稿 D-3，issue #5，规格 §5） | 平台规范固定 + 目标环境探测（回环 8080 可用性，§9 第 7 项） | `127.0.0.1:8080`（⚠️ 参考实例 A 上宿主 8080 已被 `gitea_act_runner` 占用，见 §8.2——该机部署需迁移占用者或改 publish 端口） |
+| portal 8080 | portal 服务端口，**publish 仅 `127.0.0.1:8080`（回环）**：portal 在 `backend` 网络，回环 publish 供 Traefik（host 网络）反代与 forwardAuth；不暴露 LAN（H-B 定稿 D-3，issue #5，规格 §5） | 平台规范固定 + 目标环境探测（回环 8080 可用性，§9 第 7 项） | `127.0.0.1:8080`（⚠️ 参考实例 A 上宿主 8080 已被占用——占用者见冷层 `~/projects/docs/station-dev-machine.md`；该机部署需迁移占用者或改 publish 端口） |
 | LiteLLM 数据面/管理面 | `station-litellm` 仅在 `litellm` profile 启动；宿主只发布到 `127.0.0.1`，默认端口由 `LITELLM_HOST_PORT` 控制。Traefik 通过 `LLM_GATEWAY_HOST` 访问；portal 容器内 AI-title 使用 `LLM_GATEWAY_ADMIN_URL`（backend 地址） | 平台规范固定 + 目标环境探测 | `127.0.0.1:4100`（默认） |
 | station-db 5432 | 数据库端口，**仅 `backend` 网络内**（H-B：`control` 已取消），不 publish 宿主机；station-db 是独立 postgres 容器，与宿主既有实例互不可见 | 平台规范固定 | —（同上） |
 
@@ -130,7 +130,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 > 2. **临时备用端口**：`websecure` 暂用 8443，URL 带端口号（`https://station.<base>:8443`），仅作联调过渡；正式使用前必须回到方案 1——泛域名预览 URL 带端口会污染书签/iframe/cookie 域模型。
 > 3. **只在不得以时代理链**：复用现有 443 反代、把 station/fde 域名转发给 Traefik——违反「ingress 是唯一入口」（原理四），多一层不受 portal 控制的代理，**不推荐**。
 >
-> 参考实例 A 上的端口占用实况与具体处理选项见 §8.2/§8.3——那是参考实例的现状，不是部署目标的约束。
+> 参考实例 A 上的端口占用实况与具体处理选项见冷层 `~/projects/docs/station-dev-machine.md`（不在本仓库）——那是参考实例的现状，不是部署目标的约束。
 
 ### 5.2 H-B 部署前置：地址池与拓扑加固（决策者 2026-09 定稿，issue #5）
 
@@ -199,7 +199,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | `PORTAL_RUNTIME_UID` | portal 容器运行身份 = materializer 物化写入身份（需 chown 工作区目录、写 Docker API） | 平台规范固定（user-space.md §6.1） | `0`（root） |
 | `USER_SPACE_DIR_MODE` / `USER_SPACE_UMASK` | ⚠ **规格名，不是真 env**：全仓无同名环境变量（代码里是 `materializer.js:28` 的目录模式常量与 `runner/entrypoint.sh` 的 umask 设定），本行给的是**口径值**不是开关默认值 | 平台规范固定（user-space.md §6.2） | 目录模式 `0770`（代码传 `0o2770`，缺 `CAP_FSETID` 时 portal 侧 reconcile 的 setgid 被内核静默清掉 ⇒ 落 `0770`；只建一次的 `projects/<p>` 实测仍 `2770`，口径见 user-space §6.2 / issue #273）/ umask `0002`（平台文件 `0644`，`manifest.json` `0444`） |
 | `backend` / `fde-<name>` | **`backend` = 显式 `172.30.0.0/24`**（compose 声明，与 FDE 池彻底隔离）；`fde-<name>` 每 FDE 一条 `/29`；Traefik 走 host 网络（H-B 定稿，issue #5；~~`edge` / `control`~~ 已取消——共享 `control` 是横向越权根源）。**`10.200.0.0/16` 与 `10.201.0.0/16` 保留给 FDE 网络专用**，其它 compose/自动网络不得使用 | 平台规范固定（规格 §3/§5，topology.md §2） | `backend` 接 portal + station-db + LLM 网关；`fde-<name>` 只接该 FDE 的容器（`10.200.<n>.0/29`，大 FDE `/28` 见 §5.2） |
-| 凭据存放 | 平台凭据（DB 密码、runner token、OIDC client secret、DNS-01 API token）一律环境变量或凭据文件注入（项目 AGENTS.md §6），不进仓库、不进 compose 正文 | 决策者/运维约定 | 参考实例 A：`~/.config/creds/`，权限 **600**（已实测存在，含 gitea、portainer、mssql 等凭据，见 §8.1）；或 `<DATA_ROOT>/<名称>/` 下 600 文件 |
+| 凭据存放 | 平台凭据（DB 密码、runner token、OIDC client secret、DNS-01 API token）一律环境变量或凭据文件注入（项目 AGENTS.md §6），不进仓库、不进 compose 正文 | 决策者/运维约定 | 参考实例 A 的凭据目录见冷层 `~/projects/docs/station-dev-machine.md`（600，含 gitea、portainer、mssql 等凭据）；或 `<DATA_ROOT>/<名称>/` 下 600 文件 |
 
 凭据注入要点（平台规范固定，不随环境变化）：
 
@@ -220,65 +220,12 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 
 Portainer 与本平台的关系（平台规范固定，不随环境变化）：Portainer 是**运维观察面**（看容器、日志），不是控制面——FDE 容器生命周期一律由 portal 经 Docker API 管理（规格 §14），不允许在 Portainer 里手工增删 FDE 容器（会绕过 DB 真相与端口分配事务）。
 
-运维会话注意事项：若目标环境上运维/agent 会话不在 `docker` 组，bash 中执行 docker 命令可用 `sg docker -c '<cmd>'` 绕过（此情况在参考实例 A 上实测出现过，见 §8.1；写 runbook / 运维脚本时按目标环境实际情况引用，D6 任务应引用）。
+运维会话注意事项：若目标环境上运维/agent 会话不在 `docker` 组，bash 中执行 docker 命令需用会话组切换方式绕过（如重登/newgrp；本机具体绕过命令见冷层 `~/projects/docs/station-dev-machine.md`，参考实例 A 上实测出现过；写 runbook / 运维脚本时按目标环境实际情况引用，D6 任务应引用）。
 
 ## 8. 参考实例 A（开发机）
 
-> **本节是全部实测数值的唯一出处。** 以下数值于 2026-05 在一台开发机上实测确认，仅用于验证配置可跑通、为各参数提供示例值。**参考实例不是设计约束、不是部署目标**；目标环境的对应取值必须按 §9 重新探测或向决策者确认。凡引用本节数值处，均应理解为「参考实例 A 上如此」。
-
-### 8.1 实测概览（2026-05，仅参考实例 A）
-
-| 项 | 实测值 |
-|---|---|
-| Docker Server 版本 | **29.1.3** |
-| Portainer | **已存在**：容器名 `portainerce`，监听 `127.0.0.1:9000`，endpoint Id = 2 |
-| CPU | 36 核 |
-| 内存 | 125 GiB 总量，可用约 100 GiB |
-| 磁盘 | 单盘 `/dev/nvme0n1p2` 挂载 `/`；总量 937 G，可用 275 G |
-| 已有负载 | 宿主机已跑大量容器（gitea、portainer、mssql、多个 playwright 等），资源规划需预留余量 |
-| 代码托管 | Gitea `gitea.internal`（内网自托管，在跑） |
-| 凭据目录 | `~/.config/creds/`（600，含 gitea、portainer、mssql 等凭据） |
-| docker 组会话 | 该机上 agent 的旧会话不在 `docker` 组，docker 命令需 `sg docker -c '<cmd>'` 绕过 |
-| 数据目录约定 | 全机统一 `/docker/<名称>/`；FDE 用户空间 `/srv/erix/users/<fde>/` |
-| 本机访问 GitHub | 内网 DNS 与代理处理见下方 §8.1.1 |
-
-容量评估（以参考实例 A 为例）：容器成本不是约束（规格 §1）；FDE 容器模板含 chromium（≈1 GB/容器，规格 §12.4），275 G 可用磁盘对 P1~P3 规模（个位数 FDE）充裕。
-
-### 8.1.1 本机访问 GitHub（实测事实，仅参考实例 A）
-
-- 内网 DNS（`dns.internal`）会把 `github.com` 钉到半死不活的地址：TCP 连得上、TLS 握得手、
-  HTTP 不回话，**且是间歇性的**。
-- 261110 现验：本机 `git config --global --get-regexp '^http\.'` 只有 `http.https://gitea.internal/.proxy`，
-  **`github.com` 那条根本没配** ⇒ 直连 `direct=000` 超时，显式代理 1.1s 通。
-- 不通时显式带：`git -c http.proxy=http://proxy.internal:19001 -c https.proxy=http://proxy.internal:19001 push origin <ref>`；
-  **`gh` 不读 git 配置**，得自己带 `HTTPS_PROXY=… gh …`。
-- **别在全局 env 设 `HTTP(S)_PROXY`**：把本来就通的链代理掉是负收益（曾因此把
-  `llm-gateway.internal` 的中转请求代理到卡死）。容器内的 `127.0.0.1` 不是宿主，也不继承本机代理。
-- 别改 `/etc/hosts`（无 sudo）。**policy（先验什么、什么时候加代理）见全局 `~/projects/AGENTS.md` §3.7**。
-
-### 8.2 端口占用实况（仅参考实例 A；目标环境需按 §9 重新核实）
-
-| 端口 | 参考实例 A 现状 | 规格规划 | 结论 |
-|---|---|---|---|
-| 80 | ✅ 空闲（`ss -tlnp` 无监听） | Traefik `web` entrypoint（唯一 publish 之一） | 参考实例 A 上可用 |
-| 443 | ⚠️ **已被容器 `nginx_reverse_proxy` 占用**（`0.0.0.0:443->443/tcp`，nginx，默认 vhost 对 `https://127.0.0.1/` 返回 `502 Bad Gateway`；同容器另映射 9001/9002） | Traefik `websecure` entrypoint | 参考实例 A 上冲突，处理选项见 §8.3 |
-| 8080 | 已被容器 `gitea_act_runner` 占用（host 网络，进程直接监听 `:::8080`，Go 服务：`http://127.0.0.1:8080/` 返回 `404 text/plain`） | portal（H-B：**publish `127.0.0.1:8080` 回环**，规格 §5） | ⚠️ **参考实例 A 上有冲突**：回环 8080 被占 → 该机部署需迁移占用者或改 portal publish 端口；目标环境按 §9 第 7 项重新核实 |
-| 4100 | `ss -tlnp` 未见宿主监听（2026-05） | LiteLLM data plane/admin plane（`LITELLM_HOST_PORT` 默认值；**publish `127.0.0.1:4100` 回环**） | 参考实例 A 上可用；目标环境按 §9 第 7 项重新核实 |
-| 5432 | 已被容器 `postgresql` 占用（`0.0.0.0:5432->5432/tcp`） | station-db（**仅 `backend` 网络内**（H-B：`control` 已取消），不 publish 宿主机） | 无冲突——station-db 是独立 postgres 容器，只对 `backend` 网络暴露 5432，与宿主既有实例互不可见（同上） |
-
-### 8.3 443 占用处理记录（参考实例 A 的候选方案）
-
-> 🕓 **部署期事项（P1 开发不需要）**：开发期直接用 §0 的高端口，不碰 443（决策者 2026-09，issue #3 评论）。
->
-> 以下为参考实例 A 上 443 冲突的具体处理选项，**仅参考实例 A**；通用要求与处理优先级见 §5.1。目标环境若有同类冲突，需按 §5.1 重新评估，且同样**不构成「P1 硬阻塞」级别的设计问题**——它只是部署前检查项之一。
-
-按 §5.1 的优先级展开（参考实例 A 语境）：
-
-1. **迁移 443 上的现有服务**（推荐）：占用者已定位为容器 `nginx_reverse_proxy`（映射 443、9001、9002，另有 8443 暴露未映射）。评估：把它的现有路由迁到 Traefik 之后（Traefik 作唯一 ingress，nginx 退为后端服务），或让其改听其他端口，然后 Traefik 按规格独占 443。（注意该 nginx 当前默认 vhost 返回 502，说明它是否仍在承载有效业务需先确认。）
-2. **Traefik `websecure` 暂用 8443**：URL 带端口号（`https://station.fde.erix.vip:8443`），仅作联调过渡；正式使用前必须回到方案 1。
-3. ~~复用现有 443 反代，把 station/fde 域名转发给 Traefik~~：**不推荐**（理由见 §5.1）。
-
-> 部署配置（`deploy/`）应把 Traefik 的 publish 端口做成变量（见 §10），使方案 1/2 切换只改一处。
+> 本机/参考实例的实测数值不在本仓库 ⇒ 见 `~/projects/docs/station-dev-machine.md`（源 pi-tools，自托管，不在公网）。
+> 目标环境取值一律按 §9 现验。
 
 ## 9. 目标环境核实项 checklist（部署前必做）
 
@@ -289,7 +236,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | # | 核实项 | 探测命令 | 期望值 / 记录内容 | 对应参数 | 实测值 |
 |---|---|---|---|---|---|
 | 1 | Docker Server 版本 | `docker version --format '{{.Server.Version}}'` | 记录版本号 | §7 Docker 版本 | |
-| 2 | 运维会话是否在 docker 组 | `docker ps`；若权限不足则 `sg docker -c 'docker ps'` | 可直连，或记录需 `sg docker -c` 绕过 | §7 运维会话注意 | |
+| 2 | 运维会话是否在 docker 组 | `docker ps`；若权限不足则用会话组切换方式重试 | 可直连，或记录需组切换绕过（具体命令见冷层） | §7 运维会话注意 | |
 | 3 | CPU 核数 | `nproc` | 记录核数 | §7 资源 | |
 | 4 | 内存 | `free -h` | 记录总量/可用 | §7 资源 | |
 | 5 | 磁盘 | `df -h /`；及 `df -h <DATA_ROOT> <USER_SPACE_ROOT>` | 按目标规模估算是否充裕 | §7 资源 / §6 路径 | |
@@ -297,7 +244,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | 7 | 其他端口占用 | `ss -tlnp \| grep -E ':(8080\|4100\|5432)\b'` | portal publish `127.0.0.1:8080`、LiteLLM `127.0.0.1:${LITELLM_HOST_PORT:-4100}`（回环，需对应端口空闲）；station-db 不 publish，理论上无冲突 | §5 | |
 | 8 | Portainer 是否存在 | `docker ps --format '{{.Names}} {{.Ports}}' \| grep -i portainer` | 记录容器名/监听地址 | §7 Portainer | |
 | 9 | 既有容器命名冲突 | `docker ps -a --format '{{.Names}}' \| grep -E '^(station-\|fde-)'` | 无输出，或冲突容器已评估 | §6 容器命名 | |
-| 10 | DNS 泛解析（✅ 已配，2026-10-08 #57：`*.fde.erix.vip → tailnet-host`） | `dig test-9527.fde.erix.vip`（任意子名）；异常时对照 `dig … @223.5.5.5` 区分本地/路由器负缓存 | 解析到 tailnet-host；若仅本机解析不出而公共 DNS 正常，是递归解析器负缓存，等 TTL 或重启路由器 dnsmasq | §1 DNS 泛解析 | |
+| 10 | DNS 泛解析（✅ 已配，2026-10-08 #57：`*.fde.erix.vip → 宿主 tailnet IP`（取值见冷层）） | `dig test-9527.fde.erix.vip`（任意子名）；异常时对照 `dig … @223.5.5.5` 区分本地/路由器负缓存 | 解析到宿主 tailnet IP（取值见冷层）；若仅本机解析不出而公共 DNS 正常，是递归解析器负缓存，等 TTL 或重启路由器 dnsmasq | §1 DNS 泛解析 | |
 | 11 | 公网 DNS zone 可 API 操作（🕓 部署期事项，P1 开发无需执行） | 决策者确认 DNS provider 及其 API 能力 | 支持则 DNS-01；不支持则内部 CA | §2 证书方式 | |
 | 12 | 出口正向代理 | `env \| grep -i proxy`；`curl -sI --max-time 5 https://registry.npmjs.org/` | 无强制代理可直连；有代理则记录代理地址，影响 §3 egress 落地 | §3 正向代理 | |
 | 13 | 路径可写 | `ls -ld <DATA_ROOT> <USER_SPACE_ROOT>`；不存在则 `mkdir -p` 验证 | 可创建且归属 docker 可写用户 | §6 路径 | |
@@ -370,11 +317,11 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `IPAM_RESERVED_SUBNETS` | IPAM 保留网段（逗号分隔；避开宿主既有网段，开发期可置空，因 FDE 池 10.200/10.201 与 backend 172.32 天然隔离） | 目标环境探测 | ``（空） |
 | `FDE_USER_UID` / `FDE_USER_GID` | FDE 工作区属主 UID/GID（user-space §6.1） | 平台规范固定 | `1000` / `1000` |
 
-> **本机重建 FDE 镜像**：当前构建环境访问 GitHub、GitLab 和 Gitea 下载站需经代理，且 Docker build 容器需使用 host 网络才能访问宿主代理；代理地址是构建环境配置，不写入 Dockerfile。重建时传入代理 build args，例如：
+> **本机重建 FDE 镜像**：当前构建环境访问 GitHub、GitLab 和 Gitea 下载站需经代理，且 Docker build 容器需使用 host 网络才能访问宿主代理；代理地址是构建环境配置，不写入 Dockerfile。重建时传入代理 build args（代理取值见冷层 `~/projects/docs/station-dev-machine.md`），例如：
 > ```sh
 > docker build runner/ -t erix-station/fde:local --network=host \
->   --build-arg HTTP_PROXY=http://proxy.internal:19001 \
->   --build-arg HTTPS_PROXY=http://proxy.internal:19001 \
+>   --build-arg HTTP_PROXY=${HTTP_PROXY} \
+>   --build-arg HTTPS_PROXY=${HTTPS_PROXY} \
 >   --build-arg NO_PROXY=127.0.0.1,localhost
 > ```
 
@@ -573,7 +520,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 
 | # | 事项 | 当前倾向 | 阻塞 |
 |---|---|---|---|
-| 1 | base domain = `erix.vip` | 与 gitea.internal 同域 | deploy 变量 |
+| 1 | base domain = `erix.vip` | 与内网 Gitea 主机名同域（主机名见冷层）| deploy 变量 |
 | 2 | 证书 = Let's Encrypt DNS-01（🕓 部署期事项，P1 开发不需要） | 需 erix.vip zone 可 API 操作；否则内部 CA | P1 TLS（部署期；开发期自签/http，见 §0） |
 | 3 | 平台 VPN-only（🕓 部署期事项，P1 开发不需要） | 是 | 安全模型（部署期） |
 | 4 | 出口无强制正向代理 | 按「无」设计；若有，影响安全团队 egress 策略的落地方式与 LLM 网关上游连通性（§3） | 部署前确认 |
