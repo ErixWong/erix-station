@@ -1503,7 +1503,7 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 
 **现象**：决策者开 FDE 界面点开目录下拉，第一项是 `.pnpm-store`，真实项目被挤到后面。
 
-**取证推翻了「worker 的 HOME 不可写」这个直觉归因**（我先这么说，实测否掉）：`runner/agentd.js:984` 本来就写 `childEnv.HOME = CFG.home`（= `/home/erix`），且 `/home/erix/.local` 的属主确实是 `erix-worker`(1002)——HOME 一直可写。真因是 pnpm 自己的落位规则：**默认 store 与项目不在同一卷时，它在「项目所在卷」上另找地方建 `.pnpm-store`**，而 `~/projects` 正是 `projects` 这个 bind mount 的根（容器内 `stat -c %d`：`/home`=**52**、`/home/erix`=**64512**、`/home/erix/projects`=**64512**）。eric 空间现场：**388 MB / 22781 文件**的 `~/projects/.pnpm-store`，属主 `erix-worker`，触发者是 `demo-project`（唯一带 `pnpm-lock.yaml` 的项目）。
+**取证推翻了「worker 的 HOME 不可写」这个直觉归因**（我先这么说，实测否掉）：`runner/agentd.js:984` 本来就写 `childEnv.HOME = CFG.home`（= `/home/devuser`），且 `/home/devuser/.local` 的属主确实是 `erix-worker`(1002)——HOME 一直可写。真因是 pnpm 自己的落位规则：**默认 store 与项目不在同一卷时，它在「项目所在卷」上另找地方建 `.pnpm-store`**，而 `~/projects` 正是 `projects` 这个 bind mount 的根（容器内 `stat -c %d`：`/home`=**52**、`/home/devuser`=**64512**、`/home/devuser/projects`=**64512**）。eric 空间现场：**388 MB / 22781 文件**的 `~/projects/.pnpm-store`，属主 `erix-worker`，触发者是 `demo-project`（唯一带 `pnpm-lock.yaml` 的项目）。
 ⇒ **结论：只要缓存落位由工具自己选，换个工具（corepack / pip）就会再长一次。** 两层分开做，缺一层都只剩一半。
 
 **① 展示层（`portal/src/dirs.js`）**：新增 `isListedDirName` = `isSafeDirName` + 非 `.` 开头，只用在 `listDirs` 的枚举处。下拉是**项目选择器**不是文件管理器，这类目录不可能被选为 cwd，列出来只是噪音（且 `.` 码点排在所有字母之前 ⇒ 必然顶掉第一项）。**只影响列表可见性**：`validateSessionCwd` / `fileTree` 不筛点开头，已存在的 `~/projects/.xxx` 会话 cwd 仍可读写与展开——不是收紧旧口径，只是不加严。
@@ -5572,7 +5572,7 @@ portal `sha256:42419ff2…24f7`（**portal 仍走本地构建**：`deploy/.env` 
 | portal 内引擎 | `/app/node_modules/erix-agent` = **0.33.0** |
 | 容器内真跑一条（真引擎 + 真 `shell` 工具，桩 provider） | `echo engine-0.33.0-ok` 真执行、`exit_code 0`；事件 `round_start/attempt/tool_use/tool_result/round_end/run_outcome`；`persistence_capability_degraded` **恰好 2 条**（`clearRecoveryRows` + `appendRecoveryRow`，与 #500 未做一致） |
 
-**没拿到的那一格（诚实记账）**：**真 LLM 的 run 跑不成** —— 上游中转 `example-org` 的额度**全局耗尽**：
+**没拿到的那一格（诚实记账）**：**真 LLM 的 run 跑不成** —— 上游中转组织（取值见冷层）的额度**全局耗尽**：
 `todo` 与 `eric` 两个账号的 run 都以 `litellm.AuthenticationError … 令牌额度已用尽` 失败
 （`deepseek-v4-pro` 与 `deepseek-flash` 各一次，`runs.error.code = auth`，非本单回归）。
 ⇒ #530 验收判据 7「一条真 run 时间线可读」**只做到「事件管线 + 引擎在容器内真跑」**，
