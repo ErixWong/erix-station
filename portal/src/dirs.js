@@ -632,7 +632,9 @@ export async function readFilePreview(
     }
     return { name: path.basename(target), path: rel, kind: 'text', data: buf.toString('utf8') };
   } finally {
-    await fh.close();
+    // #726：预览读的就是那个已校验的 fd；关闭幂等——已关再关（EBADF）是
+    // 合法竞态，吞掉。
+    try { await fh.close(); } catch { /* 已关（EBADF）：幂等语义 */ }
   }
 }
 
@@ -805,22 +807,42 @@ export async function openFileStream({
   // 416 分支已在上方提前 return（不开 fd）；这里只为真要开流的请求开 fd。
   const { fh } = await openVerifiedFd({ target, root });
   const status = parsed?.status === 'ok' ? 206 : 200;
-  if (length === 0) {
-    // 空文件/退化 Range：不需要流，立即关 fd（不泄漏）。
-    await fh.close();
-    return { name, path: rel, rel, size: st.size, mime, status, headers, stream: null };
-  }
-  let handedOff = false;
+  // 所有权标记：true ⇒ fd 仍由 FileHandle（本函数）负责；移交后置 false，
+  // 此后唯一关闭者是流：只有一个主体，不再有手工 close/error/end 出口。
+  let ownsFd = true;
   try {
-    // fd 交给流：autoClose 保证流结束/出错时 fd 被关闭。FileHandle 自己的
-    // GC finalizer 会在 fd 已被流关掉后再关一次 ⇒ EBADF；故在
-    // 流 'close' 时显式 fh.close()（已关会抛 EBADF，吞掉），把 finalizer 解除。
-    const stream = fs.createReadStream(null, { fd: fh.fd, autoClose: true, start, end });
-    stream.on('close', () => { fh.close().catch(() => {}); });
-    handedOff = true;
+    if (length === 0) {
+      // 空文件/退化 Range：不开流，由 finally 立即关 fd（200/416 不变）。
+      return { name, path: rel, rel, size: st.size, mime, status, headers, stream: null };
+    }
+    // fd 交给 **FileHandle 自己的**流工厂，不再交裸 fd 号：谁开谁关。
+    // Node 22 内部语义（node --expose-internals 实测 internal/fs 源码）：
+    //   FileHandle.prototype.createReadStream(o) ===
+    //     new ReadStream(undefined, { ...o, fd: this })   // fd 传的是 handle 本体
+    //   importFd() 的 FileHandle 分支：stream[kFs] = FileHandleOperations(handle);
+    //     handle[kRef](); handle.on('close', stream.close)
+    //   FileHandleOperations.close = (fd, cb) => { handle[kUnref]();
+    //     handle.close().then(() => cb(), cb) }
+    // ⇒ end / error / 提前 destroy 三条路都走 **FileHandle.close()**（Node 缓存
+    // kClosePromise ⇒ 幂等），并 kUnref 解除 GC finalizer：关闭恰好发生一次，
+    // 且 handle 内部状态同步，不会再拿旧 fd 号去关第二下。
+    // 裸 fd 号的反证是 Node 自己的注释（同文件 importFd 的 number 分支）：
+    //   "we must keep our fingers crossed that the descriptor won't get closed,
+    //    or worse, replaced with another one"（nodejs/node#35862）
+    // ⇒ 两个对象各自拥有同一号时，流 destroy 关一次 + finalizer 再关一次，
+    // 可能踩到已被别的 open 复用的号：这就是 #727-5b 只在 CI 现形的
+    // unhandled EBADF。实测证据见 test/preview-jail-toctou.test.js：读完 /
+    // 未读完就 destroy / 连续 200 次开+destroy 三种形态下 /proc/self/fd 计数
+    // 均回到基线且无 unhandled ⇒ autoClose:true 已足够，无需手工兜底。
+    const stream = fh.createReadStream({ start, end, autoClose: true });
+    ownsFd = false;
     return { name, path: rel, rel, size: st.size, mime, status, headers, stream };
   } finally {
-    if (!handedOff) await fh.close();
+    if (ownsFd) {
+      // 未把 fd 移交给流（空文件/退化 Range/开流前抛错）：本函数立即关；
+      // 已关再关是合法竞态，EBADF 吞掉。
+      try { await fh.close(); } catch { /* 已关（EBADF）：幂等语义 */ }
+    }
   }
 }
 
