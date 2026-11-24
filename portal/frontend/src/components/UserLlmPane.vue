@@ -275,6 +275,17 @@ const unpricedSelected = computed(() => {
     .filter((m) => m.pricing_configured === false && ids.includes(m.model_id));
 });
 
+// 金额展示：后端给的是原始浮点（0.08440703999999999 这种二进制尾巴），
+// 统一按「最多 6 位小数、至少 2 位」呈现，避免把浮点噪声摆给管理员看。
+// 计算与判定一律用原值（这里只管显示，绝不回写）。
+function fmtUsd(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  const fixed = value.toFixed(6);
+  const trimmed = fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed;
+  const [, dec = ''] = trimmed.split('.');
+  return dec.length >= 2 ? trimmed : Number(value).toFixed(2);
+}
+
 function budgetToInput(value: number | null | undefined): string {
   return value == null ? '' : String(value);
 }
@@ -448,7 +459,7 @@ async function onSaveBudget() {
     <!-- issue #719：周期额度区（仅在有 active binding 时显示） -->
     <div v-if="cfg?.api_key" data-test="daily-budget" class="mt-4 grid gap-2 rounded-md border border-black/15 p-3">
       <p class="text-sm font-medium">{{ t('admin.llm.budgetTitle') }}</p>
-      <p v-if="unpricedSelected.length" data-test="unpriced-warning" class="syserr">{{ t('admin.llm.unpricedWarning') }}</p>
+      <p v-if="unpricedSelected.length" data-test="unpriced-warning" class="rounded-md border border-amber-500 bg-amber-50 px-3 py-2 text-[0.83rem] text-amber-800">{{ t('admin.llm.unpricedWarning') }}</p>
       <div class="flex flex-wrap items-center gap-2">
         <label class="text-xs text-black/55">{{ t('admin.llm.budgetLabel') }}</label>
         <input
@@ -479,8 +490,8 @@ async function onSaveBudget() {
       </div>
       <p v-if="budgetLoadErr" data-test="budget-load-error" class="syserr" role="alert">{{ t('admin.llm.budgetLoadFailed') }}</p>
       <div v-else data-test="budget-state" class="grid gap-0.5 text-sm">
-        <span>{{ spendScopeLabel }}：<b data-test="budget-spend">{{ quota?.spend ?? 0 }}</b> USD</span>
-        <span>{{ t('admin.llm.budgetRemaining') }}：<b data-test="budget-remaining">{{ quota?.remaining == null ? t('admin.llm.budgetUnlimited') : quota.remaining }}</b></span>
+        <span>{{ spendScopeLabel }}：<b data-test="budget-spend">{{ fmtUsd(quota?.spend) }}</b> USD</span>
+        <span>{{ t('admin.llm.budgetRemaining') }}：<b data-test="budget-remaining">{{ quota?.remaining == null ? t('admin.llm.budgetUnlimited') : fmtUsd(quota.remaining) }}</b></span>
         <span v-if="budgetResetLocal">{{ t('admin.llm.budgetResetAt') }}：<b data-test="budget-reset">{{ budgetResetLocal }}</b></span>
       </div>
       <p v-if="budgetMsg" data-test="budget-msg" class="text-green-700">{{ budgetMsg }}</p>
@@ -494,7 +505,7 @@ async function onSaveBudget() {
         </thead>
         <tbody>
           <tr v-for="d in usageDays" :key="d.date" data-test="usage-row">
-            <td>{{ d.date }}</td><td>{{ d.spend }}</td><td>{{ d.total_tokens }}</td>
+            <td>{{ d.date }}</td><td>{{ fmtUsd(d.spend) }}</td><td>{{ d.total_tokens }}</td>
           </tr>
         </tbody>
       </table>
