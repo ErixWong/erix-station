@@ -72,7 +72,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 ### 1.3 `api_tokens` — 程序化访问令牌
 
-非浏览器客户端用（portal.md §2 之外的 API 访问；规格 §6.2 basic auth 兜底场景的补充）。哈希存储、`scopes` 数组、可吊销。`UNIQUE(user_id, name)` 便于按名管理。
+非浏览器客户端用（脚本 / agent / 长期 runner；portal.md §2.13）。**现状（#736 落地后）**：库里只存 `sha256(明文)` 的 hex（与会话 `token_hash` 同口径，`portal/src/auth.js`），明文 = `st_` + base64url(32 字节随机)，**只在签发响应里出现一次**。认证缝是 `Authorization: Bearer <明文>`。`scopes` 是 `text[]` 但**本期恒为空**（签发只支持空数组，给了非空 ⇒ `400 scopes_unsupported`）；数组列是为将来预留，不是已实现的能力。**不设过期**：表里没有 `expires_at`（本期不加列），**靠吊销**（`revoked_at`）。**无 `created_by` 列**：「谁签的」只记在审计（`auth.token_created`）里。`UNIQUE(user_id, name)` 便于按名管理；**吊销不删行**，所以同名也不释放（再签同名 ⇒ `409 token_name_taken`）。`last_used_at` 只在「从未用过或距上次超 5 分钟」时用一条条件 UPDATE 节流写。⚠️ **`id` 是 `uuid`（默认 `gen_random_uuid()`）**，偏离全局 §3.4「主键一律字符串前缀」的口径——原因是 `api_tokens` 建表早于该约定（baseline `docs/data/schema.sql:128`），本单不动 PK。
 
 ### 1.4 `containers` — FDE 容器（每 FDE 一行）
 

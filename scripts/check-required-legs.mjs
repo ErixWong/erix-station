@@ -34,6 +34,13 @@ const REQUIRED_LEGS = [
     argv: ['npm', 'run', 'test:integration:prompts'],
     minPass: 7,
   },
+  {
+    id: 'portal/test/api-tokens-db.test.js',
+    why: '#736 API 令牌真库腿：revoked 谓词 / last_used_at 窗 / ON CONFLICT / '
+      + '折 user 列面，四条假库抓不到的 SQL 回归（变异实测全红）',
+    argv: ['node', '--test', 'portal/test/api-tokens-db.test.js'],
+    minPass: 6,
+  },
 ];
 
 /** 从一段 TAP 文本里取最后出现的 `# <kind> <n>` 汇总数字。 */

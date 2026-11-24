@@ -415,6 +415,14 @@ export function loadConfig(env = process.env) {
       blockMs: intEnv(env, 'PREVIEW_TICKET_RATE_LIMIT_BLOCK_MS', 60 * 1000),
       maxEntries: intEnv(env, 'RATE_LIMIT_MAX_ENTRIES', 10000),
     },
+    // issue #736：API 令牌签发限流（portal.md §2.13.1：按**目标用户**键，默认 10/小时）。
+    // 口径照 `previewTicketRateLimit`：计数只在真签发成功时烧一次（撞名 409 不烧）。
+    authTokenMintRateLimit: {
+      maxFailures: intEnv(env, 'AUTH_TOKEN_MINT_RATE_LIMIT_MAX', 10),
+      windowMs: intEnv(env, 'AUTH_TOKEN_MINT_RATE_LIMIT_WINDOW_MS', 60 * 60 * 1000),
+      blockMs: intEnv(env, 'AUTH_TOKEN_MINT_RATE_LIMIT_BLOCK_MS', 60 * 60 * 1000),
+      maxEntries: intEnv(env, 'RATE_LIMIT_MAX_ENTRIES', 10000),
+    },
     // issue #650：宿主资源监控（采样器只在 `cli.js serve` 启动，`createServer` 不启动它）。
     systemMetrics: systemMetricsSettings(env),
   };
