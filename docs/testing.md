@@ -3,7 +3,7 @@
 > 状态：**契约基线（补齐「阻塞 P1 交付」的 D5 缺口）**
 > 依据：全局约定 [`~/projects/AGENTS.md`](../../../projects/AGENTS.md) §2.2/§2.3/§3.2（下称「全局 §x」）、[`fde-platform.md`](design/fde-platform.md)（主规格，下称「规格 §x」）、[`topology.md`](design/topology.md)（H-B 拓扑单一事实来源，下称「topology §x」）、[`user-space.md`](design/user-space.md)（用户空间物化契约，下称「user-space §x」）、[`deploy-contract.md`](design/deploy-contract.md)（P1 部署契约，下称「deploy §x」）、[`runner-integration.md`](design/runner-integration.md)（容器内进程模型，下称「runner §x」）、[`portal.md`](api/portal.md)（portal API 契约，下称「portal §x」）、[`schema.sql`](data/schema.sql) + [`model.md`](data/model.md)（数据模型，下称「schema.sql §x」/「model §x」）、[`env.md`](env.md)（部署参数，下称「env §x」）。
 >
-> **本文只定义「测什么、怎么测、什么算过」的契约与可执行验收方案，不写实现代码。** 每条命令都是本机可执行的（Node 22/24、`~/.dotnet`、python venv、docker 用 `sg docker -c '...'`、psql 用 `postgres:16` 镜像），不出现伪命令。凡涉及「目标环境事实」的安全回归用例，本文区分「本机开发可跑」与「必须目标环境真机跑」两档，避免假通过。
+> **本文只定义「测什么、怎么测、什么算过」的契约与可执行验收方案，不写实现代码。** 每条命令都是本机可执行的（Node 22/24、`~/.dotnet`、python venv、docker 直连（本机 docker 组 quirk 见冷层）、psql 用 `postgres:16` 镜像），不出现伪命令。凡涉及「目标环境事实」的安全回归用例，本文区分「本机开发可跑」与「必须目标环境真机跑」两档，避免假通过。
 >
 > 全局约定（全局 §3.2）：**语法/编译保底 → 单测全绿 → 浏览器验证（playwright 截图 → vision 读图）**。本机无真实浏览器，浏览器验证用 Playwright MCP（全局 §2.2）+ vision MCP（全局 §2.3）。
 
@@ -66,80 +66,22 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 
 临时栈起停命令见 §2.2。集成测试用 `node --test` 或独立脚本驱动，但**必须**满足 §2.2 的隔离与清理约定；判定 = 测试进程退出码 0 + 临时资源（容器/网络/数据卷）已清理（§2.2.4）。
 
-> **另一档集成：活栈 e2e（不新起隔离栈）**——`portal/integration/version-surface-e2e.mjs`（`npm run test:integration:version`）与 `portal/integration/seat-content-e2e.mjs`（`npm run test:integration:seat`）验的是**本机活着的那套栈**（admin 入口 `E2E_UI_BASE` 缺省 `https://admin.fde.erix.vip:9443`，口令只从 `~/.config/mcp/creds/station-dev.password` 读）；HTTP 腿总是跑，浏览器腿要点名才跑：`E2E_UI=1 npm run test:integration:seat`（缺 playwright 容器则 skip，不算红）。
+> **另一档集成：活栈 e2e（不新起隔离栈）**——`portal/integration/version-surface-e2e.mjs`（`npm run test:integration:version`）与 `portal/integration/seat-content-e2e.mjs`（`npm run test:integration:seat`）验的是**本机活着的那套栈**（admin 入口 `E2E_UI_BASE` 缺省 `https://admin.fde.erix.vip:9443`，口令只从 冷层记录的口令文件（见 `~/projects/docs/station-dev-machine.md`） 读）；HTTP 腿总是跑，浏览器腿要点名才跑：`E2E_UI=1 npm run test:integration:seat`（缺 playwright 容器则 skip，不算红）。
 
 #### 1.2.4 安全回归
 
-安全回归用例（§3.1/§3.2）**不能只写单测**——它们验证的是「容器网络/宿主防火墙/边缘认证」的真实行为，必须在真实 docker 网络与真实 Traefik/portal 栈上跑。本机可跑的部分用 `sg docker -c '...'` 起真容器验证；目标环境事实部分（如宿主是否真的跑了 `gitea:3000`/`mssql:1433`/`portainer:9000`）必须**目标环境实测**（topology §6.1「验收矩阵（目标环境实测，逐项打勾）」）。
+安全回归用例（§3.1/§3.2）**不能只写单测**——它们验证的是「容器网络/宿主防火墙/边缘认证」的真实行为，必须在真实 docker 网络与真实 Traefik/portal 栈上跑。本机可跑的部分用真容器验证（本机 docker 组 quirk 与绕过命令见冷层）；目标环境事实部分（如宿主是否真的跑了 `gitea:3000`/`mssql:1433`/`portainer:9000`）必须**目标环境实测**（topology §6.1「验收矩阵（目标环境实测，逐项打勾）」）。
 
-### 1.3 运行环境约束（本机事实，已实测）
+### 1.3 本机坐标与 dev 探针口径（值不在本仓库）
 
-| 项 | 事实 | 命令依据 |
-|---|---|---|
-| Node | v22.23.2（`node`）+ v24.19.0（`~/.local/node24/bin/node`） | 本机实测 |
-| .NET | `~/.dotnet/dotnet` = 8.0.424（本项目无 .NET 代码，占位） | 本机实测 |
-| Docker | 29.1.3，需 `sg docker -c '...'`（`eric` 已在 docker 组，旧会话需重登） | 全局 §2.3 |
-| Compose | `docker compose` = 2.40.3 | 本机实测 |
-| psql | 宿主无 `psql`，统一用 `postgres:16` 镜像（`docker exec -i <容器> psql ...`；`postgres:16` → psql 16.15） | 本机实测 |
-| 已拉镜像 | `postgres:16`、`traefik:v3`、`traefik/whoami:latest`、`nginx:alpine`、`curlimages/curl`、`alpine`、`mcr.microsoft.com/playwright/mcp` | 本机实测 `docker images`（`curlimages/curl` / `alpine` 供 §2.2.3/§3.1 的隔离/连通用例，使用前先 pull，见 §2.2.3） |
-| 宿主已占用端口 | 80/443（nginx_reverse_proxy）、8080（gitea_act_runner）、5432、9000（portainer）、3000（gitea）、1433（mssql）——开发期入口用 env §0 的 8443/8090 | 本机实测 `ss -tlnp` / `docker ps` |
-
-### 1.3.1 本机测试环境的坑（实测；261124 自 `AGENTS.md` 热层搬入）
-
-> 热层只留判据（`AGENTS.md` §4）；成因、版本号与实测数在本节。共同特征：**不报错，但结论是假的**。
-
-- **`npx vitest run <文件>` / `npx vue-tsc` 在本机永久挂死** —— 既不像成功也不像失败，一直占着会话；
-  而项目脚本本身 3.4 秒跑完 21 条。口径：`cd portal/frontend && timeout 240 npm test -- src/xxx.spec.ts`
-  （`test` 脚本已是 `vitest run`，`--` 后直接跟文件）+ `npm run typecheck`。
-  **工单里写测试命令一律带 `timeout 240`。**
-- **vitest 打印全绿而进程 rc=1** —— 有未捕获拒绝时摘要照打（实测出现过
-  `Test Files 33 passed (33) / Tests 488 passed (488)` 而退出码非 0）⇒ grep 摘要行必然误判。
-  成因常见于 `onMounted` 里 `await` 一个会失败的请求且没 catch（Vue 不等 `onMounted` 返回的 Promise）；
-  产品实例 issue #281。
-- **`NODE_ENV=production` 让前端测试假红** —— `@vue/test-utils@2.5.1` 的 `emitted()` 靠 Vue devtools
-  hook 捕获事件，生产构建不发 devtools 事件 ⇒ `w.emitted()` 恒空。同一台机器同一份未改代码实测：
-  未设 18/18 绿、`production` 3 红（`GitLightBadge.spec.ts`）、`NODE_ENV=test` 18/18 绿。
-  新用例别用 `w.emitted()`，改用 DOM / 请求桩断言（该形态有机闸 `test/repo-hygiene.test.js`，
-  不靠这句话拦）。
-- **worktree 里测试跑不起来** —— `git worktree` 不含未跟踪的 `node_modules`。历史上 `node_modules`
-  曾被当文件提交过（mode 120000 符号链接指向绝对路径；`.gitignore` 写的是 `node_modules/`，
-  **带斜杠只匹配目录**），一棵树被十几个 worktree 共享 ⇒ 任何一处 `npm install` 顺链接剪别处的依赖。
-  形态已由 #396（`679519a`）消除，判据 `test/repo-hygiene.test.js`（H1 跟踪必须为空，并带「删规则
-  必须看得见」的反向自证）。补装极便宜：`npm ci --offline` ~0.5s / `npm ci --prefer-offline` ~1.4s。
-  ⇒ 派单红线是「不改依赖版本、不提交 lockfile 变动」，**不是**「禁止安装依赖」。
-- **项数莫名从 1022 掉到 510 + 34 失败而代码没回归** —— 依赖不完整的树（`node_modules/erix-agent`
-  不存在）被当验收基点。旧 worktree 遗留的链接现在是未跟踪文件：`ls -ld node_modules` 看出形态后
-  `rm` 掉再装。**验收 / 发版前先重装一次并复跑拿到基线数。**
-- **前端 devDependencies 装不上** —— 本机 `NODE_ENV=production` 会跳过 dev 依赖安装，
-  需 `NODE_ENV=development npm install`（装完跑测试时别再设 production）。
-
-### 1.3.2 dev 栈登录事实与探针口径（261124 自热层搬入；仅本地 dev 环境，勿用于生产）
-
-- 入口 `http://station.fde.erix.vip:8090/`（伞域泛解析，#57 阶段2；Traefik 只认
-  `station.fde.erix.vip` / `100.100.0.3`，旧的 `hp.inteva.vip:8090` 已随 Host 路由切换失效）。
-  deploy 栈 `station-portal`；代码更新后 `docker compose build station-portal && docker compose up -d station-portal`
-  生效。⚠ **裸跑 `docker compose build` 会失败**：`.env` 里 `STATION_PORTAL_IMAGE` 默认是发布件的
-  **digest 引用**（`…@sha256:…`），docker 拒给 digest 当 tag（`refusing to create a tag with a digest
-  reference`）⇒ 开发时给一个本地 tag 覆盖（两个命令都要带，否则 `up` 仍按 `.env` 起）：
-  `STATION_PORTAL_IMAGE=erix-station/portal:local-<单号> docker compose build station-portal &&
-  STATION_PORTAL_IMAGE=… docker compose up -d station-portal`。这种本地构建没烘 `build-info.json`
-  （版本面 `localBuild=true`，**不能当发布件对账**）。本机解析器负缓存解析不出时，可用 playwright
-  容器 `erix_station_playwright`（:8935，resolver MAP 规则）或临时 hosts 条目兜底。
-- 账号 `admin`（`role=admin` → 管理台）与 `eric`（`fde:eric` → 工作台）**共用同一口令**；明文不入库
-  不外传：`~/.config/mcp/creds/station-dev.password`（600，轮换直接改该文件 + 跑密码重置流程）。
-  登录体字段是 `login` 不是 `username`。
-- **两个账号的第二因素不一样**（261124 现验 `users`）：`admin` 口令直通（一步就发会话 cookie）；
-  `eric` 有 `totp_secret` 但 `totp_login_enabled=false` + `mail_otp_enabled=true` ⇒ 走邮箱验证码：
-  **口令步只回 `pending_token`、不发 cookie，并当场寄一封真邮件**（码明文只在邮箱里，库里只有 sha256）。
-  ⇒ 一次性探针要会话就登 `admin`；**别反复登 `eric`**：每登一次用户邮箱就多一封，而脚本永远读不到
-  那枚码（放大链与修法见 #737 / #736）。
-- 要测第二因素：照 `portal/integration/wp2a-e2e.mjs:288` 自建带 TOTP 的种子账号走 step1+step2。
-- **脚本要调 API 就别登录**：管理员代签一枚 API 令牌，之后 `Authorization: Bearer` 直连
-  （三步 curl 配方 ⇒ `docs/api/portal.md` §2.13）。令牌路径**零邮件、零会话**（#736）。
-- **脚本要调 API 就别登录**：管理员代签一枚 API 令牌，之后 `Authorization: Bearer` 直连
-  （三步 curl 配方 ⇒ `docs/api/portal.md` §2.13）。令牌路径**零邮件、零会话**（#736）。
-- 密码重置：用 portal 自身 `hashPassword`（scrypt 自描述格式）生成后更新 `users.password_hash`
-  （`bootstrap-admin` 不能重置已存在账号）。
+> 本机/参考实例运行环境坐标（Node/.NET/Docker 版本、已拉镜像、宿主端口占用、dev 入口 URL、口令文件路径、docker 组 quirk）是机器事实，不在本仓库 ⇒ 见 `~/projects/docs/station-dev-machine.md`（源 pi-tools，自托管，不在公网）。
+> 本文命令一律直接写 `docker <cmd>`；本机若会话不在 docker 组需包一层组切换，该 quirk 与绕过命令属本机事实、见冷层，非本机无需包装。
+> 本节只留可移植 policy：
+>
+> 1. dev 栈登录体字段是 `login` 不是 `username`。
+> 2. 脚本要调 API 就别登录：管理员代签一枚 API 令牌，之后 `Authorization: Bearer` 直连（三步 curl 配方见 `docs/api/portal.md` §2.13），令牌路径零邮件、零会话。
+> 3. 一次性探针要会话就登 `admin`，别反复登带邮箱验证码的账号——每登一次寄一封真邮件而脚本读不到那枚码。
+> 4. dev 入口 URL、口令文件路径、宿主端口占用一律从冷层取，别写进本文。
 
 ### 1.4 阶段可执行验收清单（P1 / P2 / P3）
 
@@ -205,13 +147,13 @@ DB_NAME="station-test-$RANDOM"
 NET_NAME="station-test-net-$RANDOM"
 
 # 起临时网络 + 临时 postgres:16（--rm，退出即删）
-sg docker -c "docker network create $NET_NAME"
-sg docker -c "docker run -d --rm --name $DB_NAME --network $NET_NAME \
+docker network create $NET_NAME
+docker run -d --rm --name $DB_NAME --network $NET_NAME \
   -e POSTGRES_USER=station -e POSTGRES_PASSWORD=test -e POSTGRES_DB=station_test \
-  postgres:16"
+  postgres:16
 
 # 等它就绪（pg_isready 容器内自带）
-sg docker -c "docker exec $DB_NAME pg_isready -U station -d station_test -t 15"
+docker exec $DB_NAME pg_isready -U station -d station_test -t 15
 # 期望：输出 "<host>:<port> - accepting connections"
 ```
 
@@ -244,7 +186,7 @@ sg docker -c "docker exec $DB_NAME pg_isready -U station -d station_test -t 15"
 #### 2.2.2 schema.sql 空库可执行性（D3 验收锚点，集成层）
 
 ```bash
-sg docker -c "docker exec -i $DB_NAME psql -U station -d station_test -v ON_ERROR_STOP=1" \
+docker exec -i $DB_NAME psql -U station -d station_test -v ON_ERROR_STOP=1 \
   < docs/data/schema.sql
 # 期望：输出 CREATE TABLE / CREATE INDEX / COMMIT；退出码 0
 # 失败（任一语句报错）→ 整体回滚（schema.sql 单事务 BEGIN;…COMMIT;），退出码非 0
@@ -262,20 +204,20 @@ sg docker -c "docker exec -i $DB_NAME psql -U station -d station_test -v ON_ERRO
 # 镜像 pin：先 pull 再记 resolved digest（供 §3.1 网络连通/DNS 断言使用）
 CURL_IMAGE="curlimages/curl:8.9.1"
 ALPINE_IMAGE="alpine:3.20"
-sg docker -c "docker pull $CURL_IMAGE $ALPINE_IMAGE"
+docker pull $CURL_IMAGE $ALPINE_IMAGE
 
 # 两条 /29（默认池样例，前缀 10.200.x.0/29）
 FA_NET="fde-testfake-a"; FA_SUBNET="10.200.9.0/29";  FA_GW="10.200.9.1";  FA_IP="10.200.9.2"
 FB_NET="fde-testfake-b"; FB_SUBNET="10.200.10.0/29"; FB_GW="10.200.10.1"; FB_IP="10.200.10.2"
 
-sg docker -c "docker network create --subnet $FA_SUBNET $FA_NET"
-sg docker -c "docker network create --subnet $FB_SUBNET $FB_NET"
+docker network create --subnet $FA_SUBNET $FA_NET
+docker network create --subnet $FB_SUBNET $FB_NET
 # 起假 dev server：各自 .2，监听 4000（whoami 回显请求头，便于断言注入/未注入）
-sg docker -c "docker run -d --rm --name ${FA_NET}-svc --network $FA_NET --ip $FA_IP traefik/whoami -port 4000"
-sg docker -c "docker run -d --rm --name ${FB_NET}-svc --network $FB_NET --ip $FB_IP traefik/whoami -port 4000"
+docker run -d --rm --name ${FA_NET}-svc --network $FA_NET --ip $FA_IP traefik/whoami -port 4000
+docker run -d --rm --name ${FB_NET}-svc --network $FB_NET --ip $FB_IP traefik/whoami -port 4000
 
 # 手动写 DB 行（复现「路由表里没有 = 不可达」的反向断言用）——经临时 DB 执行：
-sg docker -c "docker exec -i $DB_NAME psql -U station -d station_test -v ON_ERROR_STOP=1" <<'SQL'
+docker exec -i $DB_NAME psql -U station -d station_test -v ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO users (id, login, fde_name) VALUES
   ('00000000-0000-0000-0000-0000000000a1', 'alice', 'alice'),
   ('00000000-0000-0000-0000-0000000000a2', 'bob',   'bob');
@@ -300,7 +242,7 @@ SQL
 
 > 注：上面的最小 seed 满足 `users`/`projects`/`fde_networks`/`port_allocations` 的外键与 CHECK（schema.sql §2/§4/§9），`fde_networks` 的 `pool='default' ∧ prefix_len=29 ∧ subnet << 10.200.0.0/16` 与 `gateway = host(subnet)+1` 两条 CHECK 均成立；两条 `port_allocations` 的活跃 `hostname` 全局唯一（`port_allocations_live_hostname_key`）不冲突。**路由发布的触发**另需 `route_outbox` + `route_revisions` 行（见 §3.5，本文不在此重复），本节 seed 只证明「假容器 + 手动写 port_allocations」这条隔离/认证测试的前置路径。
 
-判定：假容器从宿主可达（`sg docker -c "docker run --rm --network host $CURL_IMAGE -s http://$FA_IP:4000"` 与 `... http://$FB_IP:4000` 均返回 whoami 回显），且 reconciler 能用这些行生成/删除对应 Traefik 路由（§3.5）。
+判定：假容器从宿主可达（`docker run --rm --network host $CURL_IMAGE -s http://$FA_IP:4000` 与 `... http://$FB_IP:4000` 均返回 whoami 回显），且 reconciler 能用这些行生成/删除对应 Traefik 路由（§3.5）。
 
 #### 2.2.4 测试数据清理约定（硬规则）
 
@@ -324,12 +266,12 @@ SQL
 
 | # | 用例（对应 topology §6.1 验收矩阵） | 命令（本机可跑形式） | 期望输出 | 判定标准 |
 |---|---|---|---|---|
-| N1 | FDE → 宿主 `:443`（Traefik）通 | 从 FDE 网络内发起：`sg docker -c "docker run --rm --network $FA_NET $CURL_IMAGE -sk -m 5 https://$FA_GW:443/"` | TLS 握手成功（自签时 `-k`），Traefik 响应（404/路由响应均可，关键在**连接建立**） | 通（exit 0 或收到 HTTP 响应） |
-| N2 | FDE → 宿主 `:8080`/`:4000`（portal / LLM 数据面回环）拒 | `sg docker -c "docker run --rm --network $FA_NET $CURL_IMAGE -s -m 3 http://$FA_GW:8080/"` | 连接超时/拒绝（无 HTTP 响应） | 拒（curl 非 0，`Connection refused` 或超时） |
-| N3 | FDE → 宿主 publish `gitea:3000`/`mssql:1433`/`portainer:9000` 拒 | `sg docker -c "docker run --rm --network $FA_NET $CURL_IMAGE -s -m 3 http://$FA_GW:3000/"`（1433/9000 同法） | 超时/拒绝 | **三端口全拒**（任何一端口可达 = 防火墙规则未生效，阻断） |
-| N4 | FDE A → FDE B 任意端口拒（跨 bridge 直连；**P2 多 FDE 验收**） | `sg docker -c "docker run --rm --network $FA_NET $CURL_IMAGE -s -m 3 http://$FB_IP:4000/"` | 超时/被拦（DOCKER-ISOLATION） | 拒（对应 topology §7「FDE A → FDE B 禁止」） |
+| N1 | FDE → 宿主 `:443`（Traefik）通 | 从 FDE 网络内发起：`docker run --rm --network $FA_NET $CURL_IMAGE -sk -m 5 https://$FA_GW:443/` | TLS 握手成功（自签时 `-k`），Traefik 响应（404/路由响应均可，关键在**连接建立**） | 通（exit 0 或收到 HTTP 响应） |
+| N2 | FDE → 宿主 `:8080`/`:4000`（portal / LLM 数据面回环）拒 | `docker run --rm --network $FA_NET $CURL_IMAGE -s -m 3 http://$FA_GW:8080/` | 连接超时/拒绝（无 HTTP 响应） | 拒（curl 非 0，`Connection refused` 或超时） |
+| N3 | FDE → 宿主 publish `gitea:3000`/`mssql:1433`/`portainer:9000` 拒 | `docker run --rm --network $FA_NET $CURL_IMAGE -s -m 3 http://$FA_GW:3000/`（1433/9000 同法） | 超时/拒绝 | **三端口全拒**（任何一端口可达 = 防火墙规则未生效，阻断） |
+| N4 | FDE A → FDE B 任意端口拒（跨 bridge 直连；**P2 多 FDE 验收**） | `docker run --rm --network $FA_NET $CURL_IMAGE -s -m 3 http://$FB_IP:4000/` | 超时/被拦（DOCKER-ISOLATION） | 拒（对应 topology §7「FDE A → FDE B 禁止」） |
 | N5 | FDE → 互联网 HTTPS 按出口策略 | 目标环境实测（本机开发机出口策略未实施 → 本机不测，见 §5） | 按安全团队策略（issue #3） | 目标环境实测 |
-| N6 | FDE → DNS 通（netns `127.0.0.11`） | `sg docker -c "docker run --rm --network $FA_NET $ALPINE_IMAGE nslookup github.com 127.0.0.11"` 或 `getent hosts` | 解析成功 | 通（默认内嵌 DNS） |
+| N6 | FDE → DNS 通（netns `127.0.0.11`） | `docker run --rm --network $FA_NET $ALPINE_IMAGE nslookup github.com 127.0.0.11` 或 `getent hosts` | 解析成功 | 通（默认内嵌 DNS） |
 
 > 关键实现约束（写入断言，不只手工验证）：
 > - **N3 必须覆盖三个宿主服务**（`gitea:3000`/`mssql:1433`/`portainer:9000`）——这是 topology §6.1「所有方案共同缺口」的实测反例，漏一个即假通过。
@@ -404,7 +346,7 @@ SQL
 
 | 用例 | 动作 | 期望 | 判定 |
 |---|---|---|---|
-| R1 kill agentd | `sg docker -c "docker kill fde-alice"`（agentd=容器主进程） | Docker `unless-stopped` 拉起；心跳 3 次丢失（45s）→ 租约 90s 到期 → re-claim（`resume:true`）→ ~~从 checkpoint 续跑~~ **从账本续跑**（`transcript_rounds` + 恢复行；快照那条路随 #640 没了）（runner §6.4） | run 未终态前被同 run_id re-claim；`run_queue.attempts` +1；`resume=true` |
+| R1 kill agentd | `docker kill fde-alice`（agentd=容器主进程） | Docker `unless-stopped` 拉起；心跳 3 次丢失（45s）→ 租约 90s 到期 → re-claim（`resume:true`）→ ~~从 checkpoint 续跑~~ **从账本续跑**（`transcript_rounds` + 恢复行；快照那条路随 #640 没了）（runner §6.4） | run 未终态前被同 run_id re-claim；`run_queue.attempts` +1；`resume=true` |
 | R2 kill worker | 仅 kill worker 进程（agentd 存活） | agentd `release`（`worker_crashed`）→ 立即 re-claim（`attempts++`、`resume:true`）（runner §6.4） | 同上，但 release 由 agentd 发起 |
 | R3 容器重启（整容器） | `docker restart fde-alice` | 新 agentd 扫描 spool → 重传未 ack → re-claim 续跑（runner §7.5/§6.4） | spool 不丢（在 HOME bind mount 持久卷）+ 事件不重不漏 |
 | R4 重复 batch（同 `client_event_id`） | 重发同一 U3 批次 | `INSERT ... ON CONFLICT (run_id, client_event_id) DO NOTHING`，响应 `stored < 请求条数`、`200`，不产生重复事件（schema.sql §5 + portal §9.4） | `run_events` 中该 `client_event_id` 恰一条 |
@@ -565,9 +507,9 @@ curl -s -o /dev/null -w '%{http_code}' -H 'Last-Event-ID: 999999999' .../events
 
 | 用例 | 命令（真机 FDE 容器 `fde-alice`） | 期望 | 判定 |
 |---|---|---|---|
-| S1 单一 init | `sg docker -c "docker inspect fde-alice --format '{{.HostConfig.Init}} {{.Path}}'"` | `Init=true` 且 `Path` 为 `station-agentd`（**非** `tini`） | 无双重 init（deploy §6.2/§1） |
-| S2 僵尸回收 | 容器内起一个后台进程并退出后：`sg docker -c "docker exec fde-alice ps -ef"` | 无 `<defunct>` / `Z` 状态残留 | tini reap（deploy §6.2 note） |
-| S3 跨 UID kill（B7） | 领一个 run，agentd（UID 1001）在 stop/lease_lost 时对 worker（UID 1002）发 `SIGTERM`→`SIGKILL`；`sg docker -c "docker exec fde-alice ps -o uid,pid,cmd"` 确认 worker 已退出 | worker 进程被终止、退出码合理、无 `EPERM` 日志 | agentd 持 `CAP_KILL` + `PR_SET_KEEPCAPS` 生效（deploy §6.2 note；失败即 `EPERM` 需改同 UID/supervisor 模型） |
+| S1 单一 init | `docker inspect fde-alice --format '{{.HostConfig.Init}} {{.Path}}'` | `Init=true` 且 `Path` 为 `station-agentd`（**非** `tini`） | 无双重 init（deploy §6.2/§1） |
+| S2 僵尸回收 | 容器内起一个后台进程并退出后：`docker exec fde-alice ps -ef` | 无 `<defunct>` / `Z` 状态残留 | tini reap（deploy §6.2 note） |
+| S3 跨 UID kill（B7） | 领一个 run，agentd（UID 1001）在 stop/lease_lost 时对 worker（UID 1002）发 `SIGTERM`→`SIGKILL`；`docker exec fde-alice ps -o uid,pid,cmd` 确认 worker 已退出 | worker 进程被终止、退出码合理、无 `EPERM` 日志 | agentd 持 `CAP_KILL` + `PR_SET_KEEPCAPS` 生效（deploy §6.2 note；失败即 `EPERM` 需改同 UID/supervisor 模型） |
 
 ### 3.9 P1 对话验收的 LLM mock 网关（deploy §7.3）
 
