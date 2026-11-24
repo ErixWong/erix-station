@@ -16,6 +16,7 @@
 //
 // 后续要把其余 test:integration:* 接进来，只往 REQUIRED_LEGS 里加一条即可。
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 const HAS_PG = (process.env.TEST_DATABASE_URL || '').trim() !== '';
 
@@ -45,6 +46,30 @@ function parseTapSummary(text) {
     out[m[1]] = Number(m[2]);
   }
   return out;
+}
+
+/** 从一段 TAP 里挑出「红的那几条」+ 紧随其后的诊断行，供失败时打印（原来只打汇总，红了也看不出是哪条）。 */
+export function pickFailureLines(text, { maxLines = 40 } = {}) {
+  const lines = text.split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^not ok\s/.test(lines[i])) continue;
+    out.push(lines[i]);
+    // TAP 的细节（error/expected/actual/stack）缩进跟在后面，取到下一个非缩进行为止
+    for (let j = i + 1; j < lines.length && out.length < maxLines; j++) {
+      const l = lines[j];
+      if (!/^\s+\S/.test(l) || /^\s*$/.test(l)) break;
+      out.push(l);
+    }
+    if (out.length >= maxLines) break;
+  }
+  if (out.length === 0) {
+    // 全绿（有 TAP 但一条 not ok 都没有）⇒ 没什么可报的，别制造噪音。
+    // 只有「压根不像 TAP」（进程直接崩/连不上库）才退回尾部若干行，总比什么都不给强。
+    const looksLikeTap = /^(?:not )?ok\s+\d+\s+-/m.test(text) || /^#\s+tests\s+\d+\s*$/m.test(text);
+    return looksLikeTap ? [] : lines.filter((l) => l.trim() !== '').slice(-maxLines);
+  }
+  return out.slice(0, maxLines);
 }
 
 function runLeg(leg) {
@@ -91,6 +116,13 @@ function main() {
     console.log(`SKIP-GATE [${tag}] ${leg.id}  rc=${r.rc} pass=${t.pass} fail=${t.fail}` +
       ` skipped=${t.skipped} tests=${t.tests}`);
     for (const p of problems) console.log(`          ↳ ${p}`);
+    if (!ok) {
+      // 红的那几条子测试点名打出来：没有这一步，CI 上只能看到「fail=1」，
+      // 既定位不了、也分不清「真回归」和「偶发」（2026-11-24 实测踩过：同一 commit 一红一绿）。
+      const detail = pickFailureLines(`${r.stdout}\n${r.stderr}`);
+      console.log(`          ↳ 红的子测试（最多 40 行）：`);
+      for (const line of detail) console.log(`            ${line}`);
+    }
   }
 
   if (!green) {
@@ -101,4 +133,7 @@ function main() {
   return 0;
 }
 
-process.exit(main());
+// 只在「被直接执行」时跑主流程：被 import 时（单测要验 pickFailureLines）不许自己 exit。
+const invokedDirectly = process.argv[1]
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) process.exit(main());
