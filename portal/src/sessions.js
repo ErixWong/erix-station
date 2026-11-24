@@ -21,6 +21,7 @@ import { fetchUserTextTurns } from './session-text.js';
 // issue #596 片 A：手工改名的 system 从 `platform_prompts` 取（每次现读、无缓存 ⇒ 保存后下一次改名就生效）。
 import { resolveEffectiveTitlePrompt } from './platform-prompts.js';
 import { appendUserInputTurn } from './transcript-store.js';
+import { MAX_ROUND_BYTES } from './transcript-limits.js'; // issue #261123-20：保险丝拒绝文案要报真值（与写入口同一个常量）
 import { allocSeq } from './seq.js';
 // #322：本文件**不再直接调** `chatCompletion`（手工改名走 `./title-llm.js` 的唯一生成入口）；
 // 下面三个「一次对话请求」的通用件仍在此重新导出，只为既有调用方与文档口径不受影响。
@@ -840,6 +841,14 @@ export async function postMessage(pool, {
     } catch (err) {
       if (err instanceof TypeError) {
         throw new SessionError('validation_failed', err.message, { details: { field: 'content' } });
+      }
+      // issue #261123-20：唯一写入口的体积保险丝（transcript-store.js#appendRound）拒了预写
+      // ⇒ 维持 400 语义，**不许升格成 500**：业务闸 MAX_MESSAGE_CONTENT_LENGTH 正常时压得住，
+      // 本分支接的是闸被放宽/其它字段撑爆记录这类回归。
+      if (err?.code === 'transcript_record_too_large') {
+        throw new SessionError('validation_failed', `消息过长，存不下这一轮记录（上限 ${MAX_ROUND_BYTES} 字节）`, {
+          details: { field: 'content', max_bytes: MAX_ROUND_BYTES },
+        });
       }
       throw err;
     }
