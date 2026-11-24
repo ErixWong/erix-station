@@ -129,6 +129,8 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
   ⇒ 一次性探针要会话就登 `admin`；**别反复登 `eric`**：每登一次用户邮箱就多一封，而脚本永远读不到
   那枚码（放大链与修法见 #737 / #736）。
 - 要测第二因素：照 `portal/integration/wp2a-e2e.mjs:288` 自建带 TOTP 的种子账号走 step1+step2。
+- **脚本要调 API 就别登录**：管理员代签一枚 API 令牌，之后 `Authorization: Bearer` 直连
+  （三步 curl 配方 ⇒ `docs/api/portal.md` §2.13）。令牌路径**零邮件、零会话**（#736）。
 - 密码重置：用 portal 自身 `hashPassword`（scrypt 自描述格式）生成后更新 `users.password_hash`
   （`bootstrap-admin` 不能重置已存在账号）。
 

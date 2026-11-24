@@ -1038,8 +1038,10 @@ station-portal user enable  --login <login>
 **认证缝**（`Authorization: Bearer <明文>`）：
 - 只认 `Bearer` 一种 scheme，其他 ⇒ `401 unsupported_scheme`。
 - **cookie 与 Bearer 同时出现 ⇒ `400 ambiguous_credential`**（不猜客户端想哪个）。
-- **cookie 优先**：有 cookie 且能查到会话 ⇒ 走既有路径，**不发** `X-Auth-Method: api_token`；
-  cookie miss 才试 Bearer，命中则回 `X-Auth-Method: api_token`（响应头）。
+- **优先级只有一条**：cookie 与 Bearer **同现即拒**（上条 `ambiguous_credential`）。因此只存在两种形状：
+  只带 cookie ⇒ 走既有会话路径，**不发** `X-Auth-Method`；只带 `Authorization: Bearer` ⇒ 查令牌，
+  命中则回 `X-Auth-Method: api_token`（cookie 命中不发该头）。**不要把“cookie 优先”读成“两个都发拿 cookie”**——
+  那是 400，不是优先级。
 - token 认证的会话对象与 cookie 会话**同一个形状**（下游 handler 一行不改），仅多挂
   `viaToken: true` 供审计/日志区分；`session.id` 为 `null`（无 `login_sessions` 行）。
 - **受限会话门语义不变**：`must_change_password=true` 的账号拿 token 同样只开受限集合。
@@ -1057,7 +1059,10 @@ station-portal user enable  --login <login>
 - 非 admin ⇒ `403 insufficient_role`；目标用户不存在 ⇒ `404`。
 - **同账号名字唯一**（`UNIQUE (user_id, name)`，且吊销**不删行**所以同名也不释放）
   ⇒ 撞名 ⇒ `409 token_name_taken`（不冒 500）。
-- 限流：纳入现有请求限流，键 `auth-token-mint:user:<id>`，默认 10/小时；越界 ⇒ `429` + `Retry-After`。
+- 限流：单独一个计数器（键 `auth-token-mint:user:<id>`，默认 10/小时，只在**真签发成功**时计数，
+  撞名 409 / 校验失败不烧配额）；越界 ⇒ `429 rate_limited` + `Retry-After`。
+  旋钮在 `config.authTokenMintRateLimit`（env `AUTH_TOKEN_MINT_RATE_LIMIT_MAX` /
+  `_WINDOW_MS` / `_BLOCK_MS`，条目上限沿用共用的 `RATE_LIMIT_MAX_ENTRIES`）。
 - 成功 ⇒ `201 {id, name, scopes: [], created_at, token: "<明文，仅此一次>"}`。
 - 审计 `auth.token_created`，`details` 只 `{token_id, name, user}`（**不含 hash/明文**）。
 
@@ -1074,7 +1079,29 @@ station-portal user enable  --login <login>
 `findApiTokenUser` / `touchToken` / `listTokens` / `revokeToken`）；认证缝在 `http.js`
 的 `resolveSession` / `requireSession`；端点在 `http.js` `handleUserApiTokens`。
 **不加迁移**（`api_tokens` 在 baseline DDL 里）。测试：`portal/test/api-tokens.test.js`
-（15 格：工单 13 判据 + 登出配对 + 零邮件动机）+ 真库 SQL 对账（ROLLBACK）。
+（假库 15 格）+ `portal/test/api-tokens-db.test.js`（**真库腿 6 格**：`AND t.revoked_at IS NULL` /
+`last_used_at` 窗 / `ON CONFLICT` / 折出的 user 列面——假库按 SQL 文本裁决，这些它抓不到）。
+
+**最小用法（脚本/agent）**：
+
+```sh
+PW=$(cat ~/.config/mcp/creds/station-dev.password)
+# 1) 管理员登一次拿会话（admin 口令直通，不发邮件）
+curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -c /tmp/adm.jar -X POST \
+  https://admin.fde.erix.vip:9443/api/auth/login -H 'Content-Type: application/json' \
+  -H "Origin: https://admin.fde.erix.vip:9443" -d "{\"login\":\"admin\",\"password\":\"$PW\"}"
+# 2) 代目标 FDE 签一枚（明文只响应一次，自己存好）
+curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -b /tmp/adm.jar -X POST \
+  https://admin.fde.erix.vip:9443/api/admin/users/eric/tokens \
+  -H 'Content-Type: application/json' -H "Origin: https://admin.fde.erix.vip:9443" \
+  -d '{"name":"ci-probe"}'      # ⇒ {id, name, scopes:[], created_at, token:"st_…"}
+# 3) 用令牌调 API（不登录、不带 cookie、不发邮件）
+curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer st_…' \
+  https://admin.fde.erix.vip:9443/api/me   # ⇒ 200 + X-Auth-Method: api_token
+```
+
+> 令牌存哪：本机约定进 `~/.config/mcp/creds/`（600，不入库不提交）。丢了只能重签——
+> 库里只存 sha256，**没人能再看到它**（列表也不返 hash）。
 
 ---
 
