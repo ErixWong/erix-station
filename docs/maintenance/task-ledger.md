@@ -9852,3 +9852,40 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
 
 **残余**：`deploy/.env` 的 digest pin 与「换 FDE 镜像必须重建容器」是发布后动作（ci-release §2），
 本单未做。
+
+### 8.195 发版 v0.1.77 完成（2026-11-24 20:0x +08，主 agent；前置见 §8.194）
+
+**tag 与树**：`v0.1.77` → `c1cf963`（= 打 tag 时的 `origin/main`，PR #749 的 merge-commit）。
+`git rev-parse v0.1.77^{commit}` 与 `git rev-parse main` 当轮对账一致；打 tag 前 `git ls-remote --tags origin`
+现查 `v0.1.77` 未被占用（§7 那条「别人可能先打同号」的坑没踩到）。
+
+**打 tag 前那棵树上的 CI**（不是「大概绿」，是同一棵树的两条都绿）：
+
+- PR #749 门禁 run `45387772872` **success**（merge 前的同一份内容）；
+- `main` push run `45388586141`（head `c1cf963`）：质量门禁 **✓ 3m5s** + 镜像构建校验 **✓ 2m36s**。
+- 真机 e2e：用户当轮口径「都跑过了」⇒ 放行。e2e 故意不进 CI（`docs/ops/ci-release.md` §6），
+  **这条是用户口径，不是本 agent 亲验**，记明来源。
+
+**发布 run**：`release.yml` run **`45389514884`** ✓ success（3m6s，触发=tag push）。三镜像已推 GHCR：
+
+| 镜像 | 不可变 pin（= `deploy/.env` 要写的值） |
+|---|---|
+| `ghcr.io/erixwong/erix-station-portal` | `sha256:d511080b0a78d29780b45342871c3b5a7146b731a09df29fb6119f6b5b73d591` |
+| `ghcr.io/erixwong/erix-station-fde` | `sha256:a3be4287c88de838b40e42b1c70810d7a9824afc3609e7f423d78167fc8962ea` |
+| `ghcr.io/erixwong/erix-station-fde-proxy` | `sha256:2064623fab568f3d1ab11084bee75d819e16b56057c87f5f28fdebd997640c61` |
+
+**digest 清单在哪**：job summary + artifact `images-digest`（ID `14918481157`，`images-digest.json`）。
+**GitHub Release `v0.1.77` 不存在**（`gh release view` = `release not found`）——`tag push` 本来就不建 Release，
+`release.yml` 因此打印「跳过上传」并把清单留在 summary/artifact（`ci-release.md` §2 第 2 条写明了这三处来源，
+属预期不是失败）。要挂附件：`gh release create v0.1.77 --notes '…'` 后 `workflow_dispatch` 重跑。
+
+**发布后动作（本条未做，是下一单）**：
+
+1. `deploy/.env` 三行换成上面的不可变 pin（现值仍是旧 digest）；
+2. `docker compose up -d`；
+3. **必须重建 FDE 容器**——本次 `runner/worker.js` 有改动，5 个 `fde-*` 容器不换镜像不生效（§2 第 5 条）；
+4. **本次包含 `deploy/litellm/config.yaml` 改动**（`2f23848` / `50916ca`，#719）⇒ `up -d` 不会重启
+   `station-litellm`（bind mount），必须显式 `docker compose --profile litellm restart station-litellm`，
+   否则配置不生效且没有任何报错（§2 顶部 ⚠，2026-11-24 实测过）。
+5. 现场一条：本机 dev 栈的 `station-portal` 现在跑的是本地构建镜像 `erix-station/portal:local-736`，
+   不是 `deploy/.env` 里 pin 的 ghcr digest ⇒ 「部署了没有」不能只看容器 `Up`，要看容器实际镜像 ref。
