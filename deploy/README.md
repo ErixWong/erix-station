@@ -12,7 +12,7 @@ P1 walking skeleton 的本地开发栈：`station-db`（Postgres）+ `station-po
 | Traefik `web` | `127.0.0.1:8090` |
 | Traefik `websecure` | `127.0.0.1:8443` |
 | portal（宿主回环发布，容器内固定 8080） | `127.0.0.1:18080` |
-| `backend` 子网 | `172.32.0.0/24`（本机 172.30.0.0/16 被 otherproj 占用） |
+| `backend` 子网 | `172.32.0.0/24`（本机该网段已被其他容器占用） |
 
 本机 8080/443/5432 已被占用，故按 env §0 用上述开发期端口；换机器先 `ss -tlnp` 自查。
 

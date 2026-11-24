@@ -43,12 +43,12 @@ test('listDirs：枚举一级目录（字典序），cwd 相对形式 + 运行�
       },
     });
     const r = await listDirs(pool, { userId: 'u1', userSpaceRoot: root, fdeName: 'alice' });
-    assert.deepEqual(r.dirs.map((d) => d.name), ['llm-smoke', 'demo_app']);
-    const smoke = r.dirs[0];
+    assert.deepEqual(r.dirs.map((d) => d.name), ['demo_app', 'llm-smoke']);
+    const smoke = r.dirs[1];
     assert.equal(smoke.cwd, '~/projects/llm-smoke');
     assert.equal(smoke.running_count, 2);
     assert.equal(smoke.queued_count, 1);
-    assert.equal(r.dirs[1].running_count, 0, '无活跃 run 的目录徽标为 0');
+    assert.equal(r.dirs[0].running_count, 0, '无活跃 run 的目录徽标为 0');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

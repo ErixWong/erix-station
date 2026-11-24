@@ -582,11 +582,11 @@ test('#650 countContainers：FDE **只认 station.managed 标签**，名字前�
   assert.equal(c.fdeRunning, 1, 'paused 与 exited 都不算 running');
   assert.deepEqual(c.fdeNames, ['fde-bob', 'fde-eric', 'fde-old'],
     '名字集合给对账用（对账要的是**谁**）；前导 `/` 由 nameOf 剥掉');
-  // 真机反例：另一个项目的两个容器叫 `otherproj-db` / `otherproj-db-old-261107`，没有任何
+  // 真机反例：另一个项目的两个容器叫 `fde-otherproj-db` / `fde-otherproj-db-old-261107`，没有任何
   // station 标签，却被前缀规则算成 FDE ⇒ 面板显示「DB 6 台 ↔ Docker 8 台」并点名这两台。
   const collision = countContainers([
-    { Names: ['/otherproj-db'], State: 'running', Labels: {} },
-    { Names: ['/otherproj-db-old-261107'], State: 'exited', Labels: {} },
+    { Names: ['/fde-otherproj-db'], State: 'running', Labels: {} },
+    { Names: ['/fde-otherproj-db-old-261107'], State: 'exited', Labels: {} },
     { Names: ['/fde-eric'], State: 'running', Labels: { 'station.managed': 'true' } },
   ]);
   assert.equal(collision.fde, 1, '名字像 FDE 但没标签 ⇒ 不算（前缀是别人的命名空间，不是判据）');
