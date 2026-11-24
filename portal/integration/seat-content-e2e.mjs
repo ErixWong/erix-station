@@ -180,6 +180,46 @@ function adminGet(p, { params = {}, timeoutMs = 20_000 } = {}) {
   return fetchJson(u.toString(), { headers: { Cookie: probe.cookies.join('; ') }, timeoutMs });
 }
 
+/**
+ * 顺着 `next_cursor` 翻页找一个归档会话。
+ *
+ * 为什么不直接看 `it.status`：会话列表 DTO **不带 `status`**（`sessions.js`
+ * 的 `listSessions` SELECT 没选 `s.status`，产品行为，测试不改它），所以列表里
+ * 永远读不到 status（旧实现按 `it.status==='archived'` 找 ⇒ 永远命中不了 ⇒ 恒 skip）。
+ * 于是「是不是归档」只能用开关本身判：**归档 = 在 `include_archived=1` 名单里、
+ * 却不在 active 名单里**。两份名单都按 `next_cursor` 翻（各最多 `maxPages` 页），
+ * 纯内存求差（不新增依赖）。active 名单若没翻完（到顶了还有游标）则差集可能
+ * 假阳；dev 栈 active 量 < maxPages*limit ⇒ 能翻完。
+ * @returns {{id: string|null, archPages: number, scanned: number, activePages: number, activeCount: number, activeExhausted: boolean}}
+ */
+async function findArchived(adminGet, path, { maxPages = 3, limit = 100 } = {}) {
+  const active = new Set();
+  let activePages = 0;
+  let cursor = null;
+  let activeExhausted = false;
+  for (let p = 0; p < maxPages; p++) {
+    const r = await adminGet(path, { params: { limit, ...(cursor ? { cursor } : {}) } });
+    activePages++;
+    for (const it of r.json?.items ?? []) active.add(it.id);
+    cursor = r.json?.next_cursor ?? null;
+    if (!cursor) { activeExhausted = true; break; }
+  }
+  let archPages = 0;
+  let scanned = 0;
+  cursor = null;
+  for (let p = 0; p < maxPages; p++) {
+    const r = await adminGet(path, { params: { limit, include_archived: 1, ...(cursor ? { cursor } : {}) } });
+    archPages++;
+    const items = r.json?.items ?? [];
+    scanned += items.length;
+    const hit = items.find((it) => !active.has(it.id));
+    if (hit) return { id: hit.id, archPages, scanned, activePages, activeCount: active.size, activeExhausted };
+    cursor = r.json?.next_cursor ?? null;
+    if (!cursor) break;
+  }
+  return { id: null, archPages, scanned, activePages, activeCount: active.size, activeExhausted };
+}
+
 // ---------------------------------------------------------------------------
 // 探测：把「能不能登进去 + 两条腿的环境形状」在模块加载时各取一次；只读不断言。
 // reasons[leg] 有值 = 那条腿 skip（值是给人看的原因）；没有该 key = 那条腿要跑。
@@ -355,15 +395,22 @@ test('S8 路径红线：`path=../alice` ⇒ 400；`path=<dir>/.git` ⇒ 400（�
     }
   });
 
-test('S9 归档开关：archived 会话不带开关 404、`?include_archived=1` 200（拿不到 archived 会话 ⇒ skip）',
+test('S9 归档开关：archived 会话不带开关 404、`?include_archived=1` 200（翻 next_cursor 找；三页都无 ⇒ skip）',
   { skip: probe.reasons.http || false, timeout: 60_000 }, async (t) => {
     need(t, 'http', probe.cookies);
-    const list = await adminGet(`/api/admin/fdes/${FDE}/sessions`, { params: { limit: 50, include_archived: 1 } });
-    const arch = (list.json?.items ?? []).find((it) => it.status === 'archived');
-    if (!arch) { t.diagnostic(`SKIP (http)：${FDE} 名下 ${list.json?.items?.length ?? 0} 条里没有 archived 会话 ⇒ 没样本`); t.skip(); return; }
-    const off = await adminGet(`/api/admin/fdes/${FDE}/sessions/${arch.id}`);
+    const found = await findArchived(adminGet, `/api/admin/fdes/${FDE}/sessions`, { maxPages: 3, limit: 100 });
+    t.diagnostic(`归档探测：active 名单翻 ${found.activePages} 页=${found.activeCount} 条（${found.activeExhausted ? '已翻完' : '未翻完'}）；`
+      + `含归档名单翻 ${found.archPages} 页=${found.scanned} 条`);
+    if (!found.id) {
+      t.diagnostic(`SKIP (http)：三页翻了 ${found.scanned} 条仍未命中归档会话 ⇒ 没样本`
+        + `${found.activeExhausted ? '' : '（active 名单未翻完，差集不可靠）'}`);
+      t.skip();
+      return;
+    }
+    t.diagnostic(`命中归档会话 ${found.id.slice(0, 8)}…（含归档名单第 ${found.archPages} 页）`);
+    const off = await adminGet(`/api/admin/fdes/${FDE}/sessions/${found.id}`);
     assert.equal(off.status, 404, `archived 会话不带开关期望 404，得到 ${off.status}（归档可读性红线破了？）`);
-    const on = await adminGet(`/api/admin/fdes/${FDE}/sessions/${arch.id}`, { params: { include_archived: 1 } });
+    const on = await adminGet(`/api/admin/fdes/${FDE}/sessions/${found.id}`, { params: { include_archived: 1 } });
     assert.equal(on.status, 200, `archived 会话带 ?include_archived=1 期望 200，得到 ${on.status}`);
     assert.ok(on.json?.session, `开关打开却没回 session 块（body=${on.text.slice(0, 200)}）`);
   });
