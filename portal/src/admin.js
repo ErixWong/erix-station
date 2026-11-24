@@ -95,7 +95,7 @@ export function validatePassword(password, limits = {}, { field = 'password' } =
   }
 }
 
-function recordAdminAudit(pool, actorId, action, target, details = {}) {
+export function recordAdminAudit(pool, actorId, action, target, details = {}) {
   return pool.query(
     `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, $2, $3, $4)`,
     [actorId, action, target, JSON.stringify(details)],
