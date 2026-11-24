@@ -32,41 +32,43 @@ import path from 'node:path';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+// ⚠ 片段拼接：**禁止词本身也不许以明文写进本文件**——闸要是把要拦的东西抄一遍，它自己就成了
+//   新的泄露源（261124 历史重写把明文 DENY 词一起改写了，闸当场失明；修法就是把词拆成片段）。
+//   拼接发生在运行时，扫描面（*.md + .env.example + js/ts/vue 注释行）看不到 .mjs，故不会自伤。
+const j = (...parts) => parts.join('');
+
 // DENY_INFRA：命中即机器坐标 / 本机 quirk。受 EXEMPT 豁免。
 const DENY_INFRA = [
-  'dns.internal',
-  'proxy.internal',
-  '10.41.24.146',
-  'tailnet-host',
+  j('10.56.', '16.16'), // 内网 DNS
+  j('172.20.', '0.35'), // 出口代理
+  j('100.100.', '0.3'), // tailnet
+  j('10.41.', '24.146'), // 旧代理
   '192.168.',
   '100.64.0.0/10',
-  '~/.config/creds',
-  'sg docker',
-  'gitea.internal',
-  '.example.vip',
-  'llm-gateway.internal',
-  'nginx_reverse_proxy',
-  'gitea_act_runner',
-  'station-dev-password-file',
+  j('~/.config/', 'mcp/creds'),
+  j('sg', ' docker'),
+  j('git.', 'erix.vip'),
+  j('api.ai.', 'erix.vip'),
+  j('.inteva', '.vip'),
+  j('nginx_', 'reverse_proxy'),
+  j('gitea_', 'act_runner'),
+  j('station-dev', '.password'),
 ];
 
 // DENY_IDENTITY：命中即「认得出是谁」。永不被 EXEMPT 豁免。
 const DENY_IDENTITY = [
-  'example-org',
-  'example.vip',
-  'hp.example-org',
-  'devuser',
-  '/home/devuser',
-  '/home/devuser',
-  'ewang2',
-  'git-agent@example.com',
-  '@erix.vip',
-  'demo-project',
-  'otherproj',
-  'demo_app',
-  'user/proj',
-  'otherproj',
-  'Alice Demo',
+  j('inteva', 'products'),
+  j('ewang', '2'),
+  j('ghpat', '@erix.vip'),
+  j('@erix', '.vip'),
+  j('admin', 'wange'),
+  j('/home/', 'eric'), // 宿主用户名；/home/erix 是产品容器内用户名，不拦
+  j('lingo', 'lens'),
+  j('voice', 'print'),
+  j('meeting', '_asr'),
+  j('eric', '/cmms'),
+  j('fde-', 'workshop'),
+  j('Alice', ' Wong'),
 ];
 
 // EXEMPT：运维交接 / 历史取证账，允许保留**机器坐标**（DENY_INFRA）；对身份（DENY_IDENTITY）无效。

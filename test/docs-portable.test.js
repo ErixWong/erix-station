@@ -51,30 +51,32 @@ test('真仓库跑 check:doc-portable exit 0', () => {
 });
 
 // ② 夹具里塞一行含某机器坐标（DENY_INFRA 词）的 md → 必须 exit≠0 且输出带该 file:line
+//    ⚠ 夹具里的坐标也用**片段拼接**：本文件本身在仓库里，不留明文（下同）
 test('夹具：含机器坐标的 md 被拦，且报出 file:line', () => {
+  const proxy = ['172.20.', '0.35'].join('');
   const { rc, out } = fixture((dir) => {
     writeFileSync(path.join(dir, 'ok.md'), '# ok\n\n这行干净：只有伞域名与端口号 8090。\n');
-    writeFileSync(path.join(dir, 'dirty.md'), '# t\n\n本机坐标 proxy.internal 出口代理。\n');
+    writeFileSync(path.join(dir, 'dirty.md'), `# t\n\n本机坐标 ${proxy} 出口代理。\n`);
   });
   assert.notEqual(rc, 0, 'DENY 词还在却 exit 0 = 闸失效');
-  assert.match(out, /dirty\.md:3: 172\.20\.0\.35/, `输出未点名脏文件的 file:line，实得:\n${out}`);
+  assert.ok(out.includes(`dirty.md:3: ${proxy}`), `输出未点名脏文件的 file:line，实得:\n${out}`);
   assert.doesNotMatch(out, /ok\.md:/, '干净文件不该被点名');
 });
 
 // ③ 身份级 DENY_IDENTITY 永不被 EXEMPT 豁免：把含真实邮箱域的行写进一条 EXEMPT 路径，
 //    必须 exit≠0 且点名该 file:line——证明历史账能留坐标、却不能留身份（本轮补上的那一层）。
 test('夹具：身份词写进 EXEMPT 路径仍被拦，且报出 file:line', () => {
+  const org = ['inteva', 'products'].join('');
   const { rc, out } = fixture((dir) => {
     mkdirSync(path.join(dir, 'docs', 'maintenance'), { recursive: true });
     writeFileSync(
       path.join(dir, 'docs', 'maintenance', 'task-ledger.md'),
-      '# 台账\n\n上游中转组织 example-org 的额度全局耗尽。\n',
+      `# 台账\n\n上游中转组织 ${org} 的额度全局耗尽。\n`,
     );
   });
   assert.notEqual(rc, 0, '身份词还在 EXEMPT 文件里却 exit 0 = EXEMPT 越界豁免了身份');
-  assert.match(
-    out,
-    /docs\/maintenance\/task-ledger\.md:3: example-org/,
+  assert.ok(
+    out.includes(`docs/maintenance/task-ledger.md:3: ${org}`),
     `输出未点名 EXEMPT 文件里的身份 file:line，实得:\n${out}`,
   );
 });
