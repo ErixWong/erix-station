@@ -9812,3 +9812,43 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
   发布件的 digest 引用，裸跑 `docker compose build station-portal` 直接 `refusing to create a tag with a
   digest reference` —— 已在 `docs/testing.md` §1.3.2 写明要用本地 tag 覆盖；③ 与本单无关的 CI 噪声记录：本 PR 之前该仓 CI 出现过一次 `#727-5b` `500 !== 200`
   （已由 **#745** 修）与两次 20 分钟取消（`concurrency` 挤兑，重跑即绿：`#741` 重跑后 3m14s pass）。
+
+### 8.194 发版切号 0.1.76 → 0.1.77（2026-11-24，主 agent，工单 `chore-261124-29-bump-0.1.77`）
+
+**为什么现在切号**：`v0.1.76`（2026-11-18）之后 main 已合 **45 个 PR / 212 提交**没发出去，而三份
+`package.json` 还写着 `0.1.76`。`release.yml` 步骤① 是硬门（`tag` 去掉 `v` 必须等于
+`package.json.version`）⇒ 直接打 `v0.1.77` 必被拦；打 `v0.1.76` 不可能——那个 tag 已存在且指向
+11-18 那棵树（镜像不可变，**移动 tag = 造假**，ci-release §7）。所以顺序只能是
+「切号 PR 合进 main → 在那个 main 提交上打 tag → 推 tag」。
+
+**前置现验**（发版当轮跑的，没抄 ci-release §7 里写过的数）：
+
+| 项 | 读数 |
+|---|---|
+| `origin/main` tip | `d9059c8`，push CI run `45380667636` **success** |
+| 在飞的 PR | `gh pr list --state open` = 空 ⇒ 满足 §7「别在还有 PR 在飞时打 tag」 |
+| 目标 tag | `git ls-remote --tags origin` 最新是 `v0.1.76`，**`v0.1.77` 未被占用** |
+| 引擎 pin | `erix-agent 0.33.0`，`package.json` 与 `runner/package.json` **两处同步**；自 `v0.1.76` 起未变（`git show v0.1.76:package.json` 对账） |
+| 全量单测（最终树） | **3253 tests / 0 fail / rc=0**（`npm ci --prefer-offline` 重装后；见下方「现场」） |
+| 真机 e2e | 用户当轮口径「都跑过了」⇒ 本次按此放行。**e2e 故意不进 CI**（§6），本条不替它背书 |
+
+**现场一条（值得记）**：合并 #744 后我在 main 上复跑 `npm test` 得 **1409 tests / 115 fail**，
+满屏 `ERR_MODULE_NOT_FOUND: Cannot find package 'erix-agent'`——`package-lock.json` 里写着
+`node_modules/erix-agent 0.33.0`，而本地树的 `node_modules` 里没有它（#743 在 18:19 改了依赖面）。
+`npm ci --prefer-offline` 一次就全绿。**这正是刚从热层搬走的那条判据**（`AGENTS.md` §4
+「验收 / 发版前先重装依赖再复跑拿基线」，细节在 `docs/testing.md` §1.3.1）第一次真挡住一次假红。
+
+**本次发版包含什么**（`v0.1.76..origin/main`，45 PR，节选）：管理台运行时设置面
+（#700/#701/#704/#706/#709/#710）、FDE 周期额度（#722/#731）、工位内容只读浏览（#729/#735/#743）、
+预览牢笼 TOCTOU 与文件流 fd 单一关闭者（#733/#739/#745）、登录口令步发信幂等（#742）、
+`MAX_BODY_BYTES`（#724）、`transcript_rounds` 体积保险丝（#730）、idle backoff（#715）、
+env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md` 热层清退（#744）。
+
+**切号动作**（一次改齐三处，别只改一个）：`package.json` / `runner/package.json` /
+`portal/frontend/package.json` 全部 `0.1.76 → 0.1.77`。硬门只拦第一处；runner 与宿主引擎同源，
+前端是展示面（版本面另有 e2e 腿 `npm run test:integration:version`）。
+
+**tag / release run / 三镜像 digest 不在本条里**：发布完成后另开一条记，**不预写还没发生的事**。
+
+**残余**：`deploy/.env` 的 digest pin 与「换 FDE 镜像必须重建容器」是发布后动作（ci-release §2），
+本单未做。
