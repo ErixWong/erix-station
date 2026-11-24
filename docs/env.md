@@ -240,8 +240,21 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | 凭据目录 | `~/.config/mcp/creds/`（600，含 gitea、portainer、mssql 等凭据） |
 | docker 组会话 | 该机上 agent 的旧会话不在 `docker` 组，docker 命令需 `sg docker -c '<cmd>'` 绕过 |
 | 数据目录约定 | 全机统一 `/docker/<名称>/`；FDE 用户空间 `/srv/erix/users/<fde>/` |
+| 本机访问 GitHub | 内网 DNS 与代理处理见下方 §8.1.1 |
 
 容量评估（以参考实例 A 为例）：容器成本不是约束（规格 §1）；FDE 容器模板含 chromium（≈1 GB/容器，规格 §12.4），275 G 可用磁盘对 P1~P3 规模（个位数 FDE）充裕。
+
+### 8.1.1 本机访问 GitHub（实测事实，仅参考实例 A）
+
+- 内网 DNS（`10.56.16.16`）会把 `github.com` 钉到半死不活的地址：TCP 连得上、TLS 握得手、
+  HTTP 不回话，**且是间歇性的**。
+- 261110 现验：本机 `git config --global --get-regexp '^http\.'` 只有 `http.https://git.erix.vip/.proxy`，
+  **`github.com` 那条根本没配** ⇒ 直连 `direct=000` 超时，显式代理 1.1s 通。
+- 不通时显式带：`git -c http.proxy=http://172.20.0.35:19001 -c https.proxy=http://172.20.0.35:19001 push origin <ref>`；
+  **`gh` 不读 git 配置**，得自己带 `HTTPS_PROXY=… gh …`。
+- **别在全局 env 设 `HTTP(S)_PROXY`**：把本来就通的链代理掉是负收益（曾因此把
+  `api.ai.erix.vip` 的中转请求代理到卡死）。容器内的 `127.0.0.1` 不是宿主，也不继承本机代理。
+- 别改 `/etc/hosts`（无 sudo）。**policy（先验什么、什么时候加代理）见全局 `~/projects/AGENTS.md` §3.7**。
 
 ### 8.2 端口占用实况（仅参考实例 A；目标环境需按 §9 重新核实）
 

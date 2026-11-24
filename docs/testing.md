@@ -82,6 +82,54 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 | 已拉镜像 | `postgres:16`、`traefik:v3`、`traefik/whoami:latest`、`nginx:alpine`、`curlimages/curl`、`alpine`、`mcr.microsoft.com/playwright/mcp` | 本机实测 `docker images`（`curlimages/curl` / `alpine` 供 §2.2.3/§3.1 的隔离/连通用例，使用前先 pull，见 §2.2.3） |
 | 宿主已占用端口 | 80/443（nginx_reverse_proxy）、8080（gitea_act_runner）、5432、9000（portainer）、3000（gitea）、1433（mssql）——开发期入口用 env §0 的 8443/8090 | 本机实测 `ss -tlnp` / `docker ps` |
 
+### 1.3.1 本机测试环境的坑（实测；261124 自 `AGENTS.md` 热层搬入）
+
+> 热层只留判据（`AGENTS.md` §4）；成因、版本号与实测数在本节。共同特征：**不报错，但结论是假的**。
+
+- **`npx vitest run <文件>` / `npx vue-tsc` 在本机永久挂死** —— 既不像成功也不像失败，一直占着会话；
+  而项目脚本本身 3.4 秒跑完 21 条。口径：`cd portal/frontend && timeout 240 npm test -- src/xxx.spec.ts`
+  （`test` 脚本已是 `vitest run`，`--` 后直接跟文件）+ `npm run typecheck`。
+  **工单里写测试命令一律带 `timeout 240`。**
+- **vitest 打印全绿而进程 rc=1** —— 有未捕获拒绝时摘要照打（实测出现过
+  `Test Files 33 passed (33) / Tests 488 passed (488)` 而退出码非 0）⇒ grep 摘要行必然误判。
+  成因常见于 `onMounted` 里 `await` 一个会失败的请求且没 catch（Vue 不等 `onMounted` 返回的 Promise）；
+  产品实例 issue #281。
+- **`NODE_ENV=production` 让前端测试假红** —— `@vue/test-utils@2.5.1` 的 `emitted()` 靠 Vue devtools
+  hook 捕获事件，生产构建不发 devtools 事件 ⇒ `w.emitted()` 恒空。同一台机器同一份未改代码实测：
+  未设 18/18 绿、`production` 3 红（`GitLightBadge.spec.ts`）、`NODE_ENV=test` 18/18 绿。
+  新用例别用 `w.emitted()`，改用 DOM / 请求桩断言（该形态有机闸 `test/repo-hygiene.test.js`，
+  不靠这句话拦）。
+- **worktree 里测试跑不起来** —— `git worktree` 不含未跟踪的 `node_modules`。历史上 `node_modules`
+  曾被当文件提交过（mode 120000 符号链接指向绝对路径；`.gitignore` 写的是 `node_modules/`，
+  **带斜杠只匹配目录**），一棵树被十几个 worktree 共享 ⇒ 任何一处 `npm install` 顺链接剪别处的依赖。
+  形态已由 #396（`679519a`）消除，判据 `test/repo-hygiene.test.js`（H1 跟踪必须为空，并带「删规则
+  必须看得见」的反向自证）。补装极便宜：`npm ci --offline` ~0.5s / `npm ci --prefer-offline` ~1.4s。
+  ⇒ 派单红线是「不改依赖版本、不提交 lockfile 变动」，**不是**「禁止安装依赖」。
+- **项数莫名从 1022 掉到 510 + 34 失败而代码没回归** —— 依赖不完整的树（`node_modules/erix-agent`
+  不存在）被当验收基点。旧 worktree 遗留的链接现在是未跟踪文件：`ls -ld node_modules` 看出形态后
+  `rm` 掉再装。**验收 / 发版前先重装一次并复跑拿到基线数。**
+- **前端 devDependencies 装不上** —— 本机 `NODE_ENV=production` 会跳过 dev 依赖安装，
+  需 `NODE_ENV=development npm install`（装完跑测试时别再设 production）。
+
+### 1.3.2 dev 栈登录事实与探针口径（261124 自热层搬入；仅本地 dev 环境，勿用于生产）
+
+- 入口 `http://station.fde.erix.vip:8090/`（伞域泛解析，#57 阶段2；Traefik 只认
+  `station.fde.erix.vip` / `100.100.0.3`，旧的 `hp.inteva.vip:8090` 已随 Host 路由切换失效）。
+  deploy 栈 `station-portal`；代码更新后 `docker compose build station-portal && docker compose up -d station-portal`
+  生效。本机解析器负缓存解析不出时，可用 playwright 容器 `erix_station_playwright`（:8935，
+  resolver MAP 规则）或临时 hosts 条目兑底。
+- 账号 `admin`（`role=admin` → 管理台）与 `eric`（`fde:eric` → 工作台）**共用同一口令**；明文不入库
+  不外传：`~/.config/mcp/creds/station-dev.password`（600，轮换直接改该文件 + 跑密码重置流程）。
+  登录体字段是 `login` 不是 `username`。
+- **两个账号的第二因素不一样**（261124 现验 `users`）：`admin` 口令直通（一步就发会话 cookie）；
+  `eric` 有 `totp_secret` 但 `totp_login_enabled=false` + `mail_otp_enabled=true` ⇒ 走邮箱验证码：
+  **口令步只回 `pending_token`、不发 cookie，并当场寄一封真邮件**（码明文只在邮箱里，库里只有 sha256）。
+  ⇒ 一次性探针要会话就登 `admin`；**别反复登 `eric`**：每登一次用户邮箱就多一封，而脚本永远读不到
+  那枚码（放大链与修法见 #737 / #736）。
+- 要测第二因素：照 `portal/integration/wp2a-e2e.mjs:288` 自建带 TOTP 的种子账号走 step1+step2。
+- 密码重置：用 portal 自身 `hashPassword`（scrypt 自描述格式）生成后更新 `users.password_hash`
+  （`bootstrap-admin` 不能重置已存在账号）。
+
 ### 1.4 阶段可执行验收清单（P1 / P2 / P3）
 
 > 分期口径 = 规格 §15 + deploy §7（P1 范围声明）。每条给「命令 + 期望输出 + 判定标准」；命令只列验收动作，契约细节引用 §3 对应小节，**不在此重复定义**。
