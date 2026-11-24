@@ -256,7 +256,7 @@ function parseCsrfRequestAuthority(forwardedHostHeader, hostHeader, scheme) {
  *
  * 为什么需要：session cookie 是 host-only 会话 cookie + `SameSite=Lax`（portal.md §2.5），Lax 只挡
  * 「跨站带 cookie」这一半；而本部署 portal 在 Traefik 后面、入口多个（`station.fde.erix.vip` 与
- * `tailnet-host`），cookie 本身不区分发起方。这里加一道**不依赖配置项**（同源基线从请求自己的
+ * `<宿主 tailnet IP>`），cookie 本身不区分发起方。这里加一道**不依赖配置项**（同源基线从请求自己的
  * Host 派生，天然支持多入口）的服务端防线，并把拒绝写审计（可观测）。
  *
  * 判据（按顺序，任一命中即定论）：
@@ -273,7 +273,7 @@ function parseCsrfRequestAuthority(forwardedHostHeader, hostHeader, scheme) {
  * 应用去 POST portal API），所以 `same-site` 必须落到判据 c 的 Origin authority 精确比对（同注册域但不同 origin
  * ⇒ 不等 ⇒ 拒 `origin_mismatch`）。`same-site` 且 Origin 缺失 ⇒ 落 d 放行（与既有口径一致，不新造严格性）。
  *
- * **只比 authority、不比 scheme**（契约点）：本部署处在 http（dev `:8090` / `tailnet-host:8090`）与
+ * **只比 authority、不比 scheme**（契约点）：本部署处在 http（dev `:8090` / `<宿主 tailnet IP>:8090`）与
  * https 共存的过渡期，portal 又常在边缘卸载 TLS，`X-Forwarded-Proto` 与 Origin 的 scheme 不总是同形；
  * 拿 scheme 参战会把「同一个站点上的 http/https 两面」误杀成跨站。CSRF 要防的是**别的站点**
  * 带本站点 cookie 发写请求（同站不同 scheme 不构成这个威胁），故 scheme 只用于默认端口归一化。
