@@ -323,7 +323,7 @@ migrate 那 17.8s 内，prompts 腿 0 次建库只建 schema）。再加 `postgr
    就是 INSERT 23514，那支派生段从来没能真的被分配（#270 正文）。护栏还断言一堆隔离栈专属 env
    （容器名、端口、`FDE_DEV_MODE=1`（tag 形态 FDE 镜像必需，#227.1）、`STATION_DB_DIR` 必须在临时目录且
    **不存在**）；GitHub runner 上没有这套网络前提。
-3. 需要**泛域名解析 + Tailscale**（`*.fde.erix.vip` → `100.100.0.3`）与宿主 Traefik host 网络。
+3. 需要**泛域名解析 + Tailscale**（`*.fde.erix.vip` → 宿主 tailnet IP，取值见冷层 `~/projects/docs/station-dev-machine.md`）与宿主 Traefik host 网络。
 4. 分钟成本：一条 e2e 链路跑下来在 CI 里要占十几分钟，Free 额度撑不住（§4）。
 
 **口径**：e2e 由**主 agent 在部署机上、本机隔离栈**跑（`wp2a` / `wp3a` / `wp3b` / `wp5` / `wp6`），**部署前**执行；

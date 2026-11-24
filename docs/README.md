@@ -159,7 +159,7 @@
 
 ### D7. `docs/design/discussion-archive.md` —— 讨论过程归档（低优先，可选）
 
-**为什么**：六轮讨论的完整过程目前只在 [erix-llm-kit#24](https://git.erix.vip/eric/erix-llm-kit/issues/24)（内网）。`principles.md` 已覆盖其中的**结论与取舍**，本文只补**过程**。
+**为什么**：六轮讨论的完整过程目前只在 内网 Gitea issue #24（主机名见冷层 `~/projects/docs/station-dev-machine.md`）。`principles.md` 已覆盖其中的**结论与取舍**，本文只补**过程**。
 
 **必须包含**：讨论的演进路径（每个问题是怎么被提出和收敛的）、各轮中被放弃的中间方案。
 
