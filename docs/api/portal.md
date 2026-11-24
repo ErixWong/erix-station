@@ -55,6 +55,9 @@
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-enroll` | 补绑/重绑 TOTP；新种子只在本次响应下发并强制重新登录 |
+| 管理 | `POST /api/admin/users/:login/tokens` | **签发 API 令牌**（#736，§2.13）：代 FDE 签，`{name, scopes?}`⇒`201`，明文**仅此一次**；非 admin⇒`403 insufficient_role`，重名⇒`409 token_name_taken`，非空 scopes⇒`400 scopes_unsupported` |
+| 管理 | `GET /api/admin/users/:login/tokens` | **列出令牌**（#736，§2.13）：`{tokens:[{id,name,scopes,created_at,last_used_at,revoked_at}]}`，**不返 hash**，含已吊销，按创建时间升序 |
+| 管理 | `DELETE /api/admin/users/:login/tokens/:id` | **吊销令牌**（#736，§2.13）：幂等 `{status:"revoked", already_revoked}`；跨账号/查无⇒`404` |
 | 管理 | `GET /api/admin/mail/settings` | **邮件通道配置：读**（#449，§4.12）。**永不返回口令**：只给 `hasPassword` 布尔；无行（未配置）也回 `200` + 默认 DTO |
 | 管理 | `PUT /api/admin/mail/settings` | **邮件通道配置：写**（#449，§4.12）。口令**只写**：键缺席 = 不修改、`null`/`""` = 清除；落库后缓存**立刻**失效（不等 60s TTL） |
 | 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
@@ -188,6 +191,12 @@
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
 | 503 | `email_send_failed`（#449）| **验证码邮件没发出去**（SMTP 超时/拒绝/未配置口令解不开等，`details` 不带正文）。`retryable: true`：**`pending_token` 不作废**，用户点「重发」（§2.3b）即可，不必重输口令。**管理台测试发信（§4.12）用同一个码但回 `502`**：那是管理员手点的一次探活请求，没有「待决登录」可保留，`details` 只有 `{reason}` 摘要 | 是 |
+| 400 | `ambiguous_credential`（#736，§2.13）| 同一请求 **cookie 与 `Authorization: Bearer` 同时出现**（不猜客户端想用哪个）。`retryable: false`：去掉其中一个再发 | 否 |
+| 400 | `scopes_unsupported`（#736，§2.13）| 签发时给了**非空 `scopes`**（本期 scopes 只支持空数组，不留死列）；传 `[]` 或不传都合法 | 否 |
+| 400 | `logout_not_applicable_for_tokens`（#736，§2.13）| `POST /api/auth/logout` 带了 Bearer：令牌**只能被吊销，不能登出**；`message` 指到吊销端点 | 否 |
+| 401 | `unsupported_scheme`（#736，§2.13）| `Authorization` 头的 scheme **不是 `Bearer`**（只认 Bearer 一种）。与 `unauthorized`（无凭证/令牌未知）区分 | 否 |
+| 403 | `insufficient_role`（#736，§2.13）| **已认证但角色不够**（API 令牌只有 admin 能签，代 FDE）。与 `forbidden` 区分：本码专指角色等级不够 | 否 |
+| 409 | `token_name_taken`（#736，§2.13）| 同账号内令牌**重名**（`UNIQUE (user_id, name)`）；**吊销不删行**所以同名也不释放。`details` 不含 hash/明文 | 否 |
 | 500 | `internal` | 未分类服务端错误 | 否 |
 
 > 资源归属一律以「当前登录用户」过滤：**越权访问与他人资源一律表现为 404**（`not_found`），只有「本人资源上的越级操作」（如普通 FDE 开 `public` 端口）才返回 403。
@@ -1008,6 +1017,91 @@ station-portal user enable  --login <login>
 **客户端口径（前端 `stores/site.ts` + `lib/hostGate.ts`）**：拿不到（网络 / 5xx / 超时 / 缺字段）⇒ **fail-open，不跳**（跳错方向比不跳更糟：管理台不可达时会把用户踢到死地址）；失败后缓存 30s 再重试，并发导航只发一次请求（单飞）。判据与落点见 `portal/frontend/src/lib/hostGate.ts`（纯函数，六行矩阵逐条单测）。
 
 ---
+
+---
+
+### 2.13 API 令牌（#736：脚本 / agent 不再走登录、不再寄邮件）
+
+长期 runner、脚本、agent 要调 portal API，以前只能「登录换会话 cookie」；开了邮箱
+验证码的账号每次口令步都寄一封真邮件且永远拿不到会话。`api_tokens` 表早已存在（DDL
+`docs/data/schema.sql:128`）但代码里零 INSERT——本节就是补这块，不是新发明。
+
+**设计口径（已拍板）**：
+- **签发权**：只有 admin 能签（代 FDE）；本期**不做**自助签发。
+- **不设过期**：表里没有 `expires_at`（本期不加列），靠吊销。
+- **`scopes` 本期只支持空数组**：请求体给了非空 `scopes` ⇒ `400 scopes_unsupported`（不留死列）。
+- **明文** = `st_` + base64url(32 字节随机)（约 45 字符）；库里只存 `sha256(明文)` 的 hex
+  （与会话 `token_hash` 同口径，`portal/src/auth.js`）；明文**只在签发响应里出现一次**。
+- **令牌 id 是 uuid**（baseline 既定，与全局 §3.4「字符串前缀主键」口径不一致，因该表早于该约定）；
+  **无 `created_by` 列**（「谁签的」只记在审计里）。
+
+**认证缝**（`Authorization: Bearer <明文>`）：
+- 只认 `Bearer` 一种 scheme，其他 ⇒ `401 unsupported_scheme`。
+- **cookie 与 Bearer 同时出现 ⇒ `400 ambiguous_credential`**（不猜客户端想哪个）。
+- **优先级只有一条**：cookie 与 Bearer **同现即拒**（上条 `ambiguous_credential`）。因此只存在两种形状：
+  只带 cookie ⇒ 走既有会话路径，**不发** `X-Auth-Method`；只带 `Authorization: Bearer` ⇒ 查令牌，
+  命中则回 `X-Auth-Method: api_token`（cookie 命中不发该头）。**不要把“cookie 优先”读成“两个都发拿 cookie”**——
+  那是 400，不是优先级。
+- token 认证的会话对象与 cookie 会话**同一个形状**（下游 handler 一行不改），仅多挂
+  `viaToken: true` 供审计/日志区分；`session.id` 为 `null`（无 `login_sessions` 行）。
+- **受限会话门语义不变**：`must_change_password=true` 的账号拿 token 同样只开受限集合。
+- **`last_used_at` 节流**：只在 `last_used_at IS NULL OR last_used_at < now() - interval '5 minutes'`
+  时用**一条条件 UPDATE** 写（不先读再写）。
+- **token 请求一律不发 `Set-Cookie`**（含会话续期那几处）。
+- `POST /api/auth/logout` 带 Bearer ⇒ `400 logout_not_applicable_for_tokens`（令牌只能被吊销）。
+- CSRF/Origin 闸不改逻辑：Bearer 请求不带 cookie ⇒ 不构成 CSRF 面（无 Origin 的 curl 照旧放行）。
+
+**端点**（均走 `requireSession`，目标用户按 `login` 解析）：
+
+#### 2.13.1 `POST /api/admin/users/:login/tokens`（签发）
+- 体 `{name, scopes?}`：`name` 必填、trim 后 1..40 字符（否则 `400 validation_failed`）；
+  `scopes` 缺席或 `[]` 合法，非空 ⇒ `400 scopes_unsupported`。
+- 非 admin ⇒ `403 insufficient_role`；目标用户不存在 ⇒ `404`。
+- **同账号名字唯一**（`UNIQUE (user_id, name)`，且吊销**不删行**所以同名也不释放）
+  ⇒ 撞名 ⇒ `409 token_name_taken`（不冒 500）。
+- 限流：单独一个计数器（键 `auth-token-mint:user:<id>`，默认 10/小时，只在**真签发成功**时计数，
+  撞名 409 / 校验失败不烧配额）；越界 ⇒ `429 rate_limited` + `Retry-After`。
+  旋钮在 `config.authTokenMintRateLimit`（env `AUTH_TOKEN_MINT_RATE_LIMIT_MAX` /
+  `_WINDOW_MS` / `_BLOCK_MS`，条目上限沿用共用的 `RATE_LIMIT_MAX_ENTRIES`）。
+- 成功 ⇒ `201 {id, name, scopes: [], created_at, token: "<明文，仅此一次>"}`。
+- 审计 `auth.token_created`，`details` 只 `{token_id, name, user}`（**不含 hash/明文**）。
+
+#### 2.13.2 `GET /api/admin/users/:login/tokens`（列表）
+- ⇒ `200 {tokens:[{id, name, scopes, created_at, last_used_at, revoked_at}]}`（**不返 hash**；
+  含已吊销，按创建时间升序）。**不审计**。
+
+#### 2.13.3 `DELETE /api/admin/users/:login/tokens/:id`（吊销）
+- 幂等：重复吊销返 `200 {status: "revoked", already_revoked: <bool>}`（第二次 `true`）。
+- 按 user 维度过滤：跨账号/查无该账号下这个令牌 ⇒ `404`（防横向吊销）。
+- 真吊销时审计 `auth.token_revoked`，`details` 同 2.13.1。
+
+**实现**：业务在 `portal/src/api-tokens.js`（`mintToken` / `findActiveByToken` /
+`findApiTokenUser` / `touchToken` / `listTokens` / `revokeToken`）；认证缝在 `http.js`
+的 `resolveSession` / `requireSession`；端点在 `http.js` `handleUserApiTokens`。
+**不加迁移**（`api_tokens` 在 baseline DDL 里）。测试：`portal/test/api-tokens.test.js`
+（假库 15 格）+ `portal/test/api-tokens-db.test.js`（**真库腿 6 格**：`AND t.revoked_at IS NULL` /
+`last_used_at` 窗 / `ON CONFLICT` / 折出的 user 列面——假库按 SQL 文本裁决，这些它抓不到）。
+
+**最小用法（脚本/agent）**：
+
+```sh
+PW=$(cat ~/.config/creds/station-dev-password-file)
+# 1) 管理员登一次拿会话（admin 口令直通，不发邮件）
+curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -c /tmp/adm.jar -X POST \
+  https://admin.fde.erix.vip:9443/api/auth/login -H 'Content-Type: application/json' \
+  -H "Origin: https://admin.fde.erix.vip:9443" -d "{\"login\":\"admin\",\"password\":\"$PW\"}"
+# 2) 代目标 FDE 签一枚（明文只响应一次，自己存好）
+curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -b /tmp/adm.jar -X POST \
+  https://admin.fde.erix.vip:9443/api/admin/users/eric/tokens \
+  -H 'Content-Type: application/json' -H "Origin: https://admin.fde.erix.vip:9443" \
+  -d '{"name":"ci-probe"}'      # ⇒ {id, name, scopes:[], created_at, token:"st_…"}
+# 3) 用令牌调 API（不登录、不带 cookie、不发邮件）
+curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer st_…' \
+  https://admin.fde.erix.vip:9443/api/me   # ⇒ 200 + X-Auth-Method: api_token
+```
+
+> 令牌存哪：本机约定进 `~/.config/creds/`（600，不入库不提交）。丢了只能重签——
+> 库里只存 sha256，**没人能再看到它**（列表也不返 hash）。
 
 ---
 

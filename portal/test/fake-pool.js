@@ -27,6 +27,9 @@ export class FakePool {
     this._txUndo = null;
     // #456：证书台账（`tls_certificates`）。**不是真相源**（真相是盘上证书文件），只记「谁什么时候装了什么」。
     this.tlsCerts = [];
+    // #736：API 令牌（`api_tokens`）。按 SQL 文本真模拟：INSERT（含 UNIQUE(user_id,name) 撞名）、
+    // 按 hash 取活跃行、条件 UPDATE last_used_at、UPDATE revoked_at、列表。列名写错真库才报（见工单）。
+    this.apiTokens = [];
     // #456 M2：**语句流水**（`{sql, params}`，每条进来的语句）。只给「零副作用」这类判据用：
     // `POST /api/admin/tls/inspect` 必须一条写语句都不发（`SELECT` 可以，鉴权本身要查会话）。
     // ⚠ 刻意**不叫** `sqlLog`：子类（admin/must-change-password/…）自带同名字段并在自己的 `query` 里
@@ -541,6 +544,134 @@ export class FakePool {
     //   ② `kind` 只有 upload/rollback（CHECK）；
     //   ③ `sans` 是 `text[]` ⇒ 必须传数组。
     // 产品侧把指纹小写化、或把 PEM 当指纹写进去，这里会炸（而不是静默绿）。
+    // 项目内部 id（仅供需要合法 uuid 形状的分支用）：`decodeAdminUserUuid` 要过 UUID_RE。
+    // #736：api_tokens 的 id 在真库里是 uuid；假库给一个合法形状的固定号即可。
+    // ---- #736：API 令牌（api_tokens）----
+    // 假库不校 SQL 列名（列名写错只有真库会报），所以这里**按 SQL 说的做**；列面/类型对账在
+    // M2 真库事务里跑一次（见工单）。分支顺序：INSERT / 按 hash 联查 / touch / revoke / 存在探测 / 列表。
+    if (sql.includes('INSERT INTO api_tokens')) {
+      const [userId, name, tokenHash] = params;
+      // 库事实：`token_hash` 只存 sha256 hex —— 产品侧把明文写进来这里就该炸（明文只出一次）。
+      if (!/^[0-9a-f]{64}$/.test(String(tokenHash))) {
+        throw new Error('fake: api_tokens.token_hash 必须是 sha256 hex（明文不得落库）');
+      }
+      // UNIQUE (user_id, name)：同账号重名（含已吊销，因吊销不删行）⇒ ON CONFLICT DO NOTHING ⇒ 空 rows。
+      if (this.apiTokens.some((t) => t.user_id === userId && t.name === name)) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (this.apiTokens.some((t) => t.token_hash === tokenHash)) {
+        return { rows: [], rowCount: 0 }; // token_hash UNIQUE（极小概率撞 hash）
+      }
+      this._apiTokenSeq = (this._apiTokenSeq || 0) + 1;
+      const hex = this._apiTokenSeq.toString(16).padStart(12, '0');
+      const row = {
+        id: `00000000-0000-4000-8000-${hex}`,
+        user_id: userId,
+        name,
+        token_hash: tokenHash,
+        scopes: [],
+        created_at: new Date(),
+        last_used_at: null,
+        revoked_at: null,
+      };
+      this.apiTokens.push(row);
+      return {
+        rows: [{ id: row.id, name: row.name, scopes: row.scopes, created_at: row.created_at }],
+        rowCount: 1,
+      };
+    }
+
+    // findActiveByToken：按 token_hash 取「未吊销令牌 + 活跃用户」（JOIN users）。
+    if (sql.includes('FROM api_tokens t') && sql.includes('JOIN users')) {
+      const [tokenHash] = params;
+      const t = this.apiTokens.find((x) => x.token_hash === tokenHash && x.revoked_at === null);
+      if (!t) return { rows: [] };
+      const u = this.users.find((x) => x.id === t.user_id && x.status === 'active');
+      if (!u) return { rows: [] };
+      return {
+        rows: [{
+          token_id: t.id,
+          name: t.name,
+          scopes: t.scopes,
+          created_at: t.created_at,
+          last_used_at: t.last_used_at,
+          id: u.id,
+          login: u.login,
+          display_name: u.display_name,
+          role: u.role,
+          fde_name: u.fde_name,
+          auth_source: u.auth_source,
+          status: u.status,
+          must_change_password: sql.includes('must_change_password')
+            ? u.must_change_password === true : undefined,
+          ...this.projectFileUpload(sql, u),
+        }],
+      };
+    }
+
+    // touchToken：条件 UPDATE last_used_at（从未用过或距上次超 5 分钟才写）。
+    if (sql.includes('UPDATE api_tokens SET last_used_at')) {
+      const [tokenId] = params;
+      const t = this.apiTokens.find((x) => x.id === tokenId);
+      if (!t) return { rows: [], rowCount: 0 };
+      const cutoff = Date.now() - 5 * 60 * 1000;
+      if (t.last_used_at === null || new Date(t.last_used_at).getTime() < cutoff) {
+        t.last_used_at = new Date();
+        return { rows: [{ id: tokenId }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }
+
+    // revokeToken step1：置 revoked_at（仅未吊销、按 user_id 维度）。
+    if (sql.includes('UPDATE api_tokens SET revoked_at')) {
+      const [userId, tokenId] = params;
+      const t = this.apiTokens.find(
+        (x) => x.user_id === userId && x.id === tokenId && x.revoked_at === null,
+      );
+      if (!t) return { rows: [], rowCount: 0 };
+      t.revoked_at = new Date();
+      // 产品 SQL 是 `RETURNING id, name`（name 供审计 details）⇒ fake 照形状回。
+      return { rows: [{ id: tokenId, name: t.name }], rowCount: 1 };
+    }
+
+    // revokeToken step2：存在探测（已吊销但仍在本账号下 ⇒ 幂等 200）。
+    if (sql.includes('SELECT 1 FROM api_tokens')) {
+      const [userId, tokenId] = params;
+      const found = this.apiTokens.some((x) => x.user_id === userId && x.id === tokenId);
+      return { rows: found ? [{ '?column?': 1 }] : [], rowCount: found ? 1 : 0 };
+    }
+
+    // listTokens：某用户全部令牌（含已吊销），按 created_at 升序。
+    if (sql.includes('FROM api_tokens') && sql.includes('ORDER BY created_at')) {
+      const [userId] = params;
+      const rows = this.apiTokens
+        .filter((x) => x.user_id === userId)
+        .slice()
+        .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+        .map((x) => ({
+          id: x.id,
+          name: x.name,
+          scopes: x.scopes,
+          created_at: x.created_at,
+          last_used_at: x.last_used_at,
+          revoked_at: x.revoked_at,
+        }));
+      return { rows, rowCount: rows.length };
+    }
+
+    // 既有产品行为（admin.js，早于 #736）：重建/重绑账号时整账号清令牌。
+    if (sql.includes('DELETE FROM api_tokens')) {
+      const [userId] = params;
+      const before = this.apiTokens.length;
+      this.apiTokens = this.apiTokens.filter((t) => t.user_id !== userId);
+      return { rows: [], rowCount: before - this.apiTokens.length };
+    }
+
+    if (sql.includes('api_tokens')) {
+      // 其余 api_tokens SQL（新读法/新谓词）一律报错，**不许静默空集**（同 login_email_codes 口径）。
+      throw new Error(`fake: 未识别的 api_tokens SQL：${sql.replace(/\s+/g, ' ').slice(0, 160)}`);
+    }
+
     if (sql.includes('INSERT INTO tls_certificates')) {
       const [subjectCn, sans, issuerCn, notBefore, notAfter, fingerprint, kind, uploadedBy] = params;
       if (!/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(String(fingerprint))) {
