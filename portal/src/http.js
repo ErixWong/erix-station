@@ -49,6 +49,7 @@ import * as uploadSettings from './upload-settings.js'; // #485 片 A：单文�
 import * as runtimeSettings from './runtime-settings.js'; // #677 P2a：会话 TTL 进管理台（DB > env > 默认，热读）
 import * as secrets from './secrets.js';   // #608：配置槽值的形态校验（只写不读）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
+import * as apiTokens from './api-tokens.js'; // #736：API 令牌（Bearer 认证缝 + 管理台签发/吊销）
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
 import * as delegation from './delegation.js'; // 子 run（delegation）读侧：名册 + 账本两个只读端点
 import * as macroRoutes from './macro-routes.js'; // #526：宏平台 HTTP 业务层（if 链只做「匹配+鉴权+转发」，不再撑大本文件）
@@ -131,6 +132,24 @@ function getCookie(req, name) {
     if (part.slice(0, idx).trim() === name) return part.slice(idx + 1).trim();
   }
   return null;
+}
+
+/**
+ * #736：从 `Authorization` 头取 Bearer 令牌。只认 `Bearer` 这一种 scheme（§2.13 设计点 5）。
+ * @returns {{present:boolean, token:string|null, badScheme:boolean}}
+ *   present=false 无 `Authorization` 头；badScheme=true 有头但 scheme 非 Bearer（⇒ 401
+ *   `unsupported_scheme`）；否则 token = 明文（可能空串，交由下游当未知令牌 ⇒ 401）。
+ */
+function getBearerToken(req) {
+  const header = req.headers.authorization;
+  if (header === undefined || header === null || header === '') {
+    return { present: false, token: null, badScheme: false };
+  }
+  const sp = header.indexOf(' ');
+  const scheme = sp === -1 ? header : header.slice(0, sp);
+  if (scheme !== 'Bearer') return { present: true, token: null, badScheme: true };
+  const token = (sp === -1 ? '' : header.slice(sp + 1)).trim();
+  return { present: true, token, badScheme: false };
 }
 
 /**
@@ -751,6 +770,16 @@ export function createServer({
     maxEntries: config.platformPromptsRateLimit?.maxEntries
       ?? config.loginRateLimit?.maxEntries ?? 10000,
   });
+  // #736：API 令牌签发限流（键 `auth-token-mint:user:<targetUserId>`，默认 10/小时）。
+  // 口径照 tlsUpload（同为低频管理台写）：`createRateLimiter` 只有 recordFailure 一个计数入口
+  // ⇒ 只在**真签发成功**时记一次（撞名 409 / 校验失败不烧配额）。
+  const tokenMintRl = config.authTokenMintRateLimit ?? {};
+  const authTokenMintLimiter = createRateLimiter({
+    maxFailures: tokenMintRl.maxFailures ?? 10,
+    windowMs: tokenMintRl.windowMs ?? 60 * 60 * 1000,
+    blockMs: tokenMintRl.blockMs ?? 60 * 60 * 1000,
+    maxEntries: tokenMintRl.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
+  });
   // #449：邮件通道读取侧（SMTP 参数存 DB，见 `mail-provider.js`）。`mailerProvider` 参数仅供测试注入 fake。
   // 为什么不在启动时同步读一次：登录是热路径但启动不是；真正的「现在到底能不能发信」每次登录时由
   // `ctx.mailerProvider.get()` 回答（60s 缓存 + 急停硬闸）。这里只在 `config.mail` 存在（= `loadConfig`
@@ -772,6 +801,7 @@ export function createServer({
     pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter,
     mailerProvider: mailProvider, emailCodeLimiter, emailSendLimiter, mailTestLimiter, docker,
     tlsUploadLimiter, tlsVerifyLimiter, tlsInspectLimiter, platformPromptsLimiter,
+    authTokenMintLimiter,
     // #456：真机校验的注入点（生产 = `tls.connect` + `/proc/net/route`；单测换成假 socket / 假路由表）。
     tlsConnect, tlsRoutePath,
     // #456：最近一次**真机校验**结果（内存态，单实例）。GET 只回缓存，绝不主动连（那是 verify 端点的事）。
@@ -990,6 +1020,8 @@ async function route(req, res, ctx) {
 async function routeApi(req, res, ctx, url) {
   const { pathname } = url;
   const { pool, config } = ctx;
+  // #736：挂 `res` 供 `resolveSession` 在令牌命中时就地发 `X-Auth-Method: api_token`。
+  req[REQ_RES] = res;
 
   // ---- #234：跨站写请求防线（portal.md §2.11）——先于任何 handler 执行，否则 CSRF 会先碰到底层副作用。----
   // 豁免（在 csrfGateFor 里）：/api/internal/* 与 /api/forward-auth。拒绝：403 `cross_origin_forbidden`
@@ -1085,6 +1117,13 @@ async function routeApi(req, res, ctx, url) {
   }
 
   if (req.method === 'POST' && pathname === '/api/auth/logout') {
+    // #736（设计点 12）：Bearer 令牌不能被「登出」，只能被吊销 ⇒ 400（不带 body 的旧语义不变）。
+    if (getBearerToken(req).present) {
+      throw new HttpError(
+        400, 'logout_not_applicable_for_tokens',
+        'API 令牌不能登出，请用 DELETE /api/admin/users/<login>/tokens/<id> 吊销',
+      );
+    }
     const token = getCookie(req, config.cookie.name);
     if (!token) throw new HttpError(401, 'unauthorized', 'unauthorized');
     await auth.revokeSession(pool, token);
@@ -1455,6 +1494,12 @@ async function routeApi(req, res, ctx, url) {
     return sendJson(res, 200, { result, item });
   }
 
+  // ---- #736：管理台代 FDE 签发 / 列表 / 吊销 API 令牌（自己控制角色错误码与限流）----
+  // 放在 `handleAdminApi` 的 blanket 分派**之前**：那层的 `requireAdmin` 对非 admin 产
+  // `forbidden`，而 §2.13 契约要的是 `insufficient_role`；且签发要单独限流（`auth-token-mint`）。
+  const apiTokenMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)\/tokens(?:\/([^/]+))?$/);
+  if (apiTokenMatch) return handleUserApiTokens(req, res, ctx, apiTokenMatch);
+
   // ---- admin LLM 配置（issue #38 Phase A；requireAdmin 鉴权） ----
   if (pathname.startsWith('/api/admin/')) {
     return handleAdminApi(req, res, ctx, url);
@@ -1486,6 +1531,102 @@ async function requireAdmin(req, ctx) {
   const session = await requireSession(req, ctx);
   if (session.user.role !== 'admin') throw new HttpError(403, 'forbidden', 'forbidden');
   return session;
+}
+
+/**
+ * #736：管理台代 FDE 签发 / 列表 / 吊销 API 令牌（§2.13）。
+ * 只有 admin 能签（代 FDE）；目标用户按 login 解析，查不到 404。
+ * 审计只记 `{token_id, name, user}`，绝不含 hash/明文。列表不审计。
+ * @param {RegExpMatchArray} match `[^1]`=login，`[^2]`=令牌 id（可选）。
+ */
+async function handleUserApiTokens(req, res, ctx, match) {
+  const { pool } = ctx;
+  let login;
+  try {
+    login = decodeURIComponent(match[1]);
+  } catch {
+    throw new HttpError(400, 'validation_failed', 'login 非法', { details: { field: 'login' } });
+  }
+  // 角色闸：非 admin ⇒ 403 `insufficient_role`（§2.13；与 blanket requireAdmin 的 `forbidden` 区分）。
+  const actor = await requireSession(req, ctx);
+  if (actor.user.role !== 'admin') {
+    throw new HttpError(403, 'insufficient_role', '只有管理员能签发 API 令牌');
+  }
+  const targetUserId = await apiTokens.findUserIdByLogin(pool, login);
+  if (!targetUserId) throw new HttpError(404, 'not_found', '用户不存在');
+
+  const rawId = match[2];
+  const method = req.method;
+
+  // POST /api/admin/users/<login>/tokens ⇒ 签发。
+  if (!rawId && method === 'POST') {
+    requireJson(req);
+    const body = await readJsonBody(req);
+    const name = typeof body?.name === 'string' ? body.name.trim() : '';
+    if (name.length < 1 || name.length > 40) {
+      throw new HttpError(400, 'validation_failed', 'name 必填且 1..40 字符', {
+        details: { field: 'name' },
+      });
+    }
+    // scopes 本期只支持空数组（给了非空 ⇒ 400，不许留死列）。
+    if (body?.scopes !== undefined && (!Array.isArray(body.scopes) || body.scopes.length !== 0)) {
+      throw new HttpError(400, 'scopes_unsupported', '本期 scopes 只支持空数组');
+    }
+    // 限流（键 `auth-token-mint:user:<id>`，默认 10/小时）。
+    const limiterKey = `auth-token-mint:user:${targetUserId}`;
+    const gate = ctx.authTokenMintLimiter.check(limiterKey);
+    if (!gate.allowed) {
+      throw new HttpError(429, 'rate_limited', '签发令牌过于频繁，请稍后再试', {
+        retryable: true,
+        headers: { 'Retry-After': String(gate.retryAfterSeconds) },
+      });
+    }
+    const token = apiTokens.generateApiToken();
+    const tokenHash = apiTokens.hashApiToken(token);
+    const minted = await apiTokens.mintToken(pool, { userId: targetUserId, name, tokenHash });
+    if (!minted) {
+      // 同账号重名（含已吊销，因为吊销不删行）⇒ 409，不冒 500。
+      throw new HttpError(409, 'token_name_taken', '该用户已有同名令牌（吊销不释放名字）');
+    }
+    ctx.authTokenMintLimiter.recordFailure(limiterKey);
+    await auth.audit(pool, {
+      actorId: actor.user.id,
+      action: 'auth.token_created',
+      target: login,
+      details: { token_id: minted.id, name, user: login },
+    }).catch(() => {});
+    return sendJson(res, 201, {
+      id: minted.id,
+      name: minted.name,
+      scopes: minted.scopes ?? [],
+      created_at: minted.created_at,
+      token,
+    });
+  }
+
+  // GET /api/admin/users/<login>/tokens ⇒ 列表（不返 hash，含已吊销，创建时间升序，不审计）。
+  if (!rawId && method === 'GET') {
+    const tokens = await apiTokens.listTokens(pool, targetUserId);
+    return sendJson(res, 200, { tokens });
+  }
+
+  // DELETE /api/admin/users/<login>/tokens/<id> ⇒ 吊销（幂等）。
+  if (rawId && method === 'DELETE') {
+    const tokenId = decodeAdminUserUuid(rawId);
+    const result = await apiTokens.revokeToken(pool, { userId: targetUserId, tokenId });
+    if (result.outcome === 'missing') throw new HttpError(404, 'not_found', '令牌不存在');
+    if (result.outcome === 'revoked') {
+      await auth.audit(pool, {
+        actorId: actor.user.id,
+        action: 'auth.token_revoked',
+        target: login,
+        details: { token_id: tokenId, name: result.name, user: login },
+      }).catch(() => {});
+    }
+    return sendJson(res, 200, { status: 'revoked', already_revoked: result.outcome === 'already' });
+  }
+
+  throw new HttpError(405, 'method_not_allowed', 'method not allowed');
 }
 
 async function handleAdminApi(req, res, ctx, url) {
@@ -4670,19 +4811,63 @@ async function auditLoginSuccess(pool, user, method) {
  * 缓存安全：`findSessionUser` 是纯读（不续期、不写库），而一个请求只有一个 handler。
  */
 const REQ_SESSION = Symbol('station.request.session');
+// #736：把 `res` 挂到 `req` 上，供 `resolveSession` 在令牌命中时**就地**发 `X-Auth-Method: api_token`
+// （`setHeader` 会被后续 `writeHead` 并入，早于 handler 发响应 ⇒ 安全）。仅派发层写入。
+const REQ_RES = Symbol('station.request.res');
 
-/** 解析当前请求的会话；无 cookie / 会话失效 ⇒ `null`（**不抛错**，401 的语义归 `requireSession`）。 */
+/**
+ * 解析当前请求的会话；无凭证 / 会话失效 ⇒ `null`（**不抛错**，401 的语义归 `requireSession`）。
+ * #736 认证缝：cookie 命中走既有路径（不发 `X-Auth-Method`）；cookie miss 才试 Bearer，
+ * 命中则发该头并节流写 `last_used_at`。cookie 与 Bearer 同时出现 ⇒ 400（不猜）；非 Bearer
+ * scheme ⇒ 401。后两种在解析时抛 `HttpError`（经 `restrictedSessionBlocked` /
+ * `requireSession` 冒到统一错误信封）。
+ */
 async function resolveSession(req, ctx) {
   if (req[REQ_SESSION] !== undefined) return req[REQ_SESSION];
-  const token = getCookie(req, ctx.config.cookie.name);
-  req[REQ_SESSION] = token ? await auth.findSessionUser(ctx.pool, token) : null;
-  return req[REQ_SESSION];
+  const cookieToken = getCookie(req, ctx.config.cookie.name);
+  const bearer = getBearerToken(req);
+  // 设计点 6：cookie 与 Bearer 同时出现 ⇒ 不猜客户端想用哪个（先于 scheme 判定，
+  // 因为「两条凭证同时存在」本身就是要拒的事）。
+  if (cookieToken && bearer.present) {
+    throw new HttpError(
+      400, 'ambiguous_credential',
+      'cookie 与 Bearer 令牌不能同时用于同一请求（二选一）',
+    );
+  }
+  if (cookieToken) {
+    req[REQ_SESSION] = await auth.findSessionUser(ctx.pool, cookieToken);
+    return req[REQ_SESSION];
+  }
+  // cookie miss：试 Bearer（脚本/agent 不登录、不寄邮件）。
+  if (bearer.present) {
+    if (bearer.badScheme) {
+      throw new HttpError(401, 'unsupported_scheme', 'Authorization 只支持 Bearer scheme');
+    }
+    const viaToken = bearer.token
+      ? await apiTokens.findApiTokenUser(ctx.pool, bearer.token)
+      : null;
+    req[REQ_SESSION] = viaToken;
+    if (viaToken) {
+      req[REQ_RES]?.setHeader?.('X-Auth-Method', 'api_token');
+      // 节流写 last_used_at（设计点 8）：best-effort，失败不影响响应。
+      Promise.resolve(apiTokens.touchToken(ctx.pool, viaToken.token.id)).catch(() => {});
+    }
+    return req[REQ_SESSION];
+  }
+  req[REQ_SESSION] = null;
+  return null;
 }
 
-/** 要求有效 session（除登录/forward-auth 外所有公开端点）。 */
+/**
+ * 要求有效凭证（cookie 会话或 API 令牌；除登录/forward-auth 外所有公开端点）。
+ * #736：无 cookie 但有 Bearer 也算有凭证（交给 `resolveSession` 解析，含 ambiguous/scheme 的抛出）。
+ */
 async function requireSession(req, ctx) {
-  const token = getCookie(req, ctx.config.cookie.name);
-  if (!token) throw new HttpError(401, 'unauthorized', 'unauthorized');
+  const cookieToken = getCookie(req, ctx.config.cookie.name);
+  const bearer = getBearerToken(req);
+  if (!cookieToken && !bearer.present) {
+    throw new HttpError(401, 'unauthorized', 'unauthorized');
+  }
   const session = await resolveSession(req, ctx);
   if (!session) throw new HttpError(401, 'unauthorized', 'unauthorized');
   return session;
