@@ -828,6 +828,9 @@ export const en = {
     tabs: {
       label: 'Admin sections',
       users: 'User management',
+      // issue #727 slice 2: "Seat content" (one FDE's sessions and files, read-only);
+      // views/AdminSeatContentView.vue. Right after users: it is the "look at a person" follow-up.
+      seatContent: 'Seat content',
       llm: 'LLM management',
       repos: 'Repository management',
       mail: 'Mail channel',
@@ -855,6 +858,72 @@ export const en = {
       // issue #528 (event platform W5): admin tabs for macro templates / macro runs (`07` §21.1 key table).
       macros: 'Macro templates',
       macroRuns: 'Macro runs',
+    },
+    // issue #727 slice 2: the seat-content page (views/AdminSeatContentView.vue +
+    // components/AdminTranscript.vue, contract §4.22). Read-only page: no wording here may use a
+    // write-side verb such as send / stop / upload.
+    seatContent: {
+      title: 'Seat content',
+      // label of the jump link on each users row (views/AdminUsersView.vue).
+      fromUsersLink: 'Sessions / files',
+      readOnly: 'read-only',
+      readOnlyHint: 'This page only reads: there is no write, send or upload control here.',
+      fdeLabel: 'Seat (FDE)',
+      selectFde: 'Select a seat…',
+      loadingUsers: 'Loading seats…',
+      noFdeUsers: 'No user has a seat yet.',
+      empty: {
+        title: 'Nothing selected',
+        hint: 'Pick a session on the left to read the transcript, or pick a file to preview it.',
+      },
+      sessions: {
+        title: 'Sessions',
+        searchPlaceholder: 'Search titles or directories',
+        includeArchived: 'Include archived',
+        empty: 'This seat has no sessions yet.',
+        loadMore: 'Load more sessions',
+        untitled: '(untitled)',
+      },
+      files: {
+        title: 'Files',
+        empty: 'This directory is empty.',
+        loadMore: 'Load more files',
+        rootHint: 'Root = this seat’s ~/projects',
+      },
+      meta: {
+        cwd: 'directory',
+        model: 'model',
+        status: 'status',
+        createdAt: 'created',
+        updatedAt: 'updated',
+        messages: 'messages',
+        unknown: '—',
+      },
+      transcript: {
+        loadEarlier: 'Load earlier',
+        noEarlier: 'Reached the oldest entry',
+        empty: 'This session has no messages yet.',
+        toolDetails: 'Expand / collapse details',
+        toolDuration: 'took {duration}',
+        foldedBanner: 'This stretch was compacted and folded (summary of round {round})',
+        viewOriginal: 'View original',
+        hideOriginal: 'Hide original',
+        originalLoading: 'Loading the original…',
+        originalUnavailable: 'The original is unavailable (no text survived in that range).',
+        originalFailed: 'Failed to load the original: {message}',
+        reasoning: 'Reasoning',
+        partialTruncated: '(text truncated: this is all the upstream kept)',
+        partialPlaceholder: '(this run left no displayable text)',
+        loading: 'Loading transcript…',
+      },
+      preview: {
+        loading: 'Loading file…',
+        download: 'Download',
+        downloadInstead: 'Download instead',
+        notPreviewable: 'This file type is not on the preview list; download only.',
+        imageAlt: 'Image preview: {name}',
+        tooLargeHint: 'The file is too large or unsupported; use the download below.',
+      },
     },
     // Capability market, admin console (views/AdminMarketView.vue, issue #595 M2;
     // contract §7 admin API + §8 admin UI).
