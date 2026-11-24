@@ -228,6 +228,148 @@ export function resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath, notFou
 }
 
 /**
+ * issue #727（管理台按 FDE 只读浏览项目文件）：以
+ * `<userSpaceRoot>/<fde>/projects` 为根的牢笼解析。
+ *
+ * 与 `resolveJailedRoot` 的关系：**同一三条红线**（根必须真实存在且非
+ * symlink、
+ * containment 拒 `..`、逐段 `lstat` 拒 symlink），但**根不同**——管理台没有
+ * 「已绑定的 cwd」这个概念，一个 FDE 的整棵 `~/projects/` 都要能浏览。
+ * 故**不改** `resolveJailedRoot`（它的根必须是 `~/projects/<name>`，而它的
+ * 既有等价性由 `dirs.test.js` 既有例锁定，评审 major 14）
+ * ——这里是独立入口。
+ *
+ * 额外一条：路径段命中 `.git` 且该段是目录 ⇒ 400（git
+ * 元数据不泄给管理台）。
+ * `.gitignore` 这类同名前缀**文件**不受影响；工作台侧的同样收紧归 issue
+ * #726。
+ *
+ * @returns {{root:string,target:string,rel:string}}
+ */
+export function resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath = '.' } = {}) {
+  if (!userSpaceRoot || !fdeName) {
+    throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
+  }
+  const root = path.resolve(userSpaceRoot, fdeName, 'projects');
+
+  let rootSt;
+  try {
+    rootSt = fs.lstatSync(root);
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
+    }
+    throw err;
+  }
+  if (rootSt.isSymbolicLink() || !rootSt.isDirectory()) {
+    throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
+  }
+
+  // `..` 会被 `path.resolve` **词法消除**（`a/../b` → `b`），下面那次 containment
+  // 单看「逃出根」拦不到它。这里逐段再查一遍：任何一段是 `..` 一律
+  // 400。
+  const raw = relPath == null || relPath === '' ? '.' : String(relPath);
+  for (const seg of raw.split('/')) {
+    if (seg === '..') {
+      throw new DirError('validation_failed', 'path 不得逃逸目录根', {
+        details: { field: 'path' },
+      });
+    }
+  }
+
+  const target = path.resolve(root, raw);
+  if (target !== root) {
+    const relToRoot = path.relative(root, target);
+    if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
+      throw new DirError('validation_failed', 'path 不得逃逸目录根', {
+        details: { field: 'path' },
+      });
+    }
+  }
+
+  const rel = path.relative(root, target);
+  let cur = root;
+  if (rel) {
+    for (const seg of rel.split(path.sep)) {
+      cur = path.join(cur, seg);
+      let st;
+      try {
+        st = fs.lstatSync(cur);
+      } catch (err) {
+        if (err?.code === 'ENOENT') {
+          throw new DirError('not_found', 'path not found', { httpStatus: 404 });
+        }
+        throw err;
+      }
+      if (st.isSymbolicLink()) {
+        throw new DirError('validation_failed', 'path 含符号链接，拒绝读取', {
+          details: { field: 'path' },
+        });
+      }
+      // 只拦目录：`.gitignore` 这类同名前缀文件是可预览的正常项目文件。
+      if (seg === '.git' && st.isDirectory()) {
+        throw new DirError('validation_failed', 'path 不得进入 .git 目录', {
+          details: { field: 'path' },
+        });
+      }
+    }
+  }
+  return { root, target, rel };
+}
+
+/** 管理台文件树的 keyset 页大小上限（单层列得完为主，不是性能参数）。 */
+const PROJECTS_TREE_MAX = 2000;
+
+/**
+ * 管理台项目文件树（issue #727）：根 = `<userSpaceRoot>/<fde>/projects`，
+ * 单层懒展开。
+ * 排序与 `fileTree` 同一口径（目录在前 + 各按 name 码点字典序，与 locale
+ * 无关）；
+ * 额外跳过 `.git` 目录（与 `resolveJailedUnderProjects` 同一口径）。
+ * keyset：`after` = 上一页最后一项的 **name**（不是下标：新增/改名不会像
+ * offset
+ * 那样错位），只返 name 严格大于它的项；`truncated` = 过滤后候选仍多于
+ * limit；
+ * `next_after` = 本页最后一项 name，**`truncated === false` 时为 null**。
+ */
+export async function fileTreeUnderProjects(
+  { userSpaceRoot, fdeName, relPath = '.', after = null, limit = 500 } = {},
+) {
+  const { target } = resolveJailedUnderProjects({
+    userSpaceRoot, fdeName, relPath: relPath ?? '.',
+  });
+  const st = fs.lstatSync(target);
+  if (!st.isDirectory()) {
+    throw new DirError('validation_failed', 'path 必须是目录', { details: { field: 'path' } });
+  }
+
+  const entries = [];
+  for (const d of fs.readdirSync(target, { withFileTypes: true })) {
+    if (!isSafeDirName(d.name)) continue;
+    if (d.isDirectory()) {
+      if (d.name === '.git') continue; // 同 resolveJailedUnderProjects：不进 git 元数据
+      entries.push({ name: d.name, type: 'dir' });
+    } else if (d.isFile()) {
+      entries.push({ name: d.name, type: 'file' });
+    }
+    // 其余类型（symlink/socket 等）不列：与 `fileTree` 一致，
+    // 既不显示也不跟随。
+  }
+  entries.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  });
+
+  const n = Math.min(Math.max(Number(limit) || 500, 1), PROJECTS_TREE_MAX);
+  const candidates = after == null || after === ''
+    ? entries
+    : entries.filter((e) => e.name > String(after)); // 严格大于：上一页尾项不重发
+  const truncated = candidates.length > n;
+  const page = candidates.slice(0, n);
+  return { entries: page, truncated, next_after: truncated ? page[page.length - 1].name : null };
+}
+
+/**
  * 上传目标目录（issue #472 片 B）：与 `resolveJailedFile` **同一条红线**（同一份 `resolveJailedRoot`），
  * 差别只有两点——目标**必须是目录**，且 `path` 允许 `'.'`（上传到项目根）。
  *
@@ -410,8 +552,14 @@ export async function receiveUpload({
  * 大小上限 FILE_PREVIEW_MAX_BYTES（超限 413 报错不截断）；非图片按「前 8KB 嗅探 NUL 字节」
  * 判二进制，二进制明确拒绝（不猜测解码乱码）——415/413 同时被 #366 P0 埋点计数（http.js 接线）。
  */
-export async function readFilePreview({ userSpaceRoot, fdeName, cwd, relPath } = {}) {
-  const { target, rel, st } = resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath });
+export async function readFilePreview(
+  { userSpaceRoot, fdeName, cwd, relPath, rootKind = 'project' } = {},
+) {
+  // rootKind（issue #727）：'project' 缺省 = 工作台旧行为；'projects' =
+  // 管理台的根。
+  const { target, rel, st } = resolvePreviewFile({
+    userSpaceRoot, fdeName, cwd, relPath, rootKind,
+  });
   if (st.size > FILE_PREVIEW_MAX_BYTES) {
     throw new DirError('file_too_large', `文件超过预览上限（${Math.floor(FILE_PREVIEW_MAX_BYTES / 1024 / 1024)}MB）`, {
       httpStatus: 413,
@@ -431,6 +579,28 @@ export async function readFilePreview({ userSpaceRoot, fdeName, cwd, relPath } =
     throw new DirError('unsupported_file_type', '二进制文件不支持预览', { httpStatus: 415 });
   }
   return { name: path.basename(target), path: rel, kind: 'text', data: buf.toString('utf8') };
+}
+
+/**
+ * 单文件预览 / 流式两条通道的牢笼入口（issue #727）：按 `rootKind` 选根，
+ * **文件类型红线相同**（必须是非 symlink 普通文件）。缺省 `'project'`
+ * 走原来的
+ * `resolveJailedFile`（调用与参数逐字不变 ⇒ 工作台侧行为逐字节不变）；
+ * `'projects'` 走 `resolveJailedUnderProjects`（根 = `~/projects`，管理台没有
+ * 已绑定的 cwd）。**不复制**预览/流式实现：两条通道共用上面那一份。
+ */
+function resolvePreviewFile({ userSpaceRoot, fdeName, cwd, relPath, rootKind = 'project' } = {}) {
+  if (rootKind === 'projects') {
+    const { target, rel } = resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath });
+    const st = fs.lstatSync(target);
+    if (!st.isFile()) {
+      throw new DirError('validation_failed', 'path 必须是文件', {
+        details: { field: 'path' },
+      });
+    }
+    return { target, rel, st };
+  }
+  return resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath });
 }
 
 /** 预览单文件大小上限（P6 issue #84）：超限报错而非截断，防误点大文件把 portal 内存打爆。 */
@@ -496,9 +666,13 @@ export function parseSingleRange(header, size) {
  * attachment（红线：同源未知字节流不给 inline）。无 Range ⇒ 整身 200。
  */
 export async function openFileStream({
-  userSpaceRoot, fdeName, cwd, relPath, range = null, disposition = 'inline',
+  userSpaceRoot, fdeName, cwd, relPath, range = null, disposition = 'inline', rootKind = 'project',
 } = {}) {
-  const { target, rel, st } = resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath });
+  // rootKind 同 readFilePreview（#727）：缺省 'project' ⇒
+  // 下方逻辑与旧版逐字节等价。
+  const { target, rel, st } = resolvePreviewFile({
+    userSpaceRoot, fdeName, cwd, relPath, rootKind,
+  });
   if (st.size > FILE_STREAM_MAX_BYTES) {
     throw new DirError('file_too_large', `文件超过流式上限（${Math.floor(FILE_STREAM_MAX_BYTES / 1024 / 1024)}MB）`, {
       httpStatus: 413,

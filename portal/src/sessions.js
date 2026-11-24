@@ -166,8 +166,13 @@ export function validateMessageBody(body) {
  *  withMessageCount（issue #197）：仅 getSession 置 true——同一条 SQL 内嵌 messages 相关子查询带出
  *  会话消息总数（口径与 listSessions 的 message_count 同源：该会话 messages 表全量行数、含 synthetic、
  *  不按 role/synthetic/分页过滤）。写在这里而非另发 COUNT：零额外往返；其余调用方（postMessage/
- *  stop/archive/SSE 校验等）不带该列，热路径 SQL 逐字不变。 */
-export async function fetchSession(pool, sessionId, userId, { forUpdate = false, withMessageCount = false } = {}) {
+ *  stop/archive/SSE 校验等）不带该列，热路径 SQL 逐字不变。
+ *  includeArchived（issue #727，只有管理台只读浏览置 true）：默认 false 时
+ *  「非 active ⇒ 404」那条分支逐字不变；true 才跳过它。属主校验照旧。 */
+export async function fetchSession(
+  pool, sessionId, userId,
+  { forUpdate = false, withMessageCount = false, includeArchived = false } = {},
+) {
   if (typeof sessionId !== 'string' || !UUID_RE.test(sessionId)) {
     throw new SessionError('not_found', 'session not found', { httpStatus: 404 });
   }
@@ -186,7 +191,7 @@ export async function fetchSession(pool, sessionId, userId, { forUpdate = false,
   if (!row || row.user_id !== userId) {
     throw new SessionError('not_found', 'session not found', { httpStatus: 404 });
   }
-  if (row.status !== 'active') {
+  if (includeArchived !== true && row.status !== 'active') {
     throw new SessionError('not_found', 'session not found', { httpStatus: 404 });
   }
   return row;
@@ -215,16 +220,34 @@ export function decodeSessionCursor(cursor) {
   throw new SessionError('validation_failed', 'cursor 非法', { details: { field: 'cursor' } });
 }
 
+/**
+ * LIKE/ILIKE 通配符转义（issue #727 管理台搜索）：`\` 必须第一个转，
+ * 否则会把后两条的转义符再转一次。
+ */
+function escapeLikePattern(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
 /** GET /api/sessions?project_id=&cwd=&cursor=&limit=（可选过滤，updated_at DESC, id DESC
  *  复合 keyset 分页 §1.3：默认 20、上限 100；issue #94）。
  *  P5：cwd 过滤为「该目录的会话列表」（directory-as-project §4 左栏；精确匹配会话绑定 cwd）。
  *  排序键为 (updated_at, id) 复合——仅按 updated_at 会在同时间戳记录间跳页（旧游标缺陷修复）。
  *  评审裁决（issue #94 瘦身）：q 搜索/total 计数已拆除（前端选择器降级为单次全量浏览），
- *  待 #88 标题自动生成后再评估是否加回。 */
-export async function listSessions(pool, { userId, projectId, cwd, cursor, limit = 20 }) {
+ *  待 #88 标题自动生成后再评估是否加回。
+ *  issue #727（管理台只读浏览，默认行为逐字节不变）：
+ *    · includeArchived=true ⇒ where 去掉 status 条件（默认仍过滤 active）；
+ *    · q 是**新增的可选参数**（不是恢复 #94 拆掉的搜索框）：
+ *    仅当「非空白字符串
+ *      且 ≤100 字符」时追加 title/cwd 的 ILIKE 过滤（转义 \ % _ 并 ESCAPE
+ *      反斜杠），
+ *      其余情形（未传 / 全空白 / 超长）一律不加条件。
+ */
+export async function listSessions(
+  pool, { userId, projectId, cwd, cursor, limit = 20, includeArchived = false, q = null },
+) {
   const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const params = [userId];
-  let where = `user_id = $1 AND status = 'active'`;
+  let where = includeArchived === true ? `user_id = $1` : `user_id = $1 AND status = 'active'`;
   if (projectId) {
     params.push(projectId);
     where += ` AND project_id = $${params.length}`;
@@ -232,6 +255,11 @@ export async function listSessions(pool, { userId, projectId, cwd, cursor, limit
   if (cwd) {
     params.push(validateSessionCwd(cwd));
     where += ` AND cwd = $${params.length}`;
+  }
+  if (typeof q === 'string' && q.trim() !== '' && q.length <= 100) {
+    params.push(`%${escapeLikePattern(q)}%`);
+    const p = params.length;
+    where += ` AND (title ILIKE $${p} ESCAPE '\\' OR cwd ILIKE $${p} ESCAPE '\\')`;
   }
   if (cursor) {
     const boundary = decodeSessionCursor(cursor);
@@ -319,9 +347,17 @@ export async function createSession(pool, { userId, projectId, title, model, con
  * 消息 keyset 分页（§1.3）：默认/无 cursor 取**最新** limit 条（升序返回）；cursor=更早一批的最小 seq，取 seq < cursor 的最新一批。
  * includeMessages=false 供 SSE 仅校验 session/last_seq 时使用，避免无用 transcript 读取。
  */
-export async function getSession(pool, { userId, sessionId, limit = 20, messagesCursor, includeMessages = true }) {
+export async function getSession(
+  pool, {
+    userId, sessionId, limit = 20, messagesCursor,
+    includeMessages = true, includeArchived = false,
+  },
+) {
   // issue #197：withMessageCount → 会话总数与属主校验同一条 SQL 取回（见 fetchSession）。
-  const s = await fetchSession(pool, sessionId, userId, { withMessageCount: true });
+  // issue #727：includeArchived 默认 false ⇒ fetchSession 的 404 分支逐字不变。
+  const s = await fetchSession(
+    pool, sessionId, userId, { withMessageCount: true, includeArchived },
+  );
   const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const params = [sessionId, n];
   let where = `session_id = $1`;
@@ -466,8 +502,10 @@ function pickFoldCarrierRow(rows) {
     ?? null;
 }
 
-export async function getFoldedPayload(pool, { userId, sessionId, round, log }) {
-  await fetchSession(pool, sessionId, userId);
+export async function getFoldedPayload(
+  pool, { userId, sessionId, round, log, includeArchived = false },
+) {
+  await fetchSession(pool, sessionId, userId, { includeArchived });
   const n = Number(round);
   if (!Number.isInteger(n) || n < 0) {
     throw new SessionError('validation_failed', 'round 必须为非负整数', { details: { field: 'round' } });
