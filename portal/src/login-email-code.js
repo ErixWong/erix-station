@@ -210,6 +210,93 @@ export async function invalidateOtherCodes(pool, { pendingTokenHash, keepCodeHas
 }
 
 /**
+ * #737 口令步发信幂等的读侧：同一账号在窗口内已有「未消费且未过期」的码 ⇒ 返回最新一枚（可复用），
+ * 否则 `null`。
+ *
+ * 为什么不按 pending 查而按 user_id JOIN：每次口令步都新建 pending，重复重试落在**不同** pending 上，
+ * 只有账号维度才能看见上一次发出去的码。**不加 `p.used_at` 谓词**：pending 被用过时它的码必然已被
+ * 消费，`c.consumed_at IS NULL` 就够（多一个谓词只是多一处会漏的地方）。
+ *
+ * 返回 `{ id, codeHash, createdAt, expiresAt, attempts, maxAttempts } | null` —— 刻意**没有明文**：
+ * 库里只有 `sha256(code)`，而校验侧比的是 `code_hash = sha256(输入)` ⇒ 复用只需复制哈希字面值。
+ */
+export async function findReusableCode(pool, { userId, windowSeconds, now = new Date() } = {}) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.code_hash, c.created_at, c.expires_at, c.attempts, c.max_attempts
+       FROM login_email_codes c
+       JOIN login_pending p ON p.token_hash = c.pending_token_hash
+      WHERE p.user_id = $1
+        AND c.consumed_at IS NULL
+        AND c.expires_at > $2
+        AND c.created_at > $2 - make_interval(secs => $3::int)
+      ORDER BY c.created_at DESC, c.id DESC
+      LIMIT 1`,
+    [userId, now, windowSeconds],
+  );
+  const row = rows?.[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    codeHash: row.code_hash,
+    createdAt: row.created_at instanceof Date ? row.created_at : new Date(row.created_at),
+    expiresAt: row.expires_at instanceof Date ? row.expires_at : new Date(row.expires_at),
+    attempts: Number(row.attempts ?? 0),
+    maxAttempts: Number(row.max_attempts ?? 0),
+  };
+}
+
+/**
+ * #737 写侧：把已发出的那枚码**挂到本次新建的 pending** 上——插一行 `code_hash` 逐字复制的新码行，
+ * 再把旧行作废（一枚码同一时刻只服务一个 pending ⇒ 校验侧「最新未消费」无歧义，`invalidateOtherCodes`
+ * 的 `code_hash <> $keep` 判据也不留二义）。
+ *
+ * 三个「随码走」的字面值：`code_hash`（旧邮件里的明文码才能在新 pending 上过 §2.3a）、
+ * `expires_at`（**不续命**：反复口令步重试不许把码的寿命无限延长）、`attempts`（尝试预算跟码走
+ * 不跟 pending 走，复用不刷新预算）；`max_attempts` 与 `attempts` 成对，同样从 `from` 复制，
+ * 入参 `maxAttempts`/`ttlSeconds` 只是与 `createEmailCode` 调用形状对称的兜底。
+ *
+ * **顺序不许倒**（与 `handleEmailCodeRequired` 的「先插后废」契约同族）：先 `INSERT` 到新 pending、
+ * 成功后才作废旧行——反过来若插入失败，会留下「一枚可用码都没有」的死状态。
+ */
+export async function adoptEmailCode(
+  pool,
+  {
+    pendingTokenHash,
+    from,
+    ttlSeconds = 600,
+    maxAttempts = 5,
+    resendCount = 0,
+    ip = null,
+    userAgent = null,
+    now = new Date(),
+  } = {},
+) {
+  void ttlSeconds; // 复用不续命：expires_at 用 from.expiresAt 字面值（参数只为调用形状对称）。
+  const res = await pool.query(
+    `INSERT INTO login_email_codes
+       (pending_token_hash, code_hash, created_at, expires_at, attempts, max_attempts, resend_count, created_ip, created_ua)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     RETURNING id`,
+    [
+      pendingTokenHash,
+      from.codeHash,
+      now,
+      from.expiresAt,
+      Number(from.attempts ?? 0),
+      Number(from.maxAttempts ?? maxAttempts),
+      resendCount,
+      ip,
+      userAgent,
+    ],
+  );
+  await pool.query(
+    `UPDATE login_email_codes SET consumed_at = $2 WHERE id = $1 AND consumed_at IS NULL`,
+    [from.id, now],
+  );
+  return { id: res.rows?.[0]?.id ?? null, codeHash: from.codeHash, expiresAt: from.expiresAt };
+}
+
+/**
  * 第二因素选择规则（纯函数，HTTP 层唯一的判据来源）。五分支：
  *   `second_factor_choice`             允许 TOTP + 允许邮件码 + 有邮箱 ⇒ **TOTP 或 邮箱码任一通过**
  *                                      （issue #449 二选一：不清 TOTP 配置，两者并存）

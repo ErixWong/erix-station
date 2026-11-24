@@ -4128,6 +4128,13 @@ function emailCodeMessage(code, ttlSeconds) {
  * 发信失败时库里**一条码行都没有**，所以 `recordResend` 的重试路径（无码行 ⇒ 当首次发信）成立。
  *
  * 发信限流（评审返修 ②）：与重发同一把闸（`email:<ip>`），否则持有效口令的人可以反复调第一步刷邮箱。
+ *
+ * #737 口令步发信幂等：取证发现刷屏来自脚本**重复走口令步**（拿不到 cookie 就重试，每重试一封）。
+ * 所以：**窗口（`policy.resendCooldownSeconds`，现值 60s，不新增旋钮）内同账号已有「未消费且未过期」
+ * 的码 ⇒ 不再铸新码、不再发信**，而是把那枚已发出的码挂到本次新建的 pending 上（`adoptEmailCode`，
+ * 复制 `code_hash` 字面值即可让旧邮件里的码在新 pending 上过 §2.3a）——同一个人在重试，不该再寄一封。
+ * 复用**不续命**（`expires_at` 用旧码字面值）：反复登录不许把码的寿命无限延长；旧行同时作废，
+ * 一枚码同一时刻只服务一个 pending。复用没发信 ⇒ 不占发信限流配额、审计记 `auth.email_code_reused`。
  */
 async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
   const { pool, config } = ctx;
@@ -4156,6 +4163,50 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
     userAgent: req.headers['user-agent'] ?? null,
     ttlSeconds: pendingTtlSeconds,
   });
+
+  // #737：窗口内同账号已有未消费未过期的码 ⇒ 复用，不铸新码、不发信（`now` 现取一次，两处共用同值）。
+  const now = new Date();
+  const reusable = await loginEmailCode.findReusableCode(pool, {
+    userId: user.id,
+    windowSeconds: policy.resendCooldownSeconds,
+    now,
+  });
+  if (reusable) {
+    const adopted = await loginEmailCode.adoptEmailCode(pool, {
+      pendingTokenHash: pending.tokenHash,
+      from: reusable,
+      ttlSeconds: policy.ttlSeconds,
+      maxAttempts: policy.maxAttempts,
+      ip,
+      userAgent: req.headers['user-agent'] ?? null,
+      now,
+    });
+    // 没发信就不占 `email:<ip>` 配额（那把闸计的是「真的发了一封信」）；审计也不写 `sent`（假账）。
+    await auth.audit(pool, {
+      actorId: user.id,
+      action: 'auth.email_code_reused',
+      target: user.login,
+      details: {
+        login: user.login,
+        email_hint: maskEmail(email),
+        code_hash_prefix: adopted.codeHash.slice(0, 12),
+        reused_from_code_id: reusable.id,
+        expires_at: adopted.expiresAt.toISOString(),
+        at: new Date().toISOString(),
+      },
+    }).catch(() => {});
+    // 成功形状在既有五字段之外加 `email_reused`/`resend_after`（与 §2.3b 同口径）；**不带** `email_sent`。
+    return sendJson(res, 200, {
+      status: 'email_code_required',
+      pending_token: pending.token,
+      expires_in: pendingTtlSeconds,
+      email_hint: maskEmail(email),
+      email_code_ttl_seconds: policy.ttlSeconds,
+      email_reused: true,
+      resend_after: policy.resendCooldownSeconds,
+    });
+  }
+
   const code = loginEmailCode.generateEmailCode();
 
   const sent = await mailer.send({ to: email, ...emailCodeMessage(code, policy.ttlSeconds) });
