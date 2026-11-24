@@ -3916,6 +3916,74 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
 §4.15 上传上限是单行表、每次上传现读；§4.19 提示词是单行三列、每次物化现读；本节的
 `runtime_settings` 是 key-value（P3 要一批批加旋钮，多列每批都要改 DDL，所以选 key-value）。
 
+### 4.22 管理台：FDE 会话与文件（只读，issue #727）
+
+管理员按工位只读浏览该 FDE 的**会话记录**与**项目文件**。七条全部只读：没有任何写路径
+（归档 / 改名 / 删除仍在工作台面 §4.2）。非 `admin` 角色 ⇒ `403 forbidden`；非 GET ⇒
+`405 method_not_allowed`。`:fdeName` 的语法与解析口径同 §4.7a。
+
+| 方法 | 路径 | 参数 | 返回 |
+|---|---|---|---|
+| GET | `/api/admin/fdes/:fdeName/dirs` | — | 同 `GET /api/dirs`：`{ dirs: [{name, cwd, running_count, queued_count}] }` |
+| GET | `/api/admin/fdes/:fdeName/sessions` | `cwd` `cursor` `limit` `include_archived` `q` | 同 §4.2 列表：`{ items, next_cursor }` |
+| GET | `/api/admin/fdes/:fdeName/sessions/:sessionId` | `limit` `cursor` `include_archived` | 同 §4.2 详情：`{ session（含 `queued_messages`）, messages, last_seq, next_cursor }` |
+| GET | `/api/admin/fdes/:fdeName/sessions/:sessionId/events/history` | `limit` `before` `include_archived` | 同 §4.4a：`{ events, next_cursor }`（含合成 `partial_output` / `run_termination`） |
+| GET | `/api/admin/fdes/:fdeName/sessions/:sessionId/folded/:round` | `include_archived` | 同 §4.4b：`{ round, turns, source, truncated, dropped_messages }` |
+| GET | `/api/admin/fdes/:fdeName/files/tree` | `path`（缺省 `.`）`after`（`d:<name>`\|`f:<name>`）`limit` | `{ entries: [{name, type}], truncated, next_after }`；根 = 该工位的 `~/projects` |
+| GET | `/api/admin/fdes/:fdeName/file` | `path` `mode=json\|stream\|download`（+ `Range` 请求头） | 同 §4.11：`json` 回 `{name, path, kind, data}`；`stream`/`download` 直接写字节流（支持 206 / 416） |
+
+参数口径：
+
+- **目标工位不限 `status`**：停用 / 销号中的工位，其会话与文件仍可浏览（与 §4.7a
+  只认 active 的解析口径是**有意不同**的）。`:fdeName` 语法非法 ⇒ `400 validation_failed`
+  （`details.field='fde_name'`）；该 FDE 不存在 ⇒ `404 not_found`，文案「FDE「x」不存在」
+  （与 §4.7a 同码同文案）。
+- `include_archived`：只认 `1` / `true`。**缺席 ⇒ 与用户面逐字节一致**（列表不含归档，
+  详情 / history / folded 对归档会话一律 404）；带上 ⇒ 三处都能读归档会话。
+- `q`：非空白时按 `title` / `cwd` 做大小写不敏感的子串匹配（`%` `_` `\` 按字面量处理，
+  不当通配符）；未传 / 全空白 ⇒ 等同不过滤；**超过 100 字符 ⇒ `400 validation_failed`**
+  （`details.field='q'`，与 §4.2 列表共用同一个码）。
+- 分页：会话列表是 `(updated_at, id)` 游标（§1.3）；history 是 `limit` + `before`（§4.4a，
+  `next_cursor` 口径与用户面一致）；文件树是**复合游标** `after` = `<rank>:<name>`，
+  `rank` ∈ `d`（目录）| `f`（文件）——与「目录在前、各按 name 码点序」的展示序同序，
+  所以逐页翻到底的并集等于全量（只带裸 name 会整组跳过文件名排在目录名之后的那批项）。
+  `truncated=true` 时 `next_after` = 本页尾项的同格式游标，**`truncated=false` 时
+  `next_after=null`**；`after` 格式非法（缺 `:` 或 rank 不是 `d`/`f`）⇒
+  `400 validation_failed`「after 非法」（`details.field='after'`）。
+- 文件树只列 `dir` / `file` 两种类型：符号链接不列也不跟随；**唯一的排除项是 `.git`
+  目录**（元数据不外泄，口径同 #726），其余点开头的目录（`.github/`、`.erix/`、
+  `.vscode/`）与点开头的文件（`.gitignore` / `.gitattributes` / `.env`）照常列出、
+  照常预览——它们是排查对象。
+
+错误口径：
+
+- 「sessionId 不属于该 FDE」与「sessionId 不存在」⇒ **同一个 404**，响应体逐字相同
+  （`{"error":{"code":"not_found","message":"session not found","retryable":false}}`），
+  不泄露存在性（§1.2 惯例）。
+- 文件路径四条都是 `400 validation_failed` 且带 `details.field='path'`：任一段是 `..`
+  或绝对路径逃逸 ⇒「path 不得逃逸目录根」；任一段是符号链接 ⇒「path 含符号链接，拒绝读取」；
+  某段是 `.git` **目录** ⇒「path 不得进入 .git 目录」（本条只作用于本节的两个文件端点，
+  工作台侧的同样收紧归 issue #726）；`files/tree` 的 path 指向文件 ⇒「path 必须是目录」，
+  `file` 的 path 指向目录 ⇒「path 必须是文件」。路径不存在 ⇒ `404 not_found`
+  「path not found」（同样带 `details.field='path'`）；该工位从未建过 `~/projects` ⇒
+  `404 not_found`「directory not found」（`files/tree` 与 `file`；`dirs` 端点仍是空列表）。
+
+审计（`audit_log`，`target` = `:fdeName`）：
+
+| action | 触发 | `details` |
+|---|---|---|
+| `admin.fde_dirs_listed` | 目录列表 | `{fde_name, item_count}` |
+| `admin.fde_sessions_listed` | 会话列表 | `{fde_name, item_count, cwd, include_archived}` |
+| `admin.fde_session_read` | 会话详情、history | `{fde_name, session_id}` |
+| `admin.fde_folded_read` | 折叠原文 | `{fde_name, session_id, round}` |
+| `admin.fde_files_tree` | 文件树 | `{fde_name, path, item_count}` |
+| `admin.fde_file_read` | 单文件读取 | `{fde_name, path, mode}` |
+
+**恰好一行**：一次成功的读取请求写恰好一行审计（列表类带 `item_count`）。文件两端点另有
+去重：同 `(管理员, FDE, path, mode)` 在 **5 分钟窗口**内只写第一行——预览来回点、以及
+`Range` 分段拉同一个文件不该把台账刷成噪声（`mode` 参与键，所以 `json` 与 `download` 各算
+一行）。会话与目录类**不去重**（一次导航一行）。审计写失败只记 warn，不改变响应（仍 200）。
+
 ---
 
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
