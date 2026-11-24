@@ -1320,7 +1320,7 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 **决策者选 (a)「只把 `_` 加进前端」**。派单前用两名只读 reviewer 独立分析（并行、各自出报告），**两份都推翻了我给的前提**，所以这一节先记被纠正的事实——否则下一个人会按我原来的错说法去改：
 
 1. **「目录名要当 DNS label」这个理由早已失效，而且不是我说的 #246 —— 是 P5 / 迁移 `deploy/migrations/0008-deprojectize.sql`**。预览 URL 全仓只有一个生成点：`projects.js#buildHostname({fdeName, port, baseDomain})` ⇒ `<工位名>-p-<端口零填充≥4位>.<伞域>`（现网实例 `http://eric-p-22000.fde.erix.vip:8090`）。**项目/目录名不进 hostname**，也不进容器名、网络名、任何下发文件。
-2. **我建议的「后端收紧到前端」被否**，理由硬到不能含糊：`sessions.js:42-44` 原话写着目录名允许下划线是**有意的**（「用户在容器内自建目录的自由命名权」）；后端收紧会让唯一带 `_` 的真实项目 `meeting_asr_app`（真库 **15 次 run**，含 `judge_done`）变成「看得见、选得中、建不了会话」，而目录名在用户磁盘上、**平台无权改名**。⇒ **方向只有「前端补完到后端」一条**。
+2. **我建议的「后端收紧到前端」被否**，理由硬到不能含糊：`sessions.js:42-44` 原话写着目录名允许下划线是**有意的**（「用户在容器内自建目录的自由命名权」）；后端收紧会让唯一带 `_` 的真实项目 `demo_app`（真库 **15 次 run**，含 `judge_done`）变成「看得见、选得中、建不了会话」，而目录名在用户磁盘上、**平台无权改名**。⇒ **方向只有「前端补完到后端」一条**。
 3. **不会重现 #202 那类「过应用校验、被 DB CHECK 炸成裸 23514」**：真库 `pg_constraint` 实查 `chat_sessions.cwd` 的 CHECK 数 = **0**；唯一那条 DNS CHECK 是 `port_allocations_hostname_dns_check`，作用在 `hostname` 列上，而该列**永远不含项目名**。
 4. **FDE 名一个字符都不能跟着放**，且比 #284 正文说的更硬：**`users_fde_name_check` 是真库 CHECK**（`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`）+ 域名预算 55（`63 − len("-p-" + 5 位端口)`）+ 进容器名/网络名/凭据路径/LLM key alias。**「挡的是没工位的人」那类判据混淆在这里的对应物是：项目名与工位名是两条独立正则、两条独立约束，放宽前者在物理上不可能影响后者——唯一要防的是有人「顺手统一」。**
 
@@ -1503,7 +1503,7 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 
 **现象**：决策者开 FDE 界面点开目录下拉，第一项是 `.pnpm-store`，真实项目被挤到后面。
 
-**取证推翻了「worker 的 HOME 不可写」这个直觉归因**（我先这么说，实测否掉）：`runner/agentd.js:984` 本来就写 `childEnv.HOME = CFG.home`（= `/home/erix`），且 `/home/erix/.local` 的属主确实是 `erix-worker`(1002)——HOME 一直可写。真因是 pnpm 自己的落位规则：**默认 store 与项目不在同一卷时，它在「项目所在卷」上另找地方建 `.pnpm-store`**，而 `~/projects` 正是 `projects` 这个 bind mount 的根（容器内 `stat -c %d`：`/home`=**52**、`/home/erix`=**64512**、`/home/erix/projects`=**64512**）。eric 空间现场：**388 MB / 22781 文件**的 `~/projects/.pnpm-store`，属主 `erix-worker`，触发者是 `lingolens`（唯一带 `pnpm-lock.yaml` 的项目）。
+**取证推翻了「worker 的 HOME 不可写」这个直觉归因**（我先这么说，实测否掉）：`runner/agentd.js:984` 本来就写 `childEnv.HOME = CFG.home`（= `/home/devuser`），且 `/home/devuser/.local` 的属主确实是 `erix-worker`(1002)——HOME 一直可写。真因是 pnpm 自己的落位规则：**默认 store 与项目不在同一卷时，它在「项目所在卷」上另找地方建 `.pnpm-store`**，而 `~/projects` 正是 `projects` 这个 bind mount 的根（容器内 `stat -c %d`：`/home`=**52**、`/home/devuser`=**64512**、`/home/devuser/projects`=**64512**）。eric 空间现场：**388 MB / 22781 文件**的 `~/projects/.pnpm-store`，属主 `erix-worker`，触发者是 `demo-project`（唯一带 `pnpm-lock.yaml` 的项目）。
 ⇒ **结论：只要缓存落位由工具自己选，换个工具（corepack / pip）就会再长一次。** 两层分开做，缺一层都只剩一半。
 
 **① 展示层（`portal/src/dirs.js`）**：新增 `isListedDirName` = `isSafeDirName` + 非 `.` 开头，只用在 `listDirs` 的枚举处。下拉是**项目选择器**不是文件管理器，这类目录不可能被选为 cwd，列出来只是噪音（且 `.` 码点排在所有字母之前 ⇒ 必然顶掉第一项）。**只影响列表可见性**：`validateSessionCwd` / `fileTree` 不筛点开头，已存在的 `~/projects/.xxx` 会话 cwd 仍可读写与展开——不是收紧旧口径，只是不加严。
@@ -1616,7 +1616,7 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 - ⚠ 给接手 P0a 的 session：**动手前先读 #359 附录那 6 条实测**——尤其「`-uno` 会让 0 提交根仓库对脏子仓库报空输出（撒谎）」、「本机 `-u` 与 `-uall` 逐字相同、`.gitignore` 会剪掉整棵 `node_modules`」、「linked worktree 的 refs 在 `commondir` 而不是 `.git` 文件指向的目录」。**`listeners.js:112-126` 没处理 `commondir`，照抄会错。**
 
 **顺带挖到的仓库级坑（与本单无关，未动，只登记）**：`origin/main` 的 `1655d7a` 把 **`node_modules` 当文件提交成了指向它自己的符号链接**
-（`git ls-files -s` 是 mode `120000`，内容 = `/home/adminwange/projects/fde_station/erix-station/node_modules`；`file` 报 *broken symbolic link*）。
+（`git ls-files -s` 是 mode `120000`，内容 = `/home/devuser/projects/fde_station/erix-station/node_modules`；`file` 报 *broken symbolic link*）。
 后果：**任何新 checkout / 切分支到该 tip 之后，`npm test` 直接 `ERR_MODULE_NOT_FOUND: Cannot find package 'erix-agent'`**
 （本次切分支就撞上了，看着像自己的改动把测试弄挂）。本机用 `npm ci` 恢复（它先 `Removing non-directory node_modules` 再装 16 个包，0.7s）。
 CI 不受伤（`npm ci` 路径），但**本地开发受伤**，而且症状完全误导人。
@@ -2829,7 +2829,7 @@ unknown runToolLoop option: "maxRounds" (its canonical home is config.run.maxRou
 - `cd portal/frontend && timeout 240 npm test`：**主 agent 在合并树上复跑两次，两次都是 53 文件 / 982 格全绿，rc=0**。
   worker 交回的是 **rc=1 / 3 格红**（`src/components/GitLightBadge.spec.ts` 的 `git-light-finish` / `git-light-ask` /
   `git-light-refresh`，报 `Target cannot be null or undefined`），并把它记成「既有基线红，在未改动的 main 上单跑同样 3 红」——
-  **那句被现验推翻**：我在**未改动的 main 检出**（`/home/eric/projects/erix-station`，HEAD `201dd09`）单跑同一个 spec
+  **那句被现验推翻**：我在**未改动的 main 检出**（`/home/devuser/projects/erix-station`，HEAD `201dd09`）单跑同一个 spec
   = **18/18 绿 rc=0**；又在合并树上做过**并发负载复现**（后台跑全量、同时单跑该 spec ×2）也**全绿**。
   ⇒ 定性：**worker 那 3 格红是它那一侧的环境性红灯，本机不可复现**（同 spec 同症状在 §8.48 有过先例：那次是主 agent
   并行跑重活压出来的）。**不是本片引入，也不是基线红** —— 两个说法都不成立，别再引用「基线 3 红」这句。
@@ -3003,7 +3003,7 @@ unknown runToolLoop option: "maxRounds" (its canonical home is config.run.maxRou
 `git -c http.proxy=http://172.20.0.35:19001 -c https.proxy=http://172.20.0.35:19001 push origin v0.1.46`。
 
 ⚠ **一条我自己犯的清理事故（零例外纪律的反面教材）**：我删 FDE 容器时用了
-`docker rm -f $(docker ps -aq --filter "name=fde-")` —— 这个 filter **把用户的 `fde-workshop-db`（postgres:16.15，
+`docker rm -f $(docker ps -aq --filter "name=fde-")` —— 这个 filter **把用户的 `otherproj-db`（postgres:16.15，
 另一个 session 正在用的测试库）一起删了**。§8.18 早就写过「清场必须按 `station.stack` / `com.docker.compose.project`
 标签过滤，不能用宽名字匹配」，我违反了它。后果被那个 session 自己的重建机制吸收（容器与库都被它重建回来了），
 但**这条口径必须按零例外执行**：删 FDE 容器前先 `docker ps --filter "name=fde-" --format '{{.Names}} {{.Image}}'`
@@ -3120,7 +3120,7 @@ portal healthy、`healthz=200` → **重建 5 台 FDE**，全部 `0.1.47 / engin
 1. **`git push -q -c http.proxy=…` 是错的写法**——`-c` 是**全局**选项，写在子命令后面会被当成 push 的参数，
    报出来的是 curl 的 `-6, --ipv6` 帮助文本（完全误导）。正解 `git -c http.proxy=… push`。
 2. **重建 FDE 容器不能用 `--filter name=fde-`**：本站 5 台带 `label=station.stack=default`，而
-   `fde-workshop-db`（另一个 session 的 postgres）**没有**这个标签 ⇒ 用
+   `otherproj-db`（另一个 session 的 postgres）**没有**这个标签 ⇒ 用
    `--filter label=station.stack=default --filter name=fde-` 精确圈定（§8.84 那次误删的正是它）。
 3. **playwright 里「用 fetch 调 `/api/auth/login`」进不去 SPA 工作台**：cookie 种上了（`/api/me` 200），
    但 SPA 的 auth store 没被填充，路由守卫照样踢回 `/login`。正解 = **走登录表单**（或登录后
@@ -3463,7 +3463,7 @@ proxy `imageId=7bae3eca…`/`digest=538ecc32…`。
 `docker compose -p station up -d --no-build station-portal` 重建 portal（拿到新 `FDE_IMAGE`）时 **`station-docker-proxy` 被作为依赖连带重建**
 ⇒ 它的 `IMAGE_ALLOWLIST` 同步换成新 digest（**这是必须的**：白名单是**另一个容器**的 env，只改 portal 的 `FDE_IMAGE`
 会在 `docker create` 时被 proxy 拒成 `create_policy_denied`，§8.70 那个事故的同型坑）→
-`docker rm -f` 五台 `fde-*`（**按 `label=station.stack=default` + `name=fde-` 双过滤**，§8.84 误删 `fde-workshop-db` 的教训）→
+`docker rm -f` 五台 `fde-*`（**按 `label=station.stack=default` + `name=fde-` 双过滤**，§8.84 误删 `otherproj-db` 的教训）→
 reconcile 40 秒内全部重建在 `983cc2bb…` 且 healthy、容器内 `station 0.1.52 / engine 0.31.0`、agentd `sse connected` + `sse ping received`。
 
 **发布物验收**（不是只信热 patch）：会话 `83b57016…` / run `3440e8a8…`（9 轮）——agentd 日志
@@ -3987,7 +3987,7 @@ tag `v0.1.56`（打在 `f5b3cce`，version 匹配）→ release `42067503370` su
 与清单**逐个一致**（portal `9158c3a2…` / fde `99bea2d2…` / proxy `86a0e30a…`）→ `deploy/.env` 三项 pin
 （备份 `/tmp/deploy.env.bak-0156`）→ `up -d --no-build station-portal`（连带重建 `station-docker-proxy`，
 `IMAGE_ALLOWLIST` 同步含新 fde digest）→ portal 实跑 `9158c3a2…`、经 Traefik `healthz=200` →
-**`docker rm -f` 五台 `fde-*`（双过滤 `label=station.stack=default` + `name=fde-`，对照确认排除了 `fde-workshop-db`）
+**`docker rm -f` 五台 `fde-*`（双过滤 `label=station.stack=default` + `name=fde-`，对照确认排除了 `otherproj-db`）
 → reconcile 20 秒内全部重建在 `99bea2d2…`**，容器内 `station 0.1.56 / engine 0.31.0`、`lib/agents-md.js` 含新代码（9 处命中）、
 agentd `sse connected` + `sse ping received`。
 
@@ -4115,7 +4115,7 @@ github.com 不通但 GHCR 通；`docker pull` 后 `image inspect .Id` 与清单 
 fde `cb8d031b…` / proxy `dccb48aa…`，`RepoDigests` 含清单 digest）→ `deploy/.env` 形态① pin **三项**
 （备份 `/tmp/deploy.env.bak-0157`）→ `up -d --no-build station-portal`（连带重建 `station-docker-proxy`；
 `IMAGE_ALLOWLIST` 由 `${FDE_IMAGE}` 派生，不需要单独改）→ portal 实跑 `5bd39ae5…`、经 Traefik `healthz=200` →
-**`docker rm -f` 五台 `fde-*`（双过滤 `label=station.stack=default` + `name=fde-`，对照确认 `fde-workshop-db` 无标签被排除）
+**`docker rm -f` 五台 `fde-*`（双过滤 `label=station.stack=default` + `name=fde-`，对照确认 `otherproj-db` 无标签被排除）
 → reconcile 5 秒内全部重建在 `cb8d031b…`**，容器内 `build-info.json` = `station 0.1.57 / engine 0.31.0`、
 `ERIX_DELEGATE_ENABLED=1`、agentd `sse connected` + `sse ping received`。
 
@@ -4484,18 +4484,18 @@ tag `v0.1.66` → release `42776650239` → 清单 portal `digest=ae90a9a6…` /
 容器故意不重建**（`FDE_IMAGE` 未动）。
 
 **真机验收（v0.1.66 发布物，主 agent 亲手）**：API `POST /api/auth/login`（eric）⇒
-`email_code_required` + `email_code_ttl_seconds: 600`；浏览器（`meeting_asr_app_playwright` + 临时 Host/Origin
+`email_code_required` + `email_code_ttl_seconds: 600`；浏览器（`demo_app_playwright` + 临时 Host/Origin
 改写代理 `127.0.0.1:18099 → 8090`，验完已 kill）走到邮箱码第二步，DOM 里
 `[data-test="emailCodeTtl"]` 中英各读一次：`The code is valid for 10 minutes.` / `验证码 10 分钟内有效。`，
 位置在输入框之后、按钮之前；容器内 `grep` 确认 `/app/portal/src/http.js` 有双语主题行、
 `/app/portal/static/app/assets/api-*.js` 同时含中英两条 i18n 串。⚠ **vision relay 当时挂了**
-（`http_request_failed` 两次）⇒ 截图的看图复核没做，改以 DOM 断言为准（`/docker/meeting_asr_app_playwright/v0166-code-ttl-zh.png`）。
+（`http_request_failed` 两次）⇒ 截图的看图复核没做，改以 DOM 断言为准（`/docker/demo_app_playwright/v0166-code-ttl-zh.png`）。
 
 **已知遗留 / 现场事实**：
 - 验收时发现 `eric` 的 `totp_login_enabled = false`（`totp_secret` 仍在）⇒ 他现在走的是
   `email_code_required`（邮箱码是唯一第二因素），两档 switch 对他是隐藏的。**不是本单改的**，
   是管理台侧某次保存的结果；要恢复 TOTP 登录去「二次验证」tab 勾回来即可。
-- 本次验收真实发出了两封双语验证码邮件（curl 探针一封 + 浏览器一封，收件人 `ewang2@intevaproducts.com`）。
+- 本次验收真实发出了两封双语验证码邮件（curl 探针一封 + 浏览器一封，收件人 `dev-user@example.com`）。
 
 **过程账（一次真的把别人的工作区搞脏了，已完整复原）**：我在 worktree `wt449h` 里为了做版本号 bump 跑了
 `git checkout -q main || git checkout -q -B main origin/main` —— 第一支因「`main` 已在主工作区检出」失败，
@@ -5572,7 +5572,7 @@ portal `sha256:42419ff2…24f7`（**portal 仍走本地构建**：`deploy/.env` 
 | portal 内引擎 | `/app/node_modules/erix-agent` = **0.33.0** |
 | 容器内真跑一条（真引擎 + 真 `shell` 工具，桩 provider） | `echo engine-0.33.0-ok` 真执行、`exit_code 0`；事件 `round_start/attempt/tool_use/tool_result/round_end/run_outcome`；`persistence_capability_degraded` **恰好 2 条**（`clearRecoveryRows` + `appendRecoveryRow`，与 #500 未做一致） |
 
-**没拿到的那一格（诚实记账）**：**真 LLM 的 run 跑不成** —— 上游中转 `inteva` 的额度**全局耗尽**：
+**没拿到的那一格（诚实记账）**：**真 LLM 的 run 跑不成** —— 上游中转组织（取值见冷层）的额度**全局耗尽**：
 `todo` 与 `eric` 两个账号的 run 都以 `litellm.AuthenticationError … 令牌额度已用尽` 失败
 （`deepseek-v4-pro` 与 `deepseek-flash` 各一次，`runs.error.code = auth`，非本单回归）。
 ⇒ #530 验收判据 7「一条真 run 时间线可读」**只做到「事件管线 + 引擎在容器内真跑」**，
@@ -9238,8 +9238,8 @@ FDE 镜像**故意不动**（本版 runner 零改动，重建 6 台只会打断�
 
 **同一次读图抓到两条真缺陷（vision 独立复述同样两条）**：
 1. 磁盘那一行设备名与类型都是「未知」——容器里 `/` 是 `overlay`，而解析层只收真实块设备行 ⇒ 找不到挂载行。
-2. FDE 计数与对账误报——`isFde` 的「名字前缀 `fde-`」把别的项目容器（`fde-workshop-db` /
-   `fde-workshop-db-old-261107`，无 station 标签）算成 FDE ⇒ 面板报「DB 6 台 ↔ Docker 8 台」并点名。
+2. FDE 计数与对账误报——`isFde` 的「名字前缀 `fde-`」把别的项目容器（`otherproj-db` /
+   `otherproj-db-old-261107`，无 station 标签）算成 FDE ⇒ 面板报「DB 6 台 ↔ Docker 8 台」并点名。
 
 **hotfix v0.1.76**（PR #687 = `577a813`，merge `db73d7d`）：① 解析层全收、「哪行算一块盘」只由
 `isRealBlockDevice` 判；去重键改 **statfs 三元组**（一个文件系统一行），设备名取真实块设备那条、path 取最短那条
@@ -9274,7 +9274,7 @@ GET /api/admin/system/metrics   disk: [('overlay','overlay','/',73)]          �
 console errors                  none
 ```
 
-宿主上那两台同名干扰项（`fde-workshop-db` / `fde-workshop-db-old-261107`，无 station 标签）仍在跑，
+宿主上那两台同名干扰项（`otherproj-db` / `otherproj-db-old-261107`，无 station 标签）仍在跑，
 面板**不再**把它们算进 FDE —— 这就是「只认标签」那条判据的现场反证。
 
 **口径提醒（下一单别踩）**：`/` 报 `overlay` 是**正确**的，不是数据缺失——容器看到的就是 overlay 视图；

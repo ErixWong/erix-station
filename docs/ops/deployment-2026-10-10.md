@@ -29,7 +29,7 @@
 
 ## 备份（宿主侧，平台不交付备份机制：deploy-contract §7.2 / issue #3）
 
-- 脚本 `/home/eric/scripts/station-db-backup.sh`；cron **`30 3 * * *`**（本地 UTC+8）
+- 脚本 `/home/devuser/scripts/station-db-backup.sh`；cron **`30 3 * * *`**（本地 UTC+8）
 - 产物 `~/backups/station-db/station-<ts>.dump`（`pg_dump -Fc` + `pg_restore --list` **可读校验**，保留 14 天），日志 `backup.log` / `cron.log`
 - ⚠️ 规范位置应是 `/docker/station-backups/`（全局约定），但 `/docker` 是 `root:root 755` 且本机**无免密 sudo** ⇒ 待一次性 `sudo mkdir + chown eric` 后把 `BACKUP_DIR` 改过去（前提记在 #233）
 - 数据卷：`/docker/station-db`（pg data，属主是容器 uid）
