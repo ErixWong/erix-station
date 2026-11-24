@@ -9527,4 +9527,4 @@ agent 回传（`PUT /api/internal/transcript/:key/rounds/:N` → `internal.js#pu
 
 **父 agent 复审另修**：worker 写的 `throw Object.assign(...)` 单行 200 字节，拆成 3 行（`style(677)` 那个 commit）。
 
-**残余**：`MAX_ROUND_BYTES` 的 env 覆盖在生产仍无效（没接进 compose 的 environment 列表，见 8.184 残余②）——删掉它还是接进去，需要先确认「真机复现要调小闸」这条用途还用不用。
+**残余**：`MAX_ROUND_BYTES` 的 env 覆盖在生产仍无效（没接进 compose 的 environment 列表，见 8.184 残余②）——**已删**（本单后续 commit）：该 env 从未接进 compose，是假旋钮（同 8.184 删 `MAX_BODY_BYTES` 的判据），改成 `transcript-limits.js` 的纯常量（`MAX_ROUND_BYTES_DEFAULT` / env 解析函数一并删，`internal.js` 的转发同删）；真机排障要调小闸就改 `transcript-limits.js` 那一行并重跑，不再引入 env；`test/internal-round-size-cap.test.js` 的 env 解析用例随函数删除，算术余量与两处源码级哨兵保留。

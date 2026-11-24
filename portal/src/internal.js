@@ -21,7 +21,7 @@ import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle } from './session-title.js';
 import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
 import { samePayload, dedupConflictDetails, DEDUP_CONFLICT_CODE } from './transcript-payload.js';
-import { MAX_ROUND_BYTES, resolveMaxRoundBytes } from './transcript-limits.js'; // issue #261123-20 M1：常量下沉叶子模块（见下方 §9.7 指针注释）
+import { MAX_ROUND_BYTES } from './transcript-limits.js'; // issue #261123-20 M1：常量下沉叶子模块（§9.7 算术契约注释就在那边）
 // issue #500：恢复行三个端点复用 store 层的同一套 SQL + 幂等判据（**不在这里重写一份**）：
 // 写路径 / 读路径 / 清盘各只有一处实现，否则会出现「store 适配器幂等、端点不幂等」这种单侧可观测的行为。
 import { createRecoveryRowStore } from './transcript-store.js';
@@ -63,11 +63,10 @@ const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
  */
 const TEXTUALIZED_MARKER_MAX_CHARS = 120;
 const PORTAL_RESERVED_EVENT_TYPES = new Set(['run_end', 'partial_output', 'attempt_killed', 'textualized_tool_call']);
-// portal.md §9.7：单轮 transcript 记录体积上限常量已下沉到叶子模块 `./transcript-limits.js`
+// portal.md §9.7：单轮 transcript 记录体积上限常量在叶子模块 `./transcript-limits.js`
 //（issue #261123-20 M1：唯一写入口 `transcript-store.js#appendRound` 也要用它，放这里会成环
-//  internal → transcript-store → internal）。下面的转发保证既有导入面不破
-//（`test/internal-round-size-cap.test.js` 从本文件导入 `resolveMaxRoundBytes`）。
-export { resolveMaxRoundBytes };
+//  internal → transcript-store → internal；原先的 env 覆盖已随 #677 删除——假旋钮从未接进
+//  compose，排障要调小就改 `transcript-limits.js` 那一行）。
 
 /** internal 通道统一错误（http.js 映射为标准错误信封，portal.md §9.13）。 */export class InternalError extends Error {
   constructor(status, code, message, { retryable = false, details } = {}) {
@@ -1599,7 +1598,7 @@ export async function putRound(pool, { container, user, runId, round, claimToken
   }
   const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
   if (bytes > MAX_ROUND_BYTES) {
-    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`); // #371-B：闸可由 env 调，文案要说真值（旧文案写死「1MB」）
+    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`); // #371-B/#677：文案报真值；原 env 覆盖已删（假旋钮从未接进 compose），排障改 `transcript-limits.js` 的常量（旧文案写死「1MB」）
   }
 
   const run = await fetchRun(pool, runId, user.id);
@@ -1806,7 +1805,7 @@ export async function putSessionRound(pool, { container, user, key, round, claim
   }
   const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
   if (bytes > MAX_ROUND_BYTES) {
-    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`); // #371-B：闸可由 env 调，文案要说真值（旧文案写死「1MB」）
+    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`); // #371-B/#677：文案报真值；原 env 覆盖已删（假旋钮从未接进 compose），排障改 `transcript-limits.js` 的常量（旧文案写死「1MB」）
   }
 
   await fetchSession(pool, key, user.id);
