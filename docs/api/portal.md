@@ -4737,7 +4737,7 @@ store adapter 契约（runner §9.1）的落库端点；`transcript_rounds.recor
 | `messages` | array（可空），元素 `{role, content, ...}` | 该轮 canonical 消息数组；`role` ∈ `user`/`assistant`（judge 注入为 user role 合成消息） |
 | `foldedPayload` | object \| `null` | `folded: true` 时必填；fold 后的展示载荷 |
 
-**大小限制**：单轮请求体 ≤ **1MB** ⚠️，越界 → `400 validation_failed`。
+**大小限制**：单轮请求体 ≤ **1MB** ⚠️，越界 → `400 validation_failed`。该上限在 store 适配器的 `appendRound`（`transcript-store.js`，常量来自叶子模块 `transcript-limits.js`）处执行，**两条写入路径（宿主预写与 agent 回传）都过它**；`internal.js` 的 400 是传输层更早的一次拦截（超限记录另在宿主预写侧被 `sessions.js` 转成 `400 validation_failed`，`details={field:'content', max_bytes}`，不会升格成 500）。
 
 响应 `200`：
 
