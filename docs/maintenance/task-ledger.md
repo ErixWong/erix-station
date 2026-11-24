@@ -9429,7 +9429,7 @@ DB 真相位 `fde_llm_bindings.budget_usd`（`numeric(12,6)`）+ `budget_period`
 **UTC 日桶限制**：日聚合表（`/user/daily/activity`，`common_daily_activity.py:563-600`）是 **UTC 日**分桶；`timezone`（传 480）**只决定 end_date 是否把今天扩成一个 UTC 桶**，历史日期 pass-through。故「本周期已用」（网关实时计数器）与用量表最后一行（UTC 日桶）**天然可能对不上**，两者**不互相校验**。
 **重置锚点**靠 config 的 `timezone`+`budget_reset_time`；**重置任务约 597s 一跳**；`proxy_batch_write_at: 60` 只影响 spend 落库/报表与日聚合的时效，**不是超发窗口**（超限判定在鉴权阶段先做预算预留：v1.103.2 对可估价请求转发前调 `reserve_budget_for_request`（`proxy/spend_tracking/budget_reservation.py:205-296`）估 token 并按定价预留、响应回来再结算；无法估价的请求回退读时判定，而这类模型通常又没配定价⇒`spend` 恒记 0⇒额度永不触发，与「未定价模型不生效」同一条因果）；`tpd_limit` 是 batch-only 不可用。
 
-**未做的真机验收（本单 LiteLLM 容器未起，均未跑）**：① 额度触发 429；② 重置是否真落在本地周期错点；③ `/user/daily/activity/aggregated` 真机响应形状（周期语义本身已由主 agent 在 v1.103.2 容器实测）。判绿只看退出码：根 `npm test`、前端 `typecheck`/`test` 均 rc=0。
+**真机验收（2026-11-24 主 agent 亲跑，dev 栈 + LiteLLM v1.103.2）**：额度超限 → `429 budget_exceeded`；周期错点 `1mo`⇒`2026-12-01 00:00 +08`、`1d`⇒次日 `00:00 +08`；`/user/daily/activity/aggregated` 形状与映射一致；`/key/update` 传两个 null ⇒ 两列一并清空；管理台三端点端到端通过（无额度 ⇒ `spend_scope:"lifetime"`，`PUT 0.5/1mo` 与 `/key/info` 对账一致，`?days=` 空串 ⇒ 400）。**新增一条实测口径**：首次设额度**不清零** `spend` ⇒ `remaining` 一开始就小于额度（eric 设 0.5 时 `spend=0.0844` ⇒ 剩 0.4156），与 LiteLLM 判定口径一致、不是 bug（详见 fde-platform §11.5）。未观测项只剩「跨过真实零点的自动归零」（需等一个周期，重置任务约 597s 一跳）。判绿只看退出码：根 `npm test`、前端 `typecheck`/`test` 均 rc=0。
 
 ### 8.183 #677 env 清理：删 2 个死旋钮 + 4 个 auth 旋钮进管理台（#718 / #720，2026-11-23，主 agent）
 
