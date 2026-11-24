@@ -414,9 +414,10 @@ GROUP BY transcript_key ORDER BY max_record_bytes DESC LIMIT 10;
 单条折叠记录的峰值 = 归档 + 非归档部分 + `messages`：
 `256 KiB`（erix-agent #461 的默认 `ERIX_FOLD_ARCHIVE_MAX_BYTES`）+ ≈`20 KiB`（真机稳定值，#460 标本）
 + ≈`565 KiB`（满预算 `messages`：203 161 估算 token × 实测 2.78 B/估算 token）≈ **840 KiB < 1 MiB**。
-⇒ 契约值 1 MiB **够用**，前提是上游那份归档上限也生效。两个数是**配套的**：把 `MAX_ROUND_BYTES`
-调到 256 KiB 以下就得同时把上游归档上限调小，否则正常折叠也会天天碰闸（这条算术钉在
-`portal/test/internal-round-size-cap.test.js`，`docs/api/portal.md` §9.7）。
+⇒ 契约值 1 MiB **够用**，前提是上游那份归档上限也生效。两个数是**配套的**：改
+`portal/src/transcript-limits.js` 的 `MAX_ROUND_BYTES` 就得同时把上游归档上限调小，否则正常折叠也会天天碰闸（这条算术钉在
+`portal/test/internal-round-size-cap.test.js`，`docs/api/portal.md` §9.7；它原先可由 env 覆盖，但那个 env 从未接进
+compose、是假旋钮，已随 issue #677 删除——调小就改上面那个常量）。
 
 ### 6.3 与修数据的关系：这一类**不修数据**
 
