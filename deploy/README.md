@@ -3,7 +3,7 @@
 P1 walking skeleton 的本地开发栈：`station-db`（Postgres）+ `station-portal`（自构建 Node 服务）+ `station-edge`（Traefik，host 网络）。
 
 > 依据：[`docs/design/deploy-contract.md`](../docs/design/deploy-contract.md) §2、[`docs/env.md`](../docs/env.md) §0（开发期参数）。
-> docker 命令在本机需 `sg docker -c '...'` 绕过（交互 shell 无 docker 组，见 env §8.1）。
+> 本机 docker 组 quirk 与绕过命令见冷层 `~/projects/docs/station-dev-machine.md`（源 pi-tools，自托管，不在公网）；非本机直接 `docker <cmd>`。
 
 ## 端口与本机避让（env §0）
 
@@ -26,12 +26,12 @@ cp deploy/.env.example deploy/.env
 #   本地构建就填 tag 形态：portal/proxy 写 `…:local`，FDE 写 `traefik/whoami`（或自建 `…fde:local`）。
 #   部署/发布按 `docs/ops/ci-release.md` §4 pin digest。
 # 2) 起栈（构建 portal 镜像 + 拉起三容器）
-sg docker -c 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build'
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build
 # 2a) （可选，Office/压缩包预览）先自建 kkFileView 镜像再带 profile 起（#366，见「说明」节）
 #   deploy/kkfileview/build-image.sh
-#   sg docker -c 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml --profile kkfileview up -d'
+#   docker compose --env-file deploy/.env -f deploy/docker-compose.yml --profile kkfileview up -d
 # 3) 观察状态
-sg docker -c 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml ps'
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml ps
 ```
 
 就绪后：
@@ -44,16 +44,16 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/healthz   # 期�
 
 ```bash
 # 容器内执行（自动先跑迁移）
-sg docker -c 'docker exec -i station-portal node portal/src/cli.js bootstrap-admin --login admin --password <临时口令>'
+docker exec -i station-portal node portal/src/cli.js bootstrap-admin --login admin --password <临时口令>
 ```
 
 ## 停止 / 重置
 
 ```bash
 # 停止（保留数据卷）
-sg docker -c 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml down'
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml down
 # 重置（删除数据卷 /docker/station-db/ 内容，慎重）
-sg docker -c 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml down -v'
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml down -v
 ```
 
 ## 说明

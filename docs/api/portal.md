@@ -907,7 +907,7 @@ station-portal user enable  --login <login>
 
 ### 2.11 跨站请求防护（#234，工单 `feat-261013-01`）
 
-**威胁模型**：session cookie 是 host-only 会话 cookie + `SameSite=Lax`（§2.5）。Lax 只挡「跨站子资源/XHR 携带 cookie」这一半；登录端点在拿到 cookie 前根本不需要 cookie，一发给 `POST /api/auth/login` 就能把用户种成攻击者的会话（登录 CSRF）。本部署又在 Traefik 后面、入口多个（`station.fde.erix.vip` 与 `tailnet-host`），cookie 自身不区分发起方。故补一道**不读 cookie、不靠配置项**的服务端防线，并把拒绝写审计（可观测）。
+**威胁模型**：session cookie 是 host-only 会话 cookie + `SameSite=Lax`（§2.5）。Lax 只挡「跨站子资源/XHR 携带 cookie」这一半；登录端点在拿到 cookie 前根本不需要 cookie，一发给 `POST /api/auth/login` 就能把用户种成攻击者的会话（登录 CSRF）。本部署又在 Traefik 后面、入口多个（伞域名入口与宿主 tailnet IP 入口，取值见冷层），cookie 自身不区分发起方。故补一道**不读 cookie、不靠配置项**的服务端防线，并把拒绝写审计（可观测）。
 
 **落点**：`portal/src/http.js` 的纯函数 `checkSameOrigin({method, originHeader, secFetchSiteHeader, hostHeader, forwardedHostHeader})` + 豁免包装 `csrfGateFor(req, pathname)`，在 `routeApi` 里、**分派到任何 handler 之前**统一执行（故拒绝一定发生在副作用之前；`POST /api/login` 的 307 兼容跳转也在这道防线之后）。测试：`portal/test/csrf-origin.test.js`。
 
@@ -931,9 +931,9 @@ station-portal user enable  --login <login>
 
 **为何 `same-site` 不能直接放行（返修，2026-10-13）**：`same-site` 的规范语义是「**同注册域、不同 origin**」，而本站**整站坐在同一个注册域 `erix.vip` 下**：portal 在 `station.fde.erix.vip`、FDE 预览在 `eric-p-22000.fde.erix.vip`。于是从预览 host 发的 XHR，浏览器给的 `Sec-Fetch-Site` 正是 `same-site`；而 session cookie 是 **host-only + `SameSite=Lax`**（§2.5），`SameSite` 判的也是注册域 ⇒ **cookie 照样被带上**（Lax 不挡同站），CORS 只让它读不到响应、**写副作用已经发生** = 教科书意义上的 CSRF。拿旧判据（`same-site` 直接放行）这道防线会在**本站最现实的场景**（任意 FDE 预览 host 上跑的、agent 写的应用去 POST portal API）直接失效，根本走不到 Origin 比对。现口径：`same-site` 一律落到判据 c（同注册域但不同 origin ⇒ 不等 ⇒ 拒 `origin_mismatch`）；`same-site` 且 Origin 缺失 ⇒ 落 d 放行（与旧口径一致，**不新造严格性**）。回归门：`portal/test/csrf-origin.test.js`。
 
-**归一化**：小写、剔首尾空白、剥掉**与该 scheme 相同**的默认端口（`http:80` / `https:443`）；**非默认端口必须保留**（现网 dev 栈就是 `station.fde.erix.vip:8090` 与 `tailnet-host:8090`，把端口丢了就是拿 8090 与 80 当同源）。同源基线从请求自己的 Host 派生 ⇒ **零新增配置项**，两个入口天然各自成立（互不充当对方的基线）。
+**归一化**：小写、剔首尾空白、剥掉**与该 scheme 相同**的默认端口（`http:80` / `https:443`）；**非默认端口必须保留**（现网 dev 栈就是带端口的两个入口（伞域名入口与宿主 tailnet IP 入口，取值见冷层），把端口丢了就是拿 8090 与 80 当同源）。同源基线从请求自己的 Host 派生 ⇒ **零新增配置项**，两个入口天然各自成立（互不充当对方的基线）。
 
-**只比 authority、不比 scheme（契约点，理由写进代码注释）**：本部署处在 http（dev `:8090` / `tailnet-host:8090`）与 https 共存的过渡期，portal 又常在边缘卸载 TLS，`X-Forwarded-Proto` 与 Origin 的 scheme 不总是同形；拿 scheme 参战会把「同一个站点的 http/https 两面」误杀成跨站。CSRF 要防的是**别的站点**带本站 cookie 发写请求，同站不同 scheme 不构成这个威胁，所以 scheme 只用在上表的默认端口归一化。
+**只比 authority、不比 scheme（契约点，理由写进代码注释）**：本部署处在 http（dev 入口，取值见冷层）与 https 共存的过渡期，portal 又常在边缘卸载 TLS，`X-Forwarded-Proto` 与 Origin 的 scheme 不总是同形；拿 scheme 参战会把「同一个站点的 http/https 两面」误杀成跨站。CSRF 要防的是**别的站点**带本站 cookie 发写请求，同站不同 scheme 不构成这个威胁，所以 scheme 只用在上表的默认端口归一化。
 
 **畸形一律拒（绝不「解析失败当同源」）**：`Origin` 不可解析 / 多值（重复头被 Node 拼成 `a, b`）/ 含空白或制表或 CR-LF / 带路径（与 #241 的 CORS 形状口径一致）/ opaque `null` ⇒ 拒；有 `Origin` 但请求自身 authority 缺失或不合法（无 Host、XFH 多值、带 scheme）⇒ 也拒。`Sec-Fetch-Site` 的多值同样按 token 展开：**跨站 token 只要出现过就算跨站**（同站 token 洗不白它，fail-closed）。
 
@@ -1085,7 +1085,7 @@ station-portal user enable  --login <login>
 **最小用法（脚本/agent）**：
 
 ```sh
-PW=$(cat ~/.config/creds/station-dev-password-file)
+PW=$(cat "$STATION_DEV_PASSWORD_FILE")  # 变量取值见冷层 `~/projects/docs/station-dev-machine.md`
 # 1) 管理员登一次拿会话（admin 口令直通，不发邮件）
 curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -c /tmp/adm.jar -X POST \
   https://admin.fde.erix.vip:9443/api/auth/login -H 'Content-Type: application/json' \
@@ -1100,7 +1100,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
   https://admin.fde.erix.vip:9443/api/me   # ⇒ 200 + X-Auth-Method: api_token
 ```
 
-> 令牌存哪：本机约定进 `~/.config/creds/`（600，不入库不提交）。丢了只能重签——
+> 令牌存哪：本机约定进凭据目录（600，不入库不提交，路径见冷层 `~/projects/docs/station-dev-machine.md`）。丢了只能重签——
 > 库里只存 sha256，**没人能再看到它**（列表也不返 hash）。
 
 ---
@@ -3265,8 +3265,8 @@ wp5/wp6 的「起一套隔离栈」相反：新栈必然自洽，拿它验版本
 
 | 腿 | 需要什么 | 缺了会 skip 的场合 |
 |---|---|---|
-| API（默认跑） | `PORTAL_URL`（缺省 `http://127.0.0.1:${PORTAL_HOST_PORT:-18080}`）连得上；`ADMIN_PASSWORD_FILE`（缺省 `~/.config/creds/station-dev-password-file`，AGENTS.md §4.1）里的 `ADMIN_LOGIN`（缺省 `admin`）能**口令直通** | 栈没起 / 口令已轮换 / 这个账号开了 TOTP 或邮箱码（本脚本只会第一步） |
-| 容器 | `docker` 可用（直连或 `sg docker -c`）、`PORTAL_CONTAINER`（缺省 `station-portal`）在跑、镜像里有 `/app/build-info.json` | 没 docker；或镜像是 #586 **之前**烘的（里面根本没那个文件 —— 那正是本节说的 `source=package` 场合） |
+| API（默认跑） | `PORTAL_URL`（缺省 `http://127.0.0.1:${PORTAL_HOST_PORT:-18080}`）连得上；`ADMIN_PASSWORD_FILE`（缺省指向冷层记录的口令文件，见 `~/projects/docs/station-dev-machine.md`，AGENTS.md §4.1）里的 `ADMIN_LOGIN`（缺省 `admin`）能**口令直通** | 栈没起 / 口令已轮换 / 这个账号开了 TOTP 或邮箱码（本脚本只会第一步） |
+| 容器 | `docker` 可用（直连或本机 docker 组包装，见冷层）、`PORTAL_CONTAINER`（缺省 `station-portal`）在跑、镜像里有 `/app/build-info.json` | 没 docker；或镜像是 #586 **之前**烘的（里面根本没那个文件 —— 那正是本节说的 `source=package` 场合） |
 | UI（点名才跑） | `E2E_UI=1` + `PLAYWRIGHT_CONTAINER`（缺省 `erix_station_playwright`）在跑且容器内有 `/app/node_modules/playwright` | 没点名（真浏览器要几十秒），或那个容器不在跑/没装 playwright。UI 腿用**容器里的** playwright，仓库**不**加这个依赖 |
 
 可改的坐标（同一台机器上验别的栈）：`PORTAL_URL` / `PORTAL_HOST_PORT` / `PORTAL_CONTAINER` /
