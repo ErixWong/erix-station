@@ -21,6 +21,7 @@ import * as artifacts from './artifacts.js';
 import * as llm from './llm.js';
 import { createLlmGatewayClient, LlmGatewayError } from './llm-gateway.js';
 import * as admin from './admin.js';
+import * as seatContent from './admin-seat-content.js'; // #727：管理台按 FDE 只读浏览会话/文件
 import * as dirs from './dirs.js';
 import * as previewmiss from './previewmiss.js';
 import * as previewproxy from './previewproxy.js';
@@ -2311,6 +2312,79 @@ async function handleAdminApi(req, res, ctx, url) {
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
 
+  // issue #727（契约 portal.md §4.22）：管理台按 FDE 只读浏览会话记录与项目文件。
+  // 7 条全部只读；handler 只是薄封装（目标 FDE 解析 / 牢笼 / 审计都在 admin-seat-content.js）。
+  const adminFdeDirsMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/dirs$/);
+  if (adminFdeDirsMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeDirsMatch[1]);
+    requireAdminReadMethod(req);
+    const data = await seatContent.listFdeDirs({
+      pool: ctx.pool, ctx, fdeName, actorId: session.user.id, log: ctx.log,
+    });
+    return sendJson(res, 200, data);
+  }
+  const adminFdeSessionsMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/sessions$/);
+  if (adminFdeSessionsMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeSessionsMatch[1]);
+    requireAdminReadMethod(req);
+    const data = await seatContent.listFdeSessions({
+      pool: ctx.pool, ctx, fdeName, actorId: session.user.id,
+      query: url.searchParams, log: ctx.log,
+    });
+    return sendJson(res, 200, data);
+  }
+  // 详情 / 历史 / 折叠原文：`sessionId` 不做形状预判——`fetchSession` 对非法 UUID
+  // 已经给 404，这里再判一次只会多一个分流（同一形状的 404 不靠重复判断保证）。
+  const adminFdeSessionMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/sessions\/([^/]+)$/);
+  if (adminFdeSessionMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeSessionMatch[1]);
+    requireAdminReadMethod(req);
+    const data = await seatContent.getFdeSession({
+      pool: ctx.pool, ctx, fdeName, actorId: session.user.id,
+      sessionId: adminFdeSessionMatch[2], query: url.searchParams, log: ctx.log,
+    });
+    return sendJson(res, 200, data);
+  }
+  const adminFdeSessionHistoryMatch =
+    pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/sessions\/([^/]+)\/events\/history$/);
+  if (adminFdeSessionHistoryMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeSessionHistoryMatch[1]);
+    requireAdminReadMethod(req);
+    const data = await seatContent.getFdeSessionHistory({
+      pool: ctx.pool, ctx, fdeName, actorId: session.user.id,
+      sessionId: adminFdeSessionHistoryMatch[2], query: url.searchParams, log: ctx.log,
+    });
+    return sendJson(res, 200, data);
+  }
+  const adminFdeSessionFoldedMatch =
+    pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/sessions\/([^/]+)\/folded\/(\d+)$/);
+  if (adminFdeSessionFoldedMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeSessionFoldedMatch[1]);
+    requireAdminReadMethod(req);
+    const data = await seatContent.getFdeFolded({
+      pool: ctx.pool, ctx, fdeName, actorId: session.user.id,
+      sessionId: adminFdeSessionFoldedMatch[2], round: adminFdeSessionFoldedMatch[3],
+      query: url.searchParams, log: ctx.log,
+    });
+    return sendJson(res, 200, data);
+  }
+  const adminFdeFilesTreeMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/files\/tree$/);
+  if (adminFdeFilesTreeMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeFilesTreeMatch[1]);
+    requireAdminReadMethod(req);
+    const data = await seatContent.getFdeFileTree({
+      pool: ctx.pool, ctx, fdeName, actorId: session.user.id,
+      query: url.searchParams, log: ctx.log,
+    });
+    return sendJson(res, 200, data);
+  }
+  const adminFdeFileMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/file$/);
+  if (adminFdeFileMatch) {
+    const fdeName = decodeAdminFdeName(adminFdeFileMatch[1]);
+    requireAdminReadMethod(req);
+    return handleAdminFdeFile(req, res, ctx, session, fdeName, url);
+  }
+
   return sendJson(res, 404, errorBody('not_found', 'not found'));
 }
 
@@ -2326,6 +2400,38 @@ function decodeAdminFdeName(raw) {
     throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
   }
   return fdeName;
+}
+
+/**
+ * 管理台只读面的方法闸门（issue #727）：口径与同族 admin 端点逐字相同（非 GET ⇒ 405
+ * `method_not_allowed`）——抽成一个函数而不是贴 7 遍，是为了不出现「第六条忘了写」的分歧。
+ */
+function requireAdminReadMethod(req) {
+  if (req.method !== 'GET') {
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+}
+
+/**
+ * GET /api/admin/fdes/:fdeName/file（issue #727）：`mode=json|stream|download`。
+ * 与用户面 `handleFilePreview` 同一条写出路径（DTO 自带 status + headers + stream），
+ * 但不做 `previewmiss` 埋点：那是工作台用户的面板埋点，管理员浏览不该污染它。
+ */
+async function handleAdminFdeFile(req, res, ctx, session, fdeName, url) {
+  const mode = url.searchParams.get('mode') ?? 'json';
+  const data = await seatContent.getFdeFile({
+    pool: ctx.pool, ctx, fdeName, actorId: session.user.id,
+    query: url.searchParams, range: req.headers.range ?? null, log: ctx.log,
+  });
+  if (mode !== 'stream' && mode !== 'download') return sendJson(res, 200, data);
+  res.writeHead(data.status, data.headers);
+  if (data.stream) {
+    data.stream.on('error', () => res.destroy());
+    data.stream.pipe(res);
+  } else {
+    res.end(); // 416：只有头没有体
+  }
+  return undefined;
 }
 
 /** 按 fde_name 解析用户；不存在 → 404 `not_found`（复用 admin 面现有码，不新造）。 */
