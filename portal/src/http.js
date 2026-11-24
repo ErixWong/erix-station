@@ -72,11 +72,12 @@ const DEFAULT_JSON_BODY_LIMIT = 64 * 1024;
  * 值 1 MiB。只给这两个「用户输入正文本身」的端点放宽，约束两条：
  * ① 必须 **>** `MAX_MESSAGE_CONTENT_LENGTH`（`sessions.js` = 100_000 字符）× 3 —— 中文 UTF-8
  *    最坏每字符 3 字节 ≈ 300 KB，否则业务闸在 64 KiB 传输闸下永远不可达（用户看到 413 而非「content 过长」）；
- * ② 必须 **≤** `MAX_ROUND_BYTES`（`internal.js` 默认 1 MiB，单轮 transcript 记录上限，消息会进这个记录）。
+ * ② 必须 **≤** `MAX_ROUND_BYTES`（`transcript-limits.js` 契约常量 1 MiB，单轮 transcript 记录上限，消息会进这个记录）。
  *
- * ⚠ 约束 ② **没有动态联动**：`MAX_ROUND_BYTES` 可由 env 覆盖调小（`resolveMaxRoundBytes`，
- *   真机要把闸调到几百 KB 复现「宿主拒 → 剥归档重试」），而这里写死 1 MiB、不读那个 env。
- *   所以运维一旦把 `MAX_ROUND_BYTES` 降到 1 MiB 以下，`MESSAGE_BODY_LIMIT` 就可能**超过**它、
+ * ⚠ 约束 ② **没有动态联动**：`MAX_ROUND_BYTES` 是纯常量（原先的 env 覆盖已随 issue #677 删除——
+ *   假旋钮从未接进 compose；真机要把闸调到几百 KB 复现「宿主拒 → 剥归档重试」，直接改
+ *   `transcript-limits.js` 那一行并重跑），而这里写死 1 MiB、不跟着它动。
+ *   所以一旦有人把 `MAX_ROUND_BYTES` 降到 1 MiB 以下，`MESSAGE_BODY_LIMIT` 就可能**超过**它、
  *   本文件也不会察觉（此时超限消息会在 `internal.js` 的 round 闸被拒，而非在传输层）。
  *   默认值相等（都 1 MiB）⇒ 约束 ② 恰好卡在上界，**不要**为了「留余量」把它调更小——
  *   再小就顶不住约束 ①（100k 中文 × 3 ≈ 300 KB 要过去），业务闸会重新变不可达。

@@ -22,6 +22,10 @@ import { foldLedgerRecords } from './transcript-fold.js'; // 0.25.0 契约判据
 import {
   payloadFingerprint, samePayload, dedupPayloadConflict, transcriptRecordKey,
 } from './transcript-payload.js';
+// issue #261123-20：体积保险丝的上限。来路是叶子模块 `./transcript-limits.js`，**不是 `internal.js`**
+// ——`internal.js` 本来就 import 本文件，反向 import 会成环；两处校验（internal 传输层 400 与
+// 本处写入口抛错）共用同一个常量、同一把尺。
+import { MAX_ROUND_BYTES } from './transcript-limits.js';
 
 /**
  * 点查既有 record（与 `loadByDedupKey` 同一条 SQL、同一个谓词）：appendRound 判「同 key 异 payload」
@@ -98,6 +102,15 @@ export function createSessionTranscriptStore(client) {
       const dedupKey = record?.dedupKey ?? record?.roundKey;
       if (typeof dedupKey !== 'string' || dedupKey === '') {
         throw new Error('transcript store: record.dedupKey is required');
+      }
+      // issue #261123-20 体积保险丝（**先判后写**：超限抛错，下面的 INSERT 一次都不许执行）。
+      // 本函数是唯一写入口：宿主预写（sessions.js postMessage → appendUserInputTurn，此前无闸）
+      // 与 agent 回传（internal.js putRound，那里是传输层更早的一次 400 拦截）都从这里过。
+      const fuseBytes = Buffer.byteLength(JSON.stringify(record), 'utf8');
+      if (fuseBytes > MAX_ROUND_BYTES) {
+        const msg = `transcript store: record is ${fuseBytes} bytes, `
+          + `exceeds ${MAX_ROUND_BYTES} byte limit`;
+        throw Object.assign(new Error(msg), { code: 'transcript_record_too_large' });
       }
       const inserted = await client.query(
         `INSERT INTO transcript_rounds
