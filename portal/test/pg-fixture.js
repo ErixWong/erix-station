@@ -97,10 +97,42 @@ export async function acquireBootstrapLock({
  *   「建库失败会不会泄锁」。`lockFile` 让夹具测试用自己那个锁文件 —— 默认那个是与真库用例共用的，
  *   `npm test` 并发跑时去碰它就是自找竞态。
  */
+// pg Pool 对「空闲客户端」错误只有一条出路：pg-pool 的 idleListener 会调
+// pool.emit('error', err, client)（见 node_modules/pg-pool/index.js:62）。
+// Pool extends EventEmitter；没有 'error' 监听者时 EventEmitter 直接抛出，变成
+// uncaughtException，整条真库测试腿就红。这就是 pg 反复强调的那条：
+// 「永远给 Pool 挂 error 监听」。
+//
+// 本夹具用 DROP DATABASE … WITH (FORCE) 拆库：服务端强制踢掉该库所有连接，
+// 而 pool.end() 正在关闭中的 socket 仍可能收到这条终止报文，于是触发
+// pool.emit('error')。这是「拆库 FORCE 与池关闭的竞态」，是预期内的收尾
+// 噪声，非被掩盖的产品 bug。所以只吞这一类终止，其余一律留痕。
+function isDropDbTermination(err) {
+  if (!err) return false;
+  if (err.code === '57P01') return true;
+  const msg = typeof err.message === 'string' ? err.message : '';
+  return msg.includes('terminating connection due to administrator command');
+}
+
+// 给本夹具创建的 pool 挂 error 监听：拆库导致的终止吞掉；其余不能吞。
+// 为什么不能吞：真连接错误要靠日志看见。所以交给 log(...)：不 throw、
+// 不静默。
+export function attachPoolErrorHandler(pool, log) {
+  const sink = typeof log === 'function' ? log : console.error;
+  pool.on('error', (err) => {
+    if (isDropDbTermination(err)) return;
+    const msg = err && err.message ? err.message : String(err);
+    sink(`pool error（非拆库终止，需排查）: ${msg}`);
+  });
+}
+
 export function createPgFixture(adminUrl, {
   prefix = 'wfx', lockFile = LOCK_FILE, createDatabase = null, dropDatabase = null,
 } = {}) {
   const adminPool = adminUrl ? createPool(adminUrl, { max: 2 }) : null;
+  // adminPool 没有 per-用例的 log；真·非拆库错误只能落到 console.error
+  // （可见、不静默）。
+  if (adminPool) attachPoolErrorHandler(adminPool, (m) => console.error(`[pg-fixture] ${m}`));
   const admin = adminUrl ? new URL(adminUrl) : null;
   const loginRole = admin ? decodeURIComponent(admin.username) : '';
   const loginPw = admin ? decodeURIComponent(admin.password || '') : '';
@@ -144,6 +176,7 @@ export function createPgFixture(adminUrl, {
       if (runMigrate) {
         // baseline(schema.sql) → bootstrap.sql → 全部增量。
         pool = createPool(url, { max: poolMax });
+        attachPoolErrorHandler(pool, log);
         await migrateImpl(pool, { env: { DATABASE_URL: url }, log: { log } });
       }
       return await fn({ database: name, url, pool, dbUrl, adminPool });
