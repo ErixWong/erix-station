@@ -9852,3 +9852,73 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
 
 **残余**：`deploy/.env` 的 digest pin 与「换 FDE 镜像必须重建容器」是发布后动作（ci-release §2），
 本单未做。
+
+### 8.196 #727 片 2b：会话目录二级菜单（folder → session）+ 运行态与刷新（#727 / PR #757，2026-11-25，erix_run + 主 agent 真机回访）
+
+**为什么补**：用户验收指出上一版把需求做窄了——原始需求是「有个 folder(project) / session 的二级菜单」，
+而片 2 做成了「会话平铺 + 文件树」两栏并列，目录与会话之间只有「点会话高亮目录」这条弱连接，
+**不能先选目录再看该目录的会话**；同时 `GET .../sessions` 与详情 DTO 都返回 `active_run_id`，
+但页面一个都没渲染（管理员看不出「谁在跑」）。
+
+**做法（后端零改动）**：`listSessions` 本来就支持 `cwd` 参数，目录列表复用页面已加载的 `GET .../dirs`。
+- 会话面板 header 加目录下拉（`全部目录` + 43 个一级目录，带 `N running / M queued` 徽标）+ 刷新按钮
+- 选中目录 ⇒ 会话列表按 `cwd` 过滤
+- **双向联动**：点文件树一级目录 ⇒ 过滤切过去；点会话 ⇒ 若它不在当前过滤里，过滤切到它的 `cwd`
+- 深链打开时过滤落在会话所属目录
+- 会话行与详情元信息行显示运行态徽标（`active_run_id` 非空 ⇒ 绿点 + running；不用红色，红是错误语义）
+- 不做定时轮询（只读 + 零 SSE），刷新靠按钮
+
+**真机 e2e（主 agent 亲跑，dev 栈用本分支重建）**：目录下拉 44 项；选 `c3-mv6gcbck-2` ⇒ 会话 1 条且
+全部属于该目录；**运行中徽标 1 个**（该目录确有 `cancelling` run，真数据命中）；点树目录 `acc-019` ⇒
+过滤切到 `~/projects/acc-019`；点会话（cwd=hello-station）⇒ 过滤自动切到 `~/projects/hello-station`；
+刷新 ⇒ 新增 2 个请求；只读红线全绿（非登录写 0 / `/pv/` 0 / tickets 0 / pageerror 0）；无裸 i18n key。
+判绿：`typecheck` rc=0、前端 88 files/1886 tests rc=0、根 `npm test` rc=0。
+
+**遗留**：过滤到某目录时文件树**不反向高亮**该目录（只做了树→过滤方向）；Office/zip 仍只给下载。
+
+### 8.197 #726 收尾：文件流「谁开谁关」收敛到 FileHandle（#733 / #739 / #745，2026-11-24~25）
+
+**三次迭代（每次都是 CI 抓出来的，本地全绿）**：
+1. **#733**（TOCTOU）：`lstat` 校验后按字符串路径重开 ⇒ FDE 用 `rename` 换 symlink 可读到 jail 外
+   （别的 FDE 的 `.git-credentials`、portal 自己的 `DATABASE_URL`）。修法：`fsp.open` 拿 fd →
+   `readlink('/proc/self/fd/<fd>')` 反查真实路径做 containment → **用同一个 fd** 建流。
+2. **#739**：CI 偶发 `unhandled EBADF`。诊断为「两个关闭者」——`autoClose: true` 让流关 fd，
+   `close` 事件里又 `fh.close()`。修法：`autoClose: false` + `closeOnce` 幂等。
+3. **#745**：CI **仍**偶发（且 PR 的 merge-ref 直接挂到 20 分钟超时）。根因更深：`fs.createReadStream(null, {fd})`
+   拿的是**裸 fd 号**，流与 FileHandle 各自都认为拥有它——`autoClose: false` 只阻止「正常结束自动关」，
+   **不阻止 `_destroy()` 关 fd**；第二次关时那个号可能已被别的 open 复用。修法：改用
+   `fh.createReadStream({ start, end, autoClose: true })`（Node 22 内部把 **handle 本体**当 fd 传，
+   `FileHandleOperations.close` 走 `handle[kUnref]()`），删掉三个手工出口；顺带给两条
+   `res.on('close', () => stream.destroy())`（客户端提前断开时 pipe 只 unpipe、不停源流，源流会半途握着 fd）。
+
+**方法论教训（比代码更值钱）**：#739 是「本地绿 + PR CI 绿」就合了，而那次 CI 绿是运气。
+本仓有 `workflow_dispatch` 可以**在分支树上直接跑门禁**（约 4 分钟），碰 fd/流/时序类改动应当先跑它，
+再走 PR——#745 就是这么过的（run `45361389915` success）。
+
+**残余（已核查不可达）**：硬链接能绕过 `/proc/self/fd` 反查（它给的是打开时用的路径），但实测
+`fde-eric` 容器只挂自己的 `home/projects/cache`，容器内没有路径指向别人的文件；将来加共享挂载要重评。
+
+### 8.198 管理台工位内容 e2e 落仓 + CI 真库腿去抖（#743 / #758 / PR #763，2026-11-25，erix_run + 主 agent）
+
+**① e2e 落仓（PR #743）**：此前 e2e 只存在于主 agent 的 `/tmp` 脚本里（跑过、通过，但**没进仓库**）
+⇒ 别人不能复跑、以后改动没有回归。现在 `portal/integration/seat-content-e2e.mjs`（`npm run test:integration:seat`）：
+- **HTTP 腿（总是跑）** 9 条：登录 / dirs / sessions / 详情含 `queued_messages` / history / files-tree /
+  **404 同形**（跨 FDE 与不存在逐字节相同）/ **路径红线**（`../alice`、`.git` ⇒ 400）/ **归档开关**
+  （顺 `next_cursor` 翻页找 archived，不带开关 404、带开关 200）
+- **UI 腿（`E2E_UI=1`）**：真浏览器进 `#/admin/seat-content`，会话行 + 文件树 + 对话 + 文件预览 +
+  只读红线（非登录写 0 / `/pv/` 0 / tickets 0 / pageerror 0）+ 裸 i18n key 哨兵
+- 首版 `S9` **恒 skip**（只查前 50 条，而归档会话都排在后面）——主 agent 复跑抓到，改成翻页后 0 skip
+
+**② CI 真库腿随机红（#758 / PR #763）**：`main` 连续几次 push 红在**不同的真库腿**上，rerun 又绿。
+- **第一半（诊断面）**：`scripts/check-required-legs.mjs` 原来只打汇总行，CI 日志里看不到断言原文。
+  改成红时打印 `not ok` 切片（无 `not ok` 则退化为尾部 60 行，每腿上限 120 行）+ 真库腿**显式重试一次**
+  （必须打印「第 2 次」，不许静默重试）；切片逻辑抽到 `scripts/lib/leg-output.mjs` + 9 格单测。
+- **第二半（根因）**：诊断装上后第一次就打出
+  `uncaughtException: terminating connection due to administrator command`。根因：夹具清理顺序是
+  `pool.end()` → `DROP DATABASE … WITH (FORCE)`，而 `pool.end()` 返回后正在关闭的 socket 仍可能收到
+  服务端终止报文（`57P01`）；`pg` 的 `Pool` 对空闲客户端错误只有 `pool.emit('error')` 一条出路，
+  **没有监听者时 EventEmitter 直接抛** ⇒ 整条腿红。修法：夹具创建的两个 pool 都挂 `error` 监听，
+  **只吞拆库导致的终止**（`57P01` / 该 message），其余走 `log` 留痕；新增 5 格单测钉住语义。
+
+**验证**：全新 `postgres:16` 上两条最常红的腿**各跑 5 遍全绿**、日志 0 次 `terminating connection`；
+`check-required-legs` 3 条腿全真跑 0 skip rc=0；合并后 `main` CI（`ddbc590`）**success**。
