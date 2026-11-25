@@ -11,7 +11,7 @@
 //
 // 新建与编辑表单已抽成子组件 `MacroTemplateForm.vue`（issue #759）：同一套字段控件，靠 `mode`
 // 分流「新建预填 schema default」与「编辑预填模板已有值」两种语义——这里只管开/关与列表更新。
-import { computed, onMounted, ref } from 'vue';
+import { onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
 import { kindMessageKey } from '../lib/macroView';
