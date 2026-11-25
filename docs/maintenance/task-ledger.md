@@ -9999,3 +9999,24 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
 **门禁**：`node scripts/agents-hotlayer-budget.mjs` VERDICT ok（热层 10214 / 预算 10240）；`node --test portal/test/api-tokens.test.js` 18 pass / 0 fail；`TEST_DATABASE_URL=… node scripts/check-required-legs.mjs` 三条真库腿 rc=0；`npm test` rc=0。
 
 **裁决：别因为表建了就默认要做界面**。`api_tokens` 表早在 DDL 里，但「有表」≠「该有签发界面 / 该接客户端」——判据是消费者。零调用方 + 零行 + 一把不敢签的不过期管理员钥匙 ⇒ 关路由比造界面诚实。将来真有 runner 要长期凭据，把常量翻成 `true` 即可，不必先补一版界面。
+
+### 8.201 #740 客户端 IP 别再全记成 Traefik：只在可信对端时采信 `X-Forwarded-For` 最右一项（261125，erix_run + 主 agent，代号 fix-261125-02）
+
+**7 处坐标（改前，全在 `portal/src/http.js`）**：`4101`（登录 `login:<ip>:<login>`）、`4516`（邮箱码校验 `emailcode:<userId>:<ip>`）、`4604`（重发发信 `email:<ip>`）、`4727`（TOTP 校验 `totp:<userId>:<ip>`）、`5051`（预览票 `ticket:<userId>:<ip>`）、`5170`（批量预览票 `ticket:`）、`5296`（改密 `password:<userId>:<ip>`）——全是 `const ip = req.socket.remoteAddress || 'unknown';`。现全部改成 `const ip = clientIp(req);`；helper 落在本文件请求工具区（`getBearerToken` 之后），并 `import net from 'node:net'`。**改后 `req.socket.remoteAddress` 在整个 `portal/src/**` 只剩 `clientIp` 内部 1 处（防回潮闸钉死）。**
+
+**为什么取「最右一项」而不是最左**：标准里每跳代理把自己看到的对端**追加**到 `X-Forwarded-For` 末尾 ⇒ 最右一项 = 离 portal 最近那跳（edge/Traefik）写下的真客户端；**最左一项是客户端自己写的、可任意伪造**。取最左等于把「客户端能不能伪造自己的限流键」交给客户端。A2 用 `bogus-not-an-ip, 198.51.100.7` 钉死：用 `198.51.100.7`，最左伪造项被忽略。工单另定：最右一项解析不出合法 IP ⇒ **回落 socket，不向左继续找**（A2b 用 `1.2.3.4, garbage` 钉：回落 socket，绝不退回左边能解析的 `1.2.3.4`）。
+
+**可信判定为什么刻意不加 env 旋钮**：不变式 2「ingress 是唯一的路」+ portal 只 publish `127.0.0.1` ⇒ 生产里 socket 对端必然是 edge 的私有/回环地址。可信集合 = loopback（`127/8`、`::1`）/ RFC1918（`10/8`、`172.16/12`、`192.168/16`）/ ULA（`fc00::/7`），完全由部署形态推导，没有「运维要加白名单」这个真实配置面；加 env 只会多一个能配错的开关（#677 正在收 env）。对端不在这些段里（有人绕过 edge 直连、对端是公网地址）⇒ 头可任意伪造 ⇒ **不信头**、用 socket 对端（A3）。IPv6 带 zone（`%eth0`）先去掉、`::ffff:a.b.c.d` 还原成 v4 再记（否则同一 v4 客户端会以两种形态各占一桶）。**多层代理要按层数取右数第 N 项**，当前部署 = 单 edge ⇒ 取最右一项即正确。
+
+**A1–A6 实测读数（本支自跑，非引用）**：
+- 单元 `portal/test/http-client-ip.test.js`：A1（loopback+XFF ⇒ `203.0.113.9`）、A2（多值取最右）、A2b（最右不可解析回落 socket）、A3（公网对端忽略头）、A4（无头用 socket、缺失回落 `unknown`）、可信边界 13 信 / 9 不信参数化、zone/`::ffff:` 归一化，**9 pass / 0 fail**。
+- HTTP 端到端 A5（`portal/test/login-email-code.test.js`，真 server + fetch 带 XFF）：`emailSendRateLimit.maxFailures=1` + 关复用窗口 ⇒ 客户端 A 第一次 200 且发信码行 `created_ip=203.0.113.1`；A 第二次 429 `rate_limited`（带 `Retry-After`、且**发信前**就拒、不多发一封）；**同一时刻**客户端 B（`198.51.100.7`）仍 200 ⇒ 分桶成立、A 的那桶没毒害 B。**34 pass / 0 fail**。
+- A6 防回潮闸：扫 `portal/src/**/*.js`（含可选链 `req?.socket?.remoteAddress` 变体），除 `clientIp` 文档+函数体的豁免区外一律红；另有「自证非恒绿」格（plain 与 `?.` 两种写法都必须被抓）。
+- **变异自证**：把 `clientIp` 临时退化成「只用 socket」后，A1/A2/可信边界/归一化/A5 全红（5 fail），绿灯不是「不报错即绿」。
+- `created_ip` 语义核对（工单 §1 末条）：写入点 `login_pending`（`auth.js:200`、`login-email-code.js:72/277`）与 `login_sessions.ip`（`auth.js` `createSession`）都是把 handler 里的 `ip` 透传下去——换 `clientIp(req)` 后**自动**记真客户端 IP，无固定值断言需要改（既有 fake 只透传不钉死）。
+
+**真机实测（dev 栈，必须读到的判据）**：dev portal 跑 `erix-station/portal:local-754`（**不含**本单改动），故按工单 §4 用**本地构建镜像 `erix-station/portal:local-740`** 起一次性容器 `station-portal-740-test`（net=station_backend，验完 `docker rm -f`）。`agent01` 实测是**口令直通**（`mail_otp_enabled=f`、`totp_login_enabled=f`、无 TOTP）⇒ 登录直接建 `login_sessions`（写 `login_sessions.ip`），**不写 `login_pending`**（全程 `login_pending` 恒 110）——工单 §3.3 说的 `login_pending.created_ip` 是二因素账号的形状，本账号对应的可观测面是 `login_sessions.ip`，同一 `ip` 变量、同一判据。读数：从**容器内 `127.0.0.1:8080`**（loopback 对端，正是「portal 只 publish `127.0.0.1`」的不变式）发起——带头那次 `login_sessions.ip = 203.0.113.9` ✓，不带头那次 `= 127.0.0.1`（回环/内网）✓。**验的是 `local-740`，不是 `local-754`。** 测试产生的 4 行 `login_sessions` 已删（回到基线 746），临时容器已 `docker rm -f`。
+
+**dev 环境实测的局限（必须写清）**：本机 dev 的 docker 网段是 `172.32.0.0/16`——**不在** RFC1918 的 `172.16/12`（那是 `172.16–172.31`）内，属公网地址空间。所以从宿主经**发布端口 DNAT**（`127.0.0.1:18091`）打进去时，容器看到的对端是 bridge 网关 `172.32.0.1`，被本 helper 判为**不可信** ⇒ 带头也被忽略、记成 `172.32.0.1`（这恰好是 A3「不可信对端不信头」的真机活样本，不算失败）。要在 dev 复现「采信头」，必须让对端落在可信段——本次用容器内 loopback 达成。**推论**：若生产 portal 与 Traefik 之间不是 loopback 而是某个 `172.32/16` 这类非 RFC1918 网段，则 helper 会拒信头，需把该网段纳入可信判定（届时再议，本单不擅自扩白名单）。
+
+**门禁**：`npm test` rc=0（tests 3304 / pass 3184 / fail 0 / skipped 120，无 `TEST_DATABASE_URL` 的 DB 腿）；`node --test portal/test/http-client-ip.test.js portal/test/login-email-code.test.js` 43 pass / 0 fail；`TEST_DATABASE_URL=… node scripts/check-required-legs.mjs` rc=0（三条腿 migrate-fresh-db 5 / integration:prompts 7 / api-tokens-db 6，全 0 skip）；`node scripts/agents-hotlayer-budget.mjs` VERDICT ok（热层 10214 / 预算 10240，**未动 `AGENTS.md`**）。文档口径改在 `docs/api/portal.md` §2.4「全站限流键里的 `<ip>` 口径（#740）」。

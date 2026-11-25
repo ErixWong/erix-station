@@ -5,6 +5,7 @@
 // cookie 语义见 docs/api/portal.md §2.5；两步登录见 §2.2/§2.3。
 
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import { URL } from 'node:url';
@@ -154,6 +155,106 @@ function getBearerToken(req) {
   if (scheme !== 'Bearer') return { present: true, token: null, badScheme: true };
   const token = (sp === -1 ? '' : header.slice(sp + 1)).trim();
   return { present: true, token, badScheme: false };
+}
+
+/**
+ * #740：真客户端 IP——**只在 socket 对端是可信代理时**采信 `X-Forwarded-For` 的**最右一项**。
+ *
+ * 为什么需要它：部署形态里「ingress 是唯一的路」（不变式 2）且 portal 只 publish `127.0.0.1`
+ * ⇒ 每个进来的 socket 对端必然是 edge（Traefik）的**私有 / 回环**地址。旧写法
+ * `req.socket.remoteAddress` 于是把**全平台所有人**记成同一个网关 IP ⇒ 发信限流键 `email:<ip>`、
+ * 失败计数、`login_pending.created_ip` 全挤进一个桶 = 等于没限流（工单 #740 的真实危害）。
+ *
+ * 判据：
+ *  ① 只有 socket **对端本身**属于 loopback / RFC1918（`10/8`·`172.16/12`·`192.168/16`）/
+ *     ULA `fc00::/7` / `::1` 时才采信头。有人绕过 edge 直连（对端是公网地址）⇒ 头可任意伪造 ⇒
+ *     不信，用 socket 地址。**刻意不加 env 白名单旋钮**（#677 正在收 env）：可信集合由部署不变式
+ *     直接推导，没有「运维要加白名单」这个真实配置面，加旋钮只会多一个能配错的开关。
+ *  ② 采信时取 XFF 的**最右一项**：标准里每跳代理把自己看到的对端**追加**到头后，最右一项 = 离 portal
+ *     最近那跳（edge）写下的真客户端；**最左是客户端自己写的，可伪造**。头缺失 / 全空 / 最右一项解析
+ *     不出合法 IP ⇒ 回落 socket 地址（**不向左继续找**，见工单）。
+ *  ③ 多层代理时「最右」只剥**一层** edge（当前部署就是单 edge）；将来前面再加一层，要改成取右数第 N 项。
+ *  ④ IPv6 带 zone（`%eth0`）先去掉；`::ffff:a.b.c.d` 映射地址还原成 v4 再记（否则同一 v4 客户端会以
+ *     两种形态各占一桶）。
+ *
+ * 这里是 `req.socket.remoteAddress` 在 `portal/src/**` 下**唯一**的合法落点（防回潮闸见 portal/test）。
+ */
+export function clientIp(req) {
+  const socketIp = normalizeIp(req.socket.remoteAddress);
+  if (socketIp && isTrustedProxyAddr(socketIp)) {
+    const forwarded = rightmostForwardedIp(req.headers && req.headers['x-forwarded-for']);
+    if (forwarded) return forwarded;
+  }
+  return socketIp || 'unknown';
+}
+
+/** 取 XFF 头的**最右一项**并解析成合法 IP；解析不出返回 null（调用方回落 socket 地址）。 */
+function rightmostForwardedIp(header) {
+  const value = Array.isArray(header) ? header[header.length - 1] : header;
+  if (typeof value !== 'string') return null;
+  const parts = value.split(',');
+  return normalizeIp(parts[parts.length - 1]);
+}
+
+/** 归一化一个 IP 字面量：去 zone / 剥 `[...]` / 还原 v4-mapped；合法返回小写字符串，否则 null。 */
+function normalizeIp(raw) {
+  if (typeof raw !== 'string') return null;
+  let s = raw.trim();
+  if (!s) return null;
+  const zone = s.indexOf('%'); // fe80::1%eth0 → fe80::1
+  if (zone !== -1) s = s.slice(0, zone);
+  if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1); // [::1] 字面量
+  s = s.toLowerCase();
+  const mapped = /::ffff:((?:\d{1,3}\.){3}\d{1,3})$/.exec(s); // ::ffff:a.b.c.d → a.b.c.d
+  if (mapped && net.isIPv4(mapped[1])) return mapped[1];
+  return net.isIPv4(s) || net.isIPv6(s) ? s : null;
+}
+
+/** socket 对端是否「可信代理地址」：loopback / RFC1918 / ULA `fc00::/7` / `::1`。 */
+function isTrustedProxyAddr(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 127) return true; // 127/8 loopback
+    if (a === 10) return true; // RFC1918 10/8
+    if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918 172.16/12
+    if (a === 192 && b === 168) return true; // RFC1918 192.168/16
+    return false;
+  }
+  const h = expandIpv6(ip); // IPv6
+  if (!h) return false;
+  if (h.slice(0, 7).every((x) => x === 0) && h[7] === 1) return true; // ::1
+  if ((h[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA（首 hextet 高 7 位 = 0b1111110）
+  return false;
+}
+
+/** 把合法 IPv6 串展开成 8 段数值（支持 `::` 压缩与尾部 v4）；段数不为 8 返回 null。 */
+function expandIpv6(addr) {
+  let s = addr.toLowerCase();
+  const v4tail = /:((?:\d{1,3}\.){3}\d{1,3})$/.exec(s);
+  if (v4tail) {
+    const oct = v4tail[1].split('.').map(Number);
+    const hi = ((oct[0] << 8) | oct[1]).toString(16);
+    const lo = ((oct[2] << 8) | oct[3]).toString(16);
+    s = s.slice(0, v4tail.index + 1) + hi + ':' + lo;
+  }
+  const dd = s.indexOf('::');
+  let head, tail;
+  if (dd !== -1) {
+    head = s.slice(0, dd) === '' ? [] : s.slice(0, dd).split(':');
+    const t = s.slice(dd + 2);
+    tail = t === '' ? [] : t.split(':');
+  } else {
+    head = s.split(':');
+    tail = [];
+  }
+  const headNums = head.map((x) => parseInt(x, 16));
+  const tailNums = tail.map((x) => parseInt(x, 16));
+  if (headNums.some(Number.isNaN) || tailNums.some(Number.isNaN)) return null;
+  if (dd === -1) return headNums.length === 8 ? headNums : null;
+  const missing = 8 - headNums.length - tailNums.length;
+  if (missing < 0) return null;
+  const out = [...headNums, ...new Array(missing).fill(0), ...tailNums];
+  return out.length === 8 ? out : null;
 }
 
 /**
@@ -4098,7 +4199,7 @@ async function handleLoginStep1(req, res, ctx) {
     throw new HttpError(400, 'validation_failed', `password 长度超过上限 ${maxPasswordLength}`);
   }
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const rlKey = `login:${ip}:${login}`;
   const check = ctx.loginLimiter.check(rlKey);
   if (!check.allowed) {
@@ -4513,7 +4614,7 @@ async function handleLoginEmailCode(req, res, ctx) {
     throw new HttpError(400, 'validation_failed', 'pending_token 与 code 均为必填');
   }
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   // 非消费读取（码错可重试，不烧 pending）；成功才原子消费。
   const userId = await auth.findPendingUser(pool, pendingToken);
   if (!userId) {
@@ -4601,7 +4702,7 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
     throw new HttpError(400, 'validation_failed', 'pending_token 为必填');
   }
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const userId = await auth.findPendingUser(pool, pendingToken);
   if (!userId) {
     throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
@@ -4724,7 +4825,7 @@ async function handleLoginTotp(req, res, ctx) {
     throw new HttpError(400, 'validation_failed', 'pending_token 与 code 均为必填');
   }
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
 
   // 非消费读取：TOTP 错误允许用同一 pending_token 重试（错误码不烧 token）；
   // 只有 TOTP 通过才原子消费（单次消费）。先解出用户，再按「账户 + IP」限流。
@@ -5048,7 +5149,7 @@ async function handlePreviewTicket(req, res, ctx, portId) {
   requireJson(req);
   await readJsonBody(req); // 无体（空 JSON {}）
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const rlKey = `ticket:${session.user.id}:${ip}`;
   const check = ctx.previewTicketLimiter.check(rlKey);
   if (!check.allowed) {
@@ -5167,7 +5268,7 @@ async function handleBatchPreviewTickets(req, res, ctx) {
 
   // ③ 限流：先查一次，再**逐张各记一次**（一次点击 = N 张票，放大倍数必须计入配额，否则批量端点
   //    会把 20/60s 的限额放大 10 倍）。
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const rlKey = `ticket:${session.user.id}:${ip}`;
   const check = ctx.previewTicketLimiter.check(rlKey);
   if (!check.allowed) {
@@ -5293,7 +5394,7 @@ async function handleChangeMyPassword(req, res, ctx) {
   // （不能让一个还没通过旧口令校验的人因为这条新规则看到新响应），理由见 `admin.changeOwnPassword`。
   const confirmPassword = body?.confirm_password;
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const rlKey = `password:${session.user.id}:${ip}`;
   const check = ctx.loginLimiter.check(rlKey);
   if (!check.allowed) {
