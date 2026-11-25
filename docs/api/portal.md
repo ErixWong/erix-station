@@ -120,6 +120,9 @@
 > `GET /api/admin/fdes/:fde/llm/usage`（后者见 `route()` 里匹配
 > `/api/admin/fdes/<id>/llm/usage` 的正则分支）——**这两条不是 404，不得一起标成停用**。
 > 改名这条线的契约仍见 §4.9；登记这几行是为了「端点索引与文档自洽」（§7.13）。
+> 另：`POST /api/admin/llm/providers`、`PATCH|DELETE /api/admin/llm/providers/:id`、
+> `GET /api/admin/llm/models` 与 `POST /api/admin/llm/models/:id/block|unblock`
+> （`http.js:1927/1965/1995`）**已实现但无契约**，只在正文散文里出现过 —— 待补写（#777 A 组）。
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
 >
@@ -2014,7 +2017,7 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 
 | 字段 | 说明 |
 |---|---|
-| `scope` | `project` \| `run`。⚠️ 待决策者确认（Q5）：P1 先只做项目级，响应模型保留 `scope`/`run_id` 字段以兼容 P2 的 run 级端口（principles §4 Q5 倾向 (b) 起步） |
+| `scope` | `project` \| `run`。**Q5 已决**（迁移 `0018` 放开第三值 `fde`：FDE 主机级号池，`run_id` 恒 NULL；项目级仅存量）。本节是 P5 前的历史契约，**现役**列端口见 §4.7a（`scope` 恒 `fde`） |
 | `role` | `frontend` \| `backend` \| `debug` \| `spare`（规格 §8.2 端口块用途） |
 | `url` | 由 portal 与 Traefik 路由同源生成（规格 §8.1）；前端**只展示/跳转此 url，永不自行拼接** |
 | `exposure` | `private`（默认）\| `org-visible` \| `public`（规格 §6.5） |
@@ -4442,7 +4445,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | 1 | ~~Q7 portal 技术栈~~ ✅ 已定稿：(a) 零依赖 `node:http` + 原生前端（principles §4；WP1 落地） | — | 仅实现注记，**契约形状无关** |
 | 2 | `BASE_DOMAIN`（影响示例 URL 与 cookie 生效 host；**#57 定稿：语义为伞域 `fde.<可注册域>`，现取 `fde.erix.vip`；代码默认兜底 `localhost`（本地起服，不套伞域前缀）**） | env §1 | §0 / §2.5 / fde-platform §8.5 |
 | 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2；**现状**：未注册 TOTP 的账号口令直通，见 §2.1） | env §4 / Q3 倾向 (a) | §2.1 |
-| 4 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | §4.7（`scope`/`run_id` 字段保留） |
+| 4 | Q5 端口分级 | **已决**（迁移 `0018` 加第三值 `fde`，FDE 主机级号池已上线；`project` 仅存量） | §4.7（历史）、§4.7a（现役，恒 `fde`） |
 | 5 | 任务下发 push→pull 演进 | **拉模型为终态**；push 仅作 P2 优化后置（⚠️ 待决策者确认，不作默认契约） | §6.3（`container_unreachable` 出现条件） |
 | 6 | `run.cost` 记账口径 | 依赖 Q1/Q4 | §4.1（P1 可为 `null`） |
 | 7 | 预览 ticket TTL 秒数 | **60s** | §2.8 |
