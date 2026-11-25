@@ -136,8 +136,13 @@ function refFiles() {
   return scanRefs().files;
 }
 
-/** 派生预算：向上取整到 512 再加 1024 余量 */
-const budgetFor = (n) => Math.ceil(n / 512) * 512 + 1024;
+/** 热层字节预算：**显式目标值**，不再由实测派生（派生预算 = 永远绿，见台账 §8.209）。
+ *  改它 = 一次可见的决策：写台账（谁拍的板、为什么、多少），别在代码里顺手改数。 */
+const HOT_BYTES_TARGET = 20480;
+const budgetFor = () => HOT_BYTES_TARGET;
+
+/** 余量告警带：实测进到「预算 − 1024」以内就报 WARN（绿但快满，不是红） */
+const HEADROOM_WARN = 1024;
 
 function selfTest() {
   const cases = [
@@ -193,6 +198,11 @@ function main() {
   say(hotBytes <= budget, 'hot-byte-budget',
     `热层（§8 之前）${hotBytes} 字节，预算 ${budget}；全文 ${total} 字节`,
     `超预算就搬去 docs/maintenance/；确属每轮判据才可 \`npm run check:agents-hotlayer -- --sync\` 抬预算`);
+  // 余量告警带：预算内但快满 ⇒ WARN（不计红）。「绿」只说明没越线，不说明还写得下东西。
+  if (hotBytes <= budget && hotBytes > budget - HEADROOM_WARN) {
+    console.log(`WARN hot-byte-headroom: 余量只剩 ${budget - hotBytes} 字节（告警带 ${HEADROOM_WARN}）`
+      + `\n      ↳ 新内容一律写 docs/maintenance/；要往热层加行先删行，或显式抬预算并写理由`);
+  }
 
   // ④ §8.N 引用地板（只升不降）
   const { refs, ignoredFiles, ignoredRefs } = scanRefs();
