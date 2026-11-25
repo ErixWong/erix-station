@@ -31,7 +31,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
+import { createPgFixture, SKIP_WITHOUT_PG, createTestPool } from './pg-fixture.js';
 import { createPool } from '../src/db.js';
 import {
   DEFAULT_MAX_FILE_BYTES, AUDIT_ACTION, AUDIT_TARGET, updateUploadSettings,
@@ -68,7 +68,7 @@ const auditRows = (pool) => pool.query(
 const dbValue = (pool) => pool.query('SELECT max_file_bytes::text AS v FROM upload_settings WHERE id = 1');
 
 /** 真并发用的专用池：`max: 1` ⇒ 一条池 = 一条后端连接（不靠池调度碰运气凑并发）。 */
-const oneConnection = (url) => createPool(url, { max: 1 });
+const oneConnection = (url) => createTestPool(createPool, url, { max: 1 });
 const endQuietly = async (p) => { try { await p?.end(); } catch { /* 收尾不能盖掉正在报的错 */ } };
 const pidOf = async (pool) => (await pool.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
 

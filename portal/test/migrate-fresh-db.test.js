@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createPool } from '../src/db.js';
 import { migrate, computeExpectedVersions } from '../src/migrate.js';
-import { createPgFixture } from './pg-fixture.js';
+import { createPgFixture, createTestPool } from './pg-fixture.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SUPER_DATABASE_URL = (process.env.TEST_DATABASE_URL || '').trim();
@@ -62,8 +62,12 @@ const dbUrl = (database, user, pw) => fixture.dbUrl(database, user, pw);
  */
 const withFreshDatabase = (fn) => fixture.withFreshDatabase(({ database }) => fn(database), { migrate: false });
 
+// issue #763/#766：测试自己建池必须挂拆库终止监听（否则 DROP DATABASE … FORCE 踢连接时，
+// 正在关闭的 socket 收到 57P01 ⇒ pool.emit('error') 无监听 ⇒ uncaughtException ⇒ 整条腿红）。
+const mkPool = (url, opts = {}) => createTestPool(createPool, url, opts);
+
 async function ownersOf(database) {
-  const pool = createPool(dbUrl(database), { max: 1 });
+  const pool = mkPool(dbUrl(database), { max: 1 });
   try {
     const tbl = await pool.query(
       `SELECT tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename = 'transcript_rounds'`,
@@ -93,7 +97,7 @@ async function ownersOf(database) {
 test('全新空库以超级用户跑全流程（issue #280 现场）：一路到 head，序列与表同属主，台账以平台角色可写', { skip: SKIP }, async () => {
   await withFreshDatabase(async (database) => {
     // 只设 DATABASE_URL（救灾/手工路径的形状）：runner 连的是超级用户，不是表属主。
-    const pool = createPool(dbUrl(database), { max: 1 });
+    const pool = mkPool(dbUrl(database), { max: 1 });
     try {
       const summary = await migrate(pool, {
         env: { DATABASE_URL: dbUrl(database) },
@@ -154,7 +158,7 @@ test('compose 形态（连接角色已是平台角色）再跑一遍：幂等 + 
     // 这条 `ALTER ROLE` 原本在 `withFreshDatabase` **外面** ⇒ 落在锁外，正是 F-1 那个
     // 「两个进程同时改 pg_authid 同一行」的现场之一。搬进夹具体内 = 在锁内。
     await adminPool.query(`ALTER ROLE ${PLATFORM} PASSWORD '${TEST_PW}' LOGIN`);
-    const superPool = createPool(dbUrl(database), { max: 1 });
+    const superPool = mkPool(dbUrl(database), { max: 1 });
     try {
       await migrate(superPool, { env: {}, log: { log: () => {} } });
     } finally {
@@ -165,7 +169,7 @@ test('compose 形态（连接角色已是平台角色）再跑一遍：幂等 + 
     // bootstrap 步骤必须另给超级用户连接（compose 就是这么拆的：BOOTSTRAP_DATABASE_URL）——
     // bootstrap.sql 要 CREATE ROLE / ALTER ROLE / GRANT，非超级用户跑不动（实测 42501）。
     const recorded = [];
-    const inner = createPool(dbUrl(database, PLATFORM, TEST_PW), { max: 1 });
+    const inner = mkPool(dbUrl(database, PLATFORM, TEST_PW), { max: 1 });
     const recorder = {
       async connect() {
         const c = await inner.connect();
@@ -179,7 +183,7 @@ test('compose 形态（连接角色已是平台角色）再跑一遍：幂等 + 
       },
     };
     const logs = [];
-    const composeBootstrapPool = createPool(dbUrl(database), { max: 1 });
+    const composeBootstrapPool = mkPool(dbUrl(database), { max: 1 });
     try {
       const summary = await migrate(recorder, {
         bootstrapPool: composeBootstrapPool,
@@ -210,7 +214,7 @@ test('compose 形态（连接角色已是平台角色）再跑一遍：幂等 + 
 test('迁移角色无权限承担 DDL 属主 ⇒ fail fast 报可操作错误（不让人在 0016 里读 PG 内部报错）', { skip: SKIP }, async () => {
   const intruder = `w280_intr_${suffix()}`;
   await withFreshDatabase(async (database) => {
-    const superPool = createPool(dbUrl(database), { max: 1 });
+    const superPool = mkPool(dbUrl(database), { max: 1 });
     try {
       await migrate(superPool, { env: {}, log: { log: () => {} } });
       // 模拟「baseline + bootstrap 已就位、增量未落账」的中间态（迁移跑到一半炸掉后的形状）：
@@ -226,11 +230,11 @@ test('迁移角色无权限承担 DDL 属主 ⇒ fail fast 报可操作错误（
        END IF; END $$;`,
     );
     const intruderUrl = dbUrl(database, intruder, TEST_PW);
-    const intruderPool = createPool(intruderUrl, { max: 1 });
+    const intruderPool = mkPool(intruderUrl, { max: 1 });
     // bootstrap 给超级用户（生产拆分形状）；迁移本体走 intruder（非属主、非成员）。
     // schema 级授权是**分库**的 ⇒ 必须连到该库上发（owner 已由 bootstrap 归正给平台角色，
     // 这里由超级用户代授）。
-    const bootstrapPool = createPool(dbUrl(database), { max: 1 });
+    const bootstrapPool = mkPool(dbUrl(database), { max: 1 });
     try {
       await bootstrapPool.query(`GRANT CONNECT ON DATABASE ${database} TO ${intruder}`);
       await bootstrapPool.query(`GRANT USAGE ON SCHEMA public TO ${intruder}`);
@@ -283,7 +287,7 @@ test('0032 撤退役/备份表：全新库跑到 head、三张表确实不在、
   const RETIRED = ['llm_models_retired', 'llm_providers_retired', 'transcript_rounds_shape4_bak_20261027'];
 
   await withFreshDatabase(async (database) => {
-    const pool = createPool(dbUrl(database), { max: 1 });
+    const pool = mkPool(dbUrl(database), { max: 1 });
     try {
       // ① 全新库一路到 head（含 0032）。第三张表不存在 ⇒ 这一步本身就是「IF EXISTS 有没有漏」的判据。
       await migrate(pool, { env: { DATABASE_URL: dbUrl(database) }, log: { log: () => {} } });
@@ -374,7 +378,7 @@ test('0041 撤 run_checkpoints：全新库跑到 head、表确实不在、DROP �
   const BASELINE = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
 
   await withFreshDatabase(async (database) => {
-    const pool = createPool(dbUrl(database), { max: 1 });
+    const pool = mkPool(dbUrl(database), { max: 1 });
     try {
       // ① 空库 → baseline → bootstrap → 全部增量（含 0041）。0041 的 `SET LOCAL lock_timeout` 在
       //    runner 的事务里跑，这一步本身就是「没写 VACUUM / 没自己 BEGIN」的读数。

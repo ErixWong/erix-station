@@ -124,6 +124,24 @@ export function attachPoolErrorHandler(pool, log) {
     const msg = err && err.message ? err.message : String(err);
     sink(`pool error（非拆库终止，需排查）: ${msg}`);
   });
+  return pool;
+}
+
+/**
+ * 测试专用建池：`createPool()` + 自动挂拆库终止监听。
+ *
+ * issue #763 只给夹具自己创建的两个 pool 挂了监听，但 **用例自己 `createPool()` 的那些
+ * 仍然裸着**（`migrate-fresh-db` / `delta-not-persisted-db` / `upload-settings-real-db` /
+ * `pg-fixture-lock`）—— 2026-11-25 实测 `migrate-fresh-db` 又在 CI 上炸了同样的
+ * `uncaughtException: terminating connection due to administrator command`（57P01）。
+ *
+ * 根因不变：`DROP DATABASE … WITH (FORCE)` 踢连接时，正在关闭中的 socket 仍可能收到终止报文
+ * ⇒ `pool.emit('error')` ⇒ 无监听者时 EventEmitter 直接抛 ⇒ 整条腿红。
+ *
+ * ⇒ **测试里建池一律用这个，别直接 `createPool()`**。非测试代码不适用（那里的 57P01 要可见）。
+ */
+export function createTestPool(createPool, url, opts = {}, log) {
+  return attachPoolErrorHandler(createPool(url, opts), log);
 }
 
 export function createPgFixture(adminUrl, {
