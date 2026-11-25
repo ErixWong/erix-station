@@ -299,5 +299,14 @@
       "reason": "待补真实理由（#777 S1 --sync 自举占位）"
     }
   ],
-  "legs": []
+  "legs": [
+    {
+      "entry": "portal/test/api-tokens-db.test.js",
+      "reason": "REQUIRED_LEGS 第三条已接入（#736 真库腿），但 docs/ops/ci-release.md §4.1 仍写「当前接进来的两条」未点名它；另有一刀在修文档（#777 D4），S1 不许改文档让闸变绿"
+    },
+    {
+      "entry": "path:portal/test/prune-checkpoints-db.test.js",
+      "reason": "该文件已随 checkpoint 退役删除（#640），ci-release.md :38/:41 是 #665 事故记录里的历史提及；文档修刀需给历史行加退役标注（#777 S1 已知红）"
+    }
+  ]
 }

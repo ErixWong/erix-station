@@ -32,6 +32,9 @@ const HTTP_JS = path.join(ROOT, 'portal/src/http.js');
 const API_DOC = path.join(ROOT, 'docs/api/portal.md');
 const MIG_DIR = path.join(ROOT, 'deploy/migrations');
 const MODEL_DOC = path.join(ROOT, 'docs/data/model.md');
+const LEGS_SCRIPT = path.join(ROOT, 'scripts/check-required-legs.mjs');
+const CI_DOC = path.join(ROOT, 'docs/ops/ci-release.md');
+const PKG = path.join(ROOT, 'package.json');
 const EXC = path.join(ROOT, 'scripts/doc-impl-exceptions.json');
 
 const SECTIONS = ['routes', 'schema', 'legs'];
@@ -496,8 +499,52 @@ function checkSchema(ex) {
 }
 
 function checkLegs(ex) {
-  void ex;
-  return []; // M3 实装
+  const legsSrc = read(LEGS_SCRIPT);
+  assert(legsSrc.length > 0, `读不到事实源：${LEGS_SCRIPT}`);
+  const ci = read(CI_DOC);
+  assert(ci.length > 0, `读不到门禁口径文档：${CI_DOC}`);
+  const pkg = JSON.parse(read(PKG));
+  const ids = [...legsSrc.matchAll(/^\s*id:\s*'([^']+)'/gm)].map((m) => m[1]);
+  assert(ids.length >= 1, 'REQUIRED_LEGS 里一条 id 都没抽到（格式变了？）');
+  const exKeys = new Set(exList(ex, 'legs').map((e) => e.entry));
+  const reds = [];
+  const missing = (entry, hint) => {
+    if (!exKeys.has(entry)) reds.push({ kind: 'missing', entry, hint });
+  };
+  const staleCheck = (entry, nowTrue, what) => {
+    if (exKeys.has(entry) && nowTrue) {
+      reds.push({
+        kind: 'stale-ex',
+        entry,
+        hint: `${what}已成立，仍在豁免表里，请删掉它`,
+      });
+    }
+  };
+  // ⒈ REQUIRED_LEGS 每条 id 必须在 ci-release.md 出现
+  for (const id of ids) {
+    const inDoc = ci.includes(id);
+    if (!inDoc) {
+      missing(id, 'REQUIRED_LEGS 有此腿，docs/ops/ci-release.md 未点名');
+    }
+    staleCheck(id, inDoc, '文档已点名该腿');
+  }
+  // ⒉ 文档里点名的 npm run test:integration:* 必须存在于 package.json
+  for (const m of ci.matchAll(/npm run (test:integration:[a-z0-9-]+)/g)) {
+    const name = m[1];
+    const entry = `pkg:${name}`;
+    const ok = Boolean(pkg.scripts && pkg.scripts[name]);
+    if (!ok) missing(entry, `${name} 不在 package.json scripts 里`);
+    staleCheck(entry, ok, 'package.json 已有该脚本');
+  }
+  // ⒊ 文档里点名的 portal/test/*.test.js 路径必须真实存在
+  for (const m of ci.matchAll(/portal\/test\/[A-Za-z0-9_.-]+\.test\.js/g)) {
+    const p = m[0];
+    const entry = `path:${p}`;
+    const ok = existsSync(path.join(ROOT, p));
+    if (!ok) missing(entry, '文档点名的测试文件在仓库里不存在');
+    staleCheck(entry, ok, '文件已存在');
+  }
+  return reds;
 }
 
 const CHECKS = {
