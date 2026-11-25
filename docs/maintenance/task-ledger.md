@@ -10149,3 +10149,61 @@ job summary 与 artifact `images-digest`，ID `14918481157`）；GitHub Release 
 ④ 挑号与分支名复用判据未写进热层 §6 与 §8 末。
 另：本单派了 copilot 只读审计整个分层（热层 + 本仓冷层 + 机器全局冷层 + 闸缺口），
 结论落到另一单，本条只记「已派、runId `cp-2611251548-c6u274`」，不预写它还没给出的结论。
+
+### 8.204 删掉仓库根 `ISSUES.md`（2026-11-25，主 agent 裁定 + erix_run 执行，代号 `docs-261125-10-drop-trial-issues`）
+
+**为什么能删**：它的身份是「2026-10-13 那批试用反馈原文 + 只追加的对账」。用户裁定「没用了，删掉」。
+现验依据：**13 条全部已登记 GitHub issue 且全部已修/已关**（对照表见下），文末那三段
+（🌙 夜班批次、🔭 观察队列、📋 未关闭 issue 分层〔2026-10-30 刷新〕、刷新过的过期指针）是
+**v0.1.30 时代快照**，现势性早已由 issue 与台账承接；放在仓库根还每轮被 agent 当成现势材料捞走。
+
+**原文找回坐标**：`git show eb44900e:ISSUES.md`（578 行，删除前的最后一个提交态）。
+
+**抄进台账以免追踪信息随文件消失**（条目 → issue 对照，原文 2026-10-23 那一节）：
+
+```
+| # | 本文条目 | issue | 状态（截至 v0.1.26） |
+|---|---|---|---|
+| 1 | 对话页不显示时间戳 | **#282** | **已修**（v0.1.27：每条消息 `<time>` 时刻 + 顶部常驻状�
+| 2 | 工具调用时长恒显 `0s` | **#283** | **已修**（v0.1.9 真机验收：`sleep 400` 显 `6m 40s`、硬刷�
+| 3 | 目录名不允许下划线 | **#284** | **已修**（PR #345 `eb079c8`：前端补 `_`，后端不动；§8.44�
+| 4 | judge 判达成但循环继续 | **#321** | **已关**：文案（v0.1.19）+ 达成意见回灌（0.22 `judgeDo
+| 5 | 无活动度指标（TPS/字节） | **#282** | **已修**（同上：`↑ 3.8 KB · ~101 tok/s · this run 00:1
+| 6 | 报「端口已监听」要同时给预览 URL | **#285** | **已修**（告知面第 8 条 v0.1.8 + 前端裸 U
+| 7 | 剥 Cookie × cookie-session SSR | **#286** | **已关（`not_planned`）**：不改边缘剥 Cookie（两条改
+| — | 附带发现：逐字流式失效（整段一次出现） | **#342** | **已修**（PR #343 `06bbaa2`，v0.1.2
+| — | 附带发现：预览要点 10 次票 | **#247** | **已修**（v0.1.27：`POST /api/me/ports/batch-tickets` �
+| — | 崩溃恢复后账本 `partOf` 链式 | **#341** + 上游 **erix-agent #415** | 站内读侧已解（`c47a692`
+| — | 附带发现（#277 验收中）：起跑前被取消的消息，下一个 run 会当待办重做 | **#346** |
+| — | 附带发现（决策者 2026-10-24 口述）：目录下拉第一项是 `.pnpm-store`，真项目被顶掉 | 
+```
+
+**改了哪些活坐标**（`git show --numstat 57893f79` 原文；文件没了就不许留假坐标）：
+
+```
+0	578	ISSUES.md
+1	1	docs/README.md
+1	1	portal/frontend/src/composables/useEventStream.spec.ts
+1	1	portal/frontend/src/i18n/localeParity.spec.ts
+1	1	portal/frontend/src/i18n/locales/en.ts
+1	1	portal/frontend/src/i18n/locales/zh-CN.ts
+1	1	portal/frontend/src/stores/workbench.ts
+3	3	portal/test/platform-prompts.test.js
+```
+
+`platform-prompts.test.js` 那 3 行是关键：`APPEND_ONLY_HISTORY_FILES` 白名单少了一本，
+它自己的两处注释同步改成「原仓库根 `ISSUES.md`（已删 ⇒ 本条）」——**不悬空**，也不声称文件还在。
+
+**历史正文不改写**（这三处提到 `ISSUES.md` 的旧行保留原样，共 17 处）：`docs/maintenance/task-ledger.md` 11 处、
+`docs/design/analysis-2026-10-20-{judge-and-trial-issues,judge-independent-review}.md` 4 处、
+`docs/ops/handoff-2026-10-14.md` 2 处。
+
+**这单的弯路值得记**：我先按「这类记录不该在仓库根」理解，写了**搬家**补丁（→ `docs/maintenance/issues-2026-10-13.md`）
+并派 erix_run 执行完（commit `4485b9b8`，未推），用户随后裁定是**删**。复位 `origin/main` 重做。
+教训：**历史快照先问「删还是搬」**，别自作主张给它建新家——多一个家就多一次引用与一次「谁还引用它」的账。
+
+**验证**（只认退出码）：`node --test portal/test/platform-prompts.test.js` → 29 pass / 0 fail，rc 0（worker 跑，主 agent 复跑见下）；
+根 `npm test`、`check:agents-hotlayer`、`check:doc-portable` 由主 agent 在最终树复跑。
+
+**边界**：仓库其余文档（一次性审计快照、handoff/drill、地图黑户）本轮**不动**——文档总体审计由**另一个 session** 在做。
+本会话那份 copilot 只读审计（runId `cp-2611251548-c6u274`）结论已到手，**本单不落地**，移交文档审计那条线处置。
