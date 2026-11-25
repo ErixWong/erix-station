@@ -883,6 +883,12 @@ export const en = {
         empty: 'This seat has no sessions yet.',
         loadMore: 'Load more sessions',
         untitled: '(untitled)',
+        dirLabel: 'Directory',
+        dirAll: 'All directories',
+        refresh: 'Refresh',
+        running: 'running',
+        runningCount: '{count} running',
+        queuedCount: '{count} queued',
       },
       files: {
         title: 'Files',

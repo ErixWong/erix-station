@@ -902,6 +902,12 @@ export const zhCN = {
         empty: '这个工位还没有会话。',
         loadMore: '加载更多会话',
         untitled: '（无标题）',
+        dirLabel: '目录',
+        dirAll: '全部目录',
+        refresh: '刷新',
+        running: '运行中',
+        runningCount: '{count} 运行',
+        queuedCount: '{count} 排队',
       },
       files: {
         title: '文件',
