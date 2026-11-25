@@ -630,6 +630,8 @@ export const zhCN = {
     downloadInstead: '下载该文件',
     notPreviewable: '该格式不支持在线预览',
     pdfUnsupported: '当前浏览器无法内嵌显示此 PDF，请用右上角下载后本地打开',
+    backendUnconfigured: '未配置文档预览服务，请下载后查看',
+    backendUnreachable: '文档预览服务暂不可用，请下载后查看',
   },
   // 预览端口面板（issue #246 交付② 单 B：工作台「预览端口」区块 + 管理台 FDE 详情面板）。
   // 口径红线（portal.md §4.7a）：`active` 只代表「首次凭证放行过」⇒ 状态文案一律不写「健康 / 运行中」；
@@ -1308,6 +1310,11 @@ export const zhCN = {
       sourceDefault: '内置默认',
       applyHot: '立即生效',
       applyRestart: '需重启',
+      // 预览后端（kkFileView）可用性徽标（#787）：只在 `preview.kk_base_url` 那一行渲染，
+      // 三态互斥；探针请求本身失败也归「不可达」（fail-closed，但不打断整页）。
+      kkUnconfigured: '未配置',
+      kkReachable: '可达',
+      kkUnreachable: '不可达',
       save: '保存',
       saving: '正在保存…',
       saved: '已保存（下面那个数就是服务端落库后回读的那一个），{apply}',

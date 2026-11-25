@@ -19,9 +19,10 @@
 //      而"整页一行"的定位被那一行的红框削弱）。归属由 `rowError()` 一处决定，别处只消费结果。
 import { computed, onMounted, reactive, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
+import { api } from '../api';
 import { useAdminStore } from '../stores/admin';
 import {
-  buildRuntimeSettingPayload,
+  buildRuntimeSettingPayloadFor,
   draftOf,
   formatRuntimeValue,
   type RuntimeSettingApplyMode,
@@ -124,10 +125,11 @@ const pageFieldError = computed<string | null>(() => {
   return field === null ? err : `${err}${t('admin.runtime.fieldPointed', { field })}`;
 });
 
-/** 保存按钮的禁用条件：没加载完 / 有别的旋钮在写 / 这一格草稿解析不出整数。 */
+/** 保存按钮的禁用条件：没加载完 / 有别的旋钮在写 / 这一格发不出 payload。 */
 function saveDisabled(item: RuntimeSettingItem): boolean {
   if (admin.runtimeSaving !== null || !loaded.value) return true;
-  return buildRuntimeSettingPayload(draftText(item.key)) === null;
+  // #787：text 型（kk）永远能发（空串照发，服务端拒）；integer 型解不出整数 ⇒ 不发。
+  return buildRuntimeSettingPayloadFor(item, draftText(item.key)) === null;
 }
 
 // ── 数据流 ─────────────────────────────────────────────────────────────────────
@@ -149,12 +151,43 @@ async function onSave(item: RuntimeSettingItem): Promise<void> {
   if (err === null) {
     const saved = admin.runtimeSettings.find((row) => row.key === item.key);
     if (saved) drafts[saved.key] = draftOf(saved);
+    // #787：改了 kk 地址 ⇒ 重探一次（徽标跟新值）；探针失败也不影响已完成的保存。
+    if (item.key === KK_BASE_URL_KEY) await probeKk();
   }
+}
+
+// ── 预览后端（kkFileView）可用性徽标（#787）───────────────────────────────
+// 只在列表含 `preview.kk_base_url` 那一格时才探一次；探针失败不打断整页（loadError 不动）。
+const KK_BASE_URL_KEY = 'preview.kk_base_url';
+const kkProbe = ref<{ attempted: boolean; configured: boolean; available: boolean }>({
+  attempted: false, configured: false, available: false,
+});
+
+async function probeKk(): Promise<void> {
+  try {
+    const s = await api<{ configured?: boolean; available?: boolean }>('/api/preview-backend');
+    kkProbe.value = {
+      attempted: true, configured: s?.configured === true, available: s?.available === true,
+    };
+  } catch {
+    // 探针请求本身失败 ⇒ 归「不可达」（fail-closed），但不把整页打成错误态。
+    kkProbe.value = { attempted: true, configured: true, available: false };
+  }
+}
+
+/** 只有 kk 那一行、且探过 ⇒ 给三态文案；其余行返回 null（不渲染徽标）。 */
+function kkStatusText(item: RuntimeSettingItem): string | null {
+  if (item.key !== KK_BASE_URL_KEY || !kkProbe.value.attempted) return null;
+  if (kkProbe.value.configured === false) return t('admin.runtime.kkUnconfigured');
+  if (kkProbe.value.available === true) return t('admin.runtime.kkReachable');
+  return t('admin.runtime.kkUnreachable');
 }
 
 onMounted(async () => {
   await admin.loadRuntimeSettings();
   fillFrom(admin.runtimeSettings);
+  // #787：列表里有 kk 那一格 ⇒ 探一次可用性（普通 FDE 也能读的只读状态）。
+  if (admin.runtimeSettings.some((row) => row.key === KK_BASE_URL_KEY)) await probeKk();
 });
 </script>
 
@@ -225,6 +258,12 @@ onMounted(async () => {
               :data-test="`runtime-hint-${item.key}`"
               class="mt-0.5 block max-w-prose text-[11px] leading-4 text-black/50"
             >{{ item.hint }}</p>
+            <!-- #787：kk 那一行的预览后端可用性徽标（三态：未配置 / 可达 / 不可达）。 -->
+            <span
+              v-if="kkStatusText(item)"
+              data-test="kk-preview-status"
+              class="mt-0.5 inline-block rounded-full border border-black/15 px-2 py-0.5 text-[11px] text-black/60"
+            >{{ kkStatusText(item) }}</span>
           </td>
           <td class="py-1 pr-2">
             <span
@@ -257,9 +296,9 @@ onMounted(async () => {
                 v-model="drafts[item.key]"
                 :data-test="`runtime-input-${item.key}`"
                 :aria-label="t('admin.runtime.fieldValue')"
-                type="number"
-                inputmode="numeric"
-                step="1"
+                :type="item.kind === 'text' ? 'text' : 'number'"
+                :inputmode="item.kind === 'text' ? undefined : 'numeric'"
+                :step="item.kind === 'text' ? undefined : '1'"
                 :aria-invalid="rowInvalid(item) ? 'true' : undefined"
                 :class="rowInvalid(item) ? 'border-red-600' : 'border-black/20'"
                 class="w-32 rounded-md border px-2 py-1 text-sm"

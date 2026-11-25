@@ -534,3 +534,83 @@ describe('R10 hint：有就在那一行下方渲染，没有就不存在那个�
     expect(w.findAll('[data-test^="runtime-hint-"]')).toHaveLength(1);
   });
 });
+
+// ── #787：`preview.kk_base_url` 的可用性徽标（`GET /api/preview-backend`）─────
+// 列表含该键 ⇒ 挂载时探一次；行渲染三态徽标（未配置 / 可达 / 不可达）。
+// 探针请求失败只置徽标，不许把整页打成错误态；保存该键成功后重探一次。
+describe('#787 kk 预览服务状态徽标', () => {
+  const KK_KEY = 'preview.kk_base_url';
+  const PROBE_PATH = '/api/preview-backend';
+  /** 含 kk 行（text 型）的两行 DTO。 */
+  const kkDto = () => ({
+    items: [
+      DTO.items[0],
+      {
+        key: KK_KEY, label: '文档预览服务地址（kkFileView base URL）',
+        value: 'http://kkfileview:8012', source: 'db', applyMode: 'hot', kind: 'text',
+        updatedAt: '2026-11-23T05:00:00.000Z', updatedBy: 'u-root',
+      },
+    ],
+  });
+  const probes = (calls: Recorded[]) => calls.filter((c) => c.url === PROBE_PATH);
+  /** 列表 GET + 探针 GET + 单键 PUT 三合一桩；探针回 probe 给定（省略⇒抛）。 */
+  function stubWithProbe(probe?: () => Response) {
+    return stubFetch((call) => {
+      if (call.url === GET_PATH && call.method === 'GET') return json(200, kkDto());
+      if (call.url === PROBE_PATH && call.method === 'GET') {
+        if (!probe) throw new Error('探针请求失败');
+        return probe();
+      }
+      if (call.url.startsWith(`${GET_PATH}/`) && call.method === 'PUT') {
+        const key = decodeURIComponent(call.url.slice(GET_PATH.length + 1));
+        return json(200, {
+          item: { key, label: key, value: 'http://kk:8012', source: 'db', applyMode: 'hot', kind: 'text',
+            updatedAt: '2026-11-23T05:00:00.000Z', updatedBy: 'u-root' },
+        });
+      }
+      return undefined;
+    });
+  }
+
+  it('三态徽标：未配置 / 可达 / 不可达', async () => {
+    const cases = [
+      { body: { configured: false, available: false }, want: '未配置' },
+      { body: { configured: true, available: true }, want: '可达' },
+      { body: { configured: true, available: false }, want: '不可达' },
+    ];
+    for (const c of cases) {
+      stubWithProbe(() => json(200, { ...c.body, checkedAt: '2026-01-01T00:00:00.000Z' }));
+      const w = await mountView();
+      expect(text(w, 'kk-preview-status')).toBe(c.want);
+      w.unmount();
+    }
+  });
+
+  it('探针请求失败 ⇒ 徽标不可达、列表照渲染、整页不打错误态', async () => {
+    stubWithProbe(undefined); // 探针抛
+    const w = await mountView();
+    expect(exists(w, `runtime-row-${TTL_KEY}`)).toBe(true);
+    expect(exists(w, `runtime-row-${KK_KEY}`)).toBe(true);
+    expect(text(w, 'kk-preview-status')).toBe('不可达');
+    // 列表本身没被探针拖进错误态
+    expect(exists(w, 'runtime-error')).toBe(false);
+    w.unmount();
+  });
+
+  it('保存 kk 键成功后重探一次 ⇒ 探针请求计数 = 2（初探 + 保存后重探）', async () => {
+    const calls = stubWithProbe(() => json(200, { configured: true, available: true, checkedAt: 'x' }));
+    const w = await mountView();
+    expect(probes(calls)).toHaveLength(1);
+    await setDraft(w, KK_KEY, 'http://kk:8012');
+    await clickSave(w, KK_KEY);
+    expect(puts(calls)).toHaveLength(1);
+    expect(probes(calls)).toHaveLength(2);
+    w.unmount();
+  });
+
+  it('列表不含 kk 键 ⇒ 不打探针（现有页零回归）', async () => {
+    const calls = stubDefault(); // 默认 DTO 无 kk 键
+    await mountView();
+    expect(calls.filter((c) => c.url === PROBE_PATH)).toHaveLength(0);
+  });
+});

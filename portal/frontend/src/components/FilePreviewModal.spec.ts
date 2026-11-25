@@ -214,8 +214,11 @@ describe('FilePreviewModal 四通道分流（#366 P0/P1/P2）', () => {
   });
 
   it('kkfile：签票 POST → iframe 指 /pv/<码>，sandbox 无 allow-same-origin', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      jsonResponse(200, { url: '/pv/CODE123.SIG/onlinePreview', expires_in: 600 })));
+    // #787：kkfile 先探后端。桩按 URL 分派：探针说可用 ⇒ 再走签票。
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
+      String(input) === '/api/preview-backend'
+        ? jsonResponse(200, { configured: true, available: true })
+        : jsonResponse(200, { url: '/pv/CODE123.SIG/onlinePreview', expires_in: 600 })));
     const wrapper = mountAt('docs/report.docx');
     await tick();
     expect(String(vi.mocked(fetch).mock.calls.at(-1)![0])).toBe('/api/preview-tickets');
@@ -230,7 +233,11 @@ describe('FilePreviewModal 四通道分流（#366 P0/P1/P2）', () => {
 
   it('kkfile：签票遇 preview_code_expired 自动重签一次；第二次仍错才直显', async () => {
     let n = 0;
-    vi.stubGlobal('fetch', vi.fn(async () => {
+    // #787：探针（先打一次）不计入 n（n 只数签票 POST）。
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/preview-backend') {
+        return jsonResponse(200, { configured: true, available: true });
+      }
       n += 1;
       if (n === 1) return jsonResponse(403, { error: { code: 'preview_code_expired', message: 'preview code expired' } });
       return jsonResponse(200, { url: '/pv/FRESH.SIG/onlinePreview', expires_in: 600 });
@@ -242,7 +249,10 @@ describe('FilePreviewModal 四通道分流（#366 P0/P1/P2）', () => {
     wrapper.unmount();
 
     n = 0;
-    vi.stubGlobal('fetch', vi.fn(async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/preview-backend') {
+        return jsonResponse(200, { configured: true, available: true });
+      }
       n += 1;
       return jsonResponse(403, { error: { code: 'preview_code_expired', message: 'expired again' } });
     }));
@@ -254,8 +264,11 @@ describe('FilePreviewModal 四通道分流（#366 P0/P1/P2）', () => {
   });
 
   it('kkfile：kk 不可用（502）→ 错误直显 + 下载出口', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      jsonResponse(502, { error: { code: 'preview_backend_unavailable', message: 'kkfileview unreachable' } })));
+    // #787：探针报可用但签票 POST 打 kk 时 502 ⇒ 后端原文直显（探针不拦这条）。
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
+      String(input) === '/api/preview-backend'
+        ? jsonResponse(200, { configured: true, available: true })
+        : jsonResponse(502, { error: { code: 'preview_backend_unavailable', message: 'kkfileview unreachable' } })));
     const wrapper = mountAt('docs/a.xlsx');
     await tick();
     expect(wrapper.find('[role="alert"]').text()).toContain('kkfileview unreachable');
@@ -293,6 +306,59 @@ describe('FilePreviewModal 四通道分流（#366 P0/P1/P2）', () => {
     const head = wrapper.find('.flex.items-center a[href*="mode=download"]');
     expect(head.exists()).toBe(true);
     expect(head.attributes('href')).toContain(`path=${encodeURIComponent('a/b/note.txt')}`);
+    wrapper.unmount();
+  });
+
+  // #787：kkfile 通道先探 `/api/preview-backend`，后端不在线 ⇒ 不签票、不发 iframe，直接降级到下载。
+  it('kkfile：探针 available:false ⇒ 不签票、无 iframe、给下载（不可达文案）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
+      String(input) === '/api/preview-backend'
+        ? jsonResponse(200, { configured: true, available: false })
+        : jsonResponse(200, { url: '/pv/SHOULD_NOT_APPEAR/onlinePreview', expires_in: 600 })));
+    const wrapper = mountAt('docs/report.docx');
+    await tick();
+    expect(wrapper.find('iframe').exists()).toBe(false);
+    // 未 POST 过 /api/preview-tickets。
+    const posts = vi.mocked(fetch).mock.calls.filter(
+      (c) => String(c[0]) === '/api/preview-tickets');
+    expect(posts).toHaveLength(0);
+    expect(wrapper.find('[role="alert"]').text()).toContain('文档预览服务暂不可用');
+    expect(wrapper.find('a[href*="mode=download"]').attributes('href')).toContain('mode=download');
+    wrapper.unmount();
+  });
+
+  it('kkfile：探针 configured:false ⇒ 「未配置」文案、同样降级到下载', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
+      String(input) === '/api/preview-backend'
+        ? jsonResponse(200, { configured: false, available: false })
+        : jsonResponse(200, { url: '/pv/X/onlinePreview', expires_in: 600 })));
+    const wrapper = mountAt('docs/a.xlsx');
+    await tick();
+    expect(wrapper.find('iframe').exists()).toBe(false);
+    expect(wrapper.find('[role="alert"]').text()).toContain('未配置文档预览服务');
+    wrapper.unmount();
+  });
+
+  it('kkfile：探针请求本身失败 ⇒ fail-closed 走「不可达」文案', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/preview-backend') throw new Error('network down');
+      return jsonResponse(200, { url: '/pv/X/onlinePreview', expires_in: 600 });
+    }));
+    const wrapper = mountAt('docs/deck.pptx');
+    await tick();
+    expect(wrapper.find('iframe').exists()).toBe(false);
+    expect(wrapper.find('[role="alert"]').text()).toContain('文档预览服务暂不可用');
+    wrapper.unmount();
+  });
+
+  it('kkfile：探针 available:true ⇒ 照旧签票 + iframe（#787 新钉）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
+      String(input) === '/api/preview-backend'
+        ? jsonResponse(200, { configured: true, available: true })
+        : jsonResponse(200, { url: '/pv/OK.SIG/onlinePreview', expires_in: 600 })));
+    const wrapper = mountAt('docs/report.docx');
+    await tick();
+    expect(wrapper.find('iframe').attributes('src')).toBe('/pv/OK.SIG/onlinePreview');
     wrapper.unmount();
   });
 });
