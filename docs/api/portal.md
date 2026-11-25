@@ -99,6 +99,7 @@
 | 文件 | `GET /api/file?mode=json\|stream\|download` | 单文件预览（缺省 `json` 行为不变）；`stream` 带 Range/MIME/Disposition，`download` 附件（#366 P0，§4.11） |
 | 文件 | `POST /api/preview-tickets` | 签一枚 `/pv/<code>` 预览能力码（#366 P2，§4.11） |
 | 文件 | `GET /pv/<code>/**` | kkFileView 反代网关（非 JSON API，浏览器 iframe 入口；#366 P2，§4.11） |
+| 文件 | `GET /api/preview-backend` | kkFileView 可用性探针（`{configured,available,checkedAt}`，恒 200，不返 URL；#787，§4.11）|
 | 文件 | `GET /api/admin/preview-misses` | 415/413 预览未命中日聚合（#366 P1，§4.11；管理员） |
 | 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
 | 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **未交付**（同上；internal 面 U10/U11 保留作协议留档）|
@@ -2580,6 +2581,14 @@ JSON 通道的 415/413 同时写 `preview_miss_stats` 埋点（见下）。
 **`POST /api/preview-tickets`** `{cwd, path}` → `{ url: "/pv/<code>/onlinePreview", expires_in: 600 }`。
 `<code>` = `base64url(JSON 载荷) + "." + HMAC-SHA256`（载荷 `{u: user_id, p: userspace 相对路径, m: mtime 秒, e: 过期秒}`），
 密钥 = `SESSION_SIGNING_KEY`（`previewSessionSigningKey`）。mtime 入码 = 文件被 agent 改写后旧码自然失效（`403 preview_code_expired`，`retryable` → 前端重签一次）。
+
+**`GET /api/preview-backend`**（普通会话可读）→
+`{ configured: bool, available: bool, checkedAt: ISO }`。可用性探针（#787）：
+现读 `preview.kk_base_url`（三档 DB > env `KK_INTERNAL_BASE_URL` > 默认，`hot`）。
+未配置 ⇒ 不发请求，直接 `{configured:false, available:false}`；已配置 ⇒
+`GET <base>/index`（超时 1200ms），非 2xx/超时/DNS/拒连一律 `available:false`。
+**任何情况都回 200**（状态查询不是错误，非 502）；按 base URL 分槽缓存 10s。
+响应**不含 base URL 本身**。前端 kkfile 通道据此渲染 iframe 或降级到下载。
 
 **`GET/HEAD /pv/<code>/**`（反代闸门，非 JSON API）**：浏览器永远看不到 kk 真实地址。每请求依序过：
 会话 cookie（401）→ 能力码验签（404）→ 子路径白名单（kk 已知路由 + `js/css/images` 静态目录，越界 404）

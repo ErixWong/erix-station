@@ -10377,3 +10377,53 @@ job summary 与 artifact `images-digest`，ID `14918481157`）；GitHub Release 
 其中 6 个坐标例子与 `check:doc-portable` 源码重复）；也没有改「加行准入判据」——那是另一件事，
 本单只解决「余量被吃光却无人知晓」。
 
+### 8.210 kkFileView 预览后端：地址进运行时旋钮 + 可用性探针 + 降级下载（2026-11-25，PR #787）
+
+**治的是什么**：`docx/xlsx/pptx/zip` 一律走 kkFileView 通道，但「kk 有没有配 /
+可不可达」系统自己不知道——签票永远成功（本地 HMAC），iframe 拿 502
+后父页面跨域读不到 ⇒ 用户看白框里一段 JSON，且没有下载兜底。本单
+把「有没有 kk」变成可配置 + 可探测 + 可降级。
+
+**运行时旋钮 `preview.kk_base_url`**（`portal/src/runtime-settings.js`，M1 `9df0f180`）：
+新增一格 `kind:'text'`（其余 12 格不加 `kind`，前端缺省按 integer）。
+`parseKkBaseUrl` 只收 http(s) base URL，拒 userinfo / query / fragment /
+去尾斜杠后为空 / >255，
+任何输入都不抛（回 `{ok:false, reason}`）。env 兜底键 `KK_INTERNAL_BASE_URL`，
+默认 `http://kkfileview:8012`，`applyMode:'hot'`。
+
+**三档**：DB（运行时设置）> env（`KK_INTERNAL_BASE_URL`）> 代码默认。热读走
+`createHotReader`（5s 缓存），`HOT_READ_INVALIDATORS` 登记了 `invalidateKkBaseUrlCache`
+——保存后必须失效，否则「界面保存了、值没变」
+（单测钉住它的身份）。
+
+**探针口径**（`portal/src/preview-backend.js`，端点 `GET /api/preview-backend`）：
+`configured = typeof baseUrl === 'string' && baseUrl.trim() !== ''`；未配置 ⇒ 不发请求
+直接 `{configured:false, available:false}`；已配置 ⇒ `GET <base>/index`
+（超时 1200ms），
+`res.ok` ⇒ available；超时/DNS/拒连/非 2xx 一律 `available:false`，绝不抛。缓存按
+base URL 分槽（换地址立刻重探），TTL 10s 内命中并回首次探测的 `checkedAt`。
+探针不带用户身份头。端点普通会话可读，**恒回 200**
+（状态查询不是错误，
+不映射成 502），响应**不含 base URL 本身**。
+
+**降级口径**（前端，M2 `f370c225`）：`FilePreviewModal` 的 kkfile 通道 `onMounted` 先
+探 `/api/preview-backend`——`available===true` 才走原 `loadTicket()` 签票 + iframe；
+否则 `backendState='unconfigured'|'unreachable'`，不签票、不渲染 iframe，给提示 +
+下载链接。探针请求本身失败 ⇒ fail-closed 到 `unreachable`。
+设置页含该键时挂载
+探一次、渲染三态徽标（`data-test="kk-preview-status"`：
+未配置 / 可达 / 不可达），
+保存该键成功后重探；探针失败不许把整页打成错误态。`previewRoute.ts` 的
+`previewChannel` 签名未改（`lib/previewRoute.spec.ts` 原样绿）。
+
+**每步退出码**：M1 后端四测（preview-backend / runtime-settings-kk-base-url /
+http-preview-backend / runtime-settings）`node --test` 全 rc=0；M2 前端 typecheck rc=0，
+六测（runtimeSettings / AdminRuntimeSettingsView / FilePreviewModal / previewRoute /
+localeParity + 后端 runtime-settings）全 rc=0。M3 门禁见工单回帖。
+
+**已知残留**：iframe 502 竞态仍在——探针报「可用」与真正签票/iframe
+之间有时间窗，
+kk 恰在此刻挂 ⇒ iframe 仍可能拿 502 白框（探针是
+best-effort 前置门，不覆盖这个
+窗口）；本单不验真机 kk。
+

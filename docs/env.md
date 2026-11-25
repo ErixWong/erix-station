@@ -288,7 +288,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_MEMORY_LIMIT` | 平台规范固定（deploy-contract §6.2 资源限额；**已决 2026-09-18，issue #27**） | `4g`（B 档镜像下 dotnet build/chromium 峰值需要；`0` 表示不限） |
 | `FDE_WORKER_UID` | 容器内 worker 的 UID（agentd fork worker 时切；portal 侧给 agent shell 写 git `safe.directory`） | `1002`（GID 同 `1000`） |
 | `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；#366 兼任 `/pv/<code>` 能力码签名密钥 `previewSessionSigningKey`；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
-| `KK_INTERNAL_BASE_URL` | portal 访问 kkFileView 预览引擎的容器网地址（#366，portal.md §4.11；浏览器永远不碰它） | `http://kkfileview:8012` |
+| `KK_INTERNAL_BASE_URL` | portal 访问 kkFileView 预览引擎的容器网地址（#366/#787，portal.md §4.11/§4.21；三档 DB > env > 默认，运行时键 `preview.kk_base_url`（hot，管理台「运行时配置」页可改）；浏览器永远不碰它） | `http://kkfileview:8012` |
 | `KKFILEVIEW_IMAGE` | kkFileView 镜像。**官方 Hub 镜像停在 4.1.0（无 `file://` 本地协议，不支持 ro 挂载预览设计），上游 5.x 未发布镜像 → 自建**（`deploy/kkfileview/build-image.sh`，生产按 digest 钉死） | `erix-station/kkfileview:5.0.3`（dev 本地 build） |
 | `KKFILEVIEW_UID` / `KKFILEVIEW_GID` | kk 容器运行身份（userspace 属主是 1000:1000 且 `drwxrwx---`，root 无特权容器里拿不到 GID 1000 补充组，直读只能同 uid/gid；#366） | `1000` / `1000` |
 | `KKFILEVIEW_MEM_LIMIT` | kk 容器内存上限（LibreOffice 子进程计入；转换峰值实测前保守值） | `2g` |
