@@ -123,6 +123,7 @@
 > 另：`POST /api/admin/llm/providers`、`PATCH|DELETE /api/admin/llm/providers/:id`、
 > `GET /api/admin/llm/models` 与 `POST /api/admin/llm/models/:id/block|unblock`
 > （`http.js:1927/1965/1995`）**已实现但无契约**，只在正文散文里出现过 —— 待补写（#777 A 组）。
+> 心跳对账的口径仍见台账 §8.25；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
 >
