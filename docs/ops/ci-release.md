@@ -14,54 +14,31 @@
 
 | 触发 | 跑什么 | 预计分钟量级（Linux `$0.006/min`） |
 |---|---|---|
-| `pull_request` | **唯一的 CI 入口**（#783）：门禁（docs-only 走 §1.1 快道）+ 按路径过滤的三镜像构建校验（`--load`，不推送） | 全量 3–5 min + 镜像见下行旧口径 |
+| ~~`pull_request`~~ | **已删（261125）**：PR 不再触发任何 CI（§1.1）；门禁靠本地 `npm test` | 0 |
 | ~~`push`（main）~~ | **已删（#783）**：同一棵内容的树 PR 上已验过（PR 检查跑在合并 ref 上），合进 main 再跑是纯重复 | 门禁 3–5 min 白跑一遍 / 镜像 3–15 min（这列是删除前的口径） |
 | `push`（tag `v*`） | `release.yml`：版本校验 + 三镜像构建并推 GHCR + digest 清单 | 15–25 min（FDE 镜像体积大，推送占大头；GHCR 带宽目前免费） |
 | `workflow_dispatch`（ci.yml） | 门禁；`build_images=all` 时追加三镜像构建校验 | 同上 |
 | `workflow_dispatch`（release.yml） | 手填 `tag`，跑与 tag push 完全相同的发布流程 | 同上 |
 
-### 1.1 CI 只在 PR 触发 + docs-only 快道（#783）
+### 1.1 CI 不再自动触发（261125 用户裁定）
 
-**删掉 `push`（main）的代价，以及必须同时守的纪律**：PR 检查跑在它**那一刻的 base** 上，
-别人先合了就会错配——261125 实测「PR 自己绿、合进 main 才红」4 次（#757/#761/#765/#770）全是这个形状。
-⇒ **合并前若 main 已推进，先把 main 并进本支，让 CI 在新头上绿一次再合。**
-另两条一起守：**红着的 PR 不合**（同一天 2 次红单被合进 main，再花一轮才看见 main 红）；
-**main 只接受合并**——现在直推 main 不再有任何 CI（实测今天直推 0 次，所以改得起）。
+**CI 只在手动 `workflow_dispatch` 跑**：① `node --check` + ② `npm ci` + `npm test`
+（根发现规则已含 `runner/test/*.test.js`），约 40–60 秒。**PR 与 push 都不再触发**——
+单人仓库里同一套命令本地跑只要 20 秒，没必要每次 push 都占一轮 runner 分钟。
+门禁靠提交前本地 `npm test`；CI 是「你想要的时候才跑」的复核工具。
 
-**docs-only 快道（`ci.yml` 步骤 ⓪）**：`base ↔ head` 的 diff 若全部落在 `docs/**`、根级 `*.md`、
-`scripts/doc-impl-exceptions.json` 之内 ⇒ 只跑 ①、⑤ 与三条文档闸（`check:agents-hotlayer` /
-`check:doc-portable` / `check:doc-impl`，都是零依赖脚本，**不做 `npm ci`**），
-跳过 ②（根 `npm ci` + `npm test`）、②′（真库腿）、③（runner）、④（前端）。
-故意**不算** docs-only：`deploy/migrations/**`（迁移要真库腿验）、`.github/workflows/**`（改 CI 自己必须全量验）、
-任何 `*.js` / `*.test.js`。取不到 base（新分支首推 / force push / `workflow_dispatch`）⇒ 一律全量。
-被跳过的腿在步骤输出与 job summary 里点名 ⇒ **别把快道的绿读成「全套跑过」**。
+**不跑**真数据库测试、前端 typecheck+vitest、镜像构建——它们改成本地/发版前手动：
 
-**门禁步骤（顺序执行，任一失败即红；`ci.yml` 步骤 ①、①′、⓪、②–④、⑤）**
+- 真数据库测试：`npm run check:ci-legs`（需 `TEST_DATABASE_URL`，见 §4.1）
+- 前端：`cd portal/frontend && npm run typecheck && npm test`
+- 镜像：`workflow_dispatch` 且 `build_images=all`（§4）
 
-> **历史基线（2026-11-11 在 `main@ad68523` + 热层搬家那笔 docs-only 改动上实测，四步 rc 全 0）**：
-> ① `node --check` **255** 个文件（新增 1 个闸脚本 + 1 个闸测试） · ② 根 **2138 / 2134 通过 / 0 失败 /
-> 4 跳过**（含 runner 的 505） · ③ runner **505 / 505** · ④ 前端 `typecheck` 干净 +
-> **63 文件 / 1316 通过**（本笔未改前端，该读数沿用 `bd227e2` 实测，动前端时重测）。
-> ⚠ 上面四个数是**那个 commit 的历史基线**，不是现价；别拿它们对今天的报告。旧行留着是因为它带着日期与
-> 当时的口径（逐项净增的起点），**不要删**。
->
-> **当前基线（2026-11-14 在 `fix-261114-04-doc-drift-followup@709c7c9`（基点 `main@98e5dc3`）上实测；
-> 四个数都是 261114-04 本单在那棵树上亲手跑的，四步 rc 全 0）**：
-> ⚠ **锚点写的是「读数真实所在的那一笔」，不是「我记账时看到的 HEAD」**——上一笔就是那么错的
-> （它锚的是 `e006d45`，数的是两笔之后的树）。
-> ① `node --check` **265** 个文件（`git ls-files -- '*.js' '*.mjs'` 现数 265，逐文件跑过 rc=0。
-> ⚠ 旧行那个 **264** 是「拿 `main@e006d45` 当锚点 + 再算上本单新增脚本」凑出来的：`e006d45` 的树里只有 **263** 个，
-> 而 `aa78c6b`（迁移 `0034` + `portal/test/prune-checkpoints-db.test.js`）与 `5c7fc2c`（手工 e2e 脚本
-> `portal/integration/stream-typing-check.mjs`）**各加了一个** ⇒ 自 `98e5dc3` 起真值是 265）·
-> ② 根 `npm test` **2226 tests / 2212 pass / 0 fail / 14 skipped**（无 `TEST_DATABASE_URL` ⇒
-> **13 条真库用例整体 skip** = `delta-not-persisted-db` 5 + `migrate-fresh-db` 4 + `prune-checkpoints-db` 4；
-> 剩下 **那 1 条**是 LiteLLM live smoke，与 DB 无关；另有两个文件里各一条「环境门自证」用例**不设 skip**，
-> 所以它们不在那 13 里。带 PG 单独跑这三个文件：**15 tests / 15 pass / 0 skip**（一次性 postgres:16，
-> rc=0，口径见 `docs/testing.md` §2.2.1））·
-> ③ runner **507 / 507**（`cd runner && node --test`）· ④ 前端 **63 文件 / 1336 通过** + `typecheck` 干净。
-> ⚠ 下面每一步里那一大段括号是**历史沿革**（逐单净增记录），旧数字彼此矛盾——**查现价只看上面「当前基线」那块**：
-> 数字只在**本节**写（`.github/workflows/ci.yml` 步骤 ② 的注释已压成指向本节的指针，261110-04），
-> ⇒ **本节是那份读数的单一来源**。
+**为什么砍**：261125 实测一天 60 轮 / **342 分钟**（private 仓库计入免费额度，超额直接停跑），
+其中 24 轮是「合并进 main 后又跑一遍同一棵树」（#783 已删）；剩下每轮 5–8 分钟里，
+真正抓到过缺陷的只有根单测。红的次数多到没人再当真，是比慢更贵的代价。
+
+**仍然要守的两条**（与快慢无关）：合并前若 main 已推进，先把 main 并进本支再让 CI 绿一次；
+**红着的 PR 不合**。
 
 1. （步骤 ①）`node --check` 扫全部 git 跟踪的 `*.js` / `*.mjs`（当前 **252** 个文件，2026-11-10 实测；按 `git ls-files -- '*.js' '*.mjs'` 数；
    仓库 `type: module`，`node --check` 会按 `package.json` 的 type 解析，ESM 文件实测 rc=0）。
@@ -119,7 +96,7 @@
    管理台改块（**未确认不得发 POST** / 409 全文 / 400 指 `block_start`）10（`src/views/AdminPreviewPorts.spec.ts`）、
    i18n 双语键集对齐 6（`src/i18n/localeParity.spec.ts`）。既有 329 项一条没改、一条没红。
 
-**镜像构建校验的路径过滤（`ci.yml` 步骤 ⑤）**
+**镜像构建校验（261125 起只在 `workflow_dispatch` + `build_images=all` 时跑，三镜像全建）**
 
 | 镜像 | 构建上下文 / Dockerfile | 触发路径 |
 |---|---|---|
@@ -130,8 +107,6 @@
 - 后三类是**按仓库实际补的**：`portal/Dockerfile:31` COPY 了 `docs/data/`、`:34` COPY 了 `deploy/migrations/`、
   根 `.dockerignore` 参与 context `.` 的上下文计算 ⇒ 它们变了镜像内容就变，不构建校验就是假绿。
   （工单原表只列了 `portal/**` + 根 `package*.json`。）
-- **纯 docs 提交不构建任何镜像**（`docs/**` 除 `docs/data/` 外都不在触发集里）。
-- 推入前的 commit 在本地历史里找不到（新分支首推 / force push）⇒ 保守起见三个全构建。
 - CI **不传** `HTTP_PROXY/HTTPS_PROXY/NO_PROXY` build args，也不加 `--network=host`：
   `runner/Dockerfile:55-74` 那层从 github.com / dl.gitea.io / gitlab.com 直连下 gh/tea/glab，
   本开发机在墙内必须走代理（`fde-image.mjs:26-40`），GitHub runner 直连可达；
@@ -273,13 +248,13 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
   `docker buildx build --load runner/`（FDE，本机需先按 `fde-image.mjs` 的口径传代理 + `--network=host`）、
   `docker buildx build --load deploy/fde-proxy`。
 
-### 4.1 CI 里有 PostgreSQL：真库腿不再静默 skip（#665）
+### 4.1 真数据库测试：本地/发版前手动跑（#665 起不再静默 skip，261125 起不进 CI）
 
-旧口径是「集成测试不在 CI 里」——CI 无 PG ⇒ 只有空库或只有真 SQL 执行才现形的
-那类缺陷在流水线上恒绿（根门禁只看 `# fail`，`# skipped` 不参与判定，一个静默 skip
-的腿和一个通过的 job 同色）。**这条口径自 #665 起作废**：质量门禁 job（`ci.yml` 的
-`gate`）已加 `services: postgres`（`postgres:16`，内置超级用户 `postgres`），步骤 ② 之后
-新增步骤 ②′ 注入 `TEST_DATABASE_URL` 并跑「必须真跑」的腿。
+根门禁只看 `# fail`，一个静默 skip 的真库腿与一个通过的 job 同色——这条口径不变，
+但**执行位置改了**：261125 起不再在 CI 起 `postgres` service、不再跑步骤 ②′，
+改为本地或发版前手动 `npm run check:ci-legs`（需 `TEST_DATABASE_URL`）。
+它仍然对「必须真跑清单」逐条真跑并断言 `# skipped == 0` 且 `pass` 达到期望；
+没有 `TEST_DATABASE_URL` 时明确点名「这几条腿这次没跑」并 rc=1（不静默）。
 
 当前接进来的**三条**（只加 service，不新开 job、不用 matrix、不加 Playwright）：
 
