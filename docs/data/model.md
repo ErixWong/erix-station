@@ -664,6 +664,283 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 写入方与读取方与 §1.34 同一处（`disksInsertSql()` 的多值 `INSERT … ON CONFLICT (sampled_at, device) DO NOTHING`）。
 
+### 1.36 `fde_onboarding` — FDE 开户编排状态（issue #111，migration 0012）
+
+**用途**：一次 FDE 开户的分步进度落库（每 FDE 一行，主键即 `fde_id`）。
+编排可中断可续，进程重启后照本表接着推。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `fde_id` | `uuid` | `PRIMARY KEY`，`REFERENCES users(id) ON DELETE CASCADE` | 每 FDE 一行，与 `users` 同生共死 |
+| `state` | `text` | `NOT NULL DEFAULT 'pending'`，`CHECK (state IN ('pending','running','awaiting_credential','done','failed'))` | 编排状态机（见下） |
+| `steps` | `jsonb` | `NOT NULL DEFAULT '{}'` | 各步进度快照 |
+| `last_error` | `text` | 可空 | 最近一次失败原因 |
+| `attempt` | `int` | `NOT NULL DEFAULT 0` | 重试次数 |
+| `created_at` / `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建 / 更时刻 |
+
+**值域 / 状态机**：`state` 五值枚举由 `CHECK` 钉住（`pending` / `running` / `awaiting_credential` / `done` / `failed`）；典型推进 `pending → running → done`，失败 ⇒ `failed`，需人工写 PAT 时经 `awaiting_credential`——转换由应用层执行。
+
+**谁写谁读**：写 = `portal/src/onboarding.js`（编排推进）；读 = `portal/src/admin.js`（管理台开户进度）。
+
+### 1.37 `port_observations` — 容器端口占用观测（issue #246，migration 0022）
+
+**用途**：agentd 心跳上报「容器里哪个进程在听哪个端口」的观测行，供端口分配与路由漂移对账。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `uuid` | `PRIMARY KEY DEFAULT gen_random_uuid()` | 观测行 id |
+| `fde_id` | `uuid` | `NOT NULL REFERENCES users(id)` | = `containers.user_id`，冗余一份供按 FDE 直查 |
+| `container_id` | `uuid` | `NOT NULL REFERENCES containers(id) ON DELETE CASCADE` | 观测来自哪台容器（重建后随旧心跳级联清除） |
+| `port` | `int` | `NOT NULL CHECK (port BETWEEN 1 AND 65535)` | 监听端口 |
+| `pid` | `int` | 可空 | 进程号 |
+| `cwd` | `text` | 可空 | 进程工作目录（`~/projects/<name>` 下相对形，容器外进程留绝对路径） |
+| `cmd` | `text` | 可空 | cmdline 摘要（截断），分辨「是哪个 dev server」 |
+| `branch` | `text` | 可空 | `cwd` 处 `.git/HEAD` 指向的分支（尽力而为，detached / 非仓库为 NULL） |
+| `proc_started_at` | `timestamptz` | 可空 | 进程启动时刻（`/proc/<pid>/stat` 换算） |
+| `observed_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 最后一次采样到它的时刻（新鲜度窗口读侧判定） |
+| `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建行时刻 |
+
+**值域 / 状态机**：`port ∈ [1, 65535]`；无状态机（观测流，新鲜度由读侧按 `observed_at` 判）。
+
+**谁写谁读**：写 = `portal/src/portalloc.js` / `portal/src/materializer.js`（心跳落观测）；读 = `portal/src/routesdrift.js`（路由漂移对账）。
+
+### 1.38 `preview_miss_stats` — 预览未命中的按天计数（issue #366，migration 0023）
+
+**用途**：记录预览里「点了但不该被预览」的文件类型，按 `(kind, ext, day)` 聚合，回答「哪类文件在被点」。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `kind` | `text` | `NOT NULL CHECK (kind IN ('binary', 'too_large'))` | `binary` = 415 `unsupported_file_type`；`too_large` = 413 `file_too_large` |
+| `ext` | `text` | `NOT NULL` | 归一化小写扩展名（无点；无扩展名 / 不可识别为 `''`） |
+| `day` | `date` | `NOT NULL` | 按天聚合（写侧 `current_date` 归一） |
+| `hits` | `bigint` | `NOT NULL DEFAULT 0` | 当日命中数 |
+| `last_user_id` | `uuid` | `REFERENCES users(id) ON DELETE SET NULL` | 当日最后一次点击者（注销不挡计数） |
+| `created_at` / `last_seen_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建行 / 最近见到时刻 |
+
+主键：`PRIMARY KEY (kind, ext, day)`。
+
+**值域 / 状态机**：`kind` 二值 `binary` / `too_large`；`ext` 允许 `''`。无状态机。
+
+**谁写谁读**：写 = `portal/src/previewmiss.js`（点中即按 `(kind, ext, day)` 累加 `hits`）；读 = 管理台按窗口求和。
+
+### 1.39 `upload_settings` — 文件上传大小上限（单行表）（issue #485，migration 0036）
+
+**用途**：全站「单文件上限（字节）」的 DB 真相；单行表（`id` 恒为 1）。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `int` | `PRIMARY KEY DEFAULT 1 CHECK (id = 1)` | 单行表哨兵 |
+| `max_file_bytes` | `bigint` | `NOT NULL CHECK (max_file_bytes > 0)` | 单文件上限（字节）；产品区间 1 MiB–1 GiB 由写侧校验 |
+| `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 改时刻 |
+| `updated_by` | `uuid` | 可空 | 改动人 |
+
+**值域 / 状态机**：`max_file_bytes > 0` 是 DB 事实；产品区间 `[1 MiB, 1 GiB]` 交写侧。无状态机。
+
+**谁写谁读**：写 = `portal/src/upload-settings.js`（管理台改）；读 = `portal/src/http.js` / `portal/src/config.js`（上传校验取上限）。
+
+### 1.40 `notifications` — 宏事件通知（铃铛）（issue #526，migration 0037）
+
+**用途**：宏事件「谁该被通知、读没读」的落库；面板铃铛与模板软删判定都读它。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `VARCHAR(32)` | `PRIMARY KEY` | 站内短 id，应用侧生成（见 `notifications.js`） |
+| `user_id` | `uuid` | `NOT NULL REFERENCES users(id)` | 收件人 |
+| `macro_run_id` | `uuid` | `REFERENCES macro_runs(id) ON DELETE SET NULL` | 关联的宏执行 |
+| `severity` | `text` | `NOT NULL DEFAULT 'info' CHECK (severity IN ('info', 'error'))` | 严重级 |
+| `title` | `text` | `NOT NULL CHECK (btrim(title) <> '')` | 标题（不许空白） |
+| `body` | `text` | `NOT NULL DEFAULT ''` | 正文 |
+| `read_at` | `timestamptz` | 可空 | `NULL` = 未读；已读时刻应用侧写 |
+| `created_at` | `timestamptz` | `NOT NULL` | 生成时刻（应用侧写，无默认） |
+
+索引：`(user_id, created_at DESC)`（翻页主路径）+ partial `(user_id) WHERE read_at IS NULL`（未读计数）。
+
+**值域 / 状态机**：`severity ∈ {info, error}`；`read_at` `NULL`=未读 / 非 `NULL`=已读（两态）。⚠ 表与读侧 API 已落地，**不等于通知调度 / 派发全量实现**。
+
+**谁写谁读**：写 = 宏事件生成侧（`notifications.js` / `macroRoutes`）；读 = `portal/src/http.js`（`GET /api/notifications`、`/api/notifications/unread-count`、`/api/notifications/:id/read`）。
+
+### 1.41 `capability_items` — 能力市场条目（skill / mcp）（issue #595，migration 0039）
+
+**用途**：能力市场目录主表，一条 = 一个 skill / mcp 能力。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `uuid` | `PRIMARY KEY DEFAULT gen_random_uuid()` | 条目 id |
+| `kind` | `text` | `NOT NULL DEFAULT 'skill' CHECK (kind IN ('skill','mcp'))` | 能力类别 |
+| `slug` | `text` | `NOT NULL UNIQUE` | 目录名，`^[a-z0-9][a-z0-9-]{0,63}$`（校验在 `market.js`） |
+| `name` | `text` | `NOT NULL` | 展示名 |
+| `summary` | `text` | `NOT NULL` | 一句话（列表卡片） |
+| `when_to_use` | `text` | `NOT NULL` | 「何时用」，L3 路由信号 |
+| `description_md` | `text` | `NOT NULL DEFAULT ''` | 详情页正文 |
+| `version` | `text` | `NOT NULL` | 版本 |
+| `author` | `text` | 可空 | 作者 |
+| `tags` | `text[]` | `NOT NULL DEFAULT '{}'` | 标签 |
+| `license` | `text` | 可空 | 许可 |
+| `state` | `text` | `NOT NULL DEFAULT 'draft' CHECK (state IN ('draft','published','retired'))` | 生命周期 |
+| `manifest` | `jsonb` | `NOT NULL` | 清单 `{skill_id, entrypoint, tools:[…], files:[…]}` |
+| `security_score` | `int` | `NOT NULL DEFAULT 100` | 安全分 |
+| `security_warnings` | `jsonb` | `NOT NULL DEFAULT '[]'` | `[{code, path, line, note}]` |
+| `created_by` | `uuid` | `REFERENCES users(id)` | 创建人 |
+| `published_at` / `retired_at` | `timestamptz` | 可空 | 上架 / 退役时刻 |
+| `created_at` / `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建 / 更时刻 |
+
+**值域 / 状态机**：`kind ∈ {skill, mcp}`；`state` 三值 `draft → published → retired`（转换由应用层执行）。
+
+**谁写谁读**：写 = `portal/src/market.js`；读 = `portal/src/http.js`（市场列表 / 详情路由）。
+
+### 1.42 `capability_files` — 能力条目的文件原文（issue #595，migration 0039）
+
+**用途**：某能力某版本的文件内容（字节），随条目级联删。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `item_id` | `uuid` | `NOT NULL REFERENCES capability_items(id) ON DELETE CASCADE` | 所属条目 |
+| `version` | `text` | `NOT NULL` | 版本 |
+| `path` | `text` | `NOT NULL` | 相对路径，已校验（无绝对路径 / 无 `..` / 无符号链接） |
+| `content` | `bytea` | `NOT NULL` | 文件原文 |
+| `bytes` | `int` | `NOT NULL` | 字节数 |
+
+主键：`PRIMARY KEY (item_id, version, path)`。
+
+**值域 / 状态机**：`path` 必须是相对路径；无状态机。
+
+**谁写谁读**：写 = `portal/src/market.js`；读 = 装填能力时由 `market.js` 按 `(item_id, version)` 取文件。
+
+### 1.43 `fde_capability_installs` — FDE ↔ 能力安装关系（issue #595，migration 0039）
+
+**用途**：哪个 FDE 装了哪个能力哪个版本，带启停开关。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `fde_id` | `uuid` | `NOT NULL REFERENCES users(id) ON DELETE CASCADE` | 装到哪个 FDE |
+| `item_id` | `uuid` | `NOT NULL REFERENCES capability_items(id) ON DELETE CASCADE` | 装哪个能力 |
+| `version` | `text` | `NOT NULL` | 装的版本 |
+| `enabled` | `boolean` | `NOT NULL DEFAULT true` | 启 / 停开关 |
+| `installed_at` / `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 装 / 更时刻 |
+
+主键：`PRIMARY KEY (fde_id, item_id)`（每 FDE 对每能力一行）。
+
+**值域 / 状态机**：`enabled` 二值，是「启 / 停」而非「装 / 卸」（卸载 = 删行，不是置 `false`）。
+
+**谁写谁读**：写 = `portal/src/market.js`；读 = `market.js`（列已装 / 装填注入）。
+
+### 1.44 `capability_params` — 能力的参数槽声明（issue #608，migration 0040）
+
+**用途**：一个能力声明它需要哪些注入参数（配置 / 密钥）及注入位置。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `item_id` | `uuid` | `NOT NULL REFERENCES capability_items(id) ON DELETE CASCADE` | 所属能力 |
+| `name` | `text` | `NOT NULL` | 注入名，`^[A-Z][A-Z0-9_]{0,63}$` |
+| `kind` | `text` | `NOT NULL CHECK (kind IN ('config','secret'))` | 配置 / 密钥 |
+| `inject` | `text` | `NOT NULL CHECK (inject IN ('context','env','header'))` | 注入位置 |
+| `required` | `boolean` | `NOT NULL DEFAULT true` | 是否必填 |
+| `description` | `text` | `NOT NULL DEFAULT ''` | 说明 |
+| `created_at` / `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建 / 更时刻 |
+
+主键：`PRIMARY KEY (item_id, name)`。额外 `CHECK (kind <> 'secret' OR inject IN ('env','header'))`：密钥只能注到 `env` / `header`。
+
+**值域 / 状态机**：`kind ∈ {config, secret}`；`inject ∈ {context, env, header}`；`secret` 被约束为只能 `env` / `header`。无状态机。
+
+**谁写谁读**：写 = `portal/src/market.js`；读 = `portal/src/secrets.js`（注入装配）。
+
+### 1.45 `capability_param_values` — 参数槽的实际取值（issue #608，migration 0040/0042）
+
+**用途**：参数槽在某作用域（全局或某 FDE）的实际值。⚠ **最终列是 `value_plain` 明文**；`value_encrypted` 已由 `0042` 删除，**没有密文列**。
+
+**列定义**（0040 建、0042 改后的最终形态）：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `uuid` | `PRIMARY KEY DEFAULT gen_random_uuid()` | 值行 id |
+| `item_id` | `uuid` | `NOT NULL REFERENCES capability_items(id) ON DELETE CASCADE` | 所属能力 |
+| `name` | `text` | `NOT NULL` | 参数名（与 `item_id` 一起 FK 回 `capability_params`） |
+| `scope` | `text` | `NOT NULL CHECK (scope IN ('global','fde'))` | 作用域 |
+| `fde_id` | `uuid` | `REFERENCES users(id) ON DELETE CASCADE` | `scope='fde'` 才给 |
+| `value_plain` | `text` | `NOT NULL`（0042 加） | 明文值；0040 建时为 `value_encrypted bytea`，0042 `ADD value_plain` + `DROP value_encrypted` + `SET NOT NULL` |
+| `updated_by` | `uuid` | `REFERENCES users(id) ON DELETE SET NULL` | 改动人 |
+| `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 改时刻 |
+
+其他约束：`FOREIGN KEY (item_id, name) REFERENCES capability_params(item_id, name) ON DELETE CASCADE`；`CHECK ((scope = 'fde') = (fde_id IS NOT NULL))`；partial 唯一索引 `capability_param_values_global_uq (item_id, name) WHERE scope = 'global'` 与 `capability_param_values_fde_uq (item_id, name, fde_id) WHERE scope = 'fde'`。
+
+**值域 / 状态机**：`scope ∈ {global, fde}`，且与 `fde_id` 是否非空同真同假；「没有值」只能用「没有行」表达（明文拒空串）。无状态机。
+
+**谁写谁读**：写 = `portal/src/secrets.js` / `market.js`；读 = 注入装配时按 `(item_id, name, scope)` 取值。
+
+### 1.46 `platform_prompts` — 平台文案 / 提示词覆写（单行表）（issue #596，migration 0043）
+
+**用途**：管理员覆写三处平台文本（AGENTS.md 补充节、AGENTS.md 覆写主体、标题生成提示词）。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `int` | `PRIMARY KEY DEFAULT 1 CHECK (id = 1)` | 单行表哨兵 |
+| `agents_md_addendum` | `text` | `NOT NULL DEFAULT ''` | 追加到 `~/AGENTS.md` 末尾的正文；`''` = 不加该节 |
+| `agents_md_override` | `text` | `NOT NULL DEFAULT ''` | 整段替换内置模板正文主体；`''` = 用内置 |
+| `title_prompt` | `text` | `NOT NULL DEFAULT ''` | 会话标题生成的 system 提示词；`''` = 用内置默认 |
+| `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 改时刻 |
+| `updated_by` | `uuid` | 可空 | 改动人 |
+
+**值域 / 状态机**：三个文本列空串 = 回落到内置；无状态机。
+
+**谁写谁读**：写 = `portal/src/http.js`（管理台改）；读 = `portal/src/session-title.js`（标题）+ `portal/src/materializer.js`（生成 `AGENTS.md`）。
+
+### 1.47 `runtime_settings` — 运行时旋钮的 DB 真相（issue #677，migration 0046）
+
+**用途**：把 registry 旋钮的稳定值落库；读侧要的是「它是个 JSON 标量」这个类型事实。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `key` | `text` | `PRIMARY KEY` | 旋钮稳定标识 = registry key（例 `demo.limit`） |
+| `value` | `jsonb` | `NOT NULL` | 值；写侧只收 number / boolean / string；对象 / 数组读侧判非法并回落 |
+| `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 改时刻 |
+| `updated_by` | `uuid` | 可空 | 改动人 |
+
+**值域 / 状态机**：`value` 必须是 JSON 标量（number / boolean / string）；无状态机。
+
+**谁写谁读**：写 = `portal/src/cli.js` / `portal/src/http.js`；读 = `portal/src/preview.js` 等各消费方。
+
+### 1.48 `transcript_recovery_rows` — transcript 恢复行的落库（issue #500，migration 0038）
+
+**用途**：引擎 recovery 事件的落库行（session 作用域），供崩溃恢复重放。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `transcript_key` | `text` | `NOT NULL` | 引擎 store key = `sessionId`（只有 session 语义，无 run 作用域） |
+| `dedup_key` | `text` | `NOT NULL CHECK (length(dedup_key) <= 255)` | 事件键 `<runId>:engine:round:<n>:recovery:<event>:<判别子>` |
+| `round` | `integer` | `NOT NULL CHECK (round >= 0)` | 事件所属轮号 |
+| `record` | `jsonb` | `NOT NULL` | 引擎 record 原样（不剥字段） |
+| `append_seq` | `bigserial` | `NOT NULL` | 持久化追加序（排序唯一真相） |
+
+主键：`PRIMARY KEY (transcript_key, dedup_key)`。
+
+**值域 / 状态机**：`round ≥ 0`；`dedup_key` ≤ 255 字符；`append_seq` 单调递增（排序真相）。无状态机。
+
+**谁写谁读**：写 = `portal/src/transcript-store.js`（引擎 recovery 落行）；读 = 恢复重放时同一模块按 `append_seq` 有序读。
+
 
 ---
 
