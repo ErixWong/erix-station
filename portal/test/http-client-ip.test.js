@@ -16,9 +16,12 @@
 //   A9 nexthop 是别的地址（`10.0.0.1`）⇒ `172.32.0.1` **不**被顺带信任（防「信一切」退化）。
 //   A10 十六进制小端反序还原单独钉一格（工单样例 `0101A8C0`：反序还原 vs 大端直读必须可区分）。
 //   A11 懒算缓存：首次算过一次后不再重读文件（按路径缓存）。
+//   A12 真实 /proc/net/route：不炸且只返合法 v4。
+//   A13 夹具目录必须被清：mkdtemp 的临时目录一律登记 + 文件级 after() 兜底 rmSync（全局 AGENTS.md §3.2），
+//      且这条 teardown 纪律**自己也有断言**（不许只删不证）。
 // 外加最右项语义、IPv6 zone、`::ffff:` 还原、ULA/RFC1918 可信边界的判别式参数化。
 
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -61,9 +64,49 @@ function routeFile(rows) {
   return [header, ...lines].join('\n') + '\n';
 }
 
-/** 在独立临时目录里写一个夹具，返回绝对路径（nexthop 集合按路径懒算并缓存，所以临时目录必须隔离）。 */
+// ---------------------------------------------------------------------------
+// teardown（全局 AGENTS.md §3.2：`mkdtemp` 出来的必须在本文件 teardown 里 `rmSync(…, { recursive: true })`）。
+// 写法照仓里现成的两处，别自创：`portal/test/admin.test.js:1071` 的单例 `t.after(() => fs.rmSync(root, { recursive: true, force: true }))`
+// + `portal/test/login-email-code.test.js:161` 的文件级 `after()` 兜底（那份兜底防的是「断言一抛就轮不到收尾」的泄漏）。
+// 本文件的夹具散在 A7/A8/A9/A10/A11/A13 六个 test 里 ⇒ 逐个 `t.after` 容易漏，改成**模块级登记 + 文件级兜底**：
+// 所有临时目录只能经 `mkTempFixture` 诞生（漏登记会被 A13 的计数断言打红），收摊由下面两个 `after()` 负责。
+// 顺序实测（node v22）：文件级 `after()` 在**全部 test 之后**、按注册顺序跑 ⇒ 先删、再验「真的没了」。
+// ---------------------------------------------------------------------------
+
+const tempDirs = new Set();
+
+/** `mkdtempSync` + 登记进 teardown 集合：本文件的临时目录必须经这里诞生。 */
+function mkTempFixture(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.add(dir);
+  return dir;
+}
+
+/** 清理前的快照，供第二个 `after()`（A13 的后半格）验「真的被删了」。 */
+let cleanedDirs = [];
+
+after(() => {
+  cleanedDirs = [...tempDirs];
+  for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+after(() => {
+  // A13 的后半格（工单要求「在 `after()` 里断言它们已不存在」）：纪律不许只删不证。
+  assert.ok(cleanedDirs.length >= 15, `A13：清理快照必须非空（只拿到 ${cleanedDirs.length} 个）⇒ 登记通道没接上`);
+  const leaked = cleanedDirs.filter((d) => fs.existsSync(d));
+  assert.deepEqual(
+    leaked,
+    [],
+    `A13：夹具目录没被清（§3.2 违规，每跑一次往 /tmp 堆 ${leaked.length} 个目录）：\n${leaked.join('\n')}`,
+  );
+});
+
+/**
+ * 在独立临时目录里写一个夹具，返回绝对路径（nexthop 集合按路径懒算并缓存，所以临时目录必须隔离）。
+ * 目录经 `mkTempFixture` 登记 ⇒ 跑完由文件级 `after()` 一律 `rmSync`（A13 钉这条纪律）。
+ */
 function writeRouteFixture(name, text) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `proc-route-740b-`));
+  const dir = mkTempFixture('proc-route-740b-');
   const file = path.join(dir, name);
   fs.writeFileSync(file, text);
   return file;
@@ -180,7 +223,7 @@ test('#740 A7 默认路由 nexthop=172.32.0.1（compose 网关）⇒ 对端 172.
 });
 
 test('#740 A8 读不到 / 无默认路由 / Gateway=00000000 ⇒ nexthop 集合空 ⇒ 不信头（回落 socket）', () => {
-  const missing = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'proc-route-740b-missing-')), 'route');
+  const missing = path.join(mkTempFixture('proc-route-740b-missing-'), 'route'); // 同样登记 ⇒ 由文件级 after() 清（A13）
   const cases = [
     ['文件读不到', missing],
     ['只有子网直连路（无目的 00000000 的行）', writeRouteFixture('r1', routeFile([{ dest: '000020AC', gw: '00000000' }]))],
@@ -227,7 +270,7 @@ test('#740 A10 十六进制小端要按字节反序还原（0101A8C0 → 192.168
 });
 
 test('#740 A11 nexthop 懒算一次并缓存（按路径）：首算之后改文件不重读', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'proc-route-740b-cache-'));
+  const dir = mkTempFixture('proc-route-740b-cache-'); // 同样登记 ⇒ 由文件级 after() 清（A13）
   const file = path.join(dir, 'route');
   fs.writeFileSync(file, routeFile([{ dest: '00000000', gw: '010020AC' }])); // 172.32.0.1
   assert.equal(clientIp(req('172.32.0.1', '203.0.113.9'), { procRoutePath: file }), '203.0.113.9', '首次：读文件并缓存');
@@ -246,6 +289,18 @@ test('#740 A12 真实 /proc/net/route（不传 opts = 生产调用形状）：�
   assert.ok(addrs.every((a) => net.isIPv4(a)), `每一项必须是合法 v4，得到：${JSON.stringify(addrs)}`);
   // 生产那 7 个调用点都是 clientIp(req)：不传 opts 也必须照旧采信 loopback 对端的头。
   assert.equal(clientIp(req('127.0.0.1', '203.0.113.9')), '203.0.113.9');
+});
+
+test('#740 A13 夹具目录必须被清（§3.2 teardown 纪律自己也要有断言，不许只删不证）', () => {
+  // 本格跑在文件级 `after()` **之前**，所以它能钉清理断言的前半：登记到位 + 目录此刻确实存在
+  // （「此刻存在」是把后半变强的关键：否则「删完之后不存在」可以是「删了个本来就不存在的名字」那种恒真空转）。
+  // 后半（「删完必须不存在」）在上面两个 `after()` 里；两半合起来才是完整判据。
+  const dir = path.dirname(writeRouteFixture('a13', routeFile([{ dest: '00000000', gw: '010020AC' }])));
+  assert.ok(tempDirs.has(dir), `A13：mkdtemp 目录必须登记进 teardown 集合，实际没登记：${dir}`);
+  assert.ok(fs.existsSync(dir), `A13：夹具目录此刻必须存在（否则清理断言是恒真的空转）：${dir}`);
+  // 计数钉死「所有夹具都走了登记通道」：A7 1 + A8 4（含 missing 目录）+ A9 2 + A10 5 + A11 2 + 本格 1 = 15。
+  // 以后新增夹具若绕过 `mkTempFixture`，这里会红——比「/tmp 慢慢堆目录」早得多。
+  assert.equal(tempDirs.size, 15, `A13：此刻应恰好登记 15 个临时目录（见本格注释的逐项构成），实际 ${tempDirs.size} 个`);
 });
 
 // ===========================================================================
