@@ -23,13 +23,15 @@
 //  - handleUserApiTokens 用 `method ===` 别名分派，本闸不抽（现均有文档）；
 //  - requireAdminReadMethod(req) 调用按 GET 计（它就是 GET 门）。
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HTTP_JS = path.join(ROOT, 'portal/src/http.js');
 const API_DOC = path.join(ROOT, 'docs/api/portal.md');
+const MIG_DIR = path.join(ROOT, 'deploy/migrations');
+const MODEL_DOC = path.join(ROOT, 'docs/data/model.md');
 const EXC = path.join(ROOT, 'scripts/doc-impl-exceptions.json');
 
 const SECTIONS = ['routes', 'schema', 'legs'];
@@ -166,9 +168,6 @@ function expandDocPath(pRaw) {
 }
 
 // ---------------- 检查① 事实源：portal/src/http.js ----------------
-
-const ROUTE_LINE_RE = new RegExp(
-  String.raw`(req\.method\s*(?:===|!==)\s*'(?:${METHODS})')`, 'g');
 
 function methodsOn(line) {
   const ms = [];
@@ -407,9 +406,93 @@ function checkRoutes(ex) {
   return reds;
 }
 
+// ---------------- 检查② 事实源：deploy/migrations/*.sql ----------------
+
+/**
+ * 镜像 portal/src/migrate.js 的 listMigrationFiles：目录内 .sql 按文件名升序。
+ * 每个文件抽三类事实：CREATE TABLE 表名、ALTER TABLE…ADD COLUMN 列名、
+ * CHECK (col IN ('a','b',…)) 的字符串字面量集合。
+ * 表归属用「文件内最近一次 CREATE/ALTER 的表名」近似（迁移都是小文件，
+ * 归属只影响红名单的可读性，不影响登记判定）。
+ */
+function extractMigrationFacts() {
+  const files = existsSync(MIG_DIR)
+    ? readdirSync(MIG_DIR).filter((f) => f.endsWith('.sql')).sort()
+    : [];
+  assert(files.length > 0, `读不到迁移目录：${MIG_DIR}`);
+  const facts = new Map(); // entry → "file:line"
+  const add = (entry, file, line) => {
+    if (!facts.has(entry)) facts.set(entry, `${file}:${line}`);
+  };
+  for (const f of files) {
+    const text = readFileSync(path.join(MIG_DIR, f), 'utf8');
+    let cur = '(未知表)';
+    text.split('\n').forEach((rawLine, i) => {
+      const line = rawLine.replace(/--.*$/, '');
+      const ct = line.match(
+        /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?([\w.]+)["`]?/i);
+      if (ct) {
+        cur = ct[1];
+        add(`table:${cur}`, f, i + 1);
+      }
+      const at = line.match(
+        /ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?["`]?([\w.]+)["`]?/i);
+      if (at) cur = at[1];
+      const ac = line.match(
+        /ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?([\w]+)["`]?/i);
+      if (ac) add(`column:${cur}.${ac[1]}`, f, i + 1);
+      const ck = line.match(
+        /CHECK\s*\(\s*\(?(\w+)\)?(?:::\w+)?\s+IN\s*\(([^)]*)\)/i);
+      if (ck) {
+        for (const v of ck[2].matchAll(/'([^']*)'/g)) {
+          add(`check:${cur}.${ck[1]}=${v[1]}`, f, i + 1);
+        }
+      }
+    });
+  }
+  return facts;
+}
+
+/** 字面量是否出现在文档里（表/列名允许反引号或裸词，值同理）。 */
+function docMentions(text, token) {
+  const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\w.])${esc}(?![\w])`).test(text);
+}
+
 function checkSchema(ex) {
-  void ex;
-  return []; // M2 实装
+  const doc = read(MODEL_DOC);
+  assert(doc.length > 0, `读不到文档面：${MODEL_DOC}`);
+  const facts = extractMigrationFacts();
+  const exKeys = new Set(exList(ex, 'schema').map((e) => e.entry));
+  const reds = [];
+  for (const [entry, where] of facts) {
+    const token = entry.startsWith('table:')
+      ? entry.slice('table:'.length)
+      : entry.startsWith('column:')
+        ? entry.slice(entry.indexOf('.') + 1)
+        : entry.slice(entry.indexOf('=') + 1);
+    if (docMentions(doc, token) || exKeys.has(entry)) continue;
+    reds.push({
+      kind: 'missing',
+      entry,
+      hint: `迁移 ${where}，model.md 正文无该字面量`,
+    });
+  }
+  for (const e of exList(ex, 'schema')) {
+    const token = e.entry.startsWith('table:')
+      ? e.entry.slice('table:'.length)
+      : e.entry.startsWith('column:')
+        ? e.entry.slice(e.entry.indexOf('.') + 1)
+        : e.entry.slice(e.entry.indexOf('=') + 1);
+    if (docMentions(doc, token)) {
+      reds.push({
+        kind: 'stale-ex',
+        entry: e.entry,
+        hint: 'model.md 已能对上，仍在豁免表里，请删掉它',
+      });
+    }
+  }
+  return reds;
 }
 
 function checkLegs(ex) {
