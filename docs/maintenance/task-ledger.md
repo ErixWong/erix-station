@@ -10377,7 +10377,7 @@ job summary 与 artifact `images-digest`，ID `14918481157`）；GitHub Release 
 其中 6 个坐标例子与 `check:doc-portable` 源码重复）；也没有改「加行准入判据」——那是另一件事，
 本单只解决「余量被吃光却无人知晓」。
 
-### 8.210 kkFileView 预览后端：地址进运行时旋钮 + 可用性探针 + 降级下载（2026-11-25，PR #787）
+### 8.210 kkFileView 预览后端：地址进运行时旋钮 + 可用性探针 + 降级下载（2026-11-25，issue #787 / PR #792）
 
 **治的是什么**：`docx/xlsx/pptx/zip` 一律走 kkFileView 通道，但「kk 有没有配 /
 可不可达」系统自己不知道——签票永远成功（本地 HMAC），iframe 拿 502
