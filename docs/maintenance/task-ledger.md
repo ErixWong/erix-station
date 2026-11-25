@@ -10006,7 +10006,7 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
 
 **为什么取「最右一项」而不是最左**：标准里每跳代理把自己看到的对端**追加**到 `X-Forwarded-For` 末尾 ⇒ 最右一项 = 离 portal 最近那跳（edge/Traefik）写下的真客户端；**最左一项是客户端自己写的、可任意伪造**。取最左等于把「客户端能不能伪造自己的限流键」交给客户端。A2 用 `bogus-not-an-ip, 198.51.100.7` 钉死：用 `198.51.100.7`，最左伪造项被忽略。工单另定：最右一项解析不出合法 IP ⇒ **回落 socket，不向左继续找**（A2b 用 `1.2.3.4, garbage` 钉：回落 socket，绝不退回左边能解析的 `1.2.3.4`）。
 
-**可信判定为什么刻意不加 env 旋钮**：不变式 2「ingress 是唯一的路」+ portal 只 publish `127.0.0.1` ⇒ 生产里 socket 对端必然是 edge 的私有/回环地址。可信集合 = loopback（`127/8`、`::1`）/ RFC1918（`10/8`、`172.16/12`、`192.168/16`）/ ULA（`fc00::/7`），完全由部署形态推导，没有「运维要加白名单」这个真实配置面；加 env 只会多一个能配错的开关（#677 正在收 env）。对端不在这些段里（有人绕过 edge 直连、对端是公网地址）⇒ 头可任意伪造 ⇒ **不信头**、用 socket 对端（A3）。IPv6 带 zone（`%eth0`）先去掉、`::ffff:a.b.c.d` 还原成 v4 再记（否则同一 v4 客户端会以两种形态各占一桶）。**多层代理要按层数取右数第 N 项**，当前部署 = 单 edge ⇒ 取最右一项即正确。
+**可信判定为什么刻意不加 env 旋钮**：不变式 2「ingress 是唯一的路」+ portal 只 publish `127.0.0.1` ⇒ 生产里 socket 对端**按部署形态**应当是 edge 那一侧的地址（#740 评审 F3 收准：判据信的是「私网 / nexthop」这个**位置**，不是「对端身份是 edge」——暴露面见本节末「安全性（评审 F3 收准）」）。可信集合 = loopback（`127/8`、`::1`）/ RFC1918（`10/8`、`172.16/12`、`192.168/16`）/ ULA（`fc00::/7`），完全由部署形态推导，没有「运维要加白名单」这个真实配置面；加 env 只会多一个能配错的开关（#677 正在收 env）。对端不在这些段里（有人绕过 edge 直连、对端是公网地址）⇒ 头可任意伪造 ⇒ **不信头**、用 socket 对端（A3）。IPv6 带 zone（`%eth0`）先去掉、`::ffff:a.b.c.d` 还原成 v4 再记（否则同一 v4 客户端会以两种形态各占一桶）。**多层代理要按层数取右数第 N 项**，当前部署 = 单 edge ⇒ 取最右一项即正确。
 
 **A1–A6 实测读数（本支自跑，非引用）**：
 - 单元 `portal/test/http-client-ip.test.js`：A1（loopback+XFF ⇒ `203.0.113.9`）、A2（多值取最右）、A2b（最右不可解析回落 socket）、A3（公网对端忽略头）、A4（无头用 socket、缺失回落 `unknown`）、可信边界 13 信 / 9 不信参数化、zone/`::ffff:` 归一化，**9 pass / 0 fail**。
@@ -10025,10 +10025,36 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
 
 **上一刀在真实拓扑里是空转的（现验证据）**：库里 `login_pending.created_ip` **110 行全是 `172.32.0.1`**，`login_sessions.ip` 近期行同样。这个地址是 compose `backend` 网络（`172.32.0.0/24`）的**网桥网关**：部署形态里 portal 只 publish `127.0.0.1`，edge（Traefik）经 `http://127.0.0.1:<发布端口>` 打到 portal ⇒ DNAT 之后容器看到的 socket 对端就是那个网关。而 `172.32/16` **不在 RFC1918** 内（RFC1918 的 `172.16/12` 只覆盖 172.16–172.31）⇒ `isTrustedProxyAddr` 判它不可信 ⇒ 头被拒采信 ⇒ `clientIp` 恒等于网关 = 上一刀要修的那个病没被修掉。**上一轮真机验的是「容器内 loopback 对端」，恰好绕过了这条真实路径，所以没暴露**（见上一节「dev 环境实测的局限」里已经写下的推论，本刀就是它的落地）。
 
-**修法（不加 env 旋钮、不读 `X-Real-IP`、不改成「任何地址都信」）**：可信集合 = loopback ∪ RFC1918 ∪ ULA ∪ **本容器默认路由的 nexthop**。`portal/src/http.js` 新增 `defaultGatewayAddrs({ procRoutePath = '/proc/net/route' })`：只取 `Destination == 00000000`（即 `0.0.0.0/0`）那行的 Gateway，**十六进制小端要按字节反序还原**（`010020AC` → `172.32.0.1`；照大端直读会得 `172.0.32.1`），去重返回；子网直连路的 Gateway 恒 `00000000` 被排除。文件读不到（非 Linux / 进不了 `/proc`）/ 无默认路由 / Gateway 为 `00000000` ⇒ 返回 `[]` ⇒ **回落到原三类集合**（fail closed）。判定改成 `staticTrustedProxyAddr(ip) || gatewayAddrs.includes(ip)`，集合**按路径懒算一次并缓存**（`Map`，生产只有默认路径 ⇒ 一个槽位）。路径与集合都是**测试注入口子**（`clientIp(req, { gatewayAddrs, procRoutePath })`），生产那 7 个调用点保持 `clientIp(req)` 不动。**未覆盖 v6 默认路由**（`/proc/net/ipv6_route` 本轮不解析，届时再补）。安全性：攻击者伪造不了「本容器默认路由的 nexthop」这个位置——它是内核路由表里的下一跳，不是请求里可写的字段；能站到那个位置上的只有 ingress 本身。
+**修法（不加 env 旋钮、不读 `X-Real-IP`、不改成「任何地址都信」）**：可信集合 = loopback ∪ RFC1918 ∪ ULA ∪ **本容器默认路由的 nexthop**。`portal/src/http.js` 新增 `defaultGatewayAddrs({ procRoutePath = '/proc/net/route' })`：只取 `Destination == 00000000`（即 `0.0.0.0/0`）那行的 Gateway，**十六进制小端要按字节反序还原**（`010020AC` → `172.32.0.1`；照大端直读会得 `172.0.32.1`），去重返回；子网直连路的 Gateway 恒 `00000000` 被排除。文件读不到（非 Linux / 进不了 `/proc`）/ 无默认路由 / Gateway 为 `00000000` ⇒ 返回 `[]` ⇒ **回落到原三类集合**（fail closed）。判定改成 `staticTrustedProxyAddr(ip) || gatewayAddrs.includes(ip)`，集合**按路径懒算一次并缓存**（`Map`，生产只有默认路径 ⇒ 一个槽位）。路径与集合都是**测试注入口子**（`clientIp(req, { gatewayAddrs, procRoutePath })`），生产那 7 个调用点保持 `clientIp(req)` 不动。**未覆盖 v6 默认路由**（`/proc/net/ipv6_route` 本轮不解析，届时再补）。**安全性（#740 评审 F3 收准；原话「攻击者伪造不了 nexthop／能站到那个位置上的只有 ingress 本身」说强了）**：请求里没有任何字段能直接写出「本容器默认路由的 nexthop」，但**要站到那个位置上，得能占据该链路的下一跳**——同 L2 网段里抢下那个地址（`CAP_NET_RAW` / ARP 欺骗）仍可伪；代码信的是「对端落在私网 / nexthop 这个**位置**」，不是「对端的**身份**是 ingress」。今天「私网对端被信任」的暴露面为什么小（261125 现验；方法：`docker network inspect station_backend` + `docker exec fde-eric bash -lc 'timeout 3 bash -c "</dev/tcp/172.32.0.5/8080"'`）：`station_backend` 上只有平台自己的容器（`station-db` `172.32.0.2/24`、`station-litellm` `172.32.0.3/24`、`station-docker-proxy` `172.32.0.4/24`、`station-portal` `172.32.0.5/24`），FDE 工位容器只挂自己的 `/29`（`fde-eric` = `10.200.0.2/29`），从 `fde-eric` 内直连 portal 的 backend 地址 `172.32.0.5:8080` = **NOT-REACHABLE** ⇒ 暴露面是**平台容器与宿主进程，不是 FDE 代码**。**换网络拓扑要重评**：FDE 侧能直连 portal、或 ingress 不在同一 L2 ⇒ 上面这句作废，可信集合要另判（本轮不动实现，只把话说准）。
 
 **新增格子（A1–A6 一条没删）** `portal/test/http-client-ip.test.js`：A7（夹具 nexthop=`172.32.0.1` ⇒ 对端 `172.32.0.1` + XFF `203.0.113.9` ⇒ 采信头；顺带钉去重与「子网直连路不算默认路由」，就是部署形态的复刻）、A8（读不到 / 无默认路由 / Gateway `00000000` / 只有表头 ⇒ 集合空 ⇒ 不信头回落 socket）、**A9（nexthop 是别的地址 ⇒ `172.32.0.1` 不被顺带信任**，防退化成「信一切」；正向腿另用非 RFC1918 的 `198.51.100.1` 再钉一次，免得「并了 nexthop」与「只看静态集合」两种实现同绿）、A10（字节序单独一格：四个真实样例逐个断言 + 「大端直读必须得到另一个地址」的反证）、A11（懒算缓存：首算之后改文件不重读，且换路径另算）、A12（生产调用形状 `clientIp(req)` 不传 opts 仍可用、真实 `/proc/net/route` 不炸且只返合法 v4）。旧格里三处「不信头」断言改为注入 `gatewayAddrs: []`，去掉对「跑测试那台机器的真实默认路由」的隐式依赖（hermetic）。**实测 15 pass / 0 fail**（原 9 格全在）。**变异自证**：把判定改成「任何地址都信」→ 6 fail；去掉 `octets.reverse()`（不反序）→ 4 fail；完全不算 nexthop → 3 fail（A7/A9/A11 被抓）。
 
 **真机判据（这次走的是真实路径，不是容器内 loopback）**：验的镜像 = 本地构建 **`erix-station/portal:local-740b`**（`sha256:bbe52da8b04d…`，本支源码 `docker build -f portal/Dockerfile .`），**不是**常驻 dev portal 在跑的 `local-754`；一次性容器 `station-portal-740b-test` 接 `station_backend` 网络、发布 `127.0.0.1:18099:8080`，`/etc/traefik/dynamic` 与 `/srv/erix/{users,artifacts}` 挂临时目录（不与常驻 reconciler 抢写同一份 `routes.yml`），**常驻 `station-portal` 全程未动**。容器内 `/proc/net/route` 默认路由行 = `eth0 00000000 010020AC 0003` ⇒ 反序还原正是 `172.32.0.1`。登 `agent01`（口令直通，不写 `login_pending`，全程恒 110；**没登 `eric`** 免得寄真邮件）：① 不带 XFF ⇒ `login_sessions.ip = 172.32.0.1` ✓（回落 socket）；② 带 `-H 'X-Forwarded-For: 203.0.113.9'` ⇒ `login_sessions.ip = 203.0.113.9` ✓（采信头，**这次是 DNAT 后的真实对端**）；③ 负向对照：同一个头打常驻 `station-portal`（`local-754`，同一网络同一对端）⇒ 仍记 `172.32.0.1` ⇒ ② 的差值只可能来自本刀。收尾：3 行测试 `login_sessions` 已删（回基线 746 / `agent01` 3 行）、容器 `docker rm -f`、临时 tag 已 `docker rmi`（临时 userspace 目录里有 materializer 以 root 建的 `platform/git`，普通用户删不掉，留在 `/tmp/740b-users.*`）。
 
 **门禁（本刀自跑）**：`node --test portal/test/http-client-ip.test.js` rc=0（**15 格 / 15 pass / 0 fail**）；`node --test portal/test/http-client-ip.test.js portal/test/login-email-code.test.js` rc=0（49 pass / 0 fail）；`npm test` rc=0（tests 3310 / pass 3190 / fail 0 / skipped 120）；`TEST_DATABASE_URL=… node scripts/check-required-legs.mjs` rc=0（三条腿全 0 skip）；`node scripts/agents-hotlayer-budget.mjs` VERDICT ok（**未动 `AGENTS.md`**）；`node scripts/check-doc-portable.mjs` rc=0（注释里的示例坐标曾被本闸拦下：`192.168.` 属 DENY_INFRA，已换成 `010020AC → 172.32.0.1`）。文档口径同步在 `docs/api/portal.md` §2.4「全站限流键里的 `<ip>` 口径（#740）」。未动 `package.json` / lockfile / `TOKEN_ROUTES_ENABLED`（#754 刚合并的那条）。
+
+
+**评审跟进（合并后，主 agent 亲审 + 独立只读评审，代号 fix-261125-03）**：
+
+1. **测试夹具没有 teardown**（违全局 §3.2「`mkdtemp` 必须在本文件 teardown 里清」）：
+   临时目录改走单一诞生通道 + 模块级登记 + 文件级 `after()` 兜底，并**加一格断言
+   「夹具目录确实被清」**——纪律本身要有断言撑着，不许只删不证。跑完 `npm test`
+   后残留计数 **0**（本分支任何调用形态都不留）。
+2. **防回潮闸原来只认点式写法**：方括号取属性、解构、别名都能绕过（原正则要求
+   `req` 与 `socket` 连写）。禁用面收成**整词匹配**，豁免区仍只 `clientIp` 那一块；
+   自证格钉**五种形状**（点式/可选链/方括号/解构/别名）+ 讲解性注释不误伤。
+3. **`A12` 原来是空断言**（`[].every()` 恒真，空数组也算过 ⇒ 证不了解析成功）：
+   改成两分支——非空则逐值验合法 v4；为空则自读路由表证明「本机确实没有 v4
+   默认路由」，否则打红。「文件在却读不到」也不许蒙混成预期失败。
+4. **over-claim 校正（独立评审指出，属实）**：原文「攻击者伪造不了 nexthop」「生产
+   socket 对端必然是 edge」把**地址当成了身份**——代码信的是「私网地址 / 该链路
+   下一跳」，不是「ingress 身份」。现验暴露面：平台内网里只有平台自己的 4 个容器，
+   工位容器只在自己的 `/29`，**从工位容器内直连平台的内网地址:8080 = 不可达**
+   ⇒ 今天「信私网对端」的暴露面是**平台容器与宿主进程，不是 FDE 代码**。注释、
+   `docs/api/portal.md` §2.4 与本节三处已改成事实，并写明**换网络拓扑要重评**。
+5. **评审提的「再验路由表 Mask / Flags」不做**：`Destination==0` 且 `Gateway!=0`
+   已隐含「是默认路由且有下一跳」，把内核已保证的事再抄一遍不叫加固。
+6. **主 agent 变异复验**（不采信 worker 自证）：摘掉兜底 `rmSync` ⇒ 兜底格红并报
+   泄漏路径；禁用面退回点式 ⇒ 自证格红（点名方括号漏网）；把默认路由筛选条件
+   改坏 ⇒ 6 格红。还原后单文件 16/16 绿；`npm test` rc=0；真库三条腿 0 skip；
+   `check:doc-portable`、热层闸、台账完整性均 ok。

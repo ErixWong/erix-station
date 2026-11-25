@@ -9,16 +9,19 @@
 //   A2 头是 `bogus-not-an-ip, 198.51.100.7` ⇒ 用 `198.51.100.7`（最右、不被最左伪造带跑）。
 //   A3 对端公网（绕过 edge）+ XFF ⇒ 用对端地址，头被无视。
 //   A4 没有头 ⇒ 用 socket 地址（回归不变，老行为不许变）。
-//   A6 防回潮闸：`portal/src/**/*.js` 里除 `clientIp` 内部，出现 `req.socket.remoteAddress` 就红。
+//   A6 防回潮闸：`portal/src/**/*.js` 里除 `clientIp` 内部，读了 `remoteAddress` 就红（禁用面见 FORBIDDEN：点式/可选链/方括号/解构/拆写法都算）。
 // 追加刀（拓扑校正，工单 #740b）：
 //   A7 夹具默认路由 nexthop = `172.32.0.1` ⇒ 对端 `172.32.0.1` + XFF ⇒ 采信头（部署形态复刻）。
 //   A8 夹具读不到 / 无默认路由 / Gateway `00000000` ⇒ 集合空 ⇒ 不信头（回落 socket）。
 //   A9 nexthop 是别的地址（`10.0.0.1`）⇒ `172.32.0.1` **不**被顺带信任（防「信一切」退化）。
 //   A10 十六进制小端反序还原单独钉一格（工单样例 `0101A8C0`：反序还原 vs 大端直读必须可区分）。
 //   A11 懒算缓存：首次算过一次后不再重读文件（按路径缓存）。
+//   A12 真实 /proc/net/route：不炸且只返合法 v4。
+//   A13 夹具目录必须被清：mkdtemp 的临时目录一律登记 + 文件级 after() 兜底 rmSync（全局 AGENTS.md §3.2），
+//      且这条 teardown 纪律**自己也有断言**（不许只删不证）。
 // 外加最右项语义、IPv6 zone、`::ffff:` 还原、ULA/RFC1918 可信边界的判别式参数化。
 
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -61,9 +64,49 @@ function routeFile(rows) {
   return [header, ...lines].join('\n') + '\n';
 }
 
-/** 在独立临时目录里写一个夹具，返回绝对路径（nexthop 集合按路径懒算并缓存，所以临时目录必须隔离）。 */
+// ---------------------------------------------------------------------------
+// teardown（全局 AGENTS.md §3.2：`mkdtemp` 出来的必须在本文件 teardown 里 `rmSync(…, { recursive: true })`）。
+// 写法照仓里现成的两处，别自创：`portal/test/admin.test.js:1071` 的单例 `t.after(() => fs.rmSync(root, { recursive: true, force: true }))`
+// + `portal/test/login-email-code.test.js:161` 的文件级 `after()` 兜底（那份兜底防的是「断言一抛就轮不到收尾」的泄漏）。
+// 本文件的夹具散在 A7/A8/A9/A10/A11/A13 六个 test 里 ⇒ 逐个 `t.after` 容易漏，改成**模块级登记 + 文件级兜底**：
+// 所有临时目录只能经 `mkTempFixture` 诞生（漏登记会被 A13 的计数断言打红），收摊由下面两个 `after()` 负责。
+// 顺序实测（node v22）：文件级 `after()` 在**全部 test 之后**、按注册顺序跑 ⇒ 先删、再验「真的没了」。
+// ---------------------------------------------------------------------------
+
+const tempDirs = new Set();
+
+/** `mkdtempSync` + 登记进 teardown 集合：本文件的临时目录必须经这里诞生。 */
+function mkTempFixture(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.add(dir);
+  return dir;
+}
+
+/** 清理前的快照，供第二个 `after()`（A13 的后半格）验「真的被删了」。 */
+let cleanedDirs = [];
+
+after(() => {
+  cleanedDirs = [...tempDirs];
+  for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+after(() => {
+  // A13 的后半格（工单要求「在 `after()` 里断言它们已不存在」）：纪律不许只删不证。
+  assert.ok(cleanedDirs.length >= 15, `A13：清理快照必须非空（只拿到 ${cleanedDirs.length} 个）⇒ 登记通道没接上`);
+  const leaked = cleanedDirs.filter((d) => fs.existsSync(d));
+  assert.deepEqual(
+    leaked,
+    [],
+    `A13：夹具目录没被清（§3.2 违规，每跑一次往 /tmp 堆 ${leaked.length} 个目录）：\n${leaked.join('\n')}`,
+  );
+});
+
+/**
+ * 在独立临时目录里写一个夹具，返回绝对路径（nexthop 集合按路径懒算并缓存，所以临时目录必须隔离）。
+ * 目录经 `mkTempFixture` 登记 ⇒ 跑完由文件级 `after()` 一律 `rmSync`（A13 钉这条纪律）。
+ */
 function writeRouteFixture(name, text) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `proc-route-740b-`));
+  const dir = mkTempFixture('proc-route-740b-');
   const file = path.join(dir, name);
   fs.writeFileSync(file, text);
   return file;
@@ -180,7 +223,7 @@ test('#740 A7 默认路由 nexthop=172.32.0.1（compose 网关）⇒ 对端 172.
 });
 
 test('#740 A8 读不到 / 无默认路由 / Gateway=00000000 ⇒ nexthop 集合空 ⇒ 不信头（回落 socket）', () => {
-  const missing = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'proc-route-740b-missing-')), 'route');
+  const missing = path.join(mkTempFixture('proc-route-740b-missing-'), 'route'); // 同样登记 ⇒ 由文件级 after() 清（A13）
   const cases = [
     ['文件读不到', missing],
     ['只有子网直连路（无目的 00000000 的行）', writeRouteFixture('r1', routeFile([{ dest: '000020AC', gw: '00000000' }]))],
@@ -227,7 +270,7 @@ test('#740 A10 十六进制小端要按字节反序还原（0101A8C0 → 192.168
 });
 
 test('#740 A11 nexthop 懒算一次并缓存（按路径）：首算之后改文件不重读', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'proc-route-740b-cache-'));
+  const dir = mkTempFixture('proc-route-740b-cache-'); // 同样登记 ⇒ 由文件级 after() 清（A13）
   const file = path.join(dir, 'route');
   fs.writeFileSync(file, routeFile([{ dest: '00000000', gw: '010020AC' }])); // 172.32.0.1
   assert.equal(clientIp(req('172.32.0.1', '203.0.113.9'), { procRoutePath: file }), '203.0.113.9', '首次：读文件并缓存');
@@ -240,24 +283,84 @@ test('#740 A11 nexthop 懒算一次并缓存（按路径）：首算之后改文
   assert.equal(clientIp(req('172.32.0.1', '203.0.113.9'), { procRoutePath: other }), '172.32.0.1');
 });
 
-test('#740 A12 真实 /proc/net/route（不传 opts = 生产调用形状）：不炸且只返合法 v4，loopback 仍采信头', () => {
+test('#740 A12 真实 /proc/net/route（不传 opts = 生产调用形状）：解析要真出结果（空集合要自证为何空），loopback 仍采信头', () => {
   const addrs = defaultGatewayAddrs();
   assert.ok(Array.isArray(addrs), '返回必须是数组');
-  assert.ok(addrs.every((a) => net.isIPv4(a)), `每一项必须是合法 v4，得到：${JSON.stringify(addrs)}`);
+  // 独立评审 #2：原来那行 `addrs.every(...)` 在 `addrs === []` 时是**恒真**的（空数组的 every 永返 true），
+  // 加上 `Array.isArray([])` 也过 ⇒ 本格对「解析在真机上失灵」完全不敏感。改成显式两分支，各自钉死：
+  if (addrs.length > 0) {
+    // 分支①（本机有 v4 默认路由，开发宿主的常规形态）：逐值断言合法 v4（不写死具体网关地址，免得把本机坐标写进仓）。
+    for (const a of addrs) assert.ok(net.isIPv4(a), `每一项必须是合法 v4，得到：${JSON.stringify(addrs)}`);
+  } else {
+    // 分支②（空集合）：必须自己证明「本机确实没有 v4 默认路由」，而不是悄悄恒绿。
+    let raw;
+    try {
+      raw = fs.readFileSync('/proc/net/route', 'utf8');
+    } catch {
+      raw = null;
+    }
+    if (raw === null) {
+      // 读不到：只允许是「根本没有这个文件」（非 Linux / 进不了 /proc）。文件在却读不出 = 不能算预期空。
+      assert.ok(!fs.existsSync('/proc/net/route'), '/proc/net/route 存在却读不到 ⇒ 不是「本机无默认路由」，空集合不能这样蒙过去');
+    } else {
+      // 自己按列判「有没有目的 0.0.0.0/0 且带下一跳的行」，与实现无关（只看第 2/3 列，不碰解析代码）。
+      const gws = raw
+        .split('\n')
+        .slice(1)
+        .map((l) => l.trim().split(/\s+/))
+        .filter((c) => c.length >= 8 && c[1] === '00000000' && /^[0-9a-fA-F]{8}$/.test(c[2] ?? '') && c[2] !== '00000000')
+        .map((c) => `${c[0]} ${c[1]} ${c[2]}`);
+      assert.deepEqual(
+        gws,
+        [],
+        `addrs 为空，但 /proc/net/route 里有 ${gws.length} 行「目的 00000000 且 Gateway 非 0」（${gws.join(' | ')}）⇒ 解析在真机上失灵，本格不许靠空集合恒绿`,
+      );
+    }
+  }
   // 生产那 7 个调用点都是 clientIp(req)：不传 opts 也必须照旧采信 loopback 对端的头。
   assert.equal(clientIp(req('127.0.0.1', '203.0.113.9')), '203.0.113.9');
 });
 
+test('#740 A13 夹具目录必须被清（§3.2 teardown 纪律自己也要有断言，不许只删不证）', () => {
+  // 本格跑在文件级 `after()` **之前**，所以它能钉清理断言的前半：登记到位 + 目录此刻确实存在
+  // （「此刻存在」是把后半变强的关键：否则「删完之后不存在」可以是「删了个本来就不存在的名字」那种恒真空转）。
+  // 后半（「删完必须不存在」）在上面两个 `after()` 里；两半合起来才是完整判据。
+  const dir = path.dirname(writeRouteFixture('a13', routeFile([{ dest: '00000000', gw: '010020AC' }])));
+  assert.ok(tempDirs.has(dir), `A13：mkdtemp 目录必须登记进 teardown 集合，实际没登记：${dir}`);
+  assert.ok(fs.existsSync(dir), `A13：夹具目录此刻必须存在（否则清理断言是恒真的空转）：${dir}`);
+  // 计数钉死「所有夹具都走了登记通道」：A7 1 + A8 4（含 missing 目录）+ A9 2 + A10 5 + A11 2 + 本格 1 = 15。
+  // 以后新增夹具若绕过 `mkTempFixture`，这里会红——比「/tmp 慢慢堆目录」早得多。
+  assert.equal(tempDirs.size, 15, `A13：此刻应恰好登记 15 个临时目录（见本格注释的逐项构成），实际 ${tempDirs.size} 个`);
+});
+
 // ===========================================================================
-// A6：防回潮闸 —— `portal/src/**/*.js` 除 `clientIp` 内部不许再出现 `req.socket.remoteAddress`。
+// A6：防回潮闸 —— `portal/src/**/*.js` 除 `clientIp` 内部不许再读 socket 对端地址（禁用面见 FORBIDDEN）。
 // ===========================================================================
 
-const FORBIDDEN = /req\??\.socket\??\.remoteAddress/;
+// 禁用面 = `\bremoteAddress\b`（#740 评审 F2：两轮收窄的结论）。为什么不钉整串也不钉中间态 `\.remoteAddress`：
+//  ① 整串 `req\.socket\.remoteAddress` 看不见**拆写法**：`const s = req.socket; const ip = s.remoteAddress;`
+//     语义完全一样，但闸看不见；
+//  ② `\.remoteAddress` 仍看不见**没有点**的两型：方括号 `req.socket['remoteAddress']` 与解构
+//     `const { remoteAddress } = req.socket`。
+// 所以钉的是「读了 `remoteAddress` 这个名字」本身，不管用什么语法糖读到（豁免区仍只 `clientIp` helper 那一块，
+// 沿用 clientIpExemptLines，不扩面）。
+// 已知且**刻意接受**的边界（别当 bug 修）：整行注释不算 offender（见 isCommentLine）——讲解这条规矩的注释
+// 必须能写出这个词，否则文档只能绕着正则说话。今天 src 里这个词只出现在 http.js 的 4 处（3 处注释 + 1 处代码），
+// 全在 clientIp 豁免区内 ⇒ 注释豁免不是承重结构，只是给未来的讲解注释留口子。把真读法藏在行首块注释后面
+// （`/* 顺手 */ s.remoteAddress`）能绕过：本闸防**无意回潮**，不防刻意混淆（防混淆得上 AST，本轮不值当）。
+const FORBIDDEN = /\bremoteAddress\b/;
 
-/** 逐行扫一段源码文本，返回所有命中 `req.socket.remoteAddress`（含可选链变体）的 {line, text}。 */
+/** 整行注释（含块注释的 ` * ` 续行）：讲解本闸的注释要能出现被禁的那个词，故不算 offender（理由见 FORBIDDEN）。 */
+function isCommentLine(line) {
+  const t = line.trim();
+  return t.startsWith('//') || t.startsWith('/*') || t.startsWith('*') || t.startsWith('*/');
+}
+
+/** 逐行扫一段源码文本，返回所有读了 `remoteAddress` 的**代码行**（点式/可选链/方括号/解构/别名都算）的 {line, text}。 */
 function scanForbiddenLines(text) {
   const hits = [];
   text.split('\n').forEach((line, i) => {
+    if (isCommentLine(line)) return; // forEach 回调里只能这样跳过（`continue` 在这儿非法，会 SyntaxError）
     if (FORBIDDEN.test(line)) hits.push({ line: i + 1, text: line.trim() });
   });
   return hits;
@@ -295,7 +398,7 @@ function clientIpExemptLines(lines) {
   return set;
 }
 
-test('#740 A6 防回潮闸：portal/src 里除 clientIp 内部，出现 req.socket.remoteAddress 就红', () => {
+test('#740 A6 防回潮闸：portal/src 里除 clientIp 内部，读了 remoteAddress 就红（方括号/解构/拆写法也算）', () => {
   const srcDir = path.join(HERE, '..', 'src');
   const offenders = [];
   for (const file of listJs(srcDir)) {
@@ -316,11 +419,23 @@ test('#740 A6 防回潮闸：portal/src 里除 clientIp 内部，出现 req.sock
   assert.deepEqual(offenders, [], '有人绕过 clientIp 直接读 socket 对端（#740 回潮）：\n' + offenders.join('\n'));
 });
 
-test('#740 A6b 防回潮闸自证非恒绿（能抓 req.socket.remoteAddress 与可选链变体）', () => {
-  const a = scanForbiddenLines('  const x = req.socket.remoteAddress || "unknown";');
-  assert.equal(a.length, 1, 'plain 写法必须被抓');
-  const b = scanForbiddenLines('  const x = req?.socket?.remoteAddress;');
-  assert.equal(b.length, 1, '可选链变体也必须被抓（否则把写法改成 ?. 就能绕过闸）');
+test('#740 A6b 防回潮闸自证非恒绿（点式/可选链/方括号/解构/别名五种形状都要被抓，讲解性注释不抓）', () => {
+  // 每一种绕过形状都要单独钉住：闸只抓其中一种时，把写法换成另一种就能默默回潮（评审 F2 的原话）。
+  const shapes = [
+    ['点式', '  const x = req.socket.remoteAddress || "unknown";'],
+    ['可选链', '  const x = req?.socket?.remoteAddress;'],
+    ['方括号', '  const x = req.socket["remoteAddress"];'],
+    ['解构', '  const { remoteAddress } = req.socket;'],
+  ];
+  for (const [shape, code] of shapes) {
+    assert.equal(scanForbiddenLines(code).length, 1, `${shape} 写法必须被抓（抓不到 ⇒ 这一型能绕过闸）`);
+  }
+  // 别名式（拆写法）：不只要抓到，还要钉在**真正读名字那一行**，免得只靠第一行抵数。
+  const alias = scanForbiddenLines('  const s = req.socket;\n  const ip = s.remoteAddress;');
+  assert.deepEqual(alias.map((h) => h.line), [2], '别名式必须被抓，且钉在第 2 行（真正读名字的那一行）');
+  // 讲解这条规矩的注释不该被误伤（豁免理由写在 FORBIDDEN 上方的注释里，不是默默放过）。
+  const note = scanForbiddenLines('  // 讲解：别把 socket 对端的 remoteAddress 直接当客户端 IP（要用 clientIp）\n  const ip = clientIp(req);');
+  assert.equal(note.length, 0, '讲解这条规矩的整行注释不该被误伤（否则文档只能绕着正则说话）');
   const c = scanForbiddenLines('  // 只是注释里提 clientIp 之外没有 socket 读法\n  return clientIp(req);');
   assert.equal(c.length, 0, '不含被禁写法的代码不该被抓（非恒红）');
 });
