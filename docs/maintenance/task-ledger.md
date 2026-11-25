@@ -10058,3 +10058,46 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
    泄漏路径；禁用面退回点式 ⇒ 自证格红（点名方括号漏网）；把默认路由筛选条件
    改坏 ⇒ 6 格红。还原后单文件 16/16 绿；`npm test` rc=0；真库三条腿 0 skip；
    `check:doc-portable`、热层闸、台账完整性均 ok。
+
+### 8.202 #771 流式通道把 `.svg` 当 `image/svg+xml` 内联 ⇒ 管理台同源 XSS（copilot 代码审查发现，PR #772，2026-11-25，主 agent + erix_run）
+
+**怎么发现的**：本会话功能（#727）实现阶段只做过**写代码之前**的设计审计；代码本身没有独立 review。
+补做了一次 copilot readonly + xhigh 的**代码**审查（run `cp-2611251436-pspjua`），8 个方向里 1 项 MAJOR，
+其余（越权 / 存在性泄露 / 路径牢笼 / fd 生命周期 / 只读红线 / e2e 可信度 / CI 去抖风险 / 回归等价性）
+未发现可确认问题。主 agent 逐条对账后**成立**。
+
+**缺陷**：`portal/src/dirs.js` 的 `IMAGE_MIME` 有 `.svg → image/svg+xml`，`STREAM_MIME` **整体继承**它，
+而 disposition 只有 `download` 模式或 `octet-stream` 才降级为 `attachment`（`:738`）⇒ `mode=stream` 请求
+`.svg` 时回 `image/svg+xml` + `inline`。**SVG 是活动内容**（内嵌 `<script>` / `onload` / `foreignObject`），
+作为**顶层文档**打开时脚本在 portal 源里执行。
+同文件 `:723-726` 的注释早就写死这条红线（「没有 text/html……同源直出 = 预览即 XSS，一律降级为下载」），
+**`.svg` 是它的遗漏**。
+
+**为什么这构成跨权限边界**：管理台「工位内容」页会渲染 FDE 写的内容——会话里 assistant 的 Markdown
+（`AdminTranscript.vue:356` `v-html`）与项目里的 `.md`（`AdminSeatContentView.vue:726`），
+而 `lib/markdown.ts:157` 把 http(s) 链接渲染成 `<a href target="_blank">`（`rel=noopener` 只挡 `window.opener`，
+挡不住同源权限）。FDE 写一个诱饵 md → 管理员点开 → 点链接 → 新标签页在 **admin 源**执行 FDE 的脚本 →
+同源 `fetch('/api/admin/*', {credentials:'include'})`（CSRF 的 Origin 检查是同源 ⇒ 通过）。
+**FDE 不需要「拿到管理员密码」，它借管理员的手执行代码。**
+
+**严重度校准（主 agent 自我修正）**：一度准备为它单开 0.1.79 补丁版，**收回**。三问：
+触发概率低（需 FDE 造 SVG + 造诱饵 + 管理员恰好点开并点链接）、影响面 = 管理员会话、
+平台规模 = 管理员 1~2 人且入口在内网 ⇒ 属「钓鱼级」而非「打开页面就中」。**修，但不单独切版本**，
+随下一个常规版本发。
+
+**修法（PR #772）**：抽 `STREAM_INLINE_IMAGE_MIME` **显式白名单**（png/jpg/jpeg/gif/webp/bmp），
+`STREAM_MIME` 只继承它——**不用** `{ ...IMAGE_MIME }` 再 `delete '.svg'`：显式清单让漂移方向安全
+（以后往 `IMAGE_MIME` 加新格式默认落 `octet-stream`，要内联必须显式加一行），`delete` 写法会反过来默认放行。
+所有流式响应加 `X-Content-Type-Options: nosniff`（防嗅探成可执行文档）。JSON 通道**不动**：`.svg` 仍
+`kind:'image'` + data URL，前端 `<img>` 里的 SVG 不执行脚本。文档 §4.11 / §4.22 两处口径同步。
+
+**判据（`portal/test/file-stream-svg.test.js` 5 格 + 主 agent 负向对照）**：`.svg` stream ⇒
+`octet-stream` + `attachment` + `nosniff`；**即使调用方显式要 inline 也强制 attachment**；位图仍 `inline`
+且 MIME 不变（别一起降级）；`.pdf` 仍 `inline`；JSON 通道 `.svg` 仍 `kind:image` + svg data URL（`<img>` 预览不坏）。
+**负向对照**：把 `dirs.js` 还原成旧版再跑新用例 ⇒ **rc=1 / fail=3**（用例真的会咬）。根 `npm test` rc=0。
+
+**教训（流程，比代码值钱）**：
+1. **设计审计 ≠ 代码审查**。本会话前半只做了前者，于是「`.html` 红线」这类**实现层遗漏**没人看；
+   补做代码审查后 5 分钟就挖出来。以后安全敏感面（渲染 / 文件流 / 权限边界）合入前应过一遍独立代码审查。
+2. **报安全问题必须带三个数**：触发概率 × 影响面 × 平台规模。只报 severity 标签会把自己带进
+   「发现 MAJOR 就必须立刻发补丁」的过度反应。
