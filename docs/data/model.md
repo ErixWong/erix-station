@@ -532,8 +532,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 ### 1.33 `macro_templates` / `macro_assignments` / `macro_runs` — 事件平台的三张表（issue #524，migration 0035）
 
 > 同上：来自增量迁移 `0035-macro-platform.sql`；baseline 冻结、不回写 `schema.sql`。
-> **W1 只有数据层**（`portal/src/macros.js` 是唯一的写入口）：没有定时器、没有调度器、没有面板路由。
-> 「到点主动执行」是 W2，`notifications` 落地面是 W3。
+> **数据层现状**：`portal/src/macros.js` 是宏三表的写入口；没有定时器、没有调度器（「到点主动执行」是 W2，仍未做）。⚠ 早期记「没有面板路由 / `notifications` 落地面是 W3」**已过时**：`notifications` 表由迁移 `0037` **已建**，`portal/src/http.js` 已提供通知读 API（`GET /api/notifications`、`/api/notifications/unread-count`、`/api/notifications/:id/read`，走 `macroRoutes.notifications*`）。⚠ 这只等于「通知表 + 读侧 API 已落地」，**不等于通知调度/派发全量实现**（主动生成与推送仍属未做部分）。
 
 **为什么是三张而不是一张**：模板可被多人复用、订阅要能改人/改范围、执行记录要能永久审计——
 三者的生命周期与写入者完全不同（管理员改模板 / 用户改订阅 / 调度器只追加账）。
@@ -563,8 +562,8 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 2. **模板删除是三分支**（07 篇 §2.3，判定与删除**同事务** + 模板行 `FOR UPDATE`）：
    零引用 ⇒ 物理删；只有订阅、无执行记录 ⇒ 物理删 + 级联删订阅；
    有 `macro_runs` **或** `notifications` ⇒ 只能软删（写 `deleted_at`）。
-   「能不能物理删」由引用计数决定，不由请求方决定。`notifications` 表 **W3 才建** ⇒
-   判定是「表存在则检查、不存在则跳过」（探测 `information_schema`，列名不写死）。
+   「能不能物理删」由引用计数决定，不由请求方决定。`notifications` 表已由迁移 `0037` **建好**（早期「W3 才建」的口径作废）⇒
+   判定按引用计数正常检查该表即可；保留「表存在则检查、不存在则跳过」（探测 `information_schema`，列名不写死）作为对旧库 / 未跑 0037 的防御。
 3. **`until` 到期 ⇒ `enabled = false`**，一律按**瞬时**比（`timestamptz` × JS `Date`，
    不许按本地日截断）。W1 **不做定时器**：到期在读写两侧顺手收敛（`applyExpiredAssignments`
    被 `assignTemplate` / `listAssignments` / `claimMacroRun` 调用），所以「读出来的 `enabled`」
@@ -601,7 +600,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | `cpu_usage_pct numeric(5,2)` / `cpu_cores smallint` / `load1`/`load5`/`load15 numeric(8,3)` | CPU 占用是**两次 `/proc/stat` 的差**算出的（不是累计值）；`numeric(5,2)` 装得下 0.00–999.99，多核半开以上不会溢出。`load*` 直接透传 `/proc/loadavg`（单位是「 runnable 平均个数」，与核数相关 ⇒ 不除核数，口径在 `parseLoadavg`） |
 | `mem_*_bytes bigint` / `swap_used_bytes` | `MemTotal` / `MemTotal-MemAvailable` / `MemAvailable` / `Cached`（+ SwapUsed）。`mem_used_bytes` 与 API 里的 `mem.usedPct` 同源；`MemAvailable` 缺失时**不拿 `MemFree` 顶替**（`numOrNull` ⇒ `null`，不把「不知道」当 0） |
 | `uptime_seconds bigint` | `/proc/uptime` 第一字段——页面上「宿主已运行 N 天」的唯一来源（也是「DB 里的行是不是陈旧」的交叉校验） |
-| `containers_total` / `_running` / `_station`、`fde_total` / `fde_running` | 容器计数口径写死在 `countContainers()`：总数 = 宿主全部；`station` = `Labels['station.managed']='true'`；`fde` = managed 或名字形如 `fde-*`。只读已在 Docker 白名单里的 `/containers/json`——**`stats`（1.02s/个）与 `/system/df`（15s）本单不碰** |
+| `containers_total` / `_running` / `_station`、`fde_total` / `fde_running` | 容器计数口径写死在 `countContainers()`：总数 = 宿主全部；`station` = `Labels['station.managed']='true'`；`fde` = **只认** `Labels['station.managed']='true'`（名字前缀不算数——261118 真机验收修的误报：宿主别的项目容器名形如 `*-db` 曾被前缀规则算成 FDE ⇒ 面板虚报台数。一台丢了标签的 FDE 会以 `onlyDb` 形态出现在对账里，那是要看见的信号）。只读已在 Docker 白名单里的 `/containers/json`——**`stats`（1.02s/个）与 `/system/df`（15s）本单不碰** |
 | `drift_count integer` | 「DB 说 N 台 ↔ Docker 实际 M 台」的对称差个数（`containerDrift()`）。只存**个数**：是谁（`onlyDb`/`onlyDocker`）只在 `latest` 里给，历史曲线不需要点名 |
 | `written_at timestamptz NOT NULL` | 应用侧写（AGENTS §3.4：DDL 不写 `DEFAULT now()`），与 `sampled_at` 同拍；两者差得远就是写慢了的证据 |
 
