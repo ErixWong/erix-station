@@ -1,7 +1,7 @@
 {
   "note": "issue #677 P5 防回潮闸的存量基线：station-portal.environment 里**非启动期必需**的键（迁移目标：减到 0）。keys 只许删、floor 只许降。",
   "floor": 62,
-  "measuredTotal": 72,
+  "measuredTotal": 71,
   "measuredBootstrap": 10,
   "keys": [
     "ADMIN_PUBLIC_HOST",
@@ -39,7 +39,6 @@
     "IPAM_POOL_DEFAULT",
     "IPAM_POOL_LARGE",
     "IPAM_RESERVED_SUBNETS",
-    "KK_INTERNAL_BASE_URL",
     "LLM_GATEWAY_ADMIN_URL",
     "LLM_GATEWAY_HOST",
     "LLM_HOST",
