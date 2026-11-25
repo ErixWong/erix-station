@@ -4233,7 +4233,7 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
   > （见上面那条 #502 注记与 `docs/data/model.md` §1.12）。原文留着是取证它当时的口径；本注记**仍然有效的部分**
   > 是后半句：客户端不得拿跳号当重连判据，丢失恢复只走 `resync` 与 `Last-Event-ID` 两条路。
 - 响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
-- 每 15s 发送注释行心跳（`: ping\n\n`），防止中间层断连。心跳不是事件，不占 seq。
+- 首连与每 15s 各发一次注释行 `: ping` **与命名事件 `event: ping`（data `{ts}`）**；`ping` 不占 `seq`，发射点是 `portal/src/http.js` 的 `writeSseEvent(res, 'ping', {ts})`。
 - 响应建议携带 `retry: 3000`，指导浏览器断线重连间隔。
 - **`resync` 控制帧**（宿主侧帧，**不属** §5.3 事件类型清单、不带 `seq`/`id`）：服务端补发前的缓冲溢出（上限 1000 条）时，portal 不再静默丢事件——向该连接写 `event: resync` + `data: {"reason":"buffer_overflow"}` 后 `res.end()`。该帧**不带** `last_seq`：重连游标由客户端用自己的本地水位线（已收到的最大 `seq`，含 `messages` 与 `run_events` 共用分配器造成的跳号）维护，服务端缓冲区里的最大 seq 不构成可靠游标（补发/写回窗口内可能漏）。客户端应立刻 `close()` 并以 `?last_event_id=<本地已知最大 seq>` 重连，由补发路径收敛（§5.2）。这是客户端唯一的主动重连触发条件（未知类型忽略原则仍适用于 §5.3 之外的其它扩展类型）。
 
@@ -4285,10 +4285,10 @@ data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id"
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `seq` | number \| null | 宿主落库时分配，session 内**单调递增**（允许跳号，见 §5.1 注记）。**只有 durable 档才有值**：stream 档碎片不落库 ⇒ `seq` 为 **`null`**（帧也不带 `id:`）；portal 合成的状态类事件（如第 17 类 `queue_update`）同样是 `null`。**前端不得把 `null` 当 0** |
+| `seq` | number \| null | 宿主落库时分配，session 内**单调递增**（允许跳号，见 §5.1 注记）。**只有 durable 档才有值**：stream 档碎片不落库 ⇒ `seq` 为 **`null`**（帧也不带 `id:`）；portal 合成的状态类事件（如第 17 类 `queue_update`）同样是 `null`。**前端不得把 `null` 当 0**；自造会话级事件不带 `seq` |
 | `ts` | string | ISO 8601 UTC，宿主落库时间 |
 | `session_id` | string | — |
-| `run_id` | string | 产生该事件的 run |
+| `run_id` | string? | 产生该事件的 run；portal 自造的会话级事件（`session_updated`、`ping`）**不带** `run_id` |
 | `type` | string | 见下表 |
 
 **类型清单**（前端 `switch` 必须覆盖全部；未知类型一律忽略并记日志，保证上游 additive 扩展向后兼容）：
@@ -4324,6 +4324,8 @@ data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id"
 | 27 | `user_turn_guard_unrecoverable` | **引擎 `onEvent`**（erix-agent 0.30.0 的 `LoopEvent` 联合类型新增 8 类之一；发射点 `orchestrator.js:2716`） | `round: number`、`channel: string`、`reason: string`、`detail: string`（首句是固定原文）、`runId?`、`parentRunId?`。语义：请求视图违反「必须有 user 轮」不变式、且**所有回补都失败** ⇒ 请求**原样发出**，上游多半以 400 拒掉它。它是在那次 400 **之前**发的，所以是唯一归因信号。界面：中性分隔行（`stream.event.userTurnGuardUnrecoverable`，`round`/`channel`/`reason` 缺 ⇒ `?`）；runner 另落一条 **`warn`** LOG。**0.30.0 的 8 个新类型里本站只把这一类放进时间线**：另外 5 个（`tool_output_aggregate` / `continuity_written` / `continuity_write_failed` / `final_guard_extend` / `context_unknown_option`）是**写明理由的豁免**（见 `portal/test/event-surface-contract.test.js` 的豁免表），`forced_final` 与 `continuity_injection_skipped` 早在册。 |
 | 28 | `host_steer_injected` | **引擎 `onEvent`**（erix-agent 0.32.0 的 `LoopEvent` 联合类型新增——0.32.0 **27 类 → 28 类，只多这一个、删 0**；发射点 `orchestrator.js:3300`，级别 `fact`） | `round: number`、`chars: number`（注入那条 user 轮的正文字符数，上游 #753 C1 钉了它）。语义：宿主经 `capabilities.hooks.nextUserTurn` 递进来的那句话**真的被注成了这条 user 轮**。**本站显式豁免、不刷行也不回放**：引擎只在钩子是个函数时才走到发射点（`orchestrator.js:3253` 早退），而本站**不传那个钩子**（现查 `grep -rn "hooks\s*:" portal runner | grep -v node_modules` = 0 命中）⇒ 结构上不产生该事件；即使开了，用户可见的反馈也已在 `queue_update`（§4.3a）与注入后的正文里，再加一行是同一件事说两遍。订得到（水位线推进、`hooks.onEvent` 观察面可见），但**不进 §4.4a 历史白名单也不进 `HISTORY_REPLAY_TYPES`**，同 `run_outcome` / `continuity_injection_skipped` 先例；决定与理由钉在 `portal/test/event-surface-contract.test.js` 的豁免表（只加前端 `EVENT_TYPES` 不写决定会被 S2 判红）。 |
 | 29 | `textualized_tool_call` | **本站自造**（issue #243：终局正文是一段**被文本化的工具调用** —— 模型把 tool call 吐进 content，引擎当最终文本收下 ⇒ run 正常 `finished`，但交付报告可能没生成）。来源不是容器：worker 只在命中时在 U2 载荷里 additive 带 `textualized_tool_call: true`（+ 命中的那条特征名），由 `internal.js` 的 `finishRun` 在**同一个终态事务内**合成事件行（U3 那条路走不通：它的写闸是「租约有效」，而收尾时租约随时被清 —— #220 现查取证；同 `attempt_killed` 的 reaper 分支） | `chars: number`（**本站从收到的 `final_text` 自己算**，不取容器报的数）、`marker?: string`（命中的那条特征，≤120 字符的外来串，只用来出文案片段；没给就没有这个键。**上界与 runner 侧同一个命名常量**（`TEXTUALIZED_MARKER_MAX_CHARS`，两侧不许各写一个裸数字）：超长的片段由 **runner/agentd 丢在源头**（布尔照传），本站这侧的 400 只是契约闸 —— 它开在**事务之前**，真 400 会把整条终态打回（终态不写、不重试），一个纯观测性的片段不该有那种权力） | **进 `HISTORY_EVENT_TYPES`（第 29 类）**：这条事件讲的恰恰是「用户刷新来看这次交付了什么」的那一刻，实时看得见、刷新后消失就是它自己的缺陷（上游 erix-agent #182 的教训原样搬过来）。界面是**中性提示**，不是失败面 —— 红色面仍只由 `run_end` 负责（§2.5.1 第 3 条）；**不改 `termination.reason`、不改终态载荷任何既有字段**。判据：`runner/test/final-text-toolcall.test.js`（识别 + 特征集可配置 + 真样本）、`portal/test/textualized-toolcall.test.js`（事件落库 / 排序 / 幂等 / 校验 / 三处集合对账）、`portal/test/session-events-history.test.js`（**刷新后历史端点仍返回它**）、`portal/test/textualized-toolcall.test.js` 的 E3（**跨面行为**：拿 runner 真函数造的超长 marker 载荷过这道闸 ⇒ 终态照写）。**已知残余**：特征判据是逐字子串，正常交付若在代码块**外**裸写 `｜｜DSML｜｜` 这类标记会误报一条中性提示（代价是一条提示，不是把 run 判成失败；写进行内代码/围栏里不会误报） |
+| 30 | `session_updated` | **本站自造**：会话标题更新（`portal/src/session-title.js` 推 `type: 'session_updated'`，前端 `composables/useEventStream.ts` 消费） | `title: string`；⚠ **不带 `seq` / `run_id`**（#777 A3） |
+| 31 | `ping` | **本站自造**：公共 SSE 保活帧（见 §5.1 与 D 项修正） | `ts: string`；**不带 `seq` / `run_id`** |
 
 > 说明与边界：
 > - **第 18~27 类是 issue #421 / #438 / #442 补接的「引擎承诺、宿主订不到」那一族**（#421 = 2026-10-27，#438 切片 B = 2026-11-02，#442 = erix-agent 0.30.0 升级片）：erix-agent 对宿主承诺 **28 类事件**（`src/loop/orchestrator.js` 里 `LoopEvent` 的 `@property` 联合类型；0.29.0 是 19 类，0.30.0 涨到 27 类，**0.32.0（#499）涨到 28 类——只多第 28 类 `host_steer_injected`，删 0**；**0.33.0（#530）仍是 28 类，新增 0 / 删除 0**（261115 在 0.32 与 0.33 两份 `npm pack` 解包上各取一次 `LoopEvent` 联合类型逐名对账：两侧各 28 个、`added: []` / `removed: []` ⇒ 本版**无新增事件类**，本站三处白名单与豁免表零改动，对账测当场跑绿）；**这份清单由 `portal/test/event-surface-contract.test.js` 从已安装引擎源码解析，不再手抄**），而本站三处白名单（前端 `EVENT_TYPES` / 前端 `HISTORY_REPLAY_TYPES` / 本文件 §4.4a 与 `http.js` 的 `HISTORY_EVENT_TYPES`）此前只认 11 类。写入侧不过白名单（`internal.js` 直接 `INSERT`）⇒ 这 5 类**每轮都在往 `run_events` 里写，而浏览器一条都收不到**（#371-A 同形状：库里存着、读不出来）。对账测：`portal/test/event-surface-contract.test.js`（从**已安装引擎源码**解析联合类型，上游改联合类型、本站删监听、豁免没写理由、联合外真发的事件没决定都会红）+ `portal/frontend/src/composables/engineEventSurface.spec.ts`（行为面：订得到 / 能回放 / 文案不编数据）+ `runner/test/engine-notices.test.js`（LOG 那一半）。**新增一类时三处必须同步，且 `run_outcome` 那种「订到但不展示」的决定必须写进豁免表。**
