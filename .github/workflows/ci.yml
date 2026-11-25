@@ -14,9 +14,11 @@
 name: CI
 
 on:
-  pull_request: # 只跑门禁，不构建镜像
-  push:
-    branches: [main] # 门禁 + 三镜像构建校验（--push 关闭，按路径过滤）
+  # issue #783：CI **只在 PR 触发**。以前 main 每次合并都会把同一棵内容的树再跑一遍门禁
+  #（261125 实测：一天 24 轮 push(main) 全部由合并提交触发、直推 0 次），而 PR 检查本就跑在合并 ref 上。
+  # 代价与补偿：PR 检查跑在「那一刻的 base」上，别人先合了就会错配 ⇒ 合并前必须先把 main 并进分支
+  # 再让 CI 绿一次（口径见 docs/ops/ci-release.md §4.4）。
+  pull_request: # 门禁 +（按路径判定）三镜像构建校验
   workflow_dispatch: # 额度被静默停跑后手动补跑
     inputs:
       build_images:
@@ -112,7 +114,40 @@ jobs:
       # ---- ② 根单测：node --test —— 现价（项数 / 通过 / 失败 / 跳过）由
       #      docs/ops/ci-release.md §1 的「现价」块单独持有，本文件不再抄第二份。
       #      261110 之前这里挂着一条 12,034 字节的逐单沿革注释；历史沿革同处冷层，别写回来。
+      - name: '⓪ 变更范围判定：docs-only 快道与路径基线（#783）'
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docs_only=false; base=''; files=''
+          # PR 才可能有 docs-only；workflow_dispatch 一律全量（人工补跑就是要看全套）
+          if [ "$EVENT" = 'pull_request' ] && git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            base="$BASE"
+            files="$(git diff --name-only "$base" "$SHA" || true)"
+            # docs-only 的口径**故意窄**：只有文档正文 + 文档闸的豁免账算 docs。
+            # 刻意**不含** deploy/migrations/（迁移要真库腿验）也**不含** .github/workflows/（改 CI 自己必须全量验）。
+            DOCS_RE='^(docs/|[A-Za-z0-9._-]*\.md$|scripts/doc-impl-exceptions\.json$)'
+            if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE "$DOCS_RE"; then
+              docs_only=true
+            fi
+          fi
+          {
+            echo "base=$base"
+            echo "docs_only=$docs_only"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$docs_only" = 'true' ]; then
+            SKIP='docs-only ⇒ 本轮跳过 ②（根 npm ci+test）/ ②′（真库腿）/ ③（runner）/ ④（前端）'
+            echo "$SKIP，只跑 ①⑤ + 文档闸" | tee -a "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "$files" | sed 's/^/    docs-only: /' || true
+          else
+            echo "非 docs-only（或取不到 base）⇒ 全量跑，路径基线 = ${base:-无（dispatch，⑤ 走保守全量）}"
+          fi
+
       - name: '② 根 npm ci + npm test'
+        if: steps.scope.outputs.docs_only != 'true'
         run: |
           npm ci --no-audit --no-fund
           npm test
@@ -123,13 +158,25 @@ jobs:
       # test:integration:prompts（7）两条腿，断言它们 `# skipped == 0` 且真跑出 pass；
       # 任一条被 skip（比如 PG service 没起来、DSN 错导致又变 skip）⇒ 闸红。
       - name: '②′ 真库腿 + skip 不算绿闸（postgres service）'
+        if: steps.scope.outputs.docs_only != 'true'
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/station_test
         run: node scripts/check-required-legs.mjs
 
       # ---- ③ runner 单测：`node --test` 不带目录参数（AGENTS.md §4 口径：
       #      `node --test runner/test/` 会把目录当模块加载 → Cannot find module，别用）----
+      - name: '②ᴰ 文档快道：只跑四个文档闸（docs-only 时）'
+        if: steps.scope.outputs.docs_only == 'true'
+        run: |
+          set -euo pipefail
+          # 三支都是零依赖 ESM，不需要 npm ci；被跳过的代码腿已在 ⓪ 与 job summary 里点名。
+          node scripts/agents-hotlayer-budget.mjs   # 热层预算 + 台账完整性 + §8.N 引用地板
+          node scripts/check-doc-portable.mjs       # 仓库文档必须可公开（本机坐标不许写进来）
+          node scripts/check-doc-impl.mjs           # 文档 ↔ 实现比对（#777 的闸）
+          echo "VERDICT ok：文档快道三条闸全绿（跳过的代码腿见 ⓪ 输出）"
+
       - name: '③ runner npm ci + node --test'
+        if: steps.scope.outputs.docs_only != 'true'
         working-directory: runner
         run: |
           npm ci --no-audit --no-fund
@@ -137,6 +184,7 @@ jobs:
 
       # ---- ④ 前端：显式 NODE_ENV=development（本机 NODE_ENV=production 会跳过 devDeps）----
       - name: '④ 前端 npm ci + typecheck + vitest'
+        if: steps.scope.outputs.docs_only != 'true'
         working-directory: portal/frontend
         run: |
           NODE_ENV=development npm ci --no-audit --no-fund
@@ -151,10 +199,11 @@ jobs:
       #   FDE 上下文 = runner/（fde-image.mjs:36 `build -t <img> runner/`）；proxy 上下文 = deploy/fde-proxy/。
       - name: '⑤ 按路径判定要构建哪些镜像'
         id: paths
-        if: github.event_name == 'push' || github.event.inputs.build_images == 'all'
+        if: github.event_name == 'pull_request' || github.event.inputs.build_images == 'all'
         env:
           EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
+          # #783：PR 用 base sha 作路径基线（checkout 是 fetch-depth: 0，base commit 取得到）
+          BEFORE: ${{ steps.scope.outputs.base }}
           AFTER: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -187,8 +236,9 @@ jobs:
     name: 镜像构建校验（三镜像，--load 不推送）
     needs: gate
     # PR 一律不构建；push main / dispatch=all 且路径命中才构建（单一 ubuntu-latest，无 matrix）
+    # #783：镜像构建校验以前只在 push(main) 跑，现在 push(main) 没了 ⇒ 它必须在 PR 上跑，
+    # 否则 Docker 发布链从此没人验。它只 --load 不推送、不需要 packages:write，PR 面跑是安全的。
     if: >-
-      github.event_name != 'pull_request' &&
       (needs.gate.outputs.build_portal == 'true' ||
        needs.gate.outputs.build_fde == 'true' ||
        needs.gate.outputs.build_proxy == 'true')

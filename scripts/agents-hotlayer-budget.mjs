@@ -136,7 +136,7 @@ function refFiles() {
   return scanRefs().files;
 }
 
-/** 热层字节预算：**显式目标值**，不再由实测派生（派生预算 = 永远绿，见台账 §8.208）。
+/** 热层字节预算：**显式目标值**，不再由实测派生（派生预算 = 永远绿，见台账 §8.209）。
  *  改它 = 一次可见的决策：写台账（谁拍的板、为什么、多少），别在代码里顺手改数。 */
 const HOT_BYTES_TARGET = 20480;
 const budgetFor = () => HOT_BYTES_TARGET;
