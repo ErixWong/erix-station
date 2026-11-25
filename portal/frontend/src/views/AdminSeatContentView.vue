@@ -20,6 +20,7 @@ import { isMarkdownName, previewChannel, streamMediaKind } from '../lib/previewR
 import {
   fileUrl,
   useAdminSeatContentStore,
+  type SeatDir,
   type SeatFileJson,
   type SeatSession,
   type SeatSessionDetail,
@@ -35,6 +36,8 @@ const router = useRouter();
 const SESSION_PAGE_SIZE = 50;
 /** 文件树根：相对该工位 `~/projects` 的 `'.'`（与后端缺省一致，前端不拼绝对路径）。 */
 const TREE_ROOT = '.';
+/** 会话 `cwd` 与一级目录互转用的公共前缀（`~/projects`，与 `dirNameOfCwd` 同口径）。 */
+const PROJECTS_DIR = '~/projects';
 
 // ── 顶部：FDE 选择 ──
 const selectedFde = ref('');
@@ -47,6 +50,11 @@ const sessionsLoading = ref(false);
 const sessionsError = ref('');
 const searchQ = ref('');
 const includeArchived = ref(false);
+// ── 会话二级菜单：目录（folder / project）下拉 ──
+/** 该 FDE `~/projects` 的一级目录（下拉的数据源，复用页面已加载的 `dirs` 端点）。 */
+const dirs = ref<SeatDir[]>([]);
+/** 会话目录过滤：`''` = 全部目录；否则是某个目录的 `cwd`（形如 `~/projects/<name>`）。 */
+const dirFilter = ref('');
 
 // ── 左栏下：文件树（状态按路径记账，全树共享一份）──
 const childMap = ref<Record<string, SeatTreeEntry[]>>({});
@@ -71,6 +79,21 @@ const fdeOptions = computed(() => store.fdeOptions);
 const hasSelection = computed(
   () => selectedSession.value !== null || selectedFilePath.value !== null,
 );
+
+/**
+ * 目录下拉的一项标签：目录名 + 该目录的活体计数。
+ * `running_count` / `queued_count` 为 0 时不显示；两者都为 0 ⇒ 只有目录名。
+ */
+function dirOptionLabel(dir: SeatDir): string {
+  const parts: string[] = [];
+  if (dir.running_count > 0) {
+    parts.push(t('admin.seatContent.sessions.runningCount', { count: dir.running_count }));
+  }
+  if (dir.queued_count > 0) {
+    parts.push(t('admin.seatContent.sessions.queuedCount', { count: dir.queued_count }));
+  }
+  return parts.length ? `${dir.name}（${parts.join(' / ')}）` : dir.name;
+}
 
 // 会话按 `updated_at` 倒序（服务端同一口径，这里只是保证「加载更多」拼接后的顺序也成立）。
 const sortedSessions = computed(() =>
@@ -101,6 +124,7 @@ async function reloadSessions(append = false): Promise<void> {
   sessionsError.value = '';
   try {
     const page = await store.loadSessions(selectedFde.value, {
+      cwd: dirFilter.value || undefined,
       q: searchQ.value.trim() || undefined,
       includeArchived: includeArchived.value,
       cursor: append ? sessionsCursor.value ?? undefined : undefined,
@@ -140,12 +164,36 @@ async function loadDir(path: string, append = false): Promise<void> {
 }
 
 function toggleDir(path: string): void {
+  // 一级目录（节点名不含 `/`）：无论展开还是收起，都把它当「选目录」——
+  // 会话面板的目录下拉随之切到该目录并重取列表（folder → session 二级联动）。
+  if (!path.includes('/')) applyDirFilter(`${PROJECTS_DIR}/${path}`);
   if (expanded.value[path]) {
     expanded.value = { ...expanded.value, [path]: false };
     return;
   }
   expanded.value = { ...expanded.value, [path]: true };
   if (childMap.value[path] === undefined) void loadDir(path);
+}
+
+/**
+ * 把会话目录过滤切到某个 `cwd`（`''` = 全部）并重取列表。
+ * 已经是该值就不重发（避免点同一目录/同一会话时多一次无谓请求）。
+ */
+function applyDirFilter(cwd: string): void {
+  if (dirFilter.value === cwd) return;
+  dirFilter.value = cwd;
+  sessionsCursor.value = null;
+  void reloadSessions();
+}
+
+/** 读目录下拉的数据源（`dirs` 端点）；失败不阻断会话/树（下拉退化为只有「全部」）。 */
+async function loadDirsInto(): Promise<void> {
+  if (!selectedFde.value) return;
+  try {
+    dirs.value = await store.loadDirs(selectedFde.value);
+  } catch {
+    dirs.value = [];
+  }
 }
 
 /** 会话的 `cwd`（`~/projects/<name>`）→ 树里的一级目录名；形状不符就不高亮（不猜）。 */
@@ -188,6 +236,11 @@ async function selectSession(id: string): Promise<void> {
     sessionDetailError.value = e instanceof Error ? e.message : String(e);
     await revealSessionDir(selectedSession.value?.cwd);
   }
+  // 双向联动：选中的会话必须落在当前目录过滤里——否则会出现
+  // 「选中的会话不在当前过滤中」这种自相矛盾。若它的 `cwd` 与当前过滤不一致，
+  // 就把过滤切到它（「全部」也算不一致 ⇒ 收窄到该目录，深链同样靠这条落位）。
+  const sessionCwd = selectedSession.value?.cwd;
+  if (typeof sessionCwd === 'string' && sessionCwd !== '') applyDirFilter(sessionCwd);
   syncQuery();
 }
 
@@ -216,6 +269,8 @@ function onFdeChange(): void {
   sessions.value = [];
   sessionsCursor.value = null;
   sessionsError.value = '';
+  dirs.value = [];
+  dirFilter.value = '';
   childMap.value = {};
   expanded.value = {};
   dirLoading.value = {};
@@ -233,8 +288,41 @@ function onFdeChange(): void {
     return;
   }
   // 选中 FDE 才发这个工位的请求（未选时一个端点请求都不发）。
-  void Promise.all([reloadSessions(), loadDir(TREE_ROOT)]);
+  void Promise.all([reloadSessions(), loadDir(TREE_ROOT), loadDirsInto()]);
   syncQuery();
+}
+
+/** 目录下拉直接改动（`@change`）：`v-model` 已先写好 `dirFilter`，这里只重置游标重取。 */
+function onDirSelect(): void {
+  sessionsCursor.value = null;
+  void reloadSessions();
+}
+
+/** 只重取当前会话详情（不碰目录/树），供「刷新」按钮用。 */
+async function reloadSessionDetail(): Promise<void> {
+  const id = selectedSession.value?.id;
+  if (!id || !selectedFde.value) return;
+  sessionDetailError.value = '';
+  try {
+    const detail = await store.loadSession(selectedFde.value, id, {
+      includeArchived: includeArchived.value,
+    });
+    sessionDetail.value = detail;
+    if (detail.session) selectedSession.value = detail.session;
+  } catch (e) {
+    sessionDetailError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+/**
+ * 「刷新」：只重取当前目录的会话列表 + 当前会话详情（无定时轮询、无 SSE）。
+ * 不重读 `dirs` / 目录树：那与「谁在跑」无关，重读会让 fetch 计数多走。
+ */
+function refreshAll(): void {
+  if (!selectedFde.value) return;
+  sessionsCursor.value = null;
+  void reloadSessions();
+  void reloadSessionDetail();
 }
 
 // ── 文件预览的派生值 ──
@@ -267,6 +355,10 @@ const CLS_LINK = 'ml-auto shrink-0 rounded-md border border-black/15 px-2 py-1 t
   ' hover:bg-black/5';
 const CLS_LINK_BIG = 'mt-3 inline-block rounded-md border border-black/15 px-3 py-1.5 text-sm' +
   ' hover:bg-black/5';
+// 运行态徽标（会话行与详情 meta 共用）：绿底绿字，不用红（红是错误语义）。
+const CLS_RUN_BADGE = 'inline-flex items-center gap-1 rounded-full bg-green-500/10'
+  + ' px-1.5 py-[1px] text-green-700';
+const CLS_RUN_DOT = 'inline-block h-1.5 w-1.5 rounded-full bg-green-500';
 
 /** 元信息行的一格（缺失一律 `—`，不猜、不显示 `undefined`）。 */
 function metaValue(value: unknown): string {
@@ -398,6 +490,30 @@ watch(includeArchived, () => {
         <section class="flex h-[40%] min-h-0 flex-col rounded-md border border-black/10">
           <header class="shrink-0 space-y-1 border-b border-black/10 px-2 py-1.5">
             <h3 class="text-sm font-medium mb-0">{{ t('admin.seatContent.sessions.title') }}</h3>
+            <div class="flex items-center gap-1">
+              <label
+                class="shrink-0 text-xs text-black/60"
+                for="seat-content-session-dir"
+              >{{ t('admin.seatContent.sessions.dirLabel') }}</label>
+              <select
+                id="seat-content-session-dir"
+                v-model="dirFilter"
+                data-test="session-dir-select"
+                class="min-w-0 flex-1 rounded border border-black/15 px-1.5 py-1 text-xs"
+                @change="onDirSelect"
+              >
+                <option value="">{{ t('admin.seatContent.sessions.dirAll') }}</option>
+                <option v-for="dir in dirs" :key="dir.cwd" :value="dir.cwd">
+                  {{ dirOptionLabel(dir) }}
+                </option>
+              </select>
+              <button
+                type="button"
+                data-test="sessions-refresh"
+                class="shrink-0 rounded border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
+                @click="refreshAll"
+              >{{ t('admin.seatContent.sessions.refresh') }}</button>
+            </div>
             <input
               v-model="searchQ"
               type="search"
@@ -440,7 +556,17 @@ watch(includeArchived, () => {
               :class="selectedSession?.id === item.id ? 'bg-brand/10' : ''"
               @click="selectSession(item.id)"
             >
-              <span class="block truncate text-sm">{{ sessionTitle(item) }}</span>
+              <span class="flex items-center gap-1">
+                <span class="min-w-0 flex-1 truncate text-sm">{{ sessionTitle(item) }}</span>
+                <span
+                  v-if="item.active_run_id"
+                  data-test="session-running"
+                  :class="[CLS_RUN_BADGE, 'shrink-0 text-[10px]']"
+                >
+                  <span :class="CLS_RUN_DOT"></span>
+                  {{ t('admin.seatContent.sessions.running') }}
+                </span>
+              </span>
               <span class="block truncate text-[11px] text-black/45">{{ item.cwd }}</span>
               <span class="block text-[11px] text-black/40">{{ item.updated_at }}</span>
             </button>
@@ -521,6 +647,14 @@ watch(includeArchived, () => {
                 :key="cell.key"
                 :data-test="cell.test"
               >{{ cell.label }}: {{ cell.value }}</span>
+              <span
+                v-if="selectedSession.active_run_id"
+                data-test="meta-running"
+                :class="CLS_RUN_BADGE"
+              >
+                <span :class="CLS_RUN_DOT"></span>
+                {{ t('admin.seatContent.sessions.running') }}
+              </span>
             </div>
             <p
               v-if="sessionDetailError"
