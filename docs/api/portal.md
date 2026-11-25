@@ -55,9 +55,9 @@
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-enroll` | 补绑/重绑 TOTP；新种子只在本次响应下发并强制重新登录 |
-| 管理 | `POST /api/admin/users/:login/tokens` | **签发 API 令牌**（#736，§2.13）：代 FDE 签，`{name, scopes?}`⇒`201`，明文**仅此一次**；非 admin⇒`403 insufficient_role`，重名⇒`409 token_name_taken`，非空 scopes⇒`400 scopes_unsupported` |
-| 管理 | `GET /api/admin/users/:login/tokens` | **列出令牌**（#736，§2.13）：`{tokens:[{id,name,scopes,created_at,last_used_at,revoked_at}]}`，**不返 hash**，含已吊销，按创建时间升序 |
-| 管理 | `DELETE /api/admin/users/:login/tokens/:id` | **吊销令牌**（#736，§2.13）：幂等 `{status:"revoked", already_revoked}`；跨账号/查无⇒`404` |
+| 管理 | `POST /api/admin/users/:login/tokens` | **签发 API 令牌**（#736，§2.13）：代 FDE 签，`{name, scopes?}`⇒`201`，明文**仅此一次**；非 admin⇒`403 insufficient_role`，重名⇒`409 token_name_taken`，非空 scopes⇒`400 scopes_unsupported`；**当前停用（`TOKEN_ROUTES_ENABLED=false`）⇒ 404**；§2.13 是启用后的条件契约 |
+| 管理 | `GET /api/admin/users/:login/tokens` | **列出令牌**（#736，§2.13）：`{tokens:[{id,name,scopes,created_at,last_used_at,revoked_at}]}`，**不返 hash**，含已吊销，按创建时间升序；**当前停用（`TOKEN_ROUTES_ENABLED=false`）⇒ 404**；§2.13 是启用后的条件契约 |
+| 管理 | `DELETE /api/admin/users/:login/tokens/:id` | **吊销令牌**（#736，§2.13）：幂等 `{status:"revoked", already_revoked}`；跨账号/查无⇒`404`；**当前停用（`TOKEN_ROUTES_ENABLED=false`）⇒ 404**；§2.13 是启用后的条件契约 |
 | 管理 | `GET /api/admin/mail/settings` | **邮件通道配置：读**（#449，§4.12）。**永不返回口令**：只给 `hasPassword` 布尔；无行（未配置）也回 `200` + 默认 DTO |
 | 管理 | `PUT /api/admin/mail/settings` | **邮件通道配置：写**（#449，§4.12）。口令**只写**：键缺席 = 不修改、`null`/`""` = 清除；落库后缓存**立刻**失效（不等 60s TTL） |
 | 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
@@ -105,16 +105,21 @@
 | LLM 管理 | `GET /api/admin/llm/providers` | 供应商 + 模型列表（模型对象的两个名字见 §4.9） |
 | LLM 管理 | `POST /api/admin/llm/providers/:id/models` | 新增模型 |
 | LLM 管理 | `PATCH /api/admin/llm/models/:id` | **改模型：调用名 `call_name`（数据面）与显示名 `name` 是两个字段**（#296，§4.9） |
-| LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」 |
+| LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」——**当前无实现 ⇒ 404**（#777 A1）|
 | LLM 管理 | `DELETE /api/admin/llm/models/:id` | 删模型（附虚拟 key 清理） |
 | LLM 管理 | `GET/PUT /api/admin/fdes/:fde/llm/budget` | 读/设 **FDE 周期额度（USD / 周期，`budget_period` ∈ {`1d`,`1mo`}）**（#719，§4.10） |
 | LLM 管理 | `GET /api/admin/fdes/:fde/llm/usage?days=30` | 近 N 天用量（直读 LiteLLM 聚合端点，#719，§4.10） |
 
-> LLM 管理这条线**其余**端点（供应商增删、`GET/PUT /api/admin/fdes/:name/llm`、
+> LLM 管理这条线**其余**端点（`GET/PUT /api/admin/fdes/:name/llm`、
 > `POST /api/admin/fdes/:name/llm/heartbeat`、`GET /api/admin/llm/model-catalog`、
-> `GET /api/admin/llm/usage`）此前同样不在索引里，本次不逐个补写契约（不在 #296 面上）；
-> 行为以 `portal/src/llm.js` + `portal/test/llm*.test.js` 为准，改名这条线的契约见 §4.9，
-> 心跳对账的口径见 `AGENTS.md` §8.25。登记这几行是为了「端点索引与文档自洽」（§7.13）。
+> `GET /api/admin/llm/usage`）此前同样不在索引里。
+> ⚠ **#777 实测**：后三条在 `portal/src/` 与 `portal/frontend/src` 各 **0 命中**
+> （`route()` 无对应分支 ⇒ 落 **404**）。
+> 那句「行为以 `portal/src/llm.js` 为准」对这三条**不实**（`llm.js` 内也无它们的路由）。
+> **真实存在**的是 `GET/PUT /api/admin/fdes/:fde/llm` 与
+> `GET /api/admin/fdes/:fde/llm/usage`（后者见 `route()` 里匹配
+> `/api/admin/fdes/<id>/llm/usage` 的正则分支）——**这两条不是 404，不得一起标成停用**。
+> 改名这条线的契约仍见 §4.9；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
 >
@@ -1183,13 +1188,17 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 
 ### 3.5 `PATCH /api/projects/:id`
 
+> ⚠ **已退役（P5 去项目化）**：实现对该方法返回 `410 project_api_retired`（`portal/src/http.js`）；以下正文是 P5 之前的历史契约，只作历史参考，不得当现行契约
+
 请求（全部可选）：`{ "name": "proj2" }`。
-响应 `200`：更新后的 Project。
+响应 **`410`**（现行，`project_api_retired`）；~~`200`~~：更新后的 Project（P5 前历史）。
 错误：`409 name_conflict`；**改名不重生成**已有 allocation 的 `hostname`/`url`——hostname 里的 `<project-name>` 是**分配时的项目名快照**，改名只更新 `projects.name`（容器内目录名）与**后续新建** run/端口的 hostname，旧 hostname 保持可访问（书签不破，规格 §8.5 不可变性）。改名不写 route outbox（无 hostname/url 变化）；`ports.json` 与 Traefik 路由的更新时机 = **只有新建/释放 allocation** 才触发（规格 §8.1，DB 为真相）。
 
 ### 3.6 `DELETE /api/projects/:id`
 
-响应 `204`。删除 = 回收该项目全部端口（`state → released`）+ 写 route outbox tombstone（同一 DB 事务，规格 §8.2）+ 项目归档；Traefik 路由由 file provider **异步、幂等**发布删除（「路由表里没有 = 不可达」）。
+> ⚠ **已退役（P5 去项目化）**：实现对该方法返回 `410 project_api_retired`（`portal/src/http.js`）；以下正文是 P5 之前的历史契约，只作历史参考，不得当现行契约
+
+响应 **`410`**（现行，`project_api_retired`）；~~`204`~~（P5 前历史）。删除 = 回收该项目全部端口（`state → released`）+ 写 route outbox tombstone（同一 DB 事务，规格 §8.2）+ 项目归档；Traefik 路由由 file provider **异步、幂等**发布删除（「路由表里没有 = 不可达」）。
 错误：`409 active_runs` —— 项目下有进行中的 run，须先停止。
 
 ---
@@ -1967,6 +1976,8 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 
 ### 4.7 端口列表
 
+> ⚠ **已退役（P5 去项目化）**：实现对该方法返回 `410 project_api_retired`（`portal/src/http.js`）；以下正文是 P5 之前的历史契约，只作历史参考，不得当现行契约
+
 > 本节只覆盖**已退役的项目维度**列表与未交付的 `PATCH /api/ports/:id`。**现役的列端口端点（本人 / 管理员）与
 > 管理员改块（= 搬迁）在 §4.7a**（issue #246 交付②）。
 
@@ -1980,7 +1991,7 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 
 #### `GET /api/projects/:id/ports`
 
-响应 `200`：
+响应 **`410`**（现行，`project_api_retired`）；~~`200`~~（P5 前历史）：
 
 ```json
 {
