@@ -58,10 +58,12 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 ### 4.1 dev 栈访问与探针口径（仅本地 dev）
 
 - 入口、账号、口令文件位置、第二因素现状 ⇒ `docs/testing.md` §1.3；**登录体字段是 `login` 不是 `username`**
-- **脚本/agent 要调 API ⇒ 用 API 令牌**（`Authorization: Bearer`，仅 admin 可签；契约与三步 curl
-  ⇒ `docs/api/portal.md` §2.13）——**不登录就不碰第二因素，也就不寄邮件**
-- **一次性探针要会话就登 `admin`**；**别反复登 `eric`**（他走邮箱验证码：每次寄一封真邮件而脚本读不到码）
-- 要测第二因素：自建带 TOTP 的种子账号走 step1+step2（做法同 §1.3）
+- **脚本/agent 要调 API ⇒ 登 dev 专用脚本账号 `agent01`**（口令直通：不开邮箱码也不开 TOTP ⇒ 零邮件、
+  不卡第二因素；口令路径与 dev 入口 ⇒ 冷层；`Origin` 要求 ⇒ `docs/testing.md` §1.3）。
+  **别登人的账号**——开着邮箱验证码的账号每登一次寄一封真邮件，而脚本读不到那枚码（两封信 ⇒ §8.187）
+- 要管理员面就登 `admin`；要测第二因素：自建带 TOTP 的种子账号走 step1+step2（做法同 §1.3）
+- API 令牌（仅 admin 可签、不过期）**当前已停用**（`http.js` 的 `TOKEN_ROUTES_ENABLED=false` ⇒ 三端点 404；认证缝保留、库里 0 枚 ⇒ Bearer 恒 401；启用=改这一个常量）
+  （契约 ⇒ `docs/api/portal.md` §2.13；停用+启用 ⇒ 台账 §8.200）
 
 ### 4.2 LLM 网关（LiteLLM）
 

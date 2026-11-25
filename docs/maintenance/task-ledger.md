@@ -9951,3 +9951,51 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
 
 **验证**：全新 `postgres:16` 上两条最常红的腿**各跑 5 遍全绿**、日志 0 次 `terminating connection`；
 `check-required-legs` 3 条腿全真跑 0 skip rc=0；合并后 `main` CI（`ddbc590`）**success**。
+
+### 8.199 dev 建「脚本专用账号 `agent01`」：脚本不再挤人的登录通道（2026-11-25，主 agent）
+
+**为什么**：#736 那串讨论把一件事问到底了——脚本走登录**本身没问题**，问题在**登的是谁的账号**。
+开着邮箱验证码的账号每登一次口令步就寄一封真邮件（第二因素的正常行为），而脚本读不到那枚码 ⇒ 白寄 +
+拿不到会话 + 重试再寄一封。「一次登录怎么变两封信」的完整成因已记 §8.187（两次独立口令步，相隔 3.4 秒）。
+同时 `api_tokens`（#747）实测**零消费者**（表 0 行、全仓 0 个调用方），把"脚本要不要长期凭据"这件事暂时
+还给登录这条路 ⇒ 用户 261125 拍：`你自己搞个测试账号不就完了`，并背书「测试时候数据库里改一下」。
+
+**建号（走 API，有审计）**：`POST /api/admin/users` 建 `agent01` → `201`，id `f35c45bc-edf0-4b3e-8c19-bad13e9b25df`，
+`role=fde`、`fde_name=agent01`、`totp_enabled=false`、`git_host_id=e6446e83-687f-4ee2-b3d9-30a2189bfaf2`（gitea，
+`git_hosts` 里唯一一条 enabled）、`llm={provider_id:"inteva", main_model_id:"abfd93f5-3be6-4779-a594-008928ee8b43"}`。
+审计落 `admin.user_created`。口令写 `~/.config/mcp/creds/station-agent01.password`（600）。
+
+**两处 dev 便利直改库**（本单唯一"没走 API"的动作，都只在本机 dev 库，不进代码/迁移）：
+
+1. `must_change_password=false`——建号写死 `true`（`portal/src/admin.js:324` INSERT 末列），管理员重置也会设回
+   `true`（`admin.js:667`），**API 层没有清它的口子**，而受限会话（`#255` 白名单）会挡住所有业务接口。
+2. `totp_login_enabled=false`——默认给的是"开关 `t` 但 `totp_secret` 为空"的**半开态**（`admin` 同款）：
+   今天口令直通，**哪天有人给它绑上 secret，脚本就被自己的第二因素锁死**。要测 TOTP 走 §1.3 的种子账号。
+
+**实测（经 edge：Host `admin.fde.erix.vip:9443` + `--resolve …:127.0.0.1`，写方法带 `Origin`）**：
+`POST /api/auth/login` `200 authenticated` + 1 条 cookie；`GET /api/me` `200`；`POST /api/auth/logout` `204`；
+清 `totp_login_enabled` 后再登录仍 `200`；**`login_email_codes` 全程 47 → 47（零发信）**；
+审计只新增 `admin.user_created` + `auth.login_success`，**没有** `auth.email_code_sent`。
+
+**顺带查到的两条事实**（已写进 `docs/testing.md` §1.3，别再踩）：`llm.main_model_id` 必须是**文本**类模型——
+`eric` 现绑的 `1a770ab8-…` 被目录判为 **vision**，拿它当 main 会 `validation_failed`「模型类型不匹配」；
+`GET /api/admin/users/:id` 没有 GET（`405`），git host 从 `GET /api/admin/users` 列表或 `git_hosts` 现读。
+
+**未做/未决**：`api_tokens` 停用方式（#747 整块 revert vs 只禁“签给 admin”）**已由 §8.200 拍定**：不 revert，用模块级常量 `TOKEN_ROUTES_ENABLED=false` 只关掉三个管理台端点；#740 真客户端 IP
+未做；`agent01` 只存在于本机 dev 库，**不是**交付物，换机重建做法见上（建号 1 次 API + 2 条 UPDATE）。
+
+
+### 8.200 #736/#747 收尾：API 令牌「关路由、留能力」——模块级常量 `TOKEN_ROUTES_ENABLED=false`（261125，erix_run + 主 agent，代号 docs-261125-01）
+
+**为什么不是整块 revert**：#736 已把 Bearer 认证缝、`api_tokens` 读写函数、21 格测试与 CI 真库腿做完并合进主干；表 DDL（`docs/data/schema.sql:128`）也在。整块 revert 会把「已验证的认证缝 + 真库腿」一起退掉，而退不掉的表反而成了「代码没了但表还在」的第二份真相。用户 261125 拍：**关路由、留能力**。`api_tokens` 实测 0 行、全仓 0 个调用方、界面单 #746 已判零消费者关闭；「一把不过期、能代任何人签的管理员钥匙」没人敢签。本条把 §8.199 遗留的「revert vs 只禁」这道题结掉：走「只禁路由」。
+
+**关掉的是什么**：三个管理台端点 `POST/GET/DELETE /api/admin/users/:login/tokens[/:id]`（签发 / 列表 / 吊销）。
+**留着的是什么**：`portal/src/api-tokens.js` 全部函数、`Authorization: Bearer` 认证缝（`X-Auth-Method: api_token`、无 `Set-Cookie`、`ambiguous_credential` / `unsupported_scheme` / `last_used_at` 节流 / 审计不含明文与 hash）、`handleUserApiTokens` 本体与注释、`api-tokens.test.js`（改直调 `mintToken`/`revokeToken` 后 18 格）、`api-tokens-db.test.js`（真库腿 6 格，`scripts/check-required-legs.mjs` 的 `minPass=6` 不动）。
+
+**怎么关 / 怎么启用**：`portal/src/http.js` 顶部模块级常量 `TOKEN_ROUTES_ENABLED=false`（fail-closed，不是 env、不是运行时旋钮）。false 时 `apiTokenMatch` 直接 `null`，路径落到 blanket `handleAdminApi` 尾部的通用 404。重新启用 = 把这一个常量改成 `true`（其余逻辑原样都在）。
+
+**实测读数（本支自跑，非引用）**：三端点用 admin cookie 打全部 `404` 且 `{error.code:"not_found"}`（沿用通用 404 形状，未新造错误码）；非 admin 打旧路径先被 `requireAdmin` 拒 ⇒ `403 forbidden`（不再是 `insufficient_role`——那个 handler 已被常量短路）；Bearer 认证缝仍生效（有有效令牌 `200`、否则 `401`）；库里 `api_tokens` 0 枚 ⇒ 任何 Bearer 恒 `401`。
+
+**门禁**：`node scripts/agents-hotlayer-budget.mjs` VERDICT ok（热层 10214 / 预算 10240）；`node --test portal/test/api-tokens.test.js` 18 pass / 0 fail；`TEST_DATABASE_URL=… node scripts/check-required-legs.mjs` 三条真库腿 rc=0；`npm test` rc=0。
+
+**裁决：别因为表建了就默认要做界面**。`api_tokens` 表早在 DDL 里，但「有表」≠「该有签发界面 / 该接客户端」——判据是消费者。零调用方 + 零行 + 一把不敢签的不过期管理员钥匙 ⇒ 关路由比造界面诚实。将来真有 runner 要长期凭据，把常量翻成 `true` 即可，不必先补一版界面。

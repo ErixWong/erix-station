@@ -208,9 +208,10 @@ test('#736 真库④ findApiTokenUser 折的 user 与 cookie 全等，session.id
   });
 
 // ---------------------------------------------------------------------------
-// HTTP 端到端（真库 pool 注入 createServer）：
-// 管理员签发 → Bearer GET /api/me 200 且无 Set-Cookie、带 X-Auth-Method: api_token
-// → 吊销 → 同一令牌 401。吊销→401 依赖 revoked 谓词 ⇒ M1 也会打红这格。
+// HTTP 端到端（真库 pool 注入 createServer）：#736 停用后签发/吊销端点 404，
+// 改为直调 mintToken/revokeToken 拿明文与吊销；**经 HTTP 的 Bearer 断言保留**
+// （GET /api/me 200、无 Set-Cookie、X-Auth-Method: api_token、吊销后同一令牌 401）。
+// 吊销→401 依赖 revoked 谓词 ⇒ M1 也会打红这格。
 // ---------------------------------------------------------------------------
 function fakeMailerProvider() {
   const mailer = { enabled: false, async send() { return { ok: false, reason: 'disabled' }; } };
@@ -276,27 +277,13 @@ async function req(base, { method = 'GET', pathname = '/api/me', body, cookie, a
 
 test('#736 真库 HTTP Bearer 200 无 Set-Cookie，吊销后 401', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
-    await seedUser(pool, { login: 'root736', role: 'admin' });
-    await seedUser(pool, { login: 'eric736', role: 'fde' });
+    const eric = await seedUser(pool, { login: 'eric736', role: 'fde' });
     const { base, close } = await startServer(pool);
     try {
-      const login = await req(base, {
-        method: 'POST',
-        pathname: '/api/auth/login',
-        body: { login: 'root736', password: PASSWORD },
-      });
-      assert.equal(login.status, 200, `管理员口令直登应 200：${login.text}`);
-      assert.ok(login.setCookie, '登录响应应带会话 cookie');
-      const cookie = login.setCookie.split(';')[0];
-
-      const mint = await req(base, {
-        method: 'POST',
-        pathname: '/api/admin/users/eric736/tokens',
-        cookie,
-        body: { name: 'ci' },
-      });
-      assert.equal(mint.status, 201, `管理员代签应 201：${mint.text}`);
-      const bearer = `Bearer ${mint.json.token}`;
+      // #736 停用后：签发端点 404 ⇒ 直调 mintToken 拿明文（真库上真插一行），其余仍走 HTTP。
+      const { token, row } = await mintFor(pool, eric, 'ci');
+      assert.ok(row, '直调 mintToken 应在真库落一行');
+      const bearer = `Bearer ${token}`;
 
       const me = await req(base, { authz: bearer });
       assert.equal(me.status, 200, `Bearer GET /api/me 应 200：${me.text}`);
@@ -304,12 +291,9 @@ test('#736 真库 HTTP Bearer 200 无 Set-Cookie，吊销后 401', { skip: SKIP 
       assert.equal(me.setCookie, null, '令牌路径绝不吐 Set-Cookie');
       assert.equal(me.headers.get('x-auth-method'), 'api_token', '令牌路径发 X-Auth-Method');
 
-      const rev = await req(base, {
-        method: 'DELETE',
-        pathname: `/api/admin/users/eric736/tokens/${mint.json.id}`,
-        cookie,
-      });
-      assert.equal(rev.status, 200, `吊销应 200：${rev.text}`);
+      // 吊销端点停用 ⇒ 直调 revokeToken；吊销后同一令牌仍走 HTTP ⇒ 401（M1 红点）。
+      const rev = await revokeToken(pool, { userId: eric.id, tokenId: row.id });
+      assert.equal(rev.outcome, 'revoked', '直调吊销应置 revoked');
 
       const dead = await req(base, { authz: bearer });
       assert.equal(dead.status, 401, '吊销后同一令牌应 401（M1 会让它仍查回）');

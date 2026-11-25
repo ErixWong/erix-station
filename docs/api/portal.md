@@ -1022,6 +1022,10 @@ station-portal user enable  --login <login>
 
 ### 2.13 API 令牌（#736：脚本 / agent 不再走登录、不再寄邮件）
 
+> **当前状态（261125 停用）**：三个管理台端点（签发/列表/吊销）**已停用**——`portal/src/http.js`
+> 里模块级常量 `TOKEN_ROUTES_ENABLED=false` 门掉路由匹配 ⇒ `POST/GET/DELETE /api/admin/users/:login/tokens[/:id]`
+> 一律落通用 `404 not_found`。但 **Bearer 认证缝仍生效**（`Authorization: Bearer` 照常验令牌、发 `X-Auth-Method: api_token`、不发 `Set-Cookie`）；`api_tokens` 库里 0 行 ⇒ 任何 Bearer 恒 `401`。怎么打开：把 `TOKEN_ROUTES_ENABLED` 改成 `true`（就一个常量）。为什么关：全仓 0 个调用方 + 「不过期、代签的管理员钥匙」没人敢签，界面单 #746 已关；详见台账 §8.200。下面的**契约表、错误码、三步 curl 全部保留**——它们描述的是「启用后」的契约。
+
 长期 runner、脚本、agent 要调 portal API，以前只能「登录换会话 cookie」；开了邮箱
 验证码的账号每次口令步都寄一封真邮件且永远拿不到会话。`api_tokens` 表早已存在（DDL
 `docs/data/schema.sql:128`）但代码里零 INSERT——本节就是补这块，不是新发明。

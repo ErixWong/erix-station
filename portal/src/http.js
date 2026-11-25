@@ -85,6 +85,10 @@ const DEFAULT_JSON_BODY_LIMIT = 64 * 1024;
  */
 const MESSAGE_BODY_LIMIT = 1024 * 1024;
 
+// #736：签发/列表/吊销端点当前停用（库里 0 枚、消费者 0，且不过期的管理员钥匙没人敢签 ⇒ #746 已关）。
+// 认证缝（Bearer）保留；重新启用 = 把这个常量改成 true（台账 §8.200）。
+const TOKEN_ROUTES_ENABLED = false;
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -1121,7 +1125,7 @@ async function routeApi(req, res, ctx, url) {
     if (getBearerToken(req).present) {
       throw new HttpError(
         400, 'logout_not_applicable_for_tokens',
-        'API 令牌不能登出，请用 DELETE /api/admin/users/<login>/tokens/<id> 吊销',
+        'API 令牌不能登出（令牌没有会话）；作废需由管理员吊销该令牌',
       );
     }
     const token = getCookie(req, config.cookie.name);
@@ -1497,7 +1501,7 @@ async function routeApi(req, res, ctx, url) {
   // ---- #736：管理台代 FDE 签发 / 列表 / 吊销 API 令牌（自己控制角色错误码与限流）----
   // 放在 `handleAdminApi` 的 blanket 分派**之前**：那层的 `requireAdmin` 对非 admin 产
   // `forbidden`，而 §2.13 契约要的是 `insufficient_role`；且签发要单独限流（`auth-token-mint`）。
-  const apiTokenMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)\/tokens(?:\/([^/]+))?$/);
+  const apiTokenMatch = TOKEN_ROUTES_ENABLED ? pathname.match(/^\/api\/admin\/users\/([^/]+)\/tokens(?:\/([^/]+))?$/) : null;
   if (apiTokenMatch) return handleUserApiTokens(req, res, ctx, apiTokenMatch);
 
   // ---- admin LLM 配置（issue #38 Phase A；requireAdmin 鉴权） ----
