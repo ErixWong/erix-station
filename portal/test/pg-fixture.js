@@ -107,7 +107,7 @@ export async function acquireBootstrapLock({
 // 而 pool.end() 正在关闭中的 socket 仍可能收到这条终止报文，于是触发
 // pool.emit('error')。这是「拆库 FORCE 与池关闭的竞态」，是预期内的收尾
 // 噪声，非被掩盖的产品 bug。所以只吞这一类终止，其余一律留痕。
-function isDropDbTermination(err) {
+export function isDropDbTermination(err) {
   if (!err) return false;
   if (err.code === '57P01') return true;
   const msg = typeof err.message === 'string' ? err.message : '';
@@ -124,6 +124,16 @@ export function attachPoolErrorHandler(pool, log) {
     const msg = err && err.message ? err.message : String(err);
     sink(`pool error（非拆库终止，需排查）: ${msg}`);
   });
+}
+
+// 表达式可用的包装：挂完监听把同一个池原样返回，供直建池处内联
+// （如 `mkPool = (url, o) => guardPoolErrors(createPool(url, o), …)`）。
+// 为什么测试里也要挂：夹具 `DROP DATABASE … WITH (FORCE)` 与池关闭的竞态会以
+// 57P01 抵达 pool 的 'error' 事件；无监听者时 EventEmitter 直接抛出成
+// uncaughtException，整条腿红（#758 下半场：migrate-fresh / upload-settings）。
+export function guardPoolErrors(pool, log) {
+  attachPoolErrorHandler(pool, log);
+  return pool;
 }
 
 export function createPgFixture(adminUrl, {

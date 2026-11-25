@@ -31,8 +31,9 @@
 //   1. 登录体字段是 **`login`** 不是 `username`（`portal/src/http.js` handleLoginStep1）。dev 的 `admin`
 //      没注册 TOTP ⇒ 口令直通**直接发会话 cookie**（没有第二步）。账号若开了 TOTP/邮箱码，本脚本
 //      **skip 而不是硬失败**（那是环境形状，不是产品坏了）。
-//   2. 口令**不入库**：只从 `~/.config/creds/station-dev-password-file` 读（AGENTS.md §4.1）。为了把它
-//      送进 playwright 容器，会往容器 `/tmp` 写一份临时文件（里面有口令）并尽力删掉；别把它 print 出来。
+//   2. 口令**不入库**：只从 `~/.config/` 下 `mcp/creds/` 里的 dev 口令文件读
+//      （旧路径留兜底；env 点名只信 env，AGENTS §4）。为了把它送进 playwright
+//      容器，往 `/tmp` 写临时文件（有口令）并尽力删；别 print 它。
 //   3. `/api/health` 的 `version` **只有三格**，没有 `engine`/`platformEngine`（#586 刻意：公开零鉴权
 //      端点里并排两个引擎数一定被读错）。`A1` 就是钉这一条的**负断言**，别顺手「补上」引擎格。
 //   4. `provenance.*` 是**由 `source` 推导的**，不是常量（复验阻断）。旧镜像里没烘 build-info.json 时
@@ -59,8 +60,13 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const PORTAL = (process.env.PORTAL_URL || `http://127.0.0.1:${process.env.PORTAL_HOST_PORT || '18080'}`).replace(/\/$/, '');
 const PORTAL_CONTAINER = process.env.PORTAL_CONTAINER || 'station-portal';
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
-const PASSWORD_FILE = (process.env.ADMIN_PASSWORD_FILE || '~/.config/creds/station-dev-password-file')
-  .replace(/^~/, os.homedir());
+// 凭据目录口径（AGENTS §4）：~/.config/ 下 mcp/creds/；env 点名只信 env
+const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
+  ? [process.env.ADMIN_PASSWORD_FILE]
+  : ['~/.config/mcp/creds/station-dev.password', '~/.config/creds/station-dev-password-file'])
+  .map((p) => p.replace(/^~/, os.homedir()));
+/** 报错文案用：缺口令时列出试过的路径（新前旧后）。 */
+const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
 /** portal 镜像内 build-info 的位置（`portal/src/version-info.js` 的 `BUILD_INFO_PATH`；产品不许改，测试这边跟着钉）。 */
 const BUILD_INFO_PATH = '/app/build-info.json';
 /** `readBuildInfo()` 的 `source` → 面板来源标注（与 `provenanceFor()` 同表；这里是**独立复算**，不是抄产品常量）。 */
@@ -141,11 +147,15 @@ async function fetchJson(url, { method = 'GET', body, headers = {}, timeoutMs = 
   throw e;
 }
 
+/** 先新后旧取第一个存在的；空文件视同没有 ⇒ null。 */
 function readPassword() {
-  if (!fs.existsSync(PASSWORD_FILE)) return null;
-  const value = fs.readFileSync(PASSWORD_FILE, 'utf8').trim();
+  const file = PASSWORD_FILE_CANDIDATES.find((p) => fs.existsSync(p));
+  if (!file) return null;
+  const value = fs.readFileSync(file, 'utf8').trim();
   return value === '' ? null : value;
 }
+// 哨兵用：模块加载就读一次，不依赖 gather 是否提前 return。
+const CRED_PASSWORD = readPassword();
 
 const isNonEmptyString = (v) => typeof v === 'string' && v.trim() !== '';
 const UNKNOWNISH = (v) => !isNonEmptyString(v) || v.trim() === 'unknown';
@@ -603,5 +613,26 @@ test('U1 真浏览器进 `#/admin/about`：三区块 + 三格显示的就是 API
       tryQuiet(() => dockerRun(`exec ${PW_CONTAINER} sh -c "rm -f ${scriptIn} ${cfgIn}"`, { timeout: 30_000 }));
       tryQuiet(() => fs.rmSync(scriptHost, { force: true }));
       tryQuiet(() => fs.rmSync(cfgHost, { force: true }));
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// 哨兵用例：禁止「点名了却整腿静默 skip」的假通过。
+// 为什么：E2E_UI=1 点名要跑，口令文件却不在 ⇒ 所有用例 skip、rc=0，
+// 和真跑同色——这就是「假通过」，本仓反复在治的病。
+// 点名 = E2E_UI=1（UI 腿）或 E2E_HTTP=1（显式要求 HTTP 腿必须能跑）。
+// 未点名（默认）仍允许 skip：本地没有 dev 栈也得能跑 npm test。
+// ---------------------------------------------------------------------------
+const E2E_REQUESTED = UI_ENABLED || process.env.E2E_HTTP === '1';
+test('哨兵：点名要跑时口令文件必须存在（禁止静默全 skip）',
+  { timeout: 10_000 }, (t) => {
+    if (!E2E_REQUESTED) {
+      t.diagnostic('未点名 ⇒ 允许 skip（本地没有 dev 栈也能跑 npm test）');
+      return;
+    }
+    if (CRED_PASSWORD === null) {
+      assert.fail(`点名要跑却没找到口令文件（试过 ${PASSWORD_FILE}）：`
+        + '全腿静默 skip 会让 rc=0 与真跑同色（假通过）⇒ 判失败。'
+        + '修法：放好凭据文件，或用 ADMIN_PASSWORD_FILE 指过去。');
     }
   });
