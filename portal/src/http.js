@@ -25,8 +25,6 @@ import * as admin from './admin.js';
 import * as seatContent from './admin-seat-content.js'; // #727：管理台按 FDE 只读浏览会话/文件
 import * as dirs from './dirs.js';
 import * as previewmiss from './previewmiss.js';
-import * as previewproxy from './previewproxy.js';
-import * as previewBackend from './preview-backend.js'; // #787：kkFileView 可用性探针（状态查询，不是反代）
 import { getGitLight } from './gitlight.js';
 import * as gitCredential from './git-credential.js';
 import * as gitHosts from './git-hosts.js';
@@ -1201,12 +1199,6 @@ async function route(req, res, ctx) {
   if (pathname.startsWith('/api/')) {
     return routeApi(req, res, ctx, url);
   }
-  // #366 P2：/pv/<code>/** 是带鉴权的反代路由，不是静态资源——必须在 serveStatic 分流之前进 routeApi。
-  // （routeApi 内部只匹配 /api/* 的处理器，/pv 的路由条目就在那里；其余非 /api 路径照旧进静态。）
-  if (pathname.startsWith('/pv/')) {
-    return routeApi(req, res, ctx, url);
-  }
-
   return serveStatic(req, res, ctx, url);
 }
 
@@ -1417,20 +1409,6 @@ async function routeApi(req, res, ctx, url) {
   }
   if (pathname === '/api/file' && req.method === 'GET') {
     return handleFilePreview(req, res, ctx, url);
-  }
-  // 预览短码签发（#366 P2 隔离链③）：签一枚绑 (用户, 文件, mtime, exp) 的 HMAC 能力码，
-  // 拼进 /pv/<code>/onlinePreview 当 iframe src。命名对齐同族 kebab-case 端点。
-  if (pathname === '/api/preview-tickets' && req.method === 'POST') {
-    return handleFilePreviewTicket(req, res, ctx);
-  }
-  // issue #787：预览后端（kkFileView）可用性探针。普通 FDE 可读；探针失败也 **200**。
-  if (pathname === '/api/preview-backend' && req.method === 'GET') {
-    return handlePreviewBackend(req, res, ctx);
-  }
-  // /pv/<code>/** 预览反代（#366 P2）：浏览器全程只见 portal 源，kk 主机名零暴露。
-  const pvMatch = pathname.match(/^\/pv\/([^/]+)(\/.*)?$/);
-  if (pvMatch && (req.method === 'GET' || req.method === 'HEAD')) {
-    return handlePvProxy(req, res, ctx, decodeURIComponent(pvMatch[1]), pvMatch[2] ?? '/', url.searchParams.toString());
   }
   // issue #359 P0a：目录 git「收工灯」（决策见 AGENTS.md §7 D9）——同一作用域、同一条直读通道。
   if (pathname === '/api/git-light' && req.method === 'GET') {
@@ -5071,26 +5049,6 @@ async function requireSession(req, ctx) {
 }
 
 /**
- * issue #787：`GET /api/preview-backend` —— 预览后端（kkFileView）可用性探针状态。
- *
- * 普通 FDE 也能读（`requireSession` 即可，不是 admin 面）。响应 `{ configured, available,
- * checkedAt }` 三字段；**不回 baseUrl**（探针结果里不该出现内网坐标）；探针失败（未配置 /
- * 不可达 / 探测异常）一律 **200**（这是状态查询，不是错误，别映射成 502）。
- */
-async function handlePreviewBackend(req, res, ctx) {
-  await requireSession(req, ctx);
-  const baseUrl = await runtimeSettings.readKkBaseUrl({
-    pool: ctx.pool, config: ctx.config, log: ctx.log,
-  });
-  const status = await previewBackend.probePreviewBackend({ baseUrl });
-  return sendJson(res, 200, {
-    configured: status.configured,
-    available: status.available,
-    checkedAt: status.checkedAt,
-  });
-}
-
-/**
  * forwardAuth 回调（portal.md §2.7）。fail-closed：
  *  ① hostname 精确查 port_allocations（查不到 404 = 路由表里没有 = 不可达）；
  *  ② released → 403 allocation_released；
@@ -5687,102 +5645,6 @@ async function handleFilePreview(req, res, ctx, url) {
     }
     throw err;
   }
-}
-
-/**
- * 本站公开 origin（给 kk X-Base-Url 拼产物链接用）：头口径与 forwardAuth 同源（XFH 优先，
- * Traefik 权威覆写）；scheme 真机永远 https（edge TLS 终结 + XFP），直连/dev 按 cookie
- * profile 判（dev-http = 本地纯 http）。写死 https 会在 dev 里生成混合内容链接。
- */
-function publicOriginOf(req, ctx) {
-  const rawHost = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
-  // dev-http（cookie 非 secure）直连无 Traefik 头时才是 http；真机 edge TLS 终结必发 XFP。
-  const proto = req.headers['x-forwarded-proto'] ?? (ctx.config.cookie.secure ? 'https' : 'http');
-  return `${proto}://${rawHost}`;
-}
-
-/**
- * POST /api/preview-tickets（#366 P2）：{cwd, path} → { url, expires_in }。
- * 牢笼解析复用 dirs.resolveJailedFile（与预览同一红线）；mtime 进载荷做 cache-buster：
- * 文件被 agent 改写 → 旧码 403 → 前端重签 → kk 重转（陈旧性由机制自解决，不靠清缓存）。
- */
-async function handleFilePreviewTicket(req, res, ctx) {
-  const session = await requireSession(req, ctx);
-  requireJson(req);
-  const body = await readJsonBody(req);
-  const jailed = dirs.resolveJailedFile({
-    userSpaceRoot: ctx.config.userSpaceRoot,
-    fdeName: session.user.fde_name,
-    cwd: body?.cwd,
-    relPath: body?.path,
-  });
-  const code = previewproxy.issuePreviewCode({
-    secret: ctx.config.previewSessionSigningKey,
-    userId: session.user.id,
-    fdeName: session.user.fde_name,
-    project: jailed.project,
-    relPath: jailed.rel,
-    mtimeMs: jailed.st.mtimeMs,
-  });
-  return sendJson(res, 200, {
-    url: `/pv/${encodeURIComponent(code)}/onlinePreview`,
-    expires_in: previewproxy.PREVIEW_CODE_TTL_SECONDS,
-  });
-}
-
-/**
- * /pv/<code>/** 预览反代（#366 P2 定稿，previewproxy 模块注释是架构真相）：
- * 每请求过 会话（隔离链②）+ 能力码归属/时效（③）+ 路径白名单，再把载荷重写成 kk 的
- * 本地文件参数（路径泄露归零）；HTML 响应改写补前缀，子资源继续走同一闸门。
- */
-async function handlePvProxy(req, res, ctx, code, subPath, query) {
-  const session = await requireSession(req, ctx);
-  const payload = previewproxy.verifyPreviewCode(ctx.config.previewSessionSigningKey, code);
-  // 码验不过统一 404（不告诉探探器「有这枚码但过期了」这种存在性信息）。
-  if (!payload) throw new HttpError(404, 'not_found', 'not found');
-  // 路径白名单先于归属/时效：非路由就是 404，不把码的状态（有效/过期/他人）泄露给探测者。
-  const kkPath = previewproxy.pvForwardPath(subPath);
-  if (!kkPath) throw new HttpError(404, 'not_found', 'not found');
-  if (payload.u !== session.user.id) throw new HttpError(403, 'forbidden', 'forbidden');
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (!(Number(payload.e) > nowSec)) throw new HttpError(403, 'preview_code_expired', 'preview code expired', { retryable: true });
-  // onlinePreview 的 url 参数由载荷重写为 file:// URL（客户端碰不到真实路径，SSRF 根）；
-  // 其余子请求透传原 query。file URL 的根 = portal 自己的 userSpaceRoot（compose 保证 kk
-  // 容器同路径 ro 挂载，两边看到同一盘 —— 用 portal 的值而非写死，测试/异路径部署都对）。
-  const kkBase = ctx.config.kkInternalBaseUrl ?? previewproxy.KK_INTERNAL_BASE_URL;
-  const upstreamUrl = kkPath === '/onlinePreview'
-    ? `${kkBase}/onlinePreview?${previewproxy.kkOnlinePreviewQuery(payload, ctx.config.userSpaceRoot)}`
-    : `${kkBase}${kkPath}${query ? `?${query}` : ''}`;
-  let upstream;
-  try {
-    upstream = await fetch(upstreamUrl, {
-      method: req.method,
-      // 公开 origin：Traefik 权威覆写的 XFH/XFP（直连时回退 Host/scheme），给 kk 的 X-Base-Url
-      // 拼闸门内绝对链接用（previewproxy 注释是口径真相）。
-      headers: previewproxy.pvForwardHeaders(req, code, publicOriginOf(req, ctx)),
-      redirect: 'manual',
-    });
-  } catch {
-    throw new HttpError(502, 'preview_backend_unavailable', 'kkfileview unreachable', { retryable: true });
-  }
-  const headers = previewproxy.pvSanitizedHeaders(upstream);
-  let outBody = Buffer.from(await upstream.arrayBuffer());
-  const isHtml = String(upstream.headers.get('content-type') ?? '').includes('text/html');
-  if (isHtml && upstream.status === 200 && req.method === 'GET') {
-    const rewritten = previewproxy.rewriteKkHtml(outBody.toString('utf8'), code);
-    if (rewritten !== null) outBody = Buffer.from(rewritten, 'utf8');
-  }
-  if (req.method === 'HEAD') {
-    const cl = upstream.headers.get('content-length');
-    if (cl !== null) headers['content-length'] = cl;
-    res.writeHead(upstream.status, headers);
-    res.end();
-    return undefined;
-  }
-  headers['content-length'] = String(outBody.length);
-  res.writeHead(upstream.status, headers);
-  res.end(outBody);
-  return undefined;
 }
 
 /**

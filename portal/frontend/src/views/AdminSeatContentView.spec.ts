@@ -281,7 +281,6 @@ describe('issue #727 判据②：只读红线（全程 GET、不碰 `/pv/`、不
       expect(methods.filter((m) => m !== 'GET')).toEqual([]);
       const urls = fetchMock.mock.calls.map(([url]) => String(url));
       expect(urls.filter((u) => u.includes('/pv/'))).toEqual([]);
-      expect(urls.filter((u) => u.includes('/api/preview-tickets'))).toEqual([]);
       expect(EventSourceSpy.count).toBe(0);
       // 页面上也没有任何写侧按钮（发送 / 停止 / 上传 / 审批）。
       expect(wrapper.find('[data-test="seat-content-page"]').text()).not.toMatch(/上传/);
