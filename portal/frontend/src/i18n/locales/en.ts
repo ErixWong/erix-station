@@ -359,7 +359,7 @@ export const en = {
       // string below may promise "verified". The caller joins axes with " · ".
       judgeAxes: 'judge: {axes}',
       // Axis 1 · tool audit: `executed` means "this tool call was released", not task completion
-      // (the amplifier of ISSUES.md item 4).
+      // (the amplifier of the retired trial-feedback record (item 4)).
       judgeAuditExecuted: 'tool audit: released (not task completion)',
       judgeAuditPassThrough: 'tool audit: released ({mode}; not task completion)',
       judgeAuditBlocked: 'tool audit: blocked (this tool call did not run)',
