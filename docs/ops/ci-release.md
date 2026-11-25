@@ -293,8 +293,11 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
 常驻「**skip 不算绿**」闸：`scripts/check-required-legs.mjs`（根脚本 `npm run check:ci-legs`，
 本地也能跑）。它对「必须真跑清单」：有 `TEST_DATABASE_URL` 时逐条真跑并断言 `# skipped
 == 0` 且真跑出 pass（skip>0 或 pass 低于期望 ⇒ 红）；没有 `TEST_DATABASE_URL` 时明确点名
-「这几条腿这次没跑」并 rc=1（不静默）。后续把其余 `test:integration:*` 接进来，只需往
-脚本的 `REQUIRED_LEGS` 加一条。
+「这几条腿这次没跑」并 rc=1（不静默）。**判红不重试**：重试是「没有诊断面时先止血」的产物，
+诊断面（红时打 `not ok` 切片）装上当天就抓到了真根因（拆库 57P01，修在 `pg-fixture.js` 的
+`guardPoolErrors` + 源码守卫禁裸建池），之后 30 次腿执行 0 次需要重试 ⇒ 重试只剩
+「把真 flake 变成绿日志」这一种效果，已拆掉（#758）。要跑第二遍由人显式 rerun。
+后续把其余 `test:integration:*` 接进来，只需往脚本的 `REQUIRED_LEGS` 加一条。
 
 **新增分钟（本地实测，非估算）**：**前两条**腿墙钟 `migrate-fresh-db` **17.8s** +
 `test:integration:prompts` **1.6s** ≈ **19s**（**前两条**的合计；第三条 `api-tokens-db` 的墙钟本文没实测，
