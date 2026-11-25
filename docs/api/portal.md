@@ -2554,8 +2554,12 @@ SELECT fde_id FROM fde_llm_bindings
 
 **`GET /api/file` 的 `mode` 参数**：`json`（缺省，旧行为）/ `stream` / `download`。stream 通道：
 单 Range → `206`（`Accept-Ranges: bytes`；不可满足 → `416`；多 Range/非法头当无 Range 降级整身 `200`）；
-MIME 白名单（图片/pdf/mp4/webm/mov/mp3/wav/ogg/m4a），**白名单外一律 `application/octet-stream`
+MIME 白名单（位图/pdf/mp4/webm/mov/mp3/wav/ogg/m4a），**白名单外一律 `application/octet-stream`
 且强制 `attachment`**，`text/html` 永不直出（同源 XSS 红线）；上限 512MB（`413`），不读进内存。
+所有流式响应都带 `X-Content-Type-Options: nosniff`（防浏览器把 octet-stream 嗅探成可执行文档）。
+**`.svg` 等活动内容一律降级为 `application/octet-stream` + `attachment`（不内联，issue #771）**：
+SVG 内嵌 `<script>`/`onload`，以 `image/svg+xml` 内联直出时脚本在 portal 源里执行，和 `text/html`
+是同一条红线。JSON 通道的 `.svg` 不变（`kind: 'image'` 的 data URL，前端 `<img>` 里的 SVG 不执行脚本）。
 JSON 通道的 415/413 同时写 `preview_miss_stats` 埋点（见下）。
 
 **`POST /api/preview-tickets`** `{cwd, path}` → `{ url: "/pv/<code>/onlinePreview", expires_in: 600 }`。
@@ -4043,7 +4047,7 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
 | GET | `/api/admin/fdes/:fdeName/sessions/:sessionId/events/history` | `limit` `before` `include_archived` | 同 §4.4a：`{ events, next_cursor }`（含合成 `partial_output` / `run_termination`） |
 | GET | `/api/admin/fdes/:fdeName/sessions/:sessionId/folded/:round` | `include_archived` | 同 §4.4b：`{ round, turns, source, truncated, dropped_messages }` |
 | GET | `/api/admin/fdes/:fdeName/files/tree` | `path`（缺省 `.`）`after`（`d:<name>`\|`f:<name>`）`limit` | `{ entries: [{name, type}], truncated, next_after }`；根 = 该工位的 `~/projects` |
-| GET | `/api/admin/fdes/:fdeName/file` | `path` `mode=json\|stream\|download`（+ `Range` 请求头） | 同 §4.11：`json` 回 `{name, path, kind, data}`；`stream`/`download` 直接写字节流（支持 206 / 416） |
+| GET | `/api/admin/fdes/:fdeName/file` | `path` `mode=json\|stream\|download`（+ `Range` 请求头） | 同 §4.11：`json` 回 `{name, path, kind, data}`；`stream`/`download` 直接写字节流（支持 206 / 416）；`.svg` 等活动内容一律降级为 `application/octet-stream` + `attachment`（不内联，#771） |
 
 参数口径：
 
