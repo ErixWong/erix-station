@@ -66,7 +66,7 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 
 临时栈起停命令见 §2.2。集成测试用 `node --test` 或独立脚本驱动，但**必须**满足 §2.2 的隔离与清理约定；判定 = 测试进程退出码 0 + 临时资源（容器/网络/数据卷）已清理（§2.2.4）。
 
-> **另一档集成：活栈 e2e（不新起隔离栈）**——`portal/integration/version-surface-e2e.mjs`（`npm run test:integration:version`）与 `portal/integration/seat-content-e2e.mjs`（`npm run test:integration:seat`）验的是**本机活着的那套栈**（admin 入口 `E2E_UI_BASE` 缺省 `https://admin.fde.erix.vip:9443`，口令只从 冷层记录的口令文件（见 `~/projects/docs/station-dev-machine.md`） 读）；HTTP 腿总是跑，浏览器腿要点名才跑：`E2E_UI=1 npm run test:integration:seat`（缺 playwright 容器则 skip，不算红）。
+> **另一档集成：活栈 e2e（不新起隔离栈）**——`portal/integration/version-surface-e2e.mjs`（`npm run test:integration:version`）与 `portal/integration/seat-content-e2e.mjs`（`npm run test:integration:seat`）验的是**本机活着的那套栈**（admin 入口 `E2E_UI_BASE` 缺省 `https://admin.fde.erix.vip:9443`，口令从 `~/.config/` 下 `mcp/creds/` 里的 dev 口令文件读（AGENTS §4 凭据目录口径；新路径优先、旧路径兜底；文件名与轮换见冷层 `~/projects/docs/station-dev-machine.md`；可用 env `ADMIN_PASSWORD_FILE` 点名覆盖）；HTTP 腿总是跑，浏览器腿要点名才跑：`E2E_UI=1 npm run test:integration:seat`（缺 playwright 容器则 skip，不算红）；点名（`E2E_UI=1` 或 `E2E_HTTP=1`）却找不到口令文件 ⇒ 脚本退 1，不许静默全 skip 拿 rc=0（假通过）；未点名仍允许 skip。
 
 #### 1.2.4 安全回归
 

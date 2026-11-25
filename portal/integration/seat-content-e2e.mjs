@@ -13,8 +13,9 @@
 //
 // 为什么这样写（沿用 version-surface 的约定，别处已论证，这里只记本单相关的几条）：
 //   1. admin host 是自签证书 ⇒ 本进程关 TLS 校验（只影响这个测试进程）。
-//   2. 口令只从 `~/.config/creds/station-dev-password-file` 读，**绝不 print**；送进容器
-//      走临时文件（命令行会被 `ps` 抄走），跑完尽力删（那是带口令的文件）。
+//   2. 口令只读凭据目录里 dev 口令文件（AGENTS.md §4：~/.config/ 下 mcp/creds/，
+//      旧路径留兜底），**绝不 print**；进容器走临时文件（防 `ps` 抄走），
+//      跑完尽力删（那是带口令的文件）。
 //   3. 走 docker 包装层时命令串**不许含换行**（version-surface 头注 F-6）。
 //   4. UI 腿把 playwright 留在**容器里**（`/app/node_modules/playwright`），仓库**不**加
 //      这个依赖；采集脚本自包含，断言全在外层做（容器里 assert 拿不到有用信息）。
@@ -43,8 +44,13 @@ const BASE = (process.env.E2E_BASE || process.env.E2E_UI_BASE || 'https://admin.
   .replace(/\/$/, '');
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
 const FDE = process.env.E2E_FDE || 'eric';
-const PASSWORD_FILE = (process.env.ADMIN_PASSWORD_FILE || '~/.config/creds/station-dev-password-file')
-  .replace(/^~/, os.homedir());
+// 凭据目录口径（AGENTS §4）：~/.config/ 下 mcp/creds/；env 点名只信 env
+const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
+  ? [process.env.ADMIN_PASSWORD_FILE]
+  : ['~/.config/mcp/creds/station-dev.password', '~/.config/creds/station-dev-password-file'])
+  .map((p) => p.replace(/^~/, os.homedir()));
+/** 报错文案用：缺口令时列出试过的路径（新前旧后）。 */
+const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
 const UI_ENABLED = process.env.E2E_UI === '1';
 const PW_CONTAINER = process.env.PLAYWRIGHT_CONTAINER || 'erix_station_playwright';
 const PW_MODULE = '/app/node_modules/playwright/index.mjs';
@@ -167,11 +173,15 @@ function httpRequest(urlStr, { method = 'GET', body, headers = {}, timeoutMs = 1
   });
 }
 
+/** 先新后旧取第一个存在的；空文件视同没有 ⇒ null。 */
 function readPassword() {
-  if (!fs.existsSync(PASSWORD_FILE)) return null;
-  const value = fs.readFileSync(PASSWORD_FILE, 'utf8').trim();
+  const file = PASSWORD_FILE_CANDIDATES.find((p) => fs.existsSync(p));
+  if (!file) return null;
+  const value = fs.readFileSync(file, 'utf8').trim();
   return value === '' ? null : value;
 }
+// 哨兵用：模块加载就读一次，不依赖 gather 是否提前 return。
+const CRED_PASSWORD = readPassword();
 
 /** 带会话 cookie 打一个 admin 只读端点（query 用对象传，URL.searchParams 负责编码）。 */
 function adminGet(p, { params = {}, timeoutMs = 20_000 } = {}) {
@@ -557,5 +567,26 @@ test('U1 真浏览器进 `#/admin/seat-content`：会话行 + 文件树 + 对话
       tryQuiet(() => dockerRun(`exec ${PW_CONTAINER} sh -c "rm -f ${scriptIn} ${cfgIn}"`, { timeout: 30_000 }));
       tryQuiet(() => fs.rmSync(scriptHost, { force: true }));
       tryQuiet(() => fs.rmSync(cfgHost, { force: true }));
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// 哨兵用例：禁止「点名了却整腿静默 skip」的假通过。
+// 为什么：E2E_UI=1 点名要跑，口令文件却不在 ⇒ 所有用例 skip、rc=0，
+// 和真跑同色——这就是「假通过」，本仓反复在治的病。
+// 点名 = E2E_UI=1（UI 腿）或 E2E_HTTP=1（显式要求 HTTP 腿必须能跑）。
+// 未点名（默认）仍允许 skip：本地没有 dev 栈也得能跑 npm test。
+// ---------------------------------------------------------------------------
+const E2E_REQUESTED = UI_ENABLED || process.env.E2E_HTTP === '1';
+test('哨兵：点名要跑时口令文件必须存在（禁止静默全 skip）',
+  { timeout: 10_000 }, (t) => {
+    if (!E2E_REQUESTED) {
+      t.diagnostic('未点名 ⇒ 允许 skip（本地没有 dev 栈也能跑 npm test）');
+      return;
+    }
+    if (CRED_PASSWORD === null) {
+      assert.fail(`点名要跑却没找到口令文件（试过 ${PASSWORD_FILE}）：`
+        + '全腿静默 skip 会让 rc=0 与真跑同色（假通过）⇒ 判失败。'
+        + '修法：放好凭据文件，或用 ADMIN_PASSWORD_FILE 指过去。');
     }
   });
