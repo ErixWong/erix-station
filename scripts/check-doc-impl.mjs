@@ -12,8 +12,8 @@
 //  - 实现里有、文档没登记、又没豁免 ⇒ 红（缺登记）；
 //  - 已在文档里对得上、却仍留在豁免表 ⇒ 也红（防豁免堆积）；
 //  - 豁免行缺 reason、或 reason 不含 issue 号 ⇒ 红。
-// --sync 对账豁免表：补进「缺登记」条目（reason 用占位文案），
-//  并删掉「文档已能对上」的失效条目——豁免表跟着事实走，不需要人肉定期清理。
+// --sync 自举豁免表：把当前「缺登记」条目追加进豁免清单
+//  （reason 用占位文案）。只追加、不删、不改，删豁免永远是人的决定。
 //
 // 抽取面口径（诚实的洞，写在明处）：
 //  - 「有契约」= docs/api/portal.md 的索引表行（`| … \`M /p\` |`）或
@@ -570,26 +570,24 @@ function main() {
   const results = {};
   for (const s of secs) results[s] = CHECKS[s].fn(ex);
 
-  // —— --sync：对账豁免表（补缺 + 删失效）
+  // —— --sync：把「缺登记」追加进豁免清单（已有条目不动）
   if (sync) {
     let added = 0;
-    let dropped = 0;
     for (const s of secs) {
       const list = exList(ex, s);
-      const key = CHECKS[s].key;
-      const stale = new Set(results[s].filter((r) => r.kind === 'stale-ex').map((r) => r.entry));
-      const kept = list.filter((e) => !stale.has(e[key]));
-      dropped += list.length - kept.length;
-      const known = new Set(kept.map((e) => e[key]));
+      const known = new Set(list.map((e) => e[CHECKS[s].key]));
       for (const r of results[s]) {
         if (r.kind !== 'missing' || known.has(r.entry)) continue;
-        kept.push({ [key]: r.entry, reason: '待补真实理由（#777 S1 --sync 自举占位）' });
+        list.push({
+          [CHECKS[s].key]: r.entry,
+          reason: '待补真实理由（#777 S1 --sync 自举占位）',
+        });
         added += 1;
       }
-      ex[s] = kept;
+      ex[s] = list;
     }
     writeFileSync(EXC, JSON.stringify(ex, null, 2) + '\n');
-    say(`sync: 补 ${added} 条、删 ${dropped} 条失效豁免，写入 ${path.relative(ROOT, EXC)}`);
+    say(`sync: 追加 ${added} 条豁免，写入 ${path.relative(ROOT, EXC)}`);
     return 0;
   }
 
