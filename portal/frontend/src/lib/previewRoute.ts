@@ -23,7 +23,11 @@ export const PDF_EXTS = ['pdf'];
 export const VIDEO_EXTS = ['mp4', 'webm', 'm4v', 'mov'];
 export const AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'm4a'];
 
-/** kkFileView 桶（#356 清单的 kkfile 半区）：Office / 压缩包 / CAD / 电子书。 */
+/**
+ * kkFileView 桶（#356 清单的 kkfile 半区）：Office / 压缩包 / CAD / 电子书。
+ * #795 起**不再被 previewChannel 使用**（office/zip 改走前端渲染，其余降级 other）；
+ * 常量暂留是因为 kkfile 通道本体（previewproxy.js / /pv / 签票）尚未下线，下一阶段一并删。
+ */
 export const KKFILE_EXTS = [
   // Office
   'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'wps', 'et', 'dps', 'visio', 'vsd', 'vsdx', 'msword',
@@ -33,7 +37,20 @@ export const KKFILE_EXTS = [
   'cad', 'dwg', 'dxf', 'psd', 'eps', 'tif', 'tiff', 'ceb', 'epub', 'chm', 'ofd',
 ];
 
-export type PreviewChannel = 'native-json' | 'native-stream' | 'kkfile' | 'other';
+/**
+ * #795 前端渲染桶（不再经 kkFileView）：这四个扩展名有对应的前端渲染库，
+ * 组件按扩展名选（docx→docx-preview，xlsx/xls→xlsx，pptx→pptx-preview）。
+ */
+export const OFFICE_EXTS = ['docx', 'xlsx', 'xls', 'pptx'];
+
+/** 前端只列目录不解压的桶（jszip.loadAsync）。 */
+export const ZIP_EXTS = ['zip'];
+
+/** 前端渲染的字节上限（20MB）：超过一律降级下载——渲染会在主线程上把页面卡死。 */
+export const OFFICE_MAX_BYTES = 20 * 1024 * 1024;
+
+export type PreviewChannel =
+  'native-json' | 'native-stream' | 'native-office' | 'native-zip' | 'kkfile' | 'other';
 
 /** 取小写扩展名（无点；隐藏文件去点按整名计，.env 算 env、.gitignore 算 gitignore；目录尾斜杠 → ''）。 */
 export function extOf(path: string): string {
@@ -50,12 +67,15 @@ export function isMarkdownName(name: string): boolean {
   return /\.(md|markdown)$/i.test(String(name ?? ''));
 }
 
-/** 扩展名 → 预览通道。清单外一律 other（不猜）。 */
+/** 扩展名 → 预览通道。清单外一律 other（不猜）；kkfile 分支已死（#795），不再产出。 */
 export function previewChannel(path: string): PreviewChannel {
   const ext = extOf(path);
   if (IMAGE_EXTS.includes(ext) || TEXT_EXTS.includes(ext)) return 'native-json';
-  if (PDF_EXTS.includes(ext) || VIDEO_EXTS.includes(ext) || AUDIO_EXTS.includes(ext)) return 'native-stream';
-  if (KKFILE_EXTS.includes(ext)) return 'kkfile';
+  if (PDF_EXTS.includes(ext) || VIDEO_EXTS.includes(ext) || AUDIO_EXTS.includes(ext)) {
+    return 'native-stream';
+  }
+  if (OFFICE_EXTS.includes(ext)) return 'native-office';
+  if (ZIP_EXTS.includes(ext)) return 'native-zip';
   return 'other';
 }
 
