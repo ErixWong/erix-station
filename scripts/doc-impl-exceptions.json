@@ -171,38 +171,6 @@
       "reason": "退役表（0010 改名、0032 撤除）的枚举值不在 model.md 枚举账里；#777 S1 抓到，修刀决定登记或加退役标注（#777 D 组）"
     },
     {
-      "entry": "column:transcript_rounds.dedup_key",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:fde_onboarding",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "column:users.must_change_password",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:port_observations",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:preview_miss_stats",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:preview_miss_stats.kind=binary",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:preview_miss_stats.kind=too_large",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "column:users.totp_login_enabled",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
       "entry": "check:macro_runs.verdict=pass",
       "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
     },
@@ -216,86 +184,6 @@
     },
     {
       "entry": "check:macro_runs.verdict=unclassified",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:upload_settings",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "column:chat_sessions.origin",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:capability_items",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:capability_items.kind=skill",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:capability_items.kind=mcp",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:capability_items.state=draft",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:capability_files",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:fde_capability_installs",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:capability_params",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:capability_params.kind=config",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:capability_params.inject=context",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:capability_params.inject=header",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:capability_param_values",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "column:capability_param_values.value_plain",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:platform_prompts",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "table:runtime_settings",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "column:fde_llm_bindings.budget_usd",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "column:fde_llm_bindings.budget_period",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:fde_llm_bindings.budget_period=1d",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:fde_llm_bindings.budget_period=1mo",
       "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
     }
   ],
