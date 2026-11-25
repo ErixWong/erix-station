@@ -9717,11 +9717,11 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
 
 **搬移去向**（先落冷层再从热层删，一条不丢）：
 
-- `docs/testing.md` **§1.3.1** 六条本机测试坑（`npx vitest` 挂死、vitest 全绿而 rc=1、
+- `docs/testing.md` **§1.3.1**〔**已悬空**：`docs-261124-31` 把 §1.3.x 并成单个 §1.3，六条坑的现值随后出仓到机器全局冷层 `station-dev-machine.md`；本文不改历史正文，只补注坐标〕六条本机测试坑（`npx vitest` 挂死、vitest 全绿而 rc=1、
   `NODE_ENV=production` 假红、worktree 缺 `node_modules` 与 120000 符号链接史、项数 1022→510、
-  devDependencies 装不上）；**§1.3.2** dev 栈登录事实与探针口径（入口、两账号第二因素、口令文件、
+  devDependencies 装不上）；**§1.3.2**〔同上，现坐标 = `docs/testing.md` §1.3〕dev 栈登录事实与探针口径（入口、两账号第二因素、口令文件、
   密码重置）。热层各留一行判据。
-- `docs/env.md` **§8.1.1**（新增）内网 DNS `dns.internal` 把 `github.com` 钉到半死地址、本机
+- `docs/env.md` **§8.1.1**（新增；〔**已悬空**：`docs-261124-31` 把 env §8 的实测数值整节搬出本仓 ⇒ 现值在机器全局冷层 `station-dev-machine.md`〕）内网 DNS `dns.internal` 把 `github.com` 钉到半死地址、本机
   `http.*` 配置实测、显式代理命令与「别在全局 env 设 `HTTP(S)_PROXY`」。
 - `docs/design/fde-platform.md` **§11.4** 末尾追加 LiteLLM 事实面（profile 起栈、虚拟 key 明文为何
   入库、迁移 `0010` 清了旧 `api_key`、credential 无启停语义、`litellm_params.model` 不自动加前缀、
@@ -9754,6 +9754,7 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
    假事实正是漏网的。加模式必须配套夹具，否则闸会变成新的假绿发生器。
 3. 全局冷层 `~/projects/docs/git-github-ops.md`（源 `pi-tools/docs/`，**另一个项目的树**）才是
    GitHub 网络事实的规范家；本单只在**本仓** `docs/env.md` §8.1.1 落了一份，跨项目 git 写未做。
+   〔后续：该坐标已随 `docs-261124-31` 出仓，现值 ⇒ 机器全局冷层 `station-dev-machine.md`；见 §8.203〕
 4. **挑号判据要升级**：热层现在写的是「挑号前先 `grep -n '^### 8\.' docs/maintenance/task-ledger.md
    | tail -3`」——**这只查自己的树**。本单 20 分钟内撞两次（上面那条），另一 session 同轮也撞了。
    建议改成：先 `git fetch`，在 `origin/main` 上查末尾
@@ -9810,7 +9811,7 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
   `auth.token_created`/`auth.token_revoked` 两条且 `details` 无明文，库里 `token_hash` 长 64。探针令牌已
   `DELETE`（不在 dev 库留外部凭据）。**顺带撞出一个开发流程坑**：`.env` 里 `STATION_PORTAL_IMAGE` 默认是
   发布件的 digest 引用，裸跑 `docker compose build station-portal` 直接 `refusing to create a tag with a
-  digest reference` —— 已在 `docs/testing.md` §1.3.2 写明要用本地 tag 覆盖；③ 与本单无关的 CI 噪声记录：本 PR 之前该仓 CI 出现过一次 `#727-5b` `500 !== 200`
+  digest reference` —— 已在 `docs/testing.md` §1.3.2〔现坐标 §1.3，见 §8.203〕写明要用本地 tag 覆盖；③ 与本单无关的 CI 噪声记录：本 PR 之前该仓 CI 出现过一次 `#727-5b` `500 !== 200`
   （已由 **#745** 修）与两次 20 分钟取消（`concurrency` 挤兑，重跑即绿：`#741` 重跑后 3m14s pass）。
 
 ### 8.194 发版切号 0.1.76 → 0.1.77（2026-11-24，主 agent，工单 `chore-261124-29-bump-0.1.77`）
@@ -9836,7 +9837,7 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
 满屏 `ERR_MODULE_NOT_FOUND: Cannot find package 'erix-agent'`——`package-lock.json` 里写着
 `node_modules/erix-agent 0.33.0`，而本地树的 `node_modules` 里没有它（#743 在 18:19 改了依赖面）。
 `npm ci --prefer-offline` 一次就全绿。**这正是刚从热层搬走的那条判据**（`AGENTS.md` §4
-「验收 / 发版前先重装依赖再复跑拿基线」，细节在 `docs/testing.md` §1.3.1）第一次真挡住一次假红。
+「验收 / 发版前先重装依赖再复跑拿基线」，细节在 `docs/testing.md` §1.3.1〔现坐标 §1.3 + 机器全局冷层，见 §8.203〕）第一次真挡住一次假红。
 
 **本次发版包含什么**（`v0.1.76..origin/main`，45 PR，节选）：管理台运行时设置面
 （#700/#701/#704/#706/#709/#710）、FDE 周期额度（#722/#731）、工位内容只读浏览（#729/#735/#743）、
@@ -10101,3 +10102,50 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
    补做代码审查后 5 分钟就挖出来。以后安全敏感面（渲染 / 文件流 / 权限边界）合入前应过一遍独立代码审查。
 2. **报安全问题必须带三个数**：触发概率 × 影响面 × 平台规模。只报 severity 标签会把自己带进
    「发现 MAJOR 就必须立刻发补丁」的过度反应。
+
+### 8.203 分层整理：热层回潮止血 + 台账 6 处坐标补注 + 重落 v0.1.77 发版记录（2026-11-25，主 agent，代号 `docs-261125-09-layer-tidy`）
+
+**为什么有这一单**：§8.192 清退（19366 → 8798）之后 20 小时，热层涨回 10214（预算 10240，只剩 26 字节）。
+现验归因：**涨的部分大多是合格 policy**（API 令牌面、`check:doc-portable` 闸、`agent01` 脚本账号、
+注释按类别写），**夹带的 fact 只有两处**——正是 §8.192 残余第 2 条预言的那两类句式。
+
+**改了什么**（全部 `git show origin/main:<路径>` 现验坐标，热层 10214 → **10037**）：
+
+| 位置（原坐标） | 处置 | 依据 |
+|---|---|---|
+| §4.1「API 令牌**当前已停用**（`TOKEN_ROUTES_ENABLED=false` ⇒ 三端点 404；库里 0 枚 ⇒ Bearer 恒 401）」 | 读数出热层，改写成祈使句「别用 Bearer 打 API，脚本一律登 `agent01` 走会话」+ 指针（台账 §8.200 / 契约 §2.13） | 「三端点 404 / 库里 0 枚」是当下读数，`BANNED` 抓不到，哪天启用开关它就变第二条 §8.192 里那条 `max_budget` |
+| §6「**证据段落是身份与坐标的集中营**——261124 工作邮箱泄露，就是抄了收件人」 | 事故成因出热层（本条接手），热层只留「只写形态，不写值」+ 指向本条 | 前半句是 policy，后半句是日期 + 事件；那条 commit 自己写着「成因写进热层」 |
+| §7 D8 段「产物捕获目标是项目目录」 | 删（事实，附录 A.1 已有） | 不改变任何下一轮决定 |
+| §7 D9 段括注「附录 A 的 `D9` 是『认证放边缘』，编号撞车」 | 压成「引 `D9` 必带 issue 号（理由 ⇒ 附录 A.3）」 | 与 `docs/design/fde-platform.md` **附录 A.3** 逐字重复 = 第二本账 |
+
+**台账 6 处悬空坐标补注**（`grep -n '§1\.3\.[12]\|§8\.1\.1' docs/maintenance/task-ledger.md` 现列，
+逐条 `〔〕` 就地补注，**不改历史正文**）：`§8.192` 三处、`§8.194` 一处、`§8.197` 一处、`§8.202` 附近一处。
+根因：后续 `docs-261124-31` 把 `docs/testing.md` §1.3.x 并成单个 §1.3、并把 `docs/env.md` §8 的实测数值
+**整节搬出本仓**（判据是「仓库必须可公开」，方向比 §8.192 更对）——**内容没丢**（现值在机器全局冷层
+`station-dev-machine.md`，六条坑逐条 grep 命中），但**坐标断了而闸不查坐标**：
+`check:agents-hotlayer` 只数 `§8.N` 的引用地板，`check:doc-portable` 只管可移植性。
+**我自己就是当事人**——`§8.194` 里那句「细节在 `docs/testing.md` §1.3.1」写完没多久家就没了。
+
+**重落：v0.1.77 发版记录（原 §8.195 丢失经过记明）**
+
+- 原记录写在 `docs-261124-30-release-0177`（commit `782e34f4`），PR #750。**它没进 main**：
+  并行 session 复用了同一个远端分支名（`git ls-remote` 现查远端 tip 已不是我的提交），GitHub 因此
+  **auto-close** 了 #750（`gh pr view` = `state: CLOSED`、`no commit found on the pull request`），
+  本地分支也被改名成 `old-stale-261124-30`；同号 `§8.195` 随后被另一单占用（现在是 #759 宏模板界面）。
+- 从对象库 `git show 782e34f4` 找回原文，改号重落本条。**教训**：§8.192 残余第 4 条（挑号先 `git fetch`
+  再在 `origin/main` 上查）只解决编号，**不解决分支名复用**——分支名也要带可辨识代号且**推完立刻开 PR、
+  PR 合并前别让别人复用**；判据：`git ls-remote --heads origin '<本单分支名>'` 的 tip 必须等于本地 HEAD。
+
+**发布事实（重述，全部已在 §8.194 现验过，这里只搬运）**：tag `v0.1.77` → `c1cf963`；
+`release.yml` run `45389514884` ✓；三镜像 digest：portal `sha256:d511080b…73d591`、
+fde `sha256:a3be4287…8962ea`、fde-proxy `sha256:2064623f…40c61`（完整值见 run 45389514884 的
+job summary 与 artifact `images-digest`，ID `14918481157`）；GitHub Release 不存在属预期（tag push 不建）。
+**发布后四步未做**：`deploy/.env` pin、`up -d`、**必须重建 FDE 容器**（`runner/worker.js` 有改动）、
+**本次含 `deploy/litellm/config.yaml` 改动 ⇒ `up -d` 不重启 `station-litellm`，要显式 restart**。
+
+**残余（本单没做，都有判据不挂版本号）**：① 闸不查悬空坐标（可加：抽 `§X.Y` / 文件名引用，
+在被指对象里 grep 标题，指不到即红；误报风险 = 引用外部仓库的坐标，需白名单）；
+② `--sync` 不要求理由（棘轮）；③ `BANNED` 抓不到「当前已停用 / 库里 0 枚」这类当下读数；
+④ 挑号与分支名复用判据未写进热层 §6 与 §8 末。
+另：本单派了 copilot 只读审计整个分层（热层 + 本仓冷层 + 机器全局冷层 + 闸缺口），
+结论落到另一单，本条只记「已派、runId `cp-2611251548-c6u274`」，不预写它还没给出的结论。

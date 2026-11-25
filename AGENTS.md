@@ -62,8 +62,8 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
   不卡第二因素；口令路径与 dev 入口 ⇒ 冷层；`Origin` 要求 ⇒ `docs/testing.md` §1.3）。
   **别登人的账号**——开着邮箱验证码的账号每登一次寄一封真邮件，而脚本读不到那枚码（两封信 ⇒ §8.187）
 - 要管理员面就登 `admin`；要测第二因素：自建带 TOTP 的种子账号走 step1+step2（做法同 §1.3）
-- API 令牌（仅 admin 可签、不过期）**当前已停用**（`http.js` 的 `TOKEN_ROUTES_ENABLED=false` ⇒ 三端点 404；认证缝保留、库里 0 枚 ⇒ Bearer 恒 401；启用=改这一个常量）
-  （契约 ⇒ `docs/api/portal.md` §2.13；停用+启用 ⇒ 台账 §8.200）
+- **别用 `Authorization: Bearer` 打 API**（令牌路由当前关着；关的是路由、能力保留），**脚本一律登 `agent01` 走会话**；
+  现场与启用开关 ⇒ 台账 §8.200（契约 ⇒ `docs/api/portal.md` §2.13）
 
 ### 4.2 LLM 网关（LiteLLM）
 
@@ -97,7 +97,7 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 - **仓库文档必须可公开**：本机/内网坐标（内网 IP、tailnet IP、内网主机名、凭据文件路径、宿主端口占用、dev 账号名）不写进本仓库，一律放 `~/projects/docs/`，仓库里只留指针与现验判据；闸 `npm run check:doc-portable`（经 `npm test` 跑到）。
 - **证据与依据只写形态，不写值**：验收记账写「寄到该账号绑定的邮箱并收到」，**不写**邮箱地址 /
   主机名 / 绝对路径 / 端口；注释写「存量里有带下划线的」，**不写**真实目录名 / 容器名 / 入口地址。
-  **证据段落是身份与坐标的集中营**——261124 工作邮箱泄露，就是「证明真发出去了」时抄了收件人。
+  **证据段落是身份与坐标的集中营**（成因与现场 ⇒ 台账 §8.203）。
 
 ### 6.1 代码 PR 评审要求（合并前主 agent 必须亲自做完；文档 PR 不强制）
 
@@ -118,15 +118,13 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 - D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree（**已修订** ↓）；
   D9 目录 git 状态 = 一颗红/黄/绿灯（issue #359 ↓）
 
-- **D8 已修订（附录 A.1）**：隔离单元 = **项目目录（cwd）**，`prepareWorktree` / `cleanupWorktree` 已拆除，
-  产物捕获目标是项目目录；agent 弄脏项目由用户 git 自治，真要并行跑同一项目再按项目粒度加执行锁——
-  **不预支 worktree 复杂度**
+- **D8 已修订（附录 A.1）**：隔离单元 = **项目目录（cwd）**，`prepareWorktree` / `cleanupWorktree` 已拆除；
+  agent 弄脏项目由用户 git 自治，真要并行跑同一项目再按项目粒度加执行锁——**不预支 worktree 复杂度**
 - **D9（issue #359）收工灯**：灯 = **收工进度**，一句话判据「每天忙完之后要保证它是绿的」；
   🔴 未落地 → 🟡 未推送 → 🟢 已收工，**⚪ 不得渲染成绿**；**未跟踪与未提交同罪归红**；红是进度不是警报，
   措辞用状态词、不给告警底色。**portal 零 git 写**（不 init / commit / push / checkout / 代 clone），
   写一律走 run，「让 AI 收尾」**只预填不自动发**；数据源 `git status --porcelain -uall`，
-  **不得用 `-uno`**（实测它会撒谎）。四态语义、实测与成本上界 ⇒ 附录 A.2（附录 A 的 `D9` 是
-  「认证放边缘」，编号撞车，**引用必须带 issue 号**）
+  **不得用 `-uno`**（实测它会撒谎）。四态语义、实测与成本上界 ⇒ 附录 A.2；**引 `D9` 必带 issue 号**（理由 ⇒ 附录 A.3）
 
 ## 8. erix-agent 依赖与升级
 
