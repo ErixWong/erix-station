@@ -19,7 +19,7 @@
 //   W-6  迁移回填只动 `last_activity_at IS NULL` 的行（重放第二遍 = 零行）
 //
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB / docker / 网络。
-// fake 红线（AGENTS §8.14）：**按 SQL 说的做** —— 未覆盖的语句一律抛错，不心软放行。
+// fake 红线：**按 SQL 说的做** —— 未覆盖的语句一律抛错，不心软放行。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

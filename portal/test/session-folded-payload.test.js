@@ -6,7 +6,7 @@
 //   就从同会话已有轮行重建（`source:'rebuilt'`），归档退成回退路（`source:'archive'`），404 语义收窄。
 // 变异自证（一轮一还原，AGENTS 惯例）：① `range` 强制 null ⇒ 恰「空差分/夹断/取全」三格红（旧四格不受影响）；
 //   ② `truncated` 写死 false ⇒ 恰「夹断」一格红；③ 末尾源码级哨兵钉住重建 SQL 的筛除与上限——fake pool
-//   是**自己模拟**了 `messages <> '[]'::jsonb` 的，不钉就是假绿面（AGENTS §8.42「fake 必须模拟真库约束」）。
+//   是**自己模拟**了 `messages <> '[]'::jsonb` 的，不钉就是假绿面（「fake 必须模拟真库约束」）。
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB（harness 同 session-events-history.test.js）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -79,7 +79,7 @@ class FoldedPayloadPool extends FakePool {
       // 对齐 #195 回退后的 SQL：无 IS NOT NULL 过滤，行面含 folded_payload 与 record（列 NULL 时靠 record 回退）。
       // ⚠ **不能 `slice(0, 1)`**：真库同一 round 有多行，而折叠指针只长在**最后**那一行上
       //（真机 round 100 共 4 行、折叠行 append_seq 1821）。fake 只回第一行就等于把「挑错行」这个
-      // 病从测试里抹掉 ⇒ 这里是 AGENTS §8.42「fake 必须模拟真库形状」的正例。
+      // 病从测试里抹掉 ⇒ 这里是 「fake 必须模拟真库形状」的正例。
       const [key, round, limit = 64] = params;
       const rows = this.transcriptRows
         .filter((x) => x.transcript_key === key && x.round === round)

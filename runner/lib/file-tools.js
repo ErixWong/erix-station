@@ -20,7 +20,7 @@
 //
 // 文件工具（本文件后半，issue #228）：曾经的 0.3.5 fork executor（readFile/rg/tree/writeFile）已于
 // issue #228 退役，改为装配上游 erix-agent 0.18.0 的 `createFileTools`（`createStationFileTools`）。
-// jail 不是 fork 的一部分，它是宿主边界；fork 演进的终点见 AGENTS.md §8.9 与 docs/design/runner-integration.md。
+// jail 不是 fork 的一部分，它是宿主边界；fork 演进的终点见 docs/design/runner-integration.md。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';

@@ -489,7 +489,7 @@ test('#288 刻意保守：上游 createFileTools 未标注 replay ⇒ 5 个文�
   assert.match(upstreamSrc, /createFileTools|file-tools/i, '上游文件工具源码要读得到（包结构变了就更新本读点）');
   assert.doesNotMatch(upstreamSrc, /\breplay\s*:/,
     '上游文件工具源码里没有任何 replay 标注。若将来上游标了 safe，'
-    + '本断言变红 = 该重新评估「文件工具挂起时到底要不要重放」（见 AGENTS §8.22）');
+    + '本断言变红 = 该重新评估「文件工具挂起时到底要不要重放」');
 
   const schemas = fileSchemas();
   assert.ok(schemas.length >= 5, `文件工具应有 5 个，实际 ${schemas.length}`);

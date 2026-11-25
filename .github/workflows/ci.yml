@@ -281,7 +281,7 @@ jobs:
       # 缺文件（没烘）/ station_version 与仓库不符（烘错了树或 ARG 传错）/ revision 不是本次 commit
       # （没传 STATION_REVISION）/ built_at 或 engine_version 是 unknown 都算红。
       # 判据本身的负例自证（本地两种构建各跑一次）见 `portal/test/version-surface.test.js` 与
-      # `docs/maintenance/task-ledger.md` 的本单账。
+      # `portal/test/version-surface.test.js` 的负例自证。
       - name: '构建校验：station-portal 镜像的 build-info.json（版本/修订真烘进去了吗）'
         if: needs.gate.outputs.build_portal == 'true'
         run: |

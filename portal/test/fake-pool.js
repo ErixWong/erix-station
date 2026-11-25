@@ -39,7 +39,7 @@ export class FakePool {
   }
 
   /**
-   * #472 片 A：fake 的「按 SQL 说的做」（AGENTS §8.14）—— 只有 SELECT 里真的写了 `file_upload_enabled`
+   * #472 片 A：fake 的「按 SQL 说的做」—— 只有 SELECT 里真的写了 `file_upload_enabled`
    * 才回这一列。产品代码漏补列 ⇒ 行里拿不到它 ⇒ `=== true` 得 false ⇒ 用例会红，
    * 而不是被 fake 好心兼平成假绿。
    *
@@ -207,7 +207,7 @@ export class FakePool {
             fde_name: u.fde_name,
             auth_source: u.auth_source,
             status: u.status,
-            // #255：受限会话门的判据就读这一列。**按 SQL 说的做**（AGENTS §8.14）：SELECT 里没这一列
+            // #255：受限会话门的判据就读这一列。**按 SQL 说的做**：SELECT 里没这一列
             // 就不回这一列（=> 产品代码 `=== true` 得 false）⇒ 实现漏选这一列时门会失效、用例会红，
             // 而不是由 fake 好心兼平。没声明该列的 users 行一律按 false（不被要求改密）。
             must_change_password: sql.includes('must_change_password') ? u.must_change_password === true : undefined,
@@ -298,7 +298,7 @@ export class FakePool {
     }
 
     // ---- #449：邮件通道配置（mail_settings 单行表） ----
-    // 写侧（管理台 PUT）：**单条 upsert**，按 SQL 文本真模拟——不把新 SQL 当未知放行（AGENTS §8.14 同族）。
+    // 写侧（管理台 PUT）：**单条 upsert**，按 SQL 文本真模拟——不把新 SQL 当未知放行。
     // 同时把迁移 0026 的两条约束当 DB 事实执行：① 只能有一行（id = 1）；② `transport='smtp'` 时
     // host/from 必须非空（半套配置不许落库）。产品侧校验漏了这两条时这里会炸 ⇒ 用例变红而不是静默绿。
     if (sql.includes('INSERT INTO mail_settings')) {
@@ -338,7 +338,7 @@ export class FakePool {
     }
 
     // ---- #485 片 A：单文件上传上限（upload_settings 单行表，迁移 0035/0036）----
-    // 写侧按 SQL 文本真模拟（AGENTS §8.14 “不把新 SQL 当未知放行”），并把迁移 0035 的两条
+    // 写侧按 SQL 文本真模拟（ “不把新 SQL 当未知放行”），并把迁移 0035 的两条
     // 约束当 **DB 事实**执行：① 只能有一行（id = 1）；② `CHECK (max_file_bytes > 0)`。
     // 产品侧漏了这两条时 fake 会炸 ⇒ 用例变红，而不是静默存下一个“半个值”。
     if (sql.includes('INSERT INTO upload_settings')) {
@@ -379,7 +379,7 @@ export class FakePool {
       // ⚠ **`max_file_bytes` 回字符串**，这不是手误：它是 `bigint`（int8），node-pg 对 int8 **默认就回
       // 字符串**（不自动转 number，怕超 2^53 丢精度）。fake 必须复制这个形状，否则产品侧一个
       // `Number(row.max_file_bytes)` / `parseInt(row.max_file_bytes)` 的错误在单测里是绿的，到真库上才锈
-      // （`parseInt('1e4') === 1` 那族，台账 §8.126）。
+      // （`parseInt('1e4') === 1` 那族）。
       return {
         rows: this.uploadSettings
           ? [{ ...this.uploadSettings, max_file_bytes: String(this.uploadSettings.max_file_bytes) }]
@@ -493,7 +493,7 @@ export class FakePool {
       return { rows: [], rowCount: 1 };
     }
 
-    // 成功消费：单条原子 UPDATE。谓词**按 SQL 文本真解析**（AGENTS §8.14）：产品侧少写
+    // 成功消费：单条原子 UPDATE。谓词**按 SQL 文本真解析**：产品侧少写
     // `AND consumed_at IS NULL` / 少写过期或次数谓词时，fake 必须跟着放宽 ⇒ 「重放保护」这条防线
     // 才在单测里有牙（评审返修 ③ 的变异就落在这里：删掉 consumed_at 谓词必须让重放用例变红）。
     if (sql.includes('UPDATE login_email_codes') && sql.includes('code_hash = $3')) {
@@ -534,7 +534,7 @@ export class FakePool {
     }
 
     if (sql.includes('login_email_codes')) {
-      // 严格 fake：没认出来的 SQL 直接炸，不静默返回空行（AGENTS §8.14 同族）。
+      // 严格 fake：没认出来的 SQL 直接炸，不静默返回空行。
       throw new Error(`fake: 未识别的 login_email_codes SQL：${sql.replace(/\s+/g, ' ').slice(0, 160)}`);
     }
 

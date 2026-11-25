@@ -39,7 +39,7 @@ const read = (rel) => fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
 /** dev 库 `f4dfea1d-c439-4bba-ac34-4c86d7132bea` 的真样本（取自 `run_events.type='round_end'` 的 `final_text`）。 */
 const SAMPLE_DSML = ['<｜｜DSML｜｜tool_calls>', '<｜｜DSML｜｜tool',
   '  name = "writeFile"',
-  '  arguments = { "path": "docs/maintenance/task-ledger.md", "content": "…" }',
+  '  arguments = { "path": "docs/design/fde-platform.md", "content": "…" }',
   '/>'].join('\n');
 
 function harness() {

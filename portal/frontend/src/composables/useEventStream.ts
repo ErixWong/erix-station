@@ -138,7 +138,7 @@ const HISTORY_REPLAY_TYPES = new Set([
   'attempt_killed',
   // issue #288（缺陷 C）：「挂起工具未重放」的**回放**这一半。与 `http.js` 的 HISTORY_EVENT_TYPES
   // 与上方 EVENT_TYPES 是**三处独立存亡的集合**（只加一边分别会「实时收不到」或「刷新后消失」，
-  // 本分支已用变异逐条证明过），口径见 docs/api/portal.md §5.3 第 15 行与 AGENTS §8.22。
+  // 本分支已用变异逐条证明过），口径见 docs/api/portal.md §5.3 第 15 行与 。
   'tool_replay_decision_required',
   // issue #371-A：与上面 `EVENT_TYPES` 与 `http.js` 的 `HISTORY_EVENT_TYPES` **同步**加（三处只加
   // 一边就分别得到「实时收不到」或「刷新后消失」）。它是展示类、不驱动运行态状态机：
@@ -1307,7 +1307,7 @@ export function useEventStream(hooks: EventStreamHooks) {
           // issue #236：分级与取词收敛到 `runEndLine`（与历史合成项 `run_termination` 共用），红色集合
           // 从 `RUN_FAIL_REASONS` 改为 `RUN_TERMINATION_SYSERR_REASONS`（= 它减掉 `aborted`）：
           // 用户按停止不是故障 ⇒ 中性分隔条；`failed` / `max_rounds_cap` / `persistence_failed` /
-          // `final_guard_unverified` 仍然红（**没有把红色降级成中性**，AGENTS §8.7 的判据不变）。
+          // `final_guard_unverified` 仍然红。
           const line = runEndLine(reason, d.termination, usage);
           if (line.sysErr) hooks.onSysErr(line.text);
           else hooks.onSep(line.text);

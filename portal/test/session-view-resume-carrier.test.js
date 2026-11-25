@@ -19,7 +19,7 @@
 //      `ORDER BY round, append_seq`；`projectSessionMessages` 内部再用 `compareTranscriptRows`
 //      的 `(round, created_at)` 稳定重排，两者一致时即 append_seq 序的第一个）。折叠/投影两侧都钉。
 //
-// 纪律（照工单与 AGENTS §8.24）：
+// 纪律：
 //   · **判据一律不按 `run_id` 分组**：session 作用域行的 `run_id` 恒 **NULL**（迁移 0015，`putSessionRound`
 //     写 `VALUES (NULL, …)`），按它分组会把不相关的行判成同组 ⇒ 假绿。本文件所有夹具行 `run_id: null`，
 //     并且**显式钉住「分组键是 round 不是 run_id」**（第 9 条用例）。

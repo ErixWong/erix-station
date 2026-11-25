@@ -102,7 +102,7 @@ function splitTopLevel(expr, op) {
  * 为什么不能只做子串匹配：`/WHERE pa\.state <> 'released' AND/` 这种**前缀包含**判定下，把实现谓词放宽成
  * `WHERE (pa.state <> 'released' OR pa.state = 'released') AND …`（语义永真）时，fake 仍会命中「已过滤」分支
  * ⇒ 测试绿而实现错（假绿窗口）。这里按 SQL 的真实语义求值：**解析不了的形态直接抛错**，
- * fake 不许替实现兜底（AGENTS §8.14 的先例：`preview-grant-checks.js` 从 SQL 文本解析谓词、
+ * fake 不许替实现兜底（ 的先例：`preview-grant-checks.js` 从 SQL 文本解析谓词、
  * `fake-internal-pool.js` 按 SQL 文本真筛）。
  *
  * 支持（本端点真实用到的形态）：`pa.state <>|= 'x'`、`pa.state IN (…)`、`pa.port BETWEEN $n AND $m`、
@@ -148,7 +148,7 @@ function compileWhere(expr) {
   }
 
   throw new Error(`fake 解析不了这个 WHERE 原子子句：「${e}」——请让 fake 跟上 SQL（或让实现回到已支持形态），`
-    + '不要为了让测试变绿去放宽 fake（AGENTS §8.14）');
+    + '不要为了让测试变绿去放宽 fake');
 }
 
 /** 从 SQL 文本里取 `WHERE` 子句（到 `ORDER BY` / `GROUP BY` / 结尾为止）；没有 WHERE ⇒ `null`。 */

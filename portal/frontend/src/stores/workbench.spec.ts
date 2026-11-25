@@ -2341,7 +2341,7 @@ describe('issue #236：历史投影的终态分隔条（run_termination）', () 
     expect(sysErrTexts(store)).toEqual([]); // 用户按停止不是故障
   });
 
-  it('failed 类：仍走红色 syserr（**没有把红色降级成中性**，AGENTS §8.7 的判据）', async () => {
+  it('failed 类：仍走红色 syserr', async () => {
     for (const reason of ['failed', 'persistence_failed', 'final_guard_unverified', 'max_rounds_cap']) {
       stage([termEv(reason)]);
       const store = useWorkbenchStore();

@@ -632,7 +632,7 @@ describe('issue #189：折叠横幅渲染', () => {
   // 「把返回预览换成 HTML 渲染」这件能在真浏览器里执行 `onerror` 的事，CI 拦不住。
   // 本格补的就是这条断言：行为今天本来就是对的，缺的是**已提交的**护栏。
   //
-  // 两条写法红线（AGENTS §8.9 第 5 条，本文件上面已为此改过两格）：
+  // 两条写法红线（ 第 5 条，本文件上面已为此改过两格）：
   //   ① 断言只钉 DOM，**不许钉 `wrapper.emitted()`**：本机 `NODE_ENV=production` 下它恒空 ⇒ 假绿；
   //   ② 跑它必须 `cd portal/frontend && NODE_ENV=development npm test -- src/components/StreamPanel.spec.ts`
   //      （`npx vitest run <文件>` 绕开 vite.config.ts 的 jsdom environmentOptions，在 node 环境里永久挂死）。

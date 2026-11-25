@@ -75,7 +75,7 @@ class VersionPool extends FakePool {
     if (text.includes('FROM containers')) {
       this.containerQueries += 1;
       if (this.failContainers) throw new Error('db down');
-      // 按 SQL 说的做（AGENTS §8.14）：SELECT 里没点名的列**不补**，产品代码漏选就会拿 undefined；
+      // 按 SQL 说的做：SELECT 里没点名的列**不补**，产品代码漏选就会拿 undefined；
       // `ORDER BY fde_name` 也只在本 fake 真的读到这句时才排 —— 否则「产品代码丢了 ORDER BY」会被
       // 插入序兼平成假绿。
       const ordered = /ORDER BY\s+fde_name/i.test(text)

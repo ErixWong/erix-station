@@ -1138,7 +1138,7 @@ describe('#288 attempt_killed（attempt 被杀并重排）', () => {
 // issue #288（缺陷 C）：崩溃恢复时挂起工具**没被重放**必须让用户看见，且**实时与刷新后一致**。
 // ⚠ 本文件的两条用例分别钉两个独立集合：实时那条靠 `EVENT_TYPES`（EventSource 逐类型挂监听，
 // 漏加 ⇒ 帧根本没投递进来），回放那条靠 `HISTORY_REPLAY_TYPES`（漏加 ⇒ replayEvent 直接 return）。
-// 只写一条的话，另一处漏配永远测不出来——AGENTS §8.8 的坑，本分支已经踩过一次。
+// 只写一条的话，另一处漏配永远测不出来—— 的坑，本分支已经踩过一次。
 // 载荷口径：docs/api/portal.md §5.3 第 15 行（runner `loopEventPayload` 映射后的 snake_case 字段）。
 describe('#288 tool_replay_decision_required（挂起工具未重放）', () => {
   const clean = {

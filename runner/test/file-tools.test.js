@@ -1,7 +1,7 @@
 // runner/lib/file-tools.js 单测：jail 路径边界（不变式：worker 无平台凭据、cwd 内可写）+ 文件工具行为。
 //
 // issue #228 迁移说明：本文件原有 15 个用例一条没删，全部按**新语义等价改写**（工具面与返回形态的
-// 变化见 AGENTS.md §8.9 的「语义变更清单」）。三条主线：
+// 变化见 docs/design/runner-integration.md。三条主线：
 //   * `rg` 退役 → 规范入口 `searchText`（`mode` 必填、无默认），返回 `{content, metadata}`；
 //   * 越界 / 非可写 / 遮蔽路径：旧形态是 **抛 JailError**，新形态是上游统一的
 //     「错误：读取|写入被宿主边界拒绝：…」**文本结果**（jail 仍在内部抛，被谓词转成布尔）；

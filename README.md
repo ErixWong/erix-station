@@ -11,8 +11,7 @@ FDE Station 是面向 FDE（Forward Deployed Engineer）的开发工位平台（
 
 - 发布版本以 `package.json` 的 `version` 为准（当前 `0.1.79`）；
   容器镜像由 GitHub Actions 构建并发布至 GHCR（`.github/workflows/release.yml`）。
-- 能力现状与逐单记录见 [`docs/maintenance/task-ledger.md`](docs/maintenance/task-ledger.md)；
-  设计分期见 [`docs/design/fde-platform.md`](docs/design/fde-platform.md) §15。
+- 能力现状见 **GitHub issue / PR**（本仓唯一真相源）；设计分期见 [`docs/design/fde-platform.md`](docs/design/fde-platform.md) §15。
 - 测试基线见 [`docs/ops/ci-release.md`](docs/ops/ci-release.md)。
   用例数量随开发漂移，验收只认退出码与失败数，不以条数为依据。
 

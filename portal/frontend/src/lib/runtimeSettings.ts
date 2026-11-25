@@ -113,7 +113,7 @@ export function normalizeRuntimeSettingSaved(raw: unknown): RuntimeSettingItem |
 /**
  * 数字框的一手值是字符串（DOM 如此）。返回 `null` = **不发请求**（解析不出整数）。
  * ⚠ 刻意不用 `Number()` / `parseInt()`：`parseInt('1e4') === 1` 那族会把「用户打错了」
- * 静默变成「保存了一个别的数」（台账 §8.126）。只认 `/^\d+$/`。
+ * 静默变成「保存了一个别的数」。只认 `/^\d+$/`。
  */
 export function parseDraftInteger(draft: string): number | null {
   const text = draft.trim();

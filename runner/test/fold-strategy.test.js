@@ -96,7 +96,7 @@ test('#438-B1 策略名钉死 `fold-llm`，且 `keepRounds` **必须显式在场
   // #392-D 横幅两态 / A2 降级告警）在 fold-statistical 下**结构上不可达**。翻回去 = 那三处又变死代码。
   assert.equal(context.strategy, 'fold-llm',
     '折叠策略被翻回去了：`fold-llm` 是决策者 2026-11-02 定的值；翻回去必须同时把 '
-    + 'runner/test/fold-notes-e2e.test.js（E1/E2 的 llm 形态）与 AGENTS §8.73 的闸门状态一起改');
+    + 'runner/test/fold-notes-e2e.test.js（E1/E2 的 llm 形态）与该策略的闸门状态一起改');
   // keepRounds：**测的是「显式写」，不是「引擎缺省也是 6」**。
   // 引擎缺省是 `compactionContext.keepRounds ?? 6`（orchestrator.js:3856）⇒ 删掉这一行，行为上
   // 看起来没变，所以只有「键必须在场 + 值必须等于 6」这一条能把它钉住。

@@ -40,7 +40,7 @@ export class FakeInternalPool {
     this._txn = null;
     this.failCommitOnce = false;
     // 语句时序日志（`{sql, index, txnId}`）：「同事务」是能被观测的契约——只有「在 BEGIN…COMMIT 窗口里」
-    // 才叫同事务，把 INSERT 挑到 COMMIT 之后就应当红（AGENTS §8.14 的变异验收）。
+    // 才叫同事务，把 INSERT 挑到 COMMIT 之后就应当红。
     this.sqlLog = [];
     this._txnId = 0;
     // P3 PR②b B1：`session-text.js` 的取数面（投影取文本）。共用 `this.messages` / `this.rounds` 引用，
@@ -279,7 +279,7 @@ export class FakeInternalPool {
     }
 
     // ---- events：插入 ----
-    // ⚠ **type / payload 的位置从 SQL 文本里解析，不是写死两形态**（AGENTS §8.14 的教训：fake 必须
+    // ⚠ **type / payload 的位置从 SQL 文本里解析，不是写死两形态**（ 的教训：fake 必须
     // 模拟真库，否则「新事件类型接不上」这类事实在单测里结构上不可能被发现——#288 第一版 fake 只认
     // `'run_end'` 字面量与「type 在 $5」两种形态，于是 `attempt_killed`（type 是字面量、payload 在 $5）
     // 被当成 `type = <payload JSON>`，事件凭空「不存在」）。
@@ -648,7 +648,7 @@ export class FakeInternalPool {
     }
 
     // ---- tool_calls（issue #283）----
-    // ⚠ **谓词从 SQL 文本里解析，不是写死行为**（AGENTS §8.14 的教训：fake 必须模拟真库约束，
+    // ⚠ **谓词从 SQL 文本里解析，不是写死行为**（ 的教训：fake 必须模拟真库约束，
     // 否则「幂等 / 不擦写」这类性质在单测里结构上不可能被发现）：
     //   * INSERT 走 `ON CONFLICT (run_id, call_id) DO NOTHING`（UNIQUE 在真库里存在）；
     //   * `call_id` NOT NULL ⇒ 给空就报 23502（与真库同形，不许静默吞）；

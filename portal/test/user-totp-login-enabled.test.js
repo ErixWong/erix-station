@@ -14,7 +14,7 @@
 //   T-6 登录侧两条读取路径（`authenticate` / `loadActiveUser`）都把这一位带出去，且**缺键按 true**
 //
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB / docker。
-// fake 红线（AGENTS §8.14）：**按 SQL 说的做** —— 该列只在 SQL 文本里出现时才回，
+// fake 红线：**按 SQL 说的做** —— 该列只在 SQL 文本里出现时才回，
 // 产品代码漏补列 ⇒ 这里拿不到 ⇒ 用例会红，而不是被 fake 好心兼平成假绿。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -79,7 +79,7 @@ class TotpLoginPool extends FakePool {
         password_hash: hash, totp_secret: totpSecret, fde_name: fdeName,
         file_upload_enabled: false,
         // 列清单里没有 `totp_login_enabled` ⇒ 真库吃 `DEFAULT true`（迁移 0030）。fake 必须**按 SQL
-        // 说的做**（AGENTS §8.14）：这里模拟的就是那条 DEFAULT，而不是「fake 忘了」。
+        // 说的做**：这里模拟的就是那条 DEFAULT，而不是「fake 忘了」。
         // 产品代码想在 INSERT 之后立刻看见它，只能把列补进 RETURNING —— 这正是 T-3 要钉的东西。
         totp_login_enabled: true,
         created_at: new Date(),

@@ -16,7 +16,7 @@
 //   2. **回落是有意的选择，不是"报错太麻烦"**：写侧（`saveRuntimeSetting`）才是严格闸
 //      （非法值当场拒）；读侧遇到"绕过写侧进来的坏行"（手工 `UPDATE`、别的库搬来的行）
 //      必须**继续工作**并说清用的是哪个值。⚠ 一律**不许** `Number(raw)` / `parseInt(raw)`
-//      了事：`parseInt('1e4') === 1` 那一族（台账 §8.126），半个值静默生效比报错难查十倍。
+//      了事：`parseInt('1e4') === 1` 那一族，半个值静默生效比报错难查十倍。
 //   3. **写侧只接受 JSON 标量**（`typeof value` 是 `'number' | 'boolean' | 'string'`）：
 //      对象 / 数组 / `null` / `NaN` / `Infinity` / 函数 / `undefined` 一律拒。表是 `jsonb`，
 //      存进 `{"a":1}` 读出来就是个对象 —— 类型纪律从列类型退化成 jsonb 之后，这道闸是承重墙。
@@ -134,7 +134,7 @@ export const SESSION_TTL_DEFAULT_SECONDS = 604800; // 7 天，与 config.js / co
 /**
  * 读侧解析（口径 2）：只认「JSON number 里的安全正整数」或「纯十进制数字串」。
  *
- * ⚠ 判定**不靠** `Number(raw)` / `parseInt(raw)`（台账 §8.126）：`'1e4'`、`' 60 '`、`'60s'`、
+ * ⚠ 判定**不靠** `Number(raw)` / `parseInt(raw)`：`'1e4'`、`' 60 '`、`'60s'`、
  * `'0x10'`、`'1.5'`、`''` 全部当场拒。数字串先过 `/^[0-9]+$/` 再转数，转数只是搬运、不是裁决。
  * 区间外也拒（返回点名区间的 reason）：手工 `UPDATE` 成 `5` 的那种行宁可**回落**，
  * 也不要「会话 5 秒就过期」这种查半天的现象（口径照 `upload-settings.js#parseDbMaxFileBytes`：
@@ -215,7 +215,7 @@ export const WORKSPACE_RETENTION_HINT = '0 = 关掉自动清理，但不会取�
 /**
  * 读侧解析：与 `parseSessionTtlSeconds` 同一套形状（只认「安全整数」或「纯十进制数字串」，
  * 区间外拒），差别只有两点：下界是 **0**，以及 `0` 必须**原样通过**（它是有效值）。
- * `'1e3'` / `' 7 '` / `'7.0'` / `'-1'` / `true` / `null` / 对象 一律拒（台账 §8.126 那一族）。
+ * `'1e3'` / `' 7 '` / `'7.0'` / `'-1'` / `true` / `null` / 对象 一律拒。
  */
 export function parseWorkspaceRetentionDays(raw) {
   let text;
@@ -911,7 +911,7 @@ function fail(field, message, details) {
 /**
  * 每次调用都现读 env（测试能在运行中改；也让超时档位可单独单测）。
  * 只接受**严格十进制正整数**：`1e3` / `' 800 '` / `+5` / `0` / `-5` 一律算非法 ⇒ 默认 + 一条
- * 点名本旋钮的 warn（口径照 `platform-prompts.js`；`Number('1e3') === 1000` 是台账 §8.126 那族）。
+ * 点名本旋钮的 warn（口径照 `platform-prompts.js`；`Number('1e3') === 1000` 是 那族）。
  */
 export function readTimeoutMs({ env = process.env, log = console } = {}) {
   const raw = env?.[READ_TIMEOUT_ENV_VAR];

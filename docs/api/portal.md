@@ -123,7 +123,7 @@
 > 另：`POST /api/admin/llm/providers`、`PATCH|DELETE /api/admin/llm/providers/:id`、
 > `GET /api/admin/llm/models` 与 `POST /api/admin/llm/models/:id/block|unblock`
 > （`http.js:1927/1965/1995`）**已实现但无契约**，只在正文散文里出现过 —— 待补写（#777 A 组）。
-> 心跳对账的口径仍见台账 §8.25；登记这几行是为了「端点索引与文档自洽」（§7.13）。
+> 心跳对账的口径仍见；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
 >
@@ -952,7 +952,7 @@ station-portal user enable  --login <login>
 
 **畸形一律拒（绝不「解析失败当同源」）**：`Origin` 不可解析 / 多值（重复头被 Node 拼成 `a, b`）/ 含空白或制表或 CR-LF / 带路径（与 #241 的 CORS 形状口径一致）/ opaque `null` ⇒ 拒；有 `Origin` 但请求自身 authority 缺失或不合法（无 Host、XFH 多值、带 scheme）⇒ 也拒。`Sec-Fetch-Site` 的多值同样按 token 展开：**跨站 token 只要出现过就算跨站**（同站 token 洗不白它，fail-closed）。
 
-**拒绝响应**：`403` + 新错误码 `cross_origin_forbidden`（`retryable=false`，`details={origin, sec_fetch_site, method}`，**不含 cookie**），响应头带 #241 那套 CORS deny 头（`corsDenyHeaders(origin)`，§1.2）——否则浏览器只报 `No 'Access-Control-Allow-Origin'` 而看不到真实原因（AGENTS §8.11 踩过的坑）；无 Origin / 畸形 Origin 时不回显（防响应头注入），状态码不变。
+**拒绝响应**：`403` + 新错误码 `cross_origin_forbidden`（`retryable=false`，`details={origin, sec_fetch_site, method}`，**不含 cookie**），响应头带 #241 那套 CORS deny 头（`corsDenyHeaders(origin)`，§1.2）——否则浏览器只报 `No 'Access-Control-Allow-Origin'` 而看不到真实原因；无 Origin / 畸形 Origin 时不回显（防响应头注入），状态码不变。
 
 **审计**：每次拒绝写一条 `auth.csrf_denied`，`actor_id=NULL`，`target=` 只有 path（F2：剔掉所有 query，§2.7 口径），`details` 同错误信封的 `details`。`.catch(()=>{})`：审计写失败不得影响响应。
 
@@ -1039,7 +1039,7 @@ station-portal user enable  --login <login>
 
 > **当前状态（261125 停用）**：三个管理台端点（签发/列表/吊销）**已停用**——`portal/src/http.js`
 > 里模块级常量 `TOKEN_ROUTES_ENABLED=false` 门掉路由匹配 ⇒ `POST/GET/DELETE /api/admin/users/:login/tokens[/:id]`
-> 一律落通用 `404 not_found`。但 **Bearer 认证缝仍生效**（`Authorization: Bearer` 照常验令牌、发 `X-Auth-Method: api_token`、不发 `Set-Cookie`）；`api_tokens` 库里 0 行 ⇒ 任何 Bearer 恒 `401`。怎么打开：把 `TOKEN_ROUTES_ENABLED` 改成 `true`（就一个常量）。为什么关：全仓 0 个调用方 + 「不过期、代签的管理员钥匙」没人敢签，界面单 #746 已关；详见台账 §8.200。下面的**契约表、错误码、三步 curl 全部保留**——它们描述的是「启用后」的契约。
+> 一律落通用 `404 not_found`。但 **Bearer 认证缝仍生效**（`Authorization: Bearer` 照常验令牌、发 `X-Auth-Method: api_token`、不发 `Set-Cookie`）；`api_tokens` 库里 0 行 ⇒ 任何 Bearer 恒 `401`。怎么打开：把 `TOKEN_ROUTES_ENABLED` 改成 `true`（就一个常量）。为什么关：全仓 0 个调用方 + 「不过期、代签的管理员钥匙」没人敢签，界面单 #746 已关；详见。下面的**契约表、错误码、三步 curl 全部保留**——它们描述的是「启用后」的契约。
 
 长期 runner、脚本、agent 要调 portal API，以前只能「登录换会话 cookie」；开了邮箱
 验证码的账号每次口令步都寄一封真邮件且永远拿不到会话。`api_tokens` 表早已存在（DDL
@@ -1551,7 +1551,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
   「刷新后正文逐字完整」当场不成立。65536 是「现查最大值约两倍」向上取整到 2 的幂。
 - **一次查询**：候选 run 确定后，**一条** `run_id = ANY($1) AND type IN ('round_end','run_end')` 的有界查询
   （走既有 `run_events_run_idx (run_id, seq)`）拿完两处来源。**零 DDL、零新索引**（形态 M 明确不新增
-  也不删除任何索引，理由见 `docs/maintenance/task-ledger.md` §8.125）。
+  也不删除任何索引）。
 - **分页（形态 M 修的第四条审计）**：合成项**只在它 `seq` 所属的那一页出现**——`before` 已经切过它的
   `seq` 就不给（`buildHistorySynthItems(pool, rows, { before, sessionId, pageLow, limit })`）。它 `seq = MAX(seq)` 不受窗口约束，
   不加这道闸就是「往上翻一页，同一段正文再重演一遍」。同一条闸同时管 `run_termination`（§4.4a-2），
@@ -1865,7 +1865,7 @@ GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
 
 `messages[]` 是**与主对话同形**的 turn：上游 `projectTranscriptForDisplay` 的输出（`role`/`text`/`blocks`/`toolCalls`/`reasoning`/`round`/`ts`/`key`/`meta` 逐字透传，#95 红线）上叠四个宿主字段 `id`（`<childRunId>:<全量下标>`）/ `seq`（全量下标，所以向前翻页时同一条消息的 id 不漂移）/ `run_id`（= `childRunId`）/ `created_at`。⚠ `created_at` 是**轮行落盘时刻**（投影的 `ts` 读的是载体行），不是消息成型时刻，只当轮级时间戳用。
 
-**折叠与切尾的顺序（不得改）**：读全量行 → `portal/src/transcript-fold.js#foldLedgerRecords` → `projectTranscriptForDisplay` → **才** `slice(-tail)`。在原始行上切会把一轮切成半轮（`:msg:<round>:<seq>` 分片行与它的载体行分散在切界两侧），折叠拿到缺片的一轮 ⇒ 工具结果配不上对（#337 的老病根）。⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 的导出面**（实测 `undefined`，深引被包 `exports` 挡），所以用的是本站镜像——它正是 `runner/lib/store.js#load` 用的同一份口径（两份 `SHARED-FOLD-CORE` 逐字节对拍，AGENTS §8.52），也是上游读侧的**超集**（多一道 `partOf` 解链闸）。本站两条入口共用同一份 `planFold`：`session-view.js` 走 `foldTranscriptRows`（DB 行）、这里走 `foldLedgerRecords`（文件记录），不是两套规则。
+**折叠与切尾的顺序（不得改）**：读全量行 → `portal/src/transcript-fold.js#foldLedgerRecords` → `projectTranscriptForDisplay` → **才** `slice(-tail)`。在原始行上切会把一轮切成半轮（`:msg:<round>:<seq>` 分片行与它的载体行分散在切界两侧），折叠拿到缺片的一轮 ⇒ 工具结果配不上对（#337 的老病根）。⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 的导出面**（实测 `undefined`，深引被包 `exports` 挡），所以用的是本站镜像——它正是 `runner/lib/store.js#load` 用的同一份口径（两份 `SHARED-FOLD-CORE` 逐字节对拍），也是上游读侧的**超集**（多一道 `partOf` 解链闸）。本站两条入口共用同一份 `planFold`：`session-view.js` 走 `foldTranscriptRows`（DB 行）、这里走 `foldLedgerRecords`（文件记录），不是两套规则。
 
 **参数与错误**
 
@@ -2445,7 +2445,7 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
     ① 连 `context_window` 都没配；② 窗口形态 runner 不认（真小数 / `≤0` / 非数字 ⇒ 门户与 runner 同一条
     `positiveIntOrNull()` 判不可得 ⇒ 回退也算不出、心跳也不带这两个键，见上面第 3 级与
     `runner/lib/llm-models.js`）；③ 窗口**小到** 1/4 兜底仍算不出正预算（`ctx ≤ 2666`：钳完仍是非正 ⇒
-    runner 注入的上游闸 `computeBudget` 抛 ⇒ 整对不传，见 `AGENTS.md` §8.31）。
+    runner 注入的上游闸 `computeBudget` 抛 ⇒ 整对不传）。
     ① ② 由上游的一次性 `model_metadata_missing` 诊断事件告警；③ 由 runner 的 `model metadata unusable`
     warn 点名（文案会同时说「下行未带」与「形态非法」两种成因，#316）。
   - **只有一列数字**：决策者明确否决了「区分配置值 vs 假定值」的字段拆分（原话：这有什么关系呢，
@@ -2527,7 +2527,7 @@ SELECT fde_id FROM fde_llm_bindings
 - 对账失败/网关不可达 ⇒ 只 `warn`（`[llm] model rename reconcile ...`）：**不改回 `model_name`**。
   改名已在网关落定，把 PATCH 拖成 500 只会诱导管理员重试第二次改名；不自动回滚的理由同 §8.25。
 - 「门户内改名不是漂移源」这句话从此要打个补丁：**改名会把引用它的 FDE 变成漂移**（`*_model_name`
-  暂时指向旧名），立即对账就是为了让这个窗口尽量短——就地注释见 `AGENTS.md` §8.25。
+  暂时指向旧名），立即对账就是为了让这个窗口尽量短——就地注释见代码。
 
 ### 4.10 管理台 FDE 周期额度与用量（`/api/admin/fdes/:fde/llm/budget` · `/usage`，#719）
 
@@ -2756,7 +2756,7 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 > 四个端点全部过 `requireAdmin`：非 admin ⇒ `403 forbidden`，未登录 ⇒ `401 unauthorized`。
 > **#462（2026-11-05）**：判定从「只看第一段证书」升级为「按**整条链**判」（叶子选取 / 顺序 / 链完整性），
 > 新增 `tls_cert_order_invalid` / `tls_cert_chain_broken` 两个 400 码与三个 `warnings` 机器码；
-> `verify` 增加可选 `reason` / `chainDepth`。真机实测四形态表见 `AGENTS.md` §8.100。
+> `verify` 增加可选 `reason` / `chainDepth`。
 > **#456 M2 追加第五个：`POST /api/admin/tls/inspect`**（解析但不落盘，见 4.13-2a）——同样过 `requireAdmin`，
 > 但它**不参与** 4.13-1 的响应 DTO（它回的是「这份 PEM 里有什么」，不是「盘上现在是什么」）。
 
@@ -3085,8 +3085,7 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
 **为何不缓存**（与 §4.12 的 `mail_settings` 刻意不同）：登录是热路径，所以 `mail-provider` 带 60s TTL；
 上传不是。一次上传多一次单行主键 `SELECT`（按 `id = 1` 取一行）换掉「改完要等一分钟」——加缓存只是把
 「必须重启」换成「必须等 60s」，判据并没有被满足（因此写侧也不需要 `invalidate()`：没东西可失效）。
-⚠ 这条论证**不带毫秒数**：本仓没量过这条查询的耗时，写死数字就是一句代码证明不了的声称（来龙去脉见台账
-`docs/maintenance/task-ledger.md` §8.136）。取舍也不依赖它——要判断的是「一次额外的单行查询」换「下一次上传就
+⚠ 这条论证**不带毫秒数**：本仓没量过这条查询的耗时，写死数字就是一句代码证明不了的声称。取舍也不依赖它——要判断的是「一次额外的单行查询」换「下一次上传就
 生效」值不值，不是「几毫秒够不够快」。日后真要为它做容量测算，先测（同一条上传路径、真 PG、报上现场条件）再谈缓存。
 
 #### 4.15-1 `GET /api/admin/upload/settings`
@@ -4191,7 +4190,7 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
   > **单副本前提（形态 M 明确接受的限制）**：累加器与 SSE hub 都是 **per-process** 的 ⇒ 本节的补发能力
   > 假设 portal 单副本部署。多副本时「断在另一个副本上」必然看不到那段正文（表现 = 少一段未定稿，
   > 不是脏数据），要跨副本补发得先把累加器换成共享存储（登记在 §8.125 的后续里）。
-  > **已接受损失（缓冲 LRU 逐掉活跃 run，issue #515；裁决 = ② 轻量版 + ③ 同做，261115-11 / 工单 fix-261115-11；台账 §8.133，原始取证 §8.126.4）—— 潜伏项，现已显式接受**：
+  > **已接受损失（缓冲 LRU 逐掉活跃 run，issue #515；裁决 = ② 轻量版 + ③ 同做，261115-11 / 工单 fix-261115-11；，原始取证 §8.126.4）—— 潜伏项，现已显式接受**：
   > 缓冲的条目上限 `maxEntries = 32`（`run-partial-buffer.js` 的 `PARTIAL_MAX_ENTRIES_DEFAULT`）。
   > ⚠ **N=32 的来源要说准：它是内存槽上限，不是并发上限，也不是任何「平台允许同时跑几个 run」的声明**——
   > 单 entry 两路（`text` / `reasoning`）**各自**夹到 `textCap` 16,384 字符 ≈ 64 KB ⇒ 全表 32 × 64 KB ≈ 2 MB；
@@ -4675,7 +4674,7 @@ portal 只问「这条事件是不是 stream 档」。现查（本机已安装�
 - **幂等且不擦写**：守卫 `AND duration_ms IS NULL AND result_digest IS NULL` ⇒ 整批重发（at-least-once）与「后到的同 `call_id` 空值事件」都不会把已写的值改回 NULL（语义 = 首次观测即真相、先到先得）。两列用同一条 UPDATE 同一口径，不拆成两个逐列守卫：一次工具调用只有一个 `tool_result` 事件（两列同源同时到），拆列只翻倍查询。
 - **取值口径**：`duration_ms` 非有限数（含 `null`）⇒ 写 `NULL`，**不写 0**（引擎未给时长与引擎测出 0ms 是两件事，后者照写 `0`）；`result_digest` 与事件 payload **逐字一致**（portal 不截不断不重排版；worker 侧已按 500 字截断，见 §5.3 第 7 行）。
 - **旧数据不可回填**：历史 `run_events` 里本来就没带 duration（erix-agent 0.18.0 的缺口，上游 erix-agent #285 跟修），因此已存行仍是 NULL，**不跑数据修补、也不拿 `created_at` 之类造一个假时长**。
-- 防漂移：`portal/test/internal.test.js` 的 `issue #283 U3：*` 用例集（同批写入 / 顺序陷阱 / 跨批 / 重复投递 / 空值不擦写 / 行缺失 0 行 / 逐字一致 / NULL 与无键跳过）。`portal/test/fake-internal-pool.js` 的 `tool_calls` 分支**从 SQL 文本里解析 `IS NULL` 谓词**并模拟 `UNIQUE(run_id, call_id)`（AGENTS §8.14：fake 必须模拟真库约束）；变异取证：删掉守卫 ⇒「后到的同 call_id 空值事件不得把已有值擦成 NULL」必须红。
+- 防漂移：`portal/test/internal.test.js` 的 `issue #283 U3：*` 用例集（同批写入 / 顺序陷阱 / 跨批 / 重复投递 / 空值不擦写 / 行缺失 0 行 / 逐字一致 / NULL 与无键跳过）。`portal/test/fake-internal-pool.js` 的 `tool_calls` 分支**从 SQL 文本里解析 `IS NULL` 谓词**并模拟 `UNIQUE(run_id, call_id)`（fake 必须模拟真库约束）；变异取证：删掉守卫 ⇒「后到的同 call_id 空值事件不得把已有值擦成 NULL」必须红。
 
 错误：`400 validation_failed`（条数/字节超限、`payload` 非对象、`client_event_id` 格式非法）；`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`409 run_terminal`（终态 run 不再接受事件——终态 barrier，runner §7.6）；`429 rate_limited`；5xx 无限退避重试（§9.13）。
 
@@ -4973,8 +4972,7 @@ agentd 的四条转发、portal 侧四个路由与四个存储函数、以及承
 `max(updated_at)` = 2026-11-11（0.33 上线后零写入）、FK 是 child 端且零视图/触发器依赖。
 
 **编号与历史口径**：U8/U9/S3/S4 的号**不回收**；本节以下旧内容（revision CAS、`checkpoint_stale`、
-`204` 语义、0034 的终态读空注记）作为历史保留在 `docs/maintenance/task-ledger.md`
-（§8.126.2 等）与 git 历史里，**不再是活契约**。
+`204` 语义、0034 的终态读空注记）作为历史保留在 git 历史里，**不再是活契约**。
 
 **仍成立的同名物**（别一起删掉）：错误码 `checkpoint_failed` 仍是**可重试码值域**里的历史值
 （旧档案的重试判定要读它，`runner/lib/termination.js` 写明理由）；`persistence_error.phase` 的

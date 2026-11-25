@@ -25,7 +25,7 @@
 // 的读侧折叠，`runner/lib/store.js#load` 用的同一份口径）→ `erix-agent` 包根导出的
 // `projectTranscriptForDisplay`（`session-view.js` 同一个函数）→ 最后才 `slice(-tail)`。
 // ⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 的导出面**（实测 `undefined`，
-// 深引被 `exports` 挡）⇒ 只能用本站镜像；那正好也是 AGENTS §8.52 那份「两份 SHARED-FOLD-CORE 逐字节
+// 深引被 `exports` 挡）⇒ 只能用本站镜像；那正好也是  那份「两份 SHARED-FOLD-CORE 逐字节
 // 对拍」的既有保证在本入口的复验。顺序反过来（先切原始行再折）会把一轮切成半轮：`:msg:` 分片行与
 // 它的载体行分散在切界两侧，折叠拿到缺片的一轮。
 import fsSync from 'node:fs';

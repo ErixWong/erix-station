@@ -1230,7 +1230,7 @@ async function startRun(msg) {
           // 代价（刻意的保守）：上游 0.18.0 `createFileTools` **未给任何工具标 replay**（`src/tools/*.js`
           // grep `replay:` 零命中），而 `:1781` 的判据是 `=== "safe"` ⇒ **未标注也算非 safe**，
           // 5 个文件工具挂起时同样不重放（写文件是幂等的，少跑一次比多跑一次安全，模型可自行重试）。
-          // 口径钉在 runner/test/replay-policy.test.js；详细边界见 AGENTS §8.22。
+          // 口径钉在 runner/test/replay-policy.test.js。
           replayPolicy: 'per-tool-declaration',
           // 8) reflection 显式传（§6.3-8）。judge（扩轮）已开：用户 2026-09-22 拍板，
           // 推翻「P1 mock 关 judge」决策（issue #43）——每轮 end_turn 走 round judge 评估，
