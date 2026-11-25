@@ -9951,3 +9951,35 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
 
 **验证**：全新 `postgres:16` 上两条最常红的腿**各跑 5 遍全绿**、日志 0 次 `terminating connection`；
 `check-required-legs` 3 条腿全真跑 0 skip rc=0；合并后 `main` CI（`ddbc590`）**success**。
+
+### 8.199 dev 建「脚本专用账号 `agent01`」：脚本不再挤人的登录通道（2026-11-25，主 agent）
+
+**为什么**：#736 那串讨论把一件事问到底了——脚本走登录**本身没问题**，问题在**登的是谁的账号**。
+开着邮箱验证码的账号每登一次口令步就寄一封真邮件（第二因素的正常行为），而脚本读不到那枚码 ⇒ 白寄 +
+拿不到会话 + 重试再寄一封。「一次登录怎么变两封信」的完整成因已记 §8.187（两次独立口令步，相隔 3.4 秒）。
+同时 `api_tokens`（#747）实测**零消费者**（表 0 行、全仓 0 个调用方），把"脚本要不要长期凭据"这件事暂时
+还给登录这条路 ⇒ 用户 261125 拍：`你自己搞个测试账号不就完了`，并背书「测试时候数据库里改一下」。
+
+**建号（走 API，有审计）**：`POST /api/admin/users` 建 `agent01` → `201`，id `f35c45bc-edf0-4b3e-8c19-bad13e9b25df`，
+`role=fde`、`fde_name=agent01`、`totp_enabled=false`、`git_host_id=e6446e83-687f-4ee2-b3d9-30a2189bfaf2`（gitea，
+`git_hosts` 里唯一一条 enabled）、`llm={provider_id:"inteva", main_model_id:"abfd93f5-3be6-4779-a594-008928ee8b43"}`。
+审计落 `admin.user_created`。口令写 `~/.config/mcp/creds/station-agent01.password`（600）。
+
+**两处 dev 便利直改库**（本单唯一"没走 API"的动作，都只在本机 dev 库，不进代码/迁移）：
+
+1. `must_change_password=false`——建号写死 `true`（`portal/src/admin.js:324` INSERT 末列），管理员重置也会设回
+   `true`（`admin.js:667`），**API 层没有清它的口子**，而受限会话（`#255` 白名单）会挡住所有业务接口。
+2. `totp_login_enabled=false`——默认给的是"开关 `t` 但 `totp_secret` 为空"的**半开态**（`admin` 同款）：
+   今天口令直通，**哪天有人给它绑上 secret，脚本就被自己的第二因素锁死**。要测 TOTP 走 §1.3 的种子账号。
+
+**实测（经 edge：Host `admin.fde.erix.vip:9443` + `--resolve …:127.0.0.1`，写方法带 `Origin`）**：
+`POST /api/auth/login` `200 authenticated` + 1 条 cookie；`GET /api/me` `200`；`POST /api/auth/logout` `204`；
+清 `totp_login_enabled` 后再登录仍 `200`；**`login_email_codes` 全程 47 → 47（零发信）**；
+审计只新增 `admin.user_created` + `auth.login_success`，**没有** `auth.email_code_sent`。
+
+**顺带查到的两条事实**（已写进 `docs/testing.md` §1.3，别再踩）：`llm.main_model_id` 必须是**文本**类模型——
+`eric` 现绑的 `1a770ab8-…` 被目录判为 **vision**，拿它当 main 会 `validation_failed`「模型类型不匹配」；
+`GET /api/admin/users/:id` 没有 GET（`405`），git host 从 `GET /api/admin/users` 列表或 `git_hosts` 现读。
+
+**未做/未决**：`api_tokens` 停用方式（#747 整块 revert vs 只禁"签给 admin"）**仍待用户拍**；#740 真客户端 IP
+未做；`agent01` 只存在于本机 dev 库，**不是**交付物，换机重建做法见上（建号 1 次 API + 2 条 UPDATE）。

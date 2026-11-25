@@ -79,9 +79,19 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 > 本节只留可移植 policy：
 >
 > 1. dev 栈登录体字段是 `login` 不是 `username`。
-> 2. 脚本要调 API 就别登录：管理员代签一枚 API 令牌，之后 `Authorization: Bearer` 直连（三步 curl 配方见 `docs/api/portal.md` §2.13），令牌路径零邮件、零会话。
-> 3. 一次性探针要会话就登 `admin`，别反复登带邮箱验证码的账号——每登一次寄一封真邮件而脚本读不到那枚码。
-> 4. dev 入口 URL、口令文件路径、宿主端口占用一律从冷层取，别写进本文。
+> 2. **脚本/agent 要调 API ⇒ 登 `agent01`**（dev 专用脚本账号：`role=fde`，不开邮箱码也不开 TOTP ⇒
+>    口令直通，零邮件、不卡第二因素；口令文件路径见冷层）。**别登人的账号**：开着邮箱验证码的账号
+>    每登一次寄一封真邮件，而脚本读不到那枚码 ⇒ 白寄一封 + 拿不到会话 + 重试再寄一封（成因 ⇒ §8.187）。
+> 3. 要管理员面就登 `admin`（今天口令直通）；要测第二因素就自建带 TOTP 的种子账号：step1 拿
+>    `pending_token`（它不是会话，只能用来交第二因素）→ 本地算码 → step2 换 cookie。
+> 4. **脚本发写方法（POST/PATCH/DELETE）必须带 `Origin: <dev 入口>`**，否则被 CSRF 闸拒；`GET` 不受影响。
+> 5. API 令牌（`Authorization: Bearer`，仅 admin 可签）只在「脚本不该持有口令」时用；三步 curl 配方见
+>    `docs/api/portal.md` §2.13，**当前零消费者**（界面为何未做、重开判据 ⇒ issue #746 + 台账 §8.199）。
+> 6. dev 入口 URL、口令文件路径、宿主端口占用一律从冷层取，别写进本文。
+> 7. 用 API 建 dev 账号的两条坑（实测 261125）：`llm.main_model_id` 必选**文本**类模型（被目录归为
+>    vision 的 id 会被 `validation_failed`「模型类型不匹配」拒，即使它已是某个现有 FDE 的绑定）；
+>    `must_change_password` 在建号与管理员重置两条路都写死 `true`（受限会话会挡业务接口），
+>    dev 直改库清掉（做法与理由 ⇒ 台账 §8.199）。
 
 ### 1.4 阶段可执行验收清单（P1 / P2 / P3）
 
