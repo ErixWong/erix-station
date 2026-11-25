@@ -188,3 +188,133 @@ describe('列表列：订阅数占位 + 启停 PATCH', () => {
     expect(gone!.get('[data-test="row-name"]').text()).toContain('已删除');
   });
 });
+
+// ── issue #759：编辑入口 ────────────────────────────────────────────────────────
+// 红线同文件头：不用 w.emitted()，全部经 DOM / 请求桩断言。
+
+describe('编辑入口（#759）：kind/scope 只读、预填取模板值、PATCH 不带 kind/scope、400 不清空、就地更新', () => {
+  // 编辑目标：run-silence-alert，params **故意与 schema default 不同**——
+  //   threshold = 30m（默认 15m）、phases = ['awaiting_llm']（默认 ['tool_running']）。
+  //   这样「预填取模板值」与「预填取 schema default」可区分：若编辑误走 initialParams()，
+  //   用例会当场红（反向自证 ①）。audience=admin 也刻意不同于新建默认的 all。
+  function sil(id: string, over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id, kind: 'run-silence-alert', name: '静默-原值',
+      params: { threshold: '30m', phases: ['awaiting_llm'] },
+      audience: 'admin', scope: 'session', enabled: true, deleted_at: null,
+      subscriberCount: 4, ...over,
+    };
+  }
+  const editList: Handler = (c) =>
+    c.url.startsWith('/api/admin/macro-templates') && c.method === 'GET'
+      ? json(200, { items: [sil('t-sil')] })
+      : undefined;
+
+  /** param 控件是 `:value` + `@change`（非 v-model）：改值要手动触发 change 才回写 form.params。 */
+  async function changeInput(wrapper: VueWrapper, test: string, value: string): Promise<void> {
+    const el = wrapper.get(`[data-test="${test}"]`).element as HTMLInputElement;
+    el.value = value;
+    await wrapper.get(`[data-test="${test}"]`).trigger('change');
+  }
+
+  it('① 每行有编辑入口（data-test=edit-<id>）', async () => {
+    const { wrapper } = await mountView(editList);
+    expect(wrapper.find('[data-test="edit-t-sil"]').exists()).toBe(true);
+  });
+
+  it('② 打开编辑 ⇒ name/audience/params 预填的是模板已有值（不是 schema default）', async () => {
+    const { wrapper } = await mountView(editList);
+    await wrapper.get('[data-test="edit-t-sil"]').trigger('click');
+    await flushPromises();
+    // name / audience 是模板的值（audience=admin 而非新建默认 all）。
+    expect((wrapper.get('[data-test="edit-name"]').element as HTMLInputElement).value).toBe('静默-原值');
+    expect((wrapper.get('[data-test="edit-audience"]').element as HTMLSelectElement).value).toBe('admin');
+    // params 取模板已有值：threshold=30m（默认是 15m）。
+    expect((wrapper.get('[data-test="param-threshold"]').element as HTMLInputElement).value).toBe('30m');
+    // enum[] 按模板数组勾选：awaiting_llm 勾上（默认那档），tool_running 不勾（默认是它）。
+    expect((wrapper.get('[data-test="param-array-phases-awaiting_llm"]').element as HTMLInputElement).checked).toBe(true);
+    expect((wrapper.get('[data-test="param-array-phases-tool_running"]').element as HTMLInputElement).checked).toBe(false);
+  });
+
+  it('③ 编辑表单里 kind/scope 是纯文本，没有 input/select', async () => {
+    const { wrapper } = await mountView(editList);
+    await wrapper.get('[data-test="edit-t-sil"]').trigger('click');
+    await flushPromises();
+    const kind = wrapper.get('[data-test="edit-kind"]');
+    expect(kind.text()).toContain('静默'); // kind 的人话标签（run-silence-alert = 静默告警）
+    expect(kind.find('input').exists()).toBe(false);
+    expect(kind.find('select').exists()).toBe(false);
+    const scope = wrapper.get('[data-test="edit-scope"]');
+    expect(scope.text()).toContain('会话'); // scope=session 的人话（会话（session））
+    expect(scope.find('input').exists()).toBe(false);
+    expect(scope.find('select').exists()).toBe(false);
+    // 编辑态不该有新建那套 kind 下拉。
+    expect(wrapper.find('[data-test="create-kind"]').exists()).toBe(false);
+  });
+
+  it('④ 保存 ⇒ PATCH 到模板 id、body 含改后 name/params、绝不含 kind/scope', async () => {
+    const { wrapper, calls } = await mountView((c) => {
+      if (c.method === 'GET' && c.url.startsWith('/api/admin/macro-templates')) return json(200, { items: [sil('t-sil')] });
+      if (c.method === 'PATCH' && c.url.endsWith('/api/admin/macro-templates/t-sil')) {
+        return json(200, { template: { ...sil('t-sil'), name: '改名', params: { threshold: '5m', phases: ['awaiting_llm'] } } });
+      }
+      return undefined;
+    });
+    await wrapper.get('[data-test="edit-t-sil"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="edit-name"]').setValue('改名');
+    await changeInput(wrapper, 'param-threshold', '5m');
+    await wrapper.get('[data-test="macros-edit-form"]').trigger('submit');
+    await flushPromises();
+
+    const patch = calls.find((c) => c.method === 'PATCH');
+    expect(patch).toBeTruthy();
+    expect(patch!.url).toContain('/api/admin/macro-templates/t-sil');
+    const body = patch!.body as Record<string, unknown>;
+    // kind/scope 出现在 body 里后端就 400 ⇒ 前端必须不带。
+    expect('kind' in body).toBe(false);
+    expect('scope' in body).toBe(false);
+    expect(body.name).toBe('改名');
+    expect((body.params as Record<string, unknown>).threshold).toBe('5m');
+  });
+
+  it('⑤ 后端 400 ⇒ 表单仍打开、输入仍在、错误文案原样显示', async () => {
+    const { wrapper } = await mountView((c) => {
+      if (c.method === 'GET' && c.url.startsWith('/api/admin/macro-templates')) return json(200, { items: [sil('t-sil')] });
+      if (c.method === 'PATCH' && c.url.endsWith('/api/admin/macro-templates/t-sil')) {
+        return json(400, { error: { message: 'threshold 不是合法时长', code: 'validation_failed' } });
+      }
+      return undefined;
+    });
+    await wrapper.get('[data-test="edit-t-sil"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="edit-name"]').setValue('我改的名字还没丢');
+    await wrapper.get('[data-test="macros-edit-form"]').trigger('submit');
+    await flushPromises();
+    // 表单没关、输入没被清空、后端错误文案原样显示。
+    expect(wrapper.find('[data-test="macros-edit-form"]').exists()).toBe(true);
+    expect(wrapper.get('[data-test="edit-error"]').text()).toContain('threshold 不是合法时长');
+    expect((wrapper.get('[data-test="edit-name"]').element as HTMLInputElement).value).toBe('我改的名字还没丢');
+  });
+
+  it('⑥ 保存成功后列表就地更新（不整页重拉）', async () => {
+    const { wrapper, calls } = await mountView((c) => {
+      if (c.method === 'GET' && c.url.startsWith('/api/admin/macro-templates')) return json(200, { items: [sil('t-sil')] });
+      if (c.method === 'PATCH' && c.url.endsWith('/api/admin/macro-templates/t-sil')) {
+        return json(200, { template: { ...sil('t-sil'), name: '改名后' } });
+      }
+      return undefined;
+    });
+    await wrapper.get('[data-test="edit-t-sil"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="edit-name"]').setValue('改名后');
+    await wrapper.get('[data-test="macros-edit-form"]').trigger('submit');
+    await flushPromises();
+    // 编辑保存只 PATCH，不再 GET 列表（初始那次 load 是唯一一次 GET）。
+    expect(calls.filter((c) => c.method === 'GET').length).toBe(1);
+    // 列表行就地反映新名字，且编辑表单已关闭。
+    const row = wrapper.findAll('[data-test="macro-row"]').find((r) => r.attributes('data-template-id') === 't-sil');
+    expect(row!.get('[data-test="row-name"]').text()).toContain('改名后');
+    expect(wrapper.find('[data-test="macros-edit-form"]').exists()).toBe(false);
+  });
+});
