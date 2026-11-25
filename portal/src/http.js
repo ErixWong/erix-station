@@ -167,9 +167,19 @@ function getBearerToken(req) {
  *
  * 判据：
  *  ① 只有 socket **对端本身**属于 loopback / RFC1918（`10/8`·`172.16/12`·`192.168/16`）/
- *     ULA `fc00::/7` / `::1` 时才采信头。有人绕过 edge 直连（对端是公网地址）⇒ 头可任意伪造 ⇒
- *     不信，用 socket 地址。**刻意不加 env 白名单旋钮**（#677 正在收 env）：可信集合由部署不变式
- *     直接推导，没有「运维要加白名单」这个真实配置面，加旋钮只会多一个能配错的开关。
+ *     ULA `fc00::/7` / `::1` **或本机默认路由的 nexthop** 时才采信头。
+ *     后半句是 **#740 追加刀（拓扑校正）**：真实部署里 portal 只 publish `127.0.0.1`，edge（Traefik）
+ *     经 `http://127.0.0.1:<发布端口>` 打进来 ⇒ DNAT 之后容器看到的对端是 compose `backend` 网络
+ *     （`172.32.0.0/24`）的**网桥网关 `172.32.0.1`**，而 `172.32/16` **不在** RFC1918 内（`172.16/12`
+ *     只覆盖 172.16–172.31）⇒ 只认前三类会把真实拓扑的头整批拒掉（证据：库里
+ *     `login_pending.created_ip` 110 行**全**是 `172.32.0.1` = 上一刀的判据在真机上是空转的）。
+ *     安全性：攻击者**伪造不了**「本容器默认路由的 nexthop」这个位置——它是内核路由表里的下一跳，
+ *     不是请求里可写的字段；能站到那个位置上的只有 ingress 本身。读不到文件 / 无默认路由 /
+ *     Gateway 为 `00000000` ⇒ **回落到原集合**（fail closed，测试 A8）。
+ *     有人绕过 edge 直连（对端是公网地址、又不是本机 nexthop）⇒ 头可任意伪造 ⇒ 不信，用 socket 地址。
+ *     **刻意不加 env 白名单旋钮**（#677 正在收 env）：可信集合由部署形态直接推导，没有「运维要加
+ *     白名单」这个真实配置面，加旋钮只会多一个能配错的开关。
+ *     **未覆盖 v6 默认路由**（`/proc/net/ipv6_route` 本轮不解析，届时再补）。
  *  ② 采信时取 XFF 的**最右一项**：标准里每跳代理把自己看到的对端**追加**到头后，最右一项 = 离 portal
  *     最近那跳（edge）写下的真客户端；**最左是客户端自己写的，可伪造**。头缺失 / 全空 / 最右一项解析
  *     不出合法 IP ⇒ 回落 socket 地址（**不向左继续找**，见工单）。
@@ -178,10 +188,15 @@ function getBearerToken(req) {
  *     两种形态各占一桶）。
  *
  * 这里是 `req.socket.remoteAddress` 在 `portal/src/**` 下**唯一**的合法落点（防回潮闸见 portal/test）。
+ *
+ * @param {object} req 只读 `req.socket.remoteAddress` 与 `req.headers['x-forwarded-for']`
+ * @param {{gatewayAddrs?: string[], procRoutePath?: string}} [opts] **仅供测试注入**：
+ *   `gatewayAddrs` 直接给定可信 nexthop 集合；`procRoutePath` 指到夹具文件。
+ *   生产 7 个调用点一律 `clientIp(req)`（走默认路径 + 懒算缓存），不传 opts。
  */
-export function clientIp(req) {
+export function clientIp(req, { gatewayAddrs, procRoutePath } = {}) {
   const socketIp = normalizeIp(req.socket.remoteAddress);
-  if (socketIp && isTrustedProxyAddr(socketIp)) {
+  if (socketIp && isTrustedProxyAddr(socketIp, gatewayAddrs ?? gatewayAddrsFor(procRoutePath))) {
     const forwarded = rightmostForwardedIp(req.headers && req.headers['x-forwarded-for']);
     if (forwarded) return forwarded;
   }
@@ -210,8 +225,71 @@ function normalizeIp(raw) {
   return net.isIPv4(s) || net.isIPv6(s) ? s : null;
 }
 
-/** socket 对端是否「可信代理地址」：loopback / RFC1918 / ULA `fc00::/7` / `::1`。 */
-function isTrustedProxyAddr(ip) {
+/**
+ * #740 追加刀：解析 `/proc/net/route`，取**默认路由（目的 `00000000`）那行的 Gateway** = 本容器
+ * 默认路由的 nexthop，并入可信代理集合。
+ *
+ * 格式（tab 分隔文本）：`Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT`，
+ * 地址是**十六进制小端**：`010020AC` 要按字节反序还原成 `172.32.0.1`（即按 `AC 20 00 01` 读）；
+ * 照大端直读会得到另一个完全不同的地址（字节序单独钉在测试 A10）。
+ * 只取 `Destination == 00000000` 的行；Gateway 为 `00000000`（无下一跳，纯链路路由）或解析不出 ⇒ 跳过。
+ * 文件读不到（非 Linux / 进不了 `/proc` / 测试指不存在的路径）⇒ `[]`（**回落原集合**，fail closed）。
+ * 未覆盖 v6（`/proc/net/ipv6_route`），本轮不做。
+ *
+ * @param {{procRoutePath?: string}} [opts] 路径可注入（测试拿夹具文件喂）
+ * @returns {string[]} 去重后的 IP 数组（无默认路由 / 读不到 ⇒ `[]`）
+ */
+export function defaultGatewayAddrs({ procRoutePath = '/proc/net/route' } = {}) {
+  let text;
+  try {
+    text = fs.readFileSync(procRoutePath, 'utf8');
+  } catch {
+    return []; // 读不到 ⇒ 不扩可信集合（fail closed）
+  }
+  const addrs = [];
+  for (const line of text.split('\n')) {
+    const cols = line.trim().split(/\s+/);
+    // 列不足 8 = 表头/残行；目的非 00000000 = 非默认路由（子网直连路 Gateway 恒 00000000，本来也要排除）
+    if (cols.length < 8 || cols[1] !== '00000000') continue;
+    const gw = decodeHexLeIpv4(cols[2]);
+    if (gw && gw !== '0.0.0.0' && !addrs.includes(gw)) addrs.push(gw);
+  }
+  return addrs;
+}
+
+/** 把 `/proc/net/route` 的十六进制**小端**地址还原成点分 v4（`010020AC` → `172.32.0.1`）；非法返回 null。 */
+function decodeHexLeIpv4(hex) {
+  if (typeof hex !== 'string' || !/^[0-9a-fA-F]{8}$/.test(hex)) return null;
+  const octets = [];
+  for (let i = 0; i < 8; i += 2) octets.push(parseInt(hex.slice(i, i + 2), 16));
+  octets.reverse(); // 小端 → 网络序
+  const ip = octets.join('.');
+  return net.isIPv4(ip) ? ip : null;
+}
+
+/**
+ * 默认路由 nexthop 集合的**懒算缓存**：只在第一次真需要时读 `procRoutePath`，之后直接复用。
+ * 按路径缓存（生产只有一个默认路径 ⇒ 一个槽位；测试用不同夹具路径各算一次，不互相污染）。
+ */
+const gatewayAddrsCache = new Map();
+function gatewayAddrsFor(procRoutePath = '/proc/net/route') {
+  if (!gatewayAddrsCache.has(procRoutePath)) {
+    gatewayAddrsCache.set(procRoutePath, Object.freeze(defaultGatewayAddrs({ procRoutePath })));
+  }
+  return gatewayAddrsCache.get(procRoutePath);
+}
+
+/**
+ * socket 对端是否「可信代理地址」：loopback / RFC1918 / ULA `fc00::/7` / `::1`
+ * **或** 属于 `gatewayAddrs`（本机默认路由 nexthop；不传则走懒算缓存）。
+ */
+function isTrustedProxyAddr(ip, gatewayAddrs = gatewayAddrsFor()) {
+  if (staticTrustedProxyAddr(ip)) return true;
+  return Array.isArray(gatewayAddrs) && gatewayAddrs.includes(ip);
+}
+
+/** 与部署无关的静态可信段判定（loopback / RFC1918 / ULA / `::1`）。 */
+function staticTrustedProxyAddr(ip) {
   if (net.isIPv4(ip)) {
     const [a, b] = ip.split('.').map(Number);
     if (a === 127) return true; // 127/8 loopback
