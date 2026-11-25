@@ -283,10 +283,40 @@ test('#740 A11 nexthop 懒算一次并缓存（按路径）：首算之后改文
   assert.equal(clientIp(req('172.32.0.1', '203.0.113.9'), { procRoutePath: other }), '172.32.0.1');
 });
 
-test('#740 A12 真实 /proc/net/route（不传 opts = 生产调用形状）：不炸且只返合法 v4，loopback 仍采信头', () => {
+test('#740 A12 真实 /proc/net/route（不传 opts = 生产调用形状）：解析要真出结果（空集合要自证为何空），loopback 仍采信头', () => {
   const addrs = defaultGatewayAddrs();
   assert.ok(Array.isArray(addrs), '返回必须是数组');
-  assert.ok(addrs.every((a) => net.isIPv4(a)), `每一项必须是合法 v4，得到：${JSON.stringify(addrs)}`);
+  // 独立评审 #2：原来那行 `addrs.every(...)` 在 `addrs === []` 时是**恒真**的（空数组的 every 永返 true），
+  // 加上 `Array.isArray([])` 也过 ⇒ 本格对「解析在真机上失灵」完全不敏感。改成显式两分支，各自钉死：
+  if (addrs.length > 0) {
+    // 分支①（本机有 v4 默认路由，开发宿主上走的就是这条：`eno1 00000000 0114A8C0` ⇒ 192.168.20.1）：逐值断言合法 v4。
+    for (const a of addrs) assert.ok(net.isIPv4(a), `每一项必须是合法 v4，得到：${JSON.stringify(addrs)}`);
+  } else {
+    // 分支②（空集合）：必须自己证明「本机确实没有 v4 默认路由」，而不是悄悄恒绿。
+    let raw;
+    try {
+      raw = fs.readFileSync('/proc/net/route', 'utf8');
+    } catch {
+      raw = null;
+    }
+    if (raw === null) {
+      // 读不到：只允许是「根本没有这个文件」（非 Linux / 进不了 /proc）。文件在却读不出 = 不能算预期空。
+      assert.ok(!fs.existsSync('/proc/net/route'), '/proc/net/route 存在却读不到 ⇒ 不是「本机无默认路由」，空集合不能这样蒙过去');
+    } else {
+      // 自己按列判「有没有目的 0.0.0.0/0 且带下一跳的行」，与实现无关（只看第 2/3 列，不碰解析代码）。
+      const gws = raw
+        .split('\n')
+        .slice(1)
+        .map((l) => l.trim().split(/\s+/))
+        .filter((c) => c.length >= 8 && c[1] === '00000000' && /^[0-9a-fA-F]{8}$/.test(c[2] ?? '') && c[2] !== '00000000')
+        .map((c) => `${c[0]} ${c[1]} ${c[2]}`);
+      assert.deepEqual(
+        gws,
+        [],
+        `addrs 为空，但 /proc/net/route 里有 ${gws.length} 行「目的 00000000 且 Gateway 非 0」（${gws.join(' | ')}）⇒ 解析在真机上失灵，本格不许靠空集合恒绿`,
+      );
+    }
+  }
   // 生产那 7 个调用点都是 clientIp(req)：不传 opts 也必须照旧采信 loopback 对端的头。
   assert.equal(clientIp(req('127.0.0.1', '203.0.113.9')), '203.0.113.9');
 });
