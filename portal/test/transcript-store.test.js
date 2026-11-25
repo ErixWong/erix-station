@@ -390,7 +390,7 @@ test('appendRound：幂等/冲突判据与 internal 端点同源（同一把尺 
 //      已由 `runner/test/store-contract.test.js` 17 项覆盖），portal 适配器不实现。夹具：内存桩。
 // 夹具**不改产品 SQL / client 绑定 / 探针实现**：load、appendRound、loadByDedupKey、loadMaxRound
 // 全部直接转发产品代码（含 #157 探针的深比对、roundKey 回退匹配、loadMaxRound=MAX）。
-// 冲突明细逐条记录于 AGENTS.md §8.6。
+// 冲突明细逐条记在 409 响应的 `differingFields` 里。
 
 /** 契约形状夹具：产品 store 的四个方法原样转发，只补 station 不拥有/需合成的部分。 */
 function contractShapeFixture() {

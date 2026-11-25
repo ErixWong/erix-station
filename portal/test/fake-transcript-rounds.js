@@ -1,6 +1,6 @@
 // `transcript_rounds`（session 作用域那半边：`transcript_key` + 部分唯一索引）的**真库行为**仿真。
 //
-// 为什么要有这个文件（AGENTS §8.14 的教训，issue #333 第三张单）：#333 M2 把
+// 为什么要有这个文件（ 的教训，issue #333 第三张单）：#333 M2 把
 // `portal/src/transcript-store.js` 的 `ON CONFLICT … DO NOTHING` 从「静默丢弃」降级成并发防线之后，
 // 撞键路径变成「**读回既有 record → 比 payload 指纹**」。原先各处 fake 对这两条 SQL 的写法是
 // 「`INSERT` 一律 `return { rows: [] }`、`SELECT record` 一律 `return { rows: [] }`」——

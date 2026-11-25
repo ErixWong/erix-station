@@ -46,7 +46,7 @@ test('#371-A 三处集合都含 persistence_error（只加一边就是「实时�
     assert.ok(from >= 0 && to > from, `${label}：锚点没找到（结构变了就更新本用例，别删断言）`);
     const block = src.slice(from, to);
     assert.match(block, new RegExp(`'${EVENT_TYPE}'`),
-      `${label} 必须含 '${EVENT_TYPE}'。三种漏法症状不同，但都属于 AGENTS §8.8「同一事件两种可见性」`
+      `${label} 必须含 '${EVENT_TYPE}'。三种漏法症状不同，但都属于 「同一事件两种可见性」`
       + '——#288 已在同一个文件里踩过两次，这是第三次');
   }
 });

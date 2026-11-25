@@ -400,7 +400,7 @@ test('无 blocks ⇒ renderAgentsMdSection 返回空串（system 必须逐字节
   // notes 非空但 blocks 为空 ⇒ 仍然是空串（记账不能把空节变成有内容）
   assert.equal(renderAgentsMdSection({ blocks: [], notes: ['跳过 ~/projects/AGENTS.md：EACCES'] }), '');
   // #451 评审 M2 的取舍（口径 8「无注入 ⇒ system 逐字节不变」压过口径 7「子目录索引」）：
-  // 产品行为维持现状，但口径必须写死在这里（设计稿 §4.1 规则 7 / user-space.md / AGENTS.md §8.91 同一口径）。
+  // 产品行为维持现状，但口径必须写死在这里（设计稿 §4.1 规则 7 / user-space.md /  同一口径）。
   assert.equal(renderAgentsMdSection({ blocks: [], subdirHints: ['~/repo-a/AGENTS.md'] }), '',
     'blocks 为空时子目录索引也不单独出现（索引不能把空段变成有内容）');
 });

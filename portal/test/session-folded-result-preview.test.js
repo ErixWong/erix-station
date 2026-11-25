@@ -16,7 +16,7 @@
 // 变异自证（一轮一还原）：摘掉 `attachToolResultsToRecords(...)` 那层包裹 ⇒ 恰「命中率 + 反向对照 +
 // 幂等」三格红；把「查不到就塞空串」写进去 ⇒ 恰反向对照那一格红。
 //
-// 夹具是**合成的**（手写 records，形状照真库 `:msg:` 行；真库读数见 §8.62/§8.38），
+// 夹具是**合成的**（手写 records，形状照真库 `:msg:` 行；真库读数），
 // 隔离约定同 `session-folded-payload.test.js`：注入 fake pool，不碰真实 DB。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -44,7 +44,7 @@ const sessionRow = (id, userId) => ({
 
 /**
  * 只模拟这个面用到的两条 SQL：`chat_sessions` 属主查、`transcript_rounds` 的折叠行取行与 range 重建。
- * ⚠ range 重建**必须真按 `messages <> '[]'::jsonb` 筛行**（假库里不筛就是假绿面，AGENTS §8.42）。
+ * ⚠ range 重建**必须真按 `messages <> '[]'::jsonb` 筛行**。
  */
 class ResultPool extends FakePool {
   constructor() {

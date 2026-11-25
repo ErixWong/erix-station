@@ -1218,7 +1218,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   /**
-   * 试用反馈 #10（原仓库根 `ISSUES.md`，已删 ⇒ 台账 §8.204）：加载更早一批消息。
+   * 试用反馈 #10：加载更早一批消息。
    * 后端 keyset 分页早已完备（getSession `?cursor&limit`、events/history `?before&limit`，
    * 都返 next_cursor），但此前前端只取最新一窗且从不消费 next_cursor ⇒ 长会话「开头从
    * 压缩横幅开始」，最早的对话永远看不见（DB 里都在，不是压缩删的，纯读面缺陷）。
@@ -1442,7 +1442,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
     // issue #281：`session` 本身可能就是**缺的**（旧后端/网关改写回包、200 但没 `session` 键）。
     // 旧代码在这里直接读 `session.cwd` ⇒ `TypeError: Cannot read properties of undefined (reading
-    // 'cwd')`，而它在 onMounted 的 await 链上 ⇒ 变成 Unhandled Rejection（AGENTS §8.20 记的那处，
+    // 'cwd')`，而它在 onMounted 的 await 链上 ⇒ 变成 Unhandled Rejection（ 记的那处，
     // 行号已漂到这一行）。判空后**照样报可见错误**——判空不是吞掉真实错误，只是不再拿 TypeError 代替它。
     if (session == null || typeof session !== 'object') {
       entries.value.push({ kind: 'syserr', text: t('errors.sessionLoadFailed') });

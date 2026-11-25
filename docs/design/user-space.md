@@ -177,7 +177,7 @@ Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<UR
 
 | 项 | 口径 | 依据 |
 |---|---|---|
-| 为什么落在 `~/AGENTS.md` 而不是 runner 的 `SYSTEM_PROMPT` | 提示词与 portal 文案是**两个包里的两份文案**；规则抄进提示词就是埋下第二个会过期的真相源（同 `AGENTS.md` §8.10「工具名从注册面取、不手抄清单」） | 决策者定稿（#258 `#issuecomment-6117800165`） |
+| 为什么落在 `~/AGENTS.md` 而不是 runner 的 `SYSTEM_PROMPT` | 提示词与 portal 文案是**两个包里的两份文案**；规则抄进提示词就是埋下第二个会过期的真相源（同 「工具名从注册面取、不手抄清单」） | 决策者定稿（#258 `#issuecomment-6117800165`） |
 | `SYSTEM_PROMPT` 的角色 | 只留一句**强制指针**（#451 起措辞改为「平台约定**已随本次 run 注入**到本提示词末尾」，不再是「开工先读」），**不复述规则**；防漂移：`runner/test/system-prompt.test.js`（该测试**双向**禁/钉 `allowedHosts` / `credentials` / `CORS` / `Set-Cookie` / `localStorage` / `Bearer` / `打开预览` / `markdown 链接` 这八个具体规则词：提示词里不得出现、`renderHomeAgentsMd()` 输出里必须存在；后三个随 #262 第 7 条加入，最后两个随 #285 第 8 条加入） | 同上 |
 | 内容红线 | 本节**不得出现端口数字 / 端口区间 / 伞域字面量**（号段与域名都是生成值，#246 / #57）；host 一律以「取清单里那一条的 `url`」的口径表达 | `portal/test/materializer.test.js` |
 | 「下发了 ≠ 读了」 | 物化落盘不等于 agent 真读了它。R-1 P0 时代的答案是「提示词加强制指针」，真机 14 天复测显示这条**不够**（35 个 run 只 5 个读过，4/5 还自带 `head -N` 截断）⇒ #451 起改成**宿主在 run 启动时注入**（见下一行）；P0 判据同步从「transcript 里出现读调用」反转为「规则被遵守」 | 复测协议 R-1 P0 → #451（`docs/design/agents-md-layering-2026-11-05.md` §1.2 / §6.2） |

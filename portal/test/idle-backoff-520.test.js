@@ -195,7 +195,7 @@ test('#520 A3 envInt：严格整串正整数；非法/越界 ⇒ 回落默认 + 
 // 不换成假时钟的理由：这里测的就是 `sleepCancellable` 对**真** timer + **真** AbortSignal 的行为，
 // 换成假时钟就变成在测夹具（与 #506 的 B4/C3/D3/E3 同口径）。
 // 墙钟依赖的实际风险：判据是 resolve 的**布尔值**，不是流逝毫秒数 ⇒ 事件循环被停顿时本格只会变慢，
-// 不会假红（唯一能红它的形状是 timer 回调根本不跑，那已经是运行时故障）。已登记的残留见台账 §8.134。
+// 不会假红（唯一能红它的形状是 timer 回调根本不跑，那已经是运行时故障）。已登记的残留见。
 test('#520 A4 sleepCancellable：abort 立刻 resolve(false)，睡满 resolve(true)', async () => {
   const ac = new AbortController();
   const p = sleepCancellable(60_000, ac.signal); // 真 timer，但下面立刻 abort

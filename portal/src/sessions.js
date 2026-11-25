@@ -606,7 +606,7 @@ function contentBlocks(content) {
  * `ORDER BY round ASC, append_seq ASC` ⇒ `seq` 就是账本里的真实先后）：
  *   ① 取该 `tool_use` **之后**最近的一条同 id 结果（正常形状：结果行紧跟在调用行后面）；
  *   ② 之后一条都没有 ⇒ 回退取**之前**最近的一条（resume 复放：`:round:<n>:resume` 行重发旧调用，
- *      它的结果落在前面；真库实测 6 个跨轮复用的 id 全是这一类，见 §8.132 的取证读数）；
+ *      它的结果落在前面；真库实测 6 个跨轮复用的 id 全是这一类 的取证读数）；
  *   ③ 一条都没有 ⇒ 不追加（回到判据 ② 的「缺键不伪造」）。
  * 同 id 出现多份时**必须可观测**：`duplicateIds` 交回调用方，由 `rebuildFoldedRange` 走现成的
  * `log.warn` 通道打一条（零新事件类型、零 DDL、零响应字段）。

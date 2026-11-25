@@ -9,7 +9,7 @@
 //   A-6 四条 user DTO 路径（authenticate / verifyTotpForUser / loadActiveUser / findSessionUser）键集一致
 //
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB / docker。
-// fake 的红线（AGENTS §8.14）：**按 SQL 说的做** —— 该列只在 SQL 文本里出现时才回，
+// fake 的红线：**按 SQL 说的做** —— 该列只在 SQL 文本里出现时才回，
 // 产品代码漏补列 ⇒ 这里拿不到 ⇒ 用例会红，而不是被 fake 好心兼平成假绿。
 import test from 'node:test';
 import assert from 'node:assert/strict';

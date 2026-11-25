@@ -48,7 +48,7 @@
 | 落点是决策者 2026-10-12 定的：**规则只住 `~/AGENTS.md`，提示词只留强制指针** | `portal/src/materializer.js:177-183`、`docs/design/user-space.md` §4.1.2 |
 | 提示词里的强制指针 + 读法（`cat ~/AGENTS.md`） | `runner/worker.js:81`、`:85` |
 | 提示词注入点（`config.input.system`） | `runner/worker.js:703` |
-| 文件工具读边界 = 项目根，无只读例外 ⇒ `readFile ~/AGENTS.md` 撞「被宿主边界拒绝」（**本行描述的是 2026-11-05 当时的事实；#259 已于 261116 落地，读边界现在是「项目根 ∪ `$HOME/AGENTS.md` ∪ `$HOME/.erix`」，写边界不变**） | 当时：`runner/worker.js:480`（`createJail({ root: cwd, writable: [cwd] })`）、`runner/lib/file-tools.js:56-90`、`docs/design/user-space.md:184`。现在：`runner/lib/file-tools.js`（`createJail` / `platformReadExceptions`）+ 台账 §8.135 |
+| 文件工具读边界 = 项目根，无只读例外 ⇒ `readFile ~/AGENTS.md` 撞「被宿主边界拒绝」（**本行描述的是 2026-11-05 当时的事实；#259 已于 261116 落地，读边界现在是「项目根 ∪ `$HOME/AGENTS.md` ∪ `$HOME/.erix`」，写边界不变**） | 当时：`runner/worker.js:480`（`createJail({ root: cwd, writable: [cwd] })`）、`runner/lib/file-tools.js:56-90`、`docs/design/user-space.md:184`。现在：`runner/lib/file-tools.js`（`createJail` / `platformReadExceptions`）+  |
 | 防漂移锁：指针必须存在 + 8 个规则词不得进提示词 | `runner/test/system-prompt.test.js:207-247` |
 | 家目录解析已有先例（skills loader） | `runner/worker.js:554`（`home: process.env.HOME \|\| '/home/erix'`） |
 | 层级优先的仓内先例：skills 是 `project > ~/.erix/skills > bundled`（内层优先） | `runner/worker.js:546-553` 注释 |
@@ -366,7 +366,7 @@ dev 现查 `runs.usage.cacheRead` 有值（最近 5 条：3 328 / 3 328 / 3 328 
 | S1 | `runner/lib/agents-md.js` + `runner/test/agents-md.test.js` | 1 新文件（~150 行）+ 1 测试（~15 格） | ✅ 完成：采集器 326 行（含注释）+ 16 格单测（`8b945ab`）。实际导出与 §4.1 的草案差一处：`collectAgentsMd` 多返回 `subdirHints`（子目录索引是**索引不是正文**，不该混进 `blocks` 的账，也不该被截断逻辑当成一份内容）；`renderAgentsMdSection({ blocks, notes, subdirHints })` 因此多接受一个可选键 |
 | S2 | `runner/worker.js` 接线（3 行）+ 指针段改写 + `system-prompt.test.js` 重写指针用例 | ~20 行 + 1 测试改写 | ✅ 完成（`46f9465`）：`startRun` 内采集 + `MSG.LOG`（info，不新增事件类型）+ `system: SYSTEM_PROMPT + agentsMdSection`；指针段改为「已随本次 run 注入」；新增 2 条接线源码级锁。8 规则词禁词用例与 `0.0.0.0` 断言一字未动 |
 | S3 | 文档：`docs/design/user-space.md` §4.1.2 增行（层级与注入口径）、`docs/design/runner-integration.md` 记一句、本节转正 | 3 处 | ✅ 完成（本提交）：§4.1.2 增「注入 = 主路径」一行 + 「读取边界」行改口径 + §4.1 文件表同一句；`runner-integration.md` §6.3 新增 2b 条 |
-| S4 | 真机验收（§6.2 D1–D5） | 主 agent | D1–D4 ✅（数据见 `AGENTS.md` §8.91）/ D5 ⬜ |
+| S4 | 真机验收（§6.2 D1–D5） | 主 agent | D1–D4 ✅ / D5 ⬜ |
 
 **必须重建 FDE 镜像**（动 `runner/`），并按 §8.17 `docker rm -f` 让 reconcile 重建。
 **不需要** portal 改动 ⇒ 平台 AGENTS.md 内容不变、物化不变。

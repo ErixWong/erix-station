@@ -8,7 +8,7 @@
 //   **不照设计文档猜**（设计文档 §6 的例子少了 `reason` 这个 additive 键，且 `templateBytes`
 //   的数值本来就不是契约值）。
 //
-// 为什么这些函数在 lib 里而不是组件里（AGENTS §8.14 / `lib/uploadSettings.ts` 同族）：
+// 为什么这些函数在 lib 里而不是组件里（ / `lib/uploadSettings.ts` 同族）：
 //   「服务端多塞一个没点名的键怎么办」「`materializeEnqueued=0` 到底是『没工位』还是『没通知』」
 //   「`readonly[]` 给了前端没说明文案的第 5 个 key 要不要显示」都是**纯计算**，
 //   放在组件里只能断言恒真的废话。

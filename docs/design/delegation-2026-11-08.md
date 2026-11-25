@@ -2,7 +2,7 @@
 
 > 2026-11-08。设计者：主 agent。依据：两份独立评估（`~/eval-delegate-261108/{erix,pi}/repo/EVAL-REPORT.md`）
 > + 主 agent 亲验的 8 条源码事实。**实现一律派 worker，主 agent 只验收**（`~/projects/AGENTS.md` §3.0）。
-> 状态：**已实现并真机验收**（v0.1.57，2026-11-09；口径、已知边界与四个真机坑见 `AGENTS.md` §8.103）。
+> 状态：**已实现并真机验收**（v0.1.57，2026-11-09；口径、已知边界与四个真机坑）。
 
 ## 0. 一句话
 
@@ -193,7 +193,7 @@ GET /api/sessions/:sessionId/delegates/:childRunId?tail=100
   → `projectTranscriptForDisplay`（`erix-agent` 包根导出，`session-view.js:31` 同一个函数）
   → 再套一层既有 DTO 适配（`id/seq/run_id/created_at` 这些宿主字段用 `childRunId` + 行号合成）。
   ⚠ `foldLedgerMessages` / `foldMessageRows` **不在包导出面**（实测 `undefined`，深引被 `exports` 挡）
-  ⇒ 只能用本站镜像；那也正好是既有保证（两份 `SHARED-FOLD-CORE` 逐字节对拍，AGENTS §8.52）。
+  ⇒ 只能用本站镜像；那也正好是既有保证（两份 `SHARED-FOLD-CORE` 逐字节对拍）。
   `tail=N` 只投影最后 N 条逻辑消息（读侧先截断原始行会破坏折叠，**必须全量投影后再切**，
   与 `session-partial-output` 的成本口径同族：单文件有上限，超过 8MB 直接 413 并提示）。
 - **成本红线**：`tail` 默认 100，硬上限 500；文件读流式，不许整文件 `readFileSync` 进内存超过上限。
@@ -259,7 +259,7 @@ pi-web 的形态（`~/projects/github/pi-web`，已读源码）：
 
 1. **宿主单测**（worker 写）：7 条红格（见 §8）。
 2. **真机**：
-   - 本地构建 portal + fde 镜像，临时顶掉 `deploy/.env` 的 digest pin（照 §8.34 路线 A，验完还原）。
+   - 本地构建 portal + fde 镜像，临时顶掉 `deploy/.env` 的 digest pin（照路线 A，验完还原）。
    - `ERIX_DELEGATE_ENABLED=1` 下发（provisioner env 白名单已含 `ERIX_*`？需核 `fde-proxy/server.js` 的
      `ENV_KEY_ALLOW`——**这是 §8.70 那个事故的同型坑，必须加白名单**）。
    - 新会话 `~/projects/probe-delegate`，让 agent 用 `delegate` 派 2 个读密集子任务。

@@ -12,7 +12,7 @@
 //     rc=1（红，绝不静默）。本地没装 PG 时也能跑，照样点话。
 //
 // 本地：`npm run check:ci-legs`（无 PG ⇒ 红 + 点名；有 PG ⇒ 绿）。
-// CI：质量门禁 job 在步骤 ② 之后注入 TEST_DATABASE_URL 跑同一支，绿才算过。
+// 261125 起不再进 CI：本地或发版前手动跑（注入 TEST_DATABASE_URL），绿才算过。
 //
 // 后续要把其余 test:integration:* 接进来，只往 REQUIRED_LEGS 里加一条即可。
 import { spawnSync } from 'node:child_process';

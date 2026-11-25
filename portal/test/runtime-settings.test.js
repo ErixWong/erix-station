@@ -390,7 +390,7 @@ test('RS-4 非法值回落 + 点名 warn：DB 行是字符串 "1e4" ⇒ 回落 e
   const { values, problems } = await readRuntimeSettings({
     pool, registry: TEST_REGISTRY, timeoutMs: 200, env: {}, log,
   });
-  assert.equal(values['demo.limit'], undefined, '"1e4" 不许被收成 1（parseInt 那一族，台账 §8.126）');
+  assert.equal(values['demo.limit'], undefined, '"1e4" 不许被收成 1');
   assert.deepEqual(
     problems.find((p) => p.key === 'demo.limit'),
     { key: 'demo.limit', reason: 'not_a_count' },
@@ -854,7 +854,7 @@ test('RS-10 读侧超时旋钮：RUNTIME_SETTINGS_READ_TIMEOUT_MS 只收正整�
   for (const bad of ['1e3', ' 800 ', '+5', '0', '-5', 'abc', '800.5']) {
     const log = collectingLog();
     assert.equal(readTimeoutMs({ env: { [READ_TIMEOUT_ENV_VAR]: bad }, log }), DEFAULT_READ_TIMEOUT_MS,
-      `${bad} 必须判为非法 ⇒ 用默认（不许 Number(raw) 了事：Number('1e3') === 1000 是台账 §8.126 那族）`);
+      `${bad} 必须判为非法 ⇒ 用默认（不许 Number(raw) 了事：Number('1e3') === 1000 是 那族）`);
     assert.equal(log.seen.warn.length, 1, `${bad} 被判非法时必须 warn 一次`);
     assert.match(log.seen.warn[0], new RegExp(READ_TIMEOUT_ENV_VAR), 'warn 要点名这个旋钮');
   }
@@ -1117,7 +1117,7 @@ test('RS-12 session.ttl_seconds 的解析与校验：严格十进制正整数 + 
     assert.equal(r.ok, true, `${JSON.stringify(good)} 必须收`);
     assert.equal(r.value, Number(good));
   }
-  // 拒：`Number()` / `parseInt()` 会放进来或算错的那一族（台账 §8.126），加区间外的。
+  // 拒：`Number()` / `parseInt()` 会放进来或算错的那一族，加区间外的。
   for (const bad of [
     '1e4', ' 60 ', '60s', '', '0x10', '1.5', '6e5', '0', '-1', '-60', '2592001',
     0, -1, 59, 2592001, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1e21,
@@ -1800,7 +1800,7 @@ test('RS-23 workspace.retention_days 的解析与校验：非负整数、0 是�
   }
   assert.deepEqual(parseWorkspaceRetentionDays(0), { ok: true, value: 0 },
     '0 不许被当成假值丢掉（丢了就变成「库里写了不清理，读出来却回落」）');
-  // 拒：`Number()` / `parseInt()` 会放进来或算错的那一族（台账 §8.126）+ 负数 + 越界。
+  // 拒：`Number()` / `parseInt()` 会放进来或算错的那一族+ 负数 + 越界。
   for (const bad of [
     '1e3', ' 7 ', '7s', '', '0x10', '7.0', '1.5', '3651', '-1', '-0',
     -1, 3651, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1e21,

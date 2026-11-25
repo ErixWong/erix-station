@@ -97,7 +97,7 @@
 | `0027-tls-certificates.sql` | 管理台证书生命周期的**审计/历史**表 `tls_certificates`（一行一次装证/回滚；**盘上文件才是真相源**，本表只答「谁在什么时候装了什么」） | #456 |
 | `0028-user-mail-otp.sql` | `users.mail_otp_enabled`：per-user「邮件验证码」开关（默认 `false` ⇒ 开了全局邮件通道不再自动要求所有人） | #449 |
 | `0029-user-file-upload.sql` | `users.file_upload_enabled`：per-user「文件上传」开关（默认 `false`，管理员显式打开） | #472 |
-| `0030-user-totp-login-enabled.sql` | `users.totp_login_enabled`：把「绑过 TOTP」与「登录允许用 TOTP」拆成两位（默认 `true` ⇒ 存量行为零变化） | 工单 feat-261110-02（台账 §8.112） |
+| `0030-user-totp-login-enabled.sql` | `users.totp_login_enabled`：把「绑过 TOTP」与「登录允许用 TOTP」拆成两位（默认 `true` ⇒ 存量行为零变化） | 工单 feat-261110-02 |
 | `0031-user-last-activity-at.sql` | `users.last_activity_at`：该用户最近一次**亲口说话**（按下发送）的时刻，可空、无默认、不建索引 | #497 |
 | `0032-drop-retired-tables.sql` | 撤三张退役/备份表（`llm_models_retired`、`llm_providers_retired`、`transcript_rounds_shape4_bak_20261027`）；**撤前每个部署自己跑一遍访问账判据** | #503 |
 | `0033-delta-events-not-persisted.sql` | 清 `assistant_delta` / `reasoning_delta` / `tool_call_delta` 的历史存量（**形态 M：纯清理、零 DDL**，分批 `FOR UPDATE SKIP LOCKED`） | #502 |
@@ -111,8 +111,7 @@
 `pg_total_relation_size` 从 4,644,864 B 只动到 4,628,480 B，−0.35%），要回收磁盘必须在部署后手工跑
 **`VACUUM (FULL, ANALYZE) <快照表>;`**（不能写进迁移文件：`VACUUM` 不在事务块里跑，同下面 `0033` 那条；
 ⚠ 那张表已被 `0041` 撤掉 ⇒ 这条运维动作自此是**历史**，现在只需 `VACUUM (FULL, ANALYZE) run_events;`，
-实测 **4.64 MB → 565 KB**（565,248 B，−87.8%，`VACUUM FULL` 耗时 0.179 s）；出处
-`docs/maintenance/task-ledger.md` §8.126.2（那里还有「删行≠还磁盘」的逐时点读数表）。
+实测 **4.64 MB → 565 KB**（565,248 B，−87.8%，`VACUUM FULL` 耗时 0.179 s）。
 
 ## 部署顺序：`0033` 必须**先部署新代码、再跑迁移**（issue #502）
 
@@ -127,7 +126,7 @@
 - **磁盘回收不在迁移里，要手工跑**：`VACUUM` 不能跑在事务块里（25001），而迁移 runner 是单事务 ⇒ 写进迁移文件
   就是整个迁移失败、portal 拒启。`DELETE` 跑完体积**一个字节都不动**（实测：877,155 行删完仍是
   494,960,640 B），只有 `VACUUM (FULL, ANALYZE) run_events` 才回收（实测降到 5,578,752 B）。它拿
-  `ACCESS EXCLUSIVE` ⇒ **在迁移事务之外、低峰期手工跑**，读数与耗时见 `docs/maintenance/task-ledger.md` §8.126.1。
+  `ACCESS EXCLUSIVE` ⇒ **在迁移事务之外、低峰期手工跑**。
 
 ## 迁移身份：增量迁移**必须**由平台库角色执行（issue #280）
 
@@ -181,7 +180,7 @@ compose 路径显式设 `MIGRATE_DATABASE_URL=station_platform`（`deploy/docker
   **整支事务**，不是「一批」。分批真正的收益只有：单条语句的时长与 `lock_timeout` 等待窗口被切小
   （同一节自己写的「分批**不**缩短事务，也不减少累计持有的行锁」才是准的）。
   ⇒ **要在维护窗外跑，就别指望这个文件自动温和**：照文件里的谓词**手工分批 + 每批单独 COMMIT**
-  （脚本见台账 §8.125），本文件只保证「第二遍 0 行」这条可重放性。
+  ，本文件只保证「第二遍 0 行」这条可重放性。
 - **`0034` 的 14 天谓词没有排除「名下仍有活 run 的会话」**。分支 (b) 的谓词是
   `rc.updated_at < v_cutoff AND transcript_key::uuid IN (SELECT id FROM chat_sessions WHERE status <> 'active' OR updated_at < now() - interval '14 days')`
   —— 判据全在**会话**的时间戳上，`runs.status` 一个都没看。dev 真库现查**受影响 0 行**，所以今天不是缺陷；

@@ -74,7 +74,6 @@ const DENY_IDENTITY = [
 // EXEMPT：运维交接 / 历史取证账，允许保留**机器坐标**（DENY_INFRA）；对身份（DENY_IDENTITY）无效。
 // 新增 EXEMPT 必须是同类历史账，且写明理由。
 const EXEMPT = new Set([
-  'docs/maintenance/task-ledger.md',
   'docs/ops/handoff-2026-10-14.md',
   'docs/ops/handoff-2026-10-15.md',
   'docs/ops/deployment-2026-10-10.md',
