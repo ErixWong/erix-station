@@ -1,4 +1,4 @@
-// WP3b 真机端到端（需 docker；docker 命令经 `sg docker -c` 绕过，env §8.1）。
+// WP3b 真机端到端（需 docker；docker 命令经包装层绕过（本机 quirk 见冷层））。
 // 流程：起栈（含 LiteLLM）→ 建用户 + 两步登录 → 建会话（P5「目录即项目」：POST /api/sessions 建目录）
 //   + 重启 portal 触发物化写 config.json → provision FDE（真实 runner 镜像）→ agentd SSE 连接 + ping
 //   → 发消息建 run（真实 API：同事务落 transcript 用户轮次 + run 入队，§4.3）

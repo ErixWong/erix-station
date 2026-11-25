@@ -647,7 +647,7 @@ function lineMissingComposeProject(line) {
   return /docker compose\b/.test(line) && !/ -p /.test(line) && !/^\s*(?:\/\/|\*|\/\*)/.test(line);
 }
 
-// 工单 F-6：**经 `sg docker -c ${JSON.stringify(cmd)}` 两层的命令不得含裸换行**（源码级静态钉）。
+// 工单 F-6：**经 `docker` 包装层两层的命令不得含裸换行**（源码级静态钉）。
 // 根因（真机 §⑤ 首失败）：JSON.stringify 把模板里的**真实换行**变成字面 `\n` 两个字符，而双引号内的
 // POSIX shell **不还原**它 ⇒ 下游 psql 实收 `run_id\n FROM` ⇒ `ERROR: syntax error at or near "\"`。
 // 判据只看「会被送进那一层的命令串」（函数第一个实参是模板字面量的位置）：
@@ -1029,7 +1029,7 @@ const singleSourceProblems = [];
       singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 又硬编码了 portal 容器内的 userspace 路径 '/srv/erix/users'（#495 ② 应 import lib/e2e-preflight.mjs 的 PORTAL_USERSPACE_CONTAINER_ROOT + toContainerPath）`);
     }
   }
-  // 工单 F-6：所有要过 `sg docker -c ${JSON.stringify(cmd)}` 那两层的命令串必须**单行**——真实换行会被
+  // 工单 F-6：所有要过 docker 包装层 `${JSON.stringify(cmd)}` 的命令串必须**单行**——真实换行会被
   // stringify 成字面 `\n`（双引号内 POSIX shell 不还原）⇒ psql 实收 `run_id\n FROM`，真机 §⑤ 就死在这。
   // 扫描面 = 本目录全部 .mjs（不只 wp2a：同一个包裹件在各脚本里都有副本，以后谁折行都拦）。
   for (const file of files) {

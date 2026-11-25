@@ -1,4 +1,4 @@
-// WP3a 真机端到端（需 docker；docker 命令经 `sg docker -c` 绕过，env §8.1）。
+// WP3a 真机端到端（需 docker；docker 命令经包装层绕过（本机 quirk 见冷层））。
 // 流程：起栈（含 LiteLLM）→ 建用户 + provision FDE → 假 agentd（真实 token + FDE 网络路径）
 //   → SSE 连接 + claim → 事件 seq 递增 → finish → 断线重连 re-claim（方案 B）→ 并发 claim 竞态
 //   → LiteLLM mock_response 经 Traefik 注入链流式响应 → 回收。

@@ -42,7 +42,7 @@
 //      ⇒ 面板必须标 `provision-time snapshot`，`U1` 断标签数 ≥ FDE 行数。
 //   6. UI 腿把 playwright 留在**容器里**（`/app/node_modules/playwright`），仓库**不**加这个依赖。
 //      登录前 SPA 会问一次 `GET /api/me`（匿名 ⇒ 401），那是引导噪声：控制台错误**从登录成功后开始计**。
-//   7. 走 `sg docker -c` 那层时命令串**不许含换行**（wp2a 头注 F-6：换行会变成字面 `\n` 两字符）。
+//   7. 走 docker 包装层时命令串**不许含换行**（wp2a 头注 F-6：换行会变成字面 `\n` 两字符）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';

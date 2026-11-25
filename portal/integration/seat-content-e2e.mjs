@@ -15,7 +15,7 @@
 //   1. admin host 是自签证书 ⇒ 本进程关 TLS 校验（只影响这个测试进程）。
 //   2. 口令只从 `~/.config/creds/station-dev-password-file` 读，**绝不 print**；送进容器
 //      走临时文件（命令行会被 `ps` 抄走），跑完尽力删（那是带口令的文件）。
-//   3. 走 `sg docker -c` 那层时命令串**不许含换行**（version-surface 头注 F-6）。
+//   3. 走 docker 包装层时命令串**不许含换行**（version-surface 头注 F-6）。
 //   4. UI 腿把 playwright 留在**容器里**（`/app/node_modules/playwright`），仓库**不**加
 //      这个依赖；采集脚本自包含，断言全在外层做（容器里 assert 拿不到有用信息）。
 //   5. 缺口令 / 第二因素（pending_token / email_code_required）/ 限流 ⇒ 环境形状，skip。
