@@ -5,6 +5,7 @@
 // cookie 语义见 docs/api/portal.md §2.5；两步登录见 §2.2/§2.3。
 
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import { URL } from 'node:url';
@@ -154,6 +155,184 @@ function getBearerToken(req) {
   if (scheme !== 'Bearer') return { present: true, token: null, badScheme: true };
   const token = (sp === -1 ? '' : header.slice(sp + 1)).trim();
   return { present: true, token, badScheme: false };
+}
+
+/**
+ * #740：真客户端 IP——**只在 socket 对端是可信代理时**采信 `X-Forwarded-For` 的**最右一项**。
+ *
+ * 为什么需要它：部署形态里「ingress 是唯一的路」（不变式 2）且 portal 只 publish `127.0.0.1`
+ * ⇒ 每个进来的 socket 对端必然是 edge（Traefik）的**私有 / 回环**地址。旧写法
+ * `req.socket.remoteAddress` 于是把**全平台所有人**记成同一个网关 IP ⇒ 发信限流键 `email:<ip>`、
+ * 失败计数、`login_pending.created_ip` 全挤进一个桶 = 等于没限流（工单 #740 的真实危害）。
+ *
+ * 判据：
+ *  ① 只有 socket **对端本身**属于 loopback / RFC1918（`10/8`·`172.16/12`·`192.168/16`）/
+ *     ULA `fc00::/7` / `::1` **或本机默认路由的 nexthop** 时才采信头。
+ *     后半句是 **#740 追加刀（拓扑校正）**：真实部署里 portal 只 publish `127.0.0.1`，edge（Traefik）
+ *     经 `http://127.0.0.1:<发布端口>` 打进来 ⇒ DNAT 之后容器看到的对端是 compose `backend` 网络
+ *     （`172.32.0.0/24`）的**网桥网关 `172.32.0.1`**，而 `172.32/16` **不在** RFC1918 内（`172.16/12`
+ *     只覆盖 172.16–172.31）⇒ 只认前三类会把真实拓扑的头整批拒掉（证据：库里
+ *     `login_pending.created_ip` 110 行**全**是 `172.32.0.1` = 上一刀的判据在真机上是空转的）。
+ *     安全性：攻击者**伪造不了**「本容器默认路由的 nexthop」这个位置——它是内核路由表里的下一跳，
+ *     不是请求里可写的字段；能站到那个位置上的只有 ingress 本身。读不到文件 / 无默认路由 /
+ *     Gateway 为 `00000000` ⇒ **回落到原集合**（fail closed，测试 A8）。
+ *     有人绕过 edge 直连（对端是公网地址、又不是本机 nexthop）⇒ 头可任意伪造 ⇒ 不信，用 socket 地址。
+ *     **刻意不加 env 白名单旋钮**（#677 正在收 env）：可信集合由部署形态直接推导，没有「运维要加
+ *     白名单」这个真实配置面，加旋钮只会多一个能配错的开关。
+ *     **未覆盖 v6 默认路由**（`/proc/net/ipv6_route` 本轮不解析，届时再补）。
+ *  ② 采信时取 XFF 的**最右一项**：标准里每跳代理把自己看到的对端**追加**到头后，最右一项 = 离 portal
+ *     最近那跳（edge）写下的真客户端；**最左是客户端自己写的，可伪造**。头缺失 / 全空 / 最右一项解析
+ *     不出合法 IP ⇒ 回落 socket 地址（**不向左继续找**，见工单）。
+ *  ③ 多层代理时「最右」只剥**一层** edge（当前部署就是单 edge）；将来前面再加一层，要改成取右数第 N 项。
+ *  ④ IPv6 带 zone（`%eth0`）先去掉；`::ffff:a.b.c.d` 映射地址还原成 v4 再记（否则同一 v4 客户端会以
+ *     两种形态各占一桶）。
+ *
+ * 这里是 `req.socket.remoteAddress` 在 `portal/src/**` 下**唯一**的合法落点（防回潮闸见 portal/test）。
+ *
+ * @param {object} req 只读 `req.socket.remoteAddress` 与 `req.headers['x-forwarded-for']`
+ * @param {{gatewayAddrs?: string[], procRoutePath?: string}} [opts] **仅供测试注入**：
+ *   `gatewayAddrs` 直接给定可信 nexthop 集合；`procRoutePath` 指到夹具文件。
+ *   生产 7 个调用点一律 `clientIp(req)`（走默认路径 + 懒算缓存），不传 opts。
+ */
+export function clientIp(req, { gatewayAddrs, procRoutePath } = {}) {
+  const socketIp = normalizeIp(req.socket.remoteAddress);
+  if (socketIp && isTrustedProxyAddr(socketIp, gatewayAddrs ?? gatewayAddrsFor(procRoutePath))) {
+    const forwarded = rightmostForwardedIp(req.headers && req.headers['x-forwarded-for']);
+    if (forwarded) return forwarded;
+  }
+  return socketIp || 'unknown';
+}
+
+/** 取 XFF 头的**最右一项**并解析成合法 IP；解析不出返回 null（调用方回落 socket 地址）。 */
+function rightmostForwardedIp(header) {
+  const value = Array.isArray(header) ? header[header.length - 1] : header;
+  if (typeof value !== 'string') return null;
+  const parts = value.split(',');
+  return normalizeIp(parts[parts.length - 1]);
+}
+
+/** 归一化一个 IP 字面量：去 zone / 剥 `[...]` / 还原 v4-mapped；合法返回小写字符串，否则 null。 */
+function normalizeIp(raw) {
+  if (typeof raw !== 'string') return null;
+  let s = raw.trim();
+  if (!s) return null;
+  const zone = s.indexOf('%'); // fe80::1%eth0 → fe80::1
+  if (zone !== -1) s = s.slice(0, zone);
+  if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1); // [::1] 字面量
+  s = s.toLowerCase();
+  const mapped = /::ffff:((?:\d{1,3}\.){3}\d{1,3})$/.exec(s); // ::ffff:a.b.c.d → a.b.c.d
+  if (mapped && net.isIPv4(mapped[1])) return mapped[1];
+  return net.isIPv4(s) || net.isIPv6(s) ? s : null;
+}
+
+/**
+ * #740 追加刀：解析 `/proc/net/route`，取**默认路由（目的 `00000000`）那行的 Gateway** = 本容器
+ * 默认路由的 nexthop，并入可信代理集合。
+ *
+ * 格式（tab 分隔文本）：`Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT`，
+ * 地址是**十六进制小端**：`010020AC` 要按字节反序还原成 `172.32.0.1`（即按 `AC 20 00 01` 读）；
+ * 照大端直读会得到另一个完全不同的地址（字节序单独钉在测试 A10）。
+ * 只取 `Destination == 00000000` 的行；Gateway 为 `00000000`（无下一跳，纯链路路由）或解析不出 ⇒ 跳过。
+ * 文件读不到（非 Linux / 进不了 `/proc` / 测试指不存在的路径）⇒ `[]`（**回落原集合**，fail closed）。
+ * 未覆盖 v6（`/proc/net/ipv6_route`），本轮不做。
+ *
+ * @param {{procRoutePath?: string}} [opts] 路径可注入（测试拿夹具文件喂）
+ * @returns {string[]} 去重后的 IP 数组（无默认路由 / 读不到 ⇒ `[]`）
+ */
+export function defaultGatewayAddrs({ procRoutePath = '/proc/net/route' } = {}) {
+  let text;
+  try {
+    text = fs.readFileSync(procRoutePath, 'utf8');
+  } catch {
+    return []; // 读不到 ⇒ 不扩可信集合（fail closed）
+  }
+  const addrs = [];
+  for (const line of text.split('\n')) {
+    const cols = line.trim().split(/\s+/);
+    // 列不足 8 = 表头/残行；目的非 00000000 = 非默认路由（子网直连路 Gateway 恒 00000000，本来也要排除）
+    if (cols.length < 8 || cols[1] !== '00000000') continue;
+    const gw = decodeHexLeIpv4(cols[2]);
+    if (gw && gw !== '0.0.0.0' && !addrs.includes(gw)) addrs.push(gw);
+  }
+  return addrs;
+}
+
+/** 把 `/proc/net/route` 的十六进制**小端**地址还原成点分 v4（`010020AC` → `172.32.0.1`）；非法返回 null。 */
+function decodeHexLeIpv4(hex) {
+  if (typeof hex !== 'string' || !/^[0-9a-fA-F]{8}$/.test(hex)) return null;
+  const octets = [];
+  for (let i = 0; i < 8; i += 2) octets.push(parseInt(hex.slice(i, i + 2), 16));
+  octets.reverse(); // 小端 → 网络序
+  const ip = octets.join('.');
+  return net.isIPv4(ip) ? ip : null;
+}
+
+/**
+ * 默认路由 nexthop 集合的**懒算缓存**：只在第一次真需要时读 `procRoutePath`，之后直接复用。
+ * 按路径缓存（生产只有一个默认路径 ⇒ 一个槽位；测试用不同夹具路径各算一次，不互相污染）。
+ */
+const gatewayAddrsCache = new Map();
+function gatewayAddrsFor(procRoutePath = '/proc/net/route') {
+  if (!gatewayAddrsCache.has(procRoutePath)) {
+    gatewayAddrsCache.set(procRoutePath, Object.freeze(defaultGatewayAddrs({ procRoutePath })));
+  }
+  return gatewayAddrsCache.get(procRoutePath);
+}
+
+/**
+ * socket 对端是否「可信代理地址」：loopback / RFC1918 / ULA `fc00::/7` / `::1`
+ * **或** 属于 `gatewayAddrs`（本机默认路由 nexthop；不传则走懒算缓存）。
+ */
+function isTrustedProxyAddr(ip, gatewayAddrs = gatewayAddrsFor()) {
+  if (staticTrustedProxyAddr(ip)) return true;
+  return Array.isArray(gatewayAddrs) && gatewayAddrs.includes(ip);
+}
+
+/** 与部署无关的静态可信段判定（loopback / RFC1918 / ULA / `::1`）。 */
+function staticTrustedProxyAddr(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 127) return true; // 127/8 loopback
+    if (a === 10) return true; // RFC1918 10/8
+    if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918 172.16/12
+    if (a === 192 && b === 168) return true; // RFC1918 192.168/16
+    return false;
+  }
+  const h = expandIpv6(ip); // IPv6
+  if (!h) return false;
+  if (h.slice(0, 7).every((x) => x === 0) && h[7] === 1) return true; // ::1
+  if ((h[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA（首 hextet 高 7 位 = 0b1111110）
+  return false;
+}
+
+/** 把合法 IPv6 串展开成 8 段数值（支持 `::` 压缩与尾部 v4）；段数不为 8 返回 null。 */
+function expandIpv6(addr) {
+  let s = addr.toLowerCase();
+  const v4tail = /:((?:\d{1,3}\.){3}\d{1,3})$/.exec(s);
+  if (v4tail) {
+    const oct = v4tail[1].split('.').map(Number);
+    const hi = ((oct[0] << 8) | oct[1]).toString(16);
+    const lo = ((oct[2] << 8) | oct[3]).toString(16);
+    s = s.slice(0, v4tail.index + 1) + hi + ':' + lo;
+  }
+  const dd = s.indexOf('::');
+  let head, tail;
+  if (dd !== -1) {
+    head = s.slice(0, dd) === '' ? [] : s.slice(0, dd).split(':');
+    const t = s.slice(dd + 2);
+    tail = t === '' ? [] : t.split(':');
+  } else {
+    head = s.split(':');
+    tail = [];
+  }
+  const headNums = head.map((x) => parseInt(x, 16));
+  const tailNums = tail.map((x) => parseInt(x, 16));
+  if (headNums.some(Number.isNaN) || tailNums.some(Number.isNaN)) return null;
+  if (dd === -1) return headNums.length === 8 ? headNums : null;
+  const missing = 8 - headNums.length - tailNums.length;
+  if (missing < 0) return null;
+  const out = [...headNums, ...new Array(missing).fill(0), ...tailNums];
+  return out.length === 8 ? out : null;
 }
 
 /**
@@ -4098,7 +4277,7 @@ async function handleLoginStep1(req, res, ctx) {
     throw new HttpError(400, 'validation_failed', `password 长度超过上限 ${maxPasswordLength}`);
   }
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const rlKey = `login:${ip}:${login}`;
   const check = ctx.loginLimiter.check(rlKey);
   if (!check.allowed) {
@@ -4513,7 +4692,7 @@ async function handleLoginEmailCode(req, res, ctx) {
     throw new HttpError(400, 'validation_failed', 'pending_token 与 code 均为必填');
   }
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   // 非消费读取（码错可重试，不烧 pending）；成功才原子消费。
   const userId = await auth.findPendingUser(pool, pendingToken);
   if (!userId) {
@@ -4601,7 +4780,7 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
     throw new HttpError(400, 'validation_failed', 'pending_token 为必填');
   }
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const userId = await auth.findPendingUser(pool, pendingToken);
   if (!userId) {
     throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
@@ -4724,7 +4903,7 @@ async function handleLoginTotp(req, res, ctx) {
     throw new HttpError(400, 'validation_failed', 'pending_token 与 code 均为必填');
   }
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
 
   // 非消费读取：TOTP 错误允许用同一 pending_token 重试（错误码不烧 token）；
   // 只有 TOTP 通过才原子消费（单次消费）。先解出用户，再按「账户 + IP」限流。
@@ -5048,7 +5227,7 @@ async function handlePreviewTicket(req, res, ctx, portId) {
   requireJson(req);
   await readJsonBody(req); // 无体（空 JSON {}）
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const rlKey = `ticket:${session.user.id}:${ip}`;
   const check = ctx.previewTicketLimiter.check(rlKey);
   if (!check.allowed) {
@@ -5167,7 +5346,7 @@ async function handleBatchPreviewTickets(req, res, ctx) {
 
   // ③ 限流：先查一次，再**逐张各记一次**（一次点击 = N 张票，放大倍数必须计入配额，否则批量端点
   //    会把 20/60s 的限额放大 10 倍）。
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const rlKey = `ticket:${session.user.id}:${ip}`;
   const check = ctx.previewTicketLimiter.check(rlKey);
   if (!check.allowed) {
@@ -5293,7 +5472,7 @@ async function handleChangeMyPassword(req, res, ctx) {
   // （不能让一个还没通过旧口令校验的人因为这条新规则看到新响应），理由见 `admin.changeOwnPassword`。
   const confirmPassword = body?.confirm_password;
 
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   const rlKey = `password:${session.user.id}:${ip}`;
   const check = ctx.loginLimiter.check(rlKey);
   if (!check.allowed) {

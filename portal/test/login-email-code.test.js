@@ -1337,3 +1337,62 @@ test('#449㉔ 已消费的码不可复用：走完 §2.3a 把码用掉后，第�
     await s.close();
   }
 });
+
+// ===========================================================================
+// #740 A5：发信限流**真的按客户端 IP 分桶**（这是 #740 的真实危害回归，必须点名到具体断言）。
+//
+// 判据：同一账号、同一时刻——
+//   · 两个不同客户端 IP（都经 loopback 这层可信 edge 进来，各带各的 XFF）各自拿得到发信额度；
+//   · 同一个客户端 IP 打到自己那一桶的上限后被拒（429 rate_limited + Retry-After）。
+// 判别力（不是「不报错即绿」）：把 `emailSendRateLimit.maxFailures` 压到 1 ⇒ 每桶一封就封；
+//   在旧写法下 `ip` 恒等于 socket（127.0.0.1）⇒ 全平台**共用一桶** ⇒ 第 1 步发完，第 3 步（另一个
+//   IP）也会 429。本用例断言「A 被封的同时 B 仍 200」，旧写法必红、新写法必绿。
+//   另带 `created_ip` 断言：发信码行记的是 XFF 里的真客户端，不是 127.0.0.1（工单 §1 末条核对）。
+// ===========================================================================
+test('#740 A5 发信限流按客户端 IP 分桶：不同 IP 各自有额度，同 IP 打到上限被拒', async () => {
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({
+    users: [await makeUser()],
+    mailer,
+    // 每桶一封即封：限流器 recordFailure 累计到 maxFailures 即 blocked。
+    emailSendRateLimit: { maxFailures: 1, windowMs: 60_000, blockMs: 60_000, maxEntries: 1000 },
+    // 关复用窗口 ⇒ 每次登录都真发信、各占自己那桶（也便于断 created_ip）。
+    loginEmailCodeOverrides: { resendCooldownSeconds: 0, maxResends: 99 },
+  });
+  try {
+    const XFF_A = '203.0.113.1';
+    const XFF_B = '198.51.100.7';
+    const body = { login: 'alice', password: PASSWORD };
+
+    // ① 客户端 A 第一次登录 ⇒ 200 + 发信；发信码行记的是 A，不是 socket 的 127.0.0.1。
+    const rA1 = await postJson(s.base, '/api/auth/login', body, { 'X-Forwarded-For': XFF_A });
+    assert.equal(rA1.status, 200);
+    assert.equal((await rA1.json()).status, 'email_code_required');
+    assert.equal(state.sent.length, 1, 'A 的第一封必须真发出去');
+    assert.ok(
+      s.pool.emailCodes.some((c) => c.created_ip === XFF_A),
+      `发信码行 created_ip 应是真客户端 ${XFF_A}，实际=${JSON.stringify(s.pool.emailCodes.map((c) => c.created_ip))}`,
+    );
+
+    // ② 客户端 A 第二次登录 ⇒ 429（同 IP 那一桶已满）；且在发信闸前就拒 ⇒ 不多发一封。
+    const rA2 = await postJson(s.base, '/api/auth/login', body, { 'X-Forwarded-For': XFF_A });
+    assert.equal(rA2.status, 429, '同一客户端 IP 打到上限应被发信限流拒');
+    const eA2 = await rA2.json();
+    assert.equal(eA2.error.code, 'rate_limited');
+    assert.ok(rA2.headers.get('retry-after'), '429 必须带 Retry-After');
+    assert.equal(state.sent.length, 1, '被限流是在发信之前 ⇒ 不该多发第二封');
+
+    // ③ 同一时刻，客户端 B（不同 XFF）登录 ⇒ 仍 200：证明 A 的那桶没毒害 B（分桶成立）。
+    //    旧写法下这里会是 429（A、B 都记成 127.0.0.1 共用一桶）——本行就是判别力所在。
+    const rB = await postJson(s.base, '/api/auth/login', body, { 'X-Forwarded-For': XFF_B });
+    assert.equal(rB.status, 200, '不同客户端 IP 应有独立额度（若为 429 ⇒ 全平台共桶，#740 复现）');
+    assert.equal((await rB.json()).status, 'email_code_required');
+    assert.equal(state.sent.length, 2, 'B 自己那一桶的第一封');
+    assert.ok(
+      s.pool.emailCodes.some((c) => c.created_ip === XFF_B),
+      `B 的发信码行 created_ip 应是 ${XFF_B}`,
+    );
+  } finally {
+    await s.close();
+  }
+});
