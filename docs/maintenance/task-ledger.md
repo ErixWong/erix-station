@@ -9853,6 +9853,35 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
 **残余**：`deploy/.env` 的 digest pin 与「换 FDE 镜像必须重建容器」是发布后动作（ci-release §2），
 本单未做。
 
+### 8.195 管理台宏模板「编辑」界面（#759，2026-11-25，PR #761 = `eda16e9`）
+
+**缺口**：管理台「宏」tab 原本**能建、能删、能启停，但改不了 `name`/`params`/`audience`**。
+后端 `adminPatchTemplate`（`macro-routes.js:290`）的白名单**本来就是为编辑准备的**（只禁 `kind`/`scope`），
+**前端只接了 `enabled` 一个字段**。后果：想改模板参数只能删了重建，而删会连带影响所有已订阅的会话。
+
+**做法**：抽出 `components/MacroTemplateForm.vue`（298 行），新建/编辑共用（`mode: 'create' | 'edit'`）；
+`AdminMacrosView.vue` 因此**减 206 行**。净 +483 / -206。
+
+**两个不能混的 `params` 预填语义**（本单最容易做错的地方）：
+- **新建** → 取 `KIND_SCHEMA` 的 `default`（issue #625 硬口径：schema 没写 `default` 的字段**不预填**）
+- **编辑** → 取**模板已有的值**，包括用户之前留空的字段
+
+混用的后果：编辑一个「`states` 为空」的模板会显示 schema 默认值，用户一保存就**悄悄改了语义**。
+
+**保存 body 只带 `{name, params, audience}`** —— 绝不带 `kind`/`scope`（后端见这俩直接 400），
+也不带 `enabled`（有独立启停按钮）。400 时**原样显示错误、表单不关、输入不清空**。
+
+**验收**：`vue-tsc` 通过；`AdminMacrosView.spec.ts` **14 条全绿**（原 8 无回归 + 新 6）。
+三条反向自证：编辑走 schema default 预填 ⇒ 5 条红；PATCH 带 `kind` ⇒ ④ 红；400 清空输入 ⇒ ⑤ 红。
+真机后端契约（容器内真库）：`threshold 15m → 30m`、`audience` 可改、`kind`/`scope` 均 `validation_failed`。
+
+⚠ **记一次打错的变异**：第一次让 400 分支 `emit('close')` ⇒ **14 条全绿** ——
+父组件没监听 `close`，那个 emit 是空操作。**「变异没红」≠「测试无效」，可能只是变异没打在起作用的路径上。**
+换成「400 时 `form.name = ''`」才红。
+
+**未做**：列表「订阅数」列仍显示 `—`（后端 `toTemplateSnapshot` 不下发订阅数，前端不拿 `0` 冒充）。
+编辑场景下这个数很关键，但补它要动后端投影，本单不动后端。
+
 ### 8.196 #727 片 2b：会话目录二级菜单（folder → session）+ 运行态与刷新（#727 / PR #757，2026-11-25，erix_run + 主 agent 真机回访）
 
 **为什么补**：用户验收指出上一版把需求做窄了——原始需求是「有个 folder(project) / session 的二级菜单」，
