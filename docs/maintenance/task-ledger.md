@@ -10343,3 +10343,27 @@ job summary 与 artifact `images-digest`，ID `14918481157`）；GitHub Release 
 上面写的 639 / 204 / 10037 是**合并前**的读数，留着不回改。
 **本 PR 自己必然走全量**（改了 `.github/workflows/`）⇒ 快道在 CI
   上第一次真生效，要等下一个纯 docs 的 PR。
+
+### 8.209 README 专业化改写 + 清掉两处过期状态（2026-11-25，主 agent，代号 `docs-261125-17-readme-polish`）
+
+**需求**：用户要求 README 用更专业的语言表达。改写时一并处理两处**过期事实**
+（改文风不等于可以留假话）：
+
+- `状态：P1 实现中` —— 平台自 2026-10 起已连续发版（现 `package.json` = `0.1.79`，
+  `docs/ops/handoff-2026-10-15.md` 记 v0.1.13 已上线），P5/P6 亦已落地（迁移
+  `0008-deprojectize.sql`、前端 `DirectoryTree.vue` / `FilePreviewModal.vue`）。
+  改为**不写分期结论**：版本以 `package.json` 现读、能力现状指向台账、分期指向主规格 §15
+  —— 三处都是可现验的坐标，不是快照。
+- `根 npm test 730 通过 / 1 跳过，2026-10-08 快照` —— 与 `docs/ops/ci-release.md`
+  的「本节是那份读数的单一来源」冲突（同一数字记两处必漂移）。README 不再持有任何用例数，
+  改为指向该文档并保留口径句「只认退出码与失败数」。
+
+**其余改动**：按「定位 / 项目状态 / 仓库结构 / 三条不变式 / 架构要点 / 开发与验证 / 相关文档」
+重排；删掉口语化标题与比喻，术语统一为「宿主平台、执行引擎、边缘入口、状态真相」；
+仓库结构表补齐 `db-init/`、`scripts/`、`test/`（此前缺三项，读者按表找不到闸脚本）；
+新增「架构要点」六条（入口 / portal / 前端 / runner / LLM / 部署），每条取自本仓既有契约。
+
+**验证**（只认退出码）：`npm run check:doc-portable` rc=0（626 文件）、
+`npm run check:doc-impl` rc=0（三比对全绿）、根 `npm test` rc=0
+（3324 项 / 3204 通过 / 0 失败 / 120 跳过；跳过数是本机无 `TEST_DATABASE_URL` 等环境门，
+口径见 `docs/ops/ci-release.md`）。README 单行均 ≤ 100 字节。
