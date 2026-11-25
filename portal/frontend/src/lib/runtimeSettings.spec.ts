@@ -6,7 +6,6 @@ import { describe, expect, it } from 'vitest';
 import {
   RUNTIME_SETTINGS_PATH,
   buildRuntimeSettingPayload,
-  buildRuntimeSettingPayloadFor,
   draftOf,
   formatRuntimeValue,
   normalizeRuntimeSettingItem,
@@ -24,7 +23,6 @@ const item = (over: Partial<RuntimeSettingItem> = {}): RuntimeSettingItem => ({
   value: 86400,
   source: 'db',
   applyMode: 'hot',
-  kind: 'integer',
   updatedAt: '2026-11-19T03:00:00.000Z',
   updatedBy: 'u-1',
   ...over,
@@ -41,7 +39,7 @@ describe('runtimeSettings: 归一化是显式白名单', () => {
     });
     expect(out).not.toBeNull();
     expect(Object.keys(out as object).sort()).toEqual(
-      ['applyMode', 'key', 'kind', 'label', 'source', 'updatedAt', 'updatedBy', 'value'],
+      ['applyMode', 'key', 'label', 'source', 'updatedAt', 'updatedBy', 'value'],
     );
     // 断言的仍是「没点名的键不进来」；双重转型只是为了让 `vue-tsc` 能走到这一步：
     // `RuntimeSettingItem` 既没有 `extra` 属性（直写是 TS2339），也没有索引签名（单转是 TS2352）。
@@ -87,7 +85,7 @@ describe('runtimeSettings: 归一化是显式白名单', () => {
     const kept = normalizeRuntimeSettingItem({ ...base, hint: 'x' });
     expect(kept?.hint).toBe('x');
     expect(keysOf({ ...base, hint: 'x' })).toEqual(
-      ['applyMode', 'hint', 'key', 'kind', 'label', 'source', 'updatedAt', 'updatedBy', 'value'],
+      ['applyMode', 'hint', 'key', 'label', 'source', 'updatedAt', 'updatedBy', 'value'],
     );
   });
 });
@@ -164,33 +162,9 @@ describe('runtimeSettings: 展示文案', () => {
   });
 });
 
-describe('#787 text 型旋钮（preview.kk_base_url）', () => {
-  it('kind 归一：只有显式 text 才当 text，缺字段/别的值一律 integer', () => {
-    expect(normalizeRuntimeSettingItem({ key: 'kk', kind: 'text' })?.kind).toBe('text');
-    expect(normalizeRuntimeSettingItem({ key: 'kk' })?.kind).toBe('integer');
-    expect(normalizeRuntimeSettingItem({ key: 'kk', kind: 'weird' })?.kind).toBe('integer');
-    expect(normalizeRuntimeSettingItem({ key: 'kk', kind: 7 })?.kind).toBe('integer');
-  });
-
-  it('buildRuntimeSettingPayloadFor：text 型 trim 后原样发（空串照发），integer 型走原解析', () => {
-    const textItem = item({ key: 'preview.kk_base_url', kind: 'text' });
-    expect(buildRuntimeSettingPayloadFor(textItem, '  http://kk:8012/  '))
-      .toEqual({ value: 'http://kk:8012/' });
-    // 空串照发（服务端才是闸）。
-    expect(buildRuntimeSettingPayloadFor(textItem, '')).toEqual({ value: '' });
-    expect(buildRuntimeSettingPayloadFor(textItem, '   ')).toEqual({ value: '' });
-    // integer 型：与 buildRuntimeSettingPayload 逐字同。
-    const intItem = item({ kind: 'integer' });
-    expect(buildRuntimeSettingPayloadFor(intItem, '7200')).toEqual({ value: 7200 });
-    expect(buildRuntimeSettingPayloadFor(intItem, '72.5')).toBeNull();
-    expect(buildRuntimeSettingPayloadFor(intItem, '')).toBeNull();
-    // buildRuntimeSettingPayload 本体行为不变（导出钉住）。
-    expect(buildRuntimeSettingPayload('7200')).toEqual({ value: 7200 });
-    expect(buildRuntimeSettingPayload('abc')).toBeNull();
-  });
-
+describe('string 值（不走整数解析那一套展示/回填）', () => {
   it('formatRuntimeValue / draftOf 对 string 值：原样显 / 回填为草稿', () => {
-    expect(formatRuntimeValue('http://kk:8012')).toBe('http://kk:8012');
-    expect(draftOf(item({ value: 'http://kk:8012' }))).toBe('http://kk:8012');
+    expect(formatRuntimeValue('http://docs:8012')).toBe('http://docs:8012');
+    expect(draftOf(item({ value: 'http://docs:8012' }))).toBe('http://docs:8012');
   });
 });

@@ -5,7 +5,8 @@
 //   ① 取数只有 GET：本页所有请求都走 `stores/adminSeatContent.ts` 的 action 与 `api()`，
 //      那个 store 里没有任何 method 字段（`api()` 缺省 GET），也没有 POST/PUT/PATCH/DELETE；
 //   ② 没有 SSE：本文件与 AdminTranscript / AdminSeatTreeNode 都不出现 `new EventSource`；
-//   ③ 没有上传/预览票据：不请求 `/pv/`、不请求 `/api/preview-tickets`（Office 一律只给下载）。
+//   ③ 没有上传/预览反代：Office 由前端渲染（字节走 `/api/file?mode=stream`），
+//      服务端既无签票端点也无反代路径可请（#795 下线）。
 // 三件事由 `src/views/AdminSeatContentView.spec.ts` 的「只读红线」用例钉住（fetch 桩 method
 // + URL 扫描 + EventSource 构造哨兵）。
 //

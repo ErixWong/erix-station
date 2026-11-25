@@ -4,7 +4,7 @@
 // 事件断言用父级 onClose 回调（script-setup 组件 emitted() 不记录，仓库先例亦不用）。
 // 注意：需 NODE_ENV=development 运行（仓库既有约定：NODE_ENV=development npm install && npm test）。
 // #795 追加：native-office / native-zip 通道的挂载选择与 failed 降级（四个渲染组件全部 vi.mock 桩化，
-//   jsdom 没有 canvas/layout，真库渲染不在单测里跑）；kkfile 已成死代码 ⇒ 原 kkfile 用例被替换。
+//   jsdom 没有 canvas/layout，真库渲染不在单测里跑）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { h } from 'vue';
@@ -238,7 +238,7 @@ describe('FilePreviewModal 四通道分流（#366 P0/P1/P2）', () => {
     w2.unmount();
   });
 
-  // #795：office/zip 改前端渲染。kkfile 用例（签票 / iframe / 探针）随通道下线一并移除，
+  // #795：office/zip 改前端渲染（服务端签票与可用性探针通道已下线），
   // 换成下面这组：挂载选择（按扩展名）+ failed 降级（提示 + 下载）+ doc 归 other。
   it('docx → OfficeDocxPreview；弹窗自身零请求（字节由组件自己经 useFileBytes 取）', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'x')));

@@ -38,8 +38,6 @@ export interface RuntimeSettingItem {
   value: number | string | boolean | null;
   source: RuntimeSettingSource;
   applyMode: RuntimeSettingApplyMode;
-  /** 输入框类型：`text` = 自由文本（如 kk 地址），缺省一律 `integer`（后端只有那一格声明 text）。 */
-  kind: 'integer' | 'text';
   updatedAt: string | null;
   updatedBy: string | null;
   /** 服务端登记过的行内提示文案（原样照抄，本页不翻译、不参与任何判定）。 */
@@ -85,8 +83,6 @@ export function normalizeRuntimeSettingItem(raw: unknown): RuntimeSettingItem | 
     value: asScalarOrNull(r.value),
     source: asSource(r.source),
     applyMode: asApplyMode(r.applyMode),
-    // #787：只有后端显式给 `kind: 'text'` 才当 text；其余（缺字段/别的值）一律 integer。
-    kind: (r.kind === 'text' ? 'text' : 'integer') as RuntimeSettingItem['kind'],
     updatedAt: asTextOrNull(r.updatedAt),
     updatedBy: asTextOrNull(r.updatedBy),
   }, r.hint);
@@ -130,20 +126,6 @@ export function parseDraftInteger(draft: string): number | null {
 export function buildRuntimeSettingPayload(draft: string): { value: number } | null {
   const value = parseDraftInteger(draft);
   return value === null ? null : { value };
-}
-
-/**
- * 按 `item.kind` 选发法（#787）：
- *   · `text` ⇒ `{ value: draft.trim() }`——**空串照发**（服务端才是闸，前端不预拒）；
- *   · 其余 ⇒ 走现有 `buildRuntimeSettingPayload`（整数解析，解不出 ⇒ `null` 不发）。
- * ❗ `buildRuntimeSettingPayload` 本体与导出行为不变（既有测试钉着）。
- */
-export function buildRuntimeSettingPayloadFor(
-  item: RuntimeSettingItem,
-  draft: string,
-): { value: number | string } | null {
-  if (item.kind === 'text') return { value: draft.trim() };
-  return buildRuntimeSettingPayload(draft);
 }
 
 /** `400` 的 `details.field` 归一化：只认 §4.21 点名的三档，其余归 `null`（不猜）。 */

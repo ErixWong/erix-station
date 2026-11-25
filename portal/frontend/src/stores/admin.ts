@@ -52,7 +52,6 @@ import {
 import {
   RUNTIME_SETTINGS_PATH,
   buildRuntimeSettingPayload,
-  buildRuntimeSettingPayloadFor,
   normalizeRuntimeSettingSaved,
   normalizeRuntimeSettingsList,
   replaceRuntimeSetting,
@@ -1014,12 +1013,7 @@ export const useAdminStore = defineStore('admin', {
       this.runtimeSavedKey = null;
       this.runtimeSaveErr = null;
       this.runtimeSaveField = null;
-      // #787：发法按那一格的 `kind` 分——text 型（kk 地址）走 trim 直发（空串照发，服务端才是闸），
-      // integer 型（或列表里查不到该格）仍走原有的整数解析（行为逐字不变）。
-      const target = this.runtimeSettings.find((row) => row.key === key) ?? null;
-      const payload = target
-        ? buildRuntimeSettingPayloadFor(target, draft)
-        : buildRuntimeSettingPayload(draft);
+      const payload = buildRuntimeSettingPayload(draft);
       if (payload === null) {
         this.runtimeSaveField = 'value';
         this.runtimeSaveErr = t('admin.runtime.errNotInteger');

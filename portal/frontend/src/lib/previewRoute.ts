@@ -2,8 +2,9 @@
 // 两桶清单是 #356 评审定稿的前端侧：
 //   - native-json：现有 /api/file JSON 契约（文本/Markdown/图片，≤2MB）——零改动沿用；
 //   - native-stream：浏览器原生能播的二进制（PDF/音视频），走 /api/file?mode=stream；
-//   - kkfile：Office/压缩包/CAD 等，走 kkFileView iframe（P2，POST /api/preview-tickets 签码）；
-//   - other：两桶之外一律「不预览」——点开即给下载（红线：清单外不猜格式，也不产生 kk 票）。
+//   - native-office：docx/xlsx/xls/pptx ⇒ 前端渲染库（#795，字节走 /api/file?mode=stream）；
+//   - native-zip：zip ⇒ 前端只列目录（jszip）；
+//   - other：两桶之外一律「不预览」——点开即给下载（红线：清单外不猜格式，也不渲染）。
 // 后端各自还有内容级判据（JSON 通道的 NUL 嗅探、stream 通道的 MIME 白名单），本清单只决定
 // 「点开后前端拿哪个通道试」；猜错的兜底方向永远是下载不是渲染。
 
@@ -24,21 +25,7 @@ export const VIDEO_EXTS = ['mp4', 'webm', 'm4v', 'mov'];
 export const AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'm4a'];
 
 /**
- * kkFileView 桶（#356 清单的 kkfile 半区）：Office / 压缩包 / CAD / 电子书。
- * #795 起**不再被 previewChannel 使用**（office/zip 改走前端渲染，其余降级 other）；
- * 常量暂留是因为 kkfile 通道本体（previewproxy.js / /pv / 签票）尚未下线，下一阶段一并删。
- */
-export const KKFILE_EXTS = [
-  // Office
-  'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'wps', 'et', 'dps', 'visio', 'vsd', 'vsdx', 'msword',
-  // 压缩包
-  'zip', 'rar', '7z', 'tar', 'gz', 'tgz', 'bz2', 'xz', 'tar.gz',
-  // CAD / 图形 / 电子书
-  'cad', 'dwg', 'dxf', 'psd', 'eps', 'tif', 'tiff', 'ceb', 'epub', 'chm', 'ofd',
-];
-
-/**
- * #795 前端渲染桶（不再经 kkFileView）：这四个扩展名有对应的前端渲染库，
+ * #795 前端渲染桶：这四个扩展名有对应的前端渲染库，
  * 组件按扩展名选（docx→docx-preview，xlsx/xls→xlsx，pptx→pptx-preview）。
  */
 export const OFFICE_EXTS = ['docx', 'xlsx', 'xls', 'pptx'];
@@ -50,7 +37,7 @@ export const ZIP_EXTS = ['zip'];
 export const OFFICE_MAX_BYTES = 20 * 1024 * 1024;
 
 export type PreviewChannel =
-  'native-json' | 'native-stream' | 'native-office' | 'native-zip' | 'kkfile' | 'other';
+  'native-json' | 'native-stream' | 'native-office' | 'native-zip' | 'other';
 
 /** 取小写扩展名（无点；隐藏文件去点按整名计，.env 算 env、.gitignore 算 gitignore；目录尾斜杠 → ''）。 */
 export function extOf(path: string): string {
@@ -67,7 +54,7 @@ export function isMarkdownName(name: string): boolean {
   return /\.(md|markdown)$/i.test(String(name ?? ''));
 }
 
-/** 扩展名 → 预览通道。清单外一律 other（不猜）；kkfile 分支已死（#795），不再产出。 */
+/** 扩展名 → 预览通道。清单外一律 other（不猜）。 */
 export function previewChannel(path: string): PreviewChannel {
   const ext = extOf(path);
   if (IMAGE_EXTS.includes(ext) || TEXT_EXTS.includes(ext)) return 'native-json';

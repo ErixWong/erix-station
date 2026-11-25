@@ -1,8 +1,8 @@
 // previewRoute 纯函数单测（#366 / #795）：各通道分流的每一条边界 +
-// 与后端 MIME/嗅探表的两处漂移钉。#795：office/zip 已改前端渲染，kkfile 不再被产出。
+// 与后端 MIME/嗅探表的两处漂移钉。#795：office/zip 已改前端渲染。
 import { describe, expect, it } from 'vitest';
 import {
-  IMAGE_EXTS, KKFILE_EXTS, OFFICE_EXTS, PDF_EXTS, VIDEO_EXTS, AUDIO_EXTS, ZIP_EXTS,
+  IMAGE_EXTS, OFFICE_EXTS, PDF_EXTS, VIDEO_EXTS, AUDIO_EXTS, ZIP_EXTS,
   OFFICE_MAX_BYTES,
   downloadUrl, extOf, isMarkdownName, jsonPreviewUrl, previewChannel, streamMediaKind, streamPreviewUrl,
 } from './previewRoute';
@@ -38,7 +38,7 @@ describe('previewChannel 通道分流', () => {
     expect(previewChannel('pack.zip')).toBe('native-zip');
     expect(previewChannel('sub/A.ZIP')).toBe('native-zip');
   });
-  it('其余 Office / 压缩包一律 other（#795：kkfile 不再被产出，也不猜）', () => {
+  it('其余 Office / 压缩包一律 other（#795：清单外一律不猜）', () => {
     for (const p of ['a.doc', 'b.ppt', 'c.wps', 'd.visio', 'e.cad', 'f.rar', 'g.7z',
       'h.tar.gz', 'i.epub', 'j.ofd']) {
       expect(previewChannel(p)).toBe('other');
@@ -80,14 +80,6 @@ describe('与后端表的漂移钉（改一边必须改另一边）', () => {
   it('流式媒体桶逐字对齐后端 STREAM_MIME 的非图片部分', () => {
     expect([...PDF_EXTS, ...VIDEO_EXTS, ...AUDIO_EXTS].sort().join(','))
       .toEqual(['m4a', 'm4v', 'mp3', 'mp4', 'mov', 'ogg', 'pdf', 'wav', 'webm'].sort().join(','));
-  });
-  it('kkfile 桶常量仍覆盖 Office 三件套与常见压缩包（常量暂留，通道已死，#795）', () => {
-    for (const e of ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'zip', 'rar', '7z']) {
-      expect(KKFILE_EXTS).toContain(e);
-    }
-  });
-  it('kkfile 常量不再是路由依据：任何扩展名都不会路由到 kkfile', () => {
-    for (const e of KKFILE_EXTS) expect(previewChannel(`a.${e}`)).not.toBe('kkfile');
   });
 });
 

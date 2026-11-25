@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// docx 前端渲染（issue #795）：docx-preview 把 OOXML 直接画成 HTML，不再经 kkFileView。
+// docx 前端渲染（issue #795）：docx-preview 把 OOXML 直接画成 HTML（字节走 mode=stream）。
 // 字节由 useFileBytes 取（/api/file?mode=stream，>20MB 已在上游降级）。
 // 组件只负责渲染：失败/超限一律 emit('failed', …)，提示文案与下载出口统一由 FilePreviewModal
 // 出——组件自己不放下载按钮（否则同一屏会出现两个出口）。

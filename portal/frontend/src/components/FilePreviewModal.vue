@@ -4,13 +4,9 @@
 //   native-json —— 文本/Markdown/图片：/api/file JSON 契约，逐字节沿用 #84 行为
 //                  （Markdown 复用 lib/markdown.ts + mermaid；文本 <pre>；图片 base64 <img>）；
 //   native-stream — PDF/音视频：浏览器原生 <object>/<video>/<audio>，src=/api/file?mode=stream；
-//   kkfile —— Office/压缩包等：POST /api/preview-tickets 签能力码 → iframe 指 /pv/<码>/onlinePreview
-//                  （sandbox="allow-scripts" 无 allow-same-origin：kk 产物页脚本拿不到 portal 会话）；
 //   native-office — docx/xlsx/xls/pptx：前端库直接渲染（#795），字节走 mode=stream，>20MB 降级；
 //   native-zip —— zip：jszip 只列目录（不解压、不单项下载）；
 //   other —— 清单外：不发任何请求，直接给下载。
-// kkfile 分支从 #795 起是**死代码**：previewChannel 不再产出该通道；签票/iframe 原样留着，
-// 下一阶段 kkFileView 下线时一并删。
 // 失败态（413/415/502/网络）：错误 message 直显 + 「下载」按钮（P0：死路页的出口）。
 // 交互对齐 SessionPickerModal：dialog 语义（role/aria-modal）、Esc 关闭、打开焦点进 dialog、
 // 关闭归还触发按钮、锁背景滚动。
@@ -43,10 +39,6 @@ interface FilePreview {
   kind: 'image' | 'text';
   data: string;
 }
-interface PreviewTicket {
-  url: string;
-  expires_in: number;
-}
 
 const channel = computed(() => previewChannel(props.path));
 const mediaKind = computed(() => streamMediaKind(props.path));
@@ -55,7 +47,6 @@ const dlUrl = computed(() => downloadUrl(props.cwd, props.path));
 const loading = ref(true);
 const error = ref('');
 const preview = ref<FilePreview | null>(null);
-const kkUrl = ref('');
 // #795：native-office / native-zip 的降级位（子组件 emit failed 后置位，非空 ⇒ 只给提示+下载）。
 const officeFail = ref<'' | 'too_large' | 'render_failed'>('');
 /** 选哪个 office 子组件：按扩展名（xls/xlsx 共用 SheetJS 那个）。 */
@@ -65,9 +56,6 @@ const officeKind = computed(() => {
 });
 // 换文件时清掉上一个文件的降级态（否则新文件一挂载就先显示旧错误）。
 watch(() => [props.cwd, props.path], () => { officeFail.value = ''; });
-// #787：kkfile 通道先探一下预览后端。非空 ⇒ 不签票、不渲染 iframe，只给下载。
-//   'unconfigured' = 后端没配 kk；'unreachable' = 配了但不可达 / 探针请求本身失败（fail-closed）。
-const backendState = ref<'' | 'unconfigured' | 'unreachable'>('');
 
 // Markdown 分支（.md/.markdown）复用既有渲染器；其余文本原样 <pre>。
 const isMarkdown = computed(() => isMarkdownName(preview.value?.name ?? ''));
@@ -84,38 +72,6 @@ async function loadJson(): Promise<void> {
   }
 }
 
-/**
- * #787：探一下预览后端（kkFileView）是否可用。返回 'ready' / 'unconfigured' / 'unreachable'。
- * 探针请求本身失败（非 2xx / 网络）⇒ 'unreachable'（fail-closed 到下载，不赌 iframe 会渲染成功）。
- */
-async function probeBackend(): Promise<'ready' | 'unconfigured' | 'unreachable'> {
-  try {
-    const s = await api<{ configured?: boolean; available?: boolean }>('/api/preview-backend');
-    if (s?.available === true) return 'ready';
-    return s?.configured === false ? 'unconfigured' : 'unreachable';
-  } catch {
-    return 'unreachable';
-  }
-}
-
-/**
- * kkfile 通道：签能力码。票据 403 preview_code_expired（文件被 agent 改写 / 码过期）时重签一次
- * ——这是 cache-buster 语义的闭环：改写后旧码作废，自动换新码让 kk 重转。其它错误直显 + 下载。
- */
-async function loadTicket(attempt = 1): Promise<void> {
-  try {
-    const tk = await api<PreviewTicket>('/api/preview-tickets', {
-      method: 'POST',
-      body: JSON.stringify({ cwd: props.cwd, path: props.path }),
-    });
-    kkUrl.value = tk.url;
-  } catch (e) {
-    const expired = e instanceof Object && 'code' in e && (e as { code?: string }).code === 'preview_code_expired';
-    if (expired && attempt === 1) return loadTicket(2);
-    error.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
 onMounted(async () => {
   // 焦点管理 + 背景滚动锁定：打开焦点进 dialog，关闭归还触发按钮（对齐 SessionPickerModal）。
   previousFocus = document.activeElement;
@@ -127,12 +83,6 @@ onMounted(async () => {
   else if (channel.value === 'native-office' || channel.value === 'native-zip') {
     // #795：字节由子组件自己加载（含 20MB 上限判定），这里**不发任何请求**，只收掉加载态。
     loading.value = false;
-  }
-  else if (channel.value === 'kkfile') {
-    // #787：先探后端；可用才签票 + 渲染 iframe，否则直接降级到下载（不签票、不发 iframe）。
-    const state = await probeBackend();
-    if (state === 'ready') await loadTicket();
-    else backendState.value = state;
   }
   // native-stream / other 不发请求：媒体元素自加载；other 只给下载。
   loading.value = false;
@@ -186,13 +136,6 @@ function onKeydown(e: KeyboardEvent) {
       <!-- 通道内容：加载中 / 失败（带下载）/ 四通道渲染 -->
       <div class="min-h-0 flex-1 overflow-auto px-3 py-2">
         <p v-if="loading" class="muted py-6 text-center text-sm">{{ t('common.loading') }}</p>
-        <!-- #787：预览后端未配置 / 不可达 ⇒ 不渲染 iframe，只给提示 + 下载（复用失败态那套 role=alert） -->
-        <div v-else-if="backendState" class="py-6 text-center" role="alert">
-          <p class="muted text-sm">{{ t(backendState === 'unconfigured' ? 'preview.backendUnconfigured' : 'preview.backendUnreachable') }}</p>
-          <a :href="dlUrl" class="mt-3 inline-block rounded-md border border-black/15 px-3 py-1.5 text-sm hover:bg-black/5" :download="props.path.split('/').pop()">
-            {{ t('preview.downloadInstead') }}
-          </a>
-        </div>
         <div v-else-if="error" class="py-6 text-center" role="alert">
           <p class="syserr text-sm">{{ error }}</p>
           <a :href="dlUrl" class="mt-3 inline-block rounded-md border border-black/15 px-3 py-1.5 text-sm hover:bg-black/5" :download="props.path.split('/').pop()">
@@ -237,8 +180,6 @@ function onKeydown(e: KeyboardEvent) {
           v-else-if="channel === 'native-zip'"
           :cwd="props.cwd" :path="props.path" @failed="(r) => { officeFail = r; }"
         />
-        <!-- kkfile：kkFileView iframe。sandbox 不给 allow-same-origin：预览内容脚本拿不到 portal 会话/存储 -->
-        <iframe v-else-if="channel === 'kkfile' && kkUrl" :src="kkUrl" class="h-full w-full rounded-md border border-black/10 bg-white" sandbox="allow-scripts" :title="props.path"></iframe>
         <!-- other：清单外不猜格式，唯一出口是下载 -->
         <div v-else class="py-6 text-center">
           <p class="muted text-sm">{{ t('preview.notPreviewable') }}</p>

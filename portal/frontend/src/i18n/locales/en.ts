@@ -604,8 +604,6 @@ export const en = {
     downloadInstead: 'Download this file',
     notPreviewable: 'This format cannot be previewed online',
     pdfUnsupported: 'This browser cannot display the embedded PDF; download it and open locally',
-    backendUnconfigured: 'No document preview service is configured; please download and view.',
-    backendUnreachable: 'The document preview service is unavailable; please download and view.',
     // #795: two degrade messages for the client-side rendering channels (docx/xlsx/xls/pptx/zip)
     // plus the zip listing column headers. Pairs with zh-CN.ts one-for-one.
     officeTooLarge: 'This file is over 20MB; download it to view.',
@@ -1313,9 +1311,6 @@ export const en = {
       sourceDefault: 'Built-in default',
       applyHot: 'takes effect immediately',
       applyRestart: 'needs a restart',
-      kkUnconfigured: 'Not configured',
-      kkReachable: 'Reachable',
-      kkUnreachable: 'Unreachable',
       save: 'Save',
       saving: 'Saving…',
       saved: 'Saved (the number below is the one the server read back after writing), {apply}',
