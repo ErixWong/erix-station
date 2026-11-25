@@ -7,7 +7,7 @@
 // 背景（本用例存在的理由）：P5「目录即项目」之后，目录名**不进预览 hostname**
 // （hostname = <工位名>-p-<端口>.<伞域>，迁移 0008；docs/design/directory-as-project.md §3），
 // 于是「DNS label」不再是目录名的约束来源。后端 portal/src/sessions.js 的 validateSessionCwd
-// 早就有意允许 `_`（容器内用户自建目录的自由命名权，真库存量 `demo_app`），而前端表单
+// 早就有意允许 `_`（容器内用户自建目录的自由命名权），而前端表单
 // 仍按旧的 hostname 段规则把 `_` 拒掉 —— 用户看得到、选得中该目录，却建不了同族新目录。
 // 本单只补这一条：`_` 放行；首尾 / 大写 / 中文 / 空格 / 长度的既有行为**一字不改**。
 import { readFileSync } from 'node:fs';
@@ -24,8 +24,8 @@ const SESSIONS_JS = fileURLToPath(new URL('../../../src/sessions.js', import.met
 
 describe('DIR_NAME_RE（issue #284：与后端对齐，允许下划线）', () => {
   it('通过：下划线在中间的名字（真库/真实用法）+ 连字符名 + 单字符 + 63 字符', () => {
-    // `demo_app` 是真库存量（15 次 run，含 finished）；另外两个是用户实际想建的名字。
-    for (const name of ['demo_app', 'cmms_test', 'ai_agent_lab', 'my-app', 'a', 'a1', 'a_b-c9']) {
+    // 下划线形态是真实用过的写法；另外几个是用户实际想建的名字形态。
+    for (const name of ['demo_app', 'demo_test', 'agent_lab', 'my-app', 'a', 'a1', 'a_b-c9']) {
       expect(DIR_NAME_RE.test(name), `应通过：${name}`).toBe(true);
     }
     // 长度上限不变：1 + 61 + 1 = 63（首尾各一个字母数字，中间 ≤61）
