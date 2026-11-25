@@ -55,9 +55,9 @@
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-enroll` | 补绑/重绑 TOTP；新种子只在本次响应下发并强制重新登录 |
-| 管理 | `POST /api/admin/users/:login/tokens` | **签发 API 令牌**（#736，§2.13）：代 FDE 签，`{name, scopes?}`⇒`201`，明文**仅此一次**；非 admin⇒`403 insufficient_role`，重名⇒`409 token_name_taken`，非空 scopes⇒`400 scopes_unsupported` |
-| 管理 | `GET /api/admin/users/:login/tokens` | **列出令牌**（#736，§2.13）：`{tokens:[{id,name,scopes,created_at,last_used_at,revoked_at}]}`，**不返 hash**，含已吊销，按创建时间升序 |
-| 管理 | `DELETE /api/admin/users/:login/tokens/:id` | **吊销令牌**（#736，§2.13）：幂等 `{status:"revoked", already_revoked}`；跨账号/查无⇒`404` |
+| 管理 | `POST /api/admin/users/:login/tokens` | **签发 API 令牌**（#736，§2.13）：代 FDE 签，`{name, scopes?}`⇒`201`，明文**仅此一次**；非 admin⇒`403 insufficient_role`，重名⇒`409 token_name_taken`，非空 scopes⇒`400 scopes_unsupported`；**当前停用（`TOKEN_ROUTES_ENABLED=false`）⇒ 404**；§2.13 是启用后的条件契约 |
+| 管理 | `GET /api/admin/users/:login/tokens` | **列出令牌**（#736，§2.13）：`{tokens:[{id,name,scopes,created_at,last_used_at,revoked_at}]}`，**不返 hash**，含已吊销，按创建时间升序；**当前停用（`TOKEN_ROUTES_ENABLED=false`）⇒ 404**；§2.13 是启用后的条件契约 |
+| 管理 | `DELETE /api/admin/users/:login/tokens/:id` | **吊销令牌**（#736，§2.13）：幂等 `{status:"revoked", already_revoked}`；跨账号/查无⇒`404`；**当前停用（`TOKEN_ROUTES_ENABLED=false`）⇒ 404**；§2.13 是启用后的条件契约 |
 | 管理 | `GET /api/admin/mail/settings` | **邮件通道配置：读**（#449，§4.12）。**永不返回口令**：只给 `hasPassword` 布尔；无行（未配置）也回 `200` + 默认 DTO |
 | 管理 | `PUT /api/admin/mail/settings` | **邮件通道配置：写**（#449，§4.12）。口令**只写**：键缺席 = 不修改、`null`/`""` = 清除；落库后缓存**立刻**失效（不等 60s TTL） |
 | 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
@@ -105,16 +105,25 @@
 | LLM 管理 | `GET /api/admin/llm/providers` | 供应商 + 模型列表（模型对象的两个名字见 §4.9） |
 | LLM 管理 | `POST /api/admin/llm/providers/:id/models` | 新增模型 |
 | LLM 管理 | `PATCH /api/admin/llm/models/:id` | **改模型：调用名 `call_name`（数据面）与显示名 `name` 是两个字段**（#296，§4.9） |
-| LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」 |
+| LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」——**当前无实现 ⇒ 404**（#777 A1）|
 | LLM 管理 | `DELETE /api/admin/llm/models/:id` | 删模型（附虚拟 key 清理） |
 | LLM 管理 | `GET/PUT /api/admin/fdes/:fde/llm/budget` | 读/设 **FDE 周期额度（USD / 周期，`budget_period` ∈ {`1d`,`1mo`}）**（#719，§4.10） |
 | LLM 管理 | `GET /api/admin/fdes/:fde/llm/usage?days=30` | 近 N 天用量（直读 LiteLLM 聚合端点，#719，§4.10） |
 
-> LLM 管理这条线**其余**端点（供应商增删、`GET/PUT /api/admin/fdes/:name/llm`、
+> LLM 管理这条线**其余**端点（`GET/PUT /api/admin/fdes/:name/llm`、
 > `POST /api/admin/fdes/:name/llm/heartbeat`、`GET /api/admin/llm/model-catalog`、
-> `GET /api/admin/llm/usage`）此前同样不在索引里，本次不逐个补写契约（不在 #296 面上）；
-> 行为以 `portal/src/llm.js` + `portal/test/llm*.test.js` 为准，改名这条线的契约见 §4.9，
-> 心跳对账的口径见 `AGENTS.md` §8.25。登记这几行是为了「端点索引与文档自洽」（§7.13）。
+> `GET /api/admin/llm/usage`）此前同样不在索引里。
+> ⚠ **#777 实测**：后三条在 `portal/src/` 与 `portal/frontend/src` 各 **0 命中**
+> （`route()` 无对应分支 ⇒ 落 **404**）。
+> 那句「行为以 `portal/src/llm.js` 为准」对这三条**不实**（`llm.js` 内也无它们的路由）。
+> **真实存在**的是 `GET/PUT /api/admin/fdes/:fde/llm` 与
+> `GET /api/admin/fdes/:fde/llm/usage`（后者见 `route()` 里匹配
+> `/api/admin/fdes/<id>/llm/usage` 的正则分支）——**这两条不是 404，不得一起标成停用**。
+> 改名这条线的契约仍见 §4.9；登记这几行是为了「端点索引与文档自洽」（§7.13）。
+> 另：`POST /api/admin/llm/providers`、`PATCH|DELETE /api/admin/llm/providers/:id`、
+> `GET /api/admin/llm/models` 与 `POST /api/admin/llm/models/:id/block|unblock`
+> （`http.js:1927/1965/1995`）**已实现但无契约**，只在正文散文里出现过 —— 待补写（#777 A 组）。
+> 心跳对账的口径仍见台账 §8.25；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
 >
@@ -1183,13 +1192,17 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 
 ### 3.5 `PATCH /api/projects/:id`
 
+> ⚠ **已退役（P5 去项目化）**：实现对该方法返回 `410 project_api_retired`（`portal/src/http.js`）；以下正文是 P5 之前的历史契约，只作历史参考，不得当现行契约
+
 请求（全部可选）：`{ "name": "proj2" }`。
-响应 `200`：更新后的 Project。
+响应 **`410`**（现行，`project_api_retired`）；~~`200`~~：更新后的 Project（P5 前历史）。
 错误：`409 name_conflict`；**改名不重生成**已有 allocation 的 `hostname`/`url`——hostname 里的 `<project-name>` 是**分配时的项目名快照**，改名只更新 `projects.name`（容器内目录名）与**后续新建** run/端口的 hostname，旧 hostname 保持可访问（书签不破，规格 §8.5 不可变性）。改名不写 route outbox（无 hostname/url 变化）；`ports.json` 与 Traefik 路由的更新时机 = **只有新建/释放 allocation** 才触发（规格 §8.1，DB 为真相）。
 
 ### 3.6 `DELETE /api/projects/:id`
 
-响应 `204`。删除 = 回收该项目全部端口（`state → released`）+ 写 route outbox tombstone（同一 DB 事务，规格 §8.2）+ 项目归档；Traefik 路由由 file provider **异步、幂等**发布删除（「路由表里没有 = 不可达」）。
+> ⚠ **已退役（P5 去项目化）**：实现对该方法返回 `410 project_api_retired`（`portal/src/http.js`）；以下正文是 P5 之前的历史契约，只作历史参考，不得当现行契约
+
+响应 **`410`**（现行，`project_api_retired`）；~~`204`~~（P5 前历史）。删除 = 回收该项目全部端口（`state → released`）+ 写 route outbox tombstone（同一 DB 事务，规格 §8.2）+ 项目归档；Traefik 路由由 file provider **异步、幂等**发布删除（「路由表里没有 = 不可达」）。
 错误：`409 active_runs` —— 项目下有进行中的 run，须先停止。
 
 ---
@@ -1967,6 +1980,8 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 
 ### 4.7 端口列表
 
+> ⚠ **已退役（P5 去项目化）**：实现对该方法返回 `410 project_api_retired`（`portal/src/http.js`）；以下正文是 P5 之前的历史契约，只作历史参考，不得当现行契约
+
 > 本节只覆盖**已退役的项目维度**列表与未交付的 `PATCH /api/ports/:id`。**现役的列端口端点（本人 / 管理员）与
 > 管理员改块（= 搬迁）在 §4.7a**（issue #246 交付②）。
 
@@ -1980,7 +1995,7 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 
 #### `GET /api/projects/:id/ports`
 
-响应 `200`：
+响应 **`410`**（现行，`project_api_retired`）；~~`200`~~（P5 前历史）：
 
 ```json
 {
@@ -2003,7 +2018,7 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 
 | 字段 | 说明 |
 |---|---|
-| `scope` | `project` \| `run`。⚠️ 待决策者确认（Q5）：P1 先只做项目级，响应模型保留 `scope`/`run_id` 字段以兼容 P2 的 run 级端口（principles §4 Q5 倾向 (b) 起步） |
+| `scope` | `project` \| `run`。**Q5 已决**（迁移 `0018` 放开第三值 `fde`：FDE 主机级号池，`run_id` 恒 NULL；项目级仅存量）。本节是 P5 前的历史契约，**现役**列端口见 §4.7a（`scope` 恒 `fde`） |
 | `role` | `frontend` \| `backend` \| `debug` \| `spare`（规格 §8.2 端口块用途） |
 | `url` | 由 portal 与 Traefik 路由同源生成（规格 §8.1）；前端**只展示/跳转此 url，永不自行拼接** |
 | `exposure` | `private`（默认）\| `org-visible` \| `public`（规格 §6.5） |
@@ -4222,7 +4237,7 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
   > （见上面那条 #502 注记与 `docs/data/model.md` §1.12）。原文留着是取证它当时的口径；本注记**仍然有效的部分**
   > 是后半句：客户端不得拿跳号当重连判据，丢失恢复只走 `resync` 与 `Last-Event-ID` 两条路。
 - 响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
-- 每 15s 发送注释行心跳（`: ping\n\n`），防止中间层断连。心跳不是事件，不占 seq。
+- 首连与每 15s 各发一次注释行 `: ping` **与命名事件 `event: ping`（data `{ts}`）**；`ping` 不占 `seq`，发射点是 `portal/src/http.js` 的 `writeSseEvent(res, 'ping', {ts})`。
 - 响应建议携带 `retry: 3000`，指导浏览器断线重连间隔。
 - **`resync` 控制帧**（宿主侧帧，**不属** §5.3 事件类型清单、不带 `seq`/`id`）：服务端补发前的缓冲溢出（上限 1000 条）时，portal 不再静默丢事件——向该连接写 `event: resync` + `data: {"reason":"buffer_overflow"}` 后 `res.end()`。该帧**不带** `last_seq`：重连游标由客户端用自己的本地水位线（已收到的最大 `seq`，含 `messages` 与 `run_events` 共用分配器造成的跳号）维护，服务端缓冲区里的最大 seq 不构成可靠游标（补发/写回窗口内可能漏）。客户端应立刻 `close()` 并以 `?last_event_id=<本地已知最大 seq>` 重连，由补发路径收敛（§5.2）。这是客户端唯一的主动重连触发条件（未知类型忽略原则仍适用于 §5.3 之外的其它扩展类型）。
 
@@ -4274,10 +4289,10 @@ data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id"
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `seq` | number \| null | 宿主落库时分配，session 内**单调递增**（允许跳号，见 §5.1 注记）。**只有 durable 档才有值**：stream 档碎片不落库 ⇒ `seq` 为 **`null`**（帧也不带 `id:`）；portal 合成的状态类事件（如第 17 类 `queue_update`）同样是 `null`。**前端不得把 `null` 当 0** |
+| `seq` | number \| null | 宿主落库时分配，session 内**单调递增**（允许跳号，见 §5.1 注记）。**只有 durable 档才有值**：stream 档碎片不落库 ⇒ `seq` 为 **`null`**（帧也不带 `id:`）；portal 合成的状态类事件（如第 17 类 `queue_update`）同样是 `null`。**前端不得把 `null` 当 0**；自造会话级事件不带 `seq` |
 | `ts` | string | ISO 8601 UTC，宿主落库时间 |
 | `session_id` | string | — |
-| `run_id` | string | 产生该事件的 run |
+| `run_id` | string? | 产生该事件的 run；portal 自造的会话级事件（`session_updated`、`ping`）**不带** `run_id` |
 | `type` | string | 见下表 |
 
 **类型清单**（前端 `switch` 必须覆盖全部；未知类型一律忽略并记日志，保证上游 additive 扩展向后兼容）：
@@ -4313,6 +4328,8 @@ data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id"
 | 27 | `user_turn_guard_unrecoverable` | **引擎 `onEvent`**（erix-agent 0.30.0 的 `LoopEvent` 联合类型新增 8 类之一；发射点 `orchestrator.js:2716`） | `round: number`、`channel: string`、`reason: string`、`detail: string`（首句是固定原文）、`runId?`、`parentRunId?`。语义：请求视图违反「必须有 user 轮」不变式、且**所有回补都失败** ⇒ 请求**原样发出**，上游多半以 400 拒掉它。它是在那次 400 **之前**发的，所以是唯一归因信号。界面：中性分隔行（`stream.event.userTurnGuardUnrecoverable`，`round`/`channel`/`reason` 缺 ⇒ `?`）；runner 另落一条 **`warn`** LOG。**0.30.0 的 8 个新类型里本站只把这一类放进时间线**：另外 5 个（`tool_output_aggregate` / `continuity_written` / `continuity_write_failed` / `final_guard_extend` / `context_unknown_option`）是**写明理由的豁免**（见 `portal/test/event-surface-contract.test.js` 的豁免表），`forced_final` 与 `continuity_injection_skipped` 早在册。 |
 | 28 | `host_steer_injected` | **引擎 `onEvent`**（erix-agent 0.32.0 的 `LoopEvent` 联合类型新增——0.32.0 **27 类 → 28 类，只多这一个、删 0**；发射点 `orchestrator.js:3300`，级别 `fact`） | `round: number`、`chars: number`（注入那条 user 轮的正文字符数，上游 #753 C1 钉了它）。语义：宿主经 `capabilities.hooks.nextUserTurn` 递进来的那句话**真的被注成了这条 user 轮**。**本站显式豁免、不刷行也不回放**：引擎只在钩子是个函数时才走到发射点（`orchestrator.js:3253` 早退），而本站**不传那个钩子**（现查 `grep -rn "hooks\s*:" portal runner | grep -v node_modules` = 0 命中）⇒ 结构上不产生该事件；即使开了，用户可见的反馈也已在 `queue_update`（§4.3a）与注入后的正文里，再加一行是同一件事说两遍。订得到（水位线推进、`hooks.onEvent` 观察面可见），但**不进 §4.4a 历史白名单也不进 `HISTORY_REPLAY_TYPES`**，同 `run_outcome` / `continuity_injection_skipped` 先例；决定与理由钉在 `portal/test/event-surface-contract.test.js` 的豁免表（只加前端 `EVENT_TYPES` 不写决定会被 S2 判红）。 |
 | 29 | `textualized_tool_call` | **本站自造**（issue #243：终局正文是一段**被文本化的工具调用** —— 模型把 tool call 吐进 content，引擎当最终文本收下 ⇒ run 正常 `finished`，但交付报告可能没生成）。来源不是容器：worker 只在命中时在 U2 载荷里 additive 带 `textualized_tool_call: true`（+ 命中的那条特征名），由 `internal.js` 的 `finishRun` 在**同一个终态事务内**合成事件行（U3 那条路走不通：它的写闸是「租约有效」，而收尾时租约随时被清 —— #220 现查取证；同 `attempt_killed` 的 reaper 分支） | `chars: number`（**本站从收到的 `final_text` 自己算**，不取容器报的数）、`marker?: string`（命中的那条特征，≤120 字符的外来串，只用来出文案片段；没给就没有这个键。**上界与 runner 侧同一个命名常量**（`TEXTUALIZED_MARKER_MAX_CHARS`，两侧不许各写一个裸数字）：超长的片段由 **runner/agentd 丢在源头**（布尔照传），本站这侧的 400 只是契约闸 —— 它开在**事务之前**，真 400 会把整条终态打回（终态不写、不重试），一个纯观测性的片段不该有那种权力） | **进 `HISTORY_EVENT_TYPES`（第 29 类）**：这条事件讲的恰恰是「用户刷新来看这次交付了什么」的那一刻，实时看得见、刷新后消失就是它自己的缺陷（上游 erix-agent #182 的教训原样搬过来）。界面是**中性提示**，不是失败面 —— 红色面仍只由 `run_end` 负责（§2.5.1 第 3 条）；**不改 `termination.reason`、不改终态载荷任何既有字段**。判据：`runner/test/final-text-toolcall.test.js`（识别 + 特征集可配置 + 真样本）、`portal/test/textualized-toolcall.test.js`（事件落库 / 排序 / 幂等 / 校验 / 三处集合对账）、`portal/test/session-events-history.test.js`（**刷新后历史端点仍返回它**）、`portal/test/textualized-toolcall.test.js` 的 E3（**跨面行为**：拿 runner 真函数造的超长 marker 载荷过这道闸 ⇒ 终态照写）。**已知残余**：特征判据是逐字子串，正常交付若在代码块**外**裸写 `｜｜DSML｜｜` 这类标记会误报一条中性提示（代价是一条提示，不是把 run 判成失败；写进行内代码/围栏里不会误报） |
+| 30 | `session_updated` | **本站自造**：会话标题更新（`portal/src/session-title.js` 推 `type: 'session_updated'`，前端 `composables/useEventStream.ts` 消费） | `title: string`；⚠ **不带 `seq` / `run_id`**（#777 A3） |
+| 31 | `ping` | **本站自造**：公共 SSE 保活帧（见 §5.1 与 D 项修正） | `ts: string`；**不带 `seq` / `run_id`** |
 
 > 说明与边界：
 > - **第 18~27 类是 issue #421 / #438 / #442 补接的「引擎承诺、宿主订不到」那一族**（#421 = 2026-10-27，#438 切片 B = 2026-11-02，#442 = erix-agent 0.30.0 升级片）：erix-agent 对宿主承诺 **28 类事件**（`src/loop/orchestrator.js` 里 `LoopEvent` 的 `@property` 联合类型；0.29.0 是 19 类，0.30.0 涨到 27 类，**0.32.0（#499）涨到 28 类——只多第 28 类 `host_steer_injected`，删 0**；**0.33.0（#530）仍是 28 类，新增 0 / 删除 0**（261115 在 0.32 与 0.33 两份 `npm pack` 解包上各取一次 `LoopEvent` 联合类型逐名对账：两侧各 28 个、`added: []` / `removed: []` ⇒ 本版**无新增事件类**，本站三处白名单与豁免表零改动，对账测当场跑绿）；**这份清单由 `portal/test/event-surface-contract.test.js` 从已安装引擎源码解析，不再手抄**），而本站三处白名单（前端 `EVENT_TYPES` / 前端 `HISTORY_REPLAY_TYPES` / 本文件 §4.4a 与 `http.js` 的 `HISTORY_EVENT_TYPES`）此前只认 11 类。写入侧不过白名单（`internal.js` 直接 `INSERT`）⇒ 这 5 类**每轮都在往 `run_events` 里写，而浏览器一条都收不到**（#371-A 同形状：库里存着、读不出来）。对账测：`portal/test/event-surface-contract.test.js`（从**已安装引擎源码**解析联合类型，上游改联合类型、本站删监听、豁免没写理由、联合外真发的事件没决定都会红）+ `portal/frontend/src/composables/engineEventSurface.spec.ts`（行为面：订得到 / 能回放 / 文案不编数据）+ `runner/test/engine-notices.test.js`（LOG 那一半）。**新增一类时三处必须同步，且 `run_outcome` 那种「订到但不展示」的决定必须写进豁免表。**
@@ -4429,7 +4446,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | 1 | ~~Q7 portal 技术栈~~ ✅ 已定稿：(a) 零依赖 `node:http` + 原生前端（principles §4；WP1 落地） | — | 仅实现注记，**契约形状无关** |
 | 2 | `BASE_DOMAIN`（影响示例 URL 与 cookie 生效 host；**#57 定稿：语义为伞域 `fde.<可注册域>`，现取 `fde.erix.vip`；代码默认兜底 `localhost`（本地起服，不套伞域前缀）**） | env §1 | §0 / §2.5 / fde-platform §8.5 |
 | 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2；**现状**：未注册 TOTP 的账号口令直通，见 §2.1） | env §4 / Q3 倾向 (a) | §2.1 |
-| 4 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | §4.7（`scope`/`run_id` 字段保留） |
+| 4 | Q5 端口分级 | **已决**（迁移 `0018` 加第三值 `fde`，FDE 主机级号池已上线；`project` 仅存量） | §4.7（历史）、§4.7a（现役，恒 `fde`） |
 | 5 | 任务下发 push→pull 演进 | **拉模型为终态**；push 仅作 P2 优化后置（⚠️ 待决策者确认，不作默认契约） | §6.3（`container_unreachable` 出现条件） |
 | 6 | `run.cost` 记账口径 | 依赖 Q1/Q4 | §4.1（P1 可为 `null`） |
 | 7 | 预览 ticket TTL 秒数 | **60s** | §2.8 |
