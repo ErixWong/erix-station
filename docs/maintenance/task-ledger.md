@@ -10207,3 +10207,37 @@ job summary 与 artifact `images-digest`，ID `14918481157`）；GitHub Release 
 
 **边界**：仓库其余文档（一次性审计快照、handoff/drill、地图黑户）本轮**不动**——文档总体审计由**另一个 session** 在做。
 本会话那份 copilot 只读审计（runId `cp-2611251548-c6u274`）结论已到手，**本单不落地**，移交文档审计那条线处置。
+
+### 8.205 按 `^fde-` 前缀批量操作容器，误删了**别的项目**的库容器（2026-11-25，主 agent）
+
+**触发**：v0.1.79 发版后要把 7 个工位容器重建到新 digest。我（主 agent）用
+`docker ps --format '{{.Names}}' | grep "^fde-"` 当「FDE 工位清单」遍历，循环里 `docker rm -f` + 
+`POST /api/admin/fdes/<name>/provision`。一个**非平台**的 dev PostgreSQL 容器（另一个项目的库，名字恰好带 `fde-` 前缀）被同一循环删掉，随后 provision 返回 500
+（`no active user with fde_name=workshop-db`）——**这就是它不属于平台的现场证据**。
+
+**为什么没丢数据**：该容器的数据在**宿主机 bind mount**（该项目用 `FSW_DB_DATA_DIR` 指到 `$HOME` 下一个自有目录，
+不是本仓默认的 `/docker/<名称>/`），`docker rm` 只删容器层。
+用该项目自己的 `npm run db:up`（同数据目录/同口令/同端口，绑回环）重开即可。
+
+**恢复取证**（只认退出码与日志原文）：
+- `docker logs <该容器>`：`database system was not properly shut down; automatic recovery
+  in progress` → `database system is ready to accept connections`
+  （**走崩溃恢复而非 `initdb`**：空目录新初始化会是 `initializing new cluster` 且只有 `postgres` 库）
+- 库清单：`SELECT count(*) FROM pg_database WHERE datname NOT LIKE 'template%'` = **221**
+  （该项目原有的业务库与探针库全在，数量与删除前一致）
+- 该项目自己的 `npm run db:verify` → **rc 0**，`baseline 不变量：50/50 通过`，
+  gate 库报 `本次执行 0 版，台账共 39 版`（= 库已是最新迁移态，不是新建库）
+- 业务库行数抽查与删除前读数一致（`issues=6`）
+
+**唯一真实损失**：强杀那一刻仍连着的客户端连接断开；WAL 重放已收尾，无半写状态（`db:verify`
+的 50 条不变量即为此闸）。
+
+**根因（判据写错，不是手滑）**：容器名**不是**平台所有权标识。工位清单的唯一真相源是
+`station-db` 的 `containers` 表（`status <> 'removed'`，本轮 7 行）；名字前缀只反映「谁起的名字」。
+
+**落地的规则**：`AGENTS.md` §5 增一行「容器清单只从 DB 取（`containers` 表），禁按 `^fde-`
+前缀批量操作容器」——**本单是那一行的唯一依据**。
+
+**顺带的正确姿势（本轮已验证可用）**：工位重建走 `POST /api/admin/fdes/<fde>/provision`
+（先 `docker rm -f` 该工位容器，再 provision），由平台重铸 runner token、重建网络与挂载；
+不要手搓 `docker run`。7/7 工位重建后 `healthy`、`containers.image` 同步为新 digest、agent `0.33.0`。
