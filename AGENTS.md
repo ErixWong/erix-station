@@ -62,8 +62,8 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
   不卡第二因素；口令路径与 dev 入口 ⇒ 冷层；`Origin` 要求 ⇒ `docs/testing.md` §1.3）。
   **别登人的账号**——开着邮箱验证码的账号每登一次寄一封真邮件，而脚本读不到那枚码（两封信 ⇒ §8.187）
 - 要管理员面就登 `admin`；要测第二因素：自建带 TOTP 的种子账号走 step1+step2（做法同 §1.3）
-- API 令牌（仅 admin 可签、不过期）是「脚本不该持有口令」时的备用，**当前零消费者**
-  （契约 ⇒ `docs/api/portal.md` §2.13；界面为何未做 ⇒ issue #746 + 台账 §8.199）
+- API 令牌（仅 admin 可签、不过期）**当前已停用**（`http.js` 的 `TOKEN_ROUTES_ENABLED=false` ⇒ 三端点 404；认证缝保留、库里 0 枚 ⇒ Bearer 恒 401；启用=改这一个常量）
+  （契约 ⇒ `docs/api/portal.md` §2.13；停用+启用 ⇒ 台账 §8.200）
 
 ### 4.2 LLM 网关（LiteLLM）
 

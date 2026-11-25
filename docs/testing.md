@@ -85,8 +85,8 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 > 3. 要管理员面就登 `admin`（今天口令直通）；要测第二因素就自建带 TOTP 的种子账号：step1 拿
 >    `pending_token`（它不是会话，只能用来交第二因素）→ 本地算码 → step2 换 cookie。
 > 4. **脚本发写方法（POST/PATCH/DELETE）必须带 `Origin: <dev 入口>`**，否则被 CSRF 闸拒；`GET` 不受影响。
-> 5. API 令牌（`Authorization: Bearer`，仅 admin 可签）只在「脚本不该持有口令」时用；三步 curl 配方见
->    `docs/api/portal.md` §2.13，**当前零消费者**（界面为何未做、重开判据 ⇒ issue #746 + 台账 §8.199）。
+> 5. API 令牌端点（签发/列表/吊销）**当前停用**（`portal/src/http.js` 的 `TOKEN_ROUTES_ENABLED=false` ⇒ 三端点 `404`）
+>    ⇒ 脚本一律用 `agent01` 的 session（见第 2 条），**别把 Bearer 配方写进新脚本**；启用后契约 ⇒ `docs/api/portal.md` §2.13（停用/启用 ⇒ 台账 §8.200）。
 > 6. dev 入口 URL、口令文件路径、宿主端口占用一律从冷层取，别写进本文。
 > 7. 用 API 建 dev 账号的两条坑（实测 261125）：`llm.main_model_id` 必选**文本**类模型（被目录归为
 >    vision 的 id 会被 `validation_failed`「模型类型不匹配」拒，即使它已是某个现有 FDE 的绑定）；

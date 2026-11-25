@@ -9981,5 +9981,21 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
 `eric` 现绑的 `1a770ab8-…` 被目录判为 **vision**，拿它当 main 会 `validation_failed`「模型类型不匹配」；
 `GET /api/admin/users/:id` 没有 GET（`405`），git host 从 `GET /api/admin/users` 列表或 `git_hosts` 现读。
 
-**未做/未决**：`api_tokens` 停用方式（#747 整块 revert vs 只禁"签给 admin"）**仍待用户拍**；#740 真客户端 IP
+**未做/未决**：`api_tokens` 停用方式（#747 整块 revert vs 只禁“签给 admin”）**已由 §8.200 拍定**：不 revert，用模块级常量 `TOKEN_ROUTES_ENABLED=false` 只关掉三个管理台端点；#740 真客户端 IP
 未做；`agent01` 只存在于本机 dev 库，**不是**交付物，换机重建做法见上（建号 1 次 API + 2 条 UPDATE）。
+
+
+### 8.200 #736/#747 收尾：API 令牌「关路由、留能力」——模块级常量 `TOKEN_ROUTES_ENABLED=false`（261125，erix_run + 主 agent，代号 docs-261125-01）
+
+**为什么不是整块 revert**：#736 已把 Bearer 认证缝、`api_tokens` 读写函数、21 格测试与 CI 真库腿做完并合进主干；表 DDL（`docs/data/schema.sql:128`）也在。整块 revert 会把「已验证的认证缝 + 真库腿」一起退掉，而退不掉的表反而成了「代码没了但表还在」的第二份真相。用户 261125 拍：**关路由、留能力**。`api_tokens` 实测 0 行、全仓 0 个调用方、界面单 #746 已判零消费者关闭；「一把不过期、能代任何人签的管理员钥匙」没人敢签。本条把 §8.199 遗留的「revert vs 只禁」这道题结掉：走「只禁路由」。
+
+**关掉的是什么**：三个管理台端点 `POST/GET/DELETE /api/admin/users/:login/tokens[/:id]`（签发 / 列表 / 吊销）。
+**留着的是什么**：`portal/src/api-tokens.js` 全部函数、`Authorization: Bearer` 认证缝（`X-Auth-Method: api_token`、无 `Set-Cookie`、`ambiguous_credential` / `unsupported_scheme` / `last_used_at` 节流 / 审计不含明文与 hash）、`handleUserApiTokens` 本体与注释、`api-tokens.test.js`（改直调 `mintToken`/`revokeToken` 后 18 格）、`api-tokens-db.test.js`（真库腿 6 格，`scripts/check-required-legs.mjs` 的 `minPass=6` 不动）。
+
+**怎么关 / 怎么启用**：`portal/src/http.js` 顶部模块级常量 `TOKEN_ROUTES_ENABLED=false`（fail-closed，不是 env、不是运行时旋钮）。false 时 `apiTokenMatch` 直接 `null`，路径落到 blanket `handleAdminApi` 尾部的通用 404。重新启用 = 把这一个常量改成 `true`（其余逻辑原样都在）。
+
+**实测读数（本支自跑，非引用）**：三端点用 admin cookie 打全部 `404` 且 `{error.code:"not_found"}`（沿用通用 404 形状，未新造错误码）；非 admin 打旧路径先被 `requireAdmin` 拒 ⇒ `403 forbidden`（不再是 `insufficient_role`——那个 handler 已被常量短路）；Bearer 认证缝仍生效（有有效令牌 `200`、否则 `401`）；库里 `api_tokens` 0 枚 ⇒ 任何 Bearer 恒 `401`。
+
+**门禁**：`node scripts/agents-hotlayer-budget.mjs` VERDICT ok（热层 10214 / 预算 10240）；`node --test portal/test/api-tokens.test.js` 18 pass / 0 fail；`TEST_DATABASE_URL=… node scripts/check-required-legs.mjs` 三条真库腿 rc=0；`npm test` rc=0。
+
+**裁决：别因为表建了就默认要做界面**。`api_tokens` 表早在 DDL 里，但「有表」≠「该有签发界面 / 该接客户端」——判据是消费者。零调用方 + 零行 + 一把不敢签的不过期管理员钥匙 ⇒ 关路由比造界面诚实。将来真有 runner 要长期凭据，把常量翻成 `true` 即可，不必先补一版界面。
