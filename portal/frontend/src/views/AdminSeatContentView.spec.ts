@@ -633,3 +633,224 @@ describe('issue #727 真机回访：会话元信息行（裸 key 哨兵 + 真数
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 验收补充（本单）：① folder → session 二级菜单（目录过滤 + 双向联动）；
+// ② 运行态可见（会话行 / 详情 meta） + 「刷新」按钮。全程仍只读。
+// ⚠ 一律走 DOM / fetch 桩，不用 `w.emitted()`。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('issue #727 补充：会话目录二级菜单 + 运行态 + 刷新（只读）', () => {
+  const DIRS = {
+    dirs: [
+      { name: 'repo-a', cwd: '~/projects/repo-a', running_count: 2, queued_count: 1 },
+      { name: 'repo-b', cwd: '~/projects/repo-b', running_count: 0, queued_count: 0 },
+      { name: 'repo-c', cwd: '~/projects/repo-c', running_count: 0, queued_count: 3 },
+    ],
+  };
+
+  // 带 active_run_id 的会话行（非空 = 有活 run）。
+  const SESSIONS_RUNNING = {
+    items: [
+      {
+        id: 's-run', project_id: null, cwd: '~/projects/repo-a', title: '在跑的任务',
+        title_source: 'auto', origin: 'human', model: 'gpt-x', status: 'active', last_seq: 5,
+        created_at: '2026-01-06T00:00:00.000Z', updated_at: '2026-01-06T00:00:00.000Z',
+        active_run_id: 'run-99', message_count: 2,
+      },
+    ],
+    next_cursor: null,
+  };
+
+  const DETAIL_RUNNING = {
+    session: {
+      id: 's-run', project_id: null, cwd: '~/projects/repo-a', title: '在跑的任务',
+      title_source: 'auto', origin: 'human', model: 'gpt-x', status: 'active', last_seq: 5,
+      active_run_id: 'run-99', message_count: 2,
+      queued_messages: { steering: [], follow_up: [] },
+    },
+    messages: [], last_seq: 5, next_cursor: null,
+  };
+
+  /** 树根返回 repo-a / repo-b 两个一级目录（够测一级联动）。 */
+  const TREE_TWO = {
+    entries: [{ name: 'repo-a', type: 'dir' }, { name: 'repo-b', type: 'dir' }],
+    truncated: false, next_after: null,
+  };
+
+  /** 够跑目录联动全套的桩：dirs + 会话（按 cwd 分）+ 两层树。 */
+  function dirHandler(url: string): Response | undefined {
+    if (url.startsWith('/api/admin/fdes/alpha-fde/dirs')) return jsonResponse(200, DIRS);
+    if (url.startsWith('/api/admin/fdes/alpha-fde/sessions/s-1/events/history')) {
+      return jsonResponse(200, { events: [], next_cursor: null });
+    }
+    if (url.startsWith('/api/admin/fdes/alpha-fde/sessions/s-1')) {
+      return jsonResponse(200, SESSION_DETAIL);
+    }
+    if (url.startsWith('/api/admin/fdes/alpha-fde/sessions?')) {
+      return jsonResponse(200, SESSIONS_PAGE_1);
+    }
+    if (url.startsWith('/api/admin/fdes/alpha-fde/files/tree')) {
+      return url.includes('path=repo-a')
+        ? jsonResponse(200, TREE_REPO_A)
+        : jsonResponse(200, TREE_TWO);
+    }
+    return undefined;
+  }
+
+  /** 最后一条会话列表请求（`sessions?`）的 `cwd` 参数。 */
+  function lastSessionsCwd(fetchMock: ReturnType<typeof vi.fn>): string | null {
+    const calls = callsTo(fetchMock, '/api/admin/fdes/alpha-fde/sessions?');
+    const last = calls[calls.length - 1];
+    if (!last) return null;
+    return new URL(String(last[0]), 'http://x').searchParams.get('cwd');
+  }
+
+  it('目录二级菜单①：目录下拉存在且首项是「全部目录」；选目录后会话请求带 cwd=~/projects/<name>', async () => {
+    const { wrapper, fetchMock } = await mountSeat(dirHandler, '/admin/seat-content');
+    try {
+      await selectFde(wrapper);
+      const select = wrapper.get('[data-test="session-dir-select"]');
+      const options = select.findAll('option');
+      expect(options.length).toBeGreaterThanOrEqual(2);
+      expect(options[0]!.attributes('value')).toBe('');
+      expect(options[0]!.text()).toContain('全部目录');
+      // 计数：repo-a 有 2 运行 / 1 排队 ⇒ 标签里出现；repo-b 两者为 0 ⇒ 只有目录名。
+      const labels = options.map((o) => o.text());
+      expect(labels.join(' ')).toContain('2 运行');
+      expect(labels.join(' ')).toContain('1 排队');
+      // 选 repo-a ⇒ 会话请求带 cwd=~/projects/repo-a。
+      await select.setValue('~/projects/repo-a');
+      await flushPromises();
+      expect(lastSessionsCwd(fetchMock)).toBe('~/projects/repo-a');
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('目录二级菜单②：点文件树一级目录节点 ⇒ 会话请求切到该 cwd 且下拉选中态同步', async () => {
+    const { wrapper, fetchMock } = await mountSeat(dirHandler, '/admin/seat-content');
+    try {
+      await selectFde(wrapper);
+      expect(lastSessionsCwd(fetchMock)).toBe(null);
+      await wrapper.get('[data-test="tree-node"][data-node-path="repo-b"]').trigger('click');
+      await flushPromises();
+      expect(lastSessionsCwd(fetchMock)).toBe('~/projects/repo-b');
+      expect((wrapper.get('[data-test="session-dir-select"]').element as HTMLSelectElement).value)
+        .toBe('~/projects/repo-b');
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('目录二级菜单③：点会话时其 cwd 与当前过滤不同 ⇒ 过滤切到它（后续请求带该 cwd）', async () => {
+    const { wrapper, fetchMock } = await mountSeat(dirHandler, '/admin/seat-content');
+    try {
+      await selectFde(wrapper);
+      // 初始「全部」：首条会话列表请求不带 cwd。
+      expect(lastSessionsCwd(fetchMock)).toBe(null);
+      // s-1 的 cwd = ~/projects/repo-a：点它 ⇒ 过滤从「全部」收窄到它。
+      await wrapper.get('[data-test="session-row"]').trigger('click');
+      await flushPromises();
+      expect(lastSessionsCwd(fetchMock)).toBe('~/projects/repo-a');
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('运行态④：会话行 active_run_id 非空 ⇒ 出现 session-running；为空 ⇒ 不出现', async () => {
+    const running = await mountSeat((url) => {
+      if (url.startsWith('/api/admin/fdes/alpha-fde/dirs')) return jsonResponse(200, DIRS);
+      if (url.startsWith('/api/admin/fdes/alpha-fde/sessions?')) {
+        return jsonResponse(200, SESSIONS_RUNNING);
+      }
+      if (url.startsWith('/api/admin/fdes/alpha-fde/files/tree')) {
+        return jsonResponse(200, TREE_TWO);
+      }
+      return undefined;
+    }, '/admin/seat-content');
+    try {
+      await selectFde(running.wrapper);
+      expect(running.wrapper.find('[data-test="session-row"]').exists()).toBe(true);
+      expect(running.wrapper.find('[data-test="session-running"]').exists()).toBe(true);
+      expect(running.wrapper.find('[data-test="session-running"]').text()).toContain('运行中');
+    } finally {
+      running.wrapper.unmount();
+    }
+
+    const idle = await mountSeat((url) => {
+      if (url.startsWith('/api/admin/fdes/alpha-fde/dirs')) return jsonResponse(200, DIRS);
+      if (url.startsWith('/api/admin/fdes/alpha-fde/sessions?')) {
+        return jsonResponse(200, SESSIONS_PAGE_1);
+      }
+      if (url.startsWith('/api/admin/fdes/alpha-fde/files/tree')) {
+        return jsonResponse(200, TREE_TWO);
+      }
+      return undefined;
+    }, '/admin/seat-content');
+    try {
+      await selectFde(idle.wrapper);
+      expect(idle.wrapper.findAll('[data-test="session-row"]').length).toBeGreaterThan(0);
+      expect(idle.wrapper.find('[data-test="session-running"]').exists()).toBe(false);
+    } finally {
+      idle.wrapper.unmount();
+    }
+  });
+
+  it('运行态⑤：详情元信息行 active_run_id 非空 ⇒ 出现 meta-running', async () => {
+    const { wrapper } = await mountSeat((url) => {
+      if (url.startsWith('/api/admin/fdes/alpha-fde/dirs')) return jsonResponse(200, DIRS);
+      if (url.startsWith('/api/admin/fdes/alpha-fde/sessions/s-run/events/history')) {
+        return jsonResponse(200, { events: [], next_cursor: null });
+      }
+      if (url.startsWith('/api/admin/fdes/alpha-fde/sessions/s-run')) {
+        return jsonResponse(200, DETAIL_RUNNING);
+      }
+      if (url.startsWith('/api/admin/fdes/alpha-fde/sessions?')) {
+        return jsonResponse(200, SESSIONS_RUNNING);
+      }
+      if (url.startsWith('/api/admin/fdes/alpha-fde/files/tree')) {
+        return jsonResponse(200, TREE_TWO);
+      }
+      return undefined;
+    }, '/admin/seat-content');
+    try {
+      await selectFde(wrapper);
+      await wrapper.get('[data-test="session-row"]').trigger('click');
+      await flushPromises();
+      expect(wrapper.find('[data-test="meta-running"]').exists()).toBe(true);
+      expect(wrapper.text()).not.toContain('admin.seatContent.');
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('运行态⑥：刷新按钮 ⇒ 重取列表与详情各 +1，且全程只有 GET', async () => {
+    const { wrapper, fetchMock } = await mountSeat(dirHandler, '/admin/seat-content');
+    try {
+      await selectFde(wrapper);
+      await wrapper.get('[data-test="session-row"]').trigger('click');
+      await flushPromises();
+      const listUrl = '/api/admin/fdes/alpha-fde/sessions?';
+      const detailUrl = '/api/admin/fdes/alpha-fde/sessions/s-1';
+      const detailCount = () => fetchMock.mock.calls.filter(([u]) => {
+        const s = String(u);
+        return s.startsWith(detailUrl) && !s.includes('/events/');
+      }).length;
+      const beforeList = callsTo(fetchMock, listUrl).length;
+      const beforeDetail = detailCount();
+      await wrapper.get('[data-test="sessions-refresh"]').trigger('click');
+      await flushPromises();
+      expect(callsTo(fetchMock, listUrl).length).toBe(beforeList + 1);
+      expect(detailCount()).toBe(beforeDetail + 1);
+      // 只读红线：刷新全程只有 GET，不碰 `/pv/`，不建 EventSource。
+      const methods = fetchMock.mock.calls.map(([, init]) =>
+        String((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase());
+      expect(methods.filter((m) => m !== 'GET')).toEqual([]);
+      const urls = fetchMock.mock.calls.map(([u]) => String(u));
+      expect(urls.filter((u) => u.includes('/pv/'))).toEqual([]);
+      expect(EventSourceSpy.count).toBe(0);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+});
