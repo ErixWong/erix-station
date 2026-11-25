@@ -10288,3 +10288,58 @@ job summary 与 artifact `images-digest`，ID `14918481157`）；GitHub Release 
 **顺带的正确姿势（本轮已验证可用）**：工位重建走 `POST /api/admin/fdes/<fde>/provision`
 （先 `docker rm -f` 该工位容器，再 provision），由平台重铸 runner token、重建网络与挂载；
 不要手搓 `docker run`。7/7 工位重建后 `healthy`、`containers.image` 同步为新 digest、agent `0.33.0`。
+### 8.208 CI 触发面收紧：只在 PR 触发 + docs-only 快道（2026-11-25，主 agent，代号 `chore-261125-16-ci-pr-only`，依据 #783）
+
+**依据是实测不是感觉**：261125 一天 CI 56 轮 = 34 轮 PR + **24 轮
+  push(main)（全部由合并提交触发，
+直推 main 0 次）** + release 2 轮。PR 检查本来就跑在合并 ref 上，所以那 24
+  轮里门禁部分是把同一棵
+内容的树又跑一遍；纯文档改动也照跑全套（三次 `npm ci` + runner 测试 +
+  前端 typecheck/vitest）。
+
+**改了三处（`.github/workflows/ci.yml`）**：① 删 `push: branches: [main]`；② `images`
+  作业 `if` 去掉
+`github.event_name != 'pull_request'`（它以前是**唯一**能跑镜像构建校验的地方，
+  不搬就随 push 一起消失；
+只 `--load` 不推送、不需要 `packages: write`，PR 面跑安全）；③ 新增步骤 ⓪
+  `scope` 算 `docs_only` 与路径基线，
+②/②′/③/④ 加 `if` 跳过，新增 ②ᴰ 只跑三条零依赖文档闸。
+
+**docs-only 的口径故意窄**：只认 `docs/**`、根级 `*.md`、
+  `scripts/doc-impl-exceptions.json`。
+**刻意不算**：`deploy/migrations/**`（迁移要真库腿验）、`.github/workflows/**`（改
+  CI 自己必须全量验）、
+任何 `*.js`/`*.test.js`；取不到 base（新分支首推 / force push / `workflow_dispatch`）
+  一律全量。
+跳过的腿在步骤输出与 `$GITHUB_STEP_SUMMARY`
+  点名——**快道的绿不等于全套跑过**。
+
+**必须同时立的纪律**（写进 `docs/ops/ci-release.md` §1.1）：PR
+  检查跑在它那一刻的 base 上，别人先合就错配
+（同一天 4 次「PR 绿、合进 main 才红」#757/#761/#765/#770 全是这形状）⇒
+  **合并前若 main 已推进，
+先把 main 并进本支、让 CI 在新头绿一次再合**；**红着的 PR 不合**（同一天
+  2 次：#755/#756）；
+**main 只接受合并**（直推 main 从此无 CI）。
+
+**顺带注销一条豁免**：`ci-release.md` §4.1 写「当前接进来的两条」真库腿，
+  而 `REQUIRED_LEGS` 实际 **3 条**
+（第三条 `portal/test/api-tokens-db.test.js`，#736 接入）——这条是 `check:doc-impl`
+  的腿名比对抓的，
+补完文档后该豁免变成 stale，按规矩由人删（legs 2 → 1）
+  。第三条腿的墙钟本文**没实测**，
+没有把它塞进那句「≈19s」的合计里。
+
+**验证**：YAML 可解析（`on` = `pull_request` + `workflow_dispatch`；jobs =
+  `gate`,`images`；步骤 ⓪ 带 `id: scope`、
+②/②′/③/④ 带跳过条件、⑤ 基线取 `steps.scope.outputs.base`）；⓪
+  的分类逻辑抽了 6 个用例
+（纯 docs→快道、docs+豁免账→快道、代码+docs→全量、迁移+docs→全量、
+  只改 CI→全量、空 diff→全量）；
+`check:doc-impl` / `check:doc-portable` / `check:agents-hotlayer` 全 rc=0；`npm test` rc=0（见
+  PR）。
+**合并 main 后重读**（#781 占了 §8.207 ⇒ 本段顺延为 §8.208，并在合并 commit 后重跑）：
+`§8.N` 引用 **640** ≥ 地板 638、台账 **205** 条无重复、热层 10146/10240（AGENTS §5 被 #781 加了一条规则）。
+上面写的 639 / 204 / 10037 是**合并前**的读数，留着不回改。
+**本 PR 自己必然走全量**（改了 `.github/workflows/`）⇒ 快道在 CI
+  上第一次真生效，要等下一个纯 docs 的 PR。

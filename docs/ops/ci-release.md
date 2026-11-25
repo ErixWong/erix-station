@@ -14,13 +14,29 @@
 
 | 触发 | 跑什么 | 预计分钟量级（Linux `$0.006/min`） |
 |---|---|---|
-| `pull_request` | 只跑门禁：语法保底 → 根测 → runner 测 → 前端 typecheck+test | 3–5 min（大头是 checkout/setup-node/三次 npm ci，测试本身 ~25s） |
-| `push`（main） | 门禁 + **按路径过滤**的镜像构建校验（`--load`，**不推送**） | 门禁 3–5 min + portal 3–6 min / fde-proxy <1 min / **FDE 冷构建 10–15 min** |
+| `pull_request` | **唯一的 CI 入口**（#783）：门禁（docs-only 走 §1.1 快道）+ 按路径过滤的三镜像构建校验（`--load`，不推送） | 全量 3–5 min + 镜像见下行旧口径 |
+| ~~`push`（main）~~ | **已删（#783）**：同一棵内容的树 PR 上已验过（PR 检查跑在合并 ref 上），合进 main 再跑是纯重复 | 门禁 3–5 min 白跑一遍 / 镜像 3–15 min（这列是删除前的口径） |
 | `push`（tag `v*`） | `release.yml`：版本校验 + 三镜像构建并推 GHCR + digest 清单 | 15–25 min（FDE 镜像体积大，推送占大头；GHCR 带宽目前免费） |
 | `workflow_dispatch`（ci.yml） | 门禁；`build_images=all` 时追加三镜像构建校验 | 同上 |
 | `workflow_dispatch`（release.yml） | 手填 `tag`，跑与 tag push 完全相同的发布流程 | 同上 |
 
-**门禁步骤（顺序执行，任一失败即红；`ci.yml` 步骤 ①、①′、②–④）**
+### 1.1 CI 只在 PR 触发 + docs-only 快道（#783）
+
+**删掉 `push`（main）的代价，以及必须同时守的纪律**：PR 检查跑在它**那一刻的 base** 上，
+别人先合了就会错配——261125 实测「PR 自己绿、合进 main 才红」4 次（#757/#761/#765/#770）全是这个形状。
+⇒ **合并前若 main 已推进，先把 main 并进本支，让 CI 在新头上绿一次再合。**
+另两条一起守：**红着的 PR 不合**（同一天 2 次红单被合进 main，再花一轮才看见 main 红）；
+**main 只接受合并**——现在直推 main 不再有任何 CI（实测今天直推 0 次，所以改得起）。
+
+**docs-only 快道（`ci.yml` 步骤 ⓪）**：`base ↔ head` 的 diff 若全部落在 `docs/**`、根级 `*.md`、
+`scripts/doc-impl-exceptions.json` 之内 ⇒ 只跑 ①、⑤ 与三条文档闸（`check:agents-hotlayer` /
+`check:doc-portable` / `check:doc-impl`，都是零依赖脚本，**不做 `npm ci`**），
+跳过 ②（根 `npm ci` + `npm test`）、②′（真库腿）、③（runner）、④（前端）。
+故意**不算** docs-only：`deploy/migrations/**`（迁移要真库腿验）、`.github/workflows/**`（改 CI 自己必须全量验）、
+任何 `*.js` / `*.test.js`。取不到 base（新分支首推 / force push / `workflow_dispatch`）⇒ 一律全量。
+被跳过的腿在步骤输出与 job summary 里点名 ⇒ **别把快道的绿读成「全套跑过」**。
+
+**门禁步骤（顺序执行，任一失败即红；`ci.yml` 步骤 ①、①′、⓪、②–④、⑤）**
 
 > **历史基线（2026-11-11 在 `main@ad68523` + 热层搬家那笔 docs-only 改动上实测，四步 rc 全 0）**：
 > ① `node --check` **255** 个文件（新增 1 个闸脚本 + 1 个闸测试） · ② 根 **2138 / 2134 通过 / 0 失败 /
@@ -265,12 +281,14 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
 `gate`）已加 `services: postgres`（`postgres:16`，内置超级用户 `postgres`），步骤 ② 之后
 新增步骤 ②′ 注入 `TEST_DATABASE_URL` 并跑「必须真跑」的腿。
 
-当前接进来的两条（只加 service，不新开 job、不用 matrix、不加 Playwright）：
+当前接进来的**三条**（只加 service，不新开 job、不用 matrix、不加 Playwright）：
 
 - `portal/test/migrate-fresh-db.test.js`——空库 → baseline → bootstrap → 全部增量迁移，5 条；
   bootstrap 会 `CREATE ROLE`、pg-fixture 会 `CREATE DATABASE` ⇒ service 账号必须超级用户。
 - `npm run test:integration:prompts`（`portal/integration/platform-prompts-db.mjs`）——写侧真
   SQL 执行 + 种行（`FOR UPDATE` 只能锁已存在的行），7 条；在注入库里 `CREATE SCHEMA`。
+- `portal/test/api-tokens-db.test.js`——#736 的 API 令牌真库腿（`revoked` 谓词、`last_used_at` 窗、
+  `ON CONFLICT`）。本文此前只列两条 ⇒ 是 `check:doc-impl` 的腿名比对抓出来的（豁免账随之注销）。
 
 常驻「**skip 不算绿**」闸：`scripts/check-required-legs.mjs`（根脚本 `npm run check:ci-legs`，
 本地也能跑）。它对「必须真跑清单」：有 `TEST_DATABASE_URL` 时逐条真跑并断言 `# skipped
@@ -278,8 +296,9 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
 「这几条腿这次没跑」并 rc=1（不静默）。后续把其余 `test:integration:*` 接进来，只需往
 脚本的 `REQUIRED_LEGS` 加一条。
 
-**新增分钟（本地实测，非估算）**：两条腿墙钟 `migrate-fresh-db` **17.8s** +
-`test:integration:prompts` **1.6s** ≈ **19s**（含 node/npm 启动；`pg-fixture` 建库 5 次都算在
+**新增分钟（本地实测，非估算）**：**前两条**腿墙钟 `migrate-fresh-db` **17.8s** +
+`test:integration:prompts` **1.6s** ≈ **19s**（**前两条**的合计；第三条 `api-tokens-db` 的墙钟本文没实测，
+别把这句当三条合计；含 node/npm 启动；`pg-fixture` 建库 5 次都算在
 migrate 那 17.8s 内，prompts 腿 0 次建库只建 schema）。再加 `postgres:16` service 容器拉起
 + `pg_isready` 健康等待（Actions runner 上该镜像很小，量级几秒到十几秒）。合计**新增约
 0.5～1 分钟**，叠在现量 2m6s～2m34s（见 §1 现价块）之上约 3 分钟，仍在 `timeout-minutes:
