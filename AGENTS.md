@@ -81,6 +81,7 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 ## 5. 端口
 
 - **FDE 容器内的端口由平台分配（DB 为真相），不对宿主机 publish**（不变式 1、D4）
+- **容器清单只从 DB 取**（`containers` 表），禁按 `^fde-` 前缀批量操作容器（§8.207）
 - 本机端口占用实况与开发期取值 ⇒ 冷层 `~/projects/docs/station-dev-machine.md`；平台端口不变式 ⇒ `docs/env.md` §5；
   管理台入口 9443「改端口要动哪两处」与来源白名单 ⇒ `docs/deploy/edge-routing.md` §4 / §6
 
