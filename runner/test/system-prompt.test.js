@@ -103,7 +103,7 @@ test('SYSTEM_PROMPT 提到每一个注册进 registry 的文件工具名（名�
     assert.deepEqual(
       registered.filter((name) => name === 'rg' || name === 'grep'),
       [],
-      'rg / grep 是退役别名，不得进 station 注册面（AGENTS.md §8.9）',
+      'rg / grep 是退役别名，不得进 station 注册面',
     );
   });
 });

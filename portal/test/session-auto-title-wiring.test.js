@@ -7,7 +7,7 @@
 //   B 带 LLM_GATEWAY_ADMIN_URL      ⇒ "助手能力与交付说明" | 1472ms
 // 根因：网关地址只有 `config.llmGatewayAdminUrl`（容器内 `http://station-litellm:4000`）可达，
 // 而 `internal.js` 没把 config 传下去 ⇒ 退回默认 `http://127.0.0.1:4100` ⇒ 容器内 ECONNREFUSED（实测）。
-// 与 AGENTS §8.25「必须传 `ctx.llmGateway` 单例」同族：**单测全都自己注入 config，看不见这两跳接线**。
+// 与 「必须传 `ctx.llmGateway` 单例」同族：**单测全都自己注入 config，看不见这两跳接线**。
 //
 // 因此这里钉三件事：① `http.js` 把 `ctx.config` 交给 `setRunState`；② `finishRun` 把 config 交给
 // `scheduleAutoTitle`；③ 「config 缺 gateway 键 ⇒ 退回那个容器内不可达的地址」这个后果本身（防止有人

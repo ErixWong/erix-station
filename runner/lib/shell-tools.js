@@ -79,7 +79,7 @@ const TRUNCATION_MARKER = `[... output truncated, showing last ${MAX_OUTPUT_BYTE
 // 为什么显式写 `unsafe` 而不靠「未标注也是 unsafe」这条默认：行为上等价（:1781 的 `=== "safe"`），
 // 但**口径要写下来**——shell 跑的是 `kill` / 重启 backend / 重跑测试这类非幂等命令，重放就是再掀一次桌。
 // 上游 0.18.0 的 `createFileTools` **没有给任何工具标 replay**（`src/tools/*.js` grep `replay:` 零命中），
-// 本站不替上游代签「安全」——文件工具因此也一律按非 safe 处理，这是刻意的保守行为（见 §8.22）。
+// 本站不替上游代签「安全」——文件工具因此也一律按非 safe 处理，这是刻意的保守行为。
 const schema = {
   name: 'shell',
   description: 'Run a shell command with bash -c inside the run container. '

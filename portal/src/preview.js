@@ -280,7 +280,7 @@ export async function authorizeForwardAuth(pool, config, {
   // hostname 上只有部分索引、没有全表索引 ⇒ 无 ORDER BY 的 `LIMIT 1` 拿到的是执行计划扫到的第一行
   // （真库 `Seq Scan` 先扫到 released 行）⇒ 恒定 403 `allocation_released`，ticket 分支永远走不到。
   // ⇒ **读侧必须自带优先级**：`(a.state <> 'released') DESC` 让活行恒排在前；同组内再按
-  //   `released_at DESC NULLS LAST, a.id` 定序（AGENTS §8.5：不得依赖行的偶然顺序，released 多行时
+  //   `released_at DESC NULLS LAST, a.id` 定序（不得依赖行的偶然顺序，released 多行时
   //   `released_at` 可同值，`a.id` 是全序兜底）。
   // ⚠ **不能改成只加 `AND a.state <> 'released'` 的过滤**：那会让只有 released 行的 host 落进「查不到」，
   //   `allocation_released`(403) 变死代码、portal.md §2.7 第 1/2 步的既有契约被改掉

@@ -60,10 +60,10 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 - 入口、账号、口令文件位置、第二因素现状 ⇒ `docs/testing.md` §1.3；**登录体字段是 `login` 不是 `username`**
 - **脚本/agent 要调 API ⇒ 登 dev 专用脚本账号 `agent01`**（口令直通：不开邮箱码也不开 TOTP ⇒ 零邮件、
   不卡第二因素；口令路径与 dev 入口 ⇒ 冷层；`Origin` 要求 ⇒ `docs/testing.md` §1.3）。
-  **别登人的账号**——开着邮箱验证码的账号每登一次寄一封真邮件，而脚本读不到那枚码（两封信 ⇒ §8.187）
+  **别登人的账号**——开着邮箱验证码的账号每登一次寄一封真邮件，而脚本读不到那枚码
 - 要管理员面就登 `admin`；要测第二因素：自建带 TOTP 的种子账号走 step1+step2（做法同 §1.3）
 - **别用 `Authorization: Bearer` 打 API**（令牌路由当前关着；关的是路由、能力保留），**脚本一律登 `agent01` 走会话**；
-  现场与启用开关 ⇒ 台账 §8.200（契约 ⇒ `docs/api/portal.md` §2.13）
+  现场与启用开关 ⇒ `docs/api/portal.md` §2.13
 
 ### 4.2 LLM 网关（LiteLLM）
 
@@ -81,7 +81,7 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 ## 5. 端口
 
 - **FDE 容器内的端口由平台分配（DB 为真相），不对宿主机 publish**（不变式 1、D4）
-- **容器清单只从 DB 取**（`containers` 表），禁按 `^fde-` 前缀批量操作容器（§8.207）
+- **容器清单只从 DB 取**（`containers` 表），禁按 `^fde-` 前缀批量操作容器
 - 本机端口占用实况与开发期取值 ⇒ 冷层 `~/projects/docs/station-dev-machine.md`；平台端口不变式 ⇒ `docs/env.md` §5；
   管理台入口 9443「改端口要动哪两处」与来源白名单 ⇒ `docs/deploy/edge-routing.md` §4 / §6
 
@@ -92,13 +92,15 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 - 提交信息：conventional commits + 中文摘要；**不提交任何密钥**，凭据走环境变量 / 凭据文件
 - **CI 与发布**（`.github/workflows/ci.yml`、`release.yml`）：门禁口径、分钟预算语义、digest pin、
   `--provenance=false` 的理由、e2e 为何不进 CI、**发布前置的版本对齐要现验**，一律 ⇒ `docs/ops/ci-release.md`
-- **一单一账写 `docs/maintenance/task-ledger.md`**（编号 `8.N` 全局唯一、不重排；挑号前先
-  `grep -n '^### 8\.' docs/maintenance/task-ledger.md | tail -3`，并行 session 会撞号，§8.116）。
-  **别写进本页**：本页每次 agent run 全额注入（闸的引用口径见 §8.121）
+- **不写逐单台账**：一单做了什么、怎么验的，写进 **issue 与 PR 正文**（GitHub 是唯一真相源）；
+  以后还要遵守的判据写进本页（**须用户拍板**）；环境 / 参数 / 坐标事实写进 `docs/` 对应页。
+  **禁止新建逐单叙事文件**，也禁止把逐单叙事写进本页（本页每次 agent run 全额注入）。
+- **`§8.N` 是已退役台账的编号**（2026-11-25 删除）：仓库里残留的 `§8.N` 是历史注记，
+  不解析、不维护、不必追；碰到就顺手删，但不为它专门改文档。
 - **仓库文档必须可公开**：本机/内网坐标（内网 IP、tailnet IP、内网主机名、凭据文件路径、宿主端口占用、dev 账号名）不写进本仓库，一律放 `~/projects/docs/`，仓库里只留指针与现验判据；闸 `npm run check:doc-portable`（经 `npm test` 跑到）。
 - **证据与依据只写形态，不写值**：验收记账写「寄到该账号绑定的邮箱并收到」，**不写**邮箱地址 /
   主机名 / 绝对路径 / 端口；注释写「存量里有带下划线的」，**不写**真实目录名 / 容器名 / 入口地址。
-  **证据段落是身份与坐标的集中营**（成因与现场 ⇒ 台账 §8.203）。
+  **证据段落是身份与坐标的集中营**。
 
 ### 6.1 代码 PR 评审要求（合并前主 agent 必须亲自做完；文档 PR 不强制）
 
@@ -131,14 +133,7 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 
 - **pin 以 `package.json` 的 `erix-agent` 字段现读为准，本页不写死版本号**
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
-- runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6；0.18.0 见 §8.8）。升级仍走分支 + PR + §6.1 评审。
+- runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`）。升级仍走分支 + PR + §6.1 评审。
 
-> **逐单台账不在本页**：原文在 [`docs/maintenance/task-ledger.md`](docs/maintenance/task-ledger.md)。
->
-> - **查某一单**：`grep -n '^### 8\.42 ' docs/maintenance/task-ledger.md`（编号 = 全局坐标）
-> - **写新账**：写在那同一个文件；**挑号先查末尾**——
->   `grep -n '^### 8\.' docs/maintenance/task-ledger.md | tail -3`（并行 session 会撞号）
-> - **不许改号、不许重排**：`§8.N` 是全仓解析坐标；引用面由 `npm run check:agents-hotlayer` 现算
->   并设地板（只升不降，掉了就是有人改号或删引用）
-> - **现契约**不在这里：以 `erix-llm-kit` 的 `docs/host-consumer-contract.md` 与对应版本
->   `host-upgrade-guide-*.md` 为准（本节引言第二条已给路径）
+> **现契约不在本页**：以 `erix-llm-kit` 的 `docs/host-consumer-contract.md` 与对应版本
+> `host-upgrade-guide-*.md` 为准（本节引言第二条已给路径）。

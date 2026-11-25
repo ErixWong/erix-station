@@ -92,7 +92,7 @@ class EventsHistoryPool extends FakePool {
     //    WHERE session_id = $1 AND type = 'run_end' AND seq >= $2 [AND seq < $n]
     //    ORDER BY seq DESC LIMIT $k        // k = limit + 1（多取一行探针，探「窗口之下还有没有」）
     // ⚠ 必须排在下面的「主窗口」分支之前（主窗口也含 FROM run_events）。
-    // 照 SQL 文本真算（AGENTS §8.14）：产品代码撤掉 `seq >= $2` 这道页界，fake 就不夹下界；撤掉
+    // 照 SQL 文本真算：产品代码撤掉 `seq >= $2` 这道页界，fake 就不夹下界；撤掉
     // ORDER BY 就拿插入序；把 LIMIT 的 `+1` 探针改成 `limit`，fake 就多返一行 ⇒ 都别心平。
     if (/FROM run_events/.test(flat) && flat.includes("type = 'run_end'")) {
       const sessionId = params[0];

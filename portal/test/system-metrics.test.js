@@ -135,7 +135,7 @@ function makeDocker({ list = CONTAINER_LIST, status = 200, throwOnCall = null } 
   return handle;
 }
 
-/** 采样器用的假 pool：按 SQL 文本分流；未点名的语句归 `other`（**不好心兼平**，AGENTS §8.14）。 */
+/** 采样器用的假 pool：按 SQL 文本分流；未点名的语句归 `other`。 */
 class MetricsPool {
   constructor({ dbNames = [], failWrite = false } = {}) {
     this.dbNames = dbNames;

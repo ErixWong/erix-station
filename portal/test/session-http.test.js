@@ -414,7 +414,7 @@ test('#236 统一闸：同一放宽对其它 JSON 端点（POST /ai-title）同�
 // ⇒ 从 https 进来却被告知「用户面在 http:8090」，于是「回工作台」把人从 https 送回 http。
 // 判据：① 用户面 host 上的请求 ⇒ 跟随；② 管理台 host 来问 ⇒ 仍报配置值（它不知道用户平时用哪个入口）；
 //      ③ 没有 X-Forwarded-Proto（直连/测试桩）⇒ 配置值（旧行为逐字不变）。
-// ⚠ 用 node:http 手工发（`fetch` 不允许设 `Host` 头 —— AGENTS §8.31 那条坑）。
+// ⚠ 用 node:http 手工发（`fetch` 不允许设 `Host` 头 ——  那条坑）。
 // ---------------------------------------------------------------------------
 function getSiteWithHeaders(base, headers) {
   return new Promise((resolve, reject) => {

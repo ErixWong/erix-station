@@ -25,7 +25,7 @@ const later = (s) => new Date(NOW.getTime() + s * 1000);
 // 根因就是这里的 fake 用 `allocations.find(hostname 相等)` 取第一行 —— 它**结构上不可能**同时存在
 // 「同名的活行 + released 行」，而真库的 `port_allocations_live_hostname_key` 是**部分**唯一索引
 // （`WHERE state <> 'released'`，`docs/data/schema.sql` §4）⇒ released 行**不占位**、两行能共存。
-// 照 AGENTS §8.14 的约定（先例 `./preview-grant-checks.js`）：fake 必须**按 SQL 说的做**，
+// 照  的约定（先例 `./preview-grant-checks.js`）：fake 必须**按 SQL 说的做**，
 // 不得自己另写一套谓词/优先级——所以下面既建索引（种子级），也**从 SQL 文本里解析 ORDER BY 再执行**。
 // ---------------------------------------------------------------------------
 
@@ -785,7 +785,7 @@ test('#275 回归：同一 shadow 形状下稳态预览 cookie 也照样放行�
 
 test('#275 契约锁：hostname 只有 released 行（两行）⇒ 仍 403 allocation_released（不得变 404 / 不得变死代码）', async () => {
   // 两条 released 历史行：部分唯一索引对 released **不判重** ⇒ 共存合法；
-  // 种子序故意把「旧的」排前面，选到哪条全看排序子句（AGENTS §8.5：不得依赖偶然行序）。
+  // 种子序故意把「旧的」排前面，选到哪条全看排序子句（不得依赖偶然行序）。
   const history = [
     { id: 'pa-hist-old', released_at: new Date('2026-10-11T06:44:00.000Z'), created_at: new Date('2026-10-11T06:44:00.000Z') },
     { id: 'pa-hist-new', released_at: new Date('2026-10-13T01:50:00.000Z'), created_at: new Date('2026-10-13T01:50:00.000Z') },
@@ -843,7 +843,7 @@ test('#275 读侧护栏（源码级）：hostname 查表必须自带「活行优
   assert.match(
     lookup,
     /ORDER BY \(a\.state <> 'released'\) DESC, a\.released_at DESC NULLS LAST, a\.id/,
-    '活行优先 + 确定全序（AGENTS §8.5）',
+    '活行优先 + 确定全序',
   );
   assert.match(lookup, /\bLIMIT 1\b/, '取单行');
   const whereClause = lookup.slice(lookup.indexOf('WHERE'), lookup.indexOf('ORDER BY'));

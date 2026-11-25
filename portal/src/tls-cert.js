@@ -5,7 +5,7 @@
 //   · 本模块        —— 生命周期：把一份 PEM 校验干净、写进 `certs/`、备份上一代、必要时回滚，再**调**装载面。
 // 本模块**不自己拼 tls.yml**（那是 tlsassets 的唯一职责），也**不碰** routes.yml / llm-routes.yml。
 //
-// 四条真机事实（2026-11-05 实测，见 AGENTS §8.94 / docs/deploy/edge-routing.md §5，照做别重推）：
+// 四条真机事实（2026-11-05 实测，见 docs/deploy/edge-routing.md §5，照做别重推）：
 //   ① 私钥必须「属主 = Traefik 进程 uid（root）+ mode 600」——`station-edge` 里 root 没有
 //      `CAP_DAC_OVERRIDE`，属主/模式不对 ⇒ 握手直接失败（连自签兜底都没有）。portal 容器内也是 root
 //      ⇒ `atomicWriteFile(path, pem, { mode: 0o600, root: dynamicDir })` 天然满足（tmp+rename 后属主仍是 root）。
@@ -300,7 +300,7 @@ export function certificateDomains({ sans, subjectCN }) {
  * ④/⑤ 的界线（为什么顺序是 400、只有叶子只是 warning）：
  *   · C3「只有叶子」= 用户**知道自己只有叶子**（可接受的自担风险，确有只发 leaf 也够用的内部部署）；
  *   · C5「顺序反了」= Traefik **直接拒加载这张证书**，整条 `tls.certificates` 项失效、退回内置自签
- *     ⇒ 管理台变成浏览器硬告警（实测，见 AGENTS §8.100）；
+ *     ⇒ 管理台变成浏览器硬告警；
  *   · C7「接不上」= 用户**以为自己给了完整链**，发出去客户端一定链校验失败，而他没有任何别的信号。
  *   所以后两者是 400，前者只是 `chainWarnings`。
  *

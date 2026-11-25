@@ -87,7 +87,7 @@ const DEFAULT_JSON_BODY_LIMIT = 64 * 1024;
 const MESSAGE_BODY_LIMIT = 1024 * 1024;
 
 // #736：签发/列表/吊销端点当前停用（库里 0 枚、消费者 0，且不过期的管理员钥匙没人敢签 ⇒ #746 已关）。
-// 认证缝（Bearer）保留；重新启用 = 把这个常量改成 true（台账 §8.200）。
+// 认证缝（Bearer）保留；重新启用 = 把这个常量改成 true。
 const TOKEN_ROUTES_ENABLED = false;
 
 const MIME = {
@@ -1217,7 +1217,7 @@ async function routeApi(req, res, ctx, url) {
 
   // ---- #234：跨站写请求防线（portal.md §2.11）——先于任何 handler 执行，否则 CSRF 会先碰到底层副作用。----
   // 豁免（在 csrfGateFor 里）：/api/internal/* 与 /api/forward-auth。拒绝：403 `cross_origin_forbidden`
-  // + #241 那套 CORS deny 头（否则浏览器只报 ACAO 缺失、看不到真实原因，AGENTS §8.11）+ 一条审计。
+  // + #241 那套 CORS deny 头+ 一条审计。
   const csrf = csrfGateFor(req, pathname);
   if (!csrf.allow) {
     // 审计失败不得影响响应（同 §2.7 forward-auth 口径）；details 只记 origin/sec_fetch_site/method，不含 cookie。
@@ -3623,7 +3623,7 @@ export const HISTORY_EVENT_TYPES = new Set([
   'attempt_killed',
   // issue #288（缺陷 C）：崩溃恢复时挂起工具**没被重放**（引擎 `orchestrator.js:2605-2614` 发出，
   // `requiresHostDecision:true`）。同一个坑另发一次：runner 经 U3 落进 run_events、SSE 实时推得到，
-  // **不进本白名单就「实时看得见、刷新后消失」**（AGENTS §8.8）——它出现的时机正是用户刷新页面来
+  // **不进本白名单就「实时看得见、刷新后消失」**——它出现的时机正是用户刷新页面来
   // 看「我这条 run 怎么了」的时刻，不可回放比不推更坑。payload 字段口径见 portal.md §5.3。
   'tool_replay_decision_required',
   // erix-agent #182（0.18.0）新增的**诊断类**事件：模型元信息缺失时上抛。SSE 实时路径会原样推
@@ -4167,7 +4167,7 @@ const NO_TERMINAL_DISCOVERY = Object.freeze({ runIds: Object.freeze([]), truncat
  *   ② planner 有**两条路**、按统计选：`UNIQUE (session_id, seq)` **反向扫**（扫页窗口内的事件行），
  *      或 `run_events_run_end_key`（部分唯一 `WHERE type='run_end'`）**+ Top-N 排序**（扫这一形状
  *      的 `run_end` 行，与 seq 窗口无关）。⇒ 「一定走倒序扫」与「`run_end_key` 帮不上忙」两句
- *      **各说对一半**，两句都别当承诺（实测读数在 §4.4a-2 与台账 §8.130 的返修小节）。
+ *      **各说对一半**，两句都别当承诺。
  */
 async function discoverTerminalRuns(pool, sessionId, { pageLow = 0, before = null, limit = HISTORY_EVENT_DEFAULT_LIMIT } = {}) {
   const params = [sessionId, pageLow];

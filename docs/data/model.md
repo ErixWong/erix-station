@@ -137,7 +137,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 > **`content` 列语义（P3 PR②b B2，conversation-state.md §6）**：本表已降级为**纯锚点行**——两个写入点（POST 用户行 / 终态 assistant 行）的 `content` 恒写空串（列仍是 `text NOT NULL`，baseline `schema.sql` 冻结不改），正文单一来源是 `transcript_rounds.record`（UI 文本由官方展示投影派生）。因此 `content` **只对两类行有意义**：`synthetic = true` 的宿主注入行（judge/wrapup，transcript 里无对应轮次，正文只能落在本列）与迁移 0015/B2 之前的 **legacy 老行**（仅供 `portal/src/session-text.js` 的 legacy 兜底读）。上表「内容」列描述的仍是**人读层的语义归属**（本行代表哪段对话），而非正文的物理存储位置。
 
-> ⚠ **261113 现查补一条未证事实**（DB 形态审计，见 `#506` 与台账 §8.124）：本库 `messages`
+> ⚠ **261113 现查补一条未证事实**：本库 `messages`
 > 391 行里 `content` 空串 **297 行**，且**非空的 94 行全部落在 2026-09-21…09-25**，
 > 10-08 之后写入的行**一律空串** —— 与本段口径一致（正文在 `transcript_rounds.record`）。
 > 但 **`synthetic = true` 的行在本 dev 库 0 行**，所以「宿主注入行正文只能落本列」这半条
@@ -222,8 +222,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 > `assistant_delta` 的 `payload.text` 平均 **2.09 个字符**（`SELECT avg(length(payload->>'text'))
 > WHERE type='assistant_delta'` 现查；工单 #502 正文里那个 3.82 是同一条 SQL 的旧读数，本次没复现出来，
 > 以现查为准）——即「一次事务 + 五次索引更新」换两个字符。**别拿它们当现在的量级。**
-> **迁移后实测（2026-11-14：`0033` 跑完 + `VACUUM (FULL, ANALYZE) run_events` 之后；出处
-> `docs/maintenance/task-ledger.md` §8.126.1）**：`run_events` **7,008 行**、`pg_total_relation_size`
+> **迁移后实测（2026-11-14：`0033` 跑完 + `VACUUM (FULL, ANALYZE) run_events` 之后）**：`run_events` **7,008 行**、`pg_total_relation_size`
 > **5,578,752 B（5.3 MB）**、每行 **802 B**（五条索引全留）、全库 `pg_database_size`
 > **48,389,143 B（46.1 MB）**，碎片行此后保持 **0**。
 > ⇒ 每行字节反而**变大**（802 vs 560）是预期的：被删掉的正好是**最短**的那批行，留下的 durable 行本就更大
@@ -238,7 +237,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 >    「一个 run 至多一行部分正文」的库面约束——那条约束本来就由**既有**的
 >    `run_events_run_end_key (run_id) WHERE type='run_end'` 提供（一个 run 至多一条 `run_end`），
 >    形态 M 因此**不新增也不删除任何索引**；曾经计划的部分唯一索引 `run_events_run_partial_key`
->    随它服务的那个行类型一起放弃（成本与理由见 task-ledger §8.125）。
+>    随它服务的那个行类型一起放弃。
 > ⇒ 「这次 run 说过的话」的 durable 来源只有两处：已完成轮次的 `round_end.payload.final_text`
 >    + 被停住那半轮的 `run_end.payload.partial_text`；历史投影（portal.md §4.4a-1）只读这两处拼正文，
 >    两处都空则给一条**占位合成项**（`placeholder: true`，#278 不空白红线的唯一落点）。
@@ -1176,25 +1175,24 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 `run_events` **472 MB** ≫ `transcript_rounds` **12 MB** > 快照表 4.6 MB > 其余表。
 （⚠ 这条排序里「快照表」那一档是**历史项**：它已由迁移 `0041` 撤掉，issue #640；原名见冻结 baseline。）
 （⚠ 行尾那一档 4.6 MB 是 **`0034` 迁移前**的读数；`0034` + `VACUUM FULL` 后它是
-17 行 / 565,248 B，见下面「迁移后的当前量级」那条与台账 §8.126.2。）
+17 行 / 565,248 B，见下面「迁移后的当前量级」那条与。）
 本表原先写的是「`transcript_rounds.messages`（单 run 可达 MB 级）> `run_events.payload`」——**排序反了**：
 `transcript_rounds` 实测 12 MB / 2,231 行（单 run MB 级那一档远没出现），而 `run_events` 靠 stream 档碎片的
 **行数**堆到 472 MB / 884,163 行。膨胀机制不是「行大」而是「行多且每行都要走一次事务 + 索引」，这是当初写下
 「单 run 可达 MB 级」时没料到的方向。修法见 §1.12 的 stream 档那条（碎片不落库）。
 
-> **迁移后的当前量级（2026-11-14 实测：`0033` + `VACUUM (FULL, ANALYZE)` 之后；出处
-> `docs/maintenance/task-ledger.md` §8.126.1）**：`run_events` **7,008 行 / 5,578,752 B（5.3 MB）/
+> **迁移后的当前量级（2026-11-14 实测：`0033` + `VACUUM (FULL, ANALYZE)` 之后）**：`run_events` **7,008 行 / 5,578,752 B（5.3 MB）/
 > 每行 802 B**，全库 **48,389,143 B（46.1 MB）** ⇒ 上面那条排序里 `run_events` 已从「472 MB」降到全库零头，
 > 现下的榜首是 `transcript_rounds`（那个排序只在迁移前成立）。
 > ⚠ 另一处没动的膨胀源：快照表（85 行 / 4.6 MB）本单未动——**但自迁移 `0034`（PR #509）起它也不成立了**，
-> 时间边界（真库 `station` 实测，出处 `docs/maintenance/task-ledger.md` §8.126.2）：
+> 时间边界（真库 `station` 实测）：
 > **`0034` 之前 87 行 / 4,644,864 B**（台账记的拆分：heap 81,920 / 索引 32,768 / TOAST 4,227,072，
 > 那一组不逐字相加——它没含 TOAST 自己的索引与 FSM/VM 那几块），
 > **`0034` + `VACUUM (FULL, ANALYZE)` 后 17 行 / 565,248 B**（heap 8,192 + 索引 32,768 + TOAST 本体 507,904；
 > `pg_total_relation_size` 里的 TOAST 那一块算上 TOAST 自己的索引是 524,288 B，三者相加才等于 565,248）
 > ——回收 4,079,616 B = −87.8%，全库 −3.88 MB（−8.4%）。
 > 上面那句 85 行 / 4.6 MB 与本节那个排序同属**旧时点读数**（那是 `0033` 前甚至 `0034` 前的一次现查），
-> 留着是取证当时的排序，不是现价；现价的量法（行数 / `pg_total_relation_size` / heap·idx·TOAST 拆开）见 §8.126.2。
+> 留着是取证当时的排序，不是现价；现价的量法（行数 / `pg_total_relation_size` / heap·idx·TOAST 拆开）。
 > 另：`0034` 只清行，**磁盘要部署侧手工 `VACUUM (FULL, ANALYZE) <快照表>` 才回收**（表已由 `0041` 撤，这条运维动作自此是历史）（同下面 `0033` 那条运维注记的理由）。
 
 | 表 | 策略 | 理由 / 依据 |
@@ -1218,7 +1216,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
   （`portal/test/delta-not-persisted-db.test.js` 里有用例钉着这条事实）。
 - 每行字节上界（清理后）：`run_events` 每行 < 4 KB（含 5 个索引的摊销）；~~快照表每行 < 512 KB~~（**该表已随 #640 撤**，体积闸现在只断 `run_events`，并新增了「样本必须恰好是种下去的行数」+ **总字节下界**两道，防退化成空样本）
   （**时间边界**：`0034` 前 dev 实测 85 行 / 4,644,864 B ≈ 53 KB/行；`0034` + `VACUUM (FULL, ANALYZE)` 后
-  **17 行 / 565,248 B ≈ 33 KB/行**；2026-11-14 真库现查，出处台账 §8.126.2）。
+  **17 行 / 565,248 B ≈ 33 KB/行**；2026-11-14 真库现查）。
   两条上界都在真库用例里断言（`portal/test/delta-not-persisted-db.test.js` 的「体积闸」那条），不是文档口头承诺；
   ⚠ 它断的是 `pg_total_relation_size / count(*)` 的**均值**，不是单行最大值——现查单行最大
   `length(snapshot::text)` = **429,617 B**（一行的正文就吃掉那个 512 KB 上界的 **82 %**）⇒ 均值口径下很宽，

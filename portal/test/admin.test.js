@@ -14,7 +14,7 @@ import { FakePool } from './fake-pool.js';
 
 /**
  * #255 fake helper：`UPDATE ... SET ... must_change_password = <literal>` 里该列被赋成指定字面量吗？
- * fake 必须**按 SQL 说的做**（AGENTS §8.14）：判定只从 SQL 文本读，不另写一套语义。
+ * fake 必须**按 SQL 说的做**：判定只从 SQL 文本读，不另写一套语义。
  */
 function assignsMustChange(sql, literal) {
   return new RegExp(`must_change_password\\s*=\\s*${literal}\\b`).test(sql);

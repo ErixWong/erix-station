@@ -22,7 +22,7 @@
 // 判据（缺一不合成）：① 该 run 出现在本次响应窗口里；② runs.status IN ('finished','failed')
 // 且该 run 零助手锚点（含 synthetic 行）；③ 两处正文拼出非空文本，否则出占位。
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB。
-// ⚠ fake **按 SQL 文本真模拟库约束**（AGENTS §8.14）：状态过滤 / EXISTS 锚点 / ANY 数组 / ORDER BY
+// ⚠ fake **按 SQL 文本真模拟库约束**：状态过滤 / EXISTS 锚点 / ANY 数组 / ORDER BY
 //   都在 fake 里照 SQL 语义实现，并用 `sqlLog` 记录每条 SQL 以钉「无 run ⇒ 零额外查询」这条成本红线。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -130,7 +130,7 @@ class PartialOutputPool extends FakePool {
       // `run_end` 每 run 至多一行由库面既有约束 `run_events_run_end_key` 兜（不是本单新增的索引）；
       // fake 照真库**允许**多行返回 ⇒ 代码若真拿到两行 `run_end`，行为要由用例承重（见下面那一条）。
       const rows = this.runEvents.filter((e) => ids.includes(e.run_id) && (e.type === 'round_end' || e.type === 'run_end'));
-      // **按 SQL 文本决定要不要排序**（AGENTS §8.14：fake 不得好心兼平）：代码删了 ORDER BY
+      // **按 SQL 文本决定要不要排序**（fake 不得好心兼平）：代码删了 ORDER BY
       // 就得拿到插入序，而夹具的插入序与 seq 序故意不一致 ⇒ 拼接顺序用例会真红。
       const ordered = /ORDER BY run_id, seq/.test(flat);
       if (ordered) rows.sort((a, b) => (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : a.seq - b.seq));
@@ -157,7 +157,7 @@ class PartialOutputPool extends FakePool {
     //    ORDER BY seq DESC LIMIT $k          // k = limit + 1（#514 返修：多取一行探针判「是否被截断」）
     // ⚠ 必须排在下面的「主窗口」之前（主窗口也含 FROM run_events，而它的 params[1] 在这里是
     // **页下界那个数** ⇒ `types.includes` 直接 TypeError ⇒ 整个端点 500、本文件全红）。
-    // 照 SQL 文本真算（AGENTS §8.14）：代码撤了 `seq >= $2` 这道页界，fake 就不夹下界。
+    // 照 SQL 文本真算：代码撤了 `seq >= $2` 这道页界，fake 就不夹下界。
     if (/FROM run_events/.test(flat) && flat.includes("type = 'run_end'")) {
       const sessionId = params[0];
       const lowMatch = flat.match(/seq >= \$(\d+)/);

@@ -62,7 +62,7 @@ function captureLog() {
 }
 
 /**
- * `platform_prompts` 的内存 fake：**按 SQL 说的做**（AGENTS §8.14，不把新语句当未知放行），
+ * `platform_prompts` 的内存 fake：**按 SQL 说的做**（不把新语句当未知放行），
  * 并把迁移 0043 的 DB 事实当约束执行：只能有一行（`id = 1`）。
  * 注入位：`failSelect`（读抛错 = 表不存在）、`hangSelect`（读不返回 = 超时）、`failAudit`
  * （审计写失败 ⇒ 整条语句失败而设置**一格没变** = 语句级原子）、`failEnqueue`（入队抛错）、
@@ -345,7 +345,7 @@ test('P2b 读超时旋钮：默认 1500、正整数生效、非法形状 ⇒ 默
   assert.equal(readTimeoutMs({ env: { [READ_TIMEOUT_ENV_VAR]: '' }, log }), DEFAULT_READ_TIMEOUT_MS);
   assert.equal(readTimeoutMs({ env: { [READ_TIMEOUT_ENV_VAR]: '800' }, log }), 800);
   assert.equal(readTimeoutMs({ env: { [READ_TIMEOUT_ENV_VAR]: '1e3' }, log }), DEFAULT_READ_TIMEOUT_MS,
-    '1e3 不是严格正整数写法 ⇒ 不许静默当 1000（台账 §8.126 那一族）');
+    '1e3 不是严格正整数写法 ⇒ 不许静默当 1000');
   assert.equal(readTimeoutMs({ env: { [READ_TIMEOUT_ENV_VAR]: '0' }, log }), DEFAULT_READ_TIMEOUT_MS);
   assert.equal(readTimeoutMs({ env: { [READ_TIMEOUT_ENV_VAR]: '-5' }, log }), DEFAULT_READ_TIMEOUT_MS);
   assert.equal(warns.length, 3, '每个非法形状各一条 warn');
@@ -1587,34 +1587,17 @@ function repoTextFiles(rootUrl) {
 }
 
 // ④ 判「哪个文件算提示词文件」用的是**文件级**口径（见下面
-// `subjectRe.test(f.text)`：出现过一次标记就整本受管）。所以本闸
-// 的扫描范围排除了**只追加的历史文件**，理由在这两本的规矩上：
-//   - `docs/maintenance/task-ledger.md`：新单在末尾追加、号不重排；
-//   - 原仓库根 `ISSUES.md`（2026-11-25 已删，台账 §8.204）：试用反馈原始记录，
-//     「保留历史原文，不改写」——名单里再无第二本，但台账这一本的理由不变。
-// 两本都是条目按时间往后长、旧条目不回头改。于是任何一条提到
-// 提示词的新条目都会把**整本**历史拉进受管范围，而历史行的旧号
-// 在写它的那一年是对的（`§4.16` 曾是 #586「关于」面板的号）。
-// 本闸管的是**现势**契约与配置还指不指得对，不是历史叙述有没有
-// 被后来的改号追着改；后者在只追加的文件里做不到——回头改历史
-// 行就违反这两本的规矩。闸若不管这层，必然在未来某天变红，而且
-// 红的永远是别人的历史行（2026-11-17：#350 时代那行被点名）。
-//
-// 两类文件**不进**名单，各给理由：
-//   1. 不再被追加的冻结件（已应用迁移：runner 逐文件记 `sha256`，
-//      改一字节即失配拒启）：不会被新条目拉进受管范围，无需豁免；
-//   2. 现势文件（`deploy/.env.example`、`docs/env.md`、`portal.md`、
-//      源码）：写旧号就是真漏改，照旧全量受管。「排除有没有把闸
-//      掏空」由下面的常驻反向自证 ④-② 钉住（现势必须判红）。
-const APPEND_ONLY_HISTORY_FILES = new Set([
-  'docs/maintenance/task-ledger.md',  // 一单一账、末尾追加、编号不重排不复用
-]);
+// `subjectRe.test(f.text)`：出现过一次标记就整本受管）。曾经为此豁免过两本
+// 只追加的历史文件（逐单台账与原仓库根 `ISSUES.md`）：它们条目按时间往后长、
+// 旧条目不回头改，历史行里的旧号在写它的那一年是对的。
+// **2026-11-25 两本都已删除**（逐单台账退役；`ISSUES.md` 更早删）⇒ 豁免面归零：
+// 全仓文本文件一律按「现势」受管，写旧号就是真漏改。
 
 /**
  * 扫「指向 `docs/api/portal.md §<number>` 的**引用**」。
  * 只认引用形态（同一行出现 `portal.md … §N.N` 或「见/详见/契约/口径/contract … §N.N」），
  * 白话提及（「当年 §4.16 一度有两个标题」）不算；`ownerRe` 命中的行豁免（那一节真正的主人）。
- * 只扫提到 `subjectRe` 的文件；只追加历史（上面那份名单）除外。
+ * 只扫提到 `subjectRe` 的文件。
  * 返回 `['path:line: 原文', …]`。
  */
 function stalePortalSectionRefs({ files, number, subjectRe, ownerRe }) {
@@ -1626,8 +1609,6 @@ function stalePortalSectionRefs({ files, number, subjectRe, ownerRe }) {
   const bare = new RegExp(`§\\s*${num}\\b`);
   const hits = [];
   for (const f of files) {
-    // 只追加的历史不归本闸管（见 APPEND_ONLY_HISTORY_FILES）
-    if (APPEND_ONLY_HISTORY_FILES.has(f.name)) continue;
     if (!subjectRe.test(f.text)) continue;
     f.text.split('\n').forEach((line, i) => {
       if (!bare.test(line)) return;
@@ -1737,20 +1718,10 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
   // ① **台账形状**合成输入 ⇒ ④ 不许判红：新条目里有提示词标记，
   //    文件级口径因此把整本受管；另有一条历史行写着当年对的旧号。
   //    这正是 2026-11-17 咬到人的现场；缺了它，排除就是样子货。
-  const LEDGER_SHAPED = '### 8.100 某旧单（过程账）\n'
-    + '  号：`docs/api/portal.md` ' + REF_416 + '。\n'
-    + '### 8.172 提示词面板（新写的那条）\n'
-    + '  `platform_prompts` 的号是 `docs/api/portal.md` §4.19。\n';
   // ② 现势形状的合成输入：必须判红并点名（现势配置写旧号 = 漏改）
   const CURRENT_SHAPED = '# 读 `platform_prompts` 的超时。\n'
     + '# 号：docs/env.md §10.1 与 docs/api/portal.md ' + REF_416 + '\n';
   const SCOPE_SELF = [
-    // ① 的对照组：同一份内容换个非历史名必须还是红 ⇒ 救它的就是
-    // 「排除只追加历史」这一条，不是别种豁免（主人行 / 非引用形态）。
-    { label: '④-① 台账形状（新条目带标记 + 历史行是旧号）必须放过',
-      name: 'docs/maintenance/task-ledger.md', text: LEDGER_SHAPED, want: 0 },
-    { label: '④-① 对照组：同一内容换个非历史名必须照判红',
-      name: 'docs/maintenance/other-notes.md', text: LEDGER_SHAPED, want: 1 },
     { label: '④-② 现势形状（运维配置写旧号）必须照判红并点名',
       name: 'deploy/.env.example', text: CURRENT_SHAPED, want: 1 },
   ];
@@ -1782,7 +1753,7 @@ test('D1 两头说法：env 旋钮登记进 env.md 与 .env.example，端点与 
   // 同行 ⇒ 翻回旧号也不响（夹具比现实友好）。故再看上方 N 行。
   // N=5：旋钮说明块从标记行到指引行实测跨 4 行，N=5 覆盖整块并留 1 行
   // 余量；块间以空行/# 标题分隔，不会上溯到无关旋钮；全仓实测 N=5 仍
-  // 0 误伤（含 task-ledger 的 §4.16/§4.18 历史行：上方 5 行内无标记）。
+  // 0 误伤。
   const NEIGH_N = 5;
   const danglingRefs = (files, num) => {
     const esc = num.replace('.', '\\.');

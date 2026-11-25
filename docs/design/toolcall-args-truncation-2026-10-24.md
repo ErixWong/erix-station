@@ -1,6 +1,6 @@
 # qwen3.8-flash-next：tool_calls 参数流被提前截断（args > ~4KB 时）
 > **归档说明（2026-10-28）**：本文件与 `-repro.py` 原本躺在**仓库外**的 `fde_station/` 顶层，10-24 之后两周无人
-> 问津。现按 AGENTS §8.76 的规矩入仓。追踪单：**erix-station#426**（上游网关侧，本站改不了，本单是观察 +
+> 问津。现按既有规矩入仓。追踪单：**erix-station#426**（上游网关侧，本站改不了，本单是观察 +
 > 承接）。原始位置：`fde_station/toolcall-truncation-report.md` · `fde_station/toolcall-truncation-repro.py`。
 > 复测：`python3 docs/design/toolcall-args-truncation-2026-10-24-repro.py --shape nested --bytes 6000 --reps 3`。
 

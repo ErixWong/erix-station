@@ -145,7 +145,7 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
   **例外（issue #283，additive 且不碰引擎字段）**：引擎投影的 `toolCalls[]` 本身不带时长 ⇒ 宿主在投影
   **之后**给元素追加 `durationMs`（数据源 = 自家 `tool_calls`，按 `(run_id, call_id)`）：不改名、不重推导、
   不就地改引擎产出的对象（命中才拷贝新对象），旧数据 NULL 则该键不出现。口径见 `docs/api/portal.md` §4.2。
-- **写侧（契约①）实现分工已换到引擎 API**（erix-agent 0.15.0 `appendUserTurn`，上游 #97 闭环）：POST 事务内的预写由引擎承担 round 推导、dedupKey 生成、record 形态与幂等判据；station 只提供极小 store 适配器 `portal/src/transcript-store.js`（`load`/`appendRound` 复用调用方事务 client，落库列形态与原手搋时代逐列等价，「先写 transcript 再入队」顺序不变）。幂等主判据从 DB `ON CONFLICT` 换为引擎按 dedupKey 的 load 判据（顺序重放），`ON CONFLICT` 保留作并发最后防线（同 key 并发由 session `FOR UPDATE` 串行化，满足引擎「在接收事务内发起」的前提）。**0.17.0 起预写走点查快路径**（store 成对实现 `loadByDedupKey`/`loadMaxRound`，上游 #157 / station #193）：事务内不再全量 load——先按 dedupKey 点查，命中即返回既有 record；未命中才取 `MAX(round)` 派生 round 后 `appendRound`，成本不再随 session 行数增长（谓词等价性与保真口径见 AGENTS.md §8.6）。
+- **写侧（契约①）实现分工已换到引擎 API**（erix-agent 0.15.0 `appendUserTurn`，上游 #97 闭环）：POST 事务内的预写由引擎承担 round 推导、dedupKey 生成、record 形态与幂等判据；station 只提供极小 store 适配器 `portal/src/transcript-store.js`（`load`/`appendRound` 复用调用方事务 client，落库列形态与原手搋时代逐列等价，「先写 transcript 再入队」顺序不变）。幂等主判据从 DB `ON CONFLICT` 换为引擎按 dedupKey 的 load 判据（顺序重放），`ON CONFLICT` 保留作并发最后防线（同 key 并发由 session `FOR UPDATE` 串行化，满足引擎「在接收事务内发起」的前提）。**0.17.0 起预写走点查快路径**（store 成对实现 `loadByDedupKey`/`loadMaxRound`，上游 #157 / station #193）：事务内不再全量 load——先按 dedupKey 点查，命中即返回既有 record；未命中才取 `MAX(round)` 派生 round 后 `appendRound`，成本不再随 session 行数增长。
 - 与上游 ADR-018/0.12–0.14 契约的关系：本契约只涉及**读/展示侧**；写侧由 portal 先提交 session transcript、worker 再 resume 的多轮模式见上游 issue #135（本契约 ① 即其实现在 station 的收敛，0.15.0 后由 `appendUserTurn` 承接）。
 
 ### 逐行投影的载体口径与 #339 定性更正（issue #339，2026-10-22，零产品代码）

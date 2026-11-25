@@ -328,7 +328,7 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 
 1. 建 user 记录（角色来自 claim）
 2. **分配子网（IPAM）→ 建 `fde-<name>` 网络 → 起容器**（H-B 定稿 D-1/D-10，issue #5）：portal 查 `fde_networks` 推荐下一块空闲 `/29`（管理员可改），`docker network create --subnet` 显式创建；容器**只接自己这条网络**（不再有 `control` 接入），bind mount 用户空间
-3. **预分配一整段预览域名 + 同事务触发派生链**（issue #240 引入、issue #246 交付①把端口来源换成全局号池；决策者 2026-10-11 裁决）：`portal/src/portalloc.js` 的 `ensureFdePreviewPorts` 在**一个 DB 事务**里写 `port_allocations` **一整块 10 行**（`scope='fde'`、端口 = **全局号池 `22000–29999` 里最小的未占用对齐块**（#246；旧实现写死 `4000–4009`）、`role='spare'`、`exposure='private'`、`state='allocated'`，口径见 §8.2），并在**同一事务**内入队 route outbox/revision + materialize revision ⇒ reconciler **幂等发布** Traefik 路由、materializer 重写 `~/.erix/ports.json`，两条派生链都不需要人工触发（PG 事务无法含文件写入，故仍是「事务写 desired state + outbox」、由 reconciler 异步落盘，§8.1；历史上 `port_allocations` 从没被产品代码写过，手工插完之后路由与 `ports.json` 一律不动——这正是 #240 要消灭的动作）。幂等判据 = 既有部分唯一索引 `port_allocations_live_port_key (fde_id, port) WHERE state <> 'released'` + `ON CONFLICT DO NOTHING`（**与 #246 的全局索引并存**：同 FDE 重跑零插入，跳 FDE 撞号则整笔回滚并报 `preview_port_block_taken`）⇒ 重跑 `cli.js provision-fde` 只补缺口、已齐备则零插入零入队，输出行带 `block=<起>-<止>`
+3. **预分配一整段预览域名 + 同事务触发派生链**（issue #240 引入、issue #246 交付①把端口来源换成全局号池；决策者 2026-10-11 裁决）：`portal/src/portalloc.js` 的 `ensureFdePreviewPorts` 在**一个 DB 事务**里写 `port_allocations` **一整块 10 行**（`scope='fde'`、端口 = **全局号池 `22000–29999` 里最小的未占用对齐块**（#246；旧实现写死 `4000–4009`）、`role='spare'`、`exposure='private'`、`state='allocated'`，口径），并在**同一事务**内入队 route outbox/revision + materialize revision ⇒ reconciler **幂等发布** Traefik 路由、materializer 重写 `~/.erix/ports.json`，两条派生链都不需要人工触发（PG 事务无法含文件写入，故仍是「事务写 desired state + outbox」、由 reconciler 异步落盘，§8.1；历史上 `port_allocations` 从没被产品代码写过，手工插完之后路由与 `ports.json` 一律不动——这正是 #240 要消灭的动作）。幂等判据 = 既有部分唯一索引 `port_allocations_live_port_key (fde_id, port) WHERE state <> 'released'` + `ON CONFLICT DO NOTHING`（**与 #246 的全局索引并存**：同 FDE 重跑零插入，跳 FDE 撞号则整笔回滚并报 `preview_port_block_taken`）⇒ 重跑 `cli.js provision-fde` 只补缺口、已齐备则零插入零入队，输出行带 `block=<起>-<止>`
 4. **物化用户空间文件（bind mount）**：portal 直写宿主 `/srv/erix/users/<fde>/`（H-B 定稿 D-6，issue #7，无需任何入站网络；原「落容器内文件需容器网络可达」类表述随之作废）——含 `AGENTS.md`、`~/.erix/config.json`、项目 `.erix/ports.json`、模板与 `manifest.json`。**文件清单、路径映射、原子写、UID/权限、失败重试、重建幂等、项目目录归属的完整契约见 [`user-space.md`](user-space.md)**（本条由原「写模板/AGENTS.md」单点描述扩充为该契约）
 5. **创建 LLM 绑定**：按建号表单必选的 LiteLLM provider 与主模型（可选 embedding / vision）创建模型白名单受限的 per-FDE 虚拟 key 并发布 LLM 注入路由；key 只写进宿主 Traefik 动态配置（600），**不进容器**（容器内零 LLM 凭据，§11）
 
@@ -849,7 +849,7 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | **P1** | Traefik + portal + DB + 单 FDE 容器（含 station-agentd / station-runner）；登录、项目列表、对话（SSE）、停止 | 真机走通「登录→建项目→对话→工具卡片→停止」；playwright + vision 验证 |
-| **P2** | 多 FDE、run 级端口块 + 预览卡片/iframe、事件重放、~~工具审批~~（**已摘除**：裁决不交付，理由与重新考虑的条件见 principles §3 / issue #249；`approvals` 表与 internal U10/U11 保留作协议留档）、账号生命周期 workflow（项目级端口分配已在 P1，见 §8.2/deploy-contract §7.1） | 断线重连不漏事件；**FDE A 无法访问 FDE B 的任何端口** |
+| **P2** | 多 FDE、run 级端口块 + 预览卡片/iframe、事件重放、~~工具审批~~（**已摘除**：裁决不交付，理由与重新考虑的条件见 principles §3 / issue #249；`approvals` 表与 internal U10/U11 保留作协议留档）、账号生命周期 workflow（项目级端口分配已在 P1/deploy-contract §7.1） | 断线重连不漏事件；**FDE A 无法访问 FDE B 的任何端口** |
 | **P3** | LLM 网关 + 用量记账 + 审计（出口管控为**外部依赖**：安全团队网络层策略，issue #3，非平台交付项） | 成本可按客户项目归集；安全团队出口策略实施后「改 endpoint 无效」，未实施时降级为审计+告警 |
 
 > **原 P0（「等 erix-agent 抽 `src/session/` 发 0.4.0」）已删除**（决策者 2026-09，issue #3 评论）：上游把会话管理列为永久非目标（§13.1），会话层由本平台自实现。**P1 内容不变，只是解除了外部依赖阻塞**——P1 现为第一阶段。
@@ -889,7 +889,7 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
   （他自己会问 AI），对非专业人士是噪音加噪音。**未跟踪与未提交同罪**（都是零兜底），故同归于红；
   红是**进度不是警报**（agent 一改就红，直到收工），所以措辞用状态词、不给 `⚠` 与告警底色。
 - **告知面先行**：产品闭环要求容器里的 agent 真会「收工即提交」，而它看不见灯 ⇒ 要求必须先写进它读的
-  `~/AGENTS.md`（已交付，见 `AGENTS.md` §8.53），灯（P0a/P0b）后上。顺序反了就是「灯长期红/黄、
+  `~/AGENTS.md`，灯（P0a/P0b）后上。顺序反了就是「灯长期红/黄、
   而没人负责让它变绿」。
 - **实现坐标**（261110 现验，`git ls-files`）：判定与聚合 `portal/src/gitlight.js`（判据测试
   `portal/test/gitlight.test.js`）；前端 `portal/frontend/src/lib/gitLight.ts`、

@@ -184,7 +184,7 @@
 
 | 单 | 状态 | 关闭时间（UTC） | 结论 |
 |---|---|---|---|
-| erix-agent [#322](https://github.com/ErixWong/erix-agent/issues/322) 达成意见回灌主模型 | closed / completed | 2026-10-20 04:15 | 落地为 `reflection.judgeDoneAdvisory`（默认关），真机已验（`AGENTS.md` §8.35） |
+| erix-agent [#322](https://github.com/ErixWong/erix-agent/issues/322) 达成意见回灌主模型 | closed / completed | 2026-10-20 04:15 | 落地为 `reflection.judgeDoneAdvisory`（默认关），真机已验 |
 | erix-agent [#323](https://github.com/ErixWong/erix-agent/issues/323) 四处控制文本补 `meta.source` | closed / completed | 2026-10-20 03:33 | 自增强回路堵住 |
 | erix-station [#321](https://github.com/ErixWong/erix-station/issues/321) 完成语义与文案 | closed / completed | 2026-10-23 14:53 | `executed ≠ 已完成`；终态只由 `run_end` 驱动 |
 

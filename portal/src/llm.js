@@ -192,7 +192,7 @@ function modelPricing(model) {
  * 并下发，引擎的压缩开关因此默认是开的。⚠ **三种**还关着压缩的情形（#317：原文写的「唯一一种」不对）：
  * ① 连 `context_window` 都没配；② 窗口形态 runner 不认（真小数 / `≤0` / 非数字 ⇒ `positiveIntOrNull()`
  * 判不可得 ⇒ 回退也算不出，口径见 `runner/lib/llm-models.js`）；③ 窗口小到 1/4 兜底仍算不出正预算
- * （`ctx ≤ 2666`，那道闸在 runner，见 `AGENTS.md` §8.31）。前两种上游的 `model_metadata_missing`
+ * （`ctx ≤ 2666`，那道闸在 runner）。前两种上游的 `model_metadata_missing`
  * 诊断事件照发，就是它的告警。
  *
  * 1/4 这个数不是随手取的：**它恰好等于门户手填时的硬上限**（`validateMaxOutputTokens()` 里同为

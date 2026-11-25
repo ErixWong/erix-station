@@ -645,7 +645,7 @@ export function writeTraefikStatic(dir, { repoRoot = REPO_ROOT, webPort, websecu
  * 启动时动态目录里没有 `routes.yml`，watch 就落在那个「尚不存在的 inode」上，之后 materializer
  * 的原子替换（tmp 写 → rename，见 portal/src/routes.js 头部注释）产生的是**新 inode**，
  * inotify 永远不会把这次替换报给 watch → 整栈健康、DB 有路由、但 internal/预览全 404，
- * `docker restart <edge>` 立刻通（e2e262 实测复现，AGENTS §8.18「edge file-provider watch 坑」）。
+ * `docker restart <edge>` 立刻通（e2e262 实测复现，「edge file-provider watch 坑」）。
  * 预写一份 `http: {}` 空桩让启动即有文件可 watch，之后 materializer 的替换就能被 reload 捕获。
  *
  * ⚠️ 幂等红线：`routes.yml` **已存在则一字不动**——桩绝不能覆盖 materializer 的产物（把真实路由

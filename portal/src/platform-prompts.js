@@ -68,7 +68,7 @@ export const TITLE_PROMPT_MAX_BYTES = 2000;
  * ⚠ **只接受严格十进制正整数字面量**（`POSITIVE_INT_RE`），**不许** `Number(raw)` 了事：
  * `Number('1e3')` 是 1000、`Number(' 12 ')` 是 12、`Number('0x10')` 是 16 —— 那些写法在 YAML /
  * compose / shell 里都能混进门，于是「设了个东西，行为变了，但没人能说清它到底算出了多少」。
- * 台账 §8.126 那一族（env 解析把非严格写法静默半成功）在这里同样适用 ⇒ 不认的写法一律
+ *  那一族（env 解析把非严格写法静默半成功）在这里同样适用 ⇒ 不认的写法一律
  * **默认值 + 一条 warn**（不抛：配置面不许把服务弄挂），优先级 DB > 内置也不因此改变。
  */
 export const DEFAULT_READ_TIMEOUT_MS = 1500;

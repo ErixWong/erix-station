@@ -462,7 +462,7 @@ function OTHER_FP() {
 // ⑥ #462 链完整性（M1）：parseCertificateChain / selectLeaf / describeChain + C1–C7
 //
 // 判据来源：工单 `.work-orders/fix-261105-05-462-tls-chain.md` §1.2 的 C1–C7 判定表。
-// 每条都能被打红（变异取证见 `AGENTS.md` §8.100）。
+// 每条都能被打红。
 // ---------------------------------------------------------------------------
 
 test('#462 parseCertificateChain：逐段切分（fullchain=2 / with-root=3），空串与无段抛 tls_cert_invalid', () => {

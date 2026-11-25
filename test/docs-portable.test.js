@@ -68,15 +68,15 @@ test('夹具：含机器坐标的 md 被拦，且报出 file:line', () => {
 test('夹具：身份词写进 EXEMPT 路径仍被拦，且报出 file:line', () => {
   const org = ['inteva', 'products'].join('');
   const { rc, out } = fixture((dir) => {
-    mkdirSync(path.join(dir, 'docs', 'maintenance'), { recursive: true });
+    mkdirSync(path.join(dir, 'docs', 'ops'), { recursive: true });
     writeFileSync(
-      path.join(dir, 'docs', 'maintenance', 'task-ledger.md'),
-      `# 台账\n\n上游中转组织 ${org} 的额度全局耗尽。\n`,
+      path.join(dir, 'docs', 'ops', 'handoff-2026-10-14.md'),
+      `# 交接单\n\n上游中转组织 ${org} 的额度全局耗尽。\n`,
     );
   });
   assert.notEqual(rc, 0, '身份词还在 EXEMPT 文件里却 exit 0 = EXEMPT 越界豁免了身份');
   assert.ok(
-    out.includes(`docs/maintenance/task-ledger.md:3: ${org}`),
+    out.includes(`docs/ops/handoff-2026-10-14.md:3: ${org}`),
     `输出未点名 EXEMPT 文件里的身份 file:line，实得:\n${out}`,
   );
 });

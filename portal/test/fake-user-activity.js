@@ -3,7 +3,7 @@
 // 为什么要有这个文件：这句话只有两个写入点（`sessions.js#postMessage` 与
 // `queued-inputs.js#enqueueQueuedInput`），而它路过的假池有四个（llm / queued-inputs /
 // session-title / session-stop-queued），外加本单自己的判据文件。本仓假池的红线是
-// 「**未覆盖的 SQL 一律抛错**」（AGENTS §8.14：不许把未知语句好心吞掉 = 假绿），
+// 「**未覆盖的 SQL 一律抛错**」（不许把未知语句好心吞掉 = 假绿），
 // 所以每处都得认识它；把语义收在一处，四处才不会各写一份漂移的仿真。
 //
 // 仿真做三件事（都在「按 SQL 说的做」这条线内）：

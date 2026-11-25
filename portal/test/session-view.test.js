@@ -128,7 +128,7 @@ class SessionViewPool {
     }
     if (sql.includes('FROM runs')) return { rows: [] };
     // issue #283：宿主自有的时长取数面（`getSession` 为 DTO 的 toolCalls[].durationMs 而查）。
-    // 不写死行为：按 SQL 里的 `run_id = ANY($1)` 与 `duration_ms IS NOT NULL` 真筛（AGENTS §8.14）。
+    // 不写死行为：按 SQL 里的 `run_id = ANY($1)` 与 `duration_ms IS NOT NULL` 真筛。
     if (sql.includes('FROM tool_calls')) {
       assert.ok(sql.includes('run_id = ANY'), 'tool_calls 取数必须按 run 集合限定（不拿全表）');
       const runIds = new Set(params[0] ?? []);
