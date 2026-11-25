@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import AdminMacrosView from './AdminMacrosView.vue';
 import { i18n, setLocale } from '../i18n';
+import { AUDIENCES } from '@shared/macro-kinds';
+import { readFileSync } from 'node:fs';
 
 interface Recorded { url: string; method: string; body: unknown; params: URLSearchParams }
 type Handler = (c: Recorded) => Response | undefined;
@@ -316,5 +318,79 @@ describe('编辑入口（#759）：kind/scope 只读、预填取模板值、PATC
     const row = wrapper.findAll('[data-test="macro-row"]').find((r) => r.attributes('data-template-id') === 't-sil');
     expect(row!.get('[data-test="row-name"]').text()).toContain('改名后');
     expect(wrapper.find('[data-test="macros-edit-form"]').exists()).toBe(false);
+  });
+});
+
+// —— 审查（copilot gpt-6-luna）提的 4 条真缺陷，逐条钉住 ——
+// 都是「界面看着正常、实际会错」的那一类，单看渲染断言抓不到。
+
+describe('审查修复：防重提交 / 整数清空 / 软删行 / audience 单源', () => {
+  it('⑦ 连点提交只发一次 POST（后端 (kind,name) 不是唯一索引 ⇒ 重复会留两条模板）', async () => {
+    let postCount = 0;
+    const { wrapper } = await mountView((c) => {
+      if (c.method === 'GET' && c.url.startsWith('/api/admin/macro-templates')) return json(200, { items: [] });
+      if (c.method === 'POST' && c.url === '/api/admin/macro-templates') {
+        postCount += 1;
+        return json(201, { template: tpl('t-new') });
+      }
+      return undefined;
+    });
+    await wrapper.get('[data-test="macros-create-open"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="create-kind"]').setValue('run-notify');
+    await wrapper.get('[data-test="create-name"]').setValue('连点测试');
+    const form = wrapper.get('[data-test="macros-create-form"]');
+    // 同一个 tick 内连发两次 submit（模拟连点 / 重复回车）。
+    form.trigger('submit');
+    form.trigger('submit');
+    await flushPromises();
+    expect(postCount).toBe(1);
+  });
+
+  it('⑧ 整数参数清空 ⇒ body 里没有该键（不是 0；Number("") === 0 会被后端按 min 拒）', async () => {
+    const { wrapper, calls } = await mountView((c) => {
+      if (c.method === 'GET' && c.url.startsWith('/api/admin/macro-templates')) {
+        return json(200, { items: [tpl('t-sil', { kind: 'run-silence-alert', params: { max_per_day: 5 } })] });
+      }
+      if (c.method === 'PATCH') return json(200, { template: tpl('t-sil', { kind: 'run-silence-alert' }) });
+      return undefined;
+    });
+    await wrapper.get('[data-test="edit-t-sil"]').trigger('click');
+    await flushPromises();
+    // 把整数输入清空。
+    await wrapper.get('[data-test="param-max_per_day"]').setValue('');
+    await wrapper.get('[data-test="macros-edit-form"]').trigger('submit');
+    await flushPromises();
+    const patch = calls.find((c) => c.method === 'PATCH');
+    expect(patch).toBeTruthy();
+    const body = patch!.body as { params: Record<string, unknown> };
+    expect(Object.prototype.hasOwnProperty.call(body.params, 'max_per_day')).toBe(false);
+  });
+
+  it('⑨ 软删行没有编辑入口（后端 updateTemplate 的 WHERE 带 deleted_at IS NULL ⇒ 保存必然 404）', async () => {
+    const { wrapper } = await mountView(listHandler);
+    expect(wrapper.find('[data-test="edit-t-live"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="edit-t-gone"]').exists()).toBe(false);
+  });
+
+  it('⑩ audience 选项来自 shared AUDIENCES（不抄字面量，漂了就红）', async () => {
+    const { wrapper } = await mountView((c) => {
+      if (c.method === 'GET' && c.url.startsWith('/api/admin/macro-templates')) return json(200, { items: [] });
+      return undefined;
+    });
+    await wrapper.get('[data-test="macros-create-open"]').trigger('click');
+    await flushPromises();
+    // audience 在 `<template v-if="form.kind">` 里 ⇒ 先选 kind 才渲染。
+    await wrapper.get('[data-test="create-kind"]').setValue('run-notify');
+    const opts = wrapper.get('[data-test="create-audience"]').findAll('option');
+    expect(opts.map((o) => (o.element as HTMLOptionElement).value)).toEqual([...AUDIENCES]);
+
+    // ⚠ 光断渲染值**抓不到「抄字面量」**：当前 `AUDIENCES` 恰好就是 ['all','admin']，
+    //   硬编码一份一模一样的选项，上面那条照样绿（实测变异就是这么活下来的）。
+    //   ⇒ 必须从**源码**断「选项是遍历 shared 枚举渲染的」。
+    // vitest 的 cwd = portal/frontend（npm test 的工作目录）
+    const src = readFileSync('src/components/MacroTemplateForm.vue', 'utf8');
+    expect(src).toContain('v-for="a in AUDIENCES"');
+    expect(src).not.toMatch(/<option\s+value="(all|admin)"/);
   });
 });

@@ -224,8 +224,11 @@ onMounted(() => { void load(); });
           <td class="py-1 pr-2 font-mono" data-test="row-subs">{{ subscriberLabel(row) }}</td>
           <td class="py-1 pr-2">
             <div class="flex items-center gap-2">
-              <!-- 编辑（issue #759）：打开编辑表单改 name/params/audience（kind/scope 只读） -->
+              <!-- 编辑（issue #759）：打开编辑表单改 name/params/audience（kind/scope 只读）。
+                   ⚠ 软删行不给入口（审查 #4）：后端 `updateTemplate` 的 WHERE 带 `deleted_at IS NULL`
+                   ⇒ 编辑已删模板保存必然 404。启停按钮早就按同一条件藏了，编辑漏了。 -->
               <button
+                v-if="row.deleted_at == null"
                 type="button"
                 :data-test="'edit-' + row.id"
                 class="rounded border border-black/15 px-2 py-0.5 text-xs hover:bg-black/5"
