@@ -125,7 +125,13 @@ function main() {
   const hits = [];
   let files = 0;
   for (const rel of gitLsFiles(['*.md', 'deploy/.env.example'])) { files++; scanFile(rel, true, hits); }
-  for (const rel of gitLsFiles(['*.js', '*.ts', '*.vue'])) { files++; scanFile(rel, false, hits); }
+  // ⚠ `*.mjs` 必须在内：261124 的发布镜像里就漏着 `integration/lib/fde-image.mjs` 的代理 IP 注释——
+  //    扫面只写 `*.js` 时它永远不会被拦（.mjs 不是 .js）。
+  const SELF = 'scripts/check-doc-portable.mjs'; // 本文件就是 DENY 定义处，扫它会自伤
+  for (const rel of gitLsFiles(['*.js', '*.mjs', '*.cjs', '*.ts', '*.vue'])) {
+    if (rel === SELF) continue;
+    files++; scanFile(rel, false, hits);
+  }
   if (hits.length > 0) {
     console.error(`check:doc-portable RED：仓库里含本机/内网坐标或身份 ${hits.length} 处（已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/ts/vue 注释行）`);
     for (const h of hits) console.error(`  ${h}`);

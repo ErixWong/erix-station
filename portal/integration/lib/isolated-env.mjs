@@ -689,7 +689,7 @@ export function deriveIsolationComposeEnv({ docker, ownFdeNetwork, baseEnv = {},
     .split('\n').map((s) => s.trim())
     .filter((n) => n.startsWith('fde-') && n !== ownFdeNetwork);
   const subnets = [...new Set(names.map((n) => safe(() => {
-    // format 含空格，必须单引号包裹（docker() 把整条命令包进 sg docker -c "..."，
+    // format 含空格，必须单引号包裹（docker() 把整条命令包进包装层 "..."，
     // 内层 sh 会对未引用的 {{json .IPAM.Config}} 做词拆分 → Go 模板 unclosed action）。
     const cfg = JSON.parse(docker(`network inspect ${n} --format '{{json .IPAM.Config}}'`));
     return cfg?.[0]?.Subnet || null;

@@ -1,4 +1,4 @@
-// WP2a 真机端到端（需 docker；docker 命令经 `sg docker -c` 绕过，env §8.1）。
+// WP2a 真机端到端（需 docker；docker 命令经包装层绕过（本机 quirk 见冷层））。
 //
 // **本脚本是工单 F（#268 决策第 2 条）重建后的形态**：按 P5（目录即项目）+ 迁移 0019（FDE 级端口块）
 // 的现役语义重写，旧版里「POST /api/projects → 项目级 ports.json/manifest.json → DELETE 项目 → 端口回收」
@@ -119,7 +119,7 @@ const isolationComposeEnv = memoizeOnce(() => (process.env.IPAM_RESERVED_SUBNETS
   ? {}
   : deriveIsolationComposeEnv({ docker, ownFdeNetwork: FDE_CONTAINER })));
 
-// 工单 F-6：命令串进容器要经**两层** shell——`execSync` 解析一次 `sg docker -c "…"`，sg 再把参数交给
+// 工单 F-6：命令串进容器要经**两层** shell——`execSync` 解析一次包装层 "…"，sg 再把参数交给
 // `sh -c` 解析第二次。命令里的**真实换行**在 JSON.stringify 这一步就变成字面 `\n` 两个字符，而双引号
 // 内的 POSIX shell **不还原**它 ⇒ 下游收到的是 `run_id\n FROM` 这种带反斜杠的垃圾（psql 报
 // `ERROR: syntax error at or near "\"`，工单 F-6 在真机 §⑤ 上撞的就是这个）。
