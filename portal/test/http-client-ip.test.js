@@ -9,7 +9,7 @@
 //   A2 头是 `bogus-not-an-ip, 198.51.100.7` ⇒ 用 `198.51.100.7`（最右、不被最左伪造带跑）。
 //   A3 对端公网（绕过 edge）+ XFF ⇒ 用对端地址，头被无视。
 //   A4 没有头 ⇒ 用 socket 地址（回归不变，老行为不许变）。
-//   A6 防回潮闸：`portal/src/**/*.js` 里除 `clientIp` 内部，出现 `req.socket.remoteAddress` 就红。
+//   A6 防回潮闸：`portal/src/**/*.js` 里除 `clientIp` 内部，读了 `remoteAddress` 就红（禁用面见 FORBIDDEN：点式/可选链/方括号/解构/拆写法都算）。
 // 追加刀（拓扑校正，工单 #740b）：
 //   A7 夹具默认路由 nexthop = `172.32.0.1` ⇒ 对端 `172.32.0.1` + XFF ⇒ 采信头（部署形态复刻）。
 //   A8 夹具读不到 / 无默认路由 / Gateway `00000000` ⇒ 集合空 ⇒ 不信头（回落 socket）。
@@ -304,15 +304,33 @@ test('#740 A13 夹具目录必须被清（§3.2 teardown 纪律自己也要有�
 });
 
 // ===========================================================================
-// A6：防回潮闸 —— `portal/src/**/*.js` 除 `clientIp` 内部不许再出现 `req.socket.remoteAddress`。
+// A6：防回潮闸 —— `portal/src/**/*.js` 除 `clientIp` 内部不许再读 socket 对端地址（禁用面见 FORBIDDEN）。
 // ===========================================================================
 
-const FORBIDDEN = /req\??\.socket\??\.remoteAddress/;
+// 禁用面 = `\bremoteAddress\b`（#740 评审 F2：两轮收窄的结论）。为什么不钉整串也不钉中间态 `\.remoteAddress`：
+//  ① 整串 `req\.socket\.remoteAddress` 看不见**拆写法**：`const s = req.socket; const ip = s.remoteAddress;`
+//     语义完全一样，但闸看不见；
+//  ② `\.remoteAddress` 仍看不见**没有点**的两型：方括号 `req.socket['remoteAddress']` 与解构
+//     `const { remoteAddress } = req.socket`。
+// 所以钉的是「读了 `remoteAddress` 这个名字」本身，不管用什么语法糖读到（豁免区仍只 `clientIp` helper 那一块，
+// 沿用 clientIpExemptLines，不扩面）。
+// 已知且**刻意接受**的边界（别当 bug 修）：整行注释不算 offender（见 isCommentLine）——讲解这条规矩的注释
+// 必须能写出这个词，否则文档只能绕着正则说话。今天 src 里这个词只出现在 http.js 的 4 处（3 处注释 + 1 处代码），
+// 全在 clientIp 豁免区内 ⇒ 注释豁免不是承重结构，只是给未来的讲解注释留口子。把真读法藏在行首块注释后面
+// （`/* 顺手 */ s.remoteAddress`）能绕过：本闸防**无意回潮**，不防刻意混淆（防混淆得上 AST，本轮不值当）。
+const FORBIDDEN = /\bremoteAddress\b/;
 
-/** 逐行扫一段源码文本，返回所有命中 `req.socket.remoteAddress`（含可选链变体）的 {line, text}。 */
+/** 整行注释（含块注释的 ` * ` 续行）：讲解本闸的注释要能出现被禁的那个词，故不算 offender（理由见 FORBIDDEN）。 */
+function isCommentLine(line) {
+  const t = line.trim();
+  return t.startsWith('//') || t.startsWith('/*') || t.startsWith('*') || t.startsWith('*/');
+}
+
+/** 逐行扫一段源码文本，返回所有读了 `remoteAddress` 的**代码行**（点式/可选链/方括号/解构/别名都算）的 {line, text}。 */
 function scanForbiddenLines(text) {
   const hits = [];
   text.split('\n').forEach((line, i) => {
+    if (isCommentLine(line)) return; // forEach 回调里只能这样跳过（`continue` 在这儿非法，会 SyntaxError）
     if (FORBIDDEN.test(line)) hits.push({ line: i + 1, text: line.trim() });
   });
   return hits;
@@ -350,7 +368,7 @@ function clientIpExemptLines(lines) {
   return set;
 }
 
-test('#740 A6 防回潮闸：portal/src 里除 clientIp 内部，出现 req.socket.remoteAddress 就红', () => {
+test('#740 A6 防回潮闸：portal/src 里除 clientIp 内部，读了 remoteAddress 就红（方括号/解构/拆写法也算）', () => {
   const srcDir = path.join(HERE, '..', 'src');
   const offenders = [];
   for (const file of listJs(srcDir)) {
@@ -371,11 +389,23 @@ test('#740 A6 防回潮闸：portal/src 里除 clientIp 内部，出现 req.sock
   assert.deepEqual(offenders, [], '有人绕过 clientIp 直接读 socket 对端（#740 回潮）：\n' + offenders.join('\n'));
 });
 
-test('#740 A6b 防回潮闸自证非恒绿（能抓 req.socket.remoteAddress 与可选链变体）', () => {
-  const a = scanForbiddenLines('  const x = req.socket.remoteAddress || "unknown";');
-  assert.equal(a.length, 1, 'plain 写法必须被抓');
-  const b = scanForbiddenLines('  const x = req?.socket?.remoteAddress;');
-  assert.equal(b.length, 1, '可选链变体也必须被抓（否则把写法改成 ?. 就能绕过闸）');
+test('#740 A6b 防回潮闸自证非恒绿（点式/可选链/方括号/解构/别名五种形状都要被抓，讲解性注释不抓）', () => {
+  // 每一种绕过形状都要单独钉住：闸只抓其中一种时，把写法换成另一种就能默默回潮（评审 F2 的原话）。
+  const shapes = [
+    ['点式', '  const x = req.socket.remoteAddress || "unknown";'],
+    ['可选链', '  const x = req?.socket?.remoteAddress;'],
+    ['方括号', '  const x = req.socket["remoteAddress"];'],
+    ['解构', '  const { remoteAddress } = req.socket;'],
+  ];
+  for (const [shape, code] of shapes) {
+    assert.equal(scanForbiddenLines(code).length, 1, `${shape} 写法必须被抓（抓不到 ⇒ 这一型能绕过闸）`);
+  }
+  // 别名式（拆写法）：不只要抓到，还要钉在**真正读名字那一行**，免得只靠第一行抵数。
+  const alias = scanForbiddenLines('  const s = req.socket;\n  const ip = s.remoteAddress;');
+  assert.deepEqual(alias.map((h) => h.line), [2], '别名式必须被抓，且钉在第 2 行（真正读名字的那一行）');
+  // 讲解这条规矩的注释不该被误伤（豁免理由写在 FORBIDDEN 上方的注释里，不是默默放过）。
+  const note = scanForbiddenLines('  // 讲解：别把 socket 对端的 remoteAddress 直接当客户端 IP（要用 clientIp）\n  const ip = clientIp(req);');
+  assert.equal(note.length, 0, '讲解这条规矩的整行注释不该被误伤（否则文档只能绕着正则说话）');
   const c = scanForbiddenLines('  // 只是注释里提 clientIp 之外没有 socket 读法\n  return clientIp(req);');
   assert.equal(c.length, 0, '不含被禁写法的代码不该被抓（非恒红）');
 });
