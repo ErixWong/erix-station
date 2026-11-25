@@ -1,28 +1,27 @@
 # ============================================================================
-# CI —— 质量门禁（PR/main）+ 镜像构建校验（main，按路径过滤，不推送）
-# 依据：station issue #235；口径、预算语义、被停额度时的人工兜底见 docs/ops/ci-release.md
+# CI —— PR 只跑一条快腿；重活改成手动 / 发版前一次
+# 依据：station issue #235；口径与基线见 docs/ops/ci-release.md
 #
-# 运行器红线：**ubuntu-latest 单一运行器，禁止任何 matrix**
-#   （GitHub Free 账号 Linux $0.006/min、Windows $0.01/min、macOS 3-core $0.062/min ≈ 10 倍；
-#    matrix 会把分钟数成倍吃掉，而本账号 Actions/Packages 预算 $0 + Stop usage=Yes ⇒ 超额是**停跑**）。
+# 261125 用户裁定：一轮 5–8 分钟的「全量门禁」里，真正抓到过缺陷的只有根单测；
+# 真数据库测试 / 前端 typecheck+vitest / 镜像构建校验都不该每个 PR 跑。
 #
-# e2e（portal/integration/wp*-e2e.mjs）**故意不进 CI**：需要 docker daemon + 固定 IPAM 池 +
-#   泛域名/Tailscale，且 `assertIsolatedEnvironment()` 会硬断言一堆隔离栈 env（ci-release.md §6）。
+#   手动             ：① node --check + ② npm ci + npm test（含 runner，约 40–60 秒）
+#   手动 build=all   ：三个镜像构建 + build-info tripwire（发版前用）
 #
-# 依赖注：三个 lockfile 的 resolved 全指 registry.npmjs.org（erix-agent 是公开包）⇒ 不需要 NPM_TOKEN。
+# 261125 再裁定：**连 PR 触发也去掉**——单人仓库里同一套命令本地跑只要 20 秒，
+# 没必要每次 push 都占一轮 runner 分钟。门禁靠提交前本地 `npm test`，CI 只在你要的时候跑。
+#
+# 改成本地手动的：
+#   真数据库测试：npm run check:ci-legs（需 TEST_DATABASE_URL，见 docs/testing.md §2.2.1）
+#   前端        ：cd portal/frontend && npm run typecheck && npm test
 # ============================================================================
 name: CI
 
 on:
-  # issue #783：CI **只在 PR 触发**。以前 main 每次合并都会把同一棵内容的树再跑一遍门禁
-  #（261125 实测：一天 24 轮 push(main) 全部由合并提交触发、直推 0 次），而 PR 检查本就跑在合并 ref 上。
-  # 代价与补偿：PR 检查跑在「那一刻的 base」上，别人先合了就会错配 ⇒ 合并前必须先把 main 并进分支
-  # 再让 CI 绿一次（口径见 docs/ops/ci-release.md §4.4）。
-  pull_request: # 门禁 +（按路径判定）三镜像构建校验
-  workflow_dispatch: # 额度被静默停跑后手动补跑
+  workflow_dispatch: # 只有手动：门禁；build_images=all 时连镜像一起验
     inputs:
       build_images:
-        description: '镜像构建校验范围（none = 只跑门禁）'
+        description: '镜像构建校验（none = 只跑门禁）'
         type: choice
         required: false
         default: 'none'
@@ -30,61 +29,26 @@ on:
           - none
           - all
 
-# 门禁与「只构建不推送」都不需要写权限（release.yml 才有 packages: write）
 permissions:
   contents: read
 
 jobs:
   gate:
-    name: 质量门禁（语法 / 根单测 / runner 单测 / 前端 typecheck+test）
+    name: 门禁（语法 + 根单测）
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     # 同分支只留最新一次：并发堆分钟数是 Free 账号的主要风险
     concurrency:
       group: ci-${{ github.ref }}
       cancel-in-progress: true
-    # issue #665：给质量门禁接一台真 PG，让「只有空库/真 SQL 执行才现形」的那类缺陷在流水线上会红。
-    # 只加 service、不新开 job、不用 matrix（§4/§5 红线：Free 账号超额是停跑不是扣费、且没有红灯）。
-    # 版本选 postgres:16：仓库真库测试口径就指定一次性 postgres:16（docs/testing.md §2.2.1，
-    # 见 portal/test/pg-fixture.js 的 SKIP 文案与 migrate-fresh-db.test.js 顶部注释），且 pg-fixture
-    # 用的 `DROP DATABASE … WITH (FORCE)` 需 PG ≥ 13。账号用内置超级用户 postgres：migrate.js 的
-    # bootstrap.sql 会 CREATE ROLE、pg-fixture.js 会 CREATE DATABASE（需 CREATEDB）、
-    # platform-prompts-db.mjs 会 CREATE SCHEMA —— 三者都要超级用户，故直接用 postgres 超管。
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: station_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d station_test"
-          --health-interval 5s --health-timeout 5s --health-retries 10
-    env:
-      # 前端 devDependencies（vite/tailwind/vitest）要求 NODE_ENV 不是 production，否则 npm ci 会跳过 devDeps。
-      # 镜像构建里才是 NODE_ENV=production（portal/Dockerfile:17），两者不冲突。
-      NODE_ENV: development
-    outputs:
-      build_portal: ${{ steps.paths.outputs.portal }}
-      build_fde: ${{ steps.paths.outputs.fde }}
-      build_proxy: ${{ steps.paths.outputs.proxy }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          # 路径过滤要 diff「推入前 ↔ 推入后」，故取全历史（本仓库体量可忽略）
-          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22' # 对齐 package.json engines（>=22）；本机基线 22.23.2
-          # 刻意不开 `cache: npm`：Actions cache 与 Packages 共享 500MB 配额（ci-release.md §4），
-          # 三次 npm ci 冷跑共 ~3s，省下的秒数不值配额风险。
+          node-version: '22' # 对齐 package.json engines（>=22）
 
       # ---- ① 语法保底：零依赖 node --check 扫全部跟踪的 *.js / *.mjs ----
-      # 仓库是 Node ESM 且 package.json 带 "type": "module"，`node --check` 会按 package.json 的
-      # type 解析（本机实测 portal/src/config.js 与 portal/integration/lib/fde-image.mjs 均 rc=0）。
       - name: '① 语法保底：node --check 扫全部 *.js / *.mjs'
         run: |
           set -euo pipefail
@@ -96,152 +60,19 @@ jobs:
               fail=1
             fi
           done < <(git ls-files -z -- '*.js' '*.mjs')
-          echo "已 node --check ${n} 个文件（只取 git 跟踪的 *.js / *.mjs；node_modules 天然不在其中）"
+          echo "已 node --check ${n} 个文件（只取 git 跟踪的 *.js / *.mjs）"
           exit $fail
 
-      # ---- ①′ 运行身份诊断（工单 C2）：uid/gid 相关失败今后一眼可判 ----
-      # fchown 类断言只在「进程能把属主改成目标 uid」时才成立（非特权进程只能改成自己的 euid/所属组），
-      # 而 runner 用户并不恰好是 1000:1000 ⇒ 属主类断言必须跟随进程身份（见 docs/ops/ci-release.md §8）。
-      # 不加 continue-on-error / if: always()：这四行本身要跑成功才有意义。
-      - name: '①′ 运行身份诊断：id -u / id -g / id / uname -a'
-        run: |
-          set -euo pipefail
-          echo "id -u = $(id -u)"
-          echo "id -g = $(id -g)"
-          echo "id    = $(id)"
-          echo "uname = $(uname -a)"
-
-      # ---- ② 根单测：node --test —— 现价（项数 / 通过 / 失败 / 跳过）由
-      #      docs/ops/ci-release.md §1 的「现价」块单独持有，本文件不再抄第二份。
-      #      261110 之前这里挂着一条 12,034 字节的逐单沿革注释；历史沿革同处冷层，别写回来。
-      - name: '⓪ 变更范围判定：docs-only 快道与路径基线（#783）'
-        id: scope
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          docs_only=false; base=''; files=''
-          # PR 才可能有 docs-only；workflow_dispatch 一律全量（人工补跑就是要看全套）
-          if [ "$EVENT" = 'pull_request' ] && git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-            base="$BASE"
-            files="$(git diff --name-only "$base" "$SHA" || true)"
-            # docs-only 的口径**故意窄**：只有文档正文 + 文档闸的豁免账算 docs。
-            # 刻意**不含** deploy/migrations/（迁移要真库腿验）也**不含** .github/workflows/（改 CI 自己必须全量验）。
-            DOCS_RE='^(docs/|[A-Za-z0-9._-]*\.md$|scripts/doc-impl-exceptions\.json$)'
-            if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE "$DOCS_RE"; then
-              docs_only=true
-            fi
-          fi
-          {
-            echo "base=$base"
-            echo "docs_only=$docs_only"
-          } >> "$GITHUB_OUTPUT"
-          if [ "$docs_only" = 'true' ]; then
-            SKIP='docs-only ⇒ 本轮跳过 ②（根 npm ci+test）/ ②′（真库腿）/ ③（runner）/ ④（前端）'
-            echo "$SKIP，只跑 ①⑤ + 文档闸" | tee -a "$GITHUB_STEP_SUMMARY"
-            printf '%s\n' "$files" | sed 's/^/    docs-only: /' || true
-          else
-            echo "非 docs-only（或取不到 base）⇒ 全量跑，路径基线 = ${base:-无（dispatch，⑤ 走保守全量）}"
-          fi
-
+      # ---- ② 根单测：node --test（根发现规则已包含 runner/test/*.test.js）----
       - name: '② 根 npm ci + npm test'
-        if: steps.scope.outputs.docs_only != 'true'
         run: |
           npm ci --no-audit --no-fund
           npm test
-
-      # ---- ②′ 真库腿 + 「skip 不算绿」闸（issue #665）----
-      # 根门禁只看 `# fail`，一个静默 skip 的真库腿与一个通过的 job 同色。这里注入 TEST_DATABASE_URL
-      # 后跑 scripts/check-required-legs.mjs：它自己拉起 migrate-fresh-db（5）与
-      # test:integration:prompts（7）两条腿，断言它们 `# skipped == 0` 且真跑出 pass；
-      # 任一条被 skip（比如 PG service 没起来、DSN 错导致又变 skip）⇒ 闸红。
-      - name: '②′ 真库腿 + skip 不算绿闸（postgres service）'
-        if: steps.scope.outputs.docs_only != 'true'
-        env:
-          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/station_test
-        run: node scripts/check-required-legs.mjs
-
-      # ---- ③ runner 单测：`node --test` 不带目录参数（AGENTS.md §4 口径：
-      #      `node --test runner/test/` 会把目录当模块加载 → Cannot find module，别用）----
-      - name: '②ᴰ 文档快道：只跑四个文档闸（docs-only 时）'
-        if: steps.scope.outputs.docs_only == 'true'
-        run: |
-          set -euo pipefail
-          # 三支都是零依赖 ESM，不需要 npm ci；被跳过的代码腿已在 ⓪ 与 job summary 里点名。
-          node scripts/agents-hotlayer-budget.mjs   # 热层预算 + 台账完整性 + §8.N 引用地板
-          node scripts/check-doc-portable.mjs       # 仓库文档必须可公开（本机坐标不许写进来）
-          node scripts/check-doc-impl.mjs           # 文档 ↔ 实现比对（#777 的闸）
-          echo "VERDICT ok：文档快道三条闸全绿（跳过的代码腿见 ⓪ 输出）"
-
-      - name: '③ runner npm ci + node --test'
-        if: steps.scope.outputs.docs_only != 'true'
-        working-directory: runner
-        run: |
-          npm ci --no-audit --no-fund
-          node --test
-
-      # ---- ④ 前端：显式 NODE_ENV=development（本机 NODE_ENV=production 会跳过 devDeps）----
-      - name: '④ 前端 npm ci + typecheck + vitest'
-        if: steps.scope.outputs.docs_only != 'true'
-        working-directory: portal/frontend
-        run: |
-          NODE_ENV=development npm ci --no-audit --no-fund
-          npm run typecheck
-          npm test
-
-      # ---- ⑤ 按路径判定要构建哪些镜像（只在 push / dispatch=all 时需要）----
-      # 口径以**仓库实际构建方式**为准（工单原表 + portal/Dockerfile 的 COPY 面）：
-      #   portal 镜像构建上下文 = 仓库根，除 portal/** 与根 package*.json 外，还 COPY 了
-      #   docs/data/（portal/Dockerfile:31）与 deploy/migrations/（:34），根 .dockerignore 也参与上下文，
-      #   ⇒ 这四类路径变化同样会让镜像内容变化，必须触发构建校验。
-      #   FDE 上下文 = runner/（fde-image.mjs:36 `build -t <img> runner/`）；proxy 上下文 = deploy/fde-proxy/。
-      - name: '⑤ 按路径判定要构建哪些镜像'
-        id: paths
-        if: github.event_name == 'pull_request' || github.event.inputs.build_images == 'all'
-        env:
-          EVENT: ${{ github.event_name }}
-          # #783：PR 用 base sha 作路径基线（checkout 是 fetch-depth: 0，base commit 取得到）
-          BEFORE: ${{ steps.scope.outputs.base }}
-          AFTER: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          portal=false; fde=false; proxy=false; files=''
-          if [ "$EVENT" = 'workflow_dispatch' ]; then
-            echo 'workflow_dispatch + build_images=all ⇒ 三个镜像全量构建校验'
-            portal=true; fde=true; proxy=true
-          elif git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            files="$(git diff --name-only "$BEFORE" "$AFTER" || true)"
-            count="$(printf '%s' "$files" | grep -c . || true)"
-            echo "路径判定基线：${BEFORE}..${AFTER}，改动文件数 ${count}"
-            [ "$count" -gt 0 ] && printf '%s\n' "$files" | sed 's/^/    /' || true
-          else
-            echo "⚠️ 推入前的 commit（${BEFORE}）不在本地历史（新分支首推 / force push）⇒ 保守起见全量构建"
-            portal=true; fde=true; proxy=true
-          fi
-          if [ -n "$files" ]; then
-            printf '%s\n' "$files" | grep -qE '^(\.dockerignore|package\.json|package-lock\.json|portal/|docs/data/|deploy/migrations/)' && portal=true || true
-            printf '%s\n' "$files" | grep -qE '^runner/' && fde=true || true
-            printf '%s\n' "$files" | grep -qE '^deploy/fde-proxy/' && proxy=true || true
-          fi
-          {
-            echo "portal=$portal"
-            echo "fde=$fde"
-            echo "proxy=$proxy"
-          } >> "$GITHUB_OUTPUT"
-          echo "构建判定：portal=$portal fde=$fde proxy=$proxy"
 
   images:
-    name: 镜像构建校验（三镜像，--load 不推送）
+    name: 镜像构建校验（手动，三镜像 --load 不推送）
     needs: gate
-    # PR 一律不构建；push main / dispatch=all 且路径命中才构建（单一 ubuntu-latest，无 matrix）
-    # #783：镜像构建校验以前只在 push(main) 跑，现在 push(main) 没了 ⇒ 它必须在 PR 上跑，
-    # 否则 Docker 发布链从此没人验。它只 --load 不推送、不需要 packages:write，PR 面跑是安全的。
-    if: >-
-      (needs.gate.outputs.build_portal == 'true' ||
-       needs.gate.outputs.build_fde == 'true' ||
-       needs.gate.outputs.build_proxy == 'true')
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.build_images == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
@@ -255,15 +86,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 构建上下文/dockerfile 一律照抄仓库现状。**build args 的两条口径**（#586 现读，别抄旧结论）：
-      #   ① 三个**版本** ARG（`STATION_VERSION`/`STATION_REVISION`/`STATION_BUILD_DATE`）portal 与 FDE **都传**
-      #     ——它们只影响 Dockerfile **末尾**那一层（ARG 声明在末尾），缓存代价只是一层，不传就是
-      #     `build-info.json` 里 revision/built_at 恒 `unknown`（v0.1.53 实测）；传了才有下一步的 tripwire。
-      #   ② FDE 的**代理** build args CI 恒不传（runner/Dockerfile:55-74 从 github.com / dl.gitea.io /
-      #     gitlab.com 直连下载 gh/tea/glab，本机在墙内才要 HTTP_PROXY/HTTPS_PROXY/NO_PROXY + --network=host，
-      #     见 fde-image.mjs:26-40；GitHub runner 直连可达），build args 参与 Docker 缓存键 ⇒ 不传保持稳定。
+      # build args 的两条口径（#586 现读，别抄旧结论）：
+      #   ① 三个**版本** ARG（STATION_VERSION / STATION_REVISION / STATION_BUILD_DATE）portal 与 FDE 都传
+      #     ——它们只影响 Dockerfile 末尾那一层，不传就是 build-info.json 里 revision/built_at 恒 unknown。
+      #   ② FDE 的**代理** build args CI 恒不传（GitHub runner 直连可达，build args 参与缓存键）。
       - name: '构建校验：station-portal 镜像（context = 仓库根，dockerfile = portal/Dockerfile）'
-        if: needs.gate.outputs.build_portal == 'true'
         run: |
           set -euo pipefail
           docker buildx build --load \
@@ -274,27 +101,17 @@ jobs:
             --file portal/Dockerfile \
             .
 
-      # ---- ④′ portal 镜像的 build-info.json tripwire（issue #586：⑤′ 的同形版，那边只查 FDE 镜像）----
-      # 为什么必须有一条：v0.1.69 发布时 `git pull --ff-only` 网络抖动只 fetch 没 pull ⇒ portal 烘的是
-      # 停在 0.1.68 的工作树，而 portal 镜像当时**根本没有 build-info.json**、⑤′ 又只查 FDE 镜像
-      # ⇒ 真机 FDE 报 0.1.69 / portal 报 0.1.68 分裂一小时，**没有任何机器判据能发现**。四格逐条断言：
-      # 缺文件（没烘）/ station_version 与仓库不符（烘错了树或 ARG 传错）/ revision 不是本次 commit
-      # （没传 STATION_REVISION）/ built_at 或 engine_version 是 unknown 都算红。
-      # 判据本身的负例自证（本地两种构建各跑一次）见 `portal/test/version-surface.test.js` 与
-      # `portal/test/version-surface.test.js` 的负例自证。
+      # ---- ④′ portal 镜像的 build-info.json tripwire（v0.1.69 事故：portal 烘的是旧树，无人能发现）----
       - name: '构建校验：station-portal 镜像的 build-info.json（版本/修订真烘进去了吗）'
-        if: needs.gate.outputs.build_portal == 'true'
         run: |
           set -euo pipefail
           docker run --rm --entrypoint cat "${IMG_PORTAL}:ci-${GITHUB_SHA::7}" /app/build-info.json > /tmp/portal-build-info.json
           cat /tmp/portal-build-info.json
-          # 四格断言的**唯一一份实现在 `scripts/check-build-info.mjs`**（CI 与 `portal/test/version-surface.test.js`
-          # 共用），所以「判据本身会不会红」在单测里就能自证，不必靠人肉跑一次坏构建。
+          # 四格断言的唯一一份实现在 `scripts/check-build-info.mjs`（CI 与 `portal/test/version-surface.test.js` 共用）
           WANT_VERSION="$(node -p "require('./package.json').version")" WANT_REVISION="$GITHUB_SHA" \
             node scripts/check-build-info.mjs /tmp/portal-build-info.json
 
       - name: '构建校验：FDE 镜像（context = runner/）'
-        if: needs.gate.outputs.build_fde == 'true'
         run: |
           set -euo pipefail
           docker buildx build --load \
@@ -304,12 +121,7 @@ jobs:
             --build-arg STATION_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             runner/
 
-      # ---- ⑤′ build-info.json tripwire（issue #404 结案时留的第三问：「谁在检查」）----
-      # 只构建不检查 = 版本没烘进去也没人知道（v0.1.53 实测 build-info.json 的 revision/built_at 与两个
-      # OCI label 全是 unknown/空，就是因为 release.yml 从没传过这三个 ARG）。这里把它们变成红格：
-      # 三个 ARG 只影响 Dockerfile 末尾那一层（ARG 声明在末尾），所以这一步不额外增加构建成本。
       - name: '构建校验：FDE 镜像的 build-info.json（版本/修订真烘进去了吗）'
-        if: needs.gate.outputs.build_fde == 'true'
         run: |
           set -euo pipefail
           docker run --rm --entrypoint cat "${IMG_FDE}:ci-${GITHUB_SHA::7}" /opt/erix/build-info.json > /tmp/build-info.json
@@ -327,7 +139,6 @@ jobs:
           '
 
       - name: '构建校验：fde-proxy 镜像（context = deploy/fde-proxy）'
-        if: needs.gate.outputs.build_proxy == 'true'
         run: |
           set -euo pipefail
           docker buildx build --load \
