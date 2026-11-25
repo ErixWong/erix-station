@@ -3850,8 +3850,9 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 | `auth.session_renew_interval_seconds` | `SESSION_RENEW_INTERVAL_SECONDS` | 整数 `1..86400` 秒（默认 `3600`；>1 天滚动续期名存实亡） | `hot` | `/api/me` 续期时现读（算 `renewIntervalMs`） |
 | `auth.max_password_length` | `MAX_PASSWORD_LENGTH` | 整数 `1..4096` 字符（默认 `256`；下界 1 = 代码只校非空+≤上限、无最小长度常量；上界护 scrypt 代价） | `hot` | 登录 / 建用户 / 改密时现读（喂 `admin.validatePassword`） |
 | `auth.max_login_length` | `MAX_LOGIN_LENGTH` | 整数 `1..512` 字符（默认 `128`；login 进限流键/主机名种子 ⇒ 封顶防哈希内存面） | `hot` | 登录 / 建用户时现读（喂 `admin.validateLogin`） |
+| `preview.kk_base_url` | `KK_INTERNAL_BASE_URL` | http(s) base URL 字符串（默认 `http://kkfileview:8012`；只收 http(s)、无 userinfo/query/fragment、去尾斜杠后非空、长度 ≤255） | `hot` | `GET /api/preview-backend` 的探针现读（`http.js` 的 `handlePreviewBackend`）；前端据此决定渲染 iframe 还是降级下载 |
 
-十二格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+十三格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
 
 后三格（#677 P3 第六批：三个循环的空闲退避上限）也是同一套机件，但是**三份独立实例**（各自一份
 缓存与在飞槽）：共用一份就是「保存开户那格的上限，把对账那一格的缓存一起抹掉」。现读位置是
