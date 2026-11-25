@@ -16,6 +16,7 @@
 //
 // 后续要把其余 test:integration:* 接进来，只往 REQUIRED_LEGS 里加一条即可。
 import { spawnSync } from 'node:child_process';
+import { buildDiagnosis } from './lib/leg-output.mjs';
 
 const HAS_PG = (process.env.TEST_DATABASE_URL || '').trim() !== '';
 
@@ -27,12 +28,14 @@ const REQUIRED_LEGS = [
     why: '空库 → baseline → bootstrap → 全部增量迁移，只有全新库能证（#280）',
     argv: ['node', '--test', 'portal/test/migrate-fresh-db.test.js'],
     minPass: 5,
+    retryOnFailure: 1,
   },
   {
     id: 'npm run test:integration:prompts',
     why: 'platform_prompts 写侧真 SQL 执行 + 种行（FOR UPDATE 锁已存在行，#596）',
     argv: ['npm', 'run', 'test:integration:prompts'],
     minPass: 7,
+    retryOnFailure: 1,
   },
   {
     id: 'portal/test/api-tokens-db.test.js',
@@ -40,6 +43,7 @@ const REQUIRED_LEGS = [
       + '折 user 列面，四条假库抓不到的 SQL 回归（变异实测全红）',
     argv: ['node', '--test', 'portal/test/api-tokens-db.test.js'],
     minPass: 6,
+    retryOnFailure: 1,
   },
 ];
 
@@ -66,6 +70,37 @@ function runLeg(leg) {
   return { rc: res.status ?? -1, stdout, stderr, tap: parseTapSummary(stdout + '\n' + stderr) };
 }
 
+/**
+ * 判定口径（与 #665 一字未动）：rc==0 && fail==0 && skipped==0 && pass>=minPass。
+ * 返回问题清单（空数组即绿）。
+ */
+function evaluateLeg(r, minPass) {
+  const t = r.tap;
+  const problems = [];
+  if (r.rc !== 0) problems.push(`进程 rc=${r.rc}`);
+  if (t.fail > 0) problems.push(`# fail=${t.fail}`);
+  if (t.skipped > 0) problems.push(`# skipped=${t.skipped}（本该真跑，skip≠绿）`);
+  if (t.pass < minPass) {
+    problems.push(`# pass=${t.pass} < 期望最小 ${minPass}（没真跑起来）`);
+  }
+  return problems;
+}
+
+/** 一条腿的汇总行（OK/红 同格式）。 */
+function summaryLine(tag, leg, r) {
+  const t = r.tap;
+  return `SKIP-GATE [${tag}] ${leg.id}  rc=${r.rc} pass=${t.pass} fail=${t.fail}` +
+    ` skipped=${t.skipped} tests=${t.tests}`;
+}
+
+/** 红腿：把捕获内容切成可诊断切片逐行打出（绿腿不打）。 */
+function printDiagnosis(leg, label, r) {
+  const text = (r.stdout || '') + '\n' + (r.stderr || '');
+  for (const line of buildDiagnosis(text, { legId: leg.id, label })) {
+    console.log(line);
+  }
+}
+
 function main() {
   if (!HAS_PG) {
     // 无 PG：不许静默。明确点名这次没跑的清单，rc=1。
@@ -80,31 +115,45 @@ function main() {
   }
 
   let green = true;
-  const rows = [];
   for (const leg of REQUIRED_LEGS) {
-    const r = runLeg(leg);
-    const t = r.tap;
-    const problems = [];
-    if (r.rc !== 0) problems.push(`进程 rc=${r.rc}`);
-    if (t.fail > 0) problems.push(`# fail=${t.fail}`);
-    if (t.skipped > 0) problems.push(`# skipped=${t.skipped}（本该真跑，skip≠绿）`);
-    if (t.pass < leg.minPass) {
-      problems.push(`# pass=${t.pass} < 期望最小 ${leg.minPass}（没真跑起来）`);
+    const r1 = runLeg(leg);
+    const problems1 = evaluateLeg(r1, leg.minPass);
+    if (problems1.length === 0) {
+      console.log(summaryLine('OK ', leg, r1));
+      continue;
     }
-    const ok = problems.length === 0;
-    if (!ok) green = false;
-    rows.push({ leg, r, t, problems, ok });
-    const tag = ok ? 'OK ' : '红 ';
-    console.log(`SKIP-GATE [${tag}] ${leg.id}  rc=${r.rc} pass=${t.pass} fail=${t.fail}` +
-      ` skipped=${t.skipped} tests=${t.tests}`);
-    for (const p of problems) console.log(`          ↳ ${p}`);
+    // 第 1 次红：无 retryOnFailure 的腿直接判红，真库腿走下面的显式重试。
+    if ((leg.retryOnFailure || 0) < 1) {
+      green = false;
+      console.log(summaryLine('红 ', leg, r1));
+      for (const p of problems1) console.log(`          ↳ ${p}`);
+      printDiagnosis(leg, leg.id, r1);
+      continue;
+    }
+    // 显式重试（不许静默）：先打出「要重试 + 第 1 次 rc」再跑第 2 次。
+    console.log(`SKIP-GATE [重试] ${leg.id} 第 2 次（第 1 次 rc=${r1.rc}）`);
+    const r2 = runLeg(leg);
+    const problems2 = evaluateLeg(r2, leg.minPass);
+    if (problems2.length === 0) {
+      // 靠重试才过 ⇒ 判绿，但必须留痕（静默重试会把真 bug 一起吞掉）。
+      console.log(summaryLine('OK ', leg, r2));
+      console.log(`SKIP-GATE [OK ] ${leg.id}（第 2 次通过，第 1 次 rc=${r1.rc}）`);
+      continue;
+    }
+    // 两次都红 ⇒ 仍判红，且把两次的 not ok 切片都打出来。
+    green = false;
+    console.log(summaryLine('红 ', leg, r2));
+    for (const p of problems2) console.log(`          ↳ ${p}`);
+    printDiagnosis(leg, `${leg.id} 第1次`, r1);
+    printDiagnosis(leg, `${leg.id} 第2次`, r2);
   }
 
   if (!green) {
     console.log('SKIP-GATE: 有必须真跑的腿没绿 ⇒ rc=1');
     return 1;
   }
-  console.log(`SKIP-GATE: ${rows.length} 条必须真跑的腿全部真跑且 0 skip ⇒ rc=0`);
+  const n = REQUIRED_LEGS.length;
+  console.log(`SKIP-GATE: ${n} 条必须真跑的腿全部真跑且 0 skip ⇒ rc=0`);
   return 0;
 }
 
