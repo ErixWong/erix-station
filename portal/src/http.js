@@ -1125,7 +1125,7 @@ async function routeApi(req, res, ctx, url) {
     if (getBearerToken(req).present) {
       throw new HttpError(
         400, 'logout_not_applicable_for_tokens',
-        'API 令牌不能登出，请在管理台吊销该令牌',
+        'API 令牌不能登出（令牌没有会话）；作废需由管理员吊销该令牌',
       );
     }
     const token = getCookie(req, config.cookie.name);

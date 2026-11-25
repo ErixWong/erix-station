@@ -498,10 +498,14 @@ test('⑰ GET 列表端点停用 ⇒ 404 not_found', async () => {
   await env.close();
 });
 
-test('⑱ DELETE 吊销端点停用 ⇒ 404 not_found', async () => {
+test('⑱ DELETE 吊销端点停用 ⇒ 404 且**不得落吊销**（用真 id，否则与“令牌不存在”同形）', async () => {
   const env = await harness();
-  const del = await env.rawRevoke('root', 'eric', '00000000-0000-4000-8000-000000000000');
+  const m = await env.mint('eric', 'ci');
+  assert.ok(m.id, '先真造一枚：拿假 id 时“路由开着”也回 404，那这格没有判别力');
+  const del = await env.rawRevoke('root', 'eric', m.id);
   assert.equal(del.status, 404, del.text);
   assert.equal(del.json.error.code, 'not_found');
+  // 真判别力：路由真的关了 ⇒ 这枚绝不会被标成已吊销（端点开着则会 200 + 落 revoked_at）。
+  assert.equal(env.row('ci').revoked_at ?? null, null, '路由已关 ⇒ 不得把真令牌吊销掉');
   await env.close();
 });
