@@ -3,10 +3,35 @@
 // 请求参数（cwd/path 编码，路径牢笼由后端 portal/test/file-preview.test.js 覆盖）。
 // 事件断言用父级 onClose 回调（script-setup 组件 emitted() 不记录，仓库先例亦不用）。
 // 注意：需 NODE_ENV=development 运行（仓库既有约定：NODE_ENV=development npm install && npm test）。
+// #795 追加：native-office / native-zip 通道的挂载选择与 failed 降级（四个渲染组件全部 vi.mock 桩化，
+//   jsdom 没有 canvas/layout，真库渲染不在单测里跑）；kkfile 已成死代码 ⇒ 原 kkfile 用例被替换。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
+import { h } from 'vue';
 import FilePreviewModal from './FilePreviewModal.vue';
 import { i18n, setLocale } from '../i18n';
+
+// #795：四个前端渲染组件按契约桩化（真库在 jsdom 里跑不动：docx/xlsx/pptx 要 layout/canvas）。
+// 模态框层只钉两件事：按扩展名挂到哪个组件、子组件 failed 后怎么降级；渲染保真度真机验。
+// vi.hoisted：mock 工厂在静态 import 阶段就会被调用，那时本文件顶层 const 还在 TDZ，
+// 所以桩的**定义**必须先在 hoisted 块里造好（h 只在渲染时取用，那时 import 已完成）。
+const { stubComponent } = vi.hoisted(() => {
+  function stubComponent(name: string) {
+    return {
+      name,
+      props: { cwd: { type: String, required: true }, path: { type: String, required: true } },
+      emits: ['failed'],
+      setup() {
+        return () => h('div', { 'data-stub': name }, `STUB:${name}`);
+      },
+    };
+  }
+  return { stubComponent };
+});
+vi.mock('./OfficeDocxPreview.vue', () => ({ default: stubComponent('OfficeDocxPreview') }));
+vi.mock('./OfficeSheetPreview.vue', () => ({ default: stubComponent('OfficeSheetPreview') }));
+vi.mock('./OfficePptxPreview.vue', () => ({ default: stubComponent('OfficePptxPreview') }));
+vi.mock('./ZipListing.vue', () => ({ default: stubComponent('ZipListing') }));
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -213,67 +238,69 @@ describe('FilePreviewModal 四通道分流（#366 P0/P1/P2）', () => {
     w2.unmount();
   });
 
-  it('kkfile：签票 POST → iframe 指 /pv/<码>，sandbox 无 allow-same-origin', async () => {
-    // #787：kkfile 先探后端。桩按 URL 分派：探针说可用 ⇒ 再走签票。
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
-      String(input) === '/api/preview-backend'
-        ? jsonResponse(200, { configured: true, available: true })
-        : jsonResponse(200, { url: '/pv/CODE123.SIG/onlinePreview', expires_in: 600 })));
+  // #795：office/zip 改前端渲染。kkfile 用例（签票 / iframe / 探针）随通道下线一并移除，
+  // 换成下面这组：挂载选择（按扩展名）+ failed 降级（提示 + 下载）+ doc 归 other。
+  it('docx → OfficeDocxPreview；弹窗自身零请求（字节由组件自己经 useFileBytes 取）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'x')));
     const wrapper = mountAt('docs/report.docx');
     await tick();
-    expect(String(vi.mocked(fetch).mock.calls.at(-1)![0])).toBe('/api/preview-tickets');
-    const iframe = wrapper.find('iframe');
-    expect(iframe.exists()).toBe(true);
-    expect(iframe.attributes('src')).toBe('/pv/CODE123.SIG/onlinePreview');
-    // 红线：sandbox 给脚本执行权但不给同源权（预览内容 XSS 拿不到 portal 会话）。
-    expect(iframe.attributes('sandbox')).toBe('allow-scripts');
-    expect(iframe.attributes('sandbox')).not.toContain('allow-same-origin');
+    expect(wrapper.find('[data-stub="OfficeDocxPreview"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain('STUB:OfficeDocxPreview');
+    expect(wrapper.find('iframe').exists()).toBe(false);
+    expect(vi.mocked(fetch).mock.calls.length).toBe(0); // 不签票、不探针、不发 JSON
     wrapper.unmount();
   });
 
-  it('kkfile：签票遇 preview_code_expired 自动重签一次；第二次仍错才直显', async () => {
-    let n = 0;
-    // #787：探针（先打一次）不计入 n（n 只数签票 POST）。
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-      if (String(input) === '/api/preview-backend') {
-        return jsonResponse(200, { configured: true, available: true });
-      }
-      n += 1;
-      if (n === 1) return jsonResponse(403, { error: { code: 'preview_code_expired', message: 'preview code expired' } });
-      return jsonResponse(200, { url: '/pv/FRESH.SIG/onlinePreview', expires_in: 600 });
-    }));
-    const wrapper = mountAt('docs/deck.pptx');
-    await tick();
-    expect(n).toBe(2); // 一次静默重签（文件被 agent 改写后的自愈路径）
-    expect(wrapper.find('iframe').attributes('src')).toBe('/pv/FRESH.SIG/onlinePreview');
-    wrapper.unmount();
-
-    n = 0;
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-      if (String(input) === '/api/preview-backend') {
-        return jsonResponse(200, { configured: true, available: true });
-      }
-      n += 1;
-      return jsonResponse(403, { error: { code: 'preview_code_expired', message: 'expired again' } });
-    }));
-    const w2 = mountAt('docs/deck.pptx');
-    await tick();
-    expect(n).toBe(2); // 重签只重试一次，不无限循环
-    expect(w2.find('[role="alert"]').text()).toContain('expired again');
-    w2.unmount();
+  it('xlsx / xls → OfficeSheetPreview；pptx → OfficePptxPreview；zip → ZipListing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'x')));
+    const cases = [
+      ['docs/a.xlsx', 'OfficeSheetPreview'],
+      ['docs/a.xls', 'OfficeSheetPreview'],
+      ['docs/deck.pptx', 'OfficePptxPreview'],
+      ['pack/site.zip', 'ZipListing'],
+    ] as const;
+    for (const [path, stubName] of cases) {
+      const wrapper = mountAt(path);
+      await tick();
+      expect(wrapper.find(`[data-stub="${stubName}"]`).exists()).toBe(true);
+      expect(wrapper.find('iframe').exists()).toBe(false);
+      wrapper.unmount();
+    }
+    expect(vi.mocked(fetch).mock.calls.length).toBe(0);
   });
 
-  it('kkfile：kk 不可用（502）→ 错误直显 + 下载出口', async () => {
-    // #787：探针报可用但签票 POST 打 kk 时 502 ⇒ 后端原文直显（探针不拦这条）。
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
-      String(input) === '/api/preview-backend'
-        ? jsonResponse(200, { configured: true, available: true })
-        : jsonResponse(502, { error: { code: 'preview_backend_unavailable', message: 'kkfileview unreachable' } })));
-    const wrapper = mountAt('docs/a.xlsx');
+  it('doc → other 文案（不支持预览 + 下载），不挂渲染组件、零请求', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'x')));
+    const wrapper = mountAt('docs/legacy.doc');
     await tick();
-    expect(wrapper.find('[role="alert"]').text()).toContain('kkfileview unreachable');
-    const link = wrapper.find('a[role], a[href*="mode=download"]');
-    expect(link.attributes('href')).toContain('mode=download');
+    expect(wrapper.text()).toContain('该格式不支持在线预览');
+    expect(wrapper.find('[data-stub="OfficeDocxPreview"]').exists()).toBe(false);
+    expect(wrapper.find('a[href*="mode=download"]').attributes('href')).toContain('mode=download');
+    expect(vi.mocked(fetch).mock.calls.length).toBe(0);
+    wrapper.unmount();
+  });
+
+  it('子组件 failed(too_large) ⇒ 20MB 文案 + 下载链接，渲染组件让位', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'x')));
+    const wrapper = mountAt('docs/huge.pptx');
+    await tick();
+    wrapper.findComponent({ name: 'OfficePptxPreview' }).vm.$emit('failed', 'too_large');
+    await flushPromises();
+    const alert = wrapper.find('[role="alert"]');
+    expect(alert.text()).toContain('文件超过 20MB，不在此渲染，请下载后查看');
+    expect(alert.find('a[href*="mode=download"]').attributes('href')).toContain('mode=download');
+    expect(wrapper.find('[data-stub="OfficePptxPreview"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('子组件 failed(render_failed) ⇒ 「无法在此渲染」文案（zip 走同一条降级）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'x')));
+    const wrapper = mountAt('pack/broken.zip');
+    await tick();
+    wrapper.findComponent({ name: 'ZipListing' }).vm.$emit('failed', 'render_failed');
+    await flushPromises();
+    expect(wrapper.find('[role="alert"]').text()).toContain('该文件无法在此渲染，请下载后查看');
+    expect(wrapper.find('a[href*="mode=download"]').exists()).toBe(true);
     wrapper.unmount();
   });
 
@@ -309,56 +336,4 @@ describe('FilePreviewModal 四通道分流（#366 P0/P1/P2）', () => {
     wrapper.unmount();
   });
 
-  // #787：kkfile 通道先探 `/api/preview-backend`，后端不在线 ⇒ 不签票、不发 iframe，直接降级到下载。
-  it('kkfile：探针 available:false ⇒ 不签票、无 iframe、给下载（不可达文案）', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
-      String(input) === '/api/preview-backend'
-        ? jsonResponse(200, { configured: true, available: false })
-        : jsonResponse(200, { url: '/pv/SHOULD_NOT_APPEAR/onlinePreview', expires_in: 600 })));
-    const wrapper = mountAt('docs/report.docx');
-    await tick();
-    expect(wrapper.find('iframe').exists()).toBe(false);
-    // 未 POST 过 /api/preview-tickets。
-    const posts = vi.mocked(fetch).mock.calls.filter(
-      (c) => String(c[0]) === '/api/preview-tickets');
-    expect(posts).toHaveLength(0);
-    expect(wrapper.find('[role="alert"]').text()).toContain('文档预览服务暂不可用');
-    expect(wrapper.find('a[href*="mode=download"]').attributes('href')).toContain('mode=download');
-    wrapper.unmount();
-  });
-
-  it('kkfile：探针 configured:false ⇒ 「未配置」文案、同样降级到下载', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
-      String(input) === '/api/preview-backend'
-        ? jsonResponse(200, { configured: false, available: false })
-        : jsonResponse(200, { url: '/pv/X/onlinePreview', expires_in: 600 })));
-    const wrapper = mountAt('docs/a.xlsx');
-    await tick();
-    expect(wrapper.find('iframe').exists()).toBe(false);
-    expect(wrapper.find('[role="alert"]').text()).toContain('未配置文档预览服务');
-    wrapper.unmount();
-  });
-
-  it('kkfile：探针请求本身失败 ⇒ fail-closed 走「不可达」文案', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-      if (String(input) === '/api/preview-backend') throw new Error('network down');
-      return jsonResponse(200, { url: '/pv/X/onlinePreview', expires_in: 600 });
-    }));
-    const wrapper = mountAt('docs/deck.pptx');
-    await tick();
-    expect(wrapper.find('iframe').exists()).toBe(false);
-    expect(wrapper.find('[role="alert"]').text()).toContain('文档预览服务暂不可用');
-    wrapper.unmount();
-  });
-
-  it('kkfile：探针 available:true ⇒ 照旧签票 + iframe（#787 新钉）', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) =>
-      String(input) === '/api/preview-backend'
-        ? jsonResponse(200, { configured: true, available: true })
-        : jsonResponse(200, { url: '/pv/OK.SIG/onlinePreview', expires_in: 600 })));
-    const wrapper = mountAt('docs/report.docx');
-    await tick();
-    expect(wrapper.find('iframe').attributes('src')).toBe('/pv/OK.SIG/onlinePreview');
-    wrapper.unmount();
-  });
 });

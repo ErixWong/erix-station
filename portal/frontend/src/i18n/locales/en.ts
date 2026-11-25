@@ -606,6 +606,13 @@ export const en = {
     pdfUnsupported: 'This browser cannot display the embedded PDF; download it and open locally',
     backendUnconfigured: 'No document preview service is configured; please download and view.',
     backendUnreachable: 'The document preview service is unavailable; please download and view.',
+    // #795: two degrade messages for the client-side rendering channels (docx/xlsx/xls/pptx/zip)
+    // plus the zip listing column headers. Pairs with zh-CN.ts one-for-one.
+    officeTooLarge: 'This file is over 20MB; download it to view.',
+    officeRenderFailed: 'This file could not be rendered; download it to view.',
+    zipEmpty: 'Empty archive',
+    zipSize: 'Size',
+    zipDate: 'Date',
   },
   // Preview port panels (issue #246 delivery ②, ticket B: workbench section + admin FDE pane).
   // Contract red line (portal.md §4.7a): `active` only means “the first credential was admitted” ⇒

@@ -1,24 +1,35 @@
 <script setup lang="ts">
 // 文件预览 modal（issue #84 P6 第一版；#366 P0/P1/P2 扩通道）：目录树文件节点点击 → 本 modal。
-// 四条渲染通道（lib/previewRoute.ts 的纯函数按扩展名分流）：
+// 渲染通道（lib/previewRoute.ts 的纯函数按扩展名分流）：
 //   native-json —— 文本/Markdown/图片：/api/file JSON 契约，逐字节沿用 #84 行为
 //                  （Markdown 复用 lib/markdown.ts + mermaid；文本 <pre>；图片 base64 <img>）；
 //   native-stream — PDF/音视频：浏览器原生 <object>/<video>/<audio>，src=/api/file?mode=stream；
 //   kkfile —— Office/压缩包等：POST /api/preview-tickets 签能力码 → iframe 指 /pv/<码>/onlinePreview
 //                  （sandbox="allow-scripts" 无 allow-same-origin：kk 产物页脚本拿不到 portal 会话）；
+//   native-office — docx/xlsx/xls/pptx：前端库直接渲染（#795），字节走 mode=stream，>20MB 降级；
+//   native-zip —— zip：jszip 只列目录（不解压、不单项下载）；
 //   other —— 清单外：不发任何请求，直接给下载。
+// kkfile 分支从 #795 起是**死代码**：previewChannel 不再产出该通道；签票/iframe 原样留着，
+// 下一阶段 kkFileView 下线时一并删。
 // 失败态（413/415/502/网络）：错误 message 直显 + 「下载」按钮（P0：死路页的出口）。
 // 交互对齐 SessionPickerModal：dialog 语义（role/aria-modal）、Esc 关闭、打开焦点进 dialog、
 // 关闭归还触发按钮、锁背景滚动。
-import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
 import { renderMarkdown } from '../lib/markdown';
 // 与 StreamPanel 同口径：.md 预览里的 ```mermaid 块也挂图（v-html 落定后 DOM 后处理）。
 import { vMermaid } from '../directives/mermaid';
 import {
-  downloadUrl, isMarkdownName, jsonPreviewUrl, previewChannel, streamMediaKind, streamPreviewUrl,
+  downloadUrl, extOf, isMarkdownName, jsonPreviewUrl, previewChannel, streamMediaKind,
+  streamPreviewUrl,
 } from '../lib/previewRoute';
+// #795：前端渲染通道（docx/xlsx/xls/pptx/zip）。四个组件各自经 useFileBytes 取字节，
+// 失败/超限只 emit failed，提示与下载出口统一在本模态框出（组件自己不做下载按钮）。
+import OfficeDocxPreview from './OfficeDocxPreview.vue';
+import OfficeSheetPreview from './OfficeSheetPreview.vue';
+import OfficePptxPreview from './OfficePptxPreview.vue';
+import ZipListing from './ZipListing.vue';
 
 // issue #101 P2：用户可见文案走 i18n（preview.* / common.*）；错误 message 来自后端（原样展示）。
 const { t } = useI18n();
@@ -45,6 +56,15 @@ const loading = ref(true);
 const error = ref('');
 const preview = ref<FilePreview | null>(null);
 const kkUrl = ref('');
+// #795：native-office / native-zip 的降级位（子组件 emit failed 后置位，非空 ⇒ 只给提示+下载）。
+const officeFail = ref<'' | 'too_large' | 'render_failed'>('');
+/** 选哪个 office 子组件：按扩展名（xls/xlsx 共用 SheetJS 那个）。 */
+const officeKind = computed(() => {
+  const ext = extOf(props.path);
+  return ext === 'docx' || ext === 'xlsx' || ext === 'xls' || ext === 'pptx' ? ext : '';
+});
+// 换文件时清掉上一个文件的降级态（否则新文件一挂载就先显示旧错误）。
+watch(() => [props.cwd, props.path], () => { officeFail.value = ''; });
 // #787：kkfile 通道先探一下预览后端。非空 ⇒ 不签票、不渲染 iframe，只给下载。
 //   'unconfigured' = 后端没配 kk；'unreachable' = 配了但不可达 / 探针请求本身失败（fail-closed）。
 const backendState = ref<'' | 'unconfigured' | 'unreachable'>('');
@@ -104,6 +124,10 @@ onMounted(async () => {
   await nextTick();
   dialogEl.value?.focus();
   if (channel.value === 'native-json') await loadJson();
+  else if (channel.value === 'native-office' || channel.value === 'native-zip') {
+    // #795：字节由子组件自己加载（含 20MB 上限判定），这里**不发任何请求**，只收掉加载态。
+    loading.value = false;
+  }
   else if (channel.value === 'kkfile') {
     // #787：先探后端；可用才签票 + 渲染 iframe，否则直接降级到下载（不签票、不发 iframe）。
     const state = await probeBackend();
@@ -187,6 +211,32 @@ function onKeydown(e: KeyboardEvent) {
         </object>
         <video v-else-if="channel === 'native-stream' && mediaKind === 'video'" controls class="mx-auto max-h-full max-w-full" :src="streamPreviewUrl(props.cwd, props.path)"></video>
         <audio v-else-if="channel === 'native-stream' && mediaKind === 'audio'" controls class="mx-auto mt-6 w-full" :src="streamPreviewUrl(props.cwd, props.path)"></audio>
+        <!-- #795：前端渲染通道的降级面（子组件 emit failed ⇒ 统一提示 + 下载，复用 role=alert 那套） -->
+        <p v-else-if="officeFail" role="alert" class="muted py-6 text-center text-sm">
+          {{ officeFail === 'too_large'
+            ? t('preview.officeTooLarge') : t('preview.officeRenderFailed') }}
+          <a
+            :href="dlUrl"
+            class="ml-2 text-sky-600 underline"
+            :download="props.path.split('/').pop()"
+          >{{ t('preview.downloadInstead') }}</a>
+        </p>
+        <OfficeDocxPreview
+          v-else-if="channel === 'native-office' && officeKind === 'docx'"
+          :cwd="props.cwd" :path="props.path" @failed="(r) => { officeFail = r; }"
+        />
+        <OfficeSheetPreview
+          v-else-if="channel === 'native-office' && (officeKind === 'xlsx' || officeKind === 'xls')"
+          :cwd="props.cwd" :path="props.path" @failed="(r) => { officeFail = r; }"
+        />
+        <OfficePptxPreview
+          v-else-if="channel === 'native-office'"
+          :cwd="props.cwd" :path="props.path" @failed="(r) => { officeFail = r; }"
+        />
+        <ZipListing
+          v-else-if="channel === 'native-zip'"
+          :cwd="props.cwd" :path="props.path" @failed="(r) => { officeFail = r; }"
+        />
         <!-- kkfile：kkFileView iframe。sandbox 不给 allow-same-origin：预览内容脚本拿不到 portal 会话/存储 -->
         <iframe v-else-if="channel === 'kkfile' && kkUrl" :src="kkUrl" class="h-full w-full rounded-md border border-black/10 bg-white" sandbox="allow-scripts" :title="props.path"></iframe>
         <!-- other：清单外不猜格式，唯一出口是下载 -->

@@ -632,6 +632,12 @@ export const zhCN = {
     pdfUnsupported: '当前浏览器无法内嵌显示此 PDF，请用右上角下载后本地打开',
     backendUnconfigured: '未配置文档预览服务，请下载后查看',
     backendUnreachable: '文档预览服务暂不可用，请下载后查看',
+    // #795：前端渲染通道（docx/xlsx/xls/pptx/zip）的两条降级文案 + zip 列头。
+    officeTooLarge: '文件超过 20MB，不在此渲染，请下载后查看',
+    officeRenderFailed: '该文件无法在此渲染，请下载后查看',
+    zipEmpty: '空压缩包',
+    zipSize: '大小',
+    zipDate: '时间',
   },
   // 预览端口面板（issue #246 交付② 单 B：工作台「预览端口」区块 + 管理台 FDE 详情面板）。
   // 口径红线（portal.md §4.7a）：`active` 只代表「首次凭证放行过」⇒ 状态文案一律不写「健康 / 运行中」；
