@@ -184,7 +184,7 @@ describe('预览端口 state 的双语键集（§4.7a：只列 allocated / activ
   // issue #321：judge 是分轴**意见**文案——语义红线双语成对钉死：
   //   * done=true 必须说「未独立核验 + 是否收尾由模型自行判定」（本站 runner 不传 finalGuard，
   //     verification 恒 skipped，没有任何独立核验可承诺）；
-  //   * executed 必须自带「非任务完成」语义（ISSUES.md 第 4 条的放大器就是旧文案把放行读成完成）；
+  //   * executed 必须自带「非任务完成」语义（原试用反馈第 4 条的放大器就是旧文案把放行读成完成）；
   //   * 审计轴不得出现「已完成/已核验/已验证」这类承诺（zh）/ 肯定式 completed・verified（en）。
   // 反证锚：文案退回旧措辞（judge：executed / judge：扩轮 / 无「未独立核验」）时本用例变红。
   it('issue #321：judge 文案是意见不是验收——done=true 声明未独立核验，executed 不得暗示任务完成', () => {

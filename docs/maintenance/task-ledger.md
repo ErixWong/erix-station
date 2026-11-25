@@ -9717,11 +9717,11 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
 
 **搬移去向**（先落冷层再从热层删，一条不丢）：
 
-- `docs/testing.md` **§1.3.1** 六条本机测试坑（`npx vitest` 挂死、vitest 全绿而 rc=1、
+- `docs/testing.md` **§1.3.1**〔**已悬空**：`docs-261124-31` 把 §1.3.x 并成单个 §1.3，六条坑的现值随后出仓到机器全局冷层 `station-dev-machine.md`；本文不改历史正文，只补注坐标〕六条本机测试坑（`npx vitest` 挂死、vitest 全绿而 rc=1、
   `NODE_ENV=production` 假红、worktree 缺 `node_modules` 与 120000 符号链接史、项数 1022→510、
-  devDependencies 装不上）；**§1.3.2** dev 栈登录事实与探针口径（入口、两账号第二因素、口令文件、
+  devDependencies 装不上）；**§1.3.2**〔同上，现坐标 = `docs/testing.md` §1.3〕dev 栈登录事实与探针口径（入口、两账号第二因素、口令文件、
   密码重置）。热层各留一行判据。
-- `docs/env.md` **§8.1.1**（新增）内网 DNS `dns.internal` 把 `github.com` 钉到半死地址、本机
+- `docs/env.md` **§8.1.1**（新增；〔**已悬空**：`docs-261124-31` 把 env §8 的实测数值整节搬出本仓 ⇒ 现值在机器全局冷层 `station-dev-machine.md`〕）内网 DNS `dns.internal` 把 `github.com` 钉到半死地址、本机
   `http.*` 配置实测、显式代理命令与「别在全局 env 设 `HTTP(S)_PROXY`」。
 - `docs/design/fde-platform.md` **§11.4** 末尾追加 LiteLLM 事实面（profile 起栈、虚拟 key 明文为何
   入库、迁移 `0010` 清了旧 `api_key`、credential 无启停语义、`litellm_params.model` 不自动加前缀、
@@ -9754,6 +9754,7 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
    假事实正是漏网的。加模式必须配套夹具，否则闸会变成新的假绿发生器。
 3. 全局冷层 `~/projects/docs/git-github-ops.md`（源 `pi-tools/docs/`，**另一个项目的树**）才是
    GitHub 网络事实的规范家；本单只在**本仓** `docs/env.md` §8.1.1 落了一份，跨项目 git 写未做。
+   〔后续：该坐标已随 `docs-261124-31` 出仓，现值 ⇒ 机器全局冷层 `station-dev-machine.md`；见 §8.203〕
 4. **挑号判据要升级**：热层现在写的是「挑号前先 `grep -n '^### 8\.' docs/maintenance/task-ledger.md
    | tail -3`」——**这只查自己的树**。本单 20 分钟内撞两次（上面那条），另一 session 同轮也撞了。
    建议改成：先 `git fetch`，在 `origin/main` 上查末尾
@@ -9810,7 +9811,7 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
   `auth.token_created`/`auth.token_revoked` 两条且 `details` 无明文，库里 `token_hash` 长 64。探针令牌已
   `DELETE`（不在 dev 库留外部凭据）。**顺带撞出一个开发流程坑**：`.env` 里 `STATION_PORTAL_IMAGE` 默认是
   发布件的 digest 引用，裸跑 `docker compose build station-portal` 直接 `refusing to create a tag with a
-  digest reference` —— 已在 `docs/testing.md` §1.3.2 写明要用本地 tag 覆盖；③ 与本单无关的 CI 噪声记录：本 PR 之前该仓 CI 出现过一次 `#727-5b` `500 !== 200`
+  digest reference` —— 已在 `docs/testing.md` §1.3.2〔现坐标 §1.3，见 §8.203〕写明要用本地 tag 覆盖；③ 与本单无关的 CI 噪声记录：本 PR 之前该仓 CI 出现过一次 `#727-5b` `500 !== 200`
   （已由 **#745** 修）与两次 20 分钟取消（`concurrency` 挤兑，重跑即绿：`#741` 重跑后 3m14s pass）。
 
 ### 8.194 发版切号 0.1.76 → 0.1.77（2026-11-24，主 agent，工单 `chore-261124-29-bump-0.1.77`）
@@ -9836,7 +9837,7 @@ AdminUsersView 三处接线、双语 i18n、两份 spec（526 + 225 行，6 组�
 满屏 `ERR_MODULE_NOT_FOUND: Cannot find package 'erix-agent'`——`package-lock.json` 里写着
 `node_modules/erix-agent 0.33.0`，而本地树的 `node_modules` 里没有它（#743 在 18:19 改了依赖面）。
 `npm ci --prefer-offline` 一次就全绿。**这正是刚从热层搬走的那条判据**（`AGENTS.md` §4
-「验收 / 发版前先重装依赖再复跑拿基线」，细节在 `docs/testing.md` §1.3.1）第一次真挡住一次假红。
+「验收 / 发版前先重装依赖再复跑拿基线」，细节在 `docs/testing.md` §1.3.1〔现坐标 §1.3 + 机器全局冷层，见 §8.203〕）第一次真挡住一次假红。
 
 **本次发版包含什么**（`v0.1.76..origin/main`，45 PR，节选）：管理台运行时设置面
 （#700/#701/#704/#706/#709/#710）、FDE 周期额度（#722/#731）、工位内容只读浏览（#729/#735/#743）、
@@ -10058,3 +10059,151 @@ env 配置面重构（#707/#708/#718/#720）、API 令牌（#747）、`AGENTS.md
    泄漏路径；禁用面退回点式 ⇒ 自证格红（点名方括号漏网）；把默认路由筛选条件
    改坏 ⇒ 6 格红。还原后单文件 16/16 绿；`npm test` rc=0；真库三条腿 0 skip；
    `check:doc-portable`、热层闸、台账完整性均 ok。
+
+### 8.202 #771 流式通道把 `.svg` 当 `image/svg+xml` 内联 ⇒ 管理台同源 XSS（copilot 代码审查发现，PR #772，2026-11-25，主 agent + erix_run）
+
+**怎么发现的**：本会话功能（#727）实现阶段只做过**写代码之前**的设计审计；代码本身没有独立 review。
+补做了一次 copilot readonly + xhigh 的**代码**审查（run `cp-2611251436-pspjua`），8 个方向里 1 项 MAJOR，
+其余（越权 / 存在性泄露 / 路径牢笼 / fd 生命周期 / 只读红线 / e2e 可信度 / CI 去抖风险 / 回归等价性）
+未发现可确认问题。主 agent 逐条对账后**成立**。
+
+**缺陷**：`portal/src/dirs.js` 的 `IMAGE_MIME` 有 `.svg → image/svg+xml`，`STREAM_MIME` **整体继承**它，
+而 disposition 只有 `download` 模式或 `octet-stream` 才降级为 `attachment`（`:738`）⇒ `mode=stream` 请求
+`.svg` 时回 `image/svg+xml` + `inline`。**SVG 是活动内容**（内嵌 `<script>` / `onload` / `foreignObject`），
+作为**顶层文档**打开时脚本在 portal 源里执行。
+同文件 `:723-726` 的注释早就写死这条红线（「没有 text/html……同源直出 = 预览即 XSS，一律降级为下载」），
+**`.svg` 是它的遗漏**。
+
+**为什么这构成跨权限边界**：管理台「工位内容」页会渲染 FDE 写的内容——会话里 assistant 的 Markdown
+（`AdminTranscript.vue:356` `v-html`）与项目里的 `.md`（`AdminSeatContentView.vue:726`），
+而 `lib/markdown.ts:157` 把 http(s) 链接渲染成 `<a href target="_blank">`（`rel=noopener` 只挡 `window.opener`，
+挡不住同源权限）。FDE 写一个诱饵 md → 管理员点开 → 点链接 → 新标签页在 **admin 源**执行 FDE 的脚本 →
+同源 `fetch('/api/admin/*', {credentials:'include'})`（CSRF 的 Origin 检查是同源 ⇒ 通过）。
+**FDE 不需要「拿到管理员密码」，它借管理员的手执行代码。**
+
+**严重度校准（主 agent 自我修正）**：一度准备为它单开 0.1.79 补丁版，**收回**。三问：
+触发概率低（需 FDE 造 SVG + 造诱饵 + 管理员恰好点开并点链接）、影响面 = 管理员会话、
+平台规模 = 管理员 1~2 人且入口在内网 ⇒ 属「钓鱼级」而非「打开页面就中」。**修，但不单独切版本**，
+随下一个常规版本发。
+
+**修法（PR #772）**：抽 `STREAM_INLINE_IMAGE_MIME` **显式白名单**（png/jpg/jpeg/gif/webp/bmp），
+`STREAM_MIME` 只继承它——**不用** `{ ...IMAGE_MIME }` 再 `delete '.svg'`：显式清单让漂移方向安全
+（以后往 `IMAGE_MIME` 加新格式默认落 `octet-stream`，要内联必须显式加一行），`delete` 写法会反过来默认放行。
+所有流式响应加 `X-Content-Type-Options: nosniff`（防嗅探成可执行文档）。JSON 通道**不动**：`.svg` 仍
+`kind:'image'` + data URL，前端 `<img>` 里的 SVG 不执行脚本。文档 §4.11 / §4.22 两处口径同步。
+
+**判据（`portal/test/file-stream-svg.test.js` 5 格 + 主 agent 负向对照）**：`.svg` stream ⇒
+`octet-stream` + `attachment` + `nosniff`；**即使调用方显式要 inline 也强制 attachment**；位图仍 `inline`
+且 MIME 不变（别一起降级）；`.pdf` 仍 `inline`；JSON 通道 `.svg` 仍 `kind:image` + svg data URL（`<img>` 预览不坏）。
+**负向对照**：把 `dirs.js` 还原成旧版再跑新用例 ⇒ **rc=1 / fail=3**（用例真的会咬）。根 `npm test` rc=0。
+
+**教训（流程，比代码值钱）**：
+1. **设计审计 ≠ 代码审查**。本会话前半只做了前者，于是「`.html` 红线」这类**实现层遗漏**没人看；
+   补做代码审查后 5 分钟就挖出来。以后安全敏感面（渲染 / 文件流 / 权限边界）合入前应过一遍独立代码审查。
+2. **报安全问题必须带三个数**：触发概率 × 影响面 × 平台规模。只报 severity 标签会把自己带进
+   「发现 MAJOR 就必须立刻发补丁」的过度反应。
+
+### 8.203 分层整理：热层回潮止血 + 台账 6 处坐标补注 + 重落 v0.1.77 发版记录（2026-11-25，主 agent，代号 `docs-261125-09-layer-tidy`）
+
+**为什么有这一单**：§8.192 清退（19366 → 8798）之后 20 小时，热层涨回 10214（预算 10240，只剩 26 字节）。
+现验归因：**涨的部分大多是合格 policy**（API 令牌面、`check:doc-portable` 闸、`agent01` 脚本账号、
+注释按类别写），**夹带的 fact 只有两处**——正是 §8.192 残余第 2 条预言的那两类句式。
+
+**改了什么**（全部 `git show origin/main:<路径>` 现验坐标，热层 10214 → **10037**）：
+
+| 位置（原坐标） | 处置 | 依据 |
+|---|---|---|
+| §4.1「API 令牌**当前已停用**（`TOKEN_ROUTES_ENABLED=false` ⇒ 三端点 404；库里 0 枚 ⇒ Bearer 恒 401）」 | 读数出热层，改写成祈使句「别用 Bearer 打 API，脚本一律登 `agent01` 走会话」+ 指针（台账 §8.200 / 契约 §2.13） | 「三端点 404 / 库里 0 枚」是当下读数，`BANNED` 抓不到，哪天启用开关它就变第二条 §8.192 里那条 `max_budget` |
+| §6「**证据段落是身份与坐标的集中营**——261124 工作邮箱泄露，就是抄了收件人」 | 事故成因出热层（本条接手），热层只留「只写形态，不写值」+ 指向本条 | 前半句是 policy，后半句是日期 + 事件；那条 commit 自己写着「成因写进热层」 |
+| §7 D8 段「产物捕获目标是项目目录」 | 删（事实，附录 A.1 已有） | 不改变任何下一轮决定 |
+| §7 D9 段括注「附录 A 的 `D9` 是『认证放边缘』，编号撞车」 | 压成「引 `D9` 必带 issue 号（理由 ⇒ 附录 A.3）」 | 与 `docs/design/fde-platform.md` **附录 A.3** 逐字重复 = 第二本账 |
+
+**台账 6 处悬空坐标补注**（`grep -n '§1\.3\.[12]\|§8\.1\.1' docs/maintenance/task-ledger.md` 现列，
+逐条 `〔〕` 就地补注，**不改历史正文**）：`§8.192` 三处、`§8.194` 一处、`§8.197` 一处、`§8.202` 附近一处。
+根因：后续 `docs-261124-31` 把 `docs/testing.md` §1.3.x 并成单个 §1.3、并把 `docs/env.md` §8 的实测数值
+**整节搬出本仓**（判据是「仓库必须可公开」，方向比 §8.192 更对）——**内容没丢**（现值在机器全局冷层
+`station-dev-machine.md`，六条坑逐条 grep 命中），但**坐标断了而闸不查坐标**：
+`check:agents-hotlayer` 只数 `§8.N` 的引用地板，`check:doc-portable` 只管可移植性。
+**我自己就是当事人**——`§8.194` 里那句「细节在 `docs/testing.md` §1.3.1」写完没多久家就没了。
+
+**重落：v0.1.77 发版记录（原 §8.195 丢失经过记明）**
+
+- 原记录写在 `docs-261124-30-release-0177`（commit `782e34f4`），PR #750。**它没进 main**：
+  并行 session 复用了同一个远端分支名（`git ls-remote` 现查远端 tip 已不是我的提交），GitHub 因此
+  **auto-close** 了 #750（`gh pr view` = `state: CLOSED`、`no commit found on the pull request`），
+  本地分支也被改名成 `old-stale-261124-30`；同号 `§8.195` 随后被另一单占用（现在是 #759 宏模板界面）。
+- 从对象库 `git show 782e34f4` 找回原文，改号重落本条。**教训**：§8.192 残余第 4 条（挑号先 `git fetch`
+  再在 `origin/main` 上查）只解决编号，**不解决分支名复用**——分支名也要带可辨识代号且**推完立刻开 PR、
+  PR 合并前别让别人复用**；判据：`git ls-remote --heads origin '<本单分支名>'` 的 tip 必须等于本地 HEAD。
+
+**发布事实（重述，全部已在 §8.194 现验过，这里只搬运）**：tag `v0.1.77` → `c1cf963`；
+`release.yml` run `45389514884` ✓；三镜像 digest：portal `sha256:d511080b…73d591`、
+fde `sha256:a3be4287…8962ea`、fde-proxy `sha256:2064623f…40c61`（完整值见 run 45389514884 的
+job summary 与 artifact `images-digest`，ID `14918481157`）；GitHub Release 不存在属预期（tag push 不建）。
+**发布后四步未做**：`deploy/.env` pin、`up -d`、**必须重建 FDE 容器**（`runner/worker.js` 有改动）、
+**本次含 `deploy/litellm/config.yaml` 改动 ⇒ `up -d` 不重启 `station-litellm`，要显式 restart**。
+
+**残余（本单没做，都有判据不挂版本号）**：① 闸不查悬空坐标（可加：抽 `§X.Y` / 文件名引用，
+在被指对象里 grep 标题，指不到即红；误报风险 = 引用外部仓库的坐标，需白名单）；
+② `--sync` 不要求理由（棘轮）；③ `BANNED` 抓不到「当前已停用 / 库里 0 枚」这类当下读数；
+④ 挑号与分支名复用判据未写进热层 §6 与 §8 末。
+另：本单派了 copilot 只读审计整个分层（热层 + 本仓冷层 + 机器全局冷层 + 闸缺口），
+结论落到另一单，本条只记「已派、runId `cp-2611251548-c6u274`」，不预写它还没给出的结论。
+
+### 8.204 删掉仓库根 `ISSUES.md`（2026-11-25，主 agent 裁定 + erix_run 执行，代号 `docs-261125-10-drop-trial-issues`）
+
+**为什么能删**：它的身份是「2026-10-13 那批试用反馈原文 + 只追加的对账」。用户裁定「没用了，删掉」。
+现验依据：**13 条全部已登记 GitHub issue 且全部已修/已关**（对照表见下），文末那三段
+（🌙 夜班批次、🔭 观察队列、📋 未关闭 issue 分层〔2026-10-30 刷新〕、刷新过的过期指针）是
+**v0.1.30 时代快照**，现势性早已由 issue 与台账承接；放在仓库根还每轮被 agent 当成现势材料捞走。
+
+**原文找回坐标**：`git show eb44900e:ISSUES.md`（578 行，删除前的最后一个提交态）。
+
+**抄进台账以免追踪信息随文件消失**（条目 → issue 对照，原文 2026-10-23 那一节）：
+
+```
+| # | 本文条目 | issue | 状态（截至 v0.1.26） |
+|---|---|---|---|
+| 1 | 对话页不显示时间戳 | **#282** | **已修**（v0.1.27：每条消息 `<time>` 时刻 + 顶部常驻状�
+| 2 | 工具调用时长恒显 `0s` | **#283** | **已修**（v0.1.9 真机验收：`sleep 400` 显 `6m 40s`、硬刷�
+| 3 | 目录名不允许下划线 | **#284** | **已修**（PR #345 `eb079c8`：前端补 `_`，后端不动；§8.44�
+| 4 | judge 判达成但循环继续 | **#321** | **已关**：文案（v0.1.19）+ 达成意见回灌（0.22 `judgeDo
+| 5 | 无活动度指标（TPS/字节） | **#282** | **已修**（同上：`↑ 3.8 KB · ~101 tok/s · this run 00:1
+| 6 | 报「端口已监听」要同时给预览 URL | **#285** | **已修**（告知面第 8 条 v0.1.8 + 前端裸 U
+| 7 | 剥 Cookie × cookie-session SSR | **#286** | **已关（`not_planned`）**：不改边缘剥 Cookie（两条改
+| — | 附带发现：逐字流式失效（整段一次出现） | **#342** | **已修**（PR #343 `06bbaa2`，v0.1.2
+| — | 附带发现：预览要点 10 次票 | **#247** | **已修**（v0.1.27：`POST /api/me/ports/batch-tickets` �
+| — | 崩溃恢复后账本 `partOf` 链式 | **#341** + 上游 **erix-agent #415** | 站内读侧已解（`c47a692`
+| — | 附带发现（#277 验收中）：起跑前被取消的消息，下一个 run 会当待办重做 | **#346** |
+| — | 附带发现（决策者 2026-10-24 口述）：目录下拉第一项是 `.pnpm-store`，真项目被顶掉 | 
+```
+
+**改了哪些活坐标**（`git show --numstat 57893f79` 原文；文件没了就不许留假坐标）：
+
+```
+0	578	ISSUES.md
+1	1	docs/README.md
+1	1	portal/frontend/src/composables/useEventStream.spec.ts
+1	1	portal/frontend/src/i18n/localeParity.spec.ts
+1	1	portal/frontend/src/i18n/locales/en.ts
+1	1	portal/frontend/src/i18n/locales/zh-CN.ts
+1	1	portal/frontend/src/stores/workbench.ts
+3	3	portal/test/platform-prompts.test.js
+```
+
+`platform-prompts.test.js` 那 3 行是关键：`APPEND_ONLY_HISTORY_FILES` 白名单少了一本，
+它自己的两处注释同步改成「原仓库根 `ISSUES.md`（已删 ⇒ 本条）」——**不悬空**，也不声称文件还在。
+
+**历史正文不改写**（这三处提到 `ISSUES.md` 的旧行保留原样，共 17 处）：`docs/maintenance/task-ledger.md` 11 处、
+`docs/design/analysis-2026-10-20-{judge-and-trial-issues,judge-independent-review}.md` 4 处、
+`docs/ops/handoff-2026-10-14.md` 2 处。
+
+**这单的弯路值得记**：我先按「这类记录不该在仓库根」理解，写了**搬家**补丁（→ `docs/maintenance/issues-2026-10-13.md`）
+并派 erix_run 执行完（commit `4485b9b8`，未推），用户随后裁定是**删**。复位 `origin/main` 重做。
+教训：**历史快照先问「删还是搬」**，别自作主张给它建新家——多一个家就多一次引用与一次「谁还引用它」的账。
+
+**验证**（只认退出码）：`node --test portal/test/platform-prompts.test.js` → 29 pass / 0 fail，rc 0（worker 跑，主 agent 复跑见下）；
+根 `npm test`、`check:agents-hotlayer`、`check:doc-portable` 由主 agent 在最终树复跑。
+
+**边界**：仓库其余文档（一次性审计快照、handoff/drill、地图黑户）本轮**不动**——文档总体审计由**另一个 session** 在做。
+本会话那份 copilot 只读审计（runId `cp-2611251548-c6u274`）结论已到手，**本单不落地**，移交文档审计那条线处置。

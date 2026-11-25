@@ -62,6 +62,8 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | `mail_otp_enabled` | per-user「邮箱验证码」开关（迁移 `0028`，`NOT NULL DEFAULT false`）。**默认 false**：全局邮件通道开启不再自动要求所有人走邮箱码，需管理员逐个打开（portal.md §2.2）。只有 `PATCH /api/admin/users/:id` 能改（§12） |
 | `file_upload_enabled` | per-user「文件上传」开关（迁移 `0029`，`NOT NULL DEFAULT false`，issue #472）。**默认 false** 且**零回填**：上传是写用户磁盘的能力，与 TOTP / 邮件验证码同一口径，由管理员在管理台 Edit → Security 显式打开。谁能改：只有 `PATCH /api/admin/users/:id`（`createUser` 不接受该入参，开户一律 false）；**重新开户（同名 disabled 行再激活）会显式清零** ⇒ 不继承上一个任期的权限。消费方：上传端点的 403 闸（片 B）与 user DTO 下发（portal.md §2.6）；界面隐藏不是闸，服务端才是 |
 | `last_activity_at` | 该用户**最近一次亲口说话**的时刻 = 按下发送那一刻（迁移 `0031`，`timestamptz`，issue #497 方案 A3）。**可空且无默认值**：新开户与从未说过话的账号就是 `NULL`（不能拿 `now()` 充当活动）。**写入点只有两处**（不新增第三处）：`sessions.js#postMessage`（本站唯一发送路，直发与队列投递都走它）与 `queued-inputs.js#enqueueQueuedInput`（运行中按回车那一刻就是活动）。**不算**活动：agent 跑动（run 生命周期与终态）、页面刷新/重开、会话改名与归档、预览访问、程序化 token（`api_tokens`）、以及**登录本身** ⇒ 它**允许比 `last_login_at` 旧**（登录了但一句话没说）：两条独立时间线，**不得**在登录路径顺手补写。一次性回填只动 `last_activity_at IS NULL` 的行（取 `messages` 里 `role='user' AND synthetic=false` 的 `MAX(created_at)`，join `chat_sessions` 拿 `user_id`）；回填后仍无用户消息的账号保持 `NULL`，不拿 `last_login_at`/`created_at` 冒充。**不建索引**（只作返回列，不参与过滤/排序，口径同 `last_login_at`）。**重新开户（同名 `disabled` 行再激活）不清本列**——与上一行 `file_upload_enabled` 的显式清零**相反**：权限清零是因为权限不继承任期，而这一列是**事实**，事实不需要被抹掉（那段历史真的发生过）。消费方：管理台 user DTO（`admin.js#safeUser` / `listUsers`，portal.md §12；`GET /api/me` 与两个登录端点的 §2.6 DTO **不带**本列）与管理台用户列表第 8 格（主行=最后活动、副行小字=`登录于 …`，空值渲染成「从未活动」而不是「今天」） |
+| `must_change_password` | boolean `NOT NULL DEFAULT false`（迁移 `0021`，issue #614）：true ⇒ 受限会话（`RESTRICTED_SESSION_ALLOWLIST`），只允许改密码等极少数路由；`POST /api/me/password` 改密成功后清回 false。**新建用户与管理员重置密码会置 true**，强制本人首次登录改密；`bootstrap-admin` 不置（吃默认 false） |
+| `totp_login_enabled` | boolean `NOT NULL DEFAULT true`（迁移 `0030`，issue #500）：per-user 登录是否启用 TOTP 第二步。与 `totp_enabled`（=已绑密钥）**分开**——「已绑定」≠「登录要用」，关掉登录**不清 `totp_secret`**（重新开启即恢复） |
 
 **状态机**：常规账号 `active → disabled`；Git 开户 `active → awaiting_credential → active`（必须写入指定 host 的 PAT）；offboarding 可从任一态转为 `disabled`。
 产生方：onboarding workflow / Git credential 管理 / 对账任务；消费方：登录、forward-auth、容器调度（仅 `active` 可运行）。
@@ -101,6 +103,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `last_seq` | **session 级 seq 分配器**：`messages.seq` 与 `run_events.seq` 都由它分配（同事务 `UPDATE ... SET last_seq = last_seq + 1 ... RETURNING`），保证 SSE 的 `Last-Event-ID` 语义（portal.md §5.1/§5.2）。这是原理三「状态在中心」在实时层的落点 |
 | `title` / `title_source` | 会话标题（issue #88）。`title_source` ∈ `auto`/`manual`（默认 `auto`，迁移 `0009-session-auto-title.sql`）：建会话显式传 title 或 PATCH 改 title → `manual`（手工优先，自动更新**只写 `auto` 行**）；worker 侧生成（2026-09-25 修订：agent 侧用既有 provider 轻量补全 ≤30 字符，随 `run_finished` 上报），portal 在 run 终态事件后异步评估落库（降级链：首条用户消息截断 → cwd basename），经 session SSE `session_updated` 推送前端 |
 | `auto_title_seq` | 上次自动标题更新时的 `last_seq` 快照（迁移 0009；`NULL` = 从未自动更新）——防抖判据「距上次更新 ≥ N 轮新 user 消息」的游标（`ERIX_SESSION_AUTO_TITLE_MIN_NEW` 调 N，`ERIX_SESSION_AUTO_TITLE=0` 关开关） |
+| `origin` | 会话来源标记（迁移 `0037`，`text NOT NULL DEFAULT 'human'`）：普通人工会话为 `human`；宏（macro）派生的会话写成 `macro:<template-name>`（如 `macro:run-review`）⇒ 面板与清理可据此区分人工与宏会话，宏会话按来源名归组 |
 
 `active_run_id`（portal.md §4.1）**不落列**，由 `runs_one_active_per_session` 部分唯一索引覆盖的运行中 run 推导——避免两份真相（原理五同构：单一事实源）。
 
@@ -146,7 +149,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | 关键字段 | 语义 |
 |---|---|
 | `fde_id` | → `users.id`，**FDE 用户**（forward-auth 按预览凭证哈希查 `preview_grants` 解析 `user_id` 后与此列比对，portal.md §2.7；不解析 `cookie.sub`，旧口径作废） |
-| `scope` / `run_id` | `project` 级 `run_id` 必空、`run` 级必带 → `CHECK ((scope='run') = (run_id IS NOT NULL))`。⚠️ 待决策者确认（Q5）：P1 先只做项目级，字段先行保留（principles §4 Q5 倾向 (b)） |
+| `scope` / `run_id` | `scope` 三值 `CHECK (scope IN ('project','run','fde'))`（第三值 `fde` 由迁移 `0018` 追加：FDE 主机级端口占用，`run_id` 恒 NULL）。条件约束 `CHECK ((scope='run') = (run_id IS NOT NULL))` **原样保留**：`run` 级必带 `run_id`，`project` / `fde` 级 `run_id` 必空（与 `fde` 行 `run_id` 恒 NULL 自洽）。⚠️ Q5 早期记「P1 先只做项目级，字段先行保留」（principles §4 Q5 倾向 (b)）；`fde` 值已由 0018 落地 |
 | `port` | 容器内 dev 端口，baseline 的 `CHECK (port BETWEEN 4000 AND 4999)` **已被迁移 0019 换成按状态分支**：活行 `BETWEEN 22000 AND 29999`（全局号池，#246），`state='released'` 行放宽到 `BETWEEN 4000 AND 29999` 以保留历史号码；原 3001 code-server / 3000 runner 内部 API 容器固定端口角色均已取消（规格 §12.3，issue #71 / issue #3 评论，决策者 2026-09）——容器平台通道零监听，不入表 |
 | `hostname` / `url` | 由 portal **与 Traefik 路由同源生成**（规格 §8.1）；前端只展示/跳转 `url`，永不拼接（portal.md §8-4） |
 | `exposure` | `private`（默认）/ `org-visible` / `public`（规格 §6.5；非 admin 申请 `public` 被拒，portal.md §4.7） |
@@ -340,6 +343,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `api_key` | LiteLLM per-FDE 虚拟 key 明文，供 portal 注入 Traefik；上游凭据仅存在 LiteLLM credential。`NULL` = 未配置 |
 | `main_model_id` / `embedding_model_id` / `vision_model_id` | LiteLLM `model_info.id` 字符串（`text`，无外键）；`main` 必须是未 block、支持 `tool_calling` 的文本模型，由应用层校验 |
 | `main_model_name` / `embedding_model_name` / `vision_model_name` | 对应 LiteLLM `model_name`（数据面请求体使用的别名）；与 `model_info.id` 分开保存，因为二者不是同一标识 |
+| `budget_usd` / `budget_period` | 每个 FDE 的「周期 LLM 额度（USD / 周期）」（迁移 `0047`，issue #719；由旧 `daily_budget_usd` 改造成金额+周期两列）。`budget_usd` = `numeric(12,6)` **可空、无默认**：`NULL` = 该 FDE 不限额（≠ 0，0 会被 LiteLLM 当「一分钱都不能花」全拒）；下发到 key 的 `max_budget`，key 重铸时从此列恢复（不变式 3，DB 是真相 / key 是牲口）。`budget_period` = `text` 枚举 `CHECK (budget_period IN ('1d','1mo'))`（`1d` 每天本地零点重置、`1mo` 每月 1 日重置；只原样透传 LiteLLM `budget_duration`，portal 绝不自算周期）。**成对 NULL CHECK**（约束名 `fde_llm_bindings_budget_pair_null_check`）：`CHECK ((budget_usd IS NULL) = (budget_period IS NULL))`，金额与周期同生同灭，杜绝「有金额没周期」的半吊子 |
 
 **凭据边界（issue #117 phase 2）**：上游 API key 与 `api_base` 由 LiteLLM credential 管理；Station 只存 LiteLLM 虚拟 key，不把上游明文复制进自身 DB。虚拟 key 只由 portal 用于 Traefik 动态配置（文件 mode 600），容器不持有；管理 API 回显掩码，日志/审计/错误信息不含 key。`llm_providers` 与 `llm_models` 在 migration 0010 中改名为 `llm_providers_retired` / `llm_models_retired` 留作回滚与人工核对；**这两张退役表已由 migration `0032` 撤除（issue #503）**，口径见下一段。
 
@@ -528,8 +532,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 ### 1.33 `macro_templates` / `macro_assignments` / `macro_runs` — 事件平台的三张表（issue #524，migration 0035）
 
 > 同上：来自增量迁移 `0035-macro-platform.sql`；baseline 冻结、不回写 `schema.sql`。
-> **W1 只有数据层**（`portal/src/macros.js` 是唯一的写入口）：没有定时器、没有调度器、没有面板路由。
-> 「到点主动执行」是 W2，`notifications` 落地面是 W3。
+> **数据层现状**：`portal/src/macros.js` 是宏三表的写入口；没有定时器、没有调度器（「到点主动执行」是 W2，仍未做）。⚠ 早期记「没有面板路由 / `notifications` 落地面是 W3」**已过时**：`notifications` 表由迁移 `0037` **已建**，`portal/src/http.js` 已提供通知读 API（`GET /api/notifications`、`/api/notifications/unread-count`、`/api/notifications/:id/read`，走 `macroRoutes.notifications*`）。⚠ 这只等于「通知表 + 读侧 API 已落地」，**不等于通知调度/派发全量实现**（主动生成与推送仍属未做部分）。
 
 **为什么是三张而不是一张**：模板可被多人复用、订阅要能改人/改范围、执行记录要能永久审计——
 三者的生命周期与写入者完全不同（管理员改模板 / 用户改订阅 / 调度器只追加账）。
@@ -540,7 +543,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 |---|---|---|
 | `macro_templates` | **做什么**：`kind`（四类：`run-notify` / `run-silence-alert` / `run-review` / `scheduled-task`）+ `name` + `params`（jsonb：四类参数集互不相交，散列成列会让每列只对一类有意义）+ `audience`（`all` / `admin`）+ `scope`（`session` / `user`）+ `enabled` + `created_by`（可空：内置模板没有创建人）+ `deleted_at`（软删） | `CHECK` 钉住 `kind` / `audience` / `scope`；`name` 不许空白 |
 | `macro_assignments` | **给谁做、在哪个范围、到什么时候**：`template_id` + `user_id` + `session_id`（`scope='session'` 才给）+ `cwd`（限定 worktree，NULL = 不限）+ `until`（到期时刻）+ `enabled` + `last_evaluated_at`（W2 的「多久没被看过」判据） | `UNIQUE NULLS NOT DISTINCT (template_id, user_id, session_id, cwd)`（PG15+）。**这一条是「重复订阅」的唯一防线**：默认 UNIQUE 语义下 NULL 互不相等 ⇒ `scope='user'`（两列都是 NULL）能被同一人订无数次。`template_id` → `ON DELETE CASCADE` |
-| `macro_runs` | **做没做、结果如何**（执行账，只追加）：`anchor`（触发它的事件标识）+ `bucket`（去重桶）+ **`criterion`（哪条判据叫起来的：`terminal` / `silent` / `tick` / `mechanical` / `semantic`，写完不变）** + **`status`（生命周期：`pending` → `running` → `done`/`failed`，或 `skipped` / `superseded`，会推进）** + `verdict`/`verdict_raw`（归一化口径 vs 模型原话，分开存才能改了口径后重算）+ `reason` / `remediation_text` + `skipped_reason`（八种门禁穷举，见 §2.4）+ `started_at`/`finished_at` + `child_session_id`/`child_run_id`（宏真跑起来时派生的会话与 run，`ON DELETE SET NULL`：会话被清理时账要留着）+ `depth`/`parent_macro_run_id`（挡无限自我派生）+ `snapshot_id`/`worktree_path`（现场引用，**故意不建 FK**：快照是可回收物，SET NULL 会把审计链切断） | `UNIQUE (assignment_id, anchor, criterion, bucket)` = 幂等键，`macros.js#claimMacroRun` 的 `ON CONFLICT DO NOTHING` 直接依赖它。**四列全部写完不变，`status` 不在键里**（见下面的「两轴必须分两列」）。`assignment_id` → `REFERENCES macro_assignments(id)` **不带 ON DELETE**：取消订阅不许抹掉历史（有账的订阅只能停用） |
+| `macro_runs` | **做没做、结果如何**（执行账，只追加）：`anchor`（触发它的事件标识）+ `bucket`（去重桶）+ **`criterion`（哪条判据叫起来的：`terminal` / `silent` / `tick` / `mechanical` / `semantic`，写完不变）** + **`status`（生命周期：`pending` → `running` → `done`/`failed`，或 `skipped` / `superseded`，会推进）** + `verdict`/`verdict_raw`（归一化口径 vs 模型原话，分开存才能改了口径后重算）+ `reason` / `remediation_text` + `skipped_reason`（九种门禁穷举，含 `review_unavailable`，见 §2.4）+ `started_at`/`finished_at` + `child_session_id`/`child_run_id`（宏真跑起来时派生的会话与 run，`ON DELETE SET NULL`：会话被清理时账要留着）+ `depth`/`parent_macro_run_id`（挡无限自我派生）+ `snapshot_id`/`worktree_path`（现场引用，**故意不建 FK**：快照是可回收物，SET NULL 会把审计链切断） | `UNIQUE (assignment_id, anchor, criterion, bucket)` = 幂等键，`macros.js#claimMacroRun` 的 `ON CONFLICT DO NOTHING` 直接依赖它。**四列全部写完不变，`status` 不在键里**（见下面的「两轴必须分两列」）。`assignment_id` → `REFERENCES macro_assignments(id)` **不带 ON DELETE**：取消订阅不许抹掉历史（有账的订阅只能停用） |
 
 **三条口径（`portal/src/macros.js` 的三条硬语义，改代码前先读）**：
 
@@ -559,8 +562,8 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 2. **模板删除是三分支**（07 篇 §2.3，判定与删除**同事务** + 模板行 `FOR UPDATE`）：
    零引用 ⇒ 物理删；只有订阅、无执行记录 ⇒ 物理删 + 级联删订阅；
    有 `macro_runs` **或** `notifications` ⇒ 只能软删（写 `deleted_at`）。
-   「能不能物理删」由引用计数决定，不由请求方决定。`notifications` 表 **W3 才建** ⇒
-   判定是「表存在则检查、不存在则跳过」（探测 `information_schema`，列名不写死）。
+   「能不能物理删」由引用计数决定，不由请求方决定。`notifications` 表已由迁移 `0037` **建好**（早期「W3 才建」的口径作废）⇒
+   判定按引用计数正常检查该表即可；保留「表存在则检查、不存在则跳过」（探测 `information_schema`，列名不写死）作为对旧库 / 未跑 0037 的防御。
 3. **`until` 到期 ⇒ `enabled = false`**，一律按**瞬时**比（`timestamptz` × JS `Date`，
    不许按本地日截断）。W1 **不做定时器**：到期在读写两侧顺手收敛（`applyExpiredAssignments`
    被 `assignTemplate` / `listAssignments` / `claimMacroRun` 调用），所以「读出来的 `enabled`」
@@ -597,7 +600,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | `cpu_usage_pct numeric(5,2)` / `cpu_cores smallint` / `load1`/`load5`/`load15 numeric(8,3)` | CPU 占用是**两次 `/proc/stat` 的差**算出的（不是累计值）；`numeric(5,2)` 装得下 0.00–999.99，多核半开以上不会溢出。`load*` 直接透传 `/proc/loadavg`（单位是「 runnable 平均个数」，与核数相关 ⇒ 不除核数，口径在 `parseLoadavg`） |
 | `mem_*_bytes bigint` / `swap_used_bytes` | `MemTotal` / `MemTotal-MemAvailable` / `MemAvailable` / `Cached`（+ SwapUsed）。`mem_used_bytes` 与 API 里的 `mem.usedPct` 同源；`MemAvailable` 缺失时**不拿 `MemFree` 顶替**（`numOrNull` ⇒ `null`，不把「不知道」当 0） |
 | `uptime_seconds bigint` | `/proc/uptime` 第一字段——页面上「宿主已运行 N 天」的唯一来源（也是「DB 里的行是不是陈旧」的交叉校验） |
-| `containers_total` / `_running` / `_station`、`fde_total` / `fde_running` | 容器计数口径写死在 `countContainers()`：总数 = 宿主全部；`station` = `Labels['station.managed']='true'`；`fde` = managed 或名字形如 `fde-*`。只读已在 Docker 白名单里的 `/containers/json`——**`stats`（1.02s/个）与 `/system/df`（15s）本单不碰** |
+| `containers_total` / `_running` / `_station`、`fde_total` / `fde_running` | 容器计数口径写死在 `countContainers()`：总数 = 宿主全部；`station` = `Labels['station.managed']='true'`；`fde` = **只认** `Labels['station.managed']='true'`（名字前缀不算数——261118 真机验收修的误报：宿主别的项目容器名形如 `*-db` 曾被前缀规则算成 FDE ⇒ 面板虚报台数。一台丢了标签的 FDE 会以 `onlyDb` 形态出现在对账里，那是要看见的信号）。只读已在 Docker 白名单里的 `/containers/json`——**`stats`（1.02s/个）与 `/system/df`（15s）本单不碰** |
 | `drift_count integer` | 「DB 说 N 台 ↔ Docker 实际 M 台」的对称差个数（`containerDrift()`）。只存**个数**：是谁（`onlyDb`/`onlyDocker`）只在 `latest` 里给，历史曲线不需要点名 |
 | `written_at timestamptz NOT NULL` | 应用侧写（AGENTS §3.4：DDL 不写 `DEFAULT now()`），与 `sampled_at` 同拍；两者差得远就是写慢了的证据 |
 
@@ -660,6 +663,283 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 （一行读不到字节数的磁盘行在历史图上只会变成贴底的假线）。
 
 写入方与读取方与 §1.34 同一处（`disksInsertSql()` 的多值 `INSERT … ON CONFLICT (sampled_at, device) DO NOTHING`）。
+
+### 1.36 `fde_onboarding` — FDE 开户编排状态（issue #111，migration 0012）
+
+**用途**：一次 FDE 开户的分步进度落库（每 FDE 一行，主键即 `fde_id`）。
+编排可中断可续，进程重启后照本表接着推。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `fde_id` | `uuid` | `PRIMARY KEY`，`REFERENCES users(id) ON DELETE CASCADE` | 每 FDE 一行，与 `users` 同生共死 |
+| `state` | `text` | `NOT NULL DEFAULT 'pending'`，`CHECK (state IN ('pending','running','awaiting_credential','done','failed'))` | 编排状态机（见下） |
+| `steps` | `jsonb` | `NOT NULL DEFAULT '{}'` | 各步进度快照 |
+| `last_error` | `text` | 可空 | 最近一次失败原因 |
+| `attempt` | `int` | `NOT NULL DEFAULT 0` | 重试次数 |
+| `created_at` / `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建 / 更时刻 |
+
+**值域 / 状态机**：`state` 五值枚举由 `CHECK` 钉住（`pending` / `running` / `awaiting_credential` / `done` / `failed`）；典型推进 `pending → running → done`，失败 ⇒ `failed`，需人工写 PAT 时经 `awaiting_credential`——转换由应用层执行。
+
+**谁写谁读**：写 = `portal/src/onboarding.js`（编排推进）；读 = `portal/src/admin.js`（管理台开户进度）。
+
+### 1.37 `port_observations` — 容器端口占用观测（issue #246，migration 0022）
+
+**用途**：agentd 心跳上报「容器里哪个进程在听哪个端口」的观测行，供端口分配与路由漂移对账。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `uuid` | `PRIMARY KEY DEFAULT gen_random_uuid()` | 观测行 id |
+| `fde_id` | `uuid` | `NOT NULL REFERENCES users(id)` | = `containers.user_id`，冗余一份供按 FDE 直查 |
+| `container_id` | `uuid` | `NOT NULL REFERENCES containers(id) ON DELETE CASCADE` | 观测来自哪台容器（重建后随旧心跳级联清除） |
+| `port` | `int` | `NOT NULL CHECK (port BETWEEN 1 AND 65535)` | 监听端口 |
+| `pid` | `int` | 可空 | 进程号 |
+| `cwd` | `text` | 可空 | 进程工作目录（`~/projects/<name>` 下相对形，容器外进程留绝对路径） |
+| `cmd` | `text` | 可空 | cmdline 摘要（截断），分辨「是哪个 dev server」 |
+| `branch` | `text` | 可空 | `cwd` 处 `.git/HEAD` 指向的分支（尽力而为，detached / 非仓库为 NULL） |
+| `proc_started_at` | `timestamptz` | 可空 | 进程启动时刻（`/proc/<pid>/stat` 换算） |
+| `observed_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 最后一次采样到它的时刻（新鲜度窗口读侧判定） |
+| `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建行时刻 |
+
+**值域 / 状态机**：`port ∈ [1, 65535]`；无状态机（观测流，新鲜度由读侧按 `observed_at` 判）。
+
+**谁写谁读**：写 = `portal/src/portalloc.js` / `portal/src/materializer.js`（心跳落观测）；读 = `portal/src/routesdrift.js`（路由漂移对账）。
+
+### 1.38 `preview_miss_stats` — 预览未命中的按天计数（issue #366，migration 0023）
+
+**用途**：记录预览里「点了但不该被预览」的文件类型，按 `(kind, ext, day)` 聚合，回答「哪类文件在被点」。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `kind` | `text` | `NOT NULL CHECK (kind IN ('binary', 'too_large'))` | `binary` = 415 `unsupported_file_type`；`too_large` = 413 `file_too_large` |
+| `ext` | `text` | `NOT NULL` | 归一化小写扩展名（无点；无扩展名 / 不可识别为 `''`） |
+| `day` | `date` | `NOT NULL` | 按天聚合（写侧 `current_date` 归一） |
+| `hits` | `bigint` | `NOT NULL DEFAULT 0` | 当日命中数 |
+| `last_user_id` | `uuid` | `REFERENCES users(id) ON DELETE SET NULL` | 当日最后一次点击者（注销不挡计数） |
+| `created_at` / `last_seen_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建行 / 最近见到时刻 |
+
+主键：`PRIMARY KEY (kind, ext, day)`。
+
+**值域 / 状态机**：`kind` 二值 `binary` / `too_large`；`ext` 允许 `''`。无状态机。
+
+**谁写谁读**：写 = `portal/src/previewmiss.js`（点中即按 `(kind, ext, day)` 累加 `hits`）；读 = 管理台按窗口求和。
+
+### 1.39 `upload_settings` — 文件上传大小上限（单行表）（issue #485，migration 0036）
+
+**用途**：全站「单文件上限（字节）」的 DB 真相；单行表（`id` 恒为 1）。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `int` | `PRIMARY KEY DEFAULT 1 CHECK (id = 1)` | 单行表哨兵 |
+| `max_file_bytes` | `bigint` | `NOT NULL CHECK (max_file_bytes > 0)` | 单文件上限（字节）；产品区间 1 MiB–1 GiB 由写侧校验 |
+| `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 改时刻 |
+| `updated_by` | `uuid` | 可空 | 改动人 |
+
+**值域 / 状态机**：`max_file_bytes > 0` 是 DB 事实；产品区间 `[1 MiB, 1 GiB]` 交写侧。无状态机。
+
+**谁写谁读**：写 = `portal/src/upload-settings.js`（管理台改）；读 = `portal/src/http.js` / `portal/src/config.js`（上传校验取上限）。
+
+### 1.40 `notifications` — 宏事件通知（铃铛）（issue #526，migration 0037）
+
+**用途**：宏事件「谁该被通知、读没读」的落库；面板铃铛与模板软删判定都读它。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `VARCHAR(32)` | `PRIMARY KEY` | 站内短 id，应用侧生成（见 `notifications.js`） |
+| `user_id` | `uuid` | `NOT NULL REFERENCES users(id)` | 收件人 |
+| `macro_run_id` | `uuid` | `REFERENCES macro_runs(id) ON DELETE SET NULL` | 关联的宏执行 |
+| `severity` | `text` | `NOT NULL DEFAULT 'info' CHECK (severity IN ('info', 'error'))` | 严重级 |
+| `title` | `text` | `NOT NULL CHECK (btrim(title) <> '')` | 标题（不许空白） |
+| `body` | `text` | `NOT NULL DEFAULT ''` | 正文 |
+| `read_at` | `timestamptz` | 可空 | `NULL` = 未读；已读时刻应用侧写 |
+| `created_at` | `timestamptz` | `NOT NULL` | 生成时刻（应用侧写，无默认） |
+
+索引：`(user_id, created_at DESC)`（翻页主路径）+ partial `(user_id) WHERE read_at IS NULL`（未读计数）。
+
+**值域 / 状态机**：`severity ∈ {info, error}`；`read_at` `NULL`=未读 / 非 `NULL`=已读（两态）。⚠ 表与读侧 API 已落地，**不等于通知调度 / 派发全量实现**。
+
+**谁写谁读**：写 = 宏事件生成侧（`notifications.js` / `macroRoutes`）；读 = `portal/src/http.js`（`GET /api/notifications`、`/api/notifications/unread-count`、`/api/notifications/:id/read`）。
+
+### 1.41 `capability_items` — 能力市场条目（skill / mcp）（issue #595，migration 0039）
+
+**用途**：能力市场目录主表，一条 = 一个 skill / mcp 能力。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `uuid` | `PRIMARY KEY DEFAULT gen_random_uuid()` | 条目 id |
+| `kind` | `text` | `NOT NULL DEFAULT 'skill' CHECK (kind IN ('skill','mcp'))` | 能力类别 |
+| `slug` | `text` | `NOT NULL UNIQUE` | 目录名，`^[a-z0-9][a-z0-9-]{0,63}$`（校验在 `market.js`） |
+| `name` | `text` | `NOT NULL` | 展示名 |
+| `summary` | `text` | `NOT NULL` | 一句话（列表卡片） |
+| `when_to_use` | `text` | `NOT NULL` | 「何时用」，L3 路由信号 |
+| `description_md` | `text` | `NOT NULL DEFAULT ''` | 详情页正文 |
+| `version` | `text` | `NOT NULL` | 版本 |
+| `author` | `text` | 可空 | 作者 |
+| `tags` | `text[]` | `NOT NULL DEFAULT '{}'` | 标签 |
+| `license` | `text` | 可空 | 许可 |
+| `state` | `text` | `NOT NULL DEFAULT 'draft' CHECK (state IN ('draft','published','retired'))` | 生命周期 |
+| `manifest` | `jsonb` | `NOT NULL` | 清单 `{skill_id, entrypoint, tools:[…], files:[…]}` |
+| `security_score` | `int` | `NOT NULL DEFAULT 100` | 安全分 |
+| `security_warnings` | `jsonb` | `NOT NULL DEFAULT '[]'` | `[{code, path, line, note}]` |
+| `created_by` | `uuid` | `REFERENCES users(id)` | 创建人 |
+| `published_at` / `retired_at` | `timestamptz` | 可空 | 上架 / 退役时刻 |
+| `created_at` / `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建 / 更时刻 |
+
+**值域 / 状态机**：`kind ∈ {skill, mcp}`；`state` 三值 `draft → published → retired`（转换由应用层执行）。
+
+**谁写谁读**：写 = `portal/src/market.js`；读 = `portal/src/http.js`（市场列表 / 详情路由）。
+
+### 1.42 `capability_files` — 能力条目的文件原文（issue #595，migration 0039）
+
+**用途**：某能力某版本的文件内容（字节），随条目级联删。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `item_id` | `uuid` | `NOT NULL REFERENCES capability_items(id) ON DELETE CASCADE` | 所属条目 |
+| `version` | `text` | `NOT NULL` | 版本 |
+| `path` | `text` | `NOT NULL` | 相对路径，已校验（无绝对路径 / 无 `..` / 无符号链接） |
+| `content` | `bytea` | `NOT NULL` | 文件原文 |
+| `bytes` | `int` | `NOT NULL` | 字节数 |
+
+主键：`PRIMARY KEY (item_id, version, path)`。
+
+**值域 / 状态机**：`path` 必须是相对路径；无状态机。
+
+**谁写谁读**：写 = `portal/src/market.js`；读 = 装填能力时由 `market.js` 按 `(item_id, version)` 取文件。
+
+### 1.43 `fde_capability_installs` — FDE ↔ 能力安装关系（issue #595，migration 0039）
+
+**用途**：哪个 FDE 装了哪个能力哪个版本，带启停开关。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `fde_id` | `uuid` | `NOT NULL REFERENCES users(id) ON DELETE CASCADE` | 装到哪个 FDE |
+| `item_id` | `uuid` | `NOT NULL REFERENCES capability_items(id) ON DELETE CASCADE` | 装哪个能力 |
+| `version` | `text` | `NOT NULL` | 装的版本 |
+| `enabled` | `boolean` | `NOT NULL DEFAULT true` | 启 / 停开关 |
+| `installed_at` / `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 装 / 更时刻 |
+
+主键：`PRIMARY KEY (fde_id, item_id)`（每 FDE 对每能力一行）。
+
+**值域 / 状态机**：`enabled` 二值，是「启 / 停」而非「装 / 卸」（卸载 = 删行，不是置 `false`）。
+
+**谁写谁读**：写 = `portal/src/market.js`；读 = `market.js`（列已装 / 装填注入）。
+
+### 1.44 `capability_params` — 能力的参数槽声明（issue #608，migration 0040）
+
+**用途**：一个能力声明它需要哪些注入参数（配置 / 密钥）及注入位置。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `item_id` | `uuid` | `NOT NULL REFERENCES capability_items(id) ON DELETE CASCADE` | 所属能力 |
+| `name` | `text` | `NOT NULL` | 注入名，`^[A-Z][A-Z0-9_]{0,63}$` |
+| `kind` | `text` | `NOT NULL CHECK (kind IN ('config','secret'))` | 配置 / 密钥 |
+| `inject` | `text` | `NOT NULL CHECK (inject IN ('context','env','header'))` | 注入位置 |
+| `required` | `boolean` | `NOT NULL DEFAULT true` | 是否必填 |
+| `description` | `text` | `NOT NULL DEFAULT ''` | 说明 |
+| `created_at` / `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 建 / 更时刻 |
+
+主键：`PRIMARY KEY (item_id, name)`。额外 `CHECK (kind <> 'secret' OR inject IN ('env','header'))`：密钥只能注到 `env` / `header`。
+
+**值域 / 状态机**：`kind ∈ {config, secret}`；`inject ∈ {context, env, header}`；`secret` 被约束为只能 `env` / `header`。无状态机。
+
+**谁写谁读**：写 = `portal/src/market.js`；读 = `portal/src/secrets.js`（注入装配）。
+
+### 1.45 `capability_param_values` — 参数槽的实际取值（issue #608，migration 0040/0042）
+
+**用途**：参数槽在某作用域（全局或某 FDE）的实际值。⚠ **最终列是 `value_plain` 明文**；`value_encrypted` 已由 `0042` 删除，**没有密文列**。
+
+**列定义**（0040 建、0042 改后的最终形态）：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `uuid` | `PRIMARY KEY DEFAULT gen_random_uuid()` | 值行 id |
+| `item_id` | `uuid` | `NOT NULL REFERENCES capability_items(id) ON DELETE CASCADE` | 所属能力 |
+| `name` | `text` | `NOT NULL` | 参数名（与 `item_id` 一起 FK 回 `capability_params`） |
+| `scope` | `text` | `NOT NULL CHECK (scope IN ('global','fde'))` | 作用域 |
+| `fde_id` | `uuid` | `REFERENCES users(id) ON DELETE CASCADE` | `scope='fde'` 才给 |
+| `value_plain` | `text` | `NOT NULL`（0042 加） | 明文值；0040 建时为 `value_encrypted bytea`，0042 `ADD value_plain` + `DROP value_encrypted` + `SET NOT NULL` |
+| `updated_by` | `uuid` | `REFERENCES users(id) ON DELETE SET NULL` | 改动人 |
+| `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 改时刻 |
+
+其他约束：`FOREIGN KEY (item_id, name) REFERENCES capability_params(item_id, name) ON DELETE CASCADE`；`CHECK ((scope = 'fde') = (fde_id IS NOT NULL))`；partial 唯一索引 `capability_param_values_global_uq (item_id, name) WHERE scope = 'global'` 与 `capability_param_values_fde_uq (item_id, name, fde_id) WHERE scope = 'fde'`。
+
+**值域 / 状态机**：`scope ∈ {global, fde}`，且与 `fde_id` 是否非空同真同假；「没有值」只能用「没有行」表达（明文拒空串）。无状态机。
+
+**谁写谁读**：写 = `portal/src/secrets.js` / `market.js`；读 = 注入装配时按 `(item_id, name, scope)` 取值。
+
+### 1.46 `platform_prompts` — 平台文案 / 提示词覆写（单行表）（issue #596，migration 0043）
+
+**用途**：管理员覆写三处平台文本（AGENTS.md 补充节、AGENTS.md 覆写主体、标题生成提示词）。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `int` | `PRIMARY KEY DEFAULT 1 CHECK (id = 1)` | 单行表哨兵 |
+| `agents_md_addendum` | `text` | `NOT NULL DEFAULT ''` | 追加到 `~/AGENTS.md` 末尾的正文；`''` = 不加该节 |
+| `agents_md_override` | `text` | `NOT NULL DEFAULT ''` | 整段替换内置模板正文主体；`''` = 用内置 |
+| `title_prompt` | `text` | `NOT NULL DEFAULT ''` | 会话标题生成的 system 提示词；`''` = 用内置默认 |
+| `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 改时刻 |
+| `updated_by` | `uuid` | 可空 | 改动人 |
+
+**值域 / 状态机**：三个文本列空串 = 回落到内置；无状态机。
+
+**谁写谁读**：写 = `portal/src/http.js`（管理台改）；读 = `portal/src/session-title.js`（标题）+ `portal/src/materializer.js`（生成 `AGENTS.md`）。
+
+### 1.47 `runtime_settings` — 运行时旋钮的 DB 真相（issue #677，migration 0046）
+
+**用途**：把 registry 旋钮的稳定值落库；读侧要的是「它是个 JSON 标量」这个类型事实。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `key` | `text` | `PRIMARY KEY` | 旋钮稳定标识 = registry key（例 `demo.limit`） |
+| `value` | `jsonb` | `NOT NULL` | 值；写侧只收 number / boolean / string；对象 / 数组读侧判非法并回落 |
+| `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | 改时刻 |
+| `updated_by` | `uuid` | 可空 | 改动人 |
+
+**值域 / 状态机**：`value` 必须是 JSON 标量（number / boolean / string）；无状态机。
+
+**谁写谁读**：写 = `portal/src/cli.js` / `portal/src/http.js`；读 = `portal/src/preview.js` 等各消费方。
+
+### 1.48 `transcript_recovery_rows` — transcript 恢复行的落库（issue #500，migration 0038）
+
+**用途**：引擎 recovery 事件的落库行（session 作用域），供崩溃恢复重放。
+
+**列定义**：
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `transcript_key` | `text` | `NOT NULL` | 引擎 store key = `sessionId`（只有 session 语义，无 run 作用域） |
+| `dedup_key` | `text` | `NOT NULL CHECK (length(dedup_key) <= 255)` | 事件键 `<runId>:engine:round:<n>:recovery:<event>:<判别子>` |
+| `round` | `integer` | `NOT NULL CHECK (round >= 0)` | 事件所属轮号 |
+| `record` | `jsonb` | `NOT NULL` | 引擎 record 原样（不剥字段） |
+| `append_seq` | `bigserial` | `NOT NULL` | 持久化追加序（排序唯一真相） |
+
+主键：`PRIMARY KEY (transcript_key, dedup_key)`。
+
+**值域 / 状态机**：`round ≥ 0`；`dedup_key` ≤ 255 字符；`append_seq` 单调递增（排序真相）。无状态机。
+
+**谁写谁读**：写 = `portal/src/transcript-store.js`（引擎 recovery 落行）；读 = 恢复重放时同一模块按 `append_seq` 有序读。
 
 
 ---
@@ -753,11 +1033,11 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 |---|---|---|
 | `containers.status` | `creating / running / stopped / exited / removed` | portal 生命周期操作产生（规格 §7.2/§7.3）；消费：任务下发（拉模型：消息落库即 202、容器恢复后自行 claim，portal.md §6.3）、心跳检测（`running` 长时无心跳 → 视 `exited`，3 次丢失 ≈45s ⚠️，runner-integration §4.2） |
 | `chat_sessions.status` | `active / archived` | FDE 归档操作产生；消费：列表过滤、SSE 首连策略 |
-| `users.status` | `active / disabled` | onboarding / offboarding / IdP 对账（规格 §7.3）产生；消费：登录与 forward-auth 拒绝、容器停止 |
+| `users.status` | `active / disabled / awaiting_credential` | onboarding / offboarding / IdP 对账（规格 §7.3）产生；消费：登录与 forward-auth 拒绝、容器停止 |
 | `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制，attempts+1）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回收（A1/A2 定稿）：`runs.status='cancelling'` → `cancelled` + runs `finished`（aborted）；否则 `attempts < max_attempts` → 回 `pending`（**attempts 不变**），`attempts >= max_attempts` → `done` + runs `failed`（`max_attempts_exceeded`，§2.8） |
 | `queued_inputs.status` | `pending / delivering / delivered / recalled / discarded` | `pending` 由 `POST …/queued-inputs` 产生（会话行锁内，同事务判活跃 run）；`delivering` 由终态出队的 CAS 认领产生（0 行 = 被别人抢先，放弃本轮）；`delivered` 由投递成功后回写（带 `run_id`）；`recalled` 由 `DELETE …/queued-inputs` 整队取回产生；投递失败**退回 `pending`**（下一次终态再来），只有会话已 404 才 `discarded`。消费方：会话详情 `queued_messages` 快照、`queue_update` SSE、上限校验计数。**过期 `delivering` 算可认领**（判据见 §1.29 `claimed_at` 行）且**算在上限里** | 
 | `preview_grants.state` | `active / used / revoked / expired` | `active` 由 portal 签发（ticket）/ forwardAuth 换取（session）产生；`used` 由 forwardAuth 首次校验 ticket 同事务置位；`revoked` 由显式吊销 / allocation released / 用户 disabled 置位；`expired` 由 reaper 按 `expires_at` 懒打标 |
-| `macro_runs.status` | `pending / running / done / skipped / failed / superseded` | **生命周期轴**（`criterion` 是另一轴：判据五值，写完不变、进幂等键，不是状态机 ⇒ 见 §1.33）。`pending` 由 `macros.js#claimMacroRun` 产生（`INSERT … ON CONFLICT DO NOTHING`，抢不到返回 `null`）；`running`/`done`/`failed` 由 W2 执行器经 `finishMacroRun` 推进（进终态补 `finished_at`）；`skipped` = 被门禁挡下，**必带 `skipped_reason`**（八种穷举：`budget_exhausted` / `quiet_hours` / `human_present` / `run_in_progress` / `deferred` / `deferred_timeout` / `active_run_in_cwd` / `cancelled_by_user`——「为什么没跑」是面板要分组的维度，不留自由文本）；`superseded` = 同桶被更新的一次取代。**W1 只有 `pending` 与手工收口，没有主动执行** |
+| `macro_runs.status` | `pending / running / done / skipped / failed / superseded` | **生命周期轴**（`criterion` 是另一轴：判据五值，写完不变、进幂等键，不是状态机 ⇒ 见 §1.33）。`pending` 由 `macros.js#claimMacroRun` 产生（`INSERT … ON CONFLICT DO NOTHING`，抢不到返回 `null`）；`running`/`done`/`failed` 由 W2 执行器经 `finishMacroRun` 推进（进终态补 `finished_at`）；`skipped` = 被门禁挡下，**必带 `skipped_reason`**（九种穷举：`budget_exhausted` / `quiet_hours` / `human_present` / `run_in_progress` / `deferred` / `deferred_timeout` / `active_run_in_cwd` / `cancelled_by_user` / `review_unavailable`（审查暂不可用，迁移 `0045` 追加，`verdict` 保持 NULL 不冒充 done）——「为什么没跑」是面板要分组的维度，不留自由文本）；`superseded` = 同桶被更新的一次取代。**W1 只有 `pending` 与手工收口，没有主动执行** |
 
 ### 2.5 `route_outbox.state`
 

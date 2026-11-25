@@ -1,12 +1,12 @@
 {
   "hotBytesBudget": 10240,
-  "refFloor": 657,
-  "measuredHotBytes": 9441,
-  "measuredTotalBytes": 10807,
-  "measuredRefs": 657,
+  "refFloor": 638,
+  "measuredHotBytes": 10037,
+  "measuredTotalBytes": 11403,
+  "measuredRefs": 638,
   "note": "派生量：只有 `--sync`（抬预算/抬地板）或 `--rebaseline=\"<理由>\"`（显式重基线地板）能写；手改视为伪造读数",
   "refFloorMeasuredWith": "git ls-files '*.md' + /§8\\.[0-9]+/g 现算（只数 git 跟踪的 .md）",
-  "refFloorReason": "docs-261124-31: env §8 实测数值整节搬出仓库、本机坐标改指冷层，跟踪 md 的 §8.N 引用随之减少",
-  "refFloorTreeHead": "c90e45c",
+  "refFloorReason": "删掉仓库根 ISSUES.md（台账 §8.204）：现算引用 684（HEAD~1）→ 637（HEAD），被删文件带走 47 处；本单台账 §8.204 补回 1 处 = 工作树 638。不是改号也不是删引用",
+  "refFloorTreeHead": "57893f79",
   "refFloorTreeDirty": true
 }

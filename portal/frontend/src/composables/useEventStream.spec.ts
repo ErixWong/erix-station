@@ -1388,7 +1388,7 @@ describe('useEventStream · judge 分轴文案（issue #321）', () => {
       'judge',
     );
     const text = hooks.onSep.mock.calls[0][0];
-    // 旧文案「judge：executed」把用户骗成「任务完成」（ISSUES.md 第 4 条放大器）——新文案不得回退。
+    // 旧文案「judge：executed」把用户骗成「任务完成」（原试用反馈第 4 条放大器）——新文案不得回退。
     expect(text).not.toMatch(/已完成|已核验|已验证/);
     expect(text).not.toMatch(/judge：executed/);
   });

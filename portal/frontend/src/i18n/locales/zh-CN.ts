@@ -372,7 +372,7 @@ export const zhCN = {
       //（run_end）；本站 runner 不传 finalGuard ⇒ verification 恒 skipped，本组文案一律不得出现
       //「已核验 / 已验证」这类承诺。axes 之间用「 · 」由调用方拼接。
       judgeAxes: 'judge：{axes}',
-      // 轴一 · 工具审计：executed 的语义是「本次工具调用被放行」，不是任务完成（ISSUES.md 第 4 条放大器）。
+      // 轴一 · 工具审计：executed 的语义是「本次工具调用被放行」，不是任务完成（原试用反馈第 4 条放大器）。
       judgeAuditExecuted: '工具审计：已放行（非任务完成）',
       judgeAuditPassThrough: '工具审计：已放行（{mode}，非任务完成）',
       judgeAuditBlocked: '工具审计：已拦截（本次工具调用未执行）',
