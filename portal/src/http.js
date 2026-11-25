@@ -26,6 +26,7 @@ import * as seatContent from './admin-seat-content.js'; // #727：管理台按 F
 import * as dirs from './dirs.js';
 import * as previewmiss from './previewmiss.js';
 import * as previewproxy from './previewproxy.js';
+import * as previewBackend from './preview-backend.js'; // #787：kkFileView 可用性探针（状态查询，不是反代）
 import { getGitLight } from './gitlight.js';
 import * as gitCredential from './git-credential.js';
 import * as gitHosts from './git-hosts.js';
@@ -1421,6 +1422,10 @@ async function routeApi(req, res, ctx, url) {
   // 拼进 /pv/<code>/onlinePreview 当 iframe src。命名对齐同族 kebab-case 端点。
   if (pathname === '/api/preview-tickets' && req.method === 'POST') {
     return handleFilePreviewTicket(req, res, ctx);
+  }
+  // issue #787：预览后端（kkFileView）可用性探针。普通 FDE 可读；探针失败也 **200**。
+  if (pathname === '/api/preview-backend' && req.method === 'GET') {
+    return handlePreviewBackend(req, res, ctx);
   }
   // /pv/<code>/** 预览反代（#366 P2）：浏览器全程只见 portal 源，kk 主机名零暴露。
   const pvMatch = pathname.match(/^\/pv\/([^/]+)(\/.*)?$/);
@@ -5063,6 +5068,26 @@ async function requireSession(req, ctx) {
   const session = await resolveSession(req, ctx);
   if (!session) throw new HttpError(401, 'unauthorized', 'unauthorized');
   return session;
+}
+
+/**
+ * issue #787：`GET /api/preview-backend` —— 预览后端（kkFileView）可用性探针状态。
+ *
+ * 普通 FDE 也能读（`requireSession` 即可，不是 admin 面）。响应 `{ configured, available,
+ * checkedAt }` 三字段；**不回 baseUrl**（探针结果里不该出现内网坐标）；探针失败（未配置 /
+ * 不可达 / 探测异常）一律 **200**（这是状态查询，不是错误，别映射成 502）。
+ */
+async function handlePreviewBackend(req, res, ctx) {
+  await requireSession(req, ctx);
+  const baseUrl = await runtimeSettings.readKkBaseUrl({
+    pool: ctx.pool, config: ctx.config, log: ctx.log,
+  });
+  const status = await previewBackend.probePreviewBackend({ baseUrl });
+  return sendJson(res, 200, {
+    configured: status.configured,
+    available: status.available,
+    checkedAt: status.checkedAt,
+  });
 }
 
 /**

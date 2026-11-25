@@ -753,6 +753,64 @@ export function validateMaxLoginLength(value) {
   });
 }
 
+// --- preview.kk_base_url 专用闸（#787：kkFileView 预览后端地址进运行时配置） --------------
+// 语义：docx/xlsx/pptx/zip 一律走 kkFileView 通道，但 kk 是否配置/可达系统自己此前不知道。
+// 这一格把「有没有 kk」变成可配置项；探针（`preview-backend.js`）读它判可达性，前端据此降级下载。
+// 三档口径与其它格一致：DB 有效值 > env（过闸）> registry 默认。默认与 config 的
+// `kkInternalBaseUrl`（KK_INTERNAL_BASE_URL）同源；留空/改错 ⇒ Office 预览不可用（前端降级）。
+export const KK_BASE_URL_KEY = 'preview.kk_base_url';
+export const KK_BASE_URL_DEFAULT = 'http://kkfileview:8012';
+const KK_BASE_URL_MAX_LEN = 255;
+
+/**
+ * 解析一个 kkFileView base URL：只认 string、可被 `new URL()` 解析、scheme ∈ http/https。
+ * 拒：带 userinfo、带 query/fragment、去尾斜杠后为空、长度 > 255。**绝不抛**（口径 1）。
+ *
+ * @returns {{ ok: true, value: string } | { ok: false, reason: string }}
+ */
+export function parseKkBaseUrl(raw) {
+  if (typeof raw !== 'string') {
+    return { ok: false, reason: 'not_a_base_url' };
+  }
+  if (raw.length > KK_BASE_URL_MAX_LEN) {
+    return { ok: false, reason: 'too_long' };
+  }
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { ok: false, reason: 'not_a_base_url' };
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return { ok: false, reason: 'bad_scheme' };
+  }
+  if (url.username !== '' || url.password !== '') {
+    return { ok: false, reason: 'has_userinfo' };
+  }
+  if (url.search !== '' || url.hash !== '') {
+    return { ok: false, reason: 'has_query_or_fragment' };
+  }
+  const value = raw.replace(/\/+$/, '');
+  if (value === '') {
+    return { ok: false, reason: 'not_a_base_url' };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * 管理台写入前的取值闸：`true` 或一句中文原因；只收 string（非 string 直接给原因，不抛）。
+ */
+export function validateKkBaseUrl(value) {
+  if (typeof value !== 'string') {
+    return '必须是字符串形式的 http(s) 文档预览服务地址（不接受数字、布尔、对象）';
+  }
+  const parsed = parseKkBaseUrl(value);
+  if (!parsed.ok) {
+    return `必须是形如 http://host:port 的文档预览服务地址（被拒原因：${parsed.reason}）`;
+  }
+  return true;
+}
+
 export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
@@ -887,6 +945,18 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseMaxLoginLength,
     validate: validateMaxLoginLength,
     hint: MAX_LOGIN_LENGTH_HINT,
+  }),
+  [KK_BASE_URL_KEY]: Object.freeze({
+    key: KK_BASE_URL_KEY,
+    label: '文档预览服务地址（kkFileView base URL）',
+    configPath: 'kkInternalBaseUrl',
+    envVar: 'KK_INTERNAL_BASE_URL',
+    defaultValue: KK_BASE_URL_DEFAULT,
+    applyMode: 'hot',
+    kind: 'text',
+    parse: parseKkBaseUrl,
+    validate: validateKkBaseUrl,
+    hint: '留空或改错会让 Office 预览不可用；只接受 http(s) 地址',
   }),
 });
 
@@ -1633,6 +1703,33 @@ const maxLoginLengthHotReader = createHotReader({
   fallbackDefault: MAX_LOGIN_LENGTH_DEFAULT,
 });
 
+// #787：kkFileView 预览后端地址 = 又一份独立实例（自己一份缓存 / 代际号 / 在飞槽，不共用）。
+const kkBaseUrlHotReader = createHotReader({
+  key: KK_BASE_URL_KEY,
+  warnLabel: 'kk 预览服务地址',
+  fallbackDefault: KK_BASE_URL_DEFAULT,
+});
+
+/**
+ * `preview.kk_base_url` 的**热读**入口（#787；调用方是 `http.js` 的 `handlePreviewBackend`）。
+ * 口径与其它格同一套（同一工厂）：DB 有效值 > env（过闸）> registry 默认，5s 缓存 + 同池在飞
+ * 合并 + 写路径失效，**读侧永不抛**。三档都给不出 ⇒ registry 默认（绝不回 `undefined`）。
+ *
+ * @param {object} opts `{ pool, config, now?, log?, env? }`
+ * @returns {Promise<string>} 生效的 kkFileView base URL
+ */
+export function readKkBaseUrl(options = {}) {
+  return kkBaseUrlHotReader.read(options);
+}
+
+/**
+ * 丢弃 `preview.kk_base_url` 的缓存与在飞槽（口径同上；保存后立即生效）。
+ * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（同 RS-7：不能换成间接层）。
+ */
+export function invalidateKkBaseUrlCache() {
+  kkBaseUrlHotReader.invalidate();
+}
+
 /**
  * 丢弃 TTL 缓存（P2a 对外的名字；实现是上面那个工厂里每一格自己的 `invalidate`）。
  * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（RS-7 钉住身份），P3 抽工厂后也不能换成间接层。
@@ -1715,6 +1812,7 @@ export const HOT_READ_INVALIDATORS = new Map([
   [SESSION_RENEW_INTERVAL_SECONDS_KEY, invalidateSessionRenewIntervalCache],
   [MAX_PASSWORD_LENGTH_KEY, invalidateMaxPasswordLengthCache],
   [MAX_LOGIN_LENGTH_KEY, invalidateMaxLoginLengthCache],
+  [KK_BASE_URL_KEY, invalidateKkBaseUrlCache],
 ]);
 
 /**
@@ -2060,6 +2158,8 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
     key: entry.key,
     label: entry.label ?? entry.key,
     applyMode: entry.applyMode === 'hot' ? 'hot' : 'restart',
+    // #787：前端据此选输入框类型；缺省一律 `integer`（只有 kk 那一格声明 `kind:'text'`）。
+    kind: entry.kind === 'text' ? 'text' : 'integer',
     updatedAt: row ? toIso(row.updated_at) : null,
     updatedBy: row?.updated_by ?? null,
   };
