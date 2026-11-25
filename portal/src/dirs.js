@@ -721,12 +721,32 @@ const IMAGE_MIME = {
 };
 
 /**
- * 流式通道响应 MIME（#366 P0，浏览器原生可渲集）。红线：没有 text/html——工作区里的
- * .html 若以 text/html 同源直出，脚本在 portal 源里执行（预览即 XSS）；一律降级为下载。
+ * 可内联的位图 MIME（#771）：STREAM_MIME 只显式继承这一份，
+ * **不**整体继承 IMAGE_MIME。为什么 SVG 不在这里：SVG 是**活动内容**
+ * （内嵌 <script> / onload / foreignObject），和下面红线里的 .html
+ * 是同一条——以 image/svg+xml 作顶层文档同源直出时，脚本就在 portal
+ * 源里执行（预览即 XSS，issue #771）。SVG 仍留在 IMAGE_MIME：JSON 通道
+ * 回 data URL，前端塞进 <img src> 渲染，<img> 里的 SVG 不执行脚本，安全。
+ * 为什么用显式清单而不是 `{ ...IMAGE_MIME }` 之后再
+ * `delete STREAM_MIME['.svg']`：显式清单让「能内联的格式」在定义处一眼
+ * 看全，且漂移方向安全——以后往 IMAGE_MIME 加新格式，默认落
+ * octet-stream + attachment（要内联必须在这里显式加一行）；delete 写法
+ * 会反过来默认放行。
+ */
+const STREAM_INLINE_IMAGE_MIME = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+};
+
+/**
+ * 流式通道响应 MIME（#366 P0，浏览器原生可渲集）。红线：没有活动内容
+ * ——工作区里的 .html 若以 text/html 同源直出、.svg 若以 image/svg+xml
+ * 内联直出，脚本都在 portal 源里执行（预览即 XSS，#771 补的正是 SVG
+ * 这一半）；一律降级为下载。
  * 未知扩展名 → application/octet-stream（浏览器存盘，不猜）。
  */
 const STREAM_MIME = {
-  ...IMAGE_MIME,
+  ...STREAM_INLINE_IMAGE_MIME,
   '.pdf': 'application/pdf',
   '.mp4': 'video/mp4', '.webm': 'video/webm', '.m4v': 'video/x-m4v', '.mov': 'video/quicktime',
   '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.m4a': 'audio/mp4',
@@ -788,6 +808,10 @@ export async function openFileStream({
   const headers = {
     'Content-Type': mime,
     'Accept-Ranges': 'bytes',
+    // 纵深防御（#771）：白名单外是 application/octet-stream，nosniff 挡住
+    // 浏览器把它嗅探成可执行文档（老浏览器会按内容猜类型，
+    // 然后当作同源文档跑）。
+    'X-Content-Type-Options': 'nosniff',
     'Content-Disposition': `${effective}; filename="${sanitizeFilename(name)}"`,
   };
   const parsed = parseSingleRange(range, st.size);
