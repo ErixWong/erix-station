@@ -2,34 +2,20 @@
 // 管理台 · 宏模板配置（issue #529，事件平台 W6；契约 `10` 篇 §3.2 / `07` §1.3、§2.3）。
 //
 // 三条硬口径：
-//   ① 列表带**订阅数**列（不是装饰：停用前要知道影响谁）。⚠ 后端 `toTemplateSnapshot` 目前
-//      不下发订阅数列（见交付报告的「偏离」），前端拿不到就显示 `—`，**不拿 0 冒充「没人订」**。
+//   ① 列表带**订阅数**列（不是装饰：停用/改参数前要知道影响谁）。后端 `adminTemplates` 已下发
+//      `subscriberCount`（issue #613，只算启用订阅）；万一没下发就显示 `—`，**不拿 0 冒充「没人订」**。
 //   ② 新建**先选 kind 再填表**；kind 建完**不可改**（后端 PATCH 白名单只允许
 //      `{name?, params?, audience?, enabled?}`，body 里出现 kind/scope 直接 400）。
 //   ③ 删除是**一个按钮 + 两句话**：平台按数据自己判硬删/软删，前端不猜——
 //      DELETE 返回 `{mode}`，`deleted` / `deleted_with_assignments` / `soft` 各一句人话。
 //
-// 字段表从 `@shared/macro-kinds` 的 `KIND_SCHEMA` 取；判据与工具面写死显示在「以下由代码固定」区。
-// 枚举一律从 shared 迭代，绝不在此抄字面量（单源自检 `portal/test/macro-kinds-single-source.test.js`）。
-import { computed, onMounted, reactive, ref } from 'vue';
+// 新建与编辑表单已抽成子组件 `MacroTemplateForm.vue`（issue #759）：同一套字段控件，靠 `mode`
+// 分流「新建预填 schema default」与「编辑预填模板已有值」两种语义——这里只管开/关与列表更新。
+import { computed, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
-import { KINDS, KIND_SCHEMA, KIND_SCOPE } from '@shared/macro-kinds';
 import { kindMessageKey } from '../lib/macroView';
-
-/** `KIND_SCHEMA` 的松散视图（shared 是 JS，无类型；这里只声明渲染要的字段）。 */
-interface FieldSpec {
-  type: string;
-  values?: unknown[];
-  min?: number;
-  max?: number;
-  /** 契约 §1 的默认值（#625）：表单初值**只从这里取**，与后端 `validateKindParams` 补的是同一份。 */
-  default?: unknown;
-  /** 契约 §1 的必填标记（#625）：缺了后端 400，前端只用来标「必填」。 */
-  required?: boolean;
-}
-const SCHEMA = KIND_SCHEMA as unknown as Record<string, Record<string, FieldSpec>>;
-const SCOPE = KIND_SCOPE as unknown as Record<string, string>;
+import MacroTemplateForm from '../components/MacroTemplateForm.vue';
 
 interface AdminTemplate {
   id: string;
@@ -40,7 +26,7 @@ interface AdminTemplate {
   scope: string;
   enabled: boolean;
   deleted_at?: string | null;
-  /** 后端将来补订阅数列时，前端自动显示（当前不下发 ⇒ 显示 `—`）。 */
+  /** 后端下发订阅数（issue #613）；未下发时前端显示 `—` 而不是 0。 */
   subscriberCount?: number;
 }
 interface DeleteResult {
@@ -94,83 +80,38 @@ function subscriberLabel(row: AdminTemplate): string {
   return typeof row.subscriberCount === 'number' ? String(row.subscriberCount) : t('admin.macros.subscriberUnknown');
 }
 
-// ── 新建 ──────────────────────────────────────────────────────────────────────
+// ── 新建 / 编辑（表单在子组件里；这里只管开/关与列表就地更新）───────────────────
 const formOpen = ref(false);
-const form = reactive<{ kind: string; name: string; audience: string; params: Record<string, unknown> }>({
-  kind: '', name: '', audience: 'all', params: {},
-});
-const createdTpl = ref<AdminTemplate | null>(null);
-const createError = ref<string | null>(null);
-
-const schemaEntries = computed<Array<[string, FieldSpec]>>(() =>
-  form.kind && SCHEMA[form.kind] ? Object.entries(SCHEMA[form.kind]) : [],
-);
-const fixedScopeLabel = computed(() => {
-  const scope = form.kind ? SCOPE[form.kind] : null;
-  return scope === 'user' ? t('admin.macros.scopeUser') : t('admin.macros.scopeSession');
-});
-
-/**
- * 表单初值：**只取 schema 的 `default`**（issue #625）。
- *
- * 以前这里是一套「通用兜底规则」（enum 取首值、enum[] 取 `[]`、int 取 `min`），
- * 它把「没写默认值」当成「默认就是空/下界」，于是：
- *   - `run-notify` 建出来 `states: []` ⇒ **永远不会通知**，界面却显示 Enabled；
- *   - `maxRounds` 变成 1（契约是 16）、`max_rounds` 同理。
- * 现在后端 `validateKindParams` 会按契约补默认值，两边必须同源：
- *   **schema 没写 `default` 的字段就不预填**（控件自然为空，要么用户填、要么按可选省略），
- *   绝不在这层再造一套规则。
- */
-function initialParams(entries: Array<[string, FieldSpec]>): Record<string, unknown> {
-  const next: Record<string, unknown> = {};
-  for (const [key, spec] of entries) {
-    if (!('default' in spec)) continue; // 无默认 ⇒ 不预填（而不是猜一个）
-    const d = spec.default;
-    // 数组要拷一份：否则 `toggleArrayValue` 会直接改到共享的 `KIND_SCHEMA` 常量上。
-    next[key] = Array.isArray(d) ? [...d] : d;
-  }
-  return next;
-}
+// 正在编辑的行（null = 没有编辑表单）。传给子组件做预填与 PATCH 目标。
+const editing = ref<AdminTemplate | null>(null);
 
 function openCreate(): void {
   formOpen.value = true;
-  createdTpl.value = null;
-  createError.value = null;
 }
 function closeCreate(): void {
   formOpen.value = false;
 }
 
-/** 换 kind：按新 kind 的 schema 重建 params（切 kind 时不残留别的 kind 的字段）。 */
-function onKindChange(): void {
-  form.params = initialParams(schemaEntries.value);
+function openEdit(row: AdminTemplate): void {
+  editing.value = row;
+}
+function closeEdit(): void {
+  editing.value = null;
 }
 
-function toggleArrayValue(key: string, value: unknown): void {
-  const cur = Array.isArray(form.params[key]) ? (form.params[key] as unknown[]) : [];
-  form.params[key] = cur.includes(value) ? cur.filter((x) => x !== value) : [...cur, value];
-}
-function isArrayChecked(key: string, value: unknown): boolean {
-  const cur = form.params[key];
-  return Array.isArray(cur) && cur.includes(value);
+/** 新建成功：把新模板插到列表头（子组件已留预览，表单保持打开——与 #529 原行为一致）。 */
+function onCreateSaved(template: AdminTemplate): void {
+  rows.value = [template, ...rows.value];
 }
 
-async function submitCreate(): Promise<void> {
-  createError.value = null;
-  try {
-    const res = await api<{ template: AdminTemplate }>('/api/admin/macro-templates', {
-      method: 'POST',
-      // scope 由 kind 决定（后端也这么校验），前端照 `KIND_SCOPE` 送，绝不让用户手填。
-      body: JSON.stringify({
-        kind: form.kind, name: form.name, params: form.params,
-        audience: form.audience, scope: form.kind ? SCOPE[form.kind] : undefined, enabled: true,
-      }),
-    });
-    createdTpl.value = res.template;
-    rows.value = [res.template, ...rows.value];
-  } catch (e) {
-    createError.value = e instanceof Error ? e.message : String(e);
-  }
+/**
+ * 编辑成功：**就地替换那一行**（test ⑥：不整页重拉）。子组件 emit 的是后端 PATCH 返回的模板，
+ * 已带最新 name/params/audience，直接顶替即可，省一次 GET。
+ */
+function onEditSaved(template: AdminTemplate): void {
+  const idx = rows.value.findIndex((x) => x.id === template.id);
+  if (idx >= 0) rows.value[idx] = template;
+  editing.value = null;
 }
 
 // ── 动作：启停 / 删除 ──────────────────────────────────────────────────────────
@@ -217,14 +158,6 @@ function deleteResultText(res: DeleteResult): string {
   return t('admin.macros.resultDeleted');
 }
 
-// 用户视角预览 + 一次触发成本估算（usage 后端目前恒 null ⇒ 成本「暂无法估算」）。
-const createdPreview = computed(() => {
-  const tpl = createdTpl.value;
-  if (!tpl) return '';
-  const vis = tpl.audience === 'admin' ? t('admin.macros.audienceAdmin') : t('admin.macros.audienceAll');
-  return `${tpl.name} · ${t(kindMessageKey(tpl.kind))} · ${vis}`;
-});
-
 onMounted(() => { void load(); });
 </script>
 
@@ -252,120 +185,23 @@ onMounted(() => { void load(); });
     <p v-if="error" data-test="macros-error" class="syserr text-sm" role="alert">{{ error }}</p>
     <p v-if="resultText" data-test="macros-result" class="text-sm text-emerald-700" role="status">{{ resultText }}</p>
 
-    <!-- 新建表单：先选 kind 再填表 -->
-    <form
+    <!-- 新建表单（子组件；先选 kind 再填表，kind 建完不可改） -->
+    <MacroTemplateForm
       v-if="formOpen"
-      data-test="macros-create-form"
-      class="grid gap-3 rounded-lg border border-black/10 p-3"
-      @submit.prevent="submitCreate"
-    >
-      <p class="text-xs text-black/60">{{ t('admin.macros.pickKindFirst') }}</p>
+      mode="create"
+      @saved="onCreateSaved"
+      @cancel="closeCreate"
+    />
 
-      <label class="flex flex-col gap-1 text-xs text-black/55">
-        {{ t('admin.macros.colKind') }}
-        <select
-          v-model="form.kind"
-          data-test="create-kind"
-          class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
-          @change="onKindChange"
-        >
-          <option value="" disabled>—</option>
-          <option v-for="k in KINDS" :key="k" :value="k">{{ t(kindMessageKey(k)) }}</option>
-        </select>
-      </label>
-      <p data-test="create-kind-locked" class="text-xs text-amber-700">{{ t('admin.macros.kindLocked') }}</p>
-
-      <template v-if="form.kind">
-        <label class="flex flex-col gap-1 text-xs text-black/55">
-          {{ t('admin.macros.name') }}
-          <input v-model="form.name" data-test="create-name" type="text" maxlength="40"
-            class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
-        </label>
-
-        <label class="flex flex-col gap-1 text-xs text-black/55">
-          {{ t('admin.macros.audience') }}
-          <select v-model="form.audience" data-test="create-audience"
-            class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
-            <option value="all">{{ t('admin.macros.audienceAll') }}</option>
-            <option value="admin">{{ t('admin.macros.audienceAdmin') }}</option>
-          </select>
-        </label>
-
-        <fieldset class="grid gap-2 border-t border-black/10 pt-2">
-          <legend class="text-xs font-medium">{{ t('admin.macros.paramsTitle') }}</legend>
-          <div v-for="[key, spec] in schemaEntries" :key="key" class="flex flex-col gap-1 text-xs text-black/55">
-            <span data-test="param-label">{{ key }} · {{ spec.type }}</span>
-
-            <select
-              v-if="spec.type === 'enum'"
-              :value="form.params[key] as string"
-              :data-test="'param-' + key"
-              class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
-              @change="form.params[key] = ($event.target as HTMLSelectElement).value"
-            >
-              <option v-for="val in spec.values" :key="String(val)" :value="String(val)">{{ String(val) }}</option>
-            </select>
-
-            <div v-else-if="spec.type === 'enum[]'" class="flex flex-wrap gap-2">
-              <label v-for="val in spec.values" :key="String(val)" class="flex items-center gap-1">
-                <input
-                  type="checkbox"
-                  :data-test="'param-array-' + key + '-' + String(val)"
-                  :checked="isArrayChecked(key, val)"
-                  @change="toggleArrayValue(key, val)"
-                >
-                <span>{{ String(val) }}</span>
-              </label>
-            </div>
-
-            <input
-              v-else-if="spec.type === 'int'"
-              :value="form.params[key] as number"
-              :data-test="'param-' + key"
-              type="number"
-              :min="spec.min"
-              :max="spec.max"
-              class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
-              @change="form.params[key] = Number(($event.target as HTMLInputElement).value)"
-            >
-
-            <input
-              v-else
-              :value="form.params[key] as string"
-              :data-test="'param-' + key"
-              type="text"
-              class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
-              @change="form.params[key] = ($event.target as HTMLInputElement).value"
-            >
-          </div>
-        </fieldset>
-
-        <!-- 「以下由代码固定」区：判据与工具面写死 -->
-        <div data-test="create-fixed" class="rounded bg-black/5 p-2 text-xs text-black/60">
-          <p class="font-medium">{{ t('admin.macros.fixedByCode') }}</p>
-          <p>{{ t('admin.macros.fixedHint') }}</p>
-          <p data-test="create-fixed-scope">{{ t('admin.macros.fixedScope', { scope: fixedScopeLabel }) }}</p>
-        </div>
-      </template>
-
-      <p v-if="createError" data-test="create-error" class="syserr text-xs" role="alert">{{ createError }}</p>
-
-      <div class="flex gap-2">
-        <button type="submit" data-test="create-submit" :disabled="!form.kind || !form.name"
-          class="rounded bg-brand px-3 py-1 text-sm text-white disabled:opacity-50">
-          {{ t('admin.macros.submitCreate') }}
-        </button>
-        <button type="button" data-test="create-cancel" class="rounded border border-black/15 px-3 py-1 text-sm"
-          @click="closeCreate">{{ t('admin.macros.cancel') }}</button>
-      </div>
-
-      <!-- 创建后：用户视角预览 + 一次触发成本估算 -->
-      <div v-if="createdTpl" data-test="created-preview" class="rounded border border-emerald-300 bg-emerald-50 p-2 text-xs">
-        <p class="font-medium">{{ t('admin.macros.createdTitle') }}</p>
-        <p data-test="created-preview-text">{{ t('admin.macros.userPreview') }} {{ createdPreview }}</p>
-        <p data-test="created-cost">{{ t('admin.macros.triggerCostUnknown') }}</p>
-      </div>
-    </form>
+    <!-- 编辑表单（issue #759）：kind/scope 只读，name/audience/params 可改；保存 PATCH（不带 kind/scope） -->
+    <MacroTemplateForm
+      v-if="editing"
+      :key="editing.id"
+      mode="edit"
+      :template="editing"
+      @saved="onEditSaved"
+      @cancel="closeEdit"
+    />
 
     <!-- 列表 -->
     <table v-if="rows.length" data-test="macros-table" class="w-full border-collapse text-left text-sm">
@@ -388,6 +224,13 @@ onMounted(() => { void load(); });
           <td class="py-1 pr-2 font-mono" data-test="row-subs">{{ subscriberLabel(row) }}</td>
           <td class="py-1 pr-2">
             <div class="flex items-center gap-2">
+              <!-- 编辑（issue #759）：打开编辑表单改 name/params/audience（kind/scope 只读） -->
+              <button
+                type="button"
+                :data-test="'edit-' + row.id"
+                class="rounded border border-black/15 px-2 py-0.5 text-xs hover:bg-black/5"
+                @click="openEdit(row)"
+              >{{ t('admin.macros.edit') }}</button>
               <button
                 v-if="row.deleted_at == null"
                 type="button"
