@@ -1218,7 +1218,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   /**
-   * 试用台账 #10（根目录 ISSUES.md）：加载更早一批消息。
+   * 试用反馈 #10（原仓库根 `ISSUES.md`，已删 ⇒ 台账 §8.204）：加载更早一批消息。
    * 后端 keyset 分页早已完备（getSession `?cursor&limit`、events/history `?before&limit`，
    * 都返 next_cursor），但此前前端只取最新一窗且从不消费 next_cursor ⇒ 长会话「开头从
    * 压缩横幅开始」，最早的对话永远看不见（DB 里都在，不是压缩删的，纯读面缺陷）。
