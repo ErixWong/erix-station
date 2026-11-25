@@ -340,7 +340,7 @@ export function generateTraefikConfig({
     // 而登录页在管理台 host 上必须拿得到它，否则「不知道自己该不该在这」就是死锁。
     // ⚠ 本规则的允许面与下面 `admin-deny-api` 的排除列表**必须严格互补**：deny 优先级 300 > 本路由 200，
     // 漏一处就是「deny 把允许的那条吃掉」（A1 真机矩阵里 `/api/sessions` 在管理台入口 404 就是这个机制）。
-    lines.push(`      rule: ${yq(`Host(\`${adminHost}\`) && (PathPrefix(\`/api/auth\`) || PathPrefix(\`/api/me\`) || PathPrefix(\`/api/site\`) || PathPrefix(\`/api/preview-backend\`))`)}`);
+    lines.push(`      rule: ${yq(`Host(\`${adminHost}\`) && (PathPrefix(\`/api/auth\`) || PathPrefix(\`/api/me\`) || PathPrefix(\`/api/site\`))`)}`);
     lines.push('      priority: 200');
     lines.push(...adminMw);
     lines.push('      service: portal');
@@ -382,7 +382,7 @@ export function generateTraefikConfig({
     // 少一条就是「deny（300）把允许（200）吃掉」；`portal/test/routes.test.js` 的规则求值器把这条不变量写成断言。
     lines.push('    admin-deny-api:');
     lines.push(`      entryPoints: [${adminEntryPoint}]`);
-    lines.push(`      rule: ${yq(`Host(\`${adminHost}\`) && PathPrefix(\`/api\`) && !PathPrefix(\`/api/admin\`) && !PathPrefix(\`/api/auth\`) && !PathPrefix(\`/api/me\`) && !PathPrefix(\`/api/site\`) && !PathPrefix(\`/api/preview-backend\`)`)}`);
+    lines.push(`      rule: ${yq(`Host(\`${adminHost}\`) && PathPrefix(\`/api\`) && !PathPrefix(\`/api/admin\`) && !PathPrefix(\`/api/auth\`) && !PathPrefix(\`/api/me\`) && !PathPrefix(\`/api/site\`)`)}`);
     lines.push('      priority: 300');
     lines.push('      middlewares: [admin-deny]');
     lines.push('      service: noop@internal');
