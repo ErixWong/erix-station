@@ -17,7 +17,7 @@
 import { computed, reactive, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
-import { KINDS, KIND_SCHEMA, KIND_SCOPE } from '@shared/macro-kinds';
+import { KINDS, KIND_SCHEMA, KIND_SCOPE, AUDIENCES } from '@shared/macro-kinds';
 import { kindMessageKey } from '../lib/macroView';
 
 /** `KIND_SCHEMA` 的松散视图（shared 是 JS，无类型；这里只声明渲染要的字段）。 */
@@ -88,7 +88,7 @@ const tpl = props.mode === 'edit' ? props.template ?? null : null;
 const form = reactive<{ kind: string; name: string; audience: string; params: Record<string, unknown> }>({
   kind: tpl ? tpl.kind : '',
   name: tpl ? tpl.name : '',
-  audience: tpl ? tpl.audience : 'all',
+  audience: tpl ? tpl.audience : (AUDIENCES[0] ?? 'all'),
   // create：schema default；edit：模板已有值（含留空字段）。两条路径绝不相交。
   params: tpl ? cloneParams(tpl.params) : {},
 });
@@ -122,7 +122,14 @@ function isArrayChecked(key: string, value: unknown): boolean {
  * 保存：create ⇒ POST（带 kind/scope/enabled）；edit ⇒ PATCH（body **不含 kind/scope**）。
  * 成功：emit `saved`，新建再就地留一份预览（编辑由父组件关掉表单）。失败：错误文案留下、不清空、不关。
  */
+/** 提交中标记（审查 #1：防重复提交）。 */
+const submitting = ref(false);
+
 async function submit(): Promise<void> {
+  // 审查 #1：提交中没有防重 ⇒ 连点 / 重复回车会发两次 POST，后端 `(kind,name)` 索引**不是唯一索引**
+  // ⇒ 真的会留下两条模板。这里用 submitting 同时挡住「按钮可点」与「函数被重入」。
+  if (submitting.value) return;
+  submitting.value = true;
   submitError.value = null;
   try {
     if (isEdit.value) {
@@ -147,6 +154,9 @@ async function submit(): Promise<void> {
   } catch (e) {
     // 后端 400（validateKindParams / kind-scope 白名单）⇒ 原样显示、表单不关、输入不清空。
     submitError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    // 成败都复位：否则一次 400 之后按钮永久禁用（表单不关，用户改完也发不出去）。
+    submitting.value = false;
   }
 }
 
@@ -157,13 +167,34 @@ function cancel(): void {
 const createdPreview = computed(() => {
   const t0 = createdTpl.value;
   if (!t0) return '';
-  const vis = t0.audience === 'admin' ? t('admin.macros.audienceAdmin') : t('admin.macros.audienceAll');
+  const vis = audienceLabel(t0.audience);
   return `${t0.name} · ${t(kindMessageKey(t0.kind))} · ${vis}`;
 });
 
 const formTest = computed(() => (isEdit.value ? 'macros-edit-form' : 'macros-create-form'));
 const errorTest = computed(() => (isEdit.value ? 'edit-error' : 'create-error'));
 const submitTest = computed(() => (isEdit.value ? 'edit-submit' : 'create-submit'));
+/**
+ * 整数控件的变更处理（审查 #2）：**清空要删键，不是写 0**。
+ *
+ * 原来直接 `form.params[key] = Number(value)`，而 `Number('') === 0`：
+ * 可选整数（如 `max_per_day`，无 default、min=1）本该「省略」，清空后却提交 `0` ⇒ 后端
+ * `validateKindParams` 按 min 拒掉，用户看到的是一个莫名其妙的错误。
+ */
+function onIntChange(key: string, raw: string): void {
+  const v = String(raw ?? '').trim();
+  if (v === '') {
+    delete form.params[key]; // 空 = 不填（省略这个键），不是 0
+    return;
+  }
+  form.params[key] = Number(v);
+}
+
+/** `audience` 值 → 文案。**从 shared 枚举派生**，不抄字面量（审查 #5）。 */
+function audienceLabel(a: string): string {
+  return a === 'admin' ? t('admin.macros.audienceAdmin') : t('admin.macros.audienceAll');
+}
+
 const canSubmit = computed(() => (isEdit.value ? form.name.trim() !== '' : !!(form.kind && form.name)));
 </script>
 
@@ -214,8 +245,7 @@ const canSubmit = computed(() => (isEdit.value ? form.name.trim() !== '' : !!(fo
         {{ t('admin.macros.audience') }}
         <select v-model="form.audience" :data-test="isEdit ? 'edit-audience' : 'create-audience'"
           class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
-          <option value="all">{{ t('admin.macros.audienceAll') }}</option>
-          <option value="admin">{{ t('admin.macros.audienceAdmin') }}</option>
+          <option v-for="a in AUDIENCES" :key="a" :value="a">{{ audienceLabel(a) }}</option>
         </select>
       </label>
 
@@ -254,7 +284,7 @@ const canSubmit = computed(() => (isEdit.value ? form.name.trim() !== '' : !!(fo
             :min="spec.min"
             :max="spec.max"
             class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
-            @change="form.params[key] = Number(($event.target as HTMLInputElement).value)"
+            @change="onIntChange(key, ($event.target as HTMLInputElement).value)"
           >
 
           <input
@@ -279,7 +309,7 @@ const canSubmit = computed(() => (isEdit.value ? form.name.trim() !== '' : !!(fo
     <p v-if="submitError" :data-test="errorTest" class="syserr text-xs" role="alert">{{ submitError }}</p>
 
     <div class="flex gap-2">
-      <button type="submit" :data-test="submitTest" :disabled="!canSubmit"
+      <button type="submit" :data-test="submitTest" :disabled="!canSubmit || submitting"
         class="rounded bg-brand px-3 py-1 text-sm text-white disabled:opacity-50">
         {{ isEdit ? t('admin.macros.submitEdit') : t('admin.macros.submitCreate') }}
       </button>
