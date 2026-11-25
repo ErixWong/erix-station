@@ -14,6 +14,13 @@
 // 本地：`npm run check:ci-legs`（无 PG ⇒ 红 + 点名；有 PG ⇒ 绿）。
 // CI：质量门禁 job 在步骤 ② 之后注入 TEST_DATABASE_URL 跑同一支，绿才算过。
 //
+// 为什么不重试（#758）：这一闸过去对真库腿「红一次再跑一次」，理由是当时没有诊断面、
+// 无法区分「真 bug」与「环境抖」。诊断面装上（红时打 `not ok` 切片）当天就抓到根因：
+// 拆库时 pool 的 `error` 事件无监听者 ⇒ EventEmitter 直接抛（57P01），修在
+// portal/test/pg-fixture.js 的 guardPoolErrors，并加源码守卫禁止测试里裸建池
+// （portal/test/pg-fixture-error.test.js）。根因既已修且有守卫，重试只剩一个效果：
+// 把将来某条真 flake 变成一条**没人读的绿日志**。⇒ 不重试；要跑第二遍由人显式 rerun。
+//
 // 后续要把其余 test:integration:* 接进来，只往 REQUIRED_LEGS 里加一条即可。
 import { spawnSync } from 'node:child_process';
 import { buildDiagnosis } from './lib/leg-output.mjs';
@@ -28,14 +35,12 @@ const REQUIRED_LEGS = [
     why: '空库 → baseline → bootstrap → 全部增量迁移，只有全新库能证（#280）',
     argv: ['node', '--test', 'portal/test/migrate-fresh-db.test.js'],
     minPass: 5,
-    retryOnFailure: 1,
   },
   {
     id: 'npm run test:integration:prompts',
     why: 'platform_prompts 写侧真 SQL 执行 + 种行（FOR UPDATE 锁已存在行，#596）',
     argv: ['npm', 'run', 'test:integration:prompts'],
     minPass: 7,
-    retryOnFailure: 1,
   },
   {
     id: 'portal/test/api-tokens-db.test.js',
@@ -43,7 +48,6 @@ const REQUIRED_LEGS = [
       + '折 user 列面，四条假库抓不到的 SQL 回归（变异实测全红）',
     argv: ['node', '--test', 'portal/test/api-tokens-db.test.js'],
     minPass: 6,
-    retryOnFailure: 1,
   },
 ];
 
@@ -116,36 +120,17 @@ function main() {
 
   let green = true;
   for (const leg of REQUIRED_LEGS) {
-    const r1 = runLeg(leg);
-    const problems1 = evaluateLeg(r1, leg.minPass);
-    if (problems1.length === 0) {
-      console.log(summaryLine('OK ', leg, r1));
+    const r = runLeg(leg);
+    const problems = evaluateLeg(r, leg.minPass);
+    if (problems.length === 0) {
+      console.log(summaryLine('OK ', leg, r));
       continue;
     }
-    // 第 1 次红：无 retryOnFailure 的腿直接判红，真库腿走下面的显式重试。
-    if ((leg.retryOnFailure || 0) < 1) {
-      green = false;
-      console.log(summaryLine('红 ', leg, r1));
-      for (const p of problems1) console.log(`          ↳ ${p}`);
-      printDiagnosis(leg, leg.id, r1);
-      continue;
-    }
-    // 显式重试（不许静默）：先打出「要重试 + 第 1 次 rc」再跑第 2 次。
-    console.log(`SKIP-GATE [重试] ${leg.id} 第 2 次（第 1 次 rc=${r1.rc}）`);
-    const r2 = runLeg(leg);
-    const problems2 = evaluateLeg(r2, leg.minPass);
-    if (problems2.length === 0) {
-      // 靠重试才过 ⇒ 判绿，但必须留痕（静默重试会把真 bug 一起吞掉）。
-      console.log(summaryLine('OK ', leg, r2));
-      console.log(`SKIP-GATE [OK ] ${leg.id}（第 2 次通过，第 1 次 rc=${r1.rc}）`);
-      continue;
-    }
-    // 两次都红 ⇒ 仍判红，且把两次的 not ok 切片都打出来。
+    // 红就是红：不重试（见文件头「为什么不重试」）。
     green = false;
-    console.log(summaryLine('红 ', leg, r2));
-    for (const p of problems2) console.log(`          ↳ ${p}`);
-    printDiagnosis(leg, `${leg.id} 第1次`, r1);
-    printDiagnosis(leg, `${leg.id} 第2次`, r2);
+    console.log(summaryLine('红 ', leg, r));
+    for (const p of problems) console.log(`          ↳ ${p}`);
+    printDiagnosis(leg, leg.id, r);
   }
 
   if (!green) {
