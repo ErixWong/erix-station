@@ -64,7 +64,7 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     '      tls: {}',
     '    admin-auth:',
     '      entryPoints: [adminsecure]',
-    '      rule: "Host(`admin.localhost`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`) || PathPrefix(`/api/site`))"',
+    '      rule: "Host(`admin.localhost`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`) || PathPrefix(`/api/site`) || PathPrefix(`/api/preview-backend`))"',
     '      priority: 200',
     '      service: portal',
     '      tls: {}',
@@ -82,7 +82,7 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     '      service: noop@internal',
     '    admin-deny-api:',
     '      entryPoints: [adminsecure]',
-    '      rule: "Host(`admin.localhost`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`) && !PathPrefix(`/api/site`)"',
+    '      rule: "Host(`admin.localhost`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`) && !PathPrefix(`/api/site`) && !PathPrefix(`/api/preview-backend`)"',
     '      priority: 300',
     '      middlewares: [admin-deny]',
     '      service: noop@internal',
@@ -916,7 +916,7 @@ test('#450 管理台三条路由：adminsecure 入口 + admin host + tls:{} + �
 
   const auth = http.routers['admin-auth'];
   assert.deepEqual(auth.entryPoints, ['adminsecure']);
-  assert.equal(auth.rule, 'Host(`admin.fde.erix.vip`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`) || PathPrefix(`/api/site`))');
+  assert.equal(auth.rule, 'Host(`admin.fde.erix.vip`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`) || PathPrefix(`/api/site`) || PathPrefix(`/api/preview-backend`))');
   assert.equal(auth.priority, 200);
   assert.deepEqual(auth.tls, {});
 
@@ -945,7 +945,7 @@ test('#450 两条 deny 路由：规则 / 优先级 / 指向 noop@internal（不�
   assert.deepEqual(denyApi.entryPoints, ['adminsecure']);
   assert.equal(
     denyApi.rule,
-    'Host(`admin.fde.erix.vip`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`) && !PathPrefix(`/api/site`)',
+    'Host(`admin.fde.erix.vip`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`) && !PathPrefix(`/api/site`) && !PathPrefix(`/api/preview-backend`)',
   );
   assert.equal(denyApi.priority, 300);
   assert.deepEqual(denyApi.middlewares, ['admin-deny']);
