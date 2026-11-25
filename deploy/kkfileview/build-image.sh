@@ -11,6 +11,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 VER=5.0.3
+# 打包工具链镜像（可覆盖：本机 docker.io 的 registry mirror 对 maven 镜像会拉不下来，
+# 用 `MAVEN_IMAGE=public.ecr.aws/docker/library/maven:3.9-eclipse-temurin-21 ./build-image.sh` 绕过）。
+MAVEN_IMAGE="${MAVEN_IMAGE:-maven:3.9-eclipse-temurin-21}"
 TAG=erix-station/kkfileview:${VER}
 BASE_TAG=erix-station/kkfileview-base:${VER}
 SRC=/tmp/kkbuild/kkFileView-${VER}
@@ -29,7 +32,11 @@ if [ "${1:-}" != "--dist-only" ]; then
   # maven-assembly 往 tar 里写挂载文件的属主会报「group id is too big」（POSIX tar 字段上限），
   # 容器内本地文件是 uid/gid 0 就没这问题——真机踩过（v5.0.3 首建）。
   mkdir -p /tmp/kkm2 /tmp/kkdist
-  docker run --rm -v "$SRC":/src:ro -v /tmp/kkm2:/root/.m2 -v /tmp/kkdist:/out ubuntu:noble \
+  # ⚠ 打包必须在**带 JDK+maven 的镜像**里跑（`maven:3.9-eclipse-temurin-21`，与 Dockerfile 头注释
+  #   给的手工命令同源）。曾经这里写的是 `ubuntu:noble` ⇒ 镜像里既无 mvn 也无 JDK ⇒
+  #   `mvn: command not found` + 退出码 127，脚本在 `docker build` 之前就死（issue #493 现验）。
+  docker run --rm -v "$SRC":/src:ro -v /tmp/kkm2:/root/.m2 -v /tmp/kkdist:/out \
+    "$MAVEN_IMAGE" \
     bash -c 'mkdir -p /build-kk && cp -r /src/. /build-kk/ && cd /build-kk && mvn -B -q -DskipTests -pl server -am package && cp server/target/kkFileView-'"${VER}"'.tar.gz /out/'
   rm -rf "$DIST_DIR" && mkdir -p "$DIST_DIR" && \
     tar -xzf /tmp/kkdist/kkFileView-${VER}.tar.gz -C "$DIST_DIR"

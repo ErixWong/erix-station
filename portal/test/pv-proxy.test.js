@@ -12,7 +12,7 @@ import path from 'node:path';
 import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import { hashToken } from '../src/auth.js';
-import { signPreviewCode } from '../src/previewproxy.js';
+import { pvForwardPath, signPreviewCode } from '../src/previewproxy.js';
 import { FakePool } from './fake-pool.js';
 
 const SECRET = 'test-pv-signing-key';
@@ -287,4 +287,23 @@ test('/pv 子资源：js/css 透传原 query，转发头带 x-forwarded-prefix�
   } finally {
     await s.close();
   }
+});
+
+// issue #493 真机验收发现的缺口：`KK_OFFICE_PREVIEW_TYPE=pdf` 时 kk 的预览页会内嵌
+// `/pdfjs/web/viewer.html?file=…`（3 段），而旧白名单只有 `js/ css/ images/` 三个静态目录
+// ⇒ 该请求被挡成 404，模态框里只剩一段 JSON（真机截图实证）。
+// 同时补一条**前缀放行必须逐段禁点段**：`js/../admin` 不许靠前缀绕过精确匹配。
+test('/pv 路径白名单：pdfjs 静态目录放行；点段不许靠前缀绕过（#493）', () => {
+  assert.equal(pvForwardPath('pdfjs/web/viewer.html'), '/pdfjs/web/viewer.html');
+  assert.equal(pvForwardPath('/pdfjs/build/pdf.mjs'), '/pdfjs/build/pdf.mjs');
+  assert.equal(pvForwardPath('pdfjs/web/viewer.css'), '/pdfjs/web/viewer.css');
+  // 原有三个静态目录照旧
+  assert.equal(pvForwardPath('js/app.js'), '/js/app.js');
+  // 点段拦截：前缀命中也要逐段过闸
+  assert.equal(pvForwardPath('js/../admin'), null);
+  assert.equal(pvForwardPath('pdfjs/../secret'), null);
+  // 精确路由仍不许前缀命中
+  assert.equal(pvForwardPath('onlinePreviewXss'), null);
+  // 空路径归一到 index（存活探针）
+  assert.equal(pvForwardPath(''), '/index');
 });

@@ -31,7 +31,7 @@ export const KK_TRUST_HOST = 'station-preview.internal';
  * 命名路由精确匹配（非前缀：防 `onlinePreviewXss` 这种前缀命中）；静态目录才按前缀。
  */
 const KK_EXACT = new Set(['onlinePreview', 'picturesPreview', 'previewOnline', 'previewFile', 'addTask', 'task', 'deleteTask', 'fileType', 'info', 'index', 'favicon.ico']);
-const KK_DIRS = ['js/', 'css/', 'images/'];
+const KK_DIRS = ['js/', 'css/', 'images/', 'pdfjs/'];
 
 /**
  * 转换产物透传（真机实证：kk 把产物挂 web 根，模板生成 `/testdocx.pdf` 形态引用；pdf 图块
@@ -45,7 +45,12 @@ const KK_SEG_RE = /^[\w\u0080-\uFFFF .\-]+$/;
 export function pvForwardPath(subPath) {
   const p = String(subPath ?? '').replace(/^\/+/, '');
   const effective = p === '' ? 'index' : p;
-  if (KK_EXACT.has(effective) || KK_DIRS.some((d) => effective.startsWith(d))) return `/${effective}`;
+  if (KK_EXACT.has(effective)) return `/${effective}`;
+  if (KK_DIRS.some((d) => effective.startsWith(d))) {
+    // 静态目录按前缀放行，但**逐段**禁 `.`/`..`/空段：否则 `js/../admin` 这类会绕过精确匹配。
+    const dirSegs = effective.split('/');
+    return dirSegs.every((seg) => seg !== '.' && seg !== '..') ? `/${effective}` : null;
+  }
   const segs = p.split('/');
   if (segs.length <= 2 && segs.every((s) => s.length > 0 && s !== '.' && s !== '..' && KK_SEG_RE.test(s))) {
     const last = segs.at(-1);

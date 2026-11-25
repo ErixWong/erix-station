@@ -2591,7 +2591,7 @@ JSON 通道的 415/413 同时写 `preview_miss_stats` 埋点（见下）。
 响应**不含 base URL 本身**。前端 kkfile 通道据此渲染 iframe 或降级到下载。
 
 **`GET/HEAD /pv/<code>/**`（反代闸门，非 JSON API）**：浏览器永远看不到 kk 真实地址。每请求依序过：
-会话 cookie（401）→ 能力码验签（404）→ 子路径白名单（kk 已知路由 + `js/css/images` 静态目录，越界 404）
+会话 cookie（401）→ 能力码验签（404）→ 子路径白名单（kk 已知路由 + `js/css/images/pdfjs` 静态目录，越界 404；`pdfjs/` 是 #493 真机补的——`KK_OFFICE_PREVIEW_TYPE=pdf` 时预览页内嵌 `/pdfjs/web/viewer.html?file=…`，旧白名单只有前三个目录 ⇒ 该请求被挡成 404、模态框里只剩一段 JSON；静态目录按前缀放行但**逐段禁 `.`/`..`**，`js/../admin` 不能靠前缀绕过精确匹配）
 → 归属（`payload.u` ≠ 会话用户 403）→ 时效（过期 403 `preview_code_expired`）→ 把 `onlinePreview` 的
 `url` 参数**重写**为 portal 自产的 `file://<userSpaceRoot>/<p>`（base64，SSRF 根：用户的 URL 永远到不了 kk）。
 响应头消毒（剥 kk 的 XFO/CSP/Set-Cookie，注入 portal 的 `SAMEORIGIN` + CSP + `no-store`）；链接回闸门
