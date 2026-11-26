@@ -399,6 +399,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   // 若立刻把那句话画成 user 气泡，会排在旧 run 终稿**上面**（倒序）。这个在飞句柄让 adoptDeliveredMessage
   // 先等它落地再落气泡。会话级状态，不进 store 公开面（与 renderedIds / olderMessagesCursor 同族）。
   let refreshInFlight: Promise<void> | null = null;
+  // issue #799（评审 R3）：最近一次**权威快照**（refreshSession / openSession 首屏）里出现过的消息 id 集。
+  // sessionMessageCount 是后端权威值（#197）：投递那条若已在那次响应里被算过，就不得再手工 +1（否则头部计数多一条）。
+  // 会话级状态，不进 store 公开面（与 refreshInFlight / olderMessagesCursor 同族）。
+  let lastRefreshedIds: Set<string> | null = null;
   const inputValue = ref(''); // composer 输入（旧 $('input').value）
   // issue #370：输入队列（运行中说话）。**服务端是唯一真相**（`queued_inputs` 表），本 ref 只是投影：
   //   * 入队成功 → 本地先乐观插一条（消除「点了没反应」的空窗）；
@@ -455,7 +459,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       markRunTerminationRendered(d.run_id);
       // issue #799：记下这次终态补拉的在飞句柄，让紧随其后的队列投递帧先等它落地再落气泡（防倒序）。
       // `.finally` 必须清，否则一次失败就永久「等在飞」。
-      refreshInFlight = refreshSession(d.run_id).finally(() => { refreshInFlight = null; });
+      // 自比式清理：只清自己那一笔（口径同 #800 的归属校验——迟到那笔的 finally 不许清掉
+      // 新会话/新一轮刚登记的句柄，否则随后的投递帧不再等终稿 ⇒ 倒序回来）。
+      const inflight = refreshSession(d.run_id).finally(() => { if (refreshInFlight === inflight) refreshInFlight = null; });
+      refreshInFlight = inflight;
       repullHistorySynthItems(d); // issue #306（#236 起同时喂终态分隔条）：补一次 history
     },
     // issue #88：自动标题刷新 → 原地更新会话列表项（比整表 loadSessions 轻；后续列表刷新仍是兜底）。
@@ -1163,6 +1170,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     resetDelegateSurface(); // issue #592：离开会话/换账号同样不得把上一个 run 的子 run 抽屉与面板留给下一个（会话级视图态）
     renderedIds.value = new Set();
     refreshInFlight = null; // issue #799：旧会话没落完的终态补拉不得泄漏到新会话（口径同 olderMessagesCursor）
+    lastRefreshedIds = null; // R3：旧会话的权威快照 id 集不得泄漏到新会话（口径同 olderMessagesCursor）
     entries.value = [];
     sessionMessageCount.value = null; // #197：先清旧会话的计数，加载失败/竞态丢弃时不得串会话残留
     sessionCompaction.value = null; // #451：压缩累计同属会话级状态，不得串会话残留
@@ -1196,6 +1204,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       && Number.isFinite(data.session.message_count)
       ? data.session.message_count
       : null;
+    // R3（评审第 3 条）：首屏同源——记下首屏权威快照的消息 id 集（与 refreshSession 同口径）。
+    lastRefreshedIds = new Set((data.messages ?? []).map((m) => String(m.id)));
     // #451：压缩累计（键缺席 ⇒ null ⇒ 不渲染；脏值 ⇒ 归一化成 null，绝不渲染半截汇总）。
     sessionCompaction.value = normalizeSessionCompaction(data.session?.compaction);
     // issue #370：刷新 / 切会话 / 断线重连后的队列补齐（`queue_update` 是 live-only、不落库，
@@ -1499,6 +1509,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     resetDelegateSurface(); // issue #592：离开会话/换账号同样不得把上一个 run 的子 run 抽屉与面板留给下一个（会话级视图态）
     renderedIds.value = null;
     refreshInFlight = null; // issue #799：会话级在飞句柄同属复位面（口径同 olderMessagesCursor）
+    lastRefreshedIds = null; // R3：权威快照 id 集同属复位面（口径同 olderMessagesCursor）
     inputValue.value = '';
     streamDefaultText();
     workbenchHooks.onClearRoute?.();
@@ -1718,6 +1729,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
    * 幂等靠 `renderedIds`（与 addMessage / 历史补拉同一去重集）：先等的终态补拉若已渲染过它 ⇒ 跳过。
    */
   async function adoptDeliveredMessage(maybe: unknown) {
+    // R1（评审第 1 条）：进入时先捕获会话代次——`refreshInFlight` 被置空**不会**取消已经在等它的回调，
+    // 所以 await 期间用户若切了会话，只能在 await 之后靠代次比对丢弃（口径同 refreshSession 的三重守卫）。
+    const sid = sessionId.value;
+    const reqSeq = sessionReqSeq.value;
+    const ctx = ctxSeq.value;
     // 形状严格校验：非对象 / 缺 id / content 非字符串 ⇒ 整段跳过（不渲染空气泡、不动计数）。
     if (!maybe || typeof maybe !== 'object') return;
     const m = maybe as Record<string, unknown>;
@@ -1727,10 +1743,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (refreshInFlight) {
       try { await refreshInFlight; } catch { /* 补拉失败不该吃掉那句话 */ }
     }
+    // R1（评审第 1 条）：await 期间可能已换会话 ⇒ 代次不符就整段丢弃（气泡与计数都不动）。
+    if (sessionId.value !== sid || sessionReqSeq.value !== reqSeq || ctxSeq.value !== ctx) return;
     if (renderedIds.value?.has(m.id)) return; // 已被刷新/历史回放渲染过 ⇒ 不重复、也不重复计数
     addMessage(m as unknown as ChatMessage);
-    // #197 头部计数是后端权威值：不能让它比屏幕上的气泡少一条；null（不可得）保持 null，别把「不可得」编成 1。
-    if (typeof sessionMessageCount.value === 'number' && Number.isFinite(sessionMessageCount.value)) {
+    // #197 头部计数是后端权威值，手工 +1 只在「那次权威值里还没有它」时才是对的：若最近一次权威快照
+    // （lastRefreshedIds）已含这条 ⇒ 计数已含它，再 +1 就多一条；null（不可得）保持 null，别把「不可得」编成 1。
+    if (typeof sessionMessageCount.value === 'number' && Number.isFinite(sessionMessageCount.value)
+      && !lastRefreshedIds?.has(String(m.id))) {
       sessionMessageCount.value += 1;
     }
   }
@@ -1864,6 +1884,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         && Number.isFinite(data.session.message_count)
         ? data.session.message_count
         : null;
+      // R3（评审第 3 条）：记下这次权威快照含哪些消息 id，供 adoptDeliveredMessage 判断那条是否已被算过。
+      lastRefreshedIds = new Set((data.messages ?? []).map((m) => String(m.id)));
       // #451：run 终态后重取详情——压缩累计同样刷新（本 run 新折的轮数要立刻可见）。
       sessionCompaction.value = normalizeSessionCompaction(data.session?.compaction);
       const msgs = data.messages.filter((m) => m.run_id === runId && m.role === 'assistant' && !m.synthetic);
