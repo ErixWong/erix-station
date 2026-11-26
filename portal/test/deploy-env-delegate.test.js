@@ -4421,3 +4421,227 @@ test('#587-S2-⑪ 拷贝别名被参数 / 块声明遮蔽 ⇒ 遮蔽区间内 e.
 });
 
 export { scanEnvReads, scanEnvKeys, analyzeEnvReads, scanTargets };
+
+// ===========================================================================
+// 活三（#677 P3 第七批）：delegate 三个数值旋钮**搬进管理台运行时设置**之后的新判据。
+//
+// 本文件旧版那三条腿钉的是「compose → provisioner 注入 → proxy 放行，且 compose 默认 == 代码默认」，
+// 它对「注入的**值**从哪来」是瞎的：旧写法 `Number(process.env.ERIX_DELEGATE_MAX) || 2` 是启动期
+// env 快照，管理台改了也白改。接线之后注入源换成建容器时现读 registry（`resolveDelegateEnv`：
+// DB > env（过闸）> registry 默认），于是本段把判据补成「**注入容器的值 == registry 现读值**」：
+//   活三① 三档取值的等式（DB / env / 默认，默认仍 == runner 代码默认 ⇒ 腿③ 的等式没被搬坏）
+//   活三② 非法 DB 值 ⇒ 回落 env；env 也非法 ⇒ 回落默认 + 点名 warn（回落链在 provisioner 侧也成立）
+//   活三③ buildContainerConfig 注的就是那个现读值，且**不再**自己读 process.env 那三格
+//   活三④ ensureFdeContainer 在建容器前现读（真 reader + 假库），且生产调用点把 pool/config 递下去
+//
+// 红法（每条都是把产品改坏就能红，不靠改判据）：
+//   ① 把 `resolveDelegateEnv` 里任一 `read*` 换回 env 快照 ⇒ 取不到 DB 值；
+//   ② 让非法 DB 值直接透出去（不回落）⇒ 那条断言红；
+//   ③ 把 Env 行改回 `Number(process.env.ERIX_DELEGATE_MAX) || 2` ⇒ 「含 delegateEnv」与
+//      「剥注释后不含 process.env.ERIX_DELEGATE_*」两条同时红；
+//   ④ 把 `ensureFdeContainer` 里那次 await 删掉 / 或调用点不再传 `pool` ⇒ 注入值变回默认。
+// ===========================================================================
+
+const RS7 = await import('../src/runtime-settings.js');
+const PROV7 = await import(PROVISIONER.href);
+
+/** 假 `runtime_settings` 表（形状同 `runtime-settings.test.js` 的 `ttlPool`：只回 key/value 两列）。 */
+function settingPool(rows = []) {
+  return {
+    async query() {
+      return { rows: rows.map((r) => ({ key: r.key, value: r.value })), rowCount: rows.length };
+    },
+  };
+}
+
+function collectLog() {
+  const seen = { warn: [], debug: [] };
+  return {
+    seen,
+    debug: (m) => seen.debug.push(String(m)),
+    warn: (m) => seen.warn.push(String(m)),
+    error: (m) => seen.warn.push(String(m)),
+  };
+}
+
+/** 三格的热读槽是模块级的 ⇒ 每档之间必须自己抹掉，否则测的是缓存不是回落链。 */
+function invalidateDelegateCaches() {
+  RS7.invalidateDelegateMaxCache();
+  RS7.invalidateDelegateChildRoundsCache();
+  RS7.invalidateDelegateChildTimeoutMsCache();
+}
+
+const DELEGATE_TRIPLE = {
+  keyMax: 'delegate.max', keyRounds: 'delegate.child_rounds', keyTimeout: 'delegate.child_timeout_ms',
+};
+
+test('活三① resolveDelegateEnv == registry 现读值：DB > env（过闸）> registry 默认（默认仍 == runner）',
+  async () => {
+    invalidateDelegateCaches();
+    const fromDb = await PROV7.resolveDelegateEnv({
+      pool: settingPool([
+        { key: DELEGATE_TRIPLE.keyMax, value: 7 },
+        { key: DELEGATE_TRIPLE.keyRounds, value: 20 },
+        { key: DELEGATE_TRIPLE.keyTimeout, value: 120_000 },
+      ]),
+      config: {}, env: { ERIX_DELEGATE_MAX: '3' }, log: collectLog(),
+    });
+    assert.deepEqual(fromDb, { max: 7, childRounds: 20, childTimeoutMs: 120_000 },
+      '库里有有效值 ⇒ 注进容器的必须是它（管理台改了必须看得见生效，这是本批的全部意义）');
+    invalidateDelegateCaches();
+
+    const fromEnv = await PROV7.resolveDelegateEnv({
+      pool: settingPool([]), config: {},
+      env: { ERIX_DELEGATE_MAX: '5', ERIX_DELEGATE_CHILD_ROUNDS: '16', ERIX_DELEGATE_CHILD_TIMEOUT_MS: '90000' },
+      log: collectLog(),
+    });
+    assert.deepEqual(fromEnv, { max: 5, childRounds: 16, childTimeoutMs: 90_000 },
+      '库里没这一行 ⇒ env 兜底位仍要生效（compose 那行保留就是为了这一档，双读不许断）');
+    invalidateDelegateCaches();
+
+    const fromDefault = await PROV7.resolveDelegateEnv({
+      pool: settingPool([]), config: {}, env: {}, log: collectLog(),
+    });
+    const code = runnerDefaults();
+    assert.deepEqual(fromDefault, {
+      max: Number(code.ERIX_DELEGATE_MAX),
+      childRounds: Number(code.ERIX_DELEGATE_CHILD_ROUNDS),
+      childTimeoutMs: Number(code.ERIX_DELEGATE_CHILD_TIMEOUT_MS),
+    }, '三档都没有 ⇒ registry 默认，且它必须仍等于 runner 的代码默认（腿③ 那条等式的现读版）');
+    invalidateDelegateCaches();
+  });
+
+test('活三② 非法 DB 值 ⇒ 回落 env；env 也非法 ⇒ 回落默认 + 点名 key 与 envVar 的 warn', async () => {
+  // 库里是越界值（管理台存不进，但运维手改库能造出来）⇒ 不许透出去，回落 env。
+  invalidateDelegateCaches();
+  const bad = await PROV7.resolveDelegateEnv({
+    pool: settingPool([{ key: DELEGATE_TRIPLE.keyMax, value: 999 }]),
+    config: {}, env: { ERIX_DELEGATE_MAX: '4' }, log: collectLog(),
+  });
+  assert.equal(bad.max, 4, '非法 DB 值必须被闸拦下并回落 env（越界值进容器 = 界面说的数不算数）');
+  invalidateDelegateCaches();
+
+  // env 侧走**同一道闸**：`1e3` 这种字符串写法 env 拒（PUT body 侧才收，见 RS-31b 口径）。
+  const log = collectLog();
+  const worse = await PROV7.resolveDelegateEnv({
+    pool: settingPool([{ key: DELEGATE_TRIPLE.keyTimeout, value: 'abc' }]),
+    config: {}, env: { ERIX_DELEGATE_CHILD_TIMEOUT_MS: '1e3' }, log,
+  });
+  assert.equal(worse.childTimeoutMs, Number(runnerDefaults().ERIX_DELEGATE_CHILD_TIMEOUT_MS),
+    'DB 坏 + env 也坏 ⇒ 回落 registry 默认（绝不把垃圾值注进容器）');
+  const warns = log.seen.warn.join('\n');
+  assert.ok(warns.includes('ERIX_DELEGATE_CHILD_TIMEOUT_MS') && warns.includes('delegate.child_timeout_ms'),
+    '回落必须留一条同时点名 registry key 与 envVar 的 warn（否则值班的人不知道是哪一档没生效）');
+  invalidateDelegateCaches();
+});
+
+const CONTAINER_ARGS = {
+  fdeName: 'w677', containerName: 'fde-w677', image: 'img:desired', cmd: ['-port', '4000'],
+  networkName: 'fde-w677', ip: '10.200.1.2', gateway: '10.200.1.1', baseDomain: 'localhost',
+  llmHost: 'llm.localhost', portalPublicBaseUrl: 'https://station.localhost',
+  userSpaceRoot: '/srv/erix/users',
+};
+const DELEGATE_ENV_LINES = [
+  ['ERIX_DELEGATE_MAX', 'max'],
+  ['ERIX_DELEGATE_CHILD_ROUNDS', 'childRounds'],
+  ['ERIX_DELEGATE_CHILD_TIMEOUT_MS', 'childTimeoutMs'],
+];
+
+test('活三③ buildContainerConfig 注的就是现读值；那三格不再自己读 process.env（快照已搬走）', () => {
+  const body = PROV7.buildContainerConfig({
+    ...CONTAINER_ARGS, delegateEnv: { max: 6, childRounds: 14, childTimeoutMs: 90_000 },
+  });
+  assert.ok(body.Env.includes('ERIX_DELEGATE_MAX=6'), 'max 必须是现读值原样下发');
+  assert.ok(body.Env.includes('ERIX_DELEGATE_CHILD_ROUNDS=14'), 'child_rounds 必须是现读值原样下发');
+  assert.ok(body.Env.includes('ERIX_DELEGATE_CHILD_TIMEOUT_MS=90000'),
+    'child_timeout_ms 必须是现读值原样下发（不许被二次加工）');
+
+  // 没现读 ⇒ 只能是 registry 默认，**不许**偷偷回退成「自己再读一次 process.env」那第二份真相。
+  const prev = process.env.ERIX_DELEGATE_MAX;
+  process.env.ERIX_DELEGATE_MAX = '7';
+  try {
+    const bare = PROV7.buildContainerConfig({ ...CONTAINER_ARGS });
+    assert.ok(bare.Env.includes(`ERIX_DELEGATE_MAX=${RS7.DELEGATE_MAX_DEFAULT}`),
+      '调用方没现读 ⇒ 给说得出名字的默认（env 那一档由 hot reader 负责，不在这里再读一遍）');
+  } finally {
+    if (prev === undefined) delete process.env.ERIX_DELEGATE_MAX;
+    else process.env.ERIX_DELEGATE_MAX = prev;
+  }
+
+  // 源码级：三行必须取 `delegateEnv?.…`，整段（剥掉注释后）不许再出现 `process.env.ERIX_DELEGATE_*`
+  // ——「注释里说了改成现读」不算，判据只认代码位（口径同本文件 `$comment` ⑥）。
+  const src = fs.readFileSync(PROVISIONER, 'utf8');
+  const start = src.indexOf('export function buildContainerConfig');
+  const end = src.indexOf('\n}\n', start);
+  const section = stripComments(src.slice(start, end));
+  for (const [, field] of DELEGATE_ENV_LINES) {
+    assert.ok(section.includes(`delegateEnv?.${field}`), `Env 段里那一行必须取 delegateEnv?.${field}`);
+  }
+  assert.equal(
+    /process\.env\.ERIX_DELEGATE_(MAX|CHILD_ROUNDS|CHILD_TIMEOUT_MS)\b/.test(section), false,
+    '那三格的 process.env 快照必须已经搬走（留着就是第二份真相：改了库、这一行还会赢）');
+});
+
+test('活三④ ensureFdeContainer 建容器前现读（真 reader + 假库）；生产调用点必须把 pool/config 递下去',
+  async () => {
+    invalidateDelegateCaches();
+    let captured = null;
+    const docker = {
+      async inspectContainer() { return { status: 404, data: null }; },
+      async createContainer(body) { captured = body; return { status: 201, data: { Id: 'ctr-w677' } }; },
+      async startContainer() { return { status: 204 }; },
+    };
+    await PROV7.ensureFdeContainer(docker, CONTAINER_ARGS, {
+      log: collectLog(),
+      pool: settingPool([{ key: DELEGATE_TRIPLE.keyRounds, value: 24 }]),
+      config: {}, env: {},
+    });
+    assert.ok(captured?.Env?.includes('ERIX_DELEGATE_CHILD_ROUNDS=24'),
+      '建容器那一刻现读的 DB 值必须出现在 create body 的 Env 里（这条链断在何处，注入值就会变回默认）');
+    invalidateDelegateCaches();
+
+    // 生产调用点：`reconcileOnce` 与 `onboardFde` 都得把 pool/config 递下去，否则 DB 那一档读不到
+    //（热读没有池子会安静地落 env/默认 —— 那种「不报错的不生效」正是本段要拦的形状）。
+    const src = fs.readFileSync(PROVISIONER, 'utf8');
+    const code = stripComments(src);
+    // ⚠ 必须**按函数体分段**再断言（评审返修）：旧写法是两条打在整份源码上的正则，而第二条那个
+    // `ensureFdeContainer\([\s\S]{0,800}?\{…\}` 能一路匹到位置更靠前的 `reconcileOnce` 那两处 ⇒
+    // `onboardFde` 里漏传（`{ log, pool, config }` 改成 `{ log }`）时两条仍可能全绿。
+    // 切片口径：从函数头起，到下一个**顶层** `export ` 之前（`stripComments` 把注释刷成空格、
+    // 行列位不变 ⇒ 行首 `export ` 这个锚点在剥注释后的文本里仍然站得住）。
+    const fnBody = (label, header) => {
+      const start = code.indexOf(header);
+      assert.ok(start >= 0, `${header} 在源码里找不到 ⇒ 切片前提没了（改名/搬文件），先修这里再说调用点`);
+      const nextExport = code.indexOf('\nexport ', start + header.length);
+      const body = code.slice(start, nextExport === -1 ? code.length : nextExport);
+      assert.ok(body.length > 500,
+        `${label} 的切片只有 ${body.length} 字符 ⇒ 切片可疑（切窄了会把调用切到段外，判据退化成恒真）`);
+      return body;
+    };
+    const problems = [];
+    for (const [label, header] of [
+      ['reconcileOnce（周期对账：首建 + token 失配重建）', 'export async function reconcileOnce'],
+      ['onboardFde（开户路径）', 'export async function onboardFde'],
+    ]) {
+      const body = fnBody(label, header);
+      // 先钉「这一段里真的有调用」：0 处时「每一处都递了 pool/config」是恒真的（切片切错就属于这种）。
+      const callCount = (body.match(/ensureFdeContainer\s*\(/g) ?? []).length;
+      if (callCount < 1) {
+        problems.push(`${label} 里一处 ensureFdeContainer 调用都没切到 ⇒ 本段判据恒真（切片失效）`);
+      }
+      // 每一处调用都得带 pool/config：个数必须与调用点数持平（少一个就是有人漏传）。
+      const pairCount = (body.match(/\{\s*log,\s*pool,\s*config\s*\},?\s*\)/g) ?? []).length;
+      if (pairCount !== callCount) {
+        problems.push(`${label}：${callCount} 处 ensureFdeContainer 调用里只有 ${pairCount} 处带`
+          + ' { log, pool, config } ⇒ 漏传那条链建容器时读不到 DB 那一档，安静落 env/默认');
+      }
+    }
+    // 两条路径各自查完再一次断言（不是 fail-fast）：坏一处只会报出那一格，另一格的结论仍然被跑过。
+    assert.deepEqual(problems, [],
+      '每一处 ensureFdeContainer 生产调用点都必须把 pool/config 递下去（两条路径各查各的函数体，互不顶包）');
+    // 形状也钉住（别只靠上面那个宽松匹配）：reconcile 那两处就是单行 `docker, opts, { log, pool, config }`。
+    assert.ok(
+      /ensureFdeContainer\(docker, opts, \{ log, pool, config \}\)/
+        .test(fnBody('reconcileOnce', 'export async function reconcileOnce')),
+      'reconcile 的重建路径必须把 pool/config 递给 ensureFdeContainer');
+  });

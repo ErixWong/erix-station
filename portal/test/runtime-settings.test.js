@@ -86,7 +86,25 @@ import {
   readSessionRenewIntervalSeconds, invalidateSessionRenewIntervalCache,
   readMaxPasswordLength, invalidateMaxPasswordLengthCache,
   readMaxLoginLength, invalidateMaxLoginLengthCache,
+  DELEGATE_MAX_KEY, DELEGATE_MAX_MIN, DELEGATE_MAX_MAX, DELEGATE_MAX_DEFAULT, DELEGATE_MAX_HINT,
+  DELEGATE_CHILD_ROUNDS_KEY, DELEGATE_CHILD_ROUNDS_MIN, DELEGATE_CHILD_ROUNDS_MAX,
+  DELEGATE_CHILD_ROUNDS_DEFAULT, DELEGATE_CHILD_ROUNDS_HINT,
+  DELEGATE_CHILD_TIMEOUT_MS_KEY, DELEGATE_CHILD_TIMEOUT_MS_MIN, DELEGATE_CHILD_TIMEOUT_MS_MAX,
+  DELEGATE_CHILD_TIMEOUT_MS_DEFAULT, DELEGATE_CHILD_TIMEOUT_MS_HINT,
+  parseDelegateMax, validateDelegateMax,
+  parseDelegateChildRounds, validateDelegateChildRounds,
+  parseDelegateChildTimeoutMs, validateDelegateChildTimeoutMs,
+  readDelegateMax, invalidateDelegateMaxCache,
+  readDelegateChildRounds, invalidateDelegateChildRoundsCache,
+  readDelegateChildTimeoutMs, invalidateDelegateChildTimeoutMsCache,
 } from '../src/runtime-settings.js';
+// P3 第七批的值域与默认**不是自己发明的**：逐条抄自 runner 侧已有的钳位 ⇒ 同源关系直接钉住
+//（抄错一个数字 = 管理台能存下一个容器里根本不认的数）。
+import {
+  parseDelegateMax as runnerParseDelegateMax,
+  parseDelegateChildRounds as runnerParseDelegateChildRounds,
+  parseDelegateChildTimeoutMs as runnerParseDelegateChildTimeoutMs,
+} from '../../runner/lib/config.js';
 import { MAX_BACKOFF_MS_SAFE } from '../src/loop-timing.js';
 import {
   IDLE_BACKOFF_MAX_MS_DEFAULT as ONBOARDING_LOOP_DEFAULT,
@@ -633,10 +651,12 @@ test('RS-6b 审计被抑制 ⇒ 抛 500 且**设置没落库**（检查在 COMMI
 
 test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_days'
   + ' + preview.ticket_ttl_seconds + session.auto_title_min_new + preview.session_ttl_seconds'
-  + ' + 三个退避旋钮 + 四个认证旋钮（#677 Tier 2A）', async () => {
+  + ' + 三个退避旋钮 + 四个认证旋钮（#677 Tier 2A）'
+  + ' + delegate 子 run 三格（#677 P3 第七批）', async () => {
   // P1 时这一格钉的是「registry 是空对象」；P2a 迁了第一格 ⇒ 判据改成「只迁了这一格」；
-  // P3 各批逐格迁到八格；#677 Tier 2A 一次迁四个「无状态、每请求读」的认证旋钮
-  // ⇒ 判据改成「就这十二格，不多不少」。
+  // P3 各批逐格迁到八格；#677 Tier 2A 一次迁四个「无状态、每请求读」的认证旋钮；
+  // P3 第七批迁 delegate 三格（**第一批不是热改的**，见下面钉 applyMode）
+  // ⇒ 判据改成「就这十五格，不多不少」。
   // 它红了的读法不变：有人顺手多迁了一格（或把热读口径弄丢了）。
   assert.deepEqual(Object.keys(RUNTIME_SETTING_REGISTRY),
     ['session.ttl_seconds', 'workspace.retention_days', 'preview.ticket_ttl_seconds',
@@ -644,8 +664,9 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
       'loop.onboarding_idle_backoff_ms', 'loop.offboarding_idle_backoff_ms',
       'loop.provisioner_idle_backoff_ms',
       'auth.pending_token_ttl_seconds', 'auth.session_renew_interval_seconds',
-      'auth.max_password_length', 'auth.max_login_length'],
-    '只许迁这十二格（#795 删了 preview.kk_base_url）');
+      'auth.max_password_length', 'auth.max_login_length',
+      'delegate.max', 'delegate.child_rounds', 'delegate.child_timeout_ms'],
+    '只许迁这十五格（#795 删了 preview.kk_base_url）');
   assert.ok(Object.isFrozen(RUNTIME_SETTING_REGISTRY), 'registry 必须冻结（运行期没人能塞旋钮进来）');
   const entry = RUNTIME_SETTING_REGISTRY['session.ttl_seconds'];
   assert.ok(Object.isFrozen(entry), '条目也必须冻结');
@@ -737,7 +758,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   assert.notEqual(HOT_READ_INVALIDATORS.get(PREVIEW_SESSION_TTL_KEY),
     HOT_READ_INVALIDATORS.get(PREVIEW_TICKET_TTL_KEY),
     '第五格不许共用第三格的失效函数（会话 TTL 与票 TTL 各有各的缓存）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 12, '登记表里就是十二格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 15, '登记表里就是十五格（热读旋钮数 = 失效钩子数）');
 
   // P3 第六批的三格：同一个口径再钉一次（各自一个导出的失效函数，且互相不许共用）。
   assert.equal(HOT_READ_INVALIDATORS.get(ONBOARDING_IDLE_BACKOFF_MS_KEY),
@@ -748,7 +769,30 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
     invalidateProvisionerIdleBackoffCache);
   assert.equal(new Set([...HOT_READ_INVALIDATORS.values()]).size, HOT_READ_INVALIDATORS.size,
     '一格一个失效函数：共用就是「保存开户那格把对账那格的缓存也抹了」（RS-51 钉另一面）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 12, '登记表里就是十二格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 15, '登记表里就是十五格（热读旋钮数 = 失效钩子数）');
+
+  // P3 第七批（delegate 三格）：这三格的**核心是 applyMode 不许谎报成 hot**。
+  // 值是 FDE 容器内的 worker 读的，portal 只在 provision 容器那一刻把值写进容器 env
+  // ⇒ 「保存即生效」对这三格是假的（界面那个提醒会把运维指错地方：他改完以为已跑的容器变了）。
+  // 同时它们**仍要**登记失效钩子：portal 侧现读决定的是**下一个新容器**的 env，不登记就是
+  // 保存完还要吃最多 5 秒旧值（RS-65 钉那条）。
+  for (const [key, envVar, def] of [
+    [DELEGATE_MAX_KEY, 'ERIX_DELEGATE_MAX', DELEGATE_MAX_DEFAULT],
+    [DELEGATE_CHILD_ROUNDS_KEY, 'ERIX_DELEGATE_CHILD_ROUNDS', DELEGATE_CHILD_ROUNDS_DEFAULT],
+    [DELEGATE_CHILD_TIMEOUT_MS_KEY, 'ERIX_DELEGATE_CHILD_TIMEOUT_MS', DELEGATE_CHILD_TIMEOUT_MS_DEFAULT],
+  ]) {
+    const e = RUNTIME_SETTING_REGISTRY[key];
+    assert.ok(e && Object.isFrozen(e), `${key} 必须在 registry 里且冻结`);
+    assert.equal(e.envVar, envVar);
+    assert.equal(e.defaultValue, def);
+    assert.equal(e.applyMode, 'restart',
+      `${key} 的值交给 FDE 容器内的 worker：已在跑的容器要重建才生效，不许假装 hot`);
+    assert.match(e.hint ?? '', /新建的 FDE 容器/, `${key} 的 hint 必须明写「只影响之后新建的 FDE 容器」`);
+    assert.match(e.hint ?? '', /重建才生效/,
+      `${key} 的 hint 必须明写「已在跑的容器要重建才生效」（前端零改动 ⇒ hint 是唯一说明面）`);
+    assert.ok(typeof e.label === 'string' && e.label.length > 0, `${key} 要有人话 label（前端不走 i18n）`);
+    assert.ok(HOT_READ_INVALIDATORS.get(key), `${key} 必须登记失效钩子（portal 侧现读下一个新容器）`);
+  }
 
   assert.equal(isKnownSetting('demo.limit'), false, '真实 registry 里没有 demo.limit');
   assert.equal(isKnownSetting('constructor'), false,
@@ -1258,7 +1302,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   const fromDb = await listRuntimeSettingsAdmin({
     pool: dbPool, config: CONFIG_ENV, env: {}, log: silentLog,
   });
-  assert.equal(fromDb.items.length, 12);
+  assert.equal(fromDb.items.length, 15);
   assert.deepEqual(Object.keys(fromDb.items[0]).sort(),
     ['applyMode', 'key', 'label', 'reason', 'source', 'updatedAt', 'updatedBy', 'value'].sort());
   assert.deepEqual(fromDb.items[0], {
@@ -1318,7 +1362,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     pool: ttlPool({ throwOnSelect: Object.assign(new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
     config: CONFIG_ENV, log: deadLog,
   });
-  assert.equal(dead.items.length, 12, '读失败时十二格都要给得出来（不是只给前几格）');
+  assert.equal(dead.items.length, 15, '读失败时十五格都要给得出来（不是只给前几格）');
   assert.equal(dead.items[0].source, 'env');
   assert.equal(dead.items[0].reason, 'read_failed');
   assert.equal(deadLog.seen.warn.length, 1, '有人在屏幕前等答案 ⇒ 读失败要 warn（不像启动路径只能 debug）');
@@ -2319,7 +2363,7 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   // GET 两格：登记了的那格原样带出，没登记的那格**不许**出现这个键（缺席 ≠ null ≠ 空串）。
   const cfg = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
   const list = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: cfg, env: {}, log: silentLog });
-  assert.equal(list.items.length, 12);
+  assert.equal(list.items.length, 15);
   const retItem = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
   assert.equal(retItem.hint, WORKSPACE_RETENTION_HINT,
     'DTO 必须逐字透出 registry 那句话（前端自己另写一份 = 第二份真相）');
@@ -3933,8 +3977,19 @@ test('RS-52 三格都登记了写路径失效（HOT_READ_INVALIDATORS 少一行 
   // 通用不变式：每个 `applyMode:'hot'` 的格子都必须有一行失效登记（漏的那一格保存后本进程还吃旧值）。
   const hotKeys = Object.entries(RUNTIME_SETTING_REGISTRY)
     .filter(([, e]) => e.applyMode === 'hot').map(([k]) => k).sort();
-  assert.deepEqual([...HOT_READ_INVALIDATORS.keys()].sort(), hotKeys,
-    'hot 旋钮的集合必须与失效登记表逐格一致');
+  const registered = [...HOT_READ_INVALIDATORS.keys()].sort();
+  assert.deepEqual(hotKeys.filter((k) => !registered.includes(k)), [],
+    'hot 旋钮不许漏登记（漏的那格保存后本进程还吃旧值）');
+  // P3 第七批把口径从「登记表 == hot 集合」改成「hot ⊆ 登记表，多出来的只能是 `applyMode:'restart'`
+  // 但 portal 侧**仍然现读**的那几格（delegate 三格：每建一个容器读一次）。
+  // 不拿住这一半，下次往里塞一个「根本不读」的格子也没人能看出为什么在。
+  const extras = registered.filter((k) => !hotKeys.includes(k));
+  assert.deepEqual(extras, ['delegate.child_rounds', 'delegate.child_timeout_ms', 'delegate.max'],
+    '登记表里超出 hot 集合的只许是 delegate 三格（applyMode=restart 但 provisioner 现读）');
+  for (const k of extras) {
+    assert.equal(RUNTIME_SETTING_REGISTRY[k]?.applyMode, 'restart',
+      `${k} 在登记表里但不在 hot 集合里 ⇒ 它必须是 restart（否则上面那条集合不变式就该改）`);
+  }
 });
 
 test('RS-53 §4.21 的三行必须写出默认 / 值域 / 生效点（本批的文档契约，删行或含糊其辞 ⇒ 红）',
@@ -4124,8 +4179,7 @@ test('RS-63 Tier 2A 真库腿：保存⇒热读立即新值、删行⇒回落 en
     });
   });
 
-// ===========================================================================
-// #803 S1：注册表双语（labelEn / hintEn）与管理台按 locale 出 label/hint。
+// ====================================================================// #803 S1：注册表双语（labelEn / hintEn）与管理台按 locale 出 label/hint。
 // 三条各钉一件事，红法都是「双语机制被改坏」：
 //   RS-64 parity：registry 里 `label` 有 ⇒ `labelEn` 必有、`hint` 有 ⇒ `hintEn` 必有；
 //                 原本没 `hint` 的那格不许凭空造 `hintEn`。
@@ -4154,15 +4208,15 @@ test('RS-64 注册表 label/hint ⇒ labelEn/hintEn parity（有中文必有英�
       assert.ok(entry.hintEn === undefined, `${key}: 没 hint 就不该有 hintEn（否则界面凭空多一行提示）`);
     }
   }
-  assert.equal(labels, 12, '产品 registry 有 12 条 label');
-  assert.equal(hints, 11, '产品 registry 有 11 条 hint（第一格 session.ttl_seconds 无 hint）');
+  assert.equal(labels, 15, '产品 registry 有 15 条 label（#677 P3 第七批 +3：delegate 三格）');
+  assert.equal(hints, 14, '产品 registry 有 14 条 hint（第一格 session.ttl_seconds 无 hint；#677 P3 第七批 +3）');
 });
 
-test('RS-65 管理台 locale=en：12 条 label、11 条 hint 全英文且不含 CJK', async () => {
+test('RS-65 管理台 locale=en：15 条 label、14 条 hint 全英文且不含 CJK', async () => {
   const { items } = await listRuntimeSettingsAdmin({
     pool: ttlPool(), config: {}, log: silentLog, locale: 'en',
   });
-  assert.equal(items.length, 12);
+  assert.equal(items.length, 15);
   const byKey = Object.fromEntries(items.map((i) => [i.key, i]));
   for (const [key, entry] of Object.entries(RUNTIME_SETTING_REGISTRY)) {
     const item = byKey[key];
@@ -4220,3 +4274,285 @@ test('RS-67 中文原文硬编码钉子：三格 label 与一句 hint 逐字不�
     '0 = 关掉自动清理，但不会取消已排定的删除：改回正数后，已过期的工位会在下一次清理被删除；'
     + '而 0 期间完成离职的工位不会被补上期限（也不会被追删）。');
 });
+// ---------------------------------------------------------------------------
+// P3 第七批（#677）：delegate 子 run 三格 `delegate.max` / `delegate.child_rounds` /
+// `delegate.child_timeout_ms`。
+//
+// 与前面七批**唯一但关键的**不同：这三格的值不是 portal 进程自己读的，而是 **FDE 容器内的 worker**
+// 读的 ⇒ `applyMode: 'restart'`。portal 侧仍然是现读（每建一个容器读一次），但那个值只写进
+// **下一个新容器**的 env；已在跑的容器带着自己那份 env 继续跑。
+//
+//   RS-70 解析/校验（区间各自钉死 + 与 `runner/lib/config.js` 的钳位**同源** + watchdog 那条理由）
+//   RS-71 热读三档（DB > env（过闸）> 默认）+ 坏 env ⇒ 默认 + 点名 warn + 登记的失效函数就是那一个
+//   RS-72 三份独立实例（同表三行各读各的、失效只抹自己那格）
+//   RS-73 管理台 DTO：三格都在、applyMode 是 `restart`、hint 原样透出（前端零改动 ⇒ hint 是唯一说明面）
+//   RS-74 §4.21 那三行必须写出 envVar / 默认 / 值域 / `restart` / 「新建的 FDE 容器」
+//   RS-75 `applyRuntimeOverrides` 确实会把 `delegate.*` 写进覆盖后的 config（可见性与覆盖层解耦）
+//       + DB 那一档优先；订正旧注释那句「启动期 config 快照不包含这三格」（它是错的）
+//
+// ⚠ 本节格子共享**模块级**热读缓存/槽 ⇒ 每段前后都 invalidate 那三格。
+// ---------------------------------------------------------------------------
+
+const DELEGATE_KNOBS = [
+  {
+    key: DELEGATE_MAX_KEY, env: 'ERIX_DELEGATE_MAX',
+    parse: parseDelegateMax, validate: validateDelegateMax,
+    read: readDelegateMax, invalidate: invalidateDelegateMaxCache,
+    min: DELEGATE_MAX_MIN, max: DELEGATE_MAX_MAX, def: DELEGATE_MAX_DEFAULT,
+    notReason: 'not_a_delegate_max',
+    runnerParse: runnerParseDelegateMax,
+    envValue: 3, dbValue: 5,
+  },
+  {
+    key: DELEGATE_CHILD_ROUNDS_KEY, env: 'ERIX_DELEGATE_CHILD_ROUNDS',
+    parse: parseDelegateChildRounds, validate: validateDelegateChildRounds,
+    read: readDelegateChildRounds, invalidate: invalidateDelegateChildRoundsCache,
+    min: DELEGATE_CHILD_ROUNDS_MIN, max: DELEGATE_CHILD_ROUNDS_MAX,
+    def: DELEGATE_CHILD_ROUNDS_DEFAULT, notReason: 'not_a_delegate_child_rounds',
+    runnerParse: runnerParseDelegateChildRounds,
+    envValue: 12, dbValue: 20,
+  },
+  {
+    key: DELEGATE_CHILD_TIMEOUT_MS_KEY, env: 'ERIX_DELEGATE_CHILD_TIMEOUT_MS',
+    parse: parseDelegateChildTimeoutMs, validate: validateDelegateChildTimeoutMs,
+    read: readDelegateChildTimeoutMs, invalidate: invalidateDelegateChildTimeoutMsCache,
+    min: DELEGATE_CHILD_TIMEOUT_MS_MIN, max: DELEGATE_CHILD_TIMEOUT_MS_MAX,
+    def: DELEGATE_CHILD_TIMEOUT_MS_DEFAULT, notReason: 'not_a_delegate_child_timeout_ms',
+    runnerParse: runnerParseDelegateChildTimeoutMs,
+    envValue: 60_000, dbValue: 120_000,
+  },
+];
+
+test('RS-70 delegate 三格的解析/校验：区间各自钉死，且与 runner/lib/config.js 的钳位同源', () => {
+  for (const k of DELEGATE_KNOBS) {
+    assert.equal(k.parse(k.min).value, k.min, `${k.key} 下界内（含端点）`);
+    assert.equal(k.parse(k.max).value, k.max, `${k.key} 上界内（含端点）`);
+    assert.equal(k.parse(k.def).value, k.def, `${k.key} 默认值合法`);
+    assert.equal(k.parse(k.min - 1).ok, false, `${k.key} 下界-1 拒`);
+    assert.equal(k.parse(k.max + 1).ok, false, `${k.key} 上界+1 拒`);
+    for (const bad of ['1e3', ' 30 ', '-1', '1.5', '', 'abc', true, null, {}, [], NaN]) {
+      assert.equal(k.parse(bad).ok, false, `${k.key} 垃圾 ${String(bad)} 拒`);
+      assert.equal(k.parse(bad).reason, k.notReason, `${k.key} 类型不符必须点名本格`);
+    }
+    // 写侧（`validate`）与读侧（`parse`）同一套区间：管理台收的数必须就是容器能用的数。
+    assert.equal(k.validate(k.def), true, `${k.key} 默认值必须合法（否则新库开箱即红）`);
+    assert.equal(typeof k.validate('12'), 'string', `${k.key} 字符串拒（只收 JSON number）`);
+    assert.ok(String(k.validate(k.max + 1)).includes(String(k.max)), `${k.key} 越上界要点名上界`);
+    assert.ok(String(k.validate(k.min - 1)).includes(String(k.min)), `${k.key} 越下界要点名下界`);
+
+    // **同源钉**：三格的边界与默认必须是 runner 那道钳位的同一组数（值域是**抄来的**，不是发明的）。
+    // runner 越界是「钳到边界」、registry 越界是「拒 ⇒ 回落默认」——处置不同但**数不许漂**：
+    // 漂了的后果是「管理台存得进去、容器里被钳成另一个数」，界面显示的数从此不可信。
+    assert.equal(k.runnerParse(String(k.min - 1)).value, k.min,
+      `${k.key} 的下界必须等于 runner 钳位的下界（runner 把 ${k.min - 1} 钳到哪，这里就是哪）`);
+    assert.equal(k.runnerParse(String(k.max + 1)).value, k.max,
+      `${k.key} 的上界必须等于 runner 钳位的上界`);
+    assert.equal(k.runnerParse('').value, k.def, `${k.key} 的默认必须等于 runner 的默认（空 env 档）`);
+    assert.equal(k.runnerParse('not-a-number').value, k.def, `${k.key} 的默认对垃圾输入也同源`);
+  }
+
+  // 240000 这个上界**不是整数癖好**，是 agentd 的 300s F6 watchdog 的安全边界（issue #288）：
+  // 子 run 执行期父 worker 靠子的心跳刷 lastIpcAt，预算 ≥ watchdog 且心跳没来 ⇒ 父 worker 被
+  // SIGKILL 并**重放整条命令**。这条理由原本只活在 `runner/lib/config.js` 的注释里，本片的任务
+  // 就是把它变成机器闸 ⇒ 它必须出现在拒绝消息里（管理台那句红字是它唯一的读者界面）。
+  assert.ok(DELEGATE_CHILD_TIMEOUT_MS_MAX < 300_000,
+    '上界必须小于 agentd 的 300s watchdog（超过就是 #288 那个「SIGKILL + 重放整条命令」的形状）');
+  const why = String(validateDelegateChildTimeoutMs(DELEGATE_CHILD_TIMEOUT_MS_MAX + 1));
+  assert.match(why, /watchdog|300/, '越上界的拒绝消息必须点名 watchdog / 300s 这条来历');
+  assert.match(why, /重放|#288/, '越上界的拒绝消息必须说出后果（SIGKILL + 重放整条命令 / #288）');
+});
+
+test('RS-71 delegate 三格热读三档：DB > env（过闸）> 默认；坏 env ⇒ 默认 + 点名 warn；漏登记就吃旧值',
+  async () => {
+    for (const k of DELEGATE_KNOBS) {
+      k.invalidate();
+      assert.equal(
+        await k.read({ pool: ttlPool({ rows: [{ key: k.key, value: k.dbValue }] }),
+          config: {}, env: {}, log: silentLog }),
+        k.dbValue, `${k.key} 取 DB 的有效值`);
+      k.invalidate();
+      assert.equal(
+        await k.read({ pool: ttlPool({}), config: {}, env: { [k.env]: String(k.envValue) },
+          log: silentLog }),
+        k.envValue, `${k.key} env 过闸生效（compose 那行保留就是为了让这一档还能用）`);
+      k.invalidate();
+      assert.equal(
+        await k.read({ pool: ttlPool({}), config: {}, env: {}, log: silentLog }),
+        k.def, `${k.key} 无 DB 无 env ⇒ registry 默认`);
+      k.invalidate();
+
+      // env 侧走**同一道闸**（#701 LOW③ 的口径，不许「DB 严格、env 宽松」两套真相）：
+      // 越界与 `'1e3'` 这种字符串写法都 ⇒ 视为没给 ⇒ 默认 + 一条点名 key 与 envVar 的 warn。
+      for (const bad of [String(k.max + 1), '1e3', '0', '-1']) {
+        k.invalidate();
+        const log = collectingLog();
+        assert.equal(
+          await k.read({ pool: ttlPool({}), config: {}, env: { [k.env]: bad }, log }),
+          k.def, `${k.key} 坏 env ${bad} ⇒ 回落默认（不采纳）`);
+        assert.ok(log.seen.warn.length >= 1, `${k.key} 坏 env 必须留一条点名 warn`);
+        assert.ok(log.seen.warn.join('\n').includes(k.env) && log.seen.warn.join('\n').includes(k.key),
+          `${k.key} 那条 warn 必须同时点名 key 与 envVar（值班的人要知道去哪改）`);
+      }
+      k.invalidate();
+
+      // 失效登记的意义：**不失效就是吃旧值**。保存路径调的就是 HOT_READ_INVALIDATORS 里那一个函数，
+      // 所以「登记的那个函数」与「真正清槽的那个函数」必须是同一个（M-2 去登记 ⇒ 下面第二条红）。
+      const poolA = ttlPool({ rows: [{ key: k.key, value: k.dbValue }] });
+      assert.equal(await k.read({ pool: poolA, config: {}, env: {}, log: silentLog }), k.dbValue);
+      const poolB = ttlPool({ rows: [{ key: k.key, value: k.envValue }] });
+      assert.equal(
+        await k.read({ pool: poolA, config: {}, env: {}, log: silentLog }), k.dbValue,
+        '同池 5s 内命中缓存（这正是「漏登记 = 保存后还吃旧值」的机制）');
+      HOT_READ_INVALIDATORS.get(k.key)();
+      assert.equal(
+        await k.read({ pool: poolB, config: {}, env: {}, log: silentLog }), k.envValue,
+        `${k.key} 走登记的那个失效钩子后立刻读到新值（不等 5 秒）`);
+      assert.equal(HOT_READ_INVALIDATORS.get(k.key), k.invalidate,
+        `${k.key} 登记的失效函数必须是导出那一个（另一个函数清的是别的槽）`);
+      k.invalidate();
+    }
+  });
+
+test('RS-72 delegate 三格是三份独立实例：同表三行各读各的、失效只抹自己那格', async () => {
+  for (const k of DELEGATE_KNOBS) k.invalidate();
+  const rows = DELEGATE_KNOBS.map((k) => ({ key: k.key, value: k.dbValue }));
+  const pool = ttlPool({ rows });
+  for (const k of DELEGATE_KNOBS) {
+    assert.equal(
+      await k.read({ pool, config: {}, env: {}, log: silentLog }), k.dbValue,
+      `${k.key} 不许被别格串值`);
+  }
+  // 缓存槽各自一份：命中缓存不再发 SQL，而失效只抹自己那一格（共用槽 = 「保存 max 把
+  // child_rounds 的缓存也抹了」，正是 RS-51 那一族坑）。
+  const before = pool.queryCount;
+  for (const k of DELEGATE_KNOBS) {
+    assert.equal(await k.read({ pool, config: {}, env: {}, log: silentLog }), k.dbValue);
+  }
+  assert.equal(pool.queryCount, before, '三格各自命中自己的缓存，不许重发 SQL');
+
+  DELEGATE_KNOBS[0].invalidate();
+  assert.equal(await DELEGATE_KNOBS[0].read({ pool, config: {}, env: {}, log: silentLog }),
+    DELEGATE_KNOBS[0].dbValue, '被失效那格重读');
+  assert.equal(pool.queryCount, before + 1, '只有被失效那一格该发 SQL');
+  const afterOne = pool.queryCount;
+  for (const k of DELEGATE_KNOBS.slice(1)) {
+    assert.equal(await k.read({ pool, config: {}, env: {}, log: silentLog }), k.dbValue);
+  }
+  assert.equal(pool.queryCount, afterOne, '别格被失效不许把这两格的缓存一起抹掉');
+  for (const k of DELEGATE_KNOBS) k.invalidate();
+});
+
+test('RS-73 管理台 DTO：delegate 三格都在、applyMode 是 restart、hint 原样透出（前端零改动）',
+  async () => {
+    const rows = [{ key: DELEGATE_MAX_KEY, value: 4 }];
+    const list = await listRuntimeSettingsAdmin({
+      pool: ttlPool({ rows }),
+      config: {},
+      env: { ERIX_DELEGATE_CHILD_ROUNDS: '16' },
+      log: silentLog,
+    });
+    for (const k of DELEGATE_KNOBS) {
+      const item = list.items.find((i) => i.key === k.key);
+      assert.ok(item, `管理台必须能看到 ${k.key}（看不到 = 运维只能改 env）`);
+      // `applyMode` 是前端唯一能拿到的「生效方式」：写成 hot 就是让运维以为已跑的容器也变了。
+      assert.equal(item.applyMode, 'restart', `${k.key} 的 DTO 必须报 restart（不许谎报 hot）`);
+      assert.equal(item.hint, RUNTIME_SETTING_REGISTRY[k.key].hint,
+        `${k.key} 的 hint 必须原样透出（前端不走 i18n，这句话是唯一说明面）`);
+      assert.match(String(item.hint), /新建的 FDE 容器/, `${k.key} 的 hint 必须写明只影响新建容器`);
+      assert.match(String(item.hint), /重建才生效/, `${k.key} 的 hint 必须写明已跑的要重建`);
+    }
+    assert.equal(list.items.find((i) => i.key === DELEGATE_MAX_KEY).source, 'db');
+    assert.equal(list.items.find((i) => i.key === DELEGATE_MAX_KEY).value, 4);
+    const rounds = list.items.find((i) => i.key === DELEGATE_CHILD_ROUNDS_KEY);
+    assert.equal(rounds.source, 'env', 'compose 那行保留 ⇒ env 仍是兜底档，必须报得出来');
+    assert.equal(rounds.value, 16);
+    assert.equal(list.items.find((i) => i.key === DELEGATE_CHILD_TIMEOUT_MS_KEY).source, 'default');
+  });
+
+test('RS-74 §4.21 的 delegate 三行必须写出 envVar / 默认 / 值域 / restart / 只影响新建容器', () => {
+  const apiDoc = fs.readFileSync(new URL('../../docs/api/portal.md', import.meta.url), 'utf8');
+  const start = apiDoc.indexOf('### 4.21 管理台运行时设置');
+  const end = apiDoc.indexOf('#### `GET /api/admin/runtime-settings`', start);
+  assert.ok(start >= 0 && end > start, '§4.21 切片切不到（标题被改了？）');
+  const rows = apiDoc.slice(start, end).split('\n').filter((l) => l.startsWith('|')).slice(2);
+  for (const k of DELEGATE_KNOBS) {
+    const row = rows.find((r) => r.includes('`' + k.key + '`'));
+    assert.ok(row, `§4.21 缺 ${k.key} 那一行（表行集合与 registry 的等式由 RS-48 钉）`);
+    assert.ok(row.includes(k.env), `${k.key} 那一行必须写 envVar（env 兜底位的名）`);
+    assert.ok(row.includes('`restart`'), `${k.key} 那一行必须写 applyMode=restart`);
+    assert.ok(!/\bhot\b/.test(row), `${k.key} 那一行不许出现 hot（会被读成「保存即生效」）`);
+    assert.ok(new RegExp('默认 `?' + k.def + '`?').test(row), `${k.key} 那一行必须写默认 ${k.def}`);
+    assert.ok(row.includes(`${k.min}..${k.max}`), `${k.key} 那一行必须写值域 ${k.min}..${k.max}`);
+    assert.match(row, /新建的? ?FDE 容器|重建/, `${k.key} 那一行必须写生效点：只影响新建的 FDE 容器`);
+  }
+});
+
+// RS-75（评审非阻塞项 B 的配套钉）：旧注释写「portal 的启动期 config 快照**不包含**这三格」——这是
+// 错的。`applyRuntimeOverrides` 只按 `configPath` 这个字段决定要不要覆盖（同文件那段循环里的
+// `setPath(next, path, value)`），而这三格恰恰带着 `delegate.*` ⇒ 覆盖后的 config 对象里**就是**有它们。
+// 这不与「portal 进程内没有独立消费者」矛盾：`configPath` 的本职是**可见性开关**
+// （`listRuntimeSettingsAdmin` 那句 `.filter((e) => e.configPath)`），它与「进不进覆盖层」只是共用
+// 同一个字段，语义上是两件解耦的事。下面四段各自钉一面：DB 优先 / env 也写 / 默认也写 /
+// 抹掉 configPath 后两件事同时消失（带完整 registry 的对照，否则「看不见」恒真）。
+test('RS-75 applyRuntimeOverrides 把 delegate.* 写进覆盖后的 config（可见性与覆盖层解耦）且 DB 那一档优先',
+  async () => {
+    const rows = DELEGATE_KNOBS.map((k) => ({ key: k.key, value: k.dbValue }));
+    const env = Object.fromEntries(DELEGATE_KNOBS.map((k) => [k.env, String(k.envValue)]));
+    const pathOf = (k) => RUNTIME_SETTING_REGISTRY[k.key].configPath;
+
+    // ① 覆盖层里确实有 `delegate.*`，且 DB 那一档压过 env（同一格两档同时给不同值）。
+    const fromDb = await applyRuntimeOverrides({}, { pool: ttlPool({ rows }), env, log: silentLog });
+    for (const k of DELEGATE_KNOBS) {
+      const path = pathOf(k);
+      assert.ok(String(path).startsWith('delegate.'),
+        `${k.key} 的 configPath 必须是 delegate.*（本节钉的就是这个点分前缀）`);
+      const [head, leaf] = String(path).split('.');
+      assert.equal(fromDb[head]?.[leaf], k.dbValue,
+        `${k.key} 必须被写进覆盖后的 config（${head}.${leaf}），且取 DB 的 ${k.dbValue}、不是 env 的 ${k.envValue}`);
+      // #709 MED① 的既有口径：“来自 DB 的那一格额外盖来源标注”（这里是顶层字面量键 `delegate.<x>Source`）。
+      assert.equal(fromDb[`${path}Source`], 'db',
+        `${k.key} 走的是 DB 那一档 ⇒ 必须按既有口径盖上 ${path}Source=db`);
+    }
+
+    // ② 不是「只有 DB 才写」：env 那一档（过了 registry 的闸）同样进覆盖层，且不被误标成 db。
+    const fromEnv = await applyRuntimeOverrides({}, { pool: ttlPool({}), env, log: silentLog });
+    for (const k of DELEGATE_KNOBS) {
+      const path = pathOf(k);
+      const [head, leaf] = String(path).split('.');
+      assert.equal(fromEnv[head]?.[leaf], k.envValue, `${k.key} env 那一档也必须写进覆盖层`);
+      assert.notEqual(fromEnv[`${path}Source`], 'db', '未走 DB 的那一格不许被误标成 db');
+    }
+
+    // ③ 三档都没有 ⇒ registry 默认也写（“覆盖层里根本没有 delegate.*”那句就是在这红）。
+    const fromDefault = await applyRuntimeOverrides({}, { pool: ttlPool({}), env: {}, log: silentLog });
+    for (const k of DELEGATE_KNOBS) {
+      const [head, leaf] = String(pathOf(k)).split('.');
+      assert.equal(fromDefault[head]?.[leaf], k.def, `${k.key} 无 DB 无 env ⇒ 覆盖层写 registry 默认`);
+    }
+
+    // ④ 可见性那一半（旧注释里**真的**那句）：抹掉 configPath ⇒ 管理台看不见这三格。
+    const stripped = Object.fromEntries(Object.entries(RUNTIME_SETTING_REGISTRY)
+      .map(([key, entry]) => [key,
+        DELEGATE_KNOBS.some((k) => k.key === key) ? { ...entry, configPath: undefined } : entry]));
+    const strippedList = await listRuntimeSettingsAdmin({
+      pool: ttlPool({ rows }), config: {}, env: {}, log: silentLog, registry: stripped,
+    });
+    for (const k of DELEGATE_KNOBS) {
+      assert.ok(!strippedList.items.some((i) => i.key === k.key),
+        `${k.key} 抹掉 configPath 后管理台必须看不见（listRuntimeSettingsAdmin 的 configPath filter 是真话）`);
+    }
+    // 对照：完整 registry 下这三格必须在——否则上面那三条「看不见」是恒真（表本身空了也算绿）。
+    const fullList = await listRuntimeSettingsAdmin({
+      pool: ttlPool({ rows }), config: {}, env: {}, log: silentLog,
+    });
+    for (const k of DELEGATE_KNOBS) {
+      assert.ok(fullList.items.some((i) => i.key === k.key),
+        `${k.key} 在完整 registry 下必须在管理台可见（④ 的对照组）`);
+    }
+    // 同一字段也是覆盖的开关（这就是“共用一个字段但语义不同”的另一面）：抹了 ⇒ 覆盖层不再写。
+    const strippedOverlay = await applyRuntimeOverrides({}, {
+      pool: ttlPool({ rows }), env: {}, log: silentLog, registry: stripped,
+    });
+    assert.equal(strippedOverlay.delegate, undefined,
+      '抹掉 configPath 后这三格不再进覆盖层（当前 registry 带着它 ⇒ ①②③ 才成立）');
+  });

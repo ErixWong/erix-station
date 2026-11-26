@@ -3869,7 +3869,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**已迁的旋钮（十二格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
+**已迁的旋钮（十五格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
 
 | key | env 兜底位 | 值域 | `applyMode` | 生效点 |
 | --- | --- | --- | --- | --- |
@@ -3885,14 +3885,29 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 | `auth.session_renew_interval_seconds` | `SESSION_RENEW_INTERVAL_SECONDS` | 整数 `1..86400` 秒（默认 `3600`；>1 天滚动续期名存实亡） | `hot` | `/api/me` 续期时现读（算 `renewIntervalMs`） |
 | `auth.max_password_length` | `MAX_PASSWORD_LENGTH` | 整数 `1..4096` 字符（默认 `256`；下界 1 = 代码只校非空+≤上限、无最小长度常量；上界护 scrypt 代价） | `hot` | 登录 / 建用户 / 改密时现读（喂 `admin.validatePassword`） |
 | `auth.max_login_length` | `MAX_LOGIN_LENGTH` | 整数 `1..512` 字符（默认 `128`；login 进限流键/主机名种子 ⇒ 封顶防哈希内存面） | `hot` | 登录 / 建用户时现读（喂 `admin.validateLogin`） |
+| `delegate.max` | `ERIX_DELEGATE_MAX` | 整数 `1..8` 路（默认 `2`；`0` 非法：关掉 delegate 是 `ERIX_DELEGATE_ENABLED` 的活） | `restart` | **每建一个 FDE 容器**时现读（`provisioner.js#buildContainerConfig` 把它写进容器 env，容器内的 runner 读它）⇒ 只影响之后新建的容器，**已在跑的容器要重建才生效** |
+| `delegate.child_rounds` | `ERIX_DELEGATE_CHILD_ROUNDS` | 整数 `1..32` 轮（默认 `8`；`0` 非法：子 run 派出去就是立刻结束） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
+| `delegate.child_timeout_ms` | `ERIX_DELEGATE_CHILD_TIMEOUT_MS` | 整数 `1000..240000` 毫秒（默认 `240000`；**上界必须 < agentd 的 300s watchdog**：子 run 执行期父 worker 靠子的心跳刷 `lastIpcAt`，预算超过 watchdog 而心跳没来 ⇒ 父 worker 被 SIGKILL 并**重放整条命令**，#288） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
 
-十三格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+十五格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
 
 后三格（#677 P3 第六批：三个循环的空闲退避上限）也是同一套机件，但是**三份独立实例**（各自一份
 缓存与在飞槽）：共用一份就是「保存开户那格的上限，把对账那一格的缓存一起抹掉」。现读位置是
 **每一拍决定 sleep 之前**，不是循环启动时算一次（后者就是快照：改完要重启才生效）。
 
-**这三个旋钮的值域不是新发明的**，逐条抄自循环侧已有的钳位逻辑：开户 / 销号的旧路径是
+最后三格（#677 P3 第七批：delegate 子 run 的 `delegate.max` / `delegate.child_rounds` /
+`delegate.child_timeout_ms`）是**第一批 `applyMode: restart` 的**，也是本表里唯一三行「保存不等于已跑的
+容器变了」的：值不是 portal 进程读的，而是 **FDE 容器内的 worker** 读的，portal 只在 provision 容器
+那一刻把生效值写进容器 env（`provisioner.js#buildContainerConfig`）。所以：portal 侧**仍现读**
+（保存后下一个新容器就拿新值，不等 portal 重启），但已在跑的容器带着自己那份 env 继续跑，
+**要重建才生效**——管理台那三个格子的 hint 已明写这句（判据 RS-67/RS-68）。
+它们的值域同样**不是发明的**：逐条抄自 `runner/lib/config.js` 已有的钳位（`parseDelegateMax` /
+`parseDelegateChildRounds` / `parseDelegateChildTimeoutMs`，判据 RS-64 钉住同源）。两层不冲突：
+registry 这一层拒越界（写进去就是“管理台存了个容器不会用的数”），runner 那一层钳位**保留不动**
+（“容器 env 被人手改过 / 镜像比 portal 老”时的最后一道防线）。`ERIX_DELEGATE_ENABLED` 本批**故意
+不迁**：它的 env 语义是「未设/空 = 开、显式只认字符串 `1`」，与这套「严格正整数 + 区间」不同形（另片处理）。
+
+**第六批那三个旋钮的值域也不是新发明的**，逐条抄自循环侧已有的钳位逻辑：开户 / 销号的旧路径是
 `envInt(name, 30000, { max: MAX_BACKOFF_MS_SAFE })`（上界 60s 是 Node timer 的 32 位语义边界，
 越过它退避会退化成 1ms 空转）⇒ 区间 `1..60000`；越界的 env 旧路径是「回落默认 30000 + warn」，
 搬进 registry 后是「闸拒 ⇒ 回落 registry 默认 30000」，**生效值逐字相同**。

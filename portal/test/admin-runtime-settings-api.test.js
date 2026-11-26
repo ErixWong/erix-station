@@ -440,7 +440,7 @@ test('RS-API-9 Cookie locale=en ⇒ GET 的 label/hint 全英文且不含 CJK；
     const res = await call(s, { locale: 'en' });
     assert.equal(res.status, 200);
     const body = await readJson(res);
-    assert.equal(body.items.length, 12, '12 条都要在');
+    assert.equal(body.items.length, 15, '15 条都要在（#677 P3 第七批 +3：delegate 三格）');
     // 逐条：label 必须等于 registry 的 labelEn，且不含 CJK。
     for (const item of body.items) {
       const entry = RUNTIME_SETTING_REGISTRY[item.key];
