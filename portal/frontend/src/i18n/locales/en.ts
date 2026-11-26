@@ -182,7 +182,7 @@ export const en = {
       noReading: 'Usage data unavailable',
       retry: 'Retry',
       noData: 'No data in this range',
-      chartLabel: 'Daily usage, last 30 days',
+      chartLabel: 'Daily usage',
       // Summary line right above the chart (single line, `·`-joined): replaces the misread left/right y-axis labels.
       chartSummaryTotal: 'Total, last 30 days: {spend}',
       chartSummaryMax: 'Busiest day {amount} ({day})',

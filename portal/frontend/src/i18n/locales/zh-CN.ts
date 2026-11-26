@@ -194,7 +194,7 @@ export const zhCN = {
       noReading: '暂时拿不到读数',
       retry: '重试',
       noData: '该区间无数据',
-      chartLabel: '近 30 天每日用量',
+      chartLabel: '每日用量',
       // 紧贴 chart 上方的一句摘要（同一行 `·` 分隔）：替代会被读反的 y 轴左右标签。
       chartSummaryTotal: '近 30 天合计 {spend}',
       chartSummaryMax: '单日最高 {amount}（{day}）',
