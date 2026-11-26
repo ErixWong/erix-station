@@ -159,6 +159,54 @@ test('#812 黄金样例 · 配不上对的调用**缺键**（不伪造 resultPre
   assert.equal('resultPreview' in call, false, '没有配对依据 ⇒ 缺键，不是空串');
 });
 
+test('#812 黄金样例 · 结果预览预算（400 码点 + 省略号 ⇒ 401 单位）', () => {
+  const turns = projectTranscriptForDisplay([
+    {
+      round: 10,
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tc1', name: 'exec', input: { command: 'echo hi' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tc1', content: 'x'.repeat(500), is_error: false }] },
+      ],
+    },
+  ]);
+  const call = turns[0].toolCalls[0];
+  assert.equal(call.resultPreview.length, 401, '预览尺只在投影一处：400 码点 + 省略号 = 401 单位');
+  assert.ok(call.resultPreview.endsWith('…'), '超预算必须带省略号后缀');
+});
+
+test('#812 黄金样例 · 参数摘要预算（整条 120 + 单值 60 两道闸）', () => {
+  const turns = projectTranscriptForDisplay([
+    {
+      round: 11,
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tc3', name: 'writeFile', input: { path: 'p'.repeat(200), content: 'c'.repeat(200) } }] },
+      ],
+    },
+  ]);
+  const call = turns[0].toolCalls[0];
+  assert.equal(call.argsSummary.length, 121, '整条预算 120 码点 + 省略号 = 121 单位');
+  assert.ok(call.argsSummary.endsWith('…'), '整条超预算必须带省略号后缀');
+  assert.ok(call.argsSummary.startsWith('path='), 'PREFERRED_ARG_KEYS 的渲染顺序在这一格被钉住：path= 先于 content=');
+});
+
+// 旧实现（按 UTF-16 代码单元切）在这一格会留下孤立代理，脏字符经 folded 接口原样进用户界面
+// —— 这就是收编时取引擎 main 版而不是 0.33.0 版的原因（#854）。
+test('#812 黄金样例 · #854 截断不切出孤立代理（切点落在码点边界）', () => {
+  const turns = projectTranscriptForDisplay([
+    {
+      round: 12,
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tc2', name: 'exec', input: { command: 'echo emoji' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tc2', content: 'a'.repeat(399) + '😀' + 'tail', is_error: false }] },
+      ],
+    },
+  ]);
+  const resultPreview = turns[0].toolCalls[0].resultPreview;
+  assert.equal(resultPreview.length, 402, '399 个 a + 😀（2 个代码单元）+ 省略号 = 402 单位');
+  assert.ok(!/[\uD800-\uDBFF]$/.test(resultPreview), '不得以孤立代理结尾（#854：切点必须落在码点边界）');
+  assert.ok(resultPreview.endsWith('😀…'), '完整代理对留在预览里，再接省略号');
+});
+
 // ---------------------------------------------------------------------------
 // 拥有权闸：投影已经**不再从 erix-agent 取**，谁再这么取就该红，而不是门户加载期崩。
 // ---------------------------------------------------------------------------
