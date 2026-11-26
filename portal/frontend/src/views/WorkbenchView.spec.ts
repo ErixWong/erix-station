@@ -782,7 +782,8 @@ describe('WorkbenchView · 折叠常驻条 / 展开面板 / 右侧竖串（issue
     expect(rows[0].text()).not.toContain('已折叠。');
     expect(rows[0].find('[data-test="fold-row-headline"]').exists()).toBe(false);
     // 第 2 行 mechanical：没有 toolCalls ⇒ 连足迹这一格都不画（不是空 span）
-    expect(rows[1].text()).toBe('第 7–12 轮');
+    // #816④a 之后行尾多一个「查看原文」按钮 ⇒ 改按「行内到底有几格文字」逐字钉（仍不许长出别的格）
+    expect(rows[1].findAll('span').map((s) => s.text())).toEqual(['第 7–12 轮']);
     expect(rows[1].find('[data-test="fold-row-footprint"]').exists()).toBe(false);
     // 第 3 行 semantic 长 title ⇒ 剥 markdown 前缀后原样给（不带 `#`）
     expect(rows[2].get('[data-test="fold-row-range"]').text()).toBe('第 13–17 轮');
@@ -792,6 +793,57 @@ describe('WorkbenchView · 折叠常驻条 / 展开面板 / 右侧竖串（issue
     expect(rows[3].find('[data-test="fold-row-headline"]').exists()).toBe(false);
     expect(rows[3].text()).toContain('第 18–21 轮');
     expect(rows[3].get('[data-test="fold-row-truncated"]').text()).toBe('（摘要被夹断）');
+  });
+
+  // issue #816 第④步a：面板行也要能「查看原文」——渲染与旧横幅**同一个组件**（FoldOriginalTurns，单一实现）。
+  // 断言只认 DOM（`data-test` / 组件类名）与真 fetch，不用 `w.emitted()`。
+  it('面板行「查看原文」：点下去才懒加载并在该行下方渲染原文；再点收起且**不清缓存**（#816④a）', async () => {
+    const { wrapper, store } = await mountWithFolds();
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    // 每行一颉按钮（四条折叠的 round 都是安全整数），但**没点过就一个字节都不出**
+    expect(wrapper.findAll('[data-test="fold-row-original"]')).toHaveLength(FOLDS.length);
+    expect(wrapper.find('.folded-original-turn').exists()).toBe(false);
+    expect(wrapper.find('.folded-original-missing').exists()).toBe(false);
+    const baseFetch = globalThis.fetch as unknown as (input: RequestInfo | URL) => Promise<Response>;
+    const foldedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('/folded/')) {
+        foldedUrls.push(url);
+        return jsonResponse({ round: 12, turns: [{ role: 'user', text: '第 12 轮原文' }] });
+      }
+      return baseFetch(input);
+    }));
+    const btns = () => wrapper.findAll('[data-test="fold-row-original"]');
+    await btns()[0].trigger('click');
+    await tick();
+    expect(foldedUrls).toHaveLength(1);
+    expect(foldedUrls[0]).toContain('/api/sessions/s1/folded/12'); // 查询键 = **落账轮号**（不是 from/to 范围）
+    const turn = wrapper.get('.folded-original-turn');
+    expect(turn.text()).toContain('第 12 轮原文');
+    expect(turn.get('.folded-original-role').text()).toBe('用户');
+    // 再点一次 = 收起（原文整块从 DOM 摘掉），但缓存**不删**（与旧横幅 #388 同口径）
+    await btns()[0].trigger('click');
+    expect(wrapper.find('.folded-original-turn').exists()).toBe(false);
+    expect(store.getFoldedOriginal('s1', 12)?.status).toBe('loaded');
+    // 再展开 ⇒ 命中缓存，**不重发**（总次数恒为 1）
+    await btns()[0].trigger('click');
+    await tick();
+    expect(wrapper.find('.folded-original-turn').exists()).toBe(true);
+    expect(foldedUrls).toHaveLength(1);
+  });
+
+  it('折叠的 round 不是安全整数（或根本没有）⇒ 该行**没有**「查看原文」按钮（拿范围去查必然 404）', async () => {
+    const { wrapper } = await mountWithFolds([
+      { from: 1, to: 6, rounds: 6, origin: 'mechanical' },
+      { round: 2.5, from: 7, to: 12, rounds: 6, origin: 'mechanical' },
+      { round: Number.MAX_SAFE_INTEGER + 2, from: 13, to: 17, rounds: 5, origin: 'semantic', title: '## 调研' },
+    ]);
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    expect(wrapper.findAll('[data-test="fold-row"]')).toHaveLength(3);
+    expect(wrapper.findAll('[data-test="fold-row-original"]')).toHaveLength(0);
+    // 面板文本里也不许出现这个词（按钮不是靠 CSS 隐着的）
+    expect(wrapper.get('[data-test="fold-panel"]').text()).not.toContain('查看原文');
   });
 
   it('竖串：节点数 = 折叠数、恰有一颗实心 active（最新那条）、顺序与 `to` 跟着后端（from 升序）', async () => {

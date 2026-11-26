@@ -170,6 +170,8 @@ export const zhCN = {
       truncated: '（摘要被夹断）',
       railAria: '折叠位置（点击展开明细）',
       nodeAria: '已折叠到第 {round} 轮',
+      // #816④a：面板行内的「查看原文」（懒加载那段折叠前原文；与旧横幅同一个词）
+      viewOriginal: '查看原文',
     },
     // composer 占位符（store.inputPlaceholder 计算属性）
     inputPlaceholder: '输入任务，Enter 发送（Shift+Enter 换行）',
