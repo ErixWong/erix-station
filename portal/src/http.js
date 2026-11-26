@@ -2405,6 +2405,9 @@ async function handleAdminApi(req, res, ctx, url) {
       key,
       value: body.value,
       log: ctx.log,
+      // #803 返修 M1：回包的 `label`/`hint` 与 GET 同一套 locale 谈判——前端保存成功后拿这一行
+      // 顶掉表格里的整行，这里恒中文会让英文页面保存一次就变回中文。审计与校验文案仍恒中文。
+      locale: resolveRequestLocale(req),
     });
     // 审计**不在这里**写：`admin.runtime_settings_updated` 已经与 upsert 在**同一个事务**里
     // （`runtime-settings.js` 的 `BEGIN` → `SELECT … FOR UPDATE` → upsert → 审计 → `COMMIT`）。

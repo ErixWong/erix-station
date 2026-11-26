@@ -481,3 +481,58 @@ test('RS-API-10 不带 locale cookie ⇒ GET 的 label/hint 仍是中文（缺�
     await s.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// ⑥ #803 返修 M1：**保存成功的那一行**也按请求语言出。
+// 为什么必须单独一格：前端 `stores/admin.ts#replaceRuntimeSetting` 拿 PUT 回的 `item`
+// **顶掉表格里的那一行**，不是重新 GET——所以「PUT 恒中文」在界面上的形状是「英文页面
+// 保存一次，那一行的名称与小字当场变回中文」，而 GET 那一格（RS-API-9/10）绿着抓不到。
+// ---------------------------------------------------------------------------
+
+test('RS-API-11 PUT locale=en ⇒ 回包 item 的 label/hint 是英文（前端会顶掉整行，恒中文会当场变回中文）', async () => {
+  const s = await startStack();
+  try {
+    // 无 hint 的一格：只钉 label。
+    const r1 = await call(s, { method: 'PUT', key: SESSION_TTL_KEY, body: { value: 7200 }, locale: 'en' });
+    assert.equal(r1.status, 200, `PUT 必须 200（实际 ${r1.status}）`);
+    const b1 = await readJson(r1);
+    assert.equal(b1.item.label, RUNTIME_SETTING_REGISTRY[SESSION_TTL_KEY].labelEn,
+      'locale=en 时回包 label 必须是 labelEn');
+    assert.ok(!CJK_RE_803.test(b1.item.label), `英文 label 不许含 CJK：${b1.item.label}`);
+    assert.ok(!('hint' in b1.item), '这一格没登记 hint ⇒ 连键都不带（与 GET 同形）');
+    // 上面循环万一被写空，这一条兜底钉死逐字。
+    assert.equal(b1.item.label, 'Login session lifetime (seconds)');
+    // 有 hint 的一格：hint 也要跟着翻（两个字段在两个地方，只改一个会一半中一半英）。
+    const r2 = await call(s, { method: 'PUT', key: 'workspace.retention_days', body: { value: 30 }, locale: 'en' });
+    assert.equal(r2.status, 200, `PUT 必须 200（实际 ${r2.status}）`);
+    const b2 = await readJson(r2);
+    const entry2 = RUNTIME_SETTING_REGISTRY['workspace.retention_days'];
+    assert.equal(b2.item.label, entry2.labelEn, 'locale=en 时 label 出英文');
+    assert.equal(b2.item.hint, entry2.hintEn, 'locale=en 时 hint 也必须出英文');
+    assert.ok(!CJK_RE_803.test(b2.item.hint), `英文 hint 不许含 CJK：${b2.item.hint}`);
+  } finally {
+    await s.close();
+  }
+});
+
+test('RS-API-12 PUT 不带 locale cookie ⇒ 回包 item 的 label/hint 逐字中文（缺省不许漂成 en）', async () => {
+  const s = await startStack();
+  try {
+    const r1 = await call(s, { method: 'PUT', key: SESSION_TTL_KEY, body: { value: 7200 } });
+    assert.equal(r1.status, 200);
+    const b1 = await readJson(r1);
+    assert.equal(b1.item.label, '登录会话有效期（秒）', '缺省 label 必须逐字中文');
+    assert.ok(CJK_RE_803.test(b1.item.label), `缺省 label 必须含中文：${b1.item.label}`);
+    const r2 = await call(s, { method: 'PUT', key: 'workspace.retention_days', body: { value: 30 } });
+    const b2 = await readJson(r2);
+    const entry2 = RUNTIME_SETTING_REGISTRY['workspace.retention_days'];
+    assert.equal(b2.item.label, entry2.label, '缺省 label 必须是 registry 的中文');
+    assert.equal(b2.item.hint, entry2.hint, '缺省 hint 必须是 registry 的中文');
+    assert.ok(CJK_RE_803.test(b2.item.hint), `缺省 hint 应仍是中文：${b2.item.hint}`);
+    // 写侧裁决与语言无关：两种 locale 存的都是同一个值、都恰好一条审计。
+    assert.equal(s.pool.runtimeRows.get(SESSION_TTL_KEY), 7200);
+    assert.equal(s.pool.runtimeRows.get('workspace.retention_days'), 30);
+  } finally {
+    await s.close();
+  }
+});

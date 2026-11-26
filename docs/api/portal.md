@@ -1035,7 +1035,7 @@ station-portal user enable  --login <login>
 1. **错误响应的 `message`**：响应体仍是 `{ error: { code, message, retryable, details } }`（形状不变）；抛出点显式给了英文（`HttpError` 的 `en`）才在 `en` 下出英文，**没给的地方照旧出中文**（渐进覆盖，不是 bug）。`Error.message` 恒为中文，供日志与审计检索。
 2. **运行时设置的 `label` / `hint`**（见 §4.21）：按 locale 选 `labelEn` / `hintEn`；**只给中文就出中文**。
 
-两类都**不改输出字段名**（前端零改）。谈判在 `portal/src/locale.js`（零依赖纯函数）；错误出口接在 `portal/src/http.js` 的请求 catch（每请求只谈一次），管理台读侧接在 §4.21 的 GET（传请求 locale），**写侧 PUT 不做 locale 谈判、恒中文**。
+两类都**不改输出字段名**（前端零改）。谈判在 `portal/src/locale.js`（零依赖纯函数）；错误出口接在 `portal/src/http.js` 的请求 catch（每请求只谈一次），管理台读侧接在 §4.21 的 GET（传请求 locale），**写侧 PUT 的回包与 GET 同一套谈判**（#803 返修 M1）：保存成功回的那个 `item` 会被前端拿去**顶掉表格里的那一行**，恒中文等于「英文页面保存一次，那一行当场变回中文」。恒中文的面不变：**审计台账、`validate()`/校验错误消息**（日志与审计要语言稳定可检索）。
 
 ---
 
@@ -3970,7 +3970,9 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 请求体 `{ "value": <标量> }`（只收 JSON 标量：number / boolean / string；对象、数组、`null` 一律 400）。
 
 - `200` ⇒ `{ "item": { …同 GET 的一项… } }`。DTO **只来自 `RETURNING`**，所以「我以为是这个值」与
-  「库里现在是这个值」不会分离。
+  「库里现在是这个值」不会分离。`item` 的 `label` / `hint` **按请求 locale 出**（与 GET 同一套谈判，
+  #803 返修 M1）：前端 `replaceRuntimeSetting` 会拿它顶掉界面上的那一行；`locale` 不参与任何裁决，
+  审计与校验错误文案仍恒中文。
 - `400 validation_failed`，`details.field` 三档：`key`（未登记；`details.known` 列可用 key）、
   `value`（形状/区间不过）、`body`（体不是对象）。
 - **数值的两侧之分（`1e3` 这一类，#709 unproven 裁定）**：写侧只认 body 里的 JSON 类型。——

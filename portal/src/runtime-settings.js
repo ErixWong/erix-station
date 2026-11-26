@@ -2200,23 +2200,29 @@ export async function listRuntimeSettingsAdmin({
   };
 }
 
-/** 保存后的 DTO：值/时间/人**只来自 `RETURNING`**（口径 4），`label`/`applyMode` 是 registry 的静态元数据。 */
-function toSavedItem(entry, saved) {
+/**
+ * 保存后的 DTO：值/时间/人**只来自 `RETURNING`**（口径 4），`applyMode` 是 registry 的静态元数据，
+ * `label`/`hint` **按请求 locale 出**（#803 返修 M1）：前端保存成功后会用这个 item **顶掉界面上的
+ * 整行**（`stores/admin.ts#replaceRuntimeSetting`），这里恒中文 = 英文页面保存一次那一行当场变回
+ * 中文。`locale` 缺省 `DEFAULT_LOCALE` ⇒ 不传时与改动前逐字相同。
+ * 恒中文的仍然是**审计与 validate/校验错误消息**（日志面要稳定可检索，见下面注释）。
+ */
+function toSavedItem(entry, saved, locale = DEFAULT_LOCALE) {
   // `hint` 与 GET 同一口径（只在登记了的那格带）：保存后的那个 item 会直接替掉界面上的那一行，
   // 这里漏了它，保存完提示就消失（判据：RS-29 的 PUT 腿 + 前端视图 spec 的保存腿）。
   return withHint({
     key: saved.key,
-    // 保存侧（PUT）响应与审计**恒中文**：PUT 不做 locale 谈判（写操作不看请求语言），审计台账
-    // 更要语言稳定可检索 ⇒ 这里刻意读中文 `entry.label`、不走 pickLabel（与 GET 读侧的 locale 选择分开）。
-    // 写侧 validate/校验错误消息同样恒中文：它们无 `en` ⇒ `http.js` 的 pickMessage 自然出中文（S2/S3 再逐条双语）。
-    label: entry?.label ?? saved.key,
+    // 审计台账与写侧校验错误**恒中文**（审计要语言稳定可检索；校验错误无 `en` ⇒ `http.js` 的
+    // pickMessage 自然出中文，S2/S3 再逐条双语）。回包的 `label` 则跟请求 locale 走（上面）：
+    // 它是给界面看的，不是给日志看的。`|| saved.key` 保住「entry 未登记时 label 不许是空串」。
+    label: pickLabel(entry, locale) || saved.key,
     value: saved.value,
     source: 'db',
     reason: null,
     applyMode: entry?.applyMode === 'hot' ? 'hot' : 'restart',
     updatedAt: saved.updatedAt ?? null,
     updatedBy: saved.updatedBy ?? null,
-  }, entry);
+  }, entry, locale);
 }
 
 /**
@@ -2227,11 +2233,15 @@ function toSavedItem(entry, saved) {
  * 响应体里**刻意没有它**（前端不显示，而多一个字段就是多一个要维护的形状；库里与审计里都有）。
  *
  * 审计已由 `saveRuntimeSetting` 在同一个事务里写好 ⇒ **调用方不得再补 `auth.audit`**。
+ *
+ * `locale`（#803 返修 M1）：只影响回包 DTO 的 `label`/`hint` 语言，缺省 `zh-CN`；**不参与任何
+ * 判定、不进审计、不改校验文案**（写侧的裁决与语言无关）。
  */
 export async function updateRuntimeSettingAdmin({
   pool, actorId = null, key, value, registry = RUNTIME_SETTING_REGISTRY, log = console,
+  locale = DEFAULT_LOCALE,
 } = {}) {
   const saved = await saveRuntimeSetting({ pool, actorId, key, value, registry, log });
   const entry = Object.hasOwn(registry, saved.key ?? key) ? registry[saved.key ?? key] : null;
-  return { item: toSavedItem(entry, saved), previousValue: saved.previousValue };
+  return { item: toSavedItem(entry, saved, locale), previousValue: saved.previousValue };
 }
