@@ -155,6 +155,15 @@ export const zhCN = {
     // issue #595：顶栏进能力市场的入口（views/MarketView.vue，路由 #/market）。
     marketEntry: '市场',
     resizeSidebar: '调整侧栏宽度',
+    // issue #816 第③⑥步：折叠常驻条 / 展开面板 / 右侧竖串。**外壳文案在这里**，
+    // 而「第 7–12 轮」与标题那半句是**数据派生串**（lib/foldIndex：常驻条/面板/竖串卡三处共用同一个写法）。
+    foldBar: {
+      summary: '🗜 已折叠 {rounds} 轮 · {headline}',
+      panelTitle: '全部折叠（{count} 条）',
+      truncated: '（摘要被夹断）',
+      railAria: '折叠位置（点击展开明细）',
+      nodeAria: '已折叠到第 {round} 轮',
+    },
     // composer 占位符（store.inputPlaceholder 计算属性）
     inputPlaceholder: '输入任务，Enter 发送（Shift+Enter 换行）',
     // synthetic 消息前缀（store.addMessage 拼接）

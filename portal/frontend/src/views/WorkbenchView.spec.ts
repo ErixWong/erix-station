@@ -15,6 +15,9 @@ import { createAppRouter } from '../router';
 import { setUserScopeResetListener } from '../lib/userScope';
 import { useAuthStore, type AuthUser } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench'; // issue #281：断言消息流里的可见错误行要用 store
+// issue #816：折叠常驻条的数据侧（窄类型 + 把 compaction.lastRound 塞进 store 供竖串当分母）。
+import type { FoldEntry } from '../lib/foldIndex';
+import { normalizeSessionCompaction } from '../lib/compactionSummary';
 import { i18n, setLocale } from '../i18n';
 
 // issue #472：`file_upload_enabled: true` 是**故意**给真的 —— `/api/me` 桩里若全都没有这个键，
@@ -672,5 +675,168 @@ describe('issue #808：顶栏账周期/用量徽标', () => {
     // chart 区在（有数据 ⇒ svg 对阅读器可见）
     expect(wrapper.find('[data-test="metric-chart"]').exists()).toBe(true);
     expect(wrapper.find('[data-test="metric-chart-svg"]').attributes('aria-hidden')).toBe('false');
+  });
+});
+
+// ===========================================================================
+// issue #816 第③⑥步：折叠常驻条 + 展开面板 + 右侧竖串（数据源 = store.sessionFolds）。
+// 断言只认 DOM（`data-test` 选择器），不用 `w.emitted()`（NODE_ENV=production 下恒空 ⇒ 假红）。
+// 竖串位置只认 `style` 里的 `top: N%`——它是纯数学 `to / max(lastRound, maxTo)` 的产物，
+// 本文件里没有任何布局可量（jsdom 也没有），所以这些数字是可以直接逐字钉的。
+// ===========================================================================
+describe('WorkbenchView · 折叠常驻条 / 展开面板 / 右侧竖串（issue #816）', () => {
+  /** 真机形状（dev 库实测：前 5 条 mechanical、最后 1 条 semantic；这里取 4 条代表四种口径）。 */
+  const FOLDS: FoldEntry[] = [
+    {
+      round: 12,
+      from: 1,
+      to: 6,
+      rounds: 6,
+      origin: 'mechanical',
+      // 实测 mechanical 的 title 就是把范围又念一遍的模板句 ⇒ 行内不许出现它
+      title: '早期第 1–6 轮（共 6 轮）已折叠。工具足迹：readFile×40 / shell×1。需要原文请重读文件…',
+      toolCalls: [
+        ...Array.from({ length: 40 }, () => ({ name: 'readFile' })),
+        { name: 'shell' },
+        { name: 'writeFile' },
+      ],
+    },
+    { round: 18, from: 7, to: 12, rounds: 6, origin: 'mechanical', title: '早期第 7–12 轮（共 6 轮）已折叠。' },
+    { round: 24, from: 13, to: 17, rounds: 5, origin: 'semantic', title: '## 调研 store 层与投影边界' },
+    { round: 30, from: 18, to: 21, rounds: 4, origin: 'semantic', title: '## 阶段', truncated: true },
+  ];
+
+  /** 挂载后把折叠索引塞进 store（真实路径是 openSession/refreshSession 里 normalize 出来的）。 */
+  async function mountWithFolds(folds: FoldEntry[] = FOLDS) {
+    const wrapper = await mountWorkbench();
+    const store = useWorkbenchStore();
+    store.sessionId = 's1'; // 竖串与常驻条都只读 sessionFolds，但会话区其它面按有会话装配
+    store.sessionFolds = folds;
+    await flushPromises();
+    return { wrapper, store };
+  }
+
+  /** 读节点 `style` 里的 `top: N%`（竖串定位的唯一落点）。 */
+  function topPcts(wrapper: Awaited<ReturnType<typeof mountWorkbench>>): number[] {
+    return wrapper.findAll('[data-test="fold-node"]').map((node) => {
+      const match = /top:\s*([\d.]+)%/.exec(node.attributes('style') ?? '');
+      expect(match, `节点没有 top：${node.attributes('style')}`).not.toBeNull();
+      return Number(match![1]);
+    });
+  }
+
+  it('无折叠（sessionFolds = []）⇒ 常驻条 / 面板 / 竖串一个字节都不出', async () => {
+    const wrapper = await mountWorkbench(); // 默认没有任何 folds
+    expect(wrapper.find('[data-test="fold-bar"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="fold-panel"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="fold-rail"]').exists()).toBe(false);
+  });
+
+  it('有折叠 ⇒ 常驻条出现，文案是「已折叠 N 轮 · 最新那条的 headline」（mechanical 只给范围）', async () => {
+    const { wrapper } = await mountWithFolds();
+    // 最新一条是 semantic `## 阶段`（剥完 2 字 ⇒ 退回范围，这是预期口径）
+    const bar = wrapper.get('[data-test="fold-bar"]').text();
+    expect(bar).toContain('🗜 已折叠 21 轮 · 第 18–21 轮'); // 末条是 semantic `## 阶段`（剥完 2 字 ⇒ 退回范围）
+    expect(bar).toContain('▸'); // 收起态的箭头（展开后换 ▾）
+    expect(bar).not.toContain('已折叠。'); // mechanical 的模板句不在这行里
+    expect(wrapper.get('[data-test="fold-bar"]').attributes('aria-expanded')).toBe('false');
+  });
+
+  it('点常驻条 ⇒ 面板展开、行数 = 折叠数；再点收起（面板整个从 DOM 摘掉）', async () => {
+    const { wrapper } = await mountWithFolds();
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    const rows = wrapper.findAll('[data-test="fold-row"]');
+    expect(rows).toHaveLength(FOLDS.length);
+    expect(wrapper.get('[data-test="fold-bar"]').attributes('aria-expanded')).toBe('true');
+    expect(wrapper.get('[data-test="fold-panel"]').text()).toContain('全部折叠（4 条）');
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    expect(wrapper.find('[data-test="fold-panel"]').exists()).toBe(false);
+  });
+
+  it('面板逐行：范围 + 足迹；mechanical 行内不出现它的 title；semantic 长 title 剥掉 `##`，短 title 不出现', async () => {
+    const { wrapper } = await mountWithFolds();
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    const rows = wrapper.findAll('[data-test="fold-row"]');
+    // 第 1 行 mechanical：范围 + 足迹聚合，title 的模板句一个字都不许漏进界面
+    expect(rows[0].get('[data-test="fold-row-range"]').text()).toBe('第 1–6 轮');
+    expect(rows[0].get('[data-test="fold-row-footprint"]').text()).toBe('readFile×40 / shell×1 / writeFile×1');
+    expect(rows[0].text()).not.toContain('已折叠。');
+    expect(rows[0].find('[data-test="fold-row-headline"]').exists()).toBe(false);
+    // 第 2 行 mechanical：没有 toolCalls ⇒ 连足迹这一格都不画（不是空 span）
+    expect(rows[1].text()).toBe('第 7–12 轮');
+    expect(rows[1].find('[data-test="fold-row-footprint"]').exists()).toBe(false);
+    // 第 3 行 semantic 长 title ⇒ 剥 markdown 前缀后原样给（不带 `#`）
+    expect(rows[2].get('[data-test="fold-row-range"]').text()).toBe('第 13–17 轮');
+    expect(rows[2].get('[data-test="fold-row-headline"]').text()).toBe('调研 store 层与投影边界');
+    expect(rows[2].text()).not.toContain('##');
+    // 第 4 行 semantic `## 阶段`（剥完 2 字）⇒ 退回范围 + truncated 标注
+    expect(rows[3].find('[data-test="fold-row-headline"]').exists()).toBe(false);
+    expect(rows[3].text()).toContain('第 18–21 轮');
+    expect(rows[3].get('[data-test="fold-row-truncated"]').text()).toBe('（摘要被夹断）');
+  });
+
+  it('竖串：节点数 = 折叠数、恰有一颗实心 active（最新那条）、顺序与 `to` 跟着后端（from 升序）', async () => {
+    const { wrapper } = await mountWithFolds();
+    const nodes = wrapper.findAll('[data-test="fold-node"]');
+    expect(nodes).toHaveLength(FOLDS.length);
+    expect(nodes.map((n) => n.attributes('data-fold-to'))).toEqual(['6', '12', '17', '21']);
+    expect(wrapper.findAll('[data-test="fold-node-active"]')).toHaveLength(1);
+    expect(wrapper.get('[data-test="fold-node-active"]').attributes('data-test')).toBe('fold-node-active');
+    expect(nodes.at(-1)!.attributes('data-active')).toBe('true');
+    expect(nodes[0].attributes('data-active')).toBe('false');
+    // 移动端（<768px）整条竖串隐藏：类名里同时有 hidden 与 md:block（jsdom 无媒体查询，只钉结构）
+    const railClasses = wrapper.get('[data-test="fold-rail"]').classes();
+    expect(railClasses).toContain('hidden');
+    expect(railClasses).toContain('md:block');
+  });
+
+  it('竖串定位是纯数学：lastRound 拿不到 ⇒ 末条落在 100%；compaction.lastRound=40 ⇒ 整串按 40 轮压上去', async () => {
+    const { wrapper, store } = await mountWithFolds();
+    expect(topPcts(wrapper)).toEqual([28.6, 57.1, 81, 100]); // to / maxTo(21)
+    store.sessionCompaction = normalizeSessionCompaction({
+      rounds: 6, tokensSaved: 1, lastRound: 40, layers: { ttl: { triggered: 1, tokensSaved: 1 } },
+    });
+    await flushPromises();
+    expect(topPcts(wrapper)).toEqual([15, 30, 42.5, 52.5]); // to / max(40, 21)
+    expect(topPcts(wrapper).every((pct, i, all) => i === 0 || pct >= all[i - 1])).toBe(true);
+  });
+
+  it('hover 卡（CSS group-hover，不跟随鼠标）：范围 / headline（与范围不同才给）/ 足迹 / 夹断标注', async () => {
+    const { wrapper } = await mountWithFolds();
+    const tips = wrapper.findAll('[data-test="fold-tip"]');
+    expect(tips).toHaveLength(FOLDS.length);
+    // mechanical：只有范围 + 足迹，没有 headline（那半句与范围相同 ⇒ 不重复一遍）
+    expect(tips[0].text()).toContain('第 1–6 轮');
+    expect(tips[0].text()).toContain('readFile×40 / shell×1 / writeFile×1');
+    expect(tips[0].find('[data-test="fold-tip-headline"]').exists()).toBe(false);
+    // semantic 长 title ⇒ headline 在；truncated ⇒ 夹断标注在
+    expect(tips[2].get('[data-test="fold-tip-headline"]').text()).toBe('调研 store 层与投影边界');
+    expect(tips[3].get('[data-test="fold-tip-truncated"]').text()).toBe('（摘要被夹断）');
+  });
+
+  it('点竖串节点 ⇒ 打开面板并滚到那一行（scrollIntoView({block:"nearest"})；跳到流里对应位置是第④步）', async () => {
+    const original = Element.prototype.scrollIntoView;
+    const spy = vi.fn();
+    Element.prototype.scrollIntoView = spy as unknown as typeof original;
+    try {
+      const { wrapper } = await mountWithFolds();
+      expect(wrapper.find('[data-test="fold-panel"]').exists()).toBe(false);
+      await wrapper.findAll('[data-test="fold-node"]')[2].trigger('click');
+      await flushPromises();
+      expect(wrapper.find('[data-test="fold-panel"]').exists(), '点节点要顺手把面板打开').toBe(true);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith({ block: 'nearest' });
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+
+  it('换会话 ⇒ 展开面板复位（不把上一个会话的展开态留给下一个会话）', async () => {
+    const { wrapper, store } = await mountWithFolds();
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    expect(wrapper.find('[data-test="fold-panel"]').exists()).toBe(true);
+    store.sessionId = 's2';
+    await flushPromises();
+    expect(wrapper.find('[data-test="fold-panel"]').exists()).toBe(false);
   });
 });
