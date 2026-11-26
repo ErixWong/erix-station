@@ -1440,6 +1440,81 @@ describe('issue #189：折叠段 folded 字段与原文懒加载', () => {
     expect(store.sessionCompaction).toBeNull();
   });
 
+  // #816 第③步：折叠索引的 store 接线（与上面 #451 同一形状，但**空态不同**：无折叠是 `[]` 而不是 null）。
+  it('#816 sessionFolds：详情 DTO 的 folds 进 store并派生 latestFold/foldedThroughRound；无折叠=[]；脏项丢；离开会话清空', async () => {
+    let folds: unknown = [
+      { round: 12, from: 1, to: 6, rounds: 6, origin: 'mechanical', title: '早期第 1–6 轮（共 6 轮）已折叠。' },
+      { round: 24, from: 22, to: 22, origin: 'semantic', title: '## 阶段', truncated: true },
+      { from: 9 }, // 缺 to ⇒ 整项丢（不给半截）
+    ];
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null, folds }, messages: [], last_seq: 1 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.sessionFolds.map((f) => f.to)).toEqual([6, 22]); // 脏项丢了，好项按后端顺序留着
+    expect(store.latestFold).toEqual({ round: 24, from: 22, to: 22, origin: 'semantic', title: '## 阶段', truncated: true });
+    expect(store.foldedThroughRound).toBe(22);
+
+    // 旧后端无此键 ⇒ `[]`（**不是 null**：列表的空态就是空列表，与 compaction 的键缺席语义不同）
+    folds = undefined;
+    await store.openSession('s1');
+    expect(store.sessionFolds).toEqual([]);
+    expect(store.latestFold).toBeNull();
+    expect(store.foldedThroughRound).toBeNull();
+
+    // refreshSession（run 终态后的补拉）同样重取——本 run 新折的那条要立刻可见
+    folds = [{ from: 1, to: 30 }];
+    await store.refreshSession();
+    expect(store.foldedThroughRound).toBe(30);
+
+    // 离开会话（resetSessionView / selectDir）⇒ 清空，不得把上一个会话的折叠带给下一个
+    await store.openSession('s1');
+    expect(store.sessionFolds).toHaveLength(1);
+    store.resetSessionView();
+    expect(store.sessionFolds).toEqual([]);
+    await store.openSession('s1');
+    await store.selectDir('~/projects/other');
+    expect(store.sessionFolds).toEqual([]);
+  });
+
+  // #816 评审缺陷②：契约只保证「按 `from` 升序 + 同 (from,to) 只留 round 最大」，**没**保证区间不重叠 /
+  // `to` 单调 ⇒ 「末项」不等于「覆盖最远那条」（拿末项会把 20 报成 15）。
+  it('#816 重叠区间（末项不是最远的）⇒ foldedThroughRound/latestFold 取 max(to)，不取 `from` 升序末项', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: {
+              id: 's1',
+              active_run_id: null,
+              // 合法的 `from` 升序形状：第二条被第一条完全包住（to 从 20 降到 15）
+              folds: [
+                { round: 5, from: 1, to: 20, rounds: 20, origin: 'mechanical' },
+                { round: 9, from: 10, to: 15, rounds: 6, origin: 'semantic', title: '## 中途一次小折叠' },
+              ],
+            },
+            messages: [],
+            last_seq: 1,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.sessionFolds.map((f) => f.to)).toEqual([20, 15]); // 两条都在，顺序照后端的 from 升序
+    expect(store.foldedThroughRound).toBe(20); // 常驻条那个数 = max(to)，不是末项的 15
+    expect(store.latestFold?.to).toBe(20); // 覆盖最远那条，不是 at(-1)
+    expect(store.latestFold?.round).toBe(5);
+  });
+
   it('loadFoldedOriginal：200 → loaded(turns)；按 (sessionId, round) 缓存不重发；不同轮各自加载', async () => {
     let calls = 0;
     mockFetch((url) => {

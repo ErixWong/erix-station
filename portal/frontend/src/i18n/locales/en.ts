@@ -148,6 +148,24 @@ export const en = {
     // issue #595: header entry to the capability market (views/MarketView.vue, route #/market).
     marketEntry: 'Market',
     resizeSidebar: 'Resize sidebar',
+    // issue #816 step 3+6: fold bar / expand panel / right rail. Chrome text lives here; the range
+    // (「第 7–12 轮」) and the headline half are **data-derived** strings in lib/foldIndex — one spelling
+    // shared by the bar, the panel rows and the rail tip, so they are not translated per surface.
+    foldBar: {
+      summary: '🗜 Folded {rounds} rounds · {headline}',
+      // No readable headline (or the headline is the range itself) ⇒ this one: `{rounds}` and the range
+      // are usually the same number, so joining them reads as a duplicate (#816②).
+      summaryBare: '🗜 Folded {rounds} rounds',
+      // Range wording (#816①: lib returns structure only; wording lives here).
+      range: 'rounds {from}–{to}',
+      rangeSingle: 'round {to}',
+      rangeTail: 'through round {to}',
+      rangeUnknown: 'earlier rounds',
+      panelTitle: 'All folds ({count})',
+      truncated: '(summary clipped)',
+      railAria: 'Fold positions (click to expand details)',
+      nodeAria: 'Folded through round {round}',
+    },
     inputPlaceholder: 'Type a task, Enter to send (Shift+Enter for a newline)',
     systemInjection: '[system] {content}',
     stopRequested: 'Stop requested…',

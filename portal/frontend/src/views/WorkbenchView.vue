@@ -11,6 +11,8 @@ import { setWorkbenchHooks, useWorkbenchStore } from '../stores/workbench';
 // issue #431：用户 scope 结束的接线（注册方，触发方在 stores/auth.ts）。
 import { setUserScopeResetListener } from '../lib/userScope';
 import { AUTO_FOLLOW_GAP } from '../lib/constants';
+// issue #816 第③⑥步：折叠呈现的派生全部在纯函数里（模板只塞插值；竖串定位是纯数学，不量 DOM）。
+import { foldFootprint, foldHeadline, foldRange, foldRailNodes, type FoldEntry } from '../lib/foldIndex';
 import { useSidebarWidth, SIDEBAR_MAX, SIDEBAR_MIN } from '../composables/useSidebarWidth';
 import SidebarPanel from '../components/SidebarPanel.vue';
 import StreamPanel from '../components/StreamPanel.vue';
@@ -289,6 +291,84 @@ function jumpToLatest() {
   const el = streamEl.value;
   if (el) el.scrollTop = el.scrollHeight;
 }
+
+// ---- issue #816 第③⑥步：折叠常驻条 + 展开面板 + 右侧竖串 ----
+// 数据在 `store.sessionFolds`（会话级、不受消息窗口限制），口径在 `lib/foldIndex`；
+// 本视图只做三件事：拼文案、开关面板（视图态）、把 topPct 写成 `top: {pct}%`。
+
+/** 展开面板的开关是**视图态**（默认收起）；换会话复位——不把上一个会话的展开态留给下一个。 */
+const foldPanelOpen = ref(false);
+const foldPanelEl = ref<HTMLElement | null>(null);
+watch(() => store.sessionId, () => { foldPanelOpen.value = false; });
+// #816：展开/收起折叠面板会改变 streamEl 的可视高度（面板是它的**兄弟**、不是子节点：`shrink-0` 抢走
+// 一节高度）⇒ 原本贴底的用户，最新内容会被挤出视口，而**没发生滚动** ⇒ `@scroll` 不跑、
+// `showToLatest` 连「↓ 最新」都点不亮。所以开关面板后主动复算一次：仍自动跟随就重新贴底，
+// 否则按真实间距走 `onStreamScroll` 的同一套间距计算（不写第二份）。
+// （注：本 watch 必须放在 `foldPanelOpen` 声明之后 —— `watch(source)` 在 setup 里就地求值，提前写会碰 TDZ。）
+watch(foldPanelOpen, () => nextTick(() => {
+  if (autoFollow.value) scrollDown();
+  else onStreamScroll();
+}));
+
+/**
+ * 范围文本（**渲染层**，缺陷 #816①）：lib 只给结构（`foldRange`），措辞在 i18n `workbench.foldBar.range*`。
+ * 硬编码中文在 `html lang=en` 下会拼出 `Folded 22 rounds · 第 22 轮`（真机实测）。
+ * 常驻条 / 面板行 / 竖串卡三处共用本函数 ⇒ 同一折叠在三个位置仍是同一个写法（身份不变量）。
+ */
+function rangeText(fold: FoldEntry): string {
+  const range = foldRange(fold);
+  if (range.kind === 'range') return t('workbench.foldBar.range', { from: range.from, to: range.to });
+  if (range.kind === 'single') return t('workbench.foldBar.rangeSingle', { to: range.to });
+  if (range.kind === 'tail') return t('workbench.foldBar.rangeTail', { to: range.to });
+  return t('workbench.foldBar.rangeUnknown');
+}
+
+/**
+ * 那一行「讲了什么」的那半句，**已与范围去重**：`foldHeadline` 给 `null`（没有可读标题）或给出的标题
+ * 正好与范围文本同字 ⇒ `null`，调用方只渲染范围（缺陷 #816②：`Folded 22 rounds · 第 22 轮` 把同一件事
+ * 说了两遍）。 */
+function headlineText(fold: FoldEntry): string | null {
+  const headline = foldHeadline(fold);
+  return headline !== null && headline !== rangeText(fold) ? headline : null;
+}
+
+/**
+ * 常驻条全文：有**与范围不同**的 headline 才拼 ` · {headline}`，否则用 `summaryBare`（#816②）。
+ * `rounds` 是「已折叠总轮数」，与最新那条的范围（如 `round 22`）常常是同一个数字 ⇒ 不重复。 */
+const foldBarText = computed(() => {
+  const rounds = store.foldedThroughRound ?? 0;
+  const latest = store.latestFold;
+  const headline = latest ? headlineText(latest) : null;
+  if (headline === null) return t('workbench.foldBar.summaryBare', { rounds });
+  return t('workbench.foldBar.summary', { rounds, headline });
+});
+
+/**
+ * 竖串节点（`topPct` = `to / max(lastRound, maxTo)`，纯数学）。
+ * `lastRound` 取 `session.compaction.lastRound`：前端**没有**会话级「最新轮号」的来源（对话流 DTO 不带
+ * `round`，`round_start` 只在实时与历史回放里可见），拿不到就传 `null` ⇒ lib 退化成「最后一条折叠落在
+ * 100%」（有意降级，见 `lib/foldIndex#foldRailNodes`）。
+ */
+const foldNodes = computed(() => foldRailNodes(store.sessionFolds, store.sessionCompaction?.lastRound ?? null));
+
+/** 竖串里 active（实心）那一个的下标：「覆盖最远那条」= `to` 等于 `store.foldedThroughRound`（= max(to)）。
+ *  **不是** `foldNodes.length - 1`：后端只按 `from` 升序，末项可以是区间被包住的那条（#816 评审）。
+ *  同 `to` 有多条时只标**第一个**命中的（恰好一颗实心）。 */
+const activeFoldIndex = computed(() => {
+  const target = store.foldedThroughRound;
+  if (target === null) return -1;
+  return foldNodes.value.findIndex((n) => n.fold.to === target);
+});
+
+/** 点竖串节点 ⇒ 打开面板并滚到那一行（**不是**跳到消息流里的对应位置——那是第④步）。
+ *  jsdom 不实现 `scrollIntoView` ⇒ 可选调用（真实浏览器才有）。 */
+function onFoldNodeClick(index: number): void {
+  foldPanelOpen.value = true;
+  void nextTick(() => {
+    const row = foldPanelEl.value?.querySelectorAll<HTMLElement>('[data-test="fold-row"]')[index];
+    row?.scrollIntoView?.({ block: 'nearest' });
+  });
+}
 </script>
 
 <template>
@@ -402,9 +482,102 @@ function jumpToLatest() {
       ></div>
 
       <section class="relative flex flex-1 flex-col min-w-0">
-        <div ref="streamEl" class="flex-1 overflow-auto p-3" @scroll="onStreamScroll">
-          <StreamPanel />
+        <!-- issue #816 常驻条：在滚动容器**之外**（不随消息流滚走），无折叠（`sessionFolds === []`）时
+             整条不渲染。它是「这个会话已经丢了多早期细节」的真信号（#197 同源口径），展开才看清单。 -->
+        <button
+          v-if="store.sessionFolds.length > 0"
+          type="button"
+          data-test="fold-bar"
+          class="flex shrink-0 items-center gap-1 border-b border-black/10 bg-white px-3 py-1.5 text-left text-sm text-black/60 hover:bg-black/5"
+          :aria-expanded="foldPanelOpen"
+          aria-controls="fold-panel"
+          @click="foldPanelOpen = !foldPanelOpen"
+        >
+          <span data-test="fold-bar-text" class="min-w-0 flex-1 truncate">{{ foldBarText }}</span>
+          <span aria-hidden="true" class="shrink-0">{{ foldPanelOpen ? '▾' : '▸' }}</span>
+        </button>
+        <!-- issue #816 展开面板：紧贴常驻条下方，逐条列**全部**折叠（不受消息窗口限制）。
+             行内不出现 mechanical 折的 title——口径在 `foldHeadline`（实测那是把范围又念一遍的模板句），
+             去重与 i18n 渲染在 `headlineText` / `rangeText`（#816①②）。 -->
+        <div
+          v-if="foldPanelOpen && store.sessionFolds.length > 0"
+          id="fold-panel"
+          ref="foldPanelEl"
+          data-test="fold-panel"
+          class="max-h-56 shrink-0 overflow-auto border-b border-black/10 bg-white px-3 py-1.5 text-xs"
+        >
+          <div class="mb-1 text-black/40">{{ t('workbench.foldBar.panelTitle', { count: store.sessionFolds.length }) }}</div>
+          <div
+            v-for="fold in store.sessionFolds"
+            :key="`r${fold.round ?? 'x'}-${fold.from}-${fold.to}`"
+            data-test="fold-row"
+            class="flex items-baseline gap-2 py-0.5"
+          >
+            <span data-test="fold-row-range" class="shrink-0 text-black/60">{{ rangeText(fold) }}</span>
+            <span
+              v-if="headlineText(fold)"
+              data-test="fold-row-headline"
+              class="shrink-0"
+            >{{ headlineText(fold) }}</span>
+            <span v-if="foldFootprint(fold)" data-test="fold-row-footprint" class="min-w-0 truncate text-black/40">{{ foldFootprint(fold) }}</span>
+            <span v-if="fold.truncated" data-test="fold-row-truncated" class="shrink-0 text-black/40">{{ t('workbench.foldBar.truncated') }}</span>
+          </div>
         </div>
+        <!-- issue #816 右侧竖串与消息流**同一行**：竖串不参与滚动（它是 `relative` 容器 + 节点绝对定位，
+             自己不是滚动容器）。行包装给 `overflow-auto` 是刻意的：#282 那条「状态条落点」的结构断言按
+             「会话区直系子元素里含 overflow-auto 的那一个」定位消息流，行包装继承同一个类名以免旧断言漂移
+             （真正的滚动仍在 `streamEl`；`overflow-y-hidden` 保证 hover 卡顶到行上沿时不会多一条滚动条）。
+             移动端（<768px）整条竖串隐藏，不另做抽屉。 -->
+        <section class="flex min-h-0 flex-1 overflow-auto overflow-y-hidden">
+          <div ref="streamEl" class="flex-1 overflow-auto p-3" @scroll="onStreamScroll">
+            <StreamPanel />
+          </div>
+          <div
+            v-if="foldNodes.length > 0"
+            data-test="fold-rail"
+            class="relative my-2 hidden w-9 shrink-0 md:block"
+            role="group"
+            :aria-label="t('workbench.foldBar.railAria')"
+          >
+            <button
+              v-for="(node, i) in foldNodes"
+              :key="`n${node.fold.round ?? 'x'}-${node.fold.from}-${node.fold.to}`"
+              type="button"
+              data-test="fold-node"
+              :data-fold-to="node.fold.to"
+              :data-active="i === activeFoldIndex ? 'true' : 'false'"
+              :aria-label="t('workbench.foldBar.nodeAria', { round: node.fold.to })"
+              class="group absolute left-1/2 flex h-4 w-4 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full hover:bg-black/5"
+              :style="{ top: `${node.topPct}%` }"
+              @click="onFoldNodeClick(i)"
+            >
+              <!-- 最新那条实心（颜色不是唯一判据：`data-active` 与 data-test 都在），其余空心 -->
+              <span
+                :data-test="i === activeFoldIndex ? 'fold-node-active' : 'fold-node-idle'"
+                class="block h-2 w-2 rounded-full border border-brand"
+                :class="i === activeFoldIndex ? 'bg-brand' : 'bg-white'"
+              ></span>
+              <!-- hover 卡：纯 CSS（group-hover / group-focus-visible），不跟随鼠标。
+                   锚在节点的**左侧**（`right-full`）——竖串贴在会话区右缘，居中展开会把卡片顶出右缘
+                   而多出一条横向滚动条。上/下翻转看 `topPct`（同一个纯数学量，不靠量布局）：
+                   顶部附近的折叠卡往下开，免得卡被行上沿刷掉。 -->
+              <span
+                data-test="fold-tip"
+                class="pointer-events-none absolute right-full z-10 hidden max-w-[240px] rounded-md border border-black/10 bg-white px-2 py-1 text-left text-xs shadow group-hover:block group-focus-visible:block"
+                :class="node.topPct < 25 ? 'top-0 mt-1' : 'bottom-0 mb-1'"
+              >
+                <span class="block text-black/60">{{ rangeText(node.fold) }}</span>
+                <span
+                  v-if="headlineText(node.fold)"
+                  data-test="fold-tip-headline"
+                  class="block"
+                >{{ headlineText(node.fold) }}</span>
+                <span v-if="foldFootprint(node.fold)" data-test="fold-tip-footprint" class="block text-black/50">{{ foldFootprint(node.fold) }}</span>
+                <span v-if="node.fold.truncated" data-test="fold-tip-truncated" class="block text-black/40">{{ t('workbench.foldBar.truncated') }}</span>
+              </span>
+            </button>
+          </div>
+        </section>
         <!-- issue #282：状态条挂在消息流**下方**、输入框**上方**（不塞进 StreamPanel 的渲染循环，也不在
              滚动容器里——常驻可见）。原来在流上方，顶部一行容易被忽略；贴到 composer 上沿后视线自然落到它。
              无选中会话时不挂（没有 run 可报，也不白起一个 1s 时钟）。 -->
