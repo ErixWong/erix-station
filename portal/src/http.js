@@ -1447,7 +1447,7 @@ async function routeApi(req, res, ctx, url) {
     const session = await requireSession(req, ctx);
     const fdeName = session.user.fde_name;
     if (!fdeName) {
-      throw new admin.AdminError('fde_name_required', '当前用户未分配 fde_name，无法读取额度', { httpStatus: 400 });
+      throw new admin.AdminError('fde_name_required', '当前用户未分配 fde_name，无法读取额度', { httpStatus: 400, en: 'the current user has no fde_name assigned, so reading quota is not available' });
     }
     // 30s 缓存（挂在 ctx.selfQuotaCache，进程内跨请求共享）：命中直接用，不重复打网关。
     // 只缓存成功值（getSelfQuota 抛错时根本不 set），故网关故障不会被缓存成空态。
@@ -1463,7 +1463,7 @@ async function routeApi(req, res, ctx, url) {
     const session = await requireSession(req, ctx);
     const fdeName = session.user.fde_name;
     if (!fdeName) {
-      throw new admin.AdminError('fde_name_required', '当前用户未分配 fde_name，无法读取用量', { httpStatus: 400 });
+      throw new admin.AdminError('fde_name_required', '当前用户未分配 fde_name，无法读取用量', { httpStatus: 400, en: 'the current user has no fde_name assigned, so reading usage is not available' });
     }
     // days 校验逐字对齐管理侧 `/api/admin/fdes/:fde/llm/usage`（http.js 内那段）：
     // 只要带了 `days`（含空串 `?days=`）就必须是 1–90 整数；只有完全不写才走默认 30。
@@ -2100,13 +2100,13 @@ async function handleAdminApi(req, res, ctx, url) {
         );
         const gitHost = hostResult.rows[0];
         if (!gitHost) {
-          throw new admin.AdminError('validation_failed', 'git_host_id 不存在', { details: { field: 'git_host_id' } });
+          throw new admin.AdminError('validation_failed', 'git_host_id 不存在', { details: { field: 'git_host_id' }, en: 'git_host_id does not exist' });
         }
         if (!gitHost.enabled) {
-          throw new admin.AdminError('validation_failed', 'git host 已停用', { details: { field: 'git_host_id' } });
+          throw new admin.AdminError('validation_failed', 'git host 已停用', { details: { field: 'git_host_id' }, en: 'the git host is disabled' });
         }
         if (gitHost.provider === 'azure') {
-          throw new admin.AdminError('validation_failed', 'azure provider 尚不支持开户', { details: { field: 'git_host_id' } });
+          throw new admin.AdminError('validation_failed', 'azure provider 尚不支持开户', { details: { field: 'git_host_id' }, en: 'the azure provider does not yet support onboarding' });
         }
 
         // #677 Tier 2A：登录/口令长度上限是热读旋钮 ⇒ 建用户前各现读一次，喂进 admin.createUser。
@@ -2171,16 +2171,16 @@ async function handleAdminApi(req, res, ctx, url) {
         [userId],
       );
       if (offboardingRow.rows.length > 0) {
-        throw new admin.AdminError('user_offboarding', '用户正在下线或处于保留期，不能重试开户', { httpStatus: 409 });
+        throw new admin.AdminError('user_offboarding', '用户正在下线或处于保留期，不能重试开户', { httpStatus: 409, en: 'the user is being offboarded or is in the retention period, so onboarding cannot be retried' });
       }
       const result = await onboarding.retryOnboarding(ctx.pool, userId);
       if (!result) {
         const user = await ctx.pool.query(`SELECT 1 FROM users WHERE id = $1`, [userId]);
-        if (!user.rows[0]) throw new admin.AdminError('not_found', '用户不存在', { httpStatus: 404 });
-        throw new admin.AdminError('onboarding_not_found', '用户没有开户任务', { httpStatus: 409 });
+        if (!user.rows[0]) throw new admin.AdminError('not_found', '用户不存在', { httpStatus: 404, en: 'user does not exist' });
+        throw new admin.AdminError('onboarding_not_found', '用户没有开户任务', { httpStatus: 409, en: 'the user has no onboarding task' });
       }
       if (result.state === 'running') {
-        throw new admin.AdminError('onboarding_running', '开户任务正在运行', { httpStatus: 409 });
+        throw new admin.AdminError('onboarding_running', '开户任务正在运行', { httpStatus: 409, en: 'the onboarding task is already running' });
       }
       return sendJson(res, 200, { onboarding: result });
     }
@@ -2188,11 +2188,11 @@ async function handleAdminApi(req, res, ctx, url) {
       const result = await offboarding.retryOffboarding(ctx.pool, userId);
       if (!result) {
         const user = await ctx.pool.query(`SELECT 1 FROM users WHERE id = $1`, [userId]);
-        if (!user.rows[0]) throw new admin.AdminError('not_found', '用户不存在', { httpStatus: 404 });
-        throw new admin.AdminError('offboarding_not_found', '用户没有下线任务', { httpStatus: 409 });
+        if (!user.rows[0]) throw new admin.AdminError('not_found', '用户不存在', { httpStatus: 404, en: 'user does not exist' });
+        throw new admin.AdminError('offboarding_not_found', '用户没有下线任务', { httpStatus: 409, en: 'the user has no offboarding task' });
       }
       if (result.state === 'running') {
-        throw new admin.AdminError('offboarding_running', '下线任务正在运行', { httpStatus: 409 });
+        throw new admin.AdminError('offboarding_running', '下线任务正在运行', { httpStatus: 409, en: 'the offboarding task is already running' });
       }
       return sendJson(res, 200, { offboarding: result });
     }
@@ -2875,7 +2875,7 @@ async function resolveAdminFde(ctx, fdeName) {
   const fde = await portalloc.resolveFdeByName(ctx.pool, fdeName);
   if (!fde || !fde.id) {
     throw new admin.AdminError('not_found', `FDE「${fdeName}」不存在`, {
-      httpStatus: 404, details: { field: 'fde_name' },
+      httpStatus: 404, details: { field: 'fde_name' }, en: `FDE "${fdeName}" does not exist`,
     });
   }
   return fde;
@@ -5674,13 +5674,14 @@ async function handleFileUpload(req, res, ctx, url) {
   const session = await requireSession(req, ctx);
   const fdeName = session.user.fde_name;
   if (!fdeName) {
-    throw new dirs.DirError('fde_name_required', '当前用户未分配工位，无处可上传', { httpStatus: 400 });
+    throw new dirs.DirError('fde_name_required', '当前用户未分配工位，无处可上传', { httpStatus: 400, en: 'the current user has no seat assigned, so there is nowhere to upload' });
   }
   // 能力位（片 A 的 per-user 开关）。`=== true`：缺键 / `'true'` / 1 都算未开（与前端 v-if 同口径）。
   if (session.user.file_upload_enabled !== true) {
     throw new dirs.DirError('upload_disabled', '该账号未开启文件上传，请让管理员在管理台开启', {
       httpStatus: 403,
       details: { action: 'enable_in_admin_console' },
+      en: 'file upload is not enabled for this account; please ask an administrator to enable it in the admin console',
     });
   }
   // #485 片 A：上限在**请求时**现取（`DB > env > 默认`，无缓存）⇒ 管理台改完下一次上传就生效，
@@ -5786,7 +5787,7 @@ async function handleFilePreview(req, res, ctx, url) {
 async function handleGitLight(req, res, ctx, url) {
   const session = await requireSession(req, ctx);
   if (!session.user.fde_name) {
-    throw new dirs.DirError('fde_name_required', '当前用户未分配工位', { httpStatus: 400 });
+    throw new dirs.DirError('fde_name_required', '当前用户未分配工位', { httpStatus: 400, en: 'the current user has no seat assigned' });
   }
   const result = await getGitLight({
     userSpaceRoot: ctx.config.userSpaceRoot,
