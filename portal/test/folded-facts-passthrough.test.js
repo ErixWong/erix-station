@@ -211,7 +211,9 @@ test('#816-4 toolCalls 逐项清洗 ⇒ 只留两条、name 已 trim、空 argsS
 
 // ── 用例 5：toolCalls 全脏 ⇒ facts.toolCalls 不出现（不是 []） ───────────────────────────────
 test('#816-5 toolCalls 全脏 ⇒ facts.toolCalls 键不出现（不是空数组）', async () => {
-  const folded = await foldedWith({ toolCalls: [null, { name: '' }, 42, { name: '   ' }] });
+  // #816 补刀后：无任何认得子键时整个 `facts` 键会缺席；故本夹具额外带一个有效兄弟键 `from`，
+  // 使 `facts` 非空、下面「facts 键必出」前提仍成立（本例判的是 toolCalls 清洗，不受 `from` 影响）。
+  const folded = await foldedWith({ from: 2, toolCalls: [null, { name: '' }, 42, { name: '   ' }] });
   assert.ok(Object.hasOwn(folded, 'facts'), 'foldedFacts 仍是对象 ⇒ facts 键必出');
   assert.ok(!Object.hasOwn(folded.facts, 'toolCalls'), '清洗后为空 ⇒ 不给 toolCalls 键（不是 []）');
   assert.ok(!Object.hasOwn(folded.facts, 'title'),
@@ -238,4 +240,16 @@ test('#816-7 summaryText 与 facts.summary 并存且不同值（防被合并成�
   assert.equal(folded.facts.summary, '模型descriptionXYZ', 'facts.summary = 模型给的 description');
   assert.notEqual(folded.summaryText, folded.facts.summary,
     '两者是两份不同的东西，不许被合并成同一个值');
+});
+
+// ── 用例 8：无认得子键 ⇒ 整个 facts 键不出现（空壳 ≠ 有事实）；title 纯空白 ⇒ 取不到 ────────
+test('#816-8 foldedFacts 是空对象 / 只含未认得的键 ⇒ 整个 facts 键不出现（空壳不等于有事实）', async () => {
+  for (const empty of [{}, { someUnknownKey: 1 }, { title: '   ' }]) {
+    const folded = await foldedWith(empty);
+    const label = JSON.stringify(empty);
+    assert.ok(!Object.hasOwn(folded, 'facts'),
+      `foldedFacts=${label} 没有任何认得子键 ⇒ 整个 facts 键不出现（不是空壳 {}）`);
+  }
+  const trimmed = await foldedWith({ title: '  调研 store 层  ' });
+  assert.equal(trimmed.facts.title, '调研 store 层', 'title 前后空白被 trim 后作为有效值写入 facts.title');
 });

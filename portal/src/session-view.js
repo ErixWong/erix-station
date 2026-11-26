@@ -280,8 +280,10 @@ function foldedFactsFields(facts) {
     ? value.source
     : undefined;
   // #816：`facts` 嵌套键——每个子键「取不到就不写」，绝不写 null/false/0/空串。到这里 `facts` 已是
-  // 非 null 非数组对象（上面的守卫已挡掉非对象），所以 `facts` 键本身必出（无认得子键时为 `{}`）。
-  const title = typeof value.title === 'string' && value.title !== '' ? value.title : undefined;
+  // 非 null 非数组对象（上面的守卫已挡掉非对象），所以没有任何认得子键时整个 `facts` 键不出现
+  // （空壳 `{}` 等于替账本断言『有事实』，那是假话）。
+  const trimmed = typeof value.title === 'string' ? value.title.trim() : '';
+  const title = trimmed !== '' ? trimmed : undefined;
   // ⚠ `summary` 是**模型给的 description**（#897 预留读点），与 `summaryText`（=`foldedFacts.text` 替代物正文）
   //   不是同一份东西——两者各写各的键，不许合并。
   const summary = typeof value.summary === 'string' && value.summary !== '' ? value.summary : undefined;
@@ -292,21 +294,22 @@ function foldedFactsFields(facts) {
   const to = Number.isSafeInteger(value.to) ? value.to : undefined;
   const rounds = Number.isSafeInteger(value.rounds) && value.rounds > 0 ? value.rounds : undefined;
   const toolCalls = cleanFoldedToolCalls(value.toolCalls);
+  const factsObj = {
+    ...(title === undefined ? {} : { title }),
+    ...(summary === undefined ? {} : { summary }),
+    ...(origin === undefined ? {} : { origin }),
+    ...(from === undefined ? {} : { from }),
+    ...(to === undefined ? {} : { to }),
+    ...(rounds === undefined ? {} : { rounds }),
+    ...(toolCalls.length === 0 ? {} : { toolCalls }),
+    ...(value.summaryDropped === true ? { summaryDropped: true } : {}),
+    ...(value.titleFallback === true ? { titleFallback: true } : {}),
+  };
   return {
     ...(summaryText === undefined ? {} : { summaryText }),
     ...(summarySource === undefined ? {} : { summarySource }),
     ...(value.truncated === true ? { truncated: true } : {}),
-    facts: {
-      ...(title === undefined ? {} : { title }),
-      ...(summary === undefined ? {} : { summary }),
-      ...(origin === undefined ? {} : { origin }),
-      ...(from === undefined ? {} : { from }),
-      ...(to === undefined ? {} : { to }),
-      ...(rounds === undefined ? {} : { rounds }),
-      ...(toolCalls.length === 0 ? {} : { toolCalls }),
-      ...(value.summaryDropped === true ? { summaryDropped: true } : {}),
-      ...(value.titleFallback === true ? { titleFallback: true } : {}),
-    },
+    ...(Object.keys(factsObj).length === 0 ? {} : { facts: factsObj }),
   };
 }
 
