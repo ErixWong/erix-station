@@ -50,9 +50,14 @@ const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
 const UI_ENABLED = process.env.E2E_UI === '1';
 const PW_CONTAINER = process.env.PLAYWRIGHT_CONTAINER || 'erix_station_playwright';
 const PW_MODULE = '/app/node_modules/playwright/index.mjs';
-/** 截图：宿主与容器内用**同名路径**（不同文件系统，docker cp 只是搬运），两边都可 env 覆盖。 */
-const SHOT_HOST = process.env.E2E_SHOT_HOST || '/tmp/admin-locale-e2e.png';
-const SHOT_CONTAINER = process.env.E2E_SHOT_CONTAINER || SHOT_HOST;
+/**
+ * 截图：宿主与容器是**两套文件系统**，同一个路径名在容器里未必存在（`/docker/<容器名>/` 是宿主
+ * 侧给 vision 读的路，容器内没有那棵树 ⇒ `page.screenshot()` 直接 ENOENT）。
+ * 所以两个路径各自有默认值、各自可 env 覆盖：容器内固定落 `/tmp/`，宿主落临时目录，
+ * 跑完用 `docker cp` 搬回来（先例：`seat-content-e2e.mjs` 的 SHOT_CONTAINER/SHOT_HOST）。
+ */
+const SHOT_CONTAINER = process.env.E2E_SHOT_CONTAINER || '/tmp/admin-locale-e2e.png';
+const SHOT_HOST = process.env.E2E_SHOT_HOST || path.join(os.tmpdir(), 'admin-locale-e2e.png');
 /**
  * 把域名在 TCP 层映到 IP（SNI/Host 仍用域名）。本腿两个 host 都要映：管理台与用户面各是一条
  * `MAP`，都用 `E2E_RESOLVE=host=ip,host2=ip2` 覆盖。缺省把两个域名都映到本机。
@@ -224,11 +229,23 @@ try {
 
   // ── ④ 切换当场生效：lang=en；登出按钮文案 Sign out；某颗 nav tab 是英文（取含 User 的一条） ──
   r.admin.langAfterEn = await page.evaluate(() => document.documentElement.lang);
-  // 登出按钮是 header 里最后一颗 button（组件注释也钉了这个顺序）。
+  // 登出按钮 = **布局顶栏**（DOM 里第一个 <header> 元素）的最后一颗 button。
+  // ⚠ 不能用「全页 header button」集合取最后一颗：子视图（如用户管理自己的区块 <header>）也在
+  //   header 里放按钮，真页面上那颗「＋ Create user」会排在登出之后（真机腿实测踩过）。
+  //   单测里没这问题是因为它只挂 AdminLayout、没有子视图 ⇒ 组件注释钉的「插在登出之前」在真页面上
+  //   必须由**作用域限定**保证，这里就是那条作用域。
+  //   （本段在容器里跑，外面套的是模板字符串 ⇒ 这段注释里不许写反引号。）
   r.admin.logoutText = await page.evaluate(() => {
-    const btns = Array.from(document.querySelectorAll('header button'));
+    const header = document.querySelector('header');
+    if (!header) return null;
+    const btns = Array.from(header.querySelectorAll('button'));
     const out = btns[btns.length - 1];
     return out ? (out.textContent || '').trim() : null;
+  });
+  r.admin.localeBtnText = await page.evaluate(() => {
+    const header = document.querySelector('header');
+    const b = header ? header.querySelector('button[aria-haspopup="menu"]') : null;
+    return b ? (b.textContent || '').trim() : null;
   });
   r.admin.tabTexts = await page.evaluate(() => Array.from(document.querySelectorAll('nav a')).map((e) => (e.textContent || '').trim()));
 
@@ -355,7 +372,8 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     assert.deepEqual(admin.menuItems, ['中文', 'English'], `语言菜单两项应是「中文 / English」，实际 ${JSON.stringify(admin.menuItems)}`);
     // ④ 切换当场生效：lang=en、登出按钮 Sign out、某颗 nav tab 是英文
     assert.equal(admin.langAfterEn, 'en', `点 English 后 <html lang> 应当场变 en，实际 ${JSON.stringify(admin.langAfterEn)}`);
-    assert.equal(admin.logoutText, 'Sign out', `英文态登出按钮文案应是 Sign out，实际 ${JSON.stringify(admin.logoutText)}`);
+    assert.equal(admin.logoutText, 'Sign out', `英文态**布局顶栏**最后一颗 button 应是登出（Sign out），实际 ${JSON.stringify(admin.logoutText)}——若这里出现「＋ Create user」，说明作用域又漏到子视图自己的 <header> 了`);
+    assert.match(String(admin.localeBtnText || ''), /English/, `英文态顶栏语言按钮自身文案应跟着变（实测是「English ▾」），实际 ${JSON.stringify(admin.localeBtnText)}`);
     assert.ok((admin.tabTexts || []).some((x) => /User/.test(x)), `英文态 nav 里应至少一颗 tab 是英文（取含 User 的一条），实际 ${JSON.stringify(admin.tabTexts)}`);
     // ⑤ 偏好落同站 cookie
     assert.equal(admin.cookieLocale, 'en', `切英文后同站 cookie 的 locale 应是 en（document.cookie 含 locale=en），实际 locale=${JSON.stringify(admin.cookieLocale)}、cookie=${JSON.stringify(admin.cookie)}`);
