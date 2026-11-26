@@ -60,14 +60,32 @@ const METRICS = {
   series: {
     bucketSeconds: 30,
     points: [
-      { t: new Date(Date.now() - 120_000).toISOString(), cpuAvg: 20, cpuMax: 40, memUsed: 30 * GIB, containersRunning: 30, samples: 2 },
-      { t: new Date(Date.now() - 90_000).toISOString(), cpuAvg: 30, cpuMax: 55, memUsed: 36 * GIB, containersRunning: 32, samples: 2 },
-      { t: new Date(Date.now() - 60_000).toISOString(), cpuAvg: 12.5, cpuMax: 33, memUsed: 40 * GIB, containersRunning: 33, samples: 1 },
+      { t: new Date(Date.now() - 120_000).toISOString(), cpuAvg: 20, cpuMax: 40, memUsed: 30 * GIB, memAvailable: 98 * GIB, memCached: 10 * GIB, swapUsed: 1 * GIB, load1: 4.2, containersRunning: 30, samples: 2 },
+      { t: new Date(Date.now() - 90_000).toISOString(), cpuAvg: 30, cpuMax: 55, memUsed: 36 * GIB, memAvailable: 92 * GIB, memCached: 11 * GIB, swapUsed: 2 * GIB, load1: 5.1, containersRunning: 32, samples: 2 },
+      { t: new Date(Date.now() - 60_000).toISOString(), cpuAvg: 12.5, cpuMax: 33, memUsed: 40 * GIB, memAvailable: 84 * GIB, memCached: 12 * GIB, swapUsed: 2 * GIB, load1: 5.26, containersRunning: 33, samples: 1 },
+    ],
+    // 两块盘的历史：nvme0n1p2（卡片里也有）+ unknown（卡片里没有的设备）。
+    disks: [
+      {
+        device: '/dev/nvme0n1p2', path: '/',
+        points: [
+          { t: new Date(Date.now() - 120_000).toISOString(), usedBytes: 600 * GIB, totalBytes: 937 * GIB, samples: 2 },
+          { t: new Date(Date.now() - 60_000).toISOString(), usedBytes: 676 * GIB, totalBytes: 937 * GIB, samples: 1 },
+        ],
+      },
+      {
+        device: 'unknown', path: 'unknown',
+        points: [
+          { t: new Date(Date.now() - 120_000).toISOString(), usedBytes: 1 * GIB, totalBytes: 4 * GIB, samples: 2 },
+          { t: new Date(Date.now() - 60_000).toISOString(), usedBytes: 2 * GIB, totalBytes: 4 * GIB, samples: 1 },
+        ],
+      },
     ],
   },
   range: '1h',
   retentionDays: 30,
   seriesError: null,
+  disksError: null,
   enabled: true,
 };
 
@@ -548,5 +566,59 @@ describe('判据 S-4：范围切换（选中态跟服务端回显走）', () => 
     await flushPromises();
     expect(wrapper.find('[data-test="system-error"]').exists(), '恢复后错误行必须收掉').toBe(false);
     expect(wrapper.find('[data-test="card-cpu"]').exists()).toBe(true);
+  });
+});
+
+// ────────────────────────────────────────────────────
+// #814：内存/峰值/负载/磁盘趋势补齐 + 每条线可见小标题 + 字节图 y 轴钉 0 + 磁盘历史独立降级。
+// 用 `[data-metric="..."]` 点名具体那条线（不用「第几个图」）。
+describe('#814 系统页：补齐的趋势线、可见小标题与独立降级', () => {
+  it('内存卡四条线都在，且每条都有自己的可见小标题', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    for (const [metric, captionKey] of [
+      ['mem-used', 'chartMemUsed'],
+      ['mem-available', 'chartMemAvailable'],
+      ['mem-cached', 'chartMemCached'],
+      ['mem-swap', 'chartMemSwap'],
+    ]) {
+      const chart = wrapper.get(`[data-metric="${metric}"]`);
+      const caption = chart.find('[data-test="metric-chart-caption"]');
+      expect(caption.exists(), `${metric} 要有自己的可见小标题`).toBe(true);
+      expect(caption.text()).toBe(String(t(`admin.system.${captionKey}`)));
+    }
+  });
+
+  it('字节图 y 轴下界标注钉 0（缓存 80→82 不许画成暴涨）', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    const cached = wrapper.get('[data-metric="mem-cached"]');
+    expect(cached.get('[data-test="metric-chart-y-min"]').text()).toBe('0 B');
+  });
+
+  it('disksError 非空 ⇒ 磁盘图空态是「磁盘历史不可用：…」，而内存图仍画线（两格独立降级）', async () => {
+    const { wrapper } = await openSystem(withMetrics({
+      disksError: 'disk-query-failed',
+      series: { ...METRICS.series, disks: [] },
+    }));
+    const diskChart = wrapper.get('[data-metric="disk-/dev/nvme0n1p2-used"]');
+    expect(diskChart.find('[data-test="metric-chart-empty"]').text())
+      .toContain(String(t('admin.system.disksUnavailable', { reason: 'disk-query-failed' })));
+    // 磁盘查询挂了不许拖累内存：mem-cached 的线仍在
+    expect(wrapper.get('[data-metric="mem-cached"]').find('[data-test="metric-chart-line"]').attributes('d')).not.toBe('');
+  });
+
+  it('卡片里有但历史里没有的盘 ⇒ 那条 disk-row 里没有 metric-chart（不拿别的盘的历史糊）', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    const rows = wrapper.findAll('[data-test="disk-row"]');
+    const sda = rows.find((r) => r.text().includes('/dev/sda1'));
+    expect(sda, '夹具卡片里有 /dev/sda1').toBeTruthy();
+    expect(sda!.find('[data-test="metric-chart"]').exists(), 'sda1 历史里没有 ⇒ 不许配图').toBe(false);
+    // 对上的 nvme0n1p2 则有图
+    const nvme = rows.find((r) => r.text().includes('/dev/nvme0n1p2'));
+    expect(nvme!.find('[data-test="metric-chart"]').exists()).toBe(true);
+  });
+
+  it('历史里有、卡片里没有的设备（unknown）⇒ 不凭空多出一条图', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    expect(wrapper.findAll('[data-metric="disk-unknown-used"]').length).toBe(0);
   });
 });

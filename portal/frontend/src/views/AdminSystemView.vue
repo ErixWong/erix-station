@@ -24,6 +24,7 @@ import MetricChart from '../components/MetricChart.vue';
 import {
   METRIC_RANGES,
   SPARK_MAX_POINTS,
+  diskTrendFor,
   formatAgo,
   formatBytes,
   formatCount,
@@ -102,6 +103,41 @@ const cpuBounds = { min: 0, max: 100 } as const;
 const cpuSpark = computed(() => sparkPoints(seriesPoints.value, (point) => point.cpuAvg, SPARK_MAX_POINTS));
 const memSpark = computed(() => sparkPoints(seriesPoints.value, (point) => point.memUsed, SPARK_MAX_POINTS));
 const containersSpark = computed(() => sparkPoints(seriesPoints.value, (point) => point.containersRunning, SPARK_MAX_POINTS));
+
+// #814 补齐的趋势线（都是同一个 `seriesPoints` 源，只是选不同列）。
+const cpuMaxSpark = computed(() => sparkPoints(seriesPoints.value, (point) => point.cpuMax, SPARK_MAX_POINTS));
+const loadSpark = computed(() => sparkPoints(seriesPoints.value, (point) => point.load1, SPARK_MAX_POINTS));
+const memAvailSpark = computed(() => sparkPoints(seriesPoints.value, (point) => point.memAvailable, SPARK_MAX_POINTS));
+const memCachedSpark = computed(() => sparkPoints(seriesPoints.value, (point) => point.memCached, SPARK_MAX_POINTS));
+const memSwapSpark = computed(() => sparkPoints(seriesPoints.value, (point) => point.swapUsed, SPARK_MAX_POINTS));
+
+/** 磁盘历史（按设备归组，一块盘一条线）。 */
+const diskSeries = computed(() => metrics.value?.series.disks ?? []);
+
+/**
+ * 磁盘图的提示：`disksError` **独立于** `seriesError`，只让磁盘那条线说「历史不可用」；
+ * 否则回落到通用 `chartNote`（磁盘查询挂掉不能让内存/容器图也红）。
+ */
+const diskNote = computed(() => {
+  const reason = metrics.value?.disksError ?? null;
+  return reason !== null ? t('admin.system.disksUnavailable', { reason }) : chartNote.value;
+});
+
+/**
+ * 磁盘那一行要不要配图：
+ *   · `disksError` 非空 ⇒ 磁盘那条查询挂了、拿不到任何线，**仍要出图**说「历史不可用」（空态 + 原因）；
+ *   · 否则只有「这块盘真的对上了历史」才出图——卡片里有但历史里没有的盘**不配图**（不拿别的盘的历史糊上去）。
+ */
+function hasDiskTrend(row: DiskRow): boolean {
+  if ((metrics.value?.disksError ?? null) !== null) return true;
+  return diskTrendFor(diskSeries.value, row) !== null;
+}
+
+/** 卡片那一行对上它自己的历史；对不上 ⇒ 空数组（**不许**拿别的盘的线糊上去）。 */
+function diskSpark(row: DiskRow) {
+  const trend = diskTrendFor(diskSeries.value, row);
+  return trend === null ? [] : sparkPoints(trend.points, (point) => point.usedBytes, SPARK_MAX_POINTS);
+}
 
 /** load 归一化（判据 3）：三段拼进 i18n 句子；任一段缺值 ⇒ 整句不出（不出 `NaN%`）。 */
 const loadLine = computed(() => {
@@ -270,9 +306,36 @@ const retentionText = computed(() => {
           :points="cpuSpark"
           :min="cpuBounds.min"
           :max="cpuBounds.max"
+          metric-id="cpu-avg"
+          :caption="t('admin.system.chartCpuAvg')"
           :note="chartNote"
           :empty-text="t('admin.system.noData')"
           :format-y="(value: number) => `${Math.round(value)}%`"
+          :with-date="withDate"
+          :label="t('admin.system.cpuTitle')"
+        />
+        <MetricChart
+          class="mt-1 max-w-md"
+          :points="cpuMaxSpark"
+          :min="0"
+          :max="100"
+          metric-id="cpu-max"
+          :caption="t('admin.system.chartCpuMax')"
+          :note="chartNote"
+          :empty-text="t('admin.system.noData')"
+          :format-y="(value: number) => `${Math.round(value)}%`"
+          :with-date="withDate"
+          :label="t('admin.system.cpuTitle')"
+        />
+        <MetricChart
+          class="mt-1 max-w-md"
+          :points="loadSpark"
+          :min="0"
+          metric-id="load1"
+          :caption="t('admin.system.chartLoad1')"
+          :note="chartNote"
+          :empty-text="t('admin.system.noData')"
+          :format-y="(v: number) => v.toFixed(2)"
           :with-date="withDate"
           :label="t('admin.system.cpuTitle')"
         />
@@ -305,6 +368,45 @@ const retentionText = computed(() => {
         <MetricChart
           class="mt-2 max-w-md"
           :points="memSpark"
+          :min="0"
+          metric-id="mem-used"
+          :caption="t('admin.system.chartMemUsed')"
+          :note="chartNote"
+          :empty-text="t('admin.system.noData')"
+          :format-y="(value: number) => formatBytes(value) ?? String(value)"
+          :with-date="withDate"
+          :label="t('admin.system.memTitle')"
+        />
+        <MetricChart
+          class="mt-1 max-w-md"
+          :points="memAvailSpark"
+          :min="0"
+          metric-id="mem-available"
+          :caption="t('admin.system.chartMemAvailable')"
+          :note="chartNote"
+          :empty-text="t('admin.system.noData')"
+          :format-y="(value: number) => formatBytes(value) ?? String(value)"
+          :with-date="withDate"
+          :label="t('admin.system.memTitle')"
+        />
+        <MetricChart
+          class="mt-1 max-w-md"
+          :points="memCachedSpark"
+          :min="0"
+          metric-id="mem-cached"
+          :caption="t('admin.system.chartMemCached')"
+          :note="chartNote"
+          :empty-text="t('admin.system.noData')"
+          :format-y="(value: number) => formatBytes(value) ?? String(value)"
+          :with-date="withDate"
+          :label="t('admin.system.memTitle')"
+        />
+        <MetricChart
+          class="mt-1 max-w-md"
+          :points="memSwapSpark"
+          :min="0"
+          metric-id="mem-swap"
+          :caption="t('admin.system.chartMemSwap')"
           :note="chartNote"
           :empty-text="t('admin.system.noData')"
           :format-y="(value: number) => formatBytes(value) ?? String(value)"
@@ -345,6 +447,20 @@ const retentionText = computed(() => {
               {{ bytesText(row.usedBytes) }} / {{ bytesText(row.totalBytes) }}
               ({{ pctText(row.usedPct) }}) · {{ t('admin.system.diskAvail', { value: bytesText(row.availBytes) }) }}
             </p>
+            <!-- 只对「真的对上了历史」或「磁盘查询报错」的行出图；卡片里有但历史里没有的盘不配图（不拿别的盘糊） -->
+            <MetricChart
+              v-if="hasDiskTrend(row)"
+              class="mt-1 max-w-md"
+              :points="diskSpark(row)"
+              :min="0"
+              :metric-id="`disk-${row.device ?? 'unknown'}-used`"
+              :caption="t('admin.system.chartDiskUsed')"
+              :note="diskNote"
+              :empty-text="t('admin.system.noData')"
+              :format-y="(value: number) => formatBytes(value) ?? String(value)"
+              :with-date="withDate"
+              :label="t('admin.system.diskTitle')"
+            />
           </li>
         </ul>
         <!-- 配了但读不到的路径也要露面，否则「已监控 N 个」是少了一行的谎 -->
@@ -407,6 +523,8 @@ const retentionText = computed(() => {
         <MetricChart
           class="mt-2 max-w-md"
           :points="containersSpark"
+          metric-id="containers-running"
+          :caption="t('admin.system.chartContainers')"
           :note="chartNote"
           :empty-text="t('admin.system.noData')"
           :with-date="withDate"
