@@ -21,37 +21,41 @@ const MAX_TOKEN_LENGTH = 4096;
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 export class GitCredentialError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 S2-D3：可选英文对（同 AdminError/HttpError/各类 *Error 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状与 message 一字不动。
+    this.en = en;
   }
 }
 
-function fail(field, message) {
-  throw new GitCredentialError('validation_failed', message, { details: { field } });
+function fail(field, message, en) {
+  // issue #803 S2-D3：可选英文对经第三个形参透传进 options.en；省略时行为逐字不变。
+  throw new GitCredentialError('validation_failed', message, { details: { field }, en });
 }
 
 function validateFde(fdeName) {
-  if (!validateFdeName(fdeName).ok) fail('fde_name', 'fde_name 非法');
+  if (!validateFdeName(fdeName).ok) fail('fde_name', 'fde_name 非法', 'invalid fde_name');
 }
 
 function validateHost(host) {
-  if (typeof host !== 'string' || host.length > 253) fail('host', 'host 必须是有效 DNS 主机名');
+  if (typeof host !== 'string' || host.length > 253) fail('host', 'host 必须是有效 DNS 主机名', 'host must be a valid DNS hostname');
   let parsed;
   try {
     parsed = new URL(`https://${host}`);
   } catch {
-    fail('host', 'host 必须是有效 DNS 主机名');
+    fail('host', 'host 必须是有效 DNS 主机名', 'host must be a valid DNS hostname');
   }
   if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
-    fail('host', 'host 必须是有效 DNS 主机名');
+    fail('host', 'host 必须是有效 DNS 主机名', 'host must be a valid DNS hostname');
   }
   const hostname = parsed.hostname.toLowerCase();
   const labels = hostname.split('.');
   if (labels.some((label) => label.length > 63 || !DNS_LABEL_RE.test(label))) {
-    fail('host', 'host 必须是有效 DNS 主机名');
+    fail('host', 'host 必须是有效 DNS 主机名', 'host must be a valid DNS hostname');
   }
   return parsed.host.toLowerCase();
 }
@@ -333,18 +337,18 @@ async function updateAssignedAccount(pool, fdeName, host, username, configured) 
 
 function validateUsername(username) {
   if (typeof username !== 'string' || username.trim().length === 0 || username.length > 255 || /[\u0000-\u001f\u007f]/.test(username)) {
-    fail('username', 'username 必须是非空文本');
+    fail('username', 'username 必须是非空文本', 'username must be non-empty text');
   }
 }
 
 function validateToken(token) {
-  if (typeof token !== 'string' || token.trim().length === 0) fail('token', 'token 不能为空');
-  if (token.length > MAX_TOKEN_LENGTH) fail('token', `token 长度不能超过 ${MAX_TOKEN_LENGTH}`);
+  if (typeof token !== 'string' || token.trim().length === 0) fail('token', 'token 不能为空', 'token must not be empty');
+  if (token.length > MAX_TOKEN_LENGTH) fail('token', `token 长度不能超过 ${MAX_TOKEN_LENGTH}`, `token length must not exceed ${MAX_TOKEN_LENGTH}`);
 }
 
 function validateProtocol(protocol) {
   if (protocol === undefined) return undefined;
-  if (protocol !== 'http' && protocol !== 'https') fail('protocol', 'protocol 必须是 http 或 https');
+  if (protocol !== 'http' && protocol !== 'https') fail('protocol', 'protocol 必须是 http 或 https', 'protocol must be http or https');
   return protocol;
 }
 

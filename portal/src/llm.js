@@ -1640,17 +1640,19 @@ export async function listFdeKeyUsage(pool, { gateway } = {}) {
 }
 
 function validateSlotModel(model, { slotName, modelId, providerId, expectedType, requireToolCalling }) {
-  const fail = (message) => {
+  const fail = (message, en) => {
+    // issue #803 S2-D3：本处 fail 是局部闭包（仅一个形参 message），英文对加为第二个可选形参；省略时行为逐字不变。
     throw new LlmError('validation_failed', message, {
+      en,
       details: { field: slotName, model_id: modelId },
     });
   };
-  if (isModelBlocked(model)) fail(`${slotName} 模型已停用`);
+  if (isModelBlocked(model)) fail(`${slotName} 模型已停用`, `the ${slotName} model is disabled`);
   const actualCredential = modelCredentialName(model);
-  if (providerId && actualCredential !== providerId) fail(`${slotName} 模型与 credential 不匹配`);
+  if (providerId && actualCredential !== providerId) fail(`${slotName} 模型与 credential 不匹配`, `the ${slotName} model does not match the credential`);
   const type = modelType(model);
-  if (type !== expectedType) fail(`${slotName} 模型类型不匹配（期望 ${expectedType}，实际 ${type}）`);
-  if (requireToolCalling && !modelToolCalling(model)) fail(`${slotName} 模型不支持 tool_calling`);
+  if (type !== expectedType) fail(`${slotName} 模型类型不匹配（期望 ${expectedType}，实际 ${type}）`, `the ${slotName} model type does not match (expected ${expectedType}, got ${type})`);
+  if (requireToolCalling && !modelToolCalling(model)) fail(`${slotName} 模型不支持 tool_calling`, `the ${slotName} model does not support tool_calling`);
   return model;
 }
 

@@ -184,10 +184,13 @@ export class UploadSettingsError extends Error {
   }
 }
 
-function fail(field, message, details) {
+function fail(field, message, details, en) {
+  // issue #803 S2-D3：本文件的 fail 第三形参已是 details，故英文对加为**第四个**可选形参（不硬改成与同族一致）；
+  // 省略时行为逐字不变。
   throw new UploadSettingsError('validation_failed', message, {
     httpStatus: 400,
     details: { field, min_bytes: MIN_MAX_FILE_BYTES, max_bytes: MAX_MAX_FILE_BYTES, ...details },
+    en,
   });
 }
 
@@ -324,13 +327,13 @@ export async function getUploadSettings({ pool, config = {}, log = console } = {
 /** 写侧校验：只接受**区间内的 JSON number**（口径 3：字符串一律 400，`''` 与 `'1e7'` 都不许存成半个值）。 */
 function cleanMaxFileBytes(value) {
   if (value === undefined || value === null) {
-    fail('maxFileBytes', 'maxFileBytes 是必填字段（JSON 整数，单位字节）');
+    fail('maxFileBytes', 'maxFileBytes 是必填字段（JSON 整数，单位字节）', undefined, 'maxFileBytes is required (a JSON integer, in bytes)');
   }
   if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
-    fail('maxFileBytes', 'maxFileBytes 必须是整数（JSON number，不接受字符串）');
+    fail('maxFileBytes', 'maxFileBytes 必须是整数（JSON number，不接受字符串）', undefined, 'maxFileBytes must be an integer (a JSON number, strings are not accepted)');
   }
   if (value < MIN_MAX_FILE_BYTES || value > MAX_MAX_FILE_BYTES) {
-    fail('maxFileBytes', `maxFileBytes 必须在 ${MIN_MAX_FILE_BYTES}–${MAX_MAX_FILE_BYTES} 字节之间`);
+    fail('maxFileBytes', `maxFileBytes 必须在 ${MIN_MAX_FILE_BYTES}–${MAX_MAX_FILE_BYTES} 字节之间`, undefined, `maxFileBytes must be between ${MIN_MAX_FILE_BYTES} and ${MAX_MAX_FILE_BYTES} bytes`);
   }
   return value;
 }
@@ -357,7 +360,7 @@ function cleanMaxFileBytes(value) {
  */
 export async function updateUploadSettings({ pool, config = {}, log = console, actorId = null, fields } = {}) {
   if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
-    fail('body', '请求体必须是对象');
+    fail('body', '请求体必须是对象', undefined, 'the request body must be an object');
   }
   const maxFileBytes = cleanMaxFileBytes(fields.maxFileBytes);
   // 事务必须钉在**同一条连接**上：`pool.query()` 每次另借一条连接，`FOR UPDATE` 拿到的行锁会随那条

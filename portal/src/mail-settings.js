@@ -57,16 +57,20 @@ RETURNING ${SETTINGS_COLUMNS}`;
 
 /** 校验/状态类错误：`httpStatus` + `details.field`（http.js 的统一信封按此映射，见 createServer 的 catch）。 */
 export class MailSettingsError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 S2-D3：可选英文对（同 AdminError/HttpError/各类 *Error 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状与 message 一字不动。
+    this.en = en;
   }
 }
 
-function fail(field, message) {
-  throw new MailSettingsError('validation_failed', message, { httpStatus: 400, details: { field } });
+function fail(field, message, en) {
+  // issue #803 S2-D3：可选英文对经第三个形参透传进 options.en；省略时行为逐字不变。
+  throw new MailSettingsError('validation_failed', message, { httpStatus: 400, details: { field }, en });
 }
 
 /** 邮箱口径（测试发信的 `to` 与 PUT 的 `smtp.from` 共用）。 */
@@ -133,14 +137,14 @@ export async function getMailSettings(pool) {
 
 function objectInput(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    fail('body', '请求体必须是对象');
+    fail('body', '请求体必须是对象', 'the request body must be an object');
   }
   return value;
 }
 
 function cleanTransport(value) {
   if (typeof value !== 'string' || !TRANSPORTS.has(value)) {
-    fail('transport', 'transport 必须是 disabled 或 smtp');
+    fail('transport', 'transport 必须是 disabled 或 smtp', 'transport must be disabled or smtp');
   }
   return value;
 }
@@ -148,31 +152,31 @@ function cleanTransport(value) {
 /** 文本列（host / user / from）：缺席 ⇒ 空串；给了就必须是字符串（类型错是 500 的源头，必须拦）。 */
 function cleanText(value, field, { maxLength }) {
   if (value === undefined || value === null) return '';
-  if (typeof value !== 'string') fail(field, `${field} 必须是字符串`);
+  if (typeof value !== 'string') fail(field, `${field} 必须是字符串`, `${field} must be a string`);
   const trimmed = value.trim();
-  if (trimmed.length > maxLength) fail(field, `${field} 长度超过上限 ${maxLength}`);
-  if (/[\u0000-\u001f\u007f]/.test(trimmed)) fail(field, `${field} 不能包含控制字符`);
+  if (trimmed.length > maxLength) fail(field, `${field} 长度超过上限 ${maxLength}`, `${field} exceeds the maximum length of ${maxLength}`);
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) fail(field, `${field} 不能包含控制字符`, `${field} must not contain control characters`);
   return trimmed;
 }
 
 function cleanPort(value) {
   if (value === undefined || value === null) return DEFAULT_PORT;
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 65535) {
-    fail('smtp.port', 'smtp.port 必须是 1–65535 的整数');
+    fail('smtp.port', 'smtp.port 必须是 1–65535 的整数', 'smtp.port must be an integer between 1 and 65535');
   }
   return value;
 }
 
 function cleanSecure(value) {
   if (value === undefined || value === null) return DEFAULT_SECURE;
-  if (typeof value !== 'boolean') fail('smtp.secure', 'smtp.secure 必须是布尔值');
+  if (typeof value !== 'boolean') fail('smtp.secure', 'smtp.secure 必须是布尔值', 'smtp.secure must be a boolean');
   return value;
 }
 
 function cleanTimeout(value, field) {
   if (value === undefined || value === null) return DEFAULT_TIMEOUTS[field];
   if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0 || value > MAX_TIMEOUT_MS) {
-    fail(`smtp.timeouts.${field}`, `smtp.timeouts.${field} 必须是 1–${MAX_TIMEOUT_MS} 的正整数`);
+    fail(`smtp.timeouts.${field}`, `smtp.timeouts.${field} 必须是 1–${MAX_TIMEOUT_MS} 的正整数`, `smtp.timeouts.${field} must be a positive integer between 1 and ${MAX_TIMEOUT_MS}`);
   }
   return value;
 }
@@ -188,8 +192,8 @@ function resolvePassword(input, current) {
   if (!Object.hasOwn(input, 'password')) return { value: currentValue, present: false };
   const raw = input.password;
   if (raw === null || raw === '') return { value: null, present: true };
-  if (typeof raw !== 'string') fail('password', 'password 必须是字符串、null 或空串');
-  if (raw.length > MAX_PASSWORD_LENGTH) fail('password', `password 长度超过上限 ${MAX_PASSWORD_LENGTH}`);
+  if (typeof raw !== 'string') fail('password', 'password 必须是字符串、null 或空串', 'password must be a string, null, or an empty string');
+  if (raw.length > MAX_PASSWORD_LENGTH) fail('password', `password 长度超过上限 ${MAX_PASSWORD_LENGTH}`, `password exceeds the maximum length of ${MAX_PASSWORD_LENGTH}`);
   return { value: raw, present: true };
 }
 
@@ -220,12 +224,12 @@ export async function updateMailSettings({ pool, actorId = null, fields } = {}) 
   const input = objectInput(fields);
   const transport = cleanTransport(input.transport);
   if (input.smtp === null || typeof input.smtp !== 'object' || Array.isArray(input.smtp)) {
-    fail('smtp', 'smtp 必须是对象');
+    fail('smtp', 'smtp 必须是对象', 'smtp must be an object');
   }
   const smtp = input.smtp;
   const timeouts = smtp.timeouts === undefined || smtp.timeouts === null ? {} : smtp.timeouts;
   if (typeof timeouts !== 'object' || Array.isArray(timeouts)) {
-    fail('smtp.timeouts', 'smtp.timeouts 必须是对象');
+    fail('smtp.timeouts', 'smtp.timeouts 必须是对象', 'smtp.timeouts must be an object');
   }
 
   const host = cleanText(smtp.host, 'smtp.host', { maxLength: MAX_HOST_LENGTH });
@@ -239,9 +243,9 @@ export async function updateMailSettings({ pool, actorId = null, fields } = {}) 
 
   // 只在真要发信时才要求「配全」：disabled 允许保留半套（先关后配）。
   if (transport === 'smtp') {
-    if (host === '') fail('smtp.host', 'transport=smtp 时 smtp.host 为必填字段');
-    if (from === '') fail('smtp.from', 'transport=smtp 时 smtp.from 为必填字段');
-    if (!isEmail(from)) fail('smtp.from', 'smtp.from 必须是有效邮箱地址');
+    if (host === '') fail('smtp.host', 'transport=smtp 时 smtp.host 为必填字段', 'smtp.host is required when transport=smtp');
+    if (from === '') fail('smtp.from', 'transport=smtp 时 smtp.from 为必填字段', 'smtp.from is required when transport=smtp');
+    if (!isEmail(from)) fail('smtp.from', 'smtp.from 必须是有效邮箱地址', 'smtp.from must be a valid email address');
   }
 
   const current = (await pool.query(SELECT_SQL)).rows?.[0] ?? null;
