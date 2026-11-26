@@ -53,6 +53,15 @@ export class FakePool {
   }
 
   /**
+   * #828 P1：与 `projectFileUpload` 同口径的语言偏好投影——只有 SELECT 里真的写了
+   * `locale` 才回这一列（`findSessionUser` 的 SELECT 写了 `u.locale`）。值**不做兼平**：
+   * 直接透传 `user.locale`（可为 `null`），产品侧 `row.locale ?? null` 自己兼平。
+   */
+  projectLocale(sql, user) {
+    return /\blocale\b/.test(sql) ? { locale: user.locale ?? null } : {};
+  }
+
+  /**
    * feat-261110-02（迁移 0030）「允许用 TOTP 登录」这一列，同一条 fake 红线：SELECT 里点了名才回，
    * 漏选 ⇒ 值恒 `undefined` ⇒ 产品侧 `!== false` 会得 true（存量默认），而 `=== true`（admin DTO）得 false
    * ⇒ 漏补列在两侧都有用例会红，不是被 fake 兼平成假绿。同样**不做布尔兼平**。
@@ -216,6 +225,9 @@ export class FakePool {
             last_seen_at: s.last_seen_at,
             // #472：同上（`findSessionUser` 的 SELECT 里写的是 `u.file_upload_enabled`）。
             ...this.projectFileUpload(sql, u),
+            // #828 P1：同上口径（`findSessionUser` 的 SELECT 里写的是 `u.locale`）。SQL 里没这一列
+            // 就不回（=> 产品代码 `row.locale ?? null` 得 null），实现漏选这一列时用例会红，不由 fake 兼平。
+            ...this.projectLocale(sql, u),
           },
         ],
       };
@@ -605,6 +617,8 @@ export class FakePool {
           must_change_password: sql.includes('must_change_password')
             ? u.must_change_password === true : undefined,
           ...this.projectFileUpload(sql, u),
+          // #828 P1：同口径（`findActiveByToken` 的 SELECT 写了 `u.locale`）——SELECT 点了名才回，不兼平。
+          ...this.projectLocale(sql, u),
         }],
       };
     }
