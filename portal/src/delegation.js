@@ -38,11 +38,14 @@ import { validateFdeName } from './projects.js';
 
 /** 与 `SessionError` / `DirError` 同形的错误载体（`http.js` 顶层统一映射到标准错误信封）。 */
 export class DelegationError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 G 片：可选英文对（同 MacroError/InternalError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 DelegationError 分支按请求 locale 经 pickMessage 读 `err.en`，缺省照旧出中文——错误体形状与 message 一字不动。
+    this.en = en;
   }
 }
 
@@ -89,7 +92,7 @@ const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 
 function assertShape(value, re, field, label) {
   if (typeof value !== 'string' || !re.test(value)) {
-    throw new DelegationError('validation_failed', `${label} 形态非法`, { details: { field } });
+    throw new DelegationError('validation_failed', `${label} 形态非法`, { details: { field }, en: `invalid ${label}` });
   }
   return value;
 }
@@ -222,7 +225,7 @@ function activityCacheSet(key, core) {
 function assertUnderRoot(root, target, field) {
   const rel = path.relative(root, target);
   if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-    throw new DelegationError('validation_failed', '路径逃逸 delegation 根', { details: { field } });
+    throw new DelegationError('validation_failed', '路径逃逸 delegation 根', { details: { field }, en: 'path escapes the delegation root' });
   }
   return target;
 }
@@ -233,12 +236,13 @@ function assertUnderRoot(root, target, field) {
  */
 export function delegationRoot({ userSpaceRoot, fdeName } = {}) {
   if (typeof userSpaceRoot !== 'string' || userSpaceRoot === '') {
-    throw new DelegationError('internal', 'userSpaceRoot 未配置', { httpStatus: 500 });
+    throw new DelegationError('internal', 'userSpaceRoot 未配置', { httpStatus: 500, en: 'userSpaceRoot is not configured' });
   }
   if (typeof fdeName !== 'string' || fdeName === '' || !validateFdeName(fdeName).ok) {
     // 与 sessions.js:217-224 逐字同口径（同一个 field、同一句话），不另造词汇。
     throw new DelegationError('validation_failed', '当前用户未配置 fde_name，无法确定家目录', {
       details: { field: 'fde_name' },
+      en: 'the current user has no fde_name configured, cannot determine the home directory',
     });
   }
   return path.resolve(userSpaceRoot, fdeName, 'home', 'delegation');
@@ -582,6 +586,7 @@ export async function getDelegateTranscript({
   if (!Number.isInteger(tail) || tail < 1 || tail > DELEGATE_TAIL_MAX) {
     throw new DelegationError('validation_failed', `tail 必须是 1..${DELEGATE_TAIL_MAX} 的整数`, {
       details: { field: 'tail' },
+      en: `tail must be an integer between 1 and ${DELEGATE_TAIL_MAX}`,
     });
   }
 
@@ -618,6 +623,7 @@ export async function getDelegateTranscript({
   if (st.size > DELEGATE_TRANSCRIPT_MAX_BYTES) {
     throw new DelegationError('payload_too_large', '子 run 账本超过读取上限', {
       httpStatus: 413, details: { size: st.size, max_bytes: DELEGATE_TRANSCRIPT_MAX_BYTES },
+      en: 'child run ledger exceeds the read limit',
     });
   }
 

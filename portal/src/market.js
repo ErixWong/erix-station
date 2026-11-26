@@ -77,16 +77,19 @@ export const SCAN_PATTERNS = Object.freeze([
 // ---------------------------------------------------------------------------
 
 export class MarketError extends Error {
-  constructor(message, { code = 'validation_failed', httpStatus = 400, details = {} } = {}) {
+  constructor(message, { code = 'validation_failed', httpStatus = 400, details = {}, en } = {}) {
     super(message);
     this.name = 'MarketError';
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 G 片：可选英文对（同 MacroError/InternalError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 MarketError 分支按请求 locale 经 pickMessage 读 `err.en`，缺省照旧出中文——错误体形状与 message 一字不动。
+    this.en = en;
   }
 }
 
-const bad = (message, details) => new MarketError(message, { code: 'validation_failed', details });
+const bad = (message, details, en) => new MarketError(message, { code: 'validation_failed', details, en });
 
 // ---------------------------------------------------------------------------
 // §3 之一：路径与 bundle 形状（纯函数，全部可单测）
@@ -99,19 +102,19 @@ const bad = (message, details) => new MarketError(message, { code: 'validation_f
  * @returns {string} 归一化后的相对路径（`/` 分隔）
  */
 export function validateFilePath(raw) {
-  if (typeof raw !== 'string' || raw.length === 0) throw bad('bundle.files[].path 必须是非空字符串', { field: 'bundle.files[].path' });
+  if (typeof raw !== 'string' || raw.length === 0) throw bad('bundle.files[].path 必须是非空字符串', { field: 'bundle.files[].path' }, 'bundle.files[].path must be a non-empty string');
   if (raw.length > LIMITS.maxPathLen) {
-    throw bad(`路径超过 ${LIMITS.maxPathLen} 字符`, { field: 'path', path: raw.slice(0, 80), max: LIMITS.maxPathLen });
+    throw bad(`路径超过 ${LIMITS.maxPathLen} 字符`, { field: 'path', path: raw.slice(0, 80), max: LIMITS.maxPathLen }, `path exceeds ${LIMITS.maxPathLen} characters`);
   }
-  if (raw.includes('\\')) throw bad('路径不得包含反斜杠（Windows 分隔符在容器里没有含义）', { field: 'path', path: raw });
-  if (raw.startsWith('/')) throw bad('路径不得是绝对路径', { field: 'path', path: raw });
-  if (raw.endsWith('/')) throw bad('路径不得以 / 结尾（bundle 里只有文件，没有目录项）', { field: 'path', path: raw });
+  if (raw.includes('\\')) throw bad('路径不得包含反斜杠（Windows 分隔符在容器里没有含义）', { field: 'path', path: raw }, 'path must not contain a backslash (a Windows separator has no meaning inside the container)');
+  if (raw.startsWith('/')) throw bad('路径不得是绝对路径', { field: 'path', path: raw }, 'path must not be an absolute path');
+  if (raw.endsWith('/')) throw bad('路径不得以 / 结尾（bundle 里只有文件，没有目录项）', { field: 'path', path: raw }, 'path must not end with / (a bundle contains only files, no directory entries)');
   const segs = raw.split('/');
   for (const s of segs) {
-    if (s === '' ) throw bad('路径不得有空段（连续斜杠 / 前导 ./）', { field: 'path', path: raw });
-    if (s === '..') throw bad('路径不得包含 .. 段（zip-slip）', { field: 'path', path: raw });
-    if (s === '.') throw bad('路径不得包含 . 段（请给规范化的相对路径）', { field: 'path', path: raw });
-    if (s.startsWith('.')) throw bad('不允许隐藏文件（`.` 开头一律不在白名单内）', { field: 'path', path: raw });
+    if (s === '' ) throw bad('路径不得有空段（连续斜杠 / 前导 ./）', { field: 'path', path: raw }, 'path must not contain empty segments (consecutive slashes / leading ./)');
+    if (s === '..') throw bad('路径不得包含 .. 段（zip-slip）', { field: 'path', path: raw }, 'path must not contain a .. segment (zip-slip)');
+    if (s === '.') throw bad('路径不得包含 . 段（请给规范化的相对路径）', { field: 'path', path: raw }, 'path must not contain a . segment (please provide a normalized relative path)');
+    if (s.startsWith('.')) throw bad('不允许隐藏文件（`.` 开头一律不在白名单内）', { field: 'path', path: raw }, "hidden files are not allowed (anything starting with `.` is not on the whitelist)");
   }
   return raw;
 }
@@ -125,23 +128,23 @@ export function validateFilePath(raw) {
 export function validateLayout(files) {
   const paths = files.map((f) => f.path);
   if (!paths.includes(ENTRYPOINT)) {
-    throw bad(`包根必须有 ${ENTRYPOINT}`, { field: 'bundle', reason: 'missing_entrypoint', required: ENTRYPOINT });
+    throw bad(`包根必须有 ${ENTRYPOINT}`, { field: 'bundle', reason: 'missing_entrypoint', required: ENTRYPOINT }, `the package root must contain ${ENTRYPOINT}`);
   }
   for (const p of paths) {
     const segs = p.split('/');
     if (segs.length === 1) {
       if (!ALLOWED_ROOT_FILES.includes(segs[0])) {
         throw bad(`根目录只允许 ${ALLOWED_ROOT_FILES.join(' / ')}，出现 ${segs[0]}`,
-          { field: 'bundle', reason: 'unexpected_root_file', path: p, allowed: ALLOWED_ROOT_FILES });
+          { field: 'bundle', reason: 'unexpected_root_file', path: p, allowed: ALLOWED_ROOT_FILES }, `the package root may only contain ${ALLOWED_ROOT_FILES.join(' / ')}, found ${segs[0]}`);
       }
     } else {
       if (!ALLOWED_DIRS.includes(segs[0])) {
         throw bad(`子目录只允许 ${ALLOWED_DIRS.join(' / ')}，出现 ${segs[0]}/`,
-          { field: 'bundle', reason: 'unexpected_dir', path: p, allowed: ALLOWED_DIRS });
+          { field: 'bundle', reason: 'unexpected_dir', path: p, allowed: ALLOWED_DIRS }, `subdirectories may only be ${ALLOWED_DIRS.join(' / ')}, found ${segs[0]}/`);
       }
       if (segs.at(-1) === ENTRYPOINT) {
         throw bad(`${ENTRYPOINT} 只能出现在包根（子目录里的那份不会被任何入口读到）`,
-          { field: 'bundle', reason: 'entrypoint_in_subdir', path: p });
+          { field: 'bundle', reason: 'entrypoint_in_subdir', path: p }, `${ENTRYPOINT} may only appear at the package root (the copy in a subdirectory would never be read by any entrypoint)`);
       }
     }
   }
@@ -149,17 +152,17 @@ export function validateLayout(files) {
 
 /** base64 → Buffer：严格形状（Node 的 `Buffer.from(b64,'base64')` 会**静默丢掉**非法字符，半个值生效比报错难查）。 */
 export function decodeBase64File(raw, p) {
-  if (typeof raw !== 'string') throw bad('bundle.files[].content_base64 必须是字符串', { field: 'content_base64', path: p });
+  if (typeof raw !== 'string') throw bad('bundle.files[].content_base64 必须是字符串', { field: 'content_base64', path: p }, 'bundle.files[].content_base64 must be a string');
   if (raw.length > 0 && !/^[A-Za-z0-9+/]*={0,2}$/.test(raw)) {
-    throw bad('content_base64 不是规范 base64（含空白 / 换行 / 非法字符一律拒绝）', { field: 'content_base64', path: p });
+    throw bad('content_base64 不是规范 base64（含空白 / 换行 / 非法字符一律拒绝）', { field: 'content_base64', path: p }, 'content_base64 is not canonical base64 (whitespace / newlines / illegal characters are all rejected)');
   }
-  if (raw.length % 4 !== 0) throw bad('content_base64 长度不是 4 的倍数', { field: 'content_base64', path: p });
+  if (raw.length % 4 !== 0) throw bad('content_base64 长度不是 4 的倍数', { field: 'content_base64', path: p }, 'content_base64 length is not a multiple of 4');
   const buf = Buffer.from(raw, 'base64');
   // P0 的技能包是**文本**（源码 / md）：非 UTF-8 一律拒绝，否则静态正则与 SKILL.md 渲染都在字节云上做。
   try {
     new TextDecoder('utf-8', { fatal: true }).decode(buf);
   } catch {
-    throw bad('文件内容不是合法 UTF-8（P0 只分发文本文件）', { field: 'content_base64', path: p, reason: 'not_utf8' });
+    throw bad('文件内容不是合法 UTF-8（P0 只分发文本文件）', { field: 'content_base64', path: p, reason: 'not_utf8' }, 'file content is not valid UTF-8 (P0 distributes text files only)');
   }
   return buf;
 }
@@ -341,38 +344,38 @@ export function scanSecurity(files) {
  */
 export function validateBundle({ slug, whenToUse, bundle }) {
   if (!SKILL_SLUG_RE.test(String(slug ?? ''))) {
-    throw bad(`slug 必须匹配 ${SKILL_SLUG_RE.source}`, { field: 'slug', slug });
+    throw bad(`slug 必须匹配 ${SKILL_SLUG_RE.source}`, { field: 'slug', slug }, `slug must match ${SKILL_SLUG_RE.source}`);
   }
   const w = typeof whenToUse === 'string' ? whenToUse.trim() : '';
   if (w.length < LIMITS.whenToUseMin || w.length > LIMITS.whenToUseMax) {
     throw bad('when_to_use 必填且长度 8..500', {
       field: 'when_to_use', min: LIMITS.whenToUseMin, max: LIMITS.whenToUseMax, actual: w.length,
-    });
+    }, 'when_to_use is required and must be 8..500 characters');
   }
   if (bundle === null || typeof bundle !== 'object' || !Array.isArray(bundle.files)) {
-    throw bad('bundle.files 必须是数组', { field: 'bundle.files' });
+    throw bad('bundle.files 必须是数组', { field: 'bundle.files' }, 'bundle.files must be an array');
   }
-  if (bundle.files.length === 0) throw bad('bundle.files 不能为空', { field: 'bundle.files', reason: 'empty_bundle' });
+  if (bundle.files.length === 0) throw bad('bundle.files 不能为空', { field: 'bundle.files', reason: 'empty_bundle' }, 'bundle.files must not be empty');
   if (bundle.files.length > LIMITS.maxFiles) {
-    throw bad('文件数超过上限', { field: 'bundle.files', max: LIMITS.maxFiles, actual: bundle.files.length });
+    throw bad('文件数超过上限', { field: 'bundle.files', max: LIMITS.maxFiles, actual: bundle.files.length }, 'file count exceeds the limit');
   }
 
   const files = [];
   const seen = new Set();
   let total = 0;
   for (const entry of bundle.files) {
-    if (entry === null || typeof entry !== 'object') throw bad('bundle.files[] 必须是对象', { field: 'bundle.files[]' });
+    if (entry === null || typeof entry !== 'object') throw bad('bundle.files[] 必须是对象', { field: 'bundle.files[]' }, 'bundle.files[] must be an object');
     const p = validateFilePath(entry.path);
     // 重复路径必须在**解码前**拒：后写的会静默盖掉前一个，落盘只有一份，而 manifest 记的是两条。
-    if (seen.has(p)) throw bad('包内路径重复', { field: 'path', path: p, reason: 'duplicate_path' });
+    if (seen.has(p)) throw bad('包内路径重复', { field: 'path', path: p, reason: 'duplicate_path' }, 'duplicate path inside the package');
     seen.add(p);
     const buf = decodeBase64File(entry.content_base64, p);
     if (buf.length > LIMITS.maxFileBytes) {
-      throw bad('单文件超过 512 KiB', { field: 'bytes', path: p, max: LIMITS.maxFileBytes, actual: buf.length });
+      throw bad('单文件超过 512 KiB', { field: 'bytes', path: p, max: LIMITS.maxFileBytes, actual: buf.length }, 'a single file exceeds 512 KiB');
     }
     total += buf.length;
     if (total > LIMITS.maxTotalBytes) {
-      throw bad('包总大小超过 2 MiB', { field: 'bytes', max: LIMITS.maxTotalBytes, actual: total });
+      throw bad('包总大小超过 2 MiB', { field: 'bytes', max: LIMITS.maxTotalBytes, actual: total }, 'total package size exceeds 2 MiB');
     }
     files.push({ path: p, content: buf, bytes: buf.length });
   }
@@ -383,34 +386,34 @@ export function validateBundle({ slug, whenToUse, bundle }) {
   if (shapeHits.length > 0) {
     throw new MarketError(
       `包里有 ${shapeHits.length} 处「常驻/服务」形状（应做成 MCP，见 docs/design/skill-authoring.md §5）`,
-      { code: 'capability_package_shape', httpStatus: 400, details: { hits: shapeHits } });
+      { code: 'capability_package_shape', httpStatus: 400, details: { hits: shapeHits }, en: `package contains ${shapeHits.length} long-running/service shape(s) (should be implemented as an MCP; see docs/design/skill-authoring.md §5)` });
   }
   const entry = files.find((f) => f.path === ENTRYPOINT);
   const source = entry.content.toString('utf8');
   const { skillId, tools } = extractSkillMeta(source);
   if (skillId === null) {
     throw bad(`${ENTRYPOINT} 里静态取不到 id 字面量（平台不执行技能代码，取不到 = 无法交叉核对）`,
-      { field: 'bundle', reason: 'skill_id_unreadable' });
+      { field: 'bundle', reason: 'skill_id_unreadable' }, `could not statically read an id literal from ${ENTRYPOINT} (the platform does not execute skill code; unreadable = cannot cross-check)`);
   }
   if (skillId !== slug) {
     throw bad(`源码里的 skill.id="${skillId}" 与 slug="${slug}" 不一致`,
-      { field: 'bundle', reason: 'skill_id_mismatch', skill_id: skillId, slug });
+      { field: 'bundle', reason: 'skill_id_mismatch', skill_id: skillId, slug }, "the source's skill.id=\"${skillId}\" does not match slug=\"${slug}\"");
   }
   if (tools.length < 1 || tools.length > LIMITS.maxTools) {
-    throw bad(`tools[] 条数必须 1..${LIMITS.maxTools}`, { field: 'bundle', reason: 'tools_count', actual: tools.length });
+    throw bad(`tools[] 条数必须 1..${LIMITS.maxTools}`, { field: 'bundle', reason: 'tools_count', actual: tools.length }, `tools[] count must be 1..${LIMITS.maxTools}`);
   }
   const names = new Set();
   for (const t of tools) {
     if (!TOOL_NAME_RE.test(t.name)) {
-      throw bad(`工具名必须匹配 ${TOOL_NAME_RE.source}`, { field: 'bundle', reason: 'tool_name_invalid', name: t.name });
+      throw bad(`工具名必须匹配 ${TOOL_NAME_RE.source}`, { field: 'bundle', reason: 'tool_name_invalid', name: t.name }, `tool name must match ${TOOL_NAME_RE.source}`);
     }
-    if (names.has(t.name)) throw bad('工具名重复', { field: 'bundle', reason: 'tool_name_duplicate', name: t.name });
+    if (names.has(t.name)) throw bad('工具名重复', { field: 'bundle', reason: 'tool_name_duplicate', name: t.name }, 'duplicate tool name');
     names.add(t.name);
     if (t.description.trim().length < LIMITS.toolDescMin) {
       throw bad('工具 description 太短（模型靠这句话决定调不调）', {
         field: 'bundle', reason: 'tool_description_short', name: t.name,
         min: LIMITS.toolDescMin, actual: t.description.trim().length,
-      });
+      }, 'tool description is too short (the model decides whether to call based on this sentence)');
     }
   }
 
@@ -427,23 +430,23 @@ export function validateBundle({ slug, whenToUse, bundle }) {
 /** item 元数据校验（§7 的字段面；§3 只点名了 slug/when_to_use，其余按「必填就拒空」的最小口径）。 */
 export function validateMetadata(fields, { requireAll = false } = {}) {
   if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
-    throw bad('请求体必须是 JSON 对象', { field: 'body' });
+    throw bad('请求体必须是 JSON 对象', { field: 'body' }, 'request body must be a JSON object');
   }
   const out = {};
   const needStr = (key, { max = 500, min = 1 } = {}) => {
     const v = fields[key];
     if (v === undefined) {
-      if (requireAll) throw bad(`${key} 必填`, { field: key });
+      if (requireAll) throw bad(`${key} 必填`, { field: key }, `${key} is required`);
       return undefined;
     }
     if (typeof v !== 'string' || v.trim().length < min || v.length > max) {
-      throw bad(`${key} 必须是 ${min}..${max} 字符的字符串`, { field: key, min, max });
+      throw bad(`${key} 必须是 ${min}..${max} 字符的字符串`, { field: key, min, max }, `${key} must be a string of ${min}..${max} characters`);
     }
     return v.trim();
   };
   if (fields.slug !== undefined) {
     const s = needStr('slug', { max: 64 });
-    if (!SKILL_SLUG_RE.test(s)) throw bad(`slug 必须匹配 ${SKILL_SLUG_RE.source}`, { field: 'slug', slug: s });
+    if (!SKILL_SLUG_RE.test(s)) throw bad(`slug 必须匹配 ${SKILL_SLUG_RE.source}`, { field: 'slug', slug: s }, `slug must match ${SKILL_SLUG_RE.source}`);
     out.slug = s;
   }
   const name = needStr('name', { max: 120 });
@@ -452,16 +455,16 @@ export function validateMetadata(fields, { requireAll = false } = {}) {
   if (summary !== undefined) out.summary = summary;
   if (fields.when_to_use !== undefined || requireAll) {
     const w = needStr('when_to_use', { max: LIMITS.whenToUseMax });
-    if (w === undefined) throw bad('when_to_use 必填（L3 索引的路由信号，缺了等于装了但模型不知道何时用）', { field: 'when_to_use' });
+    if (w === undefined) throw bad('when_to_use 必填（L3 索引的路由信号，缺了等于装了但模型不知道何时用）', { field: 'when_to_use' }, 'when_to_use is required (it is the routing signal for the L3 index; without it the model will not know when to use the installed skill)');
     if (w.length < LIMITS.whenToUseMin) {
-      throw bad('when_to_use 长度 8..500', { field: 'when_to_use', min: LIMITS.whenToUseMin, max: LIMITS.whenToUseMax });
+      throw bad('when_to_use 长度 8..500', { field: 'when_to_use', min: LIMITS.whenToUseMin, max: LIMITS.whenToUseMax }, 'when_to_use length must be 8..500');
     }
     out.when_to_use = w;
   }
   if (fields.version !== undefined) {
     const v = needStr('version', { max: 40 });
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(v)) {
-      throw bad('version 只允许 [A-Za-z0-9._-]（它进 capability_files 主键与目录侧账目）', { field: 'version', version: v });
+      throw bad('version 只允许 [A-Za-z0-9._-]（它进 capability_files 主键与目录侧账目）', { field: 'version', version: v }, 'version may only contain [A-Za-z0-9._-] (it goes into the capability_files primary key and the directory-side ledger)');
     }
     out.version = v;
   }
@@ -473,17 +476,17 @@ export function validateMetadata(fields, { requireAll = false } = {}) {
   }
   if (fields.tags !== undefined) {
     if (!Array.isArray(fields.tags) || fields.tags.length > 12 || fields.tags.some((t) => typeof t !== 'string' || !t || t.length > 40)) {
-      throw bad('tags 必须是最多 12 条、每条 ≤ 40 字符的字符串数组', { field: 'tags', max: 12 });
+      throw bad('tags 必须是最多 12 条、每条 ≤ 40 字符的字符串数组', { field: 'tags', max: 12 }, 'tags must be a string array of at most 12 entries, each at most 40 characters');
     }
     out.tags = fields.tags;
   }
   if (fields.kind !== undefined) {
-    if (!['skill', 'mcp'].includes(fields.kind)) throw bad("kind 只允许 'skill' | 'mcp'", { field: 'kind' });
+    if (!['skill', 'mcp'].includes(fields.kind)) throw bad("kind 只允许 'skill' | 'mcp'", { field: 'kind' }, "kind must be one of 'skill' | 'mcp'");
     out.kind = fields.kind;
   }
   if (fields.state !== undefined) {
     if (!['draft', 'published', 'retired'].includes(fields.state)) {
-      throw bad("state 只允许 'draft' | 'published' | 'retired'", { field: 'state' });
+      throw bad("state 只允许 'draft' | 'published' | 'retired'", { field: 'state' }, "state must be one of 'draft' | 'published' | 'retired'");
     }
     out.state = fields.state;
   }
@@ -597,13 +600,14 @@ export function skillsRootDir(config, fdeName) {
     throw new MarketError(`FDE 名不合法：${fdeName}`, {
       code: 'capability_install_failed', httpStatus: 500,
       details: { reason: 'invalid_fde_name', fde_name: fdeName },
+      en: `invalid FDE name: ${fdeName}`,
     });
   }
   return path.join(config.userSpaceRoot, fdeName, 'home', '.erix', 'skills');
 }
 
 export function skillDirFor(config, fdeName, slug) {
-  if (!SKILL_SLUG_RE.test(String(slug ?? ''))) throw new MarketError(`slug 不合法：${slug}`, { code: 'capability_not_found', httpStatus: 404, details: { slug } });
+  if (!SKILL_SLUG_RE.test(String(slug ?? ''))) throw new MarketError(`slug 不合法：${slug}`, { code: 'capability_not_found', httpStatus: 404, details: { slug }, en: `invalid slug: ${slug}` });
   return path.join(skillsRootDir(config, fdeName), slug);
 }
 
@@ -649,6 +653,7 @@ function diskOps({ config, ops, log = console, spawnImpl = null }) {
       + '（不把 payload 塑进管道之前先拦，免得子进程白跑）', {
       code: 'capability_install_failed', httpStatus: 500,
       details: { reason: 'payload_too_large', bytes, max_bytes: DISK_PAYLOAD_MAX_BYTES },
+      en: `disk-write directive payload exceeds the size limit: ${bytes} > ${DISK_PAYLOAD_MAX_BYTES} (rejected before it is piped, to avoid a wasted child-process run)`,
     });
   }
   const spawn = spawnImpl ?? config?.spawnImpl ?? defaultDiskSpawn;
@@ -670,6 +675,7 @@ function diskOps({ config, ops, log = console, spawnImpl = null }) {
     throw new MarketError(`落盘子进程拉起失败：${r.error.message}`, {
       code: 'capability_install_failed', httpStatus: 500,
       details: { reason: `spawn_failed_${r.error.code || r.error.name || 'unknown'}`, dropped: Boolean(opts.uid) },
+      en: `failed to spawn the disk-write child process: ${r.error.message}`,
     });
   }
   if (r?.status !== 0) {
@@ -683,6 +689,7 @@ function diskOps({ config, ops, log = console, spawnImpl = null }) {
     } catch { /* stderr 不是 JSON（helper 自己炸了/没跑起来）：原文已在 details.stderr */ }
     throw new MarketError(`落盘子进程失败：${code}${stderr ? ` ${stderr.slice(0, 300)}` : ''}`, {
       code: 'capability_install_failed', httpStatus: 500, details,
+      en: `disk-write child process failed: ${code}${stderr ? ` ${stderr.slice(0, 300)}` : ''}`,
     });
   }
   if (stderr) log.warn?.(`[market] 落盘子进程 stderr（退出 0，不阻断）：${stderr.slice(0, 300)}`);
@@ -692,11 +699,13 @@ function diskOps({ config, ops, log = console, spawnImpl = null }) {
   } catch (e) {
     throw new MarketError(`落盘子进程回执不是 JSON：${String(r.stdout ?? '').slice(0, 200)}`, {
       code: 'capability_install_failed', httpStatus: 500, details: { reason: 'helper_reply_unparsable', child_error: e.message },
+      en: `disk-write child process reply is not JSON: ${String(r.stdout ?? '').slice(0, 200)}`,
     });
   }
   if (!parsed || parsed.ok !== true || !Array.isArray(parsed.results)) {
     throw new MarketError('落盘子进程回执形状不对', {
       code: 'capability_install_failed', httpStatus: 500, details: { reason: 'helper_reply_malformed' },
+      en: 'disk-write child process reply has an unexpected shape',
     });
   }
   return parsed;
@@ -762,6 +771,7 @@ export function writeSkillDir({ config, fdeName, slug, files, log = console, spa
     throw new MarketError(`技能落盘失败：${e.message}`, {
       code: 'capability_install_failed', httpStatus: 500,
       details: { reason: e.code || e.name || 'write_failed', slug, path: target },
+      en: `failed to write skill to disk: ${e.message}`,
     });
   }
   return { dir: target, files: ops.filter((o) => o.op === 'write').length };
@@ -785,6 +795,7 @@ export function removeSkillDir({ config, fdeName, slug, log = console, spawnImpl
     throw new MarketError(`技能目录删除失败：${e.message}`, {
       code: 'capability_install_failed', httpStatus: 500,
       details: { reason: e.code || e.name || 'remove_failed', slug, path: target },
+      en: `failed to remove skill directory: ${e.message}`,
     });
   }
 }
@@ -853,7 +864,7 @@ export async function publishItem({ pool, actorId = null, fields = {} }) {
   if (meta.kind === 'mcp') return publishMcpItem({ pool, actorId, meta, fields });
   // bundle 不是元数据（它是字节），不进 `validateMetadata` 的白名单，从**原始体**里取。
   const bundle = fields.bundle;
-  if (bundle === undefined || bundle === null) throw bad('bundle 必填（发布必须带包）', { field: 'bundle' });
+  if (bundle === undefined || bundle === null) throw bad('bundle 必填（发布必须带包）', { field: 'bundle' }, 'bundle is required (publishing must include a package)');
   const { files, manifest, security } = validateBundle({
     slug: meta.slug, whenToUse: meta.when_to_use, bundle,
   });
@@ -890,7 +901,7 @@ export async function updateItem({ pool, actorId = null, itemId, fields = {} }) 
     const merged = { ...manifest, ...mcpManifest };
     if (fields.transport !== undefined && fields.transport !== asJson(cur.manifest, {}).transport
         && !meta.version) {
-      throw bad('改 transport 必须同时 bump version', { field: 'version', current: cur.version });
+      throw bad('改 transport 必须同时 bump version', { field: 'version', current: cur.version }, 'changing the transport must bump the version as well');
     }
     return withTransaction(pool, async (client) => {
       const r = await client.query(
@@ -906,10 +917,10 @@ export async function updateItem({ pool, actorId = null, itemId, fields = {} }) 
   }
 
   if (fields.bundle !== undefined && fields.bundle !== null) {
-    if (!meta.version) throw bad('带 bundle 时必须给新的 version', { field: 'version' });
+    if (!meta.version) throw bad('带 bundle 时必须给新的 version', { field: 'version' }, 'when a bundle is present you must supply a new version');
     if (meta.version === cur.version) {
       throw bad('bundle 变了就必须换 version（包内容按 (item, version) 不可变）',
-        { field: 'version', current: cur.version });
+        { field: 'version', current: cur.version }, 'the bundle changed, so the version must change too (package files are immutable per (item, version))');
     }
     const v = validateBundle({ slug: next.slug, whenToUse: next.when_to_use, bundle: fields.bundle });
     ({ manifest, security } = v);
@@ -937,8 +948,8 @@ export async function updateItem({ pool, actorId = null, itemId, fields = {} }) 
 }
 
 const kindUnsupported = (slug) => new MarketError('kind="mcp" 的条目本期待发布/安装（runner 侧 MCP 客户端是 P1）',
-  { code: 'capability_kind_unsupported', httpStatus: 409, details: { slug } });
-const notFound = (key) => new MarketError('条目不存在', { code: 'capability_not_found', httpStatus: 404, details: { item: key } });
+  { code: 'capability_kind_unsupported', httpStatus: 409, details: { slug }, en: 'entries of kind "mcp" cannot be published or installed in this iteration (the runner-side MCP client is P1)' });
+const notFound = (key) => new MarketError('条目不存在', { code: 'capability_not_found', httpStatus: 404, details: { item: key }, en: 'item does not exist' });
 
 /**
  * §7 的 URL 动词 → 状态机取值（`capability_items.state` 的域）。
@@ -960,6 +971,7 @@ export function stateForVerb(verb) {
     throw new MarketError(`未知的状态动词：${verb}`, {
       code: 'capability_state_verb_unknown', httpStatus: 405,
       details: { verb, allowed: Object.keys(STATE_VERBS) },
+      en: `unknown state verb: ${verb}`,
     });
   }
   return state;
@@ -967,7 +979,7 @@ export function stateForVerb(verb) {
 
 /** §7 publish / retire：状态机只有 `draft → published → retired` 三个点，跳迁交给调用方决定语义。 */
 export async function setItemState({ pool, itemId, state }) {
-  if (!['draft', 'published', 'retired'].includes(state)) throw bad("state 只允许 draft/published/retired", { field: 'state' });
+  if (!['draft', 'published', 'retired'].includes(state)) throw bad("state 只允许 draft/published/retired", { field: 'state' }, 'state must be one of draft/published/retired');
   if (state === 'published') {
     const cur = (await pool.query('SELECT kind, manifest FROM capability_items WHERE id = $1', [itemId])).rows[0];
     if (!cur) throw notFound(itemId);
@@ -979,7 +991,7 @@ export async function setItemState({ pool, itemId, state }) {
         || (m.transport === 'http' && typeof m.url === 'string' && m.url !== '');
       if (!ok) {
         throw new MarketError('MCP 条目缺 transport/command/url，不能发布',
-          { code: 'capability_not_published', httpStatus: 409, details: { reason: 'mcp_config_incomplete' } });
+          { code: 'capability_not_published', httpStatus: 409, details: { reason: 'mcp_config_incomplete' }, en: 'MCP entry is missing transport/command/url and cannot be published' });
       }
     } else {
       // 发布闸门：当前版本必须真的**有包**。否则装上去是个空目录，而 capabilities.json 会告诉模型「有」。
@@ -988,7 +1000,7 @@ export async function setItemState({ pool, itemId, state }) {
           WHERE item_id = $1 AND version = (SELECT version FROM capability_items WHERE id = $1)`, [itemId])).rows[0]?.n ?? 0;
       if (Number(n) === 0) {
         throw new MarketError('当前版本没有包内容，不能发布',
-          { code: 'capability_not_published', httpStatus: 409, details: { reason: 'no_files_for_current_version' } });
+          { code: 'capability_not_published', httpStatus: 409, details: { reason: 'no_files_for_current_version' }, en: 'the current version has no package files and cannot be published' });
       }
     }
   }
@@ -1109,7 +1121,7 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
   if (!item) throw notFound(slug);
   if (item.state !== 'published') {
     throw new MarketError(`条目状态是 ${item.state}，只有 published 可安装`,
-      { code: 'capability_not_published', httpStatus: 409, details: { slug, state: item.state } });
+      { code: 'capability_not_published', httpStatus: 409, details: { slug, state: item.state }, en: `item state is ${item.state}; only published items can be installed` });
   }
   const existing = await selectInstall(pool, fde.id, slug);
   // ⚠ MCP 的「安装即启用」默认值必须是 **false**（审计必修）：启用要过「必填槽齐」那道闸，
@@ -1129,7 +1141,8 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
     if (n >= budget.limit) {
       throw new MarketError(`启用的${isMcp ? ' MCP server' : '技能'}已达上限 ${budget.limit} 个`,
         { code: 'capability_budget_exceeded', httpStatus: 409,
-          details: { max_enabled: budget.limit, enabled_now: n, kind: budget.kind } });
+          details: { max_enabled: budget.limit, enabled_now: n, kind: budget.kind },
+          en: `enabled ${isMcp ? 'MCP servers' : 'skills'} have reached the limit of ${budget.limit}` });
     }
   }
   // 显式 `enabled:true` 的安装也要过同一道槽位闸（否则 install 就是 setCapabilityEnabled 的旁路）。
@@ -1137,7 +1150,8 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
     const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id });
     if (missing.length > 0) {
       throw new MarketError('还有必填凭据没配置，无法启用（等管理员配置）', {
-        code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing } });
+        code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing },
+        en: 'required credentials are not configured yet, cannot enable (waiting for an administrator to configure them)' });
     }
   }
   // §4 MCP：**不落盘**（没有包内容），只落账 + 排物化。
@@ -1172,7 +1186,7 @@ export async function installCapability({ pool, config, fde, slug, enabled, forc
     [item.id, item.version])).rows.map((f) => ({ path: f.path, content: Buffer.from(f.content), bytes: f.bytes }));
   if (files.length === 0) {
     throw new MarketError(`版本 ${item.version} 在库里没有包内容`,
-      { code: 'capability_not_published', httpStatus: 409, details: { slug, version: item.version, reason: 'no_files_for_current_version' } });
+      { code: 'capability_not_published', httpStatus: 409, details: { slug, version: item.version, reason: 'no_files_for_current_version' }, en: `version ${item.version} has no package files in the store` });
   }
   const dir = writeSkillDir({ config, fdeName: fde.name, slug, files, log });
   await withTransaction(pool, async (client) => {
@@ -1205,14 +1219,14 @@ export async function uninstallCapability({ pool, config, fde, slug, log = conso
 
 /** §4 启停：只改 DB 一行，磁盘一律不动（停用后目录仍在，重新启用不必重下）。 */
 export async function setCapabilityEnabled({ pool, fde, slug, enabled, config = null }) {
-  if (typeof enabled !== 'boolean') throw bad('enabled 必须是布尔值', { field: 'enabled', actual: enabled });
+  if (typeof enabled !== 'boolean') throw bad('enabled 必须是布尔值', { field: 'enabled', actual: enabled }, 'enabled must be a boolean');
   const item = await selectItemBySlug(pool, slug);
   if (!item) throw notFound(slug);
   const existing = await selectInstall(pool, fde.id, slug);
   if (!existing) {
     // 「没装却要点启用」不是「条目不存在」：资源是那条安装记录，但它对调用方来说就是「你还没装」。
     throw new MarketError('该条目尚未安装，无法启停',
-      { code: 'capability_not_found', httpStatus: 404, details: { slug, reason: 'not_installed' } });
+      { code: 'capability_not_found', httpStatus: 404, details: { slug, reason: 'not_installed' }, en: 'this entry is not installed yet and cannot be enabled or disabled' });
   }
   const isMcp = item.kind === 'mcp';
   const budget = isMcp
@@ -1223,7 +1237,8 @@ export async function setCapabilityEnabled({ pool, fde, slug, enabled, config = 
     if (n >= budget.limit) {
       throw new MarketError(`启用的${isMcp ? ' MCP server' : '技能'}已达上限 ${budget.limit} 个`,
         { code: 'capability_budget_exceeded', httpStatus: 409,
-          details: { max_enabled: budget.limit, enabled_now: n, kind: budget.kind } });
+          details: { max_enabled: budget.limit, enabled_now: n, kind: budget.kind },
+          en: `enabled ${isMcp ? 'MCP servers' : 'skills'} have reached the limit of ${budget.limit}` });
     }
   }
   // §4：MCP 只要请求「启用」就要查槽位——**不只在状态迁移时查**。
@@ -1233,7 +1248,8 @@ export async function setCapabilityEnabled({ pool, fde, slug, enabled, config = 
     const { missing } = await resolveSlots({ pool, itemId: item.id, fdeId: fde.id });
     if (missing.length > 0) {
       throw new MarketError('还有必填凭据没配置，无法启用（等管理员配置）', {
-        code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing } });
+        code: 'capability_secret_missing', httpStatus: 409, details: { slug, missing },
+        en: 'required credentials are not configured yet, cannot enable (waiting for an administrator to configure them)' });
     }
   }
   const r = await withTransaction(pool, async (client) => {
@@ -1345,32 +1361,36 @@ export function scanPackageShape(files) {
 export function validateSlots(slots, { kind, transport }) {
   if (slots === undefined || slots === null) return [];
   if (!Array.isArray(slots)) {
-    throw new MarketError('slots 必须是数组', { code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots' } });
+    throw new MarketError('slots 必须是数组', { code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots' }, en: 'slots must be an array' });
   }
   if (slots.length > MCP_LIMITS.maxSlots) {
     throw new MarketError(`slots 条数超过 ${MCP_LIMITS.maxSlots}`, {
       code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots', actual: slots.length },
+      en: `slots count exceeds ${MCP_LIMITS.maxSlots}`,
     });
   }
   const allowedInject = kind === 'skill' ? ['context'] : transport === 'stdio' ? ['env'] : ['header'];
   const out = [];
   const seen = new Set();
   for (const s of slots) {
-    if (s === null || typeof s !== 'object') throw bad('slots[] 必须是对象', { field: 'slots[]' });
+    if (s === null || typeof s !== 'object') throw bad('slots[] 必须是对象', { field: 'slots[]' }, 'slots[] must be an object');
     const name = typeof s.name === 'string' ? s.name.trim() : '';
     if (!SLOT_NAME_RE.test(name)) {
       throw new MarketError(`槽位名必须匹配 ${SLOT_NAME_RE.source}`, {
         code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.name', name },
+        en: `slot name must match ${SLOT_NAME_RE.source}`,
       });
     }
     if (isReservedSlotName(name)) {
       throw new MarketError(`槽位名 "${name}" 是保留名（不许覆盖安全关键变量）`, {
         code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.name', name, reason: 'reserved' },
+        en: `slot name "${name}" is a reserved name (it may not shadow a security-critical variable)`,
       });
     }
     if (seen.has(name)) {
       throw new MarketError(`槽位名重复：${name}`, {
         code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.name', name, reason: 'duplicate' },
+        en: `duplicate slot name: ${name}`,
       });
     }
     seen.add(name);
@@ -1378,6 +1398,7 @@ export function validateSlots(slots, { kind, transport }) {
     if (slotKind !== 'config' && slotKind !== 'secret') {
       throw new MarketError("槽位 kind 只允许 'config' | 'secret'", {
         code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.kind', name },
+        en: `slot kind must be one of 'config' | 'secret'`,
       });
     }
     const inject = s.inject;
@@ -1385,17 +1406,20 @@ export function validateSlots(slots, { kind, transport }) {
       throw new MarketError(`transport=${transport ?? '-'} / kind=${kind} 只允许 inject ∈ ${allowedInject.join('|')}`, {
         code: 'capability_slot_invalid', httpStatus: 400,
         details: { field: 'slots.inject', name, inject, allowed: allowedInject },
+        en: `transport=${transport ?? '-'} / kind=${kind} allows only inject ∈ ${allowedInject.join('|')}`,
       });
     }
     if (slotKind === 'secret' && inject === 'context') {
       throw new MarketError('secret 槽不许 inject="context"（那等于把密钥交给技能代码）', {
         code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.inject', name },
+        en: 'secret slots may not use inject="context" (that would hand the secret to the skill code)',
       });
     }
     const description = typeof s.description === 'string' ? s.description.trim() : '';
     if (description === '' || description.length > 200) {
       throw new MarketError('槽位 description 必填且 ≤200 字符（管理员要知道这是什么）', {
         code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'slots.description', name },
+        en: 'slot description is required and must be at most 200 characters (the administrator needs to know what it is)',
       });
     }
     out.push({ name, kind: slotKind, inject, required: s.required !== false, description });
@@ -1409,33 +1433,34 @@ export function validateSlots(slots, { kind, transport }) {
  * @returns {{meta: object, manifest: object, slots: Array<object>}}
  */
 export function validateMcpFields(fields, { requireAll = false } = {}) {
-  if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) throw bad('请求体必须是 JSON 对象', { field: 'body' });
+  if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) throw bad('请求体必须是 JSON 对象', { field: 'body' }, 'request body must be a JSON object');
   const pick = (k) => fields[k];
   const need = (k, msg) => {
     const v = pick(k);
     if (v === undefined || v === null || (typeof v === 'string' && v.trim() === '')) {
-      if (requireAll) throw bad(msg ?? `${k} 必填`, { field: k });
+      if (requireAll) throw bad(msg ?? `${k} 必填`, { field: k }, `${k} is required`);
       return undefined;
     }
     return v;
   };
   const transport = need('transport', 'transport 必填（stdio | http）');
   if (transport !== undefined && !MCP_TRANSPORTS.includes(transport)) {
-    throw bad("transport 只允许 'stdio' | 'http'", { field: 'transport', transport });
+    throw bad("transport 只允许 'stdio' | 'http'", { field: 'transport', transport }, "transport must be one of 'stdio' | 'http'");
   }
   // ⚠ `requireAll:false`（PUT 部分更新）时**不许**填缺省值：填了就等于「没提 exposure 就把它改回
   // deferred」——一次只改 timeout 的 PUT 会把 `hidden` 静默放出来（审计必修，2026-11-17）。
   const exposure = pick('exposure') ?? (requireAll ? 'deferred' : undefined);
   if (exposure !== undefined && !MCP_EXPOSURES.includes(exposure)) {
-    throw bad(`exposure 只允许 ${MCP_EXPOSURES.join('|')}`, { field: 'exposure', exposure });
+    throw bad(`exposure 只允许 ${MCP_EXPOSURES.join('|')}`, { field: 'exposure', exposure }, `exposure must be one of ${MCP_EXPOSURES.join('|')}`);
   }
   const lifecycle = pick('lifecycle') ?? (requireAll ? 'run' : undefined);
   if (lifecycle !== undefined && !MCP_LIFECYCLES.includes(lifecycle)) {
-    throw bad(`lifecycle 只允许 ${MCP_LIFECYCLES.join('|')}`, { field: 'lifecycle', lifecycle });
+    throw bad(`lifecycle 只允许 ${MCP_LIFECYCLES.join('|')}`, { field: 'lifecycle', lifecycle }, `lifecycle must be one of ${MCP_LIFECYCLES.join('|')}`);
   }
   if (pick('resident') !== undefined && pick('resident') !== false) {
     throw new MarketError('resident 在 P1 只支持 false（形态②/③ 未实现）', {
       code: 'capability_kind_unsupported', httpStatus: 409, details: { field: 'resident', resident: pick('resident') },
+      en: 'resident is only supported as false in P1 (shapes 2 and 3 are not implemented)',
     });
   }
   const reasonRaw = pick('reason');
@@ -1444,18 +1469,20 @@ export function validateMcpFields(fields, { requireAll = false } = {}) {
     // §7.3：缺准入理由用专属错误码（前端要据此高亮那个下拉，而不是显示一句泛泛的「参数不合法」）。
     throw new MarketError('MCP 条目必须给准入理由（stateful / tool_surface_gt_12 / shared_quota / credential_boundary）', {
       code: 'capability_reason_required', httpStatus: 400, details: { field: 'reason', allowed: MCP_REASONS },
+      en: 'MCP entries must provide an admission reason (stateful / tool_surface_gt_12 / shared_quota / credential_boundary)',
     });
   }
   if (reason !== undefined && !MCP_REASONS.includes(reason)) {
     throw new MarketError(`reason 只允许 ${MCP_REASONS.join('|')}`, {
       code: 'capability_reason_required', httpStatus: 400, details: { field: 'reason', reason },
+      en: `reason must be one of ${MCP_REASONS.join('|')}`,
     });
   }
   const timeoutRaw = pick('timeout_ms');
   let timeoutMs = MCP_LIMITS.defaultTimeoutMs;
   if (timeoutRaw !== undefined && timeoutRaw !== null) {
     if (!Number.isInteger(timeoutRaw) || timeoutRaw < 1000 || timeoutRaw > MCP_LIMITS.maxTimeoutMs) {
-      throw bad(`timeout_ms 必须是 1000..${MCP_LIMITS.maxTimeoutMs} 的整数`, { field: 'timeout_ms', actual: timeoutRaw });
+      throw bad(`timeout_ms 必须是 1000..${MCP_LIMITS.maxTimeoutMs} 的整数`, { field: 'timeout_ms', actual: timeoutRaw }, `timeout_ms must be an integer between 1000 and ${MCP_LIMITS.maxTimeoutMs}`);
     }
     timeoutMs = timeoutRaw;
   }
@@ -1472,29 +1499,29 @@ export function validateMcpFields(fields, { requireAll = false } = {}) {
     const command = need('command', 'stdio 必须给 command');
     if (command !== undefined) {
       if (typeof command !== 'string' || /\s/.test(command.trim())) {
-        throw bad('command 必须是**一个**可执行文件（不含空格；参数放 args）', { field: 'command', command });
+        throw bad('command 必须是**一个**可执行文件（不含空格；参数放 args）', { field: 'command', command }, 'command must be a SINGLE executable (no spaces; put arguments in args)');
       }
       manifest.command = command.trim();
     }
     const args = pick('args');
     if (args !== undefined) {
       if (!Array.isArray(args) || args.length > MCP_LIMITS.maxArgs || args.some((a) => typeof a !== 'string' || a.length > 500)) {
-        throw bad(`args 必须是最多 ${MCP_LIMITS.maxArgs} 条、每条 ≤500 字符的字符串数组`, { field: 'args' });
+        throw bad(`args 必须是最多 ${MCP_LIMITS.maxArgs} 条、每条 ≤500 字符的字符串数组`, { field: 'args' }, `args must be a string array of at most ${MCP_LIMITS.maxArgs} entries, each at most 500 characters`);
       }
       manifest.args = args;
     }
-    if (pick('url') !== undefined) throw bad('stdio 条目不许给 url', { field: 'url' });
+    if (pick('url') !== undefined) throw bad('stdio 条目不许给 url', { field: 'url' }, 'a stdio entry must not provide url');
   } else if (transport === 'http') {
     const url = need('url', 'http 必须给 url');
     if (url !== undefined) {
       let u;
-      try { u = new URL(url); } catch { throw bad('url 不是合法 URL', { field: 'url', url }); }
+      try { u = new URL(url); } catch { throw bad('url 不是合法 URL', { field: 'url', url }, 'url is not a valid URL'); }
       if (!['http:', 'https:'].includes(u.protocol)) {
-        throw bad('url 只允许 http / https（file:/gopher:/data: 一律拒）', { field: 'url', protocol: u.protocol });
+        throw bad('url 只允许 http / https（file:/gopher:/data: 一律拒）', { field: 'url', protocol: u.protocol }, 'url may only be http / https (file:/gopher:/data: are all rejected)');
       }
       manifest.url = u.toString();
     }
-    if (pick('command') !== undefined) throw bad('http 条目不许给 command', { field: 'command' });
+    if (pick('command') !== undefined) throw bad('http 条目不许给 command', { field: 'command' }, 'an http entry must not provide command');
   }
   const slots = validateSlots(pick('slots'), { kind: 'mcp', transport });
   return { meta: { kind: 'mcp', transport }, manifest, slots };
@@ -1547,9 +1574,9 @@ export async function listSlots({ pool, itemId }) {
  * 值以**明文**存库（决策见 `0042-mcp-plaintext-values.sql` 头部），因此这里只做形态校验。
  */
 export async function setSlotValues({ pool, itemId, actorId = null, scope = 'global', fdeId = null, values = {} }) {
-  if (scope !== 'global' && scope !== 'fde') throw bad("scope 只允许 'global' | 'fde'", { field: 'scope', scope });
-  if (scope === 'fde' && (typeof fdeId !== 'string' || fdeId === '')) throw bad('scope=fde 时必须给 fde_id', { field: 'fde_id' });
-  if (values === null || typeof values !== 'object' || Array.isArray(values)) throw bad('values 必须是对象', { field: 'values' });
+  if (scope !== 'global' && scope !== 'fde') throw bad("scope 只允许 'global' | 'fde'", { field: 'scope', scope }, "scope must be one of 'global' | 'fde'");
+  if (scope === 'fde' && (typeof fdeId !== 'string' || fdeId === '')) throw bad('scope=fde 时必须给 fde_id', { field: 'fde_id' }, 'when scope=fde you must provide fde_id');
+  if (values === null || typeof values !== 'object' || Array.isArray(values)) throw bad('values 必须是对象', { field: 'values' }, 'values must be an object');
   const declared = new Map((await pool.query(
     'SELECT name, kind FROM capability_params WHERE item_id = $1', [itemId])).rows.map((r) => [r.name, r.kind]));
   const writes = [];
@@ -1557,12 +1584,14 @@ export async function setSlotValues({ pool, itemId, actorId = null, scope = 'glo
     if (!declared.has(name)) {
       throw new MarketError(`条目没有声明槽位 "${name}"`, {
         code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'values', name, reason: 'undeclared' },
+        en: `the entry does not declare a slot named "${name}"`,
       });
     }
     if (raw === null) { writes.push({ name, del: true }); continue; }
     if (typeof raw !== 'string') {
       throw new MarketError(`槽位 ${name} 的值必须是字符串或 null（null = 删除）`, {
         code: 'capability_slot_invalid', httpStatus: 400, details: { field: 'values', name },
+        en: `the value of slot ${name} must be a string or null (null = delete)`,
       });
     }
     writes.push({ name, value: normalizeValue({ name, value: raw }) });
@@ -1666,7 +1695,7 @@ export async function mcpSecretsReadyMap(pool, fdeId, itemIds) {
 
 /** §6.6 元数据回填：runner 连上某个 server 后把 tools 报回来。 */
 export async function recordToolsCache({ pool, slug, tools }) {
-  if (!Array.isArray(tools) || tools.length > 200) throw bad('tools 必须是 ≤200 条的数组', { field: 'tools' });
+  if (!Array.isArray(tools) || tools.length > 200) throw bad('tools 必须是 ≤200 条的数组', { field: 'tools' }, 'tools must be an array of at most 200 entries');
   const clean = tools
     .filter((t) => t && typeof t.name === 'string' && t.name !== '')
     .map((t) => ({
