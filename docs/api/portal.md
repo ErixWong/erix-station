@@ -2540,10 +2540,13 @@ SELECT fde_id FROM fde_llm_bindings
 | --- | --- | --- | --- |
 | `PUT /api/admin/fdes/:fde/llm/budget` | body `{ budget_usd: number \| null, budget_period?: '1d' \| '1mo' }`（`budget_usd=null` = 不限，`budget_period` 被忽略并一并清空；否则需为 ≤ 100000 的有限正数，`budget_period` 缺省默认 `'1mo'`）| `200 { quota }`（形状同 GET）| `400 validation_failed`（`details.field='budget_usd'`：0/负/NaN/超上限；`details.field='budget_period'`：不在 `{1d,1mo}` 白名单，如 `30d`/`7d`/`1m`/`monthly`/空串；**任一非法均不调网关、不写 DB**）；`404 not_found`（无 active litellm binding）；`502`/`503`/`504` `LlmGatewayError`（网关失败 ⇒ **不写 DB**，宁可保持旧值也不造 DB/key 分叉） |
 | `GET /api/admin/fdes/:fde/llm/budget` | — | `200 { quota }`：`{ budget_usd, budget_period, max_budget, budget_duration, budget_reset_at, spend, remaining, spend_scope }`（`budget_usd`/`budget_period` 取自 DB，其余取自 `keyInfo`；`remaining = max_budget - spend`，无额度时 `null`；**`spend_scope` 是前端已用标签的唯一依据**：`budget_duration` 非空 ⇒ `'period'`（`spend` 是本周期已用），无额度 ⇒ `'lifetime'`（`spend` 是终身累计））| `404 not_found`（无 active binding）；`5xx` 同上。**响应永不出现完整 `api_key`** |
+ | `GET /api/admin/llm/key-usage` | —（无参数）| `200 { rows: [{ fde_name, budget_usd, budget_period, max_budget, budget_duration, budget_reset_at, spend, remaining, spend_scope }] }`：整表**一次**列出全部 active litellm 绑定的额度态；`budget_usd`/`budget_period` 取自 DB，其余按 **`key_id == 网关 token`** 匹配 `/key/list` 的 key 对象取网关读数；**`spend_scope` 仍是已用标签的唯一判据**，`null` = 无读数（无 active key / 网关里查不到该 token）⇒ 前端渲染「—」，**不得当成 0** | `5xx llm_gateway_error`（网关不可达 ⇒ 整列降级「—」，用户列表本身不受影响）；`403 forbidden`（非 admin）|
 | `GET /api/admin/fdes/:fde/llm/usage?days=30` | `days` 缺省 30；需为 1–90 的整数 | `200 { days: [{ date, spend, prompt_tokens, completion_tokens, total_tokens, api_requests }], totals: { spend, total_tokens } }`（日期区间按本地 UTC+8 算，向 LiteLLM 传 `timezone=480`）| `400 validation_failed`（`details.field='days'`：非整数 / <1 / >90）；`404 not_found`（无 binding 或无 `gateway_user_id`）；`5xx` 同上 |
 
 > `spend` 是**运行计数器**：仅当存在 `budget_duration` 时才按周期归零；无额度时是**终身累计**。
 > 因此无额度的 FDE 不能把 `spend` 标成「本周期已用」——这正是 `spend_scope` 存在的理由（前端不得自己推）。
+>
+> 为什么管理台用户列表的「周期 / 用量」列**整表读 `/key/list`** 而不是日聚合（issue #800）：日聚合端点 `/user/daily/activity/aggregated` **不按用户分组**（源码刻意把 entity 列移出 GROUP BY），按人求和就要 N 次调用（每人一次）；`/key/list` 一次即覆盖全部 key 的 `spend`/`max_budget`/`budget_duration`/`budget_reset_at`（实测 v1.103.2 `size` 上限 100）。**匹配键是 `fde_llm_bindings.key_id == 网关 token`（虚拟 key 明文的 sha256 hex），不用 `key_alias`**——重铸/吊销会留下同别名旧行，按别名匹配会串到别人的钱上。
 
 为什么 PUT **先网关后 DB**：额度活在 key 上，网关写失败而 DB 已改 ⇒ 下次重铸 key 会从新值下发、但当前 key 仍旧额度（分叉）；反之若先写库后网关失败则库里有额度、key 上没有。取“宁可旧值”，**网关成功才落库**。重存已有 key 时 `updateKey` 与额度一起下发（有额度⇒两项；无额度⇒显式 `max_budget:null, budget_duration:null`）。
 
