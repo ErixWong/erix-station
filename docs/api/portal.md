@@ -68,6 +68,7 @@
 | 管理 | `PUT /api/admin/prompts/addendum` | **平台补充约定：写**（#596 片 A，§4.19）。`{text}`（`""` = 清空那一节）≤ 8192 字节，且**渲染后的整份 `~/AGENTS.md`** 必须 ≤ 16384 字节，否则 `400 validation_failed` 且**一条写语句都不发**；成功回完整 GET DTO + `materializeEnqueued` ⇒ **该工位下一次 run 生效** |
 | 管理 | `PUT /api/admin/prompts/agents-md` | **平台约定整段覆写：写**（#596 片 A，§4.19）。`{text}`（`""` = 恢复内置模板）≤ 16384 字节 + 同一条渲染闸；生效时机同上 |
 | 管理 | `PUT /api/admin/prompts/title-prompt` | **会话标题提示词：写**（#596 片 A，§4.19）。`{text}`（`""` = 用内置默认）≤ 2000 字节；**不涉物化**（`materializeEnqueued` 恒 `0`）⇒ **下一次改名就生效** |
+| 管理 | `GET /api/admin/prompts/effective-agents-md` | **按工位取「实际生效的那一份」：读**（#801，§4.19-5）。`?fde=<工位名>` ⇒ 同时给「盘上那份」与「按 DB 该有那份」两份账 + `matches` 三态；**零写零审计**，工位不存在 `404`、参数非法 `400` |
 | 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
 | 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
 | 管理 | `POST /api/admin/tls/inspect` | **解析但不落盘**（#456 M2，§4.13-3a）：`{certPem,keyPem?}` → 证书元数据 + `keyMatches` 三态 + 覆盖判定 + `warnings`。**零副作用**（不写盘/DB/审计、不动 `tlsLive`、不烧上传配额）；每管理员 120 次/小时 |
@@ -3716,6 +3717,45 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > 既有断言承担，本分支对它们零改动；**这里不用 `M` 字头的判据号** —— 它在本仓已被
 > `materializer.test.js:750`（用户自建 `AGENTS.md`/`.gitignore` 在 stale 清理后存活）占用）、
 > `portal/test/migrations.test.js`（0043 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
+
+#### 4.19-5 按工位取「实际生效的那一份」（`GET /api/admin/prompts/effective-agents-md`，issue #801）
+
+上面 §4.19-1 的 DTO 回答的是「**库里存着什么**」（三格都是空串 = 跟随内置）；本节回答「**模型现在被说了什么**」。
+两者是不同的账：管理台原来把写侧的 `"" = 跟随内置` 当成了打开页面看到的第一眼，而用户要的恰恰是实际发出去那一份。
+
+**两份账都给，只给一份就换个方向撒谎**：
+
+- `disk` = 盘上那份 `<用户空间根>/<fde_name>/home/AGENTS.md`——**实际被注入进 run 的就是它**（`runner/lib/agents-md.js` 在 run 启动时直读该文件）。
+  这份由本服务（materializer）写到用户空间，portal 已只读挂载整棵用户空间根（compose 的 `:ro` bind mount）⇒ 不需要 `docker exec`。
+- `expected` = 按 DB 那两个输入 + 内置模板、**用真工位名**渲染出来该有那份（复用 §4.19-1 的 `resolveEffectiveAgentsMd`，不是 `example` 那份预览）。
+
+只给 `disk` ⇒ 保存了但物化通知没成功时（要等 portal 重启的全量重建才收敛，见 §4.19-4），用户以为改动没生效；
+只给 `expected` ⇒ 用户以为已经生效了，而下一次 run 吃的还是旧那份。
+
+**`matches` 三态不许塌成两态**：`true` = 一致 / `false` = 盘上那份还没跟上 / `null` = **比对不了**（原因在 `disk.state` 与 `disk.truncated` 里）。
+拿 `false` 冒充「不一致」会把「新工位还没物化」说成「物化坏了」，拿 `true` 冒充更糟。前端 `effectiveVerdictOf` 把 `null` 与 `false` 分开渲染。
+
+**`disk.state` 四值封闭**（白名单，页面按值出文案，不猜）：
+
+| 值 | 含义 |
+|---|---|
+| `ok` | 读到普通文件（`text`/`bytes`/`sha256`/`mtime` 给全） |
+| `missing` | 文件或某一跳目录不存在（新工位、或用户空间被手工清过 ⇒ 「还没物化」那一档） |
+| `not_a_file` | 不是普通文件（symlink / 目录 ⇒ materializer 写的是普通文件，别的形状不当「生效全文」） |
+| `read_failed` | 读元数据或正文时失败（真相包括「这份文件今天读不到」） |
+
+**读上限 64 KiB（`EFFECTIVE_DISK_READ_MAX_BYTES`）**：超过只给前 64 KiB，`truncated=true`，且**不再承诺** `sha256`/`matches`（都置 `null`）——`disk.bytes` 仍是**真实大小**。
+
+**路径牢笼三条**：① `fde_name` 必过 `FDE_NAME_RE`⇒ 天然单段，`..` 进不来；② 解析后再钉一次 containment（相对根不得越界）；③ 只当普通文件读（symlink/目录 ⇒ `not_a_file`）。
+其中②是**两道**：拼出来的路径先过**词法** containment，打开前再对 `<用户空间根>` 与 `<用户空间根>/<fde>/home` 各取一次 realpath 判**同一套三条**（宿主机上那两级目录归工位用户可写，`home` 这一跳本身可以是 symlink，只判词法会把用户空间之外的文件当成「盘上真那份」）；③的末端另加 `O_NOFOLLOW`（`lstat` 与 `open` 之间末端被换成 symlink ⇒ `ELOOP` ⇒ 同样 `not_a_file`）；**残余**：realpath 与 `open` 之间「`home` 那一跳被换掉」的 check-then-open 竞态没有堵——堵它要把整条读路径改成逐级 `openat(dirfd)`（每级目录按 fd 打开、不再按名字解析），为一个「工位挪走自己的 `home` 又瞬间换回」的窗口换掉整个打开实现，不划算。
+用户查找**不限 status**（停用/保留期工位的盘上那份仍是可读对象，口径同 #727）。
+
+**零写零审计**：整条路径只有两条 `SELECT`（取用户 + 取 `platform_prompts`）；页每次挂载都发，审计不承重（`GET /api/admin/prompts` 本来也不审计）。
+**零新错误码**：只用既有的——`404 not_found`（工位不存在，`details.field='fde_name'`）/ `400 validation_failed`（`fde` 缺失/非法，`details.field='fde'`，且**一条 SQL 都不发**）/ `405 method_not_allowed`（非 GET）；
+没配用户空间根是 `500 internal`（配置问题照旧上报，不当「盘上没有」）。
+
+⚠ **§4.19-1 的 `example` 预览与本节的真工位渲染是两件事**：§4.19-1 的 `templateBytes`/`effectiveText` 用固定示例名 `example` 渲染（为了可对比、零动态量），本节用真工位名 ⇒ 同一份 DB 输入，两处字节可以不同（标识行随真名变长）。
+单测：`portal/test/platform-prompts-effective.test.js`（`E1`–`E14` + HTTP `H1`–`H4`）。
 
 ---
 
