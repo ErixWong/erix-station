@@ -38,6 +38,9 @@
 //   ESM 循环引用下「对面模块的绑定」在**本模块求值期**可能还没初始化 ⇒ 跨模块的名字
 //   **一律只在函数体里用**（顶层读一次就是 `ReferenceError: ... before initialization`，
 //   且凡 import 这条链的文件全部连坐）。判据 `P11` 用两个子进程正反两序各加载一次钉住这件事。
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   renderHomeAgentsMd,
   agentsMdRenderedBytes,
@@ -46,6 +49,7 @@ import {
 } from './materializer.js';
 import { enqueueMaterializeChange } from './outbox.js';
 import { TITLE_SYSTEM_PROMPT } from './title-llm.js';
+import { FDE_NAME_RE } from './projects.js';
 
 /**
  * 注入侧对**整份** `~/AGENTS.md` 的字节上限（`runner/lib/agents-md.js` 的 `AGENTS_MD_MAX_FILE_BYTES`）。
@@ -591,4 +595,172 @@ export async function updatePlatformPrompts({ pool, field, text, actorId = null,
     ? await enqueueMaterializeForAllFdes({ pool, log })
     : 0;
   return { prompts: dto, materializeEnqueued, renderedBytes };
+}
+
+// ── 按工位取「实际生效的那一份」（issue #801，契约 portal.md §4.19-5）──────────────────
+//
+// 上面那套 DTO 回答的是「库里存着什么」；本节回答「**模型现在被说了什么**」。两条不同的账：
+//   · `disk`   = 盘上那份 `<用户空间根>/<fde_name>/home/AGENTS.md` —— **实际被注入进 run 的就是它**
+//     （`runner/lib/agents-md.js` 在 run 启动时直读该文件）。这份文件由本服务（materializer）自己
+//     写到用户空间，portal 已只读挂载整棵用户空间根（compose 的 `:ro` bind mount）⇒ 不需要
+//     `docker exec`、不需要容器配合。
+//   · `expected` = 按 DB 那两个输入 + 内置模板，**用真工位名**渲染出来该有那份（`resolveEffectiveAgentsMd`
+//     现成的，不是 `example` 那份预览）。
+//
+// **两份都必须给**，只给一份就换个方向撒谎：
+//   只给 `disk` ⇒ 保存了但物化通知没成功时（要等 portal 重启的全量重建才收敛，见 §4.19-4），
+//                用户以为改动没生效；
+//   只给 `expected` ⇒ 用户以为已经生效了，而下一次 run 吃的还是旧那份。
+//
+// `matches` 三态不许塌成两态：比不了（盘上没有 / 不是普通文件 / 读失败 / 被截断）⇒ **null**，
+// 拿 `false` 冒充「不一致」会把「新工位还没物化」说成「物化坏了」，拿 `true` 冒充「一致」更糟。
+//
+// 零写、零审计：整条路径只有两条 SELECT（取用户 + 取 `platform_prompts`）。页每次挂载都发这一条，
+// 审计不承重（`GET /api/admin/prompts` 本来也不审计）。
+
+/** 读盘上那份的上限（字节）。超过只给前这么多字节，并且**不再承诺** `sha256`/`matches`。 */
+export const EFFECTIVE_DISK_READ_MAX_BYTES = 64 * 1024;
+
+/** `disk.state` 的取值集（白名单，四值封闭；页面按值出文案，不猜）。 */
+export const EFFECTIVE_DISK_STATES = Object.freeze(['ok', 'missing', 'not_a_file', 'read_failed']);
+
+/** 取用户（**不限 status**：停用/保留期工位的盘上那份仍是可读对象，口径同 #727 的 `resolveTargetFde`）。 */
+const EFFECTIVE_FDE_SQL = 'SELECT id, fde_name, status FROM users WHERE fde_name = $1';
+
+/** 盘上那份的路径（唯一一处拼法）。`fde_name` 必须过 `FDE_NAME_RE` ⇒ 天然是单段，`..` 进不来。 */
+export function homeAgentsMdPathOf({ userSpaceRoot, fdeName } = {}) {
+  if (!userSpaceRoot) {
+    throw new PlatformPromptsError('internal', '未配置用户空间根（ERIX_USERSPACE_ROOT）', { httpStatus: 500 });
+  }
+  if (typeof fdeName !== 'string' || !FDE_NAME_RE.test(fdeName)) {
+    fail('fde', `工位标识非法：${String(fdeName)}`);
+  }
+  const root = path.resolve(userSpaceRoot, fdeName, 'home');
+  const target = path.join(root, 'AGENTS.md');
+  // 双保险：`FDE_NAME_RE` 已保证单段，这里再钉一次 containment（口径同 `dirs.js#resolveJailedUnderProjects`）。
+  const rel = path.relative(path.resolve(userSpaceRoot), root);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    fail('fde', '工位标识指向了用户空间之外');
+  }
+  return { root, target };
+}
+
+/**
+ * 读盘上那份。**永不抛**（读不到是 `state`，不是异常）：这一条路径的用途是「给管理员看真相」，
+ * 而真相包括「这份文件今天读不到」。
+ * @returns {Promise<{state:string,bytes:number|null,mtime:string|null,text:string|null,sha256:string|null,truncated:boolean}>}
+ */
+export async function readDiskHomeAgentsMd({ userSpaceRoot, fdeName, log = console } = {}) {
+  const none = { state: 'missing', bytes: null, mtime: null, text: null, sha256: null, truncated: false };
+  let root; let target;
+  try {
+    ({ root, target } = homeAgentsMdPathOf({ userSpaceRoot, fdeName }));
+  } catch (err) {
+    if (err instanceof PlatformPromptsError) throw err; // 形状/配置问题照旧上报（400/500），不当「盘上没有」
+    throw err;
+  }
+  const stamp = (st) => (st?.mtime instanceof Date ? st.mtime.toISOString() : null);
+  let st;
+  try {
+    st = await fs.promises.lstat(target);
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      // 文件或某一跳目录不存在 ⇒ 「还没物化」那一档（新工位、或用户空间被手工清过）。
+      return none;
+    }
+    log?.warn?.(`[platform-prompts] 读 ~/AGENTS.md 元数据失败 fde=${fdeName}：${err?.code ?? err?.message ?? err}`);
+    return { ...none, state: 'read_failed' };
+  }
+  // symlink 与目录一律 `not_a_file`：materializer 写的是普通文件，别的形状都不该被当成「生效全文」。
+  if (st.isSymbolicLink() || !st.isFile()) {
+    return { ...none, state: 'not_a_file', bytes: st.size ?? null, mtime: stamp(st) };
+  }
+  let handle;
+  try {
+    handle = await fs.promises.open(target, 'r');
+    // 多读 1 字节当「是否超限」的判据（不靠 `size` 猜：读到的才是事实）。
+    const cap = EFFECTIVE_DISK_READ_MAX_BYTES;
+    const buf = Buffer.alloc(Math.min(st.size, cap) + 1);
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+    const read = buf.subarray(0, bytesRead);
+    const truncated = bytesRead > cap;
+    const body = truncated ? read.subarray(0, cap) : read;
+    return {
+      state: 'ok',
+      bytes: st.size ?? bytesRead,
+      mtime: stamp(st),
+      text: body.toString('utf8'),
+      sha256: truncated ? null : createHash('sha256').update(body).digest('hex'),
+      truncated,
+    };
+  } catch (err) {
+    log?.warn?.(`[platform-prompts] 读 ~/AGENTS.md 正文失败 fde=${fdeName}：${err?.code ?? err?.message ?? err}`);
+    return { ...none, state: 'read_failed', bytes: st.size ?? null, mtime: stamp(st) };
+  } finally {
+    await handle?.close?.().catch(() => {});
+  }
+}
+
+/** `GET /api/admin/prompts/effective-agents-md?fde=<fde_name>` 的 DTO（键集合由单测逐键钉住）。 */
+export function toEffectiveAgentsMdDto({ fdeName, disk, expected, renderLimitBytes = AGENTS_MD_INJECT_MAX_BYTES } = {}) {
+  const text = typeof expected?.text === 'string' ? expected.text : '';
+  const expectedSha = createHash('sha256').update(text).digest('hex');
+  const comparable = disk?.state === 'ok' && disk?.truncated === false && typeof disk?.sha256 === 'string';
+  return {
+    fdeName,
+    disk: {
+      state: EFFECTIVE_DISK_STATES.includes(disk?.state) ? disk.state : 'read_failed',
+      bytes: Number.isSafeInteger(disk?.bytes) ? disk.bytes : null,
+      mtime: typeof disk?.mtime === 'string' ? disk.mtime : null,
+      text: typeof disk?.text === 'string' ? disk.text : null,
+      sha256: typeof disk?.sha256 === 'string' ? disk.sha256 : null,
+      truncated: disk?.truncated === true,
+    },
+    expected: {
+      bytes: utf8Bytes(text),
+      sha256: expectedSha,
+      text,
+    },
+    // `null` = 比对不了（原因在 `disk.state`/`disk.truncated` 里，页面自己出那句话）。
+    matches: comparable ? disk.sha256 === expectedSha : null,
+    source: expected?.source === 'db' ? 'db' : 'builtin',
+    reason: expected?.reason ?? null,
+    db: {
+      addendumBytes: utf8Bytes(expected?.addendum ?? ''),
+      overrideBytes: utf8Bytes(expected?.override ?? ''),
+    },
+    renderLimitBytes,
+  };
+}
+
+/**
+ * 入口：`GET /api/admin/prompts/effective-agents-md?fde=<fde_name>`。
+ * @throws {PlatformPromptsError} `400 validation_failed`（`fde` 缺失/非法，`details.field='fde'`）
+ *   / `404 not_found`（工位不存在，`details.field='fde_name'`）/ `500 internal`（没配用户空间根）
+ */
+export async function getEffectiveAgentsMd({ pool, userSpaceRoot, fdeName, log = console } = {}) {
+  if (typeof fdeName !== 'string' || fdeName === '') {
+    fail('fde', 'fde 是必填查询参数（工位标识）');
+  }
+  if (!FDE_NAME_RE.test(fdeName)) {
+    fail('fde', `工位标识非法：${fdeName}`);
+  }
+  let row;
+  try {
+    const r = await pool.query(EFFECTIVE_FDE_SQL, [fdeName]);
+    row = r?.rows?.[0] ?? null;
+  } catch (err) {
+    log?.warn?.(`[platform-prompts] 查工位失败 fde=${fdeName}：${err?.message ?? err}`);
+    throw new PlatformPromptsError('internal', '读取工位失败（原因见 portal 日志）', { httpStatus: 500 });
+  }
+  if (!row || !row.fde_name) {
+    throw new PlatformPromptsError('not_found', `工位「${fdeName}」不存在`, {
+      httpStatus: 404, details: { field: 'fde_name' },
+    });
+  }
+  const name = String(row.fde_name);
+  // DB 读失败/超时 ⇒ `source='builtin'` + `reason`，**不 500**（口径同 §4.19-1）。
+  const expected = await resolveEffectiveAgentsMd({ pool, fdeName: name, log });
+  const disk = await readDiskHomeAgentsMd({ userSpaceRoot, fdeName: name, log });
+  return toEffectiveAgentsMdDto({ fdeName: name, disk, expected });
 }

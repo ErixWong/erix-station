@@ -1,0 +1,232 @@
+// issue #801：管理台「提示词」页的**生效面**数据层判据（契约 docs/api/portal.md §4.19-5）。
+//
+// 装配照 portal/test/platform-prompts.test.js：node:test + node:assert/strict + mkdtemp + 假 pool。
+// 临时目录在本文件各格子的 teardown（t.after）里 rmSync(..., {recursive:true, force:true})，前缀自带。
+// 隔离约定（docs/testing.md §2.1）：注入假 pool / 临时目录 / fs 桩，不碰真实 DB / 容器 / 网络。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { createServer } from '../src/http.js';
+import { cookieSettings } from '../src/config.js';
+import { hashToken } from '../src/auth.js';
+import { FakePool } from './fake-pool.js';
+import { renderHomeAgentsMd } from '../src/materializer.js';
+import { FDE_NAME_RE } from '../src/projects.js';
+import {
+  EFFECTIVE_DISK_READ_MAX_BYTES, EFFECTIVE_DISK_STATES,
+  homeAgentsMdPathOf, readDiskHomeAgentsMd, toEffectiveAgentsMdDto, getEffectiveAgentsMd,
+  PlatformPromptsError,
+} from '../src/platform-prompts.js';
+
+const sha = (text) => crypto.createHash('sha256').update(Buffer.from(String(text), 'utf8')).digest('hex');
+const utf8 = (text) => Buffer.byteLength(String(text ?? ''), 'utf8');
+
+const quietLog = { warn() {}, debug() {}, info() {}, error() {} };
+
+/** 造一份临时用户空间根：建 `<root>/<fde>/home/`（可选再写 AGENTS.md）。返回带 cleanup。 */
+function makeRoot({ fde, fileBody = undefined, dirInstead = false } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'eff-userspace-'));
+  const home = path.join(root, fde, 'home');
+  fs.mkdirSync(home, { recursive: true });
+  const target = path.join(home, 'AGENTS.md');
+  if (dirInstead) {
+    fs.mkdirSync(target, { recursive: true });
+  } else if (typeof fileBody === 'string' || Buffer.isBuffer(fileBody)) {
+    fs.writeFileSync(target, fileBody);
+  }
+  return { root, home, target, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
+
+/**
+ * 模块层假 pool：按 SQL 分派，记全部语句。
+ * - `SELECT id, fde_name, status FROM users WHERE fde_name = $1` → user（或空行）
+ * - `SELECT ... FROM platform_prompts WHERE id = 1` → promptsRow（或空行；failPrompts 时抛）
+ */
+class EfPool {
+  constructor({ user = null, promptsRow = null, failPrompts = false } = {}) {
+    this.user = user;
+    this.promptsRow = promptsRow;
+    this.failPrompts = failPrompts;
+    this.statements = [];
+  }
+
+  async query(sql, params = []) {
+    const s = String(sql).replace(/\s+/g, ' ').trim();
+    this.statements.push({ sql: s, params });
+    if (s.includes('FROM users WHERE fde_name = $1')) {
+      return { rows: this.user ? [{ id: 'u1', fde_name: this.user.fde_name, status: this.user.status ?? 'active' }] : [] };
+    }
+    if (s.includes('platform_prompts')) {
+      if (this.failPrompts) { throw new Error('boom: platform_prompts 读不到'); }
+      return { rows: this.promptsRow ? [this.promptsRow] : [] };
+    }
+    return { rows: [] };
+  }
+}
+
+const promptsRow = ({ addendum = '', override = '', titlePrompt = '' } = {}) => ({
+  agents_md_addendum: addendum, agents_md_override: override, title_prompt: titlePrompt,
+  updated_at: new Date(), updated_by: null,
+});
+
+// ── 模块层格子 E1–E12 ───────────────────────────────────────────────────────────
+
+test('E1 ok 且一致', async (t) => {
+  const fde = 'alice';
+  const r = makeRoot({ fde }); t.after(r.cleanup);
+  const body = renderHomeAgentsMd({ fdeName: fde, addendum: '', override: '' });
+  fs.writeFileSync(r.target, body);
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(dto.disk.state, 'ok');
+  assert.equal(dto.matches, true);
+  assert.equal(dto.expected.bytes, dto.disk.bytes);
+  assert.equal(dto.expected.sha256, sha(body));
+  assert.equal(dto.disk.sha256, sha(body));
+});
+
+test('E2 盘上落后于 DB', async (t) => {
+  const fde = 'alice';
+  const r = makeRoot({ fde }); t.after(r.cleanup);
+  // 盘上仍是「无追加段」那份；DB 里已经有追加段 ⇒ 盘上落后。
+  fs.writeFileSync(r.target, renderHomeAgentsMd({ fdeName: fde, addendum: '', override: '' }));
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow({ addendum: '收工前必须跑 npm test。' }) });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(dto.matches, false, '盘上那份 ≠ 该有那份');
+  assert.ok(dto.expected.text.includes('平台补充约定'), '该有那份含追加段标题');
+  assert.equal(dto.db.addendumBytes, 30);
+  assert.equal(dto.source, 'db');
+});
+
+test('E3 盘上没有', async (t) => {
+  const fde = 'alice';
+  const r = makeRoot({ fde }); t.after(r.cleanup); // 目录存在但没有 AGENTS.md
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(dto.disk.state, 'missing');
+  assert.equal(dto.matches, null, '比对不了 ⇒ null，不塌成 false');
+  assert.equal(dto.disk.text, null);
+});
+
+test('E4 不是普通文件', async (t) => {
+  const fde = 'alice';
+  const r = makeRoot({ fde, dirInstead: true }); t.after(r.cleanup); // AGENTS.md 是个目录
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(dto.disk.state, 'not_a_file');
+  assert.equal(dto.matches, null);
+});
+
+test('E5 读失败', async (t) => {
+  const fde = 'alice';
+  const r = makeRoot({ fde, fileBody: renderHomeAgentsMd({ fdeName: fde }) }); t.after(r.cleanup);
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  const realOpen = fs.promises.open;
+  fs.promises.open = async () => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e; };
+  t.after(() => { fs.promises.open = realOpen; });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(dto.disk.state, 'read_failed');
+  assert.equal(dto.matches, null);
+});
+
+test('E6 超读上限', async (t) => {
+  const fde = 'alice';
+  const size = EFFECTIVE_DISK_READ_MAX_BYTES + 700;
+  const buf = Buffer.alloc(size, 0x61); // 'a' * size
+  const r = makeRoot({ fde, fileBody: buf }); t.after(r.cleanup);
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(dto.disk.truncated, true);
+  assert.equal(dto.disk.sha256, null, '超限后不再承诺 sha256');
+  assert.equal(dto.matches, null);
+  assert.ok(dto.disk.text.length > 0);
+  assert.equal(dto.disk.bytes, size, 'bytes 是真实大小');
+});
+
+test('E7 工位不存在', async () => {
+  const pool = new EfPool({ user: null });
+  await assert.rejects(
+    () => getEffectiveAgentsMd({ pool, userSpaceRoot: '/tmp/whatever', fdeName: 'ghost', log: quietLog }),
+    (err) => {
+      assert.ok(err instanceof PlatformPromptsError);
+      assert.equal(err.httpStatus, 404);
+      assert.equal(err.code, 'not_found');
+      assert.equal(err.details.field, 'fde_name');
+      return true;
+    },
+  );
+});
+
+test('E8 fde 缺失/非法', async () => {
+  const pool = new EfPool({ user: { fde_name: 'alice' } });
+  for (const bad of ['', undefined, '../escape', 'a/b', 'A']) {
+    await assert.rejects(
+      () => getEffectiveAgentsMd({ pool, userSpaceRoot: '/tmp/whatever', fdeName: bad, log: quietLog }),
+      (err) => {
+        assert.ok(err instanceof PlatformPromptsError, `非法输入 ${JSON.stringify(bad)} 必须 400`);
+        assert.equal(err.httpStatus, 400);
+        assert.equal(err.code, 'validation_failed');
+        assert.equal(err.details.field, 'fde');
+        return true;
+      },
+      `非法输入 ${JSON.stringify(bad)}`,
+    );
+  }
+  assert.equal(pool.statements.length, 0, '校验在发任何 SQL 之前 ⇒ 一条 SQL 都不发');
+});
+
+test('E9 DB 读不到', async (t) => {
+  const fde = 'alice';
+  const r = makeRoot({ fde }); t.after(r.cleanup);
+  const pool = new EfPool({ user: { fde_name: fde }, failPrompts: true });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(dto.source, 'builtin');
+  assert.equal(dto.reason, 'read_failed');
+  assert.equal(dto.expected.text, renderHomeAgentsMd({ fdeName: fde, addendum: '', override: '' }));
+});
+
+test('E10 零写零审计', async (t) => {
+  const fde = 'alice';
+  const r = makeRoot({ fde, fileBody: renderHomeAgentsMd({ fdeName: fde }) }); t.after(r.cleanup);
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.ok(pool.statements.length > 0, '至少发了 SELECT');
+  for (const { sql } of pool.statements) {
+    assert.ok(!/\bINSERT\b/i.test(sql), `无 INSERT：${sql}`);
+    assert.ok(!/\bUPDATE\b/i.test(sql), `无 UPDATE：${sql}`);
+    assert.ok(!/\bDELETE\b/i.test(sql), `无 DELETE：${sql}`);
+    assert.ok(!/audit_log/i.test(sql), `无审计：${sql}`);
+  }
+});
+
+test('E11 盘上用真工位名', async (t) => {
+  const fde = 'alice-real-name-2026'; // 比 example（7）长
+  assert.ok(FDE_NAME_RE.test(fde));
+  assert.ok(fde.length > 'example'.length);
+  const r = makeRoot({ fde }); t.after(r.cleanup);
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.ok(dto.expected.text.includes(`（FDE 标识：${fde}）`), '末尾标识行用真名');
+  assert.ok(!dto.expected.text.includes('（FDE 标识：example）'), '不许出现示例名');
+  assert.notEqual(dto.expected.bytes, 9021, '真名渲染字节 ≠ example 预览的 9021');
+});
+
+test('E12 响应键集合', async (t) => {
+  const fde = 'alice';
+  const r = makeRoot({ fde }); t.after(r.cleanup);
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.deepEqual(Object.keys(dto).sort(),
+    ['db', 'disk', 'expected', 'fdeName', 'matches', 'reason', 'renderLimitBytes', 'source'].sort());
+  assert.deepEqual(Object.keys(dto.disk).sort(),
+    ['bytes', 'mtime', 'sha256', 'state', 'text', 'truncated'].sort());
+  assert.deepEqual(Object.keys(dto.expected).sort(), ['bytes', 'sha256', 'text'].sort());
+  assert.deepEqual(Object.keys(dto.db).sort(), ['addendumBytes', 'overrideBytes'].sort());
+  // disk.state 取值集白名单
+  assert.deepEqual(EFFECTIVE_DISK_STATES, Object.freeze(['ok', 'missing', 'not_a_file', 'read_failed']));
+  assert.ok(EFFECTIVE_DISK_STATES.includes(dto.disk.state));
+});
