@@ -1497,6 +1497,68 @@ export async function getFdeBudgetUsage(pool, { fdeName, gateway, days = 30 } = 
   return { days: dayRows, totals };
 }
 
+// ── issue #808：用户面「我自己的额度 / 用量」──────────────────────────────────
+// 与 §4.10 管理侧**同源投影**：字段口径、spend_scope 判据、「查不到 / 无读数一律 null 不得猜 0」
+// 全部走 getFdeBudget / getFdeBudgetUsage，本模块**只加一层身份语义**（人取 session 的 fde_name，
+// 没有参数面），不复制一份投影逻辑。
+
+/**
+ * 读「当前用户自己」的周期额度。三态，且**绝不把网关故障吞成空态**：
+ *  - 有 active litellm 绑定 ⇒ `{ quota, reason: null }`，quota 与 getFdeBudget 逐字同形（复用，不复制）；
+ *  - 无 active 绑定 ⇒ `{ quota: null, reason: 'no_binding' }`。判据是底层 getFdeBudget 抛的
+ *    `LlmError` 且 `code === 'not_found'`（getFdeBudget 对「用户不存在」与「无 active litellm binding」
+ *    都抛 not_found；用户面这里 session 已带 fde_name 且账号必为 active，故 not_found ⇔ 无绑定）。
+ *  - 网关错误（`LlmGatewayError` / 其他任何异常）**原样向上抛**，绝不收成空态——吞了就把「网关挂了」
+ *    显示成「你还没绑定」，那是撒谎（与 listFdeKeyUsage「无读数≠0」同源纪律）。
+ */
+export async function getSelfQuota(pool, { fdeName, gateway } = {}) {
+  try {
+    const quota = await getFdeBudget(pool, { fdeName, gateway });
+    return { quota, reason: null };
+  } catch (err) {
+    // 只认「无绑定」这一种业务空态；其余（含 LlmGatewayError、未知 code）一律原样抛出。
+    if (err instanceof LlmError && err.code === 'not_found') {
+      return { quota: null, reason: 'no_binding' };
+    }
+    throw err;
+  }
+}
+
+/** 读「当前用户自己」的近 N 天用量。**直接委托** getFdeBudgetUsage，不复制逻辑（同投影、同 days 上限）。 */
+export async function getSelfUsage(pool, { fdeName, gateway, days = 30 } = {}) {
+  return getFdeBudgetUsage(pool, { fdeName, gateway, days });
+}
+
+/**
+ * 进程内额度缓存（按 fde_name 分桶 + TTL），给 `GET /api/me/llm-quota` 用。
+ * - 默认 ttlMs = 30s：网关把 key 花费写回聚合态默认 60s 一拍，比这更快的缓存/轮询只会**放大网关压力
+ *   而不增加信息**，30s 是「够新、不放大」的折中。
+ * - 注入 `now` 只为单测能推进时钟过 TTL；实现里除默认参数外**不直接读 `Date.now()`**。
+ * - **绝不缓存错误**：缓存只在调用方拿到成功值后 `set`；抛错时调用方不调 `set`，故下一次仍会真打网关
+ *   （缓存本体只存成功值，`get` 未命中/过期一律 `undefined`）。
+ */
+export function createQuotaCache({ ttlMs = 30_000, now = () => Date.now() } = {}) {
+  const store = new Map();
+  return {
+    get(fdeName) {
+      const hit = store.get(fdeName);
+      if (!hit) return undefined;
+      // 到点即过期（>=）：过期顺手删除，避免无界增长。
+      if (now() - hit.storedAt >= ttlMs) {
+        store.delete(fdeName);
+        return undefined;
+      }
+      return hit.value;
+    },
+    set(fdeName, value) {
+      store.set(fdeName, { value, storedAt: now() });
+    },
+    clear() {
+      store.clear();
+    },
+  };
+}
+
 // ── issue #800：整表读「本周期已用金额」（管理台用户列表「周期 / 用量」列）────────────────
 // 一次 `/key/list` 覆盖全部虚拟 key（实测 v1.103.2：size 上限 100，对象带 spend / max_budget /
 // budget_duration / budget_reset_at / token）。匹配键是 **`fde_llm_bindings.key_id` == 网关 `token`**

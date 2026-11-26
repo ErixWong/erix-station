@@ -7,6 +7,7 @@ import FdePreviewPortsPane from '../components/FdePreviewPortsPane.vue';
 import { useAdminStore, type LlmModel, type AdminUser, type LlmProvider, type KeyUsageRow } from '../stores/admin';
 import { modelOptionLabel } from '../lib/modelLabel';
 import { fmtUsdCompact } from '../lib/money';
+import { usageCadenceOf, usageKindOf } from '../lib/usageLabel';
 import { useAuthStore } from '../stores/auth';
 
 const { t, locale } = useI18n();
@@ -651,13 +652,15 @@ function usageCell(user: AdminUser): UsageCell {
     return { kind: 'pending', text: '…', title: '', muted: false };
   }
   const row = user.fde_name ? keyUsageByFde.value.get(String(user.fde_name)) : undefined;
-  // 找不到行 / spend==null / spend_scope==null ⇒ 未知（**不得渲染成 0**）。
-  if (!row || row.spend == null || row.spend_scope == null) {
+  // 找不到行 / spend==null / spend_scope==null ⇒ 未知（**不得渲染成 0**）；lifetime / period 的判据
+  // 全在 `lib/usageLabel.ts`（与用户面徽标共用同一判断源，不再就地写一遍）。文案仍各自面用自己的 key。
+  const kind = usageKindOf(row);
+  if (kind === 'unknown') {
     return { kind: 'unknown', text: '—', title: t('admin.fde.usageTooltipUnknown'), muted: true };
   }
-  const spendText = fmtUsdCompact(row.spend);
+  const spendText = fmtUsdCompact(row!.spend);
   // lifetime（未设额度）：灰字 + 「累」，**绝不能出现「本周期」字样**。
-  if (row.spend_scope === 'lifetime') {
+  if (kind === 'lifetime') {
     return {
       kind: 'lifetime',
       text: `${t('admin.fde.usageLifetimeShort')} ${spendText}`,
@@ -665,18 +668,16 @@ function usageCell(user: AdminUser): UsageCell {
       muted: true,
     };
   }
-  // period：周期短标签 + 金额。
-  // 周期短标签以**网关的 `budget_duration`** 为准——`spend` 就是按它归零的，DB 的 `budget_period`
-  // 只在网关没说时兜底（两者不同步时，跟钱走不跟配置走）。白名单外的值（key 在门户之外被写成
-  // `30d`/`7d`/`1m` 之类，网关都收）**不许猜**成「日/月」——猜错就是把周读成月，走未知标签。
-  const cadence = row.budget_duration ?? row.budget_period ?? null;
+  // period：周期短标签 + 金额。归一化（网关 budget_duration 优先、白名单外不猜）在 `usageCadenceOf`；
+  // 白名单外 ⇒ null ⇒ 走未知标签（猜错就是把周读成月）。
+  const cadence = usageCadenceOf(row);
   const periodLabel = cadence === '1d'
     ? t('admin.fde.usagePeriodDay')
     : cadence === '1mo'
       ? t('admin.fde.usagePeriodMonth')
       : t('admin.fde.usagePeriodUnknown');
-  const budgetText = row.max_budget != null ? fmtUsdCompact(row.max_budget) : null;
-  const resetText = row.budget_reset_at ? formatLastLogin(row.budget_reset_at) : null;
+  const budgetText = row!.max_budget != null ? fmtUsdCompact(row!.max_budget) : null;
+  const resetText = row!.budget_reset_at ? formatLastLogin(row!.budget_reset_at) : null;
   // hover 里用**完整词**（格内用短标签是为了塞进窄列，hover 没这个约束，不该继续说黑话）。
   // 周期认不出来时不得拿「本月」糊弄：换成「周期未知」的专门说法（钱是真的，窗口才是未知的）。
   const parts: string[] = [cadence === '1d' || cadence === '1mo'

@@ -1025,6 +1025,11 @@ export function createServer({
       adminUrl: config.llmGatewayAdminUrl ?? 'http://station-litellm:4000',
       masterKey: config.llmGatewayMasterKey ?? '',
     }),
+    // #808：用户面额度端点（`GET /api/me/llm-quota`）的 30s 进程内缓存。**故意挂在 ctx 上**
+    // （而非模块级单例）：缓存在进程内跨请求共享（同一 server 多次 GET 只打一次网关），但**每个
+    // server 实例一份**，单测 `createServer` 起来就是干净的一份、天然不串台，无需导出 clear 钩子。
+    // TTL / 错误不缓存的口径见 `llm.createQuotaCache`。
+    selfQuotaCache: llm.createQuotaCache(),
   };
   // issue #38 Phase B2 admin UI：portal serve 进程本就有 config.dockerHost（cli.js serve 的
   // startProvisionerLoop 也用它自建 client——调查结论见 Phase B2 报告），故 provision 端点**可实现**：
@@ -1412,6 +1417,46 @@ async function routeApi(req, res, ctx, url) {
       return sendJson(res, 200, result);
     }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
+  // ---- #808 用户面额度 / 用量（portal.md §2.14 / §2.15）----
+  // 与 git-credential 同一取法：人**一律**取 session.user.fde_name，**不接受**任何 fde_name 查询/路径参
+  // 数（结构上看不了别人的账）。网关错误不吞（getSelfQuota 只把 not_found 收成 no_binding）。
+  if (pathname === '/api/me/llm-quota') {
+    if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    const session = await requireSession(req, ctx);
+    const fdeName = session.user.fde_name;
+    if (!fdeName) {
+      throw new admin.AdminError('fde_name_required', '当前用户未分配 fde_name，无法读取额度', { httpStatus: 400 });
+    }
+    // 30s 缓存（挂在 ctx.selfQuotaCache，进程内跨请求共享）：命中直接用，不重复打网关。
+    // 只缓存成功值（getSelfQuota 抛错时根本不 set），故网关故障不会被缓存成空态。
+    const cache = ctx.selfQuotaCache;
+    const cached = cache.get(fdeName);
+    if (cached !== undefined) return sendJson(res, 200, cached);
+    const result = await llm.getSelfQuota(ctx.pool, { fdeName, gateway: ctx.llmGateway });
+    cache.set(fdeName, result);
+    return sendJson(res, 200, result);
+  }
+  if (pathname === '/api/me/llm-usage') {
+    if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    const session = await requireSession(req, ctx);
+    const fdeName = session.user.fde_name;
+    if (!fdeName) {
+      throw new admin.AdminError('fde_name_required', '当前用户未分配 fde_name，无法读取用量', { httpStatus: 400 });
+    }
+    // days 校验逐字对齐管理侧 `/api/admin/fdes/:fde/llm/usage`（http.js 内那段）：
+    // 只要带了 `days`（含空串 `?days=`）就必须是 1–90 整数；只有完全不写才走默认 30。
+    const rawDays = url.searchParams.get('days');
+    let days = 30;
+    if (rawDays !== null) {
+      days = Number(rawDays);
+      if (!Number.isInteger(days) || days < 1 || days > 90) {
+        throw new HttpError(400, 'validation_failed', 'days 必须为 1–90 的整数', { details: { field: 'days' } });
+      }
+    }
+    const usage = await llm.getSelfUsage(ctx.pool, { fdeName, gateway: ctx.llmGateway, days });
+    return sendJson(res, 200, usage);
   }
 
   // 边缘授权回调（Traefik forwardAuth）：非浏览器 API，不要求 session cookie。

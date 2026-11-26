@@ -108,6 +108,8 @@
 | LLM 管理 | `DELETE /api/admin/llm/models/:id` | 删模型（附虚拟 key 清理） |
 | LLM 管理 | `GET/PUT /api/admin/fdes/:fde/llm/budget` | 读/设 **FDE 周期额度（USD / 周期，`budget_period` ∈ {`1d`,`1mo`}）**（#719，§4.10） |
 | LLM 管理 | `GET /api/admin/fdes/:fde/llm/usage?days=30` | 近 N 天用量（直读 LiteLLM 聚合端点，#719，§4.10） |
+| LLM 用户面 | `GET /api/me/llm-quota` | **普通 FDE 读自己的周期额度**（人取 `session.user.fde_name`，无参数面；与 §4.10 同源投影；30s 缓存，#808，§2.14）|
+| LLM 用户面 | `GET /api/me/llm-usage?days=30` | **普通 FDE 读自己的近 N 天用量**（人同上；`days` 缺省 30、需 1–90 整数；#808，§2.15）|
 
 > LLM 管理这条线**其余**端点（`GET/PUT /api/admin/fdes/:name/llm`、
 > `POST /api/admin/fdes/:name/llm/heartbeat`、`GET /api/admin/llm/model-catalog`、
@@ -917,6 +919,8 @@ station-portal user enable  --login <login>
 
 > 口径补充：`org-visible`/`public` 的预览仍需经 portal（§2.8 签发 ticket / 直接跳转），且 forwardAuth 每请求重查 `users.status` 与 allocation `state`（§2.7）；「同租户可见」只是 exposure 的放宽，不等于可读他人项目/会话/run 数据。
 >
+> **LLM 额度/用量（#808）**：普通 FDE 可通过 `/api/me/llm-quota`、`/api/me/llm-usage`（§2.14 / §2.15）读**自己的**额度/用量；**他人不可**——这两个端点人**一律**取 `session.user.fde_name`，**无 `fde_name` 参数面**，结构上看不了别人的账。读**别人**的额度/用量仍走 admin-only 的 §4.10。
+>
 > **ticket 的 `issuer_id` 与主体 `user_id`（B4，三处口径一致）**：签发（§2.8）记录两者——`issuer_id` = 谁签的（登录用户），`user_id` = 主体（被授权访问的身份）；forwardAuth 的 `private` 判定（§2.7 第 5 步）用**主体** + **admin 例外**；审计（§2.7）同时记 `subject_id`/`issuer_id`。普通 FDE 自签 = issuer = subject = owner；admin 代签他人 private = issuer = subject = admin。
 
 ### 2.11 跨站请求防护（#234，工单 `feat-261013-01`）
@@ -1127,6 +1131,35 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 
 > 令牌存哪：本机约定进凭据目录（600，不入库不提交，路径见冷层 `~/projects/docs/station-dev-machine.md`）。丢了只能重签——
 > 库里只存 sha256，**没人能再看到它**（列表也不返 hash）。
+
+### 2.14 `GET /api/me/llm-quota`（#808：普通 FDE 读自己的周期额度）
+
+用户面「我自己的额度」。**与 §4.10 管理侧同源投影**：字段口径、`spend_scope` 判据、「查不到 / 无读数一律 `null`、不得猜 0」全部走同一个 `projectQuota`，本端点**只加一层身份语义**：人**一律**取 `session.user.fde_name`，**不接受** `fde_name` 查询/路径参数（结构上看不了别人的账）。无 `fde_name` ⇒ `400 fde_name_required`（与 `POST /api/me/password`、`/api/me/git-credential` 同口径）。
+
+| 项 | 口径 |
+|---|---|
+| 方法 + 路径 | `GET /api/me/llm-quota`（无参数；非 GET ⇒ `405 method_not_allowed`）|
+| 鉴权 | `requireSession`（未认证 ⇒ `401`）；普通 FDE 与 admin 都只能读**自己**（无参数面）|
+| 成功 `200` | `{ quota, reason }`：有 active litellm 绑定 ⇒ `{ quota: { budget_usd, budget_period, max_budget, budget_duration, budget_reset_at, spend, remaining, spend_scope }, reason: null }`（字段逐字同 §4.10 GET budget）；无 active 绑定 ⇒ `{ quota: null, reason: "no_binding" }` |
+| 错误 | `401`（未认证）；`400 fde_name_required`（无 `fde_name`）；`405 method_not_allowed`；`5xx` `LlmGatewayError`（网关挂了**原样抛出**，**绝不**吞成 `no_binding` 空态——吞了会把「网关不可达」显示成「你还没绑定」）|
+| 缓存 | 进程内 30s（按 `fde_name` 分桶）。为什么 30s：网关把 key 花费写回聚合态默认 60s 一拍，比这更快的缓存/轮询只会**放大网关压力而不增加信息**。**只缓存成功值**，抛错不写缓存（否则一次网关抖动会被粘成 30s 空态）|
+
+> **为什么不自己算 token / 周期**：同 §4.10——`spend` 是运行计数器，只有 `budget_duration` 非空才按周期归零（⇒ `spend_scope='period'`），无额度时是终身累计（⇒ `'lifetime'`）；`spend_scope` 是前端已用标签的**唯一依据**。
+> **为什么网关错不吞**：`getSelfQuota` 只把底层 `getFdeBudget` 抛的 `LlmError(code='not_found')` 收成 `no_binding`；`LlmGatewayError` / 其他异常**原样向上抛**。实现见 `portal/src/llm.js` 的 `getSelfQuota` / `createQuotaCache`；行为以 `portal/test/llm-quota-self.test.js` 为准。
+
+### 2.15 `GET /api/me/llm-usage?days=30`（#808：普通 FDE 读自己的近 N 天用量）
+
+用户面「我自己的用量」。**直接委托** `getFdeBudgetUsage`（不复制逻辑），投影与上限与管理侧 §4.10 usage 逐字一致。人同样**只取 `session.user.fde_name`**，无参数面。
+
+| 项 | 口径 |
+|---|---|
+| 方法 + 路径 | `GET /api/me/llm-usage?days=30`（非 GET ⇒ `405 method_not_allowed`）|
+| 参数 `days` | 缺省 30；**只要出现 `days`（含空串 `?days=`）就必须是 1–90 的整数**，否则 `400 validation_failed` + `details.field='days'`（逐字对齐管理侧 `/api/admin/fdes/:fde/llm/usage`）|
+| 鉴权 | `requireSession`（未认证 ⇒ `401`）；普通 FDE 与 admin 都只能读**自己**|
+| 成功 `200` | `{ days: [{ date, spend, prompt_tokens, completion_tokens, total_tokens, api_requests }], totals: { spend, total_tokens } }`（日期区间按本地 UTC+8 算，向 LiteLLM 传 `timezone=480`；形状逐字同 §4.10 usage）|
+| 错误 | `401`；`400 validation_failed`（`details.field='days'`：非整数 / <1 / >90）；`400 fde_name_required`；`405`；`404 not_found`（无 active 绑定）；`5xx` `LlmGatewayError` |
+
+> 本端点**不走 30s 缓存**（只 `llm-quota` 缓存）：日聚合比额度读重，但用量变化不敏感于 30s，且默认只给一个固定窗口（30 天），无需再加缓存层。实现见 `portal/src/llm.js` 的 `getSelfUsage`。
 
 ---
 
@@ -2562,6 +2595,8 @@ SELECT fde_id FROM fde_llm_bindings
 周期语义（LiteLLM v1.103.2 实测，详见设计文档 §11.5）：`1d`=每天 `reset_time_of_day`（本环境 `Asia/Shanghai` 本地零点）；`1mo`=**每月 1 日** `reset_time_of_day`（`value != 1` 直接抛错）；`30d`/`7d`/`1m` 都不是“多少天/月后”而是被特判成周/月/分钟——所以白名单之外一律不接。
 
 错误映射零新码（§8.20）：额度校验复用 `LlmError('validation_failed')`、`not_found`；网关不可达沿用 `LlmGatewayError`→`httpStatus`。实现见 `portal/src/llm.js` 的 `setFdeBudget` / `getFdeBudget` / `getFdeBudgetUsage`；行为以 `portal/test/llm.test.js` 为准。
+
+> **用户侧同源投影（#808）**：普通 FDE 读**自己**的额度/用量走 `GET /api/me/llm-quota`（§2.14）与 `GET /api/me/llm-usage?days=30`（§2.15）——**同一份 `projectQuota` 投影、同一份 `getFdeBudgetUsage` 日聚合**，只是人取 `session.user.fde_name`、无参数面。管理侧本节能读**任意** `:fde`（admin-only），用户侧只能读自己；两者的字段形状与 `spend_scope`/`null` 口径逐字一致。
 
 ### 4.11 文件预览五通道（issue #366 / #795）
 

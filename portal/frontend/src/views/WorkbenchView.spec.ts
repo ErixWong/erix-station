@@ -65,12 +65,18 @@ async function mountWorkbench(
   dirs = DIRS,
   gitLightBody: unknown = GIT_LIGHT_GREEN,
   macroTemplatesBody: unknown = { items: [] },
+  quotaBody: unknown = { quota: null, reason: 'no_binding' },
+  usageBody: unknown = { days: [], totals: { spend: 0, total_tokens: 0 } },
 ) {
   const pinia = createPinia();
   setActivePinia(pinia);
   // 按 URL 分派的 fetch 桩（先于 router.push：导航守卫会打 /api/me）。
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    // issue #808：额度/用量必须排在 `/api/me` 兵项**之前**（否则被 `{ user }` 吐掉）。
+    // 默认 no_binding ⇒ 徽标不渲染，既有用例的 who / button 序列断言不受影响。
+    if (url.startsWith('/api/me/llm-quota')) return jsonResponse(quotaBody);
+    if (url.startsWith('/api/me/llm-usage')) return jsonResponse(usageBody);
     if (url.startsWith('/api/me')) return jsonResponse({ user });
     if (url.startsWith('/api/dirs')) return jsonResponse({ dirs });
     if (url.startsWith('/api/sessions')) return jsonResponse({ items: [] });
@@ -120,8 +126,8 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
     expect(badge.attributes('title')).toBe('~/projects/demo（点击复制）');
     expect(badge.text()).toContain('📁 demo');
     // who 拼接：login（role / fde_name）
-    expect(wrapper.find('header span.flex-1').text()).toBe('alice（fde / alice）');
-    // 普通 FDE 无「管理台」入口（用户面入口已整体拆除，见 fix-261126-03）
+    expect(wrapper.find('header [data-test="who"]').text()).toBe('alice（fde / alice）');
+    // 普通 FDE 无「管理台」入口（用户面入口已整体拆除，见 fix-261126-03）；登出按钮 + 语言切换菜单在位
     expect(wrapper.find('header [data-test="admin-console-link"]').exists()).toBe(false);
     // header 直系 button：☰ 导航 / cwd 徽标 / 登出（LocaleSwitch 自身按钮在子 div 内，不计入）
     expect(wrapper.findAll('header > button').at(-1)!.text()).toBe('登出');
@@ -132,13 +138,14 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
 
   it('平台管理员（第 ② 类人：admin 且有工位）：who 带 fde_name（全角括号）', async () => {
     const wrapper = await mountWorkbench(ADMIN_WITH_SEAT);
-    expect(wrapper.find('header span.flex-1').text()).toBe('root（admin / root）');
+    expect(wrapper.find('header [data-test="who"]').text()).toBe('root（admin / root）');
+    // 管理台入口在 #804 fix-261126-03 里已从用户面整体拆除（谁有 fde_name 都不再给入口）
     expect(wrapper.find('header [data-test="admin-console-link"]').exists()).toBe(false);
   });
 
   it('who 的无 fde_name 分支（fde 账号缺 fde_name）：只显示 role（全角括号）', async () => {
     const wrapper = await mountWorkbench(FDE_NO_SEAT);
-    expect(wrapper.find('header span.flex-1').text()).toBe('bob（fde）');
+    expect(wrapper.find('header [data-test="who"]').text()).toBe('bob（fde）');
     expect(wrapper.find('header [data-test="admin-console-link"]').exists()).toBe(false);
   });
 
@@ -151,14 +158,15 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
 
   it('切 English：顶栏 + 嵌套侧栏文案即时变英文（who 改半角括号），并持久化', async () => {
     const wrapper = await mountWorkbench(ADMIN_WITH_SEAT);
-    expect(wrapper.find('header span.flex-1').text()).toBe('root（admin / root）');
+    expect(wrapper.find('header [data-test="who"]').text()).toBe('root（admin / root）');
 
     await switchToEnglish(wrapper);
 
     expect(wrapper.find('header button').text()).toBe('☰ Navigation');
     expect(wrapper.find('header button').attributes('aria-label')).toBe('Open navigation');
     expect(wrapper.find('header button[title]').attributes('title')).toBe('~/projects/demo (click to copy)');
-    expect(wrapper.find('header span.flex-1').text()).toBe('root (admin / root)');
+    // who 改半角括号：用稳定钩子（顶栏 flex 布局在 #808 里调过，class 选择器不再唯一）
+    expect(wrapper.find('header [data-test="who"]').text()).toBe('root (admin / root)');
     expect(wrapper.find('header [data-test="admin-console-link"]').exists()).toBe(false);
     expect(wrapper.findAll('header > button').at(-1)!.text()).toBe('Sign out');
     expect(wrapper.find('[role="separator"]').attributes('aria-label')).toBe('Resize sidebar');
@@ -619,5 +627,50 @@ describe('WorkbenchView · 顶栏用户级 chip 开抽屉（issue #614）', () =
     const chips = wrapper.findAll('[data-test="macro-menu"]');
     expect(chips).toHaveLength(1);
     expect(chips[0].attributes('data-scope')).toBe('user');
+  });
+});
+
+// ===========================================================================
+// issue #808：顶栏「账周期 + 本周期用量」徽标 + 明细弹窗。
+// ===========================================================================
+describe('issue #808：顶栏账周期/用量徽标', () => {
+  const QUOTA_PERIOD = {
+    quota: {
+      budget_usd: 10, budget_period: '1mo', max_budget: 10, budget_duration: '1mo',
+      budget_reset_at: '2026-12-01T00:00:00Z', spend: 2.05, remaining: 7.95, spend_scope: 'period',
+    },
+    reason: null,
+  };
+  const USAGE_30 = {
+    days: [
+      { date: '2026-11-28', spend: 0.4, prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, api_requests: 1 },
+      { date: '2026-11-29', spend: 1.65, prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, api_requests: 1 },
+    ],
+    totals: { spend: 2.05, total_tokens: 4 },
+  };
+
+  it('no_binding（默认）：徽标整块不渲染', async () => {
+    const wrapper = await mountWorkbench();
+    expect(wrapper.find('[data-test="usage-badge"]').exists()).toBe(false);
+  });
+
+  it('有额度：徽标文案正确（月 + $2.05）、且在登出之前；点开弹窗有进度/剩余/清零与 30 天 chart 区', async () => {
+    const wrapper = await mountWorkbench(FDE_USER, DIRS, GIT_LIGHT_GREEN, { items: [] }, QUOTA_PERIOD, USAGE_30);
+    const badge = wrapper.find('[data-test="usage-badge"]');
+    expect(badge.exists()).toBe(true);
+    expect(badge.text()).toContain('月');
+    expect(badge.text()).toContain('$2.05');
+    // 徽标是 header > button，且「登出」仍是最后一颗
+    expect(wrapper.findAll('header > button').at(-1)!.text()).toBe('登出');
+
+    await badge.trigger('click');
+    await tick();
+    expect(wrapper.find('[data-test="usage-used"]').text()).toContain('已用 $2.05');
+    expect(wrapper.find('[data-test="usage-progress"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="usage-remaining"]').text()).toContain('$7.95');
+    expect(wrapper.find('[data-test="usage-reset"]').text()).toContain('清零');
+    // chart 区在（有数据 ⇒ svg 对阅读器可见）
+    expect(wrapper.find('[data-test="metric-chart"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="metric-chart-svg"]').attributes('aria-hidden')).toBe('false');
   });
 });
