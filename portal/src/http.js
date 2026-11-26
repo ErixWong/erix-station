@@ -1081,7 +1081,7 @@ export function createServer({
         return;
       }
       if (err instanceof LlmGatewayError) {
-        sendJson(res, err.status, errorBody('llm_gateway_error', err.message));
+        sendJson(res, err.status, errorBody('llm_gateway_error', pickMessage(err, locale)));
         return;
       }
       if (err instanceof gitCredential.GitCredentialError) {
@@ -1111,7 +1111,7 @@ export function createServer({
         // 模块里保留那三个细粒度 code 是给非 HTTP 调用方（CLI/脚本）定位用的；给运维的真相在
         // `details.field`（`key` 还是 `value`）与 `details.known` 里，它们原样透传。500 仍是 `internal`。
         const code = err.httpStatus === 400 ? 'validation_failed' : err.code;
-        sendJson(res, err.httpStatus, errorBody(code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof secrets.SecretError) {
