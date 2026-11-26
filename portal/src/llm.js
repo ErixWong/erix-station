@@ -1493,6 +1493,58 @@ export async function getFdeBudgetUsage(pool, { fdeName, gateway, days = 30 } = 
   return { days: dayRows, totals };
 }
 
+// ── issue #800：整表读「本周期已用金额」（管理台用户列表「周期 / 用量」列）────────────────
+// 一次 `/key/list` 覆盖全部虚拟 key（实测 v1.103.2：size 上限 100，对象带 spend / max_budget /
+// budget_duration / budget_reset_at / token）。匹配键是 **`fde_llm_bindings.key_id` == 网关 `token`**
+// （实测 key_id 存的就是虚拟 key 明文的 sha256 hex，与 token 逐字相等）；**不用 key_alias 匹配**
+// ——重铸/吊销会留下同别名旧行，按别名匹配会串到别人的钱上。
+const KEY_USAGE_PAGE_SIZE = 100;   // 网关 `/key/list` 的 size 上限
+const KEY_USAGE_MAX_PAGES = 20;    // 保险丝：20 页 = 2000 个 key，远超本项目规模
+
+/** 全部 active litellm 绑定的额度态一览；每行复用 projectQuota 的字段与 spend_scope 判据。 */
+export async function listFdeKeyUsage(pool, { gateway } = {}) {
+  const client = getGatewayClient(gateway);
+  const byToken = new Map();
+  for (let page = 1; page <= KEY_USAGE_MAX_PAGES; page += 1) {
+    const payload = await client.listKeys({ page, size: KEY_USAGE_PAGE_SIZE, return_full_object: true });
+    const keys = Array.isArray(payload?.keys) ? payload.keys : [];
+    for (const item of keys) {
+      if (item && typeof item === 'object' && item.token != null) byToken.set(String(item.token), item);
+    }
+    const totalPages = intOr0(payload?.total_pages);
+    if (keys.length === 0 || page >= (totalPages > 0 ? totalPages : 1)) break;
+  }
+  const bindings = await pool.query(
+    `SELECT u.fde_name, b.budget_usd, b.budget_period, b.key_id
+       FROM fde_llm_bindings b
+       JOIN users u ON u.id = b.fde_id
+      WHERE b.state = 'active' AND b.gateway = 'litellm'
+      ORDER BY u.fde_name ASC`,
+  );
+  return {
+    rows: bindings.rows.map((row) => {
+      const dbBudgetUsd = row.budget_usd == null ? null : Number(row.budget_usd);
+      const dbPeriod = row.budget_period ?? null;
+      const key = row.key_id == null ? null : (byToken.get(String(row.key_id)) ?? null);
+      // 网关里没有这条 key ⇒ 只有 DB 口径，spend/remaining 一律 null（**不得猜 0**，0 会被读成「没花钱」）。
+      if (!key) {
+        return {
+          fde_name: row.fde_name,
+          budget_usd: dbBudgetUsd,
+          budget_period: dbPeriod,
+          max_budget: null,
+          budget_duration: null,
+          budget_reset_at: null,
+          spend: null,
+          remaining: null,
+          spend_scope: null,
+        };
+      }
+      return { fde_name: row.fde_name, ...projectQuota(dbBudgetUsd, dbPeriod, key) };
+    }),
+  };
+}
+
 function validateSlotModel(model, { slotName, modelId, providerId, expectedType, requireToolCalling }) {
   const fail = (message) => {
     throw new LlmError('validation_failed', message, {

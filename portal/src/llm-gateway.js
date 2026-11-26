@@ -149,6 +149,9 @@ export function createLlmGatewayClient({
     keyInfo: (key) => request('GET', '/key/info', { query: { key: hashKeyForInfo(key) } }),
     // issue #719：读 LiteLLM 自己的每日用量聚合端点，portal 绝不自算 token。
     userDailyActivity: (query) => request('GET', '/user/daily/activity/aggregated', { query }),
+    // issue #800：整表读所有 key 的 spend/budget 字段（网关 size 上限 100，实测 v1.103.2 `le=100`）。
+    listKeys: ({ page = 1, size = 100, return_full_object = true } = {}) =>
+      request('GET', '/key/list', { query: { page, size, return_full_object } }),
     listModels: () => request('GET', '/model/info'),
     createModel: (body) => post('/model/new', body),
     updateModel: ({ model_id, ...body }) => patch(`/model/${encodeURIComponent(model_id)}/update`, body),

@@ -2556,6 +2556,13 @@ async function handleAdminApi(req, res, ctx, url) {
     }
   }
 
+  // issue #800：整表读每 FDE 的「本周期已用金额」（用户列表「周期 / 用量」列）。整表**一次**网关调用，
+  // 不是每人一次。网关不可达 ⇒ LlmGatewayError ⇒ 既有映射回 5xx；前端那一列自己降级成「—」+ 重试，
+  // **用户列表本身不受影响**（那一列是独立的一次加载）。
+  if (pathname === '/api/admin/llm/key-usage' && req.method === 'GET') {
+    return sendJson(res, 200, await llm.listFdeKeyUsage(ctx.pool, { gateway: ctx.llmGateway }));
+  }
+
   // issue #719：每 FDE 周期额度（USD / 周期）。两个独立 matcher，**不改上面那个老 /llm 正则**（避免回归）；
   // 鉴权继承 handleAdminApi 的 requireAdmin，fde_name 语法复用 decodeAdminFdeName。
   const adminFdeBudgetMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/llm\/budget$/);
