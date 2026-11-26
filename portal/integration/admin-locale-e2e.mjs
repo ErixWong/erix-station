@@ -15,6 +15,9 @@
 // 跑法（口令 / 域名 / 端口等坐标只在本机，不进文档）：
 //     node --test portal/integration/admin-locale-e2e.mjs          # 不点名 ⇒ 浏览器腿 skip（带原因）
 //     E2E_UI=1 npm run test:integration:locale                     # 点名才跑浏览器腿（需口令 + 容器）
+// 本腿口径：点名（E2E_UI=1）即硬要求——环境不齐（缺口令 / docker 不可用 / 容器没跑 / 容器里没
+//   playwright 模块 / 入口 net:: 不通）也算**红**（退 1），不许 skip 冒充通过（#804：真机 e2e
+//   不做完不算合完）。确知这台机器今天跑不了活栈、只想降级回 skip ⇒ 显式带 E2E_UI_SOFT=1（逃生门）。
 // 口令缺失却点名要跑（E2E_UI=1）⇒ 退 1（禁止静默全 skip 拿 rc=0 的假通过）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -48,6 +51,12 @@ const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
 /** 报错文案用：缺口令时列出试过的路径（新前旧后）。 */
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
 const UI_ENABLED = process.env.E2E_UI === '1';
+/**
+ * 逃生门：**显式**承认「这台机器今天跑不了活栈」，把点名（E2E_UI=1）的浏览器腿从「环境不齐判红」
+ * 降级回 skip。默认（不设）= 点名即硬要求，环境不齐也判红（#804：真机 e2e 不做完不算合完）。
+ * 与文件末尾「点名却没口令 ⇒ 判红」的哨兵用例是同一条口径的两半。
+ */
+const UI_SOFT = process.env.E2E_UI_SOFT === '1';
 const PW_CONTAINER = process.env.PLAYWRIGHT_CONTAINER || 'erix_station_playwright';
 const PW_MODULE = '/app/node_modules/playwright/index.mjs';
 /**
@@ -323,7 +332,12 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
   const reason = probeUi();
   if (reason) {
     probe.reasons.ui = reason;
-    t.skip(`浏览器腿跑不了（不是产品问题）：${reason}`);
+    // 点名即硬要求：环境不齐也算红（缺的是哪一样由 reason 点名）；不想被判红就显式带 E2E_UI_SOFT=1。
+    if (UI_SOFT) {
+      t.skip(`浏览器腿跑不了（已显式 E2E_UI_SOFT=1 降级）：${reason}`);
+      return;
+    }
+    assert.fail(`E2E_UI=1 点名要跑，环境却不齐（缺：${reason}）——不能以 skip 冒充通过；不想被判红就显式带 E2E_UI_SOFT=1`);
     return;
   }
   const password = CRED_PASSWORD;
@@ -359,7 +373,12 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     //   到了页面却没跑通（脚本里抛的：找不到控件、点了没反应、超时）⇒ 产品红，assert.fail。
     if (rep.fatal) {
       if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(rep.fatal)) {
-        t.skip(`环境到不了入口（net:: 类，不是产品问题）：${rep.fatal}`);
+        // 环境到不了入口：点名即硬要求，也算红；不想被判红就显式带 E2E_UI_SOFT=1。
+        if (UI_SOFT) {
+          t.skip(`环境到不了入口（net:: 类，已显式 E2E_UI_SOFT=1 降级）：${rep.fatal}`);
+          return;
+        }
+        assert.fail(`E2E_UI=1 点名要跑，环境却到不了入口（缺：${rep.fatal}）——不能以 skip 冒充通过；不想被判红就显式带 E2E_UI_SOFT=1`);
         return;
       }
       assert.fail(`到了入口却没跑通（产品红）：${rep.fatal}（管理台 ${BASE}）`);
@@ -413,6 +432,8 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
 test('哨兵：点名了（E2E_UI=1）却没有口令 ⇒ 判红，禁止静默全 skip 拿 rc=0', () => {
   if (!UI_ENABLED) return;
   // 点名要跑却连口令都找不到 ⇒ 几乎一定是忘了注入凭据目录，必须判红而不是 skip。
+  // 与主用例里「环境不齐（口令 / docker / 容器 / 模块 / net::）⇒ assert.fail」是同一条口径的两半：
+  // 主用例那半要探测才拿得到原因（探测本身要碰 docker，不点名就别碰），口令这条在模块加载就能判，故各自守一段。
   assert.ok(CRED_PASSWORD !== null,
     `E2E_UI=1 点名了浏览器腿，但没找到口令文件（试过 ${PASSWORD_FILE}）——口令缺失不能静默 skip 冒充通过`);
 });
