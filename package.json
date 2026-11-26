@@ -17,6 +17,7 @@
     "test:integration:wp6": "node --test portal/integration/wp6-llm-e2e.mjs",
     "test:integration:version": "node --test portal/integration/version-surface-e2e.mjs",
     "test:integration:seat": "node --test portal/integration/seat-content-e2e.mjs",
+    "test:integration:llm-usage": "node --test portal/integration/llm-usage-e2e.mjs",
     "test:integration:db": "node --test portal/integration/db-integration.mjs",
     "test:integration:prompts": "node --test portal/integration/platform-prompts-db.mjs",
     "start": "node portal/src/cli.js serve",
