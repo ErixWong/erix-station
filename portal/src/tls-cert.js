@@ -46,7 +46,7 @@ export const TLS_VERIFY_TIMEOUT_MS = 5000;
  * 别在别处发明新码（`docs/api/portal.md` §1.2 是唯一登记处）。
  */
 export class TlsCertError extends Error {
-  constructor(code, message, { httpStatus = 400, details, step } = {}) {
+  constructor(code, message, { httpStatus = 400, details, step, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
@@ -54,6 +54,9 @@ export class TlsCertError extends Error {
     // 写盘链路专用：说清失败在**哪一步**（mkdir / backup / cert / key / materialize），
     // 便于运维区分「盘满了」与「证书本身有问题」。不新增错误码，走既有 `internal` + `details.step`。
     this.step = step;
+    // issue #803 S2-D：可选英文对（同 AdminError/HttpError/SessionError/DirError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状、message 与 step 语义一字不动。
+    this.en = en;
   }
 }
 
@@ -808,6 +811,7 @@ export async function writeCertificateAssets({ dynamicDir, certPem, keyPem, fsIm
   if (!tlsOut.published) {
     const err = new TlsCertError('internal', `tls.yml 未发布（${tlsOut.reason ?? tlsOut.code ?? 'unknown'}）`, {
       httpStatus: 500,
+      en: `tls.yml was not published (${tlsOut.reason ?? tlsOut.code ?? 'unknown'})`,
       details: { step: 'materialize' },
       step: 'materialize',
     });
@@ -832,6 +836,7 @@ export async function rollbackCertificateAssets({ dynamicDir, fsImpl = fs.promis
   if (!prev.present || !prev.keyPresent) {
     throw new TlsCertError('tls_no_previous', '没有可回滚的上一代证书（certs/prev/ 不存在或不完整）', {
       httpStatus: 404,
+      en: 'there is no previous certificate generation to roll back to (certs/prev/ does not exist or is incomplete)',
     });
   }
   const paths = tlsPaths(dynamicDir);
@@ -857,6 +862,7 @@ export async function rollbackCertificateAssets({ dynamicDir, fsImpl = fs.promis
   if (!tlsOut.published) {
     throw new TlsCertError('internal', `tls.yml 未发布（${tlsOut.reason ?? tlsOut.code ?? 'unknown'}）`, {
       httpStatus: 500,
+      en: `tls.yml was not published (${tlsOut.reason ?? tlsOut.code ?? 'unknown'})`,
       details: { step: 'materialize' },
       step: 'materialize',
     });

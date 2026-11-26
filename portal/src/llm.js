@@ -29,7 +29,7 @@ export function typeToMode(type) {
 }
 
 export class LlmError extends Error {
-  constructor(code, message, { httpStatus = 400, details, retryable = false } = {}) {
+  constructor(code, message, { httpStatus = 400, details, retryable = false, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
@@ -37,6 +37,9 @@ export class LlmError extends Error {
     // issue #261014 切片 B2：调用方（http.js 的 LlmError 分支）据此填 `error.retryable`。
     // 缺省 false ⇒ 既有 LlmError 的响应面逐字节不变。
     this.retryable = retryable;
+    // issue #803 S2-D：可选英文对（同 AdminError/HttpError/SessionError/DirError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状、message 与 retryable 语义一字不动。
+    this.en = en;
   }
 }
 
@@ -304,6 +307,7 @@ export async function listProviders(gateway) {
 export async function validateFdeLlmSelection(gateway, input = {}) {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) {
     throw new LlmError('validation_failed', 'llm 必须是对象', {
+      en: 'llm must be an object',
       details: { field: 'llm' },
     });
   }
@@ -315,11 +319,13 @@ export async function validateFdeLlmSelection(gateway, input = {}) {
   } = input;
   if (typeof provider_id !== 'string' || provider_id.trim() === '') {
     throw new LlmError('validation_failed', 'provider_id 为必填字段', {
+      en: 'provider_id is required',
       details: { field: 'llm.provider_id' },
     });
   }
   if (typeof main_model_id !== 'string' || main_model_id.trim() === '') {
     throw new LlmError('validation_failed', 'main_model_id 为必填字段', {
+      en: 'main_model_id is required',
       details: { field: 'llm.main_model_id' },
     });
   }
@@ -329,6 +335,7 @@ export async function validateFdeLlmSelection(gateway, input = {}) {
   ]) {
     if (value != null && value !== '' && typeof value !== 'string') {
       throw new LlmError('validation_failed', `${field} 必须是字符串或空值`, {
+        en: `${field} must be a string or an empty value`,
         details: { field: `llm.${field}` },
       });
     }
@@ -341,12 +348,13 @@ export async function validateFdeLlmSelection(gateway, input = {}) {
     throw new LlmError(
       'llm_catalog_unavailable',
       'LiteLLM 模型目录不可用；请先启用或修复可选 LiteLLM profile 后再开户',
-      { httpStatus: 503 },
+      { httpStatus: 503, en: 'The LiteLLM model catalog is unavailable; enable or fix an optional LiteLLM profile before provisioning' },
     );
   }
   const provider = providers.find((item) => item.id === provider_id);
   if (!provider) {
     throw new LlmError('validation_failed', '所选 LiteLLM credential 不存在', {
+      en: 'the selected LiteLLM credential does not exist',
       details: { field: 'llm.provider_id' },
     });
   }
@@ -355,6 +363,7 @@ export async function validateFdeLlmSelection(gateway, input = {}) {
     const model = provider.models.find((item) => String(modelId(item)) === id);
     if (!model) {
       throw new LlmError('validation_failed', `${slotName} 模型不存在或不属于所选 provider`, {
+        en: `the ${slotName} model does not exist or does not belong to the selected provider`,
         details: { field: `llm.${slotName}`, model_id: id },
       });
     }
@@ -381,7 +390,7 @@ export async function createProvider(gateway, input = {}) {
   const client = getGatewayClient(gateway);
   const name = input.credential_name ?? input.name;
   if (typeof name !== 'string' || !name.trim()) {
-    throw new LlmError('validation_failed', 'name 为必填字段', { details: { field: 'name' } });
+    throw new LlmError('validation_failed', 'name 为必填字段', { en: 'name is required', details: { field: 'name' } });
   }
   const info = input.credential_info ?? {
     credential_name: name.trim(),
@@ -404,6 +413,7 @@ export async function updateProvider(gateway, name, { base_url, enabled, credent
   const client = getGatewayClient(gateway);
   if (enabled !== undefined) {
     throw new LlmError('validation_failed', 'LiteLLM credential 不支持启停；请删除 credential 或管理其模型', {
+      en: 'LiteLLM credentials do not support enable/disable; delete the credential or manage its models',
       details: { field: 'enabled' },
     });
   }
@@ -435,7 +445,7 @@ export async function deleteProvider(gateway, name) {
 function validateMaxTokens(value) {
   if (value === undefined || value === null) return;
   if (!Number.isInteger(value) || value < 1) {
-    throw new LlmError('validation_failed', 'max_tokens 必须为正整数', { details: { field: 'max_tokens' } });
+    throw new LlmError('validation_failed', 'max_tokens 必须为正整数', { en: 'max_tokens must be a positive integer', details: { field: 'max_tokens' } });
   }
 }
 
@@ -483,6 +493,7 @@ function validateContextWindow(value) {
   const window = positiveIntOrNull(value);
   if (window === null) {
     throw new LlmError('validation_failed', `上下文窗口必须是正整数（传入 ${value}）`, {
+      en: `context_window must be a positive integer (received ${value})`,
       details: { field: 'context_window', reason: 'not_positive_integer', min: CONTEXT_WINDOW_MIN, value },
     });
   }
@@ -490,6 +501,7 @@ function validateContextWindow(value) {
     throw new LlmError('validation_failed',
       `上下文窗口不能低于 ${CONTEXT_WINDOW_MIN}（传入 ${value}）。低于此值平台算不出正的压缩预算` +
       '（`窗口 − 输出上限 − max(2000, 10%×窗口)`），压缩会静默关闭', {
+      en: `the context window cannot be below ${CONTEXT_WINDOW_MIN} (received ${value}). Below this value the platform cannot compute a positive compaction budget, so compaction would be silently disabled`,
       details: { field: 'context_window', reason: 'too_small', min: CONTEXT_WINDOW_MIN, value },
     });
   }
@@ -553,6 +565,7 @@ function validateMaxOutputTokens(value, contextWindow) {
   if (value === undefined || value === null) return value;
   if (!Number.isInteger(value) || value < 1) {
     throw new LlmError('validation_failed', 'max_output_tokens 必须为正整数', {
+      en: 'max_output_tokens must be a positive integer',
       details: { field: 'max_output_tokens' },
     });
   }
@@ -562,6 +575,7 @@ function validateMaxOutputTokens(value, contextWindow) {
     // 而且这个值能否成立根本无法审计。
     throw new LlmError('validation_failed', '设置 max_output_tokens 前必须先配置 context_window'
       + '（或窗口形态非法：token 数必须是正整数，真小数按未配置处理）', {
+      en: 'context_window must be set before max_output_tokens (or its form is invalid: the token count must be a positive integer, and a fractional value is treated as unset)',
       details: { field: 'max_output_tokens', reason: 'context_window_missing' },
     });
   }
@@ -570,7 +584,7 @@ function validateMaxOutputTokens(value, contextWindow) {
     throw new LlmError(
       'validation_failed',
       `max_output_tokens 不能超过上限 = context_window 的 1/4（context_window=${window} ⇒ 上限 ${maxAllowed}，传入 ${value}）`,
-      { details: { field: 'max_output_tokens', max_allowed: maxAllowed, context_window: window } },
+      { en: `max_output_tokens must not exceed the limit of one quarter of context_window (context_window=${window} ⇒ limit ${maxAllowed}, received ${value})`, details: { field: 'max_output_tokens', max_allowed: maxAllowed, context_window: window } },
     );
   }
   // #325：归一后才是**落库的值**（本函数的入口闸已保证它是正整数 ⇒ 这里是恒等归一，但写侧不再拿原值）。
@@ -621,7 +635,7 @@ function applyMaxOutputTokensWrite(params, modelInfo, value, { isCreate }) {
 function validateCost(value, field) {
   if (value === undefined || value === null) return null;
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    throw new LlmError('validation_failed', `${field} 必须为非负数字（USD / token）`, { details: { field } });
+    throw new LlmError('validation_failed', `${field} 必须为非负数字（USD / token）`, { en: `${field} must be a non-negative number (USD per token)`, details: { field } });
   }
   return value;
 }
@@ -639,11 +653,11 @@ export async function createModel(gateway, input = {}) {
   const outputCost = validateCost(input.output_cost_per_token, 'output_cost_per_token');
   const modelName = input.model_name ?? input.model_id;
   if (typeof modelName !== 'string' || !modelName.trim()) {
-    throw new LlmError('validation_failed', 'model_id 为必填字段', { details: { field: 'model_id' } });
+    throw new LlmError('validation_failed', 'model_id 为必填字段', { en: 'model_id is required', details: { field: 'model_id' } });
   }
   const upstreamModel = input.model ?? input.litellm_params?.model;
   if (typeof upstreamModel !== 'string' || !upstreamModel.trim()) {
-    throw new LlmError('validation_failed', 'model 为必填字段', { details: { field: 'model' } });
+    throw new LlmError('validation_failed', 'model 为必填字段', { en: 'model is required', details: { field: 'model' } });
   }
   const params = input.litellm_params == null
     ? { model: upstreamModel.trim(), litellm_credential_name: input.provider_id }
@@ -754,6 +768,7 @@ export async function updateModel(gateway, id, {
   if (call_name !== undefined) {
     if (typeof call_name !== 'string' || call_name.trim() === '') {
       throw new LlmError('validation_failed', 'call_name 必须是非空字符串（数据面调用名）', {
+        en: 'call_name must be a non-empty string (the data-plane call name)',
         details: { field: 'call_name' },
       });
     }
@@ -762,7 +777,7 @@ export async function updateModel(gateway, id, {
   let upstreamModel;
   if (model !== undefined) {
     if (typeof model !== 'string') {
-      throw new LlmError('validation_failed', 'model 必须为字符串', { details: { field: 'model' } });
+      throw new LlmError('validation_failed', 'model 必须为字符串', { en: 'model must be a string', details: { field: 'model' } });
     }
     upstreamModel = model.trim() || undefined;
   }
@@ -789,6 +804,7 @@ export async function updateModel(gateway, id, {
       const clash = toModel(conflicting);
       const clashLabel = clash.name || clash.model_name || String(modelId(conflicting));
       throw new LlmError('model_name_conflict', `调用名「${callName}」已被模型「${clashLabel}」占用`, {
+        en: `the call name "${callName}" is already taken by model "${clashLabel}"`,
         httpStatus: 409,
         details: { field: 'call_name', call_name: callName, conflicting_model_id: String(modelId(conflicting)) },
       });
@@ -796,7 +812,7 @@ export async function updateModel(gateway, id, {
   }
   const currentEnabled = !isModelBlocked(current);
   if (enabled !== undefined && typeof enabled !== 'boolean') {
-    throw new LlmError('validation_failed', 'enabled 必须为 boolean', { details: { field: 'enabled' } });
+    throw new LlmError('validation_failed', 'enabled 必须为 boolean', { en: 'enabled must be a boolean', details: { field: 'enabled' } });
   }
   if (enabled !== undefined && enabled !== currentEnabled) {
     if (enabled) await client.unblockModel(id);
@@ -1290,6 +1306,7 @@ export async function assertBindingModelsResolvable(pool, userId, opts = {}) {
       'llm_model_not_found',
       `绑定的${SLOT_LABELS[slot] ?? slot}${boundName ? `「${boundName}」` : ''}在 LLM 网关里已不存在（模型 id ${modelId}）：请到管理台 /admin 重新选模型后再发送（无权限请联系管理员）`,
       {
+        en: `the bound ${slot} model${boundName ? ` "${boundName}"` : ''} no longer exists in the LLM gateway (model id ${modelId}): pick a model again in the /admin console before sending (contact an administrator if you lack permission)`,
         httpStatus: 409,
         details: { slot, model_id: modelId, ...(boundName ? { model_name: boundName } : {}) },
         // 「管理员改配后可重试」：本预检零副作用且不写幂等台账，同 key 原样重试能重新占位（§1.4）；
@@ -1362,13 +1379,13 @@ export async function setFdeBudget(pool, { fdeName, budgetUsd, budgetPeriod = DE
   if (!(budgetUsd === null || isFinitePositiveBudget(budgetUsd))) {
     throw new LlmError('validation_failed',
       `budget_usd 必须为 null（不限额）或 ≤ ${BUDGET_MAX_USD} 的有限正数`,
-      { details: { field: 'budget_usd' } });
+      { en: `budget_usd must be null (no limit) or a finite positive number ≤ ${BUDGET_MAX_USD}`, details: { field: 'budget_usd' } });
   }
   // 设了额度才校验周期；budgetUsd===null（清空额度）时周期被忽略并一并清空，故不必校验。
   if (budgetUsd !== null && !isValidBudgetPeriod(budgetPeriod)) {
     throw new LlmError('validation_failed',
       `budget_period 必须是 ${BUDGET_PERIODS.map((p) => `'${p}'`).join(' 或 ')}（不能自己换算：'30d'⇒月、'7d'⇒每周一、'1m'⇒1 分钟）`,
-      { details: { field: 'budget_period' } });
+      { en: `budget_period must be one of ${BUDGET_PERIODS.map((p) => `'${p}'`).join(' or ')} (do not convert yourself: '30d' means a month, '7d' means every Monday, '1m' means one minute)`, details: { field: 'budget_period' } });
   }
   const hasBudget = isFinitePositiveBudget(budgetUsd);
   const period = hasBudget ? budgetPeriod : null;
@@ -1411,7 +1428,7 @@ export async function setFdeBudget(pool, { fdeName, budgetUsd, budgetPeriod = DE
     if (!curRow || curRow.api_key !== apiKeyBefore || curRow.generation !== generationBefore) {
       await client.query('COMMIT').catch(() => {});
       throw new LlmError('conflict',
-        '写入额度期间该 FDE 的 key 被轮换/重绑，请重试', { httpStatus: 409 });
+        '写入额度期间该 FDE 的 key 被轮换/重绑，请重试', { httpStatus: 409, en: 'the key for this FDE was rotated or rebound while the budget was being written; please retry' });
     }
     // 周期列：有额度才写，无额度随金额一并清空（保持配对 CHECK）。
     await client.query(
@@ -1645,6 +1662,7 @@ async function selectGatewayModels(gateway, { providerId, mainModelId, embedding
     const model = models.find((item) => String(modelId(item)) === String(id));
     if (!model) {
       throw new LlmError('validation_failed', `${slotName} 模型不存在`, {
+        en: `the ${slotName} model does not exist`,
         details: { field: slotName, model_id: id },
       });
     }
@@ -1716,13 +1734,14 @@ export async function setFdeLlmConfig(pool, {
   force = false, allowAwaitingCredential = false, onlyIfMissing = false, gateway,
 } = {}) {
   if (typeof provider_id !== 'string' || provider_id === '') {
-    throw new LlmError('validation_failed', 'provider_id 为必填字段', { details: { field: 'provider_id' } });
+    throw new LlmError('validation_failed', 'provider_id 为必填字段', { en: 'provider_id is required', details: { field: 'provider_id' } });
   }
   if (typeof main_model_id !== 'string' || main_model_id === '') {
-    throw new LlmError('validation_failed', 'main_model_id 为必填字段', { details: { field: 'main_model_id' } });
+    throw new LlmError('validation_failed', 'main_model_id 为必填字段', { en: 'main_model_id is required', details: { field: 'main_model_id' } });
   }
   if (api_key !== undefined && api_key !== null && api_key !== '') {
     throw new LlmError('validation_failed', '上游 API key 必须保存在 LiteLLM credential 中，不得按 FDE 提交', {
+      en: 'the upstream API key must be stored in a LiteLLM credential and must not be submitted per FDE',
       details: { field: 'api_key' },
     });
   }
@@ -1786,7 +1805,7 @@ export async function setFdeLlmConfig(pool, {
       if (activeRun.rows.length > 0) {
         throw new LlmError('active_run_conflict',
           '该 FDE 有进行中的 run：更改模型白名单会在 run 执行中途生效，影响后续请求。确认无影响请带 force=true 重试。',
-          { httpStatus: 409 });
+          { httpStatus: 409, en: 'this FDE has a run in progress: changing the model allowlist takes effect mid-run and affects subsequent requests; if you are sure this is safe, retry with force=true' });
       }
     }
 

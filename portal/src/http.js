@@ -1472,7 +1472,7 @@ async function routeApi(req, res, ctx, url) {
     if (rawDays !== null) {
       days = Number(rawDays);
       if (!Number.isInteger(days) || days < 1 || days > 90) {
-        throw new HttpError(400, 'validation_failed', 'days 必须为 1–90 的整数', { details: { field: 'days' } });
+        throw new HttpError(400, 'validation_failed', 'days 必须为 1–90 的整数', { details: { field: 'days' }, en: 'days must be an integer between 1 and 90' });
       }
     }
     const usage = await llm.getSelfUsage(ctx.pool, { fdeName, gateway: ctx.llmGateway, days });
