@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { projectTranscriptForDisplay } from 'erix-agent';
+import { projectTranscriptForDisplay } from '../src/display-projection.js';
 
 import {
   projectSessionMessages,
