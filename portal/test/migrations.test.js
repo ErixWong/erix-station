@@ -28,7 +28,9 @@ const RESERVED_MIGRATION_NUMS = new Set([]);
 // 现势（issue #719，2026-11-23）：本单追加 `0047-fde-budget.sql`（`fde_llm_bindings` 加
 // `budget_usd numeric(12,6)` + `budget_period text`，每 FDE 周期额度落库（周期白名单 '1d'/'1mo'），
 // key 重铸时从这两列恢复）⇒ head 46 → 47（周期改造仍写在同一个 0047，未合并故直接改写、不新开 0048）。
-const MIGRATION_HEAD = 47;
+// 现势（issue #828 P1，2026-11-26）：本单追加 `0048-users-locale.sql`（`users.locale VARCHAR(8)` 可空，
+// 账号级语言偏好，NULL=跟随浏览器；值域交应用侧白名单不写 DB CHECK）⇒ head 47 → 48。
+const MIGRATION_HEAD = 48;
 const MIGRATION_NUMS = Array.from({ length: MIGRATION_HEAD }, (_, i) => i + 1)
   .filter((n) => !RESERVED_MIGRATION_NUMS.has(n));
 
@@ -1116,7 +1118,7 @@ test('迁移 0033-delta-events-not-persisted：形态 M 是纯清理（零 DDL�
   // 0035（`macro-platform`，issue #524）追加之后本行退一支；0037（`notifications-and-origin`，
   // issue #526）再退一支 —— 口径不变：靠**绝对位置**钉住。
   // 而不是「0033 必须永远排末位」——后者已经被上面那 19 处 head 断言接管（它们现在钉 0037）。
-  assert.equal(files[files.length - 15], file, '0033 是倒数第十二支（0034..0042 + 0043-platform-prompts + 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面，不许回头插队）');
+  assert.equal(files[files.length - 16], file, '0033 是倒数第十三支（0034..0042 + 0043-platform-prompts + 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面，不许回头插队）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里"索引""VACUUM"这些词都会出现，整文件 indexOf 会假绿）。
@@ -1176,7 +1178,7 @@ test('迁移 0034-prune-stale-run-checkpoints：纯清理（零 DDL）、cutoff 
   const file = '0034-prune-stale-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0034 存在');
-  assert.equal(files[files.length - 14], file, '0034 是倒数第十二支（新迁移只能追加，不回改已应用的编号）；0035..0045 之后它不再是末位');
+  assert.equal(files[files.length - 15], file, '0034 是倒数第十三支（新迁移只能追加，不回改已应用的编号）；0035..0045 之后它不再是末位');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里 "VACUUM""索引""DELETE" 这些词都会出现，整文件判会假绿/假红）。
@@ -1250,7 +1252,7 @@ test('迁移 0035-macro-platform：三表齐全、两条唯一键在、FK 的 ON
   const file = '0035-macro-platform.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0035 存在');
-  assert.equal(files[files.length - 13], file, '0035 是倒数第十一支（0036..0045 追加在它后面；新迁移只能追加，不回改已应用的编号）');
+  assert.equal(files[files.length - 14], file, '0035 是倒数第十二支（0036..0045 追加在它后面；新迁移只能追加，不回改已应用的编号）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 去掉**整行注释**（保留 `$$ ... $$` 内部语句），否则「注释里提到 DROP TABLE」会被误判。
@@ -1326,7 +1328,7 @@ test('迁移 0038-transcript-recovery-rows：幂等键/append_seq 排序/只新�
   const file = '0038-transcript-recovery-rows.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0038 存在');
-  assert.equal(files[files.length - 10], file, '0038 是倒数第七支（0039-capability-market / 0040-mcp-channel / 0041 / 0042 / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
+  assert.equal(files[files.length - 11], file, '0038 是倒数第八支（0039-capability-market / 0040-mcp-channel / 0041 / 0042 / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -1407,7 +1409,7 @@ test('迁移 0039-capability-market：三表齐全、包内容按 (item,version)
   const file = '0039-capability-market.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0039 存在');
-  assert.equal(files[files.length - 9], file, '0039 是倒数第六支（0040-mcp-channel / 0041-retire / 0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面；新迁移只能追加）');
+  assert.equal(files[files.length - 10], file, '0039 是倒数第七支（0040-mcp-channel / 0041-retire / 0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面；新迁移只能追加）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -1532,7 +1534,7 @@ test('迁移 0041-retire-run-checkpoints：DROP 形状四 constraint（IF EXISTS
   const file = '0041-retire-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0041 存在');
-  assert.equal(files[files.length - 7], file, '0041 是倒数第四支（0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
+  assert.equal(files[files.length - 8], file, '0041 是倒数第五支（0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**语句区**（整行注释剥掉）：头注释里 DROP / VACUUM / BEGIN / CASCADE 这些词都要出现，
@@ -1626,8 +1628,8 @@ test('迁移 0043-platform-prompts：种首行（让 FOR UPDATE 有行可锁）+
   // 本单让号到 0043 后它就是当前末位（0040→#608 mcp-channel、0041→#640 retire、0042→#670 mcp-plaintext 都排在它之前）。
   // #650 追加 `0044-system-metrics.sql` 之后 0043 不再是末位 ⇒ 判据改成「位置固定 + 只能往后追加」
   // （形状同 0033..0041 那几支的位次断言：钉的是「不许回头插队」，不是「永远是最后一支」）。
-  assert.equal(files[files.length - 5], file,
-    '0043 是倒数第二支（0040-mcp-channel、0041-retire-run-checkpoints、0042-mcp-plaintext-values 在它之前，'
+  assert.equal(files[files.length - 6], file,
+    '0043 是倒数第三支（0040-mcp-channel、0041-retire-run-checkpoints、0042-mcp-plaintext-values 在它之前，'
     + '0044-system-metrics 追加在它之后；新迁移只能追加）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
@@ -1878,8 +1880,8 @@ test('迁移 0047-fde-budget：周期额度两列 + 枚举/配对两条 CHECK + 
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0047-fde-budget.sql'), '0047-fde-budget 存在（旧名 fde-daily-budget 已 git mv）');
   assert.ok(!files.includes('0047-fde-daily-budget.sql'), '旧文件名不得残留');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, 'head=0047（连续无空洞）');
-  assert.ok(!files.some((f) => /^0048-/.test(f)), '周期改造直接改写 0047，不得新开 0048');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, 'head=48（连续无空洞；0048 已归 #828 合法启用，不再禁止 0048）');
+  assert.ok(files.includes('0048-users-locale.sql'), '0048-users-locale 已归 #828，不再禁止 0048');
 
   const sql = fs.readFileSync(path.join(dir, '0047-fde-budget.sql'), 'utf8');
   // 两列 + 金额精度
@@ -1902,4 +1904,39 @@ test('迁移 0047-fde-budget：周期额度两列 + 枚举/配对两条 CHECK + 
   // 冻结 baseline 不回写这两列
   const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
   assert.ok(!baseline.includes('budget_period'), 'baseline 不得回写 budget_period');
+});
+
+// ---------------------------------------------------------------------------
+// 迁移 0048-users-locale（issue #828 P1）：`users.locale VARCHAR(8)` 可空，账号级语言偏好。
+// 断言：列存在且可空、**值域不写 DB CHECK**（归一化交应用侧白名单，与 0036/0046 同一分层）、
+// 幂等（ADD COLUMN IF NOT EXISTS）、lock_timeout、末尾只读 DO 块、不写 BEGIN/COMMIT；
+// 以及 baseline 冻结：schema.sql **不回写** locale（DDL 只走增量，同 0006/0008/0009 那一族口径）。
+// ---------------------------------------------------------------------------
+test('迁移 0048-users-locale：users.locale 可空 + 值域不写 DB CHECK + 幂等 + baseline 不回写', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  const file = '0048-users-locale.sql';
+  assert.ok(files.includes(file), '0048-users-locale 存在');
+  assert.equal(files[files.length - 1], file, '0048 是当前末位迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, 'head=0048');
+
+  const sql = fs.readFileSync(path.join(dir, file), 'utf8');
+  // 列定义：可空（无 NOT NULL）、宽 8、幂等
+  assert.match(sql, /ALTER TABLE users/i);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS locale VARCHAR\(8\)/i, '幂等 ADD COLUMN，宽 8');
+  assert.doesNotMatch(sql, /ADD COLUMN[^\n]*locale[^\n]*NOT NULL/i, 'locale 必须可空（NULL=跟随浏览器）');
+  // 值域故意不写 DB CHECK（交应用侧 normalizeUserLocale；写了 CHECK 非法值回落那条判据真机进不去）
+  assert.doesNotMatch(sql, /CHECK\s*\(\s*\(?locale\)?/i, '不得对 locale 写 DB CHECK');
+  assert.doesNotMatch(sql, /locale[^\n]*IN\s*\(/i, '不得用 IN 白名单锁 locale 值域');
+  // 幂等与纪律
+  assert.match(sql, /SET lock_timeout/, '照 0016 的 lock_timeout 纪律');
+  assert.doesNotMatch(sql, /^\s*BEGIN\s*;/im, '不写 BEGIN（事务边界归 runner）');
+  assert.doesNotMatch(sql, /^\s*COMMIT\s*;/im, '不写 COMMIT');
+  // 只读 DO 块（重放证据）
+  assert.match(sql, /DO \$do\$/, '末尾只读 DO 块打印重放证据');
+  assert.doesNotMatch(sql, /INSERT INTO|UPDATE users SET/i, 'DO 块只读，不得写库');
+
+  // baseline 冻结：locale 只走增量，不写回 baseline（schema.sql 一字节不改，checksum 不漂）
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  assert.ok(!/\blocale\b/.test(baseline), 'baseline 不得回写 locale（DDL 只走增量迁移）');
 });
