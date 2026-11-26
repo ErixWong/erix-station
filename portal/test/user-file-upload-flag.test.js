@@ -348,7 +348,8 @@ test('A-6 四条 user DTO 路径的键集完全一致（同一夹具），且都
   const p4 = await auth.findSessionUser(pool, token, { now });
   assert.ok(p4, '会话必须能读出用户');
 
-  const base = ['id', 'login', 'display_name', 'role', 'fde_name', 'auth_source', 'file_upload_enabled'].sort();
+  // issue #828 P1：账号级语言偏好 `locale` 与 `file_upload_enabled` 同为 user DTO 的常驻键（四条路径均经 toSessionUser）。
+  const base = ['id', 'login', 'display_name', 'role', 'fde_name', 'auth_source', 'file_upload_enabled', 'locale'].sort();
   assert.deepEqual(Object.keys(p1.user).sort(), base, 'authenticate');
   assert.deepEqual(Object.keys(p2.user).sort(), base, 'verifyTotpForUser');
   assert.deepEqual(Object.keys(p3.user).sort(), base, 'loadActiveUser');
