@@ -1378,7 +1378,7 @@ async function routeApi(req, res, ctx, url) {
     const session = await requireSession(req, ctx);
     const fdeName = session.user.fde_name;
     if (!fdeName) {
-      throw new admin.AdminError('fde_name_required', '当前用户未分配 fde_name，无法管理 Git 凭据', { httpStatus: 400 });
+      throw new admin.AdminError('fde_name_required', '当前用户未分配 fde_name，无法管理 Git 凭据', { httpStatus: 400, en: 'the current user has no fde_name assigned, so managing Git credentials is not available' });
     }
     if (req.method === 'GET') {
       const result = await gitCredential.listGitCredentials({ config: ctx.config, fdeName });

@@ -12,11 +12,12 @@ import { enqueueOffboarding, offboardingStatus, workspaceExists } from './offboa
 import { removeGitCredentialFile } from './git-credential.js';
 
 export class AdminError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    this.en = en;
   }
 }
 
@@ -88,10 +89,10 @@ const safeUser = (row) => ({
 export function validatePassword(password, limits = {}, { field = 'password' } = {}) {
   const maxPassword = limits.maxPasswordLength ?? 256;
   if (typeof password !== 'string' || password.length === 0) {
-    throw new AdminError('validation_failed', `${field} 为必填字段`, { details: { field } });
+    throw new AdminError('validation_failed', `${field} 为必填字段`, { en: `${field} is required`, details: { field } });
   }
   if (password.length > maxPassword) {
-    throw new AdminError('validation_failed', `${field} 长度超过上限 ${maxPassword}`, { details: { field } });
+    throw new AdminError('validation_failed', `${field} 长度超过上限 ${maxPassword}`, { en: `${field} exceeds the limit of ${maxPassword} characters`, details: { field } });
   }
 }
 
@@ -198,20 +199,20 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
   const maxLogin = limits.maxLoginLength ?? 128;
   const maxPassword = limits.maxPasswordLength ?? 256;
   if (typeof login !== 'string' || login.trim() === '') {
-    throw new AdminError('validation_failed', 'login 为必填字段', { details: { field: 'login' } });
+    throw new AdminError('validation_failed', 'login 为必填字段', { en: 'login is required', details: { field: 'login' } });
   }
   const trimmedLogin = login.trim();
   if (trimmedLogin.length > maxLogin) {
-    throw new AdminError('validation_failed', `login 长度超过上限 ${maxLogin}`, { details: { field: 'login' } });
+    throw new AdminError('validation_failed', `login 长度超过上限 ${maxLogin}`, { en: `login exceeds the limit of ${maxLogin} characters`, details: { field: 'login' } });
   }
   validatePassword(password, { maxPasswordLength: maxPassword });
   if (typeof email !== 'string' || email.trim() === '' || email.trim().length > 320
       || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-    throw new AdminError('validation_failed', 'email 必须是有效邮箱地址', { details: { field: 'email' } });
+    throw new AdminError('validation_failed', 'email 必须是有效邮箱地址', { en: 'email must be a valid email address', details: { field: 'email' } });
   }
   const trimmedEmail = email.trim();
   if (typeof fde_name !== 'string' || !projects.validateFdeName(fde_name).ok) {
-    throw new AdminError('validation_failed', 'fde_name 非法（小写字母/数字/连字符，≤63）', { details: { field: 'fde_name' } });
+    throw new AdminError('validation_failed', 'fde_name 非法（小写字母/数字/连字符，≤63）', { en: 'invalid fde_name (lowercase letters, digits, hyphens, ≤63)', details: { field: 'fde_name' } });
   }
   // #202：开户口径提前到与路由生成（routes.js isValidHostname）同源——按 buildHostname 语法拼出
   // 最终预览 hostname 后**整体**校验（逐标签 ≤63 + 总长 ≤253），不是只验各段。
@@ -232,7 +233,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
   );
   const existing = existingResult.rows[0] ?? null;
   if (existing && existing.status !== 'disabled') {
-    throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { httpStatus: 409 });
+    throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { en: `fde_name ${fde_name} is already taken`, httpStatus: 409 });
   }
   let previousGitAccount = null;
   if (existing) {
@@ -243,7 +244,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
       [existing.id],
     );
     if (offboarding.rows.length > 0) {
-      throw new AdminError('user_offboarding', '用户下线任务仍在运行，不能重新激活', { httpStatus: 409 });
+      throw new AdminError('user_offboarding', '用户下线任务仍在运行，不能重新激活', { en: 'the user offboarding task is still running, so reactivation is not allowed', httpStatus: 409 });
     }
     const gitAccount = await pool.query(
       `SELECT git_host_id, token_ref FROM fde_git_accounts WHERE fde_id = $1`,
@@ -259,7 +260,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
     existing ? [trimmedLogin, existing.id] : [trimmedLogin],
   );
   if (duplicateLogin.rows.length > 0) {
-    throw new AdminError('login_conflict', `login ${trimmedLogin} 已被占用`, {
+    throw new AdminError('login_conflict', `login ${trimmedLogin} 已被占用`, { en: `login ${trimmedLogin} is already taken`,
       httpStatus: 409, details: { field: 'login' },
     });
   }
@@ -270,7 +271,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
     existing ? [trimmedEmail, existing.id] : [trimmedEmail],
   );
   if (duplicateEmail.rows.length > 0) {
-    throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
+    throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { en: `email ${trimmedEmail} is already taken`, httpStatus: 409 });
   }
 
   const passwordHash = await auth.hashPassword(password); // 与 bootstrap-admin 同口径（scrypt 自描述）
@@ -307,7 +308,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
         ],
       );
       if (!r.rows[0]) {
-        throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { httpStatus: 409 });
+        throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { en: `fde_name ${fde_name} is already taken`, httpStatus: 409 });
       }
       await pool.query(`DELETE FROM login_sessions WHERE user_id = $1`, [existing.id]);
       await pool.query(`DELETE FROM login_pending WHERE user_id = $1`, [existing.id]);
@@ -335,15 +336,15 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
     if (err instanceof AdminError) throw err;
     if (err?.code === '23505') {
       if (err.constraint === 'users_login_key' || String(err.detail ?? '').includes('(login)')) {
-        throw new AdminError('login_conflict', `login ${trimmedLogin} 已被占用`, {
+        throw new AdminError('login_conflict', `login ${trimmedLogin} 已被占用`, { en: `login ${trimmedLogin} is already taken`,
           httpStatus: 409, details: { field: 'login' },
         });
       }
       if (err.constraint === 'users_email_key' || String(err.detail ?? '').includes('(email)')) {
-        throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
+        throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { en: `email ${trimmedEmail} is already taken`, httpStatus: 409 });
       }
       if (err.constraint === 'users_fde_name_key' || String(err.detail ?? '').includes('(fde_name)')) {
-        throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { httpStatus: 409 });
+        throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { en: `fde_name ${fde_name} is already taken`, httpStatus: 409 });
       }
     }
     throw err;
@@ -368,20 +369,20 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
 /** 更新管理员允许编辑的用户字段；禁用时原子吊销已有登录会话。 */
 export async function updateUser(pool, userId, updates, { actorId = null } = {}) {
   if (updates === null || typeof updates !== 'object' || Array.isArray(updates)) {
-    throw new AdminError('validation_failed', '请求体必须是对象');
+    throw new AdminError('validation_failed', '请求体必须是对象', { en: 'the request body must be an object' });
   }
   const fields = Object.keys(updates);
   if (fields.length === 0) {
-    throw new AdminError('validation_failed', '至少提供一个可更新字段');
+    throw new AdminError('validation_failed', '至少提供一个可更新字段', { en: 'provide at least one updatable field' });
   }
   const allowed = new Set(['display_name', 'email', 'mail_otp_enabled', 'file_upload_enabled',
     'totp_login_enabled', 'role', 'fde_name', 'status']);
   for (const field of fields) {
     if (field === 'login') {
-      throw new AdminError('validation_failed', 'login 不可修改', { details: { field: 'login' } });
+      throw new AdminError('validation_failed', 'login 不可修改', { en: 'login cannot be modified', details: { field: 'login' } });
     }
     if (!allowed.has(field)) {
-      throw new AdminError('validation_failed', `不支持更新字段 ${field}`, { details: { field } });
+      throw new AdminError('validation_failed', `不支持更新字段 ${field}`, { en: `updating field ${field} is not supported`, details: { field } });
     }
   }
 
@@ -393,24 +394,24 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
       trimmedEmail = null;
     } else if (typeof updates.email !== 'string' || updates.email.trim().length > 320
         || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(updates.email.trim())) {
-      throw new AdminError('validation_failed', 'email 必须是有效邮箱地址', { details: { field: 'email' } });
+      throw new AdminError('validation_failed', 'email 必须是有效邮箱地址', { en: 'email must be a valid email address', details: { field: 'email' } });
     } else {
       trimmedEmail = updates.email.trim();
     }
   }
   if (Object.hasOwn(updates, 'mail_otp_enabled') && typeof updates.mail_otp_enabled !== 'boolean') {
-    throw new AdminError('validation_failed', 'mail_otp_enabled 必须是布尔值', { details: { field: 'mail_otp_enabled' } });
+    throw new AdminError('validation_failed', 'mail_otp_enabled 必须是布尔值', { en: 'mail_otp_enabled must be a boolean', details: { field: 'mail_otp_enabled' } });
   }
   // #472 片 A：上传开关同样是布尔（照上面那条的形状）。`'true'` / `1` / `null` 都是「看起来像布尔但不是」，
   // 放进 PG 的 boolean 列会在驱动层报 22P02（人不话），这里当场 400 并点名 field。
   if (Object.hasOwn(updates, 'file_upload_enabled') && typeof updates.file_upload_enabled !== 'boolean') {
-    throw new AdminError('validation_failed', 'file_upload_enabled 必须是布尔值', { details: { field: 'file_upload_enabled' } });
+    throw new AdminError('validation_failed', 'file_upload_enabled 必须是布尔值', { en: 'file_upload_enabled must be a boolean', details: { field: 'file_upload_enabled' } });
   }
   // feat-261110-02：「允许用 TOTP 登录」同样是布尔（同一形状）。**没有**「必须已绑 TOTP」的交叉防护：
   // 没绑时这一位本来就不起作用（`chooseSecondFactor` 的 `totpUsable` 还要看 `hasTotpEnrollment`），
   // 拒绝一个无害的值只会把「先绑 TOTP 再打开」这个顺序变成两次往返。
   if (Object.hasOwn(updates, 'totp_login_enabled') && typeof updates.totp_login_enabled !== 'boolean') {
-    throw new AdminError('validation_failed', 'totp_login_enabled 必须是布尔值', { details: { field: 'totp_login_enabled' } });
+    throw new AdminError('validation_failed', 'totp_login_enabled 必须是布尔值', { en: 'totp_login_enabled must be a boolean', details: { field: 'totp_login_enabled' } });
   }
   // 两条交叉防护（都在写库之前）：开了开关却没邮箱 / 清空邮箱却还开着开关 ⇒ 都会让人**登不进去**
   // （`chooseSecondFactor` 走 `email_not_registered` 那条 409）。这里拒绝保存，而不是让它在登录时才炸。
@@ -426,29 +427,29 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
         : Boolean(row.mail_otp_enabled);
       const nextEmail = Object.hasOwn(updates, 'email') ? trimmedEmail : (row.email ?? null);
       if (nextEnabled === true && (typeof nextEmail !== 'string' || nextEmail.trim() === '')) {
-        throw new AdminError('validation_failed', '启用邮件验证码前必须先填写邮箱', {
+        throw new AdminError('validation_failed', '启用邮件验证码前必须先填写邮箱', { en: 'an email address is required before enabling email verification codes',
           details: { field: 'mail_otp_enabled' },
         });
       }
     }
   }
   if (Object.hasOwn(updates, 'role') && !['fde', 'admin'].includes(updates.role)) {
-    throw new AdminError('validation_failed', "role 只允许 'fde' 或 'admin'", { details: { field: 'role' } });
+    throw new AdminError('validation_failed', "role 只允许 'fde' 或 'admin'", { en: "role must be 'fde' or 'admin'", details: { field: 'role' } });
   }
   if (Object.hasOwn(updates, 'status') && !['active', 'disabled'].includes(updates.status)) {
-    throw new AdminError('validation_failed', "status 只允许 'active' 或 'disabled'", { details: { field: 'status' } });
+    throw new AdminError('validation_failed', "status 只允许 'active' 或 'disabled'", { en: "status must be 'active' or 'disabled'", details: { field: 'status' } });
   }
   if (Object.hasOwn(updates, 'fde_name')
       && updates.fde_name !== null
       && !projects.validateFdeName(updates.fde_name).ok) {
-    throw new AdminError('validation_failed', 'fde_name 非法（小写字母/数字/连字符，≤63）', { details: { field: 'fde_name' } });
+    throw new AdminError('validation_failed', 'fde_name 非法（小写字母/数字/连字符，≤63）', { en: 'invalid fde_name (lowercase letters, digits, hyphens, ≤63)', details: { field: 'fde_name' } });
   }
   if (Object.hasOwn(updates, 'display_name') && typeof updates.display_name !== 'string') {
-    throw new AdminError('validation_failed', 'display_name 必须是字符串', { details: { field: 'display_name' } });
+    throw new AdminError('validation_failed', 'display_name 必须是字符串', { en: 'display_name must be a string', details: { field: 'display_name' } });
   }
 
   const existing = await pool.query(`SELECT id, login, fde_name FROM users WHERE id = $1`, [userId]);
-  if (!existing.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+  if (!existing.rows[0]) throw new AdminError('not_found', '用户不存在', { en: 'user does not exist', httpStatus: 404 });
   const current = existing.rows[0];
   const changesFdeName = Object.hasOwn(updates, 'fde_name') && updates.fde_name !== current.fde_name;
 
@@ -458,7 +459,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
       [updates.fde_name, userId],
     );
     if (duplicate.rows.length > 0) {
-      throw new AdminError('fde_name_conflict', `fde_name ${updates.fde_name} 已被占用`, { httpStatus: 409 });
+      throw new AdminError('fde_name_conflict', `fde_name ${updates.fde_name} 已被占用`, { en: `fde_name ${updates.fde_name} is already taken`, httpStatus: 409 });
     }
   }
 
@@ -479,7 +480,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
         [trimmedEmail, userId],
       );
       if (duplicate.rows.length > 0) {
-        throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
+        throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { en: `email ${trimmedEmail} is already taken`, httpStatus: 409 });
       }
     }
     setField('email', trimmedEmail);
@@ -522,11 +523,11 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     );
   } catch (err) {
     if (err?.code === '23505' && err?.constraint === 'users_fde_name_key') {
-      throw new AdminError('fde_name_conflict', `fde_name ${updates.fde_name} 已被占用`, { httpStatus: 409 });
+      throw new AdminError('fde_name_conflict', `fde_name ${updates.fde_name} 已被占用`, { en: `fde_name ${updates.fde_name} is already taken`, httpStatus: 409 });
     }
     // 并发下「先查后写」会漏（两个请求同时通过上面的 SELECT）⇒ 唯一索引是最后一道，映射成同一个错误码。
     if (err?.code === '23505' && err?.constraint === 'users_email_key') {
-      throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
+      throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { en: `email ${trimmedEmail} is already taken`, httpStatus: 409 });
     }
     throw err;
   }
@@ -535,9 +536,9 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
       ? await pool.query(`SELECT 1 FROM fde_offboarding WHERE fde_id = $1`, [userId])
       : { rows: [] };
     if (offboarding.rows.length > 0) {
-      throw new AdminError('user_offboarding', '用户正在下线或处于保留期，不能重新启用或修改 FDE 名称', { httpStatus: 409 });
+      throw new AdminError('user_offboarding', '用户正在下线或处于保留期，不能重新启用或修改 FDE 名称', { en: 'the user is being offboarded or in the retention period, so re-enabling or changing the FDE name is not allowed', httpStatus: 409 });
     }
-    throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+    throw new AdminError('not_found', '用户不存在', { en: 'user does not exist', httpStatus: 404 });
   }
   await recordAdminAudit(pool, actorId, 'admin.user_updated', current.login, {
     fields: fields.filter((field) => field !== 'login'),
@@ -548,7 +549,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
 /** 有 FDE 资源时排队下线；无资源用户立即禁用。用户行永久保留。 */
 export async function deleteUser(pool, { actorId, userId, config, log = console } = {}) {
   if (actorId === userId) {
-    throw new AdminError('self_delete', '管理员不能停用自己的账号', { httpStatus: 409 });
+    throw new AdminError('self_delete', '管理员不能停用自己的账号', { en: 'an admin is not allowed to disable their own account', httpStatus: 409 });
   }
 
   let userLogin;
@@ -562,7 +563,7 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
       `SELECT id, login, fde_name FROM users WHERE id = $1 FOR UPDATE`,
       [userId],
     );
-    if (!target.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+    if (!target.rows[0]) throw new AdminError('not_found', '用户不存在', { en: 'user does not exist', httpStatus: 404 });
     userLogin = target.rows[0].login;
     fdeName = target.rows[0].fde_name;
 
@@ -585,7 +586,7 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
 
     if (resources.rows[0]?.has_resources || workspaceExists(config, fdeName)) {
       if (!fdeName || !projects.validateFdeName(fdeName).ok) {
-        throw new AdminError('user_fde_name_missing', '有关联资源的用户缺少有效 fde_name，无法安全下线', { httpStatus: 409 });
+        throw new AdminError('user_fde_name_missing', '有关联资源的用户缺少有效 fde_name，无法安全下线', { en: 'the user has associated resources but no valid fde_name, so it cannot be safely offboarded', httpStatus: 409 });
       }
       offboarding = await enqueueOffboarding(client, { fdeId: userId, fdeName });
       await client.query(
@@ -627,7 +628,7 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
     await client?.query('ROLLBACK').catch(() => {});
     if (err instanceof AdminError) throw err;
     if (err?.code === '23503') {
-      throw new AdminError('user_has_related_data', '用户仍有关联记录，无法直接删除', { httpStatus: 409 });
+      throw new AdminError('user_has_related_data', '用户仍有关联记录，无法直接删除', { en: 'the user still has related records, so it cannot be deleted directly', httpStatus: 409 });
     }
     throw err;
   } finally {
@@ -660,7 +661,7 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
 export async function resetUserPassword(pool, userId, password, { actorId = null, limits = {} } = {}) {
   validatePassword(password, limits);
   const existing = await pool.query(`SELECT id, login FROM users WHERE id = $1`, [userId]);
-  if (!existing.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+  if (!existing.rows[0]) throw new AdminError('not_found', '用户不存在', { en: 'user does not exist', httpStatus: 404 });
   const passwordHash = await auth.hashPassword(password);
   const result = await pool.query(
     `WITH target AS (
@@ -673,7 +674,7 @@ export async function resetUserPassword(pool, userId, password, { actorId = null
      SELECT id, login FROM target`,
     [userId, passwordHash],
   );
-  if (!result.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+  if (!result.rows[0]) throw new AdminError('not_found', '用户不存在', { en: 'user does not exist', httpStatus: 404 });
   await recordAdminAudit(pool, actorId, 'admin.user_password_reset', result.rows[0].login);
   return { ok: true };
 }
@@ -717,7 +718,7 @@ export async function changeOwnPassword(pool, userId, currentPassword, newPasswo
   const row = existing.rows[0];
   // `password_hash IS NULL`（OIDC 账号 / 未设口令）也落这里：verifyPassword 对 NULL 返回 false。
   if (!row || !(await auth.verifyPassword(currentPassword, row.password_hash, { log }))) {
-    throw new AdminError('invalid_credentials', '用户名或口令错误', { httpStatus: 401 });
+    throw new AdminError('invalid_credentials', '用户名或口令错误', { en: 'invalid username or password', httpStatus: 401 });
   }
   // ---- 新口令那一组（**旧口令校验之后**才走到，顺序是有意的，见下）----
   // 客户端一致性校验（#255 收尾）：请求体**带了** `confirm_password` 就必须与 `new_password` 相同。
@@ -737,10 +738,10 @@ export async function changeOwnPassword(pool, userId, currentPassword, newPasswo
   // 这条放在 `newPassword === currentPassword` **之前**：它只依赖请求自身，不依赖库里状态，
   // 先报它泄露的信息最少（「你自己两格打得不一样」是纯客户端事实）。
   if (confirmPassword !== undefined && confirmPassword !== newPassword) {
-    throw new AdminError('validation_failed', '两次输入的新口令不一致', { details: { field: 'confirm_password' } });
+    throw new AdminError('validation_failed', '两次输入的新口令不一致', { en: 'the new password and its confirmation do not match', details: { field: 'confirm_password' } });
   }
   if (newPassword === currentPassword) {
-    throw new AdminError('validation_failed', '新口令不得与当前口令相同', { details: { field: 'new_password' } });
+    throw new AdminError('validation_failed', '新口令不得与当前口令相同', { en: 'the new password must not be the same as the current password', details: { field: 'new_password' } });
   }
   const passwordHash = await auth.hashPassword(newPassword);
   // 单语句（CTE）⇒ 「换哈希 + 清旗标 + 吊销其它会话」原子完成，不存在「哈希已换但会话没吊销」的中间态。
@@ -786,7 +787,7 @@ export async function enrollUserTotp(pool, userId, { actorId = null, totpIssuer 
      SELECT target.*, NULL::timestamptz AS last_login_at FROM target`,
     [userId, totpSecret],
   );
-  if (!result.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+  if (!result.rows[0]) throw new AdminError('not_found', '用户不存在', { en: 'user does not exist', httpStatus: 404 });
   const user = safeUser(result.rows[0]);
   const totpUri = totp.otpauthUri(totpSecret, { issuer: totpIssuer, label: user.login });
   await recordAdminAudit(pool, actorId, 'admin.user_totp_enroll', user.login);
@@ -807,7 +808,7 @@ export async function resetUserTotp(pool, userId, { actorId = null } = {}) {
      SELECT id, login FROM target`,
     [userId],
   );
-  if (!result.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+  if (!result.rows[0]) throw new AdminError('not_found', '用户不存在', { en: 'user does not exist', httpStatus: 404 });
   await recordAdminAudit(pool, actorId, 'admin.user_totp_reset', result.rows[0].login);
   return { ok: true };
 }

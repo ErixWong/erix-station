@@ -1555,3 +1555,57 @@ test('#472 开户（POST /api/admin/users）不接受 file_upload_enabled：新�
     await close();
   }
 });
+
+// ---- #803 S2-A：从 HTTP 面钉住管理面错误文案的双语（英文态出英文、缺省出中文原文）与错误体形状 ----
+// 6 类最常撞的报错各跑两腿：带 `Cookie: locale=en` ⇒ error.message 逐字 = 抛点写的英文；
+// 不带 cookie ⇒ error.message 逐字 = 原中文（这条就是「既有行为不破」的钉子）。
+// 另钉：错误体键集合不变（code/message/retryable，有 details 时才有 details），且 en 不外泄。
+test('admin 面错误文案双语：英文态出英文、缺省出中文原文，错误体形状不破（#803 S2-A）', async () => {
+  const { base, cookie, close } = await startAdminServer();
+  try {
+    const enCookie = `${cookie}; locale=en`;
+    const jsonH = (c) => ({ cookie: c, 'content-type': 'application/json' });
+    const cases = [
+      { name: '缺必填字段',
+        req: (c) => fetch(`${base}/api/admin/users`, { method: 'POST', headers: jsonH(c), body: JSON.stringify({ llm: TEST_LLM, git_host_id: TEST_GIT_HOST_ID }) }),
+        zh: 'login 为必填字段', en: 'login is required' },
+      { name: '字段超长（login）',
+        req: (c) => fetch(`${base}/api/admin/users`, { method: 'POST', headers: jsonH(c), body: JSON.stringify({ login: 'l'.repeat(200), llm: TEST_LLM, git_host_id: TEST_GIT_HOST_ID }) }),
+        zh: 'login 长度超过上限 128', en: 'login exceeds the limit of 128 characters' },
+      { name: 'login 重复',
+        req: (c) => fetch(`${base}/api/admin/users`, { method: 'POST', headers: jsonH(c), body: JSON.stringify({ login: 'root', password: 'ValidPass123', email: 'brandnew@example.test', fde_name: 'freshfde-9', llm: TEST_LLM, git_host_id: TEST_GIT_HOST_ID }) }),
+        zh: 'login root 已被占用', en: 'login root is already taken' },
+      { name: '未知用户 id',
+        req: (c) => fetch(`${base}/api/admin/users/d0000000-0000-4000-8000-000000000099`, { method: 'PATCH', headers: jsonH(c), body: JSON.stringify({ display_name: 'x' }) }),
+        zh: '用户不存在', en: 'user does not exist' },
+      { name: '口令校验（password 超长）',
+        req: (c) => fetch(`${base}/api/admin/users`, { method: 'POST', headers: jsonH(c), body: JSON.stringify({ login: 'pwuser', password: 'p'.repeat(300), llm: TEST_LLM, git_host_id: TEST_GIT_HOST_ID }) }),
+        zh: 'password 长度超过上限 256', en: 'password exceeds the limit of 256 characters' },
+      { name: 'fde_name_required（http.js 直抛）',
+        req: (c) => fetch(`${base}/api/me/git-credential`, { method: 'GET', headers: { cookie: c } }),
+        zh: '当前用户未分配 fde_name，无法管理 Git 凭据', en: 'the current user has no fde_name assigned, so managing Git credentials is not available' },
+    ];
+    for (const c of cases) {
+      const bodyEn = await (await c.req(enCookie)).json();
+      assert.equal(bodyEn.error.message, c.en, `${c.name}：locale=en 必须逐字出英文`);
+      assert.ok(!Object.hasOwn(bodyEn.error, 'en'), `${c.name}：en 不得泄漏进响应体（英文腿）`);
+
+      const bodyZh = await (await c.req(cookie)).json();
+      assert.equal(bodyZh.error.message, c.zh, `${c.name}：缺省 locale 必须逐字出中文原文（既有行为不破）`);
+      assert.ok(!Object.hasOwn(bodyZh.error, 'en'), `${c.name}：en 不得泄漏进响应体（中文腿）`);
+    }
+
+    // 错误体键集合：code/message/retryable 恒在，details 只在抛点给了 details 时才有；永不出现 en。
+    const withDetails = await (await fetch(`${base}/api/admin/users`, { method: 'POST', headers: jsonH(enCookie), body: JSON.stringify({ llm: TEST_LLM, git_host_id: TEST_GIT_HOST_ID }) })).json();
+    assert.deepEqual(Object.keys(withDetails.error).sort(), ['code', 'details', 'message', 'retryable']);
+    assert.equal(withDetails.error.code, 'validation_failed');
+    assert.equal(withDetails.error.retryable, false);
+
+    const noDetails = await (await fetch(`${base}/api/admin/users/d0000000-0000-4000-8000-000000000099`, { method: 'PATCH', headers: jsonH(enCookie), body: JSON.stringify({ display_name: 'x' }) })).json();
+    assert.deepEqual(Object.keys(noDetails.error).sort(), ['code', 'message', 'retryable']);
+    assert.equal(noDetails.error.code, 'not_found');
+    assert.equal(noDetails.error.retryable, false);
+  } finally {
+    await close();
+  }
+});
