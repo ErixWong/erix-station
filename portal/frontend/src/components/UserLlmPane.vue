@@ -239,8 +239,10 @@ interface UsageDay {
 const quota = ref<Quota | null>(null);
 const usageDays = ref<UsageDay[]>([]);
 const budgetInput = ref<string | number>('');
-// 周期下拉：默认 '1mo'（白名单只允许 '1d' / '1mo'，原样透传 LiteLLM，绝不自算换算）。
-const budgetPeriodInput = ref('1mo');
+// 周期下拉（issue #800）：初值必须是**空**（=「未设置」），不能兜成 '1mo'——
+// 兜底值会让「从没设过额度」的账号看上去像「已经按月限制了」（这正是 #800 附带要修的误导）。
+// 保存时不写周期 ⇒ 后端缺省仍按 '1mo' 下发（API 语义未变）。
+const budgetPeriodInput = ref('');
 const savingBudget = ref(false);
 const budgetMsg = ref('');
 const budgetErr = ref('');
@@ -308,6 +310,8 @@ async function loadQuotaAndUsage() {
     budgetPeriodInput.value = q.quota?.budget_period ?? '';
   } catch (e) {
     quota.value = null;
+    // 读不到额度 ⇒ 周期也不许留着上一次的猜值（评审 SHOULD-3）：不知道就显示「未设置」。
+    budgetPeriodInput.value = '';
     if (!(e instanceof ApiError && e.code === 'not_found')) budgetLoadErr.value = true;
   }
   try {

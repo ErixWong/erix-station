@@ -447,4 +447,20 @@ describe('loadKeyUsage（GET /api/admin/llm/key-usage，issue #800）', () => {
     expect(admin.keyUsageLoading).toBe(false);
     expect(admin.keyUsage).toEqual([]);
   });
+
+  // 评审 BLOCKER：Pinia 状态跟路由一起活，重拉失败时不许继续举着上一轮的钱。
+  it('先成功、再重拉失败 ⇒ 旧读数当场作废（清空 + loaded=false，不得回显旧金额）', async () => {
+    let mode: 'ok' | 'fail' = 'ok';
+    stubFetch(() => (mode === 'ok' ? jsonResponse(200, ROWS) : errorResponse(502, 'llm_gateway_error', '网关不可达')));
+    const admin = useAdminStore();
+
+    await admin.loadKeyUsage();
+    expect(admin.keyUsage).toHaveLength(2);
+
+    mode = 'fail';
+    await admin.loadKeyUsage();
+    expect(admin.keyUsage).toEqual([]);
+    expect(admin.keyUsageLoaded).toBe(false);
+    expect(admin.keyUsageErr).toContain('网关不可达');
+  });
 });

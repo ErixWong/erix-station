@@ -3193,3 +3193,68 @@ test('listFdeKeyUsage：网关 listKeys 抛错 ⇒ 向上冒泡（那一列自�
   });
   await assert.rejects(listFdeKeyUsage(pool, { gateway: pool }), /gateway unreachable/);
 });
+
+// ⑦ bulk 存在的全部理由：绑定数与网关调用次数**无关**（评审 NIT：这条之前没被钉住）。
+test('listFdeKeyUsage：三条绑定 ⇒ 网关 listKeys 只调一次（整表一次，不是每人一次）', async () => {
+  const users = ['ana', 'bob', 'cid'].map((n, i) => ({ id: `u${i}`, fde_name: n, status: 'active' }));
+  const pool = keyUsagePool({
+    users,
+    bindings: users.map((u) => litellmBinding({ fde_id: u.id, key_id: `tok-${u.fde_name}` })),
+    pages: [users.map((u) => ({ token: `tok-${u.fde_name}`, spend: 0.5, budget_duration: null }))],
+  });
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(pool.listKeysCalls.length, 1, `整表必须一次取完，实际打了 ${pool.listKeysCalls.length} 次`);
+  assert.deepEqual(out.rows.map((r) => r.fde_name), ['ana', 'bob', 'cid']);
+  assert.equal(out.truncated, false, '一页装得下就不算部分结果');
+});
+
+// ⑧ 保险丝到顶 ⇒ 必须明说「这是部分结果」，不许混在 200 里当全量（评审 SHOULD-1）。
+test('listFdeKeyUsage：还有下一页却没取完 ⇒ truncated=true，且没匹配上的绑定走「无读数」而不是 0', async () => {
+  const pool = keyUsagePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [litellmBinding({ fde_id: 'u1', key_id: 'tok-missing' })],
+  });
+  // 每页都给满 100 条、并声称共 99 页 ⇒ 20 页保险丝必然到顶。
+  pool.listKeys = async (query) => {
+    pool.listKeysCalls.push(query);
+    return {
+      keys: Array.from({ length: 100 }, (_, i) => ({ token: `tok-${query.page}-${i}` })),
+      total_count: 9900, current_page: query.page, total_pages: 99,
+    };
+  };
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(pool.listKeysCalls.length, 20, '保险丝应在 20 页收口（既不翻到死，也不静默少翻）');
+  assert.equal(out.truncated, true);
+  assert.equal(out.rows[0].spend, null, '没匹配到 key 的绑定必须是「无读数」，不是 $0.00');
+  assert.equal(out.rows[0].spend_scope, null);
+});
+
+// ⑨ 网关不报 total_pages 这一族：给满一页 = 可能还有 ⇒ truncated；给半页 = 确实到底了。
+test('listFdeKeyUsage：网关没报 total_pages ⇒ 满满一页算截断、不满一页不算', async () => {
+  const mk = (count) => {
+    const pool = keyUsagePool({ users: [], bindings: [] });
+    pool.listKeys = async (query) => {
+      pool.listKeysCalls.push(query);
+      return { keys: Array.from({ length: count }, (_, i) => ({ token: `t${i}` })) };
+    };
+    return pool;
+  };
+  const fullPage = mk(100);
+  assert.equal((await listFdeKeyUsage(fullPage, { gateway: fullPage })).truncated, true);
+  assert.equal(fullPage.listKeysCalls.length, 1, '不许为了猜有没有下一页就多翻');
+  const halfPage = mk(7);
+  assert.equal((await listFdeKeyUsage(halfPage, { gateway: halfPage })).truncated, false);
+});
+
+// ⑩ 金额字段的「空白 ≠ 0」（评审 SHOULD-2）：网关字段回空串/空白串 ⇒ 无读数，不是 $0.00。
+test('listFdeKeyUsage：key 的 spend 是空白串 ⇒ 该行 spend 为 null（钱没有「空白」这种值，只有有无）', async () => {
+  const pool = keyUsagePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [litellmBinding({ fde_id: 'u1', key_id: 'tok-blank' })],
+    pages: [[{ token: 'tok-blank', spend: '   ', max_budget: ' ', budget_duration: null }]],
+  });
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(out.rows[0].spend, null, '空白串被当 0 就会把「没读数」显示成「一分没花」');
+  assert.equal(out.rows[0].max_budget, null);
+  assert.equal(out.rows[0].remaining, null);
+});

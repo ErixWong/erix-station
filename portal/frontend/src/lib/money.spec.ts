@@ -41,6 +41,18 @@ describe('fmtUsdCompact', () => {
     expect(fmtUsdCompact(-5.04)).not.toContain('$-');
   });
 
+  // 评审 NIT：`toFixed(2)` 会把 −0.004 变成 `-$0.00`——那句同时说「有」和「零」，是假数。
+  // 极小非零（不论正负）只能说「不足一分」：这里的断言是**量级**。
+  it('极小非零（含极小负数）⇒ <$0.01，绝不出现 -$0.00', () => {
+    expect(fmtUsdCompact(0.0001)).toBe('<$0.01');
+    expect(fmtUsdCompact(-0.0001)).toBe('<$0.01');
+    expect(fmtUsdCompact(-0.004)).toBe('<$0.01');
+    expect(fmtUsdCompact(-0.004)).not.toBe('-$0.00');
+    expect(fmtUsdCompact(0.004)).toBe('<$0.01');
+    // 到得了一分的仍照实带符号：
+    expect(fmtUsdCompact(-0.02)).toBe('-$0.02');
+  });
+
   it('输出恒为短串（定长列的硬约束：长度远小于 6 位小数的 fmtUsd）', () => {
     for (const v of [5.091148, 1234.5678, 0.00001, -42.999]) {
       expect(fmtUsdCompact(v).length).toBeLessThanOrEqual(11);

@@ -587,6 +587,18 @@ describe('UserLlmPane · 周期额度（#719）', () => {
     expect(sel.value).toBe('1mo');
   });
 
+  // 评审 SHOULD-3：读额度失败时也不得把「猜的默认值」当现状举着（初值与失败分支都必须是空）。
+  it('读额度失败（5xx）⇒ 周期下拉仍是空（未设置），不得回落到「每月」', async () => {
+    const { wrapper } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/budget') && !init?.method) {
+        return jsonResponse(502, { error: { code: 'llm_gateway_error', message: '网关不可达' } });
+      }
+      return undefined;
+    });
+    const sel = wrapper.find('[data-test="budget-period"]').element as HTMLSelectElement;
+    expect(sel.value).toBe('');
+  });
+
   it('保存时周期为空 ⇒ body 不带 budget_period（后端缺省按每月兜）；有金额+周期未设置时出现提示行', async () => {
     const { wrapper, fetchFn } = await mountQuota((url, init) => {
       if (String(url).includes('/llm/budget') && init?.method === 'PUT') {

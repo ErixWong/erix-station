@@ -568,16 +568,21 @@ export const useAdminStore = defineStore('admin', {
       }
     },
 
-    /** issue #800：GET /api/admin/llm/key-usage —— 整表一次取回每 FDE 的周期与已用金额。 */
+    /** issue #800：GET /api/admin/llm/key-usage —— 整表一次取回每 FDE 的周期与已用金额。
+     *  重拉**一开头就作废旧读数**（评审 BLOCKER）：Pinia 状态跨路由存活，不清就会在「本轮没拿到新数」时
+     *  继续举着上一轮的钱给人看；钱这件事上「旧值」与「没读数」必须分得开 ⇒ 拿不到就回到「—」。 */
     async loadKeyUsage(): Promise<string | null> {
       this.keyUsageLoading = true;
       this.keyUsageErr = null;
+      this.keyUsage = [];
+      this.keyUsageLoaded = false;
       try {
         const data = await api<{ rows: KeyUsageRow[] }>('/api/admin/llm/key-usage');
         this.keyUsage = data.rows ?? [];
         this.keyUsageLoaded = true;
         return null;
       } catch (e) {
+        // 失败 ⇒ 保持空（渲染成「—」），**不得回展示旧金额**。
         this.keyUsageErr = t('admin.errorPrefix') + this.errText(e);
         return this.keyUsageErr;
       } finally {

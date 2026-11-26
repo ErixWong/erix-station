@@ -1316,8 +1316,12 @@ export async function getFdeLlmEcho(pool, fdeName) {
 // portal **绝不自算 token、也绝不换算周期**，用量全读 LiteLLM 自己的端点。
 
 function numOrNull(value) {
+  // 空白串必须算「没有读数」而不是 0（`Number('  ') === 0`）：钱没有「空白」这种值，只有「有」和「无」，
+  // 而 0 会被前端读成「一分没花」（issue #800 评审 SHOULD-2）。
+  if (value == null) return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
   const n = typeof value === 'number' ? value : Number(value);
-  return value == null || value === '' || !Number.isFinite(n) ? null : n;
+  return !Number.isFinite(n) ? null : n;
 }
 
 function intOr0(value) {
@@ -1505,15 +1509,25 @@ const KEY_USAGE_MAX_PAGES = 20;    // 保险丝：20 页 = 2000 个 key，远超
 export async function listFdeKeyUsage(pool, { gateway } = {}) {
   const client = getGatewayClient(gateway);
   const byToken = new Map();
+  let pages = 0;
+  let declaredPages = 0;
+  let lastCount = 0;
   for (let page = 1; page <= KEY_USAGE_MAX_PAGES; page += 1) {
     const payload = await client.listKeys({ page, size: KEY_USAGE_PAGE_SIZE, return_full_object: true });
     const keys = Array.isArray(payload?.keys) ? payload.keys : [];
     for (const item of keys) {
       if (item && typeof item === 'object' && item.token != null) byToken.set(String(item.token), item);
     }
-    const totalPages = intOr0(payload?.total_pages);
-    if (keys.length === 0 || page >= (totalPages > 0 ? totalPages : 1)) break;
+    pages = page;
+    lastCount = keys.length;
+    const total = intOr0(payload?.total_pages);
+    if (total > 0) declaredPages = total;
+    if (keys.length === 0 || page >= (declaredPages > 0 ? declaredPages : 1)) break;
   }
+  // 「这是部分结果」必须说出来，不能混在 200 里当全量：网关报了总页数却没取完（保险丝到顶）、
+  // 或它干脆没报总页数却给了满满一页（下一轮可能还有）——两种都算 truncated。
+  // 没匹配上的绑定走「无读数」分支（前端渲染 `—`），**不谎称一分没花**。
+  const truncated = declaredPages > 0 ? declaredPages > pages : lastCount >= KEY_USAGE_PAGE_SIZE;
   const bindings = await pool.query(
     `SELECT u.fde_name, b.budget_usd, b.budget_period, b.key_id
        FROM fde_llm_bindings b
@@ -1522,6 +1536,7 @@ export async function listFdeKeyUsage(pool, { gateway } = {}) {
       ORDER BY u.fde_name ASC`,
   );
   return {
+    truncated,
     rows: bindings.rows.map((row) => {
       const dbBudgetUsd = row.budget_usd == null ? null : Number(row.budget_usd);
       const dbPeriod = row.budget_period ?? null;
