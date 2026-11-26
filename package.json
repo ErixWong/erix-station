@@ -21,6 +21,7 @@
     "test:integration:locale": "node --test portal/integration/admin-locale-e2e.mjs",
     "test:integration:db": "node --test portal/integration/db-integration.mjs",
     "test:integration:prompts": "node --test portal/integration/platform-prompts-db.mjs",
+    "test:integration:prompts-ui": "node --test portal/integration/prompts-effective-e2e.mjs",
     "start": "node portal/src/cli.js serve",
     "db:migrate": "node portal/src/cli.js migrate",
     "healthcheck": "node portal/src/cli.js healthcheck",
