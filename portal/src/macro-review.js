@@ -342,9 +342,9 @@ export async function runMacroReview(pool, {
   remediate = true, notify = async () => {}, postMessageImpl = postMessage, now = new Date(),
   reviewUnavailable = false,
 } = {}) {
-  if (!macroRunId) throw new MacroError('validation_failed', 'macroRunId 必填（W4b 只 finish 不 claim）');
+  if (!macroRunId) throw new MacroError('validation_failed', 'macroRunId 必填（W4b 只 finish 不 claim）', { en: 'macroRunId is required (W4b only finishes, it does not claim)' });
   // facts-only 模式不跑审查 ⇒ 不要求 reviewRunner（#676 ②）。
-  if (!reviewUnavailable && typeof reviewRunner !== 'function') throw new MacroError('validation_failed', 'reviewRunner 必填');
+  if (!reviewUnavailable && typeof reviewRunner !== 'function') throw new MacroError('validation_failed', 'reviewRunner 必填', { en: 'reviewRunner is required' });
 
   // —— 账与订阅：一次读齐（depth / until / 缺省 user 与会话）——
   const acct = await pool.query(
@@ -354,7 +354,7 @@ export async function runMacroReview(pool, {
     [macroRunId],
   );
   const row = acct.rows?.[0];
-  if (!row) throw new MacroError('not_found', '执行记录不存在', { httpStatus: 404, details: { macroRunId } });
+  if (!row) throw new MacroError('not_found', '执行记录不存在', { httpStatus: 404, details: { macroRunId }, en: 'the run does not exist' });
   const depth = Number(row.depth ?? 0);
   const safeUserId = userId ?? row.user_id;
   const sessionId = reviewSessionId ?? row.session_id;
@@ -428,7 +428,7 @@ export async function runMacroReview(pool, {
   // —— ③ 回灌（只在 red）——
   const body = REMEDIATION_PREFIX + String(text ?? '');
   if (!body.startsWith('[系统]')) {
-    throw new MacroError('validation_failed', '回灌正文必须以 [系统] 开头');
+    throw new MacroError('validation_failed', '回灌正文必须以 [系统] 开头', { en: 'the remediation body must start with the literal prefix [系统]' });
   }
 
   // ⑤ 到期：审查结果照常入流水，但到点后**禁止再触发整改 run**（不强杀已启动的审查）。
