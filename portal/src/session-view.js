@@ -501,19 +501,21 @@ export function aggregateCompactionStats(transcriptRows) {
 }
 
 /**
- * #451：`transcriptRows` 的**那一次**扫描——三份事实一起产出，谁都别再扫第二遍。
+ * #451：`transcriptRows` 的**那一次**扫描——四份事实一起产出，谁都别再扫第二遍。
  *
- * 为什么合成一个函数而不是三个 `filter`/`for`：`GET /api/sessions/:id` 要同时拿到
- * ① 折叠行真摘要（#390-A）、② 折叠替代物（#440）、③ 压缩层聚合（#451）；分三趟就是三倍
- * `recordForProjection` 调用。成本红线的**判据**是 SQL 次数不变，但同一个数组扫三遍同样没必要。
+ * 为什么合成一个函数而不是多个 `filter`/`for`：`GET /api/sessions/:id` 要同时拿到
+ * ① 折叠行真摘要（#390-A）、② 折叠替代物（#440）、③ 压缩层聚合（#451）、
+ * ④ 会话级折叠索引 `session.folds[]`（#816 第②步，从同一趟整会话扫描派生，**不受消息窗口限制**）；
+ * 分多趟就是多倍 `recordForProjection` 调用。成本红线的**判据**是 SQL 次数不变，但同一个数组多扫一遍同样没必要。
  *
  * @param {Array<{round?: unknown, record?: unknown}>} transcriptRows
- * @returns {{roundsWithRealSummary: Set<number>, foldedFactsByRound: Map<number, unknown>, compaction: object | null, skippedCompactionEntries: number}}
+ * @returns {{roundsWithRealSummary: Set<number>, foldedFactsByRound: Map<number, unknown>, compaction: object | null, skippedCompactionEntries: number, folds: Array<object>}}
  */
 export function collectTranscriptFacts(transcriptRows) {
   const rows = Array.isArray(transcriptRows) ? transcriptRows : [];
   const roundsWithRealSummary = new Set();
   const foldedFactsByRound = new Map();
+  const foldEntries = []; // #816 第②步：会话级折叠索引的原料（{round, foldedFacts}），同趟顺手收，不去重不清洗
   const totals = new Map(); // layerId → {triggered, tokensSaved}
   const roundsSeen = new Set();
   let lastRound = null;
@@ -525,7 +527,12 @@ export function collectTranscriptFacts(transcriptRows) {
     if (record?.folded === true) {
       if (hasRealSummary(record)) roundsWithRealSummary.add(round);
       const foldedFacts = record?.foldedFacts;
-      if (foldedFacts !== undefined && foldedFacts !== null) foldedFactsByRound.set(round, foldedFacts);
+      if (foldedFacts !== undefined && foldedFacts !== null) {
+        foldedFactsByRound.set(round, foldedFacts);
+        // #816 第②步：原样把 {round, foldedFacts} 存进局部数组——folds 索引的原料（**同一次** recordForProjection，
+        // 零额外扫描）。区间可否取到、怎么排序、同 (from,to) 留哪条，全在扫描后统一派生（见函数尾）。
+        foldEntries.push({ round, foldedFacts });
+      }
     }
     // ---- #451：压缩层统计（同一趟扫描的第三个消费者）----
     const stats = record?.compactionStats;
@@ -570,11 +577,36 @@ export function collectTranscriptFacts(transcriptRows) {
   const compaction = Object.keys(layers).length === 0
     ? null
     : { rounds: roundsSeen.size, layers, tokensSaved, lastRound };
+  // ---- #816 第②步：会话级折叠索引 `session.folds[]`（同一趟扫描派生，零新增 SQL）----
+  // 每项**复用 `foldedFactsFields` 那把尺**（不另写第二份）：它的 `facts` 子对象已按「取不到即不写」清洗过
+  // from/to/rounds/title/...（from/to 只认安全整数），`truncated` 也在它的返回里（口径 = `=== true`）。
+  // 契约：① 区间取不到（`from`/`to` 非安全整数）⇒ **这一项不进数组**（没有边界画不出来，不给半截）；
+  // ② 按 `from` 升序、同 `from` 按 `round` 升序；③ 同 `(from,to)` 只留 `round` 最大的那条（最新落账=累计真值）。
+  const foldItems = [];
+  for (const { round, foldedFacts } of foldEntries) {
+    const { facts, truncated } = foldedFactsFields(foldedFacts);
+    // `facts` 缺席 ⇒ 连一个认得子键都没有（含区间）⇒ 不进数组；区间必须两头都是安全整数。
+    if (!facts || !Number.isSafeInteger(facts.from) || !Number.isSafeInteger(facts.to)) continue;
+    foldItems.push({
+      ...(Number.isSafeInteger(round) ? { round } : {}),
+      ...facts,
+      ...(truncated === true ? { truncated: true } : {}),
+    });
+  }
+  // 排序：`from` 升序（取不到排最后，实际已被上面剔除故都取得到）、同 `from` 按 `round` 升序（取不到当最小）。
+  const fromRank = (item) => (Number.isSafeInteger(item.from) ? item.from : Number.POSITIVE_INFINITY);
+  const roundRank = (item) => (Number.isSafeInteger(item.round) ? item.round : Number.NEGATIVE_INFINITY);
+  foldItems.sort((a, b) => (fromRank(a) - fromRank(b)) || (roundRank(a) - roundRank(b)));
+  // 去重：Map 按插入序（即 from 升序）保序，同 `(from,to)` 后写覆盖前写 ⇒ 留下的正是 round 最大那条。
+  const byRange = new Map();
+  for (const item of foldItems) byRange.set(`${item.from}:${item.to}`, item);
+  const folds = [...byRange.values()];
   return {
     roundsWithRealSummary,
     foldedFactsByRound,
     compaction,
     skippedCompactionEntries: skipped,
+    folds,
   };
 }
 
@@ -652,9 +684,11 @@ export function projectSessionMessages({
   // #390-A：折叠行的真摘要按**折叠行自己的 round** 记账（`recordForProjection` 恒把 round 列合成进
   // record，所以 turn.round 与 row.round 必然同值，两边对得上）。只扫一遍入参行，无额外查询。
   //
-  // #451（compactionStats 观测面）：这一趟扫描同时产出三份事实——`roundsWithRealSummary` /
-  // `foldedFactsByRound` / `compaction`（压缩层聚合）。**一趟扫描供三处消费**，聚合不另起一轮
-  // 遍历、更不另发 SQL（成本红线：`GET /api/sessions/:id` 对 `transcript_rounds` 的查询次数不变）。
+  // #451（compactionStats 观测面）：这一趟扫描同时产出四份事实——`roundsWithRealSummary` /
+  // `foldedFactsByRound` / `compaction`（压缩层聚合）/ `folds`（#816 第②步会话级折叠索引，由
+  // `getSession` 挂到 `session.folds`；这里是同一趟扫描的**第四个消费者**，投影本身不消费它）。
+  // **一趟扫描供四处消费**，聚合不另起一轮遍历、更不另发 SQL（成本红线：`GET /api/sessions/:id`
+  // 对 `transcript_rounds` 的查询次数不变）。
   const resolvedFacts = facts ?? collectTranscriptFacts(transcriptRows);
   const roundsWithRealSummary = resolvedFacts.roundsWithRealSummary;
   const foldedFactsByRound = resolvedFacts.foldedFactsByRound;
