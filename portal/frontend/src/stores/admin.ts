@@ -174,6 +174,12 @@ export interface AdminUser {
    * 消费方一律 `=== true`（未知与关都落在「不放开」那一侧，但界面要能说清是哪一种）。
    */
   file_upload_enabled?: boolean;
+  /**
+   * issue #828（portal.md §2.2）：这个用户的默认语言偏好。`'zh-CN'` / `'en'` 或 `null`（没设过）。
+   * `null` = 「跟随浏览器」，**不是** 一个语言值——管理台表单与列表都据此渲染（`null` 显示「跟随浏览器」，
+   * 不得退化成空选项或字符串 `"null"`）。可选：缺键（旧后端 / 部分响应）也当「跟随浏览器」处理。
+   */
+  locale?: string | null;
   role: 'fde' | 'admin';
   fde_name: string | null;
   status: 'active' | 'disabled' | 'awaiting_credential';
@@ -310,7 +316,7 @@ export function testMailErrorText(err: unknown): string {
 }
 
 export type AdminUserUpdate = Partial<Pick<AdminUser,
-  'display_name' | 'email' | 'mail_otp_enabled' | 'totp_login_enabled' | 'file_upload_enabled' | 'role' | 'fde_name'>> & {
+  'display_name' | 'email' | 'mail_otp_enabled' | 'totp_login_enabled' | 'file_upload_enabled' | 'locale' | 'role' | 'fde_name'>> & {
   status?: 'active' | 'disabled';
 };
 

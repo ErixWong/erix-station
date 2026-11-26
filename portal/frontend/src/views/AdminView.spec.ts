@@ -1037,18 +1037,18 @@ describe('AdminView · FDE 用户', () => {
     expect(list.text()).toContain('alice');
     expect(list.findAll('[data-test="user-row"]')).toHaveLength(2);
     expect(list.text()).toContain('✓');
-    expect(list.findAll('thead th')).toHaveLength(10);
-    expect(list.findAll('thead th')[6].text()).toBe('开户 / 下线');
-    // issue #497：第 9 列的语义从「最近登录」换成「最后活动」。
-    // issue #800：中间又插进了「周期 / 用量」⇒ 活动列从第 8 格挪到第 9 格（下标 8）。
-    expect(list.findAll('thead th')).toHaveLength(10);
-    expect(list.findAll('thead th')[8].text()).toBe('最后活动');
+    expect(list.findAll('thead th')).toHaveLength(11);
+    expect(list.findAll('thead th')[7].text()).toBe('开户 / 下线');
+    // issue #497：第 10 列的语义从「最近登录」换成「最后活动」。
+    // issue #800 插了「周期 / 用量」、#828 又插了「默认语言」⇒ 活动列再往后顺一位（下标 9）。
+    expect(list.findAll('thead th')).toHaveLength(11);
+    expect(list.findAll('thead th')[9].text()).toBe('最后活动');
     const rows = list.findAll('[data-test="user-row"]');
-    expect(rows[0].findAll('td')).toHaveLength(10);
-    expect(rows[0].findAll('td')[6].text()).toContain('失败');
-    expect(rows[0].findAll('td')[6].find('span').attributes('title')).toBe('Docker unavailable');
-    // —— 第 9 格（issue #497）：两行同格，值与顺序都由**精确等值**钉死（不是 toContain / not.toBe）——
-    const activityAlice = rows[0].findAll('td')[8];
+    expect(rows[0].findAll('td')).toHaveLength(11);
+    expect(rows[0].findAll('td')[7].text()).toContain('失败');
+    expect(rows[0].findAll('td')[7].find('span').attributes('title')).toBe('Docker unavailable');
+    // —— 第 10 格（issue #497）：两行同格，值与顺序都由**精确等值**钉死（不是 toContain / not.toBe）——
+    const activityAlice = rows[0].findAll('td')[9];
     const mainAlice = activityAlice.get('[data-test="user-activity-main"]').text();
     const subAlice = activityAlice.get('[data-test="user-login-sub"]').text();
     expect(mainAlice).toBe(new Date('2026-10-04T08:30:00.000Z').toLocaleString('zh-CN'));
@@ -1058,7 +1058,7 @@ describe('AdminView · FDE 用户', () => {
     // 副行是小字（「副行」是设计判据，不是随便两个 span）
     expect(activityAlice.get('[data-test="user-login-sub"]').attributes('class')).toContain('text-xs');
 
-    const activityBob = rows[1].findAll('td')[8];
+    const activityBob = rows[1].findAll('td')[9];
     expect(activityBob.get('[data-test="user-activity-main"]').text()).toBe('从未活动');
     expect(activityBob.find('[data-test="user-login-sub"]').exists()).toBe(false);
     // 红线：空值既不是「今天」也不是空串，而且**整格**就只有这两个字
@@ -1144,7 +1144,7 @@ describe('AdminView · FDE 用户', () => {
     const cellOf = (login: string) => {
       const row = wrapper.findAll('[data-test="user-row"]').find((r) => r.get('td').text().includes(login));
       if (!row) throw new Error(`没有 ${login} 这一行（判据会空转）`);
-      return row.findAll('td')[8];
+      return row.findAll('td')[9];
     };
 
     // ① 说过话，而且**活动比登录新** ⇒ 两行都在，主行是活动、副行是登录
@@ -1445,6 +1445,8 @@ describe('AdminView · FDE 用户', () => {
     const patch = callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')[0];
     expect(JSON.parse(String(patch[1]?.body))).toEqual({
       display_name: 'Alice Updated', email: 'alice@example.test', role: 'fde', fde_name: 'alpha-renamed',
+      // #828：profile 保存现在连带发默认语言；该用户没设过 ⇒ `null`（跟随浏览器）。
+      locale: null,
     });
     expect(profileForm.text()).toContain('资料已更新');
 

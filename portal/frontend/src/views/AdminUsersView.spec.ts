@@ -171,12 +171,13 @@ describe('issue #497：第 8 格的两行结构（列数不变、无硬编码中
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/[^\n]*$/gm, '');
 
-  it('列数与列宽：10 个 col / 10 个 th（issue #800 新增「周期 / 用量」列；周期/用量在下标 7，活动顺延到 8）', () => {
-    expect(adminUsersViewSource.match(/<col /g) ?? [], 'colgroup 列数').toHaveLength(10);
-    expect(adminUsersViewSource.match(/<th scope="col"/g) ?? [], '表头列数').toHaveLength(10);
-    // issue #800：新列插在 colLifecycle(6) 之后、lastActivity 之前 ⇒ 周期/用量=下标 7，活动=下标 8。
-    expect(headerCells[7] ?? '').toContain("t('admin.fde.colPeriodUsage')");
-    expect(headerCells[8] ?? '').toContain("t('admin.fde.lastActivity')");
+  it('列数与列宽：11 个 col / 11 个 th（#800 加周期/用量、#828 加默认语言；默认语言在下标 3，周期/用量顺延到 8、活动到 9）', () => {
+    expect(adminUsersViewSource.match(/<col /g) ?? [], 'colgroup 列数').toHaveLength(11);
+    expect(adminUsersViewSource.match(/<th scope="col"/g) ?? [], '表头列数').toHaveLength(11);
+    // #828：默认语言插在 colRole(2) 之后 ⇒ 下标 3；#800 的周期/用量因此从 7 顺延到 8，活动到 9。
+    expect(headerCells[3] ?? '').toContain("t('admin.fde.colDefaultLanguage')");
+    expect(headerCells[8] ?? '').toContain("t('admin.fde.colPeriodUsage')");
+    expect(headerCells[9] ?? '').toContain("t('admin.fde.lastActivity')");
     expect(adminUsersViewSource, '旧表头键必须退场（没换语义 = 这格还在说登录）')
       .not.toMatch(/<th[^>]*>\{\{ t\('admin\.fde\.lastLogin'\) \}\}<\/th>/);
   });
@@ -362,15 +363,15 @@ describe('AdminUsersView「周期 / 用量」列（mount + fetch 桩，issue #80
     expect(cell.text()).toBe('—');
   });
 
-  it('⑤ 表头 th 数与每行 td 数都是 10', async () => {
+  it('⑤ 表头 th 数与每行 td 数都是 11', async () => {
     const w = await mountView(
       [mkUser('alice', 'alpha')],
       { rows: [mkRow('alpha', { budget_period: '1mo', spend: 1, spend_scope: 'period' })] },
     );
-    expect(w.findAll('thead th').length).toBe(10);
+    expect(w.findAll('thead th').length).toBe(11);
     const row = w.find('[data-test="user-row"]');
     expect(row.exists()).toBe(true);
-    expect(row.findAll('td').length).toBe(10);
+    expect(row.findAll('td').length).toBe(11);
   });
 
   // 周期短标签的**来源**判据：`spend` 按网关的 `budget_duration` 归零，所以标签也得跟它——
