@@ -171,6 +171,7 @@ export const zhCN = {
     usage: {
       title: '账周期与用量',
       loading: '…',
+      reading: '正在读取…',
       shortDay: '日',
       shortMonth: '月',
       shortUnknown: '?',

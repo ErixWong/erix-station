@@ -159,6 +159,7 @@ export const en = {
     usage: {
       title: 'Billing period & usage',
       loading: '…',
+      reading: 'Reading…',
       shortDay: 'd',
       shortMonth: 'mo',
       shortUnknown: '?',

@@ -191,7 +191,7 @@ const chartNote = computed(() => {
         <div v-else-if="state === 'period'" class="grid gap-2">
           <p data-test="usage-used" class="text-sm">{{ t('workbench.usage.usedOf', { spend: spendText, budget: budgetText }) }}</p>
           <div v-if="percent != null" data-test="usage-progress" class="h-2 rounded bg-black/10 overflow-hidden">
-            <div class="h-full bg-blue-600" :style="{ width: `${percent}%` }"></div>
+            <div class="h-full bg-brand" :style="{ width: `${percent}%` }"></div>
           </div>
           <p v-if="overage != null" data-test="usage-overage" class="text-sm text-red-600">
             {{ t('workbench.usage.overage', { amount: fmtUsdCompact(overage) }) }}
@@ -205,8 +205,13 @@ const chartNote = computed(() => {
         </div>
 
         <!-- 未设额度（终身累计）：不出进度/剩余两段 -->
-        <div v-else data-test="usage-lifetime" class="text-sm">
+        <div v-else-if="state === 'lifetime'" data-test="usage-lifetime" class="text-sm">
           {{ t('workbench.usage.noBudget', { spend: spendText }) }}
+        </div>
+
+        <!-- 待载（pending）：徽标还是 … 时点开，只说「正在读取…」，绝不出现金额或未设额度文案 -->
+        <div v-else data-test="usage-pending" class="py-4 text-center text-sm text-black/60">
+          {{ t('workbench.usage.reading') }}
         </div>
 
         <!-- 30 天每日用量 chart：空数组 ⇒ MetricChart 显「该区间无数据」（不画贴底假线） -->

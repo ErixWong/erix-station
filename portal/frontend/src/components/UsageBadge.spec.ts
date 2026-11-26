@@ -120,6 +120,17 @@ describe('弹窗明细', () => {
     expect(w.find('[data-test="usage-remaining"]').exists()).toBe(false);
   });
 
+  it('待载（pending）点开弹窗：只显「正在读取…」，绝不出未设额度文案与 — 金额', async () => {
+    // 徽标还在 … 时点开：不得把「未确认」当成「未设额度」，也不得拿 — 冒充金额。
+    const w = mountBadge({ quota: null, reason: null, loading: true, loaded: false, error: null });
+    await w.get('[data-test="usage-badge"]').trigger('click');
+    expect(w.find('[data-test="usage-pending"]').exists()).toBe(true);
+    expect(w.find('[data-test="usage-lifetime"]').exists()).toBe(false);
+    const body = w.text();
+    expect(body).not.toContain('未设额度');
+    expect(body).not.toContain('—');
+  });
+
   it('30 天 chart 空区间：显「该区间无数据」（不画贴底假线）', async () => {
     const w = mountBadge({ quota: quota(), days: [] });
     await w.get('[data-test="usage-badge"]').trigger('click');
