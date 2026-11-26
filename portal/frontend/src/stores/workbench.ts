@@ -395,6 +395,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const ownedBy = ref<string | null>(null);
   const entries = ref<StreamEntry[]>([]); // 消息流（含分隔行/工具卡片占位）
   const renderedIds = ref<Set<string> | null>(null); // 去重（refresh 与流式缓冲竞态）
+  // issue #799：`refreshSession` 是异步的。run_end 之后那次「终态补拉」还在飞时，紧随其后的队列投递帧
+  // 若立刻把那句话画成 user 气泡，会排在旧 run 终稿**上面**（倒序）。这个在飞句柄让 adoptDeliveredMessage
+  // 先等它落地再落气泡。会话级状态，不进 store 公开面（与 renderedIds / olderMessagesCursor 同族）。
+  let refreshInFlight: Promise<void> | null = null;
   const inputValue = ref(''); // composer 输入（旧 $('input').value）
   // issue #370：输入队列（运行中说话）。**服务端是唯一真相**（`queued_inputs` 表），本 ref 只是投影：
   //   * 入队成功 → 本地先乐观插一条（消除「点了没反应」的空窗）；
@@ -449,7 +453,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       // issue #236：登记「这条 run 的终态行已渲染」幂等键——同一个 id（`termination:<run_id>`）
       // 被下面的历史补拉/重开会话复用，否则一次停止会得到两张分隔条（实时一张 + 历史一张）。
       markRunTerminationRendered(d.run_id);
-      refreshSession(d.run_id);
+      // issue #799：记下这次终态补拉的在飞句柄，让紧随其后的队列投递帧先等它落地再落气泡（防倒序）。
+      // `.finally` 必须清，否则一次失败就永久「等在飞」。
+      refreshInFlight = refreshSession(d.run_id).finally(() => { refreshInFlight = null; });
       repullHistorySynthItems(d); // issue #306（#236 起同时喂终态分隔条）：补一次 history
     },
     // issue #88：自动标题刷新 → 原地更新会话列表项（比整表 loadSessions 轻；后续列表刷新仍是兜底）。
@@ -460,6 +466,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         typeof d?.blocked === 'string' ? d.blocked : null,
       );
       adoptDeliveredRun(d?.delivered_run_id);
+      // issue #799：投递帧带 `delivered` ⇒ 那句话当场落进对话流（队列是状态，投递后那句话是历史）。
+      void adoptDeliveredMessage(d?.delivered);
     },
     onSessionUpdated: (d) => {
       const sid = d.session_id != null ? String(d.session_id) : sessionId.value;
@@ -1154,6 +1162,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     clearExpandedToolCalls();
     resetDelegateSurface(); // issue #592：离开会话/换账号同样不得把上一个 run 的子 run 抽屉与面板留给下一个（会话级视图态）
     renderedIds.value = new Set();
+    refreshInFlight = null; // issue #799：旧会话没落完的终态补拉不得泄漏到新会话（口径同 olderMessagesCursor）
     entries.value = [];
     sessionMessageCount.value = null; // #197：先清旧会话的计数，加载失败/竞态丢弃时不得串会话残留
     sessionCompaction.value = null; // #451：压缩累计同属会话级状态，不得串会话残留
@@ -1489,6 +1498,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     clearExpandedToolCalls();
     resetDelegateSurface(); // issue #592：离开会话/换账号同样不得把上一个 run 的子 run 抽屉与面板留给下一个（会话级视图态）
     renderedIds.value = null;
+    refreshInFlight = null; // issue #799：会话级在飞句柄同属复位面（口径同 olderMessagesCursor）
     inputValue.value = '';
     streamDefaultText();
     workbenchHooks.onClearRoute?.();
@@ -1703,6 +1713,29 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   /**
+   * issue #799：把队列投递帧带来的那条 user 消息当场画进气泡。帧里的 `delivered` 就是
+   * `postMessage` 的 user 消息回显体（`{ id, run_id, seq, role:'user', content, ... }`）。
+   * 幂等靠 `renderedIds`（与 addMessage / 历史补拉同一去重集）：先等的终态补拉若已渲染过它 ⇒ 跳过。
+   */
+  async function adoptDeliveredMessage(maybe: unknown) {
+    // 形状严格校验：非对象 / 缺 id / content 非字符串 ⇒ 整段跳过（不渲染空气泡、不动计数）。
+    if (!maybe || typeof maybe !== 'object') return;
+    const m = maybe as Record<string, unknown>;
+    if (typeof m.id !== 'string' || m.id === '') return;
+    if (typeof m.content !== 'string') return;
+    // 帧序实测：`run_end` 先到、终态补拉异步落 ⇒ 不 await 就会把气泡排在旧 run 终稿上面（倒序）。
+    if (refreshInFlight) {
+      try { await refreshInFlight; } catch { /* 补拉失败不该吃掉那句话 */ }
+    }
+    if (renderedIds.value?.has(m.id)) return; // 已被刷新/历史回放渲染过 ⇒ 不重复、也不重复计数
+    addMessage(m as unknown as ChatMessage);
+    // #197 头部计数是后端权威值：不能让它比屏幕上的气泡少一条；null（不可得）保持 null，别把「不可得」编成 1。
+    if (typeof sessionMessageCount.value === 'number' && Number.isFinite(sessionMessageCount.value)) {
+      sessionMessageCount.value += 1;
+    }
+  }
+
+  /**
    * #370：**运行中说话**。`kind='steer'`（转向，默认，`Enter`）= 当前轮跑完就停下用这句继续；
    * `kind='follow_up'`（排队，`Alt+Enter`）= 当前任务正常结束后依次发。
    *
@@ -1879,7 +1912,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     hideSession,
     saveDraft, addMessage, addPartialOutput, addRunTermination, send, stop, refreshSession,
     // issue #370：运行中说话（steer / follow_up 入队）与整队取回
-    sendQueued, recallQueue, applyQueueSnapshot, adoptDeliveredRun,
+    sendQueued, recallQueue, applyQueueSnapshot, adoptDeliveredRun, adoptDeliveredMessage,
     loadOlderMessages,
     pushStreamError,
     // issue #306：导出让单测能直接驱动「终态后补拉 history」的窄条件（不靠拼 SSE 帧也能钉零重拉）。

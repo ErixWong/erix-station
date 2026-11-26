@@ -278,4 +278,95 @@ describe('workbench store · 输入队列（#370）', () => {
     expect(store.queuedCount).toBe(0);
     expect(store.queueBlocked).toBeNull();
   });
+
+  // ---- issue #799：队列投递出去的那句话当场渲染成 user 气泡（不再只在刷新后从库里读回来） ----
+  type MsgEntry = { kind: string; id?: string; role?: string; text?: string };
+  const msgEntries = (s: ReturnType<typeof useWorkbenchStore>) =>
+    s.entries.filter((e) => (e as { kind?: string }).kind === 'msg') as unknown as MsgEntry[];
+  const probe = { id: 'm-1', run_id: 'r-new', seq: 10, role: 'user', content: '转向探针-XYZ', synthetic: false, attachments: [] };
+
+  it('#799 投递帧带 delivered ⇒ 当场渲染成实时 user 气泡，队列里不再挂着那句话', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') return detail();
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    // 经真实 SSE 帧驱动（不是直接调 action）：漏接 onQueueUpdate 的第三步就该红
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered_run_id: 'r-new', delivered: probe });
+    await flushPromises();
+    const bubble = msgEntries(store).find((e) => e.text === '转向探针-XYZ');
+    expect(bubble).toBeTruthy();
+    expect(bubble!.role).toBe('user');
+    expect(store.queuedCount).toBe(0);
+  });
+
+  it('#799 同一投递帧连发两次 ⇒ 只一张气泡、头部计数只 +1（renderedIds 幂等）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') return detail({ message_count: 5 });
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.sessionMessageCount).toBe(5); // 头部计数是后端权威值
+    const es = FakeEventSource.instances.at(-1)!;
+    const frame = { steering: [], follow_up: [], blocked: null, delivered_run_id: 'r-new', delivered: { ...probe, id: 'm-dup', content: '探针-重复' } };
+    es.emit('queue_update', frame);
+    es.emit('queue_update', frame);
+    await flushPromises();
+    expect(msgEntries(store).filter((e) => e.id === 'm-dup').length).toBe(1);
+    expect(store.sessionMessageCount).toBe(6); // 只 +1，第二条被幂等集挡掉
+  });
+
+  it('#799 delivered 为 null / 缺键 / content 非字符串 ⇒ 不新增气泡、计数不动（不空气泡）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') return detail({ message_count: 3 });
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const before = msgEntries(store).length;
+    const es = FakeEventSource.instances.at(-1)!;
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null }); // 无 delivered 键
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered: null }); // 显式 null
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered: { id: 'x', role: 'user', content: 42 } }); // content 非字符串
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered: { role: 'user', content: '缺 id' } }); // 缺 id
+    await flushPromises();
+    expect(msgEntries(store).length).toBe(before);
+    expect(store.sessionMessageCount).toBe(3); // 不动
+  });
+
+  it('#799 投递帧排在旧 run 终稿之下（先等在飞的终态补拉，防倒序）', async () => {
+    let detailCalls = 0;
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        detailCalls += 1;
+        if (detailCalls === 1) return detail({ message_count: 2 });
+        // run_end 之后 refreshSession 的那次详情：带回旧 run 的助手终稿
+        return {
+          status: 200,
+          body: { session: { id: 's1', cwd: '/w', message_count: 3 }, messages: [{ id: 'm-old', run_id: 'r1', seq: 5, role: 'assistant', content: '旧 run 的终稿', synthetic: false }], last_seq: 5 },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.es.activeRunId = 'r1';
+    const es = FakeEventSource.instances.at(-1)!;
+    es.emit('run_end', { run_id: 'r1', termination: { reason: 'end_turn' } }); // 触发 refreshSession，补拉在飞
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered_run_id: 'r-new', delivered: probe });
+    await flushPromises();
+    const msgs = msgEntries(store);
+    const aiIdx = msgs.findIndex((e) => e.role === 'assistant' && e.text === '旧 run 的终稿');
+    const uIdx = msgs.findIndex((e) => e.text === '转向探针-XYZ');
+    expect(aiIdx).toBeGreaterThanOrEqual(0);
+    expect(uIdx).toBeGreaterThanOrEqual(0);
+    expect(aiIdx).toBeLessThan(uIdx); // 旧 run 终稿在前，转向气泡在后
+  });
 });
