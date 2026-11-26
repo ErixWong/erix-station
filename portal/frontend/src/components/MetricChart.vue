@@ -44,6 +44,10 @@ const props = withDefaults(defineProps<{
   hideAxisValues?: boolean;
   /** 无障碍名（每张卡的图用自己的指标名，屏幕阅读器不至于念出四个「chart」）。 */
   label?: string;
+  /** 可见小标题（一条线一张图时靠上下文猜得出来，一张卡三四条线就分不清谁是谁）。 */
+  caption?: string | null;
+  /** 稳定的指标标识（渲染成 `data-metric`，给用例点名到具体那条线用；不参与显示）。 */
+  metricId?: string;
 }>(), {
   points: () => [],
   width: 240,
@@ -57,6 +61,8 @@ const props = withDefaults(defineProps<{
   formatX: null,
   hideAxisValues: false,
   label: '',
+  caption: null,
+  metricId: '',
 });
 
 const { locale } = useI18n();
@@ -77,13 +83,20 @@ const hasData = computed(() => geometry.value.line !== '');
  * 否则从点推。**一个都没有 ⇒ 空串**（不许拿 `min:0/max:0` 去标——那是把「没数据」标成「0 ~ 0」）。
  */
 const bounds = computed<{ min: number; max: number } | null>(() => {
-  const given = [props.min, props.max].filter(
-    (value): value is number => typeof value === 'number' && Number.isFinite(value),
-  );
-  if (given.length === 2) return { min: Math.min(...given), max: Math.max(...given) };
+  const minGiven = typeof props.min === 'number' && Number.isFinite(props.min);
+  const maxGiven = typeof props.max === 'number' && Number.isFinite(props.max);
+  // 两边都有限 ⇒ 照用（保持小/大排序）：那是页面选的口径（如 CPU 的 0~100）。
+  if (minGiven && maxGiven) {
+    return { min: Math.min(props.min as number, props.max as number), max: Math.max(props.min as number, props.max as number) };
+  }
+  // ⚠ 单边曾被**静默忽略**：只给 `:min="0"` 时旧逻辑整对退成从数据推 ⇒ y 轴下界标注不是 0（而钉 0 是口径）。
+  // `chartPath` 本身支持单边界，错的只是这里。⇒ **只补缺的那一边**；点为空 ⇒ 仍 `null`（不许 `{min:0,max:0}`）。
   if (points.value.length === 0) return null;
   const ys = points.value.map((point) => point.y);
-  return { min: Math.min(...ys), max: Math.max(...ys) };
+  return {
+    min: minGiven ? (props.min as number) : Math.min(...ys),
+    max: maxGiven ? (props.max as number) : Math.max(...ys),
+  };
 });
 
 /** Y 轴只标 min / max（不画刻度：sparkline 的像素高度不可量，标了刻度会诱使人去量斜率）。 */
@@ -108,7 +121,8 @@ const xEndText = computed(() => axisX(points.value[points.value.length - 1]?.x))
 </script>
 
 <template>
-  <figure data-test="metric-chart" class="grid gap-1" :aria-label="label || undefined">
+  <figure data-test="metric-chart" class="grid gap-1" :aria-label="label || undefined" :data-metric="metricId || undefined">
+    <p v-if="caption" data-test="metric-chart-caption" class="text-xs text-black/55">{{ caption }}</p>
     <div class="relative" :style="{ minHeight: `${Math.round(height * 0.6)}px` }">
       <!-- SVG 常驻（只切 opacity）：轮询到新数据时是**改属性**，不是重挂节点 ⇒ 不闪白 -->
       <svg

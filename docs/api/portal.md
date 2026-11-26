@@ -3833,11 +3833,11 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 
 **一句话**：宿主 CPU / 内存 / 磁盘 / 容器数的唯一读面——真相本来就在（`htop` / `free` / `df` / `docker ps`），
 但界面上一个读数都没有，症状「FDE 变慢」而平台不知道宿主是不是快满了（与 §4.16 版本三格同形）。
-实现只在 `portal/src/system-metrics.js`（`metricsApiPayload` / `toApiLatest` / `querySeries`），
+实现只在 `portal/src/system-metrics.js`（`metricsApiPayload` / `toApiLatest` / `querySeries` / `queryDiskSeries`），
 `http.js` 那一支只做转发；表的口径见 `docs/data/model.md` §1.34–§1.35，运维动作见 `docs/ops/system-metrics.md`。
 
 **鉴权**：`requireAdmin`（所有 `/api/admin/*` 在入口统一过，非 admin ⇒ 403，本端点不重复加）。
-**只读、零副作用、零新错误码**——本端点在任何降级分支下都是 `200`（下面三条硬口径）。
+**只读、零副作用、零新错误码**——本端点在任何降级分支下都是 `200`（下面四条硬口径）。
 
 **请求**：`?range=` 五个取值 `1h` / `6h` / `24h` / `7d` / `30d`（缺省 `1h`）。
 **非法取值 ⇒ 回落到 `1h`，不是 400**：这是一个只读观测面，把一个拼错的查询参数变成错误页只会让人多进一次
@@ -3871,10 +3871,17 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   },
   "series": { "bucketSeconds": 30,              // 本次生效的桶宽（由 `range` 算出，不是入参回显）
               "points": [ { "t": "2026-11-17T08:12:00.000Z", "cpuAvg": 11.2, "cpuMax": 33.4,
-                            "memUsed": 40900000000, "containersRunning": 33, "samples": 2 } ] },
+                            "memUsed": 40900000000, "memAvailable": 25000000000, "memCached": 12000000000,
+                            "swapUsed": 0, "load1": 1.024, "containersRunning": 33, "samples": 2 } ],
+              "disks": [ { "device": "/dev/nvme0n1p2",                        // #814：一块盘一条线
+                           "path": "/",
+                           "points": [ { "t": "2026-11-17T08:12:00.000Z", "usedBytes": 1820000000000,
+                                         "totalBytes": 1960000000000, "samples": 2 } ] } ],
+              "disksDropped": 0 },                    // 被丢掉的脏磁盘行数（整数，永远有值；与 `disksError` 两件事）
   "range": "1h",                                // **生效的** range（非法入参已被回落成 `1h`）
   "retentionDays": 30,                          // 来自 `config.systemMetrics.retentionDays`；拿不到 ⇒ null
   "seriesError": null,                          // 历史查询失败时是原因字符串，成功时是 null
+  "disksError": null,                           // 磁盘那条序列查询失败的原因串（#814）；成功时 null，与 `seriesError` 各自独立
   "enabled": true                               // 采样器到底开没开（`sampler?.enabled === true`；没有采样器 ⇒ false）
 }
 ```
@@ -3901,18 +3908,33 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 - `series.points[]`：**服务端分桶后的点**，绝不把原始点发给浏览器（30d × 30s = 86,400 行）。
   `t` 是桶起点（ISO 字符串），`samples` 是这个桶里聚合了几行原始点（只有 1 个点时页面要说清粒度）。
   分桶结果按 `range` 缓存 5s（`SERIES_CACHE_TTL_MS`），与前端 5s 轮询对齐 ⇒ 10 个人同开这页的 DB 查询量与 1 个人相同。
+- `series.points[]` 里 #814 新增的四列（`memAvailable` / `memCached` / `swapUsed` / `load1`）**同样是桶内平均**
+  （库里早就各存一列：`mem_available_bytes` / `mem_cached_bytes` / `swap_used_bytes` / `load1`，本单只是把读面补齐，
+  **DDL / 采样器 / 写事务一字未改**）；`load1` 保留 3 位。它们与旧四列同一句 SQL、同一个桶宽、同一个 5s 缓存，
+  不是第二条查询。缺值一律 `null`（`swapUsed: 0` 是「真 0」，与「没给」的 `null` 是两件事，不许 `?? 0`）。
+- `series.disks[]`（#814）来自**第二条 SQL**（`seriesDisksSql()`）：主表「一拍一行」、磁盘表「一拍 × 一设备一行」，
+  粒度不同 ⇒ 不 JOIN（JOIN 会把每个桶按设备数放大，`cpuAvg` 与 `samples` 全会错）。分组口径：**按桶 × 设备**
+  （`GROUP BY 1, 2`）在库里分，JS 里只按设备归组；`device` 是分组键也是排序键（按字典序输出，界面 5s 刷新不许看起来
+  像换了盘），`points` 按时间升序；`path` 用 `min(path)` 收成确定值——同一设备的挂载点可能随 env 换，`path` 只是
+  **展示用引用**，不是键也不参与分组（取该设备第一个非空串，整段没名字 ⇒ `null`）。同一窗口、同一桶宽、同一个缓存 Map
+  但**另一个 key**（`#disks` 后缀）⇒ `clearSeriesCache()` 一次清两边，不会出现两张不同时间的图拼在同一屏。
+  `device` 不是非空字符串或桶起点拿不到的行**直接丢掉并计数**，不补 `null` 点、更不补 0。
+  那个计数就落在 **`series.disksDropped`**（整数，两个分支里都永远有值）：它说的是「丢了**几行**」，
+  而顶层 `disksError` 说的是「**整条查询挂了**」——两件事不许混成一个数：磁盘查询挂掉时 `disksDropped`
+  仍是 `0`（那是「没查到」而不是「查到并丢了 0 行」），界面据此才能分清「有 N 行没进图」与「磁盘历史不可用」两句文案。
 - `retentionDays` 只是**回显配置**，让页面能写「保留 30 天」而不必硬编码；清理动作不在这个端点上（挂 reaper 小时槽）。
 - `enabled`（**additive**，#650 前端单补）：采样器到底开没开。只看 `sampler?.enabled === true`——
   `sampler` 为 `null`（`SYSTEM_METRICS_ENABLED=0` 时 `cli.js serve` 根本不建它）⇒ `false`。
   为什么需要它而不是让前端从 `latest === null` 反推：那个形状同时兼容「采样已关闭」与「刚重启还没第一拍」
   两个相反结论（前者要去改 env + 重启，后者只要等 30s），前端分不出来 ⇒ 这句话必须由说得出它的一方说。
 
-**错误语义（本端点零新错误码，三个降级分支都是 200）**：
+**错误语义（本端点零新错误码，所有降级分支都是 200）**：
 
 | 情况 | 结果 |
 | --- | --- |
 | 非 admin（含未登录） | `403`——统一入口拦的，不是本端点发的 |
 | `querySeries` 抛错（DB 挂了 / 表不存在 / 超时） | `200` + `seriesError: "<原因>"`，`series.points` 是**空数组**，而 **`latest` 仍正常有数**——卡片读的是进程内那一拍，这是本端点存在的理由，不是降级补丁 |
+| 磁盘序列那条查询抛错（#814） | `200` + `disksError: "<原因>"` + `series.disks` 是**空数组**，而 **`seriesError` 仍是 `null`、`series.points` 照常是历史点**——两个降级**各自独立**：磁盘那条挂掉绝不能让已经画出数的 CPU/内存图也被标成「历史不可用」（#650 立的口径）。取因口径与 `seriesError` 一致（`err.code` 优先，没 code 才 `message`） |
 | 采样器没跑 / 第一拍未到 | `200` + `latest: null` |
 | `range` 非法（`?range=1w`） | `200` + `range: "1h"` |
 

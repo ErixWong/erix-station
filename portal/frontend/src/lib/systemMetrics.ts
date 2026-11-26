@@ -118,9 +118,22 @@ export interface SeriesPoint {
   cpuAvg: number | null;
   cpuMax: number | null;
   memUsed: number | null;
+  /** 桶内平均可用字节（`free` 的 available；`null` = 没读到，`0` 是真 0）。 */
+  memAvailable: number | null;
+  /** 桶内平均缓存字节（page cache + 可回收；同为桶内平均口径）。 */
+  memCached: number | null;
+  /** 桶内平均 swap 已用字节（`0` 是「真没用到」，与「没读到」的 `null` 是两件事）。 */
+  swapUsed: number | null;
+  /** 桶内平均 load1（**原始值**，未除核数；归一化幅度另有 `loadNormalizedPct`）。 */
+  load1: number | null;
   containersRunning: number | null;
   samples: number | null;
 }
+
+/** 一块盘在某个桶里的用量点（`series.disks[].points`；字节为**桶内平均**）。 */
+export interface DiskSeriesPoint { t: string | null; usedBytes: number | null; totalBytes: number | null; samples: number | null; }
+/** `series.disks` 的一项：一块盘（按 `device` 归组）的历史序列，点已按时间升序。 */
+export interface DiskSeriesRow { device: string; path: string | null; points: DiskSeriesPoint[]; }
 
 export interface SystemMetrics {
   /**
@@ -135,12 +148,19 @@ export interface SystemMetrics {
     points: SeriesPoint[];
     /** 被丢掉的脏点数（>0 要显式说出来）。 */
     dropped: number;
+    /** 按设备归组的磁盘历史（一块盘一条线；服务端已按 device 字典序、点按时间升序）。 */
+    disks: DiskSeriesRow[];
   };
   /** **生效的** range（非法入参已被服务端回落）。`null` = 服务端没说。 */
   range: string | null;
   retentionDays: number | null;
   /** 非 `null` ⇒ 历史读不到（`latest` 仍可能有数）。这里存的是**原因字符串**，不是 Error。 */
   seriesError: string | null;
+  /**
+   * 磁盘历史那条查询失败的原因。⚠ **与 `seriesError` 各自独立降级**：`disksError` 非空**不代表**
+   * `points` 没数（`points` 照常是历史点）；反之 `seriesError` 非空也不代表 `disks` 没数——两格互不蕴含。
+   */
+  disksError: string | null;
 }
 
 // ── 归一化原语 ──────────────────────────────────────────────────────────────────────────
@@ -283,7 +303,7 @@ function nullIfUnknown(value: string | null): string | null {
   return value === null || value.toLowerCase() === 'unknown' ? null : value;
 }
 
-function normalizeSeries(raw: unknown): SystemMetrics['series'] {
+function normalizeSeries(raw: unknown): Omit<SystemMetrics['series'], 'disks'> {
   const root = recordOf(raw);
   const pointsRaw = Array.isArray(root?.points) ? ((root?.points as unknown[])) : [];
   const points: SeriesPoint[] = [];
@@ -295,7 +315,11 @@ function normalizeSeries(raw: unknown): SystemMetrics['series'] {
       continue;
     }
     // 整行都没有时刻、也没有任何量值 ⇒ 这个点画不出来（丢，但计数）。
-    const values = [point.cpuAvg, point.cpuMax, point.memUsed, point.containersRunning];
+    const values = [
+      point.cpuAvg, point.cpuMax, point.memUsed, point.containersRunning,
+      point.memAvailable ?? point.mem_available, point.memCached ?? point.mem_cached,
+      point.swapUsed ?? point.swap_used, point.load1 ?? point.load_1,
+    ];
     const hasValue = values.some((value) => numOrNull(value) !== null);
     const t = stringOrNull(point.t);
     if (!hasValue && t === null) {
@@ -307,6 +331,10 @@ function normalizeSeries(raw: unknown): SystemMetrics['series'] {
       cpuAvg: numOrNull(point.cpuAvg ?? point.cpu_avg),
       cpuMax: numOrNull(point.cpuMax ?? point.cpu_max),
       memUsed: nonNegativeOrNull(point.memUsed ?? point.mem_used),
+      memAvailable: nonNegativeOrNull(point.memAvailable ?? point.mem_available),
+      memCached: nonNegativeOrNull(point.memCached ?? point.mem_cached),
+      swapUsed: nonNegativeOrNull(point.swapUsed ?? point.swap_used),
+      load1: nonNegativeOrNull(point.load1 ?? point.load_1),
       containersRunning: nonNegativeOrNull(point.containersRunning ?? point.containers_running),
       samples: nonNegativeOrNull(point.samples),
     });
@@ -314,18 +342,69 @@ function normalizeSeries(raw: unknown): SystemMetrics['series'] {
   return { bucketSeconds: nonNegativeOrNull(root?.bucketSeconds ?? root?.bucket_seconds), points, dropped };
 }
 
+/**
+ * `series.disks` → 按设备归组的磁盘历史（一块盘一条线）。
+ *
+ * · 非数组 ⇒ `{ disks: [], dropped: 0 }`；
+ * · 条目不是对象、或 `device` 不是非空字符串 ⇒ 整条丢掉并计数（`device === 'unknown'` 是**真值**——
+ *   库里真有「说不清哪个设备」的行，它是分组键，**不许**过 `nullIfUnknown` 当成「没有」丢掉）；
+ * · 每个条目的 `points` 逐条归一化（`t` 拿不到 ⇒ 丢该点并计数；字节与 `samples` 走 `nonNegativeOrNull`，camel/snake 都接）；
+ * · `path` 是展示用引用 ⇒ `nullIfUnknown(stringOrNull(...))`；
+ * · 输出按 `device` 字典序**自己再排一次**（服务端已排，但前端不依赖它，保证稳定）。
+ */
+function normalizeDisks(raw: unknown): { disks: DiskSeriesRow[]; dropped: number } {
+  if (!Array.isArray(raw)) return { disks: [], dropped: 0 };
+  const disks: DiskSeriesRow[] = [];
+  let dropped = 0;
+  for (const item of raw) {
+    const row = recordOf(item);
+    // `device` 是分组键：非空字符串才算一块盘（含字面量 `unknown`）；脏 ⇒ 整条丢并计数。
+    const device = row === null ? null : stringOrNull(row.device);
+    if (row === null || device === null) {
+      dropped += 1;
+      continue;
+    }
+    const pointsRaw = Array.isArray(row.points) ? (row.points as unknown[]) : [];
+    const points: DiskSeriesPoint[] = [];
+    for (const pointItem of pointsRaw) {
+      const point = recordOf(pointItem);
+      // 时刻拿不到的点画不出来（没有 x 坐标）⇒ 丢该点并计数。
+      const t = point === null ? null : stringOrNull(point.t);
+      if (point === null || t === null) {
+        dropped += 1;
+        continue;
+      }
+      points.push({
+        t,
+        usedBytes: nonNegativeOrNull(point.usedBytes ?? point.used_bytes),
+        totalBytes: nonNegativeOrNull(point.totalBytes ?? point.total_bytes),
+        samples: nonNegativeOrNull(point.samples),
+      });
+    }
+    disks.push({ device, path: nullIfUnknown(stringOrNull(row.path)), points });
+  }
+  disks.sort((a, b) => (a.device < b.device ? -1 : a.device > b.device ? 1 : 0));
+  return { disks, dropped };
+}
+
 /** 端点响应 → DTO。入参 `unknown`：服务端换形、桩给半截、字段脏值都不许炸，也不许猜。 */
 export function normalizeSystemMetrics(raw: unknown): SystemMetrics {
   const root = recordOf(raw) ?? {};
   const seriesError = stringOrNull(root.seriesError ?? root.series_error);
+  const disksError = stringOrNull(root.disksError ?? root.disks_error);
+  const series = normalizeSeries(root.series);
+  // 只取 `disks` 那一格并进来（不覆盖 `dropped`：points 的脏计数与 disks 的脏计数各自独立）。
+  const disks = normalizeDisks(root.series === undefined ? undefined : recordOf(root.series)?.disks);
   return {
     enabled: booleanOrNull(root.enabled),
     latest: normalizeLatest(root.latest),
-    series: normalizeSeries(root.series),
+    series: { ...series, disks: disks.disks },
     range: isMetricRange(root.range) ? root.range : null,
     retentionDays: nonNegativeOrNull(root.retentionDays ?? root.retention_days),
     // 空串按「没说」处理（`seriesError` 的契约是 `null` 或非空原因串；空串是脏值不是原因）。
     seriesError,
+    // 与 `seriesError` 同样的三态：缺失 / 空串 ⇒ `null`，原因串 ⇒ 原样；**独立**于 `seriesError`。
+    disksError,
   };
 }
 
@@ -346,9 +425,9 @@ export interface ChartPointLike {
  *   · 只取**最后 `SPARK_MAX_POINTS` 个**（30d/6h 桶是 72~168 点，sparkline 不需要那么细，
  *     而全塞进 `<path>` 只让 DOM 变胖）。
  */
-export function sparkPoints(
-  points: SeriesPoint[] | null | undefined,
-  pick: (point: SeriesPoint) => number | null,
+export function sparkPoints<T extends { t: string | null }>(
+  points: T[] | null | undefined,
+  pick: (point: T) => number | null,
   limit: number = SPARK_MAX_POINTS,
 ): ChartPointLike[] {
   if (!Array.isArray(points)) return [];
@@ -363,6 +442,25 @@ export function sparkPoints(
   }
   const cap = typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : out.length;
   return out.length > cap ? out.slice(out.length - cap) : out;
+}
+
+/**
+ * 把磁盘卡片那一行对上**一条**历史序列（`series.disks` 里的一项）。
+ *
+ * 匹配规则写死（理由）：
+ *   · 卡片那行 `device` 是 `null`（`nullIfUnknown` 把字面量 `unknown` 收成 `null` 的结果）
+ *     ⇔ 序列里 `device === 'unknown'`（库里说不清设备的那块盘）；
+ *   · 否则**精确相等**。
+ * 对不上 ⇒ `null`（**不许**退成「随便拿一块盘的线」——那是给这块盘编一条历史）。
+ */
+export function diskTrendFor(
+  disks: DiskSeriesRow[] | null | undefined,
+  row: { device: string | null },
+): DiskSeriesRow | null {
+  if (!Array.isArray(disks)) return null;
+  // 卡片 `device` 为 `null` ⇔ 序列里那块 `device === 'unknown'` 的盘；其余精确相等。
+  const target = row.device === null ? 'unknown' : row.device;
+  return disks.find((disk) => disk.device === target) ?? null;
 }
 
 // ── 展示用纯函数（可单测；`.vue` 里不许再写一遍）────────────────────────────────────────

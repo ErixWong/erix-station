@@ -60,14 +60,32 @@ const METRICS = {
   series: {
     bucketSeconds: 30,
     points: [
-      { t: new Date(Date.now() - 120_000).toISOString(), cpuAvg: 20, cpuMax: 40, memUsed: 30 * GIB, containersRunning: 30, samples: 2 },
-      { t: new Date(Date.now() - 90_000).toISOString(), cpuAvg: 30, cpuMax: 55, memUsed: 36 * GIB, containersRunning: 32, samples: 2 },
-      { t: new Date(Date.now() - 60_000).toISOString(), cpuAvg: 12.5, cpuMax: 33, memUsed: 40 * GIB, containersRunning: 33, samples: 1 },
+      { t: new Date(Date.now() - 120_000).toISOString(), cpuAvg: 20, cpuMax: 40, memUsed: 30 * GIB, memAvailable: 98 * GIB, memCached: 10 * GIB, swapUsed: 1 * GIB, load1: 4.2, containersRunning: 30, samples: 2 },
+      { t: new Date(Date.now() - 90_000).toISOString(), cpuAvg: 30, cpuMax: 55, memUsed: 36 * GIB, memAvailable: 92 * GIB, memCached: 11 * GIB, swapUsed: 2 * GIB, load1: 5.1, containersRunning: 32, samples: 2 },
+      { t: new Date(Date.now() - 60_000).toISOString(), cpuAvg: 12.5, cpuMax: 33, memUsed: 40 * GIB, memAvailable: 84 * GIB, memCached: 12 * GIB, swapUsed: 2 * GIB, load1: 5.26, containersRunning: 33, samples: 1 },
+    ],
+    // 两块盘的历史：nvme0n1p2（卡片里也有）+ unknown（卡片里没有的设备）。
+    disks: [
+      {
+        device: '/dev/nvme0n1p2', path: '/',
+        points: [
+          { t: new Date(Date.now() - 120_000).toISOString(), usedBytes: 600 * GIB, totalBytes: 937 * GIB, samples: 2 },
+          { t: new Date(Date.now() - 60_000).toISOString(), usedBytes: 676 * GIB, totalBytes: 937 * GIB, samples: 1 },
+        ],
+      },
+      {
+        device: 'unknown', path: 'unknown',
+        points: [
+          { t: new Date(Date.now() - 120_000).toISOString(), usedBytes: 1 * GIB, totalBytes: 4 * GIB, samples: 2 },
+          { t: new Date(Date.now() - 60_000).toISOString(), usedBytes: 2 * GIB, totalBytes: 4 * GIB, samples: 1 },
+        ],
+      },
     ],
   },
   range: '1h',
   retentionDays: 30,
   seriesError: null,
+  disksError: null,
   enabled: true,
 };
 
@@ -548,5 +566,129 @@ describe('判据 S-4：范围切换（选中态跟服务端回显走）', () => 
     await flushPromises();
     expect(wrapper.find('[data-test="system-error"]').exists(), '恢复后错误行必须收掉').toBe(false);
     expect(wrapper.find('[data-test="card-cpu"]').exists()).toBe(true);
+  });
+});
+
+// ────────────────────────────────────────────────────
+// #814：内存/峰值/负载/磁盘趋势补齐 + 每条线可见小标题 + 字节图 y 轴钉 0 + 磁盘历史独立降级。
+// 用 `[data-metric="..."]` 点名具体那条线（不用「第几个图」）。
+describe('#814 系统页：补齐的趋势线、可见小标题与独立降级', () => {
+  it('内存卡四条线都在，且每条都有自己的可见小标题', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    for (const [metric, captionKey] of [
+      ['mem-used', 'chartMemUsed'],
+      ['mem-available', 'chartMemAvailable'],
+      ['mem-cached', 'chartMemCached'],
+      ['mem-swap', 'chartMemSwap'],
+    ]) {
+      const chart = wrapper.get(`[data-metric="${metric}"]`);
+      const caption = chart.find('[data-test="metric-chart-caption"]');
+      expect(caption.exists(), `${metric} 要有自己的可见小标题`).toBe(true);
+      expect(caption.text()).toBe(String(t(`admin.system.${captionKey}`)));
+    }
+  });
+
+  it('字节图 y 轴下界标注钉 0（缓存 80→82 不许画成暴涨）', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    const cached = wrapper.get('[data-metric="mem-cached"]');
+    expect(cached.get('[data-test="metric-chart-y-min"]').text()).toBe('0 B');
+  });
+
+  it('disksError 非空 ⇒ 磁盘图空态是「磁盘历史不可用：…」，而内存图仍画线（两格独立降级）', async () => {
+    const { wrapper } = await openSystem(withMetrics({
+      disksError: 'disk-query-failed',
+      series: { ...METRICS.series, disks: [] },
+    }));
+    const diskChart = wrapper.get('[data-metric="disk-/dev/nvme0n1p2-used"]');
+    expect(diskChart.find('[data-test="metric-chart-empty"]').text())
+      .toContain(String(t('admin.system.disksUnavailable', { reason: 'disk-query-failed' })));
+    // 磁盘查询挂了不许拖累内存：mem-cached 的线仍在
+    expect(wrapper.get('[data-metric="mem-cached"]').find('[data-test="metric-chart-line"]').attributes('d')).not.toBe('');
+  });
+
+  it('卡片里有但历史里没有的盘 ⇒ 那条 disk-row 里没有 metric-chart（不拿别的盘的历史糊）', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    const rows = wrapper.findAll('[data-test="disk-row"]');
+    const sda = rows.find((r) => r.text().includes('/dev/sda1'));
+    expect(sda, '夹具卡片里有 /dev/sda1').toBeTruthy();
+    expect(sda!.find('[data-test="metric-chart"]').exists(), 'sda1 历史里没有 ⇒ 不许配图').toBe(false);
+    // 对上的 nvme0n1p2 则有图
+    const nvme = rows.find((r) => r.text().includes('/dev/nvme0n1p2'));
+    expect(nvme!.find('[data-test="metric-chart"]').exists()).toBe(true);
+  });
+
+  it('历史里有、卡片里没有的设备（unknown）⇒ 不凭空多出一条图', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    expect(wrapper.findAll('[data-metric="disk-unknown-used"]').length).toBe(0);
+  });
+
+  // 变异验证抓到的真缺口：把「缓存趋势」的取数从 `point.memCached` 改成 `point.memUsed` 后，
+  // 上面那些「线存在 + 有标题 + y 下界是 0 B」的用例全部照绿——也就是「标题写缓存、画的却是已用」
+  // 这类错放得过。下面逐条点名 y 轴上界标注：夹具里每一列的最大值互不相同，所以上界就是
+  // 「这条线取的是哪一列」的身份证。
+  it('#814 逐条点名每条趋势线取的是哪一列（y 轴上界标注；指错列必须红）', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    const yMax = (metric: string): string =>
+      wrapper.get(`[data-metric="${metric}"]`).find('[data-test="metric-chart-y-max"]').text();
+
+    expect(yMax('mem-used'), '已用趋势取 memUsed（夹具最大 40 GiB）').toBe('40 GiB');
+    expect(yMax('mem-available'), '可用趋势取 memAvailable（夹具最大 98 GiB）').toBe('98 GiB');
+    expect(yMax('mem-cached'), '缓存趋势取 memCached（12 GiB）而不是 memUsed（40 GiB）').toBe('12 GiB');
+    expect(yMax('mem-swap'), 'swap 趋势取 swapUsed（夹具最大 2 GiB）').toBe('2 GiB');
+    expect(yMax('load1'), '负载趋势取 load1（format-y 是 toFixed(2)）').toBe('5.26');
+    expect(yMax('containers-running'), '容器趋势取 containersRunning（无 format-y ⇒ 取整原样）').toBe('33');
+    expect(yMax('disk-/dev/nvme0n1p2-used'), '磁盘趋势取该设备的 usedBytes（最大 676 GiB，不是 totalBytes 937）').toBe('676 GiB');
+
+    const lineD = (metric: string): string =>
+      wrapper.get(`[data-metric="${metric}"]`).find('[data-test="metric-chart-line"]').attributes('d') ?? '';
+
+    // CPU 两条**不能**用上界区分：百分比的界已知 ⇒ 写死 0~100，不许跟着数据重标。
+    for (const id of ['cpu-avg', 'cpu-max']) {
+      const chart = wrapper.get(`[data-metric="${id}"]`);
+      expect(chart.find('[data-test="metric-chart-y-min"]').text(), `${id} 的 y 下界是写死的 0%`).toBe('0%');
+      expect(chart.find('[data-test="metric-chart-y-max"]').text(), `${id} 的 y 上界是写死的 100%`).toBe('100%');
+    }
+    // 界相同 ⇒ 只能比线本身：cpuAvg 与 cpuMax 是不同的列，指到同一列时 `d` 会一模一样。
+    expect(lineD('cpu-avg'), '均值线必须有内容').not.toBe('');
+    expect(lineD('cpu-max'), '峰值线必须有内容').not.toBe('');
+    expect(lineD('cpu-avg'), 'cpuAvg 与 cpuMax 是不同的列 ⇒ 两条线不许指到同一列').not.toBe(lineD('cpu-max'));
+  });
+
+  // 独立红线：服务端契约里 `null` 是「没读到」。某一列有值而其余列全 `null` 时，那一列的图
+  // 必须照画——不许因为别的列没读就把这条线判成没数（那会把「只缺几个列」说成「没历史」）。
+  it('#814 只有某一列有值 ⇒ 那一列仍要有线，其余列各自走空态（互不拖累）', async () => {
+    const { wrapper } = await openSystem(withMetrics({
+      series: {
+        ...METRICS.series,
+        points: METRICS.series.points.map((point) => ({
+          ...point,
+          cpuAvg: null, cpuMax: null, memUsed: null, memAvailable: null,
+          swapUsed: null, load1: null, containersRunning: null,
+        })),
+      },
+    }));
+    const cached = wrapper.get('[data-metric="mem-cached"]');
+    const d = cached.find('[data-test="metric-chart-line"]').attributes('d') ?? '';
+    expect(d.length, '只有 memCached 有值 ⇒ 缓存趋势必须画得出').toBeGreaterThan(0);
+    expect(cached.find('[data-test="metric-chart-y-max"]').text()).toBe('12 GiB');
+    // 整列没值的那一列 ⇒ 空态，而不是贴底的假线
+    expect(wrapper.get('[data-metric="mem-used"]').find('[data-test="metric-chart-empty"]').exists(),
+      'memUsed 整列 null ⇒ 走空态').toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #814：「宕主」是「宿主」的错字，曾经出现在 5 句界面可见文案里（title / loading / notLoaded /
+// diskCaveat / caveat）。这里**读真实文案表**而不是抄第二份句子：抄句子只会把错字再抄一遍。
+describe('#814 中文文案表本身（防错字回归）', () => {
+  it('#814 中文文案里没有「宕主」这个错字（界面可见文案曾写错过）', () => {
+    // 这个版本的 `global.messages` 类型是 `ComputedRef`（运行时可能已被 unwrap）⇒ 两种形状都接住；
+    // 并且**必须真的读到内容**：如果读错了形状拿到 `{}`，下面的 `includes` 会假绿。
+    const messages = i18n.global.messages as unknown as Record<string, unknown> & { value?: Record<string, unknown> };
+    const table = (messages.value ?? messages)['zh-CN'] ?? {};
+    const zh = JSON.stringify(table);
+    expect(zh.length, '读到的是真实中文文案表（空表会让下面的断言假绿）').toBeGreaterThan(1000);
+    expect(zh, '「宿主」这个词必须在文案表里（上面那条长度钉子防的是「读到了但读错格」）').toContain('宿主');
+    expect(zh.includes('宕主'), '「宕主」是「宿主」的错字').toBe(false);
   });
 });
