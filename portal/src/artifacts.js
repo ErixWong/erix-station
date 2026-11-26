@@ -66,16 +66,17 @@ export async function putRunArtifact(pool, {
   user, runId, data, sha256, artifactsRoot, maxBytes, log = console,
 }) {
   if (!Buffer.isBuffer(data) || data.length === 0) {
-    throw new InternalError(400, 'validation_failed', 'artifact body 必须为非空字节流');
+    throw new InternalError(400, 'validation_failed', 'artifact body 必须为非空字节流', { en: 'the artifact body must be a non-empty byte stream' });
   }
   if (data.length > maxBytes) {
     throw new InternalError(413, 'artifact_too_large', 'artifact 超过大小上限', {
       details: { max_bytes: maxBytes },
+      en: 'artifact exceeds the size limit',
     });
   }
   const actualSha = crypto.createHash('sha256').update(data).digest('hex');
   if (typeof sha256 === 'string' && sha256.length > 0 && sha256 !== actualSha) {
-    throw new InternalError(400, 'sha256_mismatch', 'X-Sha-256 与 body 实际摘要不一致');
+    throw new InternalError(400, 'sha256_mismatch', 'X-Sha-256 与 body 实际摘要不一致', { en: 'the X-Sha-256 does not match the actual digest of the body' });
   }
 
   // 归属校验：容器 token 已鉴权（authenticateContainer），此处校验 run 属于该 user（fetchRun 同语义）。
@@ -94,7 +95,7 @@ export async function putRunArtifact(pool, {
     manifest = JSON.parse(extractTarGzEntry(data, 'manifest.json')?.toString('utf8') ?? 'null');
   } catch { /* 落入下方 400 */ }
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
-    throw new InternalError(400, 'invalid_artifact', 'artifact 内 manifest.json 缺失或不可解析');
+    throw new InternalError(400, 'invalid_artifact', 'artifact 内 manifest.json 缺失或不可解析', { en: 'manifest.json is missing or unparseable in the artifact' });
   }
 
   // 落盘：tmp + rename 原子替换（materializer 同款模式，user-space §4）；同 run 重复上传不覆盖。

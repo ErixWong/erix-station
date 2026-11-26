@@ -69,12 +69,15 @@ const PORTAL_RESERVED_EVENT_TYPES = new Set(['run_end', 'partial_output', 'attem
 //  compose，排障要调小就改 `transcript-limits.js` 那一行）。
 
 /** internal 通道统一错误（http.js 映射为标准错误信封，portal.md §9.13）。 */export class InternalError extends Error {
-  constructor(status, code, message, { retryable = false, details } = {}) {
+  constructor(status, code, message, { retryable = false, details, en } = {}) {
     super(message);
     this.status = status;
     this.code = code;
     this.retryable = retryable;
     this.details = details;
+    // issue #803 E 片：可选英文对（同 AdminError/HttpError/各类 *Error 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按请求 locale 读 `err.en`，缺省照旧出中文——错误体形状与 `message` 一字不动。
+    this.en = en;
   }
 }
 
@@ -647,10 +650,10 @@ export async function claimRun(pool, {
   container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), baseDomain, log = console, signal,
 } = {}) {
   if (!Number.isInteger(capacity) || capacity < 1 || capacity > 64) {
-    throw new InternalError(400, 'validation_failed', 'capacity 越界（1..64）', { details: { field: 'capacity' } });
+    throw new InternalError(400, 'validation_failed', 'capacity 越界（1..64）', { details: { field: 'capacity' }, en: 'capacity out of range (1..64)' });
   }
   if (!Number.isInteger(holdMs) || holdMs < 1 || holdMs > HOLD_MS_MAX) {
-    throw new InternalError(400, 'validation_failed', `hold_ms 越界（1..${HOLD_MS_MAX}）`, { details: { field: 'hold_ms' } });
+    throw new InternalError(400, 'validation_failed', `hold_ms 越界（1..${HOLD_MS_MAX}）`, { details: { field: 'hold_ms' }, en: `hold_ms out of range (1..${HOLD_MS_MAX})` });
   }
 
   const ticket = await tryClaim(pool, { container, user, capacity, now, baseDomain, log });
@@ -712,7 +715,7 @@ export async function releaseUndeliveredClaim(pool, { runId, claimToken, log = c
 export async function setRunState(pool, { container, user, runId, claimToken, body, config }) {
   const state = body?.state;
   if (state !== 'running' && state !== 'finished' && state !== 'failed') {
-    throw new InternalError(400, 'validation_failed', 'state 必须为 running/finished/failed', { details: { field: 'state' } });
+    throw new InternalError(400, 'validation_failed', 'state 必须为 running/finished/failed', { details: { field: 'state' }, en: 'state must be running/finished/failed' });
   }
 
   const run = await fetchRun(pool, runId, user.id);
@@ -1016,7 +1019,7 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
   //（非字符串 ⇒ 400 `validation_failed`，那是既有契约，不是新增错误码），但**值不再进任何生成链**
   //（既不截断入库，也不再当降级链的第一级）。既不写 `runs` 行，也不参与终态幂等比对（它从来就不是引擎事务）。
   if (body.title !== undefined && body.title !== null && typeof body.title !== 'string') {
-    throw new InternalError(400, 'validation_failed', 'title 必须为字符串', { details: { field: 'title' } });
+    throw new InternalError(400, 'validation_failed', 'title 必须为字符串', { details: { field: 'title' }, en: 'title must be a string' });
   }
   // issue #442（erix-agent 0.30.0 / 上游 #476）：`final_text_fallback` = 「这次终稿是**引擎兜底文案**，
   // 不是模型输出」。**只在 `true` 时合法**：runner 按契约只在真兜底时才给这个键，缺席 = 不是兜底
@@ -1024,6 +1027,7 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
   if (body.final_text_fallback !== undefined && body.final_text_fallback !== true) {
     throw new InternalError(400, 'validation_failed', 'final_text_fallback 只能为 true（缺席 = 不是兜底）', {
       details: { field: 'final_text_fallback' },
+      en: 'final_text_fallback can only be true (absent means not a fallback)',
     });
   }
   const finalTextFallback = body.final_text_fallback === true;
@@ -1035,6 +1039,7 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
   if (body.textualized_tool_call !== undefined && body.textualized_tool_call !== true) {
     throw new InternalError(400, 'validation_failed', 'textualized_tool_call 只能为 true（缺席 = 没命中）', {
       details: { field: 'textualized_tool_call' },
+      en: 'textualized_tool_call can only be true (absent means no match)',
     });
   }
   const textualizedToolCall = body.textualized_tool_call === true;
@@ -1046,17 +1051,18 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
     throw new InternalError(400, 'validation_failed',
       `textualized_tool_call_marker 必须为非空字符串且 ≤${TEXTUALIZED_MARKER_MAX_CHARS} 字符`, {
       details: { field: 'textualized_tool_call_marker' },
+      en: `textualized_tool_call_marker must be a non-empty string of ≤${TEXTUALIZED_MARKER_MAX_CHARS} characters`,
     });
   }
 
   if (!termination || typeof termination !== 'object' || !termination.reason) {
-    throw new InternalError(400, 'validation_failed', '终态载荷缺 termination.reason');
+    throw new InternalError(400, 'validation_failed', '终态载荷缺 termination.reason', { en: 'the terminal payload is missing termination.reason' });
   }
   if (usage !== undefined && usage !== null && typeof usage !== 'object') {
-    throw new InternalError(400, 'validation_failed', 'usage 必须为对象');
+    throw new InternalError(400, 'validation_failed', 'usage 必须为对象', { en: 'usage must be an object' });
   }
   if (rounds !== undefined && (!Number.isInteger(rounds) || rounds < 0)) {
-    throw new InternalError(400, 'validation_failed', 'rounds 必须为非负整数');
+    throw new InternalError(400, 'validation_failed', 'rounds 必须为非负整数', { en: 'rounds must be a non-negative integer' });
   }
 
   const client = await pool.connect();
@@ -1228,18 +1234,18 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
 export async function postEvents(pool, { container, user, runId, claimToken, body }) {
   const events = body?.events;
   if (!Array.isArray(events) || events.length > MAX_EVENTS_PER_BATCH) {
-    throw new InternalError(400, 'validation_failed', `events 必须为数组且 ≤ ${MAX_EVENTS_PER_BATCH}`, { details: { field: 'events' } });
+    throw new InternalError(400, 'validation_failed', `events 必须为数组且 ≤ ${MAX_EVENTS_PER_BATCH}`, { details: { field: 'events' }, en: `events must be an array with at most ${MAX_EVENTS_PER_BATCH} items` });
   }
   if (body.batch_id !== undefined && (typeof body.batch_id !== 'string' || body.batch_id.length > 128)) {
-    throw new InternalError(400, 'validation_failed', 'batch_id 非法', { details: { field: 'batch_id' } });
+    throw new InternalError(400, 'validation_failed', 'batch_id 非法', { details: { field: 'batch_id' }, en: 'invalid batch_id' });
   }
   const bytes = Buffer.byteLength(JSON.stringify(body.events ?? []), 'utf8');
   if (bytes > MAX_EVENTS_BYTES) {
-    throw new InternalError(400, 'validation_failed', '事件批超过 256KB 上限');
+    throw new InternalError(400, 'validation_failed', '事件批超过 256KB 上限', { en: 'the event batch exceeds the 256KB size limit' });
   }
   for (const ev of events) {
     if (!ev || typeof ev.type !== 'string' || !ev.type) {
-      throw new InternalError(400, 'validation_failed', 'event.type 必填', { details: { field: 'events[].type' } });
+      throw new InternalError(400, 'validation_failed', 'event.type 必填', { details: { field: 'events[].type' }, en: 'event.type is required' });
     }
     // issue #502 M-6③：**portal 自造的三类事件不许从 U3 上来**（审计第 3 条）。
     // 为什么这是 400 而不是「照单全收」：它们都是 portal 在终态/回收事务里**自己合成**的行
@@ -1251,14 +1257,16 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     if (PORTAL_RESERVED_EVENT_TYPES.has(ev.type)) {
       throw new InternalError(400, 'validation_failed', `${ev.type} 是 portal 自造的事件类型，容器不得上报`, {
         details: { field: 'events[].type', type: ev.type },
+        en: `${ev.type} is a portal-generated event type and the container must not report it`,
       });
     }
     if (!validateEventPayload(ev.payload)) {
-      throw new InternalError(400, 'validation_failed', 'event.payload 必须为对象', { details: { field: 'events[].payload' } });
+      throw new InternalError(400, 'validation_failed', 'event.payload 必须为对象', { details: { field: 'events[].payload' }, en: 'event.payload must be an object' });
     }
     if (!isValidClientEventId(runId, ev.client_event_id)) {
       throw new InternalError(400, 'validation_failed', 'client_event_id 格式非法（run_id:attempt:计数）', {
         details: { field: 'events[].client_event_id' },
+        en: 'invalid client_event_id format (run_id:attempt:counter)',
       });
     }
   }
@@ -1424,14 +1432,14 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
 export async function heartbeat(pool, { container, user, body, llmGateway = null, log = console }) {
   const runs = body?.runs ?? [];
   if (!Array.isArray(runs)) {
-    throw new InternalError(400, 'validation_failed', 'runs 必须为数组', { details: { field: 'runs' } });
+    throw new InternalError(400, 'validation_failed', 'runs 必须为数组', { details: { field: 'runs' }, en: 'runs must be an array' });
   }
   for (const r of runs) {
     if (!r || typeof r.run_id !== 'string' || !r.run_id) {
-      throw new InternalError(400, 'validation_failed', 'runs[].run_id 必填');
+      throw new InternalError(400, 'validation_failed', 'runs[].run_id 必填', { en: 'runs[].run_id is required' });
     }
     if (typeof r.claim_token !== 'string' || !r.claim_token) {
-      throw new InternalError(400, 'validation_failed', 'runs[].claim_token 必填');
+      throw new InternalError(400, 'validation_failed', 'runs[].claim_token 必填', { en: 'runs[].claim_token is required' });
     }
   }
 
@@ -1592,15 +1600,15 @@ async function recordPortObservations(pool, { container, user, listeners, log = 
 
 export async function putRound(pool, { container, user, runId, round, claimToken, body }) {
   if (!Number.isInteger(round) || round < 0) {
-    throw new InternalError(400, 'validation_failed', 'round 必须为非负整数');
+    throw new InternalError(400, 'validation_failed', 'round 必须为非负整数', { en: 'round must be a non-negative integer' });
   }
   const dedupKey = body?.dedupKey;
   if (typeof dedupKey !== 'string' || dedupKey.length === 0 || dedupKey.length > 256) {
-    throw new InternalError(400, 'validation_failed', 'dedupKey 必填且 ≤256 字符');
+    throw new InternalError(400, 'validation_failed', 'dedupKey 必填且 ≤256 字符', { en: 'dedupKey is required and ≤256 characters' });
   }
   const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
   if (bytes > MAX_ROUND_BYTES) {
-    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`); // #371-B/#677：文案报真值；原 env 覆盖已删（假旋钮从未接进 compose），排障改 `transcript-limits.js` 的常量（旧文案写死「1MB」）
+    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`, { en: `the round request body exceeds the ${MAX_ROUND_BYTES}-byte limit` }); // #371-B/#677：文案报真值；原 env 覆盖已删（假旋钮从未接进 compose），排障改 `transcript-limits.js` 的常量（旧文案写死「1MB」）
   }
 
   const run = await fetchRun(pool, runId, user.id);
@@ -1628,7 +1636,7 @@ export async function putRound(pool, { container, user, runId, round, claimToken
   if (!ex) return { inserted: true }; // 理论上不可达（并发已由 ON CONFLICT 序列化）
 
   if (ex.record?.dedupKey !== dedupKey) {
-    throw new InternalError(409, 'round_conflict', '同 round 已存在且 dedupKey 不同', { details: { round } });
+    throw new InternalError(409, 'round_conflict', '同 round 已存在且 dedupKey 不同', { details: { round }, en: 'the same round already exists with a different dedupKey' });
   }
   // #333 M2：轮记录的幂等/冲突判据 = **payload 指纹**（共用件 `./transcript-payload.js`，口径与
   // 上游 `erix-agent/src/store/transcript-dedup.js` 逐字对齐）：只剔**顶层**
@@ -1651,6 +1659,7 @@ export async function putRound(pool, { container, user, runId, round, claimToken
   // （错误信封对未知键透传，旧容器不读也不挂）。
   throw new InternalError(409, 'round_conflict', '同 round 已存在且 body 不同', {
     details: { round, dedupKey, ...dedupConflictDetails(ex.record, record) },
+    en: 'the same round already exists with a different body',
   });
 }
 
@@ -1683,13 +1692,13 @@ export async function getTranscript(pool, { container, user, runId, claimToken, 
 // `LIMIT 2000` 是**按行**截断，且截断口径另记 #338，本单不动。
 export async function recallTranscript(pool, { container, user, runId, claimToken, fromRound = 0, toRound = null, pattern }) {
   if (typeof pattern !== 'string' || pattern.length === 0 || pattern.length > 256) {
-    throw new InternalError(400, 'validation_failed', 'pattern 必填且 ≤256 字符');
+    throw new InternalError(400, 'validation_failed', 'pattern 必填且 ≤256 字符', { en: 'pattern is required and ≤256 characters' });
   }
   if (!Number.isInteger(fromRound) || fromRound < 0) {
-    throw new InternalError(400, 'validation_failed', 'from_round 必须为非负整数');
+    throw new InternalError(400, 'validation_failed', 'from_round 必须为非负整数', { en: 'from_round must be a non-negative integer' });
   }
   if (toRound !== null && toRound !== undefined && (!Number.isInteger(toRound) || toRound < fromRound)) {
-    throw new InternalError(400, 'validation_failed', 'to_round 必须 ≥ from_round');
+    throw new InternalError(400, 'validation_failed', 'to_round 必须 ≥ from_round', { en: 'to_round must be ≥ from_round' });
   }
   const run = await fetchRun(pool, runId, user.id);
   if (!isTerminal(run.status)) await assertClaimToken(pool, runId, claimToken);
@@ -1764,7 +1773,7 @@ const MAX_TRANSCRIPT_KEY_LEN = 128;
 
 async function fetchSession(pool, key, userId) {
   if (typeof key !== 'string' || key.length === 0 || key.length > MAX_TRANSCRIPT_KEY_LEN) {
-    throw new InternalError(400, 'validation_failed', 'transcript key 必填且 ≤128 字符', { details: { field: 'key' } });
+    throw new InternalError(400, 'validation_failed', 'transcript key 必填且 ≤128 字符', { details: { field: 'key' }, en: 'transcript key is required and ≤128 characters' });
   }
   const res = await pool.query(`SELECT id, user_id FROM chat_sessions WHERE id = $1`, [key]);
   const row = res.rows?.[0];
@@ -1799,15 +1808,15 @@ async function fetchWriterRun(pool, runId, userId, key) {
  *  才 409 round_conflict（真冲突），folded false→true 仍走 UPDATE。 */
 export async function putSessionRound(pool, { container, user, key, round, claimToken, writerRunId, body }) {
   if (!Number.isInteger(round) || round < 0) {
-    throw new InternalError(400, 'validation_failed', 'round 必须为非负整数');
+    throw new InternalError(400, 'validation_failed', 'round 必须为非负整数', { en: 'round must be a non-negative integer' });
   }
   const dedupKey = body?.dedupKey;
   if (typeof dedupKey !== 'string' || dedupKey.length === 0 || dedupKey.length > 256) {
-    throw new InternalError(400, 'validation_failed', 'dedupKey 必填且 ≤256 字符');
+    throw new InternalError(400, 'validation_failed', 'dedupKey 必填且 ≤256 字符', { en: 'dedupKey is required and ≤256 characters' });
   }
   const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
   if (bytes > MAX_ROUND_BYTES) {
-    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`); // #371-B/#677：文案报真值；原 env 覆盖已删（假旋钮从未接进 compose），排障改 `transcript-limits.js` 的常量（旧文案写死「1MB」）
+    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`, { en: `the round request body exceeds the ${MAX_ROUND_BYTES}-byte limit` }); // #371-B/#677：文案报真值；原 env 覆盖已删（假旋钮从未接进 compose），排障改 `transcript-limits.js` 的常量（旧文案写死「1MB」）
   }
 
   await fetchSession(pool, key, user.id);
@@ -1862,6 +1871,7 @@ export async function putSessionRound(pool, { container, user, key, round, claim
   // 真冲突：同 U5——零新错误码（仍 409 `round_conflict`，details 多带两份指纹 + 差异顶层字段）。
   throw new InternalError(409, 'round_conflict', '同 dedupKey 已存在且 body 不同', {
     details: { dedupKey, ...dedupConflictDetails(ex.record, record) },
+    en: 'the same dedupKey already exists with a different body',
   });
 }
 
@@ -1936,13 +1946,13 @@ export async function saveSessionRunState(pool, { container, user, key, claimTok
   let statusRecord;
   if (body?.run_state !== undefined) {
     if (!body.run_state || typeof body.run_state !== 'object' || Array.isArray(body.run_state)) {
-      throw new InternalError(400, 'validation_failed', 'run_state 必须为对象', { details: { field: 'run_state' } });
+      throw new InternalError(400, 'validation_failed', 'run_state 必须为对象', { details: { field: 'run_state' }, en: 'run_state must be an object' });
     }
     patch = Object.fromEntries(Object.entries(body.run_state).filter(([name]) => name !== 'state'));
   } else if (typeof body?.state === 'string' && body.state) {
     statusRecord = { status: body.state, runId: key, ts: new Date().toISOString() };
   } else {
-    throw new InternalError(400, 'validation_failed', 'body 需含 run_state 对象或 state 字符串', { details: { field: 'body' } });
+    throw new InternalError(400, 'validation_failed', 'body 需含 run_state 对象或 state 字符串', { details: { field: 'body' }, en: 'the body must contain a run_state object or a state string' });
   }
 
   await fetchSession(pool, key, user.id);
@@ -2037,29 +2047,31 @@ const RECOVERY_DEDUP_KEY_MAX_LEN = 255;
 /** 恢复行 record 的入参校验（只校「能不能进这张表」，形状守卫归引擎读侧）。 */
 function assertRecoveryRowBody(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    throw new InternalError(400, 'validation_failed', '恢复行 record 必须为对象', { details: { field: 'record' } });
+    throw new InternalError(400, 'validation_failed', '恢复行 record 必须为对象', { details: { field: 'record' }, en: 'the recovery row record must be an object' });
   }
   if (body.kind !== 'recovery') {
     // `kind` 是唯一判别键（引擎 `isRecoveryRow`）；不认识的行本站**不收**，而不是收了污染这张表。
     throw new InternalError(400, 'validation_failed', 'record.kind 必须为 "recovery"', {
       details: { field: 'kind', received: typeof body.kind === 'string' ? body.kind : typeof body.kind },
+      en: 'record.kind must be "recovery"',
     });
   }
   const dedupKey = body.dedupKey;
   if (typeof dedupKey !== 'string' || dedupKey.length === 0 || dedupKey.length > RECOVERY_DEDUP_KEY_MAX_LEN) {
     throw new InternalError(400, 'validation_failed',
       `record.dedupKey 必填且 ≤${RECOVERY_DEDUP_KEY_MAX_LEN} 字符（引擎算好，宿主不重算）`,
-      { details: { field: 'dedupKey' } });
+      { details: { field: 'dedupKey' }, en: `record.dedupKey is required and ≤${RECOVERY_DEDUP_KEY_MAX_LEN} characters (computed by the engine; the host does not recompute it)` });
   }
   if (!Number.isSafeInteger(body.round) || body.round < 0) {
     throw new InternalError(400, 'validation_failed', 'record.round 必须为非负安全整数', {
       details: { field: 'round', received: String(body.round) },
+      en: 'record.round must be a non-negative safe integer',
     });
   }
   const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
   if (bytes > MAX_RECOVERY_ROW_BYTES) {
     throw new InternalError(400, 'validation_failed',
-      `恢复行请求体超过 ${MAX_RECOVERY_ROW_BYTES} 字节上限`, { details: { bytes, limit: MAX_RECOVERY_ROW_BYTES } });
+      `恢复行请求体超过 ${MAX_RECOVERY_ROW_BYTES} 字节上限`, { details: { bytes, limit: MAX_RECOVERY_ROW_BYTES }, en: `the recovery row request body exceeds the ${MAX_RECOVERY_ROW_BYTES}-byte limit` });
   }
 }
 
@@ -2091,6 +2103,7 @@ export async function appendSessionRecoveryRow(pool, { container, user, key, cla
     if (err?.code === DEDUP_CONFLICT_CODE) {
       throw new InternalError(409, 'recovery_row_conflict',
         `同 dedupKey 已存在且 payload 不同（${err.key ?? ''}）`, {
+          en: `the same dedupKey already exists with a different payload (${err.key ?? ''})`,
           details: {
             dedupKey: err.key ?? null,
             existingFingerprint: err.existingFingerprint ?? null,
@@ -2126,13 +2139,13 @@ export async function saveRunState(pool, { container, user, runId, claimToken, b
   let statusRecord;
   if (body?.run_state !== undefined) {
     if (!body.run_state || typeof body.run_state !== 'object' || Array.isArray(body.run_state)) {
-      throw new InternalError(400, 'validation_failed', 'run_state 必须为对象', { details: { field: 'run_state' } });
+      throw new InternalError(400, 'validation_failed', 'run_state 必须为对象', { details: { field: 'run_state' }, en: 'run_state must be an object' });
     }
     patch = Object.fromEntries(Object.entries(body.run_state).filter(([name]) => name !== 'state'));
   } else if (typeof body?.state === 'string' && body.state) {
     statusRecord = { status: body.state, runId, ts: new Date().toISOString() };
   } else {
-    throw new InternalError(400, 'validation_failed', 'body 需含 run_state 对象或 state 字符串', { details: { field: 'body' } });
+    throw new InternalError(400, 'validation_failed', 'body 需含 run_state 对象或 state 字符串', { details: { field: 'body' }, en: 'the body must contain a run_state object or a state string' });
   }
 
   // runId 并入快照；status 记录由 markRunState 单独写入。
@@ -2201,7 +2214,7 @@ export async function createApproval(pool, { container, user, runId, claimToken,
   const toolCallId = body?.tool_call_id;
   const name = body?.name;
   if (typeof toolCallId !== 'string' || !toolCallId || typeof name !== 'string' || !name) {
-    throw new InternalError(400, 'validation_failed', 'tool_call_id 与 name 必填');
+    throw new InternalError(400, 'validation_failed', 'tool_call_id 与 name 必填', { en: 'tool_call_id and name are required' });
   }
   const run = await fetchRun(pool, runId, user.id);
   if (isTerminal(run.status)) throw new InternalError(409, 'run_terminal', 'run already terminal');
@@ -2209,7 +2222,7 @@ export async function createApproval(pool, { container, user, runId, claimToken,
 
   const tc = await pool.query(`SELECT 1 FROM tool_calls WHERE run_id = $1 AND call_id = $2`, [runId, toolCallId]);
   if (!tc.rows?.[0]) {
-    throw new InternalError(400, 'validation_failed', 'tool_call_id 无对应 tool_calls 行');
+    throw new InternalError(400, 'validation_failed', 'tool_call_id 无对应 tool_calls 行', { en: 'there is no tool_calls row for the given tool_call_id' });
   }
 
   const ins = await pool.query(
@@ -2281,7 +2294,7 @@ function parseKillReport(body) {
 export async function releaseRun(pool, { container, user, runId, claimToken, body }) {
   const reason = body?.reason;
   if (typeof reason !== 'string' || reason.length === 0 || reason.length > 64) {
-    throw new InternalError(400, 'validation_failed', 'reason 必填且 ≤64 字符');
+    throw new InternalError(400, 'validation_failed', 'reason 必填且 ≤64 字符', { en: 'reason is required and ≤64 characters' });
   }
 
   const client = await pool.connect();
