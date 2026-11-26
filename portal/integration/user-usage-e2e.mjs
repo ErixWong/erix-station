@@ -23,12 +23,12 @@
 //     这是「未设额度不得被读成本周期」的真机判据。
 //   · UI 腿（`E2E_UI=1` 且 playwright 容器在跑才跑，否则 skip 不算红）：登 agent01 进 `#/workbench`，
 //     钉徽标紧跟 `who`、徽标文案是周期格式且 hover/aria 用完整词、点开弹窗（已用/进度条/30 天 chart 的
-//     `<svg>`、进度条用 `bg-brand` 不是 `bg-blue-600`）、按钮与 Esc 都能关、0 pageerror、无裸 i18n key、
+//     `<svg>`、进度条与 chart 同一蓝色族 `bg-blue-600`）、按钮与 Esc 都能关、0 pageerror、无裸 i18n key、
 //     无「本周期从」句式、顶栏不换行；中英各一趟各存一张截图落 `os.tmpdir()`。
 //
 // 为什么这样写（沿用 llm-usage / seat / version-surface 的约定，这里只记本单相关的几条）：
 //   1. admin host 是自签证书 ⇒ 本进程关 TLS 校验（只影响这个测试进程）。
-//   2. 口令只读凭据目录里的口令文件（AGENTS §4：~/.config/mcp/creds/，旧路径兜底），**绝不 print**；
+//   2. 口令只读凭据目录里的口令文件（AGENTS §4：路径见冷层，仓库里不写；旧路径兜底），**绝不 print**；
 //      FDE（agent01）与 admin 各用各的口令文件；进容器走临时文件（防 `ps` 抄走），跑完尽力删。
 //   3. 登录**不发 Origin 头**（带不匹配的 Origin 会被 cross_origin_forbidden 403）。
 //   4. 走 docker 包装层时命令串**不许含换行**。
@@ -74,7 +74,7 @@ const DAY_KEYS = ['date', 'spend', 'prompt_tokens', 'completion_tokens', 'total_
 /** `/api/me/llm-quota` 的 30s 进程内缓存 TTL；budget PUT 不失效它 ⇒ 往返腿读前睡过它。 */
 const QUOTA_CACHE_WAIT_MS = Number(process.env.E2E_QUOTA_CACHE_WAIT_MS || 31_000);
 
-// 凭据目录口径（AGENTS §4）：~/.config/ 下 mcp/creds/；env 点名只信 env
+// 凭据目录口径（AGENTS §4：具体路径见冷层，仓库不写）；env 点名只信 env
 function credFiles(envVar, names) {
   return (process.env[envVar] ? [process.env[envVar]] : names)
     .map((p) => p.replace(/^~/, os.homedir()));
@@ -747,12 +747,11 @@ test('U1 真浏览器进 #/workbench：徽标紧跟 who/周期文案+完整词 h
       assert.ok(Number.isFinite(zh.badgeTop) && Number.isFinite(zh.whoTop), `拿不到徽标/who 的 top（badge=${JSON.stringify(zh.badgeTop)} who=${JSON.stringify(zh.whoTop)}）`);
       assert.ok(Math.abs(zh.badgeTop - zh.whoTop) < 2, `徽标 top=${zh.badgeTop} 与 who top=${zh.whoTop} 差 ≥ 2px ⇒ 顶栏换行了（header 高=${zh.headerHeight}）`);
 
-      // ③ 弹窗：已用 + 进度条（bg-brand，不是 bg-blue-600）+ chart 区有 svg；按钮与 Esc 都能关。
+      // ③ 弹窗：已用 + 进度条（与 chart 同一蓝色族 `bg-blue-600`）+ chart 区有 svg；按钮与 Esc 都能关。
       const modal = rep.modal || {};
       assert.ok(modal.usedExists, '弹窗没有 [data-test="usage-used"]（已用/额度那一行）');
       assert.ok(modal.progressExists, '弹窗没有 [data-test="usage-progress"]（进度条）');
-      assert.ok(/\bbg-brand\b/.test(String(modal.barClass)), `进度条填充条 class=${JSON.stringify(modal.barClass)} 不含 bg-brand（配色没对齐品牌色）`);
-      assert.ok(!/bg-blue-600/.test(String(modal.barClass)), `进度条填充条 class=${JSON.stringify(modal.barClass)} 仍是 bg-blue-600（旧配色没改）`);
+      assert.ok(/\bbg-blue-600\b/.test(String(modal.barClass)), `进度条填充条 class=${JSON.stringify(modal.barClass)} 不含 bg-blue-600（与 chart 的蓝色族不一致）`);
       assert.ok(modal.chartRegionSvg || modal.chartHasSvg, 'chart 区没有 <svg>（30 天图没渲染）');
       assert.equal(rep.closeButtonOk, true, '点关闭按钮没关掉弹窗');
       assert.equal(rep.closeEscOk, true, '按 Esc 没关掉弹窗');
