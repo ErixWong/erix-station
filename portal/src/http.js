@@ -2290,6 +2290,18 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
+  // 管理台提示词页的**生效面**（issue #801，契约 portal.md §4.19-5）：按工位给「盘上那份」+
+  // 「按 DB 该有那份」两份账，让页面能回答「模型现在被说了什么」而不是「库里存着什么」。
+  // **只读：零写、零审计**（页每次挂载都发；`GET /api/admin/prompts` 本来也不审计）。
+  if (pathname === '/api/admin/prompts/effective-agents-md') {
+    if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    return sendJson(res, 200, await platformPrompts.getEffectiveAgentsMd({
+      pool: ctx.pool,
+      userSpaceRoot: ctx.config.userSpaceRoot,
+      fdeName: url.searchParams.get('fde'),
+      log: ctx.log,
+    }));
+  }
   const adminPromptMatch = pathname.match(/^\/api\/admin\/prompts\/(addendum|agents-md|title-prompt)$/);
   if (adminPromptMatch) {
     if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');

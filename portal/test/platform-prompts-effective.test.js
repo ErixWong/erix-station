@@ -230,3 +230,128 @@ test('E12 响应键集合', async (t) => {
   assert.deepEqual(EFFECTIVE_DISK_STATES, Object.freeze(['ok', 'missing', 'not_a_file', 'read_failed']));
   assert.ok(EFFECTIVE_DISK_STATES.includes(dto.disk.state));
 });
+
+// ── HTTP 层格子 H1–H4 ────────────────────────────────────────────────────────────
+
+const ADMIN = {
+  id: 'd0000000-0000-4000-8000-0000000000a1', login: 'root', display_name: 'Root',
+  role: 'admin', fde_name: null, auth_source: 'local', status: 'active',
+};
+const FDE_U = {
+  id: 'd0000000-0000-4000-8000-0000000000a2', login: 'alice', display_name: 'Alice',
+  role: 'fde', fde_name: 'alice', auth_source: 'local', status: 'active',
+};
+
+/** FakePool + 生效面两条读 SQL（HTTP 层要真走会话鉴权，复用 FakePool 的会话面）。 */
+class EfHttpPool extends FakePool {
+  constructor({ failPrompts = false } = {}) {
+    super({ users: [ADMIN, FDE_U] });
+    this.failPrompts = failPrompts;
+    this.tokens = new Map();
+    for (const u of [ADMIN, FDE_U]) {
+      const token = `${u.login}-tok`;
+      this.tokens.set(u.login, token);
+      this.sessions.push({
+        id: `s-${u.login}`, user_id: u.id, token_hash: hashToken(token),
+        created_at: new Date(), expires_at: new Date(Date.now() + 3_600_000),
+        last_seen_at: new Date(), revoked_at: null,
+      });
+    }
+  }
+
+  async query(sql, params = []) {
+    const s = String(sql).replace(/\s+/g, ' ').trim();
+    if (s.includes('FROM users WHERE fde_name = $1')) {
+      return { rows: [{ id: FDE_U.id, fde_name: 'alice', status: 'active' }] };
+    }
+    if (s.includes('platform_prompts')) {
+      if (this.failPrompts) throw new Error('boom');
+      return { rows: [] };
+    }
+    return super.query(sql, params);
+  }
+}
+
+async function startEf({ poolOpts = {}, seedFile = true } = {}) {
+  const pool = new EfHttpPool(poolOpts);
+  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eff-static-'));
+  const userSpaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'eff-userspace-http-'));
+  if (seedFile) {
+    const home = path.join(userSpaceRoot, 'alice', 'home');
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, 'AGENTS.md'), renderHomeAgentsMd({ fdeName: 'alice' }));
+  }
+  const config = {
+    cookie: cookieSettings('dev-http', 604800),
+    sessionTtlSeconds: 604800,
+    sessionRenewIntervalSeconds: 3600,
+    pendingTokenTtlSeconds: 120,
+    totp: { issuer: 'T', digits: 6, period: 30, window: 1 },
+    loginRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
+    totpRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 5, maxEntries: 100 },
+    kdfConcurrency: 2, kdfQueueLimit: 10, kdfQueueTimeoutMs: 30_000,
+    maxLoginLength: 128, maxPasswordLength: 256,
+    staticDir, userSpaceRoot,
+    fdeUid: process.getuid?.() ?? 1000,
+    fdeGid: process.getgid?.() ?? 1000,
+  };
+  const server = createServer({ pool, config });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return {
+    pool,
+    base: `http://127.0.0.1:${server.address().port}`,
+    cookieFor: (login) => `fde_session_dev=${pool.tokens.get(login)}`,
+    close: () => new Promise((r) => server.close(r))
+      .finally(() => fs.rmSync(staticDir, { recursive: true, force: true }))
+      .finally(() => fs.rmSync(userSpaceRoot, { recursive: true, force: true })),
+  };
+}
+
+const call = (s, { path: p, method = 'GET', login = 'root' } = {}) => fetch(`${s.base}${p}`, {
+  method,
+  headers: { cookie: s.cookieFor(login) },
+});
+
+async function readResp(res) {
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* 非 JSON：留给断言消息 */ }
+  return { status: res.status, text, json };
+}
+
+test('H1 GET 200 且键集合白名单', async () => {
+  const s = await startEf();
+  try {
+    const r = await readResp(await call(s, { path: '/api/admin/prompts/effective-agents-md?fde=alice' }));
+    assert.equal(r.status, 200, `必须 200；实际 ${r.status} ${r.text}`);
+    assert.deepEqual(Object.keys(r.json).sort(),
+      ['db', 'disk', 'expected', 'fdeName', 'matches', 'reason', 'renderLimitBytes', 'source'].sort());
+  } finally { await s.close(); }
+});
+
+test('H2 非 GET ⇒ 405', async () => {
+  const s = await startEf();
+  try {
+    const r = await readResp(await call(s, { path: '/api/admin/prompts/effective-agents-md?fde=alice', method: 'POST' }));
+    assert.equal(r.status, 405);
+    assert.equal(r.json.error.code, 'method_not_allowed');
+  } finally { await s.close(); }
+});
+
+test('H3 非管理员 ⇒ 403', async () => {
+  const s = await startEf();
+  try {
+    const r = await readResp(await call(s, { path: '/api/admin/prompts/effective-agents-md?fde=alice', login: 'alice' }));
+    assert.equal(r.status, 403);
+  } finally { await s.close(); }
+});
+
+test('H4 fde 非法 ⇒ 400 details.field=\'fde\'', async () => {
+  const s = await startEf();
+  try {
+    const r = await readResp(await call(s, { path: '/api/admin/prompts/effective-agents-md' }));
+    assert.equal(r.status, 400);
+    assert.equal(r.json.error.code, 'validation_failed');
+    assert.equal(r.json.error.details.field, 'fde');
+  } finally { await s.close(); }
+});

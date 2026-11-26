@@ -295,3 +295,86 @@ export function shortUuid(value: string | null): string | null {
 
 /** 字节显示：单一真相在 `lib/uploadSettings.formatBytes`（不许抄第二份换算）。 */
 export { formatBytes } from './uploadSettings';
+
+/** `GET /api/admin/prompts/effective-agents-md`（issue #801，契约 §4.19-5）。 */
+export const EFFECTIVE_AGENTS_MD_PATH = '/api/admin/prompts/effective-agents-md';
+
+export const EFFECTIVE_DISK_STATES = ['ok', 'missing', 'not_a_file', 'read_failed'] as const;
+export type EffectiveDiskState = (typeof EFFECTIVE_DISK_STATES)[number];
+
+/** 盘上那份（读不到是 `state`，不是异常）。 */
+export interface EffectiveDisk {
+  state: EffectiveDiskState;
+  bytes: number | null;
+  mtime: string | null;
+  text: string | null;
+  sha256: string | null;
+  truncated: boolean;
+}
+
+export interface EffectiveAgentsMd {
+  fdeName: string;
+  disk: EffectiveDisk;
+  expected: { bytes: number | null; sha256: string | null; text: string };
+  /** `null` = 比对不了，**不许**塌成 `false`。 */
+  matches: boolean | null;
+  source: 'db' | 'builtin';
+  reason: PromptFallbackReason | null;
+  db: { addendumBytes: number | null; overrideBytes: number | null };
+  renderLimitBytes: number | null;
+}
+
+/** 归一化，**永不抛**（口径同 `normalizePlatformPrompts`：逐键取，缺键只让那一格显示「未知」）。 */
+export function normalizeEffectiveAgentsMd(raw: unknown): EffectiveAgentsMd | null {
+  const src = asRecord(raw);
+  if (src === null) return null;
+  const disk = asRecord(src.disk) ?? {};
+  const expected = asRecord(src.expected) ?? {};
+  const db = asRecord(src.db) ?? {};
+  const state = EFFECTIVE_DISK_STATES.includes(disk.state as EffectiveDiskState)
+    ? disk.state as EffectiveDiskState
+    : 'read_failed';
+  return {
+    fdeName: textOf(src.fdeName),
+    disk: {
+      state,
+      bytes: safeIntOrNull(disk.bytes),
+      mtime: typeof disk.mtime === 'string' ? disk.mtime : null,
+      text: typeof disk.text === 'string' ? disk.text : null,
+      sha256: typeof disk.sha256 === 'string' ? disk.sha256 : null,
+      truncated: disk.truncated === true,
+    },
+    expected: {
+      bytes: safeIntOrNull(expected.bytes),
+      sha256: typeof expected.sha256 === 'string' ? expected.sha256 : null,
+      text: textOf(expected.text),
+    },
+    matches: typeof src.matches === 'boolean' ? src.matches : null,
+    source: src.source === 'db' ? 'db' : 'builtin',
+    reason: reasonOrNull(src.reason),
+    db: { addendumBytes: safeIntOrNull(db.addendumBytes), overrideBytes: safeIntOrNull(db.overrideBytes) },
+    renderLimitBytes: safeIntOrNull(src.renderLimitBytes),
+  };
+}
+
+/** 请求路径（`fde` 走 `encodeURIComponent`，工位名过不了正则就不发请求）。 */
+export function effectiveAgentsMdPath(fdeName: string): string {
+  return `${EFFECTIVE_AGENTS_MD_PATH}?fde=${encodeURIComponent(fdeName)}`;
+}
+
+/**
+ * 两份账的**结论那一句话**要用的三态（`null` 必须与 `false` 分开渲染）。
+ * `ok`=一致 / `stale`=盘上那份还没跟上 / `unavailable`=比对不了（原因看 `state`/`truncated`）。
+ */
+export type EffectiveVerdict = 'ok' | 'stale' | 'unavailable';
+export function effectiveVerdictOf(item: EffectiveAgentsMd | null): EffectiveVerdict {
+  if (item === null) return 'unavailable';
+  if (item.matches === true) return 'ok';
+  if (item.matches === false) return 'stale';
+  return 'unavailable';
+}
+
+/** 草稿是否偏离落库那份（「重新读取」要不要说「会丢弃未保存的草稿」）。 */
+export function draftDirtyOf(draft: string, stored: string): boolean {
+  return (draft ?? '') !== (stored ?? '');
+}
