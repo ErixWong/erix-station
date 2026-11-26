@@ -1110,10 +1110,12 @@ export class RuntimeSettingsError extends Error {
   }
 }
 
-function fail(field, message, details) {
+function fail(field, message, details, en) {
+  // issue #803 S2-D3：本文件的 fail 第三形参已是 details，故英文对加为**第四个**可选形参；省略时行为逐字不变。
   throw new RuntimeSettingsError('validation_failed', message, {
     httpStatus: 400,
     details: { field, ...details },
+    en,
   });
 }
 
@@ -1473,7 +1475,7 @@ export async function saveRuntimeSetting({
   }
   const why = typeof entry?.validate === 'function' ? entry.validate(value) : true;
   if (why !== true) {
-    fail('value', `value 不合格：${String(why ?? '校验失败')}`);
+    fail('value', `value 不合格：${String(why ?? '校验失败')}`, undefined, `value failed validation: ${String(why ?? 'validation failed')}`);
   }
 
   // 事务必须钉在**同一条连接**上：`pool.query()` 每次另借一条连接，`FOR UPDATE` 拿到的行锁会随

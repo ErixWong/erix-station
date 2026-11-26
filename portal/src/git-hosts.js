@@ -16,19 +16,21 @@ export class GitHostError extends Error {
   }
 }
 
-function fail(field, message) {
-  throw new GitHostError('validation_failed', message, { details: { field } });
+function fail(field, message, en) {
+  // issue #803 S2-D3：可选英文对经第三个形参透传进 options.en（同各类 *Error 口径）。
+  // 省略 en ⇒ `this.en === undefined`，pickMessage 照旧出中文，行为逐字不变。
+  throw new GitHostError('validation_failed', message, { details: { field }, en });
 }
 
 function objectInput(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) fail('body', '请求体必须是对象');
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) fail('body', '请求体必须是对象', 'the request body must be an object');
   return value;
 }
 
 function cleanName(value) {
   if (typeof value !== 'string' || value.trim() === '' || value.trim().length > 120
       || /[\u0000-\u001f\u007f]/.test(value)) {
-    fail('name', 'name 必须是 1–120 个字符');
+    fail('name', 'name 必须是 1–120 个字符', 'name must be 1–120 characters');
   }
   return value.trim();
 }
@@ -38,22 +40,22 @@ function cleanProvider(value) {
     throw new GitHostError('provider_unsupported', 'azure provider 尚不支持', { httpStatus: 400, en: 'the azure provider is not yet supported', details: { field: 'provider' } });
   }
   if (typeof value !== 'string' || !PROVIDERS.has(value)) {
-    fail('provider', 'provider 必须是 gitea、github 或 gitlab');
+    fail('provider', 'provider 必须是 gitea、github 或 gitlab', 'provider must be gitea, github, or gitlab');
   }
   return value;
 }
 
 function cleanBaseUrl(value) {
-  if (typeof value !== 'string' || value.trim() === '') fail('base_url', 'base_url 为必填字段');
+  if (typeof value !== 'string' || value.trim() === '') fail('base_url', 'base_url 为必填字段', 'base_url is required');
   let parsed;
   try {
     parsed = new URL(value.trim());
   } catch {
-    fail('base_url', 'base_url 必须是有效的绝对 URL');
+    fail('base_url', 'base_url 必须是有效的绝对 URL', 'base_url must be a valid absolute URL');
   }
   if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname
       || parsed.username || parsed.password || parsed.search || parsed.hash) {
-    fail('base_url', 'base_url 仅支持不含凭据、查询或片段的 http/https URL');
+    fail('base_url', 'base_url 仅支持不含凭据、查询或片段的 http/https URL', 'base_url only supports http/https URLs without credentials, query, or fragment');
   }
   return parsed.href.replace(/\/+$/, '');
 }
@@ -61,7 +63,7 @@ function cleanBaseUrl(value) {
 function cleanAdminKey(value) {
   if (value == null || (typeof value === 'string' && value.trim() === '')) return null;
   if (typeof value !== 'string' || value.length > 8192 || /[\u0000-\u001f\u007f]/.test(value)) {
-    fail('admin_key', 'admin_key 必须是有效的非空文本');
+    fail('admin_key', 'admin_key 必须是有效的非空文本', 'admin_key must be valid non-empty text');
   }
   return value.trim();
 }
@@ -110,14 +112,14 @@ export async function listGitHosts(pool) {
 
 export async function createGitHost(pool, fields = {}) {
   fields = objectInput(fields);
-  if (fields.mode !== undefined) fail('mode', 'mode 由 provider 与 admin_key 自动决定');
+  if (fields.mode !== undefined) fail('mode', 'mode 由 provider 与 admin_key 自动决定', 'mode is determined automatically by provider and admin_key');
   const name = cleanName(fields.name);
   const provider = cleanProvider(fields.provider);
   const baseUrl = cleanBaseUrl(fields.base_url);
   const adminKey = cleanAdminKey(fields.admin_key);
   const mode = modeFor(provider, adminKey);
   const enabled = fields.enabled === undefined ? true : fields.enabled;
-  if (typeof enabled !== 'boolean') fail('enabled', 'enabled 必须是布尔值');
+  if (typeof enabled !== 'boolean') fail('enabled', 'enabled 必须是布尔值', 'enabled must be a boolean');
   try {
     const result = await pool.query(
       `INSERT INTO git_hosts (name, provider, base_url, admin_key, mode, enabled)
@@ -138,12 +140,12 @@ export async function updateGitHost(pool, id, fields = {}) {
   const current = currentResult.rows[0];
   if (!current) throw new GitHostError('not_found', 'git host 不存在', { httpStatus: 404, en: 'the git host does not exist' });
 
-  if (fields.mode !== undefined) fail('mode', 'mode 由 provider 与 admin_key 自动决定');
+  if (fields.mode !== undefined) fail('mode', 'mode 由 provider 与 admin_key 自动决定', 'mode is determined automatically by provider and admin_key');
   if (fields.clear_admin_key !== undefined && typeof fields.clear_admin_key !== 'boolean') {
-    fail('clear_admin_key', 'clear_admin_key 必须是布尔值');
+    fail('clear_admin_key', 'clear_admin_key 必须是布尔值', 'clear_admin_key must be a boolean');
   }
   if (fields.clear_admin_key === true && fields.admin_key != null && fields.admin_key !== '') {
-    fail('admin_key', 'clear_admin_key 不能与 admin_key 同时设置');
+    fail('admin_key', 'clear_admin_key 不能与 admin_key 同时设置', 'clear_admin_key cannot be set together with admin_key');
   }
 
   const name = fields.name === undefined ? current.name : cleanName(fields.name);
@@ -156,7 +158,7 @@ export async function updateGitHost(pool, id, fields = {}) {
   }
   const mode = modeFor(provider, adminKey);
   const enabled = fields.enabled === undefined ? current.enabled : fields.enabled;
-  if (typeof enabled !== 'boolean') fail('enabled', 'enabled 必须是布尔值');
+  if (typeof enabled !== 'boolean') fail('enabled', 'enabled 必须是布尔值', 'enabled must be a boolean');
 
   if ((provider !== current.provider || baseUrl !== current.base_url)
       && (await pool.query('SELECT 1 FROM fde_git_accounts WHERE git_host_id = $1 LIMIT 1', [id])).rows.length > 0) {

@@ -120,18 +120,23 @@ export const READONLY_PROMPT_KEYS = [
 
 /** 校验/状态类错误：`httpStatus` + `details`（`http.js` 的映射按此透传；**不新增错误码**）。 */
 export class PlatformPromptsError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 S2-D3：可选英文对（同 AdminError/HttpError/各类 *Error 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状与 message 一字不动。
+    this.en = en;
   }
 }
 
-function fail(field, message, details) {
+function fail(field, message, details, en) {
+  // issue #803 S2-D3：本文件的 fail 第三形参已是 details，故英文对加为**第四个**可选形参；省略时行为逐字不变。
   throw new PlatformPromptsError('validation_failed', message, {
     httpStatus: 400,
     details: { field, ...details },
+    en,
   });
 }
 
@@ -430,7 +435,7 @@ export async function getPlatformPrompts({ pool, log = console } = {}) {
  */
 export function assertJsonObjectBody(body) {
   if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    fail('body', '请求体必须是对象');
+    fail('body', '请求体必须是对象', undefined, 'the request body must be an object');
   }
   return body;
 }
@@ -438,18 +443,18 @@ export function assertJsonObjectBody(body) {
 /** 校验：字段名 + `text` 必须是**字符串**（`''` 合法 = 清空 / 跟随内置）+ 自身字节上限。 */
 function cleanTextField(fieldKey, body) {
   const spec = PROMPT_FIELDS[fieldKey];
-  if (!spec) fail('field', `未知字段：${String(fieldKey)}（只支持 addendum / agentsMd / titlePrompt）`);
+  if (!spec) fail('field', `未知字段：${String(fieldKey)}（只支持 addendum / agentsMd / titlePrompt）`, undefined, `unknown field: ${String(fieldKey)} (only addendum / agentsMd / titlePrompt are supported)`);
   assertJsonObjectBody(body);
   const value = body.text;
   if (value === undefined || value === null) {
-    fail('text', 'text 是必填字段（字符串，`""` = 跟随内置）', { max_bytes: spec.maxBytes });
+    fail('text', 'text 是必填字段（字符串，`""` = 跟随内置）', { max_bytes: spec.maxBytes }, 'text is required (a string; `""` = follow the built-in)');
   }
   if (typeof value !== 'string') {
-    fail('text', 'text 必须是字符串（不接受数字 / 对象 / null）', { max_bytes: spec.maxBytes });
+    fail('text', 'text 必须是字符串（不接受数字 / 对象 / null）', { max_bytes: spec.maxBytes }, 'text must be a string (numbers / objects / null are not accepted)');
   }
   const bytes = utf8Bytes(value);
   if (bytes > spec.maxBytes) {
-    fail('text', `text 超过上限 ${spec.maxBytes} 字节（本次 ${bytes}）`, { max_bytes: spec.maxBytes });
+    fail('text', `text 超过上限 ${spec.maxBytes} 字节（本次 ${bytes}）`, { max_bytes: spec.maxBytes }, `text exceeds the limit of ${spec.maxBytes} bytes (this attempt: ${bytes})`);
   }
   return value;
 }
@@ -530,7 +535,7 @@ export async function enqueueMaterializeForAllFdes({ pool, log = console } = {})
  */
 export async function updatePlatformPrompts({ pool, field, text, actorId = null, log = console } = {}) {
   const spec = PROMPT_FIELDS[field];
-  if (!spec) fail('field', `未知字段：${String(field)}（只支持 addendum / agentsMd / titlePrompt）`);
+  if (!spec) fail('field', `未知字段：${String(field)}（只支持 addendum / agentsMd / titlePrompt）`, undefined, `unknown field: ${String(field)} (only addendum / agentsMd / titlePrompt are supported)`);
   const value = cleanTextField(field, { text });
   // ★ 写侧闸按**最坏情况**算（评审 F2）：标识行取最长合法工位名（长度从 `FDE_NAME_RE` 导出），
   //   不是 DTO 预览那个 `example`——否则 8192 这个字段上限会放过「示例名装得下、真工位名装不下」
@@ -546,7 +551,10 @@ export async function updatePlatformPrompts({ pool, field, text, actorId = null,
         + `（本次 ${preRendered}）`
         + '——追加段/覆写文会与内置模板争这 16 KiB，超限会被注入侧静默截断'
         + '（已拒，**未写库**）',
-        renderLimitDetails(spec, preRendered));
+        renderLimitDetails(spec, preRendered),
+        `the rendered ~/AGENTS.md exceeds the injection limit of ${AGENTS_MD_INJECT_MAX_BYTES} bytes (this attempt: ${preRendered})`
+        + ' — the addendum/override text competes with the built-in template for this 16 KiB;'
+        + ' over the limit it would be silently truncated by the injector (rejected, **not written to the DB**)');
     }
   }
   let row;
@@ -569,6 +577,7 @@ export async function updatePlatformPrompts({ pool, field, text, actorId = null,
       String(err?.message ?? err).slice(0, 300));
     throw new PlatformPromptsError('internal', '保存提示词失败（数据库拒了这条语句，原因见 portal 日志）', {
       httpStatus: 500,
+      en: 'failed to save the prompt (the database rejected this statement; see the portal log for the reason)',
     });
   }
   const renderedBytes = Number(row?.rendered_bytes ?? 0);
@@ -578,11 +587,14 @@ export async function updatePlatformPrompts({ pool, field, text, actorId = null,
     fail('text',
       `渲染后的整份 ~/AGENTS.md 超过注入上限 ${AGENTS_MD_INJECT_MAX_BYTES} 字节（本次 ${renderedBytes}）`
       + '——追加段/覆写文会与内置模板争这 16 KiB，超限会被注入侧静默截断',
-      renderLimitDetails(spec, renderedBytes));
+      renderLimitDetails(spec, renderedBytes),
+      `the rendered ~/AGENTS.md exceeds the injection limit of ${AGENTS_MD_INJECT_MAX_BYTES} bytes (this attempt: ${renderedBytes})`
+      + ' — the addendum/override text competes with the built-in template for this 16 KiB;'
+      + ' over the limit it would be silently truncated by the injector');
   }
   if (Number(row?.audit_rows) !== 1) {
     // 理论上到不了：`aud` 与 `upd` 在同一条语句里同生共死。留着是因为它正是这条语句存在的理由。
-    throw new PlatformPromptsError('internal', `保存成功但审计写了 ${row?.audit_rows ?? 0} 行`, { httpStatus: 500 });
+    throw new PlatformPromptsError('internal', `保存成功但审计写了 ${row?.audit_rows ?? 0} 行`, { httpStatus: 500, en: `the save succeeded but the audit wrote ${row?.audit_rows ?? 0} rows` });
   }
   const resolved = resolveFromRow({
     agents_md_addendum: row.agents_md_addendum,
@@ -630,17 +642,17 @@ const EFFECTIVE_FDE_SQL = 'SELECT id, fde_name, status FROM users WHERE fde_name
 /** 盘上那份的路径（唯一一处拼法）。`fde_name` 必须过 `FDE_NAME_RE` ⇒ 天然是单段，`..` 进不来。 */
 export function homeAgentsMdPathOf({ userSpaceRoot, fdeName } = {}) {
   if (!userSpaceRoot) {
-    throw new PlatformPromptsError('internal', '未配置用户空间根（ERIX_USERSPACE_ROOT）', { httpStatus: 500 });
+    throw new PlatformPromptsError('internal', '未配置用户空间根（ERIX_USERSPACE_ROOT）', { httpStatus: 500, en: 'the userspace root is not configured (ERIX_USERSPACE_ROOT)' });
   }
   if (typeof fdeName !== 'string' || !FDE_NAME_RE.test(fdeName)) {
-    fail('fde', `工位标识非法：${String(fdeName)}`);
+    fail('fde', `工位标识非法：${String(fdeName)}`, undefined, `invalid fde identifier: ${String(fdeName)}`);
   }
   const root = path.resolve(userSpaceRoot, fdeName, 'home');
   const target = path.join(root, 'AGENTS.md');
   // 双保险：`FDE_NAME_RE` 已保证单段，这里再钉一次 containment（口径同 `dirs.js#resolveJailedUnderProjects`）。
   const rel = path.relative(path.resolve(userSpaceRoot), root);
   if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
-    fail('fde', '工位标识指向了用户空间之外');
+    fail('fde', '工位标识指向了用户空间之外', undefined, 'the fde identifier points outside the user space');
   }
   return { root, target };
 }
@@ -774,10 +786,10 @@ export function toEffectiveAgentsMdDto({ fdeName, disk, expected, renderLimitByt
  */
 export async function getEffectiveAgentsMd({ pool, userSpaceRoot, fdeName, log = console } = {}) {
   if (typeof fdeName !== 'string' || fdeName === '') {
-    fail('fde', 'fde 是必填查询参数（工位标识）');
+    fail('fde', 'fde 是必填查询参数（工位标识）', undefined, 'fde is a required query parameter (the fde identifier)');
   }
   if (!FDE_NAME_RE.test(fdeName)) {
-    fail('fde', `工位标识非法：${fdeName}`);
+    fail('fde', `工位标识非法：${fdeName}`, undefined, `invalid fde identifier: ${fdeName}`);
   }
   let row;
   try {
@@ -785,11 +797,12 @@ export async function getEffectiveAgentsMd({ pool, userSpaceRoot, fdeName, log =
     row = r?.rows?.[0] ?? null;
   } catch (err) {
     log?.warn?.(`[platform-prompts] 查工位失败 fde=${fdeName}：${err?.message ?? err}`);
-    throw new PlatformPromptsError('internal', '读取工位失败（原因见 portal 日志）', { httpStatus: 500 });
+    throw new PlatformPromptsError('internal', '读取工位失败（原因见 portal 日志）', { httpStatus: 500, en: 'failed to read the fde (see the portal log for the reason)' });
   }
   if (!row || !row.fde_name) {
     throw new PlatformPromptsError('not_found', `工位「${fdeName}」不存在`, {
       httpStatus: 404, details: { field: 'fde_name' },
+      en: `the fde "${fdeName}" does not exist`,
     });
   }
   const name = String(row.fde_name);
