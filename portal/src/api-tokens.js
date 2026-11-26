@@ -57,7 +57,7 @@ export async function findActiveByToken(pool, token) {
   const res = await pool.query(
     `SELECT t.id AS token_id, t.name, t.scopes, t.created_at, t.last_used_at,
             u.id, u.login, u.display_name, u.role, u.fde_name, u.auth_source,
-            u.status, u.must_change_password, u.file_upload_enabled
+            u.status, u.must_change_password, u.file_upload_enabled, u.locale
        FROM api_tokens t
        JOIN users u ON u.id = t.user_id
       WHERE t.token_hash = $1
@@ -92,6 +92,9 @@ export async function findApiTokenUser(pool, token) {
       // 受限会话门（#255）读这一项：`must_change_password` 的账号拿 token
       // 同样受限（设计点 11）。
       must_change_password: row.must_change_password === true,
+      // #828 P1：账号级语言偏好。token 认证路径打的 `GET /api/me` 与 cookie 路径是同一个端点
+      // ⇒ DTO 必须同形（少一键就是缺陷，被 api-tokens.test.js②「两条认证路径 user 逐字段一致」抓）。
+      locale: row.locale ?? null,
     },
     token: {
       id: row.token_id,

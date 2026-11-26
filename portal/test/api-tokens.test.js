@@ -229,7 +229,7 @@ test('② 两条认证路径的 user 逐字段一致', async () => {
   assert.equal(viaToken.status, 200);
   assert.deepEqual(
     Object.keys(viaToken.json.user).sort(),
-    ['auth_source', 'display_name', 'fde_name', 'file_upload_enabled', 'id', 'login',
+    ['auth_source', 'display_name', 'fde_name', 'file_upload_enabled', 'id', 'locale', 'login',
       'must_change_password', 'role'],
     '令牌路径的 user 键集 = cookie 路径的键集（秘密列不许混进来）',
   );
