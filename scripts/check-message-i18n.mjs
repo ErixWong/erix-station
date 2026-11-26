@@ -4,8 +4,8 @@
 //
 // 扫 `portal/src/**/*.js`（排除 `locale.js` 本身），做两道独立检查：
 //
-//  ① 抛出点分类 + **floor 语义**（“只许减不许增”）：
-//     对每一处 `throw new HttpError(…)`：
+//  ① 抛出点分类 + **floor 语义**（“只许减不许增”）：对每一处 `throw new *Error(…)`（**任何**
+//    错误类，含裸 `Error`），只看语句里带**中文字面量**的（消息只拼变量 = 静态面没得翻，不入账）：
 //       · 该抛出语句（跨行、按括号平衡取全，字符串/注释内的括号不误算）里出现真实标识符 `en:`
 //         （`\ben\s*:`，且已剔除字符串字面量，`token:` 之类不误判）⇒ **已双语**；
 //       · 否则该语句任一行带 `// i18n-exempt: <具体理由>（#803）` ⇒ **豁免**；理由要具体
@@ -18,12 +18,15 @@
 //     `hint` 有 ⇒ `hintEn` 必有、没 `hint` ⇒ 不许凭空 `hintEn`（漏一条即红）。
 //
 // UNBILINGUAL_FLOOR 是什么 / 怎么随覆盖下降 / 降了要同步改这里：
-//   这个数字 = 「`portal/src` 里 `throw new HttpError` 抛出点中，既没给 `en:`、也没标 `i18n-exempt` 的条数」。
-//   S1 起点：全部来自 `http.js` 的 154 处（S1 只铺机制、没翻译任何抛出点；`auth.js` 等各自抛自己的
-//   `*Error`、不经 `HttpError`，故不计入本账；`runtime-settings.js` 抛 `RuntimeSettingsError`，也不计）。
-//   怎么下降：S2/S3 每把一个抛出点补上 `en:`，未双语 -1；把某条确证「不该出英文」并标 `i18n-exempt` 也 -1；
-//   补满 / 标完后归零。**每降一批就同步把下面的 UNBILINGUAL_FLOOR 改成新的更小实测值**（闸本身不因为「降了没记账」
-//   变红，但留着虚高的上界就等于没记账）。**增加**（新加一处没 `en:` 的 `throw new HttpError`）⇒ 一定红。
+//   这个数字 = 「`portal/src` 里**带中文字面量**的 `throw new *Error(…)` 抛出点中，既没给 `en:`、
+//   也没标 `i18n-exempt` 的条数」。S1 收口时实测 407（按错误类：`HttpError` 82、`MacroError` 54、
+//   `InternalError` 50、`AdminError` 45、`MarketError` 34、`DirError` 33、`LlmError` 31、`SessionError` 26、
+//   裸 `Error` 16、`GitHostError` 9、`RuntimeSettingsError` 7、其余零头）。⚠ 为什么不是只盯 `HttpError`：
+//   出口 `pickMessage` 是**通用读 `err.en`** 的，各错误类都能接英文；只盯一类等于「新增一条没翻的
+//   `AdminError` 也不报错」，那就不是闸了。
+//   怎么下降：S2/S3 每给一个抛出点补上 `en:`，未双语 -1；把某条确证「不该出英文」并标 `i18n-exempt` 也 -1；
+//   补满 / 标完后归零。**每降一批就同步把下面的 UNBILINGUAL_FLOOR 改成新的更小实测值**（闸不因为「降了没记账」
+//   变红，但留着虚高的上界就等于没记账）。**增加**（新加一处带中文又没 `en:` 的抛出点）⇒ 一定红。
 //
 // ⚠ 本地自测：`node scripts/check-message-i18n.mjs --count` 只打印当前实测值（便于降档时取新数）。
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
@@ -33,10 +36,38 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_DIR = path.join(ROOT, 'portal/src');
 const RUNTIME_SETTINGS_SRC = path.join(ROOT, 'portal/src/runtime-settings.js');
-const THROW_MARKER = 'throw new HttpError';
+// 账本面：**任何**错误类的抛出点（`throw new HttpError` / `AdminError` / `MacroError` /
+// `InternalError` / `DirError` / `SessionError` / `LlmError` / 裸 `Error` …），只要语句里带
+// **中文字面量**。S1 最初只盯 `throw new HttpError`，实测那是**漏账**：`portal/src` 里硬编码
+// 中文消息的抛出点共 407 处，`HttpError` 只占其中 82（`AdminError` 45 / `MacroError` 54 /
+// `InternalError` 50 …各自成类），而出口 `pickMessage` 是**通用读 `err.en`** 的——只盯一类就等于
+// 「新增一条没翻的 `AdminError` 也不报错」，闸不闸。⇒ 按类名以 `Error` 结尾统一扫。
+const THROW_RE = /\bthrow\s+new\s+([A-Za-z0-9_]*Error)\s*\(/g;
 
-// 未双语地板（见文件头）。降覆盖后要同步改这里。
-const UNBILINGUAL_FLOOR = 154;
+// 中文字符（含 CJK 扩展 A 与中文标点）。只算**字符串字面量里**的中文：注释里的中文不是下发文案，
+// 拼串里只拼变量的消息不是静态可翻面。
+const CJK_RE = /[㐀-䶿一-鿿　-〿＀-￯]/;
+
+/** 一条抛出语句里是否带中文字符串字面量（跳过注释；字符串逐个取内容试）。 */
+function hasCjkStringLiteral(text, from, to) {
+  let i = from;
+  while (i < to) {
+    const c = text[i];
+    if (c === '/' && text[i + 1] === '/') { i = skipLineComment(text, i); continue; }
+    if (c === '/' && text[i + 1] === '*') { i = skipBlockComment(text, i); continue; }
+    if (c === '"' || c === "'" || c === '`') {
+      const j = skipString(text, i);
+      if (CJK_RE.test(text.slice(i, j))) return true;
+      i = j;
+      continue;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+// 未双语地板（见文件头）。降覆盖后要同步改这里。取 261126 S1 收口时的实测值（`--count` 现取）。
+const UNBILINGUAL_FLOOR = 407;
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
@@ -143,17 +174,17 @@ function measureThrowSites() {
   const firstUnbilingual = [];
   for (const file of files) {
     const text = readFileSync(file, 'utf8');
-    let from = 0;
-    for (;;) {
-      const hit = text.indexOf(THROW_MARKER, from);
-      if (hit === -1) break;
-      from = hit + THROW_MARKER.length;
-      const openParen = text.indexOf('(', hit);
-      if (openParen === -1) { unbilingual += 1; continue; }
+    THROW_RE.lastIndex = 0;
+    let m;
+    while ((m = THROW_RE.exec(text)) !== null) {
+      const hit = m.index;
+      const openParen = m.index + m[0].length - 1;
       const close = matchingClose(text, openParen);
       const lineEnd = text.indexOf('\n', close);
       const sliceEnd = lineEnd === -1 ? text.length : lineEnd;
       const raw = text.slice(hit, sliceEnd); // 含语句与其尾随注释
+      // 账本只收「硬编码中文消息」的抛出点：消息是拼变量 / 透传上游文案的，静态面没得翻。
+      if (!hasCjkStringLiteral(text, openParen, close)) continue;
       if (/\ben\s*:/.test(codeOnly(raw))) { bilingual += 1; continue; }
       if (/i18n-exempt/.test(raw)) {
         if (exemptReasonOk(raw)) { exempt += 1; }
