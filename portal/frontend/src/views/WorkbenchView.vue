@@ -7,7 +7,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
-import { setWorkbenchHooks, useWorkbenchStore } from '../stores/workbench';
+import { setWorkbenchHooks, useWorkbenchStore, type FoldedOriginalState } from '../stores/workbench';
 // issue #431：用户 scope 结束的接线（注册方，触发方在 stores/auth.ts）。
 import { setUserScopeResetListener } from '../lib/userScope';
 import { AUTO_FOLLOW_GAP } from '../lib/constants';
@@ -16,6 +16,8 @@ import { foldFootprint, foldHeadline, foldRange, foldRailNodes, type FoldEntry }
 import { useSidebarWidth, SIDEBAR_MAX, SIDEBAR_MIN } from '../composables/useSidebarWidth';
 import SidebarPanel from '../components/SidebarPanel.vue';
 import StreamPanel from '../components/StreamPanel.vue';
+// issue #816 第④步a：面板行「查看原文」的渲染本体（与 StreamPanel 旧横幅共用同一份实现）。
+import FoldOriginalTurns from '../components/FoldOriginalTurns.vue';
 // issue #282：输入框上方常驻动量状态条（run 级量化信号；消息级时刻在 StreamPanel 里）。
 import RunStatusBar from '../components/RunStatusBar.vue';
 import ComposerBar from '../components/ComposerBar.vue';
@@ -299,7 +301,42 @@ function jumpToLatest() {
 /** 展开面板的开关是**视图态**（默认收起）；换会话复位——不把上一个会话的展开态留给下一个。 */
 const foldPanelOpen = ref(false);
 const foldPanelEl = ref<HTMLElement | null>(null);
-watch(() => store.sessionId, () => { foldPanelOpen.value = false; });
+/**
+ * issue #816 第④步a：面板行内的「查看原文」展开态（按**落账轮号**记，视图态）。
+ *
+ * 与旧横幅 #388 同口径：再点一次只是收起，**不清缓存**（`store.foldedOriginals` 里的原文
+ * 不删，下次展开直接命中，不重发）；换会话复位（与 `foldPanelOpen` 同一处）。
+ * 轮号不是安全整数的折叠行没有可查的轮（拿范围去查端点必然 404）⇒ 连按钮都不渲染。
+ */
+const foldOriginalsOpen = ref<Record<number, boolean>>({});
+watch(() => store.sessionId, () => { foldPanelOpen.value = false; foldOriginalsOpen.value = {}; });
+
+/** 可用于查询端点的轮号（非安全整数 ⇒ null ⇒ 按钮与原文都不出）。 */
+function foldQueryRound(fold: FoldEntry): number | null {
+  return Number.isSafeInteger(fold.round) ? (fold.round as number) : null;
+}
+
+/** 有展开态且有 state（点过「查看原文」）才给状态；否则 undefined ⇒ 整块一个字节都不渲染。 */
+function foldRowOriginalState(fold: FoldEntry): FoldedOriginalState | undefined {
+  const round = foldQueryRound(fold);
+  if (store.sessionId == null || round === null || !foldOriginalsOpen.value[round]) return undefined;
+  return store.getFoldedOriginal(store.sessionId, round);
+}
+
+/** 点一行「查看原文」= 展开该行并懒加载（命中与否由 store 自己判）；再点 = 收起（不清缓存）。 */
+function toggleFoldOriginal(fold: FoldEntry): void {
+  const round = foldQueryRound(fold);
+  if (store.sessionId == null || round === null) return;
+  foldOriginalsOpen.value[round] = !foldOriginalsOpen.value[round];
+  void store.loadFoldedOriginal(store.sessionId, round);
+}
+
+/** 原文加载失败后的重试：强拉一次（与旧横幅 `retryOriginal` 同口径）。 */
+function retryFoldOriginal(fold: FoldEntry): void {
+  const round = foldQueryRound(fold);
+  if (store.sessionId == null || round === null) return;
+  void store.loadFoldedOriginal(store.sessionId, round, { force: true });
+}
 // #816：展开/收起折叠面板会改变 streamEl 的可视高度（面板是它的**兄弟**、不是子节点：`shrink-0` 抢走
 // 一节高度）⇒ 原本贴底的用户，最新内容会被挤出视口，而**没发生滚动** ⇒ `@scroll` 不跑、
 // `showToLatest` 连「↓ 最新」都点不亮。所以开关面板后主动复算一次：仍自动跟随就重新贴底，
@@ -507,21 +544,39 @@ function onFoldNodeClick(index: number): void {
           class="max-h-56 shrink-0 overflow-auto border-b border-black/10 bg-white px-3 py-1.5 text-xs"
         >
           <div class="mb-1 text-black/40">{{ t('workbench.foldBar.panelTitle', { count: store.sessionFolds.length }) }}</div>
-          <div
+          <template
             v-for="fold in store.sessionFolds"
             :key="`r${fold.round ?? 'x'}-${fold.from}-${fold.to}`"
-            data-test="fold-row"
-            class="flex items-baseline gap-2 py-0.5"
           >
-            <span data-test="fold-row-range" class="shrink-0 text-black/60">{{ rangeText(fold) }}</span>
-            <span
-              v-if="headlineText(fold)"
-              data-test="fold-row-headline"
-              class="shrink-0"
-            >{{ headlineText(fold) }}</span>
-            <span v-if="foldFootprint(fold)" data-test="fold-row-footprint" class="min-w-0 truncate text-black/40">{{ foldFootprint(fold) }}</span>
-            <span v-if="fold.truncated" data-test="fold-row-truncated" class="shrink-0 text-black/40">{{ t('workbench.foldBar.truncated') }}</span>
-          </div>
+            <div data-test="fold-row" class="flex items-baseline gap-2 py-0.5">
+              <span data-test="fold-row-range" class="shrink-0 text-black/60">{{ rangeText(fold) }}</span>
+              <span
+                v-if="headlineText(fold)"
+                data-test="fold-row-headline"
+                class="shrink-0"
+              >{{ headlineText(fold) }}</span>
+              <span v-if="foldFootprint(fold)" data-test="fold-row-footprint" class="min-w-0 truncate text-black/40">{{ foldFootprint(fold) }}</span>
+              <span v-if="fold.truncated" data-test="fold-row-truncated" class="shrink-0 text-black/40">{{ t('workbench.foldBar.truncated') }}</span>
+              <!-- #816④a：轮号不可用（非安全整数/缺席）就根本不渲染这个按钮（与旧横幅同口径：
+                   拿 from/to 去查是查错行、必然 404）。 -->
+              <button
+                v-if="foldQueryRound(fold) !== null"
+                type="button"
+                data-test="fold-row-original"
+                class="shrink-0 rounded-md border border-black/20 px-1.5 py-0.5 text-black/50 hover:bg-black/5"
+                @click="toggleFoldOriginal(fold)"
+              >{{ t('workbench.foldBar.viewOriginal') }}</button>
+            </div>
+            <!-- 该行下方那段原文：**同一个组件**（StreamPanel 旧横幅也用它）。`foldRowOriginalState` 在没有
+                 展开态、或从未点过（无 state）⇒ undefined ⇒ 整块一个字节都不出。 -->
+            <FoldOriginalTurns
+              v-if="foldRowOriginalState(fold)"
+              :state="foldRowOriginalState(fold)!"
+              :fold="fold"
+              class="folded-original mb-1 border-l-2 border-black/10 pl-2"
+              @retry="retryFoldOriginal(fold)"
+            />
+          </template>
         </div>
         <!-- issue #816 右侧竖串与消息流**同一行**：竖串不参与滚动（它是 `relative` 容器 + 节点绝对定位，
              自己不是滚动容器）。行包装给 `overflow-auto` 是刻意的：#282 那条「状态条落点」的结构断言按

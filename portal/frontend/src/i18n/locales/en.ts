@@ -165,6 +165,8 @@ export const en = {
       truncated: '(summary clipped)',
       railAria: 'Fold positions (click to expand details)',
       nodeAria: 'Folded through round {round}',
+      // #816④a: per-row「查看原文」in the panel (lazy-load the folded original; same wording as the old banner)
+      viewOriginal: 'View original',
     },
     inputPlaceholder: 'Type a task, Enter to send (Shift+Enter for a newline)',
     systemInjection: '[system] {content}',
