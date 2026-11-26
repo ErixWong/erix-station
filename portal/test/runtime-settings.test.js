@@ -4130,8 +4130,10 @@ test('RS-63 Tier 2A 真库腿：保存⇒热读立即新值、删行⇒回落 en
 //   RS-64 parity：registry 里 `label` 有 ⇒ `labelEn` 必有、`hint` 有 ⇒ `hintEn` 必有；
 //                 原本没 `hint` 的那格不许凭空造 `hintEn`。
 //   RS-65 locale=en：12 条 label、11 条 hint 全出英文且**不含 CJK**。
-//   RS-66 缺省（不传 locale）：输出与改动前**逐字相同**（label/hint 逐字等于 registry 中文），
-//                 这是「既有契约不破」的钉子——有人把缺省语言改成 en，这条当场红。
+//   RS-66 缺省（不传 locale）：输出与「显式 `zh-CN`」以及「当前 registry 的中文」逐字相同
+//                 （三者都出自当前实现 ⇒ 它钉的是「缺省语言不许漂成 en / 不许丢 hint 键」）。
+//   RS-67 中文原文硬编码钉子：三格 label + 一句 hint 的**中文字面量**逐字写死在本文件里，
+//                 并把缺省 locale 的输出也钉到同一句——中文原文被改写时 RS-66 会跟着绿，这条不会。
 // ===========================================================================
 const CJK_RE_803 = /[\u2E80-\u2EFF\u3000-\u303F\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]/;
 
@@ -4176,7 +4178,11 @@ test('RS-65 管理台 locale=en：12 条 label、11 条 hint 全英文且不含 
   }
 });
 
-test('RS-66 管理台缺省（不传 locale）：输出与改动前逐字相同（缺省语言不许漂成 en）', async () => {
+test('RS-66 管理台缺省（不传 locale）：与显式 zh-CN / 当前 registry 中文三者逐字相同（缺省不许漂成 en）', async () => {
+  // 注意本格的保证面（#803 返修 m7 改名，原来的「与改动前逐字相同」名不副实）：
+  // 被比的三份（缺省输出 / 显式 zh-CN 输出 / `RUNTIME_SETTING_REGISTRY` 里的中文）**全部来自
+  // 当前实现**，所以它能抓的是「缺省语言漂了」「无 hint 的格子凭空多键」这一类机制错；
+  // 有人把中文原文改一个字，这里三边一起变 ⇒ 照样绿。逐字的中文原文由 RS-67 钉。
   const byDefault = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: {}, log: silentLog });
   const byZh = await listRuntimeSettingsAdmin({
     pool: ttlPool(), config: {}, log: silentLog, locale: 'zh-CN',
@@ -4193,4 +4199,24 @@ test('RS-66 管理台缺省（不传 locale）：输出与改动前逐字相同�
       assert.ok(!('hint' in item), `${key}: 缺省时无 hint 的格子连键都不带`);
     }
   }
+});
+
+test('RS-67 中文原文硬编码钉子：三格 label 与一句 hint 逐字不许改（RS-66 会跟着实现一起绿）', async () => {
+  // #803 返修 m7：RS-66 比的是「缺省输出 vs 显式 zh-CN vs 当前 registry 的中文」，三者都出自
+  // **当前实现** ⇒ 有人把中文原文改写，RS-66 三边一起变、照样绿。本格把中文字面量**写死在这里**：
+  // 改中文原文（哪怕连 labelEn 一起改）也必须在这里红一次，由人明确认领后再动这里的字面量。
+  assert.equal(RUNTIME_SETTING_REGISTRY[SESSION_TTL_KEY].label, '登录会话有效期（秒）');
+  assert.equal(RUNTIME_SETTING_REGISTRY[WORKSPACE_RETENTION_KEY].label, '已离职工位目录保留天数（0 = 不自动清理）');
+  assert.equal(RUNTIME_SETTING_REGISTRY[PREVIEW_TICKET_TTL_KEY].label, '预览票有效期（秒）');
+  assert.equal(WORKSPACE_RETENTION_HINT,
+    '0 = 关掉自动清理，但不会取消已排定的删除：改回正数后，已过期的工位会在下一次清理被删除；'
+    + '而 0 期间完成离职的工位不会被补上期限（也不会被追删）。');
+  // 再钉一次「界面真正读到的那一行」：缺省 locale 的 DTO 必须就是上面那句（不只钉 registry 常量）。
+  const { items } = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: {}, log: silentLog });
+  const byKey = Object.fromEntries(items.map((i) => [i.key, i]));
+  assert.equal(byKey[SESSION_TTL_KEY].label, '登录会话有效期（秒）');
+  assert.equal(byKey[WORKSPACE_RETENTION_KEY].label, '已离职工位目录保留天数（0 = 不自动清理）');
+  assert.equal(byKey[WORKSPACE_RETENTION_KEY].hint,
+    '0 = 关掉自动清理，但不会取消已排定的删除：改回正数后，已过期的工位会在下一次清理被删除；'
+    + '而 0 期间完成离职的工位不会被补上期限（也不会被追删）。');
 });

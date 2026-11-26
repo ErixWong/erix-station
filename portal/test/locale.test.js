@@ -62,15 +62,25 @@ test('LC-5 parseAcceptLanguage：* 与其他语言落回（不匹配、不抛）
   assert.equal(parseAcceptLanguage('fr, de, es'), null);        // 全是别国语言 ⇒ 落回
   assert.equal(parseAcceptLanguage('*, en'), 'en');             // * 跳过、en 仍中（* q 与 en q 都 1，靠后也中）
   assert.equal(parseAcceptLanguage('fr;q=1.0, en;q=0.5'), 'en'); // 高 q 的 fr 不匹配 ⇒ 次高 en
-  // 注：本闸不把 `q=0` 当 RFC 的「排除」细则处理（q 只用来排序）；`zh;q=0` 这类见 LC-5b。
+  // 注：`q<=0` 按 RFC 算「不要」（不参与匹配），单独一条时落回 `null` ⇒ 调用方给缺省；见 LC-5b。
 });
 
-test('LC-5b parseAcceptLanguage：q=0 的匹配项在只有它时仍被选中（无更优候选）', () => {
-  // zh;q=0 仍是列表里唯一可匹配的标签 ⇒ 选中它（本闸不实现「q=0 即排除」的 RFC 细则，
-  // 只需保证 zh* 能归到 zh-CN 且脏输入不抛）。
-  assert.equal(parseAcceptLanguage('zh;q=0'), 'zh-CN');
-  // 但若同时有更正的候选，q=0 的排最后 ⇒ 让位
+test('LC-5b parseAcceptLanguage：q<=0 的项不参与匹配（RFC 的「我不要这个语言」）', () => {
+  // 单独一条 `q=0` ⇒ 没有任何可匹配项 ⇒ `null`（由调用方落回缺省），**而不是选中它**。
+  // 这是 #803 返修 m4 改的行为：旧实现只拿 q 排序 ⇒「明确说了不要」还能当选，与头注相互矛盾。
+  assert.equal(parseAcceptLanguage('zh;q=0'), null);
+  assert.equal(parseAcceptLanguage('en;q=0'), null);
+  assert.equal(parseAcceptLanguage('zh-CN;q=0.0, en;q=0'), null);
+  assert.equal(parseAcceptLanguage('en;q=0.00'), null);
+  assert.equal(parseAcceptLanguage('en;q=-1'), null);           // 负数同口径（也只能是「不要」）
+  // 但同时有更正的候选 ⇒ q=0 的让位（新旧实现这条结果相同，留着防「把带 q 的整段一律丢掉」那种过度修正）。
   assert.equal(parseAcceptLanguage('zh;q=0, en'), 'en');
+  assert.equal(parseAcceptLanguage('en;q=0, zh-CN'), 'zh-CN');
+  // 被排除的那项不许「连累」候选：它排最前，次高的受支持项仍赢。
+  assert.equal(parseAcceptLanguage('en;q=0, fr;q=0.9, zh-CN;q=0.1'), 'zh-CN');
+  // 非法 / 缺值的 q **不算排除**（写法坑 ≠ 拒绝）：该标签照常参与匹配（与 LC-6 同一口径）。
+  assert.equal(parseAcceptLanguage('en;q=abc'), 'en');
+  assert.equal(parseAcceptLanguage('zh-CN;q='), 'zh-CN');
 });
 
 test('LC-6 parseAcceptLanguage：脏输入不抛，尽量落回 null', () => {
@@ -111,6 +121,9 @@ test('LC-9 resolveRequestLocale：只有 Accept-Language（cookie 里没有 loca
   assert.equal(resolveRequestLocale({ headers: { 'accept-language': 'en-GB,en;q=0.9' } }), 'en');
   assert.equal(resolveRequestLocale({ headers: { 'accept-language': 'zh-TW' } }), 'zh-CN');
   assert.equal(resolveRequestLocale({ headers: { cookie: 'other=1', 'accept-language': 'en' } }), 'en');
+  // `q<=0` 被排除后没有候选 ⇒ 落回缺省 `zh-CN`（谈判层的结果，不只是解析层返 null）。
+  assert.equal(resolveRequestLocale({ headers: { 'accept-language': 'en;q=0' } }), 'zh-CN');
+  assert.equal(resolveRequestLocale({ headers: { 'accept-language': 'zh-CN;q=0, en' } }), 'en');
 });
 
 test('LC-10 resolveRequestLocale：cookie 与 Accept-Language 冲突 ⇒ cookie 赢', () => {

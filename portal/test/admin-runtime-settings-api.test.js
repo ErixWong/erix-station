@@ -536,3 +536,66 @@ test('RS-API-12 PUT 不带 locale cookie ⇒ 回包 item 的 label/hint 逐字�
     await s.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// ⑦ #803 返修 m6：**英文错误文案的机制端到端闭环**（此前 `pickMessage` 零覆盖）。
+// S1 那 406 处抛出点全没给 `en`，英文错误文案从没在任何测试里真走通过一次——机制坏了（比如
+// 出口忘了传 locale、或 `err.en` 被改名）也会一路绿。本格走 `requireJson` 那一处抛点（全仓
+// 目前唯一给了 `en:` 的），**只钉三件事**：状态码与错误码不变、`locale=en` 时出那句英文逐字、
+// `error` 的键形状不因语言而变。**不比整包**（整包比较会把与语言无关的字段也钉住，改一个无关
+// 字段就假红）。
+// ---------------------------------------------------------------------------
+
+/** `content-type: text/plain` 的 PUT（`call` 会自动加 json 头，那一支要的是「内容类型不对」）。 */
+const putPlainText = (s, locale) => fetch(`${s.base}/api/admin/runtime-settings/${SESSION_TTL_KEY}`, {
+  method: 'PUT',
+  headers: {
+    cookie: `${locale ? `locale=${locale}; ` : ''}${s.cookieFor('root')}`,
+    'content-type': 'text/plain',
+  },
+  body: '{"value": 7200}',
+});
+
+// 两腿共用的形状钩：`error` 的键只许是契约面那一组（`{ error: { code, message, retryable, details } }`）。
+// 本抛点没给 `details` ⇒ 实际应是三键；`en` 是**内部字段**，出现在响应里就是泄露新键。
+function assertErrorShape(error, label) {
+  assert.ok(error, `${label}：响应必须有 error 那一层`);
+  assert.deepEqual(
+    Object.keys(error).sort(),
+    ['code', 'message', 'retryable'],
+    `${label}：error 的键必须与改动前逐字同形（多了 = 新键，少了 = 契约被删；本抛点无 details）`,
+  );
+  assert.ok(!('en' in error), `${label}：en 只用来选文案，不许进响应体`);
+  assert.equal(error.code, 'validation_failed', `${label}：错误码不许随语言变`);
+  assert.equal(error.retryable, false, `${label}：retryable 不许随语言变`);
+}
+
+test('RS-API-13 机制闭环：PUT 内容类型不对 ⇒ 400，locale=en 出英文逐字、缺省出中文逐字、键形状不变', async () => {
+  const s = await startStack();
+  try {
+    // 腿 A：带 `Cookie: locale=en` ⇒ 英文逐字。
+    const resEn = await putPlainText(s, 'en');
+    assert.equal(resEn.status, 400, `内容类型不对必须 400（英文腿实得 ${resEn.status}）`);
+    const en = await readJson(resEn);
+    assert.ok(en.error, `英文腿必须有错误信封（实得 ${JSON.stringify(en)}）`);
+    assertErrorShape(en.error, '英文腿');
+    assert.equal(en.error.message, 'Content-Type must be application/json',
+      'locale=en 必须逐字命中抛出点给的那句英文（这句话是机制走通的唯一证据）');
+    assert.ok(!CJK_RE_803.test(en.error.message), `英文腿不许含 CJK：${en.error.message}`);
+
+    // 腿 B：不带 locale cookie ⇒ 中文原文逐字不改（`Error.message` 的中文是日志/审计的依赖）。
+    const resZh = await putPlainText(s, undefined);
+    assert.equal(resZh.status, 400, `内容类型不对必须 400（中文腿实得 ${resZh.status}）`);
+    const zh = await readJson(resZh);
+    assert.ok(zh.error, `中文腿必须有错误信封（实得 ${JSON.stringify(zh)}）`);
+    assertErrorShape(zh.error, '中文腿');
+    assert.equal(zh.error.message, 'Content-Type 必须为 application/json',
+      '缺省语言的 message 必须逐字等于中文原文（不改一个字）');
+    assert.ok(CJK_RE_803.test(zh.error.message), `中文腿必须是中文：${zh.error.message}`);
+
+    // 两腿的状态码与错误码同形：语言只改文案，不改契约。
+    assert.notEqual(en.error.message, zh.error.message, '两腿必须真的差在语言上（否则上面逐字都是假绿）');
+  } finally {
+    await s.close();
+  }
+});

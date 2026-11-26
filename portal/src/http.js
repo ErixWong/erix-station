@@ -737,7 +737,13 @@ function requireJson(req) {
   const ct = (raw || '').split(';')[0].trim().toLowerCase();
   if (ct === 'application/json') return;
   if (raw === undefined && requestHasNoBody(req)) return;
-  throw new HttpError(400, 'validation_failed', 'Content-Type 必须为 application/json');
+  // 这一条是 #803 的**机制端到端样桩**（返修 m6）：目前全仓只有这一处给了 `en:`，因此它是唯一
+  // 能从 HTTP 面真走通 `err.en` ⇒ `pickMessage` 那条链的抛出点（判据：
+  // `portal/test/admin-runtime-settings-api.test.js` 的 Content-Type 腿）。改动本行时**两边的
+  // 逐字都有钉**，别只改一边。
+  throw new HttpError(400, 'validation_failed', 'Content-Type 必须为 application/json', {
+    en: 'Content-Type must be application/json',
+  });
 }
 
 /** issue #236：请求是否**确定**没有 body（`Content-Length: 0`，或既无 CL 也无 chunked 编码）。 */

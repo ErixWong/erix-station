@@ -1032,7 +1032,7 @@ station-portal user enable  --login <login>
 
 **附：请求语言（locale）——服务端下发的文案按它出语言（#803 S1）**。这一条是全请求级的通用行为（不只影响本端点），登记在此是因为它是唯一面向匿名客户端、讲「客户端怎么告知服务端自己要什么」的入口小节。谈判顺序：`Cookie: locale=`（白名单 `zh-CN` | `en`，脏值忽略）→ `Accept-Language`（按 q 值，`zh*` ⇒ `zh-CN`、`en*` ⇒ `en`，`*` 与其他语言落回）→ 缺省 `zh-CN`（**缺省必须还是 `zh-CN`**，是既有契约）。它决定两类**服务端拼装、随响应下发**的文案的语言：
 
-1. **错误响应的 `message`**：响应体仍是 `{ error: { code, message, retryable, details } }`（形状不变）；抛出点显式给了英文（`HttpError` 的 `en`）才在 `en` 下出英文，**没给的地方照旧出中文**（渐进覆盖，不是 bug）。`Error.message` 恒为中文，供日志与审计检索。
+1. **错误响应的 `message`**：响应体仍是 `{ error: { code, message, retryable, details } }`（形状不变）；抛出点显式给了英文（`HttpError` 的 `en`）才在 `en` 下出英文，**没给的地方照旧出中文**（渐进覆盖，不是 bug）。口径说准确些（#803 返修 m7，原来写「`Error.message` 恒为中文」过于绝对）：**带中文原文的抛出点在补上 `en` 之前照旧出中文**，那些抛出点的中文原文是日志与审计检索的依赖、**不许动**；但**上游异常的消息不经谈判**（例：`LlmGatewayError` 由 `portal/src/llm-gateway.js` 抛出、本来就是英文；`portal/src/http.js` 的请求 catch 里也有直接把 `err.message` 发出去的出口，不走文案挑选），所以**不要把「响应里的 `message` 恒为中文」当契约写进客户端**。
 2. **运行时设置的 `label` / `hint`**（见 §4.21）：按 locale 选 `labelEn` / `hintEn`；**只给中文就出中文**。
 
 两类都**不改输出字段名**（前端零改）。谈判在 `portal/src/locale.js`（零依赖纯函数）；错误出口接在 `portal/src/http.js` 的请求 catch（每请求只谈一次），管理台读侧接在 §4.21 的 GET（传请求 locale），**写侧 PUT 的回包与 GET 同一套谈判**（#803 返修 M1）：保存成功回的那个 `item` 会被前端拿去**顶掉表格里的那一行**，恒中文等于「英文页面保存一次，那一行当场变回中文」。恒中文的面不变：**审计台账、`validate()`/校验错误消息**（日志与审计要语言稳定可检索）。

@@ -32,6 +32,8 @@
 //   裸 `Error` 16、`GitHostError` 9、`RuntimeSettingsError` 7、其余零头）。⚠ 为什么不是只盯 `HttpError`：
 //   出口 `pickMessage` 是**通用读 `err.en`** 的，各错误类都能接英文；只盯一类等于「新增一条没翻的
 //   `AdminError` 也不报错」，那就不是闸了。
+//   （上面那串分解是 **S1 收口那一刻**的 407；当前地板是 406——#803 返修 m6 给 `http.js` 的
+//   Content-Type 那处补了 `en:`，`HttpError` 82 → 81。分解仅供估量，**以 `--count` 为准）**。
 //   怎么下降：S2/S3 每给一个抛出点补上**可用**的 `en:`，未双语 -1；把某条确证「不该出英文」并标 `i18n-exempt` 也 -1；
 //   补满 / 标完后归零。**每降一批就同步把下面的 UNBILINGUAL_FLOOR 改成 `--count` 打出的新实测值。**
 //   ⚠ **为什么两个方向都要红**（#803 返修 M2）：只挡「变差」的闸会把「变好」变成**没人再看的债**。
@@ -80,8 +82,9 @@ function hasCjkStringLiteral(text, from, to) {
 
 // 未双语地板（见文件头）：**双向记账**的基准——实测必须**恰好等于**它，高了低了都红。
 // 降覆盖后把它改成新的更小实测值；新增未翻的抛出点则反过来把它改回去（那是要有人负责的回归）。
-// 取 261126 S1 收口时的实测值（`--count` 现取）。
-const UNBILINGUAL_FLOOR = 407;
+// 当前值 406：S1 收口实测 407，#803 返修 m6 给 `http.js` 的 Content-Type 那处补上了可用的 `en:`
+// ⇒ 降 1（`HttpError` 那一档 82 → 81）。取新数：`node scripts/check-message-i18n.mjs --count`。
+const UNBILINGUAL_FLOOR = 406;
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
