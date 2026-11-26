@@ -300,6 +300,15 @@ function jumpToLatest() {
 const foldPanelOpen = ref(false);
 const foldPanelEl = ref<HTMLElement | null>(null);
 watch(() => store.sessionId, () => { foldPanelOpen.value = false; });
+// #816：展开/收起折叠面板会改变 streamEl 的可视高度（面板是它的**兄弟**、不是子节点：`shrink-0` 抢走
+// 一节高度）⇒ 原本贴底的用户，最新内容会被挤出视口，而**没发生滚动** ⇒ `@scroll` 不跑、
+// `showToLatest` 连「↓ 最新」都点不亮。所以开关面板后主动复算一次：仍自动跟随就重新贴底，
+// 否则按真实间距走 `onStreamScroll` 的同一套间距计算（不写第二份）。
+// （注：本 watch 必须放在 `foldPanelOpen` 声明之后 —— `watch(source)` 在 setup 里就地求值，提前写会碰 TDZ。）
+watch(foldPanelOpen, () => nextTick(() => {
+  if (autoFollow.value) scrollDown();
+  else onStreamScroll();
+}));
 
 /**
  * 范围文本（**渲染层**，缺陷 #816①）：lib 只给结构（`foldRange`），措辞在 i18n `workbench.foldBar.range*`。
@@ -341,6 +350,15 @@ const foldBarText = computed(() => {
  * 100%」（有意降级，见 `lib/foldIndex#foldRailNodes`）。
  */
 const foldNodes = computed(() => foldRailNodes(store.sessionFolds, store.sessionCompaction?.lastRound ?? null));
+
+/** 竖串里 active（实心）那一个的下标：「覆盖最远那条」= `to` 等于 `store.foldedThroughRound`（= max(to)）。
+ *  **不是** `foldNodes.length - 1`：后端只按 `from` 升序，末项可以是区间被包住的那条（#816 评审）。
+ *  同 `to` 有多条时只标**第一个**命中的（恰好一颗实心）。 */
+const activeFoldIndex = computed(() => {
+  const target = store.foldedThroughRound;
+  if (target === null) return -1;
+  return foldNodes.value.findIndex((n) => n.fold.to === target);
+});
 
 /** 点竖串节点 ⇒ 打开面板并滚到那一行（**不是**跳到消息流里的对应位置——那是第④步）。
  *  jsdom 不实现 `scrollIntoView` ⇒ 可选调用（真实浏览器才有）。 */
@@ -527,7 +545,7 @@ function onFoldNodeClick(index: number): void {
               type="button"
               data-test="fold-node"
               :data-fold-to="node.fold.to"
-              :data-active="i === foldNodes.length - 1 ? 'true' : 'false'"
+              :data-active="i === activeFoldIndex ? 'true' : 'false'"
               :aria-label="t('workbench.foldBar.nodeAria', { round: node.fold.to })"
               class="group absolute left-1/2 flex h-4 w-4 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full hover:bg-black/5"
               :style="{ top: `${node.topPct}%` }"
@@ -535,9 +553,9 @@ function onFoldNodeClick(index: number): void {
             >
               <!-- 最新那条实心（颜色不是唯一判据：`data-active` 与 data-test 都在），其余空心 -->
               <span
-                :data-test="i === foldNodes.length - 1 ? 'fold-node-active' : 'fold-node-idle'"
+                :data-test="i === activeFoldIndex ? 'fold-node-active' : 'fold-node-idle'"
                 class="block h-2 w-2 rounded-full border border-brand"
-                :class="i === foldNodes.length - 1 ? 'bg-brand' : 'bg-white'"
+                :class="i === activeFoldIndex ? 'bg-brand' : 'bg-white'"
               ></span>
               <!-- hover 卡：纯 CSS（group-hover / group-focus-visible），不跟随鼠标。
                    锚在节点的**左侧**（`right-full`）——竖串贴在会话区右缘，居中展开会把卡片顶出右缘

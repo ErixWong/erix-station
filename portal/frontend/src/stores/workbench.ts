@@ -371,10 +371,27 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   // ⚠ 空态与 `sessionCompaction` 不同：列表的空态就是 `[]`（空列表本身就是完整答案），
   // 所以这里没有「不知道」这一态；渲染侧按 `length > 0` 决定常驻条画不画。
   const sessionFolds = ref<FoldEntry[]>([]);
-  /** 最新的那条折叠（后端按 `from` 升序 ⇒ 末条就是最新的）；无折叠 ⇒ null（不是空对象）。 */
-  const latestFold = computed<FoldEntry | null>(() => sessionFolds.value.at(-1) ?? null);
-  /** 常驻条那个数：「已折叠到第几轮」= 最新折叠的 `to`；无折叠 ⇒ null（不补 0）。 */
-  const foldedThroughRound = computed<number | null>(() => latestFold.value?.to ?? null);
+  /** **覆盖最远**的那条折叠（`to` 最大；并列取 `round` 更大者）——**不是**「按 `from` 升序的末项」：
+   *  后端契约只保证按 `from` 升序，没保证区间不重叠、`to` 单调（`[{from:1,to:20},{from:10,to:15}]`
+   *  是合法输入，末项 to=15 并不覆盖到最远 —— 见 #816 评审）。无折叠 ⇒ null。 */
+  const latestFold = computed<FoldEntry | null>(() => {
+    let best: FoldEntry | null = null;
+    for (const fold of sessionFolds.value) {
+      if (!Number.isSafeInteger(fold.to)) continue;
+      if (best === null || fold.to > best.to || (fold.to === best.to && (fold.round ?? -1) > (best.round ?? -1))) best = fold;
+    }
+    return best;
+  });
+  /** 常驻条那个数：「已折叠到第几轮」= **所有折叠里最大的 `to`**（不是末项的 `to`：
+   *  后端契约只保证按 `from` 升序，没保证区间不重叠、`to` 单调 —— 见 #816 评审）。无折叠 ⇒ null（不补 0）。 */
+  const foldedThroughRound = computed<number | null>(() => {
+    let max: number | null = null;
+    for (const fold of sessionFolds.value) {
+      if (!Number.isSafeInteger(fold.to)) continue;
+      if (max === null || fold.to > max) max = fold.to;
+    }
+    return max;
+  });
   // 试用台账 #10：更早消息历史分页。消息**从未丢**——后端 getSession 早就是 keyset 分页
   // （默认只给最新 20 条），病根是前端从不消费 next_cursor ⇒ 长会话开头永远看不见，
   // 用户误读成「压缩把消息吃了」。olderMessagesCursor = 后端 next_cursor（已加载窗口最老

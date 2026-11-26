@@ -1482,6 +1482,39 @@ describe('issue #189：折叠段 folded 字段与原文懒加载', () => {
     expect(store.sessionFolds).toEqual([]);
   });
 
+  // #816 评审缺陷②：契约只保证「按 `from` 升序 + 同 (from,to) 只留 round 最大」，**没**保证区间不重叠 /
+  // `to` 单调 ⇒ 「末项」不等于「覆盖最远那条」（拿末项会把 20 报成 15）。
+  it('#816 重叠区间（末项不是最远的）⇒ foldedThroughRound/latestFold 取 max(to)，不取 `from` 升序末项', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: {
+              id: 's1',
+              active_run_id: null,
+              // 合法的 `from` 升序形状：第二条被第一条完全包住（to 从 20 降到 15）
+              folds: [
+                { round: 5, from: 1, to: 20, rounds: 20, origin: 'mechanical' },
+                { round: 9, from: 10, to: 15, rounds: 6, origin: 'semantic', title: '## 中途一次小折叠' },
+              ],
+            },
+            messages: [],
+            last_seq: 1,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.sessionFolds.map((f) => f.to)).toEqual([20, 15]); // 两条都在，顺序照后端的 from 升序
+    expect(store.foldedThroughRound).toBe(20); // 常驻条那个数 = max(to)，不是末项的 15
+    expect(store.latestFold?.to).toBe(20); // 覆盖最远那条，不是 at(-1)
+    expect(store.latestFold?.round).toBe(5);
+  });
+
   it('loadFoldedOriginal：200 → loaded(turns)；按 (sessionId, round) 缓存不重发；不同轮各自加载', async () => {
     let calls = 0;
     mockFetch((url) => {

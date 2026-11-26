@@ -809,6 +809,43 @@ describe('WorkbenchView · 折叠常驻条 / 展开面板 / 右侧竖串（issue
     expect(railClasses).toContain('md:block');
   });
 
+  // #816 评审缺陷②：契约只保证 `from` 升序，**没**保证区间不重叠 / `to` 单调
+  // ⇒ 「竖串末项」不等于「覆盖最远那条」，active 不能按 `i === length - 1` 给。
+  it('重叠区间（末项被包住）⇒ active 落在 **to 最大**那条，不是 `from` 升序的末项', async () => {
+    const { wrapper } = await mountWithFolds([
+      { round: 5, from: 1, to: 20, rounds: 20, origin: 'mechanical' },
+      { round: 9, from: 10, to: 15, rounds: 6, origin: 'semantic', title: '## 中途一次小折叠' },
+    ]);
+    const nodes = wrapper.findAll('[data-test="fold-node"]');
+    expect(nodes.map((n) => n.attributes('data-fold-to'))).toEqual(['20', '15']);
+    // 实心恰好一颗（同 to 多条也只标第一个命中的）
+    expect(wrapper.findAll('[data-test="fold-node-active"]')).toHaveLength(1);
+    expect(wrapper.findAll('[data-test="fold-node-idle"]')).toHaveLength(1);
+    // data-test 在圆点 span 上 ⇒ 沿父级 `fold-node` 读它覆盖到哪一轮
+    const active = wrapper.get('[data-test="fold-node-active"]').element.parentElement as HTMLElement;
+    expect(active.getAttribute('data-fold-to'), 'active 必须是覆盖到 20 那条').toBe('20');
+    expect(nodes[0].attributes('data-active')).toBe('true');
+    expect(nodes[1].attributes('data-active')).toBe('false');
+    // 常驻条那个数跟着一起修：也是 max(to)，不是末项的 15
+    expect(wrapper.get('[data-test="fold-bar-text"]').text()).toBe('🗜 已折叠 20 轮');
+  });
+
+  // #816 评审缺陷①：面板是 `streamEl` 的**兄弟**（`shrink-0`）⇒ 展开只改可视高度、**不产生滚动事件**，
+  // 贴底的用户会被顶出视口且 `↓ 最新` 也不会亮 ⇒ 开关面板后必须主动复算一次。
+  it('贴底时展开面板 ⇒ 面板抢走高度后仍重新贴底（没有滚动事件也要复算）', async () => {
+    const { wrapper } = await mountWithFolds();
+    // 面板未展开 ⇒ 第一个 `section > div` 就是 `streamEl`（refs 在展开前抓住，展开后该选择器会先命中面板）
+    const el = wrapper.find('section > div').element as HTMLElement;
+    // jsdom 无布局：只桩三个几何量（scrollHeight/clientHeight 只读 ⇒ defineProperty；scrollTop 直接赋）
+    Object.defineProperty(el, 'scrollHeight', { value: 1000, configurable: true });
+    Object.defineProperty(el, 'clientHeight', { value: 300, configurable: true });
+    el.scrollTop = 700; // 贴底（gap = 1000 - 700 - 300 = 0）⇒ autoFollow 仍为 true
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="fold-panel"]').exists(), '面板真的展开了').toBe(true);
+    expect(el.scrollTop, '展开面板后必须把流重新贴底').toBe(el.scrollHeight);
+  });
+
   it('竖串定位是纯数学：lastRound 拿不到 ⇒ 末条落在 100%；compaction.lastRound=40 ⇒ 整串按 40 轮压上去', async () => {
     const { wrapper, store } = await mountWithFolds();
     expect(topPcts(wrapper)).toEqual([28.6, 57.1, 81, 100]); // to / maxTo(21)
