@@ -569,13 +569,18 @@ function onFoldNodeClick(index: number): void {
             </div>
             <!-- 该行下方那段原文：**同一个组件**（StreamPanel 旧横幅也用它）。`foldRowOriginalState` 在没有
                  展开态、或从未点过（无 state）⇒ undefined ⇒ 整块一个字节都不出。 -->
-            <FoldOriginalTurns
+            <!-- ⚠ `FoldOriginalTurns` 是**多根模板**（loading / missing / loaded / error 各一个根），
+                 Vue 不会把调用处传的 `class` 落到任何一个根上 ⇒ 包裹层必须自己带这些类（评审 nit）。 -->
+            <div
               v-if="foldRowOriginalState(fold)"
-              :state="foldRowOriginalState(fold)!"
-              :fold="fold"
               class="folded-original mb-1 border-l-2 border-black/10 pl-2"
-              @retry="retryFoldOriginal(fold)"
-            />
+            >
+              <FoldOriginalTurns
+                :state="foldRowOriginalState(fold)!"
+                :fold="fold"
+                @retry="retryFoldOriginal(fold)"
+              />
+            </div>
           </template>
         </div>
         <!-- issue #816 右侧竖串与消息流**同一行**：竖串不参与滚动（它是 `relative` 容器 + 节点绝对定位，
