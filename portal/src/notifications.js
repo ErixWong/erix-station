@@ -55,11 +55,11 @@ export function decodeNotificationCursor(cursor) {
   try {
     parsed = JSON.parse(Buffer.from(String(cursor), 'base64url').toString('utf8'));
   } catch {
-    throw new MacroError('validation_failed', 'cursor 无法解析', { details: { field: 'cursor' } });
+    throw new MacroError('validation_failed', 'cursor 无法解析', { details: { field: 'cursor' }, en: 'the cursor cannot be parsed' });
   }
   const at = toInstant('cursor.t', parsed?.t);
   if (!at || typeof parsed.i !== 'string') {
-    throw new MacroError('validation_failed', 'cursor 形状非法', { details: { field: 'cursor' } });
+    throw new MacroError('validation_failed', 'cursor 形状非法', { details: { field: 'cursor' }, en: 'invalid cursor shape' });
   }
   return { createdAt: at, id: parsed.i };
 }
@@ -78,10 +78,10 @@ export async function createNotification(pool, {
   userId, macroRunId = null, severity = 'info', title, body = '', createdAt = new Date(),
 } = {}) {
   if (!NOTIFICATION_SEVERITIES.includes(severity)) {
-    throw new MacroError('validation_failed', 'severity 非法', { details: { field: 'severity', allowed: NOTIFICATION_SEVERITIES } });
+    throw new MacroError('validation_failed', 'severity 非法', { details: { field: 'severity', allowed: NOTIFICATION_SEVERITIES }, en: 'invalid severity' });
   }
   const safeTitle = typeof title === 'string' && title.trim() !== '' ? title.trim() : null;
-  if (!safeTitle) throw new MacroError('validation_failed', 'title 不能为空', { details: { field: 'title' } });
+  if (!safeTitle) throw new MacroError('validation_failed', 'title 不能为空', { details: { field: 'title' }, en: 'title must not be empty' });
   const at = toInstant('createdAt', createdAt) ?? new Date();
   const res = await pool.query(
     `INSERT INTO notifications (id, user_id, macro_run_id, severity, title, body, created_at)
@@ -139,7 +139,7 @@ export async function markRead(pool, { notificationId, userId, now = new Date() 
     [notificationId, userId],
   );
   if (!own.rows[0]) {
-    throw new MacroError('not_found', '通知不存在', { httpStatus: 404, details: { notificationId } });
+    throw new MacroError('not_found', '通知不存在', { httpStatus: 404, details: { notificationId }, en: 'the notification does not exist' });
   }
   return toNotificationSnapshot(own.rows[0]);
 }

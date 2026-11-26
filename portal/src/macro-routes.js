@@ -49,7 +49,7 @@ function toTimeParam(name, raw) {
   if (raw == null || raw === '') return null;
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) {
-    throw new MacroError('validation_failed', `${name} 不是合法时刻`, { details: { field: name } });
+    throw new MacroError('validation_failed', `${name} 不是合法时刻`, { details: { field: name }, en: `${name} is not a valid timestamp` });
   }
   return d;
 }
@@ -83,7 +83,7 @@ export async function userTemplates({ pool }) {
  */
 function requireUserScopeCwd(cwd) {
   if (typeof cwd !== 'string' || cwd.trim() === '') {
-    throw new MacroError('validation_failed', 'cwd 必填（~/projects/<name> 一级目录）', { details: { field: 'cwd' } });
+    throw new MacroError('validation_failed', 'cwd 必填（~/projects/<name> 一级目录）', { details: { field: 'cwd' }, en: 'cwd is required (a top-level directory under ~/projects/<name>)' });
   }
   return validateSessionCwd(cwd.trim());
 }
@@ -109,7 +109,7 @@ export async function userAssignments({ pool, userId }) {
 export async function putUserAssignment({ pool, userId, body = {} }) {
   const templateId = body?.templateId;
   if (typeof templateId !== 'string' || !templateId) {
-    throw new MacroError('validation_failed', 'templateId 必填', { details: { field: 'templateId' } });
+    throw new MacroError('validation_failed', 'templateId 必填', { details: { field: 'templateId' }, en: 'templateId is required' });
   }
   const cwd = requireUserScopeCwd(body?.cwd);
   const assignment = await assignTemplate(pool, { templateId, userId, sessionId: null, cwd, until: body?.until ?? null });
@@ -133,7 +133,7 @@ export async function putAssignment({ pool, sessionId, userId, body = {} }) {
   await fetchSession(pool, sessionId, userId);
   const templateId = body?.templateId;
   if (typeof templateId !== 'string' || !templateId) {
-    throw new MacroError('validation_failed', 'templateId 必填', { details: { field: 'templateId' } });
+    throw new MacroError('validation_failed', 'templateId 必填', { details: { field: 'templateId' }, en: 'templateId is required' });
   }
   // scope='user' 的模板不该从会话入口订（会把它误写成 session 语义）——`assignTemplate` 会 400，
   // 但那要等查完模板；这里先给闸，错误里带上 scope 便于前端提示。
@@ -290,7 +290,7 @@ export async function adminCreateTemplate({ pool, body = {}, adminUserId }) {
 export async function adminPatchTemplate({ pool, templateId, body = {} }) {
   for (const forbidden of ['kind', 'scope']) {
     if (body && forbidden in body) {
-      throw new MacroError('validation_failed', `${forbidden} 不可修改`, { details: { field: forbidden } });
+      throw new MacroError('validation_failed', `${forbidden} 不可修改`, { details: { field: forbidden }, en: `${forbidden} cannot be modified` });
     }
   }
   const template = await updateTemplate(pool, { templateId, patch: body ?? {} });
@@ -388,7 +388,7 @@ export async function adminMacroRunDetail({ pool, runId }) {
     [runId],
   );
   const row = res.rows[0];
-  if (!row) throw new MacroError('not_found', '执行记录不存在', { httpStatus: 404, details: { runId } });
+  if (!row) throw new MacroError('not_found', '执行记录不存在', { httpStatus: 404, details: { runId }, en: 'the run does not exist' });
   return { run: toAdminRunItem(row) };
 }
 

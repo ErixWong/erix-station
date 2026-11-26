@@ -60,13 +60,13 @@ export { KIND_SCOPE, KIND_SCHEMA };
  */
 export function validateKindParams(kind, params) {
   const schema = KIND_SCHEMA[kind];
-  if (!schema) throw new MacroError('validation_failed', `未知 kind: ${kind}`, { details: { field: 'kind' } });
+  if (!schema) throw new MacroError('validation_failed', `未知 kind: ${kind}`, { details: { field: 'kind' }, en: `unknown kind: ${kind}` });
   if (params === null || typeof params !== 'object' || Array.isArray(params)) {
-    throw new MacroError('validation_failed', 'params 必须是对象', { details: { field: 'params' } });
+    throw new MacroError('validation_failed', 'params 必须是对象', { details: { field: 'params' }, en: 'params must be an object' });
   }
   for (const key of Object.keys(params)) {
     if (!(key in schema)) {
-      throw new MacroError('validation_failed', `${kind} 不认识参数 ${key}`, { details: { field: `params.${key}` } });
+      throw new MacroError('validation_failed', `${kind} 不认识参数 ${key}`, { details: { field: `params.${key}` }, en: `${kind} does not recognize the parameter ${key}` });
     }
   }
   const filled = { ...params };
@@ -74,7 +74,7 @@ export function validateKindParams(kind, params) {
     let value = filled[key];
     if (value === undefined) {
       if (rule.required) {
-        throw new MacroError('validation_failed', `${kind} 缺少必填参数 ${key}`, { details: { field: `params.${key}` } });
+        throw new MacroError('validation_failed', `${kind} 缺少必填参数 ${key}`, { details: { field: `params.${key}` }, en: `${kind} is missing the required parameter ${key}` });
       }
       if (!('default' in rule)) continue;
       // 数组默认值必须**拷一份**：否则调用方一 `push`/`sort` 就改到了共享的 schema 常量上。
@@ -84,42 +84,42 @@ export function validateKindParams(kind, params) {
     const where = { field: `params.${key}` };
     if (rule.type === 'enum') {
       if (!rule.values.includes(value)) {
-        throw new MacroError('validation_failed', `${key} 取值必须是 ${rule.values.join('/')}`, { details: where });
+        throw new MacroError('validation_failed', `${key} 取值必须是 ${rule.values.join('/')}`, { details: where, en: `${key} must be one of ${rule.values.join('/')}` });
       }
     } else if (rule.type === 'enum[]') {
       if (!Array.isArray(value) || value.some((v) => !rule.values.includes(v))) {
-        throw new MacroError('validation_failed', `${key} 必须是 ${rule.values.join('/')} 的子集`, { details: where });
+        throw new MacroError('validation_failed', `${key} 必须是 ${rule.values.join('/')} 的子集`, { details: where, en: `${key} must be a subset of ${rule.values.join('/')}` });
       }
     } else if (rule.type === 'int') {
-      if (!Number.isInteger(value)) throw new MacroError('validation_failed', `${key} 必须是整数`, { details: where });
+      if (!Number.isInteger(value)) throw new MacroError('validation_failed', `${key} 必须是整数`, { details: where, en: `${key} must be an integer` });
       if (rule.values && !rule.values.includes(value)) {
-        throw new MacroError('validation_failed', `${key} 只能是 ${rule.values.join('/')}`, { details: where });
+        throw new MacroError('validation_failed', `${key} 只能是 ${rule.values.join('/')}`, { details: where, en: `${key} can only be one of ${rule.values.join('/')}` });
       }
       if (rule.min !== undefined && value < rule.min) throw new MacroError('validation_failed', `${key} < ${rule.min}`, { details: where });
       if (rule.max !== undefined && value > rule.max) throw new MacroError('validation_failed', `${key} > ${rule.max}`, { details: where });
     } else if (rule.type === 'duration') {
       if (typeof value !== 'string' || !DURATION_RE.test(value)) {
-        throw new MacroError('validation_failed', `${key} 必须是 Ns/Nm/Nh 形态`, { details: where });
+        throw new MacroError('validation_failed', `${key} 必须是 Ns/Nm/Nh 形态`, { details: where, en: `${key} must be in the form Ns/Nm/Nh` });
       }
     } else if (rule.type === 'time') {
       if (typeof value !== 'string' || !TIME_RE.test(value)) {
-        throw new MacroError('validation_failed', `${key} 必须是 HH:MM（UTC+8）`, { details: where });
+        throw new MacroError('validation_failed', `${key} 必须是 HH:MM（UTC+8）`, { details: where, en: `${key} must be HH:MM (UTC+8)` });
       }
     } else if (rule.type === 'quiet_window') {
       // 形态：`"HH:MM-HH:MM"`（UTC+8）或 `"off"`；语义（跨午夜/默认）在 `macro-eval.js`。
       if (typeof value !== 'string' || !QUIET_WINDOW_RE.test(value)) {
-        throw new MacroError('validation_failed', `${key} 必须是 HH:MM-HH:MM（UTC+8）或 'off'`, { details: where });
+        throw new MacroError('validation_failed', `${key} 必须是 HH:MM-HH:MM（UTC+8）或 'off'`, { details: where, en: `${key} must be HH:MM-HH:MM (UTC+8) or 'off'` });
       }
     } else if (rule.type === 'path') {
       if (typeof value !== 'string' || value.length === 0 || value.includes('..')) {
-        throw new MacroError('validation_failed', `${key} 必须是非空路径且不许含 ..`, { details: where });
+        throw new MacroError('validation_failed', `${key} 必须是非空路径且不许含 ..`, { details: where, en: `${key} must be a non-empty path and must not contain ..` });
       }
     } else if (rule.type === 'text') {
       if (typeof value !== 'string' || value.length === 0) {
-        throw new MacroError('validation_failed', `${key} 必须是非空字符串`, { details: where });
+        throw new MacroError('validation_failed', `${key} 必须是非空字符串`, { details: where, en: `${key} must be a non-empty string` });
       }
       if (rule.max !== undefined && value.length > rule.max) {
-        throw new MacroError('validation_failed', `${key} 超过 ${rule.max} 字`, { details: where });
+        throw new MacroError('validation_failed', `${key} 超过 ${rule.max} 字`, { details: where, en: `${key} exceeds the limit of ${rule.max} characters` });
       }
     }
   }
@@ -148,11 +148,14 @@ const NOTIFICATION_RUN_REF_COLUMN = 'macro_run_id';
 
 /** 与 `SessionError` / `DelegationError` 同形的错误载体（`http.js` 顶层统一映射到标准错误信封）。 */
 export class MacroError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 F 片：可选英文对（同 InternalError/AdminError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 MacroError 分支按请求 locale 经 pickMessage 读 `err.en`，缺省照旧出中文——错误体形状与 message 一字不动。
+    this.en = en;
   }
 }
 
@@ -160,12 +163,12 @@ export class MacroError extends Error {
 export function validateMacroEnum(field, value, allowed, { nullable = false } = {}) {
   if (value === null || value === undefined) {
     if (nullable) return null;
-    throw new MacroError('validation_failed', `${field} 必填`, { details: { field } });
+    throw new MacroError('validation_failed', `${field} 必填`, { details: { field }, en: `${field} is required` });
   }
   if (!allowed.includes(value)) {
     throw new MacroError('validation_failed',
       `${field} 必须是 ${allowed.map((v) => `'${v}'`).join(' / ')}，收到 ${JSON.stringify(value)}`,
-      { details: { field, allowed, received: value } });
+      { details: { field, allowed, received: value }, en: `${field} must be one of ${allowed.map((v) => `'${v}'`).join(' / ')}, received ${JSON.stringify(value)}` });
   }
   return value;
 }
@@ -177,10 +180,10 @@ export const validateMacroCriterion = (criterion) => validateMacroEnum('criterio
 /** 非空字符串（`name` / `anchor` / `bucket` 都用它：空串进幂等键会让整桶塌成一行）。 */
 function requireText(field, value, { max = 512 } = {}) {
   if (typeof value !== 'string' || value.trim() === '') {
-    throw new MacroError('validation_failed', `${field} 必须是非空字符串`, { details: { field } });
+    throw new MacroError('validation_failed', `${field} 必须是非空字符串`, { details: { field }, en: `${field} must be a non-empty string` });
   }
   if (value.length > max) {
-    throw new MacroError('validation_failed', `${field} 超长（>${max}）`, { details: { field } });
+    throw new MacroError('validation_failed', `${field} 超长（>${max}）`, { details: { field }, en: `${field} is too long (over the limit of ${max} characters)` });
   }
   return value.trim();
 }
@@ -190,7 +193,7 @@ export function toInstant(field, value) {
   if (value === null || value === undefined) return null;
   const d = value instanceof Date ? value : (typeof value === 'number' ? new Date(value) : new Date(String(value)));
   if (Number.isNaN(d.getTime())) {
-    throw new MacroError('validation_failed', `${field} 不是合法时刻`, { details: { field, received: value } });
+    throw new MacroError('validation_failed', `${field} 不是合法时刻`, { details: { field, received: value }, en: `${field} is not a valid timestamp` });
   }
   return d;
 }
@@ -312,7 +315,7 @@ export async function getTemplate(pool, { templateId, includeDeleted = false } =
     [templateId],
   );
   const row = res.rows[0];
-  if (!row) throw new MacroError('not_found', '模板不存在', { httpStatus: 404, details: { templateId } });
+  if (!row) throw new MacroError('not_found', '模板不存在', { httpStatus: 404, details: { templateId }, en: 'template does not exist' });
   return toTemplateSnapshot(row);
 }
 
@@ -328,7 +331,7 @@ export async function createTemplate(pool, {
   // `07` §1.3：scope 与 kind 的配对是固定的，不许自由组合
   if (KIND_SCOPE[safeKind] !== safeScope) {
     throw new MacroError('validation_failed',
-      `${safeKind} 的 scope 必须是 ${KIND_SCOPE[safeKind]}`, { details: { field: 'scope' } });
+      `${safeKind} 的 scope 必须是 ${KIND_SCOPE[safeKind]}`, { details: { field: 'scope' }, en: `the scope for ${safeKind} must be ${KIND_SCOPE[safeKind]}` });
   }
   // ⚠ 必须用**返回值**入库（#625）：`validateKindParams` 会把 schema 的 `default` 补进来，
   //   只调用不接返回值 = 默认值补了又丢，库里仍是 `{}`。
@@ -365,7 +368,7 @@ export async function updateTemplate(pool, { templateId, patch = {}, now = new D
       // 所以下面补齐的只是「本次 patch 没写的可缺字段」，不会静默改掉用户显式写的值。
       if (existingKind) value = validateKindParams(existingKind, value);
       else if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-        throw new MacroError('validation_failed', 'params 必须是对象', { details: { field: 'params' } });
+        throw new MacroError('validation_failed', 'params 必须是对象', { details: { field: 'params' }, en: 'params must be an object' });
       }
       params.push(JSON.stringify(value));
       sets.push(`params = $${params.length}::jsonb`);
@@ -374,7 +377,7 @@ export async function updateTemplate(pool, { templateId, patch = {}, now = new D
     params.push(value);
     sets.push(`${column} = $${params.length}`);
   }
-  if (!sets.length) throw new MacroError('validation_failed', 'patch 里没有任何可改字段', { details: { patch } });
+  if (!sets.length) throw new MacroError('validation_failed', 'patch 里没有任何可改字段', { details: { patch }, en: 'the patch contains no editable fields' });
   params.push(toInstant('now', now) ?? new Date());
   const res = await pool.query(
     `UPDATE macro_templates SET ${sets.join(', ')}, updated_at = $${params.length}
@@ -383,7 +386,7 @@ export async function updateTemplate(pool, { templateId, patch = {}, now = new D
     params,
   );
   const row = res.rows[0];
-  if (!row) throw new MacroError('not_found', '模板不存在或已删除', { httpStatus: 404, details: { templateId } });
+  if (!row) throw new MacroError('not_found', '模板不存在或已删除', { httpStatus: 404, details: { templateId }, en: 'template does not exist or has been deleted' });
   return toTemplateSnapshot(row);
 }
 
@@ -451,7 +454,7 @@ export async function deleteTemplate(pool, { templateId, now = new Date() } = {}
     const row = t.rows[0];
     if (!row) {
       await client.query('ROLLBACK');
-      throw new MacroError('not_found', '模板不存在', { httpStatus: 404, details: { templateId } });
+      throw new MacroError('not_found', '模板不存在', { httpStatus: 404, details: { templateId }, en: 'template does not exist' });
     }
     if (row.deleted_at) {
       await client.query('COMMIT');
@@ -579,19 +582,19 @@ export async function assignTemplate(pool, {
 } = {}) {
   const template = await getTemplate(pool, { templateId });
   if (template.audience === 'admin' && !isAdmin) {
-    throw new MacroError('forbidden', '该模板仅管理员可订阅', { httpStatus: 403, details: { templateId } });
+    throw new MacroError('forbidden', '该模板仅管理员可订阅', { httpStatus: 403, details: { templateId }, en: 'only administrators can subscribe to this template' });
   }
   const safeSessionId = sessionId ?? null;
   if (template.scope === 'session' && !safeSessionId) {
     throw new MacroError('validation_failed', '该模板的 scope=session，必须给 session_id',
-      { details: { field: 'sessionId', scope: template.scope } });
+      { details: { field: 'sessionId', scope: template.scope }, en: 'the scope of this template is session; session_id is required' });
   }
   if (template.scope === 'user' && safeSessionId) {
     throw new MacroError('validation_failed', '该模板的 scope=user，不能给 session_id',
-      { details: { field: 'sessionId', scope: template.scope } });
+      { details: { field: 'sessionId', scope: template.scope }, en: 'the scope of this template is user; session_id must not be provided' });
   }
   if (!template.enabled) {
-    throw new MacroError('conflict', '模板已停用，不能订阅', { httpStatus: 409, details: { templateId } });
+    throw new MacroError('conflict', '模板已停用，不能订阅', { httpStatus: 409, details: { templateId }, en: 'the template is disabled and cannot be subscribed' });
   }
   const safeCwd = cwd === null || cwd === undefined ? null : requireText('cwd', cwd, { max: 1024 });
   const safeUntil = toInstant('until', until);
@@ -623,7 +626,7 @@ export async function unassignTemplate(pool, { assignmentId, userId = null, now 
     const row = a.rows[0];
     if (!row || (userId && row.user_id !== userId)) {
       await client.query('ROLLBACK');
-      throw new MacroError('not_found', '订阅不存在', { httpStatus: 404, details: { assignmentId } });
+      throw new MacroError('not_found', '订阅不存在', { httpStatus: 404, details: { assignmentId }, en: 'the subscription does not exist' });
     }
     const cnt = await client.query(
       'SELECT COUNT(*)::bigint AS n FROM macro_runs WHERE assignment_id = $1', [assignmentId],
@@ -678,7 +681,7 @@ export async function claimMacroRun(pool, {
   const safeAnchor = requireText('anchor', anchor, { max: 512 });
   const safeBucket = requireText('bucket', bucket, { max: 256 });
   const safeDepth = Number.isInteger(depth) ? depth : 0;
-  if (safeDepth < 0) throw new MacroError('validation_failed', 'depth 不能为负', { details: { field: 'depth' } });
+  if (safeDepth < 0) throw new MacroError('validation_failed', 'depth 不能为负', { details: { field: 'depth' }, en: 'depth must not be negative' });
   const safeWorktree = worktreePath === null || worktreePath === undefined
     ? null : requireText('worktree_path', worktreePath, { max: 1024 });
   const at = toInstant('now', now) ?? new Date();
@@ -715,7 +718,7 @@ export async function claimMacroRun(pool, {
   } catch (e) {
     // 23503 = 订阅不存在（FK）；23514 = CHECK 漂了。都翻成可读错误，别让 W2 看到裸 pg 码。
     if (e?.code === '23503') {
-      throw new MacroError('not_found', '订阅不存在，无法记账', { httpStatus: 404, details: { assignmentId } });
+      throw new MacroError('not_found', '订阅不存在，无法记账', { httpStatus: 404, details: { assignmentId }, en: 'the subscription does not exist; cannot record the run' });
     }
     throw e;
   }
@@ -751,7 +754,7 @@ export async function finishMacroRun(pool, {
   // 会让「显式传 null」绕过这道闸，把空原因的 skipped 落库（DB CHECK 允许 NULL）。
   if (safeStatus === 'skipped' && !safeSkipped) {
     throw new MacroError('validation_failed', "status='skipped' 必须给 skipped_reason",
-      { details: { field: 'skipped_reason', allowed: MACRO_SKIPPED_REASONS } });
+      { details: { field: 'skipped_reason', allowed: MACRO_SKIPPED_REASONS }, en: `status='skipped' requires skipped_reason` });
   }
   const terminal = MACRO_RUN_TERMINAL_STATUSES.includes(safeStatus);
   const params = [macroRunId, safeStatus];
@@ -784,9 +787,9 @@ export async function finishMacroRun(pool, {
     if (exists.rows[0]) {
       throw new MacroError('conflict',
         `执行记录已是终态 ${exists.rows[0].status}，不许回退成 ${safeStatus}`,
-        { httpStatus: 409, details: { macroRunId, current: exists.rows[0].status, attempted: safeStatus } });
+        { httpStatus: 409, details: { macroRunId, current: exists.rows[0].status, attempted: safeStatus }, en: `the run is already in the terminal state ${exists.rows[0].status} and cannot be reverted to ${safeStatus}` });
     }
-    throw new MacroError('not_found', '执行记录不存在', { httpStatus: 404, details: { macroRunId } });
+    throw new MacroError('not_found', '执行记录不存在', { httpStatus: 404, details: { macroRunId }, en: 'the run does not exist' });
   }
   return toMacroRunSnapshot(row);
 }
@@ -805,11 +808,11 @@ export function decodeMacroRunCursor(cursor) {
   try {
     parsed = JSON.parse(Buffer.from(String(cursor), 'base64url').toString('utf8'));
   } catch {
-    throw new MacroError('validation_failed', 'cursor 无法解析', { details: { field: 'cursor' } });
+    throw new MacroError('validation_failed', 'cursor 无法解析', { details: { field: 'cursor' }, en: 'the cursor cannot be parsed' });
   }
   const at = toInstant('cursor.t', parsed?.t);
   if (!at || typeof parsed.i !== 'string') {
-    throw new MacroError('validation_failed', 'cursor 形状非法', { details: { field: 'cursor' } });
+    throw new MacroError('validation_failed', 'cursor 形状非法', { details: { field: 'cursor' }, en: 'invalid cursor shape' });
   }
   return { startedAt: at, id: parsed.i };
 }

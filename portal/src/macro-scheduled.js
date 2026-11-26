@@ -164,10 +164,10 @@ export async function executeScheduledIntent(pool, intent, {
   const macroRunId = intent?.macroRunId;
   if (!macroRunId) {
     throw new MacroError('validation_failed', 'macroRunId 必填（W7 只 finish 不 claim）',
-      { details: { field: 'macroRunId' } });
+      { details: { field: 'macroRunId' }, en: 'macroRunId is required (W7 only finishes, it does not claim)' });
   }
   if (typeof runTask !== 'function') {
-    throw new MacroError('validation_failed', 'runTask 必填（生产=真跑，测试=桩 runner）');
+    throw new MacroError('validation_failed', 'runTask 必填（生产=真跑，测试=桩 runner）', { en: 'runTask is required (production runs for real, tests use a stub runner)' });
   }
   const userId = intent.userId;
   const templateName = intent.templateName;
