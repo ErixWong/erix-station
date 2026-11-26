@@ -39,8 +39,13 @@ function select(value: AppLocale) {
 /**
  * #828：把用户面/管理台的顶栏语言切换回写到 `PATCH /api/me/locale`。
  *
- * 只在已登录时发（未登录/登录页不发，否则会刷一片 401）；**失败静默**：界面已经切过去了，
- * 这不是用户能在界面上修的东西，不弹红条、不打断切换。无 pinia（如纯组件测试）⇒ 当作未登录，不发。
+ * 两种就绪状态分开处理：
+ * - **已登录**（`auth.user` 存在）：直接发 PATCH。**失败静默**：界面已经切过去了，
+ *   这不是用户能在界面上修的东西，不弹红条、不打断切换。无 pinia（如纯组件测试）⇒ 当作未就绪，不发。
+ * - **未就绪**（`auth.user` 为 `null`）：照旧**不发**（登录页 / 刚导航到另一个 origin 后 pinia
+ *   的 `/api/me` 探测还没回来时发只会刷 401），但把这次选择记进 `pendingLocaleWrite`，等会话
+ *   就绪后由 store 的 `flushPendingLocale()` 补发一次。不记就会把选择丢在 cookie 里、账号里留着过期值
+ *   （#828 真机腿抓的回写丢失缺陷）。
  */
 async function syncAccountLocale(value: AppLocale): Promise<void> {
   let auth: ReturnType<typeof useAuthStore>;
@@ -49,7 +54,11 @@ async function syncAccountLocale(value: AppLocale): Promise<void> {
   } catch {
     return; // 无激活的 pinia（登录页以外的挂载形式）⇒ 不发
   }
-  if (!auth.user) return; // 未登录不发
+  if (!auth.user) {
+    // 未就绪：不发（登录页不该发），但记下这次选择，等 /api/me 回来补发（缺陷①的补链）。
+    auth.pendingLocaleWrite = value;
+    return;
+  }
   try {
     await api('/api/me/locale', { method: 'PATCH', body: JSON.stringify({ locale: value }) });
   } catch {

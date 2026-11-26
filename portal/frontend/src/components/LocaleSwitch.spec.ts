@@ -185,5 +185,39 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
     expect(calls).toHaveLength(0);
     expect(i18n.global.locale.value).toBe('en'); // 本地切换照常生效
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
+    // #828 缺陷①：未就绪时不发，但这次选择不能丢——必须记进 pendingLocaleWrite 等补发。
+    expect(useAuthStore().pendingLocaleWrite).toBe('en');
+  });
+
+  it('未就绪点 English ⇒ 不发；/api/me 回来后补发一次 PATCH body {"locale":"en"}（缺陷①的钉子）', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const auth = useAuthStore();
+    auth.user = null; // 未就绪（导航后 pinia 的 /api/me 探测还没回）
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      calls.push({ url, init });
+      // /api/me 回来带一个与待补发值不同的过期账号值（zh-CN）；PATCH 一律 200。
+      if (url === '/api/me') {
+        return new Response(JSON.stringify({ user: { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local', locale: 'zh-CN' } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    const w = mount(LocaleSwitch, { global: { plugins: [pinia, i18n] } });
+
+    await pick(w, 'English');
+    await flushPromises();
+    expect(calls.filter((c) => c.url === '/api/me/locale')).toHaveLength(0); // 未就绪：一个回写都不发
+    expect(auth.pendingLocaleWrite).toBe('en'); // 选择被记下，没丢
+
+    await auth.ensureMe(); // /api/me 回来 ⇒ 会话就绪
+    await flushPromises();
+    const patch = calls.filter((c) => c.url === '/api/me/locale');
+    expect(patch).toHaveLength(1); // 只补发一次
+    expect(patch[0].init?.method).toBe('PATCH');
+    expect(JSON.parse(String(patch[0].init?.body))).toEqual({ locale: 'en' });
+    expect(auth.pendingLocaleWrite).toBeNull(); // 补发后清空
   });
 });

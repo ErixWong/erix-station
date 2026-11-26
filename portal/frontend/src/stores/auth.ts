@@ -11,7 +11,8 @@ import { seatAwareLanding } from '../lib/workbenchGate';
 // issue #431：「本轮用户结束」的应用级信号（接回工作台认领，详见 lib/userScope.ts）。
 import { notifyUserScopeReset } from '../lib/userScope';
 // #449：非组件上下文取词（与 workbench store 同一口径：i18n.global.t，随 locale 响应式取值）。
-import { i18n, isAppLocale, setLocale } from '../i18n';
+// #828：`hasLocalLocalePreference` 是「本地有没有表过态」的唯一判据（见下方 `applyAccountLocale`）。
+import { i18n, isAppLocale, setLocale, hasLocalLocalePreference, type AppLocale } from '../i18n';
 
 export interface AuthUser {
   id: string;
@@ -196,14 +197,20 @@ export function afterLoginRoute(user: AuthUser | null | undefined): string {
 /**
  * issue #828：登录后把账号上存的 `locale` 应用到界面（写 cookie + localStorage + 切 UI，全走 `setLocale`）。
  *
- * 只在两个条件同时成立时才切：① 账号确实设过（`locale` 非 `null` 且是受支持的 locale）；
- * ② 与当前界面语言不同。**比对当前值这一步不能省**：`setLocale` 会写 cookie，若无条件调用，
- * 「写 cookie → 再拉 /api/me」会来回打转。`null`（没设过）⇒ 什么都不做：行为与今天逐字一致
- * （cookie → localStorage → 浏览器语言 → zh-CN）。
+ * **优先级（新语义）**：本地已表过态就不抢。只有当**同站 cookie 与 localStorage 都没有受支持的
+ * 合法值**时才应用账号值。语义：账号值是「这台浏览器/设备第一次见面时的种子」，不是「压过本地
+ * 选择的主人」——**换设备 / 清站点数据时账号值生效；同一浏览器里用户点过语言开关之后，本地值说话**。
+ * 否则就会出现「用户刚在用户面选了中文，一刷新又被过期账号值顶成英文」（#828 真机腿抓出的优先级错）。
+ *
+ * 应用仍需两个条件同时成立：① 账号确实设过（`locale` 非 `null` 且是受支持的 locale）；
+ * ② 本地没表过态（`hasLocalLocalePreference()` 为 false）。再叠一层「与当前界面语言不同才切」：
+ * `setLocale` 会写 cookie，若无条件调用，「写 cookie → 再拉 /api/me」会来回打转。
+ * `null`（没设过）⇒ 什么都不做：行为与今天逐字一致（cookie → localStorage → 浏览器语言 → zh-CN）。
  */
 function applyAccountLocale(user: AuthUser | null | undefined): void {
   const next = user?.locale;
   if (!isAppLocale(next)) return; // null / 缺键 / 脏值：不碰现有优先级
+  if (hasLocalLocalePreference()) return; // 本地已表过态：账号值是初次见面的种子，不压本地选择
   if (next === i18n.global.locale.value) return; // 与当前一致：不重写，防打转
   setLocale(next);
 }
@@ -250,6 +257,13 @@ export const useAuthStore = defineStore('auth', {
     cooldownSeconds: 0,
     // me 探测是否已完成（全局守卫据此决定跳不跳 /login，避免每次导航都打 /api/me）。
     ready: false,
+    /**
+     * #828：会话未就绪（`user` 还是 `null`）时用户在顶栏点了语言、当时**不能**发回写而存下
+     * 的选择。导航到另一个 origin 后立刻点语言 ⇒ pinia 的 `/api/me` 探测还没回 ⇒ `user` 为 null
+     * ⇒ 直接发会刷 401，不发又会把过期值留在账号里。这里先记下，等 `/api/me` 回来（或登录成功）
+     * 后由 `flushPendingLocale()` 补发一次。`null` = 没有待补发的选择。
+     */
+    pendingLocaleWrite: null as AppLocale | null,
     loading: false,
     error: null as string | null,
     /**
@@ -272,6 +286,7 @@ export const useAuthStore = defineStore('auth', {
         this.passwordChangeRequired = me.user?.must_change_password === true;
         // #828：账号语言偏好（非 null 且与当前不同才应用；null 什么都不做）。
         applyAccountLocale(me.user);
+        void this.flushPendingLocale(); // #828：会话就绪 ⇒ 补发未就绪时被丢弃的语言回写（若有）
       } catch (err) {
         if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
           this.user = null; // 未登录：守卫负责跳转
@@ -294,8 +309,35 @@ export const useAuthStore = defineStore('auth', {
       this.user = me.user;
       this.passwordChangeRequired = me.user?.must_change_password === true;
       applyAccountLocale(me.user); // #828：同 ensureMe，取到真实 user 后顺手应用账号语言
+      void this.flushPendingLocale(); // #828：拿到真实 user 后补发未就绪时被丢弃的语言回写（若有）
       this.ready = true;
       return me.user;
+    },
+
+    /**
+     * #828：会话就绪后补发被丢弃的语言回写。
+     *
+     * 顶栏语言切换在 `user` 还没就绪时不会发 `PATCH /api/me/locale`（登录页也不该发，否则刷 401），
+     * 只把选择记进 `pendingLocaleWrite`。这里在**拿到真实 user 之后**（`ensureMe` / `refreshMe` /
+     * 三条登录路径都调它）补发一次。三条口径：① 没有 pending 直接返回；② 只在 pending 与账号
+     * 当前值**不同**时才发（相同就是无事可做，顺手清掉，别打转）；③ **失败静默**——界面在点语言那
+     * 一刻已经切过去了，补发只是把账号里那份过期值纠正回来，不是用户能在界面上修的东西。
+     */
+    async flushPendingLocale(): Promise<void> {
+      const pending = this.pendingLocaleWrite;
+      if (!pending) return;
+      if (!this.user) return; // 还没拿到 user：留着，等有 user 的那次再补
+      if (this.user.locale === pending) {
+        this.pendingLocaleWrite = null; // 账号已是这个值：无事可做，不发（防打转）
+        return;
+      }
+      this.pendingLocaleWrite = null; // 先清，避免并发/重复补发
+      try {
+        await api('/api/me/locale', { method: 'PATCH', body: JSON.stringify({ locale: pending }) });
+        this.user = { ...this.user, locale: pending }; // 本地同步账号值，下次比较不再误判
+      } catch {
+        /* 静默：界面已切，补发失败不弹窗 */
+      }
     },
 
     /**
@@ -320,6 +362,7 @@ export const useAuthStore = defineStore('auth', {
           // #255：cookie 落下的这一刻就知道受限（§2.2），不等「先碰一个 403 再猜」。
           this.passwordChangeRequired = data.password_change_required === true;
           applyAccountLocale(data.user); // #828：登录成功即应用账号语言（null ⇒ 不动）
+          void this.flushPendingLocale(); // #828：登录建会话后补发未就绪时被丢弃的语言回写（若有）
         } else if (data.status === 'email_code_required') {
           // #449（§2.2）：邮箱验证码第二步。本响应**不带**受限旗标（还没会话，§2.3a 的成功响应才带）。
           this.pendingToken = data.pending_token ?? null;
@@ -395,6 +438,7 @@ export const useAuthStore = defineStore('auth', {
         // §2.3：第二步才是本分支真正发会话的地方 ⇒ 受限旗标在这里带出去（口径与 §2.2 一致）。
         this.passwordChangeRequired = body.password_change_required === true;
         applyAccountLocale(body.user); // #828：TOTP 第二步建会话后应用账号语言
+        void this.flushPendingLocale(); // #828：建会话后补发未就绪时被丢弃的语言回写（若有）
       } catch (err) {
         // #449：pending 过期/已用 ⇒ 第二步不可能再成功，回第一步（文案仍是服务端原文，TOTP 路径一字不改）。
         if (isPendingExpired(err)) this.resetPendingLogin();
@@ -422,6 +466,7 @@ export const useAuthStore = defineStore('auth', {
         // §2.3a：与 §2.3 同口径——第二步才是真正发会话的地方，受限旗标在这里带出去。
         this.passwordChangeRequired = body.password_change_required === true;
         applyAccountLocale(body.user); // #828：邮箱码第二步建会话后应用账号语言
+        void this.flushPendingLocale(); // #828：建会话后补发未就绪时被丢弃的语言回写（若有）
       } catch (err) {
         if (isPendingExpired(err)) {
           // pending 没了（过期/已消费）⇒ 第二步不可能再成功：清干净回第一步，并说清为什么。

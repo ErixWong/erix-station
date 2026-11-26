@@ -42,6 +42,11 @@ const BASE = (process.env.E2E_BASE || process.env.E2E_UI_BASE || 'https://admin.
 const USER_BASE = (process.env.E2E_USER_BASE || 'https://station.fde.erix.vip:8443')
   .replace(/\/$/, '');
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
+/**
+ * #828 收尾：脚本可能碰到的**非管理员**账号（与同目录 `llm-usage-e2e.mjs` 的 `E2E_FDE_LOGIN` 同名同默认）。
+ * 收尾时与 `ADMIN_LOGIN` 一起把 `users.locale` 恢复成 `null`（本腿经 UI 的 PATCH 会真改 DB 里的账号语言值）。
+ */
+const SCRIPT_LOGIN = process.env.E2E_FDE_LOGIN || 'agent01';
 // 凭据目录口径（AGENTS §4）：用户配置目录下 mcp/creds 里的 dev 口令文件（新路径优先、旧路径兜底）。
 // env 点名只信 env。
 const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
@@ -59,6 +64,8 @@ const UI_ENABLED = process.env.E2E_UI === '1';
 const UI_SOFT = process.env.E2E_UI_SOFT === '1';
 const PW_CONTAINER = process.env.PLAYWRIGHT_CONTAINER || 'erix_station_playwright';
 const PW_MODULE = '/app/node_modules/playwright/index.mjs';
+/** dev 栈的 Postgres 容器名（与同目录各 wpN/db 集成脚本同名同默认）；#828 收尾恢复账号语言值要用。 */
+const STATION_DB_NAME = process.env.STATION_DB_NAME || 'station-db';
 /**
  * 截图：宿主与容器是**两套文件系统**，同一个路径名在容器里未必存在（`/docker/<容器名>/` 是宿主
  * 侧给 vision 读的路，容器内没有那棵树 ⇒ `page.screenshot()` 直接 ENOENT）。
@@ -126,6 +133,50 @@ function containerRunning(name) {
   try {
     return dockerRun(`inspect -f "{{.State.Running}}" ${name}`, { timeout: 20_000 }).trim() === 'true';
   } catch { return false; }
+}
+
+/**
+ * 对 dev 栈 Postgres 跑一句单行 SQL（与同目录 `wp5-e2e.mjs` / `wp3b-e2e.mjs` 的 psql 同口径）。
+ * `-tAc`：tuples-only + 不加边框 + 直接跑命令；`dockerCmd` 拒绝换行 ⇒ SQL 必须单行。
+ */
+function psql(query) {
+  return dockerRun(`exec -i ${STATION_DB_NAME} psql -U station -d station -tAc ${JSON.stringify(query)}`, { timeout: 20_000 }).trim();
+}
+
+/** SQL 字符串字面量（登录名里的单引号转双单引号）。 */
+function sqlLit(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+/**
+ * #828 收尾（**必须放 finally**）：把浏览器腿在 DB 里改动的两个账号语言值恢复成 `null`，并**回读确认**。
+ *
+ * 为什么要：本腿在管理台把 admin 切到英文，切换当场经 `PATCH /api/me/locale` 真写进了 `users.locale`；
+ * 旧脚本收尾只清了临时文件、**没碰 DB** ⇒ 把 dev 上的 `admin` 留成了英文（现场 `admin.locale='en'`）。
+ * 两个账号（`ADMIN_LOGIN` 与 `SCRIPT_LOGIN`）一起恢复；UPDATE 用 tryQuiet 兑 docker 抖动，
+ * 但**回读确认是硬判据**：哪个账号没回到 `NULL` 就判红（留脏值正是本腿要修的污染）。
+ */
+function resetAccountLocalesAndConfirm() {
+  const targets = [ADMIN_LOGIN, SCRIPT_LOGIN];
+  const inList = targets.map(sqlLit).join(', ');
+  // UPDATE 尽力而为（容器不可用/没这个账号 ⇒ 不因清理本身炸掉已经跑绿的用例）。
+  tryQuiet(() => psql(`UPDATE users SET locale = NULL WHERE login IN (${inList})`));
+  // 回读：`login=<value>` 一行一个，`NULL` 代指未设。回读本身跑不动（DB 不可用）也只记一句、不另抛。
+  let rows;
+  try {
+    rows = psql(`SELECT login || '=' || COALESCE(locale, 'NULL') FROM users WHERE login IN (${inList}) ORDER BY login`);
+  } catch (err) {
+    console.log(`# 收尾回读确认跑不动（不影响主判据，但请人工确认 DB 没留脏值）：${String(err?.message || err).split('\n')[0]}`);
+    return;
+  }
+  const seen = Object.fromEntries(rows.split('\n').filter(Boolean).map((l) => { const i = l.indexOf('='); return [l.slice(0, i), l.slice(i + 1)]; }));
+  for (const login of targets) {
+    const val = seen[login];
+    // 账号不存在（回读里没有这一行）不算脏；存在但非 NULL 才是本腿留下的脏值。
+    if (val !== undefined && val !== 'NULL') {
+      assert.fail(`收尾回读：账号 ${login} 的 locale 应已恢复为 NULL，实际为 ${JSON.stringify(val)}（本腿会把 dev 上的账号留成脏语言值）`);
+    }
+  }
 }
 
 /** 先新后旧取第一个存在的；空文件视同没有 ⇒ null。 */
@@ -461,6 +512,9 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     tryQuiet(() => dockerRun(`exec ${PW_CONTAINER} sh -c "rm -f ${scriptIn} ${cfgIn}"`));
     tryQuiet(() => fs.rmSync(scriptHost));
     tryQuiet(() => fs.rmSync(cfgHost));
+    // #828：把浏览器腿经 UI 写进 DB 的两个账号语言值恢复成 null 并回读确认（旧脚本只恢复了脚本
+    // 账号、把 dev 上的 admin 留成了英文）——放 finally ⇒ 断言红也不能把脏值留在库。
+    resetAccountLocalesAndConfirm();
   }
 });
 

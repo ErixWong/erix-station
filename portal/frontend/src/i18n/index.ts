@@ -37,6 +37,24 @@ function readStoredLocale(): string | null {
   }
 }
 
+/**
+ * 本地（这个浏览器）是否已经对语言**表过态**：同站 cookie 或 localStorage 任一持有受支持的
+ * 合法值即算「表过态」。#828：这是「要不要应用账号上存的语言值」的唯一判据（见 `stores/auth`
+ * 的 `applyAccountLocale`）。
+ *
+ * 语义：**账号值是「这台浏览器/设备第一次见面时的种子」，不是「压过本地选择的主人」**。
+ * 换设备 / 清了站点数据时两个载体都空 ⇒ 账号值生效；同一浏览器里用户点过语言开关之后
+ * （`setLocale` 会双写 cookie + localStorage）⇒ 本地值说话，账号值不得反过来盖掉刚选的那个。
+ *
+ * 两个载体都要看的原因：cookie 是**唯一跨 origin** 的那一份（管理台与用户面是两个 host，
+ * localStorage 各存各的，#804），localStorage 是禁 cookie/隐私模式时的兜底——任一有有效值
+ * 都说明「这个浏览器已经有人做过选择」，不能只查 cookie 而漏掉只在 localStorage 表过态的情形。
+ */
+export function hasLocalLocalePreference(): boolean {
+  if (isAppLocale(readLocaleCookie())) return true;
+  return isAppLocale(readStoredLocale());
+}
+
 /** 按优先级检测初始语言：cookie → localStorage → navigator.language → zh-CN（#804）。 */
 export function detectLocale(): AppLocale {
   // cookie 先：它是唯一跨 origin 可见的那一份（管理台与用户面是两个 host，localStorage 各存各的）。

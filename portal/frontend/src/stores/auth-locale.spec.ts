@@ -28,20 +28,49 @@ function resetLocale(to: 'zh-CN' | 'en') {
   setLocale(to);
 }
 
+/**
+ * 把**两个本地载体都清干净**（cookie + localStorage），但不动当前 i18n 值。
+ * #828 新语义下，账号语言值只在「本地没表过态」时生效——验证「应用账号值」一类用例
+ * 必须先走到这个态（模拟换设备 / 清了站点数据），否则 beforeEach 留下的 cookie+localStorage
+ * 会被当成「已表过态」而拦住账号值。每个用例开头都会 resetLocale，彼此不串台。
+ */
+function clearLocalLocale() {
+  localStorage.clear();
+  document.cookie = 'locale=; Path=/; Max-Age=0';
+}
+
 beforeEach(() => {
   setActivePinia(createPinia());
   resetLocale('zh-CN');
 });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  // #828：多个用例会 `vi.spyOn(Storage.prototype, 'setItem')` 钉「没写持久化」；
+  // 不还原的话 spy 会跨用例累积，后面的防打转用例会误报到前面用例的 setItem。
+  vi.restoreAllMocks();
+});
 
 describe('#828 登录后应用账号语言', () => {
-  it('ensureMe：/api/me 返回 en ⇒ 界面变 en，cookie 与 localStorage 同步', async () => {
+  it('本地未表态（cookie+localStorage 都空）且 /api/me 返回 en ⇒ 应用成 en，cookie 与 localStorage 写上（换设备生效）', async () => {
+    clearLocalLocale(); // 两个本地载体都空：模拟换设备 / 清了站点数据
     vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
     const auth = useAuthStore();
     await auth.ensureMe();
     expect(i18n.global.locale.value).toBe('en');
     expect(readLocaleCookie()).toBe('en');
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
+  });
+
+  it('本地已表过态（cookie 或 localStorage 为 zh-CN）而账号值是 en ⇒ refreshMe 后界面仍是 zh-CN（缺陷②的钉子）', async () => {
+    resetLocale('zh-CN'); // cookie + localStorage 均为 zh-CN：本地已表过态
+    const setItem = vi.spyOn(Storage.prototype, 'setItem'); // 基线写发生在 spy 之前
+    vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
+    const auth = useAuthStore();
+    await auth.refreshMe(); // /api/me 账号值是过期的 en
+    expect(i18n.global.locale.value).toBe('zh-CN'); // 本地选择说话，不被账号值盖掉
+    expect(readLocaleCookie()).toBe('zh-CN');
+    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('zh-CN');
+    expect(setItem).not.toHaveBeenCalled(); // setLocale 没被账号值调用（去掉「本地已表态就不抢」那道判断即变红）
   });
 
   it('ensureMe：/api/me 返回 null ⇒ 什么都不变（cookie/localStorage 不被改写，也不回落到 zh-CN）', async () => {
@@ -54,9 +83,10 @@ describe('#828 登录后应用账号语言', () => {
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
   });
 
-  it('ensureMe：/api/me 返回与当前相同的 en ⇒ 不重复 setLocale（防打转：只发一次请求、不再写持久化）', async () => {
-    resetLocale('en');
-    const setItem = vi.spyOn(Storage.prototype, 'setItem'); // 基线写发生在 spy 之前
+  it('本地未表态且 /api/me 返回与当前相同的 en ⇒ 不重复 setLocale（防打转：只发一次请求、不再写持久化）', async () => {
+    resetLocale('en'); // 先把当前界面语言设为 en
+    clearLocalLocale(); // 再清掉两个本地载体：让「不切」只能靠「与当前相同」这道判断（而非 hasLocal）
+    const setItem = vi.spyOn(Storage.prototype, 'setItem'); // 基线写与清载体都发生在 spy 之前
     const fetchFn = fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } }));
     vi.stubGlobal('fetch', fetchFn);
     const auth = useAuthStore();
@@ -66,7 +96,8 @@ describe('#828 登录后应用账号语言', () => {
     expect(i18n.global.locale.value).toBe('en');
   });
 
-  it('login 直通：user.locale=en ⇒ 界面与持久化切到 en', async () => {
+  it('login 直通：本地未表态且 user.locale=en ⇒ 界面与持久化切到 en', async () => {
+    clearLocalLocale();
     vi.stubGlobal('fetch', fetchMock(() =>
       json(200, { status: 'authenticated', user: { ...FDE, locale: 'en' } })));
     const auth = useAuthStore();
@@ -85,7 +116,8 @@ describe('#828 登录后应用账号语言', () => {
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('zh-CN');
   });
 
-  it('submitTotp 第二步：user.locale=en ⇒ 应用并同步持久化', async () => {
+  it('submitTotp 第二步：本地未表态且 user.locale=en ⇒ 应用并同步持久化', async () => {
+    clearLocalLocale();
     vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
     const auth = useAuthStore();
     auth.pendingToken = 'ptok';
@@ -95,7 +127,8 @@ describe('#828 登录后应用账号语言', () => {
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
   });
 
-  it('submitEmailCode 第二步：user.locale=en ⇒ 应用', async () => {
+  it('submitEmailCode 第二步：本地未表态且 user.locale=en ⇒ 应用', async () => {
+    clearLocalLocale();
     vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
     const auth = useAuthStore();
     auth.pendingToken = 'ptok';
