@@ -293,7 +293,7 @@ try {
   await page.waitForSelector('header', { timeout: 20000 });
   r.admin.langBackToZh = await page.evaluate(() => document.documentElement.lang);
 
-  // ── ⑨ 切回 English → 进 #\/admin\/runtime：表头英文；行名格是否仍含中文（只记录，不判红） ──
+  // ── ⑩ 切回 English → 进 #\/admin\/runtime：表头英文；**行名与小字都不该再有中文**（#803 S1）──
   await openLocaleMenu(page, LOCALE_BTN_ADMIN);
   await clickMenuItem(page, 'English');
   await page.waitForFunction(() => document.documentElement.lang === 'en', null, { timeout: 10000 });
@@ -302,11 +302,20 @@ try {
   await page.waitForTimeout(400);
   r.runtime.colValueFound = await page.evaluate(() => Array.from(document.querySelectorAll('th'))
     .some((e) => (e.textContent || '').trim() === 'Current value'));
-  // 服务端下发文案的双语属 #803；本条只把「它现在还是不是中文」留成可核对读数（只记录不断言）。
+  // #803 S1 之后，注册表的 label / hint 由服务端按请求语言下发（cookie locale=en 随同源 API 自动带上）
+  // ⇒ 英文态这一屏的**行名与小字都不该含中文**。读数把「命中格数」一起带回去：selector 一格没命中时
+  // 「没中文」会恒真，必须同时钉「确实是一屏真条目」，否则断言会被空页面骗过。
   const cjkRe = new RegExp(CJK);
-  r.runtime.rowLabelHasCjk = await page.evaluate((re) => {
-    const cells = Array.from(document.querySelectorAll('[data-test^="runtime-label-"]'));
-    return cells.some((e) => re.test((e.textContent || '').trim()));
+  r.runtime.rows = await page.evaluate((re) => {
+    const grab = (sel) => Array.from(document.querySelectorAll(sel)).map((e) => (e.textContent || '').trim());
+    const labels = grab('[data-test^="runtime-label-"]');
+    const hints = grab('[data-test^="runtime-hint-"]');
+    return {
+      labelCount: labels.length,
+      hintCount: hints.length,
+      labelCjk: labels.filter((t) => re.test(t)),
+      hintCjk: hints.filter((t) => re.test(t)),
+    };
   }, cjkRe);
   // ── ⑩ 裸 key 哨兵：整页文本不得出现这些未翻译 key 前缀 ──
   r.runtime.bareKeyHits = await page.evaluate(() => {
@@ -402,16 +411,20 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     assert.equal(rep.user.lang, 'en', `跨 host 到用户面也应读到英文（同站 cookie 共享，这是 #804 要治的故障），实际 ${JSON.stringify(rep.user.lang)}`);
     // ⑧ 反方向也共享
     assert.equal(admin.langBackToZh, 'zh-CN', `用户面切回中文后，回管理台 reload 应是 zh-CN，实际 ${JSON.stringify(admin.langBackToZh)}`);
-    // ⑨ 运行时设置页英文表头
+    // ⑩ 运行时设置页：表头英文 + **服务端下发的行名与小字也已双语**（#803 S1 的验收面）
     assert.ok(rep.runtime.colValueFound, '英文态 runtime 表头应有 "Current value" 那一格');
-    //    只记录不断言：服务端下发文案的双语属 #803，这里只留「它现在还是不是中文」的可核对读数。
-    t.diagnostic(`# runtime 行名格是否仍含中文（只记录，不判红）：${rep.runtime.rowLabelHasCjk}`);
-    // ⑩ 裸 key 哨兵
+    //    注册表现有 12 条 label / 11 条 hint；这里留余量（增删条目不该假红），但必须是「一屏真条目」，
+    //    否则下面两条「不含中文」会被空 selector 顶成恒真。
+    assert.ok(rep.runtime.rows.labelCount >= 10, `英文态 runtime 页应渲染出一屏条目（现注册表 12 条，留余量取 >=10），实际命中 ${rep.runtime.rows.labelCount} 格`);
+    assert.ok(rep.runtime.rows.hintCount >= 8, `英文态 runtime 页的小字提示也应有一屏（现注册表 11 条带 hint，留余量取 >=8），实际命中 ${rep.runtime.rows.hintCount} 格`);
+    assert.deepEqual(rep.runtime.rows.labelCjk, [], `英文态行名格不该再含中文（#803 S1：注册表 label 已按请求语言下发），实际 ${JSON.stringify(rep.runtime.rows.labelCjk)}`);
+    assert.deepEqual(rep.runtime.rows.hintCjk, [], `英文态小字提示不该再含中文（#803 S1：注册表 hint 已按请求语言下发），实际 ${JSON.stringify(rep.runtime.rows.hintCjk)}`);
+    // ⑩b 裸 key 哨兵
     assert.deepEqual(rep.runtime.bareKeyHits, [], `整页不得出现未翻译 key 前缀（admin.runtime. / admin.tabs. / locale.），实际命中 ${JSON.stringify(rep.runtime.bareKeyHits)}`);
     // ⑪ pageerror = 0
     assert.deepEqual(rep.pageErrors, [], `管理台英文态不该抛页面级 JS 异常，实际 ${JSON.stringify(rep.pageErrors)}`);
 
-    // 把容器里的截图取回宿主（同路径名）；只证明「英文态页面真渲染出来了」，不当硬判据。
+    // 把容器里的截图取回宿主（两侧路径各自独立，见文件头 SHOT_* 那段）；只证明「英文态页面真渲染出来了」，不当硬判据。
     const bytes = (() => {
       try {
         tryQuiet(() => fs.rmSync(SHOT_HOST));
