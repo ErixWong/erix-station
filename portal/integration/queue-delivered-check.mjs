@@ -37,6 +37,7 @@
 //   `QDCHECK reload_bubble=… dup_after_reload=… shot_post=…`  **刷新后**可见性与是否重复
 //   `QDCHECK verdict=PASS`                                    实时看得见 + 刷新后仍在 + 不重复（修好之后的形态）
 //   `QDCHECK verdict=BUG reason=live_missing_reload_ok`       刷新前看不见、刷新后看得见（#799 的症状本身）
+//   `QDCHECK verdict=FAIL reason=steer_was_direct_post`      转向被判成直发（run 已先结束）⇒ 这句没走队列投递路径，没测到本单（评审 R4）
 //   `QDCHECK verdict=FAIL reason=<码>[ detail=<..>]`          环境 / 前置不满足
 //   退出码：`PASS`=0 / `BUG`=3 / `FAIL`=1（BUG 与 FAIL 分开：BUG = 测到了本单要测的那个缺陷；
 //   FAIL = 根本没测成——环境不满足时既不该记成「修好了」，也不该记成「还有 bug」）。
@@ -125,11 +126,17 @@ try {
   out('QDCHECK note=sent_prompt');
   await page.waitForTimeout(2500);
 
+  // 评审 R4（硬闸，非仅 note）：点「转向钮」**之前**就挂上 /queued-inputs 的响应，用来判定这句到底进了队列还是被直发。
+  const queuedResp = page.waitForResponse((r) => r.url().includes('/queued-inputs'), { timeout: 15_000 }).catch(() => null);
   // ② run 还在跑：发转向（走 steer 钮）
   await ta.fill(STEER);
   const steerBtn = page.locator('button[data-queued-kind="steer"]').first();
   if (await steerBtn.count()) await steerBtn.click(); else await ta.press('Enter');
   out(`QDCHECK note=sent_steer probe=${PROBE}`);
+  // 评审 R4：转向必须真的进了队列。POST 响应没有 `queued`（或 `posted` 非空）⇒ 这句被服务端判成**直发**而非队列投递，
+  // 本脚本就根本没在测投递路径（直发也实时可见 ⇒ 会假 PASS）。报 FAIL 比假 PASS 诚实。queueBar 观测保留，但不再是判据。
+  const steerBody = await queuedResp?.json().catch(() => null);
+  if (!steerBody?.queued || steerBody.posted) fail('steer_was_direct_post', JSON.stringify(steerBody ?? null));
 
   // ③ 队列条必须出现过（否则这句话根本没进队列，测的就不是本单）
   let barSeen = false;
