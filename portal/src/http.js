@@ -1150,7 +1150,8 @@ export function createServer({
         return;
       }
       log.error?.('[portal] unhandled:', err);
-      if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
+      // #803：兜底文案原来只有英文一种 ⇒ 中文用户看到的 500 是英文。
+      if (!res.headersSent) sendJson(res, 500, errorBody('internal', locale === 'en' ? 'internal error' : '服务器内部错误'));
       else res.destroy();
     }
   });
@@ -1268,7 +1269,10 @@ async function routeApi(req, res, ctx, url) {
     // 刷成噪声；而「欠改密」这个状态本身已由 `user.password_changed` 与管理员代设/重置那条审计钉住。
     return sendJson(res, 403, errorBody(
       'password_change_required',
-      '当前口令由管理员代设，请先修改口令后再使用其它功能',
+      // #803：这条是「不经 throw 直发」的文案，没有 err.en 可挑 ⇒ 就地按请求语言选。
+      resolveRequestLocale(req) === 'en'
+        ? 'The current password was set by an administrator; change your password before using other features'
+        : '当前口令由管理员代设，请先修改口令后再使用其它功能',
       false,
       { action: 'change_password', endpoint: 'POST /api/me/password' },
     ));

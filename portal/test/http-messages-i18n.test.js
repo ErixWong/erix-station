@@ -212,6 +212,6 @@ test('login-email-code 与 idempotency 的内部断言（RangeError/Error/TypeEr
   assert.match(err3.message, /client 必须是/, '中文断言文本保留');
   assert.notEqual(err3.message, 'internal error', '内部断言文本 ≠ 500 固定文案');
 
-  // 结论：http.js catch 中这三类都落最后兜底 sendJson(res, 500, errorBody('internal', 'internal error'))，
+  // 结论：http.js catch 中这三类都落最后兜底，兜底现按语言挑 sendJson(res, 500, errorBody('internal', locale === 'en' ? 'internal error' : '服务器内部错误'))，
   // 中文断言文案永远不会出现在客户端响应体里，无需补 en。
 });
