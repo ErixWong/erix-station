@@ -344,6 +344,9 @@ async function onSaveBudget() {
     quota.value = r.quota ?? null;
     budgetInput.value = budgetToInput(r.quota?.budget_usd); // 保存成功后回显
     budgetPeriodInput.value = r.quota?.budget_period ?? '';
+    // issue #800：额度一变，用户列表那格的「周期」短标签就得跟着变；不重拉会停在旧标签，
+    // 直到用户重进页面（那一列不轮询，只在进页时拉一次）。失败不阻断保存反馈：列自己会降级成「—」。
+    void admin.loadKeyUsage();
     budgetMsg.value = t('admin.llm.budgetSaved');
   } catch (e) {
     budgetErr.value = t('admin.errorPrefix') + (e instanceof Error ? e.message : String(e));

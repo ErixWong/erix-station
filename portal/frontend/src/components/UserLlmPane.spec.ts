@@ -587,6 +587,23 @@ describe('UserLlmPane · 周期额度（#719）', () => {
     expect(sel.value).toBe('1mo');
   });
 
+  // issue #800：保存额度后必须重拉 bulk 端点，否则用户列表那一格的「周期」停在旧标签。
+  it('保存额度成功后重拉一次 key-usage（列表那一列跟着变，不等重进页面）', async () => {
+    const { wrapper, fetchFn } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/budget') && init?.method === 'PUT') {
+        return jsonResponse(200, { quota: { budget_usd: 1, budget_period: '1d', max_budget: 1, budget_duration: '1d', budget_reset_at: '2026-11-27T00:00:00+08:00', spend: 0.3, remaining: 0.7, spend_scope: 'period' } });
+      }
+      return undefined;
+    });
+    await wrapper.find('[data-test="budget-input"]').setValue('1');
+    await wrapper.find('[data-test="budget-period"]').setValue('1d');
+    await wrapper.find('[data-test="budget-save"]').trigger('click');
+    await flushPromises();
+    const usageCalls = fetchFn.mock.calls.filter(([u]) => String(u) === '/api/admin/llm/key-usage');
+    expect(usageCalls.length).toBeGreaterThanOrEqual(1);
+    expect(quotaPuts(fetchFn)).toHaveLength(1);
+  });
+
   // 评审 SHOULD-3：读额度失败时也不得把「猜的默认值」当现状举着（初值与失败分支都必须是空）。
   it('读额度失败（5xx）⇒ 周期下拉仍是空（未设置），不得回落到「每月」', async () => {
     const { wrapper } = await mountQuota((url, init) => {
