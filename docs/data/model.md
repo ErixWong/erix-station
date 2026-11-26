@@ -661,7 +661,11 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 配了但读不到的路径不会静默消失：它进 `latest.diskUnreadable[]`（带 `reason`）露面，只是**不落库**
 （一行读不到字节数的磁盘行在历史图上只会变成贴底的假线）。
 
-写入方与读取方与 §1.34 同一处（`disksInsertSql()` 的多值 `INSERT … ON CONFLICT (sampled_at, device) DO NOTHING`）。
+写入方与 §1.34 同一处（`disksInsertSql()` 的多值 `INSERT … ON CONFLICT (sampled_at, device) DO NOTHING`，
+与主表那一行共用同一个写事务）。**读侧自 #814 起不再是空**：新增 `seriesDisksSql()`（`portal/src/system-metrics.js`）
+在本表上做「桶 × 设备」分桶查询（`GROUP BY 1, 2` + `min(path)`），经 `queryDiskSeries()` 按设备归组后由
+`docs/api/portal.md` §4.20 的 `series.disks[]` 下发 ⇒ 本表从「只写不读」变成**有历史读面**（窗口与桶宽与
+§1.34 的主序列查询完全同一对参数，两张图共用一条时间轴）。
 
 ### 1.36 `fde_onboarding` — FDE 开户编排状态（issue #111，migration 0012）
 
