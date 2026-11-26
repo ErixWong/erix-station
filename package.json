@@ -8,7 +8,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test && node scripts/check-message-i18n.mjs",
+    "test": "node --test && node scripts/check-message-i18n.mjs && node scripts/check-integration-syntax.mjs",
     "test:integration": "node --test portal/integration/wp2a-e2e.mjs",
     "test:integration:wp3a": "node --test portal/integration/wp3a-e2e.mjs",
     "test:integration:wp3b": "node --test portal/integration/wp3b-e2e.mjs",
@@ -29,7 +29,8 @@
     "check:doc-portable": "node scripts/check-doc-portable.mjs",
     "check:ci-legs": "node scripts/check-required-legs.mjs",
     "check:doc-impl": "node scripts/check-doc-impl.mjs",
-    "check:message-i18n": "node scripts/check-message-i18n.mjs"
+    "check:message-i18n": "node scripts/check-message-i18n.mjs",
+    "check:integration-syntax": "node scripts/check-integration-syntax.mjs"
   },
   "dependencies": {
     "erix-agent": "0.33.0",
