@@ -4123,3 +4123,74 @@ test('RS-63 Tier 2A 真库腿：保存⇒热读立即新值、删行⇒回落 en
       }
     });
   });
+
+// ===========================================================================
+// #803 S1：注册表双语（labelEn / hintEn）与管理台按 locale 出 label/hint。
+// 三条各钉一件事，红法都是「双语机制被改坏」：
+//   RS-64 parity：registry 里 `label` 有 ⇒ `labelEn` 必有、`hint` 有 ⇒ `hintEn` 必有；
+//                 原本没 `hint` 的那格不许凭空造 `hintEn`。
+//   RS-65 locale=en：12 条 label、11 条 hint 全出英文且**不含 CJK**。
+//   RS-66 缺省（不传 locale）：输出与改动前**逐字相同**（label/hint 逐字等于 registry 中文），
+//                 这是「既有契约不破」的钉子——有人把缺省语言改成 en，这条当场红。
+// ===========================================================================
+const CJK_RE_803 = /[\u2E80-\u2EFF\u3000-\u303F\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]/;
+
+test('RS-64 注册表 label/hint ⇒ labelEn/hintEn parity（有中文必有英文、无 hint 不许凭空造 hintEn）', () => {
+  let labels = 0;
+  let hints = 0;
+  for (const [key, entry] of Object.entries(RUNTIME_SETTING_REGISTRY)) {
+    if (typeof entry.label === 'string' && entry.label !== '') {
+      labels += 1;
+      assert.equal(typeof entry.labelEn, 'string', `${key}: 有 label 必须有 labelEn（parity）`);
+      assert.ok(entry.labelEn !== '', `${key}: labelEn 不许是空串`);
+    }
+    if (typeof entry.hint === 'string' && entry.hint !== '') {
+      hints += 1;
+      assert.equal(typeof entry.hintEn, 'string', `${key}: 有 hint 必须有 hintEn（parity）`);
+      assert.ok(entry.hintEn !== '', `${key}: hintEn 不许是空串`);
+    } else {
+      assert.ok(entry.hintEn === undefined, `${key}: 没 hint 就不该有 hintEn（否则界面凭空多一行提示）`);
+    }
+  }
+  assert.equal(labels, 12, '产品 registry 有 12 条 label');
+  assert.equal(hints, 11, '产品 registry 有 11 条 hint（第一格 session.ttl_seconds 无 hint）');
+});
+
+test('RS-65 管理台 locale=en：12 条 label、11 条 hint 全英文且不含 CJK', async () => {
+  const { items } = await listRuntimeSettingsAdmin({
+    pool: ttlPool(), config: {}, log: silentLog, locale: 'en',
+  });
+  assert.equal(items.length, 12);
+  const byKey = Object.fromEntries(items.map((i) => [i.key, i]));
+  for (const [key, entry] of Object.entries(RUNTIME_SETTING_REGISTRY)) {
+    const item = byKey[key];
+    assert.ok(item, `${key} 必须出现在管理台响应里`);
+    assert.equal(item.label, entry.labelEn, `${key}: locale=en 时 label 出 labelEn`);
+    assert.ok(!CJK_RE_803.test(item.label), `${key}: 英文 label 不许含 CJK：${item.label}`);
+    if (typeof entry.hint === 'string' && entry.hint !== '') {
+      assert.equal(item.hint, entry.hintEn, `${key}: locale=en 时 hint 出 hintEn`);
+      assert.ok(!CJK_RE_803.test(item.hint), `${key}: 英文 hint 不许含 CJK：${item.hint}`);
+    } else {
+      assert.ok(!('hint' in item), `${key}: 无 hint 的格子连键都不带（与缺省同一形状）`);
+    }
+  }
+});
+
+test('RS-66 管理台缺省（不传 locale）：输出与改动前逐字相同（缺省语言不许漂成 en）', async () => {
+  const byDefault = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: {}, log: silentLog });
+  const byZh = await listRuntimeSettingsAdmin({
+    pool: ttlPool(), config: {}, log: silentLog, locale: 'zh-CN',
+  });
+  assert.deepEqual(byDefault.items, byZh.items, '缺省 locale 的输出必须与显式 zh-CN 逐字相同');
+  const byKey = Object.fromEntries(byDefault.items.map((i) => [i.key, i]));
+  for (const [key, entry] of Object.entries(RUNTIME_SETTING_REGISTRY)) {
+    const item = byKey[key];
+    assert.equal(item.label, entry.label, `${key}: 缺省出中文 label（逐字等于 registry 的中文）`);
+    assert.ok(CJK_RE_803.test(item.label), `${key}: 缺省 label 应仍是中文：${item.label}`);
+    if (typeof entry.hint === 'string' && entry.hint !== '') {
+      assert.equal(item.hint, entry.hint, `${key}: 缺省出中文 hint（逐字等于 registry 的中文）`);
+    } else {
+      assert.ok(!('hint' in item), `${key}: 缺省时无 hint 的格子连键都不带`);
+    }
+  }
+});

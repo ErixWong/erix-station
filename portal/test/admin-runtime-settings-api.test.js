@@ -135,12 +135,14 @@ async function startStack({ runtimeRows = {}, runtimeSelectThrows = null } = {})
   };
 }
 
-const call = (s, { method = 'GET', key, body, login = 'root' } = {}) => fetch(
+// `locale` 可选：传了就往 cookie 前面拼上 `locale=<x>; `（#803 S1：验服务端按 cookie 语言出 label/hint）；
+// 不传 ⇒ cookie 逐字等于 `s.cookieFor(login)`，既有请求行为一字不变。
+const call = (s, { method = 'GET', key, body, login = 'root', locale } = {}) => fetch(
   `${s.base}/api/admin/runtime-settings${key === undefined ? '' : `/${key}`}`,
   {
     method,
     headers: {
-      cookie: s.cookieFor(login),
+      cookie: `${locale ? `locale=${locale}; ` : ''}${s.cookieFor(login)}`,
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -423,5 +425,59 @@ test("RS-API-8 PUT 的 body 是 null / 数组 / 字符串 ⇒ 400 details.field=
     } finally {
       await s.close();
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑤ #803 S1：请求语言决定服务端下发文案的语言（`Cookie: locale=`）
+// ---------------------------------------------------------------------------
+
+const CJK_RE_803 = /[\u2E80-\u2EFF\u3000-\u303F\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]/;
+
+test('RS-API-9 Cookie locale=en ⇒ GET 的 label/hint 全英文且不含 CJK；缺 labelEn 也不该出现', async () => {
+  const s = await startStack();
+  try {
+    const res = await call(s, { locale: 'en' });
+    assert.equal(res.status, 200);
+    const body = await readJson(res);
+    assert.equal(body.items.length, 12, '12 条都要在');
+    // 逐条：label 必须等于 registry 的 labelEn，且不含 CJK。
+    for (const item of body.items) {
+      const entry = RUNTIME_SETTING_REGISTRY[item.key];
+      assert.ok(entry, `响应里冒出未知 key：${item.key}`);
+      assert.equal(item.label, entry.labelEn, `${item.key}: locale=en 时 label 必须是英文 labelEn`);
+      assert.ok(!CJK_RE_803.test(item.label), `${item.key}: 英文 label 不许含 CJK：${item.label}`);
+      if (typeof entry.hint === 'string' && entry.hint !== '') {
+        assert.equal(item.hint, entry.hintEn, `${item.key}: locale=en 时 hint 必须是英文 hintEn`);
+        assert.ok(!CJK_RE_803.test(item.hint), `${item.key}: 英文 hint 不许含 CJK：${item.hint}`);
+      }
+    }
+    // 点名单条（万一上面循环被写空，这两条兜底钉死）。
+    const sess = body.items.find((i) => i.key === SESSION_TTL_KEY);
+    assert.equal(sess.label, 'Login session lifetime (seconds)');
+    assert.ok(!('hint' in sess), 'session.ttl_seconds 无 hint ⇒ 连键都不带');
+  } finally {
+    await s.close();
+  }
+});
+
+test('RS-API-10 不带 locale cookie ⇒ GET 的 label/hint 仍是中文（缺省 zh-CN 不许漂）', async () => {
+  const s = await startStack();
+  try {
+    const res = await call(s);
+    assert.equal(res.status, 200);
+    const body = await readJson(res);
+    for (const item of body.items) {
+      const entry = RUNTIME_SETTING_REGISTRY[item.key];
+      assert.equal(item.label, entry.label, `${item.key}: 缺省 label 必须是中文`);
+      assert.ok(CJK_RE_803.test(item.label), `${item.key}: 缺省 label 应仍是中文：${item.label}`);
+      if (typeof entry.hint === 'string' && entry.hint !== '') {
+        assert.equal(item.hint, entry.hint, `${item.key}: 缺省 hint 必须是中文`);
+      }
+    }
+    const sess = body.items.find((i) => i.key === SESSION_TTL_KEY);
+    assert.equal(sess.label, '登录会话有效期（秒）');
+  } finally {
+    await s.close();
   }
 });

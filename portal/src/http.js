@@ -2370,7 +2370,7 @@ async function handleAdminApi(req, res, ctx, url) {
   if (pathname === '/api/admin/runtime-settings') {
     if (req.method === 'GET') {
       return sendJson(res, 200, await runtimeSettings.listRuntimeSettingsAdmin({
-        pool: ctx.pool, config: ctx.config, log: ctx.log,
+        pool: ctx.pool, config: ctx.config, log: ctx.log, locale: resolveRequestLocale(req),
       }));
     }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');

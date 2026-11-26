@@ -70,6 +70,7 @@
 // 循环侧的共享上限（60s）只在这里引用一次：三个退避旋钮的**上界不许自己发明**，
 // 口径源头是 `loop-timing.js`（Node timer 的 32 位语义边界）与对账循环的业务上限。
 import { MAX_BACKOFF_MS_SAFE } from './loop-timing.js';
+import { DEFAULT_LOCALE } from './locale.js'; // #803 S1：管理台 label/hint 的双语选择与错误出口共用同一缺省语言
 
 /** 读侧超时的默认值（毫秒）。口径照 `upload-settings.js` / `platform-prompts.js`：1500ms。 */
 export const DEFAULT_READ_TIMEOUT_MS = 1500;
@@ -757,6 +758,7 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
     label: '登录会话有效期（秒）',
+    labelEn: 'Login session lifetime (seconds)',
     configPath: 'sessionTtlSeconds',
     envVar: 'SESSION_TTL_SECONDS',
     defaultValue: SESSION_TTL_DEFAULT_SECONDS,
@@ -767,6 +769,7 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [WORKSPACE_RETENTION_KEY]: Object.freeze({
     key: WORKSPACE_RETENTION_KEY,
     label: '已离职工位目录保留天数（0 = 不自动清理）',
+    labelEn: 'Offboarded workspace directory retention days (0 = no automatic cleanup)',
     configPath: 'workspaceRetentionDays',
     envVar: 'ERIX_WORKSPACE_RETENTION_DAYS',
     defaultValue: WORKSPACE_RETENTION_DEFAULT_DAYS,
@@ -774,10 +777,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseWorkspaceRetentionDays,
     validate: validateWorkspaceRetentionDays,
     hint: WORKSPACE_RETENTION_HINT,
+    hintEn: '0 = turns off automatic cleanup but does not cancel deletions that are already scheduled: after you set it back to a positive number, expired workspaces get deleted on the next cleanup pass; workspaces offboarded while it was 0 do not get a deadline added back (and are not retroactively deleted).',
   }),
   [PREVIEW_TICKET_TTL_KEY]: Object.freeze({
     key: PREVIEW_TICKET_TTL_KEY,
     label: '预览票有效期（秒）',
+    labelEn: 'Preview ticket lifetime (seconds)',
     configPath: 'previewTicketTtlSeconds',
     envVar: 'PREVIEW_TICKET_TTL_SECONDS',
     defaultValue: PREVIEW_TICKET_TTL_DEFAULT_SECONDS,
@@ -785,10 +790,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parsePreviewTicketTtlSeconds,
     validate: validatePreviewTicketTtlSeconds,
     hint: PREVIEW_TICKET_TTL_HINT,
+    hintEn: 'Seconds from a preview ticket being issued to expiring; 1..3600 (default 60)',
   }),
   [AUTO_TITLE_MIN_NEW_KEY]: Object.freeze({
     key: AUTO_TITLE_MIN_NEW_KEY,
     label: '自动标题刷新防抖阈值（轮）',
+    labelEn: 'Auto-title refresh debounce threshold (rounds)',
     configPath: 'sessionAutoTitleMinNew',
     envVar: 'ERIX_SESSION_AUTO_TITLE_MIN_NEW',
     defaultValue: AUTO_TITLE_MIN_NEW_DEFAULT,
@@ -796,10 +803,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseAutoTitleMinNew,
     validate: validateAutoTitleMinNew,
     hint: AUTO_TITLE_MIN_NEW_HINT,
+    hintEn: 'Debounce threshold for auto-title refresh: it refreshes only after at least N rounds of new user messages since the last auto-update; 1..100 (default 3); the upper bound 100 only raises the threshold, it is not a hard off switch — when a new message shares no keywords with the current title it still refreshes after 1 round (behavior defined in contract §4.21)',
   }),
   [PREVIEW_SESSION_TTL_KEY]: Object.freeze({
     key: PREVIEW_SESSION_TTL_KEY,
     label: '预览会话有效期（秒）',
+    labelEn: 'Preview session lifetime (seconds)',
     configPath: 'previewSessionTtlSeconds',
     envVar: 'PREVIEW_SESSION_TTL_SECONDS',
     defaultValue: PREVIEW_SESSION_TTL_DEFAULT_SECONDS,
@@ -807,10 +816,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parsePreviewSessionTtlSeconds,
     validate: validatePreviewSessionTtlSeconds,
     hint: PREVIEW_SESSION_TTL_HINT,
+    hintEn: 'Preview session lifetime in seconds, read at each use when issuing/renewing the preview cookie; 60..86400 (default 900 = 15 minutes); 0 is invalid (it expires the moment it is issued); upper bound 1 day',
   }),
   [ONBOARDING_IDLE_BACKOFF_MS_KEY]: Object.freeze({
     key: ONBOARDING_IDLE_BACKOFF_MS_KEY,
     label: '开户循环空闲退避上限（毫秒）',
+    labelEn: 'Onboarding loop idle-backoff cap (milliseconds)',
     // config 里没有这一档（`ONBOARDING_IDLE_BACKOFF_MAX_MS` 是循环直读 env、不经 `loadConfig`），
     // 所以 config 那一档永远「没给」⇒ 管理台报来源只会说 db / env / default，不假装是 config 配的。
     configPath: 'onboardingIdleBackoffMaxMs',
@@ -820,10 +831,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseOnboardingIdleBackoffMs,
     validate: validateOnboardingIdleBackoffMs,
     hint: ONBOARDING_IDLE_BACKOFF_MS_HINT,
+    hintEn: "Cap on the onboarding loop's idle backoff in milliseconds; 1..60000 (default 30000); when it claims work it drops back to the 5000ms baseline immediately, taking effect on the next tick (within at most 5s in this process, at most 5s across replicas)",
   }),
   [OFFBOARDING_IDLE_BACKOFF_MS_KEY]: Object.freeze({
     key: OFFBOARDING_IDLE_BACKOFF_MS_KEY,
     label: '销号循环空闲退避上限（毫秒）',
+    labelEn: 'Offboarding loop idle-backoff cap (milliseconds)',
     configPath: 'offboardingIdleBackoffMaxMs',
     envVar: 'OFFBOARDING_IDLE_BACKOFF_MAX_MS',
     defaultValue: OFFBOARDING_IDLE_BACKOFF_MS_DEFAULT,
@@ -831,10 +844,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseOffboardingIdleBackoffMs,
     validate: validateOffboardingIdleBackoffMs,
     hint: OFFBOARDING_IDLE_BACKOFF_MS_HINT,
+    hintEn: "Cap on the offboarding loop's idle backoff in milliseconds; 1..60000 (default 30000); when it claims work it drops back to the 5000ms baseline immediately; the 1h workspace cleanup gate is checked every tick and can be delayed by at most one backoff tick",
   }),
   [PROVISIONER_IDLE_BACKOFF_MS_KEY]: Object.freeze({
     key: PROVISIONER_IDLE_BACKOFF_MS_KEY,
     label: '对账循环空闲退避上限（毫秒）',
+    labelEn: 'Reconciliation loop idle-backoff cap (milliseconds)',
     configPath: 'provisionerIdleBackoffMaxMs',
     envVar: 'PROVISIONER_IDLE_BACKOFF_MAX_MS',
     defaultValue: PROVISIONER_IDLE_BACKOFF_MS_DEFAULT,
@@ -842,10 +857,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseProvisionerIdleBackoffMs,
     validate: validateProvisionerIdleBackoffMs,
     hint: PROVISIONER_IDLE_BACKOFF_MS_HINT,
+    hintEn: "Cap on the reconciliation loop's idle backoff in milliseconds; 1..15000 (default 15000); the upper bound 15000 is this loop's business cap (drift-detection latency is a business commitment); set to 5000 = no backoff (the fixed cadence before #520)",
   }),
   [PENDING_TOKEN_TTL_SECONDS_KEY]: Object.freeze({
     key: PENDING_TOKEN_TTL_SECONDS_KEY,
     label: '两步登录待决令牌有效期（秒）',
+    labelEn: 'Two-step login pending-token lifetime (seconds)',
     // config 返回对象扁平、没有 `auth` 这一档 ⇒ config 那档永远「没给」（口径同 P3 的 `loop.*`）。
     configPath: 'auth.pendingTokenTtlSeconds',
     envVar: 'PENDING_TOKEN_TTL_SECONDS',
@@ -854,10 +871,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parsePendingTokenTtlSeconds,
     validate: validatePendingTokenTtlSeconds,
     hint: PENDING_TOKEN_TTL_SECONDS_HINT,
+    hintEn: 'Seconds from a two-step login pending token being issued to expiring; 1..3600 (default 120)',
   }),
   [SESSION_RENEW_INTERVAL_SECONDS_KEY]: Object.freeze({
     key: SESSION_RENEW_INTERVAL_SECONDS_KEY,
     label: '会话滚动续期间隔（秒）',
+    labelEn: 'Session rolling-renewal interval (seconds)',
     configPath: 'auth.sessionRenewIntervalSeconds',
     envVar: 'SESSION_RENEW_INTERVAL_SECONDS',
     defaultValue: SESSION_RENEW_INTERVAL_SECONDS_DEFAULT,
@@ -865,10 +884,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseSessionRenewIntervalSeconds,
     validate: validateSessionRenewIntervalSeconds,
     hint: SESSION_RENEW_INTERVAL_SECONDS_HINT,
+    hintEn: 'Only write to the DB and reissue the cookie once more than this many seconds have passed since the last renewal; 1..86400 (default 3600)',
   }),
   [MAX_PASSWORD_LENGTH_KEY]: Object.freeze({
     key: MAX_PASSWORD_LENGTH_KEY,
     label: '口令长度上限（字符）',
+    labelEn: 'Maximum password length (characters)',
     configPath: 'auth.maxPasswordLength',
     envVar: 'MAX_PASSWORD_LENGTH',
     defaultValue: MAX_PASSWORD_LENGTH_DEFAULT,
@@ -876,10 +897,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseMaxPasswordLength,
     validate: validateMaxPasswordLength,
     hint: MAX_PASSWORD_LENGTH_HINT,
+    hintEn: 'Maximum password length (characters); 1..4096 (default 256)',
   }),
   [MAX_LOGIN_LENGTH_KEY]: Object.freeze({
     key: MAX_LOGIN_LENGTH_KEY,
     label: '登录名长度上限（字符）',
+    labelEn: 'Maximum login name length (characters)',
     configPath: 'auth.maxLoginLength',
     envVar: 'MAX_LOGIN_LENGTH',
     defaultValue: MAX_LOGIN_LENGTH_DEFAULT,
@@ -887,6 +910,7 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseMaxLoginLength,
     validate: validateMaxLoginLength,
     hint: MAX_LOGIN_LENGTH_HINT,
+    hintEn: 'Maximum login name length (characters); 1..512 (default 128)',
   }),
 });
 
@@ -2035,9 +2059,19 @@ function toIso(value) {
  * 为什么不是「人人一个 null」：RS-16 钉的是「一项的键就是那八个」，而前端也得自己判空才能
  * 不渲染一行空提示。带与不带都由 registry 说话，前端只照 DTO 渲染。
  */
-function withHint(dto, entry) {
-  const hint = entry?.hint;
-  return typeof hint === 'string' && hint !== '' ? { ...dto, hint } : dto;
+/** 按 locale 选 label：`labelEn` 缺失 ⇒ 出中文（渐进覆盖；parity 闸保证 label/labelEn 成对）。 */
+function pickLabel(entry, locale) {
+  const zh = entry?.label ?? entry?.key;
+  return locale === 'en' && typeof entry?.labelEn === 'string' && entry.labelEn !== '' ? entry.labelEn : zh;
+}
+
+function withHint(dto, entry, locale = DEFAULT_LOCALE) {
+  // `hint` 的**有无**仍由中文 `hint` 决定（登记与否由 registry 说话，输出键名不变）；
+  // 只把**值**按 locale 换成 `hintEn`。`hintEn` 缺失 ⇒ 出中文（渐进覆盖，parity 闸保证 hint/hintEn 成对）。
+  const zh = entry?.hint;
+  if (typeof zh !== 'string' || zh === '') return dto;
+  const text = locale === 'en' && typeof entry?.hintEn === 'string' && entry.hintEn !== '' ? entry.hintEn : zh;
+  return { ...dto, hint: text };
 }
 
 /**
@@ -2046,7 +2080,7 @@ function withHint(dto, entry) {
  * `envTier` 是调用方算好的**过了闸的** env 那一档（`resolveEnvTier`）：管理台报的那个值必须与
  * 热读真正用的那个值是同一个数（#701 返修 LOW③：两边各算一套就是界面与行为分叉）。
  */
-function toSettingItem(entry, row, envTier, fallbackReason = null) {
+function toSettingItem(entry, row, envTier, fallbackReason = null, locale = DEFAULT_LOCALE) {
   const raw = row?.value;
   let parsed = { ok: false, reason: 'no_row' };
   if (row) {
@@ -2058,13 +2092,13 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
   }
   const base = {
     key: entry.key,
-    label: entry.label ?? entry.key,
+    label: pickLabel(entry, locale),
     applyMode: entry.applyMode === 'hot' ? 'hot' : 'restart',
     updatedAt: row ? toIso(row.updated_at) : null,
     updatedBy: row?.updated_by ?? null,
   };
   if (parsed?.ok) {
-    return withHint({ ...base, value: parsed.value, source: 'db', reason: null }, entry);
+    return withHint({ ...base, value: parsed.value, source: 'db', reason: null }, entry, locale);
   }
   // 回落：值来自 env 那一档（或 registry 默认），`reason` 说清为什么不是 db。
   // `row` 存在但值非法 ⇒ 保留库里那行的 updated_at/by（它们是真发生过的事），只是值不用它。
@@ -2088,7 +2122,7 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
     reason: bootSnapshot
       ? bootSnapshotReason
       : (row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row')),
-  }, entry);
+  }, entry, locale);
 }
 
 /**
@@ -2102,6 +2136,7 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
  */
 export async function listRuntimeSettingsAdmin({
   pool, config, registry = RUNTIME_SETTING_REGISTRY, timeoutMs, env = process.env, log = console,
+  locale = DEFAULT_LOCALE, // #803 S1：管理台按请求语言出 label/hint；缺省 zh-CN ⇒ 输出与改动前逐字相同
 } = {}) {
   const keys = Object.keys(registry);
   const entries = keys.map((key) => registry[key]).filter((entry) => entry?.configPath);
@@ -2146,6 +2181,7 @@ export async function listRuntimeSettingsAdmin({
         // 不许报一个「界面显示 env 的 30、实际却不会用这个数」的假来源。
         resolveEnvTier(entry, config, { env, log }),
         fallbackReason,
+        locale,
       );
       // #709 MED①：报 `db` + boot snapshot 的那一档，必须在 warn 里说清手里那个数是启动时快照
       // ——运维看到 source=db 会去找库，而不是去改 env。
@@ -2170,6 +2206,9 @@ function toSavedItem(entry, saved) {
   // 这里漏了它，保存完提示就消失（判据：RS-29 的 PUT 腿 + 前端视图 spec 的保存腿）。
   return withHint({
     key: saved.key,
+    // 保存侧（PUT）响应与审计**恒中文**：PUT 不做 locale 谈判（写操作不看请求语言），审计台账
+    // 更要语言稳定可检索 ⇒ 这里刻意读中文 `entry.label`、不走 pickLabel（与 GET 读侧的 locale 选择分开）。
+    // 写侧 validate/校验错误消息同样恒中文：它们无 `en` ⇒ `http.js` 的 pickMessage 自然出中文（S2/S3 再逐条双语）。
     label: entry?.label ?? saved.key,
     value: saved.value,
     source: 'db',
