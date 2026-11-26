@@ -67,6 +67,11 @@ const PW_MODULE = '/app/node_modules/playwright/index.mjs';
  */
 const SHOT_CONTAINER = process.env.E2E_SHOT_CONTAINER || '/tmp/admin-locale-e2e.png';
 const SHOT_HOST = process.env.E2E_SHOT_HOST || path.join(os.tmpdir(), 'admin-locale-e2e.png');
+// 第二张：**运行时设置页英文态**（#803 的可见面：行名与小字由服务端按语言下发，像素证据只能在这里拿）。
+// 从主图路径派生（插一个 `-runtime` 后缀），免得两个变量各自漂：主图能落的目录这一张也能落。
+const withSuffix = (p) => (p.endsWith('.png') ? `${p.slice(0, -4)}-runtime.png` : `${p}.runtime.png`);
+const SHOT2_CONTAINER = process.env.E2E_SHOT2_CONTAINER || withSuffix(SHOT_CONTAINER);
+const SHOT2_HOST = process.env.E2E_SHOT2_HOST || withSuffix(SHOT_HOST);
 /**
  * 把域名在 TCP 层映到 IP（SNI/Host 仍用域名）。本腿两个 host 都要映：管理台与用户面各是一条
  * `MAP`，都用 `E2E_RESOLVE=host=ip,host2=ip2` 覆盖。缺省把两个域名都映到本机。
@@ -317,6 +322,9 @@ try {
       hintCjk: hints.filter((t) => re.test(t)),
     };
   }, cjkRe);
+  // 像素证据：#803 之后这一屏该全英文（DOM 读数能证「没中文」，但「渲染得对不对」靠这张图给人看）。
+  await page.screenshot({ path: cfg.shotPath2 });
+  try { r.shotBytes2 = statSync(cfg.shotPath2).size; } catch { /* 容器内没落盘，宿主回收时再看 */ }
   // ── ⑩ 裸 key 哨兵：整页文本不得出现这些未翻译 key 前缀 ──
   r.runtime.bareKeyHits = await page.evaluate(() => {
     const text = document.body.innerText || '';
@@ -364,6 +372,7 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     password,
     hostResolverRules: HOST_RESOLVER_RULES,
     shotPath: SHOT_CONTAINER,
+    shotPath2: SHOT2_CONTAINER,
   };
   try {
     fs.writeFileSync(scriptHost, CONTAINER_SCRIPT.replace('__PW_MODULE__', PW_MODULE), { mode: 0o600 });
@@ -434,6 +443,19 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     })();
     assert.ok(bytes > 1024, `英文态管理台截图没拿回宿主（容器内读数 ${rep.shotBytes}，宿主 ${SHOT_HOST}）`);
     t.diagnostic(`英文态管理台截图：${SHOT_HOST}（${bytes} 字节，容器内读数 ${rep.shotBytes}）`);
+
+    // 第二张：运行时设置页英文态（#803 的面）。拿不到宿主只记一句话，不判红——
+    // 硬判据是上面那四条 DOM 读数（格数 + CJK 命中 0），图是给人看的附件。
+    const bytes2 = (() => {
+      try {
+        tryQuiet(() => fs.rmSync(SHOT2_HOST));
+        dockerRun(`cp ${PW_CONTAINER}:${SHOT2_CONTAINER} ${SHOT2_HOST}`, { timeout: 30_000 });
+        return fs.statSync(SHOT2_HOST).size;
+      } catch { return null; }
+    })();
+    t.diagnostic(bytes2
+      ? `英文态运行时设置页截图：${SHOT2_HOST}（${bytes2} 字节，容器内读数 ${rep.shotBytes2}）`
+      : `# 运行时设置页截图没拿回宿主（${SHOT2_HOST}；不影响判据，硬判据是行名/小字的 CJK 读数）`);
   } finally {
     // ⑫ 收尾：容器里那份带口令的 cfg + 脚本都尽力删；宿主临时文件也删（截图留在宿主，是给人看的）。
     tryQuiet(() => dockerRun(`exec ${PW_CONTAINER} sh -c "rm -f ${scriptIn} ${cfgIn}"`));
