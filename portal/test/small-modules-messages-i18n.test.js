@@ -261,6 +261,39 @@ test('http.js days 校验：GET /api/me/llm-usage?days=999（B 批漏网补的 e
   } finally { await s.close(); }
 });
 
+// ── 跨类抛点（A/B 两批只看本类写法看不见的 `new admin.AdminError` / `new dirs.DirError`）──
+// 各从 HTTP 面钉一类，均**在 http.js 里抛**，两腿（locale=en 逐字英文 / 缺省逐字中文）。
+
+// 在 http.js 里抛的 admin.AdminError：/api/me/llm-usage 对无 fde_name 的账号（ADMIN）抛 `fde_name_required`。
+test('http.js 内抛的 AdminError：GET /api/me/llm-usage 无 fde_name ⇒ fde_name_required', async () => {
+  const s = await startServer();
+  try {
+    await twoLeg(s, {
+      method: 'GET', p: '/api/me/llm-usage', cookie: s.adminCookie, ct: null,
+    }, {
+      code: 'fde_name_required',
+      enMsg: 'the current user has no fde_name assigned, so reading usage is not available',
+      zhMsg: '当前用户未分配 fde_name，无法读取用量',
+      keys: ['code', 'message', 'retryable'],
+    });
+  } finally { await s.close(); }
+});
+
+// 在 http.js 里抛的 dirs.DirError：/api/files/upload 对开了工位但未开上传的账号（alice）抛 `upload_disabled`。
+test('http.js 内抛的 DirError：POST /api/files/upload 未开上传 ⇒ upload_disabled', async () => {
+  const s = await startServer();
+  try {
+    await twoLeg(s, {
+      method: 'POST', p: '/api/files/upload', cookie: s.fdeCookie, body: {},
+    }, {
+      code: 'upload_disabled',
+      enMsg: 'file upload is not enabled for this account; please ask an administrator to enable it in the admin console',
+      zhMsg: '该账号未开启文件上传，请让管理员在管理台开启',
+      keys: ['code', 'details', 'message', 'retryable'],
+    });
+  } finally { await s.close(); }
+});
+
 // ── 两处出口映射的钉子（第 2 件事）：改走 pickMessage 才生效 ──────────────────────
 
 // 1083：llm 网关分支。LlmGatewayError 本身不带 en（上游英文透传），这里给它挂一个 en，
