@@ -194,10 +194,12 @@ const chartNote = computed(() => {
 <template>
   <!-- no_binding 空态：整块不渲染（用户拍板：空就是空，不占位） -->
   <template v-if="state !== 'hidden'">
+    <!-- 窄屏（≤767px，Tailwind max-md:）隐藏徽标：实测顶栏在 900px 起就在换行，徽标再顶出一行
+         （760px 高 83→143）；顶栏本就拥挤，额度也不是手机首要信息——要看用宽屏。勿删此行（钉在 spec）。 -->
     <button
       type="button"
       data-test="usage-badge"
-      class="rounded-md border px-2 py-0.5 text-sm whitespace-nowrap"
+      class="rounded-md border px-2 py-0.5 text-sm whitespace-nowrap max-md:hidden"
       :class="state === 'lifetime' || state === 'unknown' || state === 'pending' ? 'border-black/10 text-black/50 hover:bg-black/5' : 'border-black/20 hover:bg-black/5'"
       :title="badgeTitle"
       :aria-label="badgeTitle"

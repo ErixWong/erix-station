@@ -92,6 +92,11 @@ describe('徽标五态', () => {
     expect(badge.attributes('aria-label')).toBe(title);
   });
 
+  it('根按钮带 max-md:hidden：窄屏（≤767px）隐藏徽标（顶栏本已拥挤，别再顶出一行）', () => {
+    const w = mountBadge({ quota: quota() });
+    expect(w.get('[data-test="usage-badge"]').classes()).toContain('max-md:hidden');
+  });
+
   it('有额度（日）：`日 …`', () => {
     const w = mountBadge({ quota: quota({ budget_duration: '1d', spend: 0.3, remaining: 0, max_budget: 0.3 }) });
     expect(w.get('[data-test="usage-badge"]').text()).toContain('日');
