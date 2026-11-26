@@ -601,7 +601,8 @@ export async function metricsApiPayload({
   const key = METRIC_RANGES[range] ? range : DEFAULT_METRIC_RANGE;
   const latest = toApiLatest(typeof sampler?.latest === 'function' ? sampler.latest() : null);
   // `disks` 在两个分支里都必须是**数组**（降级时 `[]`，不是 undefined）：前端只判长度，不判形状。
-  let series = { bucketSeconds: pickBucketSeconds(METRIC_RANGES[key]), points: [], disks: [] };
+  // `disksDropped` 同理永远是**整数**：它是「丢了几行脏数据」，不是「查询有没有挂」（后者是 `disksError`）。
+  let series = { bucketSeconds: pickBucketSeconds(METRIC_RANGES[key]), points: [], disks: [], disksDropped: 0 };
   let seriesError = null;
   try {
     const { bucketSeconds, points } = await querySeries(pool, { range: key, now });
@@ -614,10 +615,14 @@ export async function metricsApiPayload({
   // 下完，不许被这里覆写（同一个 `code 优先` 的取因口径）。
   let disksError = null;
   try {
-    const { disks } = await queryDiskSeries(pool, { range: key, now });
+    const { disks, dropped } = await queryDiskSeries(pool, { range: key, now });
     series.disks = disks;
+    // 丢弃计数也要下发：界面上要能说「有 N 行没进图」（与主序列那份同类计数同口径，不该闷声不响）。
+    series.disksDropped = dropped;
   } catch (err) {
     series.disks = [];
+    // **查询挂了不是「丢了 N 行」**：两件事不许混成一个数，所以这里 `disksDropped` 留在初始的 `0`。
+    series.disksDropped = 0;
     disksError = String(err?.code ?? err?.message ?? err);
   }
   // 采样器到底开没开（issue #650 前端「采样已关闭」文案的唯一依据）。

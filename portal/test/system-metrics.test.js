@@ -657,6 +657,8 @@ test('#814 红线：磁盘序列查询挂 ⇒ disksError 有值，而 seriesErro
   });
   assert.equal(payload.disksError, '42P01', '取因口径与 seriesError 一致：code 优先，没 code 才 message');
   assert.deepEqual(payload.series.disks, [], '磁盘挂 ⇒ 空数组（不是 undefined、不是 null）');
+  assert.equal(payload.series.disksDropped, 0,
+    '**查询挂了不是「丢了 N 行」**：两个数各自说一件事，挂掉时丢弃计数仍是 0（不是 undefined、不是把未知当 0 以外的猜值）');
   assert.equal(payload.seriesError, null,
     '**磁盘那条挂掉绝不能让 seriesError 有值**：否则界面会把已有数的 CPU/内存图一起标成「历史不可用」（#650）');
   assert.equal(payload.series.points.length, 1, '主序列一条都没少');
@@ -668,8 +670,19 @@ test('#814 红线：磁盘序列查询挂 ⇒ disksError 有值，而 seriesErro
   });
   assert.equal(both.seriesError, '57P01');
   assert.equal(both.disksError, '57P01', '两条查询都挂 ⇒ 两个降级各自有值（不合并成一个）');
-  assert.deepEqual(both.series, { bucketSeconds: pickBucketSeconds(3600), points: [], disks: [] },
-    '全挂时 series 三个键都在，降级形状依旧可渲染');
+  assert.deepEqual(both.series, { bucketSeconds: pickBucketSeconds(3600), points: [], disks: [], disksDropped: 0 },
+    '全挂时 series 四个键都在，降级形状依旧可渲染');
+  clearSeriesCache();
+});
+
+test('#814 成功路径：磁盘丢弃行数随响应下发（disksDropped 与 disksError 是两件事）', async () => {
+  clearSeriesCache();
+  const clock = makeClock();
+  const payload = await metricsApiPayload({ pool: new MetricsPool(), range: '6h', now: clock.now });
+  assert.equal(payload.disksError, null, '这条查询没挂');
+  assert.equal(payload.series.disks.length, 2, '两块盘都下发了');
+  assert.equal(payload.series.disksDropped, 1,
+    '桩数据里那一行 `bucket: null` 被丢掉 ⇒ 界面上要能说「有 1 行没进图」，不能闷声不响');
   clearSeriesCache();
 });
 
@@ -1097,7 +1110,7 @@ test('#650 metricsApiPayload：DB 挂了 ⇒ seriesError 给原因，latest 照�
   assert.equal(payload.seriesError, '57P01', '给原因字符串（code 优先），不把堆栈与 SQL 塞进响应');
   assert.equal(payload.range, '24h');
   assert.equal(payload.retentionDays, 45);
-  assert.deepEqual(payload.series, { bucketSeconds: pickBucketSeconds(86400), points: [], disks: [] },
+  assert.deepEqual(payload.series, { bucketSeconds: pickBucketSeconds(86400), points: [], disks: [], disksDropped: 0 },
     '空 points ⇒ 页面画「该区间无数据」，不画一条贴底的假线');
   assert.equal(payload.latest.cpu.usagePct, 14.6, '**latest 必须还在**：卡片读的是进程内那一拍');
   clearSeriesCache();

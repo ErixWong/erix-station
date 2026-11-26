@@ -3876,7 +3876,8 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
               "disks": [ { "device": "/dev/nvme0n1p2",                        // #814：一块盘一条线
                            "path": "/",
                            "points": [ { "t": "2026-11-17T08:12:00.000Z", "usedBytes": 1820000000000,
-                                         "totalBytes": 1960000000000, "samples": 2 } ] } ] },
+                                         "totalBytes": 1960000000000, "samples": 2 } ] } ],
+              "disksDropped": 0 },                    // 被丢掉的脏磁盘行数（整数，永远有值；与 `disksError` 两件事）
   "range": "1h",                                // **生效的** range（非法入参已被回落成 `1h`）
   "retentionDays": 30,                          // 来自 `config.systemMetrics.retentionDays`；拿不到 ⇒ null
   "seriesError": null,                          // 历史查询失败时是原因字符串，成功时是 null
@@ -3918,6 +3919,9 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
   **展示用引用**，不是键也不参与分组（取该设备第一个非空串，整段没名字 ⇒ `null`）。同一窗口、同一桶宽、同一个缓存 Map
   但**另一个 key**（`#disks` 后缀）⇒ `clearSeriesCache()` 一次清两边，不会出现两张不同时间的图拼在同一屏。
   `device` 不是非空字符串或桶起点拿不到的行**直接丢掉并计数**，不补 `null` 点、更不补 0。
+  那个计数就落在 **`series.disksDropped`**（整数，两个分支里都永远有值）：它说的是「丢了**几行**」，
+  而顶层 `disksError` 说的是「**整条查询挂了**」——两件事不许混成一个数：磁盘查询挂掉时 `disksDropped`
+  仍是 `0`（那是「没查到」而不是「查到并丢了 0 行」），界面据此才能分清「有 N 行没进图」与「磁盘历史不可用」两句文案。
 - `retentionDays` 只是**回显配置**，让页面能写「保留 30 天」而不必硬编码；清理动作不在这个端点上（挂 reaper 小时槽）。
 - `enabled`（**additive**，#650 前端单补）：采样器到底开没开。只看 `sampler?.enabled === true`——
   `sampler` 为 `null`（`SYSTEM_METRICS_ENABLED=0` 时 `cli.js serve` 根本不建它）⇒ `false`。
