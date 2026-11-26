@@ -542,6 +542,8 @@ export interface EventStreamHooks {
     blocked?: string | null;
     /** 本帧存在的原因是一条队列输入被投出去了 ⇒ 这个 run 刚被建起来。 */
     delivered_run_id?: string | null;
+    /** issue #799：本帧存在的原因是「一条队列输入刚被投出去」⇒ 这是它变成的那条 user 消息（非投递帧为 null）。 */
+    delivered?: Record<string, unknown> | null;
   } & Record<string, unknown>) => void;
   /**
    * issue #282：**每一帧**事件的旁路通知（不改变任何既有分发语义，纯观察面）。
@@ -935,8 +937,9 @@ export function useEventStream(hooks: EventStreamHooks) {
         hooks.onSessionUpdated?.(d);
         return;
       case 'queue_update':
-        // issue #370：同样是一帧无 seq 的 live-only 状态帧；**不进消息流**（它是 composer 上方的条，
-        // 不是对话内容——投递成功后那句话才会以正常 user 消息出现）。
+        // issue #370：同样是一帧无 seq 的 live-only 状态帧；**队列本身不进消息流**（它是 composer 上方的条）。
+        // 但 issue #799 起「投递成功」这一帧带 `delivered`（那句刚被投出去的话）——它已不是队列内容而是
+        // 一条普通 user 消息，由宿主侧的 adoptDeliveredMessage 落进对话流；本帧其余字段仍是队列快照，照旧只喂队列条。
         hooks.onQueueUpdate?.(d);
         return;
       case 'round_start':

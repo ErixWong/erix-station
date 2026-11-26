@@ -1,7 +1,7 @@
 // WorkbenchView 顶栏 i18n 单测（issue #101 P2）：
-//   ① zh-CN 基线：顶栏文案（☰ 导航 / cwd 徽标 title / who 拼接 / 管理台 / 登出 / ↓ 最新）与
+//   ① zh-CN 基线：顶栏文案（☰ 导航 / cwd 徽标 title / who 拼接 / 登出 / ↓ 最新）与
 //      aria-label（打开导航 / 调整侧栏宽度）走 i18n 后取值逐字不变；
-//   ② 顶栏语言切换菜单（LocaleSwitch）挂载在管理台/登出旁；切 English 后顶栏（含嵌套的侧栏
+//   ② 顶栏语言切换菜单（LocaleSwitch）挂载在登出旁（#821 后顶栏不再有「管理台」入口）；切 English 后顶栏（含嵌套的侧栏
 //      子组件）文案即时变英文，who 拼接改半角括号。
 // 约定（照 LoginView.spec 先例）：装配真实 i18n 单例，不 mock t()；每例 localStorage.clear() + setLocale('zh-CN')。
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -14,7 +14,6 @@ import SidebarPanel from '../components/SidebarPanel.vue';
 import { createAppRouter } from '../router';
 import { setUserScopeResetListener } from '../lib/userScope';
 import { useAuthStore, type AuthUser } from '../stores/auth';
-import { useSiteStore } from '../stores/site';
 import { useWorkbenchStore } from '../stores/workbench'; // issue #281：断言消息流里的可见错误行要用 store
 import { i18n, setLocale } from '../i18n';
 
@@ -26,7 +25,7 @@ const FDE_USER = {
 } as AuthUser;
 // issue #308（M3）：原夹具是「无工位管理员」（`admin` 且 `fde_name=null`）——#334 的准入闸
 // （lib/workbenchGate.ts）之后这个形状进不到工作台（会被改写到 /admin），拿它当夹具等于给不可达
-// 状态做覆盖。换成第 ② 类人：`admin` **且**有工位（闸放行，顶栏仍有「管理台」入口）。
+// 状态做覆盖。换成第 ② 类人：`admin` **且**有工位（闸放行，可站上工作台）。
 const ADMIN_WITH_SEAT = {
   id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'root', auth_source: 'local',
 } as AuthUser;
@@ -128,7 +127,7 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
     expect(badge.text()).toContain('📁 demo');
     // who 拼接：login（role / fde_name）
     expect(wrapper.find('header [data-test="who"]').text()).toBe('alice（fde / alice）');
-    // 普通 FDE 无「管理台」入口；登出按钮 + 语言切换菜单在位
+    // 普通 FDE 无「管理台」入口（用户面入口已整体拆除，见 fix-261126-03）；登出按钮 + 语言切换菜单在位
     expect(wrapper.find('header [data-test="admin-console-link"]').exists()).toBe(false);
     // header 直系 button：☰ 导航 / cwd 徽标 / 登出（LocaleSwitch 自身按钮在子 div 内，不计入）
     expect(wrapper.findAll('header > button').at(-1)!.text()).toBe('登出');
@@ -137,26 +136,11 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
     expect(wrapper.find('[role="separator"]').attributes('aria-label')).toBe('调整侧栏宽度');
   });
 
-  it('平台管理员（第 ② 类人：admin 且有工位）：顶栏「管理台」入口；who 带 fde_name（全角括号）', async () => {
+  it('平台管理员（第 ② 类人：admin 且有工位）：who 带 fde_name（全角括号）', async () => {
     const wrapper = await mountWorkbench(ADMIN_WITH_SEAT);
     expect(wrapper.find('header [data-test="who"]').text()).toBe('root（admin / root）');
-    expect(wrapper.find('header [data-test="admin-console-link"]').text()).toBe('管理台');
-  });
-
-  it('#450 A2：管理台入口是**跨 host 的绝对地址**（site 有值 ⇒ adminBaseUrl#/admin；无值 ⇒ 退回相对 hash）', async () => {
-    // A1 之后用户入口的 /api/admin/* 是边缘 404 ⇒ 这颗按钮必须指向管理台 host 的绝对地址，
-    // 否则用户看到的是「页面在、API 全 404」。拿不到 site 信息时（fail-open）退回同 origin 的 hash 链接。
-    const wrapper = await mountWorkbench(ADMIN_WITH_SEAT);
-    const link = () => wrapper.get('header [data-test="admin-console-link"]');
-    // 本例的 fetch 桩对 /api/site 回 `{}` ⇒ 形状不对 ⇒ site 不可用 ⇒ 退回相对 hash。
-    expect(link().attributes('href')).toBe('#/admin');
-
-    useSiteStore().info = {
-      userBaseUrl: 'http://station.fde.erix.vip:8090',
-      adminBaseUrl: 'https://admin.fde.erix.vip:9443',
-    };
-    await flushPromises();
-    expect(link().attributes('href')).toBe('https://admin.fde.erix.vip:9443#/admin');
+    // 管理台入口在 #804 fix-261126-03 里已从用户面整体拆除（谁有 fde_name 都不再给入口）
+    expect(wrapper.find('header [data-test="admin-console-link"]').exists()).toBe(false);
   });
 
   it('who 的无 fde_name 分支（fde 账号缺 fde_name）：只显示 role（全角括号）', async () => {
@@ -181,8 +165,9 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
     expect(wrapper.find('header button').text()).toBe('☰ Navigation');
     expect(wrapper.find('header button').attributes('aria-label')).toBe('Open navigation');
     expect(wrapper.find('header button[title]').attributes('title')).toBe('~/projects/demo (click to copy)');
+    // who 改半角括号：用稳定钩子（顶栏 flex 布局在 #808 里调过，class 选择器不再唯一）
     expect(wrapper.find('header [data-test="who"]').text()).toBe('root (admin / root)');
-    expect(wrapper.find('header [data-test="admin-console-link"]').text()).toBe('Admin console');
+    expect(wrapper.find('header [data-test="admin-console-link"]').exists()).toBe(false);
     expect(wrapper.findAll('header > button').at(-1)!.text()).toBe('Sign out');
     expect(wrapper.find('[role="separator"]').attributes('aria-label')).toBe('Resize sidebar');
     // 嵌套子组件（SidebarPanel/DirSelect）同样响应（全局 locale 向子树传播）

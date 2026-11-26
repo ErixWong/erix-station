@@ -26,7 +26,15 @@ import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
 import { removeGitCredentialFile, setGitCredential, platformCredentialPresent, migrateLegacyCredential } from './git-credential.js';
 import { mintGitAccount } from './git-mint.js';
 import { attachLoopWatch, envInt, idleDelayMs, MAX_BACKOFF_MS_SAFE, sleepCancellable } from './loop-timing.js';
-import { readProvisionerIdleBackoffMaxMs } from './runtime-settings.js';
+// #677 P3 第六批：对账的空闲退避上限是**现读**的（不是启动快照）。
+// #677 P3 第七批：delegate 子 run 的三个数值旋钮也从「启动期 env 快照」改成**建容器时现读**：
+// DB > env（过闸）> registry 默认。它们进的是**容器**的 env（容器内的 worker 读），所以
+// `applyMode` 是 `restart`：新值只落在**之后新建的容器**上，已在跑的容器要重建才生效。
+import {
+  readProvisionerIdleBackoffMaxMs,
+  readDelegateMax, readDelegateChildRounds, readDelegateChildTimeoutMs,
+  DELEGATE_MAX_DEFAULT, DELEGATE_CHILD_ROUNDS_DEFAULT, DELEGATE_CHILD_TIMEOUT_MS_DEFAULT,
+} from './runtime-settings.js';
 
 // ---------------------------------------------------------------------------
 // 代码层 Docker API 白名单（写死）
@@ -189,6 +197,35 @@ function toolCallMarkersEnvValue() {
   return raw === undefined || raw === '' ? undefined : raw;
 }
 
+/**
+ * delegate 子 run 的三个数值旋钮：在建容器那一刻**现读** registry（#677 P3 第七批）。
+ *
+ * 为什么要这一层：旧写法是 `Number(process.env.ERIX_DELEGATE_MAX) || 2` 那种**启动期 env 快照**，
+ * 它有三处不对：① 不读 `runtime_settings` ⇒ 管理台改了也没用；② `|| 2` 会把垃圾值与 0 一律折成
+ * 默认（`Number('abc') || 2`）；③ env 侧完全不经过闸。现读后三档统一走 registry 的 `parse`/`validate`：
+ * DB 有效值 > env（过闸）> 默认（判据：`portal/test/deploy-env-delegate.test.js` 的
+ * 「注入容器的值 == registry 现读值」那一组）。
+ *
+ * 三个读各自一份缓存与在飞槽（不共用），所以这一层是 `Promise.all` 三趟而不是共用一个结果。
+ * `pool` 缺失（旧调用方 / 单测）⇒ 热读自己会落到 env/默认那一档，不抛（口径 1）。
+ *
+ * @param {object} opts `{ pool?, config?, env?, log?, now?, readMax?, readRounds?, readChildTimeoutMs? }`
+ *   三个 `read*` 是单测注入缝（钉「注入的值就是现读的值」不靠真库）。
+ * @returns {Promise<{max:number, childRounds:number, childTimeoutMs:number}>}
+ */
+export async function resolveDelegateEnv({
+  pool = null, config = null, env = process.env, log = console, now = Date.now,
+  readMax = readDelegateMax, readRounds = readDelegateChildRounds,
+  readChildTimeoutMs = readDelegateChildTimeoutMs,
+} = {}) {
+  const [max, childRounds, childTimeoutMs] = await Promise.all([
+    readMax({ pool, config, env, log, now }),
+    readRounds({ pool, config, env, log, now }),
+    readChildTimeoutMs({ pool, config, env, log, now }),
+  ]);
+  return { max, childRounds, childTimeoutMs };
+}
+
 export function buildContainerConfig({
   fdeName,
   containerName,
@@ -209,6 +246,10 @@ export function buildContainerConfig({
   memoryLimit = '4g', // issue #27 已决 2026-09-18（B 档镜像下 dotnet build/chromium 峰值；0 不限）
   runUser = null, // '1001:1000' 等；镜像不具备双 UID 用户时用 --user 兜底（FDE_DEV_USER，⚠️ dev 偏差）
   capAdd = ['SETUID', 'SETGID', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'KILL'], // 契约 §6.2：root 启动→drop 1001、fork 1002 所需最小集（含跨 UID kill 的 CAP_KILL）
+  // #677 P3 第七批：delegate 三格的**现读结果**（由 `ensureFdeContainer` 递进来）。
+  // 不递就只拿到 registry 默认（**不再**自己抄一份 `process.env` 快照——那份快照就是本批要搬走的东西）：
+  // 调用方没现读 ⇒ 宁可给一个说得出名字的默认，也不要在两个地方各读一次 env（两套真相）。
+  delegateEnv = null,
 }) {
   const hostRoot = path.join(path.resolve(userSpaceRoot), fdeName);
   // #676：挂载点单一真值表（`shared/jail-mounts.js`）——home / projects / cache + 平台 git（ro）。
@@ -241,10 +282,14 @@ export function buildContainerConfig({
       // §8.70 那个同型事故的形状就是「注入方加了键、放行方没加」⇒ 现网 `create_policy_denied`。
       // 判据：`portal/test/deploy-env-delegate.test.js`。
       `ERIX_DELEGATE_ENABLED=${delegateEnvValue()}`,
-      `ERIX_DELEGATE_MAX=${Number(process.env.ERIX_DELEGATE_MAX) || 2}`,
-      `ERIX_DELEGATE_CHILD_ROUNDS=${Number(process.env.ERIX_DELEGATE_CHILD_ROUNDS) || 8}`,
+      // ↑ 上面那个开关仍走 portal env。下面**三个数值旋钮**自 #677 P3 第七批起是**现读值** `delegateEnv`
+      //（`resolveDelegateEnv`：DB > env（过闸）> registry 默认），不再是 `Number(process.env.X) || 默认`
+      // 那种启动期快照。⚠ 新值只落在**之后新建的容器**（已在跑的容器自带那份 env ⇒ `applyMode: restart`，
+      // 要重建才生效）。runner 侧 `runner/lib/config.js` 的钳位作为最后一道防线**保留不动**。
+      `ERIX_DELEGATE_MAX=${delegateEnv?.max ?? DELEGATE_MAX_DEFAULT}`,
+      `ERIX_DELEGATE_CHILD_ROUNDS=${delegateEnv?.childRounds ?? DELEGATE_CHILD_ROUNDS_DEFAULT}`,
       `ERIX_MCP_CONFIG_TIMEOUT_MS=${Number(process.env.ERIX_MCP_CONFIG_TIMEOUT_MS) || 10000}`,
-      `ERIX_DELEGATE_CHILD_TIMEOUT_MS=${Number(process.env.ERIX_DELEGATE_CHILD_TIMEOUT_MS) || 240000}`,
+      `ERIX_DELEGATE_CHILD_TIMEOUT_MS=${delegateEnv?.childTimeoutMs ?? DELEGATE_CHILD_TIMEOUT_MS_DEFAULT}`,
       // issue #557：终局正文「文本化工具调用」特征集（runner 读 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS`）。
       // ⚠ **宿主未设 ⇒ 这一项整个不出现**（连键都不带，见 `toolCallMarkersEnvValue` 的理由：默认清单的
       //   唯一真值在 `runner/lib/final-text-toolcall.js`）——这一条与上面四行的「未设也下发默认」是有意的差别。
@@ -371,8 +416,17 @@ export function readContainerEnv(inspectData, key = 'ERIX_STATION_TOKEN') {
  * 确保 FDE 容器存在并 running（不存在则创建+启动）。
  * @param opts.runnerToken 可选：单点生成的 token 原文；不传则内部新生成。
  * 返回 { created, started, id, token, envToken }（envToken = 容器内实际 ERIX_STATION_TOKEN 原文，供对账校验）。
+ *
+ * #677 P3 第七批：建容器那一刻**现读** delegate 三格（`resolveDelegateEnv`）并把结果递给
+ * `buildContainerConfig` ⇒ 管理台改完，下一个新建的容器就拿新值（已在跑的容器要重建才生效）。
+ * `pool`/`config` 是可选的（旧调用方与单测不传 ⇒ 热读落到 env/默认，不抛）；但生产调用方
+ * （`reconcileOnce` / `onboardFde`）**都递**，否则 DB 那一档就读不到。
+ * `resolveDelegateEnvValues` 是单测注入缝（钉「注进容器的值 == 现读的值」，不靠真库）。
  */
-export async function ensureFdeContainer(docker, opts, { log = console } = {}) {
+export async function ensureFdeContainer(docker, opts, {
+  log = console, pool = null, config = null, env = process.env, now = Date.now,
+  resolveDelegateEnvValues = resolveDelegateEnv,
+} = {}) {
   const { containerName } = opts;
   const existing = await docker.inspectContainer(containerName);
   if (existing.status === 200) {
@@ -406,9 +460,15 @@ export async function ensureFdeContainer(docker, opts, { log = console } = {}) {
 
   // F6：单点生成——onboard 传入的 token 与 DB hash 同源；未传入则此处生成（reconcile 重建路径）。
   const token = opts.runnerToken ?? generateRunnerToken().token;
+  // #677 P3 第七批：三格在**建容器这一刻**现读（不是启动快照）：位置就在此处——`body.Env` 算出来之前。
+  // 三格各自一份热读实例（各自缓存与在飞槽）⇒ 这里是**三趟**读；`createHotReader` 的在飞合并只发生在
+  // **同一格**的并发调用之间（槽按 pool 分键），不同格之间不合并发 SQL。建容器是低频路径，压成一趟
+  // 要改 `createHotReader` 的共用读，属跨批复用改造，本批没动。
+  const delegateEnv = await resolveDelegateEnvValues({ pool, config, env, log, now });
   const body = buildContainerConfig({
     ...opts,
     env: [...(opts.env ?? []), `ERIX_STATION_TOKEN=${token}`, `ERIX_FDE_NAME=${opts.fdeName}`],
+    delegateEnv,
   });
   const created = await docker.createContainer(body, containerName);
   if (created.status === 409) {
@@ -590,13 +650,14 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
           stackId, // F9：创建即打 station.stack 所有权标签
         };
 
-        let res = await ensureFdeContainer(docker, opts, { log });
+        // #677 P3 第七批：`pool`/`config` 递下去 ⇒ `ensureFdeContainer` 建容器时才能现读 delegate 三格。
+        let res = await ensureFdeContainer(docker, opts, { log, pool, config });
 
         // F6：容器 env token 与 DB hash 必须一致；缺失/失配 → 重建。
         const dbHash = row.runner_token_hash;
         if (!res.created && (res.envToken == null || !dbHash || hashToken(res.envToken) !== dbHash)) {
           await removeFdeContainer(docker, containerName, { log });
-          res = await ensureFdeContainer(docker, opts, { log });
+          res = await ensureFdeContainer(docker, opts, { log, pool, config });
         }
 
         if (res.created) {
@@ -912,7 +973,7 @@ export async function onboardFde(pool, config, {
         stackId, // F9：创建即打 station.stack 所有权标签
         runnerToken: token,
       },
-      { log },
+      { log, pool, config }, // #677 P3 第七批：delegate 三格要现读 DB 那一档 ⇒ pool/config 必须递下去
     );
 
     await pool.query(`UPDATE containers SET status = 'running', updated_at = now() WHERE id = $1`, [containerId]);

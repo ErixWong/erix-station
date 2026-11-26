@@ -5,7 +5,7 @@
 // task / 终态幂等比较的 final_text），使这些点在停写 `messages.content`（PR②b B2）之后仍能取到文本。
 // （原第四个读取点「claim ticket 的历史下行 `run.history`」已随 **P3 PR③** 退役，见文件尾 ④ 注。）
 //
-// 不重复实现投影：文本一律由 `session-view.js` 的 `projectSessionMessages`（内部逐行调用上游官方纯函数
+// 不重复实现投影：文本一律由 `session-view.js` 的 `projectSessionMessages`（内部逐行调用本仓自有投影（`display-projection.js`）
 // `projectTranscriptForDisplay`，并用 `recordForProjection` 把 `dedup_key` 列合成进 record）派生——
 // 与 `GET /api/sessions/:id` 对话流**同一口径**，同一轮文本在两处必然一致。
 //
@@ -15,7 +15,7 @@
 // 新会话恒有 transcript 证据，不会走到兜底（即使走到也只是空串）。**不得删除**：删了老会话就地丢正文。
 // 例外：`synthetic = true` 的锚点行（judge/wrapup 等宿主注入）在 transcript 里没有对应轮次，
 // 其**正文本就应写在 `messages.content`**（故 SQL 用 `CASE WHEN synthetic THEN content END`），不参与兜底语义。
-import { projectTranscriptForDisplay } from 'erix-agent';
+import { projectTranscriptForDisplay } from './display-projection.js';
 import { projectSessionMessages, recordForProjection, userTurnTexts } from './session-view.js';
 
 /** 锚点列集：展示元数据取自 `messages`，正文取自投影；`legacy_content` 只服务于 legacy 兜底

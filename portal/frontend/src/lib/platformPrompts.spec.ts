@@ -19,6 +19,13 @@ import {
   promptValidationFieldOf,
   shortUuid,
   utf8ByteLength,
+  EFFECTIVE_AGENTS_MD_PATH,
+  EFFECTIVE_DISK_STATES,
+  normalizeEffectiveAgentsMd,
+  effectiveAgentsMdPath,
+  effectiveVerdictOf,
+  draftDirtyOf,
+  type EffectiveAgentsMd,
 } from './platformPrompts';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -285,5 +292,84 @@ describe('契约节号机械闸：面板只许 §4.19（第三次撞号后的常
     // 反向自证另半边：同行没有提示词上下文（他人 §4.16）不该红。
     const notMine = findSectionDrift('// 关于面板 §4.16', 'other.ts', true);
     expect(notMine, '非提示词语境的 §4.16 不该判红').toEqual([]);
+  });
+});
+
+// ── issue #801：生效面 lib 判据（N1–N6）────────────────────────────────────────
+describe('issue #801 生效面 lib', () => {
+  const base = (): Record<string, unknown> => ({
+    fdeName: 'alice',
+    disk: { state: 'ok', bytes: 10, mtime: '2026-01-01T00:00:00.000Z', text: 'D', sha256: 'aa', truncated: false },
+    expected: { bytes: 10, sha256: 'aa', text: 'E' },
+    matches: true,
+    source: 'builtin',
+    reason: null,
+    db: { addendumBytes: 0, overrideBytes: 0 },
+    renderLimitBytes: 16384,
+  });
+
+  it('N1 归一化永不抛', () => {
+    for (const bad of [null, 42, [], 'x', undefined]) {
+      expect(() => normalizeEffectiveAgentsMd(bad)).not.toThrow();
+      expect(normalizeEffectiveAgentsMd(bad)).toBeNull(); // 非纯对象 ⇒ null
+    }
+    // 纯对象但缺键 ⇒ 全「未知」形状，不抛、不 null
+    const partial = normalizeEffectiveAgentsMd({});
+    expect(partial).not.toBeNull();
+    expect(partial?.disk.state).toBe('read_failed'); // 无 state ⇒ 兜底 read_failed
+    expect(partial?.disk.text).toBeNull();
+    expect(partial?.expected.text).toBe('');
+    expect(partial?.matches).toBeNull();
+  });
+
+  it('N2 matches 三态不塌', () => {
+    const withMatches = (m: unknown) => normalizeEffectiveAgentsMd({ ...base(), matches: m });
+    expect(withMatches(undefined)?.matches).toBeNull();
+    expect(withMatches(null)?.matches).toBeNull();
+    expect(withMatches('true')?.matches).toBeNull();
+    expect(withMatches(1)?.matches).toBeNull();
+    expect(withMatches(false)?.matches).toBe(false);
+    expect(withMatches(true)?.matches).toBe(true);
+    // 缺键那份（删掉 matches）也 ⇒ null
+    const noKey = base(); delete (noKey as Record<string, unknown>).matches;
+    expect(normalizeEffectiveAgentsMd(noKey)?.matches).toBeNull();
+  });
+
+  it('N3 disk.state 白名单', () => {
+    const mk = (state: unknown) => normalizeEffectiveAgentsMd({ ...base(), disk: { ...(base().disk as object), state } });
+    expect(mk('weird')?.disk.state).toBe('read_failed'); // 第五种 ⇒ 归成 read_failed
+    expect(mk(undefined)?.disk.state).toBe('read_failed');
+    expect(mk('ok')?.disk.state).toBe('ok');
+    expect(mk('missing')?.disk.state).toBe('missing');
+    expect(mk('not_a_file')?.disk.state).toBe('not_a_file');
+    expect(mk('read_failed')?.disk.state).toBe('read_failed');
+    // 未知 state 不许被渲染成 ok
+    expect(mk('weird')?.disk.state).not.toBe('ok');
+    expect(EFFECTIVE_DISK_STATES).toEqual(['ok', 'missing', 'not_a_file', 'read_failed']);
+  });
+
+  it('N4 verdictOf 三态', () => {
+    const ok = normalizeEffectiveAgentsMd({ ...base(), matches: true }) as EffectiveAgentsMd;
+    const stale = normalizeEffectiveAgentsMd({ ...base(), matches: false }) as EffectiveAgentsMd;
+    const un = normalizeEffectiveAgentsMd({ ...base(), matches: null }) as EffectiveAgentsMd;
+    expect(effectiveVerdictOf(ok)).toBe('ok');
+    expect(effectiveVerdictOf(stale)).toBe('stale');
+    expect(effectiveVerdictOf(un)).toBe('unavailable');
+    expect(effectiveVerdictOf(null)).toBe('unavailable');
+  });
+
+  it('N5 draftDirtyOf', () => {
+    expect(draftDirtyOf('', '')).toBe(false);
+    expect(draftDirtyOf('a', '')).toBe(true);
+    expect(draftDirtyOf('', 'a')).toBe(true);
+    // 非串输入不抛
+    expect(() => draftDirtyOf(undefined as unknown as string, '' as string)).not.toThrow();
+    expect(draftDirtyOf(undefined as unknown as string, '' as string)).toBe(false);
+  });
+
+  it('N6 effectiveAgentsMdPath 转义', () => {
+    expect(effectiveAgentsMdPath('alice')).toBe(`${EFFECTIVE_AGENTS_MD_PATH}?fde=alice`);
+    // 含特殊字符要过 encodeURIComponent
+    expect(effectiveAgentsMdPath('a b/c')).toContain(`fde=${encodeURIComponent('a b/c')}`);
   });
 });

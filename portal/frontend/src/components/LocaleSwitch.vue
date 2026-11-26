@@ -2,7 +2,10 @@
 // 语言切换菜单（issue #101 P1）：小号下拉——按钮显示当前语言，菜单两项「中文」/「English」。
 // 切换即调 setLocale（i18n 响应式生效 + localStorage 持久化 + <html lang> 同步）；
 // 文案走 locale.* 命名空间（语言名用母语自名，两语言下取值一致）。
-// 组件自带外部点击收起；当前挂载点：LoginView 卡片头部 + WorkbenchView 顶栏（AdminView 为次级页面，不挂）。
+// 组件自带外部点击收起。挂载点四处：登录卡片头部 / 工作台顶栏 / 强制改密屏 / 管理台外壳顶栏 `AdminLayout`。
+// 为什么管理台**必须**挂（#804）：它是独立 origin（`admin.<伞域>:<端口>`），而 localStorage 按 origin
+// 隔离 ⇒ 偏好不跟用户面共享；「先在用户面切好再进来」这条旧前提在 #450 边缘隔离之后已不成立
+// （两个 host 各发一份 SPA，语言只能就地在管理台里切）。
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { setLocale, type AppLocale } from '../i18n';

@@ -1,10 +1,11 @@
 // LocaleSwitch 单测（issue #101 P1）：菜单文案、切换生效 + 持久化、刷新后保持，
-// 以及 i18n 基建的语言检测优先级（localStorage → 浏览器语言 → 兜底 zh-CN）。
+// 以及 i18n 基建的语言检测优先级（cookie → localStorage → 浏览器语言 → 兜底 zh-CN，#804）。
 // 用真实 i18n 单例（与 main.ts 装配一致），不 mock t()。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, type VueWrapper } from '@vue/test-utils';
 import LocaleSwitch from './LocaleSwitch.vue';
 import { LOCALE_STORAGE_KEY, createAppI18n, detectLocale, i18n, setLocale } from '../i18n';
+import { clearLocaleCookie, readLocaleCookie, writeLocaleCookie } from '../lib/localeCookie';
 
 function mountSwitch(): VueWrapper {
   return mount(LocaleSwitch, { global: { plugins: [i18n] } });
@@ -25,6 +26,10 @@ async function pick(wrapper: VueWrapper, label: '中文' | 'English') {
 beforeEach(() => {
   localStorage.clear();
   setLocale('zh-CN');
+  // ⚠ #804：setLocale 现在**双写**，上面那句会顺手写下 cookie='zh-CN'；cookie 必须在它之后清，
+  // 否则默认态就带着一份 cookie 偏好，会把「localStorage 优先于浏览器语言」这类用例挤到 cookie
+  // 分支上去。jsdom 的 document.cookie 在同一文件里是共享的，不清就会跳用例污染。
+  clearLocaleCookie();
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -52,6 +57,8 @@ describe('LocaleSwitch', () => {
     expect(menuItems(wrapper)).toHaveLength(0); // 选完自动收起
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
     expect(document.documentElement.lang).toBe('en');
+    // #804：cookie 那份必须同步写上，否则管理台（另一个 origin）依旧读不到。
+    expect(readLocaleCookie()).toBe('en');
   });
 
   it('刷新后保持：localStorage 已存 en，重建 i18n 仍按 en 初始化', async () => {
@@ -87,5 +94,38 @@ describe('locale 检测优先级（i18n 基建）', () => {
   it('无偏好且浏览器语言为空 → 兜底 zh-CN', () => {
     stubBrowserLanguage('');
     expect(detectLocale()).toBe('zh-CN');
+  });
+
+  // 以下三条是 #804 换载体后的新口径：cookie 是跨 origin 那一份，所以它赢，但只对**合法值**赢。
+  it('cookie 与 localStorage 冲突 ⇒ cookie 优先（不共享的那份不能反过来覆盖共享的那份）', () => {
+    localStorage.setItem(LOCALE_STORAGE_KEY, 'zh-CN');
+    writeLocaleCookie('en');
+    expect(detectLocale()).toBe('en');
+  });
+
+  it('cookie 脏值（非受支持语言）忽略 ⇒ 落回 localStorage；localStorage 也没有 ⇒ 落回浏览器语言', () => {
+    document.cookie = 'locale=fr; Path=/';
+
+    localStorage.setItem(LOCALE_STORAGE_KEY, 'en');
+    stubBrowserLanguage('zh-CN');
+    expect(detectLocale()).toBe('en'); // 脏 cookie 不得抢在合法 localStorage 之前
+
+    localStorage.clear();
+    expect(detectLocale()).toBe('zh-CN'); // 也不能把浏览器语言吞掉
+  });
+
+  it('禁用存储（localStorage 与 cookie 两种持久化都坏）：setLocale 本次会话仍生效，只是没持久化', () => {
+    // 两种持久化都坏才算真兜底：光让 setItem 抛错只能证「localStorage 坏了本次仍生效」，
+    // 但 setLocale 之后还会写 cookie，必须把 cookie 也变成写不进，才能证明「两种都坏仍生效」。
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('quota');
+    });
+    // cookie 也写不进（afterEach 的 vi.restoreAllMocks() 会复原这个 accessor spy，不污染后续用例）。
+    vi.spyOn(document, 'cookie', 'set').mockImplementation(() => {
+      throw new Error('cookie disabled');
+    });
+    setLocale('en');
+    expect(i18n.global.locale.value).toBe('en');
+    expect(document.documentElement.lang).toBe('en');
   });
 });

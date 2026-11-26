@@ -135,12 +135,14 @@ async function startStack({ runtimeRows = {}, runtimeSelectThrows = null } = {})
   };
 }
 
-const call = (s, { method = 'GET', key, body, login = 'root' } = {}) => fetch(
+// `locale` 可选：传了就往 cookie 前面拼上 `locale=<x>; `（#803 S1：验服务端按 cookie 语言出 label/hint）；
+// 不传 ⇒ cookie 逐字等于 `s.cookieFor(login)`，既有请求行为一字不变。
+const call = (s, { method = 'GET', key, body, login = 'root', locale } = {}) => fetch(
   `${s.base}/api/admin/runtime-settings${key === undefined ? '' : `/${key}`}`,
   {
     method,
     headers: {
-      cookie: s.cookieFor(login),
+      cookie: `${locale ? `locale=${locale}; ` : ''}${s.cookieFor(login)}`,
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -423,5 +425,177 @@ test("RS-API-8 PUT 的 body 是 null / 数组 / 字符串 ⇒ 400 details.field=
     } finally {
       await s.close();
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑤ #803 S1：请求语言决定服务端下发文案的语言（`Cookie: locale=`）
+// ---------------------------------------------------------------------------
+
+const CJK_RE_803 = /[\u2E80-\u2EFF\u3000-\u303F\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]/;
+
+test('RS-API-9 Cookie locale=en ⇒ GET 的 label/hint 全英文且不含 CJK；缺 labelEn 也不该出现', async () => {
+  const s = await startStack();
+  try {
+    const res = await call(s, { locale: 'en' });
+    assert.equal(res.status, 200);
+    const body = await readJson(res);
+    assert.equal(body.items.length, 15, '15 条都要在（#677 P3 第七批 +3：delegate 三格）');
+    // 逐条：label 必须等于 registry 的 labelEn，且不含 CJK。
+    for (const item of body.items) {
+      const entry = RUNTIME_SETTING_REGISTRY[item.key];
+      assert.ok(entry, `响应里冒出未知 key：${item.key}`);
+      assert.equal(item.label, entry.labelEn, `${item.key}: locale=en 时 label 必须是英文 labelEn`);
+      assert.ok(!CJK_RE_803.test(item.label), `${item.key}: 英文 label 不许含 CJK：${item.label}`);
+      if (typeof entry.hint === 'string' && entry.hint !== '') {
+        assert.equal(item.hint, entry.hintEn, `${item.key}: locale=en 时 hint 必须是英文 hintEn`);
+        assert.ok(!CJK_RE_803.test(item.hint), `${item.key}: 英文 hint 不许含 CJK：${item.hint}`);
+      }
+    }
+    // 点名单条（万一上面循环被写空，这两条兜底钉死）。
+    const sess = body.items.find((i) => i.key === SESSION_TTL_KEY);
+    assert.equal(sess.label, 'Login session lifetime (seconds)');
+    assert.ok(!('hint' in sess), 'session.ttl_seconds 无 hint ⇒ 连键都不带');
+  } finally {
+    await s.close();
+  }
+});
+
+test('RS-API-10 不带 locale cookie ⇒ GET 的 label/hint 仍是中文（缺省 zh-CN 不许漂）', async () => {
+  const s = await startStack();
+  try {
+    const res = await call(s);
+    assert.equal(res.status, 200);
+    const body = await readJson(res);
+    for (const item of body.items) {
+      const entry = RUNTIME_SETTING_REGISTRY[item.key];
+      assert.equal(item.label, entry.label, `${item.key}: 缺省 label 必须是中文`);
+      assert.ok(CJK_RE_803.test(item.label), `${item.key}: 缺省 label 应仍是中文：${item.label}`);
+      if (typeof entry.hint === 'string' && entry.hint !== '') {
+        assert.equal(item.hint, entry.hint, `${item.key}: 缺省 hint 必须是中文`);
+      }
+    }
+    const sess = body.items.find((i) => i.key === SESSION_TTL_KEY);
+    assert.equal(sess.label, '登录会话有效期（秒）');
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑥ #803 返修 M1：**保存成功的那一行**也按请求语言出。
+// 为什么必须单独一格：前端 `stores/admin.ts#replaceRuntimeSetting` 拿 PUT 回的 `item`
+// **顶掉表格里的那一行**，不是重新 GET——所以「PUT 恒中文」在界面上的形状是「英文页面
+// 保存一次，那一行的名称与小字当场变回中文」，而 GET 那一格（RS-API-9/10）绿着抓不到。
+// ---------------------------------------------------------------------------
+
+test('RS-API-11 PUT locale=en ⇒ 回包 item 的 label/hint 是英文（前端会顶掉整行，恒中文会当场变回中文）', async () => {
+  const s = await startStack();
+  try {
+    // 无 hint 的一格：只钉 label。
+    const r1 = await call(s, { method: 'PUT', key: SESSION_TTL_KEY, body: { value: 7200 }, locale: 'en' });
+    assert.equal(r1.status, 200, `PUT 必须 200（实际 ${r1.status}）`);
+    const b1 = await readJson(r1);
+    assert.equal(b1.item.label, RUNTIME_SETTING_REGISTRY[SESSION_TTL_KEY].labelEn,
+      'locale=en 时回包 label 必须是 labelEn');
+    assert.ok(!CJK_RE_803.test(b1.item.label), `英文 label 不许含 CJK：${b1.item.label}`);
+    assert.ok(!('hint' in b1.item), '这一格没登记 hint ⇒ 连键都不带（与 GET 同形）');
+    // 上面循环万一被写空，这一条兜底钉死逐字。
+    assert.equal(b1.item.label, 'Login session lifetime (seconds)');
+    // 有 hint 的一格：hint 也要跟着翻（两个字段在两个地方，只改一个会一半中一半英）。
+    const r2 = await call(s, { method: 'PUT', key: 'workspace.retention_days', body: { value: 30 }, locale: 'en' });
+    assert.equal(r2.status, 200, `PUT 必须 200（实际 ${r2.status}）`);
+    const b2 = await readJson(r2);
+    const entry2 = RUNTIME_SETTING_REGISTRY['workspace.retention_days'];
+    assert.equal(b2.item.label, entry2.labelEn, 'locale=en 时 label 出英文');
+    assert.equal(b2.item.hint, entry2.hintEn, 'locale=en 时 hint 也必须出英文');
+    assert.ok(!CJK_RE_803.test(b2.item.hint), `英文 hint 不许含 CJK：${b2.item.hint}`);
+  } finally {
+    await s.close();
+  }
+});
+
+test('RS-API-12 PUT 不带 locale cookie ⇒ 回包 item 的 label/hint 逐字中文（缺省不许漂成 en）', async () => {
+  const s = await startStack();
+  try {
+    const r1 = await call(s, { method: 'PUT', key: SESSION_TTL_KEY, body: { value: 7200 } });
+    assert.equal(r1.status, 200);
+    const b1 = await readJson(r1);
+    assert.equal(b1.item.label, '登录会话有效期（秒）', '缺省 label 必须逐字中文');
+    assert.ok(CJK_RE_803.test(b1.item.label), `缺省 label 必须含中文：${b1.item.label}`);
+    const r2 = await call(s, { method: 'PUT', key: 'workspace.retention_days', body: { value: 30 } });
+    const b2 = await readJson(r2);
+    const entry2 = RUNTIME_SETTING_REGISTRY['workspace.retention_days'];
+    assert.equal(b2.item.label, entry2.label, '缺省 label 必须是 registry 的中文');
+    assert.equal(b2.item.hint, entry2.hint, '缺省 hint 必须是 registry 的中文');
+    assert.ok(CJK_RE_803.test(b2.item.hint), `缺省 hint 应仍是中文：${b2.item.hint}`);
+    // 写侧裁决与语言无关：两种 locale 存的都是同一个值、都恰好一条审计。
+    assert.equal(s.pool.runtimeRows.get(SESSION_TTL_KEY), 7200);
+    assert.equal(s.pool.runtimeRows.get('workspace.retention_days'), 30);
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑦ #803 返修 m6：**英文错误文案的机制端到端闭环**（此前 `pickMessage` 零覆盖）。
+// S1 那 406 处抛出点全没给 `en`，英文错误文案从没在任何测试里真走通过一次——机制坏了（比如
+// 出口忘了传 locale、或 `err.en` 被改名）也会一路绿。本格走 `requireJson` 那一处抛点（全仓
+// 目前唯一给了 `en:` 的），**只钉三件事**：状态码与错误码不变、`locale=en` 时出那句英文逐字、
+// `error` 的键形状不因语言而变。**不比整包**（整包比较会把与语言无关的字段也钉住，改一个无关
+// 字段就假红）。
+// ---------------------------------------------------------------------------
+
+/** `content-type: text/plain` 的 PUT（`call` 会自动加 json 头，那一支要的是「内容类型不对」）。 */
+const putPlainText = (s, locale) => fetch(`${s.base}/api/admin/runtime-settings/${SESSION_TTL_KEY}`, {
+  method: 'PUT',
+  headers: {
+    cookie: `${locale ? `locale=${locale}; ` : ''}${s.cookieFor('root')}`,
+    'content-type': 'text/plain',
+  },
+  body: '{"value": 7200}',
+});
+
+// 两腿共用的形状钩：`error` 的键只许是契约面那一组（`{ error: { code, message, retryable, details } }`）。
+// 本抛点没给 `details` ⇒ 实际应是三键；`en` 是**内部字段**，出现在响应里就是泄露新键。
+function assertErrorShape(error, label) {
+  assert.ok(error, `${label}：响应必须有 error 那一层`);
+  assert.deepEqual(
+    Object.keys(error).sort(),
+    ['code', 'message', 'retryable'],
+    `${label}：error 的键必须与改动前逐字同形（多了 = 新键，少了 = 契约被删；本抛点无 details）`,
+  );
+  assert.ok(!('en' in error), `${label}：en 只用来选文案，不许进响应体`);
+  assert.equal(error.code, 'validation_failed', `${label}：错误码不许随语言变`);
+  assert.equal(error.retryable, false, `${label}：retryable 不许随语言变`);
+}
+
+test('RS-API-13 机制闭环：PUT 内容类型不对 ⇒ 400，locale=en 出英文逐字、缺省出中文逐字、键形状不变', async () => {
+  const s = await startStack();
+  try {
+    // 腿 A：带 `Cookie: locale=en` ⇒ 英文逐字。
+    const resEn = await putPlainText(s, 'en');
+    assert.equal(resEn.status, 400, `内容类型不对必须 400（英文腿实得 ${resEn.status}）`);
+    const en = await readJson(resEn);
+    assert.ok(en.error, `英文腿必须有错误信封（实得 ${JSON.stringify(en)}）`);
+    assertErrorShape(en.error, '英文腿');
+    assert.equal(en.error.message, 'Content-Type must be application/json',
+      'locale=en 必须逐字命中抛出点给的那句英文（这句话是机制走通的唯一证据）');
+    assert.ok(!CJK_RE_803.test(en.error.message), `英文腿不许含 CJK：${en.error.message}`);
+
+    // 腿 B：不带 locale cookie ⇒ 中文原文逐字不改（`Error.message` 的中文是日志/审计的依赖）。
+    const resZh = await putPlainText(s, undefined);
+    assert.equal(resZh.status, 400, `内容类型不对必须 400（中文腿实得 ${resZh.status}）`);
+    const zh = await readJson(resZh);
+    assert.ok(zh.error, `中文腿必须有错误信封（实得 ${JSON.stringify(zh)}）`);
+    assertErrorShape(zh.error, '中文腿');
+    assert.equal(zh.error.message, 'Content-Type 必须为 application/json',
+      '缺省语言的 message 必须逐字等于中文原文（不改一个字）');
+    assert.ok(CJK_RE_803.test(zh.error.message), `中文腿必须是中文：${zh.error.message}`);
+
+    // 两腿的状态码与错误码同形：语言只改文案，不改契约。
+    assert.notEqual(en.error.message, zh.error.message, '两腿必须真的差在语言上（否则上面逐字都是假绿）');
+  } finally {
+    await s.close();
   }
 });

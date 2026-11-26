@@ -20,6 +20,9 @@ import {
   formatBytes,
   shortUuid,
   utf8ByteLength,
+  effectiveVerdictOf,
+  draftDirtyOf,
+  type EffectiveAgentsMd,
   type PlatformPrompts,
   type PromptFieldKey,
   type ReadonlyPromptKey,
@@ -118,7 +121,100 @@ const updatedAtText = computed(() => {
 /** `updatedBy` 只有 uuid、没有显示名 ⇒ 短 uuid 或「—」，**不许空着**（空着像"没人改过"）。 */
 const updatedByText = computed(() => shortUuid(prompts.value?.updatedBy ?? null) ?? t('admin.prompts.never'));
 
-// ── 整段覆写卡：生效全文（只读 + 复制）──────────────────────────────────────
+// ── 当前生效的 ~/AGENTS.md（issue #801：这页要回答「模型现在被说了什么」）────────────
+/** 工位下拉：管理台用户列表里带 `fde_name` 的那些（与「工位内容」页同源同口径）。 */
+const fdeOptions = computed(() => admin.users
+  .filter((u) => typeof u.fde_name === 'string' && u.fde_name !== '')
+  .map((u) => ({ fde_name: u.fde_name as string, login: u.login })));
+const selectedFde = ref('');
+const effective = computed<EffectiveAgentsMd | null>(() => admin.effectiveAgentsMd);
+const effectiveVerdict = computed(() => effectiveVerdictOf(effective.value));
+const showDiskText = ref(false);
+const showExpectedText = ref(false);
+
+async function onFdeChange() {
+  await admin.loadEffectiveAgentsMd(selectedFde.value);
+}
+
+/** 两份文案（盘上那份 / 该有那份）都从生效面取，**不**回落到示例名预览。 */
+const diskText = computed(() => effective.value?.disk.text ?? '');
+const expectedText = computed(() => effective.value?.expected.text ?? '');
+
+/** `unavailable` 那一档的具体原因（state 与 truncated 各一句，**不许**把 null 说成 stale 那句）。 */
+const effectiveUnavailableReason = computed(() => {
+  const it = effective.value;
+  if (it === null) return t('admin.prompts.effective.unavailableReadFailed');
+  if (it.disk.truncated) return t('admin.prompts.effective.unavailableTruncated');
+  switch (it.disk.state) {
+    case 'missing': return t('admin.prompts.effective.unavailableMissing');
+    case 'not_a_file': return t('admin.prompts.effective.unavailableNotAFile');
+    default: return t('admin.prompts.effective.unavailableReadFailed');
+  }
+});
+
+/** 结论那一行：三态各一句（null 走「比对不了」那句，**不**塌成「没跟上」）。 */
+const effectiveVerdictText = computed(() => {
+  switch (effectiveVerdict.value) {
+    case 'ok': return t('admin.prompts.effective.verdictOk');
+    case 'stale': return t('admin.prompts.effective.verdictStale');
+    default: return t('admin.prompts.effective.verdictUnavailable', { reason: effectiveUnavailableReason.value });
+  }
+});
+
+function bytesOrNull(v: number | null): string {
+  return v === null || v === undefined ? t('admin.prompts.unknown') : (formatBytes(v) ?? String(v));
+}
+const effectiveDiskBytesText = computed(
+  () => t('admin.prompts.effective.diskBytes', { bytes: bytesOrNull(effective.value?.disk.bytes ?? null) }),
+);
+const effectiveExpectedBytesText = computed(
+  () => t('admin.prompts.effective.expectedBytes', { bytes: bytesOrNull(effective.value?.expected.bytes ?? null) }),
+);
+const effectiveMtimeText = computed(() => {
+  const raw = effective.value?.disk.mtime ?? null;
+  if (raw === null) return t('admin.prompts.effective.mtimeNever');
+  const at = new Date(raw);
+  return Number.isNaN(at.getTime()) ? t('admin.prompts.effective.mtimeNever') : at.toLocaleString();
+});
+const effectiveDbNoteText = computed(() => {
+  const it = effective.value;
+  return t('admin.prompts.effective.dbNote', {
+    addendum: it?.db.addendumBytes ?? '?', override: it?.db.overrideBytes ?? '?',
+  });
+});
+const effectiveSourceText = computed(() => t('admin.prompts.effective.sourceNote', {
+  source: effective.value?.source === 'db' ? t('admin.prompts.effective.sourceDb') : t('admin.prompts.effective.sourceBuiltin'),
+}));
+/** `reason \u2260 null` 时复用已有 reason 语义另起一句（生效面自己那份 reason）。 */
+const effectiveReasonText = computed(() => {
+  switch (effective.value?.reason) {
+    case 'no_row': return t('admin.prompts.reasonNoRow');
+    case 'read_failed': return t('admin.prompts.reasonReadFailed');
+    case 'read_timeout': return t('admin.prompts.reasonReadTimeout');
+    case 'unknown': return t('admin.prompts.reasonUnknown');
+    default: return null;
+  }
+});
+
+/** 任一草稿偏离落库那份 ⇒ 「重新读取」按钮要说「放弃草稿」（判据在 lib 的 draftDirtyOf）。 */
+const anyDraftDirty = computed(() => {
+  const p = prompts.value;
+  if (p === null) return false;
+  return draftDirtyOf(drafts.value.addendum, p.addendum.text)
+    || draftDirtyOf(drafts.value.agentsMd, p.agentsMd.override)
+    || draftDirtyOf(drafts.value.titlePrompt, p.titlePrompt.text);
+});
+/** 「重新读取」成功那一刻的本地时间（null ⇒ 不渲染那一行）。 */
+const reloadedAtText = computed(() => {
+  const raw = admin.platformPromptsReloadedAt;
+  if (!raw) return null;
+  const at = new Date(raw);
+  return Number.isNaN(at.getTime()) ? null : at.toLocaleTimeString();
+});
+/** 会话标题提示词：展开内置全文（只印字节数不够，跟随内置时实际发的就是它）。 */
+const showTitleDefault = ref(false);
+
+// ── 整段覆写卡：生效全文（只读 + 复制）────────────────────────────────────
 const showEffective = ref(false);
 const copied = ref<'idle' | 'ok' | 'failed'>('idle');
 
@@ -228,6 +324,11 @@ async function onReload() {
 onMounted(async () => {
   await admin.loadPlatformPrompts();
   fillFrom(prompts.value);
+  await admin.loadUsers();
+  if (fdeOptions.value.length > 0) {
+    selectedFde.value = fdeOptions.value[0].fde_name;
+    await admin.loadEffectiveAgentsMd(selectedFde.value);
+  }
 });
 </script>
 
@@ -259,6 +360,43 @@ onMounted(async () => {
       <p v-if="reasonText" data-test="prompts-reason" class="text-amber-700">{{ reasonText }}</p>
     </dl>
 
+    <!-- 当前生效的那一份（issue #801）：主视图——回答「模型现在被说了什么」。 -->
+    <div data-test="card-effective" class="grid gap-2 rounded-md border border-black/10 bg-black/[0.02] p-3">
+      <h3 class="text-sm font-medium">{{ t('admin.prompts.effective.title') }}</h3>
+      <p class="max-w-prose text-xs text-black/55">{{ t('admin.prompts.effective.intro') }}</p>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.prompts.effective.selectFde') }}
+        <select
+          v-model="selectedFde"
+          data-test="effective-fde-select"
+          class="rounded-md border border-black/20 px-2 py-1 text-sm"
+          @change="onFdeChange"
+        >
+          <option v-for="opt in fdeOptions" :key="opt.fde_name" :value="opt.fde_name">
+            {{ opt.fde_name }}（{{ opt.login }}）
+          </option>
+        </select>
+      </label>
+      <p v-if="admin.effectiveAgentsMdLoading" data-test="effective-loading" class="text-xs text-black/50">{{ t('admin.prompts.effective.loading') }}</p>
+      <p v-else-if="fdeOptions.length === 0" data-test="effective-no-fde" class="text-xs text-black/45">{{ t('admin.prompts.effective.noFde') }}</p>
+      <p v-if="admin.effectiveAgentsMdErr" data-test="effective-err" class="syserr text-xs" role="alert">{{ admin.effectiveAgentsMdErr }}</p>
+      <p v-if="effective !== null" data-test="effective-verdict" class="text-xs">{{ effectiveVerdictText }}</p>
+      <p v-if="effective !== null" data-test="effective-bytes" class="text-xs text-black/60">{{ effectiveDiskBytesText }} · {{ effectiveExpectedBytesText }}</p>
+      <p v-if="effective !== null" data-test="effective-mtime" class="text-xs text-black/45">{{ effectiveMtimeText }}</p>
+      <div v-if="effective !== null" class="flex flex-wrap items-center gap-2">
+        <button type="button" data-test="toggle-disk-text" class="rounded-md border border-black/20 px-2 py-1 text-xs" @click="showDiskText = !showDiskText">
+          {{ showDiskText ? t('admin.prompts.effective.hideDisk') : t('admin.prompts.effective.viewDisk') }}
+        </button>
+        <button type="button" data-test="toggle-expected-text" class="rounded-md border border-black/20 px-2 py-1 text-xs" @click="showExpectedText = !showExpectedText">
+          {{ showExpectedText ? t('admin.prompts.effective.hideExpected') : t('admin.prompts.effective.viewExpected') }}
+        </button>
+      </div>
+      <pre v-if="effective !== null && showDiskText" data-test="disk-text" class="max-h-64 overflow-auto rounded-md border border-black/10 bg-black/[0.02] p-2 font-mono text-[11px] whitespace-pre-wrap">{{ diskText }}</pre>
+      <pre v-if="effective !== null && showExpectedText" data-test="expected-text" class="max-h-64 overflow-auto rounded-md border border-black/10 bg-black/[0.02] p-2 font-mono text-[11px] whitespace-pre-wrap">{{ expectedText }}</pre>
+      <p v-if="effective !== null" data-test="effective-db-note" class="text-xs text-black/55">{{ effectiveDbNoteText }} · {{ effectiveSourceText }}</p>
+      <p v-if="effectiveReasonText !== null" data-test="effective-reason" class="text-xs text-amber-700">{{ effectiveReasonText }}</p>
+    </div>
+
     <!-- ① / ② / ③ 三张可编辑卡 -->
     <div
       v-for="card in cards"
@@ -289,6 +427,7 @@ onMounted(async () => {
         <textarea
           v-model="drafts[card.field]"
           :data-test="`input-${card.field}`"
+          :placeholder="card.isDefault ? t('admin.prompts.followsBuiltinPlaceholder') : ''"
           rows="5"
           spellcheck="false"
           class="rounded-md border border-black/20 px-2 py-1 font-mono text-xs"
@@ -383,6 +522,21 @@ onMounted(async () => {
         bytes: formatBytes(utf8ByteLength(prompts.titlePrompt.defaultText)) ?? '?',
       }) }}</p>
 
+      <!-- 内置标题全文（跟随内置时实际发出去的就是它）：只印字节数不够，给展开。 -->
+      <template v-if="card.field === 'titlePrompt' && prompts">
+        <button
+          type="button"
+          data-test="toggle-title-default"
+          class="rounded-md border border-black/20 px-2 py-1 text-xs"
+          @click="showTitleDefault = !showTitleDefault"
+        >{{ showTitleDefault ? t('admin.prompts.titlePromptDefaultHide') : t('admin.prompts.titlePromptDefaultView') }}</button>
+        <pre
+          v-if="showTitleDefault"
+          data-test="title-default-text"
+          class="max-h-64 overflow-auto rounded-md border border-black/10 bg-black/[0.02] p-2 font-mono text-[11px] whitespace-pre-wrap"
+        >{{ prompts.titlePrompt.defaultText }}</pre>
+      </template>
+
       <div class="mt-1 flex items-center gap-2">
         <button
           :data-test="`save-${card.field}`"
@@ -440,7 +594,12 @@ onMounted(async () => {
         class="rounded-md border border-black/20 px-3 py-1 text-sm disabled:opacity-50"
         :disabled="loading"
         @click="onReload"
-      >{{ t('admin.prompts.reload') }}</button>
+      ><span data-test="prompts-reload-label">{{ anyDraftDirty ? t('admin.prompts.reloadDiscard') : t('admin.prompts.reload') }}</span></button>
+      <p
+        v-if="reloadedAtText !== null"
+        data-test="prompts-reloaded-at"
+        class="text-xs text-emerald-700"
+      >{{ t('admin.prompts.reloadedAt', { time: reloadedAtText }) }}</p>
     </div>
     <p class="max-w-prose text-xs text-black/45">{{ t('admin.prompts.footnote') }}</p>
   </section>

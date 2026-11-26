@@ -70,6 +70,7 @@
 // 循环侧的共享上限（60s）只在这里引用一次：三个退避旋钮的**上界不许自己发明**，
 // 口径源头是 `loop-timing.js`（Node timer 的 32 位语义边界）与对账循环的业务上限。
 import { MAX_BACKOFF_MS_SAFE } from './loop-timing.js';
+import { DEFAULT_LOCALE } from './locale.js'; // #803 S1：管理台 label/hint 的双语选择与错误出口共用同一缺省语言
 
 /** 读侧超时的默认值（毫秒）。口径照 `upload-settings.js` / `platform-prompts.js`：1500ms。 */
 export const DEFAULT_READ_TIMEOUT_MS = 1500;
@@ -753,10 +754,142 @@ export function validateMaxLoginLength(value) {
   });
 }
 
+// ---- #677 P3 第七批：delegate 子 run 的三个数值旋钮（`delegate.*`） ----------------------
+// 与前面六批的**关键差别**：这三格的消费者不在 portal 进程里，而在 **FDE 容器内的 worker**。
+// portal 只做一件事： provision 容器时把生效值写进容器 env（`provisioner.js#buildContainerConfig`）。
+// 所以：
+//   * `applyMode` 是 `'restart'` 而不是 `'hot'` —— portal 侧热读到新值**不等于**容器里的 worker 看到新值；
+//     已在跑的容器带着旧的 env 继续跑，**只有新建（或重建）的容器才拿新值**。hint 里必须明写这一点，
+//     不许假装热改（界面那个「保存即生效」的提示对这三格是错的）。
+//   * portal 侧仍然是**现读**（每建一个容器现读一次）⇒ 保存后下一个新容器就拿到新值，不等 portal 重启；
+//     热读缓存最多 5 秒（同 `createHotReader` 口径），与「容器是长命的」相比不是瓶颈。
+//   * 值域**不自己发明**：逐条抄自 `runner/lib/config.js:56-77` 已有的钳位（`parseDelegateMax` /
+//     `parseDelegateChildRounds` / `parseDelegateChildTimeoutMs`）。⚠ runner 侧那道钳位**保留不动**：
+//     它是「容器里 env 被人手改过 / 镜像比 portal 老」时的最后一道防线（registry 拒 ⇒ 钳，两层不冲突）。
+//   * `ERIX_DELEGATE_ENABLED` 本片刻意**不迁**：它的 env 语义是「未设/空 = 开、显式只认字符串 `'1'`」，
+//     与这套「严格正整数 + 区间」的闸不同形（另片处理）。
+//
+// 三格各自一份热读实例（各自缓存 / 代际号 / 在飞槽），不共用（同 P3 第六批的口径：
+// 共用槽就是「保存 `delegate.max` 把 `delegate.child_rounds` 的缓存一起抹掉」）。
+export const DELEGATE_MAX_KEY = 'delegate.max';
+/** 下界 1：0 路并发 = 关掉 delegate，那是 `ERIX_DELEGATE_ENABLED` 的活，不是这一格的。 */
+export const DELEGATE_MAX_MIN = 1;
+/** 上界 8 = `runner/lib/config.js#parseDelegateMax` 的钳位上界（同源，判据 RS-64 钉住相等）。 */
+export const DELEGATE_MAX_MAX = 8;
+export const DELEGATE_MAX_DEFAULT = 2; // 与 runner 的 parseDelegateMax 默认同源
+export const DELEGATE_MAX_HINT =
+  '每个 FDE 容器内的子 run 并发上限；1..8（默认 2）；⚠ 只影响之后新建的 FDE 容器，'
+  + '已在跑的容器要重建才生效（容器 env 在创建时定一次，不是热改）';
+/** 英文原文（#803 S1 的注册表双语契约：有 `label` 必有 `labelEn`、有 `hint` 必有 `hintEn`；
+ *   双语不许混 CJK——判据 RS-65 会把每一格的英文文案扫一遍）。 */
+export const DELEGATE_MAX_HINT_EN =
+  'Concurrent delegate sub-runs inside each FDE container; 1..8 (default 2); ⚠ applies only to FDE containers created afterwards — a container that is already running keeps the env it was created with and needs to be recreated (this is not a hot change)';
+
+
+export const DELEGATE_CHILD_ROUNDS_KEY = 'delegate.child_rounds';
+/** 下界 1：0 轮的子 run 什么都做不了（派出去就是立刻结束）。 */
+export const DELEGATE_CHILD_ROUNDS_MIN = 1;
+/** 上界 32 = `runner/lib/config.js#parseDelegateChildRounds` 的钳位上界。 */
+export const DELEGATE_CHILD_ROUNDS_MAX = 32;
+export const DELEGATE_CHILD_ROUNDS_DEFAULT = 8; // 与 runner 的 parseDelegateChildRounds 默认同源
+export const DELEGATE_CHILD_ROUNDS_HINT =
+  '单个 delegate 子 run 的轮数预算；1..32（默认 8）；⚠ 只影响之后新建的 FDE 容器，'
+  + '已在跑的容器要重建才生效（容器 env 在创建时定一次，不是热改）';
+/** 英文原文（#803 S1 的注册表双语契约：有 `label` 必有 `labelEn`、有 `hint` 必有 `hintEn`；
+ *   双语不许混 CJK——判据 RS-65 会把每一格的英文文案扫一遍）。 */
+export const DELEGATE_CHILD_ROUNDS_HINT_EN =
+  'Round budget for a single delegate sub-run; 1..32 (default 8); ⚠ applies only to FDE containers created afterwards — a container that is already running keeps the env it was created with and needs to be recreated (this is not a hot change)';
+
+
+export const DELEGATE_CHILD_TIMEOUT_MS_KEY = 'delegate.child_timeout_ms';
+/** 下界 1000ms：低于 1 秒的子 run 连一次工具往返都跑不完（同 runner 钳位下界）。 */
+export const DELEGATE_CHILD_TIMEOUT_MS_MIN = 1_000;
+/**
+ * 上界 240000ms 的理由**从注释变成机器闸**（原文在 `runner/lib/config.js` 的 `parseDelegateChildTimeoutMs`）：
+ * agentd 的 F6 watchdog 默认 300s，子 run 执行期父 worker 靠子的心跳刷 `lastIpcAt`；这一格的值一旦
+ * **≥ 300s** 且心跳没来（例如子卡在单个长 shell 里），父 worker 会被 SIGKILL 并**重放整条命令**
+ *（issue #288 的真机形状）。改这个上界要连 watchdog 一起想。
+ */
+export const DELEGATE_CHILD_TIMEOUT_MS_MAX = 240_000;
+export const DELEGATE_CHILD_TIMEOUT_MS_DEFAULT = 240_000; // 与 runner 默认同源
+export const DELEGATE_CHILD_TIMEOUT_MS_HINT =
+  '单个 delegate 子 run 的时间预算（毫秒）；1000..240000（默认 240000）；⚠ 只影响之后新建的 FDE 容器，'
+  + '已在跑的容器要重建才生效；上界必须 < agentd 的 300s watchdog（见下面 maxWhy 与 #288）';
+/** 英文原文（#803 S1 的注册表双语契约：有 `label` 必有 `labelEn`、有 `hint` 必有 `hintEn`；
+ *   双语不许混 CJK——判据 RS-65 会把每一格的英文文案扫一遍）。 */
+export const DELEGATE_CHILD_TIMEOUT_MS_HINT_EN =
+  'Time budget for a single delegate sub-run, in milliseconds; 1000..240000 (default 240000); ⚠ applies only to FDE containers created afterwards — a running container needs to be recreated; the cap must stay below agentd\'s 300s watchdog (see maxWhy and #288)';
+
+
+/** `delegate.max` 的形状闸（reason 点名本格）。 */
+export function parseDelegateMax(raw) {
+  return parsePositiveInt(raw, {
+    min: DELEGATE_MAX_MIN,
+    max: DELEGATE_MAX_MAX,
+    notReason: 'not_a_delegate_max',
+    rangeReason: 'delegate_max_out_of_range',
+  });
+}
+
+/** `delegate.max` 的取值闸。 */
+export function validateDelegateMax(value) {
+  return validatePositiveInt(value, {
+    min: DELEGATE_MAX_MIN,
+    max: DELEGATE_MAX_MAX,
+    unit: '路',
+    minWhy: '至少 1 路；0 路 = 关掉 delegate，那是 ERIX_DELEGATE_ENABLED 的活',
+    maxWhy: '每一路是容器内一个完整 worker，上界 8 与 runner/lib/config.js 的钳位同源（再高是容器资源面）',
+  });
+}
+
+/** `delegate.child_rounds` 的形状闸。 */
+export function parseDelegateChildRounds(raw) {
+  return parsePositiveInt(raw, {
+    min: DELEGATE_CHILD_ROUNDS_MIN,
+    max: DELEGATE_CHILD_ROUNDS_MAX,
+    notReason: 'not_a_delegate_child_rounds',
+    rangeReason: 'delegate_child_rounds_out_of_range',
+  });
+}
+
+/** `delegate.child_rounds` 的取值闸。 */
+export function validateDelegateChildRounds(value) {
+  return validatePositiveInt(value, {
+    min: DELEGATE_CHILD_ROUNDS_MIN,
+    max: DELEGATE_CHILD_ROUNDS_MAX,
+    unit: '轮',
+    minWhy: '至少 1 轮；0 轮的子 run 派出去就是立刻结束',
+    maxWhy: '一轮 = 一次完整 LLM 往返加工具执行，上界 32 与 runner/lib/config.js 的钳位同源',
+  });
+}
+
+/** `delegate.child_timeout_ms` 的形状闸。 */
+export function parseDelegateChildTimeoutMs(raw) {
+  return parsePositiveInt(raw, {
+    min: DELEGATE_CHILD_TIMEOUT_MS_MIN,
+    max: DELEGATE_CHILD_TIMEOUT_MS_MAX,
+    notReason: 'not_a_delegate_child_timeout_ms',
+    rangeReason: 'delegate_child_timeout_out_of_range',
+  });
+}
+
+/** `delegate.child_timeout_ms` 的取值闸：上界那条是 watchdog 安全约束，不是拍脑袋。 */
+export function validateDelegateChildTimeoutMs(value) {
+  return validatePositiveInt(value, {
+    min: DELEGATE_CHILD_TIMEOUT_MS_MIN,
+    max: DELEGATE_CHILD_TIMEOUT_MS_MAX,
+    unit: '毫秒',
+    minWhy: '至少 1 秒；低于 1 秒的子 run 连一次工具往返都跑不完',
+    maxWhy: '必须小于 agentd 的 300s watchdog：子 run 期父 worker 靠子的心跳刷 lastIpcAt，'
+      + '预算超过 watchdog 而心跳没来 ⇒ 父 worker 被 SIGKILL 并重放整条命令（#288）',
+  });
+}
+
 export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
     label: '登录会话有效期（秒）',
+    labelEn: 'Login session lifetime (seconds)',
     configPath: 'sessionTtlSeconds',
     envVar: 'SESSION_TTL_SECONDS',
     defaultValue: SESSION_TTL_DEFAULT_SECONDS,
@@ -767,6 +900,7 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [WORKSPACE_RETENTION_KEY]: Object.freeze({
     key: WORKSPACE_RETENTION_KEY,
     label: '已离职工位目录保留天数（0 = 不自动清理）',
+    labelEn: 'Offboarded workspace directory retention days (0 = no automatic cleanup)',
     configPath: 'workspaceRetentionDays',
     envVar: 'ERIX_WORKSPACE_RETENTION_DAYS',
     defaultValue: WORKSPACE_RETENTION_DEFAULT_DAYS,
@@ -774,10 +908,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseWorkspaceRetentionDays,
     validate: validateWorkspaceRetentionDays,
     hint: WORKSPACE_RETENTION_HINT,
+    hintEn: '0 = turns off automatic cleanup but does not cancel deletions that are already scheduled: after you set it back to a positive number, expired workspaces get deleted on the next cleanup pass; workspaces offboarded while it was 0 do not get a deadline added back (and are not retroactively deleted).',
   }),
   [PREVIEW_TICKET_TTL_KEY]: Object.freeze({
     key: PREVIEW_TICKET_TTL_KEY,
     label: '预览票有效期（秒）',
+    labelEn: 'Preview ticket lifetime (seconds)',
     configPath: 'previewTicketTtlSeconds',
     envVar: 'PREVIEW_TICKET_TTL_SECONDS',
     defaultValue: PREVIEW_TICKET_TTL_DEFAULT_SECONDS,
@@ -785,10 +921,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parsePreviewTicketTtlSeconds,
     validate: validatePreviewTicketTtlSeconds,
     hint: PREVIEW_TICKET_TTL_HINT,
+    hintEn: 'Seconds from a preview ticket being issued to expiring; 1..3600 (default 60)',
   }),
   [AUTO_TITLE_MIN_NEW_KEY]: Object.freeze({
     key: AUTO_TITLE_MIN_NEW_KEY,
     label: '自动标题刷新防抖阈值（轮）',
+    labelEn: 'Auto-title refresh debounce threshold (rounds)',
     configPath: 'sessionAutoTitleMinNew',
     envVar: 'ERIX_SESSION_AUTO_TITLE_MIN_NEW',
     defaultValue: AUTO_TITLE_MIN_NEW_DEFAULT,
@@ -796,10 +934,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseAutoTitleMinNew,
     validate: validateAutoTitleMinNew,
     hint: AUTO_TITLE_MIN_NEW_HINT,
+    hintEn: 'Debounce threshold for auto-title refresh: it refreshes only after at least N rounds of new user messages since the last auto-update; 1..100 (default 3); the upper bound 100 only raises the threshold, it is not a hard off switch — when a new message shares no keywords with the current title it still refreshes after 1 round (behavior defined in contract §4.21)',
   }),
   [PREVIEW_SESSION_TTL_KEY]: Object.freeze({
     key: PREVIEW_SESSION_TTL_KEY,
     label: '预览会话有效期（秒）',
+    labelEn: 'Preview session lifetime (seconds)',
     configPath: 'previewSessionTtlSeconds',
     envVar: 'PREVIEW_SESSION_TTL_SECONDS',
     defaultValue: PREVIEW_SESSION_TTL_DEFAULT_SECONDS,
@@ -807,10 +947,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parsePreviewSessionTtlSeconds,
     validate: validatePreviewSessionTtlSeconds,
     hint: PREVIEW_SESSION_TTL_HINT,
+    hintEn: 'Preview session lifetime in seconds, read at each use when issuing/renewing the preview cookie; 60..86400 (default 900 = 15 minutes); 0 is invalid (it expires the moment it is issued); upper bound 1 day',
   }),
   [ONBOARDING_IDLE_BACKOFF_MS_KEY]: Object.freeze({
     key: ONBOARDING_IDLE_BACKOFF_MS_KEY,
     label: '开户循环空闲退避上限（毫秒）',
+    labelEn: 'Onboarding loop idle-backoff cap (milliseconds)',
     // config 里没有这一档（`ONBOARDING_IDLE_BACKOFF_MAX_MS` 是循环直读 env、不经 `loadConfig`），
     // 所以 config 那一档永远「没给」⇒ 管理台报来源只会说 db / env / default，不假装是 config 配的。
     configPath: 'onboardingIdleBackoffMaxMs',
@@ -820,10 +962,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseOnboardingIdleBackoffMs,
     validate: validateOnboardingIdleBackoffMs,
     hint: ONBOARDING_IDLE_BACKOFF_MS_HINT,
+    hintEn: "Cap on the onboarding loop's idle backoff in milliseconds; 1..60000 (default 30000); when it claims work it drops back to the 5000ms baseline immediately, taking effect on the next tick (within at most 5s in this process, at most 5s across replicas)",
   }),
   [OFFBOARDING_IDLE_BACKOFF_MS_KEY]: Object.freeze({
     key: OFFBOARDING_IDLE_BACKOFF_MS_KEY,
     label: '销号循环空闲退避上限（毫秒）',
+    labelEn: 'Offboarding loop idle-backoff cap (milliseconds)',
     configPath: 'offboardingIdleBackoffMaxMs',
     envVar: 'OFFBOARDING_IDLE_BACKOFF_MAX_MS',
     defaultValue: OFFBOARDING_IDLE_BACKOFF_MS_DEFAULT,
@@ -831,10 +975,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseOffboardingIdleBackoffMs,
     validate: validateOffboardingIdleBackoffMs,
     hint: OFFBOARDING_IDLE_BACKOFF_MS_HINT,
+    hintEn: "Cap on the offboarding loop's idle backoff in milliseconds; 1..60000 (default 30000); when it claims work it drops back to the 5000ms baseline immediately; the 1h workspace cleanup gate is checked every tick and can be delayed by at most one backoff tick",
   }),
   [PROVISIONER_IDLE_BACKOFF_MS_KEY]: Object.freeze({
     key: PROVISIONER_IDLE_BACKOFF_MS_KEY,
     label: '对账循环空闲退避上限（毫秒）',
+    labelEn: 'Reconciliation loop idle-backoff cap (milliseconds)',
     configPath: 'provisionerIdleBackoffMaxMs',
     envVar: 'PROVISIONER_IDLE_BACKOFF_MAX_MS',
     defaultValue: PROVISIONER_IDLE_BACKOFF_MS_DEFAULT,
@@ -842,10 +988,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseProvisionerIdleBackoffMs,
     validate: validateProvisionerIdleBackoffMs,
     hint: PROVISIONER_IDLE_BACKOFF_MS_HINT,
+    hintEn: "Cap on the reconciliation loop's idle backoff in milliseconds; 1..15000 (default 15000); the upper bound 15000 is this loop's business cap (drift-detection latency is a business commitment); set to 5000 = no backoff (the fixed cadence before #520)",
   }),
   [PENDING_TOKEN_TTL_SECONDS_KEY]: Object.freeze({
     key: PENDING_TOKEN_TTL_SECONDS_KEY,
     label: '两步登录待决令牌有效期（秒）',
+    labelEn: 'Two-step login pending-token lifetime (seconds)',
     // config 返回对象扁平、没有 `auth` 这一档 ⇒ config 那档永远「没给」（口径同 P3 的 `loop.*`）。
     configPath: 'auth.pendingTokenTtlSeconds',
     envVar: 'PENDING_TOKEN_TTL_SECONDS',
@@ -854,10 +1002,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parsePendingTokenTtlSeconds,
     validate: validatePendingTokenTtlSeconds,
     hint: PENDING_TOKEN_TTL_SECONDS_HINT,
+    hintEn: 'Seconds from a two-step login pending token being issued to expiring; 1..3600 (default 120)',
   }),
   [SESSION_RENEW_INTERVAL_SECONDS_KEY]: Object.freeze({
     key: SESSION_RENEW_INTERVAL_SECONDS_KEY,
     label: '会话滚动续期间隔（秒）',
+    labelEn: 'Session rolling-renewal interval (seconds)',
     configPath: 'auth.sessionRenewIntervalSeconds',
     envVar: 'SESSION_RENEW_INTERVAL_SECONDS',
     defaultValue: SESSION_RENEW_INTERVAL_SECONDS_DEFAULT,
@@ -865,10 +1015,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseSessionRenewIntervalSeconds,
     validate: validateSessionRenewIntervalSeconds,
     hint: SESSION_RENEW_INTERVAL_SECONDS_HINT,
+    hintEn: 'Only write to the DB and reissue the cookie once more than this many seconds have passed since the last renewal; 1..86400 (default 3600)',
   }),
   [MAX_PASSWORD_LENGTH_KEY]: Object.freeze({
     key: MAX_PASSWORD_LENGTH_KEY,
     label: '口令长度上限（字符）',
+    labelEn: 'Maximum password length (characters)',
     configPath: 'auth.maxPasswordLength',
     envVar: 'MAX_PASSWORD_LENGTH',
     defaultValue: MAX_PASSWORD_LENGTH_DEFAULT,
@@ -876,10 +1028,12 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseMaxPasswordLength,
     validate: validateMaxPasswordLength,
     hint: MAX_PASSWORD_LENGTH_HINT,
+    hintEn: 'Maximum password length (characters); 1..4096 (default 256)',
   }),
   [MAX_LOGIN_LENGTH_KEY]: Object.freeze({
     key: MAX_LOGIN_LENGTH_KEY,
     label: '登录名长度上限（字符）',
+    labelEn: 'Maximum login name length (characters)',
     configPath: 'auth.maxLoginLength',
     envVar: 'MAX_LOGIN_LENGTH',
     defaultValue: MAX_LOGIN_LENGTH_DEFAULT,
@@ -887,6 +1041,58 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     parse: parseMaxLoginLength,
     validate: validateMaxLoginLength,
     hint: MAX_LOGIN_LENGTH_HINT,
+    hintEn: 'Maximum login name length (characters); 1..512 (default 128)',
+  }),
+  // P3 第七批：delegate 子 run 三格。`applyMode: 'restart'` 是这片的核心——值交给容器内 worker，
+  // portal 只在 provision 容器那一刻把它写进容器 env ⇒ 「热改」是假的（hint 里已明写）。
+  // configPath 用 `delegate.*` 这种 config 永不提供的点分路径（口径逐字同 Tier 2A 的 `auth.*`）：
+  // `config.js` 返回的对象里没有 `delegate` 这一层 ⇒ env 那一档只认 env 原话 + registry 默认（与 Tier 2A
+  // 那段的理由同一个：把 config 档当成真相会把「env 没给」误报成 `source=config`，#485 那格坑）。
+  // ⚠ 但「config 永不提供」≠「覆盖后的 config 里没有它」：`applyRuntimeOverrides` 遍历所有带
+  // `configPath` 的条目并 `setPath(next, path, value)` ⇒ 返回的那份新 config 里**确实有**
+  // `delegate.max` / `delegate.childRounds` / `delegate.childTimeoutMs`（DB 那一档还会按既有口径盖上
+  // `delegate.<x>Source = 'db'` 标注），只是 portal 进程内没有独立消费者——真正生效的值由 provisioner
+  // 现读 registry 后写进新容器的 env（那才是 `applyMode: 'restart'` 的物理原因）。
+  // `configPath` 在这里承担的是**可见性开关**：`listRuntimeSettingsAdmin` 会 `.filter((e) => e.configPath)`
+  // ⇒ 真省了它这三格在管理台根本不可见。（可见性与覆盖层是两件解耦的事，别混着说。）
+  [DELEGATE_MAX_KEY]: Object.freeze({
+    key: DELEGATE_MAX_KEY,
+    label: '子 run 并发上限（每容器）',
+    labelEn: 'Sub-run concurrency cap (per container)',
+    configPath: 'delegate.max',
+    envVar: 'ERIX_DELEGATE_MAX',
+    defaultValue: DELEGATE_MAX_DEFAULT,
+    applyMode: 'restart',
+    parse: parseDelegateMax,
+    validate: validateDelegateMax,
+    hint: DELEGATE_MAX_HINT,
+    hintEn: DELEGATE_MAX_HINT_EN,
+  }),
+  [DELEGATE_CHILD_ROUNDS_KEY]: Object.freeze({
+    key: DELEGATE_CHILD_ROUNDS_KEY,
+    label: '子 run 轮数预算',
+    labelEn: 'Sub-run round budget',
+    configPath: 'delegate.childRounds',
+    envVar: 'ERIX_DELEGATE_CHILD_ROUNDS',
+    defaultValue: DELEGATE_CHILD_ROUNDS_DEFAULT,
+    applyMode: 'restart',
+    parse: parseDelegateChildRounds,
+    validate: validateDelegateChildRounds,
+    hint: DELEGATE_CHILD_ROUNDS_HINT,
+    hintEn: DELEGATE_CHILD_ROUNDS_HINT_EN,
+  }),
+  [DELEGATE_CHILD_TIMEOUT_MS_KEY]: Object.freeze({
+    key: DELEGATE_CHILD_TIMEOUT_MS_KEY,
+    label: '子 run 时间预算（毫秒）',
+    labelEn: 'Sub-run time budget (milliseconds)',
+    configPath: 'delegate.childTimeoutMs',
+    envVar: 'ERIX_DELEGATE_CHILD_TIMEOUT_MS',
+    defaultValue: DELEGATE_CHILD_TIMEOUT_MS_DEFAULT,
+    applyMode: 'restart',
+    parse: parseDelegateChildTimeoutMs,
+    validate: validateDelegateChildTimeoutMs,
+    hint: DELEGATE_CHILD_TIMEOUT_MS_HINT,
+    hintEn: DELEGATE_CHILD_TIMEOUT_MS_HINT_EN,
   }),
 });
 
@@ -1633,6 +1839,27 @@ const maxLoginLengthHotReader = createHotReader({
   fallbackDefault: MAX_LOGIN_LENGTH_DEFAULT,
 });
 
+// P3 第七批：delegate 三格 = **三份独立实例**（各自一份缓存 / 代际号 / 在飞槽），不共用。
+// 这三份缓存读到的值只决定**下一个新容器**拿到的 env；已在跑的容器自己带着一份 env 副本，
+// 不受这些槽影响（这就是 `applyMode: 'restart'` 的物理原因）。
+const delegateMaxHotReader = createHotReader({
+  key: DELEGATE_MAX_KEY,
+  warnLabel: '子 run 并发上限',
+  fallbackDefault: DELEGATE_MAX_DEFAULT,
+});
+
+const delegateChildRoundsHotReader = createHotReader({
+  key: DELEGATE_CHILD_ROUNDS_KEY,
+  warnLabel: '子 run 轮数预算',
+  fallbackDefault: DELEGATE_CHILD_ROUNDS_DEFAULT,
+});
+
+const delegateChildTimeoutMsHotReader = createHotReader({
+  key: DELEGATE_CHILD_TIMEOUT_MS_KEY,
+  warnLabel: '子 run 时间预算',
+  fallbackDefault: DELEGATE_CHILD_TIMEOUT_MS_DEFAULT,
+});
+
 /**
  * 丢弃 TTL 缓存（P2a 对外的名字；实现是上面那个工厂里每一格自己的 `invalidate`）。
  * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（RS-7 钉住身份），P3 抽工厂后也不能换成间接层。
@@ -1697,6 +1924,24 @@ export function invalidateMaxLoginLengthCache() {
 }
 
 /**
+ * 丢弃 `delegate.max` 的缓存与在飞槽（口径同上；provisioner 建容器时现读）。
+ * ⚠ 失效只让**下一个新容器**拿新值；已在跑的容器要重建才生效（`applyMode: 'restart'`）。
+ */
+export function invalidateDelegateMaxCache() {
+  delegateMaxHotReader.invalidate();
+}
+
+/** 丢弃 `delegate.child_rounds` 的缓存与在飞槽（口径同上；只在下一个新容器上生效）。 */
+export function invalidateDelegateChildRoundsCache() {
+  delegateChildRoundsHotReader.invalidate();
+}
+
+/** 丢弃 `delegate.child_timeout_ms` 的缓存与在飞槽（口径同上；只在下一个新容器上生效）。 */
+export function invalidateDelegateChildTimeoutMsCache() {
+  delegateChildTimeoutMsHotReader.invalidate();
+}
+
+/**
  * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。一格一行；加新的热读旋钮就在这里多登记一行，
  * **不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
  * ⚠ **漏登记这一行是 P3 那族最典型的坑**：保存能写进库、界面也会回填 DTO，但本进程的
@@ -1715,6 +1960,12 @@ export const HOT_READ_INVALIDATORS = new Map([
   [SESSION_RENEW_INTERVAL_SECONDS_KEY, invalidateSessionRenewIntervalCache],
   [MAX_PASSWORD_LENGTH_KEY, invalidateMaxPasswordLengthCache],
   [MAX_LOGIN_LENGTH_KEY, invalidateMaxLoginLengthCache],
+  // P3 第七批：这三格也是 `applyMode` 不是 'hot'，但 portal 侧**仍要失效**：provisioner 每建一个
+  // 容器现读一次，不登记就是「保存完下一个新容器还是拿旧值最多 5 秒」（在飞那一趟更是不限时）。
+  // `applyMode: 'restart'` 说的是「已跑的容器要重建」，不是「portal 不读库」——两个口径别混。
+  [DELEGATE_MAX_KEY, invalidateDelegateMaxCache],
+  [DELEGATE_CHILD_ROUNDS_KEY, invalidateDelegateChildRoundsCache],
+  [DELEGATE_CHILD_TIMEOUT_MS_KEY, invalidateDelegateChildTimeoutMsCache],
 ]);
 
 /**
@@ -2009,6 +2260,27 @@ export function readMaxLoginLength(options = {}) {
   return maxLoginLengthHotReader.read(options);
 }
 
+/**
+ * `delegate.max` 的热读入口（默认 2，自己一份缓存）。
+ *
+ * 消费点是 `provisioner.js#buildContainerConfig`：**每建一个 FDE 容器现读一次**，把结果写进容器 env。
+ * ⚠ 它只影响**之后新建的容器**（`applyMode: 'restart'`）：已在跑的容器里的 worker 拿的是自己
+ *   创建时那份 env，不会因为这个数变了而变。
+ */
+export function readDelegateMax(options = {}) {
+  return delegateMaxHotReader.read(options);
+}
+
+/** `delegate.child_rounds` 的热读入口（默认 8，自己一份缓存；口径同上，只在下一个新容器上生效）。 */
+export function readDelegateChildRounds(options = {}) {
+  return delegateChildRoundsHotReader.read(options);
+}
+
+/** `delegate.child_timeout_ms` 的热读入口（默认 240000，自己一份缓存；口径同上）。 */
+export function readDelegateChildTimeoutMs(options = {}) {
+  return delegateChildTimeoutMsHotReader.read(options);
+}
+
 // ---------------------------------------------------------------------------
 // 管理台读/写（`GET /api/admin/runtime-settings`、`PUT /api/admin/runtime-settings/:key`）
 // ---------------------------------------------------------------------------
@@ -2035,9 +2307,19 @@ function toIso(value) {
  * 为什么不是「人人一个 null」：RS-16 钉的是「一项的键就是那八个」，而前端也得自己判空才能
  * 不渲染一行空提示。带与不带都由 registry 说话，前端只照 DTO 渲染。
  */
-function withHint(dto, entry) {
-  const hint = entry?.hint;
-  return typeof hint === 'string' && hint !== '' ? { ...dto, hint } : dto;
+/** 按 locale 选 label：`labelEn` 缺失 ⇒ 出中文（渐进覆盖；parity 闸保证 label/labelEn 成对）。 */
+function pickLabel(entry, locale) {
+  const zh = entry?.label ?? entry?.key;
+  return locale === 'en' && typeof entry?.labelEn === 'string' && entry.labelEn !== '' ? entry.labelEn : zh;
+}
+
+function withHint(dto, entry, locale = DEFAULT_LOCALE) {
+  // `hint` 的**有无**仍由中文 `hint` 决定（登记与否由 registry 说话，输出键名不变）；
+  // 只把**值**按 locale 换成 `hintEn`。`hintEn` 缺失 ⇒ 出中文（渐进覆盖，parity 闸保证 hint/hintEn 成对）。
+  const zh = entry?.hint;
+  if (typeof zh !== 'string' || zh === '') return dto;
+  const text = locale === 'en' && typeof entry?.hintEn === 'string' && entry.hintEn !== '' ? entry.hintEn : zh;
+  return { ...dto, hint: text };
 }
 
 /**
@@ -2046,7 +2328,7 @@ function withHint(dto, entry) {
  * `envTier` 是调用方算好的**过了闸的** env 那一档（`resolveEnvTier`）：管理台报的那个值必须与
  * 热读真正用的那个值是同一个数（#701 返修 LOW③：两边各算一套就是界面与行为分叉）。
  */
-function toSettingItem(entry, row, envTier, fallbackReason = null) {
+function toSettingItem(entry, row, envTier, fallbackReason = null, locale = DEFAULT_LOCALE) {
   const raw = row?.value;
   let parsed = { ok: false, reason: 'no_row' };
   if (row) {
@@ -2058,13 +2340,13 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
   }
   const base = {
     key: entry.key,
-    label: entry.label ?? entry.key,
+    label: pickLabel(entry, locale),
     applyMode: entry.applyMode === 'hot' ? 'hot' : 'restart',
     updatedAt: row ? toIso(row.updated_at) : null,
     updatedBy: row?.updated_by ?? null,
   };
   if (parsed?.ok) {
-    return withHint({ ...base, value: parsed.value, source: 'db', reason: null }, entry);
+    return withHint({ ...base, value: parsed.value, source: 'db', reason: null }, entry, locale);
   }
   // 回落：值来自 env 那一档（或 registry 默认），`reason` 说清为什么不是 db。
   // `row` 存在但值非法 ⇒ 保留库里那行的 updated_at/by（它们是真发生过的事），只是值不用它。
@@ -2088,7 +2370,7 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
     reason: bootSnapshot
       ? bootSnapshotReason
       : (row ? (parsed?.reason ?? 'invalid_db_value') : (fallbackReason ?? 'no_row')),
-  }, entry);
+  }, entry, locale);
 }
 
 /**
@@ -2102,6 +2384,7 @@ function toSettingItem(entry, row, envTier, fallbackReason = null) {
  */
 export async function listRuntimeSettingsAdmin({
   pool, config, registry = RUNTIME_SETTING_REGISTRY, timeoutMs, env = process.env, log = console,
+  locale = DEFAULT_LOCALE, // #803 S1：管理台按请求语言出 label/hint；缺省 zh-CN ⇒ 输出与改动前逐字相同
 } = {}) {
   const keys = Object.keys(registry);
   const entries = keys.map((key) => registry[key]).filter((entry) => entry?.configPath);
@@ -2146,6 +2429,7 @@ export async function listRuntimeSettingsAdmin({
         // 不许报一个「界面显示 env 的 30、实际却不会用这个数」的假来源。
         resolveEnvTier(entry, config, { env, log }),
         fallbackReason,
+        locale,
       );
       // #709 MED①：报 `db` + boot snapshot 的那一档，必须在 warn 里说清手里那个数是启动时快照
       // ——运维看到 source=db 会去找库，而不是去改 env。
@@ -2164,20 +2448,29 @@ export async function listRuntimeSettingsAdmin({
   };
 }
 
-/** 保存后的 DTO：值/时间/人**只来自 `RETURNING`**（口径 4），`label`/`applyMode` 是 registry 的静态元数据。 */
-function toSavedItem(entry, saved) {
+/**
+ * 保存后的 DTO：值/时间/人**只来自 `RETURNING`**（口径 4），`applyMode` 是 registry 的静态元数据，
+ * `label`/`hint` **按请求 locale 出**（#803 返修 M1）：前端保存成功后会用这个 item **顶掉界面上的
+ * 整行**（`stores/admin.ts#replaceRuntimeSetting`），这里恒中文 = 英文页面保存一次那一行当场变回
+ * 中文。`locale` 缺省 `DEFAULT_LOCALE` ⇒ 不传时与改动前逐字相同。
+ * 恒中文的仍然是**审计与 validate/校验错误消息**（日志面要稳定可检索，见下面注释）。
+ */
+function toSavedItem(entry, saved, locale = DEFAULT_LOCALE) {
   // `hint` 与 GET 同一口径（只在登记了的那格带）：保存后的那个 item 会直接替掉界面上的那一行，
   // 这里漏了它，保存完提示就消失（判据：RS-29 的 PUT 腿 + 前端视图 spec 的保存腿）。
   return withHint({
     key: saved.key,
-    label: entry?.label ?? saved.key,
+    // 审计台账与写侧校验错误**恒中文**（审计要语言稳定可检索；校验错误无 `en` ⇒ `http.js` 的
+    // pickMessage 自然出中文，S2/S3 再逐条双语）。回包的 `label` 则跟请求 locale 走（上面）：
+    // 它是给界面看的，不是给日志看的。`|| saved.key` 保住「entry 未登记时 label 不许是空串」。
+    label: pickLabel(entry, locale) || saved.key,
     value: saved.value,
     source: 'db',
     reason: null,
     applyMode: entry?.applyMode === 'hot' ? 'hot' : 'restart',
     updatedAt: saved.updatedAt ?? null,
     updatedBy: saved.updatedBy ?? null,
-  }, entry);
+  }, entry, locale);
 }
 
 /**
@@ -2188,11 +2481,15 @@ function toSavedItem(entry, saved) {
  * 响应体里**刻意没有它**（前端不显示，而多一个字段就是多一个要维护的形状；库里与审计里都有）。
  *
  * 审计已由 `saveRuntimeSetting` 在同一个事务里写好 ⇒ **调用方不得再补 `auth.audit`**。
+ *
+ * `locale`（#803 返修 M1）：只影响回包 DTO 的 `label`/`hint` 语言，缺省 `zh-CN`；**不参与任何
+ * 判定、不进审计、不改校验文案**（写侧的裁决与语言无关）。
  */
 export async function updateRuntimeSettingAdmin({
   pool, actorId = null, key, value, registry = RUNTIME_SETTING_REGISTRY, log = console,
+  locale = DEFAULT_LOCALE,
 } = {}) {
   const saved = await saveRuntimeSetting({ pool, actorId, key, value, registry, log });
   const entry = Object.hasOwn(registry, saved.key ?? key) ? registry[saved.key ?? key] : null;
-  return { item: toSavedItem(entry, saved), previousValue: saved.previousValue };
+  return { item: toSavedItem(entry, saved, locale), previousValue: saved.previousValue };
 }

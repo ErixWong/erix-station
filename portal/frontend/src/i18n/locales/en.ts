@@ -20,7 +20,6 @@ export const en = {
     emptyDir: '(empty directory)',
     noDir: '(no directory)',
     createFirstDir: 'Create a directory first',
-    adminConsole: 'Admin console',
     logout: 'Sign out',
     // issue #332：`platformAdminHint` / `goToAdmin` 与 zh-CN 同步删除（无工位平台管理员已被路由守卫
     // 送去管理台，这两句在工作台上不可达；键集对齐由 localeParity.spec + `satisfies MessageSchema` 钉）。
@@ -1284,6 +1283,8 @@ export const en = {
       copyFailed: 'Copy failed (the browser gave no clipboard), select the text manually.',
       restoreBuiltin: 'Restore built-in',
       titlePromptDefaultBytes: 'Built-in default (what actually goes out while following the default): {bytes}',
+      titlePromptDefaultView: 'View the built-in default full text',
+      titlePromptDefaultHide: 'Hide the built-in default full text',
       save: 'Save',
       reload: 'Reload',
       saved: 'Saved (what this page now shows is the value the server read back after writing, not what you typed).',
@@ -1314,6 +1315,36 @@ export const en = {
       },
       errNotText: 'This draft is not text, so not even its length can be computed — no request was sent.',
       footnote: 'Beyond these three, the platform has four more prompts living in the runner image (see the read-only card above). Slice 1 has no per-FDE override and no version history: to see who changed what, read the audit action admin.platform_prompts_updated (the audit stores digests only; the text lives in that configuration row).',
+      followsBuiltinPlaceholder: 'Leave empty = do not override: what is actually sent is the one in the "currently in effect" card above.',
+      reloadDiscard: 'Discard drafts and reload',
+      reloadedAt: 'Reloaded {time}',
+      effective: {
+        title: 'What is in effect right now (what the model is being told)',
+        intro: 'Left is the on-disk copy (the one actually injected into a run); right is what should be there given the two DB inputs. Only when both line up is it "in effect" — this is progress, not an alarm.',
+        selectFde: 'Select station',
+        loading: 'Loading the effective view…',
+        noFde: 'No user with a station identifier to choose yet.',
+        needFde: 'Pick a station first to see the effective value.',
+        verdictOk: 'In sync: the on-disk copy is exactly what should be there; the next run reads this one.',
+        verdictStale: 'The on-disk copy has not caught up (it changes at the next materialization; if the notice failed, it converges only after a portal restart rebuild)',
+        verdictUnavailable: 'Cannot compare: {reason}',
+        unavailableMissing: 'station not materialized yet (no such file on disk)',
+        unavailableNotAFile: 'that path is not a regular file',
+        unavailableReadFailed: 'reading that file failed',
+        unavailableTruncated: 'file exceeds the read limit and was truncated; no comparison',
+        diskBytes: 'On disk {bytes}',
+        expectedBytes: 'Expected {bytes}',
+        mtime: 'On-disk copy modified {time}',
+        mtimeNever: '—',
+        viewDisk: 'Expand on-disk copy',
+        hideDisk: 'Collapse on-disk copy',
+        viewExpected: 'Expand expected copy',
+        hideExpected: 'Collapse expected copy',
+        dbNote: 'The two DB inputs: addendum {addendum} bytes / override {override} bytes',
+        sourceNote: 'Current source: {source}',
+        sourceDb: 'Inputs taken from the config row (the three fields may still be empty = following the built-in)',
+        sourceBuiltin: 'Config row not readable ⇒ fell back to the built-in template',
+      },
     },
     // issue #677 slice P2b: admin "Runtime settings" list (views/AdminRuntimeSettingsView.vue,
     // contract docs/api/portal.md §4.21). Same family as admin.upload but a *list* (issue P3 keeps
@@ -1359,10 +1390,13 @@ export const en = {
       fieldPointed: ' (the server says the fault is in: {field})',
       footnote: 'The UI does not police ranges: any parsed integer is sent as-is '
         + '(out of range ⇒ the server rejects it and writes nothing, §4.21). A row whose '
-        + '“Takes effect” column says it needs a restart only applies after station-portal '
-        + 'restarts — “Saved” here never means “in effect”. And “takes effect immediately” does '
-        + 'not cross processes: in a multi-replica deployment the other station-portal processes '
-        + 'see the new value after at most 5 seconds.',
+        + '“Takes effect” column says it needs a restart does not reach what is already running: '
+        + 'what has to be restarted is stated in the small print under that row '
+        + '(some settings need station-portal restarted, some need the FDE container recreated, '
+        + 'and recreating an FDE container interrupts the runs in progress on that workstation). '
+        + '“Saved” here never means “in effect”. And “takes effect immediately” does not cross '
+        + 'processes: in a multi-replica deployment the other station-portal processes see the new '
+        + 'value after at most 5 seconds.',
     },
     // issue #449 admin slice: mail channel settings (views/AdminMailView.vue, contract docs/api/portal.md §4.12).
     // This page is the only switch for the email-code second factor; the password is write-only

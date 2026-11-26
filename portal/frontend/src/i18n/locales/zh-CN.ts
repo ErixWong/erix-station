@@ -31,8 +31,6 @@ export const zhCN = {
     emptyDir: '（空目录）',
     noDir: '（无目录）',
     createFirstDir: '先创建目录',
-    // 顶栏「管理台」入口（role==='admin' 者可见；#332 后能站上工作台的 admin 必然同时有工位）
-    adminConsole: '管理台',
     logout: '登出',
     // issue #332：`platformAdminHint` / `goToAdmin` 两句已删——无工位的平台管理员被路由守卫
     // 直接送进管理台，上两句在工作台上永久不可达（不留「以防万一」的死文案）。en.ts 同步删。
@@ -1291,6 +1289,8 @@ export const zhCN = {
       copyFailed: '复制失败（浏览器没给剪贴板能力），请手动选中。',
       restoreBuiltin: '恢复内置',
       titlePromptDefaultBytes: '内置默认（跟随内置时实际发出去的就是它）：{bytes}',
+      titlePromptDefaultView: '查看内置默认全文',
+      titlePromptDefaultHide: '收起内置默认全文',
       save: '保存',
       reload: '重新读取',
       saved: '已保存（下面显示的就是服务端落库后回读的那一份，不是你敲的那一串）。',
@@ -1321,6 +1321,36 @@ export const zhCN = {
       },
       errNotText: '这一格的草稿不是一个文本，连长度都算不出 ⇒ 没有发请求。',
       footnote: '这三条之外平台还有 4 条提示词住在 runner 镜像里（见上面那张只读卡）。本期不做 per-FDE 覆盖，也不做版本历史：想知道是谁改的去看审计 action=admin.platform_prompts_updated（审计只存摘要，正文在这一行里）。',
+      followsBuiltinPlaceholder: '留空 = 不覆写：实际发出去的是上面「当前生效」那张卡里的那一份。',
+      reloadDiscard: '放弃草稿并重新读取',
+      reloadedAt: '已重新读取 {time}',
+      effective: {
+        title: '当前生效的那一份（模型现在被说了什么）',
+        intro: '左边是盘上那份（实际注入进 run 的就是它），右边是按库里那两个输入该有那份。两份都对上才是「已生效」；这是进度不是警报。',
+        selectFde: '选择工位',
+        loading: '正在读取生效面…',
+        noFde: '还没有带工位标识的用户可选。',
+        needFde: '先选一个工位再看生效值。',
+        verdictOk: '一致：盘上那份就是该有那份，下一次 run 吃的就是它。',
+        verdictStale: '盘上那份还没跟上（下一次物化才换；通知没成功时要等 portal 重启的全量重建）',
+        verdictUnavailable: '比对不了：{reason}',
+        unavailableMissing: '工位还没物化（盘上没有那份文件）',
+        unavailableNotAFile: '那个位置不是普通文件',
+        unavailableReadFailed: '读那份文件时出错',
+        unavailableTruncated: '文件超过读上限、已截断，不再比对',
+        diskBytes: '盘上那份 {bytes}',
+        expectedBytes: '该有那份 {bytes}',
+        mtime: '盘上那份修改于 {time}',
+        mtimeNever: '—',
+        viewDisk: '展开盘上那份',
+        hideDisk: '收起盘上那份',
+        viewExpected: '展开该有那份',
+        hideExpected: '收起该有那份',
+        dbNote: '库里那两个输入：追加段 {addendum} 字节 / 覆写 {override} 字节',
+        sourceNote: '当前来源：{source}',
+        sourceDb: '输入取自配置行（三格可能仍是空 = 跟随内置）',
+        sourceBuiltin: '配置行读不到 ⇒ 已回落内置模板',
+      },
     },
     // issue #677 P2b：管理台「运行时设置」列表（views/AdminRuntimeSettingsView.vue，契约 §4.21）。
     // 与 admin.upload 同族，但**是一列表**（P3 会往 registry 里逐格加旋钮）⇒ 文案里不许出现
@@ -1361,8 +1391,9 @@ export const zhCN = {
       // 尾注三件事：① 前端不抢服务端的闸；② restart 档「已保存 ≠ 生效」；③ §4.21 的生效时机边界
       // —— 读侧缓存按进程，所以「立即」只对处理这次 PUT 的那个进程成立，多副本最多 5 秒后才收敛。
       footnote: '前端不做区间校验：解析得出整数就照发（越界由服务端拒并零写库，§4.21）。'
-        + '生效方式显示「需重启」的项，改完要重启 station-portal 才生效'
-        + '——页面上那句「已保存」不等于生效。'
+        + '生效方式显示「需重启」的项，改完不会立刻作用到正在跑的东西——要重启什么以这一行下方的说明为准'
+        + '（有的要重启 station-portal，有的要重建 FDE 容器，而重建 FDE 容器会打断该工位正在跑的 run）。'
+        + '页面上那句「已保存」不等于生效。'
         + '而「立即生效」也不越进程：多副本部署下，其它 station-portal 进程最多 5 秒后才看到新值。',
     },
     // issue #449 管理台切片：邮件通道配置（views/AdminMailView.vue，契约 docs/api/portal.md §4.12）。

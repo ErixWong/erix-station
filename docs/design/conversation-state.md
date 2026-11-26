@@ -68,7 +68,7 @@ pi（本地单用户，无远端宿主）的会话模型与 erix-agent store 机
 三条不可让步的点：
 
 - **入队绝不写 `messages` / `transcript_rounds`**。§6 把 `messages` 定成纯锚点行、正文真相在树；而**还没说出口的话**一旦进树，就同时被模型看见并被界面渲染成「已发送」——那是把「排队」实现成了「插话且撒谎」。投递那一刻才走既有写入路径，**入队面零写入第①/②层**。
-- **队列是状态，不是历史**：真相在 `queued_inputs`，快照由会话详情全量给出，SSE 的 `queue_update` 只是通知（不落 `run_events`、不参与回放）。这条区分决定了它为什么能在刷新、换设备、断线重连之后仍然在那里——也正是 pi 内存队列（`Agent.steeringQueue`，其自身注释承认 "dead wrapper (no state) means the queue is gone"）在本架构下不能照抄的原因。
+- **队列是状态，不是历史**：真相在 `queued_inputs`，快照由会话详情全量给出，SSE 的 `queue_update` 只是通知（不落 `run_events`、不参与回放）。这条区分决定了它为什么能在刷新、换设备、断线重连之后仍然在那里——也正是 pi 内存队列（`Agent.steeringQueue`，其自身注释承认 "dead wrapper (no state) means the queue is gone"）在本架构下不能照抄的原因。**但「投递那一刻」是个分界**：那句话从此刻起**不再是队列内容**，它已经走既有写入路径成了一条普通用户消息（**历史**），所以它的展示落点在**对话流**里（`queue_update` 帧带 `delivered` 就是它，前端据此当场出 user 气泡），**不在队列条里**——队列条只装还没说出口的那几条（issue #799）。
 - **投递由服务端在 run 终态驱动，不由浏览器驱动**。pi/pi-web 用 `agent_end` 回调出队，那是浏览器进程里的回调：关页面 = 那句话蒸发。本站是「容器是牲口、DB 是真相」，出队点必须在 portal 的**终态产出处**（五处，见 `docs/data/model.md` §1.29 与 `portal/test/queued-inputs-wiring.test.js` 的接线断言）——关掉页面，队照样在，也照样会发。
 
 转向（steer）在本模型下**不改变树的形状**：它只是让当前 run 在轮边界停下（runner §6.3-8b），随后那句话作为一条普通用户消息追加到同一棵 session 树上、起一个新 run 续接。会话真相仍然单源，run 仍然只是运维单元。
@@ -118,9 +118,9 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 
 ### 落点与可替换性
 
-- **投影逻辑收敛到单一模块** `portal/src/session-view.js`，读路径只经它。**读侧已换上游官方投影（#95 闭环）**：
-  「文本 / blocks / reasoning / 折叠」的推导自 PR②b 起由 `erix-agent` 0.15.0 的
-  `projectTranscriptForDisplay(records)`（`docs/host-consumer-contract.md` → "Host display projection"）提供，
+- **投影逻辑收敛到单一模块** `portal/src/session-view.js`，读路径只经它。**读侧已换本仓投影 `portal/src/display-projection.js`（来源见文件头）（#95 闭环）**：
+  「文本 / blocks / reasoning / 折叠」的推导自 PR②b 起由本仓
+  `projectTranscriptForDisplay(records)`（`portal/src/display-projection.js`，来源见文件头）提供，
   **自研部分只剩锚点元数据映射**。官方投影不承担、仍由 station 承担的三条规则：
   ① **锚点元数据**（`id`/`seq`/`run_id`/`attachments`/`synthetic`/`created_at` 取自 `messages` 锚点行——引擎没有「消息行」概念）；
   ② **助手文本的 run 归属**（投影输出不带 `run_id`，而 UI 的助手气泡必须落到某个 run：显式 `run_id` 列 → 该 run、
@@ -132,8 +132,8 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
   `RoundRecord` 内部字段不是 → 本模块不再读 `messages`/`response`/`foldedPayload` 的结构；未知 `meta` 键忽略。
   展示口径的两点细化：`reasoning` 与正文分离（不进 DTO `content`）；折叠轮按官方规则展示
   「摘要 + 范围 + 导航指针」，`foldedPayload` 原文不进对话流（DTO 是锚点驱动的、没有可承载官方 system 折叠行的锚点，
-  故折叠摘要只在该 run 无自身助手正文时顶上——与契约 ③「显示的是历史消息」一致）。
-- **对话流 DTO 透传投影展示字段（issue #188）**：`GET /api/sessions/:id` 的助手锚点 DTO 增带上游投影的
+  故折叠摘要只在该 run 无自身助手正文时顶上——与契约 ③「显示的是历史消息」一致）。折叠呈现的**结构化数据来源是 `folded.facts`（#816）**（title / 区间 / origin / 工具足迹等，逐子键缺席即不知道），但 `foldedPayload` 原文仍不进对话流。
+- **对话流 DTO 透传投影展示字段（issue #188）**：`GET /api/sessions/:id` 的助手锚点 DTO 增带本仓投影的
   `toolCalls`/`reasoning`/`blocks`（**逐字、原名透传**，无则不写该键——不塞 `undefined`/`null` 占位）；
   宿主独有的 UI 元数据（`id`/`run_id`/`seq`/`attachments`/`synthetic`/`created_at`）语义与命名不变。
   前端**加载/刷新路径**据此重建工具卡片与推理展示（reasoning 与正文分离、默认收起可展开），与实时/历史事件流
@@ -208,7 +208,7 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | **①读路径投影** | 定义投影 DTO 与派生规则（`id`/`seq`/`attachments`/`run` 归属/折叠呈现），`GET /api/sessions/:id` 改走投影；`messages` 仍双写（本 PR 不动写路径，保证可回退）；带**过渡兜底**：当前写路径尚未把用户输入落入 transcript 时，缺少可派生内容的锚点暂回退到自身内容 | 根 `npm test`、前端 `vue-tsc` + vitest、`wp3a`/`wp5` e2e；DTO 字段与语义不变 → **前端零改动** |
 | **②a 先落树再入队（本 PR）** | portal POST 事务内写 session transcript；删 runner 预写入分支；新增 0015 一次性回填历史 user 输入；删除 PR① 投影内容兜底 | 根 `npm test`、前端 typecheck/vitest；真机由主 agent 验证同 session 多轮、崩溃 resume 与 transcript/投影等价性（所有非合成消息内容有 transcript 证据且非空） |
 | **②b 停内容双写与切换数据源** | `messages` 降级为锚点行（停止写 `content`）；终态幂等比较从 `messages.final_text` 换到 transcript；AI 标题首条用户文本改从 transcript 取 | 根 `npm test`、前端两项、`wp3a`/`wp3b`/`wp5` e2e |
-| **②b-读侧（已完成，`feat-261008-11-display-projection`）** | 读侧文本/blocks/reasoning/折叠推导改由上游官方 `projectTranscriptForDisplay` 提供（#95 闭环），自研只剩锚点元数据映射；删除 PR① 的内容匹配用于 `:input:` 行的分支（改 `meta.dedupKey` 精确映射） | 根 `npm test`（0 失败）、前端 `vue-tsc` + vitest（272 项）；真机全库等价性由主 agent 复验 |
+| **②b-读侧（已完成，`feat-261008-11-display-projection`）** | 读侧文本/blocks/reasoning/折叠推导改由本仓投影 `projectTranscriptForDisplay`（`portal/src/display-projection.js`，来源见文件头）提供（#95 闭环），自研只剩锚点元数据映射；删除 PR① 的内容匹配用于 `:input:` 行的分支（改 `meta.dedupKey` 精确映射） | 根 `npm test`（0 失败）、前端 `vue-tsc` + vitest（272 项）；真机全库等价性由主 agent 复验 |
 | **②b-B1 文本读取点改源（已完成，`feat-261008-12b-reread-source`）** | `messages.content` 的 **6 个读取点已改源（B1）**：全部改从 transcript 投影取文本（共享模块 `portal/src/session-text.js`，内部复用 `session-view.js` 的 `projectSessionMessages`/`recordForProjection` 口径，不另写一份投影）——① AI 改名上下文、② 自动标题降级链首条、③ 话题漂移最新一条、④ claim ticket 的 `task`（按 `<sessionId>:input:<messageId>` 单行精确命中，`attachments` 仍取 `messages`）、⑤ issue #69 历史上行（锚点集合/排除/预算截断不变，只有正文改源）、⑥ 终态幂等比较的 `stored.final_text`。**本单不停写内容**（行为保持型）：`messages.content` 照旧写入，仅当投影对该锚点无证据时才 legacy 回退该列（迁移 0015 之前的行；legacy-only，不用于新会话） | 根 `npm test`（0 失败，基线 679 项全绿 + 新增 16 项）、前端 `vue-tsc` + vitest（272 项）；每个读取点至少 1 个「正文来自 transcript」断言，② 另含「输入行取不到时的回退顺序」用例 |
 | **②b-B2 停写内容（已完成，`feat-261008-12d-stop-write`）** | **`messages` 降级为纯锚点行**：仅剩的两个 `messages.content` 写入点（POST 用户行 / 终态 assistant 行）改写空串——用户输入的文本真相已由契约① 的 `appendUserTurn` 落树，终态答复由引擎写 transcript。assistant 行的「有终态文本才建行」前置条件**不变**（它决定要不要产生一条锚点），只是不再携带正文；`content` 列仍是 `text NOT NULL`（**baseline `schema.sql` 冻结、不改 DDL**）。**legacy 兜底保留**（新行 content 为空串 → 投影恒有证据 → 不会触发；兜底只对迁移 0015 之前的老行有意义）。`POST .../messages` 的 202 响应体 `message.content` 改为**回显请求正文**（不再从 `messages` 读回），否则前端 `send()` 渲染的用户气泡会变空。前瞻约束：**`synthetic = true` 的宿主注入行（judge/wrapup）必须仍写正文**（它在 transcript 里没有对应轮次，读侧 `session-view.js` 的 `anchor.synthetic === true` 分支与 `session-text.js` 的 `CASE WHEN synthetic THEN content END` 取的就是锚点自身文本）；当前全库无此类写入点，已用构造用例钉住（`session-text.test.js` / `session-view.test.js`） | 根 `npm test`（0 失败，基线 695 项→698 项）、前端 `vue-tsc` + vitest（272 项）；两个写入点各有「落库 content = 空串」断言，读路径既有投影/DTO 用例全绿；真机 `wp3a`/`wp3b`/`wp5` 由主 agent 复验 |
 | **②c 残留数据收敛（待做）** | 把 0015 之前的残留行补齐到 transcript 证据，再收敛/退役 `session-text.js` 的 legacy 兜底分支（B2 只停写、**不删兜底**：删了老会话就地丢正文） | 根 `npm test`、前端两项、e2e |

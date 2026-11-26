@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { getSession } from '../src/sessions.js';
 import { projectSessionMessages, recordForProjection } from '../src/session-view.js';
-import { projectTranscriptForDisplay } from 'erix-agent';
+import { projectTranscriptForDisplay } from '../src/display-projection.js';
 
 const SESSION_ID = '10000000-0000-4000-8000-000000000001';
 const LEGACY_SESSION_ID = '10000000-0000-4000-8000-000000000002';

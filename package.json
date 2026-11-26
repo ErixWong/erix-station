@@ -8,7 +8,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test",
+    "test": "node --test && node scripts/check-integration-syntax.mjs",
     "test:integration": "node --test portal/integration/wp2a-e2e.mjs",
     "test:integration:wp3a": "node --test portal/integration/wp3a-e2e.mjs",
     "test:integration:wp3b": "node --test portal/integration/wp3b-e2e.mjs",
@@ -19,15 +19,18 @@
     "test:integration:seat": "node --test portal/integration/seat-content-e2e.mjs",
     "test:integration:llm-usage": "node --test portal/integration/llm-usage-e2e.mjs",
     "test:integration:user-usage": "node --test portal/integration/user-usage-e2e.mjs",
+    "test:integration:locale": "node --test portal/integration/admin-locale-e2e.mjs",
     "test:integration:db": "node --test portal/integration/db-integration.mjs",
     "test:integration:prompts": "node --test portal/integration/platform-prompts-db.mjs",
+    "test:integration:prompts-ui": "node --test portal/integration/prompts-effective-e2e.mjs",
     "start": "node portal/src/cli.js serve",
     "db:migrate": "node portal/src/cli.js migrate",
     "healthcheck": "node portal/src/cli.js healthcheck",
     "check:agents-hotlayer": "node scripts/agents-hotlayer-budget.mjs",
     "check:doc-portable": "node scripts/check-doc-portable.mjs",
     "check:ci-legs": "node scripts/check-required-legs.mjs",
-    "check:doc-impl": "node scripts/check-doc-impl.mjs"
+    "check:doc-impl": "node scripts/check-doc-impl.mjs",
+    "check:integration-syntax": "node scripts/check-integration-syntax.mjs"
   },
   "dependencies": {
     "erix-agent": "0.33.0",

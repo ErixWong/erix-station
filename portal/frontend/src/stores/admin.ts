@@ -38,10 +38,13 @@ import {
 import {
   PLATFORM_PROMPTS_PATH,
   buildPromptPayload,
+  effectiveAgentsMdPath,
   materializeNoticeOf,
+  normalizeEffectiveAgentsMd,
   normalizePlatformPrompts,
   platformPromptPath,
   promptValidationFieldOf,
+  type EffectiveAgentsMd,
   type MaterializeNotice,
   type PlatformPrompts,
   type PromptFieldKey,
@@ -392,6 +395,13 @@ export const useAdminStore = defineStore('admin', {
     promptSavedField: null as PromptFieldKey | null,
     // `materializeEnqueued` 的语义结论（`0` 与「没给」都是要显式说出口的事，不许静默）。
     promptNotice: null as MaterializeNotice | null,
+    /** issue #801：「重新读取」成功那一刻（ISO 串）；`null` = 本页还没手动重读过。 */
+    platformPromptsReloadedAt: null as string | null,
+    /** issue #801：`GET /api/admin/prompts/effective-agents-md` 的归一化结果。 */
+    effectiveAgentsMd: null as EffectiveAgentsMd | null,
+    effectiveAgentsMdLoading: false,
+    effectiveAgentsMdErr: null as string | null,
+    effectiveAgentsMdFde: null as string | null,
     // issue #677 P2b：管理台「运行时设置」列表（§4.21）。与 upload 那段同构，但**是列表**（P3 会往
     // registry 里一格一格加旋钮），所以「正在保存」「刚保存」「被标红」三件事都必须带 **key**，
     // 布尔位做不到这件事（一个布尔位 = 一整页的按钮同时转圈）。
@@ -1099,12 +1109,39 @@ export const useAdminStore = defineStore('admin', {
         const data = await api<unknown>(PLATFORM_PROMPTS_PATH);
         this.platformPrompts = normalizePlatformPrompts(data);
         this.platformPromptsLoaded = true;
+        this.platformPromptsReloadedAt = new Date().toISOString();
         return null;
       } catch (e) {
         this.platformPromptsErr = t('admin.errorPrefix') + this.errText(e);
         return this.platformPromptsErr;
       } finally {
         this.platformPromptsLoading = false;
+      }
+    },
+
+    /**
+     * issue #801：按工位取「实际生效的那一份」（§4.19-5）。**每次现读、不缓存**（口径同 `loadPlatformPrompts`）。
+     * 读不到（工位没物化 / DB 回落）都是 200 + `disk.state` / `reason`，只有工位不存在与非法参数才是错。
+     */
+    async loadEffectiveAgentsMd(fdeName: string): Promise<string | null> {
+      if (typeof fdeName !== 'string' || fdeName === '') {
+        this.effectiveAgentsMd = null;
+        this.effectiveAgentsMdErr = t('admin.prompts.effective.needFde');
+        return this.effectiveAgentsMdErr;
+      }
+      this.effectiveAgentsMdLoading = true;
+      this.effectiveAgentsMdErr = null;
+      this.effectiveAgentsMdFde = fdeName;
+      try {
+        const data = await api<unknown>(effectiveAgentsMdPath(fdeName));
+        this.effectiveAgentsMd = normalizeEffectiveAgentsMd(data);
+        return null;
+      } catch (e) {
+        this.effectiveAgentsMd = null;
+        this.effectiveAgentsMdErr = t('admin.errorPrefix') + this.errText(e);
+        return this.effectiveAgentsMdErr;
+      } finally {
+        this.effectiveAgentsMdLoading = false;
       }
     },
 

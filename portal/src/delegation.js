@@ -22,7 +22,7 @@
 //      账本先 `stat` 判大小（> 8 MiB ⇒ 413）再读，不许无上限 `readFileSync`；切尾必须在**投影之后**。
 //
 // 投影与主对话同形（§5.1）：`portal/src/transcript-fold.js#foldLedgerRecords`（0.23「一条消息一落盘」
-// 的读侧折叠，`runner/lib/store.js#load` 用的同一份口径）→ `erix-agent` 包根导出的
+// 的读侧折叠，`runner/lib/store.js#load` 用的同一份口径）→ 本仓 `portal/src/display-projection.js`（来源见文件头）的
 // `projectTranscriptForDisplay`（`session-view.js` 同一个函数）→ 最后才 `slice(-tail)`。
 // ⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 的导出面**（实测 `undefined`，
 // 深引被 `exports` 挡）⇒ 只能用本站镜像；那正好也是  那份「两份 SHARED-FOLD-CORE 逐字节
@@ -31,7 +31,7 @@
 import fsSync from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { projectTranscriptForDisplay } from 'erix-agent';
+import { projectTranscriptForDisplay } from './display-projection.js';
 import { foldLedgerRecords } from './transcript-fold.js';
 import { fetchSession } from './sessions.js';
 import { validateFdeName } from './projects.js';

@@ -68,6 +68,7 @@
 | 管理 | `PUT /api/admin/prompts/addendum` | **平台补充约定：写**（#596 片 A，§4.19）。`{text}`（`""` = 清空那一节）≤ 8192 字节，且**渲染后的整份 `~/AGENTS.md`** 必须 ≤ 16384 字节，否则 `400 validation_failed` 且**一条写语句都不发**；成功回完整 GET DTO + `materializeEnqueued` ⇒ **该工位下一次 run 生效** |
 | 管理 | `PUT /api/admin/prompts/agents-md` | **平台约定整段覆写：写**（#596 片 A，§4.19）。`{text}`（`""` = 恢复内置模板）≤ 16384 字节 + 同一条渲染闸；生效时机同上 |
 | 管理 | `PUT /api/admin/prompts/title-prompt` | **会话标题提示词：写**（#596 片 A，§4.19）。`{text}`（`""` = 用内置默认）≤ 2000 字节；**不涉物化**（`materializeEnqueued` 恒 `0`）⇒ **下一次改名就生效** |
+| 管理 | `GET /api/admin/prompts/effective-agents-md` | **按工位取「实际生效的那一份」：读**（#801，§4.19-5）。`?fde=<工位名>` ⇒ 同时给「盘上那份」与「按 DB 该有那份」两份账 + `matches` 三态；**零写零审计**，工位不存在 `404`、参数非法 `400` |
 | 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
 | 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
 | 管理 | `POST /api/admin/tls/inspect` | **解析但不落盘**（#456 M2，§4.13-3a）：`{certPem,keyPem?}` → 证书元数据 + `keyMatches` 三态 + 覆盖判定 + `warnings`。**零副作用**（不写盘/DB/审计、不动 `tlsLive`、不烧上传配额）；每管理员 120 次/小时 |
@@ -1033,6 +1034,13 @@ station-portal user enable  --login <login>
 
 **客户端口径（前端 `stores/site.ts` + `lib/hostGate.ts`）**：拿不到（网络 / 5xx / 超时 / 缺字段）⇒ **fail-open，不跳**（跳错方向比不跳更糟：管理台不可达时会把用户踢到死地址）；失败后缓存 30s 再重试，并发导航只发一次请求（单飞）。判据与落点见 `portal/frontend/src/lib/hostGate.ts`（纯函数，六行矩阵逐条单测）。
 
+**附：请求语言（locale）——服务端下发的文案按它出语言（#803 S1）**。这一条是全请求级的通用行为（不只影响本端点），登记在此是因为它是唯一面向匿名客户端、讲「客户端怎么告知服务端自己要什么」的入口小节。谈判顺序：`Cookie: locale=`（白名单 `zh-CN` | `en`，脏值忽略）→ `Accept-Language`（按 q 值，`zh*` ⇒ `zh-CN`、`en*` ⇒ `en`，`*` 与其他语言落回）→ 缺省 `zh-CN`（**缺省必须还是 `zh-CN`**，是既有契约）。它决定两类**服务端拼装、随响应下发**的文案的语言：
+
+1. **错误响应的 `message`**：响应体仍是 `{ error: { code, message, retryable, details } }`（形状不变）；抛出点显式给了英文（`HttpError` 的 `en`）才在 `en` 下出英文，**没给的地方照旧出中文**（渐进覆盖，不是 bug）。口径说准确些（#803 返修 m7，原来写「`Error.message` 恒为中文」过于绝对）：**带中文原文的抛出点在补上 `en` 之前照旧出中文**，那些抛出点的中文原文是日志与审计检索的依赖、**不许动**；但**上游异常的消息不经谈判**（例：`LlmGatewayError` 由 `portal/src/llm-gateway.js` 抛出、本来就是英文；`portal/src/http.js` 的请求 catch 里也有直接把 `err.message` 发出去的出口，不走文案挑选），所以**不要把「响应里的 `message` 恒为中文」当契约写进客户端**。
+2. **运行时设置的 `label` / `hint`**（见 §4.21）：按 locale 选 `labelEn` / `hintEn`；**只给中文就出中文**。
+
+两类都**不改输出字段名**（前端零改）。谈判在 `portal/src/locale.js`（零依赖纯函数）；错误出口接在 `portal/src/http.js` 的请求 catch（每请求只谈一次），管理台读侧接在 §4.21 的 GET（传请求 locale），**写侧 PUT 的回包与 GET 同一套谈判**（#803 返修 M1）：保存成功回的那个 `item` 会被前端拿去**顶掉表格里的那一行**，恒中文等于「英文页面保存一次，那一行当场变回中文」。恒中文的面不变：**审计台账、`validate()`/校验错误消息**（日志与审计要语言稳定可检索）。管理面（`/api/admin/*`）由 `portal/src/admin.js` 抛的**校验与操作类错误已按请求语言出**（英文对写在抛出点、`Error.message` 仍是中文原文）；其余服务端文件仍逐片补 `en`，**没补的照旧出中文，不是故障**。
+
 ---
 
 ---
@@ -1363,7 +1371,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 **对话流 DTO 的 `messages[]` 展示字段（`GET /api/sessions/:id`）**
 
 助手锚点上除宿主元数据（`id`/`run_id`/`seq`/`role`/`content`/`synthetic`/`attachments`/`created_at`）外，
-还挂上游官方投影 `projectTranscriptForDisplay` 的展示字段（issue #188/#189：**逐字、原名透传，有则出现、
+还挂本仓投影 `projectTranscriptForDisplay`（`portal/src/display-projection.js`，来源见文件头）的展示字段（issue #188/#189：**逐字、原名透传，有则出现、
 无则不写该键**）：`toolCalls[]`、`reasoning`、`blocks`、`turnKeys`、`folded`。
 
 | 字段 | 来源 | 口径 |
@@ -1371,6 +1379,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 | `messages[].toolCalls[]` | 引擎投影 | `{key, name, id?, argsSummary?, resultPreview?, isError?, executionStatus?}`（预览长度由上游定） |
 | `messages[].toolCalls[].durationMs` | **宿主 join**（issue #283） | 毫秒。⚠ **引擎投影不带这个字段**（`DisplayTurn.toolCalls[]` 的形状里没有时长），它由 `portal/src/session-view.js` 在投影**之后**按 `(run_id, call_id)` 从本站 `tool_calls.duration_ms` 补上（数据源 = §9.4 的 U3 `tool_result` UPDATE）。`call_id` 即事件里的 `tool_call_id` = `toolCalls[].id`。 |
 | `messages[].folded.hasSummary` | **宿主判定**（issue #390-A） | boolean。**这个键不是上游字段**，是 `portal/src/session-view.js` 按折叠行自己的 `record.summary` 形态算出来的：上游契约（erix-agent `src/store/file.js:25`）是 `summary?:{action:string,note:string}|"missing"` ⇒ 只有 `{action,note}` 且至少一项非空才算“有真摘要”，字面量 `"missing"`（现网 17/17 条折叠行都是这个值）、缺键、空壳都算没有。存否口径与 `round` 绑定：**轮号取不到就整个不带这个键**（缺席 = 前端“不知道”，不得当成 `false` 把旧数据的展开控件抹掉）。存要的作用是：没有真摘要时，摘要区只是把横幅标题换个说法重说一遍（“已压缩第 1–94 轮” vs “早期第 1–94 轮已折叠。”），前端据此不画展开控件。 |
+| `messages[].folded.facts` | 引擎 `record.foldedFacts`（issue #565 / #897，宿主仅逐项清洗、不重推导） | **嵌套键**（不是平铺 8 个键）：把账本里本就有的结构化事实透传进 DTO，供折叠呈现重设计（一行「范围 · title · 工具足迹」）直接取用。子键**全部缺席 = 不知道**：`title?string`（引擎已剥 marker、夹到 60 字符，原样）／`summary?string`（模型给的 description）／`origin?` ∈ 白名单 `['mechanical','semantic','host']`（白名单外一律不给键）／`from?number`·`to?number`（安全整数才给）／`rounds?number`（安全正整数才给）／`toolCalls?:{name:string,argsSummary?:string}[]`（逐项清洗：非空 trim 后 `name` 才收、空 `argsSummary` 不带该子键；清洗后为空 ⇒ 不给 `toolCalls` 键而非 `[]`；不截断、不改写内容）／`summaryDropped?:true`·`titleFallback?:true`（仅 `=== true` 才给）。每个子键取不到就**不写这个键**，绝不写 `null`/`false`/`0`/空串；`foldedFacts` 不是对象或是数组 ⇒ **整个 `facts` 键不出现**。`summary`/`summaryDropped`/`titleFallback` 是为引擎即将落地的 #897 预留的读点（0.33.0 上天然缺席，引擎补上后本站零改动即可用）。⚠ `facts.summary`（模型给的 description）与 `summaryText`（= `foldedFacts.text`，替代物正文）是**两份不同的东西**，不许合并成一个键。 |
 
 - **旧数据口径**：库里 `duration_ms` 为 `NULL`（引擎当年就没给时长的那批历史调用，见 §5.3 第 7 行与
   erix-agent #285）⇒ **DTO 不出现 `durationMs` 键**，不写 `0`、不塞 `null`、也不拿时间差造一个假时长；
@@ -1755,7 +1764,7 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 
 折叠横幅上「查看原文」的只读懒加载端点。鉴权同 `GET /api/sessions/:id`（非属主/不存在一律 `404 not_found`，不泄露存在性）；`:round` 是**折叠行自己的 round**（不是 `foldedRoundRange.to`）。
 
-**200 响应**（`turns` 一律走同一个上游投影 `projectTranscriptForDisplay`，不另造折叠渲染，#95 红线）：
+**200 响应**（`turns` 一律走同一个本仓投影 `projectTranscriptForDisplay`（`portal/src/display-projection.js`，来源见文件头），不另造折叠渲染，#95 红线）：
 
 ```json
 { "round": 137, "turns": [ … ], "source": "rebuilt", "truncated": true, "dropped_messages": 317 }
@@ -1769,9 +1778,9 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 | `truncated` | 布尔位（**不塞省略号文本**，截断标记由前端出，先例同 §4.4a-1）。重建行数超 `FOLDED_REBUILD_MAX_ROWS = 2000`（与 U7 recall 同尺）**或**归档被上游夹断 ⇒ `true` |
 | `dropped_messages` | 上游夹断丢掉的条数（取 `record.foldedPayloadMeta.droppedMessages`）；无则 `0` |
 
-**`turns[].toolCalls[].resultPreview` 的配对口径（#387）**：重建路（`source:'rebuilt'`）在喂上游投影**之前**，
+**`turns[].toolCalls[].resultPreview` 的配对口径（#387）**：重建路（`source:'rebuilt'`）在喂本仓投影**之前**，
 先把本 range 内各行的 `tool_result` 按 `tool_use_id` 挂回带 `tool_use` 的那条记录（`portal/src/sessions.js#attachToolResultsToRecords`，
-**纯读侧**：不改 `rows`、不动账本、不改上游 `projectTranscriptForDisplay`）。于是 `toolCalls[]` 上的
+**纯读侧**：不改 `rows`、不动账本、不改本仓投影 `projectTranscriptForDisplay`（`portal/src/display-projection.js`，来源见文件头））。于是 `toolCalls[]` 上的
 `resultPreview` / `isError` / `executionStatus` / `durationMs` **与主消息流同一个来源**（预览长度与截断规则全在上游，
 宿主不复制第二把尺，#95 红线）。为什么必须挂：0.23+ 账本一轮是多行（`:msg:<n>:0` = assistant 的 `tool_use`、
 `:msg:<n>:1..k` = 每个 `tool_result` 各一行、载体行 `messages` 为空），而上游的配对**只扫本条记录的 `messages`**
@@ -1894,7 +1903,7 @@ GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
 
 > 为什么要有这个参数而不是让前端自己读账本：面板每 2 s 一轮，前端逐个拉账本端点 = N 个请求 × 每次全量折叠投影（`foldLedgerRecords` → `projectTranscriptForDisplay`）；服务端一次 join + `stat` 缓存能把稳态成本压到「N 次 `stat` + 每 2 s 一条 SQL」。
 
-`messages[]` 是**与主对话同形**的 turn：上游 `projectTranscriptForDisplay` 的输出（`role`/`text`/`blocks`/`toolCalls`/`reasoning`/`round`/`ts`/`key`/`meta` 逐字透传，#95 红线）上叠四个宿主字段 `id`（`<childRunId>:<全量下标>`）/ `seq`（全量下标，所以向前翻页时同一条消息的 id 不漂移）/ `run_id`（= `childRunId`）/ `created_at`。⚠ `created_at` 是**轮行落盘时刻**（投影的 `ts` 读的是载体行），不是消息成型时刻，只当轮级时间戳用。
+`messages[]` 是**与主对话同形**的 turn：本仓投影 `projectTranscriptForDisplay`（`portal/src/display-projection.js`，来源见文件头）的输出（`role`/`text`/`blocks`/`toolCalls`/`reasoning`/`round`/`ts`/`key`/`meta` 逐字透传，#95 红线）上叠四个宿主字段 `id`（`<childRunId>:<全量下标>`）/ `seq`（全量下标，所以向前翻页时同一条消息的 id 不漂移）/ `run_id`（= `childRunId`）/ `created_at`。⚠ `created_at` 是**轮行落盘时刻**（投影的 `ts` 读的是载体行），不是消息成型时刻，只当轮级时间戳用。
 
 **折叠与切尾的顺序（不得改）**：读全量行 → `portal/src/transcript-fold.js#foldLedgerRecords` → `projectTranscriptForDisplay` → **才** `slice(-tail)`。在原始行上切会把一轮切成半轮（`:msg:<round>:<seq>` 分片行与它的载体行分散在切界两侧），折叠拿到缺片的一轮 ⇒ 工具结果配不上对（#337 的老病根）。⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 的导出面**（实测 `undefined`，深引被包 `exports` 挡），所以用的是本站镜像——它正是 `runner/lib/store.js#load` 用的同一份口径（两份 `SHARED-FOLD-CORE` 逐字节对拍），也是上游读侧的**超集**（多一道 `partOf` 解链闸）。本站两条入口共用同一份 `planFold`：`session-view.js` 走 `foldTranscriptRows`（DB 行）、这里走 `foldLedgerRecords`（文件记录），不是两套规则。
 
@@ -3752,6 +3761,45 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 > `materializer.test.js:750`（用户自建 `AGENTS.md`/`.gitignore` 在 stale 清理后存活）占用）、
 > `portal/test/migrations.test.js`（0043 那一段 + 「`NNNN` 编号全局唯一」那条闸）。
 
+#### 4.19-5 按工位取「实际生效的那一份」（`GET /api/admin/prompts/effective-agents-md`，issue #801）
+
+上面 §4.19-1 的 DTO 回答的是「**库里存着什么**」（三格都是空串 = 跟随内置）；本节回答「**模型现在被说了什么**」。
+两者是不同的账：管理台原来把写侧的 `"" = 跟随内置` 当成了打开页面看到的第一眼，而用户要的恰恰是实际发出去那一份。
+
+**两份账都给，只给一份就换个方向撒谎**：
+
+- `disk` = 盘上那份 `<用户空间根>/<fde_name>/home/AGENTS.md`——**实际被注入进 run 的就是它**（`runner/lib/agents-md.js` 在 run 启动时直读该文件）。
+  这份由本服务（materializer）写到用户空间，portal 已只读挂载整棵用户空间根（compose 的 `:ro` bind mount）⇒ 不需要 `docker exec`。
+- `expected` = 按 DB 那两个输入 + 内置模板、**用真工位名**渲染出来该有那份（复用 §4.19-1 的 `resolveEffectiveAgentsMd`，不是 `example` 那份预览）。
+
+只给 `disk` ⇒ 保存了但物化通知没成功时（要等 portal 重启的全量重建才收敛，见 §4.19-4），用户以为改动没生效；
+只给 `expected` ⇒ 用户以为已经生效了，而下一次 run 吃的还是旧那份。
+
+**`matches` 三态不许塌成两态**：`true` = 一致 / `false` = 盘上那份还没跟上 / `null` = **比对不了**（原因在 `disk.state` 与 `disk.truncated` 里）。
+拿 `false` 冒充「不一致」会把「新工位还没物化」说成「物化坏了」，拿 `true` 冒充更糟。前端 `effectiveVerdictOf` 把 `null` 与 `false` 分开渲染。
+
+**`disk.state` 四值封闭**（白名单，页面按值出文案，不猜）：
+
+| 值 | 含义 |
+|---|---|
+| `ok` | 读到普通文件（`text`/`bytes`/`sha256`/`mtime` 给全） |
+| `missing` | 文件或某一跳目录不存在（新工位、或用户空间被手工清过 ⇒ 「还没物化」那一档） |
+| `not_a_file` | 不是普通文件（symlink / 目录 ⇒ materializer 写的是普通文件，别的形状不当「生效全文」） |
+| `read_failed` | 读元数据或正文时失败（真相包括「这份文件今天读不到」） |
+
+**读上限 64 KiB（`EFFECTIVE_DISK_READ_MAX_BYTES`）**：超过只给前 64 KiB，`truncated=true`，且**不再承诺** `sha256`/`matches`（都置 `null`）——`disk.bytes` 仍是**真实大小**。
+
+**路径牢笼三条**：① `fde_name` 必过 `FDE_NAME_RE`⇒ 天然单段，`..` 进不来；② 解析后再钉一次 containment（相对根不得越界）；③ 只当普通文件读（symlink/目录 ⇒ `not_a_file`）。
+其中②是**两道**：拼出来的路径先过**词法** containment，打开前再对 `<用户空间根>` 与 `<用户空间根>/<fde>/home` 各取一次 realpath 判**同一套三条**（宿主机上那两级目录归工位用户可写，`home` 这一跳本身可以是 symlink，只判词法会把用户空间之外的文件当成「盘上真那份」）；③的末端另加 `O_NOFOLLOW`（`lstat` 与 `open` 之间末端被换成 symlink ⇒ `ELOOP` ⇒ 同样 `not_a_file`）；**残余**：realpath 与 `open` 之间「`home` 那一跳被换掉」的 check-then-open 竞态没有堵——堵它要把整条读路径改成逐级 `openat(dirfd)`（每级目录按 fd 打开、不再按名字解析），为一个「工位挪走自己的 `home` 又瞬间换回」的窗口换掉整个打开实现，不划算。
+用户查找**不限 status**（停用/保留期工位的盘上那份仍是可读对象，口径同 #727）。
+
+**零写零审计**：整条路径只有两条 `SELECT`（取用户 + 取 `platform_prompts`）；页每次挂载都发，审计不承重（`GET /api/admin/prompts` 本来也不审计）。
+**零新错误码**：只用既有的——`404 not_found`（工位不存在，`details.field='fde_name'`）/ `400 validation_failed`（`fde` 缺失/非法，`details.field='fde'`，且**一条 SQL 都不发**）/ `405 method_not_allowed`（非 GET）；
+没配用户空间根是 `500 internal`（配置问题照旧上报，不当「盘上没有」）。
+
+⚠ **§4.19-1 的 `example` 预览与本节的真工位渲染是两件事**：§4.19-1 的 `templateBytes`/`effectiveText` 用固定示例名 `example` 渲染（为了可对比、零动态量），本节用真工位名 ⇒ 同一份 DB 输入，两处字节可以不同（标识行随真名变长）。
+单测：`portal/test/platform-prompts-effective.test.js`（`E1`–`E14` + HTTP `H1`–`H4`）。
+
 ---
 
 ### 4.20 管理台系统监控（`GET /api/admin/system/metrics`，issue #650）
@@ -3856,7 +3904,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**已迁的旋钮（十二格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
+**已迁的旋钮（十五格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
 
 | key | env 兜底位 | 值域 | `applyMode` | 生效点 |
 | --- | --- | --- | --- | --- |
@@ -3872,14 +3920,29 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 | `auth.session_renew_interval_seconds` | `SESSION_RENEW_INTERVAL_SECONDS` | 整数 `1..86400` 秒（默认 `3600`；>1 天滚动续期名存实亡） | `hot` | `/api/me` 续期时现读（算 `renewIntervalMs`） |
 | `auth.max_password_length` | `MAX_PASSWORD_LENGTH` | 整数 `1..4096` 字符（默认 `256`；下界 1 = 代码只校非空+≤上限、无最小长度常量；上界护 scrypt 代价） | `hot` | 登录 / 建用户 / 改密时现读（喂 `admin.validatePassword`） |
 | `auth.max_login_length` | `MAX_LOGIN_LENGTH` | 整数 `1..512` 字符（默认 `128`；login 进限流键/主机名种子 ⇒ 封顶防哈希内存面） | `hot` | 登录 / 建用户时现读（喂 `admin.validateLogin`） |
+| `delegate.max` | `ERIX_DELEGATE_MAX` | 整数 `1..8` 路（默认 `2`；`0` 非法：关掉 delegate 是 `ERIX_DELEGATE_ENABLED` 的活） | `restart` | **每建一个 FDE 容器**时现读（`provisioner.js#buildContainerConfig` 把它写进容器 env，容器内的 runner 读它）⇒ 只影响之后新建的容器，**已在跑的容器要重建才生效** |
+| `delegate.child_rounds` | `ERIX_DELEGATE_CHILD_ROUNDS` | 整数 `1..32` 轮（默认 `8`；`0` 非法：子 run 派出去就是立刻结束） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
+| `delegate.child_timeout_ms` | `ERIX_DELEGATE_CHILD_TIMEOUT_MS` | 整数 `1000..240000` 毫秒（默认 `240000`；**上界必须 < agentd 的 300s watchdog**：子 run 执行期父 worker 靠子的心跳刷 `lastIpcAt`，预算超过 watchdog 而心跳没来 ⇒ 父 worker 被 SIGKILL 并**重放整条命令**，#288） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
 
-十三格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+十五格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
 
 后三格（#677 P3 第六批：三个循环的空闲退避上限）也是同一套机件，但是**三份独立实例**（各自一份
 缓存与在飞槽）：共用一份就是「保存开户那格的上限，把对账那一格的缓存一起抹掉」。现读位置是
 **每一拍决定 sleep 之前**，不是循环启动时算一次（后者就是快照：改完要重启才生效）。
 
-**这三个旋钮的值域不是新发明的**，逐条抄自循环侧已有的钳位逻辑：开户 / 销号的旧路径是
+最后三格（#677 P3 第七批：delegate 子 run 的 `delegate.max` / `delegate.child_rounds` /
+`delegate.child_timeout_ms`）是**第一批 `applyMode: restart` 的**，也是本表里唯一三行「保存不等于已跑的
+容器变了」的：值不是 portal 进程读的，而是 **FDE 容器内的 worker** 读的，portal 只在 provision 容器
+那一刻把生效值写进容器 env（`provisioner.js#buildContainerConfig`）。所以：portal 侧**仍现读**
+（保存后下一个新容器就拿新值，不等 portal 重启），但已在跑的容器带着自己那份 env 继续跑，
+**要重建才生效**——管理台那三个格子的 hint 已明写这句（判据 RS-67/RS-68）。
+它们的值域同样**不是发明的**：逐条抄自 `runner/lib/config.js` 已有的钳位（`parseDelegateMax` /
+`parseDelegateChildRounds` / `parseDelegateChildTimeoutMs`，判据 RS-64 钉住同源）。两层不冲突：
+registry 这一层拒越界（写进去就是“管理台存了个容器不会用的数”），runner 那一层钳位**保留不动**
+（“容器 env 被人手改过 / 镜像比 portal 老”时的最后一道防线）。`ERIX_DELEGATE_ENABLED` 本批**故意
+不迁**：它的 env 语义是「未设/空 = 开、显式只认字符串 `1`」，与这套「严格正整数 + 区间」不同形（另片处理）。
+
+**第六批那三个旋钮的值域也不是新发明的**，逐条抄自循环侧已有的钳位逻辑：开户 / 销号的旧路径是
 `envInt(name, 30000, { max: MAX_BACKOFF_MS_SAFE })`（上界 60s 是 Node timer 的 32 位语义边界，
 越过它退避会退化成 1ms 空转）⇒ 区间 `1..60000`；越界的 env 旧路径是「回落默认 30000 + warn」，
 搬进 registry 后是「闸拒 ⇒ 回落 registry 默认 30000」，**生效值逐字相同**。
@@ -3958,7 +4021,9 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 请求体 `{ "value": <标量> }`（只收 JSON 标量：number / boolean / string；对象、数组、`null` 一律 400）。
 
 - `200` ⇒ `{ "item": { …同 GET 的一项… } }`。DTO **只来自 `RETURNING`**，所以「我以为是这个值」与
-  「库里现在是这个值」不会分离。
+  「库里现在是这个值」不会分离。`item` 的 `label` / `hint` **按请求 locale 出**（与 GET 同一套谈判，
+  #803 返修 M1）：前端 `replaceRuntimeSetting` 会拿它顶掉界面上的那一行；`locale` 不参与任何裁决，
+  审计与校验错误文案仍恒中文。
 - `400 validation_failed`，`details.field` 三档：`key`（未登记；`details.known` 列可用 key）、
   `value`（形状/区间不过）、`body`（体不是对象）。
 - **数值的两侧之分（`1e3` 这一类，#709 unproven 裁定）**：写侧只认 body 里的 JSON 类型。——
@@ -4337,7 +4402,7 @@ data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id"
 | 14 | `attempt_killed` | **portal 合成，两条产出路径**（不是引擎事件、不经 U3、不进 `run_queue`）：① **U12 release 的 requeue 分支**（`releaseRun`，issue #288 缺陷 B：agentd 还活着并 additive 上报 `killed_by`，§9.11）② **run 租约 reaper 的 requeue 分支**（`reapExpiredRuns`，issue #292：上报者自己已死、根本没有 release，由 portal 自己合成，§9.11 注记） | `attempt: number`（死掉的那次尝试，1-based = `run_queue.attempts`），`max_attempts: number`，`reason: string`（**开放值、无枚举白名单**：release 路径 = agentd 上报的 reason 原文，如 `watchdog_silent` / `worker_crashed`；**reaper 路径固定 `lease_expired`**），`killed_by: "watchdog" | "crash"`（`watchdog` = F6 执行期静默被判死；`crash` = worker 非预期退出；**reaper 路径固定 `crash`**——它无从区分看门狗与真崩，保守取值），可选 `silent_ms: number`（判死前的静默时长 = **最后一次 IPC 上报之后**算了多久，只有活着的 agentd 报得出来；**只在可信时出现，绝不写 0/null 冒充「有」⇒ reaper 形态固定不带**），可选 `next_retry_in_ms: number`（预留：portal 侧支持，当前 agentd 不发；reaper 也不发） |
 | 15 | `tool_replay_decision_required` | `onEvent`（LoopEvent 透传，erix-agent 0.18.0 additive 类型；**仅在 `replayPolicy: "per-tool-declaration"` 下才会发**，本站自 issue #288 缺陷 C 起传该值） | `tool_call_id: string \| null`，`round: number`，`name: string \| null`（被中断的工具），`replay: string \| null`（引擎解析出的声明，当前只可能是 `"unsafe"`），`requires_host_decision: boolean`（引擎恒给 `true`），`partial_output_available: boolean`（快照里有没有已归档的部分输出）。语义：**该工具的上次执行被崩溃打断，引擎没有重放它**，模型同时收到一条 `is_error: true` + `executionStatus: "interrupted"` 的 `tool_result`（第 7 类），**是否重试由模型决定，引擎不自己重试**。⚠ 信封里的 `run_id` 是 station run id，而引擎事件自带的 `runId` 是 store key = `transcriptKey` = `session_id`（issue #81 P2）——runner 映射时落名 `engine_run_id` 以免同义不同（`runner/worker.js loopEventPayload`） |
 | 16 | `persistence_error` | **引擎 `diagnostics.error` 通道**（**不是 `onEvent`**；本站接线在 `runner/worker.js` 的 `diagnostics: { error: … }`，映射在 `loopEventPayload` 的 `persistence_error` 分支）。erix-agent 0.23.0 起就有这条通道（`orchestrator.js:873`），`fatal: false` 一类也已存在（`:895` 宿主端口桥）；erix-agent#461 / 0.25.0 再加一类「剥掉折叠归档后重试一次」 | `port: string`（缺省 `"transcript"`），`phase: string \| null`，`operation: string`（缺省 `"unknown"`；实测致命那条 = 失败的 store 方法名，如 `appendRound`），`engine_run_id: string \| null`（**引擎 store key = transcriptKey = sessionId**，不是 station run id，#81 P2 老坑），`fatal: boolean`（**runner 归一：缺字段/脏值算 `true`**——宁可报重，不可把真失败刷成灰），`sideEffect`（引擎原样透传），`error: {name, message}`（**`stack` 刻意不透传**：那是宿主日志的东西，塞进 UI payload 只会淹没前端），`ts: string \| null`。**可见性口径**：`fatal === false` → 中性分隔行（不影响本次任务）；`fatal === true` → 界面交给 `run_end` 的 `persistence_failed` 红面，本事件只作可审计明细、不重复刷 |
-| 17 | `queue_update` | **portal 合成（issue #370）**：入队 / 整队取回 / 终态出队（含被闸门挡下）三处推 |`steering: [{id, content}]`、`follow_up: [{id, content}]`（**恒为全量快照，不是增量**）、`blocked: string \| null`（暂停投递原因，当前值域 `container_not_running` / `deliver_failed` / `not_deliverable_at_terminal`；界面按它出本地化文案，**服务端只发码不发话**，#294）、`delivered_run_id: string \| null`（**本帧存在的原因是一条队列输入被投出去了** ⇒ 这个 run 刚被建起来；前端只有在「本机没有活跃 run」时接管它，见下）。**信封 `seq` 与 `run_id` 均为 `null`**：它不是历史事件而是**状态**，真相在 `queued_inputs`，可由会话详情全量重建 ⇒ **不落 `run_events`、不进历史白名单、不参与回放**（同第 16 类之外的 `session_updated` 那一支）。 |
+| 17 | `queue_update` | **portal 合成（issue #370）**：入队 / 整队取回 / 终态出队（含被闸门挡下）三处推 |`steering: [{id, content}]`、`follow_up: [{id, content}]`（**恒为全量快照，不是增量**）、`blocked: string \| null`（暂停投递原因，当前值域 `container_not_running` / `deliver_failed` / `not_deliverable_at_terminal`；界面按它出本地化文案，**服务端只发码不发话**，#294）、`delivered_run_id: string \| null`（**本帧存在的原因是一条队列输入被投出去了** ⇒ 这个 run 刚被建起来；前端只有在「本机没有活跃 run」时接管它，见下）、`delivered: object \| null`（**恒在场**：这一帧存在的原因若是「刚投出去一条」⇒ 它就是那句话当场变成的那条普通 user 消息（`postMessage` 的 user 消息回显体，含 `id` / `role:'user'` / `content` / `seq` / `run_id` 等）；非投递帧（入队 / 取回 / 失败）为 `null`。前端据此当场把它画成实时 user 气泡——队列是**状态**、投递后的那句话是**历史**，所以展示落点在**对话流**而非队列条（issue #799））。**信封 `seq` 与 `run_id` 均为 `null`**：它不是历史事件而是**状态**，真相在 `queued_inputs`，可由会话详情全量重建 ⇒ **不落 `run_events`、不进历史白名单、不参与回放**（同第 16 类之外的 `session_updated` 那一支）。 |
 | 18 | `compaction_strategy_fallback` | **引擎 `onEvent`**（additive `LoopEvent`，erix-agent 0.25.0 上游 #464-A；发射点 `orchestrator.js:3193`） | `round: number`、`detail: string`（首句是**固定原文**，宿主可直接断言）、`runId`（= 引擎 store key = transcriptKey = sessionId，**不是** station run id，#81 老坑）。语义：**你配在 `context.strategy` 上的折叠策略没生效，实跑的是引擎库层默认的 `sliding-window`**（整轮丢头、不摘要）。条件：仅当 `context.strategy` **未配置**时发，每 run 恰好一条 ⇒ 本站恒配 `fold-llm`（#438 切片 B 起），**这条一响就意味着本站的配置没送到引擎**（#392 那个回归的机读信号）。界面：中性分隔行（`stream.event.strategyFallback`）；runner 另落一条 `warn` LOG（`runner/lib/engine-notices.js`）。 |
 | 19 | `model_metadata_missing` | **引擎 `onEvent`**（erix-agent 0.18.0 上游 #182；发射点 `orchestrator.js:1040`） | `runId`（同上口径）、`detail: string`。**注意：本事件没有 `round`**（引擎不给，文案也不许编）。语义：模型上下文元数据取不到 ⇒ **本 run 的压缩闸门与聚合输出预算整条关闭**。本站 #309/#316 的行为级测早拿它当判据（「压缩关掉必须是可观测的」），但今天只有测试看得见——#421 之后实时 / 刷新 / LOG 三条路都看得到。界面：中性分隔行（`stream.event.metadataMissing`）。 |
 | 20 | `persistence_capability_degraded` | **引擎 `onEvent`**（erix-agent 0.20.0 上游 #173 PR-B；发射点 `orchestrator.js:1011`） | `runId`、`method: string`（缺的那个 store 能力名）、`detail: string`。语义：宿主 store 没实现某个持久化能力 ⇒ **那一步整个 run 跳过（中途崩溃不可恢复）**，每 run 每个方法最多一条。本站**曾经**实现 `saveRunSnapshot`（旧名 `saveCheckpoint`/`appendCheckpoint` 只是引擎兼容别名），**2026-11-17 起已随 run snapshot 退役删除（issue #640）**：erix-agent 0.33.0 不再调用它（上游 `host-upgrade-guide-0.33.0.md` §2.2 已把它从能力面摘掉）⇒ 这个码对本仓**已不可能再因它而响**；一响就说明是别的 store 能力缺失（如 `saveRunState` / `appendRound`）。界面：中性分隔行（`stream.event.capabilityDegraded`）。 |

@@ -26,6 +26,9 @@ const PUT_PATHS = {
   agentsMd: '/api/admin/prompts/agents-md',
   titlePrompt: '/api/admin/prompts/title-prompt',
 } as const;
+// issue #801：视图挂载后还会发两条 GET（用户列表取工位下拉 + 生效面）。
+const USERS_PATH = '/api/admin/users';
+const EFFECTIVE_PATH = '/api/admin/prompts/effective-agents-md';
 
 /**
  * 只读那 4 条**真实的开头**（取自 `runner/`）。它们一个字节都不该出现在页面上：
@@ -132,14 +135,42 @@ function savedDto(path: string, text: string): Record<string, unknown> {
   });
 }
 
+/** 生效面 DTO（两份账）。默认盘上一致；逐格可用 `over` 改。 */
+function effectiveDto(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    fdeName: 'alice',
+    disk: { state: 'ok', bytes: 120, mtime: '2026-01-01T08:00:00.000Z', text: 'DISK-FULL-TEXT', sha256: 'aa', truncated: false },
+    expected: { bytes: 120, sha256: 'aa', text: 'EXPECTED-FULL-TEXT' },
+    matches: true,
+    source: 'builtin',
+    reason: null,
+    db: { addendumBytes: 0, overrideBytes: 0 },
+    renderLimitBytes: 16384,
+    ...over,
+  };
+}
+
+/** 用户列表（`{ items }`）：默认一个带 `fde_name` 的工位，使下拉非空。 */
+function usersDto(items: unknown[] = [
+  { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', status: 'active' },
+]): Record<string, unknown> {
+  return { items };
+}
+
 /** 默认桩：GET 回 `get`；PUT 回 `put(call)`（缺省 = 原样落库 + 通知 2 台）。 */
 function stubDefault(
   get: unknown,
   put?: (call: RecordedCall) => Response,
+  opts: { users?: Record<string, unknown>; effective?: Record<string, unknown> | null } = {},
 ): RecordedCall[] {
   const putPaths: readonly string[] = Object.values(PUT_PATHS);
+  const eff = opts.effective === null ? null : (opts.effective ?? effectiveDto());
   return stubFetch((call) => {
     if (call.url === GET_PATH && call.method === 'GET') return jsonResponse(200, get);
+    if (call.url === USERS_PATH && call.method === 'GET') return jsonResponse(200, opts.users ?? usersDto());
+    if (call.url.startsWith(EFFECTIVE_PATH) && call.method === 'GET') {
+      return eff === null ? errorResponse(500, 'internal', 'effective down') : jsonResponse(200, eff);
+    }
     if (call.method === 'PUT' && putPaths.includes(call.url)) {
       const text = (call.body as { text: string }).text;
       return put ? put(call) : jsonResponse(200, savedDto(call.url, text));
@@ -186,7 +217,7 @@ describe('F1 挂载只发 1 次 GET', () => {
     const calls = stubDefault(dto());
     const w = await mountView();
 
-    expect(gets(calls)).toHaveLength(1);
+    expect(gets(calls).filter((c) => c.url === GET_PATH)).toHaveLength(1);
     expect(gets(calls)[0].url).toBe(GET_PATH);
     expect(puts(calls)).toHaveLength(0);
     // 「三块都在跟随内置」+ 每卡的字节数与上限（少一条这一页就没价值）
@@ -556,7 +587,7 @@ describe('store 层：三个 save action 与「连长度都算不出」那道闸
     const err = await store.saveAddendumPrompt(undefined);
     expect(err).toContain('连长度都算不出');
     expect(puts(calls)).toHaveLength(0);
-    expect(gets(calls)).toHaveLength(1);
+    expect(gets(calls).filter((c) => c.url === GET_PATH)).toHaveLength(1);
     expect(store.promptSaveField).toBe('addendum');
     expect(store.promptSavedField).toBeNull();
   });
@@ -625,4 +656,111 @@ describe('markdown 星号不许进界面：三张卡的 timing-* 与 readonly-no
       expect(w.text(), `${locale} 整页还带着 markdown 强调记号`).not.toContain('**');
     });
   }
+});
+
+// ── issue #801：生效面主视图（F8–F13）───────────────────────────────────────────
+describe('F8 生效卡在最前面且默认拉一次', () => {
+  it('挂载发出 users GET + 一条带 ?fde= 的生效面 GET；card-effective 在 card-addendum 之前', async () => {
+    const calls = stubDefault(dto());
+    const w = await mountView();
+    expect(gets(calls).some((c) => c.url === USERS_PATH)).toBe(true);
+    const eff = gets(calls).find((c) => c.url.startsWith(EFFECTIVE_PATH));
+    expect(eff, '必须发一条生效面 GET').toBeDefined();
+    expect(eff?.url).toContain('fde=alice');
+    const html = w.html();
+    expect(html).toContain('card-effective');
+    expect(html.indexOf('card-effective')).toBeLessThan(html.indexOf('card-addendum'));
+  });
+});
+
+describe('F9 三态文案不塌', () => {
+  it('matches true/false/null ⇒ 三种不同结论，null 走「比对不了」而非「没跟上」', async () => {
+    // 三次挂载必须各自一套 pinia（否则 store.effectiveAgentsMd 会被后一次覆盖）。
+    const mountWith = async (matches: unknown, disk: Record<string, unknown>) => {
+      setActivePinia(createPinia());
+      stubDefault(dto(), undefined, { effective: effectiveDto({ matches, disk }) });
+      return mountView();
+    };
+    const okW = await mountWith(true, { state: 'ok', bytes: 10, mtime: null, text: 'D', sha256: 'x', truncated: false });
+    const okText = text(okW, 'effective-verdict');
+    const staleW = await mountWith(false, { state: 'ok', bytes: 9, mtime: null, text: 'D', sha256: 'y', truncated: false });
+    const staleText = text(staleW, 'effective-verdict');
+    const unW = await mountWith(null, { state: 'missing', bytes: null, mtime: null, text: null, sha256: null, truncated: false });
+    const unText = text(unW, 'effective-verdict');
+
+    expect(new Set([okText, staleText, unText]).size).toBe(3);
+    expect(unText).toContain('比对不了');
+    expect(unText).not.toContain('没跟上');
+    expect(staleText).toContain('没跟上');
+  });
+});
+
+describe('F10 全文来自生效面', () => {
+  it('展开后 disk-text / expected-text = 桩给的两份（不是示例名预览口径）', async () => {
+    stubDefault(dto(), undefined, { effective: effectiveDto() });
+    const w = await mountView();
+    await click(w, 'toggle-disk-text');
+    await click(w, 'toggle-expected-text');
+    await flushPromises();
+    expect(text(w, 'disk-text')).toContain('DISK-FULL-TEXT');
+    expect(text(w, 'expected-text')).toContain('EXPECTED-FULL-TEXT');
+  });
+});
+
+describe('F11 内置标题全文给出来', () => {
+  it('点 toggle-title-default ⇒ title-default-text 出现且等于 defaultText', async () => {
+    stubDefault(dto());
+    const w = await mountView();
+    expect(exists(w, 'title-default-text')).toBe(false);
+    await click(w, 'toggle-title-default');
+    await flushPromises();
+    expect(text(w, 'title-default-text')).toContain('TITLE-SYSTEM-PROMPT-FULL-TEXT');
+  });
+});
+
+describe('F12 重新读取有反馈且吃草稿有言', () => {
+  it('改草稿 ⇒ 按钮变「放弃草稿并重新读取」；点它 ⇒ 多发一次 GET、出现重读时间、草稿回到落库值', async () => {
+    const calls = stubDefault(dto());
+    const w = await mountView();
+    expect(text(w, 'prompts-reload-label')).toBe('重新读取');
+    await setDraft(w, 'addendum', '未存的草稿');
+    expect(text(w, 'prompts-reload-label')).toBe('放弃草稿并重新读取');
+
+    const before = gets(calls).filter((c) => c.url === GET_PATH).length;
+    await click(w, 'prompts-reload');
+    await flushPromises();
+    expect(exists(w, 'prompts-reloaded-at')).toBe(true);
+    expect(gets(calls).filter((c) => c.url === GET_PATH).length).toBe(before + 1);
+    // 草稿回到落库那份（dto.addendum.text = ''），按钮也退回普通文案
+    expect((w.get('[data-test="input-addendum"]').element as HTMLTextAreaElement).value).toBe('');
+    expect(text(w, 'prompts-reload-label')).toBe('重新读取');
+  });
+});
+
+describe('F13 只读卡仍然没有 4 条全文', () => {
+  it('只读卡只列位置与代价，页面不含任何 runner 提示词全文', async () => {
+    stubDefault(dto());
+    const w = await mountView();
+    expect(exists(w, 'readonly-no-fulltext')).toBe(true);
+    const html = w.html();
+    for (const snippet of RUNNER_TEXTS) {
+      expect(html, `页面不该出现只读全文片段：${snippet}`).not.toContain(snippet);
+    }
+  });
+});
+
+describe('F14 生效面不得把配置行说成覆写', () => {
+  it('生效面 source=db 但三格全空 ⇒ effective-db-note 不说「DB 覆写」，同一页编辑卡仍「跟随内置」', async () => {
+    // 生效面读到配置行（source:'db'）但三个值都是空；盘上与该有那份一致。
+    stubDefault(dto(), undefined, {
+      effective: effectiveDto({ source: 'db', db: { addendumBytes: 0, overrideBytes: 0 }, matches: true }),
+    });
+    const w = await mountView();
+    const note = text(w, 'effective-db-note');
+    // 「覆写」当状态词不许出现在生效面来源那一句（新键说的是「输入取自配置行」，不是「DB 覆写」）。
+    expect(note).not.toContain('DB 覆写');
+    expect(note).toContain('输入取自配置行');
+    // 两句话必须能同时成立：编辑卡那一行（判据 text===''）仍说「跟随内置」，与生效面不矛盾。
+    expect(text(w, 'source-addendum')).toContain('跟随内置');
+  });
 });
