@@ -26,6 +26,7 @@ import SessionPickerModal from '../components/SessionPickerModal.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
 // issue #359（决策 §7 D9）P0b：顶栏「收工灯」——只回答“你的活儿被 git 保护住了吗”，平台零 git 写。
 import GitLightBadge from '../components/GitLightBadge.vue';
+import UsageBadge from '../components/UsageBadge.vue';
 // issue #528（事件平台 W5）：宏用户面三件——会话头的「自动化」chip、顶栏铃铛、覆盖式流水抽屉。
 // 入口职责分开（`07` §3.1）：chip 只开抽屉，抽屉里的 [配置 ▾] 只开模板下拉。
 import MacroMenu from '../components/MacroMenu.vue';
@@ -33,6 +34,7 @@ import MacroDrawer from '../components/MacroDrawer.vue';
 import MacroBell from '../components/MacroBell.vue';
 import { useMacroStore } from '../stores/macro';
 import { useGitLight } from '../composables/useGitLight';
+import { useMyUsage } from '../composables/useMyUsage';
 import { toDisplayText } from '../api'; // issue #281：失败详情进文案前过一道收口（不渗 [object Object]/undefined）
 // #450 A2：管理台入口是**跨 host** 链接（用户面 → 管理台），落点由 `site` store 的两个 base 决定。
 import { hashUrl } from '../lib/hostGate';
@@ -232,9 +234,24 @@ watch(
 watch(
   () => store.running,
   (now, prev) => {
-    if (prev && !now) void gitLight.load();
+    if (prev && !now) {
+      void gitLight.load();
+      // issue #808：一个 run 结束的那一刻也是额度最需要新鲜的时刻（刚烧了钱）——与收工灯同一个挂点。
+      void myUsage.load();
+    }
   },
 );
+
+// ---- issue #808：顶栏「账周期/用量」徽标（数据层 useMyUsage，判断 lib/usageLabel）----
+// 额度是**人**的维度（不随目录变）⇒ dirCwd 变化不重拉；登录后拉一次 + 60s 轮询（composable 自带）。
+const myUsage = useMyUsage();
+onMounted(() => {
+  if (auth.user) void myUsage.load();
+});
+/** 弹窗打开 ⇒ 拉 30 天用量（不在挂载预取）；打开期间每 60s 的再拉由 UsageBadge 驱动 `refresh-usage`。 */
+function onOpenUsage(): void {
+  void myUsage.loadUsage();
+}
 /** 「让 AI 收尾」/「问 AI」都只预填不发送（发送 = 一次 run，烧容量与 token，得用户自己按）。 */
 function onGitLightPrefill(text: string) {
   store.inputValue = text;
@@ -319,7 +336,23 @@ function jumpToLatest() {
         :session-id="store.sessionId"
         @open-runs="openSessionMacroDrawer"
       />
-      <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
+      <span data-test="who" class="text-black/50 text-sm">{{ who }}</span>
+      <!-- issue #808：账周期/用量徽标（紧跟用户名；无绑定时整块不渲染）。flex-1 撑位挪到它**之后**的空 span，
+           保证徽标紧跟 who；徽标是 header > button，位置在「登出」之前（既有断言）。 -->
+      <UsageBadge
+        :quota="myUsage.quota.value"
+        :reason="myUsage.reason.value"
+        :loading="myUsage.loading.value"
+        :loaded="myUsage.loaded.value"
+        :error="myUsage.error.value"
+        :days="myUsage.days.value"
+        :usage-loading="myUsage.usageLoading.value"
+        :usage-error="myUsage.usageError.value"
+        @refresh="myUsage.load()"
+        @open="onOpenUsage"
+        @refresh-usage="myUsage.loadUsage()"
+      />
+      <span class="flex-1"></span>
       <!-- issue #595 M1：能力市场入口（`#/market`）。用 `<a>` 而不是 `<button>`：既有顶栏单测拿的是
            `header > button` 序列（登出必须是最后一颗），多一颗 button 会把那些用例假红。 -->
       <router-link
