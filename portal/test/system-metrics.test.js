@@ -18,7 +18,7 @@ import path from 'node:path';
 import {
   parseProcStat, cpuUsagePct, parseMeminfo, parseLoadavg, parseUptime,
   parseProcMounts, isRealBlockDevice, diskRows, pickBucketSeconds, seriesSql,
-  retentionPurgeSql, purgeSystemMetrics, querySeries, clearSeriesCache,
+  retentionPurgeSql, purgeSystemMetrics, querySeries, queryDiskSeries, seriesDisksSql, clearSeriesCache,
   countContainers, containerDrift, startMetricsSampler, toApiLatest, metricsApiPayload,
   disksInsertSql, WRITE_METRICS_SQL,
   BUCKET_SECONDS, SERIES_TARGET_POINTS, METRIC_RANGES, DOCKER_LIST_TTL_MS,
@@ -152,6 +152,9 @@ class MetricsPool {
     if (/FROM system_metrics\b/.test(text)) return 'series';
     if (/FROM containers\b/.test(text)) return 'dbNames';
     if (/INSERT INTO system_metrics_disks\b/.test(text)) return 'insertDisks';
+    // #814 磁盘历史序列。放在 `insertDisks` **之后**：两者都含表名 `system_metrics_disks`，
+    // 先判 INSERT 才不会被 SELECT 抢走（上面 `FROM system_metrics\b` 因 `\b` 不会误吃 `_disks`）。
+    if (/FROM system_metrics_disks\b/.test(text)) return 'seriesDisks';
     if (/INSERT INTO system_metrics\b/.test(text)) return 'insertMetrics';
     if (/^\s*BEGIN\b/i.test(text)) return 'begin';
     if (/^\s*COMMIT\b/i.test(text)) return 'commit';
@@ -167,6 +170,22 @@ class MetricsPool {
         mem_used: '50671616', mem_available: '40000000', mem_cached: '50671616', swap_used: '0', load1: '1.500',
         containers_running: 3, samples: 7,
       }];
+    }
+    if (kind === 'seriesDisks') {
+      // 两设备 × 两桶，另加**一行脏的**（`bucket: null`）钉「丢掉 + 计数」。
+      // 故意把 `overlay` 放前面：字典序应该是 `/dev/...` 在前，能钉住排序不是“插入序”。
+      return [
+        { bucket: new Date('2026-11-17T03:00:00Z'), device: 'overlay', path: '/var/lib/containerd',
+          used_avg: '8000', total_avg: '40000', samples: 6 },
+        { bucket: new Date('2026-11-17T03:05:00Z'), device: 'overlay', path: '/var/lib/containerd',
+          used_avg: '8100', total_avg: '40000', samples: 7 },
+        { bucket: new Date('2026-11-17T03:00:00Z'), device: '/dev/nvme0n1p2', path: '/srv/erix',
+          used_avg: '500000', total_avg: '1900000000', samples: 6 },
+        { bucket: new Date('2026-11-17T03:05:00Z'), device: '/dev/nvme0n1p2', path: '/srv/erix',
+          used_avg: '501000', total_avg: '1900000000', samples: 7 },
+        { bucket: null, device: '/dev/nvme0n1p2', path: '/srv/erix',
+          used_avg: '1', total_avg: '2', samples: 1 },
+      ];
     }
     return [];
   }
@@ -570,6 +589,87 @@ test('#650 querySeries：服务端分桶 + 按 range 缓存 5s + 脏值不当 0'
     t: null, cpuAvg: null, cpuMax: null, memUsed: null, memAvailable: null, memCached: null,
     swapUsed: null, load1: null, containersRunning: null, samples: null,
   }, '一格都没有 ⇒ 全 null，不是 0');
+  clearSeriesCache();
+});
+
+test('#814 seriesSql() 与 seriesDisksSql()：同一对占位符、各自的分桶分组', () => {
+  for (const sql of [seriesSql(), seriesDisksSql()]) {
+    assert.ok(/\$1/.test(sql) && /\$2/.test(sql) && /GROUP BY/.test(sql),
+      '两条序列 SQL 都是 `$1` = since / `$2` = 桶宽，且分组在库里做');
+  }
+  assert.match(seriesDisksSql(), /FROM system_metrics_disks\b/, '磁盘历史只读磁盘表（不 JOIN 主表）');
+  assert.match(seriesDisksSql(), /GROUP BY 1, 2/, '按「桶 × 设备」两级分组');
+  assert.match(seriesDisksSql(), /ORDER BY 2, 1/, '先设备再时间 ⇒ 归组后点天然升序');
+  assert.match(seriesDisksSql(), /min\(path\)/, 'path 不是分组键，必须聚合成确定值');
+});
+
+test('#814 queryDiskSeries：按设备归组 + 设备字典序 + 脏行丢掉不补 0 + 同位 5s 缓存', async () => {
+  clearSeriesCache();
+  const pool = new MetricsPool();
+  const clock = makeClock();
+  const first = await queryDiskSeries(pool, { range: '6h', now: clock.now });
+  assert.equal(first.range, '6h');
+  assert.equal(first.cached, false);
+  assert.equal(first.bucketSeconds, pickBucketSeconds(METRIC_RANGES['6h']),
+    '桶宽必须与主序列同档：两张图共用一条时间轴');
+  assert.deepEqual(first.disks.map((d) => d.device), ['/dev/nvme0n1p2', 'overlay'],
+    '设备按字典序（桩数据故意把 overlay 放前面）：5s 刷新不许看起来像换了盘');
+  assert.equal(first.disks.reduce((n, d) => n + d.points.length, 0), 4,
+    '五行里 `bucket: null` 那行被丢掉 ⇒ 只剩 4 个点（不是补个 null 点、更不是补 0）');
+  assert.equal(first.dropped, 1, '丢掉要计数，不是静默消失');
+  assert.deepEqual(first.disks[0], {
+    device: '/dev/nvme0n1p2',
+    path: '/srv/erix',
+    points: [
+      { t: '2026-11-17T03:00:00.000Z', usedBytes: 500000, totalBytes: 1900000000, samples: 6 },
+      { t: '2026-11-17T03:05:00.000Z', usedBytes: 501000, totalBytes: 1900000000, samples: 7 },
+    ],
+  }, '点按时间升序；numeric 转数；path 取该设备第一个非空串');
+  const [since, bucket] = pool.find('seriesDisks').params;
+  assert.equal(bucket, first.bucketSeconds);
+  assert.equal(since.getTime(), clock.at - METRIC_RANGES['6h'] * 1000, '与主序列同一窗口');
+
+  clock.pass(4000);
+  assert.equal((await queryDiskSeries(pool, { range: '6h', now: clock.now })).cached, true,
+    '磁盘序列同样缓存 5s：10 个人同开这页 = 1 个人的 DB 查询量');
+  assert.equal(pool.countOf('seriesDisks'), 1, '第二次不许再查库');
+
+  clearSeriesCache();
+  await querySeries(pool, { range: '6h', now: clock.now });
+  await queryDiskSeries(pool, { range: '6h', now: clock.now });
+  assert.equal(pool.countOf('series'), 1);
+  assert.equal(pool.countOf('seriesDisks'), 2,
+    '`#disks` 那个 key 也在同一个 Map 里 ⇒ clearSeriesCache() 一次清两边（不会出现两张不同时间的图）');
+  clearSeriesCache();
+});
+
+test('#814 红线：磁盘序列查询挂 ⇒ disksError 有值，而 seriesError 仍 null、points 照常有数', async () => {
+  clearSeriesCache();
+  const clock = makeClock();
+  const pool = new MetricsPool();
+  const ask = pool.query.bind(pool);
+  pool.query = async (sql, params) => {
+    if (pool._kind(sql) === 'seriesDisks') { const e = new Error('disk boom'); e.code = '42P01'; throw e; }
+    return ask(sql, params);
+  };
+  const payload = await metricsApiPayload({
+    pool, sampler: { latest: () => makeSample(), enabled: true }, range: '6h', now: clock.now,
+  });
+  assert.equal(payload.disksError, '42P01', '取因口径与 seriesError 一致：code 优先，没 code 才 message');
+  assert.deepEqual(payload.series.disks, [], '磁盘挂 ⇒ 空数组（不是 undefined、不是 null）');
+  assert.equal(payload.seriesError, null,
+    '**磁盘那条挂掉绝不能让 seriesError 有值**：否则界面会把已有数的 CPU/内存图一起标成「历史不可用」（#650）');
+  assert.equal(payload.series.points.length, 1, '主序列一条都没少');
+
+  clearSeriesCache();
+  const both = await metricsApiPayload({
+    pool: { async query() { const e = new Error('all boom'); e.code = '57P01'; throw e; } },
+    range: '1h', now: clock.now,
+  });
+  assert.equal(both.seriesError, '57P01');
+  assert.equal(both.disksError, '57P01', '两条查询都挂 ⇒ 两个降级各自有值（不合并成一个）');
+  assert.deepEqual(both.series, { bucketSeconds: pickBucketSeconds(3600), points: [], disks: [] },
+    '全挂时 series 三个键都在，降级形状依旧可渲染');
   clearSeriesCache();
 });
 
@@ -997,7 +1097,7 @@ test('#650 metricsApiPayload：DB 挂了 ⇒ seriesError 给原因，latest 照�
   assert.equal(payload.seriesError, '57P01', '给原因字符串（code 优先），不把堆栈与 SQL 塞进响应');
   assert.equal(payload.range, '24h');
   assert.equal(payload.retentionDays, 45);
-  assert.deepEqual(payload.series, { bucketSeconds: pickBucketSeconds(86400), points: [] },
+  assert.deepEqual(payload.series, { bucketSeconds: pickBucketSeconds(86400), points: [], disks: [] },
     '空 points ⇒ 页面画「该区间无数据」，不画一条贴底的假线');
   assert.equal(payload.latest.cpu.usagePct, 14.6, '**latest 必须还在**：卡片读的是进程内那一拍');
   clearSeriesCache();
@@ -1157,6 +1257,8 @@ test('#650 GET /api/admin/system/metrics：admin 200，latest 与 series 同时�
     assert.deepEqual(body.latest.containers.drift.onlyDocker, ['fde-old']);
     assert.equal(body.series.bucketSeconds, 300, '6h ⇒ 5m 桶（目标 ≤240 点，服务端选档）');
     assert.deepEqual(body.series.points, [], '空库 ⇒ 空数组（前端画「该区间无数据」）');
+    assert.deepEqual(body.series.disks, [], '#814 磁盘历史随同一个响应下发（这个假池的磁盘表空 ⇒ 空数组）');
+    assert.equal(body.disksError, null, '#814 磁盘查询没挂 ⇒ disksError 是 null，不是缺键');
     assert.equal(pool.seriesQueries.length, 1, '一次请求只查一次库');
     assert.deepEqual(pool.seriesQueries[0].params[1], 300);
     assert.ok(pool.seriesQueries[0].params[0] instanceof Date);

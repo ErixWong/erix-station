@@ -402,6 +402,31 @@ export function seriesSql() {
            ORDER BY 1`;
 }
 
+/**
+ * 磁盘历史序列 SQL（导出来给单测钉文本；`$1` = since，`$2` = 桶宽秒数，与 `seriesSql()` 同一对）。
+ *
+ * 为什么是**第二条 SQL**而不是往 `seriesSql()` 里加几列：主表是「一拍一行」，
+ * `system_metrics_disks` 是「一拍 × 一设备一行」，粒度不同 ⇒ 必须按**桶 × 设备**两级分组。
+ * 若改成 JOIN 主表，每个桶会被设备数放大，`avg(cpu_usage_pct)` 与 `samples` 全会错（#814）。
+ *
+ * `min(path)` 的理由：同一 `device` 的挂载点可能随 env 变（例如 `/` 与 `/mnt/host`），而 `path`
+ * 既不是键也不参与分组，不加聚合 PG 会直接报「must appear in the GROUP BY clause」。取
+ * **字典序最小**那一条只是为了让同一桶的结果**确定可复现**（不随执行计划换名字）；
+ * 它只是**展示用引用**（标注“这块盘挂在哪儿”），前端不许拿它当分组键。
+ */
+export function seriesDisksSql() {
+  return `SELECT to_timestamp(floor(extract(epoch FROM sampled_at) / $2) * $2) AS bucket,
+                 device,
+                 min(path)               AS path,
+                 round(avg(used_bytes))  AS used_avg,
+                 round(avg(total_bytes)) AS total_avg,
+                 count(*)::integer       AS samples
+            FROM system_metrics_disks
+           WHERE sampled_at >= $1
+           GROUP BY 1, 2
+           ORDER BY 2, 1`;
+}
+
 // `(range) → {at, value}` 的进程内缓存。模块级：portal 是单进程，两个 sampler 共享一份历史读数
 // 不会互相抹掉（值只由 DB 决定）。测试用 `clearSeriesCache()` 复位。
 const seriesCache = new Map();
@@ -446,6 +471,58 @@ export async function querySeries(pool, { range = DEFAULT_METRIC_RANGE, now = ()
   }));
   const value = { bucketSeconds, points };
   seriesCache.set(key, { at, value });
+  return { ...value, range: key, cached: false };
+}
+
+/**
+ * 磁盘历史序列（#814）：与 `querySeries()` **同一窗口、同一桶宽、同一份 5s 缓存**，但是
+ * **另一个 key**（`` `${key}#disks` ``）——同一个 Map ⇒ `clearSeriesCache()` 一次清两边，
+ * 不会出现「主序列新、磁盘旧」这两张不同时间的图拼在同一屏上。
+ *
+ * 结果形状是**按设备归组**（`[{ device, path, points: [...] }]`）而不是一摊平的点表：
+ * 一块盘一条线，前端不必再分一遍组（分组规则只有一份）。
+ *
+ * 脏行的处置：`device` 不是非空字符串 ⇒ 归不了组；`t` 拿不到 ⇒ 落不到时间轴。
+ * 两种都是「这个点不存在」⇒ 丢掉并计数，**绝不补 0**（#586 口径：补 0 就是画一条贴底的假线）。
+ *
+ * @returns {Promise<{bucketSeconds:number, disks:Array<object>, range:string, cached:boolean,
+ *          dropped:number}>} `dropped` = 被丢的脏行数（additive，给运维看“库里有多少行进不了图”）
+ */
+export async function queryDiskSeries(pool, { range = DEFAULT_METRIC_RANGE, now = () => Date.now() } = {}) {
+  const key = METRIC_RANGES[range] ? range : DEFAULT_METRIC_RANGE;
+  const cacheKey = `${key}#disks`;
+  const spanSeconds = METRIC_RANGES[key];
+  const at = Number(now());
+  const hit = seriesCache.get(cacheKey);
+  if (hit && at - hit.at < SERIES_CACHE_TTL_MS) return { ...hit.value, range: key, cached: true };
+
+  // 桶宽与主序列同一个表达式（同一 `pickBucketSeconds(spanSeconds)`）：两张图共用一个时间轴。
+  const bucketSeconds = pickBucketSeconds(spanSeconds);
+  const since = new Date(at - spanSeconds * 1000);
+  const res = await pool.query(seriesDisksSql(), [since, bucketSeconds]);
+  // SQL 已 `ORDER BY 2, 1`（设备、桶），所以桶天然按时间升序，这里只归组、不再排点。
+  const byDevice = new Map();
+  let dropped = 0;
+  for (const row of res?.rows ?? []) {
+    const t = row.bucket instanceof Date ? row.bucket.toISOString() : row.bucket ?? null;
+    const device = typeof row.device === 'string' && row.device !== '' ? row.device : null;
+    if (device === null || t === null) { dropped += 1; continue; }
+    let entry = byDevice.get(device);
+    if (!entry) { entry = { device, path: null, points: [] }; byDevice.set(device, entry); }
+    // `path` 取该设备第一个非空字符串（整段都没名字 ⇒ null，不是 ''）。
+    if (entry.path === null && typeof row.path === 'string' && row.path !== '') entry.path = row.path;
+    entry.points.push({
+      t,
+      usedBytes: numOrNull(row.used_avg),
+      totalBytes: numOrNull(row.total_avg),
+      samples: numOrNull(row.samples),
+    });
+  }
+  // 设备按字典序输出：管理台每 5s 刷一次，顺序随机换会看起来像「盘换了」。
+  const disks = [...byDevice.values()]
+    .sort((a, b) => (a.device < b.device ? -1 : a.device > b.device ? 1 : 0));
+  const value = { bucketSeconds, disks, dropped };
+  seriesCache.set(cacheKey, { at, value });
   return { ...value, range: key, cached: false };
 }
 
@@ -507,6 +584,9 @@ export function containerDrift(dbNames, dockerNames) {
  *   · `querySeries` 抛错 ⇒ `seriesError` 给原因字符串，而 **`latest` 仍必须 200 正常返回**：
  *     卡片读的是进程内那一拍，DB 挂了它依旧有数（决定 2）——这是本端点存在的理由，不是降级补丁。
  *     此时 `series.points` 给空数组（页面画「该区间无数据」，不画一条贴底的假线）。
+ *   · #814 磁盘历史是**另一条查询**，降级也**各自独立**：磁盘那条挂掉只让顶层 `disksError` 有值
+ *     且 `series.disks` 为 `[]`，`seriesError` 与 `series.points` 一律不受影响——否则界面会把
+ *     已经画出数的 CPU/内存图一起标成「历史不可用」（#650 立的「三个降级各自独立」）。
  *   · 采样器没跑（`SYSTEM_METRICS_ENABLED=0`）或还没有第一拍 ⇒ `latest: null`，**不是 500**。
  *     但「没跑」与「还没第一拍」在前端必须是**两句不同文案** ⇒ 额外下发 `enabled`（additive，
  *     取自采样器句柄自己的 `enabled`，前端不许从 `latest === null` 反推）。
@@ -520,7 +600,8 @@ export async function metricsApiPayload({
   // 非法 `range` 在这里（而不是在 HTTP 层）回落：`querySeries` 本来也是同一个口径，两处共用一个判定。
   const key = METRIC_RANGES[range] ? range : DEFAULT_METRIC_RANGE;
   const latest = toApiLatest(typeof sampler?.latest === 'function' ? sampler.latest() : null);
-  let series = { bucketSeconds: pickBucketSeconds(METRIC_RANGES[key]), points: [] };
+  // `disks` 在两个分支里都必须是**数组**（降级时 `[]`，不是 undefined）：前端只判长度，不判形状。
+  let series = { bucketSeconds: pickBucketSeconds(METRIC_RANGES[key]), points: [], disks: [] };
   let seriesError = null;
   try {
     const { bucketSeconds, points } = await querySeries(pool, { range: key, now });
@@ -529,11 +610,21 @@ export async function metricsApiPayload({
     // 只给原因字符串（`code` 优先，没 code 才给 message）：堆栈与 SQL 片段不该出现在管理台响应里。
     seriesError = String(err?.code ?? err?.message ?? err);
   }
+  // #814 磁盘序列是**独立第二条查询**：它挂掉只进 `disksError`，上面那个 try/catch 的结论已经
+  // 下完，不许被这里覆写（同一个 `code 优先` 的取因口径）。
+  let disksError = null;
+  try {
+    const { disks } = await queryDiskSeries(pool, { range: key, now });
+    series.disks = disks;
+  } catch (err) {
+    series.disks = [];
+    disksError = String(err?.code ?? err?.message ?? err);
+  }
   // 采样器到底开没开（issue #650 前端「采样已关闭」文案的唯一依据）。
   // `sampler` 为 `null`（`ENABLED=0` 时 `cli.js serve` 根本不建它）⇒ `false`；
   // 这一格与 `latest: null` 是**两件事**：前者说「没人采」，后者只说「还没采到」。
   return {
-    latest, series, range: key, retentionDays: retentionDays ?? null, seriesError,
+    latest, series, range: key, retentionDays: retentionDays ?? null, seriesError, disksError,
     enabled: sampler?.enabled === true,
   };
 }
