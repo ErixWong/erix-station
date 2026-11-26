@@ -164,7 +164,8 @@ class MetricsPool {
     if (kind === 'series') {
       return [{
         bucket: new Date('2026-11-17T03:00:00Z'), cpu_avg: '12.34', cpu_max: '33.33',
-        mem_used: '50671616', containers_running: 3, samples: 7,
+        mem_used: '50671616', mem_available: '40000000', mem_cached: '50671616', swap_used: '0', load1: '1.500',
+        containers_running: 3, samples: 7,
       }];
     }
     return [];
@@ -536,6 +537,10 @@ test('#650 querySeries：服务端分桶 + 按 range 缓存 5s + 脏值不当 0'
   assert.equal(first.points[0].cpuAvg, 12.34,
     'numeric 在 pg 驱动里是字符串 ⇒ 必须转成数（否则前端拼出 "12.34%" 之外的算术错）');
   assert.equal(first.points[0].cpuMax, 33.33);
+  assert.equal(first.points[0].memAvailable, 40000000, '#814 可用内存同样是桶内平均，numeric 转数');
+  assert.equal(first.points[0].memCached, 50671616, '#814 缓存列');
+  assert.equal(first.points[0].swapUsed, 0, '#814 swap 的 0 是**真 0**，与「没给」的 null 是两件事');
+  assert.equal(first.points[0].load1, 1.5, '#814 load1 取桶内平均');
   assert.equal(first.points[0].containersRunning, 3);
   const [since, bucket] = pool.queries[0].params;
   assert.equal(bucket, 300);
@@ -558,11 +563,12 @@ test('#650 querySeries：服务端分桶 + 按 range 缓存 5s + 脏值不当 0'
 
   clearSeriesCache();
   const empty = await querySeries(
-    { async query() { return { rows: [{ bucket: null, cpu_avg: null, cpu_max: null, mem_used: null, containers_running: null, samples: null }] }; } },
+    { async query() { return { rows: [{ bucket: null, cpu_avg: null, cpu_max: null, mem_used: null, mem_available: null, mem_cached: null, swap_used: null, load1: null, containers_running: null, samples: null }] }; } },
     { range: '1h', now: clock.now },
   );
   assert.deepEqual(empty.points[0], {
-    t: null, cpuAvg: null, cpuMax: null, memUsed: null, containersRunning: null, samples: null,
+    t: null, cpuAvg: null, cpuMax: null, memUsed: null, memAvailable: null, memCached: null,
+    swapUsed: null, load1: null, containersRunning: null, samples: null,
   }, '一格都没有 ⇒ 全 null，不是 0');
   clearSeriesCache();
 });

@@ -390,6 +390,10 @@ export function seriesSql() {
                  round(avg(cpu_usage_pct), 2)  AS cpu_avg,
                  max(cpu_usage_pct)            AS cpu_max,
                  round(avg(mem_used_bytes))    AS mem_used,
+                 round(avg(mem_available_bytes)) AS mem_available,
+                 round(avg(mem_cached_bytes))    AS mem_cached,
+                 round(avg(swap_used_bytes))     AS swap_used,
+                 round(avg(load1), 3)            AS load1,
                  max(containers_running)       AS containers_running,
                  count(*)::integer             AS samples
             FROM system_metrics
@@ -433,6 +437,10 @@ export async function querySeries(pool, { range = DEFAULT_METRIC_RANGE, now = ()
     cpuAvg: numOrNull(row.cpu_avg),
     cpuMax: numOrNull(row.cpu_max),
     memUsed: numOrNull(row.mem_used),
+    memAvailable: numOrNull(row.mem_available),
+    memCached: numOrNull(row.mem_cached),
+    swapUsed: numOrNull(row.swap_used),
+    load1: numOrNull(row.load1),
     containersRunning: numOrNull(row.containers_running),
     samples: numOrNull(row.samples),
   }));
