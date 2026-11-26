@@ -16,7 +16,8 @@ function quota(over: Record<string, unknown> = {}) {
 
 const base = {
   quota: null as unknown, reason: null as unknown, loading: false, loaded: true,
-  error: null as unknown, days: [] as unknown[], usageLoading: false, usageError: null as unknown,
+  error: null as unknown, days: [] as unknown[], totals: null as unknown,
+  usageLoading: false, usageError: null as unknown,
 };
 
 function mountBadge(props: Record<string, unknown> = {}) {
@@ -49,6 +50,19 @@ function mountBadgeHost(props: Record<string, unknown> = {}) {
 }
 
 const DAY = { date: '2026-11-29', spend: 2.05, prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, api_requests: 1 };
+
+/** 本地时区「今天往前 n 天」的 `YYYY-MM-DD`（窗口是滚动的，用例不钉死绝对日期）。 */
+function localDayKeyBack(back: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - back);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 把某天包成一行日聚合（其余字段取占位值）。 */
+function usageRow(date: string, spend: number) {
+  return { date, spend, prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, api_requests: 1 };
+}
 
 beforeEach(() => {
   localStorage.clear();
@@ -131,11 +145,77 @@ describe('弹窗明细', () => {
     expect(body).not.toContain('—');
   });
 
-  it('30 天 chart 空区间：显「该区间无数据」（不画贴底假线）', async () => {
+  it('30 天窗口：一条日行都没有 ⇒ 30 个 0 点（贴底 0 线是诚实结论），**不**退化成空态', async () => {
+    // 缺陷 1 回归钉：缺行 = 那天没请求 = 花 0，不是「无数据」。
     const w = mountBadge({ quota: quota(), days: [] });
     await w.get('[data-test="usage-badge"]').trigger('click');
-    expect(w.get('[data-test="metric-chart-empty"]').text()).toBe('该区间无数据');
+    const line = w.get('[data-test="metric-chart-line"]');
+    expect((line.attributes('d') ?? '').length).toBeGreaterThan(0);
+    // 折线画得出 ⇒ 空态文案已退场（常驻 DOM 但 aria-hidden/opacity-0）
+    expect(w.get('[data-test="metric-chart-svg"]').attributes('aria-hidden')).toBe('false');
+    const empty = w.get('[data-test="metric-chart-empty"]');
+    expect(empty.attributes('aria-hidden')).toBe('true');
+    expect(empty.classes()).toContain('opacity-0');
+    // 30 个全 0 的点 ⇒ y 轴两端都是 $0.00（而不是不标）
+    expect(w.get('[data-test="metric-chart-y-max"]').text()).toBe('$0.00');
+  });
+
+  it('只有 1 行日行：不再显「该区间无数据」，窗口被补成 30 点并画出真线', async () => {
+    const w = mountBadge({ quota: quota(), days: [usageRow(localDayKeyBack(1), 0.39)] });
+    await w.get('[data-test="usage-badge"]').trigger('click');
+    const empty = w.get('[data-test="metric-chart-empty"]');
+    expect(empty.attributes('aria-hidden')).toBe('true');
+    expect(empty.classes()).toContain('opacity-0');
+    const d = w.get('[data-test="metric-chart-line"]').attributes('d') ?? '';
+    expect(d.length).toBeGreaterThan(0);
+    // 30 个点 ⇒ 30 段（1 个 M + 29 个 L），证明窗口被补齐而不是只喂那一行
+    expect((d.match(/L/g) ?? []).length).toBe(29);
+  });
+
+  it('横轴两端是日期 `MM-DD`（日粒度下 `HH:mm` 永远 `00:00`，零信息）', async () => {
+    const w = mountBadge({ quota: quota(), days: [usageRow(localDayKeyBack(1), 0.39)] });
+    await w.get('[data-test="usage-badge"]').trigger('click');
+    const start = w.get('[data-test="metric-chart-x-start"]').text();
+    const end = w.get('[data-test="metric-chart-x-end"]').text();
+    expect(start).toMatch(/^\d{2}-\d{2}$/);
+    expect(end).toMatch(/^\d{2}-\d{2}$/);
+    expect(start).not.toBe(end);
+    // 钉住今天（本地）作为窗口右端
+    const p = (n: number) => String(n).padStart(2, '0');
+    const now = new Date();
+    expect(end).toBe(`${p(now.getMonth() + 1)}-${p(now.getDate())}`);
+  });
+
+  it('拿不到数据：usageError 非空 ⇒ 出 note 那句，且不画假线、不出贴底 0 线', async () => {
+    const w = mountBadge({ quota: quota(), days: [], usageError: '网关不可达' });
+    await w.get('[data-test="usage-badge"]').trigger('click');
+    const empty = w.get('[data-test="metric-chart-empty"]');
+    expect(empty.text()).toContain('网关不可达');
+    expect(empty.attributes('aria-hidden')).toBe('false');
+    expect(w.get('[data-test="metric-chart-line"]').attributes('d')).toBe('');
     expect(w.get('[data-test="metric-chart-svg"]').attributes('aria-hidden')).toBe('true');
+  });
+
+  it('近 30 天合计：totals.spend 有值 ⇒ 出「近 30 天合计 $X」', async () => {
+    const w = mountBadge({ quota: quota(), days: [DAY], totals: { spend: 3.5, total_tokens: 450 } });
+    await w.get('[data-test="usage-badge"]').trigger('click');
+    expect(w.get('[data-test="usage-totals"]').text()).toContain('近 30 天合计 $3.50');
+  });
+
+  it('totals 缺失 ⇒ 合计那一行不渲染（不拿 $0.00 冒充）', async () => {
+    const w = mountBadge({ quota: quota(), days: [DAY], totals: null });
+    await w.get('[data-test="usage-badge"]').trigger('click');
+    expect(w.find('[data-test="usage-totals"]').exists()).toBe(false);
+    expect(w.text()).not.toContain('近 30 天合计');
+  });
+
+  it('进度条用蓝色族（与 MetricChart 同族），不是品牌绿', async () => {
+    const w = mountBadge({ quota: quota(), days: [DAY] });
+    await w.get('[data-test="usage-badge"]').trigger('click');
+    const bar = w.get('[data-test="usage-progress"] > div');
+    expect(bar.classes()).toContain('bg-blue-600');
+    expect(bar.classes()).not.toContain('bg-brand');
+    expect(w.get('[data-test="usage-progress"]').classes()).toContain('bg-black/10');
   });
 
   it('有额度常规：已用/额度/剩余/清零都在；清零用「清零」不写「已清零」', async () => {

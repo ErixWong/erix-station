@@ -346,6 +346,7 @@ function jumpToLatest() {
         :loaded="myUsage.loaded.value"
         :error="myUsage.error.value"
         :days="myUsage.days.value"
+        :totals="myUsage.totals.value"
         :usage-loading="myUsage.usageLoading.value"
         :usage-error="myUsage.usageError.value"
         @refresh="myUsage.load()"

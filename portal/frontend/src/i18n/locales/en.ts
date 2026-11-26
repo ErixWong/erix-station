@@ -183,6 +183,7 @@ export const en = {
       retry: 'Retry',
       noData: 'No data in this range',
       chartLabel: 'Daily usage, last 30 days',
+      totals30d: 'Total, last 30 days: {spend}',
       close: 'Close',
     },
   },

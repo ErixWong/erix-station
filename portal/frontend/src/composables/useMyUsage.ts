@@ -28,6 +28,13 @@ export interface MyUsageDay {
   api_requests: number | null;
 }
 
+/** `GET /api/me/llm-usage` 的 `totals`（§2.15：区间内日行的求和）。**可空**：响应里没带 /
+ *  字段脏 ⇒ `null`（调用方不出那一行，**不许**拿 0 冒充「没花钱」）。 */
+export interface MyUsageTotals {
+  spend: number;
+  total_tokens: number;
+}
+
 /** 额度轮询周期：60s（**不是 30s**）——网关把 key 花费写回聚合态默认 60s 一拍（§2.14 缓存口径），
  *  比这更快的轮询只会放大网关压力而不增加信息。 */
 const QUOTA_POLL_MS = 60_000;
@@ -47,6 +54,8 @@ export function useMyUsage() {
   const error = ref<string | null>(null);
 
   const days = ref<MyUsageDay[]>([]);
+  /** 近 30 天合计（来自响应的 `totals`）；拿不到 ⇒ `null`（弹窗就不出那一行）。 */
+  const totals = ref<MyUsageTotals | null>(null);
   const usageLoading = ref(false);
   const usageError = ref<string | null>(null);
 
@@ -63,6 +72,7 @@ export function useMyUsage() {
     loading.value = false;
     error.value = null;
     days.value = [];
+    totals.value = null;
     usageLoading.value = false;
     usageError.value = null;
   }
@@ -94,9 +104,14 @@ export function useMyUsage() {
     usageLoading.value = true;
     usageError.value = null;
     try {
-      const data = await api<{ days?: MyUsageDay[] | null }>('/api/me/llm-usage?days=30');
+      const data = await api<{ days?: MyUsageDay[] | null; totals?: MyUsageTotals | null }>('/api/me/llm-usage?days=30');
       if (mySeq !== usageReqSeq) return;
       days.value = Array.isArray(data?.days) ? data.days : [];
+      // totals 只在**形状可用**（对象且 spend 是有限数）时存；否则 `null`（宁可不显示，不出 $0.00 假数）。
+      const rawTotals = data?.totals;
+      totals.value = rawTotals && typeof rawTotals === 'object' && Number.isFinite(rawTotals.spend)
+        ? { spend: rawTotals.spend, total_tokens: Number.isFinite(rawTotals.total_tokens) ? rawTotals.total_tokens : 0 }
+        : null;
     } catch (err) {
       if (mySeq !== usageReqSeq) return;
       usageError.value = toMessage(err);
@@ -122,5 +137,5 @@ export function useMyUsage() {
     if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible);
   });
 
-  return { quota, reason, loading, loaded, error, days, usageLoading, usageError, load, loadUsage, reset };
+  return { quota, reason, loading, loaded, error, days, totals, usageLoading, usageError, load, loadUsage, reset };
 }

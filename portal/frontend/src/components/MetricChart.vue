@@ -29,6 +29,12 @@ const props = withDefaults(defineProps<{
   formatY?: ((value: number) => string) | null;
   /** 横轴跨度 ≥24h ⇒ 端点标签带上日期（否则两端都叫「08:00」，读不出是哪天）。 */
   withDate?: boolean;
+  /**
+   * 横轴端点标签的**可选**替换（issue #808 纯增量）：给了就用它（例如按日聚合的用量只要日期
+   * `MM-DD`，`HH:mm` 对日粒度毫无意义），缺省 `null` ⇒ 现有 `formatAxisTime` 行为**逐字不变**。
+   * 本组件是 #650 管理台系统指标页在用的共享组件，默认行为与既有断言不许动。
+   */
+  formatX?: ((x: number) => string) | null;
   /** 无障碍名（每张卡的图用自己的指标名，屏幕阅读器不至于念出四个「chart」）。 */
   label?: string;
 }>(), {
@@ -41,6 +47,7 @@ const props = withDefaults(defineProps<{
   note: null,
   formatY: null,
   withDate: false,
+  formatX: null,
   label: '',
 });
 
@@ -79,9 +86,11 @@ function axisY(value: number | undefined): string {
 const yMaxText = computed(() => (hasData.value ? axisY(bounds.value?.max) : ''));
 const yMinText = computed(() => (hasData.value ? axisY(bounds.value?.min) : ''));
 
-/** X 轴：两端各标一个本地时间（`formatAxisTime` 里脏值 ⇒ 原样，不猜）。 */
+/** X 轴：两端各标一个本地时间（`formatAxisTime` 里脏值 ⇒ 原样，不猜）。
+ *  给了 `formatX` ⇒ 由它出文案（调用方负责时区与形态，例如日粒度的 `MM-DD`）。 */
 function axisX(raw: number | undefined): string {
   if (raw === undefined || !Number.isFinite(raw)) return '';
+  if (props.formatX) return props.formatX(raw);
   const at = formatAxisTime(new Date(raw).toISOString(), locale.value, props.withDate);
   if (at.kind === 'unknown') return '';
   return at.text;

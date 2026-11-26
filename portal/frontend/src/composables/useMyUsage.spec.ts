@@ -77,12 +77,42 @@ describe('useMyUsage', () => {
     let call = 0;
     vi.stubGlobal('fetch', vi.fn(async () => (++call === 1 ? json({ days, totals: { spend: 0.5, total_tokens: 2 } }) : json({ error: { code: 'not_found' } }, 404))));
     const { scope, usage } = makeUsage();
+    expect(usage.totals.value).toBeNull(); // 未拉之前不拿 0 冒充
     await usage.loadUsage();
     expect(usage.days.value).toHaveLength(1);
     expect(usage.usageError.value).toBeNull();
     await usage.loadUsage();
     expect(usage.usageError.value).toBeTruthy();
     expect(usage.days.value).toHaveLength(1); // 旧 days 保留
+    scope.stop();
+  });
+
+  it('loadUsage：把响应的 totals 存下来（可空：响应没带 / spend 脏 ⇒ null）', async () => {
+    const days = [{ date: '2026-11-01', spend: 0.5, prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, api_requests: 1 }];
+    let body: unknown = { days, totals: { spend: 3.5, total_tokens: 450 } };
+    vi.stubGlobal('fetch', vi.fn(async () => json(body)));
+    const { scope, usage } = makeUsage();
+    await usage.loadUsage();
+    expect(usage.totals.value).toEqual({ spend: 3.5, total_tokens: 450 });
+
+    body = { days }; // 没有 totals 字段
+    await usage.loadUsage();
+    expect(usage.totals.value).toBeNull();
+
+    body = { days, totals: { spend: null, total_tokens: 2 } }; // 脏 spend ⇒ 也不存（宁缺勿假）
+    await usage.loadUsage();
+    expect(usage.totals.value).toBeNull();
+    scope.stop();
+  });
+
+  it('reset：连 totals 一起清', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => json({ days: [], totals: { spend: 1.2, total_tokens: 3 } })));
+    const { scope, usage } = makeUsage();
+    await usage.loadUsage();
+    expect(usage.totals.value?.spend).toBe(1.2);
+    usage.reset();
+    expect(usage.totals.value).toBeNull();
+    expect(usage.days.value).toEqual([]);
     scope.stop();
   });
 

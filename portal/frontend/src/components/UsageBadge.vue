@@ -11,7 +11,7 @@ import ModalShell from './ModalShell.vue';
 import MetricChart from './MetricChart.vue';
 import { fmtUsdCompact } from '../lib/money';
 import { usageCadenceOf, usageKindOf, usageOverage, usagePercentUsed } from '../lib/usageLabel';
-import type { MyQuota, MyUsageDay } from '../composables/useMyUsage';
+import type { MyQuota, MyUsageDay, MyUsageTotals } from '../composables/useMyUsage';
 
 const props = defineProps<{
   quota: MyQuota | null;
@@ -20,6 +20,7 @@ const props = defineProps<{
   loaded: boolean;
   error: string | null;
   days: MyUsageDay[];
+  totals: MyUsageTotals | null;
   usageLoading: boolean;
   usageError: string | null;
 }>();
@@ -112,11 +113,55 @@ const badgeTitle = computed(() => {
   return parts.join(' · ');
 });
 
-// 30 天 chart 点：date 解析为 epoch，spend 非有限值丢掉（脏点不画）。空 ⇒ MetricChart 显空态。
-const chartPoints = computed(() => props.days
-  .map((d) => ({ x: Date.parse(d.date), y: d.spend }))
-  .filter((p) => Number.isFinite(p.x) && p.y != null && Number.isFinite(p.y as number))
-  .map((p) => ({ x: p.x, y: p.y as number })));
+// 30 天 chart 点：**补齐成完整 30 天窗口再喂图**（issue #808 实测缺陷 1）。
+//
+// 为什么不直接喂 `days`：LiteLLM 的日聚合**只给有活动的那几天**行（常态：30 天里只有 1 行），
+// 旧实现只喂那一行 ⇒ 图上只有一个点，弹窗里看起来就像「没数据」；补齐后每一天一个点，线总画得出来。
+//
+// **缺行 ⇒ 0 是诚实的**：日聚合里「没有这一天」= 那天没有请求 = 当天花费 0，不是「读数缺失」。
+// 这与 `spend == null ⇒ 不猜 0` 是两回事：那是**行存在但字段空**（读数脏 ⇒ 丢掉该行的金额），
+// 这里是**整天没有活动**。所以 30 天全 0 ⇒ 一条贴底 0 线就是「真的没花钱」的正确结论，
+// **不**退化成空态；空态只留给「拿不到数据」（失败 / 首次还在读），那两种情形下面直接不喂点走 `note`。
+const CHART_WINDOW_DAYS = 30;
+
+/** 本地时区（部署环境 UTC+8）的 `YYYY-MM-DD`：与服务端日行的 `date` 用同一把钥匙对齐。 */
+function localDayKey(y: number, m: number, d: number): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${y}-${p(m + 1)}-${p(d)}`;
+}
+
+/** 横轴端点标签：只要日期 `MM-DD`（日粒度下 `HH:mm` 永远是 `00:00`，零信息量）。 */
+function formatDayAxis(x: number): string {
+  const d = new Date(x);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+const chartPoints = computed(() => {
+  // 拿不到数据（失败 / 首次还在读）⇒ 不喂点：宁可走 note，也不画一条把「未知」说成 0 的贴底线。
+  if (props.days.length === 0 && (props.usageError || props.usageLoading)) return [];
+  const byDay = new Map<string, number>();
+  for (const row of props.days ?? []) {
+    const key = typeof row?.date === 'string' ? row.date.slice(0, 10) : '';
+    if (!key) continue;
+    const spend = typeof row.spend === 'number' && Number.isFinite(row.spend) ? row.spend : 0;
+    byDay.set(key, (byDay.get(key) ?? 0) + spend);
+  }
+  const today = new Date();
+  const out: { x: number; y: number }[] = [];
+  for (let back = CHART_WINDOW_DAYS - 1; back >= 0; back--) {
+    const day = new Date(today.getFullYear(), today.getMonth(), today.getDate() - back); // 本地零点
+    if (!Number.isFinite(day.getTime())) continue;
+    out.push({ x: day.getTime(), y: byDay.get(localDayKey(day.getFullYear(), day.getMonth(), day.getDate())) ?? 0 });
+  }
+  return out;
+});
+
+// 近 30 天合计（响应里的 `totals.spend`）：拿不到 / 脏 ⇒ null ⇒ 那一行不渲染（不出 $0.00 假数）。
+const totalsSpend = computed(() => {
+  const value = props.totals?.spend;
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+});
 
 // 弹窗打开时的数据保鲜：
 //   · open 变 true ⇒ emit('open')，调用方去 loadUsage()（首次拉）。
@@ -136,10 +181,12 @@ onScopeDispose(() => {
   if (openTimer) clearInterval(openTimer);
 });
 
-// MetricChart 的 note：用量在途/失败时优先于空态文案（「该区间无数据」只在真的空数组时出现）。
+// MetricChart 的 note：一个点都没有时顶上来（「该区间无数据」不再由数据形状触发：窗口永远被补满，
+// 有读数就有真线，缺行是 0 而不是「无数据」）。
 const chartNote = computed(() => {
+  if (chartPoints.value.length > 0) return null;
   if (props.usageError) return props.usageError;
-  if (props.usageLoading && chartPoints.value.length === 0) return t('workbench.usage.loading');
+  if (props.usageLoading) return t('workbench.usage.loading');
   return null;
 });
 </script>
@@ -191,7 +238,9 @@ const chartNote = computed(() => {
         <div v-else-if="state === 'period'" class="grid gap-2">
           <p data-test="usage-used" class="text-sm">{{ t('workbench.usage.usedOf', { spend: spendText, budget: budgetText }) }}</p>
           <div v-if="percent != null" data-test="usage-progress" class="h-2 rounded bg-black/10 overflow-hidden">
-            <div class="h-full bg-brand" :style="{ width: `${percent}%` }"></div>
+            <!-- 与 MetricChart 的蓝色族同色（折线 rgb(37 99 235)）：别改成 `bg-brand`（品牌绿），
+                 绿进度条 + 蓝折线是两个色族拼在一起（#808 实测回滚）。轨道保持 bg-black/10。 -->
+            <div class="h-full bg-blue-600" :style="{ width: `${percent}%` }"></div>
           </div>
           <p v-if="overage != null" data-test="usage-overage" class="text-sm text-red-600">
             {{ t('workbench.usage.overage', { amount: fmtUsdCompact(overage) }) }}
@@ -214,7 +263,13 @@ const chartNote = computed(() => {
           {{ t('workbench.usage.reading') }}
         </div>
 
-        <!-- 30 天每日用量 chart：空数组 ⇒ MetricChart 显「该区间无数据」（不画贴底假线） -->
+        <!-- 近 30 天合计（取响应的 totals.spend）：拿不到就整行不出，**不拿 $0.00 冒充「没花钱」**。 -->
+        <p v-if="totalsSpend != null" data-test="usage-totals" class="text-sm text-black/60">
+          {{ t('workbench.usage.totals30d', { spend: fmtUsdCompact(totalsSpend) }) }}
+        </p>
+
+        <!-- 30 天每日用量 chart：点已由本组件补成完整 30 天窗口（缺行 = 0）；
+             空态文案只留给「拿不到数据」（走 note）；横轴只要日期（`format-x`）。 -->
         <div class="grid gap-1">
           <p class="text-xs text-black/50">{{ t('workbench.usage.chartLabel') }}</p>
           <MetricChart
@@ -222,6 +277,7 @@ const chartNote = computed(() => {
             :empty-text="t('workbench.usage.noData')"
             :note="chartNote"
             :format-y="fmtUsdCompact"
+            :format-x="formatDayAxis"
             :label="t('workbench.usage.chartLabel')"
           />
         </div>

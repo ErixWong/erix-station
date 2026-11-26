@@ -195,6 +195,7 @@ export const zhCN = {
       retry: '重试',
       noData: '该区间无数据',
       chartLabel: '近 30 天每日用量',
+      totals30d: '近 30 天合计 {spend}',
       close: '关闭',
     },
   },
