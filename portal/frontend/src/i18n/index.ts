@@ -1,10 +1,15 @@
 // i18n 基建（issue #101 P1）：createI18n（Composition API 模式）+ 语言检测 + 持久化。
 //
-// 语言优先级（见 issue #101 方案）：localStorage('locale') 合法值 → 浏览器语言（zh 开头 → zh-CN，否则 en）
-// → 兜底 zh-CN。偏好只存 localStorage（不上传服务端/用户表）。
+// 语言优先级（#101 定的方案，#804 换了载体）：cookie('locale') 合法值 → localStorage('locale') 合法值
+// → 浏览器语言（zh 开头 → zh-CN，否则 en）→ 兜底 zh-CN。偏好存 cookie + localStorage（不上传服务端/用户表）。
+// 为什么 cookie 排在 localStorage 之前（#804）：管理台 `admin.<伞域>:<端口>` 与用户面 `station.<伞域>`
+// 是两个 **origin**，而 localStorage 按 origin 隔离、两边各存一份互不相通 ⇒ 用户面切了英文，管理台
+// 还是读不到。同站 cookie（Domain = 父域）两边都看得见，所以「两边都有」时以 cookie 为准；
+// localStorage 继续保留是兜底：禁用 cookie / 隐私模式下它同一会话内仍然能用（那条路不能断）。
 // key 类型：locales/zh-CN.ts 的 MessageSchema 经 vue-i18n 泛型 + DefineLocaleMessage 注入（见 types.d.ts）。
 
 import { createI18n } from 'vue-i18n';
+import { readLocaleCookie, writeLocaleCookie } from '../lib/localeCookie';
 import { zhCN, type MessageSchema } from './locales/zh-CN';
 import { en } from './locales/en';
 
@@ -32,8 +37,13 @@ function readStoredLocale(): string | null {
   }
 }
 
-/** 按优先级检测初始语言：localStorage → navigator.language → zh-CN。 */
+/** 按优先级检测初始语言：cookie → localStorage → navigator.language → zh-CN（#804）。 */
 export function detectLocale(): AppLocale {
+  // cookie 先：它是唯一跨 origin 可见的那一份（管理台与用户面是两个 host，localStorage 各存各的）。
+  // 值在这里就要过 isAppLocale：cookie 是用户可以自己改的输入，脏值不能直接当 locale 用。
+  const fromCookie = readLocaleCookie();
+  if (isAppLocale(fromCookie)) return fromCookie;
+
   const stored = readStoredLocale();
   if (isAppLocale(stored)) return stored;
 
@@ -57,7 +67,7 @@ export function createAppI18n() {
 export const i18n = createAppI18n();
 
 /**
- * 切换语言：改 i18n 当前 locale（响应式生效）+ 同步 <html lang> + 写入 localStorage 偏好。
+ * 切换语言：改 i18n 当前 locale（响应式生效）+ 同步 <html lang> + 双写偏好（cookie + localStorage）。
  * 只接受受支持的 locale（调用方传字面量即可，类型已约束）。
  */
 export function setLocale(locale: AppLocale): void {
@@ -67,6 +77,13 @@ export function setLocale(locale: AppLocale): void {
     localStorage.setItem(LOCALE_STORAGE_KEY, locale);
   } catch {
     /* 隐私模式/禁用存储：本次会话仍生效，仅不持久化 */
+  }
+  // cookie 是**跨 origin** 那一份（#804）：两边都写，读取时 cookie 优先。
+  // 必须独立 try/catch（不能塞进上面那个）：任一边写不进都只影响持久化，不影响本次切换生效。
+  try {
+    writeLocaleCookie(locale);
+  } catch {
+    /* 禁用 cookie：退化成只有 localStorage（同一会话内仍生效） */
   }
 }
 
