@@ -48,6 +48,7 @@ export async function resolveTargetFde(pool, fdeName) {
     throw new admin.AdminError('not_found', `FDE「${fdeName}」不存在`, {
       httpStatus: 404,
       details: { field: 'fde_name' },
+      en: `FDE "${fdeName}" does not exist`,
     });
   }
   return row;
@@ -217,7 +218,7 @@ export async function getFdeSessionHistory(
   let limit = Number(query?.get('limit') ?? http.HISTORY_EVENT_DEFAULT_LIMIT);
   if (!Number.isInteger(limit) || limit < 1) {
     throw new admin.AdminError('validation_failed', 'limit 必须为正整数', {
-      httpStatus: 400, details: { field: 'limit' },
+      httpStatus: 400, details: { field: 'limit' }, en: 'limit must be a positive integer',
     });
   }
   limit = Math.min(limit, http.HISTORY_EVENT_MAX_LIMIT);
@@ -227,7 +228,7 @@ export async function getFdeSessionHistory(
     before = Number(beforeRaw);
     if (!Number.isInteger(before) || before < 1) {
       throw new admin.AdminError('validation_failed', 'before 必须为正整数', {
-        httpStatus: 400, details: { field: 'before' },
+        httpStatus: 400, details: { field: 'before' }, en: 'before must be a positive integer',
       });
     }
   }
@@ -343,7 +344,7 @@ export async function getFdeFile(
   // 其余 ⇒ 400。静默当 json 会把拼错的 `mode` 读成「预览成功」（复审 MINOR 2）。
   if (modeRaw !== '' && modeRaw !== 'json' && modeRaw !== 'stream' && modeRaw !== 'download') {
     throw new admin.AdminError('validation_failed', 'mode 只支持 json|stream|download', {
-      httpStatus: 400, details: { field: 'mode' },
+      httpStatus: 400, details: { field: 'mode' }, en: 'mode only supports json|stream|download',
     });
   }
   const mode = modeRaw === '' ? 'json' : modeRaw;

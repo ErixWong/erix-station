@@ -13,11 +13,14 @@
 
 /** 配置槽域错误（`code` 是 §7 契约的一部分，前端据此显示文案）。 */
 export class SecretError extends Error {
-  constructor(message, { code = 'capability_slot_invalid', httpStatus = 400, details } = {}) {
+  constructor(message, { code = 'capability_slot_invalid', httpStatus = 400, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 S2-D：可选英文对（同 AdminError/HttpError 口径，本类的 message 是第一位置参、en 进 options）。
+    // `super(message)` 仍传中文原文，http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文。
+    this.en = en;
   }
 }
 
@@ -31,6 +34,7 @@ export function normalizeValue({ name, value }) {
   if (typeof value !== 'string' || value === '') {
     throw new SecretError('值不能为空字符串（要删除请传 null，不要传空串）', {
       code: 'capability_slot_invalid', details: { field: 'values', name },
+      en: 'the value must not be an empty string (pass null to delete, not an empty string)',
     });
   }
   // 长度上界：槽值是凭据，不是配置文件。1 KiB 足够任何 token/JWT，超了几乎必然是贴错东西
@@ -38,6 +42,7 @@ export function normalizeValue({ name, value }) {
   if (value.length > 1024) {
     throw new SecretError(`槽位 ${name} 的值超过 1024 字符（凭据不该有这么长）`, {
       code: 'capability_slot_invalid', details: { field: 'values', name, length: value.length },
+      en: `the value for slot ${name} exceeds 1024 characters (a credential should not be this long)`,
     });
   }
   return value;

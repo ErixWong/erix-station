@@ -1098,12 +1098,15 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
 
 /** 校验/状态类错误：`httpStatus` + `code` + `details.field`（HTTP 层按此映射 400）。 */
 export class RuntimeSettingsError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, en } = {}) {
     super(message);
     this.name = 'RuntimeSettingsError';
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 S2-D：可选英文对（同 AdminError/HttpError/SessionError/DirError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状与 message 一字不动。
+    this.en = en;
   }
 }
 
@@ -1441,6 +1444,7 @@ export async function saveRuntimeSetting({
   if (!isKnownSetting(key, registry)) {
     throw new RuntimeSettingsError('unknown_setting', `未知的运行时配置项：${String(key)}`, {
       httpStatus: 400,
+      en: `unknown runtime setting: ${String(key)}`,
       details: { field: 'key', known: Object.keys(registry) },
     });
   }
@@ -1450,18 +1454,21 @@ export async function saveRuntimeSetting({
     throw new RuntimeSettingsError('scalar_required',
       `value 只接受 JSON 标量（number / boolean / string），收到 ${typeof value}`, {
       httpStatus: 400, details: { field: 'value' },
+      en: `value only accepts a JSON scalar (number / boolean / string), received ${typeof value}`,
     });
   }
   if (value === null || value === undefined || typeof value === 'object') {
     throw new RuntimeSettingsError('scalar_required',
       'value 只接受 JSON 标量，不接受对象 / 数组 / null / undefined', {
       httpStatus: 400, details: { field: 'value' },
+      en: 'value only accepts a JSON scalar; objects / arrays / null / undefined are not accepted',
     });
   }
   if (typeof value === 'number' && !Number.isFinite(value)) {
     throw new RuntimeSettingsError('scalar_required',
       `value 必须是有限数（收到 ${String(value)}；JSON 也装不下它）`, {
       httpStatus: 400, details: { field: 'value' },
+      en: `value must be a finite number (received ${String(value)}; JSON cannot represent it either)`,
     });
   }
   const why = typeof entry?.validate === 'function' ? entry.validate(value) : true;
@@ -1484,6 +1491,7 @@ export async function saveRuntimeSetting({
       // upsert 带了 `RETURNING` 却不给行 = SQL 形状漂了（审计也在同一个事务里 ⇒ 一起回滚）。
       throw new RuntimeSettingsError('internal', `写入 ${key} 成功却没有 RETURNING 行`, {
         httpStatus: 500,
+        en: `writing ${key} succeeded but no RETURNING row was returned`,
       });
     }
     // ③ 审计：与 upsert 同生共死。`details` 的三个键与旧 CTE 版逐字相同；`previous_value` 与接口
@@ -1500,7 +1508,7 @@ export async function saveRuntimeSetting({
     if (auditRows !== 1) {
       throw new RuntimeSettingsError('internal',
         `保存 ${key} 成功但审计写了 ${audited?.rowCount ?? 0} 行（已 ROLLBACK ⇒ 设置未生效）`,
-        { httpStatus: 500 });
+        { httpStatus: 500, en: `saving ${key} succeeded but the audit wrote ${audited?.rowCount ?? 0} rows (ROLLBACK ⇒ the setting did not take effect)` });
     }
     await client.query('COMMIT');
     // ⑤ **写完就失效热读缓存**（M-1 点名的就是这一行）。它在 `COMMIT` **之后**：事务 rolled back 时
@@ -1678,7 +1686,7 @@ function createHotReader({ key, warnLabel, fallbackDefault, cacheTtlMs = HOT_REA
           `${warnLabel} 的 DB 读不可用（${readUnavailable}）⇒ 已回落 env/默认`,
           // `fallbackValue`：这一趟算好的回落值。`read_unavailable` 只在本模块内部被接住（全仓
           // 调用方只有下面那个 `read`）⇒ 这些 `details` 不会泄漏到 HTTP 响应里。
-          { httpStatus: 500, details: { fallbackValue: value } });
+          { httpStatus: 500, details: { fallbackValue: value }, en: `${warnLabel}: the DB read is unavailable (${readUnavailable}) ⇒ fell back to env/default` });
       }
       return value;
     } finally {

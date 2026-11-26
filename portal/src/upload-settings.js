@@ -173,11 +173,14 @@ const AUDIT_SQL = 'INSERT INTO audit_log (actor_id, action, target, details)'
   + ' VALUES ($1, $2, $3, $4)';
 /** 校验/状态类错误：`httpStatus` + `details.field`（`http.js` 的统一信封按此映射）。 */
 export class UploadSettingsError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 S2-D：可选英文对（同 AdminError/HttpError/SessionError/DirError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状与 message 一字不动。
+    this.en = en;
   }
 }
 
@@ -373,6 +376,7 @@ export async function updateUploadSettings({ pool, config = {}, log = console, a
       // 不能静默回落到 env：那会让管理台显示"保存成功但生效值是别的数"这种不可调试的形态。
       throw new UploadSettingsError('internal', `写入的 max_file_bytes=${maxFileBytes} 读回后不可用`, {
         httpStatus: 500,
+        en: `the written max_file_bytes=${maxFileBytes} is unavailable after read-back`,
       });
     }
     // ③ 旧值**只在这一处派生**：区间内 = 库里那个数（source=db），无行/区间外 = 当时真正在用的兜底值
@@ -397,6 +401,7 @@ export async function updateUploadSettings({ pool, config = {}, log = console, a
       // 「设置生效了而审计没写」在事务里不可表示；真出现 = 有人把审计改成了可跳过的形状。
       throw new UploadSettingsError('internal', `保存成功但审计写了 ${audited?.rowCount ?? 0} 行`, {
         httpStatus: 500,
+        en: `save succeeded but the audit wrote ${audited?.rowCount ?? 0} rows`,
       });
     }
     await client.query('COMMIT');

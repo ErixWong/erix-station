@@ -358,7 +358,7 @@ function outerRepoCovered({ rootAbs, stopAt }) {
  * @param {() => number} [opts.now=Date.now]
  */
 export async function getGitLight({ userSpaceRoot, fdeName, cwd, gitBin = 'git', now = Date.now } = {}) {
-  if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
+  if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500, en: 'userSpaceRoot/fde_name is missing' });
   let safeCwd;
   try {
     safeCwd = validateSessionCwd(cwd);
@@ -366,6 +366,7 @@ export async function getGitLight({ userSpaceRoot, fdeName, cwd, gitBin = 'git',
     if (err instanceof DirError) throw err;
     throw new DirError(err?.code ?? 'validation_failed', err?.message ?? 'cwd 非法', {
       httpStatus: err?.httpStatus ?? 400, details: err?.details,
+      en: err?.en ?? 'the cwd is invalid',
     });
   }
   const name = CWD_RE.exec(safeCwd)[1];

@@ -54,12 +54,15 @@ const MAX_CLAIM_ATTEMPTS = 3;
 
 /** 幂等层错误（http.js 映射为标准错误信封：{code, message, retryable, details}）。 */
 export class IdempotencyError extends Error {
-  constructor(code, message, { httpStatus = 400, retryable = false, details } = {}) {
+  constructor(code, message, { httpStatus = 400, retryable = false, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.retryable = retryable;
     this.details = details;
+    // issue #803 S2-D：可选英文对（同 AdminError/HttpError/SessionError/DirError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状、message 与 retryable 语义一字不动。
+    this.en = en;
   }
 }
 
@@ -76,12 +79,14 @@ export function normalizeKey(headerValue) {
   if (headerValue === undefined || headerValue === null) return null;
   if (typeof headerValue !== 'string') {
     throw new IdempotencyError('validation_failed', 'Idempotency-Key 必须为字符串', {
+      en: 'the Idempotency-Key header must be a string',
       details: { field: 'Idempotency-Key' },
     });
   }
   // 控制字符（U+0000–U+001F、U+007F）：头注入/不可见字符一律拒绝（含两侧，先于 trim 判定）。
   if (/[\u0000-\u001f\u007f]/.test(headerValue)) {
     throw new IdempotencyError('validation_failed', 'Idempotency-Key 含非法控制字符', {
+      en: 'the Idempotency-Key header contains illegal control characters',
       details: { field: 'Idempotency-Key' },
     });
   }
@@ -89,6 +94,7 @@ export function normalizeKey(headerValue) {
   if (key === '') return null;
   if (key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
     throw new IdempotencyError('validation_failed', `Idempotency-Key 长度超过上限 ${MAX_IDEMPOTENCY_KEY_LENGTH}`, {
+      en: `the Idempotency-Key header exceeds the limit of ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`,
       details: { field: 'Idempotency-Key' },
     });
   }
@@ -246,6 +252,7 @@ function replayHit(row, hash) {
   if (row.request_hash !== hash) {
     throw new IdempotencyError('idempotency_key_reuse', 'Idempotency-Key 已用于不同的请求载荷', {
       httpStatus: 409,
+      en: 'this Idempotency-Key was already used for a different request payload',
       details: { field: 'Idempotency-Key' },
     });
   }
@@ -257,6 +264,7 @@ function conflictError() {
   return new IdempotencyError('idempotency_conflict', '同一 Idempotency-Key 的并发请求未收敛，请重试', {
     httpStatus: 409,
     retryable: true,
+    en: 'concurrent requests with the same Idempotency-Key did not converge; please retry',
     details: { field: 'Idempotency-Key' },
   });
 }
@@ -270,7 +278,7 @@ function lostClaimError() {
   return new IdempotencyError(
     'idempotency_conflict',
     '本请求的幂等占位已被其它请求接管（owner fencing），本次业务写入已回滚，请重试',
-    { httpStatus: 409, retryable: true, details: { field: 'Idempotency-Key' } },
+    { httpStatus: 409, retryable: true, en: 'this request\'s idempotency claim was taken over by another request (owner fencing); the business write has been rolled back, please retry', details: { field: 'Idempotency-Key' } },
   );
 }
 

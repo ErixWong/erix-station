@@ -38,6 +38,7 @@ const NORMAL_END_REASONS = new Set(['end_turn', 'no_tool', 'judge_done']);
 export function validateQueuedKind(kind) {
   if (kind !== 'steer' && kind !== 'follow_up') {
     throw new SessionError('validation_failed', "kind 必须是 'steer' 或 'follow_up'", {
+      en: "kind must be 'steer' or 'follow_up'",
       details: { field: 'kind' },
     });
   }
@@ -135,7 +136,7 @@ export async function enqueueQueuedInput(pool, {
     if (Number(cnt.rows[0].n) >= MAX_QUEUED_INPUTS_PER_SESSION) {
       throw new SessionError('queue_full',
         `待发送队列已满（≤${MAX_QUEUED_INPUTS_PER_SESSION} 条），请先取回或清空`,
-        { httpStatus: 409, details: { limit: MAX_QUEUED_INPUTS_PER_SESSION } });
+        { httpStatus: 409, details: { limit: MAX_QUEUED_INPUTS_PER_SESSION }, en: `the pending queue is full (limit of ${MAX_QUEUED_INPUTS_PER_SESSION} items); retrieve or clear it first` });
     }
 
     const ins = await client.query(
