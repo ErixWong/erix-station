@@ -412,7 +412,7 @@ describe('UserLlmPane · 周期额度（#719）', () => {
     const periodSel = wrapper.find('[data-test="budget-period"]').element as HTMLSelectElement;
     expect(periodSel.value).toBe('1mo');
     expect(wrapper.find('[data-test="budget-period"]').findAll('option').map((o) => o.text()))
-      .toEqual(['每月', '每日']);
+      .toEqual(['未设置', '每月', '每日']);
     // 重置时刻：本地时区格式化（不是原始 ISO 串）
     const expectedReset = new Date('2026-11-24T16:00:00Z').toLocaleString();
     expect(wrapper.find('[data-test="budget-reset"]').text()).toBe(expectedReset);
@@ -565,5 +565,42 @@ describe('UserLlmPane · 周期额度（#719）', () => {
     });
     expect(vis.wrapper.find('[data-test="budget-load-error"]').exists()).toBe(false);
     expect(vis.wrapper.find('[data-test="budget-state"]').exists()).toBe(true);
+  });
+
+  // issue #800：修「未设额度却显示每月」的误导默认。
+  it('未设额度（budget_period=null）⇒ 周期下拉选中空串且出现「未设置」选项（不再伪装成每月）', async () => {
+    const { wrapper } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/budget') && !init?.method) {
+        return jsonResponse(200, { quota: { budget_usd: null, budget_period: null, max_budget: null, budget_duration: null, budget_reset_at: null, spend: 1, remaining: null, spend_scope: 'lifetime' } });
+      }
+      return undefined;
+    });
+    const sel = wrapper.find('[data-test="budget-period"]').element as HTMLSelectElement;
+    expect(sel.value).toBe('');
+    const optTexts = wrapper.find('[data-test="budget-period"]').findAll('option').map((o) => o.text());
+    expect(optTexts).toEqual(['未设置', '每月', '每日']);
+  });
+
+  it('设了 1mo 时下拉仍显示「每月」（回显 budget_period=1mo）', async () => {
+    const { wrapper } = await mountQuota(); // QUOTA.budget_period='1mo'
+    const sel = wrapper.find('[data-test="budget-period"]').element as HTMLSelectElement;
+    expect(sel.value).toBe('1mo');
+  });
+
+  it('保存时周期为空 ⇒ body 不带 budget_period（后端缺省按每月兜）；有金额+周期未设置时出现提示行', async () => {
+    const { wrapper, fetchFn } = await mountQuota((url, init) => {
+      if (String(url).includes('/llm/budget') && init?.method === 'PUT') {
+        return jsonResponse(200, { quota: { budget_usd: 3, budget_period: '1mo', max_budget: 3, budget_duration: '1mo', budget_reset_at: '2026-12-01T00:00:00Z', spend: 0, remaining: 3, spend_scope: 'period' } });
+      }
+      return undefined;
+    });
+    await wrapper.find('[data-test="budget-input"]').setValue('3');
+    await wrapper.find('[data-test="budget-period"]').setValue('');   // 选「未设置」
+    expect(wrapper.find('[data-test="budget-period-hint"]').exists()).toBe(true); // 有金额 + 未设置
+    await wrapper.find('[data-test="budget-save"]').trigger('click');
+    await flushPromises();
+    const puts = quotaPuts(fetchFn);
+    expect(puts).toHaveLength(1);
+    expect(JSON.parse(String(puts[0][1]?.body))).toEqual({ budget_usd: 3 }); // 无 budget_period
   });
 });

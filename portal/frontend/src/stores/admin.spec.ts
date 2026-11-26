@@ -403,3 +403,48 @@ describe('verifyTls / rollbackTls（§4.13-4 / §4.13-5）', () => {
     expect(admin.tlsRollbackOk).toBe(false);
   });
 });
+
+describe('loadKeyUsage（GET /api/admin/llm/key-usage，issue #800）', () => {
+  const ROWS = { rows: [
+    { fde_name: 'alice', budget_usd: 5.04, budget_period: '1mo', max_budget: 5.04, budget_duration: '1mo', budget_reset_at: '2026-12-01T00:00:00Z', spend: 1.23, remaining: 3.81, spend_scope: 'period' },
+    { fde_name: 'bob', budget_usd: null, budget_period: null, max_budget: null, budget_duration: null, budget_reset_at: null, spend: 5.09, remaining: null, spend_scope: 'lifetime' },
+  ] };
+
+  it('成功：把 rows 写进 keyUsage、置 loaded、清 loading/err', async () => {
+    const calls = stubFetch(() => jsonResponse(200, ROWS));
+    const admin = useAdminStore();
+
+    const err = await admin.loadKeyUsage();
+
+    expect(err).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ url: '/api/admin/llm/key-usage', method: 'GET' });
+    expect(admin.keyUsage).toHaveLength(2);
+    expect(admin.keyUsage[0]).toMatchObject({ fde_name: 'alice', spend_scope: 'period' });
+    expect(admin.keyUsageLoaded).toBe(true);
+    expect(admin.keyUsageLoading).toBe(false);
+    expect(admin.keyUsageErr).toBeNull();
+  });
+
+  it('成功但 rows 缺位⇒空数组（网关说没人≠出错）', async () => {
+    stubFetch(() => jsonResponse(200, {}));
+    const admin = useAdminStore();
+    const err = await admin.loadKeyUsage();
+    expect(err).toBeNull();
+    expect(admin.keyUsage).toEqual([]);
+    expect(admin.keyUsageLoaded).toBe(true);
+  });
+
+  it('失败（网关不可达 ⇒ 5xx）：写 keyUsageErr（前缀+原文），keyUsageLoaded 保持 false', async () => {
+    stubFetch(() => errorResponse(502, 'llm_gateway_error', '网关不可达'));
+    const admin = useAdminStore();
+
+    const err = await admin.loadKeyUsage();
+
+    expect(err).toBe('错误：网关不可达');
+    expect(admin.keyUsageErr).toBe('错误：网关不可达');
+    expect(admin.keyUsageLoaded).toBe(false);
+    expect(admin.keyUsageLoading).toBe(false);
+    expect(admin.keyUsage).toEqual([]);
+  });
+});

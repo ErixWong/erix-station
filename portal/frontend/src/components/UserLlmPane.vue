@@ -256,6 +256,11 @@ const spendScopeLabel = computed(() => (
     : t('admin.llm.budgetSpendLifetime')
 ));
 
+// issue #800：「有金额 + 周期选未设置」时提醒：后端会按「每月」下发（避免把未设误读成已按月限）。
+const showBudgetDefaultHint = computed(() => (
+  String(budgetInput.value ?? '').trim() !== '' && budgetPeriodInput.value === ''
+));
+
 // 重置时刻按**本地时区**格式化（issue 要求不显示 UTC）。
 const budgetResetLocal = computed(() => {
   const iso = quota.value?.budget_reset_at;
@@ -300,7 +305,7 @@ async function loadQuotaAndUsage() {
     const q = await api<{ quota: Quota }>(`/api/admin/fdes/${fde}/llm/budget`);
     quota.value = q.quota ?? null;
     budgetInput.value = budgetToInput(q.quota?.budget_usd);
-    budgetPeriodInput.value = q.quota?.budget_period ?? '1mo';
+    budgetPeriodInput.value = q.quota?.budget_period ?? '';
   } catch (e) {
     quota.value = null;
     if (!(e instanceof ApiError && e.code === 'not_found')) budgetLoadErr.value = true;
@@ -319,11 +324,14 @@ async function onSaveBudget() {
   savingBudget.value = true;
   budgetMsg.value = '';
   budgetErr.value = '';
+  // 留空 = 不限 ⇒ budget_usd: null（period 一并清空，不发送 period）；金额非空时，周期**只在非空（已选）时才带**
+  // （issue #800：未设额度不再伪装成「每月」；后端缺省仍按 '1mo' 兜，语义不动）。
   const raw = String(budgetInput.value ?? '').trim();
-  // 留空 = 不限 ⇒ budget_usd: null（period 一并清空，不发送 period）；否则金额 + 周期两项都带。
   const body: Record<string, unknown> = raw === ''
     ? { budget_usd: null }
-    : { budget_usd: Number(raw), budget_period: budgetPeriodInput.value };
+    : (budgetPeriodInput.value
+        ? { budget_usd: Number(raw), budget_period: budgetPeriodInput.value }
+        : { budget_usd: Number(raw) });
   try {
     const r = await api<{ quota: Quota }>(`/api/admin/fdes/${fde}/llm/budget`, {
       method: 'PUT',
@@ -331,7 +339,7 @@ async function onSaveBudget() {
     });
     quota.value = r.quota ?? null;
     budgetInput.value = budgetToInput(r.quota?.budget_usd); // 保存成功后回显
-    budgetPeriodInput.value = r.quota?.budget_period ?? '1mo';
+    budgetPeriodInput.value = r.quota?.budget_period ?? '';
     budgetMsg.value = t('admin.llm.budgetSaved');
   } catch (e) {
     budgetErr.value = t('admin.errorPrefix') + (e instanceof Error ? e.message : String(e));
@@ -477,6 +485,7 @@ async function onSaveBudget() {
           data-test="budget-period"
           class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
         >
+          <option value="">{{ t('admin.llm.budgetPeriodUnset') }}</option>
           <option value="1mo">{{ t('admin.llm.budgetPeriodMonthly') }}</option>
           <option value="1d">{{ t('admin.llm.budgetPeriodDaily') }}</option>
         </select>
@@ -488,6 +497,7 @@ async function onSaveBudget() {
           @click="onSaveBudget"
         >{{ t('admin.llm.budgetSave') }}</button>
       </div>
+      <p v-if="showBudgetDefaultHint" data-test="budget-period-hint" class="text-xs text-black/55">{{ t('admin.llm.budgetPeriodDefaultHint') }}</p>
       <p v-if="budgetLoadErr" data-test="budget-load-error" class="syserr" role="alert">{{ t('admin.llm.budgetLoadFailed') }}</p>
       <div v-else data-test="budget-state" class="grid gap-0.5 text-sm">
         <span>{{ spendScopeLabel }}：<b data-test="budget-spend">{{ fmtUsd(quota?.spend) }}</b> USD</span>
