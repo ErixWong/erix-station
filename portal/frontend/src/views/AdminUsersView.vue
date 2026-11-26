@@ -44,6 +44,9 @@ const editForm = reactive({
   // 不是 false。未知 ⇒ 勾选框与保存都禁用并显示「未知」（评审 blocker 3：把缺键折叠成 false
   // 会让管理员看到「已关闭」这个**服务端未曾证实的事实**，并在一次保存里替用户改掉它）。
   file_upload_enabled: null as boolean | null,
+  // #828：默认语言三档。`null` = 跟随浏览器（也是表单默认值），`'zh-CN'` / `'en'` = 显式选定。
+  // 底层直接存真值（而非 `'auto'` 哨兵），提交时 `null` 原样发 `null`。
+  locale: null as string | null,
 });
 const resetPasswordValue = ref('');
 const deleteConfirmation = ref('');
@@ -339,6 +342,8 @@ function openEditModal(user: AdminUser) {
   editForm.file_upload_enabled = typeof user.file_upload_enabled === 'boolean' ? user.file_upload_enabled : null;
   editForm.role = user.role;
   editForm.fde_name = user.fde_name ?? '';
+  // #828：回显——只认 `'zh-CN'` / `'en'` 两个真值，其余（`null` / 缺键 / 脏值）一律归到「跟随浏览器」（`null`）。
+  editForm.locale = user.locale === 'zh-CN' || user.locale === 'en' ? user.locale : null;
   resetPasswordValue.value = '';
   clearSectionFeedback();
 }
@@ -408,6 +413,8 @@ async function saveProfile() {
       email: editForm.email.trim() || null,
       role: editForm.role,
       fde_name: editForm.fde_name.trim() || null,
+      // #828：默认语言（`null` = 跟随浏览器，`JSON.stringify` 会把 `null` 原样带出去）。
+      locale: editForm.locale,
     });
     if (error) setSectionError(user, error, 'profile');
     else {
@@ -786,17 +793,18 @@ onBeforeUnmount(() => {
 
       <table v-else-if="admin.usersLoaded" data-test="user-table" class="w-full table-fixed text-left text-sm">
           <colgroup>
-            <!-- issue #800：新增「周期 / 用量」列（10 列，百分比总和必须 = 100）。
+            <!-- issue #800：新增「周期 / 用量」列；#828 再加「默认语言」列（现 11 列，百分比总和必须 = 100）。
                  用量列给 10%（真机 e2e：8% 时表头「周期 / 用量」被挤到换行，中文还拆断了「用量」）。 -->
             <col class="w-[11%]">
             <col class="w-[10%]">
             <col class="w-[7%]">
+            <col class="w-[4%]">
             <col class="w-[11%]">
             <col class="w-[4%]">
             <col class="w-[8%]">
-            <col class="w-[13%]">
+            <col class="w-[11%]">
             <col class="w-[10%]">
-            <col class="w-[13%]">
+            <col class="w-[11%]">
             <col class="w-[13%]">
           </colgroup>
           <thead class="border-b border-black/10 bg-black/[0.025] text-xs text-black/55">
@@ -804,6 +812,7 @@ onBeforeUnmount(() => {
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colLogin') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colDisplayName') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colRole') }}</th>
+              <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colDefaultLanguage') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colFde') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colMfa') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colStatus') }}</th>
@@ -824,6 +833,10 @@ onBeforeUnmount(() => {
                   <span class="inline-flex rounded-full border border-black/20 px-2 py-0.5 text-xs text-black/70">
                     {{ user.role === 'admin' ? t('admin.fde.roleAdmin') : t('admin.fde.roleFde') }}
                   </span>
+                </td>
+                <!-- #828：默认语言列。`null` / 缺键 / 脏值一律渲染「跟随浏览器」（不退化成空或字符串 "null"）。 -->
+                <td class="truncate px-3 py-2.5" data-test="user-locale-cell">
+                  <span>{{ user.locale === 'zh-CN' ? t('admin.fde.localeZh') : user.locale === 'en' ? t('admin.fde.localeEn') : t('admin.fde.localeFollowBrowser') }}</span>
                 </td>
                 <td class="truncate px-3 py-2.5">
                   <span v-if="user.fde_name" class="max-w-full truncate">{{ user.fde_name }}</span>
@@ -948,7 +961,7 @@ onBeforeUnmount(() => {
                 </td>
               </tr>
               <tr v-if="rowErrors[user.id] || rowMessages[user.id]" class="border-b border-black/10">
-                <td colspan="10" class="px-3 py-1.5 text-xs">
+                <td colspan="11" class="px-3 py-1.5 text-xs">
                   <p v-if="rowErrors[user.id]" class="syserr" role="alert">{{ rowErrors[user.id] }}</p>
                   <p v-else class="text-green-700" role="status">{{ rowMessages[user.id] }}</p>
                 </td>
@@ -1307,6 +1320,21 @@ onBeforeUnmount(() => {
           <label class="flex flex-col gap-1 text-xs text-black/55">
             {{ t('admin.fde.fdeNameLabel') }}
             <input v-model="editForm.fde_name" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1.5 text-sm text-black">
+          </label>
+          <!-- #828：默认语言三档。第一档（跟随浏览器）绑定 `:value="null"`⇒ 当前为 `null` 时 v-model 自动选中它
+               （不是空选项、也不是字符串 "null"）；选中后提交 `locale: null`。后两档提交 'zh-CN' / 'en'。 -->
+          <label class="flex flex-col gap-1 text-xs text-black/55">
+            {{ t('admin.fde.defaultLanguageLabel') }}
+            <select
+              v-model="editForm.locale"
+              data-test="edit-locale"
+              class="rounded-md border border-black/20 bg-white px-2 py-1.5 text-sm text-black"
+            >
+              <option :value="null">{{ t('admin.fde.localeFollowBrowser') }}</option>
+              <option value="zh-CN">{{ t('admin.fde.localeZh') }}</option>
+              <option value="en">{{ t('admin.fde.localeEn') }}</option>
+            </select>
+            <span class="text-xs text-black/45">{{ t('admin.fde.defaultLanguageHint') }}</span>
           </label>
           <p v-if="profileError" class="syserr" role="alert">{{ profileError }}</p>
           <p v-if="profileMessage" class="text-sm text-green-700" role="status">{{ profileMessage }}</p>

@@ -11,7 +11,7 @@ import { seatAwareLanding } from '../lib/workbenchGate';
 // issue #431：「本轮用户结束」的应用级信号（接回工作台认领，详见 lib/userScope.ts）。
 import { notifyUserScopeReset } from '../lib/userScope';
 // #449：非组件上下文取词（与 workbench store 同一口径：i18n.global.t，随 locale 响应式取值）。
-import { i18n } from '../i18n';
+import { i18n, isAppLocale, setLocale } from '../i18n';
 
 export interface AuthUser {
   id: string;
@@ -33,6 +33,12 @@ export interface AuthUser {
    * 服务端同口径（`http.js` 的判据是 `=== true`），后端还会再挡一次 403 `upload_disabled`。
    */
   file_upload_enabled?: boolean;
+  /**
+   * issue #828（portal.md §2.2）：账号上存的界面语言偏好。`'zh-CN'` / `'en'` 或 `null`（没设过）。
+   * `null` 的含义是「跟随浏览器」，**不是** 一个语言值——登录侧据此决定要不要改界面语言（见
+   * `applyAccountLocale`）：非 `null` 且与当前不同才应用，`null` 一字不动既有优先级链。
+   */
+  locale?: string | null;
 }
 
 interface MeResponse {
@@ -187,6 +193,21 @@ export function afterLoginRoute(user: AuthUser | null | undefined): string {
   return seatAwareLanding(user);
 }
 
+/**
+ * issue #828：登录后把账号上存的 `locale` 应用到界面（写 cookie + localStorage + 切 UI，全走 `setLocale`）。
+ *
+ * 只在两个条件同时成立时才切：① 账号确实设过（`locale` 非 `null` 且是受支持的 locale）；
+ * ② 与当前界面语言不同。**比对当前值这一步不能省**：`setLocale` 会写 cookie，若无条件调用，
+ * 「写 cookie → 再拉 /api/me」会来回打转。`null`（没设过）⇒ 什么都不做：行为与今天逐字一致
+ * （cookie → localStorage → 浏览器语言 → zh-CN）。
+ */
+function applyAccountLocale(user: AuthUser | null | undefined): void {
+  const next = user?.locale;
+  if (!isAppLocale(next)) return; // null / 缺键 / 脏值：不碰现有优先级
+  if (next === i18n.global.locale.value) return; // 与当前一致：不重写，防打转
+  setLocale(next);
+}
+
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     user: null as AuthUser | null,
@@ -249,6 +270,8 @@ export const useAuthStore = defineStore('auth', {
         this.user = me.user;
         // §2.6/§2.11a：本端点在受限会话门的放行清单里 ⇒ 它是**刷新后重建改密屏的唯一数据源**。
         this.passwordChangeRequired = me.user?.must_change_password === true;
+        // #828：账号语言偏好（非 null 且与当前不同才应用；null 什么都不做）。
+        applyAccountLocale(me.user);
       } catch (err) {
         if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
           this.user = null; // 未登录：守卫负责跳转
@@ -270,6 +293,7 @@ export const useAuthStore = defineStore('auth', {
       const me = await api<MeResponse>('/api/me');
       this.user = me.user;
       this.passwordChangeRequired = me.user?.must_change_password === true;
+      applyAccountLocale(me.user); // #828：同 ensureMe，取到真实 user 后顺手应用账号语言
       this.ready = true;
       return me.user;
     },
@@ -295,6 +319,7 @@ export const useAuthStore = defineStore('auth', {
           this.resetPendingLogin();
           // #255：cookie 落下的这一刻就知道受限（§2.2），不等「先碰一个 403 再猜」。
           this.passwordChangeRequired = data.password_change_required === true;
+          applyAccountLocale(data.user); // #828：登录成功即应用账号语言（null ⇒ 不动）
         } else if (data.status === 'email_code_required') {
           // #449（§2.2）：邮箱验证码第二步。本响应**不带**受限旗标（还没会话，§2.3a 的成功响应才带）。
           this.pendingToken = data.pending_token ?? null;
@@ -369,6 +394,7 @@ export const useAuthStore = defineStore('auth', {
         this.resetPendingLogin();
         // §2.3：第二步才是本分支真正发会话的地方 ⇒ 受限旗标在这里带出去（口径与 §2.2 一致）。
         this.passwordChangeRequired = body.password_change_required === true;
+        applyAccountLocale(body.user); // #828：TOTP 第二步建会话后应用账号语言
       } catch (err) {
         // #449：pending 过期/已用 ⇒ 第二步不可能再成功，回第一步（文案仍是服务端原文，TOTP 路径一字不改）。
         if (isPendingExpired(err)) this.resetPendingLogin();
@@ -395,6 +421,7 @@ export const useAuthStore = defineStore('auth', {
         this.resetPendingLogin();
         // §2.3a：与 §2.3 同口径——第二步才是真正发会话的地方，受限旗标在这里带出去。
         this.passwordChangeRequired = body.password_change_required === true;
+        applyAccountLocale(body.user); // #828：邮箱码第二步建会话后应用账号语言
       } catch (err) {
         if (isPendingExpired(err)) {
           // pending 没了（过期/已消费）⇒ 第二步不可能再成功：清干净回第一步，并说清为什么。

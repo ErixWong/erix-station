@@ -171,12 +171,13 @@ describe('issue #497：第 8 格的两行结构（列数不变、无硬编码中
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/[^\n]*$/gm, '');
 
-  it('列数与列宽：10 个 col / 10 个 th（issue #800 新增「周期 / 用量」列；周期/用量在下标 7，活动顺延到 8）', () => {
-    expect(adminUsersViewSource.match(/<col /g) ?? [], 'colgroup 列数').toHaveLength(10);
-    expect(adminUsersViewSource.match(/<th scope="col"/g) ?? [], '表头列数').toHaveLength(10);
-    // issue #800：新列插在 colLifecycle(6) 之后、lastActivity 之前 ⇒ 周期/用量=下标 7，活动=下标 8。
-    expect(headerCells[7] ?? '').toContain("t('admin.fde.colPeriodUsage')");
-    expect(headerCells[8] ?? '').toContain("t('admin.fde.lastActivity')");
+  it('列数与列宽：11 个 col / 11 个 th（#800 加周期/用量、#828 加默认语言；默认语言在下标 3，周期/用量顺延到 8、活动到 9）', () => {
+    expect(adminUsersViewSource.match(/<col /g) ?? [], 'colgroup 列数').toHaveLength(11);
+    expect(adminUsersViewSource.match(/<th scope="col"/g) ?? [], '表头列数').toHaveLength(11);
+    // #828：默认语言插在 colRole(2) 之后 ⇒ 下标 3；#800 的周期/用量因此从 7 顺延到 8，活动到 9。
+    expect(headerCells[3] ?? '').toContain("t('admin.fde.colDefaultLanguage')");
+    expect(headerCells[8] ?? '').toContain("t('admin.fde.colPeriodUsage')");
+    expect(headerCells[9] ?? '').toContain("t('admin.fde.lastActivity')");
     expect(adminUsersViewSource, '旧表头键必须退场（没换语义 = 这格还在说登录）')
       .not.toMatch(/<th[^>]*>\{\{ t\('admin\.fde\.lastLogin'\) \}\}<\/th>/);
   });
@@ -362,15 +363,15 @@ describe('AdminUsersView「周期 / 用量」列（mount + fetch 桩，issue #80
     expect(cell.text()).toBe('—');
   });
 
-  it('⑤ 表头 th 数与每行 td 数都是 10', async () => {
+  it('⑤ 表头 th 数与每行 td 数都是 11', async () => {
     const w = await mountView(
       [mkUser('alice', 'alpha')],
       { rows: [mkRow('alpha', { budget_period: '1mo', spend: 1, spend_scope: 'period' })] },
     );
-    expect(w.findAll('thead th').length).toBe(10);
+    expect(w.findAll('thead th').length).toBe(11);
     const row = w.find('[data-test="user-row"]');
     expect(row.exists()).toBe(true);
-    expect(row.findAll('td').length).toBe(10);
+    expect(row.findAll('td').length).toBe(11);
   });
 
   // 周期短标签的**来源**判据：`spend` 按网关的 `budget_duration` 归零，所以标签也得跟它——
@@ -391,5 +392,97 @@ describe('AdminUsersView「周期 / 用量」列（mount + fetch 桩，issue #80
     // 周期认不出来那一格：hover 得说「周期未知」，不能拿「本月」糊弄。
     const unknownCell = w.findAll('[data-test="user-usage-period"]').find((c) => c.text().startsWith('?'));
     expect(unknownCell?.attributes('title') ?? '').toContain('周期未知');
+  });
+});
+
+// ── issue #828 P2：管理台「默认语言」三档（表单回显与保存 + 列表列）───────────────
+describe('AdminUsersView「默认语言」三档（mount + fetch 桩，#828）', () => {
+  beforeEach(() => { setActivePinia(createPinia()); });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  const json = (status: number, body: unknown): Response =>
+    new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+
+  const mk = (login: string, locale: string | null | undefined): AdminUser =>
+    ({
+      id: `u-${login}`, login, display_name: login, email: null, mail_otp_enabled: false,
+      totp_login_enabled: true, file_upload_enabled: false, locale,
+      role: 'fde', fde_name: login, status: 'active', totp_enabled: false,
+      last_login_at: null, last_activity_at: null, onboarding: null, offboarding: null,
+    } as unknown as AdminUser);
+
+  let patchBodies: string[];
+  async function mountWith(users: AdminUser[]) {
+    patchBodies = [];
+    setLocale('zh-CN');
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    void useAdminStore();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (init?.method === 'PATCH') { patchBodies.push(String(init.body)); return json(200, { user: {} }); }
+      if (url === '/api/admin/users') return json(200, { items: users });
+      if (url === '/api/admin/llm/key-usage') return json(200, { rows: [] });
+      return json(200, { items: [] });
+    }));
+    const w = mount(AdminUsersView, {
+      global: {
+        plugins: [pinia, i18n],
+        stubs: { RouterLink: { template: '<a><slot /></a>' }, 'router-link': { template: '<a><slot /></a>' } },
+      },
+    });
+    await flushPromises();
+    return w;
+  }
+
+  it('列表列：null 渲染「跟随浏览器」、zh-CN→简体中文、en→English', async () => {
+    const w = await mountWith([mk('a', null), mk('b', 'zh-CN'), mk('c', 'en'), mk('d', undefined)]);
+    const texts = w.findAll('[data-test="user-locale-cell"]').map((c) => c.text());
+    expect(texts).toEqual(['跟随浏览器', '简体中文', 'English', '跟随浏览器']); // 缺键也归「跟随浏览器」
+    expect(w.text()).not.toContain('admin.fde.locale'); // 不出现裸 i18n key
+  });
+
+  it('表单三档齐备，当前 null 回显「跟随浏览器」（非空选项、非字符串 "null"）', async () => {
+    const w = await mountWith([mk('a', null)]);
+    await w.find('[data-test="edit-user"]').trigger('click');
+    const sel = w.find('[data-test="edit-locale"]');
+    expect(sel.findAll('option').map((o) => o.text())).toEqual(['跟随浏览器', '简体中文', 'English']);
+    const el = sel.element as unknown as HTMLSelectElement;
+    expect(el.options[el.selectedIndex]?.text).toBe('跟随浏览器');
+    expect(el.value).not.toBe('null'); // 不得退化成字符串 "null"
+  });
+
+  it('选「简体中文」保存 ⇒ PATCH body 里 locale:"zh-CN"', async () => {
+    const w = await mountWith([mk('a', null)]);
+    await w.find('[data-test="edit-user"]').trigger('click');
+    await w.find('[data-test="edit-locale"]').setValue('zh-CN');
+    await w.find('[data-test="user-profile-form"]').trigger('submit');
+    await flushPromises();
+    expect(patchBodies.some((b) => JSON.parse(b).locale === 'zh-CN')).toBe(true);
+  });
+
+  it('当前 en 回显 English，改选「跟随浏览器」保存 ⇒ PATCH body 里 locale:null', async () => {
+    const w = await mountWith([mk('a', 'en')]);
+    await w.find('[data-test="edit-user"]').trigger('click');
+    const sel = w.find('[data-test="edit-locale"]');
+    const el = sel.element as unknown as HTMLSelectElement;
+    expect(el.options[el.selectedIndex]?.text).toBe('English'); // 回显正确
+    sel.findAll('option')[0].element.selected = true; // 选中第一档「跟随浏览器」
+    await sel.trigger('change');
+    await w.find('[data-test="user-profile-form"]').trigger('submit');
+    await flushPromises();
+    expect(patchBodies.some((b) => JSON.parse(b).locale === null)).toBe(true);
+  });
+
+  it('英文态下字段名是 Default language（DOM 文本，非裸 key）', async () => {
+    const w = await mountWith([mk('a', null)]);
+    await w.find('[data-test="edit-user"]').trigger('click');
+    setLocale('en');
+    await flushPromises();
+    const panel = w.find('[data-test="edit-panel-profile"]');
+    expect(panel.text()).toContain('Default language');
+    expect(panel.text()).toContain('Follow browser'); // 选项与提示都是英文
+    expect(panel.text()).not.toContain('admin.fde.defaultLanguage');
+    setLocale('zh-CN');
   });
 });
