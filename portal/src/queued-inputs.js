@@ -332,7 +332,9 @@ export async function drainQueuedInputs(pool, {
   // 前端平时只能从 POST 响应或会话详情知道活跃 run；队列投递两个都不是 ⇒ 不带上，界面就会
   // 在「旧 run 已终态、新 run 已在跑」的状态条上显示空闲，且新 run 那条 run_end 因 `isCurrent`
   // 判假被整条丢掉（终稿不刷新）。
-  await safeNotify(() => deps.notifyQueueUpdate?.(sessionId, null, posted?.run?.id ?? null));
+  // #799：投递成功这一帧额外带 `delivered`=`postMessage` 的 user 消息回显体（`posted?.message`）——
+  // 前端据此当场把那句话画成 user 气泡。其余 notifyQueueUpdate 调用点（入队/取回/失败）一律不带。
+  await safeNotify(() => deps.notifyQueueUpdate?.(sessionId, null, posted?.run?.id ?? null, posted?.message ?? null));
   return { delivered: row.id, kind: row.kind, runId: posted?.run?.id ?? null };
 }
 
