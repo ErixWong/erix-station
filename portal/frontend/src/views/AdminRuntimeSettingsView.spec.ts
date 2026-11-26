@@ -17,6 +17,8 @@
 //   R8 保存成功那一行显示「已保存」并回填服务端回读的生效值（不是用户敲的那一串）
 //   R10 `hint`（#706）：服务端只在登记了的那一格带 `hint` 键 ⇒ 那一行下方出小字；
 //       没登记的那一行**不存在** `runtime-hint-*` 元素（断言查询为空，不是断言文案为空）
+//   R11 页尾通用尾注（P3 评审返修）：不许替各行代宣「重启 station-portal」——要重启什么以那一行
+//       下方的小字为准，且必须点名「重建 FDE 容器」（zh/en 两份 locale 都断）
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
@@ -532,5 +534,41 @@ describe('R10 hint：有就在那一行下方渲染，没有就不存在那个�
     expect(text(w, `runtime-value-${RETENTION_KEY}`)).toBe('30');
     expect(text(w, `runtime-hint-${RETENTION_KEY}`)).toBe(HINT);
     expect(w.findAll('[data-test^="runtime-hint-"]')).toHaveLength(1);
+  });
+});
+
+// ── R11（#677 P3 评审返修）：页尾那条通用尾注不许「代各行宣布」生效方式 ────────────
+// delegate 那三格（`applyMode: 'restart'`）的生效路径是**重建 FDE 容器**，不是重启 station-portal：
+// portal 只在建容器那一刻把生效值写进容器 env，重启 portal 不会改动任何已存在容器的 env，
+// 而新建容器本来也不需要重启 portal。旧尾注那句「改完要重启 station-portal 才生效」对这三格是
+// 假话，且和每行下方的 hint 小字在同一屏自相矛盾 ⇒ 尾注只许把「要重启什么」指回那一行的小字，
+// 并点名「重建 FDE 容器会打断该工位正在跑的 run」；旧那句覆盖式断言不许复活。
+// locale 两份都要红得下来：旧文案只改中文的话，英文那半句同样在说谎。
+describe('R11 尾注：生效方式以每行小字为准，不写「一律重启 station-portal」', () => {
+  it.each([
+    {
+      locale: 'zh-CN' as const,
+      must: ['以这一行下方的说明为准', '重建 FDE 容器'],
+      mustNot: ['改完要重启 station-portal 才生效'],
+    },
+    {
+      locale: 'en' as const,
+      must: ['small print under that row', 'FDE container recreated'],
+      mustNot: ['needs a restart only applies after station-portal restarts'],
+    },
+  ])('$locale ⇒ 尾注指向行内小字并点名 FDE 容器重建，旧句式不在 DOM 里', async ({
+    locale, must, mustNot,
+  }) => {
+    setLocale(locale);
+    stubDefault();
+    const w = await mountView();
+
+    // 可断言性本身：这一页其它可断言元素都有 data-test，尾注曾经只有样式没有锚点，
+    // 断言只能退化成「全文本搜索」⇒ 整页任何一处出现同样的字都算绿（假绿）。
+    expect(exists(w, 'runtime-footnote'), '尾注必须有 data-test="runtime-footnote"').toBe(true);
+
+    const note = text(w, 'runtime-footnote');
+    for (const s of must) expect(note, `${locale} 尾注少了「${s}」`).toContain(s);
+    for (const s of mustNot) expect(note, `${locale} 尾注复活了旧句式「${s}」`).not.toContain(s);
   });
 });

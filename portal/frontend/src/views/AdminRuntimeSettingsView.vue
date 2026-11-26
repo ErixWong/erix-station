@@ -305,6 +305,6 @@ onMounted(async () => {
       {{ pageFieldError }}
     </p>
 
-    <p class="max-w-prose text-xs text-black/45">{{ t('admin.runtime.footnote') }}</p>
+    <p data-test="runtime-footnote" class="max-w-prose text-xs text-black/45">{{ t('admin.runtime.footnote') }}</p>
   </section>
 </template>
