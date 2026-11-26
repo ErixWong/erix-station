@@ -1368,6 +1368,33 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 `本会话压缩：TTL 折叠 75 次（省 314.5k token）· …`——**不新造面板**、不进 `.syserr`（压缩是正常工作，
 不是故障）、token 走既有 `formatTokenCount`（`lib/compactionSummary.ts` 收窄 DTO，模板不碰脏值）。
 
+**`session.folds[]`（#816 第②步：会话级折叠索引，**恒在（无折叠为 `[]`）**）**
+
+折叠事实此前**只从 `messages[].folded.facts` 出去**，而 `messages` 是 `ORDER BY seq DESC LIMIT n` 的**窗口**
+（前端 `MESSAGES_PAGE_LIMIT = 100`，靠 `next_cursor` 向上懒加载）⇒ 折叠发生在窗口之外时，前端一个字节都收不到。
+而 `transcript_rounds` 是**整会话扫**的（`getSession` 的 `SELECT … ORDER BY round ASC, append_seq ASC`，不带窗口），
+`session.compaction`（#451）本来就是会话级——所以折叠索引可以**从同一趟扫描派生，零新增 SQL**（`collectTranscriptFacts`
+的第四个产物，与折叠事实/压缩聚合同一次 `recordForProjection`）。
+
+```json
+"folds": [
+  { "round": 12, "from": 1, "to": 5, "rounds": 4, "title": "调研 store 层", "origin": "semantic", "truncated": true },
+  { "round": 30, "from": 6, "to": 9, "rounds": 3, "title": "接入鉴权", "origin": "semantic" }
+]
+```
+
+| 键 | 口径 |
+|---|---|
+| `folds`（整个键） | **恒在**：无折叠为 `[]`。⚠ 与 `session.compaction` 的「键缺席而非零」**不同**——`folds` 是**列表**，空列表本身就是完整答案；`compaction` 是**聚合对象**，缺席才表示「一条统计都没有」。**别把两者「统一」成同一种缺席语义** |
+| 每项字段口径 | **复用 `messages[].folded.facts` 那把尺**（`foldedFactsFields`，不另写第二份）：`title`（trim）/ `summary` / `origin`（白名单）/ `toolCalls`（逐项清洗）/ `summaryDropped` / `titleFallback` / `truncated`（= `foldedFacts.truncated === true`），**逐子键取不到即不写**（不写 `null`/`false`/`0`/空串） |
+| `round` | 该折叠的**落账轮号**（`transcript_rounds.round`），区别于下面 `from`/`to`（被折走的区间） |
+| `from` / `to` / `rounds` | 折叠覆盖的**轮区间**（取自 `foldedFacts`，经安全整数口径） |
+| 排序 | **`from` 升序**（最旧在前），同 `from` 按 `round` 升序（`from` 取不到的排最后，实际已被下面的剔除规则排掉） |
+| 去重 | 同一 `(from, to)` 多条（引擎可能重复落账）⇒ **只留 `round` 最大的那条**（最新落账 = 累计后的真值） |
+| 剔除 | `from` / `to` 任一头取不到（非安全整数）⇒ **该项不进数组**（没有边界画不出来，不给半截） |
+
+数据源与呈现：它是会话头部**常驻折叠条**的数据源（不受消息窗口限制），与就地展开的 `messages[].folded.facts` 各管各的（本单**不动** `folded.facts`）。
+
 **对话流 DTO 的 `messages[]` 展示字段（`GET /api/sessions/:id`）**
 
 助手锚点上除宿主元数据（`id`/`run_id`/`seq`/`role`/`content`/`synthetic`/`attachments`/`created_at`）外，

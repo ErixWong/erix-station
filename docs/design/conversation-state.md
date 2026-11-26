@@ -132,7 +132,7 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
   `RoundRecord` 内部字段不是 → 本模块不再读 `messages`/`response`/`foldedPayload` 的结构；未知 `meta` 键忽略。
   展示口径的两点细化：`reasoning` 与正文分离（不进 DTO `content`）；折叠轮按官方规则展示
   「摘要 + 范围 + 导航指针」，`foldedPayload` 原文不进对话流（DTO 是锚点驱动的、没有可承载官方 system 折叠行的锚点，
-  故折叠摘要只在该 run 无自身助手正文时顶上——与契约 ③「显示的是历史消息」一致）。折叠呈现的**结构化数据来源是 `folded.facts`（#816）**（title / 区间 / origin / 工具足迹等，逐子键缺席即不知道），但 `foldedPayload` 原文仍不进对话流。
+  故折叠摘要只在该 run 无自身助手正文时顶上——与契约 ③「显示的是历史消息」一致）。折叠呈现的**结构化数据来源是 `folded.facts`（#816）**（title / 区间 / origin / 工具足迹等，逐子键缺席即不知道），但 `foldedPayload` 原文仍不进对话流。会话级折叠索引 `session.folds[]`（#816 第②步）是常驻条的数据源；它不受消息窗口限制。
 - **对话流 DTO 透传投影展示字段（issue #188）**：`GET /api/sessions/:id` 的助手锚点 DTO 增带本仓投影的
   `toolCalls`/`reasoning`/`blocks`（**逐字、原名透传**，无则不写该键——不塞 `undefined`/`null` 占位）；
   宿主独有的 UI 元数据（`id`/`run_id`/`seq`/`attachments`/`synthetic`/`created_at`）语义与命名不变。
