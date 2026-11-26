@@ -11,7 +11,8 @@ import { seatAwareLanding } from '../lib/workbenchGate';
 // issue #431：「本轮用户结束」的应用级信号（接回工作台认领，详见 lib/userScope.ts）。
 import { notifyUserScopeReset } from '../lib/userScope';
 // #449：非组件上下文取词（与 workbench store 同一口径：i18n.global.t，随 locale 响应式取值）。
-import { i18n, isAppLocale, setLocale } from '../i18n';
+// #828：`hasLocalLocalePreference` 是「本地有没有表过态」的唯一判据（见下方 `applyAccountLocale`）。
+import { i18n, isAppLocale, setLocale, hasLocalLocalePreference } from '../i18n';
 
 export interface AuthUser {
   id: string;
@@ -196,14 +197,20 @@ export function afterLoginRoute(user: AuthUser | null | undefined): string {
 /**
  * issue #828：登录后把账号上存的 `locale` 应用到界面（写 cookie + localStorage + 切 UI，全走 `setLocale`）。
  *
- * 只在两个条件同时成立时才切：① 账号确实设过（`locale` 非 `null` 且是受支持的 locale）；
- * ② 与当前界面语言不同。**比对当前值这一步不能省**：`setLocale` 会写 cookie，若无条件调用，
- * 「写 cookie → 再拉 /api/me」会来回打转。`null`（没设过）⇒ 什么都不做：行为与今天逐字一致
- * （cookie → localStorage → 浏览器语言 → zh-CN）。
+ * **优先级（新语义）**：本地已表过态就不抢。只有当**同站 cookie 与 localStorage 都没有受支持的
+ * 合法值**时才应用账号值。语义：账号值是「这台浏览器/设备第一次见面时的种子」，不是「压过本地
+ * 选择的主人」——**换设备 / 清站点数据时账号值生效；同一浏览器里用户点过语言开关之后，本地值说话**。
+ * 否则就会出现「用户刚在用户面选了中文，一刷新又被过期账号值顶成英文」（#828 真机腿抓出的优先级错）。
+ *
+ * 应用仍需两个条件同时成立：① 账号确实设过（`locale` 非 `null` 且是受支持的 locale）；
+ * ② 本地没表过态（`hasLocalLocalePreference()` 为 false）。再叠一层「与当前界面语言不同才切」：
+ * `setLocale` 会写 cookie，若无条件调用，「写 cookie → 再拉 /api/me」会来回打转。
+ * `null`（没设过）⇒ 什么都不做：行为与今天逐字一致（cookie → localStorage → 浏览器语言 → zh-CN）。
  */
 function applyAccountLocale(user: AuthUser | null | undefined): void {
   const next = user?.locale;
   if (!isAppLocale(next)) return; // null / 缺键 / 脏值：不碰现有优先级
+  if (hasLocalLocalePreference()) return; // 本地已表过态：账号值是初次见面的种子，不压本地选择
   if (next === i18n.global.locale.value) return; // 与当前一致：不重写，防打转
   setLocale(next);
 }
