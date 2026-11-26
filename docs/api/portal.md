@@ -34,6 +34,7 @@
 | 认证 | `POST /api/auth/logout` | 登出 |
 | 认证 | `GET /api/me` | 当前用户信息（含 `must_change_password` 与 `file_upload_enabled`，§2.6）|
 | 认证 | `POST /api/me/password` | **本人自助改密**（#255 首登强制改密的唯一出口，§2.6a）|
+| 认证 | `PATCH /api/me/locale` | **本人改账号级语言偏好**（#828 P1，写 `users.locale`，§2.6b）|
 | 边缘授权 | `GET /api/forward-auth` | Traefik forwardAuth 回调（非浏览器 API） |
 | 项目 | `GET /api/projects` | 项目列表（**留档只读**，P5 后表内无新行 ⇒ 正常返回空 `items`，§3.2/§3.3） |
 | 项目 | `POST /api/projects` | **已退役 `410 project_api_retired`**（目录即项目，§3.3） |
@@ -620,7 +621,8 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
     "fde_name": "alice",
     "auth_source": "local",
     "must_change_password": true,
-    "file_upload_enabled": false
+    "file_upload_enabled": false,
+    "locale": "zh-CN"
   }
 }
 ```
@@ -632,8 +634,31 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
 | `auth_source` | `local` \| `oidc`（P1 恒为 `local`） |
 | `must_change_password`（#255，纯 additive）| 当前会话是否**受限**（与 §2.2 登录响应的 `password_change_required` 同源同值，只是载体不同）。本端点在 §2.11a 的放行清单里，因此它是 **SPA 刷新后重建改密屏的唯一数据源**——挡住它，前端就只能看到一片 403 而不知道该把用户送去哪儿 |
 | `file_upload_enabled`（#472 片 A，纯 additive）| 该用户能不能用上传端点（`users.file_upload_enabled`，迁移 `0029`，`NOT NULL DEFAULT false`；**上传端点本体是片 B**，届时落在 §4.14）。服务端恒给**布尔**（库里给 `'f'` / `NULL` 等形状也收成 `false`），前端判据一律 `=== true`。**它只在这个 user DTO 里**，不在登录响应顶层（顶层那个位置是 `mail_otp_enabled`，属宿主判定输入）|
+| `locale`（#828 P1，纯 additive）| 该用户的**账号级语言偏好**（`users.locale`，迁移 `0048`，`VARCHAR(8)`，**可空**）。`null` = 未设过 = **跟随浏览器**（不是第三个哨兵值）；非空只收 `zh-CN` / `en`。**登录响应与 `GET /api/me` 都带这一位**（四条 user DTO 路径共用 `toSessionUser`，见下段）；前端登录后拿到非 `null` 就写 cookie + `localStorage`（下次登录不用重选）。**服务端不拿它定语言**（仍按 cookie → `Accept-Language` → `zh-CN`）|
 
 **四条 user DTO 路径键集一致（#472 片 A，不是巧合而是约定）**：`POST /api/auth/login`（口令直通）、`POST /api/auth/login/totp`、邮箱码第二步、以及本端点，四处下发的 `user` 对象由**同一个构造函数**产出（`portal/src/auth.js` 的 `toSessionUser`）。原因：SPA 的 `login()` / `submitEmailCode()` 把**登录响应里的 `user`** 直接存进 store，且**不重拉 `/api/me`** ⇒ 只给本端点补字段会让新键在「刚登录的那整个会话」里不存在（按钮不出现，直到整页刷新）。唯一允许的额外键是本端点的 `must_change_password`（**会话态**，不属用户态），由 §2.11a 的受限会话门消费。
+
+### 2.6b `PATCH /api/me/locale`（#828 P1：本人改账号级语言偏好）
+
+会话认证。写 `users.locale`（迁移 `0048`，`VARCHAR(8)`，可空）；**服务端不查库定语言**，这里只是把跨设备真相落库，前端拿到响应后**同时**写 cookie + `localStorage`（调用失败**不打断**界面切换）。
+
+请求：
+
+```json
+{ "locale": "zh-CN" }
+```
+
+| 请求字段 | 必填 | 说明 |
+|---|---|---|
+| `locale` | 是（值可为 `null`）| `'zh-CN'` \| `'en'` \| `null`（`null` = 清掉账号级记忆 = 跟随浏览器）。**写侧白名单归一**（`db.js#normalizeUserLocale`）：`en-US`/`en-GB`→`en`、`zh`/`zh-Hans`/`zh_CN`→`zh-CN`、空串→`null`；其余（`fr`、数字、对象）⇒ `400 validation_failed` + `details.field='locale'`。**不引入第三个「自动」哨兵**：跟随浏览器就是 `null`。缺 `locale` 键 ⇒ 同样 `400`（`details.field='locale'`）。错误文案走 #803 双语（cookie / `Accept-Language` 判为 `en` 时出英文）|
+
+响应 `200`（回**归一化后**的落库值；写 `null` 时回 `{"locale": null}`）：
+
+```json
+{ "locale": "zh-CN" }
+```
+
+> **为什么不查库定语言**：库是「跨设备的真相」、cookie 是「每次请求的载体」。登录后由前端把库里那个值灌进 cookie，此后每个请求服务端仍按 cookie → `Accept-Language` → `zh-CN` 谈判（§0.1 读侧不变），不必每请求查 `users`。本端点**不在** §2.11a 受限会话放行清单内（欠改密的会话先不改语言）。
 
 ### 2.6a `POST /api/me/password`（#255：本人自助改密，受限会话的出口）
 
@@ -5432,7 +5457,7 @@ All user-management routes require `requireAdmin`: no session returns `401 unaut
 
 ### `GET /api/admin/users`
 
-Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, `role`, `fde_name`, `git_host_id`, `auth_source`, `status`, `created_at`, `totp_enabled` (boolean), `last_login_at` (the newest `login_sessions.created_at`, or `null`), `last_activity_at` (the newest real user input, or `null`; see the note below), and `offboarding` (`null` or `{ "state", "step", "error", "workspace_purge_after" }`). Offboarding `state` is `pending`, `running`, `done`, or `failed`; `step` identifies the current/failed workflow step and is `null` when complete. Revoked sessions remain part of login history.
+Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, `role`, `fde_name`, `git_host_id`, `auth_source`, `status`, `created_at`, `totp_enabled` (boolean), `last_login_at` (the newest `login_sessions.created_at`, or `null`), `last_activity_at` (the newest real user input, or `null`; see the note below), `locale`（#828 P1：账号级语言偏好，`null` = 跟随浏览器）, and `offboarding` (`null` or `{ "state", "step", "error", "workspace_purge_after" }`). Offboarding `state` is `pending`, `running`, `done`, or `failed`; `step` identifies the current/failed workflow step and is `null` when complete. Revoked sessions remain part of login history.
 
 **`last_activity_at`（issue #497，工单 `feat-261112-01`，迁移 `0031`）**：该用户**最近一次亲口说话**的时刻 = **按下发送那一刻**（`timestamptz`，DTO 里是 ISO 串）。它补的是一个**此前缺失**的维度：`last_login_at` 只回答「最近一次把门推开」，页面刷新、自动续期、以及一句话没说的天天登录都会写它，所以它答不出管理员真正想问的「**这个人还在用吗**」。
 
@@ -5470,7 +5495,7 @@ Creates a local FDE user. Request fields: `login`, `password`, `email`, `fde_nam
 
 The selected model configuration is persisted with the onboarding workflow. After provisioning and user-space materialization, Station creates a per-FDE virtual key restricted to those models. This LLM binding step is independent: key creation failures are recorded in `onboarding.llm_binding` and do not fail the user account or change its `done` / `awaiting_credential` onboarding state. An administrator can retry it with `POST /api/admin/users/:id/onboard/retry`; an existing binding is left untouched. The LLM tab can later change the model allowlist through its normal save path without rotating the key.
 
-`totp_enabled` is an optional boolean defaulting to `false`. Only the boolean value `true` enables TOTP; other values are treated as `false`.
+`totp_enabled` is an optional boolean defaulting to `false`. Only the boolean value `true` enables TOTP; other values are treated as `false`. ⚠ **`locale` 不在创建面**（与 `file_upload_enabled` 同口径，#828 P1）：开户入参**不接受** `locale`，传了也被忽略 ⇒ 新用户的 `users.locale` 一律 `NULL`（跟随浏览器）；要预设语言走创建后的 `PATCH /api/admin/users/:id`。
 
 With the default `false`, `totp_secret` is stored as `NULL`, the response contains `{ "user": <safe user>, "onboarding": ... }`, and the user signs in with password only (the existing behavior for accounts without TOTP enrollment). This is the intentional deviation from the force-TOTP design target recorded in issue #139. With `totp_enabled: true`, the response also includes `totp_secret` and `totp_uri`; the seed is shown only in this creation response and must be saved and bound with an authenticator app.
 
@@ -5480,7 +5505,7 @@ Reactivation starts a new provisioning pass for the retained identity, including
 
 ### `PATCH /api/admin/users/:id`
 
-Accepts one or more of `display_name` (trimmed; blank falls back to `login`), `email`（可改可清，`null`/空串 = 清空）, `mail_otp_enabled`（布尔，打开前需已有邮箱且邮件通道可用）, `file_upload_enabled`（布尔，#472 片 A）, `role` (`fde` or `admin`), `fde_name` (valid FDE DNS label or `null`), and `status` (`active` or `disabled`). `login` is immutable. Empty updates, unknown fields, invalid values, or an invalid UUID return `400 validation_failed`; duplicate `fde_name` returns `409 fde_name_conflict`; a missing user returns `404 not_found`. Disabling sets `disabled_at` and atomically revokes every unrevoked login session; re-enabling clears `disabled_at`.
+Accepts one or more of `display_name` (trimmed; blank falls back to `login`), `email`（可改可清，`null`/空串 = 清空）, `mail_otp_enabled`（布尔，打开前需已有邮箱且邮件通道可用）, `file_upload_enabled`（布尔，#472 片 A）, `locale`（#828 P1：`'zh-CN'` / `'en'` / `null`，`null` = 清除 = 跟随浏览器；同一套写侧白名单归一（`db.js#normalizeUserLocale`），非法值⇒ `400 validation_failed` + `details.field='locale'`。改动了 `locale` 时审计另留一条 `admin.user_locale_updated`，值写人读名称（`null` 记「跟随浏览器」而非字符串 `"null"`））, `role` (`fde` or `admin`), `fde_name` (valid FDE DNS label or `null`), and `status` (`active` or `disabled`). `login` is immutable. Empty updates, unknown fields, invalid values, or an invalid UUID return `400 validation_failed`; duplicate `fde_name` returns `409 fde_name_conflict`; a missing user returns `404 not_found`. Disabling sets `disabled_at` and atomically revokes every unrevoked login session; re-enabling clears `disabled_at`.
 
 **`file_upload_enabled`（#472 片 A，issue #472）**：非布尔（`'true'` / `1` / `null`）⇒ `400 validation_failed` + `details.field: "file_upload_enabled"`。它**只能在这里打开**：`POST /api/admin/users`（开户）**不接受**该入参，开户一律 `false`（开户是批量/脚本路径，多一个可选参数就多一条「脚本写错把上传开给所有人」的路）。⚠ **重新开户 = 重新授权**：同名 disabled 行被重新开户时（§12 `POST /api/admin/users` 的 UPDATE 分支）本列被**显式清零**，不继承上一个任期的权限（否则「曾开过上传 → 停用 → 再开户」会静默保留写盘能力）。服务端下发的 user DTO 里该键恒为布尔；管理台对**缺键**（旧后端 / 读不到）显示「未知」并禁用保存，不折叠成「已关闭」。
 

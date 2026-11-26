@@ -57,6 +57,7 @@ import { MacroError } from './macros.js'; // #526：宏域错误载体（httpSta
 import * as market from './market.js'; // #595：能力市场（校验/安装面），本文件只做「匹配+鉴权+转发+审计」
 import { metricsApiPayload } from './system-metrics.js'; // #650：管理台系统监控（响应本体在那个模块，本文件只做匹配+递旋钮）
 import { resolveRequestLocale } from './locale.js'; // #803 S1：请求语言谈判（错误文案 + 运行时设置 label/hint 共用，纯函数零依赖）
+import { normalizeUserLocale, setUserLocale } from './db.js'; // #828 P1：账号级语言偏好的写侧归一化 + 写库
 
 /**
  * **全站 JSON 请求体默认上限（内存护栏 + scrypt 保护）。**
@@ -1378,6 +1379,25 @@ async function routeApi(req, res, ctx, url) {
   if (pathname === '/api/me/password') {
     if (req.method === 'POST') return handleChangeMyPassword(req, res, ctx);
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  // ---- #828 P1：本人改账号级语言偏好（会话认证，portal.md §2.6a）----
+  // body `{ locale: 'zh-CN'|'en'|null }`；非法 ⇒ 400 `validation_failed` + `details.field='locale'`
+  // （文案走 #803 双语机制：`HttpError` 带 `en`，`locale=en` 时出英文）；成功回 `{ locale: <归一化值> }`。
+  // 服务端**不查库定语言**：这里只是写库，前端拿到响应后同时写 cookie + localStorage。
+  if (pathname === '/api/me/locale') {
+    if (req.method !== 'PATCH') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    const session = await requireSession(req, ctx);
+    requireJson(req);
+    const body = await readJsonBody(req);
+    if (!body || typeof body !== 'object' || !Object.hasOwn(body, 'locale')) {
+      throw new HttpError(400, 'validation_failed', 'locale 是必填（可为 null 以清除）', { en: 'locale is required (use null to clear)', details: { field: 'locale' } });
+    }
+    const norm = normalizeUserLocale(body.locale);
+    if (!norm.ok) {
+      throw new HttpError(400, 'validation_failed', "locale 只允许 'zh-CN'、'en' 或 null", { en: "locale must be 'zh-CN', 'en', or null", details: { field: 'locale' } });
+    }
+    const stored = await setUserLocale(ctx.pool, session.user.id, norm.value);
+    return sendJson(res, 200, { locale: stored });
   }
   if (pathname === '/api/me/git-credential') {
     const session = await requireSession(req, ctx);

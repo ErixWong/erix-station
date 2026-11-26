@@ -135,6 +135,10 @@ function toSessionUser(row) {
     // `'f'` 等形状，而消费方（片 B 的 403 闸、前端按钮显隐）的判据是 `=== true` ⇒ 不能靠真值性。
     // 它在 **user DTO 里**，不在登录响应顶层（顶层那个位置是 `mailOtpEnabled`，属宿主判定输入）。
     file_upload_enabled: row.file_upload_enabled === true,
+    // #828 P1：账号级语言偏好（迁移 0048，可空）。`null` = 未设过 = 跟随浏览器。**登录响应与
+    // `GET /api/me` 都靠这一位带出**（四条登录路径与 findSessionUser 均共用本构造点）；P2 前端拿到
+    // 非 `null` 就写 cookie + localStorage。`row.locale` 缺（旧驱动/漏选列）也给 `null`。
+    locale: row.locale ?? null,
   };
 }
 
@@ -147,7 +151,7 @@ export async function authenticate(pool, login, password, { log } = {}) {
   // 登录响应用的是顶层的 `password_change_required`（见 http.js），两条各自自己的口径。
   // #449：同理多读 `email`（只用于第二因素选择与发信，**不进 user DTO**）。
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled
+    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, locale
        FROM users WHERE login = $1 AND status = 'active'`,
     [login],
   );
@@ -252,7 +256,7 @@ export async function verifyTotpForUser(
   } = {},
 ) {
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, totp_secret, last_totp_step, must_change_password, file_upload_enabled
+    `SELECT id, login, display_name, role, fde_name, auth_source, totp_secret, last_totp_step, must_change_password, file_upload_enabled, locale
        FROM users WHERE id = $1 AND status = 'active'`,
     [userId],
   );
@@ -310,7 +314,7 @@ export async function hasTotpEnrollment(pool, userId) {
  */
 export async function loadActiveUser(pool, userId) {
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, email, must_change_password, file_upload_enabled, totp_login_enabled
+    `SELECT id, login, display_name, role, fde_name, auth_source, email, must_change_password, file_upload_enabled, totp_login_enabled, locale
        FROM users WHERE id = $1 AND status = 'active'`,
     [userId],
   );
@@ -351,7 +355,7 @@ export async function findSessionUser(pool, token, { now = new Date() } = {}) {
   // 就坐在这条查表上，另开一条查表就是每个 API 请求多一次往返。
   const res = await pool.query(
     `SELECT u.id, u.login, u.display_name, u.role, u.fde_name, u.auth_source, u.status,
-            u.must_change_password, u.file_upload_enabled, s.id AS session_id, s.expires_at, s.last_seen_at
+            u.must_change_password, u.file_upload_enabled, u.locale, s.id AS session_id, s.expires_at, s.last_seen_at
        FROM login_sessions s
        JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = $1

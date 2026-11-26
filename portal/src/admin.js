@@ -10,6 +10,7 @@ import * as projects from './projects.js';
 import { onboardingStatus } from './onboarding.js';
 import { enqueueOffboarding, offboardingStatus, workspaceExists } from './offboarding.js';
 import { removeGitCredentialFile } from './git-credential.js';
+import { normalizeUserLocale } from './db.js'; // #828 P1：语言偏好写侧归一化（纯函数，db.js 只依 pg，无环）
 
 export class AdminError extends Error {
   constructor(code, message, { httpStatus = 400, details, en } = {}) {
@@ -45,6 +46,9 @@ const safeUser = (row) => ({
   // ⚠ 代价是「SELECT 漏列 ⇒ DTO 说 false」，所以五个 safeUser 生产点的列清单都必须带上这一列
   //    （portal/test/user-totp-login-enabled.test.js 的 T-3 逐个钉）。
   totp_login_enabled: row.totp_login_enabled === true,
+  // #828 P1：账号级语言偏好（迁移 0048，可空）。`null` = 未设过 = 跟随浏览器；fake/旧驱动缺列也给 `null`。
+  // 与管理台用户表单的「默认语言」三档下拉对应（跟随浏览器/简体中文/English）。
+  locale: row.locale ?? null,
   role: row.role,
   fde_name: row.fde_name ?? null,
   git_host_id: row.git_host_id ?? null,
@@ -107,7 +111,7 @@ export function recordAdminAudit(pool, actorId, action, target, details = {}) {
 export async function listUsers(pool) {
   const r = await pool.query(
     `SELECT users.id, users.login, users.display_name, users.email, users.mail_otp_enabled,
-            users.file_upload_enabled, users.totp_login_enabled,
+            users.file_upload_enabled, users.totp_login_enabled, users.locale,
             users.role, users.fde_name,
             users.auth_source, users.status, users.created_at,
             (users.totp_secret IS NOT NULL) AS totp_enabled,
@@ -376,7 +380,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     throw new AdminError('validation_failed', '至少提供一个可更新字段', { en: 'provide at least one updatable field' });
   }
   const allowed = new Set(['display_name', 'email', 'mail_otp_enabled', 'file_upload_enabled',
-    'totp_login_enabled', 'role', 'fde_name', 'status']);
+    'totp_login_enabled', 'role', 'fde_name', 'status', 'locale']);
   for (const field of fields) {
     if (field === 'login') {
       throw new AdminError('validation_failed', 'login 不可修改', { en: 'login cannot be modified', details: { field: 'login' } });
@@ -412,6 +416,16 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   // 拒绝一个无害的值只会把「先绑 TOTP 再打开」这个顺序变成两次往返。
   if (Object.hasOwn(updates, 'totp_login_enabled') && typeof updates.totp_login_enabled !== 'boolean') {
     throw new AdminError('validation_failed', 'totp_login_enabled 必须是布尔值', { en: 'totp_login_enabled must be a boolean', details: { field: 'totp_login_enabled' } });
+  }
+  // #828 P1：语言偏好。`null` / 空串 = 清除（跟随浏览器），其余走白名单归一化（`en-US`→`en`、
+  // `zh_CN`→`zh-CN` …）；非法值（`fr`、数字）当场 400 并点名 field（与 `file_upload_enabled` 同形状）。
+  let nextLocale;
+  if (Object.hasOwn(updates, 'locale')) {
+    const norm = normalizeUserLocale(updates.locale);
+    if (!norm.ok) {
+      throw new AdminError('validation_failed', "locale 只允许 'zh-CN'、'en' 或 null（清除）", { en: "locale must be 'zh-CN', 'en', or null (to clear)", details: { field: 'locale' } });
+    }
+    nextLocale = norm.value;
   }
   // 两条交叉防护（都在写库之前）：开了开关却没邮箱 / 清空邮箱却还开着开关 ⇒ 都会让人**登不进去**
   // （`chooseSecondFactor` 走 `email_not_registered` 那条 409）。这里拒绝保存，而不是让它在登录时才炸。
@@ -488,6 +502,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   if (Object.hasOwn(updates, 'mail_otp_enabled')) setField('mail_otp_enabled', updates.mail_otp_enabled);
   if (Object.hasOwn(updates, 'file_upload_enabled')) setField('file_upload_enabled', updates.file_upload_enabled);
   if (Object.hasOwn(updates, 'totp_login_enabled')) setField('totp_login_enabled', updates.totp_login_enabled);
+  if (Object.hasOwn(updates, 'locale')) setField('locale', nextLocale);
   if (Object.hasOwn(updates, 'role')) setField('role', updates.role);
   if (Object.hasOwn(updates, 'fde_name')) setField('fde_name', updates.fde_name);
   if (Object.hasOwn(updates, 'status')) {
@@ -505,7 +520,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
       `WITH updated AS (
          UPDATE users SET ${assignments.join(', ')}
           WHERE id = $1 ${offboardingGuard}
-          RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at, last_activity_at,
+          RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at, last_activity_at, locale,
                     (totp_secret IS NOT NULL) AS totp_enabled
        ), revoked AS (
          UPDATE login_sessions SET revoked_at = now()
@@ -543,6 +558,13 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   await recordAdminAudit(pool, actorId, 'admin.user_updated', current.login, {
     fields: fields.filter((field) => field !== 'login'),
   });
+  // #828 P1：语言偏好单独留一条台账。值写**人读**名称：`null` 记成「跟随浏览器」而不是字符串
+  // "null"——否则审计里「清除」与「设成字符串 null」分不清，运维考古会读错。
+  if (Object.hasOwn(updates, 'locale')) {
+    await recordAdminAudit(pool, actorId, 'admin.user_locale_updated', current.login, {
+      locale: nextLocale === null ? '跟随浏览器' : nextLocale,
+    });
+  }
   return { user: safeUser(result.rows[0]) };
 }
 
