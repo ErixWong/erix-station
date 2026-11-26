@@ -114,9 +114,15 @@ describe('locale 检测优先级（i18n 基建）', () => {
     expect(detectLocale()).toBe('zh-CN'); // 也不能把浏览器语言吞掉
   });
 
-  it('禁用存储（setItem 抛错）：setLocale 本次会话仍生效，只是没持久化', () => {
+  it('禁用存储（localStorage 与 cookie 两种持久化都坏）：setLocale 本次会话仍生效，只是没持久化', () => {
+    // 两种持久化都坏才算真兜底：光让 setItem 抛错只能证「localStorage 坏了本次仍生效」，
+    // 但 setLocale 之后还会写 cookie，必须把 cookie 也变成写不进，才能证明「两种都坏仍生效」。
     vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
       throw new Error('quota');
+    });
+    // cookie 也写不进（afterEach 的 vi.restoreAllMocks() 会复原这个 accessor spy，不污染后续用例）。
+    vi.spyOn(document, 'cookie', 'set').mockImplementation(() => {
+      throw new Error('cookie disabled');
     });
     setLocale('en');
     expect(i18n.global.locale.value).toBe('en');
