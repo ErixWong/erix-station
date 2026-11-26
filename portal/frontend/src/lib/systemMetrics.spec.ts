@@ -10,6 +10,7 @@ import {
   SPARK_MAX_POINTS,
   SYSTEM_METRICS_PATH,
   bucketParts,
+  diskTrendFor,
   formatAgo,
   formatAxisTime,
   formatBytes,
@@ -102,8 +103,9 @@ describe('normalizeSystemMetrics：真库形状逐项搬齐，一个都不丢', 
     });
     expect(normalized.series).toEqual({ bucketSeconds: 30, points: [{
       t: '2026-11-17T07:30:30.000Z', cpuAvg: 63.46, cpuMax: 63.46,
-      memUsed: 32685326336, containersRunning: 3, samples: 1,
-    }], dropped: 0 });
+      memUsed: 32685326336, memAvailable: null, memCached: null, swapUsed: null, load1: null,
+      containersRunning: 3, samples: 1,
+    }], dropped: 0, disks: [] });
     expect(normalized.range).toBe('1h');
     expect(normalized.retentionDays).toBe(30);
     expect(normalized.seriesError).toBeNull();
@@ -137,7 +139,9 @@ describe('normalizeSystemMetrics：真库形状逐项搬齐，一个都不丢', 
     expect(stringly.latest?.cpu.load).toEqual([1.2, null, 1.4]);
     expect(stringly.series.bucketSeconds).toBe(900);
     expect(stringly.series.points[0]).toEqual({
-      t: 'x', cpuAvg: 1.5, cpuMax: null, memUsed: 1024, containersRunning: null, samples: null,
+      t: 'x', cpuAvg: 1.5, cpuMax: null, memUsed: 1024,
+      memAvailable: null, memCached: null, swapUsed: null, load1: null,
+      containersRunning: null, samples: null,
     });
   });
 });
@@ -236,8 +240,8 @@ describe('normalizeSystemMetrics：脏元素丢弃 + 计数（一个坏点不许
       expect(() => normalizeSystemMetrics(raw)).not.toThrow();
     }
     expect(normalizeSystemMetrics(null)).toEqual({
-      enabled: null, latest: null, series: { bucketSeconds: null, points: [], dropped: 0 },
-      range: null, retentionDays: null, seriesError: null,
+      enabled: null, latest: null, series: { bucketSeconds: null, points: [], dropped: 0, disks: [] },
+      range: null, retentionDays: null, seriesError: null, disksError: null,
     });
   });
 
@@ -409,8 +413,8 @@ describe('sparkPoints：sparkline 取点', () => {
   });
 
   it('时刻脏 / 缺 ⇒ 丢掉（没有 x 坐标可落，硬画会把线拉到 1970）', () => {
-    expect(sparkPoints([{ t: null, cpuAvg: 1 } as never], (p) => p.cpuAvg)).toEqual([]);
-    expect(sparkPoints([{ t: 'nope', cpuAvg: 1 } as never], (p) => p.cpuAvg)).toEqual([]);
+    expect(sparkPoints([{ t: null, cpuAvg: 1 }], (p) => p.cpuAvg)).toEqual([]);
+    expect(sparkPoints([{ t: 'nope', cpuAvg: 1 }], (p) => p.cpuAvg)).toEqual([]);
     expect(sparkPoints(null, () => 1)).toEqual([]);
   });
 
@@ -431,5 +435,100 @@ describe('错误文本（服务端 message 原文，不翻译）', () => {
     expect(metricsErrorText(new Error('kaboom'))).toBe('kaboom');
     expect(metricsErrorText({ message: 'from-server' })).toBe('from-server');
     expect(metricsErrorText(undefined)).toBe('undefined');
+  });
+});
+
+// ────────────────────────────────────────────────────
+// #814：服务端补齐了四个历史列与按设备归组的磁盘序列，前端只能接、不许替它造数。
+const T0 = '2026-11-17T07:30:00.000Z';
+const T1 = '2026-11-17T07:35:00.000Z';
+
+describe('normalizeSystemMetrics：series 新增四列（脏值 ⇒ null；swap 的 0 是真 0）', () => {
+  it('memAvailable/memCached/swapUsed/load1 camel+snake 都接；`swap_used: 0` ⇒ 0', () => {
+    const p = normalizeSystemMetrics({
+      series: { points: [{ t: T0, memAvailable: 'abc', mem_cached: 1024, swap_used: 0, load_1: 1.024 }] },
+    }).series.points[0];
+    expect(p.memAvailable, '脏串 ⇒ null（不 `?? 0`）').toBeNull();
+    expect(p.memCached).toBe(1024);
+    expect(p.swapUsed, '0 是真 0，与 null 是两件事').toBe(0);
+    expect(p.load1).toBe(1.024);
+  });
+
+  it('只有缓存有值的点不会被判成「没值」而丢掉；负数 / NaN ⇒ null（load 不可能为负）', () => {
+    const r = normalizeSystemMetrics({
+      series: { points: [{ t: T0, memCached: 512, swapUsed: -3, load1: NaN }] },
+    });
+    expect(r.series.dropped, '新四列要进脏点判定，否则只剩缓存的点会被当成空点丢掉').toBe(0);
+    expect(r.series.points[0].memCached).toBe(512);
+    expect(r.series.points[0].swapUsed).toBeNull();
+    expect(r.series.points[0].load1).toBeNull();
+  });
+});
+
+describe('normalizeSystemMetrics：series.disks 归组 / 排序 / unknown 真值 / 不污染 dropped', () => {
+  it('按 device 字典序排；snake 也接；unknown 是真值（不过 nullIfUnknown）、path 过 nullIfUnknown', () => {
+    const r = normalizeSystemMetrics({
+      series: { disks: [
+        { device: '/dev/sdb', path: '/srv', points: [{ t: T0, usedBytes: 100, totalBytes: 200, samples: 1 }] },
+        { device: '/dev/nvme0n1p2', path: '/', points: [{ t: T0, used_bytes: '50', total_bytes: '100', samples: '2' }] },
+        { device: 'unknown', path: 'unknown', points: [{ t: T1, usedBytes: 0 }] },
+        null,
+        { path: '/no-device' },
+      ] },
+    });
+    expect(r.series.disks.map((d) => d.device)).toEqual(['/dev/nvme0n1p2', '/dev/sdb', 'unknown']);
+    const unknown = r.series.disks.find((d) => d.device === 'unknown');
+    expect(unknown, 'unknown 是分组键的真值，不许当没有丢掉').toBeDefined();
+    expect(unknown!.path, 'path 是展示用引用 ⇒ nullIfUnknown').toBeNull();
+    expect(unknown!.points[0].usedBytes, '0 是真 0').toBe(0);
+    const nvme = r.series.disks[0];
+    expect(nvme.points[0].usedBytes, 'snake used_bytes 也接').toBe(50);
+    expect(nvme.points[0].samples).toBe(2);
+  });
+
+  it('非数组 ⇒ 空数组；无 t 的点丢掉；disks 的脏不进 series.dropped（不覆盖 points 计数）', () => {
+    expect(normalizeSystemMetrics({ series: { disks: 'x' } }).series.disks).toEqual([]);
+    const r = normalizeSystemMetrics({
+      series: {
+        points: [{ cpuAvg: null, t: null }, { t: T1, cpuAvg: 2 }],
+        disks: [null, { path: '/x' }, { device: '/dev/sdc', points: [{ usedBytes: 1 }] }],
+      },
+    });
+    expect(r.series.dropped, 'dropped 只数 points 的脏点，不被 disks 覆盖').toBe(1);
+    expect(r.series.disks.map((d) => d.device)).toEqual(['/dev/sdc']);
+    expect(r.series.disks[0].points, '无 t 的点被丢').toEqual([]);
+  });
+});
+
+describe('diskTrendFor：卡片行对上一条历史序列', () => {
+  const disks = [
+    { device: '/dev/nvme0n1p2', path: '/', points: [{ t: T0, usedBytes: 1, totalBytes: 2, samples: 1 }] },
+    { device: 'unknown', path: null, points: [{ t: T0, usedBytes: 3, totalBytes: 4, samples: 1 }] },
+  ];
+  it('device 精确相等才配对', () => {
+    expect(diskTrendFor(disks, { device: '/dev/nvme0n1p2' })?.device).toBe('/dev/nvme0n1p2');
+  });
+  it('卡片 device 为 null ⇔ 序列里的 unknown', () => {
+    expect(diskTrendFor(disks, { device: null })?.device).toBe('unknown');
+  });
+  it('对不上 ⇒ null（**不许**退成随便拿一块盘的线）', () => {
+    expect(diskTrendFor(disks, { device: '/dev/sda1' })).toBeNull();
+    expect(diskTrendFor(null, { device: '/dev/nvme0n1p2' })).toBeNull();
+    expect(diskTrendFor([], { device: null })).toBeNull();
+  });
+});
+
+describe('normalizeSystemMetrics：disksError 三态（与 seriesError 各自独立）', () => {
+  it('缺失 ⇒ null；空串 ⇒ null；原因串 ⇒ 原样；snake 也接', () => {
+    expect(normalizeSystemMetrics({}).disksError).toBeNull();
+    expect(normalizeSystemMetrics({ disksError: '' }).disksError).toBeNull();
+    expect(normalizeSystemMetrics({ disksError: 'disk-query-failed' }).disksError).toBe('disk-query-failed');
+    expect(normalizeSystemMetrics({ disks_error: 'snake-reason' }).disksError).toBe('snake-reason');
+  });
+  it('disksError 非空不代表 points 没数（独立降级）', () => {
+    const r = normalizeSystemMetrics({ ...REAL, disksError: 'boom' });
+    expect(r.disksError).toBe('boom');
+    expect(r.series.points.length).toBeGreaterThan(0);
+    expect(r.seriesError, 'seriesError 不受 disksError 影响').toBeNull();
   });
 });
