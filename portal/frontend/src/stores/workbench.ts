@@ -1734,11 +1734,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const sid = sessionId.value;
     const reqSeq = sessionReqSeq.value;
     const ctx = ctxSeq.value;
-    // 形状严格校验：非对象 / 缺 id / content 非字符串 ⇒ 整段跳过（不渲染空气泡、不动计数）。
+    // R5（评审第 5 条）形状收紧：帧是外部输入，空气泡与错误角色都不该进对话流 ⇒ 必须 role==='user' 且 content 为非空白字符串。
     if (!maybe || typeof maybe !== 'object') return;
     const m = maybe as Record<string, unknown>;
     if (typeof m.id !== 'string' || m.id === '') return;
-    if (typeof m.content !== 'string') return;
+    if (m.role !== 'user' || typeof m.content !== 'string' || m.content.trim() === '') return;
     // 帧序实测：`run_end` 先到、终态补拉异步落 ⇒ 不 await 就会把气泡排在旧 run 终稿上面（倒序）。
     if (refreshInFlight) {
       try { await refreshInFlight; } catch { /* 补拉失败不该吃掉那句话 */ }

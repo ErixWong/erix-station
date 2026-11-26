@@ -369,4 +369,120 @@ describe('workbench store · 输入队列（#370）', () => {
     expect(uIdx).toBeGreaterThanOrEqual(0);
     expect(aiIdx).toBeLessThan(uIdx); // 旧 run 终稿在前，转向气泡在后
   });
+
+  // ---- #799 评审修复轮新增回归用例（R1 代次守卫 / R2 句柄归属 / R3 计数不重复 / R5 形状收紧） ----
+
+  it('#799 切会话竞态：旧会话的投递帧不得落进新会话（评审 R1 代次守卫）', async () => {
+    vi.stubGlobal('EventSource', FakeEventSource);
+    calls.length = 0;
+    let s1Detail = 0;
+    let resolveRefresh: (v?: unknown) => void = () => {};
+    const refreshGate = new Promise((r) => { resolveRefresh = r; });
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit = {}) => {
+      calls.push({ url, init });
+      if (url.includes('/events/history')) return jsonResponse(200, { events: [] });
+      const base = url.split('?')[0];
+      if (base === '/api/sessions/s1') {
+        s1Detail += 1;
+        if (s1Detail === 1) return jsonResponse(200, { session: { id: 's1', cwd: '/w', message_count: 7 }, messages: [], last_seq: 1 });
+        return refreshGate.then(() => jsonResponse(200, { session: { id: 's1', cwd: '/w', message_count: 8 }, messages: [{ id: 'm-old', run_id: 'r1', seq: 5, role: 'assistant', content: '旧会话终稿', synthetic: false }], last_seq: 5 }));
+      }
+      if (base === '/api/sessions/s2') return jsonResponse(200, { session: { id: 's2', cwd: '/w', message_count: 9 }, messages: [], last_seq: 0 });
+      return jsonResponse(200, { items: [] });
+    }));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.sessionMessageCount).toBe(7);
+    store.es.activeRunId = 'r1';
+    const es = FakeEventSource.instances.at(-1)!;
+    es.emit('run_end', { run_id: 'r1', termination: { reason: 'end_turn' } }); // 终态补拉在飞（详情响应被 gate 卡住）
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered_run_id: 'r-new', delivered: probe }); // adopt 卡在 await refreshInFlight
+    await store.openSession('s2'); // 切会话：refreshInFlight=null、代次++、entries 清空、计数=9
+    resolveRefresh();              // 再放行旧详情响应
+    await flushPromises();
+    expect(msgEntries(store).some((e) => e.text === '转向探针-XYZ')).toBe(false); // 探针气泡没进新会话
+    expect(store.sessionMessageCount).toBe(9); // 新会话计数没被旧投递帧动过
+  });
+
+  it('#799 权威计数已含投递那条 ⇒ 头部计数不再 +1（评审 R3：要「已计入」的证据）', async () => {
+    let s1 = 0;
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        s1 += 1;
+        if (s1 === 1) return detail({ message_count: 1 });
+        return { status: 200, body: { session: { id: 's1', cwd: '/w', message_count: 3 }, messages: [{ id: 'm-old', run_id: 'r1', seq: 5, role: 'assistant', content: '终稿', synthetic: false }, { id: 'm-1', run_id: 'r-new', seq: 10, role: 'user', content: '转向探针-XYZ', synthetic: false }], last_seq: 6 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.es.activeRunId = 'r1';
+    const es = FakeEventSource.instances.at(-1)!;
+    es.emit('run_end', { run_id: 'r1', termination: { reason: 'end_turn' } }); // 补拉返回的 message_count 已含那条
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered_run_id: 'r-new', delivered: probe });
+    await flushPromises();
+    expect(store.sessionMessageCount).toBe(3); // = 响应里的权威值，不再 +1（R3 前会变 4）
+    expect(msgEntries(store).filter((e) => e.id === 'm-1').length).toBe(1); // 气泡照常落一张
+  });
+
+  it('#799 形状收紧：空串 / 纯空白 / role 非 user ⇒ 不产气泡、计数不动（评审 R5）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') return detail({ message_count: 3 });
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const before = msgEntries(store).length;
+    const es = FakeEventSource.instances.at(-1)!;
+    for (const bad of [
+      { id: 'b-empty', role: 'user', content: '' },
+      { id: 'b-blank', role: 'user', content: '   ' },
+      { id: 'b-role', role: 'assistant', content: '助手语气不该进对话流' },
+    ]) {
+      es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered_run_id: 'r-new', delivered: bad });
+    }
+    await flushPromises();
+    expect(msgEntries(store).length).toBe(before);
+    expect(store.sessionMessageCount).toBe(3);
+  });
+
+  it('#799 在飞句柄归属：连发两次 run_end（旧慢新快），投递帧等的是最新那笔补拉（评审 R2）', async () => {
+    vi.stubGlobal('EventSource', FakeEventSource);
+    calls.length = 0;
+    let s1Detail = 0;
+    let resolveOld: (v?: unknown) => void = () => {}; const oldGate = new Promise((r) => { resolveOld = r; });
+    let resolveNew: (v?: unknown) => void = () => {}; const newGate = new Promise((r) => { resolveNew = r; });
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit = {}) => {
+      calls.push({ url, init });
+      if (url.includes('/events/history')) return jsonResponse(200, { events: [] });
+      const base = url.split('?')[0];
+      if (base === '/api/sessions/s1') {
+        s1Detail += 1;
+        if (s1Detail === 1) return jsonResponse(200, { session: { id: 's1', cwd: '/w', message_count: 1 }, messages: [], last_seq: 1 });
+        if (s1Detail === 2) return oldGate.then(() => jsonResponse(200, { session: { id: 's1', cwd: '/w', message_count: 2 }, messages: [{ id: 'm-old', run_id: 'r1', seq: 5, role: 'assistant', content: '第一轮终稿', synthetic: false }], last_seq: 5 }));
+        return newGate.then(() => jsonResponse(200, { session: { id: 's1', cwd: '/w', message_count: 2 }, messages: [{ id: 'm-new', run_id: 'r1', seq: 6, role: 'assistant', content: '第二轮终稿', synthetic: false }], last_seq: 6 }));
+      }
+      return jsonResponse(200, { items: [] });
+    }));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = 'r1';
+    es.emit('run_end', { run_id: 'r1', termination: { reason: 'end_turn' } }); // 第一笔补拉在飞（旧，慢）
+    store.es.activeRunId = 'r1';
+    es.emit('run_end', { run_id: 'r1', termination: { reason: 'end_turn' } }); // 第二笔补拉在飞（新，快）
+    resolveOld();          // 先放行**旧**那笔：它的 finally 不得清掉新登记的句柄（R2）
+    await flushPromises();
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered_run_id: 'r-new', delivered: probe });
+    resolveNew();          // 再放行新那笔
+    await flushPromises();
+    const msgs = msgEntries(store);
+    const newIdx = msgs.findIndex((e) => e.text === '第二轮终稿');
+    const uIdx = msgs.findIndex((e) => e.text === '转向探针-XYZ');
+    expect(newIdx).toBeGreaterThanOrEqual(0);
+    expect(uIdx).toBeGreaterThanOrEqual(0);
+    expect(newIdx).toBeLessThan(uIdx); // 气泡排在最新那笔补拉的终稿之后（不是被旧 finally 清掉后抢跑）
+  });
 });

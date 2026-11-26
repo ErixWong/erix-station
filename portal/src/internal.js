@@ -462,7 +462,7 @@ export async function drainQueueAfterRun(pool, runId, log = console) {
 }
 
 /**
- * #370：队列快照推送（`queue_update`，portal.md §5.3 第 16 类）。
+ * #370：队列快照推送（`queue_update`，portal.md §5.3 第 17 类）。
  * **不落 run_events**：入队时根本没有 run（信封 `run_id NOT NULL`），且队列是**状态**不是**历史**
  * ——真相在 `queued_inputs`，快照可由 `GET /api/sessions/:id` 全量重建（不变式 3）。⇒ 它不进
  * `HISTORY_EVENT_TYPES` / `HISTORY_REPLAY_TYPES`，**刷新后靠会话详情补齐，不靠 SSE 回放**。
