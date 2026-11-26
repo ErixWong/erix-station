@@ -201,6 +201,41 @@ function hasRealSummary(record) {
 const FOLDED_FACTS_SOURCES = Object.freeze(['llm', 'statistical']);
 
 /**
+ * issue #816：`foldedFacts.origin` 里本站**认得**的那三个值——逐字取引擎
+ * `compact/fold-summary-journal.js#FOLDED_FACT_ORIGINS` 的现查值（`['mechanical','semantic','host']`）。
+ *
+ * 为什么是白名单而不是原样透传：`origin` 是「这条投影由谁产出」的三态标签，前端据它选横幅文案。
+ * 引擎将来若加第四态，本站白名单外的值**整个键不给**（与 #390-A / #440 同一条「键缺席 = 不知道」纪律），
+ * 前端退回第三态，而不是把一个没核对过的字符串直接当标签渲染。
+ */
+const FOLDED_FACT_ORIGINS = Object.freeze(['mechanical', 'semantic', 'host']);
+
+/**
+ * issue #816：`foldedFacts.toolCalls` 的逐项清洗（宿主不再动第二刀：引擎已按 ≤8 条 × ≤80 字夹过）。
+ *
+ * 只保留「形状可信」的项：非数组对象、`name` 是 trim 后非空的字符串（输出取 trim 后的值）；
+ * `argsSummary` 仅在是非空字符串时带上（空串 ⇒ 不带这个键，而不是写空串）。
+ * 清洗后为空数组 ⇒ 返回 `[]`，由调用方据此**不给 `toolCalls` 键**（不是给 `[]`）。
+ *
+ * @param {unknown} items `foldedFacts.toolCalls`
+ * @returns {{ name: string, argsSummary?: string }[]}
+ */
+function cleanFoldedToolCalls(items) {
+  const out = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const entry = /** @type {{ name?: unknown, argsSummary?: unknown }} */ (item);
+    const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+    if (name === '') continue;
+    const argsSummary = typeof entry.argsSummary === 'string' && entry.argsSummary !== ''
+      ? entry.argsSummary
+      : undefined;
+    out.push({ name, ...(argsSummary === undefined ? {} : { argsSummary }) });
+  }
+  return out;
+}
+
+/**
  * issue #440：`foldedFacts` 的**读侧**投影（一折一条，落在发生折叠的那一轮的轮记录上）。
  *
  * 为什么必须进 DTO：`foldedFacts.text` 是宿主横幅**唯一**能拿到「这次折叠到底留下了什么」的地方
@@ -221,20 +256,57 @@ const FOLDED_FACTS_SOURCES = Object.freeze(['llm', 'statistical']);
  * ⚠ `hasSummary` 的语义**一字未动**（#390-A 钉着：它只读 `record.summary`，与 `foldedFacts` 无关）。
  * 「有没有可读摘要」这件事由 `summaryText` 自己表达，不复用 `hasSummary`。
  *
+ * ── #816：`facts` 嵌套键的口径与缺席语义 ──
+ * 本函数在三个既有键之外**新增一个嵌套键 `facts`**（不是平铺 8 个键，也不动 `summaryText`/`summarySource`/
+ * `truncated`/`hasSummary`），把账本 `record.foldedFacts` 里本就有的结构化数据搬进 DTO，供折叠呈现重设计
+ * （一行「范围 · title · 工具足迹」）直接取用。
+ *   · **缺席 = 不知道**（与 #390-A / #440 同一条纪律）：每个子键取不到就**不写这个键**，绝不写 `null`/`false`/
+ *     `0`/空串；`foldedFacts` 不是对象或是数组 ⇒ **整个 `facts` 键不出现**（被上面的守卫挡掉）。
+ *   · `toolCalls` 逐项清洗（见 `cleanFoldedToolCalls`），清洗后为空 ⇒ 不给键；**不截断、不改写内容**。
+ *   · `origin` 走白名单 `FOLDED_FACT_ORIGINS`，白名单外一律不给键。
+ *   · `summary`/`summaryDropped`/`titleFallback` 是为引擎即将落地的 #897 **预留的读点**：0.33.0 上这些键
+ *     不存在 ⇒ 天然缺席；等引擎补上（用户 261126 确认近期修好）本站**零改动**就能用（不是「等升级才能用」）。
+ *   · ⚠ `facts.summary`（模型给的 description）与 `summaryText`（= `foldedFacts.text`，替代物正文）是**两份
+ *     不同的东西**，注释与实现都必须保持两者各写各的键——这是本函数最容易被误合并的地方。
+ *
  * @param {unknown} facts 轮记录上的 `record.foldedFacts`
- * @returns {{ summaryText?: string, summarySource?: string, truncated?: true }}
+ * @returns {{ summaryText?: string, summarySource?: string, truncated?: true, facts?: object }}
  */
 function foldedFactsFields(facts) {
   if (!facts || typeof facts !== 'object' || Array.isArray(facts)) return {};
-  const value = /** @type {{ text?: unknown, source?: unknown, truncated?: unknown }} */ (facts);
+  const value = /** @type {{ text?: unknown, source?: unknown, truncated?: unknown, title?: unknown, summary?: unknown, origin?: unknown, from?: unknown, to?: unknown, rounds?: unknown, toolCalls?: unknown, summaryDropped?: unknown, titleFallback?: unknown }} */ (facts);
   const summaryText = typeof value.text === 'string' && value.text !== '' ? value.text : undefined;
   const summarySource = typeof value.source === 'string' && FOLDED_FACTS_SOURCES.includes(value.source)
     ? value.source
     : undefined;
+  // #816：`facts` 嵌套键——每个子键「取不到就不写」，绝不写 null/false/0/空串。到这里 `facts` 已是
+  // 非 null 非数组对象（上面的守卫已挡掉非对象），所以 `facts` 键本身必出（无认得子键时为 `{}`）。
+  const title = typeof value.title === 'string' && value.title !== '' ? value.title : undefined;
+  // ⚠ `summary` 是**模型给的 description**（#897 预留读点），与 `summaryText`（=`foldedFacts.text` 替代物正文）
+  //   不是同一份东西——两者各写各的键，不许合并。
+  const summary = typeof value.summary === 'string' && value.summary !== '' ? value.summary : undefined;
+  const origin = typeof value.origin === 'string' && FOLDED_FACT_ORIGINS.includes(value.origin)
+    ? value.origin
+    : undefined;
+  const from = Number.isSafeInteger(value.from) ? value.from : undefined;
+  const to = Number.isSafeInteger(value.to) ? value.to : undefined;
+  const rounds = Number.isSafeInteger(value.rounds) && value.rounds > 0 ? value.rounds : undefined;
+  const toolCalls = cleanFoldedToolCalls(value.toolCalls);
   return {
     ...(summaryText === undefined ? {} : { summaryText }),
     ...(summarySource === undefined ? {} : { summarySource }),
     ...(value.truncated === true ? { truncated: true } : {}),
+    facts: {
+      ...(title === undefined ? {} : { title }),
+      ...(summary === undefined ? {} : { summary }),
+      ...(origin === undefined ? {} : { origin }),
+      ...(from === undefined ? {} : { from }),
+      ...(to === undefined ? {} : { to }),
+      ...(rounds === undefined ? {} : { rounds }),
+      ...(toolCalls.length === 0 ? {} : { toolCalls }),
+      ...(value.summaryDropped === true ? { summaryDropped: true } : {}),
+      ...(value.titleFallback === true ? { titleFallback: true } : {}),
+    },
   };
 }
 
