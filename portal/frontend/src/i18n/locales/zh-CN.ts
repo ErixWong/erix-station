@@ -1257,6 +1257,8 @@ export const zhCN = {
       copyFailed: '复制失败（浏览器没给剪贴板能力），请手动选中。',
       restoreBuiltin: '恢复内置',
       titlePromptDefaultBytes: '内置默认（跟随内置时实际发出去的就是它）：{bytes}',
+      titlePromptDefaultView: '查看内置默认全文',
+      titlePromptDefaultHide: '收起内置默认全文',
       save: '保存',
       reload: '重新读取',
       saved: '已保存（下面显示的就是服务端落库后回读的那一份，不是你敲的那一串）。',
@@ -1314,6 +1316,8 @@ export const zhCN = {
         hideExpected: '收起该有那份',
         dbNote: '库里那两个输入：追加段 {addendum} 字节 / 覆写 {override} 字节',
         sourceNote: '当前来源：{source}',
+        sourceDb: '输入取自配置行（三格可能仍是空 = 跟随内置）',
+        sourceBuiltin: '配置行读不到 ⇒ 已回落内置模板',
       },
     },
     // issue #677 P2b：管理台「运行时设置」列表（views/AdminRuntimeSettingsView.vue，契约 §4.21）。

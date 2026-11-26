@@ -121,6 +121,25 @@ test('E4 不是普通文件', async (t) => {
   assert.equal(dto.matches, null);
 });
 
+test('E4b symlink 不当生效全文', async (t) => {
+  const fde = 'alice';
+  // 临时用户空间：真文件放别处，`home/AGENTS.md` 做成指向它的 symlink。
+  const r = makeRoot({ fde }); t.after(r.cleanup);
+  const realFile = path.join(r.root, 'real-agents.md');
+  fs.writeFileSync(realFile, renderHomeAgentsMd({ fdeName: fde }));
+  fs.symlinkSync(realFile, r.target); // home/AGENTS.md 是指向真文件的 symlink
+  // 直接读不抛（symlink 被 `lstat` 认出 ⇒ `not_a_file`，绝不被当成生效全文读进来）。
+  const disk = await readDiskHomeAgentsMd({ userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(disk.state, 'not_a_file');
+  assert.equal(disk.text, null, 'symlink 不交出生效全文');
+  // 走完整 DTO：同样 `not_a_file`、比对不了、没有盘上全文。
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(dto.disk.state, 'not_a_file');
+  assert.equal(dto.matches, null);
+  assert.equal(dto.disk.text, null);
+});
+
 test('E5 读失败', async (t) => {
   const fde = 'alice';
   const r = makeRoot({ fde, fileBody: renderHomeAgentsMd({ fdeName: fde }) }); t.after(r.cleanup);

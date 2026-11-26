@@ -748,3 +748,19 @@ describe('F13 只读卡仍然没有 4 条全文', () => {
     }
   });
 });
+
+describe('F14 生效面不得把配置行说成覆写', () => {
+  it('生效面 source=db 但三格全空 ⇒ effective-db-note 不说「DB 覆写」，同一页编辑卡仍「跟随内置」', async () => {
+    // 生效面读到配置行（source:'db'）但三个值都是空；盘上与该有那份一致。
+    stubDefault(dto(), undefined, {
+      effective: effectiveDto({ source: 'db', db: { addendumBytes: 0, overrideBytes: 0 }, matches: true }),
+    });
+    const w = await mountView();
+    const note = text(w, 'effective-db-note');
+    // 「覆写」当状态词不许出现在生效面来源那一句（新键说的是「输入取自配置行」，不是「DB 覆写」）。
+    expect(note).not.toContain('DB 覆写');
+    expect(note).toContain('输入取自配置行');
+    // 两句话必须能同时成立：编辑卡那一行（判据 text===''）仍说「跟随内置」，与生效面不矛盾。
+    expect(text(w, 'source-addendum')).toContain('跟随内置');
+  });
+});

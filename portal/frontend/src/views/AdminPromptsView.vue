@@ -183,7 +183,7 @@ const effectiveDbNoteText = computed(() => {
   });
 });
 const effectiveSourceText = computed(() => t('admin.prompts.effective.sourceNote', {
-  source: effective.value?.source === 'db' ? t('admin.prompts.sourceDb') : t('admin.prompts.sourceBuiltin'),
+  source: effective.value?.source === 'db' ? t('admin.prompts.effective.sourceDb') : t('admin.prompts.effective.sourceBuiltin'),
 }));
 /** `reason \u2260 null` 时复用已有 reason 语义另起一句（生效面自己那份 reason）。 */
 const effectiveReasonText = computed(() => {
@@ -529,7 +529,7 @@ onMounted(async () => {
           data-test="toggle-title-default"
           class="rounded-md border border-black/20 px-2 py-1 text-xs"
           @click="showTitleDefault = !showTitleDefault"
-        >{{ showTitleDefault ? t('admin.prompts.hideEffective') : t('admin.prompts.viewEffective') }}</button>
+        >{{ showTitleDefault ? t('admin.prompts.titlePromptDefaultHide') : t('admin.prompts.titlePromptDefaultView') }}</button>
         <pre
           v-if="showTitleDefault"
           data-test="title-default-text"
