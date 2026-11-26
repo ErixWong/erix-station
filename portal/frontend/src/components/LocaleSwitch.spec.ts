@@ -2,10 +2,12 @@
 // 以及 i18n 基建的语言检测优先级（cookie → localStorage → 浏览器语言 → 兜底 zh-CN，#804）。
 // 用真实 i18n 单例（与 main.ts 装配一致），不 mock t()。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mount, type VueWrapper } from '@vue/test-utils';
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
+import { createPinia, setActivePinia } from 'pinia';
 import LocaleSwitch from './LocaleSwitch.vue';
 import { LOCALE_STORAGE_KEY, createAppI18n, detectLocale, i18n, setLocale } from '../i18n';
 import { clearLocaleCookie, readLocaleCookie, writeLocaleCookie } from '../lib/localeCookie';
+import { useAuthStore } from '../stores/auth';
 
 function mountSwitch(): VueWrapper {
   return mount(LocaleSwitch, { global: { plugins: [i18n] } });
@@ -127,5 +129,61 @@ describe('locale 检测优先级（i18n 基建）', () => {
     setLocale('en');
     expect(i18n.global.locale.value).toBe('en');
     expect(document.documentElement.lang).toBe('en');
+  });
+});
+
+// #828 P2：已登录时切换器顺手回写 PATCH /api/me/locale（失败静默）；未登录不发。
+describe('LocaleSwitch · #828 回写账号语言', () => {
+  function mountWithAuth(loggedIn: boolean): VueWrapper {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const auth = useAuthStore();
+    auth.user = loggedIn
+      ? { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local' }
+      : null;
+    return mount(LocaleSwitch, { global: { plugins: [pinia, i18n] } });
+  }
+
+  function stubFetch(responder: () => Response) {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      calls.push({ url, init });
+      return responder();
+    }));
+    return calls;
+  }
+
+  it('已登录点 English ⇒ 发一次 PATCH /api/me/locale，body {"locale":"en"}', async () => {
+    const calls = stubFetch(() => new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    const w = mountWithAuth(true);
+    await pick(w, 'English');
+    await flushPromises();
+    const patch = calls.filter((c) => c.url === '/api/me/locale');
+    expect(patch).toHaveLength(1);
+    expect(patch[0].init?.method).toBe('PATCH');
+    expect(JSON.parse(String(patch[0].init?.body))).toEqual({ locale: 'en' });
+  });
+
+  it('回写返回 500 ⇒ 切换仍生效、不弹红条', async () => {
+    stubFetch(() => new Response(JSON.stringify({ error: { code: 'x', message: 'boom' } }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }));
+    const w = mountWithAuth(true);
+    await pick(w, 'English');
+    await flushPromises();
+    expect(i18n.global.locale.value).toBe('en'); // 界面已切过去
+    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
+    expect(w.find('button').text()).toContain('English');
+    expect(w.find('[role="alert"]').exists()).toBe(false); // 不弹红条
+  });
+
+  it('未登录点 English ⇒ 一个请求都不发（切换仍只落 cookie+localStorage）', async () => {
+    const calls = stubFetch(() => new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    const w = mountWithAuth(false);
+    await pick(w, 'English');
+    await flushPromises();
+    expect(calls).toHaveLength(0);
+    expect(i18n.global.locale.value).toBe('en'); // 本地切换照常生效
+    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
   });
 });
