@@ -354,11 +354,11 @@ test('#387 源码级哨兵：配对必须发生在喂投影**之前**，且不�
   const attachAt = body.search(/attachToolResultsToRecords\s*\(/);
   const projectAt = body.search(/projectTranscriptForDisplay\s*\(/);
   assert.ok(attachAt >= 0 && projectAt >= 0 && attachAt < projectAt,
-    '必须先把结果挂回记录、再喂上游投影（顺序反了等于没挂）');
+    '必须先把结果挂回记录、再喂本仓投影（`portal/src/display-projection.js`，来源见文件头）（顺序反了等于没挂）');
   assert.ok(body.includes('WHERE transcript_key = $1 AND round BETWEEN $2 AND $3'),
     '取行范围仍是 range 本体：不许为了配对把 WHERE 放宽到 range 之外（反向对照判据的根）');
   assert.doesNotMatch(body, /resultPreview\s*[:=]/,
-    '本站不得自己写 `resultPreview`（预览/截断的尺只在上游，写第二把必漂）');
+    '本站不得自己写 `resultPreview`（预览/截断的尺只在本仓 `portal/src/display-projection.js`，来源见文件头；这是防第二个写 `resultPreview` 处，写第二把必漂）');
 
   const helperAt = src.indexOf('function attachToolResultsToRecords');
   assert.ok(helperAt > 0, '挂回的实现要在（改名要同步本哨兵）');

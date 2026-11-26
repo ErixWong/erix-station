@@ -78,9 +78,13 @@ test('判据 ③：随包契约套件的接入面在册（升级时不会漏跑�
     '0.20.0 新增的 toolResultEnvelopeContract 必须被接进我们自己的测试面');
   assert.match(envelope, /toolResultEnvelopeContract\('station-runner',\s*async \(\) => import\('erix-agent'\)\)/,
     '必须把**我们的**引擎入口命名空间交给套件（不是只 import 不用）');
-  // 已接的两套仍在（engine-api / file-tools / transcript-store）
+  // 已接的随包套件仍在（file-tools / transcript-store）。
+  // #812：engine-api 那格已从登记册移除——显示投影 `projectTranscriptForDisplay` 搬进本仓
+  // `portal/src/display-projection.js` 后，`engineApiContract` 不再被本站接入：原
+  // engine-api-contract.test.js 改写为**内联判据**的 engine-api-surface.test.js（只留我们仍在
+  // 消费的 appendUserTurn 预写格，逐字抄上游契约，不 import contract-tests）。这是有意替换、
+  // 不是漏跑：appendUserTurn 的预写判据仍在 engine-api-surface.test.js 里跑着。
   for (const [file, name] of [
-    ['portal/test/engine-api-contract.test.js', 'engineApiContract'],
     ['runner/test/file-tools-contract.test.js', 'fileToolsContract'],
     ['runner/test/store-contract.test.js', 'transcriptStoreContract'],
   ]) {

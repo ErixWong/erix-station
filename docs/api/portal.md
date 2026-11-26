@@ -1331,7 +1331,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 **对话流 DTO 的 `messages[]` 展示字段（`GET /api/sessions/:id`）**
 
 助手锚点上除宿主元数据（`id`/`run_id`/`seq`/`role`/`content`/`synthetic`/`attachments`/`created_at`）外，
-还挂上游官方投影 `projectTranscriptForDisplay` 的展示字段（issue #188/#189：**逐字、原名透传，有则出现、
+还挂本仓投影 `projectTranscriptForDisplay`（`portal/src/display-projection.js`，来源见文件头）的展示字段（issue #188/#189：**逐字、原名透传，有则出现、
 无则不写该键**）：`toolCalls[]`、`reasoning`、`blocks`、`turnKeys`、`folded`。
 
 | 字段 | 来源 | 口径 |
@@ -1723,7 +1723,7 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 
 折叠横幅上「查看原文」的只读懒加载端点。鉴权同 `GET /api/sessions/:id`（非属主/不存在一律 `404 not_found`，不泄露存在性）；`:round` 是**折叠行自己的 round**（不是 `foldedRoundRange.to`）。
 
-**200 响应**（`turns` 一律走同一个上游投影 `projectTranscriptForDisplay`，不另造折叠渲染，#95 红线）：
+**200 响应**（`turns` 一律走同一个本仓投影 `projectTranscriptForDisplay`（`portal/src/display-projection.js`，来源见文件头），不另造折叠渲染，#95 红线）：
 
 ```json
 { "round": 137, "turns": [ … ], "source": "rebuilt", "truncated": true, "dropped_messages": 317 }
@@ -1737,9 +1737,9 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 | `truncated` | 布尔位（**不塞省略号文本**，截断标记由前端出，先例同 §4.4a-1）。重建行数超 `FOLDED_REBUILD_MAX_ROWS = 2000`（与 U7 recall 同尺）**或**归档被上游夹断 ⇒ `true` |
 | `dropped_messages` | 上游夹断丢掉的条数（取 `record.foldedPayloadMeta.droppedMessages`）；无则 `0` |
 
-**`turns[].toolCalls[].resultPreview` 的配对口径（#387）**：重建路（`source:'rebuilt'`）在喂上游投影**之前**，
+**`turns[].toolCalls[].resultPreview` 的配对口径（#387）**：重建路（`source:'rebuilt'`）在喂本仓投影**之前**，
 先把本 range 内各行的 `tool_result` 按 `tool_use_id` 挂回带 `tool_use` 的那条记录（`portal/src/sessions.js#attachToolResultsToRecords`，
-**纯读侧**：不改 `rows`、不动账本、不改上游 `projectTranscriptForDisplay`）。于是 `toolCalls[]` 上的
+**纯读侧**：不改 `rows`、不动账本、不改本仓投影 `projectTranscriptForDisplay`（`portal/src/display-projection.js`，来源见文件头））。于是 `toolCalls[]` 上的
 `resultPreview` / `isError` / `executionStatus` / `durationMs` **与主消息流同一个来源**（预览长度与截断规则全在上游，
 宿主不复制第二把尺，#95 红线）。为什么必须挂：0.23+ 账本一轮是多行（`:msg:<n>:0` = assistant 的 `tool_use`、
 `:msg:<n>:1..k` = 每个 `tool_result` 各一行、载体行 `messages` 为空），而上游的配对**只扫本条记录的 `messages`**
@@ -1862,7 +1862,7 @@ GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
 
 > 为什么要有这个参数而不是让前端自己读账本：面板每 2 s 一轮，前端逐个拉账本端点 = N 个请求 × 每次全量折叠投影（`foldLedgerRecords` → `projectTranscriptForDisplay`）；服务端一次 join + `stat` 缓存能把稳态成本压到「N 次 `stat` + 每 2 s 一条 SQL」。
 
-`messages[]` 是**与主对话同形**的 turn：上游 `projectTranscriptForDisplay` 的输出（`role`/`text`/`blocks`/`toolCalls`/`reasoning`/`round`/`ts`/`key`/`meta` 逐字透传，#95 红线）上叠四个宿主字段 `id`（`<childRunId>:<全量下标>`）/ `seq`（全量下标，所以向前翻页时同一条消息的 id 不漂移）/ `run_id`（= `childRunId`）/ `created_at`。⚠ `created_at` 是**轮行落盘时刻**（投影的 `ts` 读的是载体行），不是消息成型时刻，只当轮级时间戳用。
+`messages[]` 是**与主对话同形**的 turn：本仓投影 `projectTranscriptForDisplay`（`portal/src/display-projection.js`，来源见文件头）的输出（`role`/`text`/`blocks`/`toolCalls`/`reasoning`/`round`/`ts`/`key`/`meta` 逐字透传，#95 红线）上叠四个宿主字段 `id`（`<childRunId>:<全量下标>`）/ `seq`（全量下标，所以向前翻页时同一条消息的 id 不漂移）/ `run_id`（= `childRunId`）/ `created_at`。⚠ `created_at` 是**轮行落盘时刻**（投影的 `ts` 读的是载体行），不是消息成型时刻，只当轮级时间戳用。
 
 **折叠与切尾的顺序（不得改）**：读全量行 → `portal/src/transcript-fold.js#foldLedgerRecords` → `projectTranscriptForDisplay` → **才** `slice(-tail)`。在原始行上切会把一轮切成半轮（`:msg:<round>:<seq>` 分片行与它的载体行分散在切界两侧），折叠拿到缺片的一轮 ⇒ 工具结果配不上对（#337 的老病根）。⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 的导出面**（实测 `undefined`，深引被包 `exports` 挡），所以用的是本站镜像——它正是 `runner/lib/store.js#load` 用的同一份口径（两份 `SHARED-FOLD-CORE` 逐字节对拍），也是上游读侧的**超集**（多一道 `partOf` 解链闸）。本站两条入口共用同一份 `planFold`：`session-view.js` 走 `foldTranscriptRows`（DB 行）、这里走 `foldLedgerRecords`（文件记录），不是两套规则。
 
