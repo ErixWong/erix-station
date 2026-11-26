@@ -153,6 +153,14 @@ export const en = {
     // shared by the bar, the panel rows and the rail tip, so they are not translated per surface.
     foldBar: {
       summary: '🗜 Folded {rounds} rounds · {headline}',
+      // No readable headline (or the headline is the range itself) ⇒ this one: `{rounds}` and the range
+      // are usually the same number, so joining them reads as a duplicate (#816②).
+      summaryBare: '🗜 Folded {rounds} rounds',
+      // Range wording (#816①: lib returns structure only; wording lives here).
+      range: 'rounds {from}–{to}',
+      rangeSingle: 'round {to}',
+      rangeTail: 'through round {to}',
+      rangeUnknown: 'earlier rounds',
       panelTitle: 'All folds ({count})',
       truncated: '(summary clipped)',
       railAria: 'Fold positions (click to expand details)',

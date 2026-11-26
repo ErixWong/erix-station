@@ -732,14 +732,33 @@ describe('WorkbenchView · 折叠常驻条 / 展开面板 / 右侧竖串（issue
     expect(wrapper.find('[data-test="fold-rail"]').exists()).toBe(false);
   });
 
-  it('有折叠 ⇒ 常驻条出现，文案是「已折叠 N 轮 · 最新那条的 headline」（mechanical 只给范围）', async () => {
+  it('有折叠 ⇒ 常驻条出现；最新那条没有可读标题 ⇒ 只说「已折叠 N 轮」，不再把范围重念一遍（#816②）', async () => {
     const { wrapper } = await mountWithFolds();
-    // 最新一条是 semantic `## 阶段`（剥完 2 字 ⇒ 退回范围，这是预期口径）
+    // 真机 bug：`🗜 Folded 22 rounds · 第 22 轮` —— `22 rounds` 与范围说的是同一件事。
+    // 末条是 semantic `## 阶段`（剥完 2 字 ⇒ foldHeadline 给 null）⇒ 走 summaryBare。
     const bar = wrapper.get('[data-test="fold-bar"]').text();
-    expect(bar).toContain('🗜 已折叠 21 轮 · 第 18–21 轮'); // 末条是 semantic `## 阶段`（剥完 2 字 ⇒ 退回范围）
+    expect(wrapper.get('[data-test="fold-bar-text"]').text()).toBe('🗜 已折叠 21 轮');
+    expect(bar).not.toContain('·'); // 去重：没有可说的标题就不拼「 · …」
+    expect(bar).not.toContain('第 18–21 轮');
     expect(bar).toContain('▸'); // 收起态的箭头（展开后换 ▾）
     expect(bar).not.toContain('已折叠。'); // mechanical 的模板句不在这行里
     expect(wrapper.get('[data-test="fold-bar"]').attributes('aria-expanded')).toBe('false');
+  });
+
+  it('常驻条：最新那条**有**可读标题 ⇒ 才拼「 · {headline}」（summary 带 {headline} 的分支不是死代码）', async () => {
+    const { wrapper } = await mountWithFolds([
+      { round: 24, from: 22, to: 22, rounds: 1, origin: 'semantic', title: '## 调研 store 层与投影边界' },
+    ]);
+    expect(wrapper.get('[data-test="fold-bar-text"]').text()).toBe('🗜 已折叠 22 轮 · 调研 store 层与投影边界');
+  });
+
+  it('常驻条去重的第二道闸：标题正好与范围同字 ⇒ 也不拼第二遍，面板行也不画 headline', async () => {
+    const { wrapper } = await mountWithFolds([
+      { round: 21, from: 18, to: 21, rounds: 4, origin: 'semantic', title: '第 18–21 轮' },
+    ]);
+    expect(wrapper.get('[data-test="fold-bar-text"]').text()).toBe('🗜 已折叠 21 轮');
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    expect(wrapper.find('[data-test="fold-row-headline"]').exists()).toBe(false);
   });
 
   it('点常驻条 ⇒ 面板展开、行数 = 折叠数；再点收起（面板整个从 DOM 摘掉）', async () => {
@@ -838,5 +857,50 @@ describe('WorkbenchView · 折叠常驻条 / 展开面板 / 右侧竖串（issue
     store.sessionId = 's2';
     await flushPromises();
     expect(wrapper.find('[data-test="fold-panel"]').exists()).toBe(false);
+  });
+
+  // ---- #816①：范围文本来自 i18n，不是 lib 里的中文字面量（真机 `html lang=en` 下拼出了中英混排）----
+  /** 中日韩汉字 + 全角标点（后端**数据**里的中文 title 不在断言范围内，所以它只用在固定几格上）。 */
+  const CJK = /[\u3400-\u9fff\u3000-\u303f\uff01-\uff60]/;
+
+  it('en 语言下范围 / 常驻条 / 面板 / 竖串卡不得出现中文（以前是 `Folded 22 rounds · 第 22 轮`）', async () => {
+    const { wrapper } = await mountWithFolds();
+    await switchToEnglish(wrapper);
+    expect(document.documentElement.lang).toBe('en');
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    // 常驻条：英文外壳 + 去重（末条无标题 ⇒ 不拼范围）
+    const barText = wrapper.get('[data-test="fold-bar-text"]').text();
+    expect(barText).toBe('🗜 Folded 21 rounds');
+    expect(barText).not.toMatch(CJK);
+    // 面板：标题行 / 四行范围 / 夹断标注全英文
+    expect(wrapper.get('[data-test="fold-panel"]').text()).toContain('All folds (4)');
+    expect(wrapper.findAll('[data-test="fold-row-range"]').map((row) => row.text()))
+      .toEqual(['rounds 1–6', 'rounds 7–12', 'rounds 13–17', 'rounds 18–21']);
+    expect(wrapper.findAll('[data-test="fold-row-truncated"]').at(-1)!.text()).toBe('(summary clipped)');
+    // 竖串卡（mechanical 那张只有范围 + 足迹 ⇒ 整张卡不得带一个中文字）
+    const tip = wrapper.findAll('[data-test="fold-tip"]')[0];
+    expect(tip.text()).toContain('rounds 1–6');
+    expect(tip.text()).not.toMatch(CJK);
+    // 唯一允许出现中文的地方 = 后端数据本身（semantic 的中文 title 当 headline）
+    expect(wrapper.findAll('[data-test="fold-row-headline"]')[0].text()).toBe('调研 store 层与投影边界');
+  });
+
+  it('en：single / tail / unknown 三种范围各有英文写法（单轮不写 `rounds 22–22`）', async () => {
+    const { wrapper } = await mountWithFolds([
+      { from: 22, to: 22 }, { to: 12 } as FoldEntry, {} as FoldEntry,
+    ]);
+    await switchToEnglish(wrapper);
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    expect(wrapper.findAll('[data-test="fold-row-range"]').map((row) => row.text()))
+      .toEqual(['round 22', 'through round 12', 'earlier rounds']);
+  });
+
+  it('zh：同三种范围仍是原来的中文写法（文案搬进 i18n 后零漂移）', async () => {
+    const { wrapper } = await mountWithFolds([
+      { from: 22, to: 22 }, { to: 12 } as FoldEntry, {} as FoldEntry,
+    ]);
+    await wrapper.get('[data-test="fold-bar"]').trigger('click');
+    expect(wrapper.findAll('[data-test="fold-row-range"]').map((row) => row.text()))
+      .toEqual(['第 22 轮', '到第 12 轮', '更早的轮次']);
   });
 });

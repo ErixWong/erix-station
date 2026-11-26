@@ -52,7 +52,7 @@ const ORIGINS: readonly string[] = ['mechanical', 'semantic', 'host'];
 /**
  * `mechanical`（机械折叠）**不显示 title** 的口径：实测它的 title 是把范围又念一遍的模板句
  * （`早期第 1–1 轮（共 1 轮）已折叠。工具足迹：无。需要原文请重读文件…`），信息量 = 范围本身，
- * 摆在常驻条上只是把「第 1 轮」重复第三次 ⇒ 直接返回范围（见 `foldHeadline`）。
+ * 摆在常驻条上只是把「第 1 轮」重复第三次 ⇒ 直接返回 `null`（视图层退回范围，见 `foldHeadline`）。
  */
 const HEADLINE_MIN_CHARS = 6;
 
@@ -127,34 +127,52 @@ export function normalizeSessionFolds(raw: unknown): FoldEntry[] {
 }
 
 /**
- * 折叠范围的**唯一**写法：`第 7–12 轮`；单轮折叠（`from === to`）写 `第 22 轮`（不写 `第 22–22 轮`）；
- * 只有 `to`（手搓的窄对象、或将来后端只给一头）写 `到第 12 轮`；两头都不知道写 `更早的轮次`。
+ * 折叠范围的**结构**（不是文本！）：`range` = 区间、`single` = 单轮（`from === to`）、`tail` = 只有上界、
+ * `unknown` = 两头都不知道。
  *
- * ⚠ 这是**数据派生串**、不是界面外壳文案（外壳文案在 i18n `workbench.foldBar.*`）：它是折叠的**身份**，
- * 常驻条 / 面板行 / 竖串卡三处必须是同一个字符串，否则同一折叠在三个位置有三种写法。
+ * ⚠ **为什么这里不给字符串**（真机 e2e 抓到的缺陷 #816①）：`html lang = en` 时常驻条曾渲染成
+ * `Folded 22 rounds · 第 22 轮` —— lib 里硬编码中文把 i18n 绕过去了。范围是折叠的**身份**，
+ * 但它是**界面要说的内容**，措辞属于 i18n（`workbench.foldBar.range*`）⇒ lib 只出结构，
+ * 渲染在视图层（`WorkbenchView#rangeText`）。常驻条 / 面板行 / 竖串卡三处必须走同一个 `rangeText`。
  */
-export function foldRangeLabel(fold: FoldEntry): string {
+export type FoldRange =
+  | { kind: 'range'; from: number; to: number }
+  | { kind: 'single'; to: number }
+  | { kind: 'tail'; to: number }
+  | { kind: 'unknown' };
+
+/**
+ * 折叠范围的**唯一**口径（形状见 {@link FoldRange}）：两头相等 ⇒ `single`（不是 `range`，界面据此不写
+ * `rounds 22–22`）；两头不等 ⇒ `range`；只有 `to`（手搓窄对象 / 将来后端只给一头）⇒ `tail`；
+ * 都没有 ⇒ `unknown`（脏值同样当「不知道」，不编造范围）。视图层拿 `kind` 去挑 i18n 键，
+ * lib 里不出现任何自然语言。
+ */
+export function foldRange(fold: FoldEntry): FoldRange {
   const from = safeInt(fold.from);
   const to = safeInt(fold.to);
-  if (from !== null && to !== null) return from === to ? `第 ${to} 轮` : `第 ${from}–${to} 轮`;
-  if (to !== null) return `到第 ${to} 轮`;
-  return '更早的轮次';
+  if (from !== null && to !== null) return from === to ? { kind: 'single', to } : { kind: 'range', from, to };
+  if (to !== null) return { kind: 'tail', to };
+  return { kind: 'unknown' };
 }
 
 /**
  * 一行里「这条折叠讲了什么」的那半句 —— **按 `origin` 分派，不许简化**（工单 #816 的核心口径）：
  *
- * * `mechanical`：**不显示 title**（它的 title 是把范围又念一遍的模板句）⇒ 返回范围；
+ * * `mechanical`：**不显示 title**（它的 title 是把范围又念一遍的模板句）⇒ 返回 `null`；
  * * `semantic`：用 title，但先剥前导 markdown 标题符号与首尾空白；剥完不足 6 字、或只剩 `#`/空白
- *   ⇒ 那是个没信息量的标题，退回范围（实测样本 `## 阶段` ⇒ 剥完 2 字 ⇒ 退回范围，**这是预期行为**）；
- * * `origin` 缺席（旧后端只给 title）：与 `semantic` 同分支（有 title 用 title，没有就范围）。
+ *   ⇒ 那是个没信息量的标题，返回 `null`（实测样本 `## 阶段` ⇒ 剥完 2 字 ⇒ `null`，**这是预期行为**）；
+ * * `origin` 缺席（旧后端只给 title）：与 `semantic` 同分支（有 title 用 title，没有就 `null`）。
+ *
+ * ⚠ `null` 的语义是**「没有可读标题，渲染范围」**，不是空串（真机 e2e 缺陷 #816②：以前「退回范围」
+ * 返的是中文范围串，于是常驻条拼出 `Folded 22 rounds · 第 22 轮` —— 同一件事说两遍，还串了语言）。
+ * 视图层据此 `headline ?? rangeText(fold)`，并**只在 headline 非空且与范围不同**时才拼 ` · {headline}`。
  */
-export function foldHeadline(fold: FoldEntry): string {
-  if (fold.origin === 'mechanical') return foldRangeLabel(fold);
+export function foldHeadline(fold: FoldEntry): string | null {
+  if (fold.origin === 'mechanical') return null;
   const title = cleanText(fold.title) ?? '';
   const heading = title.replace(MD_HEADING_PREFIX, '').trim();
   // 「只剩 #/空白」单独判一条：长度闸门可能被七个 `#` 骗过（`#######`.length === 7）。
-  if (heading.length < HEADLINE_MIN_CHARS || !/[^#\s]/.test(heading)) return foldRangeLabel(fold);
+  if (heading.length < HEADLINE_MIN_CHARS || !/[^#\s]/.test(heading)) return null;
   return heading;
 }
 

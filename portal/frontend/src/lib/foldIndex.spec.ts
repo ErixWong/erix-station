@@ -1,13 +1,16 @@
 // #816 第③步：`session.folds` 的前端读侧纯函数（`lib/foldIndex.ts`）。
 // 四组口径钉死在这里：① 脏值一律丢（绝不补 0/空串）；② `foldHeadline` 按 origin 分派
-// （mechanical 不显示 title、semantic 剥 `## ` 后太短要退回范围）；③ 足迹聚合与 3 组上限；
+// （mechanical 不显示 title、semantic 剥 `## ` 后太短要退 `null`）；③ 足迹聚合与 3 组上限；
 // ④ 竖串定位是纯数学 `to / max(lastRound, maxTo)`（没有任何 DOM 可量，所以用例只喂数字）。
+// 另钉一条真机 e2e 抓到的口径（#816①）：`foldRange` 只出**结构**，lib 里一个自然语言字都不打
+// （硬编码中文在 `html lang=en` 下拼出过 `Folded 22 rounds · 第 22 轮`）；渲染文本的断言搬到
+// `WorkbenchView.spec.ts`（中英各一条，钉「en 下不得出现中文」。
 import { describe, expect, it } from 'vitest';
 import {
   foldFootprint,
   foldHeadline,
   foldRailNodes,
-  foldRangeLabel,
+  foldRange,
   normalizeSessionFolds,
   type FoldEntry,
 } from './foldIndex';
@@ -95,31 +98,57 @@ describe('#816 normalizeSessionFolds：DTO 收窄（脏值一律丢，绝不补 
   });
 });
 
-describe('#816 foldRangeLabel：范围是折叠的身份，三处（常驻条/面板/竖串卡）共用一种写法', () => {
-  it('区间 / 单轮 / 只有 to / 两头都缺，四种写法各一条', () => {
-    expect(foldRangeLabel({ from: 7, to: 12 })).toBe('第 7–12 轮');
-    expect(foldRangeLabel({ from: 22, to: 22 })).toBe('第 22 轮'); // 不写「第 22–22 轮」
-    expect(foldRangeLabel({ from: 1, to: 1 })).toBe('第 1 轮');
-    expect(foldRangeLabel({ to: 12 } as FoldEntry)).toBe('到第 12 轮'); // 只有 to（手搓窄对象 / 将来只给一头）
-    expect(foldRangeLabel({} as FoldEntry)).toBe('更早的轮次'); // 两头都不知道
+describe('#816 foldRange：范围是折叠的身份，只出结构（措辞在 i18n，不在 lib）', () => {
+  it('区间 / 单轮 / 只有 to / 两头都缺，四种 kind 各一条（e2e #816①：lib 里不得有中文）', () => {
+    expect(foldRange({ from: 7, to: 12 })).toEqual({ kind: 'range', from: 7, to: 12 });
+    // 单轮折叠 ⇒ single（不给 `range: 22–22`，否则界面写出「第 22–22 轮 / rounds 22–22」）
+    expect(foldRange({ from: 22, to: 22 })).toEqual({ kind: 'single', to: 22 });
+    expect(foldRange({ from: 1, to: 1 })).toEqual({ kind: 'single', to: 1 });
+    // 只有 to（手搓窄对象 / 将来后端只给一头）
+    expect(foldRange({ to: 12 } as FoldEntry)).toEqual({ kind: 'tail', to: 12 });
+    expect(foldRange({} as FoldEntry)).toEqual({ kind: 'unknown' }); // 两头都不知道
+  });
+
+  it('lib 不碰自然语言：四种返回的 JSON 里一个 CJK 字都没有（常驻条才能跟着 `html lang` 走）', () => {
+    const dumps = [
+      JSON.stringify(foldRange({ from: 1, to: 6 })),
+      JSON.stringify(foldRange({ from: 22, to: 22 })),
+      JSON.stringify(foldRange({ to: 12 } as FoldEntry)),
+      JSON.stringify(foldRange({} as FoldEntry)),
+      JSON.stringify(foldRange(MECHANICAL)), // 它的 title 满是中文，也不得泄漏进结构
+    ];
+    for (const dump of dumps) expect(dump, dump).not.toMatch(/[\u3400-\u9fff\uf900-\ufaff]/);
+    expect(dumps).toEqual([
+      '{"kind":"range","from":1,"to":6}',
+      '{"kind":"single","to":22}',
+      '{"kind":"tail","to":12}',
+      '{"kind":"unknown"}',
+      '{"kind":"range","from":1,"to":6}',
+    ]);
+  });
+
+  it('脏两头 ⇒ 不编造范围：NaN / 浮点 / 字符串都当「不知道」（只剩 to ⇒ tail）', () => {
+    expect(foldRange({ from: Number.NaN, to: 6 } as FoldEntry)).toEqual({ kind: 'tail', to: 6 });
+    expect(foldRange({ from: 1.5, to: 6.5 } as FoldEntry)).toEqual({ kind: 'unknown' });
+    expect(foldRange({ from: '1', to: '6' } as unknown as FoldEntry)).toEqual({ kind: 'unknown' });
+    expect(foldRange({ from: 3, to: Number.NaN } as FoldEntry)).toEqual({ kind: 'unknown' });
   });
 });
 
 describe('#816 foldHeadline：按 origin 分派（这是本单的核心口径，不许简化）', () => {
-  it('mechanical ⇒ 返回范围，且**不含** title 原文（实测它的 title 是把范围又念一遍的模板句）', () => {
-    const label = foldHeadline(MECHANICAL);
-    expect(label).toBe('第 1–6 轮');
-    expect(label).not.toContain('已折叠');
-    expect(label).not.toContain('工具足迹');
-    expect(label).not.toContain(MECHANICAL.title!);
+  it('mechanical ⇒ **null**（视图层自己画范围），且**不是** title 原文、也不是任何中文串', () => {
+    const headline = foldHeadline(MECHANICAL);
+    expect(headline).toBeNull(); // 缺陷 #816②：以前这里返回范围串 ⇒ 常驻条拼出重复的一句
+    expect(headline).not.toBe(MECHANICAL.title);
+    expect(String(headline)).not.toMatch(/[\u3400-\u9fff]/); // 不得返中文
   });
 
-  it('semantic 剥 `## ` 前缀；剥完不足 6 字 ⇒ 退回范围（`## 阶段` 是实测样本，退回是预期行为）', () => {
-    expect(foldHeadline({ from: 22, to: 22, origin: 'semantic', title: '## 阶段' })).toBe('第 22 轮');
-    expect(foldHeadline({ from: 22, to: 22, origin: 'semantic', title: '  ###  收尾  ' })).toBe('第 22 轮');
-    expect(foldHeadline({ from: 1, to: 2, origin: 'semantic', title: '阶段' })).toBe('第 1–2 轮');
-    // 闸门就在 6 字上：5 字退回范围、6 字过闸
-    expect(foldHeadline({ from: 1, to: 2, origin: 'semantic', title: '调研边界定' })).toBe('第 1–2 轮');
+  it('semantic 剥 `## ` 前缀；剥完不足 6 字 ⇒ null（`## 阶段` 是实测样本，退 null 是预期行为）', () => {
+    expect(foldHeadline({ from: 22, to: 22, origin: 'semantic', title: '## 阶段' })).toBeNull();
+    expect(foldHeadline({ from: 22, to: 22, origin: 'semantic', title: '  ###  收尾  ' })).toBeNull();
+    expect(foldHeadline({ from: 1, to: 2, origin: 'semantic', title: '阶段' })).toBeNull();
+    // 闸门就在 6 字上：5 字退 null、6 字过闸
+    expect(foldHeadline({ from: 1, to: 2, origin: 'semantic', title: '调研边界定' })).toBeNull();
     expect(foldHeadline({ from: 1, to: 2, origin: 'semantic', title: '调研边界已定' })).toBe('调研边界已定');
   });
 
@@ -130,11 +159,11 @@ describe('#816 foldHeadline：按 origin 分派（这是本单的核心口径，
       .toBe('没有前缀的普通标题');
   });
 
-  it('origin 缺席（旧后端只给 title）⇒ 同 semantic 分支；title 也没有 ⇒ 范围', () => {
+  it('origin 缺席（旧后端只给 title）⇒ 同 semantic 分支；title 也没有 ⇒ null（没标题可说，范围是视图层的事）', () => {
     expect(foldHeadline({ from: 4, to: 9, title: '接入鉴权与配额' })).toBe('接入鉴权与配额');
-    expect(foldHeadline({ from: 4, to: 9 })).toBe('第 4–9 轮');
+    expect(foldHeadline({ from: 4, to: 9 })).toBeNull();
     // 整串只有 `#`：长度过了 6 的闸也不能当标题
-    expect(foldHeadline({ from: 4, to: 9, title: '#######' })).toBe('第 4–9 轮');
+    expect(foldHeadline({ from: 4, to: 9, title: '#######' })).toBeNull();
   });
 });
 

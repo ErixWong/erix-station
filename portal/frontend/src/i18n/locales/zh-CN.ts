@@ -159,6 +159,13 @@ export const zhCN = {
     // 而「第 7–12 轮」与标题那半句是**数据派生串**（lib/foldIndex：常驻条/面板/竖串卡三处共用同一个写法）。
     foldBar: {
       summary: '🗜 已折叠 {rounds} 轮 · {headline}',
+      // 没有可读标题（或标题与范围同字）时用这一条：`{rounds}` 与范围常常是同一个数字，拼起来就是重复（#816②）
+      summaryBare: '🗜 已折叠 {rounds} 轮',
+      // 范围文案（#816①：lib 只给结构，措辞在这里，否则 en 下会混排中文）
+      range: '第 {from}–{to} 轮',
+      rangeSingle: '第 {to} 轮',
+      rangeTail: '到第 {to} 轮',
+      rangeUnknown: '更早的轮次',
       panelTitle: '全部折叠（{count} 条）',
       truncated: '（摘要被夹断）',
       railAria: '折叠位置（点击展开明细）',

@@ -12,7 +12,7 @@ import { setWorkbenchHooks, useWorkbenchStore } from '../stores/workbench';
 import { setUserScopeResetListener } from '../lib/userScope';
 import { AUTO_FOLLOW_GAP } from '../lib/constants';
 // issue #816 第③⑥步：折叠呈现的派生全部在纯函数里（模板只塞插值；竖串定位是纯数学，不量 DOM）。
-import { foldFootprint, foldHeadline, foldRailNodes, foldRangeLabel } from '../lib/foldIndex';
+import { foldFootprint, foldHeadline, foldRange, foldRailNodes, type FoldEntry } from '../lib/foldIndex';
 import { useSidebarWidth, SIDEBAR_MAX, SIDEBAR_MIN } from '../composables/useSidebarWidth';
 import SidebarPanel from '../components/SidebarPanel.vue';
 import StreamPanel from '../components/StreamPanel.vue';
@@ -301,8 +301,38 @@ const foldPanelOpen = ref(false);
 const foldPanelEl = ref<HTMLElement | null>(null);
 watch(() => store.sessionId, () => { foldPanelOpen.value = false; });
 
-/** 常驻条那一半「讲了什么」；无折叠 ⇒ 空串（整条本来就不渲染）。 */
-const foldBarHeadline = computed(() => (store.latestFold ? foldHeadline(store.latestFold) : ''));
+/**
+ * 范围文本（**渲染层**，缺陷 #816①）：lib 只给结构（`foldRange`），措辞在 i18n `workbench.foldBar.range*`。
+ * 硬编码中文在 `html lang=en` 下会拼出 `Folded 22 rounds · 第 22 轮`（真机实测）。
+ * 常驻条 / 面板行 / 竖串卡三处共用本函数 ⇒ 同一折叠在三个位置仍是同一个写法（身份不变量）。
+ */
+function rangeText(fold: FoldEntry): string {
+  const range = foldRange(fold);
+  if (range.kind === 'range') return t('workbench.foldBar.range', { from: range.from, to: range.to });
+  if (range.kind === 'single') return t('workbench.foldBar.rangeSingle', { to: range.to });
+  if (range.kind === 'tail') return t('workbench.foldBar.rangeTail', { to: range.to });
+  return t('workbench.foldBar.rangeUnknown');
+}
+
+/**
+ * 那一行「讲了什么」的那半句，**已与范围去重**：`foldHeadline` 给 `null`（没有可读标题）或给出的标题
+ * 正好与范围文本同字 ⇒ `null`，调用方只渲染范围（缺陷 #816②：`Folded 22 rounds · 第 22 轮` 把同一件事
+ * 说了两遍）。 */
+function headlineText(fold: FoldEntry): string | null {
+  const headline = foldHeadline(fold);
+  return headline !== null && headline !== rangeText(fold) ? headline : null;
+}
+
+/**
+ * 常驻条全文：有**与范围不同**的 headline 才拼 ` · {headline}`，否则用 `summaryBare`（#816②）。
+ * `rounds` 是「已折叠总轮数」，与最新那条的范围（如 `round 22`）常常是同一个数字 ⇒ 不重复。 */
+const foldBarText = computed(() => {
+  const rounds = store.foldedThroughRound ?? 0;
+  const latest = store.latestFold;
+  const headline = latest ? headlineText(latest) : null;
+  if (headline === null) return t('workbench.foldBar.summaryBare', { rounds });
+  return t('workbench.foldBar.summary', { rounds, headline });
+});
 
 /**
  * 竖串节点（`topPct` = `to / max(lastRound, maxTo)`，纯数学）。
@@ -445,14 +475,12 @@ function onFoldNodeClick(index: number): void {
           aria-controls="fold-panel"
           @click="foldPanelOpen = !foldPanelOpen"
         >
-          <span data-test="fold-bar-text" class="min-w-0 flex-1 truncate">{{ t('workbench.foldBar.summary', {
-            rounds: store.foldedThroughRound ?? 0,
-            headline: foldBarHeadline,
-          }) }}</span>
+          <span data-test="fold-bar-text" class="min-w-0 flex-1 truncate">{{ foldBarText }}</span>
           <span aria-hidden="true" class="shrink-0">{{ foldPanelOpen ? '▾' : '▸' }}</span>
         </button>
         <!-- issue #816 展开面板：紧贴常驻条下方，逐条列**全部**折叠（不受消息窗口限制）。
-             行内不出现 mechanical 折的 title——口径就是 `foldHeadline`（实测那是把范围又念一遍的模板句）。 -->
+             行内不出现 mechanical 折的 title——口径在 `foldHeadline`（实测那是把范围又念一遍的模板句），
+             去重与 i18n 渲染在 `headlineText` / `rangeText`（#816①②）。 -->
         <div
           v-if="foldPanelOpen && store.sessionFolds.length > 0"
           id="fold-panel"
@@ -467,12 +495,12 @@ function onFoldNodeClick(index: number): void {
             data-test="fold-row"
             class="flex items-baseline gap-2 py-0.5"
           >
-            <span data-test="fold-row-range" class="shrink-0 text-black/60">{{ foldRangeLabel(fold) }}</span>
+            <span data-test="fold-row-range" class="shrink-0 text-black/60">{{ rangeText(fold) }}</span>
             <span
-              v-if="foldHeadline(fold) !== foldRangeLabel(fold)"
+              v-if="headlineText(fold)"
               data-test="fold-row-headline"
               class="shrink-0"
-            >{{ foldHeadline(fold) }}</span>
+            >{{ headlineText(fold) }}</span>
             <span v-if="foldFootprint(fold)" data-test="fold-row-footprint" class="min-w-0 truncate text-black/40">{{ foldFootprint(fold) }}</span>
             <span v-if="fold.truncated" data-test="fold-row-truncated" class="shrink-0 text-black/40">{{ t('workbench.foldBar.truncated') }}</span>
           </div>
@@ -520,12 +548,12 @@ function onFoldNodeClick(index: number): void {
                 class="pointer-events-none absolute right-full z-10 hidden max-w-[240px] rounded-md border border-black/10 bg-white px-2 py-1 text-left text-xs shadow group-hover:block group-focus-visible:block"
                 :class="node.topPct < 25 ? 'top-0 mt-1' : 'bottom-0 mb-1'"
               >
-                <span class="block text-black/60">{{ foldRangeLabel(node.fold) }}</span>
+                <span class="block text-black/60">{{ rangeText(node.fold) }}</span>
                 <span
-                  v-if="foldHeadline(node.fold) !== foldRangeLabel(node.fold)"
+                  v-if="headlineText(node.fold)"
                   data-test="fold-tip-headline"
                   class="block"
-                >{{ foldHeadline(node.fold) }}</span>
+                >{{ headlineText(node.fold) }}</span>
                 <span v-if="foldFootprint(node.fold)" data-test="fold-tip-footprint" class="block text-black/50">{{ foldFootprint(node.fold) }}</span>
                 <span v-if="node.fold.truncated" data-test="fold-tip-truncated" class="block text-black/40">{{ t('workbench.foldBar.truncated') }}</span>
               </span>
