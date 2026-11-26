@@ -364,4 +364,21 @@ describe('AdminUsersView「周期 / 用量」列（mount + fetch 桩，issue #80
     expect(row.exists()).toBe(true);
     expect(row.findAll('td').length).toBe(10);
   });
+
+  // 周期短标签的**来源**判据：`spend` 按网关的 `budget_duration` 归零，所以标签也得跟它——
+  // DB 说「每月」而 key 实为 `1d` 时显示「日」；白名单外的周期（`7d` ⇒ 网关语义是「每周一」）
+  // 不许猜成日/月，走未知标签（猜错就是把一周的钱当成一个月的钱）。
+  it('⑥ 周期短标签跟网关 budget_duration：1d 压过 DB 的 1mo；白名单外走未知标签', async () => {
+    const w = await mountView(
+      [mkUser('frank', 'frank'), mkUser('gina', 'gina')],
+      { rows: [
+        mkRow('frank', { budget_period: '1mo', budget_duration: '1d', spend: 0.42, spend_scope: 'period' }),
+        mkRow('gina', { budget_period: '1mo', budget_duration: '7d', spend: 1.5, spend_scope: 'period' }),
+      ] },
+    );
+    const texts = w.findAll('[data-test="user-usage-period"]').map((c) => c.text());
+    expect(texts.some((x) => x.startsWith('日') && x.includes('$0.42'))).toBe(true);
+    expect(texts.some((x) => x.startsWith('?') && x.includes('$1.50'))).toBe(true);
+    expect(texts.some((x) => x.startsWith('月'))).toBe(false);
+  });
 });

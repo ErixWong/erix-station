@@ -1037,17 +1037,18 @@ describe('AdminView · FDE 用户', () => {
     expect(list.text()).toContain('alice');
     expect(list.findAll('[data-test="user-row"]')).toHaveLength(2);
     expect(list.text()).toContain('✓');
-    expect(list.findAll('thead th')).toHaveLength(9);
+    expect(list.findAll('thead th')).toHaveLength(10);
     expect(list.findAll('thead th')[6].text()).toBe('开户 / 下线');
-    // issue #497：第 8 列的语义从「最近登录」换成「最后活动」（列数与列宽都没动，仍是第 8 格）。
-    expect(list.findAll('thead th')).toHaveLength(9);
-    expect(list.findAll('thead th')[7].text()).toBe('最后活动');
+    // issue #497：第 9 列的语义从「最近登录」换成「最后活动」。
+    // issue #800：中间又插进了「周期 / 用量」⇒ 活动列从第 8 格挪到第 9 格（下标 8）。
+    expect(list.findAll('thead th')).toHaveLength(10);
+    expect(list.findAll('thead th')[8].text()).toBe('最后活动');
     const rows = list.findAll('[data-test="user-row"]');
-    expect(rows[0].findAll('td')).toHaveLength(9);
+    expect(rows[0].findAll('td')).toHaveLength(10);
     expect(rows[0].findAll('td')[6].text()).toContain('失败');
     expect(rows[0].findAll('td')[6].find('span').attributes('title')).toBe('Docker unavailable');
-    // —— 第 8 格（issue #497）：两行同格，值与顺序都由**精确等值**钉死（不是 toContain / not.toBe）——
-    const activityAlice = rows[0].findAll('td')[7];
+    // —— 第 9 格（issue #497）：两行同格，值与顺序都由**精确等值**钉死（不是 toContain / not.toBe）——
+    const activityAlice = rows[0].findAll('td')[8];
     const mainAlice = activityAlice.get('[data-test="user-activity-main"]').text();
     const subAlice = activityAlice.get('[data-test="user-login-sub"]').text();
     expect(mainAlice).toBe(new Date('2026-10-04T08:30:00.000Z').toLocaleString('zh-CN'));
@@ -1057,7 +1058,7 @@ describe('AdminView · FDE 用户', () => {
     // 副行是小字（「副行」是设计判据，不是随便两个 span）
     expect(activityAlice.get('[data-test="user-login-sub"]').attributes('class')).toContain('text-xs');
 
-    const activityBob = rows[1].findAll('td')[7];
+    const activityBob = rows[1].findAll('td')[8];
     expect(activityBob.get('[data-test="user-activity-main"]').text()).toBe('从未活动');
     expect(activityBob.find('[data-test="user-login-sub"]').exists()).toBe(false);
     // 红线：空值既不是「今天」也不是空串，而且**整格**就只有这两个字
@@ -1121,7 +1122,7 @@ describe('AdminView · FDE 用户', () => {
 
   // issue #497（迁移 0031）：「最后活动」与「最近登录」是两条时间线，管理台必须分得开。
   // 三格逐个钉（每格都是**可失败**的精确等值：改回旧实现、或把 null 渲染成「今天」/空串，都会红）。
-  it('issue #497：第 8 格两行——活动时刻、从未活动、以及「有登录但从未活动」的第三种形状', async () => {
+  it('issue #497：第 9 格（#800 插列后）两行——活动时刻、从未活动、以及「有登录但从未活动」的第三种形状', async () => {
     const zh = (iso: string) => new Date(iso).toLocaleString('zh-CN');
     const mk = (over: Record<string, unknown>) => ({
       id: `u-${String(over.login)}`, display_name: null, role: 'fde' as const, fde_name: null,
@@ -1143,7 +1144,7 @@ describe('AdminView · FDE 用户', () => {
     const cellOf = (login: string) => {
       const row = wrapper.findAll('[data-test="user-row"]').find((r) => r.get('td').text().includes(login));
       if (!row) throw new Error(`没有 ${login} 这一行（判据会空转）`);
-      return row.findAll('td')[7];
+      return row.findAll('td')[8];
     };
 
     // ① 说过话，而且**活动比登录新** ⇒ 两行都在，主行是活动、副行是登录

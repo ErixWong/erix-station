@@ -1779,6 +1779,7 @@ export const zhCN = {
       colPeriodUsage: '周期 / 用量',
       usagePeriodDay: '日',
       usagePeriodMonth: '月',
+      usagePeriodUnknown: '?',
       usageLifetimeShort: '累',
       usageTooltipUnknown: '没有可用的网关读数（无 active key，或网关不可达）',
       usageTooltipLifetime: '未设额度：{spend} 是建 key 以来累计，不随周期清零',

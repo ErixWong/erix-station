@@ -666,7 +666,15 @@ function usageCell(user: AdminUser): UsageCell {
     };
   }
   // period：周期短标签 + 金额；title 给已用/额度/下次重置全文（额度或重置缺失时该段不出现）。
-  const periodLabel = row.budget_period === '1d' ? t('admin.fde.usagePeriodDay') : t('admin.fde.usagePeriodMonth');
+  // 周期短标签以**网关的 `budget_duration`** 为准——`spend` 就是按它归零的，DB 的 `budget_period`
+  // 只在网关没说时兜底（两者不同步时，跟钱走不跟配置走）。白名单外的值（key 在门户之外被写成
+  // `30d`/`7d`/`1m` 之类，网关都收）**不许猜**成「日/月」——猜错就是把周读成月，走未知标签。
+  const cadence = row.budget_duration ?? row.budget_period ?? null;
+  const periodLabel = cadence === '1d'
+    ? t('admin.fde.usagePeriodDay')
+    : cadence === '1mo'
+      ? t('admin.fde.usagePeriodMonth')
+      : t('admin.fde.usagePeriodUnknown');
   const budgetText = row.max_budget != null ? fmtUsdCompact(row.max_budget) : null;
   const resetText = row.budget_reset_at ? formatLastLogin(row.budget_reset_at) : null;
   const title = budgetText != null && resetText != null
@@ -770,8 +778,9 @@ onBeforeUnmount(() => {
 
       <table v-else-if="admin.usersLoaded" data-test="user-table" class="w-full table-fixed text-left text-sm">
           <colgroup>
+            <!-- issue #800：新增「周期 / 用量」列（10 列，百分比总和必须 = 100）。 -->
             <col class="w-[11%]">
-            <col class="w-[13%]">
+            <col class="w-[12%]">
             <col class="w-[7%]">
             <col class="w-[11%]">
             <col class="w-[4%]">
@@ -881,7 +890,7 @@ onBeforeUnmount(() => {
                 <td class="truncate px-3 py-2.5">
                   <!-- issue #497（迁移 0031）：两行同格——主行是「最后活动」（最近一次用户输入），
                        副行小字是「登录于 …」。两条时间线各说各话，所以活动那一行**不**跟着登录变。
-                       列数与列宽一字没改（colgroup / th 仍是 9 格，本格仍是第 8 格）。 -->
+                       列序账：#800 在本格左边插了「周期 / 用量」⇒ 本格是第 9 格（colgroup / th 共 10 格）。 -->
                   <div class="flex flex-col">
                     <span
                       data-test="user-activity-main"

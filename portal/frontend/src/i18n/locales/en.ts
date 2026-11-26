@@ -1778,6 +1778,7 @@ export const en = {
       colPeriodUsage: 'Period / usage',
       usagePeriodDay: 'd',
       usagePeriodMonth: 'mo',
+      usagePeriodUnknown: '?',
       usageLifetimeShort: 'all',
       usageTooltipUnknown: 'No gateway reading (no active key, or gateway unreachable)',
       usageTooltipLifetime: 'No budget set: {spend} is lifetime spend, it never resets',
