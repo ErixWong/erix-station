@@ -621,6 +621,60 @@ describe('#814 系统页：补齐的趋势线、可见小标题与独立降级',
     const { wrapper } = await openSystem(withMetrics());
     expect(wrapper.findAll('[data-metric="disk-unknown-used"]').length).toBe(0);
   });
+
+  // 变异验证抓到的真缺口：把「缓存趋势」的取数从 `point.memCached` 改成 `point.memUsed` 后，
+  // 上面那些「线存在 + 有标题 + y 下界是 0 B」的用例全部照绿——也就是「标题写缓存、画的却是已用」
+  // 这类错放得过。下面逐条点名 y 轴上界标注：夹具里每一列的最大值互不相同，所以上界就是
+  // 「这条线取的是哪一列」的身份证。
+  it('#814 逐条点名每条趋势线取的是哪一列（y 轴上界标注；指错列必须红）', async () => {
+    const { wrapper } = await openSystem(withMetrics());
+    const yMax = (metric: string): string =>
+      wrapper.get(`[data-metric="${metric}"]`).find('[data-test="metric-chart-y-max"]').text();
+
+    expect(yMax('mem-used'), '已用趋势取 memUsed（夹具最大 40 GiB）').toBe('40 GiB');
+    expect(yMax('mem-available'), '可用趋势取 memAvailable（夹具最大 98 GiB）').toBe('98 GiB');
+    expect(yMax('mem-cached'), '缓存趋势取 memCached（12 GiB）而不是 memUsed（40 GiB）').toBe('12 GiB');
+    expect(yMax('mem-swap'), 'swap 趋势取 swapUsed（夹具最大 2 GiB）').toBe('2 GiB');
+    expect(yMax('load1'), '负载趋势取 load1（format-y 是 toFixed(2)）').toBe('5.26');
+    expect(yMax('containers-running'), '容器趋势取 containersRunning（无 format-y ⇒ 取整原样）').toBe('33');
+    expect(yMax('disk-/dev/nvme0n1p2-used'), '磁盘趋势取该设备的 usedBytes（最大 676 GiB，不是 totalBytes 937）').toBe('676 GiB');
+
+    const lineD = (metric: string): string =>
+      wrapper.get(`[data-metric="${metric}"]`).find('[data-test="metric-chart-line"]').attributes('d') ?? '';
+
+    // CPU 两条**不能**用上界区分：百分比的界已知 ⇒ 写死 0~100，不许跟着数据重标。
+    for (const id of ['cpu-avg', 'cpu-max']) {
+      const chart = wrapper.get(`[data-metric="${id}"]`);
+      expect(chart.find('[data-test="metric-chart-y-min"]').text(), `${id} 的 y 下界是写死的 0%`).toBe('0%');
+      expect(chart.find('[data-test="metric-chart-y-max"]').text(), `${id} 的 y 上界是写死的 100%`).toBe('100%');
+    }
+    // 界相同 ⇒ 只能比线本身：cpuAvg 与 cpuMax 是不同的列，指到同一列时 `d` 会一模一样。
+    expect(lineD('cpu-avg'), '均值线必须有内容').not.toBe('');
+    expect(lineD('cpu-max'), '峰值线必须有内容').not.toBe('');
+    expect(lineD('cpu-avg'), 'cpuAvg 与 cpuMax 是不同的列 ⇒ 两条线不许指到同一列').not.toBe(lineD('cpu-max'));
+  });
+
+  // 独立红线：服务端契约里 `null` 是「没读到」。某一列有值而其余列全 `null` 时，那一列的图
+  // 必须照画——不许因为别的列没读就把这条线判成没数（那会把「只缺几个列」说成「没历史」）。
+  it('#814 只有某一列有值 ⇒ 那一列仍要有线，其余列各自走空态（互不拖累）', async () => {
+    const { wrapper } = await openSystem(withMetrics({
+      series: {
+        ...METRICS.series,
+        points: METRICS.series.points.map((point) => ({
+          ...point,
+          cpuAvg: null, cpuMax: null, memUsed: null, memAvailable: null,
+          swapUsed: null, load1: null, containersRunning: null,
+        })),
+      },
+    }));
+    const cached = wrapper.get('[data-metric="mem-cached"]');
+    const d = cached.find('[data-test="metric-chart-line"]').attributes('d') ?? '';
+    expect(d.length, '只有 memCached 有值 ⇒ 缓存趋势必须画得出').toBeGreaterThan(0);
+    expect(cached.find('[data-test="metric-chart-y-max"]').text()).toBe('12 GiB');
+    // 整列没值的那一列 ⇒ 空态，而不是贴底的假线
+    expect(wrapper.get('[data-metric="mem-used"]').find('[data-test="metric-chart-empty"]').exists(),
+      'memUsed 整列 null ⇒ 走空态').toBe(true);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
