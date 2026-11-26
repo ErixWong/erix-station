@@ -319,6 +319,14 @@ describe('AdminUsersView「周期 / 用量」列（mount + fetch 桩，issue #80
     expect(texts).toHaveLength(2);
     expect(texts.some((x) => x.includes('月') && x.includes('$5.04'))).toBe(true);
     expect(texts.some((x) => x.includes('日') && x.includes('$0.30'))).toBe(true);
+    // hover 全文用完整词，不拿窄列的黑话（「月」）去填 hover；且额度/重置都得到。
+    const monthCell = w.findAll('[data-test="user-usage-period"]').find((c) => c.text().includes('$5.04'));
+    const title = monthCell?.attributes('title') ?? '';
+    expect(title).toContain('本月已用 $5.04');
+    expect(title).toContain('额度 $10.00');
+    expect(title).toContain('下次重置');
+    // 开头必须是完整词「本月」（而不是拿窄列短标签「月」去填 hover）。
+    expect(title.startsWith('本月已用')).toBe(true);
   });
 
   it('② spend_scope=lifetime：渲染「累」，且整表绝不出现「本周期」', async () => {
@@ -380,5 +388,8 @@ describe('AdminUsersView「周期 / 用量」列（mount + fetch 桩，issue #80
     expect(texts.some((x) => x.startsWith('日') && x.includes('$0.42'))).toBe(true);
     expect(texts.some((x) => x.startsWith('?') && x.includes('$1.50'))).toBe(true);
     expect(texts.some((x) => x.startsWith('月'))).toBe(false);
+    // 周期认不出来那一格：hover 得说「周期未知」，不能拿「本月」糊弄。
+    const unknownCell = w.findAll('[data-test="user-usage-period"]').find((c) => c.text().startsWith('?'));
+    expect(unknownCell?.attributes('title') ?? '').toContain('周期未知');
   });
 });

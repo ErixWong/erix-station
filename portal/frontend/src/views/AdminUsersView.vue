@@ -665,7 +665,7 @@ function usageCell(user: AdminUser): UsageCell {
       muted: true,
     };
   }
-  // period：周期短标签 + 金额；title 给已用/额度/下次重置全文（额度或重置缺失时该段不出现）。
+  // period：周期短标签 + 金额。
   // 周期短标签以**网关的 `budget_duration`** 为准——`spend` 就是按它归零的，DB 的 `budget_period`
   // 只在网关没说时兜底（两者不同步时，跟钱走不跟配置走）。白名单外的值（key 在门户之外被写成
   // `30d`/`7d`/`1m` 之类，网关都收）**不许猜**成「日/月」——猜错就是把周读成月，走未知标签。
@@ -677,10 +677,17 @@ function usageCell(user: AdminUser): UsageCell {
       : t('admin.fde.usagePeriodUnknown');
   const budgetText = row.max_budget != null ? fmtUsdCompact(row.max_budget) : null;
   const resetText = row.budget_reset_at ? formatLastLogin(row.budget_reset_at) : null;
-  const title = budgetText != null && resetText != null
-    ? t('admin.fde.usageTooltipPeriod', { period: periodLabel, spend: spendText, budget: budgetText, reset: resetText })
-    : `${periodLabel} ${spendText}${budgetText != null ? ` / ${budgetText}` : ''}${resetText != null ? ` · ${resetText}` : ''}`;
-  return { kind: 'period', text: `${periodLabel} ${spendText}`, title, muted: false };
+  // hover 里用**完整词**（格内用短标签是为了塞进窄列，hover 没这个约束，不该继续说黑话）。
+  // 周期认不出来时不得拿「本月」糊弄：换成「周期未知」的专门说法（钱是真的，窗口才是未知的）。
+  const parts: string[] = [cadence === '1d' || cadence === '1mo'
+    ? t('admin.fde.usageTooltipUsed', {
+      period: cadence === '1d' ? t('admin.fde.usagePeriodFullDay') : t('admin.fde.usagePeriodFullMonth'),
+      spend: spendText,
+    })
+    : t('admin.fde.usageTooltipUsedUnknown', { spend: spendText })];
+  if (budgetText != null) parts.push(t('admin.fde.usageTooltipBudget', { budget: budgetText }));
+  if (resetText != null) parts.push(t('admin.fde.usageTooltipReset', { reset: resetText }));
+  return { kind: 'period', text: `${periodLabel} ${spendText}`, title: parts.join(' · '), muted: false };
 }
 
 onMounted(() => {
@@ -778,15 +785,16 @@ onBeforeUnmount(() => {
 
       <table v-else-if="admin.usersLoaded" data-test="user-table" class="w-full table-fixed text-left text-sm">
           <colgroup>
-            <!-- issue #800：新增「周期 / 用量」列（10 列，百分比总和必须 = 100）。 -->
+            <!-- issue #800：新增「周期 / 用量」列（10 列，百分比总和必须 = 100）。
+                 用量列给 10%（真机 e2e：8% 时表头「周期 / 用量」被挤到换行，中文还拆断了「用量」）。 -->
             <col class="w-[11%]">
-            <col class="w-[12%]">
+            <col class="w-[10%]">
             <col class="w-[7%]">
             <col class="w-[11%]">
             <col class="w-[4%]">
             <col class="w-[8%]">
             <col class="w-[13%]">
-            <col class="w-[8%]">
+            <col class="w-[10%]">
             <col class="w-[13%]">
             <col class="w-[13%]">
           </colgroup>
