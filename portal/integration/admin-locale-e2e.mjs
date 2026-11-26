@@ -289,6 +289,10 @@ async function clickMenuItem(page, want) {
 // 登进某个入口：先 goto 登录页再填（登出之后那个口令 field 就不在了，直接 fill 会 not found）。
 async function loginInto(page, base, login, password) {
   await page.goto(base + '/#/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // 必须再来一次**整页重载**：从已加载的 SPA 改 hash 不会重建文档，pinia 里那份「已登录」还在，
+  // 守卫于是把 /login 又改写回工作台 ⇒ 表单永远不出现，本腿第一次判红就是死在这里（真机读数：
+  // 清了 cookie 之后仍停在 #/ 且正文写着已登录的账号）。清站点数据模拟的是新设备，得让文档真的重来。
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForSelector('#loginName, input[autocomplete="username"]', { timeout: 20000 });
   await page.fill('#loginName, input[autocomplete="username"]', login);
   await page.fill('#loginPass', password);
@@ -578,7 +582,15 @@ try {
     try { acct.shotBytes3 = statSync(cfg.shotPath3).size; } catch { /* 容器内没落盘，宿主回收时再看 */ }
   } catch (err) {
     // 这条腿自己的失败单独记：不拕 main 那条腿的 fatal，但同样会被宿主当成产品红。
-    acct.fatal = String((err && err.message) || err).split('\n')[0].slice(0, 300);
+    // 只截第一行会把「在等哪个选择器」丢掉（本腿第一次判红时就查不出是哪一步）：
+    // Playwright 的超时把 selector 写在第二行，这里多留两行，判红时要能看出死在哪一步。
+    acct.fatal = String((err && err.message) || err).split('\n').slice(0, 4).join(' | ').slice(0, 500);
+    // 判红时要能看出「页面到底停在哪儿、渲染了什么」：URL + 标题 + 正文前 200 字（best-effort）。
+    try {
+      acct.fatalUrl = apage.url();
+      acct.fatalTitle = await apage.evaluate(() => document.title);
+      acct.fatalBody = await apage.evaluate(() => (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200));
+    } catch { /* 页面已经没了就算了 */ }
   } finally {
     // ⓬f 收尾（必做）：把该账号的 locale 恢复成 null ⇒ 别把 dev 账号留在英文态。
     //      走 API；会话可能已被上面某一步的清站点数据清掉 ⇒ 先探 /api/me，非 200 就重新登一次再 PATCH。
@@ -724,7 +736,7 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
         assert.fail(`E2E_UI=1 点名要跑，账号级偏好腿却到不了用户面入口（缺：${acct.fatal}）——不能以 skip 冒充通过；不想被判红就显式带 E2E_UI_SOFT=1`);
         return;
       }
-      assert.fail(`账号级偏好腿到了用户面却没跑通（产品红）：${acct.fatal}（用户面 ${USER_BASE}，账号 ${SCRIPT_LOGIN}）`);
+      assert.fail(`账号级偏好腿到了用户面却没跑通（产品红）：${acct.fatal}（用户面 ${USER_BASE}，账号 ${SCRIPT_LOGIN}；停在 ${acct.fatalUrl ?? '未知 URL'}，标题 ${JSON.stringify(acct.fatalTitle ?? '?')}，正文 ${JSON.stringify(acct.fatalBody ?? '?')}）`);
       return;
     }
     // ⓬a 预清那一步得先真登进去（没登进去 ⇒ 后面每一条都是空读数，先钉这一条）
