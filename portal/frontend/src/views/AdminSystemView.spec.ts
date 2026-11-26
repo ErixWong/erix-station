@@ -622,3 +622,19 @@ describe('#814 系统页：补齐的趋势线、可见小标题与独立降级',
     expect(wrapper.findAll('[data-metric="disk-unknown-used"]').length).toBe(0);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #814：「宕主」是「宿主」的错字，曾经出现在 5 句界面可见文案里（title / loading / notLoaded /
+// diskCaveat / caveat）。这里**读真实文案表**而不是抄第二份句子：抄句子只会把错字再抄一遍。
+describe('#814 中文文案表本身（防错字回归）', () => {
+  it('#814 中文文案里没有「宕主」这个错字（界面可见文案曾写错过）', () => {
+    // 这个版本的 `global.messages` 类型是 `ComputedRef`（运行时可能已被 unwrap）⇒ 两种形状都接住；
+    // 并且**必须真的读到内容**：如果读错了形状拿到 `{}`，下面的 `includes` 会假绿。
+    const messages = i18n.global.messages as unknown as Record<string, unknown> & { value?: Record<string, unknown> };
+    const table = (messages.value ?? messages)['zh-CN'] ?? {};
+    const zh = JSON.stringify(table);
+    expect(zh.length, '读到的是真实中文文案表（空表会让下面的断言假绿）').toBeGreaterThan(1000);
+    expect(zh, '「宿主」这个词必须在文案表里（上面那条长度钉子防的是「读到了但读错格」）').toContain('宿主');
+    expect(zh.includes('宕主'), '「宕主」是「宿主」的错字').toBe(false);
+  });
+});

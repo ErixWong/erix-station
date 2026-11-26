@@ -910,8 +910,8 @@ export const zhCN = {
       market: '能力市场',
       // issue #586：「关于」（版本三格，只读）；views/AdminAboutView.vue。
       about: '关于',
-      // issue #650：「系统」（宕主 CPU / 内存 / 磁盘 / 容器数，只读）；views/AdminSystemView.vue。
-      // 插在能力市场之后、号池占用之前：与号池占用同属只读宕主快照（工单 §tab 位置）。
+      // issue #650：「系统」（宿主 CPU / 内存 / 磁盘 / 容器数，只读）；views/AdminSystemView.vue。
+      // 插在能力市场之后、号池占用之前：与号池占用同属只读宿主快照（工单 §tab 位置）。
       system: '系统',
       // issue #528（事件平台 W5）：宏模板与宏流水的管理台栏目（按 `07` §21.1 的键名表）。
       macros: '宏模板',
@@ -1633,17 +1633,17 @@ export const zhCN = {
       fdesUnreadable: '读不到 containers.agent_version（这是「读不到」，不是「没有 FDE」）。',
       caveat: '口径：唯一权威是镜像内烘的 build-info.json；package.json 只是构建输入，而 git tag / 镜像 tag / digest / containers.agent_version 都是派生副本，展示时必须标口径。',
     },
-    // 宕主资源快照（views/AdminSystemView.vue，issue #650；契约 docs/api/portal.md §4.20）。
+    // 宿主资源快照（views/AdminSystemView.vue，issue #650；契约 docs/api/portal.md §4.20）。
     // 四条硬口径（逐条有 spec 用例钉住）：拿不到一律说「未知」（绝不渲染成 0）；
     // 采样关闭 / 没第一拍 / 历史不可用是**三句不同的话**；load 必须给归一化幅度；
     // 磁盘按设备一行且读不到的路径要露面。
     system: {
-      title: '系统（宕主资源）',
+      title: '系统（宿主资源）',
       intro: '只读。采样器每 30s 读一次 /proc 与 statfs 并落库；卡片读内存里最新一拍，图读库里的分桶结果——两个读数来自同一个采样器，可以差一个采样周期。',
       retention: '历史保留 {days} 天',
       rangeLabel: '历史区间',
-      loading: '正在读取宕主读数…',
-      notLoaded: '尚未加载宕主读数（还没请求）。',
+      loading: '正在读取宿主读数…',
+      notLoaded: '尚未加载宿主读数（还没请求）。',
       unknown: '未知',
       noSample: '还没有采样拍，这一格没有读数（不是 0）。',
       noData: '该区间无数据',
@@ -1678,8 +1678,8 @@ export const zhCN = {
       diskAvail: '可用 {value}',
       diskUnreadable: '读不到：{reason}',
       diskUnreadableNone: '本轮配的路径全部读到了（没有读不到的）。',
-      // 口径边界（issue #650 明文）：没挂进 portal 的盘**不会自动出现**，界面不声称「宕主全部磁盘」。
-      diskCaveat: '口径：只列被挂进 portal 的文件系统（宕主没挂载进来的盘不会出现），本面不声称「宕主全部磁盘」。',
+      // 口径边界（issue #650 明文）：没挂进 portal 的盘**不会自动出现**，界面不声称「宿主全部磁盘」。
+      diskCaveat: '口径：只列被挂进 portal 的文件系统（宿主没挂载进来的盘不会出现），本面不声称「宿主全部磁盘」。',
       containersTitle: '容器',
       containersUnreadable: '容器数读不到（docker 不可达）——这是「读不到」，不是「0 台」。',
       containersStation: 'station 标注',
@@ -1702,7 +1702,7 @@ export const zhCN = {
       bucketHours: '每个点 = {value} 小时',
       droppedPoints: '历史里有 {count} 个点形状不认识，已丢弃',
       diskDropped: '磁盘里有 {count} 行形状不认识，已丢弃',
-      caveat: '口径：本面是**宕主**读数（portal 容器内读 /proc 与 statfs，未 cgroup 化），生效区间 {range}；不是每台 FDE 容器自己的用量。',
+      caveat: '口径：本面是**宿主**读数（portal 容器内读 /proc 与 statfs，未 cgroup 化），生效区间 {range}；不是每台 FDE 容器自己的用量。',
     },
     llm: {
       sectionTitle: 'LLM 供应商',
