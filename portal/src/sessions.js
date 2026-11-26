@@ -457,6 +457,11 @@ export async function getSession(
       // `triggered === 0`）⇒ 整个键不给：前端据此一个字节都不渲染（不是「0 次压缩」）。
       // 零 DDL：数据源是引擎已经写进轮记录的 `record.compactionStats`，读侧聚合，存量与新 run 同时覆盖。
       ...(facts.compaction === null ? {} : { compaction: facts.compaction }),
+      // #816 第②步：会话级折叠索引（**恒在**，无折叠为 `[]`）——与上面 `compaction` 的「键缺席而非零」**不同**：
+      // `folds` 是**列表**，空列表本身就是完整答案；`compaction` 是**聚合对象**，缺席才表示「一条统计都没有」。
+      // 别把两者「统一」成同一种缺席语义。数据源是同一趟 `transcript_rounds` 扫描（`collectTranscriptFacts`
+      // 派生），**不受 `messages` 的 LIMIT 窗口限制** ⇒ 折叠落在窗口之外前端也收得到。每项口径复用 `folded.facts`。
+      folds: facts.folds,
     },
     messages: projection,
     last_seq: Number(s.last_seq),
