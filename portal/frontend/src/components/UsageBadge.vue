@@ -163,6 +163,32 @@ const totalsSpend = computed(() => {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 });
 
+// 30 天窗口里的「单日最高」：取 `chartPoints` 里 y 的最大值；最大值 ≤ 0 ⇒ null（不出「最高 $0.00」假数）。
+// 同值多天取**最近的一天**（从旧到新遍历，`>=` 让更靠右的相等值覆盖 ⇒ 留下最近那天）。
+const chartPeak = computed<{ amount: number; day: string } | null>(() => {
+  let best: { x: number; y: number } | null = null;
+  for (const point of chartPoints.value) {
+    if (!best || point.y >= best.y) best = point;
+  }
+  if (!best || !(best.y > 0)) return null;
+  return { amount: best.y, day: formatDayAxis(best.x) };
+});
+
+// 紧贴 chart 上方的一句摘要（同一行、`·` 分隔）：替代原先那行会被读反的 y 轴左右标签。
+//   · 合计段：`totals.spend` 拿不到 ⇒ 整段不出（**不拿 $0.00 冒充**）。
+//   · 单日最高段：仅当最大值 > 0 才出，带那天（`MM-DD`）。
+//   · 全 0（合计恰为 0 且最大为 0）⇒ 只说「近 30 天无花费」，不写「最高 $0.00」。
+// 绝不用「峰值/平均」这类黑话：只有日聚合，平均无意义。
+const chartSummary = computed(() => {
+  const total = totalsSpend.value;
+  const peak = chartPeak.value;
+  if (total === 0 && peak === null) return t('workbench.usage.chartSummaryNoSpend');
+  const parts: string[] = [];
+  if (total != null) parts.push(t('workbench.usage.chartSummaryTotal', { spend: fmtUsdCompact(total) }));
+  if (peak) parts.push(t('workbench.usage.chartSummaryMax', { amount: fmtUsdCompact(peak.amount), day: peak.day }));
+  return parts.join(' · ');
+});
+
 // 弹窗打开时的数据保鲜：
 //   · open 变 true ⇒ emit('open')，调用方去 loadUsage()（首次拉）。
 //   · 打开期间每 60s emit('refreshUsage')，调用方再拉一次用量。**由本组件负责**——它是唯一知道
@@ -265,21 +291,20 @@ const chartNote = computed(() => {
           {{ t('workbench.usage.reading') }}
         </div>
 
-        <!-- 近 30 天合计（取响应的 totals.spend）：拿不到就整行不出，**不拿 $0.00 冒充「没花钱」**。 -->
-        <p v-if="totalsSpend != null" data-test="usage-totals" class="text-sm text-black/60">
-          {{ t('workbench.usage.totals30d', { spend: fmtUsdCompact(totalsSpend) }) }}
-        </p>
-
         <!-- 30 天每日用量 chart：点已由本组件补成完整 30 天窗口（缺行 = 0）；
-             空态文案只留给「拿不到数据」（走 note）；横轴只要日期（`format-x`）。 -->
+             空态文案只留给「拿不到数据」（走 note）；横轴只要日期（`format-x`）。
+             y 轴上下界被左右排在同一行会被读反（#808 真机实测），故 `hide-axis-values` 隐数值，
+             改由紧贴 chart 上方的一句「合计 + 单日最高（日期）」承担金额信息。 -->
         <div class="grid gap-1">
           <p class="text-xs text-black/50">{{ t('workbench.usage.chartLabel') }}</p>
+          <p v-if="chartSummary" data-test="usage-totals" class="text-sm text-black/60">{{ chartSummary }}</p>
           <MetricChart
             :points="chartPoints"
             :empty-text="t('workbench.usage.noData')"
             :note="chartNote"
             :format-y="fmtUsdCompact"
             :format-x="formatDayAxis"
+            hide-axis-values
             :label="t('workbench.usage.chartLabel')"
           />
         </div>

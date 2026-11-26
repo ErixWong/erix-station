@@ -161,8 +161,9 @@ describe('弹窗明细', () => {
     const empty = w.get('[data-test="metric-chart-empty"]');
     expect(empty.attributes('aria-hidden')).toBe('true');
     expect(empty.classes()).toContain('opacity-0');
-    // 30 个全 0 的点 ⇒ y 轴两端都是 $0.00（而不是不标）
-    expect(w.get('[data-test="metric-chart-y-max"]').text()).toBe('$0.00');
+    // 本弹窗开了 hide-axis-values：y 轴上下界不再左右排在同一行（#808 读反修复）⇒ 文本为空
+    expect(w.get('[data-test="metric-chart-y-max"]').text()).toBe('');
+    expect(w.get('[data-test="metric-chart-y-min"]').text()).toBe('');
   });
 
   it('只有 1 行日行：不再显「该区间无数据」，窗口被补成 30 点并画出真线', async () => {
@@ -207,11 +208,40 @@ describe('弹窗明细', () => {
     expect(w.get('[data-test="usage-totals"]').text()).toContain('近 30 天合计 $3.50');
   });
 
-  it('totals 缺失 ⇒ 合计那一行不渲染（不拿 $0.00 冒充）', async () => {
-    const w = mountBadge({ quota: quota(), days: [DAY], totals: null });
+  it('摘要（有花费）：「近 30 天合计 $X · 单日最高 $Y（MM-DD）」，且弹窗不再出现被读反的 y 轴标签', async () => {
+    const w = mountBadge({
+      quota: quota(),
+      days: [usageRow(localDayKeyBack(0), 0.39)],
+      totals: { spend: 0.39, total_tokens: 450 },
+    });
     await w.get('[data-test="usage-badge"]').trigger('click');
-    expect(w.find('[data-test="usage-totals"]').exists()).toBe(false);
-    expect(w.text()).not.toContain('近 30 天合计');
+    const p = (n: number) => String(n).padStart(2, '0');
+    const now = new Date();
+    const today = `${p(now.getMonth() + 1)}-${p(now.getDate())}`;
+    const summary = w.get('[data-test="usage-totals"]').text();
+    expect(summary).toContain('近 30 天合计 $0.39');
+    expect(summary).toMatch(new RegExp(`单日最高 \\$0\\.39（${today}）`));
+    // 不再靠 y 轴左右标签读金额（#808 读反修复）
+    expect(w.get('[data-test="metric-chart-y-max"]').text()).toBe('');
+    expect(w.get('[data-test="metric-chart-y-min"]').text()).toBe('');
+  });
+
+  it('摘要（全 0）：totals.spend=0 且窗口全 0 ⇒ 只说「近 30 天无花费」，不出「单日最高」', async () => {
+    const w = mountBadge({ quota: quota(), days: [], totals: { spend: 0, total_tokens: 0 } });
+    await w.get('[data-test="usage-badge"]').trigger('click');
+    const summary = w.get('[data-test="usage-totals"]').text();
+    expect(summary).toContain('近 30 天无花费');
+    expect(summary).not.toContain('单日最高');
+    expect(summary).not.toContain('$0.00');
+  });
+
+  it('摘要（无 totals）：不出合计段（也不得出现 $0.00 假数）', async () => {
+    const w = mountBadge({ quota: quota(), days: [usageRow(localDayKeyBack(0), 0.39)], totals: null });
+    await w.get('[data-test="usage-badge"]').trigger('click');
+    const summary = w.get('[data-test="usage-totals"]').text();
+    // 拿不到 totals ⇒ 合计段整段不出（也不写单日最高以外的金额）
+    expect(summary).not.toContain('近 30 天合计');
+    expect(w.text()).not.toContain('$0.00');
   });
 
   it('进度条用蓝色族（与 MetricChart 同族），不是品牌绿', async () => {

@@ -35,6 +35,13 @@ const props = withDefaults(defineProps<{
    * 本组件是 #650 管理台系统指标页在用的共享组件，默认行为与既有断言不许动。
    */
   formatX?: ((x: number) => string) | null;
+  /**
+   * 隐藏 y 轴上下界数值（issue #808 纯增量，缺省 `false` ⇒ 现有行为逐字不变）。本弹窗里 y 的
+   * min/max 被左右排在同一行，会被读成「左端那天 = max、右端那天 = min」而正好读反（真机实测），
+   * 所以这里改由调用方的一句「合计 + 单日最高（日期）」承担金额信息。**只把两个 y span 的文本置空**
+   * （节点常驻、只切状态，不破「常驻 DOM 不用 v-if」的既有口径），x 轴两端日期照常显示。
+   */
+  hideAxisValues?: boolean;
   /** 无障碍名（每张卡的图用自己的指标名，屏幕阅读器不至于念出四个「chart」）。 */
   label?: string;
 }>(), {
@@ -48,6 +55,7 @@ const props = withDefaults(defineProps<{
   formatY: null,
   withDate: false,
   formatX: null,
+  hideAxisValues: false,
   label: '',
 });
 
@@ -159,8 +167,8 @@ const xEndText = computed(() => axisX(points.value[points.value.length - 1]?.x))
     </div>
 
     <div class="flex items-baseline justify-between text-[11px] text-black/50">
-      <span data-test="metric-chart-y-max" class="font-mono">{{ hasData ? yMaxText : '' }}</span>
-      <span data-test="metric-chart-y-min" class="font-mono">{{ hasData ? yMinText : '' }}</span>
+      <span data-test="metric-chart-y-max" class="font-mono">{{ hideAxisValues ? '' : (hasData ? yMaxText : '') }}</span>
+      <span data-test="metric-chart-y-min" class="font-mono">{{ hideAxisValues ? '' : (hasData ? yMinText : '') }}</span>
     </div>
     <div class="flex items-baseline justify-between text-[11px] text-black/45">
       <span data-test="metric-chart-x-start" class="font-mono">{{ xStartText }}</span>

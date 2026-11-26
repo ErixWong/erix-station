@@ -596,13 +596,15 @@ async function collectBadge(page) {
 async function collectModal(page) {
   const m = {
     usedExists: false, progressExists: false, barClass: '', chartHasSvg: false,
-    chartRegionSvg: false, bodyText: '',
+    chartRegionSvg: false, bodyText: '', yMaxText: null,
   };
   m.usedExists = (await page.locator('[data-test="usage-used"]').count()) > 0;
   m.progressExists = (await page.locator('[data-test="usage-progress"]').count()) > 0;
   m.barClass = await page.$eval('[data-test="usage-progress"] > div', (el) => el.getAttribute('class') || '').catch(() => '');
   m.chartRegionSvg = (await page.locator('[data-test="metric-chart"] svg').count()) > 0;
   m.chartHasSvg = (await page.locator('svg').count()) > 0;
+  // 本弹窗开了 hide-axis-values：y 轴上界文本应为空（金额信息改由一句摘要承担，不再靠左右轴标签）。
+  m.yMaxText = await page.$eval('[data-test="metric-chart-y-max"]', (el) => (el.textContent || '').trim()).catch(() => null);
   m.bodyText = await page.evaluate(() => document.body.innerText || '');
   return m;
 }
@@ -753,6 +755,10 @@ test('U1 真浏览器进 #/workbench：徽标紧跟 who/周期文案+完整词 h
       assert.ok(modal.progressExists, '弹窗没有 [data-test="usage-progress"]（进度条）');
       assert.ok(/\bbg-blue-600\b/.test(String(modal.barClass)), `进度条填充条 class=${JSON.stringify(modal.barClass)} 不含 bg-blue-600（与 chart 的蓝色族不一致）`);
       assert.ok(modal.chartRegionSvg || modal.chartHasSvg, 'chart 区没有 <svg>（30 天图没渲染）');
+      // 本弹窗不靠 y 轴左右标签读金额（#808 真机实测：上/下界左右排会被读反）⇒ 上界文本应为空。
+      assert.equal(modal.yMaxText, '', `弹窗 [data-test="metric-chart-y-max"] 不为空（=${JSON.stringify(modal.yMaxText)}）：本弹窗应 hide-axis-values`);
+      // 金额信息改由紧贴 chart 上方的一句摘要承担（中文腿匹配）。
+      assert.ok(/近 30 天合计|近 30 天无花费/.test(String(modal.bodyText || '')), '弹窗正文缺「近 30 天合计 / 近 30 天无花费」摘要句');
       assert.equal(rep.closeButtonOk, true, '点关闭按钮没关掉弹窗');
       assert.equal(rep.closeEscOk, true, '按 Esc 没关掉弹窗');
 

@@ -60,3 +60,26 @@ describe('MetricChart 的 formatX（issue #808 纯增量）', () => {
     expect(w.get('[data-test="metric-chart-x-end"]').text()).toBe('');
   });
 });
+
+// issue #808：新可选 prop `hideAxisValues`（纯增量）。本弹窗里 y 的 min/max 被左右排在同一行，
+// 会被读成「左端那天=max、右端那天=min」而读反 ⇒ 调用方开开关隐数值，改由一句摘要承担金额信息。
+describe('MetricChart 的 hideAxisValues（issue #808 纯增量）', () => {
+  it('hideAxisValues=true ⇒ 两个 y span 文本为空（节点常驻、只切状态），x 两端仍照常', () => {
+    const w = mountChart({ points: POINTS, hideAxisValues: true });
+    // 节点必须常驻（不用 v-if 摘节点，否则「常驻 DOM 只切状态」的既有口径会破）
+    expect(w.find('[data-test="metric-chart-y-max"]').exists()).toBe(true);
+    expect(w.find('[data-test="metric-chart-y-min"]').exists()).toBe(true);
+    expect(w.get('[data-test="metric-chart-y-max"]').text()).toBe('');
+    expect(w.get('[data-test="metric-chart-y-min"]').text()).toBe('');
+    // x 轴两端仍显示（POINT 跨度 <24h ⇒ 默认时间形态），唯一无歧义的信息不能一并抹掉
+    expect(w.get('[data-test="metric-chart-x-start"]').text()).toMatch(/\d{1,2}:\d{2}/);
+    expect(w.get('[data-test="metric-chart-x-end"]').text()).toMatch(/\d{1,2}:\d{2}/);
+  });
+
+  it('缺省（不传）⇒ y 两端仍有值（回归钉：新 prop 不许影响默认排法）', () => {
+    const w = mountChart({ points: POINTS });
+    // POINTS 的 y 为 1/2/3 ⇒ 上界 3、下界 1（formatY 缺省 ⇒ 取整原值）
+    expect(w.get('[data-test="metric-chart-y-max"]').text()).toBe('3');
+    expect(w.get('[data-test="metric-chart-y-min"]').text()).toBe('1');
+  });
+});
