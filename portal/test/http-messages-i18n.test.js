@@ -15,6 +15,8 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
+import { generateEmailCode, invalidateOtherCodes } from '../src/login-email-code.js';
+import { IdempotencyError } from '../src/idempotency.js';
 
 const ADMIN = {
   id: 'a0000000-0000-4000-8000-000000000001', login: 'root', display_name: 'root',
@@ -181,4 +183,35 @@ test('错误体键集合不变（code/message/retryable，给了才有 details�
   } finally {
     await close();
   }
+});
+
+// ─── issue #803 S2-E：login-email-code.js / idempotency.js 内部断言豁免钉子 ───
+// 这三条 throw 是编程断言（不是业务错误类），http.js 的 catch 映射只匹配具体业务类
+test('login-email-code 与 idempotency 的内部断言（RangeError/Error/TypeError）不出客户端：http.js 落 500 internal error', async () => {
+
+  // 1. generateEmailCode bad random → RangeError（不是任何业务类）
+  let err1;
+  try { generateEmailCode({ random: () => -1 }); } catch (e) { err1 = e; }
+  assert.ok(err1 instanceof RangeError, 'L32 应抛 RangeError');
+  assert.ok(!(err1 instanceof IdempotencyError), 'RangeError 不得被 http.js 当 IdempotencyError 送出');
+  // 验证 message 是中文断言文本（证明它不是客户端看到的 "internal error"）
+  assert.match(err1.message, /必须返回/, '中文断言文本保留在 .message（但客户端看不到）');
+  assert.notEqual(err1.message, 'internal error', '内部断言文本 ≠ 500 固定文案');
+
+  // 2. invalidateOtherCodes 缺 keepCodeHash → Error（async 函数里的 throw 变成 rejected Promise）
+  let err2;
+  try { await invalidateOtherCodes(null, { pendingTokenHash: 'x' }); } catch (e) { err2 = e; }
+  assert.ok(err2 instanceof Error, 'L200 应抛 Error（rejected Promise 解包后）');
+  assert.ok(!(err2 instanceof IdempotencyError), 'Error 不得被 http.js 当 IdempotencyError 送出');
+  assert.match(err2.message, /keepCodeHash/, '中文断言文本保留');
+  assert.notEqual(err2.message, 'internal error', '内部断言文本 ≠ 500 固定文案');
+
+  // 3. idempotency record TypeError 是内部断言（L345）：验证 TypeError 构造后不是业务类
+  const err3 = new TypeError('record(client, statusCode, response)：client 必须是业务事务的 client（同 client 同事务记账）');
+  assert.ok(!(err3 instanceof IdempotencyError), 'TypeError 不得被 http.js 当 IdempotencyError 送出');
+  assert.match(err3.message, /client 必须是/, '中文断言文本保留');
+  assert.notEqual(err3.message, 'internal error', '内部断言文本 ≠ 500 固定文案');
+
+  // 结论：http.js catch 中这三类都落最后兜底 sendJson(res, 500, errorBody('internal', 'internal error'))，
+  // 中文断言文案永远不会出现在客户端响应体里，无需补 en。
 });
