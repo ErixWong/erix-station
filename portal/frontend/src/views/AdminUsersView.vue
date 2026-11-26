@@ -4,8 +4,9 @@ import { useI18n } from 'vue-i18n';
 import ModalShell from '../components/ModalShell.vue';
 import UserLlmPane from '../components/UserLlmPane.vue';
 import FdePreviewPortsPane from '../components/FdePreviewPortsPane.vue';
-import { useAdminStore, type LlmModel, type AdminUser, type LlmProvider } from '../stores/admin';
+import { useAdminStore, type LlmModel, type AdminUser, type LlmProvider, type KeyUsageRow } from '../stores/admin';
 import { modelOptionLabel } from '../lib/modelLabel';
+import { fmtUsdCompact } from '../lib/money';
 import { useAuthStore } from '../stores/auth';
 
 const { t, locale } = useI18n();
@@ -632,8 +633,66 @@ function formatLastLogin(value: string | null): string {
   return value ? formatMoment(value) : t('admin.fde.neverLoggedIn');
 }
 
+// issue #800：用户列表「周期 / 用量」列。按 fde_name 取 key-usage 行（网关 bulk 端点整表一次）。
+const keyUsageByFde = computed(() => {
+  const map = new Map<string, KeyUsageRow>();
+  for (const row of admin.keyUsage) {
+    if (row && row.fde_name != null) map.set(String(row.fde_name), row);
+  }
+  return map;
+});
+
+type UsageCell = { kind: 'pending' | 'unknown' | 'period' | 'lifetime'; text: string; title: string; muted: boolean };
+
+/** 一格同时给出周期与已用金额；spend_scope 是「本周期 vs 终身」的唯一判据。 */
+function usageCell(user: AdminUser): UsageCell {
+  // 加载未完且尚未报错 ⇒ 占位（不拿「—」冒充「没有」）。
+  if (!admin.keyUsageLoaded && !admin.keyUsageErr) {
+    return { kind: 'pending', text: '…', title: '', muted: false };
+  }
+  const row = user.fde_name ? keyUsageByFde.value.get(String(user.fde_name)) : undefined;
+  // 找不到行 / spend==null / spend_scope==null ⇒ 未知（**不得渲染成 0**）。
+  if (!row || row.spend == null || row.spend_scope == null) {
+    return { kind: 'unknown', text: '—', title: t('admin.fde.usageTooltipUnknown'), muted: true };
+  }
+  const spendText = fmtUsdCompact(row.spend);
+  // lifetime（未设额度）：灰字 + 「累」，**绝不能出现「本周期」字样**。
+  if (row.spend_scope === 'lifetime') {
+    return {
+      kind: 'lifetime',
+      text: `${t('admin.fde.usageLifetimeShort')} ${spendText}`,
+      title: t('admin.fde.usageTooltipLifetime', { spend: spendText }),
+      muted: true,
+    };
+  }
+  // period：周期短标签 + 金额。
+  // 周期短标签以**网关的 `budget_duration`** 为准——`spend` 就是按它归零的，DB 的 `budget_period`
+  // 只在网关没说时兜底（两者不同步时，跟钱走不跟配置走）。白名单外的值（key 在门户之外被写成
+  // `30d`/`7d`/`1m` 之类，网关都收）**不许猜**成「日/月」——猜错就是把周读成月，走未知标签。
+  const cadence = row.budget_duration ?? row.budget_period ?? null;
+  const periodLabel = cadence === '1d'
+    ? t('admin.fde.usagePeriodDay')
+    : cadence === '1mo'
+      ? t('admin.fde.usagePeriodMonth')
+      : t('admin.fde.usagePeriodUnknown');
+  const budgetText = row.max_budget != null ? fmtUsdCompact(row.max_budget) : null;
+  const resetText = row.budget_reset_at ? formatLastLogin(row.budget_reset_at) : null;
+  // hover 里用**完整词**（格内用短标签是为了塞进窄列，hover 没这个约束，不该继续说黑话）。
+  // 周期认不出来时不得拿「本月」糊弄：换成「周期未知」的专门说法（钱是真的，窗口才是未知的）。
+  const parts: string[] = [cadence === '1d' || cadence === '1mo'
+    ? t('admin.fde.usageTooltipUsed', {
+      period: cadence === '1d' ? t('admin.fde.usagePeriodFullDay') : t('admin.fde.usagePeriodFullMonth'),
+      spend: spendText,
+    })
+    : t('admin.fde.usageTooltipUsedUnknown', { spend: spendText })];
+  if (budgetText != null) parts.push(t('admin.fde.usageTooltipBudget', { budget: budgetText }));
+  if (resetText != null) parts.push(t('admin.fde.usageTooltipReset', { reset: resetText }));
+  return { kind: 'period', text: `${periodLabel} ${spendText}`, title: parts.join(' · '), muted: false };
+}
+
 onMounted(() => {
-  void Promise.all([admin.loadUsers(), admin.loadProviders(), admin.loadGitHosts()]);
+  // issue #800：这一列与列表并行拉，且**各自吞错**（load* 返回 null/字符串）：网关挂了只影响那一列。
+  void Promise.all([admin.loadUsers(), admin.loadProviders(), admin.loadGitHosts(), admin.loadKeyUsage()]);
 });
 
 let lifecyclePoll: ReturnType<typeof setInterval> | null = null;
@@ -726,14 +785,17 @@ onBeforeUnmount(() => {
 
       <table v-else-if="admin.usersLoaded" data-test="user-table" class="w-full table-fixed text-left text-sm">
           <colgroup>
+            <!-- issue #800：新增「周期 / 用量」列（10 列，百分比总和必须 = 100）。
+                 用量列给 10%（真机 e2e：8% 时表头「周期 / 用量」被挤到换行，中文还拆断了「用量」）。 -->
             <col class="w-[11%]">
-            <col class="w-[15%]">
-            <col class="w-[8%]">
-            <col class="w-[12%]">
-            <col class="w-[5%]">
+            <col class="w-[10%]">
+            <col class="w-[7%]">
+            <col class="w-[11%]">
+            <col class="w-[4%]">
             <col class="w-[8%]">
             <col class="w-[13%]">
-            <col class="w-[15%]">
+            <col class="w-[10%]">
+            <col class="w-[13%]">
             <col class="w-[13%]">
           </colgroup>
           <thead class="border-b border-black/10 bg-black/[0.025] text-xs text-black/55">
@@ -745,6 +807,7 @@ onBeforeUnmount(() => {
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colMfa') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colStatus') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colLifecycle') }}</th>
+              <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colPeriodUsage') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.lastActivity') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colActions') }}</th>
             </tr>
@@ -825,10 +888,17 @@ onBeforeUnmount(() => {
                   </div>
                   <span v-if="!user.onboarding && !user.offboarding" class="text-black/35">—</span>
                 </td>
+                <td class="px-3 py-2.5">
+                  <span
+                    :data-test="`user-usage-${usageCell(user).kind}`"
+                    :class="usageCell(user).muted ? 'text-black/35' : ''"
+                    :title="usageCell(user).title"
+                  >{{ usageCell(user).text }}</span>
+                </td>
                 <td class="truncate px-3 py-2.5">
                   <!-- issue #497（迁移 0031）：两行同格——主行是「最后活动」（最近一次用户输入），
                        副行小字是「登录于 …」。两条时间线各说各话，所以活动那一行**不**跟着登录变。
-                       列数与列宽一字没改（colgroup / th 仍是 9 格，本格仍是第 8 格）。 -->
+                       列序账：#800 在本格左边插了「周期 / 用量」⇒ 本格是第 9 格（colgroup / th 共 10 格）。 -->
                   <div class="flex flex-col">
                     <span
                       data-test="user-activity-main"
@@ -877,7 +947,7 @@ onBeforeUnmount(() => {
                 </td>
               </tr>
               <tr v-if="rowErrors[user.id] || rowMessages[user.id]" class="border-b border-black/10">
-                <td colspan="9" class="px-3 py-1.5 text-xs">
+                <td colspan="10" class="px-3 py-1.5 text-xs">
                   <p v-if="rowErrors[user.id]" class="syserr" role="alert">{{ rowErrors[user.id] }}</p>
                   <p v-else class="text-green-700" role="status">{{ rowMessages[user.id] }}</p>
                 </td>

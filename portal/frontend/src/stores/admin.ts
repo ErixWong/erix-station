@@ -204,6 +204,20 @@ export interface AdminUser {
   } | null;
 }
 
+// issue #800：用户列表「周期 / 用量」列的一行。字段与 projectQuota / listFdeKeyUsage 逐字对齐；
+// spend_scope 是「本周期 vs 终身」标签的**唯一**判据（null = 无读数，不得渲染成 0）。
+export interface KeyUsageRow {
+  fde_name: string;
+  budget_usd: number | null;
+  budget_period: '1d' | '1mo' | null;
+  max_budget: number | null;
+  budget_duration: string | null;
+  budget_reset_at: string | null;
+  spend: number | null;
+  remaining: number | null;
+  spend_scope: 'period' | 'lifetime' | null;
+}
+
 export interface GitHost {
   id: string;
   name: string;
@@ -313,6 +327,11 @@ export const useAdminStore = defineStore('admin', {
     totpOnce: null as TotpOnce | null, // 旧 #totpOnce 内联盒
     lastReactivatedUserId: null as string | null,
     usersLoading: false,
+    // issue #800：用户列表「周期 / 用量」列。与 users 的加载**分开**：网关挂了只让这一列空着。
+    keyUsage: [] as KeyUsageRow[],
+    keyUsageLoaded: false,
+    keyUsageLoading: false,
+    keyUsageErr: null as string | null,
     // issue #350：号池占用总览。`previewUsageLoaded` 与 `previewUsage` 分开：
     // 「还没请求」（loaded=false）与「服务端说一个被占段都没有」（loaded=true + 空数组）不是同一件事。
     previewUsage: null as PreviewPoolUsage | null,
@@ -546,6 +565,28 @@ export const useAdminStore = defineStore('admin', {
         return this.fdeErr;
       } finally {
         this.usersLoading = false;
+      }
+    },
+
+    /** issue #800：GET /api/admin/llm/key-usage —— 整表一次取回每 FDE 的周期与已用金额。
+     *  重拉**一开头就作废旧读数**（评审 BLOCKER）：Pinia 状态跨路由存活，不清就会在「本轮没拿到新数」时
+     *  继续举着上一轮的钱给人看；钱这件事上「旧值」与「没读数」必须分得开 ⇒ 拿不到就回到「—」。 */
+    async loadKeyUsage(): Promise<string | null> {
+      this.keyUsageLoading = true;
+      this.keyUsageErr = null;
+      this.keyUsage = [];
+      this.keyUsageLoaded = false;
+      try {
+        const data = await api<{ rows: KeyUsageRow[] }>('/api/admin/llm/key-usage');
+        this.keyUsage = data.rows ?? [];
+        this.keyUsageLoaded = true;
+        return null;
+      } catch (e) {
+        // 失败 ⇒ 保持空（渲染成「—」），**不得回展示旧金额**。
+        this.keyUsageErr = t('admin.errorPrefix') + this.errText(e);
+        return this.keyUsageErr;
+      } finally {
+        this.keyUsageLoading = false;
       }
     },
 

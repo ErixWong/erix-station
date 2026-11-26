@@ -749,6 +749,7 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
   - **未定价模型不生效**：`pricing_configured=false` 的模型 `spend` 恒记 0（§11.5 上文），累计不到额度上 ⇒ 周期额度对「只用未定价模型」的 FDE 实际拦不住（管理台已在额度区显式警告）。
   - **`tpd_limit` 为何不可用**：该端点是 **batch-only**（`/user/daily/activity` 的 `tpd_limit` 只在批量查询里回，不能按 key 直接下发成限额），故本单只用 `max_budget`（USD），不用 tpd_limit。
   - **`spend` 是运行计数器 ⇒ `spend_scope`**：`/key/info` 的 `spend` 只有在存在 `budget_duration` 时才按周期归零；**无额度时是终身累计**。因此 `getFdeBudget` 返回 `spend_scope`：`budget_duration` 非空⇒`'period'`（本周期已用），无额度⇒`'lifetime'`（终身累计）——这是前端已用标签的**唯一依据**（无额度的 FDE 不得把 `spend` 标成“本周期已用”）。
+   - **管理台用户列表「周期 / 用量」列走整表 bulk 端点（issue #800）**：`GET /api/admin/llm/key-usage` 一次 `/key/list` 覆盖全部 key，按 `key_id == token` 匹配（不用 `key_alias`）；**金额口径与上面的额度闸门同源（同一个 key 运行计数器）**，portal 不自算周期、不重推 scope——`spend_scope` 仍是「本周期 vs 终身」的唯一判据（`null` = 无读数，渲染成「—」而非 0）。
   - **首次设额度不清零历史（实测口径，不是 bug）**：`/key/update` 只改 `max_budget` / `budget_duration`，**不动 `spend`** ⇒
     设额度那一刻的 `spend` 仍是历史累计，`remaining = max_budget − spend` 因此一开始就可能小于额度
     （dev 实测：eric 设 `0.5`/月时 `spend=0.0844` ⇒ 剩余 `0.4156`）。这与 LiteLLM 的**判定口径一致**

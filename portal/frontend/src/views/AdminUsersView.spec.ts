@@ -5,10 +5,16 @@
 // 覆盖：① 开关不置灰；② TOTP 用户走「替代方式」标签 + 说明（且说明点名 `email_code_alt`）；
 // ③ 非 TOTP 用户文案一字不改；④ 旧的「本开关不影响」死开关文案彻底退场（zh/en 都删）；
 // ⑤（feat-261110-03）控制件必须是原生勾选框，手搓 switch 已退场。
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import adminUsersViewSource from './AdminUsersView.vue?raw';
+import AdminUsersView from './AdminUsersView.vue';
 import { zhCN } from '../i18n/locales/zh-CN';
 import { en } from '../i18n/locales/en';
+// issue #800：下面新添的是真 mount + 请求桩的 DOM 断言（区别于本文件主体的源码级结构判据）。
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
+import { createPinia, setActivePinia } from 'pinia';
+import { i18n, setLocale } from '../i18n';
+import { useAdminStore, type AdminUser, type KeyUsageRow } from '../stores/admin';
 
 /**
  * 「二次验证」那一档里两个勾选框所在的那一块（feat-261110-03）。
@@ -165,11 +171,12 @@ describe('issue #497：第 8 格的两行结构（列数不变、无硬编码中
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/[^\n]*$/gm, '');
 
-  it('列数与列宽一字未改：9 个 col / 9 个 th / 行内 9 个 td（不许新增列把 th[8] 往后挤）', () => {
-    expect(adminUsersViewSource.match(/<col /g) ?? [], 'colgroup 列数').toHaveLength(9);
-    expect(adminUsersViewSource.match(/<th scope="col"/g) ?? [], '表头列数').toHaveLength(9);
-    // 第 8 格（下标 7）的语义已换成「最后活动」，且旧键 `lastLogin` 不再出现在表头里
-    expect(headerCells[7] ?? '').toContain("t('admin.fde.lastActivity')");
+  it('列数与列宽：10 个 col / 10 个 th（issue #800 新增「周期 / 用量」列；周期/用量在下标 7，活动顺延到 8）', () => {
+    expect(adminUsersViewSource.match(/<col /g) ?? [], 'colgroup 列数').toHaveLength(10);
+    expect(adminUsersViewSource.match(/<th scope="col"/g) ?? [], '表头列数').toHaveLength(10);
+    // issue #800：新列插在 colLifecycle(6) 之后、lastActivity 之前 ⇒ 周期/用量=下标 7，活动=下标 8。
+    expect(headerCells[7] ?? '').toContain("t('admin.fde.colPeriodUsage')");
+    expect(headerCells[8] ?? '').toContain("t('admin.fde.lastActivity')");
     expect(adminUsersViewSource, '旧表头键必须退场（没换语义 = 这格还在说登录）')
       .not.toMatch(/<th[^>]*>\{\{ t\('admin\.fde\.lastLogin'\) \}\}<\/th>/);
   });
@@ -251,5 +258,138 @@ describe('issue #497：第 8 格的两行结构（列数不变、无硬编码中
     // 不解析出合法时间戳时原样回显（旧行为）——不许发明「今天」这类兜底
     expect(/function formatMoment[\s\S]*?Number\.isNaN\(timestamp\) \? value/.test(src),
       '时间点格式化必须原样回显不可解析的值，而不是造一个兜底词').toBe(true);
+  });
+});
+
+// ── issue #800：真 mount + 请求桩，断言「周期 / 用量」列的渲染（不用 w.emitted）───────────
+describe('AdminUsersView「周期 / 用量」列（mount + fetch 桩，issue #800）', () => {
+  enableAutoUnmount(afterEach);
+  beforeEach(() => { setActivePinia(createPinia()); });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  const json = (status: number, body: unknown): Response =>
+    new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+
+  const mkUser = (login: string, fde: string | null): AdminUser => ({
+    id: `u-${login}`, login, display_name: login, email: null, mail_otp_enabled: false,
+    totp_login_enabled: true, file_upload_enabled: false,
+    role: 'fde', fde_name: fde, status: 'active', totp_enabled: false,
+    last_login_at: null, last_activity_at: null, onboarding: null, offboarding: null,
+  } as unknown as AdminUser);
+
+  const mkRow = (fde: string, over: Partial<KeyUsageRow>): KeyUsageRow => ({
+    fde_name: fde, budget_usd: null, budget_period: null, max_budget: null, budget_duration: null,
+    budget_reset_at: null, spend: null, remaining: null, spend_scope: null, ...over,
+  });
+
+  async function mountView(users: AdminUser[], keyUsage: { rows: KeyUsageRow[] } | null) {
+    setLocale('zh-CN');
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    void useAdminStore();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url === '/api/admin/users') return json(200, { items: users });
+      if (url === '/api/admin/llm/key-usage') {
+        return keyUsage
+          ? json(200, keyUsage)
+          : json(502, { error: { code: 'llm_gateway_error', message: '网关不可达', retryable: true } });
+      }
+      return json(200, { items: [] });
+    }));
+    const w = mount(AdminUsersView, {
+      global: {
+        plugins: [pinia, i18n],
+        stubs: { RouterLink: { template: '<a><slot /></a>' }, 'router-link': { template: '<a><slot /></a>' } },
+      },
+    });
+    await flushPromises();
+    return w;
+  }
+
+  it('① spend_scope=period：1mo 渲染「月」+ 金额、1d 渲染「日」', async () => {
+    const w = await mountView(
+      [mkUser('alice', 'alpha'), mkUser('carol', 'charlie')],
+      { rows: [
+        mkRow('alpha', { budget_period: '1mo', max_budget: 10, budget_duration: '1mo', budget_reset_at: '2026-12-01T00:00:00Z', spend: 5.04, remaining: 4.96, spend_scope: 'period' }),
+        mkRow('charlie', { budget_period: '1d', max_budget: 0.3, budget_duration: '1d', spend: 0.30, spend_scope: 'period' }),
+      ] },
+    );
+    const texts = w.findAll('[data-test="user-usage-period"]').map((c) => c.text());
+    expect(texts).toHaveLength(2);
+    expect(texts.some((x) => x.includes('月') && x.includes('$5.04'))).toBe(true);
+    expect(texts.some((x) => x.includes('日') && x.includes('$0.30'))).toBe(true);
+    // hover 全文用完整词，不拿窄列的黑话（「月」）去填 hover；且额度/重置都得到。
+    const monthCell = w.findAll('[data-test="user-usage-period"]').find((c) => c.text().includes('$5.04'));
+    const title = monthCell?.attributes('title') ?? '';
+    expect(title).toContain('本月已用 $5.04');
+    expect(title).toContain('额度 $10.00');
+    expect(title).toContain('下次重置');
+    // 开头必须是完整词「本月」（而不是拿窄列短标签「月」去填 hover）。
+    expect(title.startsWith('本月已用')).toBe(true);
+  });
+
+  it('② spend_scope=lifetime：渲染「累」，且整表绝不出现「本周期」', async () => {
+    const w = await mountView(
+      [mkUser('bob', 'bobo')],
+      { rows: [mkRow('bobo', { spend: 5.09, spend_scope: 'lifetime' })] },
+    );
+    const cell = w.find('[data-test="user-usage-lifetime"]');
+    expect(cell.exists()).toBe(true);
+    expect(cell.text()).toContain('累');
+    expect(cell.text()).toContain('$5.09');
+    expect(w.text()).not.toContain('本周期');
+  });
+
+  it('③ spend=null：那一格渲染「—」（无读数，不渲染成 0）', async () => {
+    const w = await mountView(
+      [mkUser('dana', 'dana')],
+      { rows: [mkRow('dana', { spend: null, spend_scope: null })] },
+    );
+    const cell = w.find('[data-test="user-usage-unknown"]');
+    expect(cell.exists()).toBe(true);
+    expect(cell.text()).toBe('—');
+    expect(w.text()).not.toContain('$0.00');
+  });
+
+  it('④ 网关失败（keyUsageErr）：用户行仍渲染，那一格是「—」', async () => {
+    const w = await mountView([mkUser('eve', 'eve')], null); // key-usage 返 502
+    expect(w.text()).toContain('eve'); // 用户列表不受影响
+    expect(w.find('[data-test="user-usage-period"]').exists()).toBe(false);
+    expect(w.find('[data-test="user-usage-lifetime"]').exists()).toBe(false);
+    const cell = w.find('[data-test="user-usage-unknown"]');
+    expect(cell.exists()).toBe(true);
+    expect(cell.text()).toBe('—');
+  });
+
+  it('⑤ 表头 th 数与每行 td 数都是 10', async () => {
+    const w = await mountView(
+      [mkUser('alice', 'alpha')],
+      { rows: [mkRow('alpha', { budget_period: '1mo', spend: 1, spend_scope: 'period' })] },
+    );
+    expect(w.findAll('thead th').length).toBe(10);
+    const row = w.find('[data-test="user-row"]');
+    expect(row.exists()).toBe(true);
+    expect(row.findAll('td').length).toBe(10);
+  });
+
+  // 周期短标签的**来源**判据：`spend` 按网关的 `budget_duration` 归零，所以标签也得跟它——
+  // DB 说「每月」而 key 实为 `1d` 时显示「日」；白名单外的周期（`7d` ⇒ 网关语义是「每周一」）
+  // 不许猜成日/月，走未知标签（猜错就是把一周的钱当成一个月的钱）。
+  it('⑥ 周期短标签跟网关 budget_duration：1d 压过 DB 的 1mo；白名单外走未知标签', async () => {
+    const w = await mountView(
+      [mkUser('frank', 'frank'), mkUser('gina', 'gina')],
+      { rows: [
+        mkRow('frank', { budget_period: '1mo', budget_duration: '1d', spend: 0.42, spend_scope: 'period' }),
+        mkRow('gina', { budget_period: '1mo', budget_duration: '7d', spend: 1.5, spend_scope: 'period' }),
+      ] },
+    );
+    const texts = w.findAll('[data-test="user-usage-period"]').map((c) => c.text());
+    expect(texts.some((x) => x.startsWith('日') && x.includes('$0.42'))).toBe(true);
+    expect(texts.some((x) => x.startsWith('?') && x.includes('$1.50'))).toBe(true);
+    expect(texts.some((x) => x.startsWith('月'))).toBe(false);
+    // 周期认不出来那一格：hover 得说「周期未知」，不能拿「本月」糊弄。
+    const unknownCell = w.findAll('[data-test="user-usage-period"]').find((c) => c.text().startsWith('?'));
+    expect(unknownCell?.attributes('title') ?? '').toContain('周期未知');
   });
 });

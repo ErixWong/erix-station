@@ -27,6 +27,7 @@ import {
   setFdeBudget,
   getFdeBudget,
   getFdeBudgetUsage,
+  listFdeKeyUsage,
   BUDGET_PERIODS,
   DEFAULT_BUDGET_PERIOD,
   revokeFdeLlmConfigTx,
@@ -77,6 +78,10 @@ class LlmFakePool {
     this.keyInfoExtra = null;
     this.dailyActivityResult = { results: [] };
     this.userDailyActivityCalls = [];
+    // issue #800：listKeys 可注入分页数据（keyListPages[0] = 第 1 页的 key 数组）与抛错；记录调用供断言。
+    this.keyListPages = [];
+    this.listKeysCalls = [];
+    this.listKeysError = null;
   }
 
   #gatewayError(status, message) {
@@ -294,6 +299,23 @@ class LlmFakePool {
     this.userDailyActivityCalls.push(query);
     if (this.userDailyActivityError) throw this.userDailyActivityError;
     return this.dailyActivityResult;
+  }
+
+  // issue #800：镜像真网关 `/key/list`（分页 + return_full_object）。keyListPages[i] 是第 i+1 页的
+  // key 数组；total_pages = 页数。写法照 userDailyActivity：记录调用、可注入抛错、返回可分页数据。
+  async listKeys(query) {
+    this.gatewayCalls.push({ method: 'listKeys', query });
+    this.listKeysCalls.push(query);
+    if (this.listKeysError) throw this.listKeysError;
+    const page = Number(query?.page) || 1;
+    const pages = Array.isArray(this.keyListPages) ? this.keyListPages : [];
+    const keys = pages[page - 1] ?? [];
+    return {
+      keys,
+      total_count: pages.reduce((n, p) => n + (Array.isArray(p) ? p.length : 0), 0),
+      current_page: page,
+      total_pages: pages.length || 1,
+    };
   }
 
   async query(sql, params = []) {
@@ -544,6 +566,21 @@ class LlmFakePool {
         vision_model_id: visId, vision_model_name: visName, revoked_at: null,
       });
       return { rows: [], rowCount: 1 };
+    }
+
+    // issue #800：listFdeKeyUsage 的整表绑定查询（active + litellm，JOIN users 取 fde_name，按 fde_name 排序）。
+    if (sql.includes('FROM fde_llm_bindings b') && sql.includes('JOIN users u ON u.id = b.fde_id')) {
+      const fdeNameById = new Map(this.users.map((u) => [u.id, u.fde_name]));
+      const rows = this.bindings
+        .filter((b) => b.state === 'active' && b.gateway === 'litellm')
+        .map((b) => ({
+          fde_name: fdeNameById.get(b.fde_id) ?? null,
+          budget_usd: b.budget_usd ?? null,
+          budget_period: b.budget_period ?? null,
+          key_id: b.key_id ?? null,
+        }))
+        .sort((a, b) => String(a.fde_name).localeCompare(String(b.fde_name)));
+      return { rows };
     }
 
     return { rows: [] };
@@ -3043,4 +3080,181 @@ test('额度/用量路由非 admin⇒403（鉴权继承 requireAdmin，新路径
       assert.equal((await res.json()).error.code, 'forbidden');
     }
   } finally { await close(); }
+});
+
+// ---------------------------------------------------------------------------
+// issue #800：listFdeKeyUsage（整表 `/key/list` → 按 token 匹配 → 复用 projectQuota）。
+// 匹配键 = fde_llm_bindings.key_id == 网关 token（sha256 hex）；**不用 key_alias**。
+// ---------------------------------------------------------------------------
+
+function keyUsagePool({ users = [], bindings = [], pages = [], error = null } = {}) {
+  const pool = new LlmFakePool({ users, bindings });
+  pool.keyListPages = pages;
+  pool.listKeysError = error;
+  return pool;
+}
+const litellmBinding = (over) => ({
+  gateway: 'litellm', state: 'active', generation: 1, api_key: 'sk-x', ...over,
+});
+
+// ① 多页翻页：total_pages=2 ⇒ 必须翻到第 2 页才能命中落在第 2 页的 key。
+test('listFdeKeyUsage：按 total_pages 翻页直到最后一页（第 2 页的 key 也能命中）', async () => {
+  const pool = keyUsagePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [litellmBinding({ fde_id: 'u1', key_id: 'tok-page2', budget_usd: 5.04, budget_period: '1mo' })],
+    pages: [
+      [{ token: 'tok-page1', key_alias: 'fde-zoe', spend: 1, max_budget: 9, budget_duration: '1d' }],
+      [{ token: 'tok-page2', key_alias: 'fde-alice', spend: 3.21, max_budget: 5.04, budget_duration: '1mo', budget_reset_at: '2026-12-01T00:00:00Z' }],
+    ],
+  });
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(pool.listKeysCalls.length, 2, 'total_pages=2 必须请求两页');
+  assert.deepEqual(pool.listKeysCalls.map((q) => q.page), [1, 2]);
+  assert.equal(pool.listKeysCalls[0].size, 100);
+  assert.equal(pool.listKeysCalls[0].return_full_object, true);
+  assert.equal(out.rows.length, 1);
+  assert.equal(out.rows[0].fde_name, 'alice');
+  assert.equal(out.rows[0].spend, 3.21);
+  assert.equal(out.rows[0].spend_scope, 'period');
+  assert.equal(out.rows[0].budget_period, '1mo');
+});
+
+// ② token 精确匹配：两条 key_alias 相同、token 不同，只有 key_id 命中那条被算进该 FDE。
+test('listFdeKeyUsage：按 token 精确匹配（同 key_alias、不同 token，只认 key_id 命中那条，不按别名串钱）', async () => {
+  const pool = keyUsagePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [litellmBinding({ fde_id: 'u1', key_id: 'tok-new', budget_usd: 4, budget_period: '1d' })],
+    pages: [[
+      { token: 'tok-old', key_alias: 'fde-alice', spend: 99, max_budget: 4, budget_duration: '1d' },
+      { token: 'tok-new', key_alias: 'fde-alice', spend: 0.5, max_budget: 4, budget_duration: '1d' },
+    ]],
+  });
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(out.rows.length, 1);
+  assert.equal(out.rows[0].spend, 0.5, '必须取 token==key_id 那条（0.5），不是同别名旧行（99）');
+});
+
+// ③ state='revoked' 的绑定不出现在 rows。
+test('listFdeKeyUsage：state=revoked 的绑定不进 rows（只有 active+litellm 参与）', async () => {
+  const pool = keyUsagePool({
+    users: [
+      { id: 'u1', fde_name: 'alice', status: 'active' },
+      { id: 'u2', fde_name: 'bob', status: 'active' },
+    ],
+    bindings: [
+      litellmBinding({ fde_id: 'u1', key_id: 'tok-a', budget_usd: 1, budget_period: '1d' }),
+      litellmBinding({ fde_id: 'u2', key_id: 'tok-b', state: 'revoked', api_key: null }),
+    ],
+    pages: [[
+      { token: 'tok-a', key_alias: 'fde-alice', spend: 0.1, max_budget: 1, budget_duration: '1d' },
+      { token: 'tok-b', key_alias: 'fde-bob', spend: 7, max_budget: 1, budget_duration: '1d' },
+    ]],
+  });
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.deepEqual(out.rows.map((r) => r.fde_name), ['alice']);
+});
+
+// ④ 网关里没有对应 key ⇒ spend=null 且 spend_scope=null（不得猜 0）。
+test('listFdeKeyUsage：网关里没有对应 key ⇒ spend/spend_scope 一律 null（不猜 0）', async () => {
+  const pool = keyUsagePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [litellmBinding({ fde_id: 'u1', key_id: 'tok-missing', budget_usd: 2, budget_period: '1mo' })],
+    pages: [[{ token: 'tok-other', key_alias: 'fde-alice', spend: 3.3, max_budget: 2, budget_duration: '1mo' }]],
+  });
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(out.rows.length, 1);
+  assert.equal(out.rows[0].spend, null);
+  assert.equal(out.rows[0].spend_scope, null);
+  assert.equal(out.rows[0].remaining, null);
+  // 金额取不到，但 DB 的额度口径仍保留。
+  assert.equal(out.rows[0].budget_usd, 2);
+  assert.equal(out.rows[0].budget_period, '1mo');
+});
+
+// ⑤ budget_duration 为空 ⇒ spend_scope='lifetime'（灰字「累」的唯一判据）。
+test('listFdeKeyUsage：key 无 budget_duration ⇒ spend_scope=lifetime（有 spend 也是终身累计）', async () => {
+  const pool = keyUsagePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [litellmBinding({ fde_id: 'u1', key_id: 'tok-life', budget_usd: null, budget_period: null })],
+    pages: [[{ token: 'tok-life', key_alias: 'fde-alice', spend: 5.09, max_budget: null, budget_duration: null }]],
+  });
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(out.rows[0].spend_scope, 'lifetime');
+  assert.equal(out.rows[0].spend, 5.09);
+  assert.equal(out.rows[0].budget_duration, null);
+});
+
+// ⑥ 网关抛错 ⇒ listFdeKeyUsage 向上抛（不吞）。
+test('listFdeKeyUsage：网关 listKeys 抛错 ⇒ 向上冒泡（那一列自己降级，不在此吞）', async () => {
+  const pool = keyUsagePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [litellmBinding({ fde_id: 'u1', key_id: 'tok-a' })],
+    error: new Error('gateway unreachable'),
+  });
+  await assert.rejects(listFdeKeyUsage(pool, { gateway: pool }), /gateway unreachable/);
+});
+
+// ⑦ bulk 存在的全部理由：绑定数与网关调用次数**无关**（评审 NIT：这条之前没被钉住）。
+test('listFdeKeyUsage：三条绑定 ⇒ 网关 listKeys 只调一次（整表一次，不是每人一次）', async () => {
+  const users = ['ana', 'bob', 'cid'].map((n, i) => ({ id: `u${i}`, fde_name: n, status: 'active' }));
+  const pool = keyUsagePool({
+    users,
+    bindings: users.map((u) => litellmBinding({ fde_id: u.id, key_id: `tok-${u.fde_name}` })),
+    pages: [users.map((u) => ({ token: `tok-${u.fde_name}`, spend: 0.5, budget_duration: null }))],
+  });
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(pool.listKeysCalls.length, 1, `整表必须一次取完，实际打了 ${pool.listKeysCalls.length} 次`);
+  assert.deepEqual(out.rows.map((r) => r.fde_name), ['ana', 'bob', 'cid']);
+  assert.equal(out.truncated, false, '一页装得下就不算部分结果');
+});
+
+// ⑧ 保险丝到顶 ⇒ 必须明说「这是部分结果」，不许混在 200 里当全量（评审 SHOULD-1）。
+test('listFdeKeyUsage：还有下一页却没取完 ⇒ truncated=true，且没匹配上的绑定走「无读数」而不是 0', async () => {
+  const pool = keyUsagePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [litellmBinding({ fde_id: 'u1', key_id: 'tok-missing' })],
+  });
+  // 每页都给满 100 条、并声称共 99 页 ⇒ 20 页保险丝必然到顶。
+  pool.listKeys = async (query) => {
+    pool.listKeysCalls.push(query);
+    return {
+      keys: Array.from({ length: 100 }, (_, i) => ({ token: `tok-${query.page}-${i}` })),
+      total_count: 9900, current_page: query.page, total_pages: 99,
+    };
+  };
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(pool.listKeysCalls.length, 20, '保险丝应在 20 页收口（既不翻到死，也不静默少翻）');
+  assert.equal(out.truncated, true);
+  assert.equal(out.rows[0].spend, null, '没匹配到 key 的绑定必须是「无读数」，不是 $0.00');
+  assert.equal(out.rows[0].spend_scope, null);
+});
+
+// ⑨ 网关不报 total_pages 这一族：给满一页 = 可能还有 ⇒ truncated；给半页 = 确实到底了。
+test('listFdeKeyUsage：网关没报 total_pages ⇒ 满满一页算截断、不满一页不算', async () => {
+  const mk = (count) => {
+    const pool = keyUsagePool({ users: [], bindings: [] });
+    pool.listKeys = async (query) => {
+      pool.listKeysCalls.push(query);
+      return { keys: Array.from({ length: count }, (_, i) => ({ token: `t${i}` })) };
+    };
+    return pool;
+  };
+  const fullPage = mk(100);
+  assert.equal((await listFdeKeyUsage(fullPage, { gateway: fullPage })).truncated, true);
+  assert.equal(fullPage.listKeysCalls.length, 1, '不许为了猜有没有下一页就多翻');
+  const halfPage = mk(7);
+  assert.equal((await listFdeKeyUsage(halfPage, { gateway: halfPage })).truncated, false);
+});
+
+// ⑩ 金额字段的「空白 ≠ 0」（评审 SHOULD-2）：网关字段回空串/空白串 ⇒ 无读数，不是 $0.00。
+test('listFdeKeyUsage：key 的 spend 是空白串 ⇒ 该行 spend 为 null（钱没有「空白」这种值，只有有无）', async () => {
+  const pool = keyUsagePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [litellmBinding({ fde_id: 'u1', key_id: 'tok-blank' })],
+    pages: [[{ token: 'tok-blank', spend: '   ', max_budget: ' ', budget_duration: null }]],
+  });
+  const out = await listFdeKeyUsage(pool, { gateway: pool });
+  assert.equal(out.rows[0].spend, null, '空白串被当 0 就会把「没读数」显示成「一分没花」');
+  assert.equal(out.rows[0].max_budget, null);
+  assert.equal(out.rows[0].remaining, null);
 });
