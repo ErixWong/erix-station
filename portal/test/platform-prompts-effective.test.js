@@ -250,6 +250,42 @@ test('E12 响应键集合', async (t) => {
   assert.ok(EFFECTIVE_DISK_STATES.includes(dto.disk.state));
 });
 
+test('E13 父目录是 symlink 也不越界', async (t) => {
+  // 场景：宿主机上 `<用户空间根>/<fde>` 与 `<用户空间根>/<fde>/home` 两级归工位用户可写，
+  // 工位把 `home` 整跳换成指向**根外**目录的 symlink ⇒ 只靠词法 containment 的话，
+  // `lstat` 看末端是普通文件、`open` 跟随中间的 `home` ⇒ 会读到用户空间之外那份。
+  const fde = 'alice';
+  const r = makeRoot({ fde }); t.after(r.cleanup);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'eff-outside-'));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const marker = 'E13-越界读探针串-801';
+  fs.writeFileSync(path.join(outside, 'AGENTS.md'), `根外那份 ${marker}\n`);
+  fs.rmdirSync(r.home); // 先拿掉真 home 目录（未写文件时是空的），再把同位置做成指向根外的 symlink
+  fs.symlinkSync(outside, r.home);
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  // 不抛：越界是 `state`，不是异常。
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: r.root, fdeName: fde, log: quietLog });
+  assert.equal(dto.disk.state, 'not_a_file');
+  assert.equal(dto.disk.text, null);
+  assert.equal(dto.matches, null);
+  const whole = JSON.stringify(dto);
+  assert.ok(!whole.includes(marker), `响应里泄露了根外文件的内容：${whole.slice(0, 200)}`);
+});
+
+test('E14 目录还没物化仍是 missing', async (t) => {
+  // `<fde>` 存在但没有 `home` 这一跳：realpath 那一跳 ENOENT 必须**放过**，交给 `lstat` 的 ENOENT
+  // 走 `missing`。这一格存在的唯一理由是挡住「把 ENOENT 判成 read_failed」的写法。
+  const fde = 'alice';
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'eff-userspace-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, fde), { recursive: true }); // 只建 `<fde>`，不建 `home`
+  const pool = new EfPool({ user: { fde_name: fde }, promptsRow: promptsRow() });
+  const dto = await getEffectiveAgentsMd({ pool, userSpaceRoot: root, fdeName: fde, log: quietLog });
+  assert.equal(dto.disk.state, 'missing');
+  assert.equal(dto.matches, null);
+  assert.equal(dto.disk.text, null);
+});
+
 // ── HTTP 层格子 H1–H4 ────────────────────────────────────────────────────────────
 
 const ADMIN = {

@@ -201,8 +201,10 @@ function api(p, opts = {}) {
 // 探测：把「能不能登进去 + UI 腿的环境形状」在模块加载时各取一次；只读不断言。
 // reasons[leg] 有值 = 那条腿 skip（值是给人看的原因）；没有该 key = 那条腿要跑。
 // `uiEnvBlocked`：点名了 UI 腿但环境装配不起来（缺容器 / 缺模块 / docker 不可用）——哨兵据此判红。
+// `loginBlocked`：口令文件在、HTTP 也答了，但登录没拿到会话 cookie ⇒「栈活着而登录失败」不是
+//   环境形状，哨兵据此判红；连接类失败（栈没起）不置它，那才是合法的 skip。
 // ---------------------------------------------------------------------------
-const probe = { reasons: {}, uiEnvBlocked: false, loginStatus: null };
+const probe = { reasons: {}, uiEnvBlocked: false, loginStatus: null, loginBlocked: false };
 
 async function gather() {
   // 本腿两条腿都要点名才跑：A3 会写 dev 库，默认 `node --test` 整只 skip（rc=0）。
@@ -231,6 +233,8 @@ async function gather() {
   probe.loginStatus = login.status;
   if (login.status !== 200 || login.cookies.length === 0) {
     const code = login.json?.error?.code;
+    // 拿到了 HTTP 响应但没有会话 cookie：dev 栈是活的，这不是「环境没起」的形状 ⇒ 哨兵判红用。
+    probe.loginBlocked = true;
     probe.reasons.http = `登录没拿到会话 cookie（HTTP ${login.status}${code ? ` ${code}` : ''}`
       + `${login.json?.pending_token ? '，响应带 pending_token ⇒ 这个账号开了第二因素，本脚本只会口令直通' : ''}）`;
     probe.reasons.ui = `${probe.reasons.http} ⇒ UI 腿要登管理台`;
@@ -305,13 +309,14 @@ test('A2 负例三条', { skip: probe.reasons.http || false, timeout: 60_000 }, 
 
 test('A3 存追加段 ⇒ 先不一致再收敛', { skip: probe.reasons.http || false, timeout: 300_000 }, async (t) => {
   need(t, 'http', cookieHeader());
-  const save = await api('/api/admin/prompts/addendum', { method: 'PUT', body: { text: MARK } });
-  assert.equal(save.status, 200, `存追加段期望 200，得到 ${save.status}`);
-  assert.ok((save.json?.materializeEnqueued ?? 0) > 0, `materializeEnqueued 应 >0，得到 ${save.json?.materializeEnqueued}`);
-
   let sawStale = false;
   let converged = null;
   try {
+    // 写入与两条断言必须在 try **内**：断言一失败也要走 finally 的复位，否则 dev 栈被留在脏标记上。
+    const save = await api('/api/admin/prompts/addendum', { method: 'PUT', body: { text: MARK } });
+    assert.equal(save.status, 200, `存追加段期望 200，得到 ${save.status}`);
+    assert.ok((save.json?.materializeEnqueued ?? 0) > 0, `materializeEnqueued 应 >0，得到 ${save.json?.materializeEnqueued}`);
+
     for (let i = 0; i < 40; i += 1) {
       const d = (await api(EFF_PATH)).json ?? {};
       if (d.matches === false) sawStale = true;
@@ -503,5 +508,11 @@ test('哨兵：点名要跑时口令文件与 playwright 容器必须齐（禁�
   }
   if (probe.uiEnvBlocked) {
     assert.fail(`E2E_UI=1 点名要跑但 UI 腿装配不起来：${probe.reasons.ui} ⇒ 判失败（不许静默 skip 拿 rc=0）。`);
+  }
+  if (probe.loginBlocked) {
+    // 口令文件在（上面已验）却登录失败 ⇒ 栈活着；全腿 skip 拿 rc=0 是假通过，这不是 skip 的形状。
+    // 只报 HTTP 状态与原因，**不要把口令值打进去**。
+    assert.fail(`E2E_UI=1 点名要跑：口令文件在但登录没成（${probe.reasons.http || `HTTP ${probe.loginStatus}`}）：`
+      + '栈活着而登录失败 ⇒ 这不是 skip 的形状（静默全 skip 会拿 rc=0 假通过）⇒ 判失败。');
   }
 });

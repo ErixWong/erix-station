@@ -660,6 +660,32 @@ export async function readDiskHomeAgentsMd({ userSpaceRoot, fdeName, log = conso
     throw err;
   }
   const stamp = (st) => (st?.mtime instanceof Date ? st.mtime.toISOString() : null);
+  // 父目录 realpath containment（#801 返修 H1）：`home` 这一跳**本身**可以是 symlink——宿主机上
+  // `<userSpaceRoot>/<fde>` 与 `<userSpaceRoot>/<fde>/home` 这两级归工位用户可写（容器内才是 `:ro`），
+  // 工位把 `home` 换成指向别处的 symlink 时，上面那道**词法** containment（`homeAgentsMdPathOf`）
+  // 照样放行，而 `lstat` 只看末端、`open` 会跟随中间的 `home` ⇒ portal 会把用户空间之外的文件
+  // 当成「盘上真那份」。所以这里对根与 root 各取 realpath，再按**同一套三条**判越界。
+  // **为什么只对最深一跳判**：逐级 dirfd（`openat` 一路开到底）要重做整条读路径的打开方式，
+  // 代价是给一个 64 KiB 只读展示文件上整套目录遍历；末端那一跳已由 `lstat` + `O_NOFOLLOW` 钉死，
+  // 剩下的只是「父目录这一跳在 realpath 与 open 之间被换掉」的 check-then-open 竞态——已知残余，
+  // 理由与代价见 docs/api/portal.md §4.19-5。
+  try {
+    const realBase = await fs.promises.realpath(path.resolve(userSpaceRoot));
+    const realRoot = await fs.promises.realpath(root);
+    const relReal = path.relative(realBase, realRoot);
+    // 越界判据照 `homeAgentsMdPathOf` 那三条：`''` / `..` 开头 / 绝对路径。
+    if (relReal === '' || relReal.startsWith('..') || path.isAbsolute(relReal)) {
+      return { ...none, state: 'not_a_file', bytes: null, mtime: null };
+    }
+  } catch (err) {
+    // ENOENT 是**放过**而不是失败：某一跳目录还没物化（新工位还没写过 AGENTS.md、或用户空间被
+    // 手工清过）是正常态，交给下面 `lstat` 的 ENOENT 走 `missing`；在这里判 `read_failed` 会把
+    // 「还没物化」说成「读坏了」。也不许顺手建目录（整条路径零副作用）。其余错误照 `lstat` 的口径。
+    if (err?.code !== 'ENOENT') {
+      log?.warn?.(`[platform-prompts] 读 ~/AGENTS.md 父目录失败 fde=${fdeName}：${err?.code ?? err?.message ?? err}`);
+      return { ...none, state: 'read_failed', bytes: null, mtime: null };
+    }
+  }
   let st;
   try {
     st = await fs.promises.lstat(target);
@@ -677,7 +703,10 @@ export async function readDiskHomeAgentsMd({ userSpaceRoot, fdeName, log = conso
   }
   let handle;
   try {
-    handle = await fs.promises.open(target, 'r');
+    // `O_NOFOLLOW`：关掉**末端** AGENTS.md 的 check-then-open 竞态——`lstat` 说它是普通文件与
+    // `open` 之间被换成 symlink 时，这里报 `ELOOP` 而不是跟随出去（父目录那一跳的同类竞态是
+    // 已知残余，见上面 realpath 那段与 docs/api/portal.md §4.19-5）。
+    handle = await fs.promises.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     // 多读 1 字节当「是否超限」的判据（不靠 `size` 猜：读到的才是事实）。
     const cap = EFFECTIVE_DISK_READ_MAX_BYTES;
     const buf = Buffer.alloc(Math.min(st.size, cap) + 1);
@@ -694,6 +723,11 @@ export async function readDiskHomeAgentsMd({ userSpaceRoot, fdeName, log = conso
       truncated,
     };
   } catch (err) {
+    if (err?.code === 'ELOOP') {
+      // 末端在 `lstat` 与 `open` 之间被换成 symlink ⇒ `O_NOFOLLOW` 报 `ELOOP`：形状问题，与 `lstat`
+      // 那一档同口径记 `not_a_file`。今天走不到（`lstat` 已挡），写成**代码事实**而不是「大概不会发生」。
+      return { ...none, state: 'not_a_file', bytes: st.size ?? null, mtime: stamp(st) };
+    }
     log?.warn?.(`[platform-prompts] 读 ~/AGENTS.md 正文失败 fde=${fdeName}：${err?.code ?? err?.message ?? err}`);
     return { ...none, state: 'read_failed', bytes: st.size ?? null, mtime: stamp(st) };
   } finally {

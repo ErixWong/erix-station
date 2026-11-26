@@ -3747,6 +3747,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 **读上限 64 KiB（`EFFECTIVE_DISK_READ_MAX_BYTES`）**：超过只给前 64 KiB，`truncated=true`，且**不再承诺** `sha256`/`matches`（都置 `null`）——`disk.bytes` 仍是**真实大小**。
 
 **路径牢笼三条**：① `fde_name` 必过 `FDE_NAME_RE`⇒ 天然单段，`..` 进不来；② 解析后再钉一次 containment（相对根不得越界）；③ 只当普通文件读（symlink/目录 ⇒ `not_a_file`）。
+其中②是**两道**：拼出来的路径先过**词法** containment，打开前再对 `<用户空间根>` 与 `<用户空间根>/<fde>/home` 各取一次 realpath 判**同一套三条**（宿主机上那两级目录归工位用户可写，`home` 这一跳本身可以是 symlink，只判词法会把用户空间之外的文件当成「盘上真那份」）；③的末端另加 `O_NOFOLLOW`（`lstat` 与 `open` 之间末端被换成 symlink ⇒ `ELOOP` ⇒ 同样 `not_a_file`）；**残余**：realpath 与 `open` 之间「`home` 那一跳被换掉」的 check-then-open 竞态没有堵——堵它要把整条读路径改成逐级 `openat(dirfd)`（每级目录按 fd 打开、不再按名字解析），为一个「工位挪走自己的 `home` 又瞬间换回」的窗口换掉整个打开实现，不划算。
 用户查找**不限 status**（停用/保留期工位的盘上那份仍是可读对象，口径同 #727）。
 
 **零写零审计**：整条路径只有两条 `SELECT`（取用户 + 取 `platform_prompts`）；页每次挂载都发，审计不承重（`GET /api/admin/prompts` 本来也不审计）。
@@ -3754,7 +3755,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 没配用户空间根是 `500 internal`（配置问题照旧上报，不当「盘上没有」）。
 
 ⚠ **§4.19-1 的 `example` 预览与本节的真工位渲染是两件事**：§4.19-1 的 `templateBytes`/`effectiveText` 用固定示例名 `example` 渲染（为了可对比、零动态量），本节用真工位名 ⇒ 同一份 DB 输入，两处字节可以不同（标识行随真名变长）。
-单测：`portal/test/platform-prompts-effective.test.js`（`E1`–`E12` + HTTP `H1`–`H4`）。
+单测：`portal/test/platform-prompts-effective.test.js`（`E1`–`E14` + HTTP `H1`–`H4`）。
 
 ---
 
