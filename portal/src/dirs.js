@@ -11,11 +11,14 @@ import { CWD_RE, validateSessionCwd } from './sessions.js';
 import { commitTempFile, commitTempFileNoClobber, writeTempFileFromStream } from './fsutil.js';
 
 export class DirError extends Error {
-  constructor(code, message, { httpStatus = 400, details, retryable = false } = {}) {
+  constructor(code, message, { httpStatus = 400, details, retryable = false, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 S2-C：可选英文对（同 AdminError/HttpError/SessionError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状、message 与 retryable 语义一字不动。
+    this.en = en;
     // issue #472：**默认 false ⇒ 既有全部 DirError 的响应逐字节不变**，而 `upload_interrupted` 需要
     // 「重发即可」的语义。http.js 的 DirError 映射分支从硬编码 `false` 改成读这个字段（与 #261014
     // 的 LlmError 同一先例）——**没加新映射分支**，只是让已有的分支能读错误自带的值。
@@ -51,7 +54,7 @@ function isListedDirName(name) {
  * running = 'running' + 'cancelling'，与 sessions ACTIVE_RUN_STATES 同口径）。
  */
 export async function listDirs(pool, { userId, userSpaceRoot, fdeName, log = console } = {}) {
-  if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
+  if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500, en: 'userSpaceRoot/fde_name is missing' });
   const projectsRoot = path.join(path.resolve(userSpaceRoot), fdeName, 'projects');
 
   let names = [];
@@ -117,7 +120,7 @@ function resolveJailedRoot({
   userSpaceRoot, fdeName, cwd, relPath,
   notFoundHint = 'path', symlinkHint = '列出', requireConcreteRelPath = false,
 } = {}) {
-  if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
+  if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500, en: 'userSpaceRoot/fde_name is missing' });
   let safeCwd;
   try {
     safeCwd = validateSessionCwd(cwd); // 400 validation_failed（形态不合法 / . / ..）
@@ -148,13 +151,13 @@ function resolveJailedRoot({
 
   // `resolveJailedFile` 的特判（必须指向具体文件，不接受 '.' / 空）：位置与原实现逐字对齐（根校验之后）。
   if (requireConcreteRelPath && (typeof relPath !== 'string' || relPath.length === 0 || relPath === '.')) {
-    throw new DirError('validation_failed', 'path 必须指向具体文件', { details: { field: 'path' } });
+    throw new DirError('validation_failed', 'path 必须指向具体文件', { en: 'path must point to a specific file', details: { field: 'path' } });
   }
   const target = path.resolve(root, String(relPath ?? '.'));
   if (target !== root) {
     const relToRoot = path.relative(root, target);
     if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
-      throw new DirError('validation_failed', 'path 不得逃逸目录根', { details: { field: 'path' } });
+      throw new DirError('validation_failed', 'path 不得逃逸目录根', { en: 'path must not escape the directory root', details: { field: 'path' } });
     }
   }
 
@@ -174,13 +177,14 @@ function resolveJailedRoot({
         throw err;
       }
       if (st.isSymbolicLink()) {
-        throw new DirError('validation_failed', `path 含符号链接，拒绝${symlinkHint}`, { details: { field: 'path' } });
+        throw new DirError('validation_failed', `path 含符号链接，拒绝${symlinkHint}`, { en: `path contains a symlink; refusing to ${symlinkHint}`, details: { field: 'path' } });
       }
       // issue #726 附带：工作台侧同 `resolveJailedUnderProjects` 收紧——路径段是
       // `.git` 且该段是目录 ⇒ 拒绝（git 元数据不泄给预览/树）。
       // `.gitignore` 这类同名前缀文件不受影响。
       if (seg === '.git' && st.isDirectory()) {
         throw new DirError('validation_failed', 'path 不得进入 .git 目录', {
+          en: 'path must not enter the .git directory',
           details: { field: 'path' },
         });
       }
@@ -203,7 +207,7 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
   const st = fs.lstatSync(target);
   if (!st.isDirectory()) {
     // 文件节点：树面板懒展开只列目录；文件点击是 P6 预览（本端点只回目录）。
-    throw new DirError('validation_failed', 'path 必须是目录', { details: { field: 'path' } });
+    throw new DirError('validation_failed', 'path 必须是目录', { en: 'path must be a directory', details: { field: 'path' } });
   }
 
   const entries = [];
@@ -231,7 +235,7 @@ export function resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath, notFou
   });
   const st = fs.lstatSync(target);
   if (!st.isFile()) {
-    throw new DirError('validation_failed', 'path 必须是文件', { details: { field: 'path' } });
+    throw new DirError('validation_failed', 'path 必须是文件', { en: 'path must be a file', details: { field: 'path' } });
   }
   // issue #726：额外返回 root（只增字段，既有字段不变）：调用方 openVerifiedFd
   // 需要它做 fd 真实路径的 containment 校验。
@@ -259,7 +263,7 @@ export function resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath, notFou
  */
 export function resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath = '.' } = {}) {
   if (!userSpaceRoot || !fdeName) {
-    throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
+    throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500, en: 'userSpaceRoot/fde_name is missing' });
   }
   const root = path.resolve(userSpaceRoot, fdeName, 'projects');
 
@@ -283,6 +287,7 @@ export function resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath = '
   for (const seg of raw.split('/')) {
     if (seg === '..') {
       throw new DirError('validation_failed', 'path 不得逃逸目录根', {
+        en: 'path must not escape the directory root',
         details: { field: 'path' },
       });
     }
@@ -293,6 +298,7 @@ export function resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath = '
     const relToRoot = path.relative(root, target);
     if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
       throw new DirError('validation_failed', 'path 不得逃逸目录根', {
+        en: 'path must not escape the directory root',
         details: { field: 'path' },
       });
     }
@@ -317,12 +323,14 @@ export function resolveJailedUnderProjects({ userSpaceRoot, fdeName, relPath = '
       }
       if (st.isSymbolicLink()) {
         throw new DirError('validation_failed', 'path 含符号链接，拒绝读取', {
+          en: 'path contains a symlink; refusing to read',
           details: { field: 'path' },
         });
       }
       // 只拦目录：`.gitignore` 这类同名前缀文件是可预览的正常项目文件。
       if (seg === '.git' && st.isDirectory()) {
         throw new DirError('validation_failed', 'path 不得进入 .git 目录', {
+          en: 'path must not enter the .git directory',
           details: { field: 'path' },
         });
       }
@@ -351,7 +359,7 @@ function parseTreeCursor(after) {
   const rank = at > 0 ? raw.slice(0, at) : '';
   const name = raw.slice(at + 1); // name 里允许含 `:`（文件名合法），故只按首个冒号切
   if ((rank !== 'd' && rank !== 'f') || name === '') {
-    throw new DirError('validation_failed', 'after 非法', { details: { field: 'after' } });
+    throw new DirError('validation_failed', 'after 非法', { en: 'invalid after', details: { field: 'after' } });
   }
   return { rank, name };
 }
@@ -375,7 +383,7 @@ export async function fileTreeUnderProjects(
   });
   const st = fs.lstatSync(target);
   if (!st.isDirectory()) {
-    throw new DirError('validation_failed', 'path 必须是目录', { details: { field: 'path' } });
+    throw new DirError('validation_failed', 'path 必须是目录', { en: 'path must be a directory', details: { field: 'path' } });
   }
 
   const entries = [];
@@ -447,10 +455,10 @@ export function resolveJailedDir({ userSpaceRoot, fdeName, cwd, relPath = '.', n
     throw err;
   }
   if (st.isSymbolicLink()) {
-    throw new DirError('validation_failed', 'path 含符号链接，拒绝写入', { details: { field: 'path' } });
+    throw new DirError('validation_failed', 'path 含符号链接，拒绝写入', { en: 'path contains a symlink; refusing to write', details: { field: 'path' } });
   }
   if (!st.isDirectory()) {
-    throw new DirError('validation_failed', 'path 必须是目录', { details: { field: 'path' } });
+    throw new DirError('validation_failed', 'path 必须是目录', { en: 'path must be a directory', details: { field: 'path' } });
   }
   return { dir: target, rel, root, project };
 }
@@ -463,10 +471,11 @@ export function resolveJailedDir({ userSpaceRoot, fdeName, cwd, relPath = '.', n
  */
 function assertSafeUploadName(name) {
   if (!isSafeDirName(name)) {
-    throw new DirError('validation_failed', 'name 不是合法文件名', { details: { field: 'name' } });
+    throw new DirError('validation_failed', 'name 不是合法文件名', { en: 'name is not a valid file name', details: { field: 'name' } });
   }
   if (Buffer.byteLength(name, 'utf8') > UPLOAD_NAME_MAX_BYTES) {
     throw new DirError('validation_failed', `name 超过 ${UPLOAD_NAME_MAX_BYTES} 字节`, {
+      en: `name exceeds ${UPLOAD_NAME_MAX_BYTES} bytes`,
       details: { field: 'name', max_bytes: UPLOAD_NAME_MAX_BYTES },
     });
   }
@@ -527,13 +536,13 @@ export async function receiveUpload({
     // 最终 symlink 一律拒，**与 overwrite 无关**：目标是 symlink 时 rename 换的是链接本身，
     // 而 lstat 之后到写入之前它还可能被换成指向 jail 外的东西 ⇒ 覆盖语义保不住 jail。
     if (existing.isSymbolicLink()) {
-      throw new DirError('validation_failed', '目标是符号链接，拒绝写入', { details: { field: 'name' } });
+      throw new DirError('validation_failed', '目标是符号链接，拒绝写入', { en: 'the target is a symlink; refusing to write', details: { field: 'name' } });
     }
     if (existing.isDirectory()) {
-      throw new DirError('validation_failed', '目标是一个目录，不能当文件写', { details: { field: 'name' } });
+      throw new DirError('validation_failed', '目标是一个目录，不能当文件写', { en: 'the target is a directory and cannot be written as a file', details: { field: 'name' } });
     }
     if (!overwrite) {
-      throw new DirError('file_exists', '目标文件已存在', { httpStatus: 409, details: { path: relPathOut } });
+      throw new DirError('file_exists', '目标文件已存在', { httpStatus: 409, details: { path: relPathOut }, en: 'the target file already exists' });
     }
   }
 
@@ -545,12 +554,14 @@ export async function receiveUpload({
   } catch (err) {
     if (err?.code === 'upload_too_large') {
       throw new DirError('file_too_large', `上传超过上限（${err.maxBytes} 字节）`, {
+        en: `the upload exceeds the limit (${err.maxBytes} bytes)`,
         httpStatus: 413,
         details: { max_bytes: err.maxBytes, bytes: err.bytes },
       });
     }
     if (err?.code === 'upload_interrupted') {
       throw new DirError('upload_interrupted', '上传在传输完成前中断', {
+        en: 'the upload was interrupted before the transfer completed',
         httpStatus: 400,
         retryable: true,
         details: { bytes: err.bytes },
@@ -576,6 +587,7 @@ export async function receiveUpload({
       if (err?.code === 'EISDIR' || err?.code === 'ENOTEMPTY') {
         try { fs.unlinkSync(tmp); } catch {}
         throw new DirError('file_exists', '目标在传输期间变成了目录，无法覆盖', {
+          en: 'the target became a directory during the transfer and cannot be overwritten',
           httpStatus: 409, details: { path: relPathOut, reason: 'target_is_dir' },
         });
       }
@@ -584,7 +596,7 @@ export async function receiveUpload({
     overwritten = true;
   } else if (!commitTempFileNoClobber(tmp, target, { root: dir })) {
     // d 与 e 之间目标被别人（agent / 另一个上传）创建了 ⇒ 与 c 同一个码，调用方不必区分。
-    throw new DirError('file_exists', '目标文件已存在（提交点竞态）', { httpStatus: 409, details: { path: relPathOut } });
+    throw new DirError('file_exists', '目标文件已存在（提交点竞态）', { httpStatus: 409, details: { path: relPathOut }, en: 'the target file already exists (commit-point race)' });
   }
 
   // f. DTO（docs/api/portal.md §4.14）。
@@ -614,6 +626,7 @@ export async function readFilePreview(
     const st = await fh.stat();
     if (st.size > FILE_PREVIEW_MAX_BYTES) {
       throw new DirError('file_too_large', `文件超过预览上限（${Math.floor(FILE_PREVIEW_MAX_BYTES / 1024 / 1024)}MB）`, {
+        en: `the file exceeds the preview limit (${Math.floor(FILE_PREVIEW_MAX_BYTES / 1024 / 1024)}MB)`,
         httpStatus: 413,
       });
     }
@@ -628,7 +641,7 @@ export async function readFilePreview(
     // 非图片：前 8KB NUL 嗅探判二进制（UTF-8 文本不可能含 NUL；二进制不猜测解码）。
     const head = buf.subarray(0, 8192);
     if (head.includes(0)) {
-      throw new DirError('unsupported_file_type', '二进制文件不支持预览', { httpStatus: 415 });
+      throw new DirError('unsupported_file_type', '二进制文件不支持预览', { httpStatus: 415, en: 'binary file preview is not supported' });
     }
     return { name: path.basename(target), path: rel, kind: 'text', data: buf.toString('utf8') };
   } finally {
@@ -652,6 +665,7 @@ function resolvePreviewFile({ userSpaceRoot, fdeName, cwd, relPath, rootKind = '
     const st = fs.lstatSync(target);
     if (!st.isFile()) {
       throw new DirError('validation_failed', 'path 必须是文件', {
+        en: 'path must be a file',
         details: { field: 'path' },
       });
     }
@@ -699,6 +713,7 @@ async function openVerifiedFd({ target, root } = {}) {
   if (relToReal.startsWith('..') || path.isAbsolute(relToReal)) {
     await fh.close();
     throw new DirError('validation_failed', 'path 越出目录根，拒绝读取', {
+      en: 'path is outside the directory root; refusing to read',
       details: { field: 'path' },
     });
   }
@@ -797,6 +812,7 @@ export async function openFileStream({
   });
   if (st.size > FILE_STREAM_MAX_BYTES) {
     throw new DirError('file_too_large', `文件超过流式上限（${Math.floor(FILE_STREAM_MAX_BYTES / 1024 / 1024)}MB）`, {
+      en: `the file exceeds the stream limit (${Math.floor(FILE_STREAM_MAX_BYTES / 1024 / 1024)}MB)`,
       httpStatus: 413,
     });
   }

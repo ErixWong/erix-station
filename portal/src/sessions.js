@@ -30,11 +30,14 @@ import { chatCompletionsUrl, extractAssistantText, redactSecret } from './llm-ch
 import { JAIL_RUN_CWD_HOST_SUFFIXES } from '../shared/jail-mounts.js';
 
 export class SessionError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, en } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #803 S2-C：可选英文对（同 AdminError/HttpError 口径）。`super(message)` 仍传中文原文，
+    // http.js 的 pickMessage 按 locale 读 `err.en`，缺省照旧出中文——错误体形状与 message 一字不动。
+    this.en = en;
   }
 }
 
@@ -53,12 +56,14 @@ export function validateSessionCwd(value) {
   const m = typeof value === 'string' && CWD_RE.exec(value);
   if (!m) {
     throw new SessionError('validation_failed', 'project_id（cwd）必须是 ~/projects/<name> 一级目录形式', {
+      en: 'project_id (cwd) must be a single-level directory of the form ~/projects/<name>',
       details: { field: 'project_id' },
     });
   }
   const name = m[1];
   if (name === '.' || name === '..' || /[\x00-\x1f\x7f]/.test(name)) {
     throw new SessionError('validation_failed', '目录名非法（拒绝 . / .. / 控制字符）', {
+      en: 'invalid directory name (must not be ".", "..", or contain control characters)',
       details: { field: 'project_id' },
     });
   }
@@ -86,7 +91,7 @@ export function validateSessionCwd(value) {
  */
 export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
   if (typeof cwd !== 'string' || cwd.trim() === '') {
-    throw new SessionError('validation_failed', 'cwd 不能为空', { details: { field: 'cwd' } });
+    throw new SessionError('validation_failed', 'cwd 不能为空', { en: 'cwd cannot be empty', details: { field: 'cwd' } });
   }
   const value = cwd.trim();
 
@@ -98,6 +103,7 @@ export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
   // 非绝对路径（如 `projects/x`、相对 `foo`）既不是会话约定也不可信 ⇒ 拒。
   if (!path.isAbsolute(value)) {
     throw new SessionError('validation_failed', 'cwd 必须是 ~/projects/<name> 或 jail 内的绝对路径', {
+      en: 'cwd must be of the form ~/projects/<name> or an absolute path inside the jail',
       details: { field: 'cwd' },
     });
   }
@@ -107,6 +113,7 @@ export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
   const fde = typeof fdeName === 'string' && fdeName.trim() !== '' ? fdeName.trim() : null;
   if (!root || !fde) {
     throw new SessionError('validation_failed', '绝对 cwd 需要 userSpaceRoot 与 fde_name 才能判定 jail 归属', {
+      en: 'an absolute cwd requires userSpaceRoot and fde_name to determine which jail it belongs to',
       details: { field: 'cwd' },
     });
   }
@@ -115,15 +122,14 @@ export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
   const rel = path.relative(jailRoot, target);
   // 逃出 jail（rel 以 `..` 开头或为空/绝对）⇒ 拒。
   if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-    throw new SessionError('validation_failed', `cwd 越出用户 jail（${jailRoot}）：${value}`, {
-      details: { field: 'cwd' },
-    });
+    throw new SessionError('validation_failed', `cwd 越出用户 jail（${jailRoot}）：${value}`, { en: `cwd is outside the user jail (${jailRoot}): ${value}`, details: { field: 'cwd' } });
   }
   // 第一段子目录必须是允许当 run cwd 的 jail 子目录（home / projects / cache；platform/git 被排除）。
   const firstSeg = rel.split(path.sep)[0];
   if (!JAIL_RUN_CWD_HOST_SUFFIXES.includes(firstSeg)) {
     const allowed = JAIL_RUN_CWD_HOST_SUFFIXES.join(', ');
     throw new SessionError('validation_failed', `cwd 所在 jail 子目录不可作 run 目录（允许：${allowed}）：${value}`, {
+      en: `the jail subdirectory of cwd cannot be used as a run directory (allowed: ${allowed}): ${value}`,
       details: { field: 'cwd', allowed: JAIL_RUN_CWD_HOST_SUFFIXES },
     });
   }
@@ -143,18 +149,18 @@ export const MAX_MESSAGE_CONTENT_LENGTH = 100_000;
 export function validateMessageBody(body) {
   const content = body?.content;
   if (typeof content !== 'string' || content.trim().length === 0) {
-    throw new SessionError('validation_failed', 'content 必填且非空', { details: { field: 'content' } });
+    throw new SessionError('validation_failed', 'content 必填且非空', { en: 'content is required and must not be empty', details: { field: 'content' } });
   }
   if (content.length > MAX_MESSAGE_CONTENT_LENGTH) {
-    throw new SessionError('validation_failed', `content 过长（≤${MAX_MESSAGE_CONTENT_LENGTH} 字符）`, { details: { field: 'content' } });
+    throw new SessionError('validation_failed', `content 过长（≤${MAX_MESSAGE_CONTENT_LENGTH} 字符）`, { en: `content is too long (≤${MAX_MESSAGE_CONTENT_LENGTH} characters)`, details: { field: 'content' } });
   }
   const raw = body?.attachments;
   if (raw !== undefined && !Array.isArray(raw)) {
-    throw new SessionError('validation_failed', 'attachments 必须为数组', { details: { field: 'attachments' } });
+    throw new SessionError('validation_failed', 'attachments 必须为数组', { en: 'attachments must be an array', details: { field: 'attachments' } });
   }
   const attachments = (raw ?? []).map((a) => {
     if (!a || typeof a !== 'object' || !['file', 'image'].includes(a.kind) || typeof a.path !== 'string' || !a.path) {
-      throw new SessionError('validation_failed', 'attachments 元素须为 {kind: file|image, path, name?}', { details: { field: 'attachments' } });
+      throw new SessionError('validation_failed', 'attachments 元素须为 {kind: file|image, path, name?}', { en: 'each attachments element must be {kind: file|image, path, name?}', details: { field: 'attachments' } });
     }
     // 只保留实际消费的字段（多送的 UI 字段既不落库也不参与幂等 hash）
     return a.name === undefined ? { kind: a.kind, path: a.path } : { kind: a.kind, path: a.path, name: a.name };
@@ -218,7 +224,7 @@ export function decodeSessionCursor(cursor) {
       return { updatedAt: obj.u, id: obj.i };
     }
   } catch { /* 非法编码落入统一报错 */ }
-  throw new SessionError('validation_failed', 'cursor 非法', { details: { field: 'cursor' } });
+  throw new SessionError('validation_failed', 'cursor 非法', { en: 'invalid cursor', details: { field: 'cursor' } });
 }
 
 /**
@@ -261,6 +267,7 @@ export async function listSessions(
     //（复审 MINOR 4）。全空白仍等于未传（地址栏里留个空格不该报错）。
     if (q.length > 100) {
       throw new SessionError('validation_failed', 'q 过长（≤100 字符）', {
+        en: 'q is too long (≤100 characters)',
         details: { field: 'q' },
       });
     }
@@ -308,10 +315,10 @@ export async function createSession(pool, { userId, projectId, title, model, con
   const cwd = validateSessionCwd(projectId);
   const name = CWD_RE.exec(cwd)[1];
   if (title !== undefined && (typeof title !== 'string' || title.length > 200)) {
-    throw new SessionError('validation_failed', 'title 必须为 ≤200 字符的字符串', { details: { field: 'title' } });
+    throw new SessionError('validation_failed', 'title 必须为 ≤200 字符的字符串', { en: 'title must be a string of at most 200 characters', details: { field: 'title' } });
   }
   if (model !== undefined && (typeof model !== 'string' || model.length > 100)) {
-    throw new SessionError('validation_failed', 'model 必须为 ≤100 字符的字符串', { details: { field: 'model' } });
+    throw new SessionError('validation_failed', 'model 必须为 ≤100 字符的字符串', { en: 'model must be a string of at most 100 characters', details: { field: 'model' } });
   }
 
   // 「＋新建目录」语义：目录不存在则创建（权限口径同 provisioner/materializer 工作区目录：
@@ -324,12 +331,13 @@ export async function createSession(pool, { userId, projectId, title, model, con
   const fdeName = fde.rows?.[0]?.fde_name;
   if (!fdeName) {
     throw new SessionError('validation_failed', '当前用户未配置 fde_name，无法确定家目录', {
+      en: 'the current user has no fde_name configured, so the home directory cannot be determined',
       details: { field: 'fde_name' },
     });
   }
   const userSpaceRoot = config?.userSpaceRoot;
   if (!userSpaceRoot) {
-    throw new SessionError('internal', 'userSpaceRoot 未配置', { httpStatus: 500 });
+    throw new SessionError('internal', 'userSpaceRoot 未配置', { httpStatus: 500, en: 'userSpaceRoot is not configured' });
   }
   ensureDirSafe(
     userSpaceRoot,
@@ -370,7 +378,7 @@ export async function getSession(
   let where = `session_id = $1`;
   if (messagesCursor != null) {
     if (!Number.isInteger(Number(messagesCursor)) || Number(messagesCursor) < 1) {
-      throw new SessionError('validation_failed', 'cursor 必须为正整数', { details: { field: 'cursor' } });
+      throw new SessionError('validation_failed', 'cursor 必须为正整数', { en: 'cursor must be a positive integer', details: { field: 'cursor' } });
     }
     params.push(Number(messagesCursor));
     where += ` AND seq < $3`;
@@ -520,7 +528,7 @@ export async function getFoldedPayload(
   await fetchSession(pool, sessionId, userId, { includeArchived });
   const n = Number(round);
   if (!Number.isInteger(n) || n < 0) {
-    throw new SessionError('validation_failed', 'round 必须为非负整数', { details: { field: 'round' } });
+    throw new SessionError('validation_failed', 'round 必须为非负整数', { en: 'round must be a non-negative integer', details: { field: 'round' } });
   }
   const res = await pool.query(
     `SELECT round, folded, folded_payload, record FROM transcript_rounds
@@ -715,7 +723,7 @@ async function rebuildFoldedRange(pool, { key, range, log }) {
 export async function updateSession(pool, { userId, sessionId, title }) {
   await fetchSession(pool, sessionId, userId);
   if (typeof title !== 'string' || title.length > 200) {
-    throw new SessionError('validation_failed', 'title 必须为 ≤200 字符的字符串', { details: { field: 'title' } });
+    throw new SessionError('validation_failed', 'title 必须为 ≤200 字符的字符串', { en: 'title must be a string of at most 200 characters', details: { field: 'title' } });
   }
   // issue #88：手工 PATCH 标题 → title_source='manual'（手工优先：自动更新只写 'auto' 行）。
   const res = await pool.query(
@@ -896,6 +904,7 @@ export async function postMessage(pool, {
       // 本分支接的是闸被放宽/其它字段撑爆记录这类回归。
       if (err?.code === 'transcript_record_too_large') {
         throw new SessionError('validation_failed', `消息过长，存不下这一轮记录（上限 ${MAX_ROUND_BYTES} 字节）`, {
+          en: `the message is too long to store this round's record (limit ${MAX_ROUND_BYTES} bytes)`,
           details: { field: 'content', max_bytes: MAX_ROUND_BYTES },
         });
       }
@@ -1249,7 +1258,7 @@ export async function resolveAiTitleProvider(pool, userId, { gatewayUrl = 'http:
   throw new SessionError(
     'llm_not_configured',
     '该 FDE 未配置 LiteLLM 虚拟 key（AI 改名需要一次 LLM 调用）：请在管理台配置 LiteLLM 模型',
-    { httpStatus: 409 },
+    { httpStatus: 409, en: 'this FDE has no LiteLLM virtual key configured (renaming with AI needs one LLM call); configure a LiteLLM model in the admin console' },
   );
 }
 
@@ -1278,7 +1287,7 @@ export async function generateAiTitle(pool, {
   const turns = await fetchUserTextTurns(pool, { sessionId, limit: AI_TITLE_CONTEXT_MESSAGES });
   const contexts = turns.map((turn) => turn.text);
   if (contexts.length === 0) {
-    throw new SessionError('no_user_messages', '会话还没有用户消息，无法生成标题', { httpStatus: 409 });
+    throw new SessionError('no_user_messages', '会话还没有用户消息，无法生成标题', { httpStatus: 409, en: 'the session has no user messages yet, so a title cannot be generated' });
   }
 
   const provider = await resolveAiTitleProvider(pool, userId, { gatewayUrl });
@@ -1306,7 +1315,7 @@ export async function generateAiTitle(pool, {
   const title = sanitizeTitle(text);
   if (title == null) {
     log?.warn?.(`[ai-title] 上游未返回可用标题（session=${sessionId}）`);
-    throw new SessionError('llm_upstream_failed', 'LLM 未返回可用的标题', { httpStatus: 502 });
+    throw new SessionError('llm_upstream_failed', 'LLM 未返回可用的标题', { httpStatus: 502, en: 'the LLM returned no usable title' });
   }
 
   // title_source='manual'：用户主动触发 → 任何自动流程（evaluateAutoTitle 只写 'auto' 行）不得覆盖。
