@@ -1,7 +1,7 @@
 // WorkbenchView 顶栏 i18n 单测（issue #101 P2）：
-//   ① zh-CN 基线：顶栏文案（☰ 导航 / cwd 徽标 title / who 拼接 / 管理台 / 登出 / ↓ 最新）与
+//   ① zh-CN 基线：顶栏文案（☰ 导航 / cwd 徽标 title / who 拼接 / 登出 / ↓ 最新）与
 //      aria-label（打开导航 / 调整侧栏宽度）走 i18n 后取值逐字不变；
-//   ② 顶栏语言切换菜单（LocaleSwitch）挂载在管理台/登出旁；切 English 后顶栏（含嵌套的侧栏
+//   ② 顶栏语言切换菜单（LocaleSwitch）挂载在登出旁（#821 后顶栏不再有「管理台」入口）；切 English 后顶栏（含嵌套的侧栏
 //      子组件）文案即时变英文，who 拼接改半角括号。
 // 约定（照 LoginView.spec 先例）：装配真实 i18n 单例，不 mock t()；每例 localStorage.clear() + setLocale('zh-CN')。
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';

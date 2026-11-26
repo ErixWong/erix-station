@@ -34,7 +34,7 @@ import { useMacroStore } from '../stores/macro';
 import { useGitLight } from '../composables/useGitLight';
 import { toDisplayText } from '../api'; // issue #281：失败详情进文案前过一道收口（不渗 [object Object]/undefined）
 
-// issue #101 P2：顶栏文案走 i18n（workbench.* / common.*）；LocaleSwitch 挂管理台/登出旁。
+// issue #101 P2：顶栏文案走 i18n（workbench.* / common.*）；LocaleSwitch 挂登出旁（#821 后顶栏不再有「管理台」入口）。
 const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
