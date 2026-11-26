@@ -5,6 +5,9 @@ import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { useSiteStore } from '../stores/site';
 import { hashUrl } from '../lib/hostGate';
+// #804：管理台必须自己挂语言切换。它是独立 origin（`admin.<伞域>:<端口>`），偏好不跟用户面共享；
+// 且 #450 边缘隔离之后「先在用户面切好再进来」这条前提已不成立（两个 host 各发一份 SPA）。
+import LocaleSwitch from '../components/LocaleSwitch.vue';
 
 const { t } = useI18n();
 const route = useRoute();
@@ -82,6 +85,9 @@ async function onLogout() {
       <h1 class="text-xl font-medium mb-0">{{ t('admin.title') }}</h1>
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
       <a v-if="hasWorkbench" data-test="back-to-workbench" :href="backToWorkbenchHref" class="text-sm underline">{{ t('admin.backToWorkbench') }}</a>
+      <!-- ⚠ 必须插在登出**之前**：本仓库 `AdminLayout.spec.ts` 用 `findAll('header button').at(-1)` 取登出那颗，
+           插到它之后会把登出按钮「换掉」（收口判据当场失真）。 -->
+      <LocaleSwitch />
       <button
         class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5"
         @click="onLogout"

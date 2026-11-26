@@ -10,9 +10,11 @@ import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import AdminLayout from './AdminLayout.vue';
+import LocaleSwitch from '../components/LocaleSwitch.vue';
 import { useAuthStore } from '../stores/auth';
 import { useSiteStore } from '../stores/site';
 import { i18n, setLocale } from '../i18n';
+import { clearLocaleCookie } from '../lib/localeCookie';
 import { routes } from '../router';
 import { setUserScopeResetListener } from '../lib/userScope';
 
@@ -50,6 +52,9 @@ function makeRouter() {
 beforeEach(() => {
   localStorage.clear();
   setLocale('zh-CN');
+  // #804：setLocale 现在**双写**，上面那句会顺手写 cookie='zh-CN'；cookie 必须在它之后清
+  //（jsdom 的 document.cookie 在本文件内共享，不清会跳用例污染）。语言复位靠上一行的 setLocale。
+  clearLocaleCookie();
   setActivePinia(createPinia());
 });
 
@@ -363,5 +368,52 @@ describe('AdminLayout：Back to workbench 只给**有工位**的人', () => {
     const link = wrapper.find('[data-test="back-to-workbench"]');
     expect(link.exists()).toBe(true);
     expect(link.attributes('href')).toBe('http://station.example.test:8090#/');
+  });
+});
+
+// issue #804：管理台是**独立 origin**（`admin.<伞域>:<端口>`），localStorage 按 origin 隔离 ⇒ 语言偏好
+// 不跟用户面共享，中文浏览器进来恒中文。两条判据各钉一半：控件在不在（没它就只能恒中文）、
+// 切了是不是当场生效（i18n 是同一份单例，理论上就该生效；这里真正会被回归的是「插错位置把
+// header 里最后一颗按钮——登出——挤掉」，那会让 #431 的收口判据取错按钮）。
+describe('AdminLayout 顶栏语言切换（#804：管理台必须能就地切语言）', () => {
+  async function mountLayout() {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
+    const auth = useAuthStore();
+    auth.user = ADMIN_WITH_SEAT as never;
+    auth.ready = true;
+    const router = makeRouter();
+    router.push('/');
+    await router.isReady();
+    return mount(AdminLayout, { global: { plugins: [router, i18n] } });
+  }
+
+  it('顶栏有语言切换控件，且它的按钮 aria-label 就是 locale.label', async () => {
+    const wrapper = await mountLayout();
+    const control = wrapper.findComponent(LocaleSwitch);
+    expect(control.exists()).toBe(true);
+    expect(control.find('button').attributes('aria-label')).toBe(i18n.global.t('locale.label'));
+  });
+
+  it('在管理台里切到 English：tab 文案当场变英文，且登出仍是 header 最后一颗按钮', async () => {
+    const wrapper = await mountLayout();
+    const tabs = () => wrapper.findAll('nav a').map((link) => link.text());
+    const zhTabLabel = tabs()[0]; // 第一颗 tab 的中文取值（本文件其它用例同样直接断言中文文案）
+
+    const control = wrapper.findComponent(LocaleSwitch);
+    await control.find('button').trigger('click');
+    const english = control.findAll('[role="menuitem"]').find((item) => item.text() === 'English');
+    if (!english) throw new Error('English 菜单项不存在');
+    await english.trigger('click');
+    await wrapper.vm.$nextTick();
+
+    // 真生效（不是只改了偏好）：nav 里至少一颗 tab 的文案 = 英文取值，且已不是原来的中文
+    expect(i18n.global.t('admin.tabs.users')).toBe('User management');
+    expect(tabs()).toContain(i18n.global.t('admin.tabs.users'));
+    expect(tabs()[0]).not.toBe(zhTabLabel);
+
+    // 结构判据：切换器插在登出**之前** ⇒ 登出仍是 `header button` 的最后一颗（#431 靠这个取按钮）
+    const headerButtons = wrapper.findAll('header button');
+    expect(headerButtons.length).toBeGreaterThanOrEqual(2);
+    expect(headerButtons.at(-1)!.text()).toBe(i18n.global.t('common.logout'));
   });
 });
