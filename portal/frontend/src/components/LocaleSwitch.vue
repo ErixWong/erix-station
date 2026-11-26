@@ -9,6 +9,8 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { setLocale, type AppLocale } from '../i18n';
+import { api } from '../api';
+import { useAuthStore } from '../stores/auth';
 
 const { t, locale } = useI18n();
 
@@ -29,6 +31,30 @@ const currentLabel = computed(() => {
 function select(value: AppLocale) {
   setLocale(value);
   open.value = false;
+  // #828：已登录时把这次选择回写到账号（登录后 / 换设备自动沿用）。未登录不发，免得刷 401。
+  // fire-and-forget：切换已经在上面生效，回写只是旁路。
+  void syncAccountLocale(value);
+}
+
+/**
+ * #828：把用户面/管理台的顶栏语言切换回写到 `PATCH /api/me/locale`。
+ *
+ * 只在已登录时发（未登录/登录页不发，否则会刷一片 401）；**失败静默**：界面已经切过去了，
+ * 这不是用户能在界面上修的东西，不弹红条、不打断切换。无 pinia（如纯组件测试）⇒ 当作未登录，不发。
+ */
+async function syncAccountLocale(value: AppLocale): Promise<void> {
+  let auth: ReturnType<typeof useAuthStore>;
+  try {
+    auth = useAuthStore();
+  } catch {
+    return; // 无激活的 pinia（登录页以外的挂载形式）⇒ 不发
+  }
+  if (!auth.user) return; // 未登录不发
+  try {
+    await api('/api/me/locale', { method: 'PATCH', body: JSON.stringify({ locale: value }) });
+  } catch {
+    /* 静默：切换已生效，回写失败不弹窗 */
+  }
 }
 
 // 外部点击收起（点击组件内部元素不收起；mousedown 之外用 click 以兼容键盘触发）。
