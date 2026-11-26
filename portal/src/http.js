@@ -1173,10 +1173,10 @@ function decodeAdminUserUuid(raw) {
   try {
     id = decodeUuid(raw);
   } catch {
-    throw new HttpError(400, 'validation_failed', '用户 id 必须是 UUID', { details: { field: 'id' } });
+    throw new HttpError(400, 'validation_failed', '用户 id 必须是 UUID', { en: 'User id must be a UUID', details: { field: 'id' } });
   }
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
-    throw new HttpError(400, 'validation_failed', '用户 id 必须是 UUID', { details: { field: 'id' } });
+    throw new HttpError(400, 'validation_failed', '用户 id 必须是 UUID', { en: 'User id must be a UUID', details: { field: 'id' } });
   }
   return id;
 }
@@ -1330,7 +1330,7 @@ async function routeApi(req, res, ctx, url) {
     if (getBearerToken(req).present) {
       throw new HttpError(
         400, 'logout_not_applicable_for_tokens',
-        'API 令牌不能登出（令牌没有会话）；作废需由管理员吊销该令牌',
+        'API 令牌不能登出（令牌没有会话）；作废需由管理员吊销该令牌', { en: 'API tokens cannot log out (a token has no session); to invalidate one, an administrator must revoke the token' },
       );
     }
     const token = getCookie(req, config.cookie.name);
@@ -1442,7 +1442,7 @@ async function routeApi(req, res, ctx, url) {
   // ---- 项目与端口（portal.md §3；P5：写路径退役，projects 表留档只读） ----
   if (pathname === '/api/projects') {
     // P5 去项目化：项目注册已退役（目录即项目）。写端点 410 明示退役；GET 保留（归档只读）。
-    if (req.method === 'POST') throw new HttpError(410, 'project_api_retired', '项目注册已退役（P5 目录即项目）：目录经 POST /api/sessions 的 project_id（cwd）自动创建');
+    if (req.method === 'POST') throw new HttpError(410, 'project_api_retired', '项目注册已退役（P5 目录即项目）：目录经 POST /api/sessions 的 project_id（cwd）自动创建', { en: 'Project registration is retired (P5: the directory is the project); directories are created automatically via project_id (cwd) on POST /api/sessions' });
     if (req.method === 'GET') return handleListProjects(req, res, ctx);
   }
   const projectMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
@@ -1450,13 +1450,13 @@ async function routeApi(req, res, ctx, url) {
     const projectId = decodeURIComponent(projectMatch[1]);
     if (req.method === 'GET') return handleGetProject(req, res, ctx, projectId);
     if (req.method === 'PATCH' || req.method === 'DELETE') {
-      throw new HttpError(410, 'project_api_retired', '项目 CRUD 已退役（P5 目录即项目，projects 表留档只读）');
+      throw new HttpError(410, 'project_api_retired', '项目 CRUD 已退役（P5 目录即项目，projects 表留档只读）', { en: 'Project CRUD is retired (P5: the directory is the project; the projects table is a read-only archive)' });
     }
   }
   // F10：端口列表（portal.md §4.7）。P5：port_allocations 去项目化后项目维度端口不可推导，退役。
   const projectPortsMatch = pathname.match(/^\/api\/projects\/([^/]+)\/ports$/);
   if (projectPortsMatch) {
-    throw new HttpError(410, 'project_api_retired', '项目维度端口列表已退役（P5）：端口一律见 FDE 级 ~/.erix/ports.json');
+    throw new HttpError(410, 'project_api_retired', '项目维度端口列表已退役（P5）：端口一律见 FDE 级 ~/.erix/ports.json', { en: 'Project-level port lists are retired (P5): ports are now defined only at the FDE level in ~/.erix/ports.json' });
   }
   // issue #246 交付②：FDE 本人的预览端口列表（portal.md §4.7a）。GET /api/projects/:id/ports 退役后
   // 「没有任何列端口的 API」⇒ 签票端点要的 allocation UUID 人看不见。本端点就是那条路（单 B 面板用它）。
@@ -1643,7 +1643,7 @@ async function routeApi(req, res, ctx, url) {
     if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     // slug 在**路径层**就卡形状：不合法根本不可能存条目，让它进库查一轮只会把 400 拖成 404。
     if (!market.SKILL_SLUG_RE.test(slug)) {
-      throw new HttpError(400, 'validation_failed', 'slug 不合法', { details: { field: 'slug', slug } });
+      throw new HttpError(400, 'validation_failed', 'slug 不合法', { en: 'invalid slug', details: { field: 'slug', slug } });
     }
     return sendJson(res, 200, { item: await market.getUserItem({ pool: ctx.pool, fdeId: fde.id, slug }) });
   }
@@ -1655,7 +1655,7 @@ async function routeApi(req, res, ctx, url) {
     const slug = decodeURIComponent(marketActionMatch[1]);
     const action = marketActionMatch[2];
     if (!market.SKILL_SLUG_RE.test(slug)) {
-      throw new HttpError(400, 'validation_failed', 'slug 不合法', { details: { field: 'slug', slug } });
+      throw new HttpError(400, 'validation_failed', 'slug 不合法', { en: 'invalid slug', details: { field: 'slug', slug } });
     }
     // install/enabled 带体（`enabled` / `force`）；uninstall 无体 ⇒ 不卡 Content-Type
     // （`requireJson` 会把没带 JSON 头的卸载请求直接 415，而它的语义本来就不需要体）。
@@ -1721,7 +1721,7 @@ function marketFdeOf(session) {
   const name = session.user.fde_name;
   if (!name) {
     throw new HttpError(400, 'fde_name_required', '当前用户未分配 fde_name，无法安装能力（技能）',
-      { details: { field: 'fde_name' } });
+      { en: 'The current user has no fde_name assigned and cannot install capabilities (skills)', details: { field: 'fde_name' } });
   }
   return { id: session.user.id, name };
 }
@@ -1744,15 +1744,15 @@ async function handleUserApiTokens(req, res, ctx, match) {
   try {
     login = decodeURIComponent(match[1]);
   } catch {
-    throw new HttpError(400, 'validation_failed', 'login 非法', { details: { field: 'login' } });
+    throw new HttpError(400, 'validation_failed', 'login 非法', { en: 'invalid login', details: { field: 'login' } });
   }
   // 角色闸：非 admin ⇒ 403 `insufficient_role`（§2.13；与 blanket requireAdmin 的 `forbidden` 区分）。
   const actor = await requireSession(req, ctx);
   if (actor.user.role !== 'admin') {
-    throw new HttpError(403, 'insufficient_role', '只有管理员能签发 API 令牌');
+    throw new HttpError(403, 'insufficient_role', '只有管理员能签发 API 令牌', { en: 'Only administrators can issue API tokens' });
   }
   const targetUserId = await apiTokens.findUserIdByLogin(pool, login);
-  if (!targetUserId) throw new HttpError(404, 'not_found', '用户不存在');
+  if (!targetUserId) throw new HttpError(404, 'not_found', '用户不存在', { en: 'User does not exist' });
 
   const rawId = match[2];
   const method = req.method;
@@ -1764,18 +1764,20 @@ async function handleUserApiTokens(req, res, ctx, match) {
     const name = typeof body?.name === 'string' ? body.name.trim() : '';
     if (name.length < 1 || name.length > 40) {
       throw new HttpError(400, 'validation_failed', 'name 必填且 1..40 字符', {
+        en: 'name is required and must be 1..40 characters',
         details: { field: 'name' },
       });
     }
     // scopes 本期只支持空数组（给了非空 ⇒ 400，不许留死列）。
     if (body?.scopes !== undefined && (!Array.isArray(body.scopes) || body.scopes.length !== 0)) {
-      throw new HttpError(400, 'scopes_unsupported', '本期 scopes 只支持空数组');
+      throw new HttpError(400, 'scopes_unsupported', '本期 scopes 只支持空数组', { en: 'This iteration only supports an empty scopes array' });
     }
     // 限流（键 `auth-token-mint:user:<id>`，默认 10/小时）。
     const limiterKey = `auth-token-mint:user:${targetUserId}`;
     const gate = ctx.authTokenMintLimiter.check(limiterKey);
     if (!gate.allowed) {
       throw new HttpError(429, 'rate_limited', '签发令牌过于频繁，请稍后再试', {
+        en: 'Token issuance is too frequent, please try again later',
         retryable: true,
         headers: { 'Retry-After': String(gate.retryAfterSeconds) },
       });
@@ -1785,7 +1787,7 @@ async function handleUserApiTokens(req, res, ctx, match) {
     const minted = await apiTokens.mintToken(pool, { userId: targetUserId, name, tokenHash });
     if (!minted) {
       // 同账号重名（含已吊销，因为吊销不删行）⇒ 409，不冒 500。
-      throw new HttpError(409, 'token_name_taken', '该用户已有同名令牌（吊销不释放名字）');
+      throw new HttpError(409, 'token_name_taken', '该用户已有同名令牌（吊销不释放名字）', { en: 'This user already has a token with the same name (revoking does not free the name)' });
     }
     ctx.authTokenMintLimiter.recordFailure(limiterKey);
     await auth.audit(pool, {
@@ -1813,7 +1815,7 @@ async function handleUserApiTokens(req, res, ctx, match) {
   if (rawId && method === 'DELETE') {
     const tokenId = decodeAdminUserUuid(rawId);
     const result = await apiTokens.revokeToken(pool, { userId: targetUserId, tokenId });
-    if (result.outcome === 'missing') throw new HttpError(404, 'not_found', '令牌不存在');
+    if (result.outcome === 'missing') throw new HttpError(404, 'not_found', '令牌不存在', { en: 'Token does not exist' });
     if (result.outcome === 'revoked') {
       await auth.audit(pool, {
         actorId: actor.user.id,
@@ -1894,10 +1896,10 @@ async function handleAdminApi(req, res, ctx, url) {
     try {
       fdeName = decodeURIComponent(adminGitCredentialMatch[1]);
     } catch {
-      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { en: 'invalid fde_name', details: { field: 'fde_name' } });
     }
     if (!projects.validateFdeName(fdeName).ok) {
-      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { en: 'invalid fde_name', details: { field: 'fde_name' } });
     }
     if (req.method === 'GET') {
       const result = await gitCredential.listGitCredentials({ config: ctx.config, fdeName });
@@ -2019,7 +2021,7 @@ async function handleAdminApi(req, res, ctx, url) {
       const rawGitHostId = body?.git_host_id;
       if (typeof rawGitHostId !== 'string'
           || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawGitHostId)) {
-        throw new HttpError(400, 'validation_failed', 'git_host_id 必须是有效 UUID', { details: { field: 'git_host_id' } });
+        throw new HttpError(400, 'validation_failed', 'git_host_id 必须是有效 UUID', { en: 'git_host_id must be a valid UUID', details: { field: 'git_host_id' } });
       }
       const gitHostId = rawGitHostId.toLowerCase();
       const client = await ctx.pool.connect();
@@ -2164,7 +2166,7 @@ async function handleAdminApi(req, res, ctx, url) {
         if (mailer.enabled !== true) {
           throw new HttpError(400, 'validation_failed',
             '邮件通道未配置或不可用，无法为该用户启用邮件验证码（请先在「邮件通道」里配置并测试）',
-            { details: { field: 'mail_otp_enabled' } });
+            { en: 'The mail channel is not configured or unavailable, so mail verification codes cannot be enabled for this user (configure and test it under "Mail channel" first)', details: { field: 'mail_otp_enabled' } });
         }
       }
       return sendJson(res, 200, await admin.updateUser(ctx.pool, userId, body, { actorId: session.user.id }));
@@ -2337,6 +2339,7 @@ async function handleAdminApi(req, res, ctx, url) {
     const promptGate = ctx.platformPromptsLimiter.check(promptLimitKey);
     if (!promptGate.allowed) {
       throw new HttpError(429, 'rate_limited', '提示词保存过于频繁，请稍后再试', {
+        en: 'Prompt saving is too frequent, please try again later',
         retryable: true,
         headers: { 'Retry-After': String(promptGate.retryAfterSeconds) },
       });
@@ -2392,6 +2395,7 @@ async function handleAdminApi(req, res, ctx, url) {
     const key = decodeURIComponent(adminRuntimeSettingMatch[1]);
     if (!runtimeSettings.isKnownSetting(key)) {
       throw new HttpError(400, 'validation_failed', `未知的运行时配置项：${key}`, {
+        en: `Unknown runtime setting: ${key}`,
         details: { field: 'key', known: Object.keys(runtimeSettings.RUNTIME_SETTING_REGISTRY) },
       });
     }
@@ -2400,6 +2404,7 @@ async function handleAdminApi(req, res, ctx, url) {
     // 体本身不是对象 ⇒ `details.field='body'`（与 prompts 那块逐字同口径）。
     if (body === null || typeof body !== 'object' || Array.isArray(body)) {
       throw new HttpError(400, 'validation_failed', '请求体必须是 JSON 对象', {
+        en: 'Request body must be a JSON object',
         details: { field: 'body' },
       });
     }
@@ -2431,7 +2436,7 @@ async function handleAdminApi(req, res, ctx, url) {
       // 非法 `?state=` 当场 400：静默当成「没筛」返回全量，管理台会以为筛选生效了（数字对不上才发觉）。
       if (state !== null && state !== '' && !['draft', 'published', 'retired'].includes(state)) {
         throw new HttpError(400, 'validation_failed', 'state 只允许 draft/published/retired',
-          { details: { field: 'state', state } });
+          { en: 'state only allows draft/published/retired', details: { field: 'state', state } });
       }
       return sendJson(res, 200, await market.listAdminItems({ pool: ctx.pool, state: state || null }));
     }
@@ -2484,7 +2489,7 @@ async function handleAdminApi(req, res, ctx, url) {
       const scopeRaw = body?.scope ?? 'global';
       if (scopeRaw !== 'global' && scopeRaw !== 'fde') {
         throw new HttpError(400, 'validation_failed', 'scope 只允许 global | fde',
-          { details: { field: 'scope', scope: scopeRaw } });
+          { en: 'scope only allows global | fde', details: { field: 'scope', scope: scopeRaw } });
       }
       const scope = scopeRaw;
       const fdeId = scope === 'fde' ? decodeUuid(String(body?.fde_id ?? '')) : null;
@@ -2532,7 +2537,7 @@ async function handleAdminApi(req, res, ctx, url) {
   if (adminProvisionMatch && req.method === 'POST') {
     const fdeName = decodeURIComponent(adminProvisionMatch[1]);
     if (!projects.validateFdeName(fdeName).ok) {
-      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { en: 'invalid fde_name', details: { field: 'fde_name' } });
     }
     requireJson(req);
     const body = await readJsonBody(req);
@@ -2563,7 +2568,7 @@ async function handleAdminApi(req, res, ctx, url) {
   if (adminFdeLlmMatch) {
     const fdeName = decodeURIComponent(adminFdeLlmMatch[1]);
     if (!projects.validateFdeName(fdeName).ok) {
-      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { en: 'invalid fde_name', details: { field: 'fde_name' } });
     }
     if (req.method === 'GET') {
       // 无配置 200 + null；api_key 永不出响应（只掩码）。
@@ -2637,7 +2642,7 @@ async function handleAdminApi(req, res, ctx, url) {
       if (rawDays !== null) {
         days = Number(rawDays);
         if (!Number.isInteger(days) || days < 1 || days > 90) {
-          throw new HttpError(400, 'validation_failed', 'days 必须为 1–90 的整数', { details: { field: 'days' } });
+          throw new HttpError(400, 'validation_failed', 'days 必须为 1–90 的整数', { en: 'days must be an integer from 1 to 90', details: { field: 'days' } });
         }
       }
       const usage = await llm.getFdeBudgetUsage(ctx.pool, { fdeName, gateway: ctx.llmGateway, days });
@@ -2757,10 +2762,10 @@ function decodeAdminFdeName(raw) {
   try {
     fdeName = decodeURIComponent(raw);
   } catch {
-    throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+    throw new HttpError(400, 'validation_failed', 'fde_name 非法', { en: 'invalid fde_name', details: { field: 'fde_name' } });
   }
   if (!projects.validateFdeName(fdeName).ok) {
-    throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+    throw new HttpError(400, 'validation_failed', 'fde_name 非法', { en: 'invalid fde_name', details: { field: 'fde_name' } });
   }
   return fdeName;
 }
@@ -2828,7 +2833,7 @@ async function handleAdminMailTest(req, res, ctx, session) {
   const body = await readJsonBody(req);
   const raw = body?.to;
   if (!mailSettings.isEmail(raw)) {
-    throw new HttpError(400, 'validation_failed', 'to 必须是有效邮箱地址', { details: { field: 'to' } });
+    throw new HttpError(400, 'validation_failed', 'to 必须是有效邮箱地址', { en: 'to must be a valid email address', details: { field: 'to' } });
   }
   const to = raw.trim();
 
@@ -2836,6 +2841,7 @@ async function handleAdminMailTest(req, res, ctx, session) {
   const gate = ctx.mailTestLimiter.check(limiterKey);
   if (!gate.allowed) {
     throw new HttpError(429, 'rate_limited', '测试发信过于频繁，请稍后再试', {
+      en: 'Test sending is too frequent, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(gate.retryAfterSeconds) },
     });
@@ -2848,7 +2854,7 @@ async function handleAdminMailTest(req, res, ctx, session) {
       409,
       'mail_not_configured',
       '邮件通道未启用：请先在管理台配置 SMTP（transport=smtp 且填好主机与发件人）后再测试',
-      { retryable: false },
+      { en: 'Mail channel is not enabled: configure SMTP in the admin console first (transport=smtp with the host and sender filled in), then test', retryable: false },
     );
   }
 
@@ -2867,6 +2873,7 @@ async function handleAdminMailTest(req, res, ctx, session) {
       details: { to, at, reason },
     }).catch(() => {});
     throw new HttpError(502, 'email_send_failed', '测试邮件发送失败，请检查 SMTP 配置与网络', {
+      en: 'Test email failed to send, please check the SMTP configuration and network',
       retryable: true,
       details: { reason },
     });
@@ -3121,7 +3128,7 @@ async function handleAdminPreviewPortsUsage(req, res, ctx, session, url) {
     if (parsed === null || !Number.isInteger(parsed) || parsed < 1 || parsed > max) {
       throw new HttpError(400, 'validation_failed',
         `limit 必须是 1–${max} 的整数（空闲段条数上限，默认 ${portalloc.PREVIEW_USAGE_FREE_LIMIT_DEFAULT}）`,
-        { details: { field: 'limit' } });
+        { en: `limit must be an integer from 1 to ${max} (upper bound on idle-segment entries, default ${portalloc.PREVIEW_USAGE_FREE_LIMIT_DEFAULT})`, details: { field: 'limit' } });
     }
     freeLimit = parsed;
   }
@@ -3180,7 +3187,7 @@ async function handleAdminMoveFdePortsBlock(req, res, ctx, session, fdeName) {
     throw new HttpError(400, 'validation_failed',
       `block_start 必须是号池 ${PREVIEW_PORT_POOL_START}–${portalloc.PREVIEW_PORT_POOL_END} 内、按 ${PREVIEW_PORT_COUNT} 对齐的整数块起点`
       + `（合法值：${PREVIEW_PORT_POOL_START}、${PREVIEW_PORT_POOL_START + PREVIEW_PORT_COUNT}、…）`,
-      { details: { field: 'block_start' } });
+      { en: `block_start must be an integer block start within the pool ${PREVIEW_PORT_POOL_START}-${portalloc.PREVIEW_PORT_POOL_END}, aligned to ${PREVIEW_PORT_COUNT}` + ` (valid values: ${PREVIEW_PORT_POOL_START}, ${PREVIEW_PORT_POOL_START + PREVIEW_PORT_COUNT}, ...)`, details: { field: 'block_start' } });
   }
   const fde = await resolveAdminFde(ctx, fdeName);
   // 改块前先读一眼当前块——只为审计里的 from_block_start（多一条 SELECT，不值得在搬迁事务里多开一次取数）。
@@ -3458,7 +3465,7 @@ async function handlePostMessage(req, res, ctx, sessionId) {
         [session.user.id],
       );
       if (!bound.rows?.length) {
-        throw new HttpError(409, 'llm_not_configured', '该 FDE 未配置 LLM 上游，请在管理台配置');
+        throw new HttpError(409, 'llm_not_configured', '该 FDE 未配置 LLM 上游，请在管理台配置', { en: 'This FDE has no LLM upstream configured; please configure it in the admin console' });
       }
       // issue #261014 切片 B2：绑定里的 `model_info.id` 在网关里已不存在（模型被删/重建 ⇒ id 变）时，
       // 消息仍会入队并在 run 里跑出一个看不懂的错 ⇒ 这里 fail-fast（409 llm_model_not_found）。
@@ -3527,7 +3534,7 @@ async function handleSessionStream(req, res, ctx, sessionId) {
   if (raw !== undefined && raw !== null && raw !== '') {
     lastEventId = Number(raw);
     if (!Number.isInteger(lastEventId) || lastEventId < 0) {
-      throw new HttpError(400, 'validation_failed', 'Last-Event-ID 必须为非负整数');
+      throw new HttpError(400, 'validation_failed', 'Last-Event-ID 必须为非负整数', { en: 'Last-Event-ID must be a non-negative integer' });
     }
     if (lastEventId > s.last_seq) {
       throw new HttpError(404, 'not_found', 'last_event_id beyond session');
@@ -4023,7 +4030,7 @@ async function handleSessionDelegateTranscript(req, res, ctx, sessionId, childRu
 function requireDelegateRunId(url) {
   const raw = url.searchParams.get('runId');
   if (raw == null || raw === '') {
-    throw new HttpError(400, 'validation_failed', 'runId 必填（父 run id）', { details: { field: 'runId' } });
+    throw new HttpError(400, 'validation_failed', 'runId 必填（父 run id）', { en: 'runId is required (parent run id)', details: { field: 'runId' } });
   }
   return raw.toLowerCase();
 }
@@ -4038,7 +4045,7 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
   const url = new URL(req.url, 'http://x');
   let limit = Number(url.searchParams.get('limit') ?? HISTORY_EVENT_DEFAULT_LIMIT);
   if (!Number.isInteger(limit) || limit < 1) {
-    throw new HttpError(400, 'validation_failed', 'limit 必须为正整数', { details: { field: 'limit' } });
+    throw new HttpError(400, 'validation_failed', 'limit 必须为正整数', { en: 'limit must be a positive integer', details: { field: 'limit' } });
   }
   limit = Math.min(limit, HISTORY_EVENT_MAX_LIMIT);
   const beforeRaw = url.searchParams.get('before');
@@ -4046,7 +4053,7 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
   if (beforeRaw != null && beforeRaw !== '') {
     before = Number(beforeRaw);
     if (!Number.isInteger(before) || before < 1) {
-      throw new HttpError(400, 'validation_failed', 'before 必须为正整数', { details: { field: 'before' } });
+      throw new HttpError(400, 'validation_failed', 'before 必须为正整数', { en: 'before must be a positive integer', details: { field: 'before' } });
     }
   }
   const params = [sessionId, [...HISTORY_EVENT_TYPES]];
@@ -4301,7 +4308,7 @@ async function handleLoginStep1(req, res, ctx) {
   const login = typeof body.login === 'string' ? body.login.trim() : '';
   const password = typeof body.password === 'string' ? body.password : '';
   if (!login || !password) {
-    throw new HttpError(400, 'validation_failed', 'login 与 password 均为必填');
+    throw new HttpError(400, 'validation_failed', 'login 与 password 均为必填', { en: 'Both login and password are required' });
   }
   // #677 Tier 2A：两个长度上限是热读旋钮 ⇒ 本请求各现读一次并复用（不进循环、不读两遍）。
   const maxLoginLength = await runtimeSettings.readMaxLoginLength({ pool, config, log: ctx.log });
@@ -4309,10 +4316,10 @@ async function handleLoginStep1(req, res, ctx) {
     pool, config, log: ctx.log,
   });
   if (login.length > maxLoginLength) {
-    throw new HttpError(400, 'validation_failed', `login 长度超过上限 ${maxLoginLength}`);
+    throw new HttpError(400, 'validation_failed', `login 长度超过上限 ${maxLoginLength}`, { en: `login exceeds the limit of ${maxLoginLength} characters` });
   }
   if (password.length > maxPasswordLength) {
-    throw new HttpError(400, 'validation_failed', `password 长度超过上限 ${maxPasswordLength}`);
+    throw new HttpError(400, 'validation_failed', `password 长度超过上限 ${maxPasswordLength}`, { en: `password exceeds the limit of ${maxPasswordLength} characters` });
   }
 
   const ip = clientIp(req);
@@ -4320,6 +4327,7 @@ async function handleLoginStep1(req, res, ctx) {
   const check = ctx.loginLimiter.check(rlKey);
   if (!check.allowed) {
     throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
+      en: 'Too many attempts, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(check.retryAfterSeconds) },
     });
@@ -4332,6 +4340,7 @@ async function handleLoginStep1(req, res, ctx) {
   } catch (err) {
     if (err?.code === 'kdf_queue_full' || err?.code === 'kdf_queue_timeout') {
       throw new HttpError(503, 'kdf_busy', '服务繁忙，请稍后重试', {
+        en: 'Service is busy, please try again later',
         retryable: true,
         headers: { 'Retry-After': '1' },
       });
@@ -4351,7 +4360,7 @@ async function handleLoginStep1(req, res, ctx) {
       ctx.log.warn?.(`[auth] malformed password_hash for login=${JSON.stringify(login)}`);
       await auth.audit(pool, { action: 'auth.login_malformed_hash', target: login, details: { login } }).catch(() => {});
     }
-    throw new HttpError(401, 'invalid_credentials', '用户名或口令错误');
+    throw new HttpError(401, 'invalid_credentials', '用户名或口令错误', { en: 'Invalid username or password' });
   }
 
   ctx.loginLimiter.reset(rlKey);
@@ -4387,7 +4396,7 @@ async function handleLoginStep1(req, res, ctx) {
   // 用户以为自己过了第二因素，其实只是口令）。这是「全局 disabled 不再是功能闸」的代价，必须显式化。
   if (secondFactor === 'email_code_required' && mailer.enabled !== true) {
     throw new HttpError(503, 'email_channel_unavailable',
-      '该账号要求邮件验证码，但邮件通道未配置或不可用，请联系管理员', { retryable: false });
+      '该账号要求邮件验证码，但邮件通道未配置或不可用，请联系管理员', { en: 'This account requires an email verification code, but the mail channel is not configured or unavailable; please contact an administrator', retryable: false });
   }
 
   if (secondFactor === 'email_not_registered') {
@@ -4396,7 +4405,7 @@ async function handleLoginStep1(req, res, ctx) {
       409,
       'email_not_registered',
       '当前账号未登记邮箱，无法接收登录验证码；请联系管理员补录邮箱后再登录',
-      { retryable: false },
+      { en: 'The current account has no registered email address and cannot receive a login verification code; please contact an administrator to add one, then log in again', retryable: false },
     );
   }
 
@@ -4512,6 +4521,7 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
   const sendCheck = ctx.emailSendLimiter.check(sendKey);
   if (!sendCheck.allowed) {
     throw new HttpError(429, 'rate_limited', '发信过于频繁，请稍后再试', {
+      en: 'Sending is too frequent, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(sendCheck.retryAfterSeconds) },
     });
@@ -4585,6 +4595,7 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
     // `details` 里带上 pending_token：发信失败时第一次响应就是 503（客户端还没拿到过令牌），
     // 不带它「pending 不作废、用户点重试即可」在协议上就不成立（只能回去重输口令）。
     throw new HttpError(503, 'email_send_failed', '验证码邮件发送失败，请稍后重试', {
+      en: 'Failed to send the verification code email, please try again later',
       retryable: true,
       headers: { 'Retry-After': '5' },
       details: {
@@ -4727,14 +4738,14 @@ async function handleLoginEmailCode(req, res, ctx) {
   const pendingToken = typeof body.pending_token === 'string' ? body.pending_token : '';
   const code = typeof body.code === 'string' ? body.code.trim() : '';
   if (!pendingToken || !code) {
-    throw new HttpError(400, 'validation_failed', 'pending_token 与 code 均为必填');
+    throw new HttpError(400, 'validation_failed', 'pending_token 与 code 均为必填', { en: 'Both pending_token and code are required' });
   }
 
   const ip = clientIp(req);
   // 非消费读取（码错可重试，不烧 pending）；成功才原子消费。
   const userId = await auth.findPendingUser(pool, pendingToken);
   if (!userId) {
-    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录', { en: 'pending_token expired or already used, please log in again' });
   }
 
   // 账户 + IP 失败计数（换新 pending_token 不重置，防 6 位码爆破）。
@@ -4742,6 +4753,7 @@ async function handleLoginEmailCode(req, res, ctx) {
   const check = ctx.emailCodeLimiter.check(limiterKey);
   if (!check.allowed) {
     throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
+      en: 'Too many attempts, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(check.retryAfterSeconds) },
     });
@@ -4762,13 +4774,13 @@ async function handleLoginEmailCode(req, res, ctx) {
 
   const consumedUserId = await auth.consumePendingToken(pool, pendingToken);
   if (!consumedUserId) {
-    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录', { en: 'pending_token expired or already used, please log in again' });
   }
   ctx.emailCodeLimiter.reset(limiterKey);
 
   const loaded = await auth.loadActiveUser(pool, consumedUserId);
   if (!loaded) {
-    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录', { en: 'pending_token expired or already used, please log in again' });
   }
 
   // #677 P2a：会话 TTL 热读（DB > env > 默认，5s 缓存；见 `/api/me` 那一段的完整口径）。
@@ -4815,13 +4827,13 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
   const body = await readJsonBody(req);
   const pendingToken = typeof body.pending_token === 'string' ? body.pending_token : '';
   if (!pendingToken) {
-    throw new HttpError(400, 'validation_failed', 'pending_token 为必填');
+    throw new HttpError(400, 'validation_failed', 'pending_token 为必填', { en: 'pending_token is required' });
   }
 
   const ip = clientIp(req);
   const userId = await auth.findPendingUser(pool, pendingToken);
   if (!userId) {
-    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录', { en: 'pending_token expired or already used, please log in again' });
   }
 
   // 按 IP 计发信频率（重发也计数：被当成邮件放大器时最先撞这条）。
@@ -4829,6 +4841,7 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
   const sendCheck = ctx.emailSendLimiter.check(sendKey);
   if (!sendCheck.allowed) {
     throw new HttpError(429, 'rate_limited', '发信过于频繁，请稍后再试', {
+      en: 'Sending is too frequent, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(sendCheck.retryAfterSeconds) },
     });
@@ -4836,14 +4849,14 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
 
   const loaded = await auth.loadActiveUser(pool, userId);
   if (!loaded) {
-    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录', { en: 'pending_token expired or already used, please log in again' });
   }
   if (!loaded.email) {
     throw new HttpError(
       409,
       'email_not_registered',
       '当前账号未登记邮箱，无法接收登录验证码；请联系管理员补录邮箱后再登录',
-      { retryable: false },
+      { en: 'The current account has no registered email address and cannot receive a login verification code; please contact an administrator to add one, then log in again', retryable: false },
     );
   }
 
@@ -4867,7 +4880,7 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
       429,
       'rate_limited',
       gate.reason === 'max_resends' ? '验证码重发次数已用尽，请重新登录' : '请稍后再试',
-      { retryable: true, headers: { 'Retry-After': String(retryAfter) } },
+      { en: gate.reason === 'max_resends' ? 'The verification code resend limit has been reached, please log in again' : 'Please try again later', retryable: true, headers: { 'Retry-After': String(retryAfter) } },
     );
   }
 
@@ -4885,6 +4898,7 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
       details: { login: loaded.user.login, reason: sent.reason ?? 'send_failed', at: new Date().toISOString() },
     }).catch(() => {});
     throw new HttpError(503, 'email_send_failed', '验证码邮件发送失败，请稍后重试', {
+      en: 'Failed to send the verification code email, please try again later',
       retryable: true,
       headers: { 'Retry-After': '5' },
     });
@@ -4938,7 +4952,7 @@ async function handleLoginTotp(req, res, ctx) {
   const pendingToken = typeof body.pending_token === 'string' ? body.pending_token : '';
   const code = typeof body.code === 'string' ? body.code : '';
   if (!pendingToken || !code) {
-    throw new HttpError(400, 'validation_failed', 'pending_token 与 code 均为必填');
+    throw new HttpError(400, 'validation_failed', 'pending_token 与 code 均为必填', { en: 'Both pending_token and code are required' });
   }
 
   const ip = clientIp(req);
@@ -4947,7 +4961,7 @@ async function handleLoginTotp(req, res, ctx) {
   // 只有 TOTP 通过才原子消费（单次消费）。先解出用户，再按「账户 + IP」限流。
   const userId = await auth.findPendingUser(pool, pendingToken);
   if (!userId) {
-    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录', { en: 'pending_token expired or already used, please log in again' });
   }
 
   // 账户 + IP 失败计数：换新 pending_token 不重置（口令步成功也不清空），防第二因素爆破。
@@ -4955,6 +4969,7 @@ async function handleLoginTotp(req, res, ctx) {
   const accountCheck = ctx.totpLimiter.check(accountKey);
   if (!accountCheck.allowed) {
     throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
+      en: 'Too many attempts, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(accountCheck.retryAfterSeconds) },
     });
@@ -4965,6 +4980,7 @@ async function handleLoginTotp(req, res, ctx) {
   const tokenCheck = ctx.totpTokenLimiter.check(tokenKey);
   if (!tokenCheck.allowed) {
     throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
+      en: 'Too many attempts, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(tokenCheck.retryAfterSeconds) },
     });
@@ -4979,12 +4995,12 @@ async function handleLoginTotp(req, res, ctx) {
   if (!result.ok) {
     ctx.totpLimiter.recordFailure(accountKey);
     ctx.totpTokenLimiter.recordFailure(tokenKey);
-    throw new HttpError(401, 'totp_invalid', 'TOTP 校验失败');
+    throw new HttpError(401, 'totp_invalid', 'TOTP 校验失败', { en: 'TOTP verification failed' });
   }
 
   const consumedUserId = await auth.consumePendingToken(pool, pendingToken);
   if (!consumedUserId) {
-    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录', { en: 'pending_token expired or already used, please log in again' });
   }
 
   ctx.totpLimiter.reset(accountKey);
@@ -5052,7 +5068,7 @@ async function resolveSession(req, ctx) {
   if (cookieToken && bearer.present) {
     throw new HttpError(
       400, 'ambiguous_credential',
-      'cookie 与 Bearer 令牌不能同时用于同一请求（二选一）',
+      'cookie 与 Bearer 令牌不能同时用于同一请求（二选一）', { en: 'A cookie and a Bearer token cannot be used in the same request (choose one)' },
     );
   }
   if (cookieToken) {
@@ -5062,7 +5078,7 @@ async function resolveSession(req, ctx) {
   // cookie miss：试 Bearer（脚本/agent 不登录、不寄邮件）。
   if (bearer.present) {
     if (bearer.badScheme) {
-      throw new HttpError(401, 'unsupported_scheme', 'Authorization 只支持 Bearer scheme');
+      throw new HttpError(401, 'unsupported_scheme', 'Authorization 只支持 Bearer scheme', { en: 'Authorization only supports the Bearer scheme' });
     }
     const viaToken = bearer.token
       ? await apiTokens.findApiTokenUser(ctx.pool, bearer.token)
@@ -5270,6 +5286,7 @@ async function handlePreviewTicket(req, res, ctx, portId) {
   const check = ctx.previewTicketLimiter.check(rlKey);
   if (!check.allowed) {
     throw new HttpError(429, 'rate_limited', '预览 ticket 签发过于频繁，请稍后再试', {
+      en: 'Preview ticket issuance is too frequent, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(check.retryAfterSeconds) },
     });
@@ -5389,6 +5406,7 @@ async function handleBatchPreviewTickets(req, res, ctx) {
   const check = ctx.previewTicketLimiter.check(rlKey);
   if (!check.allowed) {
     throw new HttpError(429, 'rate_limited', '预览 ticket 签发过于频繁，请稍后再试', {
+      en: 'Preview ticket issuance is too frequent, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(check.retryAfterSeconds) },
     });
@@ -5515,6 +5533,7 @@ async function handleChangeMyPassword(req, res, ctx) {
   const check = ctx.loginLimiter.check(rlKey);
   if (!check.allowed) {
     throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
+      en: 'Too many attempts, please try again later',
       retryable: true,
       headers: { 'Retry-After': String(check.retryAfterSeconds) },
     });
@@ -5525,6 +5544,7 @@ async function handleChangeMyPassword(req, res, ctx) {
   } catch (err) {
     if (err?.code === 'kdf_queue_full' || err?.code === 'kdf_queue_timeout') {
       throw new HttpError(503, 'kdf_busy', '服务繁忙，请稍后重试', {
+        en: 'Service is busy, please try again later',
         retryable: true,
         headers: { 'Retry-After': '1' },
       });
@@ -5664,7 +5684,7 @@ async function handleFilePreview(req, res, ctx, url) {
     return undefined;
   }
   if (mode !== '' && mode !== 'json') {
-    throw new HttpError(400, 'validation_failed', 'mode 只支持 json|stream|download', { details: { field: 'mode' } });
+    throw new HttpError(400, 'validation_failed', 'mode 只支持 json|stream|download', { en: 'mode only supports json|stream|download', details: { field: 'mode' } });
   }
   try {
     const result = await dirs.readFilePreview({
@@ -5853,7 +5873,7 @@ async function handleInternal(req, res, ctx, url) {
     const body = await readJsonBody(req);
     const slug = typeof body?.slug === 'string' ? body.slug : '';
     if (!market.SKILL_SLUG_RE.test(slug)) {
-      throw new HttpError(400, 'validation_failed', 'slug 不合法', { details: { field: 'slug', slug } });
+      throw new HttpError(400, 'validation_failed', 'slug 不合法', { en: 'invalid slug', details: { field: 'slug', slug } });
     }
     const out = await market.recordToolsCache({ pool: ctx.pool, slug, tools: body?.tools ?? [] });
     return sendJson(res, 200, out);
@@ -5887,7 +5907,7 @@ async function handleInternal(req, res, ctx, url) {
     const writerRunIdParam = url.searchParams.get('run_id');
     const writerRunId = writerRunIdParam ? decodeUuid(writerRunIdParam) : null;
     if (writerRunId === null) {
-      throw new HttpError(400, 'validation_failed', 'run_id query 参数必填（writer run，租约 fencing）', { details: { field: 'run_id' } });
+      throw new HttpError(400, 'validation_failed', 'run_id query 参数必填（writer run，租约 fencing）', { en: 'run_id query parameter is required (writer run, lease fencing)', details: { field: 'run_id' } });
     }
     const base = { container, user, key, claimToken, writerRunId };
 
@@ -5900,7 +5920,7 @@ async function handleInternal(req, res, ctx, url) {
       // **故意不做**「纯数字旧游标」双形态兼容：唯一消费者是 agentd，它只回传 portal 给的串。
       const cursor = url.searchParams.get('cursor');
       if (cursor !== null && !/^[0-9]+:[0-9]+$/.test(cursor)) {
-        throw new HttpError(400, 'validation_failed', 'cursor 必须为 `<round>:<append_seq>` 形式的不透明游标', { details: { field: 'cursor' } });
+        throw new HttpError(400, 'validation_failed', 'cursor 必须为 `<round>:<append_seq>` 形式的不透明游标', { en: 'cursor must be an opaque cursor in the form `<round>:<append_seq>`', details: { field: 'cursor' } });
       }
       const result = await internal.getSessionTranscript(ctx.pool, { ...base, limit, cursor });
       return sendJson(res, 200, result);
@@ -6054,7 +6074,7 @@ async function handleInternal(req, res, ctx, url) {
       // +1 余量：恰好超限的请求也能给出 413 而非连接截断。
       const data = await readRawBody(req, maxBytes + 1);
       if (data.length > maxBytes) {
-        throw new HttpError(413, 'artifact_too_large', 'artifact 超过大小上限', { details: { max_bytes: maxBytes } });
+        throw new HttpError(413, 'artifact_too_large', 'artifact 超过大小上限', { en: 'artifact exceeds the size limit', details: { max_bytes: maxBytes } });
       }
       const shaHeader = req.headers['x-sha-256'];
       const result = await artifacts.putRunArtifact(ctx.pool, {
