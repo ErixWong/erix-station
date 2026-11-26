@@ -62,6 +62,8 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 
 判定标准：`node --test` 全绿。单测只测**纯逻辑**，禁止触碰真实 docker/DB/宿主路径（§2.1 隔离约定）。
 
+> **随 `npm test` 一起跑的反退化闸（issue #803）**：`npm test` 现在链了 `node scripts/check-message-i18n.mjs`（单独跑：`npm run check:message-i18n`）。它验两件事：① 服务端 `throw new HttpError` 抛出点的**双语覆盖只许升不许降**——未双语计数 `>` 常量 `UNBILINGUAL_FLOOR` 即红（补一处 `en:`、或给确不该出英文的那条标 `// i18n-exempt: <具体理由>（#803）`就 −1；**降档后要同步把那个常量调小**，新增一处没 `en:` 的抛出点一定红）；② `runtime-settings.js` 的 `label`/`hint` 必须与 `labelEn`/`hintEn` **成对**（parity，漏一条即红）。
+
 #### 1.2.3 集成（临时栈）
 
 临时栈起停命令见 §2.2。集成测试用 `node --test` 或独立脚本驱动，但**必须**满足 §2.2 的隔离与清理约定；判定 = 测试进程退出码 0 + 临时资源（容器/网络/数据卷）已清理（§2.2.4）。

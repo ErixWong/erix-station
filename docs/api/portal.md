@@ -1030,6 +1030,13 @@ station-portal user enable  --login <login>
 
 **客户端口径（前端 `stores/site.ts` + `lib/hostGate.ts`）**：拿不到（网络 / 5xx / 超时 / 缺字段）⇒ **fail-open，不跳**（跳错方向比不跳更糟：管理台不可达时会把用户踢到死地址）；失败后缓存 30s 再重试，并发导航只发一次请求（单飞）。判据与落点见 `portal/frontend/src/lib/hostGate.ts`（纯函数，六行矩阵逐条单测）。
 
+**附：请求语言（locale）——服务端下发的文案按它出语言（#803 S1）**。这一条是全请求级的通用行为（不只影响本端点），登记在此是因为它是唯一面向匿名客户端、讲「客户端怎么告知服务端自己要什么」的入口小节。谈判顺序：`Cookie: locale=`（白名单 `zh-CN` | `en`，脏值忽略）→ `Accept-Language`（按 q 值，`zh*` ⇒ `zh-CN`、`en*` ⇒ `en`，`*` 与其他语言落回）→ 缺省 `zh-CN`（**缺省必须还是 `zh-CN`**，是既有契约）。它决定两类**服务端拼装、随响应下发**的文案的语言：
+
+1. **错误响应的 `message`**：响应体仍是 `{ error: { code, message, retryable, details } }`（形状不变）；抛出点显式给了英文（`HttpError` 的 `en`）才在 `en` 下出英文，**没给的地方照旧出中文**（渐进覆盖，不是 bug）。`Error.message` 恒为中文，供日志与审计检索。
+2. **运行时设置的 `label` / `hint`**（见 §4.21）：按 locale 选 `labelEn` / `hintEn`；**只给中文就出中文**。
+
+两类都**不改输出字段名**（前端零改）。谈判在 `portal/src/locale.js`（零依赖纯函数）；错误出口接在 `portal/src/http.js` 的请求 catch（每请求只谈一次），管理台读侧接在 §4.21 的 GET（传请求 locale），**写侧 PUT 不做 locale 谈判、恒中文**。
+
 ---
 
 ---
