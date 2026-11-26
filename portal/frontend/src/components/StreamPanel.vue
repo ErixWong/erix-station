@@ -25,6 +25,8 @@ import { compactionLayerSegments, formatSavedTokens, type SessionCompaction } fr
 // 唯一入口，红色集合由它从 `lib/terminationReasons.ts#RUN_TERMINATION_SYSERR_REASONS` 取，
 // 于是「`completed` + `persistence_failed` 仍要红」与抽屉/名册三处同源（判序在 lib 里已钉住）。
 import DelegateChildDrawer from './DelegateChildDrawer.vue';
+// issue #816 第④步a：折叠原文的渲染本体（与 WorkbenchView 的折叠面板共用同一份实现）。
+import FoldOriginalTurns from './FoldOriginalTurns.vue';
 import {
   DELEGATE_BADGE_CLASS,
   DELEGATE_UNKNOWN_MARK,
@@ -437,13 +439,6 @@ function foldedOriginalState(en: FoldedEntry): FoldedOriginalState | undefined {
   return store.getFoldedOriginal(en.sessionId, round);
 }
 
-// issue #387：原文里工具行的「返回了什么」。走 `getToolResultSummary` 而不是直接拼字符串：
-// 上游结果有三套形态（string / `{content, metadata}` / number），#228 已把这条归一收进那个函数
-// （`0` 不能被当「没结果」吞掉、对象不能渲成 `[object Object]`）；**缺键就是空串 ⇒ 一行都不许多画**。
-function foldedToolResult(tc: { resultPreview?: unknown }): string {
-  return getToolResultSummary(tc.resultPreview);
-}
-
 // issue #300：部分正文走**助手正文的既有渲染路径**（renderMarkdown 先转义后格式化，XSS 安全），
 // 与助手终稿/流式增量一致。text 在 store 里已保证是字符串（脏载荷退化成 '' 后根本不推 entry），
 // 这里再兜一层是为了组件对 entry 形状独立可推：不依赖调用方洁净，也不渲染 undefined。
@@ -593,51 +588,8 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
             @click="collapseOriginal(en.id)"
           >{{ t('stream.folded.collapseOriginal') }}</button>
         </div>
-        <div v-if="foldedOriginalState(en)!.status === 'loading'" class="text-xs text-black/40">{{ t('common.loading') }}</div>
-        <div v-else-if="foldedOriginalState(en)!.status === 'missing'" class="folded-original-missing text-xs text-black/40">{{ t('stream.folded.originalMissing') }}</div>
-        <template v-else-if="foldedOriginalState(en)!.status === 'loaded'">
-          <!-- #375：归档只是本轮差分且被上游夹断时，要说清「下面的正文是从账本按轮号补齐的」 -->
-          <div
-            v-if="(foldedOriginalState(en) as { truncated?: boolean }).truncated"
-            class="folded-original-truncated text-xs text-black/40"
-          >{{ t('stream.folded.originalTruncated', { count: (foldedOriginalState(en) as { droppedMessages?: number }).droppedMessages ?? '?' }) }}</div>
-          <!--
-            原文渲染口径（#384，真机验出来的一条「假占位」）：
-            账本里的 turn 有四类内容——`text` / `reasoning` / `toolCalls[]`（+ user 身份）。旧实现只画 `text`，
-            于是**真的干了活的那几轮**（只有 reasoning + 工具调用、没有正文）整片渲染成「（无文本内容）」——
-            真机 round 100 的 112 条里有 40 条是这样，用户看到的是满屏空行，而原文其实全在。
-            现在：四类都画；只有四类**都空**才给占位（占位的语义收窄成「这一条真的什么都没有」）。
-            #387：工具行下半句——「返回了什么」。后端重建路（`sessions.js#attachToolResultsToRecords`）
-            现在会把 `tool_result` 挂回 `tool_use` 再喂上游投影，于是 `toolCalls[].resultPreview` 有值了。
-            **配不上时那个键缺席**（不是空串），所以这里用 `foldedToolResult()` 归一后**空串就不画**：
-            宁可少一行，也不能在原文里凭空造出一个「↳ （空）」——那是原文里从来没说过的话。
-          -->
-          <div
-            v-for="(turn, ti) in (foldedOriginalState(en) as { status: 'loaded'; turns: Array<{ role?: string; text?: string; reasoning?: string; toolCalls?: Array<{ name?: string; argsSummary?: string; isError?: boolean; resultPreview?: string }> }> }).turns"
-            :key="ti"
-            class="folded-original-turn"
-          >
-            <div v-if="turn.role === 'user'" class="folded-original-role text-xs text-black/35">{{ t('stream.folded.originalRoleUser') }}</div>
-            <!-- #389：正文走 markdown（与助手气泡同一路径/样式）；reasoning 与工具行**刻意保持纯文本**
-                 （模型独白/命令行里 `*` `_` 反引号遍地，格式化会出错），绝不 v-html。 -->
-            <div v-if="turn.reasoning" class="folded-original-reasoning overflow-auto whitespace-pre-wrap break-all text-black/40 italic">{{ turn.reasoning }}</div>
-            <div v-if="turn.text" class="folded-original-text md overflow-auto text-black/70" v-html="renderMarkdown(turn.text)"></div>
-            <div
-              v-for="(tc, ci) in (turn.toolCalls ?? [])"
-              :key="ci"
-              class="folded-original-tool overflow-auto whitespace-pre-wrap break-all text-xs text-black/45"
-            >{{ t('stream.folded.originalTool', { name: tc.name ?? '?', args: tc.argsSummary ?? '' }) }}{{ tc.isError ? t('stream.folded.originalToolFailed') : '' }}<div
-                v-if="foldedToolResult(tc)"
-                class="folded-original-tool-result pl-3"
-              >↳ {{ foldedToolResult(tc) }}</div></div>
-            <div v-if="!turn.text && !turn.reasoning && !(turn.toolCalls && turn.toolCalls.length)" class="text-xs text-black/40">{{ t('stream.folded.originalEmpty') }}</div>
-          </div>
-          <div v-if="(foldedOriginalState(en) as { status: 'loaded'; turns: unknown[] }).turns.length === 0" class="text-xs text-black/40">{{ t('stream.folded.originalEmpty') }}</div>
-        </template>
-        <div v-else-if="foldedOriginalState(en)!.status === 'error'" class="folded-original-error flex items-center gap-2 text-xs text-red-600">
-          <span>{{ t('stream.folded.originalError', { message: (foldedOriginalState(en) as { status: 'error'; message: string }).message }) }}</span>
-          <button type="button" class="retry-original rounded-md border border-black/20 px-2 py-0.5 hover:bg-black/5" @click="retryOriginal(en)">{{ t('common.retry') }}</button>
-        </div>
+        <!-- #816④a：渲染本体抽成 FoldOriginalTurns（与 #816 折叠面板共用一份实现，口径注释在组件里）；可见性/收起按钮/查看原文仍归本横幅。 -->
+        <FoldOriginalTurns :state="foldedOriginalState(en)!" :fold="en.folded" @retry="retryOriginal(en)" />
       </div>
     </div>
     <!-- roundsep / 系统分隔行（judge 事件以 variant='judge' 走黄色面板样式） -->
