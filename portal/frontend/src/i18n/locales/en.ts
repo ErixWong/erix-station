@@ -20,7 +20,6 @@ export const en = {
     emptyDir: '(empty directory)',
     noDir: '(no directory)',
     createFirstDir: 'Create a directory first',
-    adminConsole: 'Admin console',
     logout: 'Sign out',
     // issue #332：`platformAdminHint` / `goToAdmin` 与 zh-CN 同步删除（无工位平台管理员已被路由守卫
     // 送去管理台，这两句在工作台上不可达；键集对齐由 localeParity.spec + `satisfies MessageSchema` 钉）。
