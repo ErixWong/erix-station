@@ -31,8 +31,6 @@ export const zhCN = {
     emptyDir: '（空目录）',
     noDir: '（无目录）',
     createFirstDir: '先创建目录',
-    // 顶栏「管理台」入口（role==='admin' 者可见；#332 后能站上工作台的 admin 必然同时有工位）
-    adminConsole: '管理台',
     logout: '登出',
     // issue #332：`platformAdminHint` / `goToAdmin` 两句已删——无工位的平台管理员被路由守卫
     // 直接送进管理台，上两句在工作台上永久不可达（不留「以防万一」的死文案）。en.ts 同步删。

@@ -17,7 +17,6 @@ import SessionPickerModal from './SessionPickerModal.vue';
 import DirectoryTree from './DirectoryTree.vue';
 import { createAppRouter } from '../router';
 import { useAuthStore } from '../stores/auth';
-import { useSiteStore } from '../stores/site';
 import { useWorkbenchStore } from '../stores/workbench';
 import type { DirInfo, Session } from '../stores/workbench';
 import { i18n, setLocale } from '../i18n';
@@ -59,8 +58,7 @@ async function setupPanel(
   store.dirCwd = opts.dirs?.[0]?.cwd ?? null;
   store.sessions = opts.sessions ?? [];
   store.noDir = opts.noDir ?? false;
-  // issue #332：isPlatformAdmin 已从 store 拆除；「是不是管理员」只影响顶栏那个「管理台」入口
-  // （判据 `auth.user?.role === 'admin'`），而能站上工作台的 admin 必然**同时有工位** ⇒ 夹具给第 ② 类人。
+  // 管理员身份在本组件已不再改变渲染（用户面「管理台」入口已拆除，fix-261126-03），夹具仍留第 ② 类人以免形状漂移。
   const auth = useAuthStore();
   auth.user = opts.adminUser
     ? { id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'root', auth_source: 'local' }
@@ -311,7 +309,7 @@ describe('SidebarPanel · 左栏视觉收敛（issue #112）', () => {
     expect(input.classes()).toContain('border-brand');
   });
 
-  it('侧栏头控件统一 32px 高 / 7px 圆角 / 12px 字号（新会话、🔍、目录下拉、↻、管理台入口）', async () => {
+  it('侧栏头控件统一 32px 高 / 7px 圆角 / 12px 字号（新会话、🔍、目录下拉、↻）', async () => {
     const wrapper = await mountPanel({ dirs: DIR, adminUser: true });
     const { head } = paneEls(wrapper);
     const ctrl = (sel: string) => head.querySelector<HTMLElement>(sel)!;
@@ -323,7 +321,7 @@ describe('SidebarPanel · 左栏视觉收敛（issue #112）', () => {
     expect(ctrl('select').classList).toContain('h-8');
     expect(ctrl('select').classList).toContain('text-[12px]');
     expect(ctrl('button[title="刷新目录列表与目录树"]').classList).toContain('h-8');
-    expect(ctrl('[data-test="admin-console-link"]').classList).toContain('h-8');
+    expect(head.querySelector('[data-test="admin-console-link"]')).toBeNull();
     expect(ctrl('label[for="dirSel"]').classList).toContain('text-[11px]');
   });
 });
@@ -385,13 +383,13 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['创建', '取消']);
   });
 
-  it('zh-CN 基线：管理员（第 ② 类人：有工位）看得到「管理台」入口，但空态只剩建目录引导', async () => {
+  it('zh-CN 基线：管理员（第 ② 类人：有工位）空态只剩建目录引导', async () => {
     // issue #332：「平台管理员：请到管理台…」+「进入管理台」两句随入口拦截删除（不可达）；
-    // 顶栏那个「管理台」入口保留——它的判据是 role==='admin'，服务的是**有工位**的管理员。
+    // 用户面的「管理台」入口已整体拆除（fix-261126-03）。
     const wrapper = await mountPanel({ noDir: true, adminUser: true });
     const { list } = paneEls(wrapper);
     expect(list.textContent).not.toContain('请到管理台');
-    expect(wrapper.get('[data-test="admin-console-link"]').text()).toBe('管理台');
+    expect(wrapper.find('[data-test="admin-console-link"]').exists()).toBe(false);
   });
 
   it('切 English：侧栏（含 DirSelect 子组件）文案即时变英文', async () => {
@@ -414,20 +412,7 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['Create', 'Cancel']);
   });
 
-  it('#450 A2：管理台入口是**跨 host 的绝对地址**（site 有值 ⇒ adminBaseUrl#/admin；无值 ⇒ 退回相对 hash）', async () => {
-    const wrapper = await mountPanel({ noDir: true, adminUser: true });
-    const link = () => wrapper.get('[data-test="admin-console-link"]');
-    // fetch 桩对 /api/site 回 `{"items":[]}` ⇒ 形状不对 ⇒ site 不可用 ⇒ fail-open 退回相对 hash。
-    expect(link().attributes('href')).toBe('#/admin');
-    useSiteStore().info = {
-      userBaseUrl: 'http://station.fde.erix.vip:8090',
-      adminBaseUrl: 'https://admin.fde.erix.vip:9443',
-    };
-    await flushPromises();
-    expect(link().attributes('href')).toBe('https://admin.fde.erix.vip:9443#/admin');
-  });
-
-  it('切 English：管理台入口变英文，且被删掉的两句指路文案不会以任何形态回潮', async () => {
+  it('切 English：被删掉的两句指路文案与管理台入口不会以任何形态回潮', async () => {
     // issue #332：zh / en 两侧的 `common.platformAdminHint`、`common.goToAdmin` 必须**成对消失**
     // （键集对齐另有 localeParity.spec 兜底，这里钉渲染结果）。
     const wrapper = await mountPanel({ noDir: true, adminUser: true });
@@ -436,7 +421,7 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.text()).toContain('Create a directory first');
     expect(wrapper.text()).not.toContain('Platform admin');
     expect(wrapper.text()).not.toContain('Go to admin console');
-    expect(wrapper.get('[data-test="admin-console-link"]').text()).toBe('Admin console');
+    expect(wrapper.find('[data-test="admin-console-link"]').exists()).toBe(false);
   });
 });
 
