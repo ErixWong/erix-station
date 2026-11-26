@@ -12,6 +12,14 @@
 // 单位级单测（LocaleSwitch.spec / localeCookie.spec / i18n）已验逻辑；本腿验的是装配、cookie 落地
 // 形状与**两个 host 共享同一份偏好**这三件纯函数测不出来的东西。
 //
+// #828 P3 在同一次跑里追加了一条腿（接在管理台那段之后，另开 context、另用脚本账号）：
+//   在**用户面**切一次英文（顺手 PATCH /api/me/locale 必须真发出去，靠请求监听钉）⇒ 清掉这个
+//   origin 的 cookie 与 localStorage（模拟新设备 / 清了站点数据，清完回读确认真的空了）⇒
+//   重新登录**一步都不点**，界面直接是英文，且 cookie 与 localStorage 被账号值重新灌满。
+//   这条是「下次登录不用重选」的判据本体：单测只能证 store 调了 applyAccountLocale，证不了
+//   真会话 + 真登录响应 + 真清载体。跑完在 finally 里把该账号的 locale 恢复成 null 并回读确认
+//   （别把 dev 账号留在英文态）；脚本账号口令同样只从本机凭据目录读，仓库里不出现口令。
+//
 // 跑法（口令 / 域名 / 端口等坐标只在本机，不进文档）：
 //     node --test portal/integration/admin-locale-e2e.mjs          # 不点名 ⇒ 浏览器腿 skip（带原因）
 //     E2E_UI=1 npm run test:integration:locale                     # 点名才跑浏览器腿（需口令 + 容器）
@@ -43,8 +51,13 @@ const USER_BASE = (process.env.E2E_USER_BASE || 'https://station.fde.erix.vip:84
   .replace(/\/$/, '');
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
 /**
- * #828 收尾：脚本可能碰到的**非管理员**账号（与同目录 `llm-usage-e2e.mjs` 的 `E2E_FDE_LOGIN` 同名同默认）。
- * 收尾时与 `ADMIN_LOGIN` 一起把 `users.locale` 恢复成 `null`（本腿经 UI 的 PATCH 会真改 DB 里的账号语言值）。
+ * #828 的脚本账号：dev 专用 FDE 账号（`role=fde`，不开邮箱验证码也不开 TOTP ⇒ 脚本能一路登到底），
+ * 与同目录各脚本的 `E2E_FDE_LOGIN` 同名同默认。
+ *
+ * 为什么不用 `admin` 做这条腿：这条腿要往账号上写 `locale` 再清回去，拿管理员账号做写测试会把
+ * 管理台那个入口的初始态搞脏（下一条跑的人看到的第一个界面就是英文）。先例：`user-usage-e2e.mjs`
+ * 的 `FDE_LOGIN` / `E2E_FDE_PASSWORD_FILE`。但**收尾仍要把 `ADMIN_LOGIN` 一起恢复**——上面那条管理台
+ * 腿经 UI 的 `PATCH /api/me/locale` 会真改 `users.locale`（现场曾把 dev 上的 `admin` 留成英文）。
  */
 const SCRIPT_LOGIN = process.env.E2E_FDE_LOGIN || 'agent01';
 // 凭据目录口径（AGENTS §4）：用户配置目录下 mcp/creds 里的 dev 口令文件（新路径优先、旧路径兜底）。
@@ -55,6 +68,12 @@ const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
   .map((p) => p.replace(/^~/, os.homedir()));
 /** 报错文案用：缺口令时列出试过的路径（新前旧后）。 */
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
+/** 脚本账号口令文件：同一套凭据目录口径（env 点名只信 env，新路径优先、旧路径兜底）。 */
+const SCRIPT_PASSWORD_FILE_CANDIDATES = (process.env.E2E_FDE_PASSWORD_FILE
+  ? [process.env.E2E_FDE_PASSWORD_FILE]
+  : ['~/.config/mcp/creds/station-agent01.password', '~/.config/creds/station-agent01-password-file'])
+  .map((p) => p.replace(/^~/, os.homedir()));
+const SCRIPT_PASSWORD_FILE = SCRIPT_PASSWORD_FILE_CANDIDATES.join(' 或 ');
 const UI_ENABLED = process.env.E2E_UI === '1';
 /**
  * 逃生门：**显式**承认「这台机器今天跑不了活栈」，把点名（E2E_UI=1）的浏览器腿从「环境不齐判红」
@@ -78,6 +97,11 @@ const SHOT_HOST = process.env.E2E_SHOT_HOST || path.join(os.tmpdir(), 'admin-loc
 // 从主图路径派生（插一个 `-runtime` 后缀），免得两个变量各自漂：主图能落的目录这一张也能落。
 const withSuffix = (p) => (p.endsWith('.png') ? `${p.slice(0, -4)}-runtime.png` : `${p}.runtime.png`);
 const SHOT2_CONTAINER = process.env.E2E_SHOT2_CONTAINER || withSuffix(SHOT_CONTAINER);
+// 第三张：**账号级语言偏好腿**重新登录后的英文态工作台（#828 P3）。同样从主图目录派生，
+// 拿回宿主只当给人看的附件（硬判据是那几条 DOM 文本与载体读数），不判红。
+const withAccountSuffix = (p) => (p.endsWith('.png') ? `${p.slice(0, -4)}-account.png` : `${p}.account.png`);
+const SHOT3_CONTAINER = process.env.E2E_SHOT3_CONTAINER || withAccountSuffix(SHOT_CONTAINER);
+const SHOT3_HOST = process.env.E2E_SHOT3_HOST || withAccountSuffix(SHOT_HOST);
 const SHOT2_HOST = process.env.E2E_SHOT2_HOST || withSuffix(SHOT_HOST);
 /**
  * 把域名在 TCP 层映到 IP（SNI/Host 仍用域名）。本腿两个 host 都要映：管理台与用户面各是一条
@@ -179,15 +203,18 @@ function resetAccountLocalesAndConfirm() {
   }
 }
 
-/** 先新后旧取第一个存在的；空文件视同没有 ⇒ null。 */
-function readPassword() {
   const file = PASSWORD_FILE_CANDIDATES.find((p) => fs.existsSync(p));
+/** 先新后旧取第一个存在的；空文件视同没有 ⇒ null。（两个账号各读各的文件，同一套读法。） */
+function readPassword(candidates = PASSWORD_FILE_CANDIDATES) {
+  const file = candidates.find((p) => fs.existsSync(p));
   if (!file) return null;
   const value = fs.readFileSync(file, 'utf8').trim();
   return value === '' ? null : value;
 }
 // 哨兵用：模块加载就读一次。
 const CRED_PASSWORD = readPassword();
+// #828 P3：脚本账号（`SCRIPT_LOGIN`）的口令；缺失与 admin 口令缺失同口径（点名 ⇒ 判红，不静默 skip）。
+const CRED_SCRIPT_PASSWORD = readPassword(SCRIPT_PASSWORD_FILE_CANDIDATES);
 
 /**
  * 探测浏览器腿能不能跑：把「口令 / docker / 容器在不在跑 / 容器里有没有 playwright 模块」各查一次。
@@ -197,6 +224,7 @@ const CRED_PASSWORD = readPassword();
 const probe = { reasons: {} };
 function probeUi() {
   if (CRED_PASSWORD === null) return `没找到口令文件（试过 ${PASSWORD_FILE}）`;
+  if (CRED_SCRIPT_PASSWORD === null) return `没找到脚本账号口令文件（账号 ${SCRIPT_LOGIN}，试过 ${SCRIPT_PASSWORD_FILE}）`;
   const d = dockerProbe();
   if (d !== true) return (d && d.reason) || String(d);
   if (!containerRunning(PW_CONTAINER)) return `playwright 容器没在跑（容器名 ${PW_CONTAINER}）`;
@@ -223,6 +251,7 @@ const r = {
   admin: {},
   user: {},
   runtime: {},
+  account: null,
   pageErrors: [],
   shotBytes: 0,
 };
@@ -251,6 +280,110 @@ async function clickMenuItem(page, want) {
     return true;
   }, want);
   if (!found) throw new Error('语言菜单里没有文案为 ' + JSON.stringify(want) + ' 的项');
+}
+
+// ── 下面四个小工具只服务「账号级语言偏好」那条腿（#828 P3）─────────────────────────────
+// ⚠ 本文件把这些代码包在 String.raw 模板里 ⇒ 模板体内的注释与字符串一律不许写反引号
+//   （反引号会提前闭合外层模板，而 node --check 可能照样过），也不许写模板插值。
+
+// 登进某个入口：先 goto 登录页再填（登出之后那个口令 field 就不在了，直接 fill 会 not found）。
+async function loginInto(page, base, login, password) {
+  await page.goto(base + '/#/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // 必须再来一次**整页重载**：从已加载的 SPA 改 hash 不会重建文档，pinia 里那份「已登录」还在，
+  // 守卫于是把 /login 又改写回工作台 ⇒ 表单永远不出现，本腿第一次判红就是死在这里（真机读数：
+  // 清了 cookie 之后仍停在 #/ 且正文写着已登录的账号）。清站点数据模拟的是新设备，得让文档真的重来。
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForSelector('#loginName, input[autocomplete="username"]', { timeout: 20000 });
+  await page.fill('#loginName, input[autocomplete="username"]', login);
+  await page.fill('#loginPass', password);
+  await page.click('button[type="submit"]');
+  await page.waitForFunction(() => !location.hash.includes('/login'), null, { timeout: 20000 });
+}
+
+// 登进之后固定去用户面工作台：钉**路由里真存在的那条正址**（hash 后面的路径写 '/'）。
+// router 里 name 'workbench' 挂在 path '/'，并没有 '/workbench' 这条 route ⇒ 导航到一个没注册的
+// 路径只会渲染空视图，看着像「页面没顶栏」的假故障。hash 内部的导航不是整页重载（文档不重建、
+// i18n 不重新检测），所以它不会把「登录后一步都不点就变英文」洗成「刷新后才变」。
+async function gotoWorkbench(page, base) {
+  await page.goto(base + '/#/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForSelector(LOCALE_BTN_ADMIN, { timeout: 20000 });
+}
+
+// 同源调 API（会话 cookie 自动带上）。返回 status + 解不了的 body 就是 null；要它而不是靠界面
+// 读数，是为了把「服务端确实收到/存了那个值」与「界面碰巧显示了英文」分开证。
+async function apiCall(page, base, method, apiPath, payload) {
+  const hasBody = payload !== undefined;
+  return page.evaluate(async (args) => {
+    const init = { method: args.method, credentials: 'same-origin' };
+    if (args.hasBody) {
+      init.headers = { 'Content-Type': 'application/json' };
+      init.body = args.bodyText;
+    }
+    const res = await fetch(args.base + args.apiPath, init);
+    let body = null;
+    try { body = await res.json(); } catch (e) { body = null; }
+    return { status: res.status, body: body };
+  }, { base: base, method: method, apiPath: apiPath, hasBody: hasBody, bodyText: hasBody ? JSON.stringify(payload) : null });
+}
+
+// 语言偏好的两个载体（cookie 名 locale 与 localStorage 键 locale）一次读齐；cookieText 一起带回去，
+// 免得「locale 没读到」其实是整串 cookie 都没了而断言说不清原因。
+async function readCarriers(page) {
+  return page.evaluate(() => {
+    let cookieLocale = null;
+    for (const part of (document.cookie || '').split(';')) {
+      const i = part.indexOf('=');
+      if (i < 0) continue;
+      if (part.slice(0, i).trim() === 'locale') cookieLocale = decodeURIComponent(part.slice(i + 1).trim());
+    }
+    let storageLocale = null;
+    let storageKeys = [];
+    try {
+      storageLocale = localStorage.getItem('locale');
+      storageKeys = Object.keys(localStorage);
+    } catch (e) {
+      storageLocale = null;
+      storageKeys = [];
+    }
+    return { cookieLocale: cookieLocale, storageLocale: storageLocale, storageKeys: storageKeys, cookieText: document.cookie || '' };
+  });
+}
+
+// 清掉这个 origin 的站点数据（模拟新设备 / 用户清了站点数据）：cookie 走 context.clearCookies，
+// localStorage 走页面里 clear。清完立即回读一次交给断言判残留（残留 ⇒ 后面那条「重登还是英文」不算证据）。
+async function clearSiteData(page, context) {
+  await context.clearCookies();
+  await page.evaluate(() => {
+    try { localStorage.clear(); } catch (e) { /* 隐私模式 / 禁用存储：本来就没什么可清 */ }
+  });
+  return readCarriers(page);
+}
+
+// 顶栏语言态的稳定文案读数（挑 DOM 文本与 aria-label，**不挑 class**）：
+//   · 顶栏最后一颗 button = 登出（zh 登出 / en Sign out）
+//   · 语言切换按钮自身文案（zh 中文 / en English）与它的 aria-label（locale.label：zh 语言 / en Language）
+//   · header 整块里还有没有中文菜单文案（反向钉「chrome 真的换了语言」，限在 header 作用域里，
+//     免得会话标题那种用户内容把它假红）
+// cjkLines 只带回去给人看（用户内容可能本来就是中文），不当判据。
+async function localeTexts(page) {
+  return page.evaluate((pat) => {
+    const re = new RegExp(pat);
+    const header = document.querySelector('header');
+    const btns = header ? Array.from(header.querySelectorAll('button')) : [];
+    const last = btns.length ? (btns[btns.length - 1].textContent || '').trim() : null;
+    const localeBtn = header ? header.querySelector('button[aria-haspopup="menu"]') : null;
+    const headerText = header ? (header.innerText || '') : '';
+    const bodyText = document.body ? (document.body.innerText || '') : '';
+    return {
+      headerButtonCount: btns.length,
+      logoutText: last,
+      localeBtnText: localeBtn ? (localeBtn.textContent || '').trim() : null,
+      localeBtnAria: localeBtn ? (localeBtn.getAttribute('aria-label') || null) : null,
+      headerHasZhChrome: /登出|新会话|语言/.test(headerText),
+      bodyHasNewSessionEn: bodyText.indexOf('New session') >= 0,
+      cjkLines: bodyText.split('\n').filter((l) => re.test(l)).slice(0, 5),
+    };
+  }, CJK);
 }
 
 let browser = null;
@@ -383,6 +516,107 @@ try {
   });
 
   await context.close();
+
+  // ── ⓬ 账号级语言偏好（#828 P3，本单验收判据 4 的本体）：脚本账号在**用户面**切一次英文 ⇒
+  //      清掉站点数据（模拟新设备 / 用户清了站点数据）⇒ 重新登录**一步都不点**就是英文。──
+  // 为什么必须真机：单测只能证 store 里调了 applyAccountLocale，证不了「库里那个值真的经登录响应
+  // 灌进了 cookie 与 localStorage、并且界面第一帧就按它渲染」——那要真会话、真登录响应、真清载体。
+  // 载体口径（前端 i18n）：cookie 名 locale（父域、非 httpOnly ⇒ 脚本读得到）与 localStorage 键 locale。
+  // ⚠ 本段在 String.raw 模板体内：注释与字符串里都不许出现反引号，也不许写模板插值。
+  const acct = { patchCalls: [], pageErrors: [] };
+  r.account = acct;
+  let acctCtx = null;
+  let apage = null;
+  try {
+    // 单独开一个 context：cookie 与 localStorage 按 context 隔离，别把上面那条腿的载体混进来。
+    // 容器 locale 仍钉 zh-CN：模拟中文浏览器，这样「起点是中文」与「后来变英文」都只能归因到账号值。
+    acctCtx = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'zh-CN', ignoreHTTPSErrors: true });
+    apage = await acctCtx.newPage();
+    apage.on('pageerror', (e) => acct.pageErrors.push(String((e && e.message) || e).split('\n')[0].slice(0, 300)));
+    // 请求监听（切语言时前端该顺手回写账号值）：**只看界面变了不算证据**，method / URL / 请求体
+    // 三样一起记下来，交给宿主断言。每次要数之前把数组清一次，免得把上一枪算成这一枪。
+    apage.on('request', (req) => {
+      const url = req.url() || '';
+      if (req.method() === 'PATCH' && url.indexOf('/api/me/locale') >= 0) {
+        acct.patchCalls.push({ method: req.method(), url: url, body: req.postData() });
+      }
+    });
+
+    // ⓬a 预清（本身不是判据）：先登一次，把账号上的值清成 null。本腿自己跑炸过一次就可能把 dev
+    //      账号留在英文态；不清就直接断「起点是中文」会假红，这条腿也就不可重跑。
+    await loginInto(apage, cfg.userBase, cfg.scriptLogin, cfg.scriptPassword);
+    const meBefore = await apiCall(apage, cfg.userBase, 'GET', '/api/me');
+    acct.meBeforeStatus = meBefore.status;
+    acct.localeBefore = meBefore.body && meBefore.body.user ? meBefore.body.user.locale : null;
+    if (acct.localeBefore !== null) {
+      await apiCall(apage, cfg.userBase, 'PATCH', '/api/me/locale', { locale: null });
+    }
+    // ⓬b 起点钉死：账号值 null + 两个载体空 ⇒ 界面必须跟着浏览器语言（容器钉 zh-CN）。
+    //      这同时是契约判据 5（没设过的用户行为与今天逐字相同）的证据，并保证下面的英文是新造成的。
+    acct.preClear = await clearSiteData(apage, acctCtx);
+    await loginInto(apage, cfg.userBase, cfg.scriptLogin, cfg.scriptPassword);
+    await gotoWorkbench(apage, cfg.userBase);
+    acct.langBaseline = await apage.evaluate(() => document.documentElement.lang);
+    acct.textsBaseline = await localeTexts(apage);
+
+    // ⓬c 点顶栏切 English：界面变英文，**且真的发了一枪 PATCH /api/me/locale**
+    acct.patchCalls = [];
+    await openLocaleMenu(apage, LOCALE_BTN_ADMIN);
+    await clickMenuItem(apage, 'English');
+    await apage.waitForFunction(() => document.documentElement.lang === 'en', null, { timeout: 10000 });
+    await apage.waitForTimeout(300);
+    acct.langAfterClickEn = await apage.evaluate(() => document.documentElement.lang);
+    acct.textsAfterClickEn = await localeTexts(apage);
+    acct.carriersAfterClickEn = await readCarriers(apage);
+
+    // ⓬d 清掉这个 origin 的 cookie 与 localStorage（新设备 / 清了站点数据）；残留交给断言判。
+    acct.cleared = await clearSiteData(apage, acctCtx);
+
+    // ⓬e 重新登录（同一账号），**一步都不点**：界面第一帧就是英文，且两个载体被库里那个值重新灌满。
+    await loginInto(apage, cfg.userBase, cfg.scriptLogin, cfg.scriptPassword);
+    await gotoWorkbench(apage, cfg.userBase);
+    acct.langAfterReLogin = await apage.evaluate(() => document.documentElement.lang);
+    acct.textsAfterReLogin = await localeTexts(apage);
+    acct.carriersAfterReLogin = await readCarriers(apage);
+    await apage.screenshot({ path: cfg.shotPath3 });
+    try { acct.shotBytes3 = statSync(cfg.shotPath3).size; } catch { /* 容器内没落盘，宿主回收时再看 */ }
+  } catch (err) {
+    // 这条腿自己的失败单独记：不拕 main 那条腿的 fatal，但同样会被宿主当成产品红。
+    // 只截第一行会把「在等哪个选择器」丢掉（本腿第一次判红时就查不出是哪一步）：
+    // Playwright 的超时把 selector 写在第二行，这里多留两行，判红时要能看出死在哪一步。
+    acct.fatal = String((err && err.message) || err).split('\n').slice(0, 4).join(' | ').slice(0, 500);
+    // 判红时要能看出「页面到底停在哪儿、渲染了什么」：URL + 标题 + 正文前 200 字（best-effort）。
+    try {
+      acct.fatalUrl = apage.url();
+      acct.fatalTitle = await apage.evaluate(() => document.title);
+      acct.fatalBody = await apage.evaluate(() => (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200));
+    } catch { /* 页面已经没了就算了 */ }
+  } finally {
+    // ⓬f 收尾（必做）：把该账号的 locale 恢复成 null ⇒ 别把 dev 账号留在英文态。
+    //      走 API；会话可能已被上面某一步的清站点数据清掉 ⇒ 先探 /api/me，非 200 就重新登一次再 PATCH。
+    try {
+      if (apage) {
+        // 先落到用户面 origin（才有同源 fetch；已登录时路由会自己把 /login 弹走，不影响）。
+        await apage.goto(cfg.userBase + '/#/login', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        const probeMe = await apiCall(apage, cfg.userBase, 'GET', '/api/me');
+        acct.restoreProbeStatus = probeMe.status;
+        if (probeMe.status !== 200) {
+          await loginInto(apage, cfg.userBase, cfg.scriptLogin, cfg.scriptPassword);
+          acct.restoreReloggedIn = true;
+        }
+        const patched = await apiCall(apage, cfg.userBase, 'PATCH', '/api/me/locale', { locale: null });
+        acct.restorePatchStatus = patched.status;
+        const meAfter = await apiCall(apage, cfg.userBase, 'GET', '/api/me');
+        acct.restoreGetStatus = meAfter.status;
+        acct.localeAfterRestore = meAfter.body && meAfter.body.user ? meAfter.body.user.locale : null;
+      } else {
+        acct.restoreSkipped = '账号腿连页面都没建起来，没写过任何值 ⇒ 无需恢复';
+      }
+    } catch (err2) {
+      acct.restoreFatal = String((err2 && err2.message) || err2).split('\n')[0].slice(0, 300);
+    }
+    try { if (acctCtx) await acctCtx.close(); } catch { /* ignore */ }
+  }
 } catch (err) {
   r.fatal = String((err && err.message) || err).split('\n')[0].slice(0, 300);
 } finally {
@@ -391,7 +625,7 @@ try {
 process.stdout.write('\nREPORT:' + JSON.stringify(r) + '\n');
 `;
 
-test('管理台语言切换：真浏览器里切英文当场生效、刷新仍在、并跨 host 共享到用户面', async (t) => {
+test('管理台语言切换：真浏览器里切英文当场生效、刷新仍在、并跨 host 共享到用户面；账号级偏好：清了站点数据重新登录不用重选', async (t) => {
   if (!UI_ENABLED) {
     t.skip('浏览器腿要点名才跑（E2E_UI=1）——未点名，按设计 skip');
     return;
@@ -424,6 +658,10 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     hostResolverRules: HOST_RESOLVER_RULES,
     shotPath: SHOT_CONTAINER,
     shotPath2: SHOT2_CONTAINER,
+    shotPath3: SHOT3_CONTAINER,
+    // 账号级语言偏好腿用的脚本账号与它的口令（只经临时 cfg 文件进容器，仓库里不出现口令）。
+    scriptLogin: SCRIPT_LOGIN,
+    scriptPassword: CRED_SCRIPT_PASSWORD,
   };
   try {
     fs.writeFileSync(scriptHost, CONTAINER_SCRIPT.replace('__PW_MODULE__', PW_MODULE), { mode: 0o600 });
@@ -435,7 +673,7 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     assert.ok(m, `容器脚本没吐 REPORT——原始输出尾部：\n${out.slice(-2000)}`);
     const rep = JSON.parse(m[1]);
     const admin = rep.admin;
-    t.diagnostic(`致命：${rep.fatal ?? '(无)'}\n管理台读数：${JSON.stringify(admin)}\n用户面读数：${JSON.stringify(rep.user)}\nruntime 读数：${JSON.stringify(rep.runtime)}\npageErrors：${JSON.stringify(rep.pageErrors)}`);
+    t.diagnostic(`致命：${rep.fatal ?? '(无)'}\n管理台读数：${JSON.stringify(admin)}\n用户面读数：${JSON.stringify(rep.user)}\nruntime 读数：${JSON.stringify(rep.runtime)}\n账号级偏好读数：${JSON.stringify(rep.account)}\npageErrors：${JSON.stringify(rep.pageErrors)}`);
 
     // 致命错误分两类（区分环境与产品）：
     //   环境到不了入口（net:: / 连不上 / 超时 / 握手）⇒ 环境问题，skip。
@@ -484,6 +722,66 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     // ⑪ pageerror = 0
     assert.deepEqual(rep.pageErrors, [], `管理台英文态不该抛页面级 JS 异常，实际 ${JSON.stringify(rep.pageErrors)}`);
 
+    // ⓬ 账号级语言偏好（#828 P3：本单判据本体）：脚本账号在用户面切一次英文 ⇒ 清掉站点数据
+    //    ⇒ 重新登录**一步都不点**就是英文。这段与管理台那条腿完全分开：不同的 context、不同的
+    //    账号、不同的入口（用户面），互不污染载体。
+    const acct = rep.account || {};
+    if (acct.fatal) {
+      if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(acct.fatal)) {
+        // 同主腿口径：环境到不了入口也算红（除非显式 E2E_UI_SOFT=1）。
+        if (UI_SOFT) {
+          t.skip(`账号级偏好腿到不了用户面入口（net:: 类，已显式 E2E_UI_SOFT=1 降级）：${acct.fatal}`);
+          return;
+        }
+        assert.fail(`E2E_UI=1 点名要跑，账号级偏好腿却到不了用户面入口（缺：${acct.fatal}）——不能以 skip 冒充通过；不想被判红就显式带 E2E_UI_SOFT=1`);
+        return;
+      }
+      assert.fail(`账号级偏好腿到了用户面却没跑通（产品红）：${acct.fatal}（用户面 ${USER_BASE}，账号 ${SCRIPT_LOGIN}；停在 ${acct.fatalUrl ?? '未知 URL'}，标题 ${JSON.stringify(acct.fatalTitle ?? '?')}，正文 ${JSON.stringify(acct.fatalBody ?? '?')}）`);
+      return;
+    }
+    // ⓬a 预清那一步得先真登进去（没登进去 ⇒ 后面每一条都是空读数，先钉这一条）
+    assert.equal(acct.meBeforeStatus, 200, `脚本账号（${SCRIPT_LOGIN}）登用户面后 GET /api/me 该是 200，实际 ${JSON.stringify(acct.meBeforeStatus)}——登不进去（口令错 / 开了二步验证 / 账号禁用）后面全部读数都不可信`);
+    // 「清干净了」的口径（预清与 ⓬d 两次清都过这个函数）：cookie 里没 locale、localStorage 里也没 locale。
+    // 残留不算绿而算红：载体还在的话，「重登后直接是英文」完全可以是被残留的那份 cookie 骗出来的。
+    const assertCleared = (label, c) => {
+      assert.ok(c, `${label}：没拿到载体读数（清站点数据那步没跑成？）`);
+      assert.equal(c.cookieLocale, null, `${label}：cookie 里不该再有 locale，实际 locale=${JSON.stringify(c.cookieLocale)}、cookie 全文=${JSON.stringify(c.cookieText)}`);
+      assert.equal(c.storageLocale, null, `${label}：localStorage 里不该再有 locale，实际 locale=${JSON.stringify(c.storageLocale)}、keys=${JSON.stringify(c.storageKeys)}`);
+    };
+    assertCleared('⓬a 预清站点数据后', acct.preClear);
+    // ⓬b 起点：账号没设过值 ⇒ 界面跟着浏览器语言（容器钉 zh-CN）。这同时是契约判据 5 的证据。
+    assert.equal(acct.langBaseline, 'zh-CN', `账号值为 null 且载体已清 ⇒ 中文浏览器上用户面该是 zh-CN（判据 5：没设过的用户行为与今天逐字相同），实际 ${JSON.stringify(acct.langBaseline)}`);
+    assert.equal(acct.textsBaseline && acct.textsBaseline.logoutText, '登出', `起点顶栏登出按钮文案该是中文「登出」，实际 ${JSON.stringify(acct.textsBaseline && acct.textsBaseline.logoutText)}——不是中文的话，下面「变英文」就没意义了`);
+    assert.equal(acct.textsBaseline && acct.textsBaseline.headerHasZhChrome, true, '起点顶栏整块该还带中文菜单文案（反向钉起点真是中文）');
+    // ⓬c 点顶栏 English：当场变英文 + **真的发了一枪 PATCH**（只看界面变了不算证据）
+    assert.equal(acct.langAfterClickEn, 'en', `用户面点 English 后 <html lang> 当场该变 en，实际 ${JSON.stringify(acct.langAfterClickEn)}`);
+    assert.equal(acct.textsAfterClickEn && acct.textsAfterClickEn.logoutText, 'Sign out', `点完顶栏登出按钮该变 Sign out，实际 ${JSON.stringify(acct.textsAfterClickEn && acct.textsAfterClickEn.logoutText)}`);
+    const enPatch = (acct.patchCalls || []).find((c) => c.method === 'PATCH'
+      && String(c.url).includes('/api/me/locale')
+      && /"en"/.test(String(c.body)));
+    assert.ok(enPatch, `已登录时切英文该顺手回写账号值（PATCH ${USER_BASE}/api/me/locale，体里带 "en"），实际监听到 ${JSON.stringify(acct.patchCalls)}——没这一枪就说明「下次登录不用重选」那个值根本没上传`);
+    assert.ok(String(enPatch.url).startsWith(USER_BASE), `那一枪该发给用户面那个 origin，实际 ${JSON.stringify(enPatch.url)}`);
+    // 前端双写：切完当场 cookie 与 localStorage 也得上 en（服务端谈判靠 cookie，不许有窗口差）
+    assert.equal(acct.carriersAfterClickEn && acct.carriersAfterClickEn.cookieLocale, 'en', `切完英文后同站 cookie 的 locale 该是 en，实际 ${JSON.stringify(acct.carriersAfterClickEn)}`);
+    assert.equal(acct.carriersAfterClickEn && acct.carriersAfterClickEn.storageLocale, 'en', `切完英文后 localStorage 的 locale 该是 en，实际 ${JSON.stringify(acct.carriersAfterClickEn)}`);
+    // ⓬d 清站点数据：真的清干净了（这一步不算绿而算判据：它没做成，后面那条就是假的）
+    assertCleared('⓬d 清站点数据后', acct.cleared);
+    // ⓬e 重登后**一步都不点**：界面直接就是英文（断 DOM 文案，不断 class）
+    assert.equal(acct.langAfterReLogin, 'en', `清掉站点数据后重新登录，<html lang> 该直接是 en（本单判据本体：不用重选），实际 ${JSON.stringify(acct.langAfterReLogin)}`);
+    assert.equal(acct.textsAfterReLogin && acct.textsAfterReLogin.logoutText, 'Sign out', `重登后顶栏登出文案该直接是 Sign out（一步都没点），实际 ${JSON.stringify(acct.textsAfterReLogin && acct.textsAfterReLogin.logoutText)}`);
+    assert.match(String((acct.textsAfterReLogin || {}).localeBtnText || ''), /English/, `重登后顶栏语言按钮自身文案该是 English，实际 ${JSON.stringify((acct.textsAfterReLogin || {}).localeBtnText)}`);
+    assert.equal((acct.textsAfterReLogin || {}).localeBtnAria, 'Language', `重登后语言按钮的 aria-label 该是 locale.label 的英文取值 Language，实际 ${JSON.stringify((acct.textsAfterReLogin || {}).localeBtnAria)}`);
+    assert.equal((acct.textsAfterReLogin || {}).headerHasZhChrome, false, `重登后顶栏整块不该再有中文菜单文案（起点那边刚钉过它确实是中文），实际 CJK 行 ${JSON.stringify((acct.textsAfterReLogin || {}).cjkLines)}`);
+    // 机制证据：服务端那个值确实被灌回了两个载体（不只是「渲染碰巧是英文」）
+    assert.equal(acct.carriersAfterReLogin && acct.carriersAfterReLogin.cookieLocale, 'en', `重登后 cookie 的 locale 该被登录响应里的账号值重新写成 en，实际 ${JSON.stringify(acct.carriersAfterReLogin)}`);
+    assert.equal(acct.carriersAfterReLogin && acct.carriersAfterReLogin.storageLocale, 'en', `重登后 localStorage 的 locale 该被账号值重新写成 en，实际 ${JSON.stringify(acct.carriersAfterReLogin)}`);
+    // ⓬f 收尾：该账号的 locale 已恢复 null（别把 dev 账号留在英文态），并且真的读回来了
+    assert.ok(!acct.restoreFatal, `收尾恢复 locale 时抛错了：${JSON.stringify(acct.restoreFatal)}`);
+    assert.equal(acct.restorePatchStatus, 200, `收尾 PATCH /api/me/locale 带 null 该 200，实际 ${JSON.stringify(acct.restorePatchStatus)}`);
+    assert.equal(acct.restoreGetStatus, 200, `收尾回读 GET /api/me 该 200，实际 ${JSON.stringify(acct.restoreGetStatus)}`);
+    assert.equal(acct.localeAfterRestore, null, `收尾后该账号的 user.locale 该是 null（没设过），实际 ${JSON.stringify(acct.localeAfterRestore)}——不是 null 就是下一个跑的人打开就是英文`);
+    assert.deepEqual(acct.pageErrors, [], `账号级偏好腿不该抛页面级 JS 异常，实际 ${JSON.stringify(acct.pageErrors)}`);
+
     // 把容器里的截图取回宿主（两侧路径各自独立，见文件头 SHOT_* 那段）；只证明「英文态页面真渲染出来了」，不当硬判据。
     const bytes = (() => {
       try {
@@ -507,6 +805,19 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     t.diagnostic(bytes2
       ? `英文态运行时设置页截图：${SHOT2_HOST}（${bytes2} 字节，容器内读数 ${rep.shotBytes2}）`
       : `# 运行时设置页截图没拿回宿主（${SHOT2_HOST}；不影响判据，硬判据是行名/小字的 CJK 读数）`);
+
+    // 第三张：账号级偏好腿「重登后直接英文」的那一屏（#828 P3）。与第二张同口径：拿回宿主只当给人
+    // 看的附件，不判红（硬判据是上面那五条 DOM 读数与两个载体读数）。
+    const bytes3 = (() => {
+      try {
+        tryQuiet(() => fs.rmSync(SHOT3_HOST));
+        dockerRun(`cp ${PW_CONTAINER}:${SHOT3_CONTAINER} ${SHOT3_HOST}`, { timeout: 30_000 });
+        return fs.statSync(SHOT3_HOST).size;
+      } catch { return null; }
+    })();
+    t.diagnostic(bytes3
+      ? `账号级偏好腿：清站点数据后重登、一步都没点的英文态截图：${SHOT3_HOST}（${bytes3} 字节，容器内读数 ${(rep.account || {}).shotBytes3}）`
+      : `# 账号级偏好腿的截图没拿回宿主（${SHOT3_HOST}；不影响判据）`);
   } finally {
     // ⑫ 收尾：容器里那份带口令的 cfg + 脚本都尽力删；宿主临时文件也删（截图留在宿主，是给人看的）。
     tryQuiet(() => dockerRun(`exec ${PW_CONTAINER} sh -c "rm -f ${scriptIn} ${cfgIn}"`));
@@ -525,4 +836,7 @@ test('哨兵：点名了（E2E_UI=1）却没有口令 ⇒ 判红，禁止静默�
   // 主用例那半要探测才拿得到原因（探测本身要碰 docker，不点名就别碰），口令这条在模块加载就能判，故各自守一段。
   assert.ok(CRED_PASSWORD !== null,
     `E2E_UI=1 点名了浏览器腿，但没找到口令文件（试过 ${PASSWORD_FILE}）——口令缺失不能静默 skip 冒充通过`);
+  // 账号级偏好腿要往脚本账号上写值再清回去：它的口令缺失与上面同口径（缺了就跑不了，不是 skip）。
+  assert.ok(CRED_SCRIPT_PASSWORD !== null,
+    `E2E_UI=1 点名了浏览器腿，但没找到脚本账号（${SCRIPT_LOGIN}）的口令文件（试过 ${SCRIPT_PASSWORD_FILE}）——缺它这条腿一步都跑不了，不能静默 skip 冒充通过`);
 });
