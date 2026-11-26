@@ -56,6 +56,7 @@ import * as macroRoutes from './macro-routes.js'; // #526：宏平台 HTTP 业�
 import { MacroError } from './macros.js'; // #526：宏域错误载体（httpStatus 自带在错误上，一处映射）
 import * as market from './market.js'; // #595：能力市场（校验/安装面），本文件只做「匹配+鉴权+转发+审计」
 import { metricsApiPayload } from './system-metrics.js'; // #650：管理台系统监控（响应本体在那个模块，本文件只做匹配+递旋钮）
+import { resolveRequestLocale } from './locale.js'; // #803 S1：请求语言谈判（错误文案 + 运行时设置 label/hint 共用，纯函数零依赖）
 
 /**
  * **全站 JSON 请求体默认上限（内存护栏 + scrypt 保护）。**
@@ -101,13 +102,17 @@ const MIME = {
 
 /** 带标准错误信封的 HTTP 异常（route 层统一捕获 → sendJson）。 */
 class HttpError extends Error {
-  constructor(status, code, message, { retryable = false, details, headers } = {}) {
+  // `en` 是 issue #803 的**可选**英文文案：给了就在 `locale === 'en'` 时替代 `message`，不给
+  // ⇒ `this.en === undefined`、出口照旧出中文（渐进覆盖）。`super(message)` 仍传中文——
+  // `Error.message` 的中文是日志与既有断言的依赖，**不许动**。
+  constructor(status, code, message, { retryable = false, details, headers, en } = {}) {
     super(message);
     this.status = status;
     this.code = code;
     this.retryable = retryable;
     this.details = details;
     this.headers = headers;
+    this.en = en;
   }
 }
 
@@ -125,6 +130,18 @@ function errorBody(code, message, retryable = false, details) {
   const err = { code, message, retryable };
   if (details !== undefined) err.details = details;
   return { error: err };
+}
+
+/**
+ * 错误出口按请求 locale 挑一条消息文案（issue #803）。
+ * `err.en` 缺失 ⇒ 出中文——这是**渐进覆盖的形状，不是 bug**：只有抛出点显式给了 `en:` 的条目，
+ * 才在 `locale === 'en'` 时出英文，其余一律照旧出 `err.message`（中文）。各类 `*Error`
+ * （ProjectError/SessionError/DirError/InternalError/LlmError/…）的 `en` 也由这里**通用读取**，
+ * S1 不给它们加构造器参数。
+ */
+function pickMessage(err, locale) {
+  if (locale === 'en' && typeof err?.en === 'string' && err.en !== '') return err.en;
+  return err.message;
 }
 
 function getCookie(req, name) {
@@ -720,7 +737,13 @@ function requireJson(req) {
   const ct = (raw || '').split(';')[0].trim().toLowerCase();
   if (ct === 'application/json') return;
   if (raw === undefined && requestHasNoBody(req)) return;
-  throw new HttpError(400, 'validation_failed', 'Content-Type 必须为 application/json');
+  // 这一条是 #803 的**机制端到端样桩**（返修 m6）：目前全仓只有这一处给了 `en:`，因此它是唯一
+  // 能从 HTTP 面真走通 `err.en` ⇒ `pickMessage` 那条链的抛出点（判据：
+  // `portal/test/admin-runtime-settings-api.test.js` 的 Content-Type 腿）。改动本行时**两边的
+  // 逐字都有钉**，别只改一边。
+  throw new HttpError(400, 'validation_failed', 'Content-Type 必须为 application/json', {
+    en: 'Content-Type must be application/json',
+  });
 }
 
 /** issue #236：请求是否**确定**没有 body（`Content-Length: 0`，或既无 CL 也无 chunked 编码）。 */
@@ -1017,37 +1040,38 @@ export function createServer({
     try {
       await route(req, res, ctx);
     } catch (err) {
+      const locale = resolveRequestLocale(req); // #803：一次请求只算一次，喂下面所有 errorBody 的文案挑选
       if (err instanceof HttpError) {
         const headers = { ...(err.headers || {}) };
         if (err.status === 413) headers['Connection'] = 'close'; // 未读完的请求体需断开
-        sendJson(res, err.status, errorBody(err.code, err.message, err.retryable, err.details), headers);
+        sendJson(res, err.status, errorBody(err.code, pickMessage(err, locale), err.retryable, err.details), headers);
         return;
       }
       if (err instanceof projects.ProjectError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof sessions.SessionError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof dirs.DirError) {
         // issue #472：`retryable` 由错误自己带（既有 DirError 一律不带 ⇒ 恒 false，行为逐字不变），
         // 只有 `upload_interrupted` 声明 true（客户端断流，重发即可）。**没加新映射分支**。
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, err.retryable === true, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), err.retryable === true, err.details));
         return;
       }
       if (err instanceof idempotency.IdempotencyError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, err.retryable, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), err.retryable, err.details));
         return;
       }
       if (err instanceof internal.InternalError) {
-        sendJson(res, err.status, errorBody(err.code, err.message, err.retryable, err.details));
+        sendJson(res, err.status, errorBody(err.code, pickMessage(err, locale), err.retryable, err.details));
         return;
       }
       if (err instanceof llm.LlmError) {
         // issue #261014 切片 B2：`retryable` 由错误自己带（既有 LlmError 不带 ⇒ 恒 false，行为不变）。
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, err.retryable === true, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), err.retryable === true, err.details));
         return;
       }
       if (err instanceof LlmGatewayError) {
@@ -1055,24 +1079,24 @@ export function createServer({
         return;
       }
       if (err instanceof gitCredential.GitCredentialError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof gitHosts.GitHostError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof mailSettings.MailSettingsError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof uploadSettings.UploadSettingsError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof platformPrompts.PlatformPromptsError) {
         // #596 片 A：httpStatus 与 `code` 自带 ⇒ **零新错误码、零新映射规则**（一律 `validation_failed`）。
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof runtimeSettings.RuntimeSettingsError) {
@@ -1086,7 +1110,7 @@ export function createServer({
       }
       if (err instanceof secrets.SecretError) {
         // #608：槽值面的错误（空串 / 超长 / 未声明）有自己的 code 集合，别混进 validation_failed。
-        sendJson(res, err.httpStatus ?? 400, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus ?? 400, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof market.MarketError) {
@@ -1094,29 +1118,29 @@ export function createServer({
         // capability_not_found / capability_not_published / capability_budget_exceeded /
         // capability_kind_unsupported / capability_install_failed）。`details` 里只有字段名/数字/路径，
         // **不含包内容**（2 MiB 的源码不该进错误响应）。
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof tlsCert.TlsCertError) {
         // #456：证书面的错误一律 `retryable:false`（`tls_cert_expired` 也是——换一张证书才是出路，
         // 重试一万次还是同一张）。`details` 里只有字段名/域名/指纹，**没有 PEM、没有私钥**。
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof admin.AdminError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof delegation.DelegationError) {
         // 子 run 读侧：只用既有错误码（not_found / validation_failed / payload_too_large / internal），
         // httpStatus 自带在错误上 ⇒ 零新码、零新映射规则。
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       if (err instanceof MacroError) {
         // #526 宏域（macros.js / macro-routes.js / notifications.js 共用这一种错误载体）：
         // httpStatus 自带 ⇒ 与 SessionError/DelegationError 同形映射，零新错误码。
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), false, err.details));
         return;
       }
       log.error?.('[portal] unhandled:', err);
@@ -2352,7 +2376,7 @@ async function handleAdminApi(req, res, ctx, url) {
   if (pathname === '/api/admin/runtime-settings') {
     if (req.method === 'GET') {
       return sendJson(res, 200, await runtimeSettings.listRuntimeSettingsAdmin({
-        pool: ctx.pool, config: ctx.config, log: ctx.log,
+        pool: ctx.pool, config: ctx.config, log: ctx.log, locale: resolveRequestLocale(req),
       }));
     }
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
@@ -2387,6 +2411,9 @@ async function handleAdminApi(req, res, ctx, url) {
       key,
       value: body.value,
       log: ctx.log,
+      // #803 返修 M1：回包的 `label`/`hint` 与 GET 同一套 locale 谈判——前端保存成功后拿这一行
+      // 顶掉表格里的整行，这里恒中文会让英文页面保存一次就变回中文。审计与校验文案仍恒中文。
+      locale: resolveRequestLocale(req),
     });
     // 审计**不在这里**写：`admin.runtime_settings_updated` 已经与 upsert 在**同一个事务**里
     // （`runtime-settings.js` 的 `BEGIN` → `SELECT … FOR UPDATE` → upsert → 审计 → `COMMIT`）。
