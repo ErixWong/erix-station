@@ -190,7 +190,7 @@ GET /api/sessions/:sessionId/delegates/:childRunId?tail=100
   坏文件跳过（不 500）。
 - **读 transcript**：`<...>/home/delegation/transcripts/<childRunId>.jsonl`，逐行 `JSON.parse`
   → **`portal/src/transcript-fold.js#foldLedgerRecords`**（本站超集镜像，`runner/lib/store.js#load` 用的同一份）
-  → `projectTranscriptForDisplay`（`erix-agent` 包根导出，`session-view.js:31` 同一个函数）
+  → `projectTranscriptForDisplay`（本仓 `portal/src/display-projection.js`，`session-view.js:31` 同一个函数）
   → 再套一层既有 DTO 适配（`id/seq/run_id/created_at` 这些宿主字段用 `childRunId` + 行号合成）。
   ⚠ `foldLedgerMessages` / `foldMessageRows` **不在包导出面**（实测 `undefined`，深引被 `exports` 挡）
   ⇒ 只能用本站镜像；那也正好是既有保证（两份 `SHARED-FOLD-CORE` 逐字节对拍）。

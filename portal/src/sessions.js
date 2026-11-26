@@ -16,7 +16,7 @@ import {
   TITLE_CONTEXT_MESSAGES, TITLE_CONTEXT_MAX_LEN, TITLE_LLM_MAX_TOKENS, TITLE_LLM_TIMEOUT_MS, TITLE_SYSTEM_PROMPT,
 } from './title-llm.js';
 import { collectTranscriptFacts, projectSessionMessages } from './session-view.js';
-import { projectTranscriptForDisplay } from 'erix-agent';
+import { projectTranscriptForDisplay } from './display-projection.js';
 import { fetchUserTextTurns } from './session-text.js';
 // issue #596 片 A：手工改名的 system 从 `platform_prompts` 取（每次现读、无缓存 ⇒ 保存后下一次改名就生效）。
 import { resolveEffectiveTitlePrompt } from './platform-prompts.js';

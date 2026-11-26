@@ -17,7 +17,7 @@ import path from 'node:path';import {
   ACTIVITY_SNIPPET_MAX_CHARS,
 } from '../src/delegation.js';
 import { foldLedgerRecords } from '../src/transcript-fold.js';
-import { projectTranscriptForDisplay } from 'erix-agent';
+import { projectTranscriptForDisplay } from '../src/display-projection.js';
 import { SessionError } from '../src/sessions.js';
 import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';

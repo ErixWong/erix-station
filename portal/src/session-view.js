@@ -1,8 +1,8 @@
 // 会话读侧展示投影（P3 PR②b，docs/design/conversation-state.md §6，上游 issue #95）。
 //
-// 「文本 / blocks / reasoning / 折叠」的推导**全部交给上游官方纯函数**
-// `projectTranscriptForDisplay(records)`（erix-agent 0.15.0，
-// erix-llm-kit `docs/host-consumer-contract.md` → "Host display projection"）：
+// 「文本 / blocks / reasoning / 折叠」的推导**全部交给本站自有投影**
+// `projectTranscriptForDisplay(records)`（本仓 `portal/src/display-projection.js`，
+// 来源见该文件头注释）：
 //   - `reasoning` 与 `text` 分离，推理文本不再混进正文；
 //   - 折叠轮只给「摘要 + 范围 + 导航指针」（`meta.foldedRoundRange` / `meta.navigationRecord`），
 //     `foldedPayload` 原文不进对话流；
@@ -28,7 +28,7 @@
 //      只存在于后续 run 的历史快照里（迁移 0015 之前入档的行甚至两者皆无）。这类行只能继续按
 //      「内容精确相等」认领尚未认领的 user 锚点（seq 升序、单调游标、一条锚点只被认领一次）。
 //      带 `<sessionId>:input:<messageId>` 的行**一律走 meta.dedupKey 精确映射**，不再参与内容匹配。
-import { projectTranscriptForDisplay } from 'erix-agent';
+import { projectTranscriptForDisplay } from './display-projection.js';
 import { foldTranscriptRows } from './transcript-fold.js';
 
 // 归属用的键名：DB `dedup_key` 列（宿主自有的幂等键）+ 投影带出的 `meta.dedupKey`。
