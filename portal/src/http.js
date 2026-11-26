@@ -3289,9 +3289,9 @@ function queuedInputDeps(ctx) {
   return {
     notifyRunEnqueued: ({ runId, userId }) => internal.notifyRunEnqueued(userId, { run_id: runId }),
     notifySteerRequest: (userId, data) => internal.broadcastSteerRequest(userId, data),
-    notifyQueueUpdate: async (sessionId, blocked = null, deliveredRunId = null) => {
+    notifyQueueUpdate: async (sessionId, blocked = null, deliveredRunId = null, delivered = null) => {
       const rows = await queuedInputs.snapshotQueuedInputs(ctx.pool, sessionId);
-      internal.notifyQueueUpdate(sessionId, rows, blocked, deliveredRunId);
+      internal.notifyQueueUpdate(sessionId, rows, blocked, deliveredRunId, delivered);
     },
   };
 }

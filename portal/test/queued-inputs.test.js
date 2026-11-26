@@ -12,6 +12,7 @@ import {
   validateQueuedKind, toSnapshot, MAX_QUEUED_INPUTS_PER_SESSION,
 } from '../src/queued-inputs.js';
 import { createUserActivityWorld } from './fake-user-activity.js';
+import { notifyQueueUpdate as internalNotifyQueueUpdate, registerSessionClient, unregisterSessionClient } from '../src/internal.js';
 
 // ---------------------------------------------------------------------------
 // 内存世界
@@ -143,7 +144,7 @@ function world(overrides = {}) {
   // postMessage 的替身：默认成功建一个 run
   const deps = {
     notifyRunEnqueued: ({ runId }) => { w.runEnqueues.push(runId); },
-    notifyQueueUpdate: (sessionId, blocked = null) => { w.notifies.push({ sessionId, blocked }); },
+    notifyQueueUpdate: (sessionId, blocked = null, deliveredRunId = null, delivered = null) => { w.notifies.push({ sessionId, blocked, deliveredRunId, delivered }); },
     notifySteerRequest: (userId, payload) => { w.steers.push({ userId, ...payload }); },
   };
   w.deps = deps;
@@ -447,4 +448,65 @@ test('#370 出队：postMessage 404（会话没了）⇒ 钉 discarded，不再�
   const out = await drainWith(w, { termination: { reason: 'end_turn' } });
   assert.equal(out.blocked, 'deliver_failed');
   assert.equal(w.queued[0].status, 'discarded');
+});
+
+// ---------------------------------------------------------------------------
+// issue #799：投递成功那一帧要带 `delivered`（那句话本身）。
+// 队列是**状态**；一句队列话被投出去那一刻起就是普通 user 消息 = **历史**，所以它必须随这一帧
+// 交到前端当场出气泡，而不是等刷新从库里读回来（读得到，但「实时对话」里那句话凭空缺席）。
+// ---------------------------------------------------------------------------
+test('#799 出队投递成功：notifyQueueUpdate 第 5 实参逐字等于 postMessage 回的 user 消息体', async () => {
+  const probe = '转向探针-799';
+  const probeMessage = { id: 'm-del-799', seq: 7, role: 'user', content: probe, synthetic: false, attachments: [] };
+  const w = world({ postImpl: () => ({ message: probeMessage, run: { id: 'run-del-799' } }) });
+  seedQueued(w, [{ kind: 'follow_up', content: '投出去的一句' }]);
+  const out = await drainWith(w, { termination: { reason: 'end_turn' } });
+  assert.equal(out.delivered, 'q0');
+  const last = w.notifies.at(-1);
+  assert.equal(last.blocked, null, '成功帧不带 blocked');
+  assert.equal(last.deliveredRunId, 'run-del-799');
+  assert.ok(last.delivered && typeof last.delivered === 'object', '投递帧必须带 delivered（那句话本身）');
+  assert.equal(last.delivered.content, probe, 'delivered 就是 postMessage 回显的那句话，逐字相等');
+  assert.equal(last.delivered.id, 'm-del-799');
+});
+
+test('#799 出队投递失败 deliver_failed：delivered 必须是 null（没投成的不许画成已发送）', async () => {
+  const w = world({ postImpl: () => { throw new Error('LLM 没绑'); } });
+  seedQueued(w, [{ kind: 'follow_up', content: '投不出去' }]);
+  const out = await drainWith(w, { termination: { reason: 'end_turn' } });
+  assert.equal(out.blocked, 'deliver_failed');
+  const last = w.notifies.at(-1);
+  assert.equal(last.blocked, 'deliver_failed');
+  assert.ok('delivered' in last, 'notify 记录面恒带 delivered 键');
+  assert.equal(last.delivered, null, '失败帧的 delivered 必须是 null');
+});
+
+test('#799 出队 container_not_running：delivered 必须是 null', async () => {
+  const w = world({ containerUp: false });
+  seedQueued(w, [{ kind: 'follow_up', content: '周五排的队' }]);
+  const out = await drainWith(w, { termination: { reason: 'end_turn' } });
+  assert.equal(out.blocked, 'container_not_running');
+  const last = w.notifies.at(-1);
+  assert.equal(last.blocked, 'container_not_running');
+  assert.ok('delivered' in last);
+  assert.equal(last.delivered, null, '容器没起来更不许渲染那句话');
+});
+
+test('#799 internal.notifyQueueUpdate 的 queue_update 帧恒带 delivered 键（非投递帧=null）', () => {
+  const res = { written: [], writableEnded: false, destroyed: false, end() {}, write(x) { this.written.push(x); } };
+  const rec = registerSessionClient('s-del-799', res);
+  try {
+    internalNotifyQueueUpdate('s-del-799', { steering: [], follow_up: [] });
+    const frame = rec.buffer.find((e) => e.type === 'queue_update');
+    assert.ok(frame, '非投递（入队/取回）也要推一帧 queue_update');
+    assert.ok('delivered' in frame.payload, 'queue_update 载荷面恒有 delivered 键');
+    assert.equal(frame.payload.delivered, null, '非投递帧 delivered=null');
+
+    const msg = { id: 'm-x', role: 'user', content: '投出去的话' };
+    internalNotifyQueueUpdate('s-del-799', { steering: [], follow_up: [] }, null, 'r-x', msg);
+    const frame2 = rec.buffer.filter((e) => e.type === 'queue_update').at(-1);
+    assert.deepEqual(frame2.payload.delivered, msg, '投递帧 delivered 逐字带上那句话的回显体');
+  } finally {
+    unregisterSessionClient('s-del-799', rec);
+  }
 });
