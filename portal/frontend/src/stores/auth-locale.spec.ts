@@ -223,4 +223,25 @@ describe('#828 pendingLocaleWrite 账号归属与登出/失效清理', () => {
     expect(urls.filter((u) => u === '/api/me/locale')).toHaveLength(1); // 无主→发一次
     expect(auth.pendingLocaleWrite).toBeNull();
   });
+
+  it('会话就绪后延迟补发 flushPendingLocale 失败 ⇒ 发了 PATCH 但 localeSyncFailed=true、pending 已清', async () => {
+    // 前置：会话未就绪时记下选择（无主哨兵，谁先就绪补发给谁）。
+    const auth = useAuthStore();
+    auth.pendingLocaleWrite = { login: NO_SESSION_LOCALE_OWNER, locale: 'en' };
+    // 让 user 就绪（BOB 无 locale，与待补发 en 不同）⇒ flush 会真发一枪。
+    auth.user = { ...BOB };
+    // 这一枪桩返回 500（api() 会抛 ApiError ⇒ catch 里置 localeSyncFailed=true）。
+    const fetchFn = fetchMock(() => json(500, { error: { code: 'boom', message: 'boom' } }));
+    vi.stubGlobal('fetch', fetchFn);
+    await auth.flushPendingLocale();
+    await flushPromises();
+    // ① 确实发出一枪：method=PATCH、URL 对，桩数得出。
+    const patch = fetchFn.mock.calls.filter((c) => (typeof c[0] === 'string' ? c[0] : '') === '/api/me/locale');
+    expect(patch).toHaveLength(1);
+    expect((patch[0][1] as RequestInit | undefined)?.method).toBe('PATCH');
+    // ② 延迟补发失败也要可见：旗标置起（把 auth.ts 的 `this.localeSyncFailed = true` 改成 = false 即变红）。
+    expect(auth.localeSyncFailed).toBe(true);
+    // ③ 先清后发 ⇒ pending 已清，不会重复补发。
+    expect(auth.pendingLocaleWrite).toBeNull();
+  });
 });

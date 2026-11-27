@@ -239,7 +239,8 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
     setActivePinia(pinia);
     const auth = useAuthStore();
     auth.user = { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local' };
-    auth.localeSyncFailed = true; // 直接置位：提示应出现
+    auth.localeSyncFailed = true; // 直接置位：本例只证「旗标 true ⇒ 提示行渲染」，**不覆盖置位来源**。
+    // 失败到底怎么把旗标置 true（当场 PATCH / 延迟补发两条发送路径）分别另见本文件「回写失败」一例与 stores/auth-locale.spec.ts。
     const w = mount(LocaleSwitch, { global: { plugins: [pinia, i18n] } });
     expect(w.find('[data-test="locale-sync-failed"]').exists()).toBe(true);
   });
