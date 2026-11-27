@@ -453,6 +453,27 @@ test('#495② L6 ② 全链都是真目录 ⇒ links 里没有任何链接、诊
 const isRootUid = () => typeof process.getuid === 'function' && process.getuid() === 0;
 
 /**
+ * #570：root 分支不许再「假设拦不住就跳」。
+ * 调用方**先把真夹具建好**（夹具自证写在夹具里，root 也照跑），再交一次 probe =
+ * **本格真半格自己要用的那一次 syscall**，由它决定这格在 root 上到不到得了：
+ *   · 真的抛 errno ⇒ root 在这台机器上确实被挡（noacl / 受限 fs / 挂载选项等）⇒ **不许 skip，继续跑真断言**；
+ *   · 真的成功返回 ⇒ 这才是 `CAP_DAC_OVERRIDE`，可以跳，但 skip 文案必须带上「哪次调用成功返回」这个现场。
+ * 文案里点名注入版的名字（读的人要知道这一格现在由谁承担）。
+ * @returns {boolean} true = 继续跑真断言；false = 已 skip（调用方立刻 return）。
+ */
+function rootSkipIfReallyUnblocked(t, { label, injection, probe, probeName }) {
+  if (!isRootUid()) return true; // 非 root：一律跑真断言（DAC 对自己也成立）
+  try {
+    probe(); // 成功 = 这台机器的 root 真不受这一位约束
+    t.skip(`${label}: id -u = 0，实测 ${probeName} 成功返回（CAP_DAC_OVERRIDE）⇒ 真 chmod 那半格不可达，本格由 ${injection} 承担`);
+    return false;
+  } catch (error) {
+    t.diagnostic(`${label}: id -u = 0 但实测 ${probeName} 仍抛 errno=${String(error?.code ?? error?.name ?? error)} ⇒ 不跳，跑真断言`);
+    return true;
+  }
+}
+
+/**
  * 真夹具（审计的复现形状）：`<base>/secret/inner` 是真文件，`<base>/link -> secret/inner`，
  * `chmod 000 <base>/secret`。⇒ `stat(link)` 要跟随链接穿过 `secret` ⇒ 真 `EACCES`（非 root 才成立）。
  */
@@ -465,6 +486,10 @@ function fixtureUnenterableTarget(t) {
   const link = path.join(base, 'link');
   fs.symlinkSync(path.relative(base, inner), link); // 相对链接：与真机 bind 源同形态，顺带验目标解析
   fs.chmodSync(secret, 0o000);
+  // #570 ①：夹具自证必须在夹具里（而不是写在调用点的 root skip 之后）——`lstat` 的 mode 与
+  // `CAP_DAC_OVERRIDE` 无关，root 上读到的也是真的 0 ⇒ 上面那句 chmod 被改坏就在**任何机器**上当场红。
+  const secretMode = fs.lstatSync(secret).mode & 0o777;
+  assert.equal(secretMode, 0, `夹具的 secret 必须真是 0o000，否则本格无效：0o${secretMode.toString(8)}`);
   t.after(() => {
     fs.chmodSync(secret, 0o755); // 不先放开就 rm 不掉（目录自己进不去）
     fs.rmSync(base, { recursive: true, force: true });
@@ -473,15 +498,18 @@ function fixtureUnenterableTarget(t) {
 }
 
 test('#495② M1 链接目标目录 chmod 000（真夹具）⇒ unreadable、blocker 点名、missingPrefix=null', (t) => {
-  if (isRootUid()) {
-    // root 下 chmod 000 拦不住 ⇒ 真 chmod 那一路**不可达**，不许假绿；同一形状由注入版 M1b 承担
-    t.skip('id -u = 0：root 有 CAP_DAC_OVERRIDE ⇒ chmod 000 拦不住，判据① 改由 M1b（fsImpl 注入 EACCES）承担');
-    return;
-  }
+  // #570 ②：先把真夹具建好（夹具自证在夹具里，root 也跑），再**量**一次本格真半格自己要用的那次真 syscall：
+  // 真抛 = root 在这台机器上也被挡 ⇒ 不许跳；真成功返回 = 确实是 `CAP_DAC_OVERRIDE` ⇒ 才能跳（文案带现场）。
   const { secret, link } = fixtureUnenterableTarget(t);
-  // 先证夹具本身成立（否则整格是假绿）：secret 真是 0o000，而 stat 真的抛 EACCES
+  // 先证夹具本身成立（否则整格是假绿）：secret 真是 0o000（夹具里已量过，重复前置保留），而 stat 真的抛 EACCES
   const secretMode = fs.lstatSync(secret).mode & 0o777;
   assert.equal(secretMode, 0, `夹具的 secret 必须真是 0o000，否则本格无效：0o${secretMode.toString(8)}`);
+  if (!rootSkipIfReallyUnblocked(t, {
+    label: 'M1（判据① 的真 chmod 半格）',
+    injection: 'M1b（fsImpl 注入 EACCES）',
+    probe: () => fs.statSync(link), // = 下面那句真断言里的同一次调用（照抄，不另挑）
+    probeName: 'fs.statSync(link)',
+  })) return;
   assert.throws(() => fs.statSync(link), (error) => {
     assert.equal(error.code, 'EACCES', `这台机器上「进不去」必须真的是 EACCES，否则取证无效：${error?.code}`);
     return true;
@@ -542,11 +570,26 @@ test('#495② M2 ENOENT/ENOTDIR 仍归 missing：悬空链接与链上缺段都�
 test('#495② M3 等待器：链接目标进不去 ⇒ 提前放弃并喊「读不到」（不许走到超时）', async (t) => {
   // 与陷阱 16（isolation-negative `#495 ②` 那族）同一件事，但钉的是**链接诱导**的那条分支：
   // 归因一退回吞错误，这格就会变成「等满 60s + 一句 timeout waiting for」⇒ 时间差就是牙。
-  const useReal = !isRootUid();
+  // #570 ②：root 分支不许再**静默**换注入版——先把真夹具建好（夹具自证在夹具里，root 也跑）并
+  // **量**一次 `fs.statSync(link)`：真抛就 `useReal=true`（连 root 也被挡 ⇒ 真夹具可用），
+  // 真成功返回才是 `CAP_DAC_OVERRIDE` ⇒ 才走注入版兜底。两条路都用 `t.diagnostic` 记现场。
+  const realLink = fixtureUnenterableTarget(t).link;
+  let probeNote = '';
+  let blocked = false;
+  try {
+    fs.statSync(realLink);
+    probeNote = '成功返回';
+  } catch (error) {
+    blocked = true;
+    probeNote = `抛 errno=${String(error?.code ?? error?.name ?? error)}`;
+  }
+  const useReal = !isRootUid() || blocked; // 语义不变：非 root 仍走真夹具，注入版仍是兜底
+  t.diagnostic(`M3: id -u = ${typeof process.getuid === 'function' ? process.getuid() : 'n/a'}，实测 fs.statSync(${realLink}) ${probeNote}`
+    + ` ⇒ useReal=${useReal}（${useReal ? '真夹具（真 chmod 000）' : 'root 有 CAP_DAC_OVERRIDE，真 chmod 那半格不可达 ⇒ 退回注入版 EACCES'}）`);
   let target = null;
   let fsImpl = fs;
   if (useReal) {
-    target = fixtureUnenterableTarget(t).link;
+    target = realLink;
   } else {
     const { dir, file } = fixtureUserspace(t);
     target = path.join(dir, 'link-m3.json');
@@ -611,6 +654,11 @@ function fixtureTraverseOnlyAncestor(t, { ancestorMode, seed = true, content = '
   const file = path.join(home, 'config.json');
   if (seed) fs.writeFileSync(file, content);
   fs.chmodSync(ancestor, ancestorMode);
+  // #570 ①：mode 前置断言搬进夹具（root 也跑）——这样**夹具自己的 chmod 写坏**当场红；
+  // 调用点把 `0o111` 写成 `0o755` 那种坏由调用点的 `assertAncestorMode`（同样在 skip 判定之前）接。
+  const gotMode = fs.lstatSync(ancestor).mode & 0o777;
+  assert.equal(gotMode, ancestorMode,
+    `夹具的祖先段必须真是 0o${ancestorMode.toString(8)}（夹具自己的 chmod 写坏就在这里接）：0o${gotMode.toString(8)}`);
   t.after(() => {
     fs.chmodSync(ancestor, 0o755);
     fs.rmSync(base, { recursive: true, force: true });
@@ -618,11 +666,19 @@ function fixtureTraverseOnlyAncestor(t, { ancestorMode, seed = true, content = '
   return { base, ancestor, home, file, content };
 }
 
-/** 夹具自证：那一段真是这个 mode，且真的**列不出来**（不可枚举）——否则「读得到」那半句是假绿。 */
-function assertAncestorModeAndUnenumerable(ancestor, wantMode) {
+/**
+ * #570：夹具自证里**与 `CAP_DAC_OVERRIDE` 无关**的那一半（`lstat` 的 mode root 上也是真的）。
+ * ⇒ 这一半可以、也必须搬到 root skip 判定**之前**（调用点写错 mode 在 root 机上也红）。
+ */
+function assertAncestorMode(ancestor, wantMode) {
   const got = fs.lstatSync(ancestor).mode & 0o777;
   assert.equal(got, wantMode,
     `夹具的祖先段必须真是 0o${wantMode.toString(8)}，本格才有效：0o${got.toString(8)}`);
+}
+
+/** 夹具自证：那一段真是这个 mode，且真的**列不出来**（不可枚举）——否则「读得到」那半句是假绿。 */
+function assertAncestorModeAndUnenumerable(ancestor, wantMode) {
+  assertAncestorMode(ancestor, wantMode);
   assert.throws(() => fs.readdirSync(ancestor), (error) => {
     assert.equal(error.code, 'EACCES', `这台机器上「不可枚举」必须真的是 EACCES，否则取证无效：${error?.code}`);
     return true;
@@ -641,11 +697,15 @@ function fakeDenyingMode(target, bit) {
 }
 
 test('#495② X1 真夹具：祖先 0o111（可穿越、不可枚举）+ 已知文件名 ⇒ present 且 waitForHostFile 成功', async (t) => {
-  if (isRootUid()) {
-    t.skip('id -u = 0：root 有 CAP_DAC_OVERRIDE ⇒ chmod 的 r/x 区别对 root 不成立，判据 ① 改由 X1b（注入版）承担');
-    return;
-  }
+  // #570 ②：夹具先建，mode 前置（与 `CAP_DAC_OVERRIDE` 无关）搬到 skip 判定之前，再量本格真半格的调用。
   const { ancestor, file, content } = fixtureTraverseOnlyAncestor(t, { ancestorMode: 0o111 });
+  assertAncestorMode(ancestor, 0o111); // 重复前置保留：root 机上也必须过（调用点把 0o111 写成 0o755 就当场红）
+  if (!rootSkipIfReallyUnblocked(t, {
+    label: 'X1（判据 ① 的真 chmod 半格）',
+    injection: 'X1b（注入版：祖先上要求 R_OK 就挡）',
+    probe: () => fs.readdirSync(ancestor), // = `assertAncestorModeAndUnenumerable` 里用的那一次调用（照抄）
+    probeName: 'fs.readdirSync(ancestor)',
+  })) return;
   assertAncestorModeAndUnenumerable(ancestor, 0o111);
   // 最硬的前置：这台机器上**真 `readFileSync`** 读得到（读得到却被判读不到 = 本单 BLOCKER 的本体）
   assert.equal(fs.readFileSync(file, 'utf8'), content, '夹具前提：真 readFileSync 读得到');
@@ -679,11 +739,15 @@ test('#495② X1b 同一形状的注入版（root 机也可跑）：祖先上要
 });
 
 test('#495② X2 真夹具：祖先 0o333 + 文件 100 ms 后才物化 ⇒ 等待器等到并成功（不许提前 reject）', async (t) => {
-  if (isRootUid()) {
-    t.skip('id -u = 0：root 有 CAP_DAC_OVERRIDE ⇒ 真 chmod 拦不住，判据 ② 的 chmod 版改由 X2b（注入版）承担');
-    return;
-  }
+  // #570 ②：同上——夹具先建 + mode 前置在前，再量本格真半格自己要用的那一次调用。
   const { ancestor, file, content } = fixtureTraverseOnlyAncestor(t, { ancestorMode: 0o333, seed: false });
+  assertAncestorMode(ancestor, 0o333); // 重复前置保留（root 机上也跑）
+  if (!rootSkipIfReallyUnblocked(t, {
+    label: 'X2（判据 ② 的真 chmod 半格）',
+    injection: 'X2b（注入版：祖先要 R 就挡 + 真延迟物化）',
+    probe: () => fs.readdirSync(ancestor), // = `assertAncestorModeAndUnenumerable` 里用的那一次调用（照抄）
+    probeName: 'fs.readdirSync(ancestor)',
+  })) return;
   assertAncestorModeAndUnenumerable(ancestor, 0o333);
   const started = Date.now();
   // 真延迟物化（真时间）：portal 写文件本来就比测试的等待晚，这正是本单里被打死的那个正常场景
@@ -747,12 +811,16 @@ test('#495② X3 祖先**不可穿越** ⇒ 仍 unreadable（真 chmod 0o600 / �
   assert.match(m, /X_OK/, '要把缺的是哪一位写出来');
   assert.doesNotMatch(m, /timeout waiting for/, '权限不是时间问题 ⇒ 不许等满');
 
-  if (isRootUid()) {
-    t.skip('注入版（判据 ③ 的主判据）已过；真 chmod 那半格在 root 机上不可达 ⇒ 整格不算假绿');
-    return;
-  }
+  // #570 ②：真夹具先建 + mode 前置（与 `CAP_DAC_OVERRIDE` 无关）搬到 skip 判定之前，再量本格真半格要用的那次真 syscall。
   const real = fixtureTraverseOnlyAncestor(t, { ancestorMode: 0o600 });
-  assert.equal(fs.lstatSync(real.ancestor).mode & 0o777, 0o600, '夹具自证：真没 `x`');
+  assertAncestorMode(real.ancestor, 0o600); // 夹具自证：真没 `x`（重复前置保留，夹具里也有一遍）
+  if (!rootSkipIfReallyUnblocked(t, {
+    label: 'X3（真 chmod 0o600 那半格）',
+    injection: '本格前半的注入版（fakeDenyingMode(ancestor, X_OK)）',
+    // = 下面 `const observed = observeHostPath(real.file);` 走查里对叶子的那次真 `statSync`（祖先没 `x` ⇒ 非 root 必抛）
+    probe: () => fs.statSync(real.file),
+    probeName: 'fs.statSync(real.file)',
+  })) return;
   const observed = observeHostPath(real.file);
   assert.equal(observed.state, 'unreadable', '真 chmod 下祖先不可穿越也必须 unreadable（与 X1 的 0o111 正好反向）');
   assert.equal(observed.blocker.path, real.ancestor);
@@ -776,13 +844,19 @@ test('#495② X4 叶子无 `R_OK` ⇒ 仍 unreadable（现有语义不退），�
   assert.doesNotMatch(m, /穿越/, '叶子级失败不许把「穿越」扯进来（把 `why` 改回「读或穿越」就红在这里）');
   assert.doesNotMatch(m, /timeout waiting for/);
 
-  if (isRootUid()) {
-    t.skip('注入版（判据 ④ 的主判据）已过；真 chmod 000 那半格在 root 机上不可达');
-    return;
-  }
+  // #570 ②：真夹具（叶子 `chmod 000`）先建 + mode 前置（root 也跑），再量本格真半格要用的那次真读。
   const leaf = path.join(dir, 'no-read.json');
   fs.writeFileSync(leaf, '{"ok":1}');
   fs.chmodSync(leaf, 0o000);
+  const leafMode = fs.lstatSync(leaf).mode & 0o777;
+  assert.equal(leafMode, 0, `夹具的叶子必须真是 0o000，否则本格无效：0o${leafMode.toString(8)}`);
+  if (!rootSkipIfReallyUnblocked(t, {
+    label: 'X4（真 chmod 000 那半格）',
+    injection: '本格前半的注入版（fakeDenyingMode(file, R_OK)）',
+    // = 下面 `const real = observeHostPath(leaf);` 里的那次真读（本半格钉的就是叶子级 `R_OK`）
+    probe: () => fs.readFileSync(leaf, 'utf8'),
+    probeName: 'fs.readFileSync(leaf)',
+  })) return;
   const real = observeHostPath(leaf);
   assert.equal(real.state, 'unreadable', '真 chmod 000 的叶子 ⇒ 仍 unreadable（第一轮 P5b 的语义不退）');
   assert.equal(real.blocker.path, leaf);
@@ -811,6 +885,10 @@ function fixtureUntraversableTargetDir(t) {
   const link = path.join(base, 'link');
   fs.symlinkSync(path.relative(base, inner), link);
   fs.chmodSync(target, 0o444);
+  // #570 ①：mode 前置搬进夹具（`lstat` 与 `CAP_DAC_OVERRIDE` 无关 ⇒ root 上也跑）
+  const targetMode = fs.lstatSync(target).mode & 0o777;
+  assert.equal(targetMode, 0o444,
+    `夹具的 target 必须真是 0o444（有 r 没 x），否则本格无效：0o${targetMode.toString(8)}`);
   t.after(() => {
     fs.chmodSync(target, 0o755);
     fs.rmSync(base, { recursive: true, force: true });
@@ -880,13 +958,18 @@ test('#495③ T3 真夹具：链接目标目录有 r 没 x（0o444）⇒ unreada
   assert.ok(injErr);
   assert.doesNotMatch(String(injErr.message), MISSING_TARGET_CLAIM, '失败文案也不许声称目标缺失');
 
-  if (isRootUid()) {
-    t.skip('注入版已过；真 chmod 0444 那半格在 root 机上不可达（CAP_DAC_OVERRIDE ⇒ root 照样能穿）');
-    return;
-  }
+  // #570 ②：夹具自证里**与 DAC 无关**的那两半（mode、能列目录）搬到 skip 判定之前（root 也跑），
+  // 再量本格真半格自己要用的那一次真 syscall。
   // 夹具自证：目录**能列**（有 r）但**穿不过**（没 x）⇒ 本格的形状真的成立
-  assert.equal(fs.lstatSync(target).mode & 0o777, 0o444, '夹具自证：target 必须真是 0o444');
+  const targetMode = fs.lstatSync(target).mode & 0o777;
+  assert.equal(targetMode, 0o444, `夹具自证（重复前置，夹具里也有一遍）：target 必须真是 0o444，实测 0o${targetMode.toString(8)}`);
   assert.deepEqual(fs.readdirSync(target), ['inner'], '夹具自证：r 还在 ⇒ 能列目录');
+  if (!rootSkipIfReallyUnblocked(t, {
+    label: 'T3（真 chmod 0o444 那半格）',
+    injection: '本格前半的注入版（fsImpl 对 inner/link 注入 EACCES）',
+    probe: () => fs.statSync(link), // = 下面那句真断言里的同一次调用（照抄，不另挑）
+    probeName: 'fs.statSync(link)',
+  })) return;
   assert.throws(() => fs.statSync(link), (error) => {
     assert.equal(error.code, 'EACCES', `这台机器上「穿不过去」必须真是 EACCES：${error?.code}`);
     return true;
