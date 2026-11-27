@@ -20,7 +20,7 @@
 //
 // 隔离（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB；进程内单例 `partialOutputs`
 // 每条用例前后都 `clear()`（node --test 每文件一进程，但同文件内多条用例共用那一份单例）。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -34,6 +34,22 @@ import {
 } from '../src/run-partial-buffer.js';
 import { runEndPartialKeys } from '../src/internal.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// startServer 的 station-515- 一律进 tmpDirs；close() 里那份 rm 仍是第一道防线。
+// force 是必需的：两道 rm 会撞同一个目录，必须容忍「已经没了」；真漏了（没 close）闸会当场抱住。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 const ev = (type, payload = {}, extra = {}) => ({ type, payload, session_id: 's-515', ...extra });
 
@@ -53,7 +69,7 @@ class ReadyPool extends FakePool {
 }
 
 async function startServer(pool = new ReadyPool()) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-515-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-515-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const config = {
     cookie: cookieSettings('dev-http', 604800),
