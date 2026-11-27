@@ -193,13 +193,14 @@ docker exec $DB_NAME pg_isready -U station -d station_test -t 15
   绝不指向真库 `station-db`）。**未设置 ⇒ 整个真库文件 `skip`，不是「假通过」**：入口文案由
   `portal/test/pg-fixture.js` 的 `SKIP_WITHOUT_PG` 单点持有（「TEST_DATABASE_URL 未设置：真库用例需一次性
   postgres:16（docs/testing.md §2.2.1），无 PG 时整体跳过」），**所有真库文件共用同一句话**，**不要再抄出第三种说法**。
-  （现查：真库文件 = `delta-not-persisted-db.test.js` / `migrate-fresh-db.test.js`（旧第三支 `prune-checkpoints-db.test.js`
-  已随 issue #640 撤表退役），**不止一处** ⇒ 本句不写个数，写「所有」；新增真库文件就接入同一入口，别另起一句 skip 文案。
-  接入形态分两支：`delta-not-persisted-db` 是 `import { SKIP_WITHOUT_PG } from './pg-fixture.js'`，
-  而 `migrate-fresh-db.test.js` 里是**字面重复的一份同文案**（它比 `SKIP_WITHOUT_PG` 这个导出更早，没回头收干）
-  ⇒ 改那句话得同时改两处：`pg-fixture.js` 的导出 + `migrate-fresh-db.test.js` 的字面量。）
+  （**本页不列真库文件清单**——它一直在长，写死必漂（261127 就漂过一次：这里曾写「两支」，现取已到十几个）。
+  要清单就现取：`grep -rl SKIP_WITHOUT_PG portal/test test`（结果里 `portal/test/pg-fixture.js` 是**定义处本身**，
+  不是用例文件）。另有**一支不走这个入口**：`portal/test/migrate-fresh-db.test.js` 比 `SKIP_WITHOUT_PG` 这个导出更早，
+  里面是**字面重复的一份同文案** ⇒ 上面那条 grep 抓不到它。
+  ⇒ **改那句 skip 文案必须同时改两处**：`pg-fixture.js` 的导出 + `migrate-fresh-db.test.js` 的字面量；
+  新增真库文件一律 `import { SKIP_WITHOUT_PG } from './pg-fixture.js'`，别再另起一句。）
   ⇒ 看门禁报告时，**「N skipped」不是失败也不是绿**：要真验迁移/夹具链路，必须带 `TEST_DATABASE_URL` 跑一遍全量
-  （`npm test` 本身会自动包含它们；CI 无 PG 就是 skip）。
+  （`npm test` 本身会自动包含它们；CI 无 PG 就是 skip）。**带 PG 跑全套不用手搓**：`scripts/real-db-legs.sh`。）
 - **夹具自己串行化，不要手工串行、也不要手工删锁**：`portal/test/pg-fixture.js` 用一把**跨进程文件锁**
   （缺省 `os.tmpdir()` 下的 `station-test-bootstrap.lock`，即 `/tmp/station-test-bootstrap.lock`）盖住「**建库 → baseline/bootstrap/增量迁移 → 用例体 → 删库**」整段。
   为什么要锁（现查，不是猜）：**每一个**真库文件（现三个，见上条）都在注入的实例上跑 `bootstrap.sql` 的**集群级**角色 DDL
