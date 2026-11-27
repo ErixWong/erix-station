@@ -590,6 +590,30 @@ export function scanEnvWriteSites(root, relDir) {
 // ───────────────── 动态下标读取 + 登记表交叉对账（本轮新增）
 
 /**
+ * 扫“下标不是字符串字面量”的 env 读取（`process.env[name]` / `baseEnv[key]` / `env?.[key]`）。
+ * 这类读取形态**无法从字面直接点名**某个旋钮（名字运行时才知道）；其中一部分会被
+ * {@link scanEnvReads} 的“表启发式”间接解析，但读取点上看不出来 ⇒ 单独列进「已知未解析的读取形态」。
+ * 只扫与 {@link scanEnvReads} 同一扫描面（listJsFiles：仅 *.js、跳过 SKIP_DIRS）；
+ * 非 .js（如 .mjs）与被 SKIP_DIRS 排除的目录根本进不来 ⇒ 由调用方另以“扫描面口径”文字补齐。
+ * @returns {Array<{ref:string, index:string, expr:string}>}
+ */
+export function scanDynamicEnvIndex(root, relDir) {
+  const out = [];
+  const re = /(?:(?:process\s*\.\s*env)|(?:(?:[A-Za-z_$][\w$]*)?[Ee]nv))\s*(?:\?\.)?\s*\[\s*([A-Za-z_$][\w$]*)\s*\]/g;
+  for (const abs of listJsFiles(root, relDir)) {
+    const rel = path.relative(root, abs).split(path.sep).join('/');
+    const src = stripJsComments(fs.readFileSync(abs, 'utf8'));
+    let m;
+    re.lastIndex = 0;
+    while ((m = re.exec(src)) !== null) {
+      const line = src.slice(0, m.index).split('\n').length;
+      out.push({ ref: `${rel}:${line}`, index: m[1], expr: m[0].trim() });
+    }
+  }
+  return out.sort((a, b) => a.ref.localeCompare(b.ref));
+}
+
+/**
  * 读登记表（不崩）：文件不存在 ⇒ present:false；JSON 解析失败 ⇒ present:true + error。
  * 结构（现读一遍）：`{ exceptions: [{key,where,reason}], unsupported: [{at,read,reason}] }`。
  */
@@ -758,6 +782,12 @@ export function buildInventory(root = DEFAULT_ROOT) {
   // 子进程基线环境（镜像自带）与硬登记的例外：都不算旋钮。
   const passThrough = new Set([...PASS_THROUGH_KEYS, ...scanChildEnvAllowlists(root, RUNNER_DIR)]);
 
+  // 本轮新增：动态下标读取形态（扫描面内能扫到的）。只读，不改任何现有文件。
+  const dynamicSites = [
+    ...scanDynamicEnvIndex(root, RUNNER_DIR),
+    ...scanDynamicEnvIndex(root, PORTAL_SRC_DIR),
+  ].sort((a, b) => a.ref.localeCompare(b.ref));
+
   const names = new Set([
     ...Object.keys(composeByService),
     ...injected.keys(),
@@ -862,6 +892,24 @@ export function buildInventory(root = DEFAULT_ROOT) {
     warnings: composeWarnings,
     /** ② 与登记表的差集（读不到登记表 ⇒ present:false，不崩）。 */
     legsDiff: computeLegsDiff(knobs, readLegsExceptions(root)),
+    /** ③ 本工具不解析的读取形态：能扫的动态下标 + 扫描面口径（哪些目录/扩展名没进）。 */
+    unparsedForms: {
+      dynamicSites,
+      surface: {
+        scannedExtensions: ['*.js（不含 *.test.js）'],
+        extensionsNotScanned: ['.mjs / .cjs / .ts 等非 .js（例：runner/skills/github/skill.mjs）'],
+        skippedDirs: [...SKIP_DIRS],
+        notNamedReads: [
+          '`...process.env` / `{ ...baseEnv }` 整包展开（不点名某个键，不算具名读点）',
+          '动态下标读取（下标不是字符串字面量，名字运行时才知道；见 dynamicSites）',
+        ],
+        realRepoExamples: [
+          'runner/worker.js process.env[name]（下标来自数组，登记为 unsupported）',
+          'runner/lib/mcp-client.js baseEnv[key]（key 来自 STDIO_ENV_ALLOWLIST，登记为 unsupported）',
+          'runner/skills/github/skill.mjs `...process.env`（.mjs + skills 双重排除出扫描面）',
+        ],
+      },
+    },
   };
 }
 
@@ -970,6 +1018,23 @@ export function renderSummary(inv) {
     out.push(`- 登记为 unsupported 的形态=${diff.unsupported.length}`);
     for (const u of diff.unsupported) out.push(`    · ${u.at}  ${u.read}`);
   }
+
+  // ③ 已知未解析的读取形态：能扫的动态下标 + 扫描面口径
+  out.push('');
+  out.push('=== 已知未解析的读取形态 ===');
+  const uf = inv.unparsedForms ?? { dynamicSites: [], surface: {} };
+  const surf = uf.surface ?? {};
+  out.push('动态下标（下标不是字符串字面量 ⇒ 从读取形态点不出名）：');
+  if ((uf.dynamicSites ?? []).length === 0) {
+    out.push('  无（扫描面内未发现动态下标）');
+  } else {
+    for (const d of uf.dynamicSites) out.push(`  - ${d.ref}  ${d.expr}  (下标=${d.index})`);
+  }
+  out.push('扫描面口径（下面这些没进扫描面，别当已覆盖）：');
+  out.push(`  - 扫描扩展名：${(surf.scannedExtensions ?? []).join(', ')}；未扫：${(surf.extensionsNotScanned ?? []).join(' / ')}`);
+  out.push(`  - 跳过目录（SKIP_DIRS）：${(surf.skippedDirs ?? []).join(', ')}`);
+  for (const n of surf.notNamedReads ?? []) out.push(`  - 不算具名读点：${n}`);
+  for (const e of surf.realRepoExamples ?? []) out.push(`  - 真实仓实例：${e}`);
   return out;
 }
 

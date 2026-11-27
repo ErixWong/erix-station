@@ -550,3 +550,30 @@ export function b() { return process.env.BROKEN_KNOB; }
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ───────────────── 件 3：含 process.env[name] 的夹具必须出现在「已知未解析的读取形态」节里
+test('③ 动态下标读取形态被扫出来并进节', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'env-unparsed-'));
+  try {
+    writeTree(root, {
+      'runner/dyn.js': `
+const NAMES = process.env.NAMES ? process.env.NAMES.split(',') : [];
+export function pick() {
+  for (const name of NAMES) { void process.env[name]; }
+}
+`,
+    });
+    const inv = buildInventory(root);
+    const sites = inv.unparsedForms.dynamicSites;
+    assert.ok(
+      sites.some((s) => s.ref.startsWith('runner/dyn.js:') && s.expr.includes('process.env[name]') && s.index === 'name'),
+      `动态 process.env[name] 必须出现在 dynamicSites，实际=${JSON.stringify(sites)}`,
+    );
+    const s = renderSummary(inv).join('\n');
+    assert.match(s, /=== 已知未解析的读取形态 ===/);
+    assert.match(s, /runner\/dyn\.js:\d+\s+process\.env\[name\]/);
+    assert.match(s, /跳过目录（SKIP_DIRS）/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
