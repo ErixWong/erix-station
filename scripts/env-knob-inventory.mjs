@@ -201,15 +201,46 @@ export function listJsFiles(root, relDir) {
  * 单测里的假 compose 也照这个形状给。
  * @returns {Record<string, Array<{name:string, raw:string, line:number, form:string}>>}
  */
+/**
+ * 解析 compose 里各服务的 `environment:` 显式列表（薄壳：只给 envByService）。
+ * 需要知道“哪些形状我们认不出”时用 {@link parseComposeEnvWithWarnings}。
+ * @returns {Record<string, Array<{name:string, raw:string, line:number, form:string}>>}
+ */
 export function parseComposeEnv(text) {
+  return parseComposeEnvWithWarnings(text).envByService;
+}
+
+/**
+ * 行式解析 + **形状告警**：认不出的 YAML 形状必须**喊出来**，不许静默空表。
+ * 返回 `{ envByService, warnings }`：envByService 与 {@link parseComposeEnv} 逐字节一致（收集逻辑没改），
+ * warnings 逐条 `{ service, line, kind, raw }`，kind 覆盖：
+ *   · list-form              environment 块内的 `- KEY=VAL`（列表式 environment，我们不解析）
+ *   · anchor-on-environment  `environment: &x`（带锚/引用/行内流 ⇒ 整块被我们跳过）
+ *   · merge-key              `<<:` YAML 合并键（全文件扫描）
+ *   · dup-environment        同一服务第二个 `environment:`
+ *   · unparsed-line          environment 块内既非 `KEY: value`、也非 `- KEY=VAL`/注释/空行
+ *   · extends               `extends:`（不解析语义，只喊）
+ *   · include               顶层 `include:`（不解析语义，只喊）
+ * @returns {{ envByService: Record<string, any[]>, warnings: Array<{service:string|null, line:number, kind:string, raw:string}> }}
+ */
+export function parseComposeEnvWithWarnings(text) {
   const lines = text.split(/\r?\n/);
   const services = {};
+  const warnings = [];
   let inServices = false;
   let service = null;
   let envIndent = -1;
   let cur = null;
+  const envSeen = new Set(); // service 名 ⇒ 已出现过 environment:
+  const pushWarn = (kind, line, raw, svc = service) => warnings.push({ service: svc ?? null, line, kind, raw });
   for (let idx = 0; idx < lines.length; idx += 1) {
     const line = lines[idx];
+    // 全文件形状告警（与进不进 services 段无关；include/extends/merge-key 在任何位置都要喊）。
+    if (/^include\s*:/.test(line)) pushWarn('include', idx + 1, line.replace(/^\s*include\s*:/, '').trim(), null);
+    const ext = line.match(/^\s+extends\s*:(.*)$/);
+    if (ext) pushWarn('extends', idx + 1, ext[1].trim());
+    const mkTop = line.match(/^\s*<<\s*:(.*)$/);
+    if (mkTop) pushWarn('merge-key', idx + 1, mkTop[1].trim());
     if (/^services:\s*$/.test(line)) { inServices = true; service = null; envIndent = -1; continue; }
     if (!inServices) continue;
     if (/^[A-Za-z0-9_-]+:/.test(line)) break; // services 之外的顶层段 ⇒ 结束
@@ -217,8 +248,15 @@ export function parseComposeEnv(text) {
     if (svc) { service = svc[1]; services[service] = []; envIndent = -1; cur = null; continue; }
     const top = line.match(/^ {2}(\S.*)$/);
     if (top) { envIndent = -1; cur = null; } // 换到该服务的另一个字段
-    const env = line.match(/^(\s+)environment:\s*$/);
-    if (env && service) { envIndent = env[1].length; cur = null; continue; }
+    const env = line.match(/^(\s+)environment\s*:(.*)$/);
+    if (env && service) {
+      if (envSeen.has(service)) pushWarn('dup-environment', idx + 1, env[2].trim());
+      envSeen.add(service);
+      const trailing = env[2].trim();
+      if (trailing === '') { envIndent = env[1].length; cur = null; }
+      else { pushWarn('anchor-on-environment', idx + 1, trailing); envIndent = -1; cur = null; } // 带锚/引用 ⇒ 不开块（键会“静默消失”，已由本告警兑现）
+      continue;
+    }
     if (envIndent < 0 || !service) continue;
     if (/^\s*#/.test(line) || line.trim() === '') continue;
     const indent = line.match(/^(\s*)/)[1].length;
@@ -227,12 +265,18 @@ export function parseComposeEnv(text) {
     if (kv) {
       cur = { name: kv[1], raw: kv[2].trim(), line: idx + 1, form: classifyComposeValue(kv[2].trim()) };
       services[service].push(cur);
+    } else if (/^\s*-\s/.test(line)) {
+      pushWarn('list-form', idx + 1, line.trim()); // 列表式 environment 的一项，我们不解析
+    } else if (/^\s*<<\s*:/.test(line)) {
+      // merge-key 已在全文件扫描里报过，这里不再计 unparsed-line
     } else if (cur && indent > envIndent + 2) {
       cur.raw += ' ' + line.trim(); // 多行值（例如 `${VAR:?多行说明}`）的续行
       cur.form = classifyComposeValue(cur.raw);
+    } else {
+      pushWarn('unparsed-line', idx + 1, line.trim()); // environment 块内认不出的行
     }
   }
-  return services;
+  return { envByService: services, warnings };
 }
 
 /** compose 一个值的写法归类：字面 / `${VAR:-默认}` / `${VAR:-}`（默认空）/ `${VAR-默认}` / `${VAR:?必填}` / 复合插值。 */
@@ -642,7 +686,7 @@ export function buildInventory(root = DEFAULT_ROOT) {
   const missing = [];
   for (const f of [compose, proxy, provisioner]) if (f.missing) missing.push(relOf(root, f.abs));
 
-  const services = parseComposeEnv(compose.text);
+  const { envByService: services, warnings: composeWarnings } = parseComposeEnvWithWarnings(compose.text);
   const portalEntries = services['station-portal'] ?? [];
   const proxyEntries = services['station-docker-proxy'] ?? [];
   const composeByService = {};
@@ -764,6 +808,8 @@ export function buildInventory(root = DEFAULT_ROOT) {
     pilesAll: {
       db: [...knobs.filter((k) => k.pile === 'dbPerRun' || k.pile === 'dbRestart').map((k) => k.name)],
     },
+    /** ① compose 里认不出的 YAML 形状（静默空表现在会被喊出来）；真实 compose 上应为空。 */
+    warnings: composeWarnings,
   };
 }
 
@@ -844,6 +890,18 @@ export function renderSummary(inv) {
     if (k.bootWhy.length === 0 && k.breaks.length === 0 && !decided) continue;
     const t = `时机=${k.timing}${decided ? `（${k.timingWhy}）` : ''}`;
     out.push(`- ${k.name}：${t} boot=${k.bootWhy.join('+') || '—'} 断=${k.breaks.join(' + ') || '—'}`);
+  }
+
+  // ① 未解析/可疑的 YAML 形状（静默空表现在会被喊出来）
+  out.push('');
+  out.push('=== 未解析/可疑 YAML 形状 ===');
+  const warns = inv.warnings ?? [];
+  if (warns.length === 0) {
+    out.push('无');
+  } else {
+    for (const w of warns) {
+      out.push(`- [${w.kind}] ${w.service ?? '(顶层)'} compose:${w.line}  ${w.raw}`);
+    }
   }
   return out;
 }

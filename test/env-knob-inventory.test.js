@@ -12,6 +12,7 @@ import {
   buildInventory,
   classifyComposeValue,
   parseComposeEnv,
+  parseComposeEnvWithWarnings,
   parseInjectedEnv,
   parseProxyAllowlist,
   scanEnvReads,
@@ -436,5 +437,62 @@ test('打不开的落点要显式说出来，不许静默当 0', () => {
     assert.match(renderSummary(inv).join('\n'), /打不开/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ───────────────── #677 第三轮件 1：认不出的 compose YAML 形状必须喊出来
+test('① 列表式 environment / environment: &e ⇒ 必须出对应 warning', () => {
+  const listForm = `
+version: "3.9"
+services:
+  station-portal:
+    environment:
+      - LOST_KNOB=1
+      - ANOTHER=2
+volumes: {}
+`;
+  const anchor = `
+version: "3.9"
+services:
+  station-portal:
+    environment: &common
+      KEY1: v1
+volumes: {}
+`;
+  const rl = parseComposeEnvWithWarnings(listForm);
+  assert.deepEqual(rl.envByService['station-portal'], [], '列表式 ⇒ 键静默消失（返回形状保持）');
+  assert.ok(rl.warnings.some((w) => w.kind === 'list-form' && w.service === 'station-portal'),
+    `列表式必须报 list-form，实际=${JSON.stringify(rl.warnings)}`);
+  const ra = parseComposeEnvWithWarnings(anchor);
+  assert.deepEqual(ra.envByService['station-portal'], [], 'environment: &e ⇒ 键静默消失（返回形状保持）');
+  assert.ok(ra.warnings.some((w) => w.kind === 'anchor-on-environment' && w.service === 'station-portal'),
+    `带锚必须报 anchor-on-environment，实际=${JSON.stringify(ra.warnings)}`);
+  // 薄壳与旧形状逐字一致（不破坏现有调用方）
+  assert.deepEqual(parseComposeEnv(listForm), rl.envByService);
+});
+
+test('① 其余可疑形状：merge-key / dup-environment / extends / include / unparsed-line', () => {
+  const t = `
+version: "3.9"
+services:
+  base:
+    environment:
+      <<: *defaults
+      GOOD_K: v
+  child:
+    extends: base
+    environment:
+      FIRST: 1
+    environment:
+      SECOND: 2
+      weird line
+include:
+  - extra.yml
+volumes: {}
+`;
+  const r = parseComposeEnvWithWarnings(t);
+  const kinds = new Set(r.warnings.map((w) => w.kind));
+  for (const k of ['merge-key', 'dup-environment', 'extends', 'include', 'unparsed-line']) {
+    assert.ok(kinds.has(k), `必须报 ${k}，实际=${JSON.stringify(r.warnings)}`);
   }
 });
