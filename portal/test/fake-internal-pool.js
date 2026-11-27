@@ -112,6 +112,9 @@ export class FakeInternalPool {
             display_name: u?.display_name ?? null,
             email: u?.email ?? null,
             user_status: u?.status ?? 'active',
+            // #845：真库只会返回 SELECT 里真的写了的列——故从 SQL 文本里读 `u.locale`：
+            // SELECT 不取这列时本行根本没有 `locale` 键（与真库同形），否则「忘加列」在单测里不可能被发现。
+            ...( /\bu\.locale\b/.test(sql) ? { locale: u?.locale ?? null } : {} ),
           },
         ],
       };
