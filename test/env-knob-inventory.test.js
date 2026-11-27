@@ -65,8 +65,41 @@ export function loadConfig(env = process.env) {
   return {
     databaseUrl: env.DATABASE_URL || 'x',
     emptyDefault: env.EMPTY_DEFAULT_KNOB || '',
+    helperKnob: intEnv(env, 'HELPER_KNOB', 7),
   };
 }
+`,
+  'portal/src/helpers.js': `
+export function intEnv(env, key, fallback) {
+  const v = Number(env[key] ?? fallback);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+`,
+  'runner/lib/intenv.js': `
+export function parseIntEnv(env, key, fallback) {
+  return Number(env[key] ?? fallback);
+}
+export function readOnce(env = process.env) {
+  return parseIntEnv(process.env, 'RUNNER_HELPER_KNOB', 3);
+}
+`,
+  'runner/lib/review.js': `
+export function isOn(env = process.env) {
+  return env.PER_RUN_KNOB === '1';
+}
+`,
+  'runner/agentd.js': `
+const CFG = {
+  capacity: Number(process.env.STARTUP_SNAPSHOT_KNOB || 2),
+};
+export function buildWorkerEnv(runStart, baseEnv = process.env) {
+  const childEnv = { ...baseEnv };
+  if (runStart?.review_only === true) {
+    childEnv.PER_RUN_KNOB = '1';
+  }
+  return childEnv;
+}
+export const CAP = CFG.capacity;
 `,
   'deploy/fde-proxy/server.js': `
 const ENV_KEY_ALLOW = new Set([
@@ -270,6 +303,47 @@ test('启动前必知的判据：连库 / 容器身份 / 启动快照 / 基线�
     assert.ok(inv.piles.nonKnob.includes('PATH'));
     assert.ok(!inv.piles.db.includes('PATH') && !inv.piles.no.includes('PATH') && !inv.piles.human.includes('PATH'));
     assert.ok(!inv.subtotals.runnerReadNotInjected.includes('PATH'));
+  });
+});
+
+test('A 假绿修正：helper 首参形（`intEnv(env, \'NAME\', …)`）算一个读数', () => {
+  withFixture((root) => {
+    const pReads = scanEnvReads(root, 'portal/src');
+    const hits = pReads.get('HELPER_KNOB') ?? [];
+    assert.ok(
+      hits.some((r) => r.kinds.includes('helperArg') && r.ref === 'portal/src/config.js:6'),
+      `helper 实参位置的读必须登记，实际=${JSON.stringify(hits)}`,
+    );
+    const rReads = scanEnvReads(root, 'runner');
+    assert.ok(
+      (rReads.get('RUNNER_HELPER_KNOB') ?? []).some((r) => r.kinds.includes('helperArg') && r.ref === 'runner/lib/intenv.js:6'),
+      '第一参写 `process.env` 也算',
+    );
+    // 核心：portal 读者不再隐身 ⇒ 它不能被判成「能搬」
+    const inv = buildInventory(root);
+    const knob = byName(inv, 'HELPER_KNOB');
+    assert.ok(knob.portalReads.some((r) => r.ref === 'portal/src/config.js:6'));
+    assert.ok(knob.bootWhy.includes('P3启动快照'), `必须报启动快照，实际=${JSON.stringify(knob.bootWhy)}`);
+    assert.notEqual(knob.pile, 'db');
+    // 没有被误伤成注入缺失以外的分类
+    const rh = byName(inv, 'RUNNER_HELPER_KNOB');
+    assert.equal(rh.runnerReads.length, 1);
+    assert.ok(rh.breaks.some((b) => b.includes('断在注入')));
+  });
+});
+
+test('E per-run 通路单列一类，不混进「断在注入」', () => {
+  withFixture((root) => {
+    const inv = buildInventory(root);
+    const knob = byName(inv, 'PER_RUN_KNOB');
+    assert.equal(knob.delivery, 'per-run');
+    assert.ok(knob.writes.some((w) => w.perRun && w.ref === 'runner/agentd.js:8'), JSON.stringify(knob.writes));
+    assert.ok(knob.breaks.some((b) => b.includes('per-run 下发')), JSON.stringify(knob.breaks));
+    assert.ok(!knob.breaks.some((b) => b.includes('断在注入')), 'per-run 通路不许算断链');
+    assert.ok(inv.subtotals.perRunDelivered.includes('PER_RUN_KNOB'));
+    assert.ok(!inv.subtotals.runnerReadNotInjected.includes('PER_RUN_KNOB'));
+    // 对照：同一个文件里没有写点的那根仍旧是「断在注入」
+    assert.ok(inv.subtotals.runnerReadNotInjected.includes('RUNNER_HELPER_KNOB'));
   });
 });
 

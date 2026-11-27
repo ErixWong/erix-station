@@ -333,6 +333,12 @@ export function scanEnvReads(root, relDir) {
         if (/^\s*(\+\+|--|=)(?!=)/.test(after)) continue; // 赋值目标 ⇒ 写，不是读
         add(m[2], rel, i + 1, 'alias');
       }
+      // helper 首参形：`intEnv(env, 'NAME', 默认)` / `parseIntEnv(process.env, 'NAME', …)`。
+      // 不补这一形就会**假绿**：portal/src/config.js 里的 `intEnv(env, 'ERIX_ARTIFACT_MAX_BYTES', …)`
+      // 会让 portal 这个读者隐身 ⇒ 启动快照旋钮被误归「能搬」（评审 #677 第二轮 A）。
+      const reHelper = /\(\s*(?:(?:process\s*\.\s*env)|(?:(?:[A-Za-z_$][\w$]*)?[Ee]nv))\s*,\s*['"]([A-Z][A-Z0-9_]{2,})['"]/g;
+      while ((m = reHelper.exec(line)) !== null) add(m[1], rel, i + 1, 'helperArg');
+      // 别名常量：`export const TOOLCALL_MARKERS_ENV = 'ERIX_...'`（名字在右边，待定表定性）。
       const reAliasConst = /\b([A-Z0-9_]*ENV[A-Z0-9_]*)\s*=\s*['"]([A-Z][A-Z0-9_]{2,})['"]/g;
       while ((m = reAliasConst.exec(line)) !== null) {
         tables.push({ table: m[1], names: [m[2]], file: rel, line: i + 1 });
@@ -398,6 +404,41 @@ export function scanChildEnvAllowlists(root, relDir) {
   return out;
 }
 
+/**
+ * env 的**写点**（给子进程改环境），用于识别「per-run 下发」通路：
+ * `childEnv.NAME = '1'` / `delete childEnv.NAME` / `childEnv['NAME'] = …`。
+ * 写点行缩进 > 0（在函数体里）⇒ 算 per-run（例如 agentd 的 `buildWorkerEnv` 每起一个 run 写一次）；
+ * 顶层写点只算「启动期改写」，不算 per-run。
+ * @returns {Map<string, Array<{ref:string, perRun:boolean}>>}
+ */
+export function scanEnvWriteSites(root, relDir) {
+  const out = new Map();
+  const add = (name, file, line, perRun) => {
+    if (!NAME_RE.test(name)) return;
+    if (!out.has(name)) out.set(name, []);
+    const ref = `${file}:${line}`;
+    const hit = out.get(name).find((w) => w.ref === ref);
+    if (hit) hit.perRun = hit.perRun || perRun;
+    else out.get(name).push({ ref, perRun });
+  };
+  for (const abs of listJsFiles(root, relDir)) {
+    const rel = path.relative(root, abs).split(path.sep).join('/');
+    const lines = stripJsComments(fs.readFileSync(abs, 'utf8')).split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      const indent = line.match(/^\s*/)[0].length;
+      let m;
+      const reDot = /\b((?:[A-Za-z_$][\w$]*)?[Ee]nv)\s*(?:\?\.|\.)\s*([A-Z][A-Z0-9_]{2,})\s*(?:=|\+\+|--)(?!=)/g;
+      while ((m = reDot.exec(line)) !== null) add(m[2], rel, i + 1, indent > 0);
+      const reDel = /\bdelete\s+((?:[A-Za-z_$][\w$]*)?[Ee]nv)\s*(?:\?\.|\.)\s*([A-Z][A-Z0-9_]{2,})/g;
+      while ((m = reDel.exec(line)) !== null) add(m[2], rel, i + 1, indent > 0);
+      const reBrk = /\b((?:[A-Za-z_$][\w$]*)?[Ee]nv)\s*\[\s*['"]([A-Z][A-Z0-9_]{2,})['"]\s*\]\s*=(?!=)/g;
+      while ((m = reBrk.exec(line)) !== null) add(m[2], rel, i + 1, indent > 0);
+    }
+  }
+  return out;
+}
+
 // ───────────────────────────────── 判定
 
 /** 「容器起来之前就得知道」的判据（见文件头 P1–P4）；返回命中的判据编号，空数组 = 不属之。 */
@@ -414,15 +455,23 @@ export function bootReasons({ name, portalReadFiles, composeEntry, composeServic
 }
 
 /** 四处落点的断点判定（只判「链路上」的键：portal 注入 / proxy 放行 / runner 真读 三者之一）。 */
-export function findBreaks({ name, composeEntry, portalComposeOnly, injected, allowlisted, runnerReads, passThrough = PASS_THROUGH_KEYS }) {
+export function findBreaks({ name, composeEntry, portalComposeOnly, injected, allowlisted, runnerReads, passThrough = PASS_THROUGH_KEYS, perRunWrites = [] }) {
   const breaks = [];
   const chain = injected.length > 0 || allowlisted.length > 0 || runnerReads.length > 0;
   if (!chain) return breaks;
+  const perRunRefs = perRunWrites.filter((w) => w.perRun).map((w) => w.ref);
   if (injected.length > 0 && allowlisted.length === 0 && !passThrough.has(name)) {
     breaks.push('断在 proxy 白名单（注入但没进 `ENV_KEY_ALLOW` ⇒ 现网 `create_policy_denied`）');
   }
   if (runnerReads.length > 0 && injected.length === 0 && !passThrough.has(name)) {
-    breaks.push('断在注入（runner 读，但 portal 不往 FDE 容器注 ⇒ compose/env 面改不动它，要改只能重建镜像或由 agentd 每 run 下发）');
+    if (perRunRefs.length > 0) {
+      // 不是断链：这根本不走 compose→provisioner→proxy 那四处落点，而是 runner 自己每跑一个 run
+      // 写一次子进程环境（例如 `RUN_REVIEW_ONLY`：portal 工单字段 → agentd 写 childEnv → worker 读）。
+      // 把它算进「断在注入」会把通路正常的旋钮报成假阳性。
+      breaks.push(`per-run 下发（不经容器 Env；写点 ${perRunRefs.join(',')}）`);
+    } else {
+      breaks.push('断在注入（runner 读，但 portal 不往 FDE 容器注 ⇒ compose/env 面改不动它，要改只能重建镜像）');
+    }
   }
   if (allowlisted.length > 0 && injected.length === 0 && !passThrough.has(name)) {
     breaks.push('断在注入（白名单放行，但没人注 ⇒ 这条放行是空转）');
@@ -478,6 +527,8 @@ export function buildInventory(root = DEFAULT_ROOT) {
 
   const runnerReads = scanEnvReads(root, RUNNER_DIR);
   const portalReads = scanEnvReads(root, PORTAL_SRC_DIR);
+  // per-run 下发通路（agentd 每起一个 run 重写一次子环境）：这类不算「断在注入」。
+  const perRunWrites = scanEnvWriteSites(root, RUNNER_DIR);
   // 子进程基线环境（镜像自带）与硬登记的例外：都不算旋钮。
   const passThrough = new Set([...PASS_THROUGH_KEYS, ...scanChildEnvAllowlists(root, RUNNER_DIR)]);
 
@@ -503,6 +554,10 @@ export function buildInventory(root = DEFAULT_ROOT) {
     const injRefs = new Set(inj.map((x) => `${PROVISIONER_FILE}:${x.line}`));
     const pReads = (portalReads.get(name) ?? []).filter((r) => !injRefs.has(r.ref));
     const pFiles = [...new Set(pReads.map((r) => r.file))];
+    const writes = perRunWrites.get(name) ?? [];
+    const delivery = inj.length > 0
+      ? 'container-Env'
+      : (writes.some((w) => w.perRun) ? 'per-run' : (allow.length > 0 ? '仅放行未注入' : '未知（镜像/基座）'));
     const composeOnly = Boolean(portalEntry) && pReads.length > 0 && rReads.length === 0 && inj.length === 0;
     const bootWhy = bootReasons({ name, portalReadFiles: pFiles, composeEntry: portalEntry, composeService: otherService?.service, injected: inj });
     const breaks = findBreaks({
@@ -513,6 +568,7 @@ export function buildInventory(root = DEFAULT_ROOT) {
       allowlisted: allow,
       runnerReads: rReads,
       passThrough,
+      perRunWrites: writes,
     });
     knobs.push({
       name,
@@ -526,6 +582,8 @@ export function buildInventory(root = DEFAULT_ROOT) {
       allowlisted: allow.map((x) => `${PROXY_FILE}:${x.line}`),
       runnerReads: rReads.map((r) => ({ ref: r.ref, kinds: r.kinds })),
       portalReads: pReads.map((r) => ({ ref: r.ref, kinds: r.kinds })),
+      writes: writes.map((w) => ({ ref: w.ref, perRun: w.perRun })),
+      delivery,
       bootWhy,
       breaks,
       pile: classifyPile({ bootWhy, injected: inj, allowlisted: allow, runnerReads: rReads, portalReadFiles: pFiles, composeEntry: portalEntry, passThrough: passThrough.has(name) }),
@@ -535,7 +593,8 @@ export function buildInventory(root = DEFAULT_ROOT) {
   knobs.sort((a, b) => a.name.localeCompare(b.name));
 
   const injectedNoAllow = knobs.filter((k) => k.injected.length > 0 && k.allowlisted.length === 0 && !k.passThrough);
-  const readNotInjected = knobs.filter((k) => k.runnerReads.length > 0 && k.injected.length === 0 && !k.passThrough);
+  const readNotInjected = knobs.filter((k) => k.runnerReads.length > 0 && k.injected.length === 0 && !k.passThrough && k.delivery !== 'per-run');
+  const perRunDelivered = knobs.filter((k) => k.runnerReads.length > 0 && k.injected.length === 0 && k.delivery === 'per-run' && !k.passThrough);
   const deadFiber = knobs.filter((k) => k.allowlisted.length > 0 && k.runnerReads.length === 0 && !k.passThrough);
   return {
     root,
@@ -558,6 +617,7 @@ export function buildInventory(root = DEFAULT_ROOT) {
     subtotals: {
       injectedNotAllowlisted: injectedNoAllow.map((k) => k.name),
       runnerReadNotInjected: readNotInjected.map((k) => k.name),
+      perRunDelivered: perRunDelivered.map((k) => k.name),
       allowlistedNobodyRead: deadFiber.map((k) => k.name),
     },
     piles: {
@@ -630,6 +690,7 @@ export function renderSummary(inv) {
   out.push('=== 三腿不齐小计 ===');
   out.push(`注入但没进白名单=${s.injectedNotAllowlisted.length} ${fmt(s.injectedNotAllowlisted)}`);
   out.push(`runner 读了但 portal 没注入=${s.runnerReadNotInjected.length} ${fmt(s.runnerReadNotInjected)}`);
+  out.push(`per-run 下发（不经容器 Env，不算断链）=${s.perRunDelivered.length} ${fmt(s.perRunDelivered)}`);
   out.push(`在白名单但没人读（死光纤）=${s.allowlistedNobodyRead.length} ${fmt(s.allowlistedNobodyRead)}`);
   out.push('');
   out.push('=== 能不能搬进 DB（判据见文件头）===');
