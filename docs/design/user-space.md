@@ -163,7 +163,7 @@
 
 Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；对应 CLI 配置也含该 host 的明文 token，二者只落在 FDE 用户空间，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。配置按 provider 选择，未注册 host 或不支持的 provider 不写 CLI 配置；轮换原位 upsert。API 只回显 host、username 与 token 掩码。
 
-> **#399（2026-10-26）：为什么平台托管凭据必须离开 `.git-credentials`。**该文件同时有三个写者（portal、FDE/agent、**git 自己**），而 git 的语义是「认证被拒 ⇒ `erase` 掉那枚凭据」——一次 401 就静默删行、rc=0、不留痕迹（现网 eric 两天内被删两次，现场复现实验：可写文件 1 行→401→0 行；ro 文件同一动作凭据存活）。`chmod` 挡不住：store helper 是「同目录建锁文件→写→rename 覆盖」，rename 只看目录可写不看目标 mode。所以平台那份搬进 portal 独占的 `platform/git/credentials` 并 **ro bind** 进容器（挂载级只读才是只读）；存在性判据同步从「DB 里 `token_ref` 非空」换成「平台文件里这一行在不在」，缺了走既有重铸路。`~/.git-credentials` 保留给 FDE 自配凭据，两边不再互侵犯。
+> **#399（2026-10-26）：为什么平台托管凭据必须离开 `.git-credentials`。**该文件同时有三个写者（portal、FDE/agent、**git 自己**），而 git 的语义是「认证被拒 ⇒ `erase` 掉那枚凭据」——一次 401 就静默删行、rc=0、不留痕迹（现网 <fde_name> 两天内被删两次，现场复现实验：可写文件 1 行→401→0 行；ro 文件同一动作凭据存活）。`chmod` 挡不住：store helper 是「同目录建锁文件→写→rename 覆盖」，rename 只看目录可写不看目标 mode。所以平台那份搬进 portal 独占的 `platform/git/credentials` 并 **ro bind** 进容器（挂载级只读才是只读）；存在性判据同步从「DB 里 `token_ref` 非空」换成「平台文件里这一行在不在」，缺了走既有重铸路。`~/.git-credentials` 保留给 FDE 自配凭据，两边不再互侵犯。
 
 该文件是 FDE 经 portal 显式授权投放的 Git 凭据，不是平台控制面密钥；FDE 容器仍不持有 DB、runner 或 LLM 平台凭据。它独立于 manifest 的纯 DB 派生平台文件，凭据更新不触发 generation，也不参与旧 manifest stale 清理。用户下线时 portal 尝试删除此文件；失败只告警，不回滚停用。
 
@@ -196,7 +196,7 @@ Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<UR
 | `/home/<user>/cache/` | FDE / agent（pnpm store / npm / pip） | 依赖缓存，内容平台不代管；**位置由 FDE 镜像预配**（`/usr/local/etc/npmrc` 的 globalconfig + `COREPACK_HOME`/`PIP_CACHE_DIR` ENV，见 runner/Dockerfile） |
 | `/home/<user>/.erix/skills/`、`.erix/todos/` | FDE / agent 自管 | 平台只建目录（若模板需要），内容不物化 |
 
-> **为何预配缓存位置**（eric 空间实测 2026-10-24）：不指默认时 pnpm 会自己在「项目所在卷」上找地方建
+> **为何预配缓存位置**（<fde_name> 空间实测 2026-10-24）：不指默认时 pnpm 会自己在「项目所在卷」上找地方建
 > `.pnpm-store`，而 `~/projects` 正是 projects bind mount 的根 → 实测长出 388 MB 的 `~/projects/.pnpm-store`，
 > 污染目录列表（`dirs.js` 现已过滤 `.` 开头目录作展示层兼容）。globalconfig 是 npmrc 链最低一层，
 > 只供默认值：`~/.npmrc` 与项目 `.npmrc` 仍可覆盖（已实测），所以这不与「内容 FDE 自管」冲突。
@@ -371,7 +371,7 @@ materializer 对所有 JSON 统一「**固定键序**（按渲染模板插入序
 |---|---|---|---|
 | `/srv/erix/users/`（宿主根） | root:root | `0755` | 仅 portal（root）可写；Traefik/db 不挂、无权限 |
 | `/srv/erix/users/<fde>/` 及其下**每轮 reconcile 的**工作区目录（`home`、`projects`、`cache`） | `erix`(1000):`erix`(1000) | **`0770`**（组 rwx，**无 setgid**） | 组 rwx 使 agentd(1001)/worker(1002) 可读写（三者主组恒为 1000）；**不需要 setgid**——新建子项的 GID 由写入进程的**主组**决定（恒 1000），不由目录的 setgid 位决定。口径与成因见本节末「为什么不需要 setgid」 |
-| `projects/<p>/`（**只创建一次**的那类，由 `sessions.js` `createSession` 建） | `erix`(1000):`erix`(1000) | **实测 `2770`**（首轮 `chmod` 时属组仍 == 进程 egid 0 ⇒ setgid 落得下，见成因 (a) 第 2 步） | ⚠ **同一棵树里 setgid 位是混的，别当一致状态**（真机实测 `eric/projects/probe-343`、`blind/projects/r1-app` = `2770`，同树 `eric/projects/probe-261014` = `770`）：同一项目再建第二个 session 会被下一轮 `chmod` 清成 `0770`。遗留的 `home/worktrees` 还见过 `2755`（在 `2770` 父目录里新建会**继承** setgid + umask `0022`）⇒ 结论同上：setgid 在这里不承载访问权 |
+| `projects/<p>/`（**只创建一次**的那类，由 `sessions.js` `createSession` 建） | `erix`(1000):`erix`(1000) | **实测 `2770`**（首轮 `chmod` 时属组仍 == 进程 egid 0 ⇒ setgid 落得下，见成因 (a) 第 2 步） | ⚠ **同一棵树里 setgid 位是混的，别当一致状态**（真机实测 `<fde>/projects/probe-343`、`blind/projects/r1-app` = `2770`，同树 `<fde>/projects/probe-261014` = `770`）：同一项目再建第二个 session 会被下一轮 `chmod` 清成 `0770`。遗留的 `home/worktrees` 还见过 `2755`（在 `2770` 父目录里新建会**继承** setgid + umask `0022`）⇒ 结论同上：setgid 在这里不承载访问权 |
 | `.erix/`（HOME 级与项目级） | `erix`(1000):`erix`(1000) | `0750` | FDE 可管理 `skills/todos`；平台文件在其中为 root 属只读（下一行）；agentd/worker 只读 |
 | `.cache/station/spool/`（事件 spool，**尚未实现**） | `erix`(1000):`erix`(1000) | 口径随创建者，**先不给数字** | spool 目前不落盘（runner README §7.5 待定项），全仓无创建该目录的代码 ⇒ 无法指到实测。将来落盘时按成因 (a) 判：**portal 建 ⇒ `0770`**（属组交出后被清）；**agentd/worker 建 ⇒ `2770` 会真落下**（其主组 1000 == egid，`chmod` 清不掉）。需要组写的结论不变（agentd 与 worker 都写） |
 | **平台文件**（`config.json`/`mcp.json`/`ports.json`/`AGENTS.md`/`.gitignore`） | root:root | `0644` | 容器内 1000/1001/1002 可读、不可写（防误改；FDE 有 root 可绕过，§4.1 已声明） |

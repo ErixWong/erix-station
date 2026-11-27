@@ -27,9 +27,9 @@
 ## 3. 端口去项目化
 
 - `port_allocations.project_id` 退役（迁移置空/删列按最小代价）；hostname 改
-  `eric-p-<port>.fde.localhost`（URL 去项目名段，顺带消灭目录名→域名段的合法化清洗）。
+  `<fde>-p-<port>.fde.localhost`（URL 去项目名段，顺带消灭目录名→域名段的合法化清洗）。
 - `ports.json` 升 FDE 级单一文件 `~/.erix/ports.json`；Traefik 动态配置模板同步。
-- dev 环境旧 URL（`eric-p-<project>-<port>`）一次性切换，不做双读过渡。
+- dev 环境旧 URL（`<fde>-p-<project>-<port>`）一次性切换，不做双读过渡。
 
 ## 4. UI（决策者拍板的布局）
 

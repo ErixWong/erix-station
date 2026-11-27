@@ -387,7 +387,7 @@ git -C "$S" grep -nE 'DIR_NAME_RE|CWD_RE|function validateSessionCwd|function bu
    60   return `${fdeName}${PREVIEW_PORT_SEGMENT}${portLabel}.${baseDomain}`;
    ```
 
-   函数补测输出 `eric-p-22000.example.test`。因此 ISSUES 第 3 条的旧 DNS 推测已过期。下划线放宽不用做目录到 hostname 的消毒/防碰撞映射；不等于平台端口/域名整体无需唯一性约束。
+   函数补测输出 `alice-p-22000.example.test`。因此 ISSUES 第 3 条的旧 DNS 推测已过期。下划线放宽不用做目录到 hostname 的消毒/防碰撞映射；不等于平台端口/域名整体无需唯一性约束。
 
 3. **GET Run 没 rounds：确认；tokens 前提错误。**
 

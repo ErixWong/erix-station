@@ -416,7 +416,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 > UNIQUE (port) WHERE state <> 'released'` 在 **DB 层**保证；`released` 行不占位 ⇒ **号码可回收复用**。
 >
 > **历史（#240，已被本节取代）**：#240 把分配粒度定在 **FDE 级**、但端口写死 `4000–4009`（人人同一段），
-> 而既有索引只按 FDE 判重 ⇒ 真机 `eric` 与 `tetris` 同时持有 4000–4009（**10 组重叠**）。
+> 而既有索引只按 FDE 判重 ⇒ 真机 `<fde_name>` 与 `tetris` 同时持有 4000–4009（**10 组重叠**）。
 > 本单只换「挑哪些号」，**不改** #240 定的其它口径：粒度仍是 FDE 级；原「项目创建分配块首单端口 +
 > 8 端口块（slot）+ 每用户总配额」的方案仍作废（项目注册制已随 P5 退役，`projects.slot` 不再参与端口分配，
 > `port_allocations.project_id` 已被迁移 0008 DROP，run 级端口块仍是 P2）；**仍不存在「超限」，
@@ -458,7 +458,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 - **存量已由迁移 0019 一次性重排**（取代 #240 的「遗留行不迁移」）：活行按 `fde_name` 定序重排进号池，
   `hostname`/`url` 同事务重写（base 域从旧 hostname 反推，不硬编码伞域）；装不进一个块的溢出活行（真机只有
   `tetris` 的 **4100**）置 `released`；`released` 历史行（真机 `portsprobe` 的 4000–4009）**保留旧号码不重写**。
-  已接受的代价：eric / tetris 现有预览 URL 全部改写，**容器内应用要改监听端口**，旧链接失效。
+  已接受的代价：<fde_name> / tetris 现有预览 URL 全部改写，**容器内应用要改监听端口**，旧链接失效。
 - **管理员改块是搬迁事务，不是再发一块**（#246 交付②，本节最容易做错的一句）：`ensureFdePreviewPorts`
   全文件零 `UPDATE port_allocations`（**insert-only**），所以「改块」若直接复用它补一段，旧 10 条行仍活、
   继续占号、旧域名仍可访问（真机就会是 20 条活行）。因此 `moveFdePreviewBlock` 在**同一事务**里先按
@@ -502,7 +502,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 > **`BASE_DOMAIN` 语义 = 伞域（#57 定稿）**：`BASE_DOMAIN` 不再是「可注册域」，而是**伞域** `fde.<可注册域>`（现取 `fde.erix.vip`）。
 > 派生结果：portal = `station.<BASE_DOMAIN>` = `station.fde.erix.vip`、LLM = `llm.<BASE_DOMAIN>` = `llm.fde.erix.vip`（两条生成式在 `config.js`，不动）；
-> 预览域 = `<fde>-p-<portLabel>.<BASE_DOMAIN>` = `eric-p-8001.fde.erix.vip`（#246 后端口段来自号池 ⇒ 实际形态 `eric-p-22000.fde.erix.vip`）——**语法里写死的 `.fde.` 段已删除**（伞域本身已含 `fde.`，否则叠加成 `.fde.fde.erix.vip`）。
+> 预览域 = `<fde>-p-<portLabel>.<BASE_DOMAIN>` = `alice-p-8001.fde.erix.vip`（#246 后端口段来自号池 ⇒ 实际形态 `alice-p-22000.fde.erix.vip`）——**语法里写死的 `.fde.` 段已删除**（伞域本身已含 `fde.`，否则叠加成 `.fde.fde.erix.vip`）。
 > 代码默认兜底 = `BASE_DOMAIN=localhost`（`config.js`，本地起服不改环境变量的形态；要给本地也套伞域则显式配 `BASE_DOMAIN=fde.localhost`）；dev 走 `http://…:8090`、生产走 `https/443`，**同一代码路径**（URL 的 scheme/端口从公开入口 `config.portalPublicBaseUrl` 派生，见 `projects.previewUrl`）。
 
 > **唯一入口**：`hostname` / `url` 由 **portal 生成**（§8.1「DB 是真相」；实现唯一入口 `portal/src/projects.js` `buildHostname`，URL 另见同模块 `previewUrl`），前端只展示/跳转、agent 只读——**任何其它方不得拼接/改写**（portal.md §8-4 / 本节 §8.4）。
@@ -516,7 +516,7 @@ hostname := <fde> "-p-" <portLabel> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> �
 <fde>       := [a-z0-9]([a-z0-9-]{0,53}[a-z0-9])?   -- users.fde_name；字符集同 schema.sql CHECK，预览域名长度预算 ≤55（#246，见上）
 <portLabel> := [0-9]{4,}                        -- 十进制；不足 4 位零填充，**超过 4 位不截断**（号池端口是 5 位）
 
--- 完整域示例：eric-p-22000.fde.erix.vip（= <fde>-p-<portLabel> + 伞域 fde.erix.vip）
+-- 完整域示例：alice-p-22000.fde.erix.vip（= <fde>-p-<portLabel> + 伞域 fde.erix.vip）
 ```
 
 | 段 | 字符集 | 长度 | 生成规则 |
@@ -768,7 +768,7 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
    - **管理台用户列表「周期 / 用量」列走整表 bulk 端点（issue #800）**：`GET /api/admin/llm/key-usage` 一次 `/key/list` 覆盖全部 key，按 `key_id == token` 匹配（不用 `key_alias`）；**金额口径与上面的额度闸门同源（同一个 key 运行计数器）**，portal 不自算周期、不重推 scope——`spend_scope` 仍是「本周期 vs 终身」的唯一判据（`null` = 无读数，渲染成「—」而非 0）。
   - **首次设额度不清零历史（实测口径，不是 bug）**：`/key/update` 只改 `max_budget` / `budget_duration`，**不动 `spend`** ⇒
     设额度那一刻的 `spend` 仍是历史累计，`remaining = max_budget − spend` 因此一开始就可能小于额度
-    （dev 实测：eric 设 `0.5`/月时 `spend=0.0844` ⇒ 剩余 `0.4156`）。这与 LiteLLM 的**判定口径一致**
+    （dev 实测：<fde_name> 设 `0.5`/月时 `spend=0.0844` ⇒ 剩余 `0.4156`）。这与 LiteLLM 的**判定口径一致**
     （它也用同一个计数器比 `max_budget`），所以不是显示 bug；要让额度「从本月重新起算」，只能在设额度时把 `spend` 显式归零
     —— **本单不做**（属产品决定：归零会抹掉累计花费，`total_spend` 另存）。
   - **日聚合表是 UTC 日桶**（`common_daily_activity.py:563-600`）：`/user/daily/activity` 返回的是 **UTC 日**分桶；`timezone`（我们传 480）**只用于决定 end_date 是否把今天扩成一个 UTC 桶**，历史日期是 **pass-through**（不会把 UTC 桶重算成 UTC+8 日）。因此「本周期已用」（网关实时计数器、本地周期）与用量表最后一行（UTC 日桶）**天然可能对不上**，两者**不互相校验**。

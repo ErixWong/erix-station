@@ -536,7 +536,7 @@ idle ──list/call 需要元数据或调用──▶ starting ──握手成�
 **真机 e2e（主 agent 亲自）**
 1. 起 **mock MCP server**（stdio node 脚本，暴露 `echo` + `delete_all` 两个工具，`ECHO_PREFIX` 从 env 读）；
 2. admin 发布 `kind='mcp'`（stdio + 槽 `ECHO_PREFIX`，`exposure=deferred`，reason=stateful）→ 设值 → 发布；
-3. `eric` 安装 + 启用 → `~/.erix/mcp.json` 出现该 server 且 **grep 不到槽值**；
+3. `alice` 安装 + 启用 → `~/.erix/mcp.json` 出现该 server 且 **grep 不到槽值**；
 4. 会话里 `mcp list` → `search` → `call echo` ⇒ 返回 `PREFIX:hello`（证明注入生效）；
 5. `list` 触发元数据回填 ⇒ DB `manifest.tools_cache` 有值 ⇒ 下次物化 `mcp.json` 带 tools；
 6. 删槽值再启用 ⇒ 409；补齐后恢复；

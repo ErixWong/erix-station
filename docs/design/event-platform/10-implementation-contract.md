@@ -179,7 +179,7 @@ W2 的预检只用来避免明显的无效执行，不作为正确性保证。
 `GET /api/admin/macro-runs` 响应项：
 ```json
 { "id": "...", "startedAt": "...", "templateId": "...", "templateName": "完成审查 · 默认",
-  "userId": "...", "userName": "eric", "anchor": "run:9f3a...", "criterion": "semantic",
+  "userId": "...", "userName": "alice", "anchor": "run:9f3a...", "criterion": "semantic",
   "status": "done", "verdict": "red", "durationMs": 252000,
   "usage": { "input": 82000, "output": 3100 } }
 ```
