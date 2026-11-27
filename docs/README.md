@@ -69,10 +69,17 @@
 ## 二、待补齐文档
 
 > 每项给出「必须包含」与「验收标准」。**未决问题未定时，先按 `principles.md §4` 的当前倾向写，并显式标注 `⚠️ 待决策者确认`**——不要留空，也不要自行改变设计。
+>
+> **本节是台账，不是待办清单**（#777 现验：D1/D2/D3/D5 早已交付，D4 已被现有事实源取代）。
+> 每条下面的「**现状**」行是唯一可下判的地方：已交付的给交付物路径，被取代/否决的写明**为什么**
+> （引 `fde-platform.md` 附录 A 或 `principles.md`），仍欠的保留为欠并给判据。
+> **不要**把整节当 TODO 背，也不要照「必须包含」去补已经退役的东西。
 
 ### D1. `docs/env.md` —— 部署参数清单（原「环境事实清单」）✅ 已完成
 
 > **状态**：✅ 已完成，交付于 [`env.md`](env.md)。实际定位为「参数清单 + 参考实例 A + 目标环境探测 checklist」，**不是单机环境事实**。以下「必须包含 / 验收 / 依赖」保留作验收依据。
+>
+> **现状**：✅ 活文档，仍是域名/证书的取值口径来源（`api/portal.md:14` 明写「文中一切域名/URL 以 `env.md` §10 的部署变量为准」）。「必须包含」里那条「宿主机 CPU/内存/磁盘/端口占用」是**机器事实**，已按坐标纪律搬冷层（不在仓库里，见冷层 `~/projects/docs/station-dev-machine.md`）⇒ **别把它当成欠项补回仓库**。
 
 **为什么**：规格全文用 `<base>` 等占位符；没有环境事实就写不出能跑的 Traefik / compose 配置。
 
@@ -94,6 +101,8 @@
 ### D2. `docs/api/portal.md` —— portal API 契约 ✅ 已完成
 
 > **状态**：✅ 已完成，交付于 [`api/portal.md`](api/portal.md)。以下「必须包含 / 验收 / 依赖」保留作验收依据。
+>
+> **现状**：✅ 活契约。「必须包含」里点名要覆盖的**项目 CRUD 已退役**（P5 目录即项目）⇒ 这一项**划掉**，别再照它补实现：写端点 `POST/PATCH/DELETE /api/projects*` 现在返回 `410 project_api_retired`（`portal/src/http.js:1521-1534`），`port_allocations.project_id` 已删列（`deploy/migrations/0008-deprojectize.sql:37`）。现口径看 `api/portal.md` 与目录面端点（`/api/dirs`、`/api/files/tree`，`portal/src/http.js:1501-1504`）。
 
 **为什么**：没有契约，前端与后端并行必然打架。
 
@@ -113,6 +122,8 @@
 ### D3. `docs/data/schema.sql` + `docs/data/model.md` —— 数据模型 ✅ 已完成
 
 > **状态**：✅ 已完成，交付于 [`data/schema.sql`](data/schema.sql) + [`data/model.md`](data/model.md)；`psql -f` 已在 postgres:16 空库实测可执行。以下「必须包含 / 验收 / 依赖」保留作验收依据。
+>
+> **现状**：✅ 交付物有效，但**角色变了**：`schema.sql` 是**已冻结的 baseline**（`version='0000_baseline'`，改它会让迁移 runner 记录的 `sha256` 失配并拒绝启动 ⇒ `deploy/migrations/README.md`）。schema 的演进一律走增量迁移目录 `deploy/migrations/`（现查最新一条是 `0049-notifications-title-key.sql`）⇒ 「验收：`psql -f schema.sql` 在空库可执行」只对 baseline 成立，**不等于现库形状**。
 
 **为什么**：规格 §9.1 是表名 + 字段草图，不是可执行 DDL。
 
@@ -129,7 +140,15 @@
 
 ---
 
-### D4. `docs/decisions/00N-*.md` —— ADR 拆分（中优先）
+### D4. `docs/decisions/00N-*.md` —— ADR 拆分 ❌ 已被现有事实源取代（不再单独做）
+
+> **状态**：❌ **不做**——不是还没做，而是照做会**新增一个事实源**。
+> **现状**：D1~D10 的权威记录已在 [`design/fde-platform.md`](design/fde-platform.md) **附录 A**
+> （标题「附录 A：决策记录」，现查该文件 `:882`），决策被修订时改在 **A.1 修订记录**（现查 `:897`，
+> D8 由 worktree 改项目目录就记在那）。`docs/decisions/` 至今**不存在**（现查目录不存在）。
+> 拆成十份 ADR 的结果是「同一决策两处写」，而本仓的既有红线是一份事实一个源
+> （`principles.md` 的实现者硬约束）⇒ 判据：**真要拆，先回答「谁是真相源、另一份怎么保证不漂」**；
+> 答不出就不拆。下面的「为什么 / 必须包含 / 验收」保留作历史台账。
 
 **为什么**：`principles.md §3` 已有「被否决方案」，但决策本身缺正式记录；erix 仓库有 `docs/decisions/` 惯例。
 
@@ -144,6 +163,8 @@
 ### D5. `docs/testing.md` —— 测试与验收 ✅ 已完成
 
 > **状态**：✅ 已完成，交付于 [`testing.md`](testing.md)。以下「必须包含 / 验收 / 依赖」保留作验收依据。
+>
+> **现状**：✅ 活文档。命令面**以 `package.json` 的 `scripts` 为准**（本文自己写了「以仓库现状为准」，`testing.md:37`）；新增的门禁类脚本（`check:doc-portable` / `check:doc-impl` / `check:ci-legs` / `check:agents-hotlayer`）住在 `package.json` 与 CI 里，比对逻辑见 `scripts/*.mjs`，腿名漂移由 `check:doc-impl` 当场抓（`docs/ops/ci-release.md:266` 记过一次）。⇒ 「每条安全回归用例都有对应命令」这句仍然成立，但**要现查脚本名**，别照本文的命令表当最新清单。
 
 **为什么**：全局约定要求「语法保底 → 单测全绿 → 浏览器验证」；规格只有一行验收。
 
@@ -165,7 +186,14 @@
 
 ---
 
-### D6. `docs/ops/runbook.md` —— 运维手册（P2 前置）
+### D6. `docs/ops/runbook.md` —— 运维手册 ⏳ 仍欠（部分职责已被别的活文档承担）
+
+> **现状**：⏳ **仍欠**——现查 `docs/ops/runbook.md` **不存在**。已被承担的部分（**不要重复建**）：
+> 发布→按 digest 部署的 pin 与回滚口径在 [`ops/ci-release.md`](ops/ci-release.md)；
+> 监控开关/保留期/加盘流程在 [`ops/system-metrics.md`](ops/system-metrics.md)；
+> 空闲 DB 负载的读数口径在 [`ops/db-idle-load.md`](ops/db-idle-load.md)。
+> **仍未被承担、所以本条不注销的那半截**：启停顺序 + 常见故障排查（502 / 401 / 容器起不来 / 任务卡住）
+> + 孤儿容器与端口回收 + 日志位置。判据仍是下面那条「新人可照着完成一次升级 erix-agent 并回滚」。
 
 **必须包含**：启停顺序、健康检查、DB 备份与恢复（**引用系统级备份方案，不在本项目范围**——runbook 只记录平台数据卷位置与对接点，不自行交付备份机制；决策者 2026-09，issue #3 评论）、容器升级流程（含 erix-agent 版本 pin 与 canary）、孤儿容器/端口回收、日志位置、常见故障排查（502 / 401 / 容器起不来 / 任务卡住）
 
@@ -175,7 +203,13 @@
 
 ---
 
-### D7. `docs/design/discussion-archive.md` —— 讨论过程归档（低优先，可选）
+### D7. `docs/design/discussion-archive.md` —— 讨论过程归档 ⏳ 仍欠（低优先，可选；不要抄成结论）
+
+> **现状**：⏳ **仍欠**——现查 `docs/design/discussion-archive.md` 不存在。低优先是**有理由的**：
+> 结论与取舍已在 [`design/principles.md`](design/principles.md)（被否决方案、未决问题决策框架），
+> 决策记录已在 [`design/fde-platform.md`](design/fde-platform.md) 附录 A/A.1 ⇒ 本条**只补过程**；
+> 判据 = 交付物里**不许重复**已有结论（重复就是新增事实源，同 D4 的病）。载体（内网 Gitea issue #24）
+> 是过程材料，不是可引用的现状。
 
 **为什么**：六轮讨论的完整过程目前只在 内网 Gitea issue #24（主机名见冷层 `~/projects/docs/station-dev-machine.md`）。`principles.md` 已覆盖其中的**结论与取舍**，本文只补**过程**。
 
@@ -189,13 +223,16 @@
 
 ```
 ✅ D1 (env) ─┬─ ✅ D5 (testing)
-             └─ D6 (runbook，P2 前置)
-✅ D2 (API 契约)
-✅ D3 (schema)
-D4 (ADR，无依赖，可随时补)
+             └─ ⏳ D6 (runbook)：仍欠，只剩半截（见 D6 现状）
+✅ D2 (API 契约)      项目 CRUD 那项已退役 ⇒ 划掉
+✅ D3 (schema)        schema.sql 已冻结为 baseline；演进看 deploy/migrations/
+❌ D4 (ADR)           已被 fde-platform.md 附录 A/A.1 取代 ⇒ 不做（做它会多一个事实源）
+⏳ D7 (讨论归档)      仍欠，低优先；只补过程
 ```
 
-**最小可开工集** = **D1 + D2 + D3 + D5** —— 已就绪 ✅（P1 可开工，测试与验收契约已补齐）。下一步：D4/D6 可在 P1 期间并行补。
+**最小可开工集** = **D1 + D2 + D3 + D5** —— 已就绪 ✅（P1 可开工，测试与验收契约已补齐）。
+**本节不是待办清单**：现在唯一还欠的是 **D6 的那半截**与 **D7**（低优先）；D4 已判**不做**。
+各条的「现状」行才是可下判的地方（含落点），标题上的 ✅/⏳/❌ 只是索引。
 
 ---
 
