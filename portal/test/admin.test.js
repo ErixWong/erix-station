@@ -1,7 +1,7 @@
 // 单测：issue #38 Phase B2 admin UI 服务端——用户管理端点 / provision 端点 /
 //       GET llm 的 active_run 字段 / GET /admin 兼容跳转（302 → /#/admin，issue #61 P4）/ 非 admin 403。
 // 隔离约定（docs/testing.md §2.1）：内存 fake pool，不碰真实 DB / docker。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,6 +11,21 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startAdminServer 建的 staticDir（`station-admin-static-`）进 tmpDirs，afterEach 逐格 rm（**不带 force**）。
+// 另一处建目录点 `station-delete-user-`（deleteUser 那格）**本来就有自己的 t.after 收尾**（既有写法，
+// 建它的同一层已挂上），本单不重复登记；还有一处 `station-delete-missing-*` 是**故意不存在**的路径，不算建目录。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 /**
  * #255 fake helper：`UPDATE ... SET ... must_change_password = <literal>` 里该列被赋成指定字面量吗？
@@ -463,7 +478,7 @@ class AdminPool extends FakePool {
 
 async function startAdminServer({ seed = {}, docker = null, llmGateway = createTestLlmGateway() } = {}) {
   // P4：旧 index.html/admin.html 静态页已退役（serveStatic 只服务注入的 app/），fixture 不再写文件。
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-admin-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-admin-static-')));
   const config = {
     cookie: cookieSettings('dev-admin', 604800),
     sessionTtlSeconds: 604800,
