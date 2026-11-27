@@ -6,11 +6,19 @@
 // 内部通道根本没有浏览器、没有 cookie 罐子，runner 两个头都不发，在这里等 cookie 永远等不到
 // ⇒ #803 E 片补好的 50 处英文对备好之后界面仍然恒中文。修法是在平台**本来就知道答案**的地方取：
 // `authenticateContainer` 的既有 `JOIN users u` 顺带取 `u.locale`（零额外查询），
-// `handleInternal` 把它挂成 `req.localeHint`，兜底 catch 用 `req.localeHint ?? resolveRequestLocale(req)`。
+// `handleInternal` 把它挂成 `req.localeHint`。兜底 catch 的实现（`http.js` 的请求 catch）**不是**直接
+// `req.localeHint ?? resolveRequestLocale(req)`，而是**先读时归一再过 `??`**：`normalizeUserLocale(req.localeHint)`
+// ⇒ 合法值收成 `'zh-CN'`/`'en'`，非法或空 ⇒ `null`，`null` 才落回 `resolveRequestLocale(req)`。
+// **为什么归一做在「读的时候」而不是指望库里干净**：迁移 `0048` 刻意不给 `users.locale` 写 DB CHECK
+// （见 `deploy/migrations/0048-users-locale.sql`），手工写进库的脏值照样读得出来：`''` 会被 `??` 当「已设」
+// 从而吃掉整个请求头回退，`'zh'`/`'fr'` 不在白名单却同样被当「已设」挡住回退，`'EN'` 更因 `pickMessage`
+// 只认精确 `'en'` 而误出中文——归一之后这些统统按「未设」处理、照旧落回请求头。
 //
-// 为什么必须「挂 hint」而不是改 `resolveRequestLocale`（本文件最后一条钉子）：浏览器那条路
-// **必须继续只认 cookie**——#828 P2b 刚修完「过期账号值顶掉用户当场选的语言」，账号值绝不能在
-// 浏览器路径上插队。hint 只在内部面设置，作用域天然隔离，故这条性质必须被钉住。
+// 为什么必须「挂 hint」而不是改 `resolveRequestLocale`（本文件最后一条钉子）：浏览器那条路**只按请求
+// 自带的 `Cookie: locale=` / `Accept-Language` 谈判**（`portal/src/locale.js` 的固定顺序：cookie 白名单 →
+// `Accept-Language` 按 q 值择优 → 缺省 `zh-CN`）。要钉的语义是「**账号值（`users.locale` / `req.localeHint`）
+// 绝不插队**」，而不是「只有 cookie 说话」——#828 P2b 刚修完「过期账号值顶掉用户当场选的语言」，账号值
+// 绝不能在浏览器路径上插队。hint 只在内部面设置，作用域天然隔离，故这条性质必须被钉住。
 //
 // 关键断言（状态码 / code / message）一律 `assert.equal(实际, 期望)` **逐字等值**（不许 includes / match）；
 // 另有少量 `assert.ok` 只用来验「信封存在」或「某键不在错误体里」这类形状/存在性（不代替逐字内容断言）；内存 fake pool，不碰真实 DB。
@@ -226,7 +234,7 @@ test('另一条内部路由（artifact 空 body）也按属主取语言：en 出
   } finally { await s.close(); }
 });
 
-// ── 4. 防回归（最重要）：浏览器路径不被属主 profile 插队 ⇒ 只认 cookie ──
+// ── 4. 防回归（最重要）：浏览器路径不被属主 profile（账号值）插队 ⇒ 只按请求自带的 Cookie / Accept-Language 谈判 ──
 // 属主（会话所属用户）`locale='en'`，但浏览器当场带 `Cookie: locale=zh-CN` ⇒ 必须出中文。
 // 这是 #828 P2b 的口径：账号值不得顶掉用户当场选的语言。
 test('防回归：浏览器请求属主 locale=en 但 Cookie locale=zh-CN ⇒ 仍出中文（账号值不许插队）', async () => {
@@ -243,9 +251,9 @@ test('防回归：浏览器请求属主 locale=en 但 Cookie locale=zh-CN ⇒ �
   } finally { await s.close(); }
 });
 
-// ── 4b. 浏览器侧 cookie 仍是唯一入口：属主 en + Cookie locale=en ⇒ 英文；属主 en + 不带 cookie ⇒ 中文
-//（中文那条同时钉住「浏览器路径不读 users.locale」：属主是 en，若被读就会出英文）──
-test('防回归：浏览器侧只认 cookie（Cookie locale=en ⇒ 英文；不带 locale cookie ⇒ 中文，即使属主是 en）', async () => {
+// ── 4b. 浏览器侧的语言只由请求自带的 Cookie / Accept-Language 决定（账号值不在其列）：属主 en + Cookie locale=en ⇒ 英文；
+// 属主 en + 不带 locale cookie（也不发 Accept-Language）⇒ 中文（中文那条同时钉住「浏览器路径不读 users.locale」：属主是 en，若被读就会出英文）──
+test('防回归：浏览器侧只按请求自带的 Cookie / Accept-Language 谈判（Cookie locale=en ⇒ 英文；不带 locale cookie ⇒ 中文，即使属主是 en）', async () => {
   const s = await startBrowserServer({ ownerLocale: 'en' });
   try {
     const en = await hit(s.base, {
