@@ -947,6 +947,25 @@ export const zhCN = {
       macros: '宏模板',
       macroRuns: '宏流水',
     },
+    // issue #818：左侧**分组**侧栏的 6 个组名（组内项名仍用上表的 `admin.tabs.*`，一个字没改）。
+    // 顺序 = 侧栏渲染顺序；组名是新语义，**不复用项名**（工单红线）。
+    navGroup: {
+      usersSeats: '用户与工位',
+      models: '模型与能力',
+      platformAccess: '平台接入',
+      platformConfig: '平台配置',
+      observe: '运行观察',
+      macros: '宏',
+    },
+    // issue #818 §④ 与 §③：侧栏自身的三条 UI 文案（skip 链接、「跳到…」过滤框、无匹配行）
+    // 加折叠开关的无障碍名。skip 链接的文本必须是「跳到主内容」这种能当朗读指令读的话。
+    nav: {
+      skip: '跳到主内容',
+      filterPlaceholder: '跳到…',
+      noMatch: '没有匹配项',
+      collapse: '收起侧栏（只留图标）',
+      expand: '展开侧栏',
+    },
     // issue #727 片 2：「工位内容」页（views/AdminSeatContentView.vue + components/AdminTranscript.vue，
     // 契约 §4.22）。只读页：文案里不得出现「发送/停止/上传」这类写侧动词。
     seatContent: {

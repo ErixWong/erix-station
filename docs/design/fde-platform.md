@@ -288,6 +288,18 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 能力边界因此由「host × entrypoint 的交集」决定，与页面在哪个 origin 渲染无关（hash 路由不改）。
 细节与真机验证矩阵见 [`../deploy/edge-routing.md`](../deploy/edge-routing.md)。
 
+**管理台导航是左侧分组侧栏（issue #818）**：顶栏只留「我是谁 / 我怎么出去」（标题 · 身份 · 返回工作台 ·
+语言 · 登出），15 项栏目全部下沉到侧栏的 **6 个组**（用户与工位 / 模型与能力 / 平台接入 / 平台配置 /
+运行观察 / 宏）+ 底部固定一项「关于」（不分组：它不帮人做决定）。侧栏与正文是**两个独立滚动面**，
+窄屏（< 900px）自动收成 44px 图标轨，全词提示靠 CSS 的 `:focus-within` / `:focus-visible` 出（键盘可达，
+不做汉堡抽屉）。**展开策略**：默认只展开当前路由所在组，导航时强制展开目标组（刚点进去的组收起着 =
+看不见自己在哪）；「跳到…」过滤态下所有组强制展开，清空即恢复。展开态存浏览器 `localStorage`，键
+`admin.nav.expanded`（值 = 组 id 数组）——**它是「这台浏览器今天想看哪几组」，不是账号属性，故不进 DB**。
+组名是新的 i18n 键 `admin.navGroup.*`（`admin.tabs.*` 那 15 项的名字与路由一个字没改）。
+**组图标是自维护内联 SVG**（不引图标库）：几何在 `portal/frontend/src/lib/icons.ts`，渲染只走
+`components/AppIcon.vue`；取不到键 ⇒ 空 `<svg>` 不抛（少一个装饰，而不是整块导航没了）。
+新增图标的流程与「什么时候才值得换成图标库」的触发条件写在该文件头注释里（后续 #817 复用同一套规矩）。
+
 **路由由 portal 生成、经 reconciler 幂等发布到 Traefik file provider，与 DB 的端口分配表同源**（DB 事务写 `port_allocations` + route outbox/revision，§8.1）——不允许手工改，也不允许 FDE 容器打 label 自注册（「路由表里没有 = 不可达」「FDE 不能自注册路由」这两条性质必须成立）。动态配置文件含全部虚拟 key，宿主文件权限 **600**，仅 portal 可写、Traefik 只读（topology.md §6 第 8 条）。
 
 > **LLM 网关凭据入口收紧（H-B）**：LLM 网关数据面只接受 Traefik 经 `fde-<name>-llm` router 注入的 `Authorization` 头；网关须显式**拒绝**其它凭据输入通道（`X-API-Key`、HTTP Basic、cookie、query token）——否则容器可绕过「来源子网 → 身份」判定直接出示凭据（topology.md §4-L7）。
