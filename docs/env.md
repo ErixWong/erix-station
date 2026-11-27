@@ -272,8 +272,8 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `PORTAL_HOST_PORT` | 平台规范固定（portal publish 仅回环 `127.0.0.1`，容器内固定 8080） | `8080`（开发期本机为 `18080`，见 §0） |
 | `ACME_EMAIL` | 决策者提供（§2 ⚠️） | 待填 |
 | `DNS_PROVIDER` / DNS-01 API token | 决策者提供，凭据文件注入（§2 ⚠️ / §6） | 待填 |
-| `DATA_ROOT` | 决策者/运维约定（§6） | `/docker` |
-| `USER_SPACE_ROOT` | 结构平台规范固定，取值决策者/运维提供（§6） | `/srv/erix/users` |
+| `DATA_ROOT` | 决策者/运维约定（§6）；⚠ **台账名：实现里没有同名 env**（⇒ §10.7 类 I） | `/docker` |
+| `USER_SPACE_ROOT` | 结构平台规范固定，取值决策者/运维提供（§6）；⚠ **台账名：compose/代码零命中**，实现侧的名字是 `ERIX_USERSPACE_ROOT`（容器内）/ `ERIX_USERSPACE_ROOT_HOST`（宿主）⇒ §10.7 类 I | `/srv/erix/users` |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | 超级用户（bootstrap）身份；部署时生成，`POSTGRES_PASSWORD` 存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station` / — / `station` |
 | `PLATFORM_DB_USER` / `PLATFORM_DB_PASSWORD` | 迁移身份（DDL/表 owner）；口令存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station_platform` / — |
 | `PORTAL_DB_USER` / `PORTAL_DB_PASSWORD` | 运行时身份（最小 DML GRANT）；口令存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station_portal` / — |
@@ -298,10 +298,10 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `LITELLM_DB_USER` / `LITELLM_DB_PASSWORD` | 独立 LiteLLM 数据库角色；新建 DB 数据目录时由 `deploy/db-init/01-litellm.sh` 创建角色与库；容器 `DATABASE_URL` 指向 `station-db:5432/litellm`，不得复用 portal 的 DB 角色 | `litellm` / 独立随机值 |
 | `DATABASE_URL`（LiteLLM 容器） | Compose 内部构造的 PostgreSQL URL，连接 `station-db` 上的 `litellm` 数据库 | `postgresql://litellm:…@station-db:5432/litellm` |
 | `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限 HTTP 部署/联调**（无 `Secure` ⇒ 拿不到 `__Host-` 前缀，cookie 被看到即会话被冒用；2026-10-10 首次部署按决策者口径用于私有网 http 部署，代价与 https 两条路线见 #234 与 `docs/ops/deployment-2026-10-10.md`）） |
-| `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
-| `TRAEFIK_CONFIG_DIR` | 平台规范固定（deploy-contract.md；由 `DATA_ROOT` 派生） | `/docker/station-edge/`（静态 `traefik.yml` + `dynamic/` 目录 + `acme.json` + `logs/` + `firewall/` 规则文件） |
-| `FIREWALL_RULES_PATH` | 平台规范固定（deploy-contract.md；由 `TRAEFIK_CONFIG_DIR` 派生） | `/docker/station-edge/firewall/`（规则文件 `rules.v4`，权限 **600**） |
-| `DB_DATA_DIR` | 平台规范固定（由 `DATA_ROOT` 派生） | `/docker/station-db/`（pg data；见 §6） |
+| `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md）；⚠ **未落地**（仓库里零读者 ⇒ §10.7 类 II） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
+| `TRAEFIK_CONFIG_DIR` | 平台规范固定（deploy-contract.md；由 `DATA_ROOT` 派生）；⚠ **台账名且未落地**（⇒ §10.7） | `/docker/station-edge/`（静态 `traefik.yml` + `dynamic/` 目录 + `acme.json` + `logs/` + `firewall/` 规则文件） |
+| `FIREWALL_RULES_PATH` | 平台规范固定（deploy-contract.md；由 `TRAEFIK_CONFIG_DIR` 派生）；⚠ **未落地**：写 `rules.v4` 的代码与 compose 挂载都还没有（⇒ §10.7 类 II） | `/docker/station-edge/firewall/`（规则文件 `rules.v4`，权限 **600**） |
+| `DB_DATA_DIR` | ⚠ **台账名，实现里没有这个 env**（词边界：compose 0 / 代码 0）——pg 数据目录的宿主 bind source 实叫 `STATION_DB_DIR`（⇒ §10.6 类 D） | `/docker/station-db/`（pg data；见 §6） |
 | `ERIX_USERSPACE_ROOT` | portal 运行时环境变量：用户空间根（portal **容器内路径**，固定 `/srv/erix/users`，与宿主 bind mount 同路径，user-space §2.2） | 平台规范固定 | `/srv/erix/users` |
 | `ERIX_USERSPACE_ROOT_HOST` | compose 插值：宿主用户空间根路径（默认 `/srv/erix/users`；开发期可指向临时目录隔离，结构不变） | 平台规范固定 + 开发期隔离 | `/srv/erix/users` |
 | `ERIX_WORKSPACE_RETENTION_DAYS` | workspace 自动清理保留天数。自 #677 P3 第一批起它只是**兜底位**：真值在 `runtime_settings.workspace.retention_days`（管理台可改，`applyMode=hot`，契约 `docs/api/portal.md` §4.21）——**下一拍 offboarding 就用新值**，不用重建容器。`0`（默认）= 不自动清理且是**有效值**（不是「没配」）；显式正数只删 workspace 目录、不删用户或关联 DB 行。⚠ **关掉清理 ≠ 取消已排定的删除**：`0` 只决定「这一拍跑不跑清理查询」，它不写也不抹 `fde_offboarding.workspace_purge_after` ⇒ `0` 期间完成离职的工位**不会被补上期限**（改回正数也不追删），而 `0` 之前已排定且已过期的那一行在改回正数后的**下一拍就被删**（不重新等 N 天）——两个方向都不许改成「按今天的旋钮重排期限」；裁定与理由见 `docs/api/portal.md` §4.21「`0` 的语义」那一小节（判据 `portal/test/offboarding.test.js` `#677 P3⑤⑥⑦`）。⚠ env 值也要过 registry 那套闸（整数且 `0..3650`，上界理由见 `portal/src/runtime-settings.js` 里 `WORKSPACE_RETENTION_MAX_DAYS` 上面那段）：`1e3` / `7.5` / `-1` / `4000` 这类过不了闸的值**视为没给** ⇒ 回落默认 `0`（= 更保守：少删目录）+ 一条点名 key 与本变量名的 warn（判据 `runtime-settings.test.js` RS-27）。`nonNegativeIntEnv` 的 `Number()` 语义在这一格**不再算数**（闸落在 registry 驱动那一层，`nonNegativeIntEnv` 本身没改） | 默认关闭，可运维显式开启 | `0` |
@@ -448,6 +448,73 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 > **下发链路现状**（本单未动 `deploy/`）：这四个名字目前**不在** `deploy/docker-compose.yml` 的 `station-portal` env 里，
 > 也不在 fde-proxy `ENV_KEY_ALLOW` / provisioner 的 Env 下行集里——它们只作用于 **portal 进程自身**，不需要下发 FDE。
 > 要改值：在 compose 里给 `station-portal` 加 env（或 `.env`）后重建 portal 容器；未设置时全部走上表的默认值。
+
+### 10.6 补登：`deploy/docker-compose.yml` 在插值、本文此前未登记的 14 个键（#777 批 D1，261128 现验）
+
+> **现验判据**（词边界，不是子串——`grep -c PORTAL_IMAGE` 会把 `STATION_PORTAL_IMAGE` 一起算）：
+> ```sh
+> grep -ohE '\$\{[A-Z0-9_]+' deploy/docker-compose.yml | sed 's/\${//' | sort -u   # ⇒ 89 个（含一个 `VAR`，那是注释里 `${VAR:?}` 的叙述噪声，不是真旋钮）
+> while read -r k; do grep -qoE "(^|[^A-Z0-9_])${k}([^A-Z0-9_]|$)" docs/env.md || echo "$k"; done < 上面那份清单   # ⇒ 14 个
+> ```
+> **不是一律补成「宿主旋钮」**：类 A/C/D 是宿主该管的（A 只在并行隔离栈才需要动），**类 B 根本不是部署旋钮**
+> ——它是镜像构建期入参。每类都写「谁读它 / 改了会怎样 / 是不是宿主该管」。
+
+**类 A：容器名（5 个，宿主该管，但**只在并行隔离栈**才需要动）**
+
+`STATION_DB_NAME` / `STATION_PORTAL_NAME` / `STATION_EDGE_NAME` / `STATION_LITELLM_NAME` / `STATION_DOCKER_PROXY_NAME`：compose 各服务的 `container_name:` 插值位（判据：compose `:17` `:62` `:116` `:342` `:388`），**缺省值就是 §本文其它处写的实名**（`station-db` 等）。
+
+- **谁读它**：只有 Docker（命名）与「按容器名找人」的运维/e2e 命令。portal **不读**——它找 FDE 容器只从 DB（`containers.container_name`，AGENTS §5）。
+- **改了会怎样**：服务间 DNS **不受影响**（`backend` 网络里解析的是 compose **服务名**，如 portal 的 `DATABASE_URL` 指 `station-db:5432`），但按容器名找人的脚本会失配——`portal/integration/lib/isolated-env.mjs:33-35`（`:33` 是 portal 容器名、`:35` 是 edge 容器名，别只引 `:33`） 就把 `station-portal` / `station-edge` 当**硬编码缺省**。
+- **为什么欠着**：隔离栈并行跑时要换名（同名 `container_name` 冲突），这层需求只出现在 e2e，所以从未进本表。
+
+**类 B：镜像构建期入参（3 个，**不是部署旋钮**，是构建/发布流水线该管）**
+
+`STATION_VERSION` / `STATION_REVISION` / `STATION_BUILD_DATE`：只出现在 compose 的 `station-portal.build.args`（compose `:128-130`，FDE 镜像同名 ARG 在 `runner/Dockerfile`），写进镜像内 `build-info.json` 的 `revision` / `built_at` 与 OCI label。
+
+- **谁读它**：镜像构建（`portal/Dockerfile` / `runner/Dockerfile` 末尾那一层）；运行时读的是**镜像内那个文件**（`portal/src/version-info.js` → `readBuildInfo()`），不是这三个 env。
+- **不改会怎样**：`revision`/`built_at` 就是 `unknown`——**不是烘进假版本**，CI 的 portal/FDE tripwire 会当场红（`ci.yml` 的 build-info 步骤、`scripts/check-build-info.mjs`）。
+- **口径**：本表不写死取值（版本真相在 `package.json` 与 git 修订）；**部署期不该动它们**，动它们的是构建命令（`ci-release.md` §3/§7）。
+
+**类 C：portal / FDE 实例的运行时属性（3 个，宿主该管）**
+
+| 变量 | 语义 | 谁读它（现读判据） | 不改 / 改错的代价 |
+|---|---|---|---|
+| `STATION_STACK_ID` | **栈所有权标签**：portal 给自建的 FDE 容器/网络打 `station.stack=<id>`，孤儿清扫只清本栈（compose `:179-180`，缺省 `default`） | `portal/src/config.js:383`（`env.STATION_STACK_ID \|\| 'default'`） | 并行隔离栈不设 ⇒ 两套栈互删对方的 FDE 容器/网络（注释里点名的 `station-e2e-*` 就是这族事故） |
+| `ERIX_MCP_CONFIG_TIMEOUT_MS` | FDE 容器内 **MCP 配置读取超时**（毫秒）；portal 在 provisioner 里把它拼进下行的容器 env，worker 侧读取 | 下发：`portal/src/provisioner.js:291`；消费：`runner/worker.js:134`（`?? 10_000`） | 设太小 ⇒ MCP 配置读不到就回落；本变量只影响容器内 agent 启动，不影响 portal 本体 |
+| `TRAEFIK_SECURE_ENTRYPOINT` | 用户面（工作台 + 预览 host）是否**同时挂 `websecure` + tls**；缺省空 = 不挂（compose `:199`） | `portal/src/config.js:359` → `portal/src/routes.js` 的路由生成 | 留空 ⇒ 用户面只挂 `web`（老部署 `routes.yml` 字节不变）；设成 `websecure` 才出 https 路由——**填了但 traefik.yml 里没那个 entryPoint 会生成挂不上路由的路由**，改之前先核 `deploy/traefik/traefik.yml` |
+
+**类 D：宿主路径（3 个，宿主该管）**
+
+| 变量 | 语义 | 现读判据 | 代价 / 口径 |
+|---|---|---|---|
+| `STATION_DB_DIR` | `station-db` 数据目录的**宿主 bind source**（缺省 `/docker/station-db`） | compose `:35`；隔离 e2e 硬要求：`portal/integration/lib/isolated-env.mjs:205-211`（**缺省即抛**，不再回退共享目录） | ⚠ 沿用缺省去跑并行隔离栈 ⇒ 两个 `station-db` 抢同一份宿主数据目录（#226 取证）；`ci-release.md` §6 已把「`STATION_DB_DIR` 必须在临时目录」列进 e2e 前置。本文此前只在 §10 写过台账名 `DB_DATA_DIR`（⇒ §10.7） |
+| `TRAEFIK_STATIC_HOST` | 整体**替换** Traefik 静态配置文件（缺省 `./traefik/traefik.yml`） | compose `:410`（注释 `:400` 记了为什么不能走 CLI 覆盖：v3 带 `--configFile` 时文件里的 entryPoints 压过 CLI） | 并行隔离栈靠它换一份只改入口端口的静态文件；填错 ⇒ 边缘直接起不来 |
+| `ERIX_ARTIFACTS_ROOT_HOST` | run 终态产物卷的**宿主侧**路径（容器内路径是 `ERIX_ARTIFACTS_ROOT`，赋值在 compose `:194`——`:193` 只是它上面的注释行；宿主挂载源在 `:165`） | compose `:165`；契约 [`design/deploy-contract.md`](design/deploy-contract.md) §2.2 已登（本表此前漏了宿主侧这一半） | 与 `ERIX_USERSPACE_ROOT_HOST` 同族：改宿主路径不动容器内路径；产物丢失面 = 该目录被清 |
+
+### 10.7 台账名 vs 实现名：两类必须分开讲（#777 批 D2，261128 现验）
+
+> 本表自称「deploy 变量一览（验收锚点）」，但里面**混着两类从来不是环境变量的台账名**：一类是文档自己起的名字（实现里没人读），一类是设计写了、实现没落地的旋钮。
+> 两类都**不删条目**（它们是台账），但必须标清「谁读它」，否则运维照本表填 `deploy/.env` 会填出一行空气。
+> 下面的计数全部用词边界（`grep -rw`），判定口径同 §10.6 判据。
+
+**类 I：文档台账名——实现里没有同名变量（不是「改过名」，是从来没这个 env）**
+
+| 本文用的名字 | 词边界实测：compose / 代码命中 | 实现真正用的名字 |
+|---|---|---|
+| `USER_SPACE_ROOT`（本文 §6 / §9 / §10 多处；条数别抄本行，`grep -cw USER_SPACE_ROOT docs/env.md` 现读） | compose **0** / 代码 **0** | 容器内路径：`ERIX_USERSPACE_ROOT`（`portal/src/config.js:331` 读，compose 以固定值写死）；宿主侧路径：`ERIX_USERSPACE_ROOT_HOST`（compose 插值 4 处）。⇒ 三个名字是**三层**（文档台账 / 容器内 / 宿主侧），不是新旧名 |
+| `DATA_ROOT`（本文 §6 / §9 / §10 多处；同上，现读） | compose **0** / 代码 **0** | 没有同名 env：各条 bind source 各自一根（pg = `STATION_DB_DIR`，边缘 = `TRAEFIK_STATIC_HOST` / `TRAEFIK_DYNAMIC_DIR_HOST`）。`DATA_ROOT` 只是**布局约定**（`<DATA_ROOT>/<名称>/`） |
+| `DB_DATA_DIR`（本文 §10 + 本小节多处） | compose **0** / 代码 **0** | `STATION_DB_DIR`（⇒ §10.6 类 D）——这一格此前是「文档起了个名，实现用了另一个名字」，不是「已改名」 |
+| `TRAEFIK_CONFIG_DIR`（§10 一行） | compose **0** / traefik.yml **0** / 代码 **0** | 无同名 env ⇒ **分类归类 II**（静态配置实挂 `${TRAEFIK_STATIC_HOST}`，见下表）；本行只登记「文档里出现过这个名字」 |
+
+**类 II：设计已写、实现未落地（部署面台账，不许当成现状）**
+
+| 项 | 本文位置 | 现验判据（命令） | 现状 |
+|---|---|---|---|
+| ACME / DNS-01 自动签发（`ACME_EMAIL`、`DNS_PROVIDER` + API token） | §2、§10、附录 A | `grep -n "certificatesResolvers\|acme" deploy/traefik/traefik.yml deploy/docker-compose.yml` ⇒ 只有 compose `:413` 那句「开发期无 acme.json」的注释 | ❌ **未落地**：本仓没有 `certificatesResolvers` 段，已落地的只有「证书由运维手放 + portal `tlsassets` 物化 `dynamic/tls.yml`」（§2 的 2026-11-05 修订已记，本行只补判据） |
+| 分层防火墙（`FIREWALL_ENABLED`、`FIREWALL_RULES_PATH`/`rules.v4`） | §5.3、§10 | `grep -rn "firewall\|rules\.v4\|nft" deploy/docker-compose.yml deploy/traefik/traefik.yml portal/src runner` ⇒ **0 命中** | ❌ **未落地**：§5.3 是**模型**（规则怎么生成），仓库里既没有写 `rules.v4` 的代码，compose 也没挂 `firewall/` 目录；deploy-contract §2.2 的 portal 卷 ③ 也标着「接入防火墙时启用」⇒ 部署时要按 §5.3 手工落规则，平台不会替你落 |
+
+| Traefik 静态配置目录可换（`TRAEFIK_CONFIG_DIR`） | §10 | `grep -rn "TRAEFIK_CONFIG_DIR" deploy portal runner` ⇒ **0** | **未落地**：静态配置是**单文件** bind（`${TRAEFIK_STATIC_HOST:-./traefik/traefik.yml}` → `/etc/traefik/traefik.yml`），不是「目录可换」 |
+> 两类的共同纪律：**条目留着**（它们是「欠的账」，删了就等于账没了），但**取值列不许写成已落地的事实**；要推进就另单做，不许拿「本表已有这一行」当现状。
 
 ---
 
