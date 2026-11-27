@@ -191,7 +191,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 |---|---|---|---|
 | 容器命名 | 项目前缀 + 组件名 | 平台规范固定（规格 §14 已定） | 本平台：`station-edge` / `station-portal` / `station-db`；FDE 容器：`fde-<name>`（如 `fde-alice`） |
 | `DATA_ROOT` | 平台数据 bind mount 根目录，布局为 `<DATA_ROOT>/<名称>/` | 决策者/运维约定 | `/docker`（参考实例 A 的全机统一约定）；如 `/docker/station-db/`（pg data）、`/docker/station-edge/`（traefik 动态配置/证书存储 acme.json） |
-| `USER_SPACE_ROOT` | FDE 用户空间根，布局为 `<USER_SPACE_ROOT>/<fde>/`（宿主路径）；FDE 容器内映射 `/home/<user>`（见 [`design/user-space.md`](design/user-space.md) §2） | 路径结构平台规范固定；具体取值由决策者/运维提供 | `/srv/erix/users`（参考实例 A）；如 `/srv/erix/users/alice/{home,projects,worktrees,cache}` |
+| `USER_SPACE_ROOT` | FDE 用户空间根，布局为 `<USER_SPACE_ROOT>/<fde>/`（宿主路径）；FDE 容器内映射 `/home/<user>`（见 [`design/user-space.md`](design/user-space.md) §2） | 路径结构平台规范固定；具体取值由决策者/运维提供 | `/srv/erix/users`（参考实例 A）；如 `/srv/erix/users/alice/{home,projects,cache}`（v0.1.x 的布局里还有第四项 `worktrees`，已随 D8 修订 + #81 P2.5 拆除 ⇒ [`design/fde-platform.md`](design/fde-platform.md) 附录 A.1；老工位里可能仍有残留目录） |
 | `FDE_CONTAINER_USER` / `FDE_HOME` | 容器内 FDE 用户名与 HOME（user-space.md §2.4；⚠️ 用户名固定 `erix` vs 按 FDE 名，倾向固定 `erix`） | 平台规范固定 | `erix` / `/home/erix` |
 | `ERIX_USERSPACE_ROOT` | portal 运行时读写的用户空间根（**容器内路径**，=`USER_SPACE_ROOT` 的 portal 运行时名；compose 以 `ERIX_USERSPACE_ROOT_HOST` 挂到该路径） | 平台规范固定 | `/srv/erix/users` |
 | `FDE_USER_UID` / `FDE_USER_GID` | FDE 工作区属主 UID/GID（工作区目录属主） | 平台规范固定（user-space.md §6） | `1000` / `1000` |
