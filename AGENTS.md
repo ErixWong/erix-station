@@ -48,7 +48,7 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 | `node --check <file>` | 语法保底（零依赖 Node ESM） |
 | `npm test` | 单测（`node --test`，仓库根）；**判定只认退出码，别 grep 摘要行** |
 | `node --test 'runner/test/*.test.js'` | runner 侧单测（`node --test runner/test/` 在本机 rc=1，是口径不是回归） |
-| `cd portal/frontend && npm run typecheck && npm test` | 前端；**单文件用 `timeout 240 npm test -- src/xxx.spec.ts`**（`npx vitest run <文件>` 本机永久挂死） |
+| `npm run check:frontend` | 前端闸（根目录一条命令 = `typecheck` + `vitest`，**判定只认退出码**，见 `docs/testing.md` §1.2.2）；**单文件用 `timeout 240 npm test -- src/xxx.spec.ts`**（`npx vitest run <文件>` 本机永久挂死） |
 | `docker compose -f deploy/docker-compose.yml up -d` | 本地起平台栈 |
 
 - **测试隔离**：涉及用户配置 / 容器网络的测试必须注入路径参数，不碰真实环境。

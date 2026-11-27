@@ -3,7 +3,7 @@
   "version": "0.1.80",
   "private": true,
   "type": "module",
-  "description": "FDE Station — 给 FDE 用的开发工位平台（宿主平台）",
+  "description": "FDE Station \u2014 \u7ed9 FDE \u7528\u7684\u5f00\u53d1\u5de5\u4f4d\u5e73\u53f0\uff08\u5bbf\u4e3b\u5e73\u53f0\uff09",
   "engines": {
     "node": ">=22"
   },
@@ -30,6 +30,7 @@
     "check:doc-portable": "node scripts/check-doc-portable.mjs",
     "check:ci-legs": "node scripts/check-required-legs.mjs",
     "check:doc-impl": "node scripts/check-doc-impl.mjs",
+    "check:frontend": "env -u NODE_ENV npm --prefix portal/frontend run typecheck && env -u NODE_ENV npm --prefix portal/frontend test",
     "check:integration-syntax": "node scripts/check-integration-syntax.mjs"
   },
   "dependencies": {
