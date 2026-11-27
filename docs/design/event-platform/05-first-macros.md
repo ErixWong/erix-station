@@ -94,7 +94,7 @@ M9（审查）已升入第一版 ⇒ **判决层现在在第一版就有消费�
 |---|---|---|---|---|
 | **M1** | `run-terminal-notify` | **会话** | E1 终态（边沿） | A5 站内通知（可选 A4 邮件） |
 | **M8** | `run-silence-alert` | **会话** | E1 `run.silent`（**状态**）+ 参数 `threshold` | A5 通知 + 停止链接 |
-| **M9** | `run-review` | **会话** | E1 终态（边沿） | 起审查 run（worktree + 只读）→ 一句话回灌 |
+| **M9** | `run-review` | **会话** | E1 终态（边沿） | 起审查 run（**读活目录** `~/projects/<项目名>` + 只读）→ 一句话回灌（v0.1.x 写的是「worktree + 只读」，**#690 起不再建快照/worktree** ⇒ [08](08-watch-and-review.md) §5.1） |
 | **M7** | `scheduled-task` | **用户** | E5 `tick(HH:MM)`（**状态**） | A3 起一个 run（宏会话复用） |
 
 ⚠ **M9 是 2026-11-15 新增**（见 [08](08-watch-and-review.md) §9）：审查从「后续候选」升入第一版。
