@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setActivePinia, createPinia } from 'pinia';
 import { flushPromises } from '@vue/test-utils';
-import { useAuthStore, NO_SESSION_LOCALE_OWNER } from './auth';
+import { useAuthStore } from './auth';
 import { i18n, LOCALE_STORAGE_KEY, LOCALE_USER_CHOSEN_KEY, setLocale } from '../i18n';
 import { readLocaleCookie } from '../lib/localeCookie';
 
@@ -26,6 +26,9 @@ function fetchMock(handler: (url: string, init?: RequestInit) => Response | Prom
 function resetLocale(to: 'zh-CN' | 'en') {
   localStorage.clear();
   document.cookie = 'locale=; Path=/; Max-Age=0';
+  // #902 ①：`fromUser` 现在会额外写一个跨子域的 `locale_chosen` 标记 cookie；基线前必须一并清，
+  // 否则上个用例立过的标记会泄到下个用例，把「新设备」类用例误判成「已点过」。
+  document.cookie = 'locale_chosen=; Path=/; Max-Age=0';
   setLocale(to);
 }
 
@@ -34,10 +37,15 @@ function resetLocale(to: 'zh-CN' | 'en') {
  * #828 新语义下，账号语言值只在「本地没表过态」时生效——验证「应用账号值」一类用例
  * 必须先走到这个态（模拟换设备 / 清了站点数据），否则 beforeEach 留下的 cookie+localStorage
  * 会被当成「已表过态」而拦住账号值。每个用例开头都会 resetLocale，彼此不串台。
+ *
+ * #902 ①：「清站点数据」在这里就是 cookie 与 localStorage **一起清**，所以连 #902 新加的
+ * `locale_chosen` 标记 cookie 也要一起清——否则「清站点后回到新设备」用例会因为残留的标记 cookie
+ * 而认为「还是点过」，账号值就不会重新生效。
  */
 function clearLocalLocale() {
   localStorage.clear();
   document.cookie = 'locale=; Path=/; Max-Age=0';
+  document.cookie = 'locale_chosen=; Path=/; Max-Age=0';
 }
 
 beforeEach(() => {
@@ -93,6 +101,29 @@ describe('#828 登录后应用账号语言', () => {
     expect(readLocaleCookie()).toBe('zh-CN');
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('zh-CN');
     expect(setItem).not.toHaveBeenCalled(); // setLocale 没被账号值调用（去掉「用户点过就不抢」那道判断即变红）
+  });
+
+  it('#902 ① 跨 host：localStorage 无标记、只有 locale_chosen cookie 标记 ⇒ 账号值不抢（标记与偏好同作用域）', async () => {
+    // 复现 #902 ① 的真实后果：在**另一个 origin**（用户面）点过开关 ⇒ 跨子域的 `locale_chosen`
+    // cookie 在，但**这台 host 的 localStorage 没有** `locale.userChosen`（localStorage 按 origin 隔离）。
+    // 只要标记与 `locale` 偏好同为跨子域 cookie，`hasUserChosenLocale` 取「或」就能在这台 host 看到标记
+    // ⇒ 账号默认语言不再抢那份共享 cookie。
+    localStorage.clear();
+    document.cookie = 'locale=; Path=/; Max-Age=0';
+    document.cookie = 'locale_chosen=; Path=/; Max-Age=0';
+    setLocale('zh-CN'); // 当前界面 zh-CN（不带 fromUser ⇒ localStorage 里**没有**标记）
+    document.cookie = 'locale_chosen=1; Path=/'; // 只放跨子域可见的那一份：cookie 有、localStorage 没有
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBeNull();
+    const setItem = vi.spyOn(Storage.prototype, 'setItem'); // 基线写发生在 spy 之前
+    vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
+    const auth = useAuthStore();
+    await auth.refreshMe(); // /api/me 账号值是过期的 en
+    // 判据走 cookie 那份标记 ⇒ 不抢：界面/载体都停在 zh-CN，且 setLocale 没被账号值调用（断 store/DOM/请求桩，不只看函数返回值）。
+    expect(i18n.global.locale.value).toBe('zh-CN');
+    expect(readLocaleCookie()).toBe('zh-CN');
+    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('zh-CN');
+    // 把 hasUserChosenLocale 退回「只读 localStorage」（不看 cookie）⇒ 这条必红（标记只在 cookie 里）。
+    expect(setItem).not.toHaveBeenCalled();
   });
 
   it('清掉标记与载体后回到「新设备」⇒ 账号值重新生效（哪怕之前点过开关）', async () => {
@@ -211,23 +242,30 @@ describe('#828 pendingLocaleWrite 账号归属与登出/失效清理', () => {
     expect(urls.filter((u) => u === '/api/me/locale')).toHaveLength(0); // 一枪都不发
   });
 
-  it('哨兵（无主）pending ⇒ 谁先就绪就补发给谁（登录后的第一个人照发）', async () => {
+  it('#902 ② 无会话时点开关 ⇒ 不发请求、pendingLocaleWrite 仍为 null（不再记无主哨兵）', async () => {
+    // 新语义（#902 ②）：登录页 / 受限态切语言是**这台设备**的偏好，不是某个人的账号偏好；
+    // 要给账号写就登录后再点一次。所以无会话时 LocaleSwitch **不记 pending**。
+    // 这里钉它的下游后果：点过 ⇒ 没排队（pending 仍 null），即便下一个会话（BOB）就绪，
+    // flushPendingLocale 也无 pending 可发 ⇒ 零请求。这正是去掉旧 `NO_SESSION_LOCALE_OWNER`
+    // 「无主→谁先就绪发给谁」放行后要钉的性质：共享设备上「我切语言」不再写进「下一个登录者」的账号。
     const auth = useAuthStore();
-    auth.pendingLocaleWrite = { login: NO_SESSION_LOCALE_OWNER, locale: 'en' };
-    auth.user = { ...BOB }; // login 与哨兵不同，但哨兵=无主 ⇒ 允许补发
+    auth.user = null; // 无会话：LocaleSwitch 此时不会记 pending
     const fetchFn = fetchMock(() => json(200, {}));
     vi.stubGlobal('fetch', fetchFn);
-    await auth.flushPendingLocale();
+    expect(auth.pendingLocaleWrite).toBeNull(); // 无会话点开关的落点：根本没排队
+    await auth.flushPendingLocale(); // 无 user ⇒ 直接返回
+    auth.user = { ...BOB }; // 下一个就绪的会话（换人）
+    await auth.flushPendingLocale(); // 无 pending ⇒ 不发
     await flushPromises();
     const urls = fetchFn.mock.calls.map((c) => (typeof c[0] === 'string' ? c[0] : ''));
-    expect(urls.filter((u) => u === '/api/me/locale')).toHaveLength(1); // 无主→发一次
-    expect(auth.pendingLocaleWrite).toBeNull();
+    expect(urls.filter((u) => u === '/api/me/locale')).toHaveLength(0); // 一枪都不发
+    expect(auth.pendingLocaleWrite).toBeNull(); // 仍然 null
   });
 
   it('会话就绪后延迟补发 flushPendingLocale 失败 ⇒ 发了 PATCH 但 localeSyncFailed=true、pending 已清', async () => {
-    // 前置：会话未就绪时记下选择（无主哨兵，谁先就绪补发给谁）。
+    // 前置：有会话时记下的选择（#902 ②：归属=当前登录人的真实 login，不再是无主哨兵）。
     const auth = useAuthStore();
-    auth.pendingLocaleWrite = { login: NO_SESSION_LOCALE_OWNER, locale: 'en' };
+    auth.pendingLocaleWrite = { login: 'bob', locale: 'en' }; // 归属与下面就维的 BOB 一致 ⇒ flush 会真发一枪
     // 让 user 就绪（BOB 无 locale，与待补发 en 不同）⇒ flush 会真发一枪。
     auth.user = { ...BOB };
     // 这一枪桩返回 500（api() 会抛 ApiError ⇒ catch 里置 localeSyncFailed=true）。

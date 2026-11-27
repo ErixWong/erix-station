@@ -15,13 +15,6 @@ import { notifyUserScopeReset } from '../lib/userScope';
 // （不能用「载体里有没有值」当判据：`setLocale` 双写载体，账号种子初次登录就把载体填满了，判据会恒真。）
 import { i18n, isAppLocale, setLocale, hasUserChosenLocale, type AppLocale } from '../i18n';
 
-/**
- * #828 复核查：`pendingLocaleWrite` 在「还没有会话」时记录用的**归属哨兵**（登录页 / 跨 origin
- * 导航后 `/api/me` 还没回）。故意用一个真实登录名不可能出现的值（含 NUL），**不用空串**冒充登录名，
- * 以免与「无主」和「某个 login 为空的真人」混淆：哨兵表示「无主，谁先就绪就补发给谁」（还是切语言那个人）。
- */
-export const NO_SESSION_LOCALE_OWNER = '\u0000nosession';
-
 export interface AuthUser {
   id: string;
   login: string;
@@ -276,9 +269,12 @@ export const useAuthStore = defineStore('auth', {
      * 的选择。导航到另一个 origin 后立刻点语言 ⇒ pinia 的 `/api/me` 探测还没回 ⇒ `user` 为 null
      * ⇒ 直接发会刷 401，不发又会把过期值留在账号里。这里先记下，等 `/api/me` 回来（或登录成功）
      * 后由 `flushPendingLocale()` 补发一次。`null` = 没有待补发的选择。
-     * #828 复核查：带**账号归属**（`login`）——无会话时用 `NO_SESSION_LOCALE_OWNER` 哨兵占位；换账号后
+     * #828 复核查：带**账号归属**（`login`）——无会话时不再记（#902 ②：旧哨兵 `NO_SESSION_LOCALE_OWNER` 已删）；换账号后
      * 归属对不上的待补发会被丢弃，不替下一个人改偏好（见 `flushPendingLocale` 与 `logout` / 失效路径的清理）。
      */
+    // #902 ②（边界，故意不实现）：pendingLocaleWrite 是内存态、刷新即丢——刷新后本地语言靠
+    // cookie/localStorage 保住但不回写账号；故意不持久化，否则会把刷新前那个过期选择带过去
+    // （#828 P2b 修过的那类跨会话污染）。要给账号写就登录后再点一次。
     pendingLocaleWrite: null as { login: string; locale: AppLocale } | null,
     // #828 复核查：最后一次 `PATCH /api/me/locale` 是否失败（不回滞到界面、不弹窗，仅供顶栏显示
     // 一行小字「语言偏好未保存到账号」）。任何一次新回写尝试开始都先置 false；成功保持 false。
@@ -345,15 +341,16 @@ export const useAuthStore = defineStore('auth', {
      * 一刻已经切过去了，补发只是把账号里那份过期值纠正回来，不是用户能在界面上修的东西。
      *
      * #828 复核查：pending 带**账号归属**——记时是另一个真人（login 与当前用户不同）⇒ 直接丢弃不发，
-     * 不替新账号改偏好；哨兵 `NO_SESSION_LOCALE_OWNER` 表示无主（记时还没会话），谁先就绪补发给谁。
+     * 不替新账号改偏好。（#902 ②：已删「无主哨兵」放行——登录页无会话时根本不会记 pending，
+     * 所以这里只剩一条判据：pending 的 login 必须与当前用户一致才补发。）
      */
     async flushPendingLocale(): Promise<void> {
       const pending = this.pendingLocaleWrite;
       if (!pending) return;
       if (!this.user) return; // 还没拿到 user：留着，等有 user 的那次再补
-      // #828 复核查：带归属——只有记时是「无主哨兵」或 login 与当前用户一致才补发。
-      // 记时是另一个真人（A）而现在站着 B ⇒ 这是 A 的选择，不发、直接丢弃（不替 B 改偏好）。
-      if (pending.login !== NO_SESSION_LOCALE_OWNER && pending.login !== this.user.login) {
+      // #902 ②：只剩一条归属判据——记时那个真人（A）而现在站着 B（login 不同）⇒ 这是 A 的选择，
+      // 不发、直接丢弃（不替 B 改偏好）。旧的「无主哨兵也算」那条放行已删（无会话时不再记 pending）。
+      if (pending.login !== this.user.login) {
         this.pendingLocaleWrite = null; // 归属对不上：这是另一个人的选择，不发、直接丢弃
         return;
       }

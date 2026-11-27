@@ -9,8 +9,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { setLocale, type AppLocale } from '../i18n';
-import { api } from '../api';
-import { useAuthStore, NO_SESSION_LOCALE_OWNER } from '../stores/auth';
+import { useAuthStore } from '../stores/auth';
 
 const { t, locale } = useI18n();
 
@@ -39,50 +38,43 @@ const currentLabel = computed(() => {
 });
 
 function select(value: AppLocale) {
-  // 用户亲自点开关 ⇒ 传 fromUser，立 `locale.userChosen` 标记（#828）：这台浏览器之后不再被
-  // 账号默认语言抢走（账号种子不传 fromUser，两件事分开）。回写旁路见下方 syncAccountLocale。
+  // 用户亲自点开关 ⇒ 传 fromUser，立 `locale.userChosen` 标记 + 同作用域的 `locale_chosen` cookie
+  // （#828 / #902 ①）：这台浏览器之后不再被账号默认语言抢走（账号种子不传 fromUser，两件事分开）。
+  // 回写旁路见下方 syncAccountLocale。
   setLocale(value, { fromUser: true });
   open.value = false;
-  // #828：已登录时把这次选择回写到账号（登录后 / 换设备自动沿用）。未登录不发，免得刷 401。
+  // #828 / #902 ②：只有登录态才会把这次选择回写账号；未登录只落本地（见 syncAccountLocale）。
   // fire-and-forget：切换已经在上面生效，回写只是旁路。
   void syncAccountLocale(value);
 }
 
 /**
- * #828：把用户面/管理台的顶栏语言切换回写到 `PATCH /api/me/locale`。
+ * #828 / #902 ②：把顶栏语言切换回写到账号（经 store 的 `flushPendingLocale` 发 `PATCH /api/me/locale`）。
  *
- * 两种就绪状态分开处理：
- * - **已登录**（`auth.user` 存在）：直接发 PATCH。**失败静默**：界面已经切过去了，
- *   这不是用户能在界面上修的东西，不弹红条、不打断切换。无 pinia（如纯组件测试）⇒ 当作未就绪，不发。
- * - **未就绪**（`auth.user` 为 `null`）：照旧**不发**（登录页 / 刚导航到另一个 origin 后 pinia
- *   的 `/api/me` 探测还没回来时发只会刷 401），但把这次选择记进 `pendingLocaleWrite`，等会话
- *   就绪后由 store 的 `flushPendingLocale()` 补发一次。不记就会把选择丢在 cookie 里、账号里留着过期值
- *   （#828 真机腿抓的回写丢失缺陷）。
+ * #902 ②：**只有当前有登录用户时**才记 `pendingLocaleWrite`（带当前 login），再交给
+ * `flushPendingLocale()` 补发。三种落点分开：
+ * - 无激活 pinia（纯组件测试 / 无会话挂载）⇒ 不发、不记。
+ * - **无会话**（`auth.user` 为 `null`，含登录页 / 强制改密屏 / 刚导航到另一 origin 后 `/api/me` 未回）：
+ *   **只落本地、一枪都不发、也不记 pending**。为什么不再像旧代码那样记一个「无主哨兵」等补发：
+ *   登录页切的是**这台设备**的偏好，不是某个人的账号偏好；旧哨兵会被 flushPendingLocale 当成
+ *   「无主，谁先就绪发给谁」⇒ 共享设备上「我切语言，写进下一个登录者的账号」（#902 ② 的缺陷）。
+ *   要给账号写就登录后再点一次（pending 是内存态、刷新即丢，见 store 的 #902 ② 边界注释）。
+ * - **已登录**：记 pending 带当前 login，随即 flushPendingLocale 补发这一枪（就绪 ⇒ 会发；登录态下
+ *   `user.login` 与 pending 一致 ⇒ 通过归属检查）。失败静默（flushPendingLocale 内已置 localeSyncFailed）。
  */
 async function syncAccountLocale(value: AppLocale): Promise<void> {
   let auth: ReturnType<typeof useAuthStore>;
   try {
     auth = useAuthStore();
   } catch {
-    return; // 无激活的 pinia（登录页以外的挂载形式）⇒ 不发
+    return; // 无激活的 pinia（登录页以外的挂载形式）⇒ 不发、也不记
   }
-  // #828 复核查：在分支前取**当时的归属**（有会话取当前 login，没会话用哨兵），供下面记 pending 用。
-  const ownerAtRecord = auth.user?.login ?? NO_SESSION_LOCALE_OWNER;
-  if (!auth.user) {
-    // 未就绪：不发（登录页不该发），但记下这次选择，等 /api/me 回来补发（缺陷①的补链）。
-    // 没会话 ⇒ ownerAtRecord 就是 NO_SESSION_LOCALE_OWNER（无主，谁先就绪补发给谁）；这样登出/
-    // 换账号后 `flushPendingLocale` 能把上一位记的、与当前用户不同归属的待补发丢弃。
-    auth.pendingLocaleWrite = { login: ownerAtRecord, locale: value };
-    return;
-  }
-  // #828 复核查：下一次回写尝试开始 ⇒ 先复位失败旗标（提示随之消失），失败再置 true（提示重现）。
-  auth.localeSyncFailed = false;
-  try {
-    await api('/api/me/locale', { method: 'PATCH', body: JSON.stringify({ locale: value }) });
-  } catch {
-    // #828 复核查：静默不打断（切换已生效、不弹红条），但把「账号没存上」记进可见旗标供顶栏提示。
-    auth.localeSyncFailed = true;
-  }
+  const user = auth.user;
+  if (!user) return; // 无会话 ⇒ 只落本地（setLocale 已写 cookie+localStorage+标记），不发、不排队（#902 ②）
+  // 有登录用户 ⇒ 记 pending 带当前 login，再立即补发（就绪 ⇒ flushPendingLocale 会发这一枪；
+  // 失败也只在 store 里置 localeSyncFailed，不打断切换）。
+  auth.pendingLocaleWrite = { login: user.login, locale: value };
+  await auth.flushPendingLocale();
 }
 
 // 外部点击收起（点击组件内部元素不收起；mousedown 之外用 click 以兼容键盘触发）。
