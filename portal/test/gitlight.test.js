@@ -1,7 +1,7 @@
 // 单测：gitlight.js（issue #359 P0a「收工灯」判定，决策见 AGENTS.md §7 D9）。
 // 隔离约定（docs/testing.md §2.1）：tmp 目录注入 userSpaceRoot；真实 git 建夹具（本机有 git，
 // 与 portal 装了 git 后的运行前提一致）；不碰真实用户空间。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -18,12 +18,31 @@ function git(args, cwd) {
   return execFileSync('git', [...GIT_ID, ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
+/** 夹具一律 mkdtemp；收尾由下方 afterEach 统一 rm（见 tmpRoots）。 */
 function tmpUserspace() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-gitlight-'));
+  const root = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-gitlight-')));
   const projects = path.join(root, 'alice', 'projects');
   fs.mkdirSync(projects, { recursive: true });
   return { root, projects };
 }
+
+// ---- 夹具生命周期：一律 mkdtemp + afterEach rm，不依赖进程退出清理 ----
+// 本文件里每一个自己建的 /tmp 目录都进 tmpRoots；漏一个就会在 /tmp 留下 erix-gitlight-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字。唯一不许搬进 mkdtemp 的钉死是
+// 「root is a symlink to elsewhere outside the user space ⇒ 404」：它的 fixture 是建在
+// **root 里面**的（tmpUserspace 的 mkdtemp 根下），本来就不另开 /tmp 目录，无需搬。
+const tmpRoots = [];
+function trackTmp(dir) {
+  tmpRoots.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpRoots.length > 0) {
+    // 不用 force 吞错：rm 失败就当场报，不拿“尽力了”冒充清干净了。
+    fs.rmSync(tmpRoots.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 /** 在 projects/<name> 建一个仓库；opts.commits>0 时写 N 个提交并干净收尾。 */
 function makeRepo(projects, name, { commits = 0, remote = null } = {}) {
