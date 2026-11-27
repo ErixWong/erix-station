@@ -4,10 +4,12 @@
 // 读得回来」。测试里的 hostname 是夹具字面量（闸只扫注释行）。
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  LOCALE_CHOSEN_COOKIE_NAME,
   LOCALE_COOKIE_MAX_AGE,
   LOCALE_COOKIE_NAME,
   clearLocaleCookie,
   localeCookieDomainOf,
+  readLocaleChosenCookie,
   readLocaleCookie,
   serializeLocaleCookie,
   writeLocaleCookie,
@@ -15,7 +17,15 @@ import {
 
 /** 清干净 jar：本模块的名字 + 用例里当噪声用的其它名字（jsdom 的 document.cookie 同文件共享）。 */
 function wipeCookies() {
-  for (const name of [LOCALE_COOKIE_NAME, 'other', 'x']) {
+  // #902 ① 之后本模块有两个 cookie（`locale` 与 `locale_chosen`），噪声名字也会随用例增加；
+  // 手写清单漏一个就会让后面的用例被前面写进 jar 的值污染（实测就是这么抓到漏清的）。
+  // 所以按 jar 现状枚举，再并上这几个已知名字（万一某个只在带 Domain 的属性下写过）。
+  const names = new Set([LOCALE_COOKIE_NAME, LOCALE_CHOSEN_COOKIE_NAME, 'other', 'x']);
+  for (const pair of (document.cookie || '').split(';')) {
+    const idx = pair.indexOf('=');
+    if (idx > 0) names.add(pair.slice(0, idx).trim());
+  }
+  for (const name of names) {
     document.cookie = `${name}=; Path=/; Max-Age=0; SameSite=Lax`;
   }
 }
@@ -85,6 +95,33 @@ describe('jsdom 往返（写进 jar 后读得回来）', () => {
     document.cookie = `${LOCALE_COOKIE_NAME}=en; Path=/`;
     document.cookie = 'x=2; Path=/';
     expect(readLocaleCookie()).toBe('en');
+  });
+
+  // #902 评审：`readCookieValue` 现在是 `locale` 与 `locale_chosen` 共用的通用解析器，
+  // 边界必须有钉子 —— 它一旦从「完整名比较」退化成「前缀匹配」，两个名字就会互相串（而
+  // `locale_chosen` 决定「账号默认语言要不要抢」，串了就是行为缺陷，不是难看）。
+  it('名字不许前缀误命中：xlocale_chosen / locale_chosenX 都不是 locale_chosen', () => {
+    document.cookie = 'xlocale_chosen=0; Path=/';
+    document.cookie = 'locale_chosenX=0; Path=/';
+    expect(readLocaleChosenCookie()).toBe(false); // 只写了别人的名字 ⇒ 自己那一份确实没有（解析器若退化成前缀匹配，这条会因 `xlocale_chosen=0` 里那个 0 而说不清，所以再补一条下面那种）
+    document.cookie = `${LOCALE_CHOSEN_COOKIE_NAME}=1; Path=/`;
+    expect(readLocaleChosenCookie()).toBe(true); // 真写上了才读得到（前缀那两条没把它盖掉）
+  });
+
+  it('别人名字的值恰好也是 1 时不许被认成自己（钉「子串匹配」退化：前缀退化由上面两条钉）', () => {
+    document.cookie = 'xlocale_chosen=1; Path=/';
+    document.cookie = 'zzz_locale_chosen=1; Path=/';
+    expect(readLocaleChosenCookie()).toBe(false); // 自己那一份没写 ⇒ false；退化成前缀/子串匹配就会误判 true
+  });
+
+  it('值里带 = 不被截断、串首/串中/串尾都读得到（jar 里别的 cookie 挤在前后）', () => {
+    document.cookie = 'a=1; Path=/';
+    document.cookie = `${LOCALE_CHOSEN_COOKIE_NAME}=1; Path=/`;
+    expect(readLocaleChosenCookie()).toBe(true); // 串中
+    document.cookie = 'b=c=d; Path=/';
+    expect(readLocaleChosenCookie()).toBe(true); // 别人的值里带 = 也不影响自己
+    document.cookie = `${LOCALE_COOKIE_NAME}=a%20b; path=/`;
+    expect(readLocaleCookie()).toBe('a b'); // 自己的值里带编码空格 ⇒ 原样解回
   });
 
   it('编码过的脏值原样解回（读回来的合法性由调用方 isAppLocale 判定）', () => {

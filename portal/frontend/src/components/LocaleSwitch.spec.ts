@@ -7,7 +7,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import LocaleSwitch from './LocaleSwitch.vue';
 import { LOCALE_STORAGE_KEY, LOCALE_USER_CHOSEN_KEY, createAppI18n, detectLocale, i18n, setLocale } from '../i18n';
 import { clearLocaleCookie, readLocaleCookie, writeLocaleCookie } from '../lib/localeCookie';
-import { useAuthStore, NO_SESSION_LOCALE_OWNER } from '../stores/auth';
+import { useAuthStore } from '../stores/auth';
 
 function mountSwitch(): VueWrapper {
   return mount(LocaleSwitch, { global: { plugins: [i18n] } });
@@ -32,6 +32,9 @@ beforeEach(() => {
   // 否则默认态就带着一份 cookie 偏好，会把「localStorage 优先于浏览器语言」这类用例挤到 cookie
   // 分支上去。jsdom 的 document.cookie 在同一文件里是共享的，不清就会跳用例污染。
   clearLocaleCookie();
+  // #902 ①：登录态用例里 setLocale(fromUser) 会多写一份 `locale_chosen` 标记 cookie；基线前一并清，
+  // 避免跳用例残留（本文件不直接断这个标记，但保持 jar 干净与 auth-locale.spec 同口径）。
+  document.cookie = 'locale_chosen=; Path=/; Max-Age=0';
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -177,7 +180,7 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
     expect(w.find('[role="alert"]').exists()).toBe(false); // 不弹红条
   });
 
-  it('未登录点 English ⇒ 一个请求都不发（切换仍只落 cookie+localStorage）', async () => {
+  it('未登录点 English ⇒ 一个请求都不发（只落本地，#902 ② 不再记 pending）', async () => {
     const calls = stubFetch(() => new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
     const w = mountWithAuth(false);
     await pick(w, 'English');
@@ -185,21 +188,25 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
     expect(calls).toHaveLength(0);
     expect(i18n.global.locale.value).toBe('en'); // 本地切换照常生效
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
-    // #828 缺陷①：未就绪时不发，但这次选择不能丢——必须记进 pendingLocaleWrite 等补发。
-    // #828 复核查：带归属——无会话时 login 是 NO_SESSION_LOCALE_OWNER 哨兵。
-    expect(useAuthStore().pendingLocaleWrite).toEqual({ login: NO_SESSION_LOCALE_OWNER, locale: 'en' });
+    // #902 ②：无会话点开关是**这台设备**的偏好，不是某个人的账号偏好 ⇒ **不记 pending**。
+    // 旧代码会记一个 NO_SESSION_LOCALE_OWNER 哨兵、留给「下一个登录者」⇒ 共享设备上替别人写账号。
+    expect(useAuthStore().pendingLocaleWrite).toBeNull();
   });
 
-  it('未就绪点 English ⇒ 不发；/api/me 回来后补发一次 PATCH body {"locale":"en"}（缺陷①的钉子）', async () => {
+  it('#902 ② 无会话（未就绪）点 English ⇒ 不发也不记 pending；/api/me 回来后仍 0 PATCH（不替下一个人补发）', async () => {
+    // 旧代码的「未就绪 ⇒ 记无主哨兵 ⇒ /api/me 回来后补发」这条链在 #902 ② 被拆掉：
+    // 无会话（登录页 / 刚导航到另一 origin 后 pinia 的 /api/me 探测还没回）⇒ **不记 pending**。
+    // 因而 ensureMe 把会话拉回来后，flushPendingLocale 无 pending 可发 ⇒ 全程零 PATCH。
+    // 要把这个选择写进账号，得登录后再点一次（pending 是内存态、刷新即丢，故意不持久化）。
     const pinia = createPinia();
     setActivePinia(pinia);
     const auth = useAuthStore();
-    auth.user = null; // 未就绪（导航后 pinia 的 /api/me 探测还没回）
+    auth.user = null; // 无会话（导航后 pinia 的 /api/me 探测还没回）
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       calls.push({ url, init });
-      // /api/me 回来带一个与待补发值不同的过期账号值（zh-CN）；PATCH 一律 200。
+      // /api/me 回来带一个与当前不同的账号值（zh-CN）；PATCH 一律 200（本例应一次 PATCH 都不发）。
       if (url === '/api/me') {
         return new Response(JSON.stringify({ user: { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local', locale: 'zh-CN' } }),
           { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -210,16 +217,14 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
 
     await pick(w, 'English');
     await flushPromises();
-    expect(calls.filter((c) => c.url === '/api/me/locale')).toHaveLength(0); // 未就绪：一个回写都不发
-    expect(auth.pendingLocaleWrite).toEqual({ login: NO_SESSION_LOCALE_OWNER, locale: 'en' }); // 选择被记下，没丢
+    expect(calls.filter((c) => c.url === '/api/me/locale')).toHaveLength(0); // 无会话：一个回写都不发
+    expect(auth.pendingLocaleWrite).toBeNull(); // #902 ②：选择只落本地，不再排队
 
-    await auth.ensureMe(); // /api/me 回来 ⇒ 会话就绪
+    await auth.ensureMe(); // /api/me 回来 ⇒ 会话就绪（alice）
     await flushPromises();
-    const patch = calls.filter((c) => c.url === '/api/me/locale');
-    expect(patch).toHaveLength(1); // 只补发一次
-    expect(patch[0].init?.method).toBe('PATCH');
-    expect(JSON.parse(String(patch[0].init?.body))).toEqual({ locale: 'en' });
-    expect(auth.pendingLocaleWrite).toBeNull(); // 补发后清空
+    // 就绪后也没有 pending 可补发 ⇒ 仍零 PATCH（不把无会话那一下塑给这个账号）。
+    expect(calls.filter((c) => c.url === '/api/me/locale')).toHaveLength(0);
+    expect(auth.pendingLocaleWrite).toBeNull();
   });
 
   it('已登录点 English ⇒ PATCH body {"locale":"en"}，且写入 locale.userChosen 标记', async () => {
