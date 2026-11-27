@@ -114,7 +114,9 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 5. **stacked PR 一开始就 `--base main`**，或下层合并后**先别删分支**再改上层 base
    （base 分支被删会让 GitHub 直接关闭上层 PR，且 reopen / `--base` 都救不回来）
 
-需要第二意见时按需调 copilot_cli 复核（用法按全局 `~/projects/AGENTS.md`）。
+需要第二意见 ⇒ 见全局 `~/projects/AGENTS.md` §3.1：**代码 PR 必须在合并前**有独立第三方评审
+（评审结论逐条现验：属实才修，不属实记裁决理由）。**合并之后再审只能落成补修 PR，不再是闸门**；
+模型与权限档用法按全局 §2。**文档 / 配置类 PR 可免。**
 
 ## 7. 已定架构决策（详见 docs/design/fde-platform.md 附录 A）
 
