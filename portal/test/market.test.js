@@ -6,7 +6,7 @@
 //
 // ⚠ fake pool 按 **SQL 指纹**分派（不是按调用顺序）：market.js 的每条查询都带唯一表名/列组合，
 // 命中不了的语句直接抛 —— 有人改 SQL 而没改 fake 时，测试当场红，而不是静默拿到空行。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -23,6 +23,23 @@ import {
 } from '../src/market.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本单只点名 harness() 的 market-test-（market-spawn- 等其余站点本单不动）。
+// force 是必需的：harness 自己的 after()（各用例的 finally）已 rm 过同一个 userSpaceRoot，
+// 这里再清一道必须容忍「已经没了」；真漏了（某条用例没走 finally）仍会漏在 /tmp 被 #875 的闸抱住。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 /** 读被测源文件本身（结构判据用）：这些判据问的是「代码里还有没有某个写法」，不是行为。 */
 const srcOf = (rel) => fs.readFileSync(path.join(HERE, rel), 'utf8');
 const MARKET_SRC = srcOf('../src/market.js');
@@ -257,7 +274,7 @@ class MarketFake {
 
 async function harness({ publish = true, slug = 'demo-skill', state = 'published' } = {}) {
   const pool = new MarketFake();
-  const userSpaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'market-test-'));
+  const userSpaceRoot = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'market-test-')));
   const config = { userSpaceRoot, fdeUid: null, fdeGid: null };   // null ⇒ 不去 chown（非 root 测试环境）
   const fde = { id: 'fde-1', name: 'alice' };
   const after = () => fs.rmSync(userSpaceRoot, { recursive: true, force: true });
