@@ -1474,7 +1474,7 @@ async function onWorkerFinished(ctx, msg) {
  * / `status --porcelain` / `readFileSync` 快照，不写不 checkout；落盘在 portal 侧
  * `putRunArtifact`（portal/src/artifacts.js:65-103）写 `config.artifactsRoot/<runId>.tar.gz`，
  * 默认 `/srv/erix/artifacts`（portal/src/config.js:309，portal 持久卷 bind mount），
- * **不在用户空间**（不碰 `~/projects`）。⇒ 审查 run 上传产物 = 读 worktree + 写平台卷，
+ * **不在用户空间**（不碰 `~/projects`）。⇒ 审查 run 上传产物 = 读**项目目录**（审查 run 的 cwd，D8 修订后没有 worktree 这层）+ 写平台卷，
  * 不弄脏用户目录，且产物本身就是审查要看的东西——跳过反而丢审查面。
  */
 async function captureRunArtifact(ctx) {

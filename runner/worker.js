@@ -923,7 +923,7 @@ async function startRun(msg) {
   // `[...fileTools.schemas, ...shellTools.schemas]`（见下 childTools），**不是从父 registry
   // 过滤出来的** ⇒ 父的只读过滤（装配点①②）传不到子；而子 run 自带 shell（`bash -c` 无白名单）。
   // ⇒ 审查 run 只要环境 `ERIX_DELEGATE_ENABLED=1`（FDE 全局开）就能
-  // `delegate("跑 shell 把 ~/projects/foo 读出来")` 让子 run 拿 shell 逃逸出 worktree。
+  // `delegate("跑 shell 把 ~/projects/foo 读出来")` 让子 run 拿 shell 逃逸出**项目目录**（#887 口径：本站没有 worktree 这层）。
   // 关掉后 `delegation` 保持 null ⇒ executeTool 里 `delegation !== null` 那条 delegate 路由自然不通。
   if (delegateEnabled && !reviewOnly) {
     const delegateMax = parseDelegateMax(process.env.ERIX_DELEGATE_MAX);
