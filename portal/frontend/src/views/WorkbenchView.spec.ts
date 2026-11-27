@@ -342,6 +342,87 @@ describe('issue #281：onMounted 的 await 失败 ⇒ 零未捕获拒绝 + 界�
     expect(line).not.toContain('[object Object]');
     expect(leaked.map(describeRejection), `泄漏 ${leaked.length} 条未捕获拒绝`).toEqual([]);
   });
+
+  // =========================================================================
+  // issue #863：上面全部钉的是 `onMounted` 那两路。**点击/换会话那两路当时没有兜底**：
+  //   ① `watch(() => route.params.id)` 里的 `await store.resolveRouteSession(...)`——Vue **不等
+  //      watcher 返回的 Promise**（与 #281 注释里 onMounted 那条同一个道理）；
+  //   ② `onSelectSession()` 的同会话分支 `await store.openSession(id)`，两个调用方（`:156` 的
+  //      `void onSelectSession(id)` 与侧栏模板绑定 `@select-session="onSelectSession"`）都把 Promise 丢掉。
+  // 边界（不要越界理解）：`openSession`/`resolveRouteSession` 内部**已经**catch 了 `ApiError` 并推 syserr
+  // （判据 stores/workbench.spec.ts:819），本组只管**形状意外 / 环境级意外**——这里用「`new EventSource`
+  // 同步抛」（例：webview 里没有 EventSource，useEventStream.ts:643）当载体，它是 openSession 的**收尾**
+  // 一步，前面的详情往返都成功了，所以 store 内部那道 ApiError catch 接不到它。
+  // 断言口径照本文件既有惯例：只看**界面上的 syserr** + **零未捕获拒绝**；不用 `w.emitted()`
+  // （AGENTS §4：`$emit` 在这里只当**输入**触发，不是被断言的输出）。
+  // =========================================================================
+  describe('issue #863：点击/换会话那两路 await 也必须收尾（零未捕获拒绝 + 可见错误）', () => {
+    // 成功的会话详情（`openSession` 收尾要用的字段都给全，唯一会炸的留给 EventSource）。
+    const okSessionDetail = (id: string): Reply => ({
+      status: 200,
+      body: {
+        session: { id, title: `会话 ${id}`, cwd: DIRS[0].cwd, active_run_id: null, message_count: 0 },
+        messages: [], last_seq: 0,
+      },
+    });
+    /** 能正常连上的假 EventSource：让**挂载阶段**（onMounted 深链）干净落地，再由用例换成会抛的那一个。 */
+    class OkES {
+      closed = false;
+      constructor(public url: string) {}
+      addEventListener() {}
+      close() { this.closed = true; }
+    }
+    /** 环境级意外：`new EventSource(...)` 同步抛（与 :315 那条同一写法）。 */
+    const stubThrowingEventSource = () =>
+      vi.stubGlobal('EventSource', vi.fn(() => { throw new TypeError('EventSource is not a constructor'); }));
+
+    /** 挂到 `/session/s1` 且会话**真的打开了**（前置自检在这做，用例里不再重复判据）。 */
+    async function mountWithSessionOpen() {
+      vi.stubGlobal('EventSource', OkES);
+      const mounted = await mountFailing((url) => {
+        const m = /^\/api\/sessions\/(s\d+)(\?|$)/.exec(url);
+        return m ? okSessionDetail(m[1]) : undefined;
+      }, '/session/s1');
+      // 前置自检：会话真开着、且挂载阶段一条错误都没推 ⇒ 后面出现的 syserr 只可能来自「点击」那一路。
+      expect(mounted.store.sessionId, '前置自检：s1 已打开（同会话分支才进得去）').toBe('s1');
+      expect(syserrTexts(mounted.store), '前置自检：挂载阶段无错误行').toEqual([]);
+      return mounted;
+    }
+
+    afterEach(() => vi.unstubAllGlobals());
+
+    it('#863 点击当前已打开的会话（同会话分支）后半段抛错 ⇒ 零未捕获拒绝 + 可见错误行', async () => {
+      const { wrapper, store } = await mountWithSessionOpen();
+      stubThrowingEventSource(); // 挂载是好的，**点击之后**的收尾才炸
+      // `$emit` 在这里是**输入**：模拟侧栏点了当前这一条（视图里接的是 `@select-session="onSelectSession"`，
+      // 模板绑定不会等 handler 的 Promise ⇒ 漏出去就是未捕获拒绝）。
+      wrapper.findComponent(SidebarPanel).vm.$emit('select-session', 's1');
+      await tick(60);
+      expect(syserrTexts(store).join('\n'), '失败必须变成看得见的错误行').toContain('会话加载失败');
+      expect(leaked.map(describeRejection), `泄漏 ${leaked.length} 条未捕获拒绝`).toEqual([]);
+    });
+
+    it('#863 换会话（路由参数变化 → watcher 那一路）抛错 ⇒ 零未捕获拒绝 + 可见错误行', async () => {
+      const { wrapper, store } = await mountWithSessionOpen();
+      stubThrowingEventSource();
+      // 点的是**另一个**会话 ⇒ onSelectSession 走 `router.push` ⇒ `route.params.id` 变 ⇒ watcher 触发。
+      // 断言只盯 watcher 那一路的收尾（删掉 watcher 的 catch 时这条必须红，见工单变异 1）。
+      wrapper.findComponent(SidebarPanel).vm.$emit('select-session', 's2');
+      await tick(60);
+      expect(store.sessionId, '前置自检：路由确实换到了 s2（否则这条根本没走 watcher）').toBe('s2');
+      expect(syserrTexts(store).join('\n'), '失败必须变成看得见的错误行').toContain('会话加载失败');
+      expect(leaked.map(describeRejection), `泄漏 ${leaked.length} 条未捕获拒绝`).toEqual([]);
+    });
+
+    it('#863 成功路径不受影响：点同一个会话不推错误行、零未捕获拒绝', async () => {
+      const { wrapper, store } = await mountWithSessionOpen(); // EventSource 不 stub 成会抛的那一个
+      wrapper.findComponent(SidebarPanel).vm.$emit('select-session', 's1');
+      await tick(60);
+      expect(store.sessionId).toBe('s1');
+      expect(syserrTexts(store), '正常态不得被兜底改成报错').toEqual([]);
+      expect(leaked.map(describeRejection)).toEqual([]);
+    });
+  });
 });
 
 // ---- issue #359（决策 §7 D9）P0b：顶栏收工灯的**接线**（判色与文案在各自 spec，这里只钉"接没接上"）----
