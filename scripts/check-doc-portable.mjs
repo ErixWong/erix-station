@@ -100,6 +100,11 @@ const MEASURE_COMPILED = MEASURE_IDENTITY.map((e) => ({
   re: e.boundary ? new RegExp(`\\b${reEscape(e.tok)}\\b`) : null,
 }));
 
+// #889 第二步：翻拦。测量通道留着（`--identity-words` 的读数还要用），但它同时进 DENY ⇒ rc 会红。
+//   词边界（`\\beric\\b` 语义）是当初量面时就定死的前提：这条词根会和前缀字母连成通用词
+//   （`gen` + 词根 = 一个常见的英文形容词），子串匹配一开就满屏假阳性。
+DENY_IDENTITY.push(...MEASURE_COMPILED.map((e) => ({ ...e })));
+
 // EXEMPT：运维交接 / 历史取证账，允许保留**机器坐标**（DENY_INFRA）；对身份（DENY_IDENTITY）无效。
 // 新增 EXEMPT 必须是同类历史账，且写明理由。
 const EXEMPT = new Set([
@@ -146,7 +151,9 @@ function scanFile(rel, wholeFile, hits, measureHits) {
     if (!wholeFile && !isCommentLine(line)) return;
     // 身份：无条件扫（EXEMPT 不豁免）。
     for (const tok of DENY_IDENTITY) {
-      if (matchToken(line, tok)) hits.push(`${rel}:${i + 1}: ${tok}`);
+      // 标签取 tok 字符串：DENY_IDENTITY 现在既有字符串条目，也有 {tok,re} 对象条目
+      const label = typeof tok === 'string' ? tok : tok.tok;
+      if (matchToken(line, tok)) hits.push(`${rel}:${i + 1}: ${label}`);
     }
     // 坐标：EXEMPT 历史账豁免。
     if (!exempt) {
