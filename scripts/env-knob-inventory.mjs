@@ -900,13 +900,13 @@ export function buildInventory(root = DEFAULT_ROOT) {
         extensionsNotScanned: ['.mjs / .cjs / .ts 等非 .js（例：runner/skills/github/skill.mjs）'],
         skippedDirs: [...SKIP_DIRS],
         notNamedReads: [
-          '`...process.env` / `{ ...baseEnv }` 整包展开（不点名某个键，不算具名读点）',
+          '`…process.env`（三点展开） / `{ ...baseEnv }` 整包展开（不点名某个键，不算具名读点）',
           '动态下标读取（下标不是字符串字面量，名字运行时才知道；见 dynamicSites）',
         ],
         realRepoExamples: [
           'runner/worker.js process.env[name]（下标来自数组，登记为 unsupported）',
           'runner/lib/mcp-client.js baseEnv[key]（key 来自 STDIO_ENV_ALLOWLIST，登记为 unsupported）',
-          'runner/skills/github/skill.mjs `...process.env`（.mjs + skills 双重排除出扫描面）',
+          'runner/skills/github/skill.mjs `…process.env`（三点展开）（.mjs + skills 双重排除出扫描面）',
         ],
       },
     },
