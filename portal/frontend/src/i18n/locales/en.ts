@@ -585,6 +585,10 @@ export const en = {
     followUpCount: '{n} queued',
     expand: 'Expand',
     collapse: 'Collapse',
+    // #816: the kind word in the row prefix "<n> <kind>: <text>". **Not** reused from
+    // `steerCount`/`followUpCount` — those are whole quantified phrases ("{n} steer").
+    kindSteer: 'steer',
+    kindFollowUp: 'follow-up',
     recall: 'Recall all',
     recallHint: 'Put every queued message back into the input box (recalled text first, existing draft after)',
     // Keys are the server's machine codes, referenced as `queued.blocked.<code>`:
