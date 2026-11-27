@@ -11,12 +11,29 @@
 //     上游只对 `path === "."` 给 `./`，而真机上模型会把 basename 标签拷回去再查一次并 ENOENT。
 // jail 自身的 4 条用例（#1/#4/#9/#10/#11 的 jail 断言面）逐字不动：createJail / JailError 没迁。
 // 隔离约定：tmp 目录作 jail root，不碰真实环境。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createJail, createStationFileTools, JailError, platformReadExceptions } from '../lib/file-tools.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件只在 #259 夹具（erix-259-）上补注册；erix-jail-test- / -outside- 那批各自 finally 已 rm。
+// force 是必需的：withHomeFixture 自己的 `finally` 已 rm 过同一个 base，这里再清一次必须容忍「已经没了」；
+// 真漏注册还是会漏在 /tmp（#875 的闸当场抱住），force 不掩盖漏注册。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 /** 用 tmp 目录做 jail root，工具面走 station 装配（issue #228 后的唯一实现）。 */
 async function withTools(fn, { writable } = {}) {
@@ -429,7 +446,7 @@ test('edit 吃 jail 写边界：非 writable 子树被拒且不改文件，writa
 
 /** #259 夹具：容器同形的家目录 `<base>/home` 与项目目录 `<base>/home/projects/<p>`（后者是 jail 根）。 */
 async function withHomeFixture(fn, { readExceptions, maskedPaths, assemblyMaskedPaths } = {}) {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-259-')));
+  const base = fs.realpathSync(trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-259-'))));
   const home = path.join(base, 'home');
   const project = path.join(home, 'projects', 'todo');
   fs.mkdirSync(path.join(home, '.erix', 'sub'), { recursive: true });
