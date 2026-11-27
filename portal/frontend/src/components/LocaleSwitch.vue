@@ -10,9 +10,19 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { setLocale, type AppLocale } from '../i18n';
 import { api } from '../api';
-import { useAuthStore } from '../stores/auth';
+import { useAuthStore, NO_SESSION_LOCALE_OWNER } from '../stores/auth';
 
 const { t, locale } = useI18n();
+
+// #828 复核查：顶栏要显示「语言偏好未保存到账号」一行——响应式读 store 的 localeSyncFailed 旗标。
+// 无激活 pinia（纯组件测试 / 无会话挂载）⇒ 取不到 store ⇒ 恒不显示（不发也不提示，与「未登录不发」一致）。
+let authStore: ReturnType<typeof useAuthStore> | null = null;
+try {
+  authStore = useAuthStore();
+} catch {
+  authStore = null;
+}
+const localeSyncFailed = computed(() => authStore?.localeSyncFailed ?? false);
 
 const OPTIONS: readonly { value: AppLocale; labelKey: 'locale.zhCN' | 'locale.en' }[] = [
   { value: 'zh-CN', labelKey: 'locale.zhCN' },
@@ -29,7 +39,9 @@ const currentLabel = computed(() => {
 });
 
 function select(value: AppLocale) {
-  setLocale(value);
+  // 用户亲自点开关 ⇒ 传 fromUser，立 `locale.userChosen` 标记（#828）：这台浏览器之后不再被
+  // 账号默认语言抢走（账号种子不传 fromUser，两件事分开）。回写旁路见下方 syncAccountLocale。
+  setLocale(value, { fromUser: true });
   open.value = false;
   // #828：已登录时把这次选择回写到账号（登录后 / 换设备自动沿用）。未登录不发，免得刷 401。
   // fire-and-forget：切换已经在上面生效，回写只是旁路。
@@ -54,15 +66,22 @@ async function syncAccountLocale(value: AppLocale): Promise<void> {
   } catch {
     return; // 无激活的 pinia（登录页以外的挂载形式）⇒ 不发
   }
+  // #828 复核查：在分支前取**当时的归属**（有会话取当前 login，没会话用哨兵），供下面记 pending 用。
+  const ownerAtRecord = auth.user?.login ?? NO_SESSION_LOCALE_OWNER;
   if (!auth.user) {
     // 未就绪：不发（登录页不该发），但记下这次选择，等 /api/me 回来补发（缺陷①的补链）。
-    auth.pendingLocaleWrite = value;
+    // 没会话 ⇒ ownerAtRecord 就是 NO_SESSION_LOCALE_OWNER（无主，谁先就绪补发给谁）；这样登出/
+    // 换账号后 `flushPendingLocale` 能把上一位记的、与当前用户不同归属的待补发丢弃。
+    auth.pendingLocaleWrite = { login: ownerAtRecord, locale: value };
     return;
   }
+  // #828 复核查：下一次回写尝试开始 ⇒ 先复位失败旗标（提示随之消失），失败再置 true（提示重现）。
+  auth.localeSyncFailed = false;
   try {
     await api('/api/me/locale', { method: 'PATCH', body: JSON.stringify({ locale: value }) });
   } catch {
-    /* 静默：切换已生效，回写失败不弹窗 */
+    // #828 复核查：静默不打断（切换已生效、不弹红条），但把「账号没存上」记进可见旗标供顶栏提示。
+    auth.localeSyncFailed = true;
   }
 }
 
@@ -103,5 +122,12 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocumentClick));
         >{{ t(opt.labelKey) }}</button>
       </li>
     </ul>
+
+    <!-- #828 复核查：回写失败的可重试提示——不弹红条、不打断，仅一行小字；再点一次开关会重新尝试并自动收起。 -->
+    <p
+      v-if="localeSyncFailed"
+      data-test="locale-sync-failed"
+      class="mt-0.5 text-[0.7rem] leading-tight text-red-600"
+    >{{ t('locale.accountSaveFailed') }}</p>
   </div>
 </template>

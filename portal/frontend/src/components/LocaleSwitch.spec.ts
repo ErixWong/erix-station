@@ -5,9 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import LocaleSwitch from './LocaleSwitch.vue';
-import { LOCALE_STORAGE_KEY, createAppI18n, detectLocale, i18n, setLocale } from '../i18n';
+import { LOCALE_STORAGE_KEY, LOCALE_USER_CHOSEN_KEY, createAppI18n, detectLocale, i18n, setLocale } from '../i18n';
 import { clearLocaleCookie, readLocaleCookie, writeLocaleCookie } from '../lib/localeCookie';
-import { useAuthStore } from '../stores/auth';
+import { useAuthStore, NO_SESSION_LOCALE_OWNER } from '../stores/auth';
 
 function mountSwitch(): VueWrapper {
   return mount(LocaleSwitch, { global: { plugins: [i18n] } });
@@ -186,7 +186,8 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
     expect(i18n.global.locale.value).toBe('en'); // 本地切换照常生效
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
     // #828 缺陷①：未就绪时不发，但这次选择不能丢——必须记进 pendingLocaleWrite 等补发。
-    expect(useAuthStore().pendingLocaleWrite).toBe('en');
+    // #828 复核查：带归属——无会话时 login 是 NO_SESSION_LOCALE_OWNER 哨兵。
+    expect(useAuthStore().pendingLocaleWrite).toEqual({ login: NO_SESSION_LOCALE_OWNER, locale: 'en' });
   });
 
   it('未就绪点 English ⇒ 不发；/api/me 回来后补发一次 PATCH body {"locale":"en"}（缺陷①的钉子）', async () => {
@@ -210,7 +211,7 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
     await pick(w, 'English');
     await flushPromises();
     expect(calls.filter((c) => c.url === '/api/me/locale')).toHaveLength(0); // 未就绪：一个回写都不发
-    expect(auth.pendingLocaleWrite).toBe('en'); // 选择被记下，没丢
+    expect(auth.pendingLocaleWrite).toEqual({ login: NO_SESSION_LOCALE_OWNER, locale: 'en' }); // 选择被记下，没丢
 
     await auth.ensureMe(); // /api/me 回来 ⇒ 会话就绪
     await flushPromises();
@@ -219,5 +220,52 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
     expect(patch[0].init?.method).toBe('PATCH');
     expect(JSON.parse(String(patch[0].init?.body))).toEqual({ locale: 'en' });
     expect(auth.pendingLocaleWrite).toBeNull(); // 补发后清空
+  });
+
+  it('已登录点 English ⇒ PATCH body {"locale":"en"}，且写入 locale.userChosen 标记', async () => {
+    const calls = stubFetch(() => new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    const w = mountWithAuth(true);
+    await pick(w, 'English');
+    await flushPromises();
+    const patch = calls.filter((c) => c.url === '/api/me/locale');
+    expect(patch).toHaveLength(1);
+    expect(JSON.parse(String(patch[0].init?.body))).toEqual({ locale: 'en' });
+    // #828：用户亲自点开关 ⇒ setLocale 传 fromUser ⇒ `locale.userChosen` 标记立起。
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBe('1');
+  });
+
+  it('localeSyncFailed=true ⇒ 提示那一行出现在 DOM（用 data-test 定位，不挑 class）', () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const auth = useAuthStore();
+    auth.user = { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local' };
+    auth.localeSyncFailed = true; // 直接置位：本例只证「旗标 true ⇒ 提示行渲染」，**不覆盖置位来源**。
+    // 失败到底怎么把旗标置 true（当场 PATCH / 延迟补发两条发送路径）分别另见本文件「回写失败」一例与 stores/auth-locale.spec.ts。
+    const w = mount(LocaleSwitch, { global: { plugins: [pinia, i18n] } });
+    expect(w.find('[data-test="locale-sync-failed"]').exists()).toBe(true);
+  });
+
+  it('回写失败 ⇒ 提示出现且 localeSyncFailed=true；再点一次成功 ⇒ 提示消失且复位 false', async () => {
+    let fail = true;
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      calls.push({ url, init });
+      return fail
+        ? new Response(JSON.stringify({ error: { code: 'x', message: 'boom' } }),
+            { status: 500, headers: { 'Content-Type': 'application/json' } })
+        : new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    const w = mountWithAuth(true);
+    await pick(w, 'English');
+    await flushPromises();
+    expect(useAuthStore().localeSyncFailed).toBe(true); // 静默失败但旗标可见
+    expect(w.find('[data-test="locale-sync-failed"]').exists()).toBe(true); // 提示行出现
+    fail = false;
+    await pick(w, '中文'); // 再点一次 ⇒ 下一次尝试开始置回 false，成功后保持 false
+    await flushPromises();
+    expect(useAuthStore().localeSyncFailed).toBe(false);
+    expect(w.find('[data-test="locale-sync-failed"]').exists()).toBe(false); // 提示消失
+    expect(calls.filter((c) => c.url === '/api/me/locale')).toHaveLength(2); // 两次尝试都发了
   });
 });

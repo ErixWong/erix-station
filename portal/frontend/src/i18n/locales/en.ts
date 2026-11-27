@@ -28,6 +28,8 @@ export const en = {
     label: 'Language',
     zhCN: '中文',
     en: 'English',
+    // #828: shown as a small inline hint when the top-bar language write-back (`PATCH /api/me/locale`) fails.
+    accountSaveFailed: "Couldn't save the language preference to your account",
   },
   login: {
     workbenchEntrySeatlessAdmin: 'This is a platform administrator without a workstation — the workbench has nothing for it. Please sign in at the admin console.',

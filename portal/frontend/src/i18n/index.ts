@@ -1,7 +1,11 @@
 // i18n 基建（issue #101 P1）：createI18n（Composition API 模式）+ 语言检测 + 持久化。
 //
 // 语言优先级（#101 定的方案，#804 换了载体）：cookie('locale') 合法值 → localStorage('locale') 合法值
-// → 浏览器语言（zh 开头 → zh-CN，否则 en）→ 兜底 zh-CN。偏好存 cookie + localStorage（不上传服务端/用户表）。
+// → 浏览器语言（zh 开头 → zh-CN，否则 en）→ 兜底 zh-CN。偏好存 cookie + localStorage 两个本地载体；
+// #828 起账号也存一份 `users.locale`（服务端字段，登录后由前端经 setLocale 灌进上面两个载体）。优先级：
+// 本地已切过的优先（cookie → localStorage）；账号值只是「这台浏览器初次见面的种子」——用户**亲自点过
+// 语言开关**（`locale.userChosen` 标记，见 `hasUserChosenLocale`）之后本地值说话、账号默认语言不再来抢
+// （要不要跟随的判据在 stores/auth 的 applyAccountLocale）。「不上传服务端/用户表」这句在 #828 后已不成立。
 // 为什么 cookie 排在 localStorage 之前（#804）：管理台 `admin.<伞域>:<端口>` 与用户面 `station.<伞域>`
 // 是两个 **origin**，而 localStorage 按 origin 隔离、两边各存一份互不相通 ⇒ 用户面切了英文，管理台
 // 还是读不到。同站 cookie（Domain = 父域）两边都看得见，所以「两边都有」时以 cookie 为准；
@@ -22,6 +26,16 @@ export const DEFAULT_LOCALE: AppLocale = 'zh-CN';
 
 /** localStorage 中语言偏好的键名。 */
 export const LOCALE_STORAGE_KEY = 'locale';
+
+/**
+ * localStorage 中「这台浏览器上用户**亲自点过**语言开关」标记的键名（#828 复核查）。
+ *
+ * 为什么另起一个键而不是复用载体（cookie/localStorage 里的 locale 值）：`setLocale` 会双写载体，
+ * 而账号种子初次登录时也会走 `setLocale` ⇒ 载体里很快就有了值，「载体里有没有值」从此恒真，
+ * 没法区分「用户选的」和「账号灌进来的」。这个标记**只在用户亲自点开关时**立（见 `setLocale` 的
+ * `fromUser`），账号种子不立它 ⇒ 「要不要跟随账号默认语言」的判据才不会被种子自己污染。
+ */
+export const LOCALE_USER_CHOSEN_KEY = 'locale.userChosen';
 
 /** 运行时判定字符串是否为受支持的 locale（localStorage 里可能是任意脏值）。 */
 export function isAppLocale(value: unknown): value is AppLocale {
@@ -53,6 +67,24 @@ function readStoredLocale(): string | null {
 export function hasLocalLocalePreference(): boolean {
   if (isAppLocale(readLocaleCookie())) return true;
   return isAppLocale(readStoredLocale());
+}
+
+/**
+ * 这台浏览器上用户是否**亲自点过**语言开关（只读 `locale.userChosen` 标记，载体里有值不算）。
+ *
+ * 这是「要不要跟随账号默认语言」的唯一判据（见 `stores/auth` 的 `applyAccountLocale`）：
+ * - **没点过** ⇒ 账号默认语言变了会跟随（含初次登录灌种子、以及用户后来在别处改了账号默认语言）；
+ * - **点过** ⇒ 本地说话，账号值不再抢（这台浏览器是用户自己定的语言，账号值只是初次见面的种子）；
+ * - **清了站点数据** ⇒ 标记随载体一起没了 ⇒ 回到「新设备」= 账号值重新生效。
+ *
+ * 隐私模式/禁用存储 ⇒ 静默返回 false（标记立不起来，退化成「每次都像新设备」，账号种子仍可用）。
+ */
+export function hasUserChosenLocale(): boolean {
+  try {
+    return localStorage.getItem(LOCALE_USER_CHOSEN_KEY) === '1';
+  } catch {
+    return false;
+  }
 }
 
 /** 按优先级检测初始语言：cookie → localStorage → navigator.language → zh-CN（#804）。 */
@@ -87,8 +119,12 @@ export const i18n = createAppI18n();
 /**
  * 切换语言：改 i18n 当前 locale（响应式生效）+ 同步 <html lang> + 双写偏好（cookie + localStorage）。
  * 只接受受支持的 locale（调用方传字面量即可，类型已约束）。
+ *
+ * `opts.fromUser === true` 表示**用户亲自点了语言开关**：额外立 `locale.userChosen` 标记（#828）。
+ * 账号语言种子（`applyAccountLocale`）调用时**不传** `fromUser` ⇒ 不立标记，这样「跟随账号默认语言」
+ * 的判据（`hasUserChosenLocale`）不会被种子自己污染。
  */
-export function setLocale(locale: AppLocale): void {
+export function setLocale(locale: AppLocale, opts?: { fromUser?: boolean }): void {
   i18n.global.locale.value = locale;
   document.documentElement.lang = locale;
   try {
@@ -102,6 +138,15 @@ export function setLocale(locale: AppLocale): void {
     writeLocaleCookie(locale);
   } catch {
     /* 禁用 cookie：退化成只有 localStorage（同一会话内仍生效） */
+  }
+  // #828：只有用户亲自点开关才立「这台浏览器用户表过态」的标记；账号种子不立（否则种子会把自己
+  // 当成用户的选择，导致此后账号默认语言变化永不生效）。写失败静默，退化成「像新设备」。
+  if (opts?.fromUser === true) {
+    try {
+      localStorage.setItem(LOCALE_USER_CHOSEN_KEY, '1');
+    } catch {
+      /* 隐私模式/禁用存储：标记立不起来，下次仍按「没点过」跟随账号值 */
+    }
   }
 }
 

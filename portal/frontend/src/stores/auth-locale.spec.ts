@@ -2,8 +2,9 @@
 // 断言一律走请求桩 + DOM（document.cookie / localStorage / i18n 当前 locale），不用 w.emitted()。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setActivePinia, createPinia } from 'pinia';
-import { useAuthStore } from './auth';
-import { i18n, LOCALE_STORAGE_KEY, setLocale } from '../i18n';
+import { flushPromises } from '@vue/test-utils';
+import { useAuthStore, NO_SESSION_LOCALE_OWNER } from './auth';
+import { i18n, LOCALE_STORAGE_KEY, LOCALE_USER_CHOSEN_KEY, setLocale } from '../i18n';
 import { readLocaleCookie } from '../lib/localeCookie';
 
 const FDE = {
@@ -51,7 +52,7 @@ afterEach(() => {
 });
 
 describe('#828 登录后应用账号语言', () => {
-  it('本地未表态（cookie+localStorage 都空）且 /api/me 返回 en ⇒ 应用成 en，cookie 与 localStorage 写上（换设备生效）', async () => {
+  it('本地未表态（cookie+localStorage 都空）且 /api/me 返回 en ⇒ 应用成 en，cookie 与 localStorage 写上（换设备生效），且不立用户标记', async () => {
     clearLocalLocale(); // 两个本地载体都空：模拟换设备 / 清了站点数据
     vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
     const auth = useAuthStore();
@@ -59,10 +60,31 @@ describe('#828 登录后应用账号语言', () => {
     expect(i18n.global.locale.value).toBe('en');
     expect(readLocaleCookie()).toBe('en');
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
+    // #828 复核查：账号种子**不立** `locale.userChosen` 标记（否则种子会把自己当成用户的选择，
+    // 导致此后账号默认语言变化永不生效）。
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBeNull();
   });
 
-  it('本地已表过态（cookie 或 localStorage 为 zh-CN）而账号值是 en ⇒ refreshMe 后界面仍是 zh-CN（缺陷②的钉子）', async () => {
-    resetLocale('zh-CN'); // cookie + localStorage 均为 zh-CN：本地已表过态
+  it('账号种子不立标记⇒未点过开关的浏览器上，账号默认语言从 en 改成 zh-CN 会跟随（旧缺陷：载体有值把它永久挡掉）', async () => {
+    clearLocalLocale();
+    vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
+    const auth = useAuthStore();
+    await auth.ensureMe();
+    expect(i18n.global.locale.value).toBe('en');
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBeNull(); // 种子不立标记
+    // 用户后来在别处把账号默认语言改成 zh-CN ⇒ 这台没点过开关的浏览器应跟随。
+    vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'zh-CN' } })));
+    await auth.refreshMe();
+    expect(i18n.global.locale.value).toBe('zh-CN'); // 旧代码：载体里已是 en ⇒ hasLocalLocalePreference 恒真→不跟随（会变红）
+    expect(readLocaleCookie()).toBe('zh-CN');
+    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('zh-CN');
+  });
+
+  it('用户亲自点过开关（标记立起）而账号值是 en ⇒ 本地 zh-CN 说话、refreshMe 后仍是 zh-CN（不抢）', async () => {
+    localStorage.clear();
+    document.cookie = 'locale=; Path=/; Max-Age=0';
+    setLocale('zh-CN', { fromUser: true }); // 用户亲自点：立标记 + 双写载体
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBe('1');
     const setItem = vi.spyOn(Storage.prototype, 'setItem'); // 基线写发生在 spy 之前
     vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
     const auth = useAuthStore();
@@ -70,7 +92,20 @@ describe('#828 登录后应用账号语言', () => {
     expect(i18n.global.locale.value).toBe('zh-CN'); // 本地选择说话，不被账号值盖掉
     expect(readLocaleCookie()).toBe('zh-CN');
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('zh-CN');
-    expect(setItem).not.toHaveBeenCalled(); // setLocale 没被账号值调用（去掉「本地已表态就不抢」那道判断即变红）
+    expect(setItem).not.toHaveBeenCalled(); // setLocale 没被账号值调用（去掉「用户点过就不抢」那道判断即变红）
+  });
+
+  it('清掉标记与载体后回到「新设备」⇒ 账号值重新生效（哪怕之前点过开关）', async () => {
+    localStorage.clear();
+    document.cookie = 'locale=; Path=/; Max-Age=0';
+    setLocale('en', { fromUser: true }); // 之前在这台浏览器上点过开关（标记已立）
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBe('1');
+    clearLocalLocale(); // 清站点数据：标记 + 两个载体一起没
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBeNull();
+    vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
+    const auth = useAuthStore();
+    await auth.ensureMe();
+    expect(i18n.global.locale.value).toBe('en'); // 新设备⇒账号值生效
   });
 
   it('ensureMe：/api/me 返回 null ⇒ 什么都不变（cookie/localStorage 不被改写，也不回落到 zh-CN）', async () => {
@@ -135,5 +170,78 @@ describe('#828 登录后应用账号语言', () => {
     await auth.submitEmailCode('123456');
     expect(i18n.global.locale.value).toBe('en');
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
+  });
+});
+
+// #828 复核查：pendingLocaleWrite 带账号归属，登出/会话失效一并清理，换账号不替别人改偏好。
+describe('#828 pendingLocaleWrite 账号归属与登出/失效清理', () => {
+  const BOB = { ...FDE, id: 'u2', login: 'bob', fde_name: 'bob' };
+
+  it('记下 pending 后 logout ⇒ 会话清空且 pending 被清（不隔会话残留给下一个账号）', async () => {
+    const auth = useAuthStore();
+    auth.user = { ...FDE }; // alice 已登录
+    auth.pendingLocaleWrite = { login: 'alice', locale: 'en' };
+    vi.stubGlobal('fetch', fetchMock(() => json(200, {}))); // logout POST 回 200
+    await auth.logout();
+    expect(auth.user).toBeNull();
+    expect(auth.pendingLocaleWrite).toBeNull();
+  });
+
+  it('会话确认失效（/api/me 回 401）⇒ pending 被清（上一位的选择不能留给下一位）', async () => {
+    const auth = useAuthStore();
+    auth.user = { ...FDE };
+    // 不设 ready：ensureMe 首行 `if (this.ready) return` 会短路；留 ready=false 才会真去拉 /api/me。
+    auth.pendingLocaleWrite = { login: 'alice', locale: 'en' };
+    vi.stubGlobal('fetch', fetchMock(() => json(401, { error: { code: 'unauthorized', message: 'gone' } })));
+    await auth.ensureMe(); // 会话已确认失效 ⇒ user=null 分支
+    expect(auth.user).toBeNull();
+    expect(auth.pendingLocaleWrite).toBeNull();
+  });
+
+  it('A 记的 pending（login=alice），换成 B 登录后 flush ⇒ 不发 PATCH 且 pending 被丢弃', async () => {
+    const auth = useAuthStore();
+    auth.pendingLocaleWrite = { login: 'alice', locale: 'en' }; // A 记的选择，未及补发就换人
+    auth.user = { ...BOB }; // 现在站着 B（login 不同，且账号值与 pending 不同）
+    const fetchFn = fetchMock(() => json(200, {}));
+    vi.stubGlobal('fetch', fetchFn);
+    await auth.flushPendingLocale();
+    await flushPromises();
+    expect(auth.pendingLocaleWrite).toBeNull(); // 归属对不上 ⇒ 丢弃
+    const urls = fetchFn.mock.calls.map((c) => (typeof c[0] === 'string' ? c[0] : ''));
+    expect(urls.filter((u) => u === '/api/me/locale')).toHaveLength(0); // 一枪都不发
+  });
+
+  it('哨兵（无主）pending ⇒ 谁先就绪就补发给谁（登录后的第一个人照发）', async () => {
+    const auth = useAuthStore();
+    auth.pendingLocaleWrite = { login: NO_SESSION_LOCALE_OWNER, locale: 'en' };
+    auth.user = { ...BOB }; // login 与哨兵不同，但哨兵=无主 ⇒ 允许补发
+    const fetchFn = fetchMock(() => json(200, {}));
+    vi.stubGlobal('fetch', fetchFn);
+    await auth.flushPendingLocale();
+    await flushPromises();
+    const urls = fetchFn.mock.calls.map((c) => (typeof c[0] === 'string' ? c[0] : ''));
+    expect(urls.filter((u) => u === '/api/me/locale')).toHaveLength(1); // 无主→发一次
+    expect(auth.pendingLocaleWrite).toBeNull();
+  });
+
+  it('会话就绪后延迟补发 flushPendingLocale 失败 ⇒ 发了 PATCH 但 localeSyncFailed=true、pending 已清', async () => {
+    // 前置：会话未就绪时记下选择（无主哨兵，谁先就绪补发给谁）。
+    const auth = useAuthStore();
+    auth.pendingLocaleWrite = { login: NO_SESSION_LOCALE_OWNER, locale: 'en' };
+    // 让 user 就绪（BOB 无 locale，与待补发 en 不同）⇒ flush 会真发一枪。
+    auth.user = { ...BOB };
+    // 这一枪桩返回 500（api() 会抛 ApiError ⇒ catch 里置 localeSyncFailed=true）。
+    const fetchFn = fetchMock(() => json(500, { error: { code: 'boom', message: 'boom' } }));
+    vi.stubGlobal('fetch', fetchFn);
+    await auth.flushPendingLocale();
+    await flushPromises();
+    // ① 确实发出一枪：method=PATCH、URL 对，桩数得出。
+    const patch = fetchFn.mock.calls.filter((c) => (typeof c[0] === 'string' ? c[0] : '') === '/api/me/locale');
+    expect(patch).toHaveLength(1);
+    expect((patch[0][1] as RequestInit | undefined)?.method).toBe('PATCH');
+    // ② 延迟补发失败也要可见：旗标置起（把 auth.ts 的 `this.localeSyncFailed = true` 改成 = false 即变红）。
+    expect(auth.localeSyncFailed).toBe(true);
+    // ③ 先清后发 ⇒ pending 已清，不会重复补发。
+    expect(auth.pendingLocaleWrite).toBeNull();
   });
 });

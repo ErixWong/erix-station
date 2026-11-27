@@ -40,6 +40,8 @@ export const zhCN = {
     label: '语言',
     zhCN: '中文',
     en: 'English',
+    // #828 复核查：顶栏语言回写 `PATCH /api/me/locale` 失败时的小字提示（不弹红条、不打断切换）。
+    accountSaveFailed: '语言偏好未保存到账号',
   },
   // 登录页（views/LoginView.vue）——覆盖该视图全部用户可见文案。
   // 注意：登录失败/校验失败的提示来自服务端 error.message（auth store 原样透传），不在前端翻译范围内。
