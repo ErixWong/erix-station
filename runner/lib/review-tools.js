@@ -2,7 +2,7 @@
 //
 // 为什么单独一个模块：审查 run 的工具面只留 `readFile`/`searchText`/`tree`——
 //   * 不给 `shell`：`shell` 是 `bash -c`、无命令白名单（见 runner/lib/shell-tools.js:84-98），
-//     `cwd` 只是起点，`cd ~/projects/foo` 就逃出 worktree；审查 agent 不该有执行能力。
+//     `cwd` 只是起点，`cd ~/projects/foo` 就越出当前 run 的项目目录（#887 口径：没有 worktree 这层）；审查 agent 不该有执行能力。
 //   * 不给 `note_*`：审查是只读观察，笔记写的是宿主会话目录，不该污染。
 //
 // ⚠ 这个模块**只 import node: 内建**，因此既能被 `runner/worker.js` import（同包），

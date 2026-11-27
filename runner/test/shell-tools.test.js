@@ -1,6 +1,6 @@
 // runner/lib/shell-tools.js 单测（issue #72 v1）：echo/退出码/stderr/cwd 边界/超时击杀/输出截断/参数校验。
 // issue #211 补：abort signal 中止行为（sleep 30 被叫停、子进程真回收、定时器真清）。
-// 隔离约定：进程内 spawn（bash -c），无外部依赖；tmp 目录作 worktree root，不写 /tmp 之外路径。
+// 隔离约定：进程内 spawn（bash -c），无外部依赖；tmp 目录作**项目目录**（= run 的 cwd，D8 修订后的隔离单元），不写 /tmp 之外路径。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -39,14 +39,14 @@ test('shell：stderr 捕获（stdout/stderr 拼接进输出体）', () =>
     assert.match(out, /err-line/);
   }));
 
-test('shell：cwd 参数生效（pwd 落在 worktree 子目录）', () =>
+test('shell：cwd 参数生效（pwd 落在项目目录子目录）', () =>
   withShellTools(async (tools, root) => {
     fs.mkdirSync(path.join(root, 'sub', 'deep'), { recursive: true });
     const out = await tools.executors.shell({ command: 'pwd', cwd: 'sub/deep' });
     assert.match(out, new RegExp(`${path.join(root, 'sub', 'deep').replaceAll('/', '\\/')}\\n?$`));
   }));
 
-test('shell：cwd 默认 worktree 根', () =>
+test('shell：cwd 默认项目目录（run 的 cwd）', () =>
   withShellTools(async (tools, root) => {
     const out = await tools.executors.shell({ command: 'pwd' });
     assert.match(out, new RegExp(`${root.replaceAll('/', '\\/')}\\n?$`));
@@ -54,8 +54,8 @@ test('shell：cwd 默认 worktree 根', () =>
 
 test('shell：cwd `..` 逃逸拒绝（含绝对路径）', () =>
   withShellTools(async (tools) => {
-    await assert.rejects(() => tools.executors.shell({ command: 'pwd', cwd: '../escape' }), /escapes worktree root/);
-    await assert.rejects(() => tools.executors.shell({ command: 'pwd', cwd: 'sub/../../escape' }), /escapes worktree root/);
+    await assert.rejects(() => tools.executors.shell({ command: 'pwd', cwd: '../escape' }), /escapes the run project directory/);
+    await assert.rejects(() => tools.executors.shell({ command: 'pwd', cwd: 'sub/../../escape' }), /escapes the run project directory/);
     await assert.rejects(() => tools.executors.shell({ command: 'pwd', cwd: '/etc' }), /absolute path/);
     // 校验失败必须不给模型返回任何命令输出。
   }));
@@ -258,3 +258,24 @@ test('shell：abort 后不留存活定时器（否则 worker 会被一个无意�
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// #887：给模型看的 tool description 与报错文案**就是它的行为边界指令**。D8 修订后隔离单元是
+// 「项目目录（run 的 cwd）」，文案再说 worktree 等于让模型去守一条不存在的路。
+// 仓库纪律：文本语义不写脚本闸（脚本看不出意思），**钉字面期望的单测**才是正解。
+test('shell：#887 模型可见文案以「run project directory」为边界，且不再出现 worktree', () =>
+  withShellTools(async (tools) => {
+    const schema = tools.schemas[0];
+    assert.equal(schema.name, 'shell');
+    assert.match(schema.description, /run project directory \(run_start\.cwd\)/);
+    assert.doesNotMatch(schema.description, /worktree/i);
+    const cwdDesc = schema.inputSchema.properties.cwd.description;
+    assert.match(cwdDesc, /relative to the run project directory/);
+    assert.doesNotMatch(cwdDesc, /worktree/i);
+    // 三条校验报错同样会进模型上下文，口径必须一致
+    await assert.rejects(() => tools.executors.shell({ command: 'pwd', cwd: 42 }),
+      /must be a path string relative to the run project directory/);
+    await assert.rejects(() => tools.executors.shell({ command: 'pwd', cwd: '/etc' }),
+      /must be relative to the run project directory, got absolute path/);
+    await assert.rejects(() => tools.executors.shell({ command: 'pwd', cwd: '../escape' }),
+      /cwd escapes the run project directory/);
+  }));

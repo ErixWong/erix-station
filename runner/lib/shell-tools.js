@@ -3,7 +3,7 @@
 // issue #71 清退 code-server 后，agent 是 FDE 唯一执行主体，本工具补齐验证闭环（构建/测试跑通再交付）。
 //
 // 安全模型（v1，已在 issue #72 拍板，勿自行改动）：
-//   - shell 有意越过 worktree 文件牢笼——容器是信任边界（不变式 1）；文件 jail 只管 file 工具，
+//   - shell 有意越过**项目目录（run 的 cwd）**的文件牢笼——容器是信任边界（不变式 1）；文件 jail 只管 file 工具，
 //     不约束本工具（cwd 仅做词法 `..` 逃逸拒绝，防模型笔误，不做 symlink/realpath 防御）。
 //   - 出口管控归安全团队网络层（runner-integration.md §11）。
 //   - 审批 v1 = 自动执行 + 既有 tool_use/tool_result 事件审计；runToolLoop approvals 钩子
@@ -84,7 +84,8 @@ const schema = {
   name: 'shell',
   description: 'Run a shell command with bash -c inside the run container. '
     + 'Use for verification (build/test/lint) before delivering. '
-    + 'Commands run with worker privileges; do not modify state outside the worktree. '
+    + 'Commands run with worker privileges inside the run project directory (run_start.cwd); '
+    + 'do not modify state outside it. '
     + 'Output is truncated to the last 32KiB.',
   // 引擎元数据（读点见上方整段注释）：崩溃恢复时**不得**自动重放本工具。
   replay: 'unsafe',
@@ -92,7 +93,7 @@ const schema = {
     type: 'object',
     properties: {
       command: { type: 'string', description: 'Command line passed to bash -c.' },
-      cwd: { type: 'string', description: 'Working directory, relative to the worktree root (default: root).' },
+      cwd: { type: 'string', description: 'Working directory, relative to the run project directory (default: that directory).' },
       timeout_ms: { type: 'integer', description: `Timeout in ms (default ${DEFAULT_TIMEOUT_MS}, max ${MAX_TIMEOUT_MS}).` },
     },
     required: ['command'],
@@ -120,14 +121,14 @@ function normalizeTimeoutMs(value) {
 function resolveWorkDir(root, cwd) {
   if (cwd === undefined || cwd === null || cwd === '' || cwd === '.') return root;
   if (typeof cwd !== 'string') {
-    throw new TypeError('shell: cwd must be a worktree-relative path string');
+    throw new TypeError('shell: cwd must be a path string relative to the run project directory');
   }
   if (path.isAbsolute(cwd)) {
-    throw new Error(`shell: cwd must be relative to the worktree root, got absolute path: ${cwd}`);
+    throw new Error(`shell: cwd must be relative to the run project directory, got absolute path: ${cwd}`);
   }
   const resolved = path.resolve(root, cwd);
   if (!isWithin(root, resolved)) {
-    throw new Error(`shell: cwd escapes worktree root: ${cwd}`);
+    throw new Error(`shell: cwd escapes the run project directory: ${cwd}`);
   }
   return resolved;
 }
@@ -298,7 +299,8 @@ function runCommand({ command, workDir, timeoutMs, signal, emitLiveness = null, 
 /**
  * 创建 shell 工具（结构与 file-tools.js 同构：{schemas, executors}，worker.js 直接并入 registry）。
  * @param {{worktreeRoot:string, liveness?:{heartbeatIntervalMs?:number, onEvent?:(ev:object)=>void}}} options
- *   worktreeRoot = 项目目录绝对路径（RUN_START.cwd）；
+ *   worktreeRoot = 项目目录绝对路径（RUN_START.cwd）；**标识符名是 D8 修订前的历史遗留**（issue #887），
+ *   值一直就是项目目录；改这个参数名会动到调用方，属契约面，本单不动（见 issue #887「边界」）；
  *   liveness = 执行期保活钩子（issue #288 缺陷 A/D），**不传时零行为变化**（单测/旧调用方路径不变）：
  *     `onEvent({phase:'spawn'|'heartbeat'|'exit', pgid, command, elapsed_ms})` —— worker 侧把它翻成
  *     一条 `shell_liveness` IPC（宿主内部信号，**不是** run_events/U3 事件）。

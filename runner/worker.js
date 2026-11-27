@@ -668,7 +668,7 @@ async function startRun(msg) {
   // 两处装配点（registry / baseToolSchemas）共用同一个常量。审查 run 只留只读三件套 ⇒ 隔离由
   // 「无 shell / 无 write / 无 note」在**工具装配层**保证（见下 registry / baseToolSchemas）。
   // ⚠ jail 的 `writable: [cwd]` **刻意不动**：#259 的锁（runner/test/system-prompt.test.js:315-319）
-  //   钉住「worker 只有一处 createJail 且该行字面含 `writable: [cwd]`」。审查 run 的 cwd 就是 worktree，
+  //   钉住「worker 只有一处 createJail 且该行字面含 `writable: [cwd]`」。审查 run 的 cwd 就是项目目录，
   //   而只读装配不含 writeFile/edit/shell ⇒ 无任何工具能触发写 ⇒ `writable: [cwd]` 与 `[]` 对 agent
   //   的**可观测写面相同（皆空）**。这是有意取舍（详见交付报告偏差说明）。
   const reviewOnly = isReviewOnly();
@@ -923,7 +923,7 @@ async function startRun(msg) {
   // `[...fileTools.schemas, ...shellTools.schemas]`（见下 childTools），**不是从父 registry
   // 过滤出来的** ⇒ 父的只读过滤（装配点①②）传不到子；而子 run 自带 shell（`bash -c` 无白名单）。
   // ⇒ 审查 run 只要环境 `ERIX_DELEGATE_ENABLED=1`（FDE 全局开）就能
-  // `delegate("跑 shell 把 ~/projects/foo 读出来")` 让子 run 拿 shell 逃逸出 worktree。
+  // `delegate("跑 shell 把 ~/projects/foo 读出来")` 让子 run 拿 shell 逃逸出**项目目录**（#887 口径：本站没有 worktree 这层）。
   // 关掉后 `delegation` 保持 null ⇒ executeTool 里 `delegation !== null` 那条 delegate 路由自然不通。
   if (delegateEnabled && !reviewOnly) {
     const delegateMax = parseDelegateMax(process.env.ERIX_DELEGATE_MAX);
