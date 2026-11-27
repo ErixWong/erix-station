@@ -99,7 +99,9 @@ function certificateInfo(cert) {
   try {
     publicKeyPem = cert.publicKey.export({ type: 'spki', format: 'pem' });
   } catch (err) {
-    throw fail('tls_cert_invalid', `证书公钥无法导出：${err?.message ?? err}`);
+    throw fail('tls_cert_invalid', `证书公钥无法导出：${err?.message ?? err}`, {
+      en: `unable to export the certificate public key: ${err?.message ?? err}`,
+    });
   }
   return {
     subjectCN: commonNameOf(cert.subject),
@@ -127,13 +129,15 @@ function certificateInfo(cert) {
  */
 export function parseCertificatePem(pem) {
   if (typeof pem !== 'string' || pem.trim() === '') {
-    throw fail('tls_cert_invalid', '证书 PEM 为空');
+    throw fail('tls_cert_invalid', '证书 PEM 为空', { en: 'certificate PEM is empty' });
   }
   let cert;
   try {
     cert = new crypto.X509Certificate(pem);
   } catch (err) {
-    throw fail('tls_cert_invalid', `证书 PEM 无法解析：${err?.message ?? err}`);
+    throw fail('tls_cert_invalid', `证书 PEM 无法解析：${err?.message ?? err}`, {
+      en: `certificate PEM cannot be parsed: ${err?.message ?? err}`,
+    });
   }
   return certificateInfo(cert);
 }
@@ -152,7 +156,7 @@ const CERT_PEM_BLOCK_RE = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICA
  */
 export function parseCertificateChain(pem) {
   if (typeof pem !== 'string' || pem.trim() === '') {
-    throw fail('tls_cert_invalid', '证书 PEM 为空');
+    throw fail('tls_cert_invalid', '证书 PEM 为空', { en: 'certificate PEM is empty' });
   }
   const blocks = [];
   const pems = [];
@@ -162,13 +166,17 @@ export function parseCertificateChain(pem) {
     try {
       cert = new crypto.X509Certificate(text);
     } catch (err) {
-      throw fail('tls_cert_invalid', `第 ${blocks.length + 1} 段证书无法解析：${err?.message ?? err}`);
+      throw fail('tls_cert_invalid', `第 ${blocks.length + 1} 段证书无法解析：${err?.message ?? err}`, {
+        en: `certificate section ${blocks.length + 1} cannot be parsed: ${err?.message ?? err}`,
+      });
     }
     blocks.push(cert);
     pems.push(text);
   }
   if (blocks.length === 0) {
-    throw fail('tls_cert_invalid', '证书 PEM 里没有任何 BEGIN CERTIFICATE 段');
+    throw fail('tls_cert_invalid', '证书 PEM 里没有任何 BEGIN CERTIFICATE 段', {
+      en: 'the certificate PEM contains no BEGIN CERTIFICATE block',
+    });
   }
   return { blocks, pem: pems };
 }
@@ -184,7 +192,7 @@ export function parseCertificateChain(pem) {
  */
 export function selectLeaf(blocks, keyObj) {
   const list = Array.isArray(blocks) ? blocks : [];
-  if (list.length === 0) throw fail('tls_cert_invalid', '证书 PEM 里没有任何证书段');
+  if (list.length === 0) throw fail('tls_cert_invalid', '证书 PEM 里没有任何证书段', { en: 'the certificate PEM contains no certificate block' });
   if (!keyObj) return { leaf: list[0], index: 0 };
   const index = list.findIndex((block) => keyMatchesCert(certificateInfo(block), keyObj));
   return index >= 0 ? { leaf: list[index], index } : { leaf: list[0], index: -1 };
@@ -215,12 +223,14 @@ export function describeChain(blocks) {
 /** 解析私钥 PEM（PKCS#8 / PKCS#1 / SEC1 都行，交给 OpenSSL）。非法 ⇒ `tls_key_invalid`。 */
 export function parsePrivateKeyPem(pem) {
   if (typeof pem !== 'string' || pem.trim() === '') {
-    throw fail('tls_key_invalid', '私钥 PEM 为空');
+    throw fail('tls_key_invalid', '私钥 PEM 为空', { en: 'private key PEM is empty' });
   }
   try {
     return crypto.createPrivateKey(pem);
   } catch (err) {
-    throw fail('tls_key_invalid', `私钥 PEM 无法解析：${err?.message ?? err}`);
+    throw fail('tls_key_invalid', `私钥 PEM 无法解析：${err?.message ?? err}`, {
+      en: `private key PEM cannot be parsed: ${err?.message ?? err}`,
+    });
   }
 }
 
@@ -311,23 +321,37 @@ export function certificateDomains({ sans, subjectCN }) {
  *          | {ok: false, code: string, message: string, details?: object}}
  */
 export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now = new Date() } = {}) {
+  // #803 返修②：这个返回面是 **return 一个结果对象**（不是 throw），所以当年按 `throw new XError`
+  // 扫的批次没看见它 ⇒ 每条失败只有中文 `message`，`http.js` 包装成 `TlsCertError` 时没有 `en` 可传
+  // ⇒ `pickMessage` 只能回退中文。现在每条都带 `messageEn`（字段名与本文件统一）。
+  // 中文 `message` 逐字不动（既有断言与日志都拄它）；`details` 形状也不动。
   const asFailure = (err) => ({
     ok: false,
     code: err.code,
     message: err.message,
+    // 解析辅助函数（`parseCertificateChain` / `parsePrivateKeyPem` / `certificateInfo` …）是 `throw` 一个
+    // 带 `en` 的 `TlsCertError`，这里把它的 `en` 折成结果对象的 `messageEn`，口径与直接 return 的那些一致。
+    messageEn: err.en,
     details: err.details,
   });
 
   // 大小闸在解析之前：64 KiB 的 base64 也要先拒，别把 OpenSSL 拖进去（同时也是「别把私钥塞进日志」的护栏）。
   for (const [field, value] of [['certPem', certPem], ['keyPem', keyPem]]) {
     if (typeof value !== 'string') {
-      return { ok: false, code: 'validation_failed', message: `${field} 必须是 PEM 字符串`, details: { field } };
+      return {
+        ok: false,
+        code: 'validation_failed',
+        message: `${field} 必须是 PEM 字符串`,
+        messageEn: `${field} must be a PEM string`,
+        details: { field },
+      };
     }
     if (Buffer.byteLength(value, 'utf8') > TLS_MAX_PEM_BYTES) {
       return {
         ok: false,
         code: 'validation_failed',
         message: `${field} 超过 ${TLS_MAX_PEM_BYTES} 字节上限`,
+        messageEn: `${field} exceeds the ${TLS_MAX_PEM_BYTES}-byte limit`,
         details: { field, max_bytes: TLS_MAX_PEM_BYTES },
       };
     }
@@ -356,6 +380,7 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
       ok: false,
       code: 'tls_key_mismatch',
       message: '私钥与证书不配对（公钥不一致）',
+      messageEn: 'the private key does not match the certificate (public keys differ)',
       details: { field: 'keyPem' },
     };
   }
@@ -368,6 +393,7 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
       ok: false,
       code: 'tls_cert_order_invalid',
       message: `第一个 BEGIN CERTIFICATE 必须是你的域名证书；现在第一个是「${firstInfo.subjectCN ?? '（无 CN）'}」（中间证书），请把叶子证书放在最前面`,
+      messageEn: `the first BEGIN CERTIFICATE must be your own domain certificate; the first one here is "${firstInfo.subjectCN ?? '(no CN)'}" (an intermediate certificate) - please put the leaf certificate first`,
       details: { firstSubjectCN: firstInfo.subjectCN, leafSubjectCN: leafInfo.subjectCN },
     };
   }
@@ -384,6 +410,7 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
       ok: false,
       code: 'tls_cert_chain_broken',
       message: `第 ${brokenAt + 1} 段接不上：「${info.subjectCN ?? '（无 CN）'}」的签发者是「${info.issuerCN ?? '（无 CN）'}」，但下一段是「${nextInfo.subjectCN ?? '（无 CN）'}」`,
+      messageEn: `section ${brokenAt + 1} does not chain: the issuer of "${info.subjectCN ?? '(no CN)'}" is "${info.issuerCN ?? '(no CN)'}", but the next section is "${nextInfo.subjectCN ?? '(no CN)'}"`,
       details: {
         index: brokenAt + 1, // 段号从 1 起（与文案里的「第 N 段」同数）
         subjectCN: info.subjectCN,
@@ -400,6 +427,7 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
       ok: false,
       code: 'tls_cert_expired',
       message: `证书已过期（notAfter=${cert.notAfter}）`,
+      messageEn: `the certificate has expired (notAfter=${cert.notAfter})`,
       details: { notAfter: cert.notAfter },
     };
   }
@@ -410,6 +438,7 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
       ok: false,
       code: 'tls_cert_domain_mismatch',
       message: `证书不覆盖管理台域名 ${normalizeHost(adminHost)}`,
+      messageEn: `the certificate does not cover the admin console hostname ${normalizeHost(adminHost)}`,
       details: { adminHost: normalizeHost(adminHost), missing: [normalizeHost(adminHost)], certDomains },
     };
   }
@@ -423,6 +452,7 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
         ok: false,
         code: 'validation_failed',
         message: 'confirmDomains 必须是字符串数组',
+        messageEn: 'confirmDomains must be an array of strings',
         details: { field: 'confirmDomains' },
       };
     }
@@ -434,6 +464,7 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
         ok: false,
         code: 'tls_cert_domain_mismatch',
         message: `confirmDomains 里有证书覆盖不到的名字：${missing.join(', ')}`,
+        messageEn: `confirmDomains contains names the certificate does not cover: ${missing.join(', ')}`,
         details: { adminHost: normalizeHost(adminHost), missing, certDomains, field: 'confirmDomains' },
       };
     }
@@ -703,10 +734,14 @@ export async function readPreviousCertificate({ dynamicDir, fsImpl = fs.promises
 // ---------------------------------------------------------------------------
 
 function stepError(step, err) {
+  // #803 返修②：这是第 5 个 `new TlsCertError` 面（写盘链路每一步的包裹），之前只有中文。
+  // `step` 是机器码（mkdir / backup / cert / key / materialize），插进两种语言都不破坏机器可读性；
+  // 内层 `err.message` 是 fs/OpenSSL 的原始英文诊断（不是本平台的文案），两边原样带。
   const wrapped = new TlsCertError('internal', `证书${step}步骤失败：${err?.message ?? err}`, {
     httpStatus: 500,
     details: { step },
     step,
+    en: `the certificate ${step} step failed: ${err?.message ?? err}`,
   });
   wrapped.cause = err;
   return wrapped;
@@ -811,7 +846,10 @@ export async function writeCertificateAssets({ dynamicDir, certPem, keyPem, fsIm
   if (!tlsOut.published) {
     const err = new TlsCertError('internal', `tls.yml 未发布（${tlsOut.reason ?? tlsOut.code ?? 'unknown'}）`, {
       httpStatus: 500,
-      en: `tls.yml was not published (${tlsOut.reason ?? tlsOut.code ?? 'unknown'})`,
+      // #803 返修②：`reason` 是**中文 + 服务器绝对路径**（如「…/certs/tls.key 是空文件」），
+      // 把它贴进英文腿等于没翻（还把路径泄进响应体）。英文腿只带机器码 `code`
+      // （missing / unreadable / not-file / empty / unknown）；中文腿原样保留 reason（运维要看路径）。
+      en: `tls.yml was not published (${tlsOut.code ?? 'unknown'})`,
       details: { step: 'materialize' },
       step: 'materialize',
     });
@@ -862,7 +900,8 @@ export async function rollbackCertificateAssets({ dynamicDir, fsImpl = fs.promis
   if (!tlsOut.published) {
     throw new TlsCertError('internal', `tls.yml 未发布（${tlsOut.reason ?? tlsOut.code ?? 'unknown'}）`, {
       httpStatus: 500,
-      en: `tls.yml was not published (${tlsOut.reason ?? tlsOut.code ?? 'unknown'})`,
+      // 与 `writeCertificateAssets` 那一处同口径（同一条中文必须配同一句英文）：英文腿只带机器码。
+      en: `tls.yml was not published (${tlsOut.code ?? 'unknown'})`,
       details: { step: 'materialize' },
       step: 'materialize',
     });

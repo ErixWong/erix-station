@@ -2987,10 +2987,13 @@ async function tlsStatusPayload(ctx) {
 }
 
 /** 429 信封（与 `handleAdminMailTest` 同一个形状）。 */
-function tlsRateLimited(gate, message) {
+function tlsRateLimited(gate, message, en) {
   return new HttpError(429, 'rate_limited', message, {
     retryable: true,
     headers: { 'Retry-After': String(gate.retryAfterSeconds) },
+    // #803 返修②：四个限流文案此前**没有英文腿**（`locale=en` 只能直出中文）。四个调用点的
+    // 英文各自对应自己的操作（upload / parsing / validation / rollback），不是同一句贴四份。
+    en,
   });
 }
 
@@ -3025,12 +3028,15 @@ async function handleAdminTlsPut(req, res, ctx, session) {
     throw new tlsCert.TlsCertError(result.code, result.message, {
       httpStatus: 400,
       details: result.details,
+      // #803 返修②：`validateUpload` 是 **return** 一个结果对象（不是 throw），它的每条失败现在都带
+      // `messageEn`；这里不传进去就等于在出口把英文腿弄丢（`pickMessage` 只能回退中文）。
+      en: result.messageEn,
     });
   }
 
   const limiterKey = `tlsupload:${session.user.id}`;
   const gate = ctx.tlsUploadLimiter.check(limiterKey);
-  if (!gate.allowed) throw tlsRateLimited(gate, '证书上传过于频繁，请稍后再试');
+  if (!gate.allowed) throw tlsRateLimited(gate, '证书上传过于频繁，请稍后再试', 'Certificate upload is too frequent; try again later.');
   ctx.tlsUploadLimiter.recordFailure(limiterKey);
 
   const written = await tlsCert.writeCertificateAssets({
@@ -3089,7 +3095,7 @@ async function handleAdminTlsInspect(req, res, ctx, session) {
 
   const limiterKey = `tlsinspect:${session.user.id}`;
   const gate = ctx.tlsInspectLimiter.check(limiterKey);
-  if (!gate.allowed) throw tlsRateLimited(gate, '证书解析过于频繁，请稍后再试');
+  if (!gate.allowed) throw tlsRateLimited(gate, '证书解析过于频繁，请稍后再试', 'Certificate parsing is too frequent; try again later.');
   ctx.tlsInspectLimiter.recordFailure(limiterKey);
 
   return sendJson(res, 200, tlsCert.inspectCertificate({
@@ -3113,7 +3119,7 @@ async function handleAdminTlsVerify(req, res, ctx, session) {
   requireJson(req);
   const limiterKey = `tlsverify:${session.user.id}`;
   const gate = ctx.tlsVerifyLimiter.check(limiterKey);
-  if (!gate.allowed) throw tlsRateLimited(gate, '证书校验过于频繁，请稍后再试');
+  if (!gate.allowed) throw tlsRateLimited(gate, '证书校验过于频繁，请稍后再试', 'Certificate validation is too frequent; try again later.');
   ctx.tlsVerifyLimiter.recordFailure(limiterKey);
 
   const active = await tlsCert.readActiveCertificate({ dynamicDir: tlsDynamicDir(ctx) });
@@ -3142,7 +3148,7 @@ async function handleAdminTlsRollback(req, res, ctx, session) {
   requireJson(req);
   const limiterKey = `tlsupload:${session.user.id}`;
   const gate = ctx.tlsUploadLimiter.check(limiterKey);
-  if (!gate.allowed) throw tlsRateLimited(gate, '回滚过于频繁，请稍后再试');
+  if (!gate.allowed) throw tlsRateLimited(gate, '回滚过于频繁，请稍后再试', 'Rollback is too frequent; try again later.');
   ctx.tlsUploadLimiter.recordFailure(limiterKey);
 
   const out = await tlsCert.rollbackCertificateAssets({
