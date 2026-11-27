@@ -3,6 +3,15 @@
 // afterEach/onError 归零）——没有这两条，把 `router.afterEach(() => budget.reset())` 整行删掉
 // 或把 budget 搬进 `beforeEach` 内部，**没有任何用例会红**，而后果是真实的（累计跳够 12 次就
 // 静默停止导航）。见本文件末尾的「熔断接线」describe。
+// ⚠ 超时口径（issue #830）：本文件每条用例都要 `await router.push(...)` 走**真实导航**
+// （真全局守卫 + `auth.ensureMe()` + 懒加载的真路由块，#450 那组还多一趟 `ensureSite()`）。
+// 机器被并行任务占住时，这一跳会撞 vitest 默认 **5s** ⇒ `Test timed out in 5000ms` **假红**
+// （issue 取证：main 串行全绿，3 个并发全量每次红 9–10 条、14s → 34.7s，红的就是本文件与
+// ForcePasswordChangeView.spec.ts 里这批用例；「16 次连续导航」那条成本更是别人的十几倍）。
+// ⇒ 只给这一类用例显式 `it(name, { timeout: 20_000 }, …)`。
+// ⚠ 这套超时**不许**搬到轻用例（纯判据 / 浅挂载 / 只调 store）上——它们的 5s 默认值是
+//   「真卡死时快一点变红」的诊断保险；也**不许**改 `vite.config.ts` 的全局 `testTimeout`
+//   绕过（issue 明确否掉：那会把真卡死的诊断时间一并拉长）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockInstance } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
@@ -84,35 +93,35 @@ beforeEach(() => vi.unstubAllGlobals());
 afterEach(() => vi.unstubAllGlobals());
 
 describe('全局路由守卫', () => {
-  it('未登录（/api/me 401）访问 / → 重定向 /login', async () => {
+  it('未登录（/api/me 401）访问 / → 重定向 /login', { timeout: 20_000 }, async () => {
     fetchMe(401, { error: { code: 'unauthorized', message: 'unauthorized' } });
     const router = await freshRouter();
     await router.push('/');
     expect(router.currentRoute.value.path).toBe('/login');
   });
 
-  it('已登录访问受保护路由 → 放行', async () => {
+  it('已登录访问受保护路由 → 放行', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: FDE_USER });
     const router = await freshRouter();
     await router.push('/');
     expect(router.currentRoute.value.path).toBe('/');
   });
 
-  it('已登录访问 /login → 回工作台 /', async () => {
+  it('已登录访问 /login → 回工作台 /', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: FDE_USER });
     const router = await freshRouter();
     await router.push('/login');
     expect(router.currentRoute.value.path).toBe('/');
   });
 
-  it('非 admin 访问 /admin → 回工作台 /', async () => {
+  it('非 admin 访问 /admin → 回工作台 /', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: FDE_USER });
     const router = await freshRouter();
     await router.push('/admin');
     expect(router.currentRoute.value.path).toBe('/');
   });
 
-  it('admin 访问 /admin → 重定向到用户管理页', async () => {
+  it('admin 访问 /admin → 重定向到用户管理页', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: ADMIN_USER });
     const router = await freshRouter();
     await router.push('/admin');
@@ -120,21 +129,21 @@ describe('全局路由守卫', () => {
     expect(router.currentRoute.value.name).toBe('admin-users');
   });
 
-  it('非 admin 访问任一管理台 tab → 回工作台', async () => {
+  it('非 admin 访问任一管理台 tab → 回工作台', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: FDE_USER });
     const router = await freshRouter();
     await router.push('/admin/llm');
     expect(router.currentRoute.value.path).toBe('/');
   });
 
-  it('无 session cookie（无响应体 401）也能落到 /login', async () => {
+  it('无 session cookie（无响应体 401）也能落到 /login', { timeout: 20_000 }, async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('unauthorized', { status: 401 })));
     const router = await freshRouter();
     await router.push('/');
     expect(router.currentRoute.value.path).toBe('/login');
   });
 
-  it('未登录访问深链 → /login 且带 redirect 回跳（hash 模式下 URL 为 #/session/s1）', async () => {
+  it('未登录访问深链 → /login 且带 redirect 回跳（hash 模式下 URL 为 #/session/s1）', { timeout: 20_000 }, async () => {
     fetchMe(401, { error: { code: 'unauthorized', message: 'unauthorized' } });
     const router = await freshRouter();
     await router.push('/session/s1');
@@ -142,21 +151,21 @@ describe('全局路由守卫', () => {
     expect(router.currentRoute.value.query.redirect).toBe('/session/s1');
   });
 
-  it('已登录访问 /login?redirect=... → 回跳到 redirect 目标', async () => {
+  it('已登录访问 /login?redirect=... → 回跳到 redirect 目标', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: FDE_USER });
     const router = await freshRouter();
     await router.push({ path: '/login', query: { redirect: '/session/s1' } });
     expect(router.currentRoute.value.path).toBe('/session/s1');
   });
 
-  it('已登录访问 /login（无 redirect）→ 回工作台 /', async () => {
+  it('已登录访问 /login（无 redirect）→ 回工作台 /', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: FDE_USER });
     const router = await freshRouter();
     await router.push('/login');
     expect(router.currentRoute.value.path).toBe('/');
   });
 
-  it('/session/:id 路由存在且复用工作台组件', async () => {
+  it('/session/:id 路由存在且复用工作台组件', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: FDE_USER });
     const router = await freshRouter();
     await router.push('/session/abc');
@@ -184,7 +193,7 @@ describe('#332 工作台准入闸的守卫接线', () => {
     ...SEATLESS_ADMIN, id: 'u9', login: 'root2', display_name: 'Root2', fde_name: 'root',
   } as AuthUser;
 
-  it('第 ③ 类人访问 / → 落到管理台（#/admin/users），不是工作台 #/', async () => {
+  it('第 ③ 类人访问 / → 落到管理台（#/admin/users），不是工作台 #/', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: SEATLESS_ADMIN });
     const router = await freshRouter();
     await router.push('/');
@@ -192,14 +201,14 @@ describe('#332 工作台准入闸的守卫接线', () => {
     expect(router.currentRoute.value.name).toBe('admin-users');
   });
 
-  it('第 ③ 类人深链 /session/:id（别人名下的会话）→ 同样落到管理台（工单 §二.3：不再踢回 #/）', async () => {
+  it('第 ③ 类人深链 /session/:id（别人名下的会话）→ 同样落到管理台（工单 §二.3：不再踢回 #/）', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: SEATLESS_ADMIN });
     const router = await freshRouter();
     await router.push('/session/someone-elses-session');
     expect(router.currentRoute.value.path).toBe('/admin/users');
   });
 
-  it('第 ② 类人（admin + 有 fde_name）访 / 与 /session/:id → 照常落地（挡的是「没工位」不是 admin）', async () => {
+  it('第 ② 类人（admin + 有 fde_name）访 / 与 /session/:id → 照常落地（挡的是「没工位」不是 admin）', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: ADMIN_WITH_SEAT });
     const router = await freshRouter();
     await router.push('/');
@@ -210,7 +219,7 @@ describe('#332 工作台准入闸的守卫接线', () => {
     expect(router.currentRoute.value.name).toBe('session');
   });
 
-  it('FDE 访 / 与 /session/:id → 落地不受影响（零回归）', async () => {
+  it('FDE 访 / 与 /session/:id → 落地不受影响（零回归）', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: FDE_USER });
     const router = await freshRouter();
     await router.push('/');
@@ -238,7 +247,7 @@ describe('#255 守卫重定向链条的熔断接线', () => {
     vi.restoreAllMocks();
   });
 
-  it('连续合法落地 16 次（远超预算 12）次次都成功 ⇒ 能落地的导航不消耗预算', async () => {
+  it('连续合法落地 16 次（远超预算 12）次次都成功 ⇒ 能落地的导航不消耗预算', { timeout: 20_000 }, async () => {
     // 判据：把 `router.ts` 的 `router.afterEach(() => budget.reset())` 注释掉 ⇒ 本条必红。
     // 目标选 `'/'` ↔ `'/session/sN'`：两个都是「已登录可直接落地」的真路由（不是被改写到别处，
     // 也不是与当前路由重复的 duplicated 空转），每一跳都真的走完 afterEach。
@@ -259,7 +268,7 @@ describe('#255 守卫重定向链条的熔断接线', () => {
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
-  it('判据退化成两态（改密屏自己也改写）时环被预算掐断：导航被终止、停在原地、恰好一条 warn', async () => {
+  it('判据退化成两态（改密屏自己也改写）时环被预算掐断：导航被终止、停在原地、恰好一条 warn', { timeout: 20_000 }, async () => {
     // 为什么不拿真判据测：真判据下根本不成环（/change-password 自己返 allow）。所以把判据换成
     // 「受限态连改密屏自己也改写过去」的两态版——正是三态判据要避免的那个环（见本文件 vi.mock）。
     //
@@ -366,7 +375,7 @@ async function freshHostRouter(currentOrigin: string) {
 }
 
 describe('#450 A2 host 闸的守卫接线', () => {
-  it('用户 host 上打开 #/admin/users ⇒ 跨 host 跳管理台，且本次导航被终止（不在错的 origin 上落地）', async () => {
+  it('用户 host 上打开 #/admin/users ⇒ 跨 host 跳管理台，且本次导航被终止（不在错的 origin 上落地）', { timeout: 20_000 }, async () => {
     const calls = stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: ADMIN_USER } } });
     const { router, navigations } = await freshHostRouter(USER_ORIGIN);
 
@@ -384,7 +393,7 @@ describe('#450 A2 host 闸的守卫接线', () => {
     expect(calls).toEqual(['/api/me', '/api/site']);
   });
 
-  it('用户 host + **未登录** + #/admin/users ⇒ 留在本 host 登录（不跨 host，跨过去必丢会话）', async () => {
+  it('用户 host + **未登录** + #/admin/users ⇒ 留在本 host 登录（不跨 host，跨过去必丢会话）', { timeout: 20_000 }, async () => {
     stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 401, body: { error: { code: 'unauthenticated' } } } });
     const { router, navigations } = await freshHostRouter(USER_ORIGIN);
 
@@ -395,7 +404,7 @@ describe('#450 A2 host 闸的守卫接线', () => {
     expect(router.currentRoute.value.query.redirect).toBe('/admin/users');
   });
 
-  it('用户 host + **FDE 账号** + #/admin/users ⇒ 回工作台（不把人送去他进不去的入口）', async () => {
+  it('用户 host + **FDE 账号** + #/admin/users ⇒ 回工作台（不把人送去他进不去的入口）', { timeout: 20_000 }, async () => {
     stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: FDE_USER } } });
     const { router, navigations } = await freshHostRouter(USER_ORIGIN);
 
@@ -405,7 +414,7 @@ describe('#450 A2 host 闸的守卫接线', () => {
     expect(router.currentRoute.value.path).toBe('/');
   });
 
-  it('管理台 host 上打开 #/session/x ⇒ **同 host** 改道 /admin/users（不跨 host —— 那是无限环的根因）', async () => {
+  it('管理台 host 上打开 #/session/x ⇒ **同 host** 改道 /admin/users（不跨 host —— 那是无限环的根因）', { timeout: 20_000 }, async () => {
     // 2026-11-06 真机「8443 ↔ 9443 疯狂跳转」：管理台 host 的非 admin 路径原来会跨 host 回用户面，
     // 而用户面又把 admin 路径送回来（两个 host 的会话可以是不同账号）⇒ 环。
     stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: FDE_USER } } });
@@ -418,7 +427,7 @@ describe('#450 A2 host 闸的守卫接线', () => {
     expect(router.currentRoute.value.path).toBe('/login');
   });
 
-  it('site 不可用（5xx）⇒ 不跳，原导航继续（fail-open）', async () => {
+  it('site 不可用（5xx）⇒ 不跳，原导航继续（fail-open）', { timeout: 20_000 }, async () => {
     stubApiByPath({
       site: { status: 503, body: { error: { code: 'unavailable', message: 'down' } } },
       me: { status: 200, body: { user: FDE_USER } },
@@ -431,7 +440,7 @@ describe('#450 A2 host 闸的守卫接线', () => {
     expect(router.currentRoute.value.path).toBe('/session/abc');
   });
 
-  it('管理台 host 上已经在对的 host ⇒ 不跳（防重定向环）', async () => {
+  it('管理台 host 上已经在对的 host ⇒ 不跳（防重定向环）', { timeout: 20_000 }, async () => {
     stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: ADMIN_USER } } });
     const { router, navigations } = await freshHostRouter(ADMIN_ORIGIN);
 
@@ -440,7 +449,7 @@ describe('#450 A2 host 闸的守卫接线', () => {
     expect(router.currentRoute.value.name).toBe('admin-users');
   });
 
-  it('#332 × #450：无工位管理员在**用户 host** 上最终落到 adminBaseUrl#/admin/users（不是 #/，也不是裸 /admin）', async () => {
+  it('#332 × #450：无工位管理员在**用户 host** 上最终落到 adminBaseUrl#/admin/users（不是 #/，也不是裸 /admin）', { timeout: 20_000 }, async () => {
     const SEATLESS = {
       id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: null, auth_source: 'local',
     } as AuthUser;
@@ -453,7 +462,7 @@ describe('#450 A2 host 闸的守卫接线', () => {
     expect(navigations).toEqual([`${ADMIN_ORIGIN}#/admin/users`]);
   });
 
-  it('管理台 host 上 FDE 用户登录成功（落地 /）⇒ **登出 + 停在登录页**（不跨 host：那是环的一半）', async () => {
+  it('管理台 host 上 FDE 用户登录成功（落地 /）⇒ **登出 + 停在登录页**（不跨 host：那是环的一半）', { timeout: 20_000 }, async () => {
     stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: FDE_USER } } });
     const { router, navigations } = await freshHostRouter(ADMIN_ORIGIN);
 

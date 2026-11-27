@@ -3,6 +3,13 @@
 // 装配风格照 ①（views/ForcePasswordChangeView.spec.ts）：真实 i18n 单例、不 mock t()、
 // 每例 localStorage.clear() + setLocale('zh-CN')、导航落地用 nextRouteLanding 显式判据（#473 family B：
 // 原先的 vi.waitFor 轮询默认 1000ms 是墙钟，慢机上假红）而不数 tick。
+//
+// ⚠ 超时口径（issue #830，第 3 步 `grep -rn "mountApp(" src --include=*.spec.ts` 核到的同款风险文件）：
+// 本文件每一条挂整 App 的用例（直写 `mountApp(…)`，或走 `enterForceScreen(…)`——它内部同样是
+// `mount(App)`）都吃真实导航 + 真实 i18n 装配，负载高时会和 ForcePasswordChangeView.spec.ts 一起
+// 撞 vitest 默认 **5s** ⇒ `Test timed out in 5000ms` 假红。⇒ 给它们显式 `it(name, { timeout: 20_000 }, …)`。
+// 纯判据/浅挂载的用例（双语键集、路由表空壳）**仍留默认 5s**：不许把宽限搬到轻用例上，
+// 也不许改 `vite.config.ts` 的全局 `testTimeout` 绕过（issue 明确否掉：那会拉长「真卡死」的诊断时间）。
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
@@ -270,7 +277,7 @@ afterEach(async () => {
 });
 
 describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言）', () => {
-  it('invalid_credentials（401 旧口令不对）⇒ 说「重输当前口令」，且**留在改密屏**、没回登录页', async () => {
+  it('invalid_credentials（401 旧口令不对）⇒ 说「重输当前口令」，且**留在改密屏**、没回登录页', { timeout: 20_000 }, async () => {
     const { wrapper, router } = await enterForceScreen({
       changeResponse: { status: 401, body: { error: { code: 'invalid_credentials', message: 'invalid credentials' } } },
     });
@@ -287,7 +294,7 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(router.currentRoute.value.path).toBe('/change-password');
   });
 
-  it('validation_failed + details.field ⇒ 文案点名到具体输入框（new_password → 「新口令」）', async () => {
+  it('validation_failed + details.field ⇒ 文案点名到具体输入框（new_password → 「新口令」）', { timeout: 20_000 }, async () => {
     const { wrapper } = await enterForceScreen({
       changeResponse: {
         status: 400,
@@ -302,7 +309,7 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(text).toContain('validation_failed');
   });
 
-  it('cross_origin_forbidden（#234）⇒ 给出「在浏览器地址栏直接打开本站再重试」这一步', async () => {
+  it('cross_origin_forbidden（#234）⇒ 给出「在浏览器地址栏直接打开本站再重试」这一步', { timeout: 20_000 }, async () => {
     const { wrapper } = await enterForceScreen({
       changeResponse: {
         status: 403,
@@ -317,7 +324,7 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(text).not.toContain('[object Object]');
   });
 
-  it('rate_limited（429 + Retry-After 头）⇒ 把 Retry-After 的秒数演成人能读的等待时长', async () => {
+  it('rate_limited（429 + Retry-After 头）⇒ 把 Retry-After 的秒数演成人能读的等待时长', { timeout: 20_000 }, async () => {
     const { wrapper } = await enterForceScreen({
       changeResponse: {
         status: 429,
@@ -333,7 +340,7 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(text).not.toMatch('undefined');
   });
 
-  it('429 但**没有** Retry-After 头 ⇒ 退到不带秒数的说法，不演 "undefined 秒"', async () => {
+  it('429 但**没有** Retry-After 头 ⇒ 退到不带秒数的说法，不演 "undefined 秒"', { timeout: 20_000 }, async () => {
     const { wrapper } = await enterForceScreen({
       changeResponse: { status: 429, body: { error: { code: 'rate_limited', message: 'too many attempts' } } },
     });
@@ -343,7 +350,7 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(text).toContain('rate_limited');
   });
 
-  it('kdf_busy（503 + Retry-After）⇒ 明说「不是你的口令有问题」并给出等待秒数', async () => {
+  it('kdf_busy（503 + Retry-After）⇒ 明说「不是你的口令有问题」并给出等待秒数', { timeout: 20_000 }, async () => {
     const { wrapper } = await enterForceScreen({
       changeResponse: {
         status: 503,
@@ -359,7 +366,7 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(text).toContain('kdf_busy');
   });
 
-  it('405（method_not_allowed）⇒ 给出「强制刷新后重试，仍失败拿错误码报障」', async () => {
+  it('405（method_not_allowed）⇒ 给出「强制刷新后重试，仍失败拿错误码报障」', { timeout: 20_000 }, async () => {
     const { wrapper } = await enterForceScreen({
       changeResponse: { status: 405, body: { error: { code: 'method_not_allowed', message: 'method not allowed' } } },
     });
@@ -369,7 +376,7 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(text).toContain('method_not_allowed');
   });
 
-  it('未知 code ⇒ 兜底文案**原样附上 code**（不许静默成通用错误）', async () => {
+  it('未知 code ⇒ 兜底文案**原样附上 code**（不许静默成通用错误）', { timeout: 20_000 }, async () => {
     const { wrapper } = await enterForceScreen({
       changeResponse: { status: 409, body: { error: { code: 'teapot_surprise', message: 'something new' } } },
     });
@@ -385,7 +392,7 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(text).not.toContain('forcePassword.errors');
   });
 
-  it('401 unauthorized（会话过期）⇒ 回登录页，**不**停在改密屏反复撞 401', async () => {
+  it('401 unauthorized（会话过期）⇒ 回登录页，**不**停在改密屏反复撞 401', { timeout: 20_000 }, async () => {
     const { wrapper, router, auth } = await enterForceScreen({
       changeResponse: { status: 401, body: { error: { code: 'unauthorized', message: 'unauthorized' } } },
     });
@@ -404,7 +411,7 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(auth.passwordChangeRequired).toBe(false);
   });
 
-  it('同一条错误切到 en 语言时说法跟着切（映射表双语都有，不是只写了中文）', async () => {
+  it('同一条错误切到 en 语言时说法跟着切（映射表双语都有，不是只写了中文）', { timeout: 20_000 }, async () => {
     const { wrapper } = await enterForceScreen({
       changeResponse: { status: 429, body: { error: { code: 'rate_limited', message: 'too many attempts' } }, headers: { 'Retry-After': '37' } },
     });
@@ -436,7 +443,7 @@ describe('#255 前端② [object Object] 反证（五种畸形形态都要渲染
   ];
 
   for (const [name, body, needle] of cases) {
-    it(`${name} ⇒ 渲染成可读字符串且不含 [object Object]`, async () => {
+    it(`${name} ⇒ 渲染成可读字符串且不含 [object Object]`, { timeout: 20_000 }, async () => {
       const { wrapper } = await enterForceScreen({ changeResponse: { status: 400, body } });
       await submitWrongButWellFormed(wrapper);
 
@@ -450,7 +457,7 @@ describe('#255 前端② [object Object] 反证（五种畸形形态都要渲染
     });
   }
 
-  it('没有 error 信封的纯文本 500（网关/反向代理原文）⇒ 渲染成可读字符串', async () => {
+  it('没有 error 信封的纯文本 500（网关/反向代理原文）⇒ 渲染成可读字符串', { timeout: 20_000 }, async () => {
     // 专门绕开 jsonResponse：非 JSON 的 text/plain 让 api() 的 r.json() 直接 reject。
     // 只接管被测那一个端点；其余端点照用确定成功夹具（不让无关请求掺进形状不对的回包）。
     const ok = makeApiFetchStub({ user: RESTRICTED_USER });
@@ -482,7 +489,7 @@ describe('#255 前端② [object Object] 反证（五种畸形形态都要渲染
 });
 
 describe('#255 前端② 全局 403 password_change_required 兜底（不在视图里判码）', () => {
-  it('任意请求返回该码 ⇒ 集中置旗标 + 切到改密屏（进路是工作台，不是改密屏自己）', async () => {
+  it('任意请求返回该码 ⇒ 集中置旗标 + 切到改密屏（进路是工作台，不是改密屏自己）', { timeout: 20_000 }, async () => {
     // 形状：会话本来**不受限**（/api/me 回答 false，人好好在工作台），**中途**任意一次 /api/*
     // 撞上 §2.11a 的门（管理员在另一头点了「重置口令」）⇒ 前端必须自己发现并把人送到改密屏。
     // 不确定性已拆掉：① 挂载期（gated=false）工作台会打的每个端点都是确定成功，且深链 s1 在会话
@@ -547,7 +554,7 @@ describe('#255 前端② 全局 403 password_change_required 兜底（不在视�
     expectNoLeakedRejections('工作台撞门 → 改密屏');
   });
 
-  it('403 但 code 是别的（forbidden / cross_origin_forbidden）⇒ **不许**误置旗标（变异靶子）', async () => {
+  it('403 但 code 是别的（forbidden / cross_origin_forbidden）⇒ **不许**误置旗标（变异靶子）', { timeout: 20_000 }, async () => {
     for (const code of ['forbidden', 'cross_origin_forbidden']) {
       const pinia = createPinia();
       setActivePinia(pinia);
@@ -580,7 +587,7 @@ describe('#255 前端② 全局 403 password_change_required 兜底（不在视�
     }
   });
 
-  it('200 响应体里带一个同名 code（理论上不该出现）⇒ 同样不许触发（判据要同时看状态码）', async () => {
+  it('200 响应体里带一个同名 code（理论上不该出现）⇒ 同样不许触发（判据要同时看状态码）', { timeout: 20_000 }, async () => {
     const pinia = createPinia();
     setActivePinia(pinia);
     // 同名 code 只挂在**工作台真的会打**的那个端点（会话列表）上，其余端点保持确定成功。
@@ -605,7 +612,7 @@ describe('#255 前端② 全局 403 password_change_required 兜底（不在视�
 });
 
 describe('#255 前端② 改密成功瞬间不把同一个组件重挂一帧', () => {
-  it('改密成功的形状：旗标已清、路由还停在 /change-password ⇒ 屏上**没有表单**（不重挂）', async () => {
+  it('改密成功的形状：旗标已清、路由还停在 /change-password ⇒ 屏上**没有表单**（不重挂）', { timeout: 20_000 }, async () => {
     const { wrapper, router } = await enterForceScreen({});
     expect(router.currentRoute.value.path).toBe('/change-password');
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(true);
@@ -634,7 +641,7 @@ describe('#255 前端② 改密成功瞬间不把同一个组件重挂一帧', (
     shimWrapper.unmount();
   });
 
-  it('成功链路照旧：清旗标后被 router.replace 送到落地页，改密屏不再在场', async () => {
+  it('成功链路照旧：清旗标后被 router.replace 送到落地页，改密屏不再在场', { timeout: 20_000 }, async () => {
     const { wrapper, auth, router } = await enterForceScreen({});
     // A 类：成功链路的导航由「清旗标 ⇒ router.replace(落地页)」触发 ⇒ 先订阅再提交。
     const landed = nextRouteLanding(router);

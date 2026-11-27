@@ -2,6 +2,17 @@
 // 约定（照 LoginView.spec / WorkbenchView.spec 先例）：装配真实 i18n 单例，不 mock t()；
 // 每例 localStorage.clear() + setLocale('zh-CN')；导航落地用 nextRouteLanding 显式判据
 // （#473 family B：原先是 vi.waitFor 墙钟轮询，默认 1000ms，慢机上假红），不数 tick。
+// ⚠ 超时口径（issue #830）：本文件上面两组用例**挂载整个 App 外壳并等真实路由跳转**
+// （`mountApp()` / `mountForce()` 都是 `mount(App)` + 真守卫改写 + `nextRouteLanding` 真落地），
+// 单次成本里含懒加载的路由块与真实 i18n 装配。机器被并行任务占住时实测一次真实导航要 1.2s+，
+// vitest 默认 **5s** 就会撞线 ⇒ `Test timed out in 5000ms` **假红**（取证：3 个并发全量，
+// 每次红 9–10 条、14s → 34.7s，且 main 串行全绿）。
+// ⇒ 只给这一类用例显式 `it(name, { timeout: 20_000 }, …)`。
+// ⚠ **不许**把这套超时搬到轻用例上（本文件末尾的双语文案用例、store 旗标用例都是纯函数/浅挂载，
+//   5s 从不撞线，留着默认值才能在真卡死时 5s 内变红）；
+//   也**不许**改 `vite.config.ts` 的全局 `testTimeout` 绕过（issue 明确否掉：那是把「慢」换成
+//   「更慢才发现真问题」）。
+// 根治方向（issue 建议 3，另开单）：改成挂被测组件 + 路由桩，跑得快就不需要宽限。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
@@ -196,7 +207,7 @@ describe('#255 登录响应旗标（auth store，三个服务端入口）', () =
 });
 
 describe('#255 强制改密屏 · 闸门（挂 App 验「工作台没挂载」）', () => {
-  it('登录返回 password_change_required=true ⇒ 渲染改密屏，且工作台/导航不渲染', async () => {
+  it('登录返回 password_change_required=true ⇒ 渲染改密屏，且工作台/导航不渲染', { timeout: 20_000 }, async () => {
     stubFetch({ loginFlag: true });
     const { wrapper, router } = await mountApp('/login');
     expect(wrapper.find('#loginName').exists()).toBe(true);
@@ -219,7 +230,7 @@ describe('#255 强制改密屏 · 闸门（挂 App 验「工作台没挂载」�
     expect(wrapper.text()).not.toContain('登出');
   });
 
-  it('登录返回 false ⇒ 一切照旧（正常进工作台，没有改密屏）', async () => {
+  it('登录返回 false ⇒ 一切照旧（正常进工作台，没有改密屏）', { timeout: 20_000 }, async () => {
     stubFetch({ loginFlag: false });
     const { wrapper, router } = await mountApp('/login');
     await wrapper.find('#loginName').setValue('bob');
@@ -234,7 +245,7 @@ describe('#255 强制改密屏 · 闸门（挂 App 验「工作台没挂载」�
     await vi.waitFor(() => expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(true));
   });
 
-  it('刷新（深链 #/session/<id> + /api/me 回答 true）⇒ 直接落在改密屏，会话视图没挂载', async () => {
+  it('刷新（深链 #/session/<id> + /api/me 回答 true）⇒ 直接落在改密屏，会话视图没挂载', { timeout: 20_000 }, async () => {
     stubFetch({ meFlag: true });
     const { wrapper, router } = await mountApp('/session/s1');
     await tick();
@@ -243,7 +254,7 @@ describe('#255 强制改密屏 · 闸门（挂 App 验「工作台没挂载」�
     expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(false);
   });
 
-  it('关不掉（不是 modal）：无对话框/遮罩/关闭按钮，且改完 URL 也进不去工作台', async () => {
+  it('关不掉（不是 modal）：无对话框/遮罩/关闭按钮，且改完 URL 也进不去工作台', { timeout: 20_000 }, async () => {
     stubFetch({ meFlag: true });
     const { wrapper, router } = await mountApp('/change-password');
     await tick();
@@ -264,7 +275,7 @@ describe('#255 强制改密屏 · 闸门（挂 App 验「工作台没挂载」�
     expect(wrapper.find('aside').exists()).toBe(false);
   });
 
-  it('已登录且受限的人访问 /login 也被改写到改密屏（登录页不是绕过口）', async () => {
+  it('已登录且受限的人访问 /login 也被改写到改密屏（登录页不是绕过口）', { timeout: 20_000 }, async () => {
     stubFetch({ meFlag: true });
     const { router } = await mountApp('/login');
     await tick();
@@ -299,7 +310,7 @@ describe('#255 改密表单与成功链路', () => {
     await tick();
   }
 
-  it('成功链路：POST /api/me/password 三字段齐全 + Content-Type application/json ⇒ 先 GET /api/me 才进正常界面', async () => {
+  it('成功链路：POST /api/me/password 三字段齐全 + Content-Type application/json ⇒ 先 GET /api/me 才进正常界面', { timeout: 20_000 }, async () => {
     const { wrapper, router, auth, calls } = await mountForce({ meFlag: true });
     // A 类：导航由「改密成功 ⇒ 清旗标 ⇒ router.replace(落地页)」触发 ⇒ 在提交之前订阅。
     const landed = nextRouteLanding(router);
@@ -330,7 +341,7 @@ describe('#255 改密表单与成功链路', () => {
     expect(auth.user?.login).toBe('alice');
   });
 
-  it('改密后 /api/me 仍回答 true ⇒ 留在改密屏（禁止本地把旗标改 false 就放行）', async () => {
+  it('改密后 /api/me 仍回答 true ⇒ 留在改密屏（禁止本地把旗标改 false 就放行）', { timeout: 20_000 }, async () => {
     // /api/me/password 返回 200，但 /api/me 依旧回答 must_change_password=true（服务端没清旗标）。
     const { wrapper, router, auth, calls } = await mountForce({ meFlag: true, clearFlagOnChange: false });
     await fillAndSubmit(wrapper);
@@ -342,7 +353,7 @@ describe('#255 改密表单与成功链路', () => {
     expect(calls.some((c) => c.url.startsWith('/api/me/password'))).toBe(true);
   });
 
-  it('失败态：服务端 error.code 与 error.message 原样渲染成字符串（不出现 [object Object]）', async () => {
+  it('失败态：服务端 error.code 与 error.message 原样渲染成字符串（不出现 [object Object]）', { timeout: 20_000 }, async () => {
     const { wrapper } = await mountForce({
       meFlag: true,
       changeResponse: {
@@ -361,7 +372,7 @@ describe('#255 改密表单与成功链路', () => {
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(true);
   });
 
-  it('服务端 message 是个对象（畸形信封）⇒ 退化成 JSON 文本，仍然没有 [object Object]', async () => {
+  it('服务端 message 是个对象（畸形信封）⇒ 退化成 JSON 文本，仍然没有 [object Object]', { timeout: 20_000 }, async () => {
     const { wrapper } = await mountForce({
       meFlag: true,
       changeResponse: { status: 400, body: { error: { code: 'validation_failed', message: { field: 'new_password' } } } },
@@ -373,7 +384,7 @@ describe('#255 改密表单与成功链路', () => {
     expect(text).toContain('new_password');
   });
 
-  it('两次新口令不一致 ⇒ 本地拦住不发请求（服务端没有 confirm 字段，一致性只能前端判）', async () => {
+  it('两次新口令不一致 ⇒ 本地拦住不发请求（服务端没有 confirm 字段，一致性只能前端判）', { timeout: 20_000 }, async () => {
     const { wrapper, calls } = await mountForce({ meFlag: true });
     await wrapper.find('#currentPassword').setValue('admin-set');
     await wrapper.find('#newPassword').setValue('one');
@@ -385,7 +396,7 @@ describe('#255 改密表单与成功链路', () => {
     expect(calls.some((c) => c.url.startsWith('/api/me/password'))).toBe(false);
   });
 
-  it('登出出口可用（§2.11a 放行清单含 logout）：清会话后回到 /login', async () => {
+  it('登出出口可用（§2.11a 放行清单含 logout）：清会话后回到 /login', { timeout: 20_000 }, async () => {
     const { wrapper, router, auth } = await mountForce({ meFlag: true });
     // A 类：登出走「清会话 + router.replace('/login')」⇒ 先订阅再点。
     const landed = nextRouteLanding(router);
