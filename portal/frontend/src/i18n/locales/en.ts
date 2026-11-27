@@ -591,6 +591,10 @@ export const en = {
     blocked: {
       container_not_running: 'Container not running — queue paused (resumes automatically)',
       deliver_failed: 'Last delivery failed — queue paused, recall and resend',
+      // #805: this run ended abnormally (user stop / failed / round cap), so the queued line
+      // was not delivered this round. Neutral status, not an error: the row is still pending
+      // and the next normal finish will retry it.
+      not_deliverable_at_terminal: 'This will be sent after the next normal finish (this run ended abnormally, which does not count as one)',
     },
   },
   picker: {

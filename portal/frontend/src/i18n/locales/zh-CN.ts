@@ -614,6 +614,9 @@ export const zhCN = {
     blocked: {
       container_not_running: '容器未运行，队列暂停投递（容器起来后自动继续）',
       deliver_failed: '上次投递没成功，队列已暂停，可取回后重发',
+      // #805：本轮被「非正常收尾」结束（用户按停止 / failed / 超轮数 …）⇒ 这句本轮不投。
+      // 语气必须是中性状态而不是错误：队列行**没丢**（仍是 pending），下一次正常收尾还会再试。
+      not_deliverable_at_terminal: '这句会等下一次正常收尾再发（本次运行被中断结束，不算正常收尾）',
     },
   },
   // 会话浏览 modal（components/SessionPickerModal.vue）
