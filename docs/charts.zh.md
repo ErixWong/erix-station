@@ -170,7 +170,7 @@ sequenceDiagram
     P->>DB: INSERT messages · INSERT runs · 入 run_queue
     P--)AG: SSE 下行：派单 hint（agentd 平时挂在这条长连接上）
     AG->>P: claim（租约 90s）+ 心跳 15s<br/>Authorization: Bearer per-container token
-    AG->>R: 起子进程 · 建 worktree agent/runId
+    AG->>R: 起子进程 · cwd = 项目目录（D8 修订：不建 worktree）
     end
 
     rect rgb(255, 240, 240)
@@ -206,7 +206,7 @@ sequenceDiagram
     R->>AG: U2 终态（termination / usage / final_text）
     AG->>P: 上报
     P->>DB: 合成 run_end · usage 入账（唯一权威）
-    Note over P: run 级端口回收 · worktree 保留<br/>确认后 fork/PR 回流（git host 中立，FDE 自理）
+    Note over P: run 级端口回收 · 项目目录保留（无 worktree 需回收）<br/>确认后 fork/PR 回流（git host 中立，FDE 自理）
     end
 ```
 

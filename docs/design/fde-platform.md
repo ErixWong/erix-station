@@ -37,8 +37,8 @@
 
 - 宿主是**一台裸 Linux host**，Docker 自管容器（无 K8s）
 - 容器成本**不是约束**
-- **隔离单元是 repository / worktree，不是容器**——容器只是「一台小电脑」
-- 允许同一仓库并发多个 agent：不同分支 + 不同 worktree，完成后 fork/PR 回流
+- **隔离单元是项目目录（cwd），不是容器**——容器只是「一台小电脑」（v0.1.x 原案写的是「repository / worktree」，**D8 已修订** ⇒ 附录 A.1）
+- 同一项目可以并行多个 run（`ERIX_AGENTD_CAPACITY` 默认 2，run 的数据/notes/transcript/产物各自 per-run 隔离）；**工作文件碰撞由用户自担（git 兜底）**，真出现踩踏再按项目粒度加执行锁——**没有 worktree**（见 [`directory-as-project.md`](directory-as-project.md)「同项目并行放行」）；回流仍走 fork/PR
 - 结对开发**不需要**：fork + PR 即可
 
 ---
@@ -50,7 +50,7 @@
 | **FDE 容器** | 一个 FDE 的「小电脑」，长期存在的开发环境 |
 | **project** | 容器内的一个仓库目录 `~/projects/<project>` |
 | **run** | 一次 `runToolLoop` 生命周期（一个 agent 任务） |
-| **worktree** | 一个 run 独占的 git worktree `~/worktrees/<project>-<runId>`，分支 `agent/<runId>` |
+| **worktree** | git 自身的 linked worktree。**当前不是 run 的隔离单元**：run 直接在 `~/projects/<project>`（cwd）里工作（D8 修订 ⇒ 附录 A.1）。v0.1.x 时代的定义是「一个 run 独占的 git worktree `~/worktrees/<project>-<runId>`，分支 `agent/<runId>`」，`prepareWorktree`/`cleanupWorktree` 已整体拆除 |
 | **slot** | 分配给一个 run 的端口块 |
 | **session** | 对话会话（UI 概念），一个 session 串起多次 run |
 | **ingress** | 唯一入口网关（Traefik），所有外部访问必经之路 |
@@ -783,7 +783,7 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 ├── home/                          # 挂到容器 /home/<user>（HOME：.git-credentials[FDE 自配] + .erix/{config.json,mcp.json,skills,todos} + .cache/station/spool）
 ├── platform/git/                  # 平台托管 Git 凭据（#399：portal 独占写，ro bind → 容器 /run/erix/git）
 ├── projects/<project>/            # 仓库；含 .erix/{ports.json,AGENTS.md} + .gitignore
-├── worktrees/<project>-<runId>/   # 每个 run 独占的 git worktree（agentd 创建）
+├── worktrees/<project>-<runId>/   # 历史遗留目录：D8 修订后 agentd 不再创建（老用户空间里可能仍存在，平台不回收）
 └── cache/                         # 依赖缓存（npm/pnpm/pip）
 ```
 
@@ -791,11 +791,11 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 
 ### 12.2 容器内约定（写进 FDE 容器的 AGENTS.md）
 
-- 一个项目 = `~/projects/<project>`；一个 run = `~/worktrees/<project>-<runId>` + 分支 `agent/<runId>`
+- 一个项目 = `~/projects/<project>`；**一个 run 的 cwd 就是 `~/projects/<project>`**（D8 修订）。v0.1.x 的口径「一个 run = `~/worktrees/<project>-<runId>` + 分支 `agent/<runId>`」已随之作废（⇒ A.1）
 - 端口从 `~/projects/<project>/.erix/ports.json` 取，不自己挑；dev server 绑 `0.0.0.0`
 - 回流走 fork/PR，不直接在主干改
-- `git worktree` 的**创建与清理（`worktree remove` / `worktree prune`）归 agentd**（run 启动前必须存在、结束后由 agentd 回收，见 runner-integration §6.2）；worktree 内的**内容由 agent（FDE）在容器内自行管理**（改代码、commit、分支），平台不代管内容（决策者 2026-09，issue #3 评论）；`.git` 是共享的，清理时别误删其他 run 的 worktree
-- `node_modules` 每个 worktree 一份 → 用 pnpm store / npm cache 共享
+- **git 一切归 agent（FDE）在容器内自理**：改代码、commit、分支、以及 `git worktree` 的创建与清理——平台不代管内容，也**不再**创建/清理 worktree（v0.1.x 曾把「创建与清理归 agentd」写进这里，随 D8 修订一并作废 ⇒ A.1；同期「`.git` 是共享的，清理时别误删其他 run 的 worktree」那条约束也不再适用）
+- `node_modules` 每个项目目录一份（v0.1.x 是「每 worktree 一份」）→ 用 pnpm store / npm cache 共享
 - agent 代劳执行 clone；Git 凭据由 FDE 经 portal 投放到 `~/.git-credentials`（#110，`0640`、FDE 属主、不进 DB/环境变量；见 [`user-space.md`](user-space.md) §4.1.1）。平台不下发 SSH key（SSH 强制私钥 `0600` 与组可读 `0640` 冲突）。
 
 > **平台文件读取纪律**：`ports.json` / `config.json` 一律经 `manifest.json` 校验后再读（防跨文件混合版本），见 [`user-space.md`](user-space.md) §3/§5.4。
@@ -848,7 +848,7 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 - FDE 容器由 portal 通过 Docker API 动态创建（模板化，非 compose）；**创建契约（网络 `--subnet`/`--add-host`/UID-GID/capability/agentd 命令）见 deploy-contract.md §5**
 - **数据持久化**：bind mount 一律 `/docker/<名称>/`（平台统一约定）；用户空间 `/srv/erix/users/<fde>/`（宿主路径，FDE 容器内映射 `/home/<user>`，见 [`user-space.md`](user-space.md) §2）；**宿主源↔容器目标↔权限见 deploy-contract.md §2**
 - `restart: unless-stopped`；DB 与 portal 配 healthcheck（**阈值与 readiness 语义见 deploy-contract.md §2/§8**）
-- **容器资源限额**：FDE 容器的创建参数（如 `--memory` 限额）只能由 portal 经 Docker API 设置（容器创建参数为平台侧独有）；`node_modules` 每 worktree 一份的磁盘/内存压力在容器内由 FDE 用 pnpm store / npm cache 自行缓解（§12.2）
+- **容器资源限额**：FDE 容器的创建参数（如 `--memory` 限额）只能由 portal 经 Docker API 设置（容器创建参数为平台侧独有）；`node_modules` 每项目目录一份（v0.1.x 写的是「每 worktree 一份」）的磁盘/内存压力在容器内由 FDE 用 pnpm store / npm cache 自行缓解（§12.2）
 - **可靠性**：中心 DB 是全平台单点；portal 无状态（状态在 DB），可重启。**DB 备份/高可用不在本项目范围**（系统级方案负责，决策者 2026-09，issue #3 评论）——平台侧只保证数据落卷（bind mount，见上）、DB 处于可被系统级备份方案备份的形态
 - **可观测**：run 事件、judge 决策、工具调用、访问审计、用量都在 DB，直接做看板
 - **长任务无人看** → 完成/失败/需审批时通知（邮件或 IM webhook）——**延后（P2+），P1 不做**（决策者 2026-09，issue #3 评论）。§7.1 本地 admin 登录告警、§11.4 出口策略未实施时的管理层书面知情，语义保留（它们是设计结论），但**通知通道实现同属延后事项**，不阻塞 P1
@@ -886,7 +886,7 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 | D5 | dev 端口由**平台分配**，DB 为真相 + `.erix/ports.json` 为派生副本（单向） | 防冲突/URL 漂移；agent 不自己挑端口 |
 | D6 | LLM 走**模式 C：唯一可达的网关出口**；其中「FDE 改不了 endpoint」**依赖网络层出口策略（安全团队职责），平台不负实施责任**；策略未实施时降级为审计+告警，须管理层书面知情（决策者 2026-09，issue #3） | 「FDE 改不了 endpoint」只能靠网络强制，不能靠文件权限 |
 | D7 | 事件/transcript 落中心 DB，portal 从 DB 读并发 SSE；**只有 durable 档落库**（issue #502 形态 M：stream 档碎片只转发不落库、不占 `seq`；未完稿正文终态**并进既有 `run_end` 的载荷**（`payload.partial_text`，零新类型零新索引），断线补发用 portal 进程内累加器且**只看内存**） | portal 重启不杀任务；断线可按 Last-Event-ID 补发（未定稿那段靠 `roundSeq` 与前端对账，不靠水位线）。碎片入库的代价是「一次事务 + 五个索引更新」换 **2.09 个字符**（dev 真库现查 `avg(length(payload->>'text'))`；早前工单里那个 3.82 是同一条 SQL 的旧读数，已按现查改正），且不落库也不丢内容——碎片可重生，终稿在 `messages`/`transcript_rounds`，未定稿在 `run_end.partial_text` |
-| D8 | 隔离单元 = **worktree**（`agent/<runId>` 分支） | 同仓库并发多 agent 不冲突；回流走 fork/PR |
+| D8 | 隔离单元 = **worktree**（`agent/<runId>` 分支）〔**已修订 ⇒ A.1：现为项目目录（cwd）**〕 | 原案理由（**已失效**）：不同 worktree 隔离 ⇒ 同仓库并发不冲突、回流走 fork/PR。**cwd 隔离不保证工作文件无冲突**：并行 run 各 own 自己的数据/产物，但同一份项目文件会互相看见，碰撞由用户自担（真踩再加 per-cwd 执行锁，见 A.1） |
 | D9 | **认证放边缘**，dev server 与 agent 不感知认证 | 安全设施对 agent 工具链透明；应用零改造 |
 | D10 | 仓库名 `erix-station`，展示名 **FDE Station** | 标识短（天天打）、展示名说清语义 |
 

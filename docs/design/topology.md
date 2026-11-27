@@ -314,7 +314,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 - **`/proc/<pid>/environ` 可读性**：同 UID 下任何进程可读同 UID 进程的 `/proc/<pid>/environ`（含注入 token 的 env）——这是「同 UID 时进程约定不可靠」的根因；不同 UID 下 Linux 默认权限阻断跨 UID 读取。
 - **禁止 ptrace、最小 capability**：容器模板不授 `CAP_SYS_PTRACE`（禁 ptrace 读他进程内存/env），capability 只授运行所需最小集（不授 `NET_ADMIN`/`SYS_ADMIN`）；seccomp/AppArmor 默认 profile 保持。
 - **残余风险声明（接受）**：FDE 拥有自己容器的 root（或等价权限）→ **接受「FDE 可破坏自己的平台状态」**——可伪造自己的事件/usage/终态（例如绕过 agentd 直连 portal 出示自己 token 编数据）。**跨 FDE 由归属校验挡住**（portal 用 token 解出 `container_id`/`user_id`，所有 `:run_id` 资源校验归属，防跨容器伪造 run_id）；FDE 不能影响他人，也不能越权读 DB / LLM 凭据。
-- **bind mount 写边界**：portal 原子写 `/srv/erix/users/<fde>/` 下**平台生成的文件**（模板 / AGENTS.md / `.erix/ports.json`——tmp+rename 原子写，容器只读到完整文件）；`~/projects`、`~/worktrees`、`~/cache` 等**允许 FDE 修改**（那是他的工作区，平台不代管内容）。
+- **bind mount 写边界**：portal 原子写 `/srv/erix/users/<fde>/` 下**平台生成的文件**（模板 / AGENTS.md / `.erix/ports.json`——tmp+rename 原子写，容器只读到完整文件）；`~/projects`、`~/cache` 等**允许 FDE 修改**（那是他的工作区，平台不代管内容；v0.1.x 此处还列 `~/worktrees`，D8 修订后 agentd 不再创建 ⇒ [`fde-platform.md`](fde-platform.md) 附录 A.1）。
 
 ---
 

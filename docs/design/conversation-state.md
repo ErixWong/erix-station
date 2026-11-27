@@ -1,7 +1,7 @@
 # 会话状态模型：三层生命周期与 session-scoped transcript（issue #77）
 
 > 状态：**已实施**（2026-11-10 复核：`chat_sessions` + `transcript_rounds` 在生产库、`appendUserTurn` 在写侧、P1 的 `archiveRunData`/`sweepRunDataDir` 在 `runner/lib/run-data.js`）。**逐阶段状态看 §5 那张表**——那里是唯一真相（P2 已实施、P3 的 PR①②a②b③ 已完成、仅剩 ②c 残留数据收敛）。
-> 依据：`design/principles.md`（不变式 3「DB 是状态真相」、D8「隔离单元 = worktree」）、
+> 依据：`design/principles.md`（不变式 3「DB 是状态真相」、D8「隔离单元 = **项目目录（cwd）**」，原案 worktree 已随 D8 修订作废 ⇒ [`fde-platform.md`](fde-platform.md) 附录 A.1）、
 > `design/runner-integration.md`（erix-agent `runToolLoop`/`TranscriptStore` 锚点）、
 > issue #64（产物回收）/ #69（历史注入，过渡方案）/ #70（已合并的第一版注入）。
 > 参照系：**pi coding agent**（`@earendil-works/pi-coding-agent` docs/sessions.md、
@@ -15,7 +15,7 @@
 |---|---|---|---|---|
 | **执行（run）** | 进程、租约、事件流、计费 | 分钟级，牲口，可崩可弃 | portal 运维 / UI 实时流 | DB（runs/run_events/run_queue） |
 | **会话（conversation）** | 消息 + 工具调用 + 推理轨迹 | 与人的协作等长（天~周），单调增长、需压缩 | **模型**（每轮都需要） | ⚠️ 当前分裂（见下） |
-| **工作区（workspace）** | 代码文件、产物 | 最长，跨一切 | 人 + 模型 | worktree / git / artifacts（#64） |
+| **工作区（workspace）** | 代码文件、产物 | 最长，跨一切 | 人 + 模型 | 项目目录（cwd；D8 修订前是 worktree）/ git / artifacts（#64） |
 
 现状的病根：**runId 同时是运维单元和 transcript key**，导致会话真相分裂成两半——
 
@@ -41,7 +41,7 @@ pi（本地单用户，无远端宿主）的会话模型与 erix-agent store 机
     ┌─────────┼──────────────┐
     ▼         ▼              ▼
  会话真相    执行单元       工作区
- session-scoped          worktree/artifacts
+ session-scoped          项目目录/artifacts
  engine transcript
  （key=sessionId，跨执行累积，append-only + 归档 TTL）
     ▲

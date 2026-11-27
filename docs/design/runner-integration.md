@@ -786,7 +786,7 @@ FDE 浏览器        portal                agentd               worker（execute
 | 文件/目录 | 写方 | 说明 |
 |---|---|---|
 | 模板 / `AGENTS.md` / `.erix/ports.json` | **portal 原子写**（tmp+rename） | 平台生成；容器只读到完整文件 |
-| `~/projects` / `~/worktrees` / `~/cache` | **FDE 可修改** | 工作区，平台不代管内容 |
+| `~/projects` / `~/cache`（v0.1.x 还含 `~/worktrees`，D8 修订后不再创建 ⇒ 规格 §12.2 / [`fde-platform.md`](fde-platform.md) 附录 A.1） | **FDE 可修改** | 工作区，平台不代管内容 |
 
 ---
 

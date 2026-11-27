@@ -5167,7 +5167,7 @@ portal 只问「这条事件是不是 stream 档」。现查（本机已安装�
 语义（与 runner §4.2 U4 一致）：
 
 - **续租**：portal 对每个 run 校验 `claim_token` 匹配当前有效租约 → 续租（`lease_until = now + 90s` ⚠️）；不匹配 → `lease: lease_lost`。
-- **`lease_lost` vs `revoked`**：`lease_lost` 是 **run 级**（单个 run 的租约被取代）→ agentd **本地 abort 该 run 的 worker、丢弃其缓冲与 spool**，不再续传该 run 的任何写；`revoked` 是 **容器级**（token 吊销 / offboard）→ agentd 停领新任务、drain（abort 全部在跑 run → 等 worker 退出 → 清理 worktree）后退出。`revoked` **不在 `200` 内表达**：吊销由鉴权阶段 `401 token_revoked` 给出（SSE revoke / claim 401 / heartbeat 401 三径同源，issue #22）；`401/5xx` 对非吊销原因才是整次心跳失败（指数退避重试）。
+- **`lease_lost` vs `revoked`**：`lease_lost` 是 **run 级**（单个 run 的租约被取代）→ agentd **本地 abort 该 run 的 worker、丢弃其缓冲与 spool**，不再续传该 run 的任何写；`revoked` 是 **容器级**（token 吊销 / offboard）→ agentd 停领新任务、drain（abort 全部在跑 run → 等 worker 退出；v0.1.x 这一步还包含「清理 worktree」，D8 修订后 agentd 不再创建 worktree ⇒ 无此清理动作）后退出。`revoked` **不在 `200` 内表达**：吊销由鉴权阶段 `401 token_revoked` 给出（SSE revoke / claim 401 / heartbeat 401 三径同源，issue #22）；`401/5xx` 对非吊销原因才是整次心跳失败（指数退避重试）。
 - **停止兑底**：`stop_run_ids` 是 portal 侧 `cancel_requested_at` 已置位但 SSE `stop_request` 可能未达的 run 的兑底通道（SSE 为主、心跳为备）。
 
 幂等：天然幂等（覆盖写 `last_heartbeat`、续 lease）。portal 侧判定：**连续 3 次心跳丢失（45s ⚠️）判容器死**；run 级处置走租约到期 re-claim（runner §6.4）。
@@ -5568,7 +5568,7 @@ resume=true 时不传 initialMessages/initialUserMessage（引擎恢复记录即
 
 ### 9.11 `POST /api/internal/runs/:id/release`（U12：主动放弃已领任务）
 
-claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃时使用（runner §6.2/§6.4）。
+claim 后准备工作（v0.1.x：worktree 创建 / worker fork；D8 修订后 agentd 只保证 `~/projects/<name>` 存在，不再建 worktree ⇒ [`../design/fde-platform.md`](../design/fde-platform.md) 附录 A.1）失败或 worker 崩溃时使用（runner §6.2/§6.4）。
 
 请求：
 
@@ -5584,7 +5584,7 @@ worker 被杀后重排的上报形态（**issue #288 additive**；没有 kill �
 
 | 字段 | 说明 |
 |---|---|
-| `reason` | string，必填，非空，≤ 64 字符。开放值（便于扩新场景，**无枚举白名单** ⇒ 新值不需协同发版），常用：`worktree_failed`（worktree 创建失败）/ `worker_crashed`（worker 非预期退出）/ `fork_failed` / `prep_failed` / `agent_shutdown`；**#288 起新增 `watchdog_silent`**（F6 执行期静默看门狗判死，之前误报 `worker_crashed`） |
+| `reason` | string，必填，非空，≤ 64 字符。开放值（便于扩新场景，**无枚举白名单** ⇒ 新值不需协同发版），常用：`worktree_failed`（worktree 创建失败；**历史遗留值**——D8 修订后 runner 不再建 worktree，新代码不再产生它，但它是开放值、旧 agentd 与历史事件里仍存在，值本身不改）/ `worker_crashed`（worker 非预期退出）/ `fork_failed` / `prep_failed` / `agent_shutdown`；**#288 起新增 `watchdog_silent`**（F6 执行期静默看门狗判死，之前误报 `worker_crashed`） |
 | `killed_by` | **issue #288 additive**，可选：`watchdog`（F6 执行期静默被判死，缺陷 A 的看门狗）\| `crash`（worker 非预期退出）。**只认这两个值**；缺省或非法值 ⇒ 视为「没有 kill 报告」，**不 400、不写事件**（旧 agentd 与「压根没起 worker」的 release 全走这条路）。它决定 portal 是否合成 `attempt_killed`（§5.3 第 14 类） |
 | `silent_ms` | **issue #288 additive**，可选 number：判死前的静默时长。portal 只在 `Number.isFinite(v) && v >= 0` 时写入事件载荷（四舍五入取整），否则**整个键不出现**——绝不拿 `0` 冒充「有静默时长」（与 #283 的 `duration_ms` 同一口径） |
 | `next_retry_in_ms` | **issue #288 additive**，可选 number：预留给「宿主侧退避」，portal 会原样写进事件载荷；**当前 agentd 不发这个字段**（不发就没有该键） |

@@ -14,7 +14,7 @@
 
 ### 原理一：容器是信任边界，不是协作单元
 
-**陈述**：每个 FDE 一台容器，容器是安全隔离、故障隔离、资源限制、环境复现的**唯一粒度**。协作与并发的粒度则是 **worktree**，不是容器。
+**陈述**：每个 FDE 一台容器，容器是安全隔离、故障隔离、资源限制、环境复现的**唯一粒度**。协作与并发的粒度则是**项目目录（cwd）**，不是容器（v0.1.x 此处写的是 **worktree**，已随 **D8 修订**作废 ⇒ [`fde-platform.md`](fde-platform.md) 附录 A.1）。
 
 **为什么**：
 - erix-agent 的 ADR-009 已裁决「agent 不内置安全，谁用谁负责」。因此平台**必须**提供牢笼，而能提供内核级隔离的最小单元就是容器。
@@ -24,7 +24,7 @@
 **派生规则**：
 - 每 FDE 容器**只接自己的 `/29` 网络**（`fde-<name>`），不与其他 FDE 共享任何网络（H-B：`control` 已取消，topology.md §2）
 - FDE 容器不 publish 端口、不挂 `docker.sock`、不持有平台密钥
-- 同一仓库的并发靠 **worktree + `agent/<runId>` 分支**，不靠多容器
+- 同一项目的并发**不靠多容器，也不靠 worktree**：靠 `ERIX_AGENTD_CAPACITY`（默认 2）放行并行 run + run 级数据隔离（数据目录/notes/transcript/产物），工作文件碰撞由用户自担（git 兜底），真出现踩踏再按项目粒度加执行锁（v0.1.x 的「worktree + `agent/<runId>` 分支」口径已作废 ⇒ [`fde-platform.md`](fde-platform.md) 附录 A.1）
 
 **违反后果**：容器间可互访（横向越权）、FDE 可从容器内操作宿主机 Docker（逃逸）、同仓库并发互相覆盖。
 
@@ -126,7 +126,7 @@
 | 事件落 DB、portal 发 SSE（§10.2） | 三 |
 | 容器不挂 docker.sock、不持平台密钥（§4） | 一 |
 | LLM 唯一出口网关（§11.3 模式 C） | 四 |
-| 隔离单元 = worktree（§12.2） | 一 |
+| 隔离单元 = 项目目录 / cwd（§12.2；**原案 worktree 已随 D8 修订作废** ⇒ 附录 A.1） | 一 |
 | 平台复用 erix 公开 API、缺口回上游（§13） | 五 |
 
 ---
@@ -143,7 +143,7 @@
 | **每个端口一条手工/动态路由配置** | 控制面复杂度爆炸（N 用户 × M 端口）——**已按 issue #9 改判**：per-allocation router+service 由 reconciler 从 DB 幂等生成，复杂度由自动化承担；被否决的是「手工维护」与「单通配 service」，不是 per-allocation 模型本身 | reconciler（topology §8） |
 | **让 agent 自己挑端口** | 冲突；端口漂移导致 URL 变化（书签/预览/iframe 全断）；无法审计与回收 | 无 |
 | **所有 FDE 容器共享一个 docker 网络** | 容器互访可绕过 ingress 直达（`curl alice:4000`） | 无 |
-| **把工作区锁在「仓库」粒度（同一仓库串行）** | 白白串行化；FDE 常态就是同仓库多分支并行 | 无（用 worktree 解决） |
+| **把工作区锁在「仓库」粒度（同一仓库串行）** | 白白串行化；FDE 常态就是同仓库多分支并行 | 无（同项目并行已放行，见 [`directory-as-project.md`](directory-as-project.md)；原案「用 worktree 解决」已随 D8 修订作废 ⇒ [`fde-platform.md`](fde-platform.md) 附录 A.1） |
 | **共享工作区做结对开发** | 需要协调锁与冲突；fork + PR 已经够用且更安全 | 需要真正的实时结对编辑时 |
 | **portal 自持上游 key 并做流式代理（§11 模式 B）** | 要自己实现 SSE 透传、超时、错误码映射、usage 透传；而 LiteLLM 这类网关**原生具备**虚拟 key / 预算 / 模型白名单 / 限流 / 用量查询 | 公司明确不允许把网关暴露给容器时 |
 | **LLM key 直发容器且无出口管控（§11 模式 A）** | 改 endpoint 即可把客户代码发往外部 LLM；「改不了」只能靠纪律，而原理四说纪律不算 | FDE 全员可信且客户数据泄漏风险被管理层显式接受 |

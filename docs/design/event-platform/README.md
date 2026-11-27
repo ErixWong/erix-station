@@ -52,7 +52,7 @@
 | [05-first-macros](05-first-macros.md) | 第一版配哪几条（M1 终态通知 / M8 静默告警 / M7 定时任务），E2/E3/E4 为什么挂账 | 「第一版到底做多少」 |
 | [06-execution-and-recovery](06-execution-and-recovery.md) | 打卡型宏为什么不需要 subagent、自动开会话的三件事、**完成→审查→回灌**、**失败→分诊→恢复** | 「每天自动跑行不行」「审查结果怎么灌回去」 |
 | [07-surfaces-and-panel](07-surfaces-and-panel.md) | 管理台模板定义 / 用户会话下拉 / 后台执行三面 + **用户端 trigger→action→result 面板** | 「界面怎么给」「跑了没有」 |
-| [08-watch-and-review](08-watch-and-review.md) | **值守与审查的收口**：一条链、**一个判决者**（平台只采集事实不下判决，为何撤掉机械判据层）+ 概念图（M1/M8/M9/M7 ↔ 值守）+ 事实采集清单 + worktree 冻结 + 只读（不给 shell）+ **判决第一行固定格式** + 回灌 | 「这套框架到底长什么样」「为什么不做机械层」 |
+| [08-watch-and-review](08-watch-and-review.md) | **值守与审查的收口**：一条链、**一个判决者**（平台只采集事实不下判决，为何撤掉机械判据层）+ 概念图（M1/M8/M9/M7 ↔ 值守）+ 事实采集清单 + **读活目录**（#690 撤掉了原「worktree 冻结副本」方案）+ 只读（不给 shell）+ **判决第一行固定格式** + 回灌 | 「这套框架到底长什么样」「为什么不做机械层」 |
 | [09-observability](09-observability.md) | **可观测性**：怎么回答「执行了没有、结果如何」——**三层问题**（看过吗 / 命中吗 / 做成了吗）+ 四态判定表 + 用户值守面板 + 管理台 List & Filter + 汇总口径 | 「它到底跑了没有」「为什么没跑」 |
 | [10-implementation-contract](10-implementation-contract.md) | **实现契约**：枚举单一真源 / W2→W3 意图对象 / 五组 HTTP API 的请求响应 / 归属补丁 / 判据命令 / W4 拆分 / M7 执行器 | 「实现者之间怎么对接」「别各自发挥」 |
 
