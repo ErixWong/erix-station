@@ -170,7 +170,7 @@ sequenceDiagram
     P->>DB: INSERT messages · INSERT runs · enqueue run_queue
     P--)AG: SSE downlink: dispatch hint (agentd idles on this long-lived connection)
     AG->>P: claim (lease 90s) + heartbeat every 15s<br/>Authorization: Bearer per-container token
-    AG->>R: spawn subprocess · create worktree agent/runId
+    AG->>R: spawn subprocess · cwd = the project directory (D8 revision: no worktree created)
     end
 
     rect rgb(255, 240, 240)
@@ -206,7 +206,7 @@ sequenceDiagram
     R->>AG: U2 terminal state (termination / usage / final_text)
     AG->>P: report
     P->>DB: synthesize run_end · usage booked (single source of truth)
-    Note over P: run-level ports recycled · worktree kept<br/>after review: fork/PR back (git-host-neutral, handled by the FDE)
+    Note over P: run-level ports recycled · the project directory is kept (no worktree to recycle)<br/>after review: fork/PR back (git-host-neutral, handled by the FDE)
     end
 ```
 
