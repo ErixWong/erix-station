@@ -391,8 +391,15 @@ export function createIntentDispatcher({
         await finishMacroRun(pool, { macroRunId, status: 'done' });
         return;
       }
-      default:
-        throw new Error(`未知 templateKind：${String(kind)}`);
+      default: {
+        // A2/#850：这条 `未知 templateKind` 的 reason 会落进 macro_runs.reason 并回传用户（宏 run 列表/详情用户可读），
+        // 属「存成品文本」那一类 ⇒ 不能把中文成品句存进库。给这条异常打一个稳定机器码，
+        // dispatch 的 catch 据此写 `dispatch_failed:unknown_template_kind`；前端拿已知码走 i18n、未知值原样显示。
+        // err.message 仍是中文原句 ⇒ log.warn 那行照旧出中文给运维（不动）。
+        const err = new Error(`未知 templateKind：${String(kind)}`);
+        err.dispatchReasonCode = 'unknown_template_kind';
+        throw err;
+      }
     }
   }
 
@@ -425,7 +432,11 @@ export function createIntentDispatcher({
         failed += 1;
         log.warn?.(`[macro-dispatch] 分派异常 kind=${intent?.templateKind} id=${intent?.macroRunId}：${err?.message ?? err}`);
         // 要求③：任何分派异常都要 finish(failed)，绝不留 pending（finishFailed 内部已吞 409）。
-        await finishFailed(intent?.macroRunId, `dispatch_failed: ${err?.message ?? String(err)}`);
+        // A2/#850：templateKind 未知这条的 reason 要给用户看 ⇒ 只存稳定机器码（不存中文成品句）；
+        // 其余异常是运维要的调试信息，保持 `dispatch_failed: <原 message>` 原样不动（不因“干净”而丢信息）。
+        const code = err?.dispatchReasonCode;
+        const reason = code ? `dispatch_failed:${code}` : `dispatch_failed: ${err?.message ?? String(err)}`;
+        await finishFailed(intent?.macroRunId, reason);
       }
     }
     return { dispatched, failed };

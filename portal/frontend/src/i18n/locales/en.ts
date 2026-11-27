@@ -2271,6 +2271,10 @@ export const en = {
         unknown: 'No description for this kind yet',
       },
     },
+    // #850 A2：稳定机器码（`macro_runs.reason`）按语言渲染；未知值由组件原样显示（不吞、不空）。
+    reason: {
+      dispatchUnknownKind: 'Dispatch failed: unknown template kind.',
+    },
     field: {
       name: 'Name',
       states: 'Terminal states to watch',

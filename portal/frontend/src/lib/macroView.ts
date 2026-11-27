@@ -56,8 +56,12 @@ export interface MacroRun {
   criterion: string | null;
   verdict: string | null;
   skippedReason: string | null;
-  /** 动作与结果的人话来源（`remediation_text` / `reason`）；原始错误码不在用户面暴露。 */
+  /** 动作与结果的人话来源（`remediation_text` / `reason`）；原始机器码在组件里经 `runReasonMessageKey` 走 i18n，未知值原样。 */
   actionText: string | null;
+  /** 原始 `reason`（可能是稳定机器码，也可能是运维调试串）；A2/#850：已知码走 i18n、未知值原样显示。 */
+  reason: string | null;
+  /** 审查整改的人话正文；有它时优先显示它，没有才轮到 `reason`。 */
+  remediationText: string | null;
   startedAt: string;
   finishedAt: string | null;
   depth: number;
@@ -171,6 +175,8 @@ export function normalizeRun(row: Record<string, unknown> | null | undefined): M
     // 审查整改文本是给用户看的人话；`reason` 里可能是原始错误码 ⇒ 只在没有人话时用，
     // 且由组件按「管理员诊断面字段」对待（不直接印错误码串）。
     actionText: remediation ?? reason,
+    reason,
+    remediationText: remediation,
     startedAt,
     finishedAt,
     depth: num(row.depth) ?? 0,
@@ -247,6 +253,18 @@ export function skipMessageKey(reason: string | null | undefined): string {
 /** 该跳过原因是否走「额度风险」的琥珀档（`07` §13.1：只有额度这一种是）。 */
 export function skipIsBudgetRisk(reason: string | null | undefined): boolean {
   return reason === 'budget_exhausted';
+}
+
+/**
+ * 分派失败原因里的稳定机器码 → i18n 键（A2/#850）。只认下表列出的**精确码**；
+ * 其它值（含运维要的 `dispatch_failed: <message>` 调试串）返 `null`，由渲染侧原样显示、不吞、不渲染成空。
+ */
+const DISPATCH_REASON_KEY: Record<string, string> = {
+  'dispatch_failed:unknown_template_kind': 'macro.reason.dispatchUnknownKind',
+};
+
+export function runReasonMessageKey(reason: string | null | undefined): string | null {
+  return reason ? DISPATCH_REASON_KEY[reason] ?? null : null;
 }
 
 /** `kind` → i18n 后缀（`macro.kind.*`）。 */
