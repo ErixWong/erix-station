@@ -1273,8 +1273,9 @@ async function assertPresentBoundary(t, { ancestorMode, ancestorWritable, label,
     assert.equal(error.code, 'EACCES', `这台机器上「列不出目录」必须真的是 EACCES，否则取证无效：${error?.code}`);
     return true;
   });
-  // ② 祖先的可写性同样**不在承诺里**：`0o111`（A1）连属主也写不进，`0o311`（A2）属主写不进得靠反向自证
-  //    拦住——两格合起来才钉住「`present` 与 `W_OK` 无关」，只测一边就是半条判据。
+  // ② 祖先的可写性同样**不在承诺里**，两格各钉一个方向：`0o111`（A1）属主**也写不进**（owner 位只有 `x` ⇒
+  //    `W_OK` 抛 `EACCES`），`0o311`（A2）属主**写得进**（owner 位是 `wx` ⇒ `W_OK` 必须成功返回）。两种 `W_OK`
+  //    状态下已知路径都必须 `present` —— 只测一边就是半条判据（要钉的是「`present` 与 `W_OK` 无关」）。
   if (ancestorWritable) {
     assert.doesNotThrow(() => fs.accessSync(base, fs.constants.W_OK),
       `祖先 0o${ancestorMode.toString(8)} 时属主必须**写得进**（本格要靠这条钉住「可写也不改变 present 这个结论」）`);

@@ -56,7 +56,8 @@ function containerOrSkip(t, { needRunning = true } = {}) {
     return null;
   }
   if (!CONTAINER) {
-    t.skip('实测 FDE_CONTAINER/--container 未给 ⇒ 无法选容器。容器清单以 DB 为真相，本判据不按 ^fde- 前缀猜容器（AGENTS §5）');
+    t.skip('实测 FDE_CONTAINER 未设、命令行里也没有 `--container=<name>` ⇒ 无法选容器（本文件只认这两种写法：'
+      + '分开两段的 `--container <name>` 是脚本的用法，别当这里也认）。容器清单以 DB 为真相，本判据不按 ^fde- 前缀猜容器（AGENTS §5「容器清单只从 DB 取」）');
     return null;
   }
   const inspect = run('docker', ['inspect', CONTAINER, '-f', '{{.State.Running}}']);

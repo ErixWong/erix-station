@@ -283,7 +283,7 @@ SQL
 #### 2.2.5 预飞 `present` 的语义边界（#575）
 
 集成预飞里的 `observeHostPath()` / `waitForHostFile()`（`portal/integration/lib/e2e-preflight.mjs`）会把一个宿主路径归成
-`present` / `missing` / `unreadable`。`present` 这句话的射程必须写死，不然后人拿它当「一切就绪」用：
+`present` / `missing` / `unreadable`（表里没有的探测错误走 `unknown` 出口，不在本节话题里）。`present` 这句话的射程必须写死，不然后人拿它当「一切就绪」用：
 
 - **`present` 只承诺两件事**：当前宿主用户能**穿越**路径上每一段祖先目录（逐段 `X_OK`），并能**读到**这个
   **已知文件名**（叶子 `R_OK`）。判定只看这两样，别的一律没说。
