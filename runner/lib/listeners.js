@@ -9,7 +9,7 @@
 //   - <proc>/<pid>/{cwd,cmdline,stat} → 目录 / 命令行摘要 / 启动时刻（stat 第 22 字段，CLK_TCK=100）；
 //   - <cwd>/.git/HEAD（或 gitdir: 链接文件）→ 分支名（尽力而为，detached/非仓库 ⇒ null）。
 //
-// ⚠ **UID 现实（真机实证，fde-eric）**：FDE 容器不授 CAP_SYS_PTRACE（topology §6 禁 ptrace，有意设计），
+// ⚠ **UID 现实（真机实证，fde-alice）**：FDE 容器不授 CAP_SYS_PTRACE（topology §6 禁 ptrace，有意设计），
 // 且 Yama ptrace_scope=1 下 `socket fd / cwd 的 readlink 需要 ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`
 // ⇒ **只有 socket owner 本人（或同 euid）读得动**。agentd（uid 1001）对 1000/1002 的进程只能报
 // 「端口在听」，拿不到进程细节。这不是 bug，是安全裁决的必然代价：

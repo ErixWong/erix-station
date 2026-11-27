@@ -1,6 +1,6 @@
 // issue #288 M1：shell 执行期保活（缺陷 A）+ shell 子进程组泄漏（缺陷 D）的单测。
 //
-// 背景（dev 真机标本：`fde-eric` / run `e480a06f-0891-4bbd-a1f9-1079ab217a07`，默认配置零 env 放宽）：
+// 背景（dev 真机标本：`fde-alice` / run `e480a06f-0891-4bbd-a1f9-1079ab217a07`，默认配置零 env 放宽）：
 //   一条消息让 agent 跑 `shell {command:"sleep 360 && echo DONE-288", timeout_ms:420000}` ⇒
 //   08:05:44 tool_use shell → 08:10:45 `watchdog: worker silent, killing`（silent_ms=301584）→
 //   `release run reason=worker_crashed outcome=requeued` → 08:11:12 attempt=2 **同一条命令再跑一遍**

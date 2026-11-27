@@ -7,7 +7,7 @@
 // 把四个 uid/gid 指给自己才绕开。本文件把「失败必须分得开」钉成**行为面**判据（无 docker、纯夹具），
 // 因此它能在任何机器上跑，也能在改动分类逻辑时当场变红。
 //
-// 真机 EACCES 形态（uid ≠ FDE_USER_UID）本机复现不了：eric 就是 uid 1000 = 目录属主，`chmod 0700`
+// 真机 EACCES 形态（uid ≠ FDE_USER_UID）本机复现不了：<fde_name> 就是 uid 1000 = 目录属主，`chmod 0700`
 // 对自己照样可读。所以「读不到」分支用注入的 fsImpl 复现（假 accessSync 抛 EACCES），并在交付报告里
 // 另附一次 **docker 里以 uid 1001 真跑**的取证（同一棵树，真 EACCES，不是夹具）。
 import test, { afterEach } from 'node:test';

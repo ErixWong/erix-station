@@ -360,7 +360,7 @@ function isStructuredCall(value) {
 // marker、排除账一律不引用 `path`**。所以把「根写法」的入参换成 `"."` 只会影响根标签一处，
 // 条目与 marker 逐字节不变（也不需要本站重算目录树）。
 //
-// 真机证据（#228，共享 dev 栈 / fde-eric）：模型 `tree {path:"./"}` 拿到首行 `hello-station/`，
+// 真机证据（#228，共享 dev 栈 / fde-alice）：模型 `tree {path:"./"}` 拿到首行 `hello-station/`，
 // 照着再调 `tree {path:"hello-station/"}` → `ENOENT …/hello-station/hello-station`、ok:false，
 // 真的失败一次并浪费一轮——不是「上游语义、我不动」能交差的量级。
 //
