@@ -496,3 +496,57 @@ volumes: {}
     assert.ok(kinds.has(k), `必须报 ${k}，实际=${JSON.stringify(r.warnings)}`);
   }
 });
+
+function writeTree(root, files) {
+  for (const [rel, text] of Object.entries(files)) {
+    const abs = path.join(root, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, text, 'utf8');
+  }
+}
+
+// ───────────────── 件 2：工具真的读登记表，能用假登记表钉住一条差集；缺文件不崩
+test('② 与登记表的差集（假登记表钉住一条）+ 缺文件不崩', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'env-legs-diff-'));
+  try {
+    writeTree(root, {
+      'deploy/docker-compose.yml': `
+services:
+  station-portal:
+    environment:
+      LEGS_COMPLETE_KNOB: \${LEGS_COMPLETE_KNOB:-1}
+`,
+      'portal/src/provisioner.js': `
+export function buildContainerConfig() {
+  return { Env: ['LEGS_COMPLETE_KNOB=1'] };
+}
+`,
+      'deploy/fde-proxy/server.js': `
+const ENV_KEY_ALLOW = new Set(['LEGS_COMPLETE_KNOB']);
+export function check(k) { return ENV_KEY_ALLOW.has(k); }
+`,
+      'runner/worker.js': `
+export function r(env = process.env) { return env.LEGS_COMPLETE_KNOB; }
+export function b() { return process.env.BROKEN_KNOB; }
+`,
+      // 把三腿齐的 LEGS_COMPLETE_KNOB 当 exception 登记（违反规矩⑤）；BROKEN_KNOB 不登记。
+      'deploy/env-legs-exceptions.json': JSON.stringify({
+        exceptions: [{ key: 'LEGS_COMPLETE_KNOB', where: 'runner/worker.js:2', reason: '测试钉差集' }],
+        unsupported: [{ at: 'runner/x.js:1', read: 'baseEnv[k]', reason: '测试' }],
+      }, null, 2),
+    });
+    const inv = buildInventory(root);
+    assert.equal(inv.legsDiff.present, true);
+    assert.ok(inv.legsDiff.registeredButLegsComplete.includes('LEGS_COMPLETE_KNOB'), '登记了但三腿齐 ⇒ 应进差集');
+    assert.ok(inv.legsDiff.brokenNotRegistered.includes('BROKEN_KNOB'), 'runner 读了但没登记 ⇒ 应进差集');
+    assert.deepEqual(inv.legsDiff.unsupported, [{ at: 'runner/x.js:1', read: 'baseEnv[k]' }]);
+    assert.match(renderSummary(inv).join('\n'), /与 deploy\/env-legs-exceptions\.json 的差集/);
+    // 缺登记表 ⇒ 不崩，明说不差
+    fs.rmSync(path.join(root, 'deploy', 'env-legs-exceptions.json'));
+    const inv2 = buildInventory(root);
+    assert.equal(inv2.legsDiff.present, false);
+    assert.match(renderSummary(inv2).join('\n'), /登记表不存在 ⇒ 差集不在本工具面内/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

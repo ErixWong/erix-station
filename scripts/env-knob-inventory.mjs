@@ -81,6 +81,8 @@ const PROXY_FILE = 'deploy/fde-proxy/server.js';
 const PROVISIONER_FILE = 'portal/src/provisioner.js';
 const PORTAL_SRC_DIR = 'portal/src';
 const RUNNER_DIR = 'runner';
+// 登记表（#557 活二的例外清单）：工具**真的读它**做交叉对账，不再只在交棒里口头提。
+const LEGS_EXCEPTIONS_FILE = 'deploy/env-legs-exceptions.json';
 
 // 扫描时跳过的目录名：依赖、构建产物、测试与探针（测试读 env 是为了造场景，不是消费者）。
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', 'test', 'probes', 'skills', 'fixtures']);
@@ -585,6 +587,54 @@ export function scanEnvWriteSites(root, relDir) {
 
 // ───────────────────────────────── 判定
 
+// ───────────────── 动态下标读取 + 登记表交叉对账（本轮新增）
+
+/**
+ * 读登记表（不崩）：文件不存在 ⇒ present:false；JSON 解析失败 ⇒ present:true + error。
+ * 结构（现读一遍）：`{ exceptions: [{key,where,reason}], unsupported: [{at,read,reason}] }`。
+ */
+export function readLegsExceptions(root) {
+  const f = readIfExists(root, LEGS_EXCEPTIONS_FILE);
+  if (f.missing) return { present: false, exceptions: [], unsupported: [], error: null };
+  try {
+    const j = JSON.parse(f.text);
+    return {
+      present: true,
+      exceptions: Array.isArray(j.exceptions) ? j.exceptions : [],
+      unsupported: Array.isArray(j.unsupported) ? j.unsupported : [],
+      error: null,
+    };
+  } catch (e) {
+    return { present: true, exceptions: [], unsupported: [], error: String((e && e.message) || e) };
+  }
+}
+
+/**
+ * 与登记表的差集（三类）：
+ *   A registeredButLegsComplete：登记了但工具现在判“三腿齐”（登记表规矩⑤⇒ 应删）。
+ *   B brokenNotRegistered：工具判“runner 真读了但不在三腿链上”（非旋钮除外）但登记表里没这条。
+ *   C unsupported：登记表登为“读形认得、名字解析不出”的形态，原样列出。
+ */
+export function computeLegsDiff(knobs, reg) {
+  const legsComplete = (k) => k.injected.length > 0 && k.allowlisted.length > 0 && k.runnerReads.length > 0;
+  const exceptionKeys = new Set((reg.exceptions || []).map((e) => e && e.key).filter(Boolean));
+  const registeredButLegsComplete = [];
+  const brokenNotRegistered = [];
+  for (const k of knobs) {
+    if (exceptionKeys.has(k.name) && legsComplete(k)) registeredButLegsComplete.push(k.name);
+    if (!exceptionKeys.has(k.name) && !k.passThrough && k.runnerReads.length > 0 && !legsComplete(k)) brokenNotRegistered.push(k.name);
+  }
+  return {
+    present: reg.present,
+    error: reg.error ?? null,
+    exceptionCount: (reg.exceptions || []).length,
+    unsupportedCount: (reg.unsupported || []).length,
+    registeredButLegsComplete,
+    brokenNotRegistered,
+    unsupported: (reg.unsupported || []).map((u) => ({ at: u.at, read: u.read })),
+  };
+}
+
 /** 「容器起来之前就得知道」的判据（见文件头 P1–P4）；返回命中的判据编号，空数组 = 不属之。 */
 export function bootReasons({ name, portalReadFiles, composeEntry, composeService, injected }) {
   const why = [];
@@ -810,6 +860,8 @@ export function buildInventory(root = DEFAULT_ROOT) {
     },
     /** ① compose 里认不出的 YAML 形状（静默空表现在会被喊出来）；真实 compose 上应为空。 */
     warnings: composeWarnings,
+    /** ② 与登记表的差集（读不到登记表 ⇒ present:false，不崩）。 */
+    legsDiff: computeLegsDiff(knobs, readLegsExceptions(root)),
   };
 }
 
@@ -902,6 +954,21 @@ export function renderSummary(inv) {
     for (const w of warns) {
       out.push(`- [${w.kind}] ${w.service ?? '(顶层)'} compose:${w.line}  ${w.raw}`);
     }
+  }
+
+  // ② 与登记表的差集（读不到 ⇒ 明说不差，不崩）
+  out.push('');
+  out.push(`=== 与 ${LEGS_EXCEPTIONS_FILE} 的差集 ===`);
+  const diff = inv.legsDiff;
+  if (!diff || !diff.present) {
+    out.push('登记表不存在 ⇒ 差集不在本工具面内');
+  } else {
+    if (diff.error) out.push(`登记表解析失败（不崩，按空登记处理）：${diff.error}`);
+    out.push(`登记表：exceptions=${diff.exceptionCount} unsupported=${diff.unsupportedCount}`);
+    out.push(`- 登记了但工具现在判「三腿齐」（应删条）=${diff.registeredButLegsComplete.length} ${fmt(diff.registeredButLegsComplete)}`);
+    out.push(`- 工具判断链（runner 读了但不在三腿链）但没登记=${diff.brokenNotRegistered.length} ${fmt(diff.brokenNotRegistered)}`);
+    out.push(`- 登记为 unsupported 的形态=${diff.unsupported.length}`);
+    for (const u of diff.unsupported) out.push(`    · ${u.at}  ${u.read}`);
   }
   return out;
 }
