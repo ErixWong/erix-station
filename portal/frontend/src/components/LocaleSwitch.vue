@@ -14,6 +14,16 @@ import { useAuthStore, NO_SESSION_LOCALE_OWNER } from '../stores/auth';
 
 const { t, locale } = useI18n();
 
+// #828 复核查：顶栏要显示「语言偏好未保存到账号」一行——响应式读 store 的 localeSyncFailed 旗标。
+// 无激活 pinia（纯组件测试 / 无会话挂载）⇒ 取不到 store ⇒ 恒不显示（不发也不提示，与「未登录不发」一致）。
+let authStore: ReturnType<typeof useAuthStore> | null = null;
+try {
+  authStore = useAuthStore();
+} catch {
+  authStore = null;
+}
+const localeSyncFailed = computed(() => authStore?.localeSyncFailed ?? false);
+
 const OPTIONS: readonly { value: AppLocale; labelKey: 'locale.zhCN' | 'locale.en' }[] = [
   { value: 'zh-CN', labelKey: 'locale.zhCN' },
   { value: 'en', labelKey: 'locale.en' },
@@ -65,10 +75,13 @@ async function syncAccountLocale(value: AppLocale): Promise<void> {
     auth.pendingLocaleWrite = { login: ownerAtRecord, locale: value };
     return;
   }
+  // #828 复核查：下一次回写尝试开始 ⇒ 先复位失败旗标（提示随之消失），失败再置 true（提示重现）。
+  auth.localeSyncFailed = false;
   try {
     await api('/api/me/locale', { method: 'PATCH', body: JSON.stringify({ locale: value }) });
   } catch {
-    /* 静默：切换已生效，回写失败不弹窗 */
+    // #828 复核查：静默不打断（切换已生效、不弹红条），但把「账号没存上」记进可见旗标供顶栏提示。
+    auth.localeSyncFailed = true;
   }
 }
 
@@ -109,5 +122,12 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocumentClick));
         >{{ t(opt.labelKey) }}</button>
       </li>
     </ul>
+
+    <!-- #828 复核查：回写失败的可重试提示——不弹红条、不打断，仅一行小字；再点一次开关会重新尝试并自动收起。 -->
+    <p
+      v-if="localeSyncFailed"
+      data-test="locale-sync-failed"
+      class="mt-0.5 text-[0.7rem] leading-tight text-red-600"
+    >{{ t('locale.accountSaveFailed') }}</p>
   </div>
 </template>

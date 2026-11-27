@@ -278,6 +278,9 @@ export const useAuthStore = defineStore('auth', {
      * 归属对不上的待补发会被丢弃，不替下一个人改偏好（见 `flushPendingLocale` 与 `logout` / 失效路径的清理）。
      */
     pendingLocaleWrite: null as { login: string; locale: AppLocale } | null,
+    // #828 复核查：最后一次 `PATCH /api/me/locale` 是否失败（不回滞到界面、不弹窗，仅供顶栏显示
+    // 一行小字「语言偏好未保存到账号」）。任何一次新回写尝试开始都先置 false；成功保持 false。
+    localeSyncFailed: false,
     loading: false,
     error: null as string | null,
     /**
@@ -357,11 +360,13 @@ export const useAuthStore = defineStore('auth', {
         return;
       }
       this.pendingLocaleWrite = null; // 先清，避免并发/重复补发
+      this.localeSyncFailed = false; // 一次新的回写尝试开始：先复位失败旗标
       try {
         await api('/api/me/locale', { method: 'PATCH', body: JSON.stringify({ locale: pending.locale }) });
         this.user = { ...this.user, locale: pending.locale }; // 本地同步账号值，下次比较不再误判
       } catch {
-        /* 静默：界面已切，补发失败不弹窗 */
+        // #828 复核查：静默不打断（界面已切），但把「账号没存上」记进可见旗标，供顶栏显示一行小字。
+        this.localeSyncFailed = true;
       }
     },
 
