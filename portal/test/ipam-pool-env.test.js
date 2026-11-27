@@ -16,8 +16,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { parse } from 'yaml';
+
+import {
+  applyStackIpamPoolEnv,
+  assertIsolatedEnvironment,
+  deriveFdeIpamPools,
+  deriveStackIpamPoolEnv,
+  ipamPoolCongruenceClass,
+} from '../integration/lib/isolated-env.mjs';
 
 import {
   POOLS,
@@ -218,4 +227,142 @@ test('#270 ④ 反向对照：同一 subnet 在同源派生下放行（证明上
   const seg = '10.201.37.0/24';
   const cand = nextAvailableSubnet([], resolveIpamPools({ IPAM_POOL_LARGE: seg }).large);
   assert.deepEqual(validateNetworkBody(networkBody(cand.subnet, cand.gateway), { ipamPools: [seg] }), []);
+});
+
+// ---------------------------------------------------------------------------
+// #550：派生段的 mod 99 **同余类**必须可被问出来，且缺变量的报错必须带栈上下文
+// ---------------------------------------------------------------------------
+//
+// 两条缺口（issue #550 的 E / D，都不是缺陷而是「看不见的形状」）：
+//   E 段号 = `1 + (栈 id 里的数字 mod 99)` ⇒ 同余类相同的两个栈 id **必派生同一段**。
+//     `stack1` 与 `stack100` 就是今天真实存在的一对（数字段 `"1"` 与 `"100"` 模 99 都是 1）。
+//     本单**不改派生算法**（`docs/data/schema.sql` 的 default↔/29、large↔/28 是启动期硬约束，
+//     动算法要连 DB CHECK 一起动），选的是「把事实钉住 + 把同余类报出来」：下面第一格钉的是
+//     **今天的碰撞事实**，不是「期望的行为」——将来真换算法时它会红，那是提示你去改判据，不是回归。
+//   D 缺必需 env 的旧文案只有 `X must be set for isolated e2e` ⇒「忘传」与「派生算漂了」两种
+//     完全不同的故障长得一模一样。现在文案带上栈 id 与它应有的派生段。
+test('#550E 钉今天的碰撞事实：stack1 与 stack100 派生同一段 10.201.2.0/24（mod 99 同余，不是期望）', () => {
+  const one = deriveFdeIpamPools('stack1');
+  const hundred = deriveFdeIpamPools('stack100');
+  assert.equal(one, hundred,
+    `这是**碰撞事实**（mod 99 同余类都是 1 ⇒ 段号必相等），不是期望：stack1=${one} stack100=${hundred}；`
+    + '红了说明派生算法换了模数（那要连 DB CHECK / docs/ops/ci-release.md §6 一起改判据）');
+  // 字面段（不是"相等"就够：段号整体漂了也要红，例如第三段从 2 变成 1）。
+  assert.equal(one, '10.201.2.0/24', `stack1 的派生段必须逐字是 10.201.2.0/24（实际 ${one}）`);
+  assert.equal(hundred, '10.201.2.0/24', `stack100 撞进同一段（实际 ${hundred}）`);
+  // 同余类本体也钉住（碰撞的**因**，段号只是它的像）。
+  assert.equal(ipamPoolCongruenceClass('stack1'), 1, 'stack1 的同余类：数字段 "1" ⇒ 1');
+  assert.equal(ipamPoolCongruenceClass('stack100'), 1, 'stack100 的同余类：数字段 "100" ⇒ 100 % 99 = 1（这就是碰撞的因）');
+  // 反向对照：不同余的两个 id 必须不同段（否则上面三格只证明了「什么都返回同一段」）。
+  assert.notEqual(deriveFdeIpamPools('stack2'), one, '不同余类必不同段（#270 既有口径）');
+});
+
+test('#550E 段号与同余类**同源**：段号 = 1 + ipamPoolCongruenceClass(id)（含无数字走 FNV 分支的 id）', () => {
+  // 变异入口：把段号改成与同余类脱钩（如 `1 + (n * 2) % 99`）⇒ 本格红。留两份 `% 99` 就是下一次
+  // 「段号与同余类各说各话」的产地，所以这里钉的是**关系**（两个函数必须给同一个答案）。
+  for (const id of ['stack1', 'stack100', 'e2e226', 'solo-alpha', 'wp5-isolated']) {
+    const segment = deriveFdeIpamPools(id);
+    const cls = ipamPoolCongruenceClass(id);
+    assert.ok(Number.isInteger(cls) && cls >= 0 && cls <= 98, `${id} 的同余类必须落在 0..98（实际 ${cls}）`);
+    const thirdOctet = Number(segment.split('.')[2]);
+    assert.equal(thirdOctet, 1 + cls,
+      `${id}：段号必须等于 1 + 同余类（段 ${segment} vs 同余类 ${cls}）⇒ 两者已脱钩，有人又抄了一份 % 99`);
+  }
+  // 无数字的 id 确实走的是 FNV 那一支（不是"恰好没数字就恒 0"），且该支同样幂等、同样在保留段内。
+  assert.ok(!/\d/.test('solo-alpha'), '夹具前提：solo-alpha 不含数字（走 FNV 分支）');
+  assert.equal(ipamPoolCongruenceClass('solo-alpha'), ipamPoolCongruenceClass('solo-alpha'), 'FNV 分支幂等');
+  assert.match(deriveFdeIpamPools('solo-alpha'), /^10\.201\.(?:[1-9][0-9]?)\.0\/24$/,
+    'FNV 分支的段仍必须是保留段内第三段 1–99 的 /24（与数字分支同一条映射，不是第二套规则）');
+});
+
+test('#550E applyStackIpamPoolEnv 的 warn 同时报出同余类与「这是提示不是保证」（注入收集器）', () => {
+  const lines = [];
+  const env = { STATION_STACK_ID: 'stack1' };
+  const applied = applyStackIpamPoolEnv(env, undefined, { warn: (m) => lines.push(String(m)) });
+  assert.deepEqual(applied, { FDE_IPAM_POOLS: '10.201.2.0/24', FDE_IPAM_POOL_LARGE: '10.201.2.0/24' },
+    '两腿仍必须一次注入同一个派生段（#270 口径不因本单变松）');
+  assert.equal(lines.length, 1, `注入两腿必须恰报一行（实际 ${lines.length} 行：${JSON.stringify(lines)}）`);
+  const text = lines.join('\n');
+  // ① 同余类：数出来（操作者拿它能自己判「哪两个栈会撞」），文案里必须带类号与模数。
+  assert.match(text, /同余类 n=1/, `文案必须报出同余类本体（实际：${text}）`);
+  assert.match(text, /mod 99/, '必须点名模数（不写模数的"同余类"是没法复核的黑话）');
+  // ② 派生段本身。
+  assert.match(text, /10\.201\.2\.0\/24/, `文案必须带派生出的段（实际：${text}）`);
+  // ③ 提示不是保证：同余类相同不必然撞（要两栈真并行），不同也可能撞（别的栈手工占段），
+  //    而且本机只看得到本栈 env ⇒ 跨栈占用查不到。缺这句就会有人把 warn 当「安全证明」用。
+  assert.match(text, /提示不是保证/, `文案必须写清「这是提示不是保证」（实际：${text}）`);
+  assert.match(text, /stack100/, '要把真实碰撞对举例带出来（stack1 ↔ stack100），否则提示不可复核');
+  // 反向对照：两腿都是操作者手传 ⇒ 不报（报了一个没在用的派生段 = 把人引向错方向）。
+  const silent = [];
+  const untouched = applyStackIpamPoolEnv(
+    { STATION_STACK_ID: 'stack1', FDE_IPAM_POOLS: '10.201.60.0/24', FDE_IPAM_POOL_LARGE: '10.201.60.0/24' },
+    undefined,
+    { warn: (m) => silent.push(String(m)) },
+  );
+  assert.deepEqual(untouched, {}, '手传两腿时不该注入任何东西');
+  assert.deepEqual(silent, [], '没写入派生值就不该报（warn 只在派生段真的进了 env 时响）');
+});
+
+test('#550D 缺 FDE_IPAM_POOL_LARGE 的报错同时带：变量名 / must be set / STATION_STACK_ID=<值> / 期望段', () => {
+  // 夹具照 `portal/integration/isolation-negative.mjs` 的 `validIsolationEnv()` 构造法**复制**一份：
+  // 那个文件是**脚本**（import 就会跑完整套负例并自设 process.exitCode），单测不能 import 它。
+  // 段号这里故意写**字面量**：拿 deriveFdeIpamPools() 现算就是「用被测件验被测件」，换模数也红不了。
+  const stackId = 'e2e226';
+  const expectedSegment = '10.201.49.0/24'; // e2e226 的全部数字拼接 '2226' ⇒ 2226 % 99 = 48 ⇒ 1 + 48
+  const valid = () => ({
+    STATION_STACK_ID: stackId,
+    COMPOSE_PROJECT_NAME: stackId,
+    STATION_DB_DIR: `${os.tmpdir()}/station-db-${stackId}-${process.pid}-550d-absent`,
+    STATION_DB_NAME: `station-db-${stackId}`,
+    STATION_PORTAL_NAME: `station-portal-${stackId}`,
+    STATION_DOCKER_PROXY_NAME: `station-docker-proxy-${stackId}`,
+    STATION_EDGE_NAME: `station-edge-${stackId}`,
+    STATION_LITELLM_NAME: `station-litellm-${stackId}`,
+    PORTAL_HOST_PORT: '28080',
+    LITELLM_HOST_PORT: '24400',
+    TRAEFIK_WEB_PORT: '18090',
+    TRAEFIK_WEBSECURE_PORT: '18443',
+    LLM_GATEWAY_HOST: 'http://127.0.0.1:24400',
+    BACKEND_SUBNET: '172.33.0.0/24',
+    FDE_POOL: 'large',
+    ...deriveStackIpamPoolEnv(stackId),
+    FDE_DEV_MODE: '1',
+    STATION_PORTAL_IMAGE: `erix-station/portal:${stackId}`,
+    STATION_DOCKER_PROXY_IMAGE: `erix-station/fde-proxy:${stackId}`,
+    FDE_IMAGE: `erix-station/fde:${stackId}`,
+  });
+  // 正例先自证：夹具本身必须过护栏（否则下面的"抛错"可能只是夹具过期，与文案无关）。
+  assertIsolatedEnvironment({ env: valid() });
+
+  const missing = valid();
+  delete missing.FDE_IPAM_POOL_LARGE;
+  let err = null;
+  try {
+    assertIsolatedEnvironment({ env: missing });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, '缺分配段必须抛（不抛就会被 compose 缺省值抬成整个 10.201 保留段）');
+  const text = String(err.message);
+  for (const needle of [
+    'FDE_IPAM_POOL_LARGE', // 缺的是哪一条
+    'must be set', // 既有锚点（isolation-negative.mjs 的陷阱与历史日志检索都依赖它）
+    `STATION_STACK_ID=${stackId}`, // ① 谁的栈
+    expectedSegment, // ② 这个栈**应该**是哪一段 ⇒ 与「忘传」一眼可分
+  ]) {
+    assert.ok(text.includes(needle), `报错文案缺锚点「${needle}」（实际：${text}）`);
+  }
+  // 另一半事实：栈 id 自己也没设时，不许瞎猜一个段（猜出来的期望段会把人引向「派生算错了」）。
+  const noStack = valid();
+  delete noStack.STATION_STACK_ID;
+  let err2 = null;
+  try {
+    assertIsolatedEnvironment({ env: noStack });
+  } catch (e) {
+    err2 = e;
+  }
+  assert.ok(err2 && String(err2.message).includes('<未设 STATION_STACK_ID>'),
+    `没栈 id 时文案必须写 <未设 STATION_STACK_ID>（实际：${err2?.message ?? '（没抛）'}）`);
+  assert.ok(!String(err2.message).includes(expectedSegment),
+    '没栈 id 就不许报一个凭空派生的"期望段"（那是第二种故障的文案）');
 });
