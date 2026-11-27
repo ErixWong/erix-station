@@ -116,11 +116,19 @@ export function readBaseline(file) {
 }
 
 export function countByPrefix({ names, prefixes }) {
-  const out = [];
-  for (const prefix of prefixes) {
-    const matched = names.filter((n) => n.startsWith(prefix));
-    if (matched.length > 0) out.push({ prefix, count: matched.length, names: matched });
+  // **最长匹配归桶**（#885 评审发现）：前缀之间可以互相嵌套（`station-static-` 是 `station-static-emailcode-`
+  // 的前缀），按「所有匹配的前缀都记一笔」会让同一个目录进两个桶 —— 加总就不是目录数了（实测 3 个目录加总 5）。
+  // 桶必须互斥，`offenders` 的加总才等于**去重目录数**，读的人才不会被数字骗。
+  const byLongest = [...prefixes].sort((a, b) => b.length - a.length);
+  const buckets = new Map();
+  for (const n of names) {
+    const hit = byLongest.find((prefix) => n.startsWith(prefix));
+    if (!hit) continue;
+    if (!buckets.has(hit)) buckets.set(hit, []);
+    buckets.get(hit).push(n);
   }
+  const out = [];
+  for (const [prefix, matched] of buckets) out.push({ prefix, count: matched.length, names: matched });
   return out;
 }
 
@@ -276,7 +284,7 @@ export function runCli(argv) {
     return 0;
   }
   const total = r.offenders.reduce((s, o) => s + o.count, 0);
-  console.log(`${head}\n${scope} ${total} 个残留，按前缀：`);
+  console.log(`${head}\n${scope} ${total} 个残留（桶按**最长匹配**互斥归组，加总即去重目录数），按前缀：`);
   for (const o of r.offenders) {
     const shown = o.names.slice(0, opts.maxNames).join(', ');
     const more = o.count > opts.maxNames ? ` …（另 ${o.count - opts.maxNames} 个）` : '';

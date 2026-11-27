@@ -233,3 +233,31 @@ test('⑨存量腿（--all）必须严格大于增量，且增量集合 ⊆ 存�
   assert.equal(code, 1, '存量存在 ⇒ `--all` 必须红（哪怕增量是绿的）');
   assert.match(lines.join('\n'), /存量 3 个残留/, `必须说明这是存量口径并把三个都算进来：\n${lines.join('\n')}`);
 });
+test('⑩嵌套前缀必须按最长匹配归桶：桶互斥、加总=去重目录数（#885 评审实测 3 个目录被加总报成 5）', () => {
+  const f = fixture(newBase(), {
+    sources: {
+      // 两个前缀互相嵌套：`hyg-nest-` 是 `hyg-nest-deep-` 的前缀。
+      'portal/test/a.test.js':
+        "fs.mkdtempSync(path.join(os.tmpdir(), 'hyg-nest-'));\n"
+        + "fs.mkdtempSync(path.join(os.tmpdir(), 'hyg-nest-deep-'));\n",
+    },
+    tmpDirs: ['hyg-nest-1', 'hyg-nest-deep-2', 'hyg-nest-deep-3', 'unrelated'],
+  });
+  const r = checkTmpHygiene({ tmpDir: f.tmp, repoRoot: f.root, all: true }); // 存量腿：不依赖基线，直接数现场
+  assert.equal(r.mode, 'all');
+  assert.equal(r.code, 1, '现场有残留就必须红');
+  const seen = new Set();
+  for (const o of r.offenders) {
+    for (const n of o.names) {
+      assert.equal(seen.has(n), false, `目录 ${n} 进了两个桶 ⇒ 桶不互斥，加总就不是目录数了`);
+      seen.add(n); // 登记动作本身：漏了它 seen 恒空，下面的等式就退化成 0===0（自欺）
+    }
+  }
+  const sum = r.offenders.reduce((s, o) => s + o.count, 0);
+  assert.equal(sum, seen.size, `加总(${sum}) 必须等于去重目录数(${seen.size})`);
+  assert.equal(sum, 3, '本夹具里属于现取前缀的目录就是 3 个（unrelated 不算）');
+  const deep = r.offenders.find((o) => o.prefix === 'hyg-nest-deep-');
+  const shallow = r.offenders.find((o) => o.prefix === 'hyg-nest-');
+  assert.deepEqual(deep.names, ['hyg-nest-deep-2', 'hyg-nest-deep-3'], '嵌套目录必须归**最长**那个前缀');
+  assert.deepEqual(shallow.names, ['hyg-nest-1'], '短前缀桶里不许再装嵌套目录');
+});
