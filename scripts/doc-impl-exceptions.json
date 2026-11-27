@@ -1,10 +1,5 @@
 {
   "routes": [],
   "schema": [],
-  "legs": [
-    {
-      "entry": "path:portal/test/prune-checkpoints-db.test.js",
-      "reason": "该文件已随 checkpoint 退役删除（#640），ci-release.md :38/:41 是 #665 事故记录里的历史提及；文档修刀需给历史行加退役标注（#777 S1 已知红）"
-    }
-  ]
+  "legs": []
 }
