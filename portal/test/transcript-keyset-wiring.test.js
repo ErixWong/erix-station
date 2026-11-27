@@ -72,8 +72,10 @@ test('#338 ②：`http.js` 原样透传游标 + 形态校验（绝不 Number()�
 
 test('#338 ③：`agentd.js` 的 load 回传 encodeURIComponent，且分页循环仍在（不是单页）', () => {
   const src = readRunner('agentd.js');
-  const idx = src.indexOf("case 'load': {");
-  assert.ok(idx >= 0, "agentd.js 应仍有 `case 'load': {`");
+  // #501：分页循环从 `case 'load'` 抽到了 `fetchAllTranscriptRecords`（`load` 与 `loadRawRows` 共用
+  // 同一条读路径）⇒ 锚点改指 helper；下面「翻页不得退化成单页 / 游标不许 Number()」的断言一条不少。
+  const idx = src.indexOf('async function fetchAllTranscriptRecords(');
+  assert.ok(idx >= 0, 'agentd.js 应仍有 fetchAllTranscriptRecords（#501 后分页读的唯一实现点）');
   const body = src.slice(idx, idx + 2400);
 
   assert.match(body, /cursor=\$\{encodeURIComponent\(cursor\)\}/,
@@ -84,4 +86,14 @@ test('#338 ③：`agentd.js` 的 load 回传 encodeURIComponent，且分页循�
   assert.match(body, /if \(cursor == null\) break;/, '循环的终止条件仍是 next_cursor == null');
   // 纯可观测日志：分页真的发生过才记一条（不是 run event）。
   assert.match(body, /log\('warn', 'transcript load paged'/, 'pages > 1 的 warn 日志（纯可观测，零新事件类型）');
+
+  // #501：两根探针共用这一条读路径 ⇒ 两边都必须委派给 helper，不许各自留一份翻页实现。
+  for (const method of ['load', 'loadRawRows']) {
+    const at = src.indexOf(`case '${method}': {`);
+    assert.ok(at >= 0, `agentd.js 应仍有 case '${method}'`);
+    const next = src.indexOf("case '", at + `case '${method}': {`.length);
+    const branch = src.slice(at, next > at ? next : at + 2400);
+    assert.match(branch, /return fetchAllTranscriptRecords\(ctx, args, \{ request \}\);/,
+      `case '${method}' 必须委派 fetchAllTranscriptRecords（同源 = 同一段代码，不是两份抄写）`);
+  }
 });

@@ -13,7 +13,8 @@
 //
 // 方法 → IPC method → internal 端点（§9.1 映射表）：
 //   appendRound          → PUT /transcript/:key/rounds/:round        （session，P2 新增）
-//   load                 → GET /transcript/:key                      （session，P2 新增）
+//   load                 → GET /transcript/:key                      （session，P2 新增；agentd 分页拉齐全量后**本层折叠**）
+//   loadRawRows          → GET /transcript/:key                      （session，#501；**与 load 同一支** agentd 分页读，不折叠）
 //   recall               → GET /runs/:id/transcript/recall          （U7 legacy，保持 run 作用域不动）
 //   markRunState         → PUT /runs/:id/state（'running'，真 runId） （U2）
 //                          → PUT /transcript/:key/runstate {state}（状态通道，session）
@@ -109,6 +110,9 @@ export function makeStore(key, { request, runId }) {
      * 上游 #714/#765（`host-consumer-contract.md`）：`foldMessageRows(await loadRawRows(r))` 必须逐字
      * 等于 `await load(r)`，所以这里不复制第二份读路径、也不在此折叠；未知 runId ⇒ 空数组。
      * 本站是引擎 `appendUserTurn` 快路径结清悬空 `tool_use` 的唯一账本来源，缺它就报 `ledger_probe_absent`。
+     * ⚠ 但「缺它」必须是**真的没这根探针**：本方法存在 ⇒ 请求会一路打到 agentd，那边少了 case 就是
+     *   `default` 抛（比缺席更糟）——路由与白名单的一致性由 `runner/test/agentd-store-route.test.js` 钉。
+     * agentd 侧也与 `load` 共用同一条分页读：`runner/agentd.js#fetchAllTranscriptRecords`（#501 返修）。
      */
     async loadRawRows(r) {
       const res = await requestWithRetry('loadRawRows', { runId: r });

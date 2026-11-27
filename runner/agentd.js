@@ -549,6 +549,54 @@ function assertRecoverySessionKey(ctx, args) {
   return assertSessionKey(ctx, args);
 }
 
+/**
+ * `load` 与 `loadRawRows` **共用**的那一条分页读（issue #501）：按 portal 给的**不透明游标**
+ * `<round>:<append_seq>` 循环拉全量（issue #338 的真 keyset；旧 portal 无 session key 时回退
+ * run 作用域端点），把各页 records 拼成一个数组返回 `{records}`。
+ *
+ * 返回的是**折叠前的原始行**：读侧折叠在 `runner/lib/store.js#load`（#351——那是 store 的
+ * `load()` 职责，且必须接在**全量拉齐之后**，接在分页端点的页内会在「一轮跨两页」时漏折）。
+ * ⇒ 这正是 `loadRawRows` **不需要新端点**的原因：它要的就是这条 HTTP 响应的原生形状。
+ *
+ * ⚠ 游标原样回传 + `encodeURIComponent`，**绝不 Number()**（`Number('1:1070')` = NaN ⇒ 第二页
+ *   从头重读 ⇒ 死循环）；#338 的源码锚点断言在 `portal/test/transcript-keyset-wiring.test.js`
+ *   （#501 把循环从 `case 'load'` 抽到这里，那边的锚点同步改指本函数）。
+ */
+async function fetchAllTranscriptRecords(ctx, args, {
+  request, runId = ctx.runId, sessionKey = ctx.sessionId,
+} = {}) {
+  const records = [];
+  let cursor = null;
+  let pages = 0;
+  let maxRound = null;
+  const basePath = sessionKey
+    ? `/transcript/${encodeURIComponent(assertSessionKey(ctx, args))}`
+    : `/runs/${runId}/transcript`;
+  for (;;) {
+    const paging = cursor == null ? 'limit=10000' : `limit=10000&cursor=${encodeURIComponent(cursor)}`;
+    const qs = sessionKey ? `?${paging}&run_id=${encodeURIComponent(runId)}` : `?${paging}`;
+    const r = await withRetry(
+      () => request('GET', `${basePath}${qs}`, { claimToken: ctx.claimToken }),
+      { what: `load ${sessionKey ? `key=${sessionKey}` : `run=${runId}`}` },
+    );
+    const page = r.data?.records ?? [];
+    pages += 1;
+    records.push(...page);
+    for (const rec of page) {
+      if (Number.isFinite(rec?.round) && (maxRound === null || rec.round > maxRound)) maxRound = rec.round;
+    }
+    cursor = r.data?.next_cursor ?? null;
+    if (cursor == null) break;
+  }
+  // 纯可观测：分页真的发生过才记一条（不是 run event、不前进 run_events、零新错误码）。
+  if (pages > 1) {
+    log('warn', 'transcript load paged', {
+      key: sessionKey ?? runId, run_id: runId, pages, rows: records.length, max_round: maxRound,
+    });
+  }
+  return { records };
+}
+
 async function handleStoreRequest(ctx, method, args, deps = {}) {
   const request = deps.request ?? internalRequest;
   const runId = ctx.runId;
@@ -576,38 +624,26 @@ async function handleStoreRequest(ctx, method, args, deps = {}) {
       return r.data;
     }
     case 'load': {
-      // 分页循环拉全量（runner §9.1 注）：游标是 portal 给的**不透明串** `<round>:<append_seq>`
-      // （issue #338 真 keyset）——原样回传并 encodeURIComponent，**绝不 Number()**（会变 NaN ⇒ 死循环）。
-      const records = [];
-      let cursor = null;
-      let pages = 0;
-      let maxRound = null;
-      const basePath = sessionKey
-        ? `/transcript/${encodeURIComponent(assertSessionKey(ctx, args))}`
-        : `/runs/${runId}/transcript`;
-      for (;;) {
-        const paging = cursor == null ? 'limit=10000' : `limit=10000&cursor=${encodeURIComponent(cursor)}`;
-        const qs = sessionKey ? `?${paging}&run_id=${encodeURIComponent(runId)}` : `?${paging}`;
-        const r = await withRetry(
-          () => request('GET', `${basePath}${qs}`, { claimToken: ctx.claimToken }),
-          { what: `load ${sessionKey ? `key=${sessionKey}` : `run=${runId}`}` },
-        );
-        const page = r.data?.records ?? [];
-        pages += 1;
-        records.push(...page);
-        for (const rec of page) {
-          if (Number.isFinite(rec?.round) && (maxRound === null || rec.round > maxRound)) maxRound = rec.round;
-        }
-        cursor = r.data?.next_cursor ?? null;
-        if (cursor == null) break;
-      }
-      // 纯可观测：分页真的发生过才记一条（不是 run event、不前进 run_events、零新错误码）。
-      if (pages > 1) {
-        log('warn', 'transcript load paged', {
-          key: sessionKey ?? runId, run_id: runId, pages, rows: records.length, max_round: maxRound,
-        });
-      }
-      return { records };
+      // 分页循环拉全量已抽给 `fetchAllTranscriptRecords`（issue #501：与 `loadRawRows` 共用同一条读
+      // 路径，两边不许各留一份翻页实现）。本层只管把全量行拉齐，**不折叠**（#351：折叠是
+      // `runner/lib/store.js#load` 的职责）。
+      return fetchAllTranscriptRecords(ctx, args, { request });
+    }
+    // ── issue #501：`loadRawRows` 这一支**必须存在**，不是可选装饰 ──
+    // 引擎 `appendUserTurn` 快路径**每次 MISS 都调**这根探针（现查
+    // `node_modules/erix-agent/src/store/append-user-turn.js:310-313`：
+    // `typeof store.loadRawRows === "function" ? await store.loadRawRows(key) : undefined`），
+    // 用它结清账本中段悬空的 `tool_use`。探针**缺席**只是软降级（终局 `ledger_probe_absent`）；
+    // 但 `runner/lib/ipc.js` 的 `STORE_METHODS` 白名单与 `runner/lib/store.js` 的探针实现都已就位
+    // ⇒ 请求会一路打到本 switch。这里**少了 case 就落到 switch 末尾那条 `default`**
+    // ——`throw new Error(`unknown store method: ${method}`)`（现位于 `runner/agentd.js:772`；
+    // 工单 #501 记的 `:735` 是抽 helper 之前的行号，会随本文件漂移 ⇒ 认那条抛的**内容**，别认行号）
+    // ⇒ 生产里**每次预写都抛**，把整次预写打挂——比「探针缺席」更糟。
+    // 走 `load` 那条分页读即可：端点回的本就是**未折叠原始行**（折叠只在 `store.js#load` 做），
+    // 所以这一支不需要新端点，也不许复制第二份翻页实现（判据 3 条见
+    // `runner/test/agentd-store-route.test.js` 的 `#501` 用例族）。
+    case 'loadRawRows': {
+      return fetchAllTranscriptRecords(ctx, args, { request });
     }
     case 'recall': {
       const qs = new URLSearchParams();
