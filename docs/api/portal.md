@@ -57,7 +57,7 @@
 | 管理 | `PATCH /api/admin/users/:id` | 更新用户资料、角色、FDE 名称或状态 |
 | 管理 | `DELETE /api/admin/users/:id` | 停用用户；有 FDE 资源时异步下线（用户行永久保留） |
 | 管理 | `POST /api/admin/users/:id/offboarding/retry` | 重试失败的 FDE 下线任务 |
-| 管理 | `POST /api/admin/users/:id/onboard/retry` | 重试失败的 FDE **开户**任务：`{onboarding:{state,step,error,llm_binding?}}`；幂等——非 `failed` 状态原样回（§12）|
+| 管理 | `POST /api/admin/users/:id/onboard/retry` | 重试失败的 FDE **开户**任务：`{onboarding:{state,step,error,llm_binding?}}`。**只有「既不失败、也没有可重排的失败步骤」才是 `200` 原样回**：`state=running` ⇒ **`409 onboarding_running`**（`http.js:2195-2197`）；`state ∈ {done, awaiting_credential}` 但 `llm-binding` 步骤 `failed` ⇒ **照样重新排队**（`onboarding.js:284-287` 的 `hasFailedLlmBinding` 分支）。判定原文：`if (row.state !== 'failed' && !(hasFailedLlmBinding && ['done', 'awaiting_credential'].includes(row.state))) return onboardingStatus(row);` |
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-enroll` | 补绑/重绑 TOTP；新种子只在本次响应下发并强制重新登录 |
@@ -108,12 +108,12 @@
 | 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
 | 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **未交付**（同上；internal 面 U10/U11 保留作协议留档）|
 | LLM 管理 | `GET /api/admin/llm/providers` | 供应商 + 模型列表（模型对象的两个名字见 §4.9） |
-| LLM 管理 | `POST /api/admin/llm/providers` | **新建 credential**（一个供应商 = 一条 LiteLLM credential）：`{(credential_name\|name), base_url?, api_key?, description?, credential_info?, credential_values?}` ⇒ **`201`** `{provider}`，响应里 `models` **恒为 `[]`**（§4.9-6）|
-| LLM 管理 | `PATCH /api/admin/llm/providers/:id` | **改 credential**：`{base_url?, credential_info?, credential_values?}`；⚠ **带 `enabled` 就 `400`**——credential **没有启停**语义（§4.9-6）|
-| LLM 管理 | `DELETE /api/admin/llm/providers/:id` | 删 credential ⇒ **`204` 无体**；它名下的模型一并消失（§4.9-6）|
-| LLM 管理 | `GET /api/admin/llm/models` | **模型目录全量**（唯一真相源 = LiteLLM 的 DB，本站只转发 + 投影）⇒ `{items:[…]}`，**无分页、无筛选参数**（§4.9-6）|
-| LLM 管理 | `POST /api/admin/llm/models/:id/block` | **停用模型**（本站唯一的启停入口）：无 body ⇒ `{model_id, enabled:false}`，转发上游 `POST /model/block`（§4.9-6）|
-| LLM 管理 | `POST /api/admin/llm/models/:id/unblock` | **启用模型**：无 body ⇒ `{model_id, enabled:true}`，转发上游 `POST /model/unblock`（§4.9-6）|
+| LLM 管理 | `POST /api/admin/llm/providers` | **新建 credential**（一个供应商 = 一条 LiteLLM credential）：`{(credential_name\|name), base_url?, api_key?, description?, credential_info?, credential_values?}` ⇒ **`201`** `{provider}`，响应里 `models` **恒为 `[]`**（§4.9-1）|
+| LLM 管理 | `PATCH /api/admin/llm/providers/:id` | **改 credential**：`{base_url?, credential_info?, credential_values?}`；⚠ **带 `enabled` 就 `400`**——credential **没有启停**语义（§4.9-1）|
+| LLM 管理 | `DELETE /api/admin/llm/providers/:id` | 删 credential ⇒ **`204` 无体**；它名下的模型一并消失（§4.9-1）|
+| LLM 管理 | `GET /api/admin/llm/models` | **模型目录全量**（唯一真相源 = LiteLLM 的 DB，本站只转发 + 投影）⇒ `{items:[…]}`，**无分页、无筛选参数**（§4.9-1）|
+| LLM 管理 | `POST /api/admin/llm/models/:id/block` | **停用模型**（本站唯一的启停入口）：无 body ⇒ `{model_id, enabled:false}`，转发上游 `POST /model/block`（§4.9-1）|
+| LLM 管理 | `POST /api/admin/llm/models/:id/unblock` | **启用模型**：无 body ⇒ `{model_id, enabled:true}`，转发上游 `POST /model/unblock`（§4.9-1）|
 | LLM 管理 | `POST /api/admin/llm/providers/:id/models` | 新增模型 |
 | LLM 管理 | `PATCH /api/admin/llm/models/:id` | **改模型：调用名 `call_name`（数据面）与显示名 `name` 是两个字段**（#296，§4.9） |
 | LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」——**当前无实现 ⇒ 404**（#777 A1）|
@@ -156,7 +156,7 @@
 > 改名这条线的契约仍见 §4.9；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 > 另：`POST /api/admin/llm/providers`、`PATCH|DELETE /api/admin/llm/providers/:id`、
 > `GET /api/admin/llm/models` 与 `POST /api/admin/llm/models/:id/block|unblock`
-> （`http.js:2014-2023`、`:2025-2040`、`:2052`、`:2082-2088`）**已实现且现已在册**：契约见 §4.9-6（#777 A2 补登记）。
+> （`http.js:2014-2023`、`:2025-2040`、`:2052`、`:2082-2088`）**已实现且现已在册**：契约见 §4.9-1（#777 A2 补登记）。
 > 心跳对账的口径仍见；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
@@ -2717,7 +2717,9 @@ SELECT fde_id FROM fde_llm_bindings
 - 「门户内改名不是漂移源」这句话从此要打个补丁：**改名会把引用它的 FDE 变成漂移**（`*_model_name`
   暂时指向旧名），立即对账就是为了让这个窗口尽量短——就地注释见代码。
 
-#### 4.9-6 供应商写面、模型目录与封禁/启停（#777 A2 补登记）
+#### 4.9-1 供应商写面、模型目录与封禁/启停（`/api/admin/llm/providers*`、`/api/admin/llm/models*`）
+
+> **编号说明**（免得被读成「上面应该有 4.9-2…4.9-5」）：`§4.9` 此前**没有任何 `4.9-N` 子号**（现验 `git show origin/main:docs/api/portal.md | grep -c '4\.9-[0-9]'` ⇒ **0**），本号是本批新登记的**第一个**子号，从 1 起。（#777 A2 补登记）
 
 本节**只写本站侧的契约 + 转发了上游哪个动作**。三条口径先说死（不然本节就会被读成「LiteLLM 的字段就是本站契约」）：
 
@@ -5827,7 +5829,8 @@ resume=true 时不传 initialMessages/initialUserMessage（引擎恢复记录即
 本站**没有** run 作用域的 `/runs/:id/recovery-rows`（引擎的 `runId` 在这里就是 transcript key = sessionId）。
 
 - **鉴权三层与其余 S 端点逐字一致，但**不享**终态豁免**：三个方法都是无条件 `assertClaimToken`
-  （`internal.js:2094`、`:2106`、`:2135`，对照 `:2010` / `:2207` 的条件式写法）⇒ **run 终态后三者都 `409 lease_lost`**，连 `GET` 也一样。这与上面的
+   （`internal.js:2094`、`:2106`、`:2135`，对照 `:2010` / `:2207` 的条件式写法）⇒ **run 终态后，凡是走到租约校验的请求三者都 `409 lease_lost`**，连 `GET` 也一样。
+   ⚠ **别读成「终态后一律 409」**：租约校验**不是函数第一步**——`PUT` 先跑 `assertRecoveryRowBody(body)`（`:2101`）**才** `assertClaimToken`（`:2106`），**无效 body 先到 `400`**；HTTP 层的 JSON 解析与体积闸更靠前。（终态确实会让租约失效：正常终态事务同时更新 `runs` 并清掉 queue 的 `claim_token` / `lease_until`，见 `internal.js:1116-1123`。）这与上面的
   `runstate/status`（终态可读）**不同**，也是本站故意保留的差异：恢复行只在「跑着/要续跑」时才有意义。
 - **`GET` 永不 `204`**：空集是 `200 {"rows":[]}`。行序是 **`append_seq` 升序**（持久化追加序，**不是时间**；
   `transcript-store.js:386-395`），返回的是 `record` **本体**（表上的 `round` 列**不合成进去**）。
