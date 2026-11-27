@@ -1,7 +1,7 @@
 // 版本必须是构建产物（issue #404 结案）。
 // 这组测试钉的是"来源顺序"与"绝不抛错"两件事，外加一条防回潮的源码锚点：
 // agentd 里不许再出现 `|| '0.1.0'` 那种"看起来合法的兜底版本号"。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,8 +11,24 @@ import { readBuildInfo, UNKNOWN } from '../lib/build-info.js';
 
 const RUNNER_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 build-info-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
+
 function tmpInfo(objOrText) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'build-info-'));
+  const dir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'build-info-')));
   const file = path.join(dir, 'build-info.json');
   fs.writeFileSync(file, typeof objOrText === 'string' ? objOrText : JSON.stringify(objOrText));
   return file;
