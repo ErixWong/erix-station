@@ -1,7 +1,11 @@
 // i18n 基建（issue #101 P1）：createI18n（Composition API 模式）+ 语言检测 + 持久化。
 //
 // 语言优先级（#101 定的方案，#804 换了载体）：cookie('locale') 合法值 → localStorage('locale') 合法值
-// → 浏览器语言（zh 开头 → zh-CN，否则 en）→ 兜底 zh-CN。偏好存 cookie + localStorage（不上传服务端/用户表）。
+// → 浏览器语言（zh 开头 → zh-CN，否则 en）→ 兜底 zh-CN。偏好存 cookie + localStorage 两个本地载体；
+// #828 起账号也存一份 `users.locale`（服务端字段，登录后由前端经 setLocale 灌进上面两个载体）。优先级：
+// 本地已切过的优先（cookie → localStorage）；账号值只是「这台浏览器初次见面的种子」——用户**亲自点过
+// 语言开关**（`locale.userChosen` 标记，见 `hasUserChosenLocale`）之后本地值说话、账号默认语言不再来抢
+// （要不要跟随的判据在 stores/auth 的 applyAccountLocale）。「不上传服务端/用户表」这句在 #828 后已不成立。
 // 为什么 cookie 排在 localStorage 之前（#804）：管理台 `admin.<伞域>:<端口>` 与用户面 `station.<伞域>`
 // 是两个 **origin**，而 localStorage 按 origin 隔离、两边各存一份互不相通 ⇒ 用户面切了英文，管理台
 // 还是读不到。同站 cookie（Domain = 父域）两边都看得见，所以「两边都有」时以 cookie 为准；
