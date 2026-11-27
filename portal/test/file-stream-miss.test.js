@@ -4,7 +4,7 @@
 // 尺寸上限（>2MB JSON 上限但 ≤512MB 流式放行——大 PDF 的合法体积）。
 // 埋点（previewmiss）：类别映射、扩展名归一、UPSERT 参数、读端聚合参数。
 // 隔离约定：tmp userspace 注入 + 内联 fake pool，不碰真实环境。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,8 +12,25 @@ import path from 'node:path';
 import { openFileStream, parseSingleRange, streamMimeFor, FILE_STREAM_MAX_BYTES, DirError } from '../src/dirs.js';
 import { missKindFor, normalizeExt, recordPreviewMiss, summarizePreviewMisses } from '../src/previewmiss.js';
 
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// tmpUserspace() 的 erix-stream- 一律进 tmpDirs；各用例 finally 里的 rm 仍是第一道防线，
+// 这里只补第二道（用例在 try 之前抛错、或 finally 自己提前报错时，目录就不会留在 /tmp）。
+// force 是必需的：两道 rm 会撞同一个目录，必须容忍「已经没了」；真漏注册闸会当场抱住。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
 function tmpUserspace() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-stream-'));
+  const root = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-stream-')));
   const proj = path.join(root, 'alice', 'projects', 'proj1');
   fs.mkdirSync(path.join(proj, 'sub'), { recursive: true });
   return { root, proj };
