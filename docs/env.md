@@ -449,6 +449,48 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 > 也不在 fde-proxy `ENV_KEY_ALLOW` / provisioner 的 Env 下行集里——它们只作用于 **portal 进程自身**，不需要下发 FDE。
 > 要改值：在 compose 里给 `station-portal` 加 env（或 `.env`）后重建 portal 容器；未设置时全部走上表的默认值。
 
+### 10.6 补登：`deploy/docker-compose.yml` 在插值、本文此前未登记的 14 个键（#777 批 D1，261128 现验）
+
+> **现验判据**（词边界，不是子串——`grep -c PORTAL_IMAGE` 会把 `STATION_PORTAL_IMAGE` 一起算）：
+> ```sh
+> grep -ohE '\$\{[A-Z0-9_]+' deploy/docker-compose.yml | sed 's/\${//' | sort -u   # ⇒ 89 个（含一个 `VAR`，那是注释里 `${VAR:?}` 的叙述噪声，不是真旋钮）
+> while read -r k; do grep -qoE "(^|[^A-Z0-9_])${k}([^A-Z0-9_]|$)" docs/env.md || echo "$k"; done < 上面那份清单   # ⇒ 14 个
+> ```
+> **不是一律补成「宿主旋钮」**：类 A/C/D 是宿主该管的（A 只在并行隔离栈才需要动），**类 B 根本不是部署旋钮**
+> ——它是镜像构建期入参。每类都写「谁读它 / 改了会怎样 / 是不是宿主该管」。
+
+**类 A：容器名（5 个，宿主该管，但**只在并行隔离栈**才需要动）**
+
+`STATION_DB_NAME` / `STATION_PORTAL_NAME` / `STATION_EDGE_NAME` / `STATION_LITELLM_NAME` / `STATION_DOCKER_PROXY_NAME`：compose 各服务的 `container_name:` 插值位（判据：compose `:17` `:62` `:116` `:342` `:388`），**缺省值就是 §本文其它处写的实名**（`station-db` 等）。
+
+- **谁读它**：只有 Docker（命名）与「按容器名找人」的运维/e2e 命令。portal **不读**——它找 FDE 容器只从 DB（`containers.container_name`，AGENTS §5）。
+- **改了会怎样**：服务间 DNS **不受影响**（`backend` 网络里解析的是 compose **服务名**，如 portal 的 `DATABASE_URL` 指 `station-db:5432`），但按容器名找人的脚本会失配——`portal/integration/lib/isolated-env.mjs:33` 就把 `station-portal` / `station-edge` 当**硬编码缺省**。
+- **为什么欠着**：隔离栈并行跑时要换名（同名 `container_name` 冲突），这层需求只出现在 e2e，所以从未进本表。
+
+**类 B：镜像构建期入参（3 个，**不是部署旋钮**，是构建/发布流水线该管）**
+
+`STATION_VERSION` / `STATION_REVISION` / `STATION_BUILD_DATE`：只出现在 compose 的 `station-portal.build.args`（compose `:128-130`，FDE 镜像同名 ARG 在 `runner/Dockerfile`），写进镜像内 `build-info.json` 的 `revision` / `built_at` 与 OCI label。
+
+- **谁读它**：镜像构建（`portal/Dockerfile` / `runner/Dockerfile` 末尾那一层）；运行时读的是**镜像内那个文件**（`portal/src/version-info.js` → `readBuildInfo()`），不是这三个 env。
+- **不改会怎样**：`revision`/`built_at` 就是 `unknown`——**不是烘进假版本**，CI 的 portal/FDE tripwire 会当场红（`ci.yml` 的 build-info 步骤、`scripts/check-build-info.mjs`）。
+- **口径**：本表不写死取值（版本真相在 `package.json` 与 git 修订）；**部署期不该动它们**，动它们的是构建命令（`ci-release.md` §3/§7）。
+
+**类 C：portal / FDE 实例的运行时属性（3 个，宿主该管）**
+
+| 变量 | 语义 | 谁读它（现读判据） | 不改 / 改错的代价 |
+|---|---|---|---|
+| `STATION_STACK_ID` | **栈所有权标签**：portal 给自建的 FDE 容器/网络打 `station.stack=<id>`，孤儿清扫只清本栈（compose `:179-180`，缺省 `default`） | `portal/src/config.js:383`（`env.STATION_STACK_ID \|\| 'default'`） | 并行隔离栈不设 ⇒ 两套栈互删对方的 FDE 容器/网络（注释里点名的 `station-e2e-*` 就是这族事故） |
+| `ERIX_MCP_CONFIG_TIMEOUT_MS` | FDE 容器内 **MCP 配置读取超时**（毫秒）；portal 在 provisioner 里把它拼进下行的容器 env，worker 侧读取 | 下发：`portal/src/provisioner.js:291`；消费：`runner/worker.js:134`（`?? 10_000`） | 设太小 ⇒ MCP 配置读不到就回落；本变量只影响容器内 agent 启动，不影响 portal 本体 |
+| `TRAEFIK_SECURE_ENTRYPOINT` | 用户面（工作台 + 预览 host）是否**同时挂 `websecure` + tls**；缺省空 = 不挂（compose `:199`） | `portal/src/config.js:359` → `portal/src/routes.js` 的路由生成 | 留空 ⇒ 用户面只挂 `web`（老部署 `routes.yml` 字节不变）；设成 `websecure` 才出 https 路由——**填了但 traefik.yml 里没那个 entryPoint 会生成挂不上路由的路由**，改之前先核 `deploy/traefik/traefik.yml` |
+
+**类 D：宿主路径（3 个，宿主该管）**
+
+| 变量 | 语义 | 现读判据 | 代价 / 口径 |
+|---|---|---|---|
+| `STATION_DB_DIR` | `station-db` 数据目录的**宿主 bind source**（缺省 `/docker/station-db`） | compose `:35`；隔离 e2e 硬要求：`portal/integration/lib/isolated-env.mjs:205-211`（**缺省即抛**，不再回退共享目录） | ⚠ 沿用缺省去跑并行隔离栈 ⇒ 两个 `station-db` 抢同一份宿主数据目录（#226 取证）；`ci-release.md` §6 已把「`STATION_DB_DIR` 必须在临时目录」列进 e2e 前置。本文此前只在 §10 写过台账名 `DB_DATA_DIR`（⇒ §10.7） |
+| `TRAEFIK_STATIC_HOST` | 整体**替换** Traefik 静态配置文件（缺省 `./traefik/traefik.yml`） | compose `:410`（注释 `:400` 记了为什么不能走 CLI 覆盖：v3 带 `--configFile` 时文件里的 entryPoints 压过 CLI） | 并行隔离栈靠它换一份只改入口端口的静态文件；填错 ⇒ 边缘直接起不来 |
+| `ERIX_ARTIFACTS_ROOT_HOST` | run 终态产物卷的**宿主侧**路径（容器内路径是 `ERIX_ARTIFACTS_ROOT`，compose `:193`） | compose `:165`；契约 [`design/deploy-contract.md`](design/deploy-contract.md) §2.2 已登（本表此前漏了宿主侧这一半） | 与 `ERIX_USERSPACE_ROOT_HOST` 同族：改宿主路径不动容器内路径；产物丢失面 = 该目录被清 |
+
 ---
 
 ## 11. P1 运行时参数表（超时 / 背压 / 时间权威 / 日志）
