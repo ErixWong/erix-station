@@ -15,7 +15,7 @@
 //   （前者被 `PARENT_RUN_ID_RE`/`CHILD_RUN_ID_RE` 锁死形状、后者 `config.userSpaceRoot` 恒有值），
 //   故 HTTP 面以可达的「runId 形态非法」（同守住路径边界的前置）替之，另以直调钉 500 一条的
 //   `httpStatus`+`en`（见文件末尾）。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -29,6 +29,23 @@ import { FakePool } from './fake-pool.js';
 
 const SELF_UID = process.getuid?.() ?? 1000;
 const SELF_GID = process.getgid?.() ?? 1000;
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// baseConfig 每次 serve 都开两个 /tmp 目录（static + tls），它们都进 tmpDirs；
+// 漏一个就会在 /tmp 留下 station-s2g-static-* / station-s2g-tls-*，而 scripts/check-tmp-hygiene.mjs
+// 正是数这个名字（增量口径：本轮新增必须为 0）。userspace 那批自己 close() 里已 rm，本单不动。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 // admin：跑 `/api/admin/*`（requireAdmin 只看 role === 'admin'）；带 fde_name 又能满足用户面的
 // `marketFdeOf`（安装/委派根都读 `user.fde_name`）。
@@ -94,9 +111,9 @@ function baseConfig(userspace) {
     kdfConcurrency: 2, kdfQueueLimit: 100, kdfQueueTimeoutMs: 30000,
     maxLoginLength: 128, maxPasswordLength: 256,
     totp: { issuer: 'erix-station-test', digits: 6, period: 30, window: 1 },
-    dockerHost: 'tcp://127.0.0.1:1', staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'station-s2g-static-')),
+    dockerHost: 'tcp://127.0.0.1:1', staticDir: trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-s2g-static-'))),
     userSpaceRoot: userspace, fdeUid: SELF_UID, fdeGid: SELF_GID, fileUploadMaxBytes: 32 * 1024 * 1024,
-    traefikDynamicDir: fs.mkdtempSync(path.join(os.tmpdir(), 'station-s2g-tls-')),
+    traefikDynamicDir: trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-s2g-tls-'))),
   };
 }
 
