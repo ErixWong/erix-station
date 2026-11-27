@@ -45,7 +45,7 @@ const LOOSE_LADDER = [250, 500, 1000, 2000, 4000, 8000];   // max=10000 生效�
 const ARM_BUDGET_MS = 5000;
 
 function makeFakeClock() {
-  const clock = { nowMs: 0, sleeps: [], pending: null };
+  const clock = { nowMs: 0, sleeps: [], pending: null, armWaits: [], budgetWins: 0 };
   // 「循环挂上了一拍 sleep」的**一次性事件**（#531）：arm() 挂上 resolver，`sleep()` 点亮并置 null。
   // 一次性 = 点亮即摘灯，下一次 arm() 自己挂新的；不靠「转 setImmediate 直到看见 pending」。
   let parkedWake = null;
@@ -75,15 +75,20 @@ function makeFakeClock() {
   let budgetTimer = null;
   async function arm() {
     const startedAt = performance.now(); // 单调时钟（Date.now() 会被 NTP 回拨）；假时钟的 now() 在这儿不动，量不出等了多久
+    let wonBy = 'event';   // #531：谁满足了这次 arm() 要记账（事件 = 正常；budget = 安全网到点）
     if (!clock.pending) {
       // 事件 = 主路径（因果唤醒）；安全网 = 只在事件永不到达时咬住。
       // 安全网先到也算过，只要那一刻 `clock.pending` 真的挂着（见下面的断言）。
       await Promise.race([
         new Promise((resolve) => { parkedWake = resolve; }),
-        new Promise((resolve) => { budgetTimer = setTimeout(resolve, ARM_BUDGET_MS); }),
+        new Promise((resolve) => {
+          budgetTimer = setTimeout(() => { wonBy = 'budget'; resolve(); }, ARM_BUDGET_MS);
+        }),
       ]).finally(() => { parkedWake = null; clearTimeout(budgetTimer); budgetTimer = null; });
     }
     const waitedMs = Math.round(performance.now() - startedAt);
+    clock.armWaits.push(waitedMs);
+    if (wonBy === 'budget') clock.budgetWins += 1;
     assert.ok(clock.pending, `循环必须停在某一拍的 sleep 上（已等 ${waitedMs}ms / 预算 ${ARM_BUDGET_MS}ms）`);
   }
   async function release() {
@@ -95,7 +100,14 @@ function makeFakeClock() {
     await arm();
     return entry.ms;
   }
-  return { clock, now, sleep, arm, release };
+  /** #531：`arm()` 的满足方式与余量（给用例当判据用，不是调试输出）。 */
+  const armStats = () => ({
+    arms: clock.armWaits.length,
+    budgetWins: clock.budgetWins,
+    maxWaitMs: clock.armWaits.length ? Math.max(...clock.armWaits) : 0,
+    budgetMs: ARM_BUDGET_MS,
+  });
+  return { clock, now, sleep, arm, release, armStats };
 }
 
 class LoopFakePool {
@@ -204,7 +216,13 @@ async function observe(suite, ticks = 6) {
     await fakes.arm();
     const ladder = [];
     for (let i = 0; i < ticks; i += 1) ladder.push(await fakes.release());
-    return { ladder, warns: log.warns, recoveries: pool.orphanRecoveries, claims: pool.claims };
+    const armStats = fakes.armStats();
+    // #531：判绿必须来自「循环真的挂上一拍」这个**事件**，不是「安全网到点」。
+    // 今天「安全网赢」本就等价于 arm() 里那条 pending 断言红，所以这一格**不新增红**；它新增的是
+    // **失败时看得见是谁赢、等了多久 vs 预算多少**——正是原 issue 缺的那盏灯（"没有红灯指向真凶"）。
+    assert.equal(armStats.budgetWins, 0,
+      `arm() 必须由事件满足（${JSON.stringify(armStats)}）——安全网赢意味着这台机器上首拍 park 慢过 ${armStats.budgetMs}ms，就是 #531 说的「没有红灯指向真凶」`);
+    return { ladder, warns: log.warns, recoveries: pool.orphanRecoveries, claims: pool.claims, armStats };
   } finally {
     loop.stop();
     fakes.clock.pending?.finish(true);
