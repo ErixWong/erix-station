@@ -1,5 +1,10 @@
 # 首次真实部署记录 — v0.1.0（2026-10-10，UTC+8）
 
+> **⚠ 某日快照（2026-10-10 首次真实部署，v0.1.0/v0.1.1），不反映现状**：本文记的是**当时**部署成了什么样（镜像 tag、端口、凭据落点、已接受偏差）；
+> 之后按 digest 一路演进，这些值已过期。**现状看**：发布与按 digest 部署 [`ci-release.md`](ci-release.md)（§2 发布 → 部署）、
+> 参数取值 [`../env.md`](../env.md)、「应该长什么样」[`../design/deploy-contract.md`](../design/deploy-contract.md)；
+> 启停/排障那半截运维手册仍是欠项 ⇒ 看 [`../README.md`](../README.md) 二·D6 的「现状」行。
+
 > 面向运维/后来者：这条记录写「实际部署成了什么样」，不替代 `docs/design/deploy-contract.md`（应该是什么样）与 `docs/env.md`（参数口径）。`docs/ops/runbook.md` 仍是待补项（docs/README D6）。
 
 ## 部署形态

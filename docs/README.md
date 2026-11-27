@@ -17,12 +17,30 @@
 | [`design/topology.md`](design/topology.md) | **H-B 网络与访问拓扑定稿（单一事实来源）**：拓扑、IPAM、链路 L1–L10、路由模型、加固清单、连通矩阵、reconciler 职责、实测证据（决策者 2026-09，issue #5） | ✅ |
 | [`design/principles.md`](design/principles.md) | **设计原理**：五条核心原理、规则对照、被否决方案、未决问题决策框架、实现者硬约束 | ✅ |
 | [`design/runner-integration.md`](design/runner-integration.md) | **runner 集成契约（WP3b）**：agentd/worker 职责、IPC 信封、租约/心跳/事件批、终态收敛、erix-agent `runToolLoop`/`TranscriptStore` 锚点（锚点版本 **v0.9.0 是历史锚点**，不是现价；**当前 pin 现查 `package.json` 与 `runner/package.json` 的 `erix-agent` 字段**，261115 现查 = 0.33.0，§9.1 八方法） | ✅ |
-| [`design/conversation-state.md`](design/conversation-state.md) | **会话状态模型（issue #77）**：三层生命周期（执行/会话/工作区）、session-scoped transcript 目标态、引擎现状源码核对、pi 参照系、P0–P3 分阶段实施、红线与验收口径 | ✅（设计定稿待实施） |
-| [`design/directory-as-project.md`](design/directory-as-project.md) | **去项目化：目录即项目（P5）+ 文件面板（P6）**：sessions.cwd 化、端口去项目化（`eric-p-<port>`）、同项目并行放行（pi 对齐不锁）、UI 定稿布局、**项目级物化退役**（仅指 `.gitignore`/`.erix/ports.json`/`.erix/AGENTS.md` 这一层；`materializer` 本身仍是**活组件**——`portal/src/cli.js` 起它的对账循环、`onboarding.js`/`platform-prompts.js` 依赖它）、迁移与部署序 | ✅（设计定稿待实施） |
-| [`design/security-posture-2026-11-05.md`](design/security-posture-2026-11-05.md) | **安全现状与风险清单（2026-11-05 真机实测）**：容器间/容器到宿主的可达性矩阵（每 FDE 一个独立 `/29`、跨 bridge 实测被挡、宿主 41 个 `0.0.0.0` 端口全可达）、谁能写 Traefik 规则（FDE 容器不能；portal 能）、证书私钥读写路径、R1–R9 风险与 S1–S6 方案（含已接受项与未验证边界） | ✅ |
-| [`design/audit-2026-09-16.md`](design/audit-2026-09-16.md) | **设计文档集一致性审计（2026-09-16）**：58 条发现 + 修复处置记录（issue #21） | ✅ |
+| [`design/conversation-state.md`](design/conversation-state.md) | **会话状态模型（issue #77）**：三层生命周期（执行/会话/工作区）、session-scoped transcript 目标态、引擎现状源码核对、pi 参照系、P0–P3 分阶段实施、红线与验收口径 | ✅（**已落地**：store key 切 session = `deploy/migrations/0006-session-transcript.sql`（#81 P2）；用户输入预写 = `portal/src/transcript-store.js:425`（真调用行 `return appendUserTurn(…)`）；终态清场改归档而非物理删 = `runner/lib/run-data.js:246`（`archiveRunData`）/`:294`（`sweepRunDataDir`，带归档 TTL 入参），归档用例在 `runner/test/run-data.test.js`）。**逐阶段状态只看本文 §5 那张表**——那里是唯一真相（现查：P3 的 **②c 残留数据收敛** 仍标「待做」；P1 那格原写「待派工」与上述已落地代码矛盾，已随 #777 批 C 改标已落地并给落点） |
+| [`design/directory-as-project.md`](design/directory-as-project.md) | **去项目化：目录即项目（P5）+ 文件面板（P6）**：sessions.cwd 化、端口去项目化（`eric-p-<port>`）、同项目并行放行（pi 对齐不锁）、UI 定稿布局、**项目级物化退役**（仅指 `.gitignore`/`.erix/ports.json`/`.erix/AGENTS.md` 这一层；`materializer` 本身仍是**活组件**——`portal/src/cli.js` 起它的对账循环、`onboarding.js`/`platform-prompts.js` 依赖它）、迁移与部署序 | ✅（**已落地**：会话绑 cwd `deploy/migrations/0008-deprojectize.sql:15`；端口去项目化 `:37`（删 `port_allocations.project_id`）；预览域名新语法 `portal/src/projects.js:96`（`buildHostname` = `<fde>-p-<portLabel>.<伞域>`）；同项目并行放行 `runner/agentd.js:60`（capacity 默认 2，`deploy/docker-compose.yml:217` 同值）；目录=推导视图 `/api/dirs` `portal/src/http.js:1501`；worktree 拆除即 D8 修订后的现状 ⇒ [`design/fde-platform.md`](design/fde-platform.md) 附录 A.1） |
+| [`design/security-posture-2026-11-05.md`](design/security-posture-2026-11-05.md) | **只剩指针，正文已整篇搬冷层**（本页现仅 5 行）——别指望在这里读结论：机器事实（宿主暴露面实测快照）在冷层 `~/projects/docs/station-dev-machine.md`，本页只留「当时存在 OPEN 项：#233 宿主防火墙未落地、`DOCKER-USER` 27 条 publish / `INPUT` 11 条」一句摘要与归档说明 | ✅ 已归档，不再更新；规格与判据仍看 [`design/topology.md`](design/topology.md) / [`design/deploy-contract.md`](design/deploy-contract.md) |
+| [`design/audit-2026-09-16.md`](design/audit-2026-09-16.md) | **设计文档集一致性审计（2026-09-16）**：58 条发现 + 修复处置记录（issue #21） | 📌 某日快照（2026-09-16）；正文已加横幅标「不反映现状」。现状看 [`design/fde-platform.md`](design/fde-platform.md) / [`design/topology.md`](design/topology.md) |
 | [`design/analysis-2026-10-20-judge-and-trial-issues.md`](design/analysis-2026-10-20-judge-and-trial-issues.md) | **试用问题与 judge 行为分析定稿（2026-10-20）**：原仓库根试用反馈第 4 条（judge 报「目标已达成」却继续跑；文件已删）的机制真相与上游改法定稿（中途审计 `done=true` 为何对模型不可见、`judge_done` 三重门、为何不能拿弱证据拦写）、#282/#284/#286 的本版范围与**已砍清单**（含三类砍因）、两次取证事故（锚点被并行 session 的未提交 WIP 污染 / 审计报告从未落盘）、待决策者拍的 5 条；⚠ 只读分析，**未做运行验证**，行号已按 erix-agent `9440b1c`/0.21.0 重验；**§11 已收尾：三张单（agent #322/#323、station #321）全部 closed，§3/§5/§9 待办作废，读本文只取 §2/§10/§11** | ✅（**已闭环**，2026-11-10） |
-| [`design/event-platform/`](design/event-platform/README.md) | **事件驱动平台（代号「锯脂鲤」）**：**9 份 + README**（定位与可研 / 事件模型与判决 / 宏模型与能力清单 / 场景压测 / 第一版宏 / 执行与回灌 / 界面与面板 / 值守与审查 / 可观测性）。入口有**决策卡（6 行）**：做什么、不做什么、关键取舍、是什么、与 n8n/Dify 差别、怎么验证有用。**第一版已批准开发（2026-11-15）**：M1/M8/M9/M7 + 可观测性；其余仍在可研不排期。结论分【实测】/【推断】/【未验】三档 | 🚧 第一版开发中（其余可研） |
+| [`design/agents-md-layering-2026-11-05.md`](design/agents-md-layering-2026-11-05.md) | **AGENTS.md 层级注入评估（issue #451）**：宿主侧「读 AGENTS.md 及其上级目录」的采集口径、去重键、渲染确定性（禁时间戳/run id）与切片表 | ✅ 已落地（采集/渲染 `runner/lib/agents-md.js`；接线在 `runner/worker.js:487-488` 的 `startRun` 体内；判据 `runner/test/agents-md.test.js`） |
+| [`design/capability-market.md`](design/capability-market.md) | **能力市场（技能市场）P0 契约**：L1 落盘面 / L2 工具面 / L3 上下文面三层分开、包规范与校验、安装/启停账、验收判据与不做清单 | ✅ 已落地（数据层 `deploy/migrations/0039-capability-market.sql`；宿主 `portal/src/market.js` + `market-write.js`；物化 `capabilities.json` 见 `portal/src/materializer.js:585`；runner 读侧 `runner/lib/capability-index.js`） |
+| [`design/mcp-integration.md`](design/mcp-integration.md) | **MCP 通道 P1 契约（issue #608，v2 2026-11-17）**：只做形态①（run 内 stdio / 远端 HTTP）、配置槽声明与「只写不读」的密文值、注入面与提示词预算 | ✅ 形态①已落地（`deploy/migrations/0040-mcp-channel.sql` + `0042-mcp-plaintext-values.sql`；runner `runner/lib/mcp-client.js`/`mcp-servers.js`/`mcp-tool.js`，接线 `runner/worker.js:59-63`）；**形态②③未做**，判据 = `runner/worker.js` 里无常驻容器/平台侧 hub 的装配点 |
+| [`design/skill-authoring.md`](design/skill-authoring.md) | **技能包编写指南**（给发布者与写包的人）：先判 skill 还是 MCP、包结构、`tools[]` 声明、被市场拒收的原因 | ✅ 活文档（收下/校验的写侧 `portal/src/market-write.js`；契约来源 `capability-market.md` §3 + `mcp-integration.md` §4） |
+| [`design/delegation-2026-11-08.md`](design/delegation-2026-11-08.md) | **delegation（子 run）接入设计**：同进程内嵌套第二个 `runToolLoop`、名册 + 账本落本地 JSONL、门户只读投影成与主对话同形的 DTO | ✅ 已落地并真机验收（开关 `runner/worker.js:921` 的 `ERIX_DELEGATE_ENABLED`，未设即开；投影 `portal/src/delegation.js`；判据 `runner/test/delegation.test.js`） |
+| [`design/delegation-activity-2026-11-16.md`](design/delegation-activity-2026-11-16.md) | **子 run 活动可视化**：三条并列通路（读名册 / 读账本 / 新通道）+ 推荐方案 + 分期表 | 🚧 阶段 0/1 已落地（阶段 0 徽标 `portal/frontend/src/components/DelegateActivityBar.vue`，挂在 `RunStatusBar.vue:216` 尾部；阶段 1 `activity=1` 摘要与缓存 `portal/src/delegation.js`；PR #597/#598/#599）；**阶段 2 未做**（槽位 `N/M`、名册 TTL 归档、真·实时通道 ⇒ 判据：`DelegateActivityBar.vue` 无 capacity 字段、`delegation.js` 无名册清理） |
+| [`design/toolcall-args-truncation-2026-10-24.md`](design/toolcall-args-truncation-2026-10-24.md) | **网关侧观察件（2026-10-24）**：`qwen3.8-flash-next` 在 `args > ~4KB` 时 tool_calls 参数流被提前截断的取证与复现脚本 | 📌 挂账观察（追踪单 erix-station #426，上游网关侧，本站改不了）；复现命令：`python3 docs/design/toolcall-args-truncation-2026-10-24-repro.py --shape nested --bytes 6000 --reps 3` |
+| [`design/analysis-2026-10-20-judge-independent-review.md`](design/analysis-2026-10-20-judge-independent-review.md) | **上一条定稿件的独立复审件**（执行体 Copilot，`work` 档 + 一次性沙箱）：源码复证 + fake-provider 离线探针，对归因与拆法给出独立结论 | ✅ 历史取证（只读分析，**没有真机 run**，行为收益未测）；上游三单已 closed 的现查见 [`design/analysis-2026-10-20-judge-and-trial-issues.md`](design/analysis-2026-10-20-judge-and-trial-issues.md) `:183-191`（§10.1/§11） |
+| [`design/event-platform/`](design/event-platform/README.md) | **事件驱动平台（代号「锯脂鲤」）**：**份数不写死**——子文档清单以它 [§3 的文件地图](design/event-platform/README.md) 那张表为准（本目录 `.md` 数 = 该表行数 + 本 README；写死「9 份 + README」的旧口径已随 #777 拆掉，**具体份数不写进地图**（写了下次加文档就失真））。入口有**决策卡（6 行）**：做什么、不做什么、关键取舍、是什么、与 n8n/Dify 差别、怎么验证有用。**第一版已批准开发（2026-11-15）**：M1/M8/M9/M7 + 可观测性；其余仍在可研不排期。结论分【实测】/【推断】/【未验】三档 | 🚧 第一版四条已落地（kind 枚举单一真源 `portal/shared/macro-kinds.js:17`；执行与审查 `portal/src/macro-eval.js`/`macro-review.js`；面板 `MacroBell.vue` + `AdminMacroRunsView.vue`）；其余可研 |
+| [`design/event-platform/01-decision-and-feasibility.md`](design/event-platform/01-decision-and-feasibility.md) | 定位（vs n8n/Dify、与 station 的 L0/L1/P1/P2 分层）+ 简化版/加强版 scope + **五条可证伪命题与三档结论标准** | 可研（2026-11-07）；不排期项的清单以 README 决策卡「不做什么」行为准 |
+| [`design/event-platform/02-event-model-and-verdict.md`](design/event-platform/02-event-model-and-verdict.md) | 事件建模（六字段、封闭 `state`、影子表、边沿 vs 状态、幂等）+ 判决模型（四档、证据、判据独立性） | 形状已进实现：执行账枚举单一真源 `portal/shared/macro-kinds.js:90`（`STATUS`）/`:112`（`VERDICT`） |
+| [`design/event-platform/03-macro-model-and-catalog.md`](design/event-platform/03-macro-model-and-catalog.md) | 宏五格、三面分离、代码 vs DB、**能力清单**（5 事件 × 12 动作 × 6 参数类型） | 形状已进实现：`KINDS`/`KIND_SCHEMA`/`KIND_SCOPE` 在 `portal/shared/macro-kinds.js:17`/`:28`/`:54`；防漂测试 `portal/test/macro-kinds-single-source.test.js` |
+| [`design/event-platform/04-scenarios.md`](design/event-platform/04-scenarios.md) | 六个典型场景逐个搭宏 + **一个反例**（会话砖化不是宏）+ §8 汇总的六处设计缺口 | 可研（2026-11-07）；**不是待办清单**——场景≠承诺，分期只看 `05` 与 README 决策卡 |
+| [`design/event-platform/05-first-macros.md`](design/event-platform/05-first-macros.md) | 第一版配哪几条宏、每条填什么（M1/M8/M9/M7），E2/E3/E4 为何挂账 | 已进实现：四条 kind 逐一对应 `portal/shared/macro-kinds.js:17`；参数默认值口径见 `:54` 的 `KIND_SCHEMA`（issue #625 补返） |
+| [`design/event-platform/06-execution-and-recovery.md`](design/event-platform/06-execution-and-recovery.md) | 打卡型宏为何不需 subagent、自动开会话的三件事、**完成→审查→回灌**、**失败→分诊→恢复** | 回灌半边已落地：`portal/src/macro-review.js:29`（`REMEDIATION_PREFIX`）+ `:46`（`MAX_REMEDIATION_DEPTH = 1`）；**失败恢复（`run-recover`）未做**，判据 = `KINDS`（`portal/shared/macro-kinds.js:17`）里没有 `run-recover` |
+| [`design/event-platform/07-surfaces-and-panel.md`](design/event-platform/07-surfaces-and-panel.md) | 管理台模板定义 / 用户会话下拉 / 后台执行三面 + 用户端 trigger→action→result 面板 | 三面已落地：管理台 `AdminMacrosView.vue`、用户下拉/面板 `MacroMenu.vue`/`MacroDrawer.vue`/`MacroBell.vue`（均在 `portal/frontend/src/`）；API 面 `portal/src/macro-routes.js` |
+| [`design/event-platform/08-watch-and-review.md`](design/event-platform/08-watch-and-review.md) | 值守与审查的收口：**一条链、一个判决者**（为何撤掉机械判据层）+ 读活目录（#690）+ 判决第一行固定格式 | 已进实现：判决行正则 `portal/src/macro-review.js:32`（`VERDICT_LINE_RE`）、映射 `:35`；派发与审查 run `:24` 引入的 `runMacroReview`（`portal/src/macro-dispatcher.js`） |
+| [`design/event-platform/09-observability.md`](design/event-platform/09-observability.md) | 可观测性三层问题（看过吗 / 命中吗 / 做成了吗）+ 四态判定表 + 用户值守面板 + 管理台 List & Filter | 已落地：执行账表 `deploy/migrations/0035-macro-platform.sql:87`（`macro_runs`）、跳过原因八档 `portal/shared/macro-kinds.js:104`（后续补档 `0045-macro-skipped-reason-review-unavailable.sql`）；管理台列表 `AdminMacroRunsView.vue` |
+| [`design/event-platform/10-implementation-contract.md`](design/event-platform/10-implementation-contract.md) | **实现契约**：枚举单一真源 / W2→W3 意图对象 / 五组 HTTP API / 归属补丁 / 判据命令 / M7 执行器 | 活契约（实现引用它，不回流）：单一真源 `portal/shared/macro-kinds.js`（头注已标「issue #528 / 契约 `10` §1」）、参数默认值返修记录见该文件 `:39-47`（#625） |
 | [`design/user-space.md`](design/user-space.md) | **用户空间物化契约（阻塞 P1 开工，issue #7）**：宿主↔portal↔FDE 容器路径映射、文件清单与 JSON schema、原子写 + manifest 多文件一致性、UID/权限、失败重试状态机、变更感知、重建幂等、项目目录归属 | ✅ |
 | [`design/deploy-contract.md`](design/deploy-contract.md) | **P1 部署契约**：服务清单与镜像 pin、compose 字段（网络/publish/volume/healthcheck/env_file）、DB 迁移机制、Traefik 静态/动态配置、防火墙应用方式（iptables-nft 幂等 + fail-closed）、socket-proxy 白名单策略、FDE 容器创建参数、P1 范围声明、readiness 语义 | ✅ |
 | [`design/llm-gateway/llm-gateway-selection.md`](design/llm-gateway/llm-gateway-selection.md) | **LLM 网关选型支撑（Q1/Q7 决策材料）**：本场景硬需求准绳、候选活跃度核查（one-api / one-hub 因停更淘汰）、LiteLLM vs new-api 源码级对比；**结论：LiteLLM 默认且唯一推荐（new-api 源码级验证出局），Q1（公司是否已有网关）待定**，剩 P3 实测项 | ✅（选型材料定稿；Q1 待公司确认） |
@@ -35,15 +53,15 @@
 | [`data/schema.sql`](data/schema.sql) | **可执行建表 DDL**：约束/索引/外键齐全，postgres:16 空库实测 `psql -f` 可执行 | ✅ |
 | [`data/model.md`](data/model.md) | **数据模型说明**：表用途、字段语义、状态机、三份数据边界、归档与记账口径 | ✅ |
 | [`testing.md`](testing.md) | **测试与验收契约（D5）**：测试分层与命令表、隔离约定（路径注入/临时栈/伪造 FDE 容器）、必测清单（网络隔离/认证/文件物化/崩溃恢复/路由发布/API 契约/浏览器验证）、验收判定与门禁、已知不可测项 | ✅ |
-| [`ops/deployment-2026-10-10.md`](ops/deployment-2026-10-10.md) | **实际部署成了什么样**（与 `design/deploy-contract.md` 的「应该是什么样」对照）：服务/镜像/端口/凭据与已接受偏差 | ✅ |
+| [`ops/deployment-2026-10-10.md`](ops/deployment-2026-10-10.md) | **实际部署成了什么样**（与 `design/deploy-contract.md` 的「应该是什么样」对照）：服务/镜像/端口/凭据与已接受偏差 | 📌 某日快照（2026-10-10 首部署，v0.1.0/v0.1.1）：镜像/端口/凭据那些值已过期。发布与 digest 口径看 [`ops/ci-release.md`](ops/ci-release.md) |
 | [`deploy/edge-routing.md`](deploy/edge-routing.md) | **边缘入口与路由（#450）**：两个 host（用户面 `station.<伞域>` / 管理台 `admin.<伞域>`）× 两个入口（`web` / `adminsecure:9443`）的能力矩阵、双向 deny 的语义与实现（`ipAllowList` 恒拒 + 404 + `noop@internal`）、`ADMIN_IP_ALLOWLIST` 的来源收紧、`dynamic/tls.yml` 证书装载面（两文件齐才生成、fingerprint 注释当 reload 把手）与「首次证书人工落盘」的鸡生蛋、`${VAR}` 在静态配置里不插值的实测 | ✅ |
 | [`ops/ci-release.md`](ops/ci-release.md) | **CI 与 GHCR 发布 runbook（#235）**：质量门禁口径、分钟预算语义、发布→部署的 digest pin、测试基线数字的同步义务 | ✅ |
 | [`ops/db-idle-load.md`](ops/db-idle-load.md) | **空闲 DB 负载：测量方法与现测基线（#506 / #520）**：取 `pg_stat_database.xact_commit` 差值的窗口/字段/前置条件与「为什么只能进容器只读 psql」；两种 `pg_stat_activity` 采样**都不可用**的实测（亚毫秒语句抓不到）⇒ 归因只能用「每拍语句数（假 pool 数出来）× 拍频」再拿每表扇描增量交叉验证；现测基线（300s 窗口 **11.34 事务/秒** 等四个窗口）与逐表归属；`chat_sessions` 0.86/秒 的**逐条 SQL 排除**（结论：不是那 7 个循环）；以及「判据 1 的 <3/秒 本单达不到」的地板算式（#506 的 2s 上限 = 4 语句/秒） | ✅ |
 | [`ops/system-metrics.md`](ops/system-metrics.md) | **宿主资源监控的运维页（#650）**：保留期与清理节拍（默认 30 天、挂 reaper 小时槽、`ENABLED=0` 也照清）；怎么关（`SYSTEM_METRICS_ENABLED=0` + 重建 portal 容器，只认严格 0/1）；读数口径（`latest` 内存那一拍 vs `series` DB 分桶、为什么卡片是 N 秒前的数）；加盘流程（compose 一行 ro bind mount + `SYSTEM_METRICS_DISK_PATHS` 一条，同一次改动）与两种漏步症状；边界（未挂进容器的盘不会自动出现，面板只声明「已监控 N 个文件系统」）；为什么不用 Prometheus/Grafana 与三条复评判据 | ✅ |
-| [`ops/transcript-ledger-inspection.md`](ops/transcript-ledger-inspection.md) | **会话账本巡检与修数据口径（#341 / 上游 #415）**：链式 `partOf` 的只读巡检 SQL（期望 0）+ 会话/轮定位、递归解链到链头的可重放幂等 UPDATE、备份/演练/回滚与复验口径；同时标注「站内投影已解链、引擎 resume 仍需修数据」 | ✅ |
+| [`ops/transcript-ledger-inspection.md`](ops/transcript-ledger-inspection.md) | **会话账本巡检与修数据口径（#341 / 上游 #415）**：链式 `partOf` 的只读巡检 SQL（期望 0）+ 会话/轮定位、递归解链到链头的可重放幂等 UPDATE、备份/演练/回滚与复验口径；同时标注「站内投影已解链、引擎 resume 仍需修数据」 | 📌 方法与 SQL 仍可用；但适用版本锚在 erix-agent 0.23.x（**不是现价**，现 pin 现查 `package.json`），「已解链」那句是当时结论 ⇒ 会话/transcript 现状看 [`design/conversation-state.md`](design/conversation-state.md) |
 | [`ops/drill-2026-10-12.md`](ops/drill-2026-10-12.md) | **平台演练记录 ②（2026-10-12 夜班）**：v0.1.3 发布与按 digest 部署（imageId/repoDigest 双校）、新工位 `todo` 开户全链、平台 agent 交付前后端分离 to-do 的浏览器真机结论，**预览域名下跑通一个普通前后端分离应用的 6 条要求链（3 条未告知 → #257/#258）**，单 B 预览端口 UI 真机验收，新一批操作坑 （含 **§八 复测 R-1 通过**：一条消息 0 返修） | ✅ |
-| [`ops/handoff-2026-10-15.md`](ops/handoff-2026-10-15.md) | **交接单（v0.1.13 已上线，接班入口）**：状态一页表（三镜像 digest / 7 台 FDE 已重建 / 基线 1177·286·546）、待办顺序（#301 需拍板 `partialPersistence`、#300 停止后半截正文、#303 定时闹钟、#296 改名误导面）、本班三条纪律、现场留痕 |
-| [`ops/handoff-2026-10-14.md`](ops/handoff-2026-10-14.md) | **交接单（上一班，v0.1.7→v0.1.12）**：当前 HEAD/tag/digest/基线一页表、新建 #282–#286 的对账、等用户决策项、未闭合验收、测试与真机探路坑（新 session 从这里开始） |
+| [`ops/handoff-2026-10-15.md`](ops/handoff-2026-10-15.md) | **交接单（v0.1.13 已上线，接班入口）**：状态一页表（三镜像 digest / 7 台 FDE 已重建 / 基线 1177·286·546）、待办顺序（#301 需拍板 `partialPersistence`、#300 停止后半截正文、#303 定时闹钟、#296 改名误导面）、本班三条纪律、现场留痕 | 📌 某日快照（2026-10-15 那一班，v0.1.13–v0.1.15）；**接班入口已不是它**（现入口 = 本文 + 仓库根 [`../AGENTS.md`](../AGENTS.md)） |
+| [`ops/handoff-2026-10-14.md`](ops/handoff-2026-10-14.md) | **交接单（上一班，v0.1.7→v0.1.12）**：当前 HEAD/tag/digest/基线一页表、新建 #282–#286 的对账、等用户决策项、未闭合验收、测试与真机探路坑（新 session 从这里开始） | 📌 某日快照（2026-10-14 那一班，v0.1.7→v0.1.12）；正文自称「接班 session 从这里开始」**已作废**，版本/digest/基线都是当时值 |
 | [`ops/drill-2026-10-11.md`](ops/drill-2026-10-11.md) | **平台演练记录（#235/#240/#241/#242/#246/#249/#250/#252 的汇流）**：开户→登录→平台自己的 agent 写前后端分离应用→预览域名跑通的全链路与断点定性；CORS 预检误诊链、号池与改块口径的三次认知纠正、可复制操作手册、踩坑清单、issue 台账 | ✅ |
 
 ---
@@ -51,10 +69,17 @@
 ## 二、待补齐文档
 
 > 每项给出「必须包含」与「验收标准」。**未决问题未定时，先按 `principles.md §4` 的当前倾向写，并显式标注 `⚠️ 待决策者确认`**——不要留空，也不要自行改变设计。
+>
+> **本节是台账，不是待办清单**（#777 现验：D1/D2/D3/D5 早已交付，D4 已被现有事实源取代）。
+> 每条下面的「**现状**」行是唯一可下判的地方：已交付的给交付物路径，被取代/否决的写明**为什么**
+> （引 `fde-platform.md` 附录 A 或 `principles.md`），仍欠的保留为欠并给判据。
+> **不要**把整节当 TODO 背，也不要照「必须包含」去补已经退役的东西。
 
 ### D1. `docs/env.md` —— 部署参数清单（原「环境事实清单」）✅ 已完成
 
 > **状态**：✅ 已完成，交付于 [`env.md`](env.md)。实际定位为「参数清单 + 参考实例 A + 目标环境探测 checklist」，**不是单机环境事实**。以下「必须包含 / 验收 / 依赖」保留作验收依据。
+>
+> **现状**：✅ 活文档，仍是域名/证书的取值口径来源（`api/portal.md:14` 明写「文中一切域名/URL 以 `env.md` §10 的部署变量为准」）。「必须包含」里那条「宿主机 CPU/内存/磁盘/端口占用」是**机器事实**，已按坐标纪律搬冷层（不在仓库里，见冷层 `~/projects/docs/station-dev-machine.md`）⇒ **别把它当成欠项补回仓库**。
 
 **为什么**：规格全文用 `<base>` 等占位符；没有环境事实就写不出能跑的 Traefik / compose 配置。
 
@@ -76,6 +101,8 @@
 ### D2. `docs/api/portal.md` —— portal API 契约 ✅ 已完成
 
 > **状态**：✅ 已完成，交付于 [`api/portal.md`](api/portal.md)。以下「必须包含 / 验收 / 依赖」保留作验收依据。
+>
+> **现状**：✅ 活契约。「必须包含」里点名要覆盖的**项目 CRUD 已退役**（P5 目录即项目）⇒ 这一项**划掉**，别再照它补实现：写端点 `POST/PATCH/DELETE /api/projects*` 现在返回 `410 project_api_retired`（`portal/src/http.js:1521-1534`），`port_allocations.project_id` 已删列（`deploy/migrations/0008-deprojectize.sql:37`）。现口径看 `api/portal.md` 与目录面端点（`/api/dirs`、`/api/files/tree`，`portal/src/http.js:1501-1504`）。
 
 **为什么**：没有契约，前端与后端并行必然打架。
 
@@ -95,6 +122,8 @@
 ### D3. `docs/data/schema.sql` + `docs/data/model.md` —— 数据模型 ✅ 已完成
 
 > **状态**：✅ 已完成，交付于 [`data/schema.sql`](data/schema.sql) + [`data/model.md`](data/model.md)；`psql -f` 已在 postgres:16 空库实测可执行。以下「必须包含 / 验收 / 依赖」保留作验收依据。
+>
+> **现状**：✅ 交付物有效，但**角色变了**：`schema.sql` 是**已冻结的 baseline**（`version='0000_baseline'`，改它会让迁移 runner 记录的 `sha256` 失配并拒绝启动 ⇒ `deploy/migrations/README.md`）。schema 的演进一律走增量迁移目录 `deploy/migrations/`（现查最新一条是 `0049-notifications-title-key.sql`）⇒ 「验收：`psql -f schema.sql` 在空库可执行」只对 baseline 成立，**不等于现库形状**。
 
 **为什么**：规格 §9.1 是表名 + 字段草图，不是可执行 DDL。
 
@@ -111,7 +140,15 @@
 
 ---
 
-### D4. `docs/decisions/00N-*.md` —— ADR 拆分（中优先）
+### D4. `docs/decisions/00N-*.md` —— ADR 拆分 ❌ 已被现有事实源取代（不再单独做）
+
+> **状态**：❌ **不做**——不是还没做，而是照做会**新增一个事实源**。
+> **现状**：D1~D10 的权威记录已在 [`design/fde-platform.md`](design/fde-platform.md) **附录 A**
+> （标题「附录 A：决策记录」，现查该文件 `:882`），决策被修订时改在 **A.1 修订记录**（现查 `:897`，
+> D8 由 worktree 改项目目录就记在那）。`docs/decisions/` 至今**不存在**（现查目录不存在）。
+> 拆成十份 ADR 的结果是「同一决策两处写」，而本仓的既有红线是一份事实一个源
+> （`principles.md` 的实现者硬约束）⇒ 判据：**真要拆，先回答「谁是真相源、另一份怎么保证不漂」**；
+> 答不出就不拆。下面的「为什么 / 必须包含 / 验收」保留作历史台账。
 
 **为什么**：`principles.md §3` 已有「被否决方案」，但决策本身缺正式记录；erix 仓库有 `docs/decisions/` 惯例。
 
@@ -126,6 +163,8 @@
 ### D5. `docs/testing.md` —— 测试与验收 ✅ 已完成
 
 > **状态**：✅ 已完成，交付于 [`testing.md`](testing.md)。以下「必须包含 / 验收 / 依赖」保留作验收依据。
+>
+> **现状**：✅ 活文档。命令面**以 `package.json` 的 `scripts` 为准**（本文自己写了「以仓库现状为准」，`testing.md:37`）；新增的门禁类脚本（`check:doc-portable` / `check:doc-impl` / `check:ci-legs` / `check:agents-hotlayer`）住在 `package.json` 与 CI 里，比对逻辑见 `scripts/*.mjs`，腿名漂移由 `check:doc-impl` 当场抓（`docs/ops/ci-release.md:266` 记过一次）。⇒ 「每条安全回归用例都有对应命令」这句仍然成立，但**要现查脚本名**，别照本文的命令表当最新清单。
 
 **为什么**：全局约定要求「语法保底 → 单测全绿 → 浏览器验证」；规格只有一行验收。
 
@@ -147,7 +186,14 @@
 
 ---
 
-### D6. `docs/ops/runbook.md` —— 运维手册（P2 前置）
+### D6. `docs/ops/runbook.md` —— 运维手册 ⏳ 仍欠（部分职责已被别的活文档承担）
+
+> **现状**：⏳ **仍欠**——现查 `docs/ops/runbook.md` **不存在**。已被承担的部分（**不要重复建**）：
+> 发布→按 digest 部署的 pin 与回滚口径在 [`ops/ci-release.md`](ops/ci-release.md)；
+> 监控开关/保留期/加盘流程在 [`ops/system-metrics.md`](ops/system-metrics.md)；
+> 空闲 DB 负载的读数口径在 [`ops/db-idle-load.md`](ops/db-idle-load.md)。
+> **仍未被承担、所以本条不注销的那半截**：启停顺序 + 常见故障排查（502 / 401 / 容器起不来 / 任务卡住）
+> + 孤儿容器与端口回收 + 日志位置。判据仍是下面那条「新人可照着完成一次升级 erix-agent 并回滚」。
 
 **必须包含**：启停顺序、健康检查、DB 备份与恢复（**引用系统级备份方案，不在本项目范围**——runbook 只记录平台数据卷位置与对接点，不自行交付备份机制；决策者 2026-09，issue #3 评论）、容器升级流程（含 erix-agent 版本 pin 与 canary）、孤儿容器/端口回收、日志位置、常见故障排查（502 / 401 / 容器起不来 / 任务卡住）
 
@@ -157,7 +203,13 @@
 
 ---
 
-### D7. `docs/design/discussion-archive.md` —— 讨论过程归档（低优先，可选）
+### D7. `docs/design/discussion-archive.md` —— 讨论过程归档 ⏳ 仍欠（低优先，可选；不要抄成结论）
+
+> **现状**：⏳ **仍欠**——现查 `docs/design/discussion-archive.md` 不存在。低优先是**有理由的**：
+> 结论与取舍已在 [`design/principles.md`](design/principles.md)（被否决方案、未决问题决策框架），
+> 决策记录已在 [`design/fde-platform.md`](design/fde-platform.md) 附录 A/A.1 ⇒ 本条**只补过程**；
+> 判据 = 交付物里**不许重复**已有结论（重复就是新增事实源，同 D4 的病）。载体（内网 Gitea issue #24）
+> 是过程材料，不是可引用的现状。
 
 **为什么**：六轮讨论的完整过程目前只在 内网 Gitea issue #24（主机名见冷层 `~/projects/docs/station-dev-machine.md`）。`principles.md` 已覆盖其中的**结论与取舍**，本文只补**过程**。
 
@@ -171,13 +223,16 @@
 
 ```
 ✅ D1 (env) ─┬─ ✅ D5 (testing)
-             └─ D6 (runbook，P2 前置)
-✅ D2 (API 契约)
-✅ D3 (schema)
-D4 (ADR，无依赖，可随时补)
+             └─ ⏳ D6 (runbook)：仍欠，只剩半截（见 D6 现状）
+✅ D2 (API 契约)      项目 CRUD 那项已退役 ⇒ 划掉
+✅ D3 (schema)        schema.sql 已冻结为 baseline；演进看 deploy/migrations/
+❌ D4 (ADR)           已被 fde-platform.md 附录 A/A.1 取代 ⇒ 不做（做它会多一个事实源）
+⏳ D7 (讨论归档)      仍欠，低优先；只补过程
 ```
 
-**最小可开工集** = **D1 + D2 + D3 + D5** —— 已就绪 ✅（P1 可开工，测试与验收契约已补齐）。下一步：D4/D6 可在 P1 期间并行补。
+**最小可开工集** = **D1 + D2 + D3 + D5** —— 已就绪 ✅（P1 可开工，测试与验收契约已补齐）。
+**本节不是待办清单**：现在唯一还欠的是 **D6 的那半截**与 **D7**（低优先）；D4 已判**不做**。
+各条的「现状」行才是可下判的地方（含落点），标题上的 ✅/⏳/❌ 只是索引。
 
 ---
 
