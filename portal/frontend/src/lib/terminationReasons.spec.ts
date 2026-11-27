@@ -29,6 +29,8 @@ import {
   TERMINATION_REASONS,
   TERMINATION_REASON_SET,
   USER_STOP_TERMINATION_REASON,
+  isGatewayMuxNotFound,
+  runErrorText,
 } from './terminationReasons';
 
 const CJK = /[\u4e00-\u9fff]/;
@@ -184,5 +186,48 @@ describe('reason 的双语文案（issue #212 → #236）', () => {
       expect(tpl).toContain('{phase}');
       expect(tpl).toContain('{sideEffect}');
     }
+  });
+});
+
+// issue #802：上游裸 404（Go `http.NotFound` 默认正文 `404 page not found`）⇒ **路径打错了**，
+// 不是「模型不存在」。这张读侧映射的判据必须 code + message **双条件**：引擎把所有 404 一律压成
+// `not_found`（`erix-agent/src/providers/errors.js`），语义全在正文里——只按 code 判就会把
+// 「模型/资源真的不存在」也误标成路径问题（那是把用户指向错误的排查方向，比裸 404 更糟）。
+describe('run 错误文案映射 runErrorText（issue #802）', () => {
+  const GATEWAY_404_KEY = 'stream.event.runErrorCode.llmEndpointNotFound';
+
+  it('上游 Go 默认 404 ⇒ 翻成「路径错」那句人话（labelKey 命中，raw 保留引擎原话）', () => {
+    const err = { code: 'not_found', message: '404 page not found\n' };
+    expect(isGatewayMuxNotFound(err)).toBe(true);
+    expect(runErrorText(err)).toEqual({ labelKey: GATEWAY_404_KEY, raw: '404 page not found\n' });
+    // 双语都得有这条文案（localeParity 只比键集，这里锁住「真是人话、真是双语」）。
+    const zh = (zhCN.stream.event.runErrorCode as Record<string, string>).llmEndpointNotFound;
+    const enMsg = (en.stream.event.runErrorCode as Record<string, string>).llmEndpointNotFound;
+    expect(zh).toMatch(CJK);
+    expect(zh).toContain('base_url');
+    expect(enMsg.length).toBeGreaterThan(0);
+    expect(enMsg).not.toMatch(CJK);
+    expect(enMsg).toContain('base_url');
+  });
+
+  it('真 404（模型/资源不存在）不许被误标成路径问题：labelKey 仍是 null，原话照出', () => {
+    const err = { code: 'not_found', message: 'model xyz not found' };
+    expect(isGatewayMuxNotFound(err)).toBe(false);
+    expect(runErrorText(err)).toEqual({ labelKey: null, raw: 'model xyz not found' });
+    // 反向：正文是那个裸串但 code 不是 not_found（网关自己回了 404 -body）⇒ 同样不误标。
+    expect(isGatewayMuxNotFound({ code: 'server', message: '404 page not found' })).toBe(false);
+  });
+
+  it('既有映射不被破坏：summarizer_failed 仍走 summarizerFailed', () => {
+    expect(runErrorText({ code: 'summarizer_failed', message: 'boom' }))
+      .toEqual({ labelKey: 'stream.event.runErrorCode.summarizerFailed', raw: 'boom' });
+  });
+
+  it('未登记的码 ⇒ labelKey null + raw 原样（不编翻译）；message 非字符串 ⇒ raw 空串', () => {
+    expect(runErrorText({ code: 'unknown', message: 'weird' })).toEqual({ labelKey: null, raw: 'weird' });
+    expect(runErrorText({ code: 'not_found' })).toEqual({ labelKey: null, raw: '' });
+    expect(runErrorText({ code: 'not_found', message: 42 })).toEqual({ labelKey: null, raw: '' });
+    // 空 code 不许撞进映射表
+    expect(runErrorText({ code: '', message: 'x' })).toEqual({ labelKey: null, raw: 'x' });
   });
 });

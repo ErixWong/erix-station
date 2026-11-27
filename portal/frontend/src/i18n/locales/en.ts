@@ -470,6 +470,12 @@ export const en = {
       // `RUN_RETRYABLE_ERROR_CODES`, single source); this block only holds the copy.
       runErrorCode: {
         summarizerFailed: 'the compaction summarizer failed, so this run failed (this is not a degraded summary: the context was not compacted; retry)',
+        // issue #802: the upstream body is Go's `http.NotFound` default text (`404 page not found`)
+        // ⇒ the gateway does not serve this path at all (typical cause: the binding's base_url is
+        // missing the `/v1` prefix); it is **not** "the model does not exist". The discriminator is
+        // `lib/terminationReasons.ts#isGatewayMuxNotFound` (code AND message — code alone would also
+        // mislabel genuine 404s such as "model xyz not found").
+        llmEndpointNotFound: 'the upstream gateway does not serve this path (404) ⇒ check the binding\'s base_url (common cause: a missing /v1 prefix), or the model has been taken offline in the gateway',
       },
       // issue #212: user-readable labels for the surfaced fail reasons (keys are the raw
       // engine reason strings, not camelCase, so they line up 1:1 with RUN_END_LABEL_REASONS in

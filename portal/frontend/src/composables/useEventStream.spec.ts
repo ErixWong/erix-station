@@ -294,6 +294,38 @@ describe('useEventStream（mock EventSource）', () => {
     expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 失败：llm_error — boom');
   });
 
+  // issue #802：上游裸 404（Go `http.NotFound` 默认正文）走同一张读侧映射。
+  // 口径：**不新增 UI 结构**（仍是既有红 `.syserr` + `stream.event.runFailed` 模板），
+  // 只把 `{message}` 那一格从 `404 page not found` 换成「路径错了，去查 base_url」那句人话。
+  it('run_end 错误信封（#802）：上游 Go 默认 404 ⇒ `.syserr` 是人话且不再出现裸 `404 page not found`', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    s.activeRunId.value = 'run-1';
+    // 经真实事件帧驱动（不是直调内部函数）：真机载荷——run 照建、照跑，失败在 LLM 调用上。
+    lastES().emit('run_end', {
+      seq: 1, run_id: 'run-1',
+      termination: { reason: 'failed', errorCode: 'not_found' },
+      error: { code: 'not_found', message: '404 page not found\n' },
+    });
+    const lines = hooks.onSysErr.mock.calls.map((c) => String(c[0]));
+    const detail = lines.find((l) => l.startsWith('run 失败：not_found'));
+    expect(detail, '错误信封那一行必须存到').toBeDefined();
+    expect(detail).toContain('上游网关不认识这个请求路径');
+    expect(detail).toContain('base_url');
+    // 引擎那句裸串对用户零信息量 ⇒ 不该再出现在文案里。
+    expect(detail).not.toContain('404 page not found');
+    // 反向对照：同为 `not_found` 但正文不是 Go 默认串（模型真不存在）⇒ 不被误标，逐字透传。
+    hooks.onSysErr.mockClear();
+    s.activeRunId.value = 'run-2';
+    lastES().emit('run_end', {
+      seq: 2, run_id: 'run-2',
+      termination: { reason: 'failed', errorCode: 'not_found' },
+      error: { code: 'not_found', message: 'model gpt-9 not found' },
+    });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 失败：not_found — model gpt-9 not found');
+  });
+
   // issue #442（erix-agent 0.30.0 / 上游 #476）：`finalTextFallback === true` ⇒ 终稿是**引擎兜底文案**。
   // 判据（工单 §M4.2/M4.3）：
   //   ① 有标记 ⇒ 多**一行中性 sep**（不进 `.syserr`：兜底不是故障）；
