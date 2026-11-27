@@ -36,6 +36,10 @@ const ADMIN_WITH_SEAT = {
 const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local',
 } as AuthUser;
+/** 第 ④ 类人（#648）：`role='fde'` 但 `fde_name` 为 null ⇒ 同样没有工位。 */
+const SEATLESS_FDE = {
+  id: 'u4', login: 'carol', display_name: 'Carol', role: 'fde', fde_name: null, auth_source: 'local',
+} as AuthUser;
 
 const WORKBENCH_MARKER = '[data-test="sidebar-aside"]';
 /** 工单 §二.2 点名要省下的那三趟。 */
@@ -131,5 +135,26 @@ describe('#332 无工位平台管理员：工作台整棵子树不挂载（§二
     await vi.waitFor(() => expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(true));
     expect(['/', '/session/alice-session-1']).toContain(router.currentRoute.value.path);
     expect(countOf(urls, '/api/me/ports')).toBeGreaterThanOrEqual(1);
+  });
+
+  // ---- #648：第 ④ 类人（`role='fde'` 且 `fde_name` 为 null）同样没有工位 ----
+  // 他以前能进来，代价是工单点名的那三趟：`/api/dirs` ⇒ 500 `internal`（dirs.js:57）、
+  // `/api/sessions` ⇒ `validation_failed`（sessions.js:333）。断言形状照抄上面 ③ 类人那三条。
+  it('#648 第 ④ 类人访 / ⇒ 工作台不挂载，三趟各 0 条', async () => {
+    const { wrapper, urls, landed } = await mountAppAt('/', SEATLESS_FDE);
+    expect(await landed).toBe('/admin/users');
+    expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(false);
+    for (const path of WORKBENCH_FETCHES) {
+      expect(countOf(urls, path), `${path} 被请求了 ${countOf(urls, path)} 次（应为 0）`).toBe(0);
+    }
+  });
+
+  it('#648 第 ④ 类人深链 /session/:id ⇒ 同样被改写走，三趟各 0 条', async () => {
+    const { wrapper, urls, landed } = await mountAppAt('/session/carol-session-1', SEATLESS_FDE);
+    expect(await landed).toBe('/admin/users');
+    expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(false);
+    for (const path of WORKBENCH_FETCHES) {
+      expect(countOf(urls, path), `${path} 被请求了 ${countOf(urls, path)} 次（应为 0）`).toBe(0);
+    }
   });
 });

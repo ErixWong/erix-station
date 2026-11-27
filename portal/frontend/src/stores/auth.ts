@@ -194,10 +194,12 @@ export interface ChangePasswordError {
   retryAfter?: number | null;
 }
 
-// afterLoginRoute：admin 且无 fde_name（平台管理员）→ /admin（默认重定向至 /admin/users）；其余回工作台。
+// afterLoginRoute：没有工位（`!fde_name`）→ /admin（默认重定向至 /admin/users）；有工位回工作台。
 // issue #332：判据与落点**不在这里抄第二份**——工作台准入闸（lib/workbenchGate.workbenchGateDecision）
 // 与共用的 `seatAwareLanding` 是同一个函数 ⇒「登录后去哪」与「工作台放不放人」不可能漂移；
 // 第 ② 类人（role=admin 但 fde_name 有值）两边都回 `/`（他能进工作台，也保留管理台入口）。
+// issue #648：判据从 `role==='admin' && !fde_name` 改成**只看工位** ⇒ 第 ④ 类人（`fde` 且无 `fde_name`）
+// 登录后也不再落在一个他一进去就 `/api/dirs` 500 / `/api/sessions` 400 的页面上。
 export function afterLoginRoute(user: AuthUser | null | undefined): string {
   return seatAwareLanding(user);
 }

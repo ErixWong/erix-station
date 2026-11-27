@@ -10,8 +10,8 @@ import {
 import { useAuthStore } from './stores/auth';
 import { useSiteStore } from './stores/site';
 import { FORCE_PASSWORD_PATH, createRedirectBudget, restrictedNavigationDecision } from './lib/forcePasswordGuard';
-// #332：工作台准入闸（admin 且无 fde_name ⇒ 送管理台）。判据本体在 lib/workbenchGate.ts，这里只接线。
-import { workbenchGateDecision } from './lib/workbenchGate';
+// #332/#648：工作台准入闸（没有工位 ⇒ 送管理台）。判据本体在 lib/workbenchGate.ts，这里只接线。
+import { hasNoSeat, workbenchGateDecision } from './lib/workbenchGate';
 // #450 A2：host 闸（在错的 host 上就跳到对的 host）。判据本体在 lib/hostGate.ts，这里只接线。
 import { hashUrl, hostGateDecision } from './lib/hostGate';
 import { setRestrictedSessionListener } from './lib/restrictedSession';
@@ -382,7 +382,15 @@ export function createAppRouter(
     //  • 与 requiresRole 互不干扰：/admin* 不是工作台路由（判据直接 next），而 fde 访 /admin 的回退仍走下面那条。
     const gate = workbenchGateDecision({ user: auth.user, toPath: to.path });
     if (gate.action === 'rewrite') return { path: gate.path };
-    if (to.meta.requiresRole && auth.user.role !== to.meta.requiresRole) return { path: '/' };
+    // #648：`requiresRole` 的回退不能把人送回「他根本进不去的工作台」，否则与上面的准入闸构成无限环。
+    // 第 ④ 类人（`fde` 且无 `fde_name`）被准入闸改写去 `/admin`，而 `/admin*` 的 requiresRole 又把他踢回
+    // `/` ⇒ `/` ⇄ `/admin/users`（实测：挂载级用例里 vue-router 直接中止导航，熔断器 `createRedirectBudget`
+    // 烧到底 + 一条 warn，用户拿到的是一个空屏 —— 比 500 更难查）。
+    // ⇒ **没有工位的人留在管理台**（两害相权：管理台对非 admin 是 403 空壳，工作台对他是一进去就
+    //   `/api/dirs` 500 + `/api/sessions` 400）。有工位的 fde 访 `/admin*` 照旧踢回 `/`（行为不变）。
+    if (to.meta.requiresRole && auth.user.role !== to.meta.requiresRole && !hasNoSeat(auth.user)) {
+      return { path: '/' };
+    }
     return true;
   });
 

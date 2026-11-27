@@ -16,8 +16,8 @@ const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local',
 } as AuthUser;
 // issue #308（M3）：原夹具是「无工位管理员」（`admin` 且 `fde_name=null`）——#334 的准入闸
-// （lib/workbenchGate.ts：`role==='admin' && !fde_name` ⇒ 改写去 /admin）之后这个形状**进不到工作台**，
-// 拿它当夹具等于给不可达状态做覆盖。换成第 ② 类人（`admin` **且**有工位，闸放行）：
+//（lib/workbenchGate.ts，#648 起判据是 `!fde_name`，与 role 无关 ⇒ 改写去 /admin）之后这个形状
+// **进不到工作台**，拿它当夹具等于给不可达状态做覆盖。换成第 ② 类人（`admin` **且**有工位，闸放行）：
 // 他同样能走到「端口列表为空」这条路径（尚未分段），空态覆盖因此保住。
 const ADMIN_WITH_SEAT = {
   id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'root', auth_source: 'local',
