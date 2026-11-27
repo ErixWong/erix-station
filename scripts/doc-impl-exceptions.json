@@ -17,54 +17,6 @@
       "reason": "本人 git 凭证 GET/PUT/DELETE 未登记 portal.md（#777 S1 抓到），另有修刀补登记（#777 D 组）"
     },
     {
-      "pair": "GET /api/sessions/:P/macro-assignments",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "PUT /api/sessions/:P/macro-assignments",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "DELETE /api/sessions/:P/macro-assignments/:P",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/sessions/:P/macro-runs",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/macro-runs",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/admin/macro-templates",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "POST /api/admin/macro-templates",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "PATCH /api/admin/macro-templates/:P",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "DELETE /api/admin/macro-templates/:P",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/admin/macro-runs/summary",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/admin/macro-runs/:P",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/admin/macro-runs",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
       "pair": "POST /api/admin/llm/providers",
       "reason": "provider 写面/models/封禁端点仅正文提及、索引行缺（#777 S1 抓到），另有修刀补索引行（#777 D 组）"
     },

@@ -118,6 +118,18 @@
 | 通知（用户面） | `GET /api/notifications` | 通知列表：`?unreadOnly=&limit=&cursor=` ⇒ `{items, nextCursor}`（§4.24.5，#526）|
 | 通知（用户面） | `GET /api/notifications/unread-count` | 顶栏铃铛的未读数：`{count}`，谓词 `read_at IS NULL`（§4.24.6，#526）|
 | 通知（用户面） | `POST /api/notifications/:id/read` | 标记已读：**天然幂等**（不读 body、无幂等台账；§4.24.7，#526）|
+| 宏（会话面） | `GET /api/sessions/:id/macro-assignments` | **会话级**订阅列表（属主 = 会话属主，非属主与不存在同为 `404`；§4.24.9，#526）|
+| 宏（会话面） | `PUT /api/sessions/:id/macro-assignments` | 会话内订阅 / 改期：`{templateId, until?}` ⇒ 幂等 upsert，`cwd` **恒 `null`**（§4.24.9，#526）|
+| 宏（会话面） | `DELETE /api/sessions/:id/macro-assignments/:assignmentId` | 取消会话订阅：有执行账 ⇒ 只停用，无账 ⇒ 物理删（§4.24.9，#526）|
+| 宏（执行账） | `GET /api/sessions/:id/macro-runs` | 会话视角的宏执行账：`?criterion=&verdict=&limit=&cursor=` ⇒ `{items, nextCursor}`（§4.24.10，#526）|
+| 宏（执行账） | `GET /api/macro-runs` | **用户级跨会话**执行账（顶栏 chip，#614）：同形同参数，但出口再剥 `snapshot_id`/`worktree_path`/`verdict_raw`（§4.24.10）|
+| 宏（管理台） | `GET /api/admin/macro-templates` | 模板全量（含 `audience='admin'`、含 `enabled`）+ 每条 `subscriberCount`（只数**启用**订阅）；`?includeDeleted=true` 才带软删行（§4.24.11，#613）|
+| 宏（管理台） | `POST /api/admin/macro-templates` | 建模板：`{kind, name≤40, params, audience?, scope, enabled?}`；`kind`↔`scope` 必须配对，否则 `400`（§4.24.11）|
+| 宏（管理台） | `PATCH /api/admin/macro-templates/:id` | 改模板：白名单 `{name,params,audience,enabled}`；body 里出现 `kind`/`scope` **当场 `400`**（不静默丢弃，§4.24.11）|
+| 宏（管理台） | `DELETE /api/admin/macro-templates/:id` | 删模板**三分支**：零引用物理删 / 只有订阅连删订阅 / 有执行账或通知 ⇒ 只能软删（§4.24.11）|
+| 宏（管理台） | `GET /api/admin/macro-runs` | 全局执行账（keyset 倒序）：`?templateId=&status=&verdict=&userId=&from=&to=&limit=&cursor=`；行内**不含** `sessionId`/`childSessionId`（§4.24.12）|
+| 宏（管理台） | `GET /api/admin/macro-runs/:id` | 单条执行账详情（与列表行同形，同一个白名单；查无 ⇒ `404`，§4.24.12）|
+| 宏（管理台） | `GET /api/admin/macro-runs/summary` | 判决汇总（**跟着同一组筛选变**）：`{triggered, done, skipped, failed, byVerdict, usage}`；`byVerdict` 的分母是 `done`，不是 `triggered`（§4.24.12）|
 
 > LLM 管理这条线**其余**端点（`GET/PUT /api/admin/fdes/:name/llm`、
 > `POST /api/admin/fdes/:name/llm/heartbeat`、`GET /api/admin/llm/model-catalog`、
@@ -4509,11 +4521,139 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
   二次 ⇒ 该 `UPDATE` 命中 0 行、改做一次 `SELECT` 回读，**不再写**。
 - **前端事实**：角标数字由前端本地减一（响应里没有 count），所以并发的另一处已读不会立刻反映到角标，下一次拉 `unread-count` 才收敛。
 
-#### 4.24.8 本批未登记的同族端点（诚实边界）
+#### 4.24.8 本面已登记端点的穷尽口径（诚实边界）
 
-上面七条之外，宏 / 通知面还有一批**已实现但本批仍未登记**的端点（会话级订阅读写、会话 / 用户的宏流水、
-管理台模板与流水、以及 `GET /api/macro-runs`），它们仍挂在豁免表里等后续批次补
-（`scripts/doc-impl-exceptions.json`）。**本节不写它们** = 没有契约，不等于行为不存在。
+宏 / 通知面的端点**现已全部在册**：用户面七条（§4.24.1–§4.24.7）、会话级订阅读写三条与执行账两条
+（§4.24.9–§4.24.10，#526 / #614）、管理台模板四条与流水三条（§4.24.11–§4.24.12，#613）。本单（#777 A1）
+把后十二条补完并把豁免表里对应的十二行删掉。
+仍要说清一句边界：登记只到**端点契约形状**（方法 / 鉴权 / 参数 / 响应键 / 错误码 / 副作用），
+各宏的**语义**（何时触发、门禁怎么排、判决怎么归一）在 `docs/design/` 的宏平台设计篇与
+`portal/shared/macro-kinds.js`，本文不复制一份（复制就会漂）。
+
+#### 4.24.9 会话级订阅读写：`/api/sessions/:id/macro-assignments[/:assignmentId]`
+
+三条（`GET` / `PUT` / `DELETE .../:assignmentId`）在 `http.js:1668-1689` 匹配，**全部先 `requireSession`**
+再进 `macro-routes.js`；属主闸是 `fetchSession(pool, sessionId, userId)`（`macro-routes.js:126`、`:133`、`:146`）。
+
+- **属主闸的真实口径**（`sessions.js:179-204`，四条共用，别只读成「非属主 404」）：路径里的 `:id` 先过
+  `decodeUuid`（`decodeURIComponent` + 转小写，`http.js:1177`），**不校验形状**；形状不是 UUID ⇒ `404 not_found`（`sessions.js:183-185`）；
+  行不存在、`user_id` 与本人不符、或会话 `status !== 'active'`（**已归档也算不存在**）⇒ 同一个 `404 not_found`。
+  本条链上**没有 `403`**，不泄露存在性。
+- **`GET` 响应键名（逐字）**：`{ "items": [ …订阅快照… ] }`，条目与 §4.24.2 的**十一个键**逐字相同
+  （`toAssignmentSnapshot`，`macros.js:233-250`）。与会话面的差异只有两点：① **不按模板 `scope` 过滤**
+  （§4.24.2 只留 `scope='user'`，这里返回该会话的全部订阅）；② `session_id` 有值（就是路径里那个会话）。
+  `ORDER BY created_at, id LIMIT 500`（`macros.js:563-566`）⇒ **无游标、无 `limit` 参数**，超 500 条静默截断。
+- **`GET` 的副作用**与 §4.24.2 同一个函数、同一个**只带 `user_id`** 的谓词（`applyExpiredAssignments`，
+  `macros.js:515-522`，调用点 `macros.js:554`）⇒ 这次读会把**本人全部**到期订阅（含别的会话的）关掉，
+  不止这个会话的。不是纯只读。
+- **`PUT` 请求形状**：JSON 体 `{ templateId, until? }`。⚠ 与 §4.24.3 的两个差异：**没有 `cwd`**
+  （本端点根本不读 `body.cwd`，入库恒 `NULL`，`macro-routes.js:141`），也**没有** §1.5 的 `Content-Type` 闸
+  （只调 `readJsonBody`，`http.js:1676`）⇒ 超限 `413 payload_too_large`、非法 JSON `400 validation_failed`、
+  空体按 `{}`（⇒ `details.field='templateId'`）。
+- **`PUT` 校验顺序**：`templateId` 非空字符串（否则 `400`，`details.field='templateId'`，`macro-routes.js:135-137`）
+  → 模板存在且未软删（`404`，`details.templateId`）→ 模板 `audience='admin'` ⇒ `403 forbidden`（`isAdmin` 恒假，`macros.js:584-586`）
+  → `scope='user'` 的模板从会话入口订不进去 ⇒ `400`，`details.field='sessionId'`（`macros.js:592-595`）
+  → 模板 `enabled=false` ⇒ `409 conflict`（`details.templateId`，`macros.js:596-598`）→ `until` 非法时刻 ⇒ `400`，`details.field='until'` + `details.received`。
+- **`PUT` 响应 / 幂等**：`{ "assignment": { …十一个键…, "reused": true|false } }`，`reused` 的推断口径与 §4.24.3
+  同一条（`macros.js:612`，两台时钟，别当「有没有新行」的可靠信号）。幂等靠唯一订阅键
+  `UNIQUE NULLS NOT DISTINCT (template_id, user_id, session_id, cwd)`；语义是**覆盖**（没给 `until` 就写成 `null`）。
+- **`DELETE .../:assignmentId`**：先过**会话**属主闸，但取消动作只按 `assignmentId` + **本人** `user_id` 判定
+  （`unassignTemplate` 不比较 `session_id`，`macros.js:621-650`）⇒ 拿会话 A 的路径去取消自己在会话 B 的订阅
+  **不会被拒**（路径里的会话只是一道「这个会话是你的」前置闸）。响应两分支与 §4.24.4 逐字相同
+  （有账 `{mode:"disabled", macroRuns, assignment}` / 无账 `{mode:"deleted", macroRuns:0}`，无 `assignment` 键）。
+- **错误码汇总**：`401` / `404` / `400 validation_failed` / `403 forbidden` / `409 conflict`，零新码；
+  顶层未分类异常 ⇒ `500 internal`（§1.2，`http.js:1155`）。`details.assignmentId` 在 `unassignTemplate` 的 404 里带出。
+
+#### 4.24.10 宏执行账（只读）：`/api/sessions/:id/macro-runs` 与 `/api/macro-runs`
+
+两条同构（`http.js:1690-1698` 会话级、`http.js:1700-1705` 用户级，#614）。**只有 `GET`**（其余方法走到
+后续分支 ⇒ 最终 `404 not_found`）。鉴权：`requireSession` + 会话级再过 `fetchSession` 属主闸
+（`macro-routes.js:156`）；用户级**不绑会话**，属主 = `macro_assignments.user_id = 当前用户`。
+
+- **query（四个都可选，两条形参完全一致）**：`criterion`（枚举，非法 ⇒ `400 validation_failed`，
+  `details.field='criterion'` + `details.allowed`/`received`）、`verdict`（枚举，同上 `details.field='verdict'`）、
+  `cursor`（上一次 `nextCursor` 原样回传；解不开或形状不合 ⇒ `400`，`details.field='cursor'`，`macros.js:806-819`）、
+  `limit`（非有限数或 `<1` ⇒ `50`；`>100` 截到 `100`；`macro-routes.js:32-40` 再过一道同口径的 `normalizeNotificationsLimit`）。
+  枚举的**唯一真源**是 `portal/shared/macro-kinds.js`：`criterion` 五值 `terminal` / `silent` / `tick` / `mechanical` / `semantic`
+  （`:102`），`verdict` 五值 `pass` / `red` / `no-op-claim` / `needs-human` / `unclassified`（`:112`）——
+  本文不另列一份枚举表，改动只改那个文件。
+- **响应键名（逐字）**：`{ "items": [ … ], "nextCursor": "<opaque>" | null }`。每一项是 `toMacroRunSnapshot`
+  （`macros.js:252-275`）的**列名即键名**十九键：`id`、`assignment_id`、`anchor`、`bucket`、`status`、`criterion`、
+  `verdict`、`verdict_raw`、`reason`、`remediation_text`、`skipped_reason`、`started_at`、`finished_at`、
+  `child_session_id`、`child_run_id`、`depth`、`parent_macro_run_id`、`snapshot_id`、`worktree_path`（缺值给 `null`，不是缺键）。
+- **两条形参同、响应面不同（唯一差异）**：`GET /api/macro-runs` 在出口**再剥三键**
+  `snapshot_id` / `worktree_path` / `verdict_raw`（`macro-routes.js:236-240`）⇒ 用户级那份是**十六键**；
+  会话级**不剥**（这三键交给前端归一层丢）。所以「会话级少三键」是错的，要说反。
+- **排序 / 分页**：`ORDER BY r.started_at DESC, r.id DESC` 的 keyset（行值比较 `(started_at, id) < (…)`），
+  游标 `base64url(JSON({t, i}))`（`macros.js:800-804`）；到底 ⇒ `nextCursor: null`。实现内部多取一行判「还有没有」，那一行不外泄。
+  ⚠ 游标键名是 `nextCursor`，**不是** §1.3 通则的 `next_cursor`（同 §4.24.5 的差异，本单不改代码）。
+- **副作用**：零（一条 `SELECT … JOIN macro_assignments`）。**幂等**天然成立（只读）。
+- **错误码**：`401` / `404`（会话级的非属主、不存在、已归档同一个码）/ `400 validation_failed`；未分类 ⇒ `500 internal`。
+
+#### 4.24.11 管理台模板面：`/api/admin/macro-templates[/:id]`
+
+四条在 `http.js:1939-1957` 匹配，**鉴权是 `handleAdminApi` 入口的统一 `requireAdmin`**（`http.js:1913`）：
+非 `role='admin'` ⇒ **`403 forbidden`**（`http.js:1807-1810`，⚠ 不是 #736 那套 `insufficient_role`，那个只覆盖
+`/api/admin/users/:login/tokens`），未登录 ⇒ `401`。边缘面另有一层：`/api/admin/*` 只能从**管理台入口**打，
+从用户入口得到的是 Traefik 的 `404`（§0.1 末段 #450 口径）。`created_by` 取会话里的管理员 id（`http.js:1945`）。
+
+- **`GET`**：query 只读 `includeDeleted`（字符串 `true`/`1` 才算真，`macro-routes.js:43-45`）⇒ 默认**排除软删**。
+  响应 `{ "items": [ … ] }`，每项是模板快照**十一键**（`id`、`kind`、`name`、`params`、`audience`、`scope`、
+  `enabled`、`created_by`、`created_at`、`updated_at`、`deleted_at`，`macros.js:215-230`）**再加一格 `subscriberCount`**
+  （`macro-routes.js:271-274`）。⚠ `subscriberCount` 的口径是**只数 `enabled = true` 的订阅**（`macros.js:540-548`）：
+  「已经取消订阅的人」不计入——停用不影响他们。计数落 `0` 而非 `undefined`（区分「没人订」与「后端没下发」）。
+  `ORDER BY kind, name`，**内部上限 200 且无游标**（`macros.js:302`，`macro-routes.js` 不传 `limit`）⇒ 模板多于 200 会静默截断。
+- **`POST`** 建模板：体 `{ kind, name, params?, audience?, scope, enabled? }`。
+  **返回 `200`**（`http.js:1945`，**不是 `201`**），形状 `{ "template": { …十一键… } }`。校验顺序（`macros.js:323-347`）：
+  ① `kind` ∈ {`run-notify`,`run-silence-alert`,`run-review`,`scheduled-task`}（`macro-kinds.js:17`），否则 `400`，`details.field='kind'`；
+  ② `name` 非空且 **≤ 40 字**（`07` 篇：下拉里看得见的字），否则 `400`，`details.field='name'`；
+  ③ `audience` ∈ {`all`,`admin`}，**缺省 `all`**（给了非法值 ⇒ `400`，`details.field='audience'`）；
+  ④ `scope` ∈ {`session`,`user`} **必填**，且必须等于该 `kind` 的固定配对（`macro-kinds.js:28-33`）——
+  自由组合 ⇒ `400`，`details.field='scope'`；⑤ `params` 走该 `kind` 的 schema **形状**校验并由服务端补齐 `default`
+  （#625：补齐的返回值入库，不是只调一次），非法 ⇒ `400`，`details` 带字段名；⑥ `enabled` 按 `=== true` 归一（缺省真）。
+  唯一约束：无（同名模板可以重复）。
+- **`PATCH /:id`** 改模板：白名单 `{name, params, audience, enabled}`。⚠ **`kind` / `scope` 出现在 body 里就 `400`**
+  （`macro-routes.js:291-295`，`details.field='kind'|'scope'`）——静默丢弃会让前端以为改成了，实际没改。
+  白名单里一个键都没带 ⇒ `400 validation_failed`，`details.patch`（`macros.js:380`）。
+  `params` 按**现有 `kind`** 重新校验（`macros.js:369`）。模板不存在或已软删 ⇒ `404`，`details.templateId`。
+  响应 `{ "template": { …十一键… } }`，`updated_at` 被写成应用侧时刻（`macros.js:381-386`）。
+- **`DELETE /:id`** 删模板（**三分支**，判定与删除同事务 + 行锁 `FOR UPDATE`，`macros.js:448-504`）：
+  响应形状随分支变——① 零引用 ⇒ `{"mode":"deleted","assignmentsRemoved":0,"notifications":0,"macroRuns":0}`；
+  ② 只有订阅、无执行账无通知 ⇒ 物理删 + 级联删订阅 ⇒ `{"mode":"deleted_with_assignments","assignmentsRemoved":<n>,"notifications":0,"macroRuns":0}`；
+  ③ 有 `macro_runs` **或** `notifications` ⇒ **只能软删** ⇒ `{"mode":"soft","assignmentsRemoved":0,"notifications":<n>,"macroRuns":<n>,"template":{…}}`。
+  已软删的再删一次 ⇒ 仍是 `200` 且 `{"mode":"soft","alreadyDeleted":true,…}`（天然幂等）。模板不存在 ⇒ `404`，`details.templateId`。
+  为什么有账就不能物理删：执行账与已发出的通知是**既成事实**，抹掉定义就没人能解释它们。
+  ⚠ 通知引用是**间接**数的（`notifications.macro_run_id → macro_runs.assignment_id → macro_assignments.template_id`，
+  `macros.js:414-425`）：表里没有直连模板列也不等于「零引用」。
+
+#### 4.24.12 管理台执行账：`/api/admin/macro-runs`、`/summary`、`/:id`
+
+三条都 `GET`、都过入口 `requireAdmin`（同 §4.24.11）。匹配顺序是契约的一部分：
+`/macro-runs/summary` 必须排在 `/macro-runs/:id` **之前**（`http.js:1960` vs `:1963`），否则字面量 `summary`
+会被当成 run id 吞掉 ⇒ 变成 `404`。
+
+- **共用筛选**（列表与 summary 用**同一份** WHERE，`macro-routes.js:308-325`——summary「跟着筛选变」靠的就是这个，
+  两处各写一遍迟早漂）：`templateId`、`status`（枚举 `pending`/`running`/`done`/`skipped`/`failed`/`superseded`，
+  `macro-kinds.js:90`）、`verdict`（五值，同上）、`userId`、`from` / `to`（ISO 时刻，非法 ⇒ `400`，
+  `details.field='from'|'to'`，`macro-routes.js:48-55`）。非法枚举一律 `400 validation_failed` +
+  `details.field` / `details.allowed` / `details.received`。
+- **`GET /api/admin/macro-runs`**：额外读 `cursor`（同 §4.24.10 的游标编解码）与 `limit`（缺省 `50`、上限 `100`）。
+  响应 `{ "items": [ … ], "nextCursor": "<opaque>" | null }`，`ORDER BY r.started_at DESC, r.id DESC` 的 keyset。
+  每一项是**十二键白名单**（`toAdminRunItem`，`macro-routes.js:339-356`）：`id`、`startedAt`、`templateId`、
+  `templateName`、`userId`、`userName`、`anchor`、`criterion`、`status`、`verdict`、`durationMs`、`usage`。
+  ⚠ 三条硬口径：① **不含 `sessionId` / `childSessionId`**（白名单映射，决策者 2026-11-15）；
+  ② `durationMs` 是**推导值**（`finished_at - started_at`，账上没这列，未完成 ⇒ `null`，负数夹成 `0`）；
+  ③ `usage` **恒 `null`**——`macro_runs` 还没有 token 记账列，用 `0` 冒充「没花钱」是假账。
+  键名是 **camelCase**（与 §4.24.10 的列名形状**不同形**，别把两份 DTO 混着用）。
+- **`GET /api/admin/macro-runs/:id`**：响应 `{ "run": { …同一个十二键… } }`，查无 ⇒ `404 not_found`，
+  `details.runId`（`macro-routes.js:383-393`）。无参数面（`cursor`/`limit` 写了也不读）。
+- **`GET /api/admin/macro-runs/summary`**：响应逐键 `{ "triggered": n, "done": n, "skipped": n, "failed": n,
+  "byVerdict": { "pass": n, "red": n, "no-op-claim": n, "needs-human": n, "unclassified": n }, "usage": null }`。
+  ⚠ **`byVerdict` 的分母是 `done`（有判决的），不是 `triggered`**：每个桶都是 `COUNT(*) FILTER (WHERE verdict = '…')`，
+  `skipped` / `failed` 的 `verdict` 是 `NULL` ⇒ 匹配不进任何桶 ⇒「各桶之和 == `done`」自动成立
+  （`macro-routes.js:403-433`）。把 `unclassified` 桶写成 `verdict IS NULL` 会把 skipped/failed 吸进分母——
+  这是本面最容易被「顺手优化」掉的语义。**无分页、无 `limit`**（一次聚合），`usage` 同样恒 `null`。
+- **副作用**：三条都零（`SELECT` / 一次聚合）。
 
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
 
