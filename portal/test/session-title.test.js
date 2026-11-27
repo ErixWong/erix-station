@@ -366,7 +366,7 @@ test('P3 PR②a（0.15.0 appendUserTurn）：POST 在同一事务内先写 trans
   });
   const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
   const messageInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO messages'));
-  // 0.17.0 快路径（#193）：store 在事务内的读点 = dedupKey 点查 + MAX(round) 两点查，全量 load 不再出现。
+  // 0.17.0 快路径（#193）：store 在事务内的读点 = dedupKey 点查 + MAX(round) 两点查，引擎从不调 `store.load`。
   const storeProbe = order.findIndex(({ sql }) => normalize(sql).startsWith('SELECT record FROM transcript_rounds'));
   const storeLoad = order.findIndex(({ sql }) => normalize(sql).startsWith('SELECT round, dedup_key, record'));
   const transcriptInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO transcript_rounds'));
@@ -378,7 +378,13 @@ test('P3 PR②a（0.15.0 appendUserTurn）：POST 在同一事务内先写 trans
   assert.ok(transcriptInsert < runQueueInsert && runQueueInsert < commit, 'transcript INSERT 位于入队之前且同属提交事务');
   assert.ok(begin < transcriptInsert && transcriptInsert < commit);
   // 预写与读取都只用传入的事务 client（同一连接：order 是单 client 的流水）。
-  assert.equal(storeLoad, -1, '0.17.0 成对探针已接入 → 事务内不得再出现全量 load SELECT');
+  // #501：自 0.33 #765 起，全新预写（MISS）在落 `:input:` 行前会调**第三根探针 `loadRawRows`** 结清悬空
+  // `tool_use`；它与 `load()` **共用同一条 SELECT** ⇒ 事务内出现**恰好一条**全量形状 SELECT（就是探针，
+  // 引擎仍从不调 `store.load` 方法）；点查命中（HIT）路径不触发探针。
+  const fullLoadCount = order.filter(({ sql }) => normalize(sql).startsWith('SELECT round, dedup_key, record')).length;
+  assert.equal(fullLoadCount, 1, '#501：MISS 快路径只发一条全量形状 SELECT = loadRawRows 探针（非引擎退回 store.load）');
+  assert.ok(storeLoad > storeProbe && storeLoad < transcriptInsert,
+    '#501：探针在两点查之后、写 :input: 行之前，且同属提交事务');
   assert.equal(order.filter(({ sql }) => normalize(sql).startsWith('SELECT record FROM transcript_rounds')).length, 1,
     'appendUserTurn 只点查一次，且与业务写入同一事务连接');
   assert.equal(order.filter(({ sql }) => normalize(sql).startsWith('SELECT MAX(round)')).length, 1,
@@ -452,7 +458,8 @@ test('0.17.0 appendUserTurn：点查命中同 dedupKey 时引擎直接判幂等�
   const n = (prefix) => order.filter(({ sql }) => sql.replace(/\s+/g, ' ').trim().startsWith(prefix)).length;
   assert.equal(n('SELECT record FROM transcript_rounds'), 2, '两次调用各点查一次（幂等判据读自同一事务连接）');
   assert.equal(n('SELECT MAX(round)'), 1, '第二次点查即命中→不再取 MAX(round)');
-  assert.equal(n('SELECT round, dedup_key, record'), 0, '全程零全量 load');
+  // #501：首次 MISS 会调一次 loadRawRows 探针（与 load 同一条 SELECT）；第二次点查命中→不再取 MAX(round)、也不再探针。
+  assert.equal(n('SELECT round, dedup_key, record'), 1, '#501：仅首次 MISS 发一条 loadRawRows 探针（HIT 不探针）');
 });
 
 test('0.15.0 appendUserTurn：空 transcript 首轮预写 round=0，有历史轮时复用现有最大 round（不 +1）', async () => {

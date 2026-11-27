@@ -172,18 +172,18 @@ test('loadByDedupKey/loadMaxRound 成对存在（缺一如缺二，引擎会整�
   assert.equal(typeof store.loadMaxRound, 'function');
 });
 
-test('探针（a）：全新预写走点查快路径，全程不发起全量 load SELECT', async () => {
+test('探针（a）：全新预写走点查快路径，全程不调 store.load（#501 后唯一的整形读是 loadRawRows 探针，与 load 同一条 SELECT）', async () => {
   const { client, order, state } = fakeClient();
   const result = await appendUserInputTurn(client, { key: KEY, text: '快路径', messageId: 'm1' });
   assert.equal(result.written, true);
   assert.equal(result.round, 0, '空 store：loadMaxRound 返回 null → 引擎派生 round 0');
+  // #501：引擎快路径**从不调 `store.load` 方法**（#157 的性能承诺不变），但自 0.33 #765 起会调**第三根
+  // 探针 `loadRawRows`** 结清悬空 `tool_use`（缺它则引擎只报 ledger_probe_absent）——它与 `load()`
+  // **共用同一条 SELECT**，故在本流水里被 `sqlTrace` 认作一个 `load` 形状。这里是**恰好一条**（探针），
+  // 不是引擎退回去 `store.load`；无多余读取的防护意图与旧版一致。
   assert.deepEqual(
-    sqlTrace(order).filter((tag) => tag === 'load'), [],
-    `快路径不得调 store.load，实际 SQL 流水：${sqlTrace(order).join(' → ')}`,
-  );
-  assert.deepEqual(
-    sqlTrace(order), ['loadByDedupKey', 'loadMaxRound', 'appendRound'],
-    '点查未命中 → 取 MAX(round) → appendRound，无多余读取',
+    sqlTrace(order), ['loadByDedupKey', 'loadMaxRound', 'load', 'appendRound'],
+    `点查未命中 → MAX(round) → loadRawRows 探针（#501）→ appendRound；实际 SQL 流水：${sqlTrace(order).join(' → ')}`,
   );
   assert.equal(state.rows.length, 1);
 });

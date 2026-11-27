@@ -69,7 +69,10 @@ function createFakeAgentdPeer() {
           transcripts.set(runId, list);
           return { inserted: true };
         }
-        case 'load': {
+        // issue #501：peer = portal internal 端点，本就不折叠（折叠是 `makeStore.load` 的职责），
+        // 故 `loadRawRows` 与 `load` 在桩里**同源**（同一批原始行、同一排序）；两 case 直接穿透。
+        case 'load':
+        case 'loadRawRows': {
           const list = transcripts.get(runId) ?? [];
           // 同 round 按追加序（数组序，稳定排序）；引擎不再二次排序（0.16.0 契约）。
           const records = list
@@ -189,8 +192,11 @@ test('STORE_METHODS：必需/可选契约与 status 读接口在 IPC 白名单�
 //   · `runState`（`saveRunState` + `loadRunState` + `markRunState`）、`runStateStatus`（`loadRunStateStatus`）
 //     ——本站这两组**真实现**（`runner/lib/store.js` + peer 桩后的 portal internal 端点），所以申报出来：
 //     实现被删时套件当场红，而不是被成对守卫当「宿主本来就没选这个能力」静默跳过；
-//   · `rawRows`（`loadRawRows`）与 `fastPathProbes`（`loadByDedupKey` + `loadMaxRound`）**本站没有**
-//     ⇒ 一个都不报（报半组会被「声明了却没整组实现」当场判红，见 #501：补上 `loadRawRows` 那天再加）。
+//   · `rawRows`（`loadRawRows`）**本站已有**（#501：portal `createSessionTranscriptStore` 与
+//     `runner/lib/store.js` 都补了这根探针，且与 `load()` 共用**同一条读路径** ⇒ `foldMessageRows(loadRawRows(id))`
+//     逐字等于 `load(id)`）⇒ **整组报出来**（报半组会被「声明了却没整组实现」当场判红）；
+//   · `fastPathProbes`（`loadByDedupKey` + `loadMaxRound`）仍**本站没有** ⇒ 不报（点查探针跑在 portal
+//     POST 事务内，不经这条 IPC 契约面）。
 //
 // ⚠ **erix-agent 0.33.0（issue #838 S2，本站 #530）：`runSnapshot` 这个能力名已从上游名单里删除**
 //   （现查 0.33.0：`test/contract/transcript-store.js` 里 `runSnapshot` **0 命中**；`OPTIONAL_CAPABILITIES`
@@ -201,7 +207,7 @@ test('STORE_METHODS：必需/可选契约与 status 读接口在 IPC 白名单�
 transcriptStoreContract('station-ipc-store', async () => {
   const peer = createFakeAgentdPeer();
   return makeStore('contract-run', { request: (method, args) => peer.handle(method, args) });
-}, { optionalCapabilities: ['runState', 'runStateStatus'] });
+}, { optionalCapabilities: ['runState', 'runStateStatus', 'rawRows'] });
 
 test('station-ipc-store：agentd 写入失败向上抛（IPC error 透传，fail-closed 语义）', async () => {
   const peer = createFakeAgentdPeer();
