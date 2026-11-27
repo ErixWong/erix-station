@@ -376,9 +376,10 @@ export async function provisionFdePreviewPorts(pool, config, { fdeId, fdeName, b
     + '每次都是新事务重取占用后取下一个空闲段，仍然冲突 ⇒ 号池里没有「算出来空闲但插不进去」的整块了，'
     + '请管理员显式改块 POST /api/admin/fdes/:fdeName/ports/block）',
     lastErr?.cause ?? lastErr,
-    // 内层 `lastErr` 自己就带英文腿（上面那个 `clash.en`）⇒ 这里优先用它的 `en`，避免英文腿里
-    // 混进中文原文；尾注自己翻译（不拼中文）。
-    `${lastErr?.en ?? lastErr?.message ?? 'preview port block overlaps existing live rows'} `
+    // 内层 `lastErr` 自己就带英文腿（上面那个 `clash.en`）⇒ 这里用它的 `en`；**没有 `en` 就落下面那句纯英文兜底，
+    // 绝不回退到 `lastErr.message`**（#902 ①：那是中文原文，拼进英文句 = 这条压根没翻，`locale=en` 的用户
+    // 会看到中英混排）。尾注自己翻译（不拼中文）。
+    `${lastErr?.en ?? 'preview port block overlaps existing live rows'} `
     + `(tried ${maxAttempts} times = the first attempt plus ${maxAttempts - 1} automatic recomputes, each in a new transaction `
     + 'that re-reads occupancy and takes the next free segment, still conflicting ⇒ the pool has no whole block that computes '
     + 'as free yet cannot be inserted; please ask an administrator to move the block explicitly via '

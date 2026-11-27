@@ -200,7 +200,10 @@ test('block_taken · 撞外来活行（真构造）：中文逐字 + .en 逐字�
 test('block_taken · 另三个抛点（23505 重叠 / 重试用尽 / 搬迁中途插入不足）中文旁边确实配了英文', () => {
   const englishFragments = [
     'clash.en = `preview port block ${previewBlockLabel(block)} overlaps existing live rows `',
-    '${lastErr?.en ?? lastErr?.message ?? \'preview port block overlaps existing live rows\'} ',
+    // #902 ①：以前这里钉的是 `${lastErr?.en ?? lastErr?.message ?? …}` ⇒ 「英文腿里可能混中文」被**当源码片段钉成了契约**
+    // （片段断言只能证明「源码写了这句」，中文真涌进英文句时它照样绿）。现在钉不带 `.message` 的那一句，
+    // 并在下面反向钉「不许再出现 `lastErr?.message`」+ 另加一条真行为判据（见下一条测试）。
+    '${lastErr?.en ?? \'preview port block overlaps existing live rows\'} ',
     'tried ${maxAttempts} times = the first attempt plus',
     'is already taken (foreign live ports:',
     '`moving to preview port block ${targetLabel} inserted only ${out.inserted.length}/${PREVIEW_PORT_COUNT} rows `',
@@ -209,6 +212,33 @@ test('block_taken · 另三个抛点（23505 重叠 / 重试用尽 / 搬迁中�
     assert.match(SRC_PORTALLOC, lit(fragment), `portalloc.js 里找不到这段英文腿：${fragment}`);
   }
   assert.equal(new Set(englishFragments).size, englishFragments.length, '四句英文必须互不相同');
+  // 反向钉子：英文腿那一格里不许再有「回退到中文 `message`」这一级。
+  assert.doesNotMatch(SRC_PORTALLOC, /\$\{lastErr\?\.en[^}]*lastErr\?\.message/,
+    'portalloc.js 重试用尽那条英文腿又带上了 lastErr?.message 中文回退（#902 ①）');
+});
+
+// #902 ① 的真行为判据（上面那条只钉源码片段，片段里混中文它看不出来）：内层 `preview_port_block_taken`
+// **只有中文 `message`、没有 `en`**（真库 23505 那条一定带 `clash.en`，但「某个内层抛点漏配英文」正是
+// 这里要防的病）⇒ 重试用尽后抛出的 `err.en` 必须**一个汉字都没有**。
+test('block_taken · 重试用尽：内层只有中文 message 无 en ⇒ 最终英文腿不含汉字（不回退中文）', async () => {
+  const zhOnlyError = () => {
+    const e = new Error('预览端口块与既有活行重叠：并发抢号，请管理员显式改块');
+    e.code = 'preview_port_block_taken';
+    return e;
+  };
+  // 每个事务的第一句 SQL（`BEGIN`）就抛 ⇒ 三次重试全部落同一颗只有中文的错。
+  const client = { query: async () => { throw zhOnlyError(); }, release() {} };
+  const pool = { connect: async () => client, query: client.query };
+  const err = await portalloc.provisionFdePreviewPorts(pool, { baseDomain: BASE },
+    { fdeId: 7, fdeName: 'alice', log: { warn() {} } }).then(() => null, (e) => e);
+  assert.equal(err.code, 'preview_port_block_taken');
+  // 中文腿照旧带内层中文原文（中文腿逐字口径不许动）。
+  assert.ok(err.message.includes('预览端口块与既有活行重叠'), '中文腿应仍带上内层中文原文');
+  // 判据本体：英文腿里零汉字（旧写法会把中文 `message` 拼进来 ⇒ 这里红）。排在下面两句片段匹配**之前**，
+  // 保证回归时报出来的是这条判据本身，而不是被前面的片段匹配先吃掉。
+  assert.equal(/[\u4e00-\u9fa5]/.test(err.en), false, `英文腿混进了汉字：${err.en}`);
+  assert.match(err.en, /preview port block overlaps existing live rows/);
+  assert.match(err.en, /tried 3 times = the first attempt plus 2 automatic recomputes/);
 });
 
 // ───────────── preview_port_block_invalid：中文在 previewpool，英文在 http 出口 ─────────────
