@@ -35,7 +35,11 @@ function makeRouter() {
   return createRouter({
     history: createMemoryHistory(),
     routes: [
-      { path: '/', component: AdminLayout },
+      // ⚠ 这里**不能**再挂 `AdminLayout`（#818 起）：挂载点本身就是 AdminLayout，它自己的
+      //   `<router-view/>` 会再渲染一份 AdminLayout ⇒ DOM 里出现**两份**导航（15 项变 30 项、
+      //   6 组变 12 组）。旧的扁平 tab 用例按 `slice(0, 12)` 与「相邻索引」断言，翻倍看不出来；
+      //   #818 要钉「15 项不多不少」，所以落点必须是一个不会自我嵌套的桩。
+      { path: '/', component: { template: '<div />' } },
       { path: '/login', component: { template: '<div>login</div>' } },
       // 顶栏 tab 用的是 `{ name: ... }` 形式的 :to ⇒ 路由表里没有这些名字，挂载当场就
       // "No match for {name:'admin-users'}" 抛错（不是断言失败）。给桩即可，本单不测 tab。
@@ -188,19 +192,13 @@ describe('AdminLayout tab 导航（#485 片 A 上传上限）', () => {
     expect(hrefs).toContain('/admin-upload');
     expect(links.find((link) => link.attributes('href') === '/admin-upload')!.text()).toBe('上传上限');
 
-    // 顺序：certs → **upload** → prompts → runtime → market → system → pool（平台配置挨在一起，
-    // 只读的号池占用永远留最后）
-    // ⚠ #595 在 upload 与 pool 之间插了「能力市场」、#596 片 B 又插了「提示词」⇒ 这里的相邻判据
-    //    同步改（精确相邻由下面几条各自钉）。
+    // 顺序：certs → **upload** → prompts → runtime → …（平台配置挨在一起，只读的号池占用永远留最后）
+    // ⚠ #818 把顶栏 15 项搬进了**分组侧栏**，DOM 里的顺序 = 分组顺序 ⇒ 跨组的相邻（旧「runtime → market」）
+    //   不再成立：能力市场现在与 LLM 同在「模型与能力」组。本用例只钉同组内的相邻与「在号池之前」。
     expect(hrefs.indexOf('/admin-upload')).toBe(hrefs.indexOf('/admin-tls') + 1);
-    // ⚠ 四颗 tab 分别由 #595 / #596 / #650 / #677 插在 upload 与 pool 之间 ⇒ 合并后顺序固定为
-    //    upload → prompts → runtime → market → system → pool，旧「紧接 upload 之后」的相邻各让一步
-    //    （同一个形状：以前 #485 插 upload 时也改掉过 #456 那条）。判据本身（存在 + 指向 + 在号池之前）一个字没让。
     expect(hrefs.indexOf('/admin-prompts')).toBe(hrefs.indexOf('/admin-upload') + 1);
     expect(hrefs.indexOf('/admin-runtime')).toBe(hrefs.indexOf('/admin-prompts') + 1);
-    expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-runtime') + 1);
-    expect(hrefs.indexOf('/admin-system')).toBe(hrefs.indexOf('/admin-market') + 1);
-    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-system') + 1);
+    expect(hrefs.indexOf('/admin-preview-pool')).toBeGreaterThan(hrefs.indexOf('/admin-runtime'));
     // tab 总数：这一格是「加 tab 必须同步改本文件桩路由」那条红线的正面（漏改 ⇒ 挂载就抛，不会走到这里）
     // ⚠ 12 = #677 P2b 在 prompts 与 market 之间插了「运行时设置」，#727 片 2 又在 users 之后插了
     //   「工位内容」⇒ 到号池占用为止各多一格。
@@ -266,11 +264,12 @@ describe('AdminLayout tab 导航（#595 能力市场）', () => {
     expect(hrefs).toContain('/admin-market');
     expect(links.find((link) => link.attributes('href') === '/admin-market')!.text()).toBe('能力市场');
 
-    // 精确相邻：prompts → runtime → **market** → system → pool（#596 的提示词与 #677 的运行时设置
-    // 在 market 之前、#650 的系统在 market 之后；pool 仍是平台配置段的末尾）
-    expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-runtime') + 1);
-    expect(hrefs.indexOf('/admin-system')).toBe(hrefs.indexOf('/admin-market') + 1);
-    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-system') + 1);
+    // 精确相邻（#818 分组后）：market 与 llm 同在「模型与能力」组 ⇒ market 紧跟 llm；
+    // 而 runtime 属「平台配置」组，旧的「runtime → market」跨组相邻已不成立（DOM 顺序 = 分组顺序）。
+    expect(hrefs.indexOf('/admin-market')).toBe(hrefs.indexOf('/admin-llm') + 1);
+    // 「运行观察」组内部：system 仍紧挨号池占用，且 market（平台配置）在号池之前
+    expect(hrefs.indexOf('/admin-system')).toBeLessThan(hrefs.indexOf('/admin-preview-pool'));
+    expect(hrefs.indexOf('/admin-market')).toBeLessThan(hrefs.indexOf('/admin-preview-pool'));
 
     // 路由表本身：`/admin` 的 children 里有 `market` → `admin-market`，懒加载且要求 admin 角色
     const adminRoute = routes.find((route) => route.path === '/admin')!;
@@ -299,9 +298,10 @@ describe('AdminLayout tab 导航（#650 系统监控）', () => {
     expect(hrefs).toContain('/admin-system');
     expect(links.find((link) => link.attributes('href') === '/admin-system')!.text()).toBe('系统');
 
-    // 精确相邻：market → **system** → pool（只读运维快照与号池占用挨在一起，且 system 在 pool 之前）
-    expect(hrefs.indexOf('/admin-system')).toBe(hrefs.indexOf('/admin-market') + 1);
+    // 精确相邻（#818 分组后）：market 已搬进「模型与能力」组，与 system 不再相邻；
+    // 本用例的判据（system 在号池之前 + 「只读快照挨在一起」）改钉同组内的 system → pool 相邻。
     expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-system') + 1);
+    expect(hrefs.indexOf('/admin-system')).toBeGreaterThan(hrefs.indexOf('/admin-runtime'));
 
     // 路由表本身：`/admin` 的 children 里有 `system` → `admin-system`，懒加载且要求 admin 角色
     const adminRoute = routes.find((route) => route.path === '/admin')!;
@@ -415,5 +415,171 @@ describe('AdminLayout 顶栏语言切换（#804：管理台必须能就地切语
     const headerButtons = wrapper.findAll('header button');
     expect(headerButtons.length).toBeGreaterThanOrEqual(2);
     expect(headerButtons.at(-1)!.text()).toBe(i18n.global.t('common.logout'));
+  });
+});
+
+// ============================ issue #818：左侧分组侧栏 ============================
+// 顶栏 15 项 tab 搬进左侧 6 组 + 底部「关于」。这里钉的是**导航还在不在、能不能找到**：
+// ① 15 项一个不少（漏分组 = 这一页在管理台里没有任何入口，历史上加 tab 只要塞一行，现在多了一层）；
+// ② 默认只展开当前组；③ 导航时强制展开目标组；④「跳到…」过滤；⑤ 展开态过 localStorage 往返；
+// ⑥ a11y（aria-expanded / aria-current / nav[aria-label] / skip 链接）。
+// 断言只认 DOM（收起的组用 `v-show` ⇒ 链接恒在 DOM，可见性用 `isVisible()`，不用 `w.emitted()`）。
+const ALL_TAB_PATHS = [
+  '/admin-users', '/admin-seat-content', '/admin-llm', '/admin-market', '/admin-repos',
+  '/admin-mail', '/admin-tls', '/admin-upload', '/admin-prompts', '/admin-runtime',
+  '/admin-system', '/admin-preview-pool', '/admin-macros', '/admin-macro-runs', '/admin-about',
+];
+const GROUP_IDS = ['usersSeats', 'models', 'platformAccess', 'platformConfig', 'observe', 'macros'];
+const GROUP_TITLES = ['用户与工位', '模型与能力', '平台接入', '平台配置', '运行观察', '宏'];
+
+async function mountAt(path: string) {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
+  const auth = useAuthStore();
+  auth.user = ADMIN_WITH_SEAT as never;
+  auth.ready = true;
+  const router = makeRouter();
+  await router.push(path);
+  await router.isReady();
+  const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
+  return { wrapper, router };
+}
+type MountedLayout = Awaited<ReturnType<typeof mountAt>>;
+const navLinks = (wrapper: MountedLayout['wrapper']) => wrapper.findAll('nav a');
+const groupButton = (wrapper: MountedLayout['wrapper'], id: string) =>
+  wrapper.get(`[data-test="nav-group-${id}"]`);
+
+describe('AdminLayout 左侧分组侧栏（#818）', () => {
+  it('① 渲染 6 个组标题 + 底部「关于」，且 15 个链接不多不少', async () => {
+    const { wrapper } = await mountAt('/');
+    expect(wrapper.findAll('[data-test^="nav-group-"]')).toHaveLength(6);
+    expect(wrapper.findAll('[data-test^="nav-group-"]').map((b) => b.text()).map((t) => t.replace(/[▸▾]/, '').trim()))
+      .toEqual(GROUP_TITLES);
+    // 15 项不多不少（`nav a` 里只有导航链接：skip 链接在 nav 外，过滤框是 input，折叠键是 button）
+    expect(navLinks(wrapper)).toHaveLength(15);
+    expect(navLinks(wrapper).map((l) => l.attributes('href'))).toEqual(ALL_TAB_PATHS);
+    // 「关于」是底部固定项：不并进任何组，但仍在同一个 <nav> 里（它属于那 15 项）
+    expect(wrapper.find('[data-test="nav-footer"] [data-test="nav-link-admin-about"]').exists()).toBe(true);
+    expect(wrapper.findAll('[data-test^="nav-group-"] [data-test="nav-link-admin-about"]')).toHaveLength(0);
+    // 结构自检位：分组表漏抄一项 ⇒ 这里会渲染出失联的 tab 名（正常态不该存在）
+    expect(wrapper.find('[data-test="nav-unassigned"]').exists()).toBe(false);
+  });
+
+  it('② 默认只展开当前路由所在组，其余全部收起', async () => {
+    const { wrapper } = await mountAt('/admin-macros');
+    expect(groupButton(wrapper, 'macros').attributes('aria-expanded')).toBe('true');
+    for (const id of GROUP_IDS.filter((each) => each !== 'macros')) {
+      expect(groupButton(wrapper, id).attributes('aria-expanded'), id).toBe('false');
+    }
+    expect(wrapper.get('[data-test="nav-link-admin-macros"]').isVisible()).toBe(true);
+    expect(wrapper.get('[data-test="nav-link-admin-users"]').isVisible(), '收起的组只是不可见，链接仍在 DOM').toBe(false);
+    // 当前项还标了 aria-current（读屏才知道自己在哪）
+    expect(wrapper.get('[data-test="nav-link-admin-macros"]').attributes('aria-current')).toBe('page');
+  });
+
+  it('② 没有当前组（落在 /）⇒ 一律收起，但 15 项链接仍在 DOM', async () => {
+    const { wrapper } = await mountAt('/');
+    for (const id of GROUP_IDS) expect(groupButton(wrapper, id).attributes('aria-expanded'), id).toBe('false');
+    expect(navLinks(wrapper)).toHaveLength(15);
+  });
+
+  it('③ 手动收起「宏」后再导航到宏流水：目标组被强制展开', async () => {
+    const { wrapper, router } = await mountAt('/admin-macros');
+    await groupButton(wrapper, 'macros').trigger('click');
+    expect(groupButton(wrapper, 'macros').attributes('aria-expanded')).toBe('false');
+
+    await router.push('/admin-macro-runs');
+    await flushPromises();
+    expect(groupButton(wrapper, 'macros').attributes('aria-expanded'), '刚点进去的组收起着 = 看不见自己在哪').toBe('true');
+    expect(wrapper.get('[data-test="nav-link-admin-macro-runs"]').isVisible()).toBe(true);
+  });
+
+  it('④「跳到…」：输入即过滤（中英任一命中）、清空恢复 15 项、无匹配给一行提示', async () => {
+    const { wrapper } = await mountAt('/');
+    const filter = wrapper.get('[data-test="nav-filter"]');
+
+    await filter.setValue('宏');
+    expect(navLinks(wrapper).map((l) => l.attributes('href'))).toEqual(['/admin-macros', '/admin-macro-runs']);
+    expect(wrapper.findAll('[data-test^="nav-group-"]')).toHaveLength(1); // 空组连标题一起藏
+    // 过滤态强制展开：不需要再点一下才看见搜到的东西
+    expect(groupButton(wrapper, 'macros').attributes('aria-expanded')).toBe('true');
+
+    // 英文界面下用中文词也命中（匹配中文项名**与**英文译文两者之一）
+    await filter.setValue('run');
+    expect(navLinks(wrapper).map((l) => l.text())).toContain('宏流水'); // Macro runs
+    expect(navLinks(wrapper).every((l) => l.isVisible())).toBe(true);
+
+    await filter.setValue('');
+    expect(navLinks(wrapper)).toHaveLength(15);
+    expect(wrapper.find('[data-test="nav-no-match"]').exists()).toBe(false);
+
+    await filter.setValue('qqqzzz');
+    expect(navLinks(wrapper)).toHaveLength(0);
+    expect(wrapper.get('[data-test="nav-no-match"]').text()).toBe('没有匹配项');
+  });
+
+  it('⑤ 收起某组 ⇒ localStorage 不含它；重新挂载仍是收起（键 admin.nav.expanded，不进 DB）', async () => {
+    const { wrapper } = await mountAt('/admin-macros');
+    await groupButton(wrapper, 'macros').trigger('click');
+    const stored = JSON.parse(localStorage.getItem('admin.nav.expanded') ?? 'null');
+    expect(Array.isArray(stored), '值是组 id 数组').toBe(true);
+    expect(stored).not.toContain('macros');
+
+    // 重新挂载 = 重新读 localStorage（**存了空数组 ≠ 没存过**：后者才会回落到「展开当前组」）
+    const again = await mountAt('/admin-macros');
+    expect(groupButton(again.wrapper, 'macros').attributes('aria-expanded')).toBe('false');
+  });
+
+  it('⑤ localStorage 里是脏值（非数组 / 未知组 id）⇒ 不抛、回落默认', async () => {
+    localStorage.setItem('admin.nav.expanded', '{not json');
+    const dirty = await mountAt('/admin-macros');
+    expect(groupButton(dirty.wrapper, 'macros').attributes('aria-expanded')).toBe('true');
+
+    localStorage.setItem('admin.nav.expanded', JSON.stringify(['models', 42, 'nope']));
+    const unknown = await mountAt('/');
+    expect(unknown.wrapper.findAll('[data-test^="nav-group-"]')).toHaveLength(6);
+    expect(groupButton(unknown.wrapper, 'models').attributes('aria-expanded')).toBe('true');
+    expect(groupButton(unknown.wrapper, 'macros').attributes('aria-expanded')).toBe('false');
+  });
+
+  it('⑥ a11y：组标题是带 aria-expanded 的 <button>、当前项 aria-current、nav 有名字、skip 链接指向 #admin-main', async () => {
+    const { wrapper } = await mountAt('/admin-macros');
+    for (const id of GROUP_IDS) {
+      const button = groupButton(wrapper, id);
+      expect(button.element.tagName, id).toBe('BUTTON');
+      expect(button.attributes('aria-expanded'), id).toBeTruthy();
+      // 组图标是装饰（读屏读的是组名）
+      expect(button.get('svg').attributes('aria-hidden'), id).toBe('true');
+    }
+    expect(wrapper.get('nav').attributes('aria-label')).toBe(i18n.global.t('admin.tabs.label'));
+    expect(wrapper.get('[data-test="nav-link-admin-macros"]').attributes('aria-current')).toBe('page');
+    expect(wrapper.get('[data-test="nav-link-admin-macro-runs"]').attributes('aria-current')).toBeUndefined();
+
+    const skip = wrapper.get('[data-test="skip-to-content"]');
+    expect(skip.attributes('href')).toBe('#admin-main');
+    expect(skip.text()).toBe(i18n.global.t('admin.nav.skip'));
+    expect(wrapper.get('#admin-main').attributes('id')).toBe('admin-main');
+    // skip 链接必须在 nav **之前**（否则键盘用户要先 TAB 过 15 项才拿到它）
+    const focusables = wrapper.element.querySelectorAll('a, button, input');
+    expect(Array.prototype.indexOf.call(focusables, skip.element)).toBe(0);
+  });
+
+  it('⑥ 两个滚动面分开：侧栏的滚动容器与 main 的滚动容器是两个元素', async () => {
+    const { wrapper } = await mountAt('/');
+    const aside = wrapper.get('aside');
+    const main = wrapper.get('#admin-main');
+    const asideScroller = aside.get('nav');
+    expect(asideScroller.classes()).toContain('overflow-y-auto');
+    expect(main.classes()).toContain('overflow-y-auto');
+    // 一个 overflow 管两边 = 长页面把导航顶出视野 ⇒ 滚动容器不能是同一个元素
+    expect(asideScroller.element).not.toBe(main.element);
+    expect(main.element.contains(asideScroller.element)).toBe(false);
+  });
+
+  it('⑤ 每个分组标题都带自维护内联 SVG 图标（不引图标库）', async () => {
+    const { wrapper } = await mountAt('/');
+    const icons = wrapper.findAll('[data-test^="nav-group-"] [data-test="app-icon"]');
+    expect(icons).toHaveLength(6);
+    expect(icons.map((icon) => icon.attributes('data-icon'))).toEqual(['users', 'cpu', 'plug', 'sliders', 'activity', 'zap']);
+    expect(wrapper.findAll('path').length).toBeGreaterThan(0);
   });
 });

@@ -934,6 +934,26 @@ export const en = {
       macros: 'Macro templates',
       macroRuns: 'Macro runs',
     },
+    // issue #818: the six **group** names of the new left sidebar (the item labels above are untouched,
+    // not one character). Order = sidebar render order; group names are new semantics and deliberately
+    // do **not** reuse any item label (work-order red line).
+    navGroup: {
+      usersSeats: 'Users & seats',
+      models: 'Models & capability',
+      platformAccess: 'Platform access',
+      platformConfig: 'Platform settings',
+      observe: 'Runtime observation',
+      macros: 'Macros',
+    },
+    // issue #818 §④ / §③: sidebar chrome strings (skip link, "jump to…" filter, no-match line)
+    // plus the collapse toggle's accessible name. The skip link text has to read like an instruction.
+    nav: {
+      skip: 'Skip to main content',
+      filterPlaceholder: 'Jump to…',
+      noMatch: 'No matches',
+      collapse: 'Collapse sidebar (icons only)',
+      expand: 'Expand sidebar',
+    },
     // issue #727 slice 2: the seat-content page (views/AdminSeatContentView.vue +
     // components/AdminTranscript.vue, contract §4.22). Read-only page: no wording here may use a
     // write-side verb such as send / stop / upload.
