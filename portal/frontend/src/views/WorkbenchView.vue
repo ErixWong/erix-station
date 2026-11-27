@@ -110,21 +110,39 @@ watch(
   async (sid) => {
     if (sid) {
       if (String(sid) === String(store.sessionId)) return;
-      await store.resolveRouteSession(String(sid));
+      // issue #863：Vue **不等 watcher 返回的 Promise**（与 `onMounted` 那条 #281 注释同一个道理）。
+      // 点侧栏/下拉换会话会走到这里，`resolveRouteSession` 收尾阶段抛错（例：环境里没有 EventSource）
+      // 就演成未捕获拒绝：界面不动、什么也不说，而且能让整条前端闸 rc=1 而用例全绿（#862）。
+      try {
+        await store.resolveRouteSession(String(sid));
+      } catch (e) {
+        store.pushStreamError(t('errors.sessionLoadFailed')); // 与深链同一个 key，中英已翻
+        console.error('Failed to resolve route session', e);
+      }
     } else if (store.sessionId) {
       store.resetSessionView();
     }
   },
 );
 
+// issue #863：调用方是 `void onSelectSession(id)`（会话浏览）与侧栏模板绑定
+// `@select-session="onSelectSession"`——两处都把返回的 Promise 丢掉 ⇒ **本函数不许把拒绝传出去**，
+// 否则同会话分支的 `await store.openSession(id)` 一旦在收尾阶段抛错就是未捕获拒绝（#281 同一个道理，
+// 代价见 #862/#864：整条前端闸可以 rc=1 而用例全绿）。收尾形状照下方 `onMounted` 那道 catch：
+// **不重试**，只把失败变成界面上看得见的错误行。
 async function onSelectSession(id: string) {
-  // 评审修复：同会话重开只刷新（旧 replaceState 语义），不重复 push 历史
-  if (String(id) === String(store.sessionId)) {
-    await store.openSession(id);
-    return;
+  try {
+    // 评审修复：同会话重开只刷新（旧 replaceState 语义），不重复 push 历史
+    if (String(id) === String(store.sessionId)) {
+      await store.openSession(id);
+      return;
+    }
+    drawerOpen.value = false; // issue #55 B4：移动端选中会话后自动收起抽屉
+    await router.push(`/session/${encodeURIComponent(id)}`);
+  } catch (e) {
+    store.pushStreamError(t('errors.sessionLoadFailed'));
+    console.error('Failed to open session', e);
   }
-  drawerOpen.value = false; // issue #55 B4：移动端选中会话后自动收起抽屉
-  await router.push(`/session/${encodeURIComponent(id)}`);
 }
 
 async function onNewSession() {
