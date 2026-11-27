@@ -4173,9 +4173,18 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
     && (before == null || minDiscoveredSeq < before)
     ? minDiscoveredSeq
     : null;
+  // issue #561：**最老的白名单页**（非空且 `hasOlder === false`）用一条页界之下的存在性探针决定
+  // 要不要把 `pageLow` 当游标交出去（理由见 `hasTerminalRunBelow` 的注释）。三个条件缺一不可：
+  // 本页非空（空页有它自己的 `tailCursor` 路径）、`hasOlder === false`（还有更老白名单行时游标
+  // 归白名单行）、`sessionId != null`（发现那条路本来就要会话 id）。
+  // ⚠ 给的游标**等于** `pageLow`，绝不小于它：小于会跳过真实事件（`#514 返修` 红线）。
+  const belowCursor = rows.length > 0 && !hasOlder && sessionId != null
+    && await hasTerminalRunBelow(ctx.pool, sessionId, pageLow)
+    ? pageLow
+    : null;
   return sendJson(res, 200, {
     events: mergeSynthItemsBySeq(events, synth.items),
-    next_cursor: whitelistCursor ?? tailCursor,
+    next_cursor: whitelistCursor ?? tailCursor ?? belowCursor,
   });
 }
 
@@ -4294,6 +4303,28 @@ async function discoverTerminalRuns(pool, sessionId, { pageLow = 0, before = nul
     truncated: rows.length > cap,
     minSeq: Number.isSafeInteger(last) ? last : null,
   };
+}
+
+/**
+ * issue #561：**页界之下**还有没有终态行。只回答存在性（`LIMIT 1`），不取 run_id、不当候选。
+ *
+ * 为什么需要它：候选发现（`discoverTerminalRuns`）的窗口下界是 `pageLow`（本页最旧白名单行），
+ * 于是「比本页更老」的 `run_end` 它一条都看不见。而**最老的白名单页**（`hasOlder === false`）
+ * 上 `whitelistCursor` 恒 null、页又非空 ⇒ `tailCursor` 也恒 null ⇒ `next_cursor` 提前 null，
+ * 客户端不会再去请求「`pageLow` 之下」那一页，那条 `run_end` 的分隔条**永远没有页可达**。
+ * 有它就给出 `next_cursor = pageLow`：下一页窗口 `[0, pageLow)` 与本页 `[pageLow, before)`
+ * **严格不重叠** ⇒ 不跳过任何真实事件（`#514 返修` 那条判据钉的正是这件事）；
+ * 而那一页会是空页 ⇒ 走既有的空页发现路径，`run_end` 以合成项出现。
+ * 没有 ⇒ 照旧 `next_cursor = null`，不多发一次请求。
+ */
+async function hasTerminalRunBelow(pool, sessionId, pageLow) {
+  const r = await pool.query(
+    `SELECT 1 FROM run_events
+      WHERE session_id = $1 AND type = 'run_end' AND seq < $2 AND run_id IS NOT NULL
+      LIMIT 1`,
+    [sessionId, pageLow],
+  );
+  return (r.rows?.length ?? 0) > 0;
 }
 
 /**
