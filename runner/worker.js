@@ -668,7 +668,7 @@ async function startRun(msg) {
   // 两处装配点（registry / baseToolSchemas）共用同一个常量。审查 run 只留只读三件套 ⇒ 隔离由
   // 「无 shell / 无 write / 无 note」在**工具装配层**保证（见下 registry / baseToolSchemas）。
   // ⚠ jail 的 `writable: [cwd]` **刻意不动**：#259 的锁（runner/test/system-prompt.test.js:315-319）
-  //   钉住「worker 只有一处 createJail 且该行字面含 `writable: [cwd]`」。审查 run 的 cwd 就是 worktree，
+  //   钉住「worker 只有一处 createJail 且该行字面含 `writable: [cwd]`」。审查 run 的 cwd 就是项目目录，
   //   而只读装配不含 writeFile/edit/shell ⇒ 无任何工具能触发写 ⇒ `writable: [cwd]` 与 `[]` 对 agent
   //   的**可观测写面相同（皆空）**。这是有意取舍（详见交付报告偏差说明）。
   const reviewOnly = isReviewOnly();

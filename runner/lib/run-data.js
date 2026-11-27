@@ -11,7 +11,8 @@
 //                                仅当 mtime 超过归档 TTL（ERIX_ARCHIVE_TTL_HOURS，默认 168h=7 天，
 //                                0=禁用清扫）才由 sweep 物理删除。
 //
-// worktree 生命周期不变（D8 执行隔离物，照旧随 run 回收）；终态产物（issue #64 R1）由 agentd 在
+// ⚠ 本文件管的是 **run 数据目录**的生命周期，**不是**工作区生命周期：D8 修订（附录 A.1）后本站没有
+//   worktree 这层，项目目录是用户资产、不随 run 回收（`runner/agentd.js` 的清理口径同此）。终态产物（#64 R1）由 agentd 在
 // archiveRunData 之前捕获上传（runner/lib/artifacts.js），归档不拦截产物回收。
 // 抽成独立模块：agentd.js 导入即用的同时可被单测直接驱动（agentd.js 顶层有 main() 副作用）。
 import { createHash } from 'node:crypto';
