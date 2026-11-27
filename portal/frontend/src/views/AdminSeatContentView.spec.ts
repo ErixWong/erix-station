@@ -527,7 +527,7 @@ describe('issue #727 判据⑥：users 行的「会话/文件」链接带 ?fde='
 });
 
 // ── 真机回访与哨兵 ──
-// 真机回访（playwright，管理台 host，FDE=eric）抓到的一格 bug + 防回潮哨兵。
+// 真机回访（playwright，管理台 host，FDE=<fde_name>）抓到的一格 bug + 防回潮哨兵。
 // 两个根因叠在一起：① 元信息行调的键名 `created` 不在语言包里（
 // 那里是 `createdAt`）⇒ 印出裸 key；② 详情没那两列 ⇒ 恒为「—」。
 // 现在格子的值来自左栏列表项 `sessions.items`，找不到就不给那一格。

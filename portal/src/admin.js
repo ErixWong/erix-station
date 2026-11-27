@@ -27,7 +27,7 @@ const safeUser = (row) => ({
   login: row.login,
   display_name: row.display_name,
   // 2026-11-06：email 进 DTO。它**不是**秘密（管理员开户时就填过），而列表里看不到它导致
-  // 「管理台无法维护邮箱」——`admin` / `eric` 至今没有邮箱，一旦启用 `transport=smtp` 就会被
+  // 「管理台无法维护邮箱」——`admin` / `<fde_name>` 至今没有邮箱，一旦启用 `transport=smtp` 就会被
   // 409 `email_not_registered` 锁在门外，而管理员连在哪儿补都不知道。
   // 仍**不**进 DTO 的：`password_hash` / `totp_secret`（真正的秘密）。
   email: row.email ?? null,

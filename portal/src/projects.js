@@ -89,7 +89,7 @@ export function validateFdeName(fdeName) {
  *   <fde>-p-<portLabel>.<baseDomain>   // portLabel = 端口十进制，不足 4 位零填充（号池端口 5 位则原样）
  * URL 去项目名段——顺带消灭「目录名 → 域名段」的合法化清洗；存量行由迁移 0008 重写。
  * `baseDomain` 语义 = **伞域**（#57：BASE_DOMAIN 从「可注册域」改为伞域 `fde.<可注册域>`，
- * 如 `fde.erix.vip`）⇒ 预览完整域 `eric-p-8001.fde.erix.vip`。语法里原先写死的 `.fde.` 段随之删除
+ * 如 `fde.erix.vip`）⇒ 预览完整域 `alice-p-8001.fde.erix.vip`。语法里原先写死的 `.fde.` 段随之删除
  * （否则伞域下会叠加成 `.fde.fde.erix.vip`）。portal / llm 两条生成式（config.js `station.`/`llm.` 前缀）
  * 在新语义下自动正确，不受本函数影响。
  */
@@ -195,8 +195,8 @@ export function validateFdeNameForHostname(fdeName, { baseDomain = null, probePo
  * 预览 URL（#57 阶段2）：**不再写死 scheme**——从公开入口配置（config.portalPublicBaseUrl，
  * 即容器/浏览器实际可达的 Traefik 入口 `scheme://host[:port]`）派生 scheme 与非默认端口，
  * 保证 dev（`http://station.fde.erix.vip:8090`）与生产（`https://station.fde.erix.vip`）走同一代码路径：
- *   public = http://station.fde.erix.vip:8090 → http://eric-p-8001.fde.erix.vip:8090
- *   public = https://station.fde.erix.vip      → https://eric-p-8001.fde.erix.vip（https 默认端口不进 URL）
+ *   public = http://station.fde.erix.vip:8090 → http://alice-p-8001.fde.erix.vip:8090
+ *   public = https://station.fde.erix.vip      → https://alice-p-8001.fde.erix.vip（https 默认端口不进 URL）
  * 预览 host 恒等于 hostname（无端口形态），端口后缀原样继承公开入口。
  * @param {string} hostname port_allocations.hostname（无端口）
  * @param {{ publicBaseUrl?: string | null }} [opts] 公开入口 base URL（config.portalPublicBaseUrl）；
