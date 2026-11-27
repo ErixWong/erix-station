@@ -1,43 +1,6 @@
 {
   "routes": [],
-  "schema": [
-    {
-      "entry": "check:llm_providers.api_format=openai",
-      "reason": "退役表（0010 改名、0032 撤除）的枚举值不在 model.md 枚举账里；#777 S1 抓到，修刀决定登记或加退役标注（#777 D 组）"
-    },
-    {
-      "entry": "check:llm_models.type=rerank",
-      "reason": "退役表（0010 改名、0032 撤除）的枚举值不在 model.md 枚举账里；#777 S1 抓到，修刀决定登记或加退役标注（#777 D 组）"
-    },
-    {
-      "entry": "check:llm_models.type=audio-tts",
-      "reason": "退役表（0010 改名、0032 撤除）的枚举值不在 model.md 枚举账里；#777 S1 抓到，修刀决定登记或加退役标注（#777 D 组）"
-    },
-    {
-      "entry": "check:llm_models.type=audio-stt",
-      "reason": "退役表（0010 改名、0032 撤除）的枚举值不在 model.md 枚举账里；#777 S1 抓到，修刀决定登记或加退役标注（#777 D 组）"
-    },
-    {
-      "entry": "check:llm_models.type=image-gen",
-      "reason": "退役表（0010 改名、0032 撤除）的枚举值不在 model.md 枚举账里；#777 S1 抓到，修刀决定登记或加退役标注（#777 D 组）"
-    },
-    {
-      "entry": "check:macro_runs.verdict=pass",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:macro_runs.verdict=no-op-claim",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:macro_runs.verdict=needs-human",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    },
-    {
-      "entry": "check:macro_runs.verdict=unclassified",
-      "reason": "迁移引入的表/列/枚举值未进 docs/data/model.md 数据字典（#777 S1 首轮抓到），另有修刀补字典（#777 D 组）"
-    }
-  ],
+  "schema": [],
   "legs": [
     {
       "entry": "path:portal/test/prune-checkpoints-db.test.js",
