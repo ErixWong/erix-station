@@ -143,13 +143,24 @@ export function validateHostnameGrammar(hostname) {
  */
 export function validateFdeNameForHostname(fdeName, { baseDomain = null, probePort = PREVIEW_PORT_BUDGET_PROBE_PORT } = {}) {
   if (!validateFdeName(fdeName).ok) {
-    return { ok: false, message: 'fde_name 非法（小写字母/数字/连字符，不以连字符开头或结尾）' };
+    // issue #803 返修①：这里是 **return**（不是 throw），所以当年按 `throw new XError` 扫的批次全漏了它；
+    // `admin.js` 开户把它包成 AdminError 时必须把 `en` 一起透传，否则 `locale=en` 直出中文。
+    // `message` 是中文原文（既有断言钉着，逐字不许动），`en` 是新增的英文对。
+    return {
+      ok: false,
+      message: 'fde_name 非法（小写字母/数字/连字符，不以连字符开头或结尾）',
+      en: 'invalid fde_name (lowercase letters, digits, hyphens; must not start or end with a hyphen)',
+    };
   }
   // 探测端口取**池内最宽**的那个（#246）：拼出的首标签就是最坏情况，预算因此不可能被端口位数放宽。
   const firstLabel = `${fdeName}${PREVIEW_PORT_SEGMENT}${String(probePort).padStart(PREVIEW_PORT_LABEL_MIN_WIDTH, '0')}`;
   const hostname = baseDomain ? buildHostname({ fdeName, port: probePort, baseDomain }) : firstLabel;
   if (hostname.length > 253) {
-    return { ok: false, message: `预览域名过长：生成的预览域名总长 ${hostname.length} 字符，超过整域名上限 253` };
+    return {
+      ok: false,
+      message: `预览域名过长：生成的预览域名总长 ${hostname.length} 字符，超过整域名上限 253`,
+      en: `preview hostname is too long: the generated hostname is ${hostname.length} characters, exceeding the 253-character limit for a full domain name`,
+    };
   }
   for (const label of hostname.split('.')) {
     if (DNS_LABEL_RE.test(label)) continue;
@@ -157,9 +168,14 @@ export function validateFdeNameForHostname(fdeName, { baseDomain = null, probePo
       return {
         ok: false,
         message: `FDE 名过长：生成的预览域名单标签 ${label.length} 字符，超过 DNS 上限 63（FDE 名请缩短到 ${MAX_FDE_NAME_LEN_FOR_HOSTNAME} 以内）`,
+        en: `FDE name is too long: a single label of the generated preview hostname is ${label.length} characters, exceeding the DNS limit of 63 (please shorten the FDE name to at most ${MAX_FDE_NAME_LEN_FOR_HOSTNAME} characters)`,
       };
     }
-    return { ok: false, message: `预览域名非法：base 域标签「${label}」${label.length} 字符，超过 DNS 上限 63 或含非法字符` };
+    return {
+      ok: false,
+      message: `预览域名非法：base 域标签「${label}」${label.length} 字符，超过 DNS 上限 63 或含非法字符`,
+      en: `invalid preview hostname: the base-domain label "${label}" is ${label.length} characters, exceeding the DNS limit of 63 or containing illegal characters`,
+    };
   }
   return { ok: true };
 }
