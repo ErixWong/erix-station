@@ -12,7 +12,7 @@
 // ⚠ 重复文案的红线（S2-B 踩过）：本文件的 8 类里 `title 必须为 ≤200 字符的字符串`（sessions.js 两处）、
 //   `path 不得逃逸目录根` / `path 必须是目录` / `userSpaceRoot/fde_name 缺失`（dirs.js 各三处）都是**同文案多处抛**，
 //   本片已把它们**全部**补了同一英文对，故任一腿无论命中哪一处都出英文——不留「删一处仍绿」的假象。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -22,6 +22,23 @@ import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { DirError } from '../src/dirs.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 station-s2c-static-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+// userspace（station-s2c-userspace-）已在 close() 里 rm，本单不动。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const SELF_UID = process.getuid?.() ?? 1000;
 const SELF_GID = process.getgid?.() ?? 1000;
@@ -45,7 +62,7 @@ async function startServer() {
   const demo = path.join(userspace, 'alice', 'projects', 'demo');
   fs.mkdirSync(demo, { recursive: true });
   fs.writeFileSync(path.join(demo, 'hello.txt'), 'hi'); // D3（path 是文件）、D4（目标已存在）都要它
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-s2c-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-s2c-static-')));
 
   const pool = new FakePool({ users: [{ ...FDE }, { ...NOFDE }] });
   for (const [u, tok, id] of [[FDE, FDE_TOKEN, 'ls-fde'], [NOFDE, NOFDE_TOKEN, 'ls-nofde']]) {
