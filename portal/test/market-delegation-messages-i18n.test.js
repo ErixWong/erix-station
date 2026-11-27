@@ -322,3 +322,105 @@ test('委派·userSpaceRoot 未配置（直调 delegationRoot → internal 500 +
   assert.equal(err.message, 'userSpaceRoot 未配置');
   assert.equal(err.en, 'userSpaceRoot is not configured');
 });
+
+// ── #803 返修第 ④ 条：同一句中文有**两个抛点**的文案，两支都必须钉 ──────────────────
+//
+// 坑的来历：`market.js` 里这两句文案各有两个抛出点，而本片此前只覆盖了「安装」那一支
+// （甚至凭据缺失两支都没覆盖）——删掉另一支的 `en:` 时用例仍是绿的。
+//   · 预算：`installCapability`（market.js 安装分支）与 `setCapabilityEnabled`（启用分支）；
+//   · 凭据缺失：`installCapability`（安装即启用）与 `setCapabilityEnabled`（启用时再查槽位）。
+// 下面三支：启用分支的预算一条、凭据缺失的两支各一条 ⇒ 三处抛出点各有自己的判据。
+const MCP_SLUG = 'pub-mcp';
+
+function marketMcpItem(slug) {
+  return { ...marketItem(slug, 'published'), kind: 'mcp' };
+}
+
+/**
+ * 启用面 / 槽位面都要用到的 pool：
+ *   · 条目按 slug 给（`pub-skill` = 已发布技能，`pub-mcp` = 已发布 MCP）；
+ *   · `selectInstall` 给调用方指定的那一行（`null` = 未装）；
+ *   · `countEnabled` **按 kind 分开**：技能给到上限（让启用分支撞预算），MCP 给 0
+ *     （让请求走到槽位闸，而不是先被预算拦下——预算排在槽位之前）；
+ *   · `capability_params` 声明一个必填 secret，`capability_param_values` 无行 ⇒ `missing` 非空。
+ */
+class BranchPool extends FakePool {
+  constructor({ installRow = null } = {}) {
+    super({ users: [ADMIN] });
+    this.installRow = installRow;
+    this.sessions.push({
+      id: 'ls-admin', user_id: ADMIN.id, token_hash: auth.hashToken(ADMIN_TOKEN),
+      created_at: new Date(), expires_at: new Date(Date.now() + 86_400_000), last_seen_at: new Date(), revoked_at: null,
+    });
+  }
+
+  async query(sql, params = []) {
+    const s = sql.replace(/\s+/g, ' ').trim();
+    if (s.includes('FROM capability_items WHERE slug = $1')) {
+      if (params[0] === 'pub-skill') return { rows: [marketItem(params[0], 'published')] };
+      if (params[0] === MCP_SLUG) return { rows: [marketMcpItem(params[0])] };
+      return { rows: [] };
+    }
+    if (s.includes('FROM fde_capability_installs inst JOIN capability_items i ON i.id = inst.item_id WHERE inst.fde_id = $1 AND i.slug = $2')) {
+      return { rows: this.installRow ? [{ version: '1.0.0', ...this.installRow }] : [] };
+    }
+    if (s.includes('count(*)::int AS n')) {
+      return { rows: [{ n: params[1] === 'mcp' ? 0 : market.LIMITS.maxEnabledSkills }] };
+    }
+    if (/FROM\s+capability_params\b/.test(s)) {
+      return { rows: [{ name: 'API_TOKEN', kind: 'secret', inject: 'env', required: true }] };
+    }
+    if (s.includes('FROM capability_param_values')) return { rows: [] };
+    return super.query(sql, params);
+  }
+}
+
+async function startBranchServer({ installRow = null } = {}) {
+  const userspace = fs.mkdtempSync(path.join(os.tmpdir(), 'station-s2g-branch-'));
+  return serve(new BranchPool({ installRow }), userspace);
+}
+
+test('市场·启用数超限（启用分支，market.js 的第二个预算抛点）→ 预算 409 capability_budget_exceeded', async () => {
+  const s = await startBranchServer({ installRow: { enabled: false } });
+  try {
+    const limit = market.LIMITS.maxEnabledSkills;
+    const req = { method: 'POST', p: '/api/market/items/pub-skill/enabled', cookie: s.adminCookie, body: { enabled: true } };
+    await twoLeg(s, req, {
+      code: 'capability_budget_exceeded', http: 409,
+      enMsg: `enabled skills have reached the limit of ${limit}`,
+      zhMsg: `启用的技能已达上限 ${limit} 个`,
+    });
+    // 数字格与 locale 无关（钉的是「两条语言腿共用同一份机器可读 details」）。
+    const en = await hit(s.base, { ...req, cookie: `${req.cookie}; locale=en` });
+    assert.deepEqual(en.error.details, { max_enabled: limit, enabled_now: limit, kind: 'skill' });
+  } finally { await s.close(); }
+});
+
+const SECRET_MISSING_ZH = '还有必填凭据没配置，无法启用（等管理员配置）';
+const SECRET_MISSING_EN = 'required credentials are not configured yet, cannot enable (waiting for an administrator to configure them)';
+
+test('市场·凭据缺失（安装分支：装 MCP 且 enabled:true）→ 409 capability_secret_missing', async () => {
+  const s = await startBranchServer(); // 未装 ⇒ 走 installCapability
+  try {
+    const req = { method: 'POST', p: `/api/market/items/${MCP_SLUG}/install`, cookie: s.adminCookie, body: { enabled: true } };
+    await twoLeg(s, req, {
+      code: 'capability_secret_missing', http: 409, enMsg: SECRET_MISSING_EN, zhMsg: SECRET_MISSING_ZH,
+    });
+    const en = await hit(s.base, { ...req, cookie: `${req.cookie}; locale=en` });
+    assert.deepEqual(en.error.details, { slug: MCP_SLUG, missing: ['API_TOKEN'] });
+  } finally { await s.close(); }
+});
+
+test('市场·凭据缺失（启用分支，market.js 的第二个凭据抛点）→ 409 capability_secret_missing', async () => {
+  // `existing.enabled = true`：预算闸的条件是「这次要启用 且 当前是停用」，所以这条**绕开预算**，
+  // 专门打槽位闸（§4：MCP 只要请求启用就查槽位，不只在状态迁移时查）。
+  const s = await startBranchServer({ installRow: { enabled: true } });
+  try {
+    const req = { method: 'POST', p: `/api/market/items/${MCP_SLUG}/enabled`, cookie: s.adminCookie, body: { enabled: true } };
+    await twoLeg(s, req, {
+      code: 'capability_secret_missing', http: 409, enMsg: SECRET_MISSING_EN, zhMsg: SECRET_MISSING_ZH,
+    });
+    const en = await hit(s.base, { ...req, cookie: `${req.cookie}; locale=en` });
+    assert.deepEqual(en.error.details, { slug: MCP_SLUG, missing: ['API_TOKEN'] });
+  } finally { await s.close(); }
+});

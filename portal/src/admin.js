@@ -228,7 +228,10 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
   // baseDomain 缺省时退化为只校验首标签（预算与 base 无关）。
   const hostnameCheck = projects.validateFdeNameForHostname(fde_name, { baseDomain });
   if (!hostnameCheck.ok) {
-    throw new AdminError('validation_failed', hostnameCheck.message, { details: { field: 'fde_name' } });
+    // #803 返修①：`validateFdeNameForHostname` 是 **return** 一个 `{ok,message,en}`，不是 throw；
+    // 早先按 `throw new XError` 扫的批次看不见它 ⇒ 这里没给 `en` ⇒ `locale=en` 直出中文。
+    // 现在把校验器算好的英文对原样透传（中文仍是 `message`，既有断言钉着）。
+    throw new AdminError('validation_failed', hostnameCheck.message, { en: hostnameCheck.en, details: { field: 'fde_name' } });
   }
 
   const existingResult = await pool.query(

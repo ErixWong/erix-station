@@ -2987,10 +2987,13 @@ async function tlsStatusPayload(ctx) {
 }
 
 /** 429 信封（与 `handleAdminMailTest` 同一个形状）。 */
-function tlsRateLimited(gate, message) {
+function tlsRateLimited(gate, message, en) {
   return new HttpError(429, 'rate_limited', message, {
     retryable: true,
     headers: { 'Retry-After': String(gate.retryAfterSeconds) },
+    // #803 返修②：四个限流文案此前**没有英文腿**（`locale=en` 只能直出中文）。四个调用点的
+    // 英文各自对应自己的操作（upload / parsing / validation / rollback），不是同一句贴四份。
+    en,
   });
 }
 
@@ -3025,12 +3028,15 @@ async function handleAdminTlsPut(req, res, ctx, session) {
     throw new tlsCert.TlsCertError(result.code, result.message, {
       httpStatus: 400,
       details: result.details,
+      // #803 返修②：`validateUpload` 是 **return** 一个结果对象（不是 throw），它的每条失败现在都带
+      // `messageEn`；这里不传进去就等于在出口把英文腿弄丢（`pickMessage` 只能回退中文）。
+      en: result.messageEn,
     });
   }
 
   const limiterKey = `tlsupload:${session.user.id}`;
   const gate = ctx.tlsUploadLimiter.check(limiterKey);
-  if (!gate.allowed) throw tlsRateLimited(gate, '证书上传过于频繁，请稍后再试');
+  if (!gate.allowed) throw tlsRateLimited(gate, '证书上传过于频繁，请稍后再试', 'Certificate upload is too frequent; try again later.');
   ctx.tlsUploadLimiter.recordFailure(limiterKey);
 
   const written = await tlsCert.writeCertificateAssets({
@@ -3089,7 +3095,7 @@ async function handleAdminTlsInspect(req, res, ctx, session) {
 
   const limiterKey = `tlsinspect:${session.user.id}`;
   const gate = ctx.tlsInspectLimiter.check(limiterKey);
-  if (!gate.allowed) throw tlsRateLimited(gate, '证书解析过于频繁，请稍后再试');
+  if (!gate.allowed) throw tlsRateLimited(gate, '证书解析过于频繁，请稍后再试', 'Certificate parsing is too frequent; try again later.');
   ctx.tlsInspectLimiter.recordFailure(limiterKey);
 
   return sendJson(res, 200, tlsCert.inspectCertificate({
@@ -3113,7 +3119,7 @@ async function handleAdminTlsVerify(req, res, ctx, session) {
   requireJson(req);
   const limiterKey = `tlsverify:${session.user.id}`;
   const gate = ctx.tlsVerifyLimiter.check(limiterKey);
-  if (!gate.allowed) throw tlsRateLimited(gate, '证书校验过于频繁，请稍后再试');
+  if (!gate.allowed) throw tlsRateLimited(gate, '证书校验过于频繁，请稍后再试', 'Certificate validation is too frequent; try again later.');
   ctx.tlsVerifyLimiter.recordFailure(limiterKey);
 
   const active = await tlsCert.readActiveCertificate({ dynamicDir: tlsDynamicDir(ctx) });
@@ -3142,7 +3148,7 @@ async function handleAdminTlsRollback(req, res, ctx, session) {
   requireJson(req);
   const limiterKey = `tlsupload:${session.user.id}`;
   const gate = ctx.tlsUploadLimiter.check(limiterKey);
-  if (!gate.allowed) throw tlsRateLimited(gate, '回滚过于频繁，请稍后再试');
+  if (!gate.allowed) throw tlsRateLimited(gate, '回滚过于频繁，请稍后再试', 'Rollback is too frequent; try again later.');
   ctx.tlsUploadLimiter.recordFailure(limiterKey);
 
   const out = await tlsCert.rollbackCertificateAssets({
@@ -3271,15 +3277,27 @@ async function handleAdminMoveFdePortsBlock(req, res, ctx, session, fdeName) {
       fdeId: fde.id, fdeName: fde.fde_name, blockStart, log: ctx.log,
     });
   } catch (err) {
+    // #803 返修②：这三个重包以前只 `String(err?.message)`，把 portalloc/previewpool 的中文直译通给
+    // `locale=en`。英文腿在 `portalloc.js` 的抛点处自带（那里才能拼出块号/端口列表等动态值），
+    // 这里只透传。
     if (err?.code === 'preview_port_block_taken') {
-      throw new HttpError(409, 'preview_port_block_taken', String(err?.message ?? err));
+      throw new HttpError(409, 'preview_port_block_taken', String(err?.message ?? err), { en: err?.en });
     }
     if (err?.code === 'preview_hostname_invalid') {
-      throw new HttpError(400, 'preview_hostname_invalid', String(err?.message ?? err), { details: { field: 'fde_name' } });
+      throw new HttpError(400, 'preview_hostname_invalid', String(err?.message ?? err), { details: { field: 'fde_name' }, en: err?.en });
     }
     // 深层又冒上来的时候（入口已前置拦住）：对前端仍是「参数不合法」的 400 validation_failed。
     if (err?.code === 'preview_port_block_invalid') {
-      throw new HttpError(400, 'validation_failed', String(err?.message ?? err), { details: { field: 'block_start' } });
+      // 中文来自 `previewpool.js` 的 `assertAlignedPreviewBlockStart`——**不改它那句**（那边已有
+      // 断言钉中文原文），所以英文对照在出口给；非法值取本路由手里的 `blockStart`（与中文里
+      // `JSON.stringify(blockStart)` 那个同源）。
+      throw new HttpError(400, 'validation_failed', String(err?.message ?? err), {
+        details: { field: 'block_start' },
+        en: `preview port block start ${JSON.stringify(blockStart)} is invalid: it must be a multiple of ${PREVIEW_PORT_COUNT} `
+          + `and the whole block must fit inside the pool ${PREVIEW_PORT_POOL_START}-${portalloc.PREVIEW_PORT_POOL_END} `
+          + `(valid starts: ${PREVIEW_PORT_POOL_START}, ${PREVIEW_PORT_POOL_START + PREVIEW_PORT_COUNT}, ..., `
+          + `${portalloc.PREVIEW_PORT_POOL_END - PREVIEW_PORT_COUNT + 1})`,
+      });
     }
     throw err;
   }

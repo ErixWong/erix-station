@@ -1025,3 +1025,56 @@ test('MK-23 publish/retire 动词必须映射成状态（真机 400 validation_f
       '不许再把 URL 动词直接当 state 传（真机 400 validation_failed 的根因）');
   } finally { h.after(); }
 });
+
+// #803 返修③的钉子（此前**没有任何断言**钉着它）：`details` 会被 `http.js` 原样序列化进错误体，
+// 而 helper 的自校验诊断是中文（`market-write.js` 的 `fail()`）⇒ 落盘子进程失败时
+// **错误体的 details 里不许有中文**，原文只准进服务端日志（`log.warn`）。
+//
+// ⚠ 第 3 组判据（日志那一侧）**允许**用 `includes`：断的是「日志行里含这段中文」= 信息没丢，
+//   日志不是对客户端的契约、同一行还带 code 与截断长度，措辞不该被钉死。
+//   错误体那一侧仍逐键 `assert.equal(..., undefined)`——**不用**整块 deepStrictEqual，
+//   否则以后加任何机器可读字段都会红，那不是本条要拦的事。
+test('MK-22b 落盘子进程失败：错误体 details 只剩机器可读字段，中文原文只进 log.warn', () => {
+  const userSpaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'market-details-i18n-'));
+  const config = { userSpaceRoot, fdeUid: 1000, fdeGid: 1000 };
+  // helper 的**真**中文自校验诊断（不是英文 errno 串）：那正是会泄进 `locale=en` 错误体的东西。
+  const HELPER_ZH = 'write 缺少 contentBase64';
+  const stderrJson = JSON.stringify({ ok: false, error: HELPER_ZH, code: 'EPIPE', op: 'write', path: '/srv/erix/x', index: 2 });
+  const failFake = () => ({ status: 1, signal: null, stdout: Buffer.from(''), stderr: Buffer.from(stderrJson) });
+  try {
+    for (const [what, run] of [
+      ['writeSkillDir', (log) => writeSkillDir({ config, fdeName: 'alice', slug: 'demo-skill', log,
+        files: [{ path: ENTRYPOINT, content: Buffer.from('// x\n') }], spawnImpl: failFake })],
+      ['removeSkillDir', (log) => removeSkillDir({ config, fdeName: 'alice', slug: 'demo-skill', log, spawnImpl: failFake })],
+    ]) {
+      const warns = [];
+      const log = { warn: (m) => { warns.push(String(m)); }, error() {}, log() {} };
+      let e = null;
+      try { run(log); } catch (err) { e = err; }
+      assert.ok(e instanceof MarketError, `${what} 非 0 退出必须抛 MarketError`);
+      assert.equal(e.code, 'capability_install_failed');
+      assert.equal(e.httpStatus, 500);
+      // 1) 中文诊断不再进错误体（逐键断 undefined）
+      assert.equal(e.details.stderr, undefined, `${what}：details 不许再带 stderr 原文`);
+      assert.equal(e.details.child_error, undefined, `${what}：details 不许再带 helper 的中文诊断`);
+      // 2) 整个 details 序列化后不含汉字（挡住「换个键名把中文塞回来」）
+      assert.equal(/[一-龥]/.test(JSON.stringify(e.details)), false,
+        `${what}：错误体的 details 里不许出现汉字（helper 的自校验诊断是中文），实得 ${JSON.stringify(e.details)}`);
+      assert.equal(/[一-龥]/.test(String(e.en)), false, `${what}：英文腿也不许夹汉字，实得 ${e.en}`);
+      // 机器可读字段一个不许少（运维要靠它们区分「越界」与「盘满」，以及「第几条指令挂了」）
+      assert.equal(e.details.reason, 'helper_exit_1');
+      assert.equal(e.details.exit_code, 1);
+      assert.equal(e.details.child_code, 'EPIPE', `${what}：errno 必须原样带出来`);
+      assert.equal(e.details.child_op, 'write');
+      assert.equal(e.details.child_path, '/srv/erix/x');
+      assert.equal(e.details.child_index, 2, `${what}：不报「第几条挂了」等于没报`);
+      // 3) 信息没丢：中文原文必须落在服务端日志里（这一侧允许 `includes`，理由见文件头注）
+      assert.equal(warns.some((l) => l.includes(HELPER_ZH)), true,
+        `${what}：helper 的中文原文必须留在 log.warn 里，实得 ${JSON.stringify(warns)}`);
+      assert.equal(warns.some((l) => l.includes('helper_exit_1')), true,
+        `${what}：日志行还要能说清是哪个退出码，实得 ${JSON.stringify(warns)}`);
+    }
+  } finally {
+    fs.rmSync(userSpaceRoot, { recursive: true, force: true });
+  }
+});
