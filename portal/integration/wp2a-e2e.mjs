@@ -555,7 +555,7 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       // 平台文件/目录的权限口径来自 portal/src/materializer.js（FILE_MODE 0644 / MANIFEST_MODE 0444 /
       // ERIX_DIR_MODE 0750 / 顶层 userspace root 0755），平台文件由 root 的 portal 进程写（root:root）。
       // 以下 0755/0750/0644/0444 四条已在真机逐路径复核（现役 FDE 的树：0755 root:root 顶层、
-      // home/.erix=0750 erix:eric、ports.json/config.json/mcp.json=0644 root:root、manifest.json=0444 root:root、
+      // home/.erix=0750 erix:<fde_name>、ports.json/config.json/mcp.json=0644 root:root、manifest.json=0444 root:root、
       // ~/AGENTS.md=0644 root:root），不是照抄代码常量。
       assert.equal(mode(S.userspaceRoot), 0o0755, 'userspace 顶层根 0755（user-space §6.2）');
 
@@ -563,7 +563,7 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       // 不是「等将来改严的临时妥协」：口径已在 user-space §6.2 定稿为 0770（无 setgid），这条断言不会再改严。
       // 代码仍传 0o2770（portal/src/provisioner.js ensureUserSpaceMountDirs 与 materializer.js 的
       // WORKSPACE_DIR_MODE 都传 0o2770 给 fsutil.ensureDirSafe = mkdir → chmod → chown），但真机拿不到
-      // setgid 位、稳定停在 0770（工单 F-5 取证：现役 4 个 FDE 的 <fde>/home 全是 0770 erix:eric）。
+      // setgid 位、稳定停在 0770（工单 F-5 取证：现役 4 个 FDE 的 <fde>/home 全是 0770 erix:<fde_name>）。
       // 机制（用 portal 镜像 + compose 里那套 cap 现场复现，不是推测）：
       //   1) ensureDirSafe 的 mkdirSync(dir,{recursive:true,mode:0o2770}) 这一步**永远交不出 setgid**
       //      （探针：umask 022 → 0750；umask 0002 → 0770）——位能不能落下，全看第 2 步的 chmod；
@@ -585,7 +585,7 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       }
       // .erix 由 materializer 的 files 清单带出来（config.json/mcp.json/ports.json 的父目录），
       // 「必须存在」只对**已物化过的 FDE**成立：上面那条 waitFor 就是它的前提；从未物化的用户树上
-      // 本来就没有这一层（真机复核：<fde>/home/.erix=0750 erix:eric；少一层 home 的 `<fde>/.erix` 从来不存在，
+      // 本来就没有这一层（真机复核：<fde>/home/.erix=0750 erix:<fde_name>；少一层 home 的 `<fde>/.erix` 从来不存在，
       // 别拿它当「.erix 没生成」的证据）。0750 没有 setgid 位，也不含会被 umask 抹掉的位，所以与代码常量一致。
       assert.equal(mode(erixDir), 0o0750, '.erix 目录 0750（user-space §6.2）');
       assert.deepEqual(owner(erixDir), { uid: 1000, gid: 1000 }, '.erix 属主 erix(1000:1000)');

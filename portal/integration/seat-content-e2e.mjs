@@ -371,7 +371,7 @@ test('S6 `GET .../files/tree?path=<真实目录>`：200 且 `entries` 是数组�
 test('S7 404 同形：跨 FDE 的 sessionId 与不存在的 uuid ⇒ 两次响应体逐字节相同（不泄露存在性）',
   { skip: probe.reasons.http || false, timeout: 90_000 }, async (t) => {
     need(t, 'http', probe.cookies);
-    // 取一个「存在但不属于 eric」的会话 id：从 /api/admin/version 找另一台有会话的 FDE。
+    // 取一个「存在但不属于 <fde_name>」的会话 id：从 /api/admin/version 找另一台有会话的 FDE。
     const ver = await adminGet('/api/admin/version');
     const others = (ver.json?.fdes ?? []).map((r) => r.name).filter((n) => n && n !== FDE);
     let foreignId = null;
