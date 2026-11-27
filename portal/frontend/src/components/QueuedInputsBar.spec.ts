@@ -48,13 +48,25 @@ describe('QueuedInputsBar（#370）', () => {
     expect(wrapper.text()).toContain('容器未运行');
   });
 
-  it('blocked 的未知码不炸界面（服务端加新码是 additive，前端只少一句翻译）', async () => {
+  it('blocked 的未知码不炸界面，但**不许渲染裸键名**（#805）', async () => {
     const store = useWorkbenchStore();
     const wrapper = setup();
     store.applyQueueSnapshot({ steering: [], follow_up: [] }, 'from_the_future');
     await flushPromises();
+    // 条体本身还在（新后端加新码是 additive，不能把整块抹掉），但那一行原因必须消失：
+    // vue-i18n 缺键会把 `queued.blocked.from_the_future` 回落成**键名**，那是把内部实现当文案递给用户。
     expect(wrapper.find('[data-testid="queued-inputs-bar"]').exists()).toBe(true);
-    expect(wrapper.text()).toContain('from_the_future'); // vue-i18n 缺键回落键名，可见但不出错
+    expect(wrapper.text()).not.toContain('from_the_future');
+    expect(wrapper.text()).not.toContain('queued.blocked.');
+  });
+
+  it('#805 not_deliverable_at_terminal 有文案（本次运行被中断结束 ⇒ 队列条要说出为什么这句没发）', async () => {
+    const store = useWorkbenchStore();
+    const wrapper = setup();
+    store.applyQueueSnapshot({ steering: [], follow_up: [{ id: 'b', content: '别烧在坏 run 上' }] }, 'not_deliverable_at_terminal');
+    await flushPromises();
+    expect(wrapper.text()).toContain('这句会等下一次正常收尾再发');
+    expect(wrapper.text()).not.toContain('not_deliverable_at_terminal'); // 码本身不许露出来
   });
 
   it('点「全部取回」调 store.recallQueue；入队 POST 在途时禁用', async () => {
