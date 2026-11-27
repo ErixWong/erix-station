@@ -389,3 +389,39 @@ test('#648-B9 护栏只管「离开 active admin 集合」这个动作：非 adm
     assert.equal(last.body.error.code, 'last_admin');
   } finally { await s.close(); }
 });
+// 评审发现的口径差：`details.field` 原本按「请求里有没有 role」选，于是 `{role:'admin', status:'disabled'}`
+// 会报 `role`——可 role 根本没离开 active-admin 集合，真正在改的是 status。这三格钉的是**指对格子**。
+test('#648-B10 role 原样保留 + status 停用 ⇒ details.field 必须指 status（不是「请求里有 role」就报 role）', async () => {
+  const s = await startStack();
+  try {
+    const r = await s.patch('root', { role: 'admin', status: 'disabled' });
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error.code, 'last_admin');
+    assert.deepEqual(r.body.error.details, { field: 'status' },
+      `role 仍是 admin、没离开集合 ⇒ 触发者是 status，details.field 必须指 status：${JSON.stringify(r.body.error.details)}`);
+    assert.equal(s.user('root').status, 'active', '被挡下 ⇒ 一格都不该落库');
+  } finally { await s.close(); }
+});
+
+test('#648-B11 role 降级 + status 保持 active ⇒ details.field 必须指 role', async () => {
+  const s = await startStack();
+  try {
+    const r = await s.patch('root', { role: 'fde', status: 'active' });
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error.code, 'last_admin');
+    assert.deepEqual(r.body.error.details, { field: 'role' },
+      `只有 role 离开集合 ⇒ 必须指 role：${JSON.stringify(r.body.error.details)}`);
+  } finally { await s.close(); }
+});
+
+test('#648-B12 两格同时离开集合 ⇒ 报 role（先按主字段），且两格都没落库', async () => {
+  const s = await startStack();
+  try {
+    const r = await s.patch('root', { role: 'fde', status: 'disabled' });
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error.code, 'last_admin');
+    assert.deepEqual(r.body.error.details, { field: 'role' });
+    assert.equal(s.user('root').role, 'admin');
+    assert.equal(s.user('root').status, 'active');
+  } finally { await s.close(); }
+});

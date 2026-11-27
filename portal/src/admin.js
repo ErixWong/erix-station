@@ -536,8 +536,12 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   //   判定与写入共用同一语句快照，不留下跨往返的窗口。
   //   `users.role`/`users.status` 在 UPDATE 的 WHERE 里看到的是**改前值**（PG 语义），子查询里那个同名表
   //   同理——所以子查询必须 `id <> users.id` 把目标行本身排掉，否则“它自己”会被当成“还有别人”。
-  const leavesActiveAdminSet = (Object.hasOwn(updates, 'role') && updates.role !== 'admin')
-    || (Object.hasOwn(updates, 'status') && updates.status !== 'active');
+  // 两个触发条件**分开留名**：错误里的 `details.field` 必须指到**真正在改的那一格**
+  // （`docs/api/portal.md` PATCH 用户端点写的就是这个口径）。只看「请求里有没有 role」会指错：
+  // `{role:'admin', status:'disabled'}` 里 role 根本没离开集合，触发者是 status。
+  const leavesByRole = Object.hasOwn(updates, 'role') && updates.role !== 'admin';
+  const leavesByStatus = Object.hasOwn(updates, 'status') && updates.status !== 'active';
+  const leavesActiveAdminSet = leavesByRole || leavesByStatus;
   const lastAdminGuard = leavesActiveAdminSet && confirmLastAdmin !== true
     ? `AND (users.role <> 'admin' OR users.status <> 'active'
             OR EXISTS (SELECT 1 FROM users last_admin_guard
@@ -603,7 +607,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
           '这是最后一名 active 管理员，降级或停用后无人在管理台（确认请带 confirm_last_admin: true）',
           { en: 'this is the last active administrator, so demoting or disabling the account would leave no one in the admin console (send confirm_last_admin: true to override)',
             httpStatus: 409,
-            details: { field: Object.hasOwn(updates, 'role') ? 'role' : 'status' } });
+            details: { field: leavesByRole ? 'role' : 'status' } });
       }
     }
     throw new AdminError('not_found', '用户不存在', { en: 'user does not exist', httpStatus: 404 });
