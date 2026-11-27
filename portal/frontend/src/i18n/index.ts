@@ -13,7 +13,7 @@
 // key 类型：locales/zh-CN.ts 的 MessageSchema 经 vue-i18n 泛型 + DefineLocaleMessage 注入（见 types.d.ts）。
 
 import { createI18n } from 'vue-i18n';
-import { readLocaleCookie, writeLocaleCookie } from '../lib/localeCookie';
+import { readLocaleCookie, writeLocaleCookie, readLocaleChosenCookie, writeLocaleChosenCookie } from '../lib/localeCookie';
 import { zhCN, type MessageSchema } from './locales/zh-CN';
 import { en } from './locales/en';
 
@@ -34,6 +34,9 @@ export const LOCALE_STORAGE_KEY = 'locale';
  * 而账号种子初次登录时也会走 `setLocale` ⇒ 载体里很快就有了值，「载体里有没有值」从此恒真，
  * 没法区分「用户选的」和「账号灌进来的」。这个标记**只在用户亲自点开关时**立（见 `setLocale` 的
  * `fromUser`），账号种子不立它 ⇒ 「要不要跟随账号默认语言」的判据才不会被种子自己污染。
+ *
+ * ⚠ #902 ①：这里只是 localStorage 那一份标记；`setLocale` 的 `fromUser` 还会**同时**写一个跨子域
+ * 的 `locale_chosen` cookie（见 `lib/localeCookie`）。判据 `hasUserChosenLocale` 读两者的「或」。
  */
 export const LOCALE_USER_CHOSEN_KEY = 'locale.userChosen';
 
@@ -70,16 +73,26 @@ export function hasLocalLocalePreference(): boolean {
 }
 
 /**
- * 这台浏览器上用户是否**亲自点过**语言开关（只读 `locale.userChosen` 标记，载体里有值不算）。
+ * 这台浏览器上用户是否**亲自点过**语言开关（载体里有值不算，只认 `locale.userChosen` 标记）。
  *
  * 这是「要不要跟随账号默认语言」的唯一判据（见 `stores/auth` 的 `applyAccountLocale`）：
  * - **没点过** ⇒ 账号默认语言变了会跟随（含初次登录灌种子、以及用户后来在别处改了账号默认语言）；
  * - **点过** ⇒ 本地说话，账号值不再抢（这台浏览器是用户自己定的语言，账号值只是初次见面的种子）；
  * - **清了站点数据** ⇒ 标记随载体一起没了 ⇒ 回到「新设备」= 账号值重新生效。
  *
- * 隐私模式/禁用存储 ⇒ 静默返回 false（标记立不起来，退化成「每次都像新设备」，账号种子仍可用）。
+ * #902 ①：判据取 **cookie 或 localStorage 任一为真**，因为「点过开关」这个事实必须与 `locale` 偏好
+ * **同作用域**：`locale` cookie 是 `Domain=父域`、两个子域共享的那一份，而 localStorage 按 origin
+ * 各存一份。若标记只落 localStorage，在管理台点了 English、到用户面 origin 读不到标记 ⇒ 账号值
+ * 盖掉那份**共享** cookie ⇒ 回到管理台又变回账号语言。所以 `setLocale(fromUser)` 除了写这份
+ * localStorage 标记，还会写一个同样 `Domain=父域` 的 `locale_chosen` cookie（见 `lib/localeCookie`），
+ * 两边任一有都算「点过」。
+ *
+ * 隐私模式/禁用存储 ⇒ 两边都立不起来 ⇒ 静默返回 false（退化成「每次都像新设备」，账号种子仍可用）。
+ * 「清站点数据 ⇒ 回到新设备」这条仍成立：cookie 与 localStorage 一起被清 ⇒ 两个判据同时落空。
  */
 export function hasUserChosenLocale(): boolean {
+  // cookie 那份跨子域可见（#902 ① 的主体）；两个来源各自静默，任一为真即算「点过」。
+  if (readLocaleChosenCookie()) return true;
   try {
     return localStorage.getItem(LOCALE_USER_CHOSEN_KEY) === '1';
   } catch {
@@ -140,12 +153,21 @@ export function setLocale(locale: AppLocale, opts?: { fromUser?: boolean }): voi
     /* 禁用 cookie：退化成只有 localStorage（同一会话内仍生效） */
   }
   // #828：只有用户亲自点开关才立「这台浏览器用户表过态」的标记；账号种子不立（否则种子会把自己
-  // 当成用户的选择，导致此后账号默认语言变化永不生效）。写失败静默，退化成「像新设备」。
+  // 当成用户的选择，导致此后账号默认语言变化永不生效）。
+  // #902 ①：标记必须与 `locale` 偏好**同作用域**——除了 localStorage 那份，还写一个同样 Domain=父域
+  // 的 `locale_chosen` cookie（两个 origin 都看得见）。否则「点过开关 ⇒ 账号不再抢」只在点开关那个
+  // host 成立，切到另一个 origin 就丢标记、被账号值盖掉共享 cookie。两边写入各自独立 try/catch：
+  // 任一写不进只影响持久化，不影响本次切换生效；都写不进就退化成「像新设备」（判据不变）。
   if (opts?.fromUser === true) {
     try {
       localStorage.setItem(LOCALE_USER_CHOSEN_KEY, '1');
     } catch {
-      /* 隐私模式/禁用存储：标记立不起来，下次仍按「没点过」跟随账号值 */
+      /* 隐私模式/禁用存储：localStorage 那份标记立不起来 */
+    }
+    try {
+      writeLocaleChosenCookie();
+    } catch {
+      /* 禁用 cookie：退化成只有 localStorage 那份标记（同一 origin 内仍生效） */
     }
   }
 }
