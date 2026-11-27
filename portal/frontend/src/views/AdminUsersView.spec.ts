@@ -486,3 +486,165 @@ describe('AdminUsersView「默认语言」三档（mount + fetch 桩，#828）',
     setLocale('zh-CN');
   });
 });
+
+// ── issue #817：用户表列简化 + 版式总则（断言只认 DOM，不用 w.emitted）────────────────────
+// 列序账（#817 只改语义与样式，**列序与下标一个没动**，下一个人别照旧文案猜下标）：
+//   0 登录名 / 1 显示名 / 2 角色 / 3 默认语言 / 4 FDE / 5 MFA / 6 状态 / 7 工位（原「开户 / 下线」）
+//   / 8 周期·用量 / 9 最后活动 / 10 操作。共 11 列。
+describe('issue #817：工位列四态一行 + 状态形状 + 动作图标 + 版式', () => {
+  // `enableAutoUnmount` 上面那个 describe 己经开过（同一个文件里调两次会直接报错），这里只补自己的副作用。
+  beforeEach(() => { setActivePinia(createPinia()); });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  const json = (status: number, body: unknown): Response =>
+    new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+
+  const mkSeatUser = (login: string, over: Record<string, unknown> = {}): AdminUser => ({
+    id: `u-${login}`, login, display_name: login, email: null, mail_otp_enabled: false,
+    totp_login_enabled: true, file_upload_enabled: false,
+    role: 'fde', fde_name: `${login}-fde`, status: 'active', totp_enabled: false,
+    last_login_at: null, last_activity_at: null, onboarding: null, offboarding: null,
+    ...over,
+  } as unknown as AdminUser);
+
+  async function mountSeat(users: AdminUser[]) {
+    setLocale('zh-CN');
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    void useAdminStore();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url === '/api/admin/users') return json(200, { items: users });
+      return json(200, { items: [] });
+    }));
+    const w = mount(AdminUsersView, {
+      global: {
+        plugins: [pinia, i18n],
+        stubs: { RouterLink: { template: '<a><slot /></a>' }, 'router-link': { template: '<a><slot /></a>' } },
+      },
+    });
+    await flushPromises();
+    return w;
+  }
+
+  /** 第 7 格（工位）本体。 */
+  const seatCellOf = (w: Awaited<ReturnType<typeof mountSeat>>, row = 0) =>
+    w.findAll('[data-test="user-row"]')[row].findAll('td')[7];
+
+  it('① 工位列四态各一格：— / 就绪 / 已下线 / 下线中，且每格只有一行文本', async () => {
+    const w = await mountSeat([
+      mkSeatUser('fresh'),
+      mkSeatUser('ready', { onboarding: { state: 'done', step: null, error: null } }),
+      mkSeatUser('gone', { offboarding: { state: 'done', step: null, error: null, workspace_purge_after: null } }),
+      mkSeatUser('leaving', { offboarding: { state: 'pending', step: null, error: null, workspace_purge_after: null } }),
+    ]);
+    const cells = [0, 1, 2, 3].map((i) => seatCellOf(w, i));
+    expect(cells.map((c) => c.text())).toEqual(['—', '就绪', '已下线', '下线中']);
+    // 「每格只有一行」是这一列的核心判据：旧形态是 onboarding 一行 + offboarding 一行 + 保留中一行。
+    // 只断言 `text()` 不含 \n 不够（VTU 会把文本压平），所以同时读**真实 DOM 的 textContent**。
+    for (const [i, cell] of cells.entries()) {
+      expect(cell.text(), `第 ${i} 格出现换行`).not.toContain('\n');
+      expect(cell.element.textContent ?? '', `第 ${i} 格 DOM 文本出现换行`).not.toContain('\n');
+      expect(cell.element.querySelectorAll('div').length, `第 ${i} 格不许再叠多个块`).toBe(1);
+    }
+    // 颜色档：默认态淡、已下线黑（异常才值得读）
+    expect(seatCellOf(w, 1).html()).toContain('text-black/45');
+    expect(seatCellOf(w, 2).find('[data-test="offboarding-status"]').attributes('class')).toContain('text-black');
+  });
+
+  it('② 「workspace 保留中」不再出现在可见文本里，但在 :title 里', async () => {
+    const w = await mountSeat([
+      mkSeatUser('gone', {
+        offboarding: { state: 'done', step: null, error: null, workspace_purge_after: '2026-12-01T00:00:00.000Z' },
+      }),
+    ]);
+    const cell = seatCellOf(w);
+    expect(cell.text()).toBe('已下线');
+    expect(cell.text()).not.toContain('workspace');
+    expect(cell.text()).not.toContain('保留中');
+    expect(w.find('[data-test="user-row"]').text(), '整行都不得把清理排期印成常驻文案').not.toContain('workspace 保留中');
+    const title = cell.find('[data-test="offboarding-status"]').attributes('title') ?? '';
+    expect(title).toContain('工位 gone-fde');
+    expect(title).toContain('已下线');
+    expect(title).toContain('workspace 保留中');
+  });
+
+  it('③ 状态列用形状区分：✓ 活跃 / ◌ 已停用 / ⊘ 待凭据（且活跃仍是 green-700）', async () => {
+    const w = await mountSeat([
+      mkSeatUser('on'),
+      mkSeatUser('off', { status: 'disabled' }),
+      mkSeatUser('pending', { status: 'awaiting_credential' }),
+    ]);
+    const statusCol = (row: number) => w.findAll('[data-test="user-row"]')[row].findAll('td')[6];
+    expect(statusCol(0).text()).toContain('✓');
+    expect(statusCol(0).text()).toContain('活跃');
+    expect(statusCol(0).text(), '装饰点已退场').not.toMatch(/[●○]/);
+    // 绿色是**合法取值**（活跃就是绿），不许靠加深补语义 ⇒ 档位必须还是 green-700。
+    expect(statusCol(0).html()).toContain('text-green-700');
+    expect(statusCol(1).text()).toContain('◌');
+    expect(statusCol(2).text()).toContain('⊘');
+    expect(statusCol(2).text()).toContain('等待凭据');
+  });
+
+  it('④ 动作列：会话/文件与编辑有 <svg> 且有文字，启用/停用是纯文字', async () => {
+    const w = await mountSeat([mkSeatUser('alice'), mkSeatUser('nobody', { fde_name: null })]);
+    const link = w.findAll('[data-test="user-row"]')[0].find('[data-test="seat-content-link"]');
+    expect(link.exists()).toBe(true);
+    expect(link.find('svg').exists(), '图标化 = 图标 + 短词').toBe(true);
+    expect(link.find('svg').attributes('data-icon')).toBe('folder');
+    expect(link.text()).toContain('会话/文件'); // 文字没被图标换掉
+    const edit = w.findAll('[data-test="user-row"]')[0].find('[data-test="edit-user"]');
+    expect(edit.find('svg').exists()).toBe(true);
+    expect(edit.find('svg').attributes('data-icon')).toBe('pencil');
+    expect(edit.text()).toContain('编辑');
+    const toggle = w.findAll('[data-test="user-row"]')[0].find('[data-test="toggle-user-status"]');
+    expect(toggle.exists()).toBe(true);
+    expect(toggle.find('svg').exists(), '唯一的危险动作保持纯文字').toBe(false);
+    expect(toggle.text()).toContain('停用');
+    // 没有工位的人没有「会话/文件」入口（#727 的既有口径，别在图标化时顺手丢掉）
+    expect(w.findAll('[data-test="user-row"]')[1].find('[data-test="seat-content-link"]').exists()).toBe(false);
+  });
+
+  it('⑤ 版式：容器 overflow-x-auto、table 有 min-width、登录名等宽、列宽总和仍是 100', async () => {
+    const w = await mountSeat([mkSeatUser('alice')]);
+    const scroller = w.find('[data-test="user-table-scroll"]');
+    expect(scroller.exists(), '横向滚动容器没了').toBe(true);
+    expect(scroller.attributes('class')).toContain('overflow-x-auto');
+    const table = w.find('[data-test="user-table"]');
+    expect(table.attributes('style') ?? '', 'table 的 min-width 没了 ⇒ 窄屏会拆行而不是横滚')
+      .toMatch(/min-width:\s*1150px/);
+    expect(w.findAll('[data-test="user-row"]')[0].findAll('td')[0].attributes('class'))
+      .toContain('font-mono'); // 登录名是机器标识符
+    expect(w.find('[data-test="user-row"]').findAll('td')[2].attributes('class') ?? '')
+      .not.toContain('font-mono'); // 角色是分类，继续比例字体
+    // 全表单行：规则必须真的钉在 th/td 上（只写容器会被 .truncate 之类盖回去）
+    const styleBlock = /<style scoped>([\s\S]*?)<\/style>/.exec(adminUsersViewSource)?.[1] ?? '';
+    expect(styleBlock, '找不到版式 <style> 块').not.toBe('');
+    expect(styleBlock).toMatch(/\.user-table-scroll\s+th,\s*\.user-table-scroll\s+td\s*\{[^}]*white-space:\s*nowrap/);
+    expect(styleBlock.replace(/\/\*[\s\S]*?\*\//g, ''), '红线：不许用「允许切词」补窄列')
+      .not.toMatch(/overflow-wrap|word-break/);
+    // 列宽账：11 个 col，总和必须 = 100
+    const widths = [...adminUsersViewSource.matchAll(/<col class="w-\[(\d+)%\]">/g)].map((m) => Number(m[1]));
+    expect(widths).toHaveLength(11);
+    expect(widths.reduce((a, b) => a + b, 0)).toBe(100);
+  });
+
+  it('⑥ failed 态的两个重试按钮仍在同一格内（图标化 / 单行化不许把它们弄丢）', async () => {
+    const w = await mountSeat([
+      mkSeatUser('ib', { onboarding: { state: 'failed', step: null, error: 'Docker unavailable' } }),
+      mkSeatUser('ob', {
+        status: 'disabled',
+        offboarding: { state: 'failed', step: 'stop-container', error: 'Docker unavailable', workspace_purge_after: null },
+      }),
+    ]);
+    const ib = seatCellOf(w, 0);
+    expect(ib.find('[data-test="retry-onboarding"]').exists()).toBe(true);
+    expect(ib.text()).toContain('失败');
+    expect(ib.find('[data-test="onboarding-status"]').attributes('title')).toBe('Docker unavailable');
+    const ob = seatCellOf(w, 1);
+    expect(ob.find('[data-test="retry-offboarding"]').exists()).toBe(true);
+    expect(ob.text()).toContain('下线失败');
+    expect(ob.text()).toContain('停止 FDE 容器'); // 失败步骤仍是可见文本（不是只藏在 hover）
+    expect(ob.find('[data-test="offboarding-status"]').attributes('title')).toBe('Docker unavailable');
+  });
+});

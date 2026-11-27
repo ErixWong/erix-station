@@ -41,3 +41,15 @@ describe('AppIcon（#818 自维护内联 SVG）', () => {
     }
   });
 });
+
+describe('#817 步 3：表格动作列复用的两个图标（folder / pencil）', () => {
+  // 只钉「有几何、能渲染」这一条：形状好不好看是视觉判据（真机 e2e 看），这里防的是**漏键**——
+  // 漏了不抛（`AppIcon` 渲染空 svg），于是按钮会退化成「只有文字 + 一个看不见的坑」而 CI 全绿。
+  for (const name of ['folder', 'pencil']) {
+    it(`${name}：表里有几何，渲染出 <path>`, () => {
+      expect(ICON_PATHS[name], `ICON_PATHS 缺 ${name}`).toBeDefined();
+      const wrapper = mount(AppIcon, { props: { name } });
+      expect(wrapper.findAll('path').length).toBeGreaterThan(0);
+    });
+  }
+});
