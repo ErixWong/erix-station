@@ -86,6 +86,48 @@ export function createPartialBuffer({
   const entries = new Map();
   /** 逐出「仍在流的 run」的次数（`stats()` 暴露；「不许静默逐出」这条口径靠它可观测）。 */
   let evictedActive = 0;
+  /**
+   * issue #545：**哪些 runId 曾被以「活跃态」逐出过**（有界集合，上限 = `maxEntries`，超了按插入序丢最老）。
+   *
+   * 为什么只有计数不够：被逐出的 run 若继续吐字，槽位会被后续碎片**重建成一个 blank entry**，
+   * 于是终态写出的 `partial_text` 是**一段从中间起笔的尾巴**（`round`/`roundSeq` 掉成 `null`、
+   * `chunks` 从 0 重数），而界面上**没有任何标记说明它是尾巴** ⇒ 用户把半截当全文。
+   * 缺字段是中性占位（§4.4a-1 判据 3），**尾巴冒充整段比缺字段更坑** ⇒ 这里把「这个 run 断过」
+   * 这件事记下来，新建槽时打上 `tailOnly`，终态那半截宁可不写。
+   *
+   * ⚠ **必须有界**：它的生命周期比 entry 长（entry 已被逐掉，集合还在记），长跑的 portal 会一直往里
+   * 追加 ⇒ 上限取 `maxEntries`（与槽位数同阶，几十字节量级），超出丢最老那条（代价 = 那条 run 的
+   * 尾巴重新变成「看着像整段」，与改前一致，不会更糟）。
+   * ⚠ **不许改逐出策略**：`observe()` 与 `stage().commit()` 都是 `while (entries.size >= maxEntries) evictOne();`
+   * ⇒ 「活跃 run 一条都逐不掉」就是死循环（issue #545 实测 `rc=124` 挂死）。本处只**记账**，不动逐出。
+   */
+  const tailOnlyRuns = new Set();
+
+  /** 记下一个被以活跃态逐出的 runId（有界：超过 `maxEntries` 就按插入序丢最老）。 */
+  function noteTailOnly(runId) {
+    if (typeof runId !== 'string' || runId === '') return;
+    tailOnlyRuns.delete(runId); // 重新插入 ⇒ 刷新位置（`Set` 的迭代序就是插入序）
+    tailOnlyRuns.add(runId);
+    while (tailOnlyRuns.size > maxEntries) {
+      const oldest = tailOnlyRuns.keys().next();
+      if (oldest.done) break;
+      tailOnlyRuns.delete(oldest.value);
+    }
+  }
+
+  /** 该 run 终结/丢弃 ⇒ 这条尾巴再也不会被写进任何 `run_end` ⇒ 记账可以还掉。 */
+  function forgetTailOnly(runId) { tailOnlyRuns.delete(runId); }
+
+  /**
+   * 新建槽。**唯一的 `blank()` 入口**（`observe()` 与 `stage().observe()` 都走这里）：
+   * 只改 `observe()` 会漏掉真实写路径 —— `internal.js` 的 U3 写入侧用的是 `stage()`。
+   * 曾被活跃态逐出过 ⇒ 这个槽从中间起笔，打上 `tailOnly`（口径见 `runEndPartialKeys`）。
+   */
+  function newEntry(runId, sessionId) {
+    const e = blank(sessionId);
+    if (tailOnlyRuns.has(runId)) e.tailOnly = true;
+    return e;
+  }
 
   const blank = (sessionId) => ({
     sessionId: sessionId ?? null,
@@ -104,6 +146,11 @@ export function createPartialBuffer({
     // 新段也从 0 起 ⇒ 它当代际信号就是一只漏气的那把尺（旧段 5 片、新段 2 片 ⇒ 前端会拿新帧
     // 当「更旧的快照」丢掉）。本字段**只加不改**：`chunks` / `roundSeq` / `truncated` 的语义一字未动。
     textSegment: 0,
+    // issue #545：**这个槽是不是「从中间起笔的尾巴」**。true = 本槽之前的正文在一次活跃态逐出里
+    // 永久丢了，这里只有后半截 ⇒ 终态**不许**把它当整段写进 `run_end.partial_text`（宁缺毋伪）。
+    // 默认 `false`（`view()` 里也照旧给 `false`，不新增「键缺席」那种第二语义）；
+    // 清掉它的唯一正常路径是观测到一条 `round_start`（见 `applyTo` 里那条注记）。
+    tailOnly: false,
     counters: new Map(), // attempt → 已观测的最大 `client_event_id` 计数（at-least-once 去重）
     terminal: false,
   });
@@ -199,6 +246,10 @@ export function createPartialBuffer({
       entry.truncatedByCap = false;
       entry.textTruncated = false;
       entry.textSegment += 1;  // 正文段边界（另一个 +1 点在 `closeRoundText`）
+      // issue #545：`round_start` 一到，**这一轮的开头我们就已经拿到了**（它是事实档、自带 seq，
+      // 且 `round_end` 的终稿本来就在库里）⇒ 此后的正文是完整一段，不再是尾巴，取消 `tailOnly`。
+      // 不清就会把一个「被逐出后又跑了三轮」的 run 的正常正文也一起判死（过度收紧 = 白白少一段）。
+      entry.tailOnly = false;
     } else {
       const payload = ev.payload && typeof ev.payload === 'object' ? ev.payload : {};
       // `assistant_delta` 与 `reasoning_delta` 的载荷键都由 runner 固定为 `text`
@@ -234,6 +285,7 @@ export function createPartialBuffer({
     entries.delete(victim);
     if (wasActive) {
       evictedActive += 1;
+      noteTailOnly(victim); // issue #545：只记账，不改逐出策略（见 `tailOnlyRuns` 那条注记的死循环红线）
       try {
         const warn = log && typeof log.warn === 'function' ? log.warn.bind(log) : console.warn;
         warn(`[run-partial-buffer] LRU 上界 ${maxEntries} 已满 ⇒ 逐出仍在流的 run ${victim}`
@@ -255,6 +307,8 @@ export function createPartialBuffer({
     textSegment: entry.textSegment,
     sessionId: entry.sessionId,
     terminal: entry.terminal === true,
+    // issue #545（additive）：这个槽是不是被逐出后重建的尾巴。`false` 时照旧给 `false`（不给缺席）。
+    tailOnly: entry.tailOnly === true,
   });
 
   /**
@@ -267,7 +321,7 @@ export function createPartialBuffer({
     let entry = entries.get(runId);
     if (!entry) {
       while (entries.size >= maxEntries) evictOne();
-      entry = blank(ev.session_id);
+      entry = newEntry(runId, ev.session_id);
       entries.set(runId, entry);
     } else {
       touch(runId, entry);
@@ -301,7 +355,7 @@ export function createPartialBuffer({
         let entry = known;
         if (entry === undefined) {
           const live = entries.get(runId);
-          entry = live ? clone(live) : blank(ev.session_id);
+          entry = live ? clone(live) : newEntry(runId, ev.session_id);
         }
         staged.set(runId, entry);
         return applyTo(entry, runId, ev);
@@ -338,7 +392,7 @@ export function createPartialBuffer({
       /** COMMIT 成功后调用：把暂存的变更并进真相。 */
       commit() {
         for (const [runId, entry] of staged) {
-          if (entry === DROPPED) { entries.delete(runId); continue; }
+          if (entry === DROPPED) { entries.delete(runId); forgetTailOnly(runId); continue; }
           while (entries.size >= maxEntries && !entries.has(runId)) evictOne();
           touch(runId, entry);
         }
@@ -349,6 +403,7 @@ export function createPartialBuffer({
 
   /** 主动丢弃（测试 / 「这段已经不再需要」）。返回是否真删了东西。 */
   function drop(runId) {
+    forgetTailOnly(runId); // #545：这段正文再也不会落库 ⇒ 记账没留着的理由
     return entries.delete(runId);
   }
 
@@ -366,6 +421,7 @@ export function createPartialBuffer({
 
   /** 标终态：LRU 优先逐它（`internal.js` 的终态点在 **COMMIT 之后**调）。 */
   function markTerminal(runId) {
+    forgetTailOnly(runId); // #545：已终结的 run 不再需要「它是尾巴」这个判据，别长期攥着（集合有界，但仍要主动还）
     const e = entries.get(runId);
     if (!e) return false;
     e.terminal = true;
@@ -377,6 +433,7 @@ export function createPartialBuffer({
   function clear() {
     const n = entries.size;
     entries.clear();
+    tailOnlyRuns.clear(); // #545：「模拟 portal 重启」= 内存全清，尾巴记账也一样
     return n;
   }
 
@@ -400,7 +457,11 @@ export function createPartialBuffer({
     clear,
     sessionRuns,
     size: () => entries.size,
-    stats: () => ({ size: entries.size, maxEntries, textCap, maxCounters, evictedActive }),
+    // `tailOnlyRuns`（#545 的尾巴记账集合）随 `size` 一起暴露，让「这个集合有没有失控」可观测；
+    // 对外读数面 `/healthz` 仍只映射 `entries/maxEntries/evictedActive` 三个整数（`http.js#partialBufferHealth`）。
+    stats: () => ({
+      size: entries.size, maxEntries, textCap, maxCounters, evictedActive, tailOnlyRuns: tailOnlyRuns.size,
+    }),
   };
 }
 

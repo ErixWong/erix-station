@@ -822,6 +822,11 @@ async function terminalPayloadMatches(pool, run, body) {
  *     `transcript_rounds`/投影里，再落一份就是「两份正文」（#300 头号坑：重复正文）。
  *   * 缓冲里没有正文（`text === ''`）⇒ **不加键** ⇒ `run_end` 的 payload 与今天**逐字相同**
  *     （被停在 `sleep` 上的 run 本来就无正文可给，也不许凭空多两个键）。
+ *   * issue #545：**尾巴宁缺毋伪**——`snap.tailOnly === true`（该 run 曾被以活跃态逐出过，槽位已被
+ *     后续碎片重建成 blank entry）⇒ **也返回空对象**。理由：那条尾巴是从中间起笔的半句，
+ *     而**尾巴比缺字段更坑**：缺字段 ⇒ 历史投影走 §4.4a-1 判据 3 的中性占位（「那段没了」），
+ *     而有 `partial_text` ⇒ 投影**不出**占位项 ⇒ 用户把半截当全文（且 `roundSeq: null` 会让补发
+ *     判据整帧丢弃，重连也补不回来）。宁可少一段，不可假一段。
  *   * `reasoning` **不落库**：它没有「成型副本在别处」的那条对账（碎片档定义），且界面不展示它；
  *     落库只会让 `run_end` 变成一个没人读的胖子。
  *   * **同事务**（与 `run_end` 的 INSERT 同一份 payload、同一次 INSERT）：拆两个事务就出现
@@ -838,6 +843,9 @@ export function runEndPartialKeys(runId, {
   if (hasAssistantAnchor) return {}; // 有锚点 ⇒ 一份正文就够，绝不再落第二份
   const snap = buffer.snapshot(runId);
   if (!snap || snap.text === '') return {}; // 空正文没什么可说的（也不写空键）
+  // issue #545（宁缺毋伪）：被逐出后重建的槽只有**半句尾巴** ⇒ 三个键一个都不写，
+  // 让本行 payload 逐字回到「无正文」那条既有中性占位路径（删掉这一行 ⇒ 尾巴又开始冒充整段）。
+  if (snap.tailOnly === true) return {};
   return {
     partial_text: snap.text,
     partial_round: Number.isFinite(Number(snap.round)) ? Number(snap.round) : 0,
