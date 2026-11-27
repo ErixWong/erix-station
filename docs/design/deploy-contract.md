@@ -49,6 +49,28 @@
 
 ---
 
+### 1.1 本文短名 ↔ compose 实名（一次性登记，#777 D3）
+
+> 本文通篇用**短名**讲服务（`portal` / `traefik` / `db` / `litellm` / `agentd` / `docker-proxy`），而
+> `deploy/docker-compose.yml` 里的**服务名与容器名是 `station-*` 实名**。全文改名会把 prose 搅烂且 diff 读不出改了什么
+> ⇒ 只在这里登记一次。**改名对不是等价互换**：服务间 DNS 解析只认 compose 服务名（下表右列）。
+>
+> 现验判据（261128）：`node -e "const Y=require('yaml'),f=require('fs');console.log(Object.keys(Y.parse(f.readFileSync('deploy/docker-compose.yml','utf8')).services))"`
+> ⇒ `station-db` / `station-docker-proxy` / `station-portal` / `station-litellm` / `station-edge`（**五个服务**，`backend` 是网络不是服务；
+> `station-litellm` 在 `litellm` profile 后面，默认不起）。FDE 容器不在 compose 里（§6）。
+
+| 本文短名 | compose 服务名 / 容器名 | compose 里的位置 | 备注 |
+|---|---|---|---|
+| `portal` | `station-portal` | `deploy/docker-compose.yml:115` | 容器名由 `STATION_PORTAL_NAME` 插值（缺省即实名，⇒ env.md §10.6 类 A） |
+| `db` / `station-db` | `station-db` | `:16` | 服务间解析靠服务名（portal 的 `DATABASE_URL` 指 `station-db:5432`） |
+| `traefik` / `edge` | `station-edge` | `:387` | `network_mode: host`，不接任何 docker 网络 |
+| `docker-proxy` | `station-docker-proxy` | `:61` | portal 经 `tcp://station-docker-proxy:2375` 访问 |
+| `litellm` | `station-litellm` | `:341` | `profiles: [litellm]`，`up -d` 不带 profile 时不存在 |
+| `agentd` | **不在 compose** | —（FDE 容器主进程） | 由 portal 经 Docker API 创建（§6），容器名 `fde-<name>` |
+
+> **另记一条不复现的账（#777 批 D 现验）**：有文档说 compose 里有个 `kkfileview` 服务而文档未提。
+> 现验：`grep -rn kkfileview docs deploy` ⇒ **零命中**（compose 没有该服务，文档也没有它）⇒ 不登记不删除，只在此记账。
+
 ## 2. compose 契约（network / publish / volume / depends_on / healthcheck / env_file）
 
 > 本节给出 P1 核心 compose 服务与开发期 helper 的字段级契约，并补充 issue #117 的可选 `station-litellm` profile；`deploy/docker-compose.yml` 按此生成。FDE 容器**不在 compose 内**（由 portal 经 Docker API 动态创建，§6）。
@@ -67,13 +89,17 @@
 
 | 服务 | network | publish | volumes（宿主源 → 容器目标，权限） | depends_on | healthcheck | env_file |
 |---|---|---|---|---|---|---|
-| `station-db` | `backend` | **无**（仅 backend 内可达） | `/docker/station-db/` → `/var/lib/postgresql/data`（RW，属主由 postgres 镜像初始化） | — | `pg_isready`（见下） | `/docker/station-db/.env.db`（600） |
-| `station-portal` | `backend` | **`127.0.0.1:8080:8080`**（回环，供 Traefik 反代 + forwardAuth） | ① 用户空间 `${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}` → `/srv/erix/users`（RW，**同路径**，materializer 直写用户空间，user-space §2.2）；② 动态配置 `${TRAEFIK_DYNAMIC_DIR_HOST:-./traefik/dynamic}` → `/etc/traefik/dynamic`（RW，**单一写方**，reconciler 写 Traefik 动态配置；生产宿主目录为 `/docker/station-edge/dynamic/`，开发期默认仓库相对目录）；③ `/docker/station-edge/firewall/` → `/docker/station-edge/firewall/`（RW，600，reconciler 写 `rules.v4`，WP2b 接入防火墙时启用）；④ run 终态产物 `${ERIX_ARTIFACTS_ROOT_HOST:-/srv/erix/artifacts}` → `/srv/erix/artifacts`（RW，issue #64 R1：agentd 经 internal API 上传的 worktree bundle tar.gz 落盘处，runner-integration §6.6）。**不挂整个 `/docker/station-edge`**（Traefik 静态配置 / `acme.json` / `logs/` 不挂给 portal）。portal 业务状态在 DB；唯一持久卷 = 产物卷 ④（文件产物不进 DB 大对象） | `station-db`（`condition: service_healthy`）+ `station-docker-proxy`（`condition: service_started`） | `station-portal healthcheck`（见下） | `/docker/station-portal/.env.portal`（600） |
-| `station-litellm` | `backend` | **`127.0.0.1:4100:4000`**（loopback；迁移期临时端口） | `./litellm/config.yaml` → `/app/config.yaml`（RO） | `station-db`（`condition: service_healthy`） | `GET /health/readiness`（见下） | `LITELLM_MASTER_KEY` / `LITELLM_SALT_KEY` / `DATABASE_URL`（deploy/.env 600） |
+| `station-db` | `backend` | **无**（仅 backend 内可达） | `${STATION_DB_DIR:-/docker/station-db}/` → `/var/lib/postgresql/data`（RW，属主由 postgres 镜像初始化）；**首次初始化还要三条 ro 挂载**（compose 实测共 5 条）：`./db-init/00-init.sh`、`./db-init/01-litellm.sh` → `/docker-entrypoint-initdb.d/`，`../docs/data/schema.sql` + `../docs/data/bootstrap.sql` → `/init-sql/`（⇒ §3.1：baseline 与 bootstrap 的**文件来源就是仓库里的这两份**） | — | `pg_isready`（见下） | `/docker/station-db/.env.db`（600）——**未落地**，见本节末「env_file 列的口径」 |
+| `station-portal` | `backend` | **`127.0.0.1:${PORTAL_HOST_PORT:-18080}:8080`**（回环，供 Traefik 反代 + forwardAuth；宿主端口是变量，开发期缺省 18080，⇒ env.md §0/§10） | ① 用户空间 `${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}` → `/srv/erix/users`（RW，**同路径**，materializer 直写用户空间，user-space §2.2）；② 动态配置 `${TRAEFIK_DYNAMIC_DIR_HOST:-./traefik/dynamic}` → `/etc/traefik/dynamic`（RW，**单一写方**，reconciler 写 Traefik 动态配置；生产宿主目录为 `/docker/station-edge/dynamic/`，开发期默认仓库相对目录）；③ `/docker/station-edge/firewall/` → `/docker/station-edge/firewall/`（RW，600，reconciler 写 `rules.v4`，WP2b 接入防火墙时启用；⚠ **compose 现在没有这一条挂载**，现读只有 ①②④ 三条 ⇒ 防火墙面未落地，同 env.md §10.7 类 II）；④ run 终态产物 `${ERIX_ARTIFACTS_ROOT_HOST:-/srv/erix/artifacts}` → `/srv/erix/artifacts`（RW，issue #64 R1：agentd 经 internal API 上传的 worktree bundle tar.gz 落盘处，runner-integration §6.6）。**不挂整个 `/docker/station-edge`**（Traefik 静态配置 / `acme.json` / `logs/` 不挂给 portal）。portal 业务状态在 DB；唯一持久卷 = 产物卷 ④（文件产物不进 DB 大对象） | `station-db`（`condition: service_healthy`）+ `station-docker-proxy`（`condition: service_started`） | `station-portal healthcheck`（见下） | `/docker/station-portal/.env.portal`（600） |
+| `station-litellm` | `backend` | **`127.0.0.1:4100:4000`**（loopback；迁移期临时端口） | `./litellm/config.yaml` → `/app/config.yaml`（RO） | `station-db`（`condition: service_healthy`） | `GET /health/readiness`（见下） | `LITELLM_MASTER_KEY` / `LITELLM_SALT_KEY` / `DATABASE_URL`（deploy/.env 600）——**实现走 compose `environment:` 直接插值，不是 `env_file:`** |
 
 > **WP2a 开发期宿主管道路径参数**：用户空间与动态配置两个 bind mount 的宿主路径用 `ERIX_USERSPACE_ROOT_HOST` / `TRAEFIK_DYNAMIC_DIR_HOST` 注入（见 env §10），容器内路径固定（`/srv/erix/users` / `/etc/traefik/dynamic`）。（开发期指向临时目录时**建议 0755**——portal 虽已回加 `CHOWN/DAC_OVERRIDE/FOWNER/SETGID/SETUID`（§1），但开发期临时目录避免依赖特权位更稳；proxy 侧见 §5.1 运行身份说明。生产路径仍按本表默认（`/srv/erix/users` / `/docker/station-edge/dynamic/`）。
-| `station-docker-proxy` | `backend` | **无**（仅 portal 可达；FDE 不在 backend，天然不可达） | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） | — | 无（自研 Node 进程；靠 `service_started` 依赖） | 路径白名单见 §5.1（12 条 + create 参数级校验） |
-| `station-edge` | `host` | **无**（host 网络直接监听 `TRAEFIK_WEB_PORT`/`TRAEFIK_WEBSECURE_PORT`） | ① `/docker/station-edge/traefik.yml` → `/etc/traefik/traefik.yml`（RO）；② `/docker/station-edge/dynamic/` → `/etc/traefik/dynamic/`（RO，**与 portal 共享宿主目录、Traefik 侧只读**）；③ `/docker/station-edge/acme.json` → `/acme.json`（RW，**600**，**仅 Traefik 读写、不挂给 portal**）；④ `/docker/station-edge/logs/` → `/var/log/traefik/`（RW，**仅 Traefik、不挂给 portal**） | —（host 网络独立启动；路由在 portal 就绪后自然可用） | 无（`--api=false` 关闭 ping；靠 restart policy + reconciler 对账兜底，§8） | `/docker/station-edge/.env.edge`（600，含 ACME/DNS-01 凭据，经环境变量注入、**不进 traefik.yml**） |
+| `station-docker-proxy` | `backend` | **无**（仅 portal 可达；FDE 不在 backend，天然不可达） | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**）；另一条 `${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}` → `/srv/erix/users`（**RO**，P3：realpath 校验 bind source 用） | — | **有**（`GET http://127.0.0.1:2375/_ping`，见 §2.3；compose 里 portal 对它的依赖仍写 `service_started`） | 路径白名单见 §5.1（12 条 + create 参数级校验） |
+| `station-edge` | `host` | **无**（host 网络直接监听 `TRAEFIK_WEB_PORT`/`TRAEFIK_WEBSECURE_PORT`） | ① `${TRAEFIK_STATIC_HOST:-./traefik/traefik.yml}` → `/etc/traefik/traefik.yml`（RO，**整份可替换**是 F8 并行隔离的入口，别改成 CLI 覆盖）；② `${TRAEFIK_DYNAMIC_DIR_HOST:-./traefik/dynamic}` → `/etc/traefik/dynamic/`（RO，**与 portal 共享宿主目录、Traefik 侧只读**）；③ `/docker/station-edge/acme.json` → `/acme.json`（RW，**600**，**仅 Traefik 读写、不挂给 portal**）；④ `/docker/station-edge/logs/` → `/var/log/traefik/`（RW，**仅 Traefik、不挂给 portal**）——⚠ **③④ 在 compose 里没有**（现读只有 ①②；compose 自己写了「开发期 http，无 acme.json / 证书」）⇒ 属部署期挂载，别当现状 | —（host 网络独立启动；路由在 portal 就绪后自然可用） | 无（`--api=false` 关闭 ping；靠 restart policy + reconciler 对账兜底，§8） | `/docker/station-edge/.env.edge`（600，含 ACME/DNS-01 凭据，经环境变量注入、**不进 traefik.yml**）——**未落地**（ACME/DNS-01 整条未实现，⇒ env.md §10.7） |
+
+> **`env_file` 列的口径（#777 D3 现验更正）**：本列写的是**部署期目标形态**（凭据拆进宿主 600 文件），而 compose 现在
+> **一条 `env_file:` 都没有**——判据：`grep -c 'env_file:' deploy/docker-compose.yml` ⇒ **0**（全部变量走 `deploy/.env` 插值 + 显式 `environment:` 列表，§2.4）。
+> 读本列时按「契约 = 部署期该长成这样，现状 = 还没拆」，别拿它当 compose 现状；要拆就另单做（拆了还要同步改 §2.4 与本列）。
 
 > **`station-db` 容器加固（与其它三服务一致）**：`security_opt: [no-new-privileges]` + `cap_drop: [ALL]`，并显式回加 postgres 初始化所需的最小 capability `CHOWN` / `DAC_OVERRIDE` / `FOWNER` / `SETGID` / `SETUID`（官方入口以 root 启动、chown 数据目录后用 gosu 降权到 `postgres`）。已用空卷起栈验证 DB 可完成首次初始化（建库/应用 schema/设角色口令）并 healthy。
 
@@ -82,10 +108,10 @@
 | 服务 | test | interval | timeout | retries | start_period |
 |---|---|---|---|---|---|
 | `station-db` | `["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]` | 5s | 5s | 10 | 10s |
-| `station-portal` | `["CMD", "station-portal", "healthcheck"]`（等价 `wget -qO- http://127.0.0.1:8080/api/health` 返回 200） | 10s | 5s | 5 | 30s |
+| `station-portal` | `["CMD", "node", "portal/src/cli.js", "healthcheck"]`（= 容器内 `fetch http://127.0.0.1:8080/healthz` 只看 `res.ok`；`/healthz` 与 `/api/health` 是同一个 handler，`portal/src/http.js:1218`） | 10s | 5s | 5 | 30s |
 | `station-litellm` | Python `urllib` GET `http://127.0.0.1:4000/health/readiness`；HTTP 200 即健康 | 10s | 5s | 6 | 60s |
 | `station-edge` | 无（见 §2.2；`--api=false` 下无 in-band ping） | — | — | — | — |
-| `station-docker-proxy` | 无（`service_started` 依赖即可） | — | — | — | — |
+| `station-docker-proxy` | `["CMD", "node", "-e", "fetch('http://127.0.0.1:2375/_ping')…"]`（proxy 自带的 `/_ping`；**本表此前写的是「无」，与 compose 不符，261128 现验更正**） | 10s | 5s | 5 | 5s |
 
 > portal healthcheck 语义：`/api/health` 返回 200 当且仅当「DB 可达 + 迁移已到 head（§3）+ 无致命初始化错误」——这使 `depends_on: station-db (service_healthy)` 传递的 readiness 链成立（§8）。
 >
@@ -389,8 +415,9 @@
 
 | 组件 | 「就绪」判据 | 消费方 |
 |---|---|---|
-| **station-db** | `pg_isready` 接受连接 **且** 迁移已到 head（`schema_migrations` 最新 version 已应用） | portal `depends_on: service_healthy` → portal 才启动监听 |
-| **portal** | `/api/health` 返回 200 = DB 可达 + 迁移到 head + 无致命初始化错误（`migration_failed` 时返回 503） | compose healthcheck；Traefik 路由自然可服务（portal 未就绪时 502） |
+| **station-db** | compose healthcheck 只判 **`pg_isready` 接受连接**（现读 compose `:51-56`，**不含**「迁移到 head」）；「迁移已到 head」是 **portal 自己**的 `/healthz` 判的（下一行），不是 DB 容器的健康口径 | portal `depends_on: service_healthy` → portal 才启动监听 |
+| **portal** | `/healthz`（= `/api/health`）返回 200 = DB 可达 + 迁移到 head + 无致命初始化错误（`migration_failed` 时返回 503） | compose healthcheck；Traefik 路由自然可服务（portal 未就绪时 502） |
+| **station-docker-proxy** | compose healthcheck `GET tcp://…:2375/_ping` 返 ok（§2.3）——但 portal 对它的 `depends_on` 只写 `service_started`，**健康状态不在启动链上**（现状，不是建议） | portal 首次调 Docker API 失败即报错（不依赖 compose 依赖位） |
 | **Traefik** | 进程 up + 监听 `TRAEFIK_WEB_PORT`/`TRAEFIK_WEBSECURE_PORT`（宿主 `ss -tln`）+ 静态/动态配置加载无错。`--api=false` 无 in-band ping → 无 healthcheck，靠 restart policy + reconciler 对账检测 | 无 compose 依赖；对账任务判「路由是否生效」 |
 | **agentd（FDE 容器）** | ① SSE 下行 `GET /api/internal/stream` 已建立；② 完成启动读（`manifest.json` 校验，user-space §3/§5.4）；③ 首次心跳上报成功（portal `containers.last_heartbeat` 在 45s 内刷新） | portal：`containers.status` 从 `creating` → `running`（心跳为在线证明，runner §4.2） |
 
