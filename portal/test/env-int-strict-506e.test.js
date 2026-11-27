@@ -27,16 +27,33 @@ const LOOSE_LADDER = [250, 500, 1000, 2000, 4000, 8000];   // max=10000 生效�
 // 假时钟 + fake pool（与 idle-backoff-safe-range-506b.test.js 同一形状，自带一份避免跨文件耦合夹具）
 // ---------------------------------------------------------------------------
 
-// arm() 的等待预算（真实时间）。为什么**不能**用固定迭代次数（原写法 `for (let i = 0; i < 300 …)`）：
-// 一次 `setImmediate` 让出换算成多少真实时间**取决于机器负载**，两者不成比例——CI 上事件循环被同机
-// 别的进程压住时，300 次让出可能只走完几十毫秒，被测循环还没走到它那一拍的 sleep，断言就假红
-// （同一 commit 本地全绿、CI 约一半红，2026-11-16 一天撞了 5 次，日志实证见
-// `循环必须停在某一拍的 sleep 上`）。判据本身问的是「循环有没有停住」，那是**时间**问题，
-// 所以预算按真实时间给；超时仍然必须红（不许改成「等不到就算了」）。
+// arm() 的等待预算。判据问的是「循环有没有停在一拍 sleep 上」——那是**因果**问题（循环走到
+// `sleep()` 了没有），所以主路径等的是 `sleep()` 点亮的一次性事件（见下面 `parkedWake`），
+// 真实时间只是**安全网**：事件永不到达（循环抛错 / 自己退了）时兜底，让测试红而不是挂死。
+// 为什么不能退回「固定让出次数」（原写法 `for (let i = 0; i < 300 …)`）：一次 `setImmediate`
+// 换算成多少真实时间取决于机器负载，CI 上 300 次让出可能只走完几十毫秒 ⇒ 同一 commit 本地全绿、
+// CI 约一半红（2026-11-16 一天撞了 5 次）。#531 之后连「靠时间流逝转够」这层也不需要了。
+// 自检口径（本机实测，下次改这块请照跑）：
+//   · 把下面 `sleep()` 里点亮那一行注释掉、预算调到很大 ⇒ **挂死**（实测 `node --test` 被 timeout 掉）
+//     ⇒ 正常的绿本来就**只来自事件**，不是「时间到了就算过」；
+//   · 预算调到很大（安全网永不先到）⇒ 连跑 3 次 rc=0，文件耗时不变 ⇒ 等待不靠真实时间流逝；
+//   · 预算调到 0 且摘掉点亮那一行 ⇒ **必红**（安全网咬住，文案带「已等 Xms / 预算 0ms」）。
+// ⚠ 别把「预算 0 仍绿」当成判据：routes 那棵树首拍的 park 本身就在等真 async fs I/O
+//   （startup rebuild 走 `fs.promises.unlink` + `atomicWriteFile`），实测 1–16ms，
+//   而 `setTimeout(_, 0)` 被夹到 1ms ⇒ 安全网必然先到 ⇒ 假红（实测 8 条红，全在 routes）。
+//   要验「不靠时间」就**摘掉安全网**跑，别把预算压成 0——那是另一回事。
 const ARM_BUDGET_MS = 5000;
 
 function makeFakeClock() {
-  const clock = { nowMs: 0, sleeps: [], pending: null };
+  const clock = { nowMs: 0, sleeps: [], pending: null, armWaits: [], budgetWins: 0 };
+  // 「循环挂上了一拍 sleep」的**一次性事件**（#531）：arm() 挂上 resolver，`sleep()` 点亮并置 null。
+  // 一次性 = 点亮即摘灯，下一次 arm() 自己挂新的；不靠「转 setImmediate 直到看见 pending」。
+  let parkedWake = null;
+  const lightParked = () => {
+    const wake = parkedWake;
+    parkedWake = null;
+    wake?.();
+  };
   const now = () => clock.nowMs;
   const sleep = (ms, signal) => new Promise((resolve) => {
     clock.sleeps.push(ms);
@@ -52,13 +69,26 @@ function makeFakeClock() {
     if (signal?.aborted) { entry.finish(false); return; }
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
     clock.pending = entry;
+    lightParked(); // ← 工单 #531 判据③要注释掉的就是这一行（注释掉 ⇒ 只剩安全网 ⇒ 必须红）
   });
+  /** 安全网：预算到点；timer 句柄留给 arm() 收尾时 clear。 */
+  let budgetTimer = null;
   async function arm() {
     const startedAt = performance.now(); // 单调时钟（Date.now() 会被 NTP 回拨）；假时钟的 now() 在这儿不动，量不出等了多久
-    while (!clock.pending && performance.now() - startedAt < ARM_BUDGET_MS) {
-      await new Promise((r) => setImmediate(r));
+    let wonBy = 'event';   // #531：谁满足了这次 arm() 要记账（事件 = 正常；budget = 安全网到点）
+    if (!clock.pending) {
+      // 事件 = 主路径（因果唤醒）；安全网 = 只在事件永不到达时咬住。
+      // 安全网先到也算过，只要那一刻 `clock.pending` 真的挂着（见下面的断言）。
+      await Promise.race([
+        new Promise((resolve) => { parkedWake = resolve; }),
+        new Promise((resolve) => {
+          budgetTimer = setTimeout(() => { wonBy = 'budget'; resolve(); }, ARM_BUDGET_MS);
+        }),
+      ]).finally(() => { parkedWake = null; clearTimeout(budgetTimer); budgetTimer = null; });
     }
     const waitedMs = Math.round(performance.now() - startedAt);
+    clock.armWaits.push(waitedMs);
+    if (wonBy === 'budget') clock.budgetWins += 1;
     assert.ok(clock.pending, `循环必须停在某一拍的 sleep 上（已等 ${waitedMs}ms / 预算 ${ARM_BUDGET_MS}ms）`);
   }
   async function release() {
@@ -70,7 +100,14 @@ function makeFakeClock() {
     await arm();
     return entry.ms;
   }
-  return { clock, now, sleep, arm, release };
+  /** #531：`arm()` 的满足方式与余量（给用例当判据用，不是调试输出）。 */
+  const armStats = () => ({
+    arms: clock.armWaits.length,
+    budgetWins: clock.budgetWins,
+    maxWaitMs: clock.armWaits.length ? Math.max(...clock.armWaits) : 0,
+    budgetMs: ARM_BUDGET_MS,
+  });
+  return { clock, now, sleep, arm, release, armStats };
 }
 
 class LoopFakePool {
@@ -179,7 +216,13 @@ async function observe(suite, ticks = 6) {
     await fakes.arm();
     const ladder = [];
     for (let i = 0; i < ticks; i += 1) ladder.push(await fakes.release());
-    return { ladder, warns: log.warns, recoveries: pool.orphanRecoveries, claims: pool.claims };
+    const armStats = fakes.armStats();
+    // #531：判绿必须来自「循环真的挂上一拍」这个**事件**，不是「安全网到点」。
+    // 今天「安全网赢」本就等价于 arm() 里那条 pending 断言红，所以这一格**不新增红**；它新增的是
+    // **失败时看得见是谁赢、等了多久 vs 预算多少**——正是原 issue 缺的那盏灯（"没有红灯指向真凶"）。
+    assert.equal(armStats.budgetWins, 0,
+      `arm() 必须由事件满足（${JSON.stringify(armStats)}）——安全网赢意味着这台机器上首拍 park 慢过 ${armStats.budgetMs}ms，就是 #531 说的「没有红灯指向真凶」`);
+    return { ladder, warns: log.warns, recoveries: pool.orphanRecoveries, claims: pool.claims, armStats };
   } finally {
     loop.stop();
     fakes.clock.pending?.finish(true);
