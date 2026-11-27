@@ -608,6 +608,10 @@ export const zhCN = {
     followUpCount: '{n} 条排队',
     expand: '展开',
     collapse: '收起',
+    // #816：行首的「编号 + 类型」里的类型词。**不复用** `steerCount`/`followUpCount`——那是带量词的
+    // 整句（「{n} 条转向」），塞进行首会变成「1 1 条转向：…」。
+    kindSteer: '转向',
+    kindFollowUp: '排队',
     recall: '全部取回',
     recallHint: '把队列里的话全部取回输入框（取回的文在前、已打的草稿在后）',
     // 暂停投递的原因（`queue_update.blocked`）。键名即服务端的机器码，拼成 `queued.blocked.<code>`

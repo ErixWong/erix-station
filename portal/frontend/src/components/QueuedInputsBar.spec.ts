@@ -93,4 +93,115 @@ describe('QueuedInputsBar（#370）', () => {
     expect(wrapper.text()).toContain('1 pending');
     expect(wrapper.text()).toContain('Last delivery failed');
   });
+
+  // issue #816：默认展开 + 每条 2 行 + 第三行编号按钮（点编号只展开那一条、hover 浮层看全文）。
+  // 这里钉的不是「好看」，是**看不看得见**：收起态只给一个计数，用户会以为自己排的那几条丢了。
+  // 断言只认 DOM（`data-test` / 类名 / 文本），不用 `w.emitted()`（仓内纪律）。
+  const six = () => ({
+    steering: [{ id: 's1', content: '转向一' }, { id: 's2', content: '转向二' }],
+    follow_up: [
+      { id: 'f1', content: '排队一' },
+      { id: 'f2', content: '排队二——这一条的正文很长，收起时必须被截掉' },
+      { id: 'f3', content: '排队三' },
+      { id: 'f4', content: '排队四' },
+    ],
+  });
+
+  it('默认展开：3 条 ⇒ 不用点任何按钮就能看到前 2 条的正文（#816）', async () => {
+    const store = useWorkbenchStore();
+    const wrapper = setup();
+    store.applyQueueSnapshot({
+      steering: [{ id: 'a', content: '把那个测试也改一下' }],
+      follow_up: [{ id: 'b', content: '改完顺手跑 npm test' }, { id: 'c', content: '第三条' }],
+    });
+    await flushPromises();
+    const rows = wrapper.findAll('[data-test="queued-row"]');
+    expect(rows).toHaveLength(2);
+    expect(rows[0]!.text()).toContain('把那个测试也改一下');
+    expect(rows[1]!.text()).toContain('改完顺手跑 npm test');
+    // 每条正文最多 2 行（原来是 3 行 ⇒ 三条就能把 composer 顶出屏幕）
+    expect(rows[0]!.classes()).toContain('line-clamp-2');
+    expect(rows[0]!.classes()).not.toContain('line-clamp-3');
+  });
+
+  it('第 3 条起是编号按钮行：6 条 ⇒ 恰好 3/4/5/6 四个，**不是**一个「+N」（#816）', async () => {
+    const store = useWorkbenchStore();
+    const wrapper = setup();
+    store.applyQueueSnapshot(six());
+    await flushPromises();
+    const nums = wrapper.findAll('[data-test="queued-index"]');
+    expect(nums).toHaveLength(4);
+    // 1-based、**跨转向/排队统一编号**，顺序 = [...steering, ...follow_up]（与后端快照一致，前端不重排）
+    expect(nums.map((n) => n.attributes('data-index'))).toEqual(['3', '4', '5', '6']);
+    expect(nums.map((n) => n.text())).toEqual(['3', '4', '5', '6']);
+    expect(wrapper.text()).not.toContain('+4');
+    expect(wrapper.find('[data-test="queued-row-full"]').exists()).toBe(false);
+  });
+
+  it('≤ 2 条不画编号行（没东西可收就别留一行空按钮）', async () => {
+    const store = useWorkbenchStore();
+    const wrapper = setup();
+    store.applyQueueSnapshot({ steering: [{ id: 'a', content: '甲' }], follow_up: [{ id: 'b', content: '乙' }] });
+    await flushPromises();
+    expect(wrapper.findAll('[data-test="queued-row"]')).toHaveLength(2);
+    expect(wrapper.findAll('[data-test="queued-index"]')).toHaveLength(0);
+  });
+
+  it('点编号只展开那一条：点 4 ⇒ 第 4 条全文可见，前 2 行仍是 2 行且照旧截断（#816）', async () => {
+    const store = useWorkbenchStore();
+    const wrapper = setup();
+    store.applyQueueSnapshot(six());
+    await flushPromises();
+    await wrapper.get('[data-test="queued-index"][data-index="4"]').trigger('click');
+    const full = wrapper.get('[data-test="queued-row-full"]');
+    expect(full.text()).toContain('排队二——这一条的正文很长，收起时必须被截掉');
+    expect(full.classes()).not.toContain('line-clamp-2');
+    // 只展开那一条：行还是前 2 条，且没有被「顺手」一起解开
+    const rows = wrapper.findAll('[data-test="queued-row"]');
+    expect(rows).toHaveLength(2);
+    expect(rows[0]!.classes()).toContain('line-clamp-2');
+    expect(rows[1]!.classes()).toContain('line-clamp-2');
+    expect(wrapper.text()).not.toContain('排队一'); // 没点开的编号不该把正文铺出来
+
+    // 再点同一条 = 收起；点另一条 = 切过去（单值 `expandedIndex`）
+    await wrapper.get('[data-test="queued-index"][data-index="4"]').trigger('click');
+    expect(wrapper.find('[data-test="queued-row-full"]').exists()).toBe(false);
+    await wrapper.get('[data-test="queued-index"][data-index="6"]').trigger('click');
+    expect(wrapper.findAll('[data-test="queued-row-full"]')).toHaveLength(1);
+    expect(wrapper.get('[data-test="queued-row-full"]').text()).toContain('排队四');
+  });
+
+  it('hover 编号出浮层（绝对定位，不改布局）：含该条全文，移开即收（#816）', async () => {
+    const store = useWorkbenchStore();
+    const wrapper = setup();
+    store.applyQueueSnapshot(six());
+    await flushPromises();
+    expect(wrapper.find('[data-test="queued-hover-tip"]').exists()).toBe(false);
+    const num6 = wrapper.get('[data-test="queued-index"][data-index="6"]');
+    await num6.trigger('mouseenter');
+    const tip = wrapper.get('[data-test="queued-hover-tip"]');
+    expect(tip.text()).toContain('排队四');
+    // 浮层必须**浮着**（`pointer-events-none` 不抢 hover）而不是插进文档流把下面顶一下
+    expect(tip.classes()).toContain('pointer-events-none');
+    expect(tip.classes().join(' ')).toContain('absolute');
+    // hover 不算展开：底下那条全文行不该因此出现
+    expect(wrapper.find('[data-test="queued-row-full"]').exists()).toBe(false);
+    await num6.trigger('mouseleave');
+    expect(wrapper.find('[data-test="queued-hover-tip"]').exists()).toBe(false);
+  });
+
+  it('换会话复位为展开（手动收起只在当前会话内有效，#816）', async () => {
+    const store = useWorkbenchStore();
+    const wrapper = setup();
+    store.applyQueueSnapshot({ steering: [{ id: 'a', content: '甲' }], follow_up: [{ id: 'b', content: '乙' }] });
+    await flushPromises();
+    const collapseBtn = wrapper.findAll('button').find((b) => b.text() === '收起');
+    expect(collapseBtn).toBeTruthy();
+    await collapseBtn!.trigger('click');
+    expect(wrapper.findAll('[data-test="queued-row"]')).toHaveLength(0);
+
+    store.sessionId = 'another-session';
+    await flushPromises();
+    expect(wrapper.findAll('[data-test="queued-row"]')).toHaveLength(2);
+  });
 });
