@@ -1576,6 +1576,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
     | 有白名单真实行（常规页） | 本页**最老那条真实事件**的 `seq`（且 `hasOlder` 为真） | 页的所有权属于真实事件：把游标压到页界之外会**跳过真实事件**，比丢一条分隔条更坑 |
     | **零白名单行**且候选发现被 `LIMIT` 截断（会话尾巴页） | 已发现的 `run_end` 行里**最小的 `seq`** | 「空页」不是到底，它意味着「游标之下还有内容，只是全不是白名单事件」；不给游标 ⇒ 被截掉的那批**永远没有页可达**。那种页的窗口是 **`[0, before)`**，不同 `before` 的两次请求在同一段尾巴上**重叠是游标分页的本性**，不消除——不重不漏由**游标严格递减 + 前端幂等键**保证（现读坐标与理由见 §4.4a-2） |
     | 零白名单行且发现**没**被截断 | `null`（确实到底） | 发现查询按主窗口同一口径多取一行**探针**（`LIMIT limit + 1`）⇒ 「还有没有更老的」是事实而非「恰好返了 `limit` 条」的猜测，不许多跑一趟空页 |
+    | **非空页且已无更老的白名单行**（最老那一页）且**页界之下还有 `run_end`** | 本页最老那条真实事件的 `seq`（= `pageLow`，**不是** `pageLow - 1`） | issue #561：那种页上 `whitelistCursor` 恒 null（没有更老的白名单行）、`tailCursor` 也恒 null（页非空）⇒ 游标就地变 null，比 `pageLow` **更老**的 `run_end` 永远没有页可达。现口径 = 先打一条**页界之下的存在性探针**（`SELECT 1 … seq < pageLow … LIMIT 1`，`http.js#hasTerminalRunBelow`）：有 ⇒ 交 `pageLow`（下一页窗口 `[0, pageLow)` 与本页 `[pageLow, before)` **严格不重叠** ⇒ 不跳过任何真实事件，且那一页必为空页 ⇒ 走既有的空页发现路径）；没有 ⇒ 照旧 `null`，不多发一次请求 |
 
   - **客户端到底靠什么续页（2026-11-16 现读，别照记忆写）**：
     | 字段 | 落在哪 | 语义 |
@@ -1798,18 +1799,29 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
   真要修就把发现并进主窗口查询（`UNION ALL` 一个只带 `run_id` 的分支），与上面成本段那条同一个后续单；
   ③ 合成项**不带 `usage`**（实时 `run_end` 的 `· tokens a+b` 后缀在历史里不重建——与 #282「刷新后运行态数字
   拿不回来」同一口径，不拿历史值假装实时）。
-- **已接受边界 ④：第三种形状 —— 非空页里「没有更老的白名单行」⇒ 翻页链提前收敛**（**② 盖不住它**）。
-  机制（现读坐标，逐条对得上）：`http.js:2905` 取 `pageLow` = 本页最小白名单 seq；
-  `http.js:3035` 发现查询带 `AND seq >= $2`（`$2 = pageLow`）⇒ 比 `pageLow` **更老**的 `run_end` 不参与发现；
-  `http.js:2913` `whitelistCursor` 要 `hasOlder` 才给，而这一页之下**已无更老的白名单行** ⇒ null；
-  `http.js:2926` `tailCursor` 只在 `rows.length === 0 && truncated` 才给 ⇒ 非空页恒 null；
-  `http.js:2933` `next_cursor: whitelistCursor ?? tailCursor` ⇒ **游标就地变 null，尾巴页根本没被走到**。
+- **已修 ④（issue #561）：第三种形状 —— 非空页里「没有更老的白名单行」⇒ 翻页链提前收敛**（**② 盖不住它**）。
+  机制（现读坐标，逐条对得上）：`http.js:4150` 取 `pageLow` = 本页最小白名单 seq；
+  `http.js:4289` 发现查询带 `AND seq >= $2`（`$2 = pageLow`）⇒ 比 `pageLow` **更老**的 `run_end` 不参与发现；
+  `http.js:4158` `whitelistCursor` 要 `hasOlder` 才给，而这一页之下**已无更老的白名单行** ⇒ null；
+  `http.js:4171` `tailCursor` 只在 `rows.length === 0 && truncated` 才给 ⇒ 非空页恒 null；
+  ⇒ 旧口径 `next_cursor: whitelistCursor ?? tailCursor`（原 `http.js:2933`）让**游标就地变 null，尾巴页根本没被走到**。
   与 ② 的区别（这条决定它是不是已知项）：这里发现行**远少于 `limit`**（复现里只有 1 条、`limit=1`，
   **没发生截断**），断点纯由游标提前置 null 造成。
-  **主 agent 与第三方审计各自独立复现，都是行为红（不是形状闸）**；对照组（把 `run_end` 放到白名单行
-  之后）同一条游标循环是绿的 ⇒ 不是探针坏。判据与修法见 **issue #561**；本 PR **不修**——
-  修它要把发现并进主窗口查询（同上那条 `UNION ALL` 方向），且不许用「把游标压到 `pageLow` 之下」换绿
-  （那会跳过真实事件，用例 `#514 返修：非空页的游标所有权…` 钉着）。
+  **现口径（本单已修）**：那种页先打一条**页界之下的存在性探针**（`http.js#hasTerminalRunBelow`，
+  `SELECT 1 FROM run_events WHERE … type = 'run_end' AND seq < pageLow AND run_id IS NOT NULL LIMIT 1`）：
+  页界之下**有**终态行 ⇒ `next_cursor = pageLow`（`http.js:4181` 的 `belowCursor`，汇流在 `4187` 的
+  `whitelistCursor ?? tailCursor ?? belowCursor`）；**没有** ⇒ 照旧 `null`，不多发一次空页请求。
+  三个入口条件缺一不可：本页非空（空页走它自己的 `tailCursor`）、`hasOlder === false`（还有更老
+  白名单行时游标仍归白名单行 = ① 的所有权不变）、`sessionId != null`。
+  ⚠ **游标必须恰好等于 `pageLow`，绝不许更小**：`pageLow - 1` 会把紧贴页界之下那一行（真实事件或
+  更老的终态行）**跳过**——那正是 `#514 返修：非空页的游标所有权…` 钉住的红线；新用例里
+  「紧贴页界之下的那条 `run_end`」（seq = `pageLow - 1`）就是这条红线的承重位（变异「游标减一」当场红）。
+  成本：那种页每次响应**多一条 `LIMIT 1` 探针**（不取列、不进候选、不打 `runs`）；上限仍是
+  「候选发现 1 + 探针 1 + `runs` 1」，已由 `#514 成本…` 那条用例分开记帐。
+  **两条既有登记仍然存在、本单不动**：② **非空页的截断残差**（一页里既有白名单行又有超过 `limit` 条
+  `run_end` 时，比 `limit` 更老的那几条仍落在 `[pageLow, minDiscoveredSeq)` 接不住；本单只开了
+  「页界**之下**」那一侧，没有动「页内截断」那一侧）；③ 合成项不带 `usage`；① 只覆盖该 run 真落在
+  本次响应窗口里的那一页（含**会话尾巴页**那串的窗口口径，包 §4.4a-2 成本段）。
 
 ```jsonc
 {

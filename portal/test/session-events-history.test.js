@@ -611,10 +611,16 @@ const runEndsOf = (body) => body.events.filter((e) => e.type === 'run_end');
 const KILLED = { reason: 'aborted', detail: 'cancelled_before_start' };
 // 发现查询的识别别拿 `SELECT run_id` 的列名单当锚（#514 返修后它多带了一列 `seq`）——
 // 按「只查 run_end 行」这条谓词认，才是它的身份。
+// issue #561 后这类查询有**两条**：候选发现（取 run_id/seq 当候选，`LIMIT $n` 参数化）与
+// 页界之下的**存在性探针**（`SELECT 1 … LIMIT 1` 字面量，只答有/没有、不当候选）——成本分开记。
 const discoveryQueries = (pool) => pool.sqlLog.filter((sql) => {
   const flat = sql.replace(/\s+/g, ' ');
   return /FROM run_events/.test(flat) && flat.includes("type = 'run_end'");
 });
+/** issue #561：存在性探针的身份 = 不取任何列（`SELECT 1`）+ `LIMIT 1` 字面量。 */
+const isExistenceProbe = (sql) => /^SELECT 1 FROM run_events\b/.test(sql.replace(/\s+/g, ' ').trim());
+const probeQueries = (pool) => discoveryQueries(pool).filter(isExistenceProbe);
+const candidateQueries = (pool) => discoveryQueries(pool).filter((sql) => !isExistenceProbe(sql));
 
 /** 种一次「从未开始就被取消」：库里只有那一行 `run_end`（载荷形状照 sessions.js 的 killedQueued）。 */
 function seedKilledQueuedRun(pool, runId, seq, termination = KILLED) {
@@ -712,7 +718,7 @@ test('#514 页界：发现查询被「本页最小 seq」与 before 夹住 ⇒ �
   }
 });
 
-test('#514 成本：发现查询每次响应至多一条、被页边界与 LIMIT 夹住；runs 查询仍恰好一条', async () => {
+test('#514 成本：发现查询每次响应至多一条、被页边界与 LIMIT 夹住；runs 查询仍恰好一条（#561：另加至多一条 LIMIT 1 探针）', async () => {
   const s = await startServer();
   try {
     s.pool.seed({ ...ev(1, 'round_start', { round: 1 }), run_id: 'r-a' });
@@ -723,10 +729,17 @@ test('#514 成本：发现查询每次响应至多一条、被页边界与 LIMIT
     s.pool.sqlLog.length = 0;
     const body = await historyOf(s);
     assert.equal(terminationsOf(body).length, 3, '三条终态 run 都要有分隔条（两条是只写 run_end 的）');
-    const disc = discoveryQueries(s.pool);
-    assert.equal(disc.length, 1, `一次响应至多一条发现查询：\n${disc.join('\n')}`);
+    const disc = candidateQueries(s.pool);
+    assert.equal(disc.length, 1, `一次响应至多一条候选发现查询：\n${disc.join('\n')}`);
     assert.match(disc[0], /seq >= \$\d+/, '页下界必须写在 SQL 里（否则旧页的分隔条会在每一页重演）');
     assert.match(disc[0], /LIMIT \$\d+/, '候选数必须被页大小夹住');
+    // issue #561：**最老的白名单页**多打一条存在性探针（本页就是那种页 ⇒ 恰好一条）。
+    // 它不取列、`LIMIT 1`、不进候选、不发 runs ⇒ 成本上限仍是「候选 1 + 探针 1 + runs 1」。
+    assert.equal(probeQueries(s.pool).length, 1,
+      `一次响应至多一条页界之下存在性探针：\n${probeQueries(s.pool).join('\n')}`);
+    assert.match(probeQueries(s.pool)[0], /LIMIT 1$/m, '探针必须 LIMIT 1（只答存在性）');
+    assert.deepEqual(discoveryQueries(s.pool).filter((q) => !isExistenceProbe(q) && !/seq >= \$\d+/.test(q)), [],
+      '除候选发现与探针外，不许再多出第三条 run_end 查询');
     assert.equal(runsQueries(s.pool).length, 1,
       `发现出来的 id 要并进既有那条批量 runs 查询，不许为它再打第二条：\n${runsQueries(s.pool).join('\n')}`);
   } finally {
@@ -885,6 +898,46 @@ test('#514 返修：非空页的游标所有权仍归白名单行——即使发
     // 这一句把「残余①」钉成**读数**而不是文档里的一句话（要修它得把发现并进主窗口查询）。
     const p2 = await historyOf(s, '?limit=1&before=10');
     assert.deepEqual(p2.events, [], '白名单游标之下确实没有页可达这些尾巴行了（残余①的形状）');
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// issue #561：**候选发现的窗口下界是 pageLow（本页最旧白名单行）** ⇒ 「比本页最旧白名单行更老」的
+// `run_end` 一条都看不见。而**最老的白名单页**（`hasOlder === false` 且非空）上 `whitelistCursor`
+// 恒 null、页又非空 ⇒ `tailCursor` 也恒 null ⇒ `next_cursor` 提前 null，客户端不会再去请求
+// 「`pageLow` 之下」那一页 ⇒ 那条 `run_end` 的分隔条**永远没有页可达**（§4.4a-2 已接受边界 ④，本单修掉）。
+// 修法：最老白名单页用一条**页界之下的存在性探针**决定要不要把 `pageLow` 当游标交出去；
+// 给的游标**等于** `pageLow`（绝不小于它 —— 小于会跳过真实事件，`#514 返修` 那条红线钉的就是这件事）。
+// ---------------------------------------------------------------------------
+
+test('#561：比本页最旧白名单行更老的 run_end 也要有页可达（跟着 next_cursor 翻完必须看见它）', async () => {
+  const s = await startServer();
+  try {
+    // 白名单行 seq 10 / 11（同一个 run），更早 seq 5 只有一行 run_end（另一个 run）。
+    s.pool.seed({ ...ev(10, 'tool_use', { name: 'shell', input: {} }), run_id: 'r-new' });
+    s.pool.seed({ ...ev(11, 'tool_result', {}), run_id: 'r-new' });
+    s.pool.seedRun('r-new', 'finished', { reason: 'end_turn' });
+    seedKilledQueuedRun(s.pool, 'r-old', 5);
+    // **边界承重位**（变异 2 的锚）：紧贴页界之下的那一行 seq 9 = `pageLow - 1`。
+    // 探针给的游标必须**等于** `pageLow`（=10）才拿得到它；再小一格（`pageLow - 1`）下一页窗口就
+    // 是 `[0, 9)` ⇒ 这一行被**跳过**（正是 `#514 返修` 钉住的那条红线：游标不许压到页界之下）。
+    seedKilledQueuedRun(s.pool, 'r-edge', 9);
+
+    const pages = await walkPages(s, 1);
+    const seen = pages.flatMap((p) => p.events.map((e) => `${e.seq}:${e.type}`));
+    assert.ok(
+      seen.some((x) => x === '5:run_termination' || x === '5:partial_output'),
+      `r-old 必须出现在某一页的事件里（实际翻到：${JSON.stringify(seen)}）`,
+    );
+    assert.ok(
+      seen.some((x) => x === '9:run_termination' || x === '9:partial_output'),
+      '游标必须恰好等于 pageLow：紧贴页界之下的那一行也不许被跳过（游标再小一格就吞掉它）'
+      + `（实际翻到：${JSON.stringify(seen)}）`,
+    );
+    assert.ok(pages.length <= 4, `链条必须有界（实际 ${pages.length} 页）`);
+    assert.equal(pages.at(-1).next_cursor, null, '最后一页必须收口');
   } finally {
     await s.close();
   }
