@@ -7,6 +7,8 @@ import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { renderMarkdown } from '../lib/markdown';
 import { getToolResultSummary } from '../lib/toolSummary';
+// issue #816 第④b步：正文走**主对话同款气泡**（与 StreamPanel 共用一份渲染）。
+import MessageBubble from './MessageBubble.vue';
 import type { FoldedInfo, FoldedOriginalState, FoldedOriginalTurn } from '../stores/workbench';
 import type { FoldEntry } from '../lib/foldIndex';
 
@@ -58,11 +60,22 @@ function foldedToolResult(tc: { resultPreview?: unknown }): string {
       :key="ti"
       class="folded-original-turn"
     >
-      <div v-if="turn.role === 'user'" class="folded-original-role text-xs text-black/35">{{ t('stream.folded.originalRoleUser') }}</div>
+      <!-- #816 ④b：**删掉角色标签**（旧的 `folded-original-role`）——气泡自己就表达了角色
+           （`.msg.user` / `.msg.assistant` 的既有样式），历史呈现与主对话一字不差。 -->
       <!-- #389：正文走 markdown（与助手气泡同一路径/样式）；reasoning 与工具行**刻意保持纯文本**
            （模型独白/命令行里 `*` `_` 反引号遍地，格式化会出错），绝不 v-html。 -->
       <div v-if="turn.reasoning" class="folded-original-reasoning overflow-auto whitespace-pre-wrap break-all text-black/40 italic">{{ turn.reasoning }}</div>
-      <div v-if="turn.text" class="folded-original-text md overflow-auto text-black/70" v-html="renderMarkdown(turn.text)"></div>
+      <!-- #816 ④b：正文 = **主对话同款气泡**（`MessageBubble`，与流同一份 `msgClass`/时刻/markdown 路径）。
+           `folded-original-text` 作为 **DOM 钩子**继续保留（StreamPanel.spec 靠它定位原文正文），它落在气泡
+           自己身上（单根组件的 class fallthrough）⇒ 一个元素同时是 `.msg.<role>.md` 与 `.folded-original-text`。
+           markdown 仍在**调用方**渲染（组件不引入第二套 markdown 逻辑）。`role` 缺键时按 `assistant` 画
+           （无背景直排）——与旧实现对「不认识的 role」的观感一致，也不会凭空调出一只用户蓝气泡。 -->
+      <MessageBubble
+        v-if="turn.text"
+        class="folded-original-text overflow-auto"
+        :role="turn.role ?? 'assistant'"
+        :html="renderMarkdown(turn.text)"
+      />
       <div
         v-for="(tc, ci) in (turn.toolCalls ?? [])"
         :key="ci"

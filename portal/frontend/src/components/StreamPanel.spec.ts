@@ -541,9 +541,12 @@ describe('issue #189：折叠横幅渲染', () => {
     expect(fetchUrl).toBe('/api/sessions/s1/folded/8');
     const turns = wrapper.findAll('.folded-original-turn');
     expect(turns).toHaveLength(2);
-    // #384：user 轮现在带一个很轻的身份标记（原来满屏正文分不清是谁说的）⇒ 断言从 `toBe` 改 `toContain`。
+    // #384：user 轮要能认出「是谁说的」。**#816 ④b 后那半句换了形状**：身份不再是一行「用户」文字
+    // 标签（`folded-original-role` 按工单退役），而是**主对话同款气泡** `.msg.user` ⇒ 断言从
+    // 「文本里有『用户』」改成「正文住在 .msg.user 气泡里」，强度不降（反而钉得更死：形状而非文案）。
     expect(turns[0].text()).toContain('原文甲');
-    expect(turns[0].text()).toContain('用户');
+    expect(turns[0].get('.msg.user').text()).toContain('原文甲');
+    expect(turns[0].find('.folded-original-role').exists()).toBe(false);
     expect(turns[1].text()).toBe('（无文本内容）'); // 四类（text/reasoning/工具/身份）都空才给占位
 
     await wrapper.get('.view-original').trigger('click'); // 缓存命中不重发

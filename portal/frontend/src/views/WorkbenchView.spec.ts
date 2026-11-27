@@ -821,7 +821,9 @@ describe('WorkbenchView · 折叠常驻条 / 展开面板 / 右侧竖串（issue
     expect(foldedUrls[0]).toContain('/api/sessions/s1/folded/12'); // 查询键 = **落账轮号**（不是 from/to 范围）
     const turn = wrapper.get('.folded-original-turn');
     expect(turn.text()).toContain('第 12 轮原文');
-    expect(turn.get('.folded-original-role').text()).toBe('用户');
+    // #816 ④b：原文正文 = **主对话同款气泡**（角色标签 `folded-original-role` 已退役）
+    expect(turn.get('.msg.user').text()).toContain('第 12 轮原文');
+    expect(turn.find('.folded-original-role').exists()).toBe(false);
     // 再点一次 = 收起（原文整块从 DOM 摘掉），但缓存**不删**（与旧横幅 #388 同口径）
     await btns()[0].trigger('click');
     expect(wrapper.find('.folded-original-turn').exists()).toBe(false);
