@@ -250,25 +250,39 @@ test('翻拦：裸登录名探针出现在扫描面内被拦，且报出 file:li
   assert.doesNotMatch(out, /\[object Object\]/, `命中标签打成了对象（label 取错），实得:\n${out}`);
 });
 
-// ⑪ 词边界：含词根的通用词（`gen` + 词根）不许被拦。这是边界存在的全部理由——
+// ⑪ 词边界：含词根的通用词不许被拦。这是边界存在的全部理由——
 //    没有本格，「把 boundary 关掉 / 退化成子串」这种退化就没人抓得住（翻拦之后它会满屏假阳性：
 //    仓库文档与注释里到处是含这个词根的通用词，`①` 那格也会连带红）。
-//    先自证前提：GENERIC 确实含 LOGIN，否则本格空转。
+//    覆盖面按**实测**扩：变异评审（#899）指出原来只钉 `gen` 一个反例，而仓库里真实存在的
+//    `num` + 词根（`docs/data/model.md`、`portal/test/*.test.js` 的注释行）同样是子串陷阱；
+//    `cl` + 词根、`esot` + 词根是再补的两个同形反例。全部用片段拼接（本文件在扫描面内）。
+//    先自证前提：每个反例都含词根、但都不含**独立单词**，否则本格空转。
+const GENERIC_TRAPS = [
+  ['gen', LOGIN].join(''), // gen + 词根
+  ['num', LOGIN].join(''), // num + 词根（仓库文档/注释里真实存在）
+  ['cl', LOGIN].join(''), // cl + 词根
+  ['esot', LOGIN].join(''), // esot + 词根
+];
 test('翻拦：含词根的通用词不被拦（词边界不得退化成子串）', () => {
-  assert.ok(GENERIC.includes(LOGIN), '夹具前提不成立：通用词未含词根，本格将空转');
-  assert.ok(!new RegExp(`\\b${LOGIN}\\b`).test(GENERIC), '夹具前提不成立：该通用词本身就有词边界');
+  for (const w of GENERIC_TRAPS) {
+    assert.ok(w.includes(LOGIN), `夹具前提不成立：${w} 未含词根，本格会空转`);
+    assert.ok(!new RegExp(`\\b${LOGIN}\\b`).test(w), `夹具前提不成立：${w} 本身就有词边界`);
+  }
   const proxy = ['172.20.', '0.35'].join('');
   const { rc, out } = fixture((dir) => {
     mkdirSync(path.join(dir, 'docs'), { recursive: true });
-    writeFileSync(path.join(dir, 'docs', 'words.md'), `# t\n\n这里是 ${GENERIC} 形态的占位词，不是身份。\n`);
+    writeFileSync(
+      path.join(dir, 'docs', 'words.md'),
+      `# t\n\n${GENERIC_TRAPS.map((w) => `这里是 ${w} 形态的占位词，不是身份。`).join('\n')}\n`,
+    );
     // 同树放一条**真坐标**：先证明这棵树真的产出了命中，否则「没点名 words.md」会因闸没跑而空转。
     writeFileSync(path.join(dir, 'docs', 'dirty.md'), `# t\n\n本机坐标 ${proxy}。\n`);
   });
   assert.notEqual(rc, 0, '夹具里的坐标行本该被拦，rc 却是 0 = 本格的断言会空转');
   assert.ok(out.includes(`docs/dirty.md:3: ${proxy}`), `坐标行未点名，实得:\n${out}`);
   assert.ok(
-    !out.includes('docs/words.md:3'),
-    `通用词 ${GENERIC} 被当成身份拦下（词边界退化成子串），实得:\n${out}`,
+    !/docs\/words\.md:\d+/.test(out),
+    `通用词（${GENERIC_TRAPS.join(' / ')}）被当成身份拦下（词边界退化成子串），实得:\n${out}`,
   );
 });
 
@@ -289,4 +303,25 @@ test('翻拦：真仓库的测量读数为 0 且 exit 0（文档里不再有裸�
   const m = out.match(/身份词测量[^\n]*?：(\d+) 处/);
   assert.ok(m, `没在输出里读到测量读数，实得:\n${out}`);
   assert.equal(Number(m[1]), 0, `测量读数应为 0，实得 ${m[1]} 处：\n${out}`);
+});
+
+// ⑬ 「N 处」的语义 = 位置数，不是规则命中数（#899 评审发现的重复计数）。
+//    同一行可以同时被「家目录前缀 + 登录名」的旧组合规则与新的**词边界**规则命中 ⇒ 详情该列两条
+//    （要知道是哪两条规则 fired），但头部计数必须按 `rel:line` 去重——否则「1 个要改的位置」被
+//    报成「2 处」，而这条闸的所有台账都在引用「处」这个数。
+test('报告语义：同一行被两条规则命中 ⇒ 头部按位置算 1 处、详情列 2 条（不去重就是重复计数）', () => {
+  const homePrefix = ['/home/', LOGIN].join('');
+  const { rc, out } = fixture((dir) => {
+    mkdirSync(path.join(dir, 'docs'), { recursive: true });
+    writeFileSync(path.join(dir, 'docs', 'dup.md'), `# t\n\n旧组合 ${homePrefix} 与新词边界同行。\n`);
+  });
+  assert.notEqual(rc, 0, '夹具本该被拦却 exit 0 = 本格的断言会空转');
+  const m = out.match(/身份坐标或身份 (\d+) 处（规则命中 (\d+) 条/) || out.match(/坐标或身份 (\d+) 处（规则命中 (\d+) 条/);
+  assert.ok(m, `头部没报「N 处（规则命中 M 条）」这个双数口径，实得:\n${out}`);
+  const [loc, rules] = [Number(m[1]), Number(m[2])];
+  assert.equal(loc, 1, `位置数应为 1，实得 ${loc}（= 同一行被算了两遍）`);
+  assert.ok(rules >= 2, `规则命中应 ≥ 2 条（旧组合 + 新词边界），实得 ${rules} ⇒ 夹具没构造出重叠，本格会空转`);
+  assert.ok(out.includes(`docs/dup.md:3: ${homePrefix}`), `旧组合规则的详情行缺失，实得:\n${out}`);
+  assert.ok(out.includes(`docs/dup.md:3: ${LOGIN}`), `新词边界规则的详情行缺失，实得:\n${out}`);
+  assert.doesNotMatch(out, /坐标或身份 2 处/, `头部仍把同一行报成 2 处（没去重），实得:\n${out}`);
 });

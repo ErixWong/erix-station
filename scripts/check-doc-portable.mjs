@@ -190,11 +190,17 @@ function main() {
   }
   if (measureHits) {
     // 打在 stdout：它是量面读数，不是错误；位置在拦截判定之前，故对 rc 零影响。
-    console.log(`check:doc-portable 身份词测量（--identity-words；打印开关，不改 rc —— 但这些词已进 DENY，命中本身会让 rc 红）：${measureHits.length} 处（已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/mjs/cjs/ts/vue 注释行）`);
+    console.log(`check:doc-portable 身份词测量（--identity-words；打印开关，不改 rc —— 但这些词已进 DENY，命中本身会让 rc 红）：${new Set(measureHits.map((h) => (h.match(/^(.*:\d+): /) || [, h])[1])).size} 处（词次 ${measureHits.length}）（已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/mjs/cjs/ts/vue 注释行）`);
     for (const h of measureHits) console.log(`  ${h}`);
   }
   if (hits.length > 0) {
-    console.error(`check:doc-portable RED：仓库里含本机/内网坐标或身份 ${hits.length} 处（已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/ts/vue 注释行）`);
+    // 「N 处」的语义 = **有 N 个位置要人改**，不是「规则匹配了几次」。同一行被两条规则命中时，详情
+    //   列两条（要知道是哪两条规则 fired），但头部按 `rel:line` 去重计数。#889 第二步之后这条是必须的：
+    //   裸登录名的词边界规则与旧的「家目录前缀 + 登录名」组合规则会对同一行同时命中，不去重就把
+    //   一个位置报成两处（`test/docs-portable.test.js` 第 ⑬ 格钉这个语义）。
+    const locOf = (h) => { const m = h.match(/^(.*:\d+): /); return m ? m[1] : h; };
+    const locations = new Set(hits.map(locOf));
+    console.error(`check:doc-portable RED：仓库里含本机/内网坐标或身份 ${locations.size} 处（规则命中 ${hits.length} 条；已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/ts/vue 注释行）`);
     for (const h of hits) console.error(`  ${h}`);
     console.error('  ↳ 坐标搬去冷层 `~/projects/docs/`；身份换中性占位（见 AGENTS.md §6）。EXEMPT 只豁免坐标，不豁免身份。');
     process.exit(1);
