@@ -196,6 +196,12 @@ describe('afterLoginRoute（旧版语义）', () => {
   it('带 fde_name 的 admin（FDE 兼管理员）→ /', () => {
     expect(afterLoginRoute({ ...ADMIN_USER, fde_name: 'root' })).toBe('/');
   });
+  // #648：判据只看「有没有工位」⇒ `role='fde'` 但 `fde_name` 为空的人登录后也不落工作台
+  //（变异靶子：判据退回 `role === 'admin' && !fde_name` ⇒ 本格红，他一登录就吃 `/api/dirs` 的 500）。
+  it('#648 fde 且无 fde_name（第 ④ 类人）→ /admin（没工位就不该落工作台）', () => {
+    expect(afterLoginRoute({ ...FDE_USER, fde_name: null })).toBe('/admin');
+    expect(afterLoginRoute({ ...FDE_USER, fde_name: '' })).toBe('/admin');
+  });
 });
 
 // ---- issue #431：登出收口——「本轮用户结束」只有 auth 知道，由它统一通知 ----

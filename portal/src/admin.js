@@ -378,7 +378,14 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   if (updates === null || typeof updates !== 'object' || Array.isArray(updates)) {
     throw new AdminError('validation_failed', '请求体必须是对象', { en: 'the request body must be an object' });
   }
-  const fields = Object.keys(updates);
+  // #648 B：`confirm_last_admin` 是**控制位**，不是可更新列（API 纯增量：旧客户端不传 ⇒ 行为一字不变）。
+  // 必须在「至少一格」与「允许字段」两道校验**之前**摘掉：
+  //   - 不摘 ⇒ 它会被当成未知字段 400（`{confirm_last_admin:true}` 明明该报「至少一格」）；
+  //   - 摘了但只摘不判 ⇒ `{confirm_last_admin:'true'}` 这种「看起来像布尔」会一路走到 SQL。
+  const fields = Object.keys(updates).filter((field) => field !== 'confirm_last_admin');
+  const confirmLastAdmin = Object.hasOwn(updates, 'confirm_last_admin')
+    ? updates.confirm_last_admin
+    : false;
   if (fields.length === 0) {
     throw new AdminError('validation_failed', '至少提供一个可更新字段', { en: 'provide at least one updatable field' });
   }
@@ -391,6 +398,10 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     if (!allowed.has(field)) {
       throw new AdminError('validation_failed', `不支持更新字段 ${field}`, { en: `updating field ${field} is not supported`, details: { field } });
     }
+  }
+  // 控制位只认真布尔（与 `mail_otp_enabled` / `file_upload_enabled` 同形状的既有红线）。
+  if (Object.hasOwn(updates, 'confirm_last_admin') && typeof confirmLastAdmin !== 'boolean') {
+    throw new AdminError('validation_failed', 'confirm_last_admin 必须是布尔值', { en: 'confirm_last_admin must be a boolean', details: { field: 'confirm_last_admin' } });
   }
 
   // email 可改可清（`null` / 空串 ⇒ 清空）。校验口径与 createUser 同源（同一正则、同一长度上限）——
@@ -515,6 +526,29 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   }
 
   let result;
+  // #648 B（判据来自 issue #648）：**最后一名 active admin 不能消失**。
+  //   本次更新会把这一行移出「role='admin' AND status='active'」集合时——**降级与停用同一条判据**（关心的是
+  //   “改完之后还有没有 active admin”，与它是被降级还是被停用无关）——必须还有第二名 active admin 留下。
+  //   按**目标账号**判，不按 actor：actor 自己是不是 admin 与本判据无关（既有的 `self_delete` 在 deleteUser
+  //   里、只管“不能停用自己”；这里新增的是“不能把最后一名 admin 改没了”，两条互不干涉）。
+  // ⚠ **同一条 SQL**：「还有没有别人」写在 UPDATE 的 WHERE 里，而不是先 SELECT 数一遍再 UPDATE。
+  //   先查后改在并发下会双双通过（两个请求各自降级一名 admin，数的时候对方都还活着）；写进 WHERE 后
+  //   判定与写入共用同一语句快照，不留下跨往返的窗口。
+  //   `users.role`/`users.status` 在 UPDATE 的 WHERE 里看到的是**改前值**（PG 语义），子查询里那个同名表
+  //   同理——所以子查询必须 `id <> users.id` 把目标行本身排掉，否则“它自己”会被当成“还有别人”。
+  // 两个触发条件**分开留名**：错误里的 `details.field` 必须指到**真正在改的那一格**
+  // （`docs/api/portal.md` PATCH 用户端点写的就是这个口径）。只看「请求里有没有 role」会指错：
+  // `{role:'admin', status:'disabled'}` 里 role 根本没离开集合，触发者是 status。
+  const leavesByRole = Object.hasOwn(updates, 'role') && updates.role !== 'admin';
+  const leavesByStatus = Object.hasOwn(updates, 'status') && updates.status !== 'active';
+  const leavesActiveAdminSet = leavesByRole || leavesByStatus;
+  const lastAdminGuard = leavesActiveAdminSet && confirmLastAdmin !== true
+    ? `AND (users.role <> 'admin' OR users.status <> 'active'
+            OR EXISTS (SELECT 1 FROM users last_admin_guard
+                        WHERE last_admin_guard.role = 'admin'
+                          AND last_admin_guard.status = 'active'
+                          AND last_admin_guard.id <> users.id))`
+    : '';
   try {
     const offboardingGuard = updates.status === 'active' || changesFdeName
       ? `AND NOT EXISTS (SELECT 1 FROM fde_offboarding WHERE fde_id = users.id)`
@@ -522,7 +556,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     result = await pool.query(
       `WITH updated AS (
          UPDATE users SET ${assignments.join(', ')}
-          WHERE id = $1 ${offboardingGuard}
+          WHERE id = $1 ${offboardingGuard} ${lastAdminGuard}
           RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at, last_activity_at, locale,
                     (totp_secret IS NOT NULL) AS totp_enabled
        ), revoked AS (
@@ -556,11 +590,47 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     if (offboarding.rows.length > 0) {
       throw new AdminError('user_offboarding', '用户正在下线或处于保留期，不能重新启用或修改 FDE 名称', { en: 'the user is being offboarded or in the retention period, so re-enabling or changing the FDE name is not allowed', httpStatus: 409 });
     }
+    // UPDATE 一行没命中 ⇒ 回查一次，只为**选对错误码**（判据本身已经在上面那条语句里跑过了，
+    // 与 offboarding 那条既有写法同法）。护栏没参与时不多花这一次查询。
+    if (lastAdminGuard) {
+      const lastOne = await pool.query(
+        `SELECT 1 FROM users guarded
+          WHERE guarded.id = $1
+            AND guarded.role = 'admin' AND guarded.status = 'active'
+            AND NOT EXISTS (SELECT 1 FROM users other
+                             WHERE other.role = 'admin' AND other.status = 'active'
+                               AND other.id <> guarded.id)`,
+        [userId],
+      );
+      if (lastOne.rows.length > 0) {
+        throw new AdminError('last_admin',
+          '这是最后一名 active 管理员，降级或停用后无人在管理台（确认请带 confirm_last_admin: true）',
+          { en: 'this is the last active administrator, so demoting or disabling the account would leave no one in the admin console (send confirm_last_admin: true to override)',
+            httpStatus: 409,
+            details: { field: leavesByRole ? 'role' : 'status' } });
+      }
+    }
     throw new AdminError('not_found', '用户不存在', { en: 'user does not exist', httpStatus: 404 });
   }
   await recordAdminAudit(pool, actorId, 'admin.user_updated', current.login, {
     fields: fields.filter((field) => field !== 'login'),
   });
+  // #648 B：显式确认位**真的救下了一次拦截**才多落这一行（沿用 `recordAdminAudit` 的既有写法：写失败只
+  // warn，不阻断保存）。事实取**更新之后**的存量数，不拿请求体当事实：带确认位但本来就没拦住
+  //（库里还有别人）时不多写一行假台账。
+  if (confirmLastAdmin === true && leavesActiveAdminSet) {
+    const remaining = await pool.query(
+      `SELECT count(*)::int AS active_admins FROM users WHERE role = 'admin' AND status = 'active'`,
+    );
+    if (Number(remaining.rows[0]?.active_admins ?? 0) === 0) {
+      await recordAdminAudit(pool, actorId, 'admin.user_last_admin_confirmed', current.login, {
+        confirm_last_admin: true,
+        remaining_active_admins: 0,
+        role: result.rows[0].role,
+        status: result.rows[0].status,
+      });
+    }
+  }
   // #828 P1：语言偏好单独留一条台账。值写**人读**名称：`null` 记成「跟随浏览器」而不是字符串
   // "null"——否则审计里「清除」与「设成字符串 null」分不清，运维考古会读错。
   if (Object.hasOwn(updates, 'locale')) {

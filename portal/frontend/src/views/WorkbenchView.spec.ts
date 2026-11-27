@@ -32,8 +32,9 @@ const FDE_USER = {
 const ADMIN_WITH_SEAT = {
   id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'root', auth_source: 'local',
 } as AuthUser;
-// `who` 的无 fde_name 分支仍然可达：闸只挡「admin 且无工位」，`role='fde'` + `fde_name=null` 的畸形
-// 账号照常进得来（lib/workbenchGate.spec.ts:82 钉着 next）⇒ 这条分支的覆盖改用它，不删。
+// `who` 的无 fde_name 分支仍然可达：**本文件直接 mount 视图组件**，全局守卫压根不参与 ⇒ 闸拦不到它
+//（#648 之后 `role='fde'` + `fde_name=null` 的第 ④ 类人在真路由下已被改写去 /admin，
+// 判据见 lib/workbenchGate.spec.ts；本夹具只是复用同一个数据形状跑「无工位时 who 怎么写」）。
 const FDE_NO_SEAT = {
   id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: null, auth_source: 'local',
 } as AuthUser;

@@ -1,11 +1,19 @@
-// issue #332：FDE 工作台的**准入闸**（纯函数，零依赖 vue-router）。
+// issue #332 + #648：FDE 工作台的**准入闸**（纯函数，零依赖 vue-router）。
 //
-// 判据（决策者 2026-10-21 拍定）：**没有工位的平台管理员不该待在 FDE 工作台**。
-//   「没有工位」= `users.role === 'admin' && !users.fde_name`（三类人里的第 ③ 类）。
-//   ⚠ `role` 的 CHECK 是 `('fde','admin')` 单值互斥（docs/data/schema.sql:80-81），而 `fde_name` 是
-//   **独立列**（:82-83）⇒ 第 ② 类人（`role='admin'` 且 `fde_name` 有值：既有工位又有管理台）**必须照常
-//   进得来**。本单挡的是「没工位」，不是「admin」——所以判据里 `!fde_name` 与 `role==='admin'` 缺一个
-//   都错：只看 role 会把 ② 类人挡在门外，只看 fde_name 会把「fde 但 fde_name 为空」的畸形账号也挡掉。
+// 判据（#648 修正 #332 的口径）：**没有工位的人不该停在 FDE 工作台**——「没有工位」= `!users.fde_name`，
+//   **与 `role` 无关**。
+//   四类人（`role` 的 CHECK 是 `('fde','admin')` 单值互斥，而 `fde_name` 是**独立列**，
+//   见 docs/data/schema.sql:80-83 ⇒ 四个组合都真存在）：
+//     ① `fde` + 有 `fde_name`：工作台（本闸放行）。
+//     ② `admin` + 有 `fde_name`：既管台又有工位 ⇒ **必须照常进得来**（#332 钉死的一条）。
+//     ③ `admin` + 无 `fde_name`：没工位的管理员 ⇒ 送管理台（#332）。
+//     ④ `fde` + 无 `fde_name`：没工位的 FDE ⇒ **同样送管理台**（#648 新增；#332 当年放他过去是错的）。
+//   ④ 为什么必须挡：他的工作台每一趟 API 都是错的（不是「没数据」，是服务端直接报错）——
+//     `GET /api/dirs` ⇒ 500 `internal`（`portal/src/dirs.js:57`、`:123`、`:266` 拿 `userSpaceRoot`/`fde_name`
+//     拼家目录，缺列即抛）；`GET /api/sessions` ⇒ `validation_failed`「当前用户未配置 fde_name，无法确定家目录」
+//     （`portal/src/sessions.js:333`）。守卫里改写 ⇒ 视图根本不挂载 ⇒ 这些错一条都不会打到用户脸上。
+//   ⚠ 与 `role` 无关，但**落点不变**：没工位 ⇒ 管理台，有工位 ⇒ 工作台（`seatAwareLanding` 与登录后
+//     默认落点共用同一个判据，本模块不抄第二份 `/admin`）。
 //
 // 为什么把它从 router.ts 的守卫里抽出来（照 lib/forcePasswordGuard.ts 的先例）：判据落在**不 import
 // vue-router、不挂载组件**的模块里，单测直接调函数即可秒级变红；守卫只负责接线。
@@ -21,11 +29,12 @@ export function isWorkbenchPath(toPath: string): boolean {
 }
 
 /**
- * 判据本体：`role === 'admin' && !fde_name` ⇒ 没有工位的平台管理员。
+ * 判据本体：**没有工位**（`!fde_name`）⇒ 不该停在工作台。#648 起与 `role` 无关（③④ 两类都算）。
  * 参数取最小形状（不看 id/login），`user` 为 null（未登录）时为 false——「未登录」归守卫的 /login 规则管。
+ * 空串也算没工位（真库里未开户的账号可能是空串而不是 null）。
  */
-export function isSeatlessAdmin(user: { role: string; fde_name: string | null } | null | undefined): boolean {
-  return !!user && user.role === 'admin' && !user.fde_name;
+export function hasNoSeat(user: { role: string; fde_name: string | null } | null | undefined): boolean {
+  return !!user && !user.fde_name;
 }
 
 /**
@@ -33,7 +42,7 @@ export function isSeatlessAdmin(user: { role: string; fde_name: string | null } 
  * 没有工位 ⇒ 管理台；其余（含第 ② 类人 `admin` + 有 `fde_name`）⇒ 工作台。
  */
 export function seatAwareLanding(user: { role: string; fde_name: string | null } | null | undefined): string {
-  return isSeatlessAdmin(user) ? ADMIN_CONSOLE_PATH : '/';
+  return hasNoSeat(user) ? ADMIN_CONSOLE_PATH : '/';
 }
 
 /**
@@ -43,18 +52,20 @@ export function seatAwareLanding(user: { role: string; fde_name: string | null }
 export type WorkbenchGateDecision = { action: 'rewrite'; path: string } | { action: 'next' };
 
 /**
- * 准入闸判据：第 ③ 类人（`admin` 且无 `fde_name`）访问工作台**任意**路由（`/`、`/session/:id`）
- * ⇒ 改写到管理台；其余一律 `next`（既有的「未登录→/login」「requiresRole」规则照旧）。
+ * 准入闸判据：**没有工位**的人（③ `admin`+无 `fde_name` / ④ `fde`+无 `fde_name`）访问工作台
+ * **任意**路由（`/`、`/session/:id`）⇒ 改写到管理台；其余一律 `next`（既有的「未登录→/login」
+ * 「requiresRole」规则照旧）。
  *
  * 为什么必须在**守卫**里做而不是在 WorkbenchView 里做：视图里的 `onMounted` 会打
- * `GET /api/dirs` + `GET /api/sessions` + `GET /api/me/ports` 三趟去换一个空壳（#308 审计实测的形状）。
- * 守卫里改写 ⇒ 视图根本不挂载 ⇒ 三趟一条都不发（工单 §二.2）。
+ * `GET /api/dirs` + `GET /api/sessions` + `GET /api/me/ports` 三趟去换一个空壳（#308 审计实测的形状），
+ * 而 ④ 类人拿到的不是空壳是 500/400（见本文件顶部）。
+ * 守卫里改写 ⇒ 视图根本不挂载 ⇒ 三趟一条都不发（#332 工单 §二.2）。
  */
 export function workbenchGateDecision(input: {
   user: { role: string; fde_name: string | null } | null;
   toPath: string;
 }): WorkbenchGateDecision {
   if (!isWorkbenchPath(input.toPath)) return { action: 'next' };
-  if (!isSeatlessAdmin(input.user)) return { action: 'next' };
+  if (!hasNoSeat(input.user)) return { action: 'next' };
   return { action: 'rewrite', path: ADMIN_CONSOLE_PATH };
 }

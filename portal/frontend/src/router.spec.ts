@@ -192,6 +192,10 @@ describe('#332 工作台准入闸的守卫接线', () => {
   const ADMIN_WITH_SEAT = {
     ...SEATLESS_ADMIN, id: 'u9', login: 'root2', display_name: 'Root2', fde_name: 'root',
   } as AuthUser;
+  /** 第 ④ 类人（#648）：`role='fde'` 且 `fde_name` 为 null ⇒ 同样没有工位。 */
+  const SEATLESS_FDE = {
+    id: 'u4', login: 'carol', display_name: 'Carol', role: 'fde', fde_name: null, auth_source: 'local',
+  } as AuthUser;
 
   it('第 ③ 类人访问 / → 落到管理台（#/admin/users），不是工作台 #/', { timeout: 20_000 }, async () => {
     fetchMe(200, { user: SEATLESS_ADMIN });
@@ -226,6 +230,42 @@ describe('#332 工作台准入闸的守卫接线', () => {
     expect(router.currentRoute.value.path).toBe('/');
     await router.push('/session/s2');
     expect(router.currentRoute.value.path).toBe('/session/s2');
+  });
+
+  // #648：第 ④ 类人（`fde` 且无 `fde_name`）同样没有工位 ⇒ 守卫必须也把他改写走。
+  // 对应变异：判据退回 `role === 'admin' && !fde_name` ⇒ 前两条红（线上表现：他的 `/` 就是
+  // `/api/dirs` 的 500 与 `/api/sessions` 的 400）。
+  it('#648 第 ④ 类人访 / 与深链 /session/:id → 都落到管理台（不再是 #/）', { timeout: 20_000 }, async () => {
+    fetchMe(200, { user: SEATLESS_FDE });
+    const router = await freshRouter();
+    await router.push('/');
+    expect(router.currentRoute.value.path).toBe('/admin/users');
+    await router.push('/session/someone-elses-session');
+    expect(router.currentRoute.value.path).toBe('/admin/users');
+  });
+
+  // 本文件新增的 `requiresRole` 退让条件（`&& !hasNoSeat(auth.user)`）的双向钉：
+  //  • 没有工位的人访管理台 ⇒ **留在管理台**（把他踢回 `/` 会被准入闸再送回 `/admin`，
+  //    两闸互踢 ⇒ `/` ⇄ `/admin/users` 无限环，实测 vue-router 中止导航 ⇒ 空屏）；
+  //  • 有工位的 fde 访管理台 ⇒ 照旧踢回 `/`（既有行为一格没变，见上面「非 admin 访问 /admin → 回工作台 /」）。
+  it('#648 第 ④ 类人访 /admin/users ⇒ 停在那儿（requiresRole 不再把他踢回一个会被改写的 `/`）', { timeout: 20_000 }, async () => {
+    fetchMe(200, { user: SEATLESS_FDE });
+    const router = await freshRouter();
+    await router.push('/admin/users');
+    expect(router.currentRoute.value.path).toBe('/admin/users');
+    expect(router.currentRoute.value.name).toBe('admin-users');
+  });
+
+  // 两道已有的跳转与准入闸的关系（#648 把它们拼在一起跑一遗）：登录页与改密屏都会把已登录的人
+  // 送回**落地页**（`seatAwareLanding`），而 ④ 类人的落地页现在也是管理台 ⇒ 链条必须收敛，
+  // 不能出现「`/login` → 落地页 → 准入闸 → 管理台 → requiresRole → `/` → …」那类互踢。
+  it('#648 第 ④ 类人访 /login 与 /change-password ⇒ 链条收敛在管理台（无第二道环）', { timeout: 20_000 }, async () => {
+    fetchMe(200, { user: SEATLESS_FDE });
+    const router = await freshRouter();
+    await router.push('/login');
+    expect(router.currentRoute.value.path).toBe('/admin/users');
+    await router.push('/change-password');
+    expect(router.currentRoute.value.path).toBe('/admin/users');
   });
 });
 
