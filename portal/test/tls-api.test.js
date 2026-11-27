@@ -17,7 +17,7 @@
 //   ⑨ GET 的响应键集**恰好**是白名单（防以后有人顺手加 `keyPem`）
 //   ⑩ 超 64 KiB ⇒ 400 `validation_failed` + `details.field`
 
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -46,9 +46,24 @@ const EXPIRED = makeExpiredCert();
 // #462：真三级链 root → intermediate → leaf（叶子 CN/SAN 覆盖 adminHost）。
 const CHAIN = makeChain();
 
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// 本文件三个前缀（tlsapi-route- / tlsapi-dyn- / tlsapi-static-）建的目录全部进 tmpDirs，
+// afterEach 逐格 rm（**不带 force**：rm 失败当场红，不拿「尽力了」冒充清干净）。
+// `dynamicDir` 是注入项：只有**本文件自己建**的那一份才登记（外头传进来的不归本文件管）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
+
 /** 假路由表（默认网关 172.32.0.1 = 现网实测值），避免依赖本机路由。 */
 function fakeRoutePath() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tlsapi-route-'));
+  const dir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'tlsapi-route-')));
   const p = path.join(dir, 'route');
   fs.writeFileSync(
     p,
@@ -59,8 +74,8 @@ function fakeRoutePath() {
 }
 
 async function startServer({ dynamicDir, connect } = {}) {
-  const dir = dynamicDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'tlsapi-dyn-'));
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tlsapi-static-'));
+  const dir = dynamicDir ?? trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'tlsapi-dyn-')));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'tlsapi-static-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'INDEX');
   const config = {
     cookie: cookieSettings('tls-api-test', 600),
