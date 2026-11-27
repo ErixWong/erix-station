@@ -227,9 +227,10 @@ export async function authenticateContainer(pool, token, { now = new Date() } = 
       fde_name: row.fde_name,
       container_name: row.container_name,
     },
-    // #845：内部通道（runner → /api/internal/*）没有浏览器、没有 cookie 罐子，语言协商
-    // （`resolveRequestLocale` 只认 `Cookie: locale=` / `Accept-Language`）在这里永远落空 ⇒ 恒中文。
-    // 属主语言由这条既有的 JOIN 顺带取出（**零额外查询**），供 `http.js#handleInternal` 挂到本次请求上。
+    // #845：内部通道（runner → /api/internal/*）没有浏览器、没有 cookie 罐子，两个语言头通常都不发；
+    // `resolveRequestLocale` 只认 `Cookie: locale=` / `Accept-Language`，**单靠请求头会落回默认语言（zh-CN）**——
+    // 那只说了「请求头这一路」的后果，不是恒中文。属主的真实语言由下面这条既有的 JOIN 顺带取出（**零额外查询**），
+    // 供 `http.js#handleInternal` 挂成 `req.localeHint`（#853：内部通道的语言取自容器属主的 `users.locale`）。
     user: { id: row.user_id, login: row.login, display_name: row.display_name, email: row.email, locale: row.locale ?? null },
   };
 }

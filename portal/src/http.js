@@ -738,10 +738,10 @@ function requireJson(req) {
   const ct = (raw || '').split(';')[0].trim().toLowerCase();
   if (ct === 'application/json') return;
   if (raw === undefined && requestHasNoBody(req)) return;
-  // 这一条是 #803 的**机制端到端样桩**（返修 m6）：目前全仓只有这一处给了 `en:`，因此它是唯一
-  // 能从 HTTP 面真走通 `err.en` ⇒ `pickMessage` 那条链的抛出点（判据：
-  // `portal/test/admin-runtime-settings-api.test.js` 的 Content-Type 腿）。改动本行时**两边的
-  // 逐字都有钉**，别只改一边。
+  // 这一条是 #803 的**机制端到端样桩**（返修 m6）：`en:` 字段如今全仓有几百处，这里早已不是「唯一给了
+  // `en:` 的地方」（那句旧描述已失效）；它留着是因为有一条测试专门从 HTTP 面真走通 `err.en` ⇒ `pickMessage`
+  // 这条链（判据：`portal/test/admin-runtime-settings-api.test.js` 的 Content-Type 腿），本行的中/英**两边逐字都有钉**。
+  // 改本行时**两边都要跟着改**，别只动一边。
   throw new HttpError(400, 'validation_failed', 'Content-Type 必须为 application/json', {
     en: 'Content-Type must be application/json',
   });
@@ -2495,7 +2495,9 @@ async function handleAdminApi(req, res, ctx, url) {
       value: body.value,
       log: ctx.log,
       // #803 返修 M1：回包的 `label`/`hint` 与 GET 同一套 locale 谈判——前端保存成功后拿这一行
-      // 顶掉表格里的整行，这里恒中文会让英文页面保存一次就变回中文。审计与校验文案仍恒中文。
+      // 顶掉表格里的整行，这里恒中文会让英文页面保存一次就变回中文。校验错误也已按 locale 出（外壳带 `en`）；
+      // **真正还剩的中文**：registry 里 validator 返回的原因片段仍是中文，会被拼进英文句（`value failed validation: <中文>`）。
+      // （审计 `details` 是 `{key,value,previous_value}` 的结构化 JSON，语言中立、不含中文文案，不在此列。）
       locale: resolveRequestLocale(req),
     });
     // 审计**不在这里**写：`admin.runtime_settings_updated` 已经与 upsert 在**同一个事务**里

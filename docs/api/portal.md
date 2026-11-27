@@ -641,7 +641,7 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
 | `auth_source` | `local` \| `oidc`（P1 恒为 `local`） |
 | `must_change_password`（#255，纯 additive）| 当前会话是否**受限**（与 §2.2 登录响应的 `password_change_required` 同源同值，只是载体不同）。本端点在 §2.11a 的放行清单里，因此它是 **SPA 刷新后重建改密屏的唯一数据源**——挡住它，前端就只能看到一片 403 而不知道该把用户送去哪儿 |
 | `file_upload_enabled`（#472 片 A，纯 additive）| 该用户能不能用上传端点（`users.file_upload_enabled`，迁移 `0029`，`NOT NULL DEFAULT false`；**上传端点本体是片 B**，届时落在 §4.14）。服务端恒给**布尔**（库里给 `'f'` / `NULL` 等形状也收成 `false`），前端判据一律 `=== true`。**它只在这个 user DTO 里**，不在登录响应顶层（顶层那个位置是 `mail_otp_enabled`，属宿主判定输入）|
-| `locale`（#828 P1，纯 additive）| 该用户的**账号级语言偏好**（`users.locale`，迁移 `0048`，`VARCHAR(8)`，**可空**）。`null` = 未设过 = **跟随浏览器**（不是第三个哨兵值）；非空只收 `zh-CN` / `en`。**登录响应与 `GET /api/me` 都带这一位**（四条 user DTO 路径共用 `toSessionUser`，见下段）；前端登录后拿到非 `null` 就写 cookie + `localStorage`（下次登录不用重选）。**服务端不拿它定语言**（仍按 cookie → `Accept-Language` → `zh-CN`）|
+| `locale`（#828 P1，纯 additive）| 该用户的**账号级语言偏好**（`users.locale`，迁移 `0048`，`VARCHAR(8)`，**可空**）。`null` = 未设过 = **跟随浏览器**（不是第三个哨兵值）；非空只收 `zh-CN` / `en`。**登录响应与 `GET /api/me` 都带这一位**（四条 user DTO 路径共用 `toSessionUser`，见下段）；前端登录后拿到非 `null` 就写 cookie + `localStorage`（下次登录不用重选）。**浏览器路径**服务端不拿它定语言（仍按 cookie → `Accept-Language` → `zh-CN`）；**例外**是内部通道（`/api/internal/*`，#853）：那边没有 cookie 罐子、runner 也不发语言头，语言取自容器属主的 `users.locale`|
 
 **四条 user DTO 路径键集一致（#472 片 A，不是巧合而是约定）**：`POST /api/auth/login`（口令直通）、`POST /api/auth/login/totp`、邮箱码第二步、以及本端点，四处下发的 `user` 对象由**同一个构造函数**产出（`portal/src/auth.js` 的 `toSessionUser`）。原因：SPA 的 `login()` / `submitEmailCode()` 把**登录响应里的 `user`** 直接存进 store，且**不重拉 `/api/me`** ⇒ 只给本端点补字段会让新键在「刚登录的那整个会话」里不存在（按钮不出现，直到整页刷新）。唯一允许的额外键是本端点的 `must_change_password`（**会话态**，不属用户态），由 §2.11a 的受限会话门消费。
 
@@ -665,7 +665,7 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
 { "locale": "zh-CN" }
 ```
 
-> **为什么不查库定语言**：库是「跨设备的真相」、cookie 是「每次请求的载体」。登录后由前端把库里那个值灌进 cookie，此后每个请求服务端仍按 cookie → `Accept-Language` → `zh-CN` 谈判（§0.1 读侧不变），不必每请求查 `users`。本端点**不在** §2.11a 受限会话放行清单内（欠改密的会话先不改语言）。
+> **为什么不查库定语言**：库是「跨设备的真相」、cookie 是「每次请求的载体」。登录后由前端把库里那个值灌进 cookie，此后**浏览器**每个请求服务端仍按 cookie → `Accept-Language` → `zh-CN` 谈判（§0.1 读侧不变），不必每请求查 `users`。**这一约定只管浏览器路径**：内部通道（`/api/internal/*`，#853）是例外——它没有 cookie、runner 也不发 `Accept-Language`，语言取自容器属主的 `users.locale`。本端点**不在** §2.11a 受限会话放行清单内（欠改密的会话先不改语言）。
 
 ### 2.6a `POST /api/me/password`（#255：本人自助改密，受限会话的出口）
 
@@ -1077,7 +1077,7 @@ station-portal user enable  --login <login>
 
 **浏览器路径不受影响（必须说清的那一半）**：`req.localeHint` **只在 `/api/internal/*` 鉴权后设置**，`portal/src/locale.js` 的 `resolveRequestLocale` 本身**一字未改**、继续只认请求头 ⇒ 账号里的 `users.locale` **绝不在浏览器路径上插队**（#828 P2b 刚修完「过期账号值顶掉用户当场选的语言」，那条修复不许被 #845 回退；这条性质由 `portal/test/internal-locale.test.js` 的防回归例钉住：属主 `locale='en'` + `Cookie: locale=zh-CN` 的浏览器请求仍必须逐字出中文）。**为什么不用「挂 hint」之外的方案**：runner 发 `Accept-Language` / `Cookie` 要给没有浏览器的通道造 cookie 罐子，而且要重建镜像、重启每个人的容器；容器 env 下发 ⇒ 改语言要重建容器；任务记录加一列 ⇒ 多一个迁移、纯绕路（平台本来就能现查）。在此之前「这条消息补了英文对」在内部通道上不等于「界面会出英文」，现在这一条已成立（英文对在抛出点、语言在属主 profile 上）。
 
-**还有两类文本不在本契约的射程内，别把它们算成「没翻」**：① **写进记录里的错误文本**（例如宏 run 结算结果里的 `error` 串）——它**写一次、被读多次**，服务端写入那一刻并不知道将来读它的人用哪种语言；要本地化得改成**存 code + 参数、由界面渲染**，那是数据结构改动，不是补 `en` 能解决的。② **未捕获的编程断言**（plain `Error` / `TypeError` / `RangeError`）——`http.js` 的兜底 catch 发**固定文案** `internal error`，**不读 `err.message`**，这类中文只进日志，补 `en` 是白做。**判据**：抛出点的类型是不是 `http.js` 映射链里那些业务 `*Error` 类；不是就别补。
+**还有两类文本不在本契约的射程内，别把它们算成「没翻」**：① **写进记录里的错误文本**——它**写一次、被读多次**，服务端写入那一刻并不知道将来读它的人用哪种语言。宏 run 的**分派失败 `reason`** 已按 #850 改成**存稳定机器码 + 由界面按语言渲染**：未知 templateKind 落 `dispatch_failed:unknown_template_kind`，前端 `zh-CN` 出「分派失败：未知的模板类型」、`en` 出 `Dispatch failed: unknown template kind.`，**未知值原样显示**（不吞、不空），这条不再算「没翻」；执行器写进 `reason` 的其余内容是运维调试串（`dispatch_failed: <原 message>`），照旧原样存、原样回传。审查整改正文（`remediation_text`）等其余成品串要本地化仍需**存 code + 参数、由界面渲染**，那是数据结构改动，不是补 `en` 能解决的。② **未捕获的编程断言**（plain `Error` / `TypeError` / `RangeError`）——`http.js` 的兜底 catch 发**按请求语言选的固定文案**（#843：`en` → `internal error`，其余 → 「服务器内部错误」），**仍不读 `err.message`**，这类中文只进日志，补 `en` 是白做。**判据**：抛出点的类型是不是 `http.js` 映射链里那些业务 `*Error` 类；不是就别补。
 
 ---
 
