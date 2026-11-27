@@ -111,6 +111,13 @@
 | LLM 管理 | `GET /api/admin/fdes/:fde/llm/usage?days=30` | 近 N 天用量（直读 LiteLLM 聚合端点，#719，§4.10） |
 | LLM 用户面 | `GET /api/me/llm-quota` | **普通 FDE 读自己的周期额度**（人取 `session.user.fde_name`，无参数面；与 §4.10 同源投影；30s 缓存，#808，§2.14）|
 | LLM 用户面 | `GET /api/me/llm-usage?days=30` | **普通 FDE 读自己的近 N 天用量**（人同上；`days` 缺省 30、需 1–90 整数；#808，§2.15）|
+| 宏（用户面） | `GET /api/macro-templates` | 可订阅的宏模板：只 `audience='all'` 且 `enabled` 的，**无分页**（§4.24.1，#526）|
+| 宏（用户面） | `GET /api/macro-assignments` | 我的**用户级**订阅（只 `scope='user'` 的那些；§4.24.2，#623）|
+| 宏（用户面） | `PUT /api/macro-assignments` | 订阅 / 改期：`{templateId, cwd, until?}` ⇒ 幂等 upsert，`cwd` 必填（§4.24.3，#623）|
+| 宏（用户面） | `DELETE /api/macro-assignments/:id` | 取消订阅：有执行账 ⇒ 只停用，无执行账 ⇒ 物理删（§4.24.4，#623）|
+| 通知（用户面） | `GET /api/notifications` | 通知列表：`?unreadOnly=&limit=&cursor=` ⇒ `{items, nextCursor}`（§4.24.5，#526）|
+| 通知（用户面） | `GET /api/notifications/unread-count` | 顶栏铃铛的未读数：`{count}`，谓词 `read_at IS NULL`（§4.24.6，#526）|
+| 通知（用户面） | `POST /api/notifications/:id/read` | 标记已读：**天然幂等**（不读 body、无幂等台账；§4.24.7，#526）|
 
 > LLM 管理这条线**其余**端点（`GET/PUT /api/admin/fdes/:name/llm`、
 > `POST /api/admin/fdes/:name/llm/heartbeat`、`GET /api/admin/llm/model-catalog`、
@@ -4320,6 +4327,193 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
   没有语言），所以入库的是**标题的键与参数**，不是某个语言的成品句子。
 - **出现时**由读者端按自己当前语言拼（`portal/frontend/src/components/MacroBell.vue`；键未登记时退回
   `title`，不裸露键名）；**缺席时**原样显示 `title`——**存量行逐字不变**，服务端也不按请求语言改写 `title`。
+
+### 4.24 宏 / 通知用户面（#526 / #614 / #623：模板、订阅、通知）
+
+七条都在用户入口面（`/api/*`，**不**在 `/api/admin/*`——`http.js` 里那几条注释写明了 #450 的边缘白名单
+不允许把它们放进管理台面）。业务全在 `portal/src/macro-routes.js`（`http.js` 只做「匹配 → 鉴权 → 调用 → 发 JSON」），
+数据读写在 `portal/src/macros.js` 与 `portal/src/notifications.js`。
+
+**七条共同的四件事**（各小节只写差异）：
+
+- **谁能调**：一律 `requireSession` ⇒ 任何已登录用户，**属主恒等于当前会话的 user**（`userId` 取自会话，
+  请求里给 `userId` 也没有用——没有任何一条读它）。没有角色门：admin 与普通 FDE 走同一条码路。
+  未带 cookie / 令牌、或会话失效 ⇒ `401 unauthorized`（§1.2）。
+- **错误载体**：**业务侧**的错误经 `MacroError` / `SessionError` 抛出（`http.js:1147`、`:1061` 两处映射到 §1.1 的信封）。
+  ⚠ 但**载体不止这两个**：鉴权与请求体解析这一层抛的是 `HttpError`（未带 cookie / 令牌、会话失效 ⇒ `401 unauthorized`
+  `http.js:5207`、`:5210`；cookie 与 Bearer 同时给 ⇒ `400 ambiguous_credential` `http.js:5169-5173`；`Authorization` 非
+  Bearer ⇒ `401 unsupported_scheme` `http.js:5182`；体超限 / 体不是合法 JSON ⇒ `413 payload_too_large` `http.js:767`、
+  `400 validation_failed` `http.js:790`——这两格只能落在**读请求体**的那条上，本批七条里只有 §4.24.3 的 PUT，
+  其余六条压根不读体）。**分派前还有两道直发信封、不经 throw 的闸**（`403 cross_origin_forbidden`
+  `http.js:1255-1260`；`403 password_change_required` `http.js:1268-1279`——七条都不在 #255 的放行清单
+  `RESTRICTED_SESSION_ALLOWLIST`（`http.js:575-655`）里，清单里没有宏 / 通知面的任何一条）。**未分类异常**
+  （含 PG 直接抛上来的裸错误，顶层没有对应的映射分支）在顶层落 `500 internal`（`http.js:1155`）。
+  以上**只用既有码**（业务侧的 `validation_failed` / `not_found` / `forbidden` / `conflict`，加宿主层 §1.2 里既有的那些），
+  零新码、零新映射规则。
+- **他人资源即 404**：订阅与通知的「不是你的」与「不存在」同一个 `404 not_found`，不泄露存在性（§1.2 末段同口径）。
+- **只有通知列表分页**：七条里**只有 `GET /api/notifications` 有分页**（`notifications.js:117` 收 `limit`/`cursor`、`:138` 给
+  `nextCursor`）——**这条不是本面通则**，模板列表（§4.24.1 那条「分页：**无**」）与 §4.24.2 的订阅列表**都不分页**
+  （请求里既无游标也无 `limit` 参数；它们各自的**内部**条数上限见两小节的「分页」行）。就那条唯一分页的列表而言：
+  游标键是 `nextCursor`，**不是** §1.3 的 `next_cursor`；
+  `limit` 缺省 `50`、上限 `100`（`notifications.js:24-25`、`:76-79`，也**不是** §1.3 写的缺省 20）。这是它与 §1.3 通则的
+  实际差异，改动前先对齐（不改代码，故此处只记录现状；§1.3 本身不动）。
+
+#### 4.24.1 模板列表：`/api/macro-templates`
+
+- **请求形状**：无 query、无 body。handler 只把 `{pool}` 传下去，**任何** query 参数都不读（写了 `?kind=` 也只是被忽略）。
+- **响应键名（逐字）**：`{ "items": [ … ] }`，每一项恰好六键：
+  `id`、`kind`、`name`、`params`（缺省成 `{}`）、`scope`、`audience`。
+  这是**白名单**映射，不是删列：`enabled` / `created_by` / `created_at` / `updated_at` / `deleted_at` **不下发**。
+- **可见集合**：SQL 侧 `deleted_at IS NULL` ∧ `audience = 'all'`（`audience='admin'` 的模板不发给普通用户），
+  再在应用侧筛 `enabled === true` ⇒ 停用的模板连条目都没有。
+- **分页**：**无**。`ORDER BY kind, name`，条数上限 200（`listTemplates` 的 `limit` 缺省 200，调用方没传 ⇒ 模板多于 200 条时会静默截断）。
+- **错误码**：`401 unauthorized` 是这条链上**唯一主动返回**的业务错误（没有 `MacroError` 抛出点：`listTemplates` 的
+  `kinds`/`audience` 参数未被使用）；⚠ 「只有 401」**不穷尽**——未分类异常仍按 §1.2 落 `500 internal`（`http.js:1155`，
+  不新造码），宿主层那两道闸与鉴权面的其余落点见本节「错误载体」。
+- **副作用**：零（一条 `SELECT`）。
+
+#### 4.24.2 我的用户级订阅：`/api/macro-assignments`
+
+- **请求形状**：无 query、无 body（`userId` 取会话）。
+- **响应键名（逐字）**：`{ "items": [ … ] }`，每一项是订阅快照，十一个键：
+  `id`、`template_id`、`user_id`、`session_id`、`cwd`、`until`、`enabled`、`expired`、`effective_enabled`、
+  `last_evaluated_at`、`created_at`。`session_id` 在这一面上恒 `null`（用户级订阅不绑会话）；
+  `expired` 是**算出来的展示态**（`until <= now`），不是库里的第四种状态；`effective_enabled = (enabled === true && !expired)`。
+- **可见集合**：只返回**模板 `scope = 'user'`** 的那些订阅（会话级订阅走 `§4` 的会话面端点，不混在这里）。
+  实现是「先查 user-scope 模板 id 集合 → 取该用户全部订阅 → 在应用侧按 `template_id` 过滤」，
+  而取回那一步写死 `LIMIT 500` ⇒ **过滤发生在截断之后**：某用户订阅总数超 500 时本面可能少报（本单未实测这条腿，标**未覆盖**）。
+- **分页**：无（`ORDER BY created_at, id`）。
+- **错误码**：`401 unauthorized`（这条链上**唯一主动返回**的业务错误）；未分类异常 ⇒ `500 internal`（§1.2，`http.js:1155`，
+  不新造码）。
+- **副作用**：**这个 GET 有写，而且写的面比读的面大** —— 读之前先跑一次到期关账（`listAssignments` 进来第一件事就是
+  `applyExpiredAssignments(pool, { now, userId })`，`macros.js:552-555`）：把 `enabled AND until IS NOT NULL AND until <= now`
+  的订阅 `UPDATE … enabled = false`（`macros.js:515-522`）。⚠ 两件事必须分开读：
+  ① **副作用范围 > 返回集合**：那条 `UPDATE` 的谓词**只有 `user_id`**（`macros.js:518-519`），「只留 `scope='user'`」是
+  **之后**才在应用侧按 `template_id` 过滤出来的（`macro-routes.js:97-101`）⇒ 该用户**会话级订阅**里过期的那些也会被
+  这次 GET 停用掉，但它们**不在响应里**（§4.24.3 写完那一次关账是同一个函数、同一个谓词，`macros.js:610`，同理）。
+  ② **列表含已停用的行**：`listAssignments` 的 `includeDisabled` **缺省 `true`**（`macros.js:553`），本端点没关掉它
+  （`where.push('enabled')` 那条只在 `includeDisabled` 为假时才加，`macros.js:561`）⇒ `enabled: false` /
+  `effective_enabled: false` 的订阅照样出现在 `items[]` 里，「停用」不是「消失」。
+  所以它不是纯只读，重复调用会收敛（第二次通常 0 行）。
+
+#### 4.24.3 订阅 / 改期：`/api/macro-assignments`（写）
+
+- **请求形状**：JSON 体 `{ templateId, cwd, until? }`。⚠ **§1.5 的 `Content-Type` 契约在这条上不成立**：这条路由只调了
+  `readJsonBody`，**没有**调 §1.5 那道统一闸 `requireJson`（`http.js:1633-1641` 里只有 `readJsonBody(req)`；对照 `requireJson`
+  的定义 `http.js:736` 与它其余的调用点，例如 `http.js:1395`）⇒ 非 `application/json` 的 `Content-Type` **不会**被拒，
+  `text/plain` 的合法 JSON 照样进 handler（按 `http.js:1633-1641` 现读，HTTP 端到端未实测）。真实的体约束只有两条：
+  体积超限 ⇒ `413 payload_too_large`（`readJsonBody` 的缺省上限 `64 KiB`，`http.js:70`、`:767`、`:777`，`details.max_bytes`
+  给上限），体不是合法 JSON ⇒ `400 validation_failed`（`invalid JSON body`，`http.js:790`；**空体按 `{}` 处理**
+  `http.js:786` ⇒ 落到下面校验顺序第 1 条的 `details.field='templateId'`）。**这是实现与 §1.5 的偏差**：要统一到 §1.5
+  是决策面的事，本单不改代码，也**没有**顺手给这条补 `requireJson`。
+  属主一律会话用户：**body 里给 `userId` 不参与判定**。
+- **校验顺序与错误（逐字 `details`）**：
+  1. `templateId` 必须是非空字符串 ⇒ 否则 `400 validation_failed`，`details.field = 'templateId'`。
+  2. `cwd` 必填且去空白后非空 ⇒ 否则 `400 validation_failed`，`details.field = 'cwd'`；
+     有值则复用会话面同一份校验（`validateSessionCwd`）：只收 `~/projects/<name>` **一级目录**，
+     拒 `.` / `..` / 控制字符 / 绝对路径 / 多级目录 ⇒ `400 validation_failed`，
+     ⚠ 此时 `details.field` 是 **`'project_id'`**（复用了会话面的文案与字段名，与本 body 的键名 `cwd` **不一致**——按 `code` 分支，别按 `details.field` 猜）。
+     服务端把值归一化成 `~/projects/<name>` 后才入库。
+  3. 模板查不到（含软删的）⇒ `404 not_found`，`details.templateId`。
+  4. 模板 `audience = 'admin'` ⇒ `403 forbidden`，`details.templateId`（本面调用时 `isAdmin` 恒为假 ⇒ 普通用户订不到管理向模板）。
+  5. 模板 `scope = 'session'` ⇒ `400 validation_failed`，`details.field = 'sessionId'`（本端点恒传 `session_id = null`，
+     所以会话向模板从这里订不进去，这是设计而非缺陷）。
+  6. 模板 `enabled = false` ⇒ `409 conflict`，`details.templateId`。
+  7. `until` 给了但不是合法时刻 ⇒ `400 validation_failed`，`details.field = 'until'`（`details.received` 带原值）。
+- **响应键名（逐字）**：`{ "assignment": { …上面那十一个键…, "reused": true|false } }`。
+  `reused` **不是数据库给的事实，是推断出来的展示值**：`reused = res.rowCount === 1 && row.created_at < at`（`macros.js:612`）。
+  前半**恒真、不携带信息**——`rowCount` 对新插入与 `ON CONFLICT (template_id, user_id, session_id, cwd) DO UPDATE SET enabled, until, cwd`
+  **两条支都返回 1**（PG 的 `INSERT … ON CONFLICT DO UPDATE … RETURNING` 命令标签两支都是 `INSERT 0 1`；本单在 PG 16 上直查实测）。
+  于是判据实际只剩「行上的 `created_at` **早于**本次请求的 `at`」，而这两个时刻来自**两台时钟**：`created_at` 是 DB 侧
+  `DEFAULT now()`（`deploy/migrations/0035-macro-platform.sql:72`），`at` 是应用侧 `toInstant('now', new Date())`（`macros.js:601`）
+  ⇒ **时钟偏差两个方向都可能误标**：DB 慢于应用 ⇒ 刚插入的新行被标 `reused: true`；DB 快于应用且两次请求贴得够近 ⇒
+  真复用被标成 `false`。别拿它当「这一次到底有没有新行」的可靠信号。
+- **幂等**：**是**（靠唯一订阅键 `UNIQUE NULLS NOT DISTINCT (template_id, user_id, session_id, cwd)`）。⚠ 语义是「覆盖」不是「不变」：
+  本次没给 `until` 就会把它写成 `null`，给了就改期。
+- **副作用**：`macro_assignments` 一行 INSERT 或 UPDATE；写完再跑一次本人范围的到期关账。
+- **未覆盖**：`templateId` 只判「非空字符串」，**没有 UUID 形状校验**，串直接进 uuid 列。非 UUID 的串实际落 `500 internal`
+  还是 `404 not_found` 本单**未实测**，不写死。
+
+#### 4.24.4 取消订阅：`/api/macro-assignments/:id`
+
+- **谁能调**：本人（`userId` 与订阅行不符就当作不存在）。`:id` 是订阅行 id；路径参数只经 `decodeUuid`
+  = `decodeURIComponent` + 转小写（UUID 大小写等价，故大写也认）。
+- **请求形状**：无 body，**且不读 JSON 体**（这条不经过 §1.5 那道 `Content-Type` 闸）。
+- **响应键名（逐字，两个分支形状不同）**：
+  - 该订阅**有**执行账（`macro_runs` 里有条目）⇒ `{ "mode": "disabled", "macroRuns": <条数>, "assignment": { …十一个键… } }`；
+  - 该订阅**没有**执行账 ⇒ `{ "mode": "deleted", "macroRuns": 0 }` —— **没有 `assignment` 键**。
+  历史不被「不想再跑了」顺手抹掉，所以有账时只停用不删行。
+- **错误码**：`404 not_found`（`details.assignmentId`；非属主与不存在同一个码）；`401 unauthorized`。
+  ⚠ 但「随便一个串都会走到 404」**不成立**：`:id` 只经 `decodeUuid` = `decodeURIComponent` + 转小写，**不校验形状**
+  （`http.js:1169-1171`），三条不同的落点：
+  ① **形状是合法 UUID**、但不存在或不是你的 ⇒ 同一个 `404 not_found`；
+  ② 形状**不是**合法 UUID 的串（如 `not-a-uuid`）原样进 SQL 与 `uuid` 列比较（`macros.js:625`）⇒ PG 报
+  `22P02 invalid_text_representation`（`invalid input syntax for type uuid`，本单在 PG 16 上对 `macro_assignments.id`
+  直查实测）⇒ 它不是任何已映射的错误类 ⇒ 顶层落 **`500 internal`**（`http.js:1155`），**不是 404**
+  （PG 侧的 `22P02` 已实测；「落到 HTTP 500」按 `http.js:1155` 现读推断，端到端未实测）；
+  ③ 路径里带**无效百分号转义**（如 `%zz`）⇒ `decodeURIComponent` 自己抛 `URIError`（本单用 node 实测），而 `URIError`
+  不在顶层任何映射分支里 ⇒ 同样落 **`500 internal`**（HTTP 端到端未实测）。
+- **幂等**：分分支——停用支重复调用仍 `200` 且 `mode: "disabled"`；物理删支第二次拿到 `404`（行已经没了）。
+- **副作用**：事务内 `SELECT … FOR UPDATE`，然后 `UPDATE … enabled = false` **或** `DELETE`。整笔在一个事务里（失败回滚）。
+
+#### 4.24.5 通知列表：`/api/notifications`
+
+- **请求形状（query，三个都可选）**：
+  - `unreadOnly` —— 只有字符串 `true` 或 `1` 算真，**其余一律假**（含 `TRUE` / `yes`）；真时只扫未读。
+  - `limit` —— 非有限数或 `< 1` ⇒ 缺省 `50`；`> 100` 向下取整并截到 `100`。
+  - `cursor` —— 上一次响应里的 `nextCursor` 原样回传。
+- **响应键名（逐字）**：`{ "items": [ … ], "nextCursor": "<opaque>" | null }`。每一项：
+  `id`、`severity`、`title`、`body`、`read_at`（未读为 `null`）、`created_at`；
+  **可选出现**的 `title_key` / `title_params`（§4.23：**没有值时连键都不出现**，不给 `null` 壳）。
+  `severity` 取值 `info` / `error`（写侧由「收件人 × 成败」推导，不由动作类型推导）。
+- **排序 / 分页**：`ORDER BY created_at DESC, id DESC` 的 keyset（行值比较 `(created_at, id) < (…)`），
+  游标是 `base64url(JSON({t, i}))`；到底 ⇒ `nextCursor` 为 `null`。实现内部多取一行判「还有没有」，那一行不外泄。
+- **错误码**：`401 unauthorized`；游标非法 ⇒ `400 validation_failed`，但 **`details.field` 有两个值**（本单直接调
+  `decodeNotificationCursor` 跑了七种输入，逐个实测）：
+  - `details.field = 'cursor'` —— `cursor` 解不出 JSON（`notifications.js:65-68`）、或 `i` 缺席 / 非字符串、或 `t` **缺席 / 是 `null`**
+    （`toInstant` 对 `null`/`undefined` 返回 `null` 而不抛，`macros.js:193` ⇒ 落回 `notifications.js:70-72`）；
+  - `details.field = 'cursor.t'` —— `t` **给了却不是合法时刻**（如 `"nonsense"`）⇒ `toInstant('cursor.t', …)` 当场抛
+    （`macros.js:192-197`），另带 `details.received`（原值）。
+  按 `details.field` 分支的调用方要准备这两个值；未分类异常 ⇒ `500 internal`（§1.2，`http.js:1155`）。
+- **副作用**：零（一条 `SELECT`）。
+- **注册顺序（影响可用性，不是契约）**：`/api/notifications/unread-count` 排在 `…/:id/read` 之前注册
+  （`http.js` 里那条注释写明了同名空间的静态段要先注册）。
+
+#### 4.24.6 未读数：`/api/notifications/unread-count`
+
+- **请求形状**：**无参数**（给了任何 query 都不读）。
+- **响应键名（逐字）**：`{ "count": <整数> }` —— 只有一个键。谓词是 `read_at IS NULL`，
+  与「标记已读」用的是**同一个谓词**（一致性靠同源，不另算一套）。
+- **错误码**：`401 unauthorized`（这条链上**唯一主动返回**的业务错误）；未分类异常 ⇒ `500 internal`（§1.2，`http.js:1155`，
+  不新造码）。
+- **副作用**：零（`COUNT(*)`）。
+- **前端事实**：读不到时前端**保留上一个数字**（宁旧不错），所以角标滞后不代表后端没数。
+
+#### 4.24.7 标记已读：`/api/notifications/:id/read`
+
+- **谁能调**：本人。`:id` 是通知 id —— **32 位 hex 短串，不是 UUID**；路径参数只做 `decodeURIComponent` + 转小写，
+  **不校验形状**（`http.js:1653`）。⇒ 「随便一个串都不会 400、只会 404」**只对能解码的串成立**：`id` 列是
+  `VARCHAR(32)`（`deploy/migrations/0037-notifications-and-origin.sql:26`）而不是 `uuid`，所以任意可解码的串（含超长串、
+  非 hex 串）只是在 SQL 里比不中 ⇒ 走到「查无此人」的 `404`（本单在 PG 16 上直查确认这类比较**不报错**）；
+  但**无效百分号转义**（如 `%zz`）会让 `decodeURIComponent` 抛 `URIError`（本单 node 实测）⇒ 顶层 **`500 internal`**
+  （`http.js:1155`；抛错这一半已实测，HTTP 端到端未实测）——这种请求**拿不到 404，也拿不到 400**。
+  uuid 列那两面（§4.24.4 的 `:id`、§4.24.3 body 里的 `templateId`）还多一类落点：形状非法的 UUID 串进 `uuid` 列
+  比较 ⇒ PG `22P02` ⇒ 按 `http.js:1155` 推成 `500`（端到端未实测），逐条见 §4.24.4。
+- **请求形状**：**不读请求体**（这条不经过 §1.5 那道 `Content-Type` 闸，带什么 body 都不影响结果；
+  前端发的是 `body: '{}'`）。也**没有** `Idempotency-Key` 台账（§1.4：台账唯一写入方仍是发消息）。
+- **响应键名（逐字）**：`{ "notification": { …与 §4.24.5 的条目同形… } }`。
+- **幂等**：**是，且是天然幂等**（不靠台账）——已读过的再点一次返回**既有的** `read_at`，
+  不刷新时刻、不报错（「已读」是事件不是时长）。
+- **错误码**：`404 not_found`（`details.notificationId`；不存在与非属主同一个码）；`401 unauthorized`。
+- **副作用**：首次 ⇒ `UPDATE notifications SET read_at = <应用侧写的时刻>`（DDL 侧无 `DEFAULT CURRENT_TIMESTAMP`，时刻由应用带）；
+  二次 ⇒ 该 `UPDATE` 命中 0 行、改做一次 `SELECT` 回读，**不再写**。
+- **前端事实**：角标数字由前端本地减一（响应里没有 count），所以并发的另一处已读不会立刻反映到角标，下一次拉 `unread-count` 才收敛。
+
+#### 4.24.8 本批未登记的同族端点（诚实边界）
+
+上面七条之外，宏 / 通知面还有一批**已实现但本批仍未登记**的端点（会话级订阅读写、会话 / 用户的宏流水、
+管理台模板与流水、以及 `GET /api/macro-runs`），它们仍挂在豁免表里等后续批次补
+（`scripts/doc-impl-exceptions.json`）。**本节不写它们** = 没有契约，不等于行为不存在。
 
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
 
