@@ -129,10 +129,10 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 | P1-2 | schema.sql 空库可执行 | §2.2.2 命令 | `COMMIT`、退出码 0 | 无 `ERROR`（§2.2.2） |
 | P1-3 | 临时栈集成 + 清理 | §2.2 全套 + 清理断言 | 测试通过 + 无 `station-test-*` 残留 | 退出码 0（§2.2.4） |
 | P1-4 | internal token 拒绝路径 | §3.2 C1/C2/C3/C6 | 401/403 各分支 | 逐条匹配（§3.2 C） |
-| P1-5 | 幂等/崩溃核心 | §3.4 R4/R6/R7/R10/R11 | 无重复事件 / CAS 拒旧 / fence 旧写 / `run_end` 唯一 | 逐条匹配（§3.4） |
+| P1-5 | 幂等/崩溃核心 | §3.4 R4/R7/R10/R11（**R6 已随 #640 退役**，见 §3.4 该行） | 无重复事件 / fence 旧写 / `run_end` 唯一 | 逐条匹配（§3.4） |
 | P1-6 | 网络隔离（本机可跑） | §3.1 N1–N3/N6 | N1 通、N2/N3 拒、N6 通（N4 归 P2） | 逐条匹配（§3.1） |
 | P1-7 | 真机主链路 | §3.7.1 playwright + vision | 登录→建项目→对话→工具卡片→停止 | 截图可读 + 无致命 console（§3.7.1） |
-| P1-8 | contract-tests 接入 | §3.6.3 | 导出面正确 + 深路径 `ERR_PACKAGE_PATH_NOT_EXPORTED` | 接入（§3.6.3） |
+| P1-8 | contract-tests 接入 | §3.6.3 | 导出面正确 + 深路径 `ERR_PACKAGE_PATH_NOT_EXPORTED` | 部分：store/file-tools/tool-result 三个套件已接入并在 `npm test` 面里；**config provider 那条未接入**（§3.6.3 接入落点） |
 
 **P2（多 FDE、run 级端口分配+预览、事件重放、工具审批、账号生命周期）**
 
@@ -493,17 +493,17 @@ internal 通道与公开端点的 `validation_failed` **统一为 `400`**（port
 
 > 契约锚点：runner §1.3「契约测试 | `erix-agent/contract-tests` | `package.json:23-27` exports；`test/contract/index.js` 导出 `transcriptStoreContract` / `modelConfigProviderContract`」。**该包只导出 `.` / `./tools` / `./contract-tests`**，深路径导入会被 `ERR_PACKAGE_PATH_NOT_EXPORTED` 拒绝。
 
-接入步骤（依赖装好后执行；当前 `erix-agent` 尚未安装，见 §5）：
+接入步骤（**本文此前的「当前 `erix-agent` 尚未安装」已过期**，261128 现验：根 `package.json` 与 `runner/package.json` 均 pin `erix-agent` `0.33.0`，且已有三个契约套件在跑 ⇒ §5 表第 4 行同步更正；下面的命令保留为「升级后重验导出面」的可复现配方）：
 
 ```bash
-# 1) 安装并 pin（版本 pin 走 containers.agent_version + canary，规格 §14/§13.2；下文以文档锚定的 v0.3.5 为例，替换为实际 pin）
-ERIX_AGENT_VERSION=0.3.5
+# 1) 安装并 pin（**版本 pin 以 `package.json` / `runner/package.json` 的 `erix-agent` 字段现读为准**，本文不写死版本号；规格 §14/§13.2）
+ERIX_AGENT_VERSION="$(node -p "require('./package.json').dependencies['erix-agent']")"
 npm install "erix-agent@$ERIX_AGENT_VERSION"
 
 # 2) 验证导出面（只允许这三个入口）
 node --input-type=module -e \
   "import('erix-agent/contract-tests').then(m => { console.log(Object.keys(m).sort().join(',')); })"
-# 期望输出包含：transcriptStoreContract,modelConfigProviderContract
+# 期望输出包含：transcriptStoreContract,modelConfigProviderContract（261128 现读 0.33.0：该子路径共导出 12 个契约，两个名字都在内 ⇒ 期望成立）
 
 # 3) 深路径导入必须被拒（负向断言）
 node --input-type=module -e \
@@ -511,11 +511,12 @@ node --input-type=module -e \
 # 期望输出：ERR_PACKAGE_PATH_NOT_EXPORTED（退出码 0）
 ```
 
-接入落点（实现后）：
+接入落点（**逐条标「已接入 / 未接入」，判据是仓内现读的导入点，不是本文的意愿**）：
 
-- **store adapter 契约测试**：用 `transcriptStoreContract` 跑**本平台的 HTTP store adapter**（实现 `TranscriptStore` 现役方法，映射到 portal internal U5–U7 与 run-state 端点；**U8/U9（run snapshot）已随 #640 退役**，runner §9.1）。跑法：起 in-process stub 实现这些端点（§2.1 fake），adapter 指向 stub，contract 测试逐方法断言。**这验证的是「我们的 adapter 满足上游 store 接口语义」，不是验证 portal 业务逻辑**。
-- **config provider 契约测试**：用 `modelConfigProviderContract` 跑**本平台物化的 `config.json`**（顶层键 `slots` + 占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot，user-space §4.3.2）经 `createJsonFileModelConfigProvider` 解析的结果——断言三个 slot 可解析、占位 key 可读（真实 key 由 Traefik 注入，容器内零凭据，runner §11.1）。
-- **CI 接入**：规格 §13.2-6「`erix-agent/contract-tests` 应接入 CI（长期运行的宿主必需）」——落点为 `npm test` 的一个子集（`contract-tests` 目录），随全绿门槛执行。
+- **store adapter 契约测试**（✅ **已接入**：`runner/test/store-contract.test.js`、`portal/test/transcript-store.test.js` 均 `import { transcriptStoreContract } from 'erix-agent/contract-tests'`）：用 `transcriptStoreContract` 跑**本平台的 HTTP store adapter**（实现 `TranscriptStore` 现役方法，映射到 portal internal U5–U7 与 run-state 端点；**U8/U9（run snapshot）已随 #640 退役**，runner §9.1）。跑法：起 in-process stub 实现这些端点（§2.1 fake），adapter 指向 stub，contract 测试逐方法断言。**这验证的是「我们的 adapter 满足上游 store 接口语义」，不是验证 portal 业务逻辑**。
+- **config provider 契约测试**（❌ **未接入 ⇒ 真缺口**：`grep -rnw modelConfigProviderContract` 在 `portal/`、`runner/`、`test/` 的全部 `*.js`/`*.mjs`/`*.ts`/`*.vue` 里 **0 命中**，只在本文与 [`design/runner-integration.md`](design/runner-integration.md) §1.3 的表里被点名（文档里的条数会随本文自身改动而变，别抄数字，判据就是上面那条 `grep -rnw`）⇒ 那些位置写的是**期望**而非现状；⚠ 引擎侧**确有**该导出，261128 现读 0.33.0 的 `erix-agent/contract-tests` 导出面含 `modelConfigProviderContract` ⇒ 缺的是**本站没有跑它**，不是上游没有）。要补的内容：用 `modelConfigProviderContract` 跑**本平台物化的 `config.json`**（顶层键 `slots` + 占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot，user-space §4.3.2）经 `createJsonFileModelConfigProvider` 解析的结果——断言三个 slot 可解析、占位 key 可读（真实 key 由 Traefik 注入，容器内零凭据，runner §11.1）。本站**已在用**那个 provider（`runner/worker.js` 导 `createJsonFileModelConfigProvider`），只是没跑上游契约套件 ⇒ 缺口是「装配没被上游语义钉住」，不是「功能没做」。
+- **其它已接入的套件**（本文此前未登记）：`runner/test/file-tools-contract.test.js` 跑 `fileToolsContract`（issue #228）、`runner/test/tool-result-envelope-contract.test.js` 跑 `toolResultEnvelopeContract` ⇒ 判据是这两个文件的 `import ... from 'erix-agent/contract-tests'`。反面一例：`engineApiContract` 已不再被本站接入（`portal/src/display-projection.js` 之后，见 `portal/test/engine-upgrade-299.test.js` 的注记）。
+- **CI 接入**：规格 §13.2-6「`erix-agent/contract-tests` 应接入 CI（长期运行的宿主必需）」——落点为 `npm test` 的一个子集（`contract-tests` 目录），随全绿门槛执行。✅ 已成立：上面点名的三个套件都在 `node --test` 的根发现面内（`runner/test/*.js` 与 `portal/test/*.js`），随 `npm test` 跑（`ci.yml` 步骤 ②）。
 
 ### 3.7 浏览器验证流程（playwright MCP → 截图 → vision MCP；守不变式 2，P1 验收主链路）
 
@@ -615,8 +616,8 @@ P1 交付完成 = 同时满足：
 1. **语法/单测全绿**：`node --check` 0 错误 + `npm test` 全绿（§1.2.1/§1.2.2）。
 2. **临时栈集成通过**：§2.2 的 `psql -f schema.sql` 空库可执行 + 集成测试（DB 约束/路由/物化/租约 CAS）通过，且临时资源清理断言通过（§2.2.4）。
 3. **P1 真机主链路走通**：规格 §15 P1 行「登录→建项目→对话→工具卡片→停止」用 playwright + vision 走通（§3.7.1），截图可读、无致命 console 错误。
-4. **P1 范围安全回归通过**：§3.1 中本机可跑的 N1–N3/N6 + §3.2 C（internal token）+ §3.4 R4/R6/R7/R10/R11 真机通过（§4.2 判「必须真机」的项；N4 归 P2）。
-5. **契约测试接入**：§3.6.3 的 `erix-agent/contract-tests` 跑通（store adapter + config provider），深路径导入被拒的负向断言通过。
+4. **P1 范围安全回归通过**：§3.1 中本机可跑的 N1–N3/N6 + §3.2 C（internal token）+ §3.4 R4/R7/R10/R11 真机通过（R6 已随 #640 退役 ⇒ 不再是待过项，判据见 §3.4 该行；§4.2 判「必须真机」的项；N4 归 P2）。
+5. **契约测试接入**：§3.6.3 的 `erix-agent/contract-tests` 跑通（store adapter ✅ 已接入；config provider ❌ **未接入 ⇒ 本条今天只满足一半**，判据与要补的内容见 §3.6.3 的「接入落点」），深路径导入被拒的负向断言通过（✅ 现验可复现：`node --input-type=module -e "import('erix-agent/tools/jail').then(()=>process.exit(1),e=>console.log(e.code))"` ⇒ `ERR_PACKAGE_PATH_NOT_EXPORTED`）。
 
 > ⚠️ **P1 是否含预览/真实 LLM（待决策者确认）**：按 deploy §7.2 已定 **P1 不含**预览 iframe、多 FDE、**真实 LLM 网关**（归 P2/P3）；**P1 对话验收走无真实凭据的 mock 网关（deploy §7.3 + §3.9）**。因此：
 > - **若按「P1 不含预览/真实 LLM」**（当前文档定稿）：§3.2 B（preview ticket）、§3.1 N4 的「多 FDE」完整版、真实 LLM 注入（topology §4-L7）**不属于 P1 验收**，归 P2/P3；P1 只须保证「未部署预览路由 = fail-closed」（`*.fde.<base>` 无路由 → 404/不可达）这一条，对话链路用 §3.9 的 mock 断言。
@@ -655,7 +656,7 @@ P1 交付完成 = 同时满足：
 | 1 | **真实 LLM 配额/调用**（P3） | 需真实 LLM 网关 + 上游配额；P1 对话走**无真实凭据的 OpenAI-compatible mock/test gateway**（deploy §7.3，容器仍只持占位 key + `endpoint`，无 `LLM_DEV_*` 变量） | P1 用 mock/占位断言「请求发出、错误码映射（`rate_limited`→429、`checkpoint_failed`）正确」（§3.9）；真实配额 P3 验收 |
 | 2 | **目标环境网络策略（出口管控）** | 外部依赖（安全团队，issue #3），本机开发机未实施 | N5（FDE→互联网）目标环境实测；「改 endpoint 无效」（P3 验收）依赖安全团队策略，未实施时降级为审计+告警（规格 §11.4） |
 | 3 | **LLM 注入真实虚拟 key 覆盖伪造头**（topology §4-L7/§10 证据 8） | P3 才部署 `llm-gateway` + LLM 注入路由（deploy §7.2） | 归 P3 验收；P1 不测（不假通过） |
-| 4 | **`erix-agent` 依赖未安装**（本机无 `~/projects/erix-agent`，npm 源未接入） | 契约已定义（runner §1.3），接入命令见 §3.6.3 | 「待接入」：安装 + contract-tests 跑通后转「已测」；当前显式标「未验收」 |
+| 4 | **config provider 契约未跑**（`modelConfigProviderContract` 本站 0 个使用者） | 引擎侧**有**该导出（261128 现读 0.33.0 的 `erix-agent/contract-tests` 导出面含它），但本站没有任何测试用它 ⇒ 本文此前写的「`erix-agent` 依赖未安装」已过期（根与 `runner/package.json` 均 pin `0.33.0`，`transcriptStoreContract` / `fileToolsContract` / `toolResultEnvelopeContract` 三个套件已在 `npm test` 面里跑） | 显式标**未验收**：补上「跑物化 `config.json` 的 config provider 契约」后才能转「已测」（落点与判据 ⇒ §3.6.3）；不拿「其它套件已绿」冒充这条绿 |
 | 5 | **预览 ticket/cookie 的 TTL 实测**（60s/15min ⚠️） | 参数待决策者确认（portal §2.8） | 拍板后按值测；未拍板前只测「过期即拒」的方向性断言，不测具体秒数 |
 | 6 | **多 FDE 全量隔离**（30 FDE 规模） | P2（deploy §7.2「多 FDE」），P1 单 FDE | P1 只测「单 FDE + 假容器」的拓扑隔离；30 FDE 规模/批量 offboarding 归 P2 |
 | 7 | **DNS-01 / 真实证书 / VPN-only / 公网可达**（env §1/§2/§3 🕓 部署期） | 部署期事项，P1 开发不需要 | 开发期用 hosts/localhost 变通 + 自签/http；部署期按 env §9 探测后实测 |
