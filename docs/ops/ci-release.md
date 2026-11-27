@@ -265,6 +265,14 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
 - `portal/test/api-tokens-db.test.js`——#736 的 API 令牌真库腿（`revoked` 谓词、`last_used_at` 窗、
   `ON CONFLICT`）。本文此前只列两条 ⇒ 是 `check:doc-impl` 的腿名比对抓出来的（豁免账随之注销）。
 
+**曾经在这里、现在不在的第四条（#777 A6 注销退役标注）**：`prune-checkpoints-db` —— `0034-prune-stale-run-checkpoints.sql`
+当初配的真库腿。它的**判据对象已经整体没了**：`run_checkpoints` 表由迁移 `0041-retire-run-checkpoints.sql:49` 一句
+`DROP TABLE IF EXISTS public.run_checkpoints` 撤掉（run snapshot 竖切随 erix-agent 0.33.0 退役，issue #640），
+配套的那个测试文件也随 #640 的 M4 清理整文件删除。现查判据：`ls portal/test | grep -c prune` ⇒ **`0`**
+（本文不拼全路径：上面的腿名比对把「文中出现的 `portal/test/*.test.js`」当作「该文件必须存在」来校，
+把已删的文件名写回去只会当场制造一条红）。⚠ **别照抄回来**：`0034` 那条迁移文件仍在链路里且**不许改一字节**
+（已应用迁移改一字节 = 现存库全部拒绝启动，见 `0041` 头注释），但它剪的那张表已经不在了 ⇒ 那条腿无物可剪。
+
 常驻「**skip 不算绿**」闸：`scripts/check-required-legs.mjs`（根脚本 `npm run check:ci-legs`，
 本地也能跑）。它对「必须真跑清单」：有 `TEST_DATABASE_URL` 时逐条真跑并断言 `# skipped
 == 0` 且真跑出 pass（skip>0 或 pass 低于期望 ⇒ 红）；没有 `TEST_DATABASE_URL` 时明确点名

@@ -27,6 +27,7 @@
 | 分类 | 方法 + 路径 | 说明 |
 |---|---|---|
 | 站点 | `GET /api/site` | **公开、零秘密**：两个入口的对外 URL（`userBaseUrl` / `adminBaseUrl`，§2.12；#450 A2）。无会话也 `200` |
+| 站点 | `GET /api/health` | **就绪探针**（与 `/healthz` 同一个 handler，`http.js:1218-1237`）：就绪 `200 {status:"ok", version:{station,revision,builtAt}}`（有缓冲实例时才多 `partialBuffer`）；未就绪 `503 migration_failed`；**无需鉴权**，非 `GET` ⇒ `405` |
 | 认证 | `POST /api/auth/login` | 第一步：口令校验 |
 | 认证 | `POST /api/auth/login/totp` | 第二步：TOTP 校验，发 cookie |
 | 认证 | `POST /api/auth/login/email-code` | 第二步：**邮箱验证码**校验，发 cookie（#449，§2.3a）|
@@ -35,6 +36,9 @@
 | 认证 | `GET /api/me` | 当前用户信息（含 `must_change_password` 与 `file_upload_enabled`，§2.6）|
 | 认证 | `POST /api/me/password` | **本人自助改密**（#255 首登强制改密的唯一出口，§2.6a）|
 | 认证 | `PATCH /api/me/locale` | **本人改账号级语言偏好**（#828 P1，写 `users.locale`，§2.6b）|
+| Git 凭据（本人） | `GET /api/me/git-credential` | **自服务面**：列本人 `fde_name` 的凭据 ⇒ `{items:[{host,protocol,username,token}]}`，`token` **是掩码**（§2.16）|
+| Git 凭据（本人） | `PUT /api/me/git-credential` | 配一个 host ⇒ `{host,username,configured:true}`（**不回显 token**，§2.16）|
+| Git 凭据（本人） | `DELETE /api/me/git-credential` | 删一个 host ⇒ `{host,deleted}`；⚠ `host` 走 **JSON body**，不是 `?host=`（§2.16）|
 | 边缘授权 | `GET /api/forward-auth` | Traefik forwardAuth 回调（非浏览器 API） |
 | 项目 | `GET /api/projects` | 项目列表（**留档只读**，P5 后表内无新行 ⇒ 正常返回空 `items`，§3.2/§3.3） |
 | 项目 | `POST /api/projects` | **已退役 `410 project_api_retired`**（目录即项目，§3.3） |
@@ -53,6 +57,7 @@
 | 管理 | `PATCH /api/admin/users/:id` | 更新用户资料、角色、FDE 名称或状态 |
 | 管理 | `DELETE /api/admin/users/:id` | 停用用户；有 FDE 资源时异步下线（用户行永久保留） |
 | 管理 | `POST /api/admin/users/:id/offboarding/retry` | 重试失败的 FDE 下线任务 |
+| 管理 | `POST /api/admin/users/:id/onboard/retry` | 重试失败的 FDE **开户**任务：`{onboarding:{state,step,error,llm_binding?}}`。**只有「既不失败、也没有可重排的失败步骤」才是 `200` 原样回**：`state=running` ⇒ **`409 onboarding_running`**（`http.js:2195-2197`）；`state ∈ {done, awaiting_credential}` 但 `llm-binding` 步骤 `failed` ⇒ **照样重新排队**（`onboarding.js:284-287` 的 `hasFailedLlmBinding` 分支）。判定原文：`if (row.state !== 'failed' && !(hasFailedLlmBinding && ['done', 'awaiting_credential'].includes(row.state))) return onboardingStatus(row);` |
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-enroll` | 补绑/重绑 TOTP；新种子只在本次响应下发并强制重新登录 |
@@ -103,11 +108,19 @@
 | 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
 | 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **未交付**（同上；internal 面 U10/U11 保留作协议留档）|
 | LLM 管理 | `GET /api/admin/llm/providers` | 供应商 + 模型列表（模型对象的两个名字见 §4.9） |
+| LLM 管理 | `POST /api/admin/llm/providers` | **新建 credential**（一个供应商 = 一条 LiteLLM credential）：`{(credential_name\|name), base_url?, api_key?, description?, credential_info?, credential_values?}` ⇒ **`201`** `{provider}`，响应里 `models` **恒为 `[]`**（§4.9-1）|
+| LLM 管理 | `PATCH /api/admin/llm/providers/:id` | **改 credential**：`{base_url?, credential_info?, credential_values?}`；⚠ **带 `enabled` 就 `400`**——credential **没有启停**语义（§4.9-1）|
+| LLM 管理 | `DELETE /api/admin/llm/providers/:id` | 删 credential ⇒ **`204` 无体**；它名下的模型一并消失（§4.9-1）|
+| LLM 管理 | `GET /api/admin/llm/models` | **模型目录全量**（唯一真相源 = LiteLLM 的 DB，本站只转发 + 投影）⇒ `{items:[…]}`，**无分页、无筛选参数**（§4.9-1）|
+| LLM 管理 | `POST /api/admin/llm/models/:id/block` | **停用模型**（本站唯一的启停入口）：无 body ⇒ `{model_id, enabled:false}`，转发上游 `POST /model/block`（§4.9-1）|
+| LLM 管理 | `POST /api/admin/llm/models/:id/unblock` | **启用模型**：无 body ⇒ `{model_id, enabled:true}`，转发上游 `POST /model/unblock`（§4.9-1）|
 | LLM 管理 | `POST /api/admin/llm/providers/:id/models` | 新增模型 |
 | LLM 管理 | `PATCH /api/admin/llm/models/:id` | **改模型：调用名 `call_name`（数据面）与显示名 `name` 是两个字段**（#296，§4.9） |
 | LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」——**当前无实现 ⇒ 404**（#777 A1）|
 | LLM 管理 | `DELETE /api/admin/llm/models/:id` | 删模型（附虚拟 key 清理） |
 | LLM 管理 | `GET/PUT /api/admin/fdes/:fde/llm/budget` | 读/设 **FDE 周期额度（USD / 周期，`budget_period` ∈ {`1d`,`1mo`}）**（#719，§4.10） |
+| LLM 管理 | `GET /api/admin/fdes/:fde/llm` | **读 FDE 的 LLM 绑定** ⇒ `{config, active_run}`；无绑定也 `200` 且 `config:null`；`api_key` 只掩码（§4.10-1）|
+| LLM 管理 | `PUT /api/admin/fdes/:fde/llm` | **写绑定** ⇒ `{config}`；⚠ `api_key` **不得按 FDE 提交**（给了就 `400`）；有活跃 run 需 `force=true`（§4.10-1）|
 | LLM 管理 | `GET /api/admin/fdes/:fde/llm/usage?days=30` | 近 N 天用量（直读 LiteLLM 聚合端点，#719，§4.10） |
 | LLM 用户面 | `GET /api/me/llm-quota` | **普通 FDE 读自己的周期额度**（人取 `session.user.fde_name`，无参数面；与 §4.10 同源投影；30s 缓存，#808，§2.14）|
 | LLM 用户面 | `GET /api/me/llm-usage?days=30` | **普通 FDE 读自己的近 N 天用量**（人同上；`days` 缺省 30、需 1–90 整数；#808，§2.15）|
@@ -118,6 +131,18 @@
 | 通知（用户面） | `GET /api/notifications` | 通知列表：`?unreadOnly=&limit=&cursor=` ⇒ `{items, nextCursor}`（§4.24.5，#526）|
 | 通知（用户面） | `GET /api/notifications/unread-count` | 顶栏铃铛的未读数：`{count}`，谓词 `read_at IS NULL`（§4.24.6，#526）|
 | 通知（用户面） | `POST /api/notifications/:id/read` | 标记已读：**天然幂等**（不读 body、无幂等台账；§4.24.7，#526）|
+| 宏（会话面） | `GET /api/sessions/:id/macro-assignments` | **会话级**订阅列表（属主 = 会话属主，非属主与不存在同为 `404`；§4.24.9，#526）|
+| 宏（会话面） | `PUT /api/sessions/:id/macro-assignments` | 会话内订阅 / 改期：`{templateId, until?}` ⇒ 幂等 upsert，`cwd` **恒 `null`**（§4.24.9，#526）|
+| 宏（会话面） | `DELETE /api/sessions/:id/macro-assignments/:assignmentId` | 取消会话订阅：有执行账 ⇒ 只停用，无账 ⇒ 物理删（§4.24.9，#526）|
+| 宏（执行账） | `GET /api/sessions/:id/macro-runs` | 会话视角的宏执行账：`?criterion=&verdict=&limit=&cursor=` ⇒ `{items, nextCursor}`（§4.24.10，#526）|
+| 宏（执行账） | `GET /api/macro-runs` | **用户级跨会话**执行账（顶栏 chip，#614）：同形同参数，但出口再剥 `snapshot_id`/`worktree_path`/`verdict_raw`（§4.24.10）|
+| 宏（管理台） | `GET /api/admin/macro-templates` | 模板全量（含 `audience='admin'`、含 `enabled`）+ 每条 `subscriberCount`（只数**启用**订阅）；`?includeDeleted=true` 才带软删行（§4.24.11，#613）|
+| 宏（管理台） | `POST /api/admin/macro-templates` | 建模板：`{kind, name≤40, params, audience?, scope, enabled?}`；`kind`↔`scope` 必须配对，否则 `400`（§4.24.11）|
+| 宏（管理台） | `PATCH /api/admin/macro-templates/:id` | 改模板：白名单 `{name,params,audience,enabled}`；body 里出现 `kind`/`scope` **当场 `400`**（不静默丢弃，§4.24.11）|
+| 宏（管理台） | `DELETE /api/admin/macro-templates/:id` | 删模板**三分支**：零引用物理删 / 只有订阅连删订阅 / 有执行账或通知 ⇒ 只能软删（§4.24.11）|
+| 宏（管理台） | `GET /api/admin/macro-runs` | 全局执行账（keyset 倒序）：`?templateId=&status=&verdict=&userId=&from=&to=&limit=&cursor=`；行内**不含** `sessionId`/`childSessionId`（§4.24.12）|
+| 宏（管理台） | `GET /api/admin/macro-runs/:id` | 单条执行账详情（与列表行同形，同一个白名单；查无 ⇒ `404`，§4.24.12）|
+| 宏（管理台） | `GET /api/admin/macro-runs/summary` | 判决汇总（**跟着同一组筛选变**）：`{triggered, done, skipped, failed, byVerdict, usage}`；`byVerdict` 的分母是 `done`，不是 `triggered`（§4.24.12）|
 
 > LLM 管理这条线**其余**端点（`GET/PUT /api/admin/fdes/:name/llm`、
 > `POST /api/admin/fdes/:name/llm/heartbeat`、`GET /api/admin/llm/model-catalog`、
@@ -131,7 +156,7 @@
 > 改名这条线的契约仍见 §4.9；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 > 另：`POST /api/admin/llm/providers`、`PATCH|DELETE /api/admin/llm/providers/:id`、
 > `GET /api/admin/llm/models` 与 `POST /api/admin/llm/models/:id/block|unblock`
-> （`http.js:1927/1965/1995`）**已实现但无契约**，只在正文散文里出现过 —— 待补写（#777 A 组）。
+> （`http.js:2014-2023`、`:2025-2040`、`:2052`、`:2082-2088`）**已实现且现已在册**：契约见 §4.9-1（#777 A2 补登记）。
 > 心跳对账的口径仍见；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
@@ -1200,6 +1225,41 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 > 本端点**不走 30s 缓存**（只 `llm-quota` 缓存）：日聚合比额度读重，但用量变化不敏感于 30s，且默认只给一个固定窗口（30 天），无需再加缓存层。实现见 `portal/src/llm.js` 的 `getSelfUsage`。
 
 ---
+
+### 2.16 本人 Git 凭据三件套：`/api/me/git-credential`（#777 A4 补登记）
+
+这是 §10（**管理员**面 `PUT|GET|DELETE /api/admin/fdes/:fdeName/git-credential`）的**自服务对应面**：
+只有两个差异——**人从会话取**、**方法集不同**。实现：`http.js:1415-1453` + `portal/src/git-credential.js`。
+
+- **谁能调**：`requireSession`（任何已登录用户，**没有角色门**——admin 走同一条码路）。`fde_name` **一律取
+  `session.user.fde_name`**，不接受任何路径/query/body 里的名字 ⇒ **结构上看不了别人的凭据**（与 §2.14/§2.15 同一口径）。
+  账号没分配 `fde_name` ⇒ `400 fde_name_required`（`http.js:1417-1420`，不是 403：「不是权限不够，是这个账号没有可写的地方」）。
+  其余方法 ⇒ `405 method_not_allowed`（`http.js:1452`）。
+- **`GET` 响应（逐字）**：`{ "items": [ { host, protocol, username, token } ] }`——`token` **永远是掩码**，
+  形态是 `****` + 后 4 位（不足 4 字 ⇒ 整个 `****`，`git-credential.js:263-265`）；**响应里不存在明文密钥这一回事**。
+  来源是**两份文件**（平台那份优先，遗留 home 那份只读展示；同 host 两处都有时取平台那份，因为那才是实际生效的）；
+  **`username` 或 `token` 缺任一就不列这一行**（`git-credential.js:512-539`）。
+- **`PUT` 请求**：走 §1.5 的 `Content-Type` 闸（这条**有** `requireJson`）+ 体 `{ host, username, token, protocol? }`。
+  校验全部 `400 validation_failed`，`details.field` 逐字是 `host` / `username` / `token` / `protocol`
+  （`git-credential.js:35-58`、`:338-353`）：`host` 必为合法 DNS 主机名且 ≤253（带 `://`、路径、端口以外的东西都拒），
+  `username` 非空且 ≤255 不含控制字符，`token` 非空且 ≤**4096**，`protocol` 只 `http`/`https`（可缺）。
+  ⚠ **`host` 不必先在 `git_hosts` 注册**：查不到就用 `https`（`git-credential.js:355-370`），本站**不拦**。
+  成功 `200 {host, username, configured: true}`——**三个字段里没有 `token`**（不回显，也不回掩码）。
+- **`DELETE` 请求与管理员面的关键差异**：本面是 **JSON body `{host}`**（`requireJson` + `readJsonBody`，
+  `http.js:1442-1450`），而 §10 的管理员面是 **`?host=<host>` 查询参数**。两个面形状不同，抄错就是 `400`。
+  成功 `200 {host, deleted: true|false}`——平台文件里本来就没这个 host ⇒ `deleted:false` 且**仍 `200`**
+  （天然幂等，不是 404）。副作用：重写平台文件 + 清遗留 home 文件的同 host 行 + 抹对应的 `git-cli` 配置。
+- **副作用与审计**：写目标 = 平台独占的 `platform/git/credentials`（mode `0644`，容器内 ro 挂载，
+  `git-credential.js:18-19`）；`PUT` 另写 `audit_log`（`admin.git_credential_set`）、`DELETE` 写
+  `admin.git_credential_deleted`——**details 只有 `fde_name` / `host` / `deleted`，从结构上不可能泄 token**。
+  `PUT` **不碰**遗留 home 文件（旧代次容器只认它，清了会当场断认）。
+
+### 2.17 `GET /api/health`（就绪探针，#777 A4 补登记）
+
+与 `/healthz` 同一个 handler（`http.js:1218-1237`）：非 `GET` ⇒ `405 method_not_allowed`；DB 就绪
+⇒ `200 {status:"ok", version:{station,revision,builtAt}}`（`partialBuffer` **只在有缓冲实例时**才出现，additive）；
+不就绪 ⇒ `503` + 标准错误信封 `migration_failed`。**无需鉴权**（它就在路由分派之前），健康检查只看 `res.ok`、
+不解析 body。`version` 三格读不到时全是 `unknown`（#586）；本端点**不**报引擎版本（那在 §4.16）。
 
 ## 3. 项目（Projects）
 
@@ -2657,6 +2717,79 @@ SELECT fde_id FROM fde_llm_bindings
 - 「门户内改名不是漂移源」这句话从此要打个补丁：**改名会把引用它的 FDE 变成漂移**（`*_model_name`
   暂时指向旧名），立即对账就是为了让这个窗口尽量短——就地注释见代码。
 
+#### 4.9-1 供应商写面、模型目录与封禁/启停（`/api/admin/llm/providers*`、`/api/admin/llm/models*`）
+
+> **编号说明**（免得被读成「上面应该有 4.9-2…4.9-5」）：`§4.9` 此前**没有任何 `4.9-N` 子号**（现验 `git show origin/main:docs/api/portal.md | grep -c '4\.9-[0-9]'` ⇒ **0**），本号是本批新登记的**第一个**子号，从 1 起。（#777 A2 补登记）
+
+本节**只写本站侧的契约 + 转发了上游哪个动作**。三条口径先说死（不然本节就会被读成「LiteLLM 的字段就是本站契约」）：
+
+- **模型目录的唯一真相源是 LiteLLM 的库**，本站**不落库**：`GET /api/admin/llm/models` 就是上游 `GET /model/info` 的
+  投影（`llm-gateway.js:155` → `llm.listModels` `llm.js:290-293`）。供应商（credential）同理，上游是 `GET/POST /credentials`
+  与 `PATCH|DELETE /credentials/{name}`（`llm-gateway.js:141`、`:161-164`）——**一个供应商 = 一条 credential**（1:1）。
+- **启停语义只有一个：模型的 `block` / `unblock`**。credential **没有**启停：`PATCH` body 里带 `enabled` 会被**当场拒**
+  （`llm.js:412-419`，文案「LiteLLM credential 不支持启停；请删除 credential 或管理其模型」，`details.field='enabled'`）。
+  读侧的 `enabled` 也不是本站的列，而是从上游封禁位**推出来的**：`enabled = !(model_info.blocked === true)`（`llm.js:138-140`、`:258`）。
+- **改 FDE 可用模型范（白名单）不走本节**：那是 per-FDE 虚拟 key 的白名单，口径是「`/key/update` 扩名单，
+  **不重铸 key**」（§4.9 末段的 #289/#296 对账链）。本节的写面只动 credential / deployment，**不碰 key**。
+
+| 方法 + 路径 | 本站侧请求 | 本站侧成功响应 | 转发的上游动作 |
+|---|---|---|---|
+| `POST /api/admin/llm/providers` | `{ credential_name \| name（必填）, base_url?, api_key?, credential_info?, credential_values? }`（走 §1.5 的 `requireJson`）| **`201`** `{ provider }` | `POST /credentials`（body：`credential_name` / `credential_info` / `credential_values`）|
+| `PATCH /api/admin/llm/providers/:id` | `{ base_url?, credential_info?, credential_values? }`；⚠ **`enabled` 任何值 ⇒ `400`**；其余键被忽略 | `200` `{ provider }` | `GET /credentials`（仅「只改了 `base_url`」时先取现状）+ `PATCH /credentials/{name}` |
+| `DELETE /api/admin/llm/providers/:id` | 无 body | **`204` 无响应体** | `DELETE /credentials/{name}` |
+| `GET /api/admin/llm/models` | **无参数**（给了也不读）、**无分页** | `200 { items: [模型对象] }` | `GET /model/info` |
+| `POST /api/admin/llm/models/:id/block` | **不读 body** | `200 { model_id, enabled: false }` | `POST /model/block`（body `{model_id}`）|
+| `POST /api/admin/llm/models/:id/unblock` | **不读 body** | `200 { model_id, enabled: true }` | `POST /model/unblock`（body `{model_id}`）|
+
+**路径参数的身份（容易误读）**：`:id` 在供应商两条上是 **credential 名**（不是 UUID），在模型三条上是上游的
+`model_info.id`（`llm.js:142-144`）。两者都只过 `decodeURIComponent`（`http.js:2027`、`:2059`、`:2084`），
+**不校形状**；查不到时本站**不兜**（只有「只改 `base_url`」那一支会先查一次现状并给 `404`，`llm.js:421-426`），
+其余全部原样交给上游，由上游的错误经 `LlmGatewayError` 映射成 `llm_gateway_error` 且**状态码原样透传**
+（`http.js:1092-1094`，所以上游回 401/403/404/5xx 就是那个数，不是恒 5xx）。
+
+**`provider` 对象的键（逐字，`toProvider`，`llm.js:265-278`）七键**：`id`（= credential 名）、`name`
+（`credential_info.display_name ?? credential_info.name ?? 名`）、`base_url`（`credential_values.api_base ??
+.base_url ?? ''`）、`api_format`、`credential_info`、`credential_values`、`models`。⚠ 三件事：
+
+1. **`api_format` 是本站写死的字面量 `'openai'`**（`llm.js:273`），**不是从上游读的**——它只是 DTO 形状的一部分，
+   不得当成「本站支持多种 API 格式」的契约（历史上它是本地表 `llm_providers.api_format` 的残留形状，该表已退役，见
+   [`../data/model.md`](../data/model.md) 的退役标注）。
+2. **写面的 `models` 恒为 `[]`**（`toProviderMutationResult` 传的就是空数组，`llm.js:280-288`）：POST/PATCH 的响应**不**
+   顺带返回模型列表，前端改完必须重拉一次 GET。只有 `GET /api/admin/llm/providers` 会给真列表（§0.1 已登记那条）。
+3. **`credential_info` / `credential_values` 是上游对象的脱敏透传**：只对键名形如 `api_key`/`master_key` 的字符串做
+   `maskKey`（`sk-...<后 4 位>`，短于 8 字符 ⇒ `***`；`llm.js:45-48`、`:98-105`），**其余键原样回显**。⇒ 上游改了这两个
+   字典里的键名，响应也会跟着变；前端**不得依赖其内部键集**（除本站明确读的 `api_base` / `api_key`）。
+   响应**永不回显密钥明文**。
+
+**`POST` 的字段归一（`createProvider`，`llm.js:389-410`）**：名字取 `credential_name ?? name`，trim 后为空 ⇒
+`400 validation_failed` + `details.field='name'`（**`details.field` 是 `name`，不是 `credential_name`**）。没给 `credential_info` 时本站**代填**
+`{ credential_name: <trim 后的名>, description: <input.description ?? 名> }`；`base_url` / `api_key` **不是独立列**，而是分别写进
+`credential_values.api_base` / `credential_values.api_key`（只在这两个键 `!== undefined` 时写，所以传 `null` 会真的把 `null` 发给上游）。
+
+**`PATCH` 的两步语义与一个陷阱（`updateProvider`，`llm.js:412-436`）**：只给 `base_url`（没给 `credential_values`）时，本站先
+`GET /credentials` 找到同名 credential（**找不到 ⇒ `404 not_found`**，`llm.js:423-424`），再只发 `{ api_base }`；给了 `credential_values`
+则**不预查**（不存在的 credential 会拿到上游的错，不是本站的 404）。⚠ 陷阱：发往上游的 body 里 `credential_info` **永远存**
+（没给就是 `{}`，`llm.js:427-430`）——那是**本站的形状**，不是 LiteLLM 要求空字典。
+
+**`DELETE` 的连带面与幂等**：本站**不预查**「还有没有模型挂在它下面」，也不查 `fde_llm_bindings` 引用；上游删 credential
+会连带改变模型目录（`llm.js:438-443` 的注释与缓存失效就是为此）。重复删第二次**不是本站幂等**：本站不兜「已删」，
+第 N 次的结果完全等上游回答（因此「删不存在的 ⇒ `204`」这说法**本站侧不成立**，不得写进前端）。
+
+**模型对象的键（逐字，`toModel`，`llm.js:233-263`）十七键**：`id`、`provider_id`、`model_id`、`model_name`、`name`、`type`、
+`tool_calling`、`context_window`、`max_tokens`、`max_output_tokens`、`enabled`、`input_cost_per_token`、`output_cost_per_token`、
+`pricing_configured`、`pricing_source`、`litellm_params`、`model_info`。本节**只订形状来源**，不重写语义：两个名字（`model_name` 调用名
+vs `name` 显示名）见上方 #296 那一段，`context_window` / `max_output_tokens` 的写侧校验见上面两节，价目口径见 §8.31。
+⚠ **`model_id` 是 `id` 的重复别名**（同一个 `modelId(model)` 产物），不是另一个字段；`litellm_params` / `model_info` 同样是
+**上游字典的脱敏透传**（前端不得当本站契约读，除本站明确用的 `model_info.blocked` / `context_window` / `max_output_tokens` 等）。
+⚠ **`type` 是推导值**（`modelType`，`llm.js:119-129`）：先看上游 `model_info.type` / `model_type` / `metadata.type` / `metadata.model_type`
+是否在**七值名单** `text` / `embedding` / `vision` / `rerank` / `audio-tts` / `audio-stt` / `image-gen`（`llm.js:10`）里，否则按
+`mode` 推（`embedding` / `image_generation` / `rerank`），**都不中 ⇒ `text`**。⚠ **读侧七值 ≠ 写侧四值**：本节上面的
+`PATCH` 表只接受 `text` / `embedding` / `rerank` / `vision`，`audio-tts` / `audio-stt` / `image-gen` **写不进去**（只能从上游读出来）。
+
+**封禁两条的响应不是事实、是推导**：`{ model_id, enabled }` 里 `model_id` 是**路径参数原样回显**，`enabled` 是按动作算的常量
+（`block` ⇒ `false`、`unblock` ⇒ `true`，`http.js:2087`）——**本站不读回目录、也不写库、不写审计**。要确认封禁真的生效，
+只能再拉一次 `GET /api/admin/llm/models` 看 `enabled`（或 `model_info.blocked`）。
+
 ### 4.10 管理台 FDE 周期额度与用量（`/api/admin/fdes/:fde/llm/budget` · `/usage`，#719）
 
 额度口径：**单位 USD / 周期**，周期由 LiteLLM 虚拟 key 的 `budget_duration` 决定。白名单**只允许**
@@ -2685,6 +2818,28 @@ SELECT fde_id FROM fde_llm_bindings
 错误映射零新码（§8.20）：额度校验复用 `LlmError('validation_failed')`、`not_found`；网关不可达沿用 `LlmGatewayError`→`httpStatus`。实现见 `portal/src/llm.js` 的 `setFdeBudget` / `getFdeBudget` / `getFdeBudgetUsage`；行为以 `portal/test/llm.test.js` 为准。
 
 > **用户侧同源投影（#808）**：普通 FDE 读**自己**的额度/用量走 `GET /api/me/llm-quota`（§2.14）与 `GET /api/me/llm-usage?days=30`（§2.15）——**同一份 `projectQuota` 投影、同一份 `getFdeBudgetUsage` 日聚合**，只是人取 `session.user.fde_name`、无参数面。管理侧本节能读**任意** `:fde`（admin-only），用户侧只能读自己；两者的字段形状与 `spend_scope`/`null` 口径逐字一致。
+
+#### 4.10-1 FDE 的 LLM 绑定读写：`GET|PUT /api/admin/fdes/:fde/llm`（#777 A4 补登记）
+
+本节两条与 §4.10 的 `budget` / `usage` 是**不同的东西**：那两条读的是「花多少钱」，本两条读写的是
+「这个 FDE 用哪个供应商、哪三个模型位」。入口同 §4.10：`requireAdmin` + `validateFdeName`（非法语法 ⇒ `400`
+`validation_failed`，`details.field='fde_name'`）；实现 `http.js:2647-2680` + `llm.js:901-926`、`:1323-1329`、`:1734-1953`。
+
+| 方法 + 路径 | 请求 | 成功响应 | 错误 |
+|---|---|---|---|
+| `GET /api/admin/fdes/:fde/llm` | —（无参数）| `200 { config, active_run }`。**无绑定也 `200`**且 `config:null`。`config` 十二键：`provider_id`、`provider_name`（= `provider_id` 的**别名**，同一个值）、`gateway`、`gateway_user_id`、`key_id`、`key_alias`、`api_key`（**已掩码**：`sk-...` + 后 4 位，`maskKey`）、`budget_usd`、`budget_period`、`main`/`embedding`/`vision`（模型位：`{model_id, name, type}` 或 `null`）。`active_run` = 该 FDE 有 `queued`/`running`/`cancelling` 的 run | `404 not_found`（**表里没有该 `fde_name` 的 active 用户**，`llm.js:1325`；注意它**不是**「没有绑定」——没绑定是 `200`）；`502 llm_gateway_error`（绑定行存在但数据面模型名丢了 ⇒ `slot()` 当场抛，`llm.js:892-897`）|
+| `PUT /api/admin/fdes/:fde/llm` | 走 §1.5 的 `Content-Type` 闸；体 `{ provider_id, main_model_id, embedding_model_id?, vision_model_id?, api_key?, force? }` | `200 { config }`——⚠ 这里的 `config` **只有九键**（`provider_id`、`provider_name`、`gateway`、`key_id`、`key_alias`、`api_key`（掩码）、`main`、`embedding`、`vision`），**不带 `gateway_user_id` / `budget_usd` / `budget_period`** ⇒ **GET 与 PUT 的 `config` 不同形**，前端改完要重拉 GET，不得拿 PUT 的响应去覆盖列表行 | `400 validation_failed`（`details.field='provider_id'` / `'main_model_id'` 缺失；**`details.field='api_key'`**：只要 `api_key` 不是 `undefined`/`null`/`""` 就被拒——上游密钥必须住在 LiteLLM credential 里，**不得按 FDE 提交**）；`404 not_found`（用户不存在或非 active）；`409 active_run_conflict`（当前绑定 active、本次不是同绑定、没带 `force=true`，且该 FDE 有活跃 run）；`llm_gateway_error`（**状态码原样透传**，模型选择要读网关目录）|
+
+- **幂等与「改白名单不重铸 key」**：PUT 先比「同绑定」（`provider_id` + 三个模型位的 id **与**数据面名全等，且现绑定
+  active）——同绑定 ⇒ **短路**：零网关写、零审计、零重铸，直接回掩码后的 config（重复点保存不会把 key 换掉）。
+  不同绑定但现有 key 可用 ⇒ 走 **`/key/update` 只改白名单**（`generation` 不 +1、`rotated_at` 不动，
+  `llm.js:1826-1848`）；只有「无可用 key / key 在网关已丢」才**重铸**（`generation + 1` + `rotated_at`）。
+  重铸时旧 key 会在提交后被 `deleteKey` 掉。**额度不自己换算**：重存已有 key 时把 DB 里的额度一并下发
+  （无额度 ⇒ 显式 `max_budget:null, budget_duration:null`）——这是 §4.10 不重算口径的另一半。
+- **副作用**：事务内 `pg_advisory_xact_lock('llm-binding:<fde_name>')` + `fde_llm_bindings` upsert +
+  `audit_log`（`llm.config_updated`，details 里带 `virtual_key_action ∈ allowlist_updated|rotated|created`）+
+  outbox 的 `llm_binding` 变更项（路由下发靠它）。**事务失败且已新铸 key ⇒ 先删新 key 再上抛**（不留孤儿）。
+- **响应永不出现完整 `api_key`**（虚拟 key 明文只在生成那一步存在过，出接口就过 `maskKey`）。
 
 ### 4.11 文件预览五通道（issue #366 / #795）
 
@@ -4509,11 +4664,139 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
   二次 ⇒ 该 `UPDATE` 命中 0 行、改做一次 `SELECT` 回读，**不再写**。
 - **前端事实**：角标数字由前端本地减一（响应里没有 count），所以并发的另一处已读不会立刻反映到角标，下一次拉 `unread-count` 才收敛。
 
-#### 4.24.8 本批未登记的同族端点（诚实边界）
+#### 4.24.8 本面已登记端点的穷尽口径（诚实边界）
 
-上面七条之外，宏 / 通知面还有一批**已实现但本批仍未登记**的端点（会话级订阅读写、会话 / 用户的宏流水、
-管理台模板与流水、以及 `GET /api/macro-runs`），它们仍挂在豁免表里等后续批次补
-（`scripts/doc-impl-exceptions.json`）。**本节不写它们** = 没有契约，不等于行为不存在。
+宏 / 通知面的端点**现已全部在册**：用户面七条（§4.24.1–§4.24.7）、会话级订阅读写三条与执行账两条
+（§4.24.9–§4.24.10，#526 / #614）、管理台模板四条与流水三条（§4.24.11–§4.24.12，#613）。本单（#777 A1）
+把后十二条补完并把豁免表里对应的十二行删掉。
+仍要说清一句边界：登记只到**端点契约形状**（方法 / 鉴权 / 参数 / 响应键 / 错误码 / 副作用），
+各宏的**语义**（何时触发、门禁怎么排、判决怎么归一）在 `docs/design/` 的宏平台设计篇与
+`portal/shared/macro-kinds.js`，本文不复制一份（复制就会漂）。
+
+#### 4.24.9 会话级订阅读写：`/api/sessions/:id/macro-assignments[/:assignmentId]`
+
+三条（`GET` / `PUT` / `DELETE .../:assignmentId`）在 `http.js:1668-1689` 匹配，**全部先 `requireSession`**
+再进 `macro-routes.js`；属主闸是 `fetchSession(pool, sessionId, userId)`（`macro-routes.js:126`、`:133`、`:146`）。
+
+- **属主闸的真实口径**（`sessions.js:179-204`，四条共用，别只读成「非属主 404」）：路径里的 `:id` 先过
+  `decodeUuid`（`decodeURIComponent` + 转小写，`http.js:1177`），**不校验形状**；形状不是 UUID ⇒ `404 not_found`（`sessions.js:183-185`）；
+  行不存在、`user_id` 与本人不符、或会话 `status !== 'active'`（**已归档也算不存在**）⇒ 同一个 `404 not_found`。
+  本条链上**没有 `403`**，不泄露存在性。
+- **`GET` 响应键名（逐字）**：`{ "items": [ …订阅快照… ] }`，条目与 §4.24.2 的**十一个键**逐字相同
+  （`toAssignmentSnapshot`，`macros.js:233-250`）。与会话面的差异只有两点：① **不按模板 `scope` 过滤**
+  （§4.24.2 只留 `scope='user'`，这里返回该会话的全部订阅）；② `session_id` 有值（就是路径里那个会话）。
+  `ORDER BY created_at, id LIMIT 500`（`macros.js:563-566`）⇒ **无游标、无 `limit` 参数**，超 500 条静默截断。
+- **`GET` 的副作用**与 §4.24.2 同一个函数、同一个**只带 `user_id`** 的谓词（`applyExpiredAssignments`，
+  `macros.js:515-522`，调用点 `macros.js:554`）⇒ 这次读会把**本人全部**到期订阅（含别的会话的）关掉，
+  不止这个会话的。不是纯只读。
+- **`PUT` 请求形状**：JSON 体 `{ templateId, until? }`。⚠ 与 §4.24.3 的两个差异：**没有 `cwd`**
+  （本端点根本不读 `body.cwd`，入库恒 `NULL`，`macro-routes.js:141`），也**没有** §1.5 的 `Content-Type` 闸
+  （只调 `readJsonBody`，`http.js:1676`）⇒ 超限 `413 payload_too_large`、非法 JSON `400 validation_failed`、
+  空体按 `{}`（⇒ `details.field='templateId'`）。
+- **`PUT` 校验顺序**：`templateId` 非空字符串（否则 `400`，`details.field='templateId'`，`macro-routes.js:135-137`）
+  → 模板存在且未软删（`404`，`details.templateId`）→ 模板 `audience='admin'` ⇒ `403 forbidden`（`isAdmin` 恒假，`macros.js:584-586`）
+  → `scope='user'` 的模板从会话入口订不进去 ⇒ `400`，`details.field='sessionId'`（`macros.js:592-595`）
+  → 模板 `enabled=false` ⇒ `409 conflict`（`details.templateId`，`macros.js:596-598`）→ `until` 非法时刻 ⇒ `400`，`details.field='until'` + `details.received`。
+- **`PUT` 响应 / 幂等**：`{ "assignment": { …十一个键…, "reused": true|false } }`，`reused` 的推断口径与 §4.24.3
+  同一条（`macros.js:612`，两台时钟，别当「有没有新行」的可靠信号）。幂等靠唯一订阅键
+  `UNIQUE NULLS NOT DISTINCT (template_id, user_id, session_id, cwd)`；语义是**覆盖**（没给 `until` 就写成 `null`）。
+- **`DELETE .../:assignmentId`**：先过**会话**属主闸，但取消动作只按 `assignmentId` + **本人** `user_id` 判定
+  （`unassignTemplate` 不比较 `session_id`，`macros.js:621-650`）⇒ 拿会话 A 的路径去取消自己在会话 B 的订阅
+  **不会被拒**（路径里的会话只是一道「这个会话是你的」前置闸）。响应两分支与 §4.24.4 逐字相同
+  （有账 `{mode:"disabled", macroRuns, assignment}` / 无账 `{mode:"deleted", macroRuns:0}`，无 `assignment` 键）。
+- **错误码汇总**：`401` / `404` / `400 validation_failed` / `403 forbidden` / `409 conflict`，零新码；
+  顶层未分类异常 ⇒ `500 internal`（§1.2，`http.js:1155`）。`details.assignmentId` 在 `unassignTemplate` 的 404 里带出。
+
+#### 4.24.10 宏执行账（只读）：`/api/sessions/:id/macro-runs` 与 `/api/macro-runs`
+
+两条同构（`http.js:1690-1698` 会话级、`http.js:1700-1705` 用户级，#614）。**只有 `GET`**（其余方法走到
+后续分支 ⇒ 最终 `404 not_found`）。鉴权：`requireSession` + 会话级再过 `fetchSession` 属主闸
+（`macro-routes.js:156`）；用户级**不绑会话**，属主 = `macro_assignments.user_id = 当前用户`。
+
+- **query（四个都可选，两条形参完全一致）**：`criterion`（枚举，非法 ⇒ `400 validation_failed`，
+  `details.field='criterion'` + `details.allowed`/`received`）、`verdict`（枚举，同上 `details.field='verdict'`）、
+  `cursor`（上一次 `nextCursor` 原样回传；解不开或形状不合 ⇒ `400`，`details.field='cursor'`，`macros.js:806-819`）、
+  `limit`（非有限数或 `<1` ⇒ `50`；`>100` 截到 `100`；`macro-routes.js:32-40` 再过一道同口径的 `normalizeNotificationsLimit`）。
+  枚举的**唯一真源**是 `portal/shared/macro-kinds.js`：`criterion` 五值 `terminal` / `silent` / `tick` / `mechanical` / `semantic`
+  （`:102`），`verdict` 五值 `pass` / `red` / `no-op-claim` / `needs-human` / `unclassified`（`:112`）——
+  本文不另列一份枚举表，改动只改那个文件。
+- **响应键名（逐字）**：`{ "items": [ … ], "nextCursor": "<opaque>" | null }`。每一项是 `toMacroRunSnapshot`
+  （`macros.js:252-275`）的**列名即键名**十九键：`id`、`assignment_id`、`anchor`、`bucket`、`status`、`criterion`、
+  `verdict`、`verdict_raw`、`reason`、`remediation_text`、`skipped_reason`、`started_at`、`finished_at`、
+  `child_session_id`、`child_run_id`、`depth`、`parent_macro_run_id`、`snapshot_id`、`worktree_path`（缺值给 `null`，不是缺键）。
+- **两条形参同、响应面不同（唯一差异）**：`GET /api/macro-runs` 在出口**再剥三键**
+  `snapshot_id` / `worktree_path` / `verdict_raw`（`macro-routes.js:236-240`）⇒ 用户级那份是**十六键**；
+  会话级**不剥**（这三键交给前端归一层丢）。所以「会话级少三键」是错的，要说反。
+- **排序 / 分页**：`ORDER BY r.started_at DESC, r.id DESC` 的 keyset（行值比较 `(started_at, id) < (…)`），
+  游标 `base64url(JSON({t, i}))`（`macros.js:800-804`）；到底 ⇒ `nextCursor: null`。实现内部多取一行判「还有没有」，那一行不外泄。
+  ⚠ 游标键名是 `nextCursor`，**不是** §1.3 通则的 `next_cursor`（同 §4.24.5 的差异，本单不改代码）。
+- **副作用**：零（一条 `SELECT … JOIN macro_assignments`）。**幂等**天然成立（只读）。
+- **错误码**：`401` / `404`（会话级的非属主、不存在、已归档同一个码）/ `400 validation_failed`；未分类 ⇒ `500 internal`。
+
+#### 4.24.11 管理台模板面：`/api/admin/macro-templates[/:id]`
+
+四条在 `http.js:1939-1957` 匹配，**鉴权是 `handleAdminApi` 入口的统一 `requireAdmin`**（`http.js:1913`）：
+非 `role='admin'` ⇒ **`403 forbidden`**（`http.js:1807-1810`，⚠ 不是 #736 那套 `insufficient_role`，那个只覆盖
+`/api/admin/users/:login/tokens`），未登录 ⇒ `401`。边缘面另有一层：`/api/admin/*` 只能从**管理台入口**打，
+从用户入口得到的是 Traefik 的 `404`（§0.1 末段 #450 口径）。`created_by` 取会话里的管理员 id（`http.js:1945`）。
+
+- **`GET`**：query 只读 `includeDeleted`（字符串 `true`/`1` 才算真，`macro-routes.js:43-45`）⇒ 默认**排除软删**。
+  响应 `{ "items": [ … ] }`，每项是模板快照**十一键**（`id`、`kind`、`name`、`params`、`audience`、`scope`、
+  `enabled`、`created_by`、`created_at`、`updated_at`、`deleted_at`，`macros.js:215-230`）**再加一格 `subscriberCount`**
+  （`macro-routes.js:271-274`）。⚠ `subscriberCount` 的口径是**只数 `enabled = true` 的订阅**（`macros.js:540-548`）：
+  「已经取消订阅的人」不计入——停用不影响他们。计数落 `0` 而非 `undefined`（区分「没人订」与「后端没下发」）。
+  `ORDER BY kind, name`，**内部上限 200 且无游标**（`macros.js:302`，`macro-routes.js` 不传 `limit`）⇒ 模板多于 200 会静默截断。
+- **`POST`** 建模板：体 `{ kind, name, params?, audience?, scope, enabled? }`。
+  **返回 `200`**（`http.js:1945`，**不是 `201`**），形状 `{ "template": { …十一键… } }`。校验顺序（`macros.js:323-347`）：
+  ① `kind` ∈ {`run-notify`,`run-silence-alert`,`run-review`,`scheduled-task`}（`macro-kinds.js:17`），否则 `400`，`details.field='kind'`；
+  ② `name` 非空且 **≤ 40 字**（`07` 篇：下拉里看得见的字），否则 `400`，`details.field='name'`；
+  ③ `audience` ∈ {`all`,`admin`}，**缺省 `all`**（给了非法值 ⇒ `400`，`details.field='audience'`）；
+  ④ `scope` ∈ {`session`,`user`} **必填**，且必须等于该 `kind` 的固定配对（`macro-kinds.js:28-33`）——
+  自由组合 ⇒ `400`，`details.field='scope'`；⑤ `params` 走该 `kind` 的 schema **形状**校验并由服务端补齐 `default`
+  （#625：补齐的返回值入库，不是只调一次），非法 ⇒ `400`，`details` 带字段名；⑥ `enabled` 按 `=== true` 归一（缺省真）。
+  唯一约束：无（同名模板可以重复）。
+- **`PATCH /:id`** 改模板：白名单 `{name, params, audience, enabled}`。⚠ **`kind` / `scope` 出现在 body 里就 `400`**
+  （`macro-routes.js:291-295`，`details.field='kind'|'scope'`）——静默丢弃会让前端以为改成了，实际没改。
+  白名单里一个键都没带 ⇒ `400 validation_failed`，`details.patch`（`macros.js:380`）。
+  `params` 按**现有 `kind`** 重新校验（`macros.js:369`）。模板不存在或已软删 ⇒ `404`，`details.templateId`。
+  响应 `{ "template": { …十一键… } }`，`updated_at` 被写成应用侧时刻（`macros.js:381-386`）。
+- **`DELETE /:id`** 删模板（**三分支**，判定与删除同事务 + 行锁 `FOR UPDATE`，`macros.js:448-504`）：
+  响应形状随分支变——① 零引用 ⇒ `{"mode":"deleted","assignmentsRemoved":0,"notifications":0,"macroRuns":0}`；
+  ② 只有订阅、无执行账无通知 ⇒ 物理删 + 级联删订阅 ⇒ `{"mode":"deleted_with_assignments","assignmentsRemoved":<n>,"notifications":0,"macroRuns":0}`；
+  ③ 有 `macro_runs` **或** `notifications` ⇒ **只能软删** ⇒ `{"mode":"soft","assignmentsRemoved":0,"notifications":<n>,"macroRuns":<n>,"template":{…}}`。
+  已软删的再删一次 ⇒ 仍是 `200` 且 `{"mode":"soft","alreadyDeleted":true,…}`（天然幂等）。模板不存在 ⇒ `404`，`details.templateId`。
+  为什么有账就不能物理删：执行账与已发出的通知是**既成事实**，抹掉定义就没人能解释它们。
+  ⚠ 通知引用是**间接**数的（`notifications.macro_run_id → macro_runs.assignment_id → macro_assignments.template_id`，
+  `macros.js:414-425`）：表里没有直连模板列也不等于「零引用」。
+
+#### 4.24.12 管理台执行账：`/api/admin/macro-runs`、`/summary`、`/:id`
+
+三条都 `GET`、都过入口 `requireAdmin`（同 §4.24.11）。匹配顺序是契约的一部分：
+`/macro-runs/summary` 必须排在 `/macro-runs/:id` **之前**（`http.js:1960` vs `:1963`），否则字面量 `summary`
+会被当成 run id 吞掉 ⇒ 变成 `404`。
+
+- **共用筛选**（列表与 summary 用**同一份** WHERE，`macro-routes.js:308-325`——summary「跟着筛选变」靠的就是这个，
+  两处各写一遍迟早漂）：`templateId`、`status`（枚举 `pending`/`running`/`done`/`skipped`/`failed`/`superseded`，
+  `macro-kinds.js:90`）、`verdict`（五值，同上）、`userId`、`from` / `to`（ISO 时刻，非法 ⇒ `400`，
+  `details.field='from'|'to'`，`macro-routes.js:48-55`）。非法枚举一律 `400 validation_failed` +
+  `details.field` / `details.allowed` / `details.received`。
+- **`GET /api/admin/macro-runs`**：额外读 `cursor`（同 §4.24.10 的游标编解码）与 `limit`（缺省 `50`、上限 `100`）。
+  响应 `{ "items": [ … ], "nextCursor": "<opaque>" | null }`，`ORDER BY r.started_at DESC, r.id DESC` 的 keyset。
+  每一项是**十二键白名单**（`toAdminRunItem`，`macro-routes.js:339-356`）：`id`、`startedAt`、`templateId`、
+  `templateName`、`userId`、`userName`、`anchor`、`criterion`、`status`、`verdict`、`durationMs`、`usage`。
+  ⚠ 三条硬口径：① **不含 `sessionId` / `childSessionId`**（白名单映射，决策者 2026-11-15）；
+  ② `durationMs` 是**推导值**（`finished_at - started_at`，账上没这列，未完成 ⇒ `null`，负数夹成 `0`）；
+  ③ `usage` **恒 `null`**——`macro_runs` 还没有 token 记账列，用 `0` 冒充「没花钱」是假账。
+  键名是 **camelCase**（与 §4.24.10 的列名形状**不同形**，别把两份 DTO 混着用）。
+- **`GET /api/admin/macro-runs/:id`**：响应 `{ "run": { …同一个十二键… } }`，查无 ⇒ `404 not_found`，
+  `details.runId`（`macro-routes.js:383-393`）。无参数面（`cursor`/`limit` 写了也不读）。
+- **`GET /api/admin/macro-runs/summary`**：响应逐键 `{ "triggered": n, "done": n, "skipped": n, "failed": n,
+  "byVerdict": { "pass": n, "red": n, "no-op-claim": n, "needs-human": n, "unclassified": n }, "usage": null }`。
+  ⚠ **`byVerdict` 的分母是 `done`（有判决的），不是 `triggered`**：每个桶都是 `COUNT(*) FILTER (WHERE verdict = '…')`，
+  `skipped` / `failed` 的 `verdict` 是 `NULL` ⇒ 匹配不进任何桶 ⇒「各桶之和 == `done`」自动成立
+  （`macro-routes.js:403-433`）。把 `unclassified` 桶写成 `verdict IS NULL` 会把 skipped/failed 吸进分母——
+  这是本面最容易被「顺手优化」掉的语义。**无分页、无 `limit`**（一次聚合），`usage` 同样恒 `null`。
+- **副作用**：三条都零（`SELECT` / 一次聚合）。
 
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
 
@@ -4953,6 +5236,11 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | ~~S4~~ | ~~`GET /api/internal/transcript/:key/checkpoint/latest`~~ | **已退役（#640）** | 同上 |
 | S5 | `PUT /api/internal/transcript/:key/runstate` | store：`saveRunState` / markRunState 终态标记（§9.8b） | `chat_sessions.engine_run_state` jsonb 合并写 |
 | S6 | `GET /api/internal/transcript/:key/runstate` | store：`loadRunState`（§9.8b） | 只读；无 → 204 |
+| — | `GET /api/internal/runs/:id/runstate/status` | store：`loadRunStateStatus`——引擎 run-state **终态标记**的只读通道（§9.8c）| 只读；无 → 204 |
+| — | `GET /api/internal/transcript/:key/runstate/status` | 同上，session 作用域（§9.8c）| 只读；无 → 204 |
+| R1 | `GET /api/internal/transcript/:key/recovery-rows` | store：`listRecoveryRows`（账本恢复行，#500，§9.8c）| 只读；**空 = `{rows:[]}`，永不 204** |
+| R2 | `PUT /api/internal/transcript/:key/recovery-rows` | store：`appendRecoveryRow`（§9.8c）| `PRIMARY KEY (transcript_key, dedup_key)` + payload 指纹 |
+| R3 | `DELETE /api/internal/transcript/:key/recovery-rows` | store：`clearRecoveryRows`（fresh start 前清台，§9.8c）| 天然幂等（`{cleared:false}` = 本来就没有）|
 | — | `GET /api/internal/stream` | SSE 下行通道（§9.12） | — |
 
 > usage **不单设端点**：随 U2 终态载荷上报（§9.9）。
@@ -5499,6 +5787,86 @@ resume=true 时不传 initialMessages/initialUserMessage（引擎恢复记录即
 `...(resume ? {} : { initialUserMessage })`）。部署顺序：
 **portal 先上（S 端点纯增量，旧 runner 无感），FDE 镜像（runner/agentd/worker）后上**。
 
+### 9.8c 终态标记通道与账本恢复行（#500 / #43；#777 A3 补登记）
+
+本节五条（下表）**只有 session 与 run 两种作用域的内部面**，鉴权与其余 U/S 端点同构：每请求
+`Authorization: Bearer <per-container token>`（§9.1）+ session 属主闸（`fetchSession`）+ writer run fencing
+（`?run_id=` 必带、writer run 必须属于该 session、且 `X-Claim-Token` 与当前活租约相等）。
+**它们不是同源接口**：容器↔portal 的内部通道，走 Traefik 的 `ipAllowList`（§9.1 行），浏览器拿不到那个 token。
+
+| 端点 | 响应 | 幂等 / 只读 |
+|---|---|---|
+| `GET /api/internal/runs/:id/runstate/status` | `200 {status:{…}}` 或 `204`（无体）| 只读 |
+| `GET /api/internal/transcript/:key/runstate/status` | 同上 | 只读 |
+| `GET /api/internal/transcript/:key/recovery-rows` | `200 {rows:[…]}`；**空 = `{rows:[]}`，永不 `204`** | 只读 |
+| `PUT /api/internal/transcript/:key/recovery-rows` | `200 {added:true\|false}` | 幂等（同 `dedupKey` 同 payload ⇒ `false`）|
+| `DELETE /api/internal/transcript/:key/recovery-rows` | `200 {cleared:true\|false}` | 天然幂等 |
+
+#### 终态标记通道：`/api/internal/runs/:id/runstate/status` 与 `/api/internal/transcript/:key/runstate/status`
+
+这是 §9.8a / §9.8b 两个 `…/runstate` 写端点的**只读对应面**（引擎 `loadRunStateStatus`）。
+
+- **读的是独立列，不是 blob**：run 作用域读 `runs.run_state_status`，session 作用域读
+  `chat_sessions.engine_run_state_status`（列 = 迁移 `0014-run-state-status.sql`）。列有值时它**就是响应**，
+  本站不重写、不补充：`200 { "status": <那一列的原文> }`——所以 `status` 里有什么由写侧决定
+  （§9.8a 写的 `{status, runId, ts}`，`http.js` 不加工）。
+- **旧形态回退（兼容面，不是第二个真相源）**：状态列为 `NULL` 时才去看旧 `run_state` / `engine_run_state` 里的
+  `state` 字符串，回 `200 {status:{status:"<那个串>"}}`；两者都没 ⇒ **`204` 无体**（不是 `200 null`）。
+  实现：`internal.js:1933-1951`（回退与抛错都在这一处，两条共用）。
+- **形状不合是 `500`，不是 `204`**：有状态列但它不是带非空 `status` 字符串的对象，或旧 blob 不合法 ⇒
+  `500 run_state_status_corrupt`（`internal.js:1933-1951`）。区别是故意的：「没终态」与「账坏了」必须分开。
+- **`X-Claim-Token` 只在非终态时校**（与 §9.8a 的 `GET …/runstate` 同口径）：`loadRunStateStatus` 先判
+  `isTerminal`，非终态才 `assertClaimToken`（session 那条：`internal.js:2009-2010`；run 那条：`internal.js:2206-2207`）
+  ⇒ **终态后仍可读**（这是它与下面三条恢复行端点的**关键差异**）。
+- **session 那条额外要求 `?run_id=<writer runId>`**：与 §9.8b 整个分支共用一道闸（缺失 ⇒ `400 validation_failed`，
+  `details.field='run_id'`，`http.js:6040-6044`）；writer run 不属于该 session ⇒ `400 transcript_key_mismatch`。
+
+#### 账本恢复行三件套：`/api/internal/transcript/:key/recovery-rows`（issue #500）
+
+引擎 0.33.0 的三个可选方法（`listRecoveryRows` / `appendRecoveryRow` / `clearRecoveryRows`）的 portal 面；
+表 = `transcript_recovery_rows`（迁移 `0038-transcript-recovery-rows.sql`，**新表而非给 `transcript_rounds` 加列**，
+原因写在那份迁移的文件头：恢复行**不进** `load()` / `loadRawRows()`）。⚠ **只有 session 作用域**：
+本站**没有** run 作用域的 `/runs/:id/recovery-rows`（引擎的 `runId` 在这里就是 transcript key = sessionId）。
+
+- **鉴权三层与其余 S 端点逐字一致，但**不享**终态豁免**：三个方法都是无条件 `assertClaimToken`
+   （`internal.js:2094`、`:2106`、`:2135`，对照 `:2010` / `:2207` 的条件式写法）⇒ **run 终态后，凡是走到租约校验的请求三者都 `409 lease_lost`**，连 `GET` 也一样。
+   ⚠ **别读成「终态后一律 409」**：租约校验**不是函数第一步**——`PUT` 先跑 `assertRecoveryRowBody(body)`（`:2101`）**才** `assertClaimToken`（`:2106`），**无效 body 先到 `400`**；HTTP 层的 JSON 解析与体积闸更靠前。（终态确实会让租约失效：正常终态事务同时更新 `runs` 并清掉 queue 的 `claim_token` / `lease_until`，见 `internal.js:1116-1123`。）这与上面的
+  `runstate/status`（终态可读）**不同**，也是本站故意保留的差异：恢复行只在「跑着/要续跑」时才有意义。
+- **`GET` 永不 `204`**：空集是 `200 {"rows":[]}`。行序是 **`append_seq` 升序**（持久化追加序，**不是时间**；
+  `transcript-store.js:386-395`），返回的是 `record` **本体**（表上的 `round` 列**不合成进去**）。
+  为何不返 `204`：契约里「空」（合法降级）与「读坏了」（非数组 ⇒ `recovery_rows_unreadable` 终局）是两个结局，
+  `204` 会被解析成 `null` 而把两者抹平。
+- **`PUT` 的幂等与冲突**：幂等键 `PRIMARY KEY (transcript_key, dedup_key)`（迁移 0038:63）；payload 指纹与轮记录
+  **同一把尺**（顶层剔除 `dedupKey`/`roundKey`/`round`/`ts`）⇒ 同键同 payload ⇒ `{"added":false}`（不新增、不覆盖），
+  同键**异** payload ⇒ `409 recovery_row_conflict` + `details {dedupKey, existingFingerprint, incomingFingerprint, differingFields}`，
+  **既不覆盖也不静默丢**（`internal.js:2101-2129`）。本站**只把这一种**失败扮成 409：其他失败一律原样上抛成 5xx
+  （agentd 对读方法只有限重试，`RECOVERY_ROWS_MAX_RETRIES`）。
+- **`PUT` 的请求体约束（两道闸，顺序有坑）**：先过 §1.5 的 `Content-Type` 闸（这条**有** `requireJson`），
+  再过 HTTP 层体积闸 **640 KiB**（`http.js:5893`，超限 ⇒ `413 payload_too_large`（`readJsonBody`））；之后是端点自己的 record 闸
+  （`internal.js:2060-2090` 的 `assertRecoveryRowBody`）：`kind` 必为 `"recovery"` / `dedupKey` 非空且 ≤**255** 字
+  （与迁移 0038:53 的 `CHECK (length(dedup_key) <= 255)` 同一个数）/ `round` 非负安全整数 / record 本体 ≤**512 KiB**
+  （`internal.js:2050`）——**两个数不同源不是笔误**：512 KiB 是「带一份 `partial-text`」的业务上限，640 KiB 是信封上限。
+  ⚠ **一个未钉住的落点**：`recoveryEvent = "tool-executed"` 的形状守卫在**存储层**（`transcript-store.js:296-302` 的 `recoveryRowWriteProblem`），
+  它抛的是**素 `Error`**，不是 `InternalError` ⇒ 按 `http.js:1155` 的顶层映射会落 **`500 internal`** 而不是 `400`
+  （本节只现读源码、未跑端到端，所以标为**未实测**；要它稳定返 400 得改实现，不是改文档）。
+- **`DELETE`**：`{"cleared":true}` = 至少删了一行，`false` = 本来就没有（**两者都是成功**）；引擎在 **fresh start、
+  第一轮写之前**调它。它**只打恢复行表**，不碰 `transcript_rounds`（`transcript-store.js:400-402` 把「全站 `DELETE FROM transcript_rounds` 零命中」当成折叠重建可证无损的前提，这条 DELETE 一个字节都不碰那张表）。
+- **与 #341 / #367 的 `partOf` 链式行无关**（工单点名要查的一条）：恢复行**永不载正文**（`messages` 恒空，
+  迁移 0038 文件头），因此结构上不可能带分片行；而 `partOf` **链**（不是「一跳」）的解链只存在于**账本读侧**
+  `portal/src/transcript-fold.js:36-45`（上游 erix-agent #415 未修、本站先解链）。⇒ **这五条端点的读写两侧都不需解链**，
+  不要为了「照贴 #341」而往恢复行上拼折叠口径。
+- **错误码（除 `recovery_row_conflict` 是 #500 自带的新码，其余全是 §9.13 的既有码）**：`401 token_invalid` /
+  `401 token_revoked`（`authenticateContainer`，`internal.js:206`、`:219-221`）/ `400 validation_failed`（含
+  `?run_id=` 缺失与 transcript key 空或 >128 字，`details.field='key'`，`internal.js:1786-1788`）/
+  `404 session_not_found` / `403 session_ownership_mismatch`（`internal.js:1792-1795`）/ `404 run_not_found` /
+  `403 run_ownership_mismatch`（`internal.js:254-257`）/ `400 transcript_key_mismatch`（writer run 不属于该 session，
+  `internal.js:1802-1806`）/ `409 lease_lost` / `413 payload_too_large`（仅 `PUT`）。
+  ⚠ 内部面的属主闸是 `internal.js` **自己那份** `fetchSession` / `fetchRun`，**不是**用户面的
+  `sessions.js#fetchSession`：两套的落点不同，别把 §4.24.9 那套「形状非法也回 404」的口径搬过来。
+  本面**不做 UUID 形状预检**（`decodeUuid` 只解码 + 转小写），所以**形状非法的 id 串**会直接进 `uuid` 列比较
+  ⇒ PG `22P02` ⇒ 按 `http.js:1155` 落 **`500 internal`**，**不是 404**（PG 侧的 `22P02` 是既有实测结论，
+  见 §4.24.4；端到端这一半本单**未实测**）。
+
 ### 9.9 usage 上报
 
 **不单设端点**（runner §4.2）：run 用量随 §9.6 终态载荷（`usage`）上报，portal 同事务写 `runs.usage` + `usage_ledger`（`source='erix'`，一 run 一条，`UNIQUE(run_id, source)`，model.md §1.14）。网关侧用量由 portal 定期从 LLM 网关拉取落 `usage_ledger`（`source='gateway'`，规格 §11.4），不经过容器。
@@ -5808,6 +6176,25 @@ This endpoint requests **disable/offboarding; it never deletes the platform acco
 The portal worker then stops active runs and the FDE container, revokes the runner token and LLM virtual key, removes local Git credentials, revokes access to a platform-minted Gitea account by setting `prohibit_login=true` (without deleting the upstream user or token), releases routes/network allocations, and records a workspace purge deadline only when retention is explicitly enabled. User-managed Git credentials are not used to disable the employee's upstream account; GitLab upstream revocation is deferred. The disable transaction also removes login sessions, pending login tokens, and API tokens. Failed steps are durable and can be retried; the account stays disabled. `ERIX_WORKSPACE_RETENTION_DAYS` defaults to `0`, which leaves `workspace_purge_after` NULL and disables sweeping. An explicit positive value enables a sweep that deletes only the workspace directory after its deadline; **all database rows remain**. A user without FDE resources or a workspace is disabled synchronously and returns `204`; the user row remains.
 
 Deleting the current administrator returns `409 self_delete`. Resources with an invalid/missing `fde_name` return `409 user_fde_name_missing` rather than attempting unsafe cleanup.
+
+### `POST /api/admin/users/:id/onboard/retry`（#777 A4 补登记）
+
+`http.js:2180-2198` + `portal/src/onboarding.js:275-303`。`requireAdmin`。**不读体**（带了也不看）。
+
+- `:id` **必须是 UUID**（`decodeAdminUserUuid`，`http.js:1187-1197`）——形状不对 ⇒ `400 validation_failed`
+  + `details.field='id'`（这一族里**只有 `:id` 是 id**，其它 admin 面多用 `fde_name`，不要拄错）。
+- **前置闸（与下线互斥）**：该用户存在 `state IN ('pending','running')` 的 `fde_offboarding` 行
+  ⇒ `409 user_offboarding`（人在下线或保留期内，不许重试开户）。
+- `retryOnboarding` 返 `null`（没开户任务行）时再查一次 `users`：行不存在 ⇒ `404 not_found`；
+  人在但没有开户任务 ⇒ `409 onboarding_not_found`。任式不同但码相不同，前端得分别处理。
+- 任务当前 `state='running'` ⇒ `409 onboarding_running`（**不排队**，重试不会堆叠）。
+- 成功 `200 { "onboarding": { state, step, error, llm_binding? } }`（形状见 `onboarding.js:39-53`）：
+  `state` 新值是 `pending`（只**重新排队**，真执行的仍是后台 worker）；`step` 在 `done`/`awaiting_credential`
+  时是 `null`；`llm_binding` 子对象**只在 steps 里有 `llm-binding` 这一步时**才出现（additive）。
+- **幂等口径（重要）**：只有 `state='failed'`（或 `done`/`awaiting_credential` 但 `llm-binding` 步 `failed`）
+  才会真的把**第一个失败步**重置成 `pending` 并清 `last_error`；**其它状态原样返回、不碰库**
+  （`onboarding.js:285-287`）——所以重复点「重试」是个 `200` 的 no-op，不会重跑已完成的开户。
+- 本端点**不**创建新用户、**不**新建 `fde_onboarding` 行（那是 §2.9 创建路径的事）。
 
 ### `POST /api/admin/users/:id/offboarding/retry`
 
