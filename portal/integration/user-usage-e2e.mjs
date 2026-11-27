@@ -7,7 +7,7 @@
 // 四条腿：
 //   · HTTP-401 腿（总是跑）：不带凭据打 `GET /api/me/llm-quota` 与 `GET /api/me/llm-usage?days=7`
 //     ⇒ 都 401（auth 在路由前拦，不依赖口令/路由是否注册）。
-//   · HTTP-200 契约腿（要 FDE 口令）：登 agent01 后——
+//   · HTTP-200 契约腿（要 FDE 口令）：登 dev 脚本账号（名字 = 下面 `FDE_LOGIN` 的默认值，不写进注释 ⇒ AGENTS §6）后——
 //       - `llm-quota` 200：`quota` 为对象或 null；若对象则 8 键齐全、金额有限数或 null、
 //         `spend_scope` 自洽（period⇒budget_duration 非空；spend==null⇔spend_scope==null）；
 //         **响应全文不许出现 `api_key` / `token` / `sk-` 字样**（密钥红线）。
@@ -21,7 +21,7 @@
 //     ⇒ `/api/me/llm-quota` 断言 `spend_scope==='lifetime'` 且 `budget_duration===null` 且 spend 非空；
 //     finally 恢复 `{budget_usd:3,budget_period:'1mo'}` 并回读断言 `spend_scope==='period'`。
 //     这是「未设额度不得被读成本周期」的真机判据。
-//   · UI 腿（`E2E_UI=1` 且 playwright 容器在跑才跑，否则 skip 不算红）：登 agent01 进 `#/workbench`，
+//   · UI 腿（`E2E_UI=1` 且 playwright 容器在跑才跑，否则 skip 不算红）：登 dev 脚本账号进 `#/workbench`，
 //     钉徽标紧跟 `who`、徽标文案是周期格式且 hover/aria 用完整词、点开弹窗（已用/进度条/30 天 chart 的
 //     `<svg>`、进度条与 chart 同一蓝色族 `bg-blue-600`）、按钮与 Esc 都能关、0 pageerror、无裸 i18n key、
 //     无「本周期从」句式、顶栏不换行；中英各一趟各存一张截图落 `os.tmpdir()`。
@@ -29,7 +29,7 @@
 // 为什么这样写（沿用 llm-usage / seat / version-surface 的约定，这里只记本单相关的几条）：
 //   1. admin host 是自签证书 ⇒ 本进程关 TLS 校验（只影响这个测试进程）。
 //   2. 口令只读凭据目录里的口令文件（AGENTS §4：路径见冷层，仓库里不写；旧路径兜底），**绝不 print**；
-//      FDE（agent01）与 admin 各用各的口令文件；进容器走临时文件（防 `ps` 抄走），跑完尽力删。
+//      FDE（脚本账号）与 admin 各用各的口令文件；进容器走临时文件（防 `ps` 抄走），跑完尽力删。
 //   3. 登录**不发 Origin 头**（带不匹配的 Origin 会被 cross_origin_forbidden 403）。
 //   4. 走 docker 包装层时命令串**不许含换行**。
 //   5. UI 腿把 playwright 留在**容器里**（`/app/node_modules/playwright`），仓库**不**加这个依赖。
@@ -79,7 +79,7 @@ function credFiles(envVar, names) {
   return (process.env[envVar] ? [process.env[envVar]] : names)
     .map((p) => p.replace(/^~/, os.homedir()));
 }
-/** FDE（agent01）口令：任务指定的文件，env 可覆盖。 */
+/** FDE（脚本账号）口令：任务指定的文件，env 可覆盖。 */
 const FDE_PASSWORD_FILES = credFiles('E2E_FDE_PASSWORD_FILE',
   ['~/.config/mcp/creds/station-agent01.password', '~/.config/creds/station-agent01-password-file']);
 /** admin 口令：与 llm-usage-e2e 同一份 dev 口令文件。 */
@@ -240,7 +240,7 @@ const probe = {
 };
 
 async function gather() {
-  // ── FDE 腿（200 契约 / 越权面 / UI）都要先登进 agent01 ──
+  // ── FDE 腿（200 契约 / 越权面 / UI）都要先登进 dev 脚本账号（`FDE_LOGIN`）──
   const fdePw = readCred(FDE_PASSWORD_FILES);
   if (fdePw === null) {
     const why = `缺 FDE（${FDE_LOGIN}）口令文件 ${FDE_PASSWORD_FILE}（明文不入库，轮换就改这个文件，或 E2E_FDE_PASSWORD_FILE 指过去）`;
@@ -501,7 +501,7 @@ test('H4 admin（无 fde_name）打 llm-quota ⇒ 400 fde_name_required（既有
 
 // ---------------------------------------------------------------------------
 // lifetime 往返腿（会短暂改真实额度，finally 必复原）
-// 声明在 UI 腿之前：节点按声明顺序串行跑 ⇒ UI 腿跑前 agent01 已被复原成 period（1mo），
+// 声明在 UI 腿之前：节点按声明顺序串行跑 ⇒ UI 腿跑前脚本账号已被复原成 period（1mo），
 // 徽标落在「月 $X/$3.00」这种周期格式上，UI 腿的文案断言才成立。
 // ---------------------------------------------------------------------------
 test(`H5 lifetime 往返（${FDE_LOGIN}）：PUT budget_usd=null ⇒ llm-quota 读 lifetime/零点空/spend 非空；finally 复原 1mo 并回读 period`,

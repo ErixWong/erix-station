@@ -208,3 +208,22 @@ test('测量：开关不改变退出码（同一棵树开关前后 rc 相同）'
   );
 });
 
+
+// ⑨ dev 脚本账号名（#777 D6）：它写在**扫描面内**必须被拦并报出 file:line。
+//    本格存在的理由：这个名字此前不在任何 DENY 清单里 ⇒ 闸查不到自家违例（AGENTS §4.1 与
+//    docs/testing.md §1.3 自己就写着它，而 AGENTS §6 规定 dev 账号名不进本仓库）。
+//    夹具里的名字同样**拆片构造**——本文件是 `*.js`，注释里不许留明文（下同）。
+test('夹具：dev 脚本账号名出现在扫描面内被拦，且报出 file:line', () => {
+  const devAcct = ['agent', '01'].join('');
+  assert.ok(devAcct.length === 7, '夹具前提不成立：拆片没拼回 7 个字符的本名');
+  const { rc, out } = fixture((dir) => {
+    writeFileSync(path.join(dir, 'devacct.md'), `# 脚本账号\n\n脚本一律登 \`${devAcct}\` 走会话。\n`);
+    writeFileSync(path.join(dir, 'clean.md'), '# ok\n\n这行只写「dev 脚本账号」这个中性说法。\n');
+  });
+  assert.notEqual(rc, 0, 'dev 账号名还在扫描面里却 exit 0 = 这条 DENY 没生效');
+  assert.ok(
+    out.includes(`devacct.md:3: ${devAcct}`),
+    `输出未点名脏文件的 file:line，实得:\n${out}`,
+  );
+  assert.doesNotMatch(out, /clean\.md:/, '中性写法那行不该被点名');
+});

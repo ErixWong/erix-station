@@ -62,11 +62,12 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 ### 4.1 dev 栈访问与探针口径（仅本地 dev）
 
 - 入口、账号、口令文件位置、第二因素现状 ⇒ `docs/testing.md` §1.3；**登录体字段是 `login` 不是 `username`**
-- **脚本/agent 要调 API ⇒ 登 dev 专用脚本账号 `agent01`**（口令直通：不开邮箱码也不开 TOTP ⇒ 零邮件、
-  不卡第二因素；口令路径与 dev 入口 ⇒ 冷层；`Origin` 要求 ⇒ `docs/testing.md` §1.3）。
+- **脚本/agent 要调 API ⇒ 登 dev 专用脚本账号**（**名字是 dev 坐标 → 取值与口令路径一律看冷层**
+  `~/projects/docs/station-dev-machine.md`；下面统称「脚本账号」）（口令直通：不开邮箱码也不开 TOTP ⇒ 零邮件、
+  不卡第二因素；`Origin` 要求 ⇒ `docs/testing.md` §1.3）。
   **别登人的账号**——开着邮箱验证码的账号每登一次寄一封真邮件，而脚本读不到那枚码
 - 要管理员面就登 `admin`；要测第二因素：自建带 TOTP 的种子账号走 step1+step2（做法同 §1.3）
-- **别用 `Authorization: Bearer` 打 API**（令牌路由当前关着；关的是路由、能力保留），**脚本一律登 `agent01` 走会话**；
+- **别用 `Authorization: Bearer` 打 API**（令牌路由当前关着；关的是路由、能力保留），**脚本一律登脚本账号走会话**；
   现场与启用开关 ⇒ `docs/api/portal.md` §2.13
 
 ### 4.2 LLM 网关（LiteLLM）
@@ -99,7 +100,7 @@ docs/       # 文档地图 docs/README.md + design/ + api/ + data/ + ops/ + depl
 - **不写逐单台账**：一单做了什么、怎么验的，写进 **issue 与 PR 正文**（GitHub 是唯一真相源）；
   以后还要遵守的判据写进本页（**须用户拍板**）；环境 / 参数 / 坐标事实写进 `docs/` 对应页。
   **禁止新建逐单叙事文件**，也禁止把逐单叙事写进本页（本页每次 agent run 全额注入）。
-- **仓库文档必须可公开**：本机/内网坐标（内网 IP、tailnet IP、内网主机名、凭据文件路径、宿主端口占用、dev 账号名）不写进本仓库，一律放 `~/projects/docs/`，仓库里只留指针与现验判据；闸 `npm run check:doc-portable`（经 `npm test` 跑到）。
+- **仓库文档必须可公开**：本机/内网坐标（内网 IP、tailnet IP、内网主机名、凭据文件路径、宿主端口占用、dev 账号名）不写进本仓库，一律放 `~/projects/docs/`，仓库里只留指针与现验判据；闸 `npm run check:doc-portable`（经 `npm test` 跑到）。⚠ **闸是子串匹配，会扫 `*.js`/`*.mjs` 的注释行** ⇒ dev 账号名写进**集成脚本的注释**同样被拦（#777 批 D 实测：闸上线时一次性中性化了 `portal/integration/user-usage-e2e.mjs` 的五条注释），**代码行的默认值（`process.env.… || '<脚本账号名>'`）不在扫描面，是坐标的合法藏身处**。
 - **证据与依据只写形态，不写值**：验收记账写「寄到该账号绑定的邮箱并收到」，**不写**邮箱地址 /
   主机名 / 绝对路径 / 端口；注释写「存量里有带下划线的」，**不写**真实目录名 / 容器名 / 入口地址。
   **证据段落是身份与坐标的集中营**。
