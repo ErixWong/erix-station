@@ -577,3 +577,35 @@ export function pick() {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ───────────────── 件 4：真实仓库用例（buildInventory() 不传参，只读不写）
+test('④ 真实仓库（不传参）：compose 键数=独立统计、白名单>0、死光纤含指定键、warnings 为空', () => {
+  const inv = buildInventory(); // 不传参 ⇒ 真实仓根，只读
+  assert.ok(inv.counts.composePortalKeys > 0, '真实 portal compose 键数应 >0');
+  // 独立行式统计（不复用被检的 parseComposeEnv*）：另写一段站式计数
+  const composeText = fs.readFileSync(path.join(inv.root, 'deploy/docker-compose.yml'), 'utf8');
+  const lines = composeText.split(/\r?\n/);
+  const start = lines.findIndex((L) => /^services:\s*$/.test(L));
+  let svc = null;
+  let inEnv = false;
+  let envIndent = -1;
+  let cnt = 0;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const L = lines[i];
+    const m = L.match(/^ {2}([A-Za-z0-9_-]+):\s*$/);
+    if (m) { svc = m[1]; inEnv = false; envIndent = -1; continue; }
+    if (/^[A-Za-z0-9_-]+:/.test(L)) break;
+    if (svc !== 'station-portal') continue;
+    const em = L.match(/^(\s+)environment:\s*$/);
+    if (em) { inEnv = true; envIndent = em[1].length; continue; }
+    if (!inEnv) continue;
+    if (L.trim() === '' || /^\s*#/.test(L)) continue;
+    const ind = L.match(/^(\s*)/)[1].length;
+    if (ind <= envIndent) { inEnv = false; continue; }
+    if (/^\s+[A-Z][A-Z0-9_]*\s*:/.test(L)) cnt += 1;
+  }
+  assert.equal(cnt, inv.counts.composePortalKeys, '独立统计必须等于工具口径');
+  assert.ok(inv.counts.allowlist > 0, 'ENV_KEY_ALLOW 条数应 >0');
+  assert.ok(inv.subtotals.allowlistedNobodyRead.includes('ERIX_SESSION_AUTO_TITLE'), '「白名单但没人读」应含 ERIX_SESSION_AUTO_TITLE');
+  assert.deepEqual(inv.warnings, [], `真实 compose 不该有可疑形状，实际=${JSON.stringify(inv.warnings)}`);
+});
