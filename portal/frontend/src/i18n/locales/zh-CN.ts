@@ -2305,6 +2305,12 @@ export const zhCN = {
     failed: '通知加载失败',
     empty: '暂无通知',
     markRead: '标记已读',
+    // issue #850：通知**标题**存的是键 + 参数（写入方是调度器，没有语言），渲染时才按读者语言拼。
+    // 下面四条的**字面必须与写入侧的旧成品中文逐字一致**（存量行与回退面长一样）。
+    macroExpired: '宏「{name}」已到期',
+    macroTriggered: '宏「{name}」',
+    reviewUnavailable: '完成审查暂未启用',
+    macroFailed: '宏「{name}」执行失败',
   },
   // `07` §21.4：侧栏单独分组「自动化」，默认折叠，组内会话**不允许发消息**。
   macroSidebar: {

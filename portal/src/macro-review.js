@@ -379,6 +379,8 @@ export async function runMacroReview(pool, {
         await createNotification(pool, {
           userId: safeUserId, macroRunId, severity: 'info',
           title: '完成审查暂未启用',
+          // #850：标题同时存键（无参数），`title` 仍是成品中文（回退面）。
+          titleKey: 'notifications.reviewUnavailable',
           body: '完成审查已由运维关闭（reviewMode=disabled），本次未审查。',
           createdAt: now,
         });

@@ -4297,6 +4297,14 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
 
 ---
 
+### 4.23 通知列表的标题字段（#850：存「键 + 参数」，渲染时按读者语言拼）
+
+- 读侧返回的 `items[]` 里 `title` **恒在**；`title_key`（文本）与 `title_params`（对象）**可选出现**
+  （列由迁移 `0049-notifications-title-key.sql` 加，可空）。写侧是调度器/审查器（没有人、没有请求、
+  没有语言），所以入库的是**标题的键与参数**，不是某个语言的成品句子。
+- **出现时**由读者端按自己当前语言拼（`portal/frontend/src/components/MacroBell.vue`；键未登记时退回
+  `title`，不裸露键名）；**缺席时**原样显示 `title`——**存量行逐字不变**，服务端也不按请求语言改写 `title`。
+
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
 
 ### 5.1 传输语义

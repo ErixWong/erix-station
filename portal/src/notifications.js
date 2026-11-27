@@ -33,7 +33,7 @@ export function newId() {
 /** 通知行 → 用户面形状。⚠ 契约没有要求隐藏的列这里也不发明：id/严重度/正文/读态/时刻。 */
 export function toNotificationSnapshot(row) {
   if (!row) return null;
-  return {
+  const snap = {
     id: row.id,
     severity: row.severity,
     title: row.title,
@@ -41,6 +41,15 @@ export function toNotificationSnapshot(row) {
     read_at: row.read_at ?? null,
     created_at: row.created_at,
   };
+  // issue #850：标题键 + 参数**可选出现**（没有就不给这两个键，不给 `null` 壳）。
+  // 缺席 = 「这条没有键，请照旧原样渲染 title」= 存量行的行为逐字不变。
+  const titleKey = typeof row.title_key === 'string' && row.title_key.trim() !== '' ? row.title_key : null;
+  if (titleKey) snap.title_key = titleKey;
+  const titleParams = row.title_params !== null && row.title_params !== undefined && typeof row.title_params === 'object'
+    ? row.title_params
+    : null;
+  if (titleParams) snap.title_params = titleParams;
+  return snap;
 }
 
 /** 通知游标：与 macro-runs 游标同构，但键是 `(created_at, id)`。 */
@@ -73,9 +82,14 @@ export function normalizeNotificationsLimit(limit) {
 /**
  * 写一条通知。`createdAt` 可注入（测试/重放用同一时钟）；`macroRunId` 可空——
  * 通知是用户资产，执行账被清（SET NULL）也不能带走它（0036 文件头）。
+ *
+ * issue #850：`titleKey`/`titleParams` 是**标题的真相**（键 + 参数，渲染时按读者语言拼），
+ * `title` 仍由写入方给成品中文——它是**回退面**（存量行、键未登记、老读侧都靠它），不许省。
+ * 两列都可空：不传 ⇒ 落库 `NULL` ⇒ 读侧 snapshot 里连键都不出现。
  */
 export async function createNotification(pool, {
   userId, macroRunId = null, severity = 'info', title, body = '', createdAt = new Date(),
+  titleKey = null, titleParams = null,
 } = {}) {
   if (!NOTIFICATION_SEVERITIES.includes(severity)) {
     throw new MacroError('validation_failed', 'severity 非法', { details: { field: 'severity', allowed: NOTIFICATION_SEVERITIES }, en: 'invalid severity' });
@@ -83,11 +97,14 @@ export async function createNotification(pool, {
   const safeTitle = typeof title === 'string' && title.trim() !== '' ? title.trim() : null;
   if (!safeTitle) throw new MacroError('validation_failed', 'title 不能为空', { details: { field: 'title' }, en: 'title must not be empty' });
   const at = toInstant('createdAt', createdAt) ?? new Date();
+  const safeKey = typeof titleKey === 'string' && titleKey.trim() !== '' ? titleKey.trim() : null;
+  // 参数只收扁平对象（渲染侧要按名字取占位符）；数组/标量/脏值 ⇒ 视为「没给」，别把垃圾喂进 jsonb。
+  const safeParams = titleParams && typeof titleParams === 'object' && !Array.isArray(titleParams) ? titleParams : null;
   const res = await pool.query(
-    `INSERT INTO notifications (id, user_id, macro_run_id, severity, title, body, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO notifications (id, user_id, macro_run_id, severity, title, body, created_at, title_key, title_params)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      RETURNING *`,
-    [newId(), userId, macroRunId, severity, safeTitle, body ?? '', at],
+    [newId(), userId, macroRunId, severity, safeTitle, body ?? '', at, safeKey, safeParams ? JSON.stringify(safeParams) : null],
   );
   return toNotificationSnapshot(res.rows[0]);
 }
@@ -171,9 +188,13 @@ export async function unreadCount(pool, { userId } = {}) {
  * 「全是无效 id」与「空清单」一样 ⇒ `wrote: 0`，但不带 `skippedReason`（没见过任何 admin，
  * 报 `admin_only` 是谎）。`skippedReason` 只在真因「只剩管理员」跳过时出现；
  * 既有三键 `{wrote, severity, notifications}` 语义不变（只增键）。
+ *
+ * issue #850：`titleKey`/`titleParams` 透给 `createNotification`（标题存键，渲染时按读者语言拼）；
+ * `title` 仍是成品中文 = 回退面，两者同存。
  */
 export async function deliverIntent(pool, intent, {
   recipients = [], success = true, title = null, body = null, now = new Date(),
+  titleKey = null, titleParams = null,
 } = {}) {
   const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const list = [...new Set(recipients.filter(Boolean))].filter(
@@ -203,6 +224,8 @@ export async function deliverIntent(pool, intent, {
       title: safeTitle,
       body: safeBody,
       createdAt: now,
+      titleKey,
+      titleParams,
     }));
   }
   return { wrote: rows.length, severity, notifications: rows };

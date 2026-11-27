@@ -375,3 +375,29 @@ test('#637②-7 产物根缺省 = config.userSpaceRoot + users.fde_name（不是
     await fs.rm(home, { recursive: true, force: true });
   });
 });
+
+// ── #850 失败通知的标题：库里存的是「键 + 参数」，`title` 仍是成品中文（回退面）──
+// 判据读**真行**（不是 spy）：调度器写入的就是最终形状，读侧拿到什么全看这两列。
+test('#850 失败通知落库带 title_key=notifications.macroFailed + title_params.name，title 中文逐字不变', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T850'));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'w850home-'));
+    const failing = async ({ pool: p, childRunId }) => {
+      if (childRunId) await p.query(`UPDATE runs SET status='failed' WHERE id=$1`, [childRunId]);
+      throw new Error('模型炸了');
+    };
+    const it = await tickIntent(pool, scene, { date: '2026-11-16' });
+    const out = await executeScheduledIntent(pool, it, {
+      reportsRoot: path.join(home, 'reports'), sessionsHome: home, runTask: failing,
+    });
+    assert.equal(out.status, 'failed');
+    const rows = (await pool.query(
+      `SELECT title, title_key, title_params FROM notifications WHERE macro_run_id=$1`, [it.macroRunId],
+    )).rows;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].title_key, 'notifications.macroFailed');
+    assert.deepEqual(rows[0].title_params, { name: `daily-${scene.login}` });
+    assert.equal(rows[0].title, `宏「daily-${scene.login}」执行失败`, '存量回退面（成品中文）不许消失');
+    await fs.rm(home, { recursive: true, force: true });
+  });
+});

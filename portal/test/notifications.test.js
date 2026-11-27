@@ -82,11 +82,15 @@ test('#526 limit 归一（契约 §3.1：1..100）', () => {
 test('#526 0036 落地：notifications 表 + chat_sessions.origin 默认 human', { skip: SKIP }, async t => {
   await withFreshDb(async (pool) => {
     const cols = await pool.query(
-      `SELECT column_name, data_type, character_maximum_length FROM information_schema.columns
+      `SELECT column_name, data_type, character_maximum_length, is_nullable FROM information_schema.columns
         WHERE table_schema='public' AND table_name='notifications'`);
     const names = cols.rows.map((r) => r.column_name).sort();
+    // #850 追加 `title_key` / `title_params`（迁移 0049，都可空）；`title` 仍是 NOT NULL 的成品回退面。
     assert.deepEqual(names,
-      ['body', 'created_at', 'id', 'macro_run_id', 'read_at', 'severity', 'title', 'user_id'].sort());
+      ['body', 'created_at', 'id', 'macro_run_id', 'read_at', 'severity', 'title', 'title_key', 'title_params', 'user_id'].sort());
+    const keyed = cols.rows.find((r) => r.column_name === 'title_key');
+    assert.equal(keyed.is_nullable, 'YES', 'title_key 必须可空（NULL = 照旧用 title）');
+    assert.equal(cols.rows.find((r) => r.column_name === 'title_params').data_type, 'jsonb', 'title_params 是 jsonb');
     const idCol = cols.rows.find((r) => r.column_name === 'id');
     assert.equal(idCol.character_maximum_length, 32, 'id 是 VARCHAR(32)');
     // 应用侧写时间（AGENTS.md §3.4）：DDL 不许 DEFAULT CURRENT_TIMESTAMP

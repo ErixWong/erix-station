@@ -391,8 +391,8 @@ test('0041 撤 run_checkpoints：全新库跑到 head、表确实不在、DROP �
       // includes('0041') 断「0041 确在链上」，head 断「链末」——两件事。
       assert.ok(versions.includes('0041-retire-run-checkpoints'),
         '台账必须有 0041（迁移 runner 真的应用了它，而不是只躺在目录里）');
-      assert.equal(versions[versions.length - 1], '0048-users-locale',
-        'head 就是 0048-users-locale（#828 P1 的 users.locale 可空列；#719 的 0047 之后；只在有 PG 时跑）');
+      assert.equal(versions[versions.length - 1], '0049-notifications-title-key',
+        'head 就是 0049-notifications-title-key（#850 的 notifications.title_key/title_params 可空列；#828 的 0048 之后；只在有 PG 时跑）');
       assert.equal(versions.length, computeExpectedVersions().length, '台账 = baseline + 全部增量');
 
       // ② 表真的不在了（`to_regclass` 不存在给 NULL，不因缺表报错）。
