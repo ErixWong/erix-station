@@ -209,7 +209,7 @@ export async function authenticateContainer(pool, token, { now = new Date() } = 
   const res = await pool.query(
     `SELECT c.id AS container_id, c.user_id, c.revoked_at, c.status AS container_status,
             c.fde_name, c.container_name, c.token_generation,
-            u.login, u.display_name, u.email, u.status AS user_status
+            u.login, u.display_name, u.email, u.status AS user_status, u.locale
        FROM containers c
        JOIN users u ON u.id = c.user_id
       WHERE c.runner_token_hash = $1`,
@@ -227,7 +227,10 @@ export async function authenticateContainer(pool, token, { now = new Date() } = 
       fde_name: row.fde_name,
       container_name: row.container_name,
     },
-    user: { id: row.user_id, login: row.login, display_name: row.display_name, email: row.email },
+    // #845：内部通道（runner → /api/internal/*）没有浏览器、没有 cookie 罐子，语言协商
+    // （`resolveRequestLocale` 只认 `Cookie: locale=` / `Accept-Language`）在这里永远落空 ⇒ 恒中文。
+    // 属主语言由这条既有的 JOIN 顺带取出（**零额外查询**），供 `http.js#handleInternal` 挂到本次请求上。
+    user: { id: row.user_id, login: row.login, display_name: row.display_name, email: row.email, locale: row.locale ?? null },
   };
 }
 

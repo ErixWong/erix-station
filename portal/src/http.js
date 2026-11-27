@@ -1046,7 +1046,8 @@ export function createServer({
     try {
       await route(req, res, ctx);
     } catch (err) {
-      const locale = resolveRequestLocale(req); // #803：一次请求只算一次，喂下面所有 errorBody 的文案挑选
+      // #845：内部面把属主语言挂在 req.localeHint 上（浏览器路径不设这个键）⇒ 优先用它。
+      const locale = req.localeHint ?? resolveRequestLocale(req); // #803：一次请求只算一次，喂下面所有 errorBody 的文案挑选
       if (err instanceof HttpError) {
         const headers = { ...(err.headers || {}) };
         if (err.status === 413) headers['Connection'] = 'close'; // 未读完的请求体需断开
@@ -5852,6 +5853,9 @@ async function handleInternal(req, res, ctx, url) {
   const { pathname } = url;
   const identity = await internal.authenticateContainer(ctx.pool, bearerToken(req));
   const { container, user } = identity;
+  // #845：内部通道没有浏览器、没有 cookie 罐子 ⇒ 语言只能从「这条请求属于谁」取。
+  // 只在内部面设置（浏览器路径不设 ⇒ 那边继续只认 cookie，别让账号值插队）。
+  req.localeHint = user.locale ?? null;
 
   // SSE 下行通道（§9.12）
   if (pathname === '/api/internal/stream') {
