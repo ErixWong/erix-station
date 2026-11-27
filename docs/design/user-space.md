@@ -79,7 +79,7 @@
 │   └── .erix/
 │       ├── ports.json          # 平台文件（该项目的端口派生视图）
 │       └── AGENTS.md           # 平台文件（该项目级约定，含 clone 指引，§11）
-├── worktrees/<project>-<runId>/# 每个 run 独占的 git worktree（agentd 创建，平台不碰）
+├── worktrees/<project>-<runId>/# 历史遗留：D8 修订后 agentd 不再建 worktree（老用户空间里可能仍存在；平台不创建也不回收）
 └── cache/                      # 依赖缓存（pnpm store / npm / pip；FDE 自管）
 ```
 
@@ -89,14 +89,14 @@
 |---|---|---|---|
 | `/srv/erix/users/<fde>/home` | `/home/<user>` | HOME | `erix`(1000) |
 | `/srv/erix/users/<fde>/projects` | `/home/<user>/projects` | 项目目录 | `erix`(1000) |
-| `/srv/erix/users/<fde>/worktrees` | `/home/<user>/worktrees` | run 工作区 | `erix`(1000) |
+| `/srv/erix/users/<fde>/worktrees` | `/home/<user>/worktrees` | **已拆除**（D8 修订 + #81 P2.5：cwd 直达项目目录，agentd 不再建 worktree；实现 = `provisioner.js#JAIL_RUN_CWD_HOST_SUFFIXES` = home/projects/cache）。老用户空间里可能仍有残留目录，但已不是挂载项也不是 run 工作区 | — |
 | `/srv/erix/users/<fde>/cache` | `/home/<user>/cache` | 依赖缓存 | `erix`(1000) |
 | `/srv/erix/users/<fde>/platform/git`（**ro**） | `/run/erix/git` | 平台托管 Git 凭据（#399）：portal 独占写，容器内连 root 都写不动；镜像 `/etc/gitconfig` 的 fill-only helper 读 `/run/erix/git/credentials`（排在 `store` 前，先答先赢） | portal(root)，`0755`/文件 `0644`（ro bind 不改权限、只拦写；容器内按 UID 可读） |
 
 > **为什么容器内路径是 `/home/<user>` 而不是「宿主路径与容器内一致」**：原规格 §12.1 写「bind mount 到容器内同路径（路径一致性约定）」，那是**未定稿的临时表述**（issue #7 指出的缺口之一）。把容器内 HOME 定为 `/home/<user>`（标准 Linux 家目录）有三个好处：
 > 1. **避免把宿主路径泄漏进容器**：容器内进程、`$HOME`、shell 提示符、`~` 展开、各类工具写 `~/.config` / `~/.cache` 都落到 `/home/<user>`，而不是 `/srv/erix/...`——镜像与工具对「家目录」的假设全部成立。
 > 2. **模板镜像可复用**：所有 FDE 用同一个 `erix` 用户、同一个 `/home/<user>` 布局，无需按 FDE 名现造用户（见 §6 UID）。
-> 3. **子目录按用途拆分挂载**：`home` / `projects` / `worktrees` / `cache` 分开挂，属主/容量/备份语义各自清晰；`home` 里的 `.cache/station/spool` 与顶层 `cache/`（依赖缓存）互不干扰。
+> 3. **子目录按用途拆分挂载**：`home` / `projects` / `cache` 分开挂（v0.1.x 还含 `worktrees`，已随 D8 修订 + #81 P2.5 拆除），属主/容量/备份语义各自清晰；`home` 里的 `.cache/station/spool` 与顶层 `cache/`（依赖缓存）互不干扰。
 >
 > ⚠️ 待决策者确认：容器内用户名用**固定 `erix`**（倾向）还是按 FDE 名 `alice`（`/home/alice`）。当前倾向**固定 `erix`**——单模板镜像、无需每 FDE 建用户、UID/GID 全局稳定；FDE 身份由 DB `fde_name` 承载，与 OS 用户名无关。若决策者要求「容器内提示符显示 FDE 名」，改为 entrypoint 里 `useradd -u 1000 <fde>` 即可，路径映射不变。
 
@@ -191,7 +191,7 @@ Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<UR
 | 路径（容器路径） | 写方 | 说明 |
 |---|---|---|
 | `/home/<user>/projects/<project>/`（仓库内容） | agent 代劳 clone + FDE/agent 编辑 | 平台只创建空目录与平台文件；Git 凭据由 FDE 经 portal 投放（#110，§4.1.1） |
-| `/home/<user>/worktrees/<project>-<runId>/` | **agentd**（`git worktree add`，runner §6.2） | **worktree 元数据无文件**：run↔worktree 绑定在 DB（`runs.id` + 路径约定 `~/worktrees/<project>-<runId>`），不在用户空间物化任何元数据文件（避免与 git 自身元数据冲突、避免双真相） |
+| `/home/<user>/worktrees/<project>-<runId>/` | **已作废**：v0.1.x 写的是「**agentd**（`git worktree add`，runner §6.2）」，D8 修订后 agentd 不再创建 worktree（⇒ [`fde-platform.md`](fde-platform.md) 附录 A.1） | **worktree 元数据无文件**（原口径，现随之作废）：run↔工作目录的绑定在 DB（`runs.id` + `run.cwd`），不在用户空间物化任何元数据文件。当前 run 的 cwd = `/home/<user>/projects/<project>/` |
 | `/home/<user>/.cache/station/spool/<runId>.jsonl` | agentd / worker（事件缓冲，runner §7.5） | **JSONL**（append-only，每行一个事件信封）；run 结束后清排；平台不读不写 |
 | `/home/<user>/cache/` | FDE / agent（pnpm store / npm / pip） | 依赖缓存，内容平台不代管；**位置由 FDE 镜像预配**（`/usr/local/etc/npmrc` 的 globalconfig + `COREPACK_HOME`/`PIP_CACHE_DIR` ENV，见 runner/Dockerfile） |
 | `/home/<user>/.erix/skills/`、`.erix/todos/` | FDE / agent 自管 | 平台只建目录（若模板需要），内容不物化 |
@@ -363,7 +363,7 @@ materializer 对所有 JSON 统一「**固定键序**（按渲染模板插入序
 > （agentd fork worker 时切 UID 用；portal 侧也读它写 git `safe.directory`）。曾有的 `FDE_AGENTD_UID` 是死键
 > （读进 config 无人消费，UID 早已焊在镜像里），已于 #677 env 清理删除。
 
-> 三 UID（1000/1001/1002）共享 GID 1000，是为了让 agentd（1001）能建 worktree、worker（1002）能读写工作区（见 §6.2 组权限），同时保持三者 UID 不同——worker（1002）读不到 agentd（1001）的 `/proc/<pid>/environ`，token 不泄漏（runner §11.3 的「不同 UID 优先」落地）。
+> 三 UID（1000/1001/1002）共享 GID 1000，是为了让 agentd（1001）与 worker（1002）能读写同一棵工作区（v0.1.x 的理由里还包括「agentd 能建 worktree」，D8 修订后 agentd 已不建 worktree ⇒ [`fde-platform.md`](fde-platform.md) 附录 A.1），见 §6.2 组权限，同时保持三者 UID 不同——worker（1002）读不到 agentd（1001）的 `/proc/<pid>/environ`，token 不泄漏（runner §11.3 的「不同 UID 优先」落地）。
 
 ### 6.2 目录/文件权限与 umask
 
@@ -505,7 +505,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 
 | 触发 | 触发方 | 范围 |
 |---|---|---|
-| onboarding（建 FDE） | materializer（portal） | 该 FDE 全量：`home/` 骨架 + `~/.erix/*` + `~/AGENTS.md` + 空 `projects/ worktrees/ cache/` |
+| onboarding（建 FDE） | materializer（portal） | 该 FDE 全量：`home/` 骨架 + `~/.erix/*` + `~/AGENTS.md` + 空 `projects/ cache/`（v0.1.x 还含空 `worktrees/`，已随 D8 修订 + #81 P2.5 拆除） |
 | 建项目 / 删项目 | materializer | 该项目目录 + 该 FDE `manifest.json` |
 | 端口分配 / 释放 | materializer | 该项目 `ports.json` + `manifest.json` |
 | **portal / 容器重建后** | materializer 的**启动对账**（topology §8「portal/Traefik 启动时从 DB 全量重建缺失状态」） | 全 FDE 全量：逐 FDE 比对 manifest `sha256`，缺失/不一致即重物化 |
@@ -555,7 +555,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | `config.json` | 手改 endpoint/model/key | **对账重物化覆盖**为平台值；但真正防「改 endpoint」靠网络（`llm.<base>` 唯一可达，Traefik 注入真 key），文件被改**无害**（占位 key 无价值） |
 | `manifest.json`（0444） | 改哈希/删文件可破坏一致性校验 | 读方校验失败 → 重读 → 仍失败则告警 + 暂停领新 run（§5.4）；对账重物化恢复 |
 | `.erix/AGENTS.md`、`~/AGENTS.md`、`.gitignore` | 改约定（`~/AGENTS.md` 还携带平台约束的单一真相，§4.1.2） | 对账重物化覆盖为平台模板值 |
-| `skills/`、`todos/`、`cache/`、`projects/<p>` 仓库内容、`worktrees/` | **FDE 合法自管内容，平台不碰** | 永不覆盖、永不告警 |
+| `skills/`、`todos/`、`cache/`、`projects/<p>` 仓库内容、`worktrees/`（**遗留目录**：D8 修订后平台不再创建，老工位里可能还在） | **FDE 合法自管内容，平台不碰** | 永不覆盖、永不告警 |
 
 > 统一口径：**平台文件（§4.1 表）一旦漂移，一律「DB 派生值覆盖 + 审计 + 告警」，绝不向 FDE 的改动妥协**；FDE 自管内容（§4.2 表）平台永不干预。这正是「DB 是真相、文件是派生视图」在写边界上的体现（principles §1 原理三）。
 
