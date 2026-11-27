@@ -501,3 +501,145 @@ test('#541 MED 源码级哨兵：多份结果必须交回 `duplicateIds` 并走 
   assert.match(payloadBody, /rebuildFoldedRange\(pool,\s*\{\s*key:\s*sessionId,\s*range,\s*log\s*\}\)/,
     'getFoldedPayload 必须把 log 继续往重建路递');
 });
+
+// ---------------------------------------------------------------------------
+// issue #562：同 id 两条调用 + 结果乱序 ⇒ 「只看 `tool_use_id` + 位置」会张冠李戴。
+//
+// 病根（docs/api/portal.md 里 #541 复审登记的那条 MED 残差）：`attachToolResultsToRecords` 的配对
+// 只比 `tool_use_id` + 位置，既不比 `run_id` 也不比块上**本来就有**的 `erix.toolCallKey`。上游明写
+// provider `id` 不能当跨轮调用身份（`tool-fact.js:150` 附近「provider id 不保证 run 内唯一」），
+// 于是「同一个 `id` 两条调用、各带自己的身份键」是**合法形状**；位置序
+// `call(OLD) < call(NEW) < res(NEW) < res(OLD)` 时，旧调用会拿到**新调用**的结果当预览——
+// 界面显示一条看着合理但**错**的结果（错内容比缺内容更难发现）。
+// 修法：配对**先按调用身份键精确配**，键缺席才退回「就近优先」；且**每个结果块最多被一个调用消费**。
+// ---------------------------------------------------------------------------
+
+/**
+ * 同一个 `id: 'tu_dup'` 的两条调用（**各带自己的 `erix.toolCallKey`**），两条结果行的位置**故意乱序**：
+ * `call(OLD) → call(NEW) → res(NEW) → res(OLD)`。两块的入参不同 ⇒ 拿错结果在界面上一眼可见。
+ * @param {ResultPool} pool
+ * @param {{ withOldResult?: boolean }} [opts] `withOldResult:false` ⇒ 只留新调用那份结果（反向对照用）
+ */
+function seedSameIdKeyedCallsOutOfOrder(pool, { withOldResult = true } = {}) {
+  seedFoldCarrier(pool);
+  pool.seed(KEY, 4, `${KEY}:msg:4:0`, [{
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'OLD CALL BODY' },
+      { type: 'tool_use', id: 'tu_dup', name: 'readFile', input: { path: 'old.txt' }, erix: { toolCallKey: 'call-old' } },
+    ],
+  }]);
+  pool.seed(KEY, 4, `${KEY}:msg:4:1`, [{
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'NEW CALL BODY' },
+      { type: 'tool_use', id: 'tu_dup', name: 'readFile', input: { path: 'new.txt' }, erix: { toolCallKey: 'call-new' } },
+    ],
+  }]);
+  // ⚠ 结果行顺序与调用顺序**相反**：新调用的结果先落盘（紧贴新调用），旧调用的结果最后才落盘。
+  pool.seed(KEY, 4, `${KEY}:msg:4:2`, [{
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: 'tu_dup', content: 'RESULT-FOR-NEW-CALL', erix: { toolCallKey: 'call-new' } }],
+  }]);
+  if (withOldResult) {
+    pool.seed(KEY, 4, `${KEY}:msg:4:3`, [{
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu_dup', content: 'RESULT-FOR-OLD-CALL', erix: { toolCallKey: 'call-old' } }],
+    }]);
+  }
+}
+
+/** 同一 id 的**两条**调用（`callsOfRound` 会给出两条，`callById` 只给第一条 ⇒ 这里按入参选）。 */
+const dupCallsByArgs = (turns, round) => Object.fromEntries(
+  callsOfRound(turns, round)
+    .filter((call) => call.id === 'tu_dup')
+    .map((call) => [call.argsSummary, call]),
+);
+
+test('#562 A：同 id 两条调用各带 `erix.toolCallKey` + 结果位置乱序 ⇒ 各自拿**自己那份**结果', async () => {
+  const s = await startServer();
+  try {
+    seedSameIdKeyedCallsOutOfOrder(s.pool);
+    const turns = await fetchTurns(s);
+
+    const byArgs = dupCallsByArgs(turns, 4);
+    const oldCall = byArgs['path=old.txt'];
+    const newCall = byArgs['path=new.txt'];
+    assert.ok(oldCall && newCall, `同 id 两条调用都要在（实际拿到 ${JSON.stringify(Object.keys(byArgs))}）`);
+    // 夹具自证：两份结果文本确实都种进了 **range 内的账本**（对着渲染结果自证会把「配错了」
+    // 与「根本没种」混成一谈，修复前那种「旧结果界面上根本不存在」就会被当成夹具问题）
+    const ledger = JSON.stringify(s.pool.transcriptRows
+      .filter((row) => row.round >= RANGE.from && row.round <= RANGE.to)
+      .map((row) => row.messages));
+    assert.match(ledger, /RESULT-FOR-OLD-CALL/, '旧调用那份结果确实在 range 内的账本里');
+    assert.match(ledger, /RESULT-FOR-NEW-CALL/, '新调用那份结果也在');
+
+    // 界面上看得见什么：旧调用那一行的预览必须是旧结果，新调用那一行必须是新结果。
+    assert.equal(oldCall.resultPreview, 'RESULT-FOR-OLD-CALL',
+      `旧调用拿到 ${JSON.stringify(oldCall.resultPreview)} ⇒ 串到了新调用的结果上（只看 id + 位置就是这条错法）`);
+    assert.equal(newCall.resultPreview, 'RESULT-FOR-NEW-CALL');
+    assert.notEqual(oldCall.resultPreview, newCall.resultPreview, '两条调用的预览不许被并成同一条');
+    // 身份键本身也是界面字段（0.20.0 起投影透传）：配对用了它，就不要在合并时被结果侧改写
+    assert.equal(oldCall.toolCallKey, 'call-old');
+    assert.equal(newCall.toolCallKey, 'call-new');
+  } finally { await s.close(); }
+});
+
+test('#562 B：同 id 多份结果 ⇒ **warn 照旧要打**（已能按键精确配对也不许悄悄停报）', async () => {
+  const lines = [];
+  const s = await startServer({ log: { warn: (m) => lines.push(String(m)), info: () => {}, error: () => {} } });
+  try {
+    seedSameIdKeyedCallsOutOfOrder(s.pool);
+    const turns = await fetchTurns(s);
+    const dup = lines.filter((line) => line.includes('tool_use_id'));
+    assert.equal(dup.length, 1, `同 id 两份结果时要恰好打一条（实际 ${dup.length} 条：${JSON.stringify(dup)}）`);
+    assert.match(dup[0], /1 个 tool_use_id/, `那条要带条数读数：${dup[0]}`);
+    assert.match(dup[0], /tu_dup/, '要能指出是哪个 id（运维定位用）');
+    // 可观测性与正确性**共存**：修完配对不许顺手把这条 warn 变成死代码（各自的预览照旧要给，
+    // 「拿对哪一份」由 #562 A 钉，这里只钉「warn 与预览同时在场」）
+    for (const call of Object.values(dupCallsByArgs(turns, 4))) {
+      assert.equal(typeof call.resultPreview, 'string', `warn 了就不能不挂预览：${JSON.stringify(call)}`);
+      assert.notEqual(call.resultPreview, '', `预览不许是空串：${JSON.stringify(call)}`);
+    }
+  } finally { await s.close(); }
+
+  // 反向对照：同 id 两条调用但只有**一份**结果 ⇒ `duplicateIds` 按结果份数计，一条都不许多打
+  const quiet = [];
+  const s2 = await startServer({ log: { warn: (m) => quiet.push(String(m)), info: () => {}, error: () => {} } });
+  try {
+    seedSameIdKeyedCallsOutOfOrder(s2.pool, { withOldResult: false });
+    await fetchTurns(s2);
+    assert.deepEqual(quiet.filter((line) => line.includes('tool_use_id')), [],
+      `只有一份结果就不许报（实际：${JSON.stringify(quiet)}）`);
+  } finally { await s2.close(); }
+});
+
+test('#562 C：调用**没有**身份键 ⇒ 退回就近，但一份结果最多被一个调用消费（两条调用不共用同一条）', async () => {
+  const s = await startServer();
+  try {
+    seedFoldCarrier(s.pool);
+    // 无键形状（普通执行路径的结果块上没有 `erix.toolCallKey`，取证见工单）：
+    // 位置序 `call(1) < call(2) < res(1) < res(2)` ⇒ 纯就近会让两条调用**都**拿 res(1)。
+    s.pool.seed(KEY, 4, `${KEY}:msg:4:0`, [{
+      role: 'assistant',
+      content: [{ type: 'text', text: 'FIRST CALL' }, { type: 'tool_use', id: 'tu_dup', name: 'shell', input: { command: 'first' } }],
+    }]);
+    s.pool.seed(KEY, 4, `${KEY}:msg:4:1`, [{
+      role: 'assistant',
+      content: [{ type: 'text', text: 'SECOND CALL' }, { type: 'tool_use', id: 'tu_dup', name: 'shell', input: { command: 'second' } }],
+    }]);
+    s.pool.seed(KEY, 4, `${KEY}:msg:4:2`, [{
+      role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_dup', content: 'UNCONSUMED-RESULT-ONE' }],
+    }]);
+    s.pool.seed(KEY, 4, `${KEY}:msg:4:3`, [{
+      role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_dup', content: 'UNCONSUMED-RESULT-TWO' }],
+    }]);
+    const turns = await fetchTurns(s);
+
+    const byArgs = dupCallsByArgs(turns, 4);
+    assert.equal(byArgs['command=first'].resultPreview, 'UNCONSUMED-RESULT-ONE', '就近取它之后最近的那条');
+    assert.equal(byArgs['command=second'].resultPreview, 'UNCONSUMED-RESULT-TWO',
+      `第二条调用拿到 ${JSON.stringify(byArgs['command=second'].resultPreview)} ⇒ 两条调用共用了同一条结果`
+      + '（一条结果最多被一个调用消费）');
+  } finally { await s.close(); }
+});

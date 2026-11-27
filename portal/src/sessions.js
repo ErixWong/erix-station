@@ -609,29 +609,45 @@ function contentBlocks(content) {
  * 追加的那条消息**只有 tool_result 块**，上游 `textOf()` 对它是空串 ⇒ 走的是「model plumbing」那条
  * `continue`（`projection.js` 原注释）⇒ **不会多冒一个 user turn**（判据里用 turn 计数钉住）。
  *
- * ⚠ **同一个 `tool_use_id` 在 range 内有多份结果时取「就近」，不取「最后一条」也不取「第一条」**
- * （PR #541 第三方审计 MED，主 agent 裁决返工）。为什么不是 last-write-wins：上游明写 provider id
- * **不保证在一个 run 内唯一**（`erix-agent/src/tool-fact.js:209-210`：「**跳轮不在这里继承**：provider id
- * 不保证 run 内唯一（issue #284）」），于是「round A 用 `x` 得 A、round B 用 `x` 得 B」是合法形状 ——
- * range 级 `Map.set` 会把 B 覆盖成唯一值，**第一个 round 也就显示 B**（错内容比缺内容更难发现）。
- * 而「取第一条」只是把错的方向反过来（B 会显示 A）：正确性来自**位置**，不是插入顺序。
- * 现在的尺（`seq` 是全局单调计数，按「记录顺序 → 消息顺序 → 块顺序」发放，记录顺序就是 SQL 的
+ * ⚠ **配对先看「调用身份」，身份缺席才退回看「位置」**（issue #562）。
+ * 为什么「只比 `tool_use_id` + 位置」不够：上游明写 provider `id` **不能当跨轮调用身份**
+ * （`erix-agent/src/tool-fact.js:150` 附近「provider id 不保证 run 内唯一（issue #284）」），
+ * 于是「同一个 `id` 两条调用」是**合法形状**；位置序 `call(OLD) < call(NEW) < res(NEW) < res(OLD)`
+ * 时旧调用会拿到**新调用**那份结果当预览 —— 界面显示一条看着合理但**错**的结果（错内容比缺内容更难发现）。
+ * 块上本来就带着可用的身份键：调用侧 `tool_use.erix.toolCallKey`（`tool-fact.js:269` `ensureToolCallKeyOnBlock`），
+ * 结果侧**只有「中断重放」那条路**才写（`erix-llm-kit/src/loop/orchestrator.js:5511`、`:5539`，
+ * 普通执行路径的 `executeToolBlock` 不写）⇒ 只能「键在就按键精确配，键缺席才退回就近」；
+ * **不许把「按 id 扫历史」当身份**（上游明令禁止，等于把串号从 `id` 搬进 key）。
+ *
+ * 配对优先级（`seq` 是全局单调计数，按「记录顺序 → 消息顺序 → 块顺序」发放，记录顺序就是 SQL 的
  * `ORDER BY round ASC, append_seq ASC` ⇒ `seq` 就是账本里的真实先后）：
- *   ① 取该 `tool_use` **之后**最近的一条同 id 结果（正常形状：结果行紧跟在调用行后面）；
- *   ② 之后一条都没有 ⇒ 回退取**之前**最近的一条（resume 复放：`:round:<n>:resume` 行重发旧调用，
+ *   ⓪ **键精确配**：调用块带非空 `erix.toolCallKey` ⇒ 在桶里找 `key === call.key` **且尚未被别的调用
+ *      消费**的那条（两侧都带键才配得上；只有一侧有键 ⇒ 配不上，退到 ①）；
+ *   ① 键缺席 / 键没配上 ⇒ 取该 `tool_use` **之后**最近的**未被消费**的同 id 结果（正常形状：结果行紧跟在调用行后面）；
+ *   ② 之后一条都没有 ⇒ 回退取**之前**最近的一条未被消费的（resume 复放：`:round:<n>:resume` 行重发旧调用，
  *      它的结果落在前面；真库实测 6 个跨轮复用的 id 全是这一类 的取证读数）；
- *   ③ 一条都没有 ⇒ 不追加（回到判据 ② 的「缺键不伪造」）。
- * 同 id 出现多份时**必须可观测**：`duplicateIds` 交回调用方，由 `rebuildFoldedRange` 走现成的
- * `log.warn` 通道打一条（零新事件类型、零 DDL、零响应字段）。
+ *   ③ 同 id 的结果**全部已被别的调用消费** ⇒ 仍按就近复用一条，**不宁可不挂**（#541 判据② 的 resume
+ *      复放形状就是「两条调用共用前面那一份结果」，那里全 range 只有那一份结果，不挂就退化成缺键）；
+ *   ④ 一条都没有 ⇒ 不追加（回到判据 ② 的「缺键不伪造」）。
+ * ①② 与 ③ 都只看**位置**、不看插入顺序 ⇒ first-wins 与 last-write-wins 一样错。
+ *
+ * ⚠ **每个结果块最多被一个调用消费**（`consumed` 按**块引用**记）：旧版本只有「同一条记录内去重」，
+ * 于是两条调用会共用同一条结果 —— 这是同一个病的另一半（各自该有各自的「返回了什么」）。
+ * 同 id 出现多份时**必须可观测**：`duplicateIds` 口径**不变**（同 id 多份结果照旧交回调用方，由
+ * `rebuildFoldedRange` 走现成的 `log.warn` 通道打一条，零新事件类型、零 DDL、零响应字段）。
  *
  * 只读：不改 `rows`、不改 `record.messages`（新建数组/新对象），账本一字节不动。
  * @returns {{ records: object[], duplicateIds: string[] }}
  */
 function attachToolResultsToRecords(records) {
   const list = Array.isArray(records) ? records : [];
-  /** @type {Map<string, { seq: number, block: object }[]>} range 内的 tool_use_id → 该 id 的全部结果块（带位置） */
+  /** 调用身份键（`erix.toolCallKey`）：只认非空字符串；没带就是 `undefined` ⇒ 配对退回「就近」 */
+  const keyOf = (block) => (typeof block?.erix?.toolCallKey === 'string' && block.erix.toolCallKey !== ''
+    ? block.erix.toolCallKey
+    : undefined);
+  /** @type {Map<string, { seq: number, block: object, key: string | undefined }[]>} range 内的 tool_use_id → 该 id 的全部结果块（带位置与身份键） */
   const results = new Map();
-  /** @type {{ seq: number, id: string, recordIndex: number }[]} 按位置排的调用块 */
+  /** @type {{ seq: number, id: string, key: string | undefined, recordIndex: number }[]} 按位置排的调用块 */
   const calls = [];
   /** @type {Set<string>[]} 每条记录里**已经**自己结清的 id（`own`，不重复挂） */
   const ownIds = [];
@@ -644,35 +660,48 @@ function attachToolResultsToRecords(records) {
         const at = seq++;
         if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
           const bucket = results.get(block.tool_use_id);
-          const entry = { seq: at, block };
+          const entry = { seq: at, block, key: keyOf(block) };
           if (bucket) bucket.push(entry);
           else results.set(block.tool_use_id, [entry]);
           own.add(block.tool_use_id);
         } else if (block.type === 'tool_use' && typeof block.id === 'string') {
-          calls.push({ seq: at, id: block.id, recordIndex });
+          calls.push({ seq: at, id: block.id, key: keyOf(block), recordIndex });
         }
       }
     }
   });
   if (results.size === 0) return { records: list, duplicateIds: [] }; // 一条结果都没有 ⇒ 原样交回（老账本零改写）
 
+  /** @type {Set<object>} 已被某个调用配走的结果块（按块引用记 ⇒ 一条结果最多被一个调用消费） */
+  const consumed = new Set();
+  /** 就近：「之后最近」优先，一条都没有才退「之前最近」；`onlyFree` 为真时只在**未被消费**的结果里挑。 */
+  const nearest = (candidates, call, onlyFree) => {
+    let after;
+    let before;
+    for (const c of candidates) {
+      if (onlyFree && consumed.has(c.block)) continue;
+      if (c.seq > call.seq && (after === undefined || c.seq < after.seq)) after = c;
+      if (c.seq < call.seq && (before === undefined || c.seq > before.seq)) before = c;
+    }
+    return after ?? before;
+  };
   /** @type {Map<number, object[]>} recordIndex → 要追加的结果块（同一条记录内按调用顺序，去重同一块引用） */
   const picks = new Map();
   for (const call of calls) {
     if (ownIds[call.recordIndex]?.has(call.id)) continue; // 本记录已结清 ⇒ 用本记录那一份
     const candidates = results.get(call.id);
     if (candidates === undefined) continue; // range 内查不到 ⇒ 缺键，不伪造
-    // ①「之后最近」优先；② 否则退到「之前最近」。两者都不看插入顺序 ⇒ first-wins 与 last-write-wins 一样错。
     let chosen;
-    for (const c of candidates) {
-      if (c.seq > call.seq && (chosen === undefined || c.seq < chosen.seq)) chosen = c;
+    if (call.key !== undefined) {
+      // ⓪ 键精确配：两侧身份键相等，且那条结果还没被别的调用消费。
+      chosen = candidates.find((c) => c.key !== undefined && c.key === call.key && !consumed.has(c.block));
     }
-    if (chosen === undefined) {
-      for (const c of candidates) {
-        if (c.seq < call.seq && (chosen === undefined || c.seq > chosen.seq)) chosen = c;
-      }
-    }
+    // ①② 键缺席 / 键没配上 ⇒ 退回「之后最近 → 之前最近」，但只在未被消费的结果里挑。
+    if (chosen === undefined) chosen = nearest(candidates, call, true);
+    // ③ 同 id 的结果全被占了 ⇒ 宁可就近复用也不退化成缺键（#541 判据② 的 resume 复放形状）。
+    if (chosen === undefined) chosen = nearest(candidates, call, false);
     if (chosen === undefined) continue; // 位置相同（不可能：seq 唯一）⇒ 宁可不挂
+    consumed.add(chosen.block);
     const bucket = picks.get(call.recordIndex) ?? [];
     if (!bucket.includes(chosen.block)) bucket.push(chosen.block); // 同一条记录里同 id 复用两次 ⇒ 只挂一份
     picks.set(call.recordIndex, bucket);
