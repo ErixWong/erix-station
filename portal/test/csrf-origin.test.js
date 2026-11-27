@@ -2,7 +2,7 @@
 // 两层：① `checkSameOrigin` / `csrfGateFor` 纯判据（判据 a/b/c/d 逐支 + 归一化 + 畸形）；
 // ② createServer + FakePool 的 HTTP 层（403 `cross_origin_forbidden`、CORS deny 头、审计、豁免端点、GET/SSE 不受影响）。
 // 口径的单一真相：docs/api/portal.md §2.11。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,6 +11,19 @@ import { createServer, checkSameOrigin, csrfGateFor } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startServer 建的 staticDir（`station-csrf-`）进 tmpDirs，afterEach 逐格 rm（**不带 force**：rm 失败当场红）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // ① 纯判据：判据 a/b/c/d 逐支
@@ -347,7 +360,7 @@ test('#234 豁免：/api/internal/* 与 /api/forward-auth 不进防线（无 coo
 // ---------------------------------------------------------------------------
 
 async function startServer({ pool: customPool, users = [] } = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-csrf-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-csrf-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   fs.mkdirSync(path.join(staticDir, 'app'), { recursive: true });
   fs.writeFileSync(path.join(staticDir, 'app', 'index.html'), 'SECRET_VUE_INDEX');
