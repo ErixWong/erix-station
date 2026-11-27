@@ -1636,7 +1636,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 
 | 键 | 类型 | 口径 |
 |---|---|---|
-| `partial_text` | string | 被停住那半轮的正文，取自进程内缓冲**当前那一轮**的正文槽（`round_end` 落库成功后那一轮的槽已被 `closeRound` 关掉 ⇒ 这里**不会**重复已完成轮次，#502 审计第 2 条）。**只在零助手锚点时写**；缓冲里没有这个 run、或正文为空 ⇒ **三个键一个都不写**（也不写空键） |
+| `partial_text` | string | 被停住那半轮的正文，取自进程内缓冲**当前那一轮**的正文槽（`round_end` 落库成功后那一轮的槽已被 `closeRound` 关掉 ⇒ 这里**不会**重复已完成轮次，#502 审计第 2 条）。**只在零助手锚点时写**；缓冲里没有这个 run、或正文为空 ⇒ **三个键一个都不写**（也不写空键）。第三种「不写」的情形（#545）：那一槽是**被逐出后重建的尾巴**（快照 `tailOnly === true`，从中间起笔、开头永久丢了）⇒ 也**三个键一个都不写**，宁缺毋伪（口径见 §5.1 那条「已接受损失」） |
 | `partial_round` | number | 那段正文所属的轮号（缓冲槽里的 `round`；拿不到数就是 `0`） |
 | `partial_truncated` | boolean | **#513 新增的键**：正文槽**自己**被缓冲上限 `textCap = 16,384` 夹过尾就是 `true`。取的是快照的 `textTruncated`（实现注记见下）。读侧**只认真字面量 `true`**：缺键（#513 之前落的 `run_end` 行本来就不可能有这个键）与脏值都当「没截」，不拿脏值谎报 |
 
@@ -4390,18 +4390,35 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
   > `run-partial-buffer.js` 文件头）。它**不与 portal 级 active-run 上限绑定**——那种上限今天不存在（见下面裁决 ①）。
   > `evictOne()` **优先逐已终态的 entry**（`markTerminal` 标过的那些）；只有当**同时 >32 个活跃 run 且一条终态
   > 条目都没得逐**时，它才必须逐一个**仍在流**的 run。
-  > **后果有两种形态（工单 #515 原文只写了第一种；第二种是 261115-11 复现时实测补的，比第一种更坑）**：
+  > **后果有两种形态（工单 #515 原文只写了第一种；第二种是 261115-11 复现时实测补的，它已由 #545 修掉）**：
   >   · **形态 ①：逐出后该 run 不再吐字** ⇒ 槽位不重建 ⇒ `runEndPartialKeys` 读到空快照 ⇒ `run_end` 里
   >     **不加 `partial_text` 键** ⇒ 那半轮正文永久丢。已跑完的轮次仍在（`round_end.final_text`），两处都空
   >     则历史里只剩 §4.4a-1 判据 3 的**占位项**（表现 = 「那段没了」+ 一行中性提示，不是脏数据）。
-  >   · **形态 ②：逐出后该 run 继续吐字** ⇒ 后续碎片把它**重建成一个 blank entry** ⇒ 终态写出的
-  >     `partial_text` 是**一段从中间起笔的尾巴**（逐出之前那段永久丢，内存与库里都没有它，也没有 DB 回落），
-  >     而且**没有任何标记说明它是尾巴**：`partial_round` 掉到 `0`（轮号随 blank 一起没了）、`chunks` 从 0
-  >     重开、`textSegment` 回落到 0、`roundSeq` 掉到 `null`。⚠ 这比缺字段更坑：有 `partial_text` ⇒ 历史投影
-  >     **不出**占位项 ⇒ 用户看到的是一段「看着完整、其实从半句开始」的正文；而 `roundSeq: null` 会让本节
-  >     的补发判据（「run + `roundSeq` 两端都匹配才覆盖气泡」）**整帧丢弃** ⇒ 重连也补不回来。
-  >     **这条尾巴是独立的正确性问题，#515 不修**（主 agent 另开单跟）；今天由
-  >     `portal/test/healthz-partial-buffer.test.js` 里那条「钉**今天的真实行为**」的用例钉住 ⇒ 谁修它，谁就必须回来改本段口径。
+  >   · **形态 ②（#515 时的行为，现已修）：逐出后该 run 继续吐字** ⇒ 后续碎片把它**重建成一个 blank entry**。
+  >     当时终态直接写出**一段从中间起笔的尾巴**（逐出之前那段永久丢，内存与库里都没有它，也没有 DB 回落），
+  >     而**没有任何标记说明它是尾巴**：`partial_round` 掉到 `0`（轮号随 blank 一起没了）、`chunks` 从 0
+  >     重开、`textSegment` 回落到 0、`roundSeq` 掉到 `null`。⚠ **尾巴比缺字段更坑：缺字段是中性占位，
+  >     尾巴冒充整段** —— 有 `partial_text` ⇒ 历史投影**不出**占位项 ⇒ 用户把一段「看着完整、其实从半句开始」
+  >     的正文当全文；而 `roundSeq: null` 会让本节的补发判据（「run + `roundSeq` 两端都匹配才覆盖气泡」）
+  >     **整帧丢弃** ⇒ 重连也补不回来。
+  >   · **现口径（#545 已修，工单 fix-261127-18，裁决 = 「宁缺毋伪」：不写尾巴，而不是给尾巴加标记）**：
+  >     缓冲自己**记住「谁被以活跃态逐出过」**（`run-partial-buffer.js` 里的 `tailOnlyRuns` 有界集合，
+  >     上限 = `maxEntries`，超出按插入序丢最老；`drop()` / `markTerminal()` / `clear()` 会清掉该 runId ——
+  >     已终结的 run 不该长期攥着记账），新建槽时（`observe()` **与** `stage().observe()` 共用的那个入口，
+  >     真实写路径走的是 `stage()`）给它打上 **`tailOnly: true`**；快照 `view()` additive 地暴露它
+  >     （没被逐出过的槽照旧给 `false`，不新增「键缺席」那种第二语义），而
+  >     **`runEndPartialKeys()` 见到 `snap.tailOnly === true` 就返回空对象** ⇒ `partial_text` /
+  >     `partial_round` / `partial_truncated` **一个都不写** ⇒ 终态 `run_end` 的 payload 逐字回到
+  >     「无正文」那条既有路径 ⇒ 界面走 §4.4a-1 判据 3 的**中性占位**（「那段没了」）。
+  >     选它而不选「写一个 `partial_incomplete: true`」的理由：后者要改动前端（还要先处理「`roundSeq`
+  >     为 `null` 时整帧丢弃」），而**少一段是「一时看不到」，假一段是「看到了错的」**。
+  >     两条通道现在都不会把半截当全文：终态不写正文，补发帧的 `roundSeq` 仍是 `null`（被前端闸②丢弃）。
+  >     ⚠ **尾巴不是永久刑**：被逐出后该 run 又跑到了**下一轮**（观测到新的 `round_start`）⇒ 那一轮的开头我们
+  >     确实拿到了 ⇒ `tailOnly` 解除，终态照旧写键（过度收紧 = 白白少一段）。
+  >     ⚠ 本单**不改逐出策略**（`observe()` / `stage().commit()` 里的 `while (entries.size >= maxEntries) evictOne();`
+  >     在「一条都逐不掉」时是死循环，实测 `rc=124`）⇒ 逐出仍会发生、`evictedActive` 仍会跳，只是被逐出的那段
+  >     正文**不再冒充整段**。判据：`portal/test/healthz-partial-buffer.test.js` 的 `#545 …` 三条用例
+  >     （尾巴不落库 / 未被逐出的 run 三键照旧 / `roundSeq === null` 的尾巴不许被当成可补发的整段）。
   > 今天**没踩到**，但要说准：**这是部署现状，不是代码保证**。逐出活跃 run 需要**同时 >32 个活跃 run**，而活跃并发 = Σ(每个 agentd 的 capacity)——缺省 **2/agentd**（`runner/agentd.js:15-17`，`ERIX_AGENTD_CAPACITY` 可调），portal 侧**没有**全局上限，认领是 `FOR UPDATE SKIP LOCKED` **逐行放行**（`portal/src/internal.js:257-280`，**不是全局串行**）。261116 现网读数：6 个 `fde-*` 容器 ⇒ 并发上界约 12；此刻库里 `status in ('running','queued')` 的 run = **0**（另有 1 条 `cancelling`）——**这是某一刻的快照，会随负载变**，别当常量引用。**FDE 数 × 2 越过 32（约 17 台）就会开始逐活跃 run**，那时 `evictedActive` 会跳（见下面的可观测面）。
   > **可观测面（裁决的 ② 轻量版）**：逐出活跃 run 会计 `stats().evictedActive` 并打一条 `log.warn`（这两半
   > 本单之前就有），本单补的是第三半：**`GET /healthz` / `/api/health` 的 200 响应多带一块

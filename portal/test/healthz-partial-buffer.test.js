@@ -12,9 +12,11 @@
 //   ③ 文档显式接受（`docs/api/portal.md` §5.1 的已接受损失条目 + `docs/design/deploy-contract.md` §2.3）。
 //   ①（把容量与 portal 级 active-run 硬上限绑定）**本单不做**：portal 今天没有那种硬上限。
 //
-// ⚠ 本文件有一条用例**钉的是「今天的真实行为」，不是「我们想要的行为」**（`尾巴冒充整段` 那条）：
+// ⚠ 本文件以前有一条用例**钉的是「今天的真实行为」，不是「我们想要的行为」**（`尾巴冒充整段` 那条）：
 //   逐出后该 run 继续吐字 ⇒ 终态写出的是一段从中间起笔的**尾巴**、且轮号掉到 0、`roundSeq` 掉到
-//   `null`。那是独立的正确性问题（主 agent 另开单跟），**本单不修**，所以这里不许把它改成期望值。
+//   `null`。**那条已由 #545 修掉**（尾巴不再冒充整段：缓冲打上 `tailOnly`，终态不写 `partial_text`）
+//   ⇒ 那条用例已改名成 `#545 …` 并改成新期望；它下面还补了两格（正常 run 不受影响 / 尾巴形状
+//   不许被当成可补发的整段）。口径见 `docs/api/portal.md` §5.1。
 //
 // 隔离（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB；进程内单例 `partialOutputs`
 // 每条用例前后都 `clear()`（node --test 每文件一进程，但同文件内多条用例共用那一份单例）。
@@ -217,7 +219,7 @@ test('#515a：默认上界下逐出一个活跃 run ⇒ `evictedActive` 严格 +
   assert.equal(warns.length, 1);
 });
 
-test('#515 复现（钉**今天的真实行为**，不是期望行为）：逐出后继续吐字 ⇒ 终态写出的是**从中间起笔的尾巴**，`roundSeq` 掉成 `null`、轮号掉到 0', () => {
+test('#545：被逐出后继续吐字 ⇒ 重建的尾巴槽带 `tailOnly`，终态**不写** `partial_text`（宁缺毋伪，不再冒充整段）', () => {
   const b = createPartialBuffer({ log: { warn: () => {} } }); // **默认 32**，不用玩具上界
   // 33 个活跃 run 同时在流；每个都进了第 1 轮（`round_start` 带 seq）并吐了正文
   for (let i = 1; i <= 33; i += 1) {
@@ -226,31 +228,145 @@ test('#515 复现（钉**今天的真实行为**，不是期望行为）：逐�
   }
   assert.equal(b.stats().evictedActive, 1, '第 33 个挤掉最老那条活跃的（`r-1`）');
 
-  // 情形①（工单原文只覆盖这一种）：逐出后**不再吐字** ⇒ 空槽 ⇒ 终态**没有** `partial_text`
+  // 情形①（#515 原文只覆盖这一种）：逐出后**不再吐字** ⇒ 空槽 ⇒ 终态**没有** `partial_text`
   assert.equal(b.snapshot('r-1'), null);
   assert.deepEqual(runEndPartialKeys('r-1', { hasAssistantAnchor: false, buffer: b }), {},
     '空槽 ⇒ 一个键都不加 ⇒ 界面走 §4.4a-1 判据 3 的占位项（「那段没了」+ 中性提示）');
 
-  // 情形②（工单原文**漏掉**的那一种，也是更坑的一种）：逐出后**继续吐字** ⇒ 槽位重建
+  // 情形②（#515 原文**漏掉**的那种）：逐出后**继续吐字** ⇒ 槽位被重建 ⇒ 只有尾巴。
+  // 改前的期望是「写出三个键、尾巴冒充整段」；#545 后的新期望 = **尾巴不落库**。
   b.observe('r-1', ev('assistant_delta', { text: '后半段' }));
   const snap = b.snapshot('r-1');
   assert.ok(snap, '槽位被后续碎片重建（不是永远没槽）');
   assert.equal(snap.text, '后半段',
-    '**只剩尾巴**：逐出之前那段（「第1个run的前半段正文」）永久丢，尾巴却看起来像一段完整正文');
-  assert.ok(!snap.text.includes('前半段'), '前半段确实回不来了（内存里没有它，也没有 DB 回落）');
+    '**只剩尾巴**：逐出之前那段（「第1个run的前半段正文」）永久丢，内存里没有它、也没有 DB 回落');
+  assert.equal(snap.tailOnly, true,
+    '#545 的核心：这个槽**被记着**是从中间起笔的尾巴（additive 键，没被逐出过的槽就是 false）');
   assert.equal(snap.round, null, '轮号也丢了（重建的是 blank entry）');
-  assert.equal(snap.roundSeq, null,
-    '⚠ `roundSeq` 掉成 `null` ⇒ 补发帧按 §4.4a「两端都匹配才覆盖气泡」的口径被**整帧丢弃**');
+  assert.equal(snap.roundSeq, null, '尾巴形状：`roundSeq` 掉成 `null`（下面那条补发判据用例钉它的后果）');
   assert.equal(snap.chunks, 1, '碎片计数从 0 重开（旧段 1 片 + 新段 1 片 ⇒ 对不上账）');
-  assert.equal(snap.textSegment, 0,
-    '代际号回落到 0 < 前端已记录的 ⇒ 按「过期一代」忽略 ⇒ 水位线不会倒退，但也补不回正文');
+  assert.equal(snap.textSegment, 0, '代际号回落到 0（同一段的两份快照里它是更旧那份）');
 
-  // 终态写库的那一份：尾巴冒充整段，且轮号谎报成 0
-  assert.deepEqual(runEndPartialKeys('r-1', { hasAssistantAnchor: false, buffer: b }), {
-    partial_text: '后半段', partial_round: 0, partial_truncated: false,
-  }, '有 `partial_text` ⇒ 历史投影**不会**出占位项，用户看到的是一段从中间起笔、没有任何标记的正文');
+  // 终态写库：尾巴**不写**（宁缺毋伪），走既有「空正文 ⇒ 不加键」那条中性占位路径
+  assert.deepEqual(runEndPartialKeys('r-1', { hasAssistantAnchor: false, buffer: b }), {},
+    '#545 新期望：**不加 `partial_text`/`partial_round`/`partial_truncated`** ⇒ 历史投影出中性占位，'
+    + '用户看到的是「那段没了」而不是一段从半句开始的「完整」正文');
 
-  // 对照：有 assistant 锚点时仍不写（这条口径没被本单动过）
+  // 反面：有 assistant 锚点时本来也不写（这条口径没被本单动过）
   assert.deepEqual(runEndPartialKeys('r-1', { hasAssistantAnchor: true, buffer: b }), {},
     '有锚点 ⇒ 一份正文就够（#300 的重复正文红线，本单没碰）');
+
+  // 尾巴也不是永久刑：下一轮 `round_start` 一到，这一轮的开头我们确实拿到了 ⇒ 判据解除
+  b.observe('r-1', ev('round_start', { round: 2 }, { seq: 900 }));
+  b.observe('r-1', ev('assistant_delta', { text: '第二轮说了一半' }));
+  assert.equal(b.snapshot('r-1').tailOnly, false,
+    '观测到 `round_start` ⇒ 此后的正文是完整一段（过度收紧 = 白白少一段）');
+  assert.deepEqual(runEndPartialKeys('r-1', { hasAssistantAnchor: false, buffer: b }), {
+    partial_text: '第二轮说了一半', partial_round: 2, partial_truncated: false,
+  }, '新一轮的正文照旧照实落库（本单只挡「从中间起笔」那一份）');
+});
+
+test('#545：未被逐出过的 run 走同一段代码 ⇒ 三键照旧给全（含 `partial_truncated`），`tailOnly` 就是 false', () => {
+  const b = createPartialBuffer({ log: { warn: () => {} } }); // 默认 32，全程无逐出
+  b.observe('r-ok', ev('round_start', { round: 3 }, { seq: 77 }));
+  b.observe('r-ok', ev('assistant_delta', { text: '一轮完整的半截正文' }));
+  const snap = b.snapshot('r-ok');
+  assert.equal(snap.tailOnly, false,
+    'additive 键在「没被逐出」这一侧给**实值 false**（不新增「键缺席」那种第二语义）');
+  assert.equal(snap.roundSeq, 77);
+  assert.deepEqual(runEndPartialKeys('r-ok', { hasAssistantAnchor: false, buffer: b }), {
+    partial_text: '一轮完整的半截正文', partial_round: 3, partial_truncated: false,
+  }, '正常路径一个键都不许少：尾巴修复不得把三键抽成两键');
+
+  // 截断路径也照旧：`partial_truncated` 仍是**正文自己**的那一位（审计第 3 条不许被本单放宽）
+  const c = createPartialBuffer({ textCap: 10, log: { warn: () => {} } });
+  c.observe('r-cap', ev('round_start', { round: 1 }, { seq: 5 }));
+  c.observe('r-cap', ev('assistant_delta', { text: '一二三四五六七八九十' }));
+  c.observe('r-cap', ev('assistant_delta', { text: '尾巴丢了' }));
+  assert.deepEqual(runEndPartialKeys('r-cap', { hasAssistantAnchor: false, buffer: c }), {
+    partial_text: '一二三四五六七八九十', partial_round: 1, partial_truncated: true,
+  }, '被 `textCap` 夹尾（正文完整度已知）与被逐出（正文从哪起笔未知）是两个问题，前者照旧写键');
+});
+
+test('#545（补发判据）：尾巴形状（`roundSeq === null`）**不被当成「可补发的整段」** ⇒ 整帧丢弃', () => {
+  // 镜像 `portal/frontend/src/composables/useEventStream.ts` 的 `case 'partial_output'` 闸②：
+  //   `frameRoundSeq = typeof d.roundSeq === 'number' && Number.isFinite(...) ? ... : null`；
+  //   `roundOk = frameRoundSeq !== null && roundSeqByRun.get(run_id) === frameRoundSeq`。
+  // 两侧分开承重（同 `session-partial-snapshot.test.js` 的约定）：本格钉的是**后端交给它的那份形状**。
+  const clientAccepts = (snap, clientRoundSeq) => {
+    const frameRoundSeq = typeof snap.roundSeq === 'number' && Number.isFinite(snap.roundSeq) ? snap.roundSeq : null;
+    return frameRoundSeq !== null && clientRoundSeq === frameRoundSeq;
+  };
+
+  const b = createPartialBuffer({ log: { warn: () => {} } }); // 默认 32
+  for (let i = 1; i <= 33; i += 1) {
+    b.observe(`t-${i}`, ev('round_start', { round: 1 }, { seq: 100 + i }));
+    b.observe(`t-${i}`, ev('assistant_delta', { text: `第${i}个run的前半段` }));
+  }
+  b.observe('t-1', ev('assistant_delta', { text: '被逐出后的尾巴' }));
+
+  const tail = b.snapshot('t-1');
+  assert.equal(tail.tailOnly, true, '前置：这就是那条尾巴');
+  assert.equal(clientAccepts(tail, 101), false,
+    '尾巴帧的 `roundSeq` 是 `null` ⇒ 闸②按不中处理 ⇒ **整帧丢弃**：它不配被当作「当前轮的整段」盖到气泡上');
+  assert.equal(clientAccepts(tail, null), false, '客户端也没观测到轮起点 ⇒ 依旧不中（不拿「两边都 null」当对上）');
+
+  // 对照：未被逐出的 run（同一段代码、同一个快照函数）仍能被接受
+  // （为什么拿 `t-33`：重建 `t-1` 时又要一个位子 ⇒ 会再咬掉当时最老的活跃 run，`t-2` 已经没了）
+  const normal = b.snapshot('t-33');
+  assert.ok(normal, '前置：对照那条还在');
+  assert.equal(normal.tailOnly, false);
+  assert.equal(clientAccepts(normal, 133), true,
+    '判据本身没被改松/改紧：只有尾巴那份被挡，正常那份照旧过闸');
+
+  // 而终态那一侧也不写 ⇒ 两条通道（补发帧 / `run_end.partial_text`）都不再把半截当全文
+  assert.deepEqual(runEndPartialKeys('t-1', { hasAssistantAnchor: false, buffer: b }), {});
+  assert.deepEqual(runEndPartialKeys('t-33', { hasAssistantAnchor: false, buffer: b }),
+    { partial_text: '第33个run的前半段', partial_round: 1, partial_truncated: false });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #545 的两条红线（issue 实测过的坑，本单不许踩）
+// ─────────────────────────────────────────────────────────────────────────────
+test('#545 红线①：记账集合**有界**（上限 = `maxEntries`），且逐出策略一字未动（全活跃时照旧逐，不许死循环）', () => {
+  const b = createPartialBuffer({ maxEntries: 4, log: { warn: () => {} } });
+  // 灌 40 个活跃 run：每一步都「全是活跃 run 可逐」⇒ 若有人把逐出改成「活跃的就 return」，
+  // 这里会**挂死**（`while (entries.size >= maxEntries) evictOne();` 没有出口，issue #545 实测 rc=124）。
+  for (let i = 1; i <= 40; i += 1) b.observe(`x-${i}`, ev('assistant_delta', { text: `c${i}` }));
+  assert.equal(b.size(), 4, '槽位数仍被 `maxEntries` 夹住（本单没动容量，也没动逐出）');
+  assert.equal(b.stats().evictedActive, 36, '逐出计数口径一字未动（对外读数面仍拿它算账）');
+  assert.ok(b.stats().tailOnlyRuns <= 4,
+    `尾巴记账必须有界（它比 entry 活得久，不设上限就是长跑 portal 的隐性泄漏）：实拿 ${b.stats().tailOnlyRuns}`);
+  assert.equal(b.stats().tailOnlyRuns, 4, '上界就是 `maxEntries`（超出按插入序丢最老）');
+});
+
+test('#545 红线②：`drop()` / `markTerminal()` 之后清掉该 runId（不长期攒着已终结的 run），且 `clear()` 一并清', () => {
+  const b = createPartialBuffer({ maxEntries: 2, log: { warn: () => {} } });
+  b.observe('a', ev('assistant_delta', { text: 'A' }));
+  b.observe('b', ev('assistant_delta', { text: 'B' }));
+  b.observe('c', ev('assistant_delta', { text: 'C' })); // 逐 'a'（活跃）⇒ 记账 {a}
+  assert.equal(b.snapshot('a'), null, '前置：a 被活跃态逐出');
+  assert.equal(b.stats().tailOnlyRuns, 1, '前置：记了一条');
+  b.observe('a', ev('assistant_delta', { text: 'A 的尾巴' })); // 重建又要位子 ⇒ 再逐 'b' ⇒ 记账 {a,b}
+  assert.equal(b.snapshot('a').tailOnly, true, '前置：a 的槽是尾巴');
+  assert.equal(b.stats().tailOnlyRuns, 2, '前置：两条活跃逐出都记着（上限 = maxEntries = 2）');
+
+  b.markTerminal('a');
+  assert.equal(b.stats().tailOnlyRuns, 1, 'markTerminal ⇒ 该 runId 的记账还掉（终态的 run 不需要这个判据）');
+  assert.equal(b.drop('a'), true, '前置：drop 真删了东西');
+  assert.equal(b.drop('b'), false, '前置：b 早在上一轮就被逐掉了（表里没它）');
+  assert.equal(b.stats().tailOnlyRuns, 0,
+    'drop() 也要清 —— 哪怕那个 run 已经不在表里，记账也不许继续攒着（长跑 portal 的隐性泄漏）');
+
+  // 记账清掉之后同一 runId 再建槽 ⇒ 不再被当尾巴（不拿陈年旧账误伤正常正文）
+  b.observe('b', ev('assistant_delta', { text: 'B2' }));
+  assert.equal(b.snapshot('b').tailOnly, false, 'drop 之后重建的槽不再背尾巴');
+
+  assert.ok(b.clear() >= 1, 'clear() 返回清掉的条数');
+  b.observe('d', ev('assistant_delta', { text: 'D' }));
+  b.observe('e', ev('assistant_delta', { text: 'E' }));
+  b.observe('f', ev('assistant_delta', { text: 'F' }));
+  assert.equal(b.stats().tailOnlyRuns, 1, '前置：clear 之后又能记（不是被永久关掉）');
+  assert.equal(b.clear(), 2);
+  assert.equal(b.stats().tailOnlyRuns, 0, 'clear()（模拟 portal 重启）连记账一起清');
 });
