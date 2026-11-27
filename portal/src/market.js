@@ -681,15 +681,26 @@ function diskOps({ config, ops, log = console, spawnImpl = null }) {
   if (r?.status !== 0) {
     // 非 0（或超时/信号）⇒ 就是失败，不强行「部分成功」。details.reason **带子进程的码**（要求）。
     const code = r?.signal ? `helper_signal_${r.signal}` : `helper_exit_${r?.status}`;
+    // #803 返修③：`details` 会被 `http.js` **原样序列化**进错误体，而 helper 的自校验诊断是中文
+    // （`market-write.js` 的 `fail()`：「write 缺少 contentBase64」这类）⇒ 之前 `stderr` /
+    // `child_error` 把中文直接泄进了 `locale=en` 的响应。现在错误体只留机器可读字段（`reason`
+    // / `exit_code` / `signal` / `dropped` / `child_code` / `child_op` / `child_path` / `child_index`），
+    // 原文（stderr 与 helper 的 error）**只进服务端日志**，一行不丢。
     const details = { reason: code, exit_code: r?.status ?? null, signal: r?.signal ?? null,
-      dropped: Boolean(opts.uid), stderr: stderr.slice(0, 500) };
+      dropped: Boolean(opts.uid) };
+    let childError = '';
     try {
       const parsed = JSON.parse(stderr);
-      if (parsed && parsed.ok === false) Object.assign(details, { child_error: parsed.error, child_code: parsed.code, child_op: parsed.op, child_path: parsed.path, child_index: parsed.index });
-    } catch { /* stderr 不是 JSON（helper 自己炸了/没跑起来）：原文已在 details.stderr */ }
+      if (parsed && parsed.ok === false) {
+        childError = typeof parsed.error === 'string' ? parsed.error : '';
+        Object.assign(details, { child_code: parsed.code, child_op: parsed.op, child_path: parsed.path, child_index: parsed.index });
+      }
+    } catch { /* stderr 不是 JSON（helper 自己炸了/没跑起来）：原文下面整段进日志 */ }
+    log.warn?.(`[market] 落盘子进程失败原文（仅服务端，不进错误体）：${code} stderr=${stderr.slice(0, 500)} child_error=${childError.slice(0, 300)}`);
     throw new MarketError(`落盘子进程失败：${code}${stderr ? ` ${stderr.slice(0, 300)}` : ''}`, {
       code: 'capability_install_failed', httpStatus: 500, details,
-      en: `disk-write child process failed: ${code}${stderr ? ` ${stderr.slice(0, 300)}` : ''}`,
+      // 英文腿不再插 stderr 原文（那是 helper 的中文诊断，贴进 en 等于没翻）；机器码 `code` 已在两边。
+      en: `disk-write child process failed: ${code}`,
     });
   }
   if (stderr) log.warn?.(`[market] 落盘子进程 stderr（退出 0，不阻断）：${stderr.slice(0, 300)}`);
