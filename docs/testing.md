@@ -71,6 +71,9 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 > **随 `npm test` 一起跑的语法腿**：`npm test` 链了 `node scripts/check-integration-syntax.mjs`（单独跑：`npm run check:integration-syntax`）。活栈 e2e 脚本是「脚本里套脚本」（浏览器里跑的代码写成 `String.raw` 模板再送进容器），模板里混进一个反引号就会提前闭合外层模板——而**外层 `node --check` 照样合法**（#804 实测：单测与 `npm test` 全绿，只有真跑浏览器腿才炸），所以外层与内嵌片段两层都查；某文件出现 `String.raw` 字样却抠出 **0 段**、或全仓总段数为 0 ⇒ **直接红**（记号被改名/换引号后内层脚本就没人查了，「0 段也算全通过」是假绿）。边界说清：抠出来的是**未插值**的模板原文（`${…}` 在这条腿眼里是字面文本，内层要传值走 `cfg`），内层脚本本身**不许再写反引号**；语义对不对仍只能真跑一次浏览器腿（§1.2.3）。 **服务端文案的双语覆盖不设计数闸**（#803 走过一次，判据见 `docs/design/principles.md` §3）：进度看 issue #803 的账；已翻面的部分由单测钉（注册表 `label↔labelEn` parity = `RS-64`；缺省中文逐字不变 = `RS-66`/`RS-67`；HTTP 级错误文案 = `RS-API-13`），没翻的照旧出中文不是故障。
 
 > **临时目录卫生闸（#875，不进 `npm test` 主链）**：`npm run check:tmp-hygiene` —— 先 `node scripts/check-tmp-hygiene.mjs snapshot` 把 `/tmp` 当前清单落盘，跑完测试再 `check`；它只数**本轮新增**（存量不算账）、**只报不删**，前缀清单从 `portal runner test scripts` 的源码现取（闸里硬写前缀 = 假绿）。**判定只认退出码**：0 = 本轮新增 0，1 = 有新增残留（点名哪个前缀积了几个）或没基线可比较（不许假装 0），**2 = 现取清单为空**（扫描面变了 = 闸自己瞎了，不是干净）。单测：`portal/test/tmp-hygiene.test.js`。
+> **`check` 是「相对基线的增量」，不是存量（#880）**：同一条命令实测过增量 **604** / 存量 **264,163**，差三个数量级。
+> 所以增量输出里会带基线年龄（`基线写入于 …（距今 n 分钟）`），要**存量**用 `node scripts/check-tmp-hygiene.mjs check --all`
+> （只读、不删；它按现取前缀直接数 `/tmp`，把基线里的存量也算进来）。**别把增量当总账**——`portal/test/tmp-hygiene.test.js` 的 ⑧⑨ 两格钉着这两件事。
 
 #### 1.2.3 集成（临时栈）
 

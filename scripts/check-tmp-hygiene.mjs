@@ -131,6 +131,7 @@ export function checkTmpHygiene({
   repoRoot = REPO_ROOT,
   baselineFile = null,
   sinceMs = null,
+  all = false, // 存量腿：不看基线，按现取前缀直接数 /tmp（#880：`check` 是增量，别当总账）
 } = {}) {
   const scan = collectPrefixes({ roots, repoRoot });
   const result = {
@@ -145,6 +146,9 @@ export function checkTmpHygiene({
     baselineFile,
     baselineCount: null,
     baselineMissing: false,
+    baselineAt: null,
+    baselineAgeMin: null,
+    mode: null, // 'all' | 'baseline' | 'since'
     sinceMs,
     currentCount: 0,
     newCount: 0,
@@ -166,9 +170,20 @@ export function checkTmpHygiene({
   result.currentCount = current.length;
 
   let newNames;
-  const baseline = baselineFile ? readBaseline(baselineFile) : null;
-  if (baseline) {
+  const baseline = all ? null : (baselineFile ? readBaseline(baselineFile) : null);
+  if (all) {
+    // 存量腿：`check` 的「本轮新增」是**相对基线的增量**，很容易被当成总账（#880 现场：增量 604 / 存量 264163）。
+    // 这一支不读基线，直接把现取前缀在 /tmp 里的**全部**名字数出来。
+    result.mode = 'all';
+    newNames = current;
+  } else if (baseline) {
+    result.mode = 'baseline';
     result.baselineCount = baseline.names.length;
+    result.baselineAt = typeof baseline.at === 'string' ? baseline.at : null;
+    if (result.baselineAt) {
+      const at = Date.parse(result.baselineAt);
+      result.baselineAgeMin = Number.isFinite(at) ? Math.max(0, Math.round((Date.now() - at) / 60000)) : null;
+    }
     const seen = new Set(baseline.names);
     newNames = current.filter((n) => !seen.has(n));
   } else if (sinceMs != null) {
@@ -195,7 +210,7 @@ export function checkTmpHygiene({
 const DEFAULT_BASELINE_NAME = '.check-tmp-hygiene.baseline'; // 不匹配任何现取前缀
 
 function parseArgs(argv) {
-  const opts = { snapshot: false, verbose: false, maxNames: 5, rootArgs: null, tmp: null, baseline: null, since: null };
+  const opts = { snapshot: false, verbose: false, maxNames: 5, rootArgs: null, tmp: null, baseline: null, since: null, all: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === 'snapshot') opts.snapshot = true;
@@ -205,6 +220,7 @@ function parseArgs(argv) {
     else if (a === '--baseline') opts.baseline = argv[++i];
     else if (a === '--roots') opts.rootArgs = String(argv[++i] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
     else if (a === '--since') opts.since = Number(argv[++i]);
+    else if (a === '--all') opts.all = true; // 存量腿（只读，不删）
     else if (a === '--max-names') opts.maxNames = Number(argv[++i]);
     else throw new Error(`unknown argument: ${a}`);
   }
@@ -230,9 +246,15 @@ export function runCli(argv) {
     roots: opts.rootArgs ?? DEFAULT_ROOTS,
     baselineFile,
     sinceMs: opts.since,
+    all: opts.all,
   });
+  // 「本轮新增」是相对基线的**增量**——所以基线多旧必须写在脸上（#880：同一条命令，增量 604 / 存量 264163）。
+  const ageNote = r.mode === 'baseline'
+    ? `｜基线写入于 ${r.baselineAt ?? '<无时间戳>'}${r.baselineAgeMin != null ? `（距今 ${r.baselineAgeMin} 分钟）` : ''}`
+    : (r.mode === 'all' ? '｜存量腿：不看基线，直接按现取前缀数 /tmp' : '');
+  const scope = r.mode === 'all' ? '存量' : '本轮新增';
   const scanNote = r.prefixCount === 0 ? '未扫（清单为空就不必去看 /tmp）' : `${r.tmpDir} 现有 ${r.currentCount} 个顶层目录`;
-  const head = `tmp 卫生闸（issue #875）｜扫描面 ${r.roots.join(', ')}｜现取前缀 ${r.prefixCount} 个（扫 ${r.filesScanned} 个 js/mjs、${r.callSites} 处 mkdtempSync）｜${scanNote}`;
+  const head = `tmp 卫生闸（issue #875）｜扫描面 ${r.roots.join(', ')}｜现取前缀 ${r.prefixCount} 个（扫 ${r.filesScanned} 个 js/mjs、${r.callSites} 处 mkdtempSync）｜${scanNote}${ageNote}`;
   if (r.prefixCount === 0) {
     console.log(`${head}\n前缀清单为空：扫描面变了（扫不到 mkdtempSync 的字面前缀），闸无法判定，不许静默绿 ⇒ rc=2`);
     if (r.missingRoots.length) console.log(`扫描目录不存在：${r.missingRoots.join(', ')}`);
@@ -247,11 +269,14 @@ export function runCli(argv) {
     return 1;
   }
   if (r.offenders.length === 0) {
-    console.log(`${head}\n本轮新增落在现取前缀上的临时目录：0 个（基线 ${r.baselineCount} → 现 ${r.currentCount}）⇒ 干净，rc=0`);
+    const tail = r.mode === 'all'
+      ? `按现取前缀数到的${scope}临时目录：0 个（现 ${r.currentCount}）⇒ 干净，rc=0`
+      : `${scope}落在现取前缀上的临时目录：0 个（基线 ${r.baselineCount} → 现 ${r.currentCount}）⇒ 干净，rc=0`;
+    console.log(`${head}\n${tail}`);
     return 0;
   }
   const total = r.offenders.reduce((s, o) => s + o.count, 0);
-  console.log(`${head}\n本轮新增 ${total} 个残留，按前缀：`);
+  console.log(`${head}\n${scope} ${total} 个残留，按前缀：`);
   for (const o of r.offenders) {
     const shown = o.names.slice(0, opts.maxNames).join(', ');
     const more = o.count > opts.maxNames ? ` …（另 ${o.count - opts.maxNames} 个）` : '';
@@ -262,6 +287,9 @@ export function runCli(argv) {
     }
   }
   console.log('谁建谁收尾：mkdtempSync 之后必须在**同一条用例**里注册 rm（afterEach / t.after），不许靠进程退出，也不许在闸里 rm。');
+  if (r.mode === 'baseline') {
+    console.log('⚠ 上面这个数是**相对基线的增量**，不是存量。要存量：`node scripts/check-tmp-hygiene.mjs check --all`（#880：实测增量 604 / 存量 264163，差三个数量级）。');
+  }
   return 1;
 }
 

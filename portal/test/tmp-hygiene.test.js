@@ -181,3 +181,55 @@ test('⑦默认扫描面在真仓库上现取得到清单；真 CLI 在本机存
   assert.equal(clean.status, 0, `空 /tmp + 现取清单应当干净：${clean.stdout}`);
   assert.match(clean.stdout, /干净，rc=0/);
 });
+
+test('⑧增量口径必须自带基线年龄（#880：把增量当总账，差过三个数量级）', () => {
+  const f = fixture(newBase(), {
+    sources: { 'portal/test/a.test.js': "fs.mkdtempSync(path.join(os.tmpdir(), 'hygiene-fixture-a-'));\n" },
+    tmpDirs: ['hygiene-fixture-a-1'],
+  });
+  writeBaseline(f.baseline, f.tmp);
+  fs.mkdirSync(path.join(f.tmp, 'hygiene-fixture-a-2'));
+
+  const r = checkTmpHygiene({ tmpDir: f.tmp, repoRoot: f.root, baselineFile: f.baseline });
+  assert.equal(r.mode, 'baseline', '有基线就必须走增量支');
+  assert.ok(typeof r.baselineAt === 'string' && !Number.isNaN(Date.parse(r.baselineAt)),
+    `必须带回基线时间戳（writeBaseline 写进去的那个 at）：${JSON.stringify(r.baselineAt)}`);
+  assert.equal(typeof r.baselineAgeMin, 'number', '必须算出基线年龄（分钟），否则读的人不知道基线多旧');
+
+  const lines = [];
+  const code = captureLog(lines, () => runCli(['check', '--tmp', f.tmp, '--baseline', f.baseline,
+    '--roots', path.join(f.root, 'portal')]));
+  assert.equal(code, 1);
+  const out = lines.join('\n');
+  assert.match(out, /基线写入于 \S+（距今 \d+ 分钟）/, `增量输出必须把基线年龄写在脸上：\n${out}`);
+  assert.match(out, /不是存量/, '必须提醒这个数只是增量、不是总账（#880 现场：增量 604 / 存量 264163）');
+});
+
+test('⑨存量腿（--all）必须严格大于增量，且增量集合 ⊆ 存量集合', () => {
+  const f = fixture(newBase(), {
+    sources: { 'portal/test/a.test.js': "fs.mkdtempSync(path.join(os.tmpdir(), 'hygiene-fixture-a-'));\n" },
+    tmpDirs: ['hygiene-fixture-a-1', 'hygiene-fixture-a-2', 'unrelated-keepme'],
+  });
+  writeBaseline(f.baseline, f.tmp);
+  fs.mkdirSync(path.join(f.tmp, 'hygiene-fixture-a-3')); // 基线之后新增的那一个
+
+  const inc = checkTmpHygiene({ tmpDir: f.tmp, repoRoot: f.root, baselineFile: f.baseline });
+  const all = checkTmpHygiene({ tmpDir: f.tmp, repoRoot: f.root, baselineFile: f.baseline, all: true });
+  assert.equal(all.mode, 'all', 'all=true 必须走存量支（不读基线）');
+  assert.deepEqual(inc.offenders.map((o) => o.names).flat(), ['hygiene-fixture-a-3'],
+    '增量只许看见基线之后新增的（基线里那两个存量不许混进来）');
+  assert.deepEqual(all.offenders.map((o) => o.names).flat().sort(),
+    ['hygiene-fixture-a-1', 'hygiene-fixture-a-2', 'hygiene-fixture-a-3'],
+    '存量腿必须把基线里的存量也数进来；不匹配任何现取前缀的那个（unrelated-keepme）不算');
+
+  const incNames = new Set(inc.offenders.map((o) => o.names).flat());
+  const allNames = new Set(all.offenders.map((o) => o.names).flat());
+  for (const n of incNames) assert.ok(allNames.has(n), `同一次现场下增量集合必须是存量集合的子集，存量腿漏了 ${n}`);
+  assert.ok(allNames.size > incNames.size, '存量必须严格大于增量，否则这条腿没有意义');
+
+  const lines = [];
+  const code = captureLog(lines, () => runCli(['check', '--all', '--tmp', f.tmp, '--baseline', f.baseline,
+    '--roots', path.join(f.root, 'portal')]));
+  assert.equal(code, 1, '存量存在 ⇒ `--all` 必须红（哪怕增量是绿的）');
+  assert.match(lines.join('\n'), /存量 3 个残留/, `必须说明这是存量口径并把三个都算进来：\n${lines.join('\n')}`);
+});
