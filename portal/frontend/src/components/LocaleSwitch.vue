@@ -10,7 +10,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { setLocale, type AppLocale } from '../i18n';
 import { api } from '../api';
-import { useAuthStore } from '../stores/auth';
+import { useAuthStore, NO_SESSION_LOCALE_OWNER } from '../stores/auth';
 
 const { t, locale } = useI18n();
 
@@ -56,9 +56,13 @@ async function syncAccountLocale(value: AppLocale): Promise<void> {
   } catch {
     return; // 无激活的 pinia（登录页以外的挂载形式）⇒ 不发
   }
+  // #828 复核查：在分支前取**当时的归属**（有会话取当前 login，没会话用哨兵），供下面记 pending 用。
+  const ownerAtRecord = auth.user?.login ?? NO_SESSION_LOCALE_OWNER;
   if (!auth.user) {
     // 未就绪：不发（登录页不该发），但记下这次选择，等 /api/me 回来补发（缺陷①的补链）。
-    auth.pendingLocaleWrite = value;
+    // 没会话 ⇒ ownerAtRecord 就是 NO_SESSION_LOCALE_OWNER（无主，谁先就绪补发给谁）；这样登出/
+    // 换账号后 `flushPendingLocale` 能把上一位记的、与当前用户不同归属的待补发丢弃。
+    auth.pendingLocaleWrite = { login: ownerAtRecord, locale: value };
     return;
   }
   try {

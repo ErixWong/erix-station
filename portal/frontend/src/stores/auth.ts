@@ -15,6 +15,13 @@ import { notifyUserScopeReset } from '../lib/userScope';
 // （不能用「载体里有没有值」当判据：`setLocale` 双写载体，账号种子初次登录就把载体填满了，判据会恒真。）
 import { i18n, isAppLocale, setLocale, hasUserChosenLocale, type AppLocale } from '../i18n';
 
+/**
+ * #828 复核查：`pendingLocaleWrite` 在「还没有会话」时记录用的**归属哨兵**（登录页 / 跨 origin
+ * 导航后 `/api/me` 还没回）。故意用一个真实登录名不可能出现的值（含 NUL），**不用空串**冒充登录名，
+ * 以免与「无主」和「某个 login 为空的真人」混淆：哨兵表示「无主，谁先就绪就补发给谁」（还是切语言那个人）。
+ */
+export const NO_SESSION_LOCALE_OWNER = '\u0000nosession';
+
 export interface AuthUser {
   id: string;
   login: string;
@@ -267,8 +274,10 @@ export const useAuthStore = defineStore('auth', {
      * 的选择。导航到另一个 origin 后立刻点语言 ⇒ pinia 的 `/api/me` 探测还没回 ⇒ `user` 为 null
      * ⇒ 直接发会刷 401，不发又会把过期值留在账号里。这里先记下，等 `/api/me` 回来（或登录成功）
      * 后由 `flushPendingLocale()` 补发一次。`null` = 没有待补发的选择。
+     * #828 复核查：带**账号归属**（`login`）——无会话时用 `NO_SESSION_LOCALE_OWNER` 哨兵占位；换账号后
+     * 归属对不上的待补发会被丢弃，不替下一个人改偏好（见 `flushPendingLocale` 与 `logout` / 失效路径的清理）。
      */
-    pendingLocaleWrite: null as AppLocale | null,
+    pendingLocaleWrite: null as { login: string; locale: AppLocale } | null,
     loading: false,
     error: null as string | null,
     /**
@@ -295,6 +304,8 @@ export const useAuthStore = defineStore('auth', {
       } catch (err) {
         if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
           this.user = null; // 未登录：守卫负责跳转
+          // #828：会话已确认失效 ⇒ 上一位的语言待补发不能留到下一位，一并清掉。
+          this.pendingLocaleWrite = null;
           this.passwordChangeRequired = false; // 没有会话就谈不上受限
         } else {
           this.ready = true;
@@ -327,19 +338,28 @@ export const useAuthStore = defineStore('auth', {
      * 三条登录路径都调它）补发一次。三条口径：① 没有 pending 直接返回；② 只在 pending 与账号
      * 当前值**不同**时才发（相同就是无事可做，顺手清掉，别打转）；③ **失败静默**——界面在点语言那
      * 一刻已经切过去了，补发只是把账号里那份过期值纠正回来，不是用户能在界面上修的东西。
+     *
+     * #828 复核查：pending 带**账号归属**——记时是另一个真人（login 与当前用户不同）⇒ 直接丢弃不发，
+     * 不替新账号改偏好；哨兵 `NO_SESSION_LOCALE_OWNER` 表示无主（记时还没会话），谁先就绪补发给谁。
      */
     async flushPendingLocale(): Promise<void> {
       const pending = this.pendingLocaleWrite;
       if (!pending) return;
       if (!this.user) return; // 还没拿到 user：留着，等有 user 的那次再补
-      if (this.user.locale === pending) {
+      // #828 复核查：带归属——只有记时是「无主哨兵」或 login 与当前用户一致才补发。
+      // 记时是另一个真人（A）而现在站着 B ⇒ 这是 A 的选择，不发、直接丢弃（不替 B 改偏好）。
+      if (pending.login !== NO_SESSION_LOCALE_OWNER && pending.login !== this.user.login) {
+        this.pendingLocaleWrite = null; // 归属对不上：这是另一个人的选择，不发、直接丢弃
+        return;
+      }
+      if (this.user.locale === pending.locale) {
         this.pendingLocaleWrite = null; // 账号已是这个值：无事可做，不发（防打转）
         return;
       }
       this.pendingLocaleWrite = null; // 先清，避免并发/重复补发
       try {
-        await api('/api/me/locale', { method: 'PATCH', body: JSON.stringify({ locale: pending }) });
-        this.user = { ...this.user, locale: pending }; // 本地同步账号值，下次比较不再误判
+        await api('/api/me/locale', { method: 'PATCH', body: JSON.stringify({ locale: pending.locale }) });
+        this.user = { ...this.user, locale: pending.locale }; // 本地同步账号值，下次比较不再误判
       } catch {
         /* 静默：界面已切，补发失败不弹窗 */
       }
@@ -663,6 +683,8 @@ export const useAuthStore = defineStore('auth', {
       // issue #431：会话已死 ⇒ 同样先收摊（断 SSE + 清工作台的上一个账号可见面），再清 auth 态。
       notifyUserScopeReset();
       this.user = null;
+      // #828：会话已确认死 ⇒ 上一位的语言待补发一并清掉，不能留给下一位（与 logout 同口径）。
+      this.pendingLocaleWrite = null;
       // #449：登录第二步的待决凭证也属于「上一个人」，跟着一起清。
       this.resetPendingLogin();
       this.ready = true;
@@ -689,6 +711,8 @@ export const useAuthStore = defineStore('auth', {
         // 会话已失效也按登出处理（旧版对 logout 失败不敏感，reload 后同样未登录态）。
       }
       this.user = null;
+      // #828：登出 = 换人的起点 ⇒ 上一位未补发的语言回写一并清掉，不能隔会话漏给下一个账号。
+      this.pendingLocaleWrite = null;
       // #449：登出 = 换人的起点 ⇒ 第二步的待决凭证（pending/factor/sendFailed/冷却）一并清掉。
       this.resetPendingLogin();
       this.error = null;

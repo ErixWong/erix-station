@@ -2,7 +2,8 @@
 // 断言一律走请求桩 + DOM（document.cookie / localStorage / i18n 当前 locale），不用 w.emitted()。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setActivePinia, createPinia } from 'pinia';
-import { useAuthStore } from './auth';
+import { flushPromises } from '@vue/test-utils';
+import { useAuthStore, NO_SESSION_LOCALE_OWNER } from './auth';
 import { i18n, LOCALE_STORAGE_KEY, LOCALE_USER_CHOSEN_KEY, setLocale } from '../i18n';
 import { readLocaleCookie } from '../lib/localeCookie';
 
@@ -169,5 +170,57 @@ describe('#828 登录后应用账号语言', () => {
     await auth.submitEmailCode('123456');
     expect(i18n.global.locale.value).toBe('en');
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
+  });
+});
+
+// #828 复核查：pendingLocaleWrite 带账号归属，登出/会话失效一并清理，换账号不替别人改偏好。
+describe('#828 pendingLocaleWrite 账号归属与登出/失效清理', () => {
+  const BOB = { ...FDE, id: 'u2', login: 'bob', fde_name: 'bob' };
+
+  it('记下 pending 后 logout ⇒ 会话清空且 pending 被清（不隔会话残留给下一个账号）', async () => {
+    const auth = useAuthStore();
+    auth.user = { ...FDE }; // alice 已登录
+    auth.pendingLocaleWrite = { login: 'alice', locale: 'en' };
+    vi.stubGlobal('fetch', fetchMock(() => json(200, {}))); // logout POST 回 200
+    await auth.logout();
+    expect(auth.user).toBeNull();
+    expect(auth.pendingLocaleWrite).toBeNull();
+  });
+
+  it('会话确认失效（/api/me 回 401）⇒ pending 被清（上一位的选择不能留给下一位）', async () => {
+    const auth = useAuthStore();
+    auth.user = { ...FDE };
+    // 不设 ready：ensureMe 首行 `if (this.ready) return` 会短路；留 ready=false 才会真去拉 /api/me。
+    auth.pendingLocaleWrite = { login: 'alice', locale: 'en' };
+    vi.stubGlobal('fetch', fetchMock(() => json(401, { error: { code: 'unauthorized', message: 'gone' } })));
+    await auth.ensureMe(); // 会话已确认失效 ⇒ user=null 分支
+    expect(auth.user).toBeNull();
+    expect(auth.pendingLocaleWrite).toBeNull();
+  });
+
+  it('A 记的 pending（login=alice），换成 B 登录后 flush ⇒ 不发 PATCH 且 pending 被丢弃', async () => {
+    const auth = useAuthStore();
+    auth.pendingLocaleWrite = { login: 'alice', locale: 'en' }; // A 记的选择，未及补发就换人
+    auth.user = { ...BOB }; // 现在站着 B（login 不同，且账号值与 pending 不同）
+    const fetchFn = fetchMock(() => json(200, {}));
+    vi.stubGlobal('fetch', fetchFn);
+    await auth.flushPendingLocale();
+    await flushPromises();
+    expect(auth.pendingLocaleWrite).toBeNull(); // 归属对不上 ⇒ 丢弃
+    const urls = fetchFn.mock.calls.map((c) => (typeof c[0] === 'string' ? c[0] : ''));
+    expect(urls.filter((u) => u === '/api/me/locale')).toHaveLength(0); // 一枪都不发
+  });
+
+  it('哨兵（无主）pending ⇒ 谁先就绪就补发给谁（登录后的第一个人照发）', async () => {
+    const auth = useAuthStore();
+    auth.pendingLocaleWrite = { login: NO_SESSION_LOCALE_OWNER, locale: 'en' };
+    auth.user = { ...BOB }; // login 与哨兵不同，但哨兵=无主 ⇒ 允许补发
+    const fetchFn = fetchMock(() => json(200, {}));
+    vi.stubGlobal('fetch', fetchFn);
+    await auth.flushPendingLocale();
+    await flushPromises();
+    const urls = fetchFn.mock.calls.map((c) => (typeof c[0] === 'string' ? c[0] : ''));
+    expect(urls.filter((u) => u === '/api/me/locale')).toHaveLength(1); // 无主→发一次
+    expect(auth.pendingLocaleWrite).toBeNull();
   });
 });

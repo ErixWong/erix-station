@@ -7,7 +7,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import LocaleSwitch from './LocaleSwitch.vue';
 import { LOCALE_STORAGE_KEY, createAppI18n, detectLocale, i18n, setLocale } from '../i18n';
 import { clearLocaleCookie, readLocaleCookie, writeLocaleCookie } from '../lib/localeCookie';
-import { useAuthStore } from '../stores/auth';
+import { useAuthStore, NO_SESSION_LOCALE_OWNER } from '../stores/auth';
 
 function mountSwitch(): VueWrapper {
   return mount(LocaleSwitch, { global: { plugins: [i18n] } });
@@ -186,7 +186,8 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
     expect(i18n.global.locale.value).toBe('en'); // 本地切换照常生效
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
     // #828 缺陷①：未就绪时不发，但这次选择不能丢——必须记进 pendingLocaleWrite 等补发。
-    expect(useAuthStore().pendingLocaleWrite).toBe('en');
+    // #828 复核查：带归属——无会话时 login 是 NO_SESSION_LOCALE_OWNER 哨兵。
+    expect(useAuthStore().pendingLocaleWrite).toEqual({ login: NO_SESSION_LOCALE_OWNER, locale: 'en' });
   });
 
   it('未就绪点 English ⇒ 不发；/api/me 回来后补发一次 PATCH body {"locale":"en"}（缺陷①的钉子）', async () => {
@@ -210,7 +211,7 @@ describe('LocaleSwitch · #828 回写账号语言', () => {
     await pick(w, 'English');
     await flushPromises();
     expect(calls.filter((c) => c.url === '/api/me/locale')).toHaveLength(0); // 未就绪：一个回写都不发
-    expect(auth.pendingLocaleWrite).toBe('en'); // 选择被记下，没丢
+    expect(auth.pendingLocaleWrite).toEqual({ login: NO_SESSION_LOCALE_OWNER, locale: 'en' }); // 选择被记下，没丢
 
     await auth.ensureMe(); // /api/me 回来 ⇒ 会话就绪
     await flushPromises();
