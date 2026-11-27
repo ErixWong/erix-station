@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setActivePinia, createPinia } from 'pinia';
 import { useAuthStore } from './auth';
-import { i18n, LOCALE_STORAGE_KEY, setLocale } from '../i18n';
+import { i18n, LOCALE_STORAGE_KEY, LOCALE_USER_CHOSEN_KEY, setLocale } from '../i18n';
 import { readLocaleCookie } from '../lib/localeCookie';
 
 const FDE = {
@@ -51,7 +51,7 @@ afterEach(() => {
 });
 
 describe('#828 登录后应用账号语言', () => {
-  it('本地未表态（cookie+localStorage 都空）且 /api/me 返回 en ⇒ 应用成 en，cookie 与 localStorage 写上（换设备生效）', async () => {
+  it('本地未表态（cookie+localStorage 都空）且 /api/me 返回 en ⇒ 应用成 en，cookie 与 localStorage 写上（换设备生效），且不立用户标记', async () => {
     clearLocalLocale(); // 两个本地载体都空：模拟换设备 / 清了站点数据
     vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
     const auth = useAuthStore();
@@ -59,10 +59,31 @@ describe('#828 登录后应用账号语言', () => {
     expect(i18n.global.locale.value).toBe('en');
     expect(readLocaleCookie()).toBe('en');
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('en');
+    // #828 复核查：账号种子**不立** `locale.userChosen` 标记（否则种子会把自己当成用户的选择，
+    // 导致此后账号默认语言变化永不生效）。
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBeNull();
   });
 
-  it('本地已表过态（cookie 或 localStorage 为 zh-CN）而账号值是 en ⇒ refreshMe 后界面仍是 zh-CN（缺陷②的钉子）', async () => {
-    resetLocale('zh-CN'); // cookie + localStorage 均为 zh-CN：本地已表过态
+  it('账号种子不立标记⇒未点过开关的浏览器上，账号默认语言从 en 改成 zh-CN 会跟随（旧缺陷：载体有值把它永久挡掉）', async () => {
+    clearLocalLocale();
+    vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
+    const auth = useAuthStore();
+    await auth.ensureMe();
+    expect(i18n.global.locale.value).toBe('en');
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBeNull(); // 种子不立标记
+    // 用户后来在别处把账号默认语言改成 zh-CN ⇒ 这台没点过开关的浏览器应跟随。
+    vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'zh-CN' } })));
+    await auth.refreshMe();
+    expect(i18n.global.locale.value).toBe('zh-CN'); // 旧代码：载体里已是 en ⇒ hasLocalLocalePreference 恒真→不跟随（会变红）
+    expect(readLocaleCookie()).toBe('zh-CN');
+    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('zh-CN');
+  });
+
+  it('用户亲自点过开关（标记立起）而账号值是 en ⇒ 本地 zh-CN 说话、refreshMe 后仍是 zh-CN（不抢）', async () => {
+    localStorage.clear();
+    document.cookie = 'locale=; Path=/; Max-Age=0';
+    setLocale('zh-CN', { fromUser: true }); // 用户亲自点：立标记 + 双写载体
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBe('1');
     const setItem = vi.spyOn(Storage.prototype, 'setItem'); // 基线写发生在 spy 之前
     vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
     const auth = useAuthStore();
@@ -70,7 +91,20 @@ describe('#828 登录后应用账号语言', () => {
     expect(i18n.global.locale.value).toBe('zh-CN'); // 本地选择说话，不被账号值盖掉
     expect(readLocaleCookie()).toBe('zh-CN');
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe('zh-CN');
-    expect(setItem).not.toHaveBeenCalled(); // setLocale 没被账号值调用（去掉「本地已表态就不抢」那道判断即变红）
+    expect(setItem).not.toHaveBeenCalled(); // setLocale 没被账号值调用（去掉「用户点过就不抢」那道判断即变红）
+  });
+
+  it('清掉标记与载体后回到「新设备」⇒ 账号值重新生效（哪怕之前点过开关）', async () => {
+    localStorage.clear();
+    document.cookie = 'locale=; Path=/; Max-Age=0';
+    setLocale('en', { fromUser: true }); // 之前在这台浏览器上点过开关（标记已立）
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBe('1');
+    clearLocalLocale(); // 清站点数据：标记 + 两个载体一起没
+    expect(localStorage.getItem(LOCALE_USER_CHOSEN_KEY)).toBeNull();
+    vi.stubGlobal('fetch', fetchMock(() => json(200, { user: { ...FDE, locale: 'en' } })));
+    const auth = useAuthStore();
+    await auth.ensureMe();
+    expect(i18n.global.locale.value).toBe('en'); // 新设备⇒账号值生效
   });
 
   it('ensureMe：/api/me 返回 null ⇒ 什么都不变（cookie/localStorage 不被改写，也不回落到 zh-CN）', async () => {

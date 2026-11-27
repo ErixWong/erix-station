@@ -29,7 +29,9 @@ const currentLabel = computed(() => {
 });
 
 function select(value: AppLocale) {
-  setLocale(value);
+  // 用户亲自点开关 ⇒ 传 fromUser，立 `locale.userChosen` 标记（#828）：这台浏览器之后不再被
+  // 账号默认语言抢走（账号种子不传 fromUser，两件事分开）。回写旁路见下方 syncAccountLocale。
+  setLocale(value, { fromUser: true });
   open.value = false;
   // #828：已登录时把这次选择回写到账号（登录后 / 换设备自动沿用）。未登录不发，免得刷 401。
   // fire-and-forget：切换已经在上面生效，回写只是旁路。

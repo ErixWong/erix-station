@@ -11,8 +11,9 @@ import { seatAwareLanding } from '../lib/workbenchGate';
 // issue #431：「本轮用户结束」的应用级信号（接回工作台认领，详见 lib/userScope.ts）。
 import { notifyUserScopeReset } from '../lib/userScope';
 // #449：非组件上下文取词（与 workbench store 同一口径：i18n.global.t，随 locale 响应式取值）。
-// #828：`hasLocalLocalePreference` 是「本地有没有表过态」的唯一判据（见下方 `applyAccountLocale`）。
-import { i18n, isAppLocale, setLocale, hasLocalLocalePreference, type AppLocale } from '../i18n';
+// #828：`hasUserChosenLocale` 是「这台浏览器上用户有没有亲自点过语言开关」的唯一判据（见下方 `applyAccountLocale`）。
+// （不能用「载体里有没有值」当判据：`setLocale` 双写载体，账号种子初次登录就把载体填满了，判据会恒真。）
+import { i18n, isAppLocale, setLocale, hasUserChosenLocale, type AppLocale } from '../i18n';
 
 export interface AuthUser {
   id: string;
@@ -197,22 +198,26 @@ export function afterLoginRoute(user: AuthUser | null | undefined): string {
 /**
  * issue #828：登录后把账号上存的 `locale` 应用到界面（写 cookie + localStorage + 切 UI，全走 `setLocale`）。
  *
- * **优先级（新语义）**：本地已表过态就不抢。只有当**同站 cookie 与 localStorage 都没有受支持的
- * 合法值**时才应用账号值。语义：账号值是「这台浏览器/设备第一次见面时的种子」，不是「压过本地
- * 选择的主人」——**换设备 / 清站点数据时账号值生效；同一浏览器里用户点过语言开关之后，本地值说话**。
- * 否则就会出现「用户刚在用户面选了中文，一刷新又被过期账号值顶成英文」（#828 真机腿抓出的优先级错）。
+ * **优先级（新语义，#828 复核查修正）**：只有在这台浏览器上用户**没亲自点过语言开关**时才跟随账号值。
+ * 判据是 `hasUserChosenLocale()`（读 `locale.userChosen` 标记），**不是**「载体里有没有值」：
+ * `setLocale` 会双写 cookie+localStorage，账号种子初次登录就把载体填满，「载体里有值」此后恒真，
+ * 会把「用户后来改了账号默认语言」永久挡掉（旧缺陷）。改成显式标记后语义钉住：
+ * - **没点过开关** ⇒ 账号默认语言变了会跟随（初次灌种子 + 用户后来在别处改了账号默认语言都会跟上）；
+ * - **点过开关** ⇒ 本地说话，账号值不再抢（这台浏览器的语言是用户自己定的）；
+ * - **清了站点数据** ⇒ 标记随载体一起没 ⇒ 回到「新设备」= 账号值重新生效。
+ * 账号种子走 `setLocale(next)`（**不传 `fromUser`**）⇒ 不立标记，不会把自己当成用户的选择。
  *
  * 应用仍需两个条件同时成立：① 账号确实设过（`locale` 非 `null` 且是受支持的 locale）；
- * ② 本地没表过态（`hasLocalLocalePreference()` 为 false）。再叠一层「与当前界面语言不同才切」：
- * `setLocale` 会写 cookie，若无条件调用，「写 cookie → 再拉 /api/me」会来回打转。
+ * ② 这台浏览器用户没点过开关（`hasUserChosenLocale()` 为 false）。再叠一层「与当前界面语言不同才切」：
+ * `setLocale` 会写 cookie，若无条件调用，「写 cookie → 再拉 /api/me」会来回打转（这行保留，防打转）。
  * `null`（没设过）⇒ 什么都不做：行为与今天逐字一致（cookie → localStorage → 浏览器语言 → zh-CN）。
  */
 function applyAccountLocale(user: AuthUser | null | undefined): void {
   const next = user?.locale;
   if (!isAppLocale(next)) return; // null / 缺键 / 脏值：不碰现有优先级
-  if (hasLocalLocalePreference()) return; // 本地已表过态：账号值是初次见面的种子，不压本地选择
+  if (hasUserChosenLocale()) return; // 这台浏览器上用户亲自点过开关：本地说话，账号值不再抢
   if (next === i18n.global.locale.value) return; // 与当前一致：不重写，防打转
-  setLocale(next);
+  setLocale(next); // 账号种子：不传 fromUser ⇒ 不立「用户点过」标记
 }
 
 export const useAuthStore = defineStore('auth', {
