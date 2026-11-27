@@ -305,8 +305,9 @@ test('#500 写方法（appendRecoveryRow）仍与其余账本写同口径：可�
 // 病（主 agent 验收 #501 时逐行验出来）：`runner/lib/store.js` 已实现这根探针、
 // `runner/lib/ipc.js:85` 的 `STORE_METHODS` 已放行，但 agentd 的 store switch 里没有这一支
 // ⇒ 落到 switch 末尾的 `default: throw new Error('unknown store method: …')`（现 :771）
-// ⇒ **生产里每次预写都抛**（引擎每次 MISS 都调它：`append-user-turn.js:310-313`），
-//    而「探针缺席」只是软降级 `ledger_probe_absent` ⇒ 抛比缺席更糟。
+// ⇒ **生产里每次 resume 要用这根探针时都抛**（runner 侧的调用点 = 引擎 resume 找 `partOf` 锚点：
+//    `erix-agent/src/loop/resume-manager.js:889-892`；预写那半条在 portal 进程内，不经 agentd），
+//    而「探针缺席」只是软降级（退回折叠行 / `ledger_probe_absent`）⇒ 抛比缺席更糟。
 // 三条判据分别堵：① 路由本身（与 `load` 同端点同分页、返回未折叠行）；② 白名单↔路由一致性
 // （以后加方法忘了路由 ⇒ 当场红）；③ 声明=实现（引擎 0.33.0 的契约套件按**实现**判，
 // 「实现了却没申报」它不判红 ⇒ 本站自己钉；申报在 `./store-contract-surface.js`）。
@@ -371,7 +372,7 @@ test('#501 判据①：loadRawRows 与 load 同端点同分页 query，返回未
   assert.ok(raw.records.length === 4 && foldLedgerRecords(RAW_ROWS_501).length === 2,
     '本标本折叠真的会少行 ⇒ 「原样返回」不是空断言');
 
-  // ③ 整条 runner 链（store.js 探针 → IPC → agentd）：上游同源等式 `fold(loadRawRows) ≡ load`，
+  // ③ 两段接缝（store.js 探针 → 注入的 request 回调 → agentd；**不经真 IPC transport**，真 IPC 在 `worker.js:564` 那一段）：上游同源等式 `fold(loadRawRows) ≡ load`，
   //    且引擎 `appendUserTurn` 拿到的 rawRows 比 load 多（多出来的正是折叠吃掉的行）。
   const portal2 = makePortalStub(RAW_ROWS_501);
   const store = makeStore(K501, {
@@ -421,7 +422,7 @@ test('#501 判据②：STORE_METHODS 每一项在 agentd 的 store switch 里都
   const missing = [...STORE_METHODS].filter((m) => !exempt.has(m) && !caseSet.has(m));
   assert.deepEqual(missing, [],
     `IPC 白名单放行了却没有 agentd case：${missing.join(', ')} ⇒ 请求会落到 default 抛 `
-    + 'unknown store method（引擎每次 MISS 都调 loadRawRows ⇒ 抛比缺席更糟）');
+    + 'unknown store method（引擎 resume 会调 loadRawRows 找 partOf 锚点 ⇒ 抛比缺席更糟）');
 
   // 反向两面：退役方法不得回流；legacy 两侧都得在（今天 recall 白名单与路由都还留着）。
   for (const retired of RETIRED_STORE_METHODS) {

@@ -630,15 +630,17 @@ async function handleStoreRequest(ctx, method, args, deps = {}) {
       return fetchAllTranscriptRecords(ctx, args, { request });
     }
     // ── issue #501：`loadRawRows` 这一支**必须存在**，不是可选装饰 ──
-    // 引擎 `appendUserTurn` 快路径**每次 MISS 都调**这根探针（现查
-    // `node_modules/erix-agent/src/store/append-user-turn.js:310-313`：
-    // `typeof store.loadRawRows === "function" ? await store.loadRawRows(key) : undefined`），
-    // 用它结清账本中段悬空的 `tool_use`。探针**缺席**只是软降级（终局 `ledger_probe_absent`）；
+    // 走到本 switch 的调用者是 **runner 侧的引擎**（`runner/worker.js` 把这份 IPC store 交给 `runToolLoop`），
+    // 它调这根探针的位置是 **resume**：恢复中途挂起的 `tool_use` 时要在**落盘行**上找 `partOf` 锚点
+    // （`erix-agent/src/loop/resume-manager.js:889-892`；缺这根探针就退回 `load()` 的折叠行 = 修前口径）。
+    // 另一处调用者在 **portal 进程内**（预写 `appendUserTurn` 的 MISS 分支，`append-user-turn.js:310-313`，
+    // HIT 提前返回不探针），用的是 `portal/src/transcript-store.js` 那份 store，**不经过本文件**。
+    // 探针**缺席**只是软降级（resume 退回修前口径 / 预写只带 `ledger_probe_absent`）；
     // 但 `runner/lib/ipc.js` 的 `STORE_METHODS` 白名单与 `runner/lib/store.js` 的探针实现都已就位
     // ⇒ 请求会一路打到本 switch。这里**少了 case 就落到 switch 末尾那条 `default`**
     // ——`throw new Error(`unknown store method: ${method}`)`（现位于 `runner/agentd.js:772`；
     // 工单 #501 记的 `:735` 是抽 helper 之前的行号，会随本文件漂移 ⇒ 认那条抛的**内容**，别认行号）
-    // ⇒ 生产里**每次预写都抛**，把整次预写打挂——比「探针缺席」更糟。
+    // ⇒ 生产里**每次 resume 走到这一步都抛**（不是退回修前口径，而是整次 resume 直接挂掉）——比「探针缺席」更糟。
     // 走 `load` 那条分页读即可：端点回的本就是**未折叠原始行**（折叠只在 `store.js#load` 做），
     // 所以这一支不需要新端点，也不许复制第二份翻页实现（判据 3 条见
     // `runner/test/agentd-store-route.test.js` 的 `#501` 用例族）。

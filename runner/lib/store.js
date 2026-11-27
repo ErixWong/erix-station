@@ -108,8 +108,15 @@ export function makeStore(key, { request, runId }) {
      * issue #501：与 `load()` 共用 peer（= portal internal 端点）的同一条读路径，只是**不过
      * `foldLedgerRecords`**——返回 `load()` 会喂给折叠的那同一批原始行（折叠前）。
      * 上游 #714/#765（`host-consumer-contract.md`）：`foldMessageRows(await loadRawRows(r))` 必须逐字
-     * 等于 `await load(r)`，所以这里不复制第二份读路径、也不在此折叠；未知 runId ⇒ 空数组。
-     * 本站是引擎 `appendUserTurn` 快路径结清悬空 `tool_use` 的唯一账本来源，缺它就报 `ledger_probe_absent`。
+     * 等于 `await load(r)`，所以这里不复制第二份读路径、也不在此折叠。
+     * ⚠ **本方法的调用者是 resume，不是预写**（#501 返修时现验）：引擎在恢复中途挂起的 `tool_use` 时，
+     *   用这根探针在**落盘行**上找 `partOf` 锚点（`erix-agent/src/loop/resume-manager.js:889-892`），
+     *   缺它就退回 `load()` 的折叠行（= 修前口径：只修内存 + `resume_journal_skipped`）。
+     *   预写那半条（`appendUserTurn` 结清悬空 `tool_use`，`append-user-turn.js:310-313`）跑在 **portal 进程内**
+     *   （`portal/src/sessions.js` 用 `createSessionTranscriptStore`），runner 侧零调用：
+     *   `grep -rn appendUserTurn runner --include=*.js` 只命中注释。
+     * ⚠ 「未知 runId」**不是**空数组：portal 对不存在的 session 抛 `404 session_not_found`
+     *   （`portal/src/internal.js` 的 `fetchSession`），本方法返回 `[]` 只覆盖「响应成功但没带 `records` 数组」那一种。
      * ⚠ 但「缺它」必须是**真的没这根探针**：本方法存在 ⇒ 请求会一路打到 agentd，那边少了 case 就是
      *   `default` 抛（比缺席更糟）——路由与白名单的一致性由 `runner/test/agentd-store-route.test.js` 钉。
      * agentd 侧也与 `load` 共用同一条分页读：`runner/agentd.js#fetchAllTranscriptRecords`（#501 返修）。

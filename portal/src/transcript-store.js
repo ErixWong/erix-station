@@ -105,7 +105,7 @@ export function createSessionTranscriptStore(client) {
      *   · 与 `load()` 共用同一条 SELECT + 同一份映射（`readRoundRows`），故
      *     `foldLedgerRecords(await loadRawRows(key))` 与 `await load(key)` **逐字同源**；
      *   · 未知 key ⇒ 空数组（无行）；**不新增错误码 / 事件类型**。
-     * 缺这根探针时引擎对每次 `appendUserTurn` 报 `unsettledToolUses.reason = 'ledger_probe_absent'`，
+     * 缺这根探针时，引擎在 `appendUserTurn` 的 **MISS 分支**（点查命中 HIT 会提前返回、不探针）报 `unsettledToolUses.reason = 'ledger_probe_absent'`，
      * 本站补上即自愈（读侧静默，不 emit `persistence_capability_degraded`）。
      */
     async loadRawRows(key) {
