@@ -29,6 +29,7 @@
 |---|---|---|---|---|---|
 | **语法/编译保底** | 改动即查，零依赖 | 宿主 Node 22/24 | `node --check <file>`（JS）；`~/.dotnet/dotnet build`（.NET，当前项目无 .NET 代码，仅占位） | <1s/文件 | 退出码 0，无输出 |
 | **单测（unit）** | 纯逻辑：seq 分配、幂等键、hostname grammar、revision CAS、manifest 校验、暴露矩阵判定 | 宿主，`node --test` | `npm test`（项目 AGENTS.md §4）；需 `await using` 的测试加 Node 24：`PATH=~/.local/node24/bin:$PATH npm test` | 秒级 | 全绿（退出码 0），0 failed |
+| **卫生闸（临时目录）** | 本轮跑测不得在 `/tmp` 新增夹具残留 | 宿主 Node | `npm run check:tmp-hygiene`（跑测前先 `node scripts/check-tmp-hygiene.mjs snapshot`） | 秒级 | 退出码 0 = 本轮新增 0；1 = 有新增残留（文案点名前缀）或没基线；2 = 前缀清单为空（闸瞎了） |
 | **集成（integration）** | 真实 Postgres + 临时 docker 网络 + 伪造 FDE 容器，验证 DB 约束/路由/物化/租约 | 宿主 + 临时 `postgres:16` 容器 | §2.2 的临时栈命令 | 分钟级 | 每条断言有明确 exit code / 输出匹配 |
 | **端到端（e2e）** | 真机走通「登录→建项目→对话→工具卡片→停止」 | 本机 docker compose 平台栈 + Playwright MCP | §1.4 P1 验收清单 + §3.7 浏览器流程 | 十分钟级 | 截图 + vision 读图确认 + 关键断言通过 |
 | **安全回归（security）** | 网络隔离 / 认证 / 凭据红线，**必须真机** | 目标环境（部分可在本机开发环境跑通，见 §3.1） | §3.1/§3.2 命令 | 分钟级 | 逐条对应 topology §6.1 验收矩阵 |
@@ -68,6 +69,8 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 > 另一个假因：**`NODE_ENV=production` 会让 `emitted()` 恒空** ⇒ 假红，所以下游脚本自己剥掩（人手工跑时也要 `env -u NODE_ENV`）。
 
 > **随 `npm test` 一起跑的语法腿**：`npm test` 链了 `node scripts/check-integration-syntax.mjs`（单独跑：`npm run check:integration-syntax`）。活栈 e2e 脚本是「脚本里套脚本」（浏览器里跑的代码写成 `String.raw` 模板再送进容器），模板里混进一个反引号就会提前闭合外层模板——而**外层 `node --check` 照样合法**（#804 实测：单测与 `npm test` 全绿，只有真跑浏览器腿才炸），所以外层与内嵌片段两层都查；某文件出现 `String.raw` 字样却抠出 **0 段**、或全仓总段数为 0 ⇒ **直接红**（记号被改名/换引号后内层脚本就没人查了，「0 段也算全通过」是假绿）。边界说清：抠出来的是**未插值**的模板原文（`${…}` 在这条腿眼里是字面文本，内层要传值走 `cfg`），内层脚本本身**不许再写反引号**；语义对不对仍只能真跑一次浏览器腿（§1.2.3）。 **服务端文案的双语覆盖不设计数闸**（#803 走过一次，判据见 `docs/design/principles.md` §3）：进度看 issue #803 的账；已翻面的部分由单测钉（注册表 `label↔labelEn` parity = `RS-64`；缺省中文逐字不变 = `RS-66`/`RS-67`；HTTP 级错误文案 = `RS-API-13`），没翻的照旧出中文不是故障。
+
+> **临时目录卫生闸（#875，不进 `npm test` 主链）**：`npm run check:tmp-hygiene` —— 先 `node scripts/check-tmp-hygiene.mjs snapshot` 把 `/tmp` 当前清单落盘，跑完测试再 `check`；它只数**本轮新增**（存量不算账）、**只报不删**，前缀清单从 `portal runner test scripts` 的源码现取（闸里硬写前缀 = 假绿）。**判定只认退出码**：0 = 本轮新增 0，1 = 有新增残留（点名哪个前缀积了几个）或没基线可比较（不许假装 0），**2 = 现取清单为空**（扫描面变了 = 闸自己瞎了，不是干净）。单测：`portal/test/tmp-hygiene.test.js`。
 
 #### 1.2.3 集成（临时栈）
 
