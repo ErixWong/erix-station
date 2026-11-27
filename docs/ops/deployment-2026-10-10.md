@@ -17,17 +17,17 @@
 | 生产判定 | **`FDE_DEV_MODE=0`**（真·生产口径；非「dev 栈当生产糊」） |
 | `SESSION_SIGNING_KEY` | 已显式注入 64hex 强随机值（生产模式下占位符会**拒绝启动**，`config.js:133`）。⚠️ 轮换它 = 全量会话失效 |
 | `COOKIE_PROFILE` | **`dev-http`**（`fde_session_dev` + `HttpOnly` + `SameSite=Lax`，**无 `Secure`**）——决策者 2026-10-10 口径放行，见 `docs/env.md` §10 |
-| FDE 镜像 pin | **`sha256:4c1e70685978b65863d5e21d6877fe39ab873d62366a52c89ff950a3f97fefc5`**（image ID 形态；`fde-eric` 的 `.Image` 已核等于此值。v0.1.0 时的初值是 `sha256:3572b989…`，换 `SYSTEM_PROMPT` 后重建镜像即换 ID —— **这正是「换镜像必须显式改 `.env`」的实例**） |
+| FDE 镜像 pin | **`sha256:4c1e70685978b65863d5e21d6877fe39ab873d62366a52c89ff950a3f97fefc5`**（image ID 形态；`fde-alice` 的 `.Image` 已核等于此值。v0.1.0 时的初值是 `sha256:3572b989…`，换 `SYSTEM_PROMPT` 后重建镜像即换 ID —— **这正是「换镜像必须显式改 `.env`」的实例**） |
 | 引擎 | `erix-agent` **0.18.0**（两处 pin 同步） |
 | LLM | `station-litellm`（profile `litellm`，宿主回环 `127.0.0.1:4100`），`spend` 可算（#164 定价），**`max_budget` 未下发** ⇒ 不自动拦（#235） |
-| 容器 | 6 个：`station-edge` / `station-portal` / `station-db` / `station-docker-proxy` / `station-litellm` / `fde-eric`，全 healthy |
+| 容器 | 6 个：`station-edge` / `station-portal` / `station-db` / `station-docker-proxy` / `station-litellm` / `fde-alice`，全 healthy |
 
 ## 已知偏离（都开了单，别当没看见）
 
 | 偏离 | 单 |
 |---|---|
 | 无 TLS：无服务端身份验证、cookie 无 `Secure`、拿不到 `__Host-` 前缀；两条 https 路线（自建 CA / ACME DNS-01）写在单里 | **#234** |
-| **防火墙应用未实现** ⇒ FDE→宿主无出口收紧。**真机实测**（从 `fde-eric` 内）：可达 `8090`(应许) / `9000` Portainer（需认证，仅 `/api/status` 未认证）/ `5432` **别的项目的** Postgres / `443` nginx 反代 / `19001` **开放代理**（可绕审计出网）；`18080` portal、`4100` LiteLLM、`3306`、`22` 因只绑回环而 `ECONNREFUSED`，`8931` playwright 靠自身 localhost 校验挡下（`403`）。⇒ 今天没出事是**靠各服务自己绑回环**，不是平台保证 | **#233** |
+| **防火墙应用未实现** ⇒ FDE→宿主无出口收紧。**真机实测**（从 `fde-alice` 内）：可达 `8090`(应许) / `9000` Portainer（需认证，仅 `/api/status` 未认证）/ `5432` **别的项目的** Postgres / `443` nginx 反代 / `19001` **开放代理**（可绕审计出网）；`18080` portal、`4100` LiteLLM、`3306`、`22` 因只绑回环而 `ECONNREFUSED`，`8931` playwright 靠自身 localhost 校验挡下（`403`）。⇒ 今天没出事是**靠各服务自己绑回环**，不是平台保证 | **#233** |
 | 镜像未推 registry、无 CI（只有本机 build + image ID pin）；`portal`/`fde-proxy` 仍是 `:local` tag | **#235** |
 | 终止文案不可见（`aborted` 无中文标签 + `run_end` 不入历史白名单 ⇒ 刷新后无终态提示）；空 body POST 强制 `Content-Type`；单次 run 无成本护栏 | **#236** |
 | 文件工具迁上游遗留（`maskedPaths` 只挡文件工具不挡 shell；`SYSTEM_PROMPT` 已在本轮补） | #231 |
@@ -36,7 +36,7 @@
 
 - 脚本 `/home/devuser/scripts/station-db-backup.sh`；cron **`30 3 * * *`**（本地 UTC+8）
 - 产物 `~/backups/station-db/station-<ts>.dump`（`pg_dump -Fc` + `pg_restore --list` **可读校验**，保留 14 天），日志 `backup.log` / `cron.log`
-- ⚠️ 规范位置应是 `/docker/station-backups/`（全局约定），但 `/docker` 是 `root:root 755` 且本机**无免密 sudo** ⇒ 待一次性 `sudo mkdir + chown eric` 后把 `BACKUP_DIR` 改过去（前提记在 #233）
+- ⚠️ 规范位置应是 `/docker/station-backups/`（全局约定），但 `/docker` 是 `root:root 755` 且本机**无免密 sudo** ⇒ 待一次性 `sudo mkdir + chown <fde_name>` 后把 `BACKUP_DIR` 改过去（前提记在 #233）
 - 数据卷：`/docker/station-db`（pg data，属主是容器 uid）
 - 首次实跑：`station-20261010-082729.dump`，**16,360,909 bytes**，校验 ok
 
@@ -57,7 +57,7 @@
 脚本 `~/e2e-diag/deploy-accept.mjs` + `stop-test.mjs`；入口用 `curl --resolve station.fde.erix.vip:8090:tailnet-host`（本机解析器解析不出泛域名，是已知负缓存坑，见 AGENTS §4.1）。
 
 - 入口 SPA `200`；未登录 `GET /api/sessions` → `401`
-- 登录 `200` + `fde_session_dev` cookie 经 ingress 下发/回传；`/api/me` → `login=eric`
+- 登录 `200` + `fde_session_dev` cookie 经 ingress 下发/回传；`/api/me` → `login=<fde_name>`
 - 建会话（cwd=`~/projects/hello-station`）`201` → 对话到终态 → **`tool_use` / `tool_result` 16/16 成对** → `runs.usage` 与 `usage_ledger` 均入账（`input_tokens=166,278`）
 - **停止**：`POST /api/sessions/:id/stop` → `200 {status:'cancelling'}` → 终态 **`finished/aborted`**、`cancel_requested_at` 已置、`usage_ledger` 有行（本轮 `input_tokens=0` 合法：在第一个模型轮次完成前就中止；另一轮跑到 2 轮时记 6,357）
 - **无新增 `persistence_failed`**：库里 3 条全部是 2026-10-09 08:14–08:16 我自己注入的 #212 测试数据（`phase=checkpoint_before_tool`），早于 #220 合并
@@ -67,5 +67,5 @@
 
 1. 改代码 → PR → 合并 → **`docker compose -f deploy/docker-compose.yml build station-portal`**（BuildKit 层缓存与 FDE 镜像共享，**构建要串行**）+ `node -e "import('./portal/integration/lib/fde-image.mjs').then(m=>m.buildFdeImage('erix-station/fde:local'))"`
 2. **生产判定下 `FDE_IMAGE` 必须换成新的 image ID**（`docker image inspect erix-station/fde:local --format '{{.Id}}'`）——这是「升级 FDE 镜像」的**显式动作**，忘改就还在跑旧镜像
-3. `docker compose -p station up -d station-portal`；然后 **`docker rm -f fde-eric` + `docker exec station-portal node portal/src/cli.js provision-fde --fde-name eric`**（`ensureFdeContainer` 不会因镜像变化自动重建；ExtraHosts 在容器创建时定死，改 `BASE_DOMAIN` 也必须重建）
+3. `docker compose -p station up -d station-portal`；然后 **`docker rm -f fde-alice` + `docker exec station-portal node portal/src/cli.js provision-fde --fde-name alice`**（`ensureFdeContainer` 不会因镜像变化自动重建；ExtraHosts 在容器创建时定死，改 `BASE_DOMAIN` 也必须重建）
 4. 回滚：`.env` 的 `FDE_IMAGE` 改回旧 image ID + 重跑第 3 步（镜像 ID 是不可变的，所以回滚可信）
