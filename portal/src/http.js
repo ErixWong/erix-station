@@ -1047,7 +1047,15 @@ export function createServer({
       await route(req, res, ctx);
     } catch (err) {
       // #845：内部面把属主语言挂在 req.localeHint 上（浏览器路径不设这个键）⇒ 优先用它。
-      const locale = req.localeHint ?? resolveRequestLocale(req); // #803：一次请求只算一次，喂下面所有 errorBody 的文案挑选
+      // 必须在「读 hint 的这里」归一，而不是指望库里干净：迁移 0048 刻意不给 users.locale 写 DB CHECK
+      // （见 deploy/migrations/0048-users-locale.sql 注释），手工写进库的 ''/'zh'/'EN'/'fr' 都会被下面的 `??`
+      // 当成「已设」原样保留、挡住 resolveRequestLocale() 回退；而 pickMessage 只认精确 'en' ⇒ 'EN'/未知值会误出中文、
+      // '' 更会连请求头回退都吃掉。故过一遍 normalizeUserLocale：合法值归一到 'zh-CN'/'en'/null，非法当未设（null），
+      // null 再落回 resolveRequestLocale()。normalizeUserLocale 对非字符串（浏览器路径 localeHint 为 undefined）判 {ok:false}
+      // ⇒ null，浏览器路径因此照旧只认 cookie/Accept-Language。
+      // #803：一次请求只算一次，喂下面所有 errorBody 的文案挑选
+      const _hint = normalizeUserLocale(req.localeHint);
+      const locale = (_hint.ok ? _hint.value : null) ?? resolveRequestLocale(req);
       if (err instanceof HttpError) {
         const headers = { ...(err.headers || {}) };
         if (err.status === 413) headers['Connection'] = 'close'; // 未读完的请求体需断开
