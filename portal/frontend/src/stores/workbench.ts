@@ -32,6 +32,8 @@ import { useAuthStore } from './auth';
 import { normalizeSessionCompaction, type SessionCompaction } from '../lib/compactionSummary';
 // #816 第③步：`session.folds`（会话级折叠索引）的读侧收窄与派生（常驻条 / 面板 / 竖串都吃这一份）。
 import { normalizeSessionFolds, type FoldEntry } from '../lib/foldIndex';
+// issue #802：run 错误文案映射（与 `useEventStream` 的 `run_end` 红面同一份），桌面通知用它才能与界面对齐。
+import { runErrorText } from '../lib/terminationReasons';
 
 // 用户可见文案取词（issue #101 P2）：Pinia setup store 不是组件 setup 上下文（useI18n 会抛
 // MUST_BE_CALL_SETUP_TOP，且组件作用域 composer 语义不符），故统一走 i18n.global.t。
@@ -1943,8 +1945,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       const title = sess?.title || t('common.unnamedSession');
       const reason = d.termination?.reason ?? '';
       const failed = RUN_FAIL_REASONS.has(reason) || !!d.error;
+      // issue #802：与流里的红面共用 `runErrorText`——两条面必须说同一句话（此前通知只透传引擎
+      // 原话，于是界面是人话、桌面通知是 `404 page not found`，两条面各说各话）。
+      const errText = d.error ? runErrorText(d.error) : null;
       const body = d.error
-        ? t('workbench.notifyFailed', { code: d.error.code, message: d.error.message })
+        ? t('workbench.notifyFailed', { code: d.error.code, message: errText!.labelKey === null ? errText!.raw : t(errText!.labelKey) })
         : failed ? t('workbench.notifyEnded', { reason }) : t('workbench.notifyDone');
       const n = new Notification(`FDE Station · ${title}`, { body });
       n.onclick = () => { window.focus(); n.close(); };

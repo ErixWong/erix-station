@@ -4607,6 +4607,12 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 > **`retryable` 判据（issue #212，与上游对齐）**：worker 的判据 = 上游错误对象显式 `retryable === true` **或** 错误码属上游可重试码集 <!-- DRIFT:run-retryable-error-code:begin -->`retryable ∈ {timeout, rate_limited, server, disconnect, checkpoint_failed}`<!-- DRIFT:run-retryable-error-code:end -->（= 上游 `erix-agent/src/providers/errors.js:1` `RETRYABLE_CODES` + 已文档化为可重试的 `checkpoint_failed`）。此前 worker 是手写半截清单（只认 `checkpoint_failed` / `rate_limited`），`timeout` / `server` / `disconnect` 会被误判为不可重试。码集单一真相常量在 `portal/frontend/src/lib/terminationReasons.ts`（`RUN_RETRYABLE_ERROR_CODES`），runner 侧运行时镜像在 `runner/lib/termination.js`（`RETRYABLE_ERROR_CODES`，FDE 镜像只 COPY `runner/*`），两者与上表由 `portal/test/termination-contract.test.js` 逐项对齐。
 
+> **上游裸 404 = 路径错，不是模型错（issue #802，读侧文案）**：`error.code === 'not_found'` 且 `error.message`（去空白后）匹配 `^404\s+page\s+not\s+found\b`（大小写不敏感）时，那句话是 **Go `http.NotFound` 的默认正文**——它证明请求打到了一个**网关根本不服务的路径**（典型成因：绑定的 `base_url` 缺 `/v1` 前缀），**与「模型不存在」无关**；界面把它翻成 `stream.event.runErrorCode.llmEndpointNotFound`（一句可行动的人话，指向 `base_url`）。
+>
+> - **为何按 `code` + `message` 双条件而不是只看 `code`**：引擎 `src/providers/errors.js` 把**所有** 404 一律压成 `not_found`（上游正文原样放在 `message`），语义全在正文里。只按 `code` 判，「模型/资源真的不存在」（`model xyz not found`）也会被误标成「路径打错了」，把用户指向错误的排查方向——那比裸 404 更糟。两个条件缺一不可。判据：`portal/frontend/src/lib/terminationReasons.ts` 的 `isGatewayMuxNotFound`（用例：同文件 `terminationReasons.spec.ts`，两条各钉一个方向）。
+> - **这是读侧文案，不改契约也不改引擎**：`error.code` 的值域仍由引擎定义（上表与 §5.3 注的口径一字未动），station 不新增/不改写任何码值，后端与 runner 零改动。映射在 `runErrorText`（返回 `{labelKey, raw}`，`labelKey === null` ⇒ 原话照旧透传，不编翻译、不吞信息），**lib 内不调 `t()`**（本文件被 `portal/test/termination-contract.test.js` 用 node 直读，拖不进 vue-i18n）。
+> - **两个消费面共用一份**：流里的红色 `.syserr` 那一行（`composables/useEventStream.ts` 的 `run_end` 分支）与**桌面通知**（`stores/workbench.ts` 的 `notifyRunEnd` → `workbench.notifyFailed`）都走 `runErrorText`——只改一条面就是「两条面各说各话」（界面是人话、通知是 `404 page not found`）。历史合成项 `run_termination` 只有 `termination.errorCode`、**没有** `error` 信封（拿不到 message），因此它只能按 code 查 `RUN_ERROR_CODE_LABELS`，本条 404 映射在那条路上不适用（那里仍显示 `code=not_found`）。
+
 ---
 
 ## 7. ⚠️ 待决策者确认汇总（本文出现的全部标注）

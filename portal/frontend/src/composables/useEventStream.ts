@@ -16,7 +16,7 @@
 // 协议状态（es/lastSeq/esSessionId/activeRunId/deltaText/toolCards）与事件语义。
 import { reactive, ref } from 'vue';
 import { i18n } from '../i18n';
-import { PERSISTENCE_TERMINATION_REASON, RUN_END_LABEL_REASONS, RUN_ERROR_CODE_LABELS, RUN_FAIL_REASONS, RUN_TERMINATION_SYSERR_REASONS } from '../lib/terminationReasons';
+import { PERSISTENCE_TERMINATION_REASON, RUN_END_LABEL_REASONS, RUN_ERROR_CODE_LABELS, RUN_FAIL_REASONS, RUN_TERMINATION_SYSERR_REASONS, runErrorText } from '../lib/terminationReasons';
 import { getToolResultSummary, formatDuration, isSpecialExecutionStatus } from '../lib/toolSummary';
 import { eventRoundToken, runSegment, toolCardKey, UNKNOWN_ROUND_TOKEN } from '../lib/toolCardKey';
 
@@ -1319,12 +1319,12 @@ export function useEventStream(hooks: EventStreamHooks) {
           if (fallbackNote !== '') hooks.onSep(fallbackNote);
           if (d.error) {
             // issue #442（erix-agent 0.30.0）：错误码命中人话表就用它，否则照旧透传引擎原话。
+            // issue #802：查表收敛到 `runErrorText`（与桌面通知 `notifyFailed` 共用一份），它额外认得
+            //   上游 Go 默认 404（`not_found` + `404 page not found` ⇒ 路径打错，不是模型不存在）。
             // ⚠ **不新增 UI 结构**：仍然是既有的红色 `.syserr` 面 + `code=` 后缀（工单 §M3.3），
-            // 只是把 `{message}` 那一格从引擎英文技术句换成用户读得懂的一句（`summarizer_failed`）。
-            const codeText = typeof d.error.code === 'string' && d.error.code !== ''
-              && Object.hasOwn(RUN_ERROR_CODE_LABELS, d.error.code)
-              ? t(`stream.event.runErrorCode.${RUN_ERROR_CODE_LABELS[d.error.code]}`)
-              : d.error.message;
+            // 只是把 `{message}` 那一格从引擎英文技术句换成用户读得懂的一句（`summarizer_failed` / 路径错）。
+            const errText = runErrorText(d.error);
+            const codeText = errText.labelKey !== null ? t(errText.labelKey) : errText.raw;
             hooks.onSysErr(t('stream.event.runFailed', { code: d.error.code, message: codeText }));
           }
           activeRunId.value = null;

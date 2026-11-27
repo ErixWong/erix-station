@@ -482,6 +482,10 @@ export const zhCN = {
       // （引擎原文，英文技术句），用户读不出「这是摘要器的问题，可以重试」。
       runErrorCode: {
         summarizerFailed: '压缩摘要器调用失败 ⇒ 本次运行失败（不是降级：上下文没能压缩，重试即可）',
+        // issue #802：上游正文是 Go `http.NotFound` 的默认串（`404 page not found`）⇒ 网关根本不服务
+        // 这个路径（典型：绑定的 base_url 缺 `/v1` 前缀），**不是**模型不存在。判据在
+        // `lib/terminationReasons.ts#isGatewayMuxNotFound`（code + message 双条件，只按 code 会误伤真 404）。
+        llmEndpointNotFound: '上游网关不认识这个请求路径（404）⇒ 检查绑定的 base_url（常见原因：缺 /v1 前缀），或该模型在网关里已被下线',
       },
       // issue #212：失败原因的用户可读标签（双语必须同时补，en.ts 的 `satisfies MessageSchema`
       // 会在漏译时编译报错）。键名故意用引擎 reason 原文（不 camelCase），以便与

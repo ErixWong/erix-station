@@ -263,3 +263,43 @@ export const LEGACY_TERMINATION_REASONS = ['reflection_stop'] as const;
 export const RUN_ERROR_CODE_LABELS: Readonly<Record<string, string>> = {
   summarizer_failed: 'summarizerFailed',
 };
+
+/**
+ * issue #802：上游 **Go `http.NotFound` 的默认正文**（`404 page not found`）⇒ 请求打到了一个
+ * **网关根本不服务的路径**（典型：绑定的 `base_url` 缺 `/v1` 前缀），**不是**「模型不存在」。
+ *
+ * 判据必须**双条件**：`code === 'not_found'` **且** message 去空白后匹配那个裸串。
+ * 只按 `code` 判会把「模型/资源真的不存在」的 404（`model xyz not found`）也误标成路径问题——
+ * 引擎 `src/providers/errors.js` 把所有 404 一律压成 `not_found`，语义全在 message 正文里。
+ *
+ * 口径同本文件其它常量：**纯函数、不引 i18n**（`portal/test/termination-contract.test.js` 用 node
+ * 直读本文件，vue-i18n 拖不进来）；取词由消费点做（见 `runErrorText` 的 `labelKey`）。
+ */
+export function isGatewayMuxNotFound(error: { code?: unknown; message?: unknown }): boolean {
+  return error.code === 'not_found'
+    && typeof error.message === 'string'
+    && /^404\s+page\s+not\s+found\b/i.test(error.message.trim());
+}
+
+/** `runErrorText` 的返回：`labelKey === null` ⇒ 没有人话，消费点原样展示 `raw`。 */
+export type RunErrorText = { labelKey: string | null; raw: string };
+
+/**
+ * issue #802：**两条面（流里的红面 + 桌面通知）共用的一份** run 错误文案映射。
+ *
+ * 优先级：① 上游裸 404（`isGatewayMuxNotFound`）→ `llmEndpointNotFound`；
+ * ② 命中既有 {@link RUN_ERROR_CODE_LABELS} → `stream.event.runErrorCode.<后缀>`；
+ * ③ 都没有 → `labelKey: null`（**不编翻译、不吞信息**，引擎原话照出）。
+ *
+ * 这里**不调 `t()`**（lib 保持无 i18n 依赖，口径同 `lib/foldIndex.ts`）：返回键，由消费点取词。
+ * `raw` 取 `message` 字符串，非字符串 ⇒ 空串。
+ */
+export function runErrorText(error: { code?: unknown; message?: unknown }): RunErrorText {
+  const raw = typeof error.message === 'string' ? error.message : '';
+  if (isGatewayMuxNotFound(error)) return { labelKey: 'stream.event.runErrorCode.llmEndpointNotFound', raw };
+  const code = typeof error.code === 'string' && error.code !== '' ? error.code : null;
+  const label = code !== null && Object.hasOwn(RUN_ERROR_CODE_LABELS, code)
+    ? RUN_ERROR_CODE_LABELS[code]
+    : null;
+  return { labelKey: label === null ? null : `stream.event.runErrorCode.${label}`, raw };
+}
