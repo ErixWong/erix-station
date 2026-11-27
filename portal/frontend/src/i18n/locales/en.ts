@@ -295,7 +295,8 @@ export const en = {
       // user). The old renderer drew only `text`, so the turns that actually *did something* (reasoning plus
       // tool calls, no prose) all collapsed into the placeholder above — 40 of 112 turns on the real session.
       // All four are rendered now; the placeholder means "this turn truly has nothing".
-      originalRoleUser: 'user',
+      // #816 ④b: `originalRoleUser` (the old role caption) retires — the body now renders through the very
+      // same `MessageBubble` as the main stream, so `.msg.<role>` already says who is speaking.
       originalTool: '🔧 {name} | {args}',
       originalToolFailed: ' (failed)',
       originalMissing: 'No text to show for this span (the ledger has none either)',

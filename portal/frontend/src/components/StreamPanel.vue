@@ -14,9 +14,9 @@ import { renderMarkdown } from '../lib/markdown';
 // mermaid 图渲染（参考 pi-web MermaidBlock）：v-html 落定后对 ```mermaid 块做 DOM 后处理。
 // 只挂**终稿/部分正文**容器；流式增量不挂（pi-web 同口径：流式中不预览，防逐 chunk 重渲）。
 import { vMermaid } from '../directives/mermaid';
-// issue #282：消息级时刻（A 块）+ 流式气泡上的「已运行 Xs」心跳（B 块在 StreamPanel 的唯一落点；
+// issue #282 B：消息时刻（A 块）自 #816 ④b 起在 MessageBubble 组件里（本文件不再持有 `msgTime`）；
+// 流式气泡上的「已运行 Xs」心跳（B 块在 StreamPanel 的唯一落点；
 // 其余动量数字都在输入框上方常驻状态条 RunStatusBar 里，见工单「落点」）。
-import { formatMessageTime } from '../lib/messageTime';
 import { formatElapsed } from '../lib/runMomentum';
 import { useRunMomentum } from '../composables/useRunMomentum';
 // #451：会话头部「本会话压缩」累计行——层序/脏值归一化/可读单位都在 lib 里（纯函数），模板只做插值。
@@ -27,6 +27,8 @@ import { compactionLayerSegments, formatSavedTokens, type SessionCompaction } fr
 import DelegateChildDrawer from './DelegateChildDrawer.vue';
 // issue #816 第④步a：折叠原文的渲染本体（与 WorkbenchView 的折叠面板共用同一份实现）。
 import FoldOriginalTurns from './FoldOriginalTurns.vue';
+// issue #816 第④b步：消息气泡的渲染本体（与折叠原文共用一份；`msgClass`/`msgTime` 只在组件里）。
+import MessageBubble from './MessageBubble.vue';
 import {
   DELEGATE_BADGE_CLASS,
   DELEGATE_UNKNOWN_MARK,
@@ -37,7 +39,7 @@ import {
   type DelegateResult,
 } from '../lib/delegate';
 
-const { t, locale } = useI18n();
+const { t } = useI18n();
 const store = useWorkbenchStore();
 // 本组件只读派生视图；1s 时钟由 composable 自己起、自己 `onUnmounted` 清（与 RunStatusBar 各一份，
 // 两条 1s interval 的成本可忽略，换来「谁卸载谁清理」的局部性）。
@@ -77,14 +79,6 @@ const compactionTitle = computed(() => {
     ? t('stream.sessionCompactionHintTitle', { rounds: compaction.rounds, last })
     : t('stream.sessionCompactionHintTitleNoRound', { rounds: compaction.rounds });
 });
-
-/**
- * issue #282 A：消息时刻文本。`created_at` 缺失/脏值 ⇒ `''`（模板 `v-if` 整段不出），
- * 绝不把 `undefined` / `Invalid Date` / `NaN` 渲染上屏（格式化规则见 `lib/messageTime.ts`）。
- */
-function msgTime(en: Extract<StreamEntry, { kind: 'msg' }>): string {
-  return formatMessageTime(en.createdAt, locale.value);
-}
 
 /**
  * issue #282 B：流式气泡上的实时计时。运行中且有起跑时刻 ⇒「已运行 03:42」；运行中但起跑时刻
@@ -458,13 +452,6 @@ function entryKey(en: StreamEntry, i: number): string {
   }
 }
 
-function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
-  // 旧 div.className = `msg ${m.role}${m.synthetic ? ' synthetic' : ''}`（+ .md 仅助手终稿）
-  let cls = 'msg ' + en.role;
-  if (en.synthetic) cls += ' synthetic';
-  if (en.html) cls += ' md';
-  return cls;
-}
 </script>
 
 <template>
@@ -496,18 +483,16 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
   </div>
 
   <template v-for="(en, i) in store.entries" :key="entryKey(en, i)">
-    <!-- 消息气泡：终稿 markdown 走 v-html；其余纯文本（{{ }} 插值等价 textContent） -->
-    <div v-if="en.kind === 'msg'" :class="msgClass(en)">
-      <!-- issue #282 A：每条消息（用户与助手都算）显示时刻；DTO 没给 created_at 就整段不出 -->
-      <time
-        v-if="msgTime(en)"
-        class="msg-time block text-right text-[11px] leading-none text-black/35"
-        :datetime="en.createdAt"
-        :title="t('runStatus.messageTimeTitle')"
-      >{{ msgTime(en) }}</time>
-      <div v-if="en.html" v-mermaid v-html="en.html"></div>
-      <template v-else>{{ en.text }}</template>
-    </div>
+    <!-- 消息气泡：渲染本体已抽成 MessageBubble（issue #816 ④b：与折叠「查看原文」共用同一份）。
+         终稿 markdown 走 v-html；其余纯文本（{{ }} 插值等价 textContent）——类名/时刻/口径全在组件里。 -->
+    <MessageBubble
+      v-if="en.kind === 'msg'"
+      :role="en.role"
+      :synthetic="en.synthetic"
+      :created-at="en.createdAt"
+      :html="en.html"
+      :text="en.text"
+    />
     <!-- 流式增量：markdown 容错渲染（v-html，渲染器先转义后格式化 XSS 安全），
          类名与助手终稿一致（.msg assistant .md），pi-web 风格下增量与终稿视觉无跳变 -->
     <!-- issue #282 B：进行中的 run 在流式气泡上带「已运行 Xs」+ 心跳脉冲（复用既有 animate-pulse）；

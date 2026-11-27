@@ -313,7 +313,8 @@ export const zhCN = {
       // #384：一个 turn 在账本里有四类内容（`text` / `reasoning` / `toolCalls[]` / user 身份），旧实现只画
       // `text` ⇒ 真的干了活的那几轮（只有思考 + 工具调用）整片渲染成上面那个占位符（真机 round 100 的
       // 112 条里 40 条如此）。现四类都画，占位符语义收窄成「四类真的都空」。
-      originalRoleUser: '用户',
+      // #816 ④b：`originalRoleUser`（旧「角色标签」文案）下线——正文改用主对话同款 `MessageBubble`，
+      // 角色由 `.msg.<role>` 气泡自己表达，标签重复且不再对齐主对话。
       originalTool: '🔧 {name}｜{args}',
       originalToolFailed: '（失败）',
       // #375：404 语义已收窄成「range 与归档两条路都拿不出正文」。旧文案那句「上游未保留折叠前载荷」

@@ -56,7 +56,29 @@ describe('FoldOriginalTurns · 四态（#816④a：单一实现，与 StreamPane
     const w = mountTurns({ status: 'loaded', turns: [{ role: 'user', text: '存量全量归档' }] });
     expect(w.find('.folded-original-truncated').exists()).toBe(false);
     expect(w.text()).not.toContain('undefined');
-    expect(w.get('.folded-original-role').text()).toBe('用户');
+    // #816 ④b：正文是**主对话同款气泡**（旧断言「角色标签 = 用户」就此作废——气泡自己就是角色）
+    expect(w.get('.msg.user').text()).toBe('存量全量归档');
+  });
+
+  // #816 ④b：**有意的口径变更**——展开原文的正文不再是「角色标签 + `folded-original-text` 文本块」，
+  // 而是与主对话**共用 `MessageBubble`** 的那一份气泡；旧的 `folded-original-role` 标签直接退役。
+  it('正文在 `.msg` 气泡里（与主对话同一份渲染），且**不再**渲染 folded-original-role 角色标签（#816④b）', () => {
+    const w = mountTurns({
+      status: 'loaded',
+      turns: [{ role: 'user', text: '用户问的那句' }, { role: 'assistant', text: '助手答的那句' }],
+    });
+    const bubbles = w.findAll('.msg');
+    expect(bubbles).toHaveLength(2);
+    expect(bubbles[0].classes()).toContain('user');
+    expect(bubbles[0].text()).toContain('用户问的那句');
+    // markdown 路径与助手终稿一致（`.md` 由 `MessageBubble` 自己按 html 加上）
+    expect(bubbles[1].classes()).toEqual(expect.arrayContaining(['assistant', 'md']));
+    expect(bubbles[1].text()).toContain('助手答的那句');
+    // 角色标签彻底没了（键也随之下线 ⇒ localeParity 绿）
+    expect(w.findAll('.folded-original-role')).toHaveLength(0);
+    // 但旧 DOM 钩子 `folded-original-text` 仍在（落在气泡自己身上 ⇒ StreamPanel 的既有定位不破）
+    expect(w.findAll('.folded-original-text')).toHaveLength(2);
+    expect(w.get('.msg.user').classes()).toContain('folded-original-text');
   });
 
   // #384 的病症：只画 text ⇒ 真的干了活的那几轮（只有 reasoning + 工具调用）整片渲染成空行。
@@ -71,8 +93,9 @@ describe('FoldOriginalTurns · 四态（#816④a：单一实现，与 StreamPane
       }],
     });
     const turn = w.get('.folded-original-turn');
-    expect(turn.get('.folded-original-role').text()).toBe('用户');
-    expect(turn.get('.folded-original-text').text()).toContain('把仓库 clone 下来');
+    // #816 ④b：正文改住**主对话同款气泡**（`.msg.user`），不再是 `folded-original-text` 文本块 + 角色标签
+    expect(turn.get('.msg.user').text()).toContain('把仓库 clone 下来');
+    expect(turn.find('.folded-original-role').exists()).toBe(false);
     expect(turn.get('.folded-original-reasoning').text()).toContain('先看工作目录再决定 clone 方式');
     const tool = turn.get('.folded-original-tool');
     expect(tool.text()).toContain('exec');
