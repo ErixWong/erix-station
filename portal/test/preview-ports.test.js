@@ -24,7 +24,7 @@
 // **preview_grants 的 CHECK 一律走 `./preview-grant-checks.js`**（baseline 五条 CHECK 逐条同名模拟，
 // 含 `(state='used') = (used_at IS NOT NULL)`，违反 ⇒ 语句级抛 23514）——旧 fake 只模拟
 // `revoked ⇔ revoked_at`，所以上面那个 bug 在单测里**结构上不可能**被发现（#252 的根因）。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -54,6 +54,20 @@ import {
 } from '../src/portalloc.js';
 import { previewUrl } from '../src/projects.js';
 import { alignedPreviewBlockStart } from '../src/previewpool.js';
+
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startPortsServer 建的 staticDir（`station-ports-static-`）进 tmpDirs，afterEach 逐格 rm（**不带 force**：
+// rm 失败当场红，不拿「尽力了」冒充清干净）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const BASE = 'fde.erix.vip';
 const PUBLIC_BASE = 'http://station.fde.erix.vip:8090';
@@ -948,7 +962,7 @@ class PortsHttpPool extends FakePool {
 }
 
 async function startPortsServer({ store, users = [ADMIN, ALICE, BOB, LONG_FDE], rateLimit = null } = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-ports-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-ports-static-')));
   const config = {
     cookie: cookieSettings('dev-http', 604800),
     sessionTtlSeconds: 604800,
