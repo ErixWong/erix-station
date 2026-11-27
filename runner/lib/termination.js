@@ -64,8 +64,21 @@ export function isRetryableErrorCode(code) {
  * 只补 `detail`、**绝不改 reason**（reason 值域由引擎定义，§5.3 红线），也**不覆盖**引擎已给的 detail。
  * 前端据此把终态行刷成中性并抑制「重试上一条」（用户已经转向了，重试是倒退）；portal 的出队判定
  * 则不看这里——它看 `queued_inputs.interrupted_run_id`（DB 是真相）。
+ *
+ * issue #802：`noLlmBinding` = 该 FDE **没有 active LLM binding**（心跳下行的 `models` 为 `null`）。
+ * 同一口径：**只补 `detail: 'no_llm_binding'`、绝不改 reason、也不覆盖引擎已给的 detail**。
+ * 存在的理由：没有 binding 时 endpoint / apiKey 仍取占位 config（`runner/worker.js` 的装配），run
+ * 照跑照炸，用户看到的 `error.message` 是**上游裸 404 的响应体**（`404 page not found`），既不说
+ * 「没配模型」也不指到该看的那一格 ⇒ 这一个 detail 是它唯一的可 grep 锚点（另一处是 worker 的
+ * `no_llm_binding:` 告警）。**只补可诊断性，不改行为**：不升格成建 run 时的硬 409（issue 明写那条
+ * 是产品判据，不在本单）。
+ * ⚠ 与 `steered` 同时成立时 **`steered` 优先**（下面那条 return 先命中就短路）：steered 描述的是
+ * 「这次 run 为什么被中止」（用户主动转向，前端要刷中性并抑制重试），比「这个账号没配模型」更贴近
+ * 用户此刻的意图；而「没配模型」在 worker 日志里仍然有一条 warn 记账，不会因此丢失。
+ *
+ * @param {{ termination?: unknown, aborted?: boolean, steered?: boolean, noLlmBinding?: boolean }} input
  */
-export function buildRunTermination({ termination, aborted = false, steered = false } = {}) {
+export function buildRunTermination({ termination, aborted = false, steered = false, noLlmBinding = false } = {}) {
   const reason = typeof termination?.reason === 'string' && termination.reason.length > 0
     ? termination.reason
     : null;
@@ -78,18 +91,23 @@ export function buildRunTermination({ termination, aborted = false, steered = fa
   if (aborted && reason === 'failed') return { ...termination, reason: 'aborted' };
   const out = /** @type {Record<string, unknown>} */ (termination);
   if (steered && out.reason === 'aborted' && out.detail == null) return { ...out, detail: 'steered' };
+  // issue #802：位置在 steered **之后** ⇒ 两者同时成立时 steered 赢（理由见上面的函数注：steered 描述
+  // 「为什么被中止」，更贴近用户意图）。`out.detail == null` 与 steered 同口径：引擎的 detail 是一手
+  // 信息，宿主一行都不许覆盖。**不动 reason**（§5.3 值域红线）。
+  if (noLlmBinding && out.detail == null) return { ...out, detail: 'no_llm_binding' };
   return out;
 }
 
 /**
  * 构造 `run_finished`（IPC）的失败终态片段：`termination` + `error` + `usage` + `rounds`。
- * @param {{ err: any, aborted?: boolean }} input
+ * `noLlmBinding`（issue #802）原样透传给 buildRunTermination（只补 detail，见那里的口径）。
+ * @param {{ err: any, aborted?: boolean, steered?: boolean, noLlmBinding?: boolean }} input
  * @returns {{ termination: Record<string, unknown>, error: { code: string, message: string, retryable: boolean }, usage: Record<string, unknown>, rounds: number }}
  */
-export function buildFailureEnvelope({ err, aborted = false, steered = false } = {}) {
+export function buildFailureEnvelope({ err, aborted = false, steered = false, noLlmBinding = false } = {}) {
   const code = aborted ? 'aborted' : (err?.code ?? 'failed');
   return {
-    termination: buildRunTermination({ termination: err?.termination, aborted, steered }),
+    termination: buildRunTermination({ termination: err?.termination, aborted, steered, noLlmBinding }),
     error: {
       code,
       message: String(err?.message ?? err),

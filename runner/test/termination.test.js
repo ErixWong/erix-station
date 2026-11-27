@@ -93,6 +93,58 @@ test('#370 steered 只补 detail、不改 reason、也不覆盖引擎给的 deta
   );
 });
 
+// issue #802：FDE 没有 active LLM binding 时心跳 `models === null`，而 endpoint/apiKey 恒取占位 config
+// ⇒ run 照跑照炸，用户只拿到上游裸 404（`not_found / 404 page not found`）。宿主只补**可诊断性**：
+// 往 `termination.detail` 补一个 `no_llm_binding`。口径逐条照抄 #370：① **不改 reason**；
+// ② **不覆盖引擎已给的 detail**；③ 与 steered 同时成立时 **steered 优先**。
+test('#802 noLlmBinding 只补 detail=no_llm_binding，不改 reason、不覆盖引擎 detail', () => {
+  // 引擎给了 reason、没给 detail → 补上具体字面
+  assert.deepEqual(
+    buildFailureEnvelope({
+      err: { message: '404 page not found\n', code: 'not_found', termination: { reason: 'failed' } },
+      noLlmBinding: true,
+    }).termination,
+    { reason: 'failed', detail: 'no_llm_binding' },
+  );
+  // 引擎已给 detail → 一个字不动（与 steered 同口径）
+  assert.deepEqual(
+    buildFailureEnvelope({
+      err: { message: 'm', termination: { reason: 'failed', detail: 'x' } },
+      noLlmBinding: true,
+    }).termination,
+    { reason: 'failed', detail: 'x' },
+  );
+  // 优先级：steered + noLlmBinding 同时成立（转向中止）→ 只能是 steered
+  assert.deepEqual(
+    buildFailureEnvelope({
+      err: { termination: { reason: 'aborted' } },
+      aborted: true, steered: true, noLlmBinding: true,
+    }).termination,
+    { reason: 'aborted', detail: 'steered' },
+  );
+  // reason 一字不变：三种形状下都不得因 noLlmBinding 而变（§5.3 值域红线），且不丢上游其余键
+  for (const [label, term, opts] of [
+    ['引擎没给 detail', { reason: 'failed' }, { noLlmBinding: true }],
+    ['引擎已给 detail', { reason: 'failed', detail: 'x' }, { noLlmBinding: true }],
+    ['steered 共存', { reason: 'aborted' }, { aborted: true, steered: true, noLlmBinding: true }],
+  ]) {
+    const t = buildRunTermination({ termination: term, ...opts });
+    assert.equal(t.reason, term.reason, `${label}：reason 不许动`);
+    assert.notEqual(t.reason, 'no_llm_binding', `${label}：reason 不许被写成宿主 detail 码`);
+    for (const k of Object.keys(term)) if (k !== 'detail') assert.equal(t[k], term[k], `${label}：${k}`);
+  }
+  // 没命中时不得冒错（否则每个普通失败都会被当成「没配模型」）
+  assert.deepEqual(
+    buildFailureEnvelope({ err: { message: 'm', termination: { reason: 'failed' } } }).termination,
+    { reason: 'failed' },
+  );
+  // 引擎根本没给 termination（回退拍平口径）时也不添 detail
+  assert.deepEqual(
+    buildFailureEnvelope({ err: new Error('boom'), noLlmBinding: true }).termination,
+    { reason: 'failed' },
+  );
+});
+
 test('竞态兜底只覆盖兜底值 failed：引擎给出 persistence_failed 时仍以引擎为准', () => {
   const { termination } = buildFailureEnvelope({
     err: { message: 'm', termination: PERSISTENCE_TERMINATION },
@@ -140,7 +192,16 @@ test('worker.js 确实用了本模块（catch 里没有第二份实现）', () =
     'worker.js 必须从 lib/termination.js import buildFailureEnvelope（catch 里不许有第二份实现）');
   // issue #370 加了第三个入参 `steered`（只往 termination.detail 补 'steered'），故这里的形状断言随之更新：
   // 断言仍锁死「catch 里只有这一处调用、没有第二份手写实现」这一原意，只是把入参表写成三参数版。
-  assert.match(worker, /const \{ termination, error, usage, rounds \} = buildFailureEnvelope\(\{ err, aborted, steered \}\);/);
+  assert.match(worker, /const \{ termination, error, usage, rounds \} = buildFailureEnvelope\(\{ err, aborted, steered, noLlmBinding \}\);/,
+    'catch 里只有这一处 buildFailureEnvelope 调用（四入参形状，没第二份手写实现）');
+  // issue #802：worker 侧告警与终态补码用**只读源码**的接线锁钉住（runner/test/ 里没有「起 worker
+  // 走 IPC」的用例，不为此现搭一套假 IPC 脚手架 —— 那是另一单，见 #802 交付报告）。
+  assert.match(worker, /const noLlmBinding = msg\.models == null;/,
+    '判据必须是 msg.models == null（旧 agentd 不带该键也算），不是 models.main 缺失');
+  assert.match(worker, /msg: 'no_llm_binding: /,
+    'worker 必须发一条含字面 no_llm_binding: 的 warn LOG（运维 grep 锚点）');
+  assert.equal((worker.match(/no_llm_binding: /g) ?? []).length, 1,
+    '告警文案只写一次（run 开头一次，不在重试/循环里重发）');
 });
 
 // ---------- erix-agent #180（0.18.0）：失败/中止终态不再谎报零用量 ----------

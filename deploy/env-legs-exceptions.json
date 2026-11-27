@@ -102,7 +102,7 @@
     },
     {
       "key": "STATION_SKILLS_DIR",
-      "where": "runner/worker.js:742",
+      "where": "runner/worker.js:759",
       "reason": "随镜像发布的内置 skills 目录兜底（`/opt/erix/skills`）。skills 是镜像内容不是部署配置（用户自己的 skills 走 userspace bind），上宿主面会让人以为能改镜像里的那棵树。"
     },
     {
@@ -158,9 +158,9 @@
       "reason": "**读形认得、名字解析不出**的动态下标：`key` 来自 `STDIO_ENV_ALLOWLIST` 这个常量数组（定义在 `runner/lib/mcp-client.js:36`，转发循环在 `runner/lib/mcp-client.js:94`），而扫描器只看字面量读形（`baseEnv.ERIX_X`）。这条不是漏投，是**故意的白名单转发**：第三方 MCP server 只许拿到 PATH/HOME/LANG 这类无身份信息的环境变量（连 ERIX_STATION_TOKEN 都不在表里，`mcp-client.test.js` 有反向判据钉住）。逐条展开成字面量会让「加一个 key 忘记同步」变成两处改，反而更容易漂 —— 所以登记在这里，让扫描器知道这处已经被显式审视过。"
     },
     {
-      "at": "runner/worker.js:923",
+      "at": "runner/worker.js:940",
       "read": "process.env[name]",
-      "reason": "**读形认得、名字解析不出**的动态下标：`name` 来自紧邻的字面量对数组（那三行字面量对在 `runner/worker.js:916-918`；`name` 由紧邻上一行的 for-of 解构绑定）（`ERIX_DELEGATE_MAX` / `ERIX_DELEGATE_CHILD_ROUNDS` / `ERIX_DELEGATE_CHILD_TIMEOUT_MS`，那三行本身是字面量读形、已被枚举覆盖，这里只是越界告警时回读原值）。扫描器**故意**不解析 for-of 解构配对数组（再写一条形状规则去迎合现存代码 = 判据围着样本转），所以这一处必须留登记 ⇒ 「扫不干净」是花钱的，不是静默的。坐标漂移时判据红，重跑一次更新即可。"
+      "reason": "**读形认得、名字解析不出**的动态下标：`name` 来自紧邻的字面量对数组（那三行字面量对在 `runner/worker.js:933-935`；`name` 由紧邻上一行的 for-of 解构绑定）（`ERIX_DELEGATE_MAX` / `ERIX_DELEGATE_CHILD_ROUNDS` / `ERIX_DELEGATE_CHILD_TIMEOUT_MS`，那三行本身是字面量读形、已被枚举覆盖，这里只是越界告警时回读原值）。扫描器**故意**不解析 for-of 解构配对数组（再写一条形状规则去迎合现存代码 = 判据围着样本转），所以这一处必须留登记 ⇒ 「扫不干净」是花钱的，不是静默的。坐标漂移时判据红，重跑一次更新即可。"
     }
   ]
 }

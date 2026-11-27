@@ -94,6 +94,17 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 >    vision 的 id 会被 `validation_failed`「模型类型不匹配」拒，即使它已是某个现有 FDE 的绑定）；
 >    `must_change_password` 在建号与管理员重置两条路都写死 `true`（受限会话会挡业务接口），
 >    dev 直改库清掉。
+> 8. **脚本账号要跑 run，先确认它有 active LLM binding**（#802，照抄配方查假 404 的人由此拦下）：
+>    执行层的 endpoint / apiKey **恒取占位 config**，心跳下行的 `models` 只决定 model 名 ⇒ 没 binding 时
+>    run **照建照跑**，几秒后 `failed`，`error` 是上游裸 `404 page not found`——**那不是网关坏了**，
+>    是这个账号没有 binding。探法二选一：查库
+>    `SELECT state, main_model_name FROM fde_llm_bindings WHERE fde_id = <该账号 id>`（`state='active'`
+>    且 `api_key` 非空才算），或看 FDE 心跳响应里的 `models` 是否为 `null`。**不查库也能定**：run 终态的
+>    `termination.detail === 'no_llm_binding'`、执行层日志里那条 `no_llm_binding:` warn（两者同字面）。
+> 9. 开箱态可能是 `fde_onboarding` 卡在 `provision: failed`、`llm-binding` 还是 `pending`（provision 常见
+>    成因 = gitea 侧不可达）。dev 修复手法（**不是契约**）：把 `fde_onboarding.steps` 里失败的
+>    `provision` / `materialize` 手工标 `done`，**只**重跑 `llm-binding`——`portal/src/onboarding.js` 的
+>    `retryOnboarding` 只重置**第一个**失败步骤，不先手工标就会再撞同一步。
 
 ### 1.4 阶段可执行验收清单（P1 / P2 / P3）
 

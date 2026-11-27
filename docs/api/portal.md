@@ -1489,7 +1489,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 | 413 | `payload_too_large` | 请求体整体超过 **1 MiB**（`MESSAGE_BODY_LIMIT`）；`details.max_bytes` = 本端点上限（区别于全站默认的 64 KiB） |
 | 404 | `not_found` | session 不存在/不属本人 |
 | 409 | `run_in_progress` | 该 session 已有进行中 run |
-| 409 | `llm_model_not_found` | **绑定的模型在网关里已不存在**（#261014 切片 B2）：属主 active binding 的某个已配置槽位 `model_info.id` 不在网关 `/model/info` 里。`details` = `{slot, model_id}`；判据/选型理由见 §1.2。预检位置：体校验与幂等占位之后、**开业务事务与写 transcript 之前** ⇒ 失败时**不留用户消息、不入队 run、不把失败钉进幂等台账**（走 `release` 路径，同 key 可原样重试）。网关不可达时放行（消息照发）；无活绑定由下一条 `llm_not_configured` 负责 |
+| 409 | `llm_model_not_found` | **绑定的模型在网关里已不存在**（#261014 切片 B2）：属主 active binding 的某个已配置槽位 `model_info.id` 不在网关 `/model/info` 里。`details` = `{slot, model_id}`；判据/选型理由见 §1.2。预检位置：体校验与幂等占位之后、**开业务事务与写 transcript 之前** ⇒ 失败时**不留用户消息、不入队 run、不把失败钉进幂等台账**（走 `release` 路径，同 key 可原样重试）。网关不可达时放行（消息照发）；无活绑定由下一条 `llm_not_configured` 负责。**但 #802 实测**：`llm_not_configured` 的判据是「无 FDE binding **且**无启用的 text provider+model」⇒ **目录里有已启用的 text 模型时该 409 不会触发**，于是无 binding 的账号仍会建出 run、到执行层才炸成上游裸 `404 page not found`（`error.code='not_found'`、`retryable:false`）；诊断锚点 = run 终态 `termination.detail === 'no_llm_binding'` 与执行层那条 `no_llm_binding:` warn（探法与 dev 修复手法 ⇒ `docs/testing.md` §1.3 第 8/9 条；不升格成建 run 时的硬 409 = 产品判据，未动） |
 | 409 | `no_active_container` | 拉模型补充分支：该用户**从未有过任何容器记录**（containers 无非 removed 行，无法确定 run 归属与入队目标）——落库即 202 前提是存在容器行（runs.container_id 非空）；已有但离线的容器不受此码影响（§6.3） |
 | 429 | `rate_limited` | 已知该用户 LLM 配额耗尽（上次 run 已确认），直接拒绝避免再烧配额（§6.1） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）：FDE 容器不在线/不可达且**不产生** message/run 记录；拉模型（终态）落库即 202、不返回此码（§6.3） |

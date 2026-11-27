@@ -572,6 +572,23 @@ async function startRun(msg) {
   // 旧 agentd / 无配置（msg 无 models）→ 占位 config 的 model 名（现状行为）。endpoint/key 始终走占位文件。
   // models 只经 IPC 内存传递，**不写任何文件/日志**。
   const modelName = resolveRunModel(defaultCfg.model, msg.models);
+  // issue #802：心跳的 `models` 为 `null` = 该 FDE **没有 active LLM binding**（portal
+  // `getFdeLlmHeartbeatModels` 查不到 `state='active' AND gateway='litellm' AND api_key <> ''` 的行）。
+  // 而上面的 endpoint / apiKey **恒取占位 config 文件** ⇒ 这次 run 会往**占位 endpoint**发请求，上游回
+  // 裸 404（`{"code":"not_found","message":"404 page not found\n"}`）——那句 404 既不说「没有 binding」
+  // 也不指到该看的那一格。这里只补**可诊断性**：不改行为、不改 reason、不升格成硬 409（产品判据不在本单）。
+  // ⚠ 判据是 `msg.models == null`（旧 agentd 不带该键也算），**不是**「models.main 缺失」——后者是
+  //   另一种形状（有 binding 但没主模型名），别混。字面 `no_llm_binding` 是运维 grep 锚点，与
+  //   `termination.detail` 同一个串（lib/termination.js）。
+  // ⚠ 只在 run 开头调**一次**（不在重试/循环里），也**不新增事件类型**（同一个 MSG.LOG，#309 先例）。
+  const noLlmBinding = msg.models == null;
+  if (noLlmBinding) {
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'warn',
+      msg: 'no_llm_binding: heartbeat models is null ⇒ this FDE has no active LLM binding; '
+        + 'the run will use the placeholder endpoint and is expected to fail with an upstream 404',
+    });
+  }
   // issue #309 切片 2：把下行元数据（context_window / max_output_tokens）喂给引擎，并**显式**发输出上限。
   // 为什么值得接：缺这两个数时引擎的压缩总开关不进入（budgetTokens 未定义→overBudget 恒 false）、
   // 单轮聚合输出预算整体关闭、输出截断上限退回 4096，而此前全链路零告警（真机 92 轮 run compaction=0）。
@@ -1393,7 +1410,11 @@ async function startRun(msg) {
     // 前端据此把终态行刷中性并抑制「重试上一条」。注意用的是**快照**：上面的 abort 会把标记清零，
     // 而「这次是不是转向」这件事必须一路带到终态信封。
     const steered = steerArmed || steeredThisRun;
-    const { termination, error, usage, rounds } = buildFailureEnvelope({ err, aborted, steered });
+    // issue #802：`noLlmBinding` 是 run 开头算好的 **const 快照**（本来就不会被 abort 清零，与 steered
+    // 同理由）；它也只往 `termination.detail` 补一个 `no_llm_binding`（不改 reason、不覆盖引擎 detail，
+    // 与 steered 同口径 ⇒ 两者同时成立时 steered 优先）。用户面因此能从终态直接看出「是没配模型」，
+    // 而不是只拿到上游那句裸 404。
+    const { termination, error, usage, rounds } = buildFailureEnvelope({ err, aborted, steered, noLlmBinding });
     // issue #442（erix-agent 0.30.0 / 上游 #661）：折叠摘要器失败**现在是终局错误**（不再静默降级成
     // 统计摘要）⇒ 这次失败必须在运维账上说得清是哪一类。只读 LOG 的人不能只看到 `run failed: failed`。
     // ⚠ 只记日志、**不改终态也不改事件**（终态是引擎判的；界面那一半是 `run_end` 的红色面）。
