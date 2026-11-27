@@ -211,6 +211,28 @@ docker exec $DB_NAME pg_isready -U station -d station_test -t 15
   ⇒ 带 PG 跑全量 `npm test` **不需要**人工拆文件跑，也不要把锁当残留去 `rm`（`STATION_TEST_LOCK_TIMEOUT_MS`
   缺省 900s，拿不到锁宁可红一条也不吊死整条 `npm test`）。
 
+##### 一条命令跑全部真库腿：`scripts/real-db-legs.sh`（工具，不是闸）
+
+上面那条总开关的另一面：**不设 `TEST_DATABASE_URL` 时这些文件整文件 skip，而 skip 既不红也不绿**
+⇒ 真库腿里的判据可以漂很久都没人看见（判据存在 ≠ 判据生效）。`scripts/real-db-legs.sh` 把
+「按本节起一台一次性 PG → **现取**真库文件清单 → 带着 `TEST_DATABASE_URL` 跑 → 删容器」
+收成一条随手能跑的命令，让「所有真库文件默认永远 skip」这件事至少有一条命令能当场翻篇：
+
+```bash
+./scripts/real-db-legs.sh          # 起一次性 PG → 现取清单 → 跑 → 删容器；退出码原样传出
+./scripts/real-db-legs.sh --keep   # 跑完不删容器，打印容器名与连接串，方便反复调同一台
+```
+
+- **清单是现取的**（`grep -rl SKIP_WITHOUT_PG portal/test test`），脚本里不写死文件名也不写死个数
+  （与本节口径一致）：新增真库文件只要接进 `SKIP_WITHOUT_PG` 这个入口，就自动被这条命令覆盖。
+- **判定只认退出码**（AGENTS.md §4）：末行 `real-db-legs: rc=<n> files=<n>` 里的 `rc` 是 `node --test`
+  的退出码原样；脚本另把 `# pass` / `# fail` / `# skipped` 三行原样透出来，那只是给人看的。
+  `skipped` 不为 0 = 这些文件其实没连上 PG，等于这条腿没跑。
+- **它不是门禁**：CI 里没有 PG ⇒ 这些文件在 CI 里**仍然 skip**，这条脚本不会替 CI 把它们变绿；
+  要不要给 CI 加 PG service，在 issue #873 里等拍。
+- 它按本节口径起的是**一次性**实例（绝不指向真库 `station-db`），宿主端口与镜像可用
+  `--port` / `--image` 覆盖（宿主端口占用实况属本机坐标 ⇒ 冷层，见 AGENTS.md §5）。
+
 #### 2.2.2 schema.sql 空库可执行性（D3 验收锚点，集成层）
 
 ```bash
