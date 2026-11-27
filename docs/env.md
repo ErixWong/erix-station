@@ -464,7 +464,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 `STATION_DB_NAME` / `STATION_PORTAL_NAME` / `STATION_EDGE_NAME` / `STATION_LITELLM_NAME` / `STATION_DOCKER_PROXY_NAME`：compose 各服务的 `container_name:` 插值位（判据：compose `:17` `:62` `:116` `:342` `:388`），**缺省值就是 §本文其它处写的实名**（`station-db` 等）。
 
 - **谁读它**：只有 Docker（命名）与「按容器名找人」的运维/e2e 命令。portal **不读**——它找 FDE 容器只从 DB（`containers.container_name`，AGENTS §5）。
-- **改了会怎样**：服务间 DNS **不受影响**（`backend` 网络里解析的是 compose **服务名**，如 portal 的 `DATABASE_URL` 指 `station-db:5432`），但按容器名找人的脚本会失配——`portal/integration/lib/isolated-env.mjs:33` 就把 `station-portal` / `station-edge` 当**硬编码缺省**。
+- **改了会怎样**：服务间 DNS **不受影响**（`backend` 网络里解析的是 compose **服务名**，如 portal 的 `DATABASE_URL` 指 `station-db:5432`），但按容器名找人的脚本会失配——`portal/integration/lib/isolated-env.mjs:33-35`（`:33` 是 portal 容器名、`:35` 是 edge 容器名，别只引 `:33`） 就把 `station-portal` / `station-edge` 当**硬编码缺省**。
 - **为什么欠着**：隔离栈并行跑时要换名（同名 `container_name` 冲突），这层需求只出现在 e2e，所以从未进本表。
 
 **类 B：镜像构建期入参（3 个，**不是部署旋钮**，是构建/发布流水线该管）**
@@ -489,7 +489,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 |---|---|---|---|
 | `STATION_DB_DIR` | `station-db` 数据目录的**宿主 bind source**（缺省 `/docker/station-db`） | compose `:35`；隔离 e2e 硬要求：`portal/integration/lib/isolated-env.mjs:205-211`（**缺省即抛**，不再回退共享目录） | ⚠ 沿用缺省去跑并行隔离栈 ⇒ 两个 `station-db` 抢同一份宿主数据目录（#226 取证）；`ci-release.md` §6 已把「`STATION_DB_DIR` 必须在临时目录」列进 e2e 前置。本文此前只在 §10 写过台账名 `DB_DATA_DIR`（⇒ §10.7） |
 | `TRAEFIK_STATIC_HOST` | 整体**替换** Traefik 静态配置文件（缺省 `./traefik/traefik.yml`） | compose `:410`（注释 `:400` 记了为什么不能走 CLI 覆盖：v3 带 `--configFile` 时文件里的 entryPoints 压过 CLI） | 并行隔离栈靠它换一份只改入口端口的静态文件；填错 ⇒ 边缘直接起不来 |
-| `ERIX_ARTIFACTS_ROOT_HOST` | run 终态产物卷的**宿主侧**路径（容器内路径是 `ERIX_ARTIFACTS_ROOT`，compose `:193`） | compose `:165`；契约 [`design/deploy-contract.md`](design/deploy-contract.md) §2.2 已登（本表此前漏了宿主侧这一半） | 与 `ERIX_USERSPACE_ROOT_HOST` 同族：改宿主路径不动容器内路径；产物丢失面 = 该目录被清 |
+| `ERIX_ARTIFACTS_ROOT_HOST` | run 终态产物卷的**宿主侧**路径（容器内路径是 `ERIX_ARTIFACTS_ROOT`，赋值在 compose `:194`——`:193` 只是它上面的注释行；宿主挂载源在 `:165`） | compose `:165`；契约 [`design/deploy-contract.md`](design/deploy-contract.md) §2.2 已登（本表此前漏了宿主侧这一半） | 与 `ERIX_USERSPACE_ROOT_HOST` 同族：改宿主路径不动容器内路径；产物丢失面 = 该目录被清 |
 
 ### 10.7 台账名 vs 实现名：两类必须分开讲（#777 批 D2，261128 现验）
 
@@ -504,7 +504,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `USER_SPACE_ROOT`（本文 §6 / §9 / §10 多处；条数别抄本行，`grep -cw USER_SPACE_ROOT docs/env.md` 现读） | compose **0** / 代码 **0** | 容器内路径：`ERIX_USERSPACE_ROOT`（`portal/src/config.js:331` 读，compose 以固定值写死）；宿主侧路径：`ERIX_USERSPACE_ROOT_HOST`（compose 插值 4 处）。⇒ 三个名字是**三层**（文档台账 / 容器内 / 宿主侧），不是新旧名 |
 | `DATA_ROOT`（本文 §6 / §9 / §10 多处；同上，现读） | compose **0** / 代码 **0** | 没有同名 env：各条 bind source 各自一根（pg = `STATION_DB_DIR`，边缘 = `TRAEFIK_STATIC_HOST` / `TRAEFIK_DYNAMIC_DIR_HOST`）。`DATA_ROOT` 只是**布局约定**（`<DATA_ROOT>/<名称>/`） |
 | `DB_DATA_DIR`（本文 §10 + 本小节多处） | compose **0** / 代码 **0** | `STATION_DB_DIR`（⇒ §10.6 类 D）——这一格此前是「文档起了个名，实现用了另一个名字」，不是「已改名」 |
-| `TRAEFIK_CONFIG_DIR` / `FIREWALL_RULES_PATH`（§10 各一行 + 本小节引用） | compose **0** / traefik.yml **0** / 代码 **0** | 无 ⇒ 属类 II |
+| `TRAEFIK_CONFIG_DIR`（§10 一行） | compose **0** / traefik.yml **0** / 代码 **0** | 无同名 env ⇒ **分类归类 II**（静态配置实挂 `${TRAEFIK_STATIC_HOST}`，见下表）；本行只登记「文档里出现过这个名字」 |
 
 **类 II：设计已写、实现未落地（部署面台账，不许当成现状）**
 
@@ -513,6 +513,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | ACME / DNS-01 自动签发（`ACME_EMAIL`、`DNS_PROVIDER` + API token） | §2、§10、附录 A | `grep -n "certificatesResolvers\|acme" deploy/traefik/traefik.yml deploy/docker-compose.yml` ⇒ 只有 compose `:413` 那句「开发期无 acme.json」的注释 | ❌ **未落地**：本仓没有 `certificatesResolvers` 段，已落地的只有「证书由运维手放 + portal `tlsassets` 物化 `dynamic/tls.yml`」（§2 的 2026-11-05 修订已记，本行只补判据） |
 | 分层防火墙（`FIREWALL_ENABLED`、`FIREWALL_RULES_PATH`/`rules.v4`） | §5.3、§10 | `grep -rn "firewall\|rules\.v4\|nft" deploy/docker-compose.yml deploy/traefik/traefik.yml portal/src runner` ⇒ **0 命中** | ❌ **未落地**：§5.3 是**模型**（规则怎么生成），仓库里既没有写 `rules.v4` 的代码，compose 也没挂 `firewall/` 目录；deploy-contract §2.2 的 portal 卷 ③ 也标着「接入防火墙时启用」⇒ 部署时要按 §5.3 手工落规则，平台不会替你落 |
 
+| Traefik 静态配置目录可换（`TRAEFIK_CONFIG_DIR`） | §10 | `grep -rn "TRAEFIK_CONFIG_DIR" deploy portal runner` ⇒ **0** | **未落地**：静态配置是**单文件** bind（`${TRAEFIK_STATIC_HOST:-./traefik/traefik.yml}` → `/etc/traefik/traefik.yml`），不是「目录可换」 |
 > 两类的共同纪律：**条目留着**（它们是「欠的账」，删了就等于账没了），但**取值列不许写成已落地的事实**；要推进就另单做，不许拿「本表已有这一行」当现状。
 
 ---

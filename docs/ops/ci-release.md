@@ -277,11 +277,10 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
   现在是两个互不相干的真相源：往 `REQUIRED_LEGS` 加一条而忘在 workflow 里接上（或反向：workflow 里删了步骤而清单没动），
   两边都不会红——本文 §4.1 上面那句「此前只列两条」就是靠 `check:doc-impl` 的**文档↔清单**比对才暴露的，
   而「清单↔workflow」那一腿至今没有机器比对。
-- **判据（要做就按这个做）**：从 `.github/workflows/ci.yml` 解析出全部 `run:` 步骤里出现的命令集合（至少认两种形态：
-  `npm run test:integration:*` 与 `node --test <路径>`，外加 `npm run check:ci-legs` 这一条），与 `REQUIRED_LEGS` 的 `id`/`argv`
-  归一后比对；**差集非空即 rc=1** 并点名是哪一边缺。
+- **判据（要做就按这个做；**本节写的是工具提案，今天还不能当闸开**）**：从 `.github/workflows/ci.yml` 解析出全部 `run:` 步骤里出现的**直接命令**集合（至少认三种形态：`npm run test:integration:*`、`node --test <路径>`、`npm run check:ci-legs`），与 `REQUIRED_LEGS` 的 `id`/`argv` 归一后比对；**目标腿的「直接命令」缺任意一条即 rc=1** 并点名缺哪条、在哪一边。
+  - **口径必须先定死两件事，否则一上就满屏假红**：① **算不算间接执行**——`npm test` 会间接跑到许多测试，但**不算**目标腿的直接命令；② **「合法缺席清单」放在哪**——必须是**同一个文件里带理由的具名清单**（例如 `REQUIRED_LEGS` 上加 `absentInCi: <一句话理由>`），不许用「文档里某处说过它不在 CI」这种要人肉对齐的说法。
 - **今天跑这条判据会得什么**（别把「红」误读成回归）：`REQUIRED_LEGS` 3 条，`ci.yml` 的 `run:` 步骤里**一条都没有**
-  （现验：`grep -n 'npm run\|node --test' .github/workflows/ci.yml` ⇒ 只有注释行与 `npm test`；闸本体 261125 起就不进 CI）
+  （现验两路：`grep -n 'npm run\|node --test' .github/workflows/ci.yml` ⇒ 只有注释行与 `npm test`；**另一路独立 YAML 解析** ⇒ workflow 里 **7 条 `run:` 步骤**、`REQUIRED_LEGS` **3 条**、三条目标腿的**直接命令命中 0 条**（缺的正是 `migrate-fresh-db`、`test:integration:prompts`、`api-tokens-db`）；闸本体 261125 起就不进 CI）
   ⇒ **差集非空是预期**，所以解析器要带「合法缺席清单」（本文 §4.1 已声明「本腿不在 CI」的那些腿必须写进那份清单），
   否则一上就满屏假红。这也是为什么它是**工具**而不是今天能直接开的闸。
 - **本单刻意没动它**：那是个解析器（要读 YAML、要定归一口径），不是闸本体；混进本单会让「文档纠偏」的 diff 里跳出一段工具代码。
