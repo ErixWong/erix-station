@@ -17,34 +17,6 @@
       "reason": "本人 git 凭证 GET/PUT/DELETE 未登记 portal.md（#777 S1 抓到），另有修刀补登记（#777 D 组）"
     },
     {
-      "pair": "GET /api/macro-templates",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "DELETE /api/macro-assignments/:P",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/macro-assignments",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "PUT /api/macro-assignments",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/notifications/unread-count",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "POST /api/notifications/:P/read",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/notifications",
-      "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
-    },
-    {
       "pair": "GET /api/sessions/:P/macro-assignments",
       "reason": "宏/通知面在 docs/api/portal.md 零登记（#614/#623 落地时只写了代码；#777 S1 首轮抓到），另有修刀补契约（#777 D 组）"
     },
