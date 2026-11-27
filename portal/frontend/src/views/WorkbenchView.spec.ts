@@ -254,7 +254,7 @@ describe('issue #281：onMounted 的 await 失败 ⇒ 零未捕获拒绝 + 界�
     await router.isReady();
     const wrapper = mount(WorkbenchView, { global: { plugins: [pinia, router, i18n] } });
     await tick(60); // 让 onMounted 里在途的 promise 在**本条用例内**落地
-    return { wrapper, store: useWorkbenchStore() };
+    return { wrapper, store: useWorkbenchStore(), router };
   }
 
   const syserrTexts = (store: ReturnType<typeof useWorkbenchStore>) =>
@@ -403,13 +403,17 @@ describe('issue #281：onMounted 的 await 失败 ⇒ 零未捕获拒绝 + 界�
     });
 
     it('#863 换会话（路由参数变化 → watcher 那一路）抛错 ⇒ 零未捕获拒绝 + 可见错误行', async () => {
-      const { wrapper, store } = await mountWithSessionOpen();
+      const { wrapper, store, router } = await mountWithSessionOpen();
       stubThrowingEventSource();
       // 点的是**另一个**会话 ⇒ onSelectSession 走 `router.push` ⇒ `route.params.id` 变 ⇒ watcher 触发。
       // 断言只盯 watcher 那一路的收尾（删掉 watcher 的 catch 时这条必须红，见工单变异 1）。
       wrapper.findComponent(SidebarPanel).vm.$emit('select-session', 's2');
       await tick(60);
-      expect(store.sessionId, '前置自检：路由确实换到了 s2（否则这条根本没走 watcher）').toBe('s2');
+      // 前置自检用**路由参数**而不是 `store.sessionId`：`openSession` 先设 id（`workbench.ts:1198`）、
+      // `es.connect()` 是**最后一句**（`:1273`）⇒ 收尾抛错时会话已经切过去了但**没有实时流**（#863 的
+      // copilot 复核 LOW：拿 id 当判据会把这种「部分打开」固定进测试）。路由参数变了才是「走到了 watcher」
+      // 的直接证据；「部分打开」该怎么收（回滚 / 标注未连接 / 重试）另开单跟。
+      expect(router.currentRoute.value.params.id, '前置自检：路由确实换到了 s2（否则这条根本没走 watcher）').toBe('s2');
       expect(syserrTexts(store).join('\n'), '失败必须变成看得见的错误行').toContain('会话加载失败');
       expect(leaked.map(describeRejection), `泄漏 ${leaked.length} 条未捕获拒绝`).toEqual([]);
     });
