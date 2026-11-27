@@ -103,6 +103,12 @@
 | 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
 | 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **未交付**（同上；internal 面 U10/U11 保留作协议留档）|
 | LLM 管理 | `GET /api/admin/llm/providers` | 供应商 + 模型列表（模型对象的两个名字见 §4.9） |
+| LLM 管理 | `POST /api/admin/llm/providers` | **新建 credential**（一个供应商 = 一条 LiteLLM credential）：`{(credential_name\|name), base_url?, api_key?, description?, credential_info?, credential_values?}` ⇒ **`201`** `{provider}`，响应里 `models` **恒为 `[]`**（§4.9-6）|
+| LLM 管理 | `PATCH /api/admin/llm/providers/:id` | **改 credential**：`{base_url?, credential_info?, credential_values?}`；⚠ **带 `enabled` 就 `400`**——credential **没有启停**语义（§4.9-6）|
+| LLM 管理 | `DELETE /api/admin/llm/providers/:id` | 删 credential ⇒ **`204` 无体**；它名下的模型一并消失（§4.9-6）|
+| LLM 管理 | `GET /api/admin/llm/models` | **模型目录全量**（唯一真相源 = LiteLLM 的 DB，本站只转发 + 投影）⇒ `{items:[…]}`，**无分页、无筛选参数**（§4.9-6）|
+| LLM 管理 | `POST /api/admin/llm/models/:id/block` | **停用模型**（本站唯一的启停入口）：无 body ⇒ `{model_id, enabled:false}`，转发上游 `POST /model/block`（§4.9-6）|
+| LLM 管理 | `POST /api/admin/llm/models/:id/unblock` | **启用模型**：无 body ⇒ `{model_id, enabled:true}`，转发上游 `POST /model/unblock`（§4.9-6）|
 | LLM 管理 | `POST /api/admin/llm/providers/:id/models` | 新增模型 |
 | LLM 管理 | `PATCH /api/admin/llm/models/:id` | **改模型：调用名 `call_name`（数据面）与显示名 `name` 是两个字段**（#296，§4.9） |
 | LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」——**当前无实现 ⇒ 404**（#777 A1）|
@@ -143,7 +149,7 @@
 > 改名这条线的契约仍见 §4.9；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 > 另：`POST /api/admin/llm/providers`、`PATCH|DELETE /api/admin/llm/providers/:id`、
 > `GET /api/admin/llm/models` 与 `POST /api/admin/llm/models/:id/block|unblock`
-> （`http.js:1927/1965/1995`）**已实现但无契约**，只在正文散文里出现过 —— 待补写（#777 A 组）。
+> （`http.js:2014-2023`、`:2025-2040`、`:2052`、`:2082-2088`）**已实现且现已在册**：契约见 §4.9-6（#777 A2 补登记）。
 > 心跳对账的口径仍见；登记这几行是为了「端点索引与文档自洽」（§7.13）。
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
@@ -2668,6 +2674,77 @@ SELECT fde_id FROM fde_llm_bindings
   改名已在网关落定，把 PATCH 拖成 500 只会诱导管理员重试第二次改名；不自动回滚的理由同 §8.25。
 - 「门户内改名不是漂移源」这句话从此要打个补丁：**改名会把引用它的 FDE 变成漂移**（`*_model_name`
   暂时指向旧名），立即对账就是为了让这个窗口尽量短——就地注释见代码。
+
+#### 4.9-6 供应商写面、模型目录与封禁/启停（#777 A2 补登记）
+
+本节**只写本站侧的契约 + 转发了上游哪个动作**。三条口径先说死（不然本节就会被读成「LiteLLM 的字段就是本站契约」）：
+
+- **模型目录的唯一真相源是 LiteLLM 的库**，本站**不落库**：`GET /api/admin/llm/models` 就是上游 `GET /model/info` 的
+  投影（`llm-gateway.js:155` → `llm.listModels` `llm.js:290-293`）。供应商（credential）同理，上游是 `GET/POST /credentials`
+  与 `PATCH|DELETE /credentials/{name}`（`llm-gateway.js:141`、`:161-164`）——**一个供应商 = 一条 credential**（1:1）。
+- **启停语义只有一个：模型的 `block` / `unblock`**。credential **没有**启停：`PATCH` body 里带 `enabled` 会被**当场拒**
+  （`llm.js:412-419`，文案「LiteLLM credential 不支持启停；请删除 credential 或管理其模型」，`details.field='enabled'`）。
+  读侧的 `enabled` 也不是本站的列，而是从上游封禁位**推出来的**：`enabled = !(model_info.blocked === true)`（`llm.js:138-140`、`:258`）。
+- **改 FDE 可用模型范（白名单）不走本节**：那是 per-FDE 虚拟 key 的白名单，口径是「`/key/update` 扩名单，
+  **不重铸 key**」（§4.9 末段的 #289/#296 对账链）。本节的写面只动 credential / deployment，**不碰 key**。
+
+| 方法 + 路径 | 本站侧请求 | 本站侧成功响应 | 转发的上游动作 |
+|---|---|---|---|
+| `POST /api/admin/llm/providers` | `{ credential_name \| name（必填）, base_url?, api_key?, credential_info?, credential_values? }`（走 §1.5 的 `requireJson`）| **`201`** `{ provider }` | `POST /credentials`（body：`credential_name` / `credential_info` / `credential_values`）|
+| `PATCH /api/admin/llm/providers/:id` | `{ base_url?, credential_info?, credential_values? }`；⚠ **`enabled` 任何值 ⇒ `400`**；其余键被忽略 | `200` `{ provider }` | `GET /credentials`（仅「只改了 `base_url`」时先取现状）+ `PATCH /credentials/{name}` |
+| `DELETE /api/admin/llm/providers/:id` | 无 body | **`204` 无响应体** | `DELETE /credentials/{name}` |
+| `GET /api/admin/llm/models` | **无参数**（给了也不读）、**无分页** | `200 { items: [模型对象] }` | `GET /model/info` |
+| `POST /api/admin/llm/models/:id/block` | **不读 body** | `200 { model_id, enabled: false }` | `POST /model/block`（body `{model_id}`）|
+| `POST /api/admin/llm/models/:id/unblock` | **不读 body** | `200 { model_id, enabled: true }` | `POST /model/unblock`（body `{model_id}`）|
+
+**路径参数的身份（容易误读）**：`:id` 在供应商两条上是 **credential 名**（不是 UUID），在模型三条上是上游的
+`model_info.id`（`llm.js:142-144`）。两者都只过 `decodeURIComponent`（`http.js:2027`、`:2059`、`:2084`），
+**不校形状**；查不到时本站**不兜**（只有「只改 `base_url`」那一支会先查一次现状并给 `404`，`llm.js:421-426`），
+其余全部原样交给上游，由上游的错误经 `LlmGatewayError` 映射成 `llm_gateway_error` 且**状态码原样透传**
+（`http.js:1092-1094`，所以上游回 401/403/404/5xx 就是那个数，不是恒 5xx）。
+
+**`provider` 对象的键（逐字，`toProvider`，`llm.js:265-278`）七键**：`id`（= credential 名）、`name`
+（`credential_info.display_name ?? credential_info.name ?? 名`）、`base_url`（`credential_values.api_base ??
+.base_url ?? ''`）、`api_format`、`credential_info`、`credential_values`、`models`。⚠ 三件事：
+
+1. **`api_format` 是本站写死的字面量 `'openai'`**（`llm.js:273`），**不是从上游读的**——它只是 DTO 形状的一部分，
+   不得当成「本站支持多种 API 格式」的契约（历史上它是本地表 `llm_providers.api_format` 的残留形状，该表已退役，见
+   [`../data/model.md`](../data/model.md) 的退役标注）。
+2. **写面的 `models` 恒为 `[]`**（`toProviderMutationResult` 传的就是空数组，`llm.js:280-288`）：POST/PATCH 的响应**不**
+   顺带返回模型列表，前端改完必须重拉一次 GET。只有 `GET /api/admin/llm/providers` 会给真列表（§0.1 已登记那条）。
+3. **`credential_info` / `credential_values` 是上游对象的脱敏透传**：只对键名形如 `api_key`/`master_key` 的字符串做
+   `maskKey`（`sk-...<后 4 位>`，短于 8 字符 ⇒ `***`；`llm.js:45-48`、`:98-105`），**其余键原样回显**。⇒ 上游改了这两个
+   字典里的键名，响应也会跟着变；前端**不得依赖其内部键集**（除本站明确读的 `api_base` / `api_key`）。
+   响应**永不回显密钥明文**。
+
+**`POST` 的字段归一（`createProvider`，`llm.js:389-410`）**：名字取 `credential_name ?? name`，trim 后为空 ⇒
+`400 validation_failed` + `details.field='name'`（**`details.field` 是 `name`，不是 `credential_name`**）。没给 `credential_info` 时本站**代填**
+`{ credential_name: <trim 后的名>, description: <input.description ?? 名> }`；`base_url` / `api_key` **不是独立列**，而是分别写进
+`credential_values.api_base` / `credential_values.api_key`（只在这两个键 `!== undefined` 时写，所以传 `null` 会真的把 `null` 发给上游）。
+
+**`PATCH` 的两步语义与一个陷阱（`updateProvider`，`llm.js:412-436`）**：只给 `base_url`（没给 `credential_values`）时，本站先
+`GET /credentials` 找到同名 credential（**找不到 ⇒ `404 not_found`**，`llm.js:423-424`），再只发 `{ api_base }`；给了 `credential_values`
+则**不预查**（不存在的 credential 会拿到上游的错，不是本站的 404）。⚠ 陷阱：发往上游的 body 里 `credential_info` **永远存**
+（没给就是 `{}`，`llm.js:427-430`）——那是**本站的形状**，不是 LiteLLM 要求空字典。
+
+**`DELETE` 的连带面与幂等**：本站**不预查**「还有没有模型挂在它下面」，也不查 `fde_llm_bindings` 引用；上游删 credential
+会连带改变模型目录（`llm.js:438-443` 的注释与缓存失效就是为此）。重复删第二次**不是本站幂等**：本站不兜「已删」，
+第 N 次的结果完全等上游回答（因此「删不存在的 ⇒ `204`」这说法**本站侧不成立**，不得写进前端）。
+
+**模型对象的键（逐字，`toModel`，`llm.js:233-263`）十七键**：`id`、`provider_id`、`model_id`、`model_name`、`name`、`type`、
+`tool_calling`、`context_window`、`max_tokens`、`max_output_tokens`、`enabled`、`input_cost_per_token`、`output_cost_per_token`、
+`pricing_configured`、`pricing_source`、`litellm_params`、`model_info`。本节**只订形状来源**，不重写语义：两个名字（`model_name` 调用名
+vs `name` 显示名）见上方 #296 那一段，`context_window` / `max_output_tokens` 的写侧校验见上面两节，价目口径见 §8.31。
+⚠ **`model_id` 是 `id` 的重复别名**（同一个 `modelId(model)` 产物），不是另一个字段；`litellm_params` / `model_info` 同样是
+**上游字典的脱敏透传**（前端不得当本站契约读，除本站明确用的 `model_info.blocked` / `context_window` / `max_output_tokens` 等）。
+⚠ **`type` 是推导值**（`modelType`，`llm.js:119-129`）：先看上游 `model_info.type` / `model_type` / `metadata.type` / `metadata.model_type`
+是否在**七值名单** `text` / `embedding` / `vision` / `rerank` / `audio-tts` / `audio-stt` / `image-gen`（`llm.js:10`）里，否则按
+`mode` 推（`embedding` / `image_generation` / `rerank`），**都不中 ⇒ `text`**。⚠ **读侧七值 ≠ 写侧四值**：本节上面的
+`PATCH` 表只接受 `text` / `embedding` / `rerank` / `vision`，`audio-tts` / `audio-stt` / `image-gen` **写不进去**（只能从上游读出来）。
+
+**封禁两条的响应不是事实、是推导**：`{ model_id, enabled }` 里 `model_id` 是**路径参数原样回显**，`enabled` 是按动作算的常量
+（`block` ⇒ `false`、`unblock` ⇒ `true`，`http.js:2087`）——**本站不读回目录、也不写库、不写审计**。要确认封禁真的生效，
+只能再拉一次 `GET /api/admin/llm/models` 看 `enabled`（或 `model_info.blocked`）。
 
 ### 4.10 管理台 FDE 周期额度与用量（`/api/admin/fdes/:fde/llm/budget` · `/usage`，#719）
 

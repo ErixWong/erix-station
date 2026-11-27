@@ -17,30 +17,6 @@
       "reason": "本人 git 凭证 GET/PUT/DELETE 未登记 portal.md（#777 S1 抓到），另有修刀补登记（#777 D 组）"
     },
     {
-      "pair": "POST /api/admin/llm/providers",
-      "reason": "provider 写面/models/封禁端点仅正文提及、索引行缺（#777 S1 抓到），另有修刀补索引行（#777 D 组）"
-    },
-    {
-      "pair": "PATCH /api/admin/llm/providers/:P",
-      "reason": "provider 写面/models/封禁端点仅正文提及、索引行缺（#777 S1 抓到），另有修刀补索引行（#777 D 组）"
-    },
-    {
-      "pair": "DELETE /api/admin/llm/providers/:P",
-      "reason": "provider 写面/models/封禁端点仅正文提及、索引行缺（#777 S1 抓到），另有修刀补索引行（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/admin/llm/models",
-      "reason": "provider 写面/models/封禁端点仅正文提及、索引行缺（#777 S1 抓到），另有修刀补索引行（#777 D 组）"
-    },
-    {
-      "pair": "POST /api/admin/llm/models/:P/block",
-      "reason": "provider 写面/models/封禁端点仅正文提及、索引行缺（#777 S1 抓到），另有修刀补索引行（#777 D 组）"
-    },
-    {
-      "pair": "POST /api/admin/llm/models/:P/unblock",
-      "reason": "provider 写面/models/封禁端点仅正文提及、索引行缺（#777 S1 抓到），另有修刀补索引行（#777 D 组）"
-    },
-    {
       "pair": "POST /api/admin/users/:P/onboard/retry",
       "reason": "§2.9 仅正文提及 onboard/retry（:5319），索引行缺（#777 S1 抓到），另有修刀补登记（#777 D 组）"
     },
