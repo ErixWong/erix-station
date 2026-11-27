@@ -166,24 +166,31 @@ export function isExpiryIntent(intent) {
   return intent?.criterion === 'tick' && intent?.bucket === EXPIRY_BUCKET;
 }
 
-/** 到期通知的正文：说清「到什么时候了、已停用」，而不是通用的「触发（tick）」。 */
+/**
+ * 到期通知的正文：说清「到什么时候了、已停用」，而不是通用的「触发（tick）」。
+ *
+ * issue #850：标题给**键 + 参数**（写入方是调度器：没有人、没有请求、没有语言），`title` 仍给成品
+ * 中文当回退面（存量行、键未登记、老读侧都靠它）。body 本单不动（嵌的是调度器算出的句子）。
+ */
 function expiryText(intent) {
   const name = intent?.templateName ?? '?';
   const until = intent?.evidence?.until;
   const untilText = until ? `到期时刻 ${until}` : '已到到期时刻';
   return {
     title: `宏「${name}」已到期`,
+    titleKey: 'notifications.macroExpired',
+    titleParams: { name },
     body: intent?.evidence?.message ?? intent?.evidence?.body
       ?? `宏「${name}」${untilText}，订阅已自动停用（正常生命周期结束，不是失败）。`,
   };
 }
 
-/** 通知类意图的标题/正文（run-notify / run-silence-alert 共用）：优先用意图 evidence 里的文案。 */
+/** 通知类意图的标题/正文（run-notify / run-silence-alert 共用）：优先用意图 evidence 里的文案。标题同 #850：键 + 参数，`title` 留回退。 */
 function notifyText(intent) {
   const name = intent?.templateName ?? '?';
   const body = intent?.evidence?.message ?? intent?.evidence?.body
     ?? `宏「${name}」触发（${intent?.criterion ?? ''}）。`;
-  return { title: `宏「${name}」`, body };
+  return { title: `宏「${name}」`, titleKey: 'notifications.macroTriggered', titleParams: { name }, body };
 }
 
 // ── issue #662 C/D：审查 run 的真实执行体 ─────────────────────────────────────────
@@ -324,10 +331,10 @@ export function createIntentDispatcher({
     // 到期先于 kind 分派（#624）：否则 `scheduled-task` 的到期会真的再起一个 run。
     if (isExpiryIntent(intent)) {
       // 到期 = 正常结束 ⇒ `done`；说一声走同一个 `deliverIntent`（无消费者就没人知道它停了）。
-      const { title, body } = expiryText(intent);
+      const { title, body, titleKey, titleParams } = expiryText(intent);
       await deliver(pool, intent, {
         recipients: intent.userId ? [intent.userId] : [],
-        success: true, title, body, now: nowVal(),
+        success: true, title, body, titleKey, titleParams, now: nowVal(),
       });
       await finishMacroRun(pool, { macroRunId, status: 'done' });
       return;
@@ -375,10 +382,10 @@ export function createIntentDispatcher({
       case 'run-notify':
       case 'run-silence-alert': {
         // ⚠ 收件人是**普通用户**（intent.userId），不是 admin：deliverIntent 自己会挡「全管理员」情形。
-        const { title, body } = notifyText(intent);
+        const { title, body, titleKey, titleParams } = notifyText(intent);
         await deliver(pool, intent, {
           recipients: intent.userId ? [intent.userId] : [],
-          success: true, title, body, now: nowVal(),
+          success: true, title, body, titleKey, titleParams, now: nowVal(),
         });
         // deliverIntent 不碰账 ⇒ 由 dispatcher 收尾。
         await finishMacroRun(pool, { macroRunId, status: 'done' });

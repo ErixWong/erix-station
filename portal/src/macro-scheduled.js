@@ -303,6 +303,9 @@ async function failRun({ pool, intent, notifyImpl, log, sessionId, childRunId, r
       recipients: intent.userId ? [intent.userId] : [],
       success: false,
       title: `宏「${intent.templateName ?? '?'}」执行失败`,
+      // #850：标题同时存键 + 参数（写入方是调度器，没有语言），`title` 仍是成品中文（回退面）。
+      titleKey: 'notifications.macroFailed',
+      titleParams: { name: intent.templateName ?? '?' },
       body: reason,
     });
   } catch (err) {

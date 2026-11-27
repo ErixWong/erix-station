@@ -2312,6 +2312,13 @@ export const en = {
     failed: 'Failed to load notifications',
     empty: 'No notifications',
     markRead: 'Mark as read',
+    // issue #850: notification titles are stored as **key + params** (the writer is the scheduler —
+    // no reader, no request, no locale) and rendered in the reader's own language. The zh-CN literal
+    // is the legacy `title` column verbatim, so the fallback and the rendered text agree.
+    macroExpired: 'Macro "{name}" expired',
+    macroTriggered: 'Macro "{name}"',
+    reviewUnavailable: 'Review-on-completion is not enabled yet',
+    macroFailed: 'Macro "{name}" failed to run',
   },
   // `07` §21.4: a separate collapsed "Automation" group in the sidebar; sessions inside are read-only.
   macroSidebar: {

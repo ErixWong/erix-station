@@ -762,7 +762,9 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | `user_id` | `uuid` | `NOT NULL REFERENCES users(id)` | 收件人 |
 | `macro_run_id` | `uuid` | `REFERENCES macro_runs(id) ON DELETE SET NULL` | 关联的宏执行 |
 | `severity` | `text` | `NOT NULL DEFAULT 'info' CHECK (severity IN ('info', 'error'))` | 严重级 |
-| `title` | `text` | `NOT NULL CHECK (btrim(title) <> '')` | 标题（不许空白） |
+| `title` | `text` | `NOT NULL CHECK (btrim(title) <> '')` | 标题（不许空白）。**入库的成品句子 = 回退面**：新行同时带下面两列，老行只有这一列 ⇒ 读侧照旧原样显示 |
+| `title_key` | `text` | 可空（迁移 `0049`，issue #850） | 标题的 **i18n 键**（例 `notifications.macroExpired`），不是成品句子——写侧常常是**调度器**（没有人、没有请求、没有语言）。`NULL` = 「这条没键，请照旧用 `title`」。值域（键必须在前端 locales 登记）是**策略**，由读侧 `te()` 兜底挡，不写 DB CHECK（同 `0048` 分层） |
+| `title_params` | `jsonb` | 可空（迁移 `0049`，issue #850） | 填 `title_key` 里占位符的参数（例 `{"name":"每日巡检"}`）。只在有键时有意义；无参数（如 `notifications.reviewUnavailable`）⇒ `NULL` |
 | `body` | `text` | `NOT NULL DEFAULT ''` | 正文 |
 | `read_at` | `timestamptz` | 可空 | `NULL` = 未读；已读时刻应用侧写 |
 | `created_at` | `timestamptz` | `NOT NULL` | 生成时刻（应用侧写，无默认） |
@@ -772,6 +774,9 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 **值域 / 状态机**：`severity ∈ {info, error}`；`read_at` `NULL`=未读 / 非 `NULL`=已读（两态）。⚠ 表与读侧 API 已落地，**不等于通知调度 / 派发全量实现**。
 
 **谁写谁读**：写 = 宏事件生成侧（`notifications.js` / `macroRoutes`）；读 = `portal/src/http.js`（`GET /api/notifications`、`/api/notifications/unread-count`、`/api/notifications/:id/read`）。
+
+**标题的语言（#850）**：`title_key`/`title_params` 由**读侧按读者当前语言渲染**（`portal/frontend/src/components/MacroBell.vue`，
+键未登记则退回 `title`）；两列在 API 响应里**可选出现**（缺席就不带该键，不给 `null` 壳）⇒ 存量行为逐字不变。契约补记 ⇒ `docs/api/portal.md` §4.23。
 
 ### 1.41 `capability_items` — 能力市场条目（skill / mcp）（issue #595，migration 0039）
 

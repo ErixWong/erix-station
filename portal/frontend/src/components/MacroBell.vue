@@ -8,11 +8,23 @@ import { computed, onMounted, onScopeDispose, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useMacroStore } from '../stores/macro';
 import { formatClock } from '../lib/macroView';
+import type { MacroNotification } from '../lib/macroView';
 
-const { t } = useI18n();
+const { t, te } = useI18n();
 const macro = useMacroStore();
 const open = ref(false);
 const root = ref<HTMLElement | null>(null);
+
+/**
+ * 通知标题（issue #850）：行里带 `title_key` ⇒ 按**读者当前语言**拼（存的是键 + 参数，
+ * 写入方是调度器、没有语言）；`te()` 兜底——键没在 locales 登记就退回 `title`，不裸露 `foo.bar`。
+ * 没有键的行（存量）照旧原样渲染 `title`，两种 locale 下逐字相同。
+ */
+function notificationTitle(n: MacroNotification): string {
+  const key = n.titleKey;
+  if (!key || !te(key)) return n.title;
+  return t(key, n.titleParams ?? {});
+}
 
 const badge = computed(() => (macro.unreadCount > 99 ? '99+' : String(macro.unreadCount)));
 const hasUnread = computed(() => macro.unreadCount > 0);
@@ -100,7 +112,7 @@ onScopeDispose(() => {
             :class="n.severity === 'error' ? 'bg-red-500' : n.severity === 'warn' ? 'bg-amber-400' : 'bg-black/25'"
           />
           <span class="min-w-0 flex-1">
-            <span class="block truncate text-sm">{{ n.title }}</span>
+            <span data-test="notification-title" class="block truncate text-sm">{{ notificationTitle(n) }}</span>
             <span v-if="n.body" class="block text-[11px] leading-[1.5] text-black/55 dark:text-white/55">{{ n.body }}</span>
             <span class="block text-[11px] text-black/40 dark:text-white/40">{{ formatClock(n.createdAt) }}</span>
           </span>

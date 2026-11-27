@@ -355,6 +355,24 @@ test('#692-2 brief 被截断时，判决格式块**仍然保留**（砍事实不
   assert.ok(brief.lastIndexOf('结论：通过') > brief.lastIndexOf('已截断'), '格式块要排在截断标注之后');
 });
 
+// ── #850「审查暂不可用」通知：标题存键（无参数），`title` 仍是成品中文 ──────────────
+test('#850 reviewUnavailable ⇒ 通知行带 title_key=notifications.reviewUnavailable（无参数）且 title 逐字不变', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T850'));
+    const macroRunId = await claim(pool, scene);
+    await runMacroReview(pool, { macroRunId, userId: scene.userId, reviewUnavailable: true });
+    const rows = (await pool.query(
+      `SELECT user_id, severity, title, title_key, title_params FROM notifications WHERE macro_run_id=$1`, [macroRunId],
+    )).rows;
+    assert.equal(rows.length, 1, '只发一条「暂不可用」');
+    assert.equal(rows[0].title_key, 'notifications.reviewUnavailable');
+    assert.equal(rows[0].title_params, null, '无参数的键 ⇒ 参数列 NULL（不造空对象）');
+    assert.equal(rows[0].title, '完成审查暂未启用', '存量回退面的中文逐字不变');
+    assert.equal(rows[0].user_id, scene.userId);
+    assert.equal(rows[0].severity, 'info');
+  });
+});
+
 // 退出收台（必须**最后注册**才能最后跑；实测教训，勿搬回文件头）：夹具的 adminPool 与
 // `migrate` 用完的 pg 连接会留下仍 ref 着的 Socket（探针输出 `AFTER-HOOK handles: Socket:,Socket:`），
 // 把 `node --test` 子进程钉住不退；而全局 `test.after` 实测会在尾部用例跑完前就触发

@@ -750,3 +750,47 @@ test('#695 KIND_SCHEMA 的 run-review.max_rounds 缺省与代码常量同源', a
   assert.equal(KIND_SCHEMA['run-review'].max_rounds.default, DEFAULT_REVIEW_MAX_ROUNDS,
     '订阅面默认值（KIND_SCHEMA）与执行面默认值（DEFAULT_REVIEW_MAX_ROUNDS）必须一致，否则 UI 填的与实跑的不同');
 });
+
+// ── #850 标题入库存「键 + 参数」（写入方是调度器：没有人、没有请求、没有语言）──────────────
+// 判据是 **opts.titleKey / opts.titleParams 的具体字面值**，并且 `opts.title` 仍是旧成品中文
+// （存量回退面不许消失：键没登记 / 老读侧 / 存量行都靠它）。
+test('#850 到期意图 ⇒ deliverIntent 收 notifications.macroExpired + {name}，title 仍是成品中文', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T850A'));
+    const intent = await claimedIntent(pool, scene, {
+      anchor: `assignment:${scene.assignmentId}`, bucket: 'expiry', criterion: 'tick',
+    });
+    const delivered = [];
+    const dispatcher = createIntentDispatcher({
+      pool,
+      deliverIntent: async (_p, it, opts) => { delivered.push(opts); },
+      log: { warn() {}, info() {} },
+    });
+    await dispatcher.dispatch([intent]);
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].titleKey, 'notifications.macroExpired');
+    assert.deepEqual(delivered[0].titleParams, { name: `daily-${scene.login}` });
+    assert.equal(delivered[0].title, `宏「daily-${scene.login}」已到期`, '回退面的中文逐字不变');
+  });
+});
+
+test('#850 通知类意图（run-notify）⇒ deliverIntent 收 notifications.macroTriggered + {name}', { skip: SKIP }, async () => {
+  await withFreshDb(async (pool) => {
+    const scene = await seedScene(pool, ids('T850B'));
+    const intent = await claimedIntent(pool, scene, {
+      kind: 'run-notify', anchor: 'run:r-850', bucket: 'b0', criterion: 'terminal',
+    });
+    const delivered = [];
+    const dispatcher = createIntentDispatcher({
+      pool,
+      deliverIntent: async (_p, it, opts) => { delivered.push(opts); },
+      log: { warn() {}, info() {} },
+    });
+    const out = await dispatcher.dispatch([intent]);
+    assert.equal(out.failed, 0);
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].titleKey, 'notifications.macroTriggered');
+    assert.deepEqual(delivered[0].titleParams, { name: `daily-${scene.login}` });
+    assert.equal(delivered[0].title, `宏「daily-${scene.login}」`, '回退面的中文逐字不变');
+  });
+});

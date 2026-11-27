@@ -75,6 +75,10 @@ export interface MacroNotification {
   body: string;
   readAt: string | null;
   createdAt: string | null;
+  /** issue #850：标题的**键**（后端 `title_key`）——缺席 = 照旧原样渲染 `title`（存量行）。 */
+  titleKey?: string;
+  /** 标题键的参数（后端 `title_params`），只在有键时出现。 */
+  titleParams?: Record<string, unknown>;
 }
 
 function str(value: unknown): string | null {
@@ -179,7 +183,7 @@ export function normalizeRun(row: Record<string, unknown> | null | undefined): M
 
 export function normalizeNotification(row: Record<string, unknown> | null | undefined): MacroNotification | null {
   if (!row) return null;
-  return {
+  const base: MacroNotification = {
     id: String(row.id ?? ''),
     severity: String(row.severity ?? 'info'),
     title: String(row.title ?? ''),
@@ -187,6 +191,14 @@ export function normalizeNotification(row: Record<string, unknown> | null | unde
     readAt: iso(row.read_at ?? row.readAt),
     createdAt: iso(row.created_at ?? row.createdAt),
   };
+  // #850：`title_key` / `title_params` 可选出现，**缺席就不造空键**（渲染侧靠「有没有」选路径）。
+  const titleKey = str(row.title_key ?? row.titleKey);
+  if (!titleKey) return base;
+  const rawParams = row.title_params ?? row.titleParams;
+  const titleParams = rawParams !== null && typeof rawParams === 'object' && !Array.isArray(rawParams)
+    ? (rawParams as Record<string, unknown>)
+    : null;
+  return titleParams ? { ...base, titleKey, titleParams } : { ...base, titleKey };
 }
 
 // ── 文案映射（判决 / 跳过 / kind）：键是枚举成员，值不存在 ⇒ 退回 unclassified 口径 ──

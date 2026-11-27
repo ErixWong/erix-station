@@ -30,7 +30,9 @@ const RESERVED_MIGRATION_NUMS = new Set([]);
 // key 重铸时从这两列恢复）⇒ head 46 → 47（周期改造仍写在同一个 0047，未合并故直接改写、不新开 0048）。
 // 现势（issue #828 P1，2026-11-26）：本单追加 `0048-users-locale.sql`（`users.locale VARCHAR(8)` 可空，
 // 账号级语言偏好，NULL=跟随浏览器；值域交应用侧白名单不写 DB CHECK）⇒ head 47 → 48。
-const MIGRATION_HEAD = 48;
+// 现势（issue #850，2026-11-27）：本单追加 `0049-notifications-title-key.sql`（`notifications.title_key text`
+// + `title_params jsonb`，都可空；`title` 的 NOT NULL 不动 ⇒ 存量行逐字不变）⇒ head 48 → 49。
+const MIGRATION_HEAD = 49;
 const MIGRATION_NUMS = Array.from({ length: MIGRATION_HEAD }, (_, i) => i + 1)
   .filter((n) => !RESERVED_MIGRATION_NUMS.has(n));
 
@@ -1118,7 +1120,7 @@ test('迁移 0033-delta-events-not-persisted：形态 M 是纯清理（零 DDL�
   // 0035（`macro-platform`，issue #524）追加之后本行退一支；0037（`notifications-and-origin`，
   // issue #526）再退一支 —— 口径不变：靠**绝对位置**钉住。
   // 而不是「0033 必须永远排末位」——后者已经被上面那 19 处 head 断言接管（它们现在钉 0037）。
-  assert.equal(files[files.length - 16], file, '0033 是倒数第十三支（0034..0042 + 0043-platform-prompts + 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面，不许回头插队）');
+  assert.equal(files[files.length - 17], file, '0033 是倒数第十三支（0034..0042 + 0043-platform-prompts + 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面，不许回头插队）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里"索引""VACUUM"这些词都会出现，整文件 indexOf 会假绿）。
@@ -1178,7 +1180,7 @@ test('迁移 0034-prune-stale-run-checkpoints：纯清理（零 DDL）、cutoff 
   const file = '0034-prune-stale-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0034 存在');
-  assert.equal(files[files.length - 15], file, '0034 是倒数第十三支（新迁移只能追加，不回改已应用的编号）；0035..0045 之后它不再是末位');
+  assert.equal(files[files.length - 16], file, '0034 是倒数第十三支（新迁移只能追加，不回改已应用的编号）；0035..0045 之后它不再是末位');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**去掉整行注释之后**的语句区（头注释里 "VACUUM""索引""DELETE" 这些词都会出现，整文件判会假绿/假红）。
@@ -1252,7 +1254,7 @@ test('迁移 0035-macro-platform：三表齐全、两条唯一键在、FK 的 ON
   const file = '0035-macro-platform.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0035 存在');
-  assert.equal(files[files.length - 14], file, '0035 是倒数第十二支（0036..0045 追加在它后面；新迁移只能追加，不回改已应用的编号）');
+  assert.equal(files[files.length - 15], file, '0035 是倒数第十二支（0036..0045 追加在它后面；新迁移只能追加，不回改已应用的编号）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 去掉**整行注释**（保留 `$$ ... $$` 内部语句），否则「注释里提到 DROP TABLE」会被误判。
@@ -1328,7 +1330,7 @@ test('迁移 0038-transcript-recovery-rows：幂等键/append_seq 排序/只新�
   const file = '0038-transcript-recovery-rows.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0038 存在');
-  assert.equal(files[files.length - 11], file, '0038 是倒数第八支（0039-capability-market / 0040-mcp-channel / 0041 / 0042 / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
+  assert.equal(files[files.length - 12], file, '0038 是倒数第八支（0039-capability-market / 0040-mcp-channel / 0041 / 0042 / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -1409,7 +1411,7 @@ test('迁移 0039-capability-market：三表齐全、包内容按 (item,version)
   const file = '0039-capability-market.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0039 存在');
-  assert.equal(files[files.length - 10], file, '0039 是倒数第七支（0040-mcp-channel / 0041-retire / 0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面；新迁移只能追加）');
+  assert.equal(files[files.length - 11], file, '0039 是倒数第七支（0040-mcp-channel / 0041-retire / 0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面；新迁移只能追加）');
   assert.deepEqual(
     files.map((f) => Number(f.slice(0, 4))),
     MIGRATION_NUMS,
@@ -1534,7 +1536,7 @@ test('迁移 0041-retire-run-checkpoints：DROP 形状四 constraint（IF EXISTS
   const file = '0041-retire-run-checkpoints.sql';
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes(file), '0041 存在');
-  assert.equal(files[files.length - 8], file, '0041 是倒数第五支（0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
+  assert.equal(files[files.length - 9], file, '0041 是倒数第五支（0042-mcp-plaintext-values / 0043-platform-prompts / 0044-system-metrics / 0045-macro-skipped-reason-review-unavailable 追加在它后面）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 只看**语句区**（整行注释剥掉）：头注释里 DROP / VACUUM / BEGIN / CASCADE 这些词都要出现，
@@ -1628,7 +1630,7 @@ test('迁移 0043-platform-prompts：种首行（让 FOR UPDATE 有行可锁）+
   // 本单让号到 0043 后它就是当前末位（0040→#608 mcp-channel、0041→#640 retire、0042→#670 mcp-plaintext 都排在它之前）。
   // #650 追加 `0044-system-metrics.sql` 之后 0043 不再是末位 ⇒ 判据改成「位置固定 + 只能往后追加」
   // （形状同 0033..0041 那几支的位次断言：钉的是「不许回头插队」，不是「永远是最后一支」）。
-  assert.equal(files[files.length - 6], file,
+  assert.equal(files[files.length - 7], file,
     '0043 是倒数第三支（0040-mcp-channel、0041-retire-run-checkpoints、0042-mcp-plaintext-values 在它之前，'
     + '0044-system-metrics 追加在它之后；新迁移只能追加）');
   assert.deepEqual(
@@ -1917,8 +1919,9 @@ test('迁移 0048-users-locale：users.locale 可空 + 值域不写 DB CHECK + �
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   const file = '0048-users-locale.sql';
   assert.ok(files.includes(file), '0048-users-locale 存在');
-  assert.equal(files[files.length - 1], file, '0048 是当前末位迁移（连续无空洞）');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, 'head=0048');
+  // #850 追加 0049 后，0048 不再是末位；这里的语义是「0048 号位没被人插走」。
+  assert.ok(files.indexOf(file) === files.length - 2, '0048 仍是倒数第二支（0049 之后）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, 'head=0049（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, file), 'utf8');
   // 列定义：可空（无 NOT NULL）、宽 8、幂等
@@ -1939,4 +1942,40 @@ test('迁移 0048-users-locale：users.locale 可空 + 值域不写 DB CHECK + �
   // baseline 冻结：locale 只走增量，不写回 baseline（schema.sql 一字节不改，checksum 不漂）
   const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
   assert.ok(!/\blocale\b/.test(baseline), 'baseline 不得回写 locale（DDL 只走增量迁移）');
+});
+
+// ---------------------------------------------------------------------------
+// 迁移 0049-notifications-title-key（issue #850）：`notifications.title_key text` + `title_params jsonb`，
+// 都可空 —— 标题入库存「键 + 参数」，渲染时按读者语言拼（写入方是调度器，没有语言）。
+// 断言：两条 `ADD COLUMN IF NOT EXISTS`（幂等可重放）、**两列都可空**（NULL = 照旧用 title）、
+// `title` 的 NOT NULL 不动（存量行逐字不变）、值域不写 DB CHECK（交读侧 `te()` 兜底，与 0048 同一分层）、
+// lock_timeout、不写 BEGIN/COMMIT、末尾只读 DO 块；以及 baseline 冻结：schema.sql **不回写**这两列。
+// ---------------------------------------------------------------------------
+test('迁移 0049-notifications-title-key：两列可空 + title NOT NULL 不动 + 幂等 + baseline 不回写', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  const file = '0049-notifications-title-key.sql';
+  assert.ok(files.includes(file), '0049-notifications-title-key 存在');
+  assert.equal(files[files.length - 1], file, '0049 是当前末位迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), MIGRATION_HEAD, 'head=0049');
+
+  const sql = fs.readFileSync(path.join(dir, file), 'utf8');
+  assert.match(sql, /ALTER TABLE notifications/i);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS title_key text/i, 'title_key 幂等 ADD COLUMN');
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS title_params jsonb/i, 'title_params 是 jsonb 且幂等');
+  assert.doesNotMatch(sql, /ADD COLUMN[^\n]*\btitle\s/i, '不得重新声明/重建成品 title 列');
+  assert.doesNotMatch(sql, /ADD COLUMN[^;\n]*NOT NULL/i, '新增两列都必须可空（NULL=这条没键，照旧用 title）');
+  assert.doesNotMatch(sql, /ALTER COLUMN[^;\n]*title[^;\n]*(SET NOT NULL|DROP NOT NULL)/i, 'title 的 NOT NULL 不动');
+  // 值域（键必须在 locales 登记）故意不写 DB CHECK：写了「键未登记 ⇒ 退回 title」那条判据真机进不去。
+  assert.doesNotMatch(sql, /CHECK\s*\(\s*title_key/i, '不得对 title_key 写 DB CHECK');
+  assert.match(sql, /SET lock_timeout/, '照 0016 的 lock_timeout 纪律');
+  assert.doesNotMatch(sql, /^\s*BEGIN\s*;/im, '不写 BEGIN（事务边界归 runner）');
+  assert.doesNotMatch(sql, /^\s*COMMIT\s*;/im, '不写 COMMIT');
+  assert.match(sql, /DO \$do\$/, '末尾只读 DO 块打印重放证据');
+  assert.doesNotMatch(sql, /INSERT INTO|UPDATE notifications SET/i, 'DO 块只读，不得写库');
+
+  // baseline 冻结：两列只走增量，不写回 baseline（schema.sql 一字节不改，checksum 不漂）
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  assert.ok(!/title_key/.test(baseline), 'baseline 不得回写 title_key（DDL 只走增量迁移）');
+  assert.ok(!/title_params/.test(baseline), 'baseline 不得回写 title_params');
 });
