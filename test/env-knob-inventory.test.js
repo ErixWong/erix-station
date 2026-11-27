@@ -1,0 +1,611 @@
+// issue #677 第一步：清点工具的判据钉。
+// 全部跑在临时目录里的**假 compose / 假 portal / 假 proxy / 假 runner** 上：
+//   · 不读真实仓库文件（`buildInventory` 只吃 `--root` 指过来的假目录）；
+//   · 不读真实环境变量（本文件一次都没碰 `process.env`，工具的输入只有文件文本）；
+//   · teardown 里 `rmSync(..., { recursive: true })`，不留残骸。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  buildInventory,
+  classifyComposeValue,
+  parseComposeEnv,
+  parseComposeEnvWithWarnings,
+  parseInjectedEnv,
+  parseProxyAllowlist,
+  scanEnvReads,
+  scanChildEnvAllowlists,
+  renderTable,
+  renderSummary,
+  stripJsComments,
+  consumeTiming,
+  topLevelInitRanges,
+} from '../scripts/env-knob-inventory.mjs';
+
+const FIXTURE = {
+  'deploy/docker-compose.yml': `
+version: "3.9"
+services:
+  station-docker-proxy:
+    environment:
+      PORT: "2375"
+      IMAGE_ALLOWLIST: ${'${FDE_IMAGE:?必填：'}
+        scratch 写 whoami}
+      ALLOWED_USERS: ${'${FDE_ALLOWED_USERS:-1001:1000}'}
+  station-portal:
+    environment:
+      OK_KNOB: ${'${OK_KNOB:-7}'}
+      NO_ALLOW_KNOB: ${'${NO_ALLOW_KNOB:-1}'}
+      DEAD_FIBER_KNOB: ${'${DEAD_FIBER_KNOB:-0}'}
+      EMPTY_DEFAULT_KNOB: ${'${EMPTY_DEFAULT_KNOB:-}'}
+      DEV_USER_KNOB: ${'${DEV_USER_KNOB-1001:1000}'}
+      LITERAL_KNOB: "42"
+      DATABASE_URL: postgres://u:p@db:5432/x
+      PERRUN_KNOB: ${'${PERRUN_KNOB:-3}'}
+      # 注释里写 OK_KNOB 不算 compose 里写了它
+  station-litellm:
+    environment:
+      HOME: /home/worker
+volumes: {}
+`,
+  'portal/src/provisioner.js': `
+export function buildContainerConfig({ env = process.env } = {}) {
+  return {
+    Env: [
+      \`OK_KNOB=\${Number(process.env.OK_KNOB) || 7}\`,
+      \`NO_ALLOW_KNOB=\${Number(process.env.NO_ALLOW_KNOB) || 1}\`,
+      'DEAD_FIBER_KNOB=0',
+      \`PERRUN_KNOB=\${Number(process.env.PERRUN_KNOB) || 3}\`,
+    ],
+  };
+}
+export function caller() {
+  return buildContainerConfig({});
+}
+`,
+  'portal/src/config.js': `
+export function loadConfig(env = process.env) {
+  return {
+    databaseUrl: env.DATABASE_URL || 'x',
+    emptyDefault: env.EMPTY_DEFAULT_KNOB || '',
+    helperKnob: intEnv(env, 'HELPER_KNOB', 7),
+  };
+}
+`,
+  'portal/src/helpers.js': `
+export function intEnv(env, key, fallback) {
+  const v = Number(env[key] ?? fallback);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+`,
+  'runner/lib/intenv.js': `
+export function parseIntEnv(env, key, fallback) {
+  return Number(env[key] ?? fallback);
+}
+export function readOnce(env = process.env) {
+  return parseIntEnv(process.env, 'RUNNER_HELPER_KNOB', 3);
+}
+`,
+  'runner/lib/review.js': `
+export function isOn(env = process.env) {
+  return env.PER_RUN_KNOB === '1';
+}
+`,
+  'runner/agentd.js': `
+const CFG = {
+  capacity: Number(process.env.STARTUP_SNAPSHOT_KNOB || 2),
+};
+export function buildWorkerEnv(runStart, baseEnv = process.env) {
+  const childEnv = { ...baseEnv };
+  if (runStart?.review_only === true) {
+    childEnv.PER_RUN_KNOB = '1';
+  }
+  return childEnv;
+}
+export const CAP = CFG.capacity;
+`,
+  'deploy/fde-proxy/server.js': `
+const ENV_KEY_ALLOW = new Set([
+  'PATH',
+  'OK_KNOB',
+  'DEAD_FIBER_KNOB',
+  'PERRUN_KNOB',
+]);
+export function check(key) {
+  if (!ENV_KEY_ALLOW.has(key)) throw new Error('create_policy_denied');
+}
+`,
+  'runner/worker.js': `
+// DEAD_FIBER_KNOB 只出现在这行注释里（注释里的名字**不算读**，否则死光纤会被洗白）。
+const rounds = Number(process.env.OK_KNOB) || 7;
+export function readIt(env = process.env) {
+  return env.NO_ALLOW_KNOB;
+}
+const baseEnv = { ...process.env };
+baseEnv.CHILD_ONLY_KNOB = '1'; // 赋值给子进程：是写，不是读
+export function dynamicChild(env = process.env, { key = LIVE_TABLE_ENV } = {}) {
+  return env?.[key];
+}
+export function readPerrun(env = process.env) {
+  return env.PERRUN_KNOB;
+}
+`,
+  'runner/lib/tables.js': `
+export const LIVE_TABLE_ENV = Object.freeze({ a: 'TABLE_READ_KNOB' });
+export const DEAD_TABLE_ENV = Object.freeze({ b: 'TABLE_IGNORED_KNOB' });
+export const STDIO_ENV_ALLOWLIST = Object.freeze(['PATH', 'HOME']);
+export function resolve(env = process.env) {
+  const out = {};
+  for (const field of Object.keys(LIVE_TABLE_ENV)) {
+    const envName = LIVE_TABLE_ENV[field];
+    out[field] = env?.[envName];
+  }
+  return out;
+}
+`,
+  'runner/lib/tables.test.js': `
+process.env.TABLE_IGNORED_KNOB = '1'; // 测试文件不算消费者
+`,
+};
+
+function withFixture(run) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'env-knob-inventory-'));
+  try {
+    for (const [rel, text] of Object.entries(FIXTURE)) {
+      const abs = path.join(root, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, text, 'utf8');
+    }
+    return run(root);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const byName = (inv, name) => inv.knobs.find((k) => k.name === name);
+
+test('① 注入但不在白名单 ⇒ 报「断在 proxy 白名单」并进小计', () => {
+  withFixture((root) => {
+    const inv = buildInventory(root);
+    const knob = byName(inv, 'NO_ALLOW_KNOB');
+    assert.ok(knob, 'NO_ALLOW_KNOB 必须在表里');
+    assert.equal(knob.injected.length, 1);
+    assert.match(knob.injected[0], /^portal\/src\/provisioner\.js:\d+$/);
+    assert.equal(knob.allowlisted.length, 0);
+    assert.ok(
+      knob.breaks.some((b) => b.includes('断在 proxy 白名单')),
+      `断链必须点名白名单，实际=${JSON.stringify(knob.breaks)}`,
+    );
+    assert.ok(inv.subtotals.injectedNotAllowlisted.includes('NO_ALLOW_KNOB'));
+    // 反向确认：四处齐的那根不会因为同表其它键被误报
+    assert.ok(!inv.subtotals.injectedNotAllowlisted.includes('OK_KNOB'));
+  });
+});
+
+test('② 在白名单但没人读 ⇒ 报「死光纤」（注释里提到不算读）', () => {
+  withFixture((root) => {
+    const inv = buildInventory(root);
+    const knob = byName(inv, 'DEAD_FIBER_KNOB');
+    assert.ok(knob, 'DEAD_FIBER_KNOB 必须在表里');
+    assert.equal(knob.allowlisted.length, 1);
+    assert.match(knob.allowlisted[0], /^deploy\/fde-proxy\/server\.js:\d+$/);
+    assert.equal(knob.runnerReads.length, 0, '只有注释提到它 ⇒ 不算 runner 读');
+    assert.ok(
+      knob.breaks.some((b) => b.includes('死光纤')),
+      `必须报死光纤，实际=${JSON.stringify(knob.breaks)}`,
+    );
+    assert.ok(inv.subtotals.allowlistedNobodyRead.includes('DEAD_FIBER_KNOB'));
+  });
+});
+
+test('③ 四处都齐 ⇒ 不报错，且判「能搬进 DB」', () => {
+  withFixture((root) => {
+    const inv = buildInventory(root);
+    const knob = byName(inv, 'OK_KNOB');
+    assert.deepEqual(knob.breaks, [], `实际=${JSON.stringify(knob.breaks)}`);
+    assert.equal(knob.compose.form, '${VAR:-默认}');
+    assert.ok(knob.injected.length >= 1);
+    assert.equal(knob.allowlisted.length, 1);
+    assert.equal(knob.runnerReads.length, 1);
+    assert.equal(knob.runnerReads[0].ref, 'runner/worker.js:3');
+    // 注入行上那句 `process.env.OK_KNOB` 是**转发**，不算 portal 消费
+    assert.deepEqual(knob.portalReads, []);
+    assert.equal(knob.bootWhy.length, 0);
+    // 四处齐且 portal 不消费 ⇒ 能搬；但读点在模块顶层（worker.js:3）⇒ 改 DB 要重启才生效
+    assert.equal(knob.pile, 'dbRestart');
+    assert.equal(knob.timing, '启动快照');
+    assert.ok(inv.piles.dbRestart.includes('OK_KNOB'));
+    assert.ok(inv.pilesAll.db.includes('OK_KNOB'));
+    // 小计里三处都不该有它
+    assert.ok(!inv.subtotals.injectedNotAllowlisted.includes('OK_KNOB'));
+    assert.ok(!inv.subtotals.runnerReadNotInjected.includes('OK_KNOB'));
+    assert.ok(!inv.subtotals.allowlistedNobodyRead.includes('OK_KNOB'));
+  });
+});
+
+test('compose 写法分类：字面 / `${VAR:-默认}` / 默认空 / 单横线 / 必填多行', () => {
+  assert.equal(classifyComposeValue('"42"'), '字面');
+  assert.equal(classifyComposeValue('${OK_KNOB:-7}'), '${VAR:-默认}');
+  assert.equal(classifyComposeValue('${OK_KNOB:-}'), '${VAR:-}（默认空）');
+  assert.equal(classifyComposeValue('${OK_KNOB-1001:1000}'), '${VAR-默认}（单横线）');
+  assert.equal(classifyComposeValue('${FDE_IMAGE:?必填}'), '${VAR:?必填}');
+  assert.equal(classifyComposeValue('llm.${BASE_DOMAIN:-localhost}'), '${VAR:-默认}');
+  assert.equal(classifyComposeValue(''), '空值');
+  assert.equal(classifyComposeValue('http://127.0.0.1:4100'), '字面');
+
+  withFixture((root) => {
+    const services = parseComposeEnv(fs.readFileSync(path.join(root, 'deploy/docker-compose.yml'), 'utf8'));
+    const portal = services['station-portal'];
+    assert.deepEqual(
+      portal.map((e) => e.name),
+      ['OK_KNOB', 'NO_ALLOW_KNOB', 'DEAD_FIBER_KNOB', 'EMPTY_DEFAULT_KNOB', 'DEV_USER_KNOB', 'LITERAL_KNOB', 'DATABASE_URL', 'PERRUN_KNOB'],
+      '注释行与别的服务的键不许混进来',
+    );
+    assert.ok(portal.every((e) => e.line > 0));
+    // proxy 服务自己的键（含跨行值）单独成组，且跨行被接回同一 raw
+    const img = services['station-docker-proxy'].find((e) => e.name === 'IMAGE_ALLOWLIST');
+    assert.equal(img.form, '${VAR:?必填}');
+    assert.match(img.raw, /scratch 写 whoami/);
+    // compose 里出现但只属于别的服务 ⇒ 标注服务名
+    const inv = buildInventory(root);
+    const home = byName(inv, 'HOME');
+    assert.equal(home.compose.service, 'station-litellm');
+  });
+});
+
+test('runner 侧读取形态：成员 / 点号别名 / 数据表；赋值与注释不算读', () => {
+  withFixture((root) => {
+    const reads = scanEnvReads(root, 'runner');
+    assert.ok(reads.get('OK_KNOB').some((r) => r.ref === 'runner/worker.js:3'));
+    assert.ok(reads.get('NO_ALLOW_KNOB').some((r) => r.ref === 'runner/worker.js:5'));
+    // 数据表：被动态下标喂过的表算读，没被喂过的不算
+    assert.ok(reads.has('TABLE_READ_KNOB'), '被 env[envName] 喂过的表必须登记');
+    assert.equal(reads.has('TABLE_IGNORED_KNOB'), false, '没被喂过的表不许登记');
+    // 赋值目标（`baseEnv.CHILD_ONLY_KNOB = ...`）与测试文件里的读都不算
+    assert.equal(reads.has('CHILD_ONLY_KNOB'), false);
+    assert.equal(reads.has('TABLE_IGNORED_KNOB'), false);
+    // 子进程环境放行面单独归类
+    assert.deepEqual([...scanChildEnvAllowlists(root, 'runner')].sort(), ['HOME', 'PATH']);
+  });
+});
+
+test('剥注释不许吃掉代码（行号与串内斜杠都要保住）', () => {
+  const src = [
+    "const a = 'x // y'; // 注释里的 'quote",
+    '/* 块注释 process.env.GONE_KNOB */',
+    'const b = process.env.KEPT_KNOB; // 尾注',
+  ].join('\n');
+  const stripped = stripJsComments(src);
+  assert.match(stripped, /'x \/\/ y'/, '字符串里的斜杠不许当注释');
+  assert.doesNotMatch(stripped, /GONE_KNOB/);
+  assert.match(stripped, /KEPT_KNOB/);
+  assert.equal(stripped.split('\n').length, src.split('\n').length, '剥注释必须保行号');
+});
+
+test('注入与白名单的解析位置给到 file:line，供人工抽验', () => {
+  withFixture((root) => {
+    const inj = parseInjectedEnv(fs.readFileSync(path.join(root, 'portal/src/provisioner.js'), 'utf8'));
+    assert.deepEqual(
+      inj.map((x) => x.name),
+      ['OK_KNOB', 'NO_ALLOW_KNOB', 'DEAD_FIBER_KNOB', 'PERRUN_KNOB'],
+    );
+    assert.deepEqual(inj.map((x) => x.line), [5, 6, 7, 8]);
+    const allow = parseProxyAllowlist(fs.readFileSync(path.join(root, 'deploy/fde-proxy/server.js'), 'utf8'));
+    assert.deepEqual(allow.map((x) => x.name), ['PATH', 'OK_KNOB', 'DEAD_FIBER_KNOB', 'PERRUN_KNOB']);
+    assert.deepEqual(allow.map((x) => x.line), [3, 4, 5, 6]);
+  });
+});
+
+test('启动前必知的判据：连库 / 容器身份 / 启动快照 / 基线环境各归各位', () => {
+  withFixture((root) => {
+    const inv = buildInventory(root);
+    const db = byName(inv, 'DATABASE_URL');
+    assert.ok(db.bootWhy.some((w) => w.startsWith('P1')), '连库串必须判 P1');
+    assert.equal(db.pile, 'no');
+    const img = byName(inv, 'IMAGE_ALLOWLIST');
+    assert.equal(img.compose.service, 'station-docker-proxy');
+    assert.ok(img.bootWhy.some((w) => w.startsWith('P2')), 'proxy 服务自己的键必须判 P2');
+    assert.equal(img.pile, 'no');
+    const empty = byName(inv, 'EMPTY_DEFAULT_KNOB');
+    assert.ok(empty.bootWhy.includes('P3启动快照'), '被 portal 启动快照读的键必须判 P3');
+    assert.equal(empty.pile, 'no');
+    // 子进程基线环境（PATH/HOME）不进三堆
+    assert.ok(inv.piles.nonKnob.includes('PATH'));
+    assert.ok(!inv.pilesAll.db.includes('PATH') && !inv.piles.no.includes('PATH') && !inv.piles.human.includes('PATH'));
+    assert.ok(!inv.subtotals.runnerReadNotInjected.includes('PATH'));
+  });
+});
+
+test('A 假绿修正：helper 首参形（`intEnv(env, \'NAME\', …)`）算一个读数', () => {
+  withFixture((root) => {
+    const pReads = scanEnvReads(root, 'portal/src');
+    const hits = pReads.get('HELPER_KNOB') ?? [];
+    assert.ok(
+      hits.some((r) => r.kinds.includes('helperArg') && r.ref === 'portal/src/config.js:6'),
+      `helper 实参位置的读必须登记，实际=${JSON.stringify(hits)}`,
+    );
+    const rReads = scanEnvReads(root, 'runner');
+    assert.ok(
+      (rReads.get('RUNNER_HELPER_KNOB') ?? []).some((r) => r.kinds.includes('helperArg') && r.ref === 'runner/lib/intenv.js:6'),
+      '第一参写 `process.env` 也算',
+    );
+    // 核心：portal 读者不再隐身 ⇒ 它不能被判成「能搬」
+    const inv = buildInventory(root);
+    const knob = byName(inv, 'HELPER_KNOB');
+    assert.ok(knob.portalReads.some((r) => r.ref === 'portal/src/config.js:6'));
+    assert.ok(knob.bootWhy.includes('P3启动快照'), `必须报启动快照，实际=${JSON.stringify(knob.bootWhy)}`);
+    assert.ok(!knob.pile.startsWith('db'), '启动快照旋钮不许进任何「能搬」堆');
+    // 没有被误伤成注入缺失以外的分类
+    const rh = byName(inv, 'RUNNER_HELPER_KNOB');
+    assert.equal(rh.runnerReads.length, 1);
+    assert.ok(rh.breaks.some((b) => b.includes('断在注入')));
+  });
+});
+
+test('E per-run 通路单列一类，不混进「断在注入」', () => {
+  withFixture((root) => {
+    const inv = buildInventory(root);
+    const knob = byName(inv, 'PER_RUN_KNOB');
+    assert.equal(knob.delivery, 'per-run');
+    assert.ok(knob.writes.some((w) => w.perRun && w.ref === 'runner/agentd.js:8'), JSON.stringify(knob.writes));
+    assert.ok(knob.breaks.some((b) => b.includes('per-run 下发')), JSON.stringify(knob.breaks));
+    assert.ok(!knob.breaks.some((b) => b.includes('断在注入')), 'per-run 通路不许算断链');
+    assert.ok(inv.subtotals.perRunDelivered.includes('PER_RUN_KNOB'));
+    assert.ok(!inv.subtotals.runnerReadNotInjected.includes('PER_RUN_KNOB'));
+    // 对照：同一个文件里没有写点的那根仍旧是「断在注入」
+    assert.ok(inv.subtotals.runnerReadNotInjected.includes('RUNNER_HELPER_KNOB'));
+  });
+});
+
+test('输出：每行八列，且小计与三堆都在渲染文本里', () => {
+  withFixture((root) => {
+    const inv = buildInventory(root);
+    const lines = renderTable(inv);
+    const header = lines[0].split(' | ');
+    assert.equal(header.length, 8);
+    assert.deepEqual(header.slice(0, 3), ['旋钮名', 'compose 里怎么写', '谁读它(file:line)']);
+    for (const row of lines.slice(2)) {
+      assert.equal(row.split(' | ').length, 8, `列数不对：${row}`);
+      assert.ok(!/^\s*\|/.test(row));
+    }
+    const summary = renderSummary(inv).join('\n');
+    assert.match(summary, /注入但没进白名单=1 \[NO_ALLOW_KNOB\]/);
+    assert.match(summary, /在白名单但没人读（死光纤）=1 \[DEAD_FIBER_KNOB\]/);
+    assert.match(summary, /能搬·不用重启（per-run 生效[^=]*=1 \[PERRUN_KNOB\]/);
+    assert.match(summary, /能搬·但要重启[^=]*=1 \[OK_KNOB\]/);
+    assert.match(summary, /compose station-portal\.environment 键数=8/);
+    assert.match(summary, /proxy ENV_KEY_ALLOW=4/);
+  });
+});
+
+test('B 消费时机：同一根旋钮的读点在顶层还是在函数体里，决定改 DB 后要不要重启', () => {
+  // 单元级：顶层初始化区间的两条规则（跳行括号 + 缩进延续）
+  const src = [
+    'const A = Math.min(',
+    '  parseIntEnv(process.env.KNOB_ONE, 1),',
+    '  parseIntEnv(process.env.KNOB_TWO, 2),',
+    ');',
+    'export const B = Number(process.env.KNOB_THREE)',
+    '  && Number(process.env.KNOB_THREE) > 0',
+    '  ? Number(process.env.KNOB_THREE) : 9;',
+    'export function f(env = process.env) {',
+    '  return env.KNOB_FOUR;',
+    '}',
+  ];
+  const ranges = topLevelInitRanges(src);
+  assert.deepEqual(ranges, [[1, 4], [5, 7]], `多行声明必须整块算顶层，实际=${JSON.stringify(ranges)}`);
+  // 单元级：时机判据三档
+  assert.equal(consumeTiming({ runnerReads: [{ ref: 'r.js:3', atLoad: true }], writes: [] }).timing, '启动快照');
+  assert.equal(consumeTiming({ runnerReads: [{ ref: 'r.js:9', atLoad: false }], writes: [] }).timing, 'per-run');
+  const byWrite = consumeTiming({ runnerReads: [{ ref: 'r.js:3', atLoad: true }], writes: [{ ref: 'a.js:8', perRun: true }] });
+  assert.equal(byWrite.timing, 'per-run', 'portal 每 run 重写子环境 ⇒ 顶层读也算 per-run');
+  assert.ok(byWrite.why.includes('a.js:8'));
+  assert.equal(consumeTiming({ runnerReads: [], writes: [] }).timing, '未知');
+
+  // 集成：两根四处齐的旋钮，因为读点位置不同而进不同的堆
+  withFixture((root) => {
+    const inv = buildInventory(root);
+    const perrun = byName(inv, 'PERRUN_KNOB');
+    assert.deepEqual(perrun.breaks, [], `四处齐不许报错，实际=${JSON.stringify(perrun.breaks)}`);
+    assert.equal(perrun.timing, 'per-run');
+    assert.ok(perrun.timingWhy.includes('runner/worker.js:13'), perrun.timingWhy);
+    assert.equal(perrun.pile, 'dbPerRun');
+    assert.ok(inv.piles.dbPerRun.includes('PERRUN_KNOB'));
+    assert.ok(!inv.piles.dbRestart.includes('PERRUN_KNOB'));
+    const restart = byName(inv, 'OK_KNOB');
+    assert.ok(restart.timingWhy.includes('runner/worker.js:3'), restart.timingWhy);
+    assert.ok(restart.timingWhy.includes('重启'), restart.timingWhy);
+    // 逐键判据行里把时机打印出来了
+    const summary = renderSummary(inv).join('\n');
+    assert.match(summary, /- PERRUN_KNOB：时机=per-run/);
+    assert.match(summary, /- OK_KNOB：时机=启动快照/);
+  });
+});
+
+test('打不开的落点要显式说出来，不许静默当 0', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'env-knob-inventory-empty-'));
+  try {
+    fs.mkdirSync(path.join(root, 'runner'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'runner', 'worker.js'), 'process.env.LONE_KNOB;', 'utf8');
+    const inv = buildInventory(root);
+    assert.deepEqual(inv.missing.sort(), ['deploy/docker-compose.yml', 'deploy/fde-proxy/server.js', 'portal/src/provisioner.js']);
+    assert.equal(inv.counts.composePortalKeys, 0);
+    const knob = byName(inv, 'LONE_KNOB');
+    assert.ok(knob.breaks.some((b) => b.includes('断在注入')), 'runner 读但没人注入 ⇒ 点名断链');
+    assert.match(renderSummary(inv).join('\n'), /打不开/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ───────────────── #677 第三轮件 1：认不出的 compose YAML 形状必须喊出来
+test('① 列表式 environment / environment: &e ⇒ 必须出对应 warning', () => {
+  const listForm = `
+version: "3.9"
+services:
+  station-portal:
+    environment:
+      - LOST_KNOB=1
+      - ANOTHER=2
+volumes: {}
+`;
+  const anchor = `
+version: "3.9"
+services:
+  station-portal:
+    environment: &common
+      KEY1: v1
+volumes: {}
+`;
+  const rl = parseComposeEnvWithWarnings(listForm);
+  assert.deepEqual(rl.envByService['station-portal'], [], '列表式 ⇒ 键静默消失（返回形状保持）');
+  assert.ok(rl.warnings.some((w) => w.kind === 'list-form' && w.service === 'station-portal'),
+    `列表式必须报 list-form，实际=${JSON.stringify(rl.warnings)}`);
+  const ra = parseComposeEnvWithWarnings(anchor);
+  assert.deepEqual(ra.envByService['station-portal'], [], 'environment: &e ⇒ 键静默消失（返回形状保持）');
+  assert.ok(ra.warnings.some((w) => w.kind === 'anchor-on-environment' && w.service === 'station-portal'),
+    `带锚必须报 anchor-on-environment，实际=${JSON.stringify(ra.warnings)}`);
+  // 薄壳与旧形状逐字一致（不破坏现有调用方）
+  assert.deepEqual(parseComposeEnv(listForm), rl.envByService);
+});
+
+test('① 其余可疑形状：merge-key / dup-environment / extends / include / unparsed-line', () => {
+  const t = `
+version: "3.9"
+services:
+  base:
+    environment:
+      <<: *defaults
+      GOOD_K: v
+  child:
+    extends: base
+    environment:
+      FIRST: 1
+    environment:
+      SECOND: 2
+      weird line
+include:
+  - extra.yml
+volumes: {}
+`;
+  const r = parseComposeEnvWithWarnings(t);
+  const kinds = new Set(r.warnings.map((w) => w.kind));
+  for (const k of ['merge-key', 'dup-environment', 'extends', 'include', 'unparsed-line']) {
+    assert.ok(kinds.has(k), `必须报 ${k}，实际=${JSON.stringify(r.warnings)}`);
+  }
+});
+
+function writeTree(root, files) {
+  for (const [rel, text] of Object.entries(files)) {
+    const abs = path.join(root, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, text, 'utf8');
+  }
+}
+
+// ───────────────── 件 2：工具真的读登记表，能用假登记表钉住一条差集；缺文件不崩
+test('② 与登记表的差集（假登记表钉住一条）+ 缺文件不崩', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'env-legs-diff-'));
+  try {
+    writeTree(root, {
+      'deploy/docker-compose.yml': `
+services:
+  station-portal:
+    environment:
+      LEGS_COMPLETE_KNOB: \${LEGS_COMPLETE_KNOB:-1}
+`,
+      'portal/src/provisioner.js': `
+export function buildContainerConfig() {
+  return { Env: ['LEGS_COMPLETE_KNOB=1'] };
+}
+`,
+      'deploy/fde-proxy/server.js': `
+const ENV_KEY_ALLOW = new Set(['LEGS_COMPLETE_KNOB']);
+export function check(k) { return ENV_KEY_ALLOW.has(k); }
+`,
+      'runner/worker.js': `
+export function r(env = process.env) { return env.LEGS_COMPLETE_KNOB; }
+export function b() { return process.env.BROKEN_KNOB; }
+`,
+      // 把三腿齐的 LEGS_COMPLETE_KNOB 当 exception 登记（违反规矩⑤）；BROKEN_KNOB 不登记。
+      'deploy/env-legs-exceptions.json': JSON.stringify({
+        exceptions: [{ key: 'LEGS_COMPLETE_KNOB', where: 'runner/worker.js:2', reason: '测试钉差集' }],
+        unsupported: [{ at: 'runner/x.js:1', read: 'baseEnv[k]', reason: '测试' }],
+      }, null, 2),
+    });
+    const inv = buildInventory(root);
+    assert.equal(inv.legsDiff.present, true);
+    assert.ok(inv.legsDiff.registeredButLegsComplete.includes('LEGS_COMPLETE_KNOB'), '登记了但三腿齐 ⇒ 应进差集');
+    assert.ok(inv.legsDiff.brokenNotRegistered.includes('BROKEN_KNOB'), 'runner 读了但没登记 ⇒ 应进差集');
+    assert.deepEqual(inv.legsDiff.unsupported, [{ at: 'runner/x.js:1', read: 'baseEnv[k]' }]);
+    assert.match(renderSummary(inv).join('\n'), /与 deploy\/env-legs-exceptions\.json 的差集/);
+    // 缺登记表 ⇒ 不崩，明说不差
+    fs.rmSync(path.join(root, 'deploy', 'env-legs-exceptions.json'));
+    const inv2 = buildInventory(root);
+    assert.equal(inv2.legsDiff.present, false);
+    assert.match(renderSummary(inv2).join('\n'), /登记表不存在 ⇒ 差集不在本工具面内/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ───────────────── 件 3：含 process.env[name] 的夹具必须出现在「已知未解析的读取形态」节里
+test('③ 动态下标读取形态被扫出来并进节', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'env-unparsed-'));
+  try {
+    writeTree(root, {
+      'runner/dyn.js': `
+const NAMES = process.env.NAMES ? process.env.NAMES.split(',') : [];
+export function pick() {
+  for (const name of NAMES) { void process.env[name]; }
+}
+`,
+    });
+    const inv = buildInventory(root);
+    const sites = inv.unparsedForms.dynamicSites;
+    assert.ok(
+      sites.some((s) => s.ref.startsWith('runner/dyn.js:') && s.expr.includes('process.env[name]') && s.index === 'name'),
+      `动态 process.env[name] 必须出现在 dynamicSites，实际=${JSON.stringify(sites)}`,
+    );
+    const s = renderSummary(inv).join('\n');
+    assert.match(s, /=== 已知未解析的读取形态 ===/);
+    assert.match(s, /runner\/dyn\.js:\d+\s+process\.env\[name\]/);
+    assert.match(s, /跳过目录（SKIP_DIRS）/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ───────────────── 件 4：真实仓库用例（buildInventory() 不传参，只读不写）
+test('④ 真实仓库（不传参）：compose 键数=独立统计、白名单>0、死光纤含指定键、warnings 为空', () => {
+  const inv = buildInventory(); // 不传参 ⇒ 真实仓根，只读
+  assert.ok(inv.counts.composePortalKeys > 0, '真实 portal compose 键数应 >0');
+  // 独立行式统计（不复用被检的 parseComposeEnv*）：另写一段站式计数
+  const composeText = fs.readFileSync(path.join(inv.root, 'deploy/docker-compose.yml'), 'utf8');
+  const lines = composeText.split(/\r?\n/);
+  const start = lines.findIndex((L) => /^services:\s*$/.test(L));
+  let svc = null;
+  let inEnv = false;
+  let envIndent = -1;
+  let cnt = 0;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const L = lines[i];
+    const m = L.match(/^ {2}([A-Za-z0-9_-]+):\s*$/);
+    if (m) { svc = m[1]; inEnv = false; envIndent = -1; continue; }
+    if (/^[A-Za-z0-9_-]+:/.test(L)) break;
+    if (svc !== 'station-portal') continue;
+    const em = L.match(/^(\s+)environment:\s*$/);
+    if (em) { inEnv = true; envIndent = em[1].length; continue; }
+    if (!inEnv) continue;
+    if (L.trim() === '' || /^\s*#/.test(L)) continue;
+    const ind = L.match(/^(\s*)/)[1].length;
+    if (ind <= envIndent) { inEnv = false; continue; }
+    if (/^\s+[A-Z][A-Z0-9_]*\s*:/.test(L)) cnt += 1;
+  }
+  assert.equal(cnt, inv.counts.composePortalKeys, '独立统计必须等于工具口径');
+  assert.ok(inv.counts.allowlist > 0, 'ENV_KEY_ALLOW 条数应 >0');
+  assert.ok(inv.subtotals.allowlistedNobodyRead.includes('ERIX_SESSION_AUTO_TITLE'), '「白名单但没人读」应含 ERIX_SESSION_AUTO_TITLE');
+  assert.deepEqual(inv.warnings, [], `真实 compose 不该有可疑形状，实际=${JSON.stringify(inv.warnings)}`);
+});
