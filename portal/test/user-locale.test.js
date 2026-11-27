@@ -1,7 +1,7 @@
 // issue #828 P1：账号级语言偏好 users.locale 的读写、归一化、审计。
 // 隔离约定（docs/testing.md §2.1）：内存 fake pool，不碰真实 DB / docker。
 // 前端落 cookie 是 P2（portal/frontend/**），本文件只钉后端契约。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,6 +12,22 @@ import * as auth from '../src/auth.js';
 import * as admin from '../src/admin.js';
 import { FakePool } from './fake-pool.js';
 import { normalizeUserLocale } from '../src/db.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 station-locale-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 // ---- normalizeUserLocale：归一化表的逐字钉（白名单在应用侧，DB 不锁）----
 test('normalizeUserLocale 归一化表逐字符合契约', () => {
@@ -119,7 +135,7 @@ class LocalePool extends FakePool {
 }
 
 async function startServer({ users = [], pool: customPool } = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-locale-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-locale-')));
   fs.mkdirSync(path.join(staticDir, 'app'), { recursive: true });
   fs.writeFileSync(path.join(staticDir, 'app', 'index.html'), 'IDX');
   const config = {
