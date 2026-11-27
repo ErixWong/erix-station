@@ -103,6 +103,17 @@ export function makeStore(key, { request, runId }) {
       // 由 `foldLedgerRecords` 原样返回**入参本身**，一个字节不改。
       return foldLedgerRecords(records);
     },
+    /**
+     * issue #501：与 `load()` 共用 peer（= portal internal 端点）的同一条读路径，只是**不过
+     * `foldLedgerRecords`**——返回 `load()` 会喂给折叠的那同一批原始行（折叠前）。
+     * 上游 #714/#765（`host-consumer-contract.md`）：`foldMessageRows(await loadRawRows(r))` 必须逐字
+     * 等于 `await load(r)`，所以这里不复制第二份读路径、也不在此折叠；未知 runId ⇒ 空数组。
+     * 本站是引擎 `appendUserTurn` 快路径结清悬空 `tool_use` 的唯一账本来源，缺它就报 `ledger_probe_absent`。
+     */
+    async loadRawRows(r) {
+      const res = await requestWithRetry('loadRawRows', { runId: r });
+      return Array.isArray(res?.records) ? res.records : [];
+    },
     async recall(r, fromRound, toRound, pattern) {
       const res = await requestWithRetry('recall', { runId: r, fromRound, toRound, pattern });
       return typeof res?.text === 'string' ? res.text : '';

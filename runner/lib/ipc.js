@@ -85,6 +85,8 @@ export const MSG = {
 export const STORE_METHODS = new Set([
   'appendRound',
   'load',
+  // issue #501：引擎 `appendUserTurn` 快路径结清悬空 `tool_use` 的唯一账本来源（与 `load` 同源、不折叠）。
+  'loadRawRows',
   'markRunState',
   'saveRunState',
   'loadRunState',
