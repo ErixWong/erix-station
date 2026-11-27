@@ -4101,7 +4101,12 @@ registry 这一层拒越界（写进去就是“管理台存了个容器不会�
 - `200` ⇒ `{ "item": { …同 GET 的一项… } }`。DTO **只来自 `RETURNING`**，所以「我以为是这个值」与
   「库里现在是这个值」不会分离。`item` 的 `label` / `hint` **按请求 locale 出**（与 GET 同一套谈判，
   #803 返修 M1）：前端 `replaceRuntimeSetting` 会拿它顶掉界面上的那一行；`locale` 不参与任何裁决，
-  审计与校验错误文案仍恒中文。
+  但**错误文案按请求 locale 出**（#803：`RuntimeSettingsError` 带中英对，出口按语言挑）——
+  写侧四类校验错（未登记的 key、值不是 JSON 标量两档、值不是有限数）与「审计没写进去」那条 500 都算。
+- **审计记录本身没有「文案」**：它是结构化四元组（`actor_id` / `action` / `target` 形如
+  `runtime_setting:<key>` / `details` 为 `{ key, value, previous_value }`）写进 `audit_log`，**不含自由文本**，
+  因此不存在「审计文案恒中文」这回事。今天也**没有读它的路由**（界面上取不到，给人查库排障用）；
+  将来要显示，该翻的是**渲染层**（前端 i18n），不是这条记录。
 - `400 validation_failed`，`details.field` 三档：`key`（未登记；`details.known` 列可用 key）、
   `value`（形状/区间不过）、`body`（体不是对象）。
 - **数值的两侧之分（`1e3` 这一类，#709 unproven 裁定）**：写侧只认 body 里的 JSON 类型。——
