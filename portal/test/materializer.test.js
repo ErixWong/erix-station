@@ -2,7 +2,7 @@
 // P5 去项目化（directory-as-project §5）：项目级物化退役——平台文件 = 家目录骨架 +
 // FDE 级 ~/.erix/ports.json；旧项目脚手架靠 stale 清理（manifest 机制）自然移除。
 // 隔离约定（docs/testing.md §2.1）：注入临时目录，不碰真实 /srv/erix/users。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import { mock } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
@@ -32,6 +32,22 @@ import { previewAllocationPlan, PREVIEW_PORTS, PREVIEW_PORT_COUNT } from '../src
 // 会刷 chown 告警、属主也不是配置声称的那个）。
 const SELF_UID = process.getuid?.() ?? 1000;
 const SELF_GID = process.getgid?.() ?? 1000;
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// tmpDirs 只收本单点名的 pinproxy-* 夹具（mat-test-* 那批由各自 finally 收尾，本单不动）；
+// 漏一个就会在 /tmp 留下 pinproxy-*，而 scripts/check-tmp-hygiene.mjs 正是数这个名字。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mat-test-'));
@@ -215,7 +231,7 @@ test('buildFilePlan：下发 ~/bin/github-pinproxy.py 且归入平台管理路�
   // 语法面：有 python3 就真编译一遍；没有就只钉形状（CI ubuntu-latest 有 python3）。
   const py = spawnSync('python3', ['-c', 'import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)'], { input: undefined });
   if (py.error === undefined) {
-    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pinproxy-')), 'p.py');
+    const f = path.join(trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'pinproxy-'))), 'p.py');
     fs.writeFileSync(f, entry.content);
     const r = spawnSync('python3', ['-m', 'py_compile', f]);
     assert.equal(r.status, 0, `代理脚本必须能被 python3 编译：${r.stderr}`);
