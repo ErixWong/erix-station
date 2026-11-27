@@ -10,7 +10,7 @@
 // 真机 EACCES 形态（uid ≠ FDE_USER_UID）本机复现不了：eric 就是 uid 1000 = 目录属主，`chmod 0700`
 // 对自己照样可读。所以「读不到」分支用注入的 fsImpl 复现（假 accessSync 抛 EACCES），并在交付报告里
 // 另附一次 **docker 里以 uid 1001 真跑**的取证（同一棵树，真 EACCES，不是夹具）。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,6 +28,23 @@ import {
 } from '../portal/integration/lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本单只点名 envFileFixture 的 erix-554-（其余 erix-495*/-oracle 那批已有 t.after 收尾，本单不动）。
+// force 是必需的：envFileFixture 自己的 `t.after` 已 rm 过同一个 root，这里再清一道必须容忍「已经没了」；
+// 真漏注册还是会漏在 /tmp（#875 的闸当场抱住），force 不掩盖漏注册。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 /** 真实 EACCES 复现不了（属主就是自己）⇒ 用注入的 fsImpl 造 EACCES。 */
 const EACCES = () => Object.assign(new Error('permission denied'), { code: 'EACCES' });
 /** 造一个「既不是缺失也不是权限」的 errno（第三轮 MED 的注入面：`EIO` 不许被塞进那两个桶）。 */
@@ -1087,7 +1104,7 @@ const ISOLATED_FOUR = Object.freeze({
 
 /** 写一份「共享 deploy/.env」夹具（根目录先 realpath 归一：`$TMPDIR` 本身是链接时也不受牵连）。 */
 function envFileFixture(t, sharedLines) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-554-')));
+  const root = fs.realpathSync(trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-554-'))));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const envFile = path.join(root, 'shared.env');
   fs.writeFileSync(envFile, sharedLines.join('\n') + '\n');
