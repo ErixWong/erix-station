@@ -1,7 +1,7 @@
 // HTTP 层路由测试：internal runstate 端点（PUT/GET /api/internal/runs/:id/runstate，issue #43）。
 // 0.14.0 status 与快照分列（runs.run_state / runs.run_state_status）：写入需有效租约 + 非终态；
 // 终态后写 409 run_terminal、读放宽（同 U9 口径）。fake pool，不碰真实 DB。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,8 +10,23 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import { FakeInternalPool, seedClaimable } from './fake-internal-pool.js';
 
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startServer 建的 staticDir 一律进 tmpDirs，afterEach 逐格 rm（**不带 force**：rm 失败当场红）。
+// 本来三格 `finally` 里各有一句 `rmSync(..., force: true)`，已收拢到这一层：收尾只有一个出处，
+// 不会和 afterEach 抢着删同一个目录（ENOENT 会把绿格变红）。断言语义未动。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
+
 async function startServer(pool) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'INDEX');
   const config = {
     cookie: cookieSettings('dev-http', 604800),
@@ -151,7 +166,6 @@ test('runstate 路由：PUT/GET 往返、租约校验、终态后写 409/读放�
     assert.equal(post.status, 405);
   } finally {
     await s.close();
-    fs.rmSync(s.staticDir, { recursive: true, force: true });
   }
 });
 
@@ -197,7 +211,6 @@ test('U2 /state：cancelling 期间的 running 写入 → 200 幂等 ack（不�
     assert.equal(pool.queue[0].claim_token, null, 'ack 不得回填租约');
   } finally {
     await s.close();
-    fs.rmSync(s.staticDir, { recursive: true, force: true });
   }
 });
 
@@ -244,6 +257,5 @@ test('#640 退役回归：四个 /checkpoint* 端点带有效内部认证打过�
     assert.notEqual(aliveSession.status, 404, 'session 作用域 /transcript/:key 还活着 ⇒ 不得 404');
   } finally {
     await s.close();
-    fs.rmSync(s.staticDir, { recursive: true, force: true });
   }
 });

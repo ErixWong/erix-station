@@ -29,7 +29,7 @@
 // ⚠ 预算下界不是自由参数：引擎算 `budget = cw - maxOutput - max(2000, ⌈cw×比例⌉)`
 //   （`src/compact/budget.js:23-25`），预留硬底 2000 ⇒ `cw: 900` 直接 `Computed context budget must be
 //   positive (got -1300)`，四格空转。`cw: 6000` 是"够小所以必然折叠、又不至于被硬底打死"的取值。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -45,6 +45,19 @@ import { summarizerFailureNotice } from '../lib/engine-notices.js';
 
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(RUNNER_DIR, rel), 'utf8');
+
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// runFoldingScene 建的 notesDir（`fold-e2e-`）进 tmpDirs，afterEach 逐格 rm（**不带 force**：rm 失败当场红）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 const PARAMS_MARKERS = /\/\* #309:engine-model-params:start \*\/([\s\S]*?)\/\* #309:engine-model-params:end \*\//;
 
 /**
@@ -136,7 +149,7 @@ function recordingProvider({ toolCalls = 5, summarizer = 'ok' } = {}) {
  * `events` 是**真 `onEvent`** 收到的事件流（M3.2/M3.3 要的是引擎真发的形状，不是手写的）。
  */
 async function runFoldingScene({ semanticEnabled = true, summarizer = 'ok' } = {}) {
-  const notesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fold-e2e-'));
+  const notesDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'fold-e2e-')));
   const sessionId = 'sess-e2e-1';
   const noteTools = await createNotesTools({ scopeRef: sessionId, notesDir });
   const deliveries = [];

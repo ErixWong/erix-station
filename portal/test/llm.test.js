@@ -3,7 +3,7 @@
 //       route outbox 联动（aggregate='llm_binding'）/ audit 不含 key / 掩码回显（响应体无完整 key）/
 //       migration 文件文本断言（无 PG 环境的弱断言，TODO e2e 真跑）。
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -46,6 +46,20 @@ import { FakePool } from './fake-pool.js';
 import { createUserActivityWorld } from './fake-user-activity.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startAdminServer 建的 staticDir（`station-llm-static-`）进 tmpDirs，afterEach 逐格 rm（**不带 force**：
+// rm 失败当场红，不拿「尽力了」冒充清干净）。本文件其余用例不建 /tmp 目录（注入内存 fake pool）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // 内存 fake pool：llm_providers / llm_models / fde_llm_bindings / users +
@@ -2273,7 +2287,7 @@ class HttpLlmPool extends FakePool {
 }
 
 async function startAdminServer(seed = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-llm-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-llm-static-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'INDEX');
   const config = {
     cookie: cookieSettings('dev-llm', 604800),

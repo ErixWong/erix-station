@@ -12,7 +12,7 @@
 //   ④ 登录响应增字段 `password_change_required`（两个发会话的分支都有，纯 additive）。
 //
 // 隔离约定（docs/testing.md §2.1）：内存 fake pool + `server.listen(0)`，不碰真实 dev 库/容器。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -27,6 +27,21 @@ import { FakePool } from './fake-pool.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC = (name) => fs.readFileSync(path.join(HERE, '../src', name), 'utf8');
+
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startServer 建的两个 /tmp 目录（station-255-static- / station-255-space-）一律进 tmpDirs，
+// afterEach 逐格 rm（**不带 force**：rm 失败当场红，不拿「尽力了」冒充清干净）。
+// `overrides` 里换了这两个路径也不矛盾：本文件建过的那一份照样登记（它是空的，rm 不会弄坏东西）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const ADMIN = {
   id: 'a0000000-0000-4000-8000-000000000001', login: 'root', display_name: 'root',
@@ -193,7 +208,7 @@ class MustChangePool extends FakePool {
 }
 
 async function startServer({ pool, overrides = {} } = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-255-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-255-static-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   fs.mkdirSync(path.join(staticDir, 'app'), { recursive: true });
   fs.writeFileSync(path.join(staticDir, 'app', 'index.html'), 'SECRET_VUE_INDEX');
@@ -214,7 +229,7 @@ async function startServer({ pool, overrides = {} } = {}) {
     maxLoginLength: 128,
     maxPasswordLength: 256,
     staticDir,
-    userSpaceRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'station-255-space-')),
+    userSpaceRoot: trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-255-space-'))),
     ...overrides,
   };
   const server = createServer({ pool, config, llmGateway: { async listCredentials() { return { credentials: [] }; }, async listModels() { return { data: [] }; } } });

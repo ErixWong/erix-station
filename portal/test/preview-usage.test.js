@@ -12,7 +12,7 @@
 // （`state <> 'released'` + `port BETWEEN $1 AND $2` + LEFT JOIN users 取 fde_name），
 // 这样「released 不占位」这条断言测的是实现真的发出去的 SQL，而不是测试自己写的过滤条件。
 // ⚠ 谓词是**解析后按行求值**的（`compileWhere()`），不是子串前缀匹配——见那段注释（#256 评审 B1）。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -35,6 +35,19 @@ const BASE = 'fde.erix.vip';
 const PUBLIC_BASE = 'http://station.fde.erix.vip:8090';
 const LOG = { log() {}, warn() {}, error() {} };
 const SRC_DIR = path.dirname(fileURLToPath(new URL('../src/portalloc.js', import.meta.url)));
+
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startUsageServer 建的 staticDir（`station-usage-static-`）进 tmpDirs，afterEach 逐格 rm（**不带 force**）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 /** 第 n 段（n=0 ⇒ 池起点那一段）的起点。测试里**不用**端口字面量，避免自己变成第二套真相源。 */
 function blockStart(nth) {
@@ -460,7 +473,7 @@ class UsageHttpPool extends FakePool {
 }
 
 async function startUsageServer({ store, users = [ADMIN, ALICE] } = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-usage-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-usage-static-')));
   const config = {
     cookie: cookieSettings('dev-http', 604800),
     sessionTtlSeconds: 604800,

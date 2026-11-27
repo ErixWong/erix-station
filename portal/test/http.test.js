@@ -1,6 +1,6 @@
 // HTTP 层集成测试（无真实 DB）：createServer + FakePool，覆盖两步登录、畸形 hash 401、
 // 限流 429、413 信封、Content-Type 400、字段上限、静态路径穿越、滚动续期、旧路径 307。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -16,6 +16,20 @@ import {
   invalidatePendingTokenTtlCache,
   invalidateMaxPasswordLengthCache,
 } from '../src/runtime-settings.js';
+
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// 本文件每个 mkdtemp 建的 /tmp 目录都进 tmpDirs，afterEach 逐格 rm（**不带 force**：rm 失败当场红，
+// 不拿「尽力了」冒充清干净）。`scripts/check-tmp-hygiene.mjs` 数的是这些名字在 `/tmp` 的新增。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const TEST_GIT_HOST_ID = 'c0000000-0000-4000-8000-000000000011';
 const TEST_LLM = { provider_id: 'mock-provider', main_model_id: 'mock-main' };
@@ -40,7 +54,7 @@ function createTestLlmGateway({ unavailable = false } = {}) {
 }
 
 async function startServer({ users = [], overrides = {}, pool: customPool, llmGateway = createTestLlmGateway() } = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   // issue #61 P2：Vue SPA dist 由 Docker 注入 staticDir/app/（见 portal/Dockerfile），/ 翻转后服务它。
   fs.mkdirSync(path.join(staticDir, 'app'), { recursive: true });
@@ -963,7 +977,7 @@ test('畸形 totp_secret（非法 base32）→ 401 totp_invalid，不 500', asyn
 });
 
 test('KDF 队列满 → 503 kdf_busy（快速失败，不无限排队）', async () => {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const password = 'pw';
   const passwordHash = await auth.hashPassword(password);
