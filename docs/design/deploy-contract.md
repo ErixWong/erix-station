@@ -274,7 +274,7 @@
 >
 > - **镜像**：只允许**预拉取/本地 build 的 `FDE_IMAGE` 不可变引用**（issue #27 双轨两形态：① `image@sha256:…`；② `sha256:<imageId>`，env §10）；拒绝任何 tag-only / 其它镜像 / `image` 为空。
 > - **网络**：只允许 `fde-<name>`（本 FDE 的网络名，与 `fde_networks.network_name` 一致）；拒绝 `backend` / `host` / `bridge` / 其它网络名。
-> - **bind mount**：白名单 = `USER_SPACE_ROOT/<fde>/{home,projects,worktrees,cache}` 四条 rw 宿主源 + **一条只读源** `USER_SPACE_ROOT/<fde>/platform/git → /run/erix/git:ro`（#399 平台托管凭据；dest 固定、mode 必须 `ro`、源必须以 `platform/git` 结尾，三条任一不满足即 403）（user-space §2.4 / §6.4）；拒绝其它宿主路径（尤其 `/var/run/docker.sock`、`/docker/**`、`/`）。
+> - **bind mount**：白名单 = `USER_SPACE_ROOT/<fde>/{home,projects,cache}` 三条 rw 宿主源（单一真值 = `provisioner.js#JAIL_RUN_CWD_HOST_SUFFIXES`）+ **一条只读源** `USER_SPACE_ROOT/<fde>/platform/git → /run/erix/git:ro`（#399 平台托管凭据；dest 固定、mode 必须 `ro`、源必须以 `platform/git` 结尾，三条任一不满足即 403）（user-space §2.4 / §6.4）；拒绝其它宿主路径（尤其 `/var/run/docker.sock`、`/docker/**`、`/`）。v0.1.x 白名单里还有第四条 `worktrees`，已随 **D8 修订 + #81 P2.5** 拆除（⇒ [`fde-platform.md`](fde-platform.md) 附录 A.1）。
 > - **禁止项（硬拒绝）**：`--privileged`、`--pid=host`、`--network=host`、`--device`、`--cap-add` 超出 §6.2 白名单、`--security-opt` 以外的任意 security 选项、`--publish`（`-p`）。
 > - **`--ip`**：只允许该 FDE `/29`（或 `/28`）内的固定位（`.2`）；其它 IP 拒绝。
 >
@@ -337,7 +337,7 @@
 |---|---|---|
 | `/srv/erix/users/<fde>/home` | `/home/<user>` | `erix`(1000) |
 | `/srv/erix/users/<fde>/projects` | `/home/<user>/projects` | `erix`(1000) |
-| `/srv/erix/users/<fde>/worktrees` | `/home/<user>/worktrees` | `erix`(1000) |
+| `/srv/erix/users/<fde>/worktrees` | `/home/<user>/worktrees` | **已拆除**（D8 修订 + #81 P2.5，原 `erix`(1000)）：agentd 不再建 worktree，老工位里可能仍有残留目录 |
 | `/srv/erix/users/<fde>/cache` | `/home/<user>/cache` | `erix`(1000) |
 | `/srv/erix/users/<fde>/platform/git`（**`:ro`**，#399） | `/run/erix/git` | portal(root)，目录 `0755`/文件 `0644` |
 
