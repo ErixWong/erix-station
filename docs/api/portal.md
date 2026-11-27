@@ -5170,6 +5170,11 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | ~~S4~~ | ~~`GET /api/internal/transcript/:key/checkpoint/latest`~~ | **已退役（#640）** | 同上 |
 | S5 | `PUT /api/internal/transcript/:key/runstate` | store：`saveRunState` / markRunState 终态标记（§9.8b） | `chat_sessions.engine_run_state` jsonb 合并写 |
 | S6 | `GET /api/internal/transcript/:key/runstate` | store：`loadRunState`（§9.8b） | 只读；无 → 204 |
+| — | `GET /api/internal/runs/:id/runstate/status` | store：`loadRunStateStatus`——引擎 run-state **终态标记**的只读通道（§9.8c）| 只读；无 → 204 |
+| — | `GET /api/internal/transcript/:key/runstate/status` | 同上，session 作用域（§9.8c）| 只读；无 → 204 |
+| R1 | `GET /api/internal/transcript/:key/recovery-rows` | store：`listRecoveryRows`（账本恢复行，#500，§9.8c）| 只读；**空 = `{rows:[]}`，永不 204** |
+| R2 | `PUT /api/internal/transcript/:key/recovery-rows` | store：`appendRecoveryRow`（§9.8c）| `PRIMARY KEY (transcript_key, dedup_key)` + payload 指纹 |
+| R3 | `DELETE /api/internal/transcript/:key/recovery-rows` | store：`clearRecoveryRows`（fresh start 前清台，§9.8c）| 天然幂等（`{cleared:false}` = 本来就没有）|
 | — | `GET /api/internal/stream` | SSE 下行通道（§9.12） | — |
 
 > usage **不单设端点**：随 U2 终态载荷上报（§9.9）。
@@ -5715,6 +5720,85 @@ resume=true 时不传 initialMessages/initialUserMessage（引擎恢复记录即
 与 env `STATION_HISTORY_MAX_*` 全部删除；非 resume 只传 `initialUserMessage = run.task`，对齐上游 CLI 的
 `...(resume ? {} : { initialUserMessage })`）。部署顺序：
 **portal 先上（S 端点纯增量，旧 runner 无感），FDE 镜像（runner/agentd/worker）后上**。
+
+### 9.8c 终态标记通道与账本恢复行（#500 / #43；#777 A3 补登记）
+
+本节五条（下表）**只有 session 与 run 两种作用域的内部面**，鉴权与其余 U/S 端点同构：每请求
+`Authorization: Bearer <per-container token>`（§9.1）+ session 属主闸（`fetchSession`）+ writer run fencing
+（`?run_id=` 必带、writer run 必须属于该 session、且 `X-Claim-Token` 与当前活租约相等）。
+**它们不是同源接口**：容器↔portal 的内部通道，走 Traefik 的 `ipAllowList`（§9.1 行），浏览器拿不到那个 token。
+
+| 端点 | 响应 | 幂等 / 只读 |
+|---|---|---|
+| `GET /api/internal/runs/:id/runstate/status` | `200 {status:{…}}` 或 `204`（无体）| 只读 |
+| `GET /api/internal/transcript/:key/runstate/status` | 同上 | 只读 |
+| `GET /api/internal/transcript/:key/recovery-rows` | `200 {rows:[…]}`；**空 = `{rows:[]}`，永不 `204`** | 只读 |
+| `PUT /api/internal/transcript/:key/recovery-rows` | `200 {added:true\|false}` | 幂等（同 `dedupKey` 同 payload ⇒ `false`）|
+| `DELETE /api/internal/transcript/:key/recovery-rows` | `200 {cleared:true\|false}` | 天然幂等 |
+
+#### 终态标记通道：`/api/internal/runs/:id/runstate/status` 与 `/api/internal/transcript/:key/runstate/status`
+
+这是 §9.8a / §9.8b 两个 `…/runstate` 写端点的**只读对应面**（引擎 `loadRunStateStatus`）。
+
+- **读的是独立列，不是 blob**：run 作用域读 `runs.run_state_status`，session 作用域读
+  `chat_sessions.engine_run_state_status`（列 = 迁移 `0014-run-state-status.sql`）。列有值时它**就是响应**，
+  本站不重写、不补充：`200 { "status": <那一列的原文> }`——所以 `status` 里有什么由写侧决定
+  （§9.8a 写的 `{status, runId, ts}`，`http.js` 不加工）。
+- **旧形态回退（兼容面，不是第二个真相源）**：状态列为 `NULL` 时才去看旧 `run_state` / `engine_run_state` 里的
+  `state` 字符串，回 `200 {status:{status:"<那个串>"}}`；两者都没 ⇒ **`204` 无体**（不是 `200 null`）。
+  实现：`internal.js:1933-1951`（回退与抛错都在这一处，两条共用）。
+- **形状不合是 `500`，不是 `204`**：有状态列但它不是带非空 `status` 字符串的对象，或旧 blob 不合法 ⇒
+  `500 run_state_status_corrupt`（`internal.js:1933-1951`）。区别是故意的：「没终态」与「账坏了」必须分开。
+- **`X-Claim-Token` 只在非终态时校**（与 §9.8a 的 `GET …/runstate` 同口径）：`loadRunStateStatus` 先判
+  `isTerminal`，非终态才 `assertClaimToken`（session 那条：`internal.js:2009-2010`；run 那条：`internal.js:2206-2207`）
+  ⇒ **终态后仍可读**（这是它与下面三条恢复行端点的**关键差异**）。
+- **session 那条额外要求 `?run_id=<writer runId>`**：与 §9.8b 整个分支共用一道闸（缺失 ⇒ `400 validation_failed`，
+  `details.field='run_id'`，`http.js:6040-6044`）；writer run 不属于该 session ⇒ `400 transcript_key_mismatch`。
+
+#### 账本恢复行三件套：`/api/internal/transcript/:key/recovery-rows`（issue #500）
+
+引擎 0.33.0 的三个可选方法（`listRecoveryRows` / `appendRecoveryRow` / `clearRecoveryRows`）的 portal 面；
+表 = `transcript_recovery_rows`（迁移 `0038-transcript-recovery-rows.sql`，**新表而非给 `transcript_rounds` 加列**，
+原因写在那份迁移的文件头：恢复行**不进** `load()` / `loadRawRows()`）。⚠ **只有 session 作用域**：
+本站**没有** run 作用域的 `/runs/:id/recovery-rows`（引擎的 `runId` 在这里就是 transcript key = sessionId）。
+
+- **鉴权三层与其余 S 端点逐字一致，但**不享**终态豁免**：三个方法都是无条件 `assertClaimToken`
+  （`internal.js:2094`、`:2106`、`:2135`，对照 `:2010` / `:2207` 的条件式写法）⇒ **run 终态后三者都 `409 lease_lost`**，连 `GET` 也一样。这与上面的
+  `runstate/status`（终态可读）**不同**，也是本站故意保留的差异：恢复行只在「跑着/要续跑」时才有意义。
+- **`GET` 永不 `204`**：空集是 `200 {"rows":[]}`。行序是 **`append_seq` 升序**（持久化追加序，**不是时间**；
+  `transcript-store.js:386-395`），返回的是 `record` **本体**（表上的 `round` 列**不合成进去**）。
+  为何不返 `204`：契约里「空」（合法降级）与「读坏了」（非数组 ⇒ `recovery_rows_unreadable` 终局）是两个结局，
+  `204` 会被解析成 `null` 而把两者抹平。
+- **`PUT` 的幂等与冲突**：幂等键 `PRIMARY KEY (transcript_key, dedup_key)`（迁移 0038:63）；payload 指纹与轮记录
+  **同一把尺**（顶层剔除 `dedupKey`/`roundKey`/`round`/`ts`）⇒ 同键同 payload ⇒ `{"added":false}`（不新增、不覆盖），
+  同键**异** payload ⇒ `409 recovery_row_conflict` + `details {dedupKey, existingFingerprint, incomingFingerprint, differingFields}`，
+  **既不覆盖也不静默丢**（`internal.js:2101-2129`）。本站**只把这一种**失败扮成 409：其他失败一律原样上抛成 5xx
+  （agentd 对读方法只有限重试，`RECOVERY_ROWS_MAX_RETRIES`）。
+- **`PUT` 的请求体约束（两道闸，顺序有坑）**：先过 §1.5 的 `Content-Type` 闸（这条**有** `requireJson`），
+  再过 HTTP 层体积闸 **640 KiB**（`http.js:5893`，超限 ⇒ `413 payload_too_large`（`readJsonBody`））；之后是端点自己的 record 闸
+  （`internal.js:2060-2090` 的 `assertRecoveryRowBody`）：`kind` 必为 `"recovery"` / `dedupKey` 非空且 ≤**255** 字
+  （与迁移 0038:53 的 `CHECK (length(dedup_key) <= 255)` 同一个数）/ `round` 非负安全整数 / record 本体 ≤**512 KiB**
+  （`internal.js:2050`）——**两个数不同源不是笔误**：512 KiB 是「带一份 `partial-text`」的业务上限，640 KiB 是信封上限。
+  ⚠ **一个未钉住的落点**：`recoveryEvent = "tool-executed"` 的形状守卫在**存储层**（`transcript-store.js:296-302` 的 `recoveryRowWriteProblem`），
+  它抛的是**素 `Error`**，不是 `InternalError` ⇒ 按 `http.js:1155` 的顶层映射会落 **`500 internal`** 而不是 `400`
+  （本节只现读源码、未跑端到端，所以标为**未实测**；要它稳定返 400 得改实现，不是改文档）。
+- **`DELETE`**：`{"cleared":true}` = 至少删了一行，`false` = 本来就没有（**两者都是成功**）；引擎在 **fresh start、
+  第一轮写之前**调它。它**只打恢复行表**，不碰 `transcript_rounds`（`transcript-store.js:400-402` 把「全站 `DELETE FROM transcript_rounds` 零命中」当成折叠重建可证无损的前提，这条 DELETE 一个字节都不碰那张表）。
+- **与 #341 / #367 的 `partOf` 链式行无关**（工单点名要查的一条）：恢复行**永不载正文**（`messages` 恒空，
+  迁移 0038 文件头），因此结构上不可能带分片行；而 `partOf` **链**（不是「一跳」）的解链只存在于**账本读侧**
+  `portal/src/transcript-fold.js:36-45`（上游 erix-agent #415 未修、本站先解链）。⇒ **这五条端点的读写两侧都不需解链**，
+  不要为了「照贴 #341」而往恢复行上拼折叠口径。
+- **错误码（除 `recovery_row_conflict` 是 #500 自带的新码，其余全是 §9.13 的既有码）**：`401 token_invalid` /
+  `401 token_revoked`（`authenticateContainer`，`internal.js:206`、`:219-221`）/ `400 validation_failed`（含
+  `?run_id=` 缺失与 transcript key 空或 >128 字，`details.field='key'`，`internal.js:1786-1788`）/
+  `404 session_not_found` / `403 session_ownership_mismatch`（`internal.js:1792-1795`）/ `404 run_not_found` /
+  `403 run_ownership_mismatch`（`internal.js:254-257`）/ `400 transcript_key_mismatch`（writer run 不属于该 session，
+  `internal.js:1802-1806`）/ `409 lease_lost` / `413 payload_too_large`（仅 `PUT`）。
+  ⚠ 内部面的属主闸是 `internal.js` **自己那份** `fetchSession` / `fetchRun`，**不是**用户面的
+  `sessions.js#fetchSession`：两套的落点不同，别把 §4.24.9 那套「形状非法也回 404」的口径搬过来。
+  本面**不做 UUID 形状预检**（`decodeUuid` 只解码 + 转小写），所以**形状非法的 id 串**会直接进 `uuid` 列比较
+  ⇒ PG `22P02` ⇒ 按 `http.js:1155` 落 **`500 internal`**，**不是 404**（PG 侧的 `22P02` 是既有实测结论，
+  见 §4.24.4；端到端这一半本单**未实测**）。
 
 ### 9.9 usage 上报
 
