@@ -1350,7 +1350,7 @@ function intOr0(value) {
 // 也可能是平铺）收成额度视图；budget_usd/budget_period 一律取 DB（真相），其余取网关读数。
 // spend_scope 是前端标签的**唯一依据**：网关 spend 是运行计数器——只有 key 上存在 budget_duration
 // 时才按周期归零（⇒ 'period'，本周期已用）；无 budget_duration（无额度）时是终身累计（⇒ 'lifetime'）。
-// 实测 dev eric 的 key spend=0.084178176，而近 14 天日聚合合计只有 0.038631168 ⇒ 无额度时把
+// 实测 dev <fde_name> 的 key spend=0.084178176，而近 14 天日聚合合计只有 0.038631168 ⇒ 无额度时把
 // spend 当「今日已用」是错的，必须按 spend_scope 区分；前端不要自己重新推导。
 function projectQuota(dbBudgetUsd, dbBudgetPeriod, infoPayload) {
   const info = (infoPayload && typeof infoPayload === 'object' && infoPayload.info

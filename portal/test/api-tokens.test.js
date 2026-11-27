@@ -394,7 +394,7 @@ test('⑩ last_used_at 窗内只写一次（假库 UPDATE 计数 + 行值）', a
   await env.close();
 });
 
-// ⑪ 跨用户吊销守卫（直调 revokeToken 按 user_id 过滤）：拿 root 的令牌 id 去 eric 名下吊销
+// ⑪ 跨用户吊销守卫（直调 revokeToken 按 user_id 过滤）：拿 root 的令牌 id 去 <fde_name> 名下吊销
 // ⇒ outcome='missing'（原端点会转 404），且不误伤 root 的令牌。守卫仍在模块里 ⇒ 能力保留。
 test('⑪ 跨用户吊销 ⇒ missing 且不误伤他人令牌', async () => {
   const env = await harness();

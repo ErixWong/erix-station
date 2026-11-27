@@ -73,7 +73,7 @@ test('#234 判据 b：Sec-Fetch-Site=same-origin 放行（即使 Origin 缺失�
 });
 
 // 返修单的**核心回归门**（主 agent 亲审发现的缺陷）：`same-site` 不得直接放行。
-// 本站的真实形状：portal 在 `station.fde.erix.vip`、预览在 `eric-p-22000.fde.erix.vip` ⇒ 同注册域 `erix.vip`、
+// 本站的真实形状：portal 在 `station.fde.erix.vip`、预览在 `alice-p-22000.fde.erix.vip` ⇒ 同注册域 `erix.vip`、
 // 不同 origin ⇒ 浏览器给预览页的 XHR 正好发 `Sec-Fetch-Site: same-site`；而 cookie 是 host-only + `SameSite=Lax`
 // （portal.md §2.5，Lax 也按注册域判）⇒ cookie 照样携带、写副作用真实发生 = 真 CSRF（见 portal.md §2.11）。
 // 本例同时是原「判据 b：same-site 直接放行」那批断言按新口径改写后的去处（三种结局全在一条里）。

@@ -142,7 +142,7 @@ compose 的插值默认值、`loadConfig({}).adminPort` 三者逐字比对，任
 ```
 
 > ⚠ **私钥属主是硬要求，不是洁癖**（2026-11-05 上线当场踩到）：`station-edge` 容器里 root **没有
-> `CAP_DAC_OVERRIDE`**（compose 收紧了 capabilities），所以「root 属主 + 0600」才读得动；`eric`(1000)
+> `CAP_DAC_OVERRIDE`**（compose 收紧了 capabilities），所以「root 属主 + 0600」才读得动；`<fde_name>`(1000)
 > 属主的 `0600` 私钥会让 Traefik 报 `open …/tls.key: permission denied` + `Error while creating
 > certificate store`，而 **9443 上 TLS 握手直接失败**（`SSL_ERROR_SYSCALL`，连自签兜底都没有）。
 > 手工放证书时：`chown 0:0 tls.key && chmod 600 tls.key`（cert 644 即可）。#456 的上传面由 portal

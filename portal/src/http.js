@@ -197,7 +197,7 @@ function getBearerToken(req) {
  *     这个**位置**」，不是「对端的**身份**是 ingress」。
  *     为什么今天暴露面小（261125 现验）：`station_backend` 上只有平台自己的容器（`station-db` `172.32.0.2`、
  *     `station-litellm` `172.32.0.3`、`station-docker-proxy` `172.32.0.4`、`station-portal` 自己 `172.32.0.5`），
- *     FDE 工位容器只挂自己的 `/29`（`fde-eric` = `10.200.0.2/29`），从 `fde-eric` 内直连 portal 的 backend 地址
+ *     FDE 工位容器只挂自己的 `/29`（`fde-alice` = `10.200.0.2/29`），从 `fde-alice` 内直连 portal 的 backend 地址
  *     `172.32.0.5:8080` = NOT-REACHABLE ⇒ 今天被这条判据信任的私网对端 = **平台容器与宿主进程，不是 FDE 代码**。
  *     **换网络拓扑要重评**：FDE 侧能直连 portal、或 ingress 不在同一 L2 ⇒ 上面那句作废。
  *     读不到文件 / 无默认路由 /
@@ -476,7 +476,7 @@ function parseCsrfRequestAuthority(forwardedHostHeader, hostHeader, scheme) {
  *
  * **`same-site` 不直接放行**（#234 返修，2026-10-13 主 agent 亲审发现）：`Sec-Fetch-Site: same-site` 的规范语义是
  * 「同注册域、不同 origin」，而本站恰好**整站坐在同一个注册域 `erix.vip` 下**（portal 在 `station.fde.erix.vip`、
- * FDE 预览在 `eric-p-22000.fde.erix.vip`），且 session cookie 是 **host-only + `SameSite=Lax`**（portal.md §2.5）——
+ * FDE 预览在 `alice-p-22000.fde.erix.vip`），且 session cookie 是 **host-only + `SameSite=Lax`**（portal.md §2.5）——
  * `SameSite` 判的同样是注册域 ⇒ 预览 host 的 XHR **照样带上 portal 的会话 cookie**（Lax 不挡同站），CORS 只让它
  * 读不到响应、**写副作用已经发生** = 教科书意义上的 CSRF。这正是本站最现实的攻击面（预览 host 上跑的、agent 写的
  * 应用去 POST portal API），所以 `same-site` 必须落到判据 c 的 Origin authority 精确比对（同注册域但不同 origin

@@ -169,8 +169,8 @@ export function hostGateDecision(input: HostGateInput): HostGateDecision {
     //
     // ⚠ 2026-11-06 真机无限环（用户报「8443 和 9443 之间疯狂跳转」）的根因就在这一行原来写的是
     // `hashUrl(userBaseUrl, toPath)`（跨 host 回用户面）：
-    //   两个 host 的登录 cookie 是 host-only ⇒ **它们可以是不同账号**（8443=admin、9443=eric 是真实状态）。
-    //   于是：8443 `/` ⇒(无工位 admin 改写 `/admin/users`)⇒ 9443 `/admin/users` ⇒(9443 的会话是 eric,
+    //   两个 host 的登录 cookie 是 host-only ⇒ **它们可以是不同账号**（8443=admin、9443=<fde_name> 是真实状态）。
+    //   于是：8443 `/` ⇒(无工位 admin 改写 `/admin/users`)⇒ 9443 `/admin/users` ⇒(9443 的会话是 <fde_name>,
     //   requiresRole 失败)⇒ 9443 `/` ⇒(管理台 host + 非 admin 路径 ⇒ 跳用户面)⇒ 8443 `/` ⇒ …
     //   每一跳都"合理"，合起来是环 —— 而且两边的身份都自洽，任何单侧判据都看不出来。
     // 修法：**管理台 host 只在自己家里改道**（`/` ⇒ `/admin/users`，未登录再由守卫送去 `/login`）。

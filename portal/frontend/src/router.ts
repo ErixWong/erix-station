@@ -182,7 +182,7 @@ export interface RouterDeps {
  * 跨 host 跳转熔断（2026-11-06）。
  *
  * 为什么需要它：`hostGate` 的每一跳单看都合法，但**两个 host 的登录 cookie 是 host-only ⇒ 可以是不同账号**
- * （8443=admin、9443=eric 是真实状态），于是「各自把自己认为不该在这里的路径送走」会互相撞成一个环。
+ * （8443=admin、9443=<fde_name> 是真实状态），于是「各自把自己认为不该在这里的路径送走」会互相撞成一个环。
  * 根因已在 `hostGate.ts` 修掉（管理台 host 不再跨 host 跳转），这里是**与具体路径无关的上界**：
  * 10 秒窗口内超过 3 次跨 host 跳转就停住 + console.error（诊断能截图给运维）。
  *

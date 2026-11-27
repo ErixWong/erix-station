@@ -11,7 +11,7 @@
 
 ## 0. 总览
 
-> **环境取值纪律**：契约形状只由规格 + principles 决定，**与环境无关**。文中一切域名/URL 以 env.md §10 的部署变量（`BASE_DOMAIN` / `PORTAL_HOST` / `FDE_WILDCARD_HOST`）为准；JSON 示例中出现的具体域名（`station.fde.erix.vip`、`eric-p-8001.fde.erix.vip` 等）均假设 **`BASE_DOMAIN=fde.erix.vip`（#57 定稿：`BASE_DOMAIN` = **伞域** = `fde.<可注册域>`，不再是可注册域）**，仅作 mock 示例，不构成设计约束。**`*.localhost` 不是“开发期变通”**：它是 `BASE_DOMAIN` 的**代码默认兜底值（本地起服，env §0/§1）**，代码默认值为 `localhost`（即本地起服 `http://station.localhost:8090`，不套伞域前缀），代码路径与生产完全一致（dev `http://station.<BASE_DOMAIN>:8090`，生产 `https://station.<BASE_DOMAIN>`，scheme/端口从公开入口配置派生）。部署目标环境不一定是任何已实测的机器。
+> **环境取值纪律**：契约形状只由规格 + principles 决定，**与环境无关**。文中一切域名/URL 以 env.md §10 的部署变量（`BASE_DOMAIN` / `PORTAL_HOST` / `FDE_WILDCARD_HOST`）为准；JSON 示例中出现的具体域名（`station.fde.erix.vip`、`alice-p-8001.fde.erix.vip` 等）均假设 **`BASE_DOMAIN=fde.erix.vip`（#57 定稿：`BASE_DOMAIN` = **伞域** = `fde.<可注册域>`，不再是可注册域）**，仅作 mock 示例，不构成设计约束。**`*.localhost` 不是“开发期变通”**：它是 `BASE_DOMAIN` 的**代码默认兜底值（本地起服，env §0/§1）**，代码默认值为 `localhost`（即本地起服 `http://station.localhost:8090`，不套伞域前缀），代码路径与生产完全一致（dev `http://station.<BASE_DOMAIN>:8090`，生产 `https://station.<BASE_DOMAIN>`，scheme/端口从公开入口配置派生）。部署目标环境不一定是任何已实测的机器。
 
 | 项 | 取值 | 来源 |
 |---|---|---|
@@ -524,7 +524,7 @@
   * **校验失败**按「账户 + IP」计（`emailcode:<userId>:<ip>`，默认 10 次 / 15 分钟窗口，超限 `429 rate_limited` + `Retry-After`）。换新 `pending_token` 不重置计数，防 6 位码爆破；
   * **发信频率**按 IP 计（`email:<ip>`，默认 **20 次 / 15 分钟**窗口；`<ip>` 口径见下条）——**§2.2 第④分支第一步的初次发信与 §2.3b 的重发（含 ① 懒发信的第一封）共用同一把闸**（每次成功发信记一次），否则持有效口令的人可以反复调第一步把邮箱刷爆。⚠ ① 分支的**第一步不再计入这把闸**（feat-261110-01：它已经不发信了），它只做一次**非消费型** `check()` 预检来决定要不要摆出邮箱那条 ⇒ 反复走第一步的① 账号既刷不爆邮箱，也烧不掉配额。
 - **全站限流键里的 `<ip>` 口径（#740）**：上面与 §2.2/§2.3/§2.6 里所有 `<ip>`（登录 `login:<ip>:<login>`、`emailcode:<userId>:<ip>`、发信 `email:<ip>`、预览票 `ticket:<userId>:<ip>`、改密 `password:<userId>:<ip>`）一律是**真客户端 IP**，由 `portal/src/http.js` 的 `clientIp(req)` 计算，**不再直接读 socket 对端**：
-  * **只有 socket 对端本身是可信代理地址时才采信 `X-Forwarded-For`**：可信 = loopback（`127/8`、`::1`）/ RFC1918（`10/8`、`172.16/12`、`192.168/16`）/ ULA（`fc00::/7`）**或本机默认路由的 nexthop**。后半句是 #740 的拓扑校正：`portal/src/http.js` 的 `defaultGatewayAddrs()` 解析 `/proc/net/route` 里目的为 `00000000`（即 `0.0.0.0/0`）那行的 Gateway（**十六进制小端 ⇒ 按字节反序还原**），结果**懒算一次并缓存**；**文件读不到 / 无默认路由 / Gateway 为 `00000000` ⇒ 回落到前三类**（fail closed）。为什么需要它：portal 只 publish `127.0.0.1`，edge 经发布端口 DNAT 打进来 ⇒ 容器看到的对端是 docker bridge 网关（dev 栈实测 `172.32.0.1`，属 compose `172.32.0.0/24`，**不在** RFC1918 的 `172.16/12` 里）⇒ 只认前三类会把真拓扑的头整批拒掉。安全性（#740 评审 F3 收准，原话「攻击者**伪造不了** nexthop」说强了）：请求里没有字段能写出「本容器默认路由的 nexthop」，但**要站到那个位置上，得能占据该链路的下一跳**（同 L2 里抢那个地址：`CAP_NET_RAW` / ARP 欺骗仍可伪）——判据信的是「对端落在私网 / nexthop 这个**位置**」，不是「对端的**身份**是 ingress」。今天暴露面为什么小（261125 现验）：`station_backend` 上只有平台自己的容器（`station-db` `172.32.0.2`、`station-litellm` `172.32.0.3`、`station-docker-proxy` `172.32.0.4`、`station-portal` `172.32.0.5`），FDE 工位容器只挂自己的 `/29`（`fde-eric` = `10.200.0.2/29`），从 `fde-eric` 内直连 portal 的 backend 地址 `172.32.0.5:8080` = **NOT-REACHABLE** ⇒ 今天「私网对端被信任」的暴露面是**平台容器与宿主进程，不是 FDE 代码**；**换网络拓扑（FDE 侧能直连 portal、或 ingress 不在同一 L2）要重评**。有人绕过 edge 直连（对端是公网地址、又不是本机 nexthop）⇒ 头可任意伪造 ⇒ **不信头**，直接用 socket 对端。**未覆盖 v6 默认路由**（`/proc/net/ipv6_route`），届时再补；也**没有** env 白名单旋钮可改这个集合。
+  * **只有 socket 对端本身是可信代理地址时才采信 `X-Forwarded-For`**：可信 = loopback（`127/8`、`::1`）/ RFC1918（`10/8`、`172.16/12`、`192.168/16`）/ ULA（`fc00::/7`）**或本机默认路由的 nexthop**。后半句是 #740 的拓扑校正：`portal/src/http.js` 的 `defaultGatewayAddrs()` 解析 `/proc/net/route` 里目的为 `00000000`（即 `0.0.0.0/0`）那行的 Gateway（**十六进制小端 ⇒ 按字节反序还原**），结果**懒算一次并缓存**；**文件读不到 / 无默认路由 / Gateway 为 `00000000` ⇒ 回落到前三类**（fail closed）。为什么需要它：portal 只 publish `127.0.0.1`，edge 经发布端口 DNAT 打进来 ⇒ 容器看到的对端是 docker bridge 网关（dev 栈实测 `172.32.0.1`，属 compose `172.32.0.0/24`，**不在** RFC1918 的 `172.16/12` 里）⇒ 只认前三类会把真拓扑的头整批拒掉。安全性（#740 评审 F3 收准，原话「攻击者**伪造不了** nexthop」说强了）：请求里没有字段能写出「本容器默认路由的 nexthop」，但**要站到那个位置上，得能占据该链路的下一跳**（同 L2 里抢那个地址：`CAP_NET_RAW` / ARP 欺骗仍可伪）——判据信的是「对端落在私网 / nexthop 这个**位置**」，不是「对端的**身份**是 ingress」。今天暴露面为什么小（261125 现验）：`station_backend` 上只有平台自己的容器（`station-db` `172.32.0.2`、`station-litellm` `172.32.0.3`、`station-docker-proxy` `172.32.0.4`、`station-portal` `172.32.0.5`），FDE 工位容器只挂自己的 `/29`（`fde-alice` = `10.200.0.2/29`），从 `fde-alice` 内直连 portal 的 backend 地址 `172.32.0.5:8080` = **NOT-REACHABLE** ⇒ 今天「私网对端被信任」的暴露面是**平台容器与宿主进程，不是 FDE 代码**；**换网络拓扑（FDE 侧能直连 portal、或 ingress 不在同一 L2）要重评**。有人绕过 edge 直连（对端是公网地址、又不是本机 nexthop）⇒ 头可任意伪造 ⇒ **不信头**，直接用 socket 对端。**未覆盖 v6 默认路由**（`/proc/net/ipv6_route`），届时再补；也**没有** env 白名单旋钮可改这个集合。
   * 采信时取该头的**最右一项**（edge 追加的那项 = 真客户端）；**最左一项是客户端自报、可伪造，不取**。头缺失 / 全空 / 最右项解析不出合法 IP ⇒ 回落 socket 地址（不向左继续找）。IPv6 带 zone（`%eth0`）先去掉，`::ffff:a.b.c.d` 映射地址还原成 v4 再记。
   * 依据：部署不变式 2「ingress 是唯一的路」+ portal 只 publish `127.0.0.1` ⇒ 生产里 socket 对端**按部署形态**应当是 edge 那一侧（但判据信的是「私网地址 / nexthop」这个位置，不是「它是 edge」这个身份——暴露面见上一条）。但 DNAT 之后那个对端**未必**落在 loopback/RFC1918/ULA 里（dev 实测是 bridge 网关 `172.32.0.1`；库里 `login_pending.created_ip` 110 行全等于它），所以可信集合必须再并上「本机默认路由 nexthop」，否则「恒采信 edge 追加的最右项」在真机上不成立。这套口径修掉的正是旧写法「`ip` 恒等于 Traefik 容器网关、全平台所有人挤一个限流桶」。
   * **多层代理要按层数取**：上面只剥**一层** edge（当前部署 = 单 edge ⇒ 取最右一项即正确）。将来 edge 前再加一层可信代理时，`clientIp` 要改成取右数第 N 项，否则会把中间代理记成客户端。
@@ -761,7 +761,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 
 | 头 | 用途 |
 |---|---|
-| `X-Forwarded-Host` | 形如 `<fde>-p-<portLabel>.<BASE_DOMAIN>`（伞域口径，#57；#246 号池端口 5 位 ⇒ 示例 `eric-p-22000.fde.erix.vip`，dev 带端口后缀 `:8090`）；Traefik 以真实 `Host` 覆盖。portal 查表前**剥端口 + 小写**（唯一实现 `preview.normalizeHostHeader`），302 `Location` 仍保留原始 Host（含端口） |
+| `X-Forwarded-Host` | 形如 `<fde>-p-<portLabel>.<BASE_DOMAIN>`（伞域口径，#57；#246 号池端口 5 位 ⇒ 示例 `alice-p-22000.fde.erix.vip`，dev 带端口后缀 `:8090`）；Traefik 以真实 `Host` 覆盖。portal 查表前**剥端口 + 小写**（唯一实现 `preview.normalizeHostHeader`），302 `Location` 仍保留原始 Host（含端口） |
 | `X-Forwarded-Uri` / `X-Forwarded-Method` | 从 `X-Forwarded-Uri` 解析 `preview_ticket` 查询参数；方法用于审计 |
 | `Cookie` | 只看 `__Host-fde_preview`（本 host 的预览 cookie） |
 | `Origin` / `Access-Control-Request-Method` | CORS 用（#241）：前者是 deny 响应回显 `Access-Control-Allow-Origin` 的唯一来源，后者是识别预检的唯一依据。⚠ 两者必须在 Traefik `forwardAuth.authRequestHeaders` **白名单**内（该白名单外的头一律不进 auth 子请求）；白名单由路由生成器 `portal/src/routes.js` 产出，不得手改生成产物 `deploy/traefik/dynamic/routes.yml` |
@@ -829,7 +829,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 ```json
 {
   "ticket": "pt_<随机 256-bit base64url>",
-  "url": "https://eric-p-8001.fde.erix.vip?preview_ticket=pt_…",
+  "url": "https://alice-p-8001.fde.erix.vip?preview_ticket=pt_…",
   "expires_in": 60
 }
 ```
@@ -1004,7 +1004,7 @@ station-portal user enable  --login <login>
 | c | 否则若有 `Origin` | 解析出 **authority（`host[:port]`）**与「请求自身的 authority」比：**优先 `X-Forwarded-Host`**（本部署 Traefik `trustForwardHeader: false`，会按真实连接覆写），无则 `Host`。相等 ⇒ 放行，不等 ⇒ 拒。**`same-site` 就落在本判据** |
 | d | 两者都没有 | **放行**（curl / CLI / 容器内脚本；否则现有 e2e 与运维脚本全挂）。`Sec-Fetch-Site` 的未知值（如 `none`）不算结论，继续走 c/d；`same-site` 且 `Origin` 缺失也走到这里 ⇒ 放行 |
 
-**为何 `same-site` 不能直接放行（返修，2026-10-13）**：`same-site` 的规范语义是「**同注册域、不同 origin**」，而本站**整站坐在同一个注册域 `erix.vip` 下**：portal 在 `station.fde.erix.vip`、FDE 预览在 `eric-p-22000.fde.erix.vip`。于是从预览 host 发的 XHR，浏览器给的 `Sec-Fetch-Site` 正是 `same-site`；而 session cookie 是 **host-only + `SameSite=Lax`**（§2.5），`SameSite` 判的也是注册域 ⇒ **cookie 照样被带上**（Lax 不挡同站），CORS 只让它读不到响应、**写副作用已经发生** = 教科书意义上的 CSRF。拿旧判据（`same-site` 直接放行）这道防线会在**本站最现实的场景**（任意 FDE 预览 host 上跑的、agent 写的应用去 POST portal API）直接失效，根本走不到 Origin 比对。现口径：`same-site` 一律落到判据 c（同注册域但不同 origin ⇒ 不等 ⇒ 拒 `origin_mismatch`）；`same-site` 且 Origin 缺失 ⇒ 落 d 放行（与旧口径一致，**不新造严格性**）。回归门：`portal/test/csrf-origin.test.js`。
+**为何 `same-site` 不能直接放行（返修，2026-10-13）**：`same-site` 的规范语义是「**同注册域、不同 origin**」，而本站**整站坐在同一个注册域 `erix.vip` 下**：portal 在 `station.fde.erix.vip`、FDE 预览在 `alice-p-22000.fde.erix.vip`。于是从预览 host 发的 XHR，浏览器给的 `Sec-Fetch-Site` 正是 `same-site`；而 session cookie 是 **host-only + `SameSite=Lax`**（§2.5），`SameSite` 判的也是注册域 ⇒ **cookie 照样被带上**（Lax 不挡同站），CORS 只让它读不到响应、**写副作用已经发生** = 教科书意义上的 CSRF。拿旧判据（`same-site` 直接放行）这道防线会在**本站最现实的场景**（任意 FDE 预览 host 上跑的、agent 写的应用去 POST portal API）直接失效，根本走不到 Origin 比对。现口径：`same-site` 一律落到判据 c（同注册域但不同 origin ⇒ 不等 ⇒ 拒 `origin_mismatch`）；`same-site` 且 Origin 缺失 ⇒ 落 d 放行（与旧口径一致，**不新造严格性**）。回归门：`portal/test/csrf-origin.test.js`。
 
 **归一化**：小写、剔首尾空白、剥掉**与该 scheme 相同**的默认端口（`http:80` / `https:443`）；**非默认端口必须保留**（现网 dev 栈就是带端口的两个入口（伞域名入口与宿主 tailnet IP 入口，取值见冷层），把端口丢了就是拿 8090 与 80 当同源）。同源基线从请求自己的 Host 派生 ⇒ **零新增配置项**，两个入口天然各自成立（互不充当对方的基线）。
 
@@ -1184,7 +1184,7 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -c /tmp/adm.jar -X POST \
   -H "Origin: https://admin.fde.erix.vip:9443" -d "{\"login\":\"admin\",\"password\":\"$PW\"}"
 # 2) 代目标 FDE 签一枚（明文只响应一次，自己存好）
 curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -b /tmp/adm.jar -X POST \
-  https://admin.fde.erix.vip:9443/api/admin/users/eric/tokens \
+  https://admin.fde.erix.vip:9443/api/admin/users/alice/tokens \
   -H 'Content-Type: application/json' -H "Origin: https://admin.fde.erix.vip:9443" \
   -d '{"name":"ci-probe"}'      # ⇒ {id, name, scopes:[], created_at, token:"st_…"}
 # 3) 用令牌调 API（不登录、不带 cookie、不发邮件）
@@ -2305,8 +2305,8 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 {
   "pool": { "start": 22000, "end": 29999, "block_size": 10, "total_blocks": 800 },
   "occupied_blocks": [
-    { "start": 22000, "end": 22009, "occupied_count": 10, "fde_names": ["eric"] },
-    { "start": 22010, "end": 22019, "occupied_count": 3, "fde_names": ["bob", "eric"] },
+    { "start": 22000, "end": 22009, "occupied_count": 10, "fde_names": ["alice"] },
+    { "start": 22010, "end": 22019, "occupied_count": 3, "fde_names": ["bob", "alice"] },
     { "start": 22050, "end": 22059, "occupied_count": 1, "fde_names": ["dana"] }
   ],
   "free_blocks": { "items": [22020, 22030, 22040], "has_more": true, "limit": 3 },
@@ -3491,7 +3491,7 @@ git tag / 镜像 tag / digest 是「我想要哪份」而不是「跑的是什�
   "platformEngine": { "version": "0.33.0" },
   "buildInfoPath": "/app/build-info.json",
   "fdes": [
-    { "name": "eric", "agentVersion": "0.33.0", "image": "ghcr.io/…@sha256:…",
+    { "name": "alice", "agentVersion": "0.33.0", "image": "ghcr.io/…@sha256:…",
       "provisionedAt": "2026-11-16T02:00:00.000Z", "lastHeartbeatAt": "2026-11-16T04:00:00.000Z",
       "revoked": false, "versionSource": "containers.agent_version", "snapshot": "provision" }
   ],

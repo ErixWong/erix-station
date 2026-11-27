@@ -100,6 +100,11 @@ const MEASURE_COMPILED = MEASURE_IDENTITY.map((e) => ({
   re: e.boundary ? new RegExp(`\\b${reEscape(e.tok)}\\b`) : null,
 }));
 
+// #889 第二步：翻拦。测量通道留着（`--identity-words` 的读数还要用），但它同时进 DENY ⇒ rc 会红。
+//   词边界（`\\beric\\b` 语义）是当初量面时就定死的前提：这条词根会和前缀字母连成通用词
+//   （`gen` + 词根 = 一个常见的英文形容词），子串匹配一开就满屏假阳性。
+DENY_IDENTITY.push(...MEASURE_COMPILED.map((e) => ({ ...e })));
+
 // EXEMPT：运维交接 / 历史取证账，允许保留**机器坐标**（DENY_INFRA）；对身份（DENY_IDENTITY）无效。
 // 新增 EXEMPT 必须是同类历史账，且写明理由。
 const EXEMPT = new Set([
@@ -146,7 +151,9 @@ function scanFile(rel, wholeFile, hits, measureHits) {
     if (!wholeFile && !isCommentLine(line)) return;
     // 身份：无条件扫（EXEMPT 不豁免）。
     for (const tok of DENY_IDENTITY) {
-      if (matchToken(line, tok)) hits.push(`${rel}:${i + 1}: ${tok}`);
+      // 标签取 tok 字符串：DENY_IDENTITY 现在既有字符串条目，也有 {tok,re} 对象条目
+      const label = typeof tok === 'string' ? tok : tok.tok;
+      if (matchToken(line, tok)) hits.push(`${rel}:${i + 1}: ${label}`);
     }
     // 坐标：EXEMPT 历史账豁免。
     if (!exempt) {
@@ -164,7 +171,9 @@ function scanFile(rel, wholeFile, hits, measureHits) {
 }
 
 function main() {
-  // 测量开关：只决定**要不要打印**命中清单，不碰退出码（本轮只量面，不翻拦）。
+  // 测量开关：只决定**要不要打印**命中清单，不碰退出码。
+//   ⚠ #889 第二步之后，这些词**本身已经进 DENY** ⇒ 命中会让 rc 变红，但**变红不是因为开了这个开关**
+//   （base 与 measured 两次跑的 rc 相同，`test/docs-portable.test.js` 第 ④ 格钉的就是这条不变量）。
   const measureOn = process.argv.includes('--identity-words') || process.env.DOC_PORTABLE_IDENTITY_WORDS === '1';
   /** @type {string[]} */
   const hits = [];
@@ -181,11 +190,17 @@ function main() {
   }
   if (measureHits) {
     // 打在 stdout：它是量面读数，不是错误；位置在拦截判定之前，故对 rc 零影响。
-    console.log(`check:doc-portable 身份词测量（--identity-words，只报不拦，不影响退出码）：${measureHits.length} 处（已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/mjs/cjs/ts/vue 注释行）`);
+    console.log(`check:doc-portable 身份词测量（--identity-words；打印开关，不改 rc —— 但这些词已进 DENY，命中本身会让 rc 红）：${new Set(measureHits.map((h) => (h.match(/^(.*:\d+): /) || [, h])[1])).size} 处（词次 ${measureHits.length}）（已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/mjs/cjs/ts/vue 注释行）`);
     for (const h of measureHits) console.log(`  ${h}`);
   }
   if (hits.length > 0) {
-    console.error(`check:doc-portable RED：仓库里含本机/内网坐标或身份 ${hits.length} 处（已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/ts/vue 注释行）`);
+    // 「N 处」的语义 = **有 N 个位置要人改**，不是「规则匹配了几次」。同一行被两条规则命中时，详情
+    //   列两条（要知道是哪两条规则 fired），但头部按 `rel:line` 去重计数。#889 第二步之后这条是必须的：
+    //   裸登录名的词边界规则与旧的「家目录前缀 + 登录名」组合规则会对同一行同时命中，不去重就把
+    //   一个位置报成两处（`test/docs-portable.test.js` 第 ⑬ 格钉这个语义）。
+    const locOf = (h) => { const m = h.match(/^(.*:\d+): /); return m ? m[1] : h; };
+    const locations = new Set(hits.map(locOf));
+    console.error(`check:doc-portable RED：仓库里含本机/内网坐标或身份 ${locations.size} 处（规则命中 ${hits.length} 条；已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/ts/vue 注释行）`);
     for (const h of hits) console.error(`  ${h}`);
     console.error('  ↳ 坐标搬去冷层 `~/projects/docs/`；身份换中性占位（见 AGENTS.md §6）。EXEMPT 只豁免坐标，不豁免身份。');
     process.exit(1);

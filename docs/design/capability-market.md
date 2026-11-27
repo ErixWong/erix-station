@@ -203,7 +203,7 @@ materializer 在 `buildFilePlan` 里新增一条（root:root 0644，与 `config.
 
 真机 e2e（主 agent 亲自跑）：
 1. admin 发布一个探针技能（`echo_probe` 工具返回固定 marker）→ 状态 published；
-2. `eric` 在 `#/market` 安装并启用 → 宿主 `users/eric/home/.erix/skills/<slug>/skill.mjs` 存在且属主 1000:1000；
+2. `alice` 在 `#/market` 安装并启用 → 宿主 `users/alice/home/.erix/skills/<slug>/skill.mjs` 存在且属主 1000:1000；
 3. 工作台新建会话，让它「调用 echo_probe」→ transcript 里出现工具调用 + marker 回显（证明 L1+L2+L3）；
 4. 页面上禁用 → 新 run 里该工具不可用（模型报 Unknown tool 或工具面不含它）；
 5. 卸载 → 目录消失，DB 行消失。
