@@ -82,11 +82,33 @@ export function portalIpamEnvFromHostEnv(env = {}) {
 }
 
 /**
+ * 栈 id → IPAM 派生段的**同余类**（`0..98`，#550E）。这是「哪些栈 id 会撞进同一段」的唯一算法出处：
+ * `deriveFdeIpamPools` 的段号 = `1 + 本函数的返回值`（**同源**，别再抄一份 `% 99`——两份必然漂）。
+ *
+ * 规则：id 里全部数字拼接后 mod 99（BigInt 防长数字精度丢失，前导零不影响十进制解析）；
+ * 无数字则走 FNV-1a 32bit 短哈希后 mod 99。⚠️ 同余类的后果是**碰撞**：`stack1` 与 `stack100`
+ * 的数字段分别是 `"1"` 与 `"100"`，模 99 都是 1 ⇒ 派生同一段 `10.201.2.0/24`（#550E 已把这对
+ * 事实钉进 `portal/test/ipam-pool-env.test.js`；它不是期望，是今天的样子）。
+ *
+ * @param {string} stackId STATION_STACK_ID
+ * @returns {number} 0..98
+ */
+export function ipamPoolCongruenceClass(stackId) {
+  const id = String(stackId ?? '');
+  const digits = id.replace(/\D+/g, '');
+  if (digits) return Number(BigInt(digits) % 99n);
+  let h = 2166136261; // FNV-1a 32bit
+  for (let i = 0; i < id.length; i += 1) h = Math.imul(h ^ id.charCodeAt(i), 16777619);
+  return Math.abs(h) % 99;
+}
+
+/**
  * 由栈 id 确定性派生本隔离栈专用的 FDE IPAM 子段（#227.3 立题，#270 把它做成**真能分配的段**）。
  *
- * 规则：取栈 id 里全部数字拼接后 mod 99 ⇒ 段 = `10.201.(1 + n%99).0/24`（第三段 1–99）；无数字
- * 则用 FNV-1a 短哈希走同一条映射。同 id 永远同段（幂等）；不同余数必不同段。为何不是新的 /16：
- * 见 `PORTAL_LARGE_POOL` 定义处（baseline 的 CHECK 把 `pool='large'` 钉在 `10.201.0.0/16` 里面）。
+ * 规则：段号 = `1 + ipamPoolCongruenceClass(栈 id)` ⇒ 段 = `10.201.(1 + n%99).0/24`（第三段 1–99）。
+ * 同 id 永远同段（幂等）；不同余数必不同段。**同余类相同 ⇒ 必同段**（`stack1` 撞 `stack100`，见
+ * `ipamPoolCongruenceClass`）。为何不是新的 /16：见 `PORTAL_LARGE_POOL` 定义处（baseline 的 CHECK
+ * 把 `pool='large'` 钉在 `10.201.0.0/16` 里面）。
  *
  * 派生值相同≠一定撞（只有两栈真的并行且同段才撞）；那时显式覆盖两腿即可，护栏允许保留段内的显式覆盖。
  *
@@ -94,17 +116,8 @@ export function portalIpamEnvFromHostEnv(env = {}) {
  * @returns {string} 形如 `10.201.49.0/24` 的单段 CIDR
  */
 export function deriveFdeIpamPools(stackId) {
-  const id = String(stackId ?? '');
-  const digits = id.replace(/\D+/g, '');
-  let n;
-  if (digits) {
-    // BigInt 防长数字精度丢失；前导零不影响十进制解析。
-    n = Number(BigInt(digits) % 99n);
-  } else {
-    let h = 2166136261; // FNV-1a 32bit
-    for (let i = 0; i < id.length; i += 1) h = Math.imul(h ^ id.charCodeAt(i), 16777619);
-    n = Math.abs(h) % 99;
-  }
+  // 段号只从同余类那一份映射算（#550E：同余类与段号同源，变异其一必让单测里「同源」那一格红）。
+  const n = ipamPoolCongruenceClass(stackId);
   // 保留段只活在上面那个常量里（不拆写第三/四段 ⇒ 改保留段不会漏改这里）。
   const family = PORTAL_LARGE_POOL.split('.');
   return `${family[0]}.${family[1]}.${1 + n}.0/${FDE_STACK_SLICE_PREFIX}`;
@@ -138,11 +151,19 @@ export function defaultFdeIpamPools(stackId) {
  * 就地把两腿注入 env（显式传入优先；没栈 id 就不注入，共享栈跑法维持 compose 缺省）。
  * 各 e2e 入口调一次，取代旧「只注入 `FDE_IPAM_POOLS`」那三行（两腿只注入一腿 = 分叉的根源）。
  *
+ * ⚠ #550E：派生段真的写进 env 时额外报一行 **同余类 + 派生段 + 「这是提示不是保证」**。
+ * 为什么需要这一行：段号是 mod 99 同余类的像 ⇒ `stack1` 与 `stack100` 这类同余栈 id 派生**同一段**，
+ * 而光看派生函数看不出来（以前的形状是「没人报错，直到两个栈并行时 `network create` 被拒」）。
+ * 为什么只是提示不是保证：同余类相同不必然撞（只有两栈真的并行且同段才撞），同余类不同也可能
+ * 因别的栈手工占段而撞；而且本函数只看本栈 env ⇒ 跳栈占用在本机查不到（要查得问 IPAM 库/宿主）。
+ * 可注入 `warn`（缺省 `console.warn`）是为了单测能收集文案而不靠抢 stdout/stderr。
+ *
  * @param {Record<string, string | undefined>} [env]
  * @param {string} [stackId] 缺省取 env.STATION_STACK_ID
+ * @param {{ warn?: (message: string) => void }} [options] `warn` 注入点（测试用收集器）
  * @returns {Record<string, string>} 实际注入了哪些键（供日志/断言；没注入则空对象）
  */
-export function applyStackIpamPoolEnv(env = process.env, stackId = env.STATION_STACK_ID) {
+export function applyStackIpamPoolEnv(env = process.env, stackId = env.STATION_STACK_ID, { warn = console.warn } = {}) {
   if (!stackId) return {};
   const derived = deriveStackIpamPoolEnv(stackId);
   const applied = {};
@@ -151,6 +172,15 @@ export function applyStackIpamPoolEnv(env = process.env, stackId = env.STATION_S
       env[key] = value;
       applied[key] = value;
     }
+  }
+  // 只在派生值**真的进了 env**时报（两腿都是操作者手传时，报派生段只会把人引向没在用的值）。
+  if (Object.keys(applied).length > 0) {
+    const segment = derived.FDE_IPAM_POOLS;
+    const cls = ipamPoolCongruenceClass(stackId);
+    warn(`[ipam] STATION_STACK_ID=${stackId} ⇒ 派生段 ${segment}（mod 99 同余类 n=${cls}，段号 = 1 + n）。`
+      + `同余类相同的两个栈 id 必派生同一段（实测对：stack1 与 stack100 都是 10.201.2.0/24）。`
+      + '⚠ 这是提示不是保证：同余类相同不必然撞（要两栈真并行才撞），同余类不同也可能因别的栈手工占段而撞；'
+      + '本函数只看得到本栈 env，跳栈占用查不到（并行前自己核对，或显式覆盖两腿）。');
   }
   return applied;
 }
@@ -433,6 +463,29 @@ export function assertHostWritePathsIsolated({
 }
 
 /**
+ * 缺必需 env 那条报错的「栈上下文」（#550D）。不带上下文的旧文案只说 `X must be set`，于是两种
+ * 完全不同的故障长得一模一样：① 真的忘传了这一条；② 传了但派生算漂了（段不对 ⇒ 后面那条
+ * 「不在放行面内」会以另一个错名报出来）。带上栈 id 与它应有的派生段后，两者一眼可分。
+ *
+ * 没设栈 id 时不猜段（`<未设 STATION_STACK_ID>` 就是全部事实）；派生抛错写 `<派生失败>` 而不是
+ * 把报错本身弄挂（报错路径里再抛 = 原本的缺变量被新异常顶掉，比不带上下文更坑）。
+ *
+ * @param {Record<string, string | undefined>} env
+ * @returns {string} 形如 `（STATION_STACK_ID=e2e226 ⇒ 本栈期望派生段 10.201.49.0/24）`
+ */
+function describeMissingEnvContext(env) {
+  const stackId = env.STATION_STACK_ID;
+  if (!stackId) return '（STATION_STACK_ID=<未设 STATION_STACK_ID> ⇒ 无栈 id 无法算期望段，先补 STATION_STACK_ID）';
+  let expected;
+  try {
+    expected = deriveFdeIpamPools(stackId);
+  } catch {
+    expected = '<派生失败>';
+  }
+  return `（STATION_STACK_ID=${stackId} ⇒ 本栈期望派生段 ${expected}；两者都对不上才是「忘传」，段不对则是派生/覆盖漂了）`;
+}
+
+/**
  * ⚠ `assertHostWritePathsIsolated` **不在这里调**：它是"起栈那一刻"的判据，要判的是
  * **compose 真正拿到的那份 env**。各脚本只在 `compose('up', extraEnv)` 里传这三个 `ERIX_*` 路径，
  * `process.env` 里往往没有 ⇒ 放进总断言会误伤所有老脚本（判错方向比不判更糟）。
@@ -464,7 +517,10 @@ export function assertIsolatedEnvironment(options = {}) {
     ...fdeNames.map((fde) => fde.env),
     ...extraRequiredEnv,
   ];
-  for (const name of required) assert.ok(env[name], `${name} must be set for isolated e2e`);
+  // #550D：缺必需 env 的文案必须**同时**带上栈 id 与它派生出的期望段。不带这两样，「忘传了这一条」与
+  // 「派生算漂了」长得一模一样（都得同一句 `X must be set`），操作者只能去重新手算 mod 99。
+  const missingEnvContext = describeMissingEnvContext(env);
+  for (const name of required) assert.ok(env[name], `${name} must be set for isolated e2e${missingEnvContext}`);
 
   const dbRelativePath = path.relative(os.tmpdir(), path.resolve(env.STATION_DB_DIR));
   assert.ok(dbRelativePath && !dbRelativePath.startsWith('..') && !path.isAbsolute(dbRelativePath),

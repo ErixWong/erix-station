@@ -172,12 +172,17 @@ cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOL_LARGE 不在 F
 {
   const missingAlloc = { ...validIsolationEnv() };
   delete missingAlloc.FDE_IPAM_POOL_LARGE;
-  // 点名 **两条**文案锚点：`must be set`（必需 env 那条更早、更准）+ 变量名。
+  // 点名 **四条**文案锚点：`must be set`（必需 env 那条更早、更准）+ 变量名
+  // + #550D 的两样：`STATION_STACK_ID=<夹具那个栈 id>` 与它派生出的期望段。
+  // 为什么后两条必须钉上：不带栈上下文时，「忘传了 FDE_IPAM_POOL_LARGE」与「派生算漂了」
+  // 长得一模一样（都是 `X must be set`），操作者只能去重算 mod 99。
   // 变异入口：把 FDE_IPAM_POOL_LARGE 从必需清单里摘掉 ⇒ 本陷阱改抛「不是规范写法」那条，
-  // `must be set` 消失 ⇒ 本项红（否则「必需 env」那一格是纸判据：删了也没人发现，只是文案变难懂）。
+  // `must be set` 消失 ⇒ 本项红；把 :467 的栈上下文摘掉 ⇒ 后两条锚点消失 ⇒ 同样红。
+  // 两个 token 都是**字面量**（栈 id 照 validIsolationEnv()，段照 :334 那条派生段断言）：
+  // 拿 deriveFdeIpamPools() 现算会变成「用被测件验被测件」，mod 99 改了也查不出来。
   cases.push(expectThrow('assertIsolatedEnvironment() 缺 FDE_IPAM_POOL_LARGE（分配段未声明）',
     () => assertIsolatedEnvironment({ env: missingAlloc }),
-    { namesMustInclude: ['FDE_IPAM_POOL_LARGE', 'must be set'] }));
+    { namesMustInclude: ['FDE_IPAM_POOL_LARGE', 'must be set', 'STATION_STACK_ID=e2e226', '10.201.49.0/24'] }));
 }
 
 // 13) #270：分配段写成**整个** large 保留段 = #270 之前「两套隔离栈都从同一池头分配」的必撞口径。
@@ -784,6 +789,9 @@ try {
 // wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
 const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable',
   'deriveFdeIpamPools', 'defaultFdeIpamPools', 'deriveStackIpamPoolEnv', 'applyStackIpamPoolEnv',
+  // #550E：段号 = 1 + 同余类，两者必须同源 ⇒ 同余类映射也只允许一份定义（两份 `% 99` 必然漂，
+  // 漂了就回到「段与同余类各说各话」——那正是本单要消除的形状）。
+  'ipamPoolCongruenceClass',
   'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce',
   // PR #554 BLOCKER：env 行内注释的解析与「无从复现」判定也只允许一份定义（两份解析必然漂）。
   'parseComposeEnvLine', 'parseComposeEnvFile', 'findUnreproducibleEnvLines'];
