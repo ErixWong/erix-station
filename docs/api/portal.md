@@ -27,6 +27,7 @@
 | 分类 | 方法 + 路径 | 说明 |
 |---|---|---|
 | 站点 | `GET /api/site` | **公开、零秘密**：两个入口的对外 URL（`userBaseUrl` / `adminBaseUrl`，§2.12；#450 A2）。无会话也 `200` |
+| 站点 | `GET /api/health` | **就绪探针**（与 `/healthz` 同一个 handler，`http.js:1218-1237`）：就绪 `200 {status:"ok", version:{station,revision,builtAt}}`（有缓冲实例时才多 `partialBuffer`）；未就绪 `503 migration_failed`；**无需鉴权**，非 `GET` ⇒ `405` |
 | 认证 | `POST /api/auth/login` | 第一步：口令校验 |
 | 认证 | `POST /api/auth/login/totp` | 第二步：TOTP 校验，发 cookie |
 | 认证 | `POST /api/auth/login/email-code` | 第二步：**邮箱验证码**校验，发 cookie（#449，§2.3a）|
@@ -35,6 +36,9 @@
 | 认证 | `GET /api/me` | 当前用户信息（含 `must_change_password` 与 `file_upload_enabled`，§2.6）|
 | 认证 | `POST /api/me/password` | **本人自助改密**（#255 首登强制改密的唯一出口，§2.6a）|
 | 认证 | `PATCH /api/me/locale` | **本人改账号级语言偏好**（#828 P1，写 `users.locale`，§2.6b）|
+| Git 凭据（本人） | `GET /api/me/git-credential` | **自服务面**：列本人 `fde_name` 的凭据 ⇒ `{items:[{host,protocol,username,token}]}`，`token` **是掩码**（§2.16）|
+| Git 凭据（本人） | `PUT /api/me/git-credential` | 配一个 host ⇒ `{host,username,configured:true}`（**不回显 token**，§2.16）|
+| Git 凭据（本人） | `DELETE /api/me/git-credential` | 删一个 host ⇒ `{host,deleted}`；⚠ `host` 走 **JSON body**，不是 `?host=`（§2.16）|
 | 边缘授权 | `GET /api/forward-auth` | Traefik forwardAuth 回调（非浏览器 API） |
 | 项目 | `GET /api/projects` | 项目列表（**留档只读**，P5 后表内无新行 ⇒ 正常返回空 `items`，§3.2/§3.3） |
 | 项目 | `POST /api/projects` | **已退役 `410 project_api_retired`**（目录即项目，§3.3） |
@@ -53,6 +57,7 @@
 | 管理 | `PATCH /api/admin/users/:id` | 更新用户资料、角色、FDE 名称或状态 |
 | 管理 | `DELETE /api/admin/users/:id` | 停用用户；有 FDE 资源时异步下线（用户行永久保留） |
 | 管理 | `POST /api/admin/users/:id/offboarding/retry` | 重试失败的 FDE 下线任务 |
+| 管理 | `POST /api/admin/users/:id/onboard/retry` | 重试失败的 FDE **开户**任务：`{onboarding:{state,step,error,llm_binding?}}`；幂等——非 `failed` 状态原样回（§12）|
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-enroll` | 补绑/重绑 TOTP；新种子只在本次响应下发并强制重新登录 |
@@ -114,6 +119,8 @@
 | LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」——**当前无实现 ⇒ 404**（#777 A1）|
 | LLM 管理 | `DELETE /api/admin/llm/models/:id` | 删模型（附虚拟 key 清理） |
 | LLM 管理 | `GET/PUT /api/admin/fdes/:fde/llm/budget` | 读/设 **FDE 周期额度（USD / 周期，`budget_period` ∈ {`1d`,`1mo`}）**（#719，§4.10） |
+| LLM 管理 | `GET /api/admin/fdes/:fde/llm` | **读 FDE 的 LLM 绑定** ⇒ `{config, active_run}`；无绑定也 `200` 且 `config:null`；`api_key` 只掩码（§4.10-1）|
+| LLM 管理 | `PUT /api/admin/fdes/:fde/llm` | **写绑定** ⇒ `{config}`；⚠ `api_key` **不得按 FDE 提交**（给了就 `400`）；有活跃 run 需 `force=true`（§4.10-1）|
 | LLM 管理 | `GET /api/admin/fdes/:fde/llm/usage?days=30` | 近 N 天用量（直读 LiteLLM 聚合端点，#719，§4.10） |
 | LLM 用户面 | `GET /api/me/llm-quota` | **普通 FDE 读自己的周期额度**（人取 `session.user.fde_name`，无参数面；与 §4.10 同源投影；30s 缓存，#808，§2.14）|
 | LLM 用户面 | `GET /api/me/llm-usage?days=30` | **普通 FDE 读自己的近 N 天用量**（人同上；`days` 缺省 30、需 1–90 整数；#808，§2.15）|
@@ -1218,6 +1225,41 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 > 本端点**不走 30s 缓存**（只 `llm-quota` 缓存）：日聚合比额度读重，但用量变化不敏感于 30s，且默认只给一个固定窗口（30 天），无需再加缓存层。实现见 `portal/src/llm.js` 的 `getSelfUsage`。
 
 ---
+
+### 2.16 本人 Git 凭据三件套：`/api/me/git-credential`（#777 A4 补登记）
+
+这是 §10（**管理员**面 `PUT|GET|DELETE /api/admin/fdes/:fdeName/git-credential`）的**自服务对应面**：
+只有两个差异——**人从会话取**、**方法集不同**。实现：`http.js:1415-1453` + `portal/src/git-credential.js`。
+
+- **谁能调**：`requireSession`（任何已登录用户，**没有角色门**——admin 走同一条码路）。`fde_name` **一律取
+  `session.user.fde_name`**，不接受任何路径/query/body 里的名字 ⇒ **结构上看不了别人的凭据**（与 §2.14/§2.15 同一口径）。
+  账号没分配 `fde_name` ⇒ `400 fde_name_required`（`http.js:1417-1420`，不是 403：「不是权限不够，是这个账号没有可写的地方」）。
+  其余方法 ⇒ `405 method_not_allowed`（`http.js:1452`）。
+- **`GET` 响应（逐字）**：`{ "items": [ { host, protocol, username, token } ] }`——`token` **永远是掩码**，
+  形态是 `****` + 后 4 位（不足 4 字 ⇒ 整个 `****`，`git-credential.js:263-265`）；**响应里不存在明文密钥这一回事**。
+  来源是**两份文件**（平台那份优先，遗留 home 那份只读展示；同 host 两处都有时取平台那份，因为那才是实际生效的）；
+  **`username` 或 `token` 缺任一就不列这一行**（`git-credential.js:512-539`）。
+- **`PUT` 请求**：走 §1.5 的 `Content-Type` 闸（这条**有** `requireJson`）+ 体 `{ host, username, token, protocol? }`。
+  校验全部 `400 validation_failed`，`details.field` 逐字是 `host` / `username` / `token` / `protocol`
+  （`git-credential.js:35-58`、`:338-353`）：`host` 必为合法 DNS 主机名且 ≤253（带 `://`、路径、端口以外的东西都拒），
+  `username` 非空且 ≤255 不含控制字符，`token` 非空且 ≤**4096**，`protocol` 只 `http`/`https`（可缺）。
+  ⚠ **`host` 不必先在 `git_hosts` 注册**：查不到就用 `https`（`git-credential.js:355-370`），本站**不拦**。
+  成功 `200 {host, username, configured: true}`——**三个字段里没有 `token`**（不回显，也不回掩码）。
+- **`DELETE` 请求与管理员面的关键差异**：本面是 **JSON body `{host}`**（`requireJson` + `readJsonBody`，
+  `http.js:1442-1450`），而 §10 的管理员面是 **`?host=<host>` 查询参数**。两个面形状不同，抄错就是 `400`。
+  成功 `200 {host, deleted: true|false}`——平台文件里本来就没这个 host ⇒ `deleted:false` 且**仍 `200`**
+  （天然幂等，不是 404）。副作用：重写平台文件 + 清遗留 home 文件的同 host 行 + 抹对应的 `git-cli` 配置。
+- **副作用与审计**：写目标 = 平台独占的 `platform/git/credentials`（mode `0644`，容器内 ro 挂载，
+  `git-credential.js:18-19`）；`PUT` 另写 `audit_log`（`admin.git_credential_set`）、`DELETE` 写
+  `admin.git_credential_deleted`——**details 只有 `fde_name` / `host` / `deleted`，从结构上不可能泄 token**。
+  `PUT` **不碰**遗留 home 文件（旧代次容器只认它，清了会当场断认）。
+
+### 2.17 `GET /api/health`（就绪探针，#777 A4 补登记）
+
+与 `/healthz` 同一个 handler（`http.js:1218-1237`）：非 `GET` ⇒ `405 method_not_allowed`；DB 就绪
+⇒ `200 {status:"ok", version:{station,revision,builtAt}}`（`partialBuffer` **只在有缓冲实例时**才出现，additive）；
+不就绪 ⇒ `503` + 标准错误信封 `migration_failed`。**无需鉴权**（它就在路由分派之前），健康检查只看 `res.ok`、
+不解析 body。`version` 三格读不到时全是 `unknown`（#586）；本端点**不**报引擎版本（那在 §4.16）。
 
 ## 3. 项目（Projects）
 
@@ -2774,6 +2816,28 @@ vs `name` 显示名）见上方 #296 那一段，`context_window` / `max_output_
 错误映射零新码（§8.20）：额度校验复用 `LlmError('validation_failed')`、`not_found`；网关不可达沿用 `LlmGatewayError`→`httpStatus`。实现见 `portal/src/llm.js` 的 `setFdeBudget` / `getFdeBudget` / `getFdeBudgetUsage`；行为以 `portal/test/llm.test.js` 为准。
 
 > **用户侧同源投影（#808）**：普通 FDE 读**自己**的额度/用量走 `GET /api/me/llm-quota`（§2.14）与 `GET /api/me/llm-usage?days=30`（§2.15）——**同一份 `projectQuota` 投影、同一份 `getFdeBudgetUsage` 日聚合**，只是人取 `session.user.fde_name`、无参数面。管理侧本节能读**任意** `:fde`（admin-only），用户侧只能读自己；两者的字段形状与 `spend_scope`/`null` 口径逐字一致。
+
+#### 4.10-1 FDE 的 LLM 绑定读写：`GET|PUT /api/admin/fdes/:fde/llm`（#777 A4 补登记）
+
+本节两条与 §4.10 的 `budget` / `usage` 是**不同的东西**：那两条读的是「花多少钱」，本两条读写的是
+「这个 FDE 用哪个供应商、哪三个模型位」。入口同 §4.10：`requireAdmin` + `validateFdeName`（非法语法 ⇒ `400`
+`validation_failed`，`details.field='fde_name'`）；实现 `http.js:2647-2680` + `llm.js:901-926`、`:1323-1329`、`:1734-1953`。
+
+| 方法 + 路径 | 请求 | 成功响应 | 错误 |
+|---|---|---|---|
+| `GET /api/admin/fdes/:fde/llm` | —（无参数）| `200 { config, active_run }`。**无绑定也 `200`**且 `config:null`。`config` 十二键：`provider_id`、`provider_name`（= `provider_id` 的**别名**，同一个值）、`gateway`、`gateway_user_id`、`key_id`、`key_alias`、`api_key`（**已掩码**：`sk-...` + 后 4 位，`maskKey`）、`budget_usd`、`budget_period`、`main`/`embedding`/`vision`（模型位：`{model_id, name, type}` 或 `null`）。`active_run` = 该 FDE 有 `queued`/`running`/`cancelling` 的 run | `404 not_found`（**表里没有该 `fde_name` 的 active 用户**，`llm.js:1325`；注意它**不是**「没有绑定」——没绑定是 `200`）；`502 llm_gateway_error`（绑定行存在但数据面模型名丢了 ⇒ `slot()` 当场抛，`llm.js:892-897`）|
+| `PUT /api/admin/fdes/:fde/llm` | 走 §1.5 的 `Content-Type` 闸；体 `{ provider_id, main_model_id, embedding_model_id?, vision_model_id?, api_key?, force? }` | `200 { config }`——⚠ 这里的 `config` **只有九键**（`provider_id`、`provider_name`、`gateway`、`key_id`、`key_alias`、`api_key`（掩码）、`main`、`embedding`、`vision`），**不带 `gateway_user_id` / `budget_usd` / `budget_period`** ⇒ **GET 与 PUT 的 `config` 不同形**，前端改完要重拉 GET，不得拿 PUT 的响应去覆盖列表行 | `400 validation_failed`（`details.field='provider_id'` / `'main_model_id'` 缺失；**`details.field='api_key'`**：只要 `api_key` 不是 `undefined`/`null`/`""` 就被拒——上游密钥必须住在 LiteLLM credential 里，**不得按 FDE 提交**）；`404 not_found`（用户不存在或非 active）；`409 active_run_conflict`（当前绑定 active、本次不是同绑定、没带 `force=true`，且该 FDE 有活跃 run）；`llm_gateway_error`（**状态码原样透传**，模型选择要读网关目录）|
+
+- **幂等与「改白名单不重铸 key」**：PUT 先比「同绑定」（`provider_id` + 三个模型位的 id **与**数据面名全等，且现绑定
+  active）——同绑定 ⇒ **短路**：零网关写、零审计、零重铸，直接回掩码后的 config（重复点保存不会把 key 换掉）。
+  不同绑定但现有 key 可用 ⇒ 走 **`/key/update` 只改白名单**（`generation` 不 +1、`rotated_at` 不动，
+  `llm.js:1826-1848`）；只有「无可用 key / key 在网关已丢」才**重铸**（`generation + 1` + `rotated_at`）。
+  重铸时旧 key 会在提交后被 `deleteKey` 掉。**额度不自己换算**：重存已有 key 时把 DB 里的额度一并下发
+  （无额度 ⇒ 显式 `max_budget:null, budget_duration:null`）——这是 §4.10 不重算口径的另一半。
+- **副作用**：事务内 `pg_advisory_xact_lock('llm-binding:<fde_name>')` + `fde_llm_bindings` upsert +
+  `audit_log`（`llm.config_updated`，details 里带 `virtual_key_action ∈ allowlist_updated|rotated|created`）+
+  outbox 的 `llm_binding` 变更项（路由下发靠它）。**事务失败且已新铸 key ⇒ 先删新 key 再上抛**（不留孤儿）。
+- **响应永不出现完整 `api_key`**（虚拟 key 明文只在生成那一步存在过，出接口就过 `maskKey`）。
 
 ### 4.11 文件预览五通道（issue #366 / #795）
 
@@ -6109,6 +6173,25 @@ This endpoint requests **disable/offboarding; it never deletes the platform acco
 The portal worker then stops active runs and the FDE container, revokes the runner token and LLM virtual key, removes local Git credentials, revokes access to a platform-minted Gitea account by setting `prohibit_login=true` (without deleting the upstream user or token), releases routes/network allocations, and records a workspace purge deadline only when retention is explicitly enabled. User-managed Git credentials are not used to disable the employee's upstream account; GitLab upstream revocation is deferred. The disable transaction also removes login sessions, pending login tokens, and API tokens. Failed steps are durable and can be retried; the account stays disabled. `ERIX_WORKSPACE_RETENTION_DAYS` defaults to `0`, which leaves `workspace_purge_after` NULL and disables sweeping. An explicit positive value enables a sweep that deletes only the workspace directory after its deadline; **all database rows remain**. A user without FDE resources or a workspace is disabled synchronously and returns `204`; the user row remains.
 
 Deleting the current administrator returns `409 self_delete`. Resources with an invalid/missing `fde_name` return `409 user_fde_name_missing` rather than attempting unsafe cleanup.
+
+### `POST /api/admin/users/:id/onboard/retry`（#777 A4 补登记）
+
+`http.js:2180-2198` + `portal/src/onboarding.js:275-303`。`requireAdmin`。**不读体**（带了也不看）。
+
+- `:id` **必须是 UUID**（`decodeAdminUserUuid`，`http.js:1187-1197`）——形状不对 ⇒ `400 validation_failed`
+  + `details.field='id'`（这一族里**只有 `:id` 是 id**，其它 admin 面多用 `fde_name`，不要拄错）。
+- **前置闸（与下线互斥）**：该用户存在 `state IN ('pending','running')` 的 `fde_offboarding` 行
+  ⇒ `409 user_offboarding`（人在下线或保留期内，不许重试开户）。
+- `retryOnboarding` 返 `null`（没开户任务行）时再查一次 `users`：行不存在 ⇒ `404 not_found`；
+  人在但没有开户任务 ⇒ `409 onboarding_not_found`。任式不同但码相不同，前端得分别处理。
+- 任务当前 `state='running'` ⇒ `409 onboarding_running`（**不排队**，重试不会堆叠）。
+- 成功 `200 { "onboarding": { state, step, error, llm_binding? } }`（形状见 `onboarding.js:39-53`）：
+  `state` 新值是 `pending`（只**重新排队**，真执行的仍是后台 worker）；`step` 在 `done`/`awaiting_credential`
+  时是 `null`；`llm_binding` 子对象**只在 steps 里有 `llm-binding` 这一步时**才出现（additive）。
+- **幂等口径（重要）**：只有 `state='failed'`（或 `done`/`awaiting_credential` 但 `llm-binding` 步 `failed`）
+  才会真的把**第一个失败步**重置成 `pending` 并清 `last_error`；**其它状态原样返回、不碰库**
+  （`onboarding.js:285-287`）——所以重复点「重试」是个 `200` 的 no-op，不会重跑已完成的开户。
+- 本端点**不**创建新用户、**不**新建 `fde_onboarding` 行（那是 §2.9 创建路径的事）。
 
 ### `POST /api/admin/users/:id/offboarding/retry`
 

@@ -1,34 +1,5 @@
 {
-  "routes": [
-    {
-      "pair": "GET /api/health",
-      "reason": "GET /api/health 仅正文提及、§0.1 索引缺行（#777 S1 抓到），另有修刀补登记（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/me/git-credential",
-      "reason": "本人 git 凭证 GET/PUT/DELETE 未登记 portal.md（#777 S1 抓到），另有修刀补登记（#777 D 组）"
-    },
-    {
-      "pair": "PUT /api/me/git-credential",
-      "reason": "本人 git 凭证 GET/PUT/DELETE 未登记 portal.md（#777 S1 抓到），另有修刀补登记（#777 D 组）"
-    },
-    {
-      "pair": "DELETE /api/me/git-credential",
-      "reason": "本人 git 凭证 GET/PUT/DELETE 未登记 portal.md（#777 S1 抓到），另有修刀补登记（#777 D 组）"
-    },
-    {
-      "pair": "POST /api/admin/users/:P/onboard/retry",
-      "reason": "§2.9 仅正文提及 onboard/retry（:5319），索引行缺（#777 S1 抓到），另有修刀补登记（#777 D 组）"
-    },
-    {
-      "pair": "GET /api/admin/fdes/:P/llm",
-      "reason": "fde LLM 绑定 GET/PUT 未登记，§4.10 标题只登记 budget/usage（#777 S1 抓到），修刀补（#777 D 组）"
-    },
-    {
-      "pair": "PUT /api/admin/fdes/:P/llm",
-      "reason": "fde LLM 绑定 GET/PUT 未登记，§4.10 标题只登记 budget/usage（#777 S1 抓到），修刀补（#777 D 组）"
-    }
-  ],
+  "routes": [],
   "schema": [
     {
       "entry": "check:llm_providers.api_format=openai",
