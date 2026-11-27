@@ -10,7 +10,7 @@
 // 假库不校列名 ⇒ 四条 SQL 已在真库事务对账并 ROLLBACK（见 M2 交棒）。
 // 隔离约定（docs/testing.md §2.1）：注入 `FakePool`，不碰真实 DB。
 
-import test, { after } from 'node:test';
+import test, { after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -20,6 +20,22 @@ import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import * as apiTokens from '../src/api-tokens.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 station-static-apitokens-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const PASSWORD = 'correct horse battery staple';
 let passwordHashCache = null;
@@ -79,7 +95,7 @@ async function makeUser({ id, login, role = 'fde', fde_name = login, mailOtp = f
 }
 
 async function startServer({ users }) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-apitokens-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-apitokens-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const config = {
     cookie: cookieSettings('dev-http', 604800),

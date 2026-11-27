@@ -14,7 +14,7 @@
 // 三格各一条判据；再加 run 作用域的回归格（不传 scopeRef ⇒ 行为逐字不变）。
 //
 // ⚠ 不 import worker.js（顶层 fork / process.on 副作用，工单明令）；worker 侧只做源码标记段判据。
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -26,6 +26,14 @@ import { prepareSessionNotesDir, safeSessionScope, sessionNotesDir } from '../li
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'station-notes-scope-'));
 const SESSION = '2f7c8a94-0f0d-4b1e-9a1c-6a1a2b3c4d5e';
+
+// ---- 夹具生命周期（#880）：/tmp 顶层只出现 station-notes-scope-* 这一个目录，收尾必须 rm 它 ----
+// tmpRoot 是**模块级共享**夹具（每一格都往它下面 mkdtemp 子目录），所以收尾只能挂在 after() 上跑一次：
+// 挂 afterEach 会在第一格之后就把共享根删掉，后面的格子全 ENOENT（子目录在 tmpRoot 里，闸不数）。
+after(() => {
+  // rmSync 必须是真语句：注释掉它收尾就没了（#880 批一那种空转形态在这里是「根本不跑」）。
+  fs.rmSync(tmpRoot, { recursive: true, maxRetries: 3 });
+});
 
 function freshDir(name) {
   return fs.mkdtempSync(path.join(tmpRoot, `${name}-`));

@@ -17,7 +17,7 @@
 //   口径登记：`docs/design/runner-integration.md` §6.3-3 / §17.1。
 //
 // 隔离约定：全部用例跑在 `fs.mkdtempSync(os.tmpdir())` 里，不碰真实项目目录与真实家目录。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -25,6 +25,22 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createJail, createStationFileTools, JailError, STATION_MASKED_PATHS } from '../lib/file-tools.js';
 import { createShellTools } from '../lib/shell-tools.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// withTempDir 的 erix-mask-231- 一律进 tmpDirs；它自己 finally 里那份 rm 仍是第一道防线。
+// force 是必需的：两道 rm 会撞同一个目录，必须容忍「已经没了」；真漏注册闸会当场抱住。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -35,7 +51,7 @@ function stationTools(root, maskedPaths = STATION_MASKED_PATHS) {
 }
 
 async function withTempDir(fn) {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-mask-231-')));
+  const dir = fs.realpathSync(trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'erix-mask-231-'))));
   try {
     return await fn(dir);
   } finally {

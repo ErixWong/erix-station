@@ -14,7 +14,7 @@
 //
 // 隔离约定（docs/testing.md §2.1）：内存 fake pool + `server.listen(0)`，不碰真实 dev 库 / 容器。
 // 语言信号：`Cookie: locale=en` 走英文腿；中文腿不带 locale cookie（`resolveRequestLocale` 缺省即非 'en' ⇒ 当中文）。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -23,6 +23,22 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 station-direct-msg-static-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 // 四条期望文案，逐字抄自 http.js 的两处发送点（精确等值，不用 includes/match，避免假绿）。
 const GATE_ZH = '当前口令由管理员代设，请先修改口令后再使用其它功能';
@@ -56,7 +72,7 @@ class Pool extends FakePool {
 }
 
 async function startServer(poolOpts) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-direct-msg-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-direct-msg-static-')));
   const config = {
     cookie: cookieSettings('dev-direct', 604800),
     sessionTtlSeconds: 604800,

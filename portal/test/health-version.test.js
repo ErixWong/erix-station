@@ -14,7 +14,7 @@
 //     于是「没读到」与「没有这个字段」在响应里无法区分——而 `unknown` 是显式的「不知道」。
 //
 // 隔离（docs/testing.md §2.1）：注入内存 fake pool + 临时 static 目录；`partialOutputs` 单例前后清空。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,6 +28,23 @@ import { partialOutputs } from '../src/run-partial-buffer.js';
 import { healthVersionBlock, readStationVersion, BUILD_INFO_PATH, PACKAGE_DIR } from '../src/version-info.js';
 import { UNKNOWN } from '../src/build-info.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本单只点名 startServer 的 station-586-（station-586-bi- 等其余站点本单不动）。
+// force 是必需的：close() 已 rm 过同一个 staticDir，这里再清一道必须容忍「已经没了」；
+// 真漏了（某条用例没 close）仍会漏在 /tmp 被 #875 的闸抱住。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 /** 把 `deploy/migrations` 的全部版本号当成「已应用」⇒ `/healthz` 走 200 分支（真判据，不 stub 布尔）。 */
 class ReadyPool extends FakePool {
@@ -45,7 +62,7 @@ class ReadyPool extends FakePool {
 }
 
 async function startServer(pool = new ReadyPool()) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-586-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-586-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const config = {
     cookie: cookieSettings('dev-http', 604800),

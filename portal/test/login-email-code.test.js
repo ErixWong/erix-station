@@ -21,7 +21,7 @@
 //   ⑮ 同一 pending_token 单次消费：任一路径先成功后，另一路径 401 pending_expired
 //   ⑯ 审计 method 三值各自可达且不串：totp / email_code / email_code_alt
 
-import test, { after } from 'node:test';
+import test, { after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,6 +33,22 @@ import * as loginEmailCode from '../src/login-email-code.js';
 import { maskEmail } from '../src/mailer.js';
 import * as totp from '../src/totp.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 station-static-emailcode-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const PASSWORD = 'correct horse battery staple';
 let passwordHashCache = null;
@@ -89,7 +105,7 @@ async function makeUser({
 }
 
 async function startServer({ users = [], mailer, loginEmailCodeOverrides = {}, emailSendRateLimit } = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-emailcode-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-emailcode-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   fs.mkdirSync(path.join(staticDir, 'app'), { recursive: true });
   fs.writeFileSync(path.join(staticDir, 'app', 'index.html'), 'SECRET_VUE_INDEX');

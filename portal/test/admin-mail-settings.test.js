@@ -20,7 +20,7 @@
 //
 // 另加两条不编号的守卫：邮箱正则与 `admin.js` 建号口径一字不差；审计/日志/响应里永不出现口令明文。
 
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -31,6 +31,22 @@ import { cookieSettings } from '../src/config.js';
 import { hashToken } from '../src/auth.js';
 import { createMailProvider } from '../src/mail-provider.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 station-static-mailadmin-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const ADMIN_ID = '00000000-0000-4000-8000-000000000001';
 const FDE_ID = '00000000-0000-4000-8000-000000000002';
@@ -92,7 +108,7 @@ function makeProvider({ pool, fail = null }) {
 }
 
 async function startServer({ mailSettings = null, fail = null } = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-mailadmin-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-mailadmin-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const config = {
     cookie: cookieSettings('mail-admin-test', 600),

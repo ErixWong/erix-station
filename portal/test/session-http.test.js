@@ -5,7 +5,7 @@
 //   F5 —— 路由分发的 session id 归一化为小写：用**大写** UUID 连上的客户端必须收到
 //         以 DB（小写）id 为 key 推送的实时事件（否则 SSE hub key 大小写不一致 → 永远收不到事件）。
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -17,6 +17,22 @@ import * as auth from '../src/auth.js';
 import * as internal from '../src/internal.js';
 import { SessionError, MAX_MESSAGE_CONTENT_LENGTH, validateMessageBody } from '../src/sessions.js';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// startServer 的 station-static-sse- 一律进 tmpDirs；close() 里那份 rm 仍是第一道防线。
+// force 是必需的：两道 rm 会撞同一个目录，必须容忍「已经没了」；真漏了（没 close）闸会当场抱住。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // F3：validateMessageBody（纯函数）
@@ -103,7 +119,7 @@ class SessionSsePool extends FakePool {
 }
 
 async function startServer(configOverrides = {}) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-sse-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-sse-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const config = {
     cookie: cookieSettings('dev-http', 604800),

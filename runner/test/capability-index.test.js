@@ -3,7 +3,7 @@
 // 判据继承 #451 对 AGENTS.md 那一套（docs/design/capability-market.md §6、lib/capability-index.js 头注释）：
 //   ① 内容只来自原文  ② 字节确定性（prompt 缓存前缀）  ③ 失败降级不抛  ④ 4 KiB 上限 + 截断记账。
 // 隔离约定（docs/testing.md §2.1）：全部用注入的假 fs / tmp 目录，不碰真实 `$HOME`。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -17,6 +17,22 @@ import {
   splitByEnabled,
   buildCapabilityIndex,
 } from '../lib/capability-index.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 capidx-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const skill = (id, over = {}) => ({
   id,
@@ -175,7 +191,7 @@ test('CI-8 单条字段过长 ⇒ 就地裁短，不许一条把整段挤掉', (
 // ---------------------------------------------------------------------------
 
 test('CI-9 tmp 目录里的真文件读得出来，并给出 §5 的字段面', () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'capidx-'));
+  const home = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'capidx-')));
   fs.mkdirSync(path.join(home, '.erix'), { recursive: true });
   fs.writeFileSync(path.join(home, '.erix', 'capabilities.json'),
     JSON.stringify({ version: 1, skills: [skill('real_one')] }, null, 2));

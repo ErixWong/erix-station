@@ -11,7 +11,7 @@
 //      再加源码级锁：Dockerfile / release.yml / ci.yml / compose 四处改动一处没落就红。
 //
 // 隔离（docs/testing.md §2.1）：临时目录 + 内存 FakePool，不碰真实 DB、不改仓库文件、不 build 镜像。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,6 +28,23 @@ import { readStationVersion } from '../src/version-info.js';
 import { readBuildInfo as readRunnerBuildInfo, UNKNOWN } from '../../runner/lib/build-info.js';
 import { checkBuildInfo, checkBuildInfoText } from '../../scripts/check-build-info.mjs';
 import { FakePool } from './fake-pool.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本单只点名 writeBuildInfo 的 station-586-surface-（station-586-sstatic- 本单不动）。
+// force 是必需的：多条用例末尾已 rm 过同一个 dir（不在 finally 里），这里再清一道必须容忍「已经没了」；
+// 真漏了（用例中途抛错）仍会漏在 /tmp 被 #875 的闸抱住。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const read = (rel) => fs.readFileSync(path.join(REPO, rel), 'utf8');
@@ -78,7 +95,7 @@ class SurfacePool extends FakePool {
 }
 
 function writeBuildInfo(values) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-586-surface-'));
+  const dir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-586-surface-')));
   const file = path.join(dir, 'build-info.json');
   fs.writeFileSync(file, JSON.stringify(values));
   return { dir, file };

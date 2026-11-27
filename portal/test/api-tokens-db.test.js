@@ -13,7 +13,7 @@
 // `TEST_DATABASE_URL` 未设 ⇒ 整文件 skip；每条用例自建自删库，
 // 绝不碰真库 station-db。
 
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,6 +33,23 @@ import {
   revokeToken,
 } from '../src/api-tokens.js';
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 station-static-736db-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+// ⚠ 本文件在无 TEST_DATABASE_URL 时整体 skip（startServer 根本不跑），这条收尾要在真库腿里才被跑到。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
 const SKIP = URL_VALUE ? false : SKIP_WITHOUT_PG;
@@ -222,7 +239,7 @@ function fakeMailerProvider() {
 }
 
 async function startServer(pool) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-736db-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-736db-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const config = {
     cookie: cookieSettings('dev-http', 604800),
