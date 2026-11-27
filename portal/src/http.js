@@ -5913,7 +5913,7 @@ async function handleInternal(req, res, ctx, url) {
   const identity = await internal.authenticateContainer(ctx.pool, bearerToken(req));
   const { container, user } = identity;
   // #845：内部通道没有浏览器、没有 cookie 罐子 ⇒ 语言只能从「这条请求属于谁」取。
-  // 只在内部面设置（浏览器路径不设 ⇒ 那边继续只认 cookie，别让账号值插队）。
+  // 只在内部面设置（浏览器路径不设 ⇒ 那边继续只按请求自带的 `Cookie: locale=` / `Accept-Language` 谈判，账号值不插队）。
   req.localeHint = user.locale ?? null;
 
   // SSE 下行通道（§9.12）
