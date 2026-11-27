@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import ModalShell from '../components/ModalShell.vue';
+import AppIcon from '../components/AppIcon.vue'; // #817 步 3：表格动作列的图标（几何在 `lib/icons.ts`）
 import UserLlmPane from '../components/UserLlmPane.vue';
 import FdePreviewPortsPane from '../components/FdePreviewPortsPane.vue';
 import { useAdminStore, type LlmModel, type AdminUser, type LlmProvider, type KeyUsageRow } from '../stores/admin';
@@ -698,6 +699,90 @@ function usageCell(user: AdminUser): UsageCell {
   return { kind: 'period', text: `${periodLabel} ${spendText}`, title: parts.join(' · '), muted: false };
 }
 
+// ── issue #817 步 1：工位列（原「开户 / 下线」）——**一态一行** ─────────────────────────
+// 四态：`—`（没开过工）/ `就绪`（默认态 ⇒ 淡）/ `已下线`（异常 ⇒ 黑）/ 进行中与失败沿用现文案。
+// 为什么并行：旧形状是 `onboarding` 一行 + `offboarding` 一行，再叠一句「· workspace 保留中」
+// ⇒ 这一格长期是三行话，比它管的三个问题还难读。一句话能说清的语义就不要拆三行：
+// 「这个人的工位现在怎么样」是一个问题，答案是**一个词**。
+// `workspace 保留中` 从常驻文案**降级到 hover**：它是清理排期的细节（且只在 hover 里才该读到），
+// 不是「工位现在什么状态」的一部分 —— 旧版把它印在每个已下线的人后面，一行里塞了两件事。
+interface SeatCell {
+  /** 可见文本：**保证一行**（多段用 ` · ` 连，不靠换行）。 */
+  text: string;
+  /** 颜色档：默认态淡（`/45`）、异常红、已下线给黑 —— 只有**异常**值得抢注意力。 */
+  cls: string;
+  /** hover 全文：`工位 <name> · <状态>[ · workspace 保留中][ · 清理排期]`；有错误时是错误原文。 */
+  title: string;
+  /** DOM 锚点（既有 `onboarding-status` / `offboarding-status` 用例靠它取格，不能退场）。 */
+  anchor: 'onboarding-status' | 'offboarding-status' | undefined;
+  retryOnboarding: boolean;
+  retryOffboarding: boolean;
+}
+
+function seatCell(user: AdminUser): SeatCell {
+  const seatName = t('admin.fde.seatHover', { name: user.fde_name || '—' });
+  const ob = user.offboarding;
+  const ib = user.onboarding;
+  const purgeAt = ob?.workspace_purge_after ? formatLastLogin(ob.workspace_purge_after) : null;
+  // 有错误时 hover 让位给错误原文（旧行为，AdminView 有用例钉着）：那一格里错误比重新描述一遍状态有用。
+  const err = ob?.state === 'failed'
+    ? ob.error ?? null
+    : ib?.llm_binding?.state === 'failed'
+      ? ib.llm_binding.error ?? null
+      : ib?.state === 'failed' ? ib.error ?? null : null;
+  const hover = (stateText: string, retained: boolean) => {
+    const parts = [seatName, stateText];
+    if (retained) parts.push(t('admin.fde.workspaceRetained'));
+    if (purgeAt) parts.push(t('admin.fde.workspacePurgeAfter', { date: purgeAt }));
+    return err ?? parts.join(' · ');
+  };
+  // ② 已下线：offboarding 走完了。它是**异常态**（这个工位已经没了，但账号还排在表里）⇒ 黑。
+  if (ob && ob.state === 'done') {
+    const text = t('admin.fde.seatOffline');
+    return {
+      text, cls: 'text-black', title: hover(text, true), anchor: 'offboarding-status',
+      retryOnboarding: false, retryOffboarding: false,
+    };
+  }
+  // ③ 就绪：默认态 ⇒ 淡（`text-black/45`）。九成的人在这里，它们不该和异常争注意力。
+  if (ib && ib.state === 'done' && !ob) {
+    const text = t('admin.fde.seatReady');
+    return {
+      text, cls: 'text-black/45', title: hover(text, false), anchor: 'onboarding-status',
+      retryOnboarding: false, retryOffboarding: false,
+    };
+  }
+  // ④ 进行中 / 失败：沿用现文案（`下线中` / `开户中` / `待凭据` / `失败`），失败点红并保留失败步骤与
+  //    LLM 绑定失败这两个「可读的错误细节」（旧行为）；`offboarding` 存在时它赢 —— 一行只放一个答案。
+  if (ob) {
+    const failed = ob.state === 'failed';
+    let text = t(`admin.fde.offboarding.${ob.state}`);
+    if (ob.step) text += ` · ${t(`admin.fde.offboardingSteps.${ob.step}`)}`;
+    return {
+      text, cls: failed ? 'text-red-700' : 'text-black/65', title: hover(text, false),
+      anchor: 'offboarding-status', retryOnboarding: false, retryOffboarding: failed,
+    };
+  }
+  if (ib) {
+    const llmFailed = ib.llm_binding?.state === 'failed';
+    const failed = ib.state === 'failed' || llmFailed;
+    let text = t(`admin.fde.onboarding.${ib.state}`);
+    // ⚠ 分隔符必须是 ` · `（两侧真空格）：AdminView 有正则钉 `待凭据\s+·\s+LLM 绑定失败`。
+    if (llmFailed) text += ` · ${t('admin.fde.llmBindingFailed')}`;
+    return {
+      text, cls: failed ? 'text-red-700' : 'text-black/65', title: hover(text, false),
+      anchor: 'onboarding-status', retryOnboarding: failed, retryOffboarding: false,
+    };
+  }
+  // ① 从未开户也从未下线 ⇒ 破折号（不是「无」、不是空串）。
+  // ① 从未开户也从未下线 ⇒ 破折号（不是「无」、不是空串）；hover 只说「这是谁的工位」，
+  //    不拿「从未活动」那种属于另一列（最后活动）的词去填这一格。
+  return {
+    text: '—', cls: 'text-black/35', title: seatName,
+    anchor: undefined, retryOnboarding: false, retryOffboarding: false,
+  };
+}
+
 onMounted(() => {
   // issue #800：这一列与列表并行拉，且**各自吞错**（load* 返回 null/字符串）：网关挂了只影响那一列。
   void Promise.all([admin.loadUsers(), admin.loadProviders(), admin.loadGitHosts(), admin.loadKeyUsage()]);
@@ -791,20 +876,35 @@ onBeforeUnmount(() => {
         {{ t('admin.fde.searchEmpty') }}
       </div>
 
-      <table v-else-if="admin.usersLoaded" data-test="user-table" class="w-full table-fixed text-left text-sm">
+      <!-- issue #817 步 4（版式总则）：窄屏**整表横滚**，而不是把列拆行。
+           容器 `overflow-x-auto` + 表 `min-width: 1150px`（中英两趟都不折行的实测下限）：
+           窄屏时页面本身不横溢（滚的是表），宽屏时 `w-full` 照旧撑满。
+           `table-fixed` **保留**：去掉它以后浏览器会按内容重算列宽，`colgroup` 的百分比与 `min-width`
+           就变成两套规则打架（实测：英文趟里「Provisioning」把显示名列顶宽、操作列被挤到折行）。
+           口径：`table-fixed`（列宽只听 colgroup）+ `min-width`（整张表的下限）+ 全表单行（见末尾 `<style>`）。 -->
+      <div
+        v-else-if="admin.usersLoaded"
+        data-test="user-table-scroll"
+        class="table-scroll user-table-scroll overflow-x-auto"
+      >
+      <table data-test="user-table" class="w-full table-fixed text-left text-sm" style="min-width: 1150px">
           <colgroup>
             <!-- issue #800：新增「周期 / 用量」列；#828 再加「默认语言」列（现 11 列，百分比总和必须 = 100）。
-                 用量列给 10%（真机 e2e：8% 时表头「周期 / 用量」被挤到换行，中文还拆断了「用量」）。 -->
+                 用量列给 10%（真机 e2e：8% 时表头「周期 / 用量」被挤到换行，中文还拆断了「用量」）。
+                 #817 步 4 重排（**语义与列序一个没动，只是数值**，总和仍 = 100）：
+                 登录名 11 / 显示名 8 / 角色 6 / 默认语言 7 / FDE 10 / MFA 4 / 状态 8 / 工位 10 /
+                 周期·用量 9 / 最后活动 14 / 操作 13。窄的那些列（MFA 4、角色 6）只能装一个符号 / 一个短词，
+                 宽的那些（最后活动 14）要装两个时间行 —— 在 `min-width: 1150px` 上它们各自都装得下。 -->
             <col class="w-[11%]">
-            <col class="w-[10%]">
+            <col class="w-[8%]">
+            <col class="w-[6%]">
             <col class="w-[7%]">
-            <col class="w-[4%]">
-            <col class="w-[11%]">
+            <col class="w-[10%]">
             <col class="w-[4%]">
             <col class="w-[8%]">
-            <col class="w-[11%]">
             <col class="w-[10%]">
-            <col class="w-[11%]">
+            <col class="w-[9%]">
+            <col class="w-[14%]">
             <col class="w-[13%]">
           </colgroup>
           <thead class="border-b border-black/10 bg-black/[0.025] text-xs text-black/55">
@@ -825,7 +925,7 @@ onBeforeUnmount(() => {
           <tbody>
             <template v-for="user in filteredUsers" :key="user.id">
               <tr data-test="user-row" class="border-b border-black/10">
-                <td class="truncate px-3 py-2.5 font-medium" :title="user.login">{{ user.login }}</td>
+                <td class="truncate px-3 py-2.5 font-mono font-medium" :title="user.login">{{ user.login }}</td>
                 <td class="truncate px-3 py-2.5 text-black/65" :title="user.display_name ?? user.login">
                   {{ user.display_name || user.login }}
                 </td>
@@ -848,59 +948,51 @@ onBeforeUnmount(() => {
                   </span>
                 </td>
                 <td class="px-3 py-2.5">
+                  <!-- issue #817 步 2：去装饰点，改**形状**（`✓` / `◌` / `⊘`）。
+                       理由：绿色在这张表里是**合法取值**（活跃就是绿，不是「读数缺失的兜底色」），
+                       所以下面不能再靠「加深 / 变浅」补语义 —— 颜色已经名草有主。
+                       能补语义的是**字符形状**：勾（通过）/ 虚线圆（暂停、待定）/ 斜标（不该发生），
+                       它们在色弱、灰阶、黑白打印下仍然可分；旧版的 `●`/`○` 在灰阶下是同一个圆。
+                       圆点只留在「状态与圆点分离」的地方（号池占用、在线状态），这张表不留。 -->
                   <span v-if="user.status === 'active'" class="inline-flex items-center gap-1.5 text-green-700">
-                    <span aria-hidden="true">●</span>{{ t('admin.fde.statusActive') }}
+                    <span aria-hidden="true">✓</span>{{ t('admin.fde.statusActive') }}
                   </span>
                   <span v-else-if="user.status === 'disabled'" class="inline-flex items-center gap-1.5 text-black/50">
-                    <span aria-hidden="true">○</span>{{ t('admin.fde.statusDisabled') }}
+                    <span aria-hidden="true">◌</span>{{ t('admin.fde.statusDisabled') }}
                   </span>
                   <span v-else class="inline-flex items-center gap-1.5 text-black/50">
-                    <span aria-hidden="true">○</span>{{ t('admin.fde.statusAwaitingCredential') }}
+                    <span aria-hidden="true">⊘</span>{{ t('admin.fde.statusAwaitingCredential') }}
                   </span>
                 </td>
-                <td class="px-2 py-2.5">
-                  <div v-if="user.onboarding" class="mb-1">
+                <!-- issue #817 步 1：生命周期两格合一（详见 script 里 `seatCell` 的注释）：
+                     一个答案、一行字、重试按钮同行。形状全靠 `seatCell()` 算，模板只负责渲染。 -->
+                <td class="px-2 py-2.5" data-test="seat-cell">
+                  <!-- ⚠ 外层必须是 `div` 不是 `span`：既有用例用 `td.find('span')` 取「那一行的状态字」，
+                       外层再套一个 span 会抢中选中（title 拿到 undefined）。 -->
+                  <div class="flex items-center gap-1 whitespace-nowrap">
                     <span
-                      data-test="onboarding-status"
-                      :title="user.onboarding.llm_binding?.state === 'failed'
-                        ? user.onboarding.llm_binding.error ?? ''
-                        : user.onboarding.state === 'failed' ? user.onboarding.error ?? '' : undefined"
-                      :class="user.onboarding.state === 'failed' || user.onboarding.llm_binding?.state === 'failed'
-                        ? 'text-red-700' : 'text-black/65'"
-                    >
-                      {{ t(`admin.fde.onboarding.${user.onboarding.state}`) }}
-                      <span v-if="user.onboarding.llm_binding?.state === 'failed'"> · {{ t('admin.fde.llmBindingFailed') }}</span>
-                    </span>
+                      :data-test="seatCell(user).anchor"
+                      :class="seatCell(user).cls"
+                      :title="seatCell(user).title"
+                      class="min-w-0 truncate"
+                    >{{ seatCell(user).text }}</span>
                     <button
-                      v-if="!user.offboarding && (user.onboarding?.state === 'failed' || user.onboarding?.llm_binding?.state === 'failed')"
+                      v-if="seatCell(user).retryOnboarding"
                       type="button"
                       data-test="retry-onboarding"
-                      class="ml-1 rounded border border-black/15 px-1 py-0.5 text-xs hover:bg-black/5 disabled:opacity-50"
+                      class="shrink-0 rounded border border-black/15 px-1 py-0.5 text-xs hover:bg-black/5 disabled:opacity-50"
                       :disabled="onboardingBusyId !== null"
                       @click.stop="retryOnboarding(user)"
                     >{{ t('admin.fde.retryOnboarding') }}</button>
-                  </div>
-                  <div
-                    v-if="user.offboarding"
-                    data-test="offboarding-status"
-                    :title="user.offboarding.error ?? undefined"
-                    :class="user.offboarding.state === 'failed' ? 'text-red-700' : 'text-black/65'"
-                  >
-                    {{ t(`admin.fde.offboarding.${user.offboarding.state}`) }}
-                    <span v-if="user.offboarding.step"> · {{ t(`admin.fde.offboardingSteps.${user.offboarding.step}`) }}</span>
-                    <span v-if="user.offboarding.workspace_purge_after">
-                      · {{ t('admin.fde.workspacePurgeAfter', { date: formatLastLogin(user.offboarding.workspace_purge_after) }) }}
-                    </span>
                     <button
-                      v-if="user.offboarding.state === 'failed'"
+                      v-if="seatCell(user).retryOffboarding"
                       type="button"
                       data-test="retry-offboarding"
-                      class="ml-1 rounded border border-black/15 px-1 py-0.5 text-xs hover:bg-black/5 disabled:opacity-50"
+                      class="shrink-0 rounded border border-black/15 px-1 py-0.5 text-xs hover:bg-black/5 disabled:opacity-50"
                       :disabled="offboardingBusyId !== null"
                       @click.stop="retryOffboarding(user)"
                     >{{ t('admin.fde.retryOffboarding') }}</button>
                   </div>
-                  <span v-if="!user.onboarding && !user.offboarding" class="text-black/35">—</span>
                 </td>
                 <td class="px-3 py-2.5">
                   <span
@@ -935,17 +1027,20 @@ onBeforeUnmount(() => {
                 </td>
                 <td class="px-2 py-2">
                   <div class="flex flex-wrap items-center justify-end gap-1">
-                    <!-- issue #727 片 2：「会话/文件」——这人的工位内容（只读页）。深链带 `?fde=`，
-                         没有 `fde_name` 的行不渲染（没有工位就没有内容可看）。 -->
+                    <!-- issue #727 片 2 + #817 步 3：「会话/文件」图标化 = **图标 + 短词**，不是纯图标
+                         （没有可猜的上下文，鼠标 hover 也不能是发现唯一手段）。emoji 不算图标。 -->
                     <router-link
                       v-if="user.fde_name"
                       data-test="seat-content-link"
                       :to="{ name: 'admin-seat-content', query: { fde: user.fde_name } }"
-                      class="rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
-                    >{{ t('admin.seatContent.fromUsersLink') }}</router-link>
+                      class="inline-flex items-center gap-1 rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
+                    ><AppIcon name="folder" />{{ t('admin.seatContent.fromUsersLink') }}</router-link>
+                    <!-- 启用 / 停用：**纯文字**。它是这一行唯一的危险动作（立刻把人推出工位），
+                         图标在这里只会多一个需要背的图形，不会降低误碰率 —— 所以不上图标。 -->
                     <button
                       v-if="!user.offboarding"
                       type="button"
+                      data-test="toggle-user-status"
                       class="rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5 disabled:opacity-50"
                       :disabled="busyUserId !== null"
                       :aria-label="user.status === 'disabled' ? t('admin.fde.enableUser') : t('admin.fde.disableUser')"
@@ -954,14 +1049,16 @@ onBeforeUnmount(() => {
                     <button
                       type="button"
                       data-test="edit-user"
-                      class="rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
+                      class="inline-flex items-center gap-1 rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
                       @click.stop="openEditModal(user)"
-                    >{{ t('admin.fde.editAction') }}</button>
+                    ><AppIcon name="pencil" />{{ t('admin.fde.editAction') }}</button>
                   </div>
                 </td>
               </tr>
               <tr v-if="rowErrors[user.id] || rowMessages[user.id]" class="border-b border-black/10">
-                <td colspan="11" class="px-3 py-1.5 text-xs">
+                <!-- 全表单行的**唯一例外**（见末尾 `<style>`）：这是跨 11 列的整行消息，不是数据列。
+                     不让它折行 ⇒ 一句长错误会把整张表顶到横向滚动（错误反而须滚动才看全）。 -->
+                <td colspan="11" class="user-msg-cell px-3 py-1.5 text-xs">
                   <p v-if="rowErrors[user.id]" class="syserr" role="alert">{{ rowErrors[user.id] }}</p>
                   <p v-else class="text-green-700" role="status">{{ rowMessages[user.id] }}</p>
                 </td>
@@ -969,6 +1066,7 @@ onBeforeUnmount(() => {
             </template>
           </tbody>
         </table>
+      </div><!-- /user-table-scroll（#817 步 4：整表横滚的容器） -->
     </div>
   </section>
 
@@ -1686,3 +1784,21 @@ onBeforeUnmount(() => {
     </form>
   </ModalShell>
 </template>
+
+
+<style scoped>
+/* issue #817 步 4（版式总则）：用户表**全表单行**。
+   为什么钉在 th/td 上、而不是只在容器上写一个 `whitespace-nowrap`：`white-space` 虽然可继承，
+   但格子里已有的 `.truncate` / `.block` 之类会各自重新声明它，写在容器上「看着对」不等于每一格
+   真的不折。红线：这里**不许**出现 `overflow-wrap: break-word` / `word-break` —— 它们的语义是
+   「允许把词切开」，正是 #800 那次表头「用量」被拆成两半的机制（窄列 + 允许切词 = 迟早折行）。
+   需要收口的格子自己带 `truncate`（overflow-hidden + text-ellipsis + nowrap），全文交给 `:title`。
+   唯一例外是 `user-msg-cell`：跨 11 列的整行错误/提示，不是数据列（见模板里的注释）。 */
+.user-table-scroll th,
+.user-table-scroll td {
+  white-space: nowrap;
+}
+.user-table-scroll td.user-msg-cell {
+  white-space: normal;
+}
+</style>

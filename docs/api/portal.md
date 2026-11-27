@@ -5505,6 +5505,13 @@ All user-management routes require `requireAdmin`: no session returns `401 unaut
 
 Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, `role`, `fde_name`, `git_host_id`, `auth_source`, `status`, `created_at`, `totp_enabled` (boolean), `last_login_at` (the newest `login_sessions.created_at`, or `null`), `last_activity_at` (the newest real user input, or `null`; see the note below), `locale`（#828 P1：账号级语言偏好，`null` = 跟随浏览器）, and `offboarding` (`null` or `{ "state", "step", "error", "workspace_purge_after" }`). Offboarding `state` is `pending`, `running`, `done`, or `failed`; `step` identifies the current/failed workflow step and is `null` when complete. Revoked sessions remain part of login history.
 
+**管理台用户表的渲染口径（issue #817，纯前端，不动本契约）**：这些字段在表里只占**一列**（列名「工位 / Seat」），
+且**一态一行**：`—`（无 `onboarding` 无 `offboarding`）/ `就绪`（`onboarding.state=done` 且未下线，淡字——默认态不抢注意力）/
+`已下线`（`offboarding.state=done`，黑字——异常才值得读）/ 其余沿用各状态词（`pending`/`running`/`failed`/`awaiting_credential`，失败点红并带失败步骤）。
+**`workspace 保留中` 与 `workspace_purge_after` 不在可见文本里，只进 hover（`:title`）**：它们是清理排期细节，不是「工位现在什么状态」；
+`failed` 时 `:title` 让位给 `error` 原文。同一行的形状区分也写进了代码：**状态列用形状不用颜色深浅**（`✓` 活跃 / `◌` 已停用 / `⊘` 待凭据——
+绿色本身是合法取值，不能再靠加深补语义，而形状在色弱与灰阶下仍可分）。版式：表格外层包 `overflow-x-auto` 容器 + `table` 上 `min-width: 1150px`，
+**全表单行且不用 `overflow-wrap: break-word`**（它的语义是「允许把词切开」，正是窄列拆断中文词那个事故的机制），窄屏整表横滚而页面不横溢。
 **`last_activity_at`（issue #497，工单 `feat-261112-01`，迁移 `0031`）**：该用户**最近一次亲口说话**的时刻 = **按下发送那一刻**（`timestamptz`，DTO 里是 ISO 串）。它补的是一个**此前缺失**的维度：`last_login_at` 只回答「最近一次把门推开」，页面刷新、自动续期、以及一句话没说的天天登录都会写它，所以它答不出管理员真正想问的「**这个人还在用吗**」。
 
 - **写入点只有两处**（刻意不加第三处）：`portal/src/sessions.js#postMessage`（本站唯一发送路，直发与队列投递都走它）与 `portal/src/queued-inputs.js#enqueueQueuedInput`（run 正在跑时按回车那一刻就是活动——那句话此刻已落进 `queued_inputs`，与「稍后被投递」无关；投递失败退回待投也不把它收回）。两处都在**既有事务内用同一个 `client`** 写 ⇒ 不会出现「消息回滚了而活动位前进了」。**无节流**：一次输入写一次。

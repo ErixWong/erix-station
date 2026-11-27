@@ -1038,7 +1038,10 @@ describe('AdminView · FDE 用户', () => {
     expect(list.findAll('[data-test="user-row"]')).toHaveLength(2);
     expect(list.text()).toContain('✓');
     expect(list.findAll('thead th')).toHaveLength(11);
-    expect(list.findAll('thead th')[7].text()).toBe('开户 / 下线');
+    // 列序账（#817 重排后只改了「工位」那一列的**文案**，列序/下标一个没动）：
+    // 0 登录名 / 1 显示名 / 2 角色 / 3 默认语言 / 4 FDE / 5 MFA / 6 状态 / 7 工位 / 8 周期·用量 / 9 最后活动 / 10 操作。
+    // 下标 7 旧文案是「开户 / 下线」（三行话），#817 收成四态一行的「工位」。
+    expect(list.findAll('thead th')[7].text()).toBe('工位');
     // issue #497：第 10 列的语义从「最近登录」换成「最后活动」。
     // issue #800 插了「周期 / 用量」、#828 又插了「默认语言」⇒ 活动列再往后顺一位（下标 9）。
     expect(list.findAll('thead th')).toHaveLength(11);

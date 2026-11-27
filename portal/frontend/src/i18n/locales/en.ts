@@ -1907,7 +1907,15 @@ export const en = {
       colMfa: 'MFA',
       colStatus: 'Status',
       colOnboarding: 'Onboarding',
-      colLifecycle: 'Provisioning / offboarding',
+      // issue #817: the column answers one question now — is this person's seat still there.
+      // Wording only; the key stays `colLifecycle` (renaming it would drag call sites and specs).
+      colLifecycle: 'Seat',
+      // issue #817 step 1: the seat column's four states. `onboarding.done` ('Ready') stays in the
+      // edit pane; the table wants the short muted word, so it gets its own key.
+      seatReady: 'Ready',
+      seatOffline: 'Offline',
+      workspaceRetained: 'workspace retained',
+      seatHover: 'Seat {name}',
       colPeriodUsage: 'Period / usage',
       colDefaultLanguage: 'Default language',
       defaultLanguageLabel: 'Default language',

@@ -1899,7 +1899,16 @@ export const zhCN = {
       colMfa: 'MFA',
       colStatus: '状态',
       colOnboarding: '开户状态',
-      colLifecycle: '开户 / 下线',
+      // issue #817：这一列的语义从「开户 / 下线」两件事收成一件事：这人的工位还在不在。
+      // ⚠ 只改文案、不改键名（换键要连带动调用点与按下标断言的 spec）。
+      colLifecycle: '工位',
+      // issue #817 步 1：工位列四态。`onboarding.done`（「已就绪」）在**编辑面板**里照用；
+      // 表格里要的是两字的「就绪」（列窄，且它是默认态不值得三个字的强调），所以另开一键：
+      // 两套并存但各管各的落点，不拿一个词去坑两个位置。
+      seatReady: '就绪',
+      seatOffline: '已下线',
+      workspaceRetained: 'workspace 保留中',
+      seatHover: '工位 {name}',
       colPeriodUsage: '周期 / 用量',
       colDefaultLanguage: '默认语言',
       defaultLanguageLabel: '默认语言',

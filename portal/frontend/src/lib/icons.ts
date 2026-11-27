@@ -63,4 +63,10 @@ export const ICON_PATHS: Record<string, string[]> = {
   zap: ['M13 2 3 14h9l-1 8 10-12h-9l1-8z'],
   // Lucide `info`（ISC）：「关于」（底部固定项）。circle(r=10) 改写成圆弧 path。
   info: ['M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0', 'M12 16v-4', 'M12 8h.01'],
+  // issue #817 步 3：管理台用户表的动作列也复用同一套表（见 `AdminUsersView.vue`）。
+  // Lucide `folder`（ISC）：「会话 / 文件」= 这人的工位内容（原生就是纯 path）。
+  folder: ['M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
+  // Lucide `pencil-line`（ISC）：「编辑」。键名按语义叫 `pencil`（口径 ①：不按调用点命名），
+  // 几何取 pencil-line（带那一横，比 `pencil` 更易认）。两笔：笔身 + 下划线。
+  pencil: ['M12 20h9', 'M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z'],
 };
