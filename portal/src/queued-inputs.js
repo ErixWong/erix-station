@@ -272,7 +272,21 @@ export async function drainQueuedInputs(pool, {
   const deliverable = head.kind === 'steer'
     || NORMAL_END_REASONS.has(reason)
     || (reason === 'aborted' && steered.rows.length > 0);
-  if (!deliverable) return { blocked: 'not_deliverable_at_terminal', head: head.kind };
+  if (!deliverable) {
+    // #805：这条**必须**发帧，与 `container_not_running` 同口径。
+    //   判据是「用户会不会自己看得出这句话这次没走」：这里用户说了话、系统当场决定这轮不投，
+    //   而且**不会自动重试到他看得见**（下一次终态才会再试，而那可能要等下一次 run）——
+    //   不发帧他就只看到「队列里还有 1 条」，没有任何地方告诉他为什么，等同消息丢了。
+    // 对比两处**故意不发**（是决定，不是遗漏）：
+    //   · `claimed_by_other`：正常握手。另一处终态已经 CAS 认领成功，它会自己推 `delivered` 帧；
+    //     这里再推一条只会让原因在界面上闪一下又消失，是噪声不是信息。
+    //   · 会话没了 / 已归档（`drainAfterRunTerminal` 对 `session_status <> 'active'` 直接 return null，
+    //     连这里都到不了）：没有收件人，推给谁都不是。
+    // ⚠ 这条帧只是「原因」，不是终态：队列行**没有被消费**（既不 delivering 也不 discarded），
+    //   仍是 `pending`，下一次终态照样会来捞它。
+    await safeNotify(() => deps.notifyQueueUpdate?.(sessionId, 'not_deliverable_at_terminal'));
+    return { blocked: 'not_deliverable_at_terminal', head: head.kind };
+  }
 
   // 容器存活闸门。口径与 postMessage 那条容器查询一致（`status <> 'removed' AND revoked_at IS NULL`）。
   const container = await pool.query(

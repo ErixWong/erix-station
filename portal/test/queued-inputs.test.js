@@ -510,3 +510,44 @@ test('#799 internal.notifyQueueUpdate 的 queue_update 帧恒带 delivered 键�
     unregisterSessionClient('s-del-799', rec);
   }
 });
+
+// ---------------------------------------------------------------------------
+// issue #805：`blocked` 不是「接口失败」，是「这句话这次为什么没投出去」的原因码。
+// 发帧面必须**逐码**钉住，不能整片发也不能整片不发：
+//   · `not_deliverable_at_terminal` ⇒ **发**（用户看得见「为什么这句没发」，否则只剩「队列里还有 1 条」）；
+//   · `claimed_by_other`（正常握手，赢的那一方自己会推 delivered 帧）与会话没了/已归档 ⇒ **零调用**。
+// 反向判据是这条测试的全部意义：少了它，「顺手把另两条也发了」一样全绿（#805）。
+// ---------------------------------------------------------------------------
+test('#805 出队：follow_up + aborted 且非转向 ⇒ blocked=not_deliverable_at_terminal，且**推一帧**、行仍 pending', async () => {
+  const w = world();
+  seedQueued(w, [{ kind: 'follow_up', content: '别烧在坏 run 上' }]);
+  const out = await drainWith(w, { termination: { reason: 'aborted' } });   // 用户按停止，无转向行
+  assert.equal(out.blocked, 'not_deliverable_at_terminal');
+  assert.equal(w.postCalls.length, 0, '不投就是不投，不能顺手 postMessage');
+  assert.equal(w.queued[0].status, 'pending', '原因码不是终态：那行没被消费，下一次终态还会来捞');
+  assert.equal(w.notifies.length, 1, '本单主判据：这条必须发帧（不发 = 界面上没有任何地方解释为什么没发）');
+  assert.equal(w.notifies[0].sessionId, SID);
+  assert.equal(w.notifies[0].blocked, 'not_deliverable_at_terminal', '第 2 实参就是原因码（#294：只发码不发话）');
+});
+
+test('#805 出队：claimed_by_other 与会话已归档 ⇒ **不投也不发帧**（故意不发，不是遗漏）', async () => {
+  // ① 认领 CAS 被别处终态抢先：赢的一方自己会推 `delivered` 帧，这里再推只会让原因闪一下又消失。
+  const w = world();
+  seedQueued(w, [{ kind: 'follow_up', content: '只该发一次' }]);
+  const origQuery = w.pool.query.bind(w.pool);
+  w.pool.query = async (sql, params) => {
+    if (/SET status = 'delivering'/.test(sql)) return { rows: [] };
+    return origQuery(sql, params);
+  };
+  w.endedRun = { id: 'r1', termination: { reason: 'end_turn' } };   // 正常终态，否则先被上一道闸门挡下
+  const out = await withFakePostMessage(w, (deps) => drainAfterRunTerminal(w.pool, { runId: 'r1', deps }));
+  assert.equal(out.blocked, 'claimed_by_other');
+  assert.equal(w.notifies.length, 0, '握手失败的一方闭嘴（反向判据：不许顺手把它也发了）');
+
+  // ② 会话已归档 / 没了 ⇒ 没有收件人，`drainAfterRunTerminal` 直接 return null，连判定都不进。
+  const a = world({ session: { id: SID, user_id: 'u1', status: 'archived', cwd: '/w', title: null, project_id: null, last_seq: 0 } });
+  seedQueued(a, [{ kind: 'follow_up', content: '没人收的话' }]);
+  const outA = await withFakePostMessage(a, (deps) => drainAfterRunTerminal(a.pool, { runId: 'r1', deps }));
+  assert.equal(outA, null, '归档会话不参与自动投递（口径不动）');
+  assert.equal(a.notifies.length, 0, '没有收件人 ⇒ 一帧都不推');
+});

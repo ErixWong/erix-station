@@ -7,13 +7,22 @@
 import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore } from '../stores/workbench';
 
-const { t } = useI18n();
+const { t, te } = useI18n();
 const store = useWorkbenchStore();
 
 // 折叠默认收起，展开后每条最多 3 行（line-clamp）。不做逐条删除：后端只有整队取回
 //（pi `clear_queue` 的口径——单条删要和引擎的 pull 竞态，故只给「整队取回」这一个动作）。
-import { ref } from 'vue';
+import { computed, ref } from 'vue';
 const expanded = ref(false);
+
+// #805：`blocked` 是服务端的**机器码**（#294：服务端只发码、前端出话），拼键之前必须先验键在不在。
+// vue-i18n 缺键时回落成**键名本身**，那就把 `queued.blocked.claimed_by_other` 这种裸键直接递给用户——
+// 那不是「少一句翻译」，那是把内部实现当文案。未知码（新后端 + 旧前端是 additive 兼容面）宁可整行不渲染。
+const blockedKey = computed(() =>
+  store.queueBlocked && te(`queued.blocked.${store.queueBlocked}`)
+    ? `queued.blocked.${store.queueBlocked}`
+    : null,
+);
 </script>
 
 <template>
@@ -23,9 +32,9 @@ const expanded = ref(false);
     class="border-t border-black/10 bg-amber-50/70 px-3 py-1.5 text-xs"
   >
     <!-- 暂停原因必须显式说：容器没起来时那句话可能几小时都发不出去，不说就是「消息丢了」 -->
-    <div v-if="store.queueBlocked" class="flex items-center gap-1.5 text-amber-800">
+    <div v-if="blockedKey" class="flex items-center gap-1.5 text-amber-800">
       <span class="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" aria-hidden="true" />
-      <span>{{ t('queued.blocked.' + store.queueBlocked) }}</span>
+      <span>{{ t(blockedKey) }}</span>
     </div>
     <div class="flex items-center gap-2">
       <span class="font-medium text-black/70">
