@@ -173,30 +173,63 @@ function sqlLit(value) {
 }
 
 /**
+ * #878：`E2E_UI_SOFT=1` 到底该不该把一次失败降级成 skip——抽成纯函数，**只认调用点显式传来的
+ * `phase`，绝不从 message 猜**。
+ *
+ * 只允许在**环境探测阶段**（`phase==='probe'`：口令/凭据读取、docker 可用性、playwright 容器在不在、
+ * playwright 模块能不能加载、`--host-resolver-rules` 能不能生效——都是「真浏览器跑起来之前」的探测）
+ * 降级。`phase==='run'`（真浏览器已经开起来、已经在导航/点击/断言）里炸出的 `net::` 一律判红：
+ * 那多半是用例中段页面自身的问题，若被 `E2E_UI_SOFT=1` 降级成 skip，真回归就被静默吃掉了。
+ * `soft` 为假（没点名软降级）时一律不降级——点名要跑就判红，与哨兵同口径。`message` 只是给人看的上下文，
+ * 不参与阶段判定。
+ */
+export function shouldSoftSkip({ soft = false, phase, message = '' } = {}) {
+  if (!soft) return false;
+  if (phase !== 'probe') return false;
+  void message;
+  return true;
+}
+
+/**
  * #828 收尾（**必须放 finally**）：把浏览器腿在 DB 里改动的两个账号语言值恢复成 `null`，并**回读确认**。
  *
  * 为什么要：本腿在管理台把 admin 切到英文，切换当场经 `PATCH /api/me/locale` 真写进了 `users.locale`；
  * 旧脚本收尾只清了临时文件、**没碰 DB** ⇒ 把 dev 上的 `admin` 留成了英文（现场 `admin.locale='en'`）。
- * 两个账号（`ADMIN_LOGIN` 与 `SCRIPT_LOGIN`）一起恢复；UPDATE 用 tryQuiet 兑 docker 抖动，
- * 但**回读确认是硬判据**：哪个账号没回到 `NULL` 就判红（留脏值正是本腿要修的污染）。
+ * 两个账号（`ADMIN_LOGIN` 与 `SCRIPT_LOGIN`）一起恢复；UPDATE 尽力而为，
+ * 但**回读确认是硬判据**：哪个账号没回到 `NULL`、或**回读本身跑不动**，都判红（留脏值正是本腿要修的污染）。
+ *
+ * #878：回读跑不动不再是「记一句日志就返回」——那等于「没确认成功也算过」。`psql` 调用做成可注入
+ * 参数 `runPsql`（默认值仍是真 `docker exec` 的 `psql`）与 `soft`（默认 `UI_SOFT`），好让这条判据能在
+ * **不启动真库/浏览器**的情况下被 `node --test` 测到。
  */
-function resetAccountLocalesAndConfirm() {
+function resetAccountLocalesAndConfirm({ runPsql = psql, soft = UI_SOFT } = {}) {
   const targets = [ADMIN_LOGIN, SCRIPT_LOGIN];
   const inList = targets.map(sqlLit).join(', ');
-  // UPDATE 尽力而为（容器不可用/没这个账号 ⇒ 不因清理本身炸掉已经跑绿的用例）。
-  tryQuiet(() => psql(`UPDATE users SET locale = NULL WHERE login IN (${inList})`));
-  // 回读：`login=<value>` 一行一个，`NULL` 代指未设。回读本身跑不动（DB 不可用）也只记一句、不另抛。
+  // UPDATE 尽力而为：容器不可用 / 这套库没这个账号 / docker 抖动 ⇒ 不让清理动作本身炸掉已经跑绿的用例。
+  // 但注意：兜住「UPDATE 到底生效没有」的是**下面的回读判红**，不是这个 tryQuiet——tryQuiet 只吞异常，
+  // 真把脏值留下了会由回读兜住（见下），别把它当成「恢复失败也算过」。
+  tryQuiet(() => runPsql(`UPDATE users SET locale = NULL WHERE login IN (${inList})`));
+  // 回读：`login=<value>` 一行一个，`NULL` 代指未设。**回读跑不动 = 没确认成功 = 不算恢复 ⇒ 判红。**
+  // 理由：本腿会把 dev 上的账号语言值写脏，「恢复了却没确认」与「没恢复」在账上必须同等对待
+  //（`E2E_UI=1` 的口径就是「不许静默冒充通过」）。回读本身抛错正是「没确认成功」，故判红而非记一句日志返回。
+  // 唯一软面：显式 `E2E_UI_SOFT=1`（环境不齐，比如 DB 压根连不上）时才降级为一句日志、不判红（见 soft 参数）。
   let rows;
   try {
-    rows = psql(`SELECT login || '=' || COALESCE(locale, 'NULL') FROM users WHERE login IN (${inList}) ORDER BY login`);
+    rows = runPsql(`SELECT login || '=' || COALESCE(locale, 'NULL') FROM users WHERE login IN (${inList}) ORDER BY login`);
   } catch (err) {
-    console.log(`# 收尾回读确认跑不动（不影响主判据，但请人工确认 DB 没留脏值）：${String(err?.message || err).split('\n')[0]}`);
+    const why = String(err?.message || err).split('\n')[0];
+    if (soft) {
+      console.log(`# 收尾回读跑不动（已显式 E2E_UI_SOFT=1 降级，不判红）：${why}`);
+      return;
+    }
+    assert.fail(`收尾回读跑不动：无法确认 ${targets.join(' 与 ')} 两个账号的语言值已恢复（原因：${why}）——本腿会把 dev 上的账号语言值写脏，恢复了却没确认和没恢复在账上同等对待，没确认成功不能算恢复（不想被判红就显式带 E2E_UI_SOFT=1）`);
     return;
   }
   const seen = Object.fromEntries(rows.split('\n').filter(Boolean).map((l) => { const i = l.indexOf('='); return [l.slice(0, i), l.slice(i + 1)]; }));
   for (const login of targets) {
     const val = seen[login];
-    // 账号不存在（回读里没有这一行）不算脏；存在但非 NULL 才是本腿留下的脏值。
+    // 「账号缺行（回读里没有这一行）不算脏」只覆盖一种情况：**这套 dev 库里本来就没有这个账号**。
+    // 它**不**覆盖「UPDATE 没生效 ⇒ 行还在且非 NULL」——那种情况 `val` 是真值（如 'en'），下面判红（今天也确实判红）。
     if (val !== undefined && val !== 'NULL') {
       assert.fail(`收尾回读：账号 ${login} 的 locale 应已恢复为 NULL，实际为 ${JSON.stringify(val)}（本腿会把 dev 上的账号留成脏语言值）`);
     }
@@ -635,7 +668,8 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
   if (reason) {
     probe.reasons.ui = reason;
     // 点名即硬要求：环境不齐也算红（缺的是哪一样由 reason 点名）；不想被判红就显式带 E2E_UI_SOFT=1。
-    if (UI_SOFT) {
+    // 这是**环境探测阶段**（probeUi：口令/docker/容器/模块）——`E2E_UI_SOFT` 只对这一阶段开（见 shouldSoftSkip）。
+    if (shouldSoftSkip({ soft: UI_SOFT, phase: 'probe', message: reason })) {
       t.skip(`浏览器腿跑不了（已显式 E2E_UI_SOFT=1 降级）：${reason}`);
       return;
     }
@@ -680,8 +714,9 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     //   到了页面却没跑通（脚本里抛的：找不到控件、点了没反应、超时）⇒ 产品红，assert.fail。
     if (rep.fatal) {
       if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(rep.fatal)) {
-        // 环境到不了入口：点名即硬要求，也算红；不想被判红就显式带 E2E_UI_SOFT=1。
-        if (UI_SOFT) {
+        // #878：这是**运行阶段**（真浏览器已开、已在导航/点击/断言）炸出的 `net::`，多半是用例中段页面
+        // 自身的问题 ⇒ 一律判红，不再被 `E2E_UI_SOFT=1` 降级成 skip（否则真回归会被静默吃掉）。
+        if (shouldSoftSkip({ soft: UI_SOFT, phase: 'run', message: rep.fatal })) {
           t.skip(`环境到不了入口（net:: 类，已显式 E2E_UI_SOFT=1 降级）：${rep.fatal}`);
           return;
         }
@@ -728,8 +763,8 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     const acct = rep.account || {};
     if (acct.fatal) {
       if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(acct.fatal)) {
-        // 同主腿口径：环境到不了入口也算红（除非显式 E2E_UI_SOFT=1）。
-        if (UI_SOFT) {
+        // #878：同主腿——这也是**运行阶段**的 `net::`，一律判红，不再被 `E2E_UI_SOFT=1` 降级（见 shouldSoftSkip）。
+        if (shouldSoftSkip({ soft: UI_SOFT, phase: 'run', message: acct.fatal })) {
           t.skip(`账号级偏好腿到不了用户面入口（net:: 类，已显式 E2E_UI_SOFT=1 降级）：${acct.fatal}`);
           return;
         }
@@ -839,4 +874,50 @@ test('哨兵：点名了（E2E_UI=1）却没有口令 ⇒ 判红，禁止静默�
   // 账号级偏好腿要往脚本账号上写值再清回去：它的口令缺失与上面同口径（缺了就跑不了，不是 skip）。
   assert.ok(CRED_SCRIPT_PASSWORD !== null,
     `E2E_UI=1 点名了浏览器腿，但没找到脚本账号（${SCRIPT_LOGIN}）的口令文件（试过 ${SCRIPT_PASSWORD_FILE}）——缺它这条腿一步都跑不了，不能静默 skip 冒充通过`);
+});
+
+// ---------------------------------------------------------------------------
+// #878 纯判据用例：不启动浏览器、不碰真库/口令也能跑（`shouldSoftSkip` 是导出纯函数，
+// `resetAccountLocalesAndConfirm` 的 `psql` 与 `soft` 均可注入 ⇒ 无 `E2E_UI` 环境下也能被调用并断言）。
+// ---------------------------------------------------------------------------
+
+test('shouldSoftSkip：soft + probe + net:: ⇒ 允许降级（环境探测阶段）#878', () => {
+  assert.equal(shouldSoftSkip({ soft: true, phase: 'probe', message: 'net::ERR_CONNECTION_REFUSED' }), true);
+});
+
+test('shouldSoftSkip：soft + run + 同样的 net:: ⇒ 不许降级（运行阶段判红）#878', () => {
+  assert.equal(shouldSoftSkip({ soft: true, phase: 'run', message: 'net::ERR_CONNECTION_REFUSED' }), false);
+});
+
+test('shouldSoftSkip：soft=false + probe ⇒ 不许降级（点名要跑就判红，与哨兵同口径）#878', () => {
+  assert.equal(shouldSoftSkip({ soft: false, phase: 'probe', message: 'docker 不可用' }), false);
+});
+
+test('shouldSoftSkip：soft + run + 非 net::（断言失败）⇒ 不许降级 #878', () => {
+  assert.equal(shouldSoftSkip({ soft: true, phase: 'run', message: 'AssertionError: 找不到控件' }), false);
+});
+
+test('收尾恢复：回读跑不动（psql 抛异常）⇒ 判红，不许静默返回 #878', () => {
+  const boom = () => { throw new Error('docker exec psql: could not connect to server'); };
+  const re = new RegExp(`收尾回读跑不动.*${ADMIN_LOGIN}.*${SCRIPT_LOGIN}.*没确认成功不能算恢复`);
+  assert.throws(() => resetAccountLocalesAndConfirm({ runPsql: boom, soft: false }), (err) => re.test(err.message));
+});
+
+test('收尾恢复：回读里某账号 locale=en（UPDATE 没生效）⇒ 判红 #878', () => {
+  const rows = `${ADMIN_LOGIN}=en\n${SCRIPT_LOGIN}=NULL`;
+  const fake = (q) => (String(q).startsWith('UPDATE') ? '' : rows);
+  assert.throws(
+    () => resetAccountLocalesAndConfirm({ runPsql: fake, soft: false }),
+    (err) => err.message.includes(ADMIN_LOGIN) && /locale 应已恢复为 NULL/.test(err.message),
+  );
+});
+
+test('收尾恢复：回读两账号都 NULL ⇒ 不判红（对照组）#878', () => {
+  const fake = (q) => (String(q).startsWith('UPDATE') ? '' : `${ADMIN_LOGIN}=NULL\n${SCRIPT_LOGIN}=NULL`);
+  assert.doesNotThrow(() => resetAccountLocalesAndConfirm({ runPsql: fake, soft: false }));
+});
+
+test('收尾恢复：回读里账号缺行 ⇒ 不算脏（库里本就没这个账号，行为保留）#878', () => {
+  const fake = (q) => (String(q).startsWith('UPDATE') ? '' : '');
+  assert.doesNotThrow(() => resetAccountLocalesAndConfirm({ runPsql: fake, soft: false }));
 });
