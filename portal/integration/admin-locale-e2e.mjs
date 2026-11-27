@@ -368,13 +368,19 @@ async function apiCall(page, base, method, apiPath, payload) {
 
 // 语言偏好的两个载体（cookie 名 locale 与 localStorage 键 locale）一次读齐；cookieText 一起带回去，
 // 免得「locale 没读到」其实是整串 cookie 都没了而断言说不清原因。
+// #902 ①：顺带读 locale_chosen——它是「用户亲自点过开关」的跨子域标记（与偏好同作用域）。
+// 这个性质 jsdom 证不了（jsdom 不按真实 hostname 处理 Domain），只有真机能证「在管理台点的标记，
+// 用户面那个 origin 看得见」，所以在这里钉一条。（本段在 String.raw 模板体内 ⇒ 不带反引号。）
 async function readCarriers(page) {
   return page.evaluate(() => {
     let cookieLocale = null;
+    let cookieChosen = null;
     for (const part of (document.cookie || '').split(';')) {
       const i = part.indexOf('=');
       if (i < 0) continue;
-      if (part.slice(0, i).trim() === 'locale') cookieLocale = decodeURIComponent(part.slice(i + 1).trim());
+      const name = part.slice(0, i).trim();
+      if (name === 'locale') cookieLocale = decodeURIComponent(part.slice(i + 1).trim());
+      if (name === 'locale_chosen') cookieChosen = decodeURIComponent(part.slice(i + 1).trim());
     }
     let storageLocale = null;
     let storageKeys = [];
@@ -385,7 +391,7 @@ async function readCarriers(page) {
       storageLocale = null;
       storageKeys = [];
     }
-    return { cookieLocale: cookieLocale, storageLocale: storageLocale, storageKeys: storageKeys, cookieText: document.cookie || '' };
+    return { cookieLocale: cookieLocale, cookieChosen: cookieChosen, storageLocale: storageLocale, storageKeys: storageKeys, cookieText: document.cookie || '' };
   });
 }
 
@@ -512,6 +518,8 @@ try {
   await page.goto(cfg.userBase + '/#/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForSelector(LOCALE_BTN_ANY, { timeout: 20000 });
   r.user.lang = await page.evaluate(() => document.documentElement.lang);
+  // #902 ①：在**用户面这个 origin** 读一次载体——标记必须在（它跟偏好同为跨子域 cookie，不是 localStorage）
+  r.user.carriers = await readCarriers(page);
 
   // ── ⑧ 反方向也共享：用户面切回中文 → 回管理台 reload → zh-CN ──
   await openLocaleMenu(page, LOCALE_BTN_ANY);
@@ -749,6 +757,13 @@ test('管理台语言切换：真浏览器里切英文当场生效、刷新仍�
     assert.equal(admin.langAfterReload, 'en', `刷新后 <html lang> 仍应是 en（钉持久化 + detectLocale 读 cookie），实际 ${JSON.stringify(admin.langAfterReload)}`);
     // ⑦ 跨 host 共享：用户面登录页也是英文
     assert.equal(rep.user.lang, 'en', `跨 host 到用户面也应读到英文（同站 cookie 共享，这是 #804 要治的故障），实际 ${JSON.stringify(rep.user.lang)}`);
+    // ⑦b 「用户亲自点过开关」这个事实也必须跨 host 可见（#902 ①）：它要是只留在管理台的
+    //     localStorage，用户面就看不到 ⇒ 账号默认值会把共享的 `locale` cookie 盖掉。
+    assert.equal(
+      rep.user.carriers && rep.user.carriers.cookieChosen,
+      '1',
+      `在管理台点过 English 后，用户面那个 origin 应当看得见 locale_chosen=1（标记与偏好同为跨子域 cookie），实际 ${JSON.stringify(rep.user.carriers && rep.user.carriers.cookieChosen)}、cookie=${JSON.stringify(rep.user.carriers && rep.user.carriers.cookieText)}`,
+    );
     // ⑧ 反方向也共享
     assert.equal(admin.langBackToZh, 'zh-CN', `用户面切回中文后，回管理台 reload 应是 zh-CN，实际 ${JSON.stringify(admin.langBackToZh)}`);
     // ⑩ 运行时设置页：表头英文 + **服务端下发的行名与小字也已双语**（#803 S1 的验收面）
