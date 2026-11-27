@@ -18,10 +18,12 @@ const store = useWorkbenchStore();
 import { computed, ref, watch } from 'vue';
 const expanded = ref(true);
 // 单值：「点编号只展开那一条」，再点收起、点别的切过去。多值会让 6 条全展开 = 等于没有展开。
-const expandedIndex = ref<number | null>(null);
+// ⚠ **按条目 id 记，不按下标记**（#852 评审 MED）：队列是服务端快照，投递成功后那一条会从快照里
+// 消失 ⇒ 下标整体前移，按下标记会让「展开的那条」静默变成另一条消息（`aria-expanded` 也跟着错）。
+const expandedId = ref<string | null>(null);
 // hover 编号 = 浮层看全文。浮层是**绝对定位**的，不改布局、不推动下面的内容（否则 hover 一下
 // 整块界面跳一下）。`pointer-events-none` 是必须的：浮层压在按钮上方时会抢走 hover ⇒ 抖成频闪。
-const hoverIndex = ref<number | null>(null);
+const hoverId = ref<string | null>(null); // 同上：hover 也按 id 记
 
 // 编号 = 快照顺序（`[...steering, ...follow_up]`，与后端一致，前端不重排）的 1-based 下标。
 // 「跨转向/排队统一编号」是刻意的：用户心里的编号就是他发送的顺序，不是服务端的分桶。
@@ -31,20 +33,20 @@ const items = computed(() => [
 ]);
 const rows = computed(() => items.value.slice(0, 2).map((it, i) => ({ ...it, n: i + 1 })));
 const numbered = computed(() => items.value.slice(2).map((it, i) => ({ ...it, n: i + 3 })));
-// 展开的那一条（编号 > 2 时它不在行里，要单独把全文摆出来）
-const expandedItem = computed(() => {
-  const n = expandedIndex.value;
-  return n != null && n > 2 ? (items.value[n - 1] ?? null) : null;
-});
+// 展开的那一条（编号 > 2 时它不在行里，要单独把全文摆出来）。
+// 按 id 找：这一条被投递掉 ⇒ 自动 null，不会去渲染「挪到同一编号上的另一条」。
+const expandedItem = computed(() => numbered.value.find((it) => it.id === expandedId.value) ?? null);
 const kindLabel = (kind: 'steer' | 'follow_up') =>
   t(kind === 'steer' ? 'queued.kindSteer' : 'queued.kindFollowUp');
 // 换会话 = 视图复位（`sessionId` 从 null→id、id→id 都算换）
 watch(() => store.sessionId, () => {
   expanded.value = true;
-  expandedIndex.value = null;
-  hoverIndex.value = null;
+  expandedId.value = null;
+  hoverId.value = null;
 });
-const toggleIndex = (n: number) => { expandedIndex.value = expandedIndex.value === n ? null : n; };
+const toggleIndex = (it: { id: string }) => {
+  expandedId.value = expandedId.value === it.id ? null : it.id;
+};
 
 // #805：`blocked` 是服务端的**机器码**（#294：服务端只发码、前端出话），拼键之前必须先验键在不在。
 // vue-i18n 缺键时回落成**键名本身**，那就把 `queued.blocked.claimed_by_other` 这种裸键直接递给用户——
@@ -97,7 +99,7 @@ const blockedKey = computed(() =>
         data-test="queued-row"
         :data-index="it.n"
         class="rounded border border-black/10 bg-white/70 px-2 py-1 text-black/70 whitespace-pre-wrap break-words"
-        :class="expandedIndex === it.n ? '' : 'line-clamp-2'"
+        :class="expandedId === it.id ? '' : 'line-clamp-2'"
       ><span class="text-black/45">{{ it.n }} {{ kindLabel(it.kind) }}：</span>{{ it.content }}</li>
       <!-- 第 3 条起：整行是编号按钮。宽度不够就换行（`flex-wrap`），**不许**缩成「+N」 -->
       <li v-if="numbered.length" data-test="queued-index-row" class="flex flex-wrap items-center gap-1 pt-0.5">
@@ -105,15 +107,15 @@ const blockedKey = computed(() =>
           <button
             data-test="queued-index"
             :data-index="it.n"
-            :aria-expanded="expandedIndex === it.n"
+            :aria-expanded="expandedId === it.id"
             class="rounded border border-black/20 px-1.5 py-0.5 tabular-nums hover:bg-black/5"
-            @click="toggleIndex(it.n)"
-            @mouseenter="hoverIndex = it.n"
-            @mouseleave="hoverIndex = null"
+            @click="toggleIndex(it)"
+            @mouseenter="hoverId = it.id"
+            @mouseleave="hoverId = null"
           >{{ it.n }}</button>
           <!-- 浮层：绝对定位 + `pointer-events-none`，移开即收；正文是**原文**，不生成任何摘要 -->
           <span
-            v-if="hoverIndex === it.n"
+            v-if="hoverId === it.id"
             data-test="queued-hover-tip"
             class="pointer-events-none absolute bottom-full left-0 z-10 mb-1 max-w-[28rem] max-h-[40vh] overflow-auto whitespace-pre-wrap break-words rounded border border-black/10 bg-white px-2 py-1 text-black/70 shadow"
           ><span class="text-black/45">{{ it.n }} {{ kindLabel(it.kind) }}：</span>{{ it.content }}</span>
@@ -123,9 +125,9 @@ const blockedKey = computed(() =>
       <li
         v-if="expandedItem"
         data-test="queued-row-full"
-        :data-index="expandedIndex"
+        :data-index="expandedItem.n"
         class="rounded border border-black/10 bg-white/70 px-2 py-1 text-black/70 whitespace-pre-wrap break-words"
-      ><span class="text-black/45">{{ expandedIndex }} {{ kindLabel(expandedItem.kind) }}：</span>{{ expandedItem.content }}</li>
+      ><span class="text-black/45">{{ expandedItem.n }} {{ kindLabel(expandedItem.kind) }}：</span>{{ expandedItem.content }}</li>
     </ul>
   </div>
 </template>

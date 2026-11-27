@@ -696,10 +696,14 @@ function attachToolResultsToRecords(records) {
       // ⓪ 键精确配：两侧身份键相等，且那条结果还没被别的调用消费。
       chosen = candidates.find((c) => c.key !== undefined && c.key === call.key && !consumed.has(c.block));
     }
-    // ①② 键缺席 / 键没配上 ⇒ 退回「之后最近 → 之前最近」，但只在未被消费的结果里挑。
-    if (chosen === undefined) chosen = nearest(candidates, call, true);
+    // ⚠ **带了键却没配上 ≠ 可以退回就近**（#854 评审 MED）：同 id 两条调用各带不同键、
+    // range 里只有其中一条的结果时，退回就近就是把**别人的**结果挂到这条调用上 —— 那正是 #562 修的病。
+    // 判据：键不匹配，且桶里**有**带键的结果 ⇒ 身份已经否定了「这是我的」，宁可不挂（缺键不伪造）。
+    // 桶里一条带键的都没有（老账本 / 普通执行路径的结果不带键）⇒ 只能退回位置。
+    const identityRulesOut = call.key !== undefined && candidates.some((c) => c.key !== undefined);
+    if (chosen === undefined && !identityRulesOut) chosen = nearest(candidates, call, true);
     // ③ 同 id 的结果全被占了 ⇒ 宁可就近复用也不退化成缺键（#541 判据② 的 resume 复放形状）。
-    if (chosen === undefined) chosen = nearest(candidates, call, false);
+    if (chosen === undefined && !identityRulesOut) chosen = nearest(candidates, call, false);
     if (chosen === undefined) continue; // 位置相同（不可能：seq 唯一）⇒ 宁可不挂
     consumed.add(chosen.block);
     const bucket = picks.get(call.recordIndex) ?? [];

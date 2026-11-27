@@ -558,6 +558,22 @@ describe('AdminLayout 左侧分组侧栏（#818）', () => {
     expect(skip.attributes('href')).toBe('#admin-main');
     expect(skip.text()).toBe(i18n.global.t('admin.nav.skip'));
     expect(wrapper.get('#admin-main').attributes('id')).toBe('admin-main');
+    // `main` 必须可聚焦（`tabindex="-1"`），否则 `.focus()` 是空操作 ⇒ 键盘用户按了 skip 还在原地
+    expect(wrapper.get('#admin-main').attributes('tabindex')).toBe('-1');
+    // #818 评审 MED：**hash 路由**下放任 `href="#admin-main"` 的默认行为，浏览器会把地址改成
+    // `…/#admin-main`，路由把它当成一条新路径 ⇒ 离开当前管理页。判据钉「点完地址不变、焦点落到 main」。
+    // （jsdom 里组件没挂进 document ⇒ `document.activeElement` 恒 body；这里用「调用过 focus」判，
+    //   真机行为由 e2e 那趟钉。）
+    const main = wrapper.get('#admin-main');
+    const focusSpy = vi.spyOn(main.element as HTMLElement, 'focus');
+    // `defaultPrevented` 才是这条的判据：jsdom 不做真导航，光断言「hash 没变」是**空断言**
+    //（实测：把 `event.preventDefault()` 删掉，hash 断言照样绿）。所以自己发一个可取消事件看有没有被拦。
+    const ev = new MouseEvent('click', { bubbles: true, cancelable: true });
+    skip.element.dispatchEvent(ev);
+    await wrapper.vm.$nextTick();
+    expect(ev.defaultPrevented).toBe(true);
+    expect(focusSpy).toHaveBeenCalledTimes(1);
+    focusSpy.mockRestore();
     // skip 链接必须在 nav **之前**（否则键盘用户要先 TAB 过 15 项才拿到它）
     const focusables = wrapper.element.querySelectorAll('a, button, input');
     expect(Array.prototype.indexOf.call(focusables, skip.element)).toBe(0);

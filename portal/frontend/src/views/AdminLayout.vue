@@ -211,6 +211,22 @@ function navAttrs(name: TabName): Record<string, string | undefined> {
   };
 }
 
+/**
+ * skip-to-content（§④）。⚠ 本 SPA 是 **hash 路由**：`href="#admin-main"` 若放任默认行为，
+ * 浏览器会把地址改成 `…/#admin-main`，路由把它当成一条**新路径** ⇒ 离开当前管理页（#818 评审 MED）。
+ * 所以链接保 `href`（读屏要念得出落点）但点/回车一律 `preventDefault`，自己聚焦 + 滚到 main。
+ * `main` 上 `tabindex="-1"` 是必须的：不可聚焦的元素 `.focus()` 是空操作。
+ */
+const mainEl = ref<HTMLElement | null>(null);
+function skipToMain(): void {
+  // ⚠ 拦截默认行为由模板上的 `@click.prevent` 负责（**必须留着**：删掉它 hash 路由就会把
+  // `#admin-main` 当成新路径）。这里只管聚焦 + 滚动。
+  const el = mainEl.value;
+  if (!el) return;
+  el.focus();
+  el.scrollIntoView({ block: 'start' });
+}
+
 // ---- 图标轨（§①）--------------------------------------------------------------------
 // 窄屏靠 CSS 媒体查询自动收；这一颗是**宽屏上手也能动**的开关（侧栏常驻 210px 时也想看内容区）。
 const rail = ref(false);
@@ -228,6 +244,7 @@ async function onLogout() {
     <a
       href="#admin-main"
       data-test="skip-to-content"
+      @click.prevent="skipToMain"
       class="sr-only focus:not-sr-only focus:absolute focus:top-1 focus:left-1 focus:z-50 focus:rounded-md focus:border focus:border-black/20 focus:bg-white focus:px-2 focus:py-1 focus:text-sm"
     >{{ t('admin.nav.skip') }}</a>
 
@@ -331,7 +348,7 @@ async function onLogout() {
         >{{ rail ? '⇄' : '⇤' }}</button>
       </aside>
 
-      <main id="admin-main" class="flex-1 overflow-y-auto p-3">
+      <main id="admin-main" ref="mainEl" tabindex="-1" class="flex-1 overflow-y-auto p-3 focus:outline-none">
         <router-view />
       </main>
     </div>
@@ -358,6 +375,13 @@ async function onLogout() {
 .admin-side.is-rail {
   width: 44px;
 }
+/* ⚠ 轨道态必须放开 `nav` 的 overflow（#818 评审 MED）：`overflow-y: auto` 会让 `overflow-x`
+   也计算成 `auto` ⇒ 从 44px 轨道往右弹出的全词提示被 nav 自己的框**裁掉**，键盘用户看到一片空白。
+   代价：轨道态失去「侧栏内部滚动」——44px 轨道只有 7 条，纵向溢出时整页滚（比看不到全词好）。
+   ⚠ 与下面 `@media` 那段是**同一件事的两处**（媒体查询无法与外层选择器表合并），改一处要改两处。 */
+.admin-side.is-rail .admin-nav {
+  overflow: visible;
+}
 .admin-side.is-rail .nav-label,
 .admin-side.is-rail .nav-caret,
 .admin-side.is-rail [data-test='nav-filter'] {
@@ -383,6 +407,9 @@ async function onLogout() {
 @media (max-width: 899px) {
   .admin-side {
     width: 44px;
+  }
+  .admin-side .admin-nav {
+    overflow: visible; /* 同上：不放开就会把全词提示裁在 44px 的框里 */
   }
   .admin-side .nav-label,
   .admin-side .nav-caret,

@@ -1545,6 +1545,10 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 - **只有整队，没有单条删除**：单条删要和投递方的领取竞态（pi 同样只给 `clear_queue` 一个动作）。
 - 状态迁移是 `pending → recalled`，**不硬删**（留一行给人查「他说过什么没发出去」）。
 - 已在 `delivering` 的**不动**——它已经变成一条正在建的 run，此时清它等于把已说出口的话再吐回输入框。
+  **例外：认领已过期**（`delivering` 但 `claimed_at` 早于 `CLAIM_STALE_MS`）的那一行**要取回**：
+  认领与建 run 跨两次提交，中间崩一次它就会停在 `delivering`（既不投递、也取不回、还算在上限里），
+  而没有后续 run 时用户看到的就是「队列里还有 1 条」且没有任何原因——那正是「消息蒸发」。
+  取回与出队用**同一个**过期尺，不另造常量。
 - 前端回填口径照 pi：取回的文在前、用户已打的草稿在后，中间空一行。
 
 > 会话详情 `GET /api/sessions/:id` 的 `session.queued_messages` = `{steering:[{id,content}], follow_up:[{id,content}]}`，是刷新 / 多端 / 断线重连后队列的**唯一补齐来源**（在 DTO 出口挂载，不在 `sessions.getSession` 内部取——依赖方向与「只有详情需要它」两条理由见该处注释；快照取失败退化成空队列，不把详情拖成 5xx）（§5.3 第 17 类 `queue_update` 是 live-only、不落库）。additive：旧客户端不读它即可，旧后端不带它 ⇒ 前端退化成空队列。

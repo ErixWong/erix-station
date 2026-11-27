@@ -614,6 +614,26 @@ test('#562 B：同 id 多份结果 ⇒ **warn 照旧要打**（已能按键精�
   } finally { await s2.close(); }
 });
 
+test('#562 D（#854 评审 MED）：键不匹配**且桶里有带键的结果** ⇒ 宁可不挂，不许退回就近拿别人的', async () => {
+  const s = await startServer();
+  try {
+    // 同 id 两条调用各带不同键，range 里**只有新调用那份结果**（旧调用那份折叠时丢了）。
+    // 修复前的错法：旧调用键配不上 ⇒ 退回「之后最近」⇒ 把 `RESULT-FOR-NEW-CALL` 挂到旧调用上，
+    // 界面于是显示一条看着合理但错的结果（正是 #562 要消灭的那种）。
+    seedSameIdKeyedCallsOutOfOrder(s.pool, { withOldResult: false });
+    const turns = await fetchTurns(s);
+    const byArgs = dupCallsByArgs(turns, 4);
+    const oldCall = byArgs['path=old.txt'];
+    const newCall = byArgs['path=new.txt'];
+    assert.ok(oldCall && newCall, `同 id 两条调用都要在（实际 ${JSON.stringify(Object.keys(byArgs))}）`);
+    // 新调用拿自己那份（键精确配）
+    assert.equal(newCall.resultPreview, 'RESULT-FOR-NEW-CALL');
+    // 旧调用：身份已经否定了「这是我的」⇒ 不挂预览（缺键不伪造），**不许**借用别人那份
+    assert.equal(oldCall.resultPreview, undefined,
+      `旧调用拿到了 ${JSON.stringify(oldCall.resultPreview)} ⇒ 键不匹配还退回就近，把别人的结果挂上去了`);
+  } finally { await s.close(); }
+});
+
 test('#562 C：调用**没有**身份键 ⇒ 退回就近，但一份结果最多被一个调用消费（两条调用不共用同一条）', async () => {
   const s = await startServer();
   try {
