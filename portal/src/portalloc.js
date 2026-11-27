@@ -85,10 +85,14 @@ function invalidArgs(message) {
 }
 
 /** 交付② 的错误工厂（码沿用既有口径：`preview_port_block_taken` / `preview_hostname_invalid`）。 */
-function portsError(code, message, cause) {
+function portsError(code, message, cause, en) {
   const err = new Error(message);
   err.code = code;
   if (cause) err.cause = cause;
+  // #803 返修②：可选英文腿。`err.en` 只在**传了**的时候挂——不传时必须与今天逐字一致
+  // （连 `en` 这个自有属性都不凭空多出来，免得 `'en' in err` / `Object.keys` 这类判定被改变）。
+  // 挂上后 `http.js` 重包时透传，出口 `pickMessage` 才认（只认精确 `'en'`）。
+  if (en !== undefined) err.en = en;
   return err;
 }
 
@@ -199,6 +203,10 @@ export async function ensureFdePreviewPorts(client, {
   if (!grammar.ok) {
     const err = new Error(`ensureFdePreviewPorts: ${grammar.message}`);
     err.code = 'preview_hostname_invalid';
+    // #803 返修②：这里以前只把中文 `grammar.message` 贴上来就没了英文腿。
+    // `grammar.en` 必给（`validateFdeNameForHostname` 的四个失败 return 现在都带 `en`），
+    // 前缀 `ensureFdePreviewPorts:` 跟着一起翻译 ⇒ 与 `moveFdePreviewBlock:` 那句天然不同。
+    err.en = `ensureFdePreviewPorts: ${grammar.en}`;
     throw err;
   }
 
@@ -253,6 +261,12 @@ export async function ensureFdePreviewPorts(client, {
       );
       clash.code = 'preview_port_block_taken';
       clash.cause = err;
+      // #803 返修②：同一个 `preview_port_block_taken` 在本文件有**四个**抛出点（开户重叠 /
+      // 重试用尽 / 改块撞外来活行 / 搬迁中途插入不足），四处中文各不相同 ⇒ 英文也各配一句，
+      // 缺一处就是「看运气出中文」。中文逐字不动（`preview-ports.test.js` 等钉着）。
+      clash.en = `preview port block ${previewBlockLabel(block)} overlaps existing live rows `
+        + '(the DB unique index port_allocations_live_global_port_key rejected the overlap, the hard invariant from issue #246): '
+        + 'retry this onboarding / block move (it automatically takes the next free block from the pool), or explicitly choose another block start';
       throw clash;
     }
     throw err;
@@ -362,6 +376,13 @@ export async function provisionFdePreviewPorts(pool, config, { fdeId, fdeName, b
     + '每次都是新事务重取占用后取下一个空闲段，仍然冲突 ⇒ 号池里没有「算出来空闲但插不进去」的整块了，'
     + '请管理员显式改块 POST /api/admin/fdes/:fdeName/ports/block）',
     lastErr?.cause ?? lastErr,
+    // 内层 `lastErr` 自己就带英文腿（上面那个 `clash.en`）⇒ 这里优先用它的 `en`，避免英文腿里
+    // 混进中文原文；尾注自己翻译（不拼中文）。
+    `${lastErr?.en ?? lastErr?.message ?? 'preview port block overlaps existing live rows'} `
+    + `(tried ${maxAttempts} times = the first attempt plus ${maxAttempts - 1} automatic recomputes, each in a new transaction `
+    + 'that re-reads occupancy and takes the next free segment, still conflicting ⇒ the pool has no whole block that computes '
+    + 'as free yet cannot be inserted; please ask an administrator to move the block explicitly via '
+    + 'POST /api/admin/fdes/:fdeName/ports/block)',
   );
 }
 
@@ -602,7 +623,7 @@ export async function moveFdePreviewBlock(pool, config, {
   // 纯校验一律**前置到开事务之前**：400 类错误（块非法 / 名超预算）必须做到零 SQL 就返回。
   assertAlignedPreviewBlockStart(blockStart);                       // code='preview_port_block_invalid'
   const grammar = validateFdeNameForHostname(fdeName, { baseDomain: config.baseDomain });
-  if (!grammar.ok) throw portsError('preview_hostname_invalid', `moveFdePreviewBlock: ${grammar.message}`);
+  if (!grammar.ok) throw portsError('preview_hostname_invalid', `moveFdePreviewBlock: ${grammar.message}`, null, `moveFdePreviewBlock: ${grammar.en}`);
 
   const targetPorts = [...previewBlockPorts(blockStart)];
   const targetLabel = previewBlockLabel(blockStart);
@@ -636,6 +657,11 @@ export async function moveFdePreviewBlock(pool, config, {
         + `占用判据 = 全局活行 state <> 'released'，本 FDE 自己的活行不算冲突）：`
         + `先释放或改走那段，或换一个整块空闲的对齐起点（${PREVIEW_PORT_POOL_START}、`
         + `${PREVIEW_PORT_POOL_START + PREVIEW_PORT_COUNT}、…，每段 ${PREVIEW_PORT_COUNT} 个）`,
+        null,
+        `preview port block ${targetLabel} is already taken (foreign live ports: ${foreign.join(',')}; `
+        + `the occupancy rule is the global live rows state <> 'released' - this FDE's own live rows do not count as a conflict): `
+        + `free or move those ports first, or choose another fully free aligned block start `
+        + `(${PREVIEW_PORT_POOL_START}, ${PREVIEW_PORT_POOL_START + PREVIEW_PORT_COUNT}, ..., ${PREVIEW_PORT_COUNT} ports per block)`,
       );
     }
 
@@ -680,6 +706,9 @@ export async function moveFdePreviewBlock(pool, config, {
         'preview_port_block_taken',
         `预览端口块 ${targetLabel} 搬迁中途只插入 ${out.inserted.length}/${PREVIEW_PORT_COUNT} 条（并发抢号）：`
         + '整笔事务判定回滚，旧块保持不变，请重试本次改块',
+        null,
+        `moving to preview port block ${targetLabel} inserted only ${out.inserted.length}/${PREVIEW_PORT_COUNT} rows `
+        + '(concurrent port grab): the whole transaction is judged rolled back, the old block stays unchanged, please retry this block move',
       );
     }
 

@@ -122,14 +122,25 @@ const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 /** 完整 hostname 校验（不是分段校验）：总长 ≤253（RFC 1035）+ 逐标签 ≤63 且 DNS 字符集。 */
 export function validateHostnameGrammar(hostname) {
   if (typeof hostname !== 'string' || hostname.length === 0) {
-    return { ok: false, reason: 'hostname 为空' };
+    // #803 返修②：`reason` 是中文原文（既有断言钉着），`reasonEn` 是新增的英文对——
+    // 同一族文案的三个 return 都要有，缺一处就是「看运气出中文」。
+    return { ok: false, reason: 'hostname 为空', reasonEn: 'hostname is empty' };
   }
   if (hostname.length > 253) {
-    return { ok: false, reason: `总长 ${hostname.length} 字符，超过整域名上限 253` };
+    return {
+      ok: false,
+      reason: `总长 ${hostname.length} 字符，超过整域名上限 253`,
+      reasonEn: `total length ${hostname.length} characters, exceeding the 253-character limit for a full domain name`,
+    };
   }
   for (const label of hostname.split('.')) {
     if (!DNS_LABEL_RE.test(label)) {
-      return { ok: false, reason: `单标签「${label}」${label.length} 字符，超过 DNS 上限 63 或含非法字符`, label };
+      return {
+        ok: false,
+        reason: `单标签「${label}」${label.length} 字符，超过 DNS 上限 63 或含非法字符`,
+        reasonEn: `the label "${label}" is ${label.length} characters, exceeding the DNS limit of 63 or containing illegal characters`,
+        label,
+      };
     }
   }
   return { ok: true };

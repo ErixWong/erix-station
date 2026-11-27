@@ -3277,15 +3277,27 @@ async function handleAdminMoveFdePortsBlock(req, res, ctx, session, fdeName) {
       fdeId: fde.id, fdeName: fde.fde_name, blockStart, log: ctx.log,
     });
   } catch (err) {
+    // #803 返修②：这三个重包以前只 `String(err?.message)`，把 portalloc/previewpool 的中文直译通给
+    // `locale=en`。英文腿在 `portalloc.js` 的抛点处自带（那里才能拼出块号/端口列表等动态值），
+    // 这里只透传。
     if (err?.code === 'preview_port_block_taken') {
-      throw new HttpError(409, 'preview_port_block_taken', String(err?.message ?? err));
+      throw new HttpError(409, 'preview_port_block_taken', String(err?.message ?? err), { en: err?.en });
     }
     if (err?.code === 'preview_hostname_invalid') {
-      throw new HttpError(400, 'preview_hostname_invalid', String(err?.message ?? err), { details: { field: 'fde_name' } });
+      throw new HttpError(400, 'preview_hostname_invalid', String(err?.message ?? err), { details: { field: 'fde_name' }, en: err?.en });
     }
     // 深层又冒上来的时候（入口已前置拦住）：对前端仍是「参数不合法」的 400 validation_failed。
     if (err?.code === 'preview_port_block_invalid') {
-      throw new HttpError(400, 'validation_failed', String(err?.message ?? err), { details: { field: 'block_start' } });
+      // 中文来自 `previewpool.js` 的 `assertAlignedPreviewBlockStart`——**不改它那句**（那边已有
+      // 断言钉中文原文），所以英文对照在出口给；非法值取本路由手里的 `blockStart`（与中文里
+      // `JSON.stringify(blockStart)` 那个同源）。
+      throw new HttpError(400, 'validation_failed', String(err?.message ?? err), {
+        details: { field: 'block_start' },
+        en: `preview port block start ${JSON.stringify(blockStart)} is invalid: it must be a multiple of ${PREVIEW_PORT_COUNT} `
+          + `and the whole block must fit inside the pool ${PREVIEW_PORT_POOL_START}-${portalloc.PREVIEW_PORT_POOL_END} `
+          + `(valid starts: ${PREVIEW_PORT_POOL_START}, ${PREVIEW_PORT_POOL_START + PREVIEW_PORT_COUNT}, ..., `
+          + `${portalloc.PREVIEW_PORT_POOL_END - PREVIEW_PORT_COUNT + 1})`,
+      });
     }
     throw err;
   }
