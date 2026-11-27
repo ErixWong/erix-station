@@ -8,7 +8,7 @@
 //     必须等于**生效值**（不是 env 值）」。
 //
 // 隔离约定（docs/testing.md §2.1）：tmp userspace + FakePool + 手工 session，不碰真实 DB / 真实 dev 栈。
-import test, { after } from 'node:test';
+import test, { after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -182,6 +182,20 @@ test('US-6 config 缺 fileUploadMaxBytes 时兜底不许变成 undefined（undef
 // 2. HTTP 层
 // ---------------------------------------------------------------------------
 
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startStack 里的 staticDir（`station-static-`）进 tmpDirs，afterEach 逐格 rm（**不带 force**：rm 失败当场红）。
+// userspace（`erix-485a-`）照旧由 `close()` 收（既有写法，本单不动），故**不**进 tmpDirs。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
+
 async function startStack({ configOverrides = {}, users = [ADMIN, UPLOADER, NO_UPLOAD] } = {}) {
   const userspace = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-485a-'));
   for (const u of users) {
@@ -208,7 +222,7 @@ async function startStack({ configOverrides = {}, users = [ADMIN, UPLOADER, NO_U
     totpRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 5, maxEntries: 100 },
     kdfConcurrency: 2, kdfQueueLimit: 10, kdfQueueTimeoutMs: 30_000,
     maxLoginLength: 128, maxPasswordLength: 256,
-    staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')),
+    staticDir: trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'))),
     userSpaceRoot: userspace,
     fdeUid: process.getuid?.() ?? 1000,
     fdeGid: process.getgid?.() ?? 1000,

@@ -2,7 +2,7 @@
 // 客户端（agentd）在响应写出前断开 → portal 识别死连接（res 'close' + !writableEnded）并中断长轮询，
 // 不为死连接领 ticket；否则 reaper 重排队唤醒会白耗一次 attempt 且占租约到自然到期。
 // fake pool，不碰真实 DB。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,8 +12,21 @@ import { cookieSettings } from '../src/config.js';
 import { hubStats, notifyRunEnqueued } from '../src/internal.js';
 import { seedClaimable } from './fake-internal-pool.js';
 
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startServer 建的 staticDir（`station-static-`）一律进 tmpDirs，afterEach 逐格 rm（**不带 force**）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
+
 async function startServer(pool) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'INDEX');
   const config = {
     cookie: cookieSettings('dev-http', 604800),

@@ -6,7 +6,7 @@
 //
 // 隔离约定（docs/testing.md §2.1）：`FakePool`（认证/会话）+ 本地子类补「整表绑定」那一条 SQL，
 // 网关用本地 stub（含 listKeys）；零真 HTTP 外呼、零真 DB。写法照 `admin-runtime-settings-api.test.js`。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -64,6 +64,20 @@ function gatewayStub({ keys = [], totalPages = 1, error = null } = {}) {
   };
 }
 
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startStack 里的 staticDir（`station-static-`）进 tmpDirs，afterEach 逐格 rm（**不带 force**：rm 失败当场红）。
+// userspace（`erix-800-keyusage-`）照旧由 `close()` 收（既有写法，本单不动），故**不**进 tmpDirs。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
+
 async function startStack({ bindingRows = [], gateway = gatewayStub() } = {}) {
   const userspace = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-800-keyusage-'));
   fs.mkdirSync(path.join(userspace, 'alice', 'projects', 'demo'), { recursive: true });
@@ -90,7 +104,7 @@ async function startStack({ bindingRows = [], gateway = gatewayStub() } = {}) {
     totpRateLimit: { maxFailures: 5, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 5, maxEntries: 100 },
     kdfConcurrency: 2, kdfQueueLimit: 10, kdfQueueTimeoutMs: 30_000,
     maxLoginLength: 128, maxPasswordLength: 256,
-    staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')),
+    staticDir: trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'))),
     userSpaceRoot: userspace,
     fdeUid: process.getuid?.() ?? 1000,
     fdeGid: process.getgid?.() ?? 1000,

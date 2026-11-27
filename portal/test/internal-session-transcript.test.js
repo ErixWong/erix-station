@@ -2,7 +2,7 @@
 // 覆盖：portal/src/internal.js 新函数（fake pool）+ http.js 路由（真 HTTP，Bearer + X-Claim-Token
 // + ?run_id= writer fencing）。核心红线：崩溃重跑幂等（同 dedupKey 重放不产生重复 user 消息）、
 // 多 session key 隔离、writer run 必须属于该 session 且持有效租约。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,8 +11,21 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import { FakeInternalPool, seedClaimable } from './fake-internal-pool.js';
 
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// startServer 建的 staticDir（`station-static-`）一律进 tmpDirs，afterEach 逐格 rm（**不带 force**）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
+
 async function startServer(pool) {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'INDEX');
   const config = {
     cookie: cookieSettings('dev-http', 604800),

@@ -2,7 +2,7 @@
 // 这里只管**闸门与线上传输**（工单判据 B-1、B-3、B-11 的线上形状 + DTO/状态码/受限会话/同源门）；
 // 落盘语义（B-2、B-4..B-10、B-12）在 `file-upload.test.js`（那里可以直接喂流，不必绕网络）。
 // 隔离约定：tmp userspace + FakePool + 手工 session（照 pv-proxy.test.js 的套路），不碰真实环境。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -46,13 +46,27 @@ const RESTRICTED = {
   file_upload_enabled: true, must_change_password: true,
 };
 
+// ---- 夹具生命周期（#880）：谁建谁收尾，不靠进程退出 ----
+// staticDir（`station-static-`）进 tmpDirs，afterEach 逐格 rm（**不带 force**：rm 失败当场红）。
+// userspace（`erix-upload-http-`）照旧由 `close()` 收（既有写法，本单不动它），故**不**进 tmpDirs。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
+
 async function startStack({ users = [ENABLED, DISABLED, UNKNOWN, NO_SEAT, RESTRICTED], config: configOverrides = {} } = {}) {
   const userspace = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-upload-http-'));
   fs.mkdirSync(path.join(userspace, 'alice', 'projects', 'demo'), { recursive: true });
   fs.mkdirSync(path.join(userspace, 'bob', 'projects', 'demo'), { recursive: true });
   fs.mkdirSync(path.join(userspace, 'carol', 'projects', 'demo'), { recursive: true });
   fs.mkdirSync(path.join(userspace, 'erin', 'projects', 'demo'), { recursive: true });
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-')));
 
   const pool = new FakePool({ users });
   const tokens = new Map();
