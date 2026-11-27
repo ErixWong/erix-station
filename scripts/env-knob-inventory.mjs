@@ -40,6 +40,29 @@
 //     · 消费点在 FDE 容器内、每次现读（runner 侧读 env），而不是 portal 的启动快照。
 //   剩下的全部进「需人判」：语义与其它旋钮耦合、钳位上限、改名遗留、或要先补腿。
 //
+// ─────────────────────────────────────────────────────────────────────────────
+// **第二个维度：消费时机**（「搬进 DB 后改值要不要重启」）——不是新信息，吃的仍是上面已扫到的
+// 三件事（per-run 写点 / 读点在不在顶层初始化区 / 有没有 runner 读点）：
+//
+//   per-run：portal 每起一个 run 重写一次子环境（`runner/agentd.js` 函数体内的
+//            `childEnv.NAME =`），或 runner 在函数体里读（`runner/worker.js` 里处理工具调用的
+//            函数、`runner/lib/llm-timeouts.js` 每 run 拼 LLM 请求头）⇒ 改 DB 下个 run 就生效。
+//   启动快照：读点全在模块顶层初始化区（`runner/lib/shell-tools.js` 那组 `const *_MS`、
+//            `runner/lib/artifacts.js` 的 `export const`、`runner/agentd.js` 的 `const CFG`）
+//            ⇒ 模块首次 import 就值定了，改 DB 得重启/重建容器。
+//   未知：runner 侧根本没有读点 ⇒ 不敢断言（进「需人判」）。
+//
+//   为什么要这一维：同样是「能搬」，上面两组对运维的含义完全不同（一组改完立刻生效，
+//   一组改完默默不改行为）；compose 自己就记了这件事（`deploy/docker-compose.yml` 里
+//   station-litellm 那一段写明某些键「per-run 生效，与容器 Env 那个同名变量是两个东西」）。
+//   保守方向：时机只影响「搬后怎么生效」的描述，不影响能不能搬；函数体读点会附注函数名，
+//   因为如果它的调用方全在启动路径上，代码形态上是 per-run、运行时其实仍是启动快照。
+//
+// 三堆归位的机器形态（`--json` 里的 `piles`）：`dbPerRun`（能搬、不用重启）/
+// `dbRestart`（能搬、但要重启）/ `no`（不能搬）/ `human`（需人判）/ `non`（非旋钮：
+// 子进程与容器的基线环境，proxy 必须放行否则任何 `docker create` 都会被拒）。
+// `pilesAll.db` = 前两堆的并集，用来跟上一轮结果对账。
+//
 // 用法：
 //   node scripts/env-knob-inventory.mjs              # 人读表格 + 小计 + 三堆
 //   node scripts/env-knob-inventory.mjs --json       # 同一份数据的机器形态
@@ -274,7 +297,57 @@ export function parseProxyAllowlist(text) {
 // ───────────────────────────────── ④ 真读它的地方
 
 /**
- * 扫一个源码树，返回每个 env 名的读取位置与读取形态。四种形态（写在这里，便于复核）：
+ * 顶层初始化区间（1-based，含头含尾）：`const X = …` / `export const X = …` 起，
+ * 到配对括号归零且下一行不再是缩进延续行为止。落在区间里的 env 读
+ * ⇒ **模块加载期就读完了**（启动快照）。两条扩展规则缺一不可：
+ *   · 括号平衡：`const A = Math.min(` 这种跳行括号靠深度归零判定；
+ *   · 缩进延续：`export const B = Number(...)` 后面跟 `  && ...` / `  ? ... : ...` 时括号已平，
+ *     但语句还没完（真例：`runner/lib/artifacts.js:27-29`）。
+ * 偏保守：扫的是剥注释后的源码，字符串里的括号可能让区间略超宽 ⇒ 宁误判成「要重启」，
+ * 不宁误判成「per-run 生效」（后者是会假绿的方向）。
+ */
+export function topLevelInitRanges(lines) {
+  const ranges = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/^(?:export\s+)?(?:const|let|var)\s/.test(lines[i])) continue;
+    let depth = 0;
+    let j = i;
+    do {
+      for (const ch of lines[j]) {
+        if (ch === '{' || ch === '(' || ch === '[') depth += 1;
+        else if (ch === '}' || ch === ')' || ch === ']') depth -= 1;
+      }
+      j += 1;
+    } while (depth > 0 && j < lines.length);
+    while (j < lines.length) {
+      const next = lines[j];
+      if (!/^[ \t]+\S/.test(next)) break;
+      // 延续行：缩进 + 以运算符/闭合符开头（`&& …` / `? … : …` / `) …` / `.then(…`）。
+      // 不能用上行的结尾判：`export const B = Number(isFinite(...))` 上行以 `))` 结尾但语句没完。
+      if (!/^[ \t]*(?:&&|\|\||\?\?|\?|:|\.{3}|\.[A-Za-z_$]|\)|\]|\}|,|\+|\*|\/|=>)/.test(next)) break;
+      j += 1;
+    }
+    ranges.push([i + 1, j]);
+    i = j - 1;
+  }
+  return ranges;
+}
+
+/** 往上找包裹这一行的函数名（只认 `function name(` / `const name = (` 两形），拿不到返回 null。 */
+export function enclosingFunctionName(lines, line) {
+  for (let i = line - 1; i >= 0; i -= 1) {
+    let m = /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/.exec(lines[i]);
+    if (m) return m[1];
+    m = /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.exec(lines[i]);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+const insideRanges = (ranges, line) => ranges.some(([a, b]) => line >= a && line <= b);
+
+/**
+ * 扫一个源码树，返回每个 env 名的读取位置与读取形态。五种形态（写在这里，便于复核）：
  *   member   `process.env.NAME` / `process.env?.NAME`
  *   bracket  `process.env['NAME']` / `process.env["NAME"]`
  *   alias    以 env/Env 结尾的局部变量上的点号读（`env.NAME`、`baseEnv.NAME`）——
@@ -286,30 +359,47 @@ export function parseProxyAllowlist(text) {
  *            **只有当同文件确实存在「以 env/Env 结尾的变量 + 动态下标」时才认表**——
  *            否则一张名字里带 ENV 的普通数组（例如 stdio 子进程环境的字面清单）会被当成读点，
  *            把 `POST`/`SIGTERM` 之类的字符串误登记成 env 名。
+ *            认表时除了表本身的声明行，**还把动态下标那一行也登成读点**（kind
+ *            `tableDynamic`）——时机判定要看真正读的那一刻在不在函数体里，表声明行常常在顶层。
+ *   每个读点另带一个布尔 `atLoad`：是否落在 `topLevelInitRanges` 的顶层初始化区间里。
  */
 export function scanEnvReads(root, relDir) {
   const reads = new Map();
-  const add = (name, file, line, kind) => {
+  const add = (name, file, line, kind, atLoad = false, fn = null) => {
     if (!NAME_RE.test(name)) return;
     if (!reads.has(name)) reads.set(name, []);
     const list = reads.get(name);
     const ref = `${file}:${line}`;
     const hit = list.find((r) => r.ref === ref);
-    if (hit) { if (!hit.kinds.includes(kind)) hit.kinds.push(kind); }
-    else list.push({ ref, file, line, kinds: [kind] });
+    if (hit) {
+      if (!hit.kinds.includes(kind)) hit.kinds.push(kind);
+      hit.atLoad = hit.atLoad || atLoad;
+      hit.fn = hit.fn || fn;
+    } else list.push({ ref, file, line, kinds: [kind], atLoad, fn });
   };
   const files = listJsFiles(root, relDir);
   const tables = []; // 待定性：{ table, names, file, line }
   const tableVars = new Map(); // 表名 → 绑到它上的局部变量名（`const envName = LLM_TIMEOUT_ENV[field]`）
   const dynamicVars = new Set(); // 出现在 `env[VAR]` / `baseEnv[VAR]` 里的变量名
+  const dynSites = new Map(); // 变量名 → 动态下标所在处（{file, line, atLoad}）
+  const rangesByFile = new Map();
   for (const abs of files) {
     const rel = path.relative(root, abs).split(path.sep).join('/');
     const src = stripJsComments(fs.readFileSync(abs, 'utf8'));
     const lines = src.split(/\r?\n/);
+    const ranges = topLevelInitRanges(lines);
+    rangesByFile.set(rel, ranges);
+    const fnCache = new Map();
+    const fnAt = (ln) => { if (!fnCache.has(ln)) fnCache.set(ln, enclosingFunctionName(lines, ln)); return fnCache.get(ln); };
     // 动态下标的变量（`out[field] = parseTimeoutMs(env?.[envName], ...)` 里的 `envName`）。
     let d;
     const reDyn = /\b(?:process\s*\.\s*env|(?:(?:[A-Za-z_$][\w$]*)?[Ee]nv))\s*(?:\?\.)?\s*\[\s*([A-Za-z_$][\w$]*)\s*(?:\]|\[)/g;
-    while ((d = reDyn.exec(src)) !== null) dynamicVars.add(d[1]);
+    while ((d = reDyn.exec(src)) !== null) {
+      dynamicVars.add(d[1]);
+      const line = src.slice(0, d.index).split('\n').length;
+      if (!dynSites.has(d[1])) dynSites.set(d[1], []);
+      dynSites.get(d[1]).push({ file: rel, line, atLoad: insideRanges(ranges, line), fn: enclosingFunctionName(lines, line) });
+    }
     // 变量↔表的绑定：`const envName = TABLE[...]`、`for (const key of TABLE)`、
     // 默认参数 `{ key = TOOLCALL_MARKERS_ENV }` —— 三种写法都是「这个变量装的是 env 名」。
     let b;
@@ -322,26 +412,28 @@ export function scanEnvReads(root, relDir) {
       const line = lines[i];
       let m;
       const reMember = /process\.env\s*(?:\?\.|\.)([A-Z][A-Z0-9_]{2,})\b/g;
-      while ((m = reMember.exec(line)) !== null) add(m[1], rel, i + 1, 'member');
+      const at = insideRanges(ranges, i + 1);
+      const fn = fnAt(i + 1);
+      while ((m = reMember.exec(line)) !== null) add(m[1], rel, i + 1, 'member', at, fn);
       const reBracket = /process\.env\[\s*['"]([A-Z][A-Z0-9_]{2,})['"]\s*\]/g;
-      while ((m = reBracket.exec(line)) !== null) add(m[1], rel, i + 1, 'bracket');
+      while ((m = reBracket.exec(line)) !== null) add(m[1], rel, i + 1, 'bracket', at, fn);
       // 组一：裸 `env` 或任何以 env/Env 结尾的标识符（`baseEnv`、`childEnv`…）。
       const reAlias = /\b((?:[A-Za-z_$][A-Za-z0-9_$]*)?[Ee]nv)\s*(?:\?\.|\.)([A-Z][A-Z0-9_]{2,})\b/g;
       while ((m = reAlias.exec(line)) !== null) {
         const after = line.slice(m.index + m[0].length);
         if (/^\s*delete\s/.test(line.slice(Math.max(0, m.index - 7), m.index))) continue;
         if (/^\s*(\+\+|--|=)(?!=)/.test(after)) continue; // 赋值目标 ⇒ 写，不是读
-        add(m[2], rel, i + 1, 'alias');
+        add(m[2], rel, i + 1, 'alias', at, fn);
       }
       // helper 首参形：`intEnv(env, 'NAME', 默认)` / `parseIntEnv(process.env, 'NAME', …)`。
       // 不补这一形就会**假绿**：portal/src/config.js 里的 `intEnv(env, 'ERIX_ARTIFACT_MAX_BYTES', …)`
       // 会让 portal 这个读者隐身 ⇒ 启动快照旋钮被误归「能搬」（评审 #677 第二轮 A）。
       const reHelper = /\(\s*(?:(?:process\s*\.\s*env)|(?:(?:[A-Za-z_$][\w$]*)?[Ee]nv))\s*,\s*['"]([A-Z][A-Z0-9_]{2,})['"]/g;
-      while ((m = reHelper.exec(line)) !== null) add(m[1], rel, i + 1, 'helperArg');
+      while ((m = reHelper.exec(line)) !== null) add(m[1], rel, i + 1, 'helperArg', at, fn);
       // 别名常量：`export const TOOLCALL_MARKERS_ENV = 'ERIX_...'`（名字在右边，待定表定性）。
       const reAliasConst = /\b([A-Z0-9_]*ENV[A-Z0-9_]*)\s*=\s*['"]([A-Z][A-Z0-9_]{2,})['"]/g;
       while ((m = reAliasConst.exec(line)) !== null) {
-        tables.push({ table: m[1], names: [m[2]], file: rel, line: i + 1 });
+        tables.push({ table: m[1], names: [m[2]], file: rel, line: i + 1, fn: fnAt(i + 1) });
       }
       const reTable = /\b([A-Z0-9_]*ENV[A-Z0-9_]*)\s*=\s*(?:Object\.freeze\(\s*)?([[{])/g;
       let t;
@@ -369,7 +461,7 @@ export function scanEnvReads(root, relDir) {
         const reName = /['"]([A-Z][A-Z0-9_]{2,})['"]/g;
         let n;
         while ((n = reName.exec(consumed)) !== null) names.push(n[1]);
-        if (names.length > 0) tables.push({ table: t[1], names, file: rel, line: i + 1 });
+        if (names.length > 0) tables.push({ table: t[1], names, file: rel, line: i + 1, fn: fnAt(i + 1) });
       }
     }
   }
@@ -381,7 +473,15 @@ export function scanEnvReads(root, relDir) {
   };
   for (const t of tables) {
     if (!isLive(t.table)) continue;
-    for (const name of t.names) add(name, t.file, t.line, 'table');
+    // 动态下标那一行也登成读点：时机（是不是每 run 才读）要看真正读的那一刻，不是表声明行。
+    const dynRefs = [];
+    for (const v of tableVars.get(t.table) ?? []) {
+      for (const s of dynSites.get(v) ?? []) if (s.file === t.file) dynRefs.push(s);
+    }
+    for (const name of t.names) {
+      add(name, t.file, t.line, 'table', insideRanges(rangesByFile.get(t.file) ?? [], t.line), t.fn);
+      for (const s of dynRefs) add(name, s.file, s.line, 'tableDynamic', s.atLoad, s.fn);
+    }
   }
   return reads;
 }
@@ -490,14 +590,46 @@ export function findBreaks({ name, composeEntry, portalComposeOnly, injected, al
 }
 
 /** 三堆归位：`db` 能搬 / `no` 不能搬 / `human` 需人判 / `non` 非旋钮（基线环境，不参与三堆）。 */
-export function classifyPile({ bootWhy, injected, allowlisted, runnerReads, portalReadFiles, composeEntry, passThrough }) {
+export function classifyPile({ bootWhy, injected, allowlisted, runnerReads, portalReadFiles, composeEntry, passThrough, timing }) {
   const legsComplete = injected.length > 0 && allowlisted.length > 0 && runnerReads.length > 0;
   if (passThrough) return 'non';
   if (bootWhy.length > 0) return 'no';
-  if (legsComplete && portalReadFiles.length === 0) return 'db';
+  if (legsComplete && portalReadFiles.length === 0) {
+    // 能搬再分两堆：改 DB 后要不要重启看消费时机（consumeTiming）。
+    if (timing === 'per-run') return 'dbPerRun';
+    if (timing === '启动快照') return 'dbRestart';
+    return 'human'; // 时机未知 ⇒ 不敢断言「改 DB 要不要重启」，交人判
+  }
   if (legsComplete) return 'human'; // 三腿齐但 portal 也读 ⇒ 两处消费，要人裁定以谁为准
   if (!composeEntry && injected.length === 0 && runnerReads.length === 0 && allowlisted.length === 0) return 'human';
   return 'human';
+}
+
+/**
+ * 消费时机（第二个维度）：「改 DB 后要不要重启」。不另加一堆新信息，吃的仍是已有三件事：
+ *   1. portal 侧有 per-run 写点（函数体内 `childEnv.NAME =`）⇒ **per-run**（每次 run 新建 FDE 时重读）
+ *   2. runner 侧读点有一条不在顶层初始化区间（在函数体里）⇒ **per-run**
+ *   3. runner 侧读点全在顶层初始化区 ⇒ **启动快照**；根本没有 runner 读点 ⇒ **未知**
+ * 为什么需要它：compose 自己就点破了两种消费时机不同（`deploy/docker-compose.yml:113`：
+ * 「per-run 生效（同 ERIX_LLM_*），与容器 Env 那个同名变量是两个东西」）；
+ * `runner/lib/llm-timeouts.js:103` 是每 run 构造 LLM 请求头时才读（名字走
+ * `LLM_TIMEOUT_ENV` 表，动态下标行已被登成读点），而 `runner/lib/shell-tools.js:20` 是模块顶层
+ * const——后者改了不重启不生效。
+ */
+export function consumeTiming({ runnerReads = [], writes = [] } = {}) {
+  const perRunWrite = writes.find((w) => w.perRun);
+  if (perRunWrite) {
+    return { timing: 'per-run', why: `P1 portal 每 run 新建 FDE 时重写子环境（${perRunWrite.ref}）⇒ 改 DB 下个 run 就生效` };
+  }
+  const fnRead = runnerReads.find((r) => !r.atLoad);
+  if (fnRead) {
+    const caveat = fnRead.fn ? `（在函数 ${fnRead.fn} 内；若它的调用方全在启动路径上，实际仍是启动快照——拿这个 file:line 复核）` : '';
+    return { timing: 'per-run', why: `P1 runner 在函数体里读（每次调用现取），${fnRead.ref}${caveat} ⇒ 改 DB 下个 run 就生效` };
+  }
+  if (runnerReads.length > 0) {
+    return { timing: '启动快照', why: `P2 runner 读点全在模块顶层初始化区（${runnerReads.map((r) => r.ref).join(', ')}）⇒ 改了要重启/重建容器` };
+  }
+  return { timing: '未知', why: 'P4 runner 侧无读点，无法断言生效时机' };
 }
 
 // ───────────────────────────────── 组表
@@ -560,6 +692,7 @@ export function buildInventory(root = DEFAULT_ROOT) {
       : (writes.some((w) => w.perRun) ? 'per-run' : (allow.length > 0 ? '仅放行未注入' : '未知（镜像/基座）'));
     const composeOnly = Boolean(portalEntry) && pReads.length > 0 && rReads.length === 0 && inj.length === 0;
     const bootWhy = bootReasons({ name, portalReadFiles: pFiles, composeEntry: portalEntry, composeService: otherService?.service, injected: inj });
+    const { timing, why: timingWhy } = consumeTiming({ runnerReads: rReads, writes });
     const breaks = findBreaks({
       name,
       composeEntry: portalEntry,
@@ -580,13 +713,13 @@ export function buildInventory(root = DEFAULT_ROOT) {
       readers: [...pReads, ...rReads].map((r) => ({ ref: r.ref, side: pReads.includes(r) ? 'portal' : 'runner', kinds: r.kinds })),
       injected: inj.map((x) => `${PROVISIONER_FILE}:${x.line}`),
       allowlisted: allow.map((x) => `${PROXY_FILE}:${x.line}`),
-      runnerReads: rReads.map((r) => ({ ref: r.ref, kinds: r.kinds })),
-      portalReads: pReads.map((r) => ({ ref: r.ref, kinds: r.kinds })),
+      runnerReads: rReads.map((r) => ({ ref: r.ref, kinds: r.kinds, atLoad: r.atLoad, fn: r.fn })),
+      portalReads: pReads.map((r) => ({ ref: r.ref, kinds: r.kinds, atLoad: r.atLoad, fn: r.fn })),
       writes: writes.map((w) => ({ ref: w.ref, perRun: w.perRun })),
-      delivery,
+      delivery, timing, timingWhy,
       bootWhy,
       breaks,
-      pile: classifyPile({ bootWhy, injected: inj, allowlisted: allow, runnerReads: rReads, portalReadFiles: pFiles, composeEntry: portalEntry, passThrough: passThrough.has(name) }),
+      pile: classifyPile({ bootWhy, injected: inj, allowlisted: allow, runnerReads: rReads, portalReadFiles: pFiles, composeEntry: portalEntry, passThrough: passThrough.has(name), timing }),
       passThrough: passThrough.has(name),
     });
   }
@@ -601,7 +734,7 @@ export function buildInventory(root = DEFAULT_ROOT) {
     knobs,
     opened: [
       COMPOSE_FILE, PROXY_FILE, PROVISIONER_FILE,
-      `${PORTAL_SRC_DIR}/（全部 *.js，剥注释后扫四种读取形态）`,
+      `${PORTAL_SRC_DIR}/（全部 *.js，剥注释后扫五种读取形态 + 顶层初始化区间）`,
       `${RUNNER_DIR}/（含 lib，跳过 test/probes/skills/node_modules）`,
     ],
     missing,
@@ -621,10 +754,15 @@ export function buildInventory(root = DEFAULT_ROOT) {
       allowlistedNobodyRead: deadFiber.map((k) => k.name),
     },
     piles: {
-      db: knobs.filter((k) => k.pile === 'db').map((k) => k.name),
+      dbPerRun: knobs.filter((k) => k.pile === 'dbPerRun').map((k) => k.name),
+      dbRestart: knobs.filter((k) => k.pile === 'dbRestart').map((k) => k.name),
       no: knobs.filter((k) => k.pile === 'no').map((k) => k.name),
       human: knobs.filter((k) => k.pile === 'human').map((k) => k.name),
       nonKnob: knobs.filter((k) => k.pile === 'non').map((k) => k.name),
+    },
+    /** 全量「能搬」（不分时机），方便与上一轮结果对账 */
+    pilesAll: {
+      db: [...knobs.filter((k) => k.pile === 'dbPerRun' || k.pile === 'dbRestart').map((k) => k.name)],
     },
   };
 }
@@ -693,16 +831,19 @@ export function renderSummary(inv) {
   out.push(`per-run 下发（不经容器 Env，不算断链）=${s.perRunDelivered.length} ${fmt(s.perRunDelivered)}`);
   out.push(`在白名单但没人读（死光纤）=${s.allowlistedNobodyRead.length} ${fmt(s.allowlistedNobodyRead)}`);
   out.push('');
-  out.push('=== 能不能搬进 DB（判据见文件头）===');
-  out.push(`能搬（三腿齐 + 非启动前必知 + portal 不读）=${inv.piles.db.length} ${fmt(inv.piles.db)}`);
+  out.push('=== 能不能搬进 DB × 消费时机（判据见文件头）===');
+  out.push(`能搬·不用重启（per-run 生效：三腿齐 + 非启动前必知 + portal 不读 + 函数体里读）=${inv.piles.dbPerRun.length} ${fmt(inv.piles.dbPerRun)}`);
+  out.push(`能搬·但要重启（读点全在模块加载期，改 DB 后得重启/重建容器）=${inv.piles.dbRestart.length} ${fmt(inv.piles.dbRestart)}`);
   out.push(`不能搬（容器起来之前就得知道）=${inv.piles.no.length} ${fmt(inv.piles.no)}`);
   out.push(`需人判=${inv.piles.human.length} ${fmt(inv.piles.human)}`);
   out.push(`（不计入三堆）非旋钮、子进程/容器基线环境=${inv.piles.nonKnob.length} ${fmt(inv.piles.nonKnob)}`);
   out.push('');
-  out.push('=== 逐键判据（只列判「不能搬」与「断链」的）===');
+  out.push('=== 逐键判据（判「不能搬」/「断链」/「能搬（看时机）」的每根都列）===');
   for (const k of inv.knobs) {
-    if (k.bootWhy.length === 0 && k.breaks.length === 0) continue;
-    out.push(`- ${k.name}：boot=${k.bootWhy.join('+') || '—'} 断=${k.breaks.join(' + ') || '—'}`);
+    const decided = k.pile === 'dbPerRun' || k.pile === 'dbRestart' || k.timing === '未知';
+    if (k.bootWhy.length === 0 && k.breaks.length === 0 && !decided) continue;
+    const t = `时机=${k.timing}${decided ? `（${k.timingWhy}）` : ''}`;
+    out.push(`- ${k.name}：${t} boot=${k.bootWhy.join('+') || '—'} 断=${k.breaks.join(' + ') || '—'}`);
   }
   return out;
 }

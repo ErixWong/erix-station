@@ -19,6 +19,8 @@ import {
   renderTable,
   renderSummary,
   stripJsComments,
+  consumeTiming,
+  topLevelInitRanges,
 } from '../scripts/env-knob-inventory.mjs';
 
 const FIXTURE = {
@@ -40,6 +42,7 @@ services:
       DEV_USER_KNOB: ${'${DEV_USER_KNOB-1001:1000}'}
       LITERAL_KNOB: "42"
       DATABASE_URL: postgres://u:p@db:5432/x
+      PERRUN_KNOB: ${'${PERRUN_KNOB:-3}'}
       # 注释里写 OK_KNOB 不算 compose 里写了它
   station-litellm:
     environment:
@@ -53,6 +56,7 @@ export function buildContainerConfig({ env = process.env } = {}) {
       \`OK_KNOB=\${Number(process.env.OK_KNOB) || 7}\`,
       \`NO_ALLOW_KNOB=\${Number(process.env.NO_ALLOW_KNOB) || 1}\`,
       'DEAD_FIBER_KNOB=0',
+      \`PERRUN_KNOB=\${Number(process.env.PERRUN_KNOB) || 3}\`,
     ],
   };
 }
@@ -106,6 +110,7 @@ const ENV_KEY_ALLOW = new Set([
   'PATH',
   'OK_KNOB',
   'DEAD_FIBER_KNOB',
+  'PERRUN_KNOB',
 ]);
 export function check(key) {
   if (!ENV_KEY_ALLOW.has(key)) throw new Error('create_policy_denied');
@@ -121,6 +126,9 @@ const baseEnv = { ...process.env };
 baseEnv.CHILD_ONLY_KNOB = '1'; // 赋值给子进程：是写，不是读
 export function dynamicChild(env = process.env, { key = LIVE_TABLE_ENV } = {}) {
   return env?.[key];
+}
+export function readPerrun(env = process.env) {
+  return env.PERRUN_KNOB;
 }
 `,
   'runner/lib/tables.js': `
@@ -204,8 +212,11 @@ test('③ 四处都齐 ⇒ 不报错，且判「能搬进 DB」', () => {
     // 注入行上那句 `process.env.OK_KNOB` 是**转发**，不算 portal 消费
     assert.deepEqual(knob.portalReads, []);
     assert.equal(knob.bootWhy.length, 0);
-    assert.equal(knob.pile, 'db');
-    assert.ok(inv.piles.db.includes('OK_KNOB'));
+    // 四处齐且 portal 不消费 ⇒ 能搬；但读点在模块顶层（worker.js:3）⇒ 改 DB 要重启才生效
+    assert.equal(knob.pile, 'dbRestart');
+    assert.equal(knob.timing, '启动快照');
+    assert.ok(inv.piles.dbRestart.includes('OK_KNOB'));
+    assert.ok(inv.pilesAll.db.includes('OK_KNOB'));
     // 小计里三处都不该有它
     assert.ok(!inv.subtotals.injectedNotAllowlisted.includes('OK_KNOB'));
     assert.ok(!inv.subtotals.runnerReadNotInjected.includes('OK_KNOB'));
@@ -228,7 +239,7 @@ test('compose 写法分类：字面 / `${VAR:-默认}` / 默认空 / 单横线 /
     const portal = services['station-portal'];
     assert.deepEqual(
       portal.map((e) => e.name),
-      ['OK_KNOB', 'NO_ALLOW_KNOB', 'DEAD_FIBER_KNOB', 'EMPTY_DEFAULT_KNOB', 'DEV_USER_KNOB', 'LITERAL_KNOB', 'DATABASE_URL'],
+      ['OK_KNOB', 'NO_ALLOW_KNOB', 'DEAD_FIBER_KNOB', 'EMPTY_DEFAULT_KNOB', 'DEV_USER_KNOB', 'LITERAL_KNOB', 'DATABASE_URL', 'PERRUN_KNOB'],
       '注释行与别的服务的键不许混进来',
     );
     assert.ok(portal.every((e) => e.line > 0));
@@ -277,12 +288,12 @@ test('注入与白名单的解析位置给到 file:line，供人工抽验', () =
     const inj = parseInjectedEnv(fs.readFileSync(path.join(root, 'portal/src/provisioner.js'), 'utf8'));
     assert.deepEqual(
       inj.map((x) => x.name),
-      ['OK_KNOB', 'NO_ALLOW_KNOB', 'DEAD_FIBER_KNOB'],
+      ['OK_KNOB', 'NO_ALLOW_KNOB', 'DEAD_FIBER_KNOB', 'PERRUN_KNOB'],
     );
-    assert.deepEqual(inj.map((x) => x.line), [5, 6, 7]);
+    assert.deepEqual(inj.map((x) => x.line), [5, 6, 7, 8]);
     const allow = parseProxyAllowlist(fs.readFileSync(path.join(root, 'deploy/fde-proxy/server.js'), 'utf8'));
-    assert.deepEqual(allow.map((x) => x.name), ['PATH', 'OK_KNOB', 'DEAD_FIBER_KNOB']);
-    assert.deepEqual(allow.map((x) => x.line), [3, 4, 5]);
+    assert.deepEqual(allow.map((x) => x.name), ['PATH', 'OK_KNOB', 'DEAD_FIBER_KNOB', 'PERRUN_KNOB']);
+    assert.deepEqual(allow.map((x) => x.line), [3, 4, 5, 6]);
   });
 });
 
@@ -301,7 +312,7 @@ test('启动前必知的判据：连库 / 容器身份 / 启动快照 / 基线�
     assert.equal(empty.pile, 'no');
     // 子进程基线环境（PATH/HOME）不进三堆
     assert.ok(inv.piles.nonKnob.includes('PATH'));
-    assert.ok(!inv.piles.db.includes('PATH') && !inv.piles.no.includes('PATH') && !inv.piles.human.includes('PATH'));
+    assert.ok(!inv.pilesAll.db.includes('PATH') && !inv.piles.no.includes('PATH') && !inv.piles.human.includes('PATH'));
     assert.ok(!inv.subtotals.runnerReadNotInjected.includes('PATH'));
   });
 });
@@ -324,7 +335,7 @@ test('A 假绿修正：helper 首参形（`intEnv(env, \'NAME\', …)`）算一�
     const knob = byName(inv, 'HELPER_KNOB');
     assert.ok(knob.portalReads.some((r) => r.ref === 'portal/src/config.js:6'));
     assert.ok(knob.bootWhy.includes('P3启动快照'), `必须报启动快照，实际=${JSON.stringify(knob.bootWhy)}`);
-    assert.notEqual(knob.pile, 'db');
+    assert.ok(!knob.pile.startsWith('db'), '启动快照旋钮不许进任何「能搬」堆');
     // 没有被误伤成注入缺失以外的分类
     const rh = byName(inv, 'RUNNER_HELPER_KNOB');
     assert.equal(rh.runnerReads.length, 1);
@@ -361,9 +372,54 @@ test('输出：每行八列，且小计与三堆都在渲染文本里', () => {
     const summary = renderSummary(inv).join('\n');
     assert.match(summary, /注入但没进白名单=1 \[NO_ALLOW_KNOB\]/);
     assert.match(summary, /在白名单但没人读（死光纤）=1 \[DEAD_FIBER_KNOB\]/);
-    assert.match(summary, /能搬（三腿齐 \+ 非启动前必知 \+ portal 不读）=1 \[OK_KNOB\]/);
-    assert.match(summary, /compose station-portal\.environment 键数=7/);
-    assert.match(summary, /proxy ENV_KEY_ALLOW=3/);
+    assert.match(summary, /能搬·不用重启（per-run 生效[^=]*=1 \[PERRUN_KNOB\]/);
+    assert.match(summary, /能搬·但要重启[^=]*=1 \[OK_KNOB\]/);
+    assert.match(summary, /compose station-portal\.environment 键数=8/);
+    assert.match(summary, /proxy ENV_KEY_ALLOW=4/);
+  });
+});
+
+test('B 消费时机：同一根旋钮的读点在顶层还是在函数体里，决定改 DB 后要不要重启', () => {
+  // 单元级：顶层初始化区间的两条规则（跳行括号 + 缩进延续）
+  const src = [
+    'const A = Math.min(',
+    '  parseIntEnv(process.env.KNOB_ONE, 1),',
+    '  parseIntEnv(process.env.KNOB_TWO, 2),',
+    ');',
+    'export const B = Number(process.env.KNOB_THREE)',
+    '  && Number(process.env.KNOB_THREE) > 0',
+    '  ? Number(process.env.KNOB_THREE) : 9;',
+    'export function f(env = process.env) {',
+    '  return env.KNOB_FOUR;',
+    '}',
+  ];
+  const ranges = topLevelInitRanges(src);
+  assert.deepEqual(ranges, [[1, 4], [5, 7]], `多行声明必须整块算顶层，实际=${JSON.stringify(ranges)}`);
+  // 单元级：时机判据三档
+  assert.equal(consumeTiming({ runnerReads: [{ ref: 'r.js:3', atLoad: true }], writes: [] }).timing, '启动快照');
+  assert.equal(consumeTiming({ runnerReads: [{ ref: 'r.js:9', atLoad: false }], writes: [] }).timing, 'per-run');
+  const byWrite = consumeTiming({ runnerReads: [{ ref: 'r.js:3', atLoad: true }], writes: [{ ref: 'a.js:8', perRun: true }] });
+  assert.equal(byWrite.timing, 'per-run', 'portal 每 run 重写子环境 ⇒ 顶层读也算 per-run');
+  assert.ok(byWrite.why.includes('a.js:8'));
+  assert.equal(consumeTiming({ runnerReads: [], writes: [] }).timing, '未知');
+
+  // 集成：两根四处齐的旋钮，因为读点位置不同而进不同的堆
+  withFixture((root) => {
+    const inv = buildInventory(root);
+    const perrun = byName(inv, 'PERRUN_KNOB');
+    assert.deepEqual(perrun.breaks, [], `四处齐不许报错，实际=${JSON.stringify(perrun.breaks)}`);
+    assert.equal(perrun.timing, 'per-run');
+    assert.ok(perrun.timingWhy.includes('runner/worker.js:13'), perrun.timingWhy);
+    assert.equal(perrun.pile, 'dbPerRun');
+    assert.ok(inv.piles.dbPerRun.includes('PERRUN_KNOB'));
+    assert.ok(!inv.piles.dbRestart.includes('PERRUN_KNOB'));
+    const restart = byName(inv, 'OK_KNOB');
+    assert.ok(restart.timingWhy.includes('runner/worker.js:3'), restart.timingWhy);
+    assert.ok(restart.timingWhy.includes('重启'), restart.timingWhy);
+    // 逐键判据行里把时机打印出来了
+    const summary = renderSummary(inv).join('\n');
+    assert.match(summary, /- PERRUN_KNOB：时机=per-run/);
+    assert.match(summary, /- OK_KNOB：时机=启动快照/);
   });
 });
 
