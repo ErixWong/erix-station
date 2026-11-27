@@ -34,7 +34,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // ⚠ 片段拼接：**禁止词本身也不许以明文写进本文件**——闸要是把要拦的东西抄一遍，它自己就成了
 //   新的泄露源（261124 历史重写把明文 DENY 词一起改写了，闸当场失明；修法就是把词拆成片段）。
-//   拼接发生在运行时，扫描面（*.md + .env.example + js/ts/vue 注释行）看不到 .mjs，故不会自伤。
+//   拼接发生在运行时；扫描面**含** `*.js/*.mjs/*.cjs/*.ts/*.vue` 的注释行（261124 实测：只写 `*.js`
+//   就永远拦不住 `.mjs` 里的代理 IP 注释），本文件靠 `SELF` 跳过（见 main() 里那句 `continue`）
+//   才不自伤——不是因为它是 `.mjs`。。
 const j = (...parts) => parts.join('');
 
 // DENY_INFRA：命中即机器坐标 / 本机 quirk。受 EXEMPT 豁免。
