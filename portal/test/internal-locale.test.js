@@ -12,7 +12,8 @@
 // **必须继续只认 cookie**——#828 P2b 刚修完「过期账号值顶掉用户当场选的语言」，账号值绝不能在
 // 浏览器路径上插队。hint 只在内部面设置，作用域天然隔离，故这条性质必须被钉住。
 //
-// 断言一律 `assert.equal(实际, 期望)` **逐字等值**（不许 includes / match）；内存 fake pool，不碰真实 DB。
+// 关键断言（状态码 / code / message）一律 `assert.equal(实际, 期望)` **逐字等值**（不许 includes / match）；
+// 另有少量 `assert.ok` 只用来验「信封存在」或「某键不在错误体里」这类形状/存在性（不代替逐字内容断言）；内存 fake pool，不碰真实 DB。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -95,11 +96,12 @@ async function startBrowserServer({ ownerLocale }) {
 }
 
 /** 一次请求；返回 {status, error}（error = 响应体 error 信封）。 */
-async function hit(base, { method, p, token, cookie, ct = 'application/json', body }) {
+async function hit(base, { method, p, token, cookie, ct = 'application/json', body, al }) {
   const headers = {};
   if (ct) headers['content-type'] = ct;
   if (token) headers.authorization = `Bearer ${token}`;
   if (cookie) headers.cookie = cookie;
+  if (al) headers['accept-language'] = al;
   const payload = body === undefined ? undefined : (Buffer.isBuffer(body) || typeof body === 'string' ? body : JSON.stringify(body));
   const res = await fetch(base + p, { method, headers, body: payload });
   const text = await res.text();
@@ -135,6 +137,38 @@ test('属主 locale=en ⇒ 内部面错误体出英文（请求不带任何语�
   } finally { await s.close(); }
 });
 
+// ── A1（脏库值读时归一）：迁移 0048 刻意不给 users.locale 写 DB CHECK ⇒ 库里可能有人手工写进非规范值。
+//    旧代码 `req.localeHint ?? ...` 会把 'EN' 当已设原样透传，而 pickMessage 只认精确 'en' ⇒ 误出中文。
+//    现在读 hint 处过 normalizeUserLocale('EN') ⇒ 'en'。al=zh-CN 钉住驱动语言的是归一后的 hint 而非请求头。──
+test('#845 内部通道：属主 locale=脏值 EN（无 DB CHECK）⇒ 读时归一为 en ⇒ 英文（盖住 Accept-Language=zh-CN）', async () => {
+  const { pool, token } = seedClaimable();
+  setOwnerLocale(pool, 'EN');
+  const s = await startInternalServer(pool);
+  try {
+    const res = await hit(s.base, { ...STATE_REQ, token, al: 'zh-CN' });
+    assert.equal(res.status, 400);
+    assert.equal(res.error.code, 'validation_failed');
+    assert.equal(res.error.message, EN_STATE);
+  } finally { await s.close(); }
+});
+
+// ── A1（空串当未设）：手工写进库的 '' 经 normalizeUserLocale 归一为 null ⇒ 当未设 ⇒ 回落请求头。
+//    al=en 出英文、al=zh-CN 出中文——钉住空串没把语言锁死到某固定档，而是真的落回 cookie/Accept-Language。──
+test('#845 内部通道：属主 locale=空串 ⇒ 读时归一为 null（当未设）⇒ 回落 Accept-Language（en 出英文 / zh-CN 出中文）', async () => {
+  const { pool, token } = seedClaimable();
+  setOwnerLocale(pool, '');
+  const s = await startInternalServer(pool);
+  try {
+    const en = await hit(s.base, { ...STATE_REQ, token, al: 'en' });
+    assert.equal(en.status, 400);
+    assert.equal(en.error.message, EN_STATE);
+
+    const zh = await hit(s.base, { ...STATE_REQ, token, al: 'zh-CN' });
+    assert.equal(zh.status, 400);
+    assert.equal(zh.error.message, ZH_STATE);
+  } finally { await s.close(); }
+});
+
 // ── 2. 属主 locale=NULL ⇒ 中文，与今天逐字相同（回落链：hint(null) → 请求头(无) → zh-CN）──
 test('属主 locale=NULL ⇒ 内部面错误体出中文（与今天逐字相同）', async () => {
   const { pool, token } = seedClaimable();
@@ -149,8 +183,10 @@ test('属主 locale=NULL ⇒ 内部面错误体出中文（与今天逐字相同
   } finally { await s.close(); }
 });
 
-// ── 2b. 属主 locale 列缺失（fake 未种该行）也按 NULL 处理 ⇒ 中文（additive 字段不改变既有行为）──
-test('属主 locale 列缺失（未种）⇒ 仍出中文，与 #803 现状钉逐字相同', async () => {
+// ── 2b. fake 种子未提供 locale 字段（seedClaimable 的 users 本就无该键）⇒ setOwnerLocale 未调用 ⇒ 按 null 处理 ──
+// ⚠ 本例只覆盖「读到一个 undefined/缺字段的 hint ⇒ 当 null」，**不**覆盖真实 schema 缺列：
+//   真库若真的缺 users.locale 列，authenticateContainer 的 SELECT u.locale 会在查询期直接报错，而不是拿到 undefined。
+test('fake 种子未提供 locale ⇒ 按 null 处理 ⇒ 仍出中文，与 #803 现状钉逐字相同（不覆盖真实 schema 缺列）', async () => {
   const { pool, token } = seedClaimable();   // seedClaimable 的 users 本就没有 locale 键
   const s = await startInternalServer(pool);
   try {

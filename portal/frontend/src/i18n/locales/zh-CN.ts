@@ -2266,6 +2266,10 @@ export const zhCN = {
         unknown: '这个类型还没有说明',
       },
     },
+    // #850 A2：宏分派失败原因（`macro_runs.reason`）里的稳定机器码按语言渲染；未知值由组件原样显示（不吞、不空）。
+    reason: {
+      dispatchUnknownKind: '分派失败：未知的模板类型',
+    },
     field: {
       name: '名称',
       states: '盯哪些终态',

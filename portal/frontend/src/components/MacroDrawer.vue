@@ -28,6 +28,7 @@ import {
   formatTokens,
   kindSuffixOf,
   minutesAgo,
+  runReasonMessageKey,
   skipIsBudgetRisk,
   skipMessageKey,
   statusMessageKey,
@@ -45,7 +46,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{ (e: 'close'): void }>();
 
-const { t } = useI18n();
+const { t, te } = useI18n();
 const macro = useMacroStore();
 
 /** 判据①：面板该显示哪一态（技术态优先于业务态）。 */
@@ -103,6 +104,25 @@ const estimateOpen = ref(false);
 /** 链存在才显示深度（`07` §12：单条无链写 `深度 0` 是噪音）。 */
 function hasChain(run: { parentMacroRunId?: string | null; childRunId: string | null; depth: number }): boolean {
   return run.depth > 0 || run.childRunId !== null;
+}
+
+/**
+ * 分派失败 reason 的展示文案（A2/#850）：已知稳定机器码走 i18n；未知值（含运维要的
+ * `dispatch_failed: <message>` 调试串）原样返回，**不吞、不渲染成空**（宏 run 对用户可读）。
+ */
+function reasonLabel(reason: string | null): string {
+  if (!reason) return '';
+  const key = runReasonMessageKey(reason);
+  if (key && te(key)) return t(key);
+  return reason;
+}
+
+/**
+ * 宏 run「动作」行的文案：审查整改是人话 ⇒ 原样；没有它时这里落回原始 `reason` ⇒ 交给 `reasonLabel` 按码/原样处理。
+ */
+function actionLabel(run: { remediationText: string | null; reason: string | null }): string {
+  if (run.remediationText) return run.remediationText;
+  return reasonLabel(run.reason);
 }
 
 function close(): void {
@@ -341,7 +361,7 @@ defineExpose({ retry, estimateOpen });
               >{{ t(statusMessageKey(item.run.status)) }}</span>
             </div>
             <div class="mt-0.5 flex items-baseline gap-2">
-              <span class="min-w-0 flex-1 truncate">{{ item.run.actionText || t('macro.detail.noAction') }}</span>
+              <span data-test="macro-run-action" class="min-w-0 flex-1 truncate">{{ actionLabel(item.run) || t('macro.detail.noAction') }}</span>
               <span
                 v-if="item.run.verdict"
                 data-test="macro-verdict"

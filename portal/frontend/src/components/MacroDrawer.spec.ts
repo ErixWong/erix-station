@@ -27,6 +27,7 @@ function run(over: Partial<MacroRun> = {}): MacroRun {
   return {
     id: 'r-1', assignmentId: 'a-1', anchor: 'run 9f3a', status: 'done', criterion: 'terminal',
     verdict: 'pass', skippedReason: null, actionText: '审查完成',
+    reason: null, remediationText: null,
     startedAt: '2026-11-16T06:03:12.000Z', finishedAt: '2026-11-16T06:07:24.000Z',
     depth: 0, childSessionId: null, childRunId: null, usage: null, pending: false,
     ...over,
@@ -217,6 +218,50 @@ describe('判据③：判决映射（五个 verdict 各自渲染成 §6.1 的词
     const wrapper = mountDrawer();
     await wrapper.vm.$nextTick();
     expect(wrapper.find('[data-test="macro-verdict"]').text()).toBe('未判');
+  });
+});
+
+describe('A2/#850：宏 run 的 reason 渲染（已知码走 i18n、未知值原样、不吞）', () => {
+  it('已知机器码 dispatch_failed:unknown_template_kind ⇒ zh 出「分派失败：未知的模板类型」', async () => {
+    setLocale('zh-CN');
+    const macro = useMacroStore();
+    macro.assignments = [assignment()];
+    macro.runs = [run({ id: 'd-1', status: 'failed', verdict: null, remediationText: null, reason: 'dispatch_failed:unknown_template_kind' })];
+    const wrapper = mountDrawer();
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="macro-run-action"]').text()).toBe('分派失败：未知的模板类型');
+  });
+
+  it('同一码切到 en ⇒ 出 Dispatch failed: unknown template kind.', async () => {
+    setLocale('en');
+    const macro = useMacroStore();
+    macro.assignments = [assignment()];
+    macro.runs = [run({ id: 'd-2', status: 'failed', verdict: null, remediationText: null, reason: 'dispatch_failed:unknown_template_kind' })];
+    const wrapper = mountDrawer();
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="macro-run-action"]').text()).toBe('Dispatch failed: unknown template kind.');
+  });
+
+  it('未知 reason 值原样显示（不吞、不渲染成空、不退到「已执行」）', async () => {
+    setLocale('zh-CN');
+    const macro = useMacroStore();
+    macro.assignments = [assignment()];
+    macro.runs = [run({ id: 'd-3', status: 'failed', verdict: null, remediationText: null, reason: 'dispatch_failed: 模型炸了' })];
+    const wrapper = mountDrawer();
+    await wrapper.vm.$nextTick();
+    const el = wrapper.find('[data-test="macro-run-action"]');
+    expect(el.text()).toBe('dispatch_failed: 模型炸了');
+    expect(el.text()).not.toBe('已执行');
+    expect(el.text()).not.toBe('');
+  });
+
+  it('有整改人话时优先原样显示 remediationText，不走 i18n、不被 reason 顶掉', async () => {
+    const macro = useMacroStore();
+    macro.assignments = [assignment()];
+    macro.runs = [run({ id: 'd-4', status: 'done', verdict: 'red', remediationText: '已自动整改，补了两个测试', reason: 'some-code' })];
+    const wrapper = mountDrawer();
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="macro-run-action"]').text()).toBe('已自动整改，补了两个测试');
   });
 });
 

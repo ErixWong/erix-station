@@ -16,6 +16,8 @@ function run(over: Partial<MacroRun> & { id: string }): MacroRun {
     verdict: null,
     skippedReason: null,
     actionText: null,
+    reason: null,
+    remediationText: null,
     startedAt: '2026-11-16T02:00:00.000Z',
     finishedAt: '2026-11-16T02:01:00.000Z',
     depth: 0,
