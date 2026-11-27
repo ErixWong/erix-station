@@ -1214,3 +1214,174 @@ test('#227① E5 同族拒：比对键的值带 $ 插值 / 未闭合引号 / 引
   ]);
   assert.doesNotThrow(() => assertHostWritePathsIsolated({ env: ISOLATED_FOUR, envFile, label: 'wp3b-e2e' }));
 });
+
+// ---------------------------------------------------------------------------
+// #575① `present` 的语义边界（口径与 `e2e-preflight.mjs` 的祖先/叶子掩码逐字对齐）
+//
+// `present` 只承诺「能**穿越**祖先各段（`X_OK`）+ 能**读到**这个已知路径（叶子 `R_OK`）」，
+// **不承诺可枚举（`R_OK`）、也不承诺可写（`W_OK`）**。这两条不写下来就会被当成「一切就绪」用，
+// 而把它们钉住的代价正是 PR #567 那发假红的反面：祖先掩码「顺手加严」成 `R_OK|X_OK` 之后，
+// `0o111` 的 bind 源会被判成「读不到」——12–53ms 就红，红得毫无信息（同一棵树里那个已知路径当时照样读得到）。
+//
+// 为什么必须真 `chmod`：注入版能证明「分类逻辑对不对」，证明不了**内核真的允许这种组合存在**
+// （`X` 而无 `R` 的目录是不是真能让已知路径读得到，是内核语义，不是我们的代码语义）。
+// 所以 A1/A2 是真夹具，A1b 才是 root 机（`CAP_DAC_OVERRIDE`）上承担判据的那半。
+// ---------------------------------------------------------------------------
+
+/** 已知正文：`present` 承诺的就是「这一串真读得到」，所以它必须逐字进断言。 */
+const LEAF_TEXT = '{"slots":{"default":{"apiKey":"erix-placeholder"}}}\n';
+
+/**
+ * 真夹具：`<base>/inner/leaf`，把**祖先** `base` 改成 `ancestorMode`（`0o111` = 可穿越不可枚举；
+ * `0o311` = 可穿越可写但仍不可枚举）。夹具自证在夹具里（`lstat` 的 mode 与 `CAP_DAC_OVERRIDE` 无关，
+ * root 上量到的也是真值）⇒ `chmod` 被改坏就在**任何机器**上当场红，不会退化成一格假绿。
+ * 清理照 #570 返修的口径：`mkdtempSync` 之后**第一行**就注册 `t.after`，里面先放开祖先再 `rmSync`
+ * （`0o111` 没有 `R_OK`/`W_OK`，直接 `rmSync` 会炸 ⇒ 泄漏 `/tmp`）。
+ */
+function fixtureUnenumerableAncestor(t, ancestorMode) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-495b-perm-'));
+  t.after(() => {
+    try { fs.chmodSync(base, 0o755); } catch { /* 已经被删掉就算了：目标是「别泄漏」，不是「chmod 必须成功」 */ }
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+  const inner = path.join(base, 'inner');
+  fs.mkdirSync(inner, { recursive: true });
+  const leaf = path.join(inner, 'leaf.json');
+  fs.writeFileSync(leaf, LEAF_TEXT);
+  fs.chmodSync(base, ancestorMode);
+  const mode = fs.lstatSync(base).mode & 0o777;
+  assert.equal(mode, ancestorMode, `夹具的祖先必须真是 0o${ancestorMode.toString(8)}，否则本格无效：0o${mode.toString(8)}`);
+  return { base, inner, leaf };
+}
+
+/**
+ * A1/A2 共用的真断言序列（两格只差祖先 mode 与「祖先可写与否」这个**事实**）。
+ * @param {boolean} ancestorWritable 该模式下**当前用户**对祖先到底有没有 `W_OK`（0o111 无 / 0o311 有）
+ */
+async function assertPresentBoundary(t, { ancestorMode, ancestorWritable, label, injection }) {
+  const { base, leaf } = fixtureUnenumerableAncestor(t, ancestorMode);
+  const mode = fs.lstatSync(base).mode & 0o777;
+  assert.equal(mode, ancestorMode, `夹具必须真是 0o${ancestorMode.toString(8)}，否则本格无效：0o${mode.toString(8)}`);
+  if (!rootSkipIfReallyUnblocked(t, {
+    label,
+    injection,
+    probe: () => fs.readdirSync(base), // ← 本格真半里真的会调的那一次调用（照抄，不另挑）
+    probeName: 'fs.readdirSync(base)',
+  })) return;
+  // ① 本格存在的理由：祖先**不可枚举**——这正是 `present` 不承诺的东西
+  assert.throws(() => fs.readdirSync(base), (error) => {
+    assert.equal(error.code, 'EACCES', `这台机器上「列不出目录」必须真的是 EACCES，否则取证无效：${error?.code}`);
+    return true;
+  });
+  // ② 祖先的可写性同样**不在承诺里**：`0o111`（A1）连属主也写不进，`0o311`（A2）属主写不进得靠反向自证
+  //    拦住——两格合起来才钉住「`present` 与 `W_OK` 无关」，只测一边就是半条判据。
+  if (ancestorWritable) {
+    assert.doesNotThrow(() => fs.accessSync(base, fs.constants.W_OK),
+      `祖先 0o${ancestorMode.toString(8)} 时属主必须**写得进**（本格要靠这条钉住「可写也不改变 present 这个结论」）`);
+  } else {
+    assert.throws(() => fs.accessSync(base, fs.constants.W_OK), (error) => {
+      assert.equal(error.code, 'EACCES', `祖先不可写必须是 EACCES，否则本格无效：${error?.code}`);
+      return true;
+    });
+  }
+  // ③ 但叶子读得到 ⇒ `present` 必须为真（掩码放松的正当性就在这）
+  const observed = observeHostPath(leaf);
+  assert.equal(observed.state, 'present', `祖先 0o${ancestorMode.toString(8)} 时已知路径必须仍算在场（实测 ${JSON.stringify(observed.state)}）`);
+  assert.equal(fs.readFileSync(leaf, 'utf8'), LEAF_TEXT, '已知路径真读得到——这才是 `present` 承诺的东西');
+  // ④ 等待路径同口径：不许因为「列不出目录」判成 unreadable，也不许假红
+  const waited = await waitForHostFile(leaf, { timeoutMs: 3000, intervalMs: 50 });
+  assert.equal(waited.content ?? waited.text ?? waited, LEAF_TEXT, '等待路径必须照样读到（返回值形状照文件里已有用例的取法）');
+  // 顺带钉住「`present` 不是靠枚举得来的」：分类里没有一条 readdir（把 readdir 塞进判定的改动会在这里露馅）
+  assert.equal(observed.blocker, null, 'present 不该带 blocker');
+  assert.equal(observed.missingPrefix, null, 'present 不该带 missingPrefix');
+}
+
+test('#575① A1 祖先 0o111（真 chmod 半格）⇒ 不可枚举、不可写，但已知路径仍 present', async (t) => {
+  await assertPresentBoundary(t, {
+    ancestorMode: 0o111, ancestorWritable: false,
+    label: 'A1（present 边界的真 chmod 半格）', injection: 'A1b（fsImpl 注入孪生格）',
+  });
+});
+
+test('#575① A2 祖先 0o311（真 chmod 半格）⇒ 可写但仍不可枚举，present 一个字不变', async (t) => {
+  await assertPresentBoundary(t, {
+    ancestorMode: 0o311, ancestorWritable: true,
+    label: 'A2（present 边界的真 chmod 半格）', injection: 'A1b（fsImpl 注入孪生格）',
+  });
+});
+
+test('#575① A1b 同一夹具的 fsImpl 注入孪生（不依赖内核权限位，root 机也可跑）⇒ present', (t) => {
+  const { base, leaf } = fixtureUnenumerableAncestor(t, 0o111);
+  const fake = {
+    ...fs,
+    // 注入版只描述**观测结果**：祖先可穿越（`X_OK` 成功）、可写性为否（`W_OK` 抛 EACCES）、
+    // 叶子可读（成功）。⚠ 它**故意不看 `R_OK` 那一位**：枚举性根本不在 `present` 的棱镜里（由下面
+    // `readdirSync` 单独承担），所以把源码祖先掩码加严成 `R_OK|X_OK` 时本格**仍绿**——孪生不该跟着内核跑。
+    accessSync: (p, mask) => {
+      if (p === base) {
+        if (mask & fs.constants.W_OK) throw EACCES();
+        return undefined;
+      }
+      if (p === leaf) return undefined;
+      return fs.accessSync(p, mask);
+    },
+    readdirSync: (p) => { if (p === base) throw EACCES(); return fs.readdirSync(p); },
+  };
+  // 先自证注入真的把「不可枚举」摆出来了（否则这格是「什么都没注入」的假绿）
+  assert.throws(() => fake.readdirSync(base), (error) => { assert.equal(error.code, 'EACCES'); return true; });
+  assert.throws(() => fake.accessSync(base, fs.constants.W_OK), (error) => { assert.equal(error.code, 'EACCES'); return true; });
+
+  const observed = observeHostPath(leaf, { fsImpl: fake });
+  assert.equal(observed.state, 'present', `祖先不可枚举时注入版也必须判 present（实测 ${JSON.stringify(observed.state)}）`);
+  assert.equal(observed.content, LEAF_TEXT, '注入版也要真把正文读出来（present 的承诺就是这一串）');
+  assert.equal(observed.blocker, null);
+  assert.equal(observed.missingPrefix, null);
+  // 反向自证：注入不是摆设——把「祖先可穿越」这一位也抽掉（mask 感知，口径同文件里的 fakeDenyingMode）
+  // ⇒ 必须换成 unreadable。这一条同时钉住「本格的 present 是从注入来的，不是什么都没注入来的」。
+  const alsoUntraversable = {
+    ...fake,
+    accessSync: (p, mask) => {
+      if (p === base && (mask & fs.constants.X_OK) === fs.constants.X_OK) throw EACCES();
+      return fake.accessSync(p, mask);
+    },
+  };
+  const blocked = observeHostPath(leaf, { fsImpl: alsoUntraversable });
+  assert.equal(blocked.state, 'unreadable', `抽掉「可穿越」后必须不再是 present（实测 ${JSON.stringify(blocked.state)}）`);
+  assert.equal(blocked.blocker?.missingAccess, 'X_OK', '被挡住的就是穿越那一位（文案口径不许退成 R_OK）');
+});
+
+test('#575① A1c 注入孪生与真 chmod 夹具落在**同一棱镜**（两个祖先模式各对一次）', (t) => {
+  // 为什么单独一格：「注入版与真机版同态」这句话只能拿**真机**当参照，而它恰好是变异（把祖先掩码
+  // 加严成 `R_OK|X_OK`）会亲手推开的那句话：真机侧会跟着掩码变成 `unreadable`，而注入版（只描述
+  // 观测结果，不看内核要哪一位）仍说 `present` ⇒ 两者一分为二，本格就红。A1b 自己不该红（它不依赖
+  // 内核权限位），依赖关系全部钉在这一格上。
+  const problems = [];
+  for (const ancestorMode of [0o111, 0o311]) {
+    const { base, leaf } = fixtureUnenumerableAncestor(t, ancestorMode);
+    if (!rootSkipIfReallyUnblocked(t, {
+      label: `A1c（同一棱镜对照，祖先 0o${ancestorMode.toString(8)}）`,
+      injection: 'A1b（fsImpl 注入孪生格）',
+      probe: () => fs.readdirSync(base), // 与 A1/A2 真半格同一次调用
+      probeName: 'fs.readdirSync(base)',
+    })) return;
+    assert.throws(() => fs.readdirSync(base), (error) => { assert.equal(error.code, 'EACCES'); return true; });
+    const fake = {
+      ...fs,
+      accessSync: (p, mask) => {
+        // 只回答「能不能穿越 / 能不能读到」（= present 的两项承诺）；可写性、可枚举性都不在这张表里。
+        if (p === base || p === leaf) return undefined;
+        return fs.accessSync(p, mask);
+      },
+      readdirSync: (p) => { if (p === base) throw EACCES(); return fs.readdirSync(p); },
+    };
+    const real = observeHostPath(leaf);
+    const injected = observeHostPath(leaf, { fsImpl: fake });
+    if (real.state !== injected.state) {
+      problems.push(`0o${ancestorMode.toString(8)}: 真机 ${JSON.stringify(real.state)} ≠ 注入 ${JSON.stringify(injected.state)}`);
+    }
+    if (real.content !== LEAF_TEXT || injected.content !== LEAF_TEXT) {
+      problems.push(`0o${ancestorMode.toString(8)}: 两侧正文必须是那一句已知的（真机 ${JSON.stringify(real.content)} / 注入 ${JSON.stringify(injected.content)}）`);
+    }
+  }
+  assert.deepEqual(problems, [], `注入版与真机版必须落在**同一棱镜**（不一致就是注入写歪了）：${problems.join('; ')}`);
+});

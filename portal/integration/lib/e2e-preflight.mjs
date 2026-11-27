@@ -482,6 +482,13 @@ export function formatAncestorLinkLines(links) {
  * ⚠ 红线（issue #495 的验收判据）：不许把「读不到」与「不存在」压成同一个布尔（#412 那条
  * 「最费时间」的根因）；也不许「忽略读错误继续等」（真的没物化会被拖成一句无信息超时）。
  *
+ * **`present` 承诺什么、不承诺什么（#575）**：只承诺「当前宿主用户能**穿越**祖先目录各段
+ * （`X_OK`）并**读到**这个已知路径（叶子 `R_OK`）」。它**不承诺**：
+ *   · 目录**可枚举**（`R_OK`）——祖先 `0o111` 时 `readdir` 会 `EACCES`，但已知路径照样读得到；
+ *   · 目录**可写**（`W_OK`）——写不写得进去是另一回事，**尤其容器侧 materializer 用的是另一套 UID/GID**（#575②）。
+ * ⚠ 别把祖先掩码「顺手加严」成 `R_OK|X_OK`：那会把 `0o111` 的 bind 源误判成「读不到」，
+ *   正是 PR #567 修掉的那发 12–53ms 假红。`test/integration-e2e-preflight.test.js` 的 `#575① A1/A2` 钉着这条。
+ *
  * @param {string} filePath 宿主路径
  * @param {{fsImpl?: typeof import('node:fs')}} [options]
  * @returns {{state: 'present' | 'missing' | 'unreadable' | 'unknown', content?: string, blocker?: object | null, missingPrefix?: string | null, link: object, links: object[], error?: object}}
@@ -617,6 +624,13 @@ function missingMessage(name, observed, extra) {
  *  · unreadable ⇒ **连续两次**观测到就立刻抛（等下去没有意义：权限不是时间问题；要两次是为了不在
  *    portal 建目录 / chown 的瞬间窗口里误报）；
  *  · missing ⇒ 等满超时，文案点名「链上第一段不存在」= 真没物化。
+ *
+ * **`present` 承诺什么、不承诺什么（#575）**：只承诺「当前宿主用户能**穿越**祖先目录各段
+ * （`X_OK`）并**读到**这个已知路径（叶子 `R_OK`）」。它**不承诺**：
+ *   · 目录**可枚举**（`R_OK`）——祖先 `0o111` 时 `readdir` 会 `EACCES`，但已知路径照样读得到；
+ *   · 目录**可写**（`W_OK`）——写不写得进去是另一回事，**尤其容器侧 materializer 用的是另一套 UID/GID**（#575②）。
+ * ⚠ 别把祖先掩码「顺手加严」成 `R_OK|X_OK`：那会把 `0o111` 的 bind 源误判成「读不到」，
+ *   正是 PR #567 修掉的那发 12–53ms 假红。`test/integration-e2e-preflight.test.js` 的 `#575① A1/A2` 钉着这条。
  *
  * @param {string} filePath 宿主路径
  * @param {object} [options]
