@@ -6,7 +6,7 @@
 //   · `Cookie: locale=en` ⇒ `error.message` **逐字**等于抛出点写的 `en`；
 //   · 不带 locale cookie ⇒ **逐字**等于原中文（既有行为不破的钉子）。
 // 另钉两条：错误体键集合不变（`code`/`message`/`retryable`，给了才有 `details`）、`en` 不外泄。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -17,6 +17,22 @@ import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
 import { generateEmailCode, invalidateOtherCodes } from '../src/login-email-code.js';
 import { IdempotencyError } from '../src/idempotency.js';
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 station-http-msg-static-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, maxRetries: 3 });
+  }
+});
 
 const ADMIN = {
   id: 'a0000000-0000-4000-8000-000000000001', login: 'root', display_name: 'root',
@@ -36,7 +52,7 @@ class Pool extends FakePool {
 }
 
 async function startServer() {
-  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-http-msg-static-'));
+  const staticDir = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'station-http-msg-static-')));
   const config = {
     cookie: cookieSettings('dev-msg', 604800),
     sessionTtlSeconds: 604800,
