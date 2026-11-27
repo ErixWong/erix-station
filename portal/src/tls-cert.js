@@ -318,7 +318,10 @@ export function certificateDomains({ sans, subjectCN }) {
  *   所以后两者是 400，前者只是 `chainWarnings`。
  *
  * @returns {{ok: true, cert: object, chainWarnings: string[]}
- *          | {ok: false, code: string, message: string, details?: object}}
+ *          | {ok: false, code: string, message: string, messageEn: string, details?: object}}
+ *   失败分支的 `messageEn` 是**契约的一部分**（#882：每条失败结果都带它，测试见
+ *   `portal/test/tls-admin-messages-i18n.test.js`）：出口 `http.js` 靠它填 `TlsCertError` 的 `en`，
+ *   丢了它 `locale=en` 的请求就只能回退中文（`pickMessage` 只认精确的 `en`）。
  */
 export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now = new Date() } = {}) {
   // #803 返修②：这个返回面是 **return 一个结果对象**（不是 throw），所以当年按 `throw new XError`
