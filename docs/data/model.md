@@ -356,7 +356,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `llm_providers.api_format`（`0002-llm-config.sql:23`，`NOT NULL DEFAULT 'openai'`）| **只有一个值** `openai` | 同名硬编码仍在：`portal/src/llm.js` 的 `toProvider()` 把每个 credential 的 `api_format` 写成字面量 `'openai'`（上游格式不再入库，所以它只能是常量）——口径见 portal.md §4.9-1 |
 | `llm_models.type`（`0002-llm-config.sql:35`）| `text` / `embedding` / `vision` / `rerank` / `audio-tts` / `audio-stt` / `image-gen`（七值）| **七值逐字仍在用**：`portal/src/llm.js` 的 `LLM_MODEL_TYPES` 就是这七项，`typeToMode()` 把它们映到 LiteLLM 的 `chat` / `embedding` / `rerank` / `audio_speech` / `audio_transcription` / `image_generation`（反向映射在 `modelType`（`portal/src/llm.js:119-128`，按显式 `type` → mode 回退 → 缺省 `text`），如 `mode === 'image_generation' → image-gen`）——**表已撤，分类口径没撤**，它现在是「portal 给模型打的能力类型标签」，不是库约束 |
 
-> 这两行是**历史事实 + 当前实现**的对账，不是「补回旧表」：库里不会再出现 `llm_providers` / `llm_models`，`api_format` 与 `type` 也**不是** `fde_llm_bindings` 的列（本表只有 `provider_id` 与三个 `*_model_id` / `*_model_name`，见上面 §1.20 字段表）。旧目录行本身只能从 dump 恢复（上一段的单向门）。
+> 这两行是**历史事实 + 当前实现**的对账，不是「补回旧表」：库里不会再出现 `llm_providers` / `llm_models`（**两路证据**：迁移链 `0010-litellm-bindings.sql:26-27` 把它们改名为 `*_retired`、`0032-drop-retired-tables.sql:52,55` 再 `DROP`；**实查 catalog** `select tablename from pg_tables where tablename like 'llm%'` ⇒ **0 行**，同一条查询里只剩 `macro_*` 三张），`api_format` 与 `type` 也**不是** `fde_llm_bindings` 的列（本表只有 `provider_id` 与三个 `*_model_id` / `*_model_name`，见上面 §1.20 字段表）。旧目录行本身只能从 dump 恢复（上一段的单向门）。
 
 **运行中变更守卫**：`PUT /api/admin/fdes/:name/llm` 在活跃 run（queued/running/cancelling）期间若改变 credential 或任一模型槽（该槽变化会轮换 LiteLLM key 白名单），返回 `409 active_run_conflict`；管理员显式传 `force: true` 才放行。相同 binding 为幂等重试，不重复铸 key 或写 outbox。上游 API key 不能经 FDE binding API 提交，需在 LiteLLM credential 管理入口更新。
 
