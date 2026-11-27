@@ -192,7 +192,10 @@ test('#736 真库④ findApiTokenUser 折的 user 与 cookie 全等，session.id
 
       // (a) 列面：两条路径 user 逐字段全等（真库能抓少列 / 混进秘密列）。
       assert.deepEqual(Object.keys(viaToken.user).sort(),
-        ['auth_source', 'display_name', 'fde_name', 'file_upload_enabled', 'id', 'login',
+        // #828 给两条认证路径都加了 `locale`（`api-tokens.js` 的 token DTO / `auth.js` 的会话 SELECT），
+        // 这张键表当时只改了 fake 那两支（`api-tokens.test.js`），**真库这一支漏了** —— 它在本机默认
+        // 门禁与 CI 里永远是 skip（`TEST_DATABASE_URL` 未设），所以漏了也没人看见（issue #873 的现场）。
+        ['auth_source', 'display_name', 'fde_name', 'file_upload_enabled', 'id', 'locale', 'login',
           'must_change_password', 'role'].sort());
       assert.deepEqual(viaToken.user, viaCookie.user,
         '两条路径 user 逐字段相等（列面/秘密列/布尔化一致）');
