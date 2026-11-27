@@ -171,7 +171,9 @@ function scanFile(rel, wholeFile, hits, measureHits) {
 }
 
 function main() {
-  // 测量开关：只决定**要不要打印**命中清单，不碰退出码（本轮只量面，不翻拦）。
+  // 测量开关：只决定**要不要打印**命中清单，不碰退出码。
+//   ⚠ #889 第二步之后，这些词**本身已经进 DENY** ⇒ 命中会让 rc 变红，但**变红不是因为开了这个开关**
+//   （base 与 measured 两次跑的 rc 相同，`test/docs-portable.test.js` 第 ④ 格钉的就是这条不变量）。
   const measureOn = process.argv.includes('--identity-words') || process.env.DOC_PORTABLE_IDENTITY_WORDS === '1';
   /** @type {string[]} */
   const hits = [];
@@ -188,7 +190,7 @@ function main() {
   }
   if (measureHits) {
     // 打在 stdout：它是量面读数，不是错误；位置在拦截判定之前，故对 rc 零影响。
-    console.log(`check:doc-portable 身份词测量（--identity-words，只报不拦，不影响退出码）：${measureHits.length} 处（已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/mjs/cjs/ts/vue 注释行）`);
+    console.log(`check:doc-portable 身份词测量（--identity-words；打印开关，不改 rc —— 但这些词已进 DENY，命中本身会让 rc 红）：${measureHits.length} 处（已扫 ${files} 个文件：*.md + deploy/.env.example 整行、js/mjs/cjs/ts/vue 注释行）`);
     for (const h of measureHits) console.log(`  ${h}`);
   }
   if (hits.length > 0) {
