@@ -201,6 +201,10 @@ export function shouldSoftSkip({ soft = false, phase, message = '' } = {}) {
  * #878：回读跑不动不再是「记一句日志就返回」——那等于「没确认成功也算过」。`psql` 调用做成可注入
  * 参数 `runPsql`（默认值仍是真 `docker exec` 的 `psql`）与 `soft`（默认 `UI_SOFT`），好让这条判据能在
  * **不启动真库/浏览器**的情况下被 `node --test` 测到。
+ *
+ * #902 ③：`soft` 已**不再兑底回读跑不动**——收尾发生在运行阶段之后，走 `shouldSoftSkip({ phase: 'run' })`
+ * ⇒ 恒 `false` ⇒ 无论 `soft` 真假，回读跑不动一律判红。`soft` 参数保留只为让上面那些用例能显式传
+ * `soft: true` 钉住这条性质（见新增的 soft:true 仍判红一例）；`E2E_UI_SOFT` 只兑环境**探测**阶段的降级。
  */
 function resetAccountLocalesAndConfirm({ runPsql = psql, soft = UI_SOFT } = {}) {
   const targets = [ADMIN_LOGIN, SCRIPT_LOGIN];
@@ -209,20 +213,23 @@ function resetAccountLocalesAndConfirm({ runPsql = psql, soft = UI_SOFT } = {}) 
   // 但注意：兜住「UPDATE 到底生效没有」的是**下面的回读判红**，不是这个 tryQuiet——tryQuiet 只吞异常，
   // 真把脏值留下了会由回读兜住（见下），别把它当成「恢复失败也算过」。
   tryQuiet(() => runPsql(`UPDATE users SET locale = NULL WHERE login IN (${inList})`));
-  // 回读：`login=<value>` 一行一个，`NULL` 代指未设。**回读跑不动 = 没确认成功 = 不算恢复 ⇒ 判红。**
+  // 回读：`login=<value>` 一行一个，`NULL` 代指未设。**回读跑不动 = 没确认成功 = 不算恢复 ⇒ 一律判红。**
   // 理由：本腿会把 dev 上的账号语言值写脏，「恢复了却没确认」与「没恢复」在账上必须同等对待
   //（`E2E_UI=1` 的口径就是「不许静默冒充通过」）。回读本身抛错正是「没确认成功」，故判红而非记一句日志返回。
-  // 唯一软面：显式 `E2E_UI_SOFT=1`（环境不齐，比如 DB 压根连不上）时才降级为一句日志、不判红（见 soft 参数）。
+  // #902 ③：收尾发生在**运行阶段之后**，按 #884「运行阶段不降级」的口径，这里**不受 `E2E_UI_SOFT` 豁免**：
+  // 走 `shouldSoftSkip({ phase: 'run' })` ⇒ 恒 `false`（它只兑环境**探测**阶段的降级，不兑运行阶段之后的收尾确认）。
   let rows;
   try {
     rows = runPsql(`SELECT login || '=' || COALESCE(locale, 'NULL') FROM users WHERE login IN (${inList}) ORDER BY login`);
   } catch (err) {
     const why = String(err?.message || err).split('\n')[0];
-    if (soft) {
-      console.log(`# 收尾回读跑不动（已显式 E2E_UI_SOFT=1 降级，不判红）：${why}`);
+    // 恒判红：`phase: 'run'` 下 `shouldSoftSkip` 永远返回 `false`，所以 `soft` 为真也不降级（把下面
+    // 改回 `if (soft)` 就等于旧行为，#902 ③ 新加的 soft:true 例就会变红）。
+    if (shouldSoftSkip({ soft, phase: 'run', message: why })) {
+      console.log(`# 收尾回读跑不动（降级，不判红）：${why}`);
       return;
     }
-    assert.fail(`收尾回读跑不动：无法确认 ${targets.join(' 与 ')} 两个账号的语言值已恢复（原因：${why}）——本腿会把 dev 上的账号语言值写脏，恢复了却没确认和没恢复在账上同等对待，没确认成功不能算恢复（不想被判红就显式带 E2E_UI_SOFT=1）`);
+    assert.fail(`收尾回读跑不动：无法确认 ${targets.join(' 与 ')} 两个账号的语言值已恢复（原因：${why}）——本腿会把 dev 上的账号语言值写脏，恢复了却没确认和没恢复在账上同等对待，没确认成功不能算恢复（#902 ③：收尾在运行阶段之后，E2E_UI_SOFT 不兑这一段，恒判红）`);
     return;
   }
   const seen = Object.fromEntries(rows.split('\n').filter(Boolean).map((l) => { const i = l.indexOf('='); return [l.slice(0, i), l.slice(i + 1)]; }));
@@ -901,6 +908,16 @@ test('收尾恢复：回读跑不动（psql 抛异常）⇒ 判红，不许静�
   const boom = () => { throw new Error('docker exec psql: could not connect to server'); };
   const re = new RegExp(`收尾回读跑不动.*${ADMIN_LOGIN}.*${SCRIPT_LOGIN}.*没确认成功不能算恢复`);
   assert.throws(() => resetAccountLocalesAndConfirm({ runPsql: boom, soft: false }), (err) => re.test(err.message));
+});
+
+test('收尾恢复：soft=true 也判红（运行阶段之后的收尾不受 E2E_UI_SOFT 豁免）#902 ③', () => {
+  // #902 ③：这一格今天没人测——旧代码 `if (soft)` 命中就「记一句日志返回」（等于没确认也算过）。
+  // 新实现把收尾回读走 `shouldSoftSkip({ soft, phase: 'run' })` ⇒ 恒 `false` ⇒ 即便显式传 `soft: true`，
+  // 回读跑不动仍判红（收尾发生在运行阶段之后，按 #884「运行阶段不降级」就该红）。把实现改回
+  // `if (soft)` 记日志返回 ⇒ 本例的 assert.throws 拿不到异常 ⇒ 变红（这就是 #902 ③ 的变异钩）。
+  const boom = () => { throw new Error('docker exec psql: could not connect to server'); };
+  const re = new RegExp(`收尾回读跑不动.*${ADMIN_LOGIN}.*${SCRIPT_LOGIN}.*没确认成功不能算恢复`);
+  assert.throws(() => resetAccountLocalesAndConfirm({ runPsql: boom, soft: true }), (err) => re.test(err.message));
 });
 
 test('收尾恢复：回读里某账号 locale=en（UPDATE 没生效）⇒ 判红 #878', () => {
