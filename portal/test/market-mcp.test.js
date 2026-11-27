@@ -19,13 +19,32 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { test } from 'node:test';
+import { test, afterEach } from 'node:test';
 
 import {
   MarketError, MCP_LIMITS, installCapability, listCapabilitiesForFde, listMcpServersForFde, listSlots, publishItem,
   resolveMcpServersForFde, setCapabilityEnabled, setItemState, setSlotValues, validateBundle,
   validateMcpFields,
 } from '../src/market.js';
+
+
+// ---- 夹具生命周期：mkdtemp 与注册 rm 必须在同一条用例内闭环（#880）----
+// 本文件建的每一个 /tmp 目录都进 tmpDirs；漏一个就会在 /tmp 留下 mcp-market-*，
+// 而 scripts/check-tmp-hygiene.mjs 正是数这个名字（增量口径：本轮新增必须为 0）。
+const tmpDirs = [];
+function trackTmp(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    // rmSync 必须是真语句：注释掉它 while 就空转成死循环（#880 批一踩过）。
+    // force 是本文件特有需求：MC-5/6/7 自己已在 `finally` 里 rm 了同一个 root，
+    // 这里再清一次必须容忍「已经没了」（别处漏注册仍会被 #875 的闸当场抱住）。
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 
 // ---------------------------------------------------------------------------
@@ -238,7 +257,7 @@ const MCP_FIELDS = (slug, extra = {}) => ({
 });
 
 function tmpConfig() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-market-'));
+  const root = trackTmp(fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-market-')));
   return { config: { userSpaceRoot: root, fdeUid: null, fdeGid: null }, root };
 }
 
