@@ -62,6 +62,11 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 
 判定标准：`node --test` 全绿。单测只测**纯逻辑**，禁止触碰真实 docker/DB/宿主路径（§2.1 隔离约定）。
 
+> **前端闸也只要一条命令**（#862 的返修）：`npm run check:frontend`（根目录 = `typecheck` + `vitest`，脚本里已 `env -u NODE_ENV`）。
+> **判定只认退出码，不许 grep 摘要行**：实测「用例全绿 + 一条**未捕获异常**」时 vitest 照旧打 `Test Files 101 passed / Tests 2154 passed`，
+> 但 **rc=1**——#862 就是这么漏过去的（`scrollIntoView` 在 jsdom 里不存在，抛在测试外面的事件回调里 ⇒ 没有一条用例失败，只有退出码知道）。
+> 另一个假因：**`NODE_ENV=production` 会让 `emitted()` 恒空** ⇒ 假红，所以下游脚本自己剥掩（人手工跑时也要 `env -u NODE_ENV`）。
+
 > **随 `npm test` 一起跑的语法腿**：`npm test` 链了 `node scripts/check-integration-syntax.mjs`（单独跑：`npm run check:integration-syntax`）。活栈 e2e 脚本是「脚本里套脚本」（浏览器里跑的代码写成 `String.raw` 模板再送进容器），模板里混进一个反引号就会提前闭合外层模板——而**外层 `node --check` 照样合法**（#804 实测：单测与 `npm test` 全绿，只有真跑浏览器腿才炸），所以外层与内嵌片段两层都查；某文件出现 `String.raw` 字样却抠出 **0 段**、或全仓总段数为 0 ⇒ **直接红**（记号被改名/换引号后内层脚本就没人查了，「0 段也算全通过」是假绿）。边界说清：抠出来的是**未插值**的模板原文（`${…}` 在这条腿眼里是字面文本，内层要传值走 `cfg`），内层脚本本身**不许再写反引号**；语义对不对仍只能真跑一次浏览器腿（§1.2.3）。 **服务端文案的双语覆盖不设计数闸**（#803 走过一次，判据见 `docs/design/principles.md` §3）：进度看 issue #803 的账；已翻面的部分由单测钉（注册表 `label↔labelEn` parity = `RS-64`；缺省中文逐字不变 = `RS-66`/`RS-67`；HTTP 级错误文案 = `RS-API-13`），没翻的照旧出中文不是故障。
 
 #### 1.2.3 集成（临时栈）

@@ -13,7 +13,7 @@
 #
 # 改成本地手动的：
 #   真数据库测试：npm run check:ci-legs（需 TEST_DATABASE_URL，见 docs/testing.md §2.2.1）
-#   前端        ：cd portal/frontend && npm run typecheck && npm test
+#   前端        ：npm run check:frontend（= typecheck + vitest，判定只认退出码）
 # ============================================================================
 name: CI
 
