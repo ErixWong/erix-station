@@ -171,6 +171,43 @@ describe('QueuedInputsBar（#370）', () => {
     expect(wrapper.get('[data-test="queued-row-full"]').text()).toContain('排队四');
   });
 
+  it('#852 评审 MED：展开态按条目身份记，快照前移时不会「换成另一条」', async () => {
+    const store = useWorkbenchStore();
+    const wrapper = setup();
+    store.applyQueueSnapshot(six());
+    await flushPromises();
+    // 展开编号 4（= `f2`「排队二…」）
+    await wrapper.get('[data-test="queued-index"][data-index="4"]').trigger('click');
+    expect(wrapper.get('[data-test="queued-row-full"]').text()).toContain('排队二——这一条的正文很长');
+
+    // 服务端快照前移：`s1` 被投递掉 ⇒ 所有编号 -1，编号 4 现在指向 `f3`「排队三」
+    store.applyQueueSnapshot({
+      steering: [{ id: 's2', content: '转向二' }],
+      follow_up: [
+        { id: 'f1', content: '排队一' },
+        { id: 'f2', content: '排队二——这一条的正文很长，收起时必须被截掉' },
+        { id: 'f3', content: '排队三' },
+        { id: 'f4', content: '排队四' },
+      ],
+    });
+    await flushPromises();
+    // 展开的还是 `f2` 本人（现在是编号 3），**不是**挪到编号 4 的 `f3`
+    const full = wrapper.get('[data-test="queued-row-full"]');
+    expect(full.text()).toContain('排队二——这一条的正文很长');
+    expect(full.text()).not.toContain('排队三');
+    // `aria-expanded` 也跟着身份走：编号 3 是 true，编号 4 是 false
+    expect(wrapper.get('[data-test="queued-index"][data-index="3"]').attributes('aria-expanded')).toBe('true');
+    expect(wrapper.get('[data-test="queued-index"][data-index="4"]').attributes('aria-expanded')).toBe('false');
+
+    // 被展开的那条自己也被投递掉 ⇒ 全文块消失（不留「挪到同编号的另一条」当残影）
+    store.applyQueueSnapshot({
+      steering: [{ id: 's2', content: '转向二' }],
+      follow_up: [{ id: 'f1', content: '排队一' }, { id: 'f3', content: '排队三' }, { id: 'f4', content: '排队四' }],
+    });
+    await flushPromises();
+    expect(wrapper.find('[data-test="queued-row-full"]').exists()).toBe(false);
+  });
+
   it('hover 编号出浮层（绝对定位，不改布局）：含该条全文，移开即收（#816）', async () => {
     const store = useWorkbenchStore();
     const wrapper = setup();

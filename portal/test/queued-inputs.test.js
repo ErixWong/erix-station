@@ -92,8 +92,15 @@ function world(overrides = {}) {
       return { rows: [] };
     }
     // --- 整队取回 ---
+    // 必须与产品 SQL 同步认「过期的 delivering」（`w.staleIds`）：#848 评审 MED 之后取回不再只动
+    // pending —— 认领后崩溃的行若不认过期，就既不投递也取不回，用户只看到「队列里还有 1 条」且没有原因。
     if (/UPDATE queued_inputs SET status = 'recalled'/.test(sql)) {
-      const rows = w.queued.filter((q) => q.session_id === params[0] && q.status === 'pending');
+      // ⚠ 假池必须**照着 SQL 字面**决定认不认过期行，否则这条用例只能证明假池自己一致：
+      // 产品 SQL 里没有 `claimed_at < now()` 这一段 ⇒ 这里也只取 pending（变异才会红）。
+      const staleAware = /claimed_at < now\(\)/.test(sql);
+      const rows = w.queued.filter((q) => q.session_id === params[0]
+        && (q.status === 'pending'
+          || (staleAware && q.status === 'delivering' && w.staleIds?.has(q.id))));
       for (const q of rows) q.status = 'recalled';
       return { rows: rows.map((q) => ({ id: q.id, kind: q.kind, content: q.content })) };
     }
@@ -266,6 +273,21 @@ test('#370 整队取回：pending → recalled（不硬删），delivering 不�
   assert.deepEqual(out, { steering: ['前排'], follow_up: ['后排'] });
   assert.equal(w.queued.find((q) => q.id === 'c').status, 'delivering', '已经在建 run 的话不许吐回输入框');
   assert.equal(w.queued.find((q) => q.id === 'a').status, 'recalled');
+});
+
+test('#848 评审 MED：认领过期（delivering 但 claimed_at 已超时）的行**必须能取回**，未过期的仍不动', async () => {
+  const w = world();
+  w.queued.push(
+    { id: 'a', session_id: SID, kind: 'steer', content: '正常待发', attachments: [], position: 0, status: 'pending' },
+    { id: 'b', session_id: SID, kind: 'follow_up', content: '认领后崩了', attachments: [], position: 1, status: 'delivering' },
+    { id: 'c', session_id: SID, kind: 'follow_up', content: '正在建 run', attachments: [], position: 2, status: 'delivering' },
+  );
+  w.staleIds = new Set(['b']); // 只有 b 的认领过期（c 是正常在飞的投递）
+  const out = await recallQueuedInputs(w.pool, { userId: 'u1', sessionId: SID, deps: w.deps });
+  assert.deepEqual(out, { steering: ['正常待发'], follow_up: ['认领后崩了'] },
+    '过期那行要能被取回（否则它永远停在 delivering：不投递、取不回、还算在上限里）');
+  assert.equal(w.queued.find((q) => q.id === 'b').status, 'recalled');
+  assert.equal(w.queued.find((q) => q.id === 'c').status, 'delivering', '未过期的投递不许被吐回输入框');
 });
 
 // ---------------------------------------------------------------------------

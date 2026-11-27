@@ -186,6 +186,12 @@ export async function enqueueQueuedInput(pool, {
  * 整队取回（`DELETE /api/sessions/:id/queued-inputs` = pi `clear_queue`）：`pending` → `recalled`
  * （**不硬删**，留一行给人查「他说过什么没发出去」），返回文本数组（steering 在前）。
  * 已在 `delivering` 的**不动**——它已经变成一条正在建的 run，此时清它等于把已发出的话再吐回输入框。
+ *
+ * ⚠ **但「认领过期」的 `delivering` 必须能取回**（#848 评审 MED）：认领与建 run 跨两次提交，
+ * 中间崩一次那行就停在 `delivering` —— 既不投递（`drainQueuedInputs` 的 CAS 只认 pending 或过期行，
+ * 而重认领只在**下一次 run 终态**才发生）、也取不回（本函数原来只动 pending）、还算在上限里。
+ * 没有后续 run 时用户看到的就是「队列里还有 1 条」且**没有任何原因**，这正是本单要消灭的那类
+ * 「消息蒸发」。判据与 `CLAIMABLE` 同一个尺（`CLAIM_STALE_MS`），不另造一个时间常量。
  */
 export async function recallQueuedInputs(pool, { userId, sessionId, deps = {} }) {
   const client = await pool.connect();
@@ -193,11 +199,14 @@ export async function recallQueuedInputs(pool, { userId, sessionId, deps = {} })
   try {
     await client.query('BEGIN');
     const s = await fetchSession(client, sessionId, userId, { forUpdate: true });
+    const staleSeconds = Math.max(1, Math.round(CLAIM_STALE_MS / 1000));
     const upd = await client.query(
       `UPDATE queued_inputs SET status = 'recalled'
-        WHERE session_id = $1 AND status = 'pending'
+        WHERE session_id = $1
+          AND (status = 'pending'
+               OR (status = 'delivering' AND claimed_at < now() - make_interval(secs => $2::int)))
         RETURNING id, kind, content`,
-      [s.id],
+      [s.id, staleSeconds],
     );
     rows = upd.rows;
     await client.query('COMMIT');
