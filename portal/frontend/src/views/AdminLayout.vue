@@ -224,7 +224,10 @@ function skipToMain(): void {
   const el = mainEl.value;
   if (!el) return;
   el.focus();
-  el.scrollIntoView({ block: 'start' });
+  // ⚠ **可选调用**（同 `WorkbenchView.vue` 的写法）：jsdom 不实现 `scrollIntoView`，直接点它
+  //   会抛**未捕获异常** ⇒ 整条 `npm test` 退出 1（用例全 pass 也算红，实测 22 passed + rc=1）。
+  //   聚焦才是本页的承重判据，滚动只是锦上添花：缺了 API 顶多少滚一下，不该让流程崩。
+  el.scrollIntoView?.({ block: 'start' });
 }
 
 // ---- 图标轨（§①）--------------------------------------------------------------------
