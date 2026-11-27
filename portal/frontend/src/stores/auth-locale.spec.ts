@@ -262,6 +262,29 @@ describe('#828 pendingLocaleWrite 账号归属与登出/失效清理', () => {
     expect(auth.pendingLocaleWrite).toBeNull(); // 仍然 null
   });
 
+  it('#902 评审 · 有 pending 但会话中途没了 ⇒ 不发 PATCH、也**不丢**这次选择（防御分支）', async () => {
+    // `flushPendingLocale` 里 `if (!this.user) return` 这条防御分支此前没有测试（评审指出）。
+    // 它的正确语义是「留着待发」而不是「丢掉」：记 pending 时确实有个真人（BOB），只是这一回合
+    // 会话探测还没回来 / 刚被清；这时替一个不存在的账号发 PATCH 会刷 401，而直接丢弃又会把用户
+    // 刚做的选择弄丢。所以两条都不许：零请求 + pending 原样留着，等下一次真拿到 user 再补。
+    const auth = useAuthStore();
+    auth.user = null;
+    auth.pendingLocaleWrite = { login: 'bob', locale: 'en' };
+    const fetchFn = fetchMock(() => json(200, {}));
+    vi.stubGlobal('fetch', fetchFn);
+    await auth.flushPendingLocale();
+    await flushPromises();
+    const urls = fetchFn.mock.calls.map((c) => (typeof c[0] === 'string' ? c[0] : ''));
+    expect(urls.filter((u) => u === '/api/me/locale')).toHaveLength(0);
+    expect(auth.pendingLocaleWrite).toEqual({ login: 'bob', locale: 'en' }); // 没丢
+    auth.user = { ...BOB }; // 会话又回来了（同一个人）
+    await auth.flushPendingLocale();
+    await flushPromises();
+    const urls2 = fetchFn.mock.calls.map((c) => (typeof c[0] === 'string' ? c[0] : ''));
+    expect(urls2.filter((u) => u === '/api/me/locale')).toHaveLength(1); // 补上了这一枪
+    expect(auth.pendingLocaleWrite).toBeNull();
+  });
+
   it('会话就绪后延迟补发 flushPendingLocale 失败 ⇒ 发了 PATCH 但 localeSyncFailed=true、pending 已清', async () => {
     // 前置：有会话时记下的选择（#902 ②：归属=当前登录人的真实 login，不再是无主哨兵）。
     const auth = useAuthStore();
