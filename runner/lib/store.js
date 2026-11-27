@@ -13,7 +13,8 @@
 //
 // 方法 → IPC method → internal 端点（§9.1 映射表）：
 //   appendRound          → PUT /transcript/:key/rounds/:round        （session，P2 新增）
-//   load                 → GET /transcript/:key                      （session，P2 新增）
+//   load                 → GET /transcript/:key                      （session，P2 新增；agentd 分页拉齐全量后**本层折叠**）
+//   loadRawRows          → GET /transcript/:key                      （session，#501；**与 load 同一支** agentd 分页读，不折叠）
 //   recall               → GET /runs/:id/transcript/recall          （U7 legacy，保持 run 作用域不动）
 //   markRunState         → PUT /runs/:id/state（'running'，真 runId） （U2）
 //                          → PUT /transcript/:key/runstate {state}（状态通道，session）
@@ -102,6 +103,27 @@ export function makeStore(key, { request, runId }) {
       // 折在全量拉齐之后（agentd `case 'load'` 已把游标翻页聚合成一个数组）；无消息行的账本（≤ 0.22）
       // 由 `foldLedgerRecords` 原样返回**入参本身**，一个字节不改。
       return foldLedgerRecords(records);
+    },
+    /**
+     * issue #501：与 `load()` 共用 peer（= portal internal 端点）的同一条读路径，只是**不过
+     * `foldLedgerRecords`**——返回 `load()` 会喂给折叠的那同一批原始行（折叠前）。
+     * 上游 #714/#765（`host-consumer-contract.md`）：`foldMessageRows(await loadRawRows(r))` 必须逐字
+     * 等于 `await load(r)`，所以这里不复制第二份读路径、也不在此折叠。
+     * ⚠ **本方法的调用者是 resume，不是预写**（#501 返修时现验）：引擎在恢复中途挂起的 `tool_use` 时，
+     *   用这根探针在**落盘行**上找 `partOf` 锚点（`erix-agent/src/loop/resume-manager.js:889-892`），
+     *   缺它就退回 `load()` 的折叠行（= 修前口径：只修内存 + `resume_journal_skipped`）。
+     *   预写那半条（`appendUserTurn` 结清悬空 `tool_use`，`append-user-turn.js:310-313`）跑在 **portal 进程内**
+     *   （`portal/src/sessions.js` 用 `createSessionTranscriptStore`），runner 侧零调用：
+     *   `grep -rn appendUserTurn runner --include=*.js` 只命中注释。
+     * ⚠ 「未知 runId」**不是**空数组：portal 对不存在的 session 抛 `404 session_not_found`
+     *   （`portal/src/internal.js` 的 `fetchSession`），本方法返回 `[]` 只覆盖「响应成功但没带 `records` 数组」那一种。
+     * ⚠ 但「缺它」必须是**真的没这根探针**：本方法存在 ⇒ 请求会一路打到 agentd，那边少了 case 就是
+     *   `default` 抛（比缺席更糟）——路由与白名单的一致性由 `runner/test/agentd-store-route.test.js` 钉。
+     * agentd 侧也与 `load` 共用同一条分页读：`runner/agentd.js#fetchAllTranscriptRecords`（#501 返修）。
+     */
+    async loadRawRows(r) {
+      const res = await requestWithRetry('loadRawRows', { runId: r });
+      return Array.isArray(res?.records) ? res.records : [];
     },
     async recall(r, fromRound, toRound, pattern) {
       const res = await requestWithRetry('recall', { runId: r, fromRound, toRound, pattern });

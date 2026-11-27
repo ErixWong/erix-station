@@ -85,6 +85,8 @@ export const MSG = {
 export const STORE_METHODS = new Set([
   'appendRound',
   'load',
+  // issue #501：runner 侧的调用者 = 引擎 **resume** 的锚点探针（`resume-manager.js:889-892`，在落盘行上找 `partOf` 首片行）；与 `load` 同源、不折叠。
+  'loadRawRows',
   'markRunState',
   'saveRunState',
   'loadRunState',

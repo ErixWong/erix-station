@@ -45,6 +45,36 @@ async function readStoredRecord(client, key, dedupKey) {
 }
 
 /**
+ * `load()` 与 `loadRawRows()` **共用的那一条 SELECT + 同一份行→record 映射**（issue #501 抽出的单一真相源）。
+ *
+ * 返回**折叠前**的原始行记录数组（round/dedup_key 以权威列合成进 record），按 `round, append_seq` 追加序。
+ * 之所以只留一份：`load()` 与 `loadRawRows()` 必须「看到同一本账」——复制第二份 SQL 迟早会漂，一漂就成
+ * 「探针看到的账本 ≠ `load()` 看到的账本」，上游 #714/#765 的
+ * `foldMessageRows(await loadRawRows(key))` 逐字等于 `await load(key)` 契约当场失效。
+ * 本 helper **不过 `planFold`**：折叠留给调用方（`load()` 折、`loadRawRows()` 原样返回折叠前的行）。
+ */
+async function readRoundRows(client, key) {
+  const res = await client.query(
+    // 0.16.0 契约（host-upgrade-guide §1 same-round ordering）：同 round 多行必须按持久化
+    // 追加序返回，引擎不再二次排序 → 用 append_seq（迁移 0016，恒非空），不再依赖 created_at。
+    `SELECT round, dedup_key, record
+       FROM transcript_rounds
+      WHERE transcript_key = $1
+      ORDER BY round, append_seq`,
+    [key],
+  );
+  return (res.rows ?? []).map((row) => {
+    const base = row.record && typeof row.record === 'object' ? row.record : {};
+    return {
+      ...base,
+      round: Number(row.round),
+      // appendUserTurn 幂等判据读 dedupKey ?? roundKey；列缺失时回退 record 内字段。
+      dedupKey: row.dedup_key ?? base.dedupKey ?? base.roundKey ?? null,
+    };
+  });
+}
+
+/**
  * 事务绑定的 session transcript store（引擎 load/appendRound 两方法契约
  * + 0.17.0 成对可选快路径探针 loadByDedupKey/loadMaxRound）。
  * @param {import('pg').PoolClient} client 调用方事务内的 PoolClient（禁止换成 pool 自身，否则脱离事务）
@@ -63,26 +93,23 @@ export function createSessionTranscriptStore(client) {
      *      判不通过，折叠之后仍作为独立记录留在数组里（`portal/test/transcript-store.test.js` 钉着）。
      *  `loadMaxRound` 同样不折（成对探针只认原始行）。 */
     async load(key) {
-      const res = await client.query(
-        // 0.16.0 契约（host-upgrade-guide §1 same-round ordering）：同 round 多行必须按持久化
-        // 追加序返回，引擎不再二次排序 → 用 append_seq（迁移 0016，恒非空），不再依赖 created_at。
-        `SELECT round, dedup_key, record
-           FROM transcript_rounds
-          WHERE transcript_key = $1
-          ORDER BY round, append_seq`,
-        [key],
-      );
-      const records = (res.rows ?? []).map((row) => {
-        const base = row.record && typeof row.record === 'object' ? row.record : {};
-        return {
-          ...base,
-          round: Number(row.round),
-          // appendUserTurn 幂等判据读 dedupKey ?? roundKey；列缺失时回退 record 内字段。
-          dedupKey: row.dedup_key ?? base.dedupKey ?? base.roundKey ?? null,
-        };
-      });
-      // 单一真相源：与展示面 / runner 镜像同一份 `planFold`（口径漂移会同时被三处用例抓到）
-      return foldLedgerRecords(records);
+      // 单一真相源：与 `loadRawRows` 共用同一条 SELECT + 同一份行→record 映射（`readRoundRows`，#501），
+      // 再折叠（与展示面 / runner 镜像同一份 `planFold`，口径漂移会同时被三处用例抓到）。
+      return foldLedgerRecords(await readRoundRows(client, key));
+    },
+    /**
+     * 可选原始行锚点探针（issue #501 / erix-agent #714；0.33.0 #765 起是 `appendUserTurn` 快路径
+     * **结清账本悬空 `tool_use` 的唯一账本来源**，全程不再回头调 `load`）：
+     *   · 返回 `load()` 读到的**那些行、折叠前**的形状（含宿主自己的 `:input:` 行与每个引擎 message 行——
+     *     按 kind 过滤或只回 round carriers 会隐藏决定行，上游 helper 会 refuse）；
+     *   · 与 `load()` 共用同一条 SELECT + 同一份映射（`readRoundRows`），故
+     *     `foldLedgerRecords(await loadRawRows(key))` 与 `await load(key)` **逐字同源**；
+     *   · 未知 key ⇒ 空数组（无行）；**不新增错误码 / 事件类型**。
+     * 缺这根探针时，引擎在 `appendUserTurn` 的 **MISS 分支**（点查命中 HIT 会提前返回、不探针）报 `unsettledToolUses.reason = 'ledger_probe_absent'`，
+     * 本站补上即自愈（读侧静默，不 emit `persistence_capability_degraded`）。
+     */
+    async loadRawRows(key) {
+      return readRoundRows(client, key);
     },
     /**
      * 追加一轮：会话预写行恒为 run_id=NULL / folded=false / folded_payload=NULL（同 PR②a 形态）。

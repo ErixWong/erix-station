@@ -21,6 +21,11 @@ import {
   payloadFingerprint, samePayload, dedupPayloadConflict, transcriptRecordKey,
 } from '../../portal/src/transcript-payload.js';
 import { STORE_METHODS } from '../lib/ipc.js';
+// issue #501：必需方法清单 / #640 退役清单 / legacy 清单 / 能力申报全部搬到
+// `./store-contract-surface.js`（唯一一份），`agentd-store-route.test.js` 的 #501 判据 2/3 复用同一份。
+import {
+  UPSTREAM_CONTRACT_METHODS, RETIRED_STORE_METHODS, DECLARED_OPTIONAL_CAPABILITIES,
+} from './store-contract-surface.js';
 
 /** 内存 IPC peer 桩：模拟 agentd → portal internal 端点的 store 语义。 */
 function createFakeAgentdPeer() {
@@ -69,7 +74,10 @@ function createFakeAgentdPeer() {
           transcripts.set(runId, list);
           return { inserted: true };
         }
-        case 'load': {
+        // issue #501：peer = portal internal 端点，本就不折叠（折叠是 `makeStore.load` 的职责），
+        // 故 `loadRawRows` 与 `load` 在桩里**同源**（同一批原始行、同一排序）；两 case 直接穿透。
+        case 'load':
+        case 'loadRawRows': {
           const list = transcripts.get(runId) ?? [];
           // 同 round 按追加序（数组序，稳定排序）；引擎不再二次排序（0.16.0 契约）。
           const records = list
@@ -156,11 +164,7 @@ function createFakeAgentdPeer() {
 }
 
 test('STORE_METHODS：必需/可选契约与 status 读接口在 IPC 白名单内；recall 为 legacy 兼容项；快照两面已退役', async () => {
-  const upstreamContract = [
-    'appendRound', 'load',
-    'saveRunState', 'loadRunState', 'markRunState',
-    'loadRunStateStatus',
-  ];
+  const upstreamContract = UPSTREAM_CONTRACT_METHODS;
   for (const m of upstreamContract) {
     assert.ok(STORE_METHODS.has(m), `STORE_METHODS 缺 ${m}`);
   }
@@ -175,7 +179,7 @@ test('STORE_METHODS：必需/可选契约与 status 读接口在 IPC 白名单�
   // **反向自证（issue #640）**：快照本体也已退役——不是「换了个名字」，而是整条竖切（IPC 白名单 /
   // agentd 路由 / portal 端点 / 快照表）都没了。名字一旦回来（引擎回退或有人
   // 「顺手补上」），本用例会红，而不是默默多一个没人调的方法。
-  for (const retired of ['saveRunSnapshot', 'loadLatestRunSnapshot']) {
+  for (const retired of RETIRED_STORE_METHODS) {
     assert.equal(typeof store[retired], 'undefined', `快照方法 ${retired} 已随 #640 退役，不得再现`);
     assert.equal(STORE_METHODS.has(retired), false, `IPC 白名单不得再包 ${retired}`);
   }
@@ -185,12 +189,17 @@ test('STORE_METHODS：必需/可选契约与 status 读接口在 IPC 白名单�
 });
 
 // 上游契约套件（transcriptStoreContract 会注册多个 node:test 用例）。
-// 第三个参数是**诚实申报**（erix-agent 0.30.0 上游 #739 把「可选」做实，#499 升级片把本站的申报补齐）：
+// 第三个参数是**诚实申报**（erix-agent 0.30.0 上游 #739 把「可选」做实，#499 升级片把本站的申报补齐；
+// 名单自 #501 起住在 `./store-contract-surface.js` 的 `DECLARED_OPTIONAL_CAPABILITIES`，
+// 与 `agentd-store-route.test.js` 的 #501 判据 3 共用一份 ⇒ 只改一边必红）：
 //   · `runState`（`saveRunState` + `loadRunState` + `markRunState`）、`runStateStatus`（`loadRunStateStatus`）
 //     ——本站这两组**真实现**（`runner/lib/store.js` + peer 桩后的 portal internal 端点），所以申报出来：
 //     实现被删时套件当场红，而不是被成对守卫当「宿主本来就没选这个能力」静默跳过；
-//   · `rawRows`（`loadRawRows`）与 `fastPathProbes`（`loadByDedupKey` + `loadMaxRound`）**本站没有**
-//     ⇒ 一个都不报（报半组会被「声明了却没整组实现」当场判红，见 #501：补上 `loadRawRows` 那天再加）。
+//   · `rawRows`（`loadRawRows`）**本站已有**（#501：portal `createSessionTranscriptStore` 与
+//     `runner/lib/store.js` 都补了这根探针，且与 `load()` 共用**同一条读路径** ⇒ `foldMessageRows(loadRawRows(id))`
+//     逐字等于 `load(id)`）⇒ **整组报出来**（报半组会被「声明了却没整组实现」当场判红）；
+//   · `fastPathProbes`（`loadByDedupKey` + `loadMaxRound`）仍**本站没有** ⇒ 不报（点查探针跑在 portal
+//     POST 事务内，不经这条 IPC 契约面）。
 //
 // ⚠ **erix-agent 0.33.0（issue #838 S2，本站 #530）：`runSnapshot` 这个能力名已从上游名单里删除**
 //   （现查 0.33.0：`test/contract/transcript-store.js` 里 `runSnapshot` **0 命中**；`OPTIONAL_CAPABILITIES`
@@ -201,7 +210,7 @@ test('STORE_METHODS：必需/可选契约与 status 读接口在 IPC 白名单�
 transcriptStoreContract('station-ipc-store', async () => {
   const peer = createFakeAgentdPeer();
   return makeStore('contract-run', { request: (method, args) => peer.handle(method, args) });
-}, { optionalCapabilities: ['runState', 'runStateStatus'] });
+}, { optionalCapabilities: DECLARED_OPTIONAL_CAPABILITIES });
 
 test('station-ipc-store：agentd 写入失败向上抛（IPC error 透传，fail-closed 语义）', async () => {
   const peer = createFakeAgentdPeer();
