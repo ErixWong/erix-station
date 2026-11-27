@@ -292,7 +292,7 @@ needs-human  判据本身无法判定（需要人裁决）
 | 形态 | 例 |
 |---|---|
 | 提交/引用 | `sha=3ae9129`、`refs/heads/main@abc123` |
-| 位置 | `runner/lib/agents-md.js:223`、`docs/ops/x.md §17` |
+| 位置 | `runner/lib/agents-md.js:223`、`docs/design/runner-integration.md §17.1`（原本写的是 `docs/ops/x.md §17`——没替换的占位符，该文档从未落地；261127 现验换成真实坐标，issue #777） |
 | 执行 | `run id`、`exit code`、`not ok 7 - <用例名>` |
 | 外部 | 完整 URL（含 commit/comment id，不是「那个页面」） |
 
