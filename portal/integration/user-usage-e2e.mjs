@@ -47,6 +47,7 @@ import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { credsFileCandidates, defaultScriptLogin } from './lib/dev-creds.mjs';
 
 // admin host 是自签证书；只在这个测试进程里关掉校验。
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -61,7 +62,7 @@ const BASE = (process.env.E2E_BASE || process.env.E2E_UI_BASE || 'https://admin.
   .replace(/\/$/, '');
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
 /** 用户面主角：一个有 active litellm binding 的 dev FDE（有 `fde_name`，能看到自己的账）。 */
-const FDE_LOGIN = process.env.E2E_FDE_LOGIN || 'agent01';
+const FDE_LOGIN = process.env.E2E_FDE_LOGIN || defaultScriptLogin();
 /** 越权面「别人」的取值：参数会被服务端忽略，取一个明确不是主角的名字即可。 */
 const OTHER_FDE = process.env.E2E_OTHER_FDE || 'someone-else-zzz';
 const QUOTA_PATH = '/api/me/llm-quota';
@@ -81,10 +82,10 @@ function credFiles(envVar, names) {
 }
 /** FDE（脚本账号）口令：任务指定的文件，env 可覆盖。 */
 const FDE_PASSWORD_FILES = credFiles('E2E_FDE_PASSWORD_FILE',
-  ['~/.config/mcp/creds/station-agent01.password', '~/.config/creds/station-agent01-password-file']);
+  credsFileCandidates('script'));
 /** admin 口令：与 llm-usage-e2e 同一份 dev 口令文件。 */
 const ADMIN_PASSWORD_FILES = credFiles('ADMIN_PASSWORD_FILE',
-  ['~/.config/mcp/creds/station-dev.password', '~/.config/creds/station-dev-password-file']);
+  credsFileCandidates('admin'));
 const FDE_PASSWORD_FILE = FDE_PASSWORD_FILES.join(' 或 ');
 const ADMIN_PASSWORD_FILE = ADMIN_PASSWORD_FILES.join(' 或 ');
 

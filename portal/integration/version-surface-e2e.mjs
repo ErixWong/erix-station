@@ -51,6 +51,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { credsFileCandidates } from './lib/dev-creds.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -63,7 +64,7 @@ const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
 // 凭据目录口径（AGENTS §4）：~/.config/ 下 mcp/creds/；env 点名只信 env
 const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
   ? [process.env.ADMIN_PASSWORD_FILE]
-  : ['~/.config/mcp/creds/station-dev.password', '~/.config/creds/station-dev-password-file'])
+  : credsFileCandidates('admin'))
   .map((p) => p.replace(/^~/, os.homedir()));
 /** 报错文案用：缺口令时列出试过的路径（新前旧后）。 */
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
