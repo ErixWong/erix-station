@@ -302,8 +302,8 @@ async function gather() {
       const code = fl.json?.error?.code;
       // 判据（照 `portal/src/http.js` 登录流的真实 wire 形状；**别照抄被截断过的日志**——本单先写成
       // `invalid_cred` 没命中，真码是 `invalid_credentials`，是变异自己抓到的）：
-      //  · 二因素/步出：响应体**顶层**的 `status ∈ {email_code_required, totp_required,
-      //    second_factor_choice}`，或带 `pending_token`（HTTP 都是 200）。
+      //  · 二因素/步出：**HTTP 200** 且响应体顶层 `status ∈ {email_code_required, totp_required,
+      //    second_factor_choice}`，或顶层带 `pending_token`。边界要写进判据，不能只写在注释里。
       //  · 强制改密：`password_change_required` 是**成功响应的顶层布尔**，不是二因素、也不是错误码。
       //    带着它的是**受限会话**：拿它去验授权隔离，收到的 403 可能只是「先去改密码」⇒ 那是假过，
       //    所以这条腿不测，但**显式记名**（不静默混进「环境形状」那一大堆）。
@@ -313,7 +313,12 @@ async function gather() {
       //  · 其余一律判红：500、503 `kdf_busy`（容量/可用性信号，要测可用性就不该被洗绿）、
       //    400 `validation_failed`、413（我们自己的请求形状错了），以及「200 却没有会话 cookie」。
       const stepUpStatuses = ['email_code_required', 'totp_required', 'second_factor_choice'];
-      const secondFactor = !!fl.json?.pending_token || stepUpStatuses.includes(fl.json?.status);
+      // 二因素信号**只在 HTTP 200 上成立**（`portal/src/http.js` 的步出响应都是 200 + 顶层字段）。
+      // 不绑这个边界，「500 带 pending_token」就会被当二因素洗成 skip——注释说 200 而判据不守，等于假绿。
+      // 注意读的是响应体**顶层**的 `pending_token`：登录发码失败（503 `email_send_failed`）那枚 token 在
+      // `error.details` 里，不该被这里当二因素（它由 503 配对规则处理）。
+      const secondFactor = fl.status === 200
+        && (!!fl.json?.pending_token || stepUpStatuses.includes(fl.json?.status));
       const restricted = fl.json?.password_change_required === true;
       const envShape = (st, cd) => st === 401 || st === 429
         || (st === 409 && cd === 'email_not_registered')
