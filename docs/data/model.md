@@ -264,6 +264,81 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 ### 1.13 `tool_calls` / `judge_decisions` / `approvals` / `artifacts`
 
 - `tool_calls`：`call_id` 对应事件流的 `tool_call_id`（portal.md §5.3），`UNIQUE(run_id, call_id)`；**`call_id` 是外部 ID（canonical，见 §1.19），`tool_calls.id` 仅内部主键（uuid）、不外露**；`result_digest` 只存摘要（完整结果可能很大）；`approved` 三态（`NULL` = 未涉及审批）。**行由 portal 在 U3 事件上报时幂等 upsert**（`type='tool_use'` 事件 `INSERT ... ON CONFLICT (run_id, call_id) DO NOTHING`，后续 `tool_result`/`tool_call_delta` 更新派生字段，portal.md §9.10）——U10 建审批单时行必已存在。
+  - **`duration_ms` 列（#303 后）**：该列仍由 U3 的 `tool_result` UPDATE 回填（写侧未变），但**自 #303（erix-agent 0.34.0 后旧键 `duration` 退役）起不再被读进对话流 DTO 的 `toolCalls[].durationMs`**——后者现在只来自引擎投影的 `erix.durationMs`（旧「投影缺省 ⇒ 回落宿主 `tool_calls.duration_ms`」支路已删，见 portal.md §5.3）。此列的旧回落曾是它在视图层的**唯一**读点；#303 删后，产品代码里已无消费此列做展示的路径（写侧仍保留：U3 照旧回填，与 `run_events` 的 `tool_result` 事件一起作为历史/审计的时长存档）。
+  - **跨实例风险（#303）**：删的是「读旧数据」的兼容——**存量比本次发布老的实例升级后**，那些老对话（引擎当年没写 `erix.*`、只有顶层 `duration` 或宿主 `tool_calls.duration_ms`）的工具耗时会渲染为「未知」（前端现有 `dur` 为空时不显示，**不是报错**）。⚠ 这只说 **DTO 面**：**事件回放是另一条来路**——`run_events` 里 `tool_result` 的 payload 存着当年的 `duration_ms`，历史接口按白名单（`portal/src/http.js` 含 `tool_result`）取出 payload、经 `truncateHistoryPayload` 后返回（数值字段不受字符串截断影响），前端把历史页喂进同一个 dispatch、**只在找到对应卡片时**回填 ⇒ 别说成「老对话一律显示未知」。准确说法：**当前已加载且能关联到卡片**的历史 `tool_result` 与 DTO 投影**都没有有限时长**时，那张卡片就**不显示时长**（前端不渲染「未知」字样，是没渲染这一格，见 `StreamPanel.vue`；历史分页默认 500／上限 2000，没加载到的页自然给不出）。
+  - **存量核对（一条可复跑语句，勿把某机实测数字当结论）**：工具结果块**不在 `record` 顶层**，而在
+    `record -> 'messages'[*] -> 'content'[*]` 里 `type = 'tool_result'` 的块上；耗时键是块内的
+    `erix.durationMs`，旧键是同一块的顶层 `duration`。按路径直查顶层键会得到恒 0 的**假阴性**（实测踩过）。
+    五个计数各自回答一个问题（`tool_results` 是分母，为 0 就说明路径问错了，其余四个数全部别信）：
+    - `tool_results` —— 分母。
+    - `legacy_duration_key` —— 仍带顶层旧键 `duration` 的块数（冗余残留，不等于会改变行为）。
+    - `legacy_only_no_engine` —— **只有**旧键、没有 `erix.durationMs` 的块数：这才是删 runner 那条
+      回退后**唯一可能改变行为**的集合。
+    - `no_engine_duration` —— **投影拿不到时长**的块数（没有 `erix` 对象，或 `erix.durationMs` 不是**能变成有限 JS 数**的数）
+      ⇒ 这些格在 DTO 面上本来就显示「未知」，删回退不改它们的显示。
+    - `no_erix_object` —— 连 `erix` **对象**都没有的块数。⚠ 别只读成「引擎 0.20.0 之前的老形状」：
+      `erix` 是数组、JSON `null` 或标量的块同样落在这里，**形态与年代不是一一对应**。
+      ⚠ 这条 CTE **不按 type 过滤**，所以每一条 `FILTER` 都得自带 `b->>'type' = 'tool_result'`；
+      漏掉就会数到 `text` / `tool_use` 块，得到**比分母还大**的数而**不报错**。
+    - 大小关系是**按构造保证**的：`erix_is_obj` 为假 ⇒ `has_engine_dur` 必为假 ⇒ `no_erix_object ⊆ no_engine_duration`。
+      别把判定改回「直接对 `b->'erix'` 用 `?`」——`?` 对**数组**是「成员存在」，`erix: ["durationMs"]`
+      这种形状会被误判成「有时长」，关系就不成立了。
+      它总是 `≤ no_engine_duration`，两者接近就说明存量里老记录占多数。
+    ```sql
+    WITH blocks AS (
+      SELECT t.run_id, b,
+             -- 把「有没有引擎时长」先算成布尔，且**只在 erix 真是对象时**才认它的键：
+             -- `?` 对数组是「成员存在」，`erix: ["durationMs"]` 这种形状会被当成有时长。
+             -- 两个布尔都必须 COALESCE：`jsonb_typeof(NULL) = 'object'` 结果是 NULL 不是 false，
+             -- 而 `NOT NULL` 仍是 NULL ⇒ FILTER 会不计数（同一个三值坑的第二层）。
+             COALESCE(jsonb_typeof(b->'erix') = 'object', false)  AS erix_is_obj,
+             -- 「有引擎时长」按**投影能显示的东西**算，不按键存在算：`display-projection.js` 只收 只收
+             -- 有限数（`typeof === 'number' && Number.isFinite`）。键存在但值是字符串或 null 的块，
+             -- DTO 面上本来就是「未知」⇒ 按键存在数会**低估**真正缺时长的块数。
+             (COALESCE(jsonb_typeof(b->'erix') = 'object', false)
+               -- 「投影能不能显示」比「JSON 类型是 number」还严：jsonb 能把 1e999 存成 numeric（类型仍是
+               -- number），解到 JS 却是 Infinity，被 display-projection 的 Number.isFinite 拒掉 ⇒ 再比一道量级。
+               -- 用 CASE 而不是 `A AND B`：AND 不保证短路，求值顺序一变，`'true'::numeric` 这类值就当场报错，
+               -- 阈值取 1e308 这个**远大于任何真实时长**的量级：引擎写的是墙钟差并被 `Math.max(0, …)` 夹过，
+               -- 一百年也才 3e12 ms ⇒ 这道闸只在病态大数上收紧，**不是**要逐位复刻 Number.isFinite 的末位边界
+               -- （1.7976931348623157e308 附近那几个可舍入值不会出现在真实数据里）。
+               AND COALESCE(CASE WHEN jsonb_typeof(b->'erix' -> 'durationMs') = 'number'
+                                  THEN ABS((b->'erix' ->> 'durationMs')::numeric) < '1e308'::numeric
+                                  ELSE false END, false))          AS has_engine_dur
+      FROM transcript_rounds t
+      CROSS JOIN LATERAL jsonb_array_elements(
+          CASE WHEN jsonb_typeof(t.record->'messages') = 'array'
+               THEN t.record->'messages' ELSE '[]'::jsonb END) m
+      CROSS JOIN LATERAL jsonb_array_elements(
+          CASE WHEN jsonb_typeof(m->'content') = 'array'
+               THEN m->'content' ELSE '[]'::jsonb END) b
+    )
+    SELECT count(*) FILTER (WHERE b->>'type' = 'tool_result')                  AS tool_results,
+           count(*) FILTER (WHERE b->>'type' = 'tool_result' AND b ? 'duration') AS legacy_duration_key,
+           count(*) FILTER (WHERE b->>'type' = 'tool_result' AND b ? 'duration'
+                                  AND NOT has_engine_dur)                      AS legacy_only_no_engine,
+           count(*) FILTER (WHERE b->>'type' = 'tool_result'
+                                  AND NOT has_engine_dur)                      AS no_engine_duration,
+           count(*) FILTER (WHERE b->>'type' = 'tool_result'
+                                  AND NOT erix_is_obj)                         AS no_erix_object
+    FROM blocks;
+    ```
+    ⚠ **三值逻辑是这条语句最大的坑**：`b->'erix'` 在块里没有 `erix` 键时结果是 SQL `NULL`，
+    `NOT (NULL ? 'durationMs')` 仍是 `NULL`，`FILTER` 直接不计数 ⇒ **恰好漏掉最老的形态**
+    （连 `erix` 都没有的老块）。判定要写成 `NOT COALESCE(..., false)`，且只在 `erix` 是对象时取键；
+    漏掉时计数会**小一个量级而不报错**——所以先看分母，再看两个计数是否满足上面那条包含关系。
+    ⚠ 别把 `run_id` 当 DTO 的准入闸：`getSession` 是**按 `transcript_key` 取 transcript 行**的（
+    `portal/src/sessions.js` 里那条 `WHERE transcript_key = $1`）；视图层把**符合归属条件**的轮次——
+    该会话只有一个 run 且这一轮还没归属——认给那个 run（`portal/src/session-view.js` 的 `soleRunId`
+    一支）⇒ **`run_id IS NULL` 的块也可能进 DTO**。所以「块数很多」不等于「用户会看到变化」，但按
+    `run_id` 关联 `runs` 筛出来的也**不是全部影响面**。
+    要判**本次删掉的宿主回落**的影响：它的键是「宿主 `tool_calls` 行的 `run_id` ＋ NUL ＋ `call_id`」，
+    而查表用的是 **DTO 上的 runId**（即上面归属之后的那个 run）⇒「这格原来显示过数字」= 「块的
+    `tool_call_id` 能在**那个 run** 的 `tool_calls` 里找到同名行，且该行 `duration_ms` 非空」。
+    ⚠ 别写成「`run_id IS NULL` 的块本来供不到」：归属之后它照样能被命中，界线是 **call_id 能否匹配**，
+    不是 transcript 行自己那个 `run_id`。
+    - `tool_calls.duration_ms IS NULL` 的行数只是**观察值**：自 #303 起该列不再被 DTO 读，
+      「本该为 NULL」的结论要靠上面的 `(run_id, call_id)` 关联得出，不能只靠这条全表计数。
 - `judge_decisions`：judge 事件（`kind / action / decision`）的持久化，与 `run_events` 中 `judge` 类型事件同源。
 - `approvals`：**一个工具调用至多一条审批单**（`UNIQUE(run_id, tool_call_id)`，`tool_call_id` 为外部 `call_id`）；`CHECK` 保证 `pending/expired` 与 `decided_at IS NULL` 一致；决定后 runner 轮询继续/终止（portal.md §4.8）。状态机见 §2.3。⚠️ 超时语义已定稿（#10：`pending → expired`，由 portal 打标，topology.md §4-L6）；`tool_call_id` 是否改判 UUID 待 #10 确认。
 - `artifacts`：run 产出的文件登记（issue #64 R1 起为**终态产物 bundle 登记**：`kind='worktree_bundle'`（**历史遗留名**：D8 修订后 bundle 的内容来自**项目目录（worker cwd）**而非 run worktree，值本身是契约不因此改名 ⇒ `portal/src/artifacts.js` 的 `ARTIFACT_KIND`），一 run 一行，`UNIQUE(run_id, kind)`（迁移 0005），重复上传 409 不覆盖）。`path` = portal 持久卷路径（`ERIX_ARTIFACTS_ROOT/<runId>.tar.gz`；原「容器内路径」登记设想由 v1 bundle 语义替代），`size`/`sha`（sha256）描述 bundle 本体，`manifest`（jsonb，迁移 0005）= agentd 生成的包内清单（文件路径/大小/sha256/`truncated` 截断标记），portal 从 tar 内 `manifest.json` 抽出落库。bundle 内容：`diff.patch`（git diff HEAD）+ 新文件快照 + `manifest.json`，上限 20MB（`ERIX_ARTIFACT_MAX_BYTES`）。

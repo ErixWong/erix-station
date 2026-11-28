@@ -10,8 +10,8 @@
 //  B. station 自己的面：
 //     ① **防回装**（#283 的临时闸已撤）：引擎自己写 `erix.durationMs`，宿主不得再包一层计时；
 //     ② 顶层退役名单里的名字**不得再出现**在我们产出的块上；
-//     ③ `loopEventPayload` 的 `duration_ms` 读点：`erix.durationMs` 优先、**顶层 `duration` 只作
-//        旧记录的一代回退**、两者都没有 ⇒ `null`（不是 0）；
+//     ③ `loopEventPayload` 的 `duration_ms` 读点：**只读 `erix.durationMs`**，缺值 ⇒ `null`
+//        （不是 0）。顶层 `duration` 的「一代回退」已在 **#303** 退役（引擎 0.34.0 起旧键不再写）；
 //     ④ 普通结果块上 `executionStatus` **缺席**（guide §7），我们的读法不得依赖「字段在不在」。
 //
 // 隔离约定：桩 provider + 内存 store + 真 `runToolLoop`，零 LLM / DB / 容器 / 网络。
@@ -133,7 +133,7 @@ test('抛异常/返回 Error：引擎给的是真实观测（不是把未知塌�
 });
 
 // ---------------------------------------------------------------------------
-// B③ loopEventPayload 的 duration_ms 读点（新记录 / 旧记录回退 / 两者都缺）
+// B③ loopEventPayload 的 duration_ms 读点（有引擎值 / 只有退役旧键（#303）/ 两者都缺）
 // ---------------------------------------------------------------------------
 
 test('loopEventPayload：erix.durationMs 优先，且两值并存时以引擎命名空间为准', () => {
@@ -148,15 +148,18 @@ test('loopEventPayload：erix.durationMs 优先，且两值并存时以引擎命
   assert.equal(payload.ok, true);
 });
 
-test('loopEventPayload：旧记录回退——只有顶层 duration 时仍要拿得到时长（盘上有 740+ 条这种行）', () => {
+test('#303 退役：只有顶层 duration、无 erix.durationMs ⇒ duration_ms 必为 null（旧键不再被读）', () => {
   const legacy = loopEventPayload({
     type: 'tool_result',
     round: 1,
     // 0.19 及更早落盘的真实形状：erix 里没有 durationMs，时长只在顶层
     toolResult: { type: 'tool_result', tool_use_id: 'old-1', content: 'x', erixRound: 1, duration: 777, success: true },
   });
-  assert.equal(legacy.duration_ms, 777,
-    '删掉 `?? tr.duration` 回退就会红在这里：老记录会退化成「没有时长」');
+  assert.equal(legacy.duration_ms, null,
+    '#303 清账：引擎侧旧键 `duration` 已退役（`tool-fact.js` 把旧键映射到 erix.durationMs、'
+    + '`loop/orchestrator.js` 落盘前 delete 旧键、`loop/run-snapshot-executor.js` 注释明写旧键已退役），'
+    + '顶层 `duration` 不再是耗时来源 ⇒ 只有顶层旧键、无 erix.durationMs 时应为 null。'
+    + '若这条又变红，说明有人把 `?? tr.duration` 回退加回来了（不应）。');
 });
 
 test('loopEventPayload：两者都缺 ⇒ null（禁止写 0），is_error 仍决定 ok', () => {

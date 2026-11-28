@@ -264,8 +264,8 @@ export function buildDelegateContext(engineContext, runId) {
 /**
  * LoopEvent → U3 事件 payload 的映射（§5/§7.3）。
  * issue #283 / #299：`export` 仅为单测可见面（runner/test/tool-result-envelope-contract.test.js
- * 要钉 `duration_ms` 的取值口径：新记录读 `erix.durationMs`、老记录回退顶层 `duration`、
- * 两者都缺⇒ `null`，**绝不伪装成 0**）；worker 自身调用方式不变。
+ * 要钉 `duration_ms` 的取值口径：只读 `erix.durationMs`、缺值 ⇒ `null`（#303 已删顶层 `duration` 回退），
+ * **绝不伪装成 0**）；worker 自身调用方式不变。
  */
 export function loopEventPayload(event, meta = {}) {
   switch (event?.type) {
@@ -314,14 +314,21 @@ export function loopEventPayload(event, meta = {}) {
         //   * 0.20.0 之前这里读顶层 `tr.duration`（那是 0.17/0.18 引擎把 `execution.metadata` 摊平到
         //     顶层的结果，当时 host-upgrade-guide-0.17.0 也是这么要求的）——0.20.0 之后这条读法会
         //     **静默退化成 null**（引擎不报错，只是不写了），本行就是为它改的。
-        //   * `?? tr.duration` 的回退**只为盘上的旧记录保留**：引擎读侧保留一代兼容（指南 §3），
-        //     真机库里 740+ 条旧 `tool_result` 只带顶层 `duration`。⚠ 回退只保一代：引擎已不再写
-        //     顶层，下一轮引擎 minor 就会真的没有这个字段，届时删掉回退项（勿新增顶层读法）。
+        //   * 顶层 `duration` 回退**已在 issue #303 退役**（erix-agent 升到 0.34.0 这个 minor 时清账）。
+        //     退役证据（引擎侧 0.34.0，`node_modules/erix-agent/src/` 现读）：契约映射把旧键 `duration`
+        //     指向 `erix.durationMs`（`tool-fact.js` 的 legacy 映射）；orchestrator 落盘前主动
+        //     `delete existingToolResult.duration`（`loop/orchestrator.js`）；run-snapshot-executor 注释
+        //     明写旧键已退役、顶层 `metadata.duration` 只进 `onToolResult` 钩子入参不进落盘记录；
+        //     投影侧只在 `erix.durationMs` 是有限数时带 `durationMs`，缺失 = 未知不是 0。
+        //     ⇒ 顶层 `duration` 不再是任何记录上的耗时来源，本行**只读 `tr.erix.durationMs`**。
         //   * 缺失 ⇒ `null`（「不知道」不是 0，0.20.0 明确把 `?? 0` 当错口径：guide §2）。
-        //     真执行过的四种形态 0.20.0 都会写值（判据见 .work-orders/probe.md 探针 1）；
-        //     没值的只剩「judge 拦截 / unsafe 重放被中止 / executor 未 settle 就被中止」三种。
-        duration_ms: Number.isFinite(tr.erix?.durationMs) ? tr.erix.durationMs
-          : (Number.isFinite(tr.duration) ? tr.duration : null),
+        //     真执行过的四种形态引擎都会写值；没值的只剩「judge 拦截 / unsafe 重放被中止 /
+        //     executor 未 settle 就被中止」三种。
+        //     存量核对：见 docs/data/model.md §1.13 的那一条查询（工具结果块在
+        //     record -> 'messages'[*] -> 'content'[*] 里，**不在 record 顶层**——按顶层路径直查会得到
+        //     恒 0 的假阴性，本单就是这么先骗了自己一次）。要看的是「只有旧键、没有
+        //     erix.durationMs」的块数：那才是删这条回退后唯一可能改变行为的集合。
+        duration_ms: Number.isFinite(tr.erix?.durationMs) ? tr.erix.durationMs : null,
         ok: tr.is_error !== true,
       };
     }

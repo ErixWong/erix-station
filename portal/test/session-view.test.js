@@ -78,12 +78,10 @@ function transcript(round, dedupKey, record, createdAt, runId = null) {
 }
 
 class SessionViewPool {
-  constructor({ sessionId = SESSION_ID, anchors, transcriptRows, toolCallDurations = [], textualizedRunIds = [] }) {
+  constructor({ sessionId = SESSION_ID, anchors, transcriptRows, textualizedRunIds = [] }) {
     this.sessionId = sessionId;
     this.anchors = anchors;
     this.transcriptRows = transcriptRows;
-    // issue #283：宿主自有 `tool_calls` 的时长行（默认空 = 「库里没时长」，与旧数据同口径）。
-    this.toolCallDurations = toolCallDurations;
     // issue #243：库里带 `textualized_tool_call` 诊断事件的 run_id（默认空 = 没命中）。
     this.textualizedRunIds = textualizedRunIds;
     this.queries = [];
@@ -131,14 +129,12 @@ class SessionViewPool {
     if (sql.includes('FROM runs')) return { rows: [] };
     // issue #283：宿主自有的时长取数面（`getSession` 为 DTO 的 toolCalls[].durationMs 而查）。
     // 不写死行为：按 SQL 里的 `run_id = ANY($1)` 与 `duration_ms IS NOT NULL` 真筛。
+    // #303：DTO 的工具时长只来自引擎投影，`getSession` **不再**为它查自家 `tool_calls`。
+    // 这里不返回空行而是**当场炸**：谁把那条取数加回来（或别的代码路过这里），测试会指名报错，
+    // 而不是静默拿到空集合让断言假绿。
     if (sql.includes('FROM tool_calls')) {
-      assert.ok(sql.includes('run_id = ANY'), 'tool_calls 取数必须按 run 集合限定（不拿全表）');
-      const runIds = new Set(params[0] ?? []);
-      const skipNull = sql.includes('duration_ms IS NOT NULL');
-      return {
-        rows: this.toolCallDurations.filter((row) => runIds.has(row.run_id)
-          && (!skipNull || row.duration_ms !== null)),
-      };
+      throw new Error('#303 已退役：session-view 不该再查 tool_calls 取时长（SQL='
+        + String(sql).replace(/\s+/g, ' ').trim().slice(0, 120) + '）');
     }
     // issue #243：宿主为助手气泡取「哪些 run 有 `textualized_tool_call` 诊断」（同 tool_calls：按 run 集合限定，不拿全表）。
     if (sql.includes('FROM run_events')) {
@@ -1360,13 +1356,15 @@ test('#189 修正：有折叠轮且该 run 有自己的助手正文 → DTO 仍�
 });
 
 // ---------------------------------------------------------------------------
-// issue #283 → #299：对话流 DTO 的 `toolCalls[].durationMs`（**两条来源 + 优先级**）。
+// issue #283 → #299 → #303：对话流 DTO 的 `toolCalls[].durationMs`（**只有一个来源 = 引擎投影**；
+// #299 时期的宿主回落已在 #303 退役，下面的用例都按新契约钉）。
 // erix-agent 0.20.0（#284）起官方投影 `toolCalls[]` **自己就带** `durationMs`/`toolCallKey`
 // （`erix.*` 的投影，见 `src/display/projection.js:167-181`），但 **T1 之前落盘的记录上两者直接
-// 缺省、不被合成** ⇒ 老记录只能靠**宿主**从自家 `tool_calls`（M2 由 U3 的 tool_result UPDATE 回填）
-// 按 `(run_id, call_id)` 回落 join。优先级（#299 定稿）：投影有值 ⇒ 用投影；投影缺省 ⇒ 用宿主；
-// 两者都缺 ⇒ **键不存在**（0.20.0 把「缺失」定义为「不知道」，**绝不写 0**）。
-// 宿主那一笔仍然必须在投影**之后**做——宿主字段不得伪装成引擎给的（#95 红线）。
+// 缺省、不被合成**。#299 定稿时投影缺省可回落**宿主**自家 `tool_calls`（按 `(run_id, call_id)` join）；
+// ** #303 起该回落已退役**（引擎 0.34.0 不再写旧键 `duration`，宿主列不再是 DTO 的时长来源）
+// ⇒ 现在**只有一个来源**：投影带的 `durationMs`；缺省 ⇒ **键不存在**（0.20.0 把「缺失」定义为
+// 「不知道」，**绝不写 0**）。这段处理仍在投影**之后**做，但只剩「非有限脏值剥键」这一件
+// 防御性收尾，不再补任何宿主值（#95 红线：宿主字段不得伪装成引擎给的）。
 // ---------------------------------------------------------------------------
 
 /** 一个 run、一个工具调用（provider call id = 'call-1'）的最小 transcript 现场。 */
@@ -1404,31 +1402,39 @@ const withoutDurationKey = (calls) => calls.map((call) => {
   return rest;
 });
 
-test('issue #283: DTO toolCalls[].durationMs 有值才出现；库里 NULL / 没这一行 ⇒ 键不出现（绝不写 0）', () => {
-  const { anchors, transcriptRows } = toolCallFixture();
-  const project = (toolCallRows) => projectSessionMessages({
-    sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows, toolCallRows,
+test('issue #283/#303：时长只来自引擎投影的 erix.durationMs；投影缺省 ⇒ 键不出现（宿主 tool_calls 行不再参与、绝不写 0）', () => {
+  // 新记录（引擎投影带 erix.durationMs）⇒ DTO 直接带该值，与宿主库无关。
+  const fresh = toolCallFixture(RUN_1, 'call-1', 4321); // erix.durationMs = 4321
+  const withValue = projectSessionMessages({
+    sessionId: SESSION_ID, anchors: fresh.anchors, userAnchors: [], transcriptRows: fresh.transcriptRows,
   })[0];
+  assert.equal(withValue.toolCalls[0].durationMs, 4321,
+    '新记录：引擎投影带 erix.durationMs ⇒ DTO 直接带该值（时长只此一份来源）');
 
-  const withValue = project([{ run_id: RUN_1, call_id: 'call-1', duration_ms: 4321 }]);
-  assert.equal(withValue.toolCalls[0].durationMs, 4321, '② 投影缺省（老记录）⇒ 回落宿主值，不退化成无时长');
-
+  // 老记录（无 erix ⇒ 投影直接缺省）⇒ 键不出现，无论宿主 tool_calls 行有没有值都不参与（#303）。
+  const legacy = toolCallFixture(RUN_1, 'call-1');
+  const project = (toolCallRows) => projectSessionMessages({
+    sessionId: SESSION_ID, anchors: legacy.anchors, userAnchors: [], transcriptRows: legacy.transcriptRows, toolCallRows,
+  })[0];
   const noRows = project(undefined);
-  assert.equal('durationMs' in noRows.toolCalls[0], false, '不传 toolCallRows ⇒ 与旧 DTO 逐字相同');
+  assert.equal('durationMs' in noRows.toolCalls[0], false, '投影缺省 ⇒ 键不出现');
   for (const rows of [
+    undefined,
     [],
+    [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 4321 }], // 宿主有值也不再参与
     [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }],
     [{ run_id: RUN_1, call_id: 'other-call', duration_ms: 4321 }],
   ]) {
     const dto = project(rows);
     assert.equal('durationMs' in dto.toolCalls[0], false,
-      `无时长（旧数据 NULL / 无匹配行）⇒ 不出现该键，实际=${JSON.stringify(dto.toolCalls[0])}`);
+      `#303：投影缺省时宿主值不再参与 ⇒ 键不出现，实际=${JSON.stringify(dto.toolCalls[0])}`);
+    assert.notEqual(dto.toolCalls[0].durationMs, 0, '把未知塌成 0 = #283 的「恒显 0s」复发');
     assert.deepEqual(withoutDurationKey(dto.toolCalls), noRows.toolCalls,
-      '除宿主新增键外，引擎投影字段一字不变');
+      '除投影自带的 durationMs 外，引擎投影字段一字不变');
   }
 });
 
-test('issue #283/#299：join 点在引擎投影**之后**——老记录上引擎形状不带时长，宿主也不去改引擎对象', () => {
+test('issue #283/#299/#303：时长只来自引擎投影——宿主 join 已退役，也不再就地改引擎对象', () => {
   const { transcriptRows } = toolCallFixture();
   // 直接问引擎：官方投影自己给出的形状（宿主未加工）里必须没有时长这个键。
   // 与产品代码同一口径逐行调用官方投影（`recordForProjection` 补 dedupKey → 纯函数展开）。
@@ -1438,8 +1444,8 @@ test('issue #283/#299：join 点在引擎投影**之后**——老记录上引�
   assert.ok(engineCalls.length > 0, '夹具必须让引擎投影产出 toolCalls');
   for (const call of engineCalls) {
     assert.equal('durationMs' in call, false,
-      '0.20.0 的投影只在结果块带 `erix.durationMs` 时才给时长，**T1 之前的记录上直接缺省**（不合成）'
-      + '⇒ 老记录仍必须靠宿主 join（新记录走投影那一路，见下面 #299 的优先级三条）');
+      '投影只在结果块带 `erix.durationMs` 时才给时长，老记录（无 erix）上直接缺省（不合成）。'
+      + '#303：宿主回落已删 ⇒ 投影缺省就是未知，不再从宿主 `tool_calls` 补值。');
   }
 
   const { anchors } = toolCallFixture();
@@ -1448,38 +1454,35 @@ test('issue #283/#299：join 点在引擎投影**之后**——老记录上引�
     anchors,
     userAnchors: [],
     transcriptRows,
-    toolCallRows: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 999 }],
+    toolCallRows: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 999 }], // 宿主行：#303 后不再参与
   })[0];
-  assert.deepEqual(withoutDurationKey(dto.toolCalls), engineCalls,
-    'DTO 的 toolCalls 除 durationMs 外必须与引擎投影逐字相同（宿主不裁剪、不改名、不重推导）');
-  assert.deepEqual(
-    Object.keys(dto.toolCalls[0]).filter((key) => key !== 'durationMs'),
-    Object.keys(engineCalls[0]),
-    '宿主字段是 additive 附加（不得覆盖/替换引擎字段的键序）',
-  );
+  assert.equal('durationMs' in dto.toolCalls[0], false, '#303：投影缺省时即使宿主行有值也不参与 ⇒ DTO 无该键');
+  assert.deepEqual(dto.toolCalls, engineCalls,
+    '宿主行不参与 ⇒ DTO 的 toolCalls 与引擎投影逐字相同（不裁剪、不改名、不重推导、不添键）');
   for (const call of engineCalls) {
-    assert.equal('durationMs' in call, false, '引擎产出的对象不被就地改写（join 产出新对象，不动上游形状）');
+    assert.equal('durationMs' in call, false, '引擎产出的对象不带 durationMs（#303 后宿主不参与，键的有无只由引擎投影决定）')
   }
 });
 
-// ---- #299 (d)：0.20.0 投影自带 durationMs 之后的**优先级**三条（投影 > 宿主 > 无键） ----
+// ---- #299 (d) → #303：投影自带 durationMs 之后只剩两格（投影带值 / 投影缺省 ⇒ 键不存在），
+//      宿主值不再参与 ----
 
-test('#299 ①：投影有值 + 宿主也有值 ⇒ 取**投影**值（单一真相在引擎那侧，宿主不得盖它）', () => {
+test('#299 ①/#303：投影有值 ⇒ 时长即投影值（#303 后宿主值完全不再参与）', () => {
   const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1', 111); // 引擎 erix.durationMs=111
   const dto = projectSessionMessages({
     sessionId: SESSION_ID,
     anchors,
     userAnchors: [],
     transcriptRows,
-    toolCallRows: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 999 }], // 宿主库里是另一份
+    toolCallRows: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 999 }], // 宿主库里另一份，#303 后不参与
   })[0];
   assert.equal(dto.toolCalls[0].durationMs, 111,
-    '投影有值时必须用投影值（宿主那一份是 U3 从同一个 tool_result 抄的，抄漏/抄错都不许覆盖引擎）');
+    '时长只来自引擎投影（erix.durationMs）；宿主那一份不再参与，无论传什么都不影响结果');
   // 反向自证：把宿主值当判据的话这条会红（不是空操作）
   assert.notEqual(dto.toolCalls[0].durationMs, 999);
 });
 
-test('#299 ②：投影缺省（T1 之前的老记录）+ 宿主有值 ⇒ 回落宿主值，老记录不退化成「没有时长」', () => {
+test('#303 清账（原 #299 ②）：投影缺省 ⇒ DTO 无 durationMs 键，宿主值不再参与（旧回落已退役，不是回归）', () => {
   const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1'); // 无 erix = 老记录
   const engineCalls = projectTranscriptForDisplay([recordForProjection(transcriptRows[0]).record])
     .flatMap((turn) => turn.toolCalls ?? []);
@@ -1487,9 +1490,14 @@ test('#299 ②：投影缺省（T1 之前的老记录）+ 宿主有值 ⇒ 回�
     '老记录上引擎投影**直接缺省**该键（不合成、不给 0）——这条红了就是上游改成「合成 0」，按 §2 报上游');
   const dto = projectSessionMessages({
     sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows,
-    toolCallRows: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 777 }],
+    toolCallRows: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 777 }], // 宿主旧回落路径的值
   })[0];
-  assert.equal(dto.toolCalls[0].durationMs, 777, '投影缺省 ⇒ 必须回落宿主值');
+  assert.equal('durationMs' in dto.toolCalls[0], false,
+    '#303 清账：投影缺省 ⇒ DTO 无 durationMs 键（宿主 tool_calls 值不再参与）。'
+    + '这条就是 #303 预告「红了才是对的信号」那一条：引擎侧旧键 duration 已退役'
+    + '（tool-fact.js 旧键映射、orchestrator.js 落盘前 delete、run-snapshot-executor.js 注释明写），'
+    + '宿主不再为老记录补时长 ⇒ 老对话的工具耗时渲染为「未知」（空白，不是报错）。若这条变红，说明有人把宿主 join 加回来了。');
+  assert.notEqual(dto.toolCalls[0].durationMs, 0, '未知不能塌成 0');
 });
 
 test('#299 ③：投影与宿主**都缺** ⇒ DTO 里没有 durationMs 这个键（禁止写 0）', () => {
@@ -1498,7 +1506,10 @@ test('#299 ③：投影与宿主**都缺** ⇒ DTO 里没有 durationMs 这个�
     undefined,
     [],
     [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }],
-    // 库里有别的调用有时长、唯独这次没有 ⇒ 走「有 map 但没命中」那一支（这条也会被 `?? 0` 变异抓到）
+    // 这些宿主行现在**应当被完全忽略**（join 已在 #303 退役）。本用例直接调 `projectSessionMessages`、
+    // 不经 `SessionViewPool`，所以它们不是运行期绊线（真正的绊线是端点级那条守卫，下面单独有用例：
+    // 谁再查 `tool_calls` 就当场 throw 指名报错）；这里留着只是**入参面**的哨兵：传不传、值还是 null
+    // 都不许影响 DTO。
     [{ run_id: RUN_1, call_id: 'ghost-call', duration_ms: 42 }],
   ]) {
     const dto = projectSessionMessages({
@@ -1513,7 +1524,7 @@ test('#299 ③：投影与宿主**都缺** ⇒ DTO 里没有 durationMs 这个�
 test('#299 (c)：executionStatus 只在特殊状态存在 ⇒ 普通块的 DTO 不带该键、也不被当成异常', () => {
   const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1', 12);
   const dto = projectSessionMessages({
-    sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows, toolCallRows: [],
+    sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows,
   })[0];
   assert.equal('executionStatus' in dto.toolCalls[0], false,
     '普通成功结果块上引擎**不写** executionStatus（guide-0.20.0 §7）⇒ DTO 也不许多造一个键');
@@ -1522,7 +1533,7 @@ test('#299 (c)：executionStatus 只在特殊状态存在 ⇒ 普通块的 DTO �
     '0.20.0 投影新增的 toolCallKey 原样透传（本单不接进卡片身份，见 session-view.js 注释）');
 });
 
-test('issue #283：按 (run_id, call_id) 复合键 join——同 call_id 跨 run 不串号', () => {
+test('issue #283/#303：宿主 join 已退役 ⇒ 同 call_id 跨 run 不再有 join 概念，时长只看各自投影', () => {
   const first = toolCallFixture(RUN_1);
   const second = toolCallFixture(RUN_2);
   const anchors = [...first.anchors, ...second.anchors];
@@ -1532,50 +1543,46 @@ test('issue #283：按 (run_id, call_id) 复合键 join——同 call_id 跨 run
     anchors,
     userAnchors: [],
     transcriptRows,
-    // 只有 RUN_2 的那次调用有入库时长（RUN_1 是同 call_id 的旧数据）
+    // 以前靠 (run_id, call_id) 复合键 join 才不串号；#303 后宿主行完全不再参与。
     toolCallRows: [{ run_id: RUN_2, call_id: 'call-1', duration_ms: 777 }],
   });
   const byRun = new Map(projection.map((dto) => [dto.run_id, dto]));
-  assert.equal('durationMs' in byRun.get(RUN_2).toolCalls[0], true);
-  assert.equal(byRun.get(RUN_2).toolCalls[0].durationMs, 777);
+  // 两个 run 的夹具都是老记录（无 erix）⇒ 两边都无键，宿主行不参与。
+  assert.equal('durationMs' in byRun.get(RUN_2).toolCalls[0], false,
+    '#303：宿主行有值也不再参与 ⇒ RUN_2 无 durationMs 键');
   assert.equal('durationMs' in byRun.get(RUN_1).toolCalls[0], false,
-    'run_id 不参与 join 就会串号：同 call_id 的另一条必须仍无时长');
+    'RUN_1 同样无键（不存在 join，也就不存在串号）');
 });
 
-test('issue #283：GET /api/sessions/:id 端到端把 durationMs 带进 DTO（旧数据仍是不出现）', async () => {
-  const { anchors, transcriptRows } = toolCallFixture(RUN_1);
-  const pool = new SessionViewPool({
-    anchors,
-    transcriptRows,
-    toolCallDurations: [
-      { run_id: RUN_1, call_id: 'call-1', duration_ms: 5021 },
-      { run_id: RUN_1, call_id: 'call-ghost', duration_ms: 1 },
-    ],
-  });
+test('issue #283/#303：GET /api/sessions/:id 端到端的 durationMs 只来自投影（不再取 tool_calls）', async () => {
+  // 新记录：引擎投影带 erix.durationMs ⇒ getSession 产出的 DTO 直接带该值（全程不碰 tool_calls）。
+  const fresh = toolCallFixture(RUN_1, 'call-1', 5021);
+  const pool = new SessionViewPool({ anchors: fresh.anchors, transcriptRows: fresh.transcriptRows });
   const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 100 });
   const dto = result.messages.find((row) => row.role === 'assistant');
-  assert.equal(dto.toolCalls[0].durationMs, 5021, '刷新后时长仍在（数据源 = 自家 tool_calls）');
-  const toolCallsQuery = pool.queries.find((query) => query.sql.includes('FROM tool_calls'));
-  assert.ok(toolCallsQuery, 'getSession 必须真的去取 tool_calls（漏了就是"表里有值但 DTO 不带"那一类 bug）');
-  assert.deepEqual(toolCallsQuery.params, [[RUN_1]], '取数按本批锚点的 run 集合限定');
+  assert.equal(dto.toolCalls[0].durationMs, 5021, '新记录：时长从投影一路带到 DTO（数据源 = 引擎 erix.durationMs）');
+  // #303：时长不再从宿主 tool_calls 取 ⇒ getSession 不应再发 FROM tool_calls 查询。
+  assert.equal(pool.queries.some((query) => query.sql.includes('FROM tool_calls')), false,
+    '#303：getSession 不再为时长去取 tool_calls（旧回落查询已删）');
 
-  // 旧数据：库里有行但 duration_ms 是 NULL ⇒ 不出现该键（也不写 0）
-  const legacyPool = new SessionViewPool({
-    anchors,
-    transcriptRows,
-    toolCallDurations: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }],
-  });
-  const legacy = await getSession(legacyPool, { userId: USER_ID, sessionId: SESSION_ID, limit: 100 });
-  const legacyDto = legacy.messages.find((row) => row.role === 'assistant');
-  assert.equal('durationMs' in legacyDto.toolCalls[0], false, '旧 740 条历史数据不可回填 ⇒ 键不出现');
+  // 老记录（无 erix）⇒ 投影缺省 ⇒ 键不出现（也不写 0）；这是跨实例升级后的「未知」形态。
+  const legacy = toolCallFixture(RUN_1, 'call-1');
+  const legacyPool = new SessionViewPool({ anchors: legacy.anchors, transcriptRows: legacy.transcriptRows });
+  const legacyResult = await getSession(legacyPool, { userId: USER_ID, sessionId: SESSION_ID, limit: 100 });
+  const legacyDto = legacyResult.messages.find((row) => row.role === 'assistant');
+  assert.equal('durationMs' in legacyDto.toolCalls[0], false, '老记录无 erix ⇒ 键不出现（#303：不回落宿主值）');
 });
 
-test('issue #283：includeMessages=false（SSE 只校验 last_seq）不多打 tool_calls', async () => {
-  const { anchors, transcriptRows } = toolCallFixture(RUN_1);
-  const pool = new SessionViewPool({ anchors, transcriptRows, toolCallDurations: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 5 }] });
-  await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, includeMessages: false });
-  assert.equal(pool.queries.some((query) => query.sql.includes('FROM tool_calls')), false,
-    '没有消息就没有可 join 的对象 ⇒ 不发这次查询');
+test('issue #283/#303：getSession 无论 includeMessages 与否都不取 tool_calls（旧回落查询已删）', async () => {
+  const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1', 5);
+  const poolWith = new SessionViewPool({ anchors, transcriptRows });
+  await getSession(poolWith, { userId: USER_ID, sessionId: SESSION_ID, includeMessages: true });
+  assert.equal(poolWith.queries.some((query) => query.sql.includes('FROM tool_calls')), false,
+    '#303：有消息也不取 tool_calls（时长只来自投影）');
+  const poolWithout = new SessionViewPool({ anchors, transcriptRows });
+  await getSession(poolWithout, { userId: USER_ID, sessionId: SESSION_ID, includeMessages: false });
+  assert.equal(poolWithout.queries.some((query) => query.sql.includes('FROM tool_calls')), false,
+    'includeMessages=false 同样不取');
 });
 
 // ============================================================================
@@ -1665,7 +1672,7 @@ test('#243 诊断进 DTO：终态带 textualized_tool_call 诊断的 run ⇒ 对
 test('#243 projectSessionMessages 直调：诊断参数缺省/非 Set ⇒ 不写键；Set 命中 ⇒ 写 true（additive 不外溢既有形状）', () => {
   const { anchors, transcriptRows } = fixture();
   const base = {
-    sessionId: SESSION_ID, anchors, transcriptRows, toolCallRows: [],
+    sessionId: SESSION_ID, anchors, transcriptRows,
     userAnchors: anchors.filter((a) => a.role === 'user'),
   };
   const findAssistant = (msgs, id) => msgs.find((m) => m.id === id);

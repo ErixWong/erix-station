@@ -1502,14 +1502,13 @@ curl -sk --resolve admin.fde.erix.vip:9443:127.0.0.1 -H 'Authorization: Bearer s
 | 字段 | 来源 | 口径 |
 |---|---|---|
 | `messages[].toolCalls[]` | 引擎投影 | `{key, name, id?, argsSummary?, resultPreview?, isError?, executionStatus?}`（预览长度由上游定） |
-| `messages[].toolCalls[].durationMs` | **宿主 join**（issue #283） | 毫秒。⚠ **引擎投影不带这个字段**（`DisplayTurn.toolCalls[]` 的形状里没有时长），它由 `portal/src/session-view.js` 在投影**之后**按 `(run_id, call_id)` 从本站 `tool_calls.duration_ms` 补上（数据源 = §9.4 的 U3 `tool_result` UPDATE）。`call_id` 即事件里的 `tool_call_id` = `toolCalls[].id`。 |
+| `messages[].toolCalls[].durationMs` | **引擎投影带**（issue #283 / #303） | 毫秒。由 erix-agent 官方投影在结果块 `erix.durationMs` 是有限数时带出（`DisplayTurn.toolCalls[]` 自带）；**投影不带 = 未知 ⇒ DTO 不出现这个键**（不写 `0`、不塞 `null`、也不拿时间差造假时长）。#303（erix-agent 0.34.0 后旧键 `duration` 退役）已删除「投影缺省 ⇒ 回落宿主 `tool_calls.duration_ms`」那条支路——时长只此一份来源，宿主不再为老记录补值。 |
 | `messages[].folded.hasSummary` | **宿主判定**（issue #390-A） | boolean。**这个键不是上游字段**，是 `portal/src/session-view.js` 按折叠行自己的 `record.summary` 形态算出来的：上游契约（erix-agent `src/store/file.js:25`）是 `summary?:{action:string,note:string}|"missing"` ⇒ 只有 `{action,note}` 且至少一项非空才算“有真摘要”，字面量 `"missing"`（现网 17/17 条折叠行都是这个值）、缺键、空壳都算没有。存否口径与 `round` 绑定：**轮号取不到就整个不带这个键**（缺席 = 前端“不知道”，不得当成 `false` 把旧数据的展开控件抹掉）。存要的作用是：没有真摘要时，摘要区只是把横幅标题换个说法重说一遍（“已压缩第 1–94 轮” vs “早期第 1–94 轮已折叠。”），前端据此不画展开控件。 |
 | `messages[].folded.facts` | 引擎 `record.foldedFacts`（issue #565 / #897，宿主仅逐项清洗、不重推导） | **嵌套键**（不是平铺 8 个键）：把账本里本就有的结构化事实透传进 DTO，供折叠呈现重设计（一行「范围 · title · 工具足迹」）直接取用。子键**全部缺席 = 不知道**：`title?string`（引擎已剥 marker、夹到 60 字符，原样）／`summary?string`（模型给的 description）／`origin?` ∈ 白名单 `['mechanical','semantic','host']`（白名单外一律不给键）／`from?number`·`to?number`（安全整数才给）／`rounds?number`（安全正整数才给）／`toolCalls?:{name:string,argsSummary?:string}[]`（逐项清洗：非空 trim 后 `name` 才收、空 `argsSummary` 不带该子键；清洗后为空 ⇒ 不给 `toolCalls` 键而非 `[]`；不截断、不改写内容）／`summaryDropped?:true`·`titleFallback?:true`（仅 `=== true` 才给）。每个子键取不到就**不写这个键**，绝不写 `null`/`false`/`0`/空串；`foldedFacts` 不是对象或是数组 ⇒ **整个 `facts` 键不出现**。`summary`/`summaryDropped`/`titleFallback` 是为引擎即将落地的 #897 预留的读点（0.33.0 上天然缺席，引擎补上后本站零改动即可用）。⚠ `facts.summary`（模型给的 description）与 `summaryText`（= `foldedFacts.text`，替代物正文）是**两份不同的东西**，不许合并成一个键。 |
 
-- **旧数据口径**：库里 `duration_ms` 为 `NULL`（引擎当年就没给时长的那批历史调用，见 §5.3 第 7 行与
-  erix-agent #285）⇒ **DTO 不出现 `durationMs` 键**，不写 `0`、不塞 `null`、也不拿时间差造一个假时长；
-  前端据此不渲染时长（而不是显示 `0ms`）。旧数据**不可回填**。
-- **取数面**：`getSession` 额外一次 `SELECT run_id, call_id, duration_ms FROM tool_calls WHERE run_id = ANY($1::uuid[]) AND duration_ms IS NOT NULL`（只查本批锚点涉及的 run）；`includeMessages=false`（SSE 只校 `last_seq`）时不发这次查询。
+- **旧数据口径**：引擎投影只在结果块带 `erix.durationMs` 时才给时长，**老记录（引擎当年就没写 `erix.*` 的那批）直接缺省该键**（不合成、不给 0，见 §5.3 第 7 行与 erix-agent #285）⇒ **DTO 不出现 `durationMs` 键**，
+  不写 `0`、不塞 `null`；前端据此不渲染时长（而不是显示 `0ms`）。旧数据**不可回填**。
+- **取数面**：#303 后 `durationMs` 只来自官方投影，`getSession` **不再**为时长去 `SELECT ... FROM tool_calls`（旧的宿主回落取数已删）。
 - **前端归并规则**：实时路（`tool_result` 事件）已拿到的时长优先，投影值只在卡片现有 `dur` 为空时填——
   同一次调用不会因为刷新而改变显示。
 
@@ -5042,7 +5041,7 @@ data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id"
 | 4 | `recovered` | 同上 | `round: number`，`attempt: number`（重试成功，依据：`src/loop.js:1413`/`1424`） |
 | 5 | `usage` | 同上 | `round: number`，`usage: object`（嵌套 usage 对象，形如 `{input_tokens, output_tokens}`；依据：`src/loop.js:1355`/`1928`/`1960`。宿主若拍平为顶层 `input_tokens`/`output_tokens`，属宿主侧改写，须显式注明）。**#425 起宿主侧 additive 字段 `context_window: number`**：值 = 本 run 下行的模型上下文窗口（与喂给引擎 `modelMetadata.contextWindowTokens` 同一个数，#309），**只在正整数时写键**，未配/脏值 ⇒ **整键缺席**（不写 0）；前端据此出「上下文占用 %」，没有就整段不出。引擎事件本身不带这个字段 ⇒ 不记为上游契约变更 |
 | 6 | `tool_use` | 同上 | `tool_call_id: string`，`name: string`，`input: object` |
-| 7 | `tool_result` | 同上 | `tool_call_id: string`，`name: string`，`result_digest: string`，`duration_ms: number \| null`，`ok: boolean`（**issue #283 → #299**：`duration_ms` 可为 `null`。erix-agent **0.20.0** 起引擎把时长写进 `tool_result.erix.durationMs`，**真执行过的四种返回形态（string / number / `{content,metadata}` / 抛异常）都会给值** ⇒ 本站 #283 那层装配期临时计时闸（`runner/lib/tool-duration.js`）已撤。仍没有值的只剩三种状态：judge 拦截、unsafe 重放被中止、executor 未 settle 就被中止（上游 `TOOL_RESULT_CONTRACT.engine.fields.durationMs`）。runner 映射读 `erix.durationMs`，**旧记录**（一代内）回退顶层 `duration`；两者都缺一律 `null`，**不伪装成 0**，前端据此不渲染时长） |
+| 7 | `tool_result` | 同上 | `tool_call_id: string`，`name: string`，`result_digest: string`，`duration_ms: number \| null`，`ok: boolean`（**issue #283 → #299**：`duration_ms` 可为 `null`。erix-agent **0.20.0** 起引擎把时长写进 `tool_result.erix.durationMs`，**真执行过的四种返回形态（string / number / `{content,metadata}` / 抛异常）都会给值** ⇒ 本站 #283 那层装配期临时计时闸（`runner/lib/tool-duration.js`）已撤。仍没有值的只剩三种状态：judge 拦截、unsafe 重放被中止、executor 未 settle 就被中止（上游 `TOOL_RESULT_CONTRACT.engine.fields.durationMs`）。runner 映射**只**读 `erix.durationMs`（#303：erix-agent 0.34.0 后旧键 `duration` 已退役，原先「旧记录（一代内）回退顶层 `duration`」那层已于 #303 删除）；缺值一律 `null`，**不伪装成 0**，前端据此不渲染时长） |
 | 8 | `round_end` | 同上 | `round: number` |
 | 9 | `assistant_delta` | `onDelta` | `text: string`（增量文本片段）。**#502：不落库、不占 `seq`**（SSE 帧不带 `id:`），dev 实测平均 2.09 字符/片 |
 | 10 | `reasoning_delta` | `onReasoningDelta` | `text: string`（推理增量片段）。**#502：不落库、不占 `seq`**（前端 P1 本来就不展示推理增量） |

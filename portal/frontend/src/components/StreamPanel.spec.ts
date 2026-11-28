@@ -203,14 +203,14 @@ describe('工具卡片折叠（issue #85）', () => {
   });
 
   // issue #283 M3：刷新后不丢——卡片由 DTO 投影路径建立（`projectToolCard`），时长来自
-  // 宿主自己 join 的 `durationMs`（引擎投影不带）。
+  // 该值即引擎投影带的 `durationMs`（#303 起宿主 join 已退役）。
   it('issue #283：刷新（投影路径）的卡片仍显示可读时长；旧数据无该字段 ⇒ 不显示 0ms', () => {
     const store = useWorkbenchStore();
     store.es.projectToolCard('p-dur', { name: 'shell', argsSummary: 'command=sleep 5', resultPreview: 'exit_code: 0', durationMs: 4321 });
     store.es.projectToolCard('p-legacy', { name: 'shell', argsSummary: 'command=sleep 5', resultPreview: 'exit_code: 0' });
     store.entries.push({ kind: 'tool', callId: 'p-dur' }, { kind: 'tool', callId: 'p-legacy' });
     const cards = mountPanel().findAll('.border-l-4');
-    // 变异取证④：摘掉前端对 `durationMs` 的消费（或后端 join）就红在本行
+    // 变异取证④：摘掉前端对 `durationMs` 的消费就红在本行（宿主 join 已在 #303 退役，本用例注入的是投影值）
     expect(cards[0].get('button').text()).toContain('✓ 4.3s');
     const legacy = cards[1].get('button').text();
     expect(legacy).toContain('✓');
