@@ -582,10 +582,16 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
         return;
       }
 
-      // ① 表头：10 格，下标 7 是「周期 / 用量」（或 en 的 `Period / usage`）。
+      // ① 表头按**列名**判，不按格子数与下标判：#828 P3 给用户表加了「默认语言」列之后，格子数与
+      //    下标都会漂（真机实测 10 → 11、「周期 / 用量」从下标 7 挪到 8），而本单要钉的是**这一列在、
+      //    且只有一列**。列数本身不是契约——管理台再加一列不该红，也不该绿得莫名其妙。
       const hc = rep.page.headerCells;
-      assert.equal(hc.length, 10, `表头格子数期望 10，得到 ${hc.length}（=${JSON.stringify(hc)}）`);
-      assert.equal(hc[7], HEADER_EXPECT, `表头下标 7 期望「${HEADER_EXPECT}」，得到「${hc[7]}」（locale=${UI_LOCALE}）`);
+      const usageIdx = hc.indexOf(HEADER_EXPECT);
+      assert.ok(usageIdx >= 0, `表头里没有「${HEADER_EXPECT}」列（locale=${UI_LOCALE}，实得=${JSON.stringify(hc)}）`);
+      const dup = hc.filter((h) => h === HEADER_EXPECT).length;
+      assert.equal(dup, 1, `「${HEADER_EXPECT}」在表头里出现 ${dup} 次（重复列 = 红，实得=${JSON.stringify(hc)}）`);
+      assert.ok(usageIdx > 0 && usageIdx < hc.length - 1,
+        `「${HEADER_EXPECT}」落在首/末列（下标 ${usageIdx} / 共 ${hc.length}）——列序被动过，用量格与表头的对齐不再可信`);
 
       const cells = rep.page.cells || [];
       // ② 每个用量格 data-test 合法（unknown|period|lifetime），整表不残留 pending。
