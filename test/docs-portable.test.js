@@ -77,3 +77,27 @@ test('夹具：宿主绝对路径被拦（坐标规则，不是账号名黑名�
   assert.ok(out.includes(`dirty.md:3: ${hostHome}`), `输出未点名宿主绝对路径，实得:\n${out}`);
   assert.doesNotMatch(out, /ok\.md:/, '干净文件不该被点名');
 });
+
+// ⑭⑮ #897：代码行的宿主凭据坐标窄判据——只认「同一行同时含两个坐标片段」，注释行不算，唯一豁免 = dev-creds.mjs。
+//   片段用 join 拼（本文件是 *.js，注释里不许出现拼接后的坐标字面）。
+const CRED_A = ['~/.config/', ''].join(''); // 家目录配置根
+const CRED_B = ['mc', 'p/creds'].join(''); // 凭据子目录
+const CRED_LEAK = `const f = '${CRED_A}${CRED_B}/station-x.password';`; // 同一行同时含两片段（代码行）
+const CRED_LABEL = CRED_A + CRED_B; // 与闸里的报告标签同形
+
+test('#897 代码行凭据坐标（非注释）被拦，且报出 file:line', () => {
+  const { rc, out } = fixture((dir) => {
+    mkdirSync(path.join(dir, 'portal/integration'), { recursive: true });
+    writeFileSync(path.join(dir, 'portal/integration/x.mjs'), `const ok = 1;\n${CRED_LEAK}\n`);
+  });
+  assert.equal(rc, 1, `代码行含两个坐标片段应判红，实得 rc=${rc}\n${out}`);
+  assert.ok(out.includes(`portal/integration/x.mjs:2: ${CRED_LABEL}`), `详情行应含 file:line + 坐标标签，实得:\n${out}`);
+});
+
+test('#897 同样字面写在豁免文件 dev-creds.mjs 里 ⇒ 绿（证明豁免真在起作用）', () => {
+  const { rc, out } = fixture((dir) => {
+    mkdirSync(path.join(dir, 'portal/integration/lib'), { recursive: true });
+    writeFileSync(path.join(dir, 'portal/integration/lib/dev-creds.mjs'), `export function f() {\n${CRED_LEAK}\n  return f;\n}\n`);
+  });
+  assert.equal(rc, 0, `豁免文件里的同样字面应被放过，实得 rc=${rc}\n${out}`);
+});
