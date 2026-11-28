@@ -88,7 +88,7 @@ const REPO_ROOT = path.join(RUNNER_DIR, '..');
 //   0.33 是 `payload.js` / `openai.js` 也一起不动，`src/providers/` 全目录零变更；
 // · 于是四相超时语义、legacy 120s 总闸、streamTotal 默认 300s、`RETRYABLE_CODES` 可重试码面
 //   **全部逐字节同一**，本文件下面所有断言一字未改，仍然只追版本号（§8.27 先例）。
-const ENGINE_VERSION_PINNED = '0.33.0';
+const ENGINE_VERSION_PINNED = '0.34.0';
 
 // 决策者定稿的四相默认值（工单 /tmp/TICKET-261.md）——本文件里**唯一**的期望值来源是 helper，
 // 数值本身在 ① 里逐键钉一次，改数值必须同时改 docs/env.md §10.4（⑤ 会盯）。
