@@ -542,7 +542,12 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   const leavesByRole = Object.hasOwn(updates, 'role') && updates.role !== 'admin';
   const leavesByStatus = Object.hasOwn(updates, 'status') && updates.status !== 'active';
   const leavesActiveAdminSet = leavesByRole || leavesByStatus;
-  const lastAdminGuard = leavesActiveAdminSet && confirmLastAdmin !== true
+  // #648 D：actor 自己就是目标 ⇒ 自降级/自停用。最后一名 active admin 把自己改没了以后，
+  //   管理台只有 admin 进得去 ⇒ 再没人能把他升回来，这一刀不可逆。`confirm_last_admin` 是为
+  //   「另一名 admin 处置最后一名 admin」设计的，救不了自锁死 ⇒ 对**自**降级确认位不生效，
+  //   护栏照旧（即使 confirmLastAdmin === true 也必须把自降级拦下）。
+  const isSelf = actorId != null && String(actorId) === String(userId);
+  const lastAdminGuard = leavesActiveAdminSet && (confirmLastAdmin !== true || isSelf)
     ? `AND (users.role <> 'admin' OR users.status <> 'active'
             OR EXISTS (SELECT 1 FROM users last_admin_guard
                         WHERE last_admin_guard.role = 'admin'
@@ -553,10 +558,22 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     const offboardingGuard = updates.status === 'active' || changesFdeName
       ? `AND NOT EXISTS (SELECT 1 FROM fde_offboarding WHERE fde_id = users.id)`
       : '';
+    // #648 A：工位（seat）一旦实体化，`fde_name` 就是它的物理身份——`containers.fde_name`
+    //   （schema.sql:148 冗余列）、`containers.container_name = fde-<name>`、`fde_networks.network_name = fde-<name>`、
+    //   家目录 `userSpaceRoot/<fde_name>`、以及 docker 容器/网络本体，全部钉在旧名上。portal 事务里只改
+    //   `users.fde_name` 一列会留下新旧名并存的静默不一致；要诚实连带就得改 docker + 文件系统，那是
+    //   runner/deploy 的范畴（本单红线），不是这一列能原子带走的 ⇒ 对已实体化的工位**拒绝改名**。
+    //   未实体化（无容器/无网络，例如尚未 provisioning 的账号）时名字还没绑到任何物理资源 ⇒ 允许，
+    //   `fde_name_conflict` 查重路径原样不变。判据写进 UPDATE 的 WHERE（与 offboarding 护栏同法），
+    //   判定与写入共用同一语句快照，不留跨往返窗口。
+    const immutableGuard = changesFdeName
+      ? `AND NOT EXISTS (SELECT 1 FROM containers WHERE user_id = users.id)
+             AND NOT EXISTS (SELECT 1 FROM fde_networks WHERE fde_id = users.id)`
+      : '';
     result = await pool.query(
       `WITH updated AS (
          UPDATE users SET ${assignments.join(', ')}
-          WHERE id = $1 ${offboardingGuard} ${lastAdminGuard}
+          WHERE id = $1 ${offboardingGuard} ${immutableGuard} ${lastAdminGuard}
           RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at, last_activity_at, locale,
                     (totp_secret IS NOT NULL) AS totp_enabled
        ), revoked AS (
@@ -590,6 +607,23 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     if (offboarding.rows.length > 0) {
       throw new AdminError('user_offboarding', '用户正在下线或处于保留期，不能重新启用或修改 FDE 名称', { en: 'the user is being offboarded or in the retention period, so re-enabling or changing the FDE name is not allowed', httpStatus: 409 });
     }
+    // #648 A：改名一格未命中且不是下线中 ⇒ 是因为工位已实体化（容器/网络存在）。
+    //   回查只为选对错误码（判据本身已在上面 UPDATE 的 WHERE 里跑过，与 offboarding 同法）。
+    if (changesFdeName) {
+      const seat = await pool.query(
+        `SELECT 1 AS hit FROM containers WHERE user_id = $1
+         UNION ALL
+         SELECT 1 AS hit FROM fde_networks WHERE fde_id = $1
+         LIMIT 1`,
+        [userId],
+      );
+      if (seat.rows.length > 0) {
+        throw new AdminError('fde_name_immutable',
+          '工位名不可改，需新建（改名要连带迁移 docker 容器/网络与家目录，本端点不跨 runner/deploy）',
+          { en: 'the workstation (FDE) name cannot be renamed once provisioned—renaming it would have to migrate the Docker container/network and home directory, which this endpoint does not do across runner/deploy; create a new one instead',
+            httpStatus: 409, details: { field: 'fde_name' } });
+      }
+    }
     // UPDATE 一行没命中 ⇒ 回查一次，只为**选对错误码**（判据本身已经在上面那条语句里跑过了，
     // 与 offboarding 那条既有写法同法）。护栏没参与时不多花这一次查询。
     if (lastAdminGuard) {
@@ -603,6 +637,13 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
         [userId],
       );
       if (lastOne.rows.length > 0) {
+        if (isSelf) {
+          throw new AdminError('last_admin_self',
+            '这是最后一名 active 管理员，不能把自己降级或停用（降完无人能把你升回管理台，确认位也救不了）',
+            { en: 'this is the last active administrator, so you cannot demote or disable your own account (no one would be left to restore it; confirm_last_admin does not override)',
+              httpStatus: 409,
+              details: { field: leavesByRole ? 'role' : 'status' } });
+        }
         throw new AdminError('last_admin',
           '这是最后一名 active 管理员，降级或停用后无人在管理台（确认请带 confirm_last_admin: true）',
           { en: 'this is the last active administrator, so demoting or disabling the account would leave no one in the admin console (send confirm_last_admin: true to override)',
