@@ -637,16 +637,16 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
         [userId],
       );
       if (lastOne.rows.length > 0) {
-        if (isSelf) {
-          throw new AdminError('last_admin_self',
-            '这是最后一名 active 管理员，不能把自己降级或停用（降完无人能把你升回管理台，确认位也救不了）',
-            { en: 'this is the last active administrator, so you cannot demote or disable your own account (no one would be left to restore it; confirm_last_admin does not override)',
-              httpStatus: 409,
-              details: { field: leavesByRole ? 'role' : 'status' } });
-        }
+        // #648 D：目标就是自己 ⇒ 确认位也救不了（降完没人能把自己升回），文案据 isSelf 分支；
+        //   错误码仍是 `last_admin`（与「另一名 admin 处置最后一名」共用同一条判据与同一码，
+        //   契约不为 D 新增码），但自降级的文案不再建议「带 confirm」，因为它带不上。
         throw new AdminError('last_admin',
-          '这是最后一名 active 管理员，降级或停用后无人在管理台（确认请带 confirm_last_admin: true）',
-          { en: 'this is the last active administrator, so demoting or disabling the account would leave no one in the admin console (send confirm_last_admin: true to override)',
+          isSelf
+            ? '这是最后一名 active 管理员，不能把自己降级或停用（降完无人能把你升回管理台，确认位也救不了）'
+            : '这是最后一名 active 管理员，降级或停用后无人在管理台（确认请带 confirm_last_admin: true）',
+          { en: isSelf
+            ? 'this is the last active administrator, so you cannot demote or disable your own account (no one would be left to restore it; confirm_last_admin does not override)'
+            : 'this is the last active administrator, so demoting or disabling the account would leave no one in the admin console (send confirm_last_admin: true to override)',
             httpStatus: 409,
             details: { field: leavesByRole ? 'role' : 'status' } });
       }
