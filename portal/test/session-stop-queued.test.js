@@ -72,6 +72,10 @@ class StopPool {
     if (/^\s*COMMIT/i.test(s)) { this.commits += 1; return { rows: [] }; }
     if (/^\s*ROLLBACK/i.test(s)) { this.rollbacks += 1; return { rows: [] }; }
 
+    // issue #905：建 run 唯一出口的 LLM 上游预检（`SELECT 1 FROM fde_llm_bindings b …`）。本文件的
+    // 判据是「queued run 停止」，前置条件按「上游配好了」仿真 ⇒ 只认这一条语句，其余照旧。
+    if (/^SELECT 1 FROM fde_llm_bindings b\b/i.test(s)) return { rows: [{ '?column?': 1 }], rowCount: 1 };
+
     // ---- stopSession 第 1 步：queued → finished（谓词 status='queued' + #277-A2 的「未被领走」守卫）----
     if (s.includes('UPDATE runs') && s.includes("SET status = 'finished'") && s.includes("AND status = 'queued'")) {
       if (this.onBeforeQueuedUpdate) await this.onBeforeQueuedUpdate(); // 竞态注入点（UPDATE 前翻转状态）

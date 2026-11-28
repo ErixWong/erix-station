@@ -43,6 +43,34 @@ export class LlmError extends Error {
   }
 }
 
+/**
+ * issue #905：「这个 FDE 的 LLM 上游到底配好没有」这条预检的**领域层**错误载体。
+ *
+ * 为什么单独一个类而不复用 `LlmError`：这条判据从 http 层挪进了「写 `runs` 的唯一出口」
+ * （`sessions.postMessage`），三条调用路（人发消息 / 宏任务 run / 只读审查 run）共用它，
+ * 而**领域层不许 `import` `http.js`**（否则 http 的类被拽进领域层，方向反了）。
+ * 于是错误自己带齐出口需要的四格 `{ status, code, message, en }`，由 `http.js` 的映射点翻成
+ * `HttpError` —— 对外 API 响应与挪动之前**逐字一致**（同 status、同 code、同中/英文案，
+ * 错误体键集合不变）。
+ *
+ * `code` 只有两种取值（本单的契约面，不多不少）：
+ *   * `llm_not_configured`：没有可用的 active LiteLLM 绑定（压根没配 / 虚拟 key 空 / 主模型槽空）。
+ *   * `llm_model_not_found`：配过，但绑定的 `model_info.id` 在网关里已不存在。
+ */
+export class FdeLlmPrecheckError extends Error {
+  constructor(code, message, { status = 409, details, retryable = false, en } = {}) {
+    super(message);
+    this.name = 'FdeLlmPrecheckError';
+    this.code = code;
+    // `status`（不是 `httpStatus`）：本单定的四格形状，出口按 `status` 读。
+    this.status = status;
+    this.details = details;
+    this.retryable = retryable;
+    // 英文对（口径同 LlmError/SessionError：`super(message)` 是中文原文，`en` 只在 locale=en 时替换文案）。
+    this.en = en;
+  }
+}
+
 export function maskKey(key) {
   if (typeof key !== 'string' || key.length < 8) return '***';
   return `sk-...${key.slice(-4)}`;
@@ -1319,6 +1347,57 @@ export async function assertBindingModelsResolvable(pool, userId, opts = {}) {
 }
 
 const SLOT_LABELS = { main: '主模型', embedding: '嵌入模型', vision: '视觉模型' };
+
+/**
+ * issue #905：「该 FDE 的 LLM 上游配好了吗」——建 run 前的**唯一一道**预检（两道串调）。
+ *
+ * 为什么住在这里（而不是 http 层）：`INSERT INTO runs` 的唯一出口是 `sessions.postMessage`，
+ * 而它有**三条**调用路（`http.js` 人发消息 / `macro-scheduled.js` 宏任务 run /
+ * `macro-dispatcher.js` 只读审查 run）。判据写在 http 层只盖住第一条 ⇒ 后两条在无 active
+ * binding 的 FDE 上照样建得出 run，然后走 #802 那条老路：runner 拿不到 endpoint/apiKey，
+ * run 要么卡着、要么跑出一个看不懂的错。收口到出口 = 三条路一次覆盖，第四条路以后加进来也自动受益。
+ *
+ * 两道口径（与 #41 / #261014 B2 逐字同源，**一条语义都没改**）：
+ *   1. **绑定存在性（硬拦）**：谓词逐字照搬原先 `http.js` 里那条 `SELECT 1 FROM fde_llm_bindings …`
+ *      （`state='active'` + `gateway='litellm'` + `api_key` 非空 + `main_model_id IS NOT NULL`）。
+ *      不命中 ⇒ 抛 `llm_not_configured`。**三处调用方都必须硬拦**，拿不到网关也一样。
+ *   2. **模型 id 可解析性**：直接转交既有 `assertBindingModelsResolvable`，`gateway` **原样透传**
+ *      （它的 `model_info.id → model_name` TTL 缓存按 client 对象身份分槽，包一层就会假绿）。
+ *      网关不可达时它一律放行（fail-open）；`gateway` 缺失 ⇒ 它自己 `skipped`——宏侧拿不到网关
+ *      就只过第二道，与 fail-open 同一取向。
+ *
+ * 失败面（位置红线由调用方保证）：本函数**只读**、零副作用；调用点必须在**开业务事务与写
+ * transcript 之前**，失败不留用户消息、不入队 run、幂等层走 `release` 不把失败钉进台账。
+ *
+ * @param {object} pool 读绑定的连接池/客户端
+ * @param {string} userId 会话属主（= FDE 的 users.id）
+ * @param {object} [opts]
+ * @param {object} [opts.gateway] `ctx.llmGateway` 单例本体（**不许包一层**）；缺省 ⇒ 只过第一道。
+ * @param {Function} [opts.listModels] 注入的网关列表替身（测试用，透给第二道）。
+ * @returns {Promise<object|undefined>} 第二道的可观测标记（第一道不过 ⇒ 抛错）。
+ * @throws {FdeLlmPrecheckError} `llm_not_configured`（第一道）
+ * @throws {LlmError} `llm_model_not_found`（第二道，既有形状不变）
+ */
+export async function assertFdeLlmReady(pool, userId, { gateway = null, listModels = null } = {}) {
+  // 第一道：谓词逐字照搬原先 `http.js` 的 `handlePostMessage` 里那条（issue #41，一字不改；文案与状态码也逐字不变）。
+  const bound = await pool.query(
+    `SELECT 1
+       FROM fde_llm_bindings b
+      WHERE b.fde_id = $1 AND b.state = 'active' AND b.gateway = 'litellm'
+        AND b.api_key IS NOT NULL AND b.api_key <> '' AND b.main_model_id IS NOT NULL
+      LIMIT 1`,
+    [userId],
+  );
+  if (!bound.rows?.length) {
+    throw new FdeLlmPrecheckError(
+      'llm_not_configured',
+      '该 FDE 未配置 LLM 上游，请在管理台配置',
+      { status: 409, en: 'This FDE has no LLM upstream configured; please configure it in the admin console' },
+    );
+  }
+  // 第二道：gateway **原样透传**（缓存按 client 对象身份分槽）；不可达时它自己 fail-open 放行。
+  return assertBindingModelsResolvable(pool, userId, { gateway, listModels });
+}
 
 export async function getFdeLlmEcho(pool, fdeName) {
   const u = await pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);

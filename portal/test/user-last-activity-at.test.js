@@ -117,6 +117,10 @@ class ActivityPool {
       return { rows: [] };
     }
 
+    // issue #905：建 run 唯一出口的 LLM 上游预检（`SELECT 1 FROM fde_llm_bindings b …`，在开业务事务
+    // 之前、经 `pool.query` 发）⇒ 按「上游配好了」仿真这条前置条件；本文件的判据是活动位，不是它。
+    if (/^SELECT 1 FROM fde_llm_bindings b\b/i.test(s)) return { rows: [{ '?column?': 1 }] };
+
     // --- 活动位（共用仿真件；命中就返回，不命中继续自己的链）---
     const hit = this.activity.query(s, params);
     if (hit) return hit;

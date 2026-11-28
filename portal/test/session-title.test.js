@@ -320,7 +320,19 @@ function postMessageClient({
     },
     release() {},
   };
-  return { pool: { connect: async () => client }, order, state, activity };
+  return {
+    pool: {
+      // issue #905：LLM 上游预检已收口进 `postMessage`，在**开业务事务之前**走 `pool.query`
+      //（不是事务内 client）⇒ 夹具给出「上游配好了」这条前置条件；只认这一条语句，余下响亮失败。
+      async query(sql, params = []) {
+        const s = String(sql).replace(/\s+/g, ' ').trim();
+        if (!/^SELECT 1 FROM fde_llm_bindings b\b/.test(s)) throw new Error(`unexpected pool SQL: ${sql}`);
+        return { rows: [{ '?column?': 1 }] };
+      },
+      connect: async () => client,
+    },
+    order, state, activity,
+  };
 }
 
 /** 从 SQL 日志里取「默认标题落库」语句（无则 undefined）。 */
@@ -519,7 +531,16 @@ test('issue #114：并发抢占（UPDATE 命中 0 行）→ 不回调（安静�
     return origQuery(sql, params);
   };
   const titles = [];
-  await postMessage({ connect: async () => client }, {
+  await postMessage({
+    // issue #905：预检在开业务事务**之前**走 `pool.query` ⇒ 这里也要顶上「上游配好了」这条前置条件
+    //（只认那一条语句，余下照旧由事务内 client 接管）。
+    async query(sql) {
+      const s = String(sql).replace(/\s+/g, ' ').trim();
+      if (!/^SELECT 1 FROM fde_llm_bindings b\b/.test(s)) throw new Error(`unexpected pool SQL: ${sql}`);
+      return { rows: [{ '?column?': 1 }] };
+    },
+    connect: async () => client,
+  }, {
     userId: 'u1', sessionId: PM_SESSION_ID, content: 'hi', attachments: [], onSessionTitle: (t) => titles.push(t),
   });
   assert.deepEqual(titles, [], '0 行（被抢占）不推送');

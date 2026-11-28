@@ -1089,6 +1089,17 @@ export function createServer({
         sendJson(res, err.httpStatus, errorBody(err.code, pickMessage(err, locale), err.retryable === true, err.details));
         return;
       }
+      if (err instanceof llm.FdeLlmPrecheckError) {
+        // issue #905：「LLM 上游配好了吗」的预检已收口到建 run 的唯一出口 `sessions.postMessage`，而
+        // 领域层（sessions.js / llm.js）**不许 import 本文件** ⇒ 错误自带四格 `{status, code, message, en}`，
+        // 在这里翻成 `HttpError`：同一个 status、同一个 code、同一对文案（`pickMessage` 按 locale 读 `en`）、
+        // `details` 缺省不写 ⇒ 错误体键集合与旧写法（`handlePostMessage` 直抛 `HttpError`）**逐字一致**。
+        const mapped = new HttpError(err.status, err.code, err.message, {
+          retryable: err.retryable, details: err.details, en: err.en,
+        });
+        sendJson(res, mapped.status, errorBody(mapped.code, pickMessage(mapped, locale), mapped.retryable, mapped.details));
+        return;
+      }
       if (err instanceof LlmGatewayError) {
         sendJson(res, err.status, errorBody('llm_gateway_error', pickMessage(err, locale)));
         return;
@@ -3547,37 +3558,22 @@ async function handlePostMessage(req, res, ctx, sessionId) {
     { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash({ content, attachments }), log: ctx.log },
     async (record) => {
       await sessions.assertSessionOwner(ctx.pool, { userId: session.user.id, sessionId });
-      // issue #117：建 run 前预检该 FDE 是否已绑定可用 LiteLLM 上游（active binding +
-      // 非空 virtual key + main model slot）。
-      // 未配置 → 409 llm_not_configured fail-fast：不入队 run（否则 run 永久排队，等一个永远不会
-      // 出现的 LLM 出口）。
-      // 评审 MEDIUM-1：预检必须放在 fn 内（executeWithIdempotency 之后）——回放优先（findDone 在
-      // fn 之前返回首次结果，不被预检截断）；claim 后 fn 抛错走 ⑤ release 路径，「失败不占位」
-      // 语义保持（修好绑定后同 key 原样重试可成功建 run）。
-      const bound = await ctx.pool.query(
-        `SELECT 1
-           FROM fde_llm_bindings b
-          WHERE b.fde_id = $1 AND b.state = 'active' AND b.gateway = 'litellm'
-            AND b.api_key IS NOT NULL AND b.api_key <> '' AND b.main_model_id IS NOT NULL
-          LIMIT 1`,
-        [session.user.id],
-      );
-      if (!bound.rows?.length) {
-        throw new HttpError(409, 'llm_not_configured', '该 FDE 未配置 LLM 上游，请在管理台配置', { en: 'This FDE has no LLM upstream configured; please configure it in the admin console' });
-      }
-      // issue #261014 切片 B2：绑定里的 `model_info.id` 在网关里已不存在（模型被删/重建 ⇒ id 变）时，
-      // 消息仍会入队并在 run 里跑出一个看不懂的错 ⇒ 这里 fail-fast（409 llm_model_not_found）。
-      // 位置红线：与 llm_not_configured 同层（幂等 fn 内、**开业务事务与写 transcript 之前**）——
-      // 失败时不留用户消息、不入队 run，且走 release 路径不把失败钉进幂等台账（同 MEDIUM-1 口径）。
-      // ⚠ 必须传 `ctx.llmGateway` 本身：llm.js 的 `model_info.id → model_name` 映射 TTL 缓存按 client
-      //   对象身份分槽（同 §9.5 心跳对账的接线红线）。网关不可达时该函数一律放行（fail-open）。
-      await llm.assertBindingModelsResolvable(ctx.pool, session.user.id, { gateway: ctx.llmGateway });
+      // issue #117（#41）与 issue #261014 切片 B2 的两道 LLM 预检**已收口到 `sessions.postMessage`**（issue #905）：
+      // 判据写在 http 层只盖住「人发消息」这一条路，宏任务 run（macro-scheduled.js）与只读审查 run
+      //（macro-dispatcher.js）同走 `INSERT INTO runs` 这个唯一出口却绕过它 ⇒ 无 active binding 的 FDE
+      // 照样建得出 run，再走 #802 那条老路（runner 拿不到 endpoint/apiKey，run 卡着或跑出一个看不懂的错）。
+      // 幂等语义一字未改（评审 MEDIUM-1 原口径）：预检仍在幂等 `fn` 之内、`findDone` 回放之后与开业务事务
+      // 之前 ⇒ 回放优先不被截断，失败走 release 路径、不把失败钉进幂等台账（修好绑定后同 key 重试能成）。
       const posted = await sessions.postMessage(ctx.pool, {
         userId: session.user.id,
         sessionId,
         content,
         attachments,
         record,
+        // issue #905：第二道预检（绑定的模型 id 还在不在网关里）要的网关 client **本体**：llm.js 的
+        // `model_info.id → model_name` TTL 缓存按 client 对象身份分槽（同 §9.5 心跳对账的接线红线）
+        // ⇒ 只许原样透传 `ctx.llmGateway`，包一层缓存就失效。网关不可达一律放行（fail-open）。
+        llmGateway: ctx.llmGateway,
         notify: ({ runId, userId }) => internal.notifyRunEnqueued(userId, { run_id: runId }),
         // issue #114：首条消息截断出默认标题时推 session_updated（侧栏标题立即到位；live-only）。
         onSessionTitle: (title) => internal.notifySessionEvents(sessionId, [{

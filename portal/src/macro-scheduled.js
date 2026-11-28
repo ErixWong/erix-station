@@ -194,10 +194,14 @@ export async function executeScheduledIntent(pool, intent, {
     });
     childRunId = posted?.run?.id ?? null;
   } catch (err) {
-    // 入队本身失败（无容器 / 会话忙）：视作执行失败，走统一失败收口（不补跑、只通知）。
+    // 入队本身失败（无容器 / 会话忙 / issue #905 「LLM 上游未配置」）：视作执行失败，走统一失败收口
+    //（不补跑、只通知）。绝不允许伪装成完成：这里把宏 run 落到 failed，**不是** done。
+    // issue #905：错误自带稳定机器码（`llm_not_configured` / `llm_model_not_found`）时把它**逐字**拼进
+    // `reason`（口径同 #850：账上留可判读的码，宏 run 视图按语言渲染、排障按码检索），中文原句照旧保留。
+    const code = typeof err?.code === 'string' && err.code !== '' ? ` [${err.code}]` : '';
     return await failRun({
       pool, intent, notifyImpl, log,
-      sessionId, childRunId, reason: `起 run 失败：${err?.message ?? String(err)}`,
+      sessionId, childRunId, reason: `起 run 失败：${err?.message ?? String(err)}${code}`,
     });
   }
 
