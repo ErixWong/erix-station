@@ -36,7 +36,7 @@
     "inventory:env-knobs": "node scripts/env-knob-inventory.mjs"
   },
   "dependencies": {
-    "erix-agent": "0.33.0",
+    "erix-agent": "0.34.0",
     "nodemailer": "10.3.1",
     "pg": "^8.23.0",
     "yaml": "2.9.1"
