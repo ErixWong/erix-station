@@ -398,7 +398,8 @@ function assistantTurnFields(turns) {
  *   渲染成「未知」（前端现有 `dur` 为空时不显示，**不是报错**）。真正会被影响的集合是「投影不带
  *   `durationMs`、而宿主 `tool_calls.duration_ms` 有值」的那些 `(run_id, call_id)`。数它先用
  *   docs/data/model.md §1.13 的那条查询取分母，再按 `run_id` 关联 `runs` / `tool_calls` 收口
- *   （⚠ `transcript_rounds` 存在 `run_id IS NULL` 的历史行，它们不经 DTO 面——别把块数当影响面；
+ *   （⚠ `transcript_rounds` 有 `run_id IS NULL` 的历史行，视图层会把没归属的轮次归给会话唯一 run，
+ *   所以它们**也**能命中这条回落——界线是 `call_id` 能否匹配那个 run 的 `tool_calls`，不是块自己的 `run_id`；
  *   按 record 顶层路径直查 `duration` 也是恒 0 的假阴性，本单先被它骗过一次）。
  *
  * 为什么仍在投影**之后**做：`assistantTurnFields()` 的职责是**逐字透传**上游形状、不向引擎字段里注

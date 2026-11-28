@@ -1460,7 +1460,7 @@ test('issue #283/#299/#303：时长只来自引擎投影——宿主 join 已退
   assert.deepEqual(dto.toolCalls, engineCalls,
     '宿主行不参与 ⇒ DTO 的 toolCalls 与引擎投影逐字相同（不裁剪、不改名、不重推导、不添键）');
   for (const call of engineCalls) {
-    assert.equal('durationMs' in call, false, '引擎产出的对象不被就地改写（join 产出新对象，不动上游形状）');
+    assert.equal('durationMs' in call, false, '引擎产出的对象不带 durationMs（#303 后宿主不参与，键的有无只由引擎投影决定）')
   }
 });
 
@@ -1506,8 +1506,10 @@ test('#299 ③：投影与宿主**都缺** ⇒ DTO 里没有 durationMs 这个�
     undefined,
     [],
     [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }],
-    // 这些宿主行现在**应当被完全忽略**（join 已在 #303 退役）：留着它们是一次绊线——若视图层哪天
-    // 重新去读 `tool_calls`，`SessionViewPool` 的守卫会当场 throw 指名报错，而不是静默拿到值。 0` 变异抓到）
+    // 这些宿主行现在**应当被完全忽略**（join 已在 #303 退役）。本用例直接调 `projectSessionMessages`、
+    // 不经 `SessionViewPool`，所以它们不是运行期绊线（真正的绊线是端点级那条守卫，下面单独有用例：
+    // 谁再查 `tool_calls` 就当场 throw 指名报错）；这里留着只是**入参面**的哨兵：传不传、值还是 null
+    // 都不许影响 DTO。
     [{ run_id: RUN_1, call_id: 'ghost-call', duration_ms: 42 }],
   ]) {
     const dto = projectSessionMessages({
