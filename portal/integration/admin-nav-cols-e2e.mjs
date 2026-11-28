@@ -34,6 +34,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import https from 'node:https';
+// #897：宿主凭据路径与脚本账号默认登录名的**唯一来源**（坐标只许住在 lib/dev-creds.mjs，
+// 闸 `check:doc-portable` 的窄判据会拦代码行里的新凭据字面）。
+import { credsFileCandidates } from './lib/dev-creds.mjs';
 
 // 自签证书（本机 CA 未进容器信任库），关掉校验；只在测试进程内生效，不外溢。
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -42,11 +45,11 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const BASE = (process.env.E2E_BASE || process.env.E2E_UI_BASE || 'https://admin.fde.erix.vip:9443').replace(/\/$/, '');
 // dev 管理账号（与口令文件配对；口令绝不打印）。可用 `ADMIN_LOGIN` 覆盖。
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
-// 口令候选：显式 `ADMIN_PASSWORD_FILE` 优先，否则走本机凭据目录的固定路径（坐标，别外传到文档/注释里）。
-const PASSWORD_FILE_CANDIDATES = process.env.ADMIN_PASSWORD_FILE
+// 口令候选：显式 `ADMIN_PASSWORD_FILE` 优先，否则走本机凭据目录（坐标由 #897 收敛到 lib/dev-creds.mjs）。
+const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
   ? [process.env.ADMIN_PASSWORD_FILE]
-  : ['~/.config/mcp/creds/station-dev.password', '~/.config/creds/station-dev-password-file']
-    .map((p) => p.replace(/^~/, os.homedir()));
+  : credsFileCandidates('admin'))
+  .map((p) => p.replace(/^~/, os.homedir()));
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
 
 const UI_ENABLED = process.env.E2E_UI === '1';
@@ -383,8 +386,18 @@ try {
   r.table = await page.evaluate((shapes) => {
     const table = document.querySelector('table[data-test="user-table"]');
     const ths = table ? [...table.querySelectorAll('thead th')] : [];
-    const wrappedThs = ths.filter((th) => th.scrollHeight > th.clientHeight + 1)
-      .map((th) => ({ text: (th.textContent || '').trim().slice(0, 40), scrollHeight: th.scrollHeight, clientHeight: th.clientHeight }));
+    // 「表头是否换行」不能用 scrollHeight > clientHeight 判：表格单元格的高度会跟着行高一起长，
+    // 两个值永远相等 ⇒ 那条断言恒真（变异实测：把 th 压到 48px 宽 + white-space:normal 强制折行，
+    // 旧写法仍然报空数组）。改为数**行盒**：Range 覆盖文本后取 client rects，按 top 去重即行数。
+    // 注意本段代码住在模板字符串里（要投进容器执行）⇒ 注释里不许出现反引号。
+    const lineCount = (el) => {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const tops = new Set([...range.getClientRects()].map((rc) => Math.round(rc.top)));
+      return tops.size;
+    };
+    const wrappedThs = ths.map((th) => ({ text: (th.textContent || '').trim().slice(0, 40), lines: lineCount(th) }))
+      .filter((each) => each.lines > 1);
     const rows = table ? [...table.querySelectorAll('tbody [data-test="user-row"]')] : [];
     const seatCells = [];
     const statusGlyphs = [];
