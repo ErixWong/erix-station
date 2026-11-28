@@ -309,16 +309,23 @@ async function gather() {
       // `password_change_required` 是**登录成功响应里的顶层布尔**，不是 `error.code`。口令不对是
       // 401 `invalid_credentials`，限流是 429。⚠ 别照抄被截断的日志：本单先写成 `invalid_cred`，
       // 真码是 `invalid_credentials`（变异自己抓到的）。
+      // 第二因素只认 wire 上那两个信号（响应体**顶层**的 `status` 与 `pending_token`）。
+      // `password_change_required` **不是**二因素：它出现在 `status: 'authenticated'` 的成功响应里，
+      // 与「有没有会话 cookie」无关 ⇒ 拿它当二因素，会把「200 却没 cookie」这个真缺陷洗成环境 skip。
       const stepUpStatuses = ['email_code_required', 'totp_required', 'second_factor_choice'];
-      const secondFactor = !!fl.json?.pending_token
-        || stepUpStatuses.includes(fl.json?.status)
-        || fl.json?.password_change_required === true;
+      const secondFactor = !!fl.json?.pending_token || stepUpStatuses.includes(fl.json?.status);
+      // 环境形状**逐个点错误码**，不一概放行 5xx（这些都是「账号/邮件通道怎么配的」而非产品坏了）：
+      // `email_not_registered`（开了邮箱码但账号没录邮箱）、`email_channel_unavailable`（开了但 SMTP 没配）、
+      // `email_send_failed`（SMTP 发不出去，retryable）。**留在判红**的是 500、503 `kdf_busy`（容量/可用性
+      // 信号，要测可用性就不该被洗绿）与 400 `validation_failed` / 413（我们自己的请求形状错了）。
+      const envCodes = ['invalid_credentials', 'rate_limited', 'email_not_registered',
+        'email_channel_unavailable', 'email_send_failed'];
       if (fl.status === 200 && fl.cookies.length > 0) {
         // 登进去了 ⇒ H3 的 403 断言正常跑
       } else {
         const why = `非管理员 ${FDE_LOGIN} 登录 HTTP ${fl.status}${code ? ` ${code}` : ''}`
           + `${secondFactor ? '（带 pending_token ⇒ 这个账号开了第二因素，本脚本只会口令直通）' : ''}`;
-        if (fl.status === 401 || secondFactor || fl.status === 429) {
+        if (fl.status === 401 || fl.status === 429 || secondFactor || envCodes.includes(code)) {
           probe.reasons.nonadmin = `${why} ⇒ 已知环境形状（口令未配 / 二因素 / 限流）`;
         } else {
           probe.nonadminFatal = `${why} ⇒ **不在**已知环境形状清单里，按产品缺陷判红`;
