@@ -579,10 +579,23 @@ function digText(input: unknown): string {
   return (typeof input === 'object' ? JSON.stringify(input ?? {}) : String(input ?? '')).slice(0, 120);
 }
 
+/**
+ * issue #867：实时流（SSE）连接态——**三态都是可判读的界面事实**，不是内部实现细节：
+ *   · `connected`　　—— 这条连接正在送帧（收到过任何一帧即算）；
+ *   · `reconnecting` —— 端点已拨出、还没送过帧，或浏览器正在自己重试（服务端 `retry:` 间隔）；
+ *   · `disconnected` —— 没有活连接：开流被判定不再重试（端点回非 2xx）或已主动关掉。
+ * 措辞约束（工单判据 4）：界面文案只用状态词，不许出现「错误 / 失败 / 崩溃」——
+ * 历史正文仍在屏上，这里说的只是「实时更新断了」。
+ */
+export type StreamStatus = 'connected' | 'reconnecting' | 'disconnected';
+
 export function useEventStream(hooks: EventStreamHooks) {
   // ---- 协议状态（旧 S 的 SSE 相关字段；es 非响应式，等价旧 S.es 引用比较）----
   const lastSeq = ref(0);
   const esSessionId = ref<string | null>(null);
+  // issue #867：实时流连接态。历史正文已经渲染在屏上，开流失败时**界面看着一切正常**却再也收不到
+  // 新消息 ⇒ 必须有一个可判读的态给界面（`components/StreamStatusBanner.vue`）。
+  const streamStatus = ref<StreamStatus>('disconnected');
   const activeRunId = ref<string | null>(null);
   // 流式增量气泡文本（旧 S.deltaBuf 指向的 DOM 的 textContent；null = 无活动气泡）。
   // round_start 只置 null（旧版不 remove 元素——半截增量留在流里）；当前 run_end 才移除。
@@ -643,6 +656,8 @@ export function useEventStream(hooks: EventStreamHooks) {
 
   function closeEs() {
     if (es) { es.close(); es = null; }
+    // 手里没有活连接 ⇒ 「没有实时流」是唯一诚实的态（换会话/登出/重连前的空档都落在这里）。
+    streamStatus.value = 'disconnected';
   }
 
   // §5.2：带 ?last_event_id=<seq> 重连 → 服务端补发 seq > last_event_id 的事件；
@@ -655,10 +670,41 @@ export function useEventStream(hooks: EventStreamHooks) {
     conn.onmessage = () => {}; // 具名事件分发
     for (const type of EVENT_TYPES) {
       // 陈旧连接的事件一律忽略（重连后旧连接可能还有在途帧，防重复渲染/重复推进水位线）。
-      conn.addEventListener(type, (e) => { if (es !== conn) return; handleEvent(type, e); });
+      // 收到任何一帧 = 这条连接确实在送数据（比 `onopen` 更强的证据）⇒ 三态里的 `connected`。
+      conn.addEventListener(type, (e) => {
+        if (es !== conn) return;
+        streamStatus.value = 'connected';
+        handleEvent(type, e);
+      });
     }
-    conn.onopen = () => { if (es === conn) hooks.onConnected?.(id); };
-    conn.onerror = () => { /* EventSource 自动重连，带 Last-Event-ID */ };
+    // 开流即「重连中」：这条连接还没证明自己能送帧（`onopen` 只证明响应头到了）。
+    streamStatus.value = 'reconnecting';
+    conn.onopen = () => {
+      if (es !== conn) return;
+      streamStatus.value = 'connected';
+      hooks.onConnected?.(id);
+    };
+    // issue #867：这里原来是一句空注释（「EventSource 自动重连」）——浏览器的自动重连**只覆盖**
+    // 「临时网络故障」那一类；端点回了非 2xx（portal 重启、代理拦截、`last_event_id` 越界 404）
+    // 时它按规范**判死不再重试**（`readyState` 变 `CLOSED`），而界面一句话都不说。
+    // 现在两个分支都有态：还活着在试 ⇒ `reconnecting`；被判定不再重试 ⇒ `disconnected`（手动重连的入口）。
+    conn.onerror = () => {
+      if (es !== conn) return; // 陈旧连接的错误不改当前态
+      // `2` = `EventSource.CLOSED`。写数字而不写 `EventSource.CLOSED`：单测里的 EventSource 桩没有那个
+      // 静态常量，拿它比会退化成 `undefined === undefined` ⇒ 任何 error 都被判成「已判死」，用例假绿。
+      streamStatus.value = conn.readyState === 2 ? 'disconnected' : 'reconnecting';
+    };
+  }
+
+  /**
+   * issue #867：手动重连（界面上「点此重连」那一颗）。带着本地水位重开一条连接，
+   * 由服务端补发 `seq > lastSeq` 的事件（§5.2）——**不碰已渲染的正文**，缺的那段由补发接上。
+   */
+  function reconnectStream() {
+    const id = esSessionId.value;
+    if (!id) return;
+    closeEs();
+    connect(id, lastSeq.value > 0 ? lastSeq.value : null);
   }
 
   // 需重同步（仅由服务端 `resync` 控制帧触发，如补发前缓冲溢出）：主动断开 +
@@ -1367,7 +1413,8 @@ export function useEventStream(hooks: EventStreamHooks) {
 
   return {
     lastSeq, esSessionId, activeRunId, deltaText, deltaRunId, toolCards,
-    connect, closeEs, resetStreamState,
+    streamStatus, // issue #867：连接态（`connected` / `reconnecting` / `disconnected`）
+    connect, closeEs, resetStreamState, reconnectStream,
     // handleEvent/toolCard 导出仅为单测驱动（旧版 static-client.test.js 的 vm 直驱等价）；
     // replayEvent 供 openSession 历史归并回放驱动（issue #89）；projectToolCard 供 DTO 投影路径（#188）。
     // cardIdentityOfCall（issue #279）：关联索引的只读探针——存的是「这个 provider id 最新对应哪张卡」，

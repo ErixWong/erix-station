@@ -22,6 +22,8 @@ import FoldOriginalTurns from '../components/FoldOriginalTurns.vue';
 import RunStatusBar from '../components/RunStatusBar.vue';
 import ComposerBar from '../components/ComposerBar.vue';
 import QueuedInputsBar from '../components/QueuedInputsBar.vue';
+// issue #867：实时流（SSE）断线状态条（中性面；历史正文仍在屏上，只是收不到新消息）。
+import StreamStatusBanner from '../components/StreamStatusBanner.vue';
 // issue #592：子 run 活动面板（设计 §4.3 的落点：状态条**下方**、队列条**上方**，读序
 // 「现在在跑什么 → 还排队说什么 → 输入框」）。徒标在 `RunStatusBar` 尾部，两边读 store 里同一份账。
 import DelegateActivityBar from '../components/DelegateActivityBar.vue';
@@ -659,6 +661,9 @@ function onFoldNodeClick(index: number): void {
         <!-- issue #282：状态条挂在消息流**下方**、输入框**上方**（不塞进 StreamPanel 的渲染循环，也不在
              滚动容器里——常驻可见）。原来在流上方，顶部一行容易被忽略；贴到 composer 上沿后视线自然落到它。
              无选中会话时不挂（没有 run 可报，也不白起一个 1s 时钟）。 -->
+        <!-- issue #867：实时流断线面（中性状态词）。挂在消息流**正下方**：它说的是「还收不收得到新消息」，
+             紧跟在它说的那段正文后面才读得顺；再往下才是「在跑什么 → 排队说什么 → 输入框」。 -->
+        <StreamStatusBanner v-if="store.sessionId" />
         <RunStatusBar v-if="store.sessionId" />
         <!-- issue #592：展开态面板（徒标点开后才会挂；无内容时整段不渲染，不会顶出一条空栏）。 -->
         <DelegateActivityBar v-if="store.sessionId" />

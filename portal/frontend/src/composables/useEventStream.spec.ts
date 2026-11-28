@@ -10,7 +10,10 @@ class FakeEventSource {
   static instances: FakeEventSource[] = [];
   url: string;
   closed = false;
+  /** issue #867：1 = CONNECTING（浏览器还会自己重试）；2 = CLOSED（端点回非 2xx ⇒ 判死）。 */
+  readyState = 1;
   listeners = new Map<string, ((e: MessageEvent) => void)[]>();
+  onopen: (() => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: (() => void) | null = null;
 
@@ -28,6 +31,9 @@ class FakeEventSource {
     const frame = { data: typeof data === 'string' ? data : JSON.stringify(data) } as MessageEvent;
     for (const fn of this.listeners.get(type) ?? []) fn(frame);
   }
+  // issue #867：连接生命周期两个入口（状态机单测用）
+  fireOpen() { this.onopen?.(); }
+  fireError(readyState: number) { this.readyState = readyState; this.onerror?.(); }
 }
 
 function makeHooks() {
@@ -2112,5 +2118,111 @@ describe('copilot 验收 D：旧页回放不得回退轮号水位（roundTokenBy
     s.replayEvent({ seq: 5, run_id: 'r1', type: 'attempt', payload: { round: 1, attempt: 2, maxAttempts: 3 } }, 'older-page');
     lastES().emit('tool_use', { seq: 41, run_id: 'r1', tool_call_id: 'c1', name: 'bash', input: {} });
     expect([...s.toolCards.keys()]).toEqual(['r1:3:c1']);
+  });
+});
+
+// issue #867：连接态三态机。这里钉的是**状态机本身**（界面那一半在 components/StreamStatusBanner.spec.ts，
+// 那里全部读 DOM）。三态的判据各自一条，加上「断流不许清正文」与「手动重连带水位」两条语义。
+describe('useEventStream 连接态（issue #867：开流失败不再默默无声）', () => {
+  it('`reconnecting`：开流即进该态；`onopen` 或收到任何一帧 ⇒ `connected`', () => {
+    const hooks = makeHooks();
+    const onConnected = vi.fn();
+    const s = useEventStream({ ...hooks, onConnected });
+    expect(s.streamStatus.value).toBe('disconnected'); // 一条都没开过
+
+    s.connect('sess-1');
+    expect(s.streamStatus.value).toBe('reconnecting'); // 拨出去了，还没证明能送帧
+
+    lastES().fireOpen();
+    expect(s.streamStatus.value).toBe('connected');
+    expect(onConnected).toHaveBeenCalledWith('sess-1'); // 原有钩子语义不动
+
+    // `onopen` 缺席也不能永远卡在 reconnecting：收到真帧就是更强的证据
+    const s2 = useEventStream(makeHooks());
+    s2.connect('sess-2');
+    lastES().emit('ping', { ts: 'x' });
+    expect(s2.streamStatus.value).toBe('connected');
+  });
+
+  it('`reconnecting`：临时故障（浏览器还会自己重试）不得说成「已断开」', () => {
+    const s = useEventStream(makeHooks());
+    s.connect('sess-1');
+    lastES().emit('assistant_delta', { seq: 3, text: 'a' });
+    expect(s.streamStatus.value).toBe('connected');
+
+    lastES().fireError(1); // CONNECTING
+    expect(s.streamStatus.value).toBe('reconnecting');
+  });
+
+  it('`disconnected`：端点回非 2xx ⇒ 浏览器判死不再重试 ⇒ 界面必须能看出断了', () => {
+    const s = useEventStream(makeHooks());
+    s.connect('sess-1');
+    lastES().emit('assistant_delta', { seq: 3, text: '已在屏上的半句' });
+    expect(s.streamStatus.value).toBe('connected');
+
+    lastES().fireError(2); // CLOSED：portal 重启 / 代理拦截 / last_event_id 越界 400与404
+    expect(s.streamStatus.value).toBe('disconnected');
+    // 断流**不清屏**（issue 的本体：正文必须还在，只是收不到新的）
+    expect(s.deltaText.value).toBe('已在屏上的半句');
+    expect(s.lastSeq.value).toBe(3);
+  });
+
+  it('陈旧连接的 error 不改当前态（重连后旧连接被判死不得误报为新流断了）', () => {
+    const s = useEventStream(makeHooks());
+    s.connect('sess-1');
+    const stale = lastES();
+    s.connect('sess-1', 1);
+    lastES().emit('assistant_delta', { seq: 2, text: 'new' });
+    expect(s.streamStatus.value).toBe('connected');
+
+    stale.fireError(2);
+    expect(s.streamStatus.value).toBe('connected');
+  });
+
+  it('手动重连：关掉判死那条、带 last_event_id 重开；水位与正文一个字都不动', () => {
+    const s = useEventStream(makeHooks());
+    s.connect('sess-1');
+    lastES().emit('assistant_delta', { seq: 9, text: '已上屏' });
+    const dead = lastES();
+    dead.fireError(2);
+    expect(s.streamStatus.value).toBe('disconnected');
+
+    s.reconnectStream();
+    expect(dead.closed).toBe(true);
+    expect(lastES().url).toBe('/api/sessions/sess-1/events?last_event_id=9');
+    expect(s.streamStatus.value).toBe('reconnecting');
+    expect(s.lastSeq.value).toBe(9);        // 水位不动 ⇒ 补发不会重复投递
+    expect(s.deltaText.value).toBe('已上屏'); // 正文不动
+
+    lastES().emit('assistant_delta', { seq: 10, text: '。' });
+    expect(s.streamStatus.value).toBe('connected');
+  });
+
+  it('没开过流的手动重连不凭空拨号（也没有会话可连）', () => {
+    const s = useEventStream(makeHooks());
+    s.reconnectStream();
+    expect(FakeEventSource.instances.length).toBe(0);
+    expect(s.streamStatus.value).toBe('disconnected');
+  });
+
+  it('换会话/登出的协议复位 ⇒ `disconnected`（不留「还连着」的谎）', () => {
+    const s = useEventStream(makeHooks());
+    s.connect('sess-1');
+    lastES().emit('ping', { ts: 'x' });
+    expect(s.streamStatus.value).toBe('connected');
+
+    s.resetStreamState();
+    expect(s.streamStatus.value).toBe('disconnected');
+    expect(FakeEventSource.instances[0].closed).toBe(true);
+  });
+
+  it('resync 重连期间就是 `reconnecting`（不是断了）：控制帧触发主动重连后态不能黑成断开', () => {
+    const s = useEventStream(makeHooks());
+    s.connect('sess-1');
+    lastES().emit('assistant_delta', { seq: 4, text: 'a' });
+    lastES().emit('resync', { reason: 'buffer_overflow' });
+    expect(s.streamStatus.value).toBe('reconnecting'); // closeEs 后紧接 connect，终态是重连中
+    expect(s.lastSeq.value).toBe(4);
+    expect(s.deltaText.value).toBe('a');
   });
 });
