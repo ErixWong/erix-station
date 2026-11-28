@@ -578,10 +578,13 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
       assert.ok(m, `容器里的采集脚本没交出 REPORT（tail=${out.slice(-400)}）`);
       const rep = JSON.parse(m[1]);
 
-      // 导航/渲染挂了分两类：压根没到页面（DNS/TLS/入口挂了 = 环境）说 skip，到了页面却没跑通 = 产品红。
+      // 导航/渲染挂了分两类：**没到登录页**（DNS/TLS/入口挂了 = 环境形状）才允许 skip；一旦正面
+      // 认定到过登录页（`reachedLogin`：goto 之后等到了登录表单），之后的任何 fatal 一律判红——
+      // 登录后、表格出现前的连接中断也带 `net::`，只看错误文案会把它伪装成环境（同 #878 口径）。
       if (rep.fatal && !rep.page.tablePresent) {
-        if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(rep.fatal)) {
-          t.diagnostic(`SKIP (ui)：管理台入口 ${BASE} 从容器里到不了：${rep.fatal}`);
+        if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(rep.fatal)
+          && !rep.reachedLogin) {
+          t.diagnostic(`SKIP (ui)：还没到登录页就到不了管理台入口 ${BASE}（环境形状）：${rep.fatal}`);
           t.skip();
           return;
         }
@@ -636,6 +639,11 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
       // 内容断言读稍后的那次采样（cells）：**只判每格长什么样，不判数量**（数量已在上面同一次
       // 快照里判完）。跨采样比数量会在轮询时假红，所以这里刻意没有 cells.length 的断言。
       const cells = rep.page.cells || [];
+      // 这次采样自己也要非空判据：`usageTable` 有行**保不了**这次也拿到格（另一次查询）。
+      // 空集合会让下面按格的 data-test / lifetime / period 循环整批空过 = 假绿。刻意**不**与
+      // usageTable 的格数比：跨采样比数量会在轮询时假红。
+      assert.ok(cells.length > 0,
+        `内容断言那次采样一个用量格都没拿到（cells=[]）⇒ 按格的检查会整批空过（假绿）`);
       // ② 每个用量格 data-test 合法（unknown|period|lifetime），整表不残留 pending。
       assert.equal(rep.page.pendingCount, 0, `整表残留 user-usage-pending ${rep.page.pendingCount} 格（卡在加载态 = 红）`);
       for (const c of cells) {
