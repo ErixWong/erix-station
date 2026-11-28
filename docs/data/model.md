@@ -264,6 +264,12 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 ### 1.13 `tool_calls` / `judge_decisions` / `approvals` / `artifacts`
 
 - `tool_calls`：`call_id` 对应事件流的 `tool_call_id`（portal.md §5.3），`UNIQUE(run_id, call_id)`；**`call_id` 是外部 ID（canonical，见 §1.19），`tool_calls.id` 仅内部主键（uuid）、不外露**；`result_digest` 只存摘要（完整结果可能很大）；`approved` 三态（`NULL` = 未涉及审批）。**行由 portal 在 U3 事件上报时幂等 upsert**（`type='tool_use'` 事件 `INSERT ... ON CONFLICT (run_id, call_id) DO NOTHING`，后续 `tool_result`/`tool_call_delta` 更新派生字段，portal.md §9.10）——U10 建审批单时行必已存在。
+  - **`duration_ms` 列（#303 后）**：该列仍由 U3 的 `tool_result` UPDATE 回填（写侧未变），但**自 #303（erix-agent 0.34.0 后旧键 `duration` 退役）起不再被读进对话流 DTO 的 `toolCalls[].durationMs`**——后者现在只来自引擎投影的 `erix.durationMs`（旧「投影缺省 ⇒ 回落宿主 `tool_calls.duration_ms`」支路已删，见 portal.md §5.3）。此列的旧回落曾是它在视图层的**唯一**读点；#303 删后，产品代码里已无消费此列做展示的路径（写侧仍保留：U3 照旧回填，与 `run_events` 的 `tool_result` 事件一起作为历史/审计的时长存档）。
+  - **跨实例风险（#303）**：删的是「读旧数据」的兼容——**存量比本次发布老的实例升级后**，那些老对话（引擎当年没写 `erix.*`、只有顶层 `duration` 或宿主 `tool_calls.duration_ms`）的工具耗时会渲染为「未知」（前端现有 `dur` 为空时不显示，**不是报错**）。
+  - **存量核对（可复跑语句形态，勿把某机实测数字当结论）**：
+    - 带顶层旧键的 transcript 记录：`SELECT count(*) FROM transcript_rounds WHERE record::jsonb ? 'duration';`
+    - 有 `toolResults` 却整条没任何 `durationMs` 的记录（升级后会变「未知」的那批）：`SELECT count(*) FROM transcript_rounds r WHERE jsonb_typeof(r.record::jsonb -> 'toolResults') = 'array' AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(r.record::jsonb -> 'toolResults') e WHERE e ? 'durationMs');`
+    - `tool_calls` 侧本来就该是 NULL、不是待修数据的行：`SELECT count(*) FROM tool_calls WHERE duration_ms IS NULL;`
 - `judge_decisions`：judge 事件（`kind / action / decision`）的持久化，与 `run_events` 中 `judge` 类型事件同源。
 - `approvals`：**一个工具调用至多一条审批单**（`UNIQUE(run_id, tool_call_id)`，`tool_call_id` 为外部 `call_id`）；`CHECK` 保证 `pending/expired` 与 `decided_at IS NULL` 一致；决定后 runner 轮询继续/终止（portal.md §4.8）。状态机见 §2.3。⚠️ 超时语义已定稿（#10：`pending → expired`，由 portal 打标，topology.md §4-L6）；`tool_call_id` 是否改判 UUID 待 #10 确认。
 - `artifacts`：run 产出的文件登记（issue #64 R1 起为**终态产物 bundle 登记**：`kind='worktree_bundle'`（**历史遗留名**：D8 修订后 bundle 的内容来自**项目目录（worker cwd）**而非 run worktree，值本身是契约不因此改名 ⇒ `portal/src/artifacts.js` 的 `ARTIFACT_KIND`），一 run 一行，`UNIQUE(run_id, kind)`（迁移 0005），重复上传 409 不覆盖）。`path` = portal 持久卷路径（`ERIX_ARTIFACTS_ROOT/<runId>.tar.gz`；原「容器内路径」登记设想由 v1 bundle 语义替代），`size`/`sha`（sha256）描述 bundle 本体，`manifest`（jsonb，迁移 0005）= agentd 生成的包内清单（文件路径/大小/sha256/`truncated` 截断标记），portal 从 tar 内 `manifest.json` 抽出落库。bundle 内容：`diff.patch`（git diff HEAD）+ 新文件快照 + `manifest.json`，上限 20MB（`ERIX_ARTIFACT_MAX_BYTES`）。

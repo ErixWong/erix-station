@@ -264,8 +264,8 @@ export function buildDelegateContext(engineContext, runId) {
 /**
  * LoopEvent → U3 事件 payload 的映射（§5/§7.3）。
  * issue #283 / #299：`export` 仅为单测可见面（runner/test/tool-result-envelope-contract.test.js
- * 要钉 `duration_ms` 的取值口径：新记录读 `erix.durationMs`、老记录回退顶层 `duration`、
- * 两者都缺⇒ `null`，**绝不伪装成 0**）；worker 自身调用方式不变。
+ * 要钉 `duration_ms` 的取值口径：只读 `erix.durationMs`、缺值 ⇒ `null`（#303 已删顶层 `duration` 回退），
+ * **绝不伪装成 0**）；worker 自身调用方式不变。
  */
 export function loopEventPayload(event, meta = {}) {
   switch (event?.type) {
