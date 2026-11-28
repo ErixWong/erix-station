@@ -19,6 +19,9 @@ const props = defineProps<{
   createdAt?: string;        // 有就画时刻（口径同 issue #282 A）
   html?: string | null;      // 已渲染好的 markdown（主对话走这条）
   text?: string;             // 纯文本兜底
+  // issue #243：终局正文是被文本化的工具调用（run 仍正常结束）⇒ 气泡上带一行**中性**状态词。
+  // 中性而非报错：不抢 .syserr 红底、不说「错误/失败」；run 正常结束，这是「报告可能不完整」。
+  textualized?: boolean;
 }>();
 
 const { t, locale } = useI18n();
@@ -49,5 +52,13 @@ const timeText = computed(() => formatMessageTime(props.createdAt, locale.value)
     >{{ timeText }}</time>
     <div v-if="html" v-mermaid v-html="html"></div>
     <template v-else>{{ text }}</template>
+    <!-- issue #243：中性状态行（有 textualized 才出）。非红、非告警底色，只一句「机器标记 / 可能不完整」的状态词，
+         与 .partial 那行同一视觉等级（text-black/45），不进红色 .syserr 语义。 -->
+    <div
+      v-if="textualized"
+      class="msg-textualized mt-0.5 text-xs text-black/45"
+      data-test="textualized-notice"
+      :title="t('stream.textualized.hint')"
+    >{{ t('stream.textualized.label') }}</div>
   </div>
 </template>

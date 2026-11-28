@@ -625,7 +625,12 @@ export function collectTranscriptFacts(transcriptRows) {
  */
 export function projectSessionMessages({
   sessionId, anchors, userAnchors, transcriptRows, toolCallRows, facts = null,
+  // issue #243：终态带 `textualized_tool_call` 诊断的 run 集合（调用方按 run_id 提供，见 `sessions.js`）。
+  // additive 可选参：缺省 / 非 Set ⇒ 空集 ⇒ DTO 不出现 `textualized_tool_call` 键（绝不透成 false）。
+  textualizedRunIds = null,
 }) {
+  // 键缺席 = 不知道 / 没命中；命中才给布尔（与终局信封、`run_events` 诊断同一口径）。
+  const textualizedRuns = textualizedRunIds instanceof Set ? textualizedRunIds : new Set();
   const users = [...userAnchors].sort((a, b) => Number(a.seq) - Number(b.seq));
   const userById = new Map(users.map((anchor) => [String(anchor.id), anchor]));
   const userAnchorsByText = new Map();
@@ -851,6 +856,10 @@ export function projectSessionMessages({
       // 上游三元组 + 折叠摘要原文（text），逐字透传；有则出现、无则不写键，同 toolCalls 规矩。
       const folded = runFolded.get(anchor.run_id);
       if (folded !== undefined) dto.folded = folded;
+      // issue #243：这一轮的终局正文是**被文本化的工具调用**（模型把 tool call 吐进 content，run 仍正常
+      // 结束）⇒ 给这条助手气泡挂一个**中性状态标记**（有则出现、无则不写键，同 toolCalls/folded 规矩，
+      // 绝不写 false）。前端据此画「这条回复是机器标记，报告可能不完整」的状态词——不是报错。
+      if (textualizedRuns.has(anchor.run_id)) dto.textualized_tool_call = true;
     }
     return dto;
   });

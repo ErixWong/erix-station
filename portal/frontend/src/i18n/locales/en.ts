@@ -342,6 +342,13 @@ export const en = {
       // placeholder item and the UI shows one **neutral** line instead of an empty bubble.
       placeholder: 'The text of this output was not retained (not persisted when the run stopped); the terminal state follows below.',
     },
+    // issue #243: the final reply body is a *textualized tool call* ⇒ one neutral status line on that
+    // assistant bubble. The run finished normally, so this is not a fault ⇒ the copy says "may be
+    // incomplete" and never uses alarm words like "error/failed".
+    textualized: {
+      label: 'This reply is a machine marker · the report may be incomplete',
+      hint: 'The model wrote a tool call into the body; the run finished normally, but the final reply may not be a conclusion',
+    },
     // Mermaid diagram blocks (see pi-web MermaidBlock): preview/source toggle & render-failure note
     mermaid: {
       preview: 'Preview',

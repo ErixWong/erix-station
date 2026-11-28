@@ -434,6 +434,21 @@ export async function getSession(
       [durationRunIds],
     )
     : { rows: [] };
+  // issue #243：这一批锚点涉及的 run 里，哪些终态合成了 `textualized_tool_call` 诊断事件（终局正文是被
+  // 文本化的工具调用）。只取本批 run（同 toolCallDurations 的取数面）；命中与否只看有无这一行（不取 payload）。
+  // 诊断事件由 portal 在终态事务内合成（`internal.js#finishRun`）⇒ 刷新后仍在（已进 `HISTORY_EVENT_TYPES`）。
+  const textualizedEventRows = durationRunIds.length > 0
+    ? await pool.query(
+      `SELECT DISTINCT run_id FROM run_events
+         WHERE run_id = ANY($1::uuid[]) AND type = 'textualized_tool_call'`,
+      [durationRunIds],
+    )
+    : { rows: [] };
+  const textualizedRunIds = new Set(
+    (Array.isArray(textualizedEventRows?.rows) ? textualizedEventRows.rows : [])
+      .map((row) => row?.run_id)
+      .filter((runId) => typeof runId === 'string' && runId !== ''),
+  );
   // #451：`transcript.rows` 只扫这一次——折叠事实与压缩层聚合同源（不另发 SQL）。
   const facts = collectTranscriptFacts(transcript.rows);
   const projection = projectSessionMessages({
@@ -442,6 +457,8 @@ export async function getSession(
     userAnchors: userAnchors.rows,
     transcriptRows: transcript.rows,
     toolCallRows: toolCallDurations.rows,
+    // issue #243：带 `textualized_tool_call` 诊断的 run 集合 ⇒ 投影给对应助手气泡挂中性状态标记。
+    textualizedRunIds,
     // #451：**同一趟扫描**的产物既喂投影（折叠摘要/折叠替代物），又喂下面的
     // `session.compaction` 聚合——成本红线：对 `transcript_rounds` 的查询次数不变。
     facts,
