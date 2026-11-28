@@ -20,8 +20,10 @@ import { hashToken } from '../src/auth.js';
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import { claimMacroRun } from '../src/macros.js';
 import { claimRun } from '../src/internal.js';
+import { validateRunCwd } from '../src/sessions.js';
 import {
   executeScheduledIntent, artifactPath, macroOrigin, macroSessionTitle, defaultReportsRoot,
+  getOrCreateMacroSession,
 } from '../src/macro-scheduled.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
@@ -36,6 +38,78 @@ const ids = (tag) => ({
   userId: crypto.randomUUID(), containerId: crypto.randomUUID(),
   templateId: crypto.randomUUID(), assignmentId: crypto.randomUUID(),
   login: `w7${tag.toLowerCase().replace(/[^a-z0-9]/g, '')}`.slice(0, 30),
+});
+
+// —— issue #919-B：宏会话是第三条写 cwd 的路径（#890 只修了 postMessage 与 createReviewSession）——
+// 假 pool（写法照 macro-dispatcher.test.js 的 #890 createReviewSession 那格），无需 DB：
+// 只驱动 SELECT 复用查 + （必要时）fde_name 查 + INSERT，断言三者的 cwd 参数。
+function fakeMacroPool({ fdeName = 'erix' } = {}) {
+  const queries = [];
+  return {
+    queries,
+    async query(sql, params = []) {
+      queries.push({ sql: String(sql), params });
+      if (/fde_name FROM users/.test(sql)) return { rows: fdeName ? [{ fde_name: fdeName }] : [] };
+      if (/SELECT id FROM chat_sessions/.test(sql)) return { rows: [] }; // 未命中 ⇒ 建
+      if (/INSERT INTO chat_sessions/.test(sql)) return { rows: [{ id: 's-macro' }] };
+      return { rows: [] };
+    },
+  };
+}
+
+test('#919-B 宏会话 getOrCreateMacroSession：绝对 projects/<name> ⇒ SELECT 比对与 INSERT 都用归一的 ~/projects/<name>', async () => {
+  const pool = fakeMacroPool();
+  const out = await getOrCreateMacroSession(pool, {
+    userId: crypto.randomUUID(), templateName: 'daily-report',
+    cwd: '/srv/erix/users/erix/projects/demo_app', config: { userSpaceRoot: '/srv/erix/users' },
+  });
+  assert.equal(out.created, true);
+  const ins = pool.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.ok(ins, '未命中 ⇒ 必须 INSERT');
+  assert.equal(ins.params[2], '~/projects/demo_app', 'INSERT 的 cwd 参数必须是归一的 tilde');
+  assert.notEqual(ins.params[2], '/srv/erix/users/erix/projects/demo_app', '宿主绝对路径绝不能原样落库');
+  // SELECT 比对参数与 INSERT 参数必须一致（同一个归一值），否则会查不中已有会话、重复建。
+  const sel = pool.queries.find((q) => /SELECT id FROM chat_sessions/.test(q.sql));
+  assert.ok(sel, '必须先按 (user,origin,cwd) 查复用');
+  assert.equal(sel.params[2], ins.params[2], 'SELECT 比对参数必须等于 INSERT 的归一值');
+  assert.equal(sel.params[2], '~/projects/demo_app');
+});
+
+test('#919-B 宏会话：~/projects/<name> 原样透传（不折叠、不报错）', async () => {
+  const pool = fakeMacroPool();
+  await getOrCreateMacroSession(pool, {
+    userId: crypto.randomUUID(), templateName: 'daily-report',
+    cwd: '~/projects/demo_app', config: { userSpaceRoot: '/srv/erix/users' },
+  });
+  const ins = pool.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.equal(ins.params[2], '~/projects/demo_app', 'tilde 形态原样透传');
+});
+
+test('#919-B 宏会话：cwd=null / 空串(\'\') / 纯空格 ⇒ INSERT 落 NULL 且不调用校验器（不查 fde_name、不抛）', async () => {
+  // fdeName=null：若被误送进校验器的绝对支会直接抛；用 null 验证 null/空串/纯空格根本不进校验器。
+  const pool = fakeMacroPool({ fdeName: null });
+  const out = await getOrCreateMacroSession(pool, {
+    userId: crypto.randomUUID(), templateName: 'daily-report', cwd: null,
+  });
+  assert.equal(out.created, true);
+  const ins = pool.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.equal(ins.params[2], null, 'cwd=null ⇒ INSERT 落 NULL');
+  assert.equal(pool.queries.some((q) => /fde_name FROM users/.test(q.sql)), false, 'null cwd 不应触发校验器（不查 fde_name）');
+
+  // 空串 ''：同样落 NULL、不查 fde_name、不抛。
+  const pool3 = fakeMacroPool({ fdeName: null });
+  const out3 = await getOrCreateMacroSession(pool3, { userId: crypto.randomUUID(), templateName: 'daily-report', cwd: '' });
+  assert.equal(out3.created, true);
+  const ins3 = pool3.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.equal(ins3.params[2], null, "cwd='' ⇒ INSERT 落 NULL");
+  assert.equal(pool3.queries.some((q) => /fde_name FROM users/.test(q.sql)), false, "cwd='' 不应触发校验器（不查 fde_name）");
+
+  // 纯空格：同样落 NULL、不查 fde_name、不抛。
+  const pool2 = fakeMacroPool({ fdeName: null });
+  await getOrCreateMacroSession(pool2, { userId: crypto.randomUUID(), templateName: 'daily-report', cwd: '   ' });
+  const ins2 = pool2.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.equal(ins2.params[2], null, 'cwd=纯空格 ⇒ 同样落 NULL');
+  assert.equal(pool2.queries.some((q) => /fde_name FROM users/.test(q.sql)), false, '纯空格 cwd 不应触发校验器');
 });
 
 /** 一套可跑 scheduled-task 的现场：用户 / 容器 / scheduled-task 模板 + 订阅（无 session：user scope）。 */
@@ -400,4 +474,68 @@ test('#850 失败通知落库带 title_key=notifications.macroFailed + title_par
     assert.equal(rows[0].title, `宏「daily-${scene.login}」执行失败`, '存量回退面（成品中文）不许消失');
     await fs.rm(home, { recursive: true, force: true });
   });
+});
+
+// —— issue #919 ①：宏路径起 run 也要传归一后的 cwd（不是原始绝对）+ 带 config ——
+// 走真实 executeScheduledIntent + 真实 getOrCreateMacroSession + 真实 validateRunCwd，只把
+// postMessageImpl/runTask/notifyImpl 打桩。假 pool 同时驱动 getOrCreateMacroSession（fde_name /
+// SELECT+INSERT chat_sessions）与 finishMacroRun（UPDATE macro_runs）。postMessageImpl 桩内部用
+// **收到的 config** 过真实 validateRunCwd —— 复刻 postMessage 对 cwd 的那一步：传原始绝对又没带
+// userSpaceRoot 就会抛「需要 userSpaceRoot 与 fde_name」（正是评审 ① 现场），传归一 tilde + config 则不抛。
+test('#919① executeScheduledIntent：绝对 cwd ⇒ 会话行与传给 postMessage 的 cwd 都是归一的 ~/projects/<name>（且不因缺 userSpaceRoot 失败）', async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'w919-macro-int-'));
+  const seen = {};
+  const queries = [];
+  const pool = {
+    async query(sql, params = []) {
+      queries.push({ sql: String(sql), params });
+      if (/fde_name FROM users/.test(sql)) return { rows: [{ fde_name: 'erix' }] };
+      if (/SELECT id FROM chat_sessions/.test(sql)) return { rows: [] }; // 未命中 ⇒ 建
+      if (/INSERT INTO chat_sessions/.test(sql)) return { rows: [{ id: 'sess-919' }] };
+      if (/UPDATE macro_runs/.test(sql)) return { rows: [{ id: 'm-919', assignment_id: 'a', status: 'done', verdict: 'unclassified', started_at: new Date() }] };
+      return { rows: [] };
+    },
+  };
+  const postMessageStub = async (_pool, args) => {
+    seen.args = args;
+    if (typeof args.cwd === 'string' && args.cwd.trim() !== '') {
+      // 复刻 sessions.postMessage 对 cwd 的那一步：缺 userSpaceRoot 的绝对形态会在这里抛。
+      validateRunCwd(args.cwd, { userSpaceRoot: args.config?.userSpaceRoot, fdeName: 'erix' });
+    }
+    return { run: { id: 'child-run-919' } };
+  };
+  const intent = {
+    macroRunId: 'm-919', userId: crypto.randomUUID(), templateName: 'daily-report', bucket: '2026-11-16',
+    cwd: '/srv/erix/users/erix/projects/demo_app',
+    params: { cwd: '/srv/erix/users/erix/projects/demo_app', task: '整理今日变更', maxRounds: 16 },
+  };
+  let out;
+  try {
+    out = await executeScheduledIntent(pool, intent, {
+      reportsRoot: path.join(home, 'reports'),
+      sessionsHome: home,
+      runTask: async () => ({ ok: true, text: '产物正文' }),
+      postMessageImpl: postMessageStub,
+      notifyImpl: async () => {},
+      config: { userSpaceRoot: '/srv/erix/users' },
+    });
+  } catch (e) {
+    out = { threw: e };
+  }
+  await fs.rm(home, { recursive: true, force: true });
+
+  // (c) 全过程没有抛出「需要 userSpaceRoot 与 fde_name」：必须走到 done（不是被 catch 成 failed，也不是抛错）。
+  assert.ok(out, 'executeScheduledIntent 必须有返回');
+  assert.equal(out.threw, undefined, `不得抛错：${out.threw?.message ?? ''}`);
+  assert.equal(out.status, 'done', `必须 done（不是因起 run 失败收口）：${out.reason ?? ''}`);
+
+  // (a) 会话行 INSERT 的 cwd 参数是归一的 ~/projects/<name>。
+  const ins = queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.ok(ins, '必须建宏会话');
+  assert.equal(ins.params[2], '~/projects/demo_app', 'INSERT 的 cwd 必须是归一 tilde');
+
+  // (b) 传给 postMessageImpl 的 cwd 也是归一值，且带上了 config.userSpaceRoot。
+  assert.ok(seen.args, '必须调用 postMessageImpl');
+  assert.equal(seen.args.cwd, '~/projects/demo_app', '传给 postMessage 的 cwd 必须是归一 tilde（不是原始绝对）');
+  assert.equal(seen.args.config?.userSpaceRoot, '/srv/erix/users', '必须把 config 透给 postMessage');
 });

@@ -82,6 +82,65 @@ test('#676-x 越界绝对路径（/root/.erix/...）与非 ~ 相对路径被拒'
   assert.throws(() => validateRunCwd(null, {}), SessionError);
 });
 
+// —— issue #919-A：绝对 cwd 不得整条 trim 后再折叠（首尾空白即拒）——
+// Linux 目录名可合法含首尾空格；若先把绝对路径 trim 再折叠，`<jail>/projects/x ` 会被折成
+// `~/projects/x`（指向另一个目录且不报错）。故绝对形态带首尾空白 ⇒ 直接拒（details.field='cwd' 且带 en）。
+// 反面对照：`~/projects/x ` 这种 tilde 形态仍按既有 trim 行为通过（会话约定，不制造新行为）。
+test('#919-A 绝对 cwd 带首尾空白 ⇒ validation_failed（details.field=cwd 且带 en）；尾空格', () => {
+  // ① 尾部带一个空格
+  assert.throws(
+    () => validateRunCwd(`${USR}/${FDE}/projects/x `, { userSpaceRoot: USR, fdeName: FDE }),
+    (e) => {
+      assert.ok(e instanceof SessionError, '必须是 SessionError');
+      assert.equal(e.code, 'validation_failed');
+      assert.equal(e.details.field, 'cwd');
+      assert.equal(typeof e.en, 'string');
+      assert.ok(e.en.length > 0, '错误必须带 en（中英双语）');
+      return true;
+    },
+  );
+  // ② 头部带空白同理
+  assert.throws(
+    () => validateRunCwd(` ${USR}/${FDE}/projects/x`, { userSpaceRoot: USR, fdeName: FDE }),
+    (e) => e instanceof SessionError && e.code === 'validation_failed' && e.details.field === 'cwd' && typeof e.en === 'string' && e.en.length > 0,
+  );
+  // 首尾都带空白
+  assert.throws(
+    () => validateRunCwd(`  ${USR}/${FDE}/projects/x\t`, { userSpaceRoot: USR, fdeName: FDE }),
+    (e) => e instanceof SessionError && e.code === 'validation_failed' && e.details.field === 'cwd',
+  );
+  // ③ 反面对照：tilde 形态的尾部空格仍按既有行为通过（不能被一并拒）
+  assert.equal(validateRunCwd('~/projects/x ', { userSpaceRoot: USR, fdeName: FDE }), '~/projects/x');
+  assert.equal(validateRunCwd('  ~/projects/x', {}), '~/projects/x');
+  // 反面对照：绝对且无首尾空白仍正常折叠
+  assert.equal(validateRunCwd(`${USR}/${FDE}/projects/x`, { userSpaceRoot: USR, fdeName: FDE }), '~/projects/x');
+});
+
+// —— issue #919-C：恢复被 #890 误删的 details.allowed（API 契约回归）——
+// 旧实现里「第一段子目录 ∉ JAIL_RUN_CWD_HOST_SUFFIXES」这一支（platform/git 等）本就带 details.allowed；
+// #890 重写时把它误删（既有测试只钉 code+details.field 所以没红）。本格钉**完整 details 键集合**
+// （不只 field）+ 钉 en 字面存在 + 钉 allowed 值。用 platform/git（旧就带 allowed 的那一支），
+// 不用 home/cache（那是 #890 新增「非 projects/<name> 一级」拒支，只带 field）。
+test('#919-C platform/git 那一支仍带 details.allowed（完整键集合 + en 字面 + allowed 值）', () => {
+  let err;
+  try {
+    validateRunCwd(`${USR}/${FDE}/platform/git`, { userSpaceRoot: USR, fdeName: FDE });
+    assert.fail('platform/git 必须被拒');
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof SessionError);
+  assert.equal(err.code, 'validation_failed');
+  // 完整 details 键集合：既有 field 也有 allowed（不只 field）。
+  assert.deepStrictEqual(Object.keys(err.details).sort(), ['allowed', 'field']);
+  assert.equal(err.details.field, 'cwd');
+  assert.deepStrictEqual([...err.details.allowed], ['home', 'projects', 'cache']);
+  // en 字面存在且照旧（“jail subdirectory ... allowed: ...”）。
+  assert.equal(typeof err.en, 'string');
+  assert.ok(err.en.includes('the jail subdirectory of cwd cannot be used as a run directory'), err.en);
+  assert.ok(err.en.includes('allowed: home, projects, cache'), err.en);
+});
+
 // —— 用例 1：postMessage 越界 cwd ⇒ validation_failed、不刷会话 cwd、不入队 run（真库）——
 test('#676-1 postMessage 越界 cwd ⇒ validation_failed、会话 cwd 不变、run_queue 无新行',
   { skip: SKIP }, async () => {
@@ -152,14 +211,17 @@ test('#890 调用点：postMessage 传绝对 projects/<name> ⇒ 落库 cwd 是�
     return { rows: [] };
   };
   const client = { async query(sql, params = []) { queries.push({ sql, params }); return dispatch(sql, params); }, release() {} };
+  let precheckCalls = 0;
+  const EXPECTED_PRECHECK_SQL = "SELECT 1 FROM fde_llm_bindings b WHERE b.fde_id = $1 AND b.state = 'active' AND b.gateway = 'litellm' AND b.api_key IS NOT NULL AND b.api_key <> '' AND b.main_model_id IS NOT NULL LIMIT 1";
   const pool = {
     // issue #905 之后，`postMessage` 在建 run 前会先走一次 pool 级的 LLM 上游预检（不经过 `connect()`）。
-    // 本单这格验的是 cwd 归一，不是预检本身 ⇒ 把「绑定已配好」回一行；**其余 SQL 不认就直接抛**，
-    // 免得将来出口又长出一条新查询被这里的兵底默默放行（同 #905 在其他文件里的写法）。
+    // 本单这格验的是 cwd 归一，不是预检本身 ⇒ 把「绑定已配好」回一行；其余 SQL 不认就直接抛。
+    // issue #919-D：改成**全串等值**——归一空白后与完整预检 SQL 逐字相等才接受（只匹配前缀会让
+    // 出口长出第二条同前缀查询、或预检被调两次都被静默放过），并用计数器钉死「一次 postMessage 恰好一次」。
     async query(sql) {
       const s = String(sql).replace(/\s+/g, ' ').trim(); // 那条预检 SQL 是多行字面，不归一匹配不上
-      if (!/^SELECT 1 FROM fde_llm_bindings b\b/.test(s)) throw new Error(`unexpected pool SQL: ${sql}`);
-      return { rows: [{ '?column?': 1 }] };
+      if (s === EXPECTED_PRECHECK_SQL) { precheckCalls++; return { rows: [{ '?column?': 1 }] }; }
+      throw new Error(`unexpected pool SQL: ${sql}`);
     },
     async connect() { return client; },
   };
@@ -170,10 +232,69 @@ test('#890 调用点：postMessage 传绝对 projects/<name> ⇒ 落库 cwd 是�
     config: { userSpaceRoot: '/srv/erix/users' },
   });
 
+  // issue #919-D：加固——预检 SQL 全串等值接受，且一次 postMessage 期间必须**恰好被调一次**。
+  assert.equal(precheckCalls, 1, 'LLM 上游预检 SQL 在一次 postMessage 期间必须恰好被调用一次');
   const cwdUpd = queries.find((q) => /UPDATE chat_sessions SET cwd/.test(q.sql));
   assert.ok(cwdUpd, 'cwd 与会话原值不同 ⇒ 必须发出 UPDATE chat_sessions SET cwd');
   assert.equal(cwdUpd.params[1], '~/projects/demo_app', '落库 cwd 必须是校验器归一的 tilde 形态');
   assert.notEqual(cwdUpd.params[1], '/srv/erix/users/erix/projects/demo_app', '宿主绝对路径绝不能原样落库');
+});
+
+// —— issue #919②：postMessage 自己不再先 trim ⇒ 绝对 cwd 带首尾空白在这条主写入路径也被拒 ——
+// 旧代码 `nextCwdRaw = ... ? cwd.trim() : null` 把已 trim 的值交给校验器，绕过了 validateRunCwd
+// 的「绝对 cwd 不得带首尾空白」拒（A）。修法后交的是原始值。本格：传**尾带一个空格**的绝对
+// projects 路径 ⇒ validation_failed（钉 code + details.field + en），且**没有** UPDATE chat_sessions SET cwd。
+test('#919② postMessage 传尾空格绝对 projects ⇒ validation_failed（details.field=cwd + en）且不刷会话 cwd', async () => {
+  const userId = crypto.randomUUID();
+  const sessionId = crypto.randomUUID();
+  const sessionRow = {
+    id: sessionId, user_id: userId, project_id: null, cwd: '~/projects/orig', title: 't',
+    title_source: 'auto', model: 'mock-model', status: 'active', last_seq: 0, origin: null,
+  };
+  const queries = [];
+  const dispatch = (sql, params = []) => {
+    if (/FROM chat_sessions s/.test(sql)) return { rows: [sessionRow] };
+    if (/fde_name FROM users/.test(sql)) return { rows: [{ fde_name: 'erix' }] };
+    if (/FROM runs WHERE session_id/.test(sql)) return { rows: [] };
+    if (/FROM containers/.test(sql)) return { rows: [{ id: 'c1' }] };
+    if (/UPDATE chat_sessions SET last_seq/.test(sql)) return { rows: [{ last_seq: 1 }] };
+    if (/INSERT INTO messages/.test(sql)) {
+      return { rows: [{ id: crypto.randomUUID(), seq: 1, role: 'user', content: '', attachments: [], created_at: new Date('2026-01-01T00:00:00.000Z') }] };
+    }
+    return { rows: [] };
+  };
+  const client = { async query(sql, params = []) { queries.push({ sql, params }); return dispatch(sql, params); }, release() {} };
+  const EXPECTED_PRECHECK_SQL = "SELECT 1 FROM fde_llm_bindings b WHERE b.fde_id = $1 AND b.state = 'active' AND b.gateway = 'litellm' AND b.api_key IS NOT NULL AND b.api_key <> '' AND b.main_model_id IS NOT NULL LIMIT 1";
+  const pool = {
+    async query(sql) {
+      const s = String(sql).replace(/\s+/g, ' ').trim();
+      if (s === EXPECTED_PRECHECK_SQL) return { rows: [{ '?column?': 1 }] };
+      throw new Error(`unexpected pool SQL: ${sql}`);
+    },
+    async connect() { return client; },
+  };
+
+  // 尾带一个空格的绝对 projects 路径：旧行为会被 trim 后折叠成 ~/projects/demo_app（静默错目录）；
+  // 修后交给校验器的是原始值 ⇒ 走到 A 的首尾空白拒。
+  let err;
+  try {
+    await postMessage(pool, {
+      userId, sessionId, content: 'hi',
+      cwd: '/srv/erix/users/erix/projects/demo_app ',
+      config: { userSpaceRoot: '/srv/erix/users' },
+    });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof SessionError, '必须抛 SessionError');
+  assert.equal(err.code, 'validation_failed');
+  assert.equal(err.details.field, 'cwd');
+  assert.equal(typeof err.en, 'string');
+  assert.ok(err.en.length > 0 && err.en.includes('leading/trailing whitespace'), `en 必须带 A 文案：${err.en}`);
+
+  // 校验在 UPDATE chat_sessions SET cwd 之前抛 ⇒ 会话 cwd 不应被刷（事务 ROLLBACK）。
+  assert.equal(queries.some((q) => /UPDATE chat_sessions SET cwd/.test(q.sql)), false,
+    '校验失败 ⇒ 不应发出 UPDATE chat_sessions SET cwd');
 });
 
 // 兜底：validateSessionCwd 回归不受影响。

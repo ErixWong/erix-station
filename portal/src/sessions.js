@@ -30,9 +30,12 @@ import { chatCompletionsUrl, extractAssistantText, redactSecret } from './llm-ch
 // ⚠ 只引 `./llm.js`（领域层）：**本文件不许 `import` `./http.js`** —— 错误载体 `FdeLlmPrecheckError`
 // 自带 `{status, code, message, en}`，把 http 层的 `HttpError` 拽进领域层就把依赖方向弄反了。
 import * as llm from './llm.js';
-// issue #890：run cwd 在边界归一为 `~/projects/<name>`。**issue #676 ①** 的 jail 子目录白名单不再被用到：
-// `validateRunCwd` 改成只认 `projects/<name>` 一级（home/cache 改拒），故本文件已移除
-// `../shared/jail-mounts.js` 的 import（`provisioner.js` 仍是它的消费者）。
+// issue #890：run cwd 在边界归一为 `~/projects/<name>`（validateRunCwd 只认 projects/<name> 一级，home/cache 改拒）。
+// issue #919-C：#890 重写校验分支时把 issue #676 ① 那条「jail 子目录白名单」错误详情键 `details.allowed`
+// 一并删了（API 契约回归：既有测试只钉了 code 与 details.field 所以没红）。故把 jail 子目录白名单
+// `JAIL_RUN_CWD_HOST_SUFFIXES` 引回，供越狱检查之后「第一段子目录不可作 run 目录」（platform/git 等，
+// home/cache 之外的 jail 子目录）这一支照旧带 `allowed` 报出。`provisioner.js` 也仍是它的消费者。
+import { JAIL_RUN_CWD_HOST_SUFFIXES } from '../shared/jail-mounts.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details, en } = {}) {
@@ -116,6 +119,17 @@ export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
     });
   }
 
+  // issue #919-A：**绝对形态不得整条 trim 后再折叠**。Linux 目录名可合法含首尾空格（本仓项目名规则只禁
+  // `/`、精确 `.`/`..`、控制字符），若把 `<jail>/projects/x `（尾巴带空格）先 trim 成 `x` 会折叠出
+  // `~/projects/x`——指向另一个目录、且校验器不报错。故：传入的绝对路径字符串与其 trim 结果不同 ⇒ 直接拒。
+  // 只收紧绝对支；`~/projects/<name>` 那一支的既有 trim 行为一字不动（会话约定形态，不制造新行为）。
+  if (cwd !== value) {
+    throw new SessionError('validation_failed', `绝对 cwd 不得带首尾空白（目录名本身可以合法含空格，先去掉空白会折叠成另一个目录）：${cwd}`, {
+      en: `an absolute cwd must not carry leading/trailing whitespace (a directory name may legitimately contain spaces; trimming first would fold it into a different directory): ${cwd}`,
+      details: { field: 'cwd' },
+    });
+  }
+
   // 形态 2：绝对路径 ⇒ 归一为 `~/projects/<name>`。判前一律 `path.resolve` 吃掉 `..`。
   const root = typeof userSpaceRoot === 'string' && userSpaceRoot.trim() !== '' ? userSpaceRoot : null;
   const fde = typeof fdeName === 'string' && fdeName.trim() !== '' ? fdeName.trim() : null;
@@ -131,6 +145,17 @@ export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
   // 逃出 jail（rel 为空/`.`/`..`/`..` 前缀/绝对）⇒ 拒（先于「是否 projects」判定，越界最严重）。
   if (rel === '' || rel === '.' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
     throw new SessionError('validation_failed', `cwd 越出用户 jail（${jailRoot}）：${value}`, { en: `cwd is outside the user jail (${jailRoot}): ${value}`, details: { field: 'cwd' } });
+  }
+  // issue #919-C：恢复 #890 误删的「jail 子目录白名单」这一支（API 契约：`details.allowed`）。
+  // 越狱之后、projects/<name> 折叠之前：第一段子目录必须是允许当 run cwd 的 jail 子目录
+  // （home / projects / cache；platform/git 等被排除 ⇒ 带 `allowed` 报出）。文案与键集合照旧字面。
+  const firstSeg = rel.split(path.sep)[0];
+  if (!JAIL_RUN_CWD_HOST_SUFFIXES.includes(firstSeg)) {
+    const allowed = JAIL_RUN_CWD_HOST_SUFFIXES.join(', ');
+    throw new SessionError('validation_failed', `cwd 所在 jail 子目录不可作 run 目录（允许：${allowed}）：${value}`, {
+      en: `the jail subdirectory of cwd cannot be used as a run directory (allowed: ${allowed}): ${value}`,
+      details: { field: 'cwd', allowed: JAIL_RUN_CWD_HOST_SUFFIXES },
+    });
   }
   // jail 内还必须**正好**是 `projects/<name>` 一级，才能折叠成 `~/projects/<name>`：
   // rel 从 `<jailRoot>/projects` 起须恰为单段、非 . / ..、无分隔符、无控制字符。
@@ -904,7 +929,12 @@ export async function postMessage(pool, {
     // 过去 `postMessage` 任意字符串都收 → 错 cwd（如快照建在 portal 本地盘 `/root/.erix/...`）
     // 会「账上 done、实际空转」。校验器（`validateRunCwd`）拒绝 ⇒ SessionError → 本事务 ROLLBACK，
     // 会话 cwd 不刷、run 不入队（调用方看到 validation_failed，而不是假绿）。
-    const nextCwdRaw = typeof cwd === 'string' && cwd.trim() !== '' ? cwd.trim() : null;
+    // issue #919②：空白判定用 `cwd.trim() !== ''`，但**交给校验器的是原始字符串 `cwd`**（不 trim）。
+    // 否则绝对形态带首尾空白会被提前 trim 掉、绕过 `validateRunCwd` 的「绝对 cwd 不得带首尾空白」拒
+    // （`<jail>/projects/x␣` 照样被折成 `~/projects/x`、指向另一个目录）。`~/` 形态由校验器自己 trim
+    // 后接受（那一支行为不动）。`:934` 的 `nextCwdRaw !== s.cwd` 比较语义不变：库里存的是已规范值，
+    // 原始值（哪怕带空白）与之不同即触发校验，这是对的。
+    const nextCwdRaw = typeof cwd === 'string' && cwd.trim() !== '' ? cwd : null;
     let nextCwd = nextCwdRaw;
     if (nextCwdRaw !== null && nextCwdRaw !== s.cwd) {
       // #890：**接住并使用校验器返回的规范值**——绝对 `<userSpaceRoot>/<fde>/projects/<name>` 会被
