@@ -325,3 +325,48 @@ test('报告语义：同一行被两条规则命中 ⇒ 头部按位置算 1 处
   assert.ok(out.includes(`docs/dup.md:3: ${LOGIN}`), `新词边界规则的详情行缺失，实得:\n${out}`);
   assert.doesNotMatch(out, /坐标或身份 2 处/, `头部仍把同一行报成 2 处（没去重），实得:\n${out}`);
 });
+
+// ⑭ #900 翻拦：dev 栈上的**另一个 FDE 登录名**已进 DENY_IDENTITY ⇒ 它的账号名形态必须命中。
+//   拆片写进代码行（不在注释里）以遵本文件头的自伤纪律（见头部④）。派生形态同罪：`fde-<本名>` /
+//   `<本名>-p-<port>` / `<本名>-<后缀>` 与裸登录名均同走子串命中。
+const DEV_FDE_LOGIN = ['te', 'tris'].join('');
+test('#900 翻拦：dev 栈 FDE 登录名（含派生形态）的账号名用法必须命中（子串翻拦）', () => {
+  const { rc, out } = fixture((dir) => {
+    mkdirSync(path.join(dir, 'docs'), { recursive: true });
+    // 一行写账号名及其三个典型派生形态，均应当被同一条 DENY 拉到。
+    writeFileSync(
+      path.join(dir, 'docs', 'acct.md'),
+      `# t\n\n工位 ${DEV_FDE_LOGIN}（容器 fde-${DEV_FDE_LOGIN}）的预览域名 ${DEV_FDE_LOGIN}-p-22010.example，仓 ${DEV_FDE_LOGIN}-arena。\n`,
+    );
+  });
+  assert.notEqual(rc, 0, `夹具写了 dev FDE 登录名却 exit 0 ⇒ DENY_IDENTITY 里本条没生效`);
+  assert.ok(/docs\/acct\.md:3:/.test(out), `账号名行未被点名（DENY 未命中），实得:\n${out}`);
+  assert.ok(out.includes(DEV_FDE_LOGIN), `命中标签未拼回登录名（拼接链断了），实得:\n${out}`);
+});
+
+// ⑮ #900：普通词用法不得被误当身份拦下。待办应用名与一个常见英文形容词同属 dev 栈登录名同族，
+//   但**故意不进 DENY**：前者既是普通词又是 `check-required-legs.mjs` 从 `node:test` 输出里解析的机读
+//   字段名（`# <该词> N`），后者在英文正文里是正当用词。本格同时钉住这个决定：一旦任一个被误加进
+//   DENY_IDENTITY，本格当场红——这就是「为什么不加这两个词」那个决定的牙齿（变异自证 ②）。
+//   夹夹具的脏词同样放 writeFileSync 代码行，不在注释里，遵本文件头自伤纪律。
+test('#900 普通词用法（待办应用名 / 常见英文形容词）不得被误当身份拦下', () => {
+  const { rc, out } = fixture((dir) => {
+    mkdirSync(path.join(dir, 'docs'), { recursive: true });
+    // 英文正文的普通形容词 + 测试夹具里的项目目录名（机读字段名与英文正文同列）。
+    writeFileSync(
+      path.join(dir, 'docs', 'words.md'),
+      '# t\n\n' +
+      'containers stay zero-listener, zero-secrets, DB-blind\n' +
+      "const project = path.join(home, 'projects', 'todo');\n" +
+      '# todo 0\n',
+    );
+    // 同树放一条**真登录名**：先证明这棵树真的产出了命中，否则「没点名 words.md」会因闸没跑而空转。
+    writeFileSync(path.join(dir, 'docs', 'dirty.md'), `# t\n\n工位 ${DEV_FDE_LOGIN} 的登录名。\n`);
+  });
+  assert.notEqual(rc, 0, '夹具里的登录名行本该被拦，rc 却是 0 = 本格的断言会空转');
+  assert.ok(/docs\/dirty\.md:3:/.test(out), `登录名行未点名（闸没跑），实得:\n${out}`);
+  assert.ok(
+    !/docs\/words\.md:\d+/.test(out),
+    `普通词（待办应用名 / 常见英文形容词 / node:test 机读字段）被误当身份拦下，实得:\n${out}`,
+  );
+});
