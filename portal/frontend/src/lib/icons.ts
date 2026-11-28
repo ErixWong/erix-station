@@ -69,4 +69,8 @@ export const ICON_PATHS: Record<string, string[]> = {
   // Lucide `pencil-line`（ISC）：「编辑」。键名按语义叫 `pencil`（口径 ①：不按调用点命名），
   // 几何取 pencil-line（带那一横，比 `pencil` 更易认）。两笔：笔身 + 下划线。
   pencil: ['M12 20h9', 'M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z'],
+  // issue #817 步 5：操作列改纯图标后，「启用 / 停用」上**两张不同图标**（颜色不是唯一信号）：
+  // Lucide `pause`（ISC）= 停用（两条竖线，polygon/rect 改写成 line 形式）；Lucide `play`（ISC）= 启用（三角，polygon 改写成闭合 path）。
+  pause: ['M9 4v16', 'M15 4v16'],
+  play: ['M6 3l14 9-14 9z'],
 };
