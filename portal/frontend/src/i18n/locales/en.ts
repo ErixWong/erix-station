@@ -262,6 +262,17 @@ export const en = {
   },
   stream: {
     chooseOrNewSession: 'Select or create a session',
+    // issue #867: live-stream (SSE) connection status bar (`components/StreamStatusBanner.vue`).
+    // Wording rule: status words only — the transcript that is already on screen stays visible, so this
+    // says "live updates stopped", not "something broke". No alert red, no dialog, and never the words
+    // "error" / "failed" / "crashed".
+    status: {
+      disconnected: 'Live updates disconnected',
+      disconnectedHint: 'Content already loaded stays put; new messages will not arrive',
+      reconnecting: 'Reconnecting live updates…',
+      reconnectingHint: 'Trying to pick the live stream back up',
+      reconnect: 'Tap to reconnect',
+    },
     argsPending: '(generating arguments…)',
     argsStreaming: '(arguments streaming…)',
     reasoning: 'Reasoning',

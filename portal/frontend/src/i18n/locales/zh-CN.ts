@@ -274,6 +274,16 @@ export const zhCN = {
   // 消息流（components/StreamPanel.vue）+ SSE 事件状态行（composables/useEventStream.ts）
   stream: {
     chooseOrNewSession: '选择或新建会话',
+    // issue #867：实时流（SSE）连接态状态条（`components/StreamStatusBanner.vue`）。
+    // 措辞铁律：只用状态词——历史正文仍在屏上，这里说的只是「实时更新断了」，
+    // 不是界面坏了（所以不用告警红、不用弹窗，也不许出现「错误 / 失败 / 崩溃」那类词）。
+    status: {
+      disconnected: '实时更新已断开',
+      disconnectedHint: '已加载的内容仍在，但收不到新消息',
+      reconnecting: '实时更新重连中…',
+      reconnectingHint: '正在重新接上实时流',
+      reconnect: '点此重连',
+    },
     // 工具卡片单行摘要兜底（参数 JSON 尚未成形）
     argsPending: '（参数生成中…）',
     // 工具卡片 dig 兜底（tool_call_delta 阶段，args 仍在流式生成）

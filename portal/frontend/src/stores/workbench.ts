@@ -14,7 +14,7 @@ import { computed, ref, watch } from 'vue';
 import { api, ApiError, patchSessionTitle, postSessionAiTitle, toDisplayText } from '../api';
 import { projectionRoundToken, runSegment, toolCardKey as buildToolCardKey } from '../lib/toolCardKey';
 import { i18n } from '../i18n';
-import { useEventStream, RUN_FAIL_REASONS, type CardAlias, type ReplayMode, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
+import { useEventStream, RUN_FAIL_REASONS, type CardAlias, type ReplayMode, type RunEndPayload, type RunHistoryEvent, type StreamStatus } from '../composables/useEventStream';
 // issue #282：会话页动量状态条的状态机（SSE 逐帧喂；组件只读派生视图，见 components/RunStatusBar.vue）。
 import { createRunMomentumFeed } from '../composables/useRunMomentum';
 // issue #592：子 run 活动面板的数据层（名册端点轮询）。**宿主是 store 而不是组件**：徽标在
@@ -1962,6 +1962,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     } catch { /* 构造通知可能抛错（非安全上下文等）：静默忽略 */ }
   }
 
+  // issue #867：实时流断线面（`StreamStatusBanner` 的唯一读口）。组件不直接摸 `es`：
+  // 它需要的是「界面该不该说话」，不是「那条 EventSource 在哪」。
+  const streamStatus = computed<StreamStatus>(() => es.streamStatus.value);
+
+  /** 手动重连（界面上那颗「重连」）：重开一条 SSE，带本地水位让服务端补发；正文不动。 */
+  function reconnectStream() {
+    es.reconnectStream();
+  }
+
   return {
     // state
     dirs, dirCwd, sessions, sessionId, noDir,
@@ -2007,5 +2016,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     delegateRows, delegateLiveCount, delegateHasLive, delegateRowsUnavailable, delegateDegraded, delegateElapsedMs,
     delegateViewer, delegatePanelOpen,
     openDelegateViewer, closeDelegateViewer, toggleDelegatePanel, collapseDelegatePanel, resetDelegateSurface,
+    // issue #867：SSE 连接态与手动重连（中性状态条的读/写入口）
+    streamStatus, reconnectStream,
   };
 });
