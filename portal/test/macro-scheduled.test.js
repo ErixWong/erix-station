@@ -22,6 +22,7 @@ import { claimMacroRun } from '../src/macros.js';
 import { claimRun } from '../src/internal.js';
 import {
   executeScheduledIntent, artifactPath, macroOrigin, macroSessionTitle, defaultReportsRoot,
+  getOrCreateMacroSession,
 } from '../src/macro-scheduled.js';
 
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
@@ -36,6 +37,69 @@ const ids = (tag) => ({
   userId: crypto.randomUUID(), containerId: crypto.randomUUID(),
   templateId: crypto.randomUUID(), assignmentId: crypto.randomUUID(),
   login: `w7${tag.toLowerCase().replace(/[^a-z0-9]/g, '')}`.slice(0, 30),
+});
+
+// —— issue #919-B：宏会话是第三条写 cwd 的路径（#890 只修了 postMessage 与 createReviewSession）——
+// 假 pool（写法照 macro-dispatcher.test.js 的 #890 createReviewSession 那格），无需 DB：
+// 只驱动 SELECT 复用查 + （必要时）fde_name 查 + INSERT，断言三者的 cwd 参数。
+function fakeMacroPool({ fdeName = 'erix' } = {}) {
+  const queries = [];
+  return {
+    queries,
+    async query(sql, params = []) {
+      queries.push({ sql: String(sql), params });
+      if (/fde_name FROM users/.test(sql)) return { rows: fdeName ? [{ fde_name: fdeName }] : [] };
+      if (/SELECT id FROM chat_sessions/.test(sql)) return { rows: [] }; // 未命中 ⇒ 建
+      if (/INSERT INTO chat_sessions/.test(sql)) return { rows: [{ id: 's-macro' }] };
+      return { rows: [] };
+    },
+  };
+}
+
+test('#919-B 宏会话 getOrCreateMacroSession：绝对 projects/<name> ⇒ SELECT 比对与 INSERT 都用归一的 ~/projects/<name>', async () => {
+  const pool = fakeMacroPool();
+  const out = await getOrCreateMacroSession(pool, {
+    userId: crypto.randomUUID(), templateName: 'daily-report',
+    cwd: '/srv/erix/users/erix/projects/demo_app', config: { userSpaceRoot: '/srv/erix/users' },
+  });
+  assert.equal(out.created, true);
+  const ins = pool.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.ok(ins, '未命中 ⇒ 必须 INSERT');
+  assert.equal(ins.params[2], '~/projects/demo_app', 'INSERT 的 cwd 参数必须是归一的 tilde');
+  assert.notEqual(ins.params[2], '/srv/erix/users/erix/projects/demo_app', '宿主绝对路径绝不能原样落库');
+  // SELECT 比对参数与 INSERT 参数必须一致（同一个归一值），否则会查不中已有会话、重复建。
+  const sel = pool.queries.find((q) => /SELECT id FROM chat_sessions/.test(q.sql));
+  assert.ok(sel, '必须先按 (user,origin,cwd) 查复用');
+  assert.equal(sel.params[2], ins.params[2], 'SELECT 比对参数必须等于 INSERT 的归一值');
+  assert.equal(sel.params[2], '~/projects/demo_app');
+});
+
+test('#919-B 宏会话：~/projects/<name> 原样透传（不折叠、不报错）', async () => {
+  const pool = fakeMacroPool();
+  await getOrCreateMacroSession(pool, {
+    userId: crypto.randomUUID(), templateName: 'daily-report',
+    cwd: '~/projects/demo_app', config: { userSpaceRoot: '/srv/erix/users' },
+  });
+  const ins = pool.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.equal(ins.params[2], '~/projects/demo_app', 'tilde 形态原样透传');
+});
+
+test('#919-B 宏会话：cwd=null/空串 ⇒ INSERT 落 NULL 且不调用校验器（不查 fde_name、不抛）', async () => {
+  // fdeName=null：若被误送进校验器的绝对支会直接抛；用 null 验证 null/空串根本不进校验器。
+  const pool = fakeMacroPool({ fdeName: null });
+  const out = await getOrCreateMacroSession(pool, {
+    userId: crypto.randomUUID(), templateName: 'daily-report', cwd: null,
+  });
+  assert.equal(out.created, true);
+  const ins = pool.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.equal(ins.params[2], null, 'cwd=null ⇒ INSERT 落 NULL');
+  assert.equal(pool.queries.some((q) => /fde_name FROM users/.test(q.sql)), false, 'null cwd 不应触发校验器（不查 fde_name）');
+
+  const pool2 = fakeMacroPool({ fdeName: null });
+  await getOrCreateMacroSession(pool2, { userId: crypto.randomUUID(), templateName: 'daily-report', cwd: '   ' });
+  const ins2 = pool2.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.equal(ins2.params[2], null, 'cwd=空串 ⇒ 同样落 NULL');
+  assert.equal(pool2.queries.some((q) => /fde_name FROM users/.test(q.sql)), false, '空串 cwd 不应触发校验器');
 });
 
 /** 一套可跑 scheduled-task 的现场：用户 / 容器 / scheduled-task 模板 + 订阅（无 session：user scope）。 */
