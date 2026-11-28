@@ -26,6 +26,10 @@ import { allocSeq } from './seq.js';
 // #322：本文件**不再直接调** `chatCompletion`（手工改名走 `./title-llm.js` 的唯一生成入口）；
 // 下面三个「一次对话请求」的通用件仍在此重新导出，只为既有调用方与文档口径不受影响。
 import { chatCompletionsUrl, extractAssistantText, redactSecret } from './llm-chat.js';
+// issue #905：「该 FDE 的 LLM 上游配好了吗」这条预检从 http 层收口到**本文件**（写 `runs` 的唯一出口）。
+// ⚠ 只引 `./llm.js`（领域层）：**本文件不许 `import` `./http.js`** —— 错误载体 `FdeLlmPrecheckError`
+// 自带 `{status, code, message, en}`，把 http 层的 `HttpError` 拽进领域层就把依赖方向弄反了。
+import * as llm from './llm.js';
 // issue #676 ①：越界 cwd 校验要 jail 的单一真值表（宿主子目录 / 哪些能当 run cwd）。
 import { JAIL_RUN_CWD_HOST_SUFFIXES } from '../shared/jail-mounts.js';
 
@@ -847,11 +851,24 @@ export async function postMessage(pool, {
   //    `childEnv.RUN_REVIEW_ONLY`。⚠ 严格布尔：只有 `=== true` 才落键；`false`/缺省**不写**
   //    （区分「没声明」与「声明关」，回落到容器默认；worker 的 `isReviewOnly()` 判 `=== '1'`）。
   reviewOnly = false,
+  //  ⑤ issue #905：`llmGateway` = 调用方手里的 LLM 网关 client **本体**（http 侧传 `ctx.llmGateway`）。
+  //    只服务下面那道 LLM 上游预检的第二道（模型 id 可解析性）：它的 TTL 缓存按 client 对象身份
+  //    分槽 ⇒ 必须原样透传、不许包一层。缺省 `null` ⇒ 只过第一道（绑定存在性，三处调用方都硬拦），
+  //    与「网关不可达一律放行」同一取向；既有调用方与测试的调用形式一字不改（新增量有默认值）。
+  llmGateway = null,
 }) {
   // 体校验（与 handlePostMessage 的前置校验同一函数；此处兜底，保证直接调用者也拿不到非法数据）
   const valid = validateMessageBody({ content, attachments });
   const safeContent = valid.content;
   const safeAttachments = valid.attachments;
+
+  // issue #905：LLM 上游预检收口到「写 runs 的唯一出口」——三条调用路（http 人发消息 /
+  // macro-scheduled 宏任务 run / macro-dispatcher 只读审查 run）一次覆盖，不再靠调用方自觉。
+  // 位置红线（评审 MEDIUM-1 原口径）：http 腿仍在幂等 `fn` 之内（`executeWithIdempotency` 之后、
+  // `findDone` 回放之后），且**在开业务事务（connect/BEGIN）与写 transcript 之前** ⇒ 失败不留
+  // 用户消息、不入队 run，幂等层走 `release` 不把失败钉进台账（同 key、修好绑定后原样重试能成）。
+  // 顺序：必须在 `validateMessageBody` 之后（#41 原口径：体校验 400 优先于 LLM 预检）。
+  await llm.assertFdeLlmReady(pool, userId, { gateway: llmGateway });
 
   const client = await pool.connect();
   let committed = null;

@@ -276,6 +276,10 @@ export async function runReviewTaskDefault({
   if (!cwd) throw new Error('审查缺活目录 cwd（无法起只读审查 run）');
 
   const sessionId = await createReviewSession(pool, { userId, cwd, originalRunId, macroRunId, config });
+  // issue #905：本腿不传 `llmGateway`（宏侧拿不到网关单例）⇒ `postMessage` 里的 LLM 上游预检只过
+  // **第一道（绑定存在性，硬拦）**，第二道自己 `skipped`（与「网关不可达一律放行」同一取向）。无 active
+  // binding 的用户以前会在这里建出一条永远跑不起来的审查 run（#802 老路）；现在 `postMessage` 直接抛，
+  // 审查会话建了但 run **没建**，错误沿 `runMacroReview` 收到 failed + unclassified（=「没判成」）。
   const posted = await postMessage(pool, {
     userId, sessionId, content: brief, triggerKind: 'synthetic', cwd, reviewOnly: true, maxRounds, config,
   });
