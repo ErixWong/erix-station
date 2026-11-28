@@ -67,6 +67,8 @@ class StopPool {
   async query(sql, params = []) {
     const s = sql.replace(/\s+/g, ' ');
     this.sqlJournal.push({ sql: s, params });
+    // issue #905：postMessage 在建 run 前统一预检 LLM 绑定；本文件用例都假设绑定存在。
+    if (s.includes('FROM fde_llm_bindings')) return { rows: [{ ok: 1 }] };
 
     if (/^\s*BEGIN/i.test(s)) return { rows: [] };
     if (/^\s*COMMIT/i.test(s)) { this.commits += 1; return { rows: [] }; }

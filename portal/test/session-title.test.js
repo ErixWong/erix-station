@@ -172,6 +172,8 @@ function sessionsPool() {
     queries,
     async query(sql, params = []) {
       queries.push({ sql, params });
+      // issue #905：postMessage 在建 run 前统一预检 LLM 绑定；本文件的用例都假设绑定存在。
+      if (sql.includes('FROM fde_llm_bindings')) return { rows: [{ ok: 1 }] };
       if (sql.includes('SELECT fde_name FROM users')) return { rows: [{ fde_name: 'alice' }] };
       if (sql.startsWith('INSERT INTO chat_sessions')) {
         state.row = { ...state.row, title: params[2], title_source: params[4] };
@@ -253,6 +255,8 @@ function postMessageClient({
       order.push({ sql, params });
       const s = sql.replace(/\s+/g, ' ').trim();
       if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK') return { rows: [] };
+      // issue #905：postMessage 在建 run 前预检 LLM 绑定（本文件用例都假设绑定存在）。
+      if (s.includes('FROM fde_llm_bindings')) return { rows: [{ ok: 1 }] };
       if (s.includes('pg_advisory_xact_lock')) return { rows: [] };
       if (s.includes('FROM chat_sessions s') && s.includes('FOR UPDATE')) {
         return { rows: [{ id: PM_SESSION_ID, user_id: 'u1', project_id: null, cwd: '~/projects/p', title: state.title, title_source: state.title_source, model: null, status: 'active', last_seq: 0 }] };
@@ -320,7 +324,8 @@ function postMessageClient({
     },
     release() {},
   };
-  return { pool: { connect: async () => client }, order, state, activity };
+  // issue #905：postMessage 用 `pool.query` 在建 run 前预检 LLM 绑定 ⇒ 替身带 query（透到 client）。
+  return { pool: { connect: async () => client, query: (sql, params) => client.query(sql, params) }, order, state, activity };
 }
 
 /** 从 SQL 日志里取「默认标题落库」语句（无则 undefined）。 */
@@ -519,7 +524,8 @@ test('issue #114：并发抢占（UPDATE 命中 0 行）→ 不回调（安静�
     return origQuery(sql, params);
   };
   const titles = [];
-  await postMessage({ connect: async () => client }, {
+  // issue #905：预检走 `pool.query` ⇒ 手搭的替身也要带 query（透到本 client，含上面那层包裹）。
+  await postMessage({ connect: async () => client, query: (sql, params) => client.query(sql, params) }, {
     userId: 'u1', sessionId: PM_SESSION_ID, content: 'hi', attachments: [], onSessionTitle: (t) => titles.push(t),
   });
   assert.deepEqual(titles, [], '0 行（被抢占）不推送');

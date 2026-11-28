@@ -100,6 +100,8 @@ class ActivityPool {
 
   async query(sql, params = [], via = 'pool') {
     const s = activitySqlOf(sql);
+    // issue #905：postMessage 在建 run 前统一预检 LLM 绑定；本文件用例都假设绑定存在。
+    if (s.includes('FROM fde_llm_bindings')) return { rows: [{ ok: 1 }] };
     this.journal.push({ sql: s, params: [...params], via });
     if (this.failOn && s.includes(this.failOn)) throw new Error(`fake: 业务写入失败（${this.failOn}）`);
 

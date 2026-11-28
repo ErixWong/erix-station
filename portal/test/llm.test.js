@@ -761,6 +761,8 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
       if (s.startsWith('INSERT INTO runs')) return { rows: [{ id: 'r1', status: 'queued' }] };
       if (s.startsWith('INSERT INTO run_queue')) return { rows: [] };
       if (s.startsWith('UPDATE messages SET run_id')) return { rows: [] };
+      // issue #905：postMessage 在建 run 前预检 LLM 绑定（本用例假设绑定存在）。
+      if (s.includes('FROM fde_llm_bindings')) return { rows: [{ ok: 1 }] };
       // issue #497：发送路的用户活动位（共用仿真件；不接管未知语句）
       const activityHit = userActivity.query(sql, params);
       if (activityHit) return activityHit;
@@ -768,7 +770,8 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
     },
     release() {},
   };
-  const pool = { connect: async () => client };
+  // issue #905：postMessage 在建 run 前用 `pool.query` 统一预检 LLM 绑定 ⇒ 替身要像真 pg.Pool 一样带 query。
+  const pool = { connect: async () => client, query: (sql, params) => client.query(sql, params) };
   const posted = await postMessage(pool, { userId: 'u1', sessionId, content: 'hi', attachments: [] });
   assert.equal(posted.run.status, 'queued');
 
