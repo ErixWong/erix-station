@@ -665,8 +665,11 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
       'loop.provisioner_idle_backoff_ms',
       'auth.pending_token_ttl_seconds', 'auth.session_renew_interval_seconds',
       'auth.max_password_length', 'auth.max_login_length',
-      'delegate.max', 'delegate.child_rounds', 'delegate.child_timeout_ms'],
-    '只许迁这十五格（#795 删了 preview.kk_base_url）');
+      'delegate.max', 'delegate.child_rounds', 'delegate.child_timeout_ms',
+      'run.max_rounds', 'shell.timeout_ms', 'shell.max_timeout_ms',
+      'shell.output_max_bytes', 'artifact.capture_budget_ms',
+      'mcp.config_timeout_ms', 'agentd.capacity'],
+    '只许迁这二十二格（#795 删了 preview.kk_base_url；#677 第八批 +7：FDE env 旋钮）');
   assert.ok(Object.isFrozen(RUNTIME_SETTING_REGISTRY), 'registry 必须冻结（运行期没人能塞旋钮进来）');
   const entry = RUNTIME_SETTING_REGISTRY['session.ttl_seconds'];
   assert.ok(Object.isFrozen(entry), '条目也必须冻结');
@@ -758,7 +761,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
   assert.notEqual(HOT_READ_INVALIDATORS.get(PREVIEW_SESSION_TTL_KEY),
     HOT_READ_INVALIDATORS.get(PREVIEW_TICKET_TTL_KEY),
     '第五格不许共用第三格的失效函数（会话 TTL 与票 TTL 各有各的缓存）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 15, '登记表里就是十五格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 22, '登记表里就是二十二格（热读旋钮数 = 失效钩子数；#677 第八批 +7）');
 
   // P3 第六批的三格：同一个口径再钉一次（各自一个导出的失效函数，且互相不许共用）。
   assert.equal(HOT_READ_INVALIDATORS.get(ONBOARDING_IDLE_BACKOFF_MS_KEY),
@@ -769,7 +772,7 @@ test('RS-7 P3 边界：registry 有 session.ttl_seconds + workspace.retention_da
     invalidateProvisionerIdleBackoffCache);
   assert.equal(new Set([...HOT_READ_INVALIDATORS.values()]).size, HOT_READ_INVALIDATORS.size,
     '一格一个失效函数：共用就是「保存开户那格把对账那格的缓存也抹了」（RS-51 钉另一面）');
-  assert.equal(HOT_READ_INVALIDATORS.size, 15, '登记表里就是十五格（热读旋钮数 = 失效钩子数）');
+  assert.equal(HOT_READ_INVALIDATORS.size, 22, '登记表里就是二十二格（热读旋钮数 = 失效钩子数；#677 第八批 +7）');
 
   // P3 第七批（delegate 三格）：这三格的**核心是 applyMode 不许谎报成 hot**。
   // 值是 FDE 容器内的 worker 读的，portal 只在 provision 容器那一刻把值写进容器 env
@@ -1302,7 +1305,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
   const fromDb = await listRuntimeSettingsAdmin({
     pool: dbPool, config: CONFIG_ENV, env: {}, log: silentLog,
   });
-  assert.equal(fromDb.items.length, 15);
+  assert.equal(fromDb.items.length, 22);
   assert.deepEqual(Object.keys(fromDb.items[0]).sort(),
     ['applyMode', 'key', 'label', 'reason', 'source', 'updatedAt', 'updatedBy', 'value'].sort());
   assert.deepEqual(fromDb.items[0], {
@@ -1362,7 +1365,7 @@ test('RS-16 管理台读侧 listRuntimeSettingsAdmin：source 三档如实 + 读
     pool: ttlPool({ throwOnSelect: Object.assign(new Error('relation "runtime_settings" does not exist'), { code: '42P01' }) }),
     config: CONFIG_ENV, log: deadLog,
   });
-  assert.equal(dead.items.length, 15, '读失败时十五格都要给得出来（不是只给前几格）');
+  assert.equal(dead.items.length, 22, '读失败时二十二格都要给得出来（不是只给前几格）');
   assert.equal(dead.items[0].source, 'env');
   assert.equal(dead.items[0].reason, 'read_failed');
   assert.equal(deadLog.seen.warn.length, 1, '有人在屏幕前等答案 ⇒ 读失败要 warn（不像启动路径只能 debug）');
@@ -2363,7 +2366,7 @@ test('RS-29 第二格的 hint：registry 登记了才进 DTO，没登记的那�
   // GET 两格：登记了的那格原样带出，没登记的那格**不许**出现这个键（缺席 ≠ null ≠ 空串）。
   const cfg = { workspaceRetentionDays: 30, workspaceRetentionDaysSource: 'env' };
   const list = await listRuntimeSettingsAdmin({ pool: ttlPool(), config: cfg, env: {}, log: silentLog });
-  assert.equal(list.items.length, 15);
+  assert.equal(list.items.length, 22);
   const retItem = list.items.find((i) => i.key === WORKSPACE_RETENTION_KEY);
   assert.equal(retItem.hint, WORKSPACE_RETENTION_HINT,
     'DTO 必须逐字透出 registry 那句话（前端自己另写一份 = 第二份真相）');
@@ -3983,9 +3986,16 @@ test('RS-52 三格都登记了写路径失效（HOT_READ_INVALIDATORS 少一行 
   // P3 第七批把口径从「登记表 == hot 集合」改成「hot ⊆ 登记表，多出来的只能是 `applyMode:'restart'`
   // 但 portal 侧**仍然现读**的那几格（delegate 三格：每建一个容器读一次）。
   // 不拿住这一半，下次往里塞一个「根本不读」的格子也没人能看出为什么在。
+  // P3 第八批：FDE env 旋钮 7 格同属「restart 但 portal 侧每建容器现读」⇒ extras 从 delegate
+  // 三格扩到十格（7 新 + 3 delegate），均为 provisioner 现读，不是「根本不读」。
   const extras = registered.filter((k) => !hotKeys.includes(k));
-  assert.deepEqual(extras, ['delegate.child_rounds', 'delegate.child_timeout_ms', 'delegate.max'],
-    '登记表里超出 hot 集合的只许是 delegate 三格（applyMode=restart 但 provisioner 现读）');
+  assert.deepEqual(extras, [
+    'agentd.capacity', 'artifact.capture_budget_ms',
+    'delegate.child_rounds', 'delegate.child_timeout_ms', 'delegate.max',
+    'mcp.config_timeout_ms', 'run.max_rounds', 'shell.max_timeout_ms',
+    'shell.output_max_bytes', 'shell.timeout_ms',
+  ],
+    '登记表里超出 hot 集合的只许是 delegate 三格 + FDE env 旋钮七格（applyMode=restart 但 provisioner 现读）');
   for (const k of extras) {
     assert.equal(RUNTIME_SETTING_REGISTRY[k]?.applyMode, 'restart',
       `${k} 在登记表里但不在 hot 集合里 ⇒ 它必须是 restart（否则上面那条集合不变式就该改）`);
@@ -4208,15 +4218,15 @@ test('RS-64 注册表 label/hint ⇒ labelEn/hintEn parity（有中文必有英�
       assert.ok(entry.hintEn === undefined, `${key}: 没 hint 就不该有 hintEn（否则界面凭空多一行提示）`);
     }
   }
-  assert.equal(labels, 15, '产品 registry 有 15 条 label（#677 P3 第七批 +3：delegate 三格）');
-  assert.equal(hints, 14, '产品 registry 有 14 条 hint（第一格 session.ttl_seconds 无 hint；#677 P3 第七批 +3）');
+  assert.equal(labels, 22, '产品 registry 有 22 条 label（#677 P3 第七批 +3：delegate 三格；#677 第八批 +7：FDE env 旋钮）');
+  assert.equal(hints, 21, '产品 registry 有 21 条 hint（第一格 session.ttl_seconds 无 hint；#677 P3 第七批 +3；#677 第八批 +7）');
 });
 
 test('RS-65 管理台 locale=en：15 条 label、14 条 hint 全英文且不含 CJK', async () => {
   const { items } = await listRuntimeSettingsAdmin({
     pool: ttlPool(), config: {}, log: silentLog, locale: 'en',
   });
-  assert.equal(items.length, 15);
+  assert.equal(items.length, 22);
   const byKey = Object.fromEntries(items.map((i) => [i.key, i]));
   for (const [key, entry] of Object.entries(RUNTIME_SETTING_REGISTRY)) {
     const item = byKey[key];
