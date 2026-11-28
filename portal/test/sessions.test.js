@@ -18,18 +18,30 @@ const withFreshDb = (fn) => fixture.withFreshDatabase(({ pool }) => fn(pool), { 
 const USR = '/srv/erix/users';
 const FDE = 'erix';
 
-// —— 用例 2：jail 内绝对路径被收（projects 与 home 都算，含更深子目录）——
-test('#676-2 jail 内绝对路径被收：.../projects/x 与 .../home/.snapshots/x', () => {
+// —— 用例 2（#890 收紧后的重写，取代旧 #676-2）：绝对 `<fde>/projects/<name>` ⇒ 归一 tilde；home/cache ⇒ 拒 ——
+// 旧 #676 口径把 home/cache 当「jail 内合法」并原样返回**绝对路径**；#890 起 runner
+// （`resolveRunCwd`）只认 `~/projects/<name>`，绝对形态下发后会被那条 warn 分支静默回退成
+// `run.project.name`（三层不一致）。所以边界只认能被 runner 还原的形态：
+//   ① 绝对 projects/<name> 折叠成 `~/projects/<name>`（不再原样返回绝对）；② home/cache 当场拒。
+// 本改是**收紧**（断言更严）而非放宽：旧断言「home 返回绝对路径」在新口径下变成「抛错」。
+test('#890-2 绝对 projects/<name> ⇒ 归一 tilde；绝对 home/cache ⇒ validation_failed', () => {
+  // ① projects/<name>：归一为 tilde 形态（宿主绝对路径不再原样返回）。
   assert.equal(
     validateRunCwd(`${USR}/${FDE}/projects/x`, { userSpaceRoot: USR, fdeName: FDE }),
-    `${USR}/${FDE}/projects/x`,
+    '~/projects/x',
   );
   assert.equal(
-    validateRunCwd(`${USR}/${FDE}/home/.snapshots/x`, { userSpaceRoot: USR, fdeName: FDE }),
-    `${USR}/${FDE}/home/.snapshots/x`,
+    validateRunCwd(`${USR}/${FDE}/projects/app_a`, { userSpaceRoot: USR, fdeName: FDE }),
+    '~/projects/app_a',
   );
-  // cache 也允许。
-  validateRunCwd(`${USR}/${FDE}/cache/tmp`, { userSpaceRoot: USR, fdeName: FDE });
+  // ② home / cache 绝对路径：runner 还原不出等价目录 ⇒ 当场拒（旧口径在此返回绝对，现收紧为抛错）。
+  for (const abs of [`${USR}/${FDE}/home/.snapshots/x`, `${USR}/${FDE}/cache/tmp`]) {
+    assert.throws(
+      () => validateRunCwd(abs, { userSpaceRoot: USR, fdeName: FDE }),
+      (e) => e instanceof SessionError && e.code === 'validation_failed' && e.details?.field === 'cwd',
+      `home/cache 绝对 cwd 必须拒：${abs}`,
+    );
+  }
 });
 
 // —— 用例 3：`~/projects/<name>` 形式仍通过（回归）——
@@ -107,6 +119,51 @@ test('#676-1 postMessage 越界 cwd ⇒ validation_failed、会话 cwd 不变、
     const rqAfter = await pool.query(`SELECT count(*)::int AS c FROM run_queue`);
     assert.equal(rqAfter.rows[0].c, rqBefore.rows[0].c, '越界 ⇒ 不入队 run（run_queue 无新行）');
   });
+});
+
+// —— #890 调用点钉子（无需 DB）：postMessage 改了 cwd ⇒ 落库用的是**校验器返回的规范值** ——
+// 假 pool 驱动真实 postMessage 事务（appendUserTurn 探针全回空 ⇒ round 派生 0），
+// 只看 `UPDATE chat_sessions SET cwd` 的参数：传入绝对 `<userSpaceRoot>/<fde>/projects/<name>`
+// ⇒ 落库必须是 `~/projects/<name>`（而不是原样绝对）。
+// 反向自证（变异 ①）：把 sessions.js 里 `nextCwd = validateRunCwd(...)` 改回「只调用不接值」
+// ⇒ nextCwd 仍是原始绝对形态 ⇒ 本断言当场红（证明调用点真的用了返回值，不是恒真）。
+test('#890 调用点：postMessage 传绝对 projects/<name> ⇒ 落库 cwd 是归一的 ~/projects/<name>（非原样）', async () => {
+  const userId = crypto.randomUUID();
+  const sessionId = crypto.randomUUID();
+  const sessionRow = {
+    id: sessionId, user_id: userId, project_id: null, cwd: '~/projects/orig', title: 't',
+    title_source: 'auto', model: 'mock-model', status: 'active', last_seq: 0, origin: null,
+  };
+  const queries = [];
+  const dispatch = (sql, params = []) => {
+    if (/FROM chat_sessions s/.test(sql)) return { rows: [sessionRow] };
+    if (/fde_name FROM users/.test(sql)) return { rows: [{ fde_name: 'erix' }] };
+    if (/FROM runs WHERE session_id/.test(sql)) return { rows: [] };
+    if (/FROM containers/.test(sql)) return { rows: [{ id: 'c1' }] };
+    if (/UPDATE chat_sessions SET last_seq/.test(sql)) return { rows: [{ last_seq: 1 }] };
+    if (/INSERT INTO messages/.test(sql)) {
+      return { rows: [{ id: crypto.randomUUID(), seq: 1, role: 'user', content: '', attachments: [], created_at: new Date('2026-01-01T00:00:00.000Z') }] };
+    }
+    if (/SELECT record\s+FROM transcript_rounds/.test(sql)) return { rows: [] };
+    if (/SELECT MAX\(round\)/.test(sql)) return { rows: [{ max_round: null }] };
+    if (/SELECT round, dedup_key, record\s+FROM transcript_rounds/.test(sql)) return { rows: [] };
+    if (/INSERT INTO transcript_rounds/.test(sql)) return { rows: [{ id: 1 }] };
+    if (/INSERT INTO runs /.test(sql)) return { rows: [{ id: crypto.randomUUID(), status: 'queued', trigger_kind: params[2] }] };
+    return { rows: [] };
+  };
+  const client = { async query(sql, params = []) { queries.push({ sql, params }); return dispatch(sql, params); }, release() {} };
+  const pool = { async connect() { return client; } };
+
+  await postMessage(pool, {
+    userId, sessionId, content: 'hi',
+    cwd: '/srv/erix/users/erix/projects/demo_app',
+    config: { userSpaceRoot: '/srv/erix/users' },
+  });
+
+  const cwdUpd = queries.find((q) => /UPDATE chat_sessions SET cwd/.test(q.sql));
+  assert.ok(cwdUpd, 'cwd 与会话原值不同 ⇒ 必须发出 UPDATE chat_sessions SET cwd');
+  assert.equal(cwdUpd.params[1], '~/projects/demo_app', '落库 cwd 必须是校验器归一的 tilde 形态');
+  assert.notEqual(cwdUpd.params[1], '/srv/erix/users/erix/projects/demo_app', '宿主绝对路径绝不能原样落库');
 });
 
 // 兜底：validateSessionCwd 回归不受影响。
