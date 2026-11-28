@@ -72,7 +72,7 @@ select count(distinct e.run_id) from run_events e join runs r on r.id=e.run_id
 |---|---|---|
 | 近 14 天 run 数 | 35 | — |
 | 读过 `AGENTS.md` 的 run | **5（14%）** | 86% 的 run 全程没读 |
-| 其中是验收探针（`cwd` 含 `probe`） | **4/5** | 真实任务里只有 1 个（`todo-multi`）读过 |
+| 其中是验收探针（`cwd` 含 `probe`） | **4/5** | 真实任务里只有 1 个（`<项目>`）读过 |
 | 真实任务 run / 其中读过 | **5 / 1**（样本小） | 有机合规率 ≈ 20%，n=5，只作趋势不作定论 |
 | 其中自带 `head -N` 截断 | **4/5**（`head -60` / `head -50` / `head -80` / `cat -n \| head`） | 读了也是残的；只有 1 个 run 整份读 |
 | `~/AGENTS.md` 行数 / 大小 | 67 行 / 9 018 B（引擎 `estimateTokens` = **4 081 tok**） | 「收工即提交」在 **53–54 行** ⇒ `head -50` 丢掉它 |

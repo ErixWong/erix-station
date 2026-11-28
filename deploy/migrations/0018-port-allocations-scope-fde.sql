@@ -13,7 +13,7 @@
 --     `port_allocations_live_port_key UNIQUE (fde_id, port) WHERE state <> 'released'`
 --     （portal/src/portalloc.js 的 INSERT 用 ON CONFLICT + 同谓词做冲突目标推断）。
 --     注意该索引**不能**改成全表 UNIQUE(fde_id,port)：released 历史行要留档（model.md §4 reaper 前不硬删）。
--- 存量数据一律不迁移：真机现存 4 行全是 P5 之前手工插的 scope='project'（含 tetris 的 4100，在
+-- 存量数据一律不迁移：真机现存 4 行全是 P5 之前手工插的 scope='project'（含 <fde_name> 的 4100，在
 --   4000–4009 窗口之外）；routes.js:382 生成路由时只看 state<>'released' 与 hostname、不看 scope，
 --   所以遗留行继续有效，新写的行才用 scope='fde'（不改、不删、不回填）。
 -- 为什么不是 NOT VALID（与 0017 不同）：新集合是旧集合的**超集**，存量行必然仍然满足，校验不可能

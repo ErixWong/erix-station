@@ -7,7 +7,7 @@
 //   - 粒度 = **FDE 级**（`scope='fde'`，迁移 0018 放开该值；`run_id` 恒 NULL，满足
 //     `CHECK ((scope='run') = (run_id IS NOT NULL))`）；条数 = **默认一块 10 个**（管理员可覆盖）；
 //   - 端口 = **全局号池 22000–29999 内「最小的未占用对齐块」**（常量与块几何全在 `previewpool.js`）；
-//     #240 的「人人都是 4000–4009」已被取代——那个实现让真机 <fde_name> 与 tetris 同时持有 4000–4009；
+//     #240 的「人人都是 4000–4009」已被取代——那个实现让真机 <fde_name> 与 alice 同时持有 4000–4009；
 //   - **跨 FDE 不重叠是硬不变式，由 DB 保证**：迁移 0019 的
 //     `port_allocations_live_global_port_key UNIQUE (port) WHERE state <> 'released'`。应用层因此
 //     **不做**「先查后插」的查重循环，只算候选块 + 把 23505 翻成可操作错误码（见下）由调用方重试；

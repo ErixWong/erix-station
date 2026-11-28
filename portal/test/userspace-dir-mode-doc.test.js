@@ -79,8 +79,8 @@ test('#273 文档口径：全仓 docs 里残留的 2770 必须处在「说真话
 });
 
 // 评审 #273（review273 finding 1，blocker）：改口时曾把「混的」写成「一致 0770」——那是一条新假话。
-// 真机实测（2026-10-24，dev 栈 /srv/erix/users）：`<fde>/projects/probe-343`、`blind/projects/r1-app`、
-// `tetris/projects/tetris-arena` = **2770**；同树 `<fde>/projects/probe-261014` = 770；遗留 `home/worktrees` = 2755。
+// 真机实测（2026-10-24，dev 栈 /srv/erix/users）：`<fde>/projects/probe-343`、`<fde>/projects/r1-app`、
+// `<fde>/projects/<项目>` = **2770**；同树 `<fde>/projects/probe-261014` = 770；遗留 `home/worktrees` = 2755。
 // 机制在成因 (a) 第 2 步：只创建一次的目录首轮属组仍 == 进程 egid 0 ⇒ setgid 落得下，且没人再来清它。
 // 所以口径不是「全树 0770」，而是「portal 反复 reconcile 的目录 0770 + 只建一次的目录 2770，混着」。
 test('#273 文档口径：§6.2 必须承认 setgid 状态在同一棵树里是混的（不许写回“一致 0770”）', () => {

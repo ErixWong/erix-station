@@ -58,7 +58,7 @@ const CHATCMPL_FEATURE = 'chatcmpl-tool-';
 const SAMPLE_A_FINAL_TEXT = [
   DSML_OPEN + 'tool_calls>',
   DSML_OPEN + 'invoke name="shell">',
-  DSML_OPEN + 'parameter name="command" string="true">cd /home/erix/projects/tetris-arena && echo "=== processes ==="',
+  DSML_OPEN + 'parameter name="command" string="true">cd /home/erix/projects/<项目> && echo "=== processes ==="',
   "; pgrep -af 'node backend/server.js' | grep -v pgrep || echo 'NONE'",
   '</' + U + U + 'DSML' + U + U + 'parameter>',
   '</' + U + U + 'DSML' + U + U + 'invoke>',

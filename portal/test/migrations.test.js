@@ -424,7 +424,7 @@ test('迁移 0019-preview-port-pool：⓪→①→②→③ 顺序不可换、CH
   assert.match(updateBody, /row_number\(\) OVER \(ORDER BY COALESCE\(u\.fde_name, l\.fde_id::text\)\)/,
     '确定顺序 = fde_name（无用户时回落 fde_id），第 1 个 FDE 拿 22000 段');
   assert.match(updateBody, /state\s+= CASE WHEN r\.slot_no <= 10 THEN pa\.state\s+ELSE 'released' END/,
-    '块装不下的第 11 条起置 released（tetris 的 4100 就走这条）');
+    '块装不下的第 11 条起置 released（<fde_name> 的 4100 就走这条）');
   assert.match(updateBody, /released_at = CASE WHEN r\.slot_no <= 10 THEN pa\.released_at ELSE now\(\) END/,
     "置 released 必须同时写 released_at（CHECK ((state='released') = (released_at IS NOT NULL))）");
   // hostname：拆「首标签前缀 + 旧端口段 + base」重组 ⇒ base 来自旧 hostname，不写死伞域；

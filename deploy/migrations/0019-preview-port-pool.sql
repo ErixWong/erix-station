@@ -2,7 +2,7 @@
 -- 背景：#240 的实现是「每个 FDE 都发同一段 4000–4009」（`portal/src/portalloc.js` 的固定常量
 --   `PREVIEW_PORT_START=4000` + `PREVIEW_PORT_COUNT=10`），而既有唯一索引只按 FDE 判重
 --   （`port_allocations_live_port_key UNIQUE (fde_id, port) WHERE state <> 'released'`）⇒ **跨 FDE
---   重叠完全不受约束**。真机后果（实测）：`eric` 与 `tetris` 同时持有 4000–4009 = 10 组重叠。
+--   重叠完全不受约束**。真机后果（实测）：`eric` 与 `<fde_name>` 同时持有 4000–4009 = 10 组重叠。
 -- 决策（决策者 2026-10-11，issue #246）：全局唯一一个号池 **22000–29999**（8000 个号 = 800 段），
 --   开户发「池内最小的未占用对齐块」（默认 10 个一段），**重叠 = 硬不变式，由 DB 保证**——应用层
 --   因此不做「先查后插」的查重循环，只算候选块 + 把 23505 翻成可操作错误码后由调用方重试。
@@ -11,10 +11,10 @@
 --   ⓪ 先按名 DROP 旧 `port` CHECK → ① 重排存量活行进池 → ② `port` CHECK 换新口径 → ③ 建全局部分唯一索引
 --   ⓪ 是 ① 的**前置条件**（TEMP 真库克隆实测出来的——issue #246 正文只列了三步，漏了这一条）：旧 CHECK 是
 --     `port BETWEEN 4000 AND 4999`，与新池 **22000–29999 不相交** ⇒ 带着旧 CHECK 根本 UPDATE 不进池内，
---     ① 自己就会当场 23514（实测失败行正是 tetris 挪到 22010 的那条）。DROP 到 ② 之间 `port` 暂时无 CHECK，
+--     ① 自己就会当场 23514（实测失败行正是 <fde_name> 挪到 22010 的那条）。DROP 到 ② 之间 `port` 暂时无 CHECK，
 --     但整个过程跑在迁移 runner 的**单个显式事务**里，而 `DROP CONSTRAINT` 持 ACCESS EXCLUSIVE 直到 COMMIT
 --     ⇒ 并发事务既看不到无 CHECK 的中间态、也写不进脏端口；baseline 冻结 ⇒ 也不能靠回写 schema.sql 绕过。
---   * 先 ③ 后 ① ⇒ 建索引当场 `23505`：eric / tetris 各有 4000–4009 的活行；真机 PG **16.15** 的唯一
+--   * 先 ③ 后 ① ⇒ 建索引当场 `23505`：eric / <fde_name> 各有 4000–4009 的活行；真机 PG **16.15** 的唯一
 --     索引不支持 `NOT VALID`（PG 17 才有），建索引时**必须已经没有重复**。
 --   * 先 ② 后 ① ⇒ `ADD CONSTRAINT` 当场 `23514`：新 CHECK 要校验存量，而存量活行还在 4000–4100。
 --   * 不用 `CREATE INDEX CONCURRENTLY`：迁移 runner 在**显式事务**里执行本文件
@@ -33,7 +33,7 @@
 --   FDE 名与第一段之后的 base 全部原样保留；`url` 只替换 `://` 之后到第一个 `/` 或 `:` 之前的 host 段，
 --   scheme 与非默认端口原样保留（与 `projects.previewUrl` 的生成口径一致）。
 --
--- 块装不下的活行（真机只有 `tetris`：11 条活行 4000–4009 + 窗口外的 4100，块只有 10 个槽位）：
+-- 块装不下的活行（真机只有 `<fde_name>`：11 条活行 4000–4009 + 窗口外的 4100，块只有 10 个槽位）：
 --   按 `(port, id)` 稠密顺序填前 10 个槽位，**第 11 条起置 `released`**（`released_at = now()`，满足
 --   `CHECK ((state = 'released') = (released_at IS NOT NULL))`）——issue #246 给的两种处置是「并回块内
 --   或置 released」，并回块内会侵吞下一个 FDE 的整块 ⇒ 取置 released。该行端口原样保留（released 分支
@@ -44,7 +44,7 @@
 --   重放时待重排 FDE 集合为空 ⇒ 零改写；③ `IF NOT EXISTS`。
 -- 冻结 baseline：`docs/data/schema.sql` **一个字节不改**（sha256 冻结，`migrate.js:138` 对整文件文本
 --   含注释算哈希，失配即 refusing to start；同 0017/0018 的手法）。
--- 已接受的代价（issue #246）：eric / tetris 现有预览 URL 全部改写——`routes.yml` 与容器内
+-- 已接受的代价（issue #246）：eric / <fde_name> 现有预览 URL 全部改写——`routes.yml` 与容器内
 --   `~/.erix/ports.json` 由派生链自动跟上，但**容器内应用要改监听端口**，已发出去的旧链接失效。
 SET lock_timeout = '5s';
 
@@ -108,7 +108,7 @@ renumbered AS (                              -- 新端口 + 新 hostname（只�
          -- ⚠ **不要用 `lpad` 拼端口段**：PG 的 `lpad(text, width, fc)` 对**比 width 长的串会截断**
          --   （实测 `lpad('22010', 4, '0') = '2201'`），而写侧 `projects.buildHostname` 的
          --   `String(port).padStart(4, '0')` **不截断**。本单恰好把端口推到 5 位，用 lpad 会把
-         --   `tetris-p-22010` 写成 `tetris-p-2201`（同块 10 行会塑成同一 hostname，当场 23505）。
+         --   `<fde_name>-p-22010` 写成 `<fde_name>-p-2201`（同块 10 行会塑成同一 hostname，当场 23505）。
          --   ⇒ 拼法：截到旧端口段之前 + 新端口原样十进制 + base 后缀。宽度自然增长，
          --     不依赖任何宽度常量，也**不硬编码伞域**（base 段从头到尾没动）。
          --   `old_port_digits IS NULL`（首标签不以数字结尾的历史形）时 hostname 不挪，

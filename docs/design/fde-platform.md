@@ -416,7 +416,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 > UNIQUE (port) WHERE state <> 'released'` 在 **DB 层**保证；`released` 行不占位 ⇒ **号码可回收复用**。
 >
 > **历史（#240，已被本节取代）**：#240 把分配粒度定在 **FDE 级**、但端口写死 `4000–4009`（人人同一段），
-> 而既有索引只按 FDE 判重 ⇒ 真机 `<fde_name>` 与 `tetris` 同时持有 4000–4009（**10 组重叠**）。
+> 而既有索引只按 FDE 判重 ⇒ 真机 `<fde_name>` 与 `alice` 同时持有 4000–4009（**10 组重叠**）。
 > 本单只换「挑哪些号」，**不改** #240 定的其它口径：粒度仍是 FDE 级；原「项目创建分配块首单端口 +
 > 8 端口块（slot）+ 每用户总配额」的方案仍作废（项目注册制已随 P5 退役，`projects.slot` 不再参与端口分配，
 > `port_allocations.project_id` 已被迁移 0008 DROP，run 级端口块仍是 P2）；**仍不存在「超限」，
@@ -457,8 +457,8 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
   就整段换下一个空闲块，而不是在残缺段里插到一半被全局索引拒（`portal/test/portalloc.test.js` 钉住）。
 - **存量已由迁移 0019 一次性重排**（取代 #240 的「遗留行不迁移」）：活行按 `fde_name` 定序重排进号池，
   `hostname`/`url` 同事务重写（base 域从旧 hostname 反推，不硬编码伞域）；装不进一个块的溢出活行（真机只有
-  `tetris` 的 **4100**）置 `released`；`released` 历史行（真机 `portsprobe` 的 4000–4009）**保留旧号码不重写**。
-  已接受的代价：<fde_name> / tetris 现有预览 URL 全部改写，**容器内应用要改监听端口**，旧链接失效。
+  `<fde_name>` 的 **4100**）置 `released`；`released` 历史行（真机 `portsprobe` 的 4000–4009）**保留旧号码不重写**。
+  已接受的代价：<fde_name> / alice 现有预览 URL 全部改写，**容器内应用要改监听端口**，旧链接失效。
 - **管理员改块是搬迁事务，不是再发一块**（#246 交付②，本节最容易做错的一句）：`ensureFdePreviewPorts`
   全文件零 `UPDATE port_allocations`（**insert-only**），所以「改块」若直接复用它补一段，旧 10 条行仍活、
   继续占号、旧域名仍可访问（真机就会是 20 条活行）。因此 `moveFdePreviewBlock` 在**同一事务**里先按
