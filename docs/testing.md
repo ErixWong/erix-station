@@ -494,7 +494,7 @@ internal 通道与公开端点的 `validation_failed` **统一为 `400`**（port
 
 > 契约锚点：runner §1.3「契约测试 | `erix-agent/contract-tests` | `package.json:23-27` exports；`test/contract/index.js` 导出 `transcriptStoreContract` / `modelConfigProviderContract`」。**该包只导出 `.` / `./tools` / `./contract-tests`**，深路径导入会被 `ERR_PACKAGE_PATH_NOT_EXPORTED` 拒绝。
 
-接入步骤（**本文此前的「当前 `erix-agent` 尚未安装」已过期**，261128 现验：根 `package.json` 与 `runner/package.json` 均 pin `erix-agent` `0.33.0`，且已有三个契约套件在跑 ⇒ §5 表第 4 行同步更正；下面的命令保留为「升级后重验导出面」的可复现配方）：
+接入步骤（**本文此前的「当前 `erix-agent` 尚未安装」已过期**，261128 现验：根 `package.json` 与 `runner/package.json` 均 pin `erix-agent` `0.34.0`（同日升号 #895，本文写作时是 0.33.0），且已有三个契约套件在跑 ⇒ §5 表第 4 行同步更正；下面的命令保留为「升级后重验导出面」的可复现配方）：
 
 ```bash
 # 1) 安装并 pin（**版本 pin 以 `package.json` / `runner/package.json` 的 `erix-agent` 字段现读为准**，本文不写死版本号；规格 §14/§13.2）
@@ -504,7 +504,7 @@ npm install "erix-agent@$ERIX_AGENT_VERSION"
 # 2) 验证导出面（只允许这三个入口）
 node --input-type=module -e \
   "import('erix-agent/contract-tests').then(m => { console.log(Object.keys(m).sort().join(',')); })"
-# 期望输出包含：transcriptStoreContract,modelConfigProviderContract（261128 现读 0.33.0：该子路径共导出 12 个契约，两个名字都在内 ⇒ 期望成立；升 0.34.0（#895）后重量：**仍 12 个、名单一字未变**，两个名字仍在内；`erix-agent/tools/jail` 仍报 `ERR_PACKAGE_PATH_NOT_EXPORTED`）
+# 期望输出包含：transcriptStoreContract,modelConfigProviderContract（261128 现读 **0.34.0**：该子路径共导出 12 个契约，两个名字都在内 ⇒ 期望成立；0.33.0 同测亦为 12 个、名单一字未变；`erix-agent/tools/jail` 仍报 `ERR_PACKAGE_PATH_NOT_EXPORTED`）
 
 # 3) 深路径导入必须被拒（负向断言）
 node --input-type=module -e \
@@ -515,7 +515,7 @@ node --input-type=module -e \
 接入落点（**逐条标「已接入 / 未接入」，判据是仓内现读的导入点，不是本文的意愿**）：
 
 - **store adapter 契约测试**（✅ **已接入**：`runner/test/store-contract.test.js`、`portal/test/transcript-store.test.js` 均 `import { transcriptStoreContract } from 'erix-agent/contract-tests'`）：用 `transcriptStoreContract` 跑**本平台的 HTTP store adapter**（实现 `TranscriptStore` 现役方法，映射到 portal internal U5–U7 与 run-state 端点；**U8/U9（run snapshot）已随 #640 退役**，runner §9.1）。跑法：起 in-process stub 实现这些端点（§2.1 fake），adapter 指向 stub，contract 测试逐方法断言。**这验证的是「我们的 adapter 满足上游 store 接口语义」，不是验证 portal 业务逻辑**。
-- **config provider 契约测试**（❌ **未接入 ⇒ 真缺口**：`grep -rnw modelConfigProviderContract` 在 `portal/`、`runner/`、`test/` 的全部 `*.js`/`*.mjs`/`*.ts`/`*.vue` 里 **0 命中**，只在本文与 [`design/runner-integration.md`](design/runner-integration.md) §1.3 的表里被点名（文档里的条数会随本文自身改动而变，别抄数字，判据就是上面那条 `grep -rnw`）⇒ 那些位置写的是**期望**而非现状；⚠ 引擎侧**确有**该导出，261128 现读 0.33.0 的 `erix-agent/contract-tests` 导出面含 `modelConfigProviderContract` ⇒ 缺的是**本站没有跑它**，不是上游没有）。要补的内容：用 `modelConfigProviderContract` 跑**本平台物化的 `config.json`**（顶层键 `slots` + 占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot，user-space §4.3.2）经 `createJsonFileModelConfigProvider` 解析的结果——断言三个 slot 可解析、占位 key 可读（真实 key 由 Traefik 注入，容器内零凭据，runner §11.1）。本站**已在用**那个 provider（`runner/worker.js` 导 `createJsonFileModelConfigProvider`），只是没跑上游契约套件 ⇒ 缺口是「装配没被上游语义钉住」，不是「功能没做」。
+- **config provider 契约测试**（❌ **未接入 ⇒ 真缺口**：`grep -rnw modelConfigProviderContract` 在 `portal/`、`runner/`、`test/` 的全部 `*.js`/`*.mjs`/`*.ts`/`*.vue` 里 **0 命中**，只在本文与 [`design/runner-integration.md`](design/runner-integration.md) §1.3 的表里被点名（文档里的条数会随本文自身改动而变，别抄数字，判据就是上面那条 `grep -rnw`）⇒ 那些位置写的是**期望**而非现状；⚠ 引擎侧**确有**该导出，261128 现读 0.34.0 的 `erix-agent/contract-tests` 导出面含 `modelConfigProviderContract`（该子路径 12 个契约，0.33.0→0.34.0 名单一字未变） ⇒ 缺的是**本站没有跑它**，不是上游没有）。要补的内容：用 `modelConfigProviderContract` 跑**本平台物化的 `config.json`**（顶层键 `slots` + 占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot，user-space §4.3.2）经 `createJsonFileModelConfigProvider` 解析的结果——断言三个 slot 可解析、占位 key 可读（真实 key 由 Traefik 注入，容器内零凭据，runner §11.1）。本站**已在用**那个 provider（`runner/worker.js` 导 `createJsonFileModelConfigProvider`），只是没跑上游契约套件 ⇒ 缺口是「装配没被上游语义钉住」，不是「功能没做」。
 - **其它已接入的套件**（本文此前未登记）：`runner/test/file-tools-contract.test.js` 跑 `fileToolsContract`（issue #228）、`runner/test/tool-result-envelope-contract.test.js` 跑 `toolResultEnvelopeContract` ⇒ 判据是这两个文件的 `import ... from 'erix-agent/contract-tests'`。反面一例：`engineApiContract` 已不再被本站接入（`portal/src/display-projection.js` 之后，见 `portal/test/engine-upgrade-299.test.js` 的注记）。
 - **CI 接入**：规格 §13.2-6「`erix-agent/contract-tests` 应接入 CI（长期运行的宿主必需）」——落点为 `npm test` 的一个子集（`contract-tests` 目录），随全绿门槛执行。✅ 已成立：上面点名的三个套件都在 `node --test` 的根发现面内（`runner/test/*.js` 与 `portal/test/*.js`），随 `npm test` 跑（`ci.yml` 步骤 ②）。
 
@@ -657,7 +657,7 @@ P1 交付完成 = 同时满足：
 | 1 | **真实 LLM 配额/调用**（P3） | 需真实 LLM 网关 + 上游配额；P1 对话走**无真实凭据的 OpenAI-compatible mock/test gateway**（deploy §7.3，容器仍只持占位 key + `endpoint`，无 `LLM_DEV_*` 变量） | P1 用 mock/占位断言「请求发出、错误码映射（`rate_limited`→429、`checkpoint_failed`）正确」（§3.9）；真实配额 P3 验收 |
 | 2 | **目标环境网络策略（出口管控）** | 外部依赖（安全团队，issue #3），本机开发机未实施 | N5（FDE→互联网）目标环境实测；「改 endpoint 无效」（P3 验收）依赖安全团队策略，未实施时降级为审计+告警（规格 §11.4） |
 | 3 | **LLM 注入真实虚拟 key 覆盖伪造头**（topology §4-L7/§10 证据 8） | P3 才部署 `llm-gateway` + LLM 注入路由（deploy §7.2） | 归 P3 验收；P1 不测（不假通过） |
-| 4 | **config provider 契约未跑**（`modelConfigProviderContract` 本站 0 个使用者） | 引擎侧**有**该导出（261128 现读 0.33.0 的 `erix-agent/contract-tests` 导出面含它），但本站没有任何测试用它 ⇒ 本文此前写的「`erix-agent` 依赖未安装」已过期（根与 `runner/package.json` 均 pin `0.33.0`，`transcriptStoreContract` / `fileToolsContract` / `toolResultEnvelopeContract` 三个套件已在 `npm test` 面里跑） | 显式标**未验收**：补上「跑物化 `config.json` 的 config provider 契约」后才能转「已测」（落点与判据 ⇒ §3.6.3）；不拿「其它套件已绿」冒充这条绿 |
+| 4 | **config provider 契约未跑**（`modelConfigProviderContract` 本站 0 个使用者） | 引擎侧**有**该导出（261128 现读 0.34.0 的 `erix-agent/contract-tests` 导出面含它；0.33.0 同含），但本站没有任何测试用它 ⇒ 本文此前写的「`erix-agent` 依赖未安装」已过期（根与 `runner/package.json` 均 pin `0.33.0`，`transcriptStoreContract` / `fileToolsContract` / `toolResultEnvelopeContract` 三个套件已在 `npm test` 面里跑） | 显式标**未验收**：补上「跑物化 `config.json` 的 config provider 契约」后才能转「已测」（落点与判据 ⇒ §3.6.3）；不拿「其它套件已绿」冒充这条绿 |
 | 5 | **预览 ticket/cookie 的 TTL 实测**（60s/15min ⚠️） | 参数待决策者确认（portal §2.8） | 拍板后按值测；未拍板前只测「过期即拒」的方向性断言，不测具体秒数 |
 | 6 | **多 FDE 全量隔离**（30 FDE 规模） | P2（deploy §7.2「多 FDE」），P1 单 FDE | P1 只测「单 FDE + 假容器」的拓扑隔离；30 FDE 规模/批量 offboarding 归 P2 |
 | 7 | **DNS-01 / 真实证书 / VPN-only / 公网可达**（env §1/§2/§3 🕓 部署期） | 部署期事项，P1 开发不需要 | 开发期用 hosts/localhost 变通 + 自签/http；部署期按 env §9 探测后实测 |

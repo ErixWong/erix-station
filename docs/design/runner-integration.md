@@ -1,7 +1,7 @@
 # FDE 容器内 runner 集成设计
 
 > 状态：**设计基线；runner 已实现**（部署/实现边界见 `runner/README.md`）。
-> 依据：[`fde-platform.md`](fde-platform.md)（主规格，下称「规格 §x」）、[`principles.md`](principles.md)（原理与硬约束）、[`../api/portal.md`](../api/portal.md)（API 契约，下称「portal.md §x」）、[`../data/model.md`](../data/model.md) + [`../data/schema.sql`](../data/schema.sql)（数据模型，下称「model.md §x」）、上游引擎源码 [erix-agent](https://github.com/ErixWong/erix-agent)（runner 的 pin **以 `runner/package.json` 的 `erix-agent` 字段现读为准**，261115 现查 = **0.33.0**（与根 `package.json` 同源）；本文保留的 v0.3.5 / v0.9.0 / v0.14.0 行号与设计决策均为**历史锚点**，store 现状以 §9 与 `runner/lib/store.js` 为准）。
+> 依据：[`fde-platform.md`](fde-platform.md)（主规格，下称「规格 §x」）、[`principles.md`](principles.md)（原理与硬约束）、[`../api/portal.md`](../api/portal.md)（API 契约，下称「portal.md §x」）、[`../data/model.md`](../data/model.md) + [`../data/schema.sql`](../data/schema.sql)（数据模型，下称「model.md §x」）、上游引擎源码 [erix-agent](https://github.com/ErixWong/erix-agent)（runner 的 pin **以 `runner/package.json` 的 `erix-agent` 字段现读为准**，261128 现查 = **0.34.0**（#895；与根 `package.json` 同源）；本文保留的 v0.3.5 / v0.9.0 / v0.14.0 行号与设计决策均为**历史锚点**，store 现状以 §9 与 `runner/lib/store.js` 为准）。
 >
 > **本文是平台最核心的实现层设计**：FDE 容器内 `station-agentd` / `station-runner` 两个可执行的进程模型、与 portal 的出站协议、IPC、run 生命周期、事件路径、store adapter、审批中转、失败恢复。目标是「实现者可直接照做」。
 >
