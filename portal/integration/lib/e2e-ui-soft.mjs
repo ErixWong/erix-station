@@ -60,7 +60,7 @@ function parseResolveEntries(raw) {
 /**
  * #932：拼 `--host-resolver-rules` 串（唯一来源）。
  *
- * 取值优先级：`E2E_RESOLVE` →（没有才）`E2E_HOST_MAP`（旧名，仅兼容一个世代）→ 缺省串。
+ * 取值优先级：`E2E_RESOLVE` →（没有才）`E2E_HOST_MAP`（旧名，只作迁移期兼容；移除条件见 docs/testing.md §1.2.3，不按版本或世代计时）→ 缺省串。
  * 若两个变量**同时存在且不同**：只用 `E2E_RESOLVE`，并在返回结构里给一条 `warning`
  * （旧名已忽略的提示）——纯函数、不写 stdout、不在模块加载时打印，由调用方决定要不要提示。
  *
@@ -86,7 +86,7 @@ export function hostResolverRules(env = process.env) {
     raw = legacy;
     // 旧名**本次生效**也要报：兼容的前提是「读得到、报得出」，静默用旧名等于把
     // 移除它的时机无限推迟（没人知道还有谁在用）。
-    warning = 'E2E_HOST_MAP（旧名）本次生效：请改用 E2E_RESOLVE（旧名只兼容一个世代）';
+    warning = 'E2E_HOST_MAP（旧名）本次生效：请改用 E2E_RESOLVE（旧名只作迁移期兼容）';
   } else {
     raw = DEFAULT_RESOLVE;
   }

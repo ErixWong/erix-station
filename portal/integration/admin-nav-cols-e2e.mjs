@@ -69,7 +69,7 @@ const SHOT_NARROW_HOST = path.join(os.tmpdir(), 'admin-nav-cols-e2e-narrow.png')
 
 // 浏览器跑在容器里 ⇒ 它自己解析不到入口域名，用 `--host-resolver-rules` 把域名映射到宿主。
 // 只覆盖容器内解析，不动宿主 hosts、不写文件。坐标可用 `E2E_RESOLVE` 覆盖：`host=ip,host=ip`。
-// #932：解析与拼接统一到 lib 的 hostResolverRules()——读 E2E_RESOLVE（旧名 E2E_HOST_MAP 兼容一世代），
+// #932：解析与拼接统一到 lib 的 hostResolverRules()——读 E2E_RESOLVE（旧名 E2E_HOST_MAP 只作迁移期兼容，移除条件见 docs/testing.md §1.2.3），
 // 两者皆无时用与现有脚本一致的缺省串；多条规则逗号连接（chromium 实测要求）。HOST_MAP/规则串同源。
 const { entries: HOST_MAP, rules: HOST_RESOLVER_RULES, warning: HOST_MAP_WARNING } = hostResolverRules();
 
@@ -579,7 +579,7 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       t.skip();
       return;
     }
-    // #932：旧名 E2E_HOST_MAP 若被用上，这里必须报出来（静默兼容 = 永远移不掉）。
+    // #932：旧名的兼容提示在 H0（总是跑）里打，不在这里——UI 腿没点名会早退，提示会跟着消失。
     // 点名之后的预检缺口（缺 docker / 容器没跑 / 容器里没 playwright / 缺口令）：
     // 只有显式逃生门 E2E_UI_SOFT=1 才允许降级 skip，其余一律判红。
     if (probe.reasons.ui) {

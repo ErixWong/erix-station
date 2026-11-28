@@ -80,7 +80,7 @@ test('hostResolverRules: 只有旧名 E2E_HOST_MAP 时也能解析', () => {
   const r = hostResolverRules({ E2E_HOST_MAP: 'admin.example=5.6.7.8' });
   assert.equal(r.rules, 'MAP admin.example 5.6.7.8');
   // #932 主文要求旧名「读得到、**报得出**」⇒ 旧名单独生效也必须给一条提示，
-  // 否则没人知道还有谁在用旧名，「兼容一个世代」就没有移除时机。
+  // 否则没人知道还有谁在用旧名 ⇒ 永远拿不到「可以删兜底」的那个条件。
   assert.equal(typeof r.warning, 'string', '旧名单独生效也必须报弃用提示');
   assert.ok(r.warning.includes('E2E_HOST_MAP'), `提示该点名旧名，实得：${r.warning}`);
   assert.ok(r.warning.includes('E2E_RESOLVE'), `提示该指明改用 E2E_RESOLVE，实得：${r.warning}`);
