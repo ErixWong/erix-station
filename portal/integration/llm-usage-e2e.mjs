@@ -508,9 +508,25 @@ try {
   r.page.featurePresent = r.page.headerCells.some((x) => /周期 \/ 用量|Period \/ usage/.test(x))
     || (await page.locator('[data-test^="user-usage-"]').count()) > 0;
 
-  // 行数：AdminUsersView 在 users 载入后**先建表**、再按 filteredUsers **出行**，所以「有表头、零行」
-  // 是真会出现的状态；零行时下面所有按格子的检查会整批空过（假绿）。外层据此判红。
-  r.page.rowCount = await page.locator('[data-test="user-row"]').count();
+  // 行与格要在**同一次 evaluate** 里一次取完：分两次查会被列表轮询插进来（有生命周期在跑时每 3s
+  // 重载用户列表），两次读数之间行数一变就假红。⚠ 下面 r.page.cells 是**稍后**的另一次采样，
+  // 只做内容断言；**任何计数都不许跨这两次采样比**（要比的量都在 usageTable 这一次里）。
+  // 逐行数而不是比两个总数：总数相等可以由「一行两格 + 一行没格」互相抵消凑出来（假绿）。
+  // 零行也判红：当前模板的 table 在两个空态分支之后才渲染（users.length === 0 与
+  // filteredUsers.length === 0 各走空态），所以「有表头无行」在这份前端上到不了；真出现了
+  // 就是渲染/筛选坏了，而且零行会让下面所有按格子的检查整批空过。
+  r.page.usageTable = await page.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('[data-test="user-row"]'));
+    const text = (el) => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
+    return {
+      rowCount: rows.length,
+      rows: rows.map((row) => ({
+        login: text(row.querySelector('td')).slice(0, 40),
+        usageCells: row.querySelectorAll('[data-test^="user-usage-"]').length,
+      })),
+      totalCells: document.querySelectorAll('[data-test^="user-usage-"]').length,
+    };
+  });
   r.page.cells = await page.$$eval('[data-test^="user-usage-"]', (els) => els.map((e) => {
     const row = e.closest('[data-test="user-row"]');
     const firstCell = row ? row.querySelector('td') : null;
@@ -601,12 +617,25 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
 
       // 先钉「有行、且每行恰好一个用量格」：否则下面 data-test / lifetime / period 那些检查会在空数组
       // 上全部空过（有表头无行是真状态，来历见采集处 rowCount）。
-      const rowCount = Number(rep.page.rowCount);
+      // 计数全部取自采集处那**一次**快照（不跨采样比，理由见采集处注释）。
+      const tab = rep.page.usageTable || {};
+      const rowCount = Number(tab.rowCount);
+      const perRow = Array.isArray(tab.rows) ? tab.rows : [];
+      const totalCells = Number(tab.totalCells);
       assert.ok(Number.isFinite(rowCount) && rowCount > 0,
-        `用户表一行都没有（rowCount=${JSON.stringify(rep.page.rowCount)}）⇒「有表头无行」，按格子的检查会空过（假绿）`);
+        `用户表一行都没有（usageTable=${JSON.stringify(tab).slice(0, 160)}）⇒ 按格子的检查会整批空过`);
+      assert.equal(perRow.length, rowCount,
+        `同一次快照里 rows=${perRow.length} 与 rowCount=${rowCount} 自相矛盾（采集器坏了）`);
+      const offRows = perRow.filter((x) => Number(x.usageCells) !== 1);
+      assert.equal(offRows.length, 0,
+        `这些行的用量格不是恰好 1 个：${JSON.stringify(offRows.slice(0, 5))}（每行应恰好一个；`
+        + `只比总数会被「一行两格 + 一行没格」的抵消骗过去）`);
+      const sumInRows = perRow.reduce((n, x) => n + Number(x.usageCells), 0);
+      assert.equal(totalCells, sumInRows,
+        `同一次快照里全表用量格 ${totalCells} ≠ 各行内之和 ${sumInRows}（差值 = 有用量格不在任何 user-row 内）`);
+      // 内容断言读稍后的那次采样（cells）：**只判每格长什么样，不判数量**（数量已在上面同一次
+      // 快照里判完）。跨采样比数量会在轮询时假红，所以这里刻意没有 cells.length 的断言。
       const cells = rep.page.cells || [];
-      assert.equal(cells.length, rowCount,
-        `用量格数 ${cells.length} ≠ 用户行数 ${rowCount}（每行应恰好一个用量格；对不上说明列与行没对上或有行漏渲染）`);
       // ② 每个用量格 data-test 合法（unknown|period|lifetime），整表不残留 pending。
       assert.equal(rep.page.pendingCount, 0, `整表残留 user-usage-pending ${rep.page.pendingCount} 格（卡在加载态 = 红）`);
       for (const c of cells) {
