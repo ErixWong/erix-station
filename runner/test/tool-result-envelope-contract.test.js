@@ -148,15 +148,18 @@ test('loopEventPayload：erix.durationMs 优先，且两值并存时以引擎命
   assert.equal(payload.ok, true);
 });
 
-test('loopEventPayload：旧记录回退——只有顶层 duration 时仍要拿得到时长（盘上有 740+ 条这种行）', () => {
+test('#303 退役：只有顶层 duration、无 erix.durationMs ⇒ duration_ms 必为 null（旧键不再被读）', () => {
   const legacy = loopEventPayload({
     type: 'tool_result',
     round: 1,
     // 0.19 及更早落盘的真实形状：erix 里没有 durationMs，时长只在顶层
     toolResult: { type: 'tool_result', tool_use_id: 'old-1', content: 'x', erixRound: 1, duration: 777, success: true },
   });
-  assert.equal(legacy.duration_ms, 777,
-    '删掉 `?? tr.duration` 回退就会红在这里：老记录会退化成「没有时长」');
+  assert.equal(legacy.duration_ms, null,
+    '#303 清账：引擎侧旧键 `duration` 已退役（`tool-fact.js` 把旧键映射到 erix.durationMs、'
+    + '`loop/orchestrator.js` 落盘前 delete 旧键、`loop/run-snapshot-executor.js` 注释明写旧键已退役），'
+    + '顶层 `duration` 不再是耗时来源 ⇒ 只有顶层旧键、无 erix.durationMs 时应为 null。'
+    + '若这条又变红，说明有人把 `?? tr.duration` 回退加回来了（不应）。');
 });
 
 test('loopEventPayload：两者都缺 ⇒ null（禁止写 0），is_error 仍决定 ok', () => {
