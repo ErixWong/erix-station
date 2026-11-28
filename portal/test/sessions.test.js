@@ -211,14 +211,17 @@ test('#890 调用点：postMessage 传绝对 projects/<name> ⇒ 落库 cwd 是�
     return { rows: [] };
   };
   const client = { async query(sql, params = []) { queries.push({ sql, params }); return dispatch(sql, params); }, release() {} };
+  let precheckCalls = 0;
+  const EXPECTED_PRECHECK_SQL = "SELECT 1 FROM fde_llm_bindings b WHERE b.fde_id = $1 AND b.state = 'active' AND b.gateway = 'litellm' AND b.api_key IS NOT NULL AND b.api_key <> '' AND b.main_model_id IS NOT NULL LIMIT 1";
   const pool = {
     // issue #905 之后，`postMessage` 在建 run 前会先走一次 pool 级的 LLM 上游预检（不经过 `connect()`）。
-    // 本单这格验的是 cwd 归一，不是预检本身 ⇒ 把「绑定已配好」回一行；**其余 SQL 不认就直接抛**，
-    // 免得将来出口又长出一条新查询被这里的兵底默默放行（同 #905 在其他文件里的写法）。
+    // 本单这格验的是 cwd 归一，不是预检本身 ⇒ 把「绑定已配好」回一行；其余 SQL 不认就直接抛。
+    // issue #919-D：改成**全串等值**——归一空白后与完整预检 SQL 逐字相等才接受（只匹配前缀会让
+    // 出口长出第二条同前缀查询、或预检被调两次都被静默放过），并用计数器钉死「一次 postMessage 恰好一次」。
     async query(sql) {
       const s = String(sql).replace(/\s+/g, ' ').trim(); // 那条预检 SQL 是多行字面，不归一匹配不上
-      if (!/^SELECT 1 FROM fde_llm_bindings b\b/.test(s)) throw new Error(`unexpected pool SQL: ${sql}`);
-      return { rows: [{ '?column?': 1 }] };
+      if (s === EXPECTED_PRECHECK_SQL) { precheckCalls++; return { rows: [{ '?column?': 1 }] }; }
+      throw new Error(`unexpected pool SQL: ${sql}`);
     },
     async connect() { return client; },
   };
@@ -229,6 +232,8 @@ test('#890 调用点：postMessage 传绝对 projects/<name> ⇒ 落库 cwd 是�
     config: { userSpaceRoot: '/srv/erix/users' },
   });
 
+  // issue #919-D：加固——预检 SQL 全串等值接受，且一次 postMessage 期间必须**恰好被调一次**。
+  assert.equal(precheckCalls, 1, 'LLM 上游预检 SQL 在一次 postMessage 期间必须恰好被调用一次');
   const cwdUpd = queries.find((q) => /UPDATE chat_sessions SET cwd/.test(q.sql));
   assert.ok(cwdUpd, 'cwd 与会话原值不同 ⇒ 必须发出 UPDATE chat_sessions SET cwd');
   assert.equal(cwdUpd.params[1], '~/projects/demo_app', '落库 cwd 必须是校验器归一的 tilde 形态');
