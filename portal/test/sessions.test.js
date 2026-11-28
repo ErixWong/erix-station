@@ -116,6 +116,31 @@ test('#919-A 绝对 cwd 带首尾空白 ⇒ validation_failed（details.field=cw
   assert.equal(validateRunCwd(`${USR}/${FDE}/projects/x`, { userSpaceRoot: USR, fdeName: FDE }), '~/projects/x');
 });
 
+// —— issue #919-C：恢复被 #890 误删的 details.allowed（API 契约回归）——
+// 旧实现里「第一段子目录 ∉ JAIL_RUN_CWD_HOST_SUFFIXES」这一支（platform/git 等）本就带 details.allowed；
+// #890 重写时把它误删（既有测试只钉 code+details.field 所以没红）。本格钉**完整 details 键集合**
+// （不只 field）+ 钉 en 字面存在 + 钉 allowed 值。用 platform/git（旧就带 allowed 的那一支），
+// 不用 home/cache（那是 #890 新增「非 projects/<name> 一级」拒支，只带 field）。
+test('#919-C platform/git 那一支仍带 details.allowed（完整键集合 + en 字面 + allowed 值）', () => {
+  let err;
+  try {
+    validateRunCwd(`${USR}/${FDE}/platform/git`, { userSpaceRoot: USR, fdeName: FDE });
+    assert.fail('platform/git 必须被拒');
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof SessionError);
+  assert.equal(err.code, 'validation_failed');
+  // 完整 details 键集合：既有 field 也有 allowed（不只 field）。
+  assert.deepStrictEqual(Object.keys(err.details).sort(), ['allowed', 'field']);
+  assert.equal(err.details.field, 'cwd');
+  assert.deepStrictEqual([...err.details.allowed], ['home', 'projects', 'cache']);
+  // en 字面存在且照旧（“jail subdirectory ... allowed: ...”）。
+  assert.equal(typeof err.en, 'string');
+  assert.ok(err.en.includes('the jail subdirectory of cwd cannot be used as a run directory'), err.en);
+  assert.ok(err.en.includes('allowed: home, projects, cache'), err.en);
+});
+
 // —— 用例 1：postMessage 越界 cwd ⇒ validation_failed、不刷会话 cwd、不入队 run（真库）——
 test('#676-1 postMessage 越界 cwd ⇒ validation_failed、会话 cwd 不变、run_queue 无新行',
   { skip: SKIP }, async () => {

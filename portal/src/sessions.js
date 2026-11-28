@@ -30,9 +30,12 @@ import { chatCompletionsUrl, extractAssistantText, redactSecret } from './llm-ch
 // ⚠ 只引 `./llm.js`（领域层）：**本文件不许 `import` `./http.js`** —— 错误载体 `FdeLlmPrecheckError`
 // 自带 `{status, code, message, en}`，把 http 层的 `HttpError` 拽进领域层就把依赖方向弄反了。
 import * as llm from './llm.js';
-// issue #890：run cwd 在边界归一为 `~/projects/<name>`。**issue #676 ①** 的 jail 子目录白名单不再被用到：
-// `validateRunCwd` 改成只认 `projects/<name>` 一级（home/cache 改拒），故本文件已移除
-// `../shared/jail-mounts.js` 的 import（`provisioner.js` 仍是它的消费者）。
+// issue #890：run cwd 在边界归一为 `~/projects/<name>`（validateRunCwd 只认 projects/<name> 一级，home/cache 改拒）。
+// issue #919-C：#890 重写校验分支时把 issue #676 ① 那条「jail 子目录白名单」错误详情键 `details.allowed`
+// 一并删了（API 契约回归：既有测试只钉了 code 与 details.field 所以没红）。故把 jail 子目录白名单
+// `JAIL_RUN_CWD_HOST_SUFFIXES` 引回，供越狱检查之后「第一段子目录不可作 run 目录」（platform/git 等，
+// home/cache 之外的 jail 子目录）这一支照旧带 `allowed` 报出。`provisioner.js` 也仍是它的消费者。
+import { JAIL_RUN_CWD_HOST_SUFFIXES } from '../shared/jail-mounts.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details, en } = {}) {
@@ -142,6 +145,17 @@ export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
   // 逃出 jail（rel 为空/`.`/`..`/`..` 前缀/绝对）⇒ 拒（先于「是否 projects」判定，越界最严重）。
   if (rel === '' || rel === '.' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
     throw new SessionError('validation_failed', `cwd 越出用户 jail（${jailRoot}）：${value}`, { en: `cwd is outside the user jail (${jailRoot}): ${value}`, details: { field: 'cwd' } });
+  }
+  // issue #919-C：恢复 #890 误删的「jail 子目录白名单」这一支（API 契约：`details.allowed`）。
+  // 越狱之后、projects/<name> 折叠之前：第一段子目录必须是允许当 run cwd 的 jail 子目录
+  // （home / projects / cache；platform/git 等被排除 ⇒ 带 `allowed` 报出）。文案与键集合照旧字面。
+  const firstSeg = rel.split(path.sep)[0];
+  if (!JAIL_RUN_CWD_HOST_SUFFIXES.includes(firstSeg)) {
+    const allowed = JAIL_RUN_CWD_HOST_SUFFIXES.join(', ');
+    throw new SessionError('validation_failed', `cwd 所在 jail 子目录不可作 run 目录（允许：${allowed}）：${value}`, {
+      en: `the jail subdirectory of cwd cannot be used as a run directory (allowed: ${allowed}): ${value}`,
+      details: { field: 'cwd', allowed: JAIL_RUN_CWD_HOST_SUFFIXES },
+    });
   }
   // jail 内还必须**正好**是 `projects/<name>` 一级，才能折叠成 `~/projects/<name>`：
   // rel 从 `<jailRoot>/projects` 起须恰为单段、非 . / ..、无分隔符、无控制字符。
