@@ -30,8 +30,9 @@ import { chatCompletionsUrl, extractAssistantText, redactSecret } from './llm-ch
 // ⚠ 只引 `./llm.js`（领域层）：**本文件不许 `import` `./http.js`** —— 错误载体 `FdeLlmPrecheckError`
 // 自带 `{status, code, message, en}`，把 http 层的 `HttpError` 拽进领域层就把依赖方向弄反了。
 import * as llm from './llm.js';
-// issue #676 ①：越界 cwd 校验要 jail 的单一真值表（宿主子目录 / 哪些能当 run cwd）。
-import { JAIL_RUN_CWD_HOST_SUFFIXES } from '../shared/jail-mounts.js';
+// issue #890：run cwd 在边界归一为 `~/projects/<name>`。**issue #676 ①** 的 jail 子目录白名单不再被用到：
+// `validateRunCwd` 改成只认 `projects/<name>` 一级（home/cache 改拒），故本文件已移除
+// `../shared/jail-mounts.js` 的 import（`provisioner.js` 仍是它的消费者）。
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details, en } = {}) {
@@ -75,23 +76,26 @@ export function validateSessionCwd(value) {
 }
 
 /**
- * issue #676 ①：校验**一条 run 的 cwd 是否落在该用户的 jail 内**（纯函数，与
+ * issue #676 ① / #890：把**一条 run 的 cwd 归一成 runner 能还原的形态**（纯函数，与
  * `validateSessionCwd` 并列；导出以便单测）。这是「响亮失败」的闸门——过去
  * `postMessage` / `createReviewSession` 任意字符串都收，错 cwd 会「账上 done、实际空转」。
  *
- * 接受两类形态：
- *  1. `~/projects/<name>` 相对形式 —— 走既有 `validateSessionCwd`（会话约定，回归口径不变）。
- *  2. **绝对路径**，且必须在该用户 jail 之内：`<userSpaceRoot>/<fde>/{home,projects,cache}/…`。
- *     jail 子目录取自 `JAIL_RUN_CWD_HOST_SUFFIXES`（`platform/git` 不在内 ⇒ 被拒，它是平台挂载点）。
+ * **唯一权威输出 = `~/projects/<name>`**：runner 的 `resolveRunCwd`（`runner/agentd.js`）只认这一
+ * 形态，宿主绝对路径下发到 runner 后会被那条 warn 分支静默回退成 `run.project.name`——于是库里存
+ * 宿主路径、界面显示宿主路径、runner 在另一目录空转（**三层不一致，#890 的根因**）。接受两类输入：
+ *  1. `~/projects/<name>` 相对形式 —— 走既有 `validateSessionCwd`，原样返回（回归口径一字不动）。
+ *  2. **绝对路径**且解析结果**正是** `<userSpaceRoot>/<fde>/projects/<name>`（一级、name 合法目录名）
+ *     ⇒ 归一返回 `~/projects/<name>`（宿主绝对路径绝不进 DB、进界面、下发 runner）。
  *     判前一律 `path.resolve` 规范化，防 `..` 穿越。
  *
- * 其余（越界绝对路径、`platform/git`、相对但非 `~/projects/`、`..` 穿出 jail、空）
- * ⇒ `SessionError('validation_failed', ...)`，`details.field='cwd'`。
+ * 其余（绝对 `home/`、`cache/`、`platform/git`、`projects/<a>/<b>` 更深子目录、越界绝对路径、
+ * 相对但非 `~/projects/`、空）⇒ `SessionError('validation_failed', ...)`，`details.field='cwd'`。
+ * ⚠ **home / cache 也在拒列**（#890 收紧、非放宽）：runner 表达不了这些形态，留着就是静默回退。
  *
  * @param {string} cwd
  * @param {{ userSpaceRoot?: string, fdeName?: string|null }} ctx 绝对路径判定需要两者；
  *        缺 userSpaceRoot/fdeName（如账户无 fde）时，绝对路径一律拒（无法证明在 jail 内）。
- * @returns {string} 规范后的 cwd（相对形式原样；绝对形式取 resolve 结果）
+ * @returns {string} 规范后的 cwd（一律 `~/projects/<name>`；绝对形式被折叠成 tilde 形态）
  */
 export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
   if (typeof cwd !== 'string' || cwd.trim() === '') {
@@ -112,7 +116,7 @@ export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
     });
   }
 
-  // 形态 2：绝对路径 ⇒ 规范化后必须落在 `<userSpaceRoot>/<fde>/{home,projects,cache}` 之下。
+  // 形态 2：绝对路径 ⇒ 归一为 `~/projects/<name>`。判前一律 `path.resolve` 吃掉 `..`。
   const root = typeof userSpaceRoot === 'string' && userSpaceRoot.trim() !== '' ? userSpaceRoot : null;
   const fde = typeof fdeName === 'string' && fdeName.trim() !== '' ? fdeName.trim() : null;
   if (!root || !fde) {
@@ -124,20 +128,23 @@ export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
   const jailRoot = path.resolve(root, fde); // `<userSpaceRoot>/<fde>`（resolve 已吃掉 `..`）
   const target = path.resolve(value);
   const rel = path.relative(jailRoot, target);
-  // 逃出 jail（rel 以 `..` 开头或为空/绝对）⇒ 拒。
-  if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+  // 逃出 jail（rel 为空/`.`/`..`/`..` 前缀/绝对）⇒ 拒（先于「是否 projects」判定，越界最严重）。
+  if (rel === '' || rel === '.' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
     throw new SessionError('validation_failed', `cwd 越出用户 jail（${jailRoot}）：${value}`, { en: `cwd is outside the user jail (${jailRoot}): ${value}`, details: { field: 'cwd' } });
   }
-  // 第一段子目录必须是允许当 run cwd 的 jail 子目录（home / projects / cache；platform/git 被排除）。
-  const firstSeg = rel.split(path.sep)[0];
-  if (!JAIL_RUN_CWD_HOST_SUFFIXES.includes(firstSeg)) {
-    const allowed = JAIL_RUN_CWD_HOST_SUFFIXES.join(', ');
-    throw new SessionError('validation_failed', `cwd 所在 jail 子目录不可作 run 目录（允许：${allowed}）：${value}`, {
-      en: `the jail subdirectory of cwd cannot be used as a run directory (allowed: ${allowed}): ${value}`,
-      details: { field: 'cwd', allowed: JAIL_RUN_CWD_HOST_SUFFIXES },
+  // jail 内还必须**正好**是 `projects/<name>` 一级，才能折叠成 `~/projects/<name>`：
+  // rel 从 `<jailRoot>/projects` 起须恰为单段、非 . / ..、无分隔符、无控制字符。
+  const name = path.relative(path.join(jailRoot, 'projects'), target);
+  const singleLevelProject = name !== '' && name !== '.' && name !== '..'
+    && !name.startsWith(`..${path.sep}`) && !name.includes(path.sep) && !/[\x00-\x1f\x7f]/.test(name);
+  if (!singleLevelProject) {
+    // home/、cache/、platform/git、projects/<a>/<b> 更深子目录：runner 都还原不出等价目录，留着=静默回退。
+    throw new SessionError('validation_failed', `绝对 cwd 必须是 jail 内的 <userSpaceRoot>/<fde>/projects/<name> 一级目录（home/、cache/ 及更深子目录 runner 还原不出等价目录，一律拒）：${value}`, {
+      en: `an absolute cwd must be exactly <userSpaceRoot>/<fde>/projects/<name>; home/, cache/ and deeper subdirectories cannot be reconstructed by the runner and are rejected: ${value}`,
+      details: { field: 'cwd' },
     });
   }
-  return target;
+  return `~/projects/${name}`;
 }
 /** 单条 user 消息内容上限（portal.md §4.3）。 */
 export const MAX_MESSAGE_CONTENT_LENGTH = 100_000;
@@ -897,9 +904,13 @@ export async function postMessage(pool, {
     // 过去 `postMessage` 任意字符串都收 → 错 cwd（如快照建在 portal 本地盘 `/root/.erix/...`）
     // 会「账上 done、实际空转」。校验器（`validateRunCwd`）拒绝 ⇒ SessionError → 本事务 ROLLBACK，
     // 会话 cwd 不刷、run 不入队（调用方看到 validation_failed，而不是假绿）。
-    const nextCwd = typeof cwd === 'string' && cwd.trim() !== '' ? cwd.trim() : null;
-    if (nextCwd !== null && nextCwd !== s.cwd) {
-      validateRunCwd(nextCwd, { userSpaceRoot: config?.userSpaceRoot, fdeName: fde.rows[0]?.fde_name ?? null });
+    const nextCwdRaw = typeof cwd === 'string' && cwd.trim() !== '' ? cwd.trim() : null;
+    let nextCwd = nextCwdRaw;
+    if (nextCwdRaw !== null && nextCwdRaw !== s.cwd) {
+      // #890：**接住并使用校验器返回的规范值**——绝对 `<userSpaceRoot>/<fde>/projects/<name>` 会被
+      // 折叠成 `~/projects/<name>`；下方落库（UPDATE chat_sessions）与下发 runner 一律用它，
+      // 绝不回落原始绝对形态（那正是「库里/界面存宿主路径、runner 静默回退」三层不一致的根因）。
+      nextCwd = validateRunCwd(nextCwdRaw, { userSpaceRoot: config?.userSpaceRoot, fdeName: fde.rows[0]?.fde_name ?? null });
     }
 
     // issue #37 评审（major）：必须同时排除 revoked_at 非空的容器——deprovision 前置事务先吊销 token

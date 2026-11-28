@@ -239,15 +239,19 @@ export async function createReviewSession(pool, { userId, cwd, originalRunId, ma
   const shortId = String(originalRunId ?? macroRunId ?? '').slice(0, 8);
   // #676 ①：审查会话的 cwd 也不能任意字符串——裸 INSERT 同样走越界校验器。
   // 绝对路径需要 fde_name + userSpaceRoot 才能判 jail 归属（从 userId 查 fde_name）。
+  // #890：**接住并使用校验器返回的规范值**——绝对 `<userSpaceRoot>/<fde>/projects/<name>` 会被折叠成
+  // `~/projects/<name>`，下面 INSERT 落库就用它（宿主绝对路径绝不进 DB）；无 fde / 缺 userSpaceRoot
+  // 时绝对路径会被拒（抛错 ⇒ 不 INSERT），相对形态原样透传。
+  let normalizedCwd = cwd;
   if (typeof cwd === 'string' && cwd.trim() !== '') {
     const fdeRes = await pool.query(`SELECT fde_name FROM users WHERE id = $1`, [userId]);
-    validateRunCwd(cwd, { userSpaceRoot: config?.userSpaceRoot, fdeName: fdeRes.rows?.[0]?.fde_name ?? null });
+    normalizedCwd = validateRunCwd(cwd, { userSpaceRoot: config?.userSpaceRoot, fdeName: fdeRes.rows?.[0]?.fde_name ?? null });
   }
   const res = await pool.query(
     `INSERT INTO chat_sessions (user_id, cwd, title, title_source, origin)
      VALUES ($1, $2, $3, 'manual', $4)
      RETURNING id`,
-    [userId, cwd, `审查 · ${shortId}`, `review:${macroRunId}`],
+    [userId, normalizedCwd, `审查 · ${shortId}`, `review:${macroRunId}`],
   );
   return res.rows?.[0]?.id ?? null;
 }

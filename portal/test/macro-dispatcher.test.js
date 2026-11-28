@@ -27,7 +27,7 @@ import { startMacroEvalLoop } from '../src/macro-eval.js';
 import { executeScheduledIntent } from '../src/macro-scheduled.js';
 import {
   createIntentDispatcher, reclaimTimedOutPendingRuns, extractReviewRunId, pollRunTask,
-  DEFAULT_REVIEW_MAX_ROUNDS,
+  DEFAULT_REVIEW_MAX_ROUNDS, createReviewSession,
 } from '../src/macro-dispatcher.js';
 import { assembleTicket } from '../src/internal.js';
 
@@ -793,4 +793,29 @@ test('#850 通知类意图（run-notify）⇒ deliverIntent 收 notifications.ma
     assert.deepEqual(delivered[0].titleParams, { name: `daily-${scene.login}` });
     assert.equal(delivered[0].title, `宏「daily-${scene.login}」`, '回退面的中文逐字不变');
   });
+});
+
+// —— #890 调用点钉子（无需 DB）：createReviewSession 传绝对 projects/<name> ⇒ 落库用归一后的 tilde ——
+// 假 pool 只驱动两条查询（SELECT fde_name + INSERT chat_sessions），断言 INSERT 的 cwd 参数（$2）
+// 是校验器归一的 `~/projects/<name>`，而不是原样绝对。反向自证：把 macro-dispatcher.js//
+// `normalizedCwd = validateRunCwd(...)` 改回「只调用不接值」⇒ 落库变回绝对 ⇒ 本断言当场红。
+test('#890 调用点：createReviewSession 传绝对 projects/<name> ⇒ 落库 cwd 是归一的 ~/projects/<name>', async () => {
+  const queries = [];
+  const pool = {
+    async query(sql, params = []) {
+      queries.push({ sql, params });
+      if (/fde_name FROM users/.test(sql)) return { rows: [{ fde_name: 'erix' }] };
+      if (/INSERT INTO chat_sessions/.test(sql)) return { rows: [{ id: 's-rv' }] };
+      return { rows: [] };
+    },
+  };
+  const id = await createReviewSession(pool, {
+    userId: crypto.randomUUID(), cwd: '/srv/erix/users/erix/projects/review_dir',
+    originalRunId: 'r-orig-12345678', macroRunId: 'm-1', config: { userSpaceRoot: '/srv/erix/users' },
+  });
+  assert.equal(id, 's-rv');
+  const ins = queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.ok(ins, 'cwd 非空 ⇒ 必须发出 INSERT INTO chat_sessions');
+  assert.equal(ins.params[1], '~/projects/review_dir', '落库 cwd 必须是校验器归一的 tilde 形态');
+  assert.notEqual(ins.params[1], '/srv/erix/users/erix/projects/review_dir', '宿主绝对路径绝不能原样落库');
 });
