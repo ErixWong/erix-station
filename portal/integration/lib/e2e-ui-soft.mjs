@@ -84,6 +84,9 @@ export function hostResolverRules(env = process.env) {
     }
   } else if (hasLegacy) {
     raw = legacy;
+    // 旧名**本次生效**也要报：兼容的前提是「读得到、报得出」，静默用旧名等于把
+    // 移除它的时机无限推迟（没人知道还有谁在用）。
+    warning = 'E2E_HOST_MAP（旧名）本次生效：请改用 E2E_RESOLVE（旧名只兼容一个世代）';
   } else {
     raw = DEFAULT_RESOLVE;
   }

@@ -55,6 +55,8 @@ const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
 
 const UI_ENABLED = process.env.E2E_UI === '1';
+// #932：软开关在**模块加载时**读一次（与 admin-locale 同一时机，免得两处语义不同）。
+const UI_SOFT = uiSoft();
 // #932：`E2E_UI_SOFT` 判定改用 lib 的 `uiSoft()`（唯一来源），本文件不再单独定义 `UI_SOFT`。
 
 const PW_CONTAINER = 'erix_station_playwright';
@@ -69,7 +71,7 @@ const SHOT_NARROW_HOST = path.join(os.tmpdir(), 'admin-nav-cols-e2e-narrow.png')
 // 只覆盖容器内解析，不动宿主 hosts、不写文件。坐标可用 `E2E_HOST_MAP` 覆盖：`host=ip,host=ip`。
 // #932：解析与拼接统一到 lib 的 hostResolverRules()——读 E2E_RESOLVE（旧名 E2E_HOST_MAP 兼容一世代），
 // 两者皆无时用与现有脚本一致的缺省串；多条规则逗号连接（chromium 实测要求）。HOST_MAP/规则串同源。
-const { entries: HOST_MAP, rules: HOST_RESOLVER_RULES } = hostResolverRules();
+const { entries: HOST_MAP, rules: HOST_RESOLVER_RULES, warning: HOST_MAP_WARNING } = hostResolverRules();
 
 const WIDE_VIEWPORT = { width: 1440, height: 900 };
 const NARROW_WIDTH = 820;
@@ -574,11 +576,13 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       t.skip();
       return;
     }
+    // #932：旧名 E2E_HOST_MAP 若被用上，这里必须报出来（静默兼容 = 永远移不掉）。
+    if (HOST_MAP_WARNING) t.diagnostic(`host-map 兼容提示：${HOST_MAP_WARNING}`);
     // 点名之后的预检缺口（缺 docker / 容器没跑 / 容器里没 playwright / 缺口令）：
     // 只有显式逃生门 E2E_UI_SOFT=1 才允许降级 skip，其余一律判红。
     if (probe.reasons.ui) {
       // #932：环境探测阶段的缺项——先分类（phase:'probe'），soft 才降级；其余判红。
-      if (shouldSoftSkip({ soft: uiSoft(), phase: 'probe', message: probe.reasons.ui })) {
+      if (shouldSoftSkip({ soft: UI_SOFT, phase: 'probe', message: probe.reasons.ui })) {
         t.diagnostic(`E2E_UI_SOFT=1 ⇒ 按环境形状 skip：${probe.reasons.ui}`);
         t.skip();
         return;
@@ -594,7 +598,7 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
     const reason = probeUi();
     if (reason) {
       probe.reasons.ui = reason;
-      if (shouldSoftSkip({ soft: uiSoft(), phase: 'probe', message: reason })) {
+      if (shouldSoftSkip({ soft: UI_SOFT, phase: 'probe', message: reason })) {
         t.diagnostic(`E2E_UI_SOFT=1 ⇒ 探测缺项按 skip 降级：${reason}`);
         t.skip();
         return;
@@ -635,7 +639,7 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       } catch (err) {
         const detail = String((err && err.stderr) || (err && err.message) || err).split('\n').slice(-6).join(' / ');
         // #932：run 阶段（已进容器）不降级 ⇒ shouldSoftSkip(phase:'run') 恒 false ⇒ 下面 assert.fail 必达。
-        if (!shouldSoftSkip({ soft: uiSoft(), phase: 'run', message: detail })) {
+        if (!shouldSoftSkip({ soft: UI_SOFT, phase: 'run', message: detail })) {
           assert.fail(`E2E_UI=1 点名要跑，浏览器脚本在容器里跑挂了（run 阶段，E2E_UI_SOFT 也不降级）：${detail}`);
         }
         t.diagnostic(`E2E_UI_SOFT=1 ⇒ 容器内执行失败按 skip 降级：${detail}`);
@@ -670,7 +674,7 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         if (entryUnreachable) {
           // #932：run 阶段 net:: 先分类再决定——走 phase:'run' ⇒ shouldSoftSkip 恒 false ⇒ 判红；
           //（旧写法把 `if (UI_SOFT)` 排在分类之前，soft=true 会把运行阶段 net:: 静默降级成 skip=假绿）。
-          if (shouldSoftSkip({ soft: uiSoft(), phase: 'run', message: rep.fatal })) {
+          if (shouldSoftSkip({ soft: UI_SOFT, phase: 'run', message: rep.fatal })) {
             t.diagnostic(`E2E_UI_SOFT=1 ⇒ 按环境形状 skip：${rep.fatal}`);
             t.skip();
             return;
