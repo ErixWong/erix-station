@@ -4980,6 +4980,16 @@ data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id"
 
 > 也可用该端点做**事件重放**（P2 验收「断线重连不漏事件」即依赖本节语义）。
 
+**连接态是界面事实，不只是传输细节（issue #867）**：本端点在**响应头之前**就能失败
+（鉴权失败、会话不存在、`Last-Event-ID` 非法 400 / 越界 404），这类回包是**非 2xx 的 JSON 错误**。
+按 SSE 规范，浏览器遇到非 2xx **直接判死这条流且不再重试**（`EventSource.readyState` → `CLOSED`），
+而那个时刻历史正文已经渲染完了 ⇒ 界面看着完全正常、却再也收不到新消息。
+所以前端把连接态当**对外契约**渲染（`connected` / `reconnecting` / `disconnected`，单一来源
+`portal/frontend/src/composables/useEventStream.ts`）：`readyState === CLOSED` 以外的错误算「还在重试」
+（沿用本端点下发的 `retry:` 间隔，不自建退避），`CLOSED` 算「已断开」并给手动重连入口——
+重连就是一条带 `?last_event_id=<本地水位>` 的新连接，回到上面第 1、2 条语义。
+**本单不改任何线上形状**（无新字段、无新事件）：判别需要的信息 `readyState` 已经给全了。
+
 ### 5.3 事件信封完整类型清单（对应规格 §10.1；LoopEvent 部分与 erix-agent v0.3.5 `src/loop.js:533` 的 LoopEvent union 一一对应，共 8 类）
 
 所有事件共享信封：
