@@ -451,11 +451,13 @@ test('env 白名单：P5 可调参数键放行（issue #84）', () => {
 
 // issue #88 修订：worker 侧会话标题生成开关经下发链登记（compose → provisioner → FDE 容器 env），
 // fde-proxy ENV_KEY_ALLOW 必须放行。
-test('env 白名单：ERIX_SESSION_AUTO_TITLE 放行（issue #88 修订，worker 侧标题生成）', () => {
+// issue #331：容器里没有读者 ⇒ 白名单同步删掉；再下发它必须被当成未知键拒绝。
+test('env 白名单：ERIX_SESSION_AUTO_TITLE 已从放行面移除（#331 死光纤）', () => {
   const body = okBody({ Env: ['ERIX_STATION_TOKEN=t', 'ERIX_FDE_NAME=alice', 'ERIX_SESSION_AUTO_TITLE=1'] });
-  assert.deepEqual(validateCreateBody(body, CFG), []);
-  const denied = okBody({ Env: ['ERIX_STATION_TOKEN=t', 'ERIX_FDE_NAME=alice', 'ERIX_SESSION_AUTO_TITLE_NOT_A_KEY=1'] });
-  assert.ok(validateCreateBody(denied, CFG).some((r) => r.includes('Env key not allowed')), '未知键仍 deny-by-default');
+  assert.ok(
+    validateCreateBody(body, CFG).some((r) => r.includes('Env key not allowed')),
+    'ERIX_SESSION_AUTO_TITLE 不再放行',
+  );
 });
 
 // ---------------------------------------------------------------------------

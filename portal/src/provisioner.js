@@ -272,10 +272,11 @@ export function buildContainerConfig({
       `ERIX_SHELL_TIMEOUT_MS=${Number(process.env.ERIX_SHELL_TIMEOUT_MS) || 60000}`,
       `ERIX_SHELL_MAX_TIMEOUT_MS=${Number(process.env.ERIX_SHELL_MAX_TIMEOUT_MS) || 600000}`,
       `ERIX_SHELL_OUTPUT_MAX_BYTES=${Number(process.env.ERIX_SHELL_OUTPUT_MAX_BYTES) || 32768}`,
-      // issue #88 / #114：会话标题生成在 worker 侧（worker 读 '0' 关；缺省/其它值开）。
-      // #114 起**默认关**（默认标题 = 首条消息截断 / 手工改名 / AI 改名），显式设 1 才开回；
-      // 与 portal 侧 config.sessionAutoTitle 同口径。字符串开关（非数值），只透传 '0'/'1'。
-      `ERIX_SESSION_AUTO_TITLE=${process.env.ERIX_SESSION_AUTO_TITLE === '1' ? '1' : '0'}`,
+      // issue #331：**不再下发** `ERIX_SESSION_AUTO_TITLE`。它原本是「worker 侧标题生成」的开关
+      // （#88），但 #114 把标题生成搬回 portal（`portal/src/session-title.js`，读 portal 自己的
+      // env：`config.js` 的 `sessionAutoTitle`）⇒ 容器里**没有任何读者**（`runner/` 非测试源码
+      // 只剩一句注释提到它）。继续下发只会让「注入 / 放行 / 消费」三腿里多一条死腿；清点工具
+      // `npm run inventory:env-knobs` 现在报「在白名单但没人读 = 0」。
       // delegation P1（2026-11-08）：子 run（`delegate` 工具）的四个下发面。**值一律来自 portal 自己的
       // env**（不硬编码）：四个都下发 ⇒ FDE 容器内的 worker/agentd 是唯一的默认值执行点
       // （`runner/lib/config.js` 钳位）。⚠ **三处同改**（compose → 这里 → `fde-proxy` 的 `ENV_KEY_ALLOW`）：
