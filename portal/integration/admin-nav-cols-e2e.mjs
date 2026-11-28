@@ -447,6 +447,12 @@ try {
       statusGlyphs,
       actionBtns,
       scrollHasContent: !!scroll,
+      // #923：宽视口下「操作」列必须完整可见（不需要横滚）。这三项是那条回归的硬判据：
+      // 容器 scrollWidth/clientWidth 判「要不要横滚」，两个 right 判「操作列有没有被容器切掉」。
+      scrollScrollWidth: scroll ? scroll.scrollWidth : -1,
+      scrollClientWidth: scroll ? scroll.clientWidth : -1,
+      actionsRightEdge: (scroll && ths.length) ? Math.round(ths[ths.length - 1].getBoundingClientRect().right) : -1,
+      scrollRightEdge: scroll ? Math.round(scroll.getBoundingClientRect().right) : -1,
       bodyHasRawI18nKey: /admin\.[A-Za-z]+\.[A-Za-z]+/.test(bodyText),
       bodyHasLegacyDot: bodyText.includes('●'),
       bodyHasRetainedInText: bodyText.includes('workspace 保留中'),
@@ -720,6 +726,18 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       assert.deepEqual(emptyTh, [], `存在空表头（文案丢了）：${JSON.stringify(tbl.thLabels)}`);
       assert.deepEqual(tbl.wrappedThs, [], `表头有换行的格（thead th 应全部单行）：${JSON.stringify(tbl.wrappedThs)}`);
       assert.ok(tbl.rowCount >= 1, `用户表至少要有 1 行，实测 ${JSON.stringify(tbl.rowCount)}`);
+      // ---- 断言：#923 宽视口（1440）不需要横滚、操作列完整可见 ----
+      // 根因是**容器上限与表格 min-width 打架**：内容区 `max-w-5xl`=1024 < 表格 `min-width: 1150px`（#817 下限）
+      // ⇒ 表格永远比内容区宽约 126px，任何视口都得横滚才点得到「操作」列（#923）。
+      // 窄视口段（820）另有「容器必须可横滚」的断言，口径不同：那里的 sw>cw 是**预期**，这里必须 sw≤cw。
+      assert.ok(tbl.scrollScrollWidth <= tbl.scrollClientWidth + 1,
+        `宽视口(1440)表格外层容器不该还需要横滚（scrollWidth 应 ≤ clientWidth+1）：`
+        + `scrollScrollWidth=${tbl.scrollScrollWidth} > scrollClientWidth=${tbl.scrollClientWidth} +1`
+        + `（内容区上限与表格 min-width 打架（#923）：section 的 max-w 必须容得下表格 min-width 1150 + 侧栏 210）`);
+      assert.ok(tbl.actionsRightEdge <= tbl.scrollRightEdge + 1,
+        `宽视口(1440)「操作」列右边界超出滚动容器（列被切掉，必须横滚才点得到按钮）：`
+        + `actionsRightEdge=${tbl.actionsRightEdge} > scrollRightEdge=${tbl.scrollRightEdge} +1`
+        + `（内容区上限与表格 min-width 打架（#923）；scrollScrollWidth=${tbl.scrollScrollWidth} scrollClientWidth=${tbl.scrollClientWidth}）`);
 
       // 工位列：每行一个状态，可见文本不含保留中、非空、长度有上界；hover(title) 必须非空。
       const seatBad = (tbl.seatCells || []).filter((c) => !c.text || c.text.includes('workspace 保留中') || c.len > 30);
@@ -822,6 +840,9 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         railWidth: nar.railWidth,
         narrowDocScroll: [nar.docScrollWidth, nar.docClientWidth],
         tableScroll: { sw: nar.scrollScrollWidth, cw: nar.scrollClientWidth, ox: nar.scrollOverflowX },
+        // #923：宽视口（1440）不横滚 + 操作列完整可见的实测值。
+        wideTableScroll: { sw: tbl.scrollScrollWidth, cw: tbl.scrollClientWidth },
+        wideActionsFit: { actionsRightEdge: tbl.actionsRightEdge, scrollRightEdge: tbl.scrollRightEdge },
         pageErrors: rep.pageErrors.length,
         consoleErrorsReal: realConsole,
         rawI18nKey: tbl.bodyHasRawI18nKey,
