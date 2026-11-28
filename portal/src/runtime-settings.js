@@ -885,6 +885,184 @@ export function validateDelegateChildTimeoutMs(value) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// #677 P3 第八批：FDE 容器 env 旋钮 7 根进管理台（issue #677 第二步）。
+//   与第七批 delegate.* 同族同口径：值最终交给 FDE 容器 env，provisioner **每建一个容器现读一次**
+//   （`resolveFdeEnv`）把生效值写进容器 env ⇒ `applyMode: 'restart'`（只影响之后新建的容器，
+//   已在跑的容器自带创建时那份 env，要重建才生效）。工单里被叫作「A 组」的 `run.max_rounds` /
+//   `shell.max_timeout_ms` 同样降级为 restart —— 理由见 provisioner 的 `resolveFdeEnv` 注释：
+//   唯一能每 run 覆盖的通道是 claim ticket（只带 max_rounds/review_only，且由宏/自动化按 run
+//   语义驱动），心跳不下发这些数，不为它们新造通道。
+//   precedence 与全部 delegate.* 同一套：parse(DB) > config[configPath]（env 档）> defaultValue。
+//   区间/默认与 runner 解析口径同源（能对上界的都对上，runner 只要求正数的只对齐默认）。
+// ---------------------------------------------------------------------------
+
+/** ⚠ key 名即管理台契约 §4.21 的行，改名 = 改契约（判据 RS-31 钉「表行集合 == registry 键集合」）。 */
+export const FDE_MAX_ROUNDS_KEY = 'run.max_rounds';
+export const FDE_SHELL_TIMEOUT_MS_KEY = 'shell.timeout_ms';
+export const FDE_SHELL_MAX_TIMEOUT_MS_KEY = 'shell.max_timeout_ms';
+export const FDE_SHELL_OUTPUT_MAX_BYTES_KEY = 'shell.output_max_bytes';
+export const FDE_ARTIFACT_CAPTURE_BUDGET_MS_KEY = 'artifact.capture_budget_ms';
+export const FDE_MCP_CONFIG_TIMEOUT_MS_KEY = 'mcp.config_timeout_ms';
+export const FDE_AGENTD_CAPACITY_KEY = 'agentd.capacity';
+
+/**
+ * 本批 7 根 + 第七批已迁的 delegate.* 3 根 = 工单点名的「10 根 FDE 数值旋钮」全清单。
+ * 管理台 scoped 端点（`GET/PUT /api/admin/fde-env-settings[/:key]`）只认这个白名单里的键；
+ * 白名单之外的键（哪怕在 registry 里，例如 `session.ttl_seconds`）一律 400。
+ */
+export const FDE_ENV_SETTING_KEYS = Object.freeze([
+  FDE_MAX_ROUNDS_KEY,
+  FDE_SHELL_TIMEOUT_MS_KEY,
+  FDE_SHELL_MAX_TIMEOUT_MS_KEY,
+  FDE_SHELL_OUTPUT_MAX_BYTES_KEY,
+  FDE_ARTIFACT_CAPTURE_BUDGET_MS_KEY,
+  FDE_MCP_CONFIG_TIMEOUT_MS_KEY,
+  FDE_AGENTD_CAPACITY_KEY,
+  DELEGATE_MAX_KEY,
+  DELEGATE_CHILD_ROUNDS_KEY,
+  DELEGATE_CHILD_TIMEOUT_MS_KEY,
+]);
+
+// 区间来源逐格注释在各 *_MAX 上；默认逐格与 runner 解析默认同源。
+// max_rounds：runner/lib/config.js#parseMaxRounds 就是 1..200、默认 16。
+export const FDE_MAX_ROUNDS_MIN = 1;
+export const FDE_MAX_ROUNDS_MAX = 200;
+export const FDE_MAX_ROUNDS_DEFAULT = 16;
+// shell.timeout_ms / shell.max_timeout_ms：runner/lib/shell-tools.js parseIntEnv 的 1_000..3_600_000。
+export const FDE_SHELL_TIMEOUT_MS_MIN = 1_000;
+export const FDE_SHELL_TIMEOUT_MS_MAX = 3_600_000;
+export const FDE_SHELL_TIMEOUT_MS_DEFAULT = 60_000;
+export const FDE_SHELL_MAX_TIMEOUT_MS_MIN = 1_000;
+export const FDE_SHELL_MAX_TIMEOUT_MS_MAX = 3_600_000;
+export const FDE_SHELL_MAX_TIMEOUT_MS_DEFAULT = 600_000;
+// shell.output_max_bytes：runner/lib/shell-tools.js 的 1024..1048576（32 KiB..1 MiB）。
+export const FDE_SHELL_OUTPUT_MAX_BYTES_MIN = 1024;
+export const FDE_SHELL_OUTPUT_MAX_BYTES_MAX = 1024 * 1024;
+export const FDE_SHELL_OUTPUT_MAX_BYTES_DEFAULT = 32 * 1024;
+// artifact.capture_budget_ms：runner/lib/artifacts.js 只要求「正整数」；这里给一个有界的合理区间
+//   （1 秒..1 小时），默认与 runner 的 60_000 同源。runner 侧那道「正整数」钳位保留不动。
+export const FDE_ARTIFACT_CAPTURE_BUDGET_MS_MIN = 1_000;
+export const FDE_ARTIFACT_CAPTURE_BUDGET_MS_MAX = 3_600_000;
+export const FDE_ARTIFACT_CAPTURE_BUDGET_MS_DEFAULT = 60_000;
+// mcp.config_timeout_ms：runner/worker.js 用 `?? 10_000`（无区间）；这里给 1 秒..10 分钟的合理界，默认同源。
+export const FDE_MCP_CONFIG_TIMEOUT_MS_MIN = 1_000;
+export const FDE_MCP_CONFIG_TIMEOUT_MS_MAX = 600_000;
+export const FDE_MCP_CONFIG_TIMEOUT_MS_DEFAULT = 10_000;
+// agentd.capacity：runner/agentd.js `Number(... || 2)`（无区间）；给 1..64 的合理界，默认 2 同源。
+export const FDE_AGENTD_CAPACITY_MIN = 1;
+export const FDE_AGENTD_CAPACITY_MAX = 64;
+export const FDE_AGENTD_CAPACITY_DEFAULT = 2;
+
+// 七格共用的一句 restart 尾巴（与 delegate.* 同一口径，写侧/契约/DTO 三处都要出现这两个短语）。
+const RESTART_TAIL = '；⚠ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效（容器 env 在创建时定一次，不是热改）';
+const RESTART_TAIL_EN = ' — a container that is already running keeps the env it was created with and needs to be recreated (this is not a hot change)';
+
+/** `run.max_rounds` 的形状闸（reason 点名本格）。 */
+export function parseFdeMaxRounds(raw) {
+  return parsePositiveInt(raw, {
+    min: FDE_MAX_ROUNDS_MIN, max: FDE_MAX_ROUNDS_MAX,
+    notReason: 'not_a_max_rounds', rangeReason: 'max_rounds_out_of_range',
+  });
+}
+export function validateFdeMaxRounds(value) {
+  return validatePositiveInt(value, {
+    min: FDE_MAX_ROUNDS_MIN, max: FDE_MAX_ROUNDS_MAX, unit: '轮',
+    minWhy: '至少 1 轮；0 轮的 run 一轮都不跑',
+    maxWhy: '上界 200 与 runner/lib/config.js 的 parseMaxRounds 钳位同源（再高是引擎资源面）',
+  });
+}
+
+/** `shell.timeout_ms` 的形状闸。 */
+export function parseFdeShellTimeoutMs(raw) {
+  return parsePositiveInt(raw, {
+    min: FDE_SHELL_TIMEOUT_MS_MIN, max: FDE_SHELL_TIMEOUT_MS_MAX,
+    notReason: 'not_a_shell_timeout_ms', rangeReason: 'shell_timeout_ms_out_of_range',
+  });
+}
+export function validateFdeShellTimeoutMs(value) {
+  return validatePositiveInt(value, {
+    min: FDE_SHELL_TIMEOUT_MS_MIN, max: FDE_SHELL_TIMEOUT_MS_MAX, unit: '毫秒',
+    minWhy: '至少 1 秒；亚秒默认会把正常构建直接切掉',
+    maxWhy: '上界 3600000（1 小时）与 runner/lib/shell-tools.js 的 parseIntEnv 同源',
+  });
+}
+
+/** `shell.max_timeout_ms` 的形状闸。 */
+export function parseFdeShellMaxTimeoutMs(raw) {
+  return parsePositiveInt(raw, {
+    min: FDE_SHELL_MAX_TIMEOUT_MS_MIN, max: FDE_SHELL_MAX_TIMEOUT_MS_MAX,
+    notReason: 'not_a_shell_max_timeout_ms', rangeReason: 'shell_max_timeout_ms_out_of_range',
+  });
+}
+export function validateFdeShellMaxTimeoutMs(value) {
+  return validatePositiveInt(value, {
+    min: FDE_SHELL_MAX_TIMEOUT_MS_MIN, max: FDE_SHELL_MAX_TIMEOUT_MS_MAX, unit: '毫秒',
+    minWhy: '至少 1 秒；上限低于 1 秒等于关掉一切长命令',
+    maxWhy: '上界 3600000（1 小时）与 runner/lib/shell-tools.js 同源；这是单次调用的钳制上限',
+  });
+}
+
+/** `shell.output_max_bytes` 的形状闸。 */
+export function parseFdeShellOutputMaxBytes(raw) {
+  return parsePositiveInt(raw, {
+    min: FDE_SHELL_OUTPUT_MAX_BYTES_MIN, max: FDE_SHELL_OUTPUT_MAX_BYTES_MAX,
+    notReason: 'not_a_shell_output_max_bytes', rangeReason: 'shell_output_max_bytes_out_of_range',
+  });
+}
+export function validateFdeShellOutputMaxBytes(value) {
+  return validatePositiveInt(value, {
+    min: FDE_SHELL_OUTPUT_MAX_BYTES_MIN, max: FDE_SHELL_OUTPUT_MAX_BYTES_MAX, unit: '字节',
+    minWhy: '至少 1024 字节；再小模型几乎看不到输出',
+    maxWhy: '上界 1048576（1 MiB）与 runner/lib/shell-tools.js 同源（再高挤占模型上下文窗口）',
+  });
+}
+
+/** `artifact.capture_budget_ms` 的形状闸。 */
+export function parseFdeArtifactCaptureBudgetMs(raw) {
+  return parsePositiveInt(raw, {
+    min: FDE_ARTIFACT_CAPTURE_BUDGET_MS_MIN, max: FDE_ARTIFACT_CAPTURE_BUDGET_MS_MAX,
+    notReason: 'not_an_artifact_capture_budget_ms', rangeReason: 'artifact_capture_budget_ms_out_of_range',
+  });
+}
+export function validateFdeArtifactCaptureBudgetMs(value) {
+  return validatePositiveInt(value, {
+    min: FDE_ARTIFACT_CAPTURE_BUDGET_MS_MIN, max: FDE_ARTIFACT_CAPTURE_BUDGET_MS_MAX, unit: '毫秒',
+    minWhy: '至少 1 秒；亚秒预算几乎必然把产物截断',
+    maxWhy: '上界 3600000（1 小时）是打包时间预算的合理天花板（runner 侧只要求正整数，此界由管理台闸）',
+  });
+}
+
+/** `mcp.config_timeout_ms` 的形状闸。 */
+export function parseFdeMcpConfigTimeoutMs(raw) {
+  return parsePositiveInt(raw, {
+    min: FDE_MCP_CONFIG_TIMEOUT_MS_MIN, max: FDE_MCP_CONFIG_TIMEOUT_MS_MAX,
+    notReason: 'not_an_mcp_config_timeout_ms', rangeReason: 'mcp_config_timeout_ms_out_of_range',
+  });
+}
+export function validateFdeMcpConfigTimeoutMs(value) {
+  return validatePositiveInt(value, {
+    min: FDE_MCP_CONFIG_TIMEOUT_MS_MIN, max: FDE_MCP_CONFIG_TIMEOUT_MS_MAX, unit: '毫秒',
+    minWhy: '至少 1 秒；亚秒必然读不到 MCP 配置就回落',
+    maxWhy: '上界 600000（10 分钟）：这是容器内 agent 启动期的一次性读，不该拖到小时级',
+  });
+}
+
+/** `agentd.capacity` 的形状闸。 */
+export function parseFdeAgentdCapacity(raw) {
+  return parsePositiveInt(raw, {
+    min: FDE_AGENTD_CAPACITY_MIN, max: FDE_AGENTD_CAPACITY_MAX,
+    notReason: 'not_an_agentd_capacity', rangeReason: 'agentd_capacity_out_of_range',
+  });
+}
+export function validateFdeAgentdCapacity(value) {
+  return validatePositiveInt(value, {
+    min: FDE_AGENTD_CAPACITY_MIN, max: FDE_AGENTD_CAPACITY_MAX, unit: '路',
+    minWhy: '至少 1 路；0 路 = 什么都不跑',
+    maxWhy: '每一路是一个完整 worker，上界 64 是管理台天花板（再高是容器资源面，runner 侧不设区间）',
+  });
+}
+
 export const RUNTIME_SETTING_REGISTRY = Object.freeze({
   [SESSION_TTL_KEY]: Object.freeze({
     key: SESSION_TTL_KEY,
@@ -1093,6 +1271,98 @@ export const RUNTIME_SETTING_REGISTRY = Object.freeze({
     validate: validateDelegateChildTimeoutMs,
     hint: DELEGATE_CHILD_TIMEOUT_MS_HINT,
     hintEn: DELEGATE_CHILD_TIMEOUT_MS_HINT_EN,
+  }),
+  // ---- #677 P3 第八批：FDE 容器 env 旋钮 7 根（均 applyMode restart，建容器时现读注入）----
+  [FDE_MAX_ROUNDS_KEY]: Object.freeze({
+    key: FDE_MAX_ROUNDS_KEY,
+    label: 'run 轮预算上限（runToolLoop maxRounds）',
+    labelEn: 'Per-run tool-loop round budget (maxRounds)',
+    configPath: 'run.maxRounds',
+    envVar: 'ERIX_MAX_ROUNDS',
+    defaultValue: FDE_MAX_ROUNDS_DEFAULT,
+    applyMode: 'restart',
+    parse: parseFdeMaxRounds,
+    validate: validateFdeMaxRounds,
+    hint: 'worker runToolLoop 的轮预算；1..200（默认 16）' + RESTART_TAIL,
+    hintEn: 'Round budget for worker runToolLoop; 1..200 (default 16)' + RESTART_TAIL_EN,
+  }),
+  [FDE_SHELL_TIMEOUT_MS_KEY]: Object.freeze({
+    key: FDE_SHELL_TIMEOUT_MS_KEY,
+    label: 'shell 工具默认超时（毫秒）',
+    labelEn: 'Shell tool default timeout (milliseconds)',
+    configPath: 'shell.timeoutMs',
+    envVar: 'ERIX_SHELL_TIMEOUT_MS',
+    defaultValue: FDE_SHELL_TIMEOUT_MS_DEFAULT,
+    applyMode: 'restart',
+    parse: parseFdeShellTimeoutMs,
+    validate: validateFdeShellTimeoutMs,
+    hint: 'agent shell 工具默认超时（可被单次 timeout_ms 覆盖）；1000..3600000（默认 60000）' + RESTART_TAIL,
+    hintEn: 'Default agent shell timeout (single-call timeout_ms may override it); 1000..3600000 (default 60000)' + RESTART_TAIL_EN,
+  }),
+  [FDE_SHELL_MAX_TIMEOUT_MS_KEY]: Object.freeze({
+    key: FDE_SHELL_MAX_TIMEOUT_MS_KEY,
+    label: 'shell 工具超时上限（毫秒）',
+    labelEn: 'Shell tool timeout ceiling (milliseconds)',
+    configPath: 'shell.maxTimeoutMs',
+    envVar: 'ERIX_SHELL_MAX_TIMEOUT_MS',
+    defaultValue: FDE_SHELL_MAX_TIMEOUT_MS_DEFAULT,
+    applyMode: 'restart',
+    parse: parseFdeShellMaxTimeoutMs,
+    validate: validateFdeShellMaxTimeoutMs,
+    hint: 'agent shell 工具单次调用的超时上限（超上限按上限钳制，默认自动钳 ≤ 此值）；1000..3600000（默认 600000）' + RESTART_TAIL,
+    hintEn: 'Per-call ceiling for the agent shell timeout (calls clamp to it; default auto-clamps ≤ this); 1000..3600000 (default 600000)' + RESTART_TAIL_EN,
+  }),
+  [FDE_SHELL_OUTPUT_MAX_BYTES_KEY]: Object.freeze({
+    key: FDE_SHELL_OUTPUT_MAX_BYTES_KEY,
+    label: 'shell 输出截断上限（字节）',
+    labelEn: 'Shell output truncation cap (bytes)',
+    configPath: 'shell.outputMaxBytes',
+    envVar: 'ERIX_SHELL_OUTPUT_MAX_BYTES',
+    defaultValue: FDE_SHELL_OUTPUT_MAX_BYTES_DEFAULT,
+    applyMode: 'restart',
+    parse: parseFdeShellOutputMaxBytes,
+    validate: validateFdeShellOutputMaxBytes,
+    hint: 'agent shell 工具输出截断上限（字节，影响模型可见输出量）；1024..1048576（默认 32768）' + RESTART_TAIL,
+    hintEn: 'Output truncation cap for the agent shell tool, in bytes (affects how much output the model sees); 1024..1048576 (default 32768)' + RESTART_TAIL_EN,
+  }),
+  [FDE_ARTIFACT_CAPTURE_BUDGET_MS_KEY]: Object.freeze({
+    key: FDE_ARTIFACT_CAPTURE_BUDGET_MS_KEY,
+    label: '产物快照打包时间预算（毫秒）',
+    labelEn: 'Artifact snapshot packaging time budget (milliseconds)',
+    configPath: 'artifact.captureBudgetMs',
+    envVar: 'ERIX_ARTIFACT_CAPTURE_BUDGET_MS',
+    defaultValue: FDE_ARTIFACT_CAPTURE_BUDGET_MS_DEFAULT,
+    applyMode: 'restart',
+    parse: parseFdeArtifactCaptureBudgetMs,
+    validate: validateFdeArtifactCaptureBudgetMs,
+    hint: '产物快照打包时间预算（超时停止收录并截断标记）；1000..3600000（默认 60000）' + RESTART_TAIL,
+    hintEn: 'Time budget for artifact snapshot packaging (stops and marks truncated on timeout); 1000..3600000 (default 60000)' + RESTART_TAIL_EN,
+  }),
+  [FDE_MCP_CONFIG_TIMEOUT_MS_KEY]: Object.freeze({
+    key: FDE_MCP_CONFIG_TIMEOUT_MS_KEY,
+    label: 'MCP 配置读取超时（毫秒）',
+    labelEn: 'MCP config read timeout (milliseconds)',
+    configPath: 'mcp.configTimeoutMs',
+    envVar: 'ERIX_MCP_CONFIG_TIMEOUT_MS',
+    defaultValue: FDE_MCP_CONFIG_TIMEOUT_MS_DEFAULT,
+    applyMode: 'restart',
+    parse: parseFdeMcpConfigTimeoutMs,
+    validate: validateFdeMcpConfigTimeoutMs,
+    hint: 'FDE 容器内 MCP 配置读取超时（只影响容器内 agent 启动，不影响 portal 本体）；1000..600000（默认 10000）' + RESTART_TAIL,
+    hintEn: 'MCP config read timeout inside the FDE container (affects only the in-container agent startup, not portal itself); 1000..600000 (default 10000)' + RESTART_TAIL_EN,
+  }),
+  [FDE_AGENTD_CAPACITY_KEY]: Object.freeze({
+    key: FDE_AGENTD_CAPACITY_KEY,
+    label: 'agentd 同时执行 run 上限（并行度）',
+    labelEn: 'agentd concurrent run capacity (parallelism)',
+    configPath: 'agentd.capacity',
+    envVar: 'ERIX_AGENTD_CAPACITY',
+    defaultValue: FDE_AGENTD_CAPACITY_DEFAULT,
+    applyMode: 'restart',
+    parse: parseFdeAgentdCapacity,
+    validate: validateFdeAgentdCapacity,
+    hint: '单个 agentd 同时执行的 run 上限（并行度）；1..64（默认 2）' + RESTART_TAIL,
+    hintEn: 'Number of runs a single agentd executes concurrently (parallelism); 1..64 (default 2)' + RESTART_TAIL_EN,
   }),
 });
 
@@ -1870,6 +2140,44 @@ const delegateChildTimeoutMsHotReader = createHotReader({
   fallbackDefault: DELEGATE_CHILD_TIMEOUT_MS_DEFAULT,
 });
 
+// #677 P3 第八批：FDE env 旋钮 7 格 = **七份独立实例**（各自一份缓存 / 代际号 / 在飞槽）。
+// 这七份读到的值只决定**下一个新容器**拿到的 env（provisioner 每建容器现读一次）。
+const fdeMaxRoundsHotReader = createHotReader({
+  key: FDE_MAX_ROUNDS_KEY,
+  warnLabel: 'run 轮预算',
+  fallbackDefault: FDE_MAX_ROUNDS_DEFAULT,
+});
+const fdeShellTimeoutMsHotReader = createHotReader({
+  key: FDE_SHELL_TIMEOUT_MS_KEY,
+  warnLabel: 'shell 默认超时',
+  fallbackDefault: FDE_SHELL_TIMEOUT_MS_DEFAULT,
+});
+const fdeShellMaxTimeoutMsHotReader = createHotReader({
+  key: FDE_SHELL_MAX_TIMEOUT_MS_KEY,
+  warnLabel: 'shell 超时上限',
+  fallbackDefault: FDE_SHELL_MAX_TIMEOUT_MS_DEFAULT,
+});
+const fdeShellOutputMaxBytesHotReader = createHotReader({
+  key: FDE_SHELL_OUTPUT_MAX_BYTES_KEY,
+  warnLabel: 'shell 输出上限',
+  fallbackDefault: FDE_SHELL_OUTPUT_MAX_BYTES_DEFAULT,
+});
+const fdeArtifactCaptureBudgetMsHotReader = createHotReader({
+  key: FDE_ARTIFACT_CAPTURE_BUDGET_MS_KEY,
+  warnLabel: '产物打包预算',
+  fallbackDefault: FDE_ARTIFACT_CAPTURE_BUDGET_MS_DEFAULT,
+});
+const fdeMcpConfigTimeoutMsHotReader = createHotReader({
+  key: FDE_MCP_CONFIG_TIMEOUT_MS_KEY,
+  warnLabel: 'MCP 配置读取超时',
+  fallbackDefault: FDE_MCP_CONFIG_TIMEOUT_MS_DEFAULT,
+});
+const fdeAgentdCapacityHotReader = createHotReader({
+  key: FDE_AGENTD_CAPACITY_KEY,
+  warnLabel: 'agentd 并行度',
+  fallbackDefault: FDE_AGENTD_CAPACITY_DEFAULT,
+});
+
 /**
  * 丢弃 TTL 缓存（P2a 对外的名字；实现是上面那个工厂里每一格自己的 `invalidate`）。
  * 它必须是 `HOT_READ_INVALIDATORS` 里登记的那一个（RS-7 钉住身份），P3 抽工厂后也不能换成间接层。
@@ -1951,6 +2259,29 @@ export function invalidateDelegateChildTimeoutMsCache() {
   delegateChildTimeoutMsHotReader.invalidate();
 }
 
+/** #677 P3 第八批：丢弃 FDE env 旋钮 7 格的缓存与在飞槽（均只让下一个新容器拿新值）。 */
+export function invalidateFdeMaxRoundsCache() {
+  fdeMaxRoundsHotReader.invalidate();
+}
+export function invalidateFdeShellTimeoutMsCache() {
+  fdeShellTimeoutMsHotReader.invalidate();
+}
+export function invalidateFdeShellMaxTimeoutMsCache() {
+  fdeShellMaxTimeoutMsHotReader.invalidate();
+}
+export function invalidateFdeShellOutputMaxBytesCache() {
+  fdeShellOutputMaxBytesHotReader.invalidate();
+}
+export function invalidateFdeArtifactCaptureBudgetMsCache() {
+  fdeArtifactCaptureBudgetMsHotReader.invalidate();
+}
+export function invalidateFdeMcpConfigTimeoutMsCache() {
+  fdeMcpConfigTimeoutMsHotReader.invalidate();
+}
+export function invalidateFdeAgentdCapacityCache() {
+  fdeAgentdCapacityHotReader.invalidate();
+}
+
 /**
  * `applyMode: 'hot'` 的旋钮 ⇒ 保存后要失效的缓存。一格一行；加新的热读旋钮就在这里多登记一行，
  * **不要**在 `saveRuntimeSetting` 里堆 `if`（那会把「谁需要失效」摊到两处）。
@@ -1976,6 +2307,14 @@ export const HOT_READ_INVALIDATORS = new Map([
   [DELEGATE_MAX_KEY, invalidateDelegateMaxCache],
   [DELEGATE_CHILD_ROUNDS_KEY, invalidateDelegateChildRoundsCache],
   [DELEGATE_CHILD_TIMEOUT_MS_KEY, invalidateDelegateChildTimeoutMsCache],
+  // #677 P3 第八批：FDE env 旋钮 7 格同为 restart，但 provisioner 每建容器现读一次 ⇒ 仍要登记失效。
+  [FDE_MAX_ROUNDS_KEY, invalidateFdeMaxRoundsCache],
+  [FDE_SHELL_TIMEOUT_MS_KEY, invalidateFdeShellTimeoutMsCache],
+  [FDE_SHELL_MAX_TIMEOUT_MS_KEY, invalidateFdeShellMaxTimeoutMsCache],
+  [FDE_SHELL_OUTPUT_MAX_BYTES_KEY, invalidateFdeShellOutputMaxBytesCache],
+  [FDE_ARTIFACT_CAPTURE_BUDGET_MS_KEY, invalidateFdeArtifactCaptureBudgetMsCache],
+  [FDE_MCP_CONFIG_TIMEOUT_MS_KEY, invalidateFdeMcpConfigTimeoutMsCache],
+  [FDE_AGENTD_CAPACITY_KEY, invalidateFdeAgentdCapacityCache],
 ]);
 
 /**
@@ -2289,6 +2628,37 @@ export function readDelegateChildRounds(options = {}) {
 /** `delegate.child_timeout_ms` 的热读入口（默认 240000，自己一份缓存；口径同上）。 */
 export function readDelegateChildTimeoutMs(options = {}) {
   return delegateChildTimeoutMsHotReader.read(options);
+}
+
+// #677 P3 第八批：FDE env 旋钮 7 格的热读入口（provisioner 每建一个容器现读一次，写进容器 env）。
+// ⚠ 均 applyMode 'restart'：只影响之后新建的容器；已在跑的容器自带创建时那份 env。
+/** `run.max_rounds` 的热读入口（默认 16，自己一份缓存）。 */
+export function readFdeMaxRounds(options = {}) {
+  return fdeMaxRoundsHotReader.read(options);
+}
+/** `shell.timeout_ms` 的热读入口（默认 60000，自己一份缓存）。 */
+export function readFdeShellTimeoutMs(options = {}) {
+  return fdeShellTimeoutMsHotReader.read(options);
+}
+/** `shell.max_timeout_ms` 的热读入口（默认 600000，自己一份缓存）。 */
+export function readFdeShellMaxTimeoutMs(options = {}) {
+  return fdeShellMaxTimeoutMsHotReader.read(options);
+}
+/** `shell.output_max_bytes` 的热读入口（默认 32768，自己一份缓存）。 */
+export function readFdeShellOutputMaxBytes(options = {}) {
+  return fdeShellOutputMaxBytesHotReader.read(options);
+}
+/** `artifact.capture_budget_ms` 的热读入口（默认 60000，自己一份缓存）。 */
+export function readFdeArtifactCaptureBudgetMs(options = {}) {
+  return fdeArtifactCaptureBudgetMsHotReader.read(options);
+}
+/** `mcp.config_timeout_ms` 的热读入口（默认 10000，自己一份缓存）。 */
+export function readFdeMcpConfigTimeoutMs(options = {}) {
+  return fdeMcpConfigTimeoutMsHotReader.read(options);
+}
+/** `agentd.capacity` 的热读入口（默认 2，自己一份缓存）。 */
+export function readFdeAgentdCapacity(options = {}) {
+  return fdeAgentdCapacityHotReader.read(options);
 }
 
 // ---------------------------------------------------------------------------
