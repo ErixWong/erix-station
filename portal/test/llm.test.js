@@ -768,7 +768,16 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
     },
     release() {},
   };
-  const pool = { connect: async () => client };
+  const pool = {
+    // issue #905：LLM 上游预检已收口进 `postMessage`，且**在开业务事务之前**走 `pool.query`
+    //（不是事务内 client）⇒ 夹具要给出「上游配好了」这条前置条件；只认这一条语句，余下响亮失败。
+    async query(sql, params = []) {
+      const s = String(sql).replace(/\s+/g, ' ').trim();
+      if (!/^SELECT 1 FROM fde_llm_bindings b\b/.test(s)) throw new Error(`unexpected pool SQL: ${sql}`);
+      return { rows: [{ '?column?': 1 }] };
+    },
+    connect: async () => client,
+  };
   const posted = await postMessage(pool, { userId: 'u1', sessionId, content: 'hi', attachments: [] });
   assert.equal(posted.run.status, 'queued');
 
