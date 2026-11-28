@@ -20,6 +20,7 @@ import { hashToken } from '../src/auth.js';
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import { claimMacroRun } from '../src/macros.js';
 import { claimRun } from '../src/internal.js';
+import { validateRunCwd } from '../src/sessions.js';
 import {
   executeScheduledIntent, artifactPath, macroOrigin, macroSessionTitle, defaultReportsRoot,
   getOrCreateMacroSession,
@@ -464,4 +465,68 @@ test('#850 失败通知落库带 title_key=notifications.macroFailed + title_par
     assert.equal(rows[0].title, `宏「daily-${scene.login}」执行失败`, '存量回退面（成品中文）不许消失');
     await fs.rm(home, { recursive: true, force: true });
   });
+});
+
+// —— issue #919 ①：宏路径起 run 也要传归一后的 cwd（不是原始绝对）+ 带 config ——
+// 走真实 executeScheduledIntent + 真实 getOrCreateMacroSession + 真实 validateRunCwd，只把
+// postMessageImpl/runTask/notifyImpl 打桩。假 pool 同时驱动 getOrCreateMacroSession（fde_name /
+// SELECT+INSERT chat_sessions）与 finishMacroRun（UPDATE macro_runs）。postMessageImpl 桩内部用
+// **收到的 config** 过真实 validateRunCwd —— 复刻 postMessage 对 cwd 的那一步：传原始绝对又没带
+// userSpaceRoot 就会抛「需要 userSpaceRoot 与 fde_name」（正是评审 ① 现场），传归一 tilde + config 则不抛。
+test('#919① executeScheduledIntent：绝对 cwd ⇒ 会话行与传给 postMessage 的 cwd 都是归一的 ~/projects/<name>（且不因缺 userSpaceRoot 失败）', async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'w919-macro-int-'));
+  const seen = {};
+  const queries = [];
+  const pool = {
+    async query(sql, params = []) {
+      queries.push({ sql: String(sql), params });
+      if (/fde_name FROM users/.test(sql)) return { rows: [{ fde_name: 'erix' }] };
+      if (/SELECT id FROM chat_sessions/.test(sql)) return { rows: [] }; // 未命中 ⇒ 建
+      if (/INSERT INTO chat_sessions/.test(sql)) return { rows: [{ id: 'sess-919' }] };
+      if (/UPDATE macro_runs/.test(sql)) return { rows: [{ id: 'm-919', assignment_id: 'a', status: 'done', verdict: 'unclassified', started_at: new Date() }] };
+      return { rows: [] };
+    },
+  };
+  const postMessageStub = async (_pool, args) => {
+    seen.args = args;
+    if (typeof args.cwd === 'string' && args.cwd.trim() !== '') {
+      // 复刻 sessions.postMessage 对 cwd 的那一步：缺 userSpaceRoot 的绝对形态会在这里抛。
+      validateRunCwd(args.cwd, { userSpaceRoot: args.config?.userSpaceRoot, fdeName: 'erix' });
+    }
+    return { run: { id: 'child-run-919' } };
+  };
+  const intent = {
+    macroRunId: 'm-919', userId: crypto.randomUUID(), templateName: 'daily-report', bucket: '2026-11-16',
+    cwd: '/srv/erix/users/erix/projects/demo_app',
+    params: { cwd: '/srv/erix/users/erix/projects/demo_app', task: '整理今日变更', maxRounds: 16 },
+  };
+  let out;
+  try {
+    out = await executeScheduledIntent(pool, intent, {
+      reportsRoot: path.join(home, 'reports'),
+      sessionsHome: home,
+      runTask: async () => ({ ok: true, text: '产物正文' }),
+      postMessageImpl: postMessageStub,
+      notifyImpl: async () => {},
+      config: { userSpaceRoot: '/srv/erix/users' },
+    });
+  } catch (e) {
+    out = { threw: e };
+  }
+  await fs.rm(home, { recursive: true, force: true });
+
+  // (c) 全过程没有抛出「需要 userSpaceRoot 与 fde_name」：必须走到 done（不是被 catch 成 failed，也不是抛错）。
+  assert.ok(out, 'executeScheduledIntent 必须有返回');
+  assert.equal(out.threw, undefined, `不得抛错：${out.threw?.message ?? ''}`);
+  assert.equal(out.status, 'done', `必须 done（不是因起 run 失败收口）：${out.reason ?? ''}`);
+
+  // (a) 会话行 INSERT 的 cwd 参数是归一的 ~/projects/<name>。
+  const ins = queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.ok(ins, '必须建宏会话');
+  assert.equal(ins.params[2], '~/projects/demo_app', 'INSERT 的 cwd 必须是归一 tilde');
+
+  // (b) 传给 postMessageImpl 的 cwd 也是归一值，且带上了 config.userSpaceRoot。
+  assert.ok(seen.args, '必须调用 postMessageImpl');
+  assert.equal(seen.args.cwd, '~/projects/demo_app', '传给 postMessage 的 cwd 必须是归一 tilde（不是原始绝对）');
+  assert.equal(seen.args.config?.userSpaceRoot, '/srv/erix/users', '必须把 config 透给 postMessage');
 });

@@ -133,7 +133,7 @@ export async function getOrCreateMacroSession(pool, { userId, templateName, cwd 
       LIMIT 1`,
     [userId, origin, normalizedCwd],
   );
-  if (found.rows[0]?.id) return { sessionId: found.rows[0].id, created: false };
+  if (found.rows[0]?.id) return { sessionId: found.rows[0].id, created: false, cwd: normalizedCwd };
 
   // 未命中 ⇒ 建。不走 sessions.createSession：那条路要求 userSpaceRoot / fde_name 并建家目录，
   // 且**不写 origin**（宏会话的 origin 写入按 `10` 篇 §4 归本单）。title_source='manual'：
@@ -144,7 +144,9 @@ export async function getOrCreateMacroSession(pool, { userId, templateName, cwd 
      RETURNING id`,
     [userId, macroSessionTitle(templateName), normalizedCwd, origin],
   );
-  return { sessionId: res.rows[0].id, created: true };
+  // issue #919 ①：一并回**归一后的 cwd**（`normalizedCwd`；null/空/纯空格时就是 null）——
+  // 复用命中的会话行本就是按 normalizedCwd 匹上的，故两支都回同一个归一值。
+  return { sessionId: res.rows[0].id, created: true, cwd: normalizedCwd };
 }
 
 /**
@@ -190,7 +192,7 @@ export async function executeScheduledIntent(pool, intent, {
   const date = intent.bucket; // tick 的 bucket = UTC+8 日期，产物按它命名
 
   // —— ① 宏会话（复用优先，见 getOrCreateMacroSession 注释）——
-  const { sessionId } = await getOrCreateMacroSession(pool, { userId, templateName, cwd, now, config });
+  const { sessionId, cwd: sessionCwd } = await getOrCreateMacroSession(pool, { userId, templateName, cwd, now, config });
 
   // —— ② 起 run：postMessage 进该会话，triggerKind='synthetic' ——
   let childRunId = null;
@@ -198,10 +200,14 @@ export async function executeScheduledIntent(pool, intent, {
     const posted = await postMessageImpl(pool, {
       userId, sessionId, content: task, triggerKind: 'synthetic',
       // issue #627 ②③：两个过去被读出来却没人用的参数现在真的下行。
-      //  · `cwd`：会话已按 cwd 取/建，但「复用旧会话 + 模板改了 cwd」这一格靠 postMessage 自己
-      //    刷会话 cwd 兑住：run 的 cwd = claim 时读的 `chat_sessions.cwd`，刷了会话行 = 新目录。
+      //  · `cwd`：传**归一后的** `sessionCwd`（不是原始意图快照的 cwd）——会话行已按它取/建，
+      //    postMessage 内部 `validateRunCwd` 也认这个 `~/projects/<name>` 形态；「复用旧会话 +
+      //    模板改了 cwd」这一格靠 postMessage 自己刷会话 cwd 兑住：run 的 cwd = claim 时读的
+      //    `chat_sessions.cwd`，刷了会话行 = 新目录。issue #919 ①：若这里仍传原始绝对路径又不带
+      //    `config`，绝对形态会在 `validateRunCwd` 里因缺 `userSpaceRoot` 抛错、起 run 这步照样失败。
+      //    故一并把 `config` 透下去（会话已建，绝对→tilde 的折叠此前已发生，这里传的是 tilde）。
       //  · `maxRounds`：写进 run 行，再由 claim 下行给 runner（路线与理由见 sessions.js postMessage）。
-      cwd, maxRounds,
+      cwd: sessionCwd, maxRounds, config,
     });
     childRunId = posted?.run?.id ?? null;
   } catch (err) {
