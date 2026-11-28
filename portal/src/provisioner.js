@@ -34,6 +34,12 @@ import {
   readProvisionerIdleBackoffMaxMs,
   readDelegateMax, readDelegateChildRounds, readDelegateChildTimeoutMs,
   DELEGATE_MAX_DEFAULT, DELEGATE_CHILD_ROUNDS_DEFAULT, DELEGATE_CHILD_TIMEOUT_MS_DEFAULT,
+  // #677 P3 第八批：FDE env 旋钮 7 根同样从「启动期 env 快照」改成建容器时现读（DB > env（过闸）> 默认）。
+  readFdeMaxRounds, readFdeShellTimeoutMs, readFdeShellMaxTimeoutMs, readFdeShellOutputMaxBytes,
+  readFdeArtifactCaptureBudgetMs, readFdeMcpConfigTimeoutMs, readFdeAgentdCapacity,
+  FDE_MAX_ROUNDS_DEFAULT, FDE_SHELL_TIMEOUT_MS_DEFAULT, FDE_SHELL_MAX_TIMEOUT_MS_DEFAULT,
+  FDE_SHELL_OUTPUT_MAX_BYTES_DEFAULT, FDE_ARTIFACT_CAPTURE_BUDGET_MS_DEFAULT,
+  FDE_MCP_CONFIG_TIMEOUT_MS_DEFAULT, FDE_AGENTD_CAPACITY_DEFAULT,
 } from './runtime-settings.js';
 
 // ---------------------------------------------------------------------------
@@ -226,6 +232,37 @@ export async function resolveDelegateEnv({
   return { max, childRounds, childTimeoutMs };
 }
 
+/**
+ * FDE 容器 env 旋钮的 7 个数值（#677 P3 第八批）：与 `resolveDelegateEnv` 同族同口径，
+ * 在建容器那一刻**现读** registry，把生效值递回 `buildContainerConfig` 写进容器 env。
+ * 7 格均 `applyMode: 'restart'`（含工单原列 A 组的 max_rounds / shell.max_timeout_ms）：
+ * 唯一能每 run 覆盖容器 env 的通道是 claim ticket（`runner/agentd.js#buildWorkerEnv`，只带
+ * `max_rounds`/`review_only`，且由宏/自动化按 run 语义驱动），心跳不下发这些数；不为它们
+ * 新造每-run 通道 ⇒ 诚实降级为「改 DB 后重建容器才生效」，不假装每-run。
+ * 7 读各自一份缓存与在飞槽（不共用），所以是 `Promise.all` 七趟。
+ * @returns {Promise<{maxRounds, shellTimeoutMs, shellMaxTimeoutMs, shellOutputMaxBytes, artifactCaptureBudgetMs, mcpConfigTimeoutMs, agentdCapacity}>}
+ */
+export async function resolveFdeEnv({
+  pool = null, config = null, env = process.env, log = console, now = Date.now,
+  readMaxRounds = readFdeMaxRounds, readShellTimeoutMs = readFdeShellTimeoutMs,
+  readShellMaxTimeoutMs = readFdeShellMaxTimeoutMs, readShellOutputMaxBytes = readFdeShellOutputMaxBytes,
+  readArtifactCaptureBudgetMs = readFdeArtifactCaptureBudgetMs,
+  readMcpConfigTimeoutMs = readFdeMcpConfigTimeoutMs, readAgentdCapacity = readFdeAgentdCapacity,
+} = {}) {
+  const [maxRounds, shellTimeoutMs, shellMaxTimeoutMs, shellOutputMaxBytes,
+    artifactCaptureBudgetMs, mcpConfigTimeoutMs, agentdCapacity] = await Promise.all([
+    readMaxRounds({ pool, config, env, log, now }),
+    readShellTimeoutMs({ pool, config, env, log, now }),
+    readShellMaxTimeoutMs({ pool, config, env, log, now }),
+    readShellOutputMaxBytes({ pool, config, env, log, now }),
+    readArtifactCaptureBudgetMs({ pool, config, env, log, now }),
+    readMcpConfigTimeoutMs({ pool, config, env, log, now }),
+    readAgentdCapacity({ pool, config, env, log, now }),
+  ]);
+  return { maxRounds, shellTimeoutMs, shellMaxTimeoutMs, shellOutputMaxBytes,
+    artifactCaptureBudgetMs, mcpConfigTimeoutMs, agentdCapacity };
+}
+
 export function buildContainerConfig({
   fdeName,
   containerName,
@@ -250,6 +287,8 @@ export function buildContainerConfig({
   // 不递就只拿到 registry 默认（**不再**自己抄一份 `process.env` 快照——那份快照就是本批要搬走的东西）：
   // 调用方没现读 ⇒ 宁可给一个说得出名字的默认，也不要在两个地方各读一次 env（两套真相）。
   delegateEnv = null,
+  // #677 P3 第八批：FDE env 旋钮 7 格的**现读结果**（`resolveFdeEnv` 递进来）。不递就只拿 registry 默认。
+  fdeEnv = null,
 }) {
   const hostRoot = path.join(path.resolve(userSpaceRoot), fdeName);
   // #676：挂载点单一真值表（`shared/jail-mounts.js`）——home / projects / cache + 平台 git（ro）。
@@ -265,13 +304,13 @@ export function buildContainerConfig({
       // F4：容器内 agentd 依赖的 internal API base URL（契约 §6.2）。dev http + 高端口 / prod https + 443。
       `ERIX_STATION_BASE_URL=${String(portalPublicBaseUrl || `https://station.${baseDomain}`).replace(/\/+$/, '')}/api/internal`,
       // issue #84 P5：agentd/worker 可调参数下发（portal env → FDE 容器 env；改值重建容器即可，无需镜像）。
-      `ERIX_MAX_ROUNDS=${Number(process.env.ERIX_MAX_ROUNDS) || 16}`,
-      `ERIX_AGENTD_CAPACITY=${Number(process.env.ERIX_AGENTD_CAPACITY) || 2}`,
+      `ERIX_MAX_ROUNDS=${fdeEnv?.maxRounds ?? FDE_MAX_ROUNDS_DEFAULT}`,
+      `ERIX_AGENTD_CAPACITY=${fdeEnv?.agentdCapacity ?? FDE_AGENTD_CAPACITY_DEFAULT}`,
       `ERIX_ARTIFACT_MAX_BYTES=${Number(process.env.ERIX_ARTIFACT_MAX_BYTES) || (100 * 1024 * 1024)}`,
-      `ERIX_ARTIFACT_CAPTURE_BUDGET_MS=${Number(process.env.ERIX_ARTIFACT_CAPTURE_BUDGET_MS) || 60000}`,
-      `ERIX_SHELL_TIMEOUT_MS=${Number(process.env.ERIX_SHELL_TIMEOUT_MS) || 60000}`,
-      `ERIX_SHELL_MAX_TIMEOUT_MS=${Number(process.env.ERIX_SHELL_MAX_TIMEOUT_MS) || 600000}`,
-      `ERIX_SHELL_OUTPUT_MAX_BYTES=${Number(process.env.ERIX_SHELL_OUTPUT_MAX_BYTES) || 32768}`,
+      `ERIX_ARTIFACT_CAPTURE_BUDGET_MS=${fdeEnv?.artifactCaptureBudgetMs ?? FDE_ARTIFACT_CAPTURE_BUDGET_MS_DEFAULT}`,
+      `ERIX_SHELL_TIMEOUT_MS=${fdeEnv?.shellTimeoutMs ?? FDE_SHELL_TIMEOUT_MS_DEFAULT}`,
+      `ERIX_SHELL_MAX_TIMEOUT_MS=${fdeEnv?.shellMaxTimeoutMs ?? FDE_SHELL_MAX_TIMEOUT_MS_DEFAULT}`,
+      `ERIX_SHELL_OUTPUT_MAX_BYTES=${fdeEnv?.shellOutputMaxBytes ?? FDE_SHELL_OUTPUT_MAX_BYTES_DEFAULT}`,
       // issue #331：**不再下发** `ERIX_SESSION_AUTO_TITLE`。它原本是「worker 侧标题生成」的开关
       // （#88），但 #114 把标题生成搬回 portal（`portal/src/session-title.js`，读 portal 自己的
       // env：`config.js` 的 `sessionAutoTitle`）⇒ 容器里**没有任何读者**（`runner/` 非测试源码
@@ -289,7 +328,7 @@ export function buildContainerConfig({
       // 要重建才生效）。runner 侧 `runner/lib/config.js` 的钳位作为最后一道防线**保留不动**。
       `ERIX_DELEGATE_MAX=${delegateEnv?.max ?? DELEGATE_MAX_DEFAULT}`,
       `ERIX_DELEGATE_CHILD_ROUNDS=${delegateEnv?.childRounds ?? DELEGATE_CHILD_ROUNDS_DEFAULT}`,
-      `ERIX_MCP_CONFIG_TIMEOUT_MS=${Number(process.env.ERIX_MCP_CONFIG_TIMEOUT_MS) || 10000}`,
+      `ERIX_MCP_CONFIG_TIMEOUT_MS=${fdeEnv?.mcpConfigTimeoutMs ?? FDE_MCP_CONFIG_TIMEOUT_MS_DEFAULT}`,
       `ERIX_DELEGATE_CHILD_TIMEOUT_MS=${delegateEnv?.childTimeoutMs ?? DELEGATE_CHILD_TIMEOUT_MS_DEFAULT}`,
       // issue #557：终局正文「文本化工具调用」特征集（runner 读 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS`）。
       // ⚠ **宿主未设 ⇒ 这一项整个不出现**（连键都不带，见 `toolCallMarkersEnvValue` 的理由：默认清单的
@@ -427,6 +466,7 @@ export function readContainerEnv(inspectData, key = 'ERIX_STATION_TOKEN') {
 export async function ensureFdeContainer(docker, opts, {
   log = console, pool = null, config = null, env = process.env, now = Date.now,
   resolveDelegateEnvValues = resolveDelegateEnv,
+  resolveFdeEnvValues = resolveFdeEnv,
 } = {}) {
   const { containerName } = opts;
   const existing = await docker.inspectContainer(containerName);
@@ -466,10 +506,13 @@ export async function ensureFdeContainer(docker, opts, {
   // **同一格**的并发调用之间（槽按 pool 分键），不同格之间不合并发 SQL。建容器是低频路径，压成一趟
   // 要改 `createHotReader` 的共用读，属跨批复用改造，本批没动。
   const delegateEnv = await resolveDelegateEnvValues({ pool, config, env, log, now });
+  // #677 P3 第八批：FDE env 旋钮 7 格同样在建容器这一刻现读（DB > env（过闸）> registry 默认）。
+  const fdeEnv = await resolveFdeEnvValues({ pool, config, env, log, now });
   const body = buildContainerConfig({
     ...opts,
     env: [...(opts.env ?? []), `ERIX_STATION_TOKEN=${token}`, `ERIX_FDE_NAME=${opts.fdeName}`],
     delegateEnv,
+    fdeEnv,
   });
   const created = await docker.createContainer(body, containerName);
   if (created.status === 409) {

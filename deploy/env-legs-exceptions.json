@@ -107,22 +107,22 @@
     },
     {
       "key": "ERIX_STATION_TOKEN",
-      "where": "runner/agentd.js:48；注入点 portal/src/provisioner.js:471；读侧 helper portal/src/provisioner.js:409",
-      "reason": "**每个 FDE 一份的凭据**，由 provisioner 在 create 时生成并注入（`env: [..., `ERIX_STATION_TOKEN=${token}`, ...]`，`provisioner.js:470`），proxy 已放行。compose 腿不适用：没有「一份共享默认值」可写，写进 compose 反而会把所有 FDE 变成同一个 token。坐标口径（返工核对）：`provisioner.js:408` 的 `readContainerEnv(inspectData, key = 'ERIX_STATION_TOKEN')` 是**读侧**（从 docker inspect 的 Config.Env 里读回来对账 hash），**不是注入点** —— 两者都含这个 key，只有前者能当腿的证据。"
+      "where": "runner/agentd.js:48；注入点 portal/src/provisioner.js:513；读侧 helper portal/src/provisioner.js:448",
+      "reason": "**每个 FDE 一份的凭据**，由 provisioner 在 create 时生成并注入（`env: [..., `ERIX_STATION_TOKEN=${token}`, ...]`，`provisioner.js:512`），proxy 已放行。compose 腿不适用：没有「一份共享默认值」可写，写进 compose 反而会把所有 FDE 变成同一个 token。坐标口径（返工核对）：`provisioner.js:447` 的 `readContainerEnv(inspectData, key = 'ERIX_STATION_TOKEN')` 是**读侧**（从 docker inspect 的 Config.Env 里读回来对账 hash），**不是注入点** —— 两者都含这个 key，只有前者能当腿的证据。"
     },
     {
       "key": "ERIX_FDE_NAME",
-      "where": "runner/agentd.js:50；注入点 portal/src/provisioner.js:471（proxy 还额外校验它必须等于路径里的 fdeName）",
+      "where": "runner/agentd.js:50；注入点 portal/src/provisioner.js:513（proxy 还额外校验它必须等于路径里的 fdeName）",
       "reason": "**每个 FDE 一份的身份**，与 `fdeName` 绑死（`fde-proxy/server.js` 的 Env 校验会拒绝不等值的注入）。compose 腿不适用，理由同 token：它是实例属性，不是部署属性。"
     },
     {
       "key": "ERIX_STATION_BASE_URL",
-      "where": "runner/agentd.js:49；注入点 portal/src/provisioner.js:266",
+      "where": "runner/agentd.js:49；注入点 portal/src/provisioner.js:305",
       "reason": "值由 provisioner 从 `PORTAL_PUBLIC_BASE_URL` **推导**（拼 `/api/internal` + 按 dev/prod 定 scheme/host）。宿主侧的入口是那个键 ⇒ compose 腿的名字与它不同，同名插值不适用（接了就是两个键管一件事）。坐标返工：原登记 `provisioner.js:213` 那一行是 bind mount 的路径拼接，与本键无关（行号漂移，见 `$comment` ⑥）。"
     },
     {
       "key": "ERIX_AGENT_VERSION",
-      "where": "runner/lib/build-info.js:84；注入点 portal/src/provisioner.js:324",
+      "where": "runner/lib/build-info.js:84；注入点 portal/src/provisioner.js:363",
       "reason": "宿主侧入口是 compose 的 `FDE_AGENT_VERSION`（版本 pin 的真值在 `deploy/.env` / 发版流程），portal 折算后按实例注入 ⇒ compose 腿**换了名字**，不是漏了。#416 那次「注入方加了键、放行方没加」的事故已由本文件的 `ENV_KEY_ALLOW` + 腿② 交叉核对钉住，这里不需要第三条腿。**本条的坐标在返工里被推翻过一次**（值得留着当反面教材）：原先写 `runner/agentd.js`（不带行）+ `provisioner.js:257`，而 `agentd.js:52` 里的 `process.env.ERIX_AGENT_VERSION` 是**注释正文**引用的旧代码（`:54` 的注释自己写了「现在读镜像里烘的 build-info.json」），真读取是 `lib/build-info.js:84` 的 `s(env.ERIX_AGENT_VERSION)`（**别名点号形**，旧扫描器只认 `process.env.` 前缀 ⇒ 扫不出来，注释因此背了书）；`provisioner.js:257` 如今是 #581 新加的 `ERIX_FINAL_TEXT_TOOLCALL_MARKERS` 那一行 —— 行号合理但内容不对。"
     },
     {
