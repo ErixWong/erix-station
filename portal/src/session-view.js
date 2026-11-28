@@ -395,11 +395,11 @@ function assistantTurnFields(turns) {
  * 写 `?? 0` 会把未知渲染成「瞬间完成」）。
  *
  * ⚠ 跨实例风险：删的是「读旧数据」的兼容——存量比本次发布老的实例升级后，那些老对话的工具耗时会
- *   渲染成「未知」（前端现有 `dur` 为空时不显示，**不是报错**）。存量核对（可复跑，勿把数字当结论）：
- *     `SELECT count(*) FROM transcript_rounds
- *        WHERE record::jsonb -> 'toolResults' @> '[{}]'::jsonb
- *          AND record::jsonb -> 'toolResults' ?? 'durationMs' IS DISTINCT FROM 'durationMs'`
- *     ——形态：「有 toolResults 却整条没有任何 durationMs」的记录数（本机实测为 0）。
+ *   渲染成「未知」（前端现有 `dur` 为空时不显示，**不是报错**）。真正会被影响的集合是「投影不带
+ *   `durationMs`、而宿主 `tool_calls.duration_ms` 有值」的那些 `(run_id, call_id)`。数它先用
+ *   docs/data/model.md §1.13 的那条查询取分母，再按 `run_id` 关联 `runs` / `tool_calls` 收口
+ *   （⚠ `transcript_rounds` 存在 `run_id IS NULL` 的历史行，它们不经 DTO 面——别把块数当影响面；
+ *   按 record 顶层路径直查 `duration` 也是恒 0 的假阴性，本单先被它骗过一次）。
  *
  * 为什么仍在投影**之后**做：`assistantTurnFields()` 的职责是**逐字透传**上游形状、不向引擎字段里注
  * 水（#95 红线）；这里只做一件防御性收尾——若上游偶发把 `durationMs` 写成非有限数（NaN/字符串），

@@ -324,8 +324,10 @@ export function loopEventPayload(event, meta = {}) {
         //   * 缺失 ⇒ `null`（「不知道」不是 0，0.20.0 明确把 `?? 0` 当错口径：guide §2）。
         //     真执行过的四种形态引擎都会写值；没值的只剩「judge 拦截 / unsafe 重放被中止 /
         //     executor 未 settle 就被中止」三种。
-        //     存量核对（可复跑，本机实测为 0，勿把数字当结论）：
-        //       `SELECT count(*) FROM transcript_rounds WHERE record::jsonb ? 'duration'`（带顶层旧键的记录数）。
+        //     存量核对：见 docs/data/model.md §1.13 的那一条查询（工具结果块在
+        //     record -> 'messages'[*] -> 'content'[*] 里，**不在 record 顶层**——按顶层路径直查会得到
+        //     恒 0 的假阴性，本单就是这么先骗了自己一次）。要看的是「只有旧键、没有
+        //     erix.durationMs」的块数：那才是删这条回退后唯一可能改变行为的集合。
         duration_ms: Number.isFinite(tr.erix?.durationMs) ? tr.erix.durationMs : null,
         ok: tr.is_error !== true,
       };
