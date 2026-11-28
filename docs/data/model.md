@@ -277,11 +277,21 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
     - `no_engine_duration` —— 引擎值缺失的块数（DTO 面上本来就显示「未知」）。
     - `no_erix_object` —— 连 `erix` 对象都没有的块数：老形状（引擎 0.20.0 之前）的规模。
       ⚠ 这条 CTE **不按 type 过滤**，所以每一条 `FILTER` 都得自带 `b->>'type' = 'tool_result'`；
-      漏掉就会数到 `text` / `tool_use` 块，得到**比分母还大**的数（本单实测踩过 4263 > 2116）。
+      漏掉就会数到 `text` / `tool_use` 块，得到**比分母还大**的数而**不报错**。
+    - 大小关系是**按构造保证**的：`erix_is_obj` 为假 ⇒ `has_engine_dur` 必为假 ⇒ `no_erix_object ⊆ no_engine_duration`。
+      别把判定改回「直接对 `b->'erix'` 用 `?`」——`?` 对**数组**是「成员存在」，`erix: ["durationMs"]`
+      这种形状会被误判成「有时长」，关系就不成立了。
       它总是 `≤ no_engine_duration`，两者接近就说明存量里老记录占多数。
     ```sql
     WITH blocks AS (
-      SELECT t.run_id, b
+      SELECT t.run_id, b,
+             -- 把「有没有引擎时长」先算成布尔，且**只在 erix 真是对象时**才认它的键：
+             -- `?` 对数组是「成员存在」，`erix: ["durationMs"]` 这种形状会被当成有时长。
+             -- 两个布尔都必须 COALESCE：`jsonb_typeof(NULL) = 'object'` 结果是 NULL 不是 false，
+             -- 而 `NOT NULL` 仍是 NULL ⇒ FILTER 会不计数（同一个三值坑的第二层）。
+             COALESCE(jsonb_typeof(b->'erix') = 'object', false)  AS erix_is_obj,
+             (COALESCE(jsonb_typeof(b->'erix') = 'object', false)
+               AND COALESCE((b->'erix') ? 'durationMs', false))   AS has_engine_dur
       FROM transcript_rounds t
       CROSS JOIN LATERAL jsonb_array_elements(
           CASE WHEN jsonb_typeof(t.record->'messages') = 'array'
@@ -290,24 +300,27 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
           CASE WHEN jsonb_typeof(m->'content') = 'array'
                THEN m->'content' ELSE '[]'::jsonb END) b
     )
-    SELECT count(*) FILTER (WHERE b->>'type' = 'tool_result')                    AS tool_results,
+    SELECT count(*) FILTER (WHERE b->>'type' = 'tool_result')                  AS tool_results,
            count(*) FILTER (WHERE b->>'type' = 'tool_result' AND b ? 'duration') AS legacy_duration_key,
            count(*) FILTER (WHERE b->>'type' = 'tool_result' AND b ? 'duration'
-                                  AND NOT COALESCE(b->'erix' ? 'durationMs', false))            AS legacy_only_no_engine,
+                                  AND NOT has_engine_dur)                      AS legacy_only_no_engine,
            count(*) FILTER (WHERE b->>'type' = 'tool_result'
-                                  AND NOT COALESCE(b->'erix' ? 'durationMs', false))   AS no_engine_duration,
+                                  AND NOT has_engine_dur)                      AS no_engine_duration,
            count(*) FILTER (WHERE b->>'type' = 'tool_result'
-                                  AND jsonb_typeof(b->'erix') IS DISTINCT FROM 'object') AS no_erix_object
+                                  AND NOT erix_is_obj)                         AS no_erix_object
     FROM blocks;
     ```
     ⚠ **三值逻辑是这条语句最大的坑**：`b->'erix'` 在块里没有 `erix` 键时结果是 SQL `NULL`，
     `NOT (NULL ? 'durationMs')` 仍是 `NULL`，`FILTER` 直接不计数 ⇒ **恰好漏掉最老的形态**
-    （连 `erix` 都没有的老块）。写成 `NOT COALESCE(..., false)` 才把它们算进来；漏掉时计数会小一个
-    量级而**不报错**（本单先漏到只剩 1/65 才发现）。
-    ⚠ 还有一条会把人骗第二次：本表存在 `run_id IS NULL` 的历史行，它们**不经 DTO 面**
-    （DTO 的取数入口是 run 锚点）⇒「块数很多」不等于「用户会看到变化」。要判影响面，再按
-    `run_id` 关联 `runs` 收窄到 DTO 可达的那些块，并按 `(run_id, call_id)` 关联 `tool_calls`
-    看宿主列**曾经**有没有值（`duration_ms IS NOT NULL` 才算「这格原来显示过数字」）。
+    （连 `erix` 都没有的老块）。判定要写成 `NOT COALESCE(..., false)`，且只在 `erix` 是对象时取键；
+    漏掉时计数会**小一个量级而不报错**——所以先看分母，再看两个计数是否满足上面那条包含关系。
+    ⚠ 别把 `run_id` 当 DTO 的准入闸：`getSession` 是**按 `transcript_key` 取 transcript 行**的
+    （`portal/src/sessions.js` 里那条 `WHERE transcript_key = $1`），视图层再把没归属的轮次归给
+    唯一 run（`portal/src/session-view.js` 的 `soleRunId` 一支）⇒ **`run_id IS NULL` 的块也会进 DTO**。
+    所以「块数很多」不等于「用户会看到变化」，但按 `run_id` 关联 `runs` 筛出来的也**不是全部影响面**。
+    要判**本次删掉的宿主回落**的影响：它按 `(run_id, call_id)` 供值 ⇒ 只有「`run_id` 非空 + 能在 `runs`
+    里找到 + `tool_calls.duration_ms IS NOT NULL`」的块才是「这格原来显示过数字」的集合；
+    `run_id IS NULL` 的块它本来就供不到，删了不改它们的显示。
     - `tool_calls.duration_ms IS NULL` 的行数只是**观察值**：自 #303 起该列不再被 DTO 读，
       「本该为 NULL」的结论要靠上面的 `(run_id, call_id)` 关联得出，不能只靠这条全表计数。
 - `judge_decisions`：judge 事件（`kind / action / decision`）的持久化，与 `run_events` 中 `judge` 类型事件同源。

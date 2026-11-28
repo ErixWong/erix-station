@@ -1356,7 +1356,8 @@ test('#189 修正：有折叠轮且该 run 有自己的助手正文 → DTO 仍�
 });
 
 // ---------------------------------------------------------------------------
-// issue #283 → #299：对话流 DTO 的 `toolCalls[].durationMs`（**两条来源 + 优先级**）。
+// issue #283 → #299 → #303：对话流 DTO 的 `toolCalls[].durationMs`（**只有一个来源 = 引擎投影**；
+// #299 时期的宿主回落已在 #303 退役，下面的用例都按新契约钉）。
 // erix-agent 0.20.0（#284）起官方投影 `toolCalls[]` **自己就带** `durationMs`/`toolCallKey`
 // （`erix.*` 的投影，见 `src/display/projection.js:167-181`），但 **T1 之前落盘的记录上两者直接
 // 缺省、不被合成**。#299 定稿时投影缺省可回落**宿主**自家 `tool_calls`（按 `(run_id, call_id)` join）；
@@ -1463,7 +1464,8 @@ test('issue #283/#299/#303：时长只来自引擎投影——宿主 join 已退
   }
 });
 
-// ---- #299 (d)：0.20.0 投影自带 durationMs 之后的**优先级**三条（投影 > 宿主 > 无键） ----
+// ---- #299 (d) → #303：投影自带 durationMs 之后只剩两格（投影带值 / 投影缺省 ⇒ 键不存在），
+//      宿主值不再参与 ----
 
 test('#299 ①/#303：投影有值 ⇒ 时长即投影值（#303 后宿主值完全不再参与）', () => {
   const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1', 111); // 引擎 erix.durationMs=111
@@ -1504,7 +1506,8 @@ test('#299 ③：投影与宿主**都缺** ⇒ DTO 里没有 durationMs 这个�
     undefined,
     [],
     [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }],
-    // 库里有别的调用有时长、唯独这次没有 ⇒ 走「有 map 但没命中」那一支（这条也会被 `?? 0` 变异抓到）
+    // 这些宿主行现在**应当被完全忽略**（join 已在 #303 退役）：留着它们是一次绊线——若视图层哪天
+    // 重新去读 `tool_calls`，`SessionViewPool` 的守卫会当场 throw 指名报错，而不是静默拿到值。 0` 变异抓到）
     [{ run_id: RUN_1, call_id: 'ghost-call', duration_ms: 42 }],
   ]) {
     const dto = projectSessionMessages({
