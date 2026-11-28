@@ -57,8 +57,17 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 // ---------------------------------------------------------------------------
 // 坐标（全部 env 可覆盖；缺省值就是这台部署机的 dev 栈）
 // ---------------------------------------------------------------------------
-/** HTTP 腿与 UI 腿共用的 admin 入口（同一台活栈：admin 反代把静态页和 /api 都收在这里）。 */
+/** HTTP 腿用的 admin 入口（同一台活栈：admin 反代把静态页和 /api 都收在这里）。
+ *  ⚠ **UI 腿不在这里**，见下面的 USER_BASE：admin 入口自 1c60afd9（用户面独立 HTTPS 入口 + host 闸按
+ *  hostname 判面）起**只放管理员进**，拿脚本账号（role=fde）在这儿登会被登录页红字挡住
+ *  （"This account is not an administrator and cannot sign in here."），hash 停在 #/login。 */
 const BASE = (process.env.E2E_BASE || process.env.E2E_UI_BASE || 'https://admin.fde.erix.vip:9443')
+  .replace(/\/$/, '');
+/** 用户面入口（工作台在它的 / 路由上；脚本账号是 role=fde，只能从这里进）。
+ *  env 名同 admin-locale-e2e.mjs（用户面只认 E2E_USER_BASE）。
+ *  ⚠ 别把 E2E_UI_BASE 也接到这里：本仓别的套件里 **E2E_UI_BASE 指的是管理台入口**，
+ *  拿它当用户站别名会把 FDE 浏览器送回只放管理员的门（正是本单修的那个错入口）。 */
+const USER_BASE = (process.env.E2E_USER_BASE || 'https://station.fde.erix.vip:8443')
   .replace(/\/$/, '');
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
 /** 用户面主角：一个有 active litellm binding 的 dev FDE（有 `fde_name`，能看到自己的账）。 */
@@ -104,7 +113,7 @@ const SHOT_HOST_EN = process.env.E2E_SHOT_HOST_EN || path.join(os.tmpdir(), 'use
  */
 const HOST_MAP = (() => {
   const map = {};
-  for (const pair of (process.env.E2E_RESOLVE || 'admin.fde.erix.vip=127.0.0.1').split(',')) {
+  for (const pair of (process.env.E2E_RESOLVE || 'admin.fde.erix.vip=127.0.0.1,station.fde.erix.vip=127.0.0.1').split(',')) {
     const [h, ip] = pair.split('=').map((s) => s.trim());
     if (h && ip) map[h] = ip;
   }
@@ -331,7 +340,7 @@ for (const [leg, label] of [
   ['fde', `HTTP-200 契约腿（${FDE_LOGIN}：llm-quota 8 键 + 密钥红线 / llm-usage 6 键 + days 校验 / 越权面）`],
   ['admin', `admin 越权口径腿（admin 打 llm-quota 期望 400 fde_name_required）`],
   ['roundtrip', `lifetime 往返腿（牺牲 ${FDE_LOGIN} 真实额度：置 null 读 lifetime，finally 复原 1mo）`],
-  ['ui', `UI 腿（真浏览器进 #/workbench：徽标紧跟 who / 文案 / 弹窗 / 中英各一趟截图）`],
+  ['ui', `UI 腿（真浏览器进工作台（路由 /）：徽标紧跟 who / 文案 / 弹窗 / 中英各一趟截图）`],
 ]) {
   console.log(probe.reasons[leg] ? `[user-usage-e2e] leg=${leg} (${label}) SKIP：${probe.reasons[leg]}` : `[user-usage-e2e] leg=${leg} (${label}) 开跑`);
 }
@@ -573,6 +582,7 @@ async function collectBadge(page) {
       title: el.getAttribute('title') || '',
       aria: el.getAttribute('aria-label') || '',
       badgeTop: rect.top,
+      badgeH: rect.height, badgeLeft: rect.left, badgeRight: rect.right,
     };
   });
   Object.assign(o, info);
@@ -587,10 +597,16 @@ async function collectBadge(page) {
     return {
       headerHeight: h ? h.getBoundingClientRect().height : null,
       whoTop: who ? who.getBoundingClientRect().top : null,
+      whoH: who ? who.getBoundingClientRect().height : null,
+      whoRight: who ? who.getBoundingClientRect().right : null,
+      viewportWidth: window.innerWidth,
     };
   });
   o.headerHeight = geo.headerHeight;
   o.whoTop = geo.whoTop;
+  o.whoH = geo.whoH;
+  o.whoRight = geo.whoRight;
+  o.viewportWidth = geo.viewportWidth;
   return o;
 }
 
@@ -615,6 +631,17 @@ try {
   if (cfg.hostResolverRules) launchArgs.push('--host-resolver-rules=' + cfg.hostResolverRules);
   browser = await chromium.launch({ channel: 'chromium', args: launchArgs });
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 1200 }, locale: 'zh-CN', ignoreHTTPSErrors: true });
+  // 起点语言必须由**载体**钉住，不能靠浏览器的协商层：解析优先级是 用户选择标记 > 账号值 > Accept-Language
+  // （#828 / #902）。账号里存着「默认语言」（users.locale），它排在协商层之前 ⇒ 只设 newContext 的
+  // locale 就会被账号存的值盖掉，整条 zh 腿恒拿英文文案（账号存的是哪种语言**不写死在这里**，它可变）。
+  // （正常形态下徽标回的是**月度额度**文案，形如「mo 金额/额度」）。开局铺这两枚（同一个 url ⇒
+  // 后面点 English 时由应用自己改写。
+  await ctx.addCookies([
+    { name: 'locale', value: 'zh-CN', url: cfg.base },
+    // 标记的**值**是字面 '1'（localeCookie.ts:130 判的就是 === '1'）；往里塞语言码等于没铺标记，
+    // 应用会当「这台设备没点过开关」，转头用账号值盖掉上面的 locale。
+    { name: 'locale_chosen', value: '1', url: cfg.base },
+  ]);
   const page = await ctx.newPage();
   page.on('request', (req) => r.requests.push({ method: req.method(), url: req.url() }));
   page.on('pageerror', (e) => r.pageErrors.push(String(e && e.message ? e.message : e)));
@@ -628,7 +655,12 @@ try {
   await page.waitForFunction(() => !location.hash.includes('/login'), null, { timeout: 20_000 });
   r.login.hash = await page.evaluate(() => location.hash);
 
-  await page.goto(cfg.base + '/#/workbench', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  // 工作台的路由是**斜杠根路径**（router.ts:37 把 name workbench 挂在 path /，没有 /workbench 这条
+  // path；admin-locale-e2e.mjs:345 也记着）。写 #/workbench 落进「无匹配路由」⇒ SPA 什么都不渲染；
+  // 而 goto 换哈希是**同文档导航**，旧 DOM 还在，who 会在过期 DOM 里被找到，于是整条腿在空页上采集、
+  // 又退化成 skip（这就是它三周不响的原因）。所以下面把 hash 一并交出去，由外层钉死。
+  await page.goto(cfg.base + '/#/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  r.hashAtWorkbench = await page.evaluate(() => location.hash);
   await page.waitForSelector('[data-test="who"]', { timeout: 25_000 });
 
   // 功能存在性：顶栏有没有徽标（改动前的前端根本没这一颗）。
@@ -686,7 +718,7 @@ process.exit(0);
 const BADGE_RE_ZH = /^(月|日) \$\d+(\.\d+)?\s*\/\s*\$\d/;
 const BADGE_RE_EN = /^(mo|d) \$\d+(\.\d+)?\s*\/\s*\$\d/;
 
-test('U1 真浏览器进 #/workbench：徽标紧跟 who/周期文案+完整词 hover/弹窗(已用+进度条 bg-brand+chart svg)/按钮与 Esc 关/0 pageerror/无裸 i18n key/无「本周期从」/顶栏不换行/中英各一趟截图',
+test('U1 真浏览器进工作台（路由 /）：徽标紧跟 who/周期文案+完整词 hover/弹窗(已用+进度条 bg-brand+chart svg)/按钮与 Esc 关/0 pageerror/无裸 i18n key/无「本周期从」/顶栏不换行/中英各一趟截图',
   { skip: probe.reasons.ui || false, timeout: 420_000 }, async (t) => {
     need(t, 'ui', probe.fdeCookies);
     const password = readCred(FDE_PASSWORD_FILES);
@@ -700,7 +732,7 @@ test('U1 真浏览器进 #/workbench：徽标紧跟 who/周期文案+完整词 h
     fs.writeFileSync(scriptHost, CONTAINER_SCRIPT.replace('__PW_MODULE__', PW_MODULE), { mode: 0o600 });
     // 口令走文件进容器（命令行会被 `ps` 抄走）；跑完在 finally 里尽力删（那是带口令的文件）。
     fs.writeFileSync(cfgHost, JSON.stringify({
-      base: BASE, login: FDE_LOGIN, password, shotPathZh: SHOT_CONTAINER_ZH, shotPathEn: SHOT_CONTAINER_EN,
+      base: USER_BASE, login: FDE_LOGIN, password, shotPathZh: SHOT_CONTAINER_ZH, shotPathEn: SHOT_CONTAINER_EN,
       hostResolverRules: HOST_RESOLVER_RULES,
     }), { mode: 0o600 });
 
@@ -715,17 +747,35 @@ test('U1 真浏览器进 #/workbench：徽标紧跟 who/周期文案+完整词 h
       // 导航/渲染挂了分两类：压根没到页面（DNS/TLS/入口挂了 = 环境）说 skip，到了页面却没跑通 = 产品红。
       if (rep.fatal && !rep.reachedLogin) {
         if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(rep.fatal)) {
-          t.diagnostic(`SKIP (ui)：入口 ${BASE} 从容器里到不了：${rep.fatal}`);
+          t.diagnostic(`SKIP (ui)：用户站入口 ${USER_BASE} 从容器里到不了：${rep.fatal}`
+          + `（要能解析 ${new URL(USER_BASE).hostname}：E2E_RESOLVE 当前=${JSON.stringify(HOST_MAP)}）`);
           t.skip();
           return;
         }
-        assert.fail(`浏览器里没跑通：${rep.fatal}（登录态=${JSON.stringify(rep.login)}，pageerror=${rep.pageErrors.slice(0, 3).join(' / ')}）`);
+        assert.fail(`入口到得了却没跑到登录页：${rep.fatal}`);
+      }
+      // 到得了登录页**之后**的 fatal 一律判红。旧写法把 assert.fail 关在 `!reachedLogin` 那一支里，
+      // 于是登录后才出的 fatal（工作台路由没匹配上、渲染挂了）会一路走到徽标存在性判断，最后以 skip
+      // 收场——这条腿因此可以在页面全空的情况下次次 rc 0（本单开局就是这么藏了三周）。
+      if (rep.fatal) {
+        // 登录后一律判红，只在消息里分个诊向：连接层失败先去端口看活栈/容器健康，其余按产品缺陷查。
+        // ⚠ 只认下面这些**明确的连接层**失败形。裸 `net::` 前缀不算证据——ERR_ABORTED、
+        // ERR_BLOCKED_BY_RESPONSE 这类是浏览器策略或应用侧中止，据此断言「容器在重启」会把
+        // 产品故障分诊错（分诊文案不许替人下结论）。
+        const connLevel = /\bECONNREFUSED\b|\bECONNRESET\b|\bETIMEDOUT\b|\bENOTFOUND\b|\bEAI_AGAIN\b|getaddrinfo|handshake|socket hang up|net::ERR_(?:CONNECTION_|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|NETWORK_CHANGED|ADDRESS_UNREACHABLE)/i.test(String(rep.fatal));
+        assert.fail(`已到达登录页却没跑通（登录后失败不退化成 skip）：${rep.fatal}`
+          + `（${connLevel ? '连接层失败：先去端口确认活栈/容器健康再重跑，别先改代码' : '未判定为连接层：先重跑一次，仍红就按产品缺陷查'}；`
+          + `登录态=${JSON.stringify(rep.login)}，pageerror=${String((rep.pageErrors || []).slice(0, 2).join(' / '))}）`);
       }
       assert.match(String(rep.login.hash || ''), /#\/(?!login)/, `登录后没离开 /login，hash=${JSON.stringify(rep.login.hash)}`);
+      // 采集前置：hash 必须真的是工作台路由 `/`。同文档哈希跳转不会清空旧 DOM，光等 [data-test="who"]
+      // 会在**过期 DOM** 上命中，于是「页面上其实什么都没有」也能一路走到徽标存在性判断并 skip 掉。
+      assert.equal(String(rep.hashAtWorkbench ?? ''), '#/',
+        `导航后不在工作台路由（hash=${JSON.stringify(rep.hashAtWorkbench)}；工作台的路由是 /，见 router.ts:37）——不在对的页面上，后面所有采集都不算数`);
 
       // 功能存在性：活栈跑改动前的前端时顶栏**根本没有徽标** ⇒ 环境形状 skip（不是产品红）。
       if (!rep.featurePresent) {
-        t.diagnostic('SKIP (ui)：顶栏找不到 [data-test="usage-badge"] ⇒ 活栈跑的是改动之前的镜像（前端无徽标），环境形状；升到含 #808 的前端后此腿即真跑');
+        t.diagnostic('SKIP (ui)：顶栏没有 [data-test="usage-badge"]。两种可能，本腿分不出：① 前端镜像早于 #808（没这颗徽标）；② 该账号无 active 绑定（徽标按设计空态不渲染，UsageBadge.vue:221）。环境形状；升到含 #808 的前端后此腿即真跑');
         t.skip();
         return;
       }
@@ -746,9 +796,28 @@ test('U1 真浏览器进 #/workbench：徽标紧跟 who/周期文案+完整词 h
       assert.ok(/本月|本日/.test(String(zh.title)) || /本月|本日/.test(String(zh.aria)),
         `zh 徽标 title/aria 应含完整词「本月/本日」，实得 title=${JSON.stringify(zh.title)} aria=${JSON.stringify(zh.aria)}`);
       assert.ok(!/^mo |^d |mo used/i.test(String(zh.title)), `zh 徽标 hover 出现窄黑话（如 "mo used"）：${JSON.stringify(zh.title)}`);
-      // 顶栏不换行：徽标与 who 的 top 差 < 2px（同一行）。
-      assert.ok(Number.isFinite(zh.badgeTop) && Number.isFinite(zh.whoTop), `拿不到徽标/who 的 top（badge=${JSON.stringify(zh.badgeTop)} who=${JSON.stringify(zh.whoTop)}）`);
-      assert.ok(Math.abs(zh.badgeTop - zh.whoTop) < 2, `徽标 top=${zh.badgeTop} 与 who top=${zh.whoTop} 差 ≥ 2px ⇒ 顶栏换行了（header 高=${zh.headerHeight}）`);
+      // 顶栏形状判据（zh / en 两趟都跑）。**同一行**的判据是「垂直中心一致」，不是「top 相等」：顶栏是
+      // flex + align-items:center：徽标盒子比纯文本那一行**更高**，居中对齐后两者的 top 天然不等
+      // （差值甚至可正可负），而**垂直中心相同** ⇒ 同一行。旧写法比 top 差 < 2px 是假探测器（同类
+      // #817 那条拿 scrollHeight 判换行恒等，修法见 8046fa0c：改数行盒）。掉行会让顶栏高度翻倍、
+      // 文案变长会把顶栏撑出视口，所以「同一行 + 没掉行 + 紧跟 + 没溢出视口」四件事一起钉，
+      // 并且**中英文两趟都钉**（只钉中文 = 英文长额度造成的溢出没人管）。
+      const assertBadgeGeometry = (label, g) => {
+        assert.ok([g.badgeTop, g.whoTop, g.badgeH, g.whoH].every(Number.isFinite),
+          `${label}：拿不到徽标/who 的盒子（badgeTop=${JSON.stringify(g.badgeTop)} whoTop=${JSON.stringify(g.whoTop)} badgeH=${JSON.stringify(g.badgeH)} whoH=${JSON.stringify(g.whoH)}）`);
+        const badgeMid = g.badgeTop + g.badgeH / 2;
+        const whoMid = g.whoTop + g.whoH / 2;
+        assert.ok(Math.abs(badgeMid - whoMid) < 2,
+          `${label}：徽标与 who 不在同一行——垂直中心 ${badgeMid.toFixed(1)} vs ${whoMid.toFixed(1)}（top ${g.badgeTop}/${g.whoTop}、高 ${g.badgeH}/${g.whoH}、header 高=${JSON.stringify(g.headerHeight)}）`);
+        assert.ok(Number.isFinite(g.headerHeight) && g.headerHeight > 0 && g.headerHeight < 60,
+          `${label}：顶栏高度 ${JSON.stringify(g.headerHeight)}px 不在 (0, 60) 内 ⇒ 要么没渲染（0/负）要么掉成了两行`);
+        assert.ok(Number.isFinite(g.badgeLeft) && Number.isFinite(g.whoRight)
+          && g.badgeLeft >= g.whoRight - 1 && g.badgeLeft - g.whoRight <= 24,
+          `${label}：徽标没紧跟在 who 右边（who 右边缘=${JSON.stringify(g.whoRight)}，徽标左边缘=${JSON.stringify(g.badgeLeft)}）`);
+        assert.ok(Number.isFinite(g.badgeRight) && Number.isFinite(g.viewportWidth) && g.badgeRight <= g.viewportWidth,
+          `${label}：徽标右边缘 ${JSON.stringify(g.badgeRight)} 超出视口宽 ${JSON.stringify(g.viewportWidth)} ⇒ 顶栏横向溢出（额度文案变长时的真实形状）`);
+      };
+      assertBadgeGeometry('zh 趟', zh);
 
       // ③ 弹窗：已用 + 进度条（与 chart 同一蓝色族 `bg-blue-600`）+ chart 区有 svg；按钮与 Esc 都能关。
       const modal = rep.modal || {};
@@ -777,6 +846,8 @@ test('U1 真浏览器进 #/workbench：徽标紧跟 who/周期文案+完整词 h
       assert.ok(/this month|this day/i.test(String(en.title)) || /this month|this day/i.test(String(en.aria)),
         `en 徽标 title/aria 应含完整词 this month/this day，实得 title=${JSON.stringify(en.title)} aria=${JSON.stringify(en.aria)}`);
       assert.ok(!/^mo |^d |mo used/i.test(String(en.title)), `en 徽标 hover 出现窄黑话（如 "mo used"）：${JSON.stringify(en.title)}`);
+      // 顶栏形状在英文趟同样钉一遍（英文文案比中文长，额度写全后更宽 ⇒ 溢出只在英文态出现的形状问题靠这条抓）。
+      assertBadgeGeometry('en 趟', en);
 
       // ⑥ 截图（人工复核证据，落宿主临时目录，不提交）。
       tryQuiet(() => fs.rmSync(SHOT_HOST_ZH, { force: true }));

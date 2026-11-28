@@ -11,7 +11,7 @@
 //     自洽性（period⇒budget_duration 非空；spend==null⇔spend_scope==null；金额有限数或 null）。
 //   · 额度往返腿（要口令）：挑一个可牺牲的 dev FDE 设/清周期额度，钉「设额度不得清零已花金额」
 //     与「重置时刻＝本地次日零点」（portal 不自算周期、原样透传网关的实证）；finally 必 teardown。
-//   · 非管理员腿（能登就测）：登一个普通 FDE 打 key-usage ⇒ 403；登不上（401/二因素）⇒ skip。
+//   · 非管理员腿（能登就测）：用 **FDE 自己的**口令文件登普通 FDE 打 key-usage ⇒ 403；登不上（401/二因素）⇒ skip。
 //   · UI 腿（`E2E_UI=1` 且 playwright 容器在跑才跑）：真浏览器进 `#/admin/users`，钉表头「周期 /
 //     用量」、用量格 data-test 合法且不残留 pending、lifetime 灰字且整页无「本周期」、period hover
 //     用完整词、0 pageerror、无裸 i18n key、金额格式合法、截图落临时目录。
@@ -69,6 +69,16 @@ const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
   .map((p) => p.replace(/^~/, os.homedir()));
 /** 报错文案用：缺口令时列出试过的路径（新前旧后）。 */
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
+/**
+ * ⚠ #925 现验出的真 bug（不是本轮引入）：非管理员腿曾拿**管理员**那份口令去登 `FDE_LOGIN`，
+ * 一直 401 invalid_cred ⇒「非管理员打 key-usage ⇒ 403」这条授权腿**从未跑过**（只 skip）。
+ * 现在各读各的：FDE 口令走 `script` 那份（env `E2E_FDE_PASSWORD_FILE` 可覆盖，同 user-usage-e2e）。
+ */
+const FDE_PASSWORD_FILE_CANDIDATES = (process.env.E2E_FDE_PASSWORD_FILE
+  ? [process.env.E2E_FDE_PASSWORD_FILE]
+  : credsFileCandidates('script'))
+  .map((p) => p.replace(/^~/, os.homedir()));
+const FDE_PASSWORD_FILE = FDE_PASSWORD_FILE_CANDIDATES.join(' 或 ');
 const UI_ENABLED = process.env.E2E_UI === '1';
 const PW_CONTAINER = process.env.PLAYWRIGHT_CONTAINER || 'erix_station_playwright';
 const PW_MODULE = '/app/node_modules/playwright/index.mjs';
@@ -190,8 +200,8 @@ function httpRequest(urlStr, { method = 'GET', body, headers = {}, timeoutMs = 1
 }
 
 /** 先新后旧取第一个存在的；空文件视同没有 ⇒ null。 */
-function readPassword() {
-  const file = PASSWORD_FILE_CANDIDATES.find((p) => fs.existsSync(p));
+function readPassword(candidates = PASSWORD_FILE_CANDIDATES) {
+  const file = candidates.find((p) => fs.existsSync(p));
   if (!file) return null;
   const value = fs.readFileSync(file, 'utf8').trim();
   return value === '' ? null : value;
@@ -223,6 +233,8 @@ const probe = {
   keyUsageStatus: null, keyUsageJson: null, keyUsageText: '', keyUsageRows: null,
   fdeCookies: null, fdeLoginStatus: null, fdeLoginBody: null,
   reasons: { http: null, budget: null, nonadmin: null, ui: null },
+  // 意外的非管理员登录结果（不在已知环境形状清单里）⇒ 由 H3 判红，不许变 skip
+  nonadminFatal: null,
 };
 
 async function gather() {
@@ -233,7 +245,6 @@ async function gather() {
     probe.reasons.http = why;
     probe.reasons.budget = why;
     probe.reasons.ui = `${why} ⇒ UI 腿要登管理台`;
-    probe.reasons.nonadmin = `${why}（非管理员腿也用同一口令文件登 ${FDE_LOGIN}）`;
   } else {
     // admin 登录：**不发 Origin**（带不匹配的 Origin 会被 cross_origin_forbidden 403）。
     let login;
@@ -272,20 +283,62 @@ async function gather() {
         probe.reasons.budget = err.message;
       }
     }
-    // ── 非管理员腿：登 FDE_LOGIN（登得上才测 403，登不上是环境形状）──
-    try {
-      const fl = await fetchJson(`${BASE}/api/auth/login`, { method: 'POST', body: { login: FDE_LOGIN, password }, timeoutMs: 20_000 });
+  }
+
+  // ── 非管理员腿：**只依赖 FDE 自己的口令文件**。以前这段嵌在「管理员口令存在」的分支里，
+  // 于是缺 admin 口令会连带把这条腿也 skip，与「两账号各读各的口令」不符。现在搬出来了。
+  // 登得上才测 403；只有**已知环境形状**（缺口令文件 / 口令未配 401 / 二因素 / 限流 / 邮件通道未配 /
+  // 强制改密受限会话 / 连不上）才留 skip，其余非 200 与「200 但没 cookie」都是产品故障 ⇒ nonadminFatal 判红。
+  try {
+    const fdePw = readPassword(FDE_PASSWORD_FILE_CANDIDATES);
+    if (fdePw === null) {
+      probe.reasons.nonadmin = `缺 FDE（${FDE_LOGIN}）口令文件 ${FDE_PASSWORD_FILE}`
+        + '（**不是**管理员那份；两账号两文件，路径口径见 lib/dev-creds.mjs）';
+    } else {
+      const fl = await fetchJson(`${BASE}/api/auth/login`, { method: 'POST', body: { login: FDE_LOGIN, password: fdePw }, timeoutMs: 20_000 });
       probe.fdeLoginStatus = fl.status;
       probe.fdeLoginBody = fl.json;
       probe.fdeCookies = fl.cookies;
-      if (fl.status !== 200 || fl.cookies.length === 0) {
-        const code = fl.json?.error?.code;
-        probe.reasons.nonadmin = `非管理员 ${FDE_LOGIN} 登不上（HTTP ${fl.status}${code ? ` ${code}` : ''}`
-          + `${fl.json?.pending_token ? '，带 pending_token ⇒ 开了第二因素，本脚本只会口令直通' : ''} ⇒ 环境形状，不算红）`;
+      const code = fl.json?.error?.code;
+      // 判据（照 `portal/src/http.js` 登录流的真实 wire 形状；**别照抄被截断过的日志**——本单先写成
+      // `invalid_cred` 没命中，真码是 `invalid_credentials`，是变异自己抓到的）：
+      //  · 二因素/步出：**HTTP 200** 且响应体顶层 `status ∈ {email_code_required, totp_required,
+      //    second_factor_choice}`，或顶层带 `pending_token`。边界要写进判据，不能只写在注释里。
+      //  · 强制改密：`password_change_required` 是**成功响应的顶层布尔**，不是二因素、也不是错误码。
+      //    带着它的是**受限会话**：拿它去验授权隔离，收到的 403 可能只是「先去改密码」⇒ 那是假过，
+      //    所以这条腿不测，但**显式记名**（不静默混进「环境形状」那一大堆）。
+      //  · 环境形状必须**状态码与错误码成对**才认——只看错误码会把带这些码的 500/413 一起放走：
+      //      401（口令未配/轮换）与 429（限流）按状态码算；409 `email_not_registered`；
+      //      503 `email_channel_unavailable`；503 `email_send_failed`（502 那条属管理端测试邮件路由）。
+      //  · 其余一律判红：500、503 `kdf_busy`（容量/可用性信号，要测可用性就不该被洗绿）、
+      //    400 `validation_failed`、413（我们自己的请求形状错了），以及「200 却没有会话 cookie」。
+      const stepUpStatuses = ['email_code_required', 'totp_required', 'second_factor_choice'];
+      // 二因素信号**只在 HTTP 200 上成立**（`portal/src/http.js` 的步出响应都是 200 + 顶层字段）。
+      // 不绑这个边界，「500 带 pending_token」就会被当二因素洗成 skip——注释说 200 而判据不守，等于假绿。
+      // 注意读的是响应体**顶层**的 `pending_token`：登录发码失败（503 `email_send_failed`）那枚 token 在
+      // `error.details` 里，不该被这里当二因素（它由 503 配对规则处理）。
+      const secondFactor = fl.status === 200
+        && (!!fl.json?.pending_token || stepUpStatuses.includes(fl.json?.status));
+      const restricted = fl.json?.password_change_required === true;
+      const envShape = (st, cd) => st === 401 || st === 429
+        || (st === 409 && cd === 'email_not_registered')
+        || (st === 503 && (cd === 'email_channel_unavailable' || cd === 'email_send_failed'));
+      if (fl.status === 200 && fl.cookies.length > 0 && !restricted) {
+        // 登进去了（且不是受限会话）⇒ H3 的 403 断言正常跑
+      } else {
+        const why = `非管理员 ${FDE_LOGIN} 登录 HTTP ${fl.status}${code ? ` ${code}` : ''}`
+          + `${secondFactor ? '（带 pending_token ⇒ 这个账号开了第二因素，本脚本只会口令直通）' : ''}`;
+        if (restricted) {
+          probe.reasons.nonadmin = `${why} ⇒ 账号处于**强制改密**态（受限会话）：拿它验授权隔离会假过 ⇒ 本腿不测`;
+        } else if (secondFactor || envShape(fl.status, code)) {
+          probe.reasons.nonadmin = `${why} ⇒ 已知环境形状（口令未配 / 二因素 / 限流 / 邮件通道未配）`;
+        } else {
+          probe.nonadminFatal = `${why} ⇒ **不在**已知环境形状清单里，按产品缺陷判红`;
+        }
       }
-    } catch (err) {
-      probe.reasons.nonadmin = `非管理员 ${FDE_LOGIN} 登录连不上：${err.message}`;
     }
+  } catch (err) {
+    probe.reasons.nonadmin = `非管理员 ${FDE_LOGIN} 登录连不上：${err.message}`;
   }
   // ── UI 腿：显式开开关 + playwright 容器在跑且里面有 playwright（仓库故意不加这个依赖）──
   if (!UI_ENABLED) {
@@ -452,6 +505,8 @@ test(`H2 额度往返（${BUDGET_FDE}）：设 1d 额度 ⇒ period/本地次日
 // ---------------------------------------------------------------------------
 test(`H3 非管理员（${FDE_LOGIN}）打 key-usage ⇒ 403`,
   { skip: probe.reasons.nonadmin || false, timeout: 60_000 }, async (t) => {
+    // 意外的登录结果先判红：不许被测试级 skip 吞掉（缺口令文件/二因素/限流才走 skip）
+    if (probe.nonadminFatal) assert.fail(probe.nonadminFatal);
     if (!need(t, 'nonadmin', probe.fdeCookies)) return;
     const res = await fetchJson(BASE + KEY_USAGE_PATH, { headers: { Cookie: probe.fdeCookies.join('; ') }, timeoutMs: 20_000 });
     if (res.status === 404) {
@@ -459,7 +514,11 @@ test(`H3 非管理员（${FDE_LOGIN}）打 key-usage ⇒ 403`,
       t.skip();
       return;
     }
+    // 只断状态码会被**别的原因**顶替（受限会话、路由改动都可能回 403）⇒ 再钉原因码：blanket 授权闸
+    // `requireAdmin` 发的是 `forbidden`。真机现验：非管理员会话打这个端点回 403 `forbidden`。
     assert.equal(res.status, 403, `非管理员 ${FDE_LOGIN} 打 key-usage 期望 403，得到 ${res.status}（body=${res.text.slice(0, 200)}）`);
+    assert.equal(res.json?.error?.code, 'forbidden', `403 的原因码应是 forbidden（blanket 授权闸 requireAdmin），`
+      + `实际=${JSON.stringify(res.json?.error?.code)}：别的码说明这格是别的原因（如受限会话），本腿的授权隔离没真验到`);
   });
 
 // ---------------------------------------------------------------------------
@@ -491,7 +550,13 @@ try {
   r.reachedLogin = true;
   await page.fill('#loginName, input[autocomplete="username"]', cfg.login);
   await page.fill('#loginPass', cfg.password);
-  await page.click('button[type=submit]');
+  // 登录点击与「登录响应」并行等：拿得到状态码才能把「入口/网关挡下」「口令轮换」
+  // 与「连接被切断」分开（只用于分诊文案；判红条件不因它放宽）。
+  const loginPair = await Promise.all([
+    page.waitForResponse((res) => res.url().endsWith('/api/auth/login'), { timeout: 20_000 }).catch(() => null),
+    page.click('button[type=submit]'),
+  ]);
+  r.login.postStatus = loginPair[0] ? loginPair[0].status() : null;
   await page.waitForFunction(() => !location.hash.includes('/login'), null, { timeout: 20_000 });
   r.login.hash = await page.evaluate(() => location.hash);
 
@@ -508,6 +573,25 @@ try {
   r.page.featurePresent = r.page.headerCells.some((x) => /周期 \/ 用量|Period \/ usage/.test(x))
     || (await page.locator('[data-test^="user-usage-"]').count()) > 0;
 
+  // 行与格要在**同一次 evaluate** 里一次取完：分两次查会被列表轮询插进来（有生命周期在跑时每 3s
+  // 重载用户列表），两次读数之间行数一变就假红。⚠ 下面 r.page.cells 是**稍后**的另一次采样，
+  // 只做内容断言；**任何计数都不许跨这两次采样比**（要比的量都在 usageTable 这一次里）。
+  // 逐行数而不是比两个总数：总数相等可以由「一行两格 + 一行没格」互相抵消凑出来（假绿）。
+  // 零行也判红：当前模板的 table 在两个空态分支之后才渲染（users.length === 0 与
+  // filteredUsers.length === 0 各走空态），所以「有表头无行」在这份前端上到不了；真出现了
+  // 就是渲染/筛选坏了，而且零行会让下面所有按格子的检查整批空过。
+  r.page.usageTable = await page.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('[data-test="user-row"]'));
+    const text = (el) => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
+    return {
+      rowCount: rows.length,
+      rows: rows.map((row) => ({
+        login: text(row.querySelector('td')).slice(0, 40),
+        usageCells: row.querySelectorAll('[data-test^="user-usage-"]').length,
+      })),
+      totalCells: document.querySelectorAll('[data-test^="user-usage-"]').length,
+    };
+  });
   r.page.cells = await page.$$eval('[data-test^="user-usage-"]', (els) => els.map((e) => {
     const row = e.closest('[data-test="user-row"]');
     const firstCell = row ? row.querySelector('td') : null;
@@ -559,14 +643,30 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
       assert.ok(m, `容器里的采集脚本没交出 REPORT（tail=${out.slice(-400)}）`);
       const rep = JSON.parse(m[1]);
 
-      // 导航/渲染挂了分两类：压根没到页面（DNS/TLS/入口挂了 = 环境）说 skip，到了页面却没跑通 = 产品红。
-      if (rep.fatal && !rep.page.tablePresent) {
-        if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(rep.fatal)) {
-          t.diagnostic(`SKIP (ui)：管理台入口 ${BASE} 从容器里到不了：${rep.fatal}`);
+      // fatal **一律先处理**，不看 tablePresent：以前只在「表格没渲染」时看它，于是
+      // 「表格已渲染之后发生的 fatal」根本没人检查，而发生在 featurePresent 之前的 fatal
+      // 会被下面的 featurePresent skip 当成「旧镜像」吞掉（假绿）。
+      // 只有**正面没到过登录页**的网络失败才算环境形状；到过之后一律判红。
+      if (rep.fatal) {
+        if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(rep.fatal)
+          && !rep.reachedLogin) {
+          t.diagnostic(`SKIP (ui)：还没到登录页就到不了管理台入口 ${BASE}（环境形状）：${rep.fatal}`);
           t.skip();
           return;
         }
-        assert.fail(`浏览器里没跑通：${rep.fatal}（登录态=${JSON.stringify(rep.login)}，pageerror=${rep.pageErrors.slice(0, 3).join(' / ')}）`);
+        const ps = rep.login ? rep.login.postStatus : undefined;
+        // ⚠ 5xx 不等于「网关挡下」：portal 自己就回 5xx（队列满 ⇒ 503 `kdf_busy`，见 portal 登录
+        // 路由），所以只说「返回 5xx」并把入口与 portal 两边都列为待查，不替人指认来源。
+        const triage = ps !== undefined && ps !== null && ps >= 500
+          ? `登录请求返回 5xx（HTTP ${ps}）：入口/网关与 portal 自身都可能（如 503 kdf_busy）`
+            + '⇒ 先看端口与 portal 日志再定性'
+          : ps === 401
+            ? '登录被拒（HTTP 401）⇒ 先核口令是否轮换，再谈产品缺陷'
+            : rep.reachedLogin && (ps === null || ps === undefined)
+              ? '到了登录页但20s 内没等到登录响应（**不足以断定**连接被切断）⇒ 先核入口/容器再谈产品缺陷'
+              : '未判定为环境形状：先重跑一次，仍红就按产品缺陷查';
+        assert.fail(`浏览器里没跑通：${rep.fatal}`
+          + `（${triage}；登录态=${JSON.stringify(rep.login)}，pageerror=${rep.pageErrors.slice(0, 2).join(' / ')}）`);
       }
       assert.match(String(rep.login.hash || ''), /#\/(?!login)/, `登录后没离开 /login，hash=${JSON.stringify(rep.login.hash)}`);
 
@@ -582,12 +682,46 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
         return;
       }
 
-      // ① 表头：10 格，下标 7 是「周期 / 用量」（或 en 的 `Period / usage`）。
+      // ① 表头按**列名**判，不按格子数与下标判：#828 P3 给用户表加了「默认语言」列之后，格子数与
+      //    下标都会漂（用户表加一列，格数与下标就全变），而本单要钉的是**这一列在不在**与
+      //    且只有一列**。列数本身不是契约——管理台再加一列不该红，也不该绿得莫名其妙。
       const hc = rep.page.headerCells;
-      assert.equal(hc.length, 10, `表头格子数期望 10，得到 ${hc.length}（=${JSON.stringify(hc)}）`);
-      assert.equal(hc[7], HEADER_EXPECT, `表头下标 7 期望「${HEADER_EXPECT}」，得到「${hc[7]}」（locale=${UI_LOCALE}）`);
+      const usageIdx = hc.indexOf(HEADER_EXPECT);
+      assert.ok(usageIdx >= 0, `表头里没有「${HEADER_EXPECT}」列（locale=${UI_LOCALE}，实得=${JSON.stringify(hc)}）`);
+      // 唯一性要**两种语言的标题一起数**：只数当前语言那份的话，「一列中文标题 + 一列英文标题」这种
+      // 混语言重复列会让当前语言的计数恰好等于 1，重复列照样溜过去（功能探测那一步两种标题都认）。
+      const OTHER_HEADER = UI_LOCALE === 'en' ? '周期 / 用量' : 'Period / usage';
+      const dup = hc.filter((h) => h === HEADER_EXPECT || h === OTHER_HEADER).length;
+      assert.equal(dup, 1, `用量列标题（「${HEADER_EXPECT}」或另一种语言的「${OTHER_HEADER}」）在表头里出现 ${dup} 次，应为 1 次（重复列 = 红，实得=${JSON.stringify(hc)}）`);
+      assert.ok(usageIdx > 0 && usageIdx < hc.length - 1,
+        `「${HEADER_EXPECT}」落在首/末列（下标 ${usageIdx} / 共 ${hc.length}）——列序被动过，用量格与表头的对齐不再可信`);
 
+      // 先钉「有行、且每行恰好一个用量格」：否则下面 data-test / lifetime / period 那些检查会在空数组
+      // 上全部空过（有表头无行是真状态，来历见采集处 rowCount）。
+      // 计数全部取自采集处那**一次**快照（不跨采样比，理由见采集处注释）。
+      const tab = rep.page.usageTable || {};
+      const rowCount = Number(tab.rowCount);
+      const perRow = Array.isArray(tab.rows) ? tab.rows : [];
+      const totalCells = Number(tab.totalCells);
+      assert.ok(Number.isFinite(rowCount) && rowCount > 0,
+        `用户表一行都没有（usageTable=${JSON.stringify(tab).slice(0, 160)}）⇒ 按格子的检查会整批空过`);
+      assert.equal(perRow.length, rowCount,
+        `同一次快照里 rows=${perRow.length} 与 rowCount=${rowCount} 自相矛盾（采集器坏了）`);
+      const offRows = perRow.filter((x) => Number(x.usageCells) !== 1);
+      assert.equal(offRows.length, 0,
+        `这些行的用量格不是恰好 1 个：${JSON.stringify(offRows.slice(0, 5))}（每行应恰好一个；`
+        + `只比总数会被「一行两格 + 一行没格」的抵消骗过去）`);
+      const sumInRows = perRow.reduce((n, x) => n + Number(x.usageCells), 0);
+      assert.equal(totalCells, sumInRows,
+        `同一次快照里全表用量格 ${totalCells} ≠ 各行内之和 ${sumInRows}（差值 = 有用量格不在任何 user-row 内）`);
+      // 内容断言读稍后的那次采样（cells）：**只判每格长什么样，不判数量**（数量已在上面同一次
+      // 快照里判完）。跨采样比数量会在轮询时假红，所以这里刻意没有 cells.length 的断言。
       const cells = rep.page.cells || [];
+      // 这次采样自己也要非空判据：`usageTable` 有行**保不了**这次也拿到格（另一次查询）。
+      // 空集合会让下面按格的 data-test / lifetime / period 循环整批空过 = 假绿。刻意**不**与
+      // usageTable 的格数比：跨采样比数量会在轮询时假红。
+      assert.ok(cells.length > 0,
+        `内容断言那次采样一个用量格都没拿到（cells=[]）⇒ 按格的检查会整批空过（假绿）`);
       // ② 每个用量格 data-test 合法（unknown|period|lifetime），整表不残留 pending。
       assert.equal(rep.page.pendingCount, 0, `整表残留 user-usage-pending ${rep.page.pendingCount} 格（卡在加载态 = 红）`);
       for (const c of cells) {
