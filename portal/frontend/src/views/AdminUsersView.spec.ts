@@ -586,21 +586,49 @@ describe('issue #817：工位列四态一行 + 状态形状 + 动作图标 + 版
     expect(statusCol(2).text()).toContain('等待凭据');
   });
 
-  it('④ 动作列：会话/文件与编辑有 <svg> 且有文字，启用/停用是纯文字', async () => {
-    const w = await mountSeat([mkSeatUser('alice'), mkSeatUser('nobody', { fde_name: null })]);
-    const link = w.findAll('[data-test="user-row"]')[0].find('[data-test="seat-content-link"]');
+  it('④ 动作列（#817 步 5 纯图标）：三个控件都有 <svg>、无可见文字、aria-label 与 title 非空；停用危险方向红色', async () => {
+    const w = await mountSeat([
+      mkSeatUser('alice'), // 启用态 ⇒ toggle 是「停用」危险动作
+      mkSeatUser('nobody', { fde_name: null }),
+      mkSeatUser('gone', { status: 'disabled' }), // 停用态 ⇒ toggle 是「启用」非破坏动作
+    ]);
+    const row = w.findAll('[data-test="user-row"]')[0];
+    // 会话/文件：纯图标 folder，无可见文字，语义全在 aria-label + title（都是完整 t() 文案）。
+    const link = row.find('[data-test="seat-content-link"]');
     expect(link.exists()).toBe(true);
-    expect(link.find('svg').exists(), '图标化 = 图标 + 短词').toBe(true);
+    expect(link.find('svg').exists(), '图标化 = 纯图标').toBe(true);
     expect(link.find('svg').attributes('data-icon')).toBe('folder');
-    expect(link.text()).toContain('会话/文件'); // 文字没被图标换掉
-    const edit = w.findAll('[data-test="user-row"]')[0].find('[data-test="edit-user"]');
+    expect(link.text().trim(), '纯图标：不该有可见文字').toBe('');
+    expect(link.attributes('aria-label'), 'aria-label 承载读屏全词').toBe('会话/文件');
+    expect(link.attributes('title'), 'title 承载 hover 全词').toBe('会话/文件');
+    // 编辑：纯图标 pencil。
+    const edit = row.find('[data-test="edit-user"]');
     expect(edit.find('svg').exists()).toBe(true);
     expect(edit.find('svg').attributes('data-icon')).toBe('pencil');
-    expect(edit.text()).toContain('编辑');
-    const toggle = w.findAll('[data-test="user-row"]')[0].find('[data-test="toggle-user-status"]');
+    expect(edit.text().trim(), '纯图标：不该有可见文字').toBe('');
+    expect(edit.attributes('aria-label'), 'aria-label 非空').toBe('编辑');
+    expect(edit.attributes('title'), 'title 非空').toBe('编辑');
+    // 启用/停用（危险方向）：纯图标 pause + 红色类 + 全词（颜色不是唯一信号）。
+    const toggle = row.find('[data-test="toggle-user-status"]');
     expect(toggle.exists()).toBe(true);
-    expect(toggle.find('svg').exists(), '唯一的危险动作保持纯文字').toBe(false);
-    expect(toggle.text()).toContain('停用');
+    expect(toggle.find('svg').exists(), '危险动作也是纯图标').toBe(true);
+    expect(toggle.find('svg').attributes('data-icon'), '启用态的 toggle 是停用方向 ⇒ pause').toBe('pause');
+    expect(toggle.text().trim(), '纯图标：不该有可见文字').toBe('');
+    expect(toggle.attributes('aria-label'), 'aria-label 承载危险动作全词').toBe('停用');
+    expect(toggle.attributes('title'), 'title 承载危险动作全词').toBe('停用');
+    const toggleCls = toggle.attributes('class') ?? '';
+    expect(toggleCls, '停用（危险方向）必须带红色文字类').toContain('text-red-600');
+    expect(toggleCls, '停用（危险方向）必须带红色边框类（red-500：red-300 约 2:1 作边界太淡）').toContain('border-red-500');
+    // 停用态 ⇒ 启用（非破坏）⇒ play 图标 + 中性（不带红）。
+    const offRow = w.findAll('[data-test="user-row"]')[2];
+    const offToggle = offRow.find('[data-test="toggle-user-status"]');
+    expect(offToggle.exists(), '停用态（无 offboarding）仍应有启用按钮').toBe(true);
+    expect(offToggle.find('svg').attributes('data-icon'), '停用态的 toggle 是启用方向 ⇒ play').toBe('play');
+    expect(offToggle.text().trim(), '纯图标：不该有可见文字').toBe('');
+    expect(offToggle.attributes('aria-label')).toBe('启用');
+    const offCls = offToggle.attributes('class') ?? '';
+    expect(offCls, '启用（非破坏）不得带红色文字类').not.toContain('text-red-600');
+    expect(offCls, '启用（非破坏）不得带红色边框类').not.toContain('border-red-500');
     // 没有工位的人没有「会话/文件」入口（#727 的既有口径，别在图标化时顺手丢掉）
     expect(w.findAll('[data-test="user-row"]')[1].find('[data-test="seat-content-link"]').exists()).toBe(false);
   });

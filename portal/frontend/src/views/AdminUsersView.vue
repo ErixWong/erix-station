@@ -1035,31 +1035,46 @@ onBeforeUnmount(() => {
                 </td>
                 <td class="px-2 py-2">
                   <div class="flex flex-wrap items-center justify-end gap-1">
-                    <!-- issue #727 片 2 + #817 步 3：「会话/文件」图标化 = **图标 + 短词**，不是纯图标
-                         （没有可猜的上下文，鼠标 hover 也不能是发现唯一手段）。emoji 不算图标。 -->
+                    <!-- issue #817 步 5（用户拍板的口径变更）：这一列（操作列）改**纯图标**，
+                         不再放可见文字。语义分两层承载：`aria-label` 是**可靠**的那层（读屏与辅助技术都读它）；
+                         `title` 只覆盖**桌面鼠标悬停**——键盘聚焦与触屏拿不到它（原生 title 的固有限制），
+                         所以别把「有 title」当成「发现性已解决」。文案都取完整 t()（会话/文件、启用/停用、编辑）。
+                         ⚠ 这是用户对**这一列**的专门决定：#817 原来定的「图标必须配文字」在
+                         其它地方（侧栏、弹窗、顶栏）仍然适用，只在用户表这一列不再适用。emoji 仍不算图标。 -->
                     <router-link
                       v-if="user.fde_name"
                       data-test="seat-content-link"
                       :to="{ name: 'admin-seat-content', query: { fde: user.fde_name } }"
+                      :aria-label="t('admin.seatContent.fromUsersLink')"
+                      :title="t('admin.seatContent.fromUsersLink')"
                       class="inline-flex items-center gap-1 rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
-                    ><AppIcon name="folder" />{{ t('admin.seatContent.fromUsersLink') }}</router-link>
-                    <!-- 启用 / 停用：**纯文字**。它是这一行唯一的危险动作（立刻把人推出工位），
-                         图标在这里只会多一个需要背的图形，不会降低误碰率 —— 所以不上图标。 -->
+                    ><AppIcon name="folder" /></router-link>
+                    <!-- 启用 / 停用（#817 步 5）：改纯图标。它是这一行唯一的危险动作（停用 ⇒ 立刻把人推出工位），
+                         所以**两个方向用两张不同图标**：停用用 `pause`、启用用 `play`；危险方向（停用，即当前是启用态）
+                         额外上红色（`text-red-600` 白底约 4.8:1；边框用 `border-red-500`（约 3.4:1）而不是 red-300——后者约 2:1，
+                         作控件边界太淡；`hover:bg-red-50` 只是极轻的底色提示，不承担语义）。
+                         busy 时 `disabled:opacity-50` 会整体淡化（含红色），那是禁用态，可接受。
+                         ⚠ 颜色不许是唯一信号：图标形状（pause vs play）+ `aria-label`/`title` 全词同时存在，
+                         色弱/黑白屏/读屏都不靠颜色也能区分两个动作。启用（非破坏）保持中性不给红。 -->
                     <button
                       v-if="!user.offboarding"
                       type="button"
                       data-test="toggle-user-status"
-                      class="rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5 disabled:opacity-50"
+                      class="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs disabled:opacity-50"
+                      :class="user.status === 'disabled' ? 'border-black/15 hover:bg-black/5' : 'text-red-600 border-red-500 hover:bg-red-50'"
                       :disabled="busyUserId !== null"
                       :aria-label="user.status === 'disabled' ? t('admin.fde.enableUser') : t('admin.fde.disableUser')"
+                      :title="user.status === 'disabled' ? t('admin.fde.enableUser') : t('admin.fde.disableUser')"
                       @click.stop="toggleStatus(user)"
-                    >{{ user.status === 'disabled' ? t('admin.fde.enableUser') : t('admin.fde.disableUser') }}</button>
+                    ><AppIcon :name="user.status === 'disabled' ? 'play' : 'pause'" /></button>
                     <button
                       type="button"
                       data-test="edit-user"
                       class="inline-flex items-center gap-1 rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
+                      :aria-label="t('admin.fde.editAction')"
+                      :title="t('admin.fde.editAction')"
                       @click.stop="openEditModal(user)"
-                    ><AppIcon name="pencil" />{{ t('admin.fde.editAction') }}</button>
+                    ><AppIcon name="pencil" /></button>
                   </div>
                 </td>
               </tr>
