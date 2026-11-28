@@ -606,6 +606,7 @@ test('④ 真实仓库（不传参）：compose 键数=独立统计、白名单>
   }
   assert.equal(cnt, inv.counts.composePortalKeys, '独立统计必须等于工具口径');
   assert.ok(inv.counts.allowlist > 0, 'ENV_KEY_ALLOW 条数应 >0');
-  assert.ok(inv.subtotals.allowlistedNobodyRead.includes('ERIX_SESSION_AUTO_TITLE'), '「白名单但没人读」应含 ERIX_SESSION_AUTO_TITLE');
+  // issue #331：那根死光纤已拆（注入与白名单同刀删）⇒ 真实仓库上这一档必须是空的。
+  assert.deepEqual(inv.subtotals.allowlistedNobodyRead, [], `白名单里不该有没人读的键，实际=${JSON.stringify(inv.subtotals.allowlistedNobodyRead)}`);
   assert.deepEqual(inv.warnings, [], `真实 compose 不该有可疑形状，实际=${JSON.stringify(inv.warnings)}`);
 });

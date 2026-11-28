@@ -149,12 +149,11 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   assert.ok(body.Env.includes('ERIX_SHELL_TIMEOUT_MS=60000'), 'ERIX_SHELL_TIMEOUT_MS 默认下发');
   assert.ok(body.Env.includes('ERIX_SHELL_MAX_TIMEOUT_MS=600000'), 'ERIX_SHELL_MAX_TIMEOUT_MS 默认下发');
   assert.ok(body.Env.includes('ERIX_SHELL_OUTPUT_MAX_BYTES=32768'), 'ERIX_SHELL_OUTPUT_MAX_BYTES 默认下发');
-  // issue #88 / #114 修订：worker 侧会话标题生成开关（字符串开关；#114 起**默认下发 '0'**——
-  // 默认标题改由首条消息截断/手工/AI 改名承担，省 token；显式设 1 才开回 #88 行为）。
-  assert.ok(body.Env.includes('ERIX_SESSION_AUTO_TITLE=0'), 'ERIX_SESSION_AUTO_TITLE 默认下发 0（#114 默认关）');
+  // issue #331：**不再下发** —— 容器里没有读者（标题生成 #114 起在 portal 侧）。
+  assert.ok(!body.Env.some((e) => e.startsWith('ERIX_SESSION_AUTO_TITLE=')), 'ERIX_SESSION_AUTO_TITLE 不再注入容器（#331 死光纤）');
 });
 
-test('issue #114：ERIX_SESSION_AUTO_TITLE 显式设 1 → 下发 1（开回 #88 自动起名）；其它值 → 0', () => {
+test('issue #331：即使 portal 侧显式设 1，也不再把 ERIX_SESSION_AUTO_TITLE 注入容器', () => {
   const cfg = {
     fdeName: 'alice',
     containerName: 'fde-alice',
@@ -171,10 +170,11 @@ test('issue #114：ERIX_SESSION_AUTO_TITLE 显式设 1 → 下发 1（开回 #88
   };
   const prev = process.env.ERIX_SESSION_AUTO_TITLE;
   try {
-    process.env.ERIX_SESSION_AUTO_TITLE = '1';
-    assert.ok(buildContainerConfig(cfg).Env.includes('ERIX_SESSION_AUTO_TITLE=1'), '显式 1 → 下发 1');
-    process.env.ERIX_SESSION_AUTO_TITLE = 'yes';
-    assert.ok(buildContainerConfig(cfg).Env.includes('ERIX_SESSION_AUTO_TITLE=0'), '非 1 值 → 下发 0');
+    for (const v of ['1', '0', 'yes']) {
+      process.env.ERIX_SESSION_AUTO_TITLE = v;
+      const env = buildContainerConfig(cfg).Env;
+      assert.ok(!env.some((e) => e.startsWith('ERIX_SESSION_AUTO_TITLE=')), `ERIX_SESSION_AUTO_TITLE=${v} 也不许下发`);
+    }
   } finally {
     if (prev === undefined) delete process.env.ERIX_SESSION_AUTO_TITLE;
     else process.env.ERIX_SESSION_AUTO_TITLE = prev;
