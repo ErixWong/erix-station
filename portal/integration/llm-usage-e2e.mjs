@@ -233,6 +233,8 @@ const probe = {
   keyUsageStatus: null, keyUsageJson: null, keyUsageText: '', keyUsageRows: null,
   fdeCookies: null, fdeLoginStatus: null, fdeLoginBody: null,
   reasons: { http: null, budget: null, nonadmin: null, ui: null },
+  // 意外的非管理员登录结果（不在已知环境形状清单里）⇒ 由 H3 判红，不许变 skip
+  nonadminFatal: null,
 };
 
 async function gather() {
@@ -243,7 +245,6 @@ async function gather() {
     probe.reasons.http = why;
     probe.reasons.budget = why;
     probe.reasons.ui = `${why} ⇒ UI 腿要登管理台`;
-    probe.reasons.nonadmin = `${why}（非管理员腿也用同一口令文件登 ${FDE_LOGIN}）`;
   } else {
     // admin 登录：**不发 Origin**（带不匹配的 Origin 会被 cross_origin_forbidden 403）。
     let login;
@@ -282,26 +283,38 @@ async function gather() {
         probe.reasons.budget = err.message;
       }
     }
-    // ── 非管理员腿：登 FDE_LOGIN（登得上才测 403，登不上是环境形状）──
-    try {
-      const fdePw = readPassword(FDE_PASSWORD_FILE_CANDIDATES);
-      if (fdePw === null) {
-        probe.reasons.nonadmin = `缺 FDE（${FDE_LOGIN}）口令文件 ${FDE_PASSWORD_FILE}`
-          + '（**不是**管理员那份；两账号两文件，路径口径见 lib/dev-creds.mjs）';
-      } else {
+  }
+
+  // ── 非管理员腿：**只依赖 FDE 自己的口令文件**。以前这段嵌在「管理员口令存在」的分支里，
+  // 于是缺 admin 口令会连带把这条腿也 skip，与「两账号各读各的口令」不符。现在搬出来了。
+  // 登得上才测 403；只有**已知环境形状**（缺口令文件 / 口令未配 401 / 二因素 / 限流 / 连不上）
+  // 才留 skip，其余非 200 与「200 但没 cookie」都是产品故障 ⇒ 记进 nonadminFatal 判红。
+  try {
+    const fdePw = readPassword(FDE_PASSWORD_FILE_CANDIDATES);
+    if (fdePw === null) {
+      probe.reasons.nonadmin = `缺 FDE（${FDE_LOGIN}）口令文件 ${FDE_PASSWORD_FILE}`
+        + '（**不是**管理员那份；两账号两文件，路径口径见 lib/dev-creds.mjs）';
+    } else {
       const fl = await fetchJson(`${BASE}/api/auth/login`, { method: 'POST', body: { login: FDE_LOGIN, password: fdePw }, timeoutMs: 20_000 });
       probe.fdeLoginStatus = fl.status;
       probe.fdeLoginBody = fl.json;
       probe.fdeCookies = fl.cookies;
-      if (fl.status !== 200 || fl.cookies.length === 0) {
-        const code = fl.json?.error?.code;
-        probe.reasons.nonadmin = `非管理员 ${FDE_LOGIN} 登不上（HTTP ${fl.status}${code ? ` ${code}` : ''}`
-          + `${fl.json?.pending_token ? '，带 pending_token ⇒ 开了第二因素，本脚本只会口令直通' : ''} ⇒ 环境形状，不算红）`;
+      const code = fl.json?.error?.code;
+      const secondFactor = !!fl.json?.pending_token || code === 'email_code_required';
+      if (fl.status === 200 && fl.cookies.length > 0) {
+        // 登进去了 ⇒ H3 的 403 断言正常跑
+      } else {
+        const why = `非管理员 ${FDE_LOGIN} 登录 HTTP ${fl.status}${code ? ` ${code}` : ''}`
+          + `${secondFactor ? '（带 pending_token ⇒ 这个账号开了第二因素，本脚本只会口令直通）' : ''}`;
+        if ((fl.status === 401 && code === 'invalid_cred') || secondFactor || fl.status === 429) {
+          probe.reasons.nonadmin = `${why} ⇒ 已知环境形状（口令未配 / 二因素 / 限流）`;
+        } else {
+          probe.nonadminFatal = `${why} ⇒ **不在**已知环境形状清单里，按产品缺陷判红`;
+        }
       }
-      }
-    } catch (err) {
-      probe.reasons.nonadmin = `非管理员 ${FDE_LOGIN} 登录连不上：${err.message}`;
     }
+  } catch (err) {
+    probe.reasons.nonadmin = `非管理员 ${FDE_LOGIN} 登录连不上：${err.message}`;
   }
   // ── UI 腿：显式开开关 + playwright 容器在跑且里面有 playwright（仓库故意不加这个依赖）──
   if (!UI_ENABLED) {
@@ -468,6 +481,8 @@ test(`H2 额度往返（${BUDGET_FDE}）：设 1d 额度 ⇒ period/本地次日
 // ---------------------------------------------------------------------------
 test(`H3 非管理员（${FDE_LOGIN}）打 key-usage ⇒ 403`,
   { skip: probe.reasons.nonadmin || false, timeout: 60_000 }, async (t) => {
+    // 意外的登录结果先判红：不许被测试级 skip 吞掉（缺口令文件/二因素/限流才走 skip）
+    if (probe.nonadminFatal) assert.fail(probe.nonadminFatal);
     if (!need(t, 'nonadmin', probe.fdeCookies)) return;
     const res = await fetchJson(BASE + KEY_USAGE_PATH, { headers: { Cookie: probe.fdeCookies.join('; ') }, timeoutMs: 20_000 });
     if (res.status === 404) {
@@ -507,7 +522,13 @@ try {
   r.reachedLogin = true;
   await page.fill('#loginName, input[autocomplete="username"]', cfg.login);
   await page.fill('#loginPass', cfg.password);
-  await page.click('button[type=submit]');
+  // 登录点击与「登录响应」并行等：拿得到状态码才能把「入口/网关挡下」「口令轮换」
+  // 与「连接被切断」分开（只用于分诊文案；判红条件不因它放宽）。
+  const loginPair = await Promise.all([
+    page.waitForResponse((res) => res.url().endsWith('/api/auth/login'), { timeout: 20_000 }).catch(() => null),
+    page.click('button[type=submit]'),
+  ]);
+  r.login.postStatus = loginPair[0] ? loginPair[0].status() : null;
   await page.waitForFunction(() => !location.hash.includes('/login'), null, { timeout: 20_000 });
   r.login.hash = await page.evaluate(() => location.hash);
 
@@ -594,17 +615,27 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
       assert.ok(m, `容器里的采集脚本没交出 REPORT（tail=${out.slice(-400)}）`);
       const rep = JSON.parse(m[1]);
 
-      // 导航/渲染挂了分两类：**没到登录页**（DNS/TLS/入口挂了 = 环境形状）才允许 skip；一旦正面
-      // 认定到过登录页（`reachedLogin`：goto 之后等到了登录表单），之后的任何 fatal 一律判红——
-      // 登录后、表格出现前的连接中断也带 `net::`，只看错误文案会把它伪装成环境（同 #878 口径）。
-      if (rep.fatal && !rep.page.tablePresent) {
+      // fatal **一律先处理**，不看 tablePresent：以前只在「表格没渲染」时看它，于是
+      // 「表格已渲染之后发生的 fatal」根本没人检查，而发生在 featurePresent 之前的 fatal
+      // 会被下面的 featurePresent skip 当成「旧镜像」吞掉（假绿）。
+      // 只有**正面没到过登录页**的网络失败才算环境形状；到过之后一律判红。
+      if (rep.fatal) {
         if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(rep.fatal)
           && !rep.reachedLogin) {
           t.diagnostic(`SKIP (ui)：还没到登录页就到不了管理台入口 ${BASE}（环境形状）：${rep.fatal}`);
           t.skip();
           return;
         }
-        assert.fail(`浏览器里没跑通：${rep.fatal}（登录态=${JSON.stringify(rep.login)}，pageerror=${rep.pageErrors.slice(0, 3).join(' / ')}）`);
+        const ps = rep.login ? rep.login.postStatus : undefined;
+        const triage = ps !== undefined && ps !== null && ps >= 500
+          ? `登录请求被入口/网关挡下（HTTP ${ps}）⇒ 先去端口看活栈/容器健康`
+          : ps === 401
+            ? '登录被拒（HTTP 401）⇒ 先核口令是否轮换，再谈产品缺陷'
+            : rep.reachedLogin && (ps === null || ps === undefined)
+              ? '到了登录页但没等到登录响应（连接被切断）⇒ 先核入口/容器，再按产品缺陷查'
+              : '未判定为环境形状：先重跑一次，仍红就按产品缺陷查';
+        assert.fail(`浏览器里没跑通：${rep.fatal}`
+          + `（${triage}；登录态=${JSON.stringify(rep.login)}，pageerror=${rep.pageErrors.slice(0, 2).join(' / ')}）`);
       }
       assert.match(String(rep.login.hash || ''), /#\/(?!login)/, `登录后没离开 /login，hash=${JSON.stringify(rep.login.hash)}`);
 
