@@ -57,7 +57,7 @@ const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
 const UI_ENABLED = process.env.E2E_UI === '1';
 // #932：软开关在**模块加载时**读一次（与 admin-locale 同一时机，免得两处语义不同）。
 const UI_SOFT = uiSoft();
-// #932：`E2E_UI_SOFT` 判定改用 lib 的 `uiSoft()`（唯一来源），本文件不再单独定义 `UI_SOFT`。
+// #932：软开关的**取值规则**在 lib 的 `uiSoft()`（唯一来源）；本文件只在模块加载时取一次快照。
 
 const PW_CONTAINER = 'erix_station_playwright';
 const PW_MODULE = '/app/node_modules/playwright/index.mjs';
@@ -68,7 +68,7 @@ const SHOT_WIDE_HOST = path.join(os.tmpdir(), 'admin-nav-cols-e2e-wide.png');
 const SHOT_NARROW_HOST = path.join(os.tmpdir(), 'admin-nav-cols-e2e-narrow.png');
 
 // 浏览器跑在容器里 ⇒ 它自己解析不到入口域名，用 `--host-resolver-rules` 把域名映射到宿主。
-// 只覆盖容器内解析，不动宿主 hosts、不写文件。坐标可用 `E2E_HOST_MAP` 覆盖：`host=ip,host=ip`。
+// 只覆盖容器内解析，不动宿主 hosts、不写文件。坐标可用 `E2E_RESOLVE` 覆盖：`host=ip,host=ip`。
 // #932：解析与拼接统一到 lib 的 hostResolverRules()——读 E2E_RESOLVE（旧名 E2E_HOST_MAP 兼容一世代），
 // 两者皆无时用与现有脚本一致的缺省串；多条规则逗号连接（chromium 实测要求）。HOST_MAP/规则串同源。
 const { entries: HOST_MAP, rules: HOST_RESOLVER_RULES, warning: HOST_MAP_WARNING } = hostResolverRules();
@@ -554,6 +554,9 @@ process.stdout.write('\nREPORT:' + JSON.stringify(r) + '\n');
 // ---------------------------------------------------------------------------
 test('H0 不带凭据 `GET /api/admin/users` ⇒ 401（不依赖口令，证明管理台入口可达）',
   { timeout: 60_000 }, async (t) => {
+    // #932：host-map 旧名的兼容提示必须**与是否点名 UI 无关**都能看见——放在 UI 腿里，
+    // 没设 E2E_UI 时那条腿会早退，提示就跟着消失了（文档承诺的「读到就报」会落空）。
+    if (HOST_MAP_WARNING) t.diagnostic(`host-map 兼容提示：${HOST_MAP_WARNING}`);
     let res;
     try {
       res = await fetchJson(BASE + '/api/admin/users', { timeoutMs: 20_000 });
@@ -577,7 +580,6 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       return;
     }
     // #932：旧名 E2E_HOST_MAP 若被用上，这里必须报出来（静默兼容 = 永远移不掉）。
-    if (HOST_MAP_WARNING) t.diagnostic(`host-map 兼容提示：${HOST_MAP_WARNING}`);
     // 点名之后的预检缺口（缺 docker / 容器没跑 / 容器里没 playwright / 缺口令）：
     // 只有显式逃生门 E2E_UI_SOFT=1 才允许降级 skip，其余一律判红。
     if (probe.reasons.ui) {
