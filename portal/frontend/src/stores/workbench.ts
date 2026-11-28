@@ -212,6 +212,9 @@ export interface ChatMessage {
   turnKeys?: string[]; // 0.16.0：聚合进本 run 的助手轮视图键（`turn.key`，逐字透传）
   // issue #189：折叠段（compaction）摘要（有折叠才出现）；渲染为独立横幅，绑定在该助手消息上。
   folded?: FoldedInfo;
+  // issue #243：这条助手终稿的正文是**被文本化的工具调用**（模型把 tool call 吐进正文，run 仍正常结束）。
+  // 后端契约：**有诊断才写 `textualized_tool_call:true`**（无则不写键，缺席 ≠ false）⇒ 前端画中性状态词。
+  textualized_tool_call?: boolean;
   // issue #282：锚点行的创建时刻（对话流 DTO 原样透传，`portal/src/session-view.js:473`）。
   // 缺失/脏值一律不猜（`lib/messageTime.formatMessageTime` 只认非空字符串）。
   created_at?: string;
@@ -248,7 +251,7 @@ export type FoldedOriginalState =
 /** 消息流渲染单元（旧版 DOM 追加序的数组等价）。 */
 export type StreamEntry =
   // issue #282：`createdAt` = DTO `created_at` 原值（缺失就是 undefined ⇒ 消息行不出时刻）。
-  | { kind: 'msg'; id: string; role: string; synthetic: boolean; text: string; html: string | null; sessionId: string | null; createdAt?: string }
+  | { kind: 'msg'; id: string; role: string; synthetic: boolean; text: string; html: string | null; sessionId: string | null; createdAt?: string; textualized?: boolean }
   // issue #189：折叠横幅独立 entry（**方案说明**：独立 kind 而非在 msg entry 加 folded 字段——
   // msg 分支渲染 .msg 气泡，加字段会诱导把横幅画进气泡内；独立 kind 天然渲染成独立分隔条
   // （非 .msg 类），并与该助手消息绑定（id=消息 id，排在正文气泡前）。renderedIds 去重、
@@ -917,6 +920,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       sessionId: sessionId.value, // issue #189：横幅「查看原文」按 (会话, 轮) 调端点，绑定所属会话
       // issue #282：消息时刻原样透传（字符串才收；缺失/脏值不写键 ⇒ StreamPanel 不出 `<time>`）。
       ...(typeof m.created_at === 'string' && m.created_at !== '' ? { createdAt: m.created_at } : {}),
+      // issue #243：终局正文是被文本化的工具调用 ⇒ 该气泡带中性状态标记（只在后端写了 true 时；否则不写键）。
+      ...(m.textualized_tool_call === true ? { textualized: true } : {}),
     });
   }
 

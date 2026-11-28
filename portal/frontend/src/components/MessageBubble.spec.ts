@@ -9,7 +9,7 @@ import { i18n, setLocale } from '../i18n';
 import { renderMarkdown } from '../lib/markdown';
 
 // props 形状与组件一致（不拿 `Record<string, unknown>` 糊弄 vue-tsc：props 类型对不上会直接报）。
-type BubbleProps = { role: string; synthetic?: boolean; createdAt?: string; html?: string | null; text?: string };
+type BubbleProps = { role: string; synthetic?: boolean; createdAt?: string; html?: string | null; text?: string; textualized?: boolean };
 
 function mountBubble(props: BubbleProps) {
   return mount(MessageBubble, { props, global: { plugins: [i18n] } });
@@ -57,5 +57,35 @@ describe('MessageBubble · #816④b：流与折叠原文共用的那一份气泡
     expect(time.attributes('title')).toBe('消息时刻');
     // 时刻挂在气泡**内部**（不是另起一个气泡）
     expect(w.get('.msg.assistant').find('time.msg-time').exists()).toBe(true);
+  });
+});
+
+describe('MessageBubble · #243：终局正文是被文本化工具调用时的中性状态行', () => {
+  it('⑥ textualized=true ⇒ 气泡内出中性状态行，文案是本地化状态词且不含告警词', () => {
+    const w = mountBubble({ role: 'assistant', text: '⟨|DSML invoke name=…', textualized: true });
+    const notice = w.get('[data-test="textualized-notice"]');
+    // 挂在气泡内部（与该轮正文同一气泡），文案是状态词（机器标记 / 可能不完整）
+    expect(w.get('.msg.assistant').find('[data-test="textualized-notice"]').exists()).toBe(true);
+    expect(notice.text()).toContain('机器标记');
+    expect(notice.text()).toContain('可能不完整');
+    // run 正常结束⇒中性而非报错：不得出现「错误/失败」告警词，也不抢红色 .syserr
+    expect(notice.text()).not.toMatch(/错误|失败/);
+    expect(notice.classes()).not.toContain('syserr');
+    expect(notice.attributes('title')).toContain('正常结束');
+  });
+
+  it('⑦ 无 textualized（缺省）⇒ **不渲染**状态行，也不冒出 undefined', () => {
+    const w = mountBubble({ role: 'assistant', text: '正常结论' });
+    expect(w.find('[data-test="textualized-notice"]').exists()).toBe(false);
+    expect(w.text()).not.toMatch(/undefined|机器标记/);
+  });
+
+  it('⑧ en 语下同一开关⇒英文状态文案（双语都真写了）', () => {
+    setLocale('en');
+    const w = mountBubble({ role: 'assistant', text: 'x', textualized: true });
+    const notice = w.get('[data-test="textualized-notice"]');
+    expect(notice.text().toLowerCase()).toContain('machine marker');
+    expect(notice.text().toLowerCase()).toContain('incomplete');
+    expect(notice.text()).not.toMatch(/error|failed/i);
   });
 });

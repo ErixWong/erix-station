@@ -492,6 +492,7 @@ function entryKey(en: StreamEntry, i: number): string {
       :created-at="en.createdAt"
       :html="en.html"
       :text="en.text"
+      :textualized="en.textualized"
     />
     <!-- 流式增量：markdown 容错渲染（v-html，渲染器先转义后格式化 XSS 安全），
          类名与助手终稿一致（.msg assistant .md），pi-web 风格下增量与终稿视觉无跳变 -->
