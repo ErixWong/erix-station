@@ -814,7 +814,12 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="mx-auto w-full max-w-5xl">
+  <!-- issue #923：这里**不能**留 `max-w-5xl`（1024px）。下方表格的 `min-width: 1150px` 是 #817 实测定的
+       「中英两趟 11 列都不折行」下限；容器上限卡在 1024 ⇒ 1024 < 1150，两者永远打架约 126px，
+       **任何** ≥900px 的视口（含 1600 / 1920 / 4K）都得横滚才点得到「操作」列，#818 的 210px 侧栏又吃掉一档。
+       现在宽屏把内容区上限放开到 1400（1400 − 侧栏 210 − 页面内边距 > 1150 ⇒ 宽屏不用横滚）；
+       窄屏口径不变：仍由 `data-test="user-table-scroll"` 容器自己横滚，页面本身不横溢。 -->
+  <section class="mx-auto w-full max-w-[1400px]">
     <header class="mb-3 flex flex-wrap items-center gap-3">
       <h2 class="text-base font-semibold">{{ t('admin.fde.sectionTitle') }}</h2>
       <div class="ml-auto flex w-full flex-wrap items-center gap-2 sm:w-auto">
