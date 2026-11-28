@@ -929,7 +929,12 @@ export async function postMessage(pool, {
     // 过去 `postMessage` 任意字符串都收 → 错 cwd（如快照建在 portal 本地盘 `/root/.erix/...`）
     // 会「账上 done、实际空转」。校验器（`validateRunCwd`）拒绝 ⇒ SessionError → 本事务 ROLLBACK，
     // 会话 cwd 不刷、run 不入队（调用方看到 validation_failed，而不是假绿）。
-    const nextCwdRaw = typeof cwd === 'string' && cwd.trim() !== '' ? cwd.trim() : null;
+    // issue #919②：空白判定用 `cwd.trim() !== ''`，但**交给校验器的是原始字符串 `cwd`**（不 trim）。
+    // 否则绝对形态带首尾空白会被提前 trim 掉、绕过 `validateRunCwd` 的「绝对 cwd 不得带首尾空白」拒
+    // （`<jail>/projects/x␣` 照样被折成 `~/projects/x`、指向另一个目录）。`~/` 形态由校验器自己 trim
+    // 后接受（那一支行为不动）。`:934` 的 `nextCwdRaw !== s.cwd` 比较语义不变：库里存的是已规范值，
+    // 原始值（哪怕带空白）与之不同即触发校验，这是对的。
+    const nextCwdRaw = typeof cwd === 'string' && cwd.trim() !== '' ? cwd : null;
     let nextCwd = nextCwdRaw;
     if (nextCwdRaw !== null && nextCwdRaw !== s.cwd) {
       // #890：**接住并使用校验器返回的规范值**——绝对 `<userSpaceRoot>/<fde>/projects/<name>` 会被

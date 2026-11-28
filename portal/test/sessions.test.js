@@ -240,6 +240,63 @@ test('#890 调用点：postMessage 传绝对 projects/<name> ⇒ 落库 cwd 是�
   assert.notEqual(cwdUpd.params[1], '/srv/erix/users/erix/projects/demo_app', '宿主绝对路径绝不能原样落库');
 });
 
+// —— issue #919②：postMessage 自己不再先 trim ⇒ 绝对 cwd 带首尾空白在这条主写入路径也被拒 ——
+// 旧代码 `nextCwdRaw = ... ? cwd.trim() : null` 把已 trim 的值交给校验器，绕过了 validateRunCwd
+// 的「绝对 cwd 不得带首尾空白」拒（A）。修法后交的是原始值。本格：传**尾带一个空格**的绝对
+// projects 路径 ⇒ validation_failed（钉 code + details.field + en），且**没有** UPDATE chat_sessions SET cwd。
+test('#919② postMessage 传尾空格绝对 projects ⇒ validation_failed（details.field=cwd + en）且不刷会话 cwd', async () => {
+  const userId = crypto.randomUUID();
+  const sessionId = crypto.randomUUID();
+  const sessionRow = {
+    id: sessionId, user_id: userId, project_id: null, cwd: '~/projects/orig', title: 't',
+    title_source: 'auto', model: 'mock-model', status: 'active', last_seq: 0, origin: null,
+  };
+  const queries = [];
+  const dispatch = (sql, params = []) => {
+    if (/FROM chat_sessions s/.test(sql)) return { rows: [sessionRow] };
+    if (/fde_name FROM users/.test(sql)) return { rows: [{ fde_name: 'erix' }] };
+    if (/FROM runs WHERE session_id/.test(sql)) return { rows: [] };
+    if (/FROM containers/.test(sql)) return { rows: [{ id: 'c1' }] };
+    if (/UPDATE chat_sessions SET last_seq/.test(sql)) return { rows: [{ last_seq: 1 }] };
+    if (/INSERT INTO messages/.test(sql)) {
+      return { rows: [{ id: crypto.randomUUID(), seq: 1, role: 'user', content: '', attachments: [], created_at: new Date('2026-01-01T00:00:00.000Z') }] };
+    }
+    return { rows: [] };
+  };
+  const client = { async query(sql, params = []) { queries.push({ sql, params }); return dispatch(sql, params); }, release() {} };
+  const EXPECTED_PRECHECK_SQL = "SELECT 1 FROM fde_llm_bindings b WHERE b.fde_id = $1 AND b.state = 'active' AND b.gateway = 'litellm' AND b.api_key IS NOT NULL AND b.api_key <> '' AND b.main_model_id IS NOT NULL LIMIT 1";
+  const pool = {
+    async query(sql) {
+      const s = String(sql).replace(/\s+/g, ' ').trim();
+      if (s === EXPECTED_PRECHECK_SQL) return { rows: [{ '?column?': 1 }] };
+      throw new Error(`unexpected pool SQL: ${sql}`);
+    },
+    async connect() { return client; },
+  };
+
+  // 尾带一个空格的绝对 projects 路径：旧行为会被 trim 后折叠成 ~/projects/demo_app（静默错目录）；
+  // 修后交给校验器的是原始值 ⇒ 走到 A 的首尾空白拒。
+  let err;
+  try {
+    await postMessage(pool, {
+      userId, sessionId, content: 'hi',
+      cwd: '/srv/erix/users/erix/projects/demo_app ',
+      config: { userSpaceRoot: '/srv/erix/users' },
+    });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof SessionError, '必须抛 SessionError');
+  assert.equal(err.code, 'validation_failed');
+  assert.equal(err.details.field, 'cwd');
+  assert.equal(typeof err.en, 'string');
+  assert.ok(err.en.length > 0 && err.en.includes('leading/trailing whitespace'), `en 必须带 A 文案：${err.en}`);
+
+  // 校验在 UPDATE chat_sessions SET cwd 之前抛 ⇒ 会话 cwd 不应被刷（事务 ROLLBACK）。
+  assert.equal(queries.some((q) => /UPDATE chat_sessions SET cwd/.test(q.sql)), false,
+    '校验失败 ⇒ 不应发出 UPDATE chat_sessions SET cwd');
+});
+
 // 兜底：validateSessionCwd 回归不受影响。
 test('回归：validateSessionCwd 仍只认 ~/projects/<name>', () => {
   assert.equal(validateSessionCwd('~/projects/a'), '~/projects/a');
