@@ -200,12 +200,14 @@ export async function executeScheduledIntent(pool, intent, {
     const posted = await postMessageImpl(pool, {
       userId, sessionId, content: task, triggerKind: 'synthetic',
       // issue #627 ②③：两个过去被读出来却没人用的参数现在真的下行。
-      //  · `cwd`：传**归一后的** `sessionCwd`（不是原始意图快照的 cwd）——会话行已按它取/建，
-      //    postMessage 内部 `validateRunCwd` 也认这个 `~/projects/<name>` 形态；「复用旧会话 +
-      //    模板改了 cwd」这一格靠 postMessage 自己刷会话 cwd 兑住：run 的 cwd = claim 时读的
-      //    `chat_sessions.cwd`，刷了会话行 = 新目录。issue #919 ①：若这里仍传原始绝对路径又不带
-      //    `config`，绝对形态会在 `validateRunCwd` 里因缺 `userSpaceRoot` 抛错、起 run 这步照样失败。
-      //    故一并把 `config` 透下去（会话已建，绝对→tilde 的折叠此前已发生，这里传的是 tilde）。
+      //  · `cwd`：传**归一后的** `sessionCwd`（不是原始意图快照的 cwd）。为什么必须是它：
+      //      - run 的实际工作目录 = claim 时读的 `chat_sessions.cwd`（见 internal.js tryClaim），
+      //        会话行已按 normalizedCwd 取/建，这里再传同一个值 = 三层（会话行 / 校验 / runner 下行）同源。
+      //      - issue #919 ①：若这里仍传原始绝对路径又不带 `config`，绝对形态会在 `validateRunCwd`
+      //        里因缺 `userSpaceRoot` 抛错 ⇒ 会话建好了、起 run 这步照样失败。所以 `config` 一并透下去。
+      //      - 「模板改了 cwd」那一格**不靠**这里刷行兑住：复用命中的判据本身含
+      //        `cwd IS NOT DISTINCT FROM $3`（上面 ① 段），cwd 变了就新建一条宏会话，旧会话留历史。
+      //        传下去的 sessionCwd 与会话行同值 ⇒ postMessage 那边「变了才写」的前置不会多写一行。
       //  · `maxRounds`：写进 run 行，再由 claim 下行给 runner（路线与理由见 sessions.js postMessage）。
       cwd: sessionCwd, maxRounds, config,
     });
