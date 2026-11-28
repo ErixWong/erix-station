@@ -292,7 +292,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
              -- 两个布尔都必须 COALESCE：`jsonb_typeof(NULL) = 'object'` 结果是 NULL 不是 false，
              -- 而 `NOT NULL` 仍是 NULL ⇒ FILTER 会不计数（同一个三值坑的第二层）。
              COALESCE(jsonb_typeof(b->'erix') = 'object', false)  AS erix_is_obj,
-             -- 「有引擎时长」按**投影能显示的东西**算，不按键存在算：`display-projection.js` 只收
+             -- 「有引擎时长」按**投影能显示的东西**算，不按键存在算：`display-projection.js` 只收 只收
              -- 有限数（`typeof === 'number' && Number.isFinite`）。键存在但值是字符串或 null 的块，
              -- DTO 面上本来就是「未知」⇒ 按键存在数会**低估**真正缺时长的块数。
              (COALESCE(jsonb_typeof(b->'erix') = 'object', false)
