@@ -107,6 +107,15 @@ export const EVENT_TYPES = [
   // ⚠ 本次只加**订阅与回放两处集合**，渲染（中性分隔行 + 中英双语文案）在下一步落 —— 在那之前
   // 这一类是「订得到、暂时不刷行」，与 `run_outcome` 今天的形态同类。
   'textualized_tool_call',
+  // issue #895（erix-agent 0.33.0 → 0.34.0，上游 #862 §2.1/§2.2）：`LoopEvent` 联合类型新增两类——
+  // `final_text_textualized_tool_call`（发射点 0.34.0 `src/loop/termination.js`，引擎把终稿判成
+  // 文本化工具调用时发，每 run 至多一条）与 `deliverable_blind`（§2.2：这种文本不再算交付物的判定信号）。
+  // **本站决定：订得到、不刷行、不回放（豁免）**——前者与本站在同一终态事务里合成的 `textualized_tool_call`
+  //（#243/#895）是同一事实的两种载体，时间线再加一行 = 同一件事说两遍；后者是引擎内部交付分类，无独立用户
+  // 动作，用户面已由 `textualized_tool_call` 承担。⇒ 只进本数组（订得到），**绝不进** `HISTORY_REPLAY_TYPES`
+  // / `http.js` 的 `HISTORY_EVENT_TYPES`；决定与理由钉在 `portal/test/event-surface-contract.test.js` 的豁免表。
+  'final_text_textualized_tool_call',
+  'deliverable_blind',
 ] as const;
 
 // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）。
