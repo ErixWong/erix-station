@@ -506,6 +506,10 @@ describe('状态条落点：紧贴输入框上方（#282 落点调整）', () =>
     const wrapper = await mountWorkbench();
     const store = useWorkbenchStore();
     store.sessionId = sessionId; // 状态条只在有选中会话时挂载（没有 run 可报）
+    // issue #867：断线面是会话区的**又一个兄弟**，它只在没连上时出。本组用例钉的是 #282 的落点，
+    // 所以上面先把它撑回「已连上」的正常态（断线时的落点另有单测，见下面那条）。
+    // `store.es` 是 Pinia `reactive` 投影：嵌套 ref 已解包 ⇒ 直接赋值，不写 `.value`。
+    store.es.streamStatus = 'connected';
     await flushPromises();
     const section = wrapper.find('main section');
     expect(section.exists(), '会话区 <section> 必须在').toBe(true);
@@ -535,6 +539,24 @@ describe('状态条落点：紧贴输入框上方（#282 落点调整）', () =>
     const composer = classes[classes.length - 1].split(/\s+/);
     expect(composer).toContain('border-t');
     expect(composer).toContain('border-black/10');
+  });
+
+  // issue #867：断线面插在哪一层是**读序**问题：它给的是「下面这些还是不是现况」的限定词，
+  // 所以必须在「在跑什么」之前（流断了时 run 状态条本身就可能写着陈旧的「运行中」）。
+  it('断线时：顺序 = 消息流 → 断线面 → 状态条（限定词先于被限定的内容）', async () => {
+    const wrapper = await mountWorkbench();
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.es.streamStatus = 'disconnected';
+    await flushPromises();
+    const classes = Array.from(wrapper.find('main section').element.children)
+      .map((el) => `${el.className}|${el.getAttribute('data-testid') ?? ''}`);
+    const stream = classes.findIndex((c) => c.includes('overflow-auto'));
+    const banner = classes.findIndex((c) => c.includes('stream-status-banner'));
+    const status = classes.findIndex((c) => c.includes('run-status-bar'));
+    expect(banner, '断线面必须渲染在会话区里').toBeGreaterThan(-1);
+    expect(banner, '断线面紧跟消息流下方').toBe(stream + 1);
+    expect(status, '断线面在状态条**上方**').toBeGreaterThan(banner);
   });
 });
 

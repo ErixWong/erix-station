@@ -50,11 +50,6 @@ const lastES = () => {
   return inst[inst.length - 1];
 };
 
-/** 只取可见内容：模板注释在 `NODE_ENV=development` 下会被 `html()` 带出来，那不是界面内容。 */
-function visibleHtml(node: { html(): string }): string {
-  return node.html().replace(/<!--[\s\S]*?-->/g, '');
-}
-
 function mountBanner() {
   setActivePinia(createPinia());
   const store = useWorkbenchStore();
