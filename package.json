@@ -20,6 +20,7 @@
     "test:integration:llm-usage": "node --test portal/integration/llm-usage-e2e.mjs",
     "test:integration:user-usage": "node --test portal/integration/user-usage-e2e.mjs",
     "test:integration:locale": "node --test portal/integration/admin-locale-e2e.mjs",
+    "test:integration:admin-ui": "node --test portal/integration/admin-nav-cols-e2e.mjs",
     "test:integration:db": "node --test portal/integration/db-integration.mjs",
     "test:integration:prompts": "node --test portal/integration/platform-prompts-db.mjs",
     "test:integration:prompts-ui": "node --test portal/integration/prompts-effective-e2e.mjs",
