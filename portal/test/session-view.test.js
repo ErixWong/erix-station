@@ -78,12 +78,14 @@ function transcript(round, dedupKey, record, createdAt, runId = null) {
 }
 
 class SessionViewPool {
-  constructor({ sessionId = SESSION_ID, anchors, transcriptRows, toolCallDurations = [] }) {
+  constructor({ sessionId = SESSION_ID, anchors, transcriptRows, toolCallDurations = [], textualizedRunIds = [] }) {
     this.sessionId = sessionId;
     this.anchors = anchors;
     this.transcriptRows = transcriptRows;
     // issue #283：宿主自有 `tool_calls` 的时长行（默认空 = 「库里没时长」，与旧数据同口径）。
     this.toolCallDurations = toolCallDurations;
+    // issue #243：库里带 `textualized_tool_call` 诊断事件的 run_id（默认空 = 没命中）。
+    this.textualizedRunIds = textualizedRunIds;
     this.queries = [];
   }
 
@@ -137,6 +139,13 @@ class SessionViewPool {
         rows: this.toolCallDurations.filter((row) => runIds.has(row.run_id)
           && (!skipNull || row.duration_ms !== null)),
       };
+    }
+    // issue #243：宿主为助手气泡取「哪些 run 有 `textualized_tool_call` 诊断」（同 tool_calls：按 run 集合限定，不拿全表）。
+    if (sql.includes('FROM run_events')) {
+      assert.ok(sql.includes("type = 'textualized_tool_call'"), 'run_events 取数必须按诊断类型限定');
+      assert.ok(sql.includes('run_id = ANY'), 'run_events 取数必须按 run 集合限定（不拿全表）');
+      const runIds = new Set(params[0] ?? []);
+      return { rows: this.textualizedRunIds.filter((runId) => runIds.has(runId)).map((run_id) => ({ run_id })) };
     }
     throw new Error(`Unexpected SQL: ${sql}`);
   }
@@ -1624,4 +1633,50 @@ test('#390-A 上游契约哨兵：`summary` 的缺失标记仍是字面量 "miss
     new URL('../../node_modules/erix-agent/src/store/file.js', import.meta.url), 'utf8');
   assert.ok(/summary\?:\{action:string,note:string\}\|"missing"/.test(upstream),
     'erix-agent 的 `summary` 契约形态变了 ⇒ `hasRealSummary()` 的判据要跟着重核（别只改这里不查上游）');
+});
+
+// issue #243：终局正文是被文本化的工具调用时，该轮助手气泡要带中性状态标记。
+// 后端投影侧只负责「有诊断 ⇒ 挂标记 / 无诊断 ⇒ 不写键（缺席 ≠ false）」；渲染在中性文案的前端。
+test('#243 诊断进 DTO：终态带 textualized_tool_call 诊断的 run ⇒ 对应助手气泡写 true，未命中的不写键', async () => {
+  const { anchors, transcriptRows } = fixture();
+  const byId = (messages, id) => messages.find((m) => m.id === id);
+
+  // 库里没有该诊断事件 ⇒ 两条助手气泡都**不带** textualized_tool_call 键（不得写成 false）
+  const plain = await getSession(new SessionViewPool({ anchors, transcriptRows }),
+    { userId: USER_ID, sessionId: SESSION_ID, limit: 100 });
+  for (const id of ['a1', 'a2']) {
+    const dto = byId(plain.messages, id);
+    assert.ok(dto, `assistant anchor ${id} present`);
+    assert.equal('textualized_tool_call' in dto, false, `${id} 无诊断 ⇒ 键缺席`);
+  }
+
+  // 只有 RUN_1 命中 ⇒ 只有它那条助手气泡带 true，RUN_2 那条仍无键
+  const hitPool = new SessionViewPool({ anchors, transcriptRows, textualizedRunIds: [RUN_1] });
+  const hit = await getSession(hitPool, { userId: USER_ID, sessionId: SESSION_ID, limit: 100 });
+  assert.equal(byId(hit.messages, 'a1').textualized_tool_call, true, '命中 run 的助手气泡写 true');
+  assert.equal('textualized_tool_call' in byId(hit.messages, 'a2'), false, '未命中 run 不写键');
+
+  // 取数按 run 集合限定（不拿全表），且按诊断类型过滤
+  assert.ok(hitPool.queries.some((q) => q.sql.includes('FROM run_events')
+    && q.sql.includes('run_id = ANY') && q.sql.includes("type = 'textualized_tool_call'")),
+  'run_events 取数必须按 run 集合 + 诊断类型限定');
+});
+
+test('#243 projectSessionMessages 直调：诊断参数缺省/非 Set ⇒ 不写键；Set 命中 ⇒ 写 true（additive 不外溢既有形状）', () => {
+  const { anchors, transcriptRows } = fixture();
+  const base = {
+    sessionId: SESSION_ID, anchors, transcriptRows, toolCallRows: [],
+    userAnchors: anchors.filter((a) => a.role === 'user'),
+  };
+  const findAssistant = (msgs, id) => msgs.find((m) => m.id === id);
+
+  assert.equal('textualized_tool_call' in findAssistant(projectSessionMessages(base), 'a1'), false,
+    '缺省（undefined）⇒ 不写键，不得透成 false 之外的形状');
+  assert.equal('textualized_tool_call' in findAssistant(
+    projectSessionMessages({ ...base, textualizedRunIds: 'not-a-set' }), 'a1'), false,
+  '非 Set 入参 ⇒ 视为空集，不写键');
+
+  const withSet = projectSessionMessages({ ...base, textualizedRunIds: new Set([RUN_1]) });
+  assert.equal(findAssistant(withSet, 'a1').textualized_tool_call, true);
+  assert.equal('textualized_tool_call' in findAssistant(withSet, 'a2'), false);
 });
