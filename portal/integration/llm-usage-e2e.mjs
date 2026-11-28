@@ -11,7 +11,7 @@
 //     自洽性（period⇒budget_duration 非空；spend==null⇔spend_scope==null；金额有限数或 null）。
 //   · 额度往返腿（要口令）：挑一个可牺牲的 dev FDE 设/清周期额度，钉「设额度不得清零已花金额」
 //     与「重置时刻＝本地次日零点」（portal 不自算周期、原样透传网关的实证）；finally 必 teardown。
-//   · 非管理员腿（能登就测）：登一个普通 FDE 打 key-usage ⇒ 403；登不上（401/二因素）⇒ skip。
+//   · 非管理员腿（能登就测）：用 **FDE 自己的**口令文件登普通 FDE 打 key-usage ⇒ 403；登不上（401/二因素）⇒ skip。
 //   · UI 腿（`E2E_UI=1` 且 playwright 容器在跑才跑）：真浏览器进 `#/admin/users`，钉表头「周期 /
 //     用量」、用量格 data-test 合法且不残留 pending、lifetime 灰字且整页无「本周期」、period hover
 //     用完整词、0 pageerror、无裸 i18n key、金额格式合法、截图落临时目录。
@@ -69,6 +69,16 @@ const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
   .map((p) => p.replace(/^~/, os.homedir()));
 /** 报错文案用：缺口令时列出试过的路径（新前旧后）。 */
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
+/**
+ * ⚠ #925 现验出的真 bug（不是本轮引入）：非管理员腿曾拿**管理员**那份口令去登 `FDE_LOGIN`，
+ * 一直 401 invalid_cred ⇒「非管理员打 key-usage ⇒ 403」这条授权腿**从未跑过**（只 skip）。
+ * 现在各读各的：FDE 口令走 `script` 那份（env `E2E_FDE_PASSWORD_FILE` 可覆盖，同 user-usage-e2e）。
+ */
+const FDE_PASSWORD_FILE_CANDIDATES = (process.env.E2E_FDE_PASSWORD_FILE
+  ? [process.env.E2E_FDE_PASSWORD_FILE]
+  : credsFileCandidates('script'))
+  .map((p) => p.replace(/^~/, os.homedir()));
+const FDE_PASSWORD_FILE = FDE_PASSWORD_FILE_CANDIDATES.join(' 或 ');
 const UI_ENABLED = process.env.E2E_UI === '1';
 const PW_CONTAINER = process.env.PLAYWRIGHT_CONTAINER || 'erix_station_playwright';
 const PW_MODULE = '/app/node_modules/playwright/index.mjs';
@@ -190,8 +200,8 @@ function httpRequest(urlStr, { method = 'GET', body, headers = {}, timeoutMs = 1
 }
 
 /** 先新后旧取第一个存在的；空文件视同没有 ⇒ null。 */
-function readPassword() {
-  const file = PASSWORD_FILE_CANDIDATES.find((p) => fs.existsSync(p));
+function readPassword(candidates = PASSWORD_FILE_CANDIDATES) {
+  const file = candidates.find((p) => fs.existsSync(p));
   if (!file) return null;
   const value = fs.readFileSync(file, 'utf8').trim();
   return value === '' ? null : value;
@@ -274,7 +284,12 @@ async function gather() {
     }
     // ── 非管理员腿：登 FDE_LOGIN（登得上才测 403，登不上是环境形状）──
     try {
-      const fl = await fetchJson(`${BASE}/api/auth/login`, { method: 'POST', body: { login: FDE_LOGIN, password }, timeoutMs: 20_000 });
+      const fdePw = readPassword(FDE_PASSWORD_FILE_CANDIDATES);
+      if (fdePw === null) {
+        probe.reasons.nonadmin = `缺 FDE（${FDE_LOGIN}）口令文件 ${FDE_PASSWORD_FILE}`
+          + '（**不是**管理员那份；两账号两文件，路径口径见 lib/dev-creds.mjs）';
+      } else {
+      const fl = await fetchJson(`${BASE}/api/auth/login`, { method: 'POST', body: { login: FDE_LOGIN, password: fdePw }, timeoutMs: 20_000 });
       probe.fdeLoginStatus = fl.status;
       probe.fdeLoginBody = fl.json;
       probe.fdeCookies = fl.cookies;
@@ -282,6 +297,7 @@ async function gather() {
         const code = fl.json?.error?.code;
         probe.reasons.nonadmin = `非管理员 ${FDE_LOGIN} 登不上（HTTP ${fl.status}${code ? ` ${code}` : ''}`
           + `${fl.json?.pending_token ? '，带 pending_token ⇒ 开了第二因素，本脚本只会口令直通' : ''} ⇒ 环境形状，不算红）`;
+      }
       }
     } catch (err) {
       probe.reasons.nonadmin = `非管理员 ${FDE_LOGIN} 登录连不上：${err.message}`;
