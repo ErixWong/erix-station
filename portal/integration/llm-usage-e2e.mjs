@@ -37,6 +37,7 @@ import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { credsFileCandidates, defaultScriptLogin } from './lib/dev-creds.mjs';
 
 // admin host 是自签证书；只在这个测试进程里关掉校验。
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -53,7 +54,7 @@ const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
 /** 额度往返腿可牺牲的 dev FDE（设完额度当场 teardown；key-usage 里没它这一行 ⇒ skip）。 */
 const BUDGET_FDE = process.env.E2E_BUDGET_FDE || 'acc019';
 /** 非管理员腿登的普通 FDE（登不上就 skip，不强求）。 */
-const FDE_LOGIN = process.env.E2E_FDE_LOGIN || 'agent01';
+const FDE_LOGIN = process.env.E2E_FDE_LOGIN || defaultScriptLogin();
 /** UI 腿钉表头/周期文案用的语言（缺省 zh；`en` 钉英文措辞）。 */
 const UI_LOCALE = (process.env.E2E_UI_LOCALE || 'zh').toLowerCase();
 const KEY_USAGE_PATH = '/api/admin/llm/key-usage';
@@ -64,7 +65,7 @@ const ROW_KEYS = ['fde_name', 'budget_usd', 'budget_period', 'max_budget', 'budg
 // 凭据目录口径（AGENTS §4）：~/.config/ 下 mcp/creds/；env 点名只信 env
 const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
   ? [process.env.ADMIN_PASSWORD_FILE]
-  : ['~/.config/mcp/creds/station-dev.password', '~/.config/creds/station-dev-password-file'])
+  : credsFileCandidates('admin'))
   .map((p) => p.replace(/^~/, os.homedir()));
 /** 报错文案用：缺口令时列出试过的路径（新前旧后）。 */
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');

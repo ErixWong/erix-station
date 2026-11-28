@@ -34,6 +34,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { credsFileCandidates, defaultScriptLogin } from './lib/dev-creds.mjs';
 
 // 自签证书：只在本测试进程内关掉校验。
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -59,19 +60,19 @@ const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
  * 的 `FDE_LOGIN` / `E2E_FDE_PASSWORD_FILE`。但**收尾仍要把 `ADMIN_LOGIN` 一起恢复**——上面那条管理台
  * 腿经 UI 的 `PATCH /api/me/locale` 会真改 `users.locale`（现场曾把 dev 上的 `admin` 留成英文）。
  */
-const SCRIPT_LOGIN = process.env.E2E_FDE_LOGIN || 'agent01';
+const SCRIPT_LOGIN = process.env.E2E_FDE_LOGIN || defaultScriptLogin();
 // 凭据目录口径（AGENTS §4）：用户配置目录下 mcp/creds 里的 dev 口令文件（新路径优先、旧路径兜底）。
 // env 点名只信 env。
 const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
   ? [process.env.ADMIN_PASSWORD_FILE]
-  : ['~/.config/mcp/creds/station-dev.password', '~/.config/creds/station-dev-password-file'])
+  : credsFileCandidates('admin'))
   .map((p) => p.replace(/^~/, os.homedir()));
 /** 报错文案用：缺口令时列出试过的路径（新前旧后）。 */
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
 /** 脚本账号口令文件：同一套凭据目录口径（env 点名只信 env，新路径优先、旧路径兜底）。 */
 const SCRIPT_PASSWORD_FILE_CANDIDATES = (process.env.E2E_FDE_PASSWORD_FILE
   ? [process.env.E2E_FDE_PASSWORD_FILE]
-  : ['~/.config/mcp/creds/station-agent01.password', '~/.config/creds/station-agent01-password-file'])
+  : credsFileCandidates('script'))
   .map((p) => p.replace(/^~/, os.homedir()));
 const SCRIPT_PASSWORD_FILE = SCRIPT_PASSWORD_FILE_CANDIDATES.join(' 或 ');
 const UI_ENABLED = process.env.E2E_UI === '1';
