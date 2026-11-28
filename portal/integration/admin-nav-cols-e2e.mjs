@@ -37,6 +37,8 @@ import https from 'node:https';
 // #897：宿主凭据路径与脚本账号默认登录名的**唯一来源**（坐标只许住在 lib/dev-creds.mjs，
 // 闸 `check:doc-portable` 的窄判据会拦代码行里的新凭据字面）。
 import { credsFileCandidates } from './lib/dev-creds.mjs';
+// #932：软降级判据、E2E_UI_SOFT 判定、host-resolver 解析与拼接收成一份（唯一来源在 lib）。
+import { shouldSoftSkip, uiSoft, hostResolverRules } from './lib/e2e-ui-soft.mjs';
 
 // 自签证书（本机 CA 未进容器信任库），关掉校验；只在测试进程内生效，不外溢。
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -53,7 +55,7 @@ const PASSWORD_FILE_CANDIDATES = (process.env.ADMIN_PASSWORD_FILE
 const PASSWORD_FILE = PASSWORD_FILE_CANDIDATES.join(' 或 ');
 
 const UI_ENABLED = process.env.E2E_UI === '1';
-const UI_SOFT = process.env.E2E_UI_SOFT === '1';
+// #932：`E2E_UI_SOFT` 判定改用 lib 的 `uiSoft()`（唯一来源），本文件不再单独定义 `UI_SOFT`。
 
 const PW_CONTAINER = 'erix_station_playwright';
 const PW_MODULE = '/app/node_modules/playwright/index.mjs';
@@ -65,14 +67,9 @@ const SHOT_NARROW_HOST = path.join(os.tmpdir(), 'admin-nav-cols-e2e-narrow.png')
 
 // 浏览器跑在容器里 ⇒ 它自己解析不到入口域名，用 `--host-resolver-rules` 把域名映射到宿主。
 // 只覆盖容器内解析，不动宿主 hosts、不写文件。坐标可用 `E2E_HOST_MAP` 覆盖：`host=ip,host=ip`。
-const HOST_MAP = (() => {
-  const raw = process.env.E2E_HOST_MAP || 'admin.fde.erix.vip=127.0.0.1,station.fde.erix.vip=127.0.0.1';
-  return raw.split(',').map((s) => s.trim()).filter(Boolean).map((pair) => {
-    const i = pair.indexOf('=');
-    return i < 0 ? null : { host: pair.slice(0, i).trim(), ip: pair.slice(i + 1).trim() };
-  }).filter(Boolean);
-})();
-const HOST_RESOLVER_RULES = HOST_MAP.map((h) => `MAP ${h.host} ${h.ip}`).join(',');
+// #932：解析与拼接统一到 lib 的 hostResolverRules()——读 E2E_RESOLVE（旧名 E2E_HOST_MAP 兼容一世代），
+// 两者皆无时用与现有脚本一致的缺省串；多条规则逗号连接（chromium 实测要求）。HOST_MAP/规则串同源。
+const { entries: HOST_MAP, rules: HOST_RESOLVER_RULES } = hostResolverRules();
 
 const WIDE_VIEWPORT = { width: 1440, height: 900 };
 const NARROW_WIDTH = 820;
@@ -134,10 +131,7 @@ function containerRunning(name) {
 
 // 只有显式 `E2E_UI_SOFT=1` 才允许降级成 skip，且**只在探测阶段**（还没碰过页面）；
 // 进了 run 阶段（已进容器）一律不降级，免得把产品回归伪装成 skip。
-function shouldSoftSkip({ soft, phase }) {
-  if (!soft) return false;
-  return phase === 'probe';
-}
+// #932：本文件旧有一份重复的 shouldSoftSkip（缺 message 参数、不分类），已删；唯一实现在 lib/e2e-ui-soft.mjs（顶部 import）。
 
 /** 口令只从本机凭据目录读；绝不打印内容，只读返回。返回 null = 没找到文件。 */
 function readPassword() {
@@ -583,7 +577,8 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
     // 点名之后的预检缺口（缺 docker / 容器没跑 / 容器里没 playwright / 缺口令）：
     // 只有显式逃生门 E2E_UI_SOFT=1 才允许降级 skip，其余一律判红。
     if (probe.reasons.ui) {
-      if (UI_SOFT) {
+      // #932：环境探测阶段的缺项——先分类（phase:'probe'），soft 才降级；其余判红。
+      if (shouldSoftSkip({ soft: uiSoft(), phase: 'probe', message: probe.reasons.ui })) {
         t.diagnostic(`E2E_UI_SOFT=1 ⇒ 按环境形状 skip：${probe.reasons.ui}`);
         t.skip();
         return;
@@ -599,7 +594,7 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
     const reason = probeUi();
     if (reason) {
       probe.reasons.ui = reason;
-      if (shouldSoftSkip({ soft: UI_SOFT, phase: 'probe', message: reason })) {
+      if (shouldSoftSkip({ soft: uiSoft(), phase: 'probe', message: reason })) {
         t.diagnostic(`E2E_UI_SOFT=1 ⇒ 探测缺项按 skip 降级：${reason}`);
         t.skip();
         return;
@@ -639,7 +634,8 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         out = dockerRun(['exec', PW_CONTAINER, 'node', scriptIn, cfgIn], { timeout: 300_000 });
       } catch (err) {
         const detail = String((err && err.stderr) || (err && err.message) || err).split('\n').slice(-6).join(' / ');
-        if (!UI_SOFT) {
+        // #932：run 阶段（已进容器）不降级 ⇒ shouldSoftSkip(phase:'run') 恒 false ⇒ 下面 assert.fail 必达。
+        if (!shouldSoftSkip({ soft: uiSoft(), phase: 'run', message: detail })) {
           assert.fail(`E2E_UI=1 点名要跑，浏览器脚本在容器里跑挂了（run 阶段，E2E_UI_SOFT 也不降级）：${detail}`);
         }
         t.diagnostic(`E2E_UI_SOFT=1 ⇒ 容器内执行失败按 skip 降级：${detail}`);
@@ -671,12 +667,14 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         const stillOnLogin = !!(rep.boot && (rep.boot.onLoginPage || /\/login/.test(String(rep.boot.hash))));
         const oldImage = !!rep.boot && !stillOnLogin
           && rep.boot.hasSidebar === false && rep.boot.hasUserTable === false;
-        if (UI_SOFT) {
-          t.diagnostic(`E2E_UI_SOFT=1 ⇒ 按环境形状 skip：${rep.fatal}`);
-          t.skip();
-          return;
-        }
         if (entryUnreachable) {
+          // #932：run 阶段 net:: 先分类再决定——走 phase:'run' ⇒ shouldSoftSkip 恒 false ⇒ 判红；
+          //（旧写法把 `if (UI_SOFT)` 排在分类之前，soft=true 会把运行阶段 net:: 静默降级成 skip=假绿）。
+          if (shouldSoftSkip({ soft: uiSoft(), phase: 'run', message: rep.fatal })) {
+            t.diagnostic(`E2E_UI_SOFT=1 ⇒ 按环境形状 skip：${rep.fatal}`);
+            t.skip();
+            return;
+          }
           assert.fail(`E2E_UI=1 点名要跑：容器内连入口 ${BASE} 都不通（#878：run 阶段 net:: 一律判红，不能降级 skip）：${rep.fatal}`);
         }
         if (stillOnLogin) {
