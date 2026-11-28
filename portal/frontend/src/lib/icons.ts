@@ -71,6 +71,8 @@ export const ICON_PATHS: Record<string, string[]> = {
   pencil: ['M12 20h9', 'M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z'],
   // issue #817 步 5：操作列改纯图标后，「启用 / 停用」上**两张不同图标**（颜色不是唯一信号）：
   // Lucide `pause`（ISC）= 停用（两条竖线，polygon/rect 改写成 line 形式）；Lucide `play`（ISC）= 启用（三角，polygon 改写成闭合 path）。
-  pause: ['M9 4v16', 'M15 4v16'],
+  // 几何照 Lucide 原形：pause 是两根**空心矩形条**（不是细线），play 是闭合三角描边。
+  // AppIcon 用 fill="none" + stroke ⇒ 矩形的 `z` 闭合会画成描边方框（与 Lucide 一致），不是实心块。
+  pause: ['M6 4h4v16H6z', 'M14 4h4v16H14z'],
   play: ['M6 3l14 9-14 9z'],
 };

@@ -789,12 +789,20 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       // 危险方向（停用）给红、启用方向中性；颜色非唯一信号（图标 + aria/title 已由上面钉）。**条件断言**：
       // 按动作方向判而非行数——dev 上有启用态用户时，每个「停用」toggle 必须带红；若哪天全是停用态，
       // 「停用 toggle」集合为空 ⇒ 不触发（不误红）。启用方向 toggle 不得带红。
-      const isRed = (b) => /(^|\s)(text-red-600|border-red-300)(\s|$)/.test(b.className || '');
+      const isRed = (b) => /(^|\s)(text-red-600|border-red-500)(\s|$)/.test(b.className || '');
       const toggles = byTest['toggle-user-status'] || [];
       const disableToggles = toggles.filter((b) => (b.ariaLabel || '').trim() === '停用');
       const enableToggles = toggles.filter((b) => (b.ariaLabel || '').trim() === '启用');
+      // ⚠ 空集不许通过（评审指出的假绿路径）：若活栈上全是停用态用户，「停用」集合为空时
+      // missRed 也是空数组 ⇒ deepEqual([], []) 照样绿，红色危险方向等于没验过。
+      // 这条要求活栈**至少有 1 个启用态用户**（dev 常态如此）；真没有就判红并说明怎么办，
+      // 而不是静默跳过——「验不了」和「验过了」不能同色。
+      assert.ok(disableToggles.length >= 1,
+        '活栈上没有任何「停用」方向的 toggle（整表都是停用态用户）⇒ 红色危险方向无法验证；'
+        + '请让 dev 上存在启用态用户，或显式改这条判据的口径（不许空集通过）。'
+        + `实测 toggle 总数=${toggles.length} aria-label 分布=${JSON.stringify(toggles.map((b) => b.ariaLabel))}`);
       const missRed = disableToggles.filter((b) => !isRed(b));
-      assert.deepEqual(missRed, [], `存在启用态用户时「停用」toggle 必须带红色类（text-red-600/border-red-300）：${JSON.stringify(missRed)}`);
+      assert.deepEqual(missRed, [], `「停用」toggle 必须带红色类（text-red-600/border-red-500）：${JSON.stringify(missRed)}`);
       const spuriousRed = enableToggles.filter((b) => isRed(b));
       assert.deepEqual(spuriousRed, [], `「启用」toggle（非破坏）不该带红色类：${JSON.stringify(spuriousRed)}`);
       assert.equal(tbl.bodyHasRawI18nKey, false, `整页残留裸 i18n key（形如 admin.tabs.xxx 原样出现），实测 ${JSON.stringify(tbl.bodyHasRawI18nKey)}`);

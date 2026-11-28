@@ -618,7 +618,7 @@ describe('issue #817：工位列四态一行 + 状态形状 + 动作图标 + 版
     expect(toggle.attributes('title'), 'title 承载危险动作全词').toBe('停用');
     const toggleCls = toggle.attributes('class') ?? '';
     expect(toggleCls, '停用（危险方向）必须带红色文字类').toContain('text-red-600');
-    expect(toggleCls, '停用（危险方向）必须带红色边框类').toContain('border-red-300');
+    expect(toggleCls, '停用（危险方向）必须带红色边框类（red-500：red-300 约 2:1 作边界太淡）').toContain('border-red-500');
     // 停用态 ⇒ 启用（非破坏）⇒ play 图标 + 中性（不带红）。
     const offRow = w.findAll('[data-test="user-row"]')[2];
     const offToggle = offRow.find('[data-test="toggle-user-status"]');
@@ -628,7 +628,7 @@ describe('issue #817：工位列四态一行 + 状态形状 + 动作图标 + 版
     expect(offToggle.attributes('aria-label')).toBe('启用');
     const offCls = offToggle.attributes('class') ?? '';
     expect(offCls, '启用（非破坏）不得带红色文字类').not.toContain('text-red-600');
-    expect(offCls, '启用（非破坏）不得带红色边框类').not.toContain('border-red-300');
+    expect(offCls, '启用（非破坏）不得带红色边框类').not.toContain('border-red-500');
     // 没有工位的人没有「会话/文件」入口（#727 的既有口径，别在图标化时顺手丢掉）
     expect(w.findAll('[data-test="user-row"]')[1].find('[data-test="seat-content-link"]').exists()).toBe(false);
   });
