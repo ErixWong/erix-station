@@ -4169,7 +4169,7 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 （迁移 `0046`，key-value，`value jsonb`），**优先级 `DB > env > 默认`**；底座（读侧/写侧/覆盖层、
 六条硬口径）见 `portal/src/runtime-settings.js` 头注释与 issue #677 P1。
 
-**已迁的旋钮（十五格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
+**已迁的旋钮（二十二格）**（其余旋钮归 P3 逐批迁；本表行集合与 registry 键集合一致，由判据 RS-48 钉住）：
 
 | key | env 兜底位 | 值域 | `applyMode` | 生效点 |
 | --- | --- | --- | --- | --- |
@@ -4188,16 +4188,22 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 | `delegate.max` | `ERIX_DELEGATE_MAX` | 整数 `1..8` 路（默认 `2`；`0` 非法：关掉 delegate 是 `ERIX_DELEGATE_ENABLED` 的活） | `restart` | **每建一个 FDE 容器**时现读（`provisioner.js#buildContainerConfig` 把它写进容器 env，容器内的 runner 读它）⇒ 只影响之后新建的容器，**已在跑的容器要重建才生效** |
 | `delegate.child_rounds` | `ERIX_DELEGATE_CHILD_ROUNDS` | 整数 `1..32` 轮（默认 `8`；`0` 非法：子 run 派出去就是立刻结束） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
 | `delegate.child_timeout_ms` | `ERIX_DELEGATE_CHILD_TIMEOUT_MS` | 整数 `1000..240000` 毫秒（默认 `240000`；**上界必须 < agentd 的 300s watchdog**：子 run 执行期父 worker 靠子的心跳刷 `lastIpcAt`，预算超过 watchdog 而心跳没来 ⇒ 父 worker 被 SIGKILL 并**重放整条命令**，#288） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
+| `run.max_rounds` | `ERIX_MAX_ROUNDS` | 整数 `1..200` 轮（默认 `16`；上界 200 与 `runner/lib/config.js#parseMaxRounds` 同源） | `restart` | 同上：建容器时现读并注入容器 env（`provisioner.js#buildContainerConfig`）⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
+| `shell.timeout_ms` | `ERIX_SHELL_TIMEOUT_MS` | 整数 `1000..3600000` 毫秒（默认 `60000`；与 `runner/lib/shell-tools.js` 的 `parseIntEnv` 同源） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
+| `shell.max_timeout_ms` | `ERIX_SHELL_MAX_TIMEOUT_MS` | 整数 `1000..3600000` 毫秒（默认 `600000`；单次调用的钳制上限，DEFAULT 自动钳 ≤ 此值；与 `runner/lib/shell-tools.js` 同源） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
+| `shell.output_max_bytes` | `ERIX_SHELL_OUTPUT_MAX_BYTES` | 整数 `1024..1048576` 字节（默认 `32768`；与 `runner/lib/shell-tools.js` 同源） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
+| `artifact.capture_budget_ms` | `ERIX_ARTIFACT_CAPTURE_BUDGET_MS` | 整数 `1000..3600000` 毫秒（默认 `60000`；runner 侧只要求正整数，区间上界由管理台闸） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
+| `mcp.config_timeout_ms` | `ERIX_MCP_CONFIG_TIMEOUT_MS` | 整数 `1000..600000` 毫秒（默认 `10000`；只影响容器内 agent 启动，不影响 portal 本体） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
+| `agentd.capacity` | `ERIX_AGENTD_CAPACITY` | 整数 `1..64` 路（默认 `2`；每路 = 一个完整 worker，上界 64 是管理台天花板，runner 侧不设区间） | `restart` | 同上：建容器时现读并注入容器 env ⇒ 只影响之后新建的 FDE 容器，已在跑的容器要重建才生效 |
 
-十五格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
+二十二格共用同一套机件（`parse`/`validate`/5s 缓存/在飞合并/写路径失效），差别只在「谁在什么时候读它」。
 
 后三格（#677 P3 第六批：三个循环的空闲退避上限）也是同一套机件，但是**三份独立实例**（各自一份
 缓存与在飞槽）：共用一份就是「保存开户那格的上限，把对账那一格的缓存一起抹掉」。现读位置是
 **每一拍决定 sleep 之前**，不是循环启动时算一次（后者就是快照：改完要重启才生效）。
 
 最后三格（#677 P3 第七批：delegate 子 run 的 `delegate.max` / `delegate.child_rounds` /
-`delegate.child_timeout_ms`）是**第一批 `applyMode: restart` 的**，也是本表里唯一三行「保存不等于已跑的
-容器变了」的：值不是 portal 进程读的，而是 **FDE 容器内的 worker** 读的，portal 只在 provision 容器
+`delegate.child_timeout_ms`）是**第一批 `applyMode: restart` 的**，也是本表里「保存不等于已跑的容器变了」那一类的头三行（第八批又加了 7 行同形，见下）：值不是 portal 进程读的，而是 **FDE 容器内的 worker** 读的，portal 只在 provision 容器
 那一刻把生效值写进容器 env（`provisioner.js#buildContainerConfig`）。所以：portal 侧**仍现读**
 （保存后下一个新容器就拿新值，不等 portal 重启），但已在跑的容器带着自己那份 env 继续跑，
 **要重建才生效**——管理台那三个格子的 hint 已明写这句（判据 RS-67/RS-68）。
@@ -4206,6 +4212,19 @@ DTO 的 `effectiveText` / `templateBytes` 仍用 `example`（那是给人看的�
 registry 这一层拒越界（写进去就是“管理台存了个容器不会用的数”），runner 那一层钳位**保留不动**
 （“容器 env 被人手改过 / 镜像比 portal 老”时的最后一道防线）。`ERIX_DELEGATE_ENABLED` 本批**故意
 不迁**：它的 env 语义是「未设/空 = 开、显式只认字符串 `1`」，与这套「严格正整数 + 区间」不同形（另片处理）。
+
+再往下七格（#677 第八批：FDE 容器 env 旋钮 `run.max_rounds` / `shell.timeout_ms` / `shell.max_timeout_ms` /
+`shell.output_max_bytes` / `artifact.capture_budget_ms` / `mcp.config_timeout_ms` / `agentd.capacity`）是
+**第八批 `applyMode: restart` 的**，形状与 delegate 三格同：值由 **FDE 容器内的 runner** 读，portal 只在 provision
+那一刻把生效值（`DB > env > 默认` 三档现读，`provisioner.js#buildContainerConfig`）写进容器 env。搬进来后
+ compose 里那 7 行 `ERIX_*` **降为兜底位**：DB 有值 ⇒ 用 DB，DB 无值 ⇒ 用 env，都没有 ⇒ 代码默认（三档读取各有单测，
+`portal/test/runtime-settings-fde-env.test.js`）。⚠ 这 7 根的读取点全在**模块加载 / 常驻进程启动快照**
+（`agentd.js:60`、`lib/artifacts.js:27`、`worker.js:134`、`lib/shell-tools.js:20`），改 DB 后**必须重启 / 重建 FDE 容器**
+才生效——所以本批把工单原分类的 A 组（`run.max_rounds`）也一并标 `restart`：它的生效时机由「注入形状 = 建容器时
+写进 env」决定，不因它是 A 组而能每 run 现读（诚实标注，不假装热）。值域逐条抄自 runner 已有解析（`config.js#parseMaxRounds`、
+`shell-tools.js` 的 `parseIntEnv` 等，RS-64/RS-65 钉住同源）；runner 侧越界钳位保留不动（最后一道防线）。
+`deploy/fde-proxy/server.js` 的 `ENV_KEY_ALLOW` 那 10 个 env 键**一字未动**。
+
 
 **第六批那三个旋钮的值域也不是新发明的**，逐条抄自循环侧已有的钳位逻辑：开户 / 销号的旧路径是
 `envInt(name, 30000, { max: MAX_BACKOFF_MS_SAFE })`（上界 60s 是 Node timer 的 32 位语义边界，
@@ -4404,6 +4423,17 @@ registry 默认 `60`**，并留**一次热读最多一条**点名 warn（`hotRea
 三块是同一类东西（「改一行不必重建镜像」的平台配置），差别只在**存储形状**与**生效时机**：
 §4.15 上传上限是单行表、每次上传现读；§4.19 提示词是单行三列、每次物化现读；本节的
 `runtime_settings` 是 key-value（P3 要一批批加旋钮，多列每批都要改 DDL，所以选 key-value）。
+
+#### FDE env 旋钮 scoped 端点（`GET/PUT /api/admin/fde-env-settings`）
+
+只读写上面这 10 根（delegate 三格 + 本批七格）的窄接口，与通用 §4.21 同机制、同审计，只多一道白名单闸：
+
+| 端点 | 方法 | 行为 | 错误 |
+| --- | --- | --- | --- |
+| `/api/admin/fde-env-settings` | `GET` | 列出这 10 根的 DTO（同 §4.21 DTO 形状，含 `value`/`source`/`applyMode`），其余 registry 旋钮不在本列表 | 非管理员 `403` |
+| `/api/admin/fde-env-settings/{key}` | `PUT` | `{value}` 写入该键（走 `updateRuntimeSettingAdmin`：同一事务 upsert + 审计） | key 不在 10 根白名单 ⇒ `400` `details.field="key"`；值越界/非 JSON 标量 ⇒ `400` `details.field="value"`（零写库）；key 形状不匹配 ⇒ `404`；非 `PUT`/`GET` ⇒ `405` |
+
+白名单 = `runtime-settings.js#FDE_ENV_SETTING_KEYS`（10 根），**不接受任意键**；判据 `portal/test/runtime-settings-fde-env.test.js`（白名单外键 400、越界值 400、零写库）。
 
 ### 4.22 管理台：FDE 会话与文件（只读，issue #727）
 
