@@ -419,6 +419,7 @@ try {
     const seatCells = [];
     const statusGlyphs = [];
     const actionBtns = [];
+    const actionBtnRightEdges = [];
     for (const row of rows) {
       const seat = row.querySelector('[data-test="seat-cell"]');
       const seatSpan = seat ? seat.querySelector('span') : null;
@@ -435,6 +436,10 @@ try {
       const edit = row.querySelector('[data-test="edit-user"]');
       if (link) actionBtns.push({ test: 'seat-content-link', svgCount: link.querySelectorAll('svg').length, text: (link.textContent || '').trim() });
       if (edit) actionBtns.push({ test: 'edit-user', svgCount: edit.querySelectorAll('svg').length, text: (edit.textContent || '').trim() });
+      // #923：直接量**按钮**的右边界（量最后一个表头格不够：格子装得下不代表按钮没被内部裁切样式遮住）。
+      for (const btn of row.querySelectorAll('[data-test="seat-content-link"], [data-test="edit-user"]')) {
+        actionBtnRightEdges.push(Math.round(btn.getBoundingClientRect().right));
+      }
     }
     const scroll = document.querySelector('[data-test="user-table-scroll"]');
     const bodyText = document.body.innerText || '';
@@ -452,6 +457,8 @@ try {
       scrollScrollWidth: scroll ? scroll.scrollWidth : -1,
       scrollClientWidth: scroll ? scroll.clientWidth : -1,
       actionsRightEdge: (scroll && ths.length) ? Math.round(ths[ths.length - 1].getBoundingClientRect().right) : -1,
+      // 按钮自身的右边界（取全表最大）：真正要保证「点得到」的是按钮，不是表头格。
+      actionBtnRightEdge: actionBtnRightEdges.length ? Math.max(...actionBtnRightEdges) : -1,
       scrollRightEdge: scroll ? Math.round(scroll.getBoundingClientRect().right) : -1,
       bodyHasRawI18nKey: /admin\.[A-Za-z]+\.[A-Za-z]+/.test(bodyText),
       bodyHasLegacyDot: bodyText.includes('●'),
@@ -738,6 +745,10 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         `宽视口(1440)「操作」列右边界超出滚动容器（列被切掉，必须横滚才点得到按钮）：`
         + `actionsRightEdge=${tbl.actionsRightEdge} > scrollRightEdge=${tbl.scrollRightEdge} +1`
         + `（内容区上限与表格 min-width 打架（#923）；scrollScrollWidth=${tbl.scrollScrollWidth} scrollClientWidth=${tbl.scrollClientWidth}）`);
+      // 真正要保证的是「按钮点得到」：直接量按钮自身的右边界（表头格装得下 ≠ 按钮没被内部裁切遮住）。
+      assert.ok(tbl.actionBtnRightEdge > 0 && tbl.actionBtnRightEdge <= tbl.scrollRightEdge + 1,
+        `宽视口(1440)动作按钮被容器切掉（量的是按钮自身右边界）：`
+        + `actionBtnRightEdge=${tbl.actionBtnRightEdge} > scrollRightEdge=${tbl.scrollRightEdge} +1`);
 
       // 工位列：每行一个状态，可见文本不含保留中、非空、长度有上界；hover(title) 必须非空。
       const seatBad = (tbl.seatCells || []).filter((c) => !c.text || c.text.includes('workspace 保留中') || c.len > 30);
@@ -790,6 +801,10 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         `表格外层容器应是可横滚（overflow-x auto/scroll），实测 ${JSON.stringify(nar.scrollOverflowX)}（hidden 也能让 scrollWidth>clientWidth 成立，故先钉 CSS）`);
       assert.ok(nar.scrollScrollWidth > nar.scrollClientWidth,
         `窄视口表格外层滚动容器应自己可横滚（scrollWidth>clientWidth）：scroll=${JSON.stringify({ sw: nar.scrollScrollWidth, cw: nar.scrollClientWidth, ox: nar.scrollOverflowX })}`);
+      // 窄屏的横滚要留在**表格容器**里：页面本身不许横溢（否则整页左右拖，顶栏与侧栏一起跑）。
+      // 这条之前只在 REPORT 里收了数、没断言（评审指出）：页面溢出而容器恰好仍可滚时，上面两条都会绿。
+      assert.ok(nar.docScrollWidth <= nar.docClientWidth + 1,
+        `窄视口(820)页面本身不应横向溢出（滚的应该是表格容器）：scrollWidth=${nar.docScrollWidth} > clientWidth=${nar.docClientWidth} +1`);
 
       // ---- 断言：通用 ----
       assert.deepEqual(rep.pageErrors, [], `有 pageerror：${JSON.stringify(rep.pageErrors.slice(0, 3))}`);
@@ -842,7 +857,7 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         tableScroll: { sw: nar.scrollScrollWidth, cw: nar.scrollClientWidth, ox: nar.scrollOverflowX },
         // #923：宽视口（1440）不横滚 + 操作列完整可见的实测值。
         wideTableScroll: { sw: tbl.scrollScrollWidth, cw: tbl.scrollClientWidth },
-        wideActionsFit: { actionsRightEdge: tbl.actionsRightEdge, scrollRightEdge: tbl.scrollRightEdge },
+        wideActionsFit: { actionsRightEdge: tbl.actionsRightEdge, actionBtnRightEdge: tbl.actionBtnRightEdge, scrollRightEdge: tbl.scrollRightEdge },
         pageErrors: rep.pageErrors.length,
         consoleErrorsReal: realConsole,
         rawI18nKey: tbl.bodyHasRawI18nKey,
