@@ -632,7 +632,7 @@ try {
   browser = await chromium.launch({ channel: 'chromium', args: launchArgs });
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 1200 }, locale: 'zh-CN', ignoreHTTPSErrors: true });
   // 起点语言必须由**载体**钉住，不能靠浏览器的协商层：解析优先级是 用户选择标记 > 账号值 > Accept-Language
-  // （#828 / #902）。账号里存着「默认语言」（`users.locale`），它排在协商层之前 ⇒ 只设 newContext 的
+  // （#828 / #902）。账号里存着「默认语言」（users.locale），它排在协商层之前 ⇒ 只设 newContext 的
   // locale 就会被账号存的值盖掉，整条 zh 腿恒拿英文文案（账号存的是哪种语言**不写死在这里**，它可变）。
   // （正常形态下徽标回的是**月度额度**文案，形如「mo 金额/额度」）。开局铺这两枚（同一个 url ⇒
   // 后面点 English 时由应用自己改写。
