@@ -456,28 +456,20 @@ export async function getSession(
     `SELECT id, status FROM runs WHERE session_id = $1 AND status IN ${ACTIVE_RUN_STATES} ORDER BY queued_at DESC LIMIT 1`,
     [sessionId],
   );
-  // issue #283：工具耗时由**宿主自己**补——引擎官方投影的 `toolCalls[]` 不带时长（上游明说该形状
-  // 没有 duration），取数面只能是本站 `tool_calls`（数据由 M2 的 U3 tool_result UPDATE 回填）。
-  // 只取本批锚点涉及的 run（锚点分页窗口已是 run 的超集）；`duration_ms IS NOT NULL` ⇒ 旧数据
-  //（引擎当年就没发时长的那批）根本不参与 join ⇒ DTO 不出现 `durationMs` 键，不写 0。
-  const durationRunIds = [...new Set(msgs.rows
+  // issue #283/#303：旧的「宿主 `tool_calls.duration_ms` 回落」查询已随 #303 退役（时长只来自引擎
+  // 投影的 toolCalls[].durationMs），故这里不再取 `tool_calls`。下面 `anchorRunIds` 是本批锚点
+  // 涉及的 run 集（锚点分页窗口已是 run 的超集），现在的**唯一**消费者是下面的 textualized 诊断查询。
+  const anchorRunIds = [...new Set(msgs.rows
     .map((row) => row.run_id)
     .filter((runId) => typeof runId === 'string' && runId !== ''))];
-  const toolCallDurations = durationRunIds.length > 0
-    ? await pool.query(
-      `SELECT run_id, call_id, duration_ms
-         FROM tool_calls WHERE run_id = ANY($1::uuid[]) AND duration_ms IS NOT NULL`,
-      [durationRunIds],
-    )
-    : { rows: [] };
   // issue #243：这一批锚点涉及的 run 里，哪些终态合成了 `textualized_tool_call` 诊断事件（终局正文是被
-  // 文本化的工具调用）。只取本批 run（同 toolCallDurations 的取数面）；命中与否只看有无这一行（不取 payload）。
+  // 文本化的工具调用）。只取本批 run；命中与否只看有无这一行（不取 payload）。
   // 诊断事件由 portal 在终态事务内合成（`internal.js#finishRun`）⇒ 刷新后仍在（已进 `HISTORY_EVENT_TYPES`）。
-  const textualizedEventRows = durationRunIds.length > 0
+  const textualizedEventRows = anchorRunIds.length > 0
     ? await pool.query(
       `SELECT DISTINCT run_id FROM run_events
          WHERE run_id = ANY($1::uuid[]) AND type = 'textualized_tool_call'`,
-      [durationRunIds],
+      [anchorRunIds],
     )
     : { rows: [] };
   const textualizedRunIds = new Set(
@@ -492,7 +484,6 @@ export async function getSession(
     anchors: msgs.rows,
     userAnchors: userAnchors.rows,
     transcriptRows: transcript.rows,
-    toolCallRows: toolCallDurations.rows,
     // issue #243：带 `textualized_tool_call` 诊断的 run 集合 ⇒ 投影给对应助手气泡挂中性状态标记。
     textualizedRunIds,
     // #451：**同一趟扫描**的产物既喂投影（折叠摘要/折叠替代物），又喂下面的

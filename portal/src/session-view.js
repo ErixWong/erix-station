@@ -382,42 +382,46 @@ function assistantTurnFields(turns) {
 }
 
 /**
- * issue #283 / #299：把工具调用时长补进上游投影的 `toolCalls[]`（**投影优先、宿主回落**）。
+ * issue #283 / #299 / #303：把引擎投影的工具调用时长规范化进 DTO 的 `toolCalls[]`。
  *
- * ⚙ **两路来源**（erix-agent 0.20.0 / 上游 #284 之后口径变了，别再只认宿主那一份）：
- *   1. **引擎投影自己带的 `toolCalls[].durationMs`**（0.20.0 起 `DisplayTurn.toolCalls[]` 新增
- *      `toolCallKey` 与 `durationMs`，`src/display/projection.js:167-181`）。⚠ T1 之前落盘的记录上
- *      两者是**直接缺省、不被合成**的（不是 `undefined` 占位、更不是 0）。
- *   2. **宿主自有的 `tool_calls.duration_ms`**（M2 由 U3 的 tool_result UPDATE 回填），按
- *      `(run_id, call_id)` join；`call_id` = 事件里的 `tool_call_id` = 投影里的 `toolCalls[].id`
- *      （provider 的 tool_use id）。
+ * ⚙ **单一来源 = 引擎投影自己带的 `toolCalls[].durationMs`**（erix-agent 0.20.0 起 `DisplayTurn.toolCalls[]`
+ *    带 `toolCallKey` 与 `durationMs`；投影**只在 `erix.durationMs` 是有限数时**才带 `durationMs`，
+ *    **缺失 = 未知、不是 0**）。宿主不再为「读老记录」补值。
  *
- * 优先级（#299 定稿）：**投影有值 ⇒ 用投影值**（单一真相在引擎那侧，且它与 `erix.durationMs` 同值）；
- * 投影缺省 ⇒ 回落宿主值（老记录唯一的时长来源，别让它退化成「无时长」）；两者都缺 ⇒ **键不存在**。
- * ⚠ 都缺时**绝不写 0**：0.20.0 把「缺失」定为「不知道」（guide §2：写 `?? 0` = 把未知渲染成「瞬间完成」）。
+ * #303 清账（erix-agent 升到 0.34.0 这个 minor）：旧的「投影缺省 ⇒ 回落宿主 `tool_calls.duration_ms`」
+ * 那条支路已删除。引擎侧旧键 `duration` 已退役（契约映射把旧键指向 erix.durationMs、orchestrator 落盘前
+ * `delete` 旧键、run-snapshot-executor 注释明写旧键已退役 ⇒ 新记录上时长只此一份）。 ⇒ 投影不带
+ * `durationMs` 就是「未知」：DTO 里**不出现这个键**，**禁止写 0**（guide §2：缺失 = 不知道，
+ * 写 `?? 0` 会把未知渲染成「瞬间完成」）。
+ *
+ * ⚠ 跨实例风险：删的是「读旧数据」的兼容——存量比本次发布老的实例升级后，那些老对话的工具耗时会
+ *   渲染成「未知」（前端现有 `dur` 为空时不显示，**不是报错**）。存量核对（可复跑，勿把数字当结论）：
+ *     `SELECT count(*) FROM transcript_rounds
+ *        WHERE record::jsonb -> 'toolResults' @> '[{}]'::jsonb
+ *          AND record::jsonb -> 'toolResults' ?? 'durationMs' IS DISTINCT FROM 'durationMs'`
+ *     ——形态：「有 toolResults 却整条没有任何 durationMs」的记录数（本机实测为 0）。
  *
  * 为什么仍在投影**之后**做：`assistantTurnFields()` 的职责是**逐字透传**上游形状、不向引擎字段里注
- * 水（#95 红线）；宿主补的那一笔在这里加，代码上两件事可分辨（用例钉住了）。产出是**新对象**，
- * 不改动引擎产出的那些对象。
+ * 水（#95 红线）；这里只做一件防御性收尾——若上游偶发把 `durationMs` 写成非有限数（NaN/字符串），
+ * 剥掉这个键而不是落 0。产出是**新对象**（剥键时），不就地改写引擎产出的对象。
  *
- * `durationMs` 是**宿主附加字段**（回落那条路），不属上游契约面：前端只在现有 `dur` 为空时用它。
- * 另：0.20.0 投影还发了 **`toolCallKey`**（引擎的耐久身份键）。本单**不接进前端卡片身份**——
+ * `durationMs` 现由**引擎投影直接带**（不再有宿主回落那条路）：前端只在现有 `dur` 为空时显示它。
+ * 另：投影还发了 **`toolCallKey`**（引擎的耐久身份键）。本单**不接进前端卡片身份**——
  * 我们 §8.5 的卡片身份用的是投影自造的 `key` + provider `tool_use.id`，接不接 `toolCallKey` 是
  * 单独的设计决定（#299 (d) 明确不在本单范围），故它只作为透传字段存在，不在此处参与匹配。
  *
- * @param {Array<Record<string, unknown>>} toolCalls 引擎投影产出的数组（不被修改）
- * @param {string} runId 当前助手锚点的 run
- * @param {Map<string, number>} durations key = `${runId}\u0000${call_id}`
+ * @param {Array<Record<string, unknown>>} toolCalls 引擎投影产出的数组（不被就地修改）
  */
-function attachToolCallDurations(toolCalls, runId, durations) {
+function attachToolCallDurations(toolCalls) {
   return toolCalls.map((call) => {
-    // ① 投影有值就用投影值（0.20.0 起的新路）；非法值（NaN/字符串）当「没有」处理，不落 0。
-    if (typeof call?.durationMs === 'number' && Number.isFinite(call.durationMs)) return call;
-    if (durations.size === 0) return call; // 库里一个时长都没有（旧数据/旧后端）⇒ 完全不碰原对象
-    const callId = typeof call?.id === 'string' ? call.id : null;
-    const ms = callId === null ? undefined : durations.get(`${runId}\u0000${callId}`);
-    // ② 命中宿主值 ⇒ 新对象添 `durationMs`；③ 没命中就**原对象返回**（不拷贝、不加伪键）。
-    return ms === undefined ? call : { ...call, durationMs: ms };
+    const ms = call?.durationMs;
+    // 键本就缺省 = 未知 ⇒ 原对象返回（不拷贝、不加伪键）。
+    if (ms === undefined) return call;
+    // 投影给的有限数（含 0：引擎把墙钟回拨夹到 0）= 时长 ⇒ 原样透传。
+    if (typeof ms === 'number' && Number.isFinite(ms)) return call;
+    // 非有限值（NaN/字符串等上游偶发脏形）⇒ 当「未知」处理：剥键、不落 0。
+    const { durationMs: _dropped, ...rest } = call;
+    return rest;
   });
 }
 
@@ -615,16 +619,15 @@ export function collectTranscriptFacts(transcriptRows) {
  * Synthetic rows (for example judge/wrapup injections) have no required transcript
  * text match yet, so their content intentionally remains sourced from the anchor.
  *
- * issue #283 可选入参 `toolCallRows`：宿主自有 `tool_calls` 里取出的
- * `{run_id, call_id, duration_ms}` 行（只带有时长的行）。不传/空数组 ⇒ DTO 的 `toolCalls[]`
- * 与以前逐字相同（向后兼容，文本取数面 `session-text.js` 就不传）。
+ * issue #283/#303：工具耗时回落（旧入参 `toolCallRows`）已退役——时长只来自引擎投影的
+ * `toolCalls[].durationMs`，故本函数不再接受宿主耗时的行入参（传了也不参与，见 #303 清账）。
  *
  * 可选入参 `facts`：调用方已经跑过 `collectTranscriptFacts(transcriptRows)` 时把它传进来，
  * 本函数就不再自己扫一遍（`GET /api/sessions/:id` 正是这样：同一次扫描既喂投影、又喂
  * `session.compaction` 聚合——成本红线的落点）。不传 ⇒ 行为与以前逐字相同。
  */
 export function projectSessionMessages({
-  sessionId, anchors, userAnchors, transcriptRows, toolCallRows, facts = null,
+  sessionId, anchors, userAnchors, transcriptRows, facts = null,
   // issue #243：终态带 `textualized_tool_call` 诊断的 run 集合（调用方按 run_id 提供，见 `sessions.js`）。
   // additive 可选参：缺省 / 非 Set ⇒ 空集 ⇒ DTO 不出现 `textualized_tool_call` 键（绝不透成 false）。
   textualizedRunIds = null,
@@ -673,17 +676,8 @@ export function projectSessionMessages({
   const runTurnKeys = new Map();
   // issue #189：折叠轮元数据（按 run 收集，写法同 runToolCalls/runTurnKeys；后到行覆盖前行，与 foldContent 同语义）。
   const runFolded = new Map();
-  // issue #283：宿主自有的工具耗时索引（数据源 = 本站 `tool_calls`，**不是**引擎投影）。
-  // key = `${run_id}\u0000${call_id}`；只收「非 null 且有限非负」的值——NULL（旧数据引擎当年就
-  // 没发）/ 脏值一律不入表 ⇒ 下游 join 不命中 ⇒ DTO 里不出现 `durationMs` 键（不写 0）。
-  const durations = new Map();
-  for (const row of Array.isArray(toolCallRows) ? toolCallRows : []) {
-    if (!row || typeof row.run_id !== 'string' || typeof row.call_id !== 'string') continue;
-    if (row.duration_ms === null || row.duration_ms === undefined) continue;
-    const ms = Number(row.duration_ms);
-    if (!Number.isFinite(ms) || ms < 0) continue;
-    durations.set(`${row.run_id}\u0000${row.call_id}`, ms);
-  }
+  // issue #283/#303：宿主自有的工具耗时回落已退役（#303）——时长只来自引擎投影的 toolCalls[].durationMs，
+  // 故不再从本站 `tool_calls` 拼 durations 索引（旧回退路径与对应的 `toolCallRows` 入参一并删除）。
   let currentRunId = null;
 
   // #390-A：折叠行的真摘要按**折叠行自己的 round** 记账（`recordForProjection` 恒把 round 列合成进
@@ -842,8 +836,9 @@ export function projectSessionMessages({
     // 不塞 undefined/null 占位。合成助手行（synthetic）正文来自锚点本身、不经 transcript 投影，故不透传。
     if (anchor.role === 'assistant' && anchor.synthetic !== true) {
       const toolCalls = runToolCalls.get(anchor.run_id);
-      // issue #283：时长由宿主在投影**之后** join（引擎投影不带），有值才添 `durationMs` 键。
-      if (toolCalls !== undefined) dto.toolCalls = attachToolCallDurations(toolCalls, anchor.run_id, durations);
+      // issue #283/#303：时长只来自引擎投影的 toolCalls[].durationMs（#303 已删宿主回落）；
+      // 这里只过一道防御性收尾（非有限的脏值剥键、不落 0），缺省即未知。
+      if (toolCalls !== undefined) dto.toolCalls = attachToolCallDurations(toolCalls);
       const reasoning = runReasoning.get(anchor.run_id);
       if (reasoning !== undefined) dto.reasoning = reasoning.join('\n');
       const blocks = runBlocks.get(anchor.run_id);
