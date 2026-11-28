@@ -24,6 +24,7 @@ import {
   detectTextualizedToolCall,
   parseToolCallMarkers,
   textualizedToolCallField,
+  textualizedToolCallFieldForRun,
   toolCallMarkersFromEnv,
 } from '../lib/final-text-toolcall.js';
 
@@ -315,6 +316,64 @@ test('#243 ⑥ additive 字段：命中才给两个键，没命中/空正文/显
     '未命中时这个键必须**缺席**，不是值为 false');
 });
 
+// ---- #895：引擎原生 finalTextShape 优先的三格（erix-agent 0.34.0 上游 #862）----
+// 三格各钉一条口径；「读 result.finalTextShape」那一步被删 ⇒ ① 红，「缺席写 false」被误写 ⇒ ③ 红（变异自证）。
+
+test('#895 ①：引擎 finalTextShape.textualizedToolCall===true ⇒ 判散文，即使 env marker 完全不匹配（引擎优先）', () => {
+  // 正文是一段 env 特征集根本嗅不到的文本；引擎却给出 {textualizedToolCall:true, marker}。
+  // ⇒ 只要判成散文，唯一来源就是引擎那条事实（env 启发式此时返回空对象）。
+  const finalText = '模型把调用写进了正文，没有任何尖括号标记';
+  const engineShape = { textualizedToolCall: true, marker: '<｜tool_call｜>' };
+  // env 配一条与正文/引擎都不搭的合法 marker ⇒ env 启发式不命中；引擎说了算。
+  assert.deepEqual(
+    textualizedToolCallFieldForRun({ finalText, finalTextShape: engineShape }, ['<totally-unrelated>']), {
+      textualized_tool_call: true,
+      textualized_tool_call_marker: '<｜tool_call｜>',
+    });
+  // env 完全没配（markers:[] = 老部署显式关闭）⇒ 同样判成散文：证明引擎优先**不受 env marker 影响**。
+  assert.deepEqual(
+    textualizedToolCallFieldForRun({ finalText, finalTextShape: engineShape }, []), {
+      textualized_tool_call: true,
+      textualized_tool_call_marker: '<｜tool_call｜>',
+    });
+  // 引擎 marker 长过上界 ⇒ 照 MED-2 只丢显示片段、布尔照传（仍判散文）。
+  const longMarker = 'x'.repeat(TEXTUALIZED_MARKER_MAX_CHARS + 1);
+  assert.deepEqual(
+    textualizedToolCallFieldForRun({ finalText, finalTextShape: { textualizedToolCall: true, marker: longMarker } }, []),
+    { textualized_tool_call: true });
+  // 对照：去掉引擎这条事实（只剩 env 不匹配的正文）⇒ 退回 env 启发式 ⇒ 不判（证明上面确由引擎生效）。
+  assert.deepEqual(textualizedToolCallFieldForRun({ finalText }, ['<totally-unrelated>']), {});
+});
+
+test('#895 ②：引擎不给 textualizedToolCall 键 ⇒ env-marker 启发式照旧生效（行为一字不变）', () => {
+  const finalText = '好正文 <｜tool▁end▁> 坏正文';
+  // (a) 整个 finalTextShape 缺席 ⇒ env 命中照旧（两键）。
+  assert.deepEqual(
+    textualizedToolCallFieldForRun({ finalText }, ['<｜tool▁end▁>']), {
+      textualized_tool_call: true,
+      textualized_tool_call_marker: '<｜tool▁end▁>',
+    });
+  // (b) finalTextShape 对象在、但没 textualizedToolCall 键 ⇒ 仍算「引擎没说」⇒ env 命中照旧。
+  assert.deepEqual(
+    textualizedToolCallFieldForRun({ finalText, finalTextShape: { unrelated: 'x' } }, ['<｜tool▁end▁>']), {
+      textualized_tool_call: true,
+      textualized_tool_call_marker: '<｜tool▁end▁>',
+    });
+});
+
+test('#895 ③：引擎给了 finalTextShape 但没 textualizedToolCall 键、且 env 不命中 ⇒ 不判且**不写 false**', () => {
+  const finalText = 'plain prose, nothing to see here';
+  for (const [label, result] of [
+    ['有 marker 无 textualizedToolCall', { finalText, finalTextShape: { marker: '<other>' } }],
+    ['空 finalTextShape 对象', { finalText, finalTextShape: {} }],
+    ['finalTextShape 整个缺席', { finalText }],
+  ]) {
+    const field = textualizedToolCallFieldForRun(result, ['<｜tool▁end▁>']);
+    assert.equal('textualized_tool_call' in field, false, `${label}：绝不写 textualized_tool_call 键（尤其绝不写 false）`);
+    assert.deepEqual(field, {}, `${label}：env 也不命中 ⇒ 空对象，一个字节都不多带`);
+  }
+});
+
 test('#243 ⑥ 事件名自解释且三处集合同名（跨端 import 不到，只能字符串对账）', () => {
   assert.equal(TEXTUALIZED_TOOL_CALL_EVENT_TYPE, 'textualized_tool_call');
   const root = path.join(RUNNER_DIR, '..');
@@ -341,8 +400,8 @@ test('#243 ⑥ worker / agentd 接线：成功信封带字段、失败信封不�
   const worker = readRunner('worker.js');
   const agentd = readRunner('agentd.js');
   // 成功信封里确实展开了这个函数（不是只在文件里 import 了没用）
-  assert.match(worker, /\.\.\.textualizedToolCallField\(result\.finalText, finalTextShapeConfig\.markers\)/,
-    'worker 的 RUN_FINISHED 成功信封必须展开 textualizedToolCallField（漏了就是"检测在跑但没人上报"）');
+  assert.match(worker, /\.\.\.textualizedToolCallFieldForRun\(result, finalTextShapeConfig\.markers\)/,
+    'worker 的 RUN_FINISHED 成功信封必须展开 textualizedToolCallFieldForRun（#895：引擎原生优先；漏了就是"检测在跑但没人上报"）');
   // 每 run 重新解析配置 + 告警必须落到 LOG 面（非法值不许静默）
   assert.match(worker, /finalTextShapeConfig = toolCallMarkersFromEnv\(process\.env\)/,
     '特征集必须每 run 解析一次（worker 进程会被复用给下一个 run）');

@@ -94,7 +94,7 @@ describe('termination reason 单一常量（issue #212）', () => {
     // ⇒ 下面九值断言一字未改（不放宽任何断言，§8.27 先例）。
     // ⚠ `RUN_RETRYABLE_ERROR_CODES` 里的 `checkpoint_failed` 在 0.33.0 已**不再产出**，但旧档案里
     // 已经写着这个码的 run 仍要判可重试 ⇒ 本单**值域不动**，只是注释说明了它为何留着。
-    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.33.0');
+    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.34.0');
     for (const legacy of LEGACY_TERMINATION_REASONS) expect(TERMINATION_REASON_SET.has(legacy)).toBe(false);
   });
 

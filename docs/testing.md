@@ -504,7 +504,7 @@ npm install "erix-agent@$ERIX_AGENT_VERSION"
 # 2) 验证导出面（只允许这三个入口）
 node --input-type=module -e \
   "import('erix-agent/contract-tests').then(m => { console.log(Object.keys(m).sort().join(',')); })"
-# 期望输出包含：transcriptStoreContract,modelConfigProviderContract（261128 现读 0.33.0：该子路径共导出 12 个契约，两个名字都在内 ⇒ 期望成立）
+# 期望输出包含：transcriptStoreContract,modelConfigProviderContract（261128 现读 0.33.0：该子路径共导出 12 个契约，两个名字都在内 ⇒ 期望成立；升 0.34.0（#895）后重量：**仍 12 个、名单一字未变**，两个名字仍在内；`erix-agent/tools/jail` 仍报 `ERR_PACKAGE_PATH_NOT_EXPORTED`）
 
 # 3) 深路径导入必须被拒（负向断言）
 node --input-type=module -e \

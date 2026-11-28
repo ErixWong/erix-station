@@ -150,6 +150,9 @@ const EXEMPT_FROM_TIMELINE = {
   tool_output_aggregate: 'stub 正文已在工具卡片里可见（重复），且每轮可多条 ⇒ 不刷行；账在 runner info LOG',
   // issue #499（erix-agent 0.32.0）：本站不传 nextUserTurn 钩子 ⇒ 结构上不产生（上面那段是完整版理由）。
   host_steer_injected: '本站不传 capabilities.hooks.nextUserTurn（引擎钩子不是函数就早退）⇒ 结构上不产生；不进回放也不下发',
+  // issue #895（erix-agent 0.34.0，上游 #862）：引擎新增两类事件，本站已有自己的用户面，不进时间线。
+  final_text_textualized_tool_call: '引擎侧文本化散文事件，与本站同一终态事务合成的 textualized_tool_call（#243/#895）是同一事实两种载体，时间线再加=说两遍；订得到不进回放不下发',
+  deliverable_blind: '引擎内部「散文文本不算交付物」判定信号（§2.2），无独立用户动作；用户面已由 textualized_tool_call 承担；订得到不进回放不下发',
 };
 
 /** 引擎真发、本站**故意不订**的事件（不进 `EVENT_TYPES`）。0.30.0 起**为空**。 */

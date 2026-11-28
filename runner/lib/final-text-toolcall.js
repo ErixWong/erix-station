@@ -258,3 +258,43 @@ export function textualizedToolCallField(finalText, markers = DEFAULT_TOOLCALL_M
   }
   return { textualized_tool_call: true, textualized_tool_call_marker: hit.marker };
 }
+
+// ---------------------------------------------------------------------------
+// issue #895（erix-agent 0.34.0 上游 #862）：**引擎原生事实优先**的接线。
+//
+// 0.34.0 起，模型把工具调用写成散文时，`result.finalTextShape` 会带
+// `{ textualizedToolCall: true, marker: "<命中的那条特征原文>" }`（**引擎已经替你判过了**）。
+// 本站以前只能自己拿 env marker 土法嗅 `finalText`——现在引擎说了算的场合先听引擎，
+// 引擎没说的场合才轮到自己的启发式。三条口径（照上游指南 §2.1 / §4 与本站 #442/#243 同族）：
+//   ① **引擎说「是」⇒ 直接判散文，优先于 env marker**：`=== true` 才认，且**不受
+//      `finalTextShapeConfig.markers` 影响**（env 里没配 / 配了不匹配都不改这个结论）。
+//      引擎的 marker 可能长过界 ⇒ 照 MED-2 只丢显示片段（仍带 `true`）。
+//   ② **键缺席 ⇒ 完全走现有 env 启发式，行为一字不变**（包括「env 没配 marker 就不判」）。
+//      `finalTextShape` 整个缺席、或对象在但没 `textualizedToolCall` 键、或该键非 `true`
+//      ⇒ 都归入「引擎没说」，交给 env 启发式。
+//   ③ **绝不因为「引擎说没有」就写 `false`**：缺席就是缺席（上游明写 absence 而非 `false`
+//      才是「未检测到」）。env 启发式不命中时本函数返回**空对象**，一个字节都不多带。
+// 线格式不变：产出仍是上面 `textualizedToolCallField` 那两键（snake_case、只在命中时给）。
+// ---------------------------------------------------------------------------
+
+/**
+ * RUN_FINISHED 的 additive 字段：**引擎原生 `finalTextShape` 优先，引擎没说才走 env 启发式**。
+ *
+ * @param {unknown} result 引擎终态 `result`（读 `result.finalTextShape` 与 `result.finalText`）
+ * @param {readonly string[]} [markers] env 解析出的特征集（只在「引擎没说」时生效；空数组 = 显式关闭）
+ * @returns {{ textualized_tool_call: true, textualized_tool_call_marker?: string }|{}}
+ *   命中（引擎说「是」或 env 启发式命中）⇒ 两键；未命中 ⇒ **空对象**（绝不写 `false`）。
+ */
+export function textualizedToolCallFieldForRun(result, markers = DEFAULT_TOOLCALL_MARKERS) {
+  const shape = result?.finalTextShape;
+  if (shape && shape.textualizedToolCall === true) {
+    // ① 引擎原生事实优先：不受 env marker 影响；marker 超上界 ⇒ 只丢片段、布尔照传（MED-2）。
+    const marker = shape.marker;
+    if (typeof marker === 'string' && marker !== '' && marker.length <= TEXTUALIZED_MARKER_MAX_CHARS) {
+      return { textualized_tool_call: true, textualized_tool_call_marker: marker };
+    }
+    return { textualized_tool_call: true };
+  }
+  // ②③ 键缺席 / 无 shape / 该键非 true ⇒ 引擎没说：完全交给既有 env 启发式（缺席⇒{}，不写 false）。
+  return textualizedToolCallField(result?.finalText, markers);
+}
