@@ -152,7 +152,17 @@ test('#890 调用点：postMessage 传绝对 projects/<name> ⇒ 落库 cwd 是�
     return { rows: [] };
   };
   const client = { async query(sql, params = []) { queries.push({ sql, params }); return dispatch(sql, params); }, release() {} };
-  const pool = { async connect() { return client; } };
+  const pool = {
+    // issue #905 之后，`postMessage` 在建 run 前会先走一次 pool 级的 LLM 上游预检（不经过 `connect()`）。
+    // 本单这格验的是 cwd 归一，不是预检本身 ⇒ 把「绑定已配好」回一行；**其余 SQL 不认就直接抛**，
+    // 免得将来出口又长出一条新查询被这里的兵底默默放行（同 #905 在其他文件里的写法）。
+    async query(sql) {
+      const s = String(sql).replace(/\s+/g, ' ').trim(); // 那条预检 SQL 是多行字面，不归一匹配不上
+      if (!/^SELECT 1 FROM fde_llm_bindings b\b/.test(s)) throw new Error(`unexpected pool SQL: ${sql}`);
+      return { rows: [{ '?column?': 1 }] };
+    },
+    async connect() { return client; },
+  };
 
   await postMessage(pool, {
     userId, sessionId, content: 'hi',
