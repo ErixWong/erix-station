@@ -63,3 +63,17 @@ test('夹具：含机器坐标的 md 被拦，且报出 file:line', () => {
   assert.ok(out.includes(`dirty.md:3: ${proxy}`), `输出未点名脏文件的 file:line，实得:\n${out}`);
   assert.doesNotMatch(out, /ok\.md:/, '干净文件不该被点名');
 });
+
+// ③ 宿主绝对路径（`/home/<宿主用户>`）必须被拦。它是**路径**不是账号名：
+//    仓库文档里出现它 = 别的机器上读的人照着做会找不到东西。
+//    ⚠ 夹具里同样用片段拼接，本文件在仓库里不留明文。
+test('夹具：宿主绝对路径被拦（坐标规则，不是账号名黑名单）', () => {
+  const hostHome = ['/home/', 'eric'].join('');
+  const { rc, out } = fixture((dir) => {
+    writeFileSync(path.join(dir, 'ok.md'), '# ok\n\n这里只有产品容器内的同名用户路径。\n');
+    writeFileSync(path.join(dir, 'dirty.md'), `# t\n\n配置在 ${hostHome}/projects/x 下。\n`);
+  });
+  assert.notEqual(rc, 0, '宿主绝对路径没被拦 = 坐标闸失效');
+  assert.ok(out.includes(`dirty.md:3: ${hostHome}`), `输出未点名宿主绝对路径，实得:\n${out}`);
+  assert.doesNotMatch(out, /ok\.md:/, '干净文件不该被点名');
+});

@@ -48,6 +48,10 @@ const DENY_INFRA = [
   j('nginx_', 'reverse_proxy'),
   j('gitea_', 'act_runner'),
   j('station-dev', '.password'),
+  // 宿主用户名的绝对路径（`/home/<宿主用户>`）。这不是账号名黑名单，是**路径前缀**：
+  // 仓库里出现它就是「这台机器上的绝对路径」，换个机器读的人照着做会找不到。
+  // 产品容器内的同名用户（`/home/erix`）**不拦**——那是镜像里的事实，不是本机坐标。
+  j('/home/', 'eric'),
 ];
 
 // EXEMPT：运维交接 / 历史取证账，允许保留**机器坐标**（DENY_INFRA）。
