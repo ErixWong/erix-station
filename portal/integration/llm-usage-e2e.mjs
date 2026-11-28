@@ -287,8 +287,8 @@ async function gather() {
 
   // ── 非管理员腿：**只依赖 FDE 自己的口令文件**。以前这段嵌在「管理员口令存在」的分支里，
   // 于是缺 admin 口令会连带把这条腿也 skip，与「两账号各读各的口令」不符。现在搬出来了。
-  // 登得上才测 403；只有**已知环境形状**（缺口令文件 / 口令未配 401 / 二因素 / 限流 / 连不上）
-  // 才留 skip，其余非 200 与「200 但没 cookie」都是产品故障 ⇒ 记进 nonadminFatal 判红。
+  // 登得上才测 403；只有**已知环境形状**（缺口令文件 / 口令未配 401 / 二因素 / 限流 / 邮件通道未配 /
+  // 强制改密受限会话 / 连不上）才留 skip，其余非 200 与「200 但没 cookie」都是产品故障 ⇒ nonadminFatal 判红。
   try {
     const fdePw = readPassword(FDE_PASSWORD_FILE_CANDIDATES);
     if (fdePw === null) {
@@ -300,33 +300,33 @@ async function gather() {
       probe.fdeLoginBody = fl.json;
       probe.fdeCookies = fl.cookies;
       const code = fl.json?.error?.code;
-      // 「已知环境形状」的码表**照 portal 登录流的真实返回值**列（`portal/src/http.js`：口令通 →
-      // `pending_token`；`email_code_required` / `totp_required` / `password_change_required`；口令不对
-      // 401 `invalid_credentials`；限流 429）。⚠ 别照抄截断过的日志——本单先写成 `invalid_cred` 没
-      // 命中，把「口令没配」这种正牌环境形状判成了产品故障（是变异自己抓到的）。
-      // 步出信号在 wire 上的**真实形状**（`portal/src/http.js` 登录流）：响应体的 `status` 取
-      // `email_code_required` / `totp_required` / `second_factor_choice`，同时带 `pending_token`；
-      // `password_change_required` 是**登录成功响应里的顶层布尔**，不是 `error.code`。口令不对是
-      // 401 `invalid_credentials`，限流是 429。⚠ 别照抄被截断的日志：本单先写成 `invalid_cred`，
-      // 真码是 `invalid_credentials`（变异自己抓到的）。
-      // 第二因素只认 wire 上那两个信号（响应体**顶层**的 `status` 与 `pending_token`）。
-      // `password_change_required` **不是**二因素：它出现在 `status: 'authenticated'` 的成功响应里，
-      // 与「有没有会话 cookie」无关 ⇒ 拿它当二因素，会把「200 却没 cookie」这个真缺陷洗成环境 skip。
+      // 判据（照 `portal/src/http.js` 登录流的真实 wire 形状；**别照抄被截断过的日志**——本单先写成
+      // `invalid_cred` 没命中，真码是 `invalid_credentials`，是变异自己抓到的）：
+      //  · 二因素/步出：响应体**顶层**的 `status ∈ {email_code_required, totp_required,
+      //    second_factor_choice}`，或带 `pending_token`（HTTP 都是 200）。
+      //  · 强制改密：`password_change_required` 是**成功响应的顶层布尔**，不是二因素、也不是错误码。
+      //    带着它的是**受限会话**：拿它去验授权隔离，收到的 403 可能只是「先去改密码」⇒ 那是假过，
+      //    所以这条腿不测，但**显式记名**（不静默混进「环境形状」那一大堆）。
+      //  · 环境形状必须**状态码与错误码成对**才认——只看错误码会把带这些码的 500/413 一起放走：
+      //      401（口令未配/轮换）与 429（限流）按状态码算；409 `email_not_registered`；
+      //      503 `email_channel_unavailable`；503 `email_send_failed`（502 那条属管理端测试邮件路由）。
+      //  · 其余一律判红：500、503 `kdf_busy`（容量/可用性信号，要测可用性就不该被洗绿）、
+      //    400 `validation_failed`、413（我们自己的请求形状错了），以及「200 却没有会话 cookie」。
       const stepUpStatuses = ['email_code_required', 'totp_required', 'second_factor_choice'];
       const secondFactor = !!fl.json?.pending_token || stepUpStatuses.includes(fl.json?.status);
-      // 环境形状**逐个点错误码**，不一概放行 5xx（这些都是「账号/邮件通道怎么配的」而非产品坏了）：
-      // `email_not_registered`（开了邮箱码但账号没录邮箱）、`email_channel_unavailable`（开了但 SMTP 没配）、
-      // `email_send_failed`（SMTP 发不出去，retryable）。**留在判红**的是 500、503 `kdf_busy`（容量/可用性
-      // 信号，要测可用性就不该被洗绿）与 400 `validation_failed` / 413（我们自己的请求形状错了）。
-      const envCodes = ['invalid_credentials', 'rate_limited', 'email_not_registered',
-        'email_channel_unavailable', 'email_send_failed'];
-      if (fl.status === 200 && fl.cookies.length > 0) {
-        // 登进去了 ⇒ H3 的 403 断言正常跑
+      const restricted = fl.json?.password_change_required === true;
+      const envShape = (st, cd) => st === 401 || st === 429
+        || (st === 409 && cd === 'email_not_registered')
+        || (st === 503 && (cd === 'email_channel_unavailable' || cd === 'email_send_failed'));
+      if (fl.status === 200 && fl.cookies.length > 0 && !restricted) {
+        // 登进去了（且不是受限会话）⇒ H3 的 403 断言正常跑
       } else {
         const why = `非管理员 ${FDE_LOGIN} 登录 HTTP ${fl.status}${code ? ` ${code}` : ''}`
           + `${secondFactor ? '（带 pending_token ⇒ 这个账号开了第二因素，本脚本只会口令直通）' : ''}`;
-        if (fl.status === 401 || fl.status === 429 || secondFactor || envCodes.includes(code)) {
-          probe.reasons.nonadmin = `${why} ⇒ 已知环境形状（口令未配 / 二因素 / 限流）`;
+        if (restricted) {
+          probe.reasons.nonadmin = `${why} ⇒ 账号处于**强制改密**态（受限会话）：拿它验授权隔离会假过 ⇒ 本腿不测`;
+        } else if (secondFactor || envShape(fl.status, code)) {
+          probe.reasons.nonadmin = `${why} ⇒ 已知环境形状（口令未配 / 二因素 / 限流 / 邮件通道未配）`;
         } else {
           probe.nonadminFatal = `${why} ⇒ **不在**已知环境形状清单里，按产品缺陷判红`;
         }
@@ -509,7 +509,11 @@ test(`H3 非管理员（${FDE_LOGIN}）打 key-usage ⇒ 403`,
       t.skip();
       return;
     }
+    // 只断状态码会被**别的原因**顶替（受限会话、路由改动都可能回 403）⇒ 再钉原因码：blanket 授权闸
+    // `requireAdmin` 发的是 `forbidden`。真机现验：非管理员会话打这个端点回 403 `forbidden`。
     assert.equal(res.status, 403, `非管理员 ${FDE_LOGIN} 打 key-usage 期望 403，得到 ${res.status}（body=${res.text.slice(0, 200)}）`);
+    assert.equal(res.json?.error?.code, 'forbidden', `403 的原因码应是 forbidden（blanket 授权闸 requireAdmin），`
+      + `实际=${JSON.stringify(res.json?.error?.code)}：别的码说明这格是别的原因（如受限会话），本腿的授权隔离没真验到`);
   });
 
 // ---------------------------------------------------------------------------
