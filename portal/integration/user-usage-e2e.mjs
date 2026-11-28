@@ -58,15 +58,16 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 // 坐标（全部 env 可覆盖；缺省值就是这台部署机的 dev 栈）
 // ---------------------------------------------------------------------------
 /** HTTP 腿用的 admin 入口（同一台活栈：admin 反代把静态页和 /api 都收在这里）。
- *  ⚠ **UI 腿不在这里**，见下面的 USER_BASE：admin 入口自 1c60afd9（用户面 HTTPS 8443 + host 闸按
+ *  ⚠ **UI 腿不在这里**，见下面的 USER_BASE：admin 入口自 1c60afd9（用户面独立 HTTPS 入口 + host 闸按
  *  hostname 判面）起**只放管理员进**，拿脚本账号（role=fde）在这儿登会被登录页红字挡住
  *  （"This account is not an administrator and cannot sign in here."），hash 停在 #/login。 */
-const BASE = (process.env.E2E_BASE || 'https://admin.fde.erix.vip:9443')
+const BASE = (process.env.E2E_BASE || process.env.E2E_UI_BASE || 'https://admin.fde.erix.vip:9443')
   .replace(/\/$/, '');
 /** 用户面入口（工作台在它的 / 路由上；脚本账号是 role=fde，只能从这里进）。
- *  env 名与缺省值同 admin-locale-e2e.mjs 的 USER_BASE（E2E_USER_BASE / 8443）；
- *  E2E_UI_BASE 仍作兼容覆盖（旧命令行传过它的人不必改）。 */
-const USER_BASE = (process.env.E2E_USER_BASE || process.env.E2E_UI_BASE || 'https://station.fde.erix.vip:8443')
+ *  env 名同 admin-locale-e2e.mjs（用户面只认 E2E_USER_BASE）。
+ *  ⚠ 别把 E2E_UI_BASE 也接到这里：本仓别的套件里 **E2E_UI_BASE 指的是管理台入口**，
+ *  拿它当用户站别名会把 FDE 浏览器送回只放管理员的门（正是本单修的那个错入口）。 */
+const USER_BASE = (process.env.E2E_USER_BASE || 'https://station.fde.erix.vip:8443')
   .replace(/\/$/, '');
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
 /** 用户面主角：一个有 active litellm binding 的 dev FDE（有 `fde_name`，能看到自己的账）。 */
@@ -743,11 +744,19 @@ test('U1 真浏览器进工作台（路由 /）：徽标紧跟 who/周期文案+
       // 导航/渲染挂了分两类：压根没到页面（DNS/TLS/入口挂了 = 环境）说 skip，到了页面却没跑通 = 产品红。
       if (rep.fatal && !rep.reachedLogin) {
         if (/net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(rep.fatal)) {
-          t.diagnostic(`SKIP (ui)：入口 ${BASE} 从容器里到不了：${rep.fatal}`);
+          t.diagnostic(`SKIP (ui)：用户站入口 ${USER_BASE} 从容器里到不了：${rep.fatal}`
+          + `（要能解析 ${new URL(USER_BASE).hostname}：E2E_RESOLVE 当前=${JSON.stringify(HOST_MAP)}）`);
           t.skip();
           return;
         }
-        assert.fail(`浏览器里没跑通：${rep.fatal}（登录态=${JSON.stringify(rep.login)}，pageerror=${rep.pageErrors.slice(0, 3).join(' / ')}）`);
+        assert.fail(`入口到得了却没跑到登录页：${rep.fatal}`);
+      }
+      // 到得了登录页**之后**的 fatal 一律判红。旧写法把 assert.fail 关在 `!reachedLogin` 那一支里，
+      // 于是登录后才出的 fatal（工作台路由没匹配上、渲染挂了）会一路走到徽标存在性判断，最后以 skip
+      // 收场——这条腿因此可以在页面全空的情况下次次 rc 0（本单开局就是这么藏了三周）。
+      if (rep.fatal) {
+        assert.fail(`已到达登录页却没跑通（登录后失败不退化成 skip）：${rep.fatal}`
+          + `（登录态=${JSON.stringify(rep.login)}，pageerror=${String((rep.pageErrors || []).slice(0, 2).join(' / '))}）`);
       }
       assert.match(String(rep.login.hash || ''), /#\/(?!login)/, `登录后没离开 /login，hash=${JSON.stringify(rep.login.hash)}`);
       // 采集前置：hash 必须真的是工作台路由 `/`。同文档哈希跳转不会清空旧 DOM，光等 [data-test="who"]
@@ -788,8 +797,8 @@ test('U1 真浏览器进工作台（路由 /）：徽标紧跟 who/周期文案+
       const zhWhoMid = zh.whoTop + zh.whoH / 2;
       assert.ok(Math.abs(zhBadgeMid - zhWhoMid) < 2,
         `徽标与 who 不在同一行：垂直中心 ${zhBadgeMid.toFixed(1)} vs ${zhWhoMid.toFixed(1)}（top ${zh.badgeTop}/${zh.whoTop}、高 ${zh.badgeH}/${zh.whoH}、header 高=${JSON.stringify(zh.headerHeight)}）`);
-      assert.ok(Number.isFinite(zh.headerHeight) && zh.headerHeight < 60,
-        `顶栏高度 ${JSON.stringify(zh.headerHeight)}px ≥ 60 ⇒ 掉成了两行`);
+      assert.ok(Number.isFinite(zh.headerHeight) && zh.headerHeight > 0 && zh.headerHeight < 60,
+        `顶栏高度 ${JSON.stringify(zh.headerHeight)}px 不在 (0, 60) 内 ⇒ 要么没渲染（0/负）要么掉成了两行`);
       assert.ok(Number.isFinite(zh.badgeLeft) && Number.isFinite(zh.whoRight)
         && zh.badgeLeft >= zh.whoRight - 1 && zh.badgeLeft - zh.whoRight <= 24,
         `徽标没紧跟在 who 右边（who 右边缘=${JSON.stringify(zh.whoRight)}，徽标左边缘=${JSON.stringify(zh.badgeLeft)}）`);

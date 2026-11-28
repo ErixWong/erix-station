@@ -588,8 +588,11 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
       const hc = rep.page.headerCells;
       const usageIdx = hc.indexOf(HEADER_EXPECT);
       assert.ok(usageIdx >= 0, `表头里没有「${HEADER_EXPECT}」列（locale=${UI_LOCALE}，实得=${JSON.stringify(hc)}）`);
-      const dup = hc.filter((h) => h === HEADER_EXPECT).length;
-      assert.equal(dup, 1, `「${HEADER_EXPECT}」在表头里出现 ${dup} 次（重复列 = 红，实得=${JSON.stringify(hc)}）`);
+      // 唯一性要**两种语言的标题一起数**：只数当前语言那份的话，「一列中文标题 + 一列英文标题」这种
+      // 混语言重复列会让当前语言的计数恰好等于 1，重复列照样溜过去（功能探测那一步两种标题都认）。
+      const OTHER_HEADER = UI_LOCALE === 'en' ? '周期 / 用量' : 'Period / usage';
+      const dup = hc.filter((h) => h === HEADER_EXPECT || h === OTHER_HEADER).length;
+      assert.equal(dup, 1, `用量列标题（「${HEADER_EXPECT}」或另一种语言的「${OTHER_HEADER}」）在表头里出现 ${dup} 次，应为 1 次（重复列 = 红，实得=${JSON.stringify(hc)}）`);
       assert.ok(usageIdx > 0 && usageIdx < hc.length - 1,
         `「${HEADER_EXPECT}」落在首/末列（下标 ${usageIdx} / 共 ${hc.length}）——列序被动过，用量格与表头的对齐不再可信`);
 
