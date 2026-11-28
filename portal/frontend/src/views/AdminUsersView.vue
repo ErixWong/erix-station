@@ -814,7 +814,15 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="mx-auto w-full max-w-5xl">
+  <!-- issue #923：这里**不能**留 `max-w-5xl`（1024px）。下方表格的 `min-width: 1150px` 是 #817 实测定的
+       「中英两趟 11 列都不折行」下限；容器上限卡在 1024 ⇒ 1024 < 1150，两者永远打架约 126px，
+       **任何**视口都得横滚才点得到「操作」列，#818 的 210px 侧栏又吃掉一档。
+       现在宽屏把内容区上限放开到 1400。换算口径（别把上限当成「视口要多宽」）：
+       不横滚需要 `视口 − 侧栏 210 − 内边距/滚动条约 26 ≥ 1150` ⇒ **视口约 ≥ 1386px**；
+       而 1400 这个上限要到约 **1636px** 视口才真正生效（再宽的屏幕上表格宽度停在上限）。
+       900–1385px 这段窄桌面视口**仍会横滚**（11 列在 ~1100px 内容宽里装不下，而 #817 明确禁止拆行）——
+       这是刻意口径：宽屏不滚、窄屏由 `data-test="user-table-scroll"` 容器自己滚、页面本身不横溢。 -->
+  <section class="mx-auto w-full max-w-[1400px]">
     <header class="mb-3 flex flex-wrap items-center gap-3">
       <h2 class="text-base font-semibold">{{ t('admin.fde.sectionTitle') }}</h2>
       <div class="ml-auto flex w-full flex-wrap items-center gap-2 sm:w-auto">

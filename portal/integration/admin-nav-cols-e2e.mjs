@@ -419,6 +419,7 @@ try {
     const seatCells = [];
     const statusGlyphs = [];
     const actionBtns = [];
+    const actionBtnRightEdges = [];
     for (const row of rows) {
       const seat = row.querySelector('[data-test="seat-cell"]');
       const seatSpan = seat ? seat.querySelector('span') : null;
@@ -435,6 +436,10 @@ try {
       const edit = row.querySelector('[data-test="edit-user"]');
       if (link) actionBtns.push({ test: 'seat-content-link', svgCount: link.querySelectorAll('svg').length, text: (link.textContent || '').trim() });
       if (edit) actionBtns.push({ test: 'edit-user', svgCount: edit.querySelectorAll('svg').length, text: (edit.textContent || '').trim() });
+      // #923：直接量**按钮**的右边界（量最后一个表头格不够：格子装得下不代表按钮没被内部裁切样式遮住）。
+      for (const btn of row.querySelectorAll('[data-test="seat-content-link"], [data-test="edit-user"]')) {
+        actionBtnRightEdges.push(Math.round(btn.getBoundingClientRect().right));
+      }
     }
     const scroll = document.querySelector('[data-test="user-table-scroll"]');
     const bodyText = document.body.innerText || '';
@@ -447,6 +452,14 @@ try {
       statusGlyphs,
       actionBtns,
       scrollHasContent: !!scroll,
+      // #923：宽视口下「操作」列必须完整可见（不需要横滚）。这三项是那条回归的硬判据：
+      // 容器 scrollWidth/clientWidth 判「要不要横滚」，两个 right 判「操作列有没有被容器切掉」。
+      scrollScrollWidth: scroll ? scroll.scrollWidth : -1,
+      scrollClientWidth: scroll ? scroll.clientWidth : -1,
+      actionsRightEdge: (scroll && ths.length) ? Math.round(ths[ths.length - 1].getBoundingClientRect().right) : -1,
+      // 按钮自身的右边界（取全表最大）：真正要保证「点得到」的是按钮，不是表头格。
+      actionBtnRightEdge: actionBtnRightEdges.length ? Math.max(...actionBtnRightEdges) : -1,
+      scrollRightEdge: scroll ? Math.round(scroll.getBoundingClientRect().right) : -1,
       bodyHasRawI18nKey: /admin\.[A-Za-z]+\.[A-Za-z]+/.test(bodyText),
       bodyHasLegacyDot: bodyText.includes('●'),
       bodyHasRetainedInText: bodyText.includes('workspace 保留中'),
@@ -720,6 +733,22 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       assert.deepEqual(emptyTh, [], `存在空表头（文案丢了）：${JSON.stringify(tbl.thLabels)}`);
       assert.deepEqual(tbl.wrappedThs, [], `表头有换行的格（thead th 应全部单行）：${JSON.stringify(tbl.wrappedThs)}`);
       assert.ok(tbl.rowCount >= 1, `用户表至少要有 1 行，实测 ${JSON.stringify(tbl.rowCount)}`);
+      // ---- 断言：#923 宽视口（1440）不需要横滚、操作列完整可见 ----
+      // 根因是**容器上限与表格 min-width 打架**：内容区 `max-w-5xl`=1024 < 表格 `min-width: 1150px`（#817 下限）
+      // ⇒ 表格永远比内容区宽约 126px，任何视口都得横滚才点得到「操作」列（#923）。
+      // 窄视口段（820）另有「容器必须可横滚」的断言，口径不同：那里的 sw>cw 是**预期**，这里必须 sw≤cw。
+      assert.ok(tbl.scrollScrollWidth <= tbl.scrollClientWidth + 1,
+        `宽视口(1440)表格外层容器不该还需要横滚（scrollWidth 应 ≤ clientWidth+1）：`
+        + `scrollScrollWidth=${tbl.scrollScrollWidth} > scrollClientWidth=${tbl.scrollClientWidth} +1`
+        + `（内容区上限与表格 min-width 打架（#923）：section 的 max-w 必须容得下表格 min-width 1150 + 侧栏 210）`);
+      assert.ok(tbl.actionsRightEdge <= tbl.scrollRightEdge + 1,
+        `宽视口(1440)「操作」列右边界超出滚动容器（列被切掉，必须横滚才点得到按钮）：`
+        + `actionsRightEdge=${tbl.actionsRightEdge} > scrollRightEdge=${tbl.scrollRightEdge} +1`
+        + `（内容区上限与表格 min-width 打架（#923）；scrollScrollWidth=${tbl.scrollScrollWidth} scrollClientWidth=${tbl.scrollClientWidth}）`);
+      // 真正要保证的是「按钮点得到」：直接量按钮自身的右边界（表头格装得下 ≠ 按钮没被内部裁切遮住）。
+      assert.ok(tbl.actionBtnRightEdge > 0 && tbl.actionBtnRightEdge <= tbl.scrollRightEdge + 1,
+        `宽视口(1440)动作按钮被容器切掉（量的是按钮自身右边界）：`
+        + `actionBtnRightEdge=${tbl.actionBtnRightEdge} > scrollRightEdge=${tbl.scrollRightEdge} +1`);
 
       // 工位列：每行一个状态，可见文本不含保留中、非空、长度有上界；hover(title) 必须非空。
       const seatBad = (tbl.seatCells || []).filter((c) => !c.text || c.text.includes('workspace 保留中') || c.len > 30);
@@ -772,6 +801,10 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         `表格外层容器应是可横滚（overflow-x auto/scroll），实测 ${JSON.stringify(nar.scrollOverflowX)}（hidden 也能让 scrollWidth>clientWidth 成立，故先钉 CSS）`);
       assert.ok(nar.scrollScrollWidth > nar.scrollClientWidth,
         `窄视口表格外层滚动容器应自己可横滚（scrollWidth>clientWidth）：scroll=${JSON.stringify({ sw: nar.scrollScrollWidth, cw: nar.scrollClientWidth, ox: nar.scrollOverflowX })}`);
+      // 窄屏的横滚要留在**表格容器**里：页面本身不许横溢（否则整页左右拖，顶栏与侧栏一起跑）。
+      // 这条之前只在 REPORT 里收了数、没断言（评审指出）：页面溢出而容器恰好仍可滚时，上面两条都会绿。
+      assert.ok(nar.docScrollWidth <= nar.docClientWidth + 1,
+        `窄视口(820)页面本身不应横向溢出（滚的应该是表格容器）：scrollWidth=${nar.docScrollWidth} > clientWidth=${nar.docClientWidth} +1`);
 
       // ---- 断言：通用 ----
       assert.deepEqual(rep.pageErrors, [], `有 pageerror：${JSON.stringify(rep.pageErrors.slice(0, 3))}`);
@@ -822,6 +855,9 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         railWidth: nar.railWidth,
         narrowDocScroll: [nar.docScrollWidth, nar.docClientWidth],
         tableScroll: { sw: nar.scrollScrollWidth, cw: nar.scrollClientWidth, ox: nar.scrollOverflowX },
+        // #923：宽视口（1440）不横滚 + 操作列完整可见的实测值。
+        wideTableScroll: { sw: tbl.scrollScrollWidth, cw: tbl.scrollClientWidth },
+        wideActionsFit: { actionsRightEdge: tbl.actionsRightEdge, actionBtnRightEdge: tbl.actionBtnRightEdge, scrollRightEdge: tbl.scrollRightEdge },
         pageErrors: rep.pageErrors.length,
         consoleErrorsReal: realConsole,
         rawI18nKey: tbl.bodyHasRawI18nKey,
