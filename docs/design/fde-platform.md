@@ -337,7 +337,7 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 角色来自 group claim（`fde` / `admin`），不在 UI 手点。
 
 两条**身份护栏**（issue #648）：
-- **最后一名 active admin 不会死于一次 PATCH**：把某账号的 `role` 改成非 `admin` 或把 `status` 改成 `disabled`，只要改完之后库里不再存在 active admin ⇒ `409 last_admin`（与 actor 是谁无关），显式带 `confirm_last_admin: true` 才放行并另落一行审计。契约见 portal.md §`PATCH /api/admin/users/:id`。表格里的「数量 1~2 个」靠它兜住：break-glass 账号不致于在误点后彻底没人能进管理台。
+- **最后一名 active admin 不会死于一次 PATCH**：把某账号的 `role` 改成非 `admin` 或把 `status` 改成 `disabled`，只要改完之后库里不再存在 active admin ⇒ `409 last_admin`。判据按**目标账号**判、与 actor 是不是 admin 无关；**但 `actor` 就是目标本身（自降级/自停用）时不可用确认位豁免**——降完再没人能把自己升回管理台，所以 `confirm_last_admin: true` 也照样拦（`details.field` 指真正在改的那一格）。只有**另一名** admin 处置最后一名 active admin 时，才靠 `confirm_last_admin: true` 放行并另落一行审计。契约见 portal.md §`PATCH /api/admin/users/:id`。表格里的「数量 1~2 个」靠它兜住：break-glass 账号不致于在误点后彻底没人能进管理台。
 - **没工位的人不停在工作台**：工作台准入闸只看「有没有工位」（`!fde_name`，与 `role` 无关）——`role='fde'` 但 `fde_name` 为空的人（#648 的第 ④ 类）在工作台上每趟 API 都是服务端报错（`/api/dirs` 的 500 `internal` 与 `/api/sessions` 的 `validation_failed`），所以他像无工位管理员一样被改写去管理台；而「既有工位又是管理员」的人照旧进得了工作台。
 
 ### 7.2 onboarding = 一个 workflow（5 步）

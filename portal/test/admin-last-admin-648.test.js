@@ -253,22 +253,36 @@ test('#648-B2 停用最后一名 active admin 走同一条判据 ⇒ 409 last_ad
   } finally { await s.close(); }
 });
 
-test('#648-B3 带 confirm_last_admin:true 放行，并另落一行 admin.user_last_admin_confirmed', async () => {
+test('#648-B3 自降级即使带 confirm_last_admin:true 也被拒（#648 D：确认位救不了自锁死）', async () => {
   const s = await startStack();
   try {
     const r = await s.patch('root', { role: 'fde', confirm_last_admin: true });
-    assert.equal(r.status, 200);
-    assert.equal(r.body.user.role, 'fde');
-    assert.equal(s.user('root').role, 'fde');
-    // 既有审计不动（纯增量），确认位另算一行
-    assert.equal(s.auditRows('admin.user_updated').length, 1);
-    const rows = s.auditRows('admin.user_last_admin_confirmed');
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].target, 'root');
-    assert.deepEqual(JSON.parse(rows[0].details), {
-      confirm_last_admin: true, remaining_active_admins: 0, role: 'fde', status: 'active',
-    });
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error.code, 'last_admin');
+    // 自降级的文案明确「确认位救不了」，不再建议带 confirm（带了也拦）
+    assert.match(r.body.error.message, /不能把自己降级/);
+    assert.equal(s.user('root').role, 'admin', '被拦 ⇒ 一格都没落库');
+    assert.equal(s.auditRows('admin.user_updated').length, 0);
+    assert.equal(s.auditRows('admin.user_last_admin_confirmed').length, 0);
+    // en 文案同样说「confirm_last_admin does not override」
+    const en = await s.patch('root', { role: 'fde', confirm_last_admin: true }, 'root', 'en');
+    assert.equal(en.status, 409);
+    assert.match(en.body.error.message, /does not override/i);
   } finally { await s.close(); }
+});
+
+test('#648-B3b 另一名（非 active）admin 处置最后一名 active admin 时 confirm_last_admin:true 仍放行并另落审计（D 只收紧「自」降级）', async () => {
+  // 函数级（不走 HTTP，理由同 B5：requireAdmin 要 actor 是 active admin）。
+  // 非自降级 ⇒ 确认位照旧有效（护栏仍可被 confirm 跳过）⇒ 成功后落 `admin.user_last_admin_confirmed`。
+  const pool = new LastAdminPool([ADMIN_SOLO, ADMIN_DISABLED, FDE_USER]);
+  const r = await updateUser(pool, ADMIN_SOLO.id, { role: 'fde', confirm_last_admin: true }, { actorId: ADMIN_DISABLED.id });
+  assert.equal(r.user.role, 'fde');
+  assert.equal(pool.users.find((u) => u.id === ADMIN_SOLO.id).role, 'fde');
+  const rows = pool.audit.filter((x) => x.action === 'admin.user_last_admin_confirmed');
+  assert.equal(rows.length, 1);
+  assert.deepEqual(JSON.parse(rows[0].details), {
+    confirm_last_admin: true, remaining_active_admins: 0, role: 'fde', status: 'active',
+  });
 });
 
 test('#648-B4 库里还有第二名 active admin ⇒ 照常降级，不多要确认位也不多写审计', async () => {
@@ -280,6 +294,23 @@ test('#648-B4 库里还有第二名 active admin ⇒ 照常降级，不多要确
     assert.equal(s.user('root').role, 'fde');
     assert.equal(s.user('root2').role, 'admin'); // 剩下那名仍然活着
     assert.equal(s.auditRows('admin.user_last_admin_confirmed').length, 0);
+  } finally { await s.close(); }
+});
+
+test('#648-D3 顺序两次自降级不会都成功：第二名先自降成功，最后一名再自降被拒（近似验并发）', async () => {
+  // 真并发 fake 测不了（不模拟 MVCC/行锁），这里用**两条顺序调用**近似：两名 admin 都想自降。
+  // 护栏把「还有没有别的 active admin」写进 UPDATE 的 WHERE ⇒ 第一个自降后只剩 root2，
+  // root2 再自降时已无别人 ⇒ 被拦。两个都成功（降到 0 active admin）就不会发生。
+  const s = await startStack([ADMIN_SOLO, ADMIN_TWO, FDE_USER]);
+  try {
+    const first = await s.patch('root', { role: 'fde' }, 'root');
+    assert.equal(first.status, 200);
+    assert.equal(s.user('root').role, 'fde');
+    assert.equal(s.user('root2').role, 'admin', '还剩 root2');
+    const second = await s.patch('root2', { role: 'fde' }, 'root2');
+    assert.equal(second.status, 409, '最后一名自降级必须被拒，否则平台 0 admin 锁死');
+    assert.equal(second.body.error.code, 'last_admin');
+    assert.equal(s.user('root2').role, 'admin', 'root2 一格都没改 ⇒ active admin 数仍 ≥ 1');
   } finally { await s.close(); }
 });
 
@@ -360,12 +391,12 @@ test('#648-B8 confirm_last_admin:false 等于没确认（照样 409）；没拦�
     assert.equal(denied.body.error.code, 'last_admin');
     assert.equal(s.user('root').role, 'admin');
     assert.equal(s.auditRows('admin.user_last_admin_confirmed').length, 0);
-    // 同一请求体只差这一位 ⇒ true 就放行，并落下那一行台账
-    const allowed = await s.patch('root', { role: 'fde', confirm_last_admin: true });
-    assert.equal(allowed.status, 200);
-    assert.equal(s.user('root').role, 'fde');
-    assert.equal(s.pool.users.filter((u) => u.role === 'admin' && u.status === 'active').length, 0);
-    assert.equal(s.auditRows('admin.user_last_admin_confirmed').length, 1);
+    // #648 D：自降级即使带 true 也拦（确认位救不了自锁死）⇒ 不再放行、不写台账。
+    const selfConfirmed = await s.patch('root', { role: 'fde', confirm_last_admin: true });
+    assert.equal(selfConfirmed.status, 409);
+    assert.equal(selfConfirmed.body.error.code, 'last_admin');
+    assert.equal(s.user('root').role, 'admin', '自降级被拦 ⇒ 一格都没落库');
+    assert.equal(s.auditRows('admin.user_last_admin_confirmed').length, 0);
   } finally { await s.close(); }
 });
 
