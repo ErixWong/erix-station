@@ -757,11 +757,13 @@ test('U1 真浏览器进工作台（路由 /）：徽标紧跟 who/周期文案+
       // 于是登录后才出的 fatal（工作台路由没匹配上、渲染挂了）会一路走到徽标存在性判断，最后以 skip
       // 收场——这条腿因此可以在页面全空的情况下次次 rc 0（本单开局就是这么藏了三周）。
       if (rep.fatal) {
-        // 登录后一律判红，但把「网络/入口中断」在消息里分出来：它多半是活栈/容器正在重启，
-        // 重跑前先确认容器健康；其余按产品缺陷查。**两类都是红**，只是分诊方向不同（不拿 skip 遮掉）。
-        const netLike = /net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake|socket hang up/i.test(String(rep.fatal));
+        // 登录后一律判红，只在消息里分个诊向：连接层失败先去端口看活栈/容器健康，其余按产品缺陷查。
+        // ⚠ 只认下面这些**明确的连接层**失败形。裸 `net::` 前缀不算证据——ERR_ABORTED、
+        // ERR_BLOCKED_BY_RESPONSE 这类是浏览器策略或应用侧中止，据此断言「容器在重启」会把
+        // 产品故障分诊错（分诊文案不许替人下结论）。
+        const connLevel = /\bECONNREFUSED\b|\bECONNRESET\b|\bETIMEDOUT\b|\bENOTFOUND\b|\bEAI_AGAIN\b|getaddrinfo|handshake|socket hang up|net::ERR_(?:CONNECTION_|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|NETWORK_CHANGED|ADDRESS_UNREACHABLE)/i.test(String(rep.fatal));
         assert.fail(`已到达登录页却没跑通（登录后失败不退化成 skip）：${rep.fatal}`
-          + `（${netLike ? '登录后网络/入口中断：多半是活栈或容器正在重启，先确认容器健康再重跑' : '非网络类：按产品缺陷查'}；`
+          + `（${connLevel ? '连接层失败：先去端口确认活栈/容器健康再重跑，别先改代码' : '未判定为连接层：先重跑一次，仍红就按产品缺陷查'}；`
           + `登录态=${JSON.stringify(rep.login)}，pageerror=${String((rep.pageErrors || []).slice(0, 2).join(' / '))}）`);
       }
       assert.match(String(rep.login.hash || ''), /#\/(?!login)/, `登录后没离开 /login，hash=${JSON.stringify(rep.login.hash)}`);
