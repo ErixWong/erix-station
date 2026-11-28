@@ -2518,6 +2518,53 @@ async function handleAdminApi(req, res, ctx, url) {
     return sendJson(res, 200, { item: result.item });
   }
 
+  // ---- #677 第八批：FDE env 旋钮 scoped 端点（契约 portal.md §4.21 末「FDE env 旋钮 scoped 端点」）。
+  // 与上面的通用 runtime-settings 同一机制（读侧/写侧/审计/校验全在 runtime-settings.js），
+  // 只多一层「只认这 10 根白名单」的闸：白名单外的键（哪怕在 registry 里）一律 400。
+  // 值/区间合法性交给 `updateRuntimeSettingAdmin`（内部走 registry `validate` → 400），不在此重提一套。
+  if (pathname === '/api/admin/fde-env-settings') {
+    if (req.method === 'GET') {
+      const all = await runtimeSettings.listRuntimeSettingsAdmin({
+        pool: ctx.pool, config: ctx.config, log: ctx.log, locale: resolveRequestLocale(req),
+      });
+      // 只透出白名单那 10 根（其余 registry 旋钮走通用端点）。
+      const allow = new Set(runtimeSettings.FDE_ENV_SETTING_KEYS);
+      return sendJson(res, 200, { ...all, items: all.items.filter((i) => allow.has(i.key)) });
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  // key 形状与通用端点同形（^[a-z][a-z0-9_.]{2,63}$，不匹配⇒404）。
+  const fdeEnvSettingMatch = pathname.match(/^\/api\/admin\/fde-env-settings\/([a-z][a-z0-9_.]{2,63})$/);
+  if (fdeEnvSettingMatch) {
+    if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    const key = decodeURIComponent(fdeEnvSettingMatch[1]);
+    // 白名单闸（比通用端点多的一层）：不在 10 根名单里 ⇒ 400，field='key'，与通用端点的「未知 key」同形。
+    if (!runtimeSettings.FDE_ENV_SETTING_KEYS.includes(key)) {
+      throw new HttpError(400, 'validation_failed', `不属于 FDE env 旋钮白名单的配置项：${key}`, {
+        en: `Not an FDE env setting whitelist key: ${key}`,
+        details: { field: 'key', known: runtimeSettings.FDE_ENV_SETTING_KEYS },
+      });
+    }
+    requireJson(req);
+    const body = await readJsonBody(req);
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      throw new HttpError(400, 'validation_failed', '请求体必须是 JSON 对象', {
+        en: 'Request body must be a JSON object',
+        details: { field: 'body' },
+      });
+    }
+    // 区间/标量闸与审计全在 updateRuntimeSettingAdmin（同一事务 upsert+审计）；非法值 400、零写库。
+    const result = await runtimeSettings.updateRuntimeSettingAdmin({
+      pool: ctx.pool,
+      actorId: session.user.id,
+      key,
+      value: body.value,
+      log: ctx.log,
+      locale: resolveRequestLocale(req),
+    });
+    return sendJson(res, 200, { item: result.item });
+  }
+
   // ---- issue #595 能力市场：管理面（§7）。全部已在 handleAdminApi 入口过 `requireAdmin`。
   // 这一层的职责只有四件：匹配、鉴权、把 body 递给 market.js、写审计。校验与落盘全在数据层
   // （判据必须与 CLI/脚本调用同一条路径，不能只长在 HTTP 上）。 ----
