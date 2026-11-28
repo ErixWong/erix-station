@@ -300,13 +300,18 @@ async function gather() {
       probe.fdeLoginBody = fl.json;
       probe.fdeCookies = fl.cookies;
       const code = fl.json?.error?.code;
-      const secondFactor = !!fl.json?.pending_token || code === 'email_code_required';
+      // 「已知环境形状」的码表**照 portal 登录流的真实返回值**列（`portal/src/http.js`：口令通 →
+      // `pending_token`；`email_code_required` / `totp_required` / `password_change_required`；口令不对
+      // 401 `invalid_credentials`；限流 429）。⚠ 别照抄截断过的日志——本单先写成 `invalid_cred` 没
+      // 命中，把「口令没配」这种正牌环境形状判成了产品故障（是变异自己抓到的）。
+      const stepUpCodes = ['email_code_required', 'totp_required', 'password_change_required'];
+      const secondFactor = !!fl.json?.pending_token || stepUpCodes.includes(code);
       if (fl.status === 200 && fl.cookies.length > 0) {
         // 登进去了 ⇒ H3 的 403 断言正常跑
       } else {
         const why = `非管理员 ${FDE_LOGIN} 登录 HTTP ${fl.status}${code ? ` ${code}` : ''}`
           + `${secondFactor ? '（带 pending_token ⇒ 这个账号开了第二因素，本脚本只会口令直通）' : ''}`;
-        if ((fl.status === 401 && code === 'invalid_cred') || secondFactor || fl.status === 429) {
+        if (fl.status === 401 || secondFactor || fl.status === 429) {
           probe.reasons.nonadmin = `${why} ⇒ 已知环境形状（口令未配 / 二因素 / 限流）`;
         } else {
           probe.nonadminFatal = `${why} ⇒ **不在**已知环境形状清单里，按产品缺陷判红`;
