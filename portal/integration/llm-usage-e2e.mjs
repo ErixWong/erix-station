@@ -304,8 +304,15 @@ async function gather() {
       // `pending_token`；`email_code_required` / `totp_required` / `password_change_required`；口令不对
       // 401 `invalid_credentials`；限流 429）。⚠ 别照抄截断过的日志——本单先写成 `invalid_cred` 没
       // 命中，把「口令没配」这种正牌环境形状判成了产品故障（是变异自己抓到的）。
-      const stepUpCodes = ['email_code_required', 'totp_required', 'password_change_required'];
-      const secondFactor = !!fl.json?.pending_token || stepUpCodes.includes(code);
+      // 步出信号在 wire 上的**真实形状**（`portal/src/http.js` 登录流）：响应体的 `status` 取
+      // `email_code_required` / `totp_required` / `second_factor_choice`，同时带 `pending_token`；
+      // `password_change_required` 是**登录成功响应里的顶层布尔**，不是 `error.code`。口令不对是
+      // 401 `invalid_credentials`，限流是 429。⚠ 别照抄被截断的日志：本单先写成 `invalid_cred`，
+      // 真码是 `invalid_credentials`（变异自己抓到的）。
+      const stepUpStatuses = ['email_code_required', 'totp_required', 'second_factor_choice'];
+      const secondFactor = !!fl.json?.pending_token
+        || stepUpStatuses.includes(fl.json?.status)
+        || fl.json?.password_change_required === true;
       if (fl.status === 200 && fl.cookies.length > 0) {
         // 登进去了 ⇒ H3 的 403 断言正常跑
       } else {
@@ -632,12 +639,15 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
           return;
         }
         const ps = rep.login ? rep.login.postStatus : undefined;
+        // ⚠ 5xx 不等于「网关挡下」：portal 自己就回 5xx（队列满 ⇒ 503 `kdf_busy`，见 portal 登录
+        // 路由），所以只说「返回 5xx」并把入口与 portal 两边都列为待查，不替人指认来源。
         const triage = ps !== undefined && ps !== null && ps >= 500
-          ? `登录请求被入口/网关挡下（HTTP ${ps}）⇒ 先去端口看活栈/容器健康`
+          ? `登录请求返回 5xx（HTTP ${ps}）：入口/网关与 portal 自身都可能（如 503 kdf_busy）`
+            + '⇒ 先看端口与 portal 日志再定性'
           : ps === 401
             ? '登录被拒（HTTP 401）⇒ 先核口令是否轮换，再谈产品缺陷'
             : rep.reachedLogin && (ps === null || ps === undefined)
-              ? '到了登录页但没等到登录响应（连接被切断）⇒ 先核入口/容器，再按产品缺陷查'
+              ? '到了登录页但20s 内没等到登录响应（**不足以断定**连接被切断）⇒ 先核入口/容器再谈产品缺陷'
               : '未判定为环境形状：先重跑一次，仍红就按产品缺陷查';
         assert.fail(`浏览器里没跑通：${rep.fatal}`
           + `（${triage}；登录态=${JSON.stringify(rep.login)}，pageerror=${rep.pageErrors.slice(0, 2).join(' / ')}）`);
@@ -657,7 +667,7 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
       }
 
       // ① 表头按**列名**判，不按格子数与下标判：#828 P3 给用户表加了「默认语言」列之后，格子数与
-      //    下标都会漂（真机实测 10 → 11、「周期 / 用量」从下标 7 挪到 8），而本单要钉的是**这一列在、
+      //    下标都会漂（用户表加一列，格数与下标就全变），而本单要钉的是**这一列在不在**与
       //    且只有一列**。列数本身不是契约——管理台再加一列不该红，也不该绿得莫名其妙。
       const hc = rep.page.headerCells;
       const usageIdx = hc.indexOf(HEADER_EXPECT);

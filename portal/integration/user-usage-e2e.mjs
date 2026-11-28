@@ -633,7 +633,7 @@ try {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 1200 }, locale: 'zh-CN', ignoreHTTPSErrors: true });
   // 起点语言必须由**载体**钉住，不能靠浏览器的协商层：解析优先级是 用户选择标记 > 账号值 > Accept-Language
   // （#828 / #902）。脚本账号 users.locale 实测是 en ⇒ 只设 newContext 的 locale 时整条 zh 腿恒拿英文文案
-  // （真机实测徽标回 "mo $1.80/$3.00"）。开局铺这两枚（同一个 url ⇒ 天然同作用域，#902 ① 要的就是这个），
+  // （正常形态下徽标回的是**月度额度**文案，形如「mo 金额/额度」）。开局铺这两枚（同一个 url ⇒
   // 后面点 English 时由应用自己改写。
   await ctx.addCookies([
     { name: 'locale', value: 'zh-CN', url: cfg.base },
@@ -796,8 +796,8 @@ test('U1 真浏览器进工作台（路由 /）：徽标紧跟 who/周期文案+
         `zh 徽标 title/aria 应含完整词「本月/本日」，实得 title=${JSON.stringify(zh.title)} aria=${JSON.stringify(zh.aria)}`);
       assert.ok(!/^mo |^d |mo used/i.test(String(zh.title)), `zh 徽标 hover 出现窄黑话（如 "mo used"）：${JSON.stringify(zh.title)}`);
       // 顶栏形状判据（zh / en 两趟都跑）。**同一行**的判据是「垂直中心一致」，不是「top 相等」：顶栏是
-      // flex + align-items:center，徽标盒子（真机实测高 26）比纯文本的 who（高 20）高一档，居中对齐后
-      // 徽标 top 反而**小 3px**，而两者中心都是 23 —— 同一行。旧写法比 top 差 < 2px 是假探测器（同类事故：
+      // flex + align-items:center：徽标盒子比纯文本那一行**更高**，居中对齐后两者的 top 天然不等
+      // （差值甚至可正可负），而**垂直中心相同** ⇒ 同一行。旧写法比 top 差 < 2px 是假探测器（同类
       // #817 那条拿 scrollHeight 判换行恒等，修法见 8046fa0c：改数行盒）。掉行会让顶栏高度翻倍、
       // 文案变长会把顶栏撑出视口，所以「同一行 + 没掉行 + 紧跟 + 没溢出视口」四件事一起钉，
       // 并且**中英文两趟都钉**（只钉中文 = 英文长额度造成的溢出没人管）。
