@@ -35,6 +35,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { credsFileCandidates, defaultScriptLogin } from './lib/dev-creds.mjs';
+// #932：软降级判据与 `E2E_UI_SOFT` 判定收成一份（唯一来源在 lib，判据语义不变）。
+import { shouldSoftSkip, uiSoft } from './lib/e2e-ui-soft.mjs';
 
 // 自签证书：只在本测试进程内关掉校验。
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -81,7 +83,7 @@ const UI_ENABLED = process.env.E2E_UI === '1';
  * 降级回 skip。默认（不设）= 点名即硬要求，环境不齐也判红（#804：真机 e2e 不做完不算合完）。
  * 与文件末尾「点名却没口令 ⇒ 判红」的哨兵用例是同一条口径的两半。
  */
-const UI_SOFT = process.env.E2E_UI_SOFT === '1';
+const UI_SOFT = uiSoft();
 const PW_CONTAINER = process.env.PLAYWRIGHT_CONTAINER || 'erix_station_playwright';
 const PW_MODULE = '/app/node_modules/playwright/index.mjs';
 /** dev 栈的 Postgres 容器名（与同目录各 wpN/db 集成脚本同名同默认）；#828 收尾恢复账号语言值要用。 */
@@ -173,23 +175,9 @@ function sqlLit(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-/**
- * #878：`E2E_UI_SOFT=1` 到底该不该把一次失败降级成 skip——抽成纯函数，**只认调用点显式传来的
- * `phase`，绝不从 message 猜**。
- *
- * 只允许在**环境探测阶段**（`phase==='probe'`：口令/凭据读取、docker 可用性、playwright 容器在不在、
- * playwright 模块能不能加载、`--host-resolver-rules` 能不能生效——都是「真浏览器跑起来之前」的探测）
- * 降级。`phase==='run'`（真浏览器已经开起来、已经在导航/点击/断言）里炸出的 `net::` 一律判红：
- * 那多半是用例中段页面自身的问题，若被 `E2E_UI_SOFT=1` 降级成 skip，真回归就被静默吃掉了。
- * `soft` 为假（没点名软降级）时一律不降级——点名要跑就判红，与哨兵同口径。`message` 只是给人看的上下文，
- * 不参与阶段判定。
- */
-export function shouldSoftSkip({ soft = false, phase, message = '' } = {}) {
-  if (!soft) return false;
-  if (phase !== 'probe') return false;
-  void message;
-  return true;
-}
+// #878/#932：`shouldSoftSkip` 已抽到 `./lib/e2e-ui-soft.mjs`（唯一来源），此文件顶部改为 import。
+// 判据不变：`phase` 是唯一判据、`phase==='run'` 恒 false（软降级只兑环境探测阶段），
+// 逐字实现与钉死用例见该 lib 与 `portal/test/e2e-ui-soft.test.js`。
 
 /**
  * #828 收尾（**必须放 finally**）：把浏览器腿在 DB 里改动的两个账号语言值恢复成 `null`，并**回读确认**。
