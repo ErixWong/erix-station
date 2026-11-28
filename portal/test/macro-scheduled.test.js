@@ -85,8 +85,8 @@ test('#919-B 宏会话：~/projects/<name> 原样透传（不折叠、不报错�
   assert.equal(ins.params[2], '~/projects/demo_app', 'tilde 形态原样透传');
 });
 
-test('#919-B 宏会话：cwd=null/空串 ⇒ INSERT 落 NULL 且不调用校验器（不查 fde_name、不抛）', async () => {
-  // fdeName=null：若被误送进校验器的绝对支会直接抛；用 null 验证 null/空串根本不进校验器。
+test('#919-B 宏会话：cwd=null / 空串(\'\') / 纯空格 ⇒ INSERT 落 NULL 且不调用校验器（不查 fde_name、不抛）', async () => {
+  // fdeName=null：若被误送进校验器的绝对支会直接抛；用 null 验证 null/空串/纯空格根本不进校验器。
   const pool = fakeMacroPool({ fdeName: null });
   const out = await getOrCreateMacroSession(pool, {
     userId: crypto.randomUUID(), templateName: 'daily-report', cwd: null,
@@ -96,11 +96,20 @@ test('#919-B 宏会话：cwd=null/空串 ⇒ INSERT 落 NULL 且不调用校验�
   assert.equal(ins.params[2], null, 'cwd=null ⇒ INSERT 落 NULL');
   assert.equal(pool.queries.some((q) => /fde_name FROM users/.test(q.sql)), false, 'null cwd 不应触发校验器（不查 fde_name）');
 
+  // 空串 ''：同样落 NULL、不查 fde_name、不抛。
+  const pool3 = fakeMacroPool({ fdeName: null });
+  const out3 = await getOrCreateMacroSession(pool3, { userId: crypto.randomUUID(), templateName: 'daily-report', cwd: '' });
+  assert.equal(out3.created, true);
+  const ins3 = pool3.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
+  assert.equal(ins3.params[2], null, "cwd='' ⇒ INSERT 落 NULL");
+  assert.equal(pool3.queries.some((q) => /fde_name FROM users/.test(q.sql)), false, "cwd='' 不应触发校验器（不查 fde_name）");
+
+  // 纯空格：同样落 NULL、不查 fde_name、不抛。
   const pool2 = fakeMacroPool({ fdeName: null });
   await getOrCreateMacroSession(pool2, { userId: crypto.randomUUID(), templateName: 'daily-report', cwd: '   ' });
   const ins2 = pool2.queries.find((q) => /INSERT INTO chat_sessions/.test(q.sql));
-  assert.equal(ins2.params[2], null, 'cwd=空串 ⇒ 同样落 NULL');
-  assert.equal(pool2.queries.some((q) => /fde_name FROM users/.test(q.sql)), false, '空串 cwd 不应触发校验器');
+  assert.equal(ins2.params[2], null, 'cwd=纯空格 ⇒ 同样落 NULL');
+  assert.equal(pool2.queries.some((q) => /fde_name FROM users/.test(q.sql)), false, '纯空格 cwd 不应触发校验器');
 });
 
 /** 一套可跑 scheduled-task 的现场：用户 / 容器 / scheduled-task 模板 + 订阅（无 session：user scope）。 */
