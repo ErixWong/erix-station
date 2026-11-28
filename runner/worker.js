@@ -48,7 +48,7 @@ import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-see
 import { buildFailureEnvelope, finalTextFallbackField } from './lib/termination.js';
 // issue #243：终局正文「被文本化的工具调用」识别（纯函数 + env 特征集，判据在
 // `runner/test/final-text-toolcall.test.js`）。**只加字段、不改终态语义**。
-import { textualizedToolCallField, toolCallMarkersFromEnv } from './lib/final-text-toolcall.js';
+import { textualizedToolCallFieldForRun, toolCallMarkersFromEnv } from './lib/final-text-toolcall.js';
 // issue #451：AGENTS.md 链注入（采集器纯函数 + 可注入 fs，判据在 runner/test/agents-md.test.js）。
 import { collectAgentsMd, renderAgentsMdSection } from './lib/agents-md.js';
 // issue #595：能力市场的 L3 注入面——`~/.erix/capabilities.json` → 提示词末尾的「平台技能」段
@@ -1395,7 +1395,12 @@ async function startRun(msg) {
       // `rounds` / `usage` 任何既有字段**：这不是失败，是「交付报告可能没生成」的提示。
       // 落点：portal 在同一终态事务里合成 `textualized_tool_call` 事件（`internal.js#finishRun`），
       // 进 `HISTORY_EVENT_TYPES` ⇒ 刷新后仍在（上游 erix-agent #182 的教训）。
-      ...textualizedToolCallField(result.finalText, finalTextShapeConfig.markers),
+      // issue #895（erix-agent 0.34.0 上游 #862）：判定来源改为**引擎原生事实优先**——
+      // `result.finalTextShape?.textualizedToolCall === true` ⇒ 直接判散文（**不受 env marker 影响**）；
+      // 该键缺席（无 shape / 对象在但无该键 / 非 true）⇒ 完全走上面 #243 那条 env-marker 启发式，行为一字不变。
+      // 绝不因「引擎说没有」而写 `false`（缺席就是缺席，与 `final_text_fallback` 同口径）；线格式（两键
+      // snake_case、只在命中时给）不变。判据在 runner/test/final-text-toolcall.test.js 钉三格。
+      ...textualizedToolCallFieldForRun(result, finalTextShapeConfig.markers),
       title: '',   // 标题归 portal 生成，worker 恒发空串（#322）
     });
   } catch (err) {
