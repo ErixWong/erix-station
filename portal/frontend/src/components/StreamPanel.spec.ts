@@ -210,7 +210,7 @@ describe('工具卡片折叠（issue #85）', () => {
     store.es.projectToolCard('p-legacy', { name: 'shell', argsSummary: 'command=sleep 5', resultPreview: 'exit_code: 0' });
     store.entries.push({ kind: 'tool', callId: 'p-dur' }, { kind: 'tool', callId: 'p-legacy' });
     const cards = mountPanel().findAll('.border-l-4');
-    // 变异取证④：摘掉前端对 `durationMs` 的消费（或后端 join）就红在本行
+    // 变异取证④：摘掉前端对 `durationMs` 的消费就红在本行（宿主 join 已在 #303 退役，本用例注入的是投影值）
     expect(cards[0].get('button').text()).toContain('✓ 4.3s');
     const legacy = cards[1].get('button').text();
     expect(legacy).toContain('✓');

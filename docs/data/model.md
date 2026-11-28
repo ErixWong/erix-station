@@ -265,7 +265,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 - `tool_calls`：`call_id` 对应事件流的 `tool_call_id`（portal.md §5.3），`UNIQUE(run_id, call_id)`；**`call_id` 是外部 ID（canonical，见 §1.19），`tool_calls.id` 仅内部主键（uuid）、不外露**；`result_digest` 只存摘要（完整结果可能很大）；`approved` 三态（`NULL` = 未涉及审批）。**行由 portal 在 U3 事件上报时幂等 upsert**（`type='tool_use'` 事件 `INSERT ... ON CONFLICT (run_id, call_id) DO NOTHING`，后续 `tool_result`/`tool_call_delta` 更新派生字段，portal.md §9.10）——U10 建审批单时行必已存在。
   - **`duration_ms` 列（#303 后）**：该列仍由 U3 的 `tool_result` UPDATE 回填（写侧未变），但**自 #303（erix-agent 0.34.0 后旧键 `duration` 退役）起不再被读进对话流 DTO 的 `toolCalls[].durationMs`**——后者现在只来自引擎投影的 `erix.durationMs`（旧「投影缺省 ⇒ 回落宿主 `tool_calls.duration_ms`」支路已删，见 portal.md §5.3）。此列的旧回落曾是它在视图层的**唯一**读点；#303 删后，产品代码里已无消费此列做展示的路径（写侧仍保留：U3 照旧回填，与 `run_events` 的 `tool_result` 事件一起作为历史/审计的时长存档）。
-  - **跨实例风险（#303）**：删的是「读旧数据」的兼容——**存量比本次发布老的实例升级后**，那些老对话（引擎当年没写 `erix.*`、只有顶层 `duration` 或宿主 `tool_calls.duration_ms`）的工具耗时会渲染为「未知」（前端现有 `dur` 为空时不显示，**不是报错**）。⚠ 这只说 **DTO 面**：**事件回放是另一条来路**——`run_events` 里 `tool_result` 的 payload 存着当年的 `duration_ms`，历史接口原样返回、前端照它渲染（`portal/src/http.js` 的事件白名单含 `tool_result`）⇒ 别说成「老对话一律显示未知」，只有**两条来路都没给**才是未知。
+  - **跨实例风险（#303）**：删的是「读旧数据」的兼容——**存量比本次发布老的实例升级后**，那些老对话（引擎当年没写 `erix.*`、只有顶层 `duration` 或宿主 `tool_calls.duration_ms`）的工具耗时会渲染为「未知」（前端现有 `dur` 为空时不显示，**不是报错**）。⚠ 这只说 **DTO 面**：**事件回放是另一条来路**——`run_events` 里 `tool_result` 的 payload 存着当年的 `duration_ms`，历史接口按白名单（`portal/src/http.js` 含 `tool_result`）取出 payload、经 `truncateHistoryPayload` 后返回（数值字段不受字符串截断影响），前端把历史页喂进同一个 dispatch、**只在找到对应卡片时**回填 ⇒ 别说成「老对话一律显示未知」。准确说法：**当前已加载且能关联到卡片**的历史 `tool_result` 与 DTO 投影**都没有有限时长**时，那张卡片才显示未知（历史分页默认 500／上限 2000，没加载到的页自然给不出）。
   - **存量核对（一条可复跑语句，勿把某机实测数字当结论）**：工具结果块**不在 `record` 顶层**，而在
     `record -> 'messages'[*] -> 'content'[*]` 里 `type = 'tool_result'` 的块上；耗时键是块内的
     `erix.durationMs`，旧键是同一块的顶层 `duration`。按路径直查顶层键会得到恒 0 的**假阴性**（实测踩过）。
@@ -274,7 +274,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
     - `legacy_duration_key` —— 仍带顶层旧键 `duration` 的块数（冗余残留，不等于会改变行为）。
     - `legacy_only_no_engine` —— **只有**旧键、没有 `erix.durationMs` 的块数：这才是删 runner 那条
       回退后**唯一可能改变行为**的集合。
-    - `no_engine_duration` —— **投影拿不到时长**的块数（没有 `erix` 对象，或 `erix.durationMs` 不是数）
+    - `no_engine_duration` —— **投影拿不到时长**的块数（没有 `erix` 对象，或 `erix.durationMs` 不是**能变成有限 JS 数**的数）
       ⇒ 这些格在 DTO 面上本来就显示「未知」，删回退不改它们的显示。
     - `no_erix_object` —— 连 `erix` **对象**都没有的块数。⚠ 别只读成「引擎 0.20.0 之前的老形状」：
       `erix` 是数组、JSON `null` 或标量的块同样落在这里，**形态与年代不是一一对应**。
@@ -296,7 +296,14 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
              -- 有限数（`typeof === 'number' && Number.isFinite`）。键存在但值是字符串或 null 的块，
              -- DTO 面上本来就是「未知」⇒ 按键存在数会**低估**真正缺时长的块数。
              (COALESCE(jsonb_typeof(b->'erix') = 'object', false)
-               AND COALESCE(jsonb_typeof(b->'erix' -> 'durationMs') = 'number', false)) AS has_engine_dur
+               -- 「投影能不能显示」比「JSON 类型是 number」还严：jsonb 能把 1e999 存成 numeric（类型仍是
+               -- number），解到 JS 却是 Infinity，被 display-projection 的 Number.isFinite 拒掉 ⇒ 再比一道量级。
+               -- 用 CASE 而不是 `A AND B`：AND 不保证短路，求值顺序一变，`'true'::numeric` 这类值就当场报错，
+               -- CASE 保证只有真是 number 才去 cast（判据：6 种形状里只认那一格真的有限数）。
+               AND COALESCE(CASE WHEN jsonb_typeof(b->'erix' -> 'durationMs') = 'number'
+                                  THEN ABS((b->'erix' ->> 'durationMs')::numeric)
+                                       < '1.7976931348623158e308'::numeric
+                                  ELSE false END, false))          AS has_engine_dur
       FROM transcript_rounds t
       CROSS JOIN LATERAL jsonb_array_elements(
           CASE WHEN jsonb_typeof(t.record->'messages') = 'array'
@@ -324,7 +331,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
     唯一 run（`portal/src/session-view.js` 的 `soleRunId` 一支）⇒ **`run_id IS NULL` 的块也会进 DTO**。
     所以「块数很多」不等于「用户会看到变化」，但按 `run_id` 关联 `runs` 筛出来的也**不是全部影响面**。
      要判**本次删掉的宿主回落**的影响：它的键是 `${宿主 tool_calls 行的 run_id}\u0000${call_id}`，而查表用
-     的是 **DTO 上的 runId**（没归属的轮次已被 `soleRunId` 归给该会话唯一 run）⇒「这格原来显示过数字」
+     的是 **DTO 上的 runId**（**符合归属条件**的轮次——该会话只有一个 run 且这轮没归属——会被 `soleRunId` 认给那个 run；
      = 「块的 `tool_call_id` 能在**那个 run** 的 `tool_calls` 里找到同名行、且该行 `duration_ms` 非空」。
      ⚠ 别写成「`run_id IS NULL` 的块本来供不到」：归属之后它照样命中，界线是 **call_id 能否匹配**，
      不是 transcript 行自己那个 `run_id`。
