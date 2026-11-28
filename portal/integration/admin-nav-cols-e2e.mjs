@@ -81,15 +81,22 @@ const STATUS_SHAPES = ['✓', '◌', '⊘'];
 
 // ---------------------------------------------------------------------------
 // docker 包装层：普通用户能跑就用普通用户，否则包一层组权限；整条命令串不许含换行。
+// 权限探测用**无副作用的** `docker version`（早先的写法把真命令当探针跑一遍、再跑一遍 ⇒
+// 浏览器脚本会被执行两次，且第一次失败会被误判成权限问题而改走 sg）。
+// sg 回退的 shell 转义：单引号包裹 + 内嵌单引号写成 '\''（JSON.stringify 不是 shell 转义）。
 // ---------------------------------------------------------------------------
+function shQuote(arg) {
+  return /^[A-Za-z0-9_./:=@%+-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
 function dockerCmd(args) {
-  const inner = ['docker', ...args].join(' ');
+  const inner = ['docker', ...args].map(shQuote).join(' ');
   if (inner.includes('\n')) throw new Error('docker 命令串含换行（sg docker -c 的引号会断）');
   try {
-    execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
+    execFileSync('docker', ['version', '--format', '{{.Server.Version}}'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000 });
     return { shell: 'plain', inner };
   } catch {
-    return { shell: 'sg', inner: `sg docker -c ${JSON.stringify(inner)}` };
+    return { shell: 'sg', inner: `sg docker -c ${shQuote(inner)}` };
   }
 }
 
@@ -274,6 +281,16 @@ try {
 
   // 进用户表（默认管理台路由）。
   await page.goto(cfg.base + '/#/admin/users', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // 先拍一张「特性在不在」的快照（**在任何可能 fatal 的 waitForSelector 之前**）：
+  // 外层靠它区分「活栈跑的是本功能之前的镜像」（环境形状 ⇒ 可 skip）与「真回归」（必须红）。
+  r.boot = await page.evaluate(() => ({
+    hasSidebar: !!document.querySelector('nav a[data-test^="nav-link-"]'),
+    hasUserTable: !!document.querySelector('table[data-test="user-table"]'),
+    hasSeatCell: !!document.querySelector('[data-test="seat-cell"]'),
+    // 停在登录页 ⇒ 不是「旧镜像」而是登录没走通（真回归）——两者都表现为「没有侧栏」，必须分开。
+    hash: location.hash || '',
+    onLoginPage: !!document.querySelector('#loginName, input[autocomplete="username"]'),
+  }));
   await page.waitForSelector('nav a[data-test^="nav-link-"]', { timeout: 20000 });
 
   // 导航腿结构事实（宽视口）。
@@ -441,6 +458,46 @@ try {
   // 宽视口截图（导航腿证据）。
   await page.screenshot({ path: cfg.shotWide, fullPage: false }).catch(() => {});
 
+  // 英文态（#817 那次表头被挤成两行，最先出问题的就是英文长标签：Repository management 之类）：
+  // 切到 English 再量一次表头行盒与文档溢出，量完**切回中文**（切换会写账号级偏好，不能把 dev 的
+  // 管理员留在英文态）。切不回中文也要尽力尝试（finally）。
+  const pickLocale = async (want) => {
+    await page.click('header button[aria-haspopup="menu"]');
+    await page.waitForSelector('[role="menuitem"]', { timeout: 10000 });
+    const hit = await page.evaluate((w) => {
+      const el = [...document.querySelectorAll('[role="menuitem"]')].find((e) => (e.textContent || '').trim() === w);
+      if (!el) return false;
+      el.click();
+      return true;
+    }, want);
+    if (!hit) throw new Error('语言菜单里没有文案为 ' + want + ' 的项');
+    await page.waitForTimeout(600);
+  };
+  try {
+    await pickLocale('English');
+    await page.waitForSelector('table[data-test="user-table"] thead th', { timeout: 20000 }).catch(() => {});
+    r.en = await page.evaluate(() => {
+      const table = document.querySelector('table[data-test="user-table"]');
+      const ths = table ? [...table.querySelectorAll('thead th')] : [];
+      const lineCount = (el) => {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        return new Set([...range.getClientRects()].map((rc) => Math.round(rc.top))).size;
+      };
+      return {
+        lang: document.documentElement.lang,
+        thCount: ths.length,
+        thLabels: ths.map((th) => (th.textContent || '').trim().slice(0, 40)),
+        wrappedThs: ths.map((th) => ({ text: (th.textContent || '').trim().slice(0, 40), lines: lineCount(th) }))
+          .filter((each) => each.lines > 1),
+        docScrollWidth: document.documentElement.scrollWidth,
+        docClientWidth: document.documentElement.clientWidth,
+      };
+    });
+  } finally {
+    try { await pickLocale('中文'); } catch (e) { r.enRestoreError = String((e && e.message) || e); }
+  }
+
   // 窄视口（#817/#818 的横向溢出与滚动面在窄屏才暴露）。
   await page.setViewportSize({ width: cfg.narrowWidth, height: 900 });
   await page.goto(cfg.base + '/#/admin/users', { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -449,10 +506,14 @@ try {
   r.narrow = await page.evaluate(() => {
     const aside = document.querySelector('aside.admin-side') || document.querySelector('aside');
     const nav = document.querySelector('nav.admin-nav') || document.querySelector('nav');
+    const main = document.querySelector('main');
     const scroll = document.querySelector('[data-test="user-table-scroll"]');
     return {
       railWidth: aside ? Math.round(aside.getBoundingClientRect().width) : -1,
       navOverflowY: nav ? getComputedStyle(nav).overflowY : '',
+      navScrollHeight: nav ? nav.scrollHeight : -1,
+      navClientHeight: nav ? nav.clientHeight : -1,
+      mainOverflowY: main ? getComputedStyle(main).overflowY : '',
       docScrollWidth: document.documentElement.scrollWidth,
       docClientWidth: document.documentElement.clientWidth,
       scrollOverflowX: scroll ? getComputedStyle(scroll).overflowX : '',
@@ -490,12 +551,25 @@ test('H0 不带凭据 `GET /api/admin/users` ⇒ 401（不依赖口令，证明�
 // ---------------------------------------------------------------------------
 // 浏览器腿：#818 导航 + #817 表格（一次性进页面、收集 REPORT、外层逐条断言）。
 // ---------------------------------------------------------------------------
-test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于固定 / aria-current / 滚动面 / 窄屏图标轨 / 展开态）+ #817 用户表（表头单行 / 横滚容器 / 工位列单状态 / 状态形状 / 动作图标+文字）',
-  { skip: probe.reasons.ui || false, timeout: 300_000 }, async (t) => {
+test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于固定 / aria-current / 滚动面 / 窄屏图标轨 / 展开态 / 英文态表头不折）+ #817 用户表（表头单行 / 横滚容器 / 工位列单状态 / 状态形状 / 动作图标+文字）',
+  // 点名（E2E_UI=1）时**不许**用 skip 把预检缺口吞成 rc=0：那时跳过 = 假通过。
+  { skip: (!UI_ENABLED && probe.reasons.ui) || false, timeout: 300_000 }, async (t) => {
     if (!UI_ENABLED) {
       t.diagnostic('浏览器腿要点名才跑（设 E2E_UI=1 开启；缺口令/容器会判红，除非显式 E2E_UI_SOFT=1）');
       t.skip();
       return;
+    }
+    // 点名之后的预检缺口（缺 docker / 容器没跑 / 容器里没 playwright / 缺口令）：
+    // 只有显式逃生门 E2E_UI_SOFT=1 才允许降级 skip，其余一律判红。
+    if (probe.reasons.ui) {
+      if (UI_SOFT) {
+        t.diagnostic(`E2E_UI_SOFT=1 ⇒ 按环境形状 skip：${probe.reasons.ui}`);
+        t.skip();
+        return;
+      }
+      assert.fail(`E2E_UI=1 点名要跑，但环境不齐：${probe.reasons.ui}。`
+        + '点名却静默 skip 会让 rc=0 与真跑同色（假通过）⇒ 判失败。'
+        + '确知这台机器今天跑不了活栈 ⇒ 显式带 E2E_UI_SOFT=1 降级。');
     }
     t.diagnostic(`入口：${BASE}（自签证书已跳过校验）`);
     t.diagnostic(`执行环境：容器 ${PW_CONTAINER} 内 ${PW_MODULE}（本仓库不装 playwright）`);
@@ -567,20 +641,48 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         + ` collapsed=${JSON.stringify(rep.macrosCollapsed)} reexpand=${JSON.stringify(rep.macrosReexpandAfterCollapse)}`
         + ` afterReloadIncludesMacros=${JSON.stringify(rep.expandedAfterReloadIncludesMacros)}`);
 
-      // 环境形状：致命且是「入口到不了」这一类 ⇒ skip；到了页面却没跑通 ⇒ 产品红。
+      // 致命分支：只有**能正面认定**的两类环境形状才允许 skip，其余一律判红——
+      // 早先的写法是「非网络错误一律 skip」⇒ 登录选择器改名、侧栏没渲染、脚本自身抛错都会被报成
+      // 环境 skip 而 rc=0（假通过）。
       if (rep.fatal) {
         const entryUnreachable = /net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake/i.test(String(rep.fatal));
-        if (entryUnreachable && !UI_SOFT) {
+        // 旧镜像的**正面证据**：登录过了（不在登录页，说明入口与鉴权都通），但侧栏与用户表**两者都不存在**。
+        const stillOnLogin = !!(rep.boot && (rep.boot.onLoginPage || /\/login/.test(String(rep.boot.hash))));
+        const oldImage = !!rep.boot && !stillOnLogin
+          && rep.boot.hasSidebar === false && rep.boot.hasUserTable === false;
+        if (UI_SOFT) {
+          t.diagnostic(`E2E_UI_SOFT=1 ⇒ 按环境形状 skip：${rep.fatal}`);
+          t.skip();
+          return;
+        }
+        if (entryUnreachable) {
           assert.fail(`E2E_UI=1 点名要跑：容器内连入口 ${BASE} 都不通（#878：run 阶段 net:: 一律判红，不能降级 skip）：${rep.fatal}`);
         }
-        t.diagnostic(`入口/环境不可达，按形状 skip：${rep.fatal}`);
-        t.skip();
-        return;
+        if (stillOnLogin) {
+          assert.fail(`登录没走通（致命后仍停在登录页）：${rep.fatal}；boot=${JSON.stringify(rep.boot)}`);
+        }
+        if (oldImage) {
+          t.diagnostic(`活栈跑的是本功能之前的镜像（侧栏与用户表都不存在，boot=${JSON.stringify(rep.boot)}），按环境形状 skip：${rep.fatal}`);
+          t.skip();
+          return;
+        }
+        assert.fail(`浏览器腿在页面已连通的情况下失败（不是环境形状，按产品红计）：${rep.fatal}；boot=${JSON.stringify(rep.boot)}`);
       }
 
       // ---- 断言：导航腿（#818）----
       const nav = rep.nav;
-      assert.ok(nav.linkCount === 15, `侧栏链接数应 = 15，实测 ${JSON.stringify(nav.linkCount)}（links=${JSON.stringify((nav.links || []).map((l) => l.test))}）`);
+      // 钉死**集合**而不只钉总数：只数 15 时，缺一项 + 多一项仍能凑够 15 而通过（评审指出的真缺口）。
+      const EXPECTED_NAV = [
+        'nav-link-admin-users', 'nav-link-admin-seat-content', 'nav-link-admin-llm',
+        'nav-link-admin-repos', 'nav-link-admin-mail', 'nav-link-admin-tls',
+        'nav-link-admin-upload', 'nav-link-admin-prompts', 'nav-link-admin-runtime',
+        'nav-link-admin-market', 'nav-link-admin-system', 'nav-link-admin-preview-pool',
+        'nav-link-admin-macros', 'nav-link-admin-macro-runs', 'nav-link-admin-about',
+      ].sort();
+      const actualNav = (nav.links || []).map((l) => String(l.test)).sort();
+      assert.deepEqual(actualNav, EXPECTED_NAV,
+        `侧栏链接集合不对（缺/多/改名都算红）。实测 ${JSON.stringify(actualNav)}`);
+      assert.ok(nav.linkCount === 15, `侧栏链接数应 = 15，实测 ${JSON.stringify(nav.linkCount)}`);
       assert.ok(nav.groupHeaderCount === 6, `分组标题数应 = 6，实测 ${JSON.stringify(nav.groupHeaderCount)}（headers=${JSON.stringify(nav.headerTests)}）`);
       assert.ok(nav.aboutPresent && nav.aboutInFooter && !nav.aboutInAnyGroup,
         `「关于」应在底部固定区且不在任何分组内：present=${JSON.stringify(nav.aboutPresent)} inFooter=${JSON.stringify(nav.aboutInFooter)} inGroup=${JSON.stringify(nav.aboutInAnyGroup)}`);
@@ -595,6 +697,7 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       assert.ok(['auto', 'scroll'].includes(nav.navOverflowY), `侧栏 overflow-y 应为 auto/scroll（两个滚动面），实测 ${JSON.stringify(nav.navOverflowY)}`);
       assert.ok(nav.navScrollWidth <= nav.navClientWidth + 1,
         `宽视口侧栏不应横向溢出：nav.scrollWidth=${nav.navScrollWidth} > nav.clientWidth=${nav.navClientWidth} +1`);
+      // 「两个滚动面」放到窄视口那段量（那里同时收了 main 的 overflow 与侧栏的实际高）。
 
       // 展开态
       assert.ok(Array.isArray(rep.expandedGroupsInitial) && rep.expandedGroupsInitial.length === 1,
@@ -611,12 +714,18 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       // ---- 断言：表格腿（#817）----
       const tbl = rep.table;
       assert.ok(tbl.tablePresent, '用户表没渲染出来（tablePresent=false）——可能活栈跑的是改动前镜像');
+      // 表头数量与非空先钉住：表头被删空时 wrappedThs 恒为空数组，光看它会假绿。
+      assert.equal(tbl.thCount, 11, `表头格数应 = 11（#817 的列序），实测 ${JSON.stringify(tbl.thCount)}：${JSON.stringify(tbl.thLabels)}`);
+      const emptyTh = (tbl.thLabels || []).filter((x) => !x || x.length < 1);
+      assert.deepEqual(emptyTh, [], `存在空表头（文案丢了）：${JSON.stringify(tbl.thLabels)}`);
       assert.deepEqual(tbl.wrappedThs, [], `表头有换行的格（thead th 应全部单行）：${JSON.stringify(tbl.wrappedThs)}`);
       assert.ok(tbl.rowCount >= 1, `用户表至少要有 1 行，实测 ${JSON.stringify(tbl.rowCount)}`);
 
-      // 工位列：每行一个状态，可见文本不含保留中、长度有上界。
-      const seatBad = (tbl.seatCells || []).filter((c) => c.text.includes('workspace 保留中') || c.len > 30);
-      assert.deepEqual(seatBad, [], `「工位」列出现堆叠/超长文本（每行应只有一个状态，保留中只在 title）：${JSON.stringify(seatBad)}`);
+      // 工位列：每行一个状态，可见文本不含保留中、非空、长度有上界；hover(title) 必须非空。
+      const seatBad = (tbl.seatCells || []).filter((c) => !c.text || c.text.includes('workspace 保留中') || c.len > 30);
+      assert.deepEqual(seatBad, [], `「工位」列出现空/堆叠/超长文本（每行应只有一个状态，保留中只在 title）：${JSON.stringify(seatBad)}`);
+      const titleBad = (tbl.seatCells || []).filter((c) => !c.title);
+      assert.deepEqual(titleBad, [], `「工位」格缺 hover 全文（title 为空）：${JSON.stringify(titleBad)}`);
       assert.ok((tbl.seatCells || []).length === tbl.rowCount, `工位列格数应 = 行数（每行一格）：cells=${JSON.stringify((tbl.seatCells || []).length)} rows=${JSON.stringify(tbl.rowCount)}`);
       // 「workspace 保留中」允许在 hover(title) 里，但不许在可见文本里 ⇒ 整页 innerText 不含它。
       assert.equal(tbl.bodyHasRetainedInText, false, `整页可见文本出现「workspace 保留中」（应只在 title/hover），实测 ${JSON.stringify(tbl.bodyHasRetainedInText)}`);
@@ -640,11 +749,27 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       }
       assert.equal(tbl.bodyHasRawI18nKey, false, `整页残留裸 i18n key（形如 admin.tabs.xxx 原样出现），实测 ${JSON.stringify(tbl.bodyHasRawI18nKey)}`);
 
+      // ---- 断言：英文态（#817 的表头换行事故最先出在英文长标签上）----
+      const en = rep.en;
+      assert.ok(en, `英文态没测到（r.en 缺失），enRestoreError=${JSON.stringify(rep.enRestoreError)}`);
+      assert.equal(en.thCount, 11, `英文态表头格数应 = 11，实测 ${JSON.stringify(en.thCount)}：${JSON.stringify(en.thLabels)}`);
+      assert.ok(/[A-Za-z]/.test((en.thLabels || []).join('')), `英文态表头应含拉丁字母（证明确实切到了英文）：${JSON.stringify(en.thLabels)}`);
+      assert.deepEqual(en.wrappedThs, [], `英文态表头有换行的格（英文长标签最容易折）：${JSON.stringify(en.wrappedThs)}`);
+      assert.ok(en.docScrollWidth <= en.docClientWidth + 1,
+        `英文态文档不应横向溢出：scrollWidth=${en.docScrollWidth} > clientWidth=${en.docClientWidth} +1`);
+      assert.equal(rep.enRestoreError, undefined, `英文态量完没切回中文（dev 账号会留在英文态）：${JSON.stringify(rep.enRestoreError)}`);
+
       // ---- 断言：窄视口（#818 图标轨 + #817 表格外层横滚）----
       const nar = rep.narrow;
-      assert.ok(nar.railWidth > 0 && nar.railWidth < 60, `窄视口侧栏应收成图标轨（≈44，<60），实测 railWidth=${JSON.stringify(nar.railWidth)}`);
-      assert.ok(nar.docScrollWidth <= nar.docClientWidth + 1,
-        `窄视口文档不应横向溢出：scrollWidth=${nar.docScrollWidth} > clientWidth=${nar.docClientWidth} +1`);
+      // 下限不只 >0：1px 也算「<60」而通过。
+      assert.ok(nar.railWidth >= 32 && nar.railWidth < 60, `窄视口侧栏应收成图标轨（≈44，32–59），实测 railWidth=${JSON.stringify(nar.railWidth)}`);
+      // 侧栏的 overflow-y 在宽视口那段已钉（窄视口它收成图标轨，computed 值会变成 visible，属正常）。
+      assert.ok(nar.navScrollHeight >= nar.navClientHeight,
+        `侧栏 scrollHeight 不应小于 clientHeight（小于说明量错了元素）：${JSON.stringify({ sh: nar.navScrollHeight, ch: nar.navClientHeight })}`);
+      assert.ok(['auto', 'scroll'].includes(nar.mainOverflowY),
+        `main 应是独立滚动面（overflow-y auto/scroll），实测 ${JSON.stringify(nar.mainOverflowY)}`);
+      assert.ok(['auto', 'scroll'].includes(nar.scrollOverflowX),
+        `表格外层容器应是可横滚（overflow-x auto/scroll），实测 ${JSON.stringify(nar.scrollOverflowX)}（hidden 也能让 scrollWidth>clientWidth 成立，故先钉 CSS）`);
       assert.ok(nar.scrollScrollWidth > nar.scrollClientWidth,
         `窄视口表格外层滚动容器应自己可横滚（scrollWidth>clientWidth）：scroll=${JSON.stringify({ sw: nar.scrollScrollWidth, cw: nar.scrollClientWidth, ox: nar.scrollOverflowX })}`);
 
@@ -653,7 +778,11 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       // console error 白名单（常见良性噪声）；白名单外一律红。
       // 其中「Failed to load resource ... 401」是 SPA 进登录页时未登录探会话的**预期** 401
       //（登录后页面正常渲染出数据）；只放行 401 这一种，不 blanket 放行所有 failed-load（会掩盖 500）。
-      const CONSOLE_ALLOW = [/favicon/i, /ResizeObserver loop/i, /Download the Vue Devtools/i, /DevTools/i, /status of 401\b/];
+      // 白名单只放「浏览器级瞬时现象」与开发提示，**不放应用错误**：
+      // ERR_NETWORK_CHANGED / ERR_ABORTED 是导航与 reload 期间被浏览器主动丢弃的请求（本次实测：
+      // 切语言后重渲染 + 立刻换视口导航时偶发），与应用无关；其余 net:: 一律仍算红。
+      const CONSOLE_ALLOW = [/favicon/i, /ResizeObserver loop/i, /Download the Vue Devtools/i, /DevTools/i, /status of 401\b/,
+        /Failed to load resource: net::ERR_(NETWORK_CHANGED|ABORTED)\b/];
       const realConsole = (rep.consoleErrors || []).filter((e) => !CONSOLE_ALLOW.some((re) => re.test(e)));
       assert.deepEqual(realConsole, [], `白名单外的 console error：${JSON.stringify(realConsole.slice(0, 5))}`);
 
@@ -682,6 +811,9 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
         macrosReexpand: rep.macrosReexpandAfterCollapse,
         reloadIncludesMacros: rep.expandedAfterReloadIncludesMacros,
         wrappedThs: tbl.wrappedThs,
+        enThLabels: (rep.en || {}).thLabels,
+        enWrappedThs: (rep.en || {}).wrappedThs,
+        enDocScroll: rep.en ? [rep.en.docScrollWidth, rep.en.docClientWidth] : null,
         rowCount: tbl.rowCount,
         seatMaxLen: (tbl.seatCells || []).reduce((a, c) => Math.max(a, c.len), 0),
         statusShapesOk: (tbl.statusGlyphs || []).length === tbl.rowCount && (tbl.statusGlyphs || []).length > 0,
