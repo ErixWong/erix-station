@@ -269,9 +269,16 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
   - **存量核对（一条可复跑语句，勿把某机实测数字当结论）**：工具结果块**不在 `record` 顶层**，而在
     `record -> 'messages'[*] -> 'content'[*]` 里 `type = 'tool_result'` 的块上；耗时键是块内的
     `erix.durationMs`，旧键是同一块的顶层 `duration`。按路径直查顶层键会得到恒 0 的**假阴性**（实测踩过）。
-    四个计数各自回答一个问题：`tool_results` = 分母（为 0 说明路径错了，别信其余三个数）；
-    `legacy_duration_key` = 还带旧键的块数；`legacy_only_no_engine` = **只**有旧键、没有引擎值的块数
-    （这才是删回退可能改变行为的集合）；`no_engine_duration` = 引擎值缺失的块数（本来就显示「未知」）。
+    五个计数各自回答一个问题（`tool_results` 是分母，为 0 就说明路径问错了，其余四个数全部别信）：
+    - `tool_results` —— 分母。
+    - `legacy_duration_key` —— 仍带顶层旧键 `duration` 的块数（冗余残留，不等于会改变行为）。
+    - `legacy_only_no_engine` —— **只有**旧键、没有 `erix.durationMs` 的块数：这才是删 runner 那条
+      回退后**唯一可能改变行为**的集合。
+    - `no_engine_duration` —— 引擎值缺失的块数（DTO 面上本来就显示「未知」）。
+    - `no_erix_object` —— 连 `erix` 对象都没有的块数：老形状（引擎 0.20.0 之前）的规模。
+      ⚠ 这条 CTE **不按 type 过滤**，所以每一条 `FILTER` 都得自带 `b->>'type' = 'tool_result'`；
+      漏掉就会数到 `text` / `tool_use` 块，得到**比分母还大**的数（本单实测踩过 4263 > 2116）。
+      它总是 `≤ no_engine_duration`，两者接近就说明存量里老记录占多数。
     ```sql
     WITH blocks AS (
       SELECT t.run_id, b
@@ -286,15 +293,23 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
     SELECT count(*) FILTER (WHERE b->>'type' = 'tool_result')                    AS tool_results,
            count(*) FILTER (WHERE b->>'type' = 'tool_result' AND b ? 'duration') AS legacy_duration_key,
            count(*) FILTER (WHERE b->>'type' = 'tool_result' AND b ? 'duration'
-                                  AND NOT (b->'erix' ? 'durationMs'))            AS legacy_only_no_engine,
+                                  AND NOT COALESCE(b->'erix' ? 'durationMs', false))            AS legacy_only_no_engine,
            count(*) FILTER (WHERE b->>'type' = 'tool_result'
-                                  AND NOT (b->'erix' ? 'durationMs'))            AS no_engine_duration
+                                  AND NOT COALESCE(b->'erix' ? 'durationMs', false))   AS no_engine_duration,
+           count(*) FILTER (WHERE b->>'type' = 'tool_result'
+                                  AND jsonb_typeof(b->'erix') IS DISTINCT FROM 'object') AS no_erix_object
     FROM blocks;
     ```
-    ⚠ 另有一条**容易把自己骗了的形状**：本表存在 `run_id IS NULL` 的历史行，它们不经 DTO 面
-    （DTO 的取数入口是 run 锚点），所以「块数很多」不等于「用户会看到变化」——要判断影响面，
-    再按 `run_id` 关联 `runs` 与 `tool_calls`（宿主回退按 `(run_id, call_id)` 供值）。 WHERE jsonb_typeof(r.record::jsonb -> 'toolResults') = 'array' AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(r.record::jsonb -> 'toolResults') e WHERE e ? 'durationMs');`
-    - `tool_calls` 侧本来就该是 NULL、不是待修数据的行：`SELECT count(*) FROM tool_calls WHERE duration_ms IS NULL;`
+    ⚠ **三值逻辑是这条语句最大的坑**：`b->'erix'` 在块里没有 `erix` 键时结果是 SQL `NULL`，
+    `NOT (NULL ? 'durationMs')` 仍是 `NULL`，`FILTER` 直接不计数 ⇒ **恰好漏掉最老的形态**
+    （连 `erix` 都没有的老块）。写成 `NOT COALESCE(..., false)` 才把它们算进来；漏掉时计数会小一个
+    量级而**不报错**（本单先漏到只剩 1/65 才发现）。
+    ⚠ 还有一条会把人骗第二次：本表存在 `run_id IS NULL` 的历史行，它们**不经 DTO 面**
+    （DTO 的取数入口是 run 锚点）⇒「块数很多」不等于「用户会看到变化」。要判影响面，再按
+    `run_id` 关联 `runs` 收窄到 DTO 可达的那些块，并按 `(run_id, call_id)` 关联 `tool_calls`
+    看宿主列**曾经**有没有值（`duration_ms IS NOT NULL` 才算「这格原来显示过数字」）。
+    - `tool_calls.duration_ms IS NULL` 的行数只是**观察值**：自 #303 起该列不再被 DTO 读，
+      「本该为 NULL」的结论要靠上面的 `(run_id, call_id)` 关联得出，不能只靠这条全表计数。
 - `judge_decisions`：judge 事件（`kind / action / decision`）的持久化，与 `run_events` 中 `judge` 类型事件同源。
 - `approvals`：**一个工具调用至多一条审批单**（`UNIQUE(run_id, tool_call_id)`，`tool_call_id` 为外部 `call_id`）；`CHECK` 保证 `pending/expired` 与 `decided_at IS NULL` 一致；决定后 runner 轮询继续/终止（portal.md §4.8）。状态机见 §2.3。⚠️ 超时语义已定稿（#10：`pending → expired`，由 portal 打标，topology.md §4-L6）；`tool_call_id` 是否改判 UUID 待 #10 确认。
 - `artifacts`：run 产出的文件登记（issue #64 R1 起为**终态产物 bundle 登记**：`kind='worktree_bundle'`（**历史遗留名**：D8 修订后 bundle 的内容来自**项目目录（worker cwd）**而非 run worktree，值本身是契约不因此改名 ⇒ `portal/src/artifacts.js` 的 `ARTIFACT_KIND`），一 run 一行，`UNIQUE(run_id, kind)`（迁移 0005），重复上传 409 不覆盖）。`path` = portal 持久卷路径（`ERIX_ARTIFACTS_ROOT/<runId>.tar.gz`；原「容器内路径」登记设想由 v1 bundle 语义替代），`size`/`sha`（sha256）描述 bundle 本体，`manifest`（jsonb，迁移 0005）= agentd 生成的包内清单（文件路径/大小/sha256/`truncated` 截断标记），portal 从 tar 内 `manifest.json` 抽出落库。bundle 内容：`diff.patch`（git diff HEAD）+ 新文件快照 + `manifest.json`，上限 20MB（`ERIX_ARTIFACT_MAX_BYTES`）。

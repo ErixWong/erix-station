@@ -10,8 +10,8 @@
 //  B. station 自己的面：
 //     ① **防回装**（#283 的临时闸已撤）：引擎自己写 `erix.durationMs`，宿主不得再包一层计时；
 //     ② 顶层退役名单里的名字**不得再出现**在我们产出的块上；
-//     ③ `loopEventPayload` 的 `duration_ms` 读点：`erix.durationMs` 优先、**顶层 `duration` 只作
-//        旧记录的一代回退**、两者都没有 ⇒ `null`（不是 0）；
+//     ③ `loopEventPayload` 的 `duration_ms` 读点：**只读 `erix.durationMs`**，缺值 ⇒ `null`
+//        （不是 0）。顶层 `duration` 的「一代回退」已在 **#303** 退役（引擎 0.34.0 起旧键不再写）；
 //     ④ 普通结果块上 `executionStatus` **缺席**（guide §7），我们的读法不得依赖「字段在不在」。
 //
 // 隔离约定：桩 provider + 内存 store + 真 `runToolLoop`，零 LLM / DB / 容器 / 网络。
@@ -133,7 +133,7 @@ test('抛异常/返回 Error：引擎给的是真实观测（不是把未知塌�
 });
 
 // ---------------------------------------------------------------------------
-// B③ loopEventPayload 的 duration_ms 读点（新记录 / 旧记录回退 / 两者都缺）
+// B③ loopEventPayload 的 duration_ms 读点（有引擎值 / 只有退役旧键（#303）/ 两者都缺）
 // ---------------------------------------------------------------------------
 
 test('loopEventPayload：erix.durationMs 优先，且两值并存时以引擎命名空间为准', () => {

@@ -130,11 +130,10 @@ export interface ProjectedToolCall {
    */
   toolCallKey?: string;
   /**
-   * 耗时（毫秒）。**两条来源**（#283 → #299）：
-   *   1. erix-agent 0.20.0 起**引擎投影自己带** `durationMs`（`erix.durationMs` 的投影）；
-   *   2. 投影缺省时由 `portal/src/session-view.js` 在投影之后按 `(run_id, call_id)` 从自家
-   *      `tool_calls.duration_ms` **回落 join**（老记录唯一的时长来源）。
-   * 两路都没有 ⇒ DTO **不出现该键**（0.20.0 明说「缺失=不知道」，**绝不写 0**）；
+   * 耗时（毫秒）。**只有一个来源**（#283 → #299 → #303）：erix-agent 0.20.0 起**引擎投影自己带**的
+   * `durationMs`（`erix.durationMs` 的投影）。#299 期间宿主曾在投影缺省时按 `(run_id, call_id)` 从自家
+   * `tool_calls.duration_ms` 回落 join，**#303 起该回落已退役**（引擎 0.34.0 不再写旧键，宿主列不再
+   * 是 DTO 的时长来源）。投影不带 ⇒ DTO **不出现该键**（0.20.0 明说「缺失=不知道」，**绝不写 0**）；
    * 前端只在卡片现有 `dur` 为空时用它。T1 之前的记录上引擎那一路是直接缺省的（不合成）。
    */
   durationMs?: number;
@@ -895,7 +894,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // 同一调用不会渲染两张卡片；仅凭 DTO（无事件）也能渲染卡片。卡片排在正文气泡前（先工具后答复）。
     if (Array.isArray(m.toolCalls)) {
       m.toolCalls.forEach((call, index) => {
-        // issue #283：整个 call（含宿主 join 的 `durationMs`）一并交给 projectToolCard——
+        // issue #283：整个 call（含引擎投影带的 `durationMs`）一并交给 projectToolCard——
         // 刷新后卡片仍能显示耗时，但实时路已拿到的值不会被它覆盖（覆盖规则在 composable 里）。
         // issue #279：身份键与实时路同一把尺（含轮号），另把 provider `id`/`run_id` 作为关联别名传过去。
         const ident = toolCardIdentity(m.id, m.run_id, call, index);

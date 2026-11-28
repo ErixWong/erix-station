@@ -208,8 +208,9 @@ export interface ToolCardState {
   // issue #85：tool_result 的 duration_ms 原值（可选，tool_result 回填），卡片头部耗时显示用；
   // out 文案的拼接语义不变。
   // issue #283：**undefined = 没有时长**（引擎没给 / 旧数据 NULL），卡片只出 ✓/✗——绝不拿 0 冒充。
-  // 两个来源：实时/历史 `tool_result` 事件，以及投影路径 DTO 的宿主字段 `durationMs`
-  //（`projectToolCard` 只在它为空的时侯填，实时值优先）。单位换算在 `lib/toolSummary.formatDuration`。
+  // 两个**路径**、一个**来源**：实时/历史 `tool_result` 事件，或投影路径 DTO 的 `durationMs`
+  //（#303 起该字段就是引擎投影带的值，宿主 join 已退役）。`projectToolCard` 只在现有 `dur` 为空时
+  // 填（实时值优先）。单位换算在 `lib/toolSummary.formatDurationMs`，这里不做格式化。
   dur?: number;
   // issue #188：DTO 投影来源的卡片字段（加载/刷新路径）——直接透传上游 `toolCalls[]` 同名键，
   // 事件流路径不填。argsSummary = 上游 120 字参数摘要；resultPreview = 上游 400 字结果预览；
@@ -889,9 +890,9 @@ export function useEventStream(hooks: EventStreamHooks) {
     resultPreview?: unknown;
     isError?: boolean;
     executionStatus?: string;
-    // issue #283：宿主从自家 `tool_calls` join 进 DTO 的耗时（**不是**引擎投影字段，来源见
-    // `portal/src/session-view.js#attachToolCallDurations`）。只在卡片现有 `dur` 为空时填——
-    // 实时路已拿到的值不许被投影覆盖（两路同 callId 归并时以实时为准）。
+    // issue #283 / #303：DTO 上的工具耗时 = **引擎投影带的** `durationMs`（宿主 `tool_calls` join 已于
+    // #303 退役；宿主侧只做「非有限脏值剥键」，见 `portal/src/session-view.js#attachToolCallDurations`）。
+    // 只在卡片现有 `dur` 为空时填——实时路已拿到的值不许被投影覆盖（两路同 callId 归并时以实时为准）。
     durationMs?: number;
   }, alias?: CardAlias) {
     // 有预览字段 = 归一后仍不为 undefined；归一后的文本另存（number/null 到卡片里就是合法展示串）。
@@ -911,8 +912,8 @@ export function useEventStream(hooks: EventStreamHooks) {
       if (resultPreview !== undefined && existing.resultPreview === undefined) existing.resultPreview = resultPreview;
       if (fields.executionStatus !== undefined && existing.executionStatus === undefined) existing.executionStatus = fields.executionStatus;
       // issue #283：刷新后不丢时长——但**只在实时路没给过的时候**用投影值（已有值优先）。
-      // issue #299：投影值现在可能来自**引擎自己**（0.20.0 起投影 `toolCalls[].durationMs`），也可能来自
-      // 宿主 join 的回落值（`portal/src/session-view.js`）；前端不分辨来源，只看「有值才用」。
+      // issue #299 → #303：投影值只可能来自**引擎自己**（0.20.0 起投影 `toolCalls[].durationMs`，宿主
+      // join 的回落已退役）；这一侧不分辨来源，只看「有值才用」。
       if (projectedDur !== undefined && existing.dur == null) existing.dur = projectedDur;
       // issue #delegate：同样「实时优先」——已有 runId 的卡**不被投影覆盖**，只给缺位的补上
       //（实时路漏收 run_id 时，刷新后仍能把抽屉打开）。
