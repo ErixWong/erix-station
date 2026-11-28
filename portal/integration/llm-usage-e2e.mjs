@@ -508,6 +508,9 @@ try {
   r.page.featurePresent = r.page.headerCells.some((x) => /周期 \/ 用量|Period \/ usage/.test(x))
     || (await page.locator('[data-test^="user-usage-"]').count()) > 0;
 
+  // 行数：AdminUsersView 在 users 载入后**先建表**、再按 filteredUsers **出行**，所以「有表头、零行」
+  // 是真会出现的状态；零行时下面所有按格子的检查会整批空过（假绿）。外层据此判红。
+  r.page.rowCount = await page.locator('[data-test="user-row"]').count();
   r.page.cells = await page.$$eval('[data-test^="user-usage-"]', (els) => els.map((e) => {
     const row = e.closest('[data-test="user-row"]');
     const firstCell = row ? row.querySelector('td') : null;
@@ -596,7 +599,14 @@ test(`U1 真浏览器进 #/admin/users 钉「周期 / 用量」列：表头/用�
       assert.ok(usageIdx > 0 && usageIdx < hc.length - 1,
         `「${HEADER_EXPECT}」落在首/末列（下标 ${usageIdx} / 共 ${hc.length}）——列序被动过，用量格与表头的对齐不再可信`);
 
+      // 先钉「有行、且每行恰好一个用量格」：否则下面 data-test / lifetime / period 那些检查会在空数组
+      // 上全部空过（有表头无行是真状态，来历见采集处 rowCount）。
+      const rowCount = Number(rep.page.rowCount);
+      assert.ok(Number.isFinite(rowCount) && rowCount > 0,
+        `用户表一行都没有（rowCount=${JSON.stringify(rep.page.rowCount)}）⇒「有表头无行」，按格子的检查会空过（假绿）`);
       const cells = rep.page.cells || [];
+      assert.equal(cells.length, rowCount,
+        `用量格数 ${cells.length} ≠ 用户行数 ${rowCount}（每行应恰好一个用量格；对不上说明列与行没对上或有行漏渲染）`);
       // ② 每个用量格 data-test 合法（unknown|period|lifetime），整表不残留 pending。
       assert.equal(rep.page.pendingCount, 0, `整表残留 user-usage-pending ${rep.page.pendingCount} 格（卡在加载态 = 红）`);
       for (const c of cells) {

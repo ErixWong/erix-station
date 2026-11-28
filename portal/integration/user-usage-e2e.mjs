@@ -582,7 +582,7 @@ async function collectBadge(page) {
       title: el.getAttribute('title') || '',
       aria: el.getAttribute('aria-label') || '',
       badgeTop: rect.top,
-      badgeH: rect.height, badgeLeft: rect.left,
+      badgeH: rect.height, badgeLeft: rect.left, badgeRight: rect.right,
     };
   });
   Object.assign(o, info);
@@ -599,12 +599,14 @@ async function collectBadge(page) {
       whoTop: who ? who.getBoundingClientRect().top : null,
       whoH: who ? who.getBoundingClientRect().height : null,
       whoRight: who ? who.getBoundingClientRect().right : null,
+      viewportWidth: window.innerWidth,
     };
   });
   o.headerHeight = geo.headerHeight;
   o.whoTop = geo.whoTop;
   o.whoH = geo.whoH;
   o.whoRight = geo.whoRight;
+  o.viewportWidth = geo.viewportWidth;
   return o;
 }
 
@@ -755,8 +757,12 @@ test('U1 真浏览器进工作台（路由 /）：徽标紧跟 who/周期文案+
       // 于是登录后才出的 fatal（工作台路由没匹配上、渲染挂了）会一路走到徽标存在性判断，最后以 skip
       // 收场——这条腿因此可以在页面全空的情况下次次 rc 0（本单开局就是这么藏了三周）。
       if (rep.fatal) {
+        // 登录后一律判红，但把「网络/入口中断」在消息里分出来：它多半是活栈/容器正在重启，
+        // 重跑前先确认容器健康；其余按产品缺陷查。**两类都是红**，只是分诊方向不同（不拿 skip 遮掉）。
+        const netLike = /net::|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|getaddrinfo|handshake|socket hang up/i.test(String(rep.fatal));
         assert.fail(`已到达登录页却没跑通（登录后失败不退化成 skip）：${rep.fatal}`
-          + `（登录态=${JSON.stringify(rep.login)}，pageerror=${String((rep.pageErrors || []).slice(0, 2).join(' / '))}）`);
+          + `（${netLike ? '登录后网络/入口中断：多半是活栈或容器正在重启，先确认容器健康再重跑' : '非网络类：按产品缺陷查'}；`
+          + `登录态=${JSON.stringify(rep.login)}，pageerror=${String((rep.pageErrors || []).slice(0, 2).join(' / '))}）`);
       }
       assert.match(String(rep.login.hash || ''), /#\/(?!login)/, `登录后没离开 /login，hash=${JSON.stringify(rep.login.hash)}`);
       // 采集前置：hash 必须真的是工作台路由 `/`。同文档哈希跳转不会清空旧 DOM，光等 [data-test="who"]
@@ -787,21 +793,28 @@ test('U1 真浏览器进工作台（路由 /）：徽标紧跟 who/周期文案+
       assert.ok(/本月|本日/.test(String(zh.title)) || /本月|本日/.test(String(zh.aria)),
         `zh 徽标 title/aria 应含完整词「本月/本日」，实得 title=${JSON.stringify(zh.title)} aria=${JSON.stringify(zh.aria)}`);
       assert.ok(!/^mo |^d |mo used/i.test(String(zh.title)), `zh 徽标 hover 出现窄黑话（如 "mo used"）：${JSON.stringify(zh.title)}`);
-      // 顶栏不换行：**同一行**的判据是「垂直中心一致」，不是「top 相等」。顶栏是 flex + align-items:center，
-      // 徽标盒子（真机实测高 26）比纯文本的 who（高 20）高一档，居中对齐后徽标 top 反而**小 3px**——实测两者
-      // 中心都是 23，同一行。旧写法比 top 差 < 2px 是假探测器（同类事故：#817 那条拿 scrollHeight 判换行恒等，
-      // 修法见 8046fa0c：改数行盒）。掉行会让顶栏高度翻倍，所以两件事一起钉。
-      assert.ok([zh.badgeTop, zh.whoTop, zh.badgeH, zh.whoH].every(Number.isFinite),
-        `拿不到徽标/who 的盒子（badgeTop=${JSON.stringify(zh.badgeTop)} whoTop=${JSON.stringify(zh.whoTop)} badgeH=${JSON.stringify(zh.badgeH)} whoH=${JSON.stringify(zh.whoH)}）`);
-      const zhBadgeMid = zh.badgeTop + zh.badgeH / 2;
-      const zhWhoMid = zh.whoTop + zh.whoH / 2;
-      assert.ok(Math.abs(zhBadgeMid - zhWhoMid) < 2,
-        `徽标与 who 不在同一行：垂直中心 ${zhBadgeMid.toFixed(1)} vs ${zhWhoMid.toFixed(1)}（top ${zh.badgeTop}/${zh.whoTop}、高 ${zh.badgeH}/${zh.whoH}、header 高=${JSON.stringify(zh.headerHeight)}）`);
-      assert.ok(Number.isFinite(zh.headerHeight) && zh.headerHeight > 0 && zh.headerHeight < 60,
-        `顶栏高度 ${JSON.stringify(zh.headerHeight)}px 不在 (0, 60) 内 ⇒ 要么没渲染（0/负）要么掉成了两行`);
-      assert.ok(Number.isFinite(zh.badgeLeft) && Number.isFinite(zh.whoRight)
-        && zh.badgeLeft >= zh.whoRight - 1 && zh.badgeLeft - zh.whoRight <= 24,
-        `徽标没紧跟在 who 右边（who 右边缘=${JSON.stringify(zh.whoRight)}，徽标左边缘=${JSON.stringify(zh.badgeLeft)}）`);
+      // 顶栏形状判据（zh / en 两趟都跑）。**同一行**的判据是「垂直中心一致」，不是「top 相等」：顶栏是
+      // flex + align-items:center，徽标盒子（真机实测高 26）比纯文本的 who（高 20）高一档，居中对齐后
+      // 徽标 top 反而**小 3px**，而两者中心都是 23 —— 同一行。旧写法比 top 差 < 2px 是假探测器（同类事故：
+      // #817 那条拿 scrollHeight 判换行恒等，修法见 8046fa0c：改数行盒）。掉行会让顶栏高度翻倍、
+      // 文案变长会把顶栏撑出视口，所以「同一行 + 没掉行 + 紧跟 + 没溢出视口」四件事一起钉，
+      // 并且**中英文两趟都钉**（只钉中文 = 英文长额度造成的溢出没人管）。
+      const assertBadgeGeometry = (label, g) => {
+        assert.ok([g.badgeTop, g.whoTop, g.badgeH, g.whoH].every(Number.isFinite),
+          `${label}：拿不到徽标/who 的盒子（badgeTop=${JSON.stringify(g.badgeTop)} whoTop=${JSON.stringify(g.whoTop)} badgeH=${JSON.stringify(g.badgeH)} whoH=${JSON.stringify(g.whoH)}）`);
+        const badgeMid = g.badgeTop + g.badgeH / 2;
+        const whoMid = g.whoTop + g.whoH / 2;
+        assert.ok(Math.abs(badgeMid - whoMid) < 2,
+          `${label}：徽标与 who 不在同一行——垂直中心 ${badgeMid.toFixed(1)} vs ${whoMid.toFixed(1)}（top ${g.badgeTop}/${g.whoTop}、高 ${g.badgeH}/${g.whoH}、header 高=${JSON.stringify(g.headerHeight)}）`);
+        assert.ok(Number.isFinite(g.headerHeight) && g.headerHeight > 0 && g.headerHeight < 60,
+          `${label}：顶栏高度 ${JSON.stringify(g.headerHeight)}px 不在 (0, 60) 内 ⇒ 要么没渲染（0/负）要么掉成了两行`);
+        assert.ok(Number.isFinite(g.badgeLeft) && Number.isFinite(g.whoRight)
+          && g.badgeLeft >= g.whoRight - 1 && g.badgeLeft - g.whoRight <= 24,
+          `${label}：徽标没紧跟在 who 右边（who 右边缘=${JSON.stringify(g.whoRight)}，徽标左边缘=${JSON.stringify(g.badgeLeft)}）`);
+        assert.ok(Number.isFinite(g.badgeRight) && Number.isFinite(g.viewportWidth) && g.badgeRight <= g.viewportWidth,
+          `${label}：徽标右边缘 ${JSON.stringify(g.badgeRight)} 超出视口宽 ${JSON.stringify(g.viewportWidth)} ⇒ 顶栏横向溢出（额度文案变长时的真实形状）`);
+      };
+      assertBadgeGeometry('zh 趟', zh);
 
       // ③ 弹窗：已用 + 进度条（与 chart 同一蓝色族 `bg-blue-600`）+ chart 区有 svg；按钮与 Esc 都能关。
       const modal = rep.modal || {};
@@ -830,6 +843,8 @@ test('U1 真浏览器进工作台（路由 /）：徽标紧跟 who/周期文案+
       assert.ok(/this month|this day/i.test(String(en.title)) || /this month|this day/i.test(String(en.aria)),
         `en 徽标 title/aria 应含完整词 this month/this day，实得 title=${JSON.stringify(en.title)} aria=${JSON.stringify(en.aria)}`);
       assert.ok(!/^mo |^d |mo used/i.test(String(en.title)), `en 徽标 hover 出现窄黑话（如 "mo used"）：${JSON.stringify(en.title)}`);
+      // 顶栏形状在英文趟同样钉一遍（英文文案比中文长，额度写全后更宽 ⇒ 溢出只在英文态出现的形状问题靠这条抓）。
+      assertBadgeGeometry('en 趟', en);
 
       // ⑥ 截图（人工复核证据，落宿主临时目录，不提交）。
       tryQuiet(() => fs.rmSync(SHOT_HOST_ZH, { force: true }));
