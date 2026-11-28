@@ -33,6 +33,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import https from 'node:https';
 
 // 自签证书（本机 CA 未进容器信任库），关掉校验；只在测试进程内生效，不外溢。
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -72,9 +73,11 @@ const HOST_RESOLVER_RULES = HOST_MAP.map((h) => `MAP ${h.host} ${h.ip}`).join(',
 
 const WIDE_VIEWPORT = { width: 1440, height: 900 };
 const NARROW_WIDTH = 820;
+// 状态列允许的形状（与容器脚本内同名常量一致）：勾/虚线圆/斜标，非旧装饰圆点。
+const STATUS_SHAPES = ['✓', '◌', '⊘'];
 
 // ---------------------------------------------------------------------------
-// docker 包装层：普通用户能跑就用普通用户，否则用 `sg docker -c`；整条命令不许含换行。
+// docker 包装层：普通用户能跑就用普通用户，否则包一层组权限；整条命令串不许含换行。
 // ---------------------------------------------------------------------------
 function dockerCmd(args) {
   const inner = ['docker', ...args].join(' ');
@@ -140,21 +143,36 @@ function readPassword() {
 }
 
 // ---------------------------------------------------------------------------
-// 通用：HTTP 取值（无浏览器；自签证书靠上面 NODE_TLS_REJECT_UNAUTHORIZED）。
+// 通用：HTTP 取值（无浏览器；自签证书靠 NODE_TLS_REJECT_UNAUTHORIZED + rejectUnauthorized:false）。
+// 宿主通常不解析入口域名（只有容器经 host-resolver-rules 能解）⇒ 这里按 HOST_MAP 把域名连到映射 IP，
+// 同时保留 SNI 与 Host 头为真域名，这样 HTTP 腿在宿主上也能真拿到 401（与浏览器腿同源）。
 // ---------------------------------------------------------------------------
-async function fetchJson(url, opts = {}) {
-  const res = await fetch(url, {
-    method: opts.method || 'GET',
-    headers: { accept: 'application/json', ...(opts.headers || {}) },
-    ...(opts.body ? { body: opts.body } : {}),
-    signal: AbortSignal.timeout(opts.timeoutMs || 15_000),
-    redirect: 'manual',
+function mapHost(hostName) {
+  const hit = HOST_MAP.find((h) => h.host === hostName);
+  return hit ? hit.ip : hostName;
+}
+
+function fetchJson(url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = https.request({
+      host: mapHost(u.hostname),
+      port: u.port || 443,
+      path: u.pathname + (u.search || ''),
+      method: opts.method || 'GET',
+      servername: u.hostname,
+      headers: { host: u.hostname, accept: 'application/json', ...(opts.headers || {}) },
+      rejectUnauthorized: false,
+      timeout: opts.timeoutMs || 15_000,
+    }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve({ status: res.statusCode, text: body, header: (k) => res.headers[k.toLowerCase()] }));
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end();
   });
-  return {
-    status: res.status,
-    text: await res.text(),
-    header: (k) => res.headers.get(k),
-  };
 }
 
 // 浏览器腿「能不能跑」逐项预探测；缺的东西记成原因，不算红。
@@ -307,6 +325,7 @@ try {
   // 展开态：清 localStorage ⇒ 默认只展开当前组；导航到别组自动展开；收起再进仍展开；刷新保持。
   await page.evaluate(() => localStorage.removeItem('admin.nav.expanded'));
   await page.goto(cfg.base + '/#/admin/users', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForSelector('[data-test="nav-group-usersSeats"]', { timeout: 20000 });
   r.expandedGroupsInitial = await page.evaluate(() => [...document.querySelectorAll('[data-test^="nav-group-"]')]
     .filter((b) => b.tagName === 'BUTTON' && b.getAttribute('aria-expanded') === 'true')
@@ -560,7 +579,7 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
 
       assert.ok(nav.docScrollWidth <= nav.docClientWidth + 1,
         `宽视口文档不应横向溢出：scrollWidth=${nav.docScrollWidth} > clientWidth=${nav.docClientWidth} +1`);
-      assert.ok(/auto|scroll/.includes(nav.navOverflowY), `侧栏 overflow-y 应为 auto/scroll（两个滚动面），实测 ${JSON.stringify(nav.navOverflowY)}`);
+      assert.ok(['auto', 'scroll'].includes(nav.navOverflowY), `侧栏 overflow-y 应为 auto/scroll（两个滚动面），实测 ${JSON.stringify(nav.navOverflowY)}`);
       assert.ok(nav.navScrollWidth <= nav.navClientWidth + 1,
         `宽视口侧栏不应横向溢出：nav.scrollWidth=${nav.navScrollWidth} > nav.clientWidth=${nav.navClientWidth} +1`);
 
@@ -613,21 +632,23 @@ test('UI 活栈管理台：#818 分组侧栏导航（15 链接 / 6 组 / 关于�
       assert.ok(nar.railWidth > 0 && nar.railWidth < 60, `窄视口侧栏应收成图标轨（≈44，<60），实测 railWidth=${JSON.stringify(nar.railWidth)}`);
       assert.ok(nar.docScrollWidth <= nar.docClientWidth + 1,
         `窄视口文档不应横向溢出：scrollWidth=${nar.docScrollWidth} > clientWidth=${nar.docClientWidth} +1`);
-      assert.ok(nar.scrollHasContent !== false && nar.scrollScrollWidth > nar.scrollClientWidth,
+      assert.ok(nar.scrollScrollWidth > nar.scrollClientWidth,
         `窄视口表格外层滚动容器应自己可横滚（scrollWidth>clientWidth）：scroll=${JSON.stringify({ sw: nar.scrollScrollWidth, cw: nar.scrollClientWidth, ox: nar.scrollOverflowX })}`);
 
       // ---- 断言：通用 ----
       assert.deepEqual(rep.pageErrors, [], `有 pageerror：${JSON.stringify(rep.pageErrors.slice(0, 3))}`);
       // console error 白名单（常见良性噪声）；白名单外一律红。
-      const CONSOLE_ALLOW = [/favicon/i, /ResizeObserver loop/i, /Download the Vue Devtools/i, /DevTools/i];
+      // 其中「Failed to load resource ... 401」是 SPA 进登录页时未登录探会话的**预期** 401
+      //（登录后页面正常渲染出数据）；只放行 401 这一种，不 blanket 放行所有 failed-load（会掩盖 500）。
+      const CONSOLE_ALLOW = [/favicon/i, /ResizeObserver loop/i, /Download the Vue Devtools/i, /DevTools/i, /status of 401\b/];
       const realConsole = (rep.consoleErrors || []).filter((e) => !CONSOLE_ALLOW.some((re) => re.test(e)));
       assert.deepEqual(realConsole, [], `白名单外的 console error：${JSON.stringify(realConsole.slice(0, 5))}`);
 
       // 截图取回（人工复核证据，落宿主临时目录，不提交）。
       tryQuiet(() => fs.rmSync(SHOT_WIDE_HOST, { force: true }));
       tryQuiet(() => fs.rmSync(SHOT_NARROW_HOST, { force: true }));
-      dockerRun(['cp', `${PW_CONTAINER}:${SHOT_WIDE_CONTAINER}`, SHOT_WIDE_HOST], { timeout: 60_000 }).catch(() => {});
-      dockerRun(['cp', `${PW_CONTAINER}:${SHOT_NARROW_CONTAINER}`, SHOT_NARROW_HOST], { timeout: 60_000 }).catch(() => {});
+      tryQuiet(() => dockerRun(['cp', `${PW_CONTAINER}:${SHOT_WIDE_CONTAINER}`, SHOT_WIDE_HOST], { timeout: 60_000 }));
+      tryQuiet(() => dockerRun(['cp', `${PW_CONTAINER}:${SHOT_NARROW_CONTAINER}`, SHOT_NARROW_HOST], { timeout: 60_000 }));
       const wideBytes = fs.existsSync(SHOT_WIDE_HOST) ? fs.statSync(SHOT_WIDE_HOST).size : 0;
       const narrowBytes = fs.existsSync(SHOT_NARROW_HOST) ? fs.statSync(SHOT_NARROW_HOST).size : 0;
       assert.ok(wideBytes > 1024, `宽视口截图只有 ${wideBytes} 字节（${SHOT_WIDE_HOST}）`);
