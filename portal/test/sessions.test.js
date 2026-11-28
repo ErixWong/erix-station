@@ -82,6 +82,40 @@ test('#676-x 越界绝对路径（/root/.erix/...）与非 ~ 相对路径被拒'
   assert.throws(() => validateRunCwd(null, {}), SessionError);
 });
 
+// —— issue #919-A：绝对 cwd 不得整条 trim 后再折叠（首尾空白即拒）——
+// Linux 目录名可合法含首尾空格；若先把绝对路径 trim 再折叠，`<jail>/projects/x ` 会被折成
+// `~/projects/x`（指向另一个目录且不报错）。故绝对形态带首尾空白 ⇒ 直接拒（details.field='cwd' 且带 en）。
+// 反面对照：`~/projects/x ` 这种 tilde 形态仍按既有 trim 行为通过（会话约定，不制造新行为）。
+test('#919-A 绝对 cwd 带首尾空白 ⇒ validation_failed（details.field=cwd 且带 en）；尾空格', () => {
+  // ① 尾部带一个空格
+  assert.throws(
+    () => validateRunCwd(`${USR}/${FDE}/projects/x `, { userSpaceRoot: USR, fdeName: FDE }),
+    (e) => {
+      assert.ok(e instanceof SessionError, '必须是 SessionError');
+      assert.equal(e.code, 'validation_failed');
+      assert.equal(e.details.field, 'cwd');
+      assert.equal(typeof e.en, 'string');
+      assert.ok(e.en.length > 0, '错误必须带 en（中英双语）');
+      return true;
+    },
+  );
+  // ② 头部带空白同理
+  assert.throws(
+    () => validateRunCwd(` ${USR}/${FDE}/projects/x`, { userSpaceRoot: USR, fdeName: FDE }),
+    (e) => e instanceof SessionError && e.code === 'validation_failed' && e.details.field === 'cwd' && typeof e.en === 'string' && e.en.length > 0,
+  );
+  // 首尾都带空白
+  assert.throws(
+    () => validateRunCwd(`  ${USR}/${FDE}/projects/x\t`, { userSpaceRoot: USR, fdeName: FDE }),
+    (e) => e instanceof SessionError && e.code === 'validation_failed' && e.details.field === 'cwd',
+  );
+  // ③ 反面对照：tilde 形态的尾部空格仍按既有行为通过（不能被一并拒）
+  assert.equal(validateRunCwd('~/projects/x ', { userSpaceRoot: USR, fdeName: FDE }), '~/projects/x');
+  assert.equal(validateRunCwd('  ~/projects/x', {}), '~/projects/x');
+  // 反面对照：绝对且无首尾空白仍正常折叠
+  assert.equal(validateRunCwd(`${USR}/${FDE}/projects/x`, { userSpaceRoot: USR, fdeName: FDE }), '~/projects/x');
+});
+
 // —— 用例 1：postMessage 越界 cwd ⇒ validation_failed、不刷会话 cwd、不入队 run（真库）——
 test('#676-1 postMessage 越界 cwd ⇒ validation_failed、会话 cwd 不变、run_queue 无新行',
   { skip: SKIP }, async () => {

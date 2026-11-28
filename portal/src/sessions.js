@@ -116,6 +116,17 @@ export function validateRunCwd(cwd, { userSpaceRoot, fdeName } = {}) {
     });
   }
 
+  // issue #919-A：**绝对形态不得整条 trim 后再折叠**。Linux 目录名可合法含首尾空格（本仓项目名规则只禁
+  // `/`、精确 `.`/`..`、控制字符），若把 `<jail>/projects/x `（尾巴带空格）先 trim 成 `x` 会折叠出
+  // `~/projects/x`——指向另一个目录、且校验器不报错。故：传入的绝对路径字符串与其 trim 结果不同 ⇒ 直接拒。
+  // 只收紧绝对支；`~/projects/<name>` 那一支的既有 trim 行为一字不动（会话约定形态，不制造新行为）。
+  if (cwd !== value) {
+    throw new SessionError('validation_failed', `绝对 cwd 不得带首尾空白（目录名本身可以合法含空格，先去掉空白会折叠成另一个目录）：${cwd}`, {
+      en: `an absolute cwd must not carry leading/trailing whitespace (a directory name may legitimately contain spaces; trimming first would fold it into a different directory): ${cwd}`,
+      details: { field: 'cwd' },
+    });
+  }
+
   // 形态 2：绝对路径 ⇒ 归一为 `~/projects/<name>`。判前一律 `path.resolve` 吃掉 `..`。
   const root = typeof userSpaceRoot === 'string' && userSpaceRoot.trim() !== '' ? userSpaceRoot : null;
   const fde = typeof fdeName === 'string' && fdeName.trim() !== '' ? fdeName.trim() : null;
