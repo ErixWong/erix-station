@@ -2151,7 +2151,7 @@ GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
 | HTTP | code | 场景 |
 |---|---|---|
 | 404 | `not_found` | session 不存在 / 不属本人 / 已归档（同 §4.2 PATCH） |
-| 409 | `llm_not_configured` | **只看会话属主 FDE 的 active binding**（#802 现验纠偏）：不存在 `state='active' AND gateway='litellm' AND api_key 非空 AND main_model_id IS NOT NULL` 的行 ⇒ 在**建 run 之前**就拒（判据在 `http.js:3557-3566`，单测 `portal/test/message-precheck.test.js`）。⚠ 旧措辞「**且无启用的 text provider+model**」是已退役 Station provider 目录的遗留（现源码**没有**目录回退，本节正文 `:2112` 早就是 binding-only），别再照旧措辞理解 |
+| 409 | `llm_not_configured` | **只看会话属主 FDE 的 active binding**（#802 现验纠偏）：不存在 `state='active' AND gateway='litellm' AND api_key 非空 AND main_model_id IS NOT NULL` 的行 ⇒ 在**建 run 之前**就拒（判据在建 run 的唯一入口 `sessions.postMessage`（`sessions.js:839-855`）统一预检，http 与宏两条路都覆盖；单测 `portal/test/message-precheck.test.js` + `portal/test/macro-postmessage-llm-precheck.test.js`）。⚠ 旧措辞「**且无启用的 text provider+model**」是已退役 Station provider 目录的遗留（现源码**没有**目录回退，本节正文 `:2112` 早就是 binding-only），别再照旧措辞理解 |
 | 409 | `no_user_messages` | 会话还没有用户消息（无可用上下文） |
 | 502 | `llm_upstream_failed` | 上游超时 / 非 2xx / 响应无可用标题。`details` 给结构化原因（`{reason: 'timeout', timeoutMs}` / `{reason: 'network'}` / `{reason: 'upstream_status', status}`），**只放状态码与耗时上限，绝不含 key**（#255 起沿用的 `details` 附加结构，见 §2 错误体） |
 

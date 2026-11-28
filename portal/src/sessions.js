@@ -836,6 +836,24 @@ export async function postMessage(pool, {
   const safeContent = valid.content;
   const safeAttachments = valid.attachments;
 
+  // issue #905：建 run 的唯一入口统一预检——无可用 LiteLLM binding → 409 llm_not_configured。
+  // 放在 pool.connect() 之前（只读，不开事务），保证「fail-fast：不占连接」语义与
+  // message-precheck.test.js 既有断言（connected===0）一致。
+  // 两条调用路（http handlePostMessage 与 macro-dispatcher）都经由本函数 ⇒ 统一覆盖。
+  // 幂等性质：postMessage 在 executeWithIdempotency 的 fn 内被调用 ⇒ 失败走 release 路径，
+  // 修好绑定后同 key 原样重试仍可成功建 run（回放优先：findDone 在 fn 之前返回，不被本预检截断）。
+  const bound = await pool.query(
+    `SELECT 1
+       FROM fde_llm_bindings b
+      WHERE b.fde_id = $1 AND b.state = 'active' AND b.gateway = 'litellm'
+        AND b.api_key IS NOT NULL AND b.api_key <> '' AND b.main_model_id IS NOT NULL
+      LIMIT 1`,
+    [userId],
+  );
+  if (!bound.rows?.length) {
+    throw new SessionError('llm_not_configured', '该 FDE 未配置 LLM 上游，请在管理台配置', { httpStatus: 409, en: 'This FDE has no LLM upstream configured; please configure it in the admin console' });
+  }
+
   const client = await pool.connect();
   let committed = null;
   let clippedTitle = null; // issue #114：首条消息截断出的默认标题（COMMIT 后回调用）

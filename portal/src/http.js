@@ -3547,24 +3547,8 @@ async function handlePostMessage(req, res, ctx, sessionId) {
     { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash({ content, attachments }), log: ctx.log },
     async (record) => {
       await sessions.assertSessionOwner(ctx.pool, { userId: session.user.id, sessionId });
-      // issue #117：建 run 前预检该 FDE 是否已绑定可用 LiteLLM 上游（active binding +
-      // 非空 virtual key + main model slot）。
-      // 未配置 → 409 llm_not_configured fail-fast：不入队 run（否则 run 永久排队，等一个永远不会
-      // 出现的 LLM 出口）。
-      // 评审 MEDIUM-1：预检必须放在 fn 内（executeWithIdempotency 之后）——回放优先（findDone 在
-      // fn 之前返回首次结果，不被预检截断）；claim 后 fn 抛错走 ⑤ release 路径，「失败不占位」
-      // 语义保持（修好绑定后同 key 原样重试可成功建 run）。
-      const bound = await ctx.pool.query(
-        `SELECT 1
-           FROM fde_llm_bindings b
-          WHERE b.fde_id = $1 AND b.state = 'active' AND b.gateway = 'litellm'
-            AND b.api_key IS NOT NULL AND b.api_key <> '' AND b.main_model_id IS NOT NULL
-          LIMIT 1`,
-        [session.user.id],
-      );
-      if (!bound.rows?.length) {
-        throw new HttpError(409, 'llm_not_configured', '该 FDE 未配置 LLM 上游，请在管理台配置', { en: 'This FDE has no LLM upstream configured; please configure it in the admin console' });
-      }
+      // issue #905：llm_not_configured 预检已挪入 sessions.postMessage（建 run 的唯一入口），
+      // 此处不再重复；幂等性质不变：postMessage 在 fn 内被调用 ⇒ 失败走 release ⇒ 回放优先。
       // issue #261014 切片 B2：绑定里的 `model_info.id` 在网关里已不存在（模型被删/重建 ⇒ id 变）时，
       // 消息仍会入队并在 run 里跑出一个看不懂的错 ⇒ 这里 fail-fast（409 llm_model_not_found）。
       // 位置红线：与 llm_not_configured 同层（幂等 fn 内、**开业务事务与写 transcript 之前**）——
